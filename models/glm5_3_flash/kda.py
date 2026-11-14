@@ -25,10 +25,7 @@ from models.glm5_3_flash.config import (
     EP_SIZE, FLASH, KDA_CONV_K, KDA_DIM, KDA_GATE_LOWER_BOUND, LOCAL_KDA_H, LOCAL_KDA_QKV_DIM,
     TP_SIZE, D, Glm53FlashConfig,
 )
-from models.glm5_3_flash.elementwise import (
-    accurate_divide, accurate_exp, accurate_row_sum, accurate_rsqrt, accurate_sigmoid, accurate_silu,
-    accurate_sqrt,
-)
+from models.glm5_3_flash.elementwise import sigmoid_fp32, silu
 from models.glm5_3_flash.linear import bf16_matmul, golden_bf16_linear
 from models.glm5_3_flash.rmsnorm import l2norm, reference_l2norm, rms_norm_gated
 from models.glm5_3_flash.utils import _assert_close, _randn
@@ -43,8 +40,10 @@ T_DYN = pl.dynamic("GLM53_T_DYN")
 CONV_DIM = 3 * LOCAL_KDA_QKV_DIM
 STATE_LEN = KDA_CONV_K - 1
 CONV_T_TILE = 16  # tokens per bulk task
-C_TILE = 128  # Bounds the corrected SiLU working set alongside the FP32 tap sum
+C_TILE = 128  # Convolution channel tile
 DECODE_C_TILE = 128  # channels per decode convolution partition
+AIV_WORKERS_TILE = 48
+MIX_WORKERS_TILE = 24
 CONV_WORKERS_TILE = 48  # AIV workers sharing the recurrent convolution partitions
 _PREFILL_LENGTHS = {"ragged": [5, 1, 9, 2, 0], "single": [1], "long": [40], "paged": [32, 1]}
 CONV_POOL_ROWS = 6
@@ -114,148 +113,150 @@ def kda_conv_prefill(
     v_flat = pl.reshape(value, [t_dim, LOCAL_KDA_QKV_DIM])
     k_flat = pl.reshape(key, [t_dim, LOCAL_KDA_QKV_DIM])
     q_flat = pl.reshape(query, [t_dim, LOCAL_KDA_QKV_DIM])
-    with pl.spmd(bulk_tiles * (CONV_DIM // C_TILE), name_hint="kda_conv_bulk") as bulk_tid:
-        task = pl.tile.get_block_idx()
-        lanes = CONV_DIM // C_TILE
-        p0 = STATE_LEN + (task // lanes) * CONV_T_TILE
-        c0 = (task % lanes) * C_TILE
-        rows = pl.min(CONV_T_TILE, t_dim - p0)
-        if rows > 0:
-            acc = pl.full([CONV_T_TILE, C_TILE], dtype=pl.FP32, value=0.0)
-            for j in pl.unroll(KDA_CONV_K):
-                tap = pl.slice(mixed_qkv, [CONV_T_TILE, C_TILE], [p0 - STATE_LEN + j, c0], valid_shape=[rows, C_TILE])
-                acc_cast = pl.cast(weight[j:j + 1, c0:c0 + C_TILE], pl.FP32)
-                acc_col_expand_mul = pl.col_expand_mul(pl.cast(tap, pl.FP32), acc_cast)
-                acc = pl.add(acc, acc_col_expand_mul)
-            activation_input = pl.create_tensor([CONV_T_TILE, C_TILE], dtype=pl.FP32)
-            activation_input[:, :] = acc
-            activated = accurate_silu(activation_input, CONV_T_TILE, C_TILE)
-            out_tile = pl.set_validshape(pl.cast(activated, pl.BF16, mode="rint"), rows, C_TILE)
-            if c0 < LOCAL_KDA_QKV_DIM:
-                q_flat[p0 : p0 + CONV_T_TILE, c0 : c0 + C_TILE] = out_tile
-            elif c0 < 2 * LOCAL_KDA_QKV_DIM:
-                kc = c0 - LOCAL_KDA_QKV_DIM
-                k_flat[p0 : p0 + CONV_T_TILE, kc : kc + C_TILE] = out_tile
-            else:
-                vc = c0 - 2 * LOCAL_KDA_QKV_DIM
-                v_flat[p0 : p0 + CONV_T_TILE, vc : vc + C_TILE] = out_tile
+    with pl.spmd(pl.min(bulk_tiles * (CONV_DIM // C_TILE), AIV_WORKERS_TILE), name_hint="kda_conv_bulk") as bulk_tid:
+        for kda_conv_bulk_partition in pl.range(pl.tile.get_block_idx(), bulk_tiles * (CONV_DIM // C_TILE), AIV_WORKERS_TILE):
+            task = kda_conv_bulk_partition
+            lanes = CONV_DIM // C_TILE
+            p0 = STATE_LEN + (task // lanes) * CONV_T_TILE
+            c0 = (task % lanes) * C_TILE
+            rows = pl.min(CONV_T_TILE, t_dim - p0)
+            if rows > 0:
+                acc = pl.full([CONV_T_TILE, C_TILE], dtype=pl.FP32, value=0.0)
+                for j in pl.unroll(KDA_CONV_K):
+                    tap = pl.slice(mixed_qkv, [CONV_T_TILE, C_TILE], [p0 - STATE_LEN + j, c0], valid_shape=[rows, C_TILE])
+                    acc_cast = pl.cast(weight[j:j + 1, c0:c0 + C_TILE], pl.FP32)
+                    acc_col_expand_mul = pl.col_expand_mul(pl.cast(tap, pl.FP32), acc_cast)
+                    acc = pl.add(acc, acc_col_expand_mul)
+                activation_input = pl.create_tensor([CONV_T_TILE, C_TILE], dtype=pl.FP32)
+                activation_input[:, :] = acc
+                activated = silu(activation_input, CONV_T_TILE, C_TILE)
+                out_tile = pl.set_validshape(pl.cast(activated, pl.BF16, mode="rint"), rows, C_TILE)
+                if c0 < LOCAL_KDA_QKV_DIM:
+                    q_flat[p0 : p0 + CONV_T_TILE, c0 : c0 + C_TILE] = out_tile
+                elif c0 < 2 * LOCAL_KDA_QKV_DIM:
+                    kc = c0 - LOCAL_KDA_QKV_DIM
+                    k_flat[p0 : p0 + CONV_T_TILE, kc : kc + C_TILE] = out_tile
+                else:
+                    vc = c0 - 2 * LOCAL_KDA_QKV_DIM
+                    v_flat[p0 : p0 + CONV_T_TILE, vc : vc + C_TILE] = out_tile
 
     # --- pass 2: the first STATE_LEN rows of every request, plus the state update ---
     cs2 = pl.reshape(conv_state, [pl.tensor.dim(conv_state, 0) * STATE_LEN, CONV_DIM])
-    with pl.spmd(requests * (CONV_DIM // C_TILE), name_hint="kda_conv_head", deps=[bulk_tid]):
-        task = pl.tile.get_block_idx()
-        lanes = CONV_DIM // C_TILE
-        b = task // lanes
-        c0 = (task % lanes) * C_TILE
-        s = pl.cast(pl.read(query_start_loc, [b]), pl.INDEX)
-        e = pl.cast(pl.read(query_start_loc, [b + 1]), pl.INDEX)
-        row = pl.cast(pl.read(state_rows, [b, 0]), pl.INDEX)
-        srow = row * STATE_LEN
-        length = e - s
-        # An empty request is legal: query_start_loc is cumulative, and equal adjacent
-        # offsets mean a request contributed no tokens -- the reference skips those.
-        # The row masks below already write nothing in that case, but the token reads
-        # still happen, and for a trailing empty request s equals the token count, so
-        # they would run past the end of the packed stream. Skip the body instead.
-        if length > 0:
-            # full[k] is conv_state[row, k] for k < STATE_LEN and mixed_qkv[s + k - STATE_LEN]
-            # otherwise. Written straight through rather than looped: a pl iterator's index
-            # is a Scalar, so it cannot drive the trace-time choice between the two sources.
-            st0 = pl.cast(cs2[srow + 0:srow + 0 + 1, c0:c0 + C_TILE], pl.FP32)
-            st1 = pl.cast(cs2[srow + 1:srow + 1 + 1, c0:c0 + C_TILE], pl.FP32)
-            st2 = pl.cast(cs2[srow + 2:srow + 2 + 1, c0:c0 + C_TILE], pl.FP32)
-            # k - STATE_LEN <= u < length whenever the row below is written, so these reads
-            # stay inside the request.
-            x0 = pl.cast(mixed_qkv[s:s + 1, c0:c0 + C_TILE], pl.FP32)
-            second = pl.min(s + 1, e - 1)
-            x1 = pl.cast(mixed_qkv[second:second + 1, c0:c0 + C_TILE], pl.FP32)
-            third = pl.min(s + 2, e - 1)
-            x2 = pl.cast(mixed_qkv[third:third + 1, c0:c0 + C_TILE], pl.FP32)
-            w0 = pl.cast(weight[0:1, c0 : c0 + C_TILE], pl.FP32)
-            w1 = pl.cast(weight[1:2, c0 : c0 + C_TILE], pl.FP32)
-            w2 = pl.cast(weight[2:3, c0 : c0 + C_TILE], pl.FP32)
-            w3 = pl.cast(weight[3:4, c0 : c0 + C_TILE], pl.FP32)
+    with pl.spmd(pl.min(requests * (CONV_DIM // C_TILE), AIV_WORKERS_TILE), name_hint="kda_conv_head", deps=[bulk_tid]):
+        for kda_conv_head_partition in pl.range(pl.tile.get_block_idx(), requests * (CONV_DIM // C_TILE), AIV_WORKERS_TILE):
+            task = kda_conv_head_partition
+            lanes = CONV_DIM // C_TILE
+            b = task // lanes
+            c0 = (task % lanes) * C_TILE
+            s = pl.cast(pl.read(query_start_loc, [b]), pl.INDEX)
+            e = pl.cast(pl.read(query_start_loc, [b + 1]), pl.INDEX)
+            row = pl.cast(pl.read(state_rows, [b, 0]), pl.INDEX)
+            srow = row * STATE_LEN
+            length = e - s
+            # An empty request is legal: query_start_loc is cumulative, and equal adjacent
+            # offsets mean a request contributed no tokens -- the reference skips those.
+            # The row masks below already write nothing in that case, but the token reads
+            # still happen, and for a trailing empty request s equals the token count, so
+            # they would run past the end of the packed stream. Skip the body instead.
+            if length > 0:
+                # full[k] is conv_state[row, k] for k < STATE_LEN and mixed_qkv[s + k - STATE_LEN]
+                # otherwise. Written straight through rather than looped: a pl iterator's index
+                # is a Scalar, so it cannot drive the trace-time choice between the two sources.
+                st0 = pl.cast(cs2[srow + 0:srow + 0 + 1, c0:c0 + C_TILE], pl.FP32)
+                st1 = pl.cast(cs2[srow + 1:srow + 1 + 1, c0:c0 + C_TILE], pl.FP32)
+                st2 = pl.cast(cs2[srow + 2:srow + 2 + 1, c0:c0 + C_TILE], pl.FP32)
+                # k - STATE_LEN <= u < length whenever the row below is written, so these reads
+                # stay inside the request.
+                x0 = pl.cast(mixed_qkv[s:s + 1, c0:c0 + C_TILE], pl.FP32)
+                second = pl.min(s + 1, e - 1)
+                x1 = pl.cast(mixed_qkv[second:second + 1, c0:c0 + C_TILE], pl.FP32)
+                third = pl.min(s + 2, e - 1)
+                x2 = pl.cast(mixed_qkv[third:third + 1, c0:c0 + C_TILE], pl.FP32)
+                w0 = pl.cast(weight[0:1, c0 : c0 + C_TILE], pl.FP32)
+                w1 = pl.cast(weight[1:2, c0 : c0 + C_TILE], pl.FP32)
+                w2 = pl.cast(weight[2:3, c0 : c0 + C_TILE], pl.FP32)
+                w3 = pl.cast(weight[3:4, c0 : c0 + C_TILE], pl.FP32)
 
-            # Match the bulk/reference's left-to-right FP32 tap sum. Pairwise
-            # sums can cross a BF16 rounding tie when a token starts a new chunk.
-            a00 = pl.mul(st0, w0)
-            a01 = pl.mul(st1, w1)
-            a02 = pl.mul(st2, w2)
-            a03 = pl.mul(x0, w3)
-            acc0 = pl.add(a00, a01)
-            acc0 = pl.add(acc0, a02)
-            acc0 = pl.add(acc0, a03)
-            a10 = pl.mul(st1, w0)
-            a11 = pl.mul(st2, w1)
-            a12 = pl.mul(x0, w2)
-            a13 = pl.mul(x1, w3)
-            acc1 = pl.add(a10, a11)
-            acc1 = pl.add(acc1, a12)
-            acc1 = pl.add(acc1, a13)
-            a20 = pl.mul(st2, w0)
-            a21 = pl.mul(x0, w1)
-            a22 = pl.mul(x1, w2)
-            a23 = pl.mul(x2, w3)
-            acc2 = pl.add(a20, a21)
-            acc2 = pl.add(acc2, a22)
-            acc2 = pl.add(acc2, a23)
+                # Match the bulk/reference's left-to-right FP32 tap sum. Pairwise
+                # sums can cross a BF16 rounding tie when a token starts a new chunk.
+                a00 = pl.mul(st0, w0)
+                a01 = pl.mul(st1, w1)
+                a02 = pl.mul(st2, w2)
+                a03 = pl.mul(x0, w3)
+                acc0 = pl.add(a00, a01)
+                acc0 = pl.add(acc0, a02)
+                acc0 = pl.add(acc0, a03)
+                a10 = pl.mul(st1, w0)
+                a11 = pl.mul(st2, w1)
+                a12 = pl.mul(x0, w2)
+                a13 = pl.mul(x1, w3)
+                acc1 = pl.add(a10, a11)
+                acc1 = pl.add(acc1, a12)
+                acc1 = pl.add(acc1, a13)
+                a20 = pl.mul(st2, w0)
+                a21 = pl.mul(x0, w1)
+                a22 = pl.mul(x1, w2)
+                a23 = pl.mul(x2, w3)
+                acc2 = pl.add(a20, a21)
+                acc2 = pl.add(acc2, a22)
+                acc2 = pl.add(acc2, a23)
 
-            # SiLU and the masked stores, one row at a time. A request shorter than the
-            # window leaves the later rows with zero valid rows, so nothing is written.
-            input0 = pl.create_tensor([1, C_TILE], dtype=pl.FP32)
-            input1 = pl.create_tensor([1, C_TILE], dtype=pl.FP32)
-            input2 = pl.create_tensor([1, C_TILE], dtype=pl.FP32)
-            input0[:, :] = acc0
-            input1[:, :] = acc1
-            input2[:, :] = acc2
-            act0 = accurate_silu(input0, 1, C_TILE)
-            act1 = accurate_silu(input1, 1, C_TILE)
-            act2 = accurate_silu(input2, 1, C_TILE)
-            v0 = pl.min(pl.max(length, 0), 1)
-            v1 = pl.min(pl.max(length - 1, 0), 1)
-            v2 = pl.min(pl.max(length - 2, 0), 1)
-            o0 = pl.set_validshape(pl.cast(act0, pl.BF16, mode="rint"), v0, C_TILE)
-            o1 = pl.set_validshape(pl.cast(act1, pl.BF16, mode="rint"), v1, C_TILE)
-            o2 = pl.set_validshape(pl.cast(act2, pl.BF16, mode="rint"), v2, C_TILE)
-            # The destination is chosen by writing in each branch, not by rebinding a name
-            # to a different tensor: an IfStmt's in-place return must yield one backing
-            # value, and three different tensors cannot be unified into it.
-            if c0 < LOCAL_KDA_QKV_DIM:
-                q_flat[s : s + 1, c0 : c0 + C_TILE] = o0
-                q_flat[s + 1 : s + 2, c0 : c0 + C_TILE] = o1
-                q_flat[s + 2 : s + 3, c0 : c0 + C_TILE] = o2
-            elif c0 < 2 * LOCAL_KDA_QKV_DIM:
-                kc0 = c0 - LOCAL_KDA_QKV_DIM
-                k_flat[s : s + 1, kc0 : kc0 + C_TILE] = o0
-                k_flat[s + 1 : s + 2, kc0 : kc0 + C_TILE] = o1
-                k_flat[s + 2 : s + 3, kc0 : kc0 + C_TILE] = o2
-            else:
-                vc0 = c0 - 2 * LOCAL_KDA_QKV_DIM
-                v_flat[s : s + 1, vc0 : vc0 + C_TILE] = o0
-                v_flat[s + 1 : s + 2, vc0 : vc0 + C_TILE] = o1
-                v_flat[s + 2 : s + 3, vc0 : vc0 + C_TILE] = o2
+                # SiLU and the masked stores, one row at a time. A request shorter than the
+                # window leaves the later rows with zero valid rows, so nothing is written.
+                input0 = pl.create_tensor([1, C_TILE], dtype=pl.FP32)
+                input1 = pl.create_tensor([1, C_TILE], dtype=pl.FP32)
+                input2 = pl.create_tensor([1, C_TILE], dtype=pl.FP32)
+                input0[:, :] = acc0
+                input1[:, :] = acc1
+                input2[:, :] = acc2
+                act0 = silu(input0, 1, C_TILE)
+                act1 = silu(input1, 1, C_TILE)
+                act2 = silu(input2, 1, C_TILE)
+                v0 = pl.min(pl.max(length, 0), 1)
+                v1 = pl.min(pl.max(length - 1, 0), 1)
+                v2 = pl.min(pl.max(length - 2, 0), 1)
+                o0 = pl.set_validshape(pl.cast(act0, pl.BF16, mode="rint"), v0, C_TILE)
+                o1 = pl.set_validshape(pl.cast(act1, pl.BF16, mode="rint"), v1, C_TILE)
+                o2 = pl.set_validshape(pl.cast(act2, pl.BF16, mode="rint"), v2, C_TILE)
+                # The destination is chosen by writing in each branch, not by rebinding a name
+                # to a different tensor: an IfStmt's in-place return must yield one backing
+                # value, and three different tensors cannot be unified into it.
+                if c0 < LOCAL_KDA_QKV_DIM:
+                    q_flat[s : s + 1, c0 : c0 + C_TILE] = o0
+                    q_flat[s + 1 : s + 2, c0 : c0 + C_TILE] = o1
+                    q_flat[s + 2 : s + 3, c0 : c0 + C_TILE] = o2
+                elif c0 < 2 * LOCAL_KDA_QKV_DIM:
+                    kc0 = c0 - LOCAL_KDA_QKV_DIM
+                    k_flat[s : s + 1, kc0 : kc0 + C_TILE] = o0
+                    k_flat[s + 1 : s + 2, kc0 : kc0 + C_TILE] = o1
+                    k_flat[s + 2 : s + 3, kc0 : kc0 + C_TILE] = o2
+                else:
+                    vc0 = c0 - 2 * LOCAL_KDA_QKV_DIM
+                    v_flat[s : s + 1, vc0 : vc0 + C_TILE] = o0
+                    v_flat[s + 1 : s + 2, vc0 : vc0 + C_TILE] = o1
+                    v_flat[s + 2 : s + 3, vc0 : vc0 + C_TILE] = o2
 
-            # Write the private working tail and the retained prefix boundaries.
-            for checkpoint in pl.range(0, length + CHUNK_TILE, CHUNK_TILE):
-                endpoint = length
-                destination = pl.cast(pl.read(state_rows, [b, 1]), pl.INDEX)
-                if checkpoint < length:
-                    endpoint = pl.min(checkpoint + CHUNK_TILE, length)
-                    destination = pl.cast(pl.read(state_rows, [b, 2 + checkpoint // CHUNK_TILE]), pl.INDEX)
-                if destination >= 0:
-                    dst_row = destination * STATE_LEN
-                    for i in pl.unroll(STATE_LEN - 1):
-                        old_idx = pl.min(endpoint + i, STATE_LEN - 1)
-                        new_idx = pl.max(s + endpoint - STATE_LEN + i, s)
-                        keep_old = pl.min(pl.max(STATE_LEN - endpoint - i, 0), 1)
-                        take_new = pl.min(pl.max(endpoint + i - STATE_LEN + 1, 0), 1)
-                        old_row = cs2[srow + old_idx:srow + old_idx + 1, c0:c0 + C_TILE]
-                        new_row = mixed_qkv[new_idx:new_idx + 1, c0:c0 + C_TILE]
-                        cs2[dst_row + i:dst_row + i + 1, c0:c0 + C_TILE] = pl.set_validshape(old_row, keep_old, C_TILE)
-                        cs2[dst_row + i:dst_row + i + 1, c0:c0 + C_TILE] = pl.set_validshape(new_row, take_new, C_TILE)
-                    last = dst_row + STATE_LEN - 1
-                    final_row = s + endpoint - 1
-                    cs2[last:last + 1, c0:c0 + C_TILE] = mixed_qkv[final_row:final_row + 1, c0:c0 + C_TILE]
+                # Write the private working tail and the retained prefix boundaries.
+                for checkpoint in pl.range(0, length + CHUNK_TILE, CHUNK_TILE):
+                    endpoint = length
+                    destination = pl.cast(pl.read(state_rows, [b, 1]), pl.INDEX)
+                    if checkpoint < length:
+                        endpoint = pl.min(checkpoint + CHUNK_TILE, length)
+                        destination = pl.cast(pl.read(state_rows, [b, 2 + checkpoint // CHUNK_TILE]), pl.INDEX)
+                    if destination >= 0:
+                        dst_row = destination * STATE_LEN
+                        for i in pl.unroll(STATE_LEN - 1):
+                            old_idx = pl.min(endpoint + i, STATE_LEN - 1)
+                            new_idx = pl.max(s + endpoint - STATE_LEN + i, s)
+                            keep_old = pl.min(pl.max(STATE_LEN - endpoint - i, 0), 1)
+                            take_new = pl.min(pl.max(endpoint + i - STATE_LEN + 1, 0), 1)
+                            old_row = cs2[srow + old_idx:srow + old_idx + 1, c0:c0 + C_TILE]
+                            new_row = mixed_qkv[new_idx:new_idx + 1, c0:c0 + C_TILE]
+                            cs2[dst_row + i:dst_row + i + 1, c0:c0 + C_TILE] = pl.set_validshape(old_row, keep_old, C_TILE)
+                            cs2[dst_row + i:dst_row + i + 1, c0:c0 + C_TILE] = pl.set_validshape(new_row, take_new, C_TILE)
+                        last = dst_row + STATE_LEN - 1
+                        final_row = s + endpoint - 1
+                        cs2[last:last + 1, c0:c0 + C_TILE] = mixed_qkv[final_row:final_row + 1, c0:c0 + C_TILE]
 
     return query, key, value, conv_state
 
@@ -316,7 +317,7 @@ def kda_conv_recurrent(
                 acc = pl.add(acc_add_2, acc_mul_4)
                 activation_arg_activated = pl.create_tensor([1, DECODE_C_TILE], dtype=pl.FP32)
                 activation_arg_activated[:, :] = acc
-                activated = accurate_silu(activation_arg_activated, 1, DECODE_C_TILE)
+                activated = silu(activation_arg_activated, 1, DECODE_C_TILE)
                 out_tile = pl.cast(activated, pl.BF16, mode="rint")
                 if c0 < LOCAL_KDA_QKV_DIM:
                     q_flat[t : t + 1, c0 : c0 + DECODE_C_TILE] = out_tile
@@ -529,29 +530,30 @@ def kda_projection(
             out_gate_flat[t0:t0 + PROJECTION_T_TILE, n0:n0 + GATE_PROJECTION_N_TILE] = out_raw_valid
     dt_bias_row = pl.reshape(dt_bias, [1, LOCAL_KDA_QKV_DIM])
     decay_flat = pl.reshape(decay, [t_dim, LOCAL_KDA_QKV_DIM])
-    with pl.spmd((t_dim + 3) // 4 * (LOCAL_KDA_QKV_DIM // KDA_DIM), name_hint="kda_projection_decay", deps=[output_tid]):
-        task = pl.tile.get_block_idx()
-        t0 = task // (LOCAL_KDA_QKV_DIM // KDA_DIM) * 4
-        n0 = task % (LOCAL_KDA_QKV_DIM // KDA_DIM) * KDA_DIM
-        rows = pl.min(4, t_dim - t0)
-        g_raw_gm_tile = pl.slice(g_raw_gm, [4, KDA_DIM], [t0, n0], valid_shape=[rows, KDA_DIM])
-        g_part = pl.cast(g_raw_gm_tile, pl.FP32)
-        biased = pl.col_expand_add(g_part, dt_bias_row[0:1, n0 : n0 + KDA_DIM])
-        a_fill = pl.create_tensor([4, KDA_DIM], dtype=pl.FP32)
-        a_fill[:, :] = pl.add(pl.mul(biased, 0.0), pl.read(a_log, [n0 // KDA_DIM]))
-        rate = accurate_exp(a_fill)
-        scaled = pl.create_tensor([4, KDA_DIM], dtype=pl.FP32)
-        scaled[:, :] = pl.mul(biased, rate)
-        gate_h = accurate_sigmoid(scaled, 4, KDA_DIM)
-        part_mul = pl.mul(gate_h, KDA_GATE_LOWER_BOUND)
-        decay_flat[t0 : t0 + 4, n0 : n0 + KDA_DIM] = pl.set_validshape(part_mul, rows, KDA_DIM)
+    with pl.spmd(pl.min((t_dim + 3) // 4 * (LOCAL_KDA_QKV_DIM // KDA_DIM), AIV_WORKERS_TILE), name_hint="kda_projection_decay", deps=[output_tid]):
+        for kda_projection_decay_partition in pl.range(pl.tile.get_block_idx(), (t_dim + 3) // 4 * (LOCAL_KDA_QKV_DIM // KDA_DIM), AIV_WORKERS_TILE):
+            task = kda_projection_decay_partition
+            t0 = task // (LOCAL_KDA_QKV_DIM // KDA_DIM) * 4
+            n0 = task % (LOCAL_KDA_QKV_DIM // KDA_DIM) * KDA_DIM
+            rows = pl.min(4, t_dim - t0)
+            g_raw_gm_tile = pl.slice(g_raw_gm, [4, KDA_DIM], [t0, n0], valid_shape=[rows, KDA_DIM])
+            g_part = pl.cast(g_raw_gm_tile, pl.FP32)
+            biased = pl.col_expand_add(g_part, dt_bias_row[0:1, n0 : n0 + KDA_DIM])
+            a_fill = pl.create_tensor([4, KDA_DIM], dtype=pl.FP32)
+            a_fill[:, :] = pl.add(pl.mul(biased, 0.0), pl.read(a_log, [n0 // KDA_DIM]))
+            rate = pl.exp(a_fill)
+            scaled = pl.create_tensor([4, KDA_DIM], dtype=pl.FP32)
+            scaled[:, :] = pl.mul(biased, rate)
+            gate_h = sigmoid_fp32(scaled, 4, KDA_DIM)
+            part_mul = pl.mul(gate_h, KDA_GATE_LOWER_BOUND)
+            decay_flat[t0 : t0 + 4, n0 : n0 + KDA_DIM] = pl.set_validshape(part_mul, rows, KDA_DIM)
     with pl.spmd((t_dim + 7) // 8, name_hint="kda_projection_beta", deps=[bottleneck_tid]):
         t0 = pl.tile.get_block_idx() * 8
         rows = pl.min(8, t_dim - t0)
         logits = pl.create_tensor([8, BETA_PAD], dtype=pl.FP32)
         b_raw_gm_tile = pl.slice(b_raw_gm, [8, BETA_PAD], [t0, 0], valid_shape=[rows, BETA_PAD])
         logits[:, :] = pl.cast(b_raw_gm_tile, pl.FP32)
-        sigmoid = accurate_sigmoid(logits, 8, BETA_PAD)
+        sigmoid = sigmoid_fp32(logits, 8, BETA_PAD)
         beta[t0 : t0 + 8, :] = pl.set_validshape(sigmoid, rows, BETA_PAD)
     return (mixed_qkv, decay, beta, out_gate)
 
@@ -596,32 +598,33 @@ def kda_output(
     weight_row = pl.reshape(norm_weight, [1, KDA_DIM])
     gate_rows = pl.reshape(out_gate, [t_dim * LOCAL_KDA_H, KDA_DIM])
     core_rows = pl.reshape(core_attn_out, [t_dim * LOCAL_KDA_H, KDA_DIM])
-    with pl.spmd((t_dim * LOCAL_KDA_H + OUTPUT_NORM_ROWS_TILE - 1) // OUTPUT_NORM_ROWS_TILE, name_hint="kda_output_norm"):
-        task = pl.tile.get_block_idx()
-        r0 = task * OUTPUT_NORM_ROWS_TILE
-        rows = pl.max(0, pl.min(OUTPUT_NORM_ROWS_TILE, t_dim * LOCAL_KDA_H - r0))
-        core_rows_tile = pl.slice(core_rows, [OUTPUT_NORM_ROWS_TILE, KDA_DIM], [r0, 0], valid_shape=[rows, KDA_DIM])
-        value = pl.cast(core_rows_tile, pl.FP32)
-        square_buffer = pl.create_tensor([OUTPUT_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
-        square_buffer[:, :] = pl.mul(value, value)
-        square_sum = accurate_row_sum(square_buffer)
-        norm_argument = pl.create_tensor([1, OUTPUT_NORM_ROWS_TILE], dtype=pl.FP32)
-        part_mul = pl.mul(square_sum, KDA_DIM_INV)
-        part_add = pl.add(part_mul, EPS)
-        norm_argument[:, :] = pl.reshape(part_add, [1, OUTPUT_NORM_ROWS_TILE])
-        inverse = accurate_rsqrt(norm_argument)
-        inv_rms = pl.reshape(inverse, [OUTPUT_NORM_ROWS_TILE, 1])
-        normed_row_expand_mul = pl.row_expand_mul(value, inv_rms)
-        normed_fp32 = pl.cast(weight_row[0:1, 0:KDA_DIM], pl.FP32)
-        normed = pl.col_expand_mul(normed_row_expand_mul, normed_fp32)
-        gate_rows_tile = pl.slice(gate_rows, [OUTPUT_NORM_ROWS_TILE, KDA_DIM], [r0, 0], valid_shape=[rows, KDA_DIM])
-        gate = pl.cast(gate_rows_tile, pl.FP32)
-        gate_buffer = pl.create_tensor([OUTPUT_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
-        gate_buffer[:, :] = gate
-        gate_sigmoid = accurate_sigmoid(gate_buffer, OUTPUT_NORM_ROWS_TILE, KDA_DIM)
-        activated = pl.mul(normed, gate_sigmoid)
-        activated_bf16 = pl.cast(activated, pl.BF16, mode="rint")
-        gated_rows[r0 : r0 + OUTPUT_NORM_ROWS_TILE, 0:KDA_DIM] = pl.set_validshape(activated_bf16, rows, KDA_DIM)
+    norm_tasks = (t_dim * LOCAL_KDA_H + OUTPUT_NORM_ROWS_TILE - 1) // OUTPUT_NORM_ROWS_TILE
+    with pl.spmd(pl.min(norm_tasks, AIV_WORKERS_TILE), name_hint="kda_output_norm"):
+        for task in pl.range(pl.tile.get_block_idx(), norm_tasks, AIV_WORKERS_TILE):
+            r0 = task * OUTPUT_NORM_ROWS_TILE
+            rows = pl.max(0, pl.min(OUTPUT_NORM_ROWS_TILE, t_dim * LOCAL_KDA_H - r0))
+            core_rows_tile = pl.slice(core_rows, [OUTPUT_NORM_ROWS_TILE, KDA_DIM], [r0, 0], valid_shape=[rows, KDA_DIM])
+            value = pl.cast(core_rows_tile, pl.FP32)
+            square_buffer = pl.create_tensor([OUTPUT_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
+            square_buffer[:, :] = pl.mul(value, value)
+            square_sum = pl.row_sum(square_buffer)
+            norm_argument = pl.create_tensor([1, OUTPUT_NORM_ROWS_TILE], dtype=pl.FP32)
+            part_mul = pl.mul(square_sum, KDA_DIM_INV)
+            part_add = pl.add(part_mul, EPS)
+            norm_argument[:, :] = pl.reshape(part_add, [1, OUTPUT_NORM_ROWS_TILE])
+            inverse = pl.rsqrt(norm_argument, high_precision=False)
+            inv_rms = pl.reshape(inverse, [OUTPUT_NORM_ROWS_TILE, 1])
+            normed_row_expand_mul = pl.row_expand_mul(value, inv_rms)
+            normed_fp32 = pl.cast(weight_row[0:1, 0:KDA_DIM], pl.FP32)
+            normed = pl.col_expand_mul(normed_row_expand_mul, normed_fp32)
+            gate_rows_tile = pl.slice(gate_rows, [OUTPUT_NORM_ROWS_TILE, KDA_DIM], [r0, 0], valid_shape=[rows, KDA_DIM])
+            gate = pl.cast(gate_rows_tile, pl.FP32)
+            gate_buffer = pl.create_tensor([OUTPUT_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
+            gate_buffer[:, :] = gate
+            gate_sigmoid = sigmoid_fp32(gate_buffer, OUTPUT_NORM_ROWS_TILE, KDA_DIM)
+            activated = pl.mul(normed, gate_sigmoid)
+            activated_bf16 = pl.cast(activated, pl.BF16, mode="rint")
+            gated_rows[r0 : r0 + OUTPUT_NORM_ROWS_TILE, 0:KDA_DIM] = pl.set_validshape(activated_bf16, rows, KDA_DIM)
     output_n_tiles = D // OUTPUT_PROJECTION_MM_N_TILE
     output_tasks = ((t_dim + PROJECTION_T_TILE - 1) // PROJECTION_T_TILE) * output_n_tiles
     output_workers = pl.min(output_tasks, PROJECTION_WORKERS_TILE)
@@ -694,19 +697,19 @@ def recurrent_kda(
         k_square = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
         q_square[:, :] = pl.mul(q_buffer, q_buffer)
         k_square[:, :] = pl.mul(k_buffer, k_buffer)
-        q_sum = accurate_row_sum(q_square)
-        k_sum = accurate_row_sum(k_square)
+        q_sum = pl.row_sum(q_square)
+        k_sum = pl.row_sum(k_square)
         q_squared_norm[:, :] = pl.add(q_sum, DECODE_L2_EPS)
         k_squared_norm[:, :] = pl.add(k_sum, DECODE_L2_EPS)
-        q_root = accurate_sqrt(q_squared_norm)
-        k_root = accurate_sqrt(k_squared_norm)
+        q_root = pl.sqrt(q_squared_norm)
+        k_root = pl.sqrt(k_squared_norm)
         q_denominator = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
         k_denominator = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
         ones = pl.full([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32, value=1.0)
         q_denominator[:, :] = pl.row_expand_mul(ones, q_root)
         k_denominator[:, :] = pl.row_expand_mul(ones, k_root)
-        q_unit = accurate_divide(q_buffer, q_denominator)
-        k_unit = accurate_divide(k_buffer, k_denominator)
+        q_unit = pl.div(q_buffer, q_denominator)
+        k_unit = pl.div(k_buffer, k_denominator)
         qn_gm[r0 : r0 + DECODE_NORM_ROWS_TILE, :] = pl.mul(q_unit, DECODE_Q_SCALE)
         kn_gm[r0 : r0 + DECODE_NORM_ROWS_TILE, :] = k_unit
     state_2d = pl.reshape(recurrent_state, [pl.tensor.dim(recurrent_state, 0) * LOCAL_KDA_H * KDA_DIM, KDA_DIM])
@@ -727,7 +730,7 @@ def recurrent_kda(
                 exp_buffer = pl.create_tensor([1, KDA_DIM], dtype=pl.FP32)
                 decay_tile = pl.slice(decay, [1, 1, KDA_DIM], [t, h, 0], drop_dims=[0])
                 exp_buffer[:, :] = pl.reshape(decay_tile, [1, KDA_DIM])
-                g_row = accurate_exp(exp_buffer)
+                g_row = pl.exp(exp_buffer)
                 beta_s = pl.read(beta, [t, h])
                 source_col = pl.min(step, 1) * (step + 1)
                 row = pl.cast(pl.read(state_rows, [request, source_col]), pl.INDEX)
@@ -742,7 +745,7 @@ def recurrent_kda(
                 decayed = pl.col_expand_mul(state_tile, g_row)
                 kv_buffer = pl.create_tensor([DECODE_V_TILE, KDA_DIM], dtype=pl.FP32)
                 kv_buffer[:, :] = pl.col_expand_mul(decayed, k_row)
-                kv_col = accurate_row_sum(kv_buffer)
+                kv_col = pl.row_sum(kv_buffer)
                 value_tile = pl.slice(value, [1, 1, DECODE_V_TILE], [t, h, v0], drop_dims=[0])
                 v_row_v4_rows = pl.reshape(value_tile, [1, DECODE_V_TILE])
                 v_row = pl.cast(v_row_v4_rows, pl.FP32)
@@ -765,7 +768,7 @@ def recurrent_kda(
                 # as the recurrent update.
                 out_products = pl.create_tensor([DECODE_V_TILE, KDA_DIM], dtype=pl.FP32)
                 out_products[:, :] = pl.col_expand_mul(updated, q_row)
-                out_sum = accurate_row_sum(out_products)
+                out_sum = pl.row_sum(out_products)
                 out_row = pl.reshape(out_sum, [1, DECODE_V_TILE])
                 ocol = h * KDA_DIM + v0
                 out_row_bf16 = pl.cast(out_row, pl.BF16, mode="rint")
@@ -930,11 +933,12 @@ def prefill_kda(
     agw_rows = LOCAL_KDA_H * scratch_rows
     zero_tiles = (agw_rows + CHUNK_TILE - 1) // CHUNK_TILE
     agw_gm = pl.create_tensor([LOCAL_KDA_H * scratch_rows, KDA_DIM], dtype=pl.FP32)
-    with pl.spmd(zero_tiles, name_hint="prefill_kda_zero") as zero_tid:
-        z0 = pl.tile.get_block_idx() * CHUNK_TILE
-        zrows = pl.min(CHUNK_TILE, agw_rows - z0)
-        agw_gm_value_full = pl.full([CHUNK_TILE, KDA_DIM], dtype=pl.FP32, value=0.0)
-        agw_gm[z0:z0 + CHUNK_TILE, 0:KDA_DIM] = pl.set_validshape(agw_gm_value_full, zrows, KDA_DIM)
+    with pl.spmd(pl.min(zero_tiles, AIV_WORKERS_TILE), name_hint="prefill_kda_zero") as zero_tid:
+        for prefill_kda_zero_partition in pl.range(pl.tile.get_block_idx(), zero_tiles, AIV_WORKERS_TILE):
+            z0 = prefill_kda_zero_partition * CHUNK_TILE
+            zrows = pl.min(CHUNK_TILE, agw_rows - z0)
+            agw_gm_value_full = pl.full([CHUNK_TILE, KDA_DIM], dtype=pl.FP32, value=0.0)
+            agw_gm[z0:z0 + CHUNK_TILE, 0:KDA_DIM] = pl.set_validshape(agw_gm_value_full, zrows, KDA_DIM)
     # The cumulative sum comes out of the cube in a boxed layout, whose subviews must
     # be whole inner blocks -- a single row of it is not addressable. Parking it in GM
     # and reading the pivot and last rows back is the way to get at them.
@@ -957,123 +961,124 @@ def prefill_kda(
     v_rows = pl.reshape(value, [t_dim, head_width])
     k_rows = pl.reshape(key, [t_dim, head_width])
     q_rows = pl.reshape(query, [t_dim, head_width])
-    with pl.spmd(LOCAL_KDA_H * requests, name_hint="prefill_kda_chunk", deps=[zero_tid]) as chunk_tid:
-        task = pl.tile.get_block_idx()
-        h = task // requests
-        n = task % requests
-        bos = pl.cast(pl.read(query_start_loc, [n]), pl.INDEX)
-        eos = pl.cast(pl.read(query_start_loc, [n + 1]), pl.INDEX)
-        length = eos - bos
+    with pl.spmd(pl.min(LOCAL_KDA_H * requests, MIX_WORKERS_TILE), name_hint="prefill_kda_chunk", deps=[zero_tid]) as chunk_tid:
+        for prefill_kda_chunk_partition in pl.range(pl.tile.get_block_idx(), LOCAL_KDA_H * requests, MIX_WORKERS_TILE):
+            task = prefill_kda_chunk_partition
+            h = task // requests
+            n = task % requests
+            bos = pl.cast(pl.read(query_start_loc, [n]), pl.INDEX)
+            eos = pl.cast(pl.read(query_start_loc, [n + 1]), pl.INDEX)
+            length = eos - bos
 
-        for s_idx in pl.range(0, length, CHUNK_TILE):
-            off = bos + s_idx
-            actual = pl.min(length - s_idx, CHUNK_TILE)
-            base = off + n * CHUNK_TILE
-            # Rows past the chunk's real length must read as zero, and valid_shape does
-            # not put them there: it marks which rows are real, while the tile still
-            # holds whatever the overread picked up -- which for a chunk that runs past
-            # the end of the packed stream is whatever follows it in GM. fillpad zeroes
-            # them explicitly. For the decay this is not hygiene but load-bearing: a
-            # zero pad keeps the cumulative sum flat, so its last row is still the
-            # chunk's true final decay, and the padded rows contribute nothing to the
-            # state update. Sequences that are a whole number of chunks never expose
-            # this; a ragged tail after a full chunk does.
-            # Zeroed, then declared valid to the full chunk. Both halves matter. The
-            # zeroing is load-bearing for the decay: a zero pad keeps the cumulative sum
-            # flat, so its last row is still the chunk's true final decay, and the pad
-            # rows contribute nothing to the state. Restoring the valid extent matters
-            # because these tiles end up as transposed matmul operands, and the cube
-            # lowers a transposed operand to an extract whose row count must be a
-            # multiple of 16 -- a ragged valid extent becomes exactly that row count.
-            # The simulator enforces neither, so both show up only on device.
-            col0 = h * KDA_DIM
-            q_raw_slice = pl.slice(q_rows, [CHUNK_TILE, KDA_DIM], [off, col0], valid_shape=[actual, KDA_DIM])
-            q_raw_fillpad = pl.fillpad(q_raw_slice, pad_value=pl.PadValue.zero)
-            q_raw_set_validshape = pl.set_validshape(q_raw_fillpad, CHUNK_TILE, KDA_DIM)
-            q_raw = pl.cast(q_raw_set_validshape, pl.FP32)
-            k_raw_slice = pl.slice(k_rows, [CHUNK_TILE, KDA_DIM], [off, col0], valid_shape=[actual, KDA_DIM])
-            k_raw_fillpad = pl.fillpad(k_raw_slice, pad_value=pl.PadValue.zero)
-            k_raw_set_validshape = pl.set_validshape(k_raw_fillpad, CHUNK_TILE, KDA_DIM)
-            k_raw = pl.cast(k_raw_set_validshape, pl.FP32)
-            v_c_slice = pl.slice(v_rows, [CHUNK_TILE, KDA_DIM], [off, col0], valid_shape=[actual, KDA_DIM])
-            v_c_fillpad = pl.fillpad(v_c_slice, pad_value=pl.PadValue.zero)
-            v_c = pl.set_validshape(v_c_fillpad, CHUNK_TILE, KDA_DIM)
-            g_c_slice = pl.slice(g_rows, [CHUNK_TILE, KDA_DIM], [off, col0], valid_shape=[actual, KDA_DIM])
-            g_c_fillpad = pl.fillpad(g_c_slice, pad_value=pl.PadValue.zero)
-            g_c = pl.set_validshape(g_c_fillpad, CHUNK_TILE, KDA_DIM)
+            for s_idx in pl.range(0, length, CHUNK_TILE):
+                off = bos + s_idx
+                actual = pl.min(length - s_idx, CHUNK_TILE)
+                base = off + n * CHUNK_TILE
+                # Rows past the chunk's real length must read as zero, and valid_shape does
+                # not put them there: it marks which rows are real, while the tile still
+                # holds whatever the overread picked up -- which for a chunk that runs past
+                # the end of the packed stream is whatever follows it in GM. fillpad zeroes
+                # them explicitly. For the decay this is not hygiene but load-bearing: a
+                # zero pad keeps the cumulative sum flat, so its last row is still the
+                # chunk's true final decay, and the padded rows contribute nothing to the
+                # state update. Sequences that are a whole number of chunks never expose
+                # this; a ragged tail after a full chunk does.
+                # Zeroed, then declared valid to the full chunk. Both halves matter. The
+                # zeroing is load-bearing for the decay: a zero pad keeps the cumulative sum
+                # flat, so its last row is still the chunk's true final decay, and the pad
+                # rows contribute nothing to the state. Restoring the valid extent matters
+                # because these tiles end up as transposed matmul operands, and the cube
+                # lowers a transposed operand to an extract whose row count must be a
+                # multiple of 16 -- a ragged valid extent becomes exactly that row count.
+                # The simulator enforces neither, so both show up only on device.
+                col0 = h * KDA_DIM
+                q_raw_slice = pl.slice(q_rows, [CHUNK_TILE, KDA_DIM], [off, col0], valid_shape=[actual, KDA_DIM])
+                q_raw_fillpad = pl.fillpad(q_raw_slice, pad_value=pl.PadValue.zero)
+                q_raw_set_validshape = pl.set_validshape(q_raw_fillpad, CHUNK_TILE, KDA_DIM)
+                q_raw = pl.cast(q_raw_set_validshape, pl.FP32)
+                k_raw_slice = pl.slice(k_rows, [CHUNK_TILE, KDA_DIM], [off, col0], valid_shape=[actual, KDA_DIM])
+                k_raw_fillpad = pl.fillpad(k_raw_slice, pad_value=pl.PadValue.zero)
+                k_raw_set_validshape = pl.set_validshape(k_raw_fillpad, CHUNK_TILE, KDA_DIM)
+                k_raw = pl.cast(k_raw_set_validshape, pl.FP32)
+                v_c_slice = pl.slice(v_rows, [CHUNK_TILE, KDA_DIM], [off, col0], valid_shape=[actual, KDA_DIM])
+                v_c_fillpad = pl.fillpad(v_c_slice, pad_value=pl.PadValue.zero)
+                v_c = pl.set_validshape(v_c_fillpad, CHUNK_TILE, KDA_DIM)
+                g_c_slice = pl.slice(g_rows, [CHUNK_TILE, KDA_DIM], [off, col0], valid_shape=[actual, KDA_DIM])
+                g_c_fillpad = pl.fillpad(g_c_slice, pad_value=pl.PadValue.zero)
+                g_c = pl.set_validshape(g_c_fillpad, CHUNK_TILE, KDA_DIM)
 
-            qf_gm_value_mul = pl.mul(q_raw, q_raw)
-            qf_gm_value_row_sum = pl.row_sum(qf_gm_value_mul)
-            qf_gm_value_add = pl.add(qf_gm_value_row_sum, PREFILL_L2_EPS)
-            qf_gm_value_rsqrt = pl.rsqrt(qf_gm_value_add, high_precision=True)
-            qf_gm_value_row_expand_mul = pl.row_expand_mul(q_raw, qf_gm_value_rsqrt)
-            qf_gm_value_mul_2 = pl.mul(qf_gm_value_row_expand_mul, PREFILL_Q_SCALE)
-            qf_gm[h:h + 1, base:base + CHUNK_TILE, 0:KDA_DIM] = pl.reshape(qf_gm_value_mul_2, [1, CHUNK_TILE, KDA_DIM])
-            kf_gm_value_mul = pl.mul(k_raw, k_raw)
-            kf_gm_value_row_sum = pl.row_sum(kf_gm_value_mul)
-            kf_gm_value_add = pl.add(kf_gm_value_row_sum, PREFILL_L2_EPS)
-            kf_gm_value_rsqrt = pl.rsqrt(kf_gm_value_add, high_precision=True)
-            kf_gm_value_row_expand_mul = pl.row_expand_mul(k_raw, kf_gm_value_rsqrt)
-            kf_gm[h:h + 1, base:base + CHUNK_TILE, 0:KDA_DIM] = pl.reshape(kf_gm_value_row_expand_mul, [1, CHUNK_TILE, KDA_DIM])
-            q_f_slice = pl.slice(qf_gm, [1, CHUNK_TILE, KDA_DIM], [h, base, 0], drop_dims=[0])
-            q_f = pl.reshape(q_f_slice, [CHUNK_TILE, KDA_DIM])
-            k_f_slice = pl.slice(kf_gm, [1, CHUNK_TILE, KDA_DIM], [h, base, 0], drop_dims=[0])
-            k_f = pl.reshape(k_f_slice, [CHUNK_TILE, KDA_DIM])
+                qf_gm_value_mul = pl.mul(q_raw, q_raw)
+                qf_gm_value_row_sum = pl.row_sum(qf_gm_value_mul)
+                qf_gm_value_add = pl.add(qf_gm_value_row_sum, PREFILL_L2_EPS)
+                qf_gm_value_rsqrt = pl.rsqrt(qf_gm_value_add, high_precision=False)
+                qf_gm_value_row_expand_mul = pl.row_expand_mul(q_raw, qf_gm_value_rsqrt)
+                qf_gm_value_mul_2 = pl.mul(qf_gm_value_row_expand_mul, PREFILL_Q_SCALE)
+                qf_gm[h:h + 1, base:base + CHUNK_TILE, 0:KDA_DIM] = pl.reshape(qf_gm_value_mul_2, [1, CHUNK_TILE, KDA_DIM])
+                kf_gm_value_mul = pl.mul(k_raw, k_raw)
+                kf_gm_value_row_sum = pl.row_sum(kf_gm_value_mul)
+                kf_gm_value_add = pl.add(kf_gm_value_row_sum, PREFILL_L2_EPS)
+                kf_gm_value_rsqrt = pl.rsqrt(kf_gm_value_add, high_precision=False)
+                kf_gm_value_row_expand_mul = pl.row_expand_mul(k_raw, kf_gm_value_rsqrt)
+                kf_gm[h:h + 1, base:base + CHUNK_TILE, 0:KDA_DIM] = pl.reshape(kf_gm_value_row_expand_mul, [1, CHUNK_TILE, KDA_DIM])
+                q_f_slice = pl.slice(qf_gm, [1, CHUNK_TILE, KDA_DIM], [h, base, 0], drop_dims=[0])
+                q_f = pl.reshape(q_f_slice, [CHUNK_TILE, KDA_DIM])
+                k_f_slice = pl.slice(kf_gm, [1, CHUNK_TILE, KDA_DIM], [h, base, 0], drop_dims=[0])
+                k_f = pl.reshape(k_f_slice, [CHUNK_TILE, KDA_DIM])
 
-            # Per-channel cumulative sum along the chunk axis, as one GEMM against the
-            # inclusive lower-triangular constant: the DSL has no scan primitive.
-            gcum_gm_value_matmul = pl.matmul(tri_incl[0:CHUNK_TILE, 0:CHUNK_TILE], g_c, pl.FP32)
-            gcum_gm[h:h + 1, base:base + CHUNK_TILE, 0:KDA_DIM] = pl.reshape(gcum_gm_value_matmul, [1, CHUNK_TILE, KDA_DIM])
-            gcum_slice = pl.slice(gcum_gm, [1, CHUNK_TILE, KDA_DIM], [h, base, 0], drop_dims=[0])
-            gcum = pl.reshape(gcum_slice, [CHUNK_TILE, KDA_DIM])
-            eg = pl.exp(gcum)
+                # Per-channel cumulative sum along the chunk axis, as one GEMM against the
+                # inclusive lower-triangular constant: the DSL has no scan primitive.
+                gcum_gm_value_matmul = pl.matmul(tri_incl[0:CHUNK_TILE, 0:CHUNK_TILE], g_c, pl.FP32)
+                gcum_gm[h:h + 1, base:base + CHUNK_TILE, 0:KDA_DIM] = pl.reshape(gcum_gm_value_matmul, [1, CHUNK_TILE, KDA_DIM])
+                gcum_slice = pl.slice(gcum_gm, [1, CHUNK_TILE, KDA_DIM], [h, base, 0], drop_dims=[0])
+                gcum = pl.reshape(gcum_slice, [CHUNK_TILE, KDA_DIM])
+                eg = pl.exp(gcum)
 
-            # Decay reconstructed around the chunk's first row, which is also its only
-            # pivot: CHUNK_TILE is DECAY_TILE. Rows are at or after the pivot, so row_dec's
-            # exponent is <= 0; the column factor's exponent is at most
-            # 5 * (CHUNK_TILE - 1) = 75 inside the chunk, so the clamp provably touches only
-            # the masked-out future. Both Gram matrices stay FP32 -- the decay's
-            # dynamic range rounds away in BF16.
-            gp = pl.reshape(pl.slice(gcum_gm, [1, 1, KDA_DIM], [h, base, 0], drop_dims=[0]), [1, KDA_DIM])
-            gp_full = pl.col_expand_mul(pl.full([CHUNK_TILE, KDA_DIM], dtype=pl.FP32, value=1.0), gp)
-            row_dec = pl.exp(pl.sub(gcum, gp_full))
-            ki_a = pl.mul(k_f, pl.exp(pl.minimum(pl.sub(gp_full, gcum), DECAY_CAP)))
-            a_full = pl.matmul(pl.mul(k_f, row_dec), ki_a, pl.FP32, b_trans=True)
-            a2_raw = pl.matmul(pl.mul(q_f, row_dec), ki_a, pl.FP32, b_trans=True)
+                # Decay reconstructed around the chunk's first row, which is also its only
+                # pivot: CHUNK_TILE is DECAY_TILE. Rows are at or after the pivot, so row_dec's
+                # exponent is <= 0; the column factor's exponent is at most
+                # 5 * (CHUNK_TILE - 1) = 75 inside the chunk, so the clamp provably touches only
+                # the masked-out future. Both Gram matrices stay FP32 -- the decay's
+                # dynamic range rounds away in BF16.
+                gp = pl.reshape(pl.slice(gcum_gm, [1, 1, KDA_DIM], [h, base, 0], drop_dims=[0]), [1, KDA_DIM])
+                gp_full = pl.col_expand_mul(pl.full([CHUNK_TILE, KDA_DIM], dtype=pl.FP32, value=1.0), gp)
+                row_dec = pl.exp(pl.sub(gcum, gp_full))
+                ki_a = pl.mul(k_f, pl.exp(pl.minimum(pl.sub(gp_full, gcum), DECAY_CAP)))
+                a_full = pl.matmul(pl.mul(k_f, row_dec), ki_a, pl.FP32, b_trans=True)
+                a2_raw = pl.matmul(pl.mul(q_f, row_dec), ki_a, pl.FP32, b_trans=True)
 
-            # beta as a column, straight out of a masked reduction. beta is stored one
-            # value per head in a 16-wide row, so selecting this head's column with a
-            # host-supplied one-hot and summing gives the column directly -- no
-            # transpose, and a reduction is the only way a column is a legal tile here.
-            beta_block_slice = pl.slice(beta, [CHUNK_TILE, BETA_PAD], [off, 0], valid_shape=[actual, BETA_PAD])
-            beta_block_fillpad = pl.fillpad(beta_block_slice, pad_value=pl.PadValue.zero)
-            beta_block = pl.set_validshape(beta_block_fillpad, CHUNK_TILE, BETA_PAD)
-            b_col = pl.row_sum(pl.col_expand_mul(beta_block, head_onehot[h : h + 1, 0:BETA_PAD]))
-            a_gram = pl.mul(pl.row_expand_mul(a_full, b_col), tri_strict[0:CHUNK_TILE, 0:CHUNK_TILE])
-            agram_gm[h:h + 1, base:base + CHUNK_TILE, 0:CHUNK_TILE] = pl.reshape(a_gram, [1, CHUNK_TILE, CHUNK_TILE])
-            a2_gm_value_mul = pl.mul(a2_raw, tri_incl[0:CHUNK_TILE, 0:CHUNK_TILE])
-            a2_gm_value_cast = pl.cast(a2_gm_value_mul, pl.BF16, mode="rint")
-            a2_gm[h:h + 1, base:base + CHUNK_TILE, 0:CHUNK_TILE] = pl.reshape(a2_gm_value_cast, [1, CHUNK_TILE, CHUNK_TILE])
-            qg_gm_value_mul = pl.mul(q_f, eg)
-            qg_gm_value_cast = pl.cast(qg_gm_value_mul, pl.BF16, mode="rint")
-            qg_gm[h:h + 1, base:base + CHUNK_TILE, 0:KDA_DIM] = pl.reshape(qg_gm_value_cast, [1, CHUNK_TILE, KDA_DIM])
-            # kg = k * exp(gcum) feeds W; kdec carries the chunk-final decay.
-            glast_slice = pl.slice(gcum_gm, [1, 1, KDA_DIM], [h, base + CHUNK_TILE - 1, 0], drop_dims=[0])
-            glast = pl.reshape(glast_slice, [1, KDA_DIM])
-            glast_full = pl.col_expand_mul(pl.full([CHUNK_TILE, KDA_DIM], dtype=pl.FP32, value=1.0), glast)
-            kdec_gm_value_sub = pl.sub(glast_full, gcum)
-            kdec_gm_value_exp = pl.exp(kdec_gm_value_sub)
-            kdec_gm_value_mul = pl.mul(k_f, kdec_gm_value_exp)
-            kdec_gm_value_cast = pl.cast(kdec_gm_value_mul, pl.BF16, mode="rint")
-            kdec_gm[h:h + 1, base:base + CHUNK_TILE, 0:KDA_DIM] = pl.reshape(kdec_gm_value_cast, [1, CHUNK_TILE, KDA_DIM])
-            eg_row = h * scratch_rows + base
-            eglast_gm[eg_row : eg_row + 1, 0:KDA_DIM] = pl.exp(glast)
-            kg_gm_value_mul = pl.mul(k_f, eg)
-            kg_gm_value_cast = pl.cast(kg_gm_value_mul, pl.BF16, mode="rint")
-            kg_gm[h:h + 1, base:base + CHUNK_TILE, 0:KDA_DIM] = pl.reshape(kg_gm_value_cast, [1, CHUNK_TILE, KDA_DIM])
+                # beta as a column, straight out of a masked reduction. beta is stored one
+                # value per head in a 16-wide row, so selecting this head's column with a
+                # host-supplied one-hot and summing gives the column directly -- no
+                # transpose, and a reduction is the only way a column is a legal tile here.
+                beta_block_slice = pl.slice(beta, [CHUNK_TILE, BETA_PAD], [off, 0], valid_shape=[actual, BETA_PAD])
+                beta_block_fillpad = pl.fillpad(beta_block_slice, pad_value=pl.PadValue.zero)
+                beta_block = pl.set_validshape(beta_block_fillpad, CHUNK_TILE, BETA_PAD)
+                b_col = pl.row_sum(pl.col_expand_mul(beta_block, head_onehot[h : h + 1, 0:BETA_PAD]))
+                a_gram = pl.mul(pl.row_expand_mul(a_full, b_col), tri_strict[0:CHUNK_TILE, 0:CHUNK_TILE])
+                agram_gm[h:h + 1, base:base + CHUNK_TILE, 0:CHUNK_TILE] = pl.reshape(a_gram, [1, CHUNK_TILE, CHUNK_TILE])
+                a2_gm_value_mul = pl.mul(a2_raw, tri_incl[0:CHUNK_TILE, 0:CHUNK_TILE])
+                a2_gm_value_cast = pl.cast(a2_gm_value_mul, pl.BF16, mode="rint")
+                a2_gm[h:h + 1, base:base + CHUNK_TILE, 0:CHUNK_TILE] = pl.reshape(a2_gm_value_cast, [1, CHUNK_TILE, CHUNK_TILE])
+                qg_gm_value_mul = pl.mul(q_f, eg)
+                qg_gm_value_cast = pl.cast(qg_gm_value_mul, pl.BF16, mode="rint")
+                qg_gm[h:h + 1, base:base + CHUNK_TILE, 0:KDA_DIM] = pl.reshape(qg_gm_value_cast, [1, CHUNK_TILE, KDA_DIM])
+                # kg = k * exp(gcum) feeds W; kdec carries the chunk-final decay.
+                glast_slice = pl.slice(gcum_gm, [1, 1, KDA_DIM], [h, base + CHUNK_TILE - 1, 0], drop_dims=[0])
+                glast = pl.reshape(glast_slice, [1, KDA_DIM])
+                glast_full = pl.col_expand_mul(pl.full([CHUNK_TILE, KDA_DIM], dtype=pl.FP32, value=1.0), glast)
+                kdec_gm_value_sub = pl.sub(glast_full, gcum)
+                kdec_gm_value_exp = pl.exp(kdec_gm_value_sub)
+                kdec_gm_value_mul = pl.mul(k_f, kdec_gm_value_exp)
+                kdec_gm_value_cast = pl.cast(kdec_gm_value_mul, pl.BF16, mode="rint")
+                kdec_gm[h:h + 1, base:base + CHUNK_TILE, 0:KDA_DIM] = pl.reshape(kdec_gm_value_cast, [1, CHUNK_TILE, KDA_DIM])
+                eg_row = h * scratch_rows + base
+                eglast_gm[eg_row : eg_row + 1, 0:KDA_DIM] = pl.exp(glast)
+                kg_gm_value_mul = pl.mul(k_f, eg)
+                kg_gm_value_cast = pl.cast(kg_gm_value_mul, pl.BF16, mode="rint")
+                kg_gm[h:h + 1, base:base + CHUNK_TILE, 0:KDA_DIM] = pl.reshape(kg_gm_value_cast, [1, CHUNK_TILE, KDA_DIM])
 
-            rb = h * scratch_rows + base
-            agw_gm[rb : rb + CHUNK_TILE, 0:CHUNK_TILE] = a_gram
+                rb = h * scratch_rows + base
+                agw_gm[rb : rb + CHUNK_TILE, 0:CHUNK_TILE] = a_gram
 
     # (I + A)^-1 as a finite series. A is strictly lower and therefore nilpotent with
     # A^CHUNK_TILE = 0, so (I + A)^-1 = sum_k (-A)^k, and the sum doubles its reach each
@@ -1097,131 +1102,137 @@ def prefill_kda(
 
     prod_gm = pl.create_tensor([LOCAL_KDA_H * scratch_rows, 5 * KDA_DIM], dtype=pl.FP32)
     estep_gm = pl.create_tensor([LOCAL_KDA_H * scratch_rows, 5 * KDA_DIM], dtype=pl.FP32)
-    with pl.spmd(LOCAL_KDA_H * requests, name_hint="prefill_kda_inv_seed", deps=[chunk_tid]) as seed_tid:
-        task = pl.tile.get_block_idx()
-        h = task // requests
-        n = task % requests
-        bos = pl.cast(pl.read(query_start_loc, [n]), pl.INDEX)
-        eos = pl.cast(pl.read(query_start_loc, [n + 1]), pl.INDEX)
-        length = eos - bos
-        for s_idx in pl.range(0, length, CHUNK_TILE):
-            off = bos + s_idx
-            base = off + n * CHUNK_TILE
-            rb = h * scratch_rows + base
-            estep_gm[rb:rb + CHUNK_TILE, 0:KDA_DIM] = pl.sub(eye_wide[0:CHUNK_TILE, 0:KDA_DIM], agw_gm[rb:rb + CHUNK_TILE, 0:KDA_DIM])
-            prod_gm[rb : rb + CHUNK_TILE, 0:KDA_DIM] = eye_wide[0:CHUNK_TILE, 0:KDA_DIM]
+    with pl.spmd(pl.min(LOCAL_KDA_H * requests, MIX_WORKERS_TILE), name_hint="prefill_kda_inv_seed", deps=[chunk_tid]) as seed_tid:
+        for prefill_kda_inv_seed_partition in pl.range(pl.tile.get_block_idx(), LOCAL_KDA_H * requests, MIX_WORKERS_TILE):
+            task = prefill_kda_inv_seed_partition
+            h = task // requests
+            n = task % requests
+            bos = pl.cast(pl.read(query_start_loc, [n]), pl.INDEX)
+            eos = pl.cast(pl.read(query_start_loc, [n + 1]), pl.INDEX)
+            length = eos - bos
+            for s_idx in pl.range(0, length, CHUNK_TILE):
+                off = bos + s_idx
+                base = off + n * CHUNK_TILE
+                rb = h * scratch_rows + base
+                estep_gm[rb:rb + CHUNK_TILE, 0:KDA_DIM] = pl.sub(eye_wide[0:CHUNK_TILE, 0:KDA_DIM], agw_gm[rb:rb + CHUNK_TILE, 0:KDA_DIM])
+                prod_gm[rb : rb + CHUNK_TILE, 0:KDA_DIM] = eye_wide[0:CHUNK_TILE, 0:KDA_DIM]
 
-    with pl.spmd(LOCAL_KDA_H * requests, name_hint="prefill_kda_inv0", deps=[seed_tid]) as inv0_tid:
-        task = pl.tile.get_block_idx()
-        h = task // requests
-        n = task % requests
-        bos = pl.cast(pl.read(query_start_loc, [n]), pl.INDEX)
-        eos = pl.cast(pl.read(query_start_loc, [n + 1]), pl.INDEX)
-        length = eos - bos
-        for s_idx in pl.range(0, length, CHUNK_TILE):
-            off = bos + s_idx
-            base = off + n * CHUNK_TILE
-            rb = h * scratch_rows + base
-            e16 = estep_gm[rb : rb + CHUNK_TILE, 0 : 0 + CHUNK_TILE]
-            e_wide = estep_gm[rb : rb + CHUNK_TILE, 0 : 0 + KDA_DIM]
-            two_eye = pl.mul(eye_wide[0:CHUNK_TILE, 0:KDA_DIM], 2.0)
-            prod_gm[rb:rb + CHUNK_TILE, 128:128 + KDA_DIM] = pl.matmul(e16, prod_gm[rb:rb + CHUNK_TILE, 0:0 + KDA_DIM], pl.FP32)
-            estep_gm_value_sub = pl.sub(e_wide, two_eye)
-            estep_gm_value_matmul = pl.matmul(e16, estep_gm_value_sub, pl.FP32)
-            estep_gm[rb:rb + CHUNK_TILE, 128:128 + KDA_DIM] = pl.add(estep_gm_value_matmul, two_eye)
+    with pl.spmd(pl.min(LOCAL_KDA_H * requests, MIX_WORKERS_TILE), name_hint="prefill_kda_inv0", deps=[seed_tid]) as inv0_tid:
+        for prefill_kda_inv0_partition in pl.range(pl.tile.get_block_idx(), LOCAL_KDA_H * requests, MIX_WORKERS_TILE):
+            task = prefill_kda_inv0_partition
+            h = task // requests
+            n = task % requests
+            bos = pl.cast(pl.read(query_start_loc, [n]), pl.INDEX)
+            eos = pl.cast(pl.read(query_start_loc, [n + 1]), pl.INDEX)
+            length = eos - bos
+            for s_idx in pl.range(0, length, CHUNK_TILE):
+                off = bos + s_idx
+                base = off + n * CHUNK_TILE
+                rb = h * scratch_rows + base
+                e16 = estep_gm[rb : rb + CHUNK_TILE, 0 : 0 + CHUNK_TILE]
+                e_wide = estep_gm[rb : rb + CHUNK_TILE, 0 : 0 + KDA_DIM]
+                two_eye = pl.mul(eye_wide[0:CHUNK_TILE, 0:KDA_DIM], 2.0)
+                prod_gm[rb:rb + CHUNK_TILE, 128:128 + KDA_DIM] = pl.matmul(e16, prod_gm[rb:rb + CHUNK_TILE, 0:0 + KDA_DIM], pl.FP32)
+                estep_gm_value_sub = pl.sub(e_wide, two_eye)
+                estep_gm_value_matmul = pl.matmul(e16, estep_gm_value_sub, pl.FP32)
+                estep_gm[rb:rb + CHUNK_TILE, 128:128 + KDA_DIM] = pl.add(estep_gm_value_matmul, two_eye)
 
-    with pl.spmd(LOCAL_KDA_H * requests, name_hint="prefill_kda_inv1", deps=[inv0_tid]) as inv1_tid:
-        task = pl.tile.get_block_idx()
-        h = task // requests
-        n = task % requests
-        bos = pl.cast(pl.read(query_start_loc, [n]), pl.INDEX)
-        eos = pl.cast(pl.read(query_start_loc, [n + 1]), pl.INDEX)
-        length = eos - bos
-        for s_idx in pl.range(0, length, CHUNK_TILE):
-            off = bos + s_idx
-            base = off + n * CHUNK_TILE
-            rb = h * scratch_rows + base
-            e16 = estep_gm[rb : rb + CHUNK_TILE, 128 : 128 + CHUNK_TILE]
-            e_wide = estep_gm[rb : rb + CHUNK_TILE, 128 : 128 + KDA_DIM]
-            two_eye = pl.mul(eye_wide[0:CHUNK_TILE, 0:KDA_DIM], 2.0)
-            prod_gm[rb:rb + CHUNK_TILE, 256:256 + KDA_DIM] = pl.matmul(e16, prod_gm[rb:rb + CHUNK_TILE, 128:128 + KDA_DIM], pl.FP32)
-            estep_gm_value_sub_2 = pl.sub(e_wide, two_eye)
-            estep_gm_value_matmul_2 = pl.matmul(e16, estep_gm_value_sub_2, pl.FP32)
-            estep_gm[rb:rb + CHUNK_TILE, 256:256 + KDA_DIM] = pl.add(estep_gm_value_matmul_2, two_eye)
+    with pl.spmd(pl.min(LOCAL_KDA_H * requests, MIX_WORKERS_TILE), name_hint="prefill_kda_inv1", deps=[inv0_tid]) as inv1_tid:
+        for prefill_kda_inv1_partition in pl.range(pl.tile.get_block_idx(), LOCAL_KDA_H * requests, MIX_WORKERS_TILE):
+            task = prefill_kda_inv1_partition
+            h = task // requests
+            n = task % requests
+            bos = pl.cast(pl.read(query_start_loc, [n]), pl.INDEX)
+            eos = pl.cast(pl.read(query_start_loc, [n + 1]), pl.INDEX)
+            length = eos - bos
+            for s_idx in pl.range(0, length, CHUNK_TILE):
+                off = bos + s_idx
+                base = off + n * CHUNK_TILE
+                rb = h * scratch_rows + base
+                e16 = estep_gm[rb : rb + CHUNK_TILE, 128 : 128 + CHUNK_TILE]
+                e_wide = estep_gm[rb : rb + CHUNK_TILE, 128 : 128 + KDA_DIM]
+                two_eye = pl.mul(eye_wide[0:CHUNK_TILE, 0:KDA_DIM], 2.0)
+                prod_gm[rb:rb + CHUNK_TILE, 256:256 + KDA_DIM] = pl.matmul(e16, prod_gm[rb:rb + CHUNK_TILE, 128:128 + KDA_DIM], pl.FP32)
+                estep_gm_value_sub_2 = pl.sub(e_wide, two_eye)
+                estep_gm_value_matmul_2 = pl.matmul(e16, estep_gm_value_sub_2, pl.FP32)
+                estep_gm[rb:rb + CHUNK_TILE, 256:256 + KDA_DIM] = pl.add(estep_gm_value_matmul_2, two_eye)
 
-    with pl.spmd(LOCAL_KDA_H * requests, name_hint="prefill_kda_inv2", deps=[inv1_tid]) as inv2_tid:
-        task = pl.tile.get_block_idx()
-        h = task // requests
-        n = task % requests
-        bos = pl.cast(pl.read(query_start_loc, [n]), pl.INDEX)
-        eos = pl.cast(pl.read(query_start_loc, [n + 1]), pl.INDEX)
-        length = eos - bos
-        for s_idx in pl.range(0, length, CHUNK_TILE):
-            off = bos + s_idx
-            base = off + n * CHUNK_TILE
-            rb = h * scratch_rows + base
-            e16 = estep_gm[rb : rb + CHUNK_TILE, 256 : 256 + CHUNK_TILE]
-            e_wide = estep_gm[rb : rb + CHUNK_TILE, 256 : 256 + KDA_DIM]
-            two_eye = pl.mul(eye_wide[0:CHUNK_TILE, 0:KDA_DIM], 2.0)
-            prod_gm[rb:rb + CHUNK_TILE, 384:384 + KDA_DIM] = pl.matmul(e16, prod_gm[rb:rb + CHUNK_TILE, 256:256 + KDA_DIM], pl.FP32)
-            estep_gm_value_sub_3 = pl.sub(e_wide, two_eye)
-            estep_gm_value_matmul_3 = pl.matmul(e16, estep_gm_value_sub_3, pl.FP32)
-            estep_gm[rb:rb + CHUNK_TILE, 384:384 + KDA_DIM] = pl.add(estep_gm_value_matmul_3, two_eye)
+    with pl.spmd(pl.min(LOCAL_KDA_H * requests, MIX_WORKERS_TILE), name_hint="prefill_kda_inv2", deps=[inv1_tid]) as inv2_tid:
+        for prefill_kda_inv2_partition in pl.range(pl.tile.get_block_idx(), LOCAL_KDA_H * requests, MIX_WORKERS_TILE):
+            task = prefill_kda_inv2_partition
+            h = task // requests
+            n = task % requests
+            bos = pl.cast(pl.read(query_start_loc, [n]), pl.INDEX)
+            eos = pl.cast(pl.read(query_start_loc, [n + 1]), pl.INDEX)
+            length = eos - bos
+            for s_idx in pl.range(0, length, CHUNK_TILE):
+                off = bos + s_idx
+                base = off + n * CHUNK_TILE
+                rb = h * scratch_rows + base
+                e16 = estep_gm[rb : rb + CHUNK_TILE, 256 : 256 + CHUNK_TILE]
+                e_wide = estep_gm[rb : rb + CHUNK_TILE, 256 : 256 + KDA_DIM]
+                two_eye = pl.mul(eye_wide[0:CHUNK_TILE, 0:KDA_DIM], 2.0)
+                prod_gm[rb:rb + CHUNK_TILE, 384:384 + KDA_DIM] = pl.matmul(e16, prod_gm[rb:rb + CHUNK_TILE, 256:256 + KDA_DIM], pl.FP32)
+                estep_gm_value_sub_3 = pl.sub(e_wide, two_eye)
+                estep_gm_value_matmul_3 = pl.matmul(e16, estep_gm_value_sub_3, pl.FP32)
+                estep_gm[rb:rb + CHUNK_TILE, 384:384 + KDA_DIM] = pl.add(estep_gm_value_matmul_3, two_eye)
 
-    with pl.spmd(LOCAL_KDA_H * requests, name_hint="prefill_kda_inv3", deps=[inv2_tid]) as inv3_tid:
-        task = pl.tile.get_block_idx()
-        h = task // requests
-        n = task % requests
-        bos = pl.cast(pl.read(query_start_loc, [n]), pl.INDEX)
-        eos = pl.cast(pl.read(query_start_loc, [n + 1]), pl.INDEX)
-        length = eos - bos
-        for s_idx in pl.range(0, length, CHUNK_TILE):
-            off = bos + s_idx
-            base = off + n * CHUNK_TILE
-            rb = h * scratch_rows + base
-            e16 = estep_gm[rb : rb + CHUNK_TILE, 384 : 384 + CHUNK_TILE]
-            e_wide = estep_gm[rb : rb + CHUNK_TILE, 384 : 384 + KDA_DIM]
-            two_eye = pl.mul(eye_wide[0:CHUNK_TILE, 0:KDA_DIM], 2.0)
-            prod_gm[rb:rb + CHUNK_TILE, 512:512 + KDA_DIM] = pl.matmul(e16, prod_gm[rb:rb + CHUNK_TILE, 384:384 + KDA_DIM], pl.FP32)
-            estep_gm_value_sub_4 = pl.sub(e_wide, two_eye)
-            estep_gm_value_matmul_4 = pl.matmul(e16, estep_gm_value_sub_4, pl.FP32)
-            estep_gm[rb:rb + CHUNK_TILE, 512:512 + KDA_DIM] = pl.add(estep_gm_value_matmul_4, two_eye)
+    with pl.spmd(pl.min(LOCAL_KDA_H * requests, MIX_WORKERS_TILE), name_hint="prefill_kda_inv3", deps=[inv2_tid]) as inv3_tid:
+        for prefill_kda_inv3_partition in pl.range(pl.tile.get_block_idx(), LOCAL_KDA_H * requests, MIX_WORKERS_TILE):
+            task = prefill_kda_inv3_partition
+            h = task // requests
+            n = task % requests
+            bos = pl.cast(pl.read(query_start_loc, [n]), pl.INDEX)
+            eos = pl.cast(pl.read(query_start_loc, [n + 1]), pl.INDEX)
+            length = eos - bos
+            for s_idx in pl.range(0, length, CHUNK_TILE):
+                off = bos + s_idx
+                base = off + n * CHUNK_TILE
+                rb = h * scratch_rows + base
+                e16 = estep_gm[rb : rb + CHUNK_TILE, 384 : 384 + CHUNK_TILE]
+                e_wide = estep_gm[rb : rb + CHUNK_TILE, 384 : 384 + KDA_DIM]
+                two_eye = pl.mul(eye_wide[0:CHUNK_TILE, 0:KDA_DIM], 2.0)
+                prod_gm[rb:rb + CHUNK_TILE, 512:512 + KDA_DIM] = pl.matmul(e16, prod_gm[rb:rb + CHUNK_TILE, 384:384 + KDA_DIM], pl.FP32)
+                estep_gm_value_sub_4 = pl.sub(e_wide, two_eye)
+                estep_gm_value_matmul_4 = pl.matmul(e16, estep_gm_value_sub_4, pl.FP32)
+                estep_gm[rb:rb + CHUNK_TILE, 512:512 + KDA_DIM] = pl.add(estep_gm_value_matmul_4, two_eye)
 
     u_gm = pl.create_tensor([LOCAL_KDA_H, scratch_rows, KDA_DIM], dtype=pl.FP32)
     w_gm = pl.create_tensor([LOCAL_KDA_H, scratch_rows, KDA_DIM], dtype=pl.BF16)
-    with pl.spmd(LOCAL_KDA_H * requests, name_hint="prefill_kda_wu", deps=[inv3_tid]) as wu_tid:
-        task = pl.tile.get_block_idx()
-        h = task // requests
-        n = task % requests
-        bos = pl.cast(pl.read(query_start_loc, [n]), pl.INDEX)
-        eos = pl.cast(pl.read(query_start_loc, [n + 1]), pl.INDEX)
-        length = eos - bos
-        for s_idx in pl.range(0, length, CHUNK_TILE):
-            off = bos + s_idx
-            base = off + n * CHUNK_TILE
-            rb = h * scratch_rows + base
-            actual = pl.min(length - s_idx, CHUNK_TILE)
-            col0 = h * KDA_DIM
-            # W = A^-1 (beta . kg) and U = A^-1 (beta . v). Scaling the inverse's
-            # columns by beta is the same as scaling the rows of what it multiplies.
-            beta_block_slice_2 = pl.slice(beta, [CHUNK_TILE, BETA_PAD], [off, 0], valid_shape=[actual, BETA_PAD])
-            beta_block_fillpad_2 = pl.fillpad(beta_block_slice_2, pad_value=pl.PadValue.zero)
-            beta_block = pl.set_validshape(beta_block_fillpad_2, CHUNK_TILE, BETA_PAD)
-            b_col = pl.row_sum(pl.col_expand_mul(beta_block, head_onehot[h : h + 1, 0:BETA_PAD]))
-            a_inv_bf = pl.cast(prod_gm[rb:rb + CHUNK_TILE, 4 * KDA_DIM:4 * KDA_DIM + CHUNK_TILE], pl.BF16, mode="rint")
-            kg_bf_slice = pl.slice(kg_gm, [1, CHUNK_TILE, KDA_DIM], [h, base, 0], drop_dims=[0])
-            kg_bf_reshape = pl.reshape(kg_bf_slice, [CHUNK_TILE, KDA_DIM])
-            kg_bf_row_expand_mul = pl.row_expand_mul(pl.cast(kg_bf_reshape, pl.FP32), b_col)
-            kg_bf = pl.cast(kg_bf_row_expand_mul, pl.BF16, mode="rint")
-            w_gm_value_matmul = pl.matmul(a_inv_bf, kg_bf, pl.FP32)
-            w_gm_value_cast = pl.cast(w_gm_value_matmul, pl.BF16, mode="rint")
-            w_gm[h:h + 1, base:base + CHUNK_TILE, 0:KDA_DIM] = pl.reshape(w_gm_value_cast, [1, CHUNK_TILE, KDA_DIM])
-            v_c_slice_2 = pl.slice(v_rows, [CHUNK_TILE, KDA_DIM], [off, col0], valid_shape=[actual, KDA_DIM])
-            v_c_fillpad_2 = pl.fillpad(v_c_slice_2, pad_value=pl.PadValue.zero)
-            v_c = pl.set_validshape(v_c_fillpad_2, CHUNK_TILE, KDA_DIM)
-            v_beta = pl.cast(pl.row_expand_mul(pl.cast(v_c, pl.FP32), b_col), pl.BF16, mode="rint")
-            u_gm_value_matmul = pl.matmul(a_inv_bf, v_beta, pl.FP32)
-            u_gm[h:h + 1, base:base + CHUNK_TILE, 0:KDA_DIM] = pl.reshape(u_gm_value_matmul, [1, CHUNK_TILE, KDA_DIM])
+    with pl.spmd(pl.min(LOCAL_KDA_H * requests, MIX_WORKERS_TILE), name_hint="prefill_kda_wu", deps=[inv3_tid]) as wu_tid:
+        for prefill_kda_wu_partition in pl.range(pl.tile.get_block_idx(), LOCAL_KDA_H * requests, MIX_WORKERS_TILE):
+            task = prefill_kda_wu_partition
+            h = task // requests
+            n = task % requests
+            bos = pl.cast(pl.read(query_start_loc, [n]), pl.INDEX)
+            eos = pl.cast(pl.read(query_start_loc, [n + 1]), pl.INDEX)
+            length = eos - bos
+            for s_idx in pl.range(0, length, CHUNK_TILE):
+                off = bos + s_idx
+                base = off + n * CHUNK_TILE
+                rb = h * scratch_rows + base
+                actual = pl.min(length - s_idx, CHUNK_TILE)
+                col0 = h * KDA_DIM
+                # W = A^-1 (beta . kg) and U = A^-1 (beta . v). Scaling the inverse's
+                # columns by beta is the same as scaling the rows of what it multiplies.
+                beta_block_slice_2 = pl.slice(beta, [CHUNK_TILE, BETA_PAD], [off, 0], valid_shape=[actual, BETA_PAD])
+                beta_block_fillpad_2 = pl.fillpad(beta_block_slice_2, pad_value=pl.PadValue.zero)
+                beta_block = pl.set_validshape(beta_block_fillpad_2, CHUNK_TILE, BETA_PAD)
+                b_col = pl.row_sum(pl.col_expand_mul(beta_block, head_onehot[h : h + 1, 0:BETA_PAD]))
+                a_inv_bf = pl.cast(prod_gm[rb:rb + CHUNK_TILE, 4 * KDA_DIM:4 * KDA_DIM + CHUNK_TILE], pl.BF16, mode="rint")
+                kg_bf_slice = pl.slice(kg_gm, [1, CHUNK_TILE, KDA_DIM], [h, base, 0], drop_dims=[0])
+                kg_bf_reshape = pl.reshape(kg_bf_slice, [CHUNK_TILE, KDA_DIM])
+                kg_bf_row_expand_mul = pl.row_expand_mul(pl.cast(kg_bf_reshape, pl.FP32), b_col)
+                kg_bf = pl.cast(kg_bf_row_expand_mul, pl.BF16, mode="rint")
+                w_gm_value_matmul = pl.matmul(a_inv_bf, kg_bf, pl.FP32)
+                w_gm_value_cast = pl.cast(w_gm_value_matmul, pl.BF16, mode="rint")
+                w_gm[h:h + 1, base:base + CHUNK_TILE, 0:KDA_DIM] = pl.reshape(w_gm_value_cast, [1, CHUNK_TILE, KDA_DIM])
+                v_c_slice_2 = pl.slice(v_rows, [CHUNK_TILE, KDA_DIM], [off, col0], valid_shape=[actual, KDA_DIM])
+                v_c_fillpad_2 = pl.fillpad(v_c_slice_2, pad_value=pl.PadValue.zero)
+                v_c = pl.set_validshape(v_c_fillpad_2, CHUNK_TILE, KDA_DIM)
+                v_beta = pl.cast(pl.row_expand_mul(pl.cast(v_c, pl.FP32), b_col), pl.BF16, mode="rint")
+                u_gm_value_matmul = pl.matmul(a_inv_bf, v_beta, pl.FP32)
+                u_gm[h:h + 1, base:base + CHUNK_TILE, 0:KDA_DIM] = pl.reshape(u_gm_value_matmul, [1, CHUNK_TILE, KDA_DIM])
     # --- pass 2: the sequential scan over chunks, tiled over the value axis ---
     lanes = KDA_DIM // PREFILL_V_TILE
     # Two slots per task, alternating by chunk. Reading and writing one buffer inside
@@ -1232,75 +1243,89 @@ def prefill_kda(
     state_pool_rows = pl.tensor.dim(recurrent_state, 0)
     state_2d = pl.reshape(recurrent_state, [state_pool_rows * LOCAL_KDA_H * KDA_DIM, KDA_DIM])
     out_rows = pl.reshape(output, [t_dim, head_width])
-    with pl.spmd(LOCAL_KDA_H * requests * lanes, name_hint="prefill_kda_scan", deps=[wu_tid]):
-        task = pl.tile.get_block_idx()
-        h = task // (requests * lanes)
-        n = (task // lanes) % requests
-        v0 = (task % lanes) * PREFILL_V_TILE
-        bos = pl.cast(pl.read(query_start_loc, [n]), pl.INDEX)
-        eos = pl.cast(pl.read(query_start_loc, [n + 1]), pl.INDEX)
-        length = eos - bos
-        row = pl.cast(pl.read(state_rows, [n, 0]), pl.INDEX)
+    # Stage carried states for nonempty requests before the mixed scan.
+    with pl.spmd(pl.min(LOCAL_KDA_H * requests * lanes, AIV_WORKERS_TILE), name_hint="prefill_kda_scan_seed", deps=[wu_tid]) as scan_seed_tid:
+        for seed_partition in pl.range(pl.tile.get_block_idx(), LOCAL_KDA_H * requests * lanes, AIV_WORKERS_TILE):
+            seed_request = seed_partition // (LOCAL_KDA_H * lanes)
+            seed_head = seed_partition % (LOCAL_KDA_H * lanes) // lanes
+            seed_lane = seed_partition % lanes
+            seed_begin = pl.read(query_start_loc, [seed_request])
+            seed_end = pl.read(query_start_loc, [seed_request + 1])
+            if seed_end > seed_begin:
+                seed_source = pl.cast(pl.read(state_rows, [seed_request, 0]), pl.INDEX)
+                seed_pool_row = (seed_source * LOCAL_KDA_H + seed_head) * KDA_DIM + seed_lane * PREFILL_V_TILE
+                seed_task = (seed_head * requests + seed_request) * lanes + seed_lane
+                seed_slot = seed_task * 2 * PREFILL_V_TILE
+                seed_value = state_2d[seed_pool_row:seed_pool_row + PREFILL_V_TILE, 0:KDA_DIM]
+                state_gm[seed_slot:seed_slot + PREFILL_V_TILE, 0:KDA_DIM] = seed_value
+    with pl.spmd(pl.min(LOCAL_KDA_H * requests * lanes, MIX_WORKERS_TILE), name_hint="prefill_kda_scan", deps=[scan_seed_tid]):
+        for scan_partition in pl.range(pl.tile.get_block_idx(), LOCAL_KDA_H * requests * lanes, MIX_WORKERS_TILE):
+            request_major = scan_partition
+            request_slot = request_major // (LOCAL_KDA_H * lanes)
+            head_slot = request_major % (LOCAL_KDA_H * lanes) // lanes
+            value_slot = request_major % lanes
+            task = (head_slot * requests + request_slot) * lanes + value_slot
+            h = task // (requests * lanes)
+            n = (task // lanes) % requests
+            v0 = (task % lanes) * PREFILL_V_TILE
+            bos = pl.cast(pl.read(query_start_loc, [n]), pl.INDEX)
+            eos = pl.cast(pl.read(query_start_loc, [n + 1]), pl.INDEX)
+            length = eos - bos
 
-        # The scan runs in the pool's own [V, K] orientation. The recurrence is natural
-        # in [K, V], but every re-orientation it needs is a matmul operand flag, and
-        # keeping [V, K] means the seed and the flush are plain copies. That matters
-        # beyond tidiness: the transpose instruction constrains both of its row counts
-        # to multiples of 16, which the simulator does not check and the device does.
-        pool_row = (row * LOCAL_KDA_H + h) * KDA_DIM + v0
-        seed = state_2d[pool_row:pool_row + PREFILL_V_TILE, 0:KDA_DIM]
-        slot0 = task * 2 * PREFILL_V_TILE
-        state_gm[slot0 : slot0 + PREFILL_V_TILE, 0:KDA_DIM] = seed
+            # The scan runs in the pool's own [V, K] orientation. The recurrence is natural
+            # in [K, V], but every re-orientation it needs is a matmul operand flag, and
+            # keeping [V, K] means the seed and the flush are plain copies. That matters
+            # beyond tidiness: the transpose instruction constrains both of its row counts
+            # to multiples of 16, which the simulator does not check and the device does.
+            for s_idx in pl.range(0, length, CHUNK_TILE):
+                off = bos + s_idx
+                actual = pl.min(length - s_idx, CHUNK_TILE)
+                base = off + n * CHUNK_TILE
+                chunk_idx = s_idx // CHUNK_TILE
+                src = chunk_idx % 2
+                dst = (chunk_idx + 1) % 2
+                s_cur = state_gm[(task * 2 + src) * PREFILL_V_TILE:(task * 2 + src) * PREFILL_V_TILE + PREFILL_V_TILE, 0:KDA_DIM]
+                s_bf = pl.cast(s_cur, pl.BF16, mode="rint")
+                w_c_slice = pl.slice(w_gm, [1, CHUNK_TILE, KDA_DIM], [h, base, 0], drop_dims=[0])
+                w_c = pl.reshape(w_c_slice, [CHUNK_TILE, KDA_DIM])
+                u_c_slice = pl.slice(u_gm, [1, CHUNK_TILE, PREFILL_V_TILE], [h, base, v0], drop_dims=[0])
+                u_c = pl.reshape(u_c_slice, [CHUNK_TILE, PREFILL_V_TILE])
+                # v' = U - W S: the part of the chunk's values the carried state already
+                # explains.
+                vi = pl.sub(u_c, pl.matmul(w_c, s_bf, pl.FP32, b_trans=True))
+                vi_bf = pl.cast(vi, pl.BF16, mode="rint")
+                qg_c_slice = pl.slice(qg_gm, [1, CHUNK_TILE, KDA_DIM], [h, base, 0], drop_dims=[0])
+                qg_c = pl.reshape(qg_c_slice, [CHUNK_TILE, KDA_DIM])
+                a2_c_slice = pl.slice(a2_gm, [1, CHUNK_TILE, CHUNK_TILE], [h, base, 0], drop_dims=[0])
+                a2_c = pl.reshape(a2_c_slice, [CHUNK_TILE, CHUNK_TILE])
+                oc = pl.add(pl.matmul(qg_c, s_bf, pl.FP32, b_trans=True), pl.matmul(a2_c, vi_bf, pl.FP32))
+                ocol = h * KDA_DIM + v0
+                out_rows[off:off + CHUNK_TILE, ocol:ocol + PREFILL_V_TILE] = pl.set_validshape(pl.cast(oc, pl.BF16, mode="rint"), actual, PREFILL_V_TILE)
 
-        for s_idx in pl.range(0, length, CHUNK_TILE):
-            off = bos + s_idx
-            actual = pl.min(length - s_idx, CHUNK_TILE)
-            base = off + n * CHUNK_TILE
-            chunk_idx = s_idx // CHUNK_TILE
-            src = chunk_idx % 2
-            dst = (chunk_idx + 1) % 2
-            s_cur = state_gm[(task * 2 + src) * PREFILL_V_TILE:(task * 2 + src) * PREFILL_V_TILE + PREFILL_V_TILE, 0:KDA_DIM]
-            s_bf = pl.cast(s_cur, pl.BF16, mode="rint")
-            w_c_slice = pl.slice(w_gm, [1, CHUNK_TILE, KDA_DIM], [h, base, 0], drop_dims=[0])
-            w_c = pl.reshape(w_c_slice, [CHUNK_TILE, KDA_DIM])
-            u_c_slice = pl.slice(u_gm, [1, CHUNK_TILE, PREFILL_V_TILE], [h, base, v0], drop_dims=[0])
-            u_c = pl.reshape(u_c_slice, [CHUNK_TILE, PREFILL_V_TILE])
-            # v' = U - W S: the part of the chunk's values the carried state already
-            # explains.
-            vi = pl.sub(u_c, pl.matmul(w_c, s_bf, pl.FP32, b_trans=True))
-            vi_bf = pl.cast(vi, pl.BF16, mode="rint")
-            qg_c_slice = pl.slice(qg_gm, [1, CHUNK_TILE, KDA_DIM], [h, base, 0], drop_dims=[0])
-            qg_c = pl.reshape(qg_c_slice, [CHUNK_TILE, KDA_DIM])
-            a2_c_slice = pl.slice(a2_gm, [1, CHUNK_TILE, CHUNK_TILE], [h, base, 0], drop_dims=[0])
-            a2_c = pl.reshape(a2_c_slice, [CHUNK_TILE, CHUNK_TILE])
-            oc = pl.add(pl.matmul(qg_c, s_bf, pl.FP32, b_trans=True), pl.matmul(a2_c, vi_bf, pl.FP32))
-            ocol = h * KDA_DIM + v0
-            out_rows[off:off + CHUNK_TILE, ocol:ocol + PREFILL_V_TILE] = pl.set_validshape(pl.cast(oc, pl.BF16, mode="rint"), actual, PREFILL_V_TILE)
+                kdec_c_slice = pl.slice(kdec_gm, [1, CHUNK_TILE, KDA_DIM], [h, base, 0], drop_dims=[0])
+                kdec_c = pl.reshape(kdec_c_slice, [CHUNK_TILE, KDA_DIM])
+                # In [V, K] the chunk-final decay is a per-column factor, so it applies as
+                # the row it already is.
+                eglast_row = eglast_gm[h * scratch_rows + base:h * scratch_rows + base + 1, 0:KDA_DIM]
+                d_row = (task * 2 + dst) * PREFILL_V_TILE
+                state_gm_value_col_expand_mul = pl.col_expand_mul(s_cur, eglast_row)
+                state_gm_value_matmul = pl.matmul(vi_bf, kdec_c, pl.FP32, a_trans=True)
+                state_gm[d_row:d_row + PREFILL_V_TILE, 0:KDA_DIM] = pl.add(state_gm_value_col_expand_mul, state_gm_value_matmul)
 
-            kdec_c_slice = pl.slice(kdec_gm, [1, CHUNK_TILE, KDA_DIM], [h, base, 0], drop_dims=[0])
-            kdec_c = pl.reshape(kdec_c_slice, [CHUNK_TILE, KDA_DIM])
-            # In [V, K] the chunk-final decay is a per-column factor, so it applies as
-            # the row it already is.
-            eglast_row = eglast_gm[h * scratch_rows + base:h * scratch_rows + base + 1, 0:KDA_DIM]
-            d_row = (task * 2 + dst) * PREFILL_V_TILE
-            state_gm_value_col_expand_mul = pl.col_expand_mul(s_cur, eglast_row)
-            state_gm_value_matmul = pl.matmul(vi_bf, kdec_c, pl.FP32, a_trans=True)
-            state_gm[d_row:d_row + PREFILL_V_TILE, 0:KDA_DIM] = pl.add(state_gm_value_col_expand_mul, state_gm_value_matmul)
+                state_row = pl.cast(pl.read(state_rows, [n, 2 + s_idx // CHUNK_TILE]), pl.INDEX)
+                if state_row >= 0:
+                    checkpoint_row = (state_row * LOCAL_KDA_H + h) * KDA_DIM + v0
+                    chunk_state = state_gm[d_row:d_row + PREFILL_V_TILE, 0:KDA_DIM]
+                    state_2d[checkpoint_row:checkpoint_row + PREFILL_V_TILE, 0:KDA_DIM] = chunk_state
 
-            state_row = pl.cast(pl.read(state_rows, [n, 2 + s_idx // CHUNK_TILE]), pl.INDEX)
-            if state_row >= 0:
-                checkpoint_row = (state_row * LOCAL_KDA_H + h) * KDA_DIM + v0
-                chunk_state = state_gm[d_row:d_row + PREFILL_V_TILE, 0:KDA_DIM]
-                state_2d[checkpoint_row:checkpoint_row + PREFILL_V_TILE, 0:KDA_DIM] = chunk_state
-
-        # Flush the private working row.
-        chunks = (length + CHUNK_TILE - 1) // CHUNK_TILE
-        last = chunks % 2
-        final = state_gm[(task * 2 + last) * PREFILL_V_TILE:(task * 2 + last) * PREFILL_V_TILE + PREFILL_V_TILE, 0:KDA_DIM]
-        if length > 0:
-            working_row = pl.cast(pl.read(state_rows, [n, 1]), pl.INDEX)
-            output_row = (working_row * LOCAL_KDA_H + h) * KDA_DIM + v0
-            state_2d[output_row:output_row + PREFILL_V_TILE, 0:KDA_DIM] = final
+            if length > 0:
+                # Flush the private working row.
+                chunks = (length + CHUNK_TILE - 1) // CHUNK_TILE
+                last = chunks % 2
+                final = state_gm[(task * 2 + last) * PREFILL_V_TILE:(task * 2 + last) * PREFILL_V_TILE + PREFILL_V_TILE, 0:KDA_DIM]
+                working_row = pl.cast(pl.read(state_rows, [n, 1]), pl.INDEX)
+                output_row = (working_row * LOCAL_KDA_H + h) * KDA_DIM + v0
+                state_2d[output_row:output_row + PREFILL_V_TILE, 0:KDA_DIM] = final
 
     return output, recurrent_state
 
@@ -1337,21 +1362,22 @@ def stack_conv_weight(
 ):
     """Stack Q/K/V convolution weights into tap-major channel rows.
 
-    Each block owns a 32-column BF16 line; family boundaries remain 32-aligned."""
-    with pl.spmd(CONV_DIM // 32, name_hint="stack_conv_weight"):
-        c0 = pl.tile.get_block_idx() * 32
-        for tap in pl.unroll(KDA_CONV_K):
-            line = pl.tile.full([1, 32], dtype=pl.BF16, value=0.0)
-            for col in pl.unroll(32):
-                c = c0 + col
-                if c < LOCAL_KDA_QKV_DIM:
-                    value = pl.read(conv_q, [c, 0, tap])
-                elif c < 2 * LOCAL_KDA_QKV_DIM:
-                    value = pl.read(conv_k, [c - LOCAL_KDA_QKV_DIM, 0, tap])
-                else:
-                    value = pl.read(conv_v, [c - 2 * LOCAL_KDA_QKV_DIM, 0, tap])
-                pl.tile.write(line, [0, col], value)
-            pl.tile.store(line, [tap, c0], weight)
+    Each partition owns a 32-column BF16 line; family boundaries remain 32-aligned."""
+    with pl.spmd(pl.min(CONV_DIM // 32, AIV_WORKERS_TILE), name_hint="stack_conv_weight"):
+        for stack_conv_weight_partition in pl.range(pl.tile.get_block_idx(), CONV_DIM // 32, AIV_WORKERS_TILE):
+            c0 = stack_conv_weight_partition * 32
+            for tap in pl.unroll(KDA_CONV_K):
+                line = pl.tile.full([1, 32], dtype=pl.BF16, value=0.0)
+                for col in pl.unroll(32):
+                    c = c0 + col
+                    if c < LOCAL_KDA_QKV_DIM:
+                        value = pl.read(conv_q, [c, 0, tap])
+                    elif c < 2 * LOCAL_KDA_QKV_DIM:
+                        value = pl.read(conv_k, [c - LOCAL_KDA_QKV_DIM, 0, tap])
+                    else:
+                        value = pl.read(conv_v, [c - 2 * LOCAL_KDA_QKV_DIM, 0, tap])
+                    pl.tile.write(line, [0, col], value)
+                pl.tile.store(line, [tap, c0], weight)
 
 
 def _conv_reference(

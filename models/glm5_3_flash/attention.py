@@ -25,7 +25,6 @@ from models.glm5_3_flash.config import (
     TOPK_INDEX_WIDTH, TP_SIZE, V_DIM, D,
     Glm53FlashConfig,
 )
-from models.glm5_3_flash.elementwise import accurate_divide, accurate_exp, accurate_row_sum_parts
 from models.glm5_3_flash.linear import (
     bf16_linear, golden_bf16_linear, w8a8_projection_bf16,
 )
@@ -41,6 +40,7 @@ B_DYN = pl.dynamic("GLM53_B_DYN")
 TABLE_DYN = pl.dynamic("GLM53_TABLE_DYN")
 T_DYN = pl.dynamic("GLM53_T_DYN")
 
+CACHE_WORKERS_TILE = 48
 MLA_CACHE_QUANT_TILE = 128
 MLA_CACHE_WIDTH = KV_LORA + KV_LORA // MLA_CACHE_QUANT_TILE * 4
 
@@ -543,46 +543,46 @@ def mla_cache_write(
 ):
     """Quantize normalized BF16 latents and scatter packed INT8 payload/FP32 scales."""
     tokens = pl.tensor.dim(latent, 0)
-    with pl.spmd(tokens, name_hint="mla_cache_write") as write_tid:
-        token = pl.tile.get_block_idx()
-        slot_i32 = pl.read(slots, [token])
-        if slot_i32 >= 0:
-            slot = pl.cast(slot_i32, pl.INDEX)
-            tail_bits = pl.full([1, 8], dtype=pl.INT32, value=0)
-            for block in pl.range(KV_LORA // MLA_CACHE_QUANT_TILE):
-                col = block * MLA_CACHE_QUANT_TILE
-                value = pl.cast(latent[token:token + 1, col:col + MLA_CACHE_QUANT_TILE], pl.FP32)
-                repeated = pl.col_expand_add(pl.full([8, MLA_CACHE_QUANT_TILE], dtype=pl.FP32, value=0.0), value)
-                amax = pl.row_max(pl.abs(repeated))
-                maximum = pl.read(amax, [0, 0])
-                if maximum > 0.0:
-                    max_lanes = pl.create_tensor([1, 8], dtype=pl.FP32)
-                    max_lanes[:, :] = pl.reshape(amax, [1, 8])
-                    one_lanes = pl.create_tensor([1, 8], dtype=pl.FP32)
-                    one_lanes[:, :] = pl.full([1, 8], dtype=pl.FP32, value=1.0)
-                    reciprocal_lanes = accurate_divide(one_lanes, max_lanes)
-                    inverse_lanes = pl.mul(reciprocal_lanes, 127.0)
-                    inverse_column = pl.reshape(inverse_lanes, [8, 1])
-                    scaled = pl.row_expand_mul(repeated, inverse_column)
-                    integer = pl.cast(scaled, pl.INT32, mode="rint")
-                    bounded = pl.minimum(pl.maximum(integer, -127), 127)
-                    half = pl.cast(bounded, pl.FP16)
-                    codes = pl.cast(half, pl.INT8, mode="trunc")
-                    cache[slot:slot + 1, col:col + MLA_CACHE_QUANT_TILE] = pl.set_validshape(codes, 1, MLA_CACHE_QUANT_TILE)
-                    scale_lanes = pl.mul(max_lanes, 1.0 / 127.0)
-                    scale_bits = pl.reinterpret_view(scale_lanes, pl.INT32)
-                    pl.write(tail_bits, [0, 4 + block], pl.read(scale_bits, [0, 0]))
-                    if block == KV_LORA // MLA_CACHE_QUANT_TILE - 1:
-                        code_bits = pl.reinterpret_view(codes, pl.INT32)
-                        for word in pl.unroll(4):
-                            pl.write(tail_bits, [0, word], pl.read(code_bits, [0, MLA_CACHE_QUANT_TILE // 4 - 4 + word]))
-                else:
-                    zeros = pl.full([1, MLA_CACHE_QUANT_TILE], dtype=pl.FP16, value=0.0)
-                    zero_codes = pl.cast(zeros, pl.INT8, mode="trunc")
-                    cache[slot:slot + 1, col:col + MLA_CACHE_QUANT_TILE] = zero_codes
-                    pl.write(tail_bits, [0, 4 + block], pl.cast(0, pl.INT32))
-            packed_tail = pl.reinterpret_view(tail_bits, pl.INT8)
-            cache[slot:slot + 1, KV_LORA - 16:MLA_CACHE_WIDTH] = packed_tail
+    with pl.spmd(pl.min(tokens, CACHE_WORKERS_TILE), name_hint="mla_cache_write") as write_tid:
+        for token in pl.range(pl.tile.get_block_idx(), tokens, CACHE_WORKERS_TILE):
+            slot_i32 = pl.read(slots, [token])
+            if slot_i32 >= 0:
+                slot = pl.cast(slot_i32, pl.INDEX)
+                tail_bits = pl.full([1, 8], dtype=pl.INT32, value=0)
+                for block in pl.range(KV_LORA // MLA_CACHE_QUANT_TILE):
+                    col = block * MLA_CACHE_QUANT_TILE
+                    value = pl.cast(latent[token:token + 1, col:col + MLA_CACHE_QUANT_TILE], pl.FP32)
+                    repeated = pl.col_expand_add(pl.full([8, MLA_CACHE_QUANT_TILE], dtype=pl.FP32, value=0.0), value)
+                    amax = pl.row_max(pl.abs(repeated))
+                    maximum = pl.read(amax, [0, 0])
+                    if maximum > 0.0:
+                        max_lanes = pl.create_tensor([1, 8], dtype=pl.FP32)
+                        max_lanes[:, :] = pl.reshape(amax, [1, 8])
+                        one_lanes = pl.create_tensor([1, 8], dtype=pl.FP32)
+                        one_lanes[:, :] = pl.full([1, 8], dtype=pl.FP32, value=1.0)
+                        reciprocal_lanes = pl.div(one_lanes, max_lanes)
+                        inverse_lanes = pl.mul(reciprocal_lanes, 127.0)
+                        inverse_column = pl.reshape(inverse_lanes, [8, 1])
+                        scaled = pl.row_expand_mul(repeated, inverse_column)
+                        integer = pl.cast(scaled, pl.INT32, mode="rint")
+                        bounded = pl.minimum(pl.maximum(integer, -127), 127)
+                        half = pl.cast(bounded, pl.FP16)
+                        codes = pl.cast(half, pl.INT8, mode="trunc")
+                        cache[slot:slot + 1, col:col + MLA_CACHE_QUANT_TILE] = pl.set_validshape(codes, 1, MLA_CACHE_QUANT_TILE)
+                        scale_lanes = pl.mul(max_lanes, 1.0 / 127.0)
+                        scale_bits = pl.reinterpret_view(scale_lanes, pl.INT32)
+                        pl.write(tail_bits, [0, 4 + block], pl.read(scale_bits, [0, 0]))
+                        if block == KV_LORA // MLA_CACHE_QUANT_TILE - 1:
+                            code_bits = pl.reinterpret_view(codes, pl.INT32)
+                            for word in pl.unroll(4):
+                                pl.write(tail_bits, [0, word], pl.read(code_bits, [0, MLA_CACHE_QUANT_TILE // 4 - 4 + word]))
+                    else:
+                        zeros = pl.full([1, MLA_CACHE_QUANT_TILE], dtype=pl.FP16, value=0.0)
+                        zero_codes = pl.cast(zeros, pl.INT8, mode="trunc")
+                        cache[slot:slot + 1, col:col + MLA_CACHE_QUANT_TILE] = zero_codes
+                        pl.write(tail_bits, [0, 4 + block], pl.cast(0, pl.INT32))
+                packed_tail = pl.reinterpret_view(tail_bits, pl.INT8)
+                cache[slot:slot + 1, KV_LORA - 16:MLA_CACHE_WIDTH] = packed_tail
 
     return write_tid
 
@@ -611,8 +611,8 @@ def decode_sparse_attn(
 ):
     """Attend over front-packed logical positions in the latent cache.
 
-    Compensated FP32 QK scores feed BF16-probability PV products. Block
-    statistics merge in FP32 before corrected division. Padding is a suffix
+    FP32 QK scores feed BF16-probability PV products. Block
+    statistics merge in FP32 before native division. Padding is a suffix
     of -1 indices; an entirely padded row produces zero output.
 
     H_PAD preserves the 16-row Cube minimum and 32-byte reduction alignment.
@@ -645,7 +645,6 @@ def decode_sparse_attn(
                         page = pl.cast(pl.read(block_table, [request, logical // BLOCK_SIZE]), pl.INDEX)
                         source = page * BLOCK_SIZE + logical % BLOCK_SIZE
                         total = pl.full([1, DECODE_H_PAD], dtype=pl.FP32, value=0.0)
-                        correction = pl.full([1, DECODE_H_PAD], dtype=pl.FP32, value=0.0)
                         for k0 in pl.pipeline(0, KV_LORA, 128, stage=1):
                             query_part = q_flat[token * LOCAL_H + head * DECODE_H_TILE:token * LOCAL_H + head * DECODE_H_TILE + DECODE_H_TILE, k0:k0 + 128]
                             query_value = pl.create_tensor([DECODE_H_PAD, 128], dtype=pl.FP32)
@@ -655,15 +654,10 @@ def decode_sparse_attn(
                             key_value = pl.cast(key_bf16, pl.FP32)
                             products = pl.create_tensor([DECODE_H_PAD, 128], dtype=pl.FP32)
                             products[:, :] = pl.col_expand_mul(query_value, key_value)
-                            high, low = accurate_row_sum_parts(products, 128)
-                            part_sum = pl.reshape(high, [1, DECODE_H_PAD])
-                            tail = pl.reshape(low, [1, DECODE_H_PAD])
-                            updated = pl.add(total, part_sum)
-                            recovered = pl.sub(updated, total)
-                            error = pl.add(pl.sub(total, pl.sub(updated, recovered)), pl.sub(part_sum, recovered))
-                            correction = pl.add(correction, pl.add(error, tail))
-                            total = updated
-                        dot = pl.add(total, correction)
+                            row_sum = pl.row_sum(products)
+                            part_sum = pl.reshape(row_sum, [1, DECODE_H_PAD])
+                            total = pl.add(total, part_sum)
+                        dot = total
                         for h in pl.range(DECODE_H_PAD):
                             pl.write(score_block, [h, selected], pl.read(dot, [0, h]))
             score_row = (token * ((LOCAL_H + DECODE_H_TILE - 1) // DECODE_H_TILE) + head) * DECODE_H_PAD
@@ -722,7 +716,7 @@ def decode_sparse_attn(
                     mi = pl.row_max(scores)
                     shifted = pl.create_tensor([DECODE_H_PAD // 2, DECODE_ATTN_K_TILE], dtype=pl.FP32)
                     shifted[:, :] = pl.row_expand_sub(scores, mi)
-                    weights = accurate_exp(shifted)
+                    weights = pl.exp(shifted)
                     weights = pl.col_expand_mul(weights, pl.cmp(bias_row, 0.0, cmp_type=0))
                     li = pl.row_sum(weights)
                     weights_bf16 = pl.cast(weights, target_type=pl.BF16, mode="rint")
@@ -763,8 +757,7 @@ def decode_sparse_attn(
         merged_numerators[task * DECODE_H_PAD:(task + 1) * DECODE_H_PAD, :] = merged_oi
         merged_denominators[task * DECODE_H_PAD:(task + 1) * DECODE_H_PAD, :] = merged_li
 
-    # A separate column-tiled normalization bounds the compensated division's
-    # vector working set while retaining the FP32 merged numerator.
+    # Column-tiled normalization of the FP32 merged numerator.
     out_flat = pl.reshape(output, [t_dim * LOCAL_H, KV_LORA])
     with pl.spmd(t_dim * ((LOCAL_H + DECODE_H_TILE - 1) // DECODE_H_TILE) * (KV_LORA // 128), name_hint="mla_decode_normalize", deps=[merge_tid]):
         part = pl.tile.get_block_idx()
@@ -781,7 +774,7 @@ def decode_sparse_attn(
             denominator_value_full = pl.full([DECODE_H_PAD, 128], dtype=pl.FP32, value=1.0)
             denominator_value_slice = merged_denominators[task * DECODE_H_PAD:task * DECODE_H_PAD + DECODE_H_PAD, 0:1]
             denominator[:, :] = pl.row_expand_mul(denominator_value_full, denominator_value_slice)
-            normalized = accurate_divide(numerator, denominator)
+            normalized = pl.div(numerator, denominator)
             out_bf16 = pl.cast(normalized, target_type=pl.BF16, mode="rint")
             output_row = token * LOCAL_H + head * DECODE_H_TILE
             out_flat[output_row:output_row + DECODE_H_TILE, col:col + 128] = out_bf16[0:DECODE_H_TILE, :]
