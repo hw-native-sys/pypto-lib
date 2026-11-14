@@ -246,6 +246,7 @@ def decode_encoder(
                 engram_from_rows(
                     engram_lookup[engram_slot], engram_wkv[engram_slot], layer_engram_scale,
                     engram_weight[engram_slot], x_hc, x_hc,
+                    mask_zero_rows=False,
                 )
         with pl.scope():
             weight_layer = layer % WEIGHT_BANK_SIZE

@@ -25,7 +25,6 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 # Dynamic shape variables.
 ROWS = pl.dynamic("VISION_ROWS")
 INPUT = pl.dynamic("VISION_INPUT")
-OUTPUT = pl.dynamic("VISION_OUTPUT")
 
 # tiling
 M_TILE = 16
@@ -78,10 +77,10 @@ def vision_rope(n_h, n_w, cfg=VisionConfig()):
 
 @pl.jit.inline(auto_scope=False)
 def linear_inline(
-    x: pl.Tensor[[ROWS, INPUT], pl.BF16],
-    weight: pl.Tensor[[INPUT, OUTPUT], pl.BF16],
+    x: pl.Tensor,
+    weight: pl.Tensor,
     bias: pl.Tensor,
-    output: pl.Tensor[[ROWS, OUTPUT], pl.BF16],
+    output: pl.Tensor,
     has_bias: pl.Scalar[pl.INT32],
 ):
     rows = pl.tensor.dim(x, 0)
@@ -632,9 +631,10 @@ def _golden_norm(x, weight):
 
 
 def golden_vision(patches, weights, n_h, n_w, cfg=VisionConfig()):
-    """Independent Torch transcription with SDPA and unfold, including BF16 boundaries."""
-    def linear(x, name, bias=None):
-        return F.linear(x, weights[name].t(), None if bias is None else weights[bias])
+    """Torch reference with BF16 storage and FP32 projection/attention accumulation."""
+    def linear(x, weight, bias=None):
+        value = F.linear(x.float(), weight.t().float(), None if bias is None else bias.float())
+        return value.bfloat16()
 
     d, heads = cfg.dim, cfg.heads
     channels = d // heads
@@ -650,27 +650,28 @@ def golden_vision(patches, weights, n_h, n_w, cfg=VisionConfig()):
         a, b = x.float().chunk(2, dim=-1)
         return torch.cat((a * cos - b * sin, b * cos + a * sin), dim=-1).bfloat16()
 
-    x = linear(patches.flatten(1), "patch_w", "patch_b")
+    x = linear(patches.flatten(1), weights["patch_w"], weights["patch_b"])
     for layer in range(cfg.layers):
         normalized = _golden_norm(x, weights["norm1_w"][layer])
-        qkv = F.linear(normalized, weights["qkv_w"][layer].t(), weights["qkv_b"][layer])
+        qkv = linear(normalized, weights["qkv_w"][layer], weights["qkv_b"][layer])
         q, k, v = (value.reshape(-1, heads, channels) for value in qkv.chunk(3, dim=-1))
         query = rotate(q).transpose(0, 1)
         keys = rotate(k).transpose(0, 1)
         values = v.transpose(0, 1)
         with sdpa_kernel(SDPBackend.MATH):
-            attended = F.scaled_dot_product_attention(query, keys, values)
+            attended = F.scaled_dot_product_attention(query.float(), keys.float(), values.float()).bfloat16()
         attended = attended.transpose(0, 1).reshape(-1, d)
-        x = x + F.linear(attended, weights["out_w"][layer].t(), weights["out_b"][layer])
+        x = x + linear(attended, weights["out_w"][layer], weights["out_b"][layer])
         normalized = _golden_norm(x, weights["norm2_w"][layer])
-        gate, up = F.linear(normalized, weights["mlp1_w"][layer].t()).chunk(2, dim=-1)
-        x = x + F.linear(F.silu(gate) * up, weights["mlp2_w"][layer].t())
+        gate, up = linear(normalized, weights["mlp1_w"][layer]).chunk(2, dim=-1)
+        x = x + linear(F.silu(gate) * up, weights["mlp2_w"][layer])
     features = _golden_norm(x, weights["norm_w"])
     r = cfg.downsample
     image = features.reshape(n_h, n_w, d).permute(2, 0, 1)
     image = F.pad(image, (0, -n_w % r, 0, -n_h % r))
     unfolded = F.unfold(image.unsqueeze(0), r, stride=r).squeeze(0).t().contiguous()
-    embeddings = linear(F.gelu(linear(unfolded, "align1_w", "align1_b")), "align2_w", "align2_b")
+    projected = linear(unfolded, weights["align1_w"], weights["align1_b"])
+    embeddings = linear(F.gelu(projected), weights["align2_w"], weights["align2_b"])
     return features, embeddings
 
 

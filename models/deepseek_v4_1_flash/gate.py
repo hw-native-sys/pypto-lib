@@ -23,6 +23,7 @@ from config import MOE_TOKENS, EP_SIZE, N_LOCAL_EXPERTS
 # model config
 T = MOE_TOKENS
 D = M.hidden_size
+BIAS_DYN = pl.dynamic("GATE_BIAS_DYN")
 N_EXPERTS = EP_SIZE * N_LOCAL_EXPERTS
 TOPK = M.num_experts_per_tok
 ROUTE_SCALE = M.routed_scaling_factor
@@ -57,9 +58,38 @@ def _gate_scores_vf(
     route_scores: pl.Out[pl.Tensor],
     biased_scores: pl.InOut[pl.Tensor],
     tasks: pl.Scalar[pl.INDEX],
+    bias_stride: pl.Scalar[pl.INDEX],
 ) -> tuple[pl.Tensor, pl.Tensor]:
     """Project router inputs and compute sqrt-softplus scores with selection bias."""
     return route_scores, biased_scores
+
+
+@pl.jit.inline
+def gather_routing_bias(
+    source: pl.Tensor,
+    row_ids: pl.Tensor,
+    output: pl.Tensor,
+    ready: pl.Scalar[pl.TASK_ID],
+    n_experts: pl.constexpr,
+):
+    """Gather token routing biases or copy one broadcast expert vector."""
+    source_rows = pl.tensor.dim(source, 0) // n_experts
+    output_rows = pl.tensor.dim(output, 0) // n_experts
+    source_matrix = pl.reshape(source, [source_rows, n_experts])
+    output_matrix = pl.reshape(output, [output_rows, n_experts])
+    for row in pl.spmd(output_rows, name_hint="gate_bias_gather", deps=[ready]):
+        source_row = pl.cast(0, pl.INT32)
+        if source_rows > 1:
+            source_row = pl.read(row_ids, [row])
+        for column in pl.range(0, n_experts, 32):
+            valid_columns = pl.min(32, n_experts - column)
+            if source_row >= 0 and source_row < source_rows:
+                value = pl.load(source_matrix, [source_row, column], [1, 32], valid_shape=[1, valid_columns])
+                pl.store(value, [row, column], output_matrix)
+            else:
+                zero = pl.tile.full([1, 32], dtype=pl.FP32, value=0.0)
+                pl.store(pl.set_validshape(zero, 1, valid_columns), [row, column], output_matrix)
+    return output
 
 
 @pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "gate_route_sort_vf.cpp",
@@ -109,10 +139,31 @@ def golden_gate_reference(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute sqrt-softplus routing, with bias affecting selection only."""
     scores = F.softplus(F.linear(x.float(), weight.to(torch.bfloat16).float()) / M.gate_temperature).sqrt()
-    indices = (scores + correction_bias.float()).topk(M.num_experts_per_tok, dim=-1).indices
+    bias = correction_bias.float().reshape(-1, weight.shape[0])[:x.shape[0]]
+    indices = (scores + bias).topk(M.num_experts_per_tok, dim=-1).indices
     weights = scores.gather(-1, indices)
     weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
     return weights * M.routed_scaling_factor, indices.to(torch.int32)
+
+
+def prepare_routing_bias(text_bias, vision_bias, image_mask, capacity):
+    """Flatten per-layer token biases in encoder input order, padding with text bias."""
+    if text_bias.ndim not in (1, 2) or text_bias.shape != vision_bias.shape:
+        raise ValueError("text and vision biases must have matching [experts] or [layers, experts] shapes")
+    if text_bias.dtype != torch.float32 or vision_bias.dtype != torch.float32:
+        raise ValueError("routing biases must have FP32 dtype")
+    if text_bias.device.type != "cpu" or vision_bias.device.type != "cpu":
+        raise ValueError("routing bias preparation requires CPU weights")
+    mask = torch.as_tensor(image_mask, device="cpu")
+    if mask.ndim != 1 or mask.dtype != torch.bool:
+        raise ValueError("image_mask must be a one-dimensional boolean sequence")
+    if type(capacity) is not int or capacity < max(1, mask.numel()):
+        raise ValueError("capacity must be a positive integer covering the image mask")
+    padded_mask = torch.zeros(capacity, dtype=torch.bool)
+    padded_mask[:mask.numel()] = mask
+    text = text_bias.reshape(-1, 1, text_bias.shape[-1])
+    vision = vision_bias.reshape_as(text)
+    return torch.where(padded_mask[None, :, None], vision, text).flatten().contiguous()
 
 
 @pl.jit.inline
@@ -156,11 +207,14 @@ def gate_from_bf16(
     # Reserve both engines before any local Cube-to-Vector transfer.
     # Bound synchronous cohorts to the target A5 core count.
     gate_tasks = task_gate_tiles * ((n_experts + GATE_N_TILE - 1) // GATE_N_TILE)
+    bias_stride = pl.cast(0, pl.INDEX)
+    if pl.tensor.dim(gate_bias, 0) > n_experts:
+        bias_stride = pl.cast(n_experts, pl.INDEX)
     gate_worker_limit = pl.min(16, pl.system.available_cluster_count())
     gate_workers = pl.max(1, pl.min(gate_tasks, gate_worker_limit))
     with pl.spmd(gate_workers, name_hint="gate", sync_start=True):
         route_scores_buf, biased_scores_buf = _gate_scores_vf(
-            xg_buf, gate_w, gate_bias, route_scores_buf, biased_scores_buf, gate_tasks,
+            xg_buf, gate_w, gate_bias, route_scores_buf, biased_scores_buf, gate_tasks, bias_stride,
         )
 
     # V4.1 uses score-only top-k: the V4 hash-route loop is dropped so that PTOAS
@@ -234,13 +288,14 @@ def gate_from_bf16(
 def l2_gate(
     x_normed: pl.Tensor[[T_PAD, D], pl.BF16],
     gate_w: pl.Tensor[[N_EXPERTS, D], pl.BF16],
-    gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    gate_bias: pl.Tensor[[BIAS_DYN], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
     x_norm_mx: pl.Out[pl.Tensor[[T_PAD, D], pl.FP8E4M3FN]],
     x_norm_scale: pl.Out[pl.Tensor[[1, T_PAD * MX_SCALE_GROUPS], pl.FP8E8M0]],
     indices: pl.Out[pl.Tensor[[T, TOPK], pl.INT32]],
     weights: pl.Out[pl.Tensor[[T, TOPK], pl.FP32]],
 ):
+    gate_bias.bind_dynamic(0, BIAS_DYN)
     gate_from_bf16(
         x_normed, gate_w, gate_bias,
         num_tokens,
@@ -260,7 +315,7 @@ def _golden_gate_scores(tensors):
     logits = x_norm @ gate_w.T
     softplus = logits.clamp(min=0) + torch.log1p(torch.exp(-logits.abs()))
     scores = softplus.sqrt()
-    biased = scores + gate_bias.view(1, -1)
+    biased = scores + gate_bias.reshape(-1, N_EXPERTS)[:T]
     return x_norm, scores, biased
 
 
@@ -306,7 +361,7 @@ def golden_gate_normalized_core(tensors):
     _golden_gate_core(tensors, x_norm, scores, biased)
 
 
-def build_tensor_specs(num_tokens=T):
+def build_tensor_specs(num_tokens=T, *, token_bias=False):
     import torch
     from golden import ScalarSpec, TensorSpec
 
@@ -321,7 +376,13 @@ def build_tensor_specs(num_tokens=T):
         return torch.randn(N_EXPERTS, D) / D ** 0.5
 
     def init_gate_bias():
-        return torch.randn(N_EXPERTS) * 0.1
+        if not token_bias:
+            return torch.randn(N_EXPERTS) * 0.1
+        bias = torch.full((T_PAD, N_EXPERTS), -10.0)
+        for row in range(T_PAD):
+            selected = (torch.arange(TOPK) + row * TOPK) % N_EXPERTS
+            bias[row, selected] = 10.0
+        return bias.flatten()
 
     # PyTorch CPU has incomplete float8 support for zeros/fill; initialise through
     # a uint8 carrier and view it as FP8 so the harness does not fail before NPU
@@ -338,7 +399,7 @@ def build_tensor_specs(num_tokens=T):
     return [
         TensorSpec("x_normed", [T_PAD, D], torch.bfloat16, init_value=init_x_normed),
         TensorSpec("gate_w", [N_EXPERTS, D], torch.bfloat16, init_value=init_gate_w),
-        TensorSpec("gate_bias", [N_EXPERTS], torch.float32, init_value=init_gate_bias),
+        TensorSpec("gate_bias", [T_PAD * N_EXPERTS if token_bias else N_EXPERTS], torch.float32, init_value=init_gate_bias),
         ScalarSpec("num_tokens", torch.int32, num_tokens),
         TensorSpec("x_norm_mx", [T_PAD, D], torch.float8_e4m3fn, init_value=lambda: init_fp8((T_PAD, D))),
         TensorSpec("x_norm_scale", [1, T_PAD * MX_SCALE_GROUPS], getattr(torch, "float8_e8m0fnu", torch.uint8), init_value=lambda: init_e8m0((1, T_PAD * MX_SCALE_GROUPS))),
@@ -533,6 +594,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--num-tokens", type=int, default=T)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--token-bias", action="store_true")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
@@ -540,7 +602,7 @@ if __name__ == "__main__":
 
     result = run(
         fn=l2_gate,
-        specs=build_tensor_specs(num_tokens=args.num_tokens),
+        specs=build_tensor_specs(num_tokens=args.num_tokens, token_bias=args.token_bias),
         golden_fn=golden_gate_normalized_core,
         config=dict(
             dump_passes=args.dump_passes,
