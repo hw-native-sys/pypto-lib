@@ -1176,13 +1176,7 @@ def publish_c1a_index_key(
         workers=4, name_hint="prefill_index_key",
     )
     index_normalized = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-    norm_blocks = (num_tokens + 7) // 8
-    norm_worker_blocks = pl.max(1, norm_blocks)
-    norm_worker_workers = pl.min(norm_worker_blocks, 8)
-    for norm_worker_worker in pl.spmd(norm_worker_workers, name_hint="attention_rmsnorm"):
-        for norm_worker in pl.range(norm_worker_worker, norm_worker_blocks, norm_worker_workers):
-            if norm_worker < norm_blocks:
-                rms_norm(index_projection, index_norm_weight, index_normalized, norm_worker, num_tokens, width=INDEX_DIM)
+    rms_norm(index_projection, index_norm_weight, index_normalized, num_tokens, width=INDEX_DIM, zero_tail=False)
     index_rotated = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     _index_rope(
         index_normalized, compressed_rope_cos, compressed_rope_sin, index_rotated, num_tokens,

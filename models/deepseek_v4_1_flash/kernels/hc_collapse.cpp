@@ -15,10 +15,7 @@
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
 #include "intrinsic.h"
-#if !defined(__CPU_SIM)
-#include <pto/npu/a5/custom/TSqrtHp.hpp>
-#include <pto/npu/a5/custom/Div754.hpp>
-#endif
+#include "rmsnorm.hpp"
 using namespace pto;
 namespace {
 template <typename T, int R, int C>
@@ -37,35 +34,59 @@ __tf__ __aicore__ inline void collapse_norm(
     Output::TileDType __out__ output, Input::TileDType __in__ input,
     Vec<bfloat16_t, 1, 5120>::TileDType __in__ weight,
     Premix::TileDType __in__ premix, uint16_t rows, uint16_t row_offset,
-    Output::TileDType __out__ collapsed) {
+    Output::TileDType __out__ collapsed, Input::TileDType __out__ scratch) {
     auto src = (__ubuf__ float*)__cce_get_tile_ptr(input);
     auto dst = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(output);
     auto gamma = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(weight);
     auto mix = (__ubuf__ float*)__cce_get_tile_ptr(premix);
     auto raw = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(collapsed);
+    auto reduce = (__ubuf__ float*)__cce_get_tile_ptr(scratch);
 #if defined(__CPU_SIM)
     for (int row = 0; row < rows; ++row) {
-        float partial[64] = {};
+
         for (int k = 0; k < 5120; ++k) {
             volatile float y0 = src[row * 20480 + k] * mix[(row + row_offset) * 4];
             volatile float y1 = src[row * 20480 + 5120 + k] * mix[(row + row_offset) * 4 + 1];
             volatile float y2 = src[row * 20480 + 10240 + k] * mix[(row + row_offset) * 4 + 2];
             volatile float y3 = src[row * 20480 + 15360 + k] * mix[(row + row_offset) * 4 + 3];
             volatile float first_pair = y0 + y1;
-            volatile float second_pair = y2 + y3;
-            bfloat16_t rounded = static_cast<bfloat16_t>(first_pair + second_pair);
+            volatile float first_three = first_pair + y2;
+            bfloat16_t rounded = static_cast<bfloat16_t>(first_three + y3);
             dst[row * 5120 + k] = rounded;
             if constexpr (StoreCollapsed) {
                 raw[row * 5120 + k] = rounded;
             }
-            float value = static_cast<float>(rounded);
-            partial[k % 64] += value * value;
         }
-        for (int width = 64; width > 1; width /= 2) {
-            for (int lane = 0; lane < width / 2; ++lane)
-                partial[lane] = partial[lane * 2] + partial[lane * 2 + 1];
+        float partial[64] = {};
+        for (int block = 0; block < 64; ++block) {
+            float lanes[64];
+            for (int lane = 0; lane < 64; ++lane) {
+                const int col = block * 64 + lane;
+                const float value = static_cast<float>(dst[row * 5120 + col]);
+                lanes[lane] = value * value;
+                if (col < 1024) {
+                    const float tail = static_cast<float>(dst[row * 5120 + 4096 + col]);
+                    lanes[lane] += tail * tail;
+                }
+            }
+            for (int count = 64; count > 1; count /= 2)
+                for (int lane = 0; lane < count / 2; ++lane)
+                    lanes[lane] = lanes[2 * lane] + lanes[2 * lane + 1];
+            partial[block] = lanes[0];
         }
-        float inverse = 1.0f / std::sqrt(partial[0] / 5120.0f + 1.0e-6f);
+        for (int count = 64; count > 1; count /= 2)
+            for (int lane = 0; lane < count / 2; ++lane)
+                partial[lane] = partial[2 * lane] + partial[2 * lane + 1];
+        float variance = partial[0] * (1.0f / 5120.0f) + 1.0e-6f;
+        float reciprocal = 1.0f / variance;
+        float root = std::sqrt(reciprocal);
+        float product = (variance * -0.5f) * root;
+        float inverse = root * std::fma(product, root, 1.5f);
+        float correction = std::fma(-variance, reciprocal, 1.0f);
+        float error = std::fma(-inverse, inverse, reciprocal);
+        correction = std::fma(variance, error, correction) * inverse;
+        inverse = std::fma(correction, 0.5f, inverse);
+        if (std::isinf(variance)) inverse = 0.0f;
         for (int k = 0; k < 5120; ++k) {
             dst[row * 5120 + k] = static_cast<bfloat16_t>(
                 static_cast<float>(dst[row * 5120 + k]) * inverse * static_cast<float>(gamma[k]));
@@ -75,44 +96,56 @@ __tf__ __aicore__ inline void collapse_norm(
     __VEC_SCOPE__ {
         MaskReg full = pset_b32(PAT_ALL);
         for (uint16_t row = 0; row < rows; ++row) {
-            RegTensor<float> p0, p1, p2, p3, sum;
+            RegTensor<float> p0, p1, p2, p3;
             vlds(p0, mix, (row + row_offset) * 4, BRC_B32);
             vlds(p1, mix, (row + row_offset) * 4 + 1, BRC_B32);
             vlds(p2, mix, (row + row_offset) * 4 + 2, BRC_B32);
             vlds(p3, mix, (row + row_offset) * 4 + 3, BRC_B32);
-            vdup(sum, 0.0f, full, MODE_ZEROING);
-            for (uint16_t k = 0; k < 80; ++k) {
-                RegTensor<float> x0, x1, x2, x3, a, b, value, square;
-                RegTensor<bfloat16_t> rounded;
-                vlds(x0, src, row * 20480 + k * 64, NORM);
-                vlds(x1, src, row * 20480 + 5120 + k * 64, NORM);
-                vlds(x2, src, row * 20480 + 10240 + k * 64, NORM);
-                vlds(x3, src, row * 20480 + 15360 + k * 64, NORM);
-                vmul(x0, x0, p0, full, MODE_ZEROING);
-                vmul(x1, x1, p1, full, MODE_ZEROING);
-                vmul(x2, x2, p2, full, MODE_ZEROING);
-                vmul(x3, x3, p3, full, MODE_ZEROING);
-                vadd(a, x0, x1, full, MODE_ZEROING);
-                vadd(b, x2, x3, full, MODE_ZEROING);
-                vadd(value, a, b, full, MODE_ZEROING);
-                vcvt(rounded, value, full, ROUND_R, RS_DISABLE, PART_EVEN);
-                vsts(rounded, dst, row * 5120 + k * 64, PK_B32, full);
-                if constexpr (StoreCollapsed) {
-                    vsts(rounded, raw, row * 5120 + k * 64, PK_B32, full);
+            uint32_t one_lane = 1;
+            MaskReg scalar = plt_b32(one_lane, POST_UPDATE);
+            for (uint16_t block = 0; block < 64; ++block) {
+                RegTensor<float> folded_square;
+                vdup(folded_square, 0.0f, full, MODE_ZEROING);
+                uint16_t pieces = block < 16 ? 2 : 1;
+                for (uint16_t piece = 0; piece < pieces; ++piece) {
+                    uint16_t k = block + piece * 64;
+                    RegTensor<float> x0, x1, x2, x3, a, b, value, square;
+                    RegTensor<bfloat16_t> rounded;
+                    vlds(x0, src, row * 20480 + k * 64, NORM);
+                    vlds(x1, src, row * 20480 + 5120 + k * 64, NORM);
+                    vlds(x2, src, row * 20480 + 10240 + k * 64, NORM);
+                    vlds(x3, src, row * 20480 + 15360 + k * 64, NORM);
+                    vmul(x0, x0, p0, full, MODE_ZEROING);
+                    vmul(x1, x1, p1, full, MODE_ZEROING);
+                    vmul(x2, x2, p2, full, MODE_ZEROING);
+                    vmul(x3, x3, p3, full, MODE_ZEROING);
+                    vadd(a, x0, x1, full, MODE_ZEROING);
+                    vadd(b, a, x2, full, MODE_ZEROING);
+                    vadd(value, b, x3, full, MODE_ZEROING);
+                    vcvt(rounded, value, full, ROUND_R, RS_DISABLE, PART_EVEN);
+                    vsts(rounded, dst, row * 5120 + k * 64, PK_B32, full);
+                    if constexpr (StoreCollapsed) {
+                        vsts(rounded, raw, row * 5120 + k * 64, PK_B32, full);
+                    }
+                    vcvt(value, rounded, full, PART_EVEN);
+                    vmul(square, value, value, full, MODE_ZEROING);
+                    vadd(folded_square, folded_square, square, full, MODE_ZEROING);
                 }
-                vcvt(value, rounded, full, PART_EVEN);
-                vmul(square, value, value, full, MODE_ZEROING);
-                vadd(sum, sum, square, full, MODE_ZEROING);
+                RegTensor<float> partial;
+                vcadd(partial, folded_square, full, MODE_ZEROING);
+                // Each source vector is consumed before its prefix becomes reduction scratch.
+                RegTensor<uint32_t> location;
+                vbr(location, static_cast<uint32_t>(row * 20480 + block));
+                vscatter(partial, reduce, location, scalar);
             }
-            RegTensor<float> inverse, one, root;
-            vcadd(sum, sum, full, MODE_ZEROING);
-            vmuls(inverse, sum, 1.0f / 5120.0f, full, MODE_ZEROING);
-            vadds(inverse, inverse, 1.0e-6f, full, MODE_ZEROING);
-            SqrtFloatImpl<float, RegTensor<float>>(root, inverse, full);
-            vdup(one, 1.0f, full, MODE_ZEROING);
-            DivIEEE754FloatImpl<float, RegTensor<float>>(inverse, one, root, full);
-            vdup(inverse, inverse, full, POS_LOWEST, MODE_ZEROING);
+            RegTensor<float> inverse;
             mem_bar(VST_VLD);
+            RegTensor<float> partials, total;
+            vlds(partials, reduce, row * 20480, NORM);
+            vcadd(total, partials, full, MODE_ZEROING);
+            vmuls(total, total, 1.0f / 5120.0f, full, MODE_ZEROING);
+            recipe_rms::inverse_root(inverse, total, full);
+            vdup(inverse, inverse, full, POS_LOWEST, MODE_ZEROING);
             for (uint16_t k = 0; k < 80; ++k) {
                 RegTensor<float> value, gain;
                 RegTensor<bfloat16_t> rounded;
@@ -136,7 +169,7 @@ __aicore__ inline void normalize(__gm__ int64_t* args) {
 #if defined(__DAV_VEC__)
     set_mask_norm();
     set_vector_mask(-1, -1);
-    constexpr int row_tile = StoreCollapsed ? 2 : 8;
+    constexpr int row_tile = StoreCollapsed ? 2 : 4;
     for (int t0 = get_block_idx(args) * row_tile; t0 < args[5]; t0 += get_block_num(args) * row_tile) {
         int rows = args[5] - t0;
         rows = rows > row_tile ? row_tile : rows;
@@ -183,13 +216,13 @@ __aicore__ inline void normalize(__gm__ int64_t* args) {
             Output collapsed(1);
             TASSIGN(collapsed, 194688 + slot * 10240);
             if constexpr (StoreCollapsed) {
-                collapse_norm<true>(output.data(), input.data(), weight.data(), mix.data(), 1, local, collapsed.data());
+                collapse_norm<true>(output.data(), input.data(), weight.data(), mix.data(), 1, local, collapsed.data(), input.data());
                 if (t0 + local >= args[6]) {
                     pipe_barrier(PIPE_ALL);
                     TEXPANDS(output, 0.0f);
                 }
             } else {
-                collapse_norm<false>(output.data(), input.data(), weight.data(), mix.data(), 1, local, output.data());
+                collapse_norm<false>(output.data(), input.data(), weight.data(), mix.data(), 1, local, output.data(), input.data());
             }
             set_flag(PIPE_V, PIPE_MTE2, current);
             set_flag(PIPE_V, PIPE_MTE3, current);
@@ -213,7 +246,7 @@ __aicore__ inline void normalize(__gm__ int64_t* args) {
 #endif
 }
 
-// Four-stream HC collapse with pairwise FP32 sums and BF16 rounding.
+// Four-stream HC collapse with ordered FP32 sums and BF16 rounding.
 namespace hc_collapse_detail {
 template <typename T>
 __aicore__ inline __gm__ T* data(__gm__ int64_t* args, int i) {
@@ -237,7 +270,7 @@ __tf__ __aicore__ inline void collapse(
             float y1 = src[row * 20480 + 5120 + k] * mix[(row + row_offset) * 4 + 1];
             float y2 = src[row * 20480 + 10240 + k] * mix[(row + row_offset) * 4 + 2];
             float y3 = src[row * 20480 + 15360 + k] * mix[(row + row_offset) * 4 + 3];
-            bfloat16_t rounded = static_cast<bfloat16_t>((y0 + y1) + (y2 + y3));
+            bfloat16_t rounded = static_cast<bfloat16_t>(((y0 + y1) + y2) + y3);
             dst[row * 5120 + k] = rounded;
         }
     }
@@ -262,8 +295,8 @@ __tf__ __aicore__ inline void collapse(
                 vmul(x2, x2, p2, full, MODE_ZEROING);
                 vmul(x3, x3, p3, full, MODE_ZEROING);
                 vadd(a, x0, x1, full, MODE_ZEROING);
-                vadd(b, x2, x3, full, MODE_ZEROING);
-                vadd(value, a, b, full, MODE_ZEROING);
+                vadd(b, a, x2, full, MODE_ZEROING);
+                vadd(value, b, x3, full, MODE_ZEROING);
                 vcvt(rounded, value, full, ROUND_R, RS_DISABLE, PART_EVEN);
                 vsts(rounded, dst, row * 5120 + k * 64, PK_B32, full);
             }

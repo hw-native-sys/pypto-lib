@@ -29,7 +29,7 @@ from pypto.runtime import pto_isa_include_dir
 
 from config import EP_SIZE, FLASH as M, LM_HEAD_TP_SIZE, SUPPORTED_LM_HEAD_TP_SIZES
 from hc import hc_head, golden_hc_collapse
-from rmsnorm import rms_norm_tiled_compensated, golden_rms_norm_tiled
+from rmsnorm import rms_norm, golden_rms_norm_tiled
 from quant import pack_bf16_nz, unpack_bf16_nz
 
 
@@ -624,8 +624,7 @@ def _final_output(
         collapsed = pl.create_tensor([rows, D], dtype=pl.BF16)
         hc_head(x_hc, pre_mix, collapsed, worker_limit=64)
         normalized = pl.create_tensor([rows, D], dtype=pl.BF16)
-        for norm_block in pl.spmd((rows + 7) // 8, name_hint="final_rms_norm"):
-            rms_norm_tiled_compensated(collapsed, final_norm_weight, normalized, norm_block, rows)
+        rms_norm(collapsed, final_norm_weight, normalized, rows, width=D, zero_tail=False)
         lm_head_with_sampling(
             normalized, lm_head_weight, logit_row_indices, logits, sampled_ids,
             hidden_window, hidden_done, logits_window, logits_done, group_base, tp_rank, done_epoch, completed_epochs,

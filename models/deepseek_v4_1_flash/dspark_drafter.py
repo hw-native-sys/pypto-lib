@@ -26,7 +26,7 @@ from config import (
     BLOCK_SIZE, B_DYN, EP_SIZE, FLASH, MOE_TOKENS, TABLE_DYN,
     WINDOW_CACHE_BYTES,
 )
-from rmsnorm import golden_rms_norm_tiled, rms_norm_tiled
+from rmsnorm import golden_rms_norm_tiled, rms_norm
 from hc import hc_head, hc_head_norm, hc_project, hc_sinkhorn, zero_bf16_padding
 from expert_routed import (
     MX_PACKED_LANE_COLS,
@@ -209,8 +209,7 @@ def dspark_proj(
     projected = pl.create_tensor([tokens, D], dtype=pl.BF16)
     with pl.spmd(32, name_hint="dspark_main_proj") as projected_ready:
         projected = _dspark_projection_native(target_hidden, main_proj_weight, projected, num_tokens)
-    for block in pl.spmd((num_tokens + 7) // 8, name_hint="dspark_main_norm", deps=[projected_ready]):
-        rms_norm_tiled(projected, main_norm_weight, main_x, block, num_tokens, output_fp32=False)
+    rms_norm(projected, main_norm_weight, main_x, num_tokens, width=D, zero_tail=False)
     return main_x
 
 

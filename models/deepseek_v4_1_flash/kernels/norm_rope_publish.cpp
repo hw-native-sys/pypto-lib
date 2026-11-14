@@ -17,6 +17,7 @@
 #include "tensor.h"
 #include "intrinsic.h"
 
+#include "rmsnorm.hpp"
 using namespace pto;
 namespace {
 template <typename T, int C>
@@ -102,20 +103,7 @@ __tf__ __aicore__ inline void postprocess(
         for (uint16_t row = 0; row < rows; ++row) {
             RegTensor<float> sum, source, square, inverse, one, cosv, sinv;
             RegTensor<bfloat16_t> bf;
-            vdup(sum, 0.0f, full, MODE_ZEROING);
-            for (uint16_t segment = 0; segment < 8; ++segment) {
-                vlds(bf, src, row * 512 + segment * 64, UNPK_B16);
-                vcvt(source, bf, full, PART_EVEN);
-                vmul(square, source, source, full, MODE_ZEROING);
-                vadd(sum, sum, square, full, MODE_ZEROING);
-            }
-            vcadd(sum, sum, full, MODE_ZEROING);
-            vmuls(inverse, sum, 1.0f / 512.0f, full, MODE_ZEROING);
-            vadds(inverse, inverse, 1.0e-6f, full, MODE_ZEROING);
-            vsqrt(inverse, inverse, full, MODE_ZEROING);
-            vdup(one, 1.0f, full, MODE_ZEROING);
-            vdiv(inverse, one, inverse, full, MODE_ZEROING);
-            vdup(inverse, inverse, full, POS_LOWEST, MODE_ZEROING);
+            recipe_rms::row_inverse<512>(inverse, src, row * 512, full);
             vlds(cosv, cp, row * 32, NORM);
             vlds(sinv, sp, row * 32, NORM);
             for (uint16_t segment = 0; segment < 8; ++segment) {
