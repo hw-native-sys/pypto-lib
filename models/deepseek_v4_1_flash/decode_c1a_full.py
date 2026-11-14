@@ -162,7 +162,7 @@ def decode_c1a_full(
     pool_tid = select_candidate_block_pool(
         scores, compressed_lens, pool_block_ids, pool_block_counts, num_tokens, scores_tid, True,
     )
-    selection_ready = pl.system.task_dummy(deps=[topk_tid, pool_tid, compressed_ready])
+    selection_ready = pl.system.task_dummy(deps=[topk_tid, compressed_ready])
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     gather_sparse_attention(
         query, window_indices, window_cache, topk_indices, compressed_cache,

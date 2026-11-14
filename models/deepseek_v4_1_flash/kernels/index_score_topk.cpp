@@ -738,6 +738,556 @@ namespace {
             }
         }
 #endif
+        template <typename T, typename G> __aicore__ inline void load_value(T& tile, G global) {
+            TLOAD(tile, global);
+        }
+        template <typename G, typename T> __aicore__ inline void store_value(G global, T& tile) {
+            TSTORE(global, tile);
+        }
+#if defined(__DAV_VEC__)
+        __tf__ __aicore__ void pool_score(__ubuf__ bfloat16_t* src, __ubuf__ bfloat16_t* weights,
+                                          __ubuf__ uint16_t* cache, __ubuf__ uint16_t* hist,
+                                          __ubuf__ uint16_t* valid, int column) {
+            __VEC_SCOPE__ {
+                RegTensor<bfloat16_t> a, b, c, d, x, y, z, t, weight;
+                auto mask = pset_b16(PAT_ALL);
+                vbr(a, bfloat16_t(0));
+                vbr(b, bfloat16_t(0));
+                vbr(c, bfloat16_t(0));
+                vbr(d, bfloat16_t(0));
+#pragma unroll 4
+                for (uint16_t h = 0; h < 32; ++h) {
+                    vlds(weight, weights, h, BRC_B16);
+                    vlds(x, src, h * 512, NORM);
+                    vlds(y, src, h * 512 + 128, NORM);
+                    vlds(z, src, h * 512 + 256, NORM);
+                    vlds(t, src, h * 512 + 384, NORM);
+
+                    vmula(a, x, weight, mask, MODE_ZEROING);
+                    vmula(b, y, weight, mask, MODE_ZEROING);
+                    vmula(c, z, weight, mask, MODE_ZEROING);
+                    vmula(d, t, weight, mask, MODE_ZEROING);
+                }
+                write_cached_row(a, b, cache + column, hist, 128, 128, 128, 128, column == 0, valid, true);
+                write_cached_row(c, d, cache + column + 256, hist, 128, 128, 128, 128, false, valid + 256,
+                                 true);
+            }
+        }
+
+        __tf__ __aicore__ void pool_map(__ubuf__ uint32_t* indices, __ubuf__ uint32_t* candidates,
+                                        __ubuf__ uint32_t* pages) {
+            __VEC_SCOPE__ {
+                vector_u32 pos, block, logical, physical, within, mask7, mask127;
+                vector_bool valid;
+                auto mask = pset_b32(PAT_ALL);
+                vbr(mask7, uint32_t(7));
+                vbr(mask127, uint32_t(127));
+                for (uint16_t chunk = 0; chunk < 8; ++chunk) {
+                    vlds(pos, indices, chunk * 64, NORM);
+                    vcmps_ne(valid, pos, uint32_t(-1), mask);
+                    vshrs(block, pos, 3, mask, MODE_ZEROING);
+                    vgather2(logical, candidates, block, valid);
+                    vshls(logical, logical, 3, mask, MODE_ZEROING);
+                    vand(within, pos, mask7, mask, MODE_ZEROING);
+                    vadd(logical, logical, within, mask, MODE_ZEROING);
+                    vshrs(block, logical, 7, mask, MODE_ZEROING);
+                    vgather2(physical, pages, block, valid);
+                    vshls(physical, physical, 7, mask, MODE_ZEROING);
+                    vand(within, logical, mask127, mask, MODE_ZEROING);
+                    vadd(physical, physical, within, mask, MODE_ZEROING);
+                    vsel(pos, physical, pos, valid);
+                    vsts(pos, indices, chunk * 64, NORM_B32, mask);
+                }
+            }
+        }
+
+        __tf__ __aicore__ void prepare_pool_metadata(__ubuf__ int32_t* ids, __ubuf__ int32_t* pages,
+                                                     __ubuf__ int32_t* direct, int capacity, int count,
+                                                     int visible, int table_width, int cache_pages) {
+            __VEC_SCOPE__ {
+                vector_u32 candidate, page_index, page, invalid, zero, lane, first, expected, error, reduced,
+                    within;
+                vector_bool active, bounded, mapped, contiguous, aligned;
+                auto all = pset_b32(PAT_ALL);
+                vbr(invalid, uint32_t(-1));
+                vbr(zero, uint32_t(0));
+                uint32_t remaining = capacity;
+                for (uint16_t chunk = 0; chunk < (capacity + 63) / 64; ++chunk) {
+                    auto mask = CreatePredicate<uint32_t>(remaining);
+                    vlds(candidate, (__ubuf__ uint32_t*)ids, chunk * 64, NORM);
+                    vci((vector_s32&)lane, int32_t(chunk * 64), INC_ORDER);
+                    vcmps_lt(active, lane, uint32_t(count), mask);
+                    vcmps_lt(bounded, candidate, uint32_t((visible + 7) / 8), mask);
+                    pand(active, active, bounded, mask);
+                    vshrs(page_index, candidate, 4, mask, MODE_ZEROING);
+                    vcmps_lt(bounded, page_index, uint32_t(table_width), mask);
+                    pand(active, active, bounded, mask);
+                    vgather2(page, (__ubuf__ uint32_t*)pages, page_index, active);
+                    vcmps_lt(mapped, page, uint32_t(cache_pages), mask);
+                    pand(active, active, mapped, mask);
+                    vsel(candidate, candidate, invalid, active);
+                    vsts(candidate, (__ubuf__ uint32_t*)ids, chunk * 64, NORM_B32, mask);
+                }
+                mem_bar(VST_VLD);
+                uint32_t sixteen = 16, one = 1;
+                auto block = CreatePredicate<uint32_t>(sixteen);
+                auto scalar = CreatePredicate<uint32_t>(one);
+                vci((vector_s32&)lane, 0, INC_ORDER);
+                for (uint16_t half = 0; half < capacity / 16; ++half) {
+                    vlds(candidate, (__ubuf__ uint32_t*)ids, half * 16, NORM);
+                    vlds(first, (__ubuf__ uint32_t*)ids, half * 16, BRC_B32);
+                    vadd(expected, first, lane, block, MODE_ZEROING);
+                    vxor(error, candidate, expected, block, MODE_ZEROING);
+                    vcmax(reduced, error, block, MODE_ZEROING);
+                    vcmps_eq(contiguous, reduced, uint32_t(0), scalar);
+                    vshrs(page_index, first, 4, scalar, MODE_ZEROING);
+                    vcmps_lt(bounded, page_index, uint32_t(table_width), scalar);
+                    pand(contiguous, contiguous, bounded, scalar);
+                    vbr(within, uint32_t(15));
+                    vand(within, first, within, scalar, MODE_ZEROING);
+                    vcmps_eq(aligned, within, uint32_t(0), scalar);
+                    pand(contiguous, contiguous, aligned, scalar);
+                    vgather2(page, (__ubuf__ uint32_t*)pages, page_index, contiguous);
+                    vsel(page, page, invalid, contiguous);
+                    vsts(page, (__ubuf__ uint32_t*)direct, half * 8, NORM_B32, scalar);
+                }
+            }
+        }
+
+        __tf__ __aicore__ void pool_validity(__ubuf__ int32_t* ids, __ubuf__ int32_t* output, int visible,
+                                             int count) {
+            __VEC_SCOPE__ {
+                vector_u32 row, block, logical, within, seven, one, zero, result;
+                vector_bool causal, active;
+                auto full = pset_b32(PAT_ALL);
+                vbr(seven, uint32_t(7));
+                vbr(one, uint32_t(1));
+                vbr(zero, uint32_t(0));
+                for (uint16_t part = 0; part < 8; ++part) {
+                    vci((vector_s32&)row, int32_t(part * 64), INC_ORDER);
+                    vshrs(block, row, 3, full, MODE_ZEROING);
+                    vgather2(logical, (__ubuf__ uint32_t*)ids, block, full);
+                    vshls(logical, logical, 3, full, MODE_ZEROING);
+                    vand(within, row, seven, full, MODE_ZEROING);
+                    vadd(logical, logical, within, full, MODE_ZEROING);
+                    vcmps_lt(causal, logical, uint32_t(visible), full);
+                    vcmps_lt(active, row, uint32_t(count), full);
+                    pand(active, active, causal, full);
+                    vsel(result, one, zero, active);
+                    vsts(result, (__ubuf__ uint32_t*)output, part * 64, NORM_B32, full);
+                }
+            }
+        }
+
+        __tf__ __aicore__ void pool_physical_rows(__ubuf__ int32_t* ids, __ubuf__ int32_t* pages,
+                                                  __ubuf__ uint32_t* output, int capacity) {
+            __VEC_SCOPE__ {
+                vector_u32 candidate, page, physical, within, fifteen, zero;
+                vector_bool valid;
+                vbr(fifteen, uint32_t(15));
+                vbr(zero, uint32_t(0));
+                uint32_t remaining = capacity;
+                for (uint16_t chunk = 0; chunk < (capacity + 63) / 64; ++chunk) {
+                    auto mask = CreatePredicate<uint32_t>(remaining);
+                    vlds(candidate, (__ubuf__ uint32_t*)ids, chunk * 64, NORM);
+                    vcmps_ne(valid, candidate, uint32_t(-1), mask);
+                    vshrs(page, candidate, 4, mask, MODE_ZEROING);
+                    vgather2(physical, (__ubuf__ uint32_t*)pages, page, valid);
+                    vshls(physical, physical, 7, mask, MODE_ZEROING);
+                    vand(within, candidate, fifteen, mask, MODE_ZEROING);
+                    vshls(within, within, 3, mask, MODE_ZEROING);
+                    vadd(physical, physical, within, mask, MODE_ZEROING);
+                    vsel(physical, physical, zero, valid);
+                    vsts(physical, output, chunk * 64, NORM_B32, mask);
+                }
+            }
+        }
+
+        __aicore__ inline void gather_pool_half(__gm__ int64_t* args, int panel, __gm__ uint8_t* ring,
+                                                int slot, bool reuse) {
+            int lane = get_subblockid();
+            int ub_base = lane == 0 ? (slot == 0 ? 0 : 147456) : (slot == 0 ? 65536 : 222208);
+            auto physical = ub<uint32_t>(lane == 0 ? 49152 : 82944) + panel * 64 + lane * 32;
+            auto payload = data<uint8_t>(args, 3);
+            auto scale = data<uint8_t>(args, 4);
+            if (reuse)
+                wait_flag(PIPE_MTE3, PIPE_MTE2, event_t(4 + slot));
+#pragma unroll 8
+            for (int pair = 0; pair < 16; ++pair) {
+                uint64_t addresses = reinterpret_cast<__ubuf__ uint64_t*>(physical)[pair];
+                int64_t first = uint32_t(addresses), second = uint32_t(addresses >> 32);
+                if (second >= first + 8) {
+                    int64_t payload_stride = (second - first) * 64;
+                    int64_t scale_stride = (second - first) * 4;
+                    Vec<uint8_t, 2, 512> keys;
+                    Vec<uint8_t, 2, 32> scales;
+                    TASSIGN(keys, ub_base + pair * 1024);
+                    TASSIGN(scales, ub_base + 16384 + pair * 64);
+                    load_value(keys, (GM<uint8_t, 2, 512, 2, DYNAMIC>(
+                                         payload + first * 64, TileShape2D<uint8_t, 2, 512>(2, 512),
+                                         BaseShape2D<uint8_t, 2, DYNAMIC>(2, payload_stride))));
+                    load_value(scales, (GM<uint8_t, 2, 32, 2, DYNAMIC>(
+                                           scale + first * 4, TileShape2D<uint8_t, 2, 32>(2, 32),
+                                           BaseShape2D<uint8_t, 2, DYNAMIC>(2, scale_stride))));
+                } else {
+                    for (int half = 0; half < 2; ++half) {
+                        int64_t row = half == 0 ? first : second;
+                        Vec<uint8_t, 8, 64> keys;
+                        Vec<uint8_t, 1, 32> scales;
+                        TASSIGN(keys, ub_base + pair * 1024 + half * 512);
+                        TASSIGN(scales, ub_base + 16384 + pair * 64 + half * 32);
+                        load_value(keys, (GM<uint8_t, 8, 64, 8, 64>(payload + row * 64)));
+                        load_value(scales, (GM<uint8_t, 1, 32, 1, 32>(scale + row * 4)));
+                    }
+                }
+            }
+            Vec<uint8_t, 256, 64> keys;
+            Vec<uint8_t, 1, 1024> scales;
+            TASSIGN(keys, ub_base);
+            TASSIGN(scales, ub_base + 16384);
+            set_flag(PIPE_MTE2, PIPE_MTE3, event_t(4 + slot));
+            wait_flag(PIPE_MTE2, PIPE_MTE3, event_t(4 + slot));
+            store_value((GM<uint8_t, 256, 64, 256, 64>(ring + lane * 16384)), keys);
+            store_value((GM<uint8_t, 1, 1024, 1, 1024>(ring + 32768 + lane * 1024)), scales);
+            set_flag(PIPE_MTE3, PIPE_MTE2, event_t(4 + slot));
+        }
+#endif
+
+        // Each worker owns two 34 KiB gather slots and 12 KiB of sanitized pool metadata.
+        // AIV0 gathers the first 256 tokens; AIV1 gathers the second half and reduces scores.
+        __aicore__ inline void run_pool(__gm__ int64_t* args) {
+            int worker = get_block_idx(args), workers = get_block_num(args);
+            int capacity = reinterpret_cast<__gm__ Tensor*>(args[12])->shapes[1];
+            int tokens = args[18], table_width = args[17];
+            auto cache_payload = data<F4>(args, 3);
+            auto cache_scale = data<S>(args, 4);
+            int padded_capacity = (capacity + 63) / 64 * 64;
+            int token_panels = padded_capacity / 64;
+            int owners = minimum(workers, tokens * token_panels);
+            if (worker >= owners) return;
+            int first = tokens * token_panels * worker / owners;
+            int finish = tokens * token_panels * (worker + 1) / owners;
+            for (int cursor = first; cursor < finish;) {
+                int token = cursor / token_panels;
+                int first_panel = cursor % token_panels;
+                int next = minimum(finish, (token + 1) * token_panels);
+                int last_panel = next - token * token_panels;
+                int count = minimum(capacity, read(data<int32_t>(args, 13) + token));
+                if (count < 0)
+                    count = 0;
+                int request = read(data<int32_t>(args, 6) + token);
+                int visible = read(data<int32_t>(args, 7) + token);
+                if (visible < 0)
+                    visible = 0;
+                if (request < 0 || request >= reinterpret_cast<__gm__ Tensor*>(args[5])->shapes[0]) {
+                    request = 0;
+                    count = 0;
+                }
+                last_panel = minimum(last_panel, (count + 63) / 64);
+                int panels = last_panel > first_panel ? last_panel - first_panel : 0;
+                auto metadata = data<int32_t>(args, 14) + worker * 20480 + 17408;
+                bool gathered_slot0 = false, gathered_slot1 = false;
+#if defined(__DAV_CUBE__)
+                Tile<TileType::Mat, F4, 32, 128, BLayout::ColMajor, 32, 128, SLayout::RowMajor> query;
+                TASSIGN(query, 0);
+                GM<F4, 32, 128, 32, 128> qdata(data<F4>(args, 0) + token * 2048);
+                TLOAD(query, qdata);
+                QueryScale query_scale(32);
+                TASSIGN(query_scale, 49152);
+                using QS = TileShape2D<S, DYNAMIC, 4, Layout::MX_A_ND>;
+                using QD = BaseShape2D<S, DYNAMIC, 4, Layout::MX_A_ND>;
+                GlobalTensor<S, QS, QD, Layout::MX_A_ND> qg(data<S>(args, 1) + token * 128, QS(32, 4),
+                                                            QD(32, 4));
+                TLOAD(query_scale, qg);
+                set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+                wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+                TileLeft<F4, 32, 128> left;
+                TileLeftScale<S, 32, 4> left_scale;
+                TASSIGN(left, 0);
+                TASSIGN(left_scale, GetScaleAddr(left.data()));
+                TEXTRACT(left, query, 0, 0);
+                TEXTRACT(left_scale, query_scale, 0, 0);
+#else
+                prepare_weights(args, token, 1);
+                if (get_subblockid() == 0) {
+                    Tile<TileType::Vec, int32_t, 1, 16384, BLayout::RowMajor, 1, DYNAMIC> pages(table_width);
+                    TASSIGN(pages, 73728);
+                    load_value(pages, (GM<int32_t, 1, DYNAMIC, 1, DYNAMIC>(
+                                          data<int32_t>(args, 5) + request * table_width,
+                                          TileShape2D<int32_t, 1, DYNAMIC>(1, table_width),
+                                          BaseShape2D<int32_t, 1, DYNAMIC>(1, table_width))));
+                    set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+                    wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+                    Tile<TileType::Vec, int32_t, 1, 2048, BLayout::RowMajor, 1, DYNAMIC> ids(capacity);
+                    TASSIGN(ids, 32768);
+                    Vec<int32_t, 1, 2048> padded_ids;
+                    TASSIGN(padded_ids, 32768);
+                    TEXPANDS(padded_ids, int32_t(-1));
+                    set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+                    wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+                    load_value(ids, (GM<int32_t, 1, DYNAMIC, 1, DYNAMIC>(
+                                        data<int32_t>(args, 12) + token * capacity,
+                                        TileShape2D<int32_t, 1, DYNAMIC>(1, capacity),
+                                        BaseShape2D<int32_t, 1, DYNAMIC>(1, capacity))));
+                    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+                    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+                    prepare_pool_metadata(ids.data(), pages.data(), ub<int32_t>(40960), padded_capacity,
+                                          count, visible, table_width,
+                                          reinterpret_cast<__gm__ Tensor*>(args[3])->shapes[0]);
+                    pool_physical_rows(ids.data(), pages.data(), ub<uint32_t>(49152), padded_capacity);
+                    Vec<int32_t, 1, 1024> direct;
+                    TASSIGN(direct, 40960);
+                    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+                    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+                    store_value((GM<int32_t, 1, 2048, 1, 2048>(metadata)), padded_ids);
+                    store_value((GM<int32_t, 1, 1024, 1, 1024>(metadata + 2048)), direct);
+                    set_intra_block(PIPE_MTE3, 7);
+                    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+                    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+                } else {
+                    wait_intra_block(PIPE_MTE2, 7);
+                    Tile<TileType::Vec, int32_t, 1, 2048, BLayout::RowMajor, 1, DYNAMIC> ids(padded_capacity);
+                    TASSIGN(ids, 134656);
+                    load_value(ids, (GM<int32_t, 1, DYNAMIC, 1, DYNAMIC>(
+                                        metadata, TileShape2D<int32_t, 1, DYNAMIC>(1, padded_capacity),
+                                        BaseShape2D<int32_t, 1, DYNAMIC>(1, padded_capacity))));
+                    Tile<TileType::Vec, int32_t, 1, 16384, BLayout::RowMajor, 1, DYNAMIC> pages(table_width);
+                    Vec<int32_t, 1, 1024> direct;
+                    TASSIGN(pages, 143360);
+                    TASSIGN(direct, 212992);
+                    load_value(pages, (GM<int32_t, 1, DYNAMIC, 1, DYNAMIC>(
+                                          data<int32_t>(args, 5) + request * table_width,
+                                          TileShape2D<int32_t, 1, DYNAMIC>(1, table_width),
+                                          BaseShape2D<int32_t, 1, DYNAMIC>(1, table_width))));
+                    load_value(direct, (GM<int32_t, 1, 1024, 1, 1024>(metadata + 2048)));
+                    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+                    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+                    pool_physical_rows(ids.data(), pages.data(), ub<uint32_t>(82944), padded_capacity);
+                    set_flag(PIPE_V, PIPE_S, EVENT_ID0);
+                    wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
+                }
+#endif
+#if defined(__DAV_CUBE__)
+                wait_intra_block(PIPE_S, 7);
+                set_intra_block(PIPE_S, 23);
+#endif
+                for (int local_panel = 0; local_panel < panels; ++local_panel) {
+                    int panel = first_panel + local_panel;
+                    int slot = local_panel % 2;
+                    auto ring = data<uint8_t>(args, 14) + worker * 81920 + slot * 34816;
+#if defined(__DAV_CUBE__)
+                    int page0 = read(metadata + 2048 + panel * 32);
+                    int page1 = metadata[2048 + panel * 32 + 8];
+                    int page2 = read(metadata + 2048 + panel * 32 + 16);
+                    int page3 = metadata[2048 + panel * 32 + 24];
+                    bool direct = page0 >= 0 && page1 >= 0 && page2 >= 0 && page3 >= 0;
+                    if (!direct) {
+                        wait_intra_block(PIPE_MTE2, 8 + slot * 2);
+                        wait_intra_block(PIPE_MTE2, 24 + slot * 2);
+                    }
+                    using Key =
+                        Tile<TileType::Mat, F4, 128, 512, BLayout::RowMajor, 128, 512, SLayout::ColMajor>;
+                    using Scale =
+                        Tile<TileType::Mat, S, 4, 512, BLayout::ColMajor, 4, 512, SLayout::ColMajor, 32>;
+                    Key key;
+                    Scale key_scale;
+                    TileRight<F4, 128, 512> right;
+                    TileRightScale<S, 4, 512> right_scale;
+                    TileAcc<float, 32, 512> dot;
+                    TASSIGN(key, 65536 + slot * 65536);
+                    TASSIGN(key_scale, 98304 + slot * 65536);
+                    TASSIGN(right, slot * 32768);
+                    TASSIGN(right_scale, GetScaleAddr(right.data()));
+                    TASSIGN(dot, 0);
+                    if (local_panel >= 2)
+                        wait_flag(PIPE_MTE1, PIPE_MTE2, event_t(2 + slot));
+                    for (int piece = 0; piece < 4; ++piece) {
+                        using KeyPart =
+                            Tile<TileType::Mat, F4, 128, 512, BLayout::RowMajor, 128, 128, SLayout::ColMajor>;
+                        KeyPart part;
+                        KeyScale part_scale;
+                        TASSIGN(part, 65536 + slot * 65536 + piece * 4096);
+                        TASSIGN(part_scale, 98304 + slot * 65536 + piece * 512);
+                        int page = piece == 0 ? page0 : piece == 1 ? page1 : piece == 2 ? page2 : page3;
+                        auto kp = direct ? cache_payload + int64_t(page) * 8192
+                                         : reinterpret_cast<__gm__ F4*>(ring + piece * 8192);
+                        auto sp = direct ? cache_scale + int64_t(page) * 512
+                                         : reinterpret_cast<__gm__ S*>(ring + 32768 + piece * 512);
+                        GM<F4, 128, 128, 128, 128, Layout::DN> kg(kp);
+                        GM<S, 4, 128, 4, 128, Layout::MX_B_DN> sg(sp);
+                        TLOAD(part, kg);
+                        TLOAD(part_scale, sg);
+                    }
+                    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+                    wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+                    if (local_panel >= 2)
+                        wait_flag(PIPE_M, PIPE_MTE1, event_t(2 + slot));
+                    TMOV(right, key);
+                    TMOV(right_scale, key_scale);
+                    set_flag(PIPE_MTE1, PIPE_MTE2, event_t(2 + slot));
+                    set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+                    wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+                    TMATMUL_MX<AccPhase::Final>(dot, left, left_scale, right, right_scale);
+                    set_flag(PIPE_M, PIPE_MTE1, event_t(2 + slot));
+                    if (local_panel >= 2)
+                        wait_intra_block(PIPE_FIX, slot * 2 + 17);
+                    using Received = Vec<bfloat16_t, 32, 512>;
+                    Received received;
+                    TASSIGN(received, slot * 32768);
+                    TMOV<STPhase::Final, Received, TileAcc<float, 32, 512>, AccToVecMode::SingleModeVec1,
+                         ReluPreMode::NormalRelu>(received, dot);
+                    set_intra_block(PIPE_FIX, slot * 2 + 16);
+                    if (!direct) {
+                        set_intra_block(PIPE_MTE2, 9 + slot * 2);
+                        set_intra_block(PIPE_MTE2, 25 + slot * 2);
+                    }
+#else
+                    int direct_base = get_subblockid() == 0 ? 40960 : 212992;
+                    bool direct = ub<int32_t>(direct_base)[panel * 32] >= 0 &&
+                                  ub<int32_t>(direct_base)[panel * 32 + 8] >= 0;
+                    direct = direct && ub<int32_t>(direct_base)[panel * 32 + 16] >= 0 &&
+                             ub<int32_t>(direct_base)[panel * 32 + 24] >= 0;
+                    if (!direct) {
+                        if (slot == 0 ? gathered_slot0 : gathered_slot1)
+                            wait_intra_block(PIPE_MTE2, 9 + slot * 2);
+                        gather_pool_half(args, panel, ring, slot, slot == 0 ? gathered_slot0 : gathered_slot1);
+                        set_intra_block(PIPE_MTE3, 8 + slot * 2);
+                        if (slot == 0)
+                            gathered_slot0 = true;
+                        else
+                            gathered_slot1 = true;
+                    }
+                    if (get_subblockid() == 1) {
+                        wait_intra_block(PIPE_V, slot * 2);
+                        Vec<int32_t, 1, 512> raw_valid;
+                        Vec<uint16_t, 1, 512> valid;
+                        TASSIGN(raw_valid, 240640 + slot * 2048);
+                        TASSIGN(valid, 244736 + slot * 1024);
+                        pool_validity(ub<int32_t>(134656) + panel * 64, raw_valid.data(), visible,
+                                      minimum(512, (count - panel * 64) * 8));
+                        TCVT(valid, raw_valid, RoundMode::CAST_NONE);
+                        pool_score(ub<bfloat16_t>(slot * 32768), ub<bfloat16_t>(257280), ub<uint16_t>(98304),
+                                   ub<uint16_t>(251904), valid.data(), local_panel * 512);
+                        set_intra_block(PIPE_V, slot * 2 + 1);
+                    }
+#endif
+                }
+#if defined(__DAV_CUBE__)
+                for (int slot = 0; slot < minimum(2, panels); ++slot) {
+                    wait_flag(PIPE_MTE1, PIPE_MTE2, event_t(2 + slot));
+                    wait_flag(PIPE_M, PIPE_MTE1, event_t(2 + slot));
+                }
+                for (int slot = 0; slot < minimum(2, panels); ++slot)
+                    wait_intra_block(PIPE_FIX, slot * 2 + 17);
+                wait_intra_block(PIPE_S, 22);
+                set_intra_block(PIPE_S, 4);
+#else
+                if (gathered_slot0)
+                    wait_intra_block(PIPE_MTE2, 9);
+                if (gathered_slot1)
+                    wait_intra_block(PIPE_MTE2, 11);
+                if (gathered_slot0)
+                    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID4);
+                if (gathered_slot1)
+                    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID5);
+                if (get_subblockid() == 1) {
+                    CandidateKeys keys;
+                    CandidateIndices indices;
+                    TASSIGN(keys, 51200);
+                    TASSIGN(indices, 52224);
+                    // Histogram counts include the masked suffix of the last 512-token tile.
+                    int cached_width = panels * 512;
+                    local_select(keys.data(), indices.data(), ub<uint16_t>(98304), cached_width,
+                                 first_panel * 512, ub<uint16_t>(251904));
+                    bool complete = first_panel == 0 && next == (token + 1) * token_panels;
+                    if (complete) {
+                        pool_map(indices.data(), ub<uint32_t>(134656), ub<uint32_t>(143360));
+                        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+                        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+                        store_value((GM<uint32_t, 1, 512, 1, 512>(data<uint32_t>(args, 8) + token * 512)),
+                                    indices);
+                    } else {
+                        int output_offset = (token * workers + worker) * 512;
+                        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+                        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+                        store_value((GM<uint16_t, 1, 512, 1, 512>(data<uint16_t>(args, 10) + output_offset)),
+                                    keys);
+                        store_value((GM<uint32_t, 1, 512, 1, 512>(data<uint32_t>(args, 11) + output_offset)),
+                                    indices);
+                    }
+                    pipe_barrier(PIPE_ALL);
+                    set_intra_block(PIPE_MTE3, 6);
+                } else {
+                    // Keep the current pool metadata live until both consumers finish.
+                    wait_intra_block(PIPE_S, 4);
+                }
+#endif
+                cursor = next;
+            }
+        }
+
+#if defined(__DAV_VEC__)
+        __aicore__ inline void merge_pool(__gm__ int64_t* args) {
+            int worker = get_block_idx(args) * 2 + get_subblockid();
+            int workers = get_block_num(args), tokens = args[18];
+            int capacity = reinterpret_cast<__gm__ Tensor*>(args[12])->shapes[1];
+            int panels = (capacity + 63) / 64, total = tokens * panels, table_width = args[17];
+            int owners = minimum(workers, total);
+            for (int token = worker; token < tokens; token += workers * 2) {
+                int first = ((token * panels + 1) * owners - 1) / total;
+                int last = (((token + 1) * panels) * owners - 1) / total;
+                if (first == last)
+                    continue;
+                int count = (last - first + 1) * 512;
+                int offset = (token * workers + first) * 512;
+                Tile<TileType::Vec, uint16_t, 1, 16384, BLayout::RowMajor, 1, DYNAMIC> keys(count);
+                Tile<TileType::Vec, uint32_t, 1, 16384, BLayout::RowMajor, 1, DYNAMIC> indices(count);
+                TASSIGN(keys, 0);
+                TASSIGN(indices, 65536);
+                load_value(keys,
+                           (GM<uint16_t, 1, DYNAMIC, 1, DYNAMIC>(
+                               data<uint16_t>(args, 10) + offset, TileShape2D<uint16_t, 1, DYNAMIC>(1, count),
+                               BaseShape2D<uint16_t, 1, DYNAMIC>(1, count))));
+                load_value(indices,
+                           (GM<uint32_t, 1, DYNAMIC, 1, DYNAMIC>(
+                               data<uint32_t>(args, 11) + offset, TileShape2D<uint32_t, 1, DYNAMIC>(1, count),
+                               BaseShape2D<uint32_t, 1, DYNAMIC>(1, count))));
+                Tile<TileType::Vec, uint32_t, 1, 2048, BLayout::RowMajor, 1, DYNAMIC> candidates(capacity);
+                Tile<TileType::Vec, uint32_t, 1, 16384, BLayout::RowMajor, 1, DYNAMIC> pages(table_width);
+                TASSIGN(candidates, 134656);
+                TASSIGN(pages, 143360);
+                int request = read(data<int32_t>(args, 6) + token);
+                if (request < 0 || request >= reinterpret_cast<__gm__ Tensor*>(args[5])->shapes[0])
+                    request = 0;
+                load_value(candidates, (GM<uint32_t, 1, DYNAMIC, 1, DYNAMIC>(
+                                           data<uint32_t>(args, 12) + token * capacity,
+                                           TileShape2D<uint32_t, 1, DYNAMIC>(1, capacity),
+                                           BaseShape2D<uint32_t, 1, DYNAMIC>(1, capacity))));
+                load_value(pages, (GM<uint32_t, 1, DYNAMIC, 1, DYNAMIC>(
+                                      data<uint32_t>(args, 5) + request * table_width,
+                                      TileShape2D<uint32_t, 1, DYNAMIC>(1, table_width),
+                                      BaseShape2D<uint32_t, 1, DYNAMIC>(1, table_width))));
+                set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+                wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+                uint32_t cutoff;
+                int boundary;
+                packed_threshold(keys.data(), count, 32768, 131072, cutoff, boundary);
+                CandidateKeys selected_keys;
+                CandidateIndices selected_indices;
+                TASSIGN(selected_keys, 131584);
+                TASSIGN(selected_indices, 132608);
+                packed_select(selected_keys.data(), selected_indices.data(), keys.data(), indices.data(),
+                              (__ubuf__ uint32_t*)0, count, cutoff, boundary, false, false);
+                pool_map(selected_indices.data(), candidates.data(), pages.data());
+                set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+                wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+                store_value((GM<uint32_t, 1, 512, 1, 512>(data<uint32_t>(args, 8) + token * 512)),
+                            selected_indices);
+                pipe_barrier(PIPE_ALL);
+            }
+        }
+#endif
+
         __aicore__ inline void run(__gm__ int64_t* args) {
             int width = args[15], stride = args[16], table_width = args[17];
             int gathered_rows = args[19];
@@ -958,6 +1508,14 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 #else
     set_ctrl(sbitset0(get_ctrl(), pto::MAD_MODE_BIT));
 #endif
+    if (args[19] < 0) {
+        fused::run_pool(args);
+        SYNCALL<SyncCoreType::AIVOnly>();
+#if defined(__DAV_VEC__)
+        fused::merge_pool(args);
+#endif
+        return;
+    }
     fused::run(args);
     SYNCALL<SyncCoreType::AIVOnly>();
 #if defined(__DAV_VEC__)
