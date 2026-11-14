@@ -12,6 +12,7 @@ attention-normalized inputs for both decode and prefill attention paths."""
 import inspect
 
 import pypto.language as pl
+from causal_cache_ready import CAUSAL_CACHE_TILE, CAUSAL_FAMILIES, causal_publish_prefix
 import pypto.language.distributed as pld
 from projection_exchange import (
     PROJECTION_KINDS, PROJECTION_RANKS, PROJECTION_SIGNAL_ROWS,
@@ -22,6 +23,7 @@ from projection_exchange import (
 from projection_weight_layout import PROJECTION_WEIGHT_LAYOUT
 
 from config import (
+    BLOCK_SIZE,
     FLASH as M,
     DECODE_BATCH,
     DECODE_SEQ,
@@ -1789,3 +1791,56 @@ if __name__ == "__main__":
             if result.error:
                 print(result.error)
             raise SystemExit(1)
+
+
+@pl.jit.inline(auto_scope=False)
+def kv_proj_cache_causal(
+    x: pl.Tensor,
+    wkv: pl.Tensor,
+    gamma_ckv: pl.Tensor,
+    rope_cos_il: pl.Tensor,
+    rope_sin_signed: pl.Tensor,
+    rope_swap_idx: pl.Tensor,
+    kv_cache: pl.Tensor,
+    slot_mapping: pl.Tensor,
+    causal_ready: pld.DistributedTensor[[CAUSAL_FAMILIES, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    seed: pl.Scalar[pl.TASK_ID],
+):
+    """Run ordered raw-KV projection and publish complete physical cache tiles."""
+    rows = pl.tensor.dim(x, 0)
+    cache_rows = pl.tensor.dim(kv_cache, 0) * BLOCK_SIZE
+    kv_cache_flat = pl.reshape(kv_cache, [cache_rows, HEAD_DIM])
+    kv_slots = pl.create_tensor([2 * CAUSAL_CACHE_TILE, HEAD_DIM], dtype=pl.BF16)
+    raw_slot_retired = pl.array.create(2, pl.TASK_ID)
+    raw_slot_retired[0] = seed
+    raw_slot_retired[1] = seed
+    published = pl.array.create(1, pl.TASK_ID)
+    published[0] = seed
+    for tile_base in pl.range(0, rows, CAUSAL_CACHE_TILE):
+        with pl.scope():
+            tile_rows = pl.min(CAUSAL_CACHE_TILE, rows - tile_base)
+            tile_x = x[tile_base:tile_base + tile_rows, :]
+            tile_cos = rope_cos_il[tile_base:tile_base + tile_rows, :]
+            tile_sin = rope_sin_signed[tile_base:tile_base + tile_rows, :]
+            tile_swap = rope_swap_idx[tile_base:tile_base + tile_rows, :]
+            raw_lane = (tile_base // CAUSAL_CACHE_TILE) % 2
+            raw_slot_begin = raw_lane * CAUSAL_CACHE_TILE
+            tile_kv = kv_slots[raw_slot_begin:raw_slot_begin + tile_rows, :]
+            previous_raw_slot = raw_slot_retired[raw_lane]
+            kv_proj_rope(tile_x, wkv, gamma_ckv, tile_cos, tile_sin, tile_swap, tile_kv, previous_raw_slot)
+            with pl.spmd((tile_rows + 15) // 16, name_hint="causal_raw_cache_scatter") as cache_complete:
+                write_base = pl.tile.get_block_idx() * 16
+                for offset in pl.range(16):
+                    local_row = write_base + offset
+                    if local_row < tile_rows:
+                        physical_row = pl.read(slot_mapping, [tile_base + local_row])
+                        if physical_row >= 0:
+                            write_row = pl.cast(physical_row, pl.INDEX)
+                            kv_cache_flat[write_row:write_row + 1, :] = tile_kv[local_row:local_row + 1, :]
+            raw_slot_retired[raw_lane] = cache_complete
+            previous_raw_publication = published[0]
+            tile_published = causal_publish_prefix(causal_ready, my_rank, tile_rows, cache_complete, previous_raw_publication, 0)
+            published[0] = tile_published
+    raw_complete = published[0]
+    return raw_complete

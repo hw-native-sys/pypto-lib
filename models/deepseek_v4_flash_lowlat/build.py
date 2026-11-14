@@ -106,7 +106,9 @@ def _validate_target_capacity(metadata, profile, max_seq_len):
 
 
 def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=180, max_seq_len=1048576,
-                    prefill_indexer_arenas=1, projection_degrees=None, prefill_moe_ready=False):
+                    prefill_indexer_arenas=1, projection_degrees=None, prefill_moe_ready=False,
+                    prefill_causal_ready=False, prefill_causal_full_wait=False,
+                    prefill_echo_prefetch=False, prefill_echo_diagnostics=False, prefill_mechanisms=None):
     """Compile one immutable source profile; device IDs describe topology only."""
     if profile not in ("single", "one", "two", "rsag", "prefill"):
         raise ValueError("Unknown request-pipeline source profile")
@@ -120,12 +122,32 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
         raise ValueError("Prefill MoE readiness must be a boolean compile option")
     if profile != "prefill" and prefill_moe_ready:
         raise ValueError("MoE readiness selection applies only to prefill")
+    from .prefill_fwd import resolve_prefill_mechanisms
+    selected_mechanisms = resolve_prefill_mechanisms(prefill_mechanisms, echo_prefetch=prefill_echo_prefetch, causal_ready=prefill_causal_ready)
+    prefill_echo_prefetch = selected_mechanisms in ("echo-only", "both")
+    prefill_causal_ready = selected_mechanisms in ("causal-only", "both")
+    if type(prefill_causal_ready) is not bool or type(prefill_causal_full_wait) is not bool:
+        raise ValueError("Causal readiness options must be boolean compile options")
+    if profile != "prefill" and (prefill_causal_ready or prefill_causal_full_wait):
+        raise ValueError("Causal cache readiness applies only to prefill")
+    if prefill_causal_full_wait and not prefill_causal_ready:
+        raise ValueError("Full-prefix diagnostics require causal cache readiness")
+    if type(prefill_echo_prefetch) is not bool or type(prefill_echo_diagnostics) is not bool:
+        raise ValueError("ECHO options must be booleans")
+    if prefill_echo_prefetch and (profile != "prefill" or prefill_indexer_arenas != 2):
+        raise ValueError("ECHO requires prefill with two indexer arenas")
+    if prefill_echo_diagnostics and not prefill_echo_prefetch:
+        raise ValueError("ECHO diagnostics require ECHO prefetch")
+    if prefill_mechanisms is not None and (profile != "prefill" or prefill_indexer_arenas != 2 or not prefill_moe_ready):
+        raise ValueError("Mechanism comparisons require prefill exact2 and MoE-ready")
     degrees = {family: 8 for family in ("swa", "csa", "hca")}
     degrees.update(projection_degrees or {})
     if set(degrees) != {"swa", "csa", "hca"} or any(type(d) is not int or d not in (1, 2, 4, 8) for d in degrees.values()):
         raise ValueError("Projection degrees require swa/csa/hca and d=1/2/4/8")
     if profile != "prefill" and any(d != 8 for d in degrees.values()):
         raise ValueError("Projection degree selection applies only to prefill")
+    if prefill_mechanisms is not None and any(d != 8 for d in degrees.values()):
+        raise ValueError("Mechanism comparisons require eight projection replicas")
     projection_degrees = degrees
     if (
         len(device_ids) != 8
@@ -160,7 +182,13 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
         if profile == "prefill":
             from .prefill_fwd import load_prefill_programs
 
-            function = load_prefill_programs(indexer_arenas=prefill_indexer_arenas, projection_degrees=projection_degrees, moe_ready=prefill_moe_ready)["chunk"]
+            function = load_prefill_programs(
+                indexer_arenas=prefill_indexer_arenas, projection_degrees=projection_degrees,
+                moe_ready=prefill_moe_ready, causal_ready=prefill_causal_ready,
+                causal_full_wait=prefill_causal_full_wait,
+                echo_prefetch=prefill_echo_prefetch, echo_diagnostics=prefill_echo_diagnostics,
+                mechanisms=prefill_mechanisms,
+            )["chunk"]
             kwargs = {}
             selected_source = None
         elif profile == "single":
@@ -238,6 +266,11 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
             projection_replicas=projection_degrees, prefetch="exact", transfer_slots=2,
             indexer_arenas=prefill_indexer_arenas,
             moe_ready=prefill_moe_ready,
+            causal_ready=prefill_causal_ready,
+            causal_full_wait=prefill_causal_full_wait,
+            echo_prefetch=prefill_echo_prefetch, echo_diagnostics=prefill_echo_diagnostics,
+            mechanisms=selected_mechanisms, primary_control="exact2",
+            echo_bins=256, echo_ema_alpha=0.5, echo_query_slots=2,
             resident_projection_layout="ND",
             dispatches_per_chunk=1, tp8_baseline_bitwise_verified=False,
         )
@@ -261,6 +294,11 @@ def main():
     for family in ("swa", "csa", "hca"):
         parser.add_argument("--projection-" + family + "-d", type=int, choices=(1, 2, 4, 8), default=8)
     parser.add_argument("--prefill-moe-ready", action="store_true", help="Experimental bounded T8 compute/publish overlap")
+    parser.add_argument("--prefill-causal-ready", action="store_true", help="Experimental per-query causal cache readiness")
+    parser.add_argument("--prefill-causal-full-wait", action="store_true", help="Diagnostic full-prefix gate with causal control tasks")
+    parser.add_argument("--prefill-echo-prefetch", action="store_true", help="Experimental coarse-bin KV prefetch")
+    parser.add_argument("--prefill-echo-diagnostics", action="store_true", help="Collect ECHO recall counters")
+    parser.add_argument("--prefill-mechanisms", choices=("none", "echo-only", "causal-only", "both"))
     args = parser.parse_args()
     if args.report.exists():
         parser.error("The report already exists; preserve it and choose a new run directory")
@@ -274,6 +312,10 @@ def main():
         max_seq_len=args.max_seq_len,
         prefill_indexer_arenas=args.prefill_indexer_arenas,
         prefill_moe_ready=args.prefill_moe_ready,
+        prefill_causal_ready=args.prefill_causal_ready,
+        prefill_causal_full_wait=args.prefill_causal_full_wait,
+        prefill_echo_prefetch=args.prefill_echo_prefetch, prefill_echo_diagnostics=args.prefill_echo_diagnostics,
+        prefill_mechanisms=args.prefill_mechanisms,
         projection_degrees={family: getattr(args, "projection_" + family + "_d") for family in ("swa", "csa", "hca")},
     )
     report["generation_seconds"] = time.monotonic() - started

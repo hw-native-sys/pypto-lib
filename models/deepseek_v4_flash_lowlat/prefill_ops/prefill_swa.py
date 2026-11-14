@@ -10,12 +10,17 @@
 """DeepSeek-V4 packed prefill SWA attention: single-die at --tp 1, context-parallel above it."""
 
 import pypto.language as pl
+CAUSAL_QUERY_START_LOC_DYN = pl.dynamic("CAUSAL_QUERY_START_LOC_DYN")
+from causal_cache_ready import (
+    CAUSAL_READY, CAUSAL_FAMILIES, CAUSAL_REQUIRED_COLS, CAUSAL_QUERY_TILE,
+    causal_tensor_specs, causal_required_prefixes, causal_publish_prefix, causal_layer_ready,
+)
 from projection_exchange import (
     PROJECTION_KINDS, PROJECTION_RANKS, PROJECTION_SIGNAL_ROWS,
     PROJECTION_WINDOW_COLS, PROJECTION_WINDOW_ROWS,
     projection_degree, projection_tensor_specs,
 )
-from qkv_proj_rope import kv_proj_rope_cp
+from qkv_proj_rope import kv_proj_cache_causal, kv_proj_rope_cp
 
 from projection_weight_layout import PROJECTION_WEIGHT_LAYOUT
 import pypto.language.distributed as pld
@@ -53,6 +58,7 @@ from prefill_o_proj import (
     gather_o_proj_full_weights,
 )
 from prefill_sparse_attn import (
+    sparse_attn_physical_causal,
     PREFILL_ATTN_TILE,
     PREFILL_RING_HEAP,
     SPARSE_BIAS_COLS,
@@ -261,6 +267,9 @@ def prefill_attention_swa_cp_core(
     projection_peers: pl.Tensor[[PROJECTION_RANKS], pl.INT32],
     projection_epochs: pl.Array[PROJECTION_KINDS, pl.INT32],
     projection_rank: pl.Scalar[pl.INT32],
+    causal_ready_signal: pld.DistributedTensor[[CAUSAL_FAMILIES, 1], pl.INT32],
+    causal_epoch_base: pl.Scalar[pl.INT32],
+    causal_query_start_loc: pl.Tensor[[CAUSAL_QUERY_START_LOC_DYN], pl.INT32],
 ):
     """SWA attention body: local queries/output projection and replicated full KV."""
     q_dim = pl.tensor.dim(x_normed_local, 0)
@@ -281,25 +290,45 @@ def prefill_attention_swa_cp_core(
     kv_swap_idx = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
     rope_prepare(freqs_cos_full, freqs_sin_full, kv_cos_il, kv_sin_signed, kv_swap_idx)
 
-    kv_full = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.BF16)
-    if PROJECTION_D < 8:
-        kv_proj_rope_cp(
-            x_normed_full, wkv, gamma_ckv, kv_cos_il, kv_sin_signed, kv_swap_idx, kv_full, late_dep,
-            projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers,
-            projection_epochs, projection_rank, 0, PROJECTION_D,
+    causal_completions = pl.array.create(4, pl.TASK_ID)
+    for causal_stage in pl.unroll(4):
+        causal_completions[causal_stage] = late_dep
+    causal_required = pl.create_tensor([(q_dim + CAUSAL_QUERY_TILE - 1) // CAUSAL_QUERY_TILE, CAUSAL_REQUIRED_COLS], dtype=pl.INT32)
+    if CAUSAL_READY:
+        causal_metadata_ready = causal_required_prefixes(
+            causal_query_start_loc, position_ids_full, position_ids_local, local_request_ids,
+            causal_required, late_dep, 0, False,
         )
+        causal_completions[0] = causal_metadata_ready
+        causal_raw_complete = kv_proj_cache_causal(
+            x_normed_full, wkv, gamma_ckv, kv_cos_il, kv_sin_signed, kv_swap_idx,
+            kv_cache, ori_slot_mapping_full, causal_ready_signal, projection_rank, late_dep,
+        )
+        causal_completions[1] = causal_raw_complete
+        causal_indexer_unused = causal_publish_prefix(causal_ready_signal, projection_rank, kv_dim, late_dep, late_dep, 2)
+        causal_completions[3] = causal_indexer_unused
+        causal_compressed_unused = causal_publish_prefix(causal_ready_signal, projection_rank, kv_dim, late_dep, late_dep, 1)
+        causal_completions[2] = causal_compressed_unused
     else:
-        kv_proj_rope(x_normed_full, wkv, gamma_ckv, kv_cos_il, kv_sin_signed, kv_swap_idx, kv_full, late_dep)
+        kv_full = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.BF16)
+        if PROJECTION_D < 8:
+            kv_proj_rope_cp(
+                x_normed_full, wkv, gamma_ckv, kv_cos_il, kv_sin_signed, kv_swap_idx, kv_full, late_dep,
+                projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers,
+                projection_epochs, projection_rank, 0, PROJECTION_D,
+            )
+        else:
+            kv_proj_rope(x_normed_full, wkv, gamma_ckv, kv_cos_il, kv_sin_signed, kv_swap_idx, kv_full, late_dep)
 
-    block_num = pl.tensor.dim(kv_cache, 0)
-    kv_cache_flat = pl.reshape(kv_cache, [block_num * BLOCK_SIZE, HEAD_DIM])
-    for write_worker in pl.spmd(KV_CACHE_WRITE_WORKERS, name_hint="prefill_swa_cp_cache_write"):
-        for write_t in pl.range(kv_dim):
-            write_row_raw = pl.read(ori_slot_mapping_full, [write_t])
-            if write_row_raw >= 0:
-                write_row = pl.cast(write_row_raw, pl.INDEX)
-                if write_row % KV_CACHE_WRITE_WORKERS == write_worker:
-                    kv_cache_flat[write_row : write_row + 1, :] = kv_full[write_t : write_t + 1, :]
+        block_num = pl.tensor.dim(kv_cache, 0)
+        kv_cache_flat = pl.reshape(kv_cache, [block_num * BLOCK_SIZE, HEAD_DIM])
+        for write_worker in pl.spmd(KV_CACHE_WRITE_WORKERS, name_hint="prefill_swa_cp_cache_write"):
+            for write_t in pl.range(kv_dim):
+                write_row_raw = pl.read(ori_slot_mapping_full, [write_t])
+                if write_row_raw >= 0:
+                    write_row = pl.cast(write_row_raw, pl.INDEX)
+                    if write_row % KV_CACHE_WRITE_WORKERS == write_worker:
+                        kv_cache_flat[write_row : write_row + 1, :] = kv_full[write_t : write_t + 1, :]
 
     swa_indices = pl.create_tensor([q_dim, WIN], dtype=pl.INT32)
     valid_block_mask = pl.create_tensor([q_dim, VALID_BLOCK_MASK_COLS], dtype=pl.INT32)
@@ -338,14 +367,31 @@ def prefill_attention_swa_cp_core(
         cmp_block_table_dummy[request : request + 1, :] = pl.full([1, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32, value=0)
     for dummy_t in pl.spmd(q_dim, name_hint="prefill_swa_cp_cmp_indices_dummy_init"):
         cmp_indices_dummy[dummy_t : dummy_t + 1, :] = pl.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
-    attn_out_local = sparse_attn_physical(
-        q, kv_cache, swa_indices,
-        cmp_kv_dummy, cmp_block_table_dummy, local_request_ids, cmp_indices_dummy,
-        valid_block_mask, attn_sink,
-        freqs_cos_local, freqs_sin_local,
-        wo_a, wo_b, wo_b_scale,
-        attn_out_local, o_proj_weight_dep,
-    )
+    if CAUSAL_READY:
+        sparse_attn_physical_causal(
+            q, kv_cache, swa_indices,
+            cmp_kv_dummy, cmp_block_table_dummy, local_request_ids, cmp_indices_dummy,
+            valid_block_mask, attn_sink,
+            freqs_cos_local, freqs_sin_local,
+            wo_a, wo_b, wo_b_scale,
+            attn_out_local, o_proj_weight_dep,
+            causal_ready_signal, causal_required, causal_epoch_base,
+        )
+    else:
+        sparse_attn_physical(
+            q, kv_cache, swa_indices,
+            cmp_kv_dummy, cmp_block_table_dummy, local_request_ids, cmp_indices_dummy,
+            valid_block_mask, attn_sink,
+            freqs_cos_local, freqs_sin_local,
+            wo_a, wo_b, wo_b_scale,
+            attn_out_local, o_proj_weight_dep,
+        )
+    if CAUSAL_READY:
+        causal_producers_complete = pl.system.task_dummy(deps=[causal_completions[1], causal_completions[2], causal_completions[3]])
+        causal_complete = causal_layer_ready(causal_ready_signal, causal_epoch_base, kv_dim, causal_producers_complete)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="causal_swa_layer_publish", deps=[causal_complete]):
+            causal_output_anchor = pl.read(attn_out_local, [0, 0])
+            pl.write(attn_out_local, [0, 0], causal_output_anchor)
     return kv_cache, attn_out_local
 
 
@@ -393,6 +439,9 @@ def prefill_attention_swa_cp(
     projection_consumed: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
     projection_peers: pl.Tensor[[3, PROJECTION_RANKS], pl.INT32],
     projection_epochs: pl.Array[PROJECTION_KINDS, pl.INT32],
+    causal_ready_signal: pld.DistributedTensor[[CAUSAL_FAMILIES, 1], pl.INT32],
+    causal_epoch_base: pl.Scalar[pl.INT32],
+    causal_query_start_loc: pl.Tensor[[CAUSAL_QUERY_START_LOC_DYN], pl.INT32],
 ):
     """DSA-CP SWA with replicated HC state at both layer boundaries."""
     o_proj_weight_dep = gather_o_proj_full_weights(
@@ -442,6 +491,7 @@ def prefill_attention_swa_cp(
         attn_out_local,
         late_dep, o_proj_weight_dep,
         projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers[0], projection_epochs, group_base + tp_rank,
+        causal_ready_signal, causal_epoch_base + (weight_epoch - 1) * pl.cast(kv_dim, pl.INT32), causal_query_start_loc,
     )
 
     attn_out_full = pl.create_tensor([kv_dim, D], dtype=pl.BF16)
@@ -495,6 +545,9 @@ def prefill_attention_swa_cp_test(
     projection_consumed: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
     projection_peers: pl.Tensor[[3, PROJECTION_RANKS], pl.INT32],
     projection_epoch_bases: pl.Tensor[[PROJECTION_KINDS], pl.INT32],
+    causal_ready_signal: pld.DistributedTensor[[CAUSAL_FAMILIES, 1], pl.INT32],
+    causal_epoch_bases: pl.Tensor[[1], pl.INT32],
+    causal_query_start_loc: pl.Tensor[[CAUSAL_QUERY_START_LOC_DYN], pl.INT32],
 ):
     projection_epochs = pl.array.create(PROJECTION_KINDS, pl.INT32)
     for projection_kind in pl.unroll(PROJECTION_KINDS):
@@ -532,6 +585,7 @@ def prefill_attention_swa_cp_test(
         o_proj_order_fence,
         group_base, tp_rank, pl.const(1, pl.INT32),
         projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers, projection_epochs,
+        causal_ready_signal, pl.read(causal_epoch_bases, [0]), causal_query_start_loc,
     )
     return kv_cache, x_out_full
 
@@ -564,6 +618,8 @@ def l3_prefill_attention_swa_cp(
     x_out_full: pl.Out[pl.Tensor[[TP_SIZE, CP_KV_T_DYN, HC_MULT, D], pl.FP32]],
     projection_peers: pl.Tensor[[TP_SIZE, 3, PROJECTION_RANKS], pl.INT32],
     projection_epoch_bases: pl.Tensor[[TP_SIZE, PROJECTION_KINDS], pl.INT32],
+    causal_epoch_bases: pl.Tensor[[TP_SIZE, 1], pl.INT32],
+    causal_query_start_loc: pl.Tensor[[TP_SIZE, CAUSAL_QUERY_START_LOC_DYN], pl.INT32],
 ):
     """Launch one CP group's SWA block, one child per rank."""
     x_hc_full.bind_dynamic(1, CP_KV_T_DYN)
@@ -588,12 +644,14 @@ def l3_prefill_attention_swa_cp(
     projection_prepared_buf = pld.alloc_window_buffer([PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
     projection_ready_buf = pld.alloc_window_buffer([PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
     projection_consumed_buf = pld.alloc_window_buffer([PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
+    causal_ready_buf = pld.alloc_window_buffer([CAUSAL_FAMILIES, 1], dtype=pl.INT32)
 
     for rank in pl.range(pld.world_size()):
         projection_window = pld.window(projection_window_buf, [PROJECTION_WINDOW_ROWS, PROJECTION_WINDOW_COLS], dtype=pl.FP32)
         projection_prepared = pld.window(projection_prepared_buf, [PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
         projection_ready = pld.window(projection_ready_buf, [PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
         projection_consumed = pld.window(projection_consumed_buf, [PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
+        causal_ready_signal = pld.window(causal_ready_buf, [CAUSAL_FAMILIES, 1], dtype=pl.INT32)
 
         gather_window = pld.window(gather_window_buf, [PREFILL_GROUP_CAP, D], dtype=pl.BF16)
         gather_signal = pld.window(gather_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
@@ -620,6 +678,7 @@ def l3_prefill_attention_swa_cp(
             o_proj_weight_ready, o_proj_weight_consumed,
             0, rank,
             projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers[rank], projection_epoch_bases[rank],
+            causal_ready_signal, causal_epoch_bases[rank], causal_query_start_loc[rank],
             device=rank,
         )
 
@@ -936,7 +995,7 @@ def build_cp_tensor_specs(
                 spec.name, [tp_size, *spec.shape], spec.dtype,
                 init_value=cp_stack(value, tp_size),
             ))
-    return (specs) + projection_tensor_specs(tp_size)
+    return (specs) + projection_tensor_specs(tp_size) + causal_tensor_specs(tp_size) + [TensorSpec("causal_query_start_loc", [tp_size, 2], torch.int32, init_value=torch.tensor([[0, token_count]], dtype=torch.int32).repeat(tp_size, 1))]
 
 
 def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE):
@@ -979,6 +1038,7 @@ def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE):
 
     freqs_cos, freqs_sin = token_local_rope(M, 0, position_ids, max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16)
     replacements = {
+        "causal_query_start_loc": torch.tensor([[0, 3, 7]], dtype=torch.int32).repeat(tp_size, 1),
         "freqs_cos": cp_stack(freqs_cos, tp_size),
         "freqs_sin": cp_stack(freqs_sin, tp_size),
         "kv_cache": cp_stack(kv_cache, tp_size),

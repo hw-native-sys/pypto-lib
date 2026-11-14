@@ -26,7 +26,63 @@ it is recorded in the generated prefill plan. The two bounded KV gather slots
 are independent of this choice. Two-arena experiments have no confirmed
 end-to-end speedup in the representative 16K scope; each generated artifact
 requires its own correctness and performance qualification. Histogram selection
-and EMA recall are not implemented by that option.
+and EMA recall are not enabled by that option alone.
+
+The separate opt-in `--prefill-echo-prefetch` requires two indexer arenas. It
+accumulates 256 ordered score bins in the existing score wave, then prefetches
+only complete high bins while the original exact top-512 selection proceeds.
+A direct logical-index map supplies prefetched rows and fills every miss from
+the original paged cache in exact selected order. Two transport slots retire
+with their actual attention consumers. This is device-HBM staging, not a host
+KV offload service; score, selection, quantization and attention arithmetic stay
+unchanged. NaN score queries use the original gather fallback.
+
+The request-zero stream uses the preceding outer chunk's global final exact
+kth score for a per-layer EMA with alpha 0.5. Other packed requests retain
+exact scoring and gather without inheriting that prediction. The first chunk
+uses a neutral shift and initializes the estimate from its exact ending result.
+An epoch replay retains the same input estimate instead of advancing EMA twice.
+Generated metadata includes required `echo_epoch`, `echo_first_chunk`, and an
+owned FP32 `echo_diagnostics` buffer with two snapshots per CSA layer. Epochs
+must be positive, below 2^24, and advance per prepared program after successful
+whole-chunk completion. Set the first-chunk flag for every new request; no
+per-query host state update is required.
+
+`--prefill-echo-diagnostics` adds recall/miss counters for separate diagnostic
+runs. It must not be silently substituted for an ordinary timing plan. The
+feature remains off by default. CPU source/protocol checks and native artifacts
+do not establish device numerical correctness, actual prefetch overlap or an
+end-to-end gain; these qualifications remain pending for this new option.
+
+
+The opt-in prefill option `--prefill-causal-ready` publishes completed cache
+prefixes in 512-token producer tiles. Each 128-query CSA block waits for its
+logical causal range rather than the complete current chunk. Publication covers
+raw-KV normalization and RoPE, compressed-KV pooling and cache writes, and both
+the indexer's INT8 keys and FP32 dequantization scales. Cache readers use explicit
+readiness dependencies; logical positions and request origins determine those
+dependencies independently of rank-local physical page numbers. SWA uses the raw
+prefix, while HCA uses raw and compressed prefixes with its existing ordered
+query waves and 512-query output projection.
+
+This option currently requires projection degree eight. Its three INT32 prefix
+counters reserve one physical full-stream row extent per layer, including unused
+channels for layers without that cache family. The per-query requirement table
+has 16 INT32 columns per row; only the first three are semantic. Metadata stores
+own complete 64-byte rows. Raw projection staging has two bounded slots retired
+by actual cache scatter, and the existing attention workspaces retain their
+consumer retirement. Layer completion joins all cache publishers and attention
+outputs before the next ordered stage.
+
+Callers bind `causal_epoch_bases` using `prepare_causal_bindings` and advance the
+base with `advance_causal_epoch` only after successful whole-chunk completion.
+Retained domains keep separate bases for independently compiled plans. Before
+submission, callers must admit the complete reservation against INT32 overflow;
+a failed domain must be discarded. `--prefill-causal-full-wait` is a diagnostic
+variant that retains the same producer/control path and waits for full current
+prefixes. Compile each plan in a fresh setup process. Both options default off.
+Native preparation does not establish device correctness or performance; the
+causal option requires its own full output/cache and ordinary timing gates.
 
 The opt-in build option `--prefill-moe-ready` permits two bounded T8 MoE
 compute waves to advance ahead of ordered TP publication. Peer waits use
@@ -551,8 +607,8 @@ matched a copied-cache control for all sampled IDs and final logits, hidden
 states and cache contents. The timing loop omits per-step diagnostic readbacks;
 its host-stepped latency is not the original speculative serving TPOT.
 This qualifies the tested allocation handoff; longer contexts
-and complete serving sessions remain unvalidated. Histogram/EMA early prefetch, projection sharing across
-ranks, and tile-specific cache publication dependencies are not implemented.
+and complete serving sessions remain unvalidated. Histogram/EMA early prefetch remains device-unqualified. Tile-specific cache
+publication dependencies are not implemented by this option.
 Their configuration must not be advertised as available or selected from
 unmeasured cost estimates.
 
