@@ -1604,6 +1604,32 @@ class TestScalarMixedSpecs:
 class TestStageOrder:
     """compute_golden runs before runtime — fail-fast on golden_fn errors."""
 
+    @pytest.mark.parametrize("shared_initializer", ["tensor", "callable"])
+    def test_shared_out_initializer_cannot_mask_wrong_device_output(
+        self, shared_initializer, three_kinds_specs, build_dir,
+    ):
+        """Actual output and its golden must not share initializer storage."""
+        initial = torch.zeros(4)
+        output = next(spec for spec in three_kinds_specs if spec.name == "y")
+        output.init_value = initial if shared_initializer == "tensor" else lambda: initial
+        seen = {}
+
+        def golden_fn(values):
+            values["y"].fill_(1.0)
+
+        def wrong_execute(_work_dir, tensors, **_kwargs):
+            seen["before"] = tensors[1].clone()
+            tensors[1].fill_(2.0)
+
+        compile_p, exec_p = _patch_compile_and_execute(
+            build_dir, fake_execute=wrong_execute,
+        )
+        with compile_p, exec_p:
+            result = run(fn=object(), specs=three_kinds_specs, golden_fn=golden_fn)
+
+        assert not result.passed, "wrong device output overwrote its own golden"
+        torch.testing.assert_close(seen["before"], torch.zeros(4))
+
     def test_compute_golden_runs_before_runtime(self, three_kinds_specs, build_dir):
         """golden_fn is invoked before execute_compiled."""
 

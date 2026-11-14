@@ -1436,7 +1436,9 @@ def _compute_golden(
             elif spec.is_input:
                 scratch[spec.name] = tensors[spec.name].clone()
             else:
-                scratch[spec.name] = spec.create_tensor()
+                # Tensor initializers and factories may return the dispatch's
+                # buffer itself. Keep its reference output independent.
+                scratch[spec.name] = spec.create_tensor().clone()
         golden_fn(scratch)
         golden_outputs = {spec.name: scratch[spec.name] for spec in tensor_specs if spec.is_output}
         if save_data:
