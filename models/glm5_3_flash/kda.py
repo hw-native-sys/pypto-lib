@@ -25,10 +25,7 @@ from models.glm5_3_flash.config import (
     EP_SIZE, FLASH, KDA_CONV_K, KDA_DIM, KDA_GATE_LOWER_BOUND, LOCAL_KDA_H, LOCAL_KDA_QKV_DIM,
     TP_SIZE, D, Glm53FlashConfig,
 )
-from models.glm5_3_flash.elementwise import (
-    accurate_divide, accurate_exp, accurate_row_sum, accurate_rsqrt, accurate_sigmoid, accurate_silu,
-    accurate_sqrt,
-)
+from models.glm5_3_flash.elementwise import sigmoid_fp32, silu
 from models.glm5_3_flash.linear import bf16_matmul, golden_bf16_linear
 from models.glm5_3_flash.rmsnorm import l2norm, reference_l2norm, rms_norm_gated
 from models.glm5_3_flash.utils import _assert_close, _randn
@@ -43,7 +40,7 @@ T_DYN = pl.dynamic("GLM53_T_DYN")
 CONV_DIM = 3 * LOCAL_KDA_QKV_DIM
 STATE_LEN = KDA_CONV_K - 1
 CONV_T_TILE = 16  # tokens per bulk task
-C_TILE = 128  # Bounds the corrected SiLU working set alongside the FP32 tap sum
+C_TILE = 128  # Convolution channel tile
 DECODE_C_TILE = 128  # channels per decode convolution partition
 CONV_WORKERS_TILE = 48  # AIV workers sharing the recurrent convolution partitions
 _PREFILL_LENGTHS = {"ragged": [5, 1, 9, 2, 0], "single": [1], "long": [40], "paged": [32, 1]}
@@ -129,7 +126,7 @@ def kda_conv_prefill(
                 acc = pl.add(acc, acc_col_expand_mul)
             activation_input = pl.create_tensor([CONV_T_TILE, C_TILE], dtype=pl.FP32)
             activation_input[:, :] = acc
-            activated = accurate_silu(activation_input, CONV_T_TILE, C_TILE)
+            activated = silu(activation_input, CONV_T_TILE, C_TILE)
             out_tile = pl.set_validshape(pl.cast(activated, pl.BF16, mode="rint"), rows, C_TILE)
             if c0 < LOCAL_KDA_QKV_DIM:
                 q_flat[p0 : p0 + CONV_T_TILE, c0 : c0 + C_TILE] = out_tile
@@ -208,9 +205,9 @@ def kda_conv_prefill(
             input0[:, :] = acc0
             input1[:, :] = acc1
             input2[:, :] = acc2
-            act0 = accurate_silu(input0, 1, C_TILE)
-            act1 = accurate_silu(input1, 1, C_TILE)
-            act2 = accurate_silu(input2, 1, C_TILE)
+            act0 = silu(input0, 1, C_TILE)
+            act1 = silu(input1, 1, C_TILE)
+            act2 = silu(input2, 1, C_TILE)
             v0 = pl.min(pl.max(length, 0), 1)
             v1 = pl.min(pl.max(length - 1, 0), 1)
             v2 = pl.min(pl.max(length - 2, 0), 1)
@@ -316,7 +313,7 @@ def kda_conv_recurrent(
                 acc = pl.add(acc_add_2, acc_mul_4)
                 activation_arg_activated = pl.create_tensor([1, DECODE_C_TILE], dtype=pl.FP32)
                 activation_arg_activated[:, :] = acc
-                activated = accurate_silu(activation_arg_activated, 1, DECODE_C_TILE)
+                activated = silu(activation_arg_activated, 1, DECODE_C_TILE)
                 out_tile = pl.cast(activated, pl.BF16, mode="rint")
                 if c0 < LOCAL_KDA_QKV_DIM:
                     q_flat[t : t + 1, c0 : c0 + DECODE_C_TILE] = out_tile
@@ -539,10 +536,10 @@ def kda_projection(
         biased = pl.col_expand_add(g_part, dt_bias_row[0:1, n0 : n0 + KDA_DIM])
         a_fill = pl.create_tensor([4, KDA_DIM], dtype=pl.FP32)
         a_fill[:, :] = pl.add(pl.mul(biased, 0.0), pl.read(a_log, [n0 // KDA_DIM]))
-        rate = accurate_exp(a_fill)
+        rate = pl.exp(a_fill)
         scaled = pl.create_tensor([4, KDA_DIM], dtype=pl.FP32)
         scaled[:, :] = pl.mul(biased, rate)
-        gate_h = accurate_sigmoid(scaled, 4, KDA_DIM)
+        gate_h = sigmoid_fp32(scaled, 4, KDA_DIM)
         part_mul = pl.mul(gate_h, KDA_GATE_LOWER_BOUND)
         decay_flat[t0 : t0 + 4, n0 : n0 + KDA_DIM] = pl.set_validshape(part_mul, rows, KDA_DIM)
     with pl.spmd((t_dim + 7) // 8, name_hint="kda_projection_beta", deps=[bottleneck_tid]):
@@ -551,7 +548,7 @@ def kda_projection(
         logits = pl.create_tensor([8, BETA_PAD], dtype=pl.FP32)
         b_raw_gm_tile = pl.slice(b_raw_gm, [8, BETA_PAD], [t0, 0], valid_shape=[rows, BETA_PAD])
         logits[:, :] = pl.cast(b_raw_gm_tile, pl.FP32)
-        sigmoid = accurate_sigmoid(logits, 8, BETA_PAD)
+        sigmoid = sigmoid_fp32(logits, 8, BETA_PAD)
         beta[t0 : t0 + 8, :] = pl.set_validshape(sigmoid, rows, BETA_PAD)
     return (mixed_qkv, decay, beta, out_gate)
 
@@ -604,12 +601,12 @@ def kda_output(
         value = pl.cast(core_rows_tile, pl.FP32)
         square_buffer = pl.create_tensor([OUTPUT_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
         square_buffer[:, :] = pl.mul(value, value)
-        square_sum = accurate_row_sum(square_buffer)
+        square_sum = pl.row_sum(square_buffer)
         norm_argument = pl.create_tensor([1, OUTPUT_NORM_ROWS_TILE], dtype=pl.FP32)
         part_mul = pl.mul(square_sum, KDA_DIM_INV)
         part_add = pl.add(part_mul, EPS)
         norm_argument[:, :] = pl.reshape(part_add, [1, OUTPUT_NORM_ROWS_TILE])
-        inverse = accurate_rsqrt(norm_argument)
+        inverse = pl.rsqrt(norm_argument, high_precision=False)
         inv_rms = pl.reshape(inverse, [OUTPUT_NORM_ROWS_TILE, 1])
         normed_row_expand_mul = pl.row_expand_mul(value, inv_rms)
         normed_fp32 = pl.cast(weight_row[0:1, 0:KDA_DIM], pl.FP32)
@@ -618,7 +615,7 @@ def kda_output(
         gate = pl.cast(gate_rows_tile, pl.FP32)
         gate_buffer = pl.create_tensor([OUTPUT_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
         gate_buffer[:, :] = gate
-        gate_sigmoid = accurate_sigmoid(gate_buffer, OUTPUT_NORM_ROWS_TILE, KDA_DIM)
+        gate_sigmoid = sigmoid_fp32(gate_buffer, OUTPUT_NORM_ROWS_TILE, KDA_DIM)
         activated = pl.mul(normed, gate_sigmoid)
         activated_bf16 = pl.cast(activated, pl.BF16, mode="rint")
         gated_rows[r0 : r0 + OUTPUT_NORM_ROWS_TILE, 0:KDA_DIM] = pl.set_validshape(activated_bf16, rows, KDA_DIM)
@@ -694,19 +691,19 @@ def recurrent_kda(
         k_square = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
         q_square[:, :] = pl.mul(q_buffer, q_buffer)
         k_square[:, :] = pl.mul(k_buffer, k_buffer)
-        q_sum = accurate_row_sum(q_square)
-        k_sum = accurate_row_sum(k_square)
+        q_sum = pl.row_sum(q_square)
+        k_sum = pl.row_sum(k_square)
         q_squared_norm[:, :] = pl.add(q_sum, DECODE_L2_EPS)
         k_squared_norm[:, :] = pl.add(k_sum, DECODE_L2_EPS)
-        q_root = accurate_sqrt(q_squared_norm)
-        k_root = accurate_sqrt(k_squared_norm)
+        q_root = pl.sqrt(q_squared_norm)
+        k_root = pl.sqrt(k_squared_norm)
         q_denominator = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
         k_denominator = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
         ones = pl.full([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32, value=1.0)
         q_denominator[:, :] = pl.row_expand_mul(ones, q_root)
         k_denominator[:, :] = pl.row_expand_mul(ones, k_root)
-        q_unit = accurate_divide(q_buffer, q_denominator)
-        k_unit = accurate_divide(k_buffer, k_denominator)
+        q_unit = pl.div(q_buffer, q_denominator)
+        k_unit = pl.div(k_buffer, k_denominator)
         qn_gm[r0 : r0 + DECODE_NORM_ROWS_TILE, :] = pl.mul(q_unit, DECODE_Q_SCALE)
         kn_gm[r0 : r0 + DECODE_NORM_ROWS_TILE, :] = k_unit
     state_2d = pl.reshape(recurrent_state, [pl.tensor.dim(recurrent_state, 0) * LOCAL_KDA_H * KDA_DIM, KDA_DIM])
@@ -727,7 +724,7 @@ def recurrent_kda(
                 exp_buffer = pl.create_tensor([1, KDA_DIM], dtype=pl.FP32)
                 decay_tile = pl.slice(decay, [1, 1, KDA_DIM], [t, h, 0], drop_dims=[0])
                 exp_buffer[:, :] = pl.reshape(decay_tile, [1, KDA_DIM])
-                g_row = accurate_exp(exp_buffer)
+                g_row = pl.exp(exp_buffer)
                 beta_s = pl.read(beta, [t, h])
                 source_col = pl.min(step, 1) * (step + 1)
                 row = pl.cast(pl.read(state_rows, [request, source_col]), pl.INDEX)
@@ -742,7 +739,7 @@ def recurrent_kda(
                 decayed = pl.col_expand_mul(state_tile, g_row)
                 kv_buffer = pl.create_tensor([DECODE_V_TILE, KDA_DIM], dtype=pl.FP32)
                 kv_buffer[:, :] = pl.col_expand_mul(decayed, k_row)
-                kv_col = accurate_row_sum(kv_buffer)
+                kv_col = pl.row_sum(kv_buffer)
                 value_tile = pl.slice(value, [1, 1, DECODE_V_TILE], [t, h, v0], drop_dims=[0])
                 v_row_v4_rows = pl.reshape(value_tile, [1, DECODE_V_TILE])
                 v_row = pl.cast(v_row_v4_rows, pl.FP32)
@@ -765,7 +762,7 @@ def recurrent_kda(
                 # as the recurrent update.
                 out_products = pl.create_tensor([DECODE_V_TILE, KDA_DIM], dtype=pl.FP32)
                 out_products[:, :] = pl.col_expand_mul(updated, q_row)
-                out_sum = accurate_row_sum(out_products)
+                out_sum = pl.row_sum(out_products)
                 out_row = pl.reshape(out_sum, [1, DECODE_V_TILE])
                 ocol = h * KDA_DIM + v0
                 out_row_bf16 = pl.cast(out_row, pl.BF16, mode="rint")
@@ -1005,14 +1002,14 @@ def prefill_kda(
             qf_gm_value_mul = pl.mul(q_raw, q_raw)
             qf_gm_value_row_sum = pl.row_sum(qf_gm_value_mul)
             qf_gm_value_add = pl.add(qf_gm_value_row_sum, PREFILL_L2_EPS)
-            qf_gm_value_rsqrt = pl.rsqrt(qf_gm_value_add, high_precision=True)
+            qf_gm_value_rsqrt = pl.rsqrt(qf_gm_value_add, high_precision=False)
             qf_gm_value_row_expand_mul = pl.row_expand_mul(q_raw, qf_gm_value_rsqrt)
             qf_gm_value_mul_2 = pl.mul(qf_gm_value_row_expand_mul, PREFILL_Q_SCALE)
             qf_gm[h:h + 1, base:base + CHUNK_TILE, 0:KDA_DIM] = pl.reshape(qf_gm_value_mul_2, [1, CHUNK_TILE, KDA_DIM])
             kf_gm_value_mul = pl.mul(k_raw, k_raw)
             kf_gm_value_row_sum = pl.row_sum(kf_gm_value_mul)
             kf_gm_value_add = pl.add(kf_gm_value_row_sum, PREFILL_L2_EPS)
-            kf_gm_value_rsqrt = pl.rsqrt(kf_gm_value_add, high_precision=True)
+            kf_gm_value_rsqrt = pl.rsqrt(kf_gm_value_add, high_precision=False)
             kf_gm_value_row_expand_mul = pl.row_expand_mul(k_raw, kf_gm_value_rsqrt)
             kf_gm[h:h + 1, base:base + CHUNK_TILE, 0:KDA_DIM] = pl.reshape(kf_gm_value_row_expand_mul, [1, CHUNK_TILE, KDA_DIM])
             q_f_slice = pl.slice(qf_gm, [1, CHUNK_TILE, KDA_DIM], [h, base, 0], drop_dims=[0])

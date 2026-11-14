@@ -18,7 +18,6 @@ if __package__ in (None, ""):
 import pypto.language as pl
 import torch
 
-from models.glm5_3_flash.elementwise import accurate_row_sum_parts
 from models.glm5_3_flash.quantization import (
     quantize_bf16_rows, quantize_per_channel_int8, quantize_per_token_int8,
 )
@@ -79,28 +78,17 @@ def bf16_linear_row(
     K_TILE: pl.constexpr,
     STAGES: pl.constexpr,
 ):
-    """Reduce aligned transposed-weight row dots with compensated FP32 sums."""
+    """Reduce aligned transposed-weight row dots with FP32 sums."""
     total = pl.full([1, N_TILE], dtype=pl.FP32, value=0.0)
-    correction = pl.full([1, N_TILE], dtype=pl.FP32, value=0.0)
     for k0 in pl.pipeline(0, K_DIM, K_TILE, stage=STAGES):
         source = pl.cast(x[row:row + 1, k0:k0 + K_TILE], pl.FP32)
         weights = pl.cast(weight[column:column + N_TILE, k0:k0 + K_TILE], pl.FP32)
         products = pl.create_tensor([N_TILE, K_TILE], dtype=pl.FP32)
         products[:, :] = pl.col_expand_mul(weights, source)
-        high, low = accurate_row_sum_parts(products, K_TILE)
-        partial = pl.reshape(high, [1, N_TILE])
-        tail = pl.reshape(low, [1, N_TILE])
-        if K_DIM == K_TILE:
-            total = partial
-            correction = tail
-        else:
-            updated = pl.add(total, partial)
-            recovered = pl.sub(updated, total)
-            left_error = pl.sub(total, pl.sub(updated, recovered))
-            right_error = pl.sub(partial, recovered)
-            correction = pl.add(correction, pl.add(pl.add(left_error, right_error), tail))
-            total = updated
-    return pl.add(total, correction)
+        row_sum = pl.row_sum(products)
+        partial = pl.reshape(row_sum, [1, N_TILE])
+        total = pl.add(total, partial)
+    return total
 
 
 @pl.jit.inline
@@ -140,7 +128,7 @@ def bf16_projection(
     N_DIM: pl.constexpr,
     HAS_BIAS: pl.constexpr = True,
 ):
-    """Project rows with compensated dot products and an optional bias."""
+    """Project rows with FP32 dot products and an optional bias."""
     rows = pl.tensor.dim(x, 0)
     for block in pl.spmd(((rows + 15) // 16) * ((N_DIM + 63) // 64), name_hint="bf16_projection"):
         row0 = block // ((N_DIM + 63) // 64) * 16

@@ -20,7 +20,7 @@ import pypto.language as pl
 import torch
 
 from models.glm5_3_flash.config import FLASH, N_EXPERTS, TOPK, D, Glm53FlashConfig
-from models.glm5_3_flash.elementwise import FP32_NEG_INF, accurate_divide, accurate_sigmoid
+from models.glm5_3_flash.elementwise import FP32_NEG_INF, sigmoid_fp32
 from models.glm5_3_flash.linear import bf16_linear_row
 from models.glm5_3_flash.rmsnorm import golden_rmsnorm_quant, rms_norm, rmsnorm_quant
 
@@ -95,7 +95,7 @@ def moe_gate(
                 gate_logits_tile = pl.create_tensor([1, GATE_N_TILE], dtype=pl.FP32)
                 gate_logits_tile[:, :] = logits
                 gp_sigmoid = pl.create_tensor([1, GATE_N_TILE], dtype=pl.FP32)
-                gp_sigmoid[:, :] = accurate_sigmoid(gate_logits_tile, 1, GATE_N_TILE)
+                gp_sigmoid[:, :] = sigmoid_fp32(gate_logits_tile, 1, GATE_N_TILE)
                 route_scores_buf[t1:t1 + 1, n0:n0 + GATE_N_TILE] = gp_sigmoid
                 gp_bias_row = pl.reshape(correction_bias[n0:n0 + GATE_N_TILE], [1, GATE_N_TILE])
                 gp_biased = pl.add(gp_sigmoid, gp_bias_row)
@@ -137,17 +137,14 @@ def moe_gate(
             topk_values[:, :] = gather_all
             if TOPK < TOPK_PAD:
                 topk_values[:, TOPK:TOPK_PAD] = pl.full([GATE_T_TILE, TOPK_PAD - TOPK], dtype=pl.FP32, value=0.0)
-            split = pl.mul(topk_values, 4097.0)
-            score_high = pl.sub(split, pl.sub(split, topk_values))
-            score_low = pl.sub(topk_values, score_high)
-            topk_sum = pl.add(pl.row_sum(score_high), pl.row_sum(score_low))
+            topk_sum = pl.row_sum(topk_values)
             denom = pl.reshape(topk_sum, [GATE_T_TILE, 1])
             denominator = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.FP32)
             denominator_value_full = pl.full([GATE_T_TILE, TOPK_PAD], dtype=pl.FP32, value=1.0)
             denominator_value_add = pl.add(denom, 1e-20)
             denominator[:, :] = pl.row_expand_mul(denominator_value_full, denominator_value_add)
             normalized = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.FP32)
-            normalized[:, :] = accurate_divide(topk_values, denominator)
+            normalized[:, :] = pl.div(topk_values, denominator)
             normalized_weights = pl.mul(normalized, ROUTE_SCALE)
             for wt_tt in pl.range(GATE_T_TILE):
                 wt_out_t = t1 + wt_tt

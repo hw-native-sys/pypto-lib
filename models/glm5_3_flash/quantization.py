@@ -19,7 +19,6 @@ import torch
 import torch.nn.functional as F
 
 from models.glm5_3_flash.config import FLASH
-from models.glm5_3_flash.elementwise import accurate_divide
 from models.glm5_3_flash.utils import _check, _report
 
 INT8_K_ALIGN = 32
@@ -57,7 +56,7 @@ def quantize_bf16_rows(
         denominator[:, :] = pl.add(maximum, zero_rows)
         one = pl.create_tensor([1, QUANT_M_TILE], dtype=pl.FP32)
         one[:, :] = pl.full([1, QUANT_M_TILE], dtype=pl.FP32, value=1.0)
-        inverse_maximum = accurate_divide(one, denominator)
+        inverse_maximum = pl.div(one, denominator)
         scale_buffer[:, :] = pl.mul(inverse_maximum, INT8_SCALE_MAX)
         inverse_scale = pl.mul(maximum, 1.0 / INT8_SCALE_MAX)
         inverse_column = pl.reshape(inverse_scale, [QUANT_M_TILE, 1])
