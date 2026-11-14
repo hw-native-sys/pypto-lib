@@ -1,0 +1,219 @@
+{
+  "scenario": {
+    "history_length": 8192,
+    "batch": 64,
+    "sequence": 6,
+    "tp": 1,
+    "query_heads": 64,
+    "head_dim": 512,
+    "platform": "a2a3",
+    "warmup": 2,
+    "rounds": 10,
+    "order": "ABBA",
+    "allocation": "same queue-allocated device for all four groups",
+    "profiling": false,
+    "sampling_policy": "Explicit experiment requirement: 2 warmups and 10 measurements per group; not the default CI 5/100 protocol."
+  },
+  "baseline_sha": "2af6b46beb7626f990235915b9a04a421d6715cb",
+  "toolchain": {
+    "pypto": "ff2e0a4ec3015c7bead91ca123ead3282f09f81e",
+    "simpler": "31f9e72ee6832cd198b77df18c1c305e7fd83676",
+    "pto_isa": "f83d4b7e4be0a4ca9805944ae2d9ce8c84e581f7"
+  },
+  "ptoas": "0.72",
+  "cann": "9.0.0",
+  "metrics": {
+    "effective": "enclosure of orch and sched intervals, including gaps, from device-clock STRACE",
+    "device_wall": "complete device launch interval, including graph/pre/post phases",
+    "host_wall": "chip.run host interval, includes input staging and validation; excludes worker registration and Python startup"
+  },
+  "groups": [
+    {
+      "implementation": "baseline",
+      "effective_us": [
+        623.8,
+        535.959,
+        536.14,
+        534.62,
+        541.62,
+        537.72,
+        534.261,
+        603.86,
+        618.699,
+        541.9
+      ],
+      "device_wall_us": [
+        1046.16,
+        929.979,
+        973.82,
+        983.72,
+        925.04,
+        977.199,
+        979.54,
+        1029.699,
+        932.36,
+        989.16
+      ],
+      "host_wall_us": [
+        9298.54,
+        9129.968,
+        9232.279,
+        9181.178,
+        9093.117,
+        9238.419,
+        9135.648,
+        9210.539,
+        9044.437,
+        9176.138
+      ]
+    },
+    {
+      "implementation": "optimized",
+      "effective_us": [
+        468.678,
+        434.14,
+        434.8,
+        560.021,
+        457.8,
+        450.86,
+        434.14,
+        488.96,
+        541.82,
+        434.98
+      ],
+      "device_wall_us": [
+        873.88,
+        836.48,
+        863.7,
+        960.02,
+        849.22,
+        900.78,
+        863.74,
+        828.68,
+        917.64,
+        891.08
+      ],
+      "host_wall_us": [
+        7606.863,
+        7549.063,
+        7601.384,
+        7710.114,
+        7594.683,
+        7611.053,
+        7573.673,
+        7941.867,
+        7844.265,
+        7714.025
+      ]
+    },
+    {
+      "implementation": "optimized",
+      "effective_us": [
+        514.798,
+        457.78,
+        438.58,
+        449.08,
+        629.639,
+        532.239,
+        494.881,
+        435.96,
+        452.18,
+        433.2
+      ],
+      "device_wall_us": [
+        880.319,
+        774.0,
+        874.28,
+        874.3,
+        855.78,
+        869.52,
+        864.239,
+        865.3,
+        865.36,
+        875.959
+      ],
+      "host_wall_us": [
+        7576.613,
+        7464.152,
+        7567.233,
+        7585.454,
+        7543.563,
+        7579.793,
+        7544.843,
+        7525.803,
+        7479.002,
+        7752.545
+      ]
+    },
+    {
+      "implementation": "baseline",
+      "effective_us": [
+        532.579,
+        533.819,
+        620.28,
+        530.421,
+        592.399,
+        543.719,
+        660.32,
+        642.34,
+        528.92,
+        768.14
+      ],
+      "device_wall_us": [
+        956.88,
+        937.66,
+        967.0,
+        897.44,
+        978.9,
+        962.26,
+        1018.16,
+        987.48,
+        951.06,
+        1048.96
+      ],
+      "host_wall_us": [
+        9675.903,
+        9581.112,
+        9669.723,
+        9498.972,
+        9679.903,
+        9967.106,
+        9671.333,
+        9659.863,
+        9589.442,
+        9691.803
+      ]
+    }
+  ],
+  "comparison": {
+    "effective": {
+      "baseline_mean_group_median_us": 553.8645,
+      "candidate_mean_group_median_us": 454.65500000000003,
+      "reduction_pct": 17.912233046169234
+    },
+    "device_wall": {
+      "baseline_mean_group_median_us": 971.49975,
+      "candidate_mean_group_median_us": 868.125,
+      "reduction_pct": 10.640738713519992
+    },
+    "host_wall": {
+      "baseline_mean_group_median_us": 9424.593,
+      "candidate_mean_group_median_us": 7582.4980000000005,
+      "reduction_pct": 19.545618574722535
+    }
+  },
+  "golden_cases_passed": [
+    "normal",
+    "short-window",
+    "mixed-topk",
+    "all-invalid compressed indices",
+    "block-holes",
+    "causal-regression"
+  ],
+  "limitations": [
+    "Standalone CSA entry includes preparation kernels; not full-model timing.",
+    "Host timing includes staging and validation; excludes worker registration and compilation.",
+    "TP > 1 path retained; TP > 1 runtime and full-model execution not revalidated."
+  ],
+  "status": "Historical measurement before coherent index staging; see csa-buffer-review-benchmark.json for current measurements."
+}
