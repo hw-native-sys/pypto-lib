@@ -377,6 +377,120 @@ RoPE inputs.
 
 ## Batch-one DSpark request serving
 
+### Prefill
+
+`prefill_fwd.load_prefill_programs()` loads one 43-layer chunk program with
+CP8 attention, TP8 MoE intermediate shards, and a TP8 vocabulary head. Each
+rank holds the complete chunk's HC input and owns a consecutive eighth of its
+attention queries. Bind the decode Worker's existing TP8 weight banks, original
+quantization scales, and cache allocations. The chunk entry reshapes contiguous
+layer banks through borrowed device views and never uploads another weight set.
+Query LoRA, query expansion, indexer-gate and vocabulary projections keep the
+decode banks' ND storage. The isolated import loads lowlat's private copies in
+`prefill_ops/`; callers must not repack these resident banks into NZ. The DSpark
+model's operators and configuration remain unchanged.
+`load_prefill_programs(mode="serial")` loads the six component entries for the
+same TP8 numerical baseline.
+
+`prefill_cache.prefill_cache_views` borrows each owning decode cache buffer
+through that Worker's `view_tensor` API. The cache bytes remain in place:
+prefill uses 32-row raw-KV pages and 2-row ratio-4 state pages, while decode
+views the same rows as 128-row and 4-row pages. `prefill_block_tables` splits
+and pads the scheduler's decode tables, and `prefill_slot_mappings` derives
+physical rows for each active position. The caller retains both the owning
+buffers and the prefill views until all dependent dispatches complete; only
+the original owning allocations may be freed. `initialize_cache_pages`
+initializes newly owned pages, including the compressor score sentinel,
+without clearing other requests' or shared-prefix pages.
+
+`prefill_metadata` packs each prompt chunk and its RoPE rows for the CP8 group.
+Physical page IDs may differ between ranks; each rank's table is converted
+against its own cache allocation. Pass the existing `block_counts` when the
+compressor tables use the decode ring layout.
+The caller must provide enough non-aliased cache pages for the whole chunk and
+the preceding sliding window, and preserve the page mappings and stored values
+of live history across chunks. The metadata helper rejects missing pages,
+out-of-bounds writes, and aliased HCA history. The HCA state must also
+provide distinct rows for the kernel's 128-row history plus one DSpark decode
+transaction when a prefill tile publishes that many rows. Prefix checkpoints
+are not requested by this helper. Host tensors passed directly to a prepared
+Worker submission must use shared storage allocated before the Worker starts.
+For cache initialization, the distributed Worker's `copy_to` stages
+non-inherited CPU buffers.
+
+For single-machine prefill and decode, the caller uses the same rank-local
+cache allocations and waits for each prefill dispatch before dependent decode
+work. The scheduler and request lifetime remain the serving caller's job.
+Prepare both programs on one Worker using `extra_compiled`, retain the owning
+decode cache tensors, and pass their borrowed views to prefill. After terminal
+prefill completes, use its sampled token as the next decode input at the prompt
+length, with `kv_seq_lens` including that input. Decode uses the original block
+tables and counts, including compressor state; it does not use the expanded
+prefill page tables or reinitialize the retained cache pages. The decode RoPE
+capacity must cover the prompt and all subsequent generated positions. Allocate
+decode metadata, scratch and any retained ABI buffers during Worker setup,
+before prefill. Borrowed views require no physical layout conversion; first-use
+program/domain preparation and normal dispatch synchronization remain separate
+latency costs.
+Registering a decode program with `extra_compiled` does not eagerly create its
+communication domains. A caller that needs a warm first decode can run a startup
+invocation on separately initialized scratch caches before prefill, retaining the
+same prepared Worker. That invocation must not bind the real request caches.
+The first real decode then reuses the domain; normal per-dispatch buffer resets,
+input staging and completion fences still contribute to latency.
+
+`prefill_fwd.prepare_prefill_bindings` combines the caller's resident decode-format
+weights, input metadata and scratch with the cache views. `submit_prefill`
+orders the bindings using the actual generated parameter metadata. The chunk
+program submits all layers once and waits once before returning. Its final HC
+output aliases the supplied `x_hc`; `x_hc_next` is scratch for the serial
+baseline only. The `terminal` scalar runs the learned head and sampling only
+on the final chunk. The caller supplies the original sampling, grammar,
+allocation and request-lifetime inputs, and consumes its outputs. Submit chunks
+in order, retaining the owning allocations through the final completion.
+
+CSA coordinates 128-query indexer blocks with two bounded gather slots.
+Gather waits for that block's exact top-512 selection and the previous consumer
+of its slot. QK/PV waits for its gather and the preceding attention block.
+The existing 512-row output-projection tile and all attention arithmetic remain
+in their owning operators. The indexer score/pair arenas and the two KV slots
+are reused across blocks; their lifetime ends with the layer's device scope.
+This permits subsequent index scoring and gather to become ready before the
+preceding attention finishes. Generated dependencies establish eligibility;
+actual overlap and wall-time benefit still require device measurements.
+
+Generate the chunk artifact without a Worker using:
+
+```bash
+python -m models.deepseek_v4_flash_lowlat.build \
+  --profile prefill --cache build_output/prefill-cache \
+  --report ../experiments/lowlat-prefill/pr1747/builds/prefill-generated.json
+```
+
+Keep experiment scripts, case manifests, datasets and timing reports under the
+workspace's `experiments/` directory. `build_output/` owns generated compiler
+artifacts and JIT caches. Experimental callers select explicit AgentX trace and
+request identities; input length, padding and chunk boundaries must come from
+the actual reconstructed input, with no fixed short-prompt fallback.
+
+The report records chunk/tile sizes, the exact-prefetch mode, two slots, and
+the retained eight projection replicas. Code generation, native compilation,
+and host binding checks alone do not establish device equivalence. The relocated
+private operators passed a rebuilt four-board TP8 device replay. A reconstructed
+AgentX request of 16,384 tokens passed full-output and cache byte-digest checks
+against the frozen TP8 component baseline. On the same Worker, 64 subsequent
+single-query decode steps retained the original weight/cache allocations and
+matched a copied-cache control for all sampled IDs and final logits, hidden
+states and cache contents. The timing loop omits per-step diagnostic readbacks;
+its host-stepped latency is not the original speculative serving TPOT.
+This qualifies the tested allocation handoff; longer contexts
+and complete serving sessions remain unvalidated. Histogram/EMA early prefetch, projection sharing across
+ranks, and tile-specific cache publication dependencies are not implemented.
+Their configuration must not be advertised as available or selected from
+unmeasured cost estimates.
+
+
+### Deployment
 
 This deployment retains five draft tokens and six target verification rows.
 It complements the [wide-batch DSpark model](../deepseek_v4_flash_dspark/index.md).
