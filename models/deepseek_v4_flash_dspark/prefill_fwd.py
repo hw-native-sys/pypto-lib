@@ -19,6 +19,8 @@ from golden import run
 from pypto.ir import DistributedConfig
 
 from moe import (
+    EPLB_ABI_VERSION as EPLB_ABI_VERSION,
+    EPLB_ENABLED as EPLB_ENABLED,
     D,
     EXPERTS_PER_RANK,
     HC_DIM,
@@ -27,6 +29,9 @@ from moe import (
     MOE_INTER,
     N_EXPERTS_GLOBAL,
     N_LOCAL,
+    META_SLOTS,
+    EPLB_LAYERS,
+    EPLB_BANK_ROWS,
     N_RANKS,
     PREFILL_MOE_SCALE_PAD,
     PREFILL_MOE_TOTAL_CAP,
@@ -368,7 +373,7 @@ def prefill_fwd(
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
     grammar_mask: pl.Tensor[[MAX_LOGIT_ROWS, GREEDY_GRID_ROWS, GRAMMAR_SEGMENT_WORDS], pl.INT16],
     sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
-    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_meta: pld.DistributedTensor[[N_RANKS, META_SLOTS], pl.INT32],
     recv_x: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
@@ -386,6 +391,10 @@ def prefill_fwd(
     lm_head_hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     lm_head_logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32],
     lm_head_logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
+    eplb_mapping: pl.Tensor[[EPLB_BANK_ROWS, N_RANKS], pl.INT32],
+    eplb_replicas: pl.Tensor[[EPLB_BANK_ROWS], pl.INT32],
+    eplb_load: pl.Tensor[[EPLB_LAYERS, META_SLOTS], pl.INT32],
+    eplb_control: pl.Tensor[[2], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
     """Run prefill; a zero query_start_loc terminal marks an empty DP group.
@@ -523,6 +532,7 @@ def prefill_fwd(
                 arrived, data_arrived, routed_y_buf, combine_arrived,
                 stage_done, stage_token, layer_completion,
                 gather_window, gather_signal,
+                eplb_mapping, eplb_replicas, input_ids, eplb_load, eplb_control,
                 group_base, tp_rank, layer_l0, my_rank, group_tokens,
             )
 
@@ -615,6 +625,7 @@ def prefill_fwd(
                 arrived, data_arrived, routed_y_buf, combine_arrived,
                 stage_done, stage_token, layer_completion,
                 gather_window, gather_signal,
+                eplb_mapping, eplb_replicas, input_ids, eplb_load, eplb_control,
                 group_base, tp_rank, layer_l1, my_rank, group_tokens,
             )
 
@@ -779,6 +790,7 @@ def prefill_fwd(
                     arrived, data_arrived, routed_y_buf, combine_arrived,
                     stage_done, stage_token, layer_completion,
                     gather_window, gather_signal,
+                    eplb_mapping, eplb_replicas, input_ids, eplb_load, eplb_control,
                     group_base, tp_rank, csa_layer, my_rank, group_tokens,
                 )
                 if group_tokens > 0:
@@ -910,6 +922,7 @@ def prefill_fwd(
                     arrived, data_arrived, routed_y_buf, combine_arrived,
                     stage_done, stage_token, layer_completion,
                     gather_window, gather_signal,
+                    eplb_mapping, eplb_replicas, input_ids, eplb_load, eplb_control,
                     group_base, tp_rank, hca_layer, my_rank, group_tokens,
                 )
                 if group_tokens > 0:
@@ -1079,6 +1092,7 @@ def prefill_fwd(
                 arrived, data_arrived, routed_y_buf, combine_arrived,
                 stage_done, stage_token, layer_completion,
                 gather_window, gather_signal,
+                eplb_mapping, eplb_replicas, input_ids, eplb_load, eplb_control,
                 group_base, tp_rank, layer_last, my_rank, group_tokens,
             )
 
@@ -1138,6 +1152,8 @@ def prefill_fwd(
 
 
 # DSA-CP layer-major multi-wave forward.
+
+
 @pl.jit.host
 def l3_prefill_fwd(
     x_hc: pl.InOut[pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32]],
@@ -1293,7 +1309,7 @@ def l3_prefill_fwd(
     csa_state_slot_mapping_full.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     csa_inner_state_slot_mapping_full.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
 
-    recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
+    recv_meta_buf = pld.alloc_window_buffer([N_RANKS, META_SLOTS], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
     recv_aux_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32)
     arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
@@ -1313,7 +1329,7 @@ def l3_prefill_fwd(
     lm_head_logits_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
-        recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
+        recv_meta = pld.window(recv_meta_buf, [N_RANKS, META_SLOTS], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buf, [PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
         recv_aux = pld.window(recv_aux_buf, [PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32)
         arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
@@ -1389,10 +1405,273 @@ def l3_prefill_fwd(
             o_proj_weight_ready, o_proj_weight_consumed,
             lm_head_hidden_window, lm_head_hidden_done,
             lm_head_logits_window, lm_head_logits_done,
+            gate_w[r], gate_bias[r], gate_w[r], gate_bias[r],
             r,
             device=r,
         )
     return x_out, logits, sampled_ids, dspark_target_hidden
+
+
+@pl.jit.host
+def l3_prefill_fwd_eplb(
+    x_hc: pl.InOut[pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32]],
+    query_start_loc: pl.Tensor[[N_RANKS, QUERY_START_LOC_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[N_RANKS, REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
+    hc_attn_fn: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * 3], pl.FP32],
+    hc_attn_base: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC], pl.FP32],
+    attn_norm_w: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D], pl.BF16],
+    wq_a: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS, D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS, Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * H * HEAD_DIM], pl.FP32],
+    wkv: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D, HEAD_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * HEAD_DIM], pl.BF16],
+    kv_cache: pl.InOut[pl.Tensor[[N_RANKS, FWD_ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    attn_sink: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * H], pl.FP32],
+    wo_a: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * O_PROJ_LOCAL_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * O_PROJ_LOCAL_GROUPS, D, O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D], pl.FP32],
+    hca_cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, FWD_HCA_CMP_BLOCK_NUM_DYN, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    csa_cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, FWD_CSA_CMP_BLOCK_NUM_DYN, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    hca_cmp_wkv: pl.Tensor[[N_RANKS, HCA_NUM_LAYERS * HCA_MAIN_OUT_DIM, D], pl.BF16],
+    hca_cmp_wgate: pl.Tensor[[N_RANKS, HCA_NUM_LAYERS * HCA_MAIN_OUT_DIM, D], pl.BF16],
+    hca_cmp_ape: pl.Tensor[[N_RANKS, HCA_NUM_LAYERS * HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32],
+    hca_cmp_norm_w: pl.Tensor[[N_RANKS, HCA_NUM_LAYERS * HEAD_DIM], pl.BF16],
+    hca_compress_state: pl.InOut[pl.Tensor[[N_RANKS, FWD_HCA_STATE_BLOCK_NUM_DYN, HCA_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32]],
+    csa_cmp_wkv: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * CSA_MAIN_OUT_DIM, D], pl.BF16],
+    csa_cmp_wgate: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * CSA_MAIN_OUT_DIM, D], pl.BF16],
+    csa_cmp_ape: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], pl.FP32],
+    csa_cmp_norm_w: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * HEAD_DIM], pl.BF16],
+    csa_compress_state: pl.InOut[pl.Tensor[[N_RANKS, FWD_CSA_STATE_BLOCK_NUM_DYN, CSA_STATE_BLOCK_SIZE, CSA_COMPRESS_STATE_DIM], pl.FP32]],
+    csa_hadamard_idx: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
+    csa_idx_wq_b: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
+    csa_idx_wq_b_scale: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
+    csa_weights_proj: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS, D, IDX_N_HEADS], pl.BF16],
+    csa_inner_wkv: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * INNER_OUT_DIM, D], pl.BF16],
+    csa_inner_wgate: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * INNER_OUT_DIM, D], pl.BF16],
+    csa_inner_ape: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * CSA_COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
+    csa_inner_norm_w: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * IDX_HEAD_DIM], pl.BF16],
+    csa_inner_compress_state: pl.InOut[pl.Tensor[[N_RANKS, FWD_INNER_STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, CSA_INNER_COMPRESS_STATE_DIM], pl.FP32]],
+    idx_kv_cache: pl.InOut[pl.Tensor[[N_RANKS, FWD_IDX_BLOCK_NUM_DYN, CSA_CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.InOut[pl.Tensor[[N_RANKS, FWD_IDX_BLOCK_NUM_DYN, CSA_CMP_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32]],
+    hca_compress_state_block_table: pl.Tensor[[N_RANKS, REQUESTS_DYN, HCA_STATE_MAX_BLOCKS], pl.INT32],
+    csa_compress_state_block_table: pl.Tensor[[N_RANKS, REQUESTS_DYN, CSA_STATE_MAX_BLOCKS], pl.INT32],
+    csa_inner_compress_state_block_table: pl.Tensor[[N_RANKS, REQUESTS_DYN, INNER_STATE_MAX_BLOCKS], pl.INT32],
+    swa_freqs_cos: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    swa_freqs_sin: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    compressed_freqs_cos: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    compressed_freqs_sin: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    hca_cmp_freqs_cos: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    hca_cmp_freqs_sin: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    csa_cmp_freqs_cos: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    csa_cmp_freqs_sin: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    ori_block_table: pl.Tensor[[N_RANKS, REQUESTS_DYN, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
+    hca_cmp_block_table: pl.Tensor[[N_RANKS, REQUESTS_DYN, HCA_CMP_MAX_BLOCKS], pl.INT32],
+    csa_cmp_block_table: pl.Tensor[[N_RANKS, REQUESTS_DYN, CSA_CMP_MAX_BLOCKS], pl.INT32],
+    idx_block_table: pl.Tensor[[N_RANKS, REQUESTS_DYN, IDX_CACHE_MAX_BLOCKS], pl.INT32],
+    ori_slot_mapping_full: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN], pl.INT64],
+    position_ids_local: pl.Tensor[[N_RANKS, FWD_TOKENS_DYN], pl.INT32],
+    position_ids_full: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN], pl.INT32],
+    input_ids: pl.Tensor[[N_RANKS, FWD_TOKENS_DYN], pl.INT64],
+    hca_cmp_slot_mapping_full: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN], pl.INT64],
+    hca_state_slot_mapping_full: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN], pl.INT64],
+    csa_cmp_slot_mapping_full: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN], pl.INT64],
+    csa_idx_slot_mapping_full: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN], pl.INT64],
+    csa_state_slot_mapping_full: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN], pl.INT64],
+    csa_inner_state_slot_mapping_full: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN], pl.INT64],
+    hc_ffn_fn: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * 3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC], pl.FP32],
+    norm_w: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D], pl.BF16],
+    gate_w: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_EXPERTS_GLOBAL, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_EXPERTS_GLOBAL], pl.FP32],
+    tid2eid: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * VOCAB, TOPK], pl.INT32],
+    routed_w1: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, D], pl.FP32],
+    shared_w1: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS, MOE_INTER, D], pl.INT8],
+    shared_w1_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
+    shared_w3: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS, MOE_INTER, D], pl.INT8],
+    shared_w3_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
+    shared_w2: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS, D, MOE_INTER], pl.INT8],
+    shared_w2_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D], pl.FP32],
+    o_proj_wo_a_full: pl.Out[pl.Tensor[[N_RANKS, O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], pl.BF16]],
+    o_proj_wo_b_full: pl.Out[pl.Tensor[[N_RANKS, O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_D, O_LORA], pl.INT8]],
+    attn_stage: pl.InOut[pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32]],
+    x_mixed: pl.Out[pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, D], pl.BF16]],
+    post_ffn: pl.Out[pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, HC_MULT], pl.FP32]],
+    comb_ffn: pl.Out[pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, HC_MULT * HC_MULT], pl.FP32]],
+    ffn_out: pl.Out[pl.Tensor[[N_RANKS, FWD_TOKENS_DYN, D], pl.BF16]],
+    hc_head_fn: pl.Tensor[[N_RANKS, HC_MULT, HC_DIM], pl.FP32],
+    hc_head_scale: pl.Tensor[[N_RANKS, 1], pl.FP32],
+    hc_head_base: pl.Tensor[[N_RANKS, HC_MULT], pl.FP32],
+    final_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[N_RANKS, VOCAB_PER_TP, D], pl.BF16],
+    logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
+    dspark_target_hidden: pl.Out[pl.Tensor[[N_RANKS, FWD_TOKENS_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
+    x_out: pl.Out[pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, D], pl.BF16]],
+    logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
+    grammar_mask: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, GREEDY_GRID_ROWS, GRAMMAR_SEGMENT_WORDS], pl.INT16],
+    sampled_ids: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
+    eplb_mapping: pl.Tensor[[N_RANKS, EPLB_BANK_ROWS, N_RANKS], pl.INT32],
+    eplb_replicas: pl.Tensor[[N_RANKS, EPLB_BANK_ROWS], pl.INT32],
+    eplb_load: pl.Out[pl.Tensor[[N_RANKS, EPLB_LAYERS, META_SLOTS], pl.INT32]],
+    eplb_control: pl.Tensor[[N_RANKS, 2], pl.INT32],
+):
+    """EPLB HOST ABI v1. Run layer-major DSA-CP over a caller-padded physical token extent.
+
+    Packed request boundaries are provided by a monotonic ``query_start_loc``
+    that starts at zero and ends at total logical length ``N``. Its request
+    count must match the leading dimension of every request-indexed block table,
+    and metadata must be identical within a TP group. Each TP group supplies
+    ``P = align_up(N, TP_SIZE)`` full rows and each rank supplies
+    ``L = P // TP_SIZE`` local rows. Callers zero padded ``x_hc`` and
+    ``input_ids``, use non-aliasing synthetic positions and ``-1`` cache/state
+    mappings for padding, and restrict live ``logit_row_indices`` to ``[0, N)``.
+    The device schedule, including MoE collectives, runs over physical P/L.
+    """
+    x_hc.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    query_start_loc.bind_dynamic(1, QUERY_START_LOC_DYN)
+    state_checkpoint_ends.bind_dynamic(1, REQUESTS_DYN)
+    state_checkpoint_ends.bind_dynamic(2, CHECKPOINT_TILES_DYN)
+    hca_compress_state_block_table.bind_dynamic(1, REQUESTS_DYN)
+    csa_compress_state_block_table.bind_dynamic(1, REQUESTS_DYN)
+    csa_inner_compress_state_block_table.bind_dynamic(1, REQUESTS_DYN)
+    ori_block_table.bind_dynamic(1, REQUESTS_DYN)
+    hca_cmp_block_table.bind_dynamic(1, REQUESTS_DYN)
+    csa_cmp_block_table.bind_dynamic(1, REQUESTS_DYN)
+    idx_block_table.bind_dynamic(1, REQUESTS_DYN)
+    dspark_target_hidden.bind_dynamic(1, FWD_TOKENS_DYN)
+    x_out.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    attn_stage.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    x_mixed.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    post_ffn.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    comb_ffn.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    ffn_out.bind_dynamic(1, FWD_TOKENS_DYN)
+    swa_freqs_cos.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    swa_freqs_sin.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    compressed_freqs_cos.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    compressed_freqs_sin.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    hca_cmp_freqs_cos.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    hca_cmp_freqs_sin.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    csa_cmp_freqs_cos.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    csa_cmp_freqs_sin.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    position_ids_local.bind_dynamic(1, FWD_TOKENS_DYN)
+    input_ids.bind_dynamic(1, FWD_TOKENS_DYN)
+    ori_slot_mapping_full.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    position_ids_full.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    hca_cmp_slot_mapping_full.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    hca_state_slot_mapping_full.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    csa_cmp_slot_mapping_full.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    csa_idx_slot_mapping_full.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    csa_state_slot_mapping_full.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    csa_inner_state_slot_mapping_full.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+
+    recv_meta_buf = pld.alloc_window_buffer([N_RANKS, META_SLOTS], dtype=pl.INT32)
+    recv_x_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
+    recv_aux_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32)
+    arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    routed_y_buf_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16)
+    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    stage_done_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    gather_window_buf = pld.alloc_window_buffer([PREFILL_GROUP_CAP, D], dtype=pl.BF16)
+    gather_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    o_proj_wo_a_window_buf = pld.alloc_window_buffer([O_PROJ_WO_A_WINDOW_ROWS, O_PROJ_WO_A_WINDOW_COLS], dtype=pl.BF16)
+    o_proj_wo_b_window_buf = pld.alloc_window_buffer([O_PROJ_WO_B_WINDOW_ROWS, O_PROJ_WO_B_WINDOW_COLS], dtype=pl.INT8)
+    o_proj_weight_ready_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    o_proj_weight_consumed_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    lm_head_hidden_window_buf = pld.alloc_window_buffer([GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
+    lm_head_hidden_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+    lm_head_logits_window_buf = pld.alloc_window_buffer([MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32)
+    lm_head_logits_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+
+    for r in pl.range(pld.world_size()):
+        recv_meta = pld.window(recv_meta_buf, [N_RANKS, META_SLOTS], dtype=pl.INT32)
+        recv_x = pld.window(recv_x_buf, [PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
+        recv_aux = pld.window(recv_aux_buf, [PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32)
+        arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        data_arrived = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        routed_y_buf = pld.window(routed_y_buf_buf, [PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16)
+        combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        stage_done = pld.window(stage_done_buf, [N_RANKS, 1], dtype=pl.INT32)
+        gather_window = pld.window(gather_window_buf, [PREFILL_GROUP_CAP, D], dtype=pl.BF16)
+        gather_signal = pld.window(gather_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
+        o_proj_wo_a_window = pld.window(
+            o_proj_wo_a_window_buf, [O_PROJ_WO_A_WINDOW_ROWS, O_PROJ_WO_A_WINDOW_COLS], dtype=pl.BF16,
+        )
+        o_proj_wo_b_window = pld.window(
+            o_proj_wo_b_window_buf, [O_PROJ_WO_B_WINDOW_ROWS, O_PROJ_WO_B_WINDOW_COLS], dtype=pl.INT8,
+        )
+        o_proj_weight_ready = pld.window(o_proj_weight_ready_buf, [TP_SIZE, 1], dtype=pl.INT32)
+        o_proj_weight_consumed = pld.window(o_proj_weight_consumed_buf, [TP_SIZE, 1], dtype=pl.INT32)
+        lm_head_hidden_window = pld.window(lm_head_hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
+        lm_head_hidden_done = pld.window(lm_head_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+        lm_head_logits_window = pld.window(lm_head_logits_window_buf, [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32)
+        lm_head_logits_done = pld.window(lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+        prefill_fwd(
+            x_hc[r],
+            query_start_loc[r], state_checkpoint_ends[r],
+            hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r],
+            attn_norm_w[r], wq_a[r], wq_b[r], wq_b_scale[r],
+            wkv[r], gamma_cq[r], gamma_ckv[r],
+            kv_cache[r], attn_sink[r], wo_a[r], wo_b[r], wo_b_scale[r],
+            hca_cmp_kv[r], csa_cmp_kv[r],
+            hca_cmp_wkv[r], hca_cmp_wgate[r], hca_cmp_ape[r],
+            hca_cmp_norm_w[r], hca_compress_state[r],
+            csa_cmp_wkv[r], csa_cmp_wgate[r], csa_cmp_ape[r],
+            csa_cmp_norm_w[r], csa_compress_state[r],
+            csa_hadamard_idx[r], csa_idx_wq_b[r],
+            csa_idx_wq_b_scale[r], csa_weights_proj[r],
+            csa_inner_wkv[r], csa_inner_wgate[r],
+            csa_inner_ape[r], csa_inner_norm_w[r],
+            csa_inner_compress_state[r], idx_kv_cache[r], idx_kv_scale[r],
+            hca_compress_state_block_table[r],
+            csa_compress_state_block_table[r],
+            csa_inner_compress_state_block_table[r],
+            swa_freqs_cos[r], swa_freqs_sin[r],
+            compressed_freqs_cos[r], compressed_freqs_sin[r],
+            hca_cmp_freqs_cos[r], hca_cmp_freqs_sin[r],
+            csa_cmp_freqs_cos[r], csa_cmp_freqs_sin[r],
+            ori_block_table[r], hca_cmp_block_table[r],
+            csa_cmp_block_table[r], idx_block_table[r],
+            ori_slot_mapping_full[r], position_ids_local[r],
+            position_ids_full[r], input_ids[r],
+            hca_cmp_slot_mapping_full[r], hca_state_slot_mapping_full[r],
+            csa_cmp_slot_mapping_full[r], csa_idx_slot_mapping_full[r],
+            csa_state_slot_mapping_full[r], csa_inner_state_slot_mapping_full[r],
+            hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
+            norm_w[r], gate_w[r], gate_bias[r], tid2eid[r],
+            routed_w1[r], routed_w1_scale[r],
+            routed_w3[r], routed_w3_scale[r],
+            routed_w2[r], routed_w2_scale[r],
+            shared_w1[r], shared_w1_scale[r],
+            shared_w3[r], shared_w3_scale[r],
+            shared_w2[r], shared_w2_scale[r],
+            o_proj_wo_a_full[r], o_proj_wo_b_full[r],
+            attn_stage[r], x_mixed[r],
+            post_ffn[r], comb_ffn[r], ffn_out[r],
+            hc_head_fn[r], hc_head_scale[r], hc_head_base[r],
+            final_norm_w[r], lm_head_weight[r], logit_row_indices[r],
+            dspark_target_hidden[r],
+            x_out[r], logits[r], grammar_mask[r], sampled_ids[r],
+            recv_meta, recv_x, recv_aux,
+            arrived, data_arrived, routed_y_buf, combine_arrived,
+            stage_done,
+            gather_window, gather_signal,
+            o_proj_wo_a_window, o_proj_wo_b_window,
+            o_proj_weight_ready, o_proj_weight_consumed,
+            lm_head_hidden_window, lm_head_hidden_done,
+            lm_head_logits_window, lm_head_logits_done,
+            eplb_mapping[r], eplb_replicas[r], eplb_load[r], eplb_control[r],
+            r,
+            device=r,
+        )
+
 
 
 # Kernel-only smoke fixtures.
