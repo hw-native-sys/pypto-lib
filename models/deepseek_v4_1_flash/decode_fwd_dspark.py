@@ -471,17 +471,9 @@ MARKOV_VOCAB = markov.VOCAB
 MARKOV_MARKOV_RANK = markov.MARKOV_RANK
 MARKOV_B_DYN = markov.B_DYN
 MARKOV_DSPARK_QUERY_WIDTH = markov.DSPARK_QUERY_WIDTH
-TARGET_FWD_RECV_MAX = target_fwd.RECV_MAX
-TARGET_FWD_AUX_WIDTH = target_fwd.AUX_WIDTH
-TARGET_FWD_ROUTE_WIDTH = target_fwd.ROUTE_WIDTH
-TARGET_FWD_SIGNAL_PAD = target_fwd.SIGNAL_PAD
 TARGET_FWD_MOE_TOKENS = target_fwd.MOE_TOKENS
 TARGET_FWD_TOPK = target_fwd.TOPK
 TARGET_FWD_GROUP_LOGIT_ROWS = target_fwd.GROUP_LOGIT_ROWS
-DRAFT_RECV_MAX = draft.RECV_MAX
-DRAFT_AUX_WIDTH = draft.AUX_WIDTH
-DRAFT_ROUTE_WIDTH = draft.ROUTE_WIDTH
-DRAFT_SIGNAL_PAD = draft.SIGNAL_PAD
 DRAFT_MOE_TOKENS = draft.MOE_TOKENS
 DRAFT_TOPK = draft.TOPK
 MARKOV_GROUP_LOGIT_ROWS = markov.GROUP_LOGIT_ROWS
@@ -645,26 +637,12 @@ def l2_decode_fwd_dspark(
     confidences: pl.Out[pl.Tensor[[MARKOV_B_DYN, MARKOV_DSPARK_QUERY_WIDTH], pl.FP32]],
     logits_epoch: pl.Scalar[pl.INT32],
     committed: pl.Out[pl.Tensor[[DECODE_BATCH], pl.INT32]],
-    target_fwd_recv_meta: pld.DistributedTensor[[EP_SIZE, TARGET_FWD_N_LOCAL_EXPERTS], pl.INT32],
-    target_fwd_recv_x: pld.DistributedTensor[[TARGET_FWD_N_LOCAL_EXPERTS * TARGET_FWD_RECV_MAX, D], pl.INT8],
-    target_fwd_recv_scale: pld.DistributedTensor[[TARGET_FWD_N_LOCAL_EXPERTS * TARGET_FWD_RECV_MAX, D // TARGET_FWD_MX_GROUP], pl.UINT8],
-    target_fwd_recv_weights: pld.DistributedTensor[[TARGET_FWD_N_LOCAL_EXPERTS * TARGET_FWD_RECV_MAX, TARGET_FWD_AUX_WIDTH], pl.FP32],
-    target_fwd_recv_routes: pld.DistributedTensor[[TARGET_FWD_N_LOCAL_EXPERTS * TARGET_FWD_RECV_MAX, TARGET_FWD_ROUTE_WIDTH], pl.INT32],
-    target_fwd_data_arrived: pld.DistributedTensor[[EP_SIZE, TARGET_FWD_N_LOCAL_EXPERTS, TARGET_FWD_SIGNAL_PAD], pl.INT32],
-    target_fwd_routed_output: pld.DistributedTensor[[TARGET_FWD_MOE_TOKENS * TARGET_FWD_TOPK, D], pl.BF16],
-    target_fwd_combine_arrived: pld.DistributedTensor[[EP_SIZE, TARGET_FWD_N_LOCAL_EXPERTS, TARGET_FWD_SIGNAL_PAD], pl.INT32],
+    target_fwd_recv_x: pld.DistributedTensor,
     target_fwd_head_hidden: pld.DistributedTensor[[TARGET_FWD_GROUP_LOGIT_ROWS, D], pl.BF16],
     target_fwd_head_hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     target_fwd_head_logits: pld.DistributedTensor[[TARGET_FWD_MAX_LOGIT_ROWS, TARGET_FWD_VOCAB], pl.FP32],
     target_fwd_head_logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
-    draft_recv_meta: pld.DistributedTensor[[EP_SIZE, DRAFT_N_LOCAL_EXPERTS], pl.INT32],
-    draft_recv_x: pld.DistributedTensor[[DRAFT_N_LOCAL_EXPERTS * DRAFT_RECV_MAX, D], pl.INT8],
-    draft_recv_scale: pld.DistributedTensor[[DRAFT_N_LOCAL_EXPERTS * DRAFT_RECV_MAX, D // DRAFT_MX_GROUP], pl.UINT8],
-    draft_recv_weights: pld.DistributedTensor[[DRAFT_N_LOCAL_EXPERTS * DRAFT_RECV_MAX, DRAFT_AUX_WIDTH], pl.FP32],
-    draft_recv_routes: pld.DistributedTensor[[DRAFT_N_LOCAL_EXPERTS * DRAFT_RECV_MAX, DRAFT_ROUTE_WIDTH], pl.INT32],
-    draft_data_arrived: pld.DistributedTensor[[EP_SIZE, DRAFT_N_LOCAL_EXPERTS, DRAFT_SIGNAL_PAD], pl.INT32],
-    draft_routed_output: pld.DistributedTensor[[DRAFT_MOE_TOKENS * DRAFT_TOPK, D], pl.BF16],
-    draft_combine_arrived: pld.DistributedTensor[[EP_SIZE, DRAFT_N_LOCAL_EXPERTS, DRAFT_SIGNAL_PAD], pl.INT32],
+    draft_recv_x: pld.DistributedTensor,
     markov_hidden_window: pld.DistributedTensor[[MARKOV_GROUP_LOGIT_ROWS, D], pl.BF16],
     markov_hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     markov_logits_window: pld.DistributedTensor[[MARKOV_MAX_LOGIT_ROWS, MARKOV_VOCAB], pl.FP32],
@@ -735,9 +713,8 @@ def l2_decode_fwd_dspark(
         index_weights_proj, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         ffn_norm_weight, gate_weight, correction_bias, routed_w1,
         routed_w2, routed_w3, shared_w1, shared_w2,
-        shared_w3, target_fwd_recv_meta, target_fwd_recv_x, target_fwd_recv_scale,
-        target_fwd_recv_weights, target_fwd_recv_routes, target_fwd_data_arrived, target_fwd_routed_output,
-        target_fwd_combine_arrived, moe_num_tokens, attention_num_tokens, rank,
+        shared_w3, target_fwd_recv_x,
+        moe_num_tokens, attention_num_tokens, rank,
         wq_a_scale, wq_b_scale, wkv_scale, wo_b_scale,
         index_wq_b_scale, routed_w1_scale, routed_w2_scale, routed_w3_scale,
         shared_w1_scale, shared_w2_scale, shared_w3_scale, final_norm_weight,
@@ -780,8 +757,7 @@ def l2_decode_fwd_dspark(
         draft_routed_w1_scale, draft_routed_w2, draft_routed_w2_scale, draft_routed_w3,
         draft_routed_w3_scale, draft_shared_w1, draft_shared_w1_scale, draft_shared_w2,
         draft_shared_w2_scale, draft_shared_w3, draft_shared_w3_scale, draft_head_hidden,
-        draft_recv_meta, draft_recv_x, draft_recv_scale, draft_recv_weights,
-        draft_recv_routes, draft_data_arrived, draft_routed_output, draft_combine_arrived,
+        draft_recv_x,
         rank, moe_epoch,
     )
     markov_sample_from_hidden(
@@ -816,6 +792,12 @@ def l2_decode_fwd_dspark(
         for request in pl.range(DECODE_BATCH + 1):
             pl.write(query_starts, [request], pl.read(local_query_starts, [request]))
 
+
+
+from expert_routed import fused_workspace_bytes
+
+_MOE_WINDOW_BYTES_0 = fused_workspace_bytes((EP_SIZE), TARGET_FWD_N_LOCAL_EXPERTS, TARGET_FWD_MOE_TOKENS, TARGET_FWD_TOPK, D, TARGET_FWD_MOE_INTER)
+_MOE_WINDOW_BYTES_1 = fused_workspace_bytes((DRAFT_EP_SIZE), DRAFT_N_LOCAL_EXPERTS, DRAFT_MOE_TOKENS, DRAFT_TOPK, D, DRAFT_MOE_INTER)
 
 
 @pl.jit.host
@@ -1003,14 +985,7 @@ def l3_decode_fwd_dspark(
     draft_head_hidden.bind_dynamic(1, DRAFT_B_DYN)
     draft_ids.bind_dynamic(1, MARKOV_B_DYN)
     confidences.bind_dynamic(1, MARKOV_B_DYN)
-    target_fwd_recv_meta_buffer = pld.alloc_window_buffer([EP_SIZE, TARGET_FWD_N_LOCAL_EXPERTS], dtype=pl.INT32)
-    target_fwd_recv_x_buffer = pld.alloc_window_buffer([TARGET_FWD_N_LOCAL_EXPERTS * TARGET_FWD_RECV_MAX, D], dtype=pl.INT8)
-    target_fwd_recv_scale_buffer = pld.alloc_window_buffer([TARGET_FWD_N_LOCAL_EXPERTS * TARGET_FWD_RECV_MAX, D // TARGET_FWD_MX_GROUP], dtype=pl.UINT8)
-    target_fwd_recv_weights_buffer = pld.alloc_window_buffer([TARGET_FWD_N_LOCAL_EXPERTS * TARGET_FWD_RECV_MAX, TARGET_FWD_AUX_WIDTH], dtype=pl.FP32)
-    target_fwd_recv_routes_buffer = pld.alloc_window_buffer([TARGET_FWD_N_LOCAL_EXPERTS * TARGET_FWD_RECV_MAX, TARGET_FWD_ROUTE_WIDTH], dtype=pl.INT32)
-    target_fwd_data_arrived_buffer = pld.alloc_window_buffer([EP_SIZE, TARGET_FWD_N_LOCAL_EXPERTS, TARGET_FWD_SIGNAL_PAD], dtype=pl.INT32)
-    target_fwd_routed_output_buffer = pld.alloc_window_buffer([TARGET_FWD_MOE_TOKENS * TARGET_FWD_TOPK, D], dtype=pl.BF16)
-    target_fwd_combine_arrived_buffer = pld.alloc_window_buffer([EP_SIZE, TARGET_FWD_N_LOCAL_EXPERTS, TARGET_FWD_SIGNAL_PAD], dtype=pl.INT32)
+    target_fwd_recv_x_buffer = pld.alloc_window_buffer([_MOE_WINDOW_BYTES_0], dtype=pl.UINT8)
     target_fwd_head_hidden_buffer = pld.alloc_window_buffer([TARGET_FWD_GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
     target_fwd_head_hidden_done_buffer = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     target_fwd_head_logits_buffer = pld.alloc_window_buffer([TARGET_FWD_MAX_LOGIT_ROWS, TARGET_FWD_VOCAB], dtype=pl.FP32)
@@ -1019,27 +994,13 @@ def l3_decode_fwd_dspark(
     sample_hidden_done_buffer = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     sample_logits_buffer = pld.alloc_window_buffer([TARGET_FWD_MAX_LOGIT_ROWS, TARGET_FWD_VOCAB], dtype=pl.FP32)
     sample_logits_done_buffer = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-    draft_recv_meta_buf = pld.alloc_window_buffer([EP_SIZE, DRAFT_N_LOCAL_EXPERTS], dtype=pl.INT32)
-    draft_recv_x_buf = pld.alloc_window_buffer([DRAFT_N_LOCAL_EXPERTS * DRAFT_RECV_MAX, D], dtype=pl.INT8)
-    draft_recv_scale_buf = pld.alloc_window_buffer([DRAFT_N_LOCAL_EXPERTS * DRAFT_RECV_MAX, D // DRAFT_MX_GROUP], dtype=pl.UINT8)
-    draft_recv_weights_buf = pld.alloc_window_buffer([DRAFT_N_LOCAL_EXPERTS * DRAFT_RECV_MAX, DRAFT_AUX_WIDTH], dtype=pl.FP32)
-    draft_recv_routes_buf = pld.alloc_window_buffer([DRAFT_N_LOCAL_EXPERTS * DRAFT_RECV_MAX, DRAFT_ROUTE_WIDTH], dtype=pl.INT32)
-    draft_data_arrived_buf = pld.alloc_window_buffer([EP_SIZE, DRAFT_N_LOCAL_EXPERTS, DRAFT_SIGNAL_PAD], dtype=pl.INT32)
-    draft_routed_output_buf = pld.alloc_window_buffer([DRAFT_MOE_TOKENS * DRAFT_TOPK, D], dtype=pl.BF16)
-    draft_combine_arrived_buf = pld.alloc_window_buffer([EP_SIZE, DRAFT_N_LOCAL_EXPERTS, DRAFT_SIGNAL_PAD], dtype=pl.INT32)
+    draft_recv_x_buf = pld.alloc_window_buffer([_MOE_WINDOW_BYTES_1], dtype=pl.UINT8)
     markov_hidden_window_buf = pld.alloc_window_buffer([MARKOV_GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
     markov_hidden_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     markov_logits_window_buf = pld.alloc_window_buffer([MARKOV_MAX_LOGIT_ROWS, MARKOV_VOCAB], dtype=pl.FP32)
     markov_logits_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
-        target_fwd_recv_meta = pld.window(target_fwd_recv_meta_buffer, [EP_SIZE, TARGET_FWD_N_LOCAL_EXPERTS], dtype=pl.INT32)
-        target_fwd_recv_x = pld.window(target_fwd_recv_x_buffer, [TARGET_FWD_N_LOCAL_EXPERTS * TARGET_FWD_RECV_MAX, D], dtype=pl.INT8)
-        target_fwd_recv_scale = pld.window(target_fwd_recv_scale_buffer, [TARGET_FWD_N_LOCAL_EXPERTS * TARGET_FWD_RECV_MAX, D // TARGET_FWD_MX_GROUP], dtype=pl.UINT8)
-        target_fwd_recv_weights = pld.window(target_fwd_recv_weights_buffer, [TARGET_FWD_N_LOCAL_EXPERTS * TARGET_FWD_RECV_MAX, TARGET_FWD_AUX_WIDTH], dtype=pl.FP32)
-        target_fwd_recv_routes = pld.window(target_fwd_recv_routes_buffer, [TARGET_FWD_N_LOCAL_EXPERTS * TARGET_FWD_RECV_MAX, TARGET_FWD_ROUTE_WIDTH], dtype=pl.INT32)
-        target_fwd_data_arrived = pld.window(target_fwd_data_arrived_buffer, [EP_SIZE, TARGET_FWD_N_LOCAL_EXPERTS, TARGET_FWD_SIGNAL_PAD], dtype=pl.INT32)
-        target_fwd_routed_output = pld.window(target_fwd_routed_output_buffer, [TARGET_FWD_MOE_TOKENS * TARGET_FWD_TOPK, D], dtype=pl.BF16)
-        target_fwd_combine_arrived = pld.window(target_fwd_combine_arrived_buffer, [EP_SIZE, TARGET_FWD_N_LOCAL_EXPERTS, TARGET_FWD_SIGNAL_PAD], dtype=pl.INT32)
+        target_fwd_recv_x = pld.window(target_fwd_recv_x_buffer, [_MOE_WINDOW_BYTES_0], dtype=pl.UINT8)
         target_fwd_head_hidden = pld.window(target_fwd_head_hidden_buffer, [TARGET_FWD_GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
         target_fwd_head_hidden_done = pld.window(target_fwd_head_hidden_done_buffer, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         target_fwd_head_logits = pld.window(target_fwd_head_logits_buffer, [TARGET_FWD_MAX_LOGIT_ROWS, TARGET_FWD_VOCAB], dtype=pl.FP32)
@@ -1048,14 +1009,7 @@ def l3_decode_fwd_dspark(
         sampling_hidden_done = pld.window(sample_hidden_done_buffer, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         sampling_logits_window = pld.window(sample_logits_buffer, [TARGET_FWD_MAX_LOGIT_ROWS, TARGET_FWD_VOCAB], dtype=pl.FP32)
         sampling_logits_done = pld.window(sample_logits_done_buffer, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-        draft_recv_meta = pld.window(draft_recv_meta_buf, [EP_SIZE, DRAFT_N_LOCAL_EXPERTS], dtype=pl.INT32)
-        draft_recv_x = pld.window(draft_recv_x_buf, [DRAFT_N_LOCAL_EXPERTS * DRAFT_RECV_MAX, D], dtype=pl.INT8)
-        draft_recv_scale = pld.window(draft_recv_scale_buf, [DRAFT_N_LOCAL_EXPERTS * DRAFT_RECV_MAX, D // DRAFT_MX_GROUP], dtype=pl.UINT8)
-        draft_recv_weights = pld.window(draft_recv_weights_buf, [DRAFT_N_LOCAL_EXPERTS * DRAFT_RECV_MAX, DRAFT_AUX_WIDTH], dtype=pl.FP32)
-        draft_recv_routes = pld.window(draft_recv_routes_buf, [DRAFT_N_LOCAL_EXPERTS * DRAFT_RECV_MAX, DRAFT_ROUTE_WIDTH], dtype=pl.INT32)
-        draft_data_arrived = pld.window(draft_data_arrived_buf, [EP_SIZE, DRAFT_N_LOCAL_EXPERTS, DRAFT_SIGNAL_PAD], dtype=pl.INT32)
-        draft_routed_output = pld.window(draft_routed_output_buf, [DRAFT_MOE_TOKENS * DRAFT_TOPK, D], dtype=pl.BF16)
-        draft_combine_arrived = pld.window(draft_combine_arrived_buf, [EP_SIZE, DRAFT_N_LOCAL_EXPERTS, DRAFT_SIGNAL_PAD], dtype=pl.INT32)
+        draft_recv_x = pld.window(draft_recv_x_buf, [_MOE_WINDOW_BYTES_1], dtype=pl.UINT8)
         markov_hidden_window = pld.window(markov_hidden_window_buf, [MARKOV_GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
         markov_hidden_done = pld.window(markov_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         markov_logits_window = pld.window(markov_logits_window_buf, [MARKOV_MAX_LOGIT_ROWS, MARKOV_VOCAB], dtype=pl.FP32)
@@ -1099,12 +1053,12 @@ def l3_decode_fwd_dspark(
             draft_shared_w2[rank], draft_shared_w2_scale[rank], draft_shared_w3[rank], draft_shared_w3_scale[rank],
             draft_head_hidden[rank], moe_epoch, markov_final_norm_weight[rank], markov_lm_head_weight[rank],
             markov_markov_w1[rank], markov_markov_w2[rank], markov_confidence_weight[rank], draft_ids[rank],
-            confidences[rank], logits_epoch, committed[rank], target_fwd_recv_meta,
-            target_fwd_recv_x, target_fwd_recv_scale, target_fwd_recv_weights, target_fwd_recv_routes,
-            target_fwd_data_arrived, target_fwd_routed_output, target_fwd_combine_arrived, target_fwd_head_hidden,
-            target_fwd_head_hidden_done, target_fwd_head_logits, target_fwd_head_logits_done, draft_recv_meta,
-            draft_recv_x, draft_recv_scale, draft_recv_weights, draft_recv_routes,
-            draft_data_arrived, draft_routed_output, draft_combine_arrived, markov_hidden_window,
+            confidences[rank], logits_epoch, committed[rank],
+            target_fwd_recv_x,
+            target_fwd_head_hidden,
+            target_fwd_head_hidden_done, target_fwd_head_logits, target_fwd_head_logits_done,
+            draft_recv_x,
+            markov_hidden_window,
             markov_hidden_done, markov_logits_window, markov_logits_done, sampling_hidden_window,
             sampling_hidden_done, sampling_logits_window, sampling_logits_done, rank,
             device=rank,
