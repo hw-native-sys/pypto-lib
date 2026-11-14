@@ -47,7 +47,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest
+          pip install pytest numpy safetensors
           pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Run unit tests
@@ -62,6 +62,7 @@ jobs:
       a2a3sim_files: ${{ steps.check.outputs.a2a3sim_files }}
       a5sim_files: ${{ steps.check.outputs.a5sim_files }}
       run_qwen_serving_tests: ${{ steps.check.outputs.run_qwen_serving_tests }}
+      run_qwen_vllm_eager: ${{ steps.check.outputs.run_qwen_vllm_eager }}
       run_deepseek_serving_tests: ${{ steps.check.outputs.run_deepseek_serving_tests }}
       run_dspark_serving_tests: ${{ steps.check.outputs.run_dspark_serving_tests }}
       a5_files: ${{ steps.check.outputs.a5_files }}
@@ -78,6 +79,7 @@ jobs:
           set -euo pipefail
 
           echo "run_qwen_serving_tests=false" >> "$GITHUB_OUTPUT"
+          echo "run_qwen_vllm_eager=false" >> "$GITHUB_OUTPUT"
           echo "run_deepseek_serving_tests=false" >> "$GITHUB_OUTPUT"
           echo "run_dspark_serving_tests=false" >> "$GITHUB_OUTPUT"
           select_all=false
@@ -136,6 +138,10 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ] &&
              printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/qwen3_14b/'; then
             echo "run_qwen_serving_tests=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "${{ github.event_name }}" = "pull_request" ] &&
+             printf '%s\n' "$CHANGED_FILES" | grep -qE '^(models/qwen3_14b/|\.github/scripts/qwen-vllm-kernel/)'; then
+            echo "run_qwen_vllm_eager=true" >> "$GITHUB_OUTPUT"
           fi
           if [ "${{ github.event_name }}" = "pull_request" ] &&
              printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/deepseek_v4_flash_mtp/'; then
@@ -284,6 +290,142 @@ jobs:
         if: always()
         working-directory: checkout
         run: rm -rf build_output
+
+  qwen-vllm-eager:
+    # Preserve the established check/cache identities; the adapter covers both
+    # eager and capture under .github/scripts/qwen-vllm-kernel/.
+    needs: detect-changes
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.run_qwen_vllm_eager == 'true'
+    runs-on: [self-hosted, linux, npu, a3]
+    timeout-minutes: 120
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/checkout-vllm/ptoas-bin
+      # The A3 runner's GitHub HTTP/2 connection can close mid-checkout.
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: http.https://github.com/.version
+      GIT_CONFIG_VALUE_0: HTTP/1.1
+      CMAKE_BUILD_PARALLEL_LEVEL: 8
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      CCACHE_UMASK: '000'
+    steps:
+      - name: Fetch composite action definitions
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+      - name: Set up the pinned compiler
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: checkout-vllm
+          needs-device: 'true'
+          runtime-platform: a2a3
+          build-namespace: qwen-vllm-eager
+          pip-cache-name: pip-qwen-vllm-eager
+          toolchain: bundle
+          pypto-ref: 04aed6915460a98d1ecd07fe29c6e0e7c6da3022
+          torch-version: 'torch==2.10.0'
+      - name: Fetch the pinned Simpler capture runtime
+        uses: actions/checkout@v4
+        with:
+          repository: hw-native-sys/simpler
+          ref: 20af3c1d25aa4cc04f22680ab8360d6e3cdfe042
+          path: qwen-vllm-simpler
+          persist-credentials: false
+      - name: Fetch vLLM
+        uses: actions/checkout@v4
+        with:
+          repository: vllm-project/vllm
+          ref: bc150f50299199599673614f80d12a196f377655
+          path: qwen-vllm
+          persist-credentials: false
+      - name: Fetch vLLM-Ascend
+        uses: actions/checkout@v4
+        with:
+          repository: vllm-project/vllm-ascend
+          ref: 367b8e62da799870a7476ce34f5f7658589a8aad
+          path: qwen-vllm-ascend
+          persist-credentials: false
+      - name: Build Lib decode artifacts and guard native prefill in four Kernel cases
+        working-directory: checkout-vllm
+        shell: bash
+        run: |
+          source activate.sh
+          : "${PYPTO_QWEN3_MODEL_DIR:?Configure Qwen3-14B weights on this runner}"
+          scripts="$PWD/.github/scripts/qwen-vllm-kernel"
+          output="$PWD/build_output/qwen-vllm-kernel-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          simpler="$GITHUB_WORKSPACE/qwen-vllm-simpler"
+          vllm="$GITHUB_WORKSPACE/qwen-vllm"
+          ascend="$GITHUB_WORKSPACE/qwen-vllm-ascend"
+          atb_env="${PYPTO_VLLM_ATB_ENV:-/usr/local/Ascend/nnal/atb/set_env.sh}"
+          mkdir -p "$output"
+          {
+            printf 'lib %s\n' "$(git rev-parse HEAD)"
+            printf 'pypto %s\n' "$(git -C "$PYPTO_SRC" rev-parse HEAD)"
+            printf 'simpler %s\n' "$(git -C "$simpler" rev-parse HEAD)"
+            printf 'runtime pto-isa %s\n' "$(cat "$simpler/pto_isa.pin")"
+            printf 'vllm %s\n' "$(git -C "$vllm" rev-parse HEAD)"
+            printf 'vllm-ascend %s\n' "$(git -C "$ascend" rev-parse HEAD)"
+          } > "$output/source-revisions.log"
+          TORCH_DEVICE_BACKEND_AUTOLOAD=0 python "$scripts/compile_decode.py" \
+            --model "$PYPTO_QWEN3_MODEL_DIR" --output "$output" \
+            |& tee "$output/compile.log"
+
+          if [[ -z ${PYPTO_VLLM_ATB_ENV:-} && ! -r "$atb_env" ]]; then
+            # vLLM-Ascend's A3 worker needs ATB. Unpack the vendor runtime in
+            # this job's output when it is absent from the runner image.
+            nnal=Ascend-cann-nnal_9.0.0_linux-aarch64.run
+            (
+              export TMPDIR="$output"
+              curl --fail --location --retry 2 --retry-all-errors --max-time 300 \
+                --referer https://www.hiascend.com/ --output "$output/$nnal" \
+                "https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%209.0.0/$nnal"
+              bash "$output/$nnal" --quiet --noexec --extract="$output/nnal"
+              bash "$output/nnal/run_package/Ascend-cann-atb_9.0.0_linux-aarch64.run" \
+                --quiet --noexec --extract="$output/atb"
+            ) |& tee "$output/atb-setup.log"
+            atb_env="$output/atb/atb/set_env.sh"
+          fi
+          if [[ ! -r "$atb_env" ]]; then
+            echo "::error::ATB environment script not found: $atb_env"
+            exit 1
+          fi
+          source "$atb_env" --cxx_abi=1
+          export CC=gcc-15 CXX=g++-15
+          bash "$scripts/setup_runtime.sh" "$simpler" "$vllm" "$ascend" "$output" |& tee "$output/setup.log"
+          export PTO_ISA_ROOT="$output/runtime-pto-isa"
+          export XDG_CACHE_HOME="$output/cache"
+          (
+            source "$output/venv/bin/activate"
+            runtime_site="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+            export PYTHONPATH="$scripts:$PWD:$runtime_site:$ASCEND_HOME_PATH/python/site-packages"
+            python "$scripts/prepare_runtime.py" "$output"
+          ) |& tee "$output/native-build.log"
+          printf -v run_cmd 'source %q && source %q && source %q --cxx_abi=1 && bash %q %q %q' \
+            "$PWD/activate.sh" "$output/venv/bin/activate" "$atb_env" "$scripts/run_smoke.sh" "$simpler" "$output"
+          task-submit --env PYPTO_QWEN3_MODEL_DIR --env PTO_ISA_ROOT --env XDG_CACHE_HOME --env CC --env CXX \
+            --device auto --device-num 1 --timeout 3600 --max-time 1200 --run "$run_cmd" |& tee "$output/task.log"
+      - name: Kill orphaned task-submit tasks
+        if: always()
+        uses: ./.github/actions/kill-orphaned-tasks
+        with:
+          checkout-path: checkout-vllm
+      - name: Upload smoke results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-vllm-kernel-a3
+          path: |
+            checkout-vllm/build_output/qwen-vllm-kernel-*/*.log
+            checkout-vllm/build_output/qwen-vllm-kernel-*/*-result.json
+      - name: Clean up build artifacts and runtime environment
+        if: always()
+        working-directory: checkout-vllm
+        run: rm -rf "build_output/qwen-vllm-kernel-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
   serving-qwen:
     needs: detect-changes
