@@ -17,7 +17,7 @@ import pypto.language.distributed as pld
 
 from models.deepseek_v4_flash_lowlat.prefill_moe import (
     D, HC_DIM, HC_MULT, MIX_HC, MOE_INTER, N_BANK, N_EXPERTS, N_RANKS,
-    REDUCE_WINDOW_ROWS, T, TOPK, VOCAB, prefill_moe_tp, clear_prefill_moe_tp_signals,
+    REDUCE_WINDOW_ROWS, T as MOE_WAVE_TOKENS, TOPK, VOCAB, prefill_moe_tp, clear_prefill_moe_tp_signals,
 )
 N_LOCAL = N_BANK
 N_EXPERTS_GLOBAL = N_EXPERTS
@@ -390,7 +390,7 @@ def prefill_tp8_fwd(
                 routed_w1_l0, routed_w1_scale_l0, routed_w3_l0, routed_w3_scale_l0,
                 routed_w2_l0, routed_w2_scale_l0, x_hc, stage_token, layer_completion,
                 tp_reduce_window, tp_reduce_signal, layer_l0, group_tokens, my_rank,
-                layer_l0 * pl.cast((group_tokens + T - 1) // T, pl.INT32),
+                layer_l0 * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
             )
 
     # Layer 1: SWA.
@@ -469,7 +469,7 @@ def prefill_tp8_fwd(
                 routed_w1_l1, routed_w1_scale_l1, routed_w3_l1, routed_w3_scale_l1,
                 routed_w2_l1, routed_w2_scale_l1, x_hc, stage_token, layer_completion,
                 tp_reduce_window, tp_reduce_signal, layer_l1, group_tokens, my_rank,
-                layer_l1 * pl.cast((group_tokens + T - 1) // T, pl.INT32),
+                layer_l1 * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
             )
 
     group_rows = pl.tensor.dim(x_hc, 0)
@@ -620,7 +620,7 @@ def prefill_tp8_fwd(
                     routed_w1_csa, routed_w1_scale_csa, routed_w3_csa, routed_w3_scale_csa,
                     routed_w2_csa, routed_w2_scale_csa, x_hc, stage_token, layer_completion,
                     tp_reduce_window, tp_reduce_signal, csa_layer, group_tokens, my_rank,
-                    csa_layer * pl.cast((group_tokens + T - 1) // T, pl.INT32),
+                    csa_layer * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
                 )
                 if group_tokens > 0:
                     if pair_order == HCA_NUM_LAYERS - 1:
@@ -738,7 +738,7 @@ def prefill_tp8_fwd(
                     routed_w1_hca, routed_w1_scale_hca, routed_w3_hca, routed_w3_scale_hca,
                     routed_w2_hca, routed_w2_scale_hca, x_hc, stage_token, layer_completion,
                     tp_reduce_window, tp_reduce_signal, hca_layer, group_tokens, my_rank,
-                    hca_layer * pl.cast((group_tokens + T - 1) // T, pl.INT32),
+                    hca_layer * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
                 )
                 if group_tokens > 0:
                     if pair_order == HCA_NUM_LAYERS - 1:
@@ -894,7 +894,7 @@ def prefill_tp8_fwd(
                 routed_w1_last, routed_w1_scale_last, routed_w3_last, routed_w3_scale_last,
                 routed_w2_last, routed_w2_scale_last, x_hc, stage_token, layer_completion,
                 tp_reduce_window, tp_reduce_signal, layer_last, group_tokens, my_rank,
-                layer_last * pl.cast((group_tokens + T - 1) // T, pl.INT32),
+                layer_last * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
             )
 
     moe_retired_tid = clear_prefill_moe_tp_signals(stage_token, tp_reduce_signal)

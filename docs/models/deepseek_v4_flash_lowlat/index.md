@@ -28,12 +28,23 @@ end-to-end speedup in the representative 16K scope; each generated artifact
 requires its own correctness and performance qualification. Histogram selection
 and EMA recall are not implemented by that option.
 
-The opt-in build option `--prefill-moe-ready` permits two bounded T8 MoE
-compute waves to advance ahead of ordered TP publication. Peer waits use
-core-releasing deferred completion; rank-order FP32 summation and BF16
-rounding remain unchanged. Each compile plan must be loaded in a fresh setup
-process. The option is recorded in the prefill plan and remains off by default.
-It changes prefill scheduling only; native decode entries are unaffected.
+Prefill MoE execution has an independent slab geometry. The build option
+`--prefill-moe-wave-tokens` selects 8, 32, 64 or 128 rows, with 64 as the
+candidate default in this branch. Routed and shared experts use bounded
+sixteen-row physical tiles; full expert tiles continue in another tile without
+discarding routes, including repeated expert IDs. Weight banks and TP8
+intermediate shards are unchanged. HC and per-token routing, quantization,
+expert arithmetic and ordered combine retain their original numerical rules.
+This larger-slab path still requires its own device bitwise and ordinary
+performance qualification; native preparation alone is not an accepted speedup.
+
+The opt-in build option `--prefill-moe-ready` permits two bounded prefill MoE
+slabs to advance ahead of ordered TP publication and uses core-releasing peer
+waits. The original wait policy uses the same prefill slab. Copies use bounded
+4-by-2048 FP32 staging tiles; rank reduction uses 8-by-512 tiles, adds ranks
+in ascending order and rounds once to BF16. Load every compile plan in a fresh
+setup process. Both options are recorded in the prefill plan; readiness remains
+off by default. Decode S1/S6 geometry, source and ABI are unaffected.
 
 A fixed 16K batch-one replay on four dual-chip 910C boards measured prefill
 public submit-to-result medians of 20.290 s with the original d8 plan and

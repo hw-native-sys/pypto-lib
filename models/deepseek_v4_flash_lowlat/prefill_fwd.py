@@ -24,10 +24,13 @@ _HCA_LAYERS = 20
 
 
 @contextmanager
-def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degrees=None, moe_ready=False):
+def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degrees=None,
+                    moe_ready=False, moe_wave_tokens=64):
     """Isolate the private prefill operators' import-time TP8 configuration."""
     if type(moe_ready) is not bool:
         raise ValueError("Prefill MoE readiness must be a boolean compile option")
+    if type(moe_wave_tokens) is not int or moe_wave_tokens not in (8, 32, 64, 128):
+        raise ValueError("Prefill MoE wave tokens must be 8, 32, 64 or 128")
     projection_degrees = dict(projection_degrees or {})
     for family, degree in projection_degrees.items():
         if family not in ("swa", "csa", "hca") or type(degree) is not int or degree not in (1, 2, 4, 8):
@@ -38,6 +41,7 @@ def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degree
     if type(indexer_arenas) is not int or indexer_arenas not in (1, 2):
         raise ValueError("Prefill indexer arenas must be one or two")
     with _IMPORT_LOCK:
+        importlib.import_module(".decode_shapes", __package__)
         old_modules = {name: sys.modules.get(name, missing) for name in names}
         old_path, old_argv = list(sys.path), list(sys.argv)
         for name in names:
@@ -47,6 +51,7 @@ def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degree
         sys.argv += ["--prefill-query-pipeline", "1" if query_pipeline else "0", "--prefill-resident-weights"]
         sys.argv += ["--prefill-indexer-arenas", str(indexer_arenas)]
         sys.argv += ["--prefill-moe-ready", "1" if moe_ready else "0"]
+        sys.argv += ["--prefill-moe-wave-tokens", str(moe_wave_tokens)]
         for family, degree in projection_degrees.items():
             sys.argv += ["--prefill-projection-" + family + "-d", str(degree)]
         try:
@@ -61,7 +66,8 @@ def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degree
                     sys.modules[name] = module
 
 
-def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=None, moe_ready=False):
+def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=None,
+                         moe_ready=False, moe_wave_tokens=64):
     """Return the TP8 attention, MoE, tap, and head entries for compilation.
 
     Load each compile plan in a fresh setup process before creating Workers. ``chunk``
@@ -72,7 +78,8 @@ def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=
         raise ValueError("Prefill mode must be chunk or serial")
     if mode == "serial" and indexer_arenas != 1:
         raise ValueError("Multiple indexer arenas require the chunk query pipeline")
-    with _prefill_import(query_pipeline=mode == "chunk", indexer_arenas=indexer_arenas, projection_degrees=projection_degrees, moe_ready=moe_ready):
+    with _prefill_import(query_pipeline=mode == "chunk", indexer_arenas=indexer_arenas,
+                         projection_degrees=projection_degrees, moe_ready=moe_ready, moe_wave_tokens=moe_wave_tokens):
         qkv = importlib.import_module("qkv_proj_rope")
         ordered_qkv = importlib.import_module("models.deepseek_v4_flash_lowlat.drafter.qkv_proj_rope")
         geometry = (
@@ -87,7 +94,7 @@ def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=
         attention = {name: importlib.import_module("prefill_" + name) for name in ("swa", "csa", "hca")}
         head = importlib.import_module("models.deepseek_v4_flash_lowlat.prefill_head")
         moe = importlib.import_module("models.deepseek_v4_flash_lowlat.prefill_moe")
-        if bool(moe.PREFILL_MOE_READY) != moe_ready:
+        if bool(moe.PREFILL_MOE_READY) != moe_ready or moe.T != moe_wave_tokens:
             raise RuntimeError("Prefill MoE configuration is frozen; load each plan in a fresh process")
         if any(module.TP_SIZE != _RANKS or module.O_PROJ_LOCAL_GROUPS != 1 for module in attention.values()):
             raise RuntimeError("Unexpected TP8 prefill attention geometry")

@@ -106,7 +106,8 @@ def _validate_target_capacity(metadata, profile, max_seq_len):
 
 
 def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=180, max_seq_len=1048576,
-                    prefill_indexer_arenas=1, projection_degrees=None, prefill_moe_ready=False):
+                    prefill_indexer_arenas=1, projection_degrees=None, prefill_moe_ready=False,
+                    prefill_moe_wave_tokens=None):
     """Compile one immutable source profile; device IDs describe topology only."""
     if profile not in ("single", "one", "two", "rsag", "prefill"):
         raise ValueError("Unknown request-pipeline source profile")
@@ -120,6 +121,13 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
         raise ValueError("Prefill MoE readiness must be a boolean compile option")
     if profile != "prefill" and prefill_moe_ready:
         raise ValueError("MoE readiness selection applies only to prefill")
+    if prefill_moe_wave_tokens is not None:
+        if type(prefill_moe_wave_tokens) is not int or prefill_moe_wave_tokens not in (8, 32, 64, 128):
+            raise ValueError("Prefill MoE wave tokens must be 8, 32, 64 or 128")
+        if profile != "prefill":
+            raise ValueError("MoE wave geometry selection applies only to prefill")
+    if profile == "prefill" and prefill_moe_wave_tokens is None:
+        prefill_moe_wave_tokens = 64
     degrees = {family: 8 for family in ("swa", "csa", "hca")}
     degrees.update(projection_degrees or {})
     if set(degrees) != {"swa", "csa", "hca"} or any(type(d) is not int or d not in (1, 2, 4, 8) for d in degrees.values()):
@@ -160,7 +168,11 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
         if profile == "prefill":
             from .prefill_fwd import load_prefill_programs
 
-            function = load_prefill_programs(indexer_arenas=prefill_indexer_arenas, projection_degrees=projection_degrees, moe_ready=prefill_moe_ready)["chunk"]
+            programs = load_prefill_programs(
+                indexer_arenas=prefill_indexer_arenas, projection_degrees=projection_degrees,
+                moe_ready=prefill_moe_ready, moe_wave_tokens=prefill_moe_wave_tokens,
+            )
+            function = programs["chunk"]
             kwargs = {}
             selected_source = None
         elif profile == "single":
@@ -238,6 +250,10 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
             projection_replicas=projection_degrees, prefetch="exact", transfer_slots=2,
             indexer_arenas=prefill_indexer_arenas,
             moe_ready=prefill_moe_ready,
+            moe_wave_tokens=prefill_moe_wave_tokens,
+            moe_expert_tile_tokens=16,
+            moe_copy_tile=[4, 2048], moe_reduce_tile=[8, 512],
+            moe_waves_per_chunk=(8192 + prefill_moe_wave_tokens - 1) // prefill_moe_wave_tokens,
             resident_projection_layout="ND",
             dispatches_per_chunk=1, tp8_baseline_bitwise_verified=False,
         )
@@ -260,7 +276,8 @@ def main():
     )
     for family in ("swa", "csa", "hca"):
         parser.add_argument("--projection-" + family + "-d", type=int, choices=(1, 2, 4, 8), default=8)
-    parser.add_argument("--prefill-moe-ready", action="store_true", help="Experimental bounded T8 compute/publish overlap")
+    parser.add_argument("--prefill-moe-ready", action="store_true", help="Bounded prefill compute/publish overlap")
+    parser.add_argument("--prefill-moe-wave-tokens", type=int, choices=(8, 32, 64, 128), default=None)
     args = parser.parse_args()
     if args.report.exists():
         parser.error("The report already exists; preserve it and choose a new run directory")
@@ -274,6 +291,7 @@ def main():
         max_seq_len=args.max_seq_len,
         prefill_indexer_arenas=args.prefill_indexer_arenas,
         prefill_moe_ready=args.prefill_moe_ready,
+        prefill_moe_wave_tokens=args.prefill_moe_wave_tokens,
         projection_degrees={family: getattr(args, "projection_" + family + "_d") for family in ("swa", "csa", "hca")},
     )
     report["generation_seconds"] = time.monotonic() - started
