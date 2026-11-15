@@ -50,15 +50,16 @@ def c1a_compressor_project(
     n_tile: pl.constexpr,
 ):
     """Project NZ weights with full-height Cube tiles and store active rows."""
-    blocks = (num_tokens + m_tile - 1) // m_tile * (HEAD_DIM // n_tile)
-    workers = pl.max(pl.min(blocks, 8), 1)
+    row_groups = (num_tokens + 2 * m_tile - 1) // (2 * m_tile)
+    workers = pl.max(pl.min(row_groups * (HEAD_DIM // n_tile), pl.system.available_cluster_count()), 1)
     with pl.spmd(workers, name_hint="proj_cmp", deps=[ready]) as completed:
         with pl.at(level=pl.Level.CORE_GROUP):
             worker = pl.tile.get_block_idx()
-            col = worker % (HEAD_DIM // n_tile) * n_tile
-            row_workers = pl.max(workers // (HEAD_DIM // n_tile), 1)
+            task_stride = pl.max(workers, 1)
             row_blocks = (num_tokens + m_tile - 1) // m_tile
-            for row_block in pl.range(worker // (HEAD_DIM // n_tile), row_blocks, row_workers):
+            for task in pl.range(worker, row_blocks * (HEAD_DIM // n_tile), task_stride):
+                row_block = task // (HEAD_DIM // n_tile)
+                col = task % (HEAD_DIM // n_tile) * n_tile
                 row = row_block * m_tile
                 rows = pl.max(pl.min(m_tile, num_tokens - row), 0)
                 a = pl.load(source, [row, 0], [m_tile, C1A_PROJ_K_TILE], valid_shape=[rows, C1A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
@@ -106,7 +107,8 @@ def c1a_compressor_publish(
 ):
     """Normalize and publish MXFP4 rows while retaining the unrotated latent."""
     active_tokens = pl.cast(num_tokens, pl.INT32)
-    workers = pl.max(pl.min(active_tokens, 8), 1)
+    row_groups = (active_tokens + 2 * C1A_PROJ_M_TILE - 1) // (2 * C1A_PROJ_M_TILE)
+    workers = pl.max(pl.min(pl.min(active_tokens, row_groups * 8), pl.system.available_cluster_count()), 1)
     with pl.spmd(workers, name_hint="c1a_compress", deps=[cache_ready, source_ready]) as published:
         cache = _c1a_compress(source, slots, cache, cosine, sine, norm_weight, latent, active_tokens)
     return published
@@ -430,7 +432,7 @@ def c2a_compressor_project(
 ):
     """Project KV and gate with NZ BF16 weights and FP32 Cube output."""
     blocks = (num_tokens + C2A_PROJ_M_TILE - 1) // C2A_PROJ_M_TILE * (2 * HEAD_DIM // n_tile)
-    workers = pl.max(pl.min(pl.min(blocks, 16), pl.system.available_cluster_count()), 1)
+    workers = pl.max(pl.min(blocks, pl.system.available_cluster_count()), 1)
     with pl.spmd(workers, name_hint="proj_cmp", sync_start=True):
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, blocks, workers):
@@ -638,7 +640,7 @@ def _c2a_compress(
     num_state_blocks: pl.Scalar[pl.INT32],
     phase_begin: pl.constexpr,
     phase_end: pl.constexpr,
-    token_parallel: pl.constexpr,
+    partition: pl.constexpr,
 ):
     worker = pl.tile.get_block_idx()
     workers = pl.tile.get_block_num()
@@ -669,7 +671,7 @@ def _c2a_compress(
             owner = request % workers
             if valid_block:
                 owner = block % workers
-            if token_parallel:
+            if partition == "token":
                 owner = request % workers
             start = pl.max(start, 0)
             end = pl.min(end, num_tokens)
@@ -767,9 +769,9 @@ def c2a_compressor_publish(
     sine: pl.Tensor,
     slots: pl.Tensor[[T_DYN], pl.INT64],
     cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
-    parallel_tokens: pl.constexpr,
+    partition: pl.constexpr,
 ):
-    """Pool token spans and publish the latest physical state slots."""
+    """Pool spans by request or token partition and publish the latest state slots."""
     active_tokens = pl.cast(num_tokens, pl.INT32)
     blocks = pl.cast(pl.tensor.dim(state_cache, 0), pl.INT32)
     requests = pl.tensor.dim(state_block_table, 0)
@@ -812,7 +814,7 @@ def c2a_compressor_publish(
                         if pl.read(token_to_req_indices, [token]) == request:
                             pl.write(mapped_requests, [token], count)
                     count = pl.cast(count + 1, pl.INT32)
-    workers = pl.max(pl.min(pl.tensor.dim(state_block_table, 0), 16), 1)
+    workers = pl.max(pl.min(pl.tensor.dim(state_block_table, 0), pl.system.available_cluster_count()), 1)
     native_count = pl.cast(native_blocks, pl.INT32)
     native_rows = native_blocks * 4
     native_flat = pl.reshape(native_state, [native_rows, STATE_WIDTH])
@@ -820,14 +822,14 @@ def c2a_compressor_publish(
     cache_rows = cache_blocks * 128
     cache_flat = pl.reshape(cache, [cache_rows, COMPRESSED_CACHE_BYTES])
     completed = state_ready
-    if parallel_tokens:
+    if partition == "token":
         token_workers = pl.max(1, pl.min((active_tokens + 15) // 16, 64))
         with pl.spmd(token_workers, name_hint="c2a_compress", deps=[mapped]) as pooled:
             pooled_state, pooled_latent, pooled_cache = _c2a_compress(
                 kv_proj, score_proj, native_flat, position_ids, norm_weight, latent,
                 mapped_starts, mapped_requests, mapped_blocks,
                 slots, cosine, sine, cache_flat, active_tokens, native_count,
-                phase_begin=0, phase_end=1, token_parallel=True,
+                phase_begin=0, phase_end=1, partition="token",
             )
         state_workers = pl.max(1, pl.min(native_rows, 64))
         with pl.spmd(state_workers, name_hint="c2a_state_commit", deps=[pooled]) as branch_completed:
@@ -859,7 +861,7 @@ def c2a_compressor_publish(
                 kv_proj, score_proj, native_flat, position_ids, norm_weight, latent,
                 mapped_starts, mapped_requests, mapped_blocks,
                 slots, cosine, sine, cache_flat, active_tokens, native_count,
-                phase_begin=0, phase_end=2, token_parallel=False,
+                phase_begin=0, phase_end=2, partition="request",
             )
         completed = branch_completed
     return completed
@@ -887,7 +889,7 @@ def c2a_state_feedback_test(
     c2a_compressor_publish(
         kv, score, query_starts, positions, request_ids, state_table,
         state_cache, norm_weight, latent, pl.cast(6, pl.INT32), state_ready,
-        cosine, sine, slots, cache, parallel_tokens=False,
+        cosine, sine, slots, cache, partition="request",
     )
     return state_cache, latent
 

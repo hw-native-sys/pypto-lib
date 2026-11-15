@@ -2,7 +2,7 @@
 // This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 // CANN Open Software License Agreement Version 2.0 (the "License").
 // -----------------------------------------------------------------------------------------------------------
-// Runtime-M O-B N192 x26 + N128 with SplitM HC-post.
+// Runtime-M O-B with N160 tiles and SplitM HC-post.
 #include "mxfp8_projection.hpp"
 #if defined(__CPU_SIM)
 #include <cmath>
@@ -14,23 +14,22 @@ template <typename T, int R, int C>
 using Vec = Tile<TileType::Vec, T, R, C>;
 template <int MT, int NT>
 using Raw = Vec<float, MT / 2, NT>;
+constexpr int PRELOAD_ROWS = 64;
 template <int NT>
-using Residual = Vec<float, 160, NT>;  // 40 rows x four streams, used as output in place.
+using Residual = Vec<float, 4 * PRELOAD_ROWS, NT>;  // Prefetched rows x four streams, used as output in place.
 template <int NT>
 using ResidualBlock = Vec<float, 4, NT>;
-using PostMix = Tile<TileType::Vec, float, 40, 8, BLayout::RowMajor, 40, 4>;
-using ResMix = Vec<float, 40, 16>;
+using PostMix = Tile<TileType::Vec, float, 64, 8, BLayout::RowMajor, 64, 4>;
+using ResMix = Vec<float, 64, 16>;
 using PostRow = Tile<TileType::Vec, float, 1, 8, BLayout::RowMajor, 1, 4>;
 using ResMixRow = Vec<float, 1, 16>;
-constexpr int COLUMNS = 27;
-constexpr int FULL_COLUMNS = 26;
-constexpr int PRELOAD_ROWS = 40;
 constexpr int RAW_UB = 0;
-constexpr int RESIDUAL_UB = 49152;
-constexpr int POST_UB = 172032;
-constexpr int RES_MIX_UB = 173312;
+template <int NT>
+constexpr int ResidualUB = 64 * NT * sizeof(float);
+constexpr int POST_UB = 245760;
+constexpr int RES_MIX_UB = 247808;
 constexpr int READY = 0, RELEASE = 1, FINISH = 2, STORE_DONE = 3, VEC_OFFSET = 16;
-static_assert(RES_MIX_UB + 40 * 16 * 4 <= 196608, "UB capacity exceeded");
+static_assert(RES_MIX_UB + 64 * 16 * 4 <= 262144, "UB capacity exceeded");
 #if defined(__CPU_SIM)
 using SimPipe = TPipe<0, Direction::DIR_C2V, 65536, 1, 2>;
 #endif
@@ -118,7 +117,7 @@ __tf__ __aicore__ inline void mix_row(
 #else
     __VEC_SCOPE__ {
         MaskReg full = pset_b32(PAT_ALL), full16 = pset_b16(PAT_ALL);
-        for (uint16_t k = 0; k < NT / 64; ++k) {
+        for (uint16_t k = 0; k < (NT + 63) / 64; ++k) {
             RegTensor<bfloat16_t> rounded;
             RegTensor<float> value, x0, r0, r1, r2, r3, coef, term;
             vlds(x0, raw, k * 64, NORM);
@@ -147,7 +146,13 @@ __tf__ __aicore__ inline void mix_row(
                 term = r3;
                 vmadd(term, coef, value, full, MODE_ZEROING);
                 value = term;
-                vsts(value, residual_output, h * NT + k * 64, NORM_B32, full);
+                if constexpr (NT % 64 == 0) {
+                    vsts(value, residual_output, h * NT + k * 64, NORM_B32, full);
+                } else {
+                    uint32_t remaining = NT - k * 64;
+                    MaskReg tail = CreatePredicate<float>(remaining);
+                    vsts(value, residual_output, h * NT + k * 64, NORM_B32, tail);
+                }
             }
         }
     }
@@ -159,7 +164,7 @@ __aicore__ inline void preload_row(__gm__ int64_t* args, int global_row, int n, 
     ResidualBlock<NT> residual;
     PostRow post;
     ResMixRow res_mix;
-    TASSIGN(residual, RESIDUAL_UB + slot * 16 * NT);
+    TASSIGN(residual, ResidualUB<NT> + slot * 16 * NT);
     TASSIGN(post, POST_UB + slot * 32);
     TASSIGN(res_mix, RES_MIX_UB + slot * 64);
     GlobalTensor<float, TileShape2D<float, 4, NT>, BaseShape2D<float, 4, 5120>> r(
@@ -173,20 +178,21 @@ __aicore__ inline void preload_row(__gm__ int64_t* args, int global_row, int n, 
     TLOAD(res_mix, m);
 }
 
-template <int MT, int NT>
+template <int MT, int NT, int NC>
 __aicore__ inline void vector_task(__gm__ int64_t* args, int task, PostMix& post, ResMix& res_mix) {
     const int active = args[8];
+    constexpr int COLUMNS = (5120 + NC - 1) / NC;
     const int row_group = task / COLUMNS * MT;
     const int group = active - row_group > MT ? MT : active - row_group;
     const int half = (group + 1) / 2;
     const int row = row_group + get_sub_block_id(args) * half;
-    const int n = task % COLUMNS * 192;
+    const int n = task % COLUMNS * NC;
     const int valid = active - row < 0 ? 0 : (active - row > half ? half : active - row);
     Raw<MT, NT> raw;
     Residual<NT> residual;
     TASSIGN(raw, RAW_UB);
-    TASSIGN(residual, RESIDUAL_UB);
-    wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+    TASSIGN(residual, ResidualUB<NT>);
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
     const int preload = valid < PRELOAD_ROWS ? valid : PRELOAD_ROWS;
     for (int local = 0; local < preload; ++local) preload_row<NT>(args, row + local, n, local);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
@@ -200,25 +206,25 @@ __aicore__ inline void vector_task(__gm__ int64_t* args, int task, PostMix& post
     for (int local = 0; local < valid; ++local) {
         const int slot = local % PRELOAD_ROWS;
         if (local >= PRELOAD_ROWS) {
-            wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
             preload_row<NT>(args, row + local, n, slot);
             set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
             wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         }
         mix_row<MT, NT>(residual.data(), raw.data(), post.data(), res_mix.data(), slot, local);
         ResidualBlock<NT> output;
-        TASSIGN(output, RESIDUAL_UB + slot * 16 * NT);
+        TASSIGN(output, ResidualUB<NT> + slot * 16 * NT);
         GlobalTensor<float, TileShape2D<float, 4, NT>, BaseShape2D<float, 4, 5120>> y(
             data<float>(args, 7) + (row + local) * 20480 + n);
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         TSTORE(y, output);
         if (local == PRELOAD_ROWS - 1 || local >= PRELOAD_ROWS) {
-            set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
         }
     }
     if (valid < PRELOAD_ROWS) {
-        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
     }
 #if defined(__CPU_SIM)
     TFREE<SimPipe, TileSplitAxis::TILE_UP_DOWN_ODD>(pipe);
@@ -227,10 +233,12 @@ __aicore__ inline void vector_task(__gm__ int64_t* args, int task, PostMix& post
 #endif
 }
 
-template <int MT>
+template <int MT, int NC>
 __aicore__ inline void vector_entry(__gm__ int64_t* args) {
     const int active = args[8];
     const int workers = get_block_num(args);
+    constexpr int COLUMNS = (5120 + NC - 1) / NC;
+    constexpr int FULL_COLUMNS = 5120 / NC;
     const int tasks = ((active + MT - 1) / MT) * COLUMNS;
     PostMix post;
     ResMix res_mix;
@@ -239,15 +247,15 @@ __aicore__ inline void vector_entry(__gm__ int64_t* args) {
 #if !defined(__CPU_SIM)
     set_intra_block(PIPE_V, RELEASE);
 #endif
-    set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
     for (int task = get_block_idx(args); task < tasks; task += workers) {
         if (task % COLUMNS < FULL_COLUMNS) {
-            vector_task<MT, 192>(args, task, post, res_mix);
+            vector_task<MT, NC, NC>(args, task, post, res_mix);
         } else {
-            vector_task<MT, 128>(args, task, post, res_mix);
+            vector_task<MT, 128, NC>(args, task, post, res_mix);
         }
     }
-    wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
 #if !defined(__CPU_SIM)
     set_intra_block(PIPE_MTE3, STORE_DONE);
     wait_intra_block(PIPE_V, FINISH);
@@ -287,31 +295,33 @@ __aicore__ inline void project_group(__gm__ int64_t* args, int row, int n, int r
 }
 #endif
 
-template <int MT>
+template <int MT, int NC>
 __aicore__ inline void kernel_entry_m(__gm__ int64_t* args) {
     const int active = args[8];
     const int workers = get_block_num(args);
+    constexpr int COLUMNS = (5120 + NC - 1) / NC;
+    constexpr int FULL_COLUMNS = 5120 / NC;
     const int tasks = ((active + MT - 1) / MT) * COLUMNS;
 #if defined(__DAV_CUBE__)
     PostOutput<MT> emit;
     for (int task = get_block_idx(args); task < tasks; task += workers) {
         const int row = task / COLUMNS * MT;
         const int column = task % COLUMNS;
-        const int n = column * 192;
+        const int n = column * NC;
         const int rows = active - row > MT ? MT : active - row;
         if (column < FULL_COLUMNS) {
-            project_group<192>(args, row, n, rows);
+            project_group<NC>(args, row, n, rows);
         } else {
             project_group<128>(args, row, n, rows);
         }
     }
     emit.finish();
 #elif defined(__DAV_VEC__)
-    vector_entry<MT>(args);
+    vector_entry<MT, NC>(args);
 #endif
 }
 }  // namespace
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    kernel_entry_m<128>(args);
+    kernel_entry_m<128, 160>(args);
 }

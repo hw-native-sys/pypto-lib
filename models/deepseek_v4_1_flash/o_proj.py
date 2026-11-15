@@ -49,7 +49,7 @@ O_OUT_SCALE_COLS = pl.dynamic("O_OUT_SCALE_COLS")
 
 # tiling
 O_A_N_TILE = 256
-OB_HC_POST_COLUMNS = 27  # 26 full N192 tiles plus one N128 tile.
+O_B_N_TILE = 160
 
 
 @pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "o_quant_vf.cpp",
@@ -63,7 +63,6 @@ def _quant_o_vf(
     active_rows: pl.Scalar[pl.INT32],
     groups: pl.Scalar[pl.INT32],
     padded_rows: pl.Scalar[pl.INDEX],
-    full_group_rows: pl.Scalar[pl.INDEX],
 ) -> tuple[pl.Tensor, pl.Tensor]:
     """Inverse-rotate BF16 tails and quantize projection inputs to OCP MXFP8."""
     # Preserve both extern Out values: https://github.com/hw-native-sys/pypto/issues/3249
@@ -247,7 +246,7 @@ def o_proj_hc_post(
     oa_row_tile: pl.constexpr = 80,
     ob_row_tile: pl.constexpr = 128,
 ):
-    """Return HC output and completion after consuming each N192/N128 accumulator."""
+    """Return HC output and completion after consuming each N160 accumulator."""
     total_rows = pl.tensor.dim(output, 0)
     oa_tile = oa_row_tile
     if total_rows > oa_row_tile:
@@ -256,26 +255,23 @@ def o_proj_hc_post(
     payload_all = pl.create_tensor([LOCAL_O_GROUPS * padded_rows, O_GROUP_IN], dtype=pl.FP8E4M3FN)
     scales_all = pl.create_tensor([LOCAL_O_GROUPS, padded_rows * (O_GROUP_IN // 32)], dtype=pl.FP8E8M0)
     vector_workers = 2 * pl.system.available_cluster_count()
-    full_group_rows = 80
-    if oa_row_tile > 80:
-        full_group_rows = 64
     with pl.spmd(vector_workers, name_hint="quant_o_vf"):
         payload_all, scales_all = _quant_o_vf(
             attended, rope_cos, rope_sin, payload_all, scales_all,
-            num_tokens, LOCAL_O_GROUPS, padded_rows, full_group_rows,
+            num_tokens, LOCAL_O_GROUPS, padded_rows,
         )
     payload = pl.create_tensor([padded_rows, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
     activation_scale = pl.create_tensor([1, padded_rows * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)
     oa_tasks = (padded_rows // oa_tile) * (LOCAL_O_WIDTH // O_A_N_TILE)
     oa_workers = pl.max(1, pl.min(oa_tasks, pl.system.available_cluster_count()))
-    with pl.spmd(oa_workers, name_hint="proj_o_a_quant"):
+    with pl.spmd(oa_workers, name_hint="proj_o_a_quant", sync_start=True):
         payload, activation_scale = _o_proj_a(
             payload_all, wo_a, scales_all, wo_a_scale, payload, activation_scale,
             LOCAL_O_WIDTH, num_tokens, padded_rows, oa_tile,
         )
-    ob_tasks = ((total_rows + ob_row_tile - 1) // ob_row_tile) * OB_HC_POST_COLUMNS
+    ob_tasks = ((total_rows + ob_row_tile - 1) // ob_row_tile) * ((D + O_B_N_TILE - 1) // O_B_N_TILE)
     ob_workers = pl.max(1, pl.min(ob_tasks, pl.system.available_cluster_count()))
-    with pl.spmd(ob_workers, name_hint="proj_o_b_hc_post") as ready:
+    with pl.spmd(ob_workers, name_hint="proj_o_b_hc_post", sync_start=True) as ready:
         output = _o_proj_b_hc_post(
             payload, wo_b, activation_scale, wo_b_scale,
             residual, post_mix, residual_mix, output, total_rows, ob_row_tile,
@@ -416,7 +412,7 @@ def o_proj_hc_post_native_validation(
     vector_workers = 2 * pl.system.available_cluster_count()
     with pl.spmd(vector_workers, name_hint="quant_o_vf"):
         payload_all, scales_all = _quant_o_vf(
-            attended, rope_cos, rope_sin, payload_all, scales_all, num_tokens, LOCAL_O_GROUPS, padded_rows, 80,
+            attended, rope_cos, rope_sin, payload_all, scales_all, num_tokens, LOCAL_O_GROUPS, padded_rows,
         )
     payload = pl.create_tensor([padded_rows, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
     activation_scale = pl.create_tensor([1, padded_rows * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)
@@ -424,9 +420,10 @@ def o_proj_hc_post_native_validation(
         payload_all, wo_a, scales_all, wo_a_scale, payload, activation_scale,
         LOCAL_O_WIDTH, num_tokens, padded_rows,
     )
-    ob_tasks = ((total_rows + 127) // 128) * OB_HC_POST_COLUMNS
-    ob_workers = pl.max(1, pl.min(ob_tasks, pl.system.available_cluster_count()))
-    with pl.spmd(ob_workers, name_hint="proj_o_b_hc_post"):
+    ob_tasks = ((total_rows + 127) // 128) * ((D + O_B_N_TILE - 1) // O_B_N_TILE)
+    # Process at least two output tiles per worker.
+    ob_workers = pl.max(1, pl.min(ob_tasks // 2, pl.system.available_cluster_count()))
+    with pl.spmd(ob_workers, name_hint="proj_o_b_hc_post", sync_start=True):
         output = _o_proj_b_hc_post(
             payload, wo_b, activation_scale, wo_b_scale,
             residual, post_mix, residual_mix, output, total_rows, 128,
@@ -557,7 +554,7 @@ if __name__ == "__main__":
     validation = o_proj_hc_post_native_validation if args.native_oa else o_proj_hc_post_validation
     if args.tokens is not None and args.tokens < 0:
         parser.error("tokens must be nonnegative")
-    cases = ((0, True), (17, True), (72, False), (129, True))
+    cases = ((0, True), (1, True), (17, True), (72, False), (129, True))
     if args.tokens is not None:
         cases = ((args.tokens, True),)
     for active, padded in cases:
