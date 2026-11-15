@@ -197,8 +197,6 @@ wall-time claims still require an unprofiled benchmark through `perf`.
 
 ## Helper validation
 
-After changing scheduling logic, run `scripts/test_scheduling.py` with the same
-isolated OR-Tools environment. It covers multi-wave work conservation and
-precedence, partial/MIX waves, pressure diagnostics, timeout fallback and a large
-parallel DAG. Reanalyze compatible existing captures for real-data regressions;
-a new device capture is unnecessary for changes confined to this analyzer.
+After changing scheduling logic, reanalyze compatible existing captures and
+check work conservation, dependencies and physical core assignments. A new
+device capture is unnecessary for changes confined to this analyzer.
