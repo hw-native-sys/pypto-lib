@@ -1,13 +1,13 @@
 ---
 name: perf-ideal-schedule
-description: Capture a level-1 PyPTO swimlane and estimate a resource-constrained ideal task schedule, including off-path core contention and MIX placement. Use for best-schedule kernel latency estimates and dependency-only versus finite-core comparisons, rather than benchmark medians or observed dispatch-gap attribution.
+description: Capture a level-1 PyPTO swimlane and estimate a resource-constrained ideal task schedule, including oversized launches, off-path core contention, MIX placement, and actionable parallel-demand diagnostics. Use for best-schedule kernel latency estimates and dependency-only versus finite-core comparisons, rather than benchmark medians or observed dispatch-gap attribution.
 ---
 
 # Ideal Schedule Performance
 
 Run the requested case with numerical validation, collect a level-1 chip
 swimlane, and compute a physically core-feasible ideal schedule. Report it as
-**a conservative task-gang model estimate**, never as measured latency or a
+**a conservative ordered-wave task-gang model estimate**, never as measured latency or a
 proof of hardware-optimal execution.
 
 ## Capture
@@ -60,8 +60,13 @@ For one explicit rank/dispatch, pass its `chip_swimlane_records.json` instead.
 That analyzes only the supplied rank and cannot establish the fastest rank.
 Distributed directory inputs require `--expected-ranks` so an incomplete rank
 cannot silently disappear. The current helper supports A5's contiguous
-32-AIC/64-AIV topology; unsupported topologies or multi-wave launch sizes fail
-explicitly instead of producing guessed results.
+32-AIC/64-AIV topology; unsupported topologies fail explicitly. Launches larger
+than the engine capacity become ordered waves, including a partial final wave.
+Every wave retains the original task's maximum worker duration. Incoming
+dependencies enter the first wave; consumers wait for the last. The report
+retains original task IDs, wave sizes and the original dependency-only value;
+the primary dependency path and bounds use the expanded graph. Raw captures
+are never rewritten.
 
 Weights default to **execution only**: `max_worker(end - start)`. This reproduces
 the agreed kernel-only metric. Local setup is excluded from both duration and
@@ -95,7 +100,8 @@ For each included task:
 
 - Use its longest physical worker duration, including all AIC/AIV lanes of MIX.
 - Start all its blocks together as an indivisible gang; hold every occupied
-  core until this task duration expires. This is conservative for launches
+  core until this task duration expires. For oversized launches, apply this
+  rule separately to sequential capacity-sized waves. This is conservative for launches
   that can actually stagger blocks or release short worker lanes early.
 - Allocate pure AIC/AIV blocks from their corresponding capacity. MIX requires
   an AIC and its associated one/two AIV cores in the same cluster.
@@ -107,13 +113,25 @@ publication/pool outputs, rather than stopping at an arbitrarily named HC post.
 This accounts for branches competing for cores; branches with sufficient slack
 can still be hidden.
 
-CP-SAT first solves engine-capacity scheduling, then verifies a physical
-paired-core assignment at those exact times. Independent checks reject core
-capacity excess or overlapping reservations. If placement is unavailable,
-retain the engine result only as diagnostic information and do not report it
-as a feasible best schedule. Emit the engine candidate, bound, status, and
-placement status even on placement failure; mark that dispatch and its rank
-feasible total as unavailable. Timeouts are configurable with `--timeout`.
+The helper first constructs a physical list schedule, prioritizing the longest
+remaining dependency chain. It groups ready tasks by core demand, and validates
+precedence, exact worker counts, MIX slot pairing and core overlap independently.
+This provides a feasible fallback and a CP-SAT warm start.
+
+`--solver auto` (default) uses CP-SAT up to `--exact-task-limit 500` expanded
+graph nodes, then uses the verified list schedule for larger graphs. Use
+`--solver heuristic` for a quick estimate or `--solver exact` to explicitly
+attempt CP-SAT on a larger graph. `--timeout` bounds each optimization and
+placement solve separately; parsing, graph construction and checks are outside
+that limit. Do not keep increasing timeouts without a useful bound improvement.
+
+CP-SAT solves engine-capacity scheduling, then checks physical paired-core
+placement at those times. On timeout or unavailable placement, retain the engine
+candidate/status as diagnostics and report the independently verified fallback.
+A candidate without placement is never promoted to a feasible schedule. Report
+the chosen method, fallback reason, dependency/workload lower bound, solver bound
+when available, and feasible-minus-bound gap. `HEURISTIC` is an upper bound within
+this model and carries no optimality claim, even if it happens to meet the bound.
 
 - `OPTIMAL` plus a paired-core witness proves optimality **within this model**.
 - `FEASIBLE` is a model-feasible upper bound; report the solver lower bound too.
@@ -123,8 +141,40 @@ feasible total as unavailable. Timeouts are configurable with `--timeout`.
 Do not describe this as a hardware lower bound. Fixed measured durations retain
 kernel-internal waits and capture-time contention. The model does not recompute
 memory bandwidth, cache interference, remote-peer progress, descriptor slots,
-or changes in kernel duration under a different execution order. A finer
+or changes in kernel duration under a different execution order. Ordered waves
+also impose extra barriers and charge the slowest worker to every wave; they do not reconstruct actual wave timing. A finer
 per-block model can reduce the conservative gang-model result.
+
+## Parallelism diagnostics and optimization advice
+
+Surface capacity warnings in the user-facing result, not only in JSON:
+
+- **Oversized launch:** name, original task ID, block count, AIC/AIV demand,
+  capacity, wave count and partial final wave. Suggest inspecting tiling,
+  coarsening work per block or moving independent iterations into a block-local
+  loop, subject to buffer limits and measured load balance.
+- **Competing branches:** the expanded DAG's unlimited-core ASAP timeline
+  identifies potential demand above 32 AIC / 64 AIV. Report the time, engine,
+  demand/capacity, concurrent task count and contributing names/IDs. The report
+  also samples the largest overloaded intervals by excess core-time; this ranks
+  inspection candidates, not predicted latency savings. This is
+  hypothetical dependency-ready demand, not observed occupancy or a proof that
+  every feasible schedule must contend at that point. Use the verified optimized
+  timeline to assess actual model delay before recommending changes.
+
+Compare worker demand, not task count alone: one MIX task may occupy the whole
+chip. Suggest fewer workers or coarser tasks on noncritical branches when that
+could leave cores for critical work. Extra waves can improve load balance;
+oversubscription alone does not establish a performance defect. Never suggest
+blindly clamping block counts, removing work, or serializing all parallel loops.
+Any kernel change needs numerical validation and unprofiled wall-time evidence.
+
+Launch metadata cannot reveal every logical tile inside a worker. When observed
+worker durations are imbalanced even though the launch fits, inspect generated
+kernel loop/tile counts and the short final wave (for example, 40 logical chunks
+on 32 workers). Explain this separately from exposed launch oversubscription;
+do not infer logical tile counts from task counts or treat model reservations
+as evidence of actual idle cores.
 
 ## Deliver
 
@@ -144,3 +194,9 @@ Compare CANN or another reference only when requested. State differences in
 routing/EPLB, EP topology, weights and measurement boundaries; do not equate
 CANN whole-operator duration with a measured per-core statistic. Production
 wall-time claims still require an unprofiled benchmark through `perf`.
+
+## Helper validation
+
+After changing scheduling logic, reanalyze compatible existing captures and
+check work conservation, dependencies and physical core assignments. A new
+device capture is unnecessary for changes confined to this analyzer.

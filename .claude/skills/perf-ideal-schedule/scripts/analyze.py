@@ -12,6 +12,7 @@ import argparse
 from collections import defaultdict, deque
 import json
 import math
+import time
 from pathlib import Path
 
 try:
@@ -21,65 +22,65 @@ except ImportError as exc:
         "Install ortools in an isolated target and add it to PYTHONPATH; retain the active PyPTO environment."
     ) from exc
 
-SCALE = 1000
+from scheduling import (
+    SCALE,
+    demand,
+    expand_waves,
+    graph_times,
+    list_schedule,
+    pressure_report,
+    verify_schedule,
+)
 
 
-def run(key, record):
-    r = record["ranks"][record["rank"]]
-    p = Path(r["records"])
-    deps = json.loads((p.parent / "deps.json").read_text())
-    info = {str(t["task_id"]): t for t in deps["tasks"]}
-    stats = {t["task_id"]: t for t in r["tasks"]}
-    nodes = set(info)
-    for e in deps["edges"]:
-        nodes.update([str(e["pred"]), str(e["succ"])])
-    horizon = sum(math.ceil(t["max_us"] * SCALE - 1e-6) for t in stats.values())
+def solve_exact(info, stats, edges, graph, timeout, hint):
+    duration = graph[0]
+    horizon = max(hint[1].values())
     model = cp_model.CpModel()
-    starts = {}
-    ends = {}
-    intervals = {}
-    demands = {"aic": [], "aiv": []}
-    resource = {"aic": [], "aiv": []}
-    dur = {}
-    for tid in sorted(nodes):
-        t = stats.get(tid)
-        w = math.ceil(t["max_us"] * SCALE - 1e-6) if t else 0
-        dur[tid] = w
+    starts, ends, intervals = {}, {}, {}
+    resource, demands = {"aic": [], "aiv": []}, {"aic": [], "aiv": []}
+    for tid in sorted(duration):
+        w = duration[tid]
         starts[tid] = model.new_int_var(0, horizon, "s" + tid)
         ends[tid] = model.new_int_var(0, horizon, "e" + tid)
         model.add(ends[tid] == starts[tid] + w)
+        model.add_hint(starts[tid], hint[0][tid])
+        model.add_hint(ends[tid], hint[1][tid])
         if not w:
             continue
         iv = model.new_interval_var(starts[tid], w, ends[tid], "iv" + tid)
         intervals[tid] = iv
-        ks = info[tid]["kernel_ids"]
-        b = info[tid]["block_num"]
-        n_c = int(ks[0] >= 0) * b
-        n_v = sum(k >= 0 for k in ks[1:]) * b
-        if n_c > 32 or n_v > 64:
-            raise ValueError(("multi-wave task", tid, n_c, n_v))
-        for engine, n in [("aic", n_c), ("aiv", n_v)]:
+        for engine, n in zip(("aic", "aiv"), demand(info[tid])):
             if n:
                 resource[engine].append(iv)
                 demands[engine].append(n)
-    for e in deps["edges"]:
-        model.add(starts[str(e["succ"])] >= ends[str(e["pred"])])
+    for a, b in edges:
+        model.add(starts[b] >= ends[a])
     for engine, cap in [("aic", 32), ("aiv", 64)]:
         model.add_cumulative(resource[engine], demands[engine], cap)
     makespan = model.new_int_var(0, horizon, "makespan")
-    model.add_max_equality(makespan, [ends[t] for t in intervals])
+    model.add_max_equality(makespan, [ends[t] for t in duration])
     model.minimize(makespan)
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = record.get("timeout", 30)
+    solver.parameters.max_time_in_seconds = timeout
     solver.parameters.num_search_workers = 4
     solver.parameters.random_seed = 0
     status = solver.solve(model)
+    result = {
+        "engine_status": solver.status_name(status),
+        "engine_schedule_us": None,
+        "solver_bound_us": solver.best_objective_bound / SCALE,
+        "paired_core_assignment": "NOT_RUN",
+        "candidate": None,
+    }
     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-        raise ValueError(("no schedule", key, solver.status_name(status)))
+        if status != cp_model.UNKNOWN:
+            raise ValueError(("Unexpected solver failure with verified feasible hint", result))
+        return result
+    result["engine_schedule_us"] = solver.value(makespan) / SCALE
     # Verify the relaxed engine capacities have a physically paired core assignment.
     placement = cp_model.CpModel()
     cores = defaultdict(list)
-    choices = {}
     presence = defaultdict(list)
     for tid in intervals:
         ks = info[tid]["kernel_ids"]
@@ -120,74 +121,125 @@ def run(key, record):
                 presence[core].append((tid, v))
                 candidates.append(v)
             placement.add(sum(candidates) == b * sum(k >= 0 for k in ks[1:]))
-        choices[tid] = candidates
     for ivs in cores.values():
         placement.add_no_overlap(ivs)
     ps = cp_model.CpSolver()
-    ps.parameters.max_time_in_seconds = record.get("timeout", 30)
+    ps.parameters.max_time_in_seconds = timeout
     ps.parameters.num_search_workers = 4
     pstatus = ps.solve(placement)
     has_placement = pstatus in [cp_model.OPTIMAL, cp_model.FEASIBLE]
-    schedule = []
-    for tid in intervals:
-        t = stats[tid]
-        schedule.append(
-            {
-                "task_id": tid,
-                "name": t["name"],
-                "blocks": t["blocks"],
-                "start_us": solver.value(starts[tid]) / SCALE,
-                "end_us": solver.value(ends[tid]) / SCALE,
-                "weight_us": dur[tid] / SCALE,
-                "kernel_ids": info[tid]["kernel_ids"],
-            }
+    result["paired_core_assignment"] = ps.status_name(pstatus)
+    if has_placement:
+        assigned = defaultdict(list)
+        for core, entries in presence.items():
+            for tid, present in entries:
+                if ps.value(present):
+                    assigned[tid].append(core)
+        result["candidate"] = (
+            {tid: solver.value(v) for tid, v in starts.items()},
+            {tid: solver.value(v) for tid, v in ends.items()},
+            dict(assigned),
         )
+    return result
+
+
+def run(key, record):
+    began = time.monotonic()
+    r = record["ranks"][record["rank"]]
+    p = Path(r["records"])
+    deps = json.loads((p.parent / "deps.json").read_text())
+    info, stats, edges, expansions = expand_waves(deps, r["tasks"])
+    graph = graph_times(info, stats, edges)
+    duration, _, _, asap_start, asap_end, _, _ = graph
+    included = [t for t in duration if duration[t]]
+    if not included:
+        raise ValueError("No positive-duration compute tasks")
+    path_us = max(asap_end.values()) / SCALE
+    pressure = pressure_report(info, stats, asap_start, asap_end)
+    lower = (
+        max(
+            max(asap_end.values()),
+            *(
+                math.ceil(sum(duration[t] * demand(info[t])[engine] for t in included) / capacity)
+                for engine, capacity in enumerate((32, 64))
+            ),
+        )
+        / SCALE
+    )
+    fallback = list_schedule(info, stats, graph)
+    verify_schedule(info, duration, edges, *fallback)
+    mode = record.get("solver", "auto")
+    limit = record.get("exact_task_limit", 500)
+    use_exact = mode == "exact" or (mode == "auto" and len(duration) <= limit)
+    exact = {
+        "engine_status": "NOT_RUN",
+        "engine_schedule_us": None,
+        "solver_bound_us": lower,
+        "paired_core_assignment": "NOT_RUN",
+        "candidate": None,
+    }
+    reason = (
+        "requested heuristic"
+        if mode == "heuristic"
+        else f"{len(duration)} graph nodes exceed exact limit {limit}"
+    )
+    if use_exact:
+        exact = solve_exact(info, stats, edges, graph, record.get("timeout", 30), fallback)
+        reason = f"engine {exact['engine_status']}; placement {exact['paired_core_assignment']}"
+    candidate = exact.pop("candidate")
+    chosen = fallback
+    method = "heuristic"
+    if candidate is not None:
+        verify_schedule(info, duration, edges, *candidate)
+        if max(candidate[1].values()) <= max(fallback[1].values()):
+            chosen, method = candidate, "cp-sat"
+        else:
+            reason = "verified heuristic is shorter than the placed engine candidate"
+    starts, ends, assigned = chosen
+    physical = verify_schedule(info, duration, edges, starts, ends, assigned)
+    feasible = max(ends.values()) / SCALE
+    lower = max(lower, exact["solver_bound_us"])
+    if lower > feasible + 1e-6:
+        raise ValueError("Model bound exceeds verified feasible schedule")
+    status = exact["engine_status"] if method == "cp-sat" else "HEURISTIC"
+    schedule = [
+        {
+            "task_id": tid,
+            "original_task_id": stats[tid].get("original_task_id", tid),
+            "name": stats[tid]["name"],
+            "blocks": info[tid]["block_num"],
+            "start_us": starts[tid] / SCALE,
+            "end_us": ends[tid] / SCALE,
+            "weight_us": duration[tid] / SCALE,
+            "kernel_ids": info[tid]["kernel_ids"],
+        }
+        for tid in included
+    ]
     schedule.sort(key=lambda t: (t["start_us"], t["task_id"]))
-    events = []
-    for t in schedule:
-        ks = t["kernel_ids"]
-        b = t["blocks"]
-        events.extend(
-            [
-                (t["start_us"], b * int(ks[0] >= 0), b * sum(k >= 0 for k in ks[1:])),
-                (t["end_us"], -b * int(ks[0] >= 0), -b * sum(k >= 0 for k in ks[1:])),
-            ]
-        )
-    # Independent sweep check of every half-open resource interval.
-    for a in sorted({e[0] for e in events}):
-        active = [t for t in schedule if t["start_us"] <= a < t["end_us"]]
-        nc = sum(t["blocks"] * int(t["kernel_ids"][0] >= 0) for t in active)
-        nv = sum(t["blocks"] * sum(k >= 0 for k in t["kernel_ids"][1:]) for t in active)
-        if nc > 32 or nv > 64:
-            raise ValueError("resource violation")
-    result = {
+    return {
         "case": key,
-        "previous_path_us": r["kernel_us"],
-        "resource_schedule_us": solver.value(makespan) / SCALE if has_placement else None,
-        "engine_schedule_us": solver.value(makespan) / SCALE,
-        "resource_lower_bound_us": solver.best_objective_bound / SCALE,
-        "status": solver.status_name(status),
-        "paired_core_assignment": ps.status_name(pstatus),
-        "solver_wall_s": solver.wall_time,
+        "previous_path_us": path_us,
+        "single_wave_dependency_path_us": r["kernel_us"],
+        "resource_schedule_us": feasible,
+        "resource_lower_bound_us": lower,
+        "optimality_gap_us": feasible - lower,
+        "status": status,
+        **exact,
+        "schedule_method": method,
+        "fallback_reason": reason if method == "heuristic" else None,
+        "physical_assignment": "VERIFIED",
+        "physical_cores": physical,
+        "solver_wall_s": time.monotonic() - began,
         "schedule": schedule,
         "records": str(p),
         "include_setup": record.get("include_setup", False),
-        "model": "task-gang; all physical workers charged task max duration; paired MIX cores; ignores gaps and bandwidth changes",
+        "extra_us": feasible - path_us,
+        "wave_expansions": expansions,
+        "parallel_pressure": pressure,
+        "graph_nodes": len(duration),
+        "compute_tasks": len(included),
+        "model": "ordered-wave task-gang; each wave charges original max worker duration; paired MIX cores; ignores gaps and bandwidth changes",
     }
-    if not has_placement:
-        result["physical_cores"] = None
-        result["extra_us"] = None
-        return result
-    result["physical_cores"] = {
-        str(core): [tid for tid, v in vv if ps.value(v)] for core, vv in presence.items()
-    }
-    for core, tids in result["physical_cores"].items():
-        ordered = sorted(tids, key=lambda t: solver.value(starts[t]))
-        for a, b in zip(ordered, ordered[1:]):
-            if solver.value(ends[a]) > solver.value(starts[b]):
-                raise ValueError(("core overlap", core, a, b))
-    result["extra_us"] = result["resource_schedule_us"] - r["kernel_us"]
-    return result
 
 
 def load_capture(path, include_setup=False, exclusions=()):
@@ -304,10 +356,22 @@ def main():
         help="Additional zero-weight tasks; dependencies retained",
     )
     parser.add_argument("--keep-signal-clear", action="store_true")
+    parser.add_argument("--solver", choices=("auto", "exact", "heuristic"), default="auto")
+    parser.add_argument(
+        "--exact-task-limit",
+        type=int,
+        default=500,
+        help="Auto mode uses the verified heuristic above this expanded graph size",
+    )
     parser.add_argument("--timeout", type=float, default=30, help="Seconds per optimization/placement solve")
     args = parser.parse_args()
-    if args.timeout <= 0 or (args.expected_ranks is not None and args.expected_ranks < 1):
-        parser.error("Timeout and expected-ranks must be positive")
+    if (
+        args.exact_task_limit < 1
+        or not math.isfinite(args.timeout)
+        or args.timeout <= 0
+        or (args.expected_ranks is not None and args.expected_ranks < 1)
+    ):
+        parser.error("Timeout must be finite and positive; task limit and expected-ranks must be positive")
     source = args.capture.resolve()
     compared_ranks = False
     if source.is_file():
@@ -351,6 +415,7 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     results = {}
     for path in paths:
+        print(f"Analyzing {path}", flush=True)
         r = load_capture(path, args.include_setup, exclusions)
         key = (
             path.parent.parent.name + "/" + path.parent.name
@@ -363,6 +428,8 @@ def main():
                 "rank": "selected",
                 "ranks": {"selected": r},
                 "timeout": args.timeout,
+                "solver": args.solver,
+                "exact_task_limit": args.exact_task_limit,
                 "include_setup": args.include_setup,
             },
         )
@@ -380,8 +447,14 @@ def main():
         rank_summaries[rank] = {
             "observed_span_us": observed,
             "dependency_path_us": sum(r["previous_path_us"] for r in dispatches),
-            "feasible_schedule_us": sum(r["resource_schedule_us"] for r in dispatches) if all_placed else None,
-            "engine_schedule_us": sum(r["engine_schedule_us"] for r in dispatches),
+            "feasible_schedule_us": sum(r["resource_schedule_us"] for r in dispatches)
+            if all_placed
+            else None,
+            "engine_schedule_us": (
+                sum(r["engine_schedule_us"] for r in dispatches)
+                if all(r["engine_schedule_us"] is not None for r in dispatches)
+                else None
+            ),
             "model_bound_us": sum(r["resource_lower_bound_us"] for r in dispatches),
             "all_optimal": all_placed and all(r["status"] == "OPTIMAL" for r in dispatches),
         }
@@ -404,26 +477,89 @@ def main():
             else f"Supplied rank: {selected}; fastest rank was not established."
         ),
         "",
-        "Conservative task-gang model, not measured latency or hardware-optimal execution. "
-        "All blocks start together and hold cores until the task maximum worker duration. "
+        "Conservative ordered-wave task-gang model, not measured latency or hardware-optimal execution. "
+        "Oversized launches become sequential capacity-sized waves; each wave holds cores for the original maximum worker duration. "
         "Inter-task gaps and fixed-core ordering are removed; bandwidth/cache effects and remote-rank progress are not simulated.",
         "",
         "| Dispatch | Dependency path us | Feasible schedule us | Model bound us | Status |",
         "|---|---:|---:|---:|---|",
     ]
+
     def timing(value):
         return "unavailable" if value is None else f"{value:.3f}"
 
     for key, r in results.items():
         lines.append(
-            f"| {key} | {r['previous_path_us']:.3f} | {timing(r['resource_schedule_us'])} | {r['resource_lower_bound_us']:.3f} | {r['status']}; placement {r['paired_core_assignment']} |"
+            f"| {key} | {r['previous_path_us']:.3f} | {timing(r['resource_schedule_us'])} | {r['resource_lower_bound_us']:.3f} | {r['status']}; {r['schedule_method']}; physical {r['physical_assignment']} |"
         )
     for key, r in results.items():
-        if r["resource_schedule_us"] is None:
-            lines.append("")
+        lines += [
+            "",
+            f"### {key}: capacity diagnostics",
+            "",
+            f"Graph: {r['graph_nodes']} nodes / {r['compute_tasks']} compute gangs. "
+            f"Feasible-minus-bound gap: {r['optimality_gap_us']:.3f} us. "
+            f"Finite-core schedule minus dependency path: {r['extra_us']:.3f} us.",
+        ]
+        if r["fallback_reason"]:
+            lines.append(f"Verified heuristic: {r['fallback_reason']}. No optimality claim.")
+        lines.append(
+            f"Engine status: {r['engine_status']}; candidate: {timing(r['engine_schedule_us'])} us; "
+            f"engine placement: {r['paired_core_assignment']}."
+        )
+        lines.append("")
+        for wave in r["wave_expansions"]:
             lines.append(
-                f"{key}: placement {r['paired_core_assignment']}; engine candidate "
-                f"{r['engine_schedule_us']:.3f} us is diagnostic only, not a feasible schedule."
+                f"- Oversized launch `{wave['name']}` (task {wave['task_id']}): {wave['blocks']} blocks, "
+                f"AIC/AIV demand {wave['aic_demand']}/{wave['aiv_demand']} versus 32/64 cores; "
+                f"{len(wave['wave_ids'])} ordered waves, {wave['blocks_per_wave']} blocks per full wave, "
+                f"{wave['wave_blocks'][-1]} in the last, each {wave['worker_max_us']:.3f} us. "
+                "Inspect tiling and consider coarser blocks or looping over more work per block; "
+                "preserve all work and check load balance and buffer limits."
+            )
+        pressure = r["parallel_pressure"]
+        for peak in pressure["peaks"]:
+            lines.append(
+                f"- Potential {peak['engine']} pressure at dependency-ASAP {peak['time_us']:.3f} us: "
+                f"{peak['parallel_tasks']} tasks demand {peak['peak_demand']} / {peak['capacity']} cores. "
+                "Inspect noncritical branches for fewer workers or coarser tasks, keeping critical work ready."
+            )
+            for group in peak["groups"][:10]:
+                lines.append(
+                    f"  - `{group['name']}`: {group['tasks']} tasks, "
+                    f"{group['core_demand']} cores; sample IDs {', '.join(group['task_ids'])}."
+                )
+        if pressure["top_windows"]:
+            lines += [
+                "",
+                "Largest dependency-ASAP demand intervals by excess core-time "
+                "(not a latency penalty or predicted speedup):",
+                "",
+                "| Engine | Interval us | Demand / cores | Tasks | Contributors |",
+                "|---|---:|---:|---:|---|",
+            ]
+            for window in pressure["top_windows"]:
+                contributors = "; ".join(
+                    f"{g['name']} ({g['core_demand']}, IDs {', '.join(g['task_ids'])})"
+                    for g in window["groups"][:5]
+                )
+                if len(window["groups"]) > 5:
+                    contributors += "; additional groups in results.json"
+                lines.append(
+                    f"| {window['engine']} | {window['time_us']:.3f} - {window['end_us']:.3f} | "
+                    f"{window['peak_demand']} / {window['capacity']} | "
+                    f"{window['parallel_tasks']} | {contributors} |"
+                )
+            lines.append("")
+        if not r["wave_expansions"] and not pressure["peaks"]:
+            lines.append("No exposed core demand exceeds capacity in the dependency-ASAP timeline.")
+        if r["wave_expansions"] or pressure["peaks"]:
+            lines.append(
+                "These are optimization candidates, not measured occupancy or proof of wasted parallelism. "
+                "Extra waves can be useful for load balance. Do not clamp block counts or serialize branches "
+                "without preserving work; validate candidate changes and benchmark device wall time. "
+                "Inspect generated inner-loop tiling separately: logical work can exceed cores even when "
+                "the exposed launch fits in one wave."
             )
     lines += [
         "",
@@ -440,8 +576,8 @@ def main():
     lines += [
         "",
         "Engine OPTIMAL proves model optimality only with a paired-core witness; "
-        "engine FEASIBLE is an upper bound only with that witness. "
-        "Every reported feasible schedule has a paired-core assignment with independently checked core overlap. "
+        "engine FEASIBLE is an upper bound only with that witness. HEURISTIC is a verified upper bound, not an optimum. "
+        "Every reported feasible schedule has independently checked dependencies, core demand, MIX pairing and core overlap. "
         "Durations round upward to 0.001 us. All non-excluded compute tasks contribute to makespan.",
         "",
     ]
