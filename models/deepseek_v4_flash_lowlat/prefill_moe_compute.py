@@ -14,7 +14,7 @@ from .prefill_moe_gate import gate, ROUTE_ROW_PAD
 from .prefill_moe_expert import expert_routed_persistent_planned
 from .prefill_moe_geometry import (
     D, HC_DIM, HC_MULT, IDX_PAD, MIX_HC, MOE_INTER, N_BANK, N_EXPERTS, N_ROUTES,
-    N_SLOTS_B, RECV_MAX, SHARED_EID, SHARED_TILES, SH_SLOT, T, TOPK, VOCAB, WORK_SLOTS_PAD,
+    PREFILL_MOE_EXPERT_AFFINITY, EXPERT_IDS_PAD, N_SLOTS_B, RECV_MAX, SHARED_EID, SHARED_TILES, SH_SLOT, T, TOPK, VOCAB, WORK_SLOTS_PAD,
 )
 
 
@@ -203,6 +203,53 @@ def prepare_moe(
     return post_ffn, comb_ffn, recv_x, recv_scale, recv_w, work_slot, work_rows, slot_expert, route_slot_row
 
 
+@pl.jit.inline
+
+def _prefill_expert_affinity_plan(
+    work_slot: pl.Tensor[[WORK_SLOTS_PAD], pl.INT32],
+    work_rows: pl.Tensor[[WORK_SLOTS_PAD], pl.INT32],
+    slot_expert: pl.Tensor[[N_SLOTS_B, IDX_PAD], pl.INT32],
+):
+    """Group independent physical tiles by expert without changing their rows."""
+    heads = pl.create_tensor([1, EXPERT_IDS_PAD], dtype=pl.INT32)
+    tails = pl.create_tensor([1, EXPERT_IDS_PAD], dtype=pl.INT32)
+    counts = pl.create_tensor([1, EXPERT_IDS_PAD], dtype=pl.INT32)
+    links = pl.create_tensor([1, WORK_SLOTS_PAD], dtype=pl.INT32)
+    slots = pl.create_tensor([1, WORK_SLOTS_PAD], dtype=pl.INT32)
+    rows = pl.create_tensor([1, WORK_SLOTS_PAD], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_expert_affinity_plan"):
+        for expert_init in pl.range(EXPERT_IDS_PAD):
+            pl.write(heads, [0, expert_init], pl.const(-1, pl.INT32))
+            pl.write(tails, [0, expert_init], pl.const(-1, pl.INT32))
+            pl.write(counts, [0, expert_init], pl.const(0, pl.INT32))
+        for work_init in pl.range(WORK_SLOTS_PAD):
+            pl.write(links, [0, work_init], pl.const(-1, pl.INT32))
+            pl.write(slots, [0, work_init], pl.const(0, pl.INT32))
+            pl.write(rows, [0, work_init], pl.const(0, pl.INT32))
+        for work in pl.range(WORK_SLOTS_PAD):
+            active_rows = pl.read(work_rows, [work])
+            if active_rows > 0:
+                slot = pl.cast(pl.read(work_slot, [work]), pl.INDEX)
+                expert = pl.cast(pl.read(slot_expert, [slot, 0]), pl.INDEX)
+                tail = pl.read(tails, [0, expert])
+                if tail < 0:
+                    pl.write(heads, [0, expert], pl.cast(work, pl.INT32))
+                else:
+                    pl.write(links, [0, pl.cast(tail, pl.INDEX)], pl.cast(work, pl.INT32))
+                pl.write(tails, [0, expert], pl.cast(work, pl.INT32))
+                pl.write(counts, [0, expert], pl.cast(pl.read(counts, [0, expert]) + 1, pl.INT32))
+        output_work = pl.cast(0, pl.INDEX)
+        for expert in pl.range(N_BANK):
+            cursor = pl.cast(pl.read(heads, [0, expert]), pl.INDEX)
+            tiles = pl.cast(pl.read(counts, [0, expert]), pl.INDEX)
+            for step in pl.range(tiles):
+                pl.write(slots, [0, output_work], pl.read(work_slot, [cursor]))
+                pl.write(rows, [0, output_work], pl.read(work_rows, [cursor]))
+                cursor = pl.cast(pl.read(links, [0, cursor]), pl.INDEX)
+                output_work = output_work + 1
+    return pl.reshape(slots, [WORK_SLOTS_PAD]), pl.reshape(rows, [WORK_SLOTS_PAD])
+
+
 @pl.jit.inline(auto_scope=False)
 def moe_local(
     recv_x: pl.Tensor[[N_SLOTS_B, RECV_MAX, D], pl.INT8],
@@ -221,8 +268,12 @@ def moe_local(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     recv_y = pl.create_tensor([N_SLOTS_B, RECV_MAX, D], dtype=pl.BF16)
+    planned_slot = work_slot
+    planned_rows = work_rows
+    if PREFILL_MOE_EXPERT_AFFINITY != 0:
+        planned_slot, planned_rows = _prefill_expert_affinity_plan(work_slot, work_rows, slot_expert)
     expert_routed_persistent_planned(
-        recv_x, recv_scale, recv_w, work_slot, work_rows, slot_expert,
+        recv_x, recv_scale, recv_w, planned_slot, planned_rows, slot_expert,
         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
         routed_w2, routed_w2_scale,
         recv_y,

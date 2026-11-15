@@ -19,7 +19,7 @@ import pypto.language.distributed as pld
 
 from models.deepseek_v4_flash_lowlat.prefill_moe import (
     D, HC_DIM, HC_MULT, MIX_HC, MOE_INTER, N_BANK, N_EXPERTS, N_RANKS,
-    REDUCE_WINDOW_ROWS, T as MOE_WAVE_TOKENS, TOPK, VOCAB, prefill_moe_tp, clear_prefill_moe_tp_signals,
+    REDUCE_WINDOW_ROWS, RESULT_WINDOW_ROWS, PREFILL_MOE_OWNER_REDUCE, PREFILL_MOE_EXPERT_AFFINITY, T as MOE_WAVE_TOKENS, TOPK, VOCAB, prefill_moe_tp, clear_prefill_moe_tp_signals,
 )
 N_LOCAL = N_BANK
 N_EXPERTS_GLOBAL = N_EXPERTS
@@ -96,6 +96,7 @@ from lm_head import (
 from rmsnorm import rms_norm
 
 
+PREFILL_MOE_OWNER_PLAN = (bool(PREFILL_MOE_OWNER_REDUCE), bool(PREFILL_MOE_EXPERT_AFFINITY))
 PREFILL_MECHANISM_PLAN = (bool(CAUSAL_READY), bool(CAUSAL_FULL_WAIT), bool(ECHO_PREFETCH), bool(ECHO_DIAGNOSTICS), INDEXER_ARENAS)
 
 
@@ -253,6 +254,8 @@ def prefill_tp8_fwd(
     terminal: pl.Scalar[pl.INT32],
     tp_reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.FP32],
     tp_reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    tp_result_window: pld.DistributedTensor[[RESULT_WINDOW_ROWS, D], pl.BF16],
+    tp_result_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     gather_window: pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16],
     gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     o_proj_wo_a_window: pld.DistributedTensor[[O_PROJ_WO_A_WINDOW_ROWS, O_PROJ_WO_A_WINDOW_COLS], pl.BF16],
@@ -411,7 +414,7 @@ def prefill_tp8_fwd(
                 norm_w_l0, gate_w_l0, gate_bias_l0, tid2eid_l0, input_ids,
                 routed_w1_l0, routed_w1_scale_l0, routed_w3_l0, routed_w3_scale_l0,
                 routed_w2_l0, routed_w2_scale_l0, x_hc, stage_token, layer_completion,
-                tp_reduce_window, tp_reduce_signal, layer_l0, group_tokens, my_rank,
+                tp_reduce_window, tp_reduce_signal, tp_result_window, tp_result_signal, layer_l0, group_tokens, my_rank,
                 layer_l0 * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
             )
 
@@ -491,7 +494,7 @@ def prefill_tp8_fwd(
                 norm_w_l1, gate_w_l1, gate_bias_l1, tid2eid_l1, input_ids,
                 routed_w1_l1, routed_w1_scale_l1, routed_w3_l1, routed_w3_scale_l1,
                 routed_w2_l1, routed_w2_scale_l1, x_hc, stage_token, layer_completion,
-                tp_reduce_window, tp_reduce_signal, layer_l1, group_tokens, my_rank,
+                tp_reduce_window, tp_reduce_signal, tp_result_window, tp_result_signal, layer_l1, group_tokens, my_rank,
                 layer_l1 * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
             )
 
@@ -644,7 +647,7 @@ def prefill_tp8_fwd(
                     norm_w_csa, gate_w_csa, gate_bias_csa, tid2eid_csa, input_ids,
                     routed_w1_csa, routed_w1_scale_csa, routed_w3_csa, routed_w3_scale_csa,
                     routed_w2_csa, routed_w2_scale_csa, x_hc, stage_token, layer_completion,
-                    tp_reduce_window, tp_reduce_signal, csa_layer, group_tokens, my_rank,
+                    tp_reduce_window, tp_reduce_signal, tp_result_window, tp_result_signal, csa_layer, group_tokens, my_rank,
                     csa_layer * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
                 )
                 if group_tokens > 0:
@@ -763,7 +766,7 @@ def prefill_tp8_fwd(
                     norm_w_hca, gate_w_hca, gate_bias_hca, tid2eid_hca, input_ids,
                     routed_w1_hca, routed_w1_scale_hca, routed_w3_hca, routed_w3_scale_hca,
                     routed_w2_hca, routed_w2_scale_hca, x_hc, stage_token, layer_completion,
-                    tp_reduce_window, tp_reduce_signal, hca_layer, group_tokens, my_rank,
+                    tp_reduce_window, tp_reduce_signal, tp_result_window, tp_result_signal, hca_layer, group_tokens, my_rank,
                     hca_layer * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
                 )
                 if group_tokens > 0:
@@ -921,11 +924,11 @@ def prefill_tp8_fwd(
                 norm_w_last, gate_w_last, gate_bias_last, tid2eid_last, input_ids,
                 routed_w1_last, routed_w1_scale_last, routed_w3_last, routed_w3_scale_last,
                 routed_w2_last, routed_w2_scale_last, x_hc, stage_token, layer_completion,
-                tp_reduce_window, tp_reduce_signal, layer_last, group_tokens, my_rank,
+                tp_reduce_window, tp_reduce_signal, tp_result_window, tp_result_signal, layer_last, group_tokens, my_rank,
                 layer_last * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
             )
 
-    moe_retired_tid = clear_prefill_moe_tp_signals(stage_token, tp_reduce_signal)
+    moe_retired_tid = clear_prefill_moe_tp_signals(stage_token, tp_reduce_signal, tp_result_signal)
     with pl.scope():
         if group_tokens > 0:
             retire_o_proj_weight_signals(
@@ -1132,6 +1135,8 @@ def l3_prefill_tp8_fwd(
 
     tp_reduce_window_buf = pld.alloc_window_buffer([REDUCE_WINDOW_ROWS, D], dtype=pl.FP32)
     tp_reduce_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    tp_result_window_buf = pld.alloc_window_buffer([RESULT_WINDOW_ROWS, D], dtype=pl.BF16)
+    tp_result_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     gather_window_buf = pld.alloc_window_buffer([PREFILL_GROUP_CAP, D], dtype=pl.BF16)
     gather_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     o_proj_wo_a_window_buf = pld.alloc_window_buffer([O_PROJ_WO_A_WINDOW_ROWS, O_PROJ_WO_A_WINDOW_COLS], dtype=pl.BF16)
@@ -1162,6 +1167,8 @@ def l3_prefill_tp8_fwd(
 
         tp_reduce_window = pld.window(tp_reduce_window_buf, [REDUCE_WINDOW_ROWS, D], dtype=pl.FP32)
         tp_reduce_signal = pld.window(tp_reduce_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
+        tp_result_window = pld.window(tp_result_window_buf, [RESULT_WINDOW_ROWS, D], dtype=pl.BF16)
+        tp_result_signal = pld.window(tp_result_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         gather_window = pld.window(gather_window_buf, [PREFILL_GROUP_CAP, D], dtype=pl.BF16)
         gather_signal = pld.window(gather_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
         o_proj_wo_a_window = pld.window(
@@ -1218,7 +1225,7 @@ def l3_prefill_tp8_fwd(
             final_norm_w[r], lm_head_weight[r], logit_row_indices[r],
             dspark_target_hidden[r],
             x_out[r], logits[r], grammar_mask[r], sampled_ids[r], terminal,
-            tp_reduce_window, tp_reduce_signal,
+            tp_reduce_window, tp_reduce_signal, tp_result_window, tp_result_signal,
             gather_window, gather_signal,
             o_proj_wo_a_window, o_proj_wo_b_window,
             o_proj_weight_ready, o_proj_weight_consumed,

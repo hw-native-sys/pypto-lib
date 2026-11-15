@@ -15,6 +15,7 @@ from .prefill_moe_geometry import (
     D, HC_DIM, HC_MULT, MIX_HC, MOE_INTER, N_BANK, N_EXPERTS, N_RANKS,
     REDUCE_WINDOW_ROWS, REDUCE_LANE_ROWS, REDUCE_D_TILE, T_PAD, T, TOPK, VOCAB,
     COPY_T_TILE, COPY_D_TILE, REDUCE_T_TILE,
+    PREFILL_MOE_OWNER_REDUCE, PREFILL_MOE_EXPERT_AFFINITY as PREFILL_MOE_EXPERT_AFFINITY, OWNER_ROWS, OWNER_REDUCE_T_TILE, OWNER_COPY_T_TILE, RESULT_WINDOW_ROWS,
 )
 
 
@@ -31,6 +32,7 @@ PREFILL_ROWS = pl.dynamic("LOWLAT_PREFILL_MOE_ROWS")
 def clear_prefill_moe_tp_signals(
     completion: pl.Tensor[[1], pl.INT32],
     reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    result_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
 ):
     """Retire local counters after the final ordered TP wave completes."""
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_moe_cleanup") as retired_tid:
@@ -38,11 +40,12 @@ def clear_prefill_moe_tp_signals(
         if completed >= 0:
             for src in pl.range(N_RANKS):
                 pl.write(reduce_signal, [src, 0], pl.const(0, pl.INT32))
+                pl.write(result_signal, [src, 0], pl.const(0, pl.INT32))
     return retired_tid
 
 
 @pl.jit.inline(auto_scope=False)
-def _prefill_moe_publish_reduce(
+def _prefill_moe_legacy_publish_reduce(
     ffn_partial: pl.Tensor[[T, D], pl.FP32],
     ffn_out: pl.Tensor[[T, D], pl.BF16],
     reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.FP32],
@@ -91,6 +94,110 @@ def _prefill_moe_publish_reduce(
 
 
 @pl.jit.inline(auto_scope=False)
+def _prefill_moe_owner_publish_reduce(
+    partial: pl.Tensor[[T, D], pl.FP32],
+    output: pl.Tensor[[T, D], pl.BF16],
+    receive: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.FP32],
+    received: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    result: pld.DistributedTensor[[RESULT_WINDOW_ROWS, D], pl.BF16],
+    result_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    rank: pl.Scalar[pl.INT32],
+    epoch: pl.Scalar[pl.INT32],
+    partial_ready: pl.Scalar[pl.TASK_ID],
+    previous_store: pl.Scalar[pl.TASK_ID],
+):
+    """Scatter FP32 rows, sum rank0..7 once per owner, and publish BF16 rows."""
+    lane = pl.cast((epoch - 1) % 2, pl.INDEX)
+    receive_base = lane * T_PAD
+    source_row = pl.cast(rank, pl.INDEX) * OWNER_ROWS
+    tasks = pl.array.create(6, pl.TASK_ID)
+    with pl.manual_scope():
+        with pl.spmd(N_RANKS, name_hint="prefill_owner_fp32_scatter", deps=[partial_ready, previous_store], allow_early_resolve=False) as scattered:
+            owner = pl.tile.get_block_idx()
+            pld.tensor.put(
+                dst=receive, peer=owner, src=partial,
+                dst_offsets=[receive_base + source_row, 0], src_offsets=[owner * OWNER_ROWS, 0],
+                shape=[OWNER_ROWS, D], chunk_rows=OWNER_COPY_T_TILE, chunk_cols=COPY_D_TILE,
+            )
+            pld.system.notify(received, owner, [rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
+        tasks[0] = scattered
+    with pl.manual_scope():
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_owner_fp32_defer", deps=[tasks[0]], allow_early_resolve=False) as all_partials:
+            for source in pl.range(N_RANKS):
+                if PREFILL_MOE_READY != 0:
+                    pld.system.defer_wait(received, [source, 0], epoch, cmp=pld.WaitCmp.Ge)
+                else:
+                    pld.system.wait(received, [source, 0], epoch, cmp=pld.WaitCmp.Ge)
+        tasks[1] = all_partials
+    owner_output = pl.create_tensor([OWNER_ROWS, D], dtype=pl.BF16)
+    with pl.manual_scope():
+        with pl.spmd((OWNER_ROWS // OWNER_REDUCE_T_TILE) * (D // REDUCE_D_TILE), name_hint="prefill_owner_rank_order_sum", deps=[tasks[1]], allow_early_resolve=False) as summed:
+            block = pl.tile.get_block_idx()
+            t0 = (block // (D // REDUCE_D_TILE)) * OWNER_REDUCE_T_TILE
+            d0 = (block % (D // REDUCE_D_TILE)) * REDUCE_D_TILE
+            acc = pl.load(receive, [receive_base + t0, d0], [OWNER_REDUCE_T_TILE, REDUCE_D_TILE])
+            for source in pl.range(1, N_RANKS):
+                row = receive_base + source * OWNER_ROWS + t0
+                acc = pl.add(acc, pl.load(receive, [row, d0], [OWNER_REDUCE_T_TILE, REDUCE_D_TILE]))
+            rounded = pl.cast(acc, target_type=pl.BF16, mode="rint")
+            pl.store(rounded, [t0, d0], owner_output)
+        tasks[2] = summed
+    result_base = lane * T_PAD
+    with pl.manual_scope():
+        with pl.spmd(N_RANKS, name_hint="prefill_owner_bf16_publish", deps=[tasks[2]], allow_early_resolve=False) as published:
+            peer = pl.tile.get_block_idx()
+            pld.tensor.put(
+                dst=result, peer=peer, src=owner_output,
+                dst_offsets=[result_base + source_row, 0], src_offsets=[0, 0],
+                shape=[OWNER_ROWS, D], chunk_rows=OWNER_COPY_T_TILE, chunk_cols=COPY_D_TILE,
+            )
+            pld.system.notify(result_ready, peer, [rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
+        tasks[3] = published
+    with pl.manual_scope():
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_owner_bf16_defer", deps=[tasks[3]], allow_early_resolve=False) as all_results:
+            for source in pl.range(N_RANKS):
+                if PREFILL_MOE_READY != 0:
+                    pld.system.defer_wait(result_ready, [source, 0], epoch, cmp=pld.WaitCmp.Ge)
+                else:
+                    pld.system.wait(result_ready, [source, 0], epoch, cmp=pld.WaitCmp.Ge)
+        tasks[4] = all_results
+    with pl.manual_scope():
+        with pl.spmd((T // REDUCE_T_TILE) * (D // REDUCE_D_TILE), name_hint="prefill_owner_bf16_collect", deps=[tasks[4]], allow_early_resolve=False) as collected:
+            block = pl.tile.get_block_idx()
+            t0 = (block // (D // REDUCE_D_TILE)) * REDUCE_T_TILE
+            d0 = (block % (D // REDUCE_D_TILE)) * REDUCE_D_TILE
+            value = pl.load(result, [result_base + t0, d0], [REDUCE_T_TILE, REDUCE_D_TILE])
+            pl.store(value, [t0, d0], output)
+        tasks[5] = collected
+    return tasks[5]
+
+
+@pl.jit.inline(auto_scope=False)
+def _prefill_moe_publish_reduce(
+    partial: pl.Tensor[[T, D], pl.FP32],
+    output: pl.Tensor[[T, D], pl.BF16],
+    receive: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.FP32],
+    received: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    result: pld.DistributedTensor[[RESULT_WINDOW_ROWS, D], pl.BF16],
+    result_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    rank: pl.Scalar[pl.INT32],
+    epoch: pl.Scalar[pl.INT32],
+    partial_ready: pl.Scalar[pl.TASK_ID],
+    previous_store: pl.Scalar[pl.TASK_ID],
+):
+    chosen = pl.array.create(1, pl.TASK_ID)
+    if PREFILL_MOE_OWNER_REDUCE != 0:
+        chosen[0] = _prefill_moe_owner_publish_reduce(
+            partial, output, receive, received, result, result_ready, rank, epoch, partial_ready, previous_store,
+        )
+    else:
+        chosen[0] = _prefill_moe_legacy_publish_reduce(
+            partial, output, receive, received, rank, epoch, partial_ready, previous_store,
+        )
+    return chosen[0]
+
+
+@pl.jit.inline(auto_scope=False)
 def prefill_moe_tp(
     attn_out: pl.Tensor[[PREFILL_ROWS, HC_MULT, D], pl.FP32],
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
@@ -112,6 +219,8 @@ def prefill_moe_tp(
     layer_completion: pl.Tensor[[1], pl.INT32],
     reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.FP32],
     reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    result_window: pld.DistributedTensor[[RESULT_WINDOW_ROWS, D], pl.BF16],
+    result_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     group_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
@@ -167,7 +276,7 @@ def prefill_moe_tp(
             ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
             previous_store = stored[0]
             reduced = _prefill_moe_publish_reduce(
-                ffn_partial, ffn_out, reduce_window, reduce_signal, my_rank, epoch, partial_ready, previous_store,
+                ffn_partial, ffn_out, reduce_window, reduce_signal, result_window, result_signal, my_rank, epoch, partial_ready, previous_store,
             )
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_ready_post_gate", deps=[reduced]) as post_ready:
                 pl.write(ffn_out, [0, 0], pl.read(ffn_out, [0, 0]))
@@ -211,6 +320,8 @@ def l2_prefill_moe_tp(
     out: pl.Out[pl.Tensor[[PREFILL_ROWS, HC_MULT, D], pl.FP32]],
     reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.FP32],
     reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    result_window: pld.DistributedTensor[[RESULT_WINDOW_ROWS, D], pl.BF16],
+    result_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     group_tokens: pl.Scalar[pl.INT32],
     rank: pl.Scalar[pl.INT32],
@@ -225,8 +336,8 @@ def l2_prefill_moe_tp(
         pl.write(completion, [0], pl.const(0, pl.INT32))
     prefill_moe_tp(x, hc_fn, hc_scale, hc_base, norm_w, gate_w, gate_bias,
                    tid2eid, ids, w1, s1, w3, s3, w2, s2, out, stage, completion,
-                   reduce_window, reduce_signal, layer_id, group_tokens, rank, pl.const(0, pl.INT32))
-    clear_prefill_moe_tp_signals(completion, reduce_signal)
+                   reduce_window, reduce_signal, result_window, result_signal, layer_id, group_tokens, rank, pl.const(0, pl.INT32))
+    clear_prefill_moe_tp_signals(completion, reduce_signal, result_signal)
     return out
 
 @pl.jit.host
@@ -255,10 +366,14 @@ def l3_prefill_moe_tp(
     out.bind_dynamic(1, PREFILL_ROWS)
     rw_buf = pld.alloc_window_buffer([REDUCE_WINDOW_ROWS, D], dtype=pl.FP32)
     rs_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    result_buf = pld.alloc_window_buffer([RESULT_WINDOW_ROWS, D], dtype=pl.BF16)
+    result_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     for r in pl.range(pld.world_size()):
         rw = pld.window(rw_buf, [REDUCE_WINDOW_ROWS, D], dtype=pl.FP32)
         rs = pld.window(rs_buf, [N_RANKS, 1], dtype=pl.INT32)
+        result = pld.window(result_buf, [RESULT_WINDOW_ROWS, D], dtype=pl.BF16)
+        result_ready = pld.window(result_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         l2_prefill_moe_tp(x[r], hc_fn[r], hc_scale[r], hc_base[r], norm_w[r],
             gate_w[r], gate_bias[r], tid2eid[r], ids[r], w1[r], s1[r], w3[r], s3[r],
-            w2[r], s2[r], out[r], rw, rs, layer_id, group_tokens, r, device=r)
+            w2[r], s2[r], out[r], rw, rs, result, result_ready, layer_id, group_tokens, r, device=r)
     return out

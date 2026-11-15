@@ -33,6 +33,15 @@ if T not in (8, 32, 64, 128, 1024, 2048, 8192):
 if MOE_INTER != 256:
     raise ValueError("Prefill MoE requires TP8 intermediate shards of 256 columns")
 
+PREFILL_MOE_OWNER_REDUCE = _parse_int_argv("--prefill-moe-owner-reduce", 0)
+if PREFILL_MOE_OWNER_REDUCE not in (0, 1):
+    raise ValueError("Prefill owner reduction must be zero or one")
+
+PREFILL_MOE_EXPERT_AFFINITY = _parse_int_argv("--prefill-moe-expert-affinity", 0)
+if PREFILL_MOE_EXPERT_AFFINITY not in (0, 1):
+    raise ValueError("Prefill expert affinity must be zero or one")
+EXPERT_IDS_PAD = (N_BANK + 7) // 8 * 8
+
 # Expert and transport tiling.
 RECV_TILE = 16
 RECV_MAX = RECV_TILE
@@ -45,7 +54,11 @@ SHARED_TILES = (T + RECV_TILE - 1) // RECV_TILE
 N_SLOTS_B = N_SLOTS + SHARED_TILES
 WORK_SLOTS_PAD = (N_SLOTS_B + IDX_PAD - 1) // IDX_PAD * IDX_PAD
 T_PAD = (T + RECV_TILE - 1) // RECV_TILE * RECV_TILE
-REDUCE_LANE_ROWS = N_RANKS * T_PAD
+OWNER_ROWS = T // N_RANKS
+OWNER_REDUCE_T_TILE = min(8, OWNER_ROWS)
+OWNER_COPY_T_TILE = min(4, OWNER_ROWS)
+RESULT_WINDOW_ROWS = 2 * T_PAD
+REDUCE_LANE_ROWS = T_PAD if PREFILL_MOE_OWNER_REDUCE else N_RANKS * T_PAD
 REDUCE_WINDOW_ROWS = 2 * REDUCE_LANE_ROWS
 COPY_T_TILE = 4
 COPY_D_TILE = 2048

@@ -107,7 +107,7 @@ def _validate_target_capacity(metadata, profile, max_seq_len):
 
 def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=180, max_seq_len=1048576,
                     prefill_indexer_arenas=1, projection_degrees=None, prefill_moe_ready=None,
-                    prefill_moe_wave_tokens=None,
+                    prefill_moe_wave_tokens=None, prefill_moe_owner_reduce=False, prefill_moe_expert_affinity=False,
 
                     prefill_causal_ready=False, prefill_causal_full_wait=False,
                     prefill_echo_prefetch=False, prefill_echo_diagnostics=False, prefill_mechanisms=None):
@@ -120,6 +120,14 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
         raise ValueError("Prefill indexer arenas must be one or two")
     if profile != "prefill" and prefill_indexer_arenas != 1:
         raise ValueError("Indexer arena selection applies only to prefill")
+    if type(prefill_moe_expert_affinity) is not bool:
+        raise ValueError("Prefill expert affinity must be a boolean compile option")
+    if profile != "prefill" and prefill_moe_expert_affinity:
+        raise ValueError("Expert affinity applies only to prefill")
+    if type(prefill_moe_owner_reduce) is not bool:
+        raise ValueError("Prefill owner reduction must be a boolean compile option")
+    if profile != "prefill" and prefill_moe_owner_reduce:
+        raise ValueError("Owner reduction applies only to prefill")
     if prefill_moe_ready is None:
         prefill_moe_ready = profile == "prefill"
     if type(prefill_moe_ready) is not bool:
@@ -195,7 +203,7 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
 
             function = load_prefill_programs(
                 indexer_arenas=prefill_indexer_arenas, projection_degrees=projection_degrees,
-                moe_ready=prefill_moe_ready, moe_wave_tokens=prefill_moe_wave_tokens,
+                moe_ready=prefill_moe_ready, moe_wave_tokens=prefill_moe_wave_tokens, moe_owner_reduce=prefill_moe_owner_reduce, moe_expert_affinity=prefill_moe_expert_affinity,
                 causal_ready=prefill_causal_ready,
                 causal_full_wait=prefill_causal_full_wait,
                 echo_prefetch=prefill_echo_prefetch, echo_diagnostics=prefill_echo_diagnostics,
@@ -279,6 +287,7 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
             indexer_arenas=prefill_indexer_arenas,
             moe_ready=prefill_moe_ready,
             moe_wave_tokens=prefill_moe_wave_tokens,
+            moe_owner_reduce=prefill_moe_owner_reduce, moe_expert_affinity=prefill_moe_expert_affinity,
             moe_expert_tile_tokens=16,
             moe_copy_tile=[4, 2048], moe_reduce_tile=[8, 512],
             moe_waves_per_chunk=(8192 + prefill_moe_wave_tokens - 1) // prefill_moe_wave_tokens,
@@ -316,6 +325,8 @@ def main():
     parser.add_argument("--prefill-echo-prefetch", action="store_true", help="Experimental coarse-bin KV prefetch")
     parser.add_argument("--prefill-echo-diagnostics", action="store_true", help="Collect ECHO recall counters")
     parser.add_argument("--prefill-mechanisms", choices=("none", "echo-only", "causal-only", "both"))
+    parser.add_argument("--prefill-moe-owner-reduce", action="store_true", help="Experimental ordered owner reduction")
+    parser.add_argument("--prefill-moe-expert-affinity", action="store_true", help="Experimental expert work locality")
     args = parser.parse_args()
     if args.report.exists():
         parser.error("The report already exists; preserve it and choose a new run directory")
@@ -330,6 +341,8 @@ def main():
         prefill_indexer_arenas=args.prefill_indexer_arenas,
         prefill_moe_ready=args.prefill_moe_ready,
         prefill_moe_wave_tokens=args.prefill_moe_wave_tokens,
+        prefill_moe_owner_reduce=args.prefill_moe_owner_reduce,
+        prefill_moe_expert_affinity=args.prefill_moe_expert_affinity,
         prefill_causal_ready=args.prefill_causal_ready,
         prefill_causal_full_wait=args.prefill_causal_full_wait,
         prefill_echo_prefetch=args.prefill_echo_prefetch, prefill_echo_diagnostics=args.prefill_echo_diagnostics,
