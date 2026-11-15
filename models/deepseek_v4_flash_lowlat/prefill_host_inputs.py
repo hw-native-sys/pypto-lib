@@ -54,3 +54,35 @@ class SharedInput:
         if not self.copying:
             raise RuntimeError("No active copy to retire")
         self.copying = False
+
+
+class CompactInput(SharedInput):
+    """Register real BF16 prompt rows; HC expansion is a separate device op."""
+
+    def __init__(self, max_rows=8192):
+        if type(max_rows) is not int or max_rows < 8 or max_rows > 8192 or max_rows % 8:
+            raise ValueError("Aligned1..8192-row buffer required")
+        self.storage = torch.zeros((max_rows, 4096), dtype=torch.bfloat16).share_memory_()
+        self.copying = False
+        self.generation = 0
+
+    def fill(self, embeddings):
+        if self.copying:
+            raise RuntimeError("Do not overwrite shared input while copies are active")
+        if (
+            not isinstance(embeddings, torch.Tensor)
+            or embeddings.device.type != "cpu"
+            or embeddings.dtype != torch.bfloat16
+            or embeddings.ndim != 2
+            or embeddings.shape[1] != 4096
+        ):
+            raise ValueError("Actual CPU BF16 embeddings required")
+        rows = embeddings.shape[0]
+        padded = (rows + 7) // 8 * 8
+        if rows < 1 or padded > self.storage.shape[0]:
+            raise ValueError("Input exceeds the real shared allocation")
+        result = self.storage[:padded]
+        result[:rows].copy_(embeddings)
+        result[rows:].zero_()
+        self.generation += 1
+        return result.unsqueeze(0).expand(8, *result.shape)
