@@ -46,6 +46,7 @@ Q_A_N_TILE = 64
 Q_B_N_TILE = 256
 KV_N_TILE = 64
 PROJ_M_TILE = 80
+PROJ_WIDE_M_TILE = 128
 WINDOW_PUBLISH_WORKER_TILE = 12
 NATIVE_VALIDATION_WORKERS = 32
 
@@ -136,13 +137,13 @@ def quantize_projection_input(
     """Quantize shared Q/KV inputs with padded rows and M16-packed scales."""
     capacity = pl.tensor.dim(x, 0)
     projection_rows = ((capacity + row_tile - 1) // row_tile) * row_tile
-    # Index-Q reads M80-padded input rows.
+    # Shared input covers both native projection row tiles.
     index_rows = ((capacity + PROJ_M_TILE - 1) // PROJ_M_TILE) * PROJ_M_TILE
     padded_rows = pl.max(projection_rows, index_rows)
     payload = pl.create_tensor([padded_rows, D], dtype=pl.FP8E4M3FN)
     scales = pl.create_tensor([1, padded_rows * (D // 32)], dtype=pl.FP8E8M0)
     quant_blocks = (padded_rows // MX_M_TILE) * (D // MX_K_TILE)
-    workers = pl.min(pl.min(quant_blocks, 32), 2 * pl.system.available_cluster_count())
+    workers = pl.min(quant_blocks, 2 * pl.system.available_cluster_count())
     with pl.spmd(workers, name_hint="qkv_quant"):
         qkv_quant(x, payload, scales, num_tokens, padded_rows)
     return payload, scales, padded_rows
@@ -169,19 +170,32 @@ def q_proj_rope(
     qb_row_tile: pl.constexpr = 80,
 ):
     """Project NZ QA/QB weights, rotate Q, and retain normalized rows for Index-Q."""
-    # Native QA tiles: M80/N64 or M256/N128; QB tiles: M80/N256 or M128/N256.
-    if qa_row_tile == 256:
-        qa_n_tile = 128
-    else:
+    # Native QA tiles: M80/N64, M128/N128, or M256/N128; QB tiles: M80/N256 or M128/N256.
+    qa_tile = qa_row_tile
+    # Minimize padded row work; equal padding selects the wider tile.
+    narrow_rows = ((num_tokens + PROJ_M_TILE - 1) // PROJ_M_TILE) * PROJ_M_TILE
+    wide_rows = ((num_tokens + PROJ_WIDE_M_TILE - 1) // PROJ_WIDE_M_TILE) * PROJ_WIDE_M_TILE
+    if qa_row_tile == PROJ_M_TILE:
+        if wide_rows <= narrow_rows:
+            if padded_rows >= wide_rows:
+                qa_tile = PROJ_WIDE_M_TILE
+    if qa_tile == 80:
         qa_n_tile = Q_A_N_TILE
-    payload_rows = padded_rows
+    else:
+        qa_n_tile = 128
+    qb_tile = qb_row_tile
+    if qb_row_tile == PROJ_M_TILE:
+        if wide_rows <= narrow_rows:
+            qb_tile = PROJ_WIDE_M_TILE
+    qb_padded_rows = ((num_tokens + qb_tile - 1) // qb_tile) * qb_tile
+    payload_rows = pl.max(padded_rows, qb_padded_rows)
     qb_payload = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.FP8E4M3FN)
     qb_scales = pl.create_tensor([1, payload_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
     projected = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.BF16)
-    qa_tasks = ((num_tokens + qa_row_tile - 1) // qa_row_tile) * (Q_LORA // qa_n_tile)
+    qa_tasks = ((num_tokens + qa_tile - 1) // qa_tile) * (Q_LORA // qa_n_tile)
     qa_workers = pl.max(pl.min(qa_tasks, qa_worker_limit), 1)
     with pl.spmd(qa_workers, name_hint="proj_q_a"):
-        projected = _proj_q_a(payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_row_tile)
+        projected = _proj_q_a(payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_tile)
     norm_workers = pl.max(pl.min(payload_rows // (MX_M_TILE // 2), 32), 1)
     latent_rows = pl.tensor.dim(query_latent, 0)
     norm_latent = pl.tensor.slice(query_latent, [latent_rows, Q_LORA], [0, 0])
@@ -189,12 +203,12 @@ def q_proj_rope(
     norm_scales = pl.tensor.slice(qb_scales, [1, payload_rows * (Q_LORA // 32)], [0, 0])
     with pl.spmd(norm_workers, name_hint="q_norm_quant"):
         q_norm_quant(projected, q_norm_weight, norm_latent, norm_payload, norm_scales, num_tokens)
-    qb_tasks = ((num_tokens + qb_row_tile - 1) // qb_row_tile) * (LOCAL_H * HEAD_DIM // Q_B_N_TILE)
-    qb_workers = pl.max(pl.min(qb_tasks, qb_worker_limit), 1)
-    with pl.spmd(qb_workers, name_hint="proj_q_b"):
+    qb_tasks = ((num_tokens + qb_tile - 1) // qb_tile) * (LOCAL_H * HEAD_DIM // Q_B_N_TILE)
+    qb_workers = pl.max(pl.min(qb_tasks, pl.min(qb_worker_limit, pl.system.available_cluster_count())), 1)
+    with pl.spmd(qb_workers, name_hint="proj_q_b", sync_start=True):
         query = _proj_q_b(
             qb_payload, wq_b, qb_scales, wq_b_scale,
-            query, rope_cos, rope_sin, num_tokens, LOCAL_H * HEAD_DIM, 0, qb_row_tile,
+            query, rope_cos, rope_sin, num_tokens, LOCAL_H * HEAD_DIM, 0, qb_tile,
         )
     return query_latent, query, qb_payload, qb_scales
 
@@ -232,7 +246,7 @@ def kv_proj(
     else:
         n_tile = KV_N_TILE
     tasks = ((num_tokens + row_tile - 1) // row_tile) * (HEAD_DIM // n_tile)
-    workers = pl.max(pl.min(tasks, worker_limit), 1)
+    workers = pl.max(pl.min(tasks, pl.min(worker_limit, pl.system.available_cluster_count())), 1)
     with pl.spmd(workers, name_hint="proj_kv", sync_start=True):
         kv_projection = _proj_kv(payload, wkv, scales, wkv_scale, kv_projection, num_tokens, 0, row_tile)
     return kv_projection

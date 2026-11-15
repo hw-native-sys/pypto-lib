@@ -19,7 +19,7 @@ from quant import pack_quantized_cache, unpack_quantized_cache
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from decode_indexer import (
     select_candidate_block_pool, c1a_index, score_select_paged,
-    publish_index_rows, project_index_key,
+    publish_index_rows, project_index_key, SCORE_SHARD_CACHE,
 )
 from o_proj import o_proj_hc_post
 from sparse_attention import gather_sparse_attention
@@ -157,10 +157,11 @@ def decode_c1a_full(
         index_cache, index_cache_scale, index_block_table, request_ids, compressed_lens,
         scores, topk_indices,
         num_tokens, index_ready, query_tid, weights_tid,
-        pl.tensor.dim(pool_block_ids, 1), False, True,
+        pl.tensor.dim(pool_block_ids, 1),
+        shard_k_tile=SCORE_SHARD_CACHE, short_history_policy="score", score_layout="block_maxima",
     )
     pool_tid = select_candidate_block_pool(
-        scores, compressed_lens, pool_block_ids, pool_block_counts, num_tokens, scores_tid, True,
+        scores, compressed_lens, pool_block_ids, pool_block_counts, num_tokens, scores_tid, score_layout="block_maxima",
     )
     selection_ready = pl.system.task_dummy(deps=[topk_tid, compressed_ready])
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)

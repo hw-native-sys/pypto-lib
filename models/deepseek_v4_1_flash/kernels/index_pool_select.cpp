@@ -33,11 +33,14 @@ template <typename T> __aicore__ inline __ubuf__ T *ub(int offset) {
     TASSIGN(tile, offset);
     return tile.data();
 }
+template <bool PackUpper = false>
 __tf__ __aicore__ void encode(__ubuf__ float* source, __ubuf__ uint32_t* keys, int begin, int last, int width) {
     __VEC_SCOPE__ {
         vector_f32 value;
         vector_u32 sign, positive, negative, key, tail, index;
-        vector_bool below, newest;
+        vector_bool below, newest, packed_mask;
+        vector_u16 packed;
+        vector_u32 upper;
         auto all = pset_b32(PAT_ALL);
         vbr(sign, uint32_t(0x80000000));
         vbr(tail, uint32_t(0xf149f2ca));
@@ -53,6 +56,34 @@ __tf__ __aicore__ void encode(__ubuf__ float* source, __ubuf__ uint32_t* keys, i
             vcmps_eq(newest, (vector_s32 &)index, last, all);
             vsel(key, tail, key, newest);
             vsts(key, keys, chunk * 64, NORM_B32, all);
+            if constexpr (PackUpper) {
+                vshrs(upper, key, 16, all, MODE_ZEROING);
+                vpack(packed, upper, LOWER);
+                ppack(packed_mask, all, LOWER);
+                vsts(packed, (__ubuf__ uint16_t*)source, chunk * 64, NORM_B16, packed_mask);
+            }
+        }
+    }
+}
+__tf__ __aicore__ void prepare_keys(__ubuf__ uint32_t* source, __ubuf__ uint32_t* keys, int width) {
+    __VEC_SCOPE__ {
+        vector_u32 key, lower, tail, index, upper;
+        vector_u16 packed;
+        vector_bool newest, packed_mask;
+        auto full = pset_b32(PAT_ALL);
+        vbr(lower, 0x0eb60d35u);
+        vbr(tail, 0xf149f2cau);
+        for (uint16_t c = 0; c < (width + 63) / 64; ++c) {
+            vlds(key, source, c * 64, NORM);
+            vmax(key, key, lower, full, MODE_ZEROING);
+            vci((vector_s32&)index, int32_t(c * 64), INC_ORDER);
+            vcmps_eq(newest, index, uint32_t(width - 1), full);
+            vsel(key, tail, key, newest);
+            vsts(key, keys, c * 64, NORM_B32, full);
+            vshrs(upper, key, 16, full, MODE_ZEROING);
+            vpack(packed, upper, LOWER);
+            ppack(packed_mask, full, LOWER);
+            vsts(packed, (__ubuf__ uint16_t*)source, c * 64, NORM_B16, packed_mask);
         }
     }
 }
@@ -278,7 +309,8 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
                 TLOAD(input, gm);
                 set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
                 wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-                encode(input.data(), ub<uint32_t>(131072), 0, blocks - 1, blocks);
+                if (args[5] == 2) prepare_keys((__ubuf__ uint32_t*)input.data(), ub<uint32_t>(131072), blocks);
+                else encode<true>(input.data(), ub<uint32_t>(131072), 0, blocks - 1, blocks);
             } else {
                 for (int block = 0; block < blocks; block += 1024) {
                     int valid = minimum(8192, width - block * 8);
@@ -299,7 +331,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
             }
             pipe_barrier(PIPE_ALL);
             int rank = blocks - selected + 1, count = 0;
-            pack_upper_keys(ub<uint32_t>(131072), ub<uint16_t>(0), blocks);
+            if (!args[5]) pack_upper_keys(ub<uint32_t>(131072), ub<uint16_t>(0), blocks);
             packed_histogram<8>(ub<uint16_t>(0), ub<uint16_t>(73728), blocks, 0);
             choose_bin(ub<uint16_t>(73728), 24, cutoff, rank, count);
             packed_histogram<0>(ub<uint16_t>(0), ub<uint16_t>(73728), blocks, cutoff >> 16);

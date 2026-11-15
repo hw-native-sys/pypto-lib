@@ -81,11 +81,13 @@ namespace {
         }
         using CandidateKeys = Vec<uint16_t, 1, 512>;
         using CandidateIndices = Vec<uint32_t, 1, 512>;
+        template <int HistogramTile = 128>
         __aicore__ inline void write_cached_row(RegTensor<bfloat16_t>& a, RegTensor<bfloat16_t>& b,
         __ubuf__ uint16_t* dst, __ubuf__ uint16_t* hist, int valid0, int valid1,
         int span0, int span1, bool reset, __ubuf__ uint16_t* pool_valid, bool gathered) {
             vector_u16 h0, h1, pos, negkey, sign, key, high, invalid, lane_valid;
-            vector_u8 bytes;
+            vector_u8 bytes, unused;
+            vector_u16 first_key;
             vector_bool negative, pool_mask;
             auto full = pset_b16(PAT_ALL);
             mem_bar(VST_VLD);
@@ -113,12 +115,15 @@ namespace {
                 vsel(key, key, invalid, pool_mask);
             }
             vsts(key, dst, 0, NORM_B16, full);
-            vshrs(high, key, 8, full, MODE_ZEROING);
-            vpack(bytes, high, LOWER);
-            remaining = span0;
-            auto hist_mask = CreatePredicate<uint8_t>(remaining);
-            chistv2(h0, bytes, hist_mask, Bin_N0);
-            chistv2(h1, bytes, hist_mask, Bin_N1);
+            first_key = key;
+            if constexpr (HistogramTile == 128) {
+                vshrs(high, key, 8, full, MODE_ZEROING);
+                vpack(bytes, high, LOWER);
+                remaining = span0;
+                auto hist_mask = CreatePredicate<uint8_t>(remaining);
+                chistv2(h0, bytes, hist_mask, Bin_N0);
+                chistv2(h1, bytes, hist_mask, Bin_N1);
+            }
             vadds(b, b, bfloat16_t(0), full, MODE_ZEROING);
             vcmps_lt(negative, (vector_s16&)b, int16_t(0), full);
             vxor(pos, (vector_u16&)b, sign, full, MODE_ZEROING);
@@ -133,15 +138,24 @@ namespace {
                 vsel(key, key, invalid, pool_mask);
             }
             vsts(key, dst, 128, NORM_B16, full);
-            vshrs(high, key, 8, full, MODE_ZEROING);
-            vpack(bytes, high, LOWER);
-            remaining = span1;
-            hist_mask = CreatePredicate<uint8_t>(remaining);
-            chistv2(h0, bytes, hist_mask, Bin_N0);
-            chistv2(h1, bytes, hist_mask, Bin_N1);
+            if constexpr (HistogramTile == 256) {
+                vdintlv(unused, bytes, (vector_u8&)first_key, (vector_u8&)key);
+                remaining = span0 + span1;
+                auto mask = CreatePredicate<uint8_t>(remaining);
+                chistv2(h0, bytes, mask, Bin_N0);
+                chistv2(h1, bytes, mask, Bin_N1);
+            } else {
+                vshrs(high, key, 8, full, MODE_ZEROING);
+                vpack(bytes, high, LOWER);
+                remaining = span1;
+                auto hist_mask = CreatePredicate<uint8_t>(remaining);
+                chistv2(h0, bytes, hist_mask, Bin_N0);
+                chistv2(h1, bytes, hist_mask, Bin_N1);
+            }
             vsts(h0, hist, 0, NORM_B16, full);
             vsts(h1, hist, 128, NORM_B16, full);
         }
+        template <int HistogramTile>
         __tf__ __aicore__ void score_cache(__ubuf__ bfloat16_t* src, __ubuf__ bfloat16_t* weights,
         __ubuf__ uint16_t* cache, __ubuf__ uint16_t* hist, int column, int span0, int span1,
         int v00, int v01, int v10, int v11, int v20, int v21, bool have_dot,
@@ -187,9 +201,9 @@ namespace {
                         s21 = d21;
                     }
                 }
-                write_cached_row(s00, s01, cache+column, hist, v00, v01, span0, span1, column == 0, pool_valid, gathered);
-                write_cached_row(s10, s11, cache+25600+column, hist+256, v10, v11, span0, span1, column == 0, pool_valid, gathered);
-                write_cached_row(s20, s21, cache+51200+column, hist+512, v20, v21, span0, span1, column == 0, pool_valid, gathered);
+                write_cached_row<HistogramTile>(s00, s01, cache+column, hist, v00, v01, span0, span1, column == 0, pool_valid, gathered);
+                write_cached_row<HistogramTile>(s10, s11, cache+25600+column, hist+256, v10, v11, span0, span1, column == 0, pool_valid, gathered);
+                write_cached_row<HistogramTile>(s20, s21, cache+51200+column, hist+512, v20, v21, span0, span1, column == 0, pool_valid, gathered);
             }
         }
         __aicore__ inline void threshold_bin(vector_u16 h0, vector_u16 h1, vector_u16& rank,
@@ -397,6 +411,77 @@ namespace {
                 }
             }
         }
+        __tf__ __aicore__ void merge_select(__ubuf__ uint16_t* outk, __ubuf__ uint32_t* outi,
+        __ubuf__ uint16_t* src, __ubuf__ uint32_t* ids, __ubuf__ uint32_t* table,
+        int width, bool gathered, bool map_output, __ubuf__ uint16_t* scratch) {
+            auto result = outi;
+            __VEC_SCOPE__ {
+                vector_u16 cutoff16, boundary16;
+                vector_u32 cutoff, boundary;
+                if (width > 512) {
+                    find_threshold(src, width, scratch, false, (__ubuf__ uint16_t*)0, cutoff16, boundary16);
+                    mem_bar(VLD_VST);
+                } else {
+                    vbr(cutoff16, uint16_t(0x007f));
+                    vbr(boundary16, uint16_t(65535));
+                }
+                auto convert_mask = pset_b16(PAT_ALL);
+                vcvt(cutoff, cutoff16, convert_mask, PART_EVEN);
+                vcvt(boundary, boundary16, convert_mask, PART_EVEN);
+                vector_u32 key, lane, logical, tmp, page, squeezed, invalid, shift;
+                vector_u16 key16, zero16;
+                vector_bool eq, strict, early, keep, valid, packed_mask;
+                vector_align align;
+                auto full = pset_b32(PAT_ALL);
+                auto full16 = pset_b16(PAT_ALL);
+                vbr(invalid, 0xffffffffu);
+                vbr(zero16, uint16_t(0));
+                for (uint16_t c = 0;c<8;++c)vsts(invalid, outi, c*64, NORM_B32, full);
+                for (uint16_t c = 0;c<4;++c)vsts(zero16, outk, c*128, NORM_B16, full16);
+                mem_bar(VST_VST);
+                sprclr(SPR_AR);
+                uint32_t remaining = width;
+                for (uint16_t c = 0;c<(width+63)/64;++c) {
+                    auto mask = CreatePredicate<uint32_t>(remaining);
+                    vlds((vector_u16&)key, src, c*64, UNPK_B16);
+                    vci((vector_s32&)lane, int32_t(c*64), INC_ORDER);
+                    vcmp_gt(strict, key, cutoff, mask);
+                    vcmp_eq(eq, key, cutoff, mask);
+                    vcmp_le(early, lane, boundary, mask);
+                    pand(eq, eq, early, mask);
+                    por(keep, strict, eq, mask);
+                    vcmps_gt(valid, key, 0x007fu, mask);
+                    pand(keep, keep, valid, mask);
+                    {
+                        vlds(logical, ids, c*64, NORM);
+                    }
+                    vsqz(squeezed, logical, keep, MODE_STORED);
+                    vstur(align, squeezed, outi, POST_UPDATE);
+                }
+                vstar(align, outi);
+                // Map only the selected rows, retaining their logical order.
+                if (map_output) {
+                    mem_bar(VST_VLD);
+                    for (uint16_t c = 0; c < 8; ++c) {
+                        vlds(logical, result, c * 64, NORM);
+                        vcmps_ne(valid, logical, 0xffffffffu, full);
+                        if (gathered) {
+                            vgather2(page, table, logical, valid);
+                            logical = page;
+                        } else {
+                            vshrs(tmp, logical, 7, full, MODE_ZEROING);
+                            vgather2(page, table, tmp, valid);
+                            vshls(page, page, 7, full, MODE_ZEROING);
+                            vbr(tmp, 127u);
+                            vand(tmp, logical, tmp, full, MODE_ZEROING);
+                            vadd(logical, page, tmp, full, MODE_ZEROING);
+                        }
+                        vsel(logical, logical, invalid, valid);
+                        vsts(logical, result, c * 64, NORM_B32, full);
+                    }
+                }
+            }
+        }
         __aicore__ inline void select_local(__ubuf__ uint16_t* outk, __ubuf__ uint32_t* outi,
                                             __ubuf__ uint16_t* src, int width, vector_u16& cutoff,
                                             vector_u16& boundary, int logical_begin) {
@@ -541,6 +626,26 @@ namespace {
                 }
             }
         }
+        __tf__ __aicore__ void block_max_keys(__ubuf__ uint32_t* dst, __ubuf__ uint16_t* src, int width) {
+            __VEC_SCOPE__ {
+                vector_u32 keys, maxima, lower, zero, negative_tail;
+                vector_bool negative;
+                auto full = pset_b32(PAT_ALL);
+                uint32_t count = 8;
+                auto reduced = CreatePredicate<uint32_t>(count);
+                vbr(zero, 0u);
+                vbr(negative_tail, 0xffffu);
+                for (uint16_t c = 0; c < (width + 63) / 64; ++c) {
+                    vlds((vector_u16&)keys, src, c * 64, UNPK_B16);
+                    vcgmax(maxima, keys, full);
+                    vcmps_lt(negative, maxima, 0x8000u, reduced);
+                    vsel(lower, negative_tail, zero, negative);
+                    vshls(maxima, maxima, 16, reduced, MODE_ZEROING);
+                    vor(maxima, maxima, lower, reduced, MODE_ZEROING);
+                    vsts(maxima, dst, c * 8, NORM_B32, reduced);
+                }
+            }
+        }
         __tf__ __aicore__ void block_maxima(__ubuf__ float* dst, __ubuf__ uint16_t* src, int width) {
             __VEC_SCOPE__ {
                 vector_u32 keys, maxima, positive, negative, bits, sign;
@@ -571,8 +676,9 @@ namespace {
             for (int row = 0; row < 3; ++row) {
                 int offset = get_subblockid() * 3 + row;
                 if (offset >= count) continue;
-                if (args[20] == 2) {
-                    block_maxima(ub<float>(4096), ub<uint16_t>(98304 + row * 51200), cached_width);
+                if (args[20] >= 2) {
+                    if (args[20] == 3) block_max_keys(ub<uint32_t>(4096), ub<uint16_t>(98304 + row * 51200), cached_width);
+                    else block_maxima(ub<float>(4096), ub<uint16_t>(98304 + row * 51200), cached_width);
                 } else {
                     for (int column = 0; column < cached_width; column += 256) {
                     unpack_scores(rounded.data(), ub<uint16_t>(98304 + row * 51200) + column);
@@ -592,7 +698,7 @@ namespace {
                     }
                     }
                 }
-                if (args[20] == 2) {
+                if (args[20] >= 2) {
                     int blocks = (cached_width + 7) / 8;
                     Tile<TileType::Vec, float, 1, 3200, BLayout::RowMajor, 1, DYNAMIC> maxima(blocks);
                     TASSIGN(maxima, 4096);
@@ -659,7 +765,7 @@ namespace {
             for (int token = worker; token < tokens; token += workers * 2) {
                 if (args[22]) {
                     int length = read(data<int32_t>(args, 7) + token);
-                    if (length <= 512) {
+                    if (length <= args[22]) {
                         write_short_topk(args, token, length, selected_indices);
                         continue;
                     }
@@ -715,9 +821,14 @@ namespace {
                     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
                     uint32_t cutoff;
                     int boundary;
-                    packed_threshold(ub<uint16_t>(0), candidates, 32768, 131072, cutoff, boundary);
-                    packed_select(selected_keys.data(), selected_indices.data(), ub<uint16_t>(0),
-                        ub<uint32_t>(65536), mapping, candidates, cutoff, boundary, gathered_rows != 0, final);
+                    if (final) {
+                        merge_select(selected_keys.data(), selected_indices.data(), ub<uint16_t>(0),
+                            ub<uint32_t>(65536), mapping, candidates, gathered_rows != 0, final, ub<uint16_t>(32768));
+                    } else {
+                        packed_threshold(ub<uint16_t>(0), candidates, 32768, 131072, cutoff, boundary);
+                        packed_select(selected_keys.data(), selected_indices.data(), ub<uint16_t>(0),
+                            ub<uint32_t>(65536), mapping, candidates, cutoff, boundary, gathered_rows != 0, final);
+                    }
                     if (final) {
                         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
                         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -968,10 +1079,14 @@ namespace {
             int first = tokens * token_panels * worker / owners;
             int finish = tokens * token_panels * (worker + 1) / owners;
             for (int cursor = first; cursor < finish;) {
-                int token = cursor / token_panels;
+                int token_group = cursor / token_panels;
+                int token = token_group;
+                if (tokens % workers == 0) {
+                    token = (token_group - first / token_panels) * workers + worker;
+                }
                 int first_panel = cursor % token_panels;
-                int next = minimum(finish, (token + 1) * token_panels);
-                int last_panel = next - token * token_panels;
+                int next = minimum(finish, (token_group + 1) * token_panels);
+                int last_panel = next - token_group * token_panels;
                 int count = minimum(capacity, read(data<int32_t>(args, 13) + token));
                 if (count < 0)
                     count = 0;
@@ -1101,22 +1216,34 @@ namespace {
                     TASSIGN(dot, 0);
                     if (local_panel >= 2)
                         wait_flag(PIPE_MTE1, PIPE_MTE2, event_t(2 + slot));
-                    for (int piece = 0; piece < 4; ++piece) {
-                        using KeyPart =
-                            Tile<TileType::Mat, F4, 128, 512, BLayout::RowMajor, 128, 128, SLayout::ColMajor>;
-                        KeyPart part;
-                        KeyScale part_scale;
-                        TASSIGN(part, 65536 + slot * 65536 + piece * 4096);
-                        TASSIGN(part_scale, 98304 + slot * 65536 + piece * 512);
-                        int page = piece == 0 ? page0 : piece == 1 ? page1 : piece == 2 ? page2 : page3;
-                        auto kp = direct ? cache_payload + int64_t(page) * 8192
-                                         : reinterpret_cast<__gm__ F4*>(ring + piece * 8192);
-                        auto sp = direct ? cache_scale + int64_t(page) * 512
-                                         : reinterpret_cast<__gm__ S*>(ring + 32768 + piece * 512);
-                        GM<F4, 128, 128, 128, 128, Layout::DN> kg(kp);
-                        GM<S, 4, 128, 4, 128, Layout::MX_B_DN> sg(sp);
-                        TLOAD(part, kg);
-                        TLOAD(part_scale, sg);
+                    bool contiguous = !direct || (page1 == page0 + 1 && page2 == page0 + 2 && page3 == page0 + 3);
+                    if (contiguous) {
+                        auto kp = direct ? cache_payload + int64_t(page0) * 8192
+                                         : reinterpret_cast<__gm__ F4*>(ring);
+                        auto sp = direct ? cache_scale + int64_t(page0) * 512
+                                         : reinterpret_cast<__gm__ S*>(ring + 32768);
+                        GM<F4, 128, 512, 128, 512, Layout::DN> kg(kp);
+                        GM<S, 4, 512, 4, 512, Layout::MX_B_DN> sg(sp);
+                        TLOAD(key, kg);
+                        TLOAD(key_scale, sg);
+                    } else {
+                        for (int piece = 0; piece < 4; ++piece) {
+                            using KeyPart =
+                                Tile<TileType::Mat, F4, 128, 512, BLayout::RowMajor, 128, 128, SLayout::ColMajor>;
+                            KeyPart part;
+                            KeyScale part_scale;
+                            TASSIGN(part, 65536 + slot * 65536 + piece * 4096);
+                            TASSIGN(part_scale, 98304 + slot * 65536 + piece * 512);
+                            int page = piece == 0 ? page0 : piece == 1 ? page1 : piece == 2 ? page2 : page3;
+                            auto kp = direct ? cache_payload + int64_t(page) * 8192
+                                             : reinterpret_cast<__gm__ F4*>(ring + piece * 8192);
+                            auto sp = direct ? cache_scale + int64_t(page) * 512
+                                             : reinterpret_cast<__gm__ S*>(ring + 32768 + piece * 512);
+                            GM<F4, 128, 128, 128, 128, Layout::DN> kg(kp);
+                            GM<S, 4, 128, 4, 128, Layout::MX_B_DN> sg(sp);
+                            TLOAD(part, kg);
+                            TLOAD(part_scale, sg);
+                        }
                     }
                     set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
                     wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
@@ -1199,7 +1326,7 @@ namespace {
                     int cached_width = panels * 512;
                     local_select(keys.data(), indices.data(), ub<uint16_t>(98304), cached_width,
                                  first_panel * 512, ub<uint16_t>(251904));
-                    bool complete = first_panel == 0 && next == (token + 1) * token_panels;
+                    bool complete = first_panel == 0 && next == (token_group + 1) * token_panels;
                     if (complete) {
                         pool_map(indices.data(), ub<uint32_t>(134656), ub<uint32_t>(143360));
                         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -1288,6 +1415,39 @@ namespace {
         }
 #endif
 
+#if defined(__DAV_CUBE__)
+        __aicore__ inline bool prefetch_key(__gm__ int64_t* args, int request, int maximum,
+                                            int first_panel, int panel, int cache_pages) {
+            int logical = (first_panel + panel) * 256;
+            int table_width = args[17];
+            int page0 = logical < maximum ? read(data<int32_t>(args, 5) + request * table_width + logical / 128) : -1;
+            int page1 = logical + 128 < maximum ? read(data<int32_t>(args, 5) + request * table_width + logical / 128 + 1) : -1;
+            if (page0 >= cache_pages) page0 = -1;
+            if (page1 >= cache_pages) page1 = -1;
+            int slot = panel % 4;
+            int event = slot + 2;
+            if (panel >= 4) wait_flag(PIPE_MTE1, PIPE_MTE2, event);
+            if (page0 >= 0 || page1 >= 0) {
+                using KeyPart = Tile<TileType::Mat, F4, 128, 256, BLayout::RowMajor, 128, 128, SLayout::ColMajor>;
+                for (int piece = 0; piece < 2; ++piece) {
+                    int page = piece == 0 ? page0 : page1;
+                    if (page < 0) page = page0 >= 0 ? page0 : page1;
+                    KeyPart key;
+                    KeyScale scale;
+                    TASSIGN(key, 65536 + slot * 65536 + piece * 4096);
+                    TASSIGN(scale, 81920 + slot * 65536 + piece * 512);
+                    GM<F4, 128, 128, 128, 128, Layout::DN> kg(data<F4>(args, 3) + static_cast<int64_t>(page) * 8192);
+                    GM<S, 4, 128, 4, 128, Layout::MX_B_DN> sg(data<S>(args, 4) + page * 512);
+                    TLOAD(key, kg);
+                    TLOAD(scale, sg);
+                }
+            }
+            set_flag(PIPE_MTE2, PIPE_MTE1, event);
+            return page0 >= 0 || page1 >= 0;
+        }
+#endif
+
+        template <int KeySlots>
         __aicore__ inline void run(__gm__ int64_t* args) {
             int width = args[15], stride = args[16], table_width = args[17];
             int gathered_rows = args[19];
@@ -1341,6 +1501,15 @@ namespace {
                     TEXTRACT(left1, query, 96, 0);
                     TEXTRACT(scale0, query_scale, 0, 0);
                     TEXTRACT(scale1, query_scale, 96, 0);
+                    int valid_panels = 0;
+                    if constexpr (KeySlots == 4) {
+                        set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+                        wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+                        for (int panel = 0; panel < minimum(3, panel_count); ++panel) {
+                            bool valid = prefetch_key(args, request, maximum, first_panel, panel, cache_pages);
+                            if (valid) valid_panels |= 1 << panel;
+                        }
+                    }
 #else
                     prepare_weights(args, begin, count);
                     int offset = get_subblockid() * 3;
@@ -1349,9 +1518,23 @@ namespace {
                     int visible2 = offset + 2 < count ? (gathered_rows ? maximum : minimum(read(data<int32_t>(args, 7) + begin + offset + 2), width)) : 0;
 #endif
                     for (int panel = 0; panel < panel_count; ++panel) {
+#if defined(__DAV_CUBE__)
+                        if constexpr (KeySlots == 4) {
+                            int future = panel + 3;
+                            if (future < panel_count) {
+                                bool valid = prefetch_key(args, request, maximum, first_panel, future, cache_pages);
+                                int bit = 1 << (future % 4);
+                                valid_panels = (valid_panels & ~bit) | (valid ? bit : 0);
+                            }
+                        }
+#endif
                         int logical = (first_panel + panel) * 256;
-                        int page0 = !gathered_rows && logical < maximum ? read(data<int32_t>(args, 5) + request * table_width + logical / 128) : -1;
-                        int page1 = !gathered_rows && logical + 128 < maximum ? read(data<int32_t>(args, 5) + request * table_width + logical / 128 + 1) : -1;
+                        int page0 = -1, page1 = -1;
+#if defined(__DAV_CUBE__)
+                        if constexpr (KeySlots == 2) {
+#endif
+                        page0 = !gathered_rows && logical < maximum ? read(data<int32_t>(args, 5) + request * table_width + logical / 128) : -1;
+                        page1 = !gathered_rows && logical + 128 < maximum ? read(data<int32_t>(args, 5) + request * table_width + logical / 128 + 1) : -1;
                         if (gathered_rows) {
                             page0 = logical < maximum ? (begin * gathered_rows + logical) / 128 : -1;
                             page1 = logical + 128 < maximum ? (begin * gathered_rows + logical) / 128 + 1 : -1;
@@ -1360,8 +1543,15 @@ namespace {
                             if (page0 >= cache_pages) page0 = -1;
                             if (page1 >= cache_pages) page1 = -1;
                         }
+#if defined(__DAV_CUBE__)
+                        }
+#endif
                         bool have_dot = page0 >= 0 || page1 >= 0;
 #if defined(__DAV_CUBE__)
+                        if constexpr (KeySlots == 4) {
+                            have_dot = (valid_panels & (1 << (panel % 4))) != 0;
+                            wait_flag(PIPE_MTE2, PIPE_MTE1, panel % 4 + 2);
+                        }
                         if (have_dot) {
                             using Key = Tile<TileType::Mat, F4, 128, 256, BLayout::RowMajor, 128, 256, SLayout::ColMajor>;
                             using KeyPart = Tile<TileType::Mat, F4, 128, 256, BLayout::RowMajor, 128, 128, SLayout::ColMajor>;
@@ -1373,31 +1563,34 @@ namespace {
                             TileAcc<float, 96, 256> dot0, dot1;
                             int key_slot = transferred % 2;
                             int key_event = key_slot + 2;
-                            TASSIGN(key, 65536 + key_slot * 65536);
-                            TASSIGN(key_scale, 81920 + key_slot * 65536);
+                            int l1_slot = KeySlots == 4 ? panel % KeySlots : key_slot;
+                            TASSIGN(key, 65536 + l1_slot * 65536);
+                            TASSIGN(key_scale, 81920 + l1_slot * 65536);
                             TASSIGN(right, key_slot * 16384);
                             TASSIGN(right_scale, GetScaleAddr(right.data()));
                             TASSIGN(dot0, 0);
                             TASSIGN(dot1, 98304);
-                            if (transferred >= 2) wait_flag(PIPE_MTE1, PIPE_MTE2, key_event);
-                            for (int piece = 0; piece < 2; ++piece) {
-                                int page = piece == 0 ? page0 : page1;
-                                if (page < 0) page = page0 >= 0 ? page0 : page1;
-                                KeyPart part;
-                                KeyScale part_scale;
-                                TASSIGN(part, 65536 + key_slot * 65536 + piece * 4096);
-                                TASSIGN(part_scale, 81920 + key_slot * 65536 + piece * 512);
-                                GM<F4, 128, 128, 128, 128, Layout::DN> kg(data<F4>(args, 3) + static_cast<int64_t>(page) * 8192);
-                                GM<S, 4, 128, 4, 128, Layout::MX_B_DN> sg(data<S>(args, 4) + page * 512);
-                                TLOAD(part, kg);
-                                TLOAD(part_scale, sg);
+                            if constexpr (KeySlots == 2) {
+                                if (transferred >= 2) wait_flag(PIPE_MTE1, PIPE_MTE2, key_event);
+                                for (int piece = 0; piece < 2; ++piece) {
+                                    int page = piece == 0 ? page0 : page1;
+                                    if (page < 0) page = page0 >= 0 ? page0 : page1;
+                                    KeyPart part;
+                                    KeyScale part_scale;
+                                    TASSIGN(part, 65536 + key_slot * 65536 + piece * 4096);
+                                    TASSIGN(part_scale, 81920 + key_slot * 65536 + piece * 512);
+                                    GM<F4, 128, 128, 128, 128, Layout::DN> kg(data<F4>(args, 3) + static_cast<int64_t>(page) * 8192);
+                                    GM<S, 4, 128, 4, 128, Layout::MX_B_DN> sg(data<S>(args, 4) + page * 512);
+                                    TLOAD(part, kg);
+                                    TLOAD(part_scale, sg);
+                                }
+                                set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+                                wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
                             }
-                            set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
-                            wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
                             if (transferred >= 2) wait_flag(PIPE_M, PIPE_MTE1, key_event);
                             TMOV(right, key);
                             TMOV(right_scale, key_scale);
-                            set_flag(PIPE_MTE1, PIPE_MTE2, key_event);
+                            set_flag(PIPE_MTE1, PIPE_MTE2, KeySlots == 4 ? panel % KeySlots + 2 : key_event);
                             set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
                             wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
                             int slot = transferred % 2;
@@ -1433,6 +1626,8 @@ namespace {
                             set_flag(PIPE_FIX, PIPE_M, EVENT_ID3);
                             set_intra_block(PIPE_FIX, slot * 2 + 16);
                             ++transferred;
+                        } else if constexpr (KeySlots == 4) {
+                            set_flag(PIPE_MTE1, PIPE_MTE2, panel % 4 + 2);
                         }
 #else
                         if (have_dot) wait_intra_block(PIPE_V, (transferred % 2) * 2);
@@ -1461,7 +1656,7 @@ namespace {
                         int span0 = minimum(128, width-logical), span1 = minimum(128, width-logical-128);
                         if (span0<0)span0 = 0;
                         if (span1<0)span1 = 0;
-                        score_cache(ub<bfloat16_t>((transferred%2)*49152), ub<bfloat16_t>(257280+offset*64),
+                        score_cache<KeySlots == 4 ? 256 : 128>(ub<bfloat16_t>((transferred%2)*49152), ub<bfloat16_t>(257280+offset*64),
                         ub<uint16_t>(98304), ub<uint16_t>(251904), panel*256, span0, span1, v00, v01, v10, v11, v20, v21, have_dot, ub<uint16_t>(254464), gathered_rows != 0);
                         if (have_dot) {
                             set_intra_block(PIPE_V, (transferred%2)*2+1);
@@ -1470,6 +1665,11 @@ namespace {
 #endif
                     }
 #if defined(__DAV_CUBE__)
+                    if constexpr (KeySlots == 4) {
+                        for (int slot = 0; slot < minimum(4, panel_count); ++slot) {
+                            wait_flag(PIPE_MTE1, PIPE_MTE2, slot + 2);
+                        }
+                    }
                     wait_intra_block(PIPE_FIX, 6);
                     wait_intra_block(PIPE_FIX, 22);
 #else
@@ -1484,7 +1684,7 @@ namespace {
 #if defined(__DAV_CUBE__)
             if (transferred > 0) {
                 for (int slot = 0; slot < minimum(2, transferred); ++slot) {
-                    wait_flag(PIPE_MTE1, PIPE_MTE2, slot + 2);
+                    if constexpr (KeySlots == 2) wait_flag(PIPE_MTE1, PIPE_MTE2, slot + 2);
                     wait_flag(PIPE_M, PIPE_MTE1, slot + 2);
                 }
                 wait_flag(PIPE_FIX, PIPE_M, EVENT_ID2);
@@ -1516,7 +1716,8 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 #endif
         return;
     }
-    fused::run(args);
+    if (args[19] == 0) fused::run<4>(args);
+    else fused::run<2>(args);
     SYNCALL<SyncCoreType::AIVOnly>();
 #if defined(__DAV_VEC__)
     fused::merge(args);

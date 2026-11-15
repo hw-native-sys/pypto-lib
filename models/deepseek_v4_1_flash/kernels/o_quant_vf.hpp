@@ -70,10 +70,8 @@ __tf__ __aicore__ inline void rotate_quant_vf(
         vshls(pair_lo, half_lane, (uint16_t)1, all16, MODE_ZEROING);
         vadds(pair_hi, pair_lo, (uint16_t)1, all16, MODE_ZEROING);
         vshls(scatter_offset, half_lane, (uint16_t)4, all16, MODE_ZEROING);
-        RegTensor<float> zero, low, high;
+        RegTensor<float> zero;
         vdup(zero, 0.0f, all, MODE_ZEROING);
-        vdup(low, -448.0f, all, MODE_ZEROING);
-        vdup(high, 448.0f, all, MODE_ZEROING);
         for (uint16_t row = 0; row < active_rows; ++row) {
             for (uint16_t chunk = 0; chunk < 2; ++chunk) {
                 RegTensor<float> x0, x1, x2, x3;
@@ -96,18 +94,15 @@ __tf__ __aicore__ inline void rotate_quant_vf(
                 vselr(expanded_inverse, inverse, group_index);
                 vmul(even, even, (RegTensor<bfloat16_t>&)expanded_inverse, all16, MODE_ZEROING);
                 vmul(odd, odd, (RegTensor<bfloat16_t>&)expanded_inverse, all16, MODE_ZEROING);
+                // Clamp normalized BF16 values to the finite E4M3 range.
+                vmaxs(even, even, bfloat16_t(-448), all16, MODE_ZEROING);
+                vmins(even, even, bfloat16_t(448), all16, MODE_ZEROING);
+                vmaxs(odd, odd, bfloat16_t(-448), all16, MODE_ZEROING);
+                vmins(odd, odd, bfloat16_t(448), all16, MODE_ZEROING);
                 vcvt(x0, even, all16, PART_EVEN);
                 vcvt(x2, even, all16, PART_ODD);
                 vcvt(x1, odd, all16, PART_EVEN);
                 vcvt(x3, odd, all16, PART_ODD);
-                vmax(x0, x0, low, all, MODE_ZEROING);
-                vmin(x0, x0, high, all, MODE_ZEROING);
-                vmax(x1, x1, low, all, MODE_ZEROING);
-                vmin(x1, x1, high, all, MODE_ZEROING);
-                vmax(x2, x2, low, all, MODE_ZEROING);
-                vmin(x2, x2, high, all, MODE_ZEROING);
-                vmax(x3, x3, low, all, MODE_ZEROING);
-                vmin(x3, x3, high, all, MODE_ZEROING);
                 vector_f8e4m3 p0, p1, p2, p3;
                 vcvt(p0, x0, all, ROUND_R, RS_DISABLE, PART_P0);
                 vcvt(p1, x1, all, ROUND_R, RS_DISABLE, PART_P1);

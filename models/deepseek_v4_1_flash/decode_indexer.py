@@ -294,7 +294,7 @@ def _idx_score_topk(
     gathered_rows: pl.Scalar[pl.INDEX],
     emit_scores: pl.Scalar[pl.INT32],
     shards: pl.Scalar[pl.INDEX],
-    direct_short: pl.Scalar[pl.INT32],
+    short_history_limit: pl.Scalar[pl.INT32],
 ) -> pl.Tensor:
     """Score history shards and merge local TopK candidates within one MIX."""
     ...
@@ -326,7 +326,7 @@ def _idx_pool_score_topk(
     gathered_rows: pl.Scalar[pl.INDEX],
     emit_scores: pl.Scalar[pl.INT32],
     shards: pl.Scalar[pl.INDEX],
-    direct_short: pl.Scalar[pl.INT32],
+    short_history_limit: pl.Scalar[pl.INT32],
 ) -> pl.Tensor:
     """Gather and score pool shards, then merge local TopK within one MIX."""
     ...
@@ -340,7 +340,7 @@ def _index_pool_select(
     output: pl.Out[pl.Tensor],
     counts: pl.Out[pl.Tensor],
     num_tokens: pl.Scalar[pl.INT32],
-    block_maxima: pl.Scalar[pl.INT32],
+    score_format: pl.Scalar[pl.INT32],
 ):
     """Select bounded candidate pools by exact FP32 maxima and stable logical IDs."""
     ...
@@ -451,9 +451,9 @@ def select_candidate_block_pool(
     pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     scores_ready: pl.Scalar[pl.TASK_ID],
-    precomputed_maxima: pl.constexpr = False,
+    score_layout: pl.constexpr = "dense",
 ):
-    """Publish sorted logical candidate block IDs and per-query counts."""
+    """Select a pool from dense scores or block_maxima with dense overflow."""
     tokens = pl.tensor.dim(pool_block_ids, 0)
     positions = pl.tensor.dim(index_scores, 1)
     capacity = pl.tensor.dim(pool_block_ids, 1)
@@ -484,8 +484,9 @@ def select_candidate_block_pool(
         workers = pl.max(1, pl.min(tokens, 64))
         active_count = pl.cast(active_tokens, pl.INT32)
         input_format = pl.cast(0, pl.INT32)
-        if precomputed_maxima:
-            input_format = pl.cast(1, pl.INT32)
+        if score_layout == "block_maxima":
+            # The FP32 workspace carries ordered UINT32 maximum keys.
+            input_format = pl.cast(2, pl.INT32)
         with pl.spmd(workers, name_hint="pool_select", deps=[scores_ready]) as selected_tid:
             _index_pool_select(index_scores, compressed_lens, pool_block_ids, pool_block_counts, active_count, input_format)
         pool_tid = selected_tid
@@ -591,7 +592,8 @@ def publish_index_rows(
     """Publish normalized and rotated MXFP4 index keys with one writer per page."""
     slot_capacity = pl.tensor.dim(slots, 0)
     slots_matrix = pl.reshape(slots, [1, slot_capacity])
-    workers = pl.max(1, pl.min(num_tokens, 4))
+    row_groups = (num_tokens + 95) // 96
+    workers = pl.max(1, pl.min(pl.min(num_tokens, row_groups * 4), pl.system.available_cluster_count()))
     cache_rows = pl.tensor.dim(cache, 0) * 128
     cache_flat = pl.reshape(cache, [cache_rows, INDEX_DIM // 2])
     scale_flat = pl.reshape(scales, [cache_rows, _SCALE_COUNT])
@@ -850,7 +852,8 @@ def _plan_index_runs(
     runs: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     width: pl.Scalar[pl.INDEX],
-    skip_short: pl.constexpr,
+    short_history_policy: pl.constexpr,
+    score_layout: pl.constexpr,
 ):
     """Publish request groups synchronously before using their count to size shards."""
     run_count = pl.cast(0, pl.INT32)
@@ -868,9 +871,10 @@ def _plan_index_runs(
                 run_start = pl.cast(token, pl.INT32)
                 maximum_visible = pl.cast(0, pl.INT32)
         visible = pl.cast(pl.max(0, pl.min(pl.read(lengths, [token]), width)), pl.INT32)
-        if skip_short:
-            if visible <= INDEX_TOPK:
-                visible = pl.cast(0, pl.INT32)
+        if short_history_policy == "all_if_fits":
+            if score_layout == "none":
+                if visible <= INDEX_TOPK:
+                    visible = pl.cast(0, pl.INT32)
         maximum_visible = pl.max(maximum_visible, visible)
         pl.write(runs, [3, token + 1], run_count)
         previous_request = request
@@ -956,7 +960,8 @@ def score_select_reindex(
         selected, scores_tid = score_select_paged(
             query, query_scale, weights, index_cache, index_cache_scale,
             block_table, request_ids, lengths, paged_scores, output,
-            num_tokens, plan_tid, query_ready, weights_ready, capacity, False, False,
+            num_tokens, plan_tid, query_ready, weights_ready, capacity,
+            shard_k_tile=SCORE_SHARD_CACHE, short_history_policy="score", score_layout="dense",
         )
         result = selected
     else:
@@ -1024,34 +1029,43 @@ def score_select_paged(
     query_ready: pl.Scalar[pl.TASK_ID],
     weights_ready: pl.Scalar[pl.TASK_ID],
     pool_capacity: pl.Scalar[pl.INDEX],
-    c2a: pl.constexpr,
-    emit_block_maxima: pl.constexpr = False,
+    shard_k_tile: pl.constexpr = SCORE_SHARD_CACHE,
+    short_history_policy: pl.constexpr = "score",
+    score_layout: pl.constexpr = "dense",
 ):
-    """Score history shards and merge their TopK within one MIX."""
+    """Score history shards and merge their TopK within one MIX.
+
+    shard_k_tile is rounded down to SCORE_TILE and bounded by the native cache.
+    short_history_policy is "score" or "all_if_fits" within INDEX_TOPK.
+    score_layout is "none", "dense", or "block_maxima". Block maxima use
+    ordered keys within the native pool capacity and dense scores above it.
+    """
     width = pl.tensor.dim(scores, 1)
     capacity = pl.tensor.dim(output, 0)
     runs = pl.create_tensor([4, capacity + 1], dtype=pl.INT32)
-    run_count = _plan_index_runs(request_ids, lengths, runs, num_tokens, width, c2a)
+    run_count = _plan_index_runs(request_ids, lengths, runs, num_tokens, width, short_history_policy, score_layout)
     workers = pl.max(1, pl.min(32, pl.system.available_cluster_count()))
-    panels = (width + 255) // 256
+    panels = (width + SCORE_TILE - 1) // SCORE_TILE
+    shard_panels = pl.max(1, pl.min(shard_k_tile // SCORE_TILE, SCORE_SHARD_CACHE // SCORE_TILE))
     shards = workers
-    if panels > 100:
-        waves = (run_count * panels + workers * 100 - 1) // (workers * 100)
+    if panels > shard_panels:
+        waves = (run_count * panels + workers * shard_panels - 1) // (workers * shard_panels)
         shards = workers * pl.max(1, waves)
     block_count = (width + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
     emit_scores = pl.cast(0, pl.INT32)
-    if not c2a:
+    if score_layout != "none":
         if block_count > pl.min(pool_capacity, CANDIDATE_TOPK_BLOCKS):
             emit_scores = pl.cast(1, pl.INT32)
-            if emit_block_maxima:
+            if score_layout == "block_maxima":
                 if block_count <= 32768:
-                    emit_scores = pl.cast(2, pl.INT32)
+                    # Match the encoded-maximum input format of pool selection.
+                    emit_scores = pl.cast(3, pl.INT32)
     run_stride = pl.tensor.dim(runs, 1)
     table_width = pl.tensor.dim(block_table, 1)
     active_tokens = pl.cast(num_tokens, pl.INT32)
-    direct_short = pl.cast(0, pl.INT32)
-    if c2a:
-        direct_short = pl.cast(1, pl.INT32)
+    direct_limit_i32 = pl.cast(0, pl.INT32)
+    if short_history_policy == "all_if_fits":
+        direct_limit_i32 = pl.cast(INDEX_TOPK, pl.INT32)
     query_rows = pl.slice(query, [capacity, INDEX_H * INDEX_DIM // 2], [0, 0])
     scale_rows = pl.slice(query_scale, [capacity, INDEX_H * (INDEX_DIM // INDEX_CACHE_GROUP)], [0, 0])
     weight_rows = pl.slice(weights, [capacity, INDEX_H], [0, 0])
@@ -1066,7 +1080,7 @@ def score_select_paged(
             query_rows, scale_rows, weight_rows, index_cache, index_cache_scale,
             block_table, request_rows, length_rows, mixed_output, runs, candidate_keys, candidate_indices,
             block_table, block_table, score_rows, width, run_stride, table_width, active_tokens, 0,
-            emit_scores, shards, direct_short,
+            emit_scores, shards, direct_limit_i32,
         )
     return mix_tid, mix_tid
 
@@ -1538,7 +1552,7 @@ def _select_index_topk_sharded(
     num_tokens: pl.Scalar[pl.INT32],
     shards: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
-    direct_short: pl.constexpr,
+    short_history_policy: pl.constexpr,
 ):
     width = pl.tensor.dim(scores, 1)
     capacity = pl.tensor.dim(scores, 0)
@@ -1587,7 +1601,7 @@ def _select_index_topk_sharded(
                     )
                     for token in pl.range(run_begin, run_end):
                         compute_local = pl.cast(1, pl.INT32)
-                        if direct_short:
+                        if short_history_policy == "all_if_fits":
                             if pl.read(lengths, [token]) <= INDEX_TOPK:
                                 compute_local = pl.cast(0, pl.INT32)
                         if compute_local == 1:
@@ -1867,7 +1881,7 @@ def _select_index_topk_sharded(
             final_ids = pl.tile.full([INDEX_TOPK], dtype=pl.INT32, value=-1)
             final_ids = pl.tile.move(final_ids, target_memory=pl.MemorySpace.Vec)
             short = pl.cast(0, pl.INT32)
-            if direct_short:
+            if short_history_policy == "all_if_fits":
                 if pl.read(lengths, [merge_token]) <= INDEX_TOPK:
                     short = pl.cast(1, pl.INT32)
             if short == 1:
@@ -2222,7 +2236,7 @@ def score_select_paged_pypto(
     query_ready: pl.Scalar[pl.TASK_ID],
     weights_ready: pl.Scalar[pl.TASK_ID],
     pool_capacity: pl.Scalar[pl.INDEX],
-    c2a: pl.constexpr,
+    short_history_policy: pl.constexpr = "score",
 ):
     tokens = pl.tensor.dim(scores, 0)
     width = pl.tensor.dim(scores, 1)
@@ -2249,7 +2263,7 @@ def score_select_paged_pypto(
             pl.max(workers, (run_count * panels + 99) // 100),
             pl.INT32,
         )
-    selected = _select_index_topk_sharded(scores, physical, lengths, runs, output, num_tokens, shards, completed, c2a)
+    selected = _select_index_topk_sharded(scores, physical, lengths, runs, output, num_tokens, shards, completed, short_history_policy)
     return selected, completed
 
 
@@ -2317,7 +2331,7 @@ def c1a_index(
     tokens = pl.tensor.dim(x, 0)
     query = pl.create_tensor([tokens, INDEX_H * INDEX_DIM // 2], dtype=pl.UINT8)
     query_scale = pl.create_tensor([tokens, INDEX_H * (INDEX_DIM // INDEX_CACHE_GROUP)], dtype=pl.FP8E8M0)
-    with pl.spmd(16, name_hint="idx_q", deps=[entry_ready]) as query_tid:
+    with pl.spmd(16, name_hint="idx_q", sync_start=True, deps=[entry_ready]) as query_tid:
         query = _idx_q(
             projection_payload, index_wq_b, projection_scale_backing, index_wq_b_scale,
             cos, sin, query, query_scale, num_tokens,
@@ -2394,7 +2408,8 @@ def decode_c2a_indexer(
     selected_tid, scores_tid = score_select_paged(
         query, query_scale, raw_weights, index_cache, index_cache_scale,
         index_block_table, token_to_req_indices, compressed_lens, scores, topk_indices,
-        num_tokens, index_publish_tid, query_tid, weights_tid, score_width // CANDIDATE_BLOCK_SIZE, True, False,
+        num_tokens, index_publish_tid, query_tid, weights_tid, score_width // CANDIDATE_BLOCK_SIZE,
+        shard_k_tile=SCORE_SHARD_CACHE, short_history_policy="all_if_fits", score_layout="none",
     )
     return selected_tid
 
