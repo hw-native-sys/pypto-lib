@@ -106,7 +106,7 @@ def _validate_target_capacity(metadata, profile, max_seq_len):
 
 
 def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=180, max_seq_len=1048576,
-                    prefill_indexer_arenas=1, projection_degrees=None, prefill_moe_ready=False,
+                    prefill_indexer_arenas=1, projection_degrees=None, prefill_moe_ready=None,
                     prefill_moe_wave_tokens=None,
 
                     prefill_causal_ready=False, prefill_causal_full_wait=False,
@@ -120,6 +120,8 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
         raise ValueError("Prefill indexer arenas must be one or two")
     if profile != "prefill" and prefill_indexer_arenas != 1:
         raise ValueError("Indexer arena selection applies only to prefill")
+    if prefill_moe_ready is None:
+        prefill_moe_ready = profile == "prefill"
     if type(prefill_moe_ready) is not bool:
         raise ValueError("Prefill MoE readiness must be a boolean compile option")
     if profile != "prefill" and prefill_moe_ready:
@@ -130,7 +132,7 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
         if profile != "prefill":
             raise ValueError("MoE wave geometry selection applies only to prefill")
     if profile == "prefill" and prefill_moe_wave_tokens is None:
-        prefill_moe_wave_tokens = 64
+        prefill_moe_wave_tokens = 2048
     from .prefill_fwd import resolve_prefill_mechanisms
     selected_mechanisms = resolve_prefill_mechanisms(prefill_mechanisms, echo_prefetch=prefill_echo_prefetch, causal_ready=prefill_causal_ready)
     prefill_echo_prefetch = selected_mechanisms in ("echo-only", "both")
@@ -307,7 +309,7 @@ def main():
     )
     for family in ("swa", "csa", "hca"):
         parser.add_argument("--projection-" + family + "-d", type=int, choices=(1, 2, 4, 8), default=8)
-    parser.add_argument("--prefill-moe-ready", action="store_true", help="Bounded prefill compute/publish overlap")
+    parser.add_argument("--prefill-moe-ready", action=argparse.BooleanOptionalAction, default=None, help="Bounded prefill compute/publish overlap")
     parser.add_argument("--prefill-moe-wave-tokens", type=int, choices=(8, 32, 64, 128, 1024, 2048, 8192), default=None)
     parser.add_argument("--prefill-causal-ready", action="store_true", help="Experimental per-query causal cache readiness")
     parser.add_argument("--prefill-causal-full-wait", action="store_true", help="Diagnostic full-prefix gate with causal control tasks")

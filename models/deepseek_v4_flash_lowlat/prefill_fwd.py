@@ -39,7 +39,7 @@ def resolve_prefill_mechanisms(mechanisms, *, echo_prefetch=False, causal_ready=
 
 
 @contextmanager
-def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degrees=None, moe_ready=False, moe_wave_tokens=64,
+def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degrees=None, moe_ready=True, moe_wave_tokens=2048,
                     causal_ready=False, causal_full_wait=False, echo_prefetch=False, echo_diagnostics=False):
     """Isolate the private prefill operators' import-time TP8 configuration."""
     if type(moe_ready) is not bool:
@@ -97,7 +97,7 @@ def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degree
                     sys.modules[name] = module
 
 
-def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=None, moe_ready=False, moe_wave_tokens=64,
+def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=None, moe_ready=True, moe_wave_tokens=2048,
                          causal_ready=False, causal_full_wait=False, echo_prefetch=False, echo_diagnostics=False,
                          mechanisms=None):
     """Return the TP8 attention, MoE, tap, and head entries for compilation.

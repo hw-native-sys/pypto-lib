@@ -27,7 +27,7 @@ MOE_INTER = M.moe_intermediate_size // N_RANKS
 SWIGLU_LIMIT = M.swiglu_limit
 
 # Prefill plan.
-T = _parse_int_argv("--prefill-moe-wave-tokens", 64)
+T = _parse_int_argv("--prefill-moe-wave-tokens", 2048)
 if T not in (8, 32, 64, 128, 1024, 2048, 8192):
     raise ValueError("Prefill MoE wave tokens must be 8, 32, 64, 128, 1024, 2048 or 8192")
 if MOE_INTER != 256:

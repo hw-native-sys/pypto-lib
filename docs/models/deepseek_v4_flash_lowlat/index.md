@@ -88,8 +88,7 @@ causal option requires its own full output/cache and ordinary timing gates.
 
 Prefill MoE execution has an independent slab geometry. The build option
 `--prefill-moe-wave-tokens` selects 8, 32, 64, 128, 1024, 2048 or 8192 rows,
-with 64 as the
-candidate default in this branch. Routed and shared experts use bounded
+with 2048 as the default in this branch. Routed and shared experts use bounded
 sixteen-row physical tiles; routing metadata initialization also uses bounded
 64-row tiles to avoid a slab-sized on-chip temporary. Full expert tiles
 continue in another tile without
@@ -104,8 +103,8 @@ slabs to advance ahead of ordered TP publication and uses core-releasing peer
 waits. The original wait policy uses the same prefill slab. Copies use bounded
 4-by-2048 FP32 staging tiles; rank reduction uses 8-by-512 tiles, adds ranks
 in ascending order and rounds once to BF16. Load every compile plan in a fresh
-setup process. Both options are recorded in the prefill plan; readiness remains
-off by default. Decode S1/S6 geometry, source and ABI are unaffected.
+setup process. Both options are recorded in the prefill plan; readiness is enabled by default for prefill. The build option
+`--no-prefill-moe-ready` retains the serial publication control. Decode S1/S6 geometry, source and ABI are unaffected.
 
 A fixed 16K batch-one replay on four dual-chip 910C boards measured prefill
 public submit-to-result medians of 20.290 s with the original d8 plan and
@@ -783,3 +782,19 @@ measurement is not a measurement of the current commit.
 
 The validated reference-arithmetic source is preserved on
 [the reference branch](https://github.com/zzjc1234/pypto-lib/tree/feat/dsv4-dspark-bs1-reference).
+
+## Host input uploads
+
+`prefill_host_inputs.SharedInput` provides a real mutable shared CPU buffer for
+HC input. Allocate it before preparing the Worker and pass its contiguous
+`storage` tensor in `inherited_host_tensors`, without `ReadOnlyHostTensor`. Fill
+it from actual BF16 prompt embeddings inside request timing. The returned
+rank-broadcast view has identical FP32 bytes per rank; upload each contiguous
+rank slice into a real device tensor. It cannot be passed directly where a
+contiguous rank-stacked shared CPU dispatch argument is required.
+
+All copies must complete before refilling the storage. Registering a private
+or post-fork allocation is not a substitute for shared backing. Reusable
+metadata buffers follow the same lifetime and must retain actual per-rank
+values, shapes and dtypes. These host changes do not alter native compute,
+weights, quantization or cache semantics.

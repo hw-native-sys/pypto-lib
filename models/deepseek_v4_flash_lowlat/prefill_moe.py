@@ -23,7 +23,7 @@ from .prefill_moe_compute import prepare_moe, moe_local
 from .hc_post import hc_post
 
 
-PREFILL_MOE_READY = _parse_int_argv("--prefill-moe-ready", 0)
+PREFILL_MOE_READY = _parse_int_argv("--prefill-moe-ready", 1)
 PREFILL_ROWS = pl.dynamic("LOWLAT_PREFILL_MOE_ROWS")
 
 
