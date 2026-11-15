@@ -29,9 +29,12 @@ requires its own correctness and performance qualification. Histogram selection
 and EMA recall are not implemented by that option.
 
 Prefill MoE execution has an independent slab geometry. The build option
-`--prefill-moe-wave-tokens` selects 8, 32, 64 or 128 rows, with 64 as the
+`--prefill-moe-wave-tokens` selects 8, 32, 64, 128, 1024, 2048 or 8192 rows,
+with 64 as the
 candidate default in this branch. Routed and shared experts use bounded
-sixteen-row physical tiles; full expert tiles continue in another tile without
+sixteen-row physical tiles; routing metadata initialization also uses bounded
+64-row tiles to avoid a slab-sized on-chip temporary. Full expert tiles
+continue in another tile without
 discarding routes, including repeated expert IDs. Weight banks and TP8
 intermediate shards are unchanged. HC and per-token routing, quantization,
 expert arithmetic and ordered combine retain their original numerical rules.

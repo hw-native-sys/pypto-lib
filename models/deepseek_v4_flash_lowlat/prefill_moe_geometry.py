@@ -28,8 +28,8 @@ SWIGLU_LIMIT = M.swiglu_limit
 
 # Prefill plan.
 T = _parse_int_argv("--prefill-moe-wave-tokens", 64)
-if T not in (8, 32, 64, 128):
-    raise ValueError("Prefill MoE wave tokens must be 8, 32, 64 or 128")
+if T not in (8, 32, 64, 128, 1024, 2048, 8192):
+    raise ValueError("Prefill MoE wave tokens must be 8, 32, 64, 128, 1024, 2048 or 8192")
 if MOE_INTER != 256:
     raise ValueError("Prefill MoE requires TP8 intermediate shards of 256 columns")
 

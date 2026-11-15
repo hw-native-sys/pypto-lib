@@ -44,10 +44,22 @@ def route_group(
         expert_slot[:, :] = pl.full([1, N_EXPERTS], dtype=pl.INT32, value=-1)
         work_slot_2d[:, :] = pl.full([1, WORK_SLOTS_PAD], dtype=pl.INT32, value=0)
         work_rows_2d[:, :] = pl.full([1, WORK_SLOTS_PAD], dtype=pl.INT32, value=0)
-        slot_expert[:, :] = pl.full([N_SLOTS_B, IDX_PAD], dtype=pl.INT32, value=0)
-        recv_scale[:, :] = pl.full([N_SLOTS_B, RECV_MAX], dtype=pl.FP32, value=0.0)
-        recv_w[:, :] = pl.full([N_SLOTS_B, RECV_MAX], dtype=pl.FP32, value=0.0)
-        route_slot_row[:, :] = pl.full([N_ROUTES, IDX_PAD], dtype=pl.INT32, value=0)
+        for slot_t0 in pl.range(0, N_SLOTS_B, 64):
+            slot_rows = pl.min(64, N_SLOTS_B - slot_t0)
+            zero_experts = pl.tile.full([64, IDX_PAD], dtype=pl.INT32, value=0)
+            valid_experts = pl.set_validshape(zero_experts, slot_rows, IDX_PAD)
+            pl.store(valid_experts, [slot_t0, 0], slot_expert)
+            zero_scales = pl.tile.full([64, RECV_MAX], dtype=pl.FP32, value=0.0)
+            valid_scales = pl.set_validshape(zero_scales, slot_rows, RECV_MAX)
+            pl.store(valid_scales, [slot_t0, 0], recv_scale)
+            zero_weights = pl.tile.full([64, RECV_MAX], dtype=pl.FP32, value=0.0)
+            valid_weights = pl.set_validshape(zero_weights, slot_rows, RECV_MAX)
+            pl.store(valid_weights, [slot_t0, 0], recv_w)
+        for route_t0 in pl.range(0, N_ROUTES, 64):
+            route_rows = pl.min(64, N_ROUTES - route_t0)
+            zero_routes = pl.tile.full([64, IDX_PAD], dtype=pl.INT32, value=0)
+            valid_routes = pl.set_validshape(zero_routes, route_rows, IDX_PAD)
+            pl.store(valid_routes, [route_t0, 0], route_slot_row)
 
         slot_expert[SH_SLOT : SH_SLOT + SHARED_TILES, :] = pl.full(
             [SHARED_TILES, IDX_PAD], dtype=pl.INT32, value=SHARED_EID)

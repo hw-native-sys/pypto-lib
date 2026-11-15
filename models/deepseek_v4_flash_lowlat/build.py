@@ -122,8 +122,8 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
     if profile != "prefill" and prefill_moe_ready:
         raise ValueError("MoE readiness selection applies only to prefill")
     if prefill_moe_wave_tokens is not None:
-        if type(prefill_moe_wave_tokens) is not int or prefill_moe_wave_tokens not in (8, 32, 64, 128):
-            raise ValueError("Prefill MoE wave tokens must be 8, 32, 64 or 128")
+        if type(prefill_moe_wave_tokens) is not int or prefill_moe_wave_tokens not in (8, 32, 64, 128, 1024, 2048, 8192):
+            raise ValueError("Prefill MoE wave tokens must be 8, 32, 64, 128, 1024, 2048 or 8192")
         if profile != "prefill":
             raise ValueError("MoE wave geometry selection applies only to prefill")
     if profile == "prefill" and prefill_moe_wave_tokens is None:
@@ -277,7 +277,7 @@ def main():
     for family in ("swa", "csa", "hca"):
         parser.add_argument("--projection-" + family + "-d", type=int, choices=(1, 2, 4, 8), default=8)
     parser.add_argument("--prefill-moe-ready", action="store_true", help="Bounded prefill compute/publish overlap")
-    parser.add_argument("--prefill-moe-wave-tokens", type=int, choices=(8, 32, 64, 128), default=None)
+    parser.add_argument("--prefill-moe-wave-tokens", type=int, choices=(8, 32, 64, 128, 1024, 2048, 8192), default=None)
     args = parser.parse_args()
     if args.report.exists():
         parser.error("The report already exists; preserve it and choose a new run directory")

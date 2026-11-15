@@ -29,8 +29,8 @@ def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degree
     """Isolate the private prefill operators' import-time TP8 configuration."""
     if type(moe_ready) is not bool:
         raise ValueError("Prefill MoE readiness must be a boolean compile option")
-    if type(moe_wave_tokens) is not int or moe_wave_tokens not in (8, 32, 64, 128):
-        raise ValueError("Prefill MoE wave tokens must be 8, 32, 64 or 128")
+    if type(moe_wave_tokens) is not int or moe_wave_tokens not in (8, 32, 64, 128, 1024, 2048, 8192):
+        raise ValueError("Prefill MoE wave tokens must be 8, 32, 64, 128, 1024, 2048 or 8192")
     projection_degrees = dict(projection_degrees or {})
     for family, degree in projection_degrees.items():
         if family not in ("swa", "csa", "hca") or type(degree) is not int or degree not in (1, 2, 4, 8):
