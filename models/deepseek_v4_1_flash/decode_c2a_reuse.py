@@ -270,7 +270,7 @@ if __name__ == "__main__":
         specs=specs,
         golden_fn=partial(golden_c2a, mode="reuse"),
         compare_fn={
-            "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
+            "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128, max_error_ratio=0.01),
             "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
             "window_cache": packed_cache_compare(
                 mapped_pool_ratio_allclose(

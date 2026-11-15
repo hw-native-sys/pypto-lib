@@ -347,18 +347,54 @@ def l3_decode_c2a_full(
     )
 
 
+def _golden_c2a_publish(t, x, qr):
+    """Publish ratio-2 compressed KV and index keys, then select the compressed rows."""
+    import torch
+    from functools import partial
+    from compressor import golden_c2a_compressor
+    from qkv_proj_rope import golden_rope_tail
+    from rmsnorm import golden_rms_norm
+    from decode_indexer import golden_c2a_index
+    from quant import _publish_quantized_cache, quantize_mxfp4_cache, unpack_bf16_nz
+
+    # Ratio-2 compressor and ring-state update.
+    state_cache = t["state_cache"].clone()
+    latent, publish = golden_c2a_compressor(
+        x, t["query_start_loc"], t["position_ids"], t["token_to_req_indices"],
+        t["state_block_table"], state_cache, t["compressor_wkv"], t["compressor_wgate"],
+        t["compressor_norm_weight"],
+    )
+    # Compressed KV publication.
+    rotated = golden_rope_tail(latent, t["compressed_rope_cos"], t["compressed_rope_sin"])
+    compressed_slots = t["compressed_slots"].masked_fill(~publish, -1)
+    compressed_quantize = partial(quantize_mxfp4_cache, group_size=CMP_GROUP, scale_format="bf16")
+    compressed_cache, compressed_cache_scale = _publish_quantized_cache(
+        t["compressed_cache"], t["compressed_cache_scale"], rotated, compressed_slots, compressed_quantize,
+    )
+
+    # Publish RNE E2M1 index keys with group-32 E8M0 scales.
+    index_projection = latent.float() @ unpack_bf16_nz(t["index_wk"]).float()
+    index_projection = index_projection.to(torch.bfloat16)
+    index_key = golden_rms_norm(index_projection, t["index_norm_weight"])
+    index_key = golden_rope_tail(index_key, t["compressed_rope_cos"], t["compressed_rope_sin"])
+    index_quantize = partial(quantize_mxfp4_cache, group_size=IDX_GROUP, scale_format="e8m0", round_to_even=True)
+    index_cache, index_cache_scale = _publish_quantized_cache(
+        t["index_cache"], t["index_cache_scale"], index_key, compressed_slots, index_quantize,
+    )
+
+    # Score FP4 queries in original coordinate order with the shared BF16 epilogue.
+    topk_indices = golden_c2a_index(t, qr, index_cache, index_cache_scale)
+    return compressed_cache, compressed_cache_scale, index_cache, index_cache_scale, state_cache, topk_indices
+
+
 def golden_c2a(tensors, mode="full"):
     """Compute HC pre, C2A attention, cache updates, and HC post."""
     import torch
-    from compressor import golden_c2a_compressor
     from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_norm, golden_hc_post
-    from rmsnorm import golden_rms_norm
-    from qkv_proj_rope import golden_qkv_proj_rope, golden_rope_tail
-    from decode_indexer import golden_c2a_index
+    from qkv_proj_rope import golden_qkv_proj_rope
     from sparse_attention import golden_gather_sparse_attention
     from o_proj import golden_o_proj
-    from functools import partial
-    from quant import quantize_mxfp8_cache, quantize_mxfp4_cache, unpack_bf16_nz
+    from quant import quantize_mxfp8_cache
     from quant import _publish_quantized_cache
 
     t = dict(tensors)
@@ -388,33 +424,8 @@ def golden_c2a(tensors, mode="full"):
     )
 
     if mode == "full":
-        # Ratio-2 compressor and ring-state update.
-        state_cache = t["state_cache"].clone()
-        latent, publish = golden_c2a_compressor(
-            x, t["query_start_loc"], t["position_ids"], t["token_to_req_indices"],
-            t["state_block_table"], state_cache, t["compressor_wkv"], t["compressor_wgate"],
-            t["compressor_norm_weight"],
-        )
-        # Compressed KV publication.
-        rotated = golden_rope_tail(latent, t["compressed_rope_cos"], t["compressed_rope_sin"])
-        compressed_slots = t["compressed_slots"].masked_fill(~publish, -1)
-        compressed_quantize = partial(quantize_mxfp4_cache, group_size=CMP_GROUP, scale_format="bf16")
-        compressed_cache, compressed_cache_scale = _publish_quantized_cache(
-            t["compressed_cache"], t["compressed_cache_scale"], rotated, compressed_slots, compressed_quantize,
-        )
-
-        # Publish RNE E2M1 index keys with group-32 E8M0 scales.
-        index_projection = latent.float() @ unpack_bf16_nz(t["index_wk"]).float()
-        index_projection = index_projection.to(torch.bfloat16)
-        index_key = golden_rms_norm(index_projection, t["index_norm_weight"])
-        index_key = golden_rope_tail(index_key, t["compressed_rope_cos"], t["compressed_rope_sin"])
-        index_quantize = partial(quantize_mxfp4_cache, group_size=IDX_GROUP, scale_format="e8m0", round_to_even=True)
-        index_cache, index_cache_scale = _publish_quantized_cache(
-            t["index_cache"], t["index_cache_scale"], index_key, compressed_slots, index_quantize,
-        )
-
-        # Score FP4 queries in original coordinate order with the shared BF16 epilogue.
-        topk_indices = golden_c2a_index(t, qr, index_cache, index_cache_scale)
+        published = _golden_c2a_publish(t, x, qr)
+        compressed_cache, compressed_cache_scale, index_cache, index_cache_scale, state_cache, topk_indices = published
 
     else:
         compressed_cache = t["compressed_cache"]
@@ -465,10 +476,10 @@ def build_c2a_specs(
     """Build C2A HC, attention, cache, and runtime specifications."""
     import torch
     import math
-    from config import DECODE_BATCH, BLOCK_SIZE
-    from utils import packed_query_lengths, paged_slots, window_metadata
+    from config import BLOCK_SIZE
+    from utils import compact_window_table, packed_query_lengths, paged_slots, window_metadata
     from quant import (
-        pack_bf16_nz, pack_fp8_nz,
+        generate_quantized_cache, pack_bf16_nz, pack_fp8_nz,
         quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache,
         quantize_mxfp8_upward_reference, pack_mx_b_scale,
     )
@@ -479,8 +490,8 @@ def build_c2a_specs(
 
     if case not in ("mixed", "long", "masked", "zero"):
         raise ValueError(f"unsupported case {case!r}")
-    if not 1 <= requests <= min(DECODE_BATCH, tokens):
-        raise ValueError(f"requests must be in [1, min({DECODE_BATCH}, tokens)]")
+    if not 1 <= requests <= tokens:
+        raise ValueError("requests must be in [1, tokens]")
     gen = torch.Generator().manual_seed(seed)
 
     lengths = [tokens // requests + (index < tokens % requests) for index in range(requests)]
@@ -497,14 +508,11 @@ def build_c2a_specs(
     token_to_req_indices = torch.repeat_interleave(torch.arange(requests), torch.tensor(lengths))
     positions = torch.cat([torch.arange(prefix, prefix + length) for prefix, length in zip(prefixes, lengths)])
     maximum = int(positions.max())
-    window_columns = maximum // BLOCK_SIZE + 1
     compressed_columns = max(4, (maximum // RATIO) // BLOCK_SIZE + 1)
 
     # One unmapped control page per cache.
-    window_pages = requests * window_columns + 1
+    window_table, window_pages = compact_window_table(prefixes, lengths)
     compressed_pages = requests * compressed_columns + 1
-    window_rows = torch.randperm(window_pages, generator=gen)[: requests * window_columns]
-    window_table = window_rows.reshape(requests, window_columns).to(torch.int32)
     index_rows = torch.randperm(compressed_pages, generator=gen)[: requests * compressed_columns]
     index_block_table = index_rows.reshape(requests, compressed_columns).to(torch.int32)
 
@@ -542,8 +550,8 @@ def build_c2a_specs(
     compressor_wgate = (torch.randn(D, HEAD_DIM, generator=gen) / math.sqrt(D)).bfloat16()
     wo_a_values = torch.randn(LOCAL_O_GROUPS, O_LORA, O_GROUP_IN, generator=gen)
     # Predecessor projections in each request's ring block.
-    pending = torch.randn(DECODE_BATCH, D, generator=gen).bfloat16().float()
-    state_cache = torch.zeros(DECODE_BATCH + 1, STATE_CAPACITY, STATE_WIDTH)
+    pending = torch.randn(requests, D, generator=gen).bfloat16().float()
+    state_cache = torch.zeros(requests + 1, STATE_CAPACITY, STATE_WIDTH)
     state_block_table = torch.arange(requests - 1, -1, -1, dtype=torch.int32).unsqueeze(1) + 1
     for request, prefix in enumerate(prefixes):
         if prefix:
@@ -553,12 +561,20 @@ def build_c2a_specs(
             state_cache[block, slot, HEAD_DIM:] = pending[request] @ compressor_wgate.float()
     query_start_loc = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32)
 
-    window_values = torch.randn(window_pages, BLOCK_SIZE, 1, HEAD_DIM, generator=gen).bfloat16()
-    window_cache, window_cache_scales = quantize_mxfp8_cache(window_values)
-    compressed_values = torch.randn(compressed_pages, BLOCK_SIZE, 1, HEAD_DIM, generator=gen).bfloat16()
-    compressed_cache, compressed_cache_scale = quantize_mxfp4_cache(compressed_values, CMP_GROUP, "bf16")
-    index_values = torch.randn(compressed_pages, BLOCK_SIZE, 1, INDEX_DIM, generator=gen).bfloat16()
-    index_cache, index_cache_codes = quantize_mxfp4_cache(index_values, IDX_GROUP, "e8m0")
+    window_cache, window_cache_scales = generate_quantized_cache(
+        (window_pages, BLOCK_SIZE, 1, HEAD_DIM), quantize_mxfp8_cache,
+        generator=gen, input_dtype=torch.bfloat16,
+    )
+    quantize_compressed = partial(quantize_mxfp4_cache, group_size=CMP_GROUP, scale_format="bf16")
+    compressed_cache, compressed_cache_scale = generate_quantized_cache(
+        (compressed_pages, BLOCK_SIZE, 1, HEAD_DIM), quantize_compressed,
+        generator=gen, input_dtype=torch.bfloat16,
+    )
+    quantize_index = partial(quantize_mxfp4_cache, group_size=IDX_GROUP, scale_format="e8m0")
+    index_cache, index_cache_codes = generate_quantized_cache(
+        (compressed_pages, BLOCK_SIZE, 1, INDEX_DIM), quantize_index,
+        generator=gen, input_dtype=torch.bfloat16,
+    )
 
     values = {
         "x": torch.randn(tokens, D, generator=gen).bfloat16(),
@@ -633,11 +649,21 @@ def build_c2a_specs(
     values["compressed_cache"] = pack_quantized_cache(values["compressed_cache"], values.pop("compressed_cache_scale"))
     if mode == "reuse":
         source = values
-        published = {name: value.clone() for name, value in source.items()}
-        golden_c2a(published)
-        values["compressed_cache"] = published["compressed_cache"]
-        values["compressed_indices"] = published["topk_indices"]
-        reachable = int((published["topk_indices"] >= 0).sum())
+        from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
+        from rmsnorm import golden_rms_norm
+        from quant import unpack_fp8_nz
+
+        published = dict(source)
+        cache = unpack_quantized_cache(source["compressed_cache"], True)
+        published["compressed_cache"], published["compressed_cache_scale"] = cache
+        projected = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(
+            source["x"], unpack_fp8_nz(source["wq_a"]), source["wq_a_scale"],
+        )
+        qr = golden_rms_norm(projected, source["q_norm_weight"])
+        compressed, scales, _, _, _, topk = _golden_c2a_publish(published, source["x"], qr)
+        values["compressed_cache"] = pack_quantized_cache(compressed, scales)
+        values["compressed_indices"] = topk
+        reachable = int((topk >= 0).sum())
         print(
             f"[FIXTURE] c2a reuse tokens={tokens} requests={requests} case={case} "
             f"selected_rows={reachable} source_published_rows="
@@ -707,8 +733,6 @@ if __name__ == "__main__":
     parser.set_defaults(tokens=72, requests=12, startpos=[8192] * 12)
     args = parser.parse_args()
     configure_decode_workload(args, parser)
-    if args.tokens != 72:
-        parser.error("this decode entry requires 72 query tokens")
     host = l3_decode_c2a_full
     specs = build_c2a_specs(
         "full", args.tokens, args.requests, args.seed, args.case,

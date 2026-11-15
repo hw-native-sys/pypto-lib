@@ -167,6 +167,8 @@ def golden_gather_sparse_attention(
             for begin in range(0, indices.shape[-1], key_tile):
                 rows = indices[token_begin:token_end, begin:begin + key_tile].long()
                 valid = rows >= 0
+                if not valid.any():
+                    continue
                 packed = flat_cache[rows.clamp_min(0)]
                 payload, scales = unpack_quantized_cache(packed, fp4, head_dim=head_dim)
                 if fp4:

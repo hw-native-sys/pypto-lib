@@ -2521,12 +2521,48 @@ def golden_select_candidate_block_pool(
 
 def golden_index_weighted_sum(dots, weights):
     """Accumulate heads in order with one BF16 rounding per fused multiply-add."""
-    values = torch.zeros(dots.shape[-1], dtype=torch.bfloat16, device=dots.device)
+    values = torch.zeros(dots.shape[1:], dtype=torch.bfloat16, device=dots.device)
     positive = dots.relu().double()
     head_weights = weights.double()
     for head in range(dots.shape[0]):
-        values = (positive[head] * head_weights[head] + values.double()).bfloat16()
+        values = (positive[head] * head_weights[head].unsqueeze(-1) + values.double()).bfloat16()
     return values.float()
+
+
+def _golden_paged_index_scores(query, weights, keys, table, request_ids, lengths, *, skip_short=False):
+    """Score request-local history in token batches with sequential BF16 head accumulation."""
+    tokens, heads, dim = query.shape
+    width = table.shape[-1] * 128
+    scores = torch.full((tokens, width), -torch.inf)
+    physical = torch.full((tokens, width), -1, dtype=torch.int64)
+    for request in request_ids.unique().tolist():
+        if not 0 <= request < table.shape[0]:
+            continue
+        token_ids = (request_ids == request).nonzero().flatten()
+        count = max(0, min(int(lengths[token_ids].max()), width))
+        logical = torch.arange(count)
+        pages = table[request, logical // 128].long()
+        rows = pages * 128 + logical.remainder(128)
+        valid = (pages >= 0) & (rows >= 0) & (rows < keys.shape[0])
+        logical, rows = logical[valid], rows[valid]
+        if not rows.numel():
+            continue
+        history = keys[rows].T.float()
+        for begin in range(0, token_ids.numel(), 8):
+            selected = token_ids[begin:begin + 8]
+            visible = logical.unsqueeze(0) < lengths[selected].unsqueeze(-1)
+            mapped = rows.unsqueeze(0).expand(selected.numel(), -1).masked_fill(~visible, -1)
+            physical[selected[:, None], logical] = mapped
+            if skip_short:
+                selected = selected[lengths[selected] > INDEX_TOPK]
+                if not selected.numel():
+                    continue
+                visible = logical.unsqueeze(0) < lengths[selected].unsqueeze(-1)
+            dots = query[selected].reshape(-1, dim).float() @ history
+            dots = dots.reshape(selected.numel(), heads, -1).transpose(0, 1).bfloat16()
+            total = golden_index_weighted_sum(dots, weights[selected].T)
+            scores[selected[:, None], logical] = total.masked_fill(~visible, -torch.inf)
+    return scores, physical
 
 
 def golden_c1a_index_scores(a, qr, index_payload, index_scale):
@@ -2536,8 +2572,6 @@ def golden_c1a_index_scores(a, qr, index_payload, index_scale):
 
     x = a["x"]
     lengths = a["compressed_lens"]
-    # Logical page-table score columns.
-    width = a["index_block_table"].shape[-1] * 128
     heads = a["index_weights_proj"].shape[-1]
     iq = golden_mxfp8_linear_grouped_sum(
         qr, unpack_fp8_nz(a["index_wq_b"]), a["index_wq_b_scale"], output_dtype=torch.float32,
@@ -2553,23 +2587,7 @@ def golden_c1a_index_scores(a, qr, index_payload, index_scale):
     # The device scales the projected head weight in FP32 and rounds it once to BF16.
     weight = ((x).float() @ unpack_bf16_nz(a["index_weights_proj"]).float()).to(torch.bfloat16).float() * (dim * heads) ** -0.5
     weight = weight.to(torch.bfloat16).float()
-    scores = torch.full((x.shape[0], width), -torch.inf)
-    physical = torch.full((x.shape[0], width), -1, dtype=torch.int64)
-    for t in range(x.shape[0]):
-        count = max(0, min(int(lengths[t]), width))
-        pos = torch.arange(count)
-        pages = a["index_block_table"][a["request_ids"][t].long(), pos // 128]
-        valid = (pages >= 0) & (pages < index_payload.shape[0])
-        valid_pos = pos[valid]
-        rows = pages[valid] * 128 + valid_pos % 128
-        physical[t, valid_pos] = rows
-        if not valid_pos.numel():
-            continue
-        # BF16 dot products, ReLU, and sequential BF16 head FMAs.
-        dots = ((iq[t]).float() @ (keys[rows.long()].T).float()).to(torch.bfloat16)
-        values = golden_index_weighted_sum(dots, weight[t])
-        scores[t, valid_pos] = values
-    return scores, physical
+    return _golden_paged_index_scores(iq, weight, keys, a["index_block_table"], a["request_ids"], lengths)
 
 
 def golden_pool_index_scores(scores, physical, pool_block_ids, pool_block_counts):
@@ -2631,7 +2649,6 @@ def golden_c2a_index(t, qr, index_cache, index_cache_scale):
     from quant import unpack_bf16_nz, unpack_fp8_nz
 
     x = t["x"]
-    tokens = x.shape[0]
     index_dim = t["index_norm_weight"].numel()
     index_heads = t["index_weights_proj"].shape[-1]
     index_values = dequantize_mxfp4_cache(index_cache, index_cache_scale, INDEX_CACHE_GROUP, "e8m0").flatten(0, -2)
@@ -2645,27 +2662,10 @@ def golden_c2a_index(t, qr, index_cache, index_cache_scale):
     head_weights = ((x).float() @ unpack_bf16_nz(t["index_weights_proj"]).float()).to(torch.bfloat16).float()
     head_weights = (head_weights * (index_dim * index_heads) ** -0.5).to(torch.bfloat16).float()
     lens = t["compressed_lens"].long()
-    score_width = t["index_block_table"].shape[1] * 128
-    scores = torch.full((tokens, score_width), -torch.inf)
-    physical_rows = torch.full((tokens, score_width), -1, dtype=torch.int64)
-    for token in range(tokens):
-        count = max(0, min(int(lens[token]), score_width))
-        request = int(t["token_to_req_indices"][token])
-        if not count or not 0 <= request < t["index_block_table"].shape[0]:
-            continue
-        logical = torch.arange(count)
-        pages = t["index_block_table"][request, logical // 128].long()
-        rows = pages * 128 + logical.remainder(128)
-        valid = (pages >= 0) & (rows >= 0) & (rows < index_values.shape[0])
-        valid_logical = logical[valid]
-        valid_rows = rows[valid]
-        physical_rows[token, valid_logical] = valid_rows
-        if count <= INDEX_TOPK or not valid_rows.numel():
-            continue
-        # Round each fused head multiply-add to BF16.
-        dots = ((index_q[token]).float() @ (index_values[valid_rows].to(torch.bfloat16).T).float()).to(torch.bfloat16)
-        total = golden_index_weighted_sum(dots, head_weights[token])
-        scores[token, valid_logical] = total
+    keys = index_values.to(torch.bfloat16)
+    scores, physical_rows = _golden_paged_index_scores(
+        index_q, head_weights, keys, t["index_block_table"], t["token_to_req_indices"], lens, skip_short=True,
+    )
     return _select_shared_c2a_topk(scores, physical_rows, lens)
 
 

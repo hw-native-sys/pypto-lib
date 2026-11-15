@@ -103,7 +103,7 @@ and rank-local request metadata, KV caches, and compressor state. The prefill
 formula `DP_SIZE = EP_SIZE // CP_SIZE` describes prefill grouping; decode does
 not use its head-tail CP layout. Use CP1 for the current decode deployment.
 The default per-rank batch is `DECODE_BATCH = 12`; DSpark verifies
-`DECODE_SEQ = 6` rows per request, giving up to 72 local rows per step.
+`DECODE_SEQ = 6` rows per request, giving 72 local rows in the default workload.
 MoE routes these local rows across the EP group and returns results to their
 originating rank.
 
@@ -125,6 +125,26 @@ LM-head TP1, each rank computes its own complete vocabulary projection.
 | Text forward | [`prefill_fwd.py`](../../../models/deepseek_v4_1_flash/prefill_fwd.py), [`decode_fwd.py`](../../../models/deepseek_v4_1_flash/decode_fwd.py) |
 | Speculative decoding | [`decode_fwd_dspark.py`](../../../models/deepseek_v4_1_flash/decode_fwd_dspark.py), `dspark_drafter.py`, `dspark_state.py`, and sampling helpers |
 | Shared operators | `hc.py`, `qkv_proj_rope.py`, `compressor.py`, `sparse_attention.py`, `o_proj.py`, `engram.py`, and `lm_head.py` |
+
+The six standalone decode attention entries accept explicit request starts and
+query lengths through `--start-pos` and `--query-lens`. Both lists have one
+comma-separated value per request. Their lengths and sum determine the request
+and token counts; the default batch of 12 and 72-token workload are not limits
+for these standalone entries. For example, batch 64 with four query tokens per
+request uses 64 starting positions and 64 query lengths of `4` (256 tokens).
+Query blocks must remain within the model position range. This does not change
+the forward or DSpark serving capacities.
+
+Compressed-attention decode fixtures retain only the sliding-window pages visible
+to the current query block, plus an unmapped control page. Compressed and index caches retain
+their history. Random cache generation uses bounded page batches; index goldens
+batch tokens sharing one request while retaining sequential BF16 head rounding.
+C2A reuse fixture preparation computes its source compressed cache and selected
+indices without computing the source attention output.
+
+C2A reuse validates its composed HC output with `atol=0.01`, `rtol=1/128`,
+and a maximum outlier ratio of 1%. Its cache and HC-mix checks retain their
+separate tolerances.
 
 For prefill attention, `--tokens` is capacity per DP group, before CP partitioning.
 `--query-lens '65,31;96'` describes two requests in DP0 and one in DP1;
