@@ -9,6 +9,7 @@
 """DeepSeek-V4 packed prefill compressor for the ratio-128 state cache."""
 
 import pypto.language as pl
+from causal_cache_ready import CAUSAL_FAMILIES, causal_publish_prefix
 import pypto.language.distributed as pld
 from projection_exchange import (
     PROJECTION_KINDS, PROJECTION_RANKS, PROJECTION_SIGNAL_ROWS,
@@ -801,7 +802,7 @@ def _prefill_compressor_ratio128_tile(
         rope_rot = pl.add(pl.mul(rope_normed, cos_il), pl.mul(pl.mul(swapped, rope_sign), sin_il))
         normed_kv_pad[r0 : r0 + HCA_C128_RMS_TILE, NOPE_HEAD_DIM:HEAD_DIM] = rope_rot
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_kv_finalize"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_kv_finalize") as causal_cache_write:
         for final_i in pl.range(MAX_CMP_WRITES):
             final_cmp_row_raw = pl.read(write_dst_map, [0, final_i])
             if final_cmp_row_raw >= 0:
@@ -818,7 +819,7 @@ def _prefill_compressor_ratio128_tile(
     # Writes through the flattened views already update the caller-owned buffers; a dynamic
     # reshape-back is not valid in this nested inline kernel.
 
-    return cmp_kv, compress_state
+    return causal_cache_write
 
 
 
@@ -1346,3 +1347,121 @@ if __name__ == "__main__":
             if result.error:
                 print(result.error)
             raise SystemExit(1)
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_compressor_ratio128_causal(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
+    compress_state: pl.InOut[
+        pl.Tensor[[STATE_BLOCK_NUM_DYN, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
+    ],
+    compress_state_block_table: pl.Tensor[[REQUESTS_DYN, HCA_STATE_MAX_BLOCKS], pl.INT32],
+    wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
+    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
+    cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    causal_ready: pld.DistributedTensor[[CAUSAL_FAMILIES, 1], pl.INT32],
+    causal_rank: pl.Scalar[pl.INT32],
+    causal_seed: pl.Scalar[pl.TASK_ID],
+):
+    """Compress packed requests independently through ordered 512-row state tiles.
+
+    Each request slice delimited by ``query_start_loc`` must use consecutive positions.
+    """
+    x.bind_dynamic(0, T_DYN)
+    query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
+    state_checkpoint_ends.bind_dynamic(0, REQUESTS_DYN)
+    state_checkpoint_ends.bind_dynamic(1, CHECKPOINT_TILES_DYN)
+    compress_state.bind_dynamic(0, STATE_BLOCK_NUM_DYN)
+    compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
+    cmp_kv.bind_dynamic(0, CMP_BLOCK_NUM_DYN)
+    cmp_freqs_cos.bind_dynamic(0, T_DYN)
+    cmp_freqs_sin.bind_dynamic(0, T_DYN)
+    position_ids.bind_dynamic(0, T_DYN)
+    cmp_slot_mapping.bind_dynamic(0, T_DYN)
+    state_slot_mapping.bind_dynamic(0, T_DYN)
+    request_count = pl.tensor.dim(query_start_loc, 0) - 1
+    rope_dup_idx_template = pl.create_tensor([HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
+    rope_swap_idx_template = pl.create_tensor([HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
+    rope_sign_template = pl.create_tensor([HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_rope_index_prepare"):
+        # Scalar construction avoids TCI's implicit temporary, which is not
+        # available when this inline program is itself nested under HCA.
+        for rope_r in pl.range(HCA_C128_RMS_TILE):
+            for rope_c in pl.range(ROPE_HEAD_DIM):
+                rope_lane = rope_c % 2
+                pl.write(
+                    rope_dup_idx_template,
+                    [rope_r, rope_c],
+                    pl.cast(rope_c // 2, pl.INT32),
+                )
+                pl.write(
+                    rope_swap_idx_template,
+                    [rope_r, rope_c],
+                    pl.cast(rope_c + 1 - rope_lane * 2, pl.INT32),
+                )
+                pl.write(
+                    rope_sign_template,
+                    [rope_r, rope_c],
+                    pl.cast(pl.cast(rope_lane * 2 - 1, pl.INT32), pl.FP32),
+                )
+
+    # One GM-resident token orders each tile's pool and bounded state-tail commit.
+    state_order_fence = pl.create_tensor([1], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_state_order_init"):
+        pl.write(state_order_fence, [0], pl.cast(0, pl.INT32))
+    causal_published = pl.array.create(1, pl.TASK_ID)
+    causal_published[0] = causal_seed
+    for request in pl.range(request_count):
+        request_start = pl.cast(pl.read(query_start_loc, [request]), pl.INDEX)
+        request_end = pl.cast(pl.read(query_start_loc, [request + 1]), pl.INDEX)
+        request_table = compress_state_block_table[request]
+        for request_offset in pl.range(0, request_end - request_start, PREFILL_STATE_TILE):
+            tile_base = request_start + request_offset
+            tile_rows = pl.min(PREFILL_STATE_TILE, request_end - tile_base)
+            with pl.scope():
+                causal_tile_complete = _prefill_compressor_ratio128_tile(
+                    x,
+                    compress_state,
+                    request_table,
+                    wkv,
+                    wgate,
+                    ape,
+                    norm_w,
+                    cmp_freqs_cos,
+                    cmp_freqs_sin,
+                    cmp_kv,
+                    position_ids,
+                    cmp_slot_mapping,
+                    state_slot_mapping,
+                    rope_dup_idx_template,
+                    rope_swap_idx_template,
+                    rope_sign_template,
+                    state_order_fence,
+                    request_start,
+                    tile_base,
+                    tile_rows,
+                    state_checkpoint_ends[request, request_offset // PREFILL_STATE_TILE],
+                )
+                causal_previous_publication = causal_published[0]
+                causal_tile_published = causal_publish_prefix(
+                    causal_ready, causal_rank, tile_rows, causal_tile_complete, causal_previous_publication, 1,
+                )
+                causal_published[0] = causal_tile_published
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="causal_compressor_state_complete", deps=[causal_published[0]]) as causal_state_complete:
+        causal_state_anchor = pl.read(state_order_fence, [0])
+        pl.write(state_order_fence, [0], causal_state_anchor)
+    causal_padding = pl.tensor.dim(x, 0) - pl.cast(pl.read(query_start_loc, [request_count]), pl.INDEX)
+    causal_previous_final = causal_published[0]
+    causal_final = causal_publish_prefix(
+        causal_ready, causal_rank, causal_padding, causal_state_complete, causal_previous_final, 1,
+    )
+    return causal_final

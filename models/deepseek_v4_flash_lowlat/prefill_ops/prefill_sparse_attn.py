@@ -10,6 +10,9 @@
 
 
 import pypto.language as pl
+import pypto.language.distributed as pld
+from causal_cache_ready import CAUSAL_READY, CAUSAL_BLOCKS_DYN, CAUSAL_FAMILIES, CAUSAL_REQUIRED_COLS, CAUSAL_QUERY_TILE, causal_query_ready
+from echo_prefetch import ECHO_DIAGNOSTICS
 
 from config import (
     BLOCK_SIZE,
@@ -242,28 +245,27 @@ def _hca_streaming_wave(
     query_base = request_offset + tile_base + dense_query_base
     request_end = request_offset + active_rows
 
-    with pl.spmd(
-        HCA_QUERY_TILE // HCA_GATHER_TOKEN_TILE,
-        name_hint="prefill_hca_stream_raw_gather", deps=[wave_completion[0]],
-    ) as raw_gather_tid:
-        gather_block = pl.tile.get_block_idx()
-        gather_local_t0 = gather_block * HCA_GATHER_TOKEN_TILE
-        for gather_dt in pl.range(HCA_GATHER_TOKEN_TILE):
-            gather_local_t = gather_local_t0 + gather_dt
-            gather_t = query_base + gather_local_t
-            gather_dst = gather_local_t * WIN
-            raw_stage = pl.full([WIN, HEAD_DIM], dtype=pl.BF16, value=0.0)
-            valid_stage = pl.full([1, WIN], dtype=pl.FP32, value=0.0)
-            if gather_t < request_end:
-                for gather_k in pl.range(WIN):
-                    gather_row_i32 = pl.read(swa_indices, [gather_t, gather_k])
-                    if gather_row_i32 >= 0:
-                        gather_row = pl.cast(gather_row_i32, pl.INDEX)
-                        gather_kv = ori_kv_flat[gather_row : gather_row + 1, 0:HEAD_DIM]
-                        raw_stage[gather_k : gather_k + 1, 0:HEAD_DIM] = gather_kv
-                        pl.write(valid_stage, [0, gather_k], 1.0)
-            raw_kv[gather_dst : gather_dst + WIN, 0:HEAD_DIM] = raw_stage
-            raw_valid[gather_local_t : gather_local_t + 1, 0:WIN] = valid_stage
+    causal_raw_gather_tid_choices = pl.array.create(1, pl.TASK_ID)
+    if CAUSAL_READY:
+        if False:
+            causal_specialize_prefill_hca_stream_raw_gather_raw_kv = pl.create_tensor([HCA_QUERY_TILE * WIN, HEAD_DIM], dtype=pl.BF16)
+            causal_specialize_prefill_hca_stream_raw_gather_raw_valid = pl.create_tensor([HCA_QUERY_TILE, WIN], dtype=pl.FP32)
+            _causal_reader_prefill_hca_stream_raw_gather(ori_kv_flat, query_base, causal_specialize_prefill_hca_stream_raw_gather_raw_kv, causal_specialize_prefill_hca_stream_raw_gather_raw_valid, request_end, swa_indices)
+        (raw_kv, raw_valid), raw_gather_tid_causal = pl.spmd_submit(
+            self._causal_reader_prefill_hca_stream_raw_gather,  # noqa: F821 - materialized by @pl.jit
+            pl.no_dep(ori_kv_flat), query_base, raw_kv, raw_valid, request_end, swa_indices,
+            core_num=HCA_QUERY_TILE // HCA_GATHER_TOKEN_TILE, deps=[wave_completion[0]],
+        )
+        causal_raw_gather_tid_choices[0] = raw_gather_tid_causal
+    else:
+        with pl.spmd(
+            HCA_QUERY_TILE // HCA_GATHER_TOKEN_TILE,
+            name_hint="prefill_hca_stream_raw_gather", deps=[wave_completion[0]],
+        ) as raw_gather_tid_global:
+            with pl.at(level=pl.Level.CORE_GROUP):
+                _causal_prefill_hca_stream_raw_gather_body(ori_kv_flat, query_base, raw_kv, raw_valid, request_end, swa_indices)
+        causal_raw_gather_tid_choices[0] = raw_gather_tid_global
+    raw_gather_tid = causal_raw_gather_tid_choices[0]
 
     # Raw-window online-softmax state.
     q_rows = t_dim * H
@@ -520,6 +522,7 @@ def _hca_streaming_wave(
     wave_completion[0] = merge_tid
 
 
+
 @pl.jit.inline(auto_scope=False)
 def _hca_streaming_attn_tile(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
@@ -641,155 +644,169 @@ def _hca_streaming_attn_tile(
 
 
 @pl.jit.inline(auto_scope=False)
-def _sparse_attn_wave(
-    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[REQUESTS_DYN, CMP_MAX_BLOCKS], pl.INT32],
-    local_request_ids: pl.Tensor[[T_DYN], pl.INT32],
-    cmp_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
-    valid_block_mask: pl.Tensor[[T_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    active_rows: pl.Scalar[pl.INDEX],
-    o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16],
-    sparse_kv: pl.Tensor[[PREFILL_QUERY_TILE * PREFILL_SPARSE_PAD, HEAD_DIM], pl.BF16],
-    sparse_bias: pl.Tensor[[PREFILL_QUERY_TILE, PREFILL_SPARSE_PAD], pl.FP32],
-    sparse_blk_mi: pl.Tensor[[PREFILL_QUERY_STATS_ROWS, 1], pl.FP32],
-    sparse_blk_li: pl.Tensor[[PREFILL_QUERY_STATS_ROWS, 1], pl.FP32],
-    sparse_blk_oi: pl.Tensor[[PREFILL_QUERY_STATS_ROWS, HEAD_DIM], pl.FP32],
-    rope_cos_il: pl.Tensor[[T_PAD, ROPE_DIM], pl.FP32],
-    rope_sin_signed: pl.Tensor[[T_PAD, ROPE_DIM], pl.FP32],
-    rope_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
+def _sparse_gather_raw(
+    q: pl.Tensor,
+    ori_kv: pl.Tensor,
+    swa_indices: pl.Tensor,
+    cmp_indices: pl.Tensor,
+    valid_block_mask: pl.Tensor,
+    local_request_ids: pl.Tensor,
+    sparse_kv: pl.Tensor,
+    sparse_bias: pl.Tensor,
     prior_merge_tid: pl.Scalar[pl.TASK_ID],
-    compute_dep: pl.Scalar[pl.TASK_ID],
     query_base: pl.Scalar[pl.INDEX],
-    dense_query_base: pl.Scalar[pl.INDEX],
-) -> pl.Scalar[pl.TASK_ID]:
-    """Run one 128-row gather/QK-PV/merge wave over reusable scratch."""
+    active_rows: pl.Scalar[pl.INDEX],
+):
     t_dim = pl.tensor.dim(q, 0)
     ori_block_num = pl.tensor.dim(ori_kv, 0)
     ori_kv_flat = pl.reshape(ori_kv, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
+    gather_blocks = PREFILL_QUERY_TILE // GATHER_TOKEN_TILE
+    causal_gather_ori_tid_choices = pl.array.create(1, pl.TASK_ID)
+    if CAUSAL_READY:
+        causal_gather_local_request_ids_view = pl.reshape(local_request_ids, [t_dim])
+        causal_gather_cmp_indices_view = pl.reshape(cmp_indices, [t_dim, IDX_TOPK])
+        causal_gather_valid_block_mask_view = pl.reshape(valid_block_mask, [t_dim, VALID_BLOCK_MASK_COLS])
+        causal_gather_swa_indices_view = pl.reshape(swa_indices, [t_dim, WIN])
+        if False:
+            causal_specialize_gather_ori_kv_sparse_kv = pl.create_tensor([PREFILL_QUERY_TILE * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
+            causal_specialize_gather_ori_kv_sparse_bias = pl.create_tensor([PREFILL_QUERY_TILE, PREFILL_SPARSE_PAD], dtype=pl.FP32)
+            _causal_reader_gather_ori_kv(gather_blocks, query_base, t_dim, active_rows, causal_gather_swa_indices_view, causal_specialize_gather_ori_kv_sparse_bias, causal_gather_cmp_indices_view, causal_gather_local_request_ids_view, causal_gather_valid_block_mask_view, causal_specialize_gather_ori_kv_sparse_kv, ori_kv_flat)
+        (sparse_kv, sparse_bias), gather_ori_tid_causal = pl.spmd_submit(
+            self._causal_reader_gather_ori_kv,  # noqa: F821 - materialized by @pl.jit
+            gather_blocks, query_base, t_dim, active_rows, causal_gather_swa_indices_view, sparse_bias, causal_gather_cmp_indices_view, causal_gather_local_request_ids_view, causal_gather_valid_block_mask_view, sparse_kv, pl.no_dep(ori_kv_flat),
+            core_num=gather_blocks, deps=[prior_merge_tid],
+        )
+        causal_gather_ori_tid_choices[0] = gather_ori_tid_causal
+    else:
+        with pl.spmd(
+            gather_blocks,
+            name_hint="gather_ori_kv",
+            deps=[prior_merge_tid],
+        ) as gather_ori_tid:
+            with pl.at(level=pl.Level.CORE_GROUP):
+                _causal_gather_ori_kv_body(gather_blocks, query_base, t_dim, active_rows, swa_indices, sparse_bias, cmp_indices, local_request_ids, valid_block_mask, sparse_kv, ori_kv_flat)
+        causal_gather_ori_tid_choices[0] = gather_ori_tid
+    gather_ori_tid = causal_gather_ori_tid_choices[0]
+    return gather_ori_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def _sparse_gather_cmp(
+    q: pl.Tensor,
+    cmp_kv: pl.Tensor,
+    cmp_block_table: pl.Tensor,
+    local_request_ids: pl.Tensor,
+    cmp_indices: pl.Tensor,
+    valid_block_mask: pl.Tensor,
+    sparse_kv: pl.Tensor,
+    prior_merge_tid: pl.Scalar[pl.TASK_ID],
+    query_base: pl.Scalar[pl.INDEX],
+    active_rows: pl.Scalar[pl.INDEX],
+):
+    t_dim = pl.tensor.dim(q, 0)
     cmp_block_num = pl.tensor.dim(cmp_kv, 0)
     cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * BLOCK_SIZE, HEAD_DIM])
+    gather_cmp_token_blocks = PREFILL_QUERY_TILE // SPARSE_OPT_CMP_GATHER_TOKEN_TILE
+    gather_cmp_blocks = gather_cmp_token_blocks * (PREFILL_ATTN_BLOCKS - 1)
+    causal_gather_cmp_tid_choices = pl.array.create(1, pl.TASK_ID)
+    if CAUSAL_READY:
+        causal_gather_local_request_ids_view = pl.reshape(local_request_ids, [t_dim])
+        causal_gather_cmp_indices_view = pl.reshape(cmp_indices, [t_dim, IDX_TOPK])
+        causal_gather_valid_block_mask_view = pl.reshape(valid_block_mask, [t_dim, VALID_BLOCK_MASK_COLS])
+        if False:
+            causal_specialize_gather_cmp_kv_sparse_kv = pl.create_tensor([PREFILL_QUERY_TILE * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
+            _causal_reader_gather_cmp_kv(gather_cmp_token_blocks, query_base, t_dim, active_rows, causal_gather_local_request_ids_view, causal_gather_valid_block_mask_view, causal_specialize_gather_cmp_kv_sparse_kv, causal_gather_cmp_indices_view, cmp_block_table, cmp_block_num, cmp_kv_flat)
+        sparse_kv, gather_cmp_tid_causal = pl.spmd_submit(
+            self._causal_reader_gather_cmp_kv,  # noqa: F821 - materialized by @pl.jit
+            gather_cmp_token_blocks, query_base, t_dim, active_rows, causal_gather_local_request_ids_view, causal_gather_valid_block_mask_view, sparse_kv, causal_gather_cmp_indices_view, cmp_block_table, cmp_block_num, pl.no_dep(cmp_kv_flat),
+            core_num=gather_cmp_blocks, deps=[prior_merge_tid],
+        )
+        causal_gather_cmp_tid_choices[0] = gather_cmp_tid_causal
+    else:
+        with pl.spmd(
+            gather_cmp_blocks,
+            name_hint="gather_cmp_kv",
+            deps=[prior_merge_tid],
+        ) as gather_cmp_tid:
+            with pl.at(level=pl.Level.CORE_GROUP):
+                _causal_gather_cmp_kv_body(gather_cmp_token_blocks, query_base, t_dim, active_rows, local_request_ids, valid_block_mask, sparse_kv, cmp_indices, cmp_block_table, cmp_block_num, cmp_kv_flat)
+        causal_gather_cmp_tid_choices[0] = gather_cmp_tid
+    gather_cmp_tid = causal_gather_cmp_tid_choices[0]
+    return gather_cmp_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def _sparse_gather_cmp_echo(
+    q: pl.Tensor,
+    cmp_kv: pl.Tensor,
+    cmp_block_table: pl.Tensor,
+    local_request_ids: pl.Tensor,
+    cmp_indices: pl.Tensor,
+    valid_block_mask: pl.Tensor,
+    sparse_kv: pl.Tensor,
+    echo_prefetched: pl.Tensor,
+    echo_map: pl.Tensor,
+    echo_counts: pl.Tensor,
+    echo_epoch: pl.Scalar[pl.INT32],
+    prior_merge_tid: pl.Scalar[pl.TASK_ID],
+    query_base: pl.Scalar[pl.INDEX],
+    active_rows: pl.Scalar[pl.INDEX],
+):
+    t_dim = pl.tensor.dim(q, 0)
+    cmp_block_num = pl.tensor.dim(cmp_kv, 0)
+    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * BLOCK_SIZE, HEAD_DIM])
+    gather_cmp_token_blocks = PREFILL_QUERY_TILE // SPARSE_OPT_CMP_GATHER_TOKEN_TILE
+    gather_cmp_blocks = gather_cmp_token_blocks * (PREFILL_ATTN_BLOCKS - 1)
+    causal_gather_cmp_tid_choices = pl.array.create(1, pl.TASK_ID)
+    if CAUSAL_READY:
+        causal_gather_local_request_ids_view = pl.reshape(local_request_ids, [t_dim])
+        causal_gather_cmp_indices_view = pl.reshape(cmp_indices, [t_dim, IDX_TOPK])
+        causal_gather_valid_block_mask_view = pl.reshape(valid_block_mask, [t_dim, VALID_BLOCK_MASK_COLS])
+        if False:
+            causal_specialize_echo_exact_order_cmp_fill_sparse_kv = pl.create_tensor([PREFILL_QUERY_TILE * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
+            causal_specialize_echo_exact_order_cmp_fill_echo_counts = pl.create_tensor([PREFILL_QUERY_TILE, 16], dtype=pl.INT32)
+            _causal_reader_echo_exact_order_cmp_fill(query_base, t_dim, active_rows, causal_gather_local_request_ids_view, causal_gather_valid_block_mask_view, causal_specialize_echo_exact_order_cmp_fill_sparse_kv, causal_gather_cmp_indices_view, causal_specialize_echo_exact_order_cmp_fill_echo_counts, echo_epoch, cmp_block_table, echo_map, cmp_block_num, cmp_kv_flat, echo_prefetched)
+        (sparse_kv, echo_counts), gather_cmp_tid_causal = pl.spmd_submit(
+            self._causal_reader_echo_exact_order_cmp_fill,  # noqa: F821 - materialized by @pl.jit
+            query_base, t_dim, active_rows, causal_gather_local_request_ids_view, causal_gather_valid_block_mask_view, sparse_kv, causal_gather_cmp_indices_view, echo_counts, echo_epoch, cmp_block_table, echo_map, cmp_block_num, pl.no_dep(cmp_kv_flat), echo_prefetched,
+            core_num=PREFILL_QUERY_TILE, deps=[prior_merge_tid],
+        )
+        causal_gather_cmp_tid_choices[0] = gather_cmp_tid_causal
+    else:
+        with pl.spmd(PREFILL_QUERY_TILE, name_hint="echo_exact_order_cmp_fill", deps=[prior_merge_tid]) as gather_cmp_tid:
+            with pl.at(level=pl.Level.CORE_GROUP):
+                _causal_echo_exact_order_cmp_fill_body(query_base, t_dim, active_rows, local_request_ids, valid_block_mask, sparse_kv, cmp_indices, echo_counts, echo_epoch, cmp_block_table, echo_map, cmp_block_num, cmp_kv_flat, echo_prefetched)
+        causal_gather_cmp_tid_choices[0] = gather_cmp_tid
+    gather_cmp_tid = causal_gather_cmp_tid_choices[0]
+    return gather_cmp_tid
+
+
+
+@pl.jit.inline(auto_scope=False)
+def _sparse_attn_compute_wave(
+    q: pl.Tensor,
+    sparse_kv: pl.Tensor,
+    sparse_bias: pl.Tensor,
+    valid_block_mask: pl.Tensor,
+    attn_sink: pl.Tensor,
+    o_packed_heads: pl.Tensor,
+    sparse_blk_mi: pl.Tensor,
+    sparse_blk_li: pl.Tensor,
+    sparse_blk_oi: pl.Tensor,
+    rope_cos_il: pl.Tensor,
+    rope_sin_signed: pl.Tensor,
+    rope_swap_idx: pl.Tensor,
+    gather_ori_tid: pl.Scalar[pl.TASK_ID],
+    gather_cmp_tid: pl.Scalar[pl.TASK_ID],
+    compute_dep: pl.Scalar[pl.TASK_ID],
+    query_base: pl.Scalar[pl.INDEX],
+    dense_query_base: pl.Scalar[pl.INDEX],
+    active_rows: pl.Scalar[pl.INDEX],
+):
+    t_dim = pl.tensor.dim(q, 0)
     o_packed = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
     q_flat = pl.reshape(q, [t_dim * H, HEAD_DIM])
     attn_sink_col = pl.reshape(attn_sink, [H, 1])
-    gather_blocks = PREFILL_QUERY_TILE // GATHER_TOKEN_TILE
-    gather_cmp_token_blocks = PREFILL_QUERY_TILE // SPARSE_OPT_CMP_GATHER_TOKEN_TILE
-    gather_cmp_blocks = gather_cmp_token_blocks * (PREFILL_ATTN_BLOCKS - 1)
-
-    # Stage original-window rows in reverse token-tile order.
-    with pl.spmd(
-        gather_blocks,
-        name_hint="gather_ori_kv",
-        deps=[prior_merge_tid],
-    ) as gather_ori_tid:
-        gather_schedule_block = pl.tile.get_block_idx()
-        gather_token_block = gather_blocks - 1 - gather_schedule_block
-        gather_local_t0 = gather_token_block * GATHER_TOKEN_TILE
-        gather_bias_t0 = query_base + gather_local_t0
-        if gather_bias_t0 < t_dim and gather_bias_t0 < active_rows:
-            gather_bias_rows = pl.min(GATHER_TOKEN_TILE, pl.min(t_dim, active_rows) - gather_bias_t0)
-            gather_bias_win_rows = pl.slice(swa_indices, [GATHER_TOKEN_TILE, WIN], [gather_bias_t0, 0], valid_shape=[gather_bias_rows, WIN])
-            gather_bias_win_idx = pl.cast(gather_bias_win_rows, target_type=pl.FP32)
-            gather_bias_win_flag = pl.minimum(pl.maximum(pl.add(gather_bias_win_idx, 1.0), 0.0), 1.0)
-            gather_bias_win = pl.mul(pl.sub(gather_bias_win_flag, 1.0), -FP32_NEG_INF)
-            sparse_bias[gather_local_t0 : gather_local_t0 + GATHER_TOKEN_TILE, 0:WIN] = gather_bias_win
-            if SPARSE_CMP_BIAS_COLS > 0:
-                gather_bias_cmp_rows = pl.slice(cmp_indices, [GATHER_TOKEN_TILE, SPARSE_CMP_BIAS_COLS], [gather_bias_t0, 0], valid_shape=[gather_bias_rows, SPARSE_CMP_BIAS_COLS])
-                gather_bias_cmp_idx = pl.cast(gather_bias_cmp_rows, target_type=pl.FP32)
-                gather_bias_cmp_flag = pl.minimum(pl.maximum(pl.add(gather_bias_cmp_idx, 1.0), 0.0), 1.0)
-                gather_bias_cmp = pl.mul(pl.sub(gather_bias_cmp_flag, 1.0), -FP32_NEG_INF)
-                sparse_bias[gather_local_t0 : gather_local_t0 + GATHER_TOKEN_TILE, WIN:SPARSE_BIAS_COLS] = gather_bias_cmp
-            if PREFILL_SPARSE_PAD > SPARSE_BIAS_COLS:
-                gather_bias_pad = pl.full([GATHER_TOKEN_TILE, PREFILL_SPARSE_PAD - SPARSE_BIAS_COLS], dtype=pl.FP32, value=FP32_NEG_INF)
-                sparse_bias[gather_local_t0 : gather_local_t0 + GATHER_TOKEN_TILE, SPARSE_BIAS_COLS:PREFILL_SPARSE_PAD] = gather_bias_pad
-        for gather_dt in pl.range(GATHER_TOKEN_TILE):
-            gather_local_t = gather_local_t0 + gather_dt
-            gather_t = query_base + gather_local_t
-            if gather_t < t_dim:
-                if gather_t < active_rows:
-                    request_id = pl.read(local_request_ids, [gather_t])
-                    block_base = gather_local_t * PREFILL_SPARSE_PAD
-                    if pl.read(valid_block_mask, [gather_t, 0]) > 0:
-                        stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                        if request_id >= 0:
-                            gather_ori_indices = pl.load(swa_indices, [gather_t, 0], [1, PREFILL_ATTN_TILE], target_memory=pl.MemorySpace.Vec)
-                            for gather_g0 in pl.range(0, PREFILL_ATTN_TILE, SPARSE_OPT_GATHER_ROW_TILE):
-                                gather_first = pl.tile.read(gather_ori_indices, [0, gather_g0])
-                                gather_contiguous = gather_first >= 0
-                                for gather_ci, (contiguous_iter,) in pl.range(1, SPARSE_OPT_GATHER_ROW_TILE, init_values=(gather_contiguous,)):
-                                    gather_next = pl.tile.read(gather_ori_indices, [0, gather_g0 + gather_ci])
-                                    gather_matches = contiguous_iter and gather_next == gather_first + gather_ci
-                                    gather_contiguous = pl.yield_(gather_matches)
-                                if gather_contiguous:
-                                    src = pl.cast(gather_first, pl.INDEX)
-                                    stage[gather_g0 : gather_g0 + SPARSE_OPT_GATHER_ROW_TILE, :] = ori_kv_flat[src : src + SPARSE_OPT_GATHER_ROW_TILE, :]
-                                else:
-                                    for gather_ci in pl.range(SPARSE_OPT_GATHER_ROW_TILE):
-                                        gather_ki = gather_g0 + gather_ci
-                                        gather_raw = pl.tile.read(gather_ori_indices, [0, gather_ki])
-                                        if gather_raw >= 0:
-                                            src = pl.cast(gather_raw, pl.INDEX)
-                                            stage[gather_ki : gather_ki + 1, :] = ori_kv_flat[src : src + 1, :]
-                        sparse_kv[block_base : block_base + PREFILL_ATTN_TILE, :] = stage
-
-    with pl.spmd(
-        gather_cmp_blocks,
-        name_hint="gather_cmp_kv",
-        deps=[prior_merge_tid],
-    ) as gather_cmp_tid:
-        gather_block = pl.tile.get_block_idx()
-        gather_schedule_block = gather_block // (PREFILL_ATTN_BLOCKS - 1)
-        gather_token_block = gather_cmp_token_blocks - 1 - gather_schedule_block
-        gather_sb = gather_block - gather_schedule_block * (PREFILL_ATTN_BLOCKS - 1) + 1
-        gather_local_t0 = gather_token_block * SPARSE_OPT_CMP_GATHER_TOKEN_TILE
-        gather_k0 = gather_sb * PREFILL_ATTN_TILE
-        for gather_dt in pl.range(SPARSE_OPT_CMP_GATHER_TOKEN_TILE):
-            gather_local_t = gather_local_t0 + gather_dt
-            gather_t = query_base + gather_local_t
-            if gather_t < t_dim:
-                if gather_t < active_rows:
-                    request_id = pl.read(local_request_ids, [gather_t])
-                    gather_block_valid = pl.read(valid_block_mask, [gather_t, gather_sb])
-                    block_base = gather_local_t * PREFILL_SPARSE_PAD + gather_k0
-                    if gather_block_valid > 0:
-                        stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                        if request_id >= 0:
-                            gather_cmp_offset = gather_k0 - WIN
-                            gather_cmp_cols = pl.min(PREFILL_ATTN_TILE, IDX_TOPK - gather_cmp_offset)
-                            gather_indices = pl.load(cmp_indices, [gather_t, gather_cmp_offset], [1, PREFILL_ATTN_TILE], valid_shape=[1, gather_cmp_cols], target_memory=pl.MemorySpace.Vec)
-                            for gather_g0 in pl.range(0, PREFILL_ATTN_TILE, SPARSE_OPT_CMP_GATHER_ROW_TILE):
-                                gather_first = pl.tile.read(gather_indices, [0, gather_g0])
-                                gather_page = gather_first // BLOCK_SIZE
-                                gather_intra = gather_first - gather_page * BLOCK_SIZE
-                                gather_contiguous = gather_first >= 0 and gather_g0 + SPARSE_OPT_CMP_GATHER_ROW_TILE <= gather_cmp_cols
-                                gather_contiguous = gather_contiguous and gather_intra + SPARSE_OPT_CMP_GATHER_ROW_TILE <= BLOCK_SIZE
-                                for gather_ci, (contiguous_iter,) in pl.range(1, SPARSE_OPT_CMP_GATHER_ROW_TILE, init_values=(gather_contiguous,)):
-                                    gather_next = pl.tile.read(gather_indices, [0, gather_g0 + gather_ci])
-                                    gather_matches = contiguous_iter and gather_next == gather_first + gather_ci
-                                    gather_contiguous = pl.yield_(gather_matches)
-                                if gather_contiguous:
-                                    blk_raw = pl.read(cmp_block_table, [request_id, gather_page])
-                                    if blk_raw >= 0 and blk_raw < cmp_block_num:
-                                        blk = pl.cast(blk_raw, pl.INDEX)
-                                        src = blk * BLOCK_SIZE + gather_intra
-                                        stage[gather_g0 : gather_g0 + SPARSE_OPT_CMP_GATHER_ROW_TILE, :] = cmp_kv_flat[src : src + SPARSE_OPT_CMP_GATHER_ROW_TILE, :]
-                                else:
-                                    for gather_ci in pl.range(SPARSE_OPT_CMP_GATHER_ROW_TILE):
-                                        gather_ki = gather_g0 + gather_ci
-                                        gather_cmp_k = gather_cmp_offset + gather_ki
-                                        if gather_cmp_k < IDX_TOPK:
-                                            gather_raw = pl.tile.read(gather_indices, [0, gather_ki])
-                                            if gather_raw >= 0:
-                                                blk_slot = gather_raw // BLOCK_SIZE
-                                                blk_raw = pl.read(cmp_block_table, [request_id, blk_slot])
-                                                if blk_raw >= 0 and blk_raw < cmp_block_num:
-                                                    blk = pl.cast(blk_raw, pl.INDEX)
-                                                    src = blk * BLOCK_SIZE + (gather_raw - blk_slot * BLOCK_SIZE)
-                                                    stage[gather_ki : gather_ki + 1, :] = cmp_kv_flat[src : src + 1, :]
-                        sparse_kv[block_base : block_base + PREFILL_ATTN_TILE, :] = stage
 
     # Pipeline K blocks and keep the online-softmax state local to each query.
     transfer_slots = NUM_QK_CORES * QK_TRANSFER_SLOTS
@@ -1001,6 +1018,38 @@ def _sparse_attn_wave(
                         ] = m_rope_row
 
     return merge_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def _sparse_attn_wave(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[REQUESTS_DYN, CMP_MAX_BLOCKS], pl.INT32],
+    local_request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    cmp_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
+    valid_block_mask: pl.Tensor[[T_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    active_rows: pl.Scalar[pl.INDEX],
+    o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16],
+    sparse_kv: pl.Tensor[[PREFILL_QUERY_TILE * PREFILL_SPARSE_PAD, HEAD_DIM], pl.BF16],
+    sparse_bias: pl.Tensor[[PREFILL_QUERY_TILE, PREFILL_SPARSE_PAD], pl.FP32],
+    sparse_blk_mi: pl.Tensor[[PREFILL_QUERY_STATS_ROWS, 1], pl.FP32],
+    sparse_blk_li: pl.Tensor[[PREFILL_QUERY_STATS_ROWS, 1], pl.FP32],
+    sparse_blk_oi: pl.Tensor[[PREFILL_QUERY_STATS_ROWS, HEAD_DIM], pl.FP32],
+    rope_cos_il: pl.Tensor[[T_PAD, ROPE_DIM], pl.FP32],
+    rope_sin_signed: pl.Tensor[[T_PAD, ROPE_DIM], pl.FP32],
+    rope_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
+    prior_merge_tid: pl.Scalar[pl.TASK_ID],
+    compute_dep: pl.Scalar[pl.TASK_ID],
+    query_base: pl.Scalar[pl.INDEX],
+    dense_query_base: pl.Scalar[pl.INDEX],
+) -> pl.Scalar[pl.TASK_ID]:
+    gather_ori_tid = _sparse_gather_raw(q, ori_kv, swa_indices, cmp_indices, valid_block_mask, local_request_ids, sparse_kv, sparse_bias, prior_merge_tid, query_base, active_rows)
+    gather_cmp_tid = _sparse_gather_cmp(q, cmp_kv, cmp_block_table, local_request_ids, cmp_indices, valid_block_mask, sparse_kv, prior_merge_tid, query_base, active_rows)
+    merged = _sparse_attn_compute_wave(q, sparse_kv, sparse_bias, valid_block_mask, attn_sink, o_packed_heads, sparse_blk_mi, sparse_blk_li, sparse_blk_oi, rope_cos_il, rope_sin_signed, rope_swap_idx, gather_ori_tid, gather_cmp_tid, compute_dep, query_base, dense_query_base, active_rows)
+    return merged
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1465,6 +1514,788 @@ def prefill_sparse_attn_test(
         attn_out,
         o_proj_weight_dep,
     )
+
+
+@pl.jit.inline(auto_scope=False)
+def _sparse_attn_heads_causal(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[REQUESTS_DYN, CMP_MAX_BLOCKS], pl.INT32],
+    local_request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    cmp_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
+    valid_block_mask: pl.Tensor[[T_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    active_rows: pl.Scalar[pl.INDEX],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16],
+    packed_init_tid: pl.Scalar[pl.TASK_ID],
+    tile_base: pl.Scalar[pl.INDEX],
+    tile_rows: pl.Scalar[pl.INDEX],
+    causal_signal: pld.DistributedTensor[[CAUSAL_FAMILIES, 1], pl.INT32],
+    causal_required: pl.Tensor[[CAUSAL_BLOCKS_DYN, CAUSAL_REQUIRED_COLS], pl.INT32],
+    causal_epoch_base: pl.Scalar[pl.INT32],
+) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
+    """Write one bounded dense tile through serial 128-row waves."""
+    # Query waves share their large KV/statistics workspace.  Keeping the
+    # waves chained lets the allocator recycle it instead of retaining one
+    # full sparse workspace per query block.
+    merge_tids = pl.array.create(1, pl.TASK_ID)
+    with pl.scope():
+        sparse_kv = pl.create_tensor(
+            [PREFILL_QUERY_TILE * PREFILL_SPARSE_PAD, HEAD_DIM],
+            dtype=pl.BF16,
+        )
+        sparse_bias = pl.create_tensor(
+            [PREFILL_QUERY_TILE, PREFILL_SPARSE_PAD],
+            dtype=pl.FP32,
+        )
+        sparse_blk_mi = pl.create_tensor([PREFILL_QUERY_STATS_ROWS, 1], dtype=pl.FP32)
+        sparse_blk_li = pl.create_tensor([PREFILL_QUERY_STATS_ROWS, 1], dtype=pl.FP32)
+        sparse_blk_oi = pl.create_tensor([PREFILL_QUERY_STATS_ROWS, HEAD_DIM], dtype=pl.FP32)
+        rope_cos_il = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
+        rope_sin_signed = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
+        rope_swap_idx = pl.create_tensor([HEAD_TILE, ROPE_DIM], dtype=pl.INT32, manual_dep=True)
+        rope_cs_tid = _prepare_sparse_attn_rope(
+            freqs_cos,
+            freqs_sin,
+            rope_cos_il,
+            rope_sin_signed,
+            rope_swap_idx,
+            tile_base,
+            tile_rows,
+            packed_init_tid,
+        )
+        ready_tid = pl.system.task_dummy(deps=[packed_init_tid, rope_cs_tid])
+        merge_tids[0] = ready_tid
+        for query_block in pl.unroll(PREFILL_QUERY_BLOCKS):
+            dense_query_base = query_block * PREFILL_QUERY_TILE
+            query_base = tile_base + dense_query_base
+            prior_merge_tid = merge_tids[0]
+            merge_tid = prior_merge_tid
+            if dense_query_base < tile_rows:
+                causal_wave_ready = causal_query_ready(
+                    causal_signal, causal_required, causal_epoch_base,
+                    query_base // CAUSAL_QUERY_TILE, prior_merge_tid,
+                )
+                merge_tid = _sparse_attn_wave(
+                    q,
+                    ori_kv,
+                    swa_indices,
+                    cmp_kv,
+                    cmp_block_table,
+                    local_request_ids,
+                    cmp_indices,
+                    valid_block_mask,
+                    attn_sink,
+                    active_rows,
+                    o_packed_heads,
+                    sparse_kv,
+                    sparse_bias,
+                    sparse_blk_mi,
+                    sparse_blk_li,
+                    sparse_blk_oi,
+                    rope_cos_il,
+                    rope_sin_signed,
+                    rope_swap_idx,
+                    causal_wave_ready,
+                    prior_merge_tid,
+                    query_base,
+                    dense_query_base,
+                )
+            merge_tids[0] = merge_tid
+
+    return o_packed_heads, merge_tids[0]
+
+
+
+@pl.jit.inline(auto_scope=False)
+def sparse_attn_compute_causal(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[REQUESTS_DYN, CMP_MAX_BLOCKS], pl.INT32],
+    local_request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    cmp_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
+    valid_block_mask: pl.Tensor[[T_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    active_rows: pl.Scalar[pl.INDEX],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
+    o_proj_weight_dep: pl.Scalar[pl.TASK_ID],
+    causal_signal: pld.DistributedTensor[[CAUSAL_FAMILIES, 1], pl.INT32],
+    causal_required: pl.Tensor[[CAUSAL_BLOCKS_DYN, CAUSAL_REQUIRED_COLS], pl.INT32],
+    causal_epoch_base: pl.Scalar[pl.INT32],
+):
+    """Run sparse heads and dense output projection over bounded physical tiles."""
+    for tile_base in pl.range(0, active_rows, T_PAD):
+        # Tile-local attention workspace scope.
+        with pl.scope():
+            tile_rows = pl.min(T_PAD, active_rows - tile_base)
+            o_packed_heads = pl.create_tensor(
+                [O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM],
+                dtype=pl.BF16,
+                manual_dep=True,
+            )
+            packed_rows = ((tile_rows + PROJ_A_ROW_TILE - 1) // PROJ_A_ROW_TILE) * PROJ_A_ROW_TILE
+            packed_group_blocks = packed_rows * HEADS_PER_GROUP // PREFILL_QUERY_TILE
+            with pl.spmd(O_GROUPS * packed_group_blocks, name_hint="prefill_sparse_packed_init") as packed_init_tid:
+                packed_block = pl.tile.get_block_idx()
+                packed_group = packed_block // packed_group_blocks
+                packed_row = packed_group * T_PAD * HEADS_PER_GROUP
+                packed_row = packed_row + (packed_block % packed_group_blocks) * PREFILL_QUERY_TILE
+                packed_zero = pl.full([PREFILL_QUERY_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                o_packed_heads[packed_row : packed_row + PREFILL_QUERY_TILE, 0:HEAD_DIM] = packed_zero
+            o_packed_heads, heads_dep = _sparse_attn_heads_causal(
+                q,
+                ori_kv,
+                swa_indices,
+                cmp_kv,
+                cmp_block_table,
+                local_request_ids,
+                cmp_indices,
+                valid_block_mask,
+                attn_sink,
+                active_rows,
+                freqs_cos,
+                freqs_sin,
+                o_packed_heads,
+                packed_init_tid,
+                tile_base,
+                tile_rows,
+                                            causal_signal, causal_required, causal_epoch_base,
+            )
+            _act_tid = _sparse_attn_o_proj(
+                o_packed_heads,
+                wo_a,
+                wo_b,
+                wo_b_scale,
+                attn_out,
+                tile_base,
+                tile_rows,
+                heads_dep,
+                o_proj_weight_dep,
+            )
+    return attn_out
+
+
+
+@pl.jit.inline(auto_scope=False)
+def sparse_attn_physical_causal(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[REQUESTS_DYN, CMP_MAX_BLOCKS], pl.INT32],
+    local_request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    cmp_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
+    valid_block_mask: pl.Tensor[[T_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
+    o_proj_weight_dep: pl.Scalar[pl.TASK_ID],
+    causal_signal: pld.DistributedTensor[[CAUSAL_FAMILIES, 1], pl.INT32],
+    causal_required: pl.Tensor[[CAUSAL_BLOCKS_DYN, CAUSAL_REQUIRED_COLS], pl.INT32],
+    causal_epoch_base: pl.Scalar[pl.INT32],
+):
+    """Run sparse attention over the full physical token dimension."""
+    active_rows = pl.tensor.dim(q, 0)
+    return sparse_attn_compute_causal(
+        q,
+        ori_kv,
+        swa_indices,
+        cmp_kv,
+        cmp_block_table,
+        local_request_ids,
+        cmp_indices,
+        valid_block_mask,
+        attn_sink,
+        active_rows,
+        freqs_cos,
+        freqs_sin,
+        wo_a,
+        wo_b,
+        wo_b_scale,
+        attn_out,
+        o_proj_weight_dep,
+               causal_signal, causal_required, causal_epoch_base,
+    )
+
+
+
+@pl.jit.inline(auto_scope=False)
+def hca_streaming_attn_physical_causal(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[HCA_CMP_MAX_BLOCKS], pl.INT32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
+    cache_ready_dep: pl.Scalar[pl.TASK_ID],
+    o_proj_weight_dep: pl.Scalar[pl.TASK_ID],
+    request_offset: pl.Scalar[pl.INDEX],
+    active_rows: pl.Scalar[pl.INDEX],
+    causal_signal: pld.DistributedTensor[[CAUSAL_FAMILIES, 1], pl.INT32],
+    causal_required: pl.Tensor[[CAUSAL_BLOCKS_DYN, CAUSAL_REQUIRED_COLS], pl.INT32],
+    causal_epoch_base: pl.Scalar[pl.INT32],
+    causal_request_begin: pl.Scalar[pl.INT32],
+    causal_request_origin: pl.Scalar[pl.INT32],
+):
+    """Run ratio-128 attention over streamed history."""
+    tile_completion = pl.array.create(1, pl.TASK_ID)
+    tile_completion[0] = cache_ready_dep
+    for tile_base in pl.range(0, active_rows, T_PAD):
+        with pl.scope():
+            tile_rows = pl.min(T_PAD, active_rows - tile_base)
+            o_packed_heads = pl.create_tensor(
+                [O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16, manual_dep=True,
+            )
+            with pl.spmd(
+                T_PAD * H // PREFILL_QUERY_TILE, name_hint="prefill_hca_stream_packed_init",
+                deps=[tile_completion[0]],
+            ) as packed_init_tid:
+                packed_row = pl.tile.get_block_idx() * PREFILL_QUERY_TILE
+                packed_zero = pl.full([PREFILL_QUERY_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                o_packed_heads[packed_row : packed_row + PREFILL_QUERY_TILE, 0:HEAD_DIM] = packed_zero
+
+            causal_prior_tile = tile_completion[0]
+            causal_tile_complete = _hca_streaming_attn_tile_causal(
+                q, ori_kv, swa_indices,
+                cmp_kv, cmp_block_table,
+                position_ids, attn_sink, request_offset, active_rows,
+                freqs_cos, freqs_sin,
+                wo_a, wo_b, wo_b_scale,
+                attn_out,
+                o_packed_heads, packed_init_tid, o_proj_weight_dep,
+                causal_prior_tile, tile_base, tile_rows,
+                causal_signal, causal_required, causal_epoch_base,
+                causal_request_begin, causal_request_origin,
+            )
+            tile_completion[0] = causal_tile_complete
+    # Publish final o-proj completion outside the manual tile scope.
+    with pl.at(
+        level=pl.Level.CORE_GROUP, name_hint="prefill_hca_stream_publish", deps=[tile_completion[0]]
+    ) as publish_tid:
+        completion_anchor = pl.read(attn_out, [request_offset, 0])
+        pl.write(attn_out, [request_offset, 0], completion_anchor)
+    return publish_tid
+
+
+
+@pl.jit.inline(auto_scope=False)
+def _hca_streaming_attn_tile_causal(
+    q: pl.Tensor,
+    ori_kv: pl.Tensor,
+    swa_indices: pl.Tensor,
+    cmp_kv: pl.Tensor,
+    cmp_block_table: pl.Tensor,
+    position_ids: pl.Tensor,
+    attn_sink: pl.Tensor,
+    request_offset: pl.Scalar[pl.INDEX],
+    active_rows: pl.Scalar[pl.INDEX],
+    freqs_cos: pl.Tensor,
+    freqs_sin: pl.Tensor,
+    wo_a: pl.Tensor,
+    wo_b: pl.Tensor,
+    wo_b_scale: pl.Tensor,
+    attn_out: pl.Tensor,
+    o_packed_heads: pl.Tensor,
+    packed_init_tid: pl.Scalar[pl.TASK_ID],
+    o_proj_weight_dep: pl.Scalar[pl.TASK_ID],
+    prior_tile: pl.Scalar[pl.TASK_ID],
+    tile_base: pl.Scalar[pl.INDEX],
+    tile_rows: pl.Scalar[pl.INDEX],
+    causal_signal: pld.DistributedTensor[[CAUSAL_FAMILIES, 1], pl.INT32],
+    causal_required: pl.Tensor[[CAUSAL_BLOCKS_DYN, CAUSAL_REQUIRED_COLS], pl.INT32],
+    causal_epoch_base: pl.Scalar[pl.INT32],
+    causal_request_begin: pl.Scalar[pl.INT32],
+    causal_request_origin: pl.Scalar[pl.INT32],
+):
+    """Gate HCA cache gathers by completed producer tiles with ordered query waves."""
+    cmp_block_num = pl.tensor.dim(cmp_kv, 0)
+    cmp_cache_rows = cmp_block_num * HCA_CMP_STORAGE_BLOCK_SIZE
+    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
+    rope_cos_il = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
+    rope_sin_signed = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
+    rope_swap_idx = pl.create_tensor([HEAD_TILE, ROPE_DIM], dtype=pl.INT32, manual_dep=True)
+    rope_cs_tid = _prepare_sparse_attn_rope(
+        freqs_cos, freqs_sin, rope_cos_il, rope_sin_signed, rope_swap_idx,
+        request_offset + tile_base, tile_rows, packed_init_tid,
+    )
+    cmp_work_kv = pl.create_tensor([HCA_CMP_PAD_ROWS, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
+    cmp_work_valid = pl.create_tensor([HCA_CMP_WORK_COUNT, HCA_WORK_VALID_STRIDE], dtype=pl.INT32, manual_dep=True)
+    raw_kv = pl.create_tensor([HCA_QUERY_TILE * WIN, HEAD_DIM], dtype=pl.BF16)
+    raw_valid = pl.create_tensor([HCA_QUERY_TILE, WIN], dtype=pl.FP32)
+    stream_state_m = pl.create_tensor([HCA_QUERY_TILE * H, 1], dtype=pl.FP32)
+    stream_state_l = pl.create_tensor([HCA_QUERY_TILE * H, 1], dtype=pl.FP32)
+    stream_heads = pl.create_tensor([HCA_QUERY_TILE * H, HEAD_DIM], dtype=pl.FP32)
+    cmp_partial_m = pl.create_tensor([HCA_QUERY_STATS_ROWS, 1], dtype=pl.FP32)
+    cmp_partial_l = pl.create_tensor([HCA_QUERY_STATS_ROWS, 1], dtype=pl.FP32)
+    cmp_partial_o = pl.create_tensor([HCA_QUERY_STATS_ROWS, HEAD_DIM], dtype=pl.FP32)
+    wave_completion = pl.array.create(1, pl.TASK_ID)
+    wave_completion[0] = pl.system.task_dummy(deps=[packed_init_tid, rope_cs_tid, prior_tile])
+
+    first_position = pl.read(position_ids, [request_offset + tile_base])
+    relative_start = first_position - causal_request_origin
+    physical_start = causal_request_begin + relative_start
+    group_width = pl.cast(CAUSAL_QUERY_TILE, pl.INDEX)
+    if relative_start % T_PAD == 0 and physical_start % T_PAD == 0:
+        group_width = pl.cast(T_PAD, pl.INDEX)
+    for group in pl.range((tile_rows + group_width - 1) // group_width):
+        group_base = group * group_width
+        group_rows = pl.min(group_width, tile_rows - group_base)
+        last_query = request_offset + tile_base + group_base + group_rows - 1
+        causal_prior_group = wave_completion[0]
+        causal_group_ready = causal_query_ready(
+            causal_signal, causal_required, causal_epoch_base,
+            last_query // CAUSAL_QUERY_TILE, causal_prior_group,
+        )
+        tile_cmp_work_count = pl.create_tensor([1], dtype=pl.INT32)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="causal_hca_cmp_plan", deps=[causal_group_ready]) as cmp_plan_tid:
+            plan_max_pos = pl.read(position_ids, [last_query])
+            plan_visible_rows = pl.max((plan_max_pos + 1) // HCA_COMPRESS_RATIO, 0)
+            plan_work_count = (plan_visible_rows + HCA_ATTN_TILE - 1) // HCA_ATTN_TILE
+            plan_work_count = pl.min(plan_work_count, pl.cast(HCA_CMP_WORK_COUNT, pl.INDEX))
+            pl.write(tile_cmp_work_count, [0], pl.cast(plan_work_count, pl.INT32))
+        if False:
+            causal_hca_specialize_cmp_work_kv = pl.create_tensor([HCA_CMP_PAD_ROWS, HEAD_DIM], dtype=pl.BF16)
+            causal_hca_specialize_cmp_work_valid = pl.create_tensor([HCA_CMP_WORK_COUNT, HCA_WORK_VALID_STRIDE], dtype=pl.INT32)
+            _causal_reader_prefill_hca_stream_cmp_gather(cmp_block_num, cmp_block_table, cmp_kv_flat, causal_hca_specialize_cmp_work_kv, causal_hca_specialize_cmp_work_valid, tile_cmp_work_count)
+        (cmp_work_kv, cmp_work_valid), cmp_gather_tid = pl.spmd_submit(
+            self._causal_reader_prefill_hca_stream_cmp_gather,  # noqa: F821 - materialized by @pl.jit
+            cmp_block_num, cmp_block_table, pl.no_dep(cmp_kv_flat), cmp_work_kv, cmp_work_valid, tile_cmp_work_count,
+            core_num=HCA_CMP_WORK_COUNT, deps=[cmp_plan_tid],
+        )
+        wave_completion[0] = pl.system.task_dummy(deps=[causal_group_ready, cmp_gather_tid, rope_cs_tid])
+        for group_wave in pl.range(0, group_rows, HCA_QUERY_TILE):
+            dense_query_base = group_base + group_wave
+            causal_prior_wave = wave_completion[0]
+            causal_wave_ready = causal_query_ready(
+                causal_signal, causal_required, causal_epoch_base,
+                (request_offset + tile_base + dense_query_base) // CAUSAL_QUERY_TILE,
+                causal_prior_wave,
+            )
+            wave_completion[0] = causal_wave_ready
+            _hca_streaming_wave(
+                q, ori_kv, swa_indices, cmp_work_kv, cmp_work_valid,
+                position_ids, attn_sink, active_rows, o_packed_heads,
+                raw_kv, raw_valid, stream_state_m, stream_state_l, stream_heads,
+                cmp_partial_m, cmp_partial_l, cmp_partial_o,
+                rope_cos_il, rope_sin_signed, wave_completion,
+                request_offset, tile_base, dense_query_base,
+            )
+    heads_complete_tid = pl.system.task_dummy(deps=[wave_completion[0]])
+    act_tid = _sparse_attn_o_proj(
+        o_packed_heads, wo_a, wo_b, wo_b_scale, attn_out,
+        request_offset + tile_base, tile_rows, heads_complete_tid, o_proj_weight_dep,
+    )
+    return act_tid
+
+
+
+@pl.jit.inline(auto_scope=False)
+def _causal_prefill_hca_stream_raw_gather_body(
+    ori_kv_flat: pl.Tensor,
+    query_base: pl.Scalar[pl.INDEX],
+    raw_kv: pl.Tensor,
+    raw_valid: pl.Tensor,
+    request_end: pl.Scalar[pl.INDEX],
+    swa_indices: pl.Tensor,
+):
+    """Compute the cache-reader block for prefill_hca_stream_raw_gather."""
+    gather_block = pl.tile.get_block_idx()
+    gather_local_t0 = gather_block * HCA_GATHER_TOKEN_TILE
+    for gather_dt in pl.range(HCA_GATHER_TOKEN_TILE):
+        gather_local_t = gather_local_t0 + gather_dt
+        gather_t = query_base + gather_local_t
+        gather_dst = gather_local_t * WIN
+        raw_stage = pl.full([WIN, HEAD_DIM], dtype=pl.BF16, value=0.0)
+        valid_stage = pl.full([1, WIN], dtype=pl.FP32, value=0.0)
+        if gather_t < request_end:
+            for gather_k in pl.range(WIN):
+                gather_row_i32 = pl.read(swa_indices, [gather_t, gather_k])
+                if gather_row_i32 >= 0:
+                    gather_row = pl.cast(gather_row_i32, pl.INDEX)
+                    gather_kv = ori_kv_flat[gather_row : gather_row + 1, 0:HEAD_DIM]
+                    raw_stage[gather_k : gather_k + 1, 0:HEAD_DIM] = gather_kv
+                    pl.write(valid_stage, [0, gather_k], 1.0)
+        raw_kv[gather_dst : gather_dst + WIN, 0:HEAD_DIM] = raw_stage
+        raw_valid[gather_local_t : gather_local_t + 1, 0:WIN] = valid_stage
+
+
+
+@pl.jit.inline(auto_scope=False)
+def _causal_prefill_hca_stream_cmp_gather_body(
+    cmp_block_num: pl.Scalar[pl.INDEX],
+    cmp_block_table: pl.Tensor,
+    cmp_kv_flat: pl.Tensor,
+    cmp_work_kv: pl.Tensor,
+    cmp_work_valid: pl.Tensor,
+    tile_cmp_work_count: pl.Tensor,
+):
+    """Compute the cache-reader block for prefill_hca_stream_cmp_gather."""
+    gather_work = pl.tile.get_block_idx()
+    pl.write(cmp_work_valid, [gather_work, 0], pl.cast(0, pl.INT32))
+    gather_active_count_i32 = pl.read(tile_cmp_work_count, [0])
+    if pl.cast(gather_work, pl.INT32) < gather_active_count_i32:
+        gather_dst0 = gather_work * HCA_ATTN_TILE
+        for gather_page in pl.range(HCA_CMP_PAGES_PER_WORK):
+            gather_table_col = gather_work * HCA_CMP_PAGES_PER_WORK + gather_page
+            gather_local = gather_page * HCA_CMP_STORAGE_BLOCK_SIZE
+            gather_dst = gather_dst0 + gather_local
+            # Preserve the manually managed workspace identity across gather writes.
+            gather_zero = pl.tile.full([HCA_CMP_STORAGE_BLOCK_SIZE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+            pl.store(gather_zero, [gather_dst, 0], cmp_work_kv)
+            gather_block_i32 = pl.read(cmp_block_table, [gather_table_col])
+            if gather_block_i32 >= 0:
+                if gather_block_i32 < cmp_block_num:
+                    if gather_page == 0:
+                        pl.write(cmp_work_valid, [gather_work, 0], pl.cast(1, pl.INT32))
+                    gather_block = pl.cast(gather_block_i32, pl.INDEX)
+                    gather_src = gather_block * HCA_CMP_STORAGE_BLOCK_SIZE
+                    gather_page_kv = pl.load(cmp_kv_flat, [gather_src, 0], [HCA_CMP_STORAGE_BLOCK_SIZE, HEAD_DIM])
+                    pl.store(gather_page_kv, [gather_dst, 0], cmp_work_kv)
+
+
+
+@pl.jit.incore
+def _causal_reader_prefill_hca_stream_raw_gather(
+    ori_kv_flat: pl.Tensor,
+    query_base: pl.Scalar[pl.INDEX],
+    raw_kv: pl.InOut[pl.Tensor[[HCA_QUERY_TILE * WIN, HEAD_DIM], pl.BF16]],
+    raw_valid: pl.InOut[pl.Tensor[[HCA_QUERY_TILE, WIN], pl.FP32]],
+    request_end: pl.Scalar[pl.INDEX],
+    swa_indices: pl.Tensor,
+):
+    """Read the persistent cache through explicit NoDep arguments."""
+    _causal_prefill_hca_stream_raw_gather_body(ori_kv_flat, query_base, raw_kv, raw_valid, request_end, swa_indices)
+    return raw_kv, raw_valid
+
+
+
+@pl.jit.incore
+def _causal_reader_prefill_hca_stream_cmp_gather(
+    cmp_block_num: pl.Scalar[pl.INDEX],
+    cmp_block_table: pl.Tensor,
+    cmp_kv_flat: pl.Tensor,
+    cmp_work_kv: pl.InOut[pl.Tensor[[HCA_CMP_PAD_ROWS, HEAD_DIM], pl.BF16]],
+    cmp_work_valid: pl.InOut[pl.Tensor[[HCA_CMP_WORK_COUNT, HCA_WORK_VALID_STRIDE], pl.INT32]],
+    tile_cmp_work_count: pl.Tensor,
+):
+    """Read the persistent cache through explicit NoDep arguments."""
+    _causal_prefill_hca_stream_cmp_gather_body(cmp_block_num, cmp_block_table, cmp_kv_flat, cmp_work_kv, cmp_work_valid, tile_cmp_work_count)
+    return cmp_work_kv, cmp_work_valid
+
+
+
+@pl.jit.inline(auto_scope=False)
+def _causal_gather_ori_kv_body(
+    gather_blocks: pl.Scalar[pl.INDEX],
+    query_base: pl.Scalar[pl.INDEX],
+    t_dim: pl.Scalar[pl.INDEX],
+    active_rows: pl.Scalar[pl.INDEX],
+    swa_indices: pl.Tensor,
+    sparse_bias: pl.Tensor,
+    cmp_indices: pl.Tensor,
+    local_request_ids: pl.Tensor,
+    valid_block_mask: pl.Tensor,
+    sparse_kv: pl.Tensor,
+    ori_kv_flat: pl.Tensor,
+):
+    """Compute the unchanged gather_ori_kv reader body."""
+    gather_schedule_block = pl.tile.get_block_idx()
+    gather_token_block = gather_blocks - 1 - gather_schedule_block
+    gather_local_t0 = gather_token_block * GATHER_TOKEN_TILE
+    gather_bias_t0 = query_base + gather_local_t0
+    if gather_bias_t0 < t_dim and gather_bias_t0 < active_rows:
+        gather_bias_rows = pl.min(GATHER_TOKEN_TILE, pl.min(t_dim, active_rows) - gather_bias_t0)
+        gather_bias_win_rows = pl.slice(swa_indices, [GATHER_TOKEN_TILE, WIN], [gather_bias_t0, 0], valid_shape=[gather_bias_rows, WIN])
+        gather_bias_win_idx = pl.cast(gather_bias_win_rows, target_type=pl.FP32)
+        gather_bias_win_flag = pl.minimum(pl.maximum(pl.add(gather_bias_win_idx, 1.0), 0.0), 1.0)
+        gather_bias_win = pl.mul(pl.sub(gather_bias_win_flag, 1.0), -FP32_NEG_INF)
+        sparse_bias[gather_local_t0 : gather_local_t0 + GATHER_TOKEN_TILE, 0:WIN] = gather_bias_win
+        if SPARSE_CMP_BIAS_COLS > 0:
+            gather_bias_cmp_rows = pl.slice(cmp_indices, [GATHER_TOKEN_TILE, SPARSE_CMP_BIAS_COLS], [gather_bias_t0, 0], valid_shape=[gather_bias_rows, SPARSE_CMP_BIAS_COLS])
+            gather_bias_cmp_idx = pl.cast(gather_bias_cmp_rows, target_type=pl.FP32)
+            gather_bias_cmp_flag = pl.minimum(pl.maximum(pl.add(gather_bias_cmp_idx, 1.0), 0.0), 1.0)
+            gather_bias_cmp = pl.mul(pl.sub(gather_bias_cmp_flag, 1.0), -FP32_NEG_INF)
+            sparse_bias[gather_local_t0 : gather_local_t0 + GATHER_TOKEN_TILE, WIN:SPARSE_BIAS_COLS] = gather_bias_cmp
+        if PREFILL_SPARSE_PAD > SPARSE_BIAS_COLS:
+            gather_bias_pad = pl.full([GATHER_TOKEN_TILE, PREFILL_SPARSE_PAD - SPARSE_BIAS_COLS], dtype=pl.FP32, value=FP32_NEG_INF)
+            sparse_bias[gather_local_t0 : gather_local_t0 + GATHER_TOKEN_TILE, SPARSE_BIAS_COLS:PREFILL_SPARSE_PAD] = gather_bias_pad
+    for gather_dt in pl.range(GATHER_TOKEN_TILE):
+        gather_local_t = gather_local_t0 + gather_dt
+        gather_t = query_base + gather_local_t
+        if gather_t < t_dim:
+            if gather_t < active_rows:
+                request_id = pl.read(local_request_ids, [gather_t])
+                block_base = gather_local_t * PREFILL_SPARSE_PAD
+                if pl.read(valid_block_mask, [gather_t, 0]) > 0:
+                    stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                    if request_id >= 0:
+                        gather_ori_indices = pl.load(swa_indices, [gather_t, 0], [1, PREFILL_ATTN_TILE], target_memory=pl.MemorySpace.Vec)
+                        for gather_g0 in pl.range(0, PREFILL_ATTN_TILE, SPARSE_OPT_GATHER_ROW_TILE):
+                            gather_first = pl.tile.read(gather_ori_indices, [0, gather_g0])
+                            gather_contiguous = gather_first >= 0
+                            for gather_ci, (contiguous_iter,) in pl.range(1, SPARSE_OPT_GATHER_ROW_TILE, init_values=(gather_contiguous,)):
+                                gather_next = pl.tile.read(gather_ori_indices, [0, gather_g0 + gather_ci])
+                                gather_matches = contiguous_iter and gather_next == gather_first + gather_ci
+                                gather_contiguous = pl.yield_(gather_matches)
+                            if gather_contiguous:
+                                src = pl.cast(gather_first, pl.INDEX)
+                                stage[gather_g0 : gather_g0 + SPARSE_OPT_GATHER_ROW_TILE, :] = ori_kv_flat[src : src + SPARSE_OPT_GATHER_ROW_TILE, :]
+                            else:
+                                for gather_ci in pl.range(SPARSE_OPT_GATHER_ROW_TILE):
+                                    gather_ki = gather_g0 + gather_ci
+                                    gather_raw = pl.tile.read(gather_ori_indices, [0, gather_ki])
+                                    if gather_raw >= 0:
+                                        src = pl.cast(gather_raw, pl.INDEX)
+                                        stage[gather_ki : gather_ki + 1, :] = ori_kv_flat[src : src + 1, :]
+                    sparse_kv[block_base : block_base + PREFILL_ATTN_TILE, :] = stage
+
+
+@pl.jit.incore
+def _causal_reader_gather_ori_kv(
+    gather_blocks: pl.Scalar[pl.INDEX],
+    query_base: pl.Scalar[pl.INDEX],
+    t_dim: pl.Scalar[pl.INDEX],
+    active_rows: pl.Scalar[pl.INDEX],
+    swa_indices: pl.Tensor,
+    sparse_bias: pl.InOut[pl.Tensor[[PREFILL_QUERY_TILE, PREFILL_SPARSE_PAD], pl.FP32]],
+    cmp_indices: pl.Tensor,
+    local_request_ids: pl.Tensor,
+    valid_block_mask: pl.Tensor,
+    sparse_kv: pl.InOut[pl.Tensor[[PREFILL_QUERY_TILE * PREFILL_SPARSE_PAD, HEAD_DIM], pl.BF16]],
+    ori_kv_flat: pl.Tensor,
+):
+    """Read persistent caches with explicit NoDep directions."""
+    _causal_gather_ori_kv_body(gather_blocks, query_base, t_dim, active_rows, swa_indices, sparse_bias, cmp_indices, local_request_ids, valid_block_mask, sparse_kv, ori_kv_flat)
+    return sparse_kv, sparse_bias
+
+
+@pl.jit.inline(auto_scope=False)
+def _causal_gather_cmp_kv_body(
+    gather_cmp_token_blocks: pl.Scalar[pl.INDEX],
+    query_base: pl.Scalar[pl.INDEX],
+    t_dim: pl.Scalar[pl.INDEX],
+    active_rows: pl.Scalar[pl.INDEX],
+    local_request_ids: pl.Tensor,
+    valid_block_mask: pl.Tensor,
+    sparse_kv: pl.Tensor,
+    cmp_indices: pl.Tensor,
+    cmp_block_table: pl.Tensor,
+    cmp_block_num: pl.Scalar[pl.INDEX],
+    cmp_kv_flat: pl.Tensor,
+):
+    """Compute the unchanged gather_cmp_kv reader body."""
+    gather_block = pl.tile.get_block_idx()
+    gather_schedule_block = gather_block // (PREFILL_ATTN_BLOCKS - 1)
+    gather_token_block = gather_cmp_token_blocks - 1 - gather_schedule_block
+    gather_sb = gather_block - gather_schedule_block * (PREFILL_ATTN_BLOCKS - 1) + 1
+    gather_local_t0 = gather_token_block * SPARSE_OPT_CMP_GATHER_TOKEN_TILE
+    gather_k0 = gather_sb * PREFILL_ATTN_TILE
+    for gather_dt in pl.range(SPARSE_OPT_CMP_GATHER_TOKEN_TILE):
+        gather_local_t = gather_local_t0 + gather_dt
+        gather_t = query_base + gather_local_t
+        if gather_t < t_dim:
+            if gather_t < active_rows:
+                request_id = pl.read(local_request_ids, [gather_t])
+                gather_block_valid = pl.read(valid_block_mask, [gather_t, gather_sb])
+                block_base = gather_local_t * PREFILL_SPARSE_PAD + gather_k0
+                if gather_block_valid > 0:
+                    stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                    if request_id >= 0:
+                        gather_cmp_offset = gather_k0 - WIN
+                        gather_cmp_cols = pl.min(PREFILL_ATTN_TILE, IDX_TOPK - gather_cmp_offset)
+                        gather_indices = pl.load(cmp_indices, [gather_t, gather_cmp_offset], [1, PREFILL_ATTN_TILE], valid_shape=[1, gather_cmp_cols], target_memory=pl.MemorySpace.Vec)
+                        for gather_g0 in pl.range(0, PREFILL_ATTN_TILE, SPARSE_OPT_CMP_GATHER_ROW_TILE):
+                            gather_first = pl.tile.read(gather_indices, [0, gather_g0])
+                            gather_page = gather_first // BLOCK_SIZE
+                            gather_intra = gather_first - gather_page * BLOCK_SIZE
+                            gather_contiguous = gather_first >= 0 and gather_g0 + SPARSE_OPT_CMP_GATHER_ROW_TILE <= gather_cmp_cols
+                            gather_contiguous = gather_contiguous and gather_intra + SPARSE_OPT_CMP_GATHER_ROW_TILE <= BLOCK_SIZE
+                            for gather_ci, (contiguous_iter,) in pl.range(1, SPARSE_OPT_CMP_GATHER_ROW_TILE, init_values=(gather_contiguous,)):
+                                gather_next = pl.tile.read(gather_indices, [0, gather_g0 + gather_ci])
+                                gather_matches = contiguous_iter and gather_next == gather_first + gather_ci
+                                gather_contiguous = pl.yield_(gather_matches)
+                            if gather_contiguous:
+                                blk_raw = pl.read(cmp_block_table, [request_id, gather_page])
+                                if blk_raw >= 0 and blk_raw < cmp_block_num:
+                                    blk = pl.cast(blk_raw, pl.INDEX)
+                                    src = blk * BLOCK_SIZE + gather_intra
+                                    stage[gather_g0 : gather_g0 + SPARSE_OPT_CMP_GATHER_ROW_TILE, :] = cmp_kv_flat[src : src + SPARSE_OPT_CMP_GATHER_ROW_TILE, :]
+                            else:
+                                for gather_ci in pl.range(SPARSE_OPT_CMP_GATHER_ROW_TILE):
+                                    gather_ki = gather_g0 + gather_ci
+                                    gather_cmp_k = gather_cmp_offset + gather_ki
+                                    if gather_cmp_k < IDX_TOPK:
+                                        gather_raw = pl.tile.read(gather_indices, [0, gather_ki])
+                                        if gather_raw >= 0:
+                                            blk_slot = gather_raw // BLOCK_SIZE
+                                            blk_raw = pl.read(cmp_block_table, [request_id, blk_slot])
+                                            if blk_raw >= 0 and blk_raw < cmp_block_num:
+                                                blk = pl.cast(blk_raw, pl.INDEX)
+                                                src = blk * BLOCK_SIZE + (gather_raw - blk_slot * BLOCK_SIZE)
+                                                stage[gather_ki : gather_ki + 1, :] = cmp_kv_flat[src : src + 1, :]
+                    sparse_kv[block_base : block_base + PREFILL_ATTN_TILE, :] = stage
+
+
+@pl.jit.incore
+def _causal_reader_gather_cmp_kv(
+    gather_cmp_token_blocks: pl.Scalar[pl.INDEX],
+    query_base: pl.Scalar[pl.INDEX],
+    t_dim: pl.Scalar[pl.INDEX],
+    active_rows: pl.Scalar[pl.INDEX],
+    local_request_ids: pl.Tensor,
+    valid_block_mask: pl.Tensor,
+    sparse_kv: pl.InOut[pl.Tensor[[PREFILL_QUERY_TILE * PREFILL_SPARSE_PAD, HEAD_DIM], pl.BF16]],
+    cmp_indices: pl.Tensor,
+    cmp_block_table: pl.Tensor,
+    cmp_block_num: pl.Scalar[pl.INDEX],
+    cmp_kv_flat: pl.Tensor,
+):
+    """Read persistent caches with explicit NoDep directions."""
+    _causal_gather_cmp_kv_body(gather_cmp_token_blocks, query_base, t_dim, active_rows, local_request_ids, valid_block_mask, sparse_kv, cmp_indices, cmp_block_table, cmp_block_num, cmp_kv_flat)
+    return sparse_kv
+
+
+@pl.jit.inline(auto_scope=False)
+def _causal_echo_exact_order_cmp_fill_body(
+    query_base: pl.Scalar[pl.INDEX],
+    t_dim: pl.Scalar[pl.INDEX],
+    active_rows: pl.Scalar[pl.INDEX],
+    local_request_ids: pl.Tensor,
+    valid_block_mask: pl.Tensor,
+    sparse_kv: pl.Tensor,
+    cmp_indices: pl.Tensor,
+    echo_counts: pl.Tensor,
+    echo_epoch: pl.Scalar[pl.INT32],
+    cmp_block_table: pl.Tensor,
+    echo_map: pl.Tensor,
+    cmp_block_num: pl.Scalar[pl.INDEX],
+    cmp_kv_flat: pl.Tensor,
+    echo_prefetched: pl.Tensor,
+):
+    """Compute the unchanged echo_exact_order_cmp_fill reader body."""
+    gather_local_t = pl.tile.get_block_idx()
+    gather_t = query_base + gather_local_t
+    total_hits = pl.const(0, pl.INT32)
+    total_misses = pl.const(0, pl.INT32)
+    for gather_sb in pl.range(1, PREFILL_ATTN_BLOCKS):
+        gather_k0 = gather_sb * PREFILL_ATTN_TILE
+        if gather_t < t_dim:
+            if gather_t < active_rows:
+                request_id = pl.read(local_request_ids, [gather_t])
+                gather_block_valid = pl.read(valid_block_mask, [gather_t, gather_sb])
+                block_base = gather_local_t * PREFILL_SPARSE_PAD + gather_k0
+                if gather_block_valid > 0:
+                    stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                    if request_id >= 0:
+                        gather_cmp_offset = gather_k0 - WIN
+                        gather_cmp_cols = pl.min(PREFILL_ATTN_TILE, IDX_TOPK - gather_cmp_offset)
+                        gather_indices = pl.load(cmp_indices, [gather_t, gather_cmp_offset], [1, PREFILL_ATTN_TILE], valid_shape=[1, gather_cmp_cols], target_memory=pl.MemorySpace.Vec)
+                        planned = pl.read(echo_counts, [gather_local_t, 1])
+                        plan_epoch = pl.read(echo_counts, [gather_local_t, 0])
+                        hits = pl.const(0, pl.INT32)
+                        misses = pl.const(0, pl.INT32)
+                        if planned > 0 and plan_epoch == echo_epoch:
+                            for gather_ki in pl.range(PREFILL_ATTN_TILE):
+                                gather_cmp_k = gather_cmp_offset + gather_ki
+                                if gather_cmp_k < IDX_TOPK:
+                                    logical = pl.tile.read(gather_indices, [0, gather_ki])
+                                    if logical >= 0:
+                                        slot = pl.read(echo_map, [gather_local_t, logical])
+                                        if slot >= 0 and slot < IDX_TOPK:
+                                            source = gather_local_t * IDX_TOPK + slot
+                                            stage[gather_ki:gather_ki + 1, :] = echo_prefetched[source:source + 1, :]
+                                            hits = hits + pl.const(1, pl.INT32)
+                                        else:
+                                            page = logical // BLOCK_SIZE
+                                            block = pl.read(cmp_block_table, [request_id, page])
+                                            if block >= 0 and block < cmp_block_num:
+                                                source = pl.cast(block, pl.INDEX) * BLOCK_SIZE + logical % BLOCK_SIZE
+                                                stage[gather_ki:gather_ki + 1, :] = cmp_kv_flat[source:source + 1, :]
+                                                misses = misses + pl.const(1, pl.INT32)
+                        else:
+                            for gather_g0 in pl.range(0, PREFILL_ATTN_TILE, SPARSE_OPT_CMP_GATHER_ROW_TILE):
+                                gather_first = pl.tile.read(gather_indices, [0, gather_g0])
+                                gather_page = gather_first // BLOCK_SIZE
+                                gather_intra = gather_first - gather_page * BLOCK_SIZE
+                                gather_contiguous = gather_first >= 0 and gather_g0 + SPARSE_OPT_CMP_GATHER_ROW_TILE <= gather_cmp_cols
+                                gather_contiguous = gather_contiguous and gather_intra + SPARSE_OPT_CMP_GATHER_ROW_TILE <= BLOCK_SIZE
+                                for gather_ci, (contiguous_iter,) in pl.range(1, SPARSE_OPT_CMP_GATHER_ROW_TILE, init_values=(gather_contiguous,)):
+                                    gather_next = pl.tile.read(gather_indices, [0, gather_g0 + gather_ci])
+                                    gather_matches = contiguous_iter and gather_next == gather_first + gather_ci
+                                    gather_contiguous = pl.yield_(gather_matches)
+                                if gather_contiguous:
+                                    blk_raw = pl.read(cmp_block_table, [request_id, gather_page])
+                                    if blk_raw >= 0 and blk_raw < cmp_block_num:
+                                        blk = pl.cast(blk_raw, pl.INDEX)
+                                        src = blk * BLOCK_SIZE + gather_intra
+                                        stage[gather_g0 : gather_g0 + SPARSE_OPT_CMP_GATHER_ROW_TILE, :] = cmp_kv_flat[src : src + SPARSE_OPT_CMP_GATHER_ROW_TILE, :]
+                                    misses = misses + pl.const(SPARSE_OPT_CMP_GATHER_ROW_TILE, pl.INT32)
+                                else:
+                                    for gather_ci in pl.range(SPARSE_OPT_CMP_GATHER_ROW_TILE):
+                                        gather_ki = gather_g0 + gather_ci
+                                        gather_cmp_k = gather_cmp_offset + gather_ki
+                                        if gather_cmp_k < IDX_TOPK:
+                                            gather_raw = pl.tile.read(gather_indices, [0, gather_ki])
+                                            if gather_raw >= 0:
+                                                blk_slot = gather_raw // BLOCK_SIZE
+                                                blk_raw = pl.read(cmp_block_table, [request_id, blk_slot])
+                                                if blk_raw >= 0 and blk_raw < cmp_block_num:
+                                                    blk = pl.cast(blk_raw, pl.INDEX)
+                                                    src = blk * BLOCK_SIZE + (gather_raw - blk_slot * BLOCK_SIZE)
+                                                    stage[gather_ki : gather_ki + 1, :] = cmp_kv_flat[src : src + 1, :]
+                                                    misses = misses + pl.const(1, pl.INT32)
+                        if ECHO_DIAGNOSTICS != 0:
+                            total_hits = total_hits + hits
+                            total_misses = total_misses + misses
+                    sparse_kv[block_base : block_base + PREFILL_ATTN_TILE, :] = stage
+    if ECHO_DIAGNOSTICS != 0:
+        if gather_t < t_dim and gather_t < active_rows:
+            pl.write(echo_counts, [gather_local_t, 3], total_hits)
+            pl.write(echo_counts, [gather_local_t, 4], total_misses)
+
+
+@pl.jit.incore
+def _causal_reader_echo_exact_order_cmp_fill(
+    query_base: pl.Scalar[pl.INDEX],
+    t_dim: pl.Scalar[pl.INDEX],
+    active_rows: pl.Scalar[pl.INDEX],
+    local_request_ids: pl.Tensor,
+    valid_block_mask: pl.Tensor,
+    sparse_kv: pl.InOut[pl.Tensor[[PREFILL_QUERY_TILE * PREFILL_SPARSE_PAD, HEAD_DIM], pl.BF16]],
+    cmp_indices: pl.Tensor,
+    echo_counts: pl.InOut[pl.Tensor[[PREFILL_QUERY_TILE, 16], pl.INT32]],
+    echo_epoch: pl.Scalar[pl.INT32],
+    cmp_block_table: pl.Tensor,
+    echo_map: pl.Tensor,
+    cmp_block_num: pl.Scalar[pl.INDEX],
+    cmp_kv_flat: pl.Tensor,
+    echo_prefetched: pl.Tensor,
+):
+    """Read persistent caches with explicit NoDep directions."""
+    _causal_echo_exact_order_cmp_fill_body(query_base, t_dim, active_rows, local_request_ids, valid_block_mask, sparse_kv, cmp_indices, echo_counts, echo_epoch, cmp_block_table, echo_map, cmp_block_num, cmp_kv_flat, echo_prefetched)
+    return sparse_kv, echo_counts
 
 
 def golden_prefill_sparse_attn(tensors):

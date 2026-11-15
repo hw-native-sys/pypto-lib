@@ -23,18 +23,45 @@ _CSA_LAYERS = 21
 _HCA_LAYERS = 20
 
 
+def resolve_prefill_mechanisms(mechanisms, *, echo_prefetch=False, causal_ready=False):
+    """Resolve the four independent prefill mechanism plans."""
+    if type(echo_prefetch) is not bool or type(causal_ready) is not bool:
+        raise ValueError("Mechanism flags must be boolean compile selections")
+    choices = {"none": (False, False), "echo-only": (True, False), "causal-only": (False, True), "both": (True, True)}
+    if mechanisms is None:
+        return next(name for name, flags in choices.items() if flags == (echo_prefetch, causal_ready))
+    if mechanisms not in choices:
+        raise ValueError("Prefill mechanisms must be none, echo-only, causal-only, or both")
+    selected = choices[mechanisms]
+    if (echo_prefetch and not selected[0]) or (causal_ready and not selected[1]):
+        raise ValueError("Boolean mechanism flags conflict with the selected plan")
+    return mechanisms
+
+
 @contextmanager
-def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degrees=None,
-                    moe_ready=False, moe_wave_tokens=64):
+def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degrees=None, moe_ready=False, moe_wave_tokens=64,
+                    causal_ready=False, causal_full_wait=False, echo_prefetch=False, echo_diagnostics=False):
     """Isolate the private prefill operators' import-time TP8 configuration."""
     if type(moe_ready) is not bool:
         raise ValueError("Prefill MoE readiness must be a boolean compile option")
+    if type(causal_ready) is not bool or type(causal_full_wait) is not bool:
+        raise ValueError("Causal readiness options must be boolean compile options")
+    if causal_full_wait and not causal_ready:
+        raise ValueError("Full-prefix diagnostics require causal readiness")
+    if type(echo_prefetch) is not bool or type(echo_diagnostics) is not bool:
+        raise ValueError("ECHO options must be boolean compile selections")
+    if echo_prefetch and (not query_pipeline or indexer_arenas != 2):
+        raise ValueError("ECHO requires the chunk pipeline with two indexer arenas")
+    if echo_diagnostics and not echo_prefetch:
+        raise ValueError("ECHO diagnostics require ECHO prefetch")
     if type(moe_wave_tokens) is not int or moe_wave_tokens not in (8, 32, 64, 128, 1024, 2048, 8192):
         raise ValueError("Prefill MoE wave tokens must be 8, 32, 64, 128, 1024, 2048 or 8192")
     projection_degrees = dict(projection_degrees or {})
     for family, degree in projection_degrees.items():
         if family not in ("swa", "csa", "hca") or type(degree) is not int or degree not in (1, 2, 4, 8):
             raise ValueError("Projection degrees require swa/csa/hca and d=1/2/4/8")
+    if causal_ready and any(degree != 8 for degree in projection_degrees.values()):
+        raise ValueError("Causal cache readiness currently requires eight projection replicas")
     source = Path(__file__).resolve().parent / "prefill_ops"
     names = tuple(path.stem for path in source.glob("*.py"))
     missing = object()
@@ -52,6 +79,10 @@ def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degree
         sys.argv += ["--prefill-indexer-arenas", str(indexer_arenas)]
         sys.argv += ["--prefill-moe-ready", "1" if moe_ready else "0"]
         sys.argv += ["--prefill-moe-wave-tokens", str(moe_wave_tokens)]
+        sys.argv += ["--prefill-causal-ready", "1" if causal_ready else "0"]
+        sys.argv += ["--prefill-causal-full-wait", "1" if causal_full_wait else "0"]
+        sys.argv += ["--prefill-echo-prefetch", "1" if echo_prefetch else "0"]
+        sys.argv += ["--prefill-echo-diagnostics", "1" if echo_diagnostics else "0"]
         for family, degree in projection_degrees.items():
             sys.argv += ["--prefill-projection-" + family + "-d", str(degree)]
         try:
@@ -66,20 +97,32 @@ def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degree
                     sys.modules[name] = module
 
 
-def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=None,
-                         moe_ready=False, moe_wave_tokens=64):
+def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=None, moe_ready=False, moe_wave_tokens=64,
+                         causal_ready=False, causal_full_wait=False, echo_prefetch=False, echo_diagnostics=False,
+                         mechanisms=None):
     """Return the TP8 attention, MoE, tap, and head entries for compilation.
 
     Load each compile plan in a fresh setup process before creating Workers. ``chunk``
     composes all layers in one device program; ``serial`` loads the component
-    baseline for the same TP8 weights and arithmetic.
+    baseline for the same TP8 weights and arithmetic. ``attention`` exposes the
+    exact query pipeline through the component entries.
     """
-    if mode not in ("chunk", "serial"):
-        raise ValueError("Prefill mode must be chunk or serial")
+    plan = resolve_prefill_mechanisms(mechanisms, echo_prefetch=echo_prefetch, causal_ready=causal_ready)
+    echo_prefetch = plan in ("echo-only", "both")
+    causal_ready = plan in ("causal-only", "both")
+    if mechanisms is not None:
+        if indexer_arenas != 2 or not moe_ready or any(d != 8 for d in (projection_degrees or {}).values()):
+            raise ValueError("Mechanism comparisons require exact2, MoE-ready and d8")
+    if mode not in ("chunk", "serial", "attention"):
+        raise ValueError("Prefill mode must be chunk, serial, or attention")
+    if causal_ready and mode == "serial":
+        raise ValueError("Causal cache readiness requires the query pipeline")
     if mode == "serial" and indexer_arenas != 1:
         raise ValueError("Multiple indexer arenas require the chunk query pipeline")
-    with _prefill_import(query_pipeline=mode == "chunk", indexer_arenas=indexer_arenas,
-                         projection_degrees=projection_degrees, moe_ready=moe_ready, moe_wave_tokens=moe_wave_tokens):
+    with _prefill_import(query_pipeline=mode in ("chunk", "attention"), indexer_arenas=indexer_arenas,
+                        projection_degrees=projection_degrees, moe_ready=moe_ready, moe_wave_tokens=moe_wave_tokens,
+                        causal_ready=causal_ready, causal_full_wait=causal_full_wait,
+                        echo_prefetch=echo_prefetch, echo_diagnostics=echo_diagnostics):
         qkv = importlib.import_module("qkv_proj_rope")
         ordered_qkv = importlib.import_module("models.deepseek_v4_flash_lowlat.drafter.qkv_proj_rope")
         geometry = (
@@ -92,6 +135,8 @@ def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=
             raise RuntimeError("Prefill KV projection geometry differs from lowlat: " + ", ".join(mismatched))
         qkv.kv_proj_rope = ordered_qkv.kv_proj_rope
         attention = {name: importlib.import_module("prefill_" + name) for name in ("swa", "csa", "hca")}
+        if any(bool(module.CAUSAL_READY) != causal_ready for module in attention.values()):
+            raise RuntimeError("Causal readiness configuration is frozen; use a fresh setup process")
         head = importlib.import_module("models.deepseek_v4_flash_lowlat.prefill_head")
         moe = importlib.import_module("models.deepseek_v4_flash_lowlat.prefill_moe")
         if bool(moe.PREFILL_MOE_READY) != moe_ready or moe.T != moe_wave_tokens:
@@ -100,8 +145,12 @@ def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=
             raise RuntimeError("Unexpected TP8 prefill attention geometry")
         if head.TP_SIZE != _RANKS or (moe.N_RANKS, moe.N_BANK, moe.MOE_INTER) != (8, 257, 256):
             raise RuntimeError("Unexpected TP8 prefill head or MoE weight geometry")
+        if any(bool(module.ECHO_PREFETCH) != echo_prefetch or bool(module.ECHO_DIAGNOSTICS) != echo_diagnostics for module in (attention["csa"],)):
+            raise RuntimeError("ECHO configuration is frozen; use a fresh setup process")
         if mode == "chunk":
             device = importlib.import_module("models.deepseek_v4_flash_lowlat.prefill_device")
+            if device.PREFILL_MECHANISM_PLAN != (causal_ready, causal_full_wait, echo_prefetch, echo_diagnostics, indexer_arenas):
+                raise RuntimeError("Causal device plan is frozen; load each plan in a fresh setup process")
             return {"chunk": device.l3_prefill_tp8_fwd}
         programs = {name: getattr(module, "l3_prefill_attention_" + name + "_cp")
                     for name, module in attention.items()}
@@ -195,6 +244,26 @@ def advance_projection_epochs(bases, request_lengths, *, projection_degrees, lay
             for base, end, family in zip(bases, result, families)]
 
 
+def prepare_causal_bindings(*, epoch_base=0):
+    """Allocate the common rank-local cache-prefix epoch before Worker preparation."""
+    import torch
+
+    if type(epoch_base) is not int or not 0 <= epoch_base < 2**31 - 1:
+        raise ValueError("The causal epoch base must be a nonnegative INT32")
+    epochs = torch.full((_RANKS, 1), epoch_base, dtype=torch.int32)
+    return {"causal_epoch_bases": epochs.share_memory_()}
+
+
+def advance_causal_epoch(epoch_base, physical_rows, *, layers=43):
+    """Advance a successfully completed chunk's reserved physical prefix extent."""
+    if any(type(value) is not int or value < 0 for value in (epoch_base, physical_rows, layers)):
+        raise ValueError("Causal epochs, physical extents, and layer counts must be nonnegative integers")
+    end = epoch_base + physical_rows * layers
+    if end >= 2**31 - 1:
+        raise ValueError("Causal prefix counters require a fresh communication domain before INT32 overflow")
+    return end
+
+
 def prepare_prefill_bindings(worker, caches, weights, inputs, scratch):
     """Bind caller-owned TP8 weights, shared caches, input metadata and scratch."""
     from .prefill_cache import prefill_cache_views
@@ -258,6 +327,8 @@ def _attention_bindings(worker, metadata, bindings, layer, x_hc):
     for name in ("projection_peers", "projection_epoch_bases"):
         if name in rows:
             result[name] = bindings[name]
+    if "causal_epoch_bases" in rows:
+        result["causal_epoch_bases"] = bindings["causal_epoch_bases"]
     for name in ("hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w", "wq_a", "wq_b",
                  "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv", "attn_sink", "wo_b_scale"):
         result[name] = _layer_weight(worker, bindings, rows, name, name, layer, _LAYERS)
@@ -302,6 +373,10 @@ def _attention_bindings(worker, metadata, bindings, layer, x_hc):
             result["idx_block_table"] = bindings["idx_block_table"]
             result["idx_slot_mapping_full"] = bindings["csa_idx_slot_mapping_full"]
             result["inner_state_slot_mapping_full"] = bindings["csa_inner_state_slot_mapping_full"]
+            if "echo_diagnostics" in rows:
+                result["echo_diagnostics"] = bindings["echo_diagnostics"]
+                result["echo_epoch"] = bindings["echo_epoch"]
+                result["echo_first_chunk"] = bindings["echo_first_chunk"]
     return kind, result
 
 
