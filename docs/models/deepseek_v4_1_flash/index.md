@@ -187,6 +187,15 @@ The standalone entry defaults to a reduced two-layer Torch comparison;
 `--checkpoint` selects the released profile and weights, while `--patches` and
 `--grid` supply preprocessed input.
 
+Decode MoE communication launches use at most 64 AIV workers. Dispatch sends FP8
+payload and unpacked MX scale bytes in one row packet; route metadata also carries
+router-weight bits and per-source counts. Small token capacities compact and send
+expert lanes in one task. Capacities above 80 rows first build a route plan and
+then distribute matched rows evenly across send workers. Both paths preserve the
+same expert/source receive layout. Peer waits are independent tasks joined before
+gather or combine reduction. Combine reduces two token rows per worker iteration,
+including the shared-expert contribution, with zero padding for inactive rows.
+
 ## Development priorities
 
 | Field | Current priority |
