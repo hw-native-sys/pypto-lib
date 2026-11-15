@@ -225,7 +225,7 @@ def build_swa_specs(args):
     import torch
     from functools import partial
     from utils import packed_query_lengths, window_metadata
-    from quant import quantize_mxfp8_cache
+    from quant import generate_quantized_cache, quantize_mxfp8_cache
     import math
     from quant import pack_fp8_nz, pack_mx_b_scale
     from quant import quantize_mxfp8_upward_reference, quantize_grouped_mxfp8_weight
@@ -242,7 +242,7 @@ def build_swa_specs(args):
         if query_lens is None and args.requests > 1 and lengths[-1] > 16:
             lengths[0] += 7
             lengths[-1] -= 7
-        prefixes = ([127, 128, 511, 1048000] * 8)[:args.requests] if args.case == "prefix" else [0] * args.requests
+        prefixes = ([127, 128, 511, 1048000] * ((args.requests + 3) // 4))[:args.requests] if args.case == "prefix" else [0] * args.requests
         if getattr(args, "start_pos", None) is not None:
             prefixes = args.start_pos
         pages = 1 + sum((p + n + 128) // 128 - max(0, p - 127) // 128 + 1 for p, n in zip(prefixes, lengths))
@@ -331,8 +331,9 @@ def build_swa_specs(args):
                 indices[row, :length] = (physical_pages[row] * 128 + logical.remainder(128)).to(torch.int32)
         frequency = 10000.0 ** (-torch.arange(0, ROPE_DIM, 2).float() / ROPE_DIM)
         angles = positions.float()[:, None] * frequency
-        cache_values = torch.randn(pages, 128, 1, HEAD_DIM, generator=cache_gen).bfloat16()
-        cache, scales = quantize_mxfp8_cache(cache_values)
+        cache, scales = generate_quantized_cache(
+            (pages, 128, 1, HEAD_DIM), quantize_mxfp8_cache, generator=cache_gen, input_dtype=torch.bfloat16,
+        )
         values.update(
             rope_cos=angles.cos(), rope_sin=angles.sin(), window_slots=slots, window_indices=indices,
             window_cache=cache, window_cache_scale=scales,
@@ -485,8 +486,6 @@ if __name__ == "__main__":
     parser.set_defaults(tokens=72, requests=12, startpos=[8192] * 12)
     args = parser.parse_args()
     configure_decode_workload(args, parser)
-    if args.tokens != 72:
-        parser.error("this decode entry requires 72 query tokens")
     args.start_pos = args.startpos
     args.dp = 1
     args.active_tokens = args.tokens

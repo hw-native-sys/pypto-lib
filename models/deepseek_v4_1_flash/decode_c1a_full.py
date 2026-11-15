@@ -451,8 +451,8 @@ def build_c1a_specs(
     from functools import partial
     from golden import ScalarSpec, TensorSpec
     from decode_indexer import index_pool_block_capacity
-    from quant import quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache
-    from utils import packed_query_lengths
+    from quant import generate_quantized_cache, quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache
+    from utils import compact_window_table, packed_query_lengths
     from rope_tables import precompute_rope_tables
     import math
 
@@ -494,8 +494,12 @@ def build_c1a_specs(
     values["window_indices"] = torch.arange(128, dtype=torch.int32).view(1, 128).expand(TOKENS, -1).contiguous()
     values["compressed_indices"] = torch.full((TOKENS, INDEX_TOPK), -1, dtype=torch.int32)
     values["compressed_indices"][:, :128] = torch.arange(128, dtype=torch.int32)
-    wc, ws = quantize_mxfp8_cache(torch.randn(cache_pages, 128, 1, HEAD_DIM))
-    cc, cs = quantize_mxfp4_cache(torch.randn(cache_pages, 128, 1, HEAD_DIM), 16, "bf16")
+    window_pages = cache_pages
+    if start_pos is not None:
+        window_table, window_pages = compact_window_table(start_pos, lengths)
+    wc, ws = generate_quantized_cache((window_pages, 128, 1, HEAD_DIM), quantize_mxfp8_cache)
+    quantize_compressed = partial(quantize_mxfp4_cache, group_size=16, scale_format="bf16")
+    cc, cs = generate_quantized_cache((cache_pages, 128, 1, HEAD_DIM), quantize_compressed)
     values["window_cache"], values["window_cache_scale"] = wc, ws
     values["compressed_cache"], values["compressed_cache_scale"] = cc, cs
     values["output"] = torch.zeros(TOKENS, D, dtype=torch.bfloat16)
@@ -511,7 +515,7 @@ def build_c1a_specs(
         from utils import window_metadata
 
         table = torch.arange(cache_pages, dtype=torch.int32).reshape(REQUESTS, PAGES)
-        slots, indices, _ = window_metadata(positions, token_to_req, table)
+        slots, indices, _ = window_metadata(positions, token_to_req, window_table)
         values["window_slots"] = slots
         values["window_indices"] = indices
         values["compressed_lens"] = (positions + 1).int()
@@ -522,13 +526,16 @@ def build_c1a_specs(
         values["compressed_indices"] = physical.masked_fill(~valid, -1).int()
         values["compressed_indices"] = values["compressed_indices"]
 
-    # Page-level index-key magnitude ladder.
-    quiet_page = torch.arange(cache_pages).remainder(PAGES) >= PAGES // 2
-    page_gain = torch.where(quiet_page, torch.full((cache_pages,), 2.0**-10), torch.ones(cache_pages))
-    keys = torch.randn(cache_pages, 128, 1, INDEX_DIM) * page_gain.view(cache_pages, 1, 1, 1)
-    ic, ics = quantize_mxfp4_cache(keys.to(torch.bfloat16), 32, "e8m0", round_to_even=True)
-    values["index_cache"], values["index_cache_scale"] = (ic, ics.view(torch.float8_e8m0fnu))
-    values["topk_indices"] = torch.zeros(TOKENS, INDEX_TOPK, dtype=torch.int32)
+    if mode != "reuse":
+        # Page-level index-key magnitude ladder.
+        quiet_page = torch.arange(cache_pages).remainder(PAGES) >= PAGES // 2
+        page_gain = torch.where(quiet_page, torch.full((cache_pages,), 2.0**-10), torch.ones(cache_pages))
+        quantize_index = partial(quantize_mxfp4_cache, group_size=32, scale_format="e8m0", round_to_even=True)
+        ic, ics = generate_quantized_cache(
+            (cache_pages, 128, 1, INDEX_DIM), quantize_index, input_dtype=torch.bfloat16, page_gain=page_gain,
+        )
+        values["index_cache"], values["index_cache_scale"] = (ic, ics.view(torch.float8_e8m0fnu))
+        values["topk_indices"] = torch.zeros(TOKENS, INDEX_TOPK, dtype=torch.int32)
     if mode == "full":
         values["compressed_rope_cos"] = values["rope_cos"].clone()
         values["compressed_rope_sin"] = values["rope_sin"].clone()

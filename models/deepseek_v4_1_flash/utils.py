@@ -24,9 +24,8 @@ def parse_decode_startpos(value):
         positions = [int(item) for item in value.split(",")]
     except ValueError as error:
         raise argparse.ArgumentTypeError("start-pos must be a comma-separated list of integers") from error
-    limit = min(C.DECODE_BATCH, C.DECODE_MAX_TOKENS)
-    if not 1 <= len(positions) <= limit:
-        raise argparse.ArgumentTypeError(f"start-pos must contain between 1 and {limit} positions")
+    if not positions:
+        raise argparse.ArgumentTypeError("start-pos must contain at least one position")
     max_start = M.max_position_embeddings - 1
     if any(position < 0 or position > max_start for position in positions):
         raise argparse.ArgumentTypeError(f"positions must be in [0, {max_start}]")
@@ -58,8 +57,6 @@ def configure_decode_workload(args, parser):
     if len(args.query_lens) != args.requests:
         parser.error("--query-lens must contain one length per --start-pos value")
     args.tokens = sum(args.query_lens)
-    if args.tokens > C.DECODE_MAX_TOKENS:
-        parser.error(f"total query tokens must not exceed {C.DECODE_MAX_TOKENS}")
     ends = [pos + length for pos, length in zip(args.startpos, args.query_lens)]
     if max(ends) > M.max_position_embeddings:
         parser.error("a query block exceeds max_position_embeddings")
@@ -179,6 +176,20 @@ def window_metadata(
     visible_requests = request_ids.unsqueeze(-1).expand_as(visible)
     indices[valid] = paged_slots(visible[valid], visible_requests[valid], block_table)
     return slots, indices.to(torch.int32), lens
+
+
+def compact_window_table(prefixes, lengths):
+    """Map each request's visible sliding-window pages and retain one unmapped control page."""
+    columns = max((prefix + length - 1) // BLOCK_SIZE + 1 for prefix, length in zip(prefixes, lengths))
+    table = torch.full((len(prefixes), columns), -1, dtype=torch.int32)
+    next_page = 0
+    for request, (prefix, length) in enumerate(zip(prefixes, lengths)):
+        first = max(0, prefix - M.sliding_window + 1) // BLOCK_SIZE
+        end = (prefix + length - 1) // BLOCK_SIZE + 1
+        count = end - first
+        table[request, first:end] = torch.arange(next_page, next_page + count, dtype=torch.int32)
+        next_page += count
+    return table, next_page + 1
 
 
 def upload_forward_inputs(runtime, specs, parameters, ranks, host_inputs, upload_buffer):
