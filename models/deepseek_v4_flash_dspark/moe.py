@@ -6,6 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# CI baseline probe: no executable changes relative to main.
 # ci: devices=2
 """DeepSeek-V4 FLASH MoE layer with DSpark expert-parallel dispatch and combine."""
 
