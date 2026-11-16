@@ -17,17 +17,27 @@ import pypto.language.distributed as pld
 import config
 
 
-def _parse_experts_per_rank():
+def parse_expert_token():
+    flags = ("--experts-per-rank", "--num-tokens", "--num-tokens-per-rank")
+    values = {}
     for index, argument in enumerate(sys.argv):
-        if argument == "--experts-per-rank" and index + 1 < len(sys.argv):
-            return int(sys.argv[index + 1])
-        if argument.startswith("--experts-per-rank="):
-            return int(argument.split("=", 1)[1])
-    return config.N_LOCAL_EXPERTS
+        flag, separator, value = argument.partition("=")
+        if flag not in flags or flag in values:
+            continue
+        if not separator:
+            if index + 1 == len(sys.argv):
+                raise ValueError(f"{flag} requires a value")
+            value = sys.argv[index + 1]
+        values[flag] = value
+    experts = int(values.get("--experts-per-rank", config.N_LOCAL_EXPERTS))
+    tokens = values.get("--num-tokens-per-rank", values.get("--num-tokens", str(config.MOE_TOKENS)))
+    counts = [int(value) for value in tokens.split(",")]
+    return experts, max(config.MOE_TOKENS, max(counts))
 
 
-# Resolve test expert dimensions before importing kernels.
-_experts_per_rank = _parse_experts_per_rank()
+# Resolve entry dimensions before importing kernels.
+_experts_per_rank, _token_capacity = parse_expert_token()
+config.set_moe_tokens((_token_capacity + 15) // 16 * 16)
 _test_experts = config.EP_SIZE * _experts_per_rank
 if _experts_per_rank <= 0 or not config.FLASH.num_experts_per_tok <= _test_experts <= 384:
     raise ValueError("--experts-per-rank must give between TopK and 384 total routed experts")
