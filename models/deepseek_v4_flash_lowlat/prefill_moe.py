@@ -15,13 +15,14 @@ from .prefill_moe_geometry import (
     D, HC_DIM, HC_MULT, MIX_HC, MOE_INTER, N_BANK, N_EXPERTS, N_RANKS,
     REDUCE_WINDOW_ROWS, REDUCE_LANE_ROWS, REDUCE_D_TILE, T_PAD, T, TOPK, VOCAB,
     COPY_T_TILE, COPY_D_TILE, REDUCE_T_TILE,
+    PREFILL_MOE_BATCHED_GATHER as PREFILL_MOE_BATCHED_GATHER, PREFILL_MOE_DIRECT_POST,
     PREFILL_MOE_OWNER_REDUCE, PREFILL_MOE_EXPERT_AFFINITY as PREFILL_MOE_EXPERT_AFFINITY, OWNER_ROWS, OWNER_REDUCE_T_TILE, OWNER_COPY_T_TILE, RESULT_WINDOW_ROWS,
 )
 
 
 from .config import _parse_int_argv
 from .prefill_moe_compute import prepare_moe, moe_local
-from .hc_post import hc_post
+from .hc_post import hc_post, T_TILE as HC_POST_T_TILE
 
 
 PREFILL_MOE_READY = _parse_int_argv("--prefill-moe-ready", 1)
@@ -161,15 +162,56 @@ def _prefill_moe_owner_publish_reduce(
                 else:
                     pld.system.wait(result_ready, [source, 0], epoch, cmp=pld.WaitCmp.Ge)
         tasks[4] = all_results
-    with pl.manual_scope():
-        with pl.spmd((T // REDUCE_T_TILE) * (D // REDUCE_D_TILE), name_hint="prefill_owner_bf16_collect", deps=[tasks[4]], allow_early_resolve=False) as collected:
-            block = pl.tile.get_block_idx()
-            t0 = (block // (D // REDUCE_D_TILE)) * REDUCE_T_TILE
-            d0 = (block % (D // REDUCE_D_TILE)) * REDUCE_D_TILE
-            value = pl.load(result, [result_base + t0, d0], [REDUCE_T_TILE, REDUCE_D_TILE])
-            pl.store(value, [t0, d0], output)
-        tasks[5] = collected
+    tasks[5] = tasks[4]
+    if PREFILL_MOE_DIRECT_POST == 0:
+        with pl.manual_scope():
+            with pl.spmd((T // REDUCE_T_TILE) * (D // REDUCE_D_TILE), name_hint="prefill_owner_bf16_collect", deps=[tasks[4]], allow_early_resolve=False) as collected:
+                block = pl.tile.get_block_idx()
+                t0 = (block // (D // REDUCE_D_TILE)) * REDUCE_T_TILE
+                d0 = (block % (D // REDUCE_D_TILE)) * REDUCE_D_TILE
+                value = pl.load(result, [result_base + t0, d0], [REDUCE_T_TILE, REDUCE_D_TILE])
+                pl.store(value, [t0, d0], output)
+            tasks[5] = collected
     return tasks[5]
+
+
+@pl.jit.inline
+def _prefill_moe_direct_post(
+    result: pld.DistributedTensor[[RESULT_WINDOW_ROWS, D], pl.BF16],
+    residual: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    post: pl.Tensor[[T, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[T, HC_MULT * HC_MULT], pl.FP32],
+    output: pl.Tensor[[PREFILL_ROWS, HC_MULT, D], pl.FP32],
+    result_base: pl.Scalar[pl.INDEX],
+    output_base: pl.Scalar[pl.INDEX],
+    active: pl.Scalar[pl.INDEX],
+    reduced: pl.Scalar[pl.TASK_ID],
+):
+    """Apply ordered HC post from the completed BF16 lane into final token rows."""
+    residual_flat = pl.reshape(residual, [T, HC_DIM])
+    output_rows = pl.tensor.dim(output, 0)
+    output_flat = pl.reshape(output, [output_rows, HC_DIM])
+    with pl.spmd(((T + HC_POST_T_TILE - 1) // HC_POST_T_TILE) * HC_MULT, name_hint="prefill_moe_direct_post", deps=[reduced], allow_early_resolve=True) as posted:
+        block = pl.tile.get_block_idx()
+        token_block = block // HC_MULT
+        out_h = block % HC_MULT
+        t0 = token_block * HC_POST_T_TILE
+        token_end = pl.min(t0 + HC_POST_T_TILE, active)
+        for t in pl.pipeline(t0, token_end, stage=2):
+            post_w = pl.read(post, [t, out_h])
+            source_row = result_base + t
+            x_row = pl.cast(result[source_row:source_row + 1, 0:D], target_type=pl.FP32)
+            y_row = pl.mul(x_row, post_w)
+            for in_h in pl.pipeline(HC_MULT, stage=4):
+                comb_w = pl.read(comb, [t, in_h * HC_MULT + out_h])
+                res_d = in_h * D
+                res_row = residual_flat[t:t + 1, res_d:res_d + D]
+                weighted = pl.mul(res_row, comb_w)
+                y_row = pl.add(y_row, weighted)
+            destination_row = output_base + t
+            destination_col = out_h * D
+            output_flat[destination_row:destination_row + 1, destination_col:destination_col + D] = y_row
+    return posted
 
 
 @pl.jit.inline(auto_scope=False)
@@ -278,16 +320,25 @@ def prefill_moe_tp(
             reduced = _prefill_moe_publish_reduce(
                 ffn_partial, ffn_out, reduce_window, reduce_signal, result_window, result_signal, my_rank, epoch, partial_ready, previous_store,
             )
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_ready_post_gate", deps=[reduced]) as post_ready:
-                pl.write(ffn_out, [0, 0], pl.read(ffn_out, [0, 0]))
-            wave_out = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
-            hc_post(ffn_out, wave_hc, post_ffn, comb_ffn, wave_out)
-            with pl.spmd(T, name_hint="prefill_moe_ready_store", deps=[post_ready]) as store_done:
-                token = pl.tile.get_block_idx()
-                if token < active:
-                    x_hc[base + token:base + token + 1, :, :] = wave_out[token:token + 1, :, :]
-            consumed[lane] = store_done
-            stored[0] = store_done
+            if PREFILL_MOE_DIRECT_POST != 0:
+                result_base = pl.cast(((epoch - 1) % 2) * T_PAD, pl.INDEX)
+                direct_done = _prefill_moe_direct_post(
+                    result_window, wave_hc, post_ffn, comb_ffn, x_hc,
+                    result_base, base, active, reduced,
+                )
+                consumed[lane] = direct_done
+                stored[0] = direct_done
+            else:
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_ready_post_gate", deps=[reduced]) as post_ready:
+                    pl.write(ffn_out, [0, 0], pl.read(ffn_out, [0, 0]))
+                wave_out = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+                hc_post(ffn_out, wave_hc, post_ffn, comb_ffn, wave_out)
+                with pl.spmd(T, name_hint="prefill_moe_ready_store", deps=[post_ready]) as store_done:
+                    token = pl.tile.get_block_idx()
+                    if token < active:
+                        x_hc[base + token:base + token + 1, :, :] = wave_out[token:token + 1, :, :]
+                consumed[lane] = store_done
+                stored[0] = store_done
     padded = pl.tensor.dim(x_hc, 0)
     if padded > group_tokens:
         with pl.spmd(padded - group_tokens, name_hint="prefill_moe_ready_padding", deps=[stored[0]]) as padded_done:

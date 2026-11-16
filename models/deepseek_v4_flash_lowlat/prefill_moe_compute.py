@@ -15,6 +15,7 @@ from .prefill_moe_expert import expert_routed_persistent_planned
 from .prefill_moe_geometry import (
     D, HC_DIM, HC_MULT, IDX_PAD, MIX_HC, MOE_INTER, N_BANK, N_EXPERTS, N_ROUTES,
     PREFILL_MOE_EXPERT_AFFINITY, EXPERT_IDS_PAD, N_SLOTS_B, RECV_MAX, SHARED_EID, SHARED_TILES, SH_SLOT, T, TOPK, VOCAB, WORK_SLOTS_PAD,
+    PREFILL_MOE_BATCHED_GATHER, GATHER_TOKEN_TILE, SHARED_GATHER_T_TILE,
 )
 
 
@@ -109,19 +110,38 @@ def route_group(
             pl.write(work_rows, [next_slot + shared_tile], pl.cast(shared_count, pl.INT32))
 
 
-    with pl.spmd(T + 1, name_hint="route_gather", allow_early_resolve=True, deps=[scalar_tid]) as _gather_tid:
-        blk = pl.tile.get_block_idx()
-        if blk < T:
-            if blk < active_tokens:
-                for k in pl.range(TOPK):
-                    dst_row = pl.cast(pl.read(route_slot_row, [blk * TOPK + k, 0]), pl.INDEX)
-                    recv_x_flat[dst_row : dst_row + 1, :] = x_norm_i8[blk : blk + 1, :]
-        else:
-
-
-            sh_base = pl.cast(SH_SLOT * RECV_MAX, pl.INDEX)
-            for shared_t0 in pl.range(0, T, 8):
-                recv_x_flat[sh_base + shared_t0 : sh_base + shared_t0 + 8, :] = x_norm_i8[shared_t0 : shared_t0 + 8, :]
+    if PREFILL_MOE_BATCHED_GATHER != 0:
+        routed_blocks = (T + GATHER_TOKEN_TILE - 1) // GATHER_TOKEN_TILE
+        shared_blocks = (T + SHARED_GATHER_T_TILE - 1) // SHARED_GATHER_T_TILE
+        with pl.spmd(routed_blocks + shared_blocks, name_hint="route_gather_batched", allow_early_resolve=True, deps=[scalar_tid]):
+            gather_block = pl.tile.get_block_idx()
+            if gather_block < routed_blocks:
+                token_begin = gather_block * GATHER_TOKEN_TILE
+                token_end = pl.min(token_begin + GATHER_TOKEN_TILE, active_tokens)
+                for gather_token in pl.range(token_begin, token_end):
+                    source_row = x_norm_i8[gather_token:gather_token + 1, :]
+                    for route_index in pl.range(TOPK):
+                        route_id = gather_token * TOPK + route_index
+                        destination = pl.cast(pl.read(route_slot_row, [route_id, 0]), pl.INDEX)
+                        recv_x_flat[destination:destination + 1, :] = source_row
+            else:
+                shared_begin = (gather_block - routed_blocks) * SHARED_GATHER_T_TILE
+                shared_rows = pl.min(SHARED_GATHER_T_TILE, T - shared_begin)
+                shared_value = pl.slice(x_norm_i8, [SHARED_GATHER_T_TILE, D], [shared_begin, 0], valid_shape=[shared_rows, D])
+                shared_destination = SH_SLOT * RECV_MAX + shared_begin
+                recv_x_flat[shared_destination:shared_destination + SHARED_GATHER_T_TILE, :] = shared_value
+    else:
+        with pl.spmd(T + 1, name_hint="route_gather", allow_early_resolve=True, deps=[scalar_tid]) as _gather_tid:
+            blk = pl.tile.get_block_idx()
+            if blk < T:
+                if blk < active_tokens:
+                    for k in pl.range(TOPK):
+                        dst_row = pl.cast(pl.read(route_slot_row, [blk * TOPK + k, 0]), pl.INDEX)
+                        recv_x_flat[dst_row : dst_row + 1, :] = x_norm_i8[blk : blk + 1, :]
+            else:
+                sh_base = pl.cast(SH_SLOT * RECV_MAX, pl.INDEX)
+                for shared_t0 in pl.range(0, T, 8):
+                    recv_x_flat[sh_base + shared_t0 : sh_base + shared_t0 + 8, :] = x_norm_i8[shared_t0 : shared_t0 + 8, :]
 
 
 @pl.jit.inline

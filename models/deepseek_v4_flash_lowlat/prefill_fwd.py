@@ -39,9 +39,13 @@ def resolve_prefill_mechanisms(mechanisms, *, echo_prefetch=False, causal_ready=
 
 
 @contextmanager
-def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degrees=None, moe_ready=True, moe_wave_tokens=2048, moe_owner_reduce=False, moe_expert_affinity=False,
+def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degrees=None, moe_ready=True, moe_wave_tokens=2048, moe_owner_reduce=False, moe_expert_affinity=False, moe_batched_gather=False, moe_direct_post=False,
                     causal_ready=False, causal_full_wait=False, echo_prefetch=False, echo_diagnostics=False):
     """Isolate the private prefill operators' import-time TP8 configuration."""
+    if type(moe_direct_post) is not bool or (moe_direct_post and not moe_owner_reduce):
+        raise ValueError("Prefill direct post requires a boolean and owner reduction")
+    if type(moe_batched_gather) is not bool:
+        raise ValueError("Prefill batched gather must be a boolean compile option")
     if type(moe_expert_affinity) is not bool:
         raise ValueError("Prefill expert affinity must be a boolean compile option")
     if type(moe_owner_reduce) is not bool:
@@ -85,6 +89,8 @@ def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degree
         sys.argv += ["--prefill-moe-wave-tokens", str(moe_wave_tokens)]
         sys.argv += ["--prefill-moe-owner-reduce", "1" if moe_owner_reduce else "0"]
         sys.argv += ["--prefill-moe-expert-affinity", "1" if moe_expert_affinity else "0"]
+        sys.argv += ["--prefill-moe-batched-gather", "1" if moe_batched_gather else "0"]
+        sys.argv += ["--prefill-moe-direct-post", "1" if moe_direct_post else "0"]
         sys.argv += ["--prefill-causal-ready", "1" if causal_ready else "0"]
         sys.argv += ["--prefill-causal-full-wait", "1" if causal_full_wait else "0"]
         sys.argv += ["--prefill-echo-prefetch", "1" if echo_prefetch else "0"]
@@ -103,7 +109,7 @@ def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degree
                     sys.modules[name] = module
 
 
-def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=None, moe_ready=True, moe_wave_tokens=2048, moe_owner_reduce=False, moe_expert_affinity=False,
+def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=None, moe_ready=True, moe_wave_tokens=2048, moe_owner_reduce=False, moe_expert_affinity=False, moe_batched_gather=False, moe_direct_post=False,
                          causal_ready=False, causal_full_wait=False, echo_prefetch=False, echo_diagnostics=False,
                          mechanisms=None):
     """Return the TP8 attention, MoE, tap, and head entries for compilation.
@@ -126,7 +132,7 @@ def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=
     if mode == "serial" and indexer_arenas != 1:
         raise ValueError("Multiple indexer arenas require the chunk query pipeline")
     with _prefill_import(query_pipeline=mode in ("chunk", "attention"), indexer_arenas=indexer_arenas,
-                        projection_degrees=projection_degrees, moe_ready=moe_ready, moe_wave_tokens=moe_wave_tokens, moe_owner_reduce=moe_owner_reduce, moe_expert_affinity=moe_expert_affinity,
+                        projection_degrees=projection_degrees, moe_ready=moe_ready, moe_wave_tokens=moe_wave_tokens, moe_owner_reduce=moe_owner_reduce, moe_expert_affinity=moe_expert_affinity, moe_batched_gather=moe_batched_gather, moe_direct_post=moe_direct_post,
                         causal_ready=causal_ready, causal_full_wait=causal_full_wait,
                         echo_prefetch=echo_prefetch, echo_diagnostics=echo_diagnostics):
         qkv = importlib.import_module("qkv_proj_rope")
@@ -145,7 +151,7 @@ def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=
             raise RuntimeError("Causal readiness configuration is frozen; use a fresh setup process")
         head = importlib.import_module("models.deepseek_v4_flash_lowlat.prefill_head")
         moe = importlib.import_module("models.deepseek_v4_flash_lowlat.prefill_moe")
-        if bool(moe.PREFILL_MOE_READY) != moe_ready or moe.T != moe_wave_tokens or bool(moe.PREFILL_MOE_OWNER_REDUCE) != moe_owner_reduce or bool(moe.PREFILL_MOE_EXPERT_AFFINITY) != moe_expert_affinity:
+        if bool(moe.PREFILL_MOE_READY) != moe_ready or moe.T != moe_wave_tokens or bool(moe.PREFILL_MOE_OWNER_REDUCE) != moe_owner_reduce or bool(moe.PREFILL_MOE_EXPERT_AFFINITY) != moe_expert_affinity or bool(moe.PREFILL_MOE_BATCHED_GATHER) != moe_batched_gather or bool(moe.PREFILL_MOE_DIRECT_POST) != moe_direct_post:
             raise RuntimeError("Prefill MoE configuration is frozen; load each plan in a fresh process")
         if any(module.TP_SIZE != _RANKS or module.O_PROJ_LOCAL_GROUPS != 1 for module in attention.values()):
             raise RuntimeError("Unexpected TP8 prefill attention geometry")
@@ -155,7 +161,7 @@ def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=
             raise RuntimeError("ECHO configuration is frozen; use a fresh setup process")
         if mode == "chunk":
             device = importlib.import_module("models.deepseek_v4_flash_lowlat.prefill_device")
-            if device.PREFILL_MOE_OWNER_PLAN != (moe_owner_reduce, moe_expert_affinity):
+            if device.PREFILL_MOE_OWNER_PLAN != (moe_owner_reduce, moe_expert_affinity, moe_batched_gather, moe_direct_post):
                 raise RuntimeError("Prefill owner communication plan is frozen; use a fresh setup process")
             if device.PREFILL_MECHANISM_PLAN != (causal_ready, causal_full_wait, echo_prefetch, echo_diagnostics, indexer_arenas):
                 raise RuntimeError("Causal device plan is frozen; load each plan in a fresh setup process")

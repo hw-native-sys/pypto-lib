@@ -40,10 +40,20 @@ if PREFILL_MOE_OWNER_REDUCE not in (0, 1):
 PREFILL_MOE_EXPERT_AFFINITY = _parse_int_argv("--prefill-moe-expert-affinity", 0)
 if PREFILL_MOE_EXPERT_AFFINITY not in (0, 1):
     raise ValueError("Prefill expert affinity must be zero or one")
+PREFILL_MOE_BATCHED_GATHER = _parse_int_argv("--prefill-moe-batched-gather", 0)
+if PREFILL_MOE_BATCHED_GATHER not in (0, 1):
+    raise ValueError("Prefill batched gather must be zero or one")
+PREFILL_MOE_DIRECT_POST = _parse_int_argv("--prefill-moe-direct-post", 0)
+if PREFILL_MOE_DIRECT_POST not in (0, 1):
+    raise ValueError("Prefill direct post must be zero or one")
+if PREFILL_MOE_DIRECT_POST and not PREFILL_MOE_OWNER_REDUCE:
+    raise ValueError("Prefill direct post requires owner reduction")
 EXPERT_IDS_PAD = (N_BANK + 7) // 8 * 8
 
 # Expert and transport tiling.
 RECV_TILE = 16
+GATHER_TOKEN_TILE = 8
+SHARED_GATHER_T_TILE = 16
 RECV_MAX = RECV_TILE
 IDX_PAD = 8
 N_ROUTES = T * TOPK
