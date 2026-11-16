@@ -26,9 +26,14 @@ from config import (
     PREFILL_SEQ,
 )
 from prefill_metadata import REQUESTS_DYN
+from models.deepseek_v4_flash_lowlat.config import _parse_int_argv
 
 # Longest sequence the model config admits; the host-side bound on token_count.
 MAX_SEQ_LEN = M.max_position_embeddings
+
+PREFILL_OPROJ_B_BATCHED = _parse_int_argv("--prefill-oproj-b-batched", 0)
+if PREFILL_OPROJ_B_BATCHED not in (0, 1):
+    raise ValueError("Prefill O-projection B batching must be zero or one")
 
 # Sparse attention's internal physical-row geometry and runtime workspace.
 PREFILL_DENSE_TILE = 512
@@ -109,6 +114,7 @@ PROJ_B_ROW_TILE = min(128, T_PAD)
 # out of the call (the tracer rejects a bare ListComp statement).
 PA_NFRAGS = O_LORA // PROJ_A_MM_N_TILE
 PB_DSLABS = D // PROJ_B_D_TILE
+PB_JOIN_SIZE = 1 if PREFILL_OPROJ_B_BATCHED else PB_DSLABS * O_GROUPS
 PREFILL_ATTN_TILE = 128  # sparse-K rows per compile-time block
 PREFILL_ATTN_BLOCKS = (PREFILL_SPARSE_TOPK + PREFILL_ATTN_TILE - 1) // PREFILL_ATTN_TILE
 PREFILL_SPARSE_PAD = PREFILL_ATTN_BLOCKS * PREFILL_ATTN_TILE
@@ -1139,6 +1145,36 @@ def _sparse_attn_heads(
     return o_packed_heads, merge_tids[0]
 
 
+@pl.jit.inline
+def _prefill_o_proj_b_compute(
+    o_r_i8: pl.Tensor[[T_PAD, O_GROUPS * O_LORA], pl.INT8],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
+    partials: pl.Tensor[[T_PAD, O_GROUPS * D], pl.INT32],
+    g: pl.Scalar[pl.INDEX],
+    d0: pl.Scalar[pl.INDEX],
+    proj_b_rows: pl.Scalar[pl.INDEX],
+):
+    col_g = g * O_LORA
+    for nf in pl.range(PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
+        n0 = d0 + nf * PROJ_B_MM_N_TILE
+        for pb_rb in pl.range(proj_b_rows):
+            pb_r0 = pb_rb * PROJ_B_ROW_TILE
+            acc_b = pl.create_tensor([1, PROJ_B_ROW_TILE, PROJ_B_MM_N_TILE], dtype=pl.INT32)
+            for kb in pl.pipeline(0, O_LORA // B_K_TILE, stage=2):
+                k0 = col_g + kb * B_K_TILE
+                wb_k0 = kb * B_K_TILE
+                b_act = o_r_i8[
+                    pb_r0 : pb_r0 + PROJ_B_ROW_TILE,
+                    k0 : k0 + B_K_TILE,
+                ]
+                b_weight = wo_b[g : g + 1, n0 : n0 + PROJ_B_MM_N_TILE, wb_k0 : wb_k0 + B_K_TILE]
+                acc_b = pl.matmul_acc(acc_b, b_act, b_weight, b_trans=True, init_cond=(kb == 0))
+            acc_b_2d = pl.reshape(acc_b, [PROJ_B_ROW_TILE, PROJ_B_MM_N_TILE])
+            partials[
+                pb_r0 : pb_r0 + PROJ_B_ROW_TILE, g * D + n0 : g * D + n0 + PROJ_B_MM_N_TILE
+            ] = acc_b_2d
+
+
 @pl.jit.inline(auto_scope=False)
 def _sparse_attn_o_proj(
     o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16],
@@ -1161,7 +1197,7 @@ def _sparse_attn_o_proj(
     partials = pl.create_tensor([T_PAD, O_GROUPS * D], dtype=pl.INT32)
     proj_a_tids = pl.array.create(O_GROUPS * PA_NFRAGS, pl.TASK_ID)
     quant_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
-    proj_b_tids = pl.array.create(PB_DSLABS * O_GROUPS, pl.TASK_ID)
+    proj_b_tids = pl.array.create(PB_JOIN_SIZE, pl.TASK_ID)
     # Round physical tails up to a complete proj_a tile; only the final store
     # writes active rows.
     o_compute_rows = ((tile_rows + PROJ_A_ROW_TILE - 1) // PROJ_A_ROW_TILE) * PROJ_A_ROW_TILE
@@ -1232,40 +1268,28 @@ def _sparse_attn_o_proj(
                     ] = oq_i8
             quant_tids[g] = q_tid
 
-        # proj_b_mm[dc, g]: INT8 GEMM of group g's contribution to a PROJ_B_D_TILE-wide slab
-        # of D, written as INT32 partials[:, g*D+n]. init_cond overwrites the accumulator on
-        # the first K step; accumulating from a zero carry trips TLOAD DN->NZ (pypto#1540).
-        for dc in pl.parallel(PB_DSLABS):
-            d0 = dc * PROJ_B_D_TILE
-            for g in pl.range(O_GROUPS):
-                col_g = g * O_LORA
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_b_mm", deps=[quant_tids[g]]) as pb_tid:
-                    for nf in pl.range(PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
-                        n0 = d0 + nf * PROJ_B_MM_N_TILE
-                        for pb_rb in pl.range(proj_b_rows):
-                            pb_r0 = pb_rb * PROJ_B_ROW_TILE
-                            acc_b = pl.create_tensor([1, PROJ_B_ROW_TILE, PROJ_B_MM_N_TILE], dtype=pl.INT32)
-                            for kb in pl.pipeline(0, O_LORA // B_K_TILE, stage=2):
-                                k0 = col_g + kb * B_K_TILE
-                                wb_k0 = kb * B_K_TILE
-                                b_act = o_r_i8[
-                                    pb_r0 : pb_r0 + PROJ_B_ROW_TILE,
-                                    k0 : k0 + B_K_TILE,
-                                ]
-                                b_weight = wo_b[g : g + 1, n0 : n0 + PROJ_B_MM_N_TILE, wb_k0 : wb_k0 + B_K_TILE]
-                                acc_b = pl.matmul_acc(acc_b, b_act, b_weight, b_trans=True, init_cond=(kb == 0))
-                            acc_b_2d = pl.reshape(acc_b, [PROJ_B_ROW_TILE, PROJ_B_MM_N_TILE])
-                            partials[
-                                pb_r0 : pb_r0 + PROJ_B_ROW_TILE, g * D + n0 : g * D + n0 + PROJ_B_MM_N_TILE
-                            ] = acc_b_2d
-                proj_b_tids[dc * O_GROUPS + g] = pb_tid
+        # Preserve each INT8 block and expose independent output slabs together.
+        if PREFILL_OPROJ_B_BATCHED != 0:
+            with pl.spmd(PB_DSLABS * O_GROUPS, name_hint="proj_b_mm_batched", deps=[quant_tids[i] for i in range(O_GROUPS)]) as batched_b_tid:
+                b_block = pl.tile.get_block_idx()
+                b_group = b_block % O_GROUPS
+                b_d0 = (b_block // O_GROUPS) * PROJ_B_D_TILE
+                _prefill_o_proj_b_compute(o_r_i8, wo_b, partials, b_group, b_d0, proj_b_rows)
+            proj_b_tids[0] = batched_b_tid
+        else:
+            for dc in pl.parallel(PB_DSLABS):
+                d0 = dc * PROJ_B_D_TILE
+                for g in pl.range(O_GROUPS):
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_b_mm", deps=[quant_tids[g]]) as pb_tid:
+                        _prefill_o_proj_b_compute(o_r_i8, wo_b, partials, g, d0, proj_b_rows)
+                    proj_b_tids[dc * O_GROUPS + g] = pb_tid
 
     # Dequantize and sum per-group INT32 partials into the BF16 output.
     act_t_blks = (tile_rows + PROJ_B_ACT_TASK_T_TILE - 1) // PROJ_B_ACT_TASK_T_TILE
     act_blocks = (D // PROJ_B_ACT_N_TILE) * act_t_blks
     with pl.spmd(
         act_blocks, name_hint="proj_b_act",
-        deps=[proj_b_tids[i] for i in range(PB_DSLABS * O_GROUPS)],
+        deps=[proj_b_tids[i] for i in range(PB_JOIN_SIZE)],
     ) as act_tid:
         act_idx = pl.tile.get_block_idx()
         nreg = act_idx // act_t_blks

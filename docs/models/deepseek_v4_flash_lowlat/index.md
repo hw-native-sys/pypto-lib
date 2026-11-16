@@ -149,6 +149,11 @@ replicated `wo_a` and `wo_b` inputs have been removed. Callers bind the actual
 generated metadata and regenerate older native artifacts. The standalone
 forward's golden-facing entry retains its full-weight reference inputs.
 
+The experimental prefill option `--prefill-oproj-b-batched` groups independent
+O-projection B output slabs in one grid while retaining the existing GEMM
+fragments and ordered epilogue. It defaults off and changes no decode path.
+See [the dispatch batching notes](prefill_oproj_batch.md) for its scope.
+
 ## Precision contract
 
 The native HC stream uses FP32 at `hc_pre` input and `hc_post` residual/output,
