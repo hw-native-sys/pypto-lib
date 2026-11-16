@@ -26,20 +26,6 @@ __tf__ __aicore__ inline void normalize_quantize(
     auto codes = (__ubuf__ uint16_t*)__cce_get_tile_ptr(scales);
     auto gamma = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(weight);
     auto rms = (__ubuf__ float*)__cce_get_tile_ptr(rms_scratch);
-#if defined(__CPU_SIM)
-    for (int row = 0; row < rows; ++row) {
-        float sum = 0.0f;
-        for (int k = 0; k < 1280; ++k) {
-            float x = static_cast<float>(src[row * 1280 + k]);
-            sum += x * x;
-        }
-        float inverse = 1.0f / std::sqrt(sum / 1280.0f + 1.0e-6f);
-        for (int k = 0; k < 1280; ++k) {
-            dst[row * 1280 + k] = static_cast<bfloat16_t>(
-                static_cast<float>(src[row * 1280 + k]) * inverse * static_cast<float>(gamma[k]));
-        }
-    }
-#else
     __VEC_SCOPE__ {
         MaskReg full = pset_b32(PAT_ALL);
         uint32_t half_count = 32, byte_count = 64, scalar_count = 1;
@@ -103,7 +89,6 @@ __tf__ __aicore__ inline void normalize_quantize(
             }
         }
     }
-#endif
 }
 #endif
 }
@@ -136,9 +121,6 @@ __aicore__ inline void normalize_chunk(__gm__ int64_t* args, int first, int rows
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     normalize_quantize(normalized.data(), output.data(), scales.data(), input.data(), weight.data(), rms_scratch.data(), rows, row_tile);
-#if defined(__CPU_SIM)
-    quantize<1280, decltype(normalized)>(output.data(), scales.data(), normalized.data(), rows);
-#endif
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     if (rows > 0) {

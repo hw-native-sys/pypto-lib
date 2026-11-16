@@ -192,6 +192,20 @@ standalone forms cannot drift. `decode_prepare` lowers the packed input
 IDs and the paged-cache metadata on device; `utils` is its host-side torch
 counterpart used by the test fixtures.
 
+The input projection folds the positive RMS inverse into the activation
+dequantization scale. Its shared kernel and Torch reference quantize
+`hidden * (norm_weight * smooth_weight)` with round-to-nearest-even and direct
+FP32 division for the quantization multiplier. The amax floor before this
+folding is `INT8_AMAX_EPS / rms_inverse`, preserving the normalized-input
+floor for small values. This order keeps INT8 decisions independent of small
+RMS reduction differences; normalizing before quantization can change codes
+at half-integer boundaries despite being algebraically equivalent.
+
+Default decode and prefill projection validation mixes standard-normal rows
+with zero and signed floor-active rows, including each input in isolation.
+Unit-weight output channels make a regression in either input's amax floor
+exceed the unchanged output comparator tolerances.
+
 ## How it was optimized
 
 [DeepSeek V4 decode optimization](decode_optimization.md)

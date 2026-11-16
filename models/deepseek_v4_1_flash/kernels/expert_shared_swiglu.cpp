@@ -16,11 +16,6 @@
 // events so the next item's TLOAD overlaps the current item's VF.
 //
 #include <cstdint>
-#if defined(__CPU_SIM)
-#include <algorithm>
-#include <cmath>
-#include <cstring>
-#endif
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
 #include "intrinsic.h"
@@ -40,7 +35,7 @@ __aicore__ inline int64_t stride(__gm__ int64_t* args, int i) {
 __aicore__ inline int64_t dim(__gm__ int64_t* args, int i, int d) {
     return reinterpret_cast<__gm__ Tensor*>(args[i])->shapes[d];
 }
-#if defined(__DAV_VEC__) && !defined(__CPU_SIM)
+#if defined(__DAV_VEC__)
 constexpr int ROW_TILE = 16;
 constexpr int GROUP = 32;
 constexpr int COL_TILE = 2 * GROUP;                   // one MX scale-group pair
@@ -421,9 +416,7 @@ __aicore__ inline void run_native(__gm__ int64_t* args) {
 #endif
 } // namespace
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-#if defined(__CPU_SIM)
-    (void)args;
-#elif defined(__DAV_VEC__)
+#if defined(__DAV_VEC__)
     set_mask_norm(); set_vector_mask(-1, -1); run_native(args);
 #endif
 }

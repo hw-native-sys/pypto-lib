@@ -16,12 +16,6 @@
 //   * AIC issues QK(next, 0) before PV(current, last); KV stays live through PV.
 //   * AIV taps: gather t, dequant t-1, softmax t-3, update t-4, with four drain ticks.
 #include <cstdint>
-#if defined(__CPU_SIM)
-#include <algorithm>
-#include <cmath>
-#include <limits>
-#include <vector>
-#endif
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
 #include "intrinsic.h"
@@ -58,12 +52,10 @@ constexpr int ARG_COMPRESSED_KEYS = 11;
 constexpr int ARG_BALANCED = 12;
 constexpr int PARTIAL_STRIDE = 64 * (512 + 2);
 
-#if !defined(__CPU_SIM)
 __aicore__ inline __gm__ uint32_t* ready_flags(__gm__ int64_t* args) {
     return reinterpret_cast<__gm__ uint32_t*>(data<float>(args, ARG_PARTIALS) +
         (int64_t)2 * get_block_num(args) * PARTIAL_STRIDE);
 }
-#endif
 
 
 constexpr int DIM = 512;
@@ -297,7 +289,7 @@ __aicore__ inline TileTask make_task(__gm__ int64_t* args, const WorkPlan& plan,
     return task;
 }
 
-#if defined(__DAV_CUBE__) && !defined(__CPU_SIM)
+#if defined(__DAV_CUBE__)
 template <pipe_t Pipe>
 __aicore__ inline void signal_both(int flag) {
     set_intra_block(Pipe, flag);
@@ -542,7 +534,7 @@ __aicore__ inline void attend_cube(__gm__ int64_t* args) {
 }
 #endif
 
-#if defined(__DAV_VEC__) && !defined(__CPU_SIM)
+#if defined(__DAV_VEC__)
 template <bool FP4>
 __aicore__ inline void gather_rows(__gm__ uint8_t* cache, __gm__ const int32_t* indices, int raw_base) {
     constexpr int row_bytes = FP4 ? 320 : 544;
@@ -886,101 +878,11 @@ __aicore__ inline void attend_vector(__gm__ int64_t* args) {
 }
 #endif
 
-#if defined(__CPU_SIM)
-float decode_byte(uint8_t code, bool fp4) {
-    if (fp4) {
-        const float magnitude[8] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6};
-        return magnitude[code & 7] * (code & 8 ? -1.0f : 1.0f);
-    }
-    int exponent = (code >> 3) & 15;
-    int mantissa = code & 7;
-    float value = exponent == 0 ? mantissa / 512.0f : std::ldexp(1.0f + mantissa / 8.0f, exponent - 7);
-    if (exponent == 15 && mantissa == 7) value = std::numeric_limits<float>::quiet_NaN();
-    return code & 128 ? -value : value;
-}
-
-void simulate_attention(__gm__ int64_t* args) {
-    int heads = args[ARG_HEADS];
-    int keys = args[ARG_WINDOW_KEYS] + args[ARG_COMPRESSED_KEYS];
-    auto query = data<bfloat16_t>(args, ARG_QUERY);
-    auto output = data<bfloat16_t>(args, ARG_OUTPUT);
-    auto sink = data<float>(args, ARG_SINK);
-    int64_t sink_stride = row_stride(args, ARG_SINK);
-    for (int token = get_block_idx(args); token < args[ARG_TOKENS]; token += get_block_num(args)) {
-        std::vector<float> numerator(heads * 512, 0.0f), maximum(heads, -1e30f), denominator(heads, 0.0f);
-        std::vector<float> kv(128 * 512), scores(128);
-        std::vector<bool> valid(128);
-        for (int part = 0; part < keys; part += 128) {
-            bool fp4 = part >= args[ARG_WINDOW_KEYS];
-            int payload_arg = fp4 ? ARG_COMPRESSED : ARG_WINDOW;
-            int index_arg = fp4 ? ARG_COMPRESSED_INDICES : ARG_WINDOW_INDICES;
-            int width = fp4 ? 320 : 544;
-            int groups = width / sizeof(bfloat16_t);
-            auto payload = data<uint8_t>(args, payload_arg);
-            auto scales = reinterpret_cast<__gm__ bfloat16_t*>(payload + (fp4 ? 256 : 512));
-            auto indices = data<int32_t>(args, index_arg) + token * row_stride(args, index_arg);
-            for (int k = 0; k < 128; ++k) {
-                int physical = indices[part + k - (fp4 ? args[ARG_WINDOW_KEYS] : 0)];
-                valid[k] = physical >= 0;
-                for (int d = 0; d < 512; ++d) {
-                    float value = 0;
-                    if (valid[k]) {
-                        uint8_t code = payload[(int64_t)physical * width + (fp4 ? d / 2 : d)];
-                        if (fp4) code = (code >> ((d % 2) * 4)) & 15;
-                        float factor = static_cast<float>(scales[(int64_t)physical * groups + d / (fp4 ? 16 : 32)]);
-                        value = static_cast<float>(static_cast<bfloat16_t>(decode_byte(code, fp4) * factor));
-                    }
-                    kv[k * 512 + d] = value;
-                }
-            }
-            for (int h = 0; h < heads; ++h) {
-                float next = maximum[h];
-                for (int k = 0; k < 128; ++k) {
-                    float dot = 0;
-                    if (valid[k]) {
-                        for (int d = 0; d < 512; ++d) {
-                            dot += static_cast<float>(query[token * row_stride(args, ARG_QUERY) + h * 512 + d]) *
-                                   kv[k * 512 + d];
-                        }
-                    }
-                    scores[k] = valid[k] ? dot * 0.0441941731f : -1e30f;
-                    next = std::max(next, scores[k]);
-                }
-                float correction = std::exp(maximum[h] - next);
-                denominator[h] *= correction;
-                for (int d = 0; d < 512; ++d) numerator[h * 512 + d] *= correction;
-                for (int k = 0; k < 128; ++k) {
-                    float probability = valid[k] ? std::exp(scores[k] - next) : 0;
-                    denominator[h] += probability;
-                    float rounded = static_cast<float>(static_cast<bfloat16_t>(probability));
-                    for (int d = 0; d < 512; ++d) numerator[h * 512 + d] += rounded * kv[k * 512 + d];
-                }
-                maximum[h] = next;
-            }
-        }
-        for (int h = 0; h < heads; ++h) {
-            float sink_value = sink[h * sink_stride];
-            float final_max = std::max(maximum[h], sink_value);
-            float correction = std::exp(maximum[h] - final_max);
-            float factor = correction / (denominator[h] * correction + std::exp(sink_value - final_max));
-            for (int d = 0; d < 512; ++d) {
-                output[token * row_stride(args, ARG_OUTPUT) + h * 512 + d] =
-                    static_cast<bfloat16_t>(numerator[h * 512 + d] * factor);
-            }
-        }
-    }
-}
-#endif
 }  // namespace
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     // ABI: O, Q, sink, W, C, Wi, Ci, partials; tokens, heads, Wkeys, Ckeys, balanced.
-#if defined(__CPU_SIM) && defined(__DAV_VEC__)
-    if (get_sub_block_id(args) == 0) {
-        simulate_attention(args);
-    }
-#endif
-#if defined(__DAV_CUBE__) && !defined(__CPU_SIM)
+#if defined(__DAV_CUBE__)
     const uint64_t saved_ctrl = get_ctrl();
     const int parts = (args[ARG_WINDOW_KEYS] + args[ARG_COMPRESSED_KEYS]) / TILE_KEYS;
     if (args[ARG_BALANCED]) {
@@ -992,7 +894,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
         else attend_cube<0, false>(args);
     }
     set_ctrl(saved_ctrl);
-#elif defined(__DAV_VEC__) && !defined(__CPU_SIM)
+#elif defined(__DAV_VEC__)
     set_mask_norm();
     set_vector_mask(-1, -1);
     const int parts = (args[ARG_WINDOW_KEYS] + args[ARG_COMPRESSED_KEYS]) / TILE_KEYS;

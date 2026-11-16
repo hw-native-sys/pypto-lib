@@ -23,7 +23,7 @@ __aicore__ inline void project_head(__gm__ int64_t* args) {
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     pipe_barrier(PIPE_ALL);
-#if !defined(__CPU_SIM) && !defined(__COSTMODEL)
+#if !defined(__COSTMODEL)
     set_atomic_none();
 #endif
     if (args[4] == 129280) project_head<129280>(args);

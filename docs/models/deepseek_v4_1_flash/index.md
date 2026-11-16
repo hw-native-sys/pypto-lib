@@ -169,6 +169,32 @@ checkpoint-level generation accuracy or a complete numerical forward golden.
 The configured context ceiling and supported parallel-size choices are not a
 claim that every size/sequence-length combination has been device validated.
 
+The standalone `expert_routed.py` entry defaults to boundary counts, 16-row
+tails, zero occupancy, and full receive capacity. These cases exercise the
+same W13, SwiGLU quantization, and W2 implementations used by model composition.
+Use `--case full` to validate the compact buffers at maximum occupancy alone.
+
+## CPU simulation
+
+The standalone `dspark_state.py`, `gate.py`, `input_pack.py`, `lm_head.py`
+with `--lm-head-tp 1`, and `vision.py` entries support `-p a5 --sim`. They use Tile
+instructions and simulator-supported initialization and synchronization.
+The `*_vf.cpp` names in the gate implementation do not imply register-level
+VF code: those kernels use Tile operations.
+
+LM-head TP greater than one uses a fused projection and exchange with native
+Cube/Vector intra-block signaling and requires device execution. Engram's default
+C++ implementation uses register VF operations and also requires a device; its
+explicit `--implementation pypto` comparison entry remains separate from the
+production path.
+
+Entries using native register VF operations, shared L1 transfers, or
+Cube/Vector intra-block signaling carry a standalone `# ci: no-sim` marker.
+These include compressor/cache publication, DSpark context-KV, Engram, HC,
+Q/KV and output projections, sparse attention, expert computation, and their
+layer/forward consumers. They require device execution. Their C++ kernels
+share the device implementation and do not provide separate CPU algorithms.
+
 ## Vision
 
 [`vision.py`](../../../models/deepseek_v4_1_flash/vision.py) provides a BF16 ViT

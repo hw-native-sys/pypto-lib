@@ -741,6 +741,9 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
+    if args.execution_mode and args.lm_head_tp > 1:
+        parser.error("LM-head TP > 1 requires device Cube/Vector intra-block signaling")
+
     device_ids = [int(d) for d in args.device.split(",")]
     if args.fused_sample and (args.execution_mode or args.final_output):
         parser.error("--fused-sample requires device execution without --final-output")

@@ -8,9 +8,6 @@
 // -----------------------------------------------------------------------------------------------------------
 // Bounded-worker K64 online attention with paired Cube/Vector ownership.
 #include <cstdint>
-#if defined(__CPU_SIM)
-#error "DSpark native attention requires A5 device execution"
-#endif
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
 #include "intrinsic.h"

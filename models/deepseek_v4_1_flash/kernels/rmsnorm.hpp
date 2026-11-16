@@ -19,7 +19,7 @@ __aicore__ constexpr int fold_point(int width) {
     while (result * 2 < width) result *= 2;
     return result;
 }
-#if defined(__DAV_VEC__) && !defined(__CPU_SIM)
+#if defined(__DAV_VEC__)
 __aicore__ inline void fma(RegTensor<float>& acc, RegTensor<float>& lhs,
                           RegTensor<float>& rhs, MaskReg& mask) {
     RegTensor<float> value = lhs;

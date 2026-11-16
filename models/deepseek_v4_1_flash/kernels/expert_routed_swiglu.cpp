@@ -14,10 +14,6 @@
 #include "tensor.h"
 #include "intrinsic.h"
 
-#if defined(__CPU_SIM)
-#include <cmath>
-#include <cstring>
-#endif
 
 using namespace pto;
 
@@ -41,54 +37,6 @@ AICORE inline void activateQuantize(__ubuf__ bfloat16_t* gate, __ubuf__ bfloat16
                                    __ubuf__ float* weights, __ubuf__ uint8_t* out,
                                    __ubuf__ uint8_t* codes, uint16_t validRows, uint16_t validCols)
 {
-#if defined(__CPU_SIM)
-    using Input = Tile<TileType::Vec, bfloat16_t, ROW_TILE, COL_TILE>;
-    using Weight = Tile<TileType::Vec, float, 1, ROW_TILE>;
-    using Output = Tile<TileType::Vec, uint8_t, ROW_TILE, COL_TILE>;
-    using Codes = Tile<TileType::Vec, uint8_t, 1, ROW_TILE * SCALE_COLS>;
-    Input gateTile, upTile;
-    Weight weightTile;
-    Output outputTile;
-    Codes codeTile;
-    TASSIGN(gateTile, reinterpret_cast<uintptr_t>(gate));
-    TASSIGN(upTile, reinterpret_cast<uintptr_t>(up));
-    TASSIGN(weightTile, reinterpret_cast<uintptr_t>(weights));
-    TASSIGN(outputTile, reinterpret_cast<uintptr_t>(out));
-    TASSIGN(codeTile, reinterpret_cast<uintptr_t>(codes));
-    gate = gateTile.data();
-    up = upTile.data();
-    weights = weightTile.data();
-    out = outputTile.data();
-    codes = codeTile.data();
-    for (uint16_t row = 0; row < validRows; ++row) {
-        for (uint16_t group = 0; group < validCols / 32; ++group) {
-            float values[32] = {};
-            float maximum = 1e-4f;
-            for (uint16_t col = 0; col < 32; ++col) {
-                if (row < validRows) {
-                    const uint16_t offset = row * COL_TILE + group * 32 + col;
-                    const float g = std::fmin(static_cast<float>(gate[offset]), 10.0f);
-                    const float u = std::fmax(std::fmin(static_cast<float>(up[offset]), 10.0f), -10.0f);
-                    values[col] = (g / (1.0f + std::exp(-g))) * u * weights[row];
-                }
-                maximum = std::fmax(maximum, std::fabs(values[col]));
-            }
-            maximum *= 1.0f / 448.0f;
-            uint32_t bits;
-            std::memcpy(&bits, &maximum, sizeof(bits));
-            const uint32_t exponent = (bits + 8388607) >> 23;
-            codes[row * SCALE_STRIDE + group] = static_cast<uint8_t>(exponent);
-            bits = (254 - exponent) << 23;
-            float reciprocal;
-            std::memcpy(&reciprocal, &bits, sizeof(reciprocal));
-            for (uint16_t col = 0; col < 32; ++col) {
-                const float normalized = std::fmax(std::fmin(values[col] * reciprocal, 448.0f), -448.0f);
-                const float8_e4m3_t value(normalized, RoundMode::CAST_RINT, SaturationMode::ON);
-                out[row * COL_TILE + group * 32 + col] = value.RawData();
-            }
-        }
-    }
-#else
     __VEC_SCOPE__ {
         constexpr auto halfStore = static_cast<::DistVST>(pto::DistVST::DIST_ONEPT_B16);
         vector_bool all = pset_b32(PAT_ALL);
@@ -171,7 +119,6 @@ AICORE inline void activateQuantize(__ubuf__ bfloat16_t* gate, __ubuf__ bfloat16
         }
 
     }
-#endif
 }
 
 }  // namespace
@@ -179,11 +126,6 @@ AICORE inline void activateQuantize(__ubuf__ bfloat16_t* gate, __ubuf__ bfloat16
 
 AICORE inline void reduceCounts(__ubuf__ int32_t* input, uint16_t count)
 {
-#if defined(__CPU_SIM)
-    int32_t total = 0;
-    for (uint16_t e = 0; e < count; ++e) total += input[e];
-    input[0] = total;
-#else
     __VEC_SCOPE__ {
         vector_s32 total;
         vbr(total, 0);
@@ -198,7 +140,6 @@ AICORE inline void reduceCounts(__ubuf__ int32_t* input, uint16_t count)
         }
         vsts(total, input, 0, ONEPT_B32, one);
     }
-#endif
 }
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
 {

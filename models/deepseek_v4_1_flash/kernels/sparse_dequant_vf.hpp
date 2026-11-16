@@ -12,7 +12,7 @@
 namespace sparse_dequant {
 using namespace pto;
 
-#if defined(__DAV_VEC__) && !defined(__CPU_SIM)
+#if defined(__DAV_VEC__)
 template <bool FP4, typename Output, typename Payload, typename Indices>
 __tf__ __aicore__ inline void decode_nz(
     typename Output::TileDType __out__ dst, typename Payload::TileDType __in__ src,

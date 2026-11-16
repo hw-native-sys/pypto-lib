@@ -66,7 +66,7 @@ def _mtp_projection(
     for hidden_idx in pl.spmd(t_dim // T_TILE, name_hint="mtp_hidden_norm_quant", allow_early_resolve=True):
         t0 = hidden_idx * T_TILE
         hidden_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-        hidden_amax = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+        hidden_amax = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for k0 in pl.pipeline(0, D, D_TILE, stage=1):
             hidden_bf16 = hidden_flat[t0 : t0 + T_TILE, k0 : k0 + D_TILE]
             hidden_chunk = pl.cast(hidden_bf16, target_type=pl.FP32)
@@ -83,6 +83,9 @@ def _mtp_projection(
         hidden_mean_sq = pl.mul(hidden_sq_sum, D_INV)
         hidden_var = pl.add(hidden_mean_sq, EPS)
         hidden_inv = pl.rsqrt(hidden_var, high_precision=True)
+        hidden_amax_eps = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+        hidden_amax_floor = pl.div(hidden_amax_eps, hidden_inv)
+        hidden_amax = pl.maximum(hidden_amax, hidden_amax_floor)
         hidden_scale_max = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
         hidden_sq_row = pl.div(hidden_scale_max, hidden_amax)
         hidden_scale_recip = pl.recip(hidden_sq_row)
@@ -113,7 +116,7 @@ def _mtp_projection(
         hc = norm_idx - norm_t_idx * HC_MULT
         t0 = norm_t_idx * T_TILE
         prev_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-        prev_amax = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+        prev_amax = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for k0 in pl.pipeline(0, D, D_TILE, stage=1):
             prev_k0 = hc * D + k0
             prev_chunk = prev_flat[t0 : t0 + T_TILE, prev_k0 : prev_k0 + D_TILE]
@@ -130,6 +133,9 @@ def _mtp_projection(
         prev_mean_sq = pl.mul(prev_sq_sum, D_INV)
         prev_var = pl.add(prev_mean_sq, EPS)
         prev_inv = pl.rsqrt(prev_var, high_precision=True)
+        prev_amax_eps = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+        prev_amax_floor = pl.div(prev_amax_eps, prev_inv)
+        prev_amax = pl.maximum(prev_amax, prev_amax_floor)
         prev_scale_max = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
         prev_sq_row = pl.div(prev_scale_max, prev_amax)
         prev_scale_recip = pl.recip(prev_sq_row)
@@ -207,7 +213,7 @@ mtp_projection = pl.jit.inline(_mtp_projection)
 mtp_projection_test = pl.jit(_mtp_projection)
 
 
-def _rms_norm(x, weight):
+def _rms_inverse(x):
     import torch
 
     shape = x.shape
@@ -217,7 +223,7 @@ def _rms_norm(x, weight):
         x_chunk = x_2d[:, k0 : k0 + D_TILE]
         sq_sum += (x_chunk * x_chunk).sum(dim=1, keepdim=True)
     inv = torch.rsqrt(sq_sum * D_INV + EPS)
-    return (x_2d * inv * weight.float().view(1, D)).reshape(shape)
+    return inv.reshape(*shape[:-1], 1)
 
 
 def golden_mtp_projection(tensors):
@@ -225,12 +231,12 @@ def golden_mtp_projection(tensors):
 
     from utils import unpack_nz
 
-    hidden_norm = _rms_norm(tensors["hidden_states"], tensors["enorm_w"])
-    hidden_states = hidden_norm * tensors["e_proj_smooth"].float()
-    prev_hidden_norm = _rms_norm(tensors["prev_hidden_states"], tensors["hnorm_w"])
-    prev_hidden_states = prev_hidden_norm * tensors["h_proj_smooth"].float()
-    hidden_i8, hidden_scale = _quantize_rows(hidden_states.float())
-    prev_i8, prev_scale = _quantize_rows(prev_hidden_states.float())
+    hidden_i8, hidden_scale = _quantize_norm_rows(
+        tensors["hidden_states"], tensors["enorm_w"], tensors["e_proj_smooth"],
+    )
+    prev_i8, prev_scale = _quantize_norm_rows(
+        tensors["prev_hidden_states"], tensors["hnorm_w"], tensors["h_proj_smooth"],
+    )
     hidden_e = hidden_i8.to(torch.int32).matmul(unpack_nz(tensors["e_proj_w"]).to(torch.int32).t()).float()
     hidden_e = hidden_e * hidden_scale * tensors["e_proj_w_scale"].float().view(1, D)
     hidden_h = prev_i8.to(torch.int32).matmul(unpack_nz(tensors["h_proj_w"]).to(torch.int32).t()).float()
@@ -238,14 +244,17 @@ def golden_mtp_projection(tensors):
     tensors["hidden_states_out"][:] = (hidden_e.unsqueeze(1) + hidden_h).to(torch.float32)
 
 
-def _quantize_rows(x):
+def _quantize_norm_rows(x, norm_weight, smooth_weight):
     import torch
 
-    amax = x.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-    scale_quant = INT8_SCALE_MAX / amax
-    x_i32 = torch.round(x * scale_quant).to(torch.int32)
+    inv = _rms_inverse(x)
+    weighted = x.float() * (norm_weight.float() * smooth_weight.float())
+    amax_floor = torch.div(torch.full_like(inv, INT8_AMAX_EPS), inv)
+    amax = torch.maximum(weighted.abs().amax(dim=-1, keepdim=True), amax_floor)
+    scale_quant = torch.div(torch.full_like(amax, INT8_SCALE_MAX), amax)
+    x_i32 = torch.round(weighted * scale_quant).to(torch.int32)
     x_i32 = torch.clamp(x_i32, -int(INT8_SCALE_MAX), int(INT8_SCALE_MAX))
-    return x_i32.to(torch.float16).to(torch.int8), 1.0 / scale_quant
+    return x_i32.to(torch.float16).to(torch.int8), inv * scale_quant.reciprocal()
 
 
 def _quantize_weight_per_out(w):
@@ -264,13 +273,29 @@ def build_tensor_specs(batch=DECODE_BATCH, seq=DECODE_SEQ):
     from utils import pack_nz
     t = batch * seq
     prev_shape = [t, HC_MULT, D]
+    tiny = INT8_AMAX_EPS * EPS ** 0.5 / 4
 
     def init_proj_pair():
         w = (0.25 * torch.rand(D, D) / D ** 0.5).to(torch.bfloat16)
+        # Unit-weight output channels for the amax-floor rows.
+        w[::4] = 1
         return _quantize_weight_per_out(w)
 
+    def init_hidden_states():
+        values = torch.randn(t, D)
+        values[0::8] = 0
+        values[1::8] = tiny
+        values[2::8] = 0
+        values[3::8] = -tiny
+        return values
+
     def init_prev_hidden_states():
-        return torch.randn(*prev_shape)
+        values = torch.randn(*prev_shape)
+        values[0::8] = 0
+        values[1::8] = 0
+        values[2::8] = tiny
+        values[3::8] = -tiny
+        return values
 
     e_proj_cache = None
     h_proj_cache = None
@@ -298,7 +323,7 @@ def build_tensor_specs(batch=DECODE_BATCH, seq=DECODE_SEQ):
         return h_proj_cache[1].float()
 
     return [
-        TensorSpec("hidden_states", [t, D], torch.bfloat16, init_value=lambda: torch.randn(t, D)),
+        TensorSpec("hidden_states", [t, D], torch.bfloat16, init_value=init_hidden_states),
         TensorSpec("prev_hidden_states", prev_shape, torch.float32, init_value=init_prev_hidden_states),
         TensorSpec("enorm_w", [D], torch.float32, init_value=lambda: torch.ones(D)),
         TensorSpec("hnorm_w", [D], torch.float32, init_value=lambda: torch.ones(D)),

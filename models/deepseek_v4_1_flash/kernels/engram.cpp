@@ -10,9 +10,6 @@
 #include "mx_quant.hpp"
 #include "rmsnorm.hpp"
 #include "mxfp8_projection.hpp"
-#if defined(__CPU_SIM)
-#include <cmath>
-#endif
 
 // External calls place tensors before scalars. Split vector modes occupy args[5].
 namespace engram_abi {
@@ -160,20 +157,6 @@ __tf__ __aicore__ inline void gate(Row<float>::TileDType __out__ output, Row<flo
     auto k = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(key);
     auto v = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(value);
     auto w = (__ubuf__ float*)__cce_get_tile_ptr(weight);
-#if defined(__CPU_SIM)
-    float sx = 0, sk = 0, dot = 0;
-    for (int i = 0; i < D; ++i) {
-        float ki = static_cast<float>(k[i]);
-        sx += x[i] * x[i];
-        sk += ki * ki;
-        dot += (x[i] * w[i]) * ki;
-    }
-    dot *= (1.0f / std::sqrt(sx / D + 1e-6f)) * (1.0f / std::sqrt(sk / D + 1e-6f)) * 0.013975424859373685f;
-    float signed_root = std::copysign(std::sqrt(std::max(std::abs(dot), 1e-6f)), dot);
-    float g = 1.0f / (1.0f + std::exp(-signed_root));
-    for (int i = 0; i < D; ++i)
-        out[i] = static_cast<float>(static_cast<bfloat16_t>(x[i] + g * static_cast<float>(v[i])));
-#else
     __VEC_SCOPE__ {
         MaskReg full = pset_b32(PAT_ALL);
         RegTensor<float> sx, sk, dot;
@@ -234,7 +217,6 @@ __tf__ __aicore__ inline void gate(Row<float>::TileDType __out__ output, Row<flo
             vsts(y, out, chunk * 64, NORM_B32, full);
         }
     }
-#endif
 }
 #endif
 } // namespace

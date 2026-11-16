@@ -6,6 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: no-sim
 """V4.1 Engram projection and residual gating from host rows or local lookup tables."""
 
 import math
@@ -402,6 +403,9 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     args = parser.parse_args()
+
+    if args.execution_mode and args.implementation == "cpp":
+        parser.error("the C++ Engram implementation requires device register VF operations")
 
     device_ids = [int(d) for d in args.device.split(",")]
     if len(device_ids) != 1:
