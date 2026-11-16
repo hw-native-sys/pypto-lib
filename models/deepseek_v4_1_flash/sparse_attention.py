@@ -1875,14 +1875,6 @@ def sparse_vf_fused_vector(
     pl.system.aiv_initialize_pipe(v2c_consumer_buf=p_peer, dir_mask=2, slot_size=16384, slot_num=1, id=2)
     pv_ring_next = pl.system.reserve_buffer(name='sparse_pv_ring', size=16384)
     pl.system.aiv_initialize_pipe(pv_ring_next, dir_mask=1, slot_size=16384, slot_num=1, id=3)
-    scale_w_lanes = pl.tile.ci(0, [1, 2 * SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS], dtype=pl.INT16)
-    scale_w_duplicate_indices = pl.shr(scale_w_lanes, 1)
-    scale_c_lanes = pl.tile.ci(0, [1, SPARSE_VF_INDEX_TILE], dtype=pl.INT16)
-    scale_c_column = pl.tile.reshape(scale_c_lanes, [SPARSE_VF_INDEX_TILE, 1])
-    scale_c_target = pl.tile.create([SPARSE_VF_INDEX_TILE, SPARSE_VF_COMPRESSED_GROUP], pl.INT16, pl.MemorySpace.Vec)
-    scale_c_expanded = pl.tile.row_expand(scale_c_target, scale_c_column)
-    scale_c_indices = pl.tile.reshape(scale_c_expanded, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-    scale_gather_tmp = pl.tile.create([1, 16], dtype=pl.INT16, target_memory=pl.MemorySpace.Vec)
     worker = pl.tile.get_block_idx()
     for block in pl.range(worker, num_tokens * (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE), workers):
         token = block // (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE)
@@ -1978,19 +1970,25 @@ def sparse_vf_fused_vector(
                         fwa_codes = fwa_packed[:, :HEAD_DIM]
                         fwa_values_fp32 = pl.cast(fwa_codes, pl.FP32)
                         fwa_values = pl.cast(fwa_values_fp32, pl.BF16, mode='rint')
-                        fwa_bits = pl.reinterpret_view(fwa_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
-                        fwa_scales = pl.reinterpret_view(fwa_bits, pl.BF16)
-                        fwa_scale_view = fwa_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
-                        fwa_dense_scales = pl.tile.move(fwa_scale_view, pl.MemorySpace.Vec)
-                        fwa_value_flat = pl.tile.reshape(fwa_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fwa_scale_row = pl.tile.reshape(fwa_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
-                        fwa_scale_bits = pl.tile.reinterpret_view(fwa_scale_row, pl.INT16)
-                        fwa_duplicated_bits = pl.tile.gather(fwa_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
-                        fwa_expanded_bits = pl.tile.gather(fwa_duplicated_bits, scale_c_indices, scale_gather_tmp)
-                        fwa_expanded = pl.tile.reinterpret_view(fwa_expanded_bits, pl.BF16)
-                        fwa_scaled_flat = pl.col_expand_mul(fwa_value_flat, fwa_expanded)
-                        fwa_result = pl.tile.reshape(fwa_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                        kv_half = pl.tile.assemble(kv_half, fwa_result, [0 + fwa_cast_row0, 0])
+                        fwa_scale_words = pl.reinterpret_view(fwa_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                        fwa_scale_flat = pl.tile.reshape(fwa_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_HALFWORDS])
+                        fwa_value_flat = pl.tile.reshape(fwa_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fwa_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                        with pl.reg_scope():
+                            fwa_all_r0 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                            for fwa_row_r0 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                                for fwa_chunk_r0 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                    fwa_scale_offset_r0 = fwa_row_r0 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
+                                    fwa_scale_offset_r0 = fwa_scale_offset_r0 + fwa_chunk_r0 * SPARSE_VF_WINDOW_STEP
+                                    fwa_groups_r0 = pl.reg.load(fwa_scale_flat, fwa_scale_offset_r0, lanes=SPARSE_VF_WINDOW_STEP)
+                                    fwa_factor_bits_r0 = pl.reg.group_broadcast(fwa_groups_r0, lanes=SPARSE_VF_REG_TILE)
+                                    fwa_factor_r0 = pl.reg.interpret_cast(fwa_factor_bits_r0, dtype=pl.BF16)
+                                    fwa_value_offset_r0 = fwa_row_r0 * HEAD_DIM + fwa_chunk_r0 * SPARSE_VF_REG_TILE
+                                    fwa_value_r0 = pl.reg.load(fwa_value_flat, fwa_value_offset_r0, lanes=SPARSE_VF_REG_TILE)
+                                    fwa_scaled_r0 = pl.reg.mul(fwa_value_r0, fwa_factor_r0, fwa_all_r0)
+                                    fwa_target_row_r0 = 0 + fwa_cast_row0 + fwa_row_r0
+                                    fwa_target_offset_r0 = fwa_target_row_r0 * HEAD_DIM + fwa_chunk_r0 * SPARSE_VF_REG_TILE
+                                    fwa_write_r0 = pl.reg.store(fwa_kv_flat, fwa_target_offset_r0, fwa_scaled_r0, fwa_all_r0)
                     ids_fwc = pl.tile.load(window_indices, [token, first_key_base + 32], [1, SPARSE_VF_FUSED_GATHER_TILE])
                     fwc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
                     # Gather contiguous rows in one DMA.
@@ -2034,19 +2032,25 @@ def sparse_vf_fused_vector(
                         fwb_codes = fwb_packed[:, :HEAD_DIM]
                         fwb_values_fp32 = pl.cast(fwb_codes, pl.FP32)
                         fwb_values = pl.cast(fwb_values_fp32, pl.BF16, mode='rint')
-                        fwb_bits = pl.reinterpret_view(fwb_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
-                        fwb_scales = pl.reinterpret_view(fwb_bits, pl.BF16)
-                        fwb_scale_view = fwb_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
-                        fwb_dense_scales = pl.tile.move(fwb_scale_view, pl.MemorySpace.Vec)
-                        fwb_value_flat = pl.tile.reshape(fwb_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fwb_scale_row = pl.tile.reshape(fwb_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
-                        fwb_scale_bits = pl.tile.reinterpret_view(fwb_scale_row, pl.INT16)
-                        fwb_duplicated_bits = pl.tile.gather(fwb_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
-                        fwb_expanded_bits = pl.tile.gather(fwb_duplicated_bits, scale_c_indices, scale_gather_tmp)
-                        fwb_expanded = pl.tile.reinterpret_view(fwb_expanded_bits, pl.BF16)
-                        fwb_scaled_flat = pl.col_expand_mul(fwb_value_flat, fwb_expanded)
-                        fwb_result = pl.tile.reshape(fwb_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                        kv_half = pl.tile.assemble(kv_half, fwb_result, [16 + fwb_cast_row0, 0])
+                        fwb_scale_words = pl.reinterpret_view(fwb_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                        fwb_scale_flat = pl.tile.reshape(fwb_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_HALFWORDS])
+                        fwb_value_flat = pl.tile.reshape(fwb_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fwb_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                        with pl.reg_scope():
+                            fwb_all_r1 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                            for fwb_row_r1 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                                for fwb_chunk_r1 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                    fwb_scale_offset_r1 = fwb_row_r1 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
+                                    fwb_scale_offset_r1 = fwb_scale_offset_r1 + fwb_chunk_r1 * SPARSE_VF_WINDOW_STEP
+                                    fwb_groups_r1 = pl.reg.load(fwb_scale_flat, fwb_scale_offset_r1, lanes=SPARSE_VF_WINDOW_STEP)
+                                    fwb_factor_bits_r1 = pl.reg.group_broadcast(fwb_groups_r1, lanes=SPARSE_VF_REG_TILE)
+                                    fwb_factor_r1 = pl.reg.interpret_cast(fwb_factor_bits_r1, dtype=pl.BF16)
+                                    fwb_value_offset_r1 = fwb_row_r1 * HEAD_DIM + fwb_chunk_r1 * SPARSE_VF_REG_TILE
+                                    fwb_value_r1 = pl.reg.load(fwb_value_flat, fwb_value_offset_r1, lanes=SPARSE_VF_REG_TILE)
+                                    fwb_scaled_r1 = pl.reg.mul(fwb_value_r1, fwb_factor_r1, fwb_all_r1)
+                                    fwb_target_row_r1 = 16 + fwb_cast_row0 + fwb_row_r1
+                                    fwb_target_offset_r1 = fwb_target_row_r1 * HEAD_DIM + fwb_chunk_r1 * SPARSE_VF_REG_TILE
+                                    fwb_write_r1 = pl.reg.store(fwb_kv_flat, fwb_target_offset_r1, fwb_scaled_r1, fwb_all_r1)
                     ids_fwd = pl.tile.load(window_indices, [token, first_key_base + 48], [1, SPARSE_VF_FUSED_GATHER_TILE])
                     fwd_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
                     # Gather contiguous rows in one DMA.
@@ -2090,19 +2094,25 @@ def sparse_vf_fused_vector(
                         fwc_codes = fwc_packed[:, :HEAD_DIM]
                         fwc_values_fp32 = pl.cast(fwc_codes, pl.FP32)
                         fwc_values = pl.cast(fwc_values_fp32, pl.BF16, mode='rint')
-                        fwc_bits = pl.reinterpret_view(fwc_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
-                        fwc_scales = pl.reinterpret_view(fwc_bits, pl.BF16)
-                        fwc_scale_view = fwc_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
-                        fwc_dense_scales = pl.tile.move(fwc_scale_view, pl.MemorySpace.Vec)
-                        fwc_value_flat = pl.tile.reshape(fwc_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fwc_scale_row = pl.tile.reshape(fwc_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
-                        fwc_scale_bits = pl.tile.reinterpret_view(fwc_scale_row, pl.INT16)
-                        fwc_duplicated_bits = pl.tile.gather(fwc_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
-                        fwc_expanded_bits = pl.tile.gather(fwc_duplicated_bits, scale_c_indices, scale_gather_tmp)
-                        fwc_expanded = pl.tile.reinterpret_view(fwc_expanded_bits, pl.BF16)
-                        fwc_scaled_flat = pl.col_expand_mul(fwc_value_flat, fwc_expanded)
-                        fwc_result = pl.tile.reshape(fwc_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                        kv_half = pl.tile.assemble(kv_half, fwc_result, [32 + fwc_cast_row0, 0])
+                        fwc_scale_words = pl.reinterpret_view(fwc_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                        fwc_scale_flat = pl.tile.reshape(fwc_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_HALFWORDS])
+                        fwc_value_flat = pl.tile.reshape(fwc_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fwc_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                        with pl.reg_scope():
+                            fwc_all_r2 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                            for fwc_row_r2 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                                for fwc_chunk_r2 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                    fwc_scale_offset_r2 = fwc_row_r2 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
+                                    fwc_scale_offset_r2 = fwc_scale_offset_r2 + fwc_chunk_r2 * SPARSE_VF_WINDOW_STEP
+                                    fwc_groups_r2 = pl.reg.load(fwc_scale_flat, fwc_scale_offset_r2, lanes=SPARSE_VF_WINDOW_STEP)
+                                    fwc_factor_bits_r2 = pl.reg.group_broadcast(fwc_groups_r2, lanes=SPARSE_VF_REG_TILE)
+                                    fwc_factor_r2 = pl.reg.interpret_cast(fwc_factor_bits_r2, dtype=pl.BF16)
+                                    fwc_value_offset_r2 = fwc_row_r2 * HEAD_DIM + fwc_chunk_r2 * SPARSE_VF_REG_TILE
+                                    fwc_value_r2 = pl.reg.load(fwc_value_flat, fwc_value_offset_r2, lanes=SPARSE_VF_REG_TILE)
+                                    fwc_scaled_r2 = pl.reg.mul(fwc_value_r2, fwc_factor_r2, fwc_all_r2)
+                                    fwc_target_row_r2 = 32 + fwc_cast_row0 + fwc_row_r2
+                                    fwc_target_offset_r2 = fwc_target_row_r2 * HEAD_DIM + fwc_chunk_r2 * SPARSE_VF_REG_TILE
+                                    fwc_write_r2 = pl.reg.store(fwc_kv_flat, fwc_target_offset_r2, fwc_scaled_r2, fwc_all_r2)
                     for fwd_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
                         fwd_cast_row0 = fwd_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
                         fwd_raw_chunk = pl.tile.slice(fwd_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwd_cast_row0, 0])
@@ -2111,19 +2121,25 @@ def sparse_vf_fused_vector(
                         fwd_codes = fwd_packed[:, :HEAD_DIM]
                         fwd_values_fp32 = pl.cast(fwd_codes, pl.FP32)
                         fwd_values = pl.cast(fwd_values_fp32, pl.BF16, mode='rint')
-                        fwd_bits = pl.reinterpret_view(fwd_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
-                        fwd_scales = pl.reinterpret_view(fwd_bits, pl.BF16)
-                        fwd_scale_view = fwd_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
-                        fwd_dense_scales = pl.tile.move(fwd_scale_view, pl.MemorySpace.Vec)
-                        fwd_value_flat = pl.tile.reshape(fwd_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fwd_scale_row = pl.tile.reshape(fwd_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
-                        fwd_scale_bits = pl.tile.reinterpret_view(fwd_scale_row, pl.INT16)
-                        fwd_duplicated_bits = pl.tile.gather(fwd_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
-                        fwd_expanded_bits = pl.tile.gather(fwd_duplicated_bits, scale_c_indices, scale_gather_tmp)
-                        fwd_expanded = pl.tile.reinterpret_view(fwd_expanded_bits, pl.BF16)
-                        fwd_scaled_flat = pl.col_expand_mul(fwd_value_flat, fwd_expanded)
-                        fwd_result = pl.tile.reshape(fwd_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                        kv_half = pl.tile.assemble(kv_half, fwd_result, [48 + fwd_cast_row0, 0])
+                        fwd_scale_words = pl.reinterpret_view(fwd_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                        fwd_scale_flat = pl.tile.reshape(fwd_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_HALFWORDS])
+                        fwd_value_flat = pl.tile.reshape(fwd_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fwd_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                        with pl.reg_scope():
+                            fwd_all_r3 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                            for fwd_row_r3 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                                for fwd_chunk_r3 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                    fwd_scale_offset_r3 = fwd_row_r3 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
+                                    fwd_scale_offset_r3 = fwd_scale_offset_r3 + fwd_chunk_r3 * SPARSE_VF_WINDOW_STEP
+                                    fwd_groups_r3 = pl.reg.load(fwd_scale_flat, fwd_scale_offset_r3, lanes=SPARSE_VF_WINDOW_STEP)
+                                    fwd_factor_bits_r3 = pl.reg.group_broadcast(fwd_groups_r3, lanes=SPARSE_VF_REG_TILE)
+                                    fwd_factor_r3 = pl.reg.interpret_cast(fwd_factor_bits_r3, dtype=pl.BF16)
+                                    fwd_value_offset_r3 = fwd_row_r3 * HEAD_DIM + fwd_chunk_r3 * SPARSE_VF_REG_TILE
+                                    fwd_value_r3 = pl.reg.load(fwd_value_flat, fwd_value_offset_r3, lanes=SPARSE_VF_REG_TILE)
+                                    fwd_scaled_r3 = pl.reg.mul(fwd_value_r3, fwd_factor_r3, fwd_all_r3)
+                                    fwd_target_row_r3 = 48 + fwd_cast_row0 + fwd_row_r3
+                                    fwd_target_offset_r3 = fwd_target_row_r3 * HEAD_DIM + fwd_chunk_r3 * SPARSE_VF_REG_TILE
+                                    fwd_write_r3 = pl.reg.store(fwd_kv_flat, fwd_target_offset_r3, fwd_scaled_r3, fwd_all_r3)
                 else:
                     ids_fca = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 0], [1, SPARSE_VF_FUSED_GATHER_TILE])
                     ids_fcb = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 16], [1, SPARSE_VF_FUSED_GATHER_TILE])
@@ -2175,18 +2191,25 @@ def sparse_vf_fused_vector(
                         fca_packed = pl.reinterpret_view(fca_raw_chunk, pl.FP4E2M1X2)
                         fca_codes = fca_packed[:, :SPARSE_VF_HALF_DIM]
                         fca_values = pl.cast(fca_codes, pl.BF16)
-                        fca_bits = pl.reinterpret_view(fca_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scales = pl.reinterpret_view(fca_bits, pl.BF16)
-                        fca_scale_view = fca_scales[:, SPARSE_VF_COMPRESSED_SCALE_OFFSET:SPARSE_VF_COMPRESSED_SCALE_END]
-                        fca_dense_scales = pl.tile.move(fca_scale_view, pl.MemorySpace.Vec)
-                        fca_value_flat = pl.tile.reshape(fca_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fca_scale_row = pl.tile.reshape(fca_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_GROUPS])
-                        fca_scale_bits = pl.tile.reinterpret_view(fca_scale_row, pl.INT16)
-                        fca_expanded_bits = pl.tile.gather(fca_scale_bits, scale_c_indices, scale_gather_tmp)
-                        fca_expanded = pl.tile.reinterpret_view(fca_expanded_bits, pl.BF16)
-                        fca_scaled_flat = pl.col_expand_mul(fca_value_flat, fca_expanded)
-                        fca_result = pl.tile.reshape(fca_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                        kv_half = pl.tile.assemble(kv_half, fca_result, [0 + fca_cast_row0, 0])
+                        fca_scale_words = pl.reinterpret_view(fca_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_scale_flat = pl.tile.reshape(fca_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_value_flat = pl.tile.reshape(fca_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fca_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                        with pl.reg_scope():
+                            fca_all_r4 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                            for fca_row_r4 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                                for fca_chunk_r4 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                    fca_scale_offset_r4 = fca_row_r4 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
+                                    fca_scale_offset_r4 = fca_scale_offset_r4 + fca_chunk_r4 * SPARSE_VF_COMPRESSED_STEP
+                                    fca_groups_r4 = pl.reg.load(fca_scale_flat, fca_scale_offset_r4, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                    fca_factor_bits_r4 = pl.reg.group_broadcast(fca_groups_r4, lanes=SPARSE_VF_REG_TILE)
+                                    fca_factor_r4 = pl.reg.interpret_cast(fca_factor_bits_r4, dtype=pl.BF16)
+                                    fca_value_offset_r4 = fca_row_r4 * HEAD_DIM + fca_chunk_r4 * SPARSE_VF_REG_TILE
+                                    fca_value_r4 = pl.reg.load(fca_value_flat, fca_value_offset_r4, lanes=SPARSE_VF_REG_TILE)
+                                    fca_scaled_r4 = pl.reg.mul(fca_value_r4, fca_factor_r4, fca_all_r4)
+                                    fca_target_row_r4 = 0 + fca_cast_row0 + fca_row_r4
+                                    fca_target_offset_r4 = fca_target_row_r4 * HEAD_DIM + fca_chunk_r4 * SPARSE_VF_REG_TILE
+                                    fca_write_r4 = pl.reg.store(fca_kv_flat, fca_target_offset_r4, fca_scaled_r4, fca_all_r4)
                     ids_fcc = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 32], [1, SPARSE_VF_FUSED_GATHER_TILE])
                     fcc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
                     for fcc_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
@@ -2215,18 +2238,25 @@ def sparse_vf_fused_vector(
                         fcb_packed = pl.reinterpret_view(fcb_raw_chunk, pl.FP4E2M1X2)
                         fcb_codes = fcb_packed[:, :SPARSE_VF_HALF_DIM]
                         fcb_values = pl.cast(fcb_codes, pl.BF16)
-                        fcb_bits = pl.reinterpret_view(fcb_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fcb_scales = pl.reinterpret_view(fcb_bits, pl.BF16)
-                        fcb_scale_view = fcb_scales[:, SPARSE_VF_COMPRESSED_SCALE_OFFSET:SPARSE_VF_COMPRESSED_SCALE_END]
-                        fcb_dense_scales = pl.tile.move(fcb_scale_view, pl.MemorySpace.Vec)
-                        fcb_value_flat = pl.tile.reshape(fcb_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fcb_scale_row = pl.tile.reshape(fcb_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_GROUPS])
-                        fcb_scale_bits = pl.tile.reinterpret_view(fcb_scale_row, pl.INT16)
-                        fcb_expanded_bits = pl.tile.gather(fcb_scale_bits, scale_c_indices, scale_gather_tmp)
-                        fcb_expanded = pl.tile.reinterpret_view(fcb_expanded_bits, pl.BF16)
-                        fcb_scaled_flat = pl.col_expand_mul(fcb_value_flat, fcb_expanded)
-                        fcb_result = pl.tile.reshape(fcb_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                        kv_half = pl.tile.assemble(kv_half, fcb_result, [16 + fcb_cast_row0, 0])
+                        fcb_scale_words = pl.reinterpret_view(fcb_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fcb_scale_flat = pl.tile.reshape(fcb_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fcb_value_flat = pl.tile.reshape(fcb_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fcb_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                        with pl.reg_scope():
+                            fcb_all_r5 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                            for fcb_row_r5 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                                for fcb_chunk_r5 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                    fcb_scale_offset_r5 = fcb_row_r5 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
+                                    fcb_scale_offset_r5 = fcb_scale_offset_r5 + fcb_chunk_r5 * SPARSE_VF_COMPRESSED_STEP
+                                    fcb_groups_r5 = pl.reg.load(fcb_scale_flat, fcb_scale_offset_r5, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                    fcb_factor_bits_r5 = pl.reg.group_broadcast(fcb_groups_r5, lanes=SPARSE_VF_REG_TILE)
+                                    fcb_factor_r5 = pl.reg.interpret_cast(fcb_factor_bits_r5, dtype=pl.BF16)
+                                    fcb_value_offset_r5 = fcb_row_r5 * HEAD_DIM + fcb_chunk_r5 * SPARSE_VF_REG_TILE
+                                    fcb_value_r5 = pl.reg.load(fcb_value_flat, fcb_value_offset_r5, lanes=SPARSE_VF_REG_TILE)
+                                    fcb_scaled_r5 = pl.reg.mul(fcb_value_r5, fcb_factor_r5, fcb_all_r5)
+                                    fcb_target_row_r5 = 16 + fcb_cast_row0 + fcb_row_r5
+                                    fcb_target_offset_r5 = fcb_target_row_r5 * HEAD_DIM + fcb_chunk_r5 * SPARSE_VF_REG_TILE
+                                    fcb_write_r5 = pl.reg.store(fcb_kv_flat, fcb_target_offset_r5, fcb_scaled_r5, fcb_all_r5)
                     ids_fcd = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 48], [1, SPARSE_VF_FUSED_GATHER_TILE])
                     fcd_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
                     for fcd_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
@@ -2255,36 +2285,50 @@ def sparse_vf_fused_vector(
                         fcc_packed = pl.reinterpret_view(fcc_raw_chunk, pl.FP4E2M1X2)
                         fcc_codes = fcc_packed[:, :SPARSE_VF_HALF_DIM]
                         fcc_values = pl.cast(fcc_codes, pl.BF16)
-                        fcc_bits = pl.reinterpret_view(fcc_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fcc_scales = pl.reinterpret_view(fcc_bits, pl.BF16)
-                        fcc_scale_view = fcc_scales[:, SPARSE_VF_COMPRESSED_SCALE_OFFSET:SPARSE_VF_COMPRESSED_SCALE_END]
-                        fcc_dense_scales = pl.tile.move(fcc_scale_view, pl.MemorySpace.Vec)
-                        fcc_value_flat = pl.tile.reshape(fcc_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fcc_scale_row = pl.tile.reshape(fcc_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_GROUPS])
-                        fcc_scale_bits = pl.tile.reinterpret_view(fcc_scale_row, pl.INT16)
-                        fcc_expanded_bits = pl.tile.gather(fcc_scale_bits, scale_c_indices, scale_gather_tmp)
-                        fcc_expanded = pl.tile.reinterpret_view(fcc_expanded_bits, pl.BF16)
-                        fcc_scaled_flat = pl.col_expand_mul(fcc_value_flat, fcc_expanded)
-                        fcc_result = pl.tile.reshape(fcc_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                        kv_half = pl.tile.assemble(kv_half, fcc_result, [32 + fcc_cast_row0, 0])
+                        fcc_scale_words = pl.reinterpret_view(fcc_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fcc_scale_flat = pl.tile.reshape(fcc_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fcc_value_flat = pl.tile.reshape(fcc_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fcc_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                        with pl.reg_scope():
+                            fcc_all_r6 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                            for fcc_row_r6 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                                for fcc_chunk_r6 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                    fcc_scale_offset_r6 = fcc_row_r6 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
+                                    fcc_scale_offset_r6 = fcc_scale_offset_r6 + fcc_chunk_r6 * SPARSE_VF_COMPRESSED_STEP
+                                    fcc_groups_r6 = pl.reg.load(fcc_scale_flat, fcc_scale_offset_r6, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                    fcc_factor_bits_r6 = pl.reg.group_broadcast(fcc_groups_r6, lanes=SPARSE_VF_REG_TILE)
+                                    fcc_factor_r6 = pl.reg.interpret_cast(fcc_factor_bits_r6, dtype=pl.BF16)
+                                    fcc_value_offset_r6 = fcc_row_r6 * HEAD_DIM + fcc_chunk_r6 * SPARSE_VF_REG_TILE
+                                    fcc_value_r6 = pl.reg.load(fcc_value_flat, fcc_value_offset_r6, lanes=SPARSE_VF_REG_TILE)
+                                    fcc_scaled_r6 = pl.reg.mul(fcc_value_r6, fcc_factor_r6, fcc_all_r6)
+                                    fcc_target_row_r6 = 32 + fcc_cast_row0 + fcc_row_r6
+                                    fcc_target_offset_r6 = fcc_target_row_r6 * HEAD_DIM + fcc_chunk_r6 * SPARSE_VF_REG_TILE
+                                    fcc_write_r6 = pl.reg.store(fcc_kv_flat, fcc_target_offset_r6, fcc_scaled_r6, fcc_all_r6)
                     for fcd_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
                         fcd_cast_row0 = fcd_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
                         fcd_raw_chunk = pl.tile.slice(fcd_raw, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [fcd_cast_row0, 0])
                         fcd_packed = pl.reinterpret_view(fcd_raw_chunk, pl.FP4E2M1X2)
                         fcd_codes = fcd_packed[:, :SPARSE_VF_HALF_DIM]
                         fcd_values = pl.cast(fcd_codes, pl.BF16)
-                        fcd_bits = pl.reinterpret_view(fcd_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fcd_scales = pl.reinterpret_view(fcd_bits, pl.BF16)
-                        fcd_scale_view = fcd_scales[:, SPARSE_VF_COMPRESSED_SCALE_OFFSET:SPARSE_VF_COMPRESSED_SCALE_END]
-                        fcd_dense_scales = pl.tile.move(fcd_scale_view, pl.MemorySpace.Vec)
-                        fcd_value_flat = pl.tile.reshape(fcd_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fcd_scale_row = pl.tile.reshape(fcd_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_GROUPS])
-                        fcd_scale_bits = pl.tile.reinterpret_view(fcd_scale_row, pl.INT16)
-                        fcd_expanded_bits = pl.tile.gather(fcd_scale_bits, scale_c_indices, scale_gather_tmp)
-                        fcd_expanded = pl.tile.reinterpret_view(fcd_expanded_bits, pl.BF16)
-                        fcd_scaled_flat = pl.col_expand_mul(fcd_value_flat, fcd_expanded)
-                        fcd_result = pl.tile.reshape(fcd_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                        kv_half = pl.tile.assemble(kv_half, fcd_result, [48 + fcd_cast_row0, 0])
+                        fcd_scale_words = pl.reinterpret_view(fcd_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fcd_scale_flat = pl.tile.reshape(fcd_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fcd_value_flat = pl.tile.reshape(fcd_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fcd_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                        with pl.reg_scope():
+                            fcd_all_r7 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                            for fcd_row_r7 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                                for fcd_chunk_r7 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                    fcd_scale_offset_r7 = fcd_row_r7 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
+                                    fcd_scale_offset_r7 = fcd_scale_offset_r7 + fcd_chunk_r7 * SPARSE_VF_COMPRESSED_STEP
+                                    fcd_groups_r7 = pl.reg.load(fcd_scale_flat, fcd_scale_offset_r7, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                    fcd_factor_bits_r7 = pl.reg.group_broadcast(fcd_groups_r7, lanes=SPARSE_VF_REG_TILE)
+                                    fcd_factor_r7 = pl.reg.interpret_cast(fcd_factor_bits_r7, dtype=pl.BF16)
+                                    fcd_value_offset_r7 = fcd_row_r7 * HEAD_DIM + fcd_chunk_r7 * SPARSE_VF_REG_TILE
+                                    fcd_value_r7 = pl.reg.load(fcd_value_flat, fcd_value_offset_r7, lanes=SPARSE_VF_REG_TILE)
+                                    fcd_scaled_r7 = pl.reg.mul(fcd_value_r7, fcd_factor_r7, fcd_all_r7)
+                                    fcd_target_row_r7 = 48 + fcd_cast_row0 + fcd_row_r7
+                                    fcd_target_offset_r7 = fcd_target_row_r7 * HEAD_DIM + fcd_chunk_r7 * SPARSE_VF_REG_TILE
+                                    fcd_write_r7 = pl.reg.store(fcd_kv_flat, fcd_target_offset_r7, fcd_scaled_r7, fcd_all_r7)
             else:
                 ids_fwa = pl.tile.load(window_indices, [token, first_key_base + 0], [1, SPARSE_VF_FUSED_GATHER_TILE])
                 ids_fwb = pl.tile.load(window_indices, [token, first_key_base + 16], [1, SPARSE_VF_FUSED_GATHER_TILE])
@@ -2364,19 +2408,25 @@ def sparse_vf_fused_vector(
                     fwa_codes = fwa_packed[:, :HEAD_DIM]
                     fwa_values_fp32 = pl.cast(fwa_codes, pl.FP32)
                     fwa_values = pl.cast(fwa_values_fp32, pl.BF16, mode='rint')
-                    fwa_bits = pl.reinterpret_view(fwa_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
-                    fwa_scales = pl.reinterpret_view(fwa_bits, pl.BF16)
-                    fwa_scale_view = fwa_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
-                    fwa_dense_scales = pl.tile.move(fwa_scale_view, pl.MemorySpace.Vec)
-                    fwa_value_flat = pl.tile.reshape(fwa_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                    fwa_scale_row = pl.tile.reshape(fwa_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
-                    fwa_scale_bits = pl.tile.reinterpret_view(fwa_scale_row, pl.INT16)
-                    fwa_duplicated_bits = pl.tile.gather(fwa_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
-                    fwa_expanded_bits = pl.tile.gather(fwa_duplicated_bits, scale_c_indices, scale_gather_tmp)
-                    fwa_expanded = pl.tile.reinterpret_view(fwa_expanded_bits, pl.BF16)
-                    fwa_scaled_flat = pl.col_expand_mul(fwa_value_flat, fwa_expanded)
-                    fwa_result = pl.tile.reshape(fwa_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                    kv_half = pl.tile.assemble(kv_half, fwa_result, [0 + fwa_cast_row0, 0])
+                    fwa_scale_words = pl.reinterpret_view(fwa_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                    fwa_scale_flat = pl.tile.reshape(fwa_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_HALFWORDS])
+                    fwa_value_flat = pl.tile.reshape(fwa_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                    fwa_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                    with pl.reg_scope():
+                        fwa_all_r8 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                        for fwa_row_r8 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                            for fwa_chunk_r8 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                fwa_scale_offset_r8 = fwa_row_r8 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
+                                fwa_scale_offset_r8 = fwa_scale_offset_r8 + fwa_chunk_r8 * SPARSE_VF_WINDOW_STEP
+                                fwa_groups_r8 = pl.reg.load(fwa_scale_flat, fwa_scale_offset_r8, lanes=SPARSE_VF_WINDOW_STEP)
+                                fwa_factor_bits_r8 = pl.reg.group_broadcast(fwa_groups_r8, lanes=SPARSE_VF_REG_TILE)
+                                fwa_factor_r8 = pl.reg.interpret_cast(fwa_factor_bits_r8, dtype=pl.BF16)
+                                fwa_value_offset_r8 = fwa_row_r8 * HEAD_DIM + fwa_chunk_r8 * SPARSE_VF_REG_TILE
+                                fwa_value_r8 = pl.reg.load(fwa_value_flat, fwa_value_offset_r8, lanes=SPARSE_VF_REG_TILE)
+                                fwa_scaled_r8 = pl.reg.mul(fwa_value_r8, fwa_factor_r8, fwa_all_r8)
+                                fwa_target_row_r8 = 0 + fwa_cast_row0 + fwa_row_r8
+                                fwa_target_offset_r8 = fwa_target_row_r8 * HEAD_DIM + fwa_chunk_r8 * SPARSE_VF_REG_TILE
+                                fwa_write_r8 = pl.reg.store(fwa_kv_flat, fwa_target_offset_r8, fwa_scaled_r8, fwa_all_r8)
                 ids_fwc = pl.tile.load(window_indices, [token, first_key_base + 32], [1, SPARSE_VF_FUSED_GATHER_TILE])
                 fwc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
                 # Gather contiguous rows in one DMA.
@@ -2420,19 +2470,25 @@ def sparse_vf_fused_vector(
                     fwb_codes = fwb_packed[:, :HEAD_DIM]
                     fwb_values_fp32 = pl.cast(fwb_codes, pl.FP32)
                     fwb_values = pl.cast(fwb_values_fp32, pl.BF16, mode='rint')
-                    fwb_bits = pl.reinterpret_view(fwb_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
-                    fwb_scales = pl.reinterpret_view(fwb_bits, pl.BF16)
-                    fwb_scale_view = fwb_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
-                    fwb_dense_scales = pl.tile.move(fwb_scale_view, pl.MemorySpace.Vec)
-                    fwb_value_flat = pl.tile.reshape(fwb_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                    fwb_scale_row = pl.tile.reshape(fwb_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
-                    fwb_scale_bits = pl.tile.reinterpret_view(fwb_scale_row, pl.INT16)
-                    fwb_duplicated_bits = pl.tile.gather(fwb_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
-                    fwb_expanded_bits = pl.tile.gather(fwb_duplicated_bits, scale_c_indices, scale_gather_tmp)
-                    fwb_expanded = pl.tile.reinterpret_view(fwb_expanded_bits, pl.BF16)
-                    fwb_scaled_flat = pl.col_expand_mul(fwb_value_flat, fwb_expanded)
-                    fwb_result = pl.tile.reshape(fwb_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                    kv_half = pl.tile.assemble(kv_half, fwb_result, [16 + fwb_cast_row0, 0])
+                    fwb_scale_words = pl.reinterpret_view(fwb_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                    fwb_scale_flat = pl.tile.reshape(fwb_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_HALFWORDS])
+                    fwb_value_flat = pl.tile.reshape(fwb_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                    fwb_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                    with pl.reg_scope():
+                        fwb_all_r9 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                        for fwb_row_r9 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                            for fwb_chunk_r9 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                fwb_scale_offset_r9 = fwb_row_r9 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
+                                fwb_scale_offset_r9 = fwb_scale_offset_r9 + fwb_chunk_r9 * SPARSE_VF_WINDOW_STEP
+                                fwb_groups_r9 = pl.reg.load(fwb_scale_flat, fwb_scale_offset_r9, lanes=SPARSE_VF_WINDOW_STEP)
+                                fwb_factor_bits_r9 = pl.reg.group_broadcast(fwb_groups_r9, lanes=SPARSE_VF_REG_TILE)
+                                fwb_factor_r9 = pl.reg.interpret_cast(fwb_factor_bits_r9, dtype=pl.BF16)
+                                fwb_value_offset_r9 = fwb_row_r9 * HEAD_DIM + fwb_chunk_r9 * SPARSE_VF_REG_TILE
+                                fwb_value_r9 = pl.reg.load(fwb_value_flat, fwb_value_offset_r9, lanes=SPARSE_VF_REG_TILE)
+                                fwb_scaled_r9 = pl.reg.mul(fwb_value_r9, fwb_factor_r9, fwb_all_r9)
+                                fwb_target_row_r9 = 16 + fwb_cast_row0 + fwb_row_r9
+                                fwb_target_offset_r9 = fwb_target_row_r9 * HEAD_DIM + fwb_chunk_r9 * SPARSE_VF_REG_TILE
+                                fwb_write_r9 = pl.reg.store(fwb_kv_flat, fwb_target_offset_r9, fwb_scaled_r9, fwb_all_r9)
                 ids_fwd = pl.tile.load(window_indices, [token, first_key_base + 48], [1, SPARSE_VF_FUSED_GATHER_TILE])
                 fwd_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
                 # Gather contiguous rows in one DMA.
@@ -2476,19 +2532,25 @@ def sparse_vf_fused_vector(
                     fwc_codes = fwc_packed[:, :HEAD_DIM]
                     fwc_values_fp32 = pl.cast(fwc_codes, pl.FP32)
                     fwc_values = pl.cast(fwc_values_fp32, pl.BF16, mode='rint')
-                    fwc_bits = pl.reinterpret_view(fwc_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
-                    fwc_scales = pl.reinterpret_view(fwc_bits, pl.BF16)
-                    fwc_scale_view = fwc_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
-                    fwc_dense_scales = pl.tile.move(fwc_scale_view, pl.MemorySpace.Vec)
-                    fwc_value_flat = pl.tile.reshape(fwc_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                    fwc_scale_row = pl.tile.reshape(fwc_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
-                    fwc_scale_bits = pl.tile.reinterpret_view(fwc_scale_row, pl.INT16)
-                    fwc_duplicated_bits = pl.tile.gather(fwc_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
-                    fwc_expanded_bits = pl.tile.gather(fwc_duplicated_bits, scale_c_indices, scale_gather_tmp)
-                    fwc_expanded = pl.tile.reinterpret_view(fwc_expanded_bits, pl.BF16)
-                    fwc_scaled_flat = pl.col_expand_mul(fwc_value_flat, fwc_expanded)
-                    fwc_result = pl.tile.reshape(fwc_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                    kv_half = pl.tile.assemble(kv_half, fwc_result, [32 + fwc_cast_row0, 0])
+                    fwc_scale_words = pl.reinterpret_view(fwc_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                    fwc_scale_flat = pl.tile.reshape(fwc_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_HALFWORDS])
+                    fwc_value_flat = pl.tile.reshape(fwc_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                    fwc_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                    with pl.reg_scope():
+                        fwc_all_r10 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                        for fwc_row_r10 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                            for fwc_chunk_r10 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                fwc_scale_offset_r10 = fwc_row_r10 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
+                                fwc_scale_offset_r10 = fwc_scale_offset_r10 + fwc_chunk_r10 * SPARSE_VF_WINDOW_STEP
+                                fwc_groups_r10 = pl.reg.load(fwc_scale_flat, fwc_scale_offset_r10, lanes=SPARSE_VF_WINDOW_STEP)
+                                fwc_factor_bits_r10 = pl.reg.group_broadcast(fwc_groups_r10, lanes=SPARSE_VF_REG_TILE)
+                                fwc_factor_r10 = pl.reg.interpret_cast(fwc_factor_bits_r10, dtype=pl.BF16)
+                                fwc_value_offset_r10 = fwc_row_r10 * HEAD_DIM + fwc_chunk_r10 * SPARSE_VF_REG_TILE
+                                fwc_value_r10 = pl.reg.load(fwc_value_flat, fwc_value_offset_r10, lanes=SPARSE_VF_REG_TILE)
+                                fwc_scaled_r10 = pl.reg.mul(fwc_value_r10, fwc_factor_r10, fwc_all_r10)
+                                fwc_target_row_r10 = 32 + fwc_cast_row0 + fwc_row_r10
+                                fwc_target_offset_r10 = fwc_target_row_r10 * HEAD_DIM + fwc_chunk_r10 * SPARSE_VF_REG_TILE
+                                fwc_write_r10 = pl.reg.store(fwc_kv_flat, fwc_target_offset_r10, fwc_scaled_r10, fwc_all_r10)
                 for fwd_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
                     fwd_cast_row0 = fwd_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
                     fwd_raw_chunk = pl.tile.slice(fwd_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwd_cast_row0, 0])
@@ -2497,19 +2559,25 @@ def sparse_vf_fused_vector(
                     fwd_codes = fwd_packed[:, :HEAD_DIM]
                     fwd_values_fp32 = pl.cast(fwd_codes, pl.FP32)
                     fwd_values = pl.cast(fwd_values_fp32, pl.BF16, mode='rint')
-                    fwd_bits = pl.reinterpret_view(fwd_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
-                    fwd_scales = pl.reinterpret_view(fwd_bits, pl.BF16)
-                    fwd_scale_view = fwd_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
-                    fwd_dense_scales = pl.tile.move(fwd_scale_view, pl.MemorySpace.Vec)
-                    fwd_value_flat = pl.tile.reshape(fwd_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                    fwd_scale_row = pl.tile.reshape(fwd_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
-                    fwd_scale_bits = pl.tile.reinterpret_view(fwd_scale_row, pl.INT16)
-                    fwd_duplicated_bits = pl.tile.gather(fwd_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
-                    fwd_expanded_bits = pl.tile.gather(fwd_duplicated_bits, scale_c_indices, scale_gather_tmp)
-                    fwd_expanded = pl.tile.reinterpret_view(fwd_expanded_bits, pl.BF16)
-                    fwd_scaled_flat = pl.col_expand_mul(fwd_value_flat, fwd_expanded)
-                    fwd_result = pl.tile.reshape(fwd_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                    kv_half = pl.tile.assemble(kv_half, fwd_result, [48 + fwd_cast_row0, 0])
+                    fwd_scale_words = pl.reinterpret_view(fwd_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                    fwd_scale_flat = pl.tile.reshape(fwd_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_HALFWORDS])
+                    fwd_value_flat = pl.tile.reshape(fwd_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                    fwd_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                    with pl.reg_scope():
+                        fwd_all_r11 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                        for fwd_row_r11 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                            for fwd_chunk_r11 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                fwd_scale_offset_r11 = fwd_row_r11 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
+                                fwd_scale_offset_r11 = fwd_scale_offset_r11 + fwd_chunk_r11 * SPARSE_VF_WINDOW_STEP
+                                fwd_groups_r11 = pl.reg.load(fwd_scale_flat, fwd_scale_offset_r11, lanes=SPARSE_VF_WINDOW_STEP)
+                                fwd_factor_bits_r11 = pl.reg.group_broadcast(fwd_groups_r11, lanes=SPARSE_VF_REG_TILE)
+                                fwd_factor_r11 = pl.reg.interpret_cast(fwd_factor_bits_r11, dtype=pl.BF16)
+                                fwd_value_offset_r11 = fwd_row_r11 * HEAD_DIM + fwd_chunk_r11 * SPARSE_VF_REG_TILE
+                                fwd_value_r11 = pl.reg.load(fwd_value_flat, fwd_value_offset_r11, lanes=SPARSE_VF_REG_TILE)
+                                fwd_scaled_r11 = pl.reg.mul(fwd_value_r11, fwd_factor_r11, fwd_all_r11)
+                                fwd_target_row_r11 = 48 + fwd_cast_row0 + fwd_row_r11
+                                fwd_target_offset_r11 = fwd_target_row_r11 * HEAD_DIM + fwd_chunk_r11 * SPARSE_VF_REG_TILE
+                                fwd_write_r11 = pl.reg.store(fwd_kv_flat, fwd_target_offset_r11, fwd_scaled_r11, fwd_all_r11)
             pl.system.tpush_to_aic(kv_half, split=1, id=1)
         for part in pl.range(parts):
             column = part * SPARSE_VF_KEY_TILE
@@ -2521,27 +2589,60 @@ def sparse_vf_fused_vector(
             else:
                 c_column = column - WINDOW_KEYS
                 ids = pl.tile.load(compressed_indices, [token, c_column], [1, SPARSE_VF_KEY_TILE])
-            idx = pl.cast(ids, pl.FP32)
-            positive = pl.add(idx, 1.0)
-            nonnegative = pl.maximum(positive, 0.0)
-            valid = pl.minimum(nonnegative, 1.0)
-            masked = pl.sub(valid, 1.0)
-            penalty = pl.mul(masked, 1e+30)
-            scores = pl.col_expand_add(scores, penalty)
-            softmax_tmp = pl.tile.create([SPARSE_VF_FUSED_AIV_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-            row_max = pl.tile.row_max(scores, softmax_tmp)
-            tile_max = pl.reshape(row_max, [1, SPARSE_VF_FUSED_AIV_HEAD_TILE])
-            next_max = pl.maximum(maximum, tile_max)
-            correction = pl.col_expand_expdif(maximum, next_max)
-            next_max_col = pl.reshape(next_max, [SPARSE_VF_FUSED_AIV_HEAD_TILE, 1])
-            exponentials = pl.row_expand_expdif(scores, next_max_col)
-            probabilities = pl.col_expand_mul(exponentials, valid)
-            row_sum = pl.tile.row_sum(probabilities, softmax_tmp)
-            tile_sum = pl.reshape(row_sum, [1, SPARSE_VF_FUSED_AIV_HEAD_TILE])
-            corrected_sum = pl.mul(denominator, correction)
-            denominator = pl.add(corrected_sum, tile_sum)
+            # Keep the scaled QK Tile as owned UB for the register helper.
+            weights = pl.tile.create([SPARSE_VF_FUSED_AIV_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.BF16, target_memory=pl.MemorySpace.Vec)
+            next_max = pl.tile.create([1, SPARSE_VF_FUSED_AIV_HEAD_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+            next_denominator = pl.tile.create([1, SPARSE_VF_FUSED_AIV_HEAD_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+            correction = pl.tile.create([1, SPARSE_VF_FUSED_AIV_HEAD_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+            sm_ids_owned = pl.tile.move(ids, pl.MemorySpace.Vec)
+            sm_scores_flat = pl.tile.reshape(scores, [SPARSE_VF_FUSED_AIV_HEAD_TILE * SPARSE_VF_KEY_TILE])
+            sm_ids_flat = pl.tile.reshape(sm_ids_owned, [SPARSE_VF_KEY_TILE])
+            sm_weights_flat = pl.tile.reshape(weights, [SPARSE_VF_FUSED_AIV_HEAD_TILE * SPARSE_VF_KEY_TILE])
+            sm_old_max_flat = pl.tile.reshape(maximum, [SPARSE_VF_FUSED_AIV_HEAD_TILE])
+            sm_old_den_flat = pl.tile.reshape(denominator, [SPARSE_VF_FUSED_AIV_HEAD_TILE])
+            sm_next_max_flat = pl.tile.reshape(next_max, [SPARSE_VF_FUSED_AIV_HEAD_TILE])
+            sm_next_den_flat = pl.tile.reshape(next_denominator, [SPARSE_VF_FUSED_AIV_HEAD_TILE])
+            sm_correction_flat = pl.tile.reshape(correction, [SPARSE_VF_FUSED_AIV_HEAD_TILE])
+            with pl.reg_scope():
+                sm_all64 = pl.reg.full_mask(lanes=64)
+                sm_one = pl.reg.full_mask(lanes=1)
+                sm_ids0 = pl.reg.load(sm_ids_flat, 0, lanes=64)
+                sm_ids1 = pl.reg.load(sm_ids_flat, 64, lanes=64)
+                sm_valid0 = pl.reg.compares(sm_ids0, 0, sm_all64, predicate='ge')
+                sm_valid1 = pl.reg.compares(sm_ids1, 0, sm_all64, predicate='ge')
+                sm_invalid = pl.reg.broadcast(-1e30, lanes=64, dtype=pl.FP32)
+                for sm_row in pl.hardware_loop(SPARSE_VF_FUSED_AIV_HEAD_TILE):
+                    sm_offset = sm_row * SPARSE_VF_KEY_TILE
+                    sm_x0 = pl.reg.load(sm_scores_flat, sm_offset, lanes=64)
+                    sm_x1 = pl.reg.load(sm_scores_flat, sm_offset + 64, lanes=64)
+                    sm_masked0 = pl.reg.select(sm_valid0, sm_x0, sm_invalid)
+                    sm_masked1 = pl.reg.select(sm_valid1, sm_x1, sm_invalid)
+                    sm_folded = pl.reg.maximum(sm_masked0, sm_masked1, sm_all64)
+                    sm_tile_max = pl.reg.reduce_max(sm_folded, sm_all64)
+                    sm_old_max = pl.reg.load(sm_old_max_flat, sm_row, lanes=1)
+                    sm_new_max = pl.reg.maximum(sm_tile_max, sm_old_max, sm_one)
+                    sm_delta = pl.reg.sub(sm_old_max, sm_new_max, sm_one)
+                    sm_alpha = pl.reg.exp(sm_delta, sm_one)
+                    sm_max64 = pl.reg.broadcast(sm_new_max, lanes=64, dtype=pl.FP32)
+                    sm_probability0 = pl.reg.expdif(sm_masked0, sm_max64, sm_valid0)
+                    sm_probability1 = pl.reg.expdif(sm_masked1, sm_max64, sm_valid1)
+                    sm_sum0 = pl.reg.reduce_sum(sm_probability0, sm_all64, reassoc=True)
+                    sm_sum1 = pl.reg.reduce_sum(sm_probability1, sm_all64, reassoc=True)
+                    # Keep the two 64-lane sums ordered before their scalar add.
+                    sm_sum0_ordered = pl.reg.adds(sm_sum0, 0.0, sm_one)
+                    sm_tile_sum = pl.reg.add(sm_sum0_ordered, sm_sum1, sm_one)
+                    sm_old_den = pl.reg.load(sm_old_den_flat, sm_row, lanes=1)
+                    sm_corrected_den = pl.reg.mul(sm_old_den, sm_alpha, sm_one)
+                    sm_new_den = pl.reg.add(sm_corrected_den, sm_tile_sum, sm_one)
+                    sm_bf16_0 = pl.reg.convert(sm_probability0, dtype=pl.BF16, rounding='R', saturate=False)
+                    sm_bf16_1 = pl.reg.convert(sm_probability1, dtype=pl.BF16, rounding='R', saturate=False)
+                    sm_store_p0 = pl.reg.store(sm_weights_flat, sm_offset, sm_bf16_0)
+                    sm_store_p1 = pl.reg.store(sm_weights_flat, sm_offset + 64, sm_bf16_1)
+                    sm_store_m = pl.reg.store(sm_next_max_flat, sm_row, sm_new_max)
+                    sm_store_l = pl.reg.store(sm_next_den_flat, sm_row, sm_new_den)
+                    sm_store_c = pl.reg.store(sm_correction_flat, sm_row, sm_alpha)
             maximum = next_max
-            weights = pl.cast(probabilities, pl.BF16, mode='rint')
+            denominator = next_denominator
             pl.system.tfree_to_aic(qk_half, id=0)
             pl.system.tpush_to_aic(weights, split=1, id=2)
             if part + 2 < parts:
@@ -2628,19 +2729,25 @@ def sparse_vf_fused_vector(
                             fwa_codes = fwa_packed[:, :HEAD_DIM]
                             fwa_values_fp32 = pl.cast(fwa_codes, pl.FP32)
                             fwa_values = pl.cast(fwa_values_fp32, pl.BF16, mode='rint')
-                            fwa_bits = pl.reinterpret_view(fwa_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
-                            fwa_scales = pl.reinterpret_view(fwa_bits, pl.BF16)
-                            fwa_scale_view = fwa_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
-                            fwa_dense_scales = pl.tile.move(fwa_scale_view, pl.MemorySpace.Vec)
-                            fwa_value_flat = pl.tile.reshape(fwa_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                            fwa_scale_row = pl.tile.reshape(fwa_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
-                            fwa_scale_bits = pl.tile.reinterpret_view(fwa_scale_row, pl.INT16)
-                            fwa_duplicated_bits = pl.tile.gather(fwa_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
-                            fwa_expanded_bits = pl.tile.gather(fwa_duplicated_bits, scale_c_indices, scale_gather_tmp)
-                            fwa_expanded = pl.tile.reinterpret_view(fwa_expanded_bits, pl.BF16)
-                            fwa_scaled_flat = pl.col_expand_mul(fwa_value_flat, fwa_expanded)
-                            fwa_result = pl.tile.reshape(fwa_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                            kv_half = pl.tile.assemble(kv_half, fwa_result, [0 + fwa_cast_row0, 0])
+                            fwa_scale_words = pl.reinterpret_view(fwa_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                            fwa_scale_flat = pl.tile.reshape(fwa_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_HALFWORDS])
+                            fwa_value_flat = pl.tile.reshape(fwa_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                            fwa_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                            with pl.reg_scope():
+                                fwa_all_r12 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                                for fwa_row_r12 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                                    for fwa_chunk_r12 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                        fwa_scale_offset_r12 = fwa_row_r12 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
+                                        fwa_scale_offset_r12 = fwa_scale_offset_r12 + fwa_chunk_r12 * SPARSE_VF_WINDOW_STEP
+                                        fwa_groups_r12 = pl.reg.load(fwa_scale_flat, fwa_scale_offset_r12, lanes=SPARSE_VF_WINDOW_STEP)
+                                        fwa_factor_bits_r12 = pl.reg.group_broadcast(fwa_groups_r12, lanes=SPARSE_VF_REG_TILE)
+                                        fwa_factor_r12 = pl.reg.interpret_cast(fwa_factor_bits_r12, dtype=pl.BF16)
+                                        fwa_value_offset_r12 = fwa_row_r12 * HEAD_DIM + fwa_chunk_r12 * SPARSE_VF_REG_TILE
+                                        fwa_value_r12 = pl.reg.load(fwa_value_flat, fwa_value_offset_r12, lanes=SPARSE_VF_REG_TILE)
+                                        fwa_scaled_r12 = pl.reg.mul(fwa_value_r12, fwa_factor_r12, fwa_all_r12)
+                                        fwa_target_row_r12 = 0 + fwa_cast_row0 + fwa_row_r12
+                                        fwa_target_offset_r12 = fwa_target_row_r12 * HEAD_DIM + fwa_chunk_r12 * SPARSE_VF_REG_TILE
+                                        fwa_write_r12 = pl.reg.store(fwa_kv_flat, fwa_target_offset_r12, fwa_scaled_r12, fwa_all_r12)
                         ids_fwc = pl.tile.load(window_indices, [token, first_key_base + 32], [1, SPARSE_VF_FUSED_GATHER_TILE])
                         fwc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
                         # Gather contiguous rows in one DMA.
@@ -2684,19 +2791,25 @@ def sparse_vf_fused_vector(
                             fwb_codes = fwb_packed[:, :HEAD_DIM]
                             fwb_values_fp32 = pl.cast(fwb_codes, pl.FP32)
                             fwb_values = pl.cast(fwb_values_fp32, pl.BF16, mode='rint')
-                            fwb_bits = pl.reinterpret_view(fwb_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
-                            fwb_scales = pl.reinterpret_view(fwb_bits, pl.BF16)
-                            fwb_scale_view = fwb_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
-                            fwb_dense_scales = pl.tile.move(fwb_scale_view, pl.MemorySpace.Vec)
-                            fwb_value_flat = pl.tile.reshape(fwb_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                            fwb_scale_row = pl.tile.reshape(fwb_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
-                            fwb_scale_bits = pl.tile.reinterpret_view(fwb_scale_row, pl.INT16)
-                            fwb_duplicated_bits = pl.tile.gather(fwb_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
-                            fwb_expanded_bits = pl.tile.gather(fwb_duplicated_bits, scale_c_indices, scale_gather_tmp)
-                            fwb_expanded = pl.tile.reinterpret_view(fwb_expanded_bits, pl.BF16)
-                            fwb_scaled_flat = pl.col_expand_mul(fwb_value_flat, fwb_expanded)
-                            fwb_result = pl.tile.reshape(fwb_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                            kv_half = pl.tile.assemble(kv_half, fwb_result, [16 + fwb_cast_row0, 0])
+                            fwb_scale_words = pl.reinterpret_view(fwb_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                            fwb_scale_flat = pl.tile.reshape(fwb_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_HALFWORDS])
+                            fwb_value_flat = pl.tile.reshape(fwb_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                            fwb_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                            with pl.reg_scope():
+                                fwb_all_r13 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                                for fwb_row_r13 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                                    for fwb_chunk_r13 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                        fwb_scale_offset_r13 = fwb_row_r13 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
+                                        fwb_scale_offset_r13 = fwb_scale_offset_r13 + fwb_chunk_r13 * SPARSE_VF_WINDOW_STEP
+                                        fwb_groups_r13 = pl.reg.load(fwb_scale_flat, fwb_scale_offset_r13, lanes=SPARSE_VF_WINDOW_STEP)
+                                        fwb_factor_bits_r13 = pl.reg.group_broadcast(fwb_groups_r13, lanes=SPARSE_VF_REG_TILE)
+                                        fwb_factor_r13 = pl.reg.interpret_cast(fwb_factor_bits_r13, dtype=pl.BF16)
+                                        fwb_value_offset_r13 = fwb_row_r13 * HEAD_DIM + fwb_chunk_r13 * SPARSE_VF_REG_TILE
+                                        fwb_value_r13 = pl.reg.load(fwb_value_flat, fwb_value_offset_r13, lanes=SPARSE_VF_REG_TILE)
+                                        fwb_scaled_r13 = pl.reg.mul(fwb_value_r13, fwb_factor_r13, fwb_all_r13)
+                                        fwb_target_row_r13 = 16 + fwb_cast_row0 + fwb_row_r13
+                                        fwb_target_offset_r13 = fwb_target_row_r13 * HEAD_DIM + fwb_chunk_r13 * SPARSE_VF_REG_TILE
+                                        fwb_write_r13 = pl.reg.store(fwb_kv_flat, fwb_target_offset_r13, fwb_scaled_r13, fwb_all_r13)
                         ids_fwd = pl.tile.load(window_indices, [token, first_key_base + 48], [1, SPARSE_VF_FUSED_GATHER_TILE])
                         fwd_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
                         # Gather contiguous rows in one DMA.
@@ -2740,19 +2853,25 @@ def sparse_vf_fused_vector(
                             fwc_codes = fwc_packed[:, :HEAD_DIM]
                             fwc_values_fp32 = pl.cast(fwc_codes, pl.FP32)
                             fwc_values = pl.cast(fwc_values_fp32, pl.BF16, mode='rint')
-                            fwc_bits = pl.reinterpret_view(fwc_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
-                            fwc_scales = pl.reinterpret_view(fwc_bits, pl.BF16)
-                            fwc_scale_view = fwc_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
-                            fwc_dense_scales = pl.tile.move(fwc_scale_view, pl.MemorySpace.Vec)
-                            fwc_value_flat = pl.tile.reshape(fwc_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                            fwc_scale_row = pl.tile.reshape(fwc_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
-                            fwc_scale_bits = pl.tile.reinterpret_view(fwc_scale_row, pl.INT16)
-                            fwc_duplicated_bits = pl.tile.gather(fwc_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
-                            fwc_expanded_bits = pl.tile.gather(fwc_duplicated_bits, scale_c_indices, scale_gather_tmp)
-                            fwc_expanded = pl.tile.reinterpret_view(fwc_expanded_bits, pl.BF16)
-                            fwc_scaled_flat = pl.col_expand_mul(fwc_value_flat, fwc_expanded)
-                            fwc_result = pl.tile.reshape(fwc_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                            kv_half = pl.tile.assemble(kv_half, fwc_result, [32 + fwc_cast_row0, 0])
+                            fwc_scale_words = pl.reinterpret_view(fwc_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                            fwc_scale_flat = pl.tile.reshape(fwc_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_HALFWORDS])
+                            fwc_value_flat = pl.tile.reshape(fwc_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                            fwc_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                            with pl.reg_scope():
+                                fwc_all_r14 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                                for fwc_row_r14 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                                    for fwc_chunk_r14 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                        fwc_scale_offset_r14 = fwc_row_r14 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
+                                        fwc_scale_offset_r14 = fwc_scale_offset_r14 + fwc_chunk_r14 * SPARSE_VF_WINDOW_STEP
+                                        fwc_groups_r14 = pl.reg.load(fwc_scale_flat, fwc_scale_offset_r14, lanes=SPARSE_VF_WINDOW_STEP)
+                                        fwc_factor_bits_r14 = pl.reg.group_broadcast(fwc_groups_r14, lanes=SPARSE_VF_REG_TILE)
+                                        fwc_factor_r14 = pl.reg.interpret_cast(fwc_factor_bits_r14, dtype=pl.BF16)
+                                        fwc_value_offset_r14 = fwc_row_r14 * HEAD_DIM + fwc_chunk_r14 * SPARSE_VF_REG_TILE
+                                        fwc_value_r14 = pl.reg.load(fwc_value_flat, fwc_value_offset_r14, lanes=SPARSE_VF_REG_TILE)
+                                        fwc_scaled_r14 = pl.reg.mul(fwc_value_r14, fwc_factor_r14, fwc_all_r14)
+                                        fwc_target_row_r14 = 32 + fwc_cast_row0 + fwc_row_r14
+                                        fwc_target_offset_r14 = fwc_target_row_r14 * HEAD_DIM + fwc_chunk_r14 * SPARSE_VF_REG_TILE
+                                        fwc_write_r14 = pl.reg.store(fwc_kv_flat, fwc_target_offset_r14, fwc_scaled_r14, fwc_all_r14)
                         for fwd_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
                             fwd_cast_row0 = fwd_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
                             fwd_raw_chunk = pl.tile.slice(fwd_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwd_cast_row0, 0])
@@ -2761,19 +2880,25 @@ def sparse_vf_fused_vector(
                             fwd_codes = fwd_packed[:, :HEAD_DIM]
                             fwd_values_fp32 = pl.cast(fwd_codes, pl.FP32)
                             fwd_values = pl.cast(fwd_values_fp32, pl.BF16, mode='rint')
-                            fwd_bits = pl.reinterpret_view(fwd_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
-                            fwd_scales = pl.reinterpret_view(fwd_bits, pl.BF16)
-                            fwd_scale_view = fwd_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
-                            fwd_dense_scales = pl.tile.move(fwd_scale_view, pl.MemorySpace.Vec)
-                            fwd_value_flat = pl.tile.reshape(fwd_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                            fwd_scale_row = pl.tile.reshape(fwd_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
-                            fwd_scale_bits = pl.tile.reinterpret_view(fwd_scale_row, pl.INT16)
-                            fwd_duplicated_bits = pl.tile.gather(fwd_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
-                            fwd_expanded_bits = pl.tile.gather(fwd_duplicated_bits, scale_c_indices, scale_gather_tmp)
-                            fwd_expanded = pl.tile.reinterpret_view(fwd_expanded_bits, pl.BF16)
-                            fwd_scaled_flat = pl.col_expand_mul(fwd_value_flat, fwd_expanded)
-                            fwd_result = pl.tile.reshape(fwd_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                            kv_half = pl.tile.assemble(kv_half, fwd_result, [48 + fwd_cast_row0, 0])
+                            fwd_scale_words = pl.reinterpret_view(fwd_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                            fwd_scale_flat = pl.tile.reshape(fwd_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_HALFWORDS])
+                            fwd_value_flat = pl.tile.reshape(fwd_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                            fwd_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                            with pl.reg_scope():
+                                fwd_all_r15 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                                for fwd_row_r15 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                                    for fwd_chunk_r15 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                        fwd_scale_offset_r15 = fwd_row_r15 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
+                                        fwd_scale_offset_r15 = fwd_scale_offset_r15 + fwd_chunk_r15 * SPARSE_VF_WINDOW_STEP
+                                        fwd_groups_r15 = pl.reg.load(fwd_scale_flat, fwd_scale_offset_r15, lanes=SPARSE_VF_WINDOW_STEP)
+                                        fwd_factor_bits_r15 = pl.reg.group_broadcast(fwd_groups_r15, lanes=SPARSE_VF_REG_TILE)
+                                        fwd_factor_r15 = pl.reg.interpret_cast(fwd_factor_bits_r15, dtype=pl.BF16)
+                                        fwd_value_offset_r15 = fwd_row_r15 * HEAD_DIM + fwd_chunk_r15 * SPARSE_VF_REG_TILE
+                                        fwd_value_r15 = pl.reg.load(fwd_value_flat, fwd_value_offset_r15, lanes=SPARSE_VF_REG_TILE)
+                                        fwd_scaled_r15 = pl.reg.mul(fwd_value_r15, fwd_factor_r15, fwd_all_r15)
+                                        fwd_target_row_r15 = 48 + fwd_cast_row0 + fwd_row_r15
+                                        fwd_target_offset_r15 = fwd_target_row_r15 * HEAD_DIM + fwd_chunk_r15 * SPARSE_VF_REG_TILE
+                                        fwd_write_r15 = pl.reg.store(fwd_kv_flat, fwd_target_offset_r15, fwd_scaled_r15, fwd_all_r15)
                     else:
                         ids_fca = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 0], [1, SPARSE_VF_FUSED_GATHER_TILE])
                         ids_fcb = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 16], [1, SPARSE_VF_FUSED_GATHER_TILE])
@@ -2825,18 +2950,25 @@ def sparse_vf_fused_vector(
                             fca_packed = pl.reinterpret_view(fca_raw_chunk, pl.FP4E2M1X2)
                             fca_codes = fca_packed[:, :SPARSE_VF_HALF_DIM]
                             fca_values = pl.cast(fca_codes, pl.BF16)
-                            fca_bits = pl.reinterpret_view(fca_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                            fca_scales = pl.reinterpret_view(fca_bits, pl.BF16)
-                            fca_scale_view = fca_scales[:, SPARSE_VF_COMPRESSED_SCALE_OFFSET:SPARSE_VF_COMPRESSED_SCALE_END]
-                            fca_dense_scales = pl.tile.move(fca_scale_view, pl.MemorySpace.Vec)
-                            fca_value_flat = pl.tile.reshape(fca_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                            fca_scale_row = pl.tile.reshape(fca_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_GROUPS])
-                            fca_scale_bits = pl.tile.reinterpret_view(fca_scale_row, pl.INT16)
-                            fca_expanded_bits = pl.tile.gather(fca_scale_bits, scale_c_indices, scale_gather_tmp)
-                            fca_expanded = pl.tile.reinterpret_view(fca_expanded_bits, pl.BF16)
-                            fca_scaled_flat = pl.col_expand_mul(fca_value_flat, fca_expanded)
-                            fca_result = pl.tile.reshape(fca_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                            kv_half = pl.tile.assemble(kv_half, fca_result, [0 + fca_cast_row0, 0])
+                            fca_scale_words = pl.reinterpret_view(fca_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                            fca_scale_flat = pl.tile.reshape(fca_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+                            fca_value_flat = pl.tile.reshape(fca_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                            fca_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                            with pl.reg_scope():
+                                fca_all_r16 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                                for fca_row_r16 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                                    for fca_chunk_r16 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                        fca_scale_offset_r16 = fca_row_r16 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
+                                        fca_scale_offset_r16 = fca_scale_offset_r16 + fca_chunk_r16 * SPARSE_VF_COMPRESSED_STEP
+                                        fca_groups_r16 = pl.reg.load(fca_scale_flat, fca_scale_offset_r16, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                        fca_factor_bits_r16 = pl.reg.group_broadcast(fca_groups_r16, lanes=SPARSE_VF_REG_TILE)
+                                        fca_factor_r16 = pl.reg.interpret_cast(fca_factor_bits_r16, dtype=pl.BF16)
+                                        fca_value_offset_r16 = fca_row_r16 * HEAD_DIM + fca_chunk_r16 * SPARSE_VF_REG_TILE
+                                        fca_value_r16 = pl.reg.load(fca_value_flat, fca_value_offset_r16, lanes=SPARSE_VF_REG_TILE)
+                                        fca_scaled_r16 = pl.reg.mul(fca_value_r16, fca_factor_r16, fca_all_r16)
+                                        fca_target_row_r16 = 0 + fca_cast_row0 + fca_row_r16
+                                        fca_target_offset_r16 = fca_target_row_r16 * HEAD_DIM + fca_chunk_r16 * SPARSE_VF_REG_TILE
+                                        fca_write_r16 = pl.reg.store(fca_kv_flat, fca_target_offset_r16, fca_scaled_r16, fca_all_r16)
                         ids_fcc = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 32], [1, SPARSE_VF_FUSED_GATHER_TILE])
                         fcc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
                         for fcc_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
@@ -2865,18 +2997,25 @@ def sparse_vf_fused_vector(
                             fcb_packed = pl.reinterpret_view(fcb_raw_chunk, pl.FP4E2M1X2)
                             fcb_codes = fcb_packed[:, :SPARSE_VF_HALF_DIM]
                             fcb_values = pl.cast(fcb_codes, pl.BF16)
-                            fcb_bits = pl.reinterpret_view(fcb_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                            fcb_scales = pl.reinterpret_view(fcb_bits, pl.BF16)
-                            fcb_scale_view = fcb_scales[:, SPARSE_VF_COMPRESSED_SCALE_OFFSET:SPARSE_VF_COMPRESSED_SCALE_END]
-                            fcb_dense_scales = pl.tile.move(fcb_scale_view, pl.MemorySpace.Vec)
-                            fcb_value_flat = pl.tile.reshape(fcb_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                            fcb_scale_row = pl.tile.reshape(fcb_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_GROUPS])
-                            fcb_scale_bits = pl.tile.reinterpret_view(fcb_scale_row, pl.INT16)
-                            fcb_expanded_bits = pl.tile.gather(fcb_scale_bits, scale_c_indices, scale_gather_tmp)
-                            fcb_expanded = pl.tile.reinterpret_view(fcb_expanded_bits, pl.BF16)
-                            fcb_scaled_flat = pl.col_expand_mul(fcb_value_flat, fcb_expanded)
-                            fcb_result = pl.tile.reshape(fcb_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                            kv_half = pl.tile.assemble(kv_half, fcb_result, [16 + fcb_cast_row0, 0])
+                            fcb_scale_words = pl.reinterpret_view(fcb_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                            fcb_scale_flat = pl.tile.reshape(fcb_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+                            fcb_value_flat = pl.tile.reshape(fcb_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                            fcb_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                            with pl.reg_scope():
+                                fcb_all_r17 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                                for fcb_row_r17 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                                    for fcb_chunk_r17 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                        fcb_scale_offset_r17 = fcb_row_r17 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
+                                        fcb_scale_offset_r17 = fcb_scale_offset_r17 + fcb_chunk_r17 * SPARSE_VF_COMPRESSED_STEP
+                                        fcb_groups_r17 = pl.reg.load(fcb_scale_flat, fcb_scale_offset_r17, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                        fcb_factor_bits_r17 = pl.reg.group_broadcast(fcb_groups_r17, lanes=SPARSE_VF_REG_TILE)
+                                        fcb_factor_r17 = pl.reg.interpret_cast(fcb_factor_bits_r17, dtype=pl.BF16)
+                                        fcb_value_offset_r17 = fcb_row_r17 * HEAD_DIM + fcb_chunk_r17 * SPARSE_VF_REG_TILE
+                                        fcb_value_r17 = pl.reg.load(fcb_value_flat, fcb_value_offset_r17, lanes=SPARSE_VF_REG_TILE)
+                                        fcb_scaled_r17 = pl.reg.mul(fcb_value_r17, fcb_factor_r17, fcb_all_r17)
+                                        fcb_target_row_r17 = 16 + fcb_cast_row0 + fcb_row_r17
+                                        fcb_target_offset_r17 = fcb_target_row_r17 * HEAD_DIM + fcb_chunk_r17 * SPARSE_VF_REG_TILE
+                                        fcb_write_r17 = pl.reg.store(fcb_kv_flat, fcb_target_offset_r17, fcb_scaled_r17, fcb_all_r17)
                         ids_fcd = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 48], [1, SPARSE_VF_FUSED_GATHER_TILE])
                         fcd_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
                         for fcd_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
@@ -2905,36 +3044,50 @@ def sparse_vf_fused_vector(
                             fcc_packed = pl.reinterpret_view(fcc_raw_chunk, pl.FP4E2M1X2)
                             fcc_codes = fcc_packed[:, :SPARSE_VF_HALF_DIM]
                             fcc_values = pl.cast(fcc_codes, pl.BF16)
-                            fcc_bits = pl.reinterpret_view(fcc_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                            fcc_scales = pl.reinterpret_view(fcc_bits, pl.BF16)
-                            fcc_scale_view = fcc_scales[:, SPARSE_VF_COMPRESSED_SCALE_OFFSET:SPARSE_VF_COMPRESSED_SCALE_END]
-                            fcc_dense_scales = pl.tile.move(fcc_scale_view, pl.MemorySpace.Vec)
-                            fcc_value_flat = pl.tile.reshape(fcc_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                            fcc_scale_row = pl.tile.reshape(fcc_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_GROUPS])
-                            fcc_scale_bits = pl.tile.reinterpret_view(fcc_scale_row, pl.INT16)
-                            fcc_expanded_bits = pl.tile.gather(fcc_scale_bits, scale_c_indices, scale_gather_tmp)
-                            fcc_expanded = pl.tile.reinterpret_view(fcc_expanded_bits, pl.BF16)
-                            fcc_scaled_flat = pl.col_expand_mul(fcc_value_flat, fcc_expanded)
-                            fcc_result = pl.tile.reshape(fcc_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                            kv_half = pl.tile.assemble(kv_half, fcc_result, [32 + fcc_cast_row0, 0])
+                            fcc_scale_words = pl.reinterpret_view(fcc_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                            fcc_scale_flat = pl.tile.reshape(fcc_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+                            fcc_value_flat = pl.tile.reshape(fcc_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                            fcc_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                            with pl.reg_scope():
+                                fcc_all_r18 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                                for fcc_row_r18 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                                    for fcc_chunk_r18 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                        fcc_scale_offset_r18 = fcc_row_r18 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
+                                        fcc_scale_offset_r18 = fcc_scale_offset_r18 + fcc_chunk_r18 * SPARSE_VF_COMPRESSED_STEP
+                                        fcc_groups_r18 = pl.reg.load(fcc_scale_flat, fcc_scale_offset_r18, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                        fcc_factor_bits_r18 = pl.reg.group_broadcast(fcc_groups_r18, lanes=SPARSE_VF_REG_TILE)
+                                        fcc_factor_r18 = pl.reg.interpret_cast(fcc_factor_bits_r18, dtype=pl.BF16)
+                                        fcc_value_offset_r18 = fcc_row_r18 * HEAD_DIM + fcc_chunk_r18 * SPARSE_VF_REG_TILE
+                                        fcc_value_r18 = pl.reg.load(fcc_value_flat, fcc_value_offset_r18, lanes=SPARSE_VF_REG_TILE)
+                                        fcc_scaled_r18 = pl.reg.mul(fcc_value_r18, fcc_factor_r18, fcc_all_r18)
+                                        fcc_target_row_r18 = 32 + fcc_cast_row0 + fcc_row_r18
+                                        fcc_target_offset_r18 = fcc_target_row_r18 * HEAD_DIM + fcc_chunk_r18 * SPARSE_VF_REG_TILE
+                                        fcc_write_r18 = pl.reg.store(fcc_kv_flat, fcc_target_offset_r18, fcc_scaled_r18, fcc_all_r18)
                         for fcd_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
                             fcd_cast_row0 = fcd_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
                             fcd_raw_chunk = pl.tile.slice(fcd_raw, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [fcd_cast_row0, 0])
                             fcd_packed = pl.reinterpret_view(fcd_raw_chunk, pl.FP4E2M1X2)
                             fcd_codes = fcd_packed[:, :SPARSE_VF_HALF_DIM]
                             fcd_values = pl.cast(fcd_codes, pl.BF16)
-                            fcd_bits = pl.reinterpret_view(fcd_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                            fcd_scales = pl.reinterpret_view(fcd_bits, pl.BF16)
-                            fcd_scale_view = fcd_scales[:, SPARSE_VF_COMPRESSED_SCALE_OFFSET:SPARSE_VF_COMPRESSED_SCALE_END]
-                            fcd_dense_scales = pl.tile.move(fcd_scale_view, pl.MemorySpace.Vec)
-                            fcd_value_flat = pl.tile.reshape(fcd_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                            fcd_scale_row = pl.tile.reshape(fcd_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_GROUPS])
-                            fcd_scale_bits = pl.tile.reinterpret_view(fcd_scale_row, pl.INT16)
-                            fcd_expanded_bits = pl.tile.gather(fcd_scale_bits, scale_c_indices, scale_gather_tmp)
-                            fcd_expanded = pl.tile.reinterpret_view(fcd_expanded_bits, pl.BF16)
-                            fcd_scaled_flat = pl.col_expand_mul(fcd_value_flat, fcd_expanded)
-                            fcd_result = pl.tile.reshape(fcd_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                            kv_half = pl.tile.assemble(kv_half, fcd_result, [48 + fcd_cast_row0, 0])
+                            fcd_scale_words = pl.reinterpret_view(fcd_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                            fcd_scale_flat = pl.tile.reshape(fcd_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+                            fcd_value_flat = pl.tile.reshape(fcd_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                            fcd_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                            with pl.reg_scope():
+                                fcd_all_r19 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                                for fcd_row_r19 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                                    for fcd_chunk_r19 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                        fcd_scale_offset_r19 = fcd_row_r19 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
+                                        fcd_scale_offset_r19 = fcd_scale_offset_r19 + fcd_chunk_r19 * SPARSE_VF_COMPRESSED_STEP
+                                        fcd_groups_r19 = pl.reg.load(fcd_scale_flat, fcd_scale_offset_r19, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                        fcd_factor_bits_r19 = pl.reg.group_broadcast(fcd_groups_r19, lanes=SPARSE_VF_REG_TILE)
+                                        fcd_factor_r19 = pl.reg.interpret_cast(fcd_factor_bits_r19, dtype=pl.BF16)
+                                        fcd_value_offset_r19 = fcd_row_r19 * HEAD_DIM + fcd_chunk_r19 * SPARSE_VF_REG_TILE
+                                        fcd_value_r19 = pl.reg.load(fcd_value_flat, fcd_value_offset_r19, lanes=SPARSE_VF_REG_TILE)
+                                        fcd_scaled_r19 = pl.reg.mul(fcd_value_r19, fcd_factor_r19, fcd_all_r19)
+                                        fcd_target_row_r19 = 48 + fcd_cast_row0 + fcd_row_r19
+                                        fcd_target_offset_r19 = fcd_target_row_r19 * HEAD_DIM + fcd_chunk_r19 * SPARSE_VF_REG_TILE
+                                        fcd_write_r19 = pl.reg.store(fcd_kv_flat, fcd_target_offset_r19, fcd_scaled_r19, fcd_all_r19)
                 else:
                     ids_fwa = pl.tile.load(window_indices, [token, first_key_base + 0], [1, SPARSE_VF_FUSED_GATHER_TILE])
                     ids_fwb = pl.tile.load(window_indices, [token, first_key_base + 16], [1, SPARSE_VF_FUSED_GATHER_TILE])
@@ -3014,19 +3167,25 @@ def sparse_vf_fused_vector(
                         fwa_codes = fwa_packed[:, :HEAD_DIM]
                         fwa_values_fp32 = pl.cast(fwa_codes, pl.FP32)
                         fwa_values = pl.cast(fwa_values_fp32, pl.BF16, mode='rint')
-                        fwa_bits = pl.reinterpret_view(fwa_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
-                        fwa_scales = pl.reinterpret_view(fwa_bits, pl.BF16)
-                        fwa_scale_view = fwa_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
-                        fwa_dense_scales = pl.tile.move(fwa_scale_view, pl.MemorySpace.Vec)
-                        fwa_value_flat = pl.tile.reshape(fwa_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fwa_scale_row = pl.tile.reshape(fwa_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
-                        fwa_scale_bits = pl.tile.reinterpret_view(fwa_scale_row, pl.INT16)
-                        fwa_duplicated_bits = pl.tile.gather(fwa_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
-                        fwa_expanded_bits = pl.tile.gather(fwa_duplicated_bits, scale_c_indices, scale_gather_tmp)
-                        fwa_expanded = pl.tile.reinterpret_view(fwa_expanded_bits, pl.BF16)
-                        fwa_scaled_flat = pl.col_expand_mul(fwa_value_flat, fwa_expanded)
-                        fwa_result = pl.tile.reshape(fwa_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                        kv_half = pl.tile.assemble(kv_half, fwa_result, [0 + fwa_cast_row0, 0])
+                        fwa_scale_words = pl.reinterpret_view(fwa_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                        fwa_scale_flat = pl.tile.reshape(fwa_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_HALFWORDS])
+                        fwa_value_flat = pl.tile.reshape(fwa_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fwa_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                        with pl.reg_scope():
+                            fwa_all_r20 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                            for fwa_row_r20 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                                for fwa_chunk_r20 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                    fwa_scale_offset_r20 = fwa_row_r20 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
+                                    fwa_scale_offset_r20 = fwa_scale_offset_r20 + fwa_chunk_r20 * SPARSE_VF_WINDOW_STEP
+                                    fwa_groups_r20 = pl.reg.load(fwa_scale_flat, fwa_scale_offset_r20, lanes=SPARSE_VF_WINDOW_STEP)
+                                    fwa_factor_bits_r20 = pl.reg.group_broadcast(fwa_groups_r20, lanes=SPARSE_VF_REG_TILE)
+                                    fwa_factor_r20 = pl.reg.interpret_cast(fwa_factor_bits_r20, dtype=pl.BF16)
+                                    fwa_value_offset_r20 = fwa_row_r20 * HEAD_DIM + fwa_chunk_r20 * SPARSE_VF_REG_TILE
+                                    fwa_value_r20 = pl.reg.load(fwa_value_flat, fwa_value_offset_r20, lanes=SPARSE_VF_REG_TILE)
+                                    fwa_scaled_r20 = pl.reg.mul(fwa_value_r20, fwa_factor_r20, fwa_all_r20)
+                                    fwa_target_row_r20 = 0 + fwa_cast_row0 + fwa_row_r20
+                                    fwa_target_offset_r20 = fwa_target_row_r20 * HEAD_DIM + fwa_chunk_r20 * SPARSE_VF_REG_TILE
+                                    fwa_write_r20 = pl.reg.store(fwa_kv_flat, fwa_target_offset_r20, fwa_scaled_r20, fwa_all_r20)
                     ids_fwc = pl.tile.load(window_indices, [token, first_key_base + 32], [1, SPARSE_VF_FUSED_GATHER_TILE])
                     fwc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
                     # Gather contiguous rows in one DMA.
@@ -3070,19 +3229,25 @@ def sparse_vf_fused_vector(
                         fwb_codes = fwb_packed[:, :HEAD_DIM]
                         fwb_values_fp32 = pl.cast(fwb_codes, pl.FP32)
                         fwb_values = pl.cast(fwb_values_fp32, pl.BF16, mode='rint')
-                        fwb_bits = pl.reinterpret_view(fwb_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
-                        fwb_scales = pl.reinterpret_view(fwb_bits, pl.BF16)
-                        fwb_scale_view = fwb_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
-                        fwb_dense_scales = pl.tile.move(fwb_scale_view, pl.MemorySpace.Vec)
-                        fwb_value_flat = pl.tile.reshape(fwb_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fwb_scale_row = pl.tile.reshape(fwb_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
-                        fwb_scale_bits = pl.tile.reinterpret_view(fwb_scale_row, pl.INT16)
-                        fwb_duplicated_bits = pl.tile.gather(fwb_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
-                        fwb_expanded_bits = pl.tile.gather(fwb_duplicated_bits, scale_c_indices, scale_gather_tmp)
-                        fwb_expanded = pl.tile.reinterpret_view(fwb_expanded_bits, pl.BF16)
-                        fwb_scaled_flat = pl.col_expand_mul(fwb_value_flat, fwb_expanded)
-                        fwb_result = pl.tile.reshape(fwb_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                        kv_half = pl.tile.assemble(kv_half, fwb_result, [16 + fwb_cast_row0, 0])
+                        fwb_scale_words = pl.reinterpret_view(fwb_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                        fwb_scale_flat = pl.tile.reshape(fwb_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_HALFWORDS])
+                        fwb_value_flat = pl.tile.reshape(fwb_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fwb_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                        with pl.reg_scope():
+                            fwb_all_r21 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                            for fwb_row_r21 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                                for fwb_chunk_r21 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                    fwb_scale_offset_r21 = fwb_row_r21 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
+                                    fwb_scale_offset_r21 = fwb_scale_offset_r21 + fwb_chunk_r21 * SPARSE_VF_WINDOW_STEP
+                                    fwb_groups_r21 = pl.reg.load(fwb_scale_flat, fwb_scale_offset_r21, lanes=SPARSE_VF_WINDOW_STEP)
+                                    fwb_factor_bits_r21 = pl.reg.group_broadcast(fwb_groups_r21, lanes=SPARSE_VF_REG_TILE)
+                                    fwb_factor_r21 = pl.reg.interpret_cast(fwb_factor_bits_r21, dtype=pl.BF16)
+                                    fwb_value_offset_r21 = fwb_row_r21 * HEAD_DIM + fwb_chunk_r21 * SPARSE_VF_REG_TILE
+                                    fwb_value_r21 = pl.reg.load(fwb_value_flat, fwb_value_offset_r21, lanes=SPARSE_VF_REG_TILE)
+                                    fwb_scaled_r21 = pl.reg.mul(fwb_value_r21, fwb_factor_r21, fwb_all_r21)
+                                    fwb_target_row_r21 = 16 + fwb_cast_row0 + fwb_row_r21
+                                    fwb_target_offset_r21 = fwb_target_row_r21 * HEAD_DIM + fwb_chunk_r21 * SPARSE_VF_REG_TILE
+                                    fwb_write_r21 = pl.reg.store(fwb_kv_flat, fwb_target_offset_r21, fwb_scaled_r21, fwb_all_r21)
                     ids_fwd = pl.tile.load(window_indices, [token, first_key_base + 48], [1, SPARSE_VF_FUSED_GATHER_TILE])
                     fwd_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
                     # Gather contiguous rows in one DMA.
@@ -3126,19 +3291,25 @@ def sparse_vf_fused_vector(
                         fwc_codes = fwc_packed[:, :HEAD_DIM]
                         fwc_values_fp32 = pl.cast(fwc_codes, pl.FP32)
                         fwc_values = pl.cast(fwc_values_fp32, pl.BF16, mode='rint')
-                        fwc_bits = pl.reinterpret_view(fwc_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
-                        fwc_scales = pl.reinterpret_view(fwc_bits, pl.BF16)
-                        fwc_scale_view = fwc_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
-                        fwc_dense_scales = pl.tile.move(fwc_scale_view, pl.MemorySpace.Vec)
-                        fwc_value_flat = pl.tile.reshape(fwc_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fwc_scale_row = pl.tile.reshape(fwc_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
-                        fwc_scale_bits = pl.tile.reinterpret_view(fwc_scale_row, pl.INT16)
-                        fwc_duplicated_bits = pl.tile.gather(fwc_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
-                        fwc_expanded_bits = pl.tile.gather(fwc_duplicated_bits, scale_c_indices, scale_gather_tmp)
-                        fwc_expanded = pl.tile.reinterpret_view(fwc_expanded_bits, pl.BF16)
-                        fwc_scaled_flat = pl.col_expand_mul(fwc_value_flat, fwc_expanded)
-                        fwc_result = pl.tile.reshape(fwc_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                        kv_half = pl.tile.assemble(kv_half, fwc_result, [32 + fwc_cast_row0, 0])
+                        fwc_scale_words = pl.reinterpret_view(fwc_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                        fwc_scale_flat = pl.tile.reshape(fwc_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_HALFWORDS])
+                        fwc_value_flat = pl.tile.reshape(fwc_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fwc_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                        with pl.reg_scope():
+                            fwc_all_r22 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                            for fwc_row_r22 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                                for fwc_chunk_r22 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                    fwc_scale_offset_r22 = fwc_row_r22 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
+                                    fwc_scale_offset_r22 = fwc_scale_offset_r22 + fwc_chunk_r22 * SPARSE_VF_WINDOW_STEP
+                                    fwc_groups_r22 = pl.reg.load(fwc_scale_flat, fwc_scale_offset_r22, lanes=SPARSE_VF_WINDOW_STEP)
+                                    fwc_factor_bits_r22 = pl.reg.group_broadcast(fwc_groups_r22, lanes=SPARSE_VF_REG_TILE)
+                                    fwc_factor_r22 = pl.reg.interpret_cast(fwc_factor_bits_r22, dtype=pl.BF16)
+                                    fwc_value_offset_r22 = fwc_row_r22 * HEAD_DIM + fwc_chunk_r22 * SPARSE_VF_REG_TILE
+                                    fwc_value_r22 = pl.reg.load(fwc_value_flat, fwc_value_offset_r22, lanes=SPARSE_VF_REG_TILE)
+                                    fwc_scaled_r22 = pl.reg.mul(fwc_value_r22, fwc_factor_r22, fwc_all_r22)
+                                    fwc_target_row_r22 = 32 + fwc_cast_row0 + fwc_row_r22
+                                    fwc_target_offset_r22 = fwc_target_row_r22 * HEAD_DIM + fwc_chunk_r22 * SPARSE_VF_REG_TILE
+                                    fwc_write_r22 = pl.reg.store(fwc_kv_flat, fwc_target_offset_r22, fwc_scaled_r22, fwc_all_r22)
                     for fwd_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
                         fwd_cast_row0 = fwd_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
                         fwd_raw_chunk = pl.tile.slice(fwd_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwd_cast_row0, 0])
@@ -3147,19 +3318,25 @@ def sparse_vf_fused_vector(
                         fwd_codes = fwd_packed[:, :HEAD_DIM]
                         fwd_values_fp32 = pl.cast(fwd_codes, pl.FP32)
                         fwd_values = pl.cast(fwd_values_fp32, pl.BF16, mode='rint')
-                        fwd_bits = pl.reinterpret_view(fwd_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
-                        fwd_scales = pl.reinterpret_view(fwd_bits, pl.BF16)
-                        fwd_scale_view = fwd_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
-                        fwd_dense_scales = pl.tile.move(fwd_scale_view, pl.MemorySpace.Vec)
-                        fwd_value_flat = pl.tile.reshape(fwd_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fwd_scale_row = pl.tile.reshape(fwd_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
-                        fwd_scale_bits = pl.tile.reinterpret_view(fwd_scale_row, pl.INT16)
-                        fwd_duplicated_bits = pl.tile.gather(fwd_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
-                        fwd_expanded_bits = pl.tile.gather(fwd_duplicated_bits, scale_c_indices, scale_gather_tmp)
-                        fwd_expanded = pl.tile.reinterpret_view(fwd_expanded_bits, pl.BF16)
-                        fwd_scaled_flat = pl.col_expand_mul(fwd_value_flat, fwd_expanded)
-                        fwd_result = pl.tile.reshape(fwd_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                        kv_half = pl.tile.assemble(kv_half, fwd_result, [48 + fwd_cast_row0, 0])
+                        fwd_scale_words = pl.reinterpret_view(fwd_raw_chunk, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                        fwd_scale_flat = pl.tile.reshape(fwd_scale_words, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_HALFWORDS])
+                        fwd_value_flat = pl.tile.reshape(fwd_values, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fwd_kv_flat = pl.tile.reshape(kv_half, [SPARSE_VF_KEY_TILE // 2 * HEAD_DIM])
+                        with pl.reg_scope():
+                            fwd_all_r23 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                            for fwd_row_r23 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                                for fwd_chunk_r23 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                                    fwd_scale_offset_r23 = fwd_row_r23 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
+                                    fwd_scale_offset_r23 = fwd_scale_offset_r23 + fwd_chunk_r23 * SPARSE_VF_WINDOW_STEP
+                                    fwd_groups_r23 = pl.reg.load(fwd_scale_flat, fwd_scale_offset_r23, lanes=SPARSE_VF_WINDOW_STEP)
+                                    fwd_factor_bits_r23 = pl.reg.group_broadcast(fwd_groups_r23, lanes=SPARSE_VF_REG_TILE)
+                                    fwd_factor_r23 = pl.reg.interpret_cast(fwd_factor_bits_r23, dtype=pl.BF16)
+                                    fwd_value_offset_r23 = fwd_row_r23 * HEAD_DIM + fwd_chunk_r23 * SPARSE_VF_REG_TILE
+                                    fwd_value_r23 = pl.reg.load(fwd_value_flat, fwd_value_offset_r23, lanes=SPARSE_VF_REG_TILE)
+                                    fwd_scaled_r23 = pl.reg.mul(fwd_value_r23, fwd_factor_r23, fwd_all_r23)
+                                    fwd_target_row_r23 = 48 + fwd_cast_row0 + fwd_row_r23
+                                    fwd_target_offset_r23 = fwd_target_row_r23 * HEAD_DIM + fwd_chunk_r23 * SPARSE_VF_REG_TILE
+                                    fwd_write_r23 = pl.reg.store(fwd_kv_flat, fwd_target_offset_r23, fwd_scaled_r23, fwd_all_r23)
                 pl.system.tpush_to_aic(kv_half, split=1, id=1)
             correction_col = pl.reshape(correction, [SPARSE_VF_FUSED_AIV_HEAD_TILE, 1])
             weighted_0 = pl.system.tpop_from_aic(shape=[SPARSE_VF_FUSED_AIV_HEAD_TILE, 128], dtype=pl.FP32, split=1, id=3)
