@@ -79,14 +79,13 @@ from moe import (
     IDX_PAD,
     MOE_INTER,
     N_EXPERTS_GLOBAL,
-    N_LOCAL,
     N_RANKS,
     N_ROUTES,
     RECV_MAX,
     TOPK,
     VOCAB,
     clear_moe_signals,
-    moe,
+    make_moe,
 )
 from prefill_cp_token_allgather import (
     PREFILL_GROUP_CAP,
@@ -94,6 +93,10 @@ from prefill_cp_token_allgather import (
     prefill_cp_token_allgather_step,
 )
 del sys.argv[_caller_argv_length:]
+
+N_LOCAL = N_EXPERTS_GLOBAL // N_RANKS
+META_SLOTS = (N_LOCAL + 15) // 16 * 16
+moe = make_moe(N_LOCAL)
 
 T_MAIN_DYN = pl.dynamic("DSPARK_BACKBONE_T_MAIN_DYN")
 CP_CONTEXT_T_DYN = pl.dynamic("DSPARK_BACKBONE_CP_CONTEXT_T_DYN")
@@ -342,7 +345,7 @@ def draft_layer(
     o_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     dsa_cp_rank: pl.Scalar[pl.INT32],
-    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_meta: pld.DistributedTensor[[N_RANKS, META_SLOTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
@@ -497,6 +500,7 @@ def draft_layer(
         output_hc,
         recv_meta, recv_x, recv_aux, recv_route,
         arrived, data_arrived, routed_y_buf, combine_arrived,
+        layer_gate_w, query_token_ids, query_token_ids, layer_gate_w, query_token_ids,
         layer_id, active_tokens, my_rank, moe_epoch,
     )
     return output_hc, hidden_gather_signal
@@ -567,7 +571,7 @@ def _dspark_drafter(
     attention_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     o_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.BF16],
     o_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_meta: pld.DistributedTensor[[N_RANKS, META_SLOTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
@@ -854,7 +858,7 @@ def l3_dspark_drafter(
     attention_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     o_window_buf = pld.alloc_window_buffer([O_WINDOW_ROWS, D], dtype=pl.BF16)
     o_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-    recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
+    recv_meta_buf = pld.alloc_window_buffer([N_RANKS, META_SLOTS], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
     recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
     recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
@@ -870,7 +874,7 @@ def l3_dspark_drafter(
         attention_signal = pld.window(attention_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
         o_window = pld.window(o_window_buf, [O_WINDOW_ROWS, D], dtype=pl.BF16)
         o_signal = pld.window(o_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
+        recv_meta = pld.window(recv_meta_buf, [N_RANKS, META_SLOTS], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
         recv_aux = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
         recv_route = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)

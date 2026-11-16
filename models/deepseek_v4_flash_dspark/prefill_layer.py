@@ -28,6 +28,7 @@ from moe import (
     MOE_INTER,
     N_EXPERTS_GLOBAL,
     N_LOCAL,
+    META_SLOTS,
     N_RANKS,
     PREFILL_MOE_SCALE_PAD,
     PREFILL_MOE_TOTAL_CAP,
@@ -353,7 +354,7 @@ def prefill_layer_moe(
     comb_ffn: pl.Out[pl.Tensor[[FWD_GROUP_TOKENS_DYN, HC_MULT * HC_MULT], pl.FP32]],
     ffn_out: pl.Out[pl.Tensor[[FWD_TOKENS_DYN, D], pl.BF16]],
     x_next: pl.Out[pl.Tensor[[FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32]],
-    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_meta: pld.DistributedTensor[[N_RANKS, META_SLOTS], pl.INT32],
     recv_x: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
@@ -422,6 +423,7 @@ def prefill_layer_moe(
         arrived, data_arrived, routed_y_buf, combine_arrived,
         stage_done, stage_token, layer_completion,
         gather_window, gather_signal,
+        gate_w, input_ids, input_ids, gate_w, input_ids,
         group_base, tp_rank, layer_i32, my_rank, pl.cast(pl.tensor.dim(attn_stage, 0), pl.INT32),
     )
     clear_prefill_moe_signals(stage_token, arrived, data_arrived, combine_arrived, stage_done)
@@ -569,7 +571,7 @@ def l3_prefill_layer(
     comb_ffn.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     ffn_out.bind_dynamic(1, FWD_TOKENS_DYN)
     x_next.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
-    recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
+    recv_meta_buf = pld.alloc_window_buffer([N_RANKS, META_SLOTS], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
     recv_aux_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32)
     arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
@@ -641,7 +643,7 @@ def l3_prefill_layer(
             )
 
     for rank in pl.range(pld.world_size()):
-        recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
+        recv_meta = pld.window(recv_meta_buf, [N_RANKS, META_SLOTS], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buf, [PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
         recv_aux = pld.window(recv_aux_buf, [PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32)
         arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
