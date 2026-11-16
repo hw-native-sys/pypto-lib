@@ -108,7 +108,6 @@ def prefill_swa(
             kv_write_slots, window_cache,
             kv_token_count, normalized_ready,
         )
-        chunk_hidden = pl.create_tensor([Q_TILE, D], dtype=pl.BF16)
         chunk_rope_cos = pl.create_tensor([Q_TILE, ROPE_DIM // 2], dtype=pl.FP32)
         chunk_rope_sin = pl.create_tensor([Q_TILE, ROPE_DIM // 2], dtype=pl.FP32)
         chunk_window_indices = pl.create_tensor([Q_TILE, 128], dtype=pl.INT32)
@@ -123,20 +122,22 @@ def prefill_swa(
                 worker = pl.tile.get_block_idx()
                 for row in pl.range(worker, active, WORKER_TILE):
                     source_row = start + row
-                    chunk_hidden[row:row + 1, :] = kv_hidden[source_row:source_row + 1, :]
                     chunk_rope_cos[row:row + 1, :] = kv_rope_cos[source_row:source_row + 1, :]
                     chunk_rope_sin[row:row + 1, :] = kv_rope_sin[source_row:source_row + 1, :]
                     chunk_window_indices[row:row + 1, :] = q_window_indices[source_row:source_row + 1, :]
-            q_input_payload, q_input_scales, q_input_payload_padded_rows = quantize_projection_input(
-                chunk_hidden, active, row_tile=256,
-            )
+            q_input_payload_padded_rows = ((active + 255) // 256) * 256
+            q_input_end = start + q_input_payload_padded_rows
+            q_input_payload = kv_input_payload[start:q_input_end, :]
+            q_scale_start = start * (D // 32)
+            q_scale_end = q_input_end * (D // 32)
+            q_input_scales = kv_input_scales[:, q_scale_start:q_scale_end]
             q_proj_rope(
                 q_input_payload, q_input_scales,
                 wq_a, wq_a_scale, wq_norm,
                 wq_b, wq_b_scale,
                 chunk_rope_cos, chunk_rope_sin,
                 q_latent, q,
-                active, qa_worker_limit=24, qb_worker_limit=24,
+                active, qa_worker_limit=24, qb_worker_limit=32,
                 padded_rows=q_input_payload_padded_rows,
                 qa_row_tile=256, qb_row_tile=128,
             )
@@ -364,7 +365,9 @@ def prefill_swa_cp(
             kv_write_slots, window_cache,
             kv_token_count, gathered,
         )
-        chunk_hidden = pl.create_tensor([Q_TILE, D], dtype=pl.BF16)
+        q_projection_payload, q_projection_scales, q_projection_padded_rows = quantize_projection_input(
+            q_hidden, q_token_count, row_tile=256,
+        )
         chunk_rope_cos = pl.create_tensor([Q_TILE, ROPE_DIM // 2], dtype=pl.FP32)
         chunk_rope_sin = pl.create_tensor([Q_TILE, ROPE_DIM // 2], dtype=pl.FP32)
         chunk_window_indices = pl.create_tensor([Q_TILE, 128], dtype=pl.INT32)
@@ -379,20 +382,22 @@ def prefill_swa_cp(
                 worker = pl.tile.get_block_idx()
                 for row in pl.range(worker, active, WORKER_TILE):
                     source_row = start + row
-                    chunk_hidden[row:row + 1, :] = q_hidden[source_row:source_row + 1, :]
                     chunk_rope_cos[row:row + 1, :] = q_rope_cos[source_row:source_row + 1, :]
                     chunk_rope_sin[row:row + 1, :] = q_rope_sin[source_row:source_row + 1, :]
                     chunk_window_indices[row:row + 1, :] = q_window_indices[source_row:source_row + 1, :]
-            q_input_payload, q_input_scales, q_input_payload_padded_rows = quantize_projection_input(
-                chunk_hidden, active, row_tile=256,
-            )
+            q_input_payload_padded_rows = ((active + 255) // 256) * 256
+            q_input_end = start + q_input_payload_padded_rows
+            q_input_payload = q_projection_payload[start:q_input_end, :]
+            q_scale_start = start * (D // 32)
+            q_scale_end = q_input_end * (D // 32)
+            q_input_scales = q_projection_scales[:, q_scale_start:q_scale_end]
             q_proj_rope(
                 q_input_payload, q_input_scales,
                 wq_a, wq_a_scale, wq_norm,
                 wq_b, wq_b_scale,
                 chunk_rope_cos, chunk_rope_sin,
                 q_latent, q,
-                active, qa_worker_limit=24, qb_worker_limit=24,
+                active, qa_worker_limit=24, qb_worker_limit=32,
                 padded_rows=q_input_payload_padded_rows,
                 qa_row_tile=256, qb_row_tile=128,
             )
