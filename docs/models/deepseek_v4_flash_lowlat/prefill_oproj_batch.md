@@ -29,3 +29,18 @@ cache initialization, expansion and first-token readback; Worker and weight
 startup and diagnostic hashes are excluded. This result does not establish
 performance for other shapes, serving, decode or long-context workloads.
 The option remains off by default.
+
+The independent `--prefill-oproj-a-batched` option groups the eight A
+projection N fragments in one grid per group. Every row/N-fragment block
+uses the original BF16 computation, and group quantization waits for all
+its fragments. It preserves the existing M128, N128 and K256 fragments.
+The option defaults off and needs separate device numerical and ordinary
+qualification before a speedup is claimed.
+
+A batching was checked with the resident input lookup in a same-Worker TP8
+AgentX 16K, two-8K-chunk comparison, one warm request and four ordinary requests
+per arm. Request-to-first-token time, including input and cache initialization,
+was 4.550466s without A batching and 4.413579s with it; all four paired samples
+improved. All twenty requests in the four-arm input/compute comparison matched
+the frozen full output/cache hashes. These measurements cover this opt-in
+prepared-prefill configuration, not serving TPOT or long-context qualification.

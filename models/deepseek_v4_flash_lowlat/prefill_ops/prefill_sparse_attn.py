@@ -31,6 +31,10 @@ from models.deepseek_v4_flash_lowlat.config import _parse_int_argv
 # Longest sequence the model config admits; the host-side bound on token_count.
 MAX_SEQ_LEN = M.max_position_embeddings
 
+PREFILL_OPROJ_A_BATCHED = _parse_int_argv("--prefill-oproj-a-batched", 0)
+if PREFILL_OPROJ_A_BATCHED not in (0, 1):
+    raise ValueError("Prefill O-projection A batching must be zero or one")
+
 PREFILL_OPROJ_B_BATCHED = _parse_int_argv("--prefill-oproj-b-batched", 0)
 if PREFILL_OPROJ_B_BATCHED not in (0, 1):
     raise ValueError("Prefill O-projection B batching must be zero or one")
@@ -113,6 +117,7 @@ PROJ_B_ROW_TILE = min(128, T_PAD)
 # Task-array fan-outs; named because a deps= list comprehension cannot be hoisted
 # out of the call (the tracer rejects a bare ListComp statement).
 PA_NFRAGS = O_LORA // PROJ_A_MM_N_TILE
+PA_JOIN_SIZE = 1 if PREFILL_OPROJ_A_BATCHED else PA_NFRAGS
 PB_DSLABS = D // PROJ_B_D_TILE
 PB_JOIN_SIZE = 1 if PREFILL_OPROJ_B_BATCHED else PB_DSLABS * O_GROUPS
 PREFILL_ATTN_TILE = 128  # sparse-K rows per compile-time block
@@ -1146,6 +1151,33 @@ def _sparse_attn_heads(
 
 
 @pl.jit.inline
+def _prefill_o_proj_a_compute(
+    o_packed: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    o_r: pl.Tensor[[T_PAD, O_GROUPS * O_LORA], pl.FP32],
+    g: pl.Scalar[pl.INDEX],
+    n0: pl.Scalar[pl.INDEX],
+    pa_rb: pl.Scalar[pl.INDEX],
+):
+    row_base_o = g * T_PAD
+    out_col_g = g * O_LORA
+    pa_r0 = pa_rb * PROJ_A_ROW_TILE
+    pa_src0 = row_base_o + pa_r0
+    acc_a = pl.create_tensor([1, PROJ_A_ROW_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
+    for kb in pl.pipeline(0, O_GROUP_IN // A_K_TILE, stage=2):
+        k0 = kb * A_K_TILE
+        xa_k_chunk = o_packed[
+            pa_src0 : pa_src0 + PROJ_A_ROW_TILE,
+            k0 : k0 + A_K_TILE,
+        ]
+        wa_k_chunk = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, k0 : k0 + A_K_TILE]
+        acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True, init_cond=(kb == 0))
+    # acc_a is 3D (wo_a keeps its group axis), which subscript-write cannot express.
+    o_r = pl.assemble(o_r, acc_a, [pa_r0, out_col_g + n0])
+    return o_r
+
+
+@pl.jit.inline
 def _prefill_o_proj_b_compute(
     o_r_i8: pl.Tensor[[T_PAD, O_GROUPS * O_LORA], pl.INT8],
     wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
@@ -1195,7 +1227,7 @@ def _sparse_attn_o_proj(
     o_r_i8 = pl.create_tensor([T_PAD, O_GROUPS * O_LORA], dtype=pl.INT8)
     act_scale_dq = pl.create_tensor([O_GROUPS, T_PAD], dtype=pl.FP32)
     partials = pl.create_tensor([T_PAD, O_GROUPS * D], dtype=pl.INT32)
-    proj_a_tids = pl.array.create(O_GROUPS * PA_NFRAGS, pl.TASK_ID)
+    proj_a_tids = pl.array.create(O_GROUPS * PA_JOIN_SIZE, pl.TASK_ID)
     quant_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
     proj_b_tids = pl.array.create(PB_JOIN_SIZE, pl.TASK_ID)
     # Round physical tails up to a complete proj_a tile; only the final store
@@ -1206,30 +1238,22 @@ def _sparse_attn_o_proj(
     proj_b_rows = o_compute_rows // PROJ_B_ROW_TILE
 
     with pl.scope():
-        # proj_a[g, nf]: BF16 grouped GEMM -> o_r[:, group g], init_cond K loop.
-        # Row-blocked over PROJ_A_ROW_TILE with a padded load, so the T_PAD-strided
-        # o_packed slab never feeds uninitialized rows into the matmul.
+        # Each group retains one quantization barrier after all N fragments.
         for g in pl.parallel(O_GROUPS):
-            row_base_o = g * T_PAD
-            out_col_g = g * O_LORA
-            for nf in pl.range(PA_NFRAGS):
-                n0 = nf * PROJ_A_MM_N_TILE
-                with pl.spmd(proj_a_rows, name_hint="proj_a_mm", deps=[heads_dep, weight_dep]) as pa_tid:
-                    pa_rb = pl.tile.get_block_idx()
-                    pa_r0 = pa_rb * PROJ_A_ROW_TILE
-                    pa_src0 = row_base_o + pa_r0
-                    acc_a = pl.create_tensor([1, PROJ_A_ROW_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
-                    for kb in pl.pipeline(0, O_GROUP_IN // A_K_TILE, stage=2):
-                        k0 = kb * A_K_TILE
-                        xa_k_chunk = o_packed[
-                            pa_src0 : pa_src0 + PROJ_A_ROW_TILE,
-                            k0 : k0 + A_K_TILE,
-                        ]
-                        wa_k_chunk = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, k0 : k0 + A_K_TILE]
-                        acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True, init_cond=(kb == 0))
-                    # acc_a is 3D (wo_a keeps its group axis), which subscript-write cannot express.
-                    o_r = pl.assemble(o_r, acc_a, [pa_r0, out_col_g + n0])
-                proj_a_tids[g * PA_NFRAGS + nf] = pa_tid
+            if PREFILL_OPROJ_A_BATCHED != 0:
+                with pl.spmd(proj_a_rows * PA_NFRAGS, name_hint="proj_a_mm_batched", deps=[heads_dep, weight_dep]) as batched_a_tid:
+                    a_block = pl.tile.get_block_idx()
+                    a_row_block = a_block // PA_NFRAGS
+                    a_n0 = (a_block % PA_NFRAGS) * PROJ_A_MM_N_TILE
+                    o_r = _prefill_o_proj_a_compute(o_packed, wo_a, o_r, g, a_n0, a_row_block)
+                proj_a_tids[g] = batched_a_tid
+            else:
+                for nf in pl.range(PA_NFRAGS):
+                    n0 = nf * PROJ_A_MM_N_TILE
+                    with pl.spmd(proj_a_rows, name_hint="proj_a_mm", deps=[heads_dep, weight_dep]) as pa_tid:
+                        pa_rb = pl.tile.get_block_idx()
+                        o_r = _prefill_o_proj_a_compute(o_packed, wo_a, o_r, g, n0, pa_rb)
+                    proj_a_tids[g * PA_NFRAGS + nf] = pa_tid
 
         # quant[g]: per-group amax and symmetric INT8 quant over physical rows.
         for g in pl.parallel(O_GROUPS):
@@ -1237,7 +1261,7 @@ def _sparse_attn_o_proj(
             with pl.spmd(
                 quant_rows,
                 name_hint="quant",
-                deps=[proj_a_tids[g * PA_NFRAGS + j] for j in range(PA_NFRAGS)],
+                deps=[proj_a_tids[g * PA_JOIN_SIZE + j] for j in range(PA_JOIN_SIZE)],
             ) as q_tid:
                 qt = pl.tile.get_block_idx() * QUANT_TOKEN_TILE
                 g_amax = pl.full([1, QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)

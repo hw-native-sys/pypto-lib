@@ -107,7 +107,7 @@ def _validate_target_capacity(metadata, profile, max_seq_len):
 
 def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=180, max_seq_len=1048576,
                     prefill_indexer_arenas=1, projection_degrees=None, prefill_moe_ready=None,
-                    prefill_moe_wave_tokens=None, prefill_moe_owner_reduce=False, prefill_moe_expert_affinity=False, prefill_moe_batched_gather=False, prefill_moe_direct_post=False, prefill_oproj_b_batched=False,
+                    prefill_moe_wave_tokens=None, prefill_moe_owner_reduce=False, prefill_moe_expert_affinity=False, prefill_moe_batched_gather=False, prefill_moe_direct_post=False, prefill_oproj_b_batched=False, prefill_oproj_a_batched=False,
 
                     prefill_causal_ready=False, prefill_causal_full_wait=False,
                     prefill_echo_prefetch=False, prefill_echo_diagnostics=False, prefill_mechanisms=None):
@@ -120,6 +120,8 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
         raise ValueError("Prefill indexer arenas must be one or two")
     if profile != "prefill" and prefill_indexer_arenas != 1:
         raise ValueError("Indexer arena selection applies only to prefill")
+    if type(prefill_oproj_a_batched) is not bool or (prefill_oproj_a_batched and profile != "prefill"):
+        raise ValueError("O-projection A batching requires boolean prefill selection")
     if type(prefill_oproj_b_batched) is not bool or (prefill_oproj_b_batched and profile != "prefill"):
         raise ValueError("O-projection B batching requires boolean prefill selection")
     if type(prefill_moe_direct_post) is not bool or (prefill_moe_direct_post and (profile != "prefill" or not prefill_moe_owner_reduce)):
@@ -211,7 +213,7 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
 
             function = load_prefill_programs(
                 indexer_arenas=prefill_indexer_arenas, projection_degrees=projection_degrees,
-                moe_ready=prefill_moe_ready, moe_wave_tokens=prefill_moe_wave_tokens, moe_owner_reduce=prefill_moe_owner_reduce, moe_expert_affinity=prefill_moe_expert_affinity, moe_batched_gather=prefill_moe_batched_gather, moe_direct_post=prefill_moe_direct_post, oproj_b_batched=prefill_oproj_b_batched,
+                moe_ready=prefill_moe_ready, moe_wave_tokens=prefill_moe_wave_tokens, moe_owner_reduce=prefill_moe_owner_reduce, moe_expert_affinity=prefill_moe_expert_affinity, moe_batched_gather=prefill_moe_batched_gather, moe_direct_post=prefill_moe_direct_post, oproj_b_batched=prefill_oproj_b_batched, oproj_a_batched=prefill_oproj_a_batched,
                 causal_ready=prefill_causal_ready,
                 causal_full_wait=prefill_causal_full_wait,
                 echo_prefetch=prefill_echo_prefetch, echo_diagnostics=prefill_echo_diagnostics,
@@ -295,7 +297,7 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
             indexer_arenas=prefill_indexer_arenas,
             moe_ready=prefill_moe_ready,
             moe_wave_tokens=prefill_moe_wave_tokens,
-            moe_owner_reduce=prefill_moe_owner_reduce, moe_expert_affinity=prefill_moe_expert_affinity, moe_batched_gather=prefill_moe_batched_gather, moe_direct_post=prefill_moe_direct_post, oproj_b_batched=prefill_oproj_b_batched,
+            moe_owner_reduce=prefill_moe_owner_reduce, moe_expert_affinity=prefill_moe_expert_affinity, moe_batched_gather=prefill_moe_batched_gather, moe_direct_post=prefill_moe_direct_post, oproj_b_batched=prefill_oproj_b_batched, oproj_a_batched=prefill_oproj_a_batched,
             moe_expert_tile_tokens=16,
             moe_copy_tile=[4, 2048], moe_reduce_tile=[8, 512],
             moe_waves_per_chunk=(8192 + prefill_moe_wave_tokens - 1) // prefill_moe_wave_tokens,
@@ -333,6 +335,7 @@ def main():
     parser.add_argument("--prefill-echo-prefetch", action="store_true", help="Experimental coarse-bin KV prefetch")
     parser.add_argument("--prefill-echo-diagnostics", action="store_true", help="Collect ECHO recall counters")
     parser.add_argument("--prefill-mechanisms", choices=("none", "echo-only", "causal-only", "both"))
+    parser.add_argument("--prefill-oproj-a-batched", action="store_true", help="Batch prefill O-projection A N fragments per group")
     parser.add_argument("--prefill-oproj-b-batched", action="store_true", help="Batch independent prefill O-projection B slabs")
     parser.add_argument("--prefill-moe-direct-post", action="store_true", help="Write prefill HC post directly from completed owner results")
     parser.add_argument("--prefill-moe-batched-gather", action="store_true", help="Batch prefill route copies without changing expert geometry")
@@ -357,6 +360,7 @@ def main():
         prefill_moe_batched_gather=args.prefill_moe_batched_gather,
         prefill_moe_direct_post=args.prefill_moe_direct_post,
         prefill_oproj_b_batched=args.prefill_oproj_b_batched,
+        prefill_oproj_a_batched=args.prefill_oproj_a_batched,
         prefill_causal_ready=args.prefill_causal_ready,
         prefill_causal_full_wait=args.prefill_causal_full_wait,
         prefill_echo_prefetch=args.prefill_echo_prefetch, prefill_echo_diagnostics=args.prefill_echo_diagnostics,
