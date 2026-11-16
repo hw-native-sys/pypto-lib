@@ -9,8 +9,10 @@
 """V4.1 Engram projection and residual gating from host rows or local lookup tables."""
 
 import math
+from pathlib import Path
 
 import pypto.language as pl
+from pypto.runtime import pto_isa_include_dir
 import torch
 
 from config import FLASH as M, T_DYN
@@ -26,87 +28,61 @@ N_HASH_COLS = (M.engram_max_ngram_size - 1) * M.engram_n_heads  # 24
 HEAD_DIM = M.engram_head_dim  # 256
 ENGRAM_K = N_HASH_COLS * HEAD_DIM  # 6144 flattened lookup width
 KV_OUT = (HC_MULT + 1) * D  # 5 * 5120 = 25600
-# Validation-sized table; the released layer-1 table (384006168 rows) does not fit
-# in host memory for a standalone case, so this exercises the same kernel against a
-# much smaller row count. The kernel only reads gathered rows, so any size works.
-NUM_EMBEDDINGS = 1 << 20  # 1048576 rows (~512 MiB as BF16)
 CLAMP = 1e-6
 NORM_EPS = M.rms_norm_eps
 D_INV = 1.0 / D
 DOT_SCALE = D**-0.5
 
-T_TILE = 16
-K_TILE = 128
-N_TILE = 256
-D_TILE = 512
+# PyPTO comparison tiling.
+GATE_T_TILE = 8
+GATE_D_TILE = 1280
+PROJECTION_N_TILE = 256
+PROJECTION_K_TILE = 256
 
 
-@pl.jit.inline
-def engram_cast_to_fp32(source: pl.Tensor, output: pl.Tensor):
-    """Widen a BF16 matrix into FP32 tiles."""
-    rows = pl.tensor.dim(source, 0)
-    width = pl.tensor.dim(source, 1)
-    for block in pl.spmd(((rows + T_TILE - 1) // T_TILE) * (width // N_TILE), name_hint="engram_widen"):
-        t0 = block // (width // N_TILE) * T_TILE
-        n0 = block % (width // N_TILE) * N_TILE
-        valid_rows = pl.min(T_TILE, rows - t0)
-        value = pl.slice(source, [T_TILE, N_TILE], [t0, n0], valid_shape=[valid_rows, N_TILE])
-        widened = pl.cast(value, pl.FP32)
-        output[t0:t0 + T_TILE, n0:n0 + N_TILE] = pl.set_validshape(widened, valid_rows, N_TILE)
-    return output
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels/engram.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _engram_quantize(lookup: pl.Tensor, payload: pl.Out[pl.Tensor], scales: pl.Out[pl.Tensor],
+                      tokens: pl.Scalar[pl.INT32], padded: pl.Scalar[pl.INDEX],
+                      mode: pl.Scalar[pl.INDEX]) -> tuple[pl.Tensor, pl.Tensor]:
+    """Write FP8 activation payload and packed E8M0 scales."""
+    return payload, scales
 
 
-@pl.jit.inline
-def engram_gate(
-    kv: pl.Tensor,
-    weight: pl.Tensor[[HC_MULT, D], pl.FP32],
-    x: pl.Tensor,
-    out: pl.Tensor,
-    output_fp32: pl.constexpr,
-):
-    """Gate projected keys and values into each residual stream copy."""
-    t_dim = pl.tensor.dim(kv, 0)
-    x_flat = pl.reshape(x, [t_dim, HC_MULT * D])
-    out_flat = pl.reshape(out, [t_dim, HC_MULT * D])
-    t_blocks = (t_dim + T_TILE - 1) // T_TILE
-    for block in pl.spmd(t_blocks * HC_MULT, name_hint="engram_gate"):
-        t0 = (block // HC_MULT) * T_TILE
-        c = block % HC_MULT
-        valid_rows = pl.min(T_TILE, t_dim - t0)
-        reduction_tmp = pl.create_tile([T_TILE, D_TILE], dtype=pl.FP32)
-        # Reduction accumulators have 32-byte aligned rows.
-        sq_x = pl.tile.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-        sq_k = pl.tile.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-        dot = pl.tile.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-        for d0 in pl.range(0, D, D_TILE):
-            x_raw = pl.load(x_flat, [t0, c * D + d0], [T_TILE, D_TILE], valid_shape=[valid_rows, D_TILE])
-            key_raw = pl.load(kv, [t0, c * D + d0], [T_TILE, D_TILE], valid_shape=[valid_rows, D_TILE])
-            key_d = pl.set_validshape(pl.fillpad(key_raw, pad_value=pl.PadValue.zero), T_TILE, D_TILE)
-            x_d = pl.set_validshape(pl.fillpad(x_raw, pad_value=pl.PadValue.zero), T_TILE, D_TILE)
-            sq_x = pl.add(sq_x, pl.reshape(pl.row_sum(pl.mul(x_d, x_d), reduction_tmp), [1, T_TILE]))
-            sq_k = pl.add(sq_k, pl.reshape(pl.row_sum(pl.mul(key_d, key_d), reduction_tmp), [1, T_TILE]))
-            w_d = pl.load(weight, [c, d0], [1, D_TILE])
-            xw_d = pl.col_expand_mul(x_d, w_d)
-            dot = pl.add(dot, pl.reshape(pl.row_sum(pl.mul(xw_d, key_d), reduction_tmp), [1, T_TILE]))
-        inv_x = pl.rsqrt(pl.add(pl.mul(sq_x, D_INV), NORM_EPS))
-        inv_k = pl.rsqrt(pl.add(pl.mul(sq_k, D_INV), NORM_EPS))
-        dot = pl.mul(pl.mul(pl.mul(dot, inv_x), inv_k), DOT_SCALE)
-        root = pl.sqrt(pl.maximum(pl.abs(dot), CLAMP))
-        nonnegative = pl.cmps(dot, 0.0, cmp_type=5)
-        signed = pl.tile.select(nonnegative, root, pl.neg(root))
-        gate = pl.reshape(pl.recip(pl.add(pl.exp(pl.neg(signed)), 1.0)), [T_TILE, 1])
-        for d0 in pl.range(0, D, D_TILE):
-            output_source = pl.load(x_flat, [t0, c * D + d0], [T_TILE, D_TILE], valid_shape=[valid_rows, D_TILE])
-            output_value = pl.load(kv, [t0, HC_MULT * D + d0], [T_TILE, D_TILE], valid_shape=[valid_rows, D_TILE])
-            gated = pl.row_expand_mul(output_value, gate)
-            y = pl.add(output_source, gated)
-            y_bf16 = pl.cast(y, target_type=pl.BF16, mode="rint")
-            if output_fp32:
-                y_rounded = pl.cast(y_bf16, pl.FP32)
-                pl.store(pl.set_validshape(y_rounded, valid_rows, D_TILE), [t0, c * D + d0], out_flat)
-            else:
-                pl.store(pl.set_validshape(y_bf16, valid_rows, D_TILE), [t0, c * D + d0], out_flat)
+@pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels/engram.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _engram_project(payload: pl.Tensor, weight: pl.Tensor, scales: pl.Tensor, weight_scale: pl.Tensor,
+                    kv: pl.Out[pl.Tensor], tokens: pl.Scalar[pl.INDEX], row_tile: pl.Scalar[pl.INDEX]) -> pl.Tensor:
+    """Project quantized rows into BF16 keys and values."""
+    return kv
+
+
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels/engram.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _engram_gate_native(kv: pl.Tensor, weight: pl.Tensor, x: pl.Tensor, out: pl.Out[pl.Tensor],
+                        tokens: pl.Scalar[pl.INDEX], mode: pl.Scalar[pl.INDEX]) -> pl.Tensor:
+    """Compute the normalized-dot gate and update the residual."""
     return out
+
+
+@pl.jit.inline(auto_scope=False)
+def _engram_rows_tile(
+    lookup: pl.Tensor, wkv: pl.Tensor, wkv_scale: pl.Tensor, weight: pl.Tensor,
+    x: pl.Tensor, out: pl.Tensor, tokens: pl.Scalar[pl.INT32],
+    row_tile: pl.constexpr,
+):
+    """Quantize and project host rows before gating the residual."""
+    padded = ((tokens + row_tile - 1) // row_tile) * row_tile
+    payload = pl.create_tensor([padded, ENGRAM_K], dtype=pl.FP8E4M3FN)
+    scales = pl.create_tensor([1, padded * (ENGRAM_K // 32)], dtype=pl.FP8E8M0)
+    kv = pl.create_tensor([tokens, KV_OUT], dtype=pl.BF16)
+    with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_quant"):
+        quantized, quantized_scales = _engram_quantize(lookup, payload, scales, tokens, padded, 1)
+    with pl.spmd(pl.system.available_cluster_count(), name_hint="engram_projection"):
+        projected = _engram_project(quantized, wkv, quantized_scales, wkv_scale, kv, tokens, row_tile)
+    with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_gate"):
+        result = _engram_gate_native(projected, weight, x, out, tokens, 3)
+    return result
 
 
 @pl.jit.inline(auto_scope=False)
@@ -118,112 +94,98 @@ def engram_from_rows(
     x: pl.Tensor,
     out: pl.Tensor,
 ):
-    """Project host-gathered BF16 rows and gate the FP32 residual stream."""
+    """Project host-gathered ND rows and gate the FP32 residual in place or out of place."""
     tokens = pl.tensor.dim(x, 0)
-    kv = pl.create_tensor([tokens, KV_OUT], dtype=pl.BF16)
-    gemm_bf16_via_mxfp8_to_bf16_staged(
-        lookup, wkv_weight, wkv_scale, kv, tokens,
-        ENGRAM_K, KV_OUT, "engram_projection", "engram_quant", N_TILE, 256, 1, 2147483647,
-    )
-    kv_fp32 = pl.create_tensor([tokens, KV_OUT], dtype=pl.FP32)
-    engram_cast_to_fp32(kv, kv_fp32)
-    engram_gate(kv_fp32, weight, x, out, output_fp32=True)
-    return out
+    if tokens > 0:
+        if tokens <= 80:
+            result = _engram_rows_tile(
+                lookup, wkv_weight, wkv_scale, weight, x, out, tokens, 80,
+            )
+        elif tokens <= 128:
+            result = _engram_rows_tile(
+                lookup, wkv_weight, wkv_scale, weight, x, out, tokens, 128,
+            )
+        else:
+            result = _engram_rows_tile(
+                lookup, wkv_weight, wkv_scale, weight, x, out, tokens, 256,
+            )
+    else:
+        result = out
+    return result
 
 
 @pl.jit.inline
-def engram(
-    hash_ids: pl.Tensor[[T_DYN, N_HASH_COLS], pl.INT32],
-    engram_table: pl.Tensor[[NUM_EMBEDDINGS, HEAD_DIM], pl.BF16],
-    wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.BF16],
+def _engram_gate_pypto(
+    kv: pl.Tensor,
     weight: pl.Tensor[[HC_MULT, D], pl.FP32],
-    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
-    out: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+    x: pl.Tensor,
+    out: pl.Tensor,
 ):
-    t_dim = pl.tensor.dim(hash_ids, 0)
-    t_blocks = (t_dim + T_TILE - 1) // T_TILE
-
-    # GM intermediate: kv[t, n] = flatten(engram_table[hash_ids[t]]) @ wkv[:, n]
-    kv = pl.create_tensor([t_dim, KV_OUT], dtype=pl.FP32)
-
-    # ---- Stage 1: gather n-gram rows, project to key|value, write to GM
-    n_blocks = KV_OUT // N_TILE
-    for block in pl.spmd(t_blocks * n_blocks, name_hint="engram_matmul"):
-        t0 = (block // n_blocks) * T_TILE
-        n0 = (block % n_blocks) * N_TILE
-        valid_rows = pl.min(T_TILE, t_dim - t0)
-
-        # gather the 24 n-gram rows for this token tile into [T_TILE, 6144]
-        lookup = pl.create_tensor([T_TILE, ENGRAM_K], dtype=pl.BF16)
-        for c in pl.range(N_HASH_COLS):
-            for tt in pl.range(T_TILE):
-                if t0 + tt < t_dim:
-                    row = pl.read(hash_ids, [t0 + tt, c])
-                    row = pl.max(0, pl.min(NUM_EMBEDDINGS - 1, row))
-                    lookup[tt : tt + 1, c * HEAD_DIM : (c + 1) * HEAD_DIM] = engram_table[
-                        row : row + 1, 0:HEAD_DIM
-                    ]
-                else:
-                    lookup[tt : tt + 1, c * HEAD_DIM : (c + 1) * HEAD_DIM] = pl.full(
-                        [1, HEAD_DIM], dtype=pl.BF16, value=0.0
-                    )
-
-        # matmul: [T,6144] @ [6144,N_TILE], bf16 in, fp32 acc
-        acc = pl.create_tensor([T_TILE, N_TILE], dtype=pl.FP32)
-        for kb in pl.pipeline(ENGRAM_K // K_TILE, stage=2):
-            k0 = kb * K_TILE
-            a_tile = pl.slice(lookup, [T_TILE, K_TILE], [0, k0])
-            w_tile = pl.slice(wkv_weight, [K_TILE, N_TILE], [k0, n0])
-            acc = pl.matmul_acc(acc, a_tile, w_tile, init_cond=(kb == 0))
-        kv[t0 : t0 + T_TILE, n0 : n0 + N_TILE] = pl.set_validshape(acc, valid_rows, N_TILE)
-
-    # ---- Stage 2: per (token block, hc copy) gate and residual add
+    """Gate projected keys and values into each residual stream copy."""
+    t_dim = pl.tensor.dim(kv, 0)
     x_flat = pl.reshape(x, [t_dim, HC_MULT * D])
-    x_fp32 = pl.create_tensor([t_dim, HC_MULT * D], dtype=pl.FP32)
-    engram_cast_to_fp32(x_flat, x_fp32)
-    x_hc_fp32 = pl.reshape(x_fp32, [t_dim, HC_MULT, D])
-    engram_gate(kv, weight, x_hc_fp32, out, output_fp32=False)
+    out_flat = pl.reshape(out, [t_dim, HC_MULT * D])
+    t_blocks = (t_dim + GATE_T_TILE - 1) // GATE_T_TILE
+    workers = pl.min(t_blocks * HC_MULT, pl.system.available_aiv_count())
+    for worker in pl.spmd(workers, name_hint="_engram_gate_pypto"):
+        for wave in pl.pipeline((t_blocks * HC_MULT + workers - 1) // workers, stage=2):
+            block = wave * workers + worker
+            if block < t_blocks * HC_MULT:
+                t0 = (block // HC_MULT) * GATE_T_TILE
+                c = block % HC_MULT
+                valid_rows = pl.min(GATE_T_TILE, t_dim - t0)
+                reduction_tmp = pl.create_tile([GATE_T_TILE, GATE_D_TILE], dtype=pl.FP32)
+                # Reduction accumulators have 32-byte aligned rows.
+                sq_x = pl.tile.full([1, GATE_T_TILE], dtype=pl.FP32, value=0.0)
+                sq_k = pl.tile.full([1, GATE_T_TILE], dtype=pl.FP32, value=0.0)
+                dot = pl.tile.full([1, GATE_T_TILE], dtype=pl.FP32, value=0.0)
+                for d0 in pl.range(0, D, GATE_D_TILE):
+                    x_raw = pl.load(x_flat, [t0, c * D + d0], [GATE_T_TILE, GATE_D_TILE], valid_shape=[valid_rows, GATE_D_TILE])
+                    key_raw = pl.load(kv, [t0, c * D + d0], [GATE_T_TILE, GATE_D_TILE], valid_shape=[valid_rows, GATE_D_TILE])
+                    key_d = pl.cast(pl.set_validshape(pl.fillpad(key_raw, pad_value=pl.PadValue.zero), GATE_T_TILE, GATE_D_TILE), pl.FP32)
+                    x_d = pl.set_validshape(pl.fillpad(x_raw, pad_value=pl.PadValue.zero), GATE_T_TILE, GATE_D_TILE)
+                    sq_x = pl.add(sq_x, pl.reshape(pl.row_sum(pl.mul(x_d, x_d), reduction_tmp), [1, GATE_T_TILE]))
+                    sq_k = pl.add(sq_k, pl.reshape(pl.row_sum(pl.mul(key_d, key_d), reduction_tmp), [1, GATE_T_TILE]))
+                    w_d = pl.load(weight, [c, d0], [1, GATE_D_TILE])
+                    xw_d = pl.col_expand_mul(x_d, w_d)
+                    dot = pl.add(dot, pl.reshape(pl.row_sum(pl.mul(xw_d, key_d), reduction_tmp), [1, GATE_T_TILE]))
+                inv_x = pl.rsqrt(pl.add(pl.mul(sq_x, D_INV), NORM_EPS))
+                inv_k = pl.rsqrt(pl.add(pl.mul(sq_k, D_INV), NORM_EPS))
+                dot = pl.mul(pl.mul(pl.mul(dot, inv_x), inv_k), DOT_SCALE)
+                root = pl.sqrt(pl.maximum(pl.abs(dot), CLAMP))
+                nonnegative = pl.cmps(dot, 0.0, cmp_type=5)
+                signed = pl.tile.select(nonnegative, root, pl.neg(root))
+                gate = pl.reshape(pl.recip(pl.add(pl.exp(pl.neg(signed)), 1.0)), [GATE_T_TILE, 1])
+                for d0 in pl.range(0, D, GATE_D_TILE):
+                    output_source = pl.load(x_flat, [t0, c * D + d0], [GATE_T_TILE, GATE_D_TILE], valid_shape=[valid_rows, GATE_D_TILE])
+                    output_value = pl.load(kv, [t0, HC_MULT * D + d0], [GATE_T_TILE, GATE_D_TILE], valid_shape=[valid_rows, GATE_D_TILE])
+                    gated = pl.row_expand_mul(pl.cast(output_value, pl.FP32), gate)
+                    y = pl.add(output_source, gated)
+                    y_bf16 = pl.cast(y, target_type=pl.BF16, mode="rint")
+                    y_rounded = pl.cast(y_bf16, pl.FP32)
+                    pl.store(pl.set_validshape(y_rounded, valid_rows, GATE_D_TILE), [t0, c * D + d0], out_flat)
     return out
 
 
-def golden_engram(
-    hash_ids: torch.Tensor,
-    engram_table: torch.Tensor,
-    wkv_weight: torch.Tensor,
-    weight: torch.Tensor,
-    x: torch.Tensor,
-) -> torch.Tensor:
-    """Torch reference mirroring the released Engram.forward (world_size == 1)."""
-    rows = engram_table[hash_ids.long()]  # [T, N_HASH_COLS, HEAD_DIM], bf16
-    flattened = rows.float().flatten(1)  # [T, ENGRAM_K]
-    kv = flattened @ wkv_weight.float()  # [T, KV_OUT]
-    key, value = kv.split([HC_MULT * D, D], dim=-1)
-    key = key.unflatten(-1, (HC_MULT, D))  # [T, HC_MULT, D]
-
-    h = x.float()
-    w = weight.float().unsqueeze(0)  # [1, HC_MULT, D]
-    rstd = torch.rsqrt(h.square().mean(-1, keepdim=True) + M.rms_norm_eps) * torch.rsqrt(
-        key.square().mean(-1, keepdim=True) + M.rms_norm_eps
-    )
-    dot = (h * w * key).sum(-1, keepdim=True) * rstd * (D**-0.5)  # [T, HC_MULT, 1]
-    gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(CLAMP).sqrt(), dot))
-    return (h + gate * value.unsqueeze(1)).to(torch.bfloat16)
-
-
-@pl.jit
-def l2_engram(
-    hash_ids: pl.Tensor[[T_DYN, N_HASH_COLS], pl.INT32],
-    engram_table: pl.Tensor[[NUM_EMBEDDINGS, HEAD_DIM], pl.BF16],
-    wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.BF16],
+@pl.jit.inline(auto_scope=False)
+def engram_from_rows_pypto(
+    lookup: pl.Tensor,
+    wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[ENGRAM_K // 32, KV_OUT], pl.FP8E8M0],
     weight: pl.Tensor[[HC_MULT, D], pl.FP32],
-    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
-    out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16]],
+    x: pl.Tensor,
+    out: pl.Tensor,
 ):
-    """Run the Engram block for standalone validation."""
-    hash_ids.bind_dynamic(0, T_DYN)
-    x.bind_dynamic(0, T_DYN)
-    out.bind_dynamic(0, T_DYN)
-    engram(hash_ids, engram_table, wkv_weight, weight, x, out)
+    """Compute Engram in PyPTO DSL for explicit comparison with the production entry."""
+    tokens = pl.tensor.dim(x, 0)
+    if tokens > 0:
+        kv = pl.create_tensor([tokens, KV_OUT], dtype=pl.BF16)
+        projected = gemm_bf16_via_mxfp8_to_bf16_staged(
+            lookup, wkv_weight, wkv_scale, kv, tokens,
+            ENGRAM_K, KV_OUT, "engram_pypto_projection", "engram_pypto_quant",
+            PROJECTION_N_TILE, PROJECTION_K_TILE, 1, 2147483647,
+        )
+        _engram_gate_pypto(projected, weight, x, out)
     return out
 
 
@@ -337,56 +299,83 @@ class HostEngram:
         return result
 
 
-def build_engram_tensor_specs(batch: int = 2, sequence: int = 4):
-    """Build deterministic inputs and the output for Engram validation."""
-    from golden import TensorSpec
+@pl.jit
+def l2_engram_rows(
+    lookup: pl.Tensor[[T_DYN, ENGRAM_K], pl.BF16],
+    wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[ENGRAM_K // 32, KV_OUT], pl.FP8E8M0],
+    weight: pl.Tensor[[HC_MULT, D], pl.FP32],
+    x: pl.InOut[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+):
+    """Validate the same in-place entry used by decode and prefill forwards."""
+    lookup.bind_dynamic(0, T_DYN)
+    x.bind_dynamic(0, T_DYN)
+    engram_from_rows(lookup, wkv_weight, wkv_scale, weight, x, x)
+    return x
 
-    tokens = batch * sequence
+
+@pl.jit
+def l2_engram_rows_pypto(
+    lookup: pl.Tensor[[T_DYN, ENGRAM_K], pl.BF16],
+    wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[ENGRAM_K // 32, KV_OUT], pl.FP8E8M0],
+    weight: pl.Tensor[[HC_MULT, D], pl.FP32],
+    x: pl.InOut[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+):
+    """Validate the explicit PyPTO comparison implementation in place."""
+    lookup.bind_dynamic(0, T_DYN)
+    x.bind_dynamic(0, T_DYN)
+    engram_from_rows_pypto(lookup, wkv_weight, wkv_scale, weight, x, x)
+    return x
+
+
+def build_engram_rows_specs(tokens: int):
+    """Build deterministic host-row inputs with nonuniform packed MX scales."""
+    from golden import TensorSpec
+    from quant import pack_mx_b_scale
+
     generator = torch.Generator().manual_seed(3)
 
-    def init_hash_ids():
-        return torch.randint(0, NUM_EMBEDDINGS, (tokens, N_HASH_COLS), generator=generator)
-
-    def init_table():
-        # small-magnitude rows keep the projection in a numerically tame range
-        return (torch.randn(NUM_EMBEDDINGS, HEAD_DIM, generator=generator) * 0.02).to(
-            torch.bfloat16
-        )
+    def init_lookup():
+        return (torch.randn(tokens, ENGRAM_K, generator=generator) * 0.2).bfloat16()
 
     def init_wkv():
-        return (torch.randn(ENGRAM_K, KV_OUT, generator=generator) / math.sqrt(ENGRAM_K)).to(
-            torch.bfloat16
-        )
+        value = (torch.randn(ENGRAM_K, KV_OUT, generator=generator) * 0.02).to(torch.float8_e4m3fn)
+        return value
+
+    def init_scale():
+        codes = torch.randint(120, 128, (ENGRAM_K // 32, KV_OUT), generator=generator, dtype=torch.uint8)
+        return pack_mx_b_scale(codes).view(torch.float8_e8m0fnu)
 
     def init_weight():
-        # released module keeps q_weight and k_weight separate; fold them
-        # host-side so the kernel takes a single per-channel scale
-        q = torch.rand(HC_MULT, D, generator=generator) + 0.5
-        k = torch.rand(HC_MULT, D, generator=generator) + 0.5
-        return q * k
+        return torch.rand(HC_MULT, D, generator=generator) + 0.5
 
     def init_x():
-        return torch.randn(tokens, HC_MULT, D, generator=generator).to(torch.bfloat16)
+        return torch.randn(tokens, HC_MULT, D, generator=generator)
 
     return [
-        TensorSpec("hash_ids", [tokens, N_HASH_COLS], torch.int32, init_value=init_hash_ids),
-        TensorSpec("engram_table", [NUM_EMBEDDINGS, HEAD_DIM], torch.bfloat16, init_value=init_table),
-        TensorSpec("wkv_weight", [ENGRAM_K, KV_OUT], torch.bfloat16, init_value=init_wkv),
+        TensorSpec("lookup", [tokens, ENGRAM_K], torch.bfloat16, init_value=init_lookup),
+        TensorSpec("wkv_weight", [ENGRAM_K, KV_OUT], torch.float8_e4m3fn, init_value=init_wkv),
+        TensorSpec("wkv_scale", [ENGRAM_K // 32, KV_OUT], torch.float8_e8m0fnu, init_value=init_scale),
         TensorSpec("weight", [HC_MULT, D], torch.float32, init_value=init_weight),
-        TensorSpec("x", [tokens, HC_MULT, D], torch.bfloat16, init_value=init_x),
-        TensorSpec("out", [tokens, HC_MULT, D], torch.bfloat16),
+        TensorSpec("x", [tokens, HC_MULT, D], torch.float32, init_value=init_x),
     ]
 
 
-def golden_engram_case(tensors):
-    """Fill the expected Engram output."""
-    tensors["out"][:] = golden_engram(
-        tensors["hash_ids"],
-        tensors["engram_table"],
-        tensors["wkv_weight"],
-        tensors["weight"],
-        tensors["x"],
-    )
+def golden_engram_rows_case(tensors):
+    """Apply independent sequential MX projection and the released gate formula."""
+    from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
+
+    wkv = tensors["wkv_weight"]
+    kv = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(tensors["lookup"], wkv, tensors["wkv_scale"])
+    key = kv[:, :HC_MULT * D].float().reshape(-1, HC_MULT, D)
+    value = kv[:, HC_MULT * D:].float()
+    h = tensors["x"].float()
+    inverse = torch.rsqrt(h.square().mean(-1) + NORM_EPS) * torch.rsqrt(key.square().mean(-1) + NORM_EPS)
+    dot = (h * tensors["weight"] * key).sum(-1) * inverse * DOT_SCALE
+    root = dot.abs().clamp_min(CLAMP).sqrt()
+    gate = torch.sigmoid(torch.where(dot >= 0, root, -root))
+    tensors["x"][:] = (h + gate.unsqueeze(-1) * value.unsqueeze(-2)).bfloat16().float()
 
 
 if __name__ == "__main__":
@@ -404,8 +393,12 @@ if __name__ == "__main__":
         default="0",
         help="comma-separated device ids; provide one device id",
     )
-    parser.add_argument("--batch", type=int, default=2)
-    parser.add_argument("--sequence", type=int, default=4)
+    parser.add_argument("--implementation", choices=["cpp", "pypto"], default="cpp",
+                        help="cpp is the production default; pypto is for explicit comparison")
+    parser.add_argument("--tokens", type=int, help="explicit row count; default checks tile boundaries and tails")
+    parser.add_argument("--runtime-dir", help="reuse a CPU-prebuilt runtime; requires --tokens")
+    parser.add_argument("--golden-data", help="reuse frozen input/reference tensors; requires --tokens")
+    parser.add_argument("--save-data", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     args = parser.parse_args()
@@ -414,19 +407,39 @@ if __name__ == "__main__":
     if len(device_ids) != 1:
         raise ValueError(f"need exactly one device id, got {device_ids}")
 
-    result = run(
-        fn=l2_engram,
-        specs=build_engram_tensor_specs(args.batch, args.sequence),
-        golden_fn=golden_engram_case,
-        config={
-            "backend_type": args.backend_type, "execution_mode": args.execution_mode,
-            "device_id": device_ids[0],
-            "enable_chip_swimlane": args.enable_chip_swimlane,
-        },
-        rtol=1e-3,
-        atol=1e-3,
-        compare_fn={"out": ratio_allclose(atol=1e-3, rtol=1e-2)},
-        compile_only=args.compile_only,
-    )
-    if not result.passed:
-        raise SystemExit(result.error or 1)
+    if args.tokens is not None and args.tokens <= 0:
+        parser.error("--tokens must be positive")
+    if (args.runtime_dir or args.golden_data or args.save_data) and args.tokens is None:
+        parser.error("replay/capture options require an explicit --tokens case")
+    if args.runtime_dir:
+        from pypto.runtime._artifact_sources import read_kernel_config
+
+        kernels = read_kernel_config(Path(args.runtime_dir) / "kernel_config.py").KERNELS
+        native_runtime = any(kernel.get("external", False) for kernel in kernels)
+        if native_runtime != (args.implementation == "cpp"):
+            parser.error("--runtime-dir implementation does not match --implementation")
+    entry = l2_engram_rows if args.implementation == "cpp" else l2_engram_rows_pypto
+    token_cases = [17, 81, 129, 256] if args.execution_mode else [17, 80, 81, 128, 129, 256, 257]
+    if args.tokens is not None:
+        token_cases = [args.tokens]
+    for tokens in token_cases:
+        specs = build_engram_rows_specs(tokens)
+        result = run(
+            fn=entry,
+            specs=specs,
+            golden_fn=golden_engram_rows_case,
+            config={
+                "backend_type": args.backend_type, "execution_mode": args.execution_mode,
+                "device_id": device_ids[0],
+                "enable_chip_swimlane": args.enable_chip_swimlane,
+            },
+            rtol=1e-3,
+            atol=1e-3,
+            compare_fn={"x": ratio_allclose(atol=1e-3, rtol=1e-2)},
+            compile_only=args.compile_only,
+            runtime_dir=args.runtime_dir,
+            golden_data=args.golden_data,
+            save_data=args.save_data,
+        )
+        if not result.passed:
+            raise SystemExit(result.error or 1)
