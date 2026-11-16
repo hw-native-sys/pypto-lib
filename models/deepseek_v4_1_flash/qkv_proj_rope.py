@@ -49,6 +49,12 @@ PROJ_M_TILE = 80
 PROJ_WIDE_M_TILE = 128
 WINDOW_PUBLISH_WORKER_TILE = 12
 NATIVE_VALIDATION_WORKERS = 32
+WINDOW_HEAD_DIM = 512
+WINDOW_PAGE_SIZE = 128
+
+# Window tiling.
+WINDOW_ROW_TILE = 8
+WINDOW_SLOT_TILE = 128
 
 
 @pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "proj_q_a.cpp",
@@ -235,15 +241,6 @@ def kv_proj(
     with pl.spmd(workers, name_hint="proj_kv", sync_start=True):
         kv_projection = _proj_kv(payload, wkv, scales, wkv_scale, kv_projection, num_tokens, 0, row_tile)
     return kv_projection
-
-
-# model config
-WINDOW_HEAD_DIM = 512
-WINDOW_PAGE_SIZE = 128
-
-# tiling
-WINDOW_ROW_TILE = 8
-WINDOW_SLOT_TILE = 128
 
 
 @pl.jit.inline(auto_scope=False)
