@@ -1316,21 +1316,22 @@ def _score_index_rows(
                         last_panel = pl.min(panels, end_work - run_id * panels)
                         run_begin = pl.cast(pl.read(runs, [0, run_id]), pl.INDEX)
                         run_end = pl.cast(pl.read(runs, [1, run_id]), pl.INDEX)
-                        valid_query_scales = (run_end - run_begin) * INDEX_H * 4
-                        raw_query_scale = pl.tile.load(
-                            flat_query_scales, [0, run_begin * INDEX_H * 4],
-                            [1, SCORE_ROWS_TILE * 4], valid_shape=[1, valid_query_scales],
-                            target_memory=pl.MemorySpace.Vec,
-                        )
-                        padded_query_scale = pl.fillpad(raw_query_scale, pad_value=pl.PadValue.zero)
-                        full_query_scale = pl.set_validshape(padded_query_scale, 1, SCORE_ROWS_TILE * 4)
-                        query_bytes = pl.reinterpret_view(full_query_scale, pl.UINT8)
-                        query_temporary = pl.create_tile([1, 128], dtype=pl.UINT8)
-                        query_zz = pl.tmov_x2zz(query_bytes, query_temporary, group_axis=1, dst_rows=SCORE_ROWS_TILE, dst_cols=4)
-                        cached_keys = pl.tile.full([6, 2 * _PY_SCORE_SHARD_CACHE], dtype=pl.INT8, value=0)
-                        cached_keys = pl.tile.move(cached_keys, target_memory=pl.MemorySpace.Vec)
-                        cached_high = pl.tile.full([6, 512], dtype=pl.INT8, value=0)
-                        cached_high = pl.tile.move(cached_high, target_memory=pl.MemorySpace.Vec)
+                        for scale_lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                            valid_query_scales = (run_end - run_begin) * INDEX_H * 4
+                            raw_query_scale = pl.tile.load(
+                                flat_query_scales, [0, run_begin * INDEX_H * 4],
+                                [1, SCORE_ROWS_TILE * 4], valid_shape=[1, valid_query_scales],
+                                target_memory=pl.MemorySpace.Vec,
+                            )
+                            padded_query_scale = pl.fillpad(raw_query_scale, pad_value=pl.PadValue.zero)
+                            full_query_scale = pl.set_validshape(padded_query_scale, 1, SCORE_ROWS_TILE * 4)
+                            query_bytes = pl.reinterpret_view(full_query_scale, pl.UINT8)
+                            query_temporary = pl.create_tile([1, 128], dtype=pl.UINT8)
+                            query_zz = pl.tmov_x2zz(query_bytes, query_temporary, group_axis=1, dst_rows=SCORE_ROWS_TILE, dst_cols=4)
+                            cached_keys = pl.tile.full([3, 2 * _PY_SCORE_SHARD_CACHE], dtype=pl.INT8, value=0)
+                            cached_keys = pl.tile.move(cached_keys, target_memory=pl.MemorySpace.Vec)
+                            cached_high = pl.tile.full([3, 512], dtype=pl.INT8, value=0)
+                            cached_high = pl.tile.move(cached_high, target_memory=pl.MemorySpace.Vec)
                         for panel in pl.range(first_panel, last_panel):
                             work = run_id * panels + panel
                             staging_slot = work - batch_begin
@@ -1340,43 +1341,44 @@ def _score_index_rows(
                                 packed_keys, [staging_slot * SCORE_TILE, 0],
                                 [SCORE_TILE, INDEX_DIM // 2], target_memory=pl.MemorySpace.Mat,
                             )
-                            dot_scale_bytes = pl.tile.load(
-                                staged_scales, [staging_slot, 0], [1, SCORE_TILE * 4],
-                                target_memory=pl.MemorySpace.Vec,
-                            )
-                            scale_temporary = pl.create_tile([1, 128], dtype=pl.UINT8)
-                            key_zz = pl.tmov_x2zz(
-                                dot_scale_bytes, scale_temporary, group_axis=1,
-                                dst_rows=SCORE_TILE, dst_cols=4,
-                            )
-                            key_scale_nn = pl.tile.transpose_view(pl.reinterpret_view(key_zz, pl.FP8E8M0))
+                            for key_lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                                dot_scale_bytes = pl.tile.load(
+                                    staged_scales, [staging_slot, key_lane * SCORE_TILE * 2],
+                                    [1, SCORE_TILE * 2], target_memory=pl.MemorySpace.Vec,
+                                )
+                                scale_temporary = pl.create_tile([1, 128], dtype=pl.UINT8)
+                                key_half_zz = pl.tmov_x2zz(
+                                    dot_scale_bytes, scale_temporary, group_axis=1,
+                                    dst_rows=128, dst_cols=4,
+                                )
+                                key_half_scale = pl.reinterpret_view(key_half_zz, pl.FP8E8M0)
+                                key_half_nn = pl.tile.transpose_view(key_half_scale)
+                            for key_transfer_lane in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
+                                key_full_scale = pl.aic_gather(key_half_nn)
                             keys_mat = pl.tile.transpose_view(dot_keys)
                             keys_right = pl.tile.move(keys_mat, target_memory=pl.MemorySpace.Right)
-                            key_scale_mat = pl.tile.move(
-                                key_scale_nn, target_memory=pl.MemorySpace.Mat,
-                                blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major,
-                            )
-                            key_right_scale = pl.tile.move(key_scale_mat, target_memory=pl.MemorySpace.RightScale)
+                            key_right_scale = pl.tile.move(key_full_scale, target_memory=pl.MemorySpace.RightScale)
                             for pair in pl.unroll(3):
                                 query_mat = pl.tile.load(
                                     query_fp4, [run_id * SCORE_ROWS_TILE + pair * 64, 0],
                                     [64, INDEX_DIM // 2], target_memory=pl.MemorySpace.Mat,
                                 )
                                 query_left = pl.tile.move(query_mat, target_memory=pl.MemorySpace.Left)
-                                query_scale_pair = pl.tile.slice(
-                                    pl.reinterpret_view(query_zz, pl.FP8E8M0), [64, 4], [pair * 64, 0],
-                                )
-                                query_scale_mat = pl.tile.move(
-                                    query_scale_pair, target_memory=pl.MemorySpace.Mat,
-                                    blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major,
-                                )
-                                query_left_scale = pl.tile.move(query_scale_mat, target_memory=pl.MemorySpace.LeftScale)
+                                for query_lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                                    query_scale_offset = pair * 64 + query_lane * INDEX_H
+                                    query_scale_pair = pl.tile.slice(
+                                        pl.reinterpret_view(query_zz, pl.FP8E8M0),
+                                        [INDEX_H, 4], [query_scale_offset, 0],
+                                    )
+                                    query_scale_full = pl.aic_gather(query_scale_pair)
+                                query_left_scale = pl.tile.move(query_scale_full, target_memory=pl.MemorySpace.LeftScale)
                                 dot = pl.matmul_mx(query_left, query_left_scale, keys_right, key_right_scale)
-                                dot_bf16 = pl.cast(dot, target_type=pl.BF16, mode="rint")
-                                dot_flat = pl.reshape(dot_bf16, [2 * INDEX_H * SCORE_TILE])
-                                for token_lane in pl.unroll(2):
+                                for token_lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                                    dot_half = pl.aiv_shard(dot)
+                                    dot_bf16 = pl.cast(dot_half, target_type=pl.BF16, mode="rint")
+                                    dot_flat = pl.reshape(dot_bf16, [INDEX_H * SCORE_TILE])
                                     token = run_begin + pair * 2 + token_lane
-                                    cache_slot = pair * 2 + token_lane
+                                    cache_slot = pair
                                     if token < run_end:
                                         compute_local = pl.cast(1, pl.INT32)
                                         if direct_short and pl.read(lengths, [token]) <= INDEX_TOPK:
@@ -1418,15 +1420,23 @@ def _score_index_rows(
                                             r0_halfwords = pl.reg.interpret_cast(r0_rounded, dtype=pl.UINT16)
                                             r0_even, r0_weights_bits = pl.reg.dintlv(r0_halfwords, r0_halfwords, r0_mask)
                                             r0_zero = pl.reg.broadcast(0.0, lanes=128, dtype=pl.BF16)
-                                            for reduce_part in pl.hardware_loop(SCORE_TILE // 128):
-                                                r0_acc = r0_zero
-                                                for head in pl.unroll(INDEX_H):
-                                                    r0_dots = pl.reg.load(dot_flat, token_lane * INDEX_H * SCORE_TILE + head * SCORE_TILE + reduce_part * 128, lanes=128)
-                                                    r0_positive = pl.reg.maximum(r0_dots, r0_zero)
-                                                    r0_indices = pl.reg.broadcast(pl.cast(head, pl.UINT16), lanes=128, dtype=pl.UINT16)
-                                                    r0_repeated_bits = pl.reg.gather_lanes(r0_weights_bits, r0_indices)
-                                                    r0_repeated = pl.reg.interpret_cast(r0_repeated_bits, dtype=pl.BF16)
-                                                    r0_acc = pl.reg.mula(r0_acc, r0_positive, r0_repeated)
+                                            r0_acc0 = r0_zero
+                                            r0_acc1 = r0_zero
+                                            for head in pl.unroll(INDEX_H):
+                                                r0_dots0 = pl.reg.load(dot_flat, head * SCORE_TILE, lanes=128)
+                                                r0_dots1 = pl.reg.load(dot_flat, head * SCORE_TILE + 128, lanes=128)
+                                                r0_positive0 = pl.reg.maximum(r0_dots0, r0_zero)
+                                                r0_positive1 = pl.reg.maximum(r0_dots1, r0_zero)
+                                                r0_indices = pl.reg.broadcast(pl.cast(head, pl.UINT16), lanes=128, dtype=pl.UINT16)
+                                                r0_repeated_bits = pl.reg.gather_lanes(r0_weights_bits, r0_indices)
+                                                r0_repeated = pl.reg.interpret_cast(r0_repeated_bits, dtype=pl.BF16)
+                                                r0_acc0 = pl.reg.mula(r0_acc0, r0_positive0, r0_repeated)
+                                                r0_acc1 = pl.reg.mula(r0_acc1, r0_positive1, r0_repeated)
+                                            for reduce_part in pl.unroll(SCORE_TILE // 128):
+                                                if reduce_part == 0:
+                                                    r0_acc = r0_acc0
+                                                else:
+                                                    r0_acc = r0_acc1
                                                 r0_acc = pl.reg.add(r0_acc, r0_zero)
                                                 r0_total_bits16 = pl.reg.interpret_cast(r0_acc, dtype=pl.UINT16)
                                                 r0_total_bits = pl.reg.convert(r0_total_bits16, dtype=pl.UINT32)
@@ -1460,10 +1470,10 @@ def _score_index_rows(
                                             high_bytes = pl.reinterpret_view(next_high_values, pl.UINT8)
                                             high_row = pl.reshape(pl.reinterpret_view(high_bytes, pl.INT8), [1, 512])
                                             cached_high = pl.tile.assemble(cached_high, high_row, [cache_slot, 0])
-                        for pair in pl.unroll(3):
-                            for token_lane in pl.unroll(2):
+                        for token_lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                            for pair in pl.unroll(3):
                                 token = run_begin + pair * 2 + token_lane
-                                cache_slot = pair * 2 + token_lane
+                                cache_slot = pair
                                 if token < run_end:
                                     select_compute_local = pl.cast(1, pl.INT32)
                                     if direct_short and pl.read(lengths, [token]) <= INDEX_TOPK:
