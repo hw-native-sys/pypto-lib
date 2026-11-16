@@ -69,11 +69,7 @@ cover the fused path and the statistics-producing path's mixed and all-invalid
 cases. Distributed TP > 1 hardware execution and the complete model were not
 revalidated in this change.
 
-The [current raw ABBA samples](../../../../docs/models/deepseek_v4_flash_dspark/csa-buffer-review-benchmark.json)
-record every measurement, metric definitions, source hashes and the pinned
-toolchain after coherent index staging. The
-[historical samples](../../../../docs/models/deepseek_v4_flash_dspark/csa-buffer-benchmark.json)
-retain the preceding implementation's measurements separately. To
+To
 reproduce this scenario, set `TP = 1`, `DP = 16` and
 `DSPARK_SPEC_TOKENS = 5` in the experiment checkout configuration; these are
 benchmark overrides, not changes to the deployment defaults.
