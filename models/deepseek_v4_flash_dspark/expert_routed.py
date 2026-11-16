@@ -9,6 +9,8 @@
 """DeepSeek-V4 MoE routed expert: gate/up matmul, SwiGLU, requant, W2, output scaling."""
 
 
+from types import SimpleNamespace
+
 import pypto.language as pl
 
 from config import (FLASH as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS,
@@ -199,184 +201,228 @@ def _gate_up_python(
     return gate, up
 
 
-@pl.jit.inline(auto_scope=False)
-def expert_routed_tile(
-    recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.INT8],
-    recv_scale_dq: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
-    recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
-    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8, pl.NZ],
-    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8, pl.NZ],
-    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8, pl.NZ],
-    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
-    recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
-    recv_y_tile: pl.Tensor,
-    local_e: pl.Scalar[pl.INDEX],
-    tile_row: pl.Scalar[pl.INDEX],
-    valid_rows: pl.Scalar[pl.INDEX],
-    inputs_ready: pl.Scalar[pl.TASK_ID],
-    ROW_TILE: pl.constexpr,
-    INTER_K: pl.constexpr,
-    D_OUT_TILE: pl.constexpr,
-    D_OUT_TILE_ACT: pl.constexpr,
-    GROUP_TILE: pl.constexpr,
-    Y_ROW_TILE: pl.constexpr,
-) -> pl.Scalar[pl.TASK_ID]:
-    recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
-    flat_tile_row = local_e * RECV_MAX + tile_row
-    recv_x_tile = recv_x_flat[flat_tile_row : flat_tile_row + (GROUP_TILE - 1) * RECV_MAX + ROW_TILE, :]
-    recv_scale_flat = pl.reshape(recv_scale_dq, [1, N_LOCAL_EXPERTS * RECV_MAX])
-    recv_scale_tile = recv_scale_flat[:, flat_tile_row : flat_tile_row + (GROUP_TILE - 1) * RECV_MAX + ROW_TILE]
-    recv_weight_flat = pl.reshape(recv_weights, [1, N_LOCAL_EXPERTS * RECV_MAX])
-    recv_weight_tile = recv_weight_flat[:, flat_tile_row : flat_tile_row + (GROUP_TILE - 1) * RECV_MAX + ROW_TILE]
-    h_tile_i8 = pl.create_tensor([GROUP_TILE * ROW_TILE, MOE_INTER], dtype=pl.INT8)
-    h_tile_row_scale = pl.create_tensor([1, GROUP_TILE * ROW_TILE], dtype=pl.FP32, manual_dep=True)
-    quant_tids = pl.array.create(1, pl.TASK_ID)
+def _expert_geometry(local_experts: int):
+    """Per-instantiation constants that depend on the local expert capacity."""
+    if local_experts <= 0:
+        raise ValueError("Local expert capacity must be positive")
+    w2_expert_rows = (MOE_TOKENS * M.num_experts_per_tok + local_experts - 1) // local_experts
+    return SimpleNamespace(
+        local_experts=local_experts,
+        w2_expert_rows=w2_expert_rows,
+        inter_k=256 if w2_expert_rows >= 2 * RECV_TILE else 512,
+        d_out_tile=512 if w2_expert_rows >= 2 * RECV_TILE else 256,
+        tail_inter_k=256 if w2_expert_rows >= 2 * TAIL_TILE else 512,
+        tail_d_out_tile=512 if w2_expert_rows >= 2 * TAIL_TILE else 256,
+        mid_k_tile=256 if w2_expert_rows >= 2 * MID_TILE else 512,
+        mid_d_tile=512 if w2_expert_rows >= 2 * MID_TILE else 256,
+        expert_group_tile=4 if local_experts % 4 == 0 else (2 if local_experts % 2 == 0 else 1),
+    )
 
-    with pl.scope():
-        gate_tile_i32 = pl.create_tensor([GROUP_TILE * ROW_TILE, MOE_INTER], dtype=pl.INT32)
-        up_tile_i32 = pl.create_tensor([GROUP_TILE * ROW_TILE, MOE_INTER], dtype=pl.INT32)
 
-        expert_rows = pl.cast(pl.read(recv_expert_count, [local_e, 0]), pl.INDEX)
-        if ROW_TILE <= 64 and expert_rows <= RECV_TILE:
-            with pl.spmd(GROUP_TILE * MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_up_mm", deps=[inputs_ready]):
-                gate_tile_i32, up_tile_i32 = _gate_up_python(
-                    recv_x_tile, gate_tile_i32, up_tile_i32,
-                    routed_w1, routed_w3, 0, local_e, ROW_TILE, GROUP_TILE, True,
-                )
+class ExpertRoutedTile:
+    """One specialized expert tile plus the geometry its caller must pass."""
 
-        else:
-            with pl.spmd(GROUP_TILE * MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_up_mm", deps=[inputs_ready]):
-                gate_tile_i32, up_tile_i32 = _gate_up_python(
-                    recv_x_tile, gate_tile_i32, up_tile_i32,
-                    routed_w1, routed_w3, 0, local_e, ROW_TILE, GROUP_TILE, False,
-                )
+    def __init__(self, tile, geometry):
+        self.tile = tile
+        self.local_experts = geometry.local_experts
+        self.w2_expert_rows = geometry.w2_expert_rows
+        self.expert_group_tile = geometry.expert_group_tile
+        self.inter_k = geometry.inter_k
+        self.d_out_tile = geometry.d_out_tile
+        self.tail_inter_k = geometry.tail_inter_k
+        self.tail_d_out_tile = geometry.tail_d_out_tile
+        self.mid_k_tile = geometry.mid_k_tile
+        self.mid_d_tile = geometry.mid_d_tile
 
-        with pl.spmd(GROUP_TILE * ROW_TILE // QUANT_ROW_TILE, name_hint="exp_gate_up_act_q") as quant_tid:
-            quant_block = pl.tile.get_block_idx()
-            group = quant_block // (ROW_TILE // QUANT_ROW_TILE)
+
+def make_expert_routed_tile(local_experts: int):
+    """Specialize the expert bank extent independently for target and drafter."""
+    geometry = _expert_geometry(local_experts)
+    LOCAL_EXPERTS = geometry.local_experts
+
+    @pl.jit.inline(auto_scope=False)
+    def expert_routed_tile(
+        recv_x: pl.Tensor[[LOCAL_EXPERTS, RECV_MAX, D], pl.INT8],
+        recv_scale_dq: pl.Tensor[[LOCAL_EXPERTS, RECV_MAX], pl.FP32],
+        recv_weights: pl.Tensor[[LOCAL_EXPERTS, RECV_MAX], pl.FP32],
+        routed_w1: pl.Tensor[[LOCAL_EXPERTS, MOE_INTER, D], pl.INT8, pl.NZ],
+        routed_w1_scale: pl.Tensor[[LOCAL_EXPERTS, MOE_INTER], pl.FP32],
+        routed_w3: pl.Tensor[[LOCAL_EXPERTS, MOE_INTER, D], pl.INT8, pl.NZ],
+        routed_w3_scale: pl.Tensor[[LOCAL_EXPERTS, MOE_INTER], pl.FP32],
+        routed_w2: pl.Tensor[[LOCAL_EXPERTS, D, MOE_INTER], pl.INT8, pl.NZ],
+        routed_w2_scale: pl.Tensor[[LOCAL_EXPERTS, D], pl.FP32],
+        recv_expert_count: pl.Tensor[[LOCAL_EXPERTS, 1], pl.INT32],
+        recv_y_tile: pl.Tensor,
+        local_e: pl.Scalar[pl.INDEX],
+        tile_row: pl.Scalar[pl.INDEX],
+        valid_rows: pl.Scalar[pl.INDEX],
+        inputs_ready: pl.Scalar[pl.TASK_ID],
+        ROW_TILE: pl.constexpr,
+        INTER_K: pl.constexpr,
+        D_OUT_TILE: pl.constexpr,
+        D_OUT_TILE_ACT: pl.constexpr,
+        GROUP_TILE: pl.constexpr,
+        Y_ROW_TILE: pl.constexpr,
+    ) -> pl.Scalar[pl.TASK_ID]:
+        recv_x_flat = pl.reshape(recv_x, [LOCAL_EXPERTS * RECV_MAX, D])
+        flat_tile_row = local_e * RECV_MAX + tile_row
+        recv_x_tile = recv_x_flat[flat_tile_row : flat_tile_row + (GROUP_TILE - 1) * RECV_MAX + ROW_TILE, :]
+        recv_scale_flat = pl.reshape(recv_scale_dq, [1, LOCAL_EXPERTS * RECV_MAX])
+        recv_scale_tile = recv_scale_flat[:, flat_tile_row : flat_tile_row + (GROUP_TILE - 1) * RECV_MAX + ROW_TILE]
+        recv_weight_flat = pl.reshape(recv_weights, [1, LOCAL_EXPERTS * RECV_MAX])
+        recv_weight_tile = recv_weight_flat[:, flat_tile_row : flat_tile_row + (GROUP_TILE - 1) * RECV_MAX + ROW_TILE]
+        h_tile_i8 = pl.create_tensor([GROUP_TILE * ROW_TILE, MOE_INTER], dtype=pl.INT8)
+        h_tile_row_scale = pl.create_tensor([1, GROUP_TILE * ROW_TILE], dtype=pl.FP32, manual_dep=True)
+        quant_tids = pl.array.create(1, pl.TASK_ID)
+
+        with pl.scope():
+            gate_tile_i32 = pl.create_tensor([GROUP_TILE * ROW_TILE, MOE_INTER], dtype=pl.INT32)
+            up_tile_i32 = pl.create_tensor([GROUP_TILE * ROW_TILE, MOE_INTER], dtype=pl.INT32)
+
+            expert_rows = pl.cast(pl.read(recv_expert_count, [local_e, 0]), pl.INDEX)
+            if ROW_TILE <= 64 and expert_rows <= RECV_TILE:
+                with pl.spmd(GROUP_TILE * MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_up_mm", deps=[inputs_ready]):
+                    gate_tile_i32, up_tile_i32 = _gate_up_python(
+                        recv_x_tile, gate_tile_i32, up_tile_i32,
+                        routed_w1, routed_w3, 0, local_e, ROW_TILE, GROUP_TILE, True,
+                    )
+
+            else:
+                with pl.spmd(GROUP_TILE * MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_up_mm", deps=[inputs_ready]):
+                    gate_tile_i32, up_tile_i32 = _gate_up_python(
+                        recv_x_tile, gate_tile_i32, up_tile_i32,
+                        routed_w1, routed_w3, 0, local_e, ROW_TILE, GROUP_TILE, False,
+                    )
+
+            with pl.spmd(GROUP_TILE * ROW_TILE // QUANT_ROW_TILE, name_hint="exp_gate_up_act_q") as quant_tid:
+                quant_block = pl.tile.get_block_idx()
+                group = quant_block // (ROW_TILE // QUANT_ROW_TILE)
+                group_expert = local_e + group
+                quant_row = (quant_block % (ROW_TILE // QUANT_ROW_TILE)) * QUANT_ROW_TILE
+                out_quant_row = group * ROW_TILE + quant_row
+                scale_row = group * RECV_MAX + quant_row
+                if GROUP_TILE > 1:
+                    count = pl.cast(pl.read(recv_expert_count, [group_expert, 0]), pl.INDEX)
+                    valid_rows = pl.min(ROW_TILE, pl.max(0, count - tile_row))
+                valid_quant_rows = pl.min(QUANT_ROW_TILE, pl.max(0, valid_rows - quant_row))
+                x_scale = recv_scale_tile[:, scale_row : scale_row + QUANT_ROW_TILE]
+                x_scale = pl.reshape(x_scale, [QUANT_ROW_TILE, 1])
+                row_amax = pl.full([1, QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+                gate0_i32 = gate_tile_i32[out_quant_row : out_quant_row + QUANT_ROW_TILE, :ACT_INTER_TILE]
+                gate0_fp32 = pl.cast(gate0_i32, target_type=pl.FP32, mode="none")
+                gate0_scaled = pl.row_expand_mul(gate0_fp32, x_scale)
+                w1_scale0 = routed_w1_scale[group_expert : group_expert + 1, :ACT_INTER_TILE]
+                gate0_fp32 = pl.col_expand_mul(gate0_scaled, w1_scale0)
+                if SWIGLU_LIMIT > 0.0:
+                    gate0_fp32 = pl.minimum(gate0_fp32, SWIGLU_LIMIT)
+                sigmoid0 = pl.recip(pl.add(pl.exp(pl.neg(gate0_fp32)), 1.0))
+                silu0 = pl.mul(gate0_fp32, sigmoid0)
+                up0_i32 = up_tile_i32[out_quant_row : out_quant_row + QUANT_ROW_TILE, :ACT_INTER_TILE]
+                up0_fp32 = pl.cast(up0_i32, target_type=pl.FP32, mode="none")
+                up0_scaled = pl.row_expand_mul(up0_fp32, x_scale)
+                w3_scale0 = routed_w3_scale[group_expert : group_expert + 1, :ACT_INTER_TILE]
+                up0_fp32 = pl.col_expand_mul(up0_scaled, w3_scale0)
+                if SWIGLU_LIMIT > 0.0:
+                    up0_fp32 = pl.maximum(pl.minimum(up0_fp32, SWIGLU_LIMIT), -SWIGLU_LIMIT)
+                activated0 = pl.mul(silu0, up0_fp32)
+                activated0 = pl.set_validshape(activated0, valid_quant_rows, ACT_INTER_TILE)
+                activated0 = pl.fillpad(activated0, pad_value=pl.PadValue.zero)
+                abs0 = pl.maximum(activated0, pl.neg(activated0))
+                row_amax = pl.maximum(row_amax, pl.reshape(pl.row_max(abs0), [1, QUANT_ROW_TILE]))
+
+                gate1_i32 = gate_tile_i32[out_quant_row : out_quant_row + QUANT_ROW_TILE, ACT_INTER_TILE:]
+                gate1_fp32 = pl.cast(gate1_i32, target_type=pl.FP32, mode="none")
+                gate1_scaled = pl.row_expand_mul(gate1_fp32, x_scale)
+                w1_scale1 = routed_w1_scale[group_expert : group_expert + 1, ACT_INTER_TILE:]
+                gate1_fp32 = pl.col_expand_mul(gate1_scaled, w1_scale1)
+                if SWIGLU_LIMIT > 0.0:
+                    gate1_fp32 = pl.minimum(gate1_fp32, SWIGLU_LIMIT)
+                sigmoid1 = pl.recip(pl.add(pl.exp(pl.neg(gate1_fp32)), 1.0))
+                silu1 = pl.mul(gate1_fp32, sigmoid1)
+                up1_i32 = up_tile_i32[out_quant_row : out_quant_row + QUANT_ROW_TILE, ACT_INTER_TILE:]
+                up1_fp32 = pl.cast(up1_i32, target_type=pl.FP32, mode="none")
+                up1_scaled = pl.row_expand_mul(up1_fp32, x_scale)
+                w3_scale1 = routed_w3_scale[group_expert : group_expert + 1, ACT_INTER_TILE:]
+                up1_fp32 = pl.col_expand_mul(up1_scaled, w3_scale1)
+                if SWIGLU_LIMIT > 0.0:
+                    up1_fp32 = pl.maximum(pl.minimum(up1_fp32, SWIGLU_LIMIT), -SWIGLU_LIMIT)
+                activated1 = pl.mul(silu1, up1_fp32)
+                activated1 = pl.set_validshape(activated1, valid_quant_rows, MOE_INTER - ACT_INTER_TILE)
+                activated1 = pl.fillpad(activated1, pad_value=pl.PadValue.zero)
+                abs1 = pl.maximum(activated1, pl.neg(activated1))
+                row_amax = pl.maximum(row_amax, pl.reshape(pl.row_max(abs1), [1, QUANT_ROW_TILE]))
+
+                quant_scale = pl.div(pl.full([1, QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), row_amax)
+                dequant_scale = pl.recip(quant_scale)
+                route_weight = recv_weight_tile[:, scale_row : scale_row + QUANT_ROW_TILE]
+                h_tile_row_scale[:, out_quant_row : out_quant_row + QUANT_ROW_TILE] = pl.mul(dequant_scale, route_weight)
+                quant_scale_col = pl.reshape(quant_scale, [QUANT_ROW_TILE, 1])
+                scaled0 = pl.row_expand_mul(activated0, quant_scale_col)
+                i32_0 = pl.cast(scaled0, target_type=pl.INT32, mode="rint")
+                fp16_0 = pl.cast(i32_0, target_type=pl.FP16, mode="round")
+                h_tile_i8[out_quant_row : out_quant_row + QUANT_ROW_TILE, :ACT_INTER_TILE] = pl.cast(fp16_0, pl.INT8, mode="trunc")
+                scaled1 = pl.row_expand_mul(activated1, quant_scale_col)
+                i32_1 = pl.cast(scaled1, target_type=pl.INT32, mode="rint")
+                fp16_1 = pl.cast(i32_1, target_type=pl.FP16, mode="round")
+                h_tile_i8[out_quant_row : out_quant_row + QUANT_ROW_TILE, ACT_INTER_TILE:] = pl.cast(fp16_1, pl.INT8, mode="trunc")
+            quant_tids[0] = quant_tid
+
+        y_i32 = pl.create_tensor([GROUP_TILE * ROW_TILE, D], dtype=pl.INT32)
+        with pl.spmd(
+            GROUP_TILE * D // (W2_INNER * D_OUT_TILE),
+            name_hint="exp_w2_mm",
+            deps=[quant_tids[0]],
+            allow_early_resolve=True,
+        ) as w2_tid:
+            group_block = pl.tile.get_block_idx()
+            group = group_block // (D // (W2_INNER * D_OUT_TILE))
+            block = group_block % (D // (W2_INNER * D_OUT_TILE))
             group_expert = local_e + group
-            quant_row = (quant_block % (ROW_TILE // QUANT_ROW_TILE)) * QUANT_ROW_TILE
-            out_quant_row = group * ROW_TILE + quant_row
-            scale_row = group * RECV_MAX + quant_row
-            if GROUP_TILE > 1:
-                count = pl.cast(pl.read(recv_expert_count, [group_expert, 0]), pl.INDEX)
-                valid_rows = pl.min(ROW_TILE, pl.max(0, count - tile_row))
-            valid_quant_rows = pl.min(QUANT_ROW_TILE, pl.max(0, valid_rows - quant_row))
-            x_scale = recv_scale_tile[:, scale_row : scale_row + QUANT_ROW_TILE]
-            x_scale = pl.reshape(x_scale, [QUANT_ROW_TILE, 1])
-            row_amax = pl.full([1, QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-            gate0_i32 = gate_tile_i32[out_quant_row : out_quant_row + QUANT_ROW_TILE, :ACT_INTER_TILE]
-            gate0_fp32 = pl.cast(gate0_i32, target_type=pl.FP32, mode="none")
-            gate0_scaled = pl.row_expand_mul(gate0_fp32, x_scale)
-            w1_scale0 = routed_w1_scale[group_expert : group_expert + 1, :ACT_INTER_TILE]
-            gate0_fp32 = pl.col_expand_mul(gate0_scaled, w1_scale0)
-            if SWIGLU_LIMIT > 0.0:
-                gate0_fp32 = pl.minimum(gate0_fp32, SWIGLU_LIMIT)
-            sigmoid0 = pl.recip(pl.add(pl.exp(pl.neg(gate0_fp32)), 1.0))
-            silu0 = pl.mul(gate0_fp32, sigmoid0)
-            up0_i32 = up_tile_i32[out_quant_row : out_quant_row + QUANT_ROW_TILE, :ACT_INTER_TILE]
-            up0_fp32 = pl.cast(up0_i32, target_type=pl.FP32, mode="none")
-            up0_scaled = pl.row_expand_mul(up0_fp32, x_scale)
-            w3_scale0 = routed_w3_scale[group_expert : group_expert + 1, :ACT_INTER_TILE]
-            up0_fp32 = pl.col_expand_mul(up0_scaled, w3_scale0)
-            if SWIGLU_LIMIT > 0.0:
-                up0_fp32 = pl.maximum(pl.minimum(up0_fp32, SWIGLU_LIMIT), -SWIGLU_LIMIT)
-            activated0 = pl.mul(silu0, up0_fp32)
-            activated0 = pl.set_validshape(activated0, valid_quant_rows, ACT_INTER_TILE)
-            activated0 = pl.fillpad(activated0, pad_value=pl.PadValue.zero)
-            abs0 = pl.maximum(activated0, pl.neg(activated0))
-            row_amax = pl.maximum(row_amax, pl.reshape(pl.row_max(abs0), [1, QUANT_ROW_TILE]))
+            out_row = group * ROW_TILE
+            d_base = block * (W2_INNER * D_OUT_TILE)
+            h_l1 = pl.create_l1([ROW_TILE, MOE_INTER], dtype=pl.INT8)
+            h_l1 = pl.gather_row(h_l1, h_tile_i8, [0, 0], [out_row, 0], [ROW_TILE, MOE_INTER])
+            for inner in pl.range(W2_INNER):
+                d0 = d_base + inner * D_OUT_TILE
+                y_acc = pl.create_tensor([1, ROW_TILE, D_OUT_TILE], dtype=pl.INT32)
+                for k0 in pl.pipeline(0, MOE_INTER, INTER_K, stage=2):
+                    h_w2_chunk = h_l1[:, k0 : k0 + INTER_K]
+                    w2_chunk = routed_w2[group_expert : group_expert + 1, d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K]
+                    y_acc = pl.matmul_acc(y_acc, h_w2_chunk, w2_chunk, b_trans=True, init_cond=(k0 == 0))
+                y_i32[out_row : out_row + ROW_TILE, d0 : d0 + D_OUT_TILE] = pl.reshape(y_acc, [ROW_TILE, D_OUT_TILE])
 
-            gate1_i32 = gate_tile_i32[out_quant_row : out_quant_row + QUANT_ROW_TILE, ACT_INTER_TILE:]
-            gate1_fp32 = pl.cast(gate1_i32, target_type=pl.FP32, mode="none")
-            gate1_scaled = pl.row_expand_mul(gate1_fp32, x_scale)
-            w1_scale1 = routed_w1_scale[group_expert : group_expert + 1, ACT_INTER_TILE:]
-            gate1_fp32 = pl.col_expand_mul(gate1_scaled, w1_scale1)
-            if SWIGLU_LIMIT > 0.0:
-                gate1_fp32 = pl.minimum(gate1_fp32, SWIGLU_LIMIT)
-            sigmoid1 = pl.recip(pl.add(pl.exp(pl.neg(gate1_fp32)), 1.0))
-            silu1 = pl.mul(gate1_fp32, sigmoid1)
-            up1_i32 = up_tile_i32[out_quant_row : out_quant_row + QUANT_ROW_TILE, ACT_INTER_TILE:]
-            up1_fp32 = pl.cast(up1_i32, target_type=pl.FP32, mode="none")
-            up1_scaled = pl.row_expand_mul(up1_fp32, x_scale)
-            w3_scale1 = routed_w3_scale[group_expert : group_expert + 1, ACT_INTER_TILE:]
-            up1_fp32 = pl.col_expand_mul(up1_scaled, w3_scale1)
-            if SWIGLU_LIMIT > 0.0:
-                up1_fp32 = pl.maximum(pl.minimum(up1_fp32, SWIGLU_LIMIT), -SWIGLU_LIMIT)
-            activated1 = pl.mul(silu1, up1_fp32)
-            activated1 = pl.set_validshape(activated1, valid_quant_rows, MOE_INTER - ACT_INTER_TILE)
-            activated1 = pl.fillpad(activated1, pad_value=pl.PadValue.zero)
-            abs1 = pl.maximum(activated1, pl.neg(activated1))
-            row_amax = pl.maximum(row_amax, pl.reshape(pl.row_max(abs1), [1, QUANT_ROW_TILE]))
+        with pl.spmd(
+            GROUP_TILE * D // (W2_ACT_INNER * D_OUT_TILE_ACT),
+            name_hint="exp_w2_act",
+            deps=[w2_tid],
+            allow_early_resolve=True,
+        ) as w2_act_tid:
+            group_block = pl.tile.get_block_idx()
+            group = group_block // (D // (W2_ACT_INNER * D_OUT_TILE_ACT))
+            block = group_block % (D // (W2_ACT_INNER * D_OUT_TILE_ACT))
+            group_expert = local_e + group
+            out_row = group * ROW_TILE
+            d_base = block * (W2_ACT_INNER * D_OUT_TILE_ACT)
+            y_out_row = group * Y_ROW_TILE
+            row_scale = h_tile_row_scale[:, out_row : out_row + ROW_TILE]
+            row_scale = pl.reshape(row_scale, [ROW_TILE, 1])
+            for inner in pl.pipeline(W2_ACT_INNER, stage=2):
+                d0 = d_base + inner * D_OUT_TILE_ACT
+                y_fp32 = pl.cast(y_i32[out_row : out_row + ROW_TILE, d0 : d0 + D_OUT_TILE_ACT], target_type=pl.FP32, mode="none")
+                y_fp32 = pl.col_expand_mul(
+                    pl.row_expand_mul(y_fp32, row_scale),
+                    routed_w2_scale[
+                        group_expert : group_expert + 1,
+                        d0 : d0 + D_OUT_TILE_ACT,
+                    ],
+                )
+                recv_y_tile[y_out_row : y_out_row + ROW_TILE, d0 : d0 + D_OUT_TILE_ACT] = pl.cast(y_fp32, target_type=pl.BF16, mode="rint")
+        return w2_act_tid
 
-            quant_scale = pl.div(pl.full([1, QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), row_amax)
-            dequant_scale = pl.recip(quant_scale)
-            route_weight = recv_weight_tile[:, scale_row : scale_row + QUANT_ROW_TILE]
-            h_tile_row_scale[:, out_quant_row : out_quant_row + QUANT_ROW_TILE] = pl.mul(dequant_scale, route_weight)
-            quant_scale_col = pl.reshape(quant_scale, [QUANT_ROW_TILE, 1])
-            scaled0 = pl.row_expand_mul(activated0, quant_scale_col)
-            i32_0 = pl.cast(scaled0, target_type=pl.INT32, mode="rint")
-            fp16_0 = pl.cast(i32_0, target_type=pl.FP16, mode="round")
-            h_tile_i8[out_quant_row : out_quant_row + QUANT_ROW_TILE, :ACT_INTER_TILE] = pl.cast(fp16_0, pl.INT8, mode="trunc")
-            scaled1 = pl.row_expand_mul(activated1, quant_scale_col)
-            i32_1 = pl.cast(scaled1, target_type=pl.INT32, mode="rint")
-            fp16_1 = pl.cast(i32_1, target_type=pl.FP16, mode="round")
-            h_tile_i8[out_quant_row : out_quant_row + QUANT_ROW_TILE, ACT_INTER_TILE:] = pl.cast(fp16_1, pl.INT8, mode="trunc")
-        quant_tids[0] = quant_tid
+    return ExpertRoutedTile(expert_routed_tile, geometry)
 
-    y_i32 = pl.create_tensor([GROUP_TILE * ROW_TILE, D], dtype=pl.INT32)
-    with pl.spmd(
-        GROUP_TILE * D // (W2_INNER * D_OUT_TILE),
-        name_hint="exp_w2_mm",
-        deps=[quant_tids[0]],
-        allow_early_resolve=True,
-    ) as w2_tid:
-        group_block = pl.tile.get_block_idx()
-        group = group_block // (D // (W2_INNER * D_OUT_TILE))
-        block = group_block % (D // (W2_INNER * D_OUT_TILE))
-        group_expert = local_e + group
-        out_row = group * ROW_TILE
-        d_base = block * (W2_INNER * D_OUT_TILE)
-        h_l1 = pl.create_l1([ROW_TILE, MOE_INTER], dtype=pl.INT8)
-        h_l1 = pl.gather_row(h_l1, h_tile_i8, [0, 0], [out_row, 0], [ROW_TILE, MOE_INTER])
-        for inner in pl.range(W2_INNER):
-            d0 = d_base + inner * D_OUT_TILE
-            y_acc = pl.create_tensor([1, ROW_TILE, D_OUT_TILE], dtype=pl.INT32)
-            for k0 in pl.pipeline(0, MOE_INTER, INTER_K, stage=2):
-                h_w2_chunk = h_l1[:, k0 : k0 + INTER_K]
-                w2_chunk = routed_w2[group_expert : group_expert + 1, d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K]
-                y_acc = pl.matmul_acc(y_acc, h_w2_chunk, w2_chunk, b_trans=True, init_cond=(k0 == 0))
-            y_i32[out_row : out_row + ROW_TILE, d0 : d0 + D_OUT_TILE] = pl.reshape(y_acc, [ROW_TILE, D_OUT_TILE])
 
-    with pl.spmd(
-        GROUP_TILE * D // (W2_ACT_INNER * D_OUT_TILE_ACT),
-        name_hint="exp_w2_act",
-        deps=[w2_tid],
-        allow_early_resolve=True,
-    ) as w2_act_tid:
-        group_block = pl.tile.get_block_idx()
-        group = group_block // (D // (W2_ACT_INNER * D_OUT_TILE_ACT))
-        block = group_block % (D // (W2_ACT_INNER * D_OUT_TILE_ACT))
-        group_expert = local_e + group
-        out_row = group * ROW_TILE
-        d_base = block * (W2_ACT_INNER * D_OUT_TILE_ACT)
-        y_out_row = group * Y_ROW_TILE
-        row_scale = h_tile_row_scale[:, out_row : out_row + ROW_TILE]
-        row_scale = pl.reshape(row_scale, [ROW_TILE, 1])
-        for inner in pl.pipeline(W2_ACT_INNER, stage=2):
-            d0 = d_base + inner * D_OUT_TILE_ACT
-            y_fp32 = pl.cast(y_i32[out_row : out_row + ROW_TILE, d0 : d0 + D_OUT_TILE_ACT], target_type=pl.FP32, mode="none")
-            y_fp32 = pl.col_expand_mul(
-                pl.row_expand_mul(y_fp32, row_scale),
-                routed_w2_scale[
-                    group_expert : group_expert + 1,
-                    d0 : d0 + D_OUT_TILE_ACT,
-                ],
-            )
-            recv_y_tile[y_out_row : y_out_row + ROW_TILE, d0 : d0 + D_OUT_TILE_ACT] = pl.cast(y_fp32, target_type=pl.BF16, mode="rint")
-    return w2_act_tid
+expert_routed_tile = make_expert_routed_tile(N_LOCAL_EXPERTS).tile
 
 
 @pl.jit(auto_scope=False)
