@@ -296,41 +296,39 @@ def dispatch(
             active_tokens = pl.cast(T, pl.INDEX)
 
         for loc_e in pl.range(push_group, N_LOCAL, PUSH_GROUPS):
-            e_lane_base = loc_e * RECV_MAX + my_rank * MAX_PER_SRC
+            if active_tokens > 0:
+                e_lane_base = loc_e * RECV_MAX + my_rank * MAX_PER_SRC
 
-            indices_tile = pl.tile.load(indices, [0, 0], [T, IDX_PAD], valid_shape=[T, TOPK])
-            weights_tile = pl.tile.load(weights, [0, 0], [T, AUX_PAD], valid_shape=[T, TOPK])
-            # This block's rows fill the contiguous lane (loc_e, my_rank, 0..n), so aux
-            # and route ship as one remote_store. The lane tile always stores
-            # MAX_PER_SRC rows; slots >= n are never read back.
-            aux_lane = pl.tile.full([MAX_PER_SRC, AUX_PAD], dtype=pl.FP32, value=0.0)
-            route_lane = pl.tile.full([MAX_PER_SRC, IDX_PAD], dtype=pl.INT32, value=0)
-            slot_ctr = pl.array.create(1, pl.INT32)
-            slot_ctr[0] = 0
-            for t in pl.range(active_tokens):
-                for k in pl.range(TOPK):
-                    eid = pl.tile.read(indices_tile, [t, k])
-                    d = eid // N_LOCAL
-                    le = eid - d * N_LOCAL
-                    if le == loc_e:
-                        if d == dst:
-                            slot = slot_ctr[0]
-                            slot_ctr[0] = slot + 1
-                            # lane (loc_e, my_rank, slot) on peer=dst
-                            row = e_lane_base + slot
-                            pld.tensor.put(
-                                dst=recv_x,
-                                peer=dst,
-                                src=x_norm_i8,
-                                dst_offsets=[row, 0],
-                                src_offsets=[t, 0],
-                                shape=[1, D],
-                            )
-                            pl.tile.write(aux_lane, [slot, AUX_SCALE], pl.read(x_norm_scale, [t, 0]))
-                            pl.tile.write(aux_lane, [slot, AUX_W], pl.tile.read(weights_tile, [t, k]))
-                            pl.tile.write(route_lane, [slot, 0], pl.cast(t * TOPK + k, pl.INT32))
-            pld.tile.remote_store(aux_lane, target=recv_aux, peer=dst, offsets=[e_lane_base, 0])
-            pld.tile.remote_store(route_lane, target=recv_route, peer=dst, offsets=[e_lane_base, 0])
+                payload_indices = pl.tile.load(indices, [0, 0], [T, IDX_PAD], valid_shape=[T, TOPK])
+                payload_weights = pl.tile.load(weights, [0, 0], [T, AUX_PAD], valid_shape=[T, TOPK])
+                # This block's rows fill the contiguous lane (loc_e, my_rank, 0..n), so aux
+                # and route ship as one remote_store. The lane tile always stores
+                # MAX_PER_SRC rows; slots >= n are never read back.
+                aux_lane = pl.tile.full([MAX_PER_SRC, AUX_PAD], dtype=pl.FP32, value=0.0)
+                route_lane = pl.tile.full([MAX_PER_SRC, IDX_PAD], dtype=pl.INT32, value=0)
+                slot_ctr = pl.array.create(1, pl.INT32)
+                slot_ctr[0] = 0
+                for t in pl.range(active_tokens):
+                    for k in pl.range(TOPK):
+                        eid = pl.tile.read(payload_indices, [t, k])
+                        d = eid // N_LOCAL
+                        le = eid - d * N_LOCAL
+                        if le == loc_e:
+                            if d == dst:
+                                slot = slot_ctr[0]
+                                slot_ctr[0] = slot + 1
+                                # lane (loc_e, my_rank, slot) on peer=dst
+                                row = e_lane_base + slot
+                                pld.tensor.put(
+                                    dst=recv_x, peer=dst, src=x_norm_i8,
+                                    dst_offsets=[row, 0], src_offsets=[t, 0], shape=[1, D],
+                                )
+                                pl.tile.write(aux_lane, [slot, AUX_SCALE], pl.read(x_norm_scale, [t, 0]))
+                                pl.tile.write(aux_lane, [slot, AUX_W], pl.tile.read(payload_weights, [t, k]))
+                                pl.tile.write(route_lane, [slot, 0], pl.cast(t * TOPK + k, pl.INT32))
+                if slot_ctr[0] > 0:
+                    pld.tile.remote_store(aux_lane, target=recv_aux, peer=dst, offsets=[e_lane_base, 0])
+                    pld.tile.remote_store(route_lane, target=recv_route, peer=dst, offsets=[e_lane_base, 0])
 
         # Payload-arrival notify folded into the push: a block signals its own
         # destination after its own puts, so a peer sees PUSH_GROUPS notifies per

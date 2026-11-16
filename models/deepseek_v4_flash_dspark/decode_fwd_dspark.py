@@ -131,6 +131,7 @@ DRAFT_D = dspark.D
 DRAFT_DSPARK_CP_SIZE = dspark.DSPARK_CP_SIZE
 DRAFT_DSPARK_DRAFT_LAYERS = dspark.DSPARK_DRAFT_LAYERS
 DRAFT_DSPARK_MARKOV_RANK = markov.DSPARK_MARKOV_RANK
+DRAFT_DSPARK_MAX_BATCH = dspark.DSPARK_MAX_BATCH
 DRAFT_DSPARK_QUERY_WIDTH = dspark.DSPARK_QUERY_WIDTH
 DRAFT_GROUP_LOGIT_ROWS = lmhead.GROUP_LOGIT_ROWS
 DRAFT_LM_HEAD_TP_SIZE = markov.TP_SIZE
@@ -638,6 +639,7 @@ def l2_decode_fwd_dspark(
             draft_attention_signal, draft_o_window, draft_o_signal, draft_recv_meta, draft_recv_x,
             draft_recv_aux, draft_recv_route, draft_arrived, draft_data_arrived,
             draft_routed_y_buf, draft_combine_arrived, group_base, tp_rank, my_rank,
+            DRAFT_DSPARK_MAX_BATCH, False,
         )
         fence_drafter_head_hidden(draft_head_hidden, draft_head_hidden_ready_tid)
     with pl.scope():
@@ -649,6 +651,7 @@ def l2_decode_fwd_dspark(
             draft_markov_hidden_window, draft_markov_hidden_done,
             draft_markov_logits_window, draft_markov_logits_done,
             my_rank // DRAFT_LM_HEAD_TP_SIZE * DRAFT_LM_HEAD_TP_SIZE, my_rank % DRAFT_LM_HEAD_TP_SIZE,
+            DRAFT_MAX_LOGIT_ROWS, False,
         )
     with pl.scope():
         state_tokens, state_meta = commit_drafts_to_device_state(

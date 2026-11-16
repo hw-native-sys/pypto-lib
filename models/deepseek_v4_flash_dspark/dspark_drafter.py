@@ -160,6 +160,7 @@ WIN = M.sliding_window
 MAIN_PROJ_T_TILE = 128    # cube M-tile; matmul rows must be a multiple of 16
 MAIN_PROJ_N_TILE = 128    # 32 output blocks over D
 MAIN_PROJ_K_TILE = 512    # 24 reduction steps over MAIN_IN
+NORM_PAD_T_TILE = 8
 
 # Per-ring heap for three draft layers plus their MoE communication graph.
 _DSPARK_RING_HEAP = (4 * 1024 * 1024 * 1024,) * 4
@@ -354,6 +355,9 @@ def draft_layer(
     active_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
+    moe_tokens: pl.Scalar[pl.INT32],
+    QUERY_REQUESTS: pl.constexpr = DSPARK_MAX_BATCH,
+    BOOTSTRAP_QUERIES: pl.constexpr = False,
 ):
     layer_hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [draft_layer_index * MIX_HC, 0])
     layer_hc_attn_scale: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [draft_layer_index * 3])
@@ -392,21 +396,49 @@ def draft_layer(
     query_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     combine = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre(query_hc, layer_hc_attn_fn, layer_hc_attn_scale, layer_hc_attn_base, query_mixed, post, combine)
+    hc_rows = QUERY_REQUESTS * DSPARK_QUERY_PAD
+    query_rows = QUERY_REQUESTS * DSPARK_QUERY_WIDTH
+    query_hc_active = query_hc[0:hc_rows, :, :]
+    query_mixed_active = query_mixed[0:hc_rows, :]
+    post_active = post[0:hc_rows, :]
+    combine_active = combine[0:hc_rows, :]
+    hc_pre(query_hc_active, layer_hc_attn_fn, layer_hc_attn_scale, layer_hc_attn_base, query_mixed_active, post_active, combine_active)
 
     query_normed = pl.create_tensor([T_QUERY, D], dtype=pl.BF16)
-    query_mixed_active: pl.Tensor[[T_QUERY, D], pl.BF16] = pl.slice(query_mixed, [T_QUERY, D], [0, 0])
-    rms_norm(query_mixed_active, layer_attn_norm_w, query_normed)
+    query_mixed_rows = query_mixed[0:query_rows, :]
+    query_normed_rows = query_normed[0:query_rows, :]
+    rms_norm(query_mixed_rows, layer_attn_norm_w, query_normed_rows)
+    if QUERY_REQUESTS < DSPARK_MAX_BATCH:
+        norm_pad_blocks = (T_QUERY - query_rows + NORM_PAD_T_TILE - 1) // NORM_PAD_T_TILE
+        for norm_pad_block in pl.spmd(norm_pad_blocks, name_hint="dspark_query_norm_pad"):
+            norm_pad_begin = query_rows + norm_pad_block * NORM_PAD_T_TILE
+            norm_pad_rows = pl.min(NORM_PAD_T_TILE, T_QUERY - norm_pad_begin)
+            norm_zero = pl.full([NORM_PAD_T_TILE, D], dtype=pl.BF16, value=0.0)
+            query_normed[norm_pad_begin:norm_pad_begin + NORM_PAD_T_TILE, :] = pl.set_validshape(norm_zero, norm_pad_rows, D)
     query_group = pl.create_tensor([DSPARK_CP_SIZE * T_QUERY, D], dtype=pl.BF16)
-    with pl.scope():
-        _gathered_query, hidden_gather_signal = prefill_cp_token_allgather_step(
-            query_normed,
-            query_group,
-            hidden_gather_window,
-            hidden_gather_signal,
-            group_base,
-            dsa_cp_rank,
-        )
+    if BOOTSTRAP_QUERIES:
+        compact_query_rows = query_normed[0:active_tokens, :]
+        compact_query_group = pl.create_tensor([DSPARK_CP_SIZE * active_tokens, D], dtype=pl.BF16)
+        with pl.scope():
+            _gathered_compact_query, hidden_gather_signal = prefill_cp_token_allgather_step(
+                compact_query_rows, compact_query_group,
+                hidden_gather_window, hidden_gather_signal, group_base, dsa_cp_rank,
+            )
+        for expand_worker in pl.spmd(48, name_hint="dspark_query_gather_expand"):
+            for expand_row in pl.range(expand_worker, DSPARK_CP_SIZE * T_QUERY, 48):
+                expand_owner = expand_row // T_QUERY
+                expand_token = expand_row % T_QUERY
+                expand_value = pl.full([1, D], dtype=pl.BF16, value=0.0)
+                if expand_token < active_tokens:
+                    compact_row = expand_owner * active_tokens + expand_token
+                    expand_value = compact_query_group[compact_row:compact_row + 1, :]
+                query_group[expand_row:expand_row + 1, :] = expand_value
+    else:
+        with pl.scope():
+            _gathered_query, hidden_gather_signal = prefill_cp_token_allgather_step(
+                query_normed, query_group,
+                hidden_gather_window, hidden_gather_signal, group_base, dsa_cp_rank,
+            )
     o_packed_heads = pl.create_tensor([O_GROUPS * LOCAL_T_PAD * (H // O_GROUPS), HEAD_DIM], dtype=pl.BF16)
     dspark_attention(
         query_normed,
@@ -416,7 +448,7 @@ def draft_layer(
         query_group_freqs_cos, query_group_freqs_sin,
         query_positions, query_group_positions,
         kv_cache, query_group_slot_mapping, swa_indices, swa_lens,
-        layer_attn_sink, o_packed_heads,
+        layer_attn_sink, o_packed_heads, active_tokens, QUERY_REQUESTS,
     )
     attention_grouped = pl.reshape(o_packed_heads, [O_GROUPS * LOCAL_T_PAD, O_GROUP_IN])
     attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
@@ -497,7 +529,7 @@ def draft_layer(
         output_hc,
         recv_meta, recv_x, recv_aux, recv_route,
         arrived, data_arrived, routed_y_buf, combine_arrived,
-        layer_id, active_tokens, my_rank, moe_epoch,
+        layer_id, moe_tokens, my_rank, moe_epoch,
     )
     return output_hc, hidden_gather_signal
 
@@ -578,6 +610,8 @@ def _dspark_drafter(
     group_base: pl.Scalar[pl.INT32],
     dsa_cp_rank: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
+    QUERY_REQUESTS: pl.constexpr = DSPARK_MAX_BATCH,
+    BOOTSTRAP_QUERIES: pl.constexpr = False,
 ):
     """Run one local-query shard of the DSA-CP drafter.
 
@@ -605,6 +639,23 @@ def _dspark_drafter(
     batch = pl.tensor.dim(num_sampled, 0)
     target_tokens = pl.tensor.dim(target_hidden, 0)
     active_tokens = pl.cast(batch * DSPARK_QUERY_WIDTH, pl.INT32)
+    moe_tokens = active_tokens
+    if BOOTSTRAP_QUERIES:
+        bootstrap_slot_rows = pl.tensor.dim(query_group_slot_mapping, 1)
+        bootstrap_owner_rows = bootstrap_slot_rows // DSPARK_CP_SIZE
+        active_tokens = pl.cast(DSPARK_QUERY_WIDTH, pl.INT32)
+        for attention_request in pl.range(batch):
+            uniform_query = attention_request * DSPARK_QUERY_WIDTH
+            if uniform_query < bootstrap_owner_rows:
+                if pl.read(query_group_slot_mapping, [0, uniform_query]) >= 0:
+                    active_tokens = pl.cast((attention_request + 1) * DSPARK_QUERY_WIDTH, pl.INT32)
+        moe_tokens = pl.cast(0, pl.INT32)
+        for request in pl.range(batch):
+            local_query = request * DSPARK_QUERY_WIDTH
+            group_query = dsa_cp_rank * bootstrap_owner_rows + local_query
+            if local_query < bootstrap_owner_rows:
+                if pl.read(query_group_slot_mapping, [0, group_query]) >= 0:
+                    moe_tokens = pl.cast((request + 1) * DSPARK_QUERY_WIDTH, pl.INT32)
 
     kv_cache_0 = kv_caches[0]
     kv_cache_1 = kv_caches[1]
@@ -652,14 +703,30 @@ def _dspark_drafter(
     lookup_embedding(query_token_ids, embedding_weight, lookup_hidden, query_hc)
     group_context_tokens = pl.tensor.dim(context_group_position_ids, 0)
     group_main_x = pl.create_tensor([group_context_tokens, D], dtype=pl.BF16)
-    _gathered_context, hidden_gather_signal = prefill_cp_token_allgather_step(
-        main_x,
-        group_main_x,
-        hidden_gather_window,
-        hidden_gather_signal,
-        group_base,
-        dsa_cp_rank,
-    )
+    if BOOTSTRAP_QUERIES:
+        context_request_rows = target_tokens // batch
+        context_prefix_rows = context_request_rows * (active_tokens // DSPARK_QUERY_WIDTH)
+        context_main_prefix = main_x[0:context_prefix_rows, :]
+        compact_context_group = pl.create_tensor([DSPARK_CP_SIZE * context_prefix_rows, D], dtype=pl.BF16)
+        with pl.scope():
+            _gathered_compact_context, hidden_gather_signal = prefill_cp_token_allgather_step(
+                context_main_prefix, compact_context_group,
+                hidden_gather_window, hidden_gather_signal, group_base, dsa_cp_rank,
+            )
+        for context_expand_worker in pl.spmd(48, name_hint="dspark_context_gather_expand"):
+            for context_expand_row in pl.range(context_expand_worker, group_context_tokens, 48):
+                context_expand_owner = context_expand_row // target_tokens
+                context_expand_token = context_expand_row % target_tokens
+                context_expand_value = pl.full([1, D], dtype=pl.BF16, value=0.0)
+                if context_expand_token < context_prefix_rows:
+                    context_compact_row = context_expand_owner * context_prefix_rows + context_expand_token
+                    context_expand_value = compact_context_group[context_compact_row:context_compact_row + 1, :]
+                group_main_x[context_expand_row:context_expand_row + 1, :] = context_expand_value
+    else:
+        _gathered_context, hidden_gather_signal = prefill_cp_token_allgather_step(
+            main_x, group_main_x,
+            hidden_gather_window, hidden_gather_signal, group_base, dsa_cp_rank,
+        )
     dspark_context_kv(
         group_main_x, wkv_0, gamma_ckv_0,
         context_group_freqs_cos, context_group_freqs_sin,
@@ -709,7 +776,7 @@ def _dspark_drafter(
         hidden_1, hidden_gather_window, hidden_gather_signal,
         attention_window, attention_signal, o_window, o_signal, group_base, dsa_cp_rank,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
-        pl.const(40, pl.INT32), active_tokens, my_rank, pl.const(1, pl.INT32),
+        pl.const(40, pl.INT32), active_tokens, my_rank, pl.const(1, pl.INT32), moe_tokens, QUERY_REQUESTS, BOOTSTRAP_QUERIES,
     )
 
     hidden_2 = intermediate_hidden[1]
@@ -731,7 +798,7 @@ def _dspark_drafter(
         hidden_2, hidden_gather_window, hidden_gather_signal,
         attention_window, attention_signal, o_window, o_signal, group_base, dsa_cp_rank,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
-        pl.const(41, pl.INT32), active_tokens, my_rank, pl.const(2, pl.INT32),
+        pl.const(41, pl.INT32), active_tokens, my_rank, pl.const(2, pl.INT32), moe_tokens, QUERY_REQUESTS, BOOTSTRAP_QUERIES,
     )
 
     hidden_3 = intermediate_hidden[2]
@@ -753,12 +820,14 @@ def _dspark_drafter(
         hidden_3, hidden_gather_window, hidden_gather_signal,
         attention_window, attention_signal, o_window, o_signal, group_base, dsa_cp_rank,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
-        pl.const(42, pl.INT32), active_tokens, my_rank, pl.const(3, pl.INT32),
+        pl.const(42, pl.INT32), active_tokens, my_rank, pl.const(3, pl.INT32), moe_tokens, QUERY_REQUESTS, BOOTSTRAP_QUERIES,
     )
     clear_moe_signals(hidden_3, arrived, data_arrived, combine_arrived)
 
-    padded_head_hidden = pl.create_tensor([T, D], dtype=pl.BF16)
-    hc_head(hidden_3, hc_head_fn, hc_head_scale, hc_head_base, padded_head_hidden)
+    head_rows = QUERY_REQUESTS * DSPARK_QUERY_PAD
+    head_input = hidden_3[0:head_rows, :, :]
+    padded_head_hidden = pl.create_tensor([head_rows, D], dtype=pl.BF16)
+    hc_head(head_input, hc_head_fn, hc_head_scale, hc_head_base, padded_head_hidden)
     head_hidden_flat = pl.reshape(head_hidden, [batch * DSPARK_QUERY_WIDTH, D])
     with pl.spmd(batch * DSPARK_QUERY_WIDTH, name_hint="dspark_head_unpad") as head_hidden_ready_tid:
         token = pl.tile.get_block_idx()
@@ -903,7 +972,7 @@ def l3_dspark_drafter(
             attention_window, attention_signal, o_window, o_signal,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
             rank // DSPARK_CP_SIZE * DSPARK_CP_SIZE, rank % DSPARK_CP_SIZE,
-            rank,
+            rank, DSPARK_MAX_BATCH, False,
             device=rank,
         )
 

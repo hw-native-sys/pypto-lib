@@ -1172,7 +1172,7 @@ def _decode_fwd(
         lm_head_hidden_window, lm_head_hidden_done,
         lm_head_logits_window, lm_head_logits_done,
         my_rank // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE, my_rank % LM_HEAD_TP_SIZE,
-        pl.const(LM_HEAD_COMM_EPOCH, pl.INT32), final_norm_tid,
+        pl.const(LM_HEAD_COMM_EPOCH, pl.INT32), final_norm_tid, MAX_LOGIT_ROWS, False,
     )
     greedy_sample(logits, logit_row_indices, grammar_mask, sampled_ids)
     return x_out

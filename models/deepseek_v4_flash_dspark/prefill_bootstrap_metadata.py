@@ -152,10 +152,17 @@ def prepare_bootstrap_metadata_rank(
                     page = slot * 6 + (position // 32 + 7 * layer) % 6
                     cache_slot = pl.cast(page * 32 + position % 32, pl.INT64)
                 pl.write(query_group_slot_mapping, [layer, row], cache_slot)
-        # Exact integer phase templates avoid vector integer-division assumptions.
+        # Modulo-six phase templates for indices zero through 1028.
+        pattern_columns = pl.arange(0, [1, TABLE_TILE], dtype=pl.INT32)
         for phase in pl.range(6):
-            for column in pl.range(TABLE_TILE):
-                pl.write(pattern, [phase, column], pl.cast((phase + column) % 6, pl.INT32))
+            pattern_phase = pl.cast(phase, pl.INT32)
+            pattern_index = pl.add(pattern_columns, pattern_phase)
+            pattern_index_fp32 = pl.cast(pattern_index, pl.FP32)
+            pattern_quotient_fp32 = pl.mul(pattern_index_fp32, 1.0 / 6.0)
+            pattern_quotient = pl.cast(pattern_quotient_fp32, pl.INT32, mode="trunc")
+            pattern_multiple = pl.mul(pattern_quotient, 6)
+            pattern_remainder = pl.sub(pattern_index, pattern_multiple)
+            pattern[phase:phase + 1, :] = pattern_remainder
     for core in pl.spmd(48, name_hint="dspark_bootstrap_tables"):
         for work in pl.range(core, 3 * BATCH * (TABLE_DEPTH // TABLE_TILE), 48):
             row = work // (TABLE_DEPTH // TABLE_TILE)
