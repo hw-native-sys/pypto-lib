@@ -15,7 +15,7 @@ from .prefill_moe_expert import expert_routed_persistent_planned
 from .prefill_moe_geometry import (
     D, HC_DIM, HC_MULT, IDX_PAD, MIX_HC, MOE_INTER, N_BANK, N_EXPERTS, N_ROUTES,
     PREFILL_MOE_EXPERT_AFFINITY, EXPERT_IDS_PAD, N_SLOTS_B, RECV_MAX, SHARED_EID, SHARED_TILES, SH_SLOT, T, TOPK, VOCAB, WORK_SLOTS_PAD,
-    PREFILL_MOE_BATCHED_GATHER, GATHER_TOKEN_TILE, SHARED_GATHER_T_TILE,
+    PREFILL_MOE_BATCHED_GATHER, GATHER_TOKEN_TILE, SHARED_GATHER_T_TILE, PREFILL_MOE_COMBINE_ROWS,
 )
 
 
@@ -163,18 +163,21 @@ def combine_local(
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
 
-    with pl.spmd(T, name_hint="shared_routed", allow_early_resolve=True):
-        t = pl.tile.get_block_idx()
-        if t < active_tokens:
-            sh_row = pl.cast(SH_SLOT * RECV_MAX + t, pl.INDEX)
-            acc = pl.cast(recv_y_flat[sh_row : sh_row + 1, :], target_type=pl.FP32)
-            for k in pl.range(TOPK):
-                src_row = pl.cast(pl.read(route_slot_row, [t * TOPK + k, 0]), pl.INDEX)
-                acc = pl.add(acc, pl.cast(recv_y_flat[src_row : src_row + 1, :], target_type=pl.FP32))
-            ffn_partial[t : t + 1, :] = acc
-        else:
-            ffn_partial[t : t + 1, :] = pl.full([1, D], dtype=pl.FP32, value=0.0)
-
+    combine_blocks = (T + PREFILL_MOE_COMBINE_ROWS - 1) // PREFILL_MOE_COMBINE_ROWS
+    with pl.spmd(combine_blocks, name_hint="shared_routed", allow_early_resolve=True):
+        combine_block = pl.tile.get_block_idx()
+        token_begin = combine_block * PREFILL_MOE_COMBINE_ROWS
+        token_end = pl.min(token_begin + PREFILL_MOE_COMBINE_ROWS, T)
+        for t in pl.range(token_begin, token_end):
+            if t < active_tokens:
+                sh_row = pl.cast(SH_SLOT * RECV_MAX + t, pl.INDEX)
+                acc = pl.cast(recv_y_flat[sh_row : sh_row + 1, :], target_type=pl.FP32)
+                for k in pl.range(TOPK):
+                    src_row = pl.cast(pl.read(route_slot_row, [t * TOPK + k, 0]), pl.INDEX)
+                    acc = pl.add(acc, pl.cast(recv_y_flat[src_row : src_row + 1, :], target_type=pl.FP32))
+                ffn_partial[t : t + 1, :] = acc
+            else:
+                ffn_partial[t : t + 1, :] = pl.full([1, D], dtype=pl.FP32, value=0.0)
 
 @pl.jit.inline(auto_scope=False)
 def prepare_moe(

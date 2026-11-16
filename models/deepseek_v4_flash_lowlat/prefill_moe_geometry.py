@@ -48,6 +48,9 @@ if PREFILL_MOE_DIRECT_POST not in (0, 1):
     raise ValueError("Prefill direct post must be zero or one")
 if PREFILL_MOE_DIRECT_POST and not PREFILL_MOE_OWNER_REDUCE:
     raise ValueError("Prefill direct post requires owner reduction")
+PREFILL_MOE_COMBINE_ROWS = _parse_int_argv("--prefill-moe-combine-rows", 1)
+if PREFILL_MOE_COMBINE_ROWS not in (1, 4, 8):
+    raise ValueError("Prefill combine rows must be 1, 4 or 8")
 EXPERT_IDS_PAD = (N_BANK + 7) // 8 * 8
 
 # Expert and transport tiling.

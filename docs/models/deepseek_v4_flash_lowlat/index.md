@@ -827,3 +827,20 @@ input, and validate token bounds before submission. Request token upload and
 device lookup remain inside prepared-request timing. This optional input path
 does not change the prefill compute program or establish a performance gain
 without full output/cache and ordinary request checks.
+
+The opt-in `--prefill-moe-combine-rows 4` or `8` batches independent token rows
+inside each prefill ordered-combine task. Each row still starts from its shared
+expert output, then adds route outputs in the original order. The row accumulator
+and BF16-to-FP32 conversion retain their original shapes and operations; no
+expert GEMM, quantization, routing, TP reduction, or decode geometry changes.
+The default is one row per task. CPU and native checks alone do not qualify a
+latency benefit; full bytewise and ordinary request measurements are required.
+
+A prepared TP8 AgentX 16K comparison with two 8K chunks, one warm request and
+six ordinary requests per arm measured request-to-first-token medians of
+4.410906s, 4.328511s and 4.326021s for one, four and eight rows per combine task.
+All twenty-one requests matched the frozen full output/cache hashes. Both
+batched settings improved every pair against one row. The 2.490ms difference
+between four and eight rows has mixed pair directions and does not establish
+stable superiority. These figures include request input and cache initialization;
+they do not qualify serving TPOT or long-context performance.
