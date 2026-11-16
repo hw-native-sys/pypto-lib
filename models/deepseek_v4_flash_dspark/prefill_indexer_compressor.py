@@ -205,20 +205,27 @@ def _prefill_indexer_compressor_tile(
     write_pos_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
     write_dst_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
     write_src_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
+    write_dense_map = pl.create_tensor([1], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_c4_write_map"):
         write_pos_tile = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=0)
         write_dst_tile = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=-1)
         write_src_tile = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=-1)
         map_seen = pl.cast(0, pl.INDEX)
+        map_is_dense = pl.cast(1, pl.INT32)
         for map_local in pl.range(tile_rows):
             map_global = tile_base + map_local
+            map_position = pl.read(position_ids, [map_global])
+            expected_position = pl.cast(tile_first_position, pl.INDEX) + map_local
+            if pl.cast(map_position, pl.INDEX) != expected_position:
+                map_is_dense = pl.cast(0, pl.INT32)
             map_slot_raw = pl.read(idx_slot_mapping, [map_global])
             if map_slot_raw >= 0:
-                pl.write(write_pos_tile, [0, map_seen], pl.read(position_ids, [map_global]))
+                pl.write(write_pos_tile, [0, map_seen], map_position)
                 pl.write(write_dst_tile, [0, map_seen], pl.cast(map_slot_raw, pl.INT32))
                 map_global_i32 = pl.cast(map_global, pl.INT32)
                 pl.write(write_src_tile, [0, map_seen], map_global_i32)
                 map_seen = map_seen + 1
+        pl.write(write_dense_map, [0], map_is_dense)
         write_pos_map[0:1, 0:MAX_CMP_WRITES] = write_pos_tile
         write_dst_map[0:1, 0:MAX_CMP_WRITES] = write_dst_tile
         write_src_map[0:1, 0:MAX_CMP_WRITES] = write_src_tile
@@ -309,7 +316,13 @@ def _prefill_indexer_compressor_tile(
                     ]
 
             # Current-tile state overlay from projection scratch.
-            for pool_local in pl.range(tile_rows):
+            overlay_begin = pl.cast(0, pl.INDEX)
+            overlay_end = tile_rows
+            if pl.read(write_dense_map, [0]) > 0:
+                overlay_first = pl.cast(tile_first_position, pl.INDEX)
+                overlay_begin = pl.max(0, pl.cast(prev_start, pl.INDEX) - overlay_first)
+                overlay_end = pl.min(tile_rows, pl.cast(write_pos, pl.INDEX) + 1 - overlay_first)
+            for pool_local in pl.range(overlay_begin, overlay_end):
                 pool_global = tile_base + pool_local
                 pool_pos = pl.read(position_ids, [pool_global])
                 if pool_pos <= write_pos:

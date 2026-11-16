@@ -22,14 +22,15 @@ from config import (
     PREFILL_SEQ,
 )
 
-from hc_post import golden_hc_post, hc_post
-from hc_pre import golden_hc_pre, hc_pre
+from hc_post import golden_hc_post, _hc_post_full_prefill as hc_post
+from hc_pre import golden_hc_pre, _hc_pre_prefill as hc_pre
 from prefill_cp_token_allgather import (
     PREFILL_GROUP_CAP,
     TP_SIZE,
     cp_stack,
     materialize_spec,
-    prefill_cp_token_allgather_step,
+    prefill_cp_materialize_owner_hc,
+    prefill_cp_token_allgather_into,
 )
 from prefill_metadata import REQUESTS_DYN
 from prefill_o_proj import (
@@ -325,6 +326,100 @@ def prefill_attention_swa_cp_core(
 
 
 @pl.jit.inline
+def prefill_attention_swa_cp_owner(
+    x_hc_local: pl.Tensor[[CP_Q_T_DYN, HC_MULT, D], pl.FP32],
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_w: pl.Tensor[[D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    kv_cache: pl.Tensor[[BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    block_table: pl.Tensor[[REQUESTS_DYN, BLOCK_TABLE_BLOCKS], pl.INT32],
+    ori_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
+    position_ids_local: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
+    position_ids_full: pl.Tensor[[CP_KV_T_DYN], pl.INT32],
+    local_request_ids: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    wo_a_local: pl.Tensor[[O_PROJ_LOCAL_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_local: pl.Tensor[[O_PROJ_LOCAL_GROUPS, D, O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    wo_a_full: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], pl.BF16],
+    wo_b_full: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_D, O_LORA], pl.INT8],
+    x_out_local: pl.Tensor[[CP_Q_T_DYN, HC_MULT, D], pl.FP32],
+    gather_window: pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16],
+    gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    o_proj_wo_a_window: pld.DistributedTensor[[O_PROJ_WO_A_WINDOW_ROWS, O_PROJ_WO_A_WINDOW_COLS], pl.BF16],
+    o_proj_wo_b_window: pld.DistributedTensor[[O_PROJ_WO_B_WINDOW_ROWS, O_PROJ_WO_B_WINDOW_COLS], pl.INT8],
+    o_proj_weight_ready: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    o_proj_weight_consumed: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    o_proj_order_fence: pl.Tensor[[1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    weight_epoch: pl.Scalar[pl.INT32],
+):
+    """Run SWA with owner-local HC state and replicated normalized input."""
+    o_proj_weight_dep = gather_o_proj_full_weights(
+        wo_a_local, wo_b_local,
+        wo_a_full, wo_b_full,
+        o_proj_wo_a_window, o_proj_wo_b_window,
+        o_proj_weight_ready, o_proj_weight_consumed,
+        o_proj_order_fence,
+        group_base, tp_rank, weight_epoch,
+    )
+    q_dim = pl.tensor.dim(position_ids_local, 0)
+    kv_dim = pl.tensor.dim(position_ids_full, 0)
+
+    x_mixed_local = pl.create_tensor([q_dim, D], dtype=pl.BF16)
+    post_local = pl.create_tensor([q_dim, HC_MULT], dtype=pl.FP32)
+    comb_local = pl.create_tensor([q_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
+    hc_pre(x_hc_local, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed_local, post_local, comb_local)
+
+    x_normed_local = pl.create_tensor([q_dim, D], dtype=pl.BF16)
+    rms_norm(x_mixed_local, attn_norm_w, x_normed_local)
+    x_normed_full = pl.create_tensor([kv_dim, D], dtype=pl.BF16)
+    input_ready_dep = prefill_cp_token_allgather_into(
+        x_normed_local, x_normed_full,
+        gather_window, gather_signal,
+        group_base, tp_rank,
+    )
+    local_base = tp_rank * q_dim
+    freqs_cos_local = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
+    freqs_sin_local = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
+    for local_row in pl.spmd(q_dim, name_hint="prefill_swa_cp_query_slice"):
+        full_row = local_base + local_row
+        cos_row = pl.load(freqs_cos, [full_row, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
+        sin_row = pl.load(freqs_sin, [full_row, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
+        pl.store(cos_row, [local_row, 0], freqs_cos_local)
+        pl.store(sin_row, [local_row, 0], freqs_sin_local)
+
+    attn_out_local = pl.create_tensor([q_dim, D], dtype=pl.BF16)
+    kv_cache, attn_out_local = prefill_attention_swa_cp_core(
+        x_normed_local, x_normed_full,
+        wq_a, wq_b, wq_b_scale,
+        wkv, gamma_cq, gamma_ckv,
+        freqs_cos_local, freqs_sin_local,
+        freqs_cos, freqs_sin,
+        kv_cache, block_table,
+        ori_slot_mapping_full,
+        position_ids_local, position_ids_full, local_request_ids,
+        attn_sink,
+        wo_a_full, wo_b_full, wo_b_scale,
+        attn_out_local,
+        input_ready_dep, o_proj_weight_dep,
+    )
+
+    hc_post(attn_out_local, x_hc_local, post_local, comb_local, x_out_local)
+    return kv_cache, x_out_local, gather_signal
+
+
+@pl.jit.inline(auto_scope=False)
 def prefill_attention_swa_cp(
     x_hc_full: pl.Tensor[[CP_KV_T_DYN, HC_MULT, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
@@ -363,63 +458,34 @@ def prefill_attention_swa_cp(
     tp_rank: pl.Scalar[pl.INT32],
     weight_epoch: pl.Scalar[pl.INT32],
 ):
-    """DSA-CP SWA with replicated HC state at both layer boundaries."""
-    o_proj_weight_dep = gather_o_proj_full_weights(
-        wo_a_local, wo_b_local,
+    """Materialize the full HC result at the public SWA CP boundary."""
+    q_dim = pl.tensor.dim(position_ids_local, 0)
+    local_base = tp_rank * q_dim
+    x_hc_local = pl.slice(x_hc_full, [q_dim, HC_MULT, D], [local_base, 0, 0])
+    x_out_local = pl.slice(x_out_full, [q_dim, HC_MULT, D], [local_base, 0, 0])
+    kv_cache, x_out_local, gather_signal = prefill_attention_swa_cp_owner(
+        x_hc_local,
+        hc_attn_fn, hc_attn_scale, hc_attn_base,
+        attn_norm_w, wq_a, wq_b, wq_b_scale,
+        wkv, gamma_cq, gamma_ckv,
+        freqs_cos, freqs_sin,
+        kv_cache, block_table, ori_slot_mapping_full,
+        position_ids_local, position_ids_full, local_request_ids,
+        attn_sink,
+        wo_a_local, wo_b_local, wo_b_scale,
         wo_a_full, wo_b_full,
+        x_out_local,
+        gather_window, gather_signal,
         o_proj_wo_a_window, o_proj_wo_b_window,
         o_proj_weight_ready, o_proj_weight_consumed,
         o_proj_order_fence,
         group_base, tp_rank, weight_epoch,
     )
-    q_dim = pl.tensor.dim(position_ids_local, 0)
-    kv_dim = pl.tensor.dim(x_hc_full, 0)
-
-    x_mixed_full = pl.create_tensor([kv_dim, D], dtype=pl.BF16)
-    post_full = pl.create_tensor([kv_dim, HC_MULT], dtype=pl.FP32)
-    comb_full = pl.create_tensor([kv_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre(x_hc_full, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed_full, post_full, comb_full)
-
-    x_normed_full = pl.create_tensor([kv_dim, D], dtype=pl.BF16)
-    rms_tid = rms_norm(x_mixed_full, attn_norm_w, x_normed_full)
-    late_dep = pl.system.task_dummy(deps=[rms_tid])
-    local_base = tp_rank * q_dim
-    x_normed_local = pl.create_tensor([q_dim, D], dtype=pl.BF16)
-    freqs_cos_local = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
-    freqs_sin_local = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
-    for local_row in pl.spmd(q_dim, name_hint="prefill_swa_cp_query_slice"):
-        full_row = local_base + local_row
-        query_row = pl.load(x_normed_full, [full_row, 0], [1, D], target_memory=pl.MemorySpace.Vec)
-        pl.store(query_row, [local_row, 0], x_normed_local)
-        cos_row = pl.load(freqs_cos, [full_row, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
-        sin_row = pl.load(freqs_sin, [full_row, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
-        pl.store(cos_row, [local_row, 0], freqs_cos_local)
-        pl.store(sin_row, [local_row, 0], freqs_sin_local)
-
-    attn_out_local = pl.create_tensor([q_dim, D], dtype=pl.BF16)
-    kv_cache, attn_out_local = prefill_attention_swa_cp_core(
-        x_normed_local, x_normed_full,
-        wq_a, wq_b, wq_b_scale,
-        wkv, gamma_cq, gamma_ckv,
-        freqs_cos_local, freqs_sin_local,
-        freqs_cos, freqs_sin,
-        kv_cache, block_table,
-        ori_slot_mapping_full,
-        position_ids_local, position_ids_full, local_request_ids,
-        attn_sink,
-        wo_a_full, wo_b_full, wo_b_scale,
-        attn_out_local,
-        late_dep, o_proj_weight_dep,
-    )
-
-    attn_out_full = pl.create_tensor([kv_dim, D], dtype=pl.BF16)
-    attn_out_full, gather_signal = prefill_cp_token_allgather_step(
-        attn_out_local, attn_out_full,
+    prefill_cp_materialize_owner_hc(
+        x_out_local, x_out_full,
         gather_window, gather_signal,
         group_base, tp_rank,
     )
-
-    hc_post(attn_out_full, x_hc_full, post_full, comb_full, x_out_full)
     return kv_cache, x_out_full, gather_signal
 
 

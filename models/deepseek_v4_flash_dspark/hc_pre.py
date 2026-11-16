@@ -56,6 +56,8 @@ assert HC_MULT == 4, f"hc_pre is specialized to HC_MULT == 4, got {HC_MULT}"
 def _hc_pre_statistics(
     x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    LINEAR_T_TILE: pl.constexpr,
+    PEEL_FIRST_K: pl.constexpr,
 ):
     """Compute HC input inverse RMS and split-K linear partials."""
     t_dim = pl.tensor.dim(x, 0)
@@ -97,12 +99,22 @@ def _hc_pre_statistics(
             linear_split = task % LINEAR_OK
             k_base = linear_split * LINEAR_K_PER_SPLIT
             t_rows = pl.min(LINEAR_T_TILE, t_dim - t0)  # last row-block spills past t_dim; valid_shape zero-fills the tail
-            acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
-            for kb in pl.pipeline(0, LINEAR_K_PER_SPLIT // LINEAR_K_TILE, stage=2):
+            if PEEL_FIRST_K:
+                x_linear_first = pl.slice(x_flat, [LINEAR_T_TILE, LINEAR_K_TILE], [t0, k_base], valid_shape=[t_rows, LINEAR_K_TILE])
+                w_first = pl.slice(hc_fn, [MIX_PAD, LINEAR_K_TILE], [0, k_base], valid_shape=[MIX_HC, LINEAR_K_TILE])
+                acc = pl.matmul(x_linear_first, w_first, b_trans=True)
+                first_k = 1
+            else:
+                acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
+                first_k = 0
+            for kb in pl.pipeline(first_k, LINEAR_K_PER_SPLIT // LINEAR_K_TILE, stage=2):
                 k0 = k_base + kb * LINEAR_K_TILE
                 x_linear_chunk = pl.slice(x_flat, [LINEAR_T_TILE, LINEAR_K_TILE], [t0, k0], valid_shape=[t_rows, LINEAR_K_TILE])
                 w_chunk = pl.slice(hc_fn, [MIX_PAD, LINEAR_K_TILE], [0, k0], valid_shape=[MIX_HC, LINEAR_K_TILE])
-                acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True, init_cond=(kb == 0))
+                if PEEL_FIRST_K:
+                    acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True)
+                else:
+                    acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True, init_cond=(kb == 0))
             partial_row0 = linear_split * t_linear + t0
             mixes_partials[partial_row0 : partial_row0 + LINEAR_T_TILE, 0:MIX_PAD] = acc
     return inv_rms, mixes_partials
@@ -152,7 +164,7 @@ def _hc_pre_gate_values(
 
 
 @pl.jit.inline
-def hc_pre_gates(
+def _hc_pre_gates(
     x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_scale: pl.Tensor[[3], pl.FP32],
@@ -161,12 +173,15 @@ def hc_pre_gates(
     post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
     row_recip: pl.Scalar[pl.BOOL],
+    LINEAR_T_TILE: pl.constexpr,
+    COMB_T_TILE: pl.constexpr,
+    PEEL_FIRST_K: pl.constexpr,
 ):
     """Compute pre/post gates and Sinkhorn combinations with padded linear intermediates."""
     t_dim = pl.tensor.dim(x, 0)
     token_tiles = (t_dim + T_TILE - 1) // T_TILE
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
-    inv_rms, mixes_partials = _hc_pre_statistics(x, hc_fn)
+    inv_rms, mixes_partials = _hc_pre_statistics(x, hc_fn, LINEAR_T_TILE, PEEL_FIRST_K)
     scale0 = pl.read(hc_scale, [0])
     scale1 = pl.read(hc_scale, [1])
     scale2 = pl.read(hc_scale, [2])
@@ -209,7 +224,7 @@ def hc_pre_gates(
                         post_tile = pl.load(post_tail_store, [t0, 0], [T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
                         pl.store(post_tile, [t0, 0], post)
 
-    _hc_pre_combinations(mixes_raw, inv_rms, hc_base, comb, t_dim, scale2, row_recip)
+    _hc_pre_combinations(mixes_raw, inv_rms, hc_base, comb, t_dim, scale2, row_recip, COMB_T_TILE)
     return pre_val_store
 
 
@@ -222,6 +237,7 @@ def _hc_pre_combinations(
     t_dim: pl.Scalar[pl.INDEX],
     scale2: pl.Scalar[pl.FP32],
     row_recip: pl.Scalar[pl.BOOL],
+    COMB_T_TILE: pl.constexpr,
 ):
     """Compute the HC comb softmax and Sinkhorn normalization."""
     token_tiles = (t_dim + COMB_T_TILE - 1) // COMB_T_TILE
@@ -374,7 +390,8 @@ def _hc_pre_combinations(
     return comb
 
 
-def _hc_pre(
+@pl.jit.inline(auto_scope=False)
+def _hc_pre_impl(
     x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_scale: pl.Tensor[[3], pl.FP32],
@@ -382,6 +399,9 @@ def _hc_pre(
     x_mixed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
     post: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
     comb: pl.Out[pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32]],
+    LINEAR_T_TILE: pl.constexpr,
+    COMB_T_TILE: pl.constexpr,
+    PEEL_FIRST_K: pl.constexpr,
 ):
     """Compute HC gates and BF16 pre-mixed activations."""
     x.bind_dynamic(0, T_DYN)
@@ -392,7 +412,10 @@ def _hc_pre(
     token_tiles = (t_dim + T_TILE - 1) // T_TILE
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
     pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
-    hc_pre_gates(x, hc_fn, hc_scale, hc_base, pre_val_store, post, comb, False)
+    _hc_pre_gates(
+        x, hc_fn, hc_scale, hc_base, pre_val_store, post, comb,
+        False, LINEAR_T_TILE, COMB_T_TILE, PEEL_FIRST_K,
+    )
     x_flat = pl.reshape(x, [t_dim, HC_DIM])
 
     # mix_x: x_mixed = sum_h pre[:,h]*x[:,h,:], fanned over D/D_SPMD blocks per token tile.
@@ -427,8 +450,50 @@ def _hc_pre(
     return x_mixed
 
 
+@pl.jit.inline(auto_scope=False)
+def hc_pre_gates(
+    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_scale: pl.Tensor[[3], pl.FP32],
+    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+    pre_val_store: pl.Tensor[[T_DYN, HC_PAD], pl.FP32],
+    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+    row_recip: pl.Scalar[pl.BOOL],
+):
+    """Compute gates with the shared decode geometry."""
+    return _hc_pre_gates(x, hc_fn, hc_scale, hc_base, pre_val_store, post, comb, row_recip, 16, 8, False)
+
+
+def _hc_pre(
+    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_scale: pl.Tensor[[3], pl.FP32],
+    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+    x_mixed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    post: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
+    comb: pl.Out[pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32]],
+):
+    """Compute mixed activations with the shared decode geometry."""
+    return _hc_pre_impl(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb, 16, 8, False)
+
+
 hc_pre = pl.jit.inline(_hc_pre)
 hc_pre_test = pl.jit(_hc_pre)
+
+
+@pl.jit.inline
+def _hc_pre_prefill(
+    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_scale: pl.Tensor[[3], pl.FP32],
+    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+    x_mixed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    post: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
+    comb: pl.Out[pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32]],
+):
+    """Compute mixed activations with the prefill geometry."""
+    return _hc_pre_impl(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb, 64, 32, True)
 
 
 @pl.jit.inline
@@ -447,7 +512,7 @@ def hc_pre_norm(
     t_dim = pl.tensor.dim(x, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
     pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
-    inv_rms, mixes_partials = _hc_pre_statistics(x, hc_fn)
+    inv_rms, mixes_partials = _hc_pre_statistics(x, hc_fn, LINEAR_T_TILE, False)
     mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
     scale0 = pl.read(hc_scale, [0])
     scale1 = pl.read(hc_scale, [1])
@@ -511,7 +576,7 @@ def hc_pre_norm(
             normed_bf16 = rms_norm_apply(mixed_input, norm_w_row, y_inv)
             normed_valid = pl.set_validshape(normed_bf16, valid_rows, D_TILE)
             x_normed[t0:t0 + T_TILE, d0:d0 + D_TILE] = normed_valid
-    _hc_pre_combinations(mixes_raw, inv_rms, hc_base, comb, t_dim, scale2, row_recip)
+    _hc_pre_combinations(mixes_raw, inv_rms, hc_base, comb, t_dim, scale2, row_recip, COMB_T_TILE)
     return mixed_tid
 
 

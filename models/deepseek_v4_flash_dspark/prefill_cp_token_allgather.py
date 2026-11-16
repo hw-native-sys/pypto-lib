@@ -40,9 +40,11 @@ from config import FLASH as M, MOE_TOKENS, DECODE_SEQ
 # Dynamic shape variables.
 CP_Q_T_DYN = pl.dynamic("PREFILL_CP_Q_T_DYN")
 CP_KV_T_DYN = pl.dynamic("PREFILL_CP_KV_T_DYN")
+CP_COEFF_DYN = pl.dynamic("PREFILL_CP_COEFF_DYN")
 
 # model config
 D = M.hidden_size
+HC_MULT = M.hc_mult
 
 # communication bounds
 PREFILL_GROUP_CAP = 8192
@@ -52,20 +54,22 @@ PREFILL_LOCAL_CAP = PREFILL_GROUP_CAP // TP_SIZE
 COMM_ROW_TILE = 8
 READBACK_ROW_TILE = gcd(MOE_TOKENS // DECODE_SEQ * (DECODE_SEQ - 1), 16)
 READBACK_WORKERS = 16
+COEFF_ROW_TILE = 4
 
 # fixture
 FIXTURE_ROUNDS = 2
 FIXTURE_LOCAL_T = min(257, PREFILL_LOCAL_CAP)
 
 
-def _prefill_cp_token_allgather_step(
+@pl.jit.inline
+def prefill_cp_token_allgather_into(
     hidden_local: pl.Tensor[[CP_Q_T_DYN, D], pl.BF16],
-    group_out: pl.Out[pl.Tensor[[CP_KV_T_DYN, D], pl.BF16]],
-    gather_window: pl.InOut[pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16]],
-    gather_signal: pl.InOut[pld.DistributedTensor[[TP_SIZE, 1], pl.INT32]],
+    group_out: pl.Tensor[[CP_KV_T_DYN, D], pl.BF16],
+    gather_window: pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16],
+    gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
-):
+) -> pl.Scalar[pl.TASK_ID]:
     """Gather rank-major rows and retire the complete two-phase signal epoch."""
     hidden_local.bind_dynamic(0, CP_Q_T_DYN)
     group_out.bind_dynamic(0, CP_KV_T_DYN)
@@ -137,13 +141,15 @@ def _prefill_cp_token_allgather_step(
                     expected=pl.cast(2, pl.INT32), cmp=pld.WaitCmp.Ge,
                 )
 
-    # Retire peer credits and anchor output consumption to signal retirement.
+    # Retire peer credits and anchor raw output words to signal retirement.
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="prefill_cp_token_allgather_retire",
         deps=[_readback_notify_tid, _readback_wait_tid],
-    ):
-        completion_anchor = pl.read(group_out, [0, 0])
+    ) as retire_tid:
+        anchor_bits = pl.load(group_out, [0, 0], [1, 16])
+        anchor_words = pl.reinterpret_view(anchor_bits, pl.INT32)
+        completion_anchor = pl.tile.read(anchor_words, [0, 0])
         reset_value = pl.cast(-2, pl.INT32)
         for source_tp in pl.range(TP_SIZE):
             if source_tp != tp_rank:
@@ -151,13 +157,172 @@ def _prefill_cp_token_allgather_step(
                     target=gather_signal, peer=group_base + tp_rank,
                     offsets=[source_tp, 0], value=reset_value, op=pld.NotifyOp.AtomicAdd,
                 )
-        pl.write(group_out, [0, 0], completion_anchor)
+        pl.tile.write(anchor_words, [0, 0], completion_anchor)
+        anchor_output = pl.reinterpret_view(anchor_words, pl.BF16)
+        pl.store(anchor_output, [0, 0], group_out)
+
+    return retire_tid
+
+
+def _prefill_cp_token_allgather_step(
+    hidden_local: pl.Tensor[[CP_Q_T_DYN, D], pl.BF16],
+    group_out: pl.Out[pl.Tensor[[CP_KV_T_DYN, D], pl.BF16]],
+    gather_window: pl.InOut[pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16]],
+    gather_signal: pl.InOut[pld.DistributedTensor[[TP_SIZE, 1], pl.INT32]],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+):
+    """Gather BF16 rows through the shared retained-window protocol."""
+    retire_tid = prefill_cp_token_allgather_into(
+        hidden_local, group_out, gather_window, gather_signal, group_base, tp_rank,
+    )
 
     return group_out, gather_signal
 
 
 prefill_cp_token_allgather_step = pl.jit.inline(_prefill_cp_token_allgather_step)
 prefill_cp_token_allgather_fixture = pl.jit(_prefill_cp_token_allgather_step)
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_cp_materialize_owner_hc(
+    local_hc: pl.Tensor[[CP_Q_T_DYN, HC_MULT, D], pl.FP32],
+    full_hc: pl.Tensor[[CP_KV_T_DYN, HC_MULT, D], pl.FP32],
+    gather_window: pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16],
+    gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+) -> pl.Scalar[pl.TASK_ID]:
+    """Materialize rank-major FP32 HC rows through serialized raw-word epochs."""
+    local_rows = pl.tensor.dim(local_hc, 0)
+    group_rows = pl.tensor.dim(full_hc, 0)
+    raw_local_rows = local_rows * HC_MULT * 2
+    local_flat_rows = local_rows * HC_MULT
+    group_flat_rows = group_rows * HC_MULT
+    local_flat = pl.reshape(local_hc, [local_flat_rows, D])
+    full_flat = pl.reshape(full_hc, [group_flat_rows, D])
+    completion_tids = pl.array.create(1, pl.TASK_ID)
+    completion_tids[0] = pl.system.task_dummy(deps=[])
+    for raw_base in pl.range(0, raw_local_rows, PREFILL_LOCAL_CAP):
+        with pl.scope():
+            chunk_rows = pl.min(PREFILL_LOCAL_CAP, raw_local_rows - raw_base)
+            local_packet = pl.create_tensor([chunk_rows, D], dtype=pl.BF16)
+            with pl.spmd(
+                READBACK_WORKERS, name_hint="prefill_cp_hc_pack", deps=[completion_tids[0]],
+            ) as pack_tid:
+                pack_worker = pl.tile.get_block_idx()
+                for pack_row in pl.range(pack_worker, chunk_rows, READBACK_WORKERS):
+                    source_row = raw_base + pack_row
+                    source_hc_row = source_row // 2
+                    source_col = (source_row % 2) * (D // 2)
+                    source_tile = pl.load(local_flat, [source_hc_row, source_col], [1, D // 2])
+                    raw_row = pl.reinterpret_view(source_tile, pl.BF16)
+                    pl.store(raw_row, [pack_row, 0], local_packet)
+
+            packet_group_rows = TP_SIZE * chunk_rows
+            group_packet = pl.create_tensor([packet_group_rows, D], dtype=pl.BF16)
+            gather_tid = prefill_cp_token_allgather_into(
+                local_packet, group_packet, gather_window, gather_signal, group_base, tp_rank,
+            )
+            with pl.spmd(
+                READBACK_WORKERS, name_hint="prefill_cp_hc_unpack", deps=[gather_tid],
+            ) as unpack_tid:
+                unpack_worker = pl.tile.get_block_idx()
+                for packet_row in pl.range(unpack_worker, TP_SIZE * chunk_rows, READBACK_WORKERS):
+                    source_rank = packet_row // chunk_rows
+                    source_row = packet_row % chunk_rows
+                    output_row = source_rank * raw_local_rows + raw_base + source_row
+                    raw_row = pl.load(group_packet, [packet_row, 0], [1, D])
+                    output_tile = pl.reinterpret_view(raw_row, pl.FP32)
+                    output_hc_row = output_row // 2
+                    output_col = (output_row % 2) * (D // 2)
+                    pl.store(output_tile, [output_hc_row, output_col], full_flat)
+            completion_tids[0] = unpack_tid
+
+    with pl.at(
+        level=pl.Level.CORE_GROUP, name_hint="prefill_cp_hc_publish", deps=[completion_tids[0]],
+    ) as publish_tid:
+        anchor_tile = pl.load(full_flat, [0, 0], [1, 8])
+        anchor_words = pl.reinterpret_view(anchor_tile, pl.INT32)
+        anchor = pl.tile.read(anchor_words, [0, 0])
+        pl.tile.write(anchor_words, [0, 0], anchor)
+        anchor_output = pl.reinterpret_view(anchor_words, pl.FP32)
+        pl.store(anchor_output, [0, 0], full_flat)
+    return publish_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_cp_materialize_owner_coeff(
+    local_coeff: pl.Tensor[[CP_Q_T_DYN, CP_COEFF_DYN], pl.FP32],
+    full_coeff: pl.Tensor[[CP_KV_T_DYN, CP_COEFF_DYN], pl.FP32],
+    gather_window: pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16],
+    gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+) -> pl.Scalar[pl.TASK_ID]:
+    """Materialize four- or sixteen-column FP32 coefficients as raw words."""
+    local_rows = pl.tensor.dim(local_coeff, 0)
+    group_rows = pl.tensor.dim(full_coeff, 0)
+    coeff_cols = pl.tensor.dim(local_coeff, 1)
+    with pl.scope():
+        local_packet = pl.create_tensor([local_rows, D], dtype=pl.BF16)
+        with pl.spmd(READBACK_WORKERS, name_hint="prefill_cp_coeff_pack") as pack_tid:
+            coeff_pack_worker = pl.tile.get_block_idx()
+            for token in pl.range(coeff_pack_worker, local_rows, READBACK_WORKERS):
+                pack_source_tile = pl.load(local_coeff, [token, 0], [1, 16], valid_shape=[1, coeff_cols])
+                pack_source_words = pl.reinterpret_view(pack_source_tile, pl.INT32)
+                word_row = pl.tile.full([1, D // 2], dtype=pl.INT32, value=0)
+                for column in pl.range(coeff_cols):
+                    pack_word = pl.tile.read(pack_source_words, [0, column])
+                    pl.tile.write(word_row, [0, column], pack_word)
+                raw_row = pl.reinterpret_view(word_row, pl.BF16)
+                pl.store(raw_row, [token, 0], local_packet)
+
+        group_packet = pl.create_tensor([group_rows, D], dtype=pl.BF16)
+        gather_tid = prefill_cp_token_allgather_into(
+            local_packet, group_packet, gather_window, gather_signal, group_base, tp_rank,
+        )
+        unpack_tids = pl.array.create(1, pl.TASK_ID)
+        if coeff_cols == 4:
+            token_blocks = (group_rows + COEFF_ROW_TILE - 1) // COEFF_ROW_TILE
+            with pl.spmd(token_blocks, name_hint="prefill_cp_coeff4_unpack", deps=[gather_tid]) as unpack4_tid:
+                token0 = pl.tile.get_block_idx() * COEFF_ROW_TILE
+                valid_rows = pl.min(COEFF_ROW_TILE, group_rows - token0)
+                output4_words = pl.tile.full([COEFF_ROW_TILE, 8], dtype=pl.INT32, value=0)
+                for row in pl.range(valid_rows):
+                    source4_bits = pl.load(group_packet, [token0 + row, 0], [1, 32])
+                    source4_words = pl.reinterpret_view(source4_bits, pl.INT32)
+                    for column in pl.unroll(4):
+                        word4 = pl.tile.read(source4_words, [0, column])
+                        pl.tile.write(output4_words, [row, column], word4)
+                output4_tile = pl.reinterpret_view(output4_words, pl.FP32)
+                output4_valid = pl.set_validshape(output4_tile, valid_rows, 4)
+                pl.store(output4_valid, [token0, 0], full_coeff)
+            unpack_tids[0] = unpack4_tid
+        else:
+            with pl.spmd(group_rows, name_hint="prefill_cp_coeff16_unpack", deps=[gather_tid]) as unpack16_tid:
+                output_token = pl.tile.get_block_idx()
+                source16_bits = pl.load(group_packet, [output_token, 0], [1, 32])
+                source16_words = pl.reinterpret_view(source16_bits, pl.INT32)
+                output16_words = pl.tile.full([1, 16], dtype=pl.INT32, value=0)
+                for column in pl.unroll(16):
+                    word16 = pl.tile.read(source16_words, [0, column])
+                    pl.tile.write(output16_words, [0, column], word16)
+                output16_tile = pl.reinterpret_view(output16_words, pl.FP32)
+                pl.store(output16_tile, [output_token, 0], full_coeff)
+            unpack_tids[0] = unpack16_tid
+
+        with pl.at(
+            level=pl.Level.CORE_GROUP, name_hint="prefill_cp_coeff_publish", deps=[unpack_tids[0]],
+        ) as publish_tid:
+            anchor_tile = pl.load(full_coeff, [0, 0], [1, 16], valid_shape=[1, coeff_cols])
+            anchor_words = pl.reinterpret_view(anchor_tile, pl.INT32)
+            anchor = pl.tile.read(anchor_words, [0, 0])
+            pl.tile.write(anchor_words, [0, 0], anchor)
+            anchor_output = pl.reinterpret_view(anchor_words, pl.FP32)
+            anchor_valid = pl.set_validshape(anchor_output, 1, coeff_cols)
+            pl.store(anchor_valid, [0, 0], full_coeff)
+    return publish_tid
 
 
 @pl.jit.host

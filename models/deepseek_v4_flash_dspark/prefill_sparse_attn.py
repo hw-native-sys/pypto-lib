@@ -70,7 +70,7 @@ CMP_BLOCK_NUM = CMP_MAX_BLOCKS
 
 # tiling
 HEAD_TILE = 16  # storage / merge head-tile
-QK_M_TILE = 32  # head rows cube-batched per QK/PV matmul
+QK_M_TILE = 64  # head rows cube-batched per QK/PV matmul
 NUM_QK_CORES = 24
 QK_PRE_LAUNCH = 2
 QK_TRANSFER_SLOTS = QK_PRE_LAUNCH + 1
@@ -229,6 +229,7 @@ def _hca_streaming_wave(
     cmp_partial_o: pl.Tensor[[HCA_QUERY_STATS_ROWS, HEAD_DIM], pl.FP32],
     rope_cos_il: pl.Tensor[[T_PAD, ROPE_DIM], pl.FP32],
     rope_sin_signed: pl.Tensor[[T_PAD, ROPE_DIM], pl.FP32],
+    rope_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
     wave_completion: pl.Array[1, pl.TASK_ID],
     request_offset: pl.Scalar[pl.INDEX],
     tile_base: pl.Scalar[pl.INDEX],
@@ -255,13 +256,29 @@ def _hca_streaming_wave(
             raw_stage = pl.full([WIN, HEAD_DIM], dtype=pl.BF16, value=0.0)
             valid_stage = pl.full([1, WIN], dtype=pl.FP32, value=0.0)
             if gather_t < request_end:
-                for gather_k in pl.range(WIN):
-                    gather_row_i32 = pl.read(swa_indices, [gather_t, gather_k])
-                    if gather_row_i32 >= 0:
-                        gather_row = pl.cast(gather_row_i32, pl.INDEX)
-                        gather_kv = ori_kv_flat[gather_row : gather_row + 1, 0:HEAD_DIM]
-                        raw_stage[gather_k : gather_k + 1, 0:HEAD_DIM] = gather_kv
-                        pl.write(valid_stage, [0, gather_k], 1.0)
+                gather_indices = pl.load(swa_indices, [gather_t, 0], [1, WIN], target_memory=pl.MemorySpace.Vec)
+                for gather_g0 in pl.range(0, WIN, SPARSE_OPT_GATHER_ROW_TILE):
+                    gather_first = pl.tile.read(gather_indices, [0, gather_g0])
+                    gather_contiguous = gather_first >= 0
+                    for gather_ci, (contiguous_iter,) in pl.range(1, SPARSE_OPT_GATHER_ROW_TILE, init_values=(gather_contiguous,)):
+                        gather_next = pl.tile.read(gather_indices, [0, gather_g0 + gather_ci])
+                        gather_matches = contiguous_iter and gather_next == gather_first + gather_ci
+                        gather_contiguous = pl.yield_(gather_matches)
+                    if gather_contiguous:
+                        gather_row = pl.cast(gather_first, pl.INDEX)
+                        gather_bulk = pl.slice(ori_kv_flat, [SPARSE_OPT_GATHER_ROW_TILE, HEAD_DIM], [gather_row, 0])
+                        raw_stage[gather_g0:gather_g0 + SPARSE_OPT_GATHER_ROW_TILE, :] = gather_bulk
+                        gather_valid = pl.full([1, SPARSE_OPT_GATHER_ROW_TILE], dtype=pl.FP32, value=1.0)
+                        valid_stage[:, gather_g0:gather_g0 + SPARSE_OPT_GATHER_ROW_TILE] = gather_valid
+                    else:
+                        for gather_ci in pl.range(SPARSE_OPT_GATHER_ROW_TILE):
+                            gather_k = gather_g0 + gather_ci
+                            gather_row_i32 = pl.tile.read(gather_indices, [0, gather_k])
+                            if gather_row_i32 >= 0:
+                                gather_row = pl.cast(gather_row_i32, pl.INDEX)
+                                gather_kv = ori_kv_flat[gather_row:gather_row + 1, 0:HEAD_DIM]
+                                raw_stage[gather_k:gather_k + 1, 0:HEAD_DIM] = gather_kv
+                                pl.write(valid_stage, [0, gather_k], 1.0)
             raw_kv[gather_dst : gather_dst + WIN, 0:HEAD_DIM] = raw_stage
             raw_valid[gather_local_t : gather_local_t + 1, 0:WIN] = valid_stage
 
@@ -496,11 +513,8 @@ def _hca_streaming_wave(
 
             merge_dense_t = dense_query_base + merge_local_t
             merge_rope = merge_full[:, NOPE_DIM:HEAD_DIM]
-            merge_even = pl.gather(merge_rope, mask_pattern=pl.tile.MaskPattern.P0101)
-            merge_odd = pl.gather(merge_rope, mask_pattern=pl.tile.MaskPattern.P1010)
-            merge_swapped = pl.full([HEAD_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
-            merge_swapped = pl.tensor.scatter(merge_odd, mask_pattern=pl.tile.MaskPattern.P0101, dst=merge_swapped)
-            merge_swapped = pl.tensor.scatter(merge_even, mask_pattern=pl.tile.MaskPattern.P1010, dst=merge_swapped)
+            merge_swap_idx = rope_swap_idx[:, :]
+            merge_swapped = pl.gather(merge_rope, dim=-1, index=merge_swap_idx)
             merge_cos = rope_cos_il[merge_dense_t : merge_dense_t + 1, 0:ROPE_DIM]
             merge_sin = rope_sin_signed[merge_dense_t : merge_dense_t + 1, 0:ROPE_DIM]
             merge_main = pl.col_expand_mul(merge_rope, merge_cos)
@@ -623,7 +637,7 @@ def _hca_streaming_attn_tile(
                 raw_kv, raw_valid,
                 stream_state_m, stream_state_l, stream_heads,
                 cmp_partial_m, cmp_partial_l, cmp_partial_o,
-                rope_cos_il, rope_sin_signed,
+                rope_cos_il, rope_sin_signed, rope_swap_idx,
                 wave_completion, request_offset, tile_base, dense_query_base,
             )
 
@@ -679,6 +693,8 @@ def _sparse_attn_wave(
     gather_cmp_blocks = gather_cmp_token_blocks * (PREFILL_ATTN_BLOCKS - 1)
 
     # Stage original-window rows in reverse token-tile order.
+    sparse_ori_rows = PREFILL_QUERY_TILE * PREFILL_ATTN_TILE
+    sparse_ori_kv = sparse_kv[0:sparse_ori_rows, 0:HEAD_DIM]
     with pl.spmd(
         gather_blocks,
         name_hint="gather_ori_kv",
@@ -710,7 +726,7 @@ def _sparse_attn_wave(
             if gather_t < t_dim:
                 if gather_t < active_rows:
                     request_id = pl.read(local_request_ids, [gather_t])
-                    block_base = gather_local_t * PREFILL_SPARSE_PAD
+                    block_base = gather_local_t * PREFILL_ATTN_TILE
                     if pl.read(valid_block_mask, [gather_t, 0]) > 0:
                         stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
                         if request_id >= 0:
@@ -732,8 +748,9 @@ def _sparse_attn_wave(
                                         if gather_raw >= 0:
                                             src = pl.cast(gather_raw, pl.INDEX)
                                             stage[gather_ki : gather_ki + 1, :] = ori_kv_flat[src : src + 1, :]
-                        sparse_kv[block_base : block_base + PREFILL_ATTN_TILE, :] = stage
+                        sparse_ori_kv[block_base : block_base + PREFILL_ATTN_TILE, :] = stage
 
+    sparse_cmp_kv = sparse_kv[sparse_ori_rows:PREFILL_QUERY_TILE * PREFILL_SPARSE_PAD, 0:HEAD_DIM]
     with pl.spmd(
         gather_cmp_blocks,
         name_hint="gather_cmp_kv",
@@ -752,7 +769,7 @@ def _sparse_attn_wave(
                 if gather_t < active_rows:
                     request_id = pl.read(local_request_ids, [gather_t])
                     gather_block_valid = pl.read(valid_block_mask, [gather_t, gather_sb])
-                    block_base = gather_local_t * PREFILL_SPARSE_PAD + gather_k0
+                    block_base = ((gather_sb - 1) * PREFILL_QUERY_TILE + gather_local_t) * PREFILL_ATTN_TILE
                     if gather_block_valid > 0:
                         stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
                         if request_id >= 0:
@@ -788,7 +805,7 @@ def _sparse_attn_wave(
                                                     blk = pl.cast(blk_raw, pl.INDEX)
                                                     src = blk * BLOCK_SIZE + (gather_raw - blk_slot * BLOCK_SIZE)
                                                     stage[gather_ki : gather_ki + 1, :] = cmp_kv_flat[src : src + 1, :]
-                        sparse_kv[block_base : block_base + PREFILL_ATTN_TILE, :] = stage
+                        sparse_cmp_kv[block_base : block_base + PREFILL_ATTN_TILE, :] = stage
 
     # Pipeline K blocks and keep the online-softmax state local to each query.
     transfer_slots = NUM_QK_CORES * QK_TRANSFER_SLOTS
@@ -813,7 +830,7 @@ def _sparse_attn_wave(
                     qk_sb = qk_tick
                     if pl.read(valid_block_mask, [qk_t, qk_sb]) > 0:
                         qk_slot = qk_core * QK_TRANSFER_SLOTS + qk_sb % QK_TRANSFER_SLOTS
-                        qk_kv_row = qk_local_t * PREFILL_SPARSE_PAD + qk_sb * PREFILL_ATTN_TILE
+                        qk_kv_row = (qk_sb * PREFILL_QUERY_TILE + qk_local_t) * PREFILL_ATTN_TILE
                         qk_transfer_row = qk_slot * H
                         qk_kv = pl.load(
                             sparse_kv, [qk_kv_row, 0], [PREFILL_ATTN_TILE, HEAD_DIM],
@@ -829,7 +846,7 @@ def _sparse_attn_wave(
                     pv_sb = qk_tick - QK_PRE_LAUNCH
                     if pl.read(valid_block_mask, [qk_t, pv_sb]) > 0:
                         pv_slot = qk_core * QK_TRANSFER_SLOTS + pv_sb % QK_TRANSFER_SLOTS
-                        pv_kv_row = qk_local_t * PREFILL_SPARSE_PAD + pv_sb * PREFILL_ATTN_TILE
+                        pv_kv_row = (pv_sb * PREFILL_QUERY_TILE + qk_local_t) * PREFILL_ATTN_TILE
                         pv_transfer_row = pv_slot * H
                         pl.system.sync_wait(QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
                         pv_probability = pl.load(
@@ -1104,10 +1121,10 @@ def _sparse_attn_o_proj(
     o_packed = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
 
     # Chain merge, quantization, and projection through explicit task dependencies.
-    o_r = pl.create_tensor([T_PAD, O_GROUPS * O_LORA], dtype=pl.FP32)
+    o_r = pl.create_tensor([O_GROUPS * PA_NFRAGS * T_PAD, PROJ_A_MM_N_TILE], dtype=pl.FP32)
     o_r_i8 = pl.create_tensor([T_PAD, O_GROUPS * O_LORA], dtype=pl.INT8)
     act_scale_dq = pl.create_tensor([O_GROUPS, T_PAD], dtype=pl.FP32)
-    partials = pl.create_tensor([T_PAD, O_GROUPS * D], dtype=pl.INT32)
+    partials = pl.create_tensor([PB_DSLABS * O_GROUPS * T_PAD, PROJ_B_D_TILE], dtype=pl.INT32)
     proj_a_tids = pl.array.create(O_GROUPS * PA_NFRAGS, pl.TASK_ID)
     quant_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
     proj_b_tids = pl.array.create(PB_DSLABS * O_GROUPS, pl.TASK_ID)
@@ -1119,14 +1136,15 @@ def _sparse_attn_o_proj(
     proj_b_rows = o_compute_rows // PROJ_B_ROW_TILE
 
     with pl.scope():
-        # proj_a[g, nf]: BF16 grouped GEMM -> o_r[:, group g], init_cond K loop.
+        # proj_a[g, nf]: BF16 grouped GEMM -> contiguous FP32 fragment, init_cond K loop.
         # Row-blocked over PROJ_A_ROW_TILE with a padded load, so the T_PAD-strided
         # o_packed slab never feeds uninitialized rows into the matmul.
         for g in pl.parallel(O_GROUPS):
             row_base_o = g * T_PAD
-            out_col_g = g * O_LORA
             for nf in pl.range(PA_NFRAGS):
                 n0 = nf * PROJ_A_MM_N_TILE
+                pa_slab_row = (g * PA_NFRAGS + nf) * T_PAD
+                o_r_slab = o_r[pa_slab_row:pa_slab_row + T_PAD, 0:PROJ_A_MM_N_TILE]
                 with pl.spmd(proj_a_rows, name_hint="proj_a_mm", deps=[heads_dep, weight_dep]) as pa_tid:
                     pa_rb = pl.tile.get_block_idx()
                     pa_r0 = pa_rb * PROJ_A_ROW_TILE
@@ -1140,13 +1158,16 @@ def _sparse_attn_o_proj(
                         ]
                         wa_k_chunk = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, k0 : k0 + A_K_TILE]
                         acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True, init_cond=(kb == 0))
-                    # acc_a is 3D (wo_a keeps its group axis), which subscript-write cannot express.
-                    o_r = pl.assemble(o_r, acc_a, [pa_r0, out_col_g + n0])
+                    acc_a_2d = pl.reshape(acc_a, [PROJ_A_ROW_TILE, PROJ_A_MM_N_TILE])
+                    o_r_slab[pa_r0:pa_r0 + PROJ_A_ROW_TILE, 0:PROJ_A_MM_N_TILE] = acc_a_2d
                 proj_a_tids[g * PA_NFRAGS + nf] = pa_tid
 
         # quant[g]: per-group amax and symmetric INT8 quant over physical rows.
         for g in pl.parallel(O_GROUPS):
             col_g = g * O_LORA
+            quant_group_row = g * PA_NFRAGS * T_PAD
+            quant_group_end = quant_group_row + PA_NFRAGS * T_PAD
+            o_r_group = o_r[quant_group_row:quant_group_end, 0:PROJ_A_MM_N_TILE]
             with pl.spmd(
                 quant_rows,
                 name_hint="quant",
@@ -1155,10 +1176,13 @@ def _sparse_attn_o_proj(
                 qt = pl.tile.get_block_idx() * QUANT_TOKEN_TILE
                 g_amax = pl.full([1, QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
                 for k1 in pl.range(0, O_LORA, QUANT_TILE):
-                    oc = o_r[
-                        qt : qt + QUANT_TOKEN_TILE,
-                        col_g + k1 : col_g + k1 + QUANT_TILE,
-                    ]
+                    oc = pl.create_tensor([QUANT_TOKEN_TILE, QUANT_TILE], dtype=pl.FP32)
+                    for amax_nf in pl.unroll(QUANT_TILE // PROJ_A_MM_N_TILE):
+                        amax_slab = k1 // PROJ_A_MM_N_TILE + amax_nf
+                        amax_row = amax_slab * T_PAD + qt
+                        amax_col = amax_nf * PROJ_A_MM_N_TILE
+                        amax_fragment = o_r_group[amax_row:amax_row + QUANT_TOKEN_TILE, 0:PROJ_A_MM_N_TILE]
+                        oc[0:QUANT_TOKEN_TILE, amax_col:amax_col + PROJ_A_MM_N_TILE] = amax_fragment
                     oc_abs = pl.maximum(oc, pl.neg(oc))
                     oc_amax = pl.reshape(pl.row_max(oc_abs), [1, QUANT_TOKEN_TILE])
                     g_amax = pl.maximum(g_amax, oc_amax)
@@ -1167,10 +1191,13 @@ def _sparse_attn_o_proj(
                 act_scale_dq[g : g + 1, qt : qt + QUANT_TOKEN_TILE] = pl.recip(g_sq_row)
                 g_sq_col = pl.reshape(g_sq_row, [QUANT_TOKEN_TILE, 1])
                 for k1 in pl.range(0, O_LORA, QUANT_TILE):
-                    oc = o_r[
-                        qt : qt + QUANT_TOKEN_TILE,
-                        col_g + k1 : col_g + k1 + QUANT_TILE,
-                    ]
+                    oc = pl.create_tensor([QUANT_TOKEN_TILE, QUANT_TILE], dtype=pl.FP32)
+                    for quant_nf in pl.unroll(QUANT_TILE // PROJ_A_MM_N_TILE):
+                        quant_slab = k1 // PROJ_A_MM_N_TILE + quant_nf
+                        quant_row = quant_slab * T_PAD + qt
+                        quant_col = quant_nf * PROJ_A_MM_N_TILE
+                        quant_fragment = o_r_group[quant_row:quant_row + QUANT_TOKEN_TILE, 0:PROJ_A_MM_N_TILE]
+                        oc[0:QUANT_TOKEN_TILE, quant_col:quant_col + PROJ_A_MM_N_TILE] = quant_fragment
                     oq_scaled = pl.row_expand_mul(oc, g_sq_col)
                     oq_i32 = pl.cast(oq_scaled, target_type=pl.INT32, mode="rint")
                     oq_half = pl.cast(oq_i32, target_type=pl.FP16, mode="round")
@@ -1182,12 +1209,14 @@ def _sparse_attn_o_proj(
             quant_tids[g] = q_tid
 
         # proj_b_mm[dc, g]: INT8 GEMM of group g's contribution to a PROJ_B_D_TILE-wide slab
-        # of D, written as INT32 partials[:, g*D+n]. init_cond overwrites the accumulator on
+        # of D, stored in contiguous INT32 slabs. init_cond overwrites the accumulator on
         # the first K step; accumulating from a zero carry trips TLOAD DN->NZ (pypto#1540).
         for dc in pl.parallel(PB_DSLABS):
             d0 = dc * PROJ_B_D_TILE
             for g in pl.range(O_GROUPS):
                 col_g = g * O_LORA
+                slab_row = (dc * O_GROUPS + g) * T_PAD
+                partial_slab = partials[slab_row:slab_row + T_PAD, 0:PROJ_B_D_TILE]
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_b_mm", deps=[quant_tids[g]]) as pb_tid:
                     for nf in pl.range(PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
                         n0 = d0 + nf * PROJ_B_MM_N_TILE
@@ -1204,8 +1233,9 @@ def _sparse_attn_o_proj(
                                 b_weight = wo_b[g : g + 1, n0 : n0 + PROJ_B_MM_N_TILE, wb_k0 : wb_k0 + B_K_TILE]
                                 acc_b = pl.matmul_acc(acc_b, b_act, b_weight, b_trans=True, init_cond=(kb == 0))
                             acc_b_2d = pl.reshape(acc_b, [PROJ_B_ROW_TILE, PROJ_B_MM_N_TILE])
-                            partials[
-                                pb_r0 : pb_r0 + PROJ_B_ROW_TILE, g * D + n0 : g * D + n0 + PROJ_B_MM_N_TILE
+                            slab_n0 = nf * PROJ_B_MM_N_TILE
+                            partial_slab[
+                                pb_r0:pb_r0 + PROJ_B_ROW_TILE, slab_n0:slab_n0 + PROJ_B_MM_N_TILE
                             ] = acc_b_2d
                 proj_b_tids[dc * O_GROUPS + g] = pb_tid
 
@@ -1228,9 +1258,12 @@ def _sparse_attn_o_proj(
                 out_rows = pl.min(PROJ_B_ACT_T_TILE, tile_rows - b_tb)
                 acc = pl.full([PROJ_B_ACT_T_TILE, PROJ_B_ACT_N_TILE], dtype=pl.FP32, value=0.0)
                 for g in pl.range(O_GROUPS):
+                    slab_dc = ob_n0 // PROJ_B_D_TILE
+                    slab_col = ob_n0 % PROJ_B_D_TILE
+                    slab_row = (slab_dc * O_GROUPS + g) * T_PAD + b_tb
                     p_g = partials[
-                        b_tb : b_tb + PROJ_B_ACT_T_TILE,
-                        g * D + ob_n0 : g * D + ob_n0 + PROJ_B_ACT_N_TILE,
+                        slab_row:slab_row + PROJ_B_ACT_T_TILE,
+                        slab_col:slab_col + PROJ_B_ACT_N_TILE,
                     ]
                     g_scale_row = act_scale_dq[g : g + 1, b_tb : b_tb + PROJ_B_ACT_T_TILE]
                     g_scale = pl.reshape(g_scale_row, [PROJ_B_ACT_T_TILE, 1])

@@ -113,6 +113,17 @@ orchestrations, and the same `hc_head → rms_norm → lm_head` tail. Prompt
 sequence lengths that do not divide the CP group are padded rather than
 rejected, so one program serves an arbitrary chunk against a resident prefix.
 
+Within the forward, each rank carries HC state for its own token rows. Attention
+runs HC-pre and RMS normalization on those rows, gathers the normalized BF16
+stream for the existing full-context KV and compression consumers, and applies
+HC-post locally. MoE keeps its HC transforms and FFN output on the token owner.
+The public attention and layer entries reconstruct full rank-major outputs at
+their boundaries; the full forward reconstructs its public stage tensors before
+the final learned HC head. FP32 HC state and coefficients use lossless raw-word
+transport through the existing retained-window protocol. Paged KV, compression
+state, checkpoint publication, and the public tensor interfaces retain their
+existing ownership and layouts.
+
 Prefill also takes `state_checkpoint_ends`, an INT32
 `[requests, checkpoint_tiles, 6]` tensor (rank-stacked in L3).
 Checkpoint tiles follow each request's own 512-token projection tiles. Each
