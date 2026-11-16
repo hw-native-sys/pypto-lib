@@ -844,3 +844,19 @@ batched settings improved every pair against one row. The 2.490ms difference
 between four and eight rows has mixed pair directions and does not establish
 stable superiority. These figures include request input and cache initialization;
 they do not qualify serving TPOT or long-context performance.
+
+The experimental `--prefill-moe-fused-norm-quant` keeps each token's existing
+FP32 normalization, maximum reduction, and scale arithmetic, then applies the
+original round-to-INT32, FP16, saturated-INT8 cast chain before leaving the norm
+task. It retains the FP32 activation write required by the gate GEMM, avoids
+the quantization consumer's duplicate FP32 activation read and scale writes,
+and removes the separate quantization tasks. Routing, expert GEMMs, activation
+quantization rules, TP sums and decode are unchanged. The option defaults off;
+native preparation alone does not establish bytewise correctness or latency.
+
+A prepared TP8 AgentX 16K, two8K-chunk comparison with compact request
+journaling, A/B projection batching and combine8 matched all fourteen complete
+output/cache hashes. One warm request plus six ordinary requests per arm gave
+USER medians of 4.286619s versus 4.278417s, with only four of six paired samples
+improving. This small difference is inconclusive; keep fusion disabled in the
+selected plan until a phase-level comparison isolates its additional norm tail.

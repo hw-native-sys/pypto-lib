@@ -10,7 +10,7 @@
 
 import pypto.language as pl
 from .config import FLASH as M, FP32_NEG_INF, INT8_SCALE_MAX, INT8_AMAX_EPS
-from .prefill_moe_geometry import T
+from .prefill_moe_geometry import T, PREFILL_MOE_FUSED_NORM_QUANT
 
 D = M.hidden_size
 NORM_EPS = M.rms_norm_eps
@@ -120,30 +120,39 @@ def gate(
             xg_dequant_scale = pl.mul(xg_amax, 1.0 / INT8_SCALE_MAX)
             x_norm_dequant_scale = pl.mul(xg_dequant_scale, inv_rms)
             pl.tile.store(x_norm_dequant_scale, [tok, 0], x_norm_scale, shapes=[1, 1])
-            pl.tile.store(xg_sq, [tok, 0], xn_scale_buf, shapes=[1, 1])
+            if PREFILL_MOE_FUSED_NORM_QUANT == 0:
+                pl.tile.store(xg_sq, [tok, 0], xn_scale_buf, shapes=[1, 1])
+            else:
+                fused_xn_sq_scalar = pl.read(xg_sq, [0, 0])
+                fused_xn_q_scaled = pl.mul(xg, fused_xn_sq_scalar)
+                fused_xn_q_i32 = pl.cast(fused_xn_q_scaled, pl.INT32, mode="rint")
+                fused_xn_q_half = pl.cast(fused_xn_q_i32, pl.FP16, mode="round")
+                fused_xn_q_i8 = pl.cast(fused_xn_q_half, pl.INT8, mode="trunc", saturation_mode="on")
+                pl.tile.store(fused_xn_q_i8, [tok, 0], x_norm_i8, shapes=[1, D])
 
-    seed_dummy = pl.system.task_dummy(deps=[])
+    if PREFILL_MOE_FUSED_NORM_QUANT == 0:
+        seed_dummy = pl.system.task_dummy(deps=[])
 
 
-    for t0 in pl.parallel(0, active_gate_tokens, T_TILE):
-        with pl.at(
-            level=pl.Level.CORE_GROUP,
-            name_hint="x_norm_quant",
-            deps=[seed_dummy],
-            allow_early_resolve=True,
-        ):
-            quant_rows = pl.min(T_TILE, active_gate_tokens - t0)
-            xn_sq_col = pl.slice(xn_scale_buf, [T_TILE, 1], [t0, 0], valid_shape=[quant_rows, 1])
-            for xq_b_k in pl.pipeline(0, D, QUANT_TILE, stage=2):
-                xn_input = pl.slice(
-                    xg_buf, [T_TILE, QUANT_TILE], [t0, xq_b_k], valid_shape=[quant_rows, QUANT_TILE]
-                )
-                xn_q_scaled = pl.row_expand_mul(xn_input, xn_sq_col)
-                xn_q_i32 = pl.cast(xn_q_scaled, pl.INT32, mode="rint")
-                xn_q_half = pl.cast(xn_q_i32, pl.FP16, mode="round")
-                xn_q_i8 = pl.cast(xn_q_half, pl.INT8, mode="trunc", saturation_mode="on")
-                xn_q_valid = pl.set_validshape(xn_q_i8, quant_rows, QUANT_TILE)
-                x_norm_i8[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE] = xn_q_valid
+        for t0 in pl.parallel(0, active_gate_tokens, T_TILE):
+            with pl.at(
+                level=pl.Level.CORE_GROUP,
+                name_hint="x_norm_quant",
+                deps=[seed_dummy],
+                allow_early_resolve=True,
+            ):
+                quant_rows = pl.min(T_TILE, active_gate_tokens - t0)
+                xn_sq_col = pl.slice(xn_scale_buf, [T_TILE, 1], [t0, 0], valid_shape=[quant_rows, 1])
+                for xq_b_k in pl.pipeline(0, D, QUANT_TILE, stage=2):
+                    xn_input = pl.slice(
+                        xg_buf, [T_TILE, QUANT_TILE], [t0, xq_b_k], valid_shape=[quant_rows, QUANT_TILE]
+                    )
+                    xn_q_scaled = pl.row_expand_mul(xn_input, xn_sq_col)
+                    xn_q_i32 = pl.cast(xn_q_scaled, pl.INT32, mode="rint")
+                    xn_q_half = pl.cast(xn_q_i32, pl.FP16, mode="round")
+                    xn_q_i8 = pl.cast(xn_q_half, pl.INT8, mode="trunc", saturation_mode="on")
+                    xn_q_valid = pl.set_validshape(xn_q_i8, quant_rows, QUANT_TILE)
+                    x_norm_i8[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE] = xn_q_valid
 
     gate_logits_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
     GATE_N_BLOCKS = N_EXPERTS // GATE_N_TILE

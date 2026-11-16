@@ -48,6 +48,9 @@ if PREFILL_MOE_DIRECT_POST not in (0, 1):
     raise ValueError("Prefill direct post must be zero or one")
 if PREFILL_MOE_DIRECT_POST and not PREFILL_MOE_OWNER_REDUCE:
     raise ValueError("Prefill direct post requires owner reduction")
+PREFILL_MOE_FUSED_NORM_QUANT = _parse_int_argv("--prefill-moe-fused-norm-quant", 0)
+if PREFILL_MOE_FUSED_NORM_QUANT not in (0, 1):
+    raise ValueError("Prefill fused norm quant must be zero or one")
 PREFILL_MOE_COMBINE_ROWS = _parse_int_argv("--prefill-moe-combine-rows", 1)
 if PREFILL_MOE_COMBINE_ROWS not in (1, 4, 8):
     raise ValueError("Prefill combine rows must be 1, 4 or 8")
