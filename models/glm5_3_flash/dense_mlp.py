@@ -21,7 +21,6 @@ import torch
 import torch.nn.functional as F
 
 from models.glm5_3_flash.config import FLASH, TP_SIZE, D, Glm53FlashConfig
-from models.glm5_3_flash.elementwise import accurate_divide, accurate_exp
 from models.glm5_3_flash.linear import bf16_linear, golden_bf16_linear
 from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX, quantize_per_token_int8
 from models.glm5_3_flash.utils import _assert_close, _randn
@@ -107,10 +106,10 @@ def dense_mlp(
                 gate_buffer[:, :] = pl.set_validshape(gate_fp32, DN_ROW_PAD, ACT_INTER_TILE)
                 exp_argument = pl.create_tensor([DN_ROW_PAD, ACT_INTER_TILE], dtype=pl.FP32)
                 exp_argument[:, :] = pl.neg(gate_buffer)
-                exponential = accurate_exp(exp_argument)
+                exponential = pl.exp(exp_argument)
                 denominator = pl.create_tensor([DN_ROW_PAD, ACT_INTER_TILE], dtype=pl.FP32)
                 denominator[:, :] = pl.add(exponential, 1.0)
-                silu_value = accurate_divide(gate_buffer, denominator)
+                silu_value = pl.div(gate_buffer, denominator)
                 product = pl.mul(silu_value, up_fp32)
                 gated = pl.cast(pl.cast(product, pl.BF16, mode="rint"), pl.FP32)
                 gated = pl.set_validshape(gated, DN_ROW_TILE, ACT_INTER_TILE)
@@ -123,7 +122,7 @@ def dense_mlp(
             row_scale_q_buffer = pl.create_tensor([1, DN_ROW_PAD], dtype=pl.FP32)
             one = pl.create_tensor([1, DN_ROW_PAD], dtype=pl.FP32)
             one[:, :] = pl.full([1, DN_ROW_PAD], dtype=pl.FP32, value=1.0)
-            inverse_maximum = accurate_divide(one, amax_buffer)
+            inverse_maximum = pl.div(one, amax_buffer)
             quantization_scale = pl.mul(inverse_maximum, INT8_SCALE_MAX)
             row_scale_q_buffer[:, :] = quantization_scale
             row_scale_q = row_scale_q_buffer
@@ -209,10 +208,10 @@ def dense_mlp_bf16(
         gate_buffer[:, :] = gate
         exp_argument = pl.create_tensor([BF16_ACT_M_TILE, BF16_N_TILE], dtype=pl.FP32)
         exp_argument[:, :] = pl.neg(gate)
-        exponential = accurate_exp(exp_argument)
+        exponential = pl.exp(exp_argument)
         denominator = pl.create_tensor([BF16_ACT_M_TILE, BF16_N_TILE], dtype=pl.FP32)
         denominator[:, :] = pl.add(exponential, 1.0)
-        silu_value = accurate_divide(gate_buffer, denominator)
+        silu_value = pl.div(gate_buffer, denominator)
         product = pl.mul(silu_value, up)
         product_bf16 = pl.cast(product, pl.BF16, mode="rint")
         activated[t0:t0 + BF16_ACT_M_TILE, n0:n0 + BF16_N_TILE] = pl.set_validshape(product_bf16, rows, BF16_N_TILE)
