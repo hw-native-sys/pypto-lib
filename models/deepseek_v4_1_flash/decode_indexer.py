@@ -1276,13 +1276,9 @@ def _score_index_rows(
     workers = pl.max(1, pl.min(32, pl.system.available_cluster_count()))
     work_count = run_count * panels
     batch_capacity = pl.max(1, pl.min(work_count, workers * SCORE_BATCH_TILE))
-    dot_rows = batch_capacity * SCORE_ROWS_TILE
     key_rows = batch_capacity * SCORE_TILE
-    panel_slots = batch_capacity * 16
-    dot_backing = pl.create_tensor([dot_rows, SCORE_TILE], dtype=pl.BF16)
     staged_keys = pl.create_tensor([key_rows, INDEX_DIM], dtype=pl.FP8E4M3FN)
     staged_scales = pl.create_tensor([batch_capacity, SCORE_TILE * 4], dtype=pl.UINT8)
-    panel_valid = pl.create_tensor([panel_slots], dtype=pl.INT32)
     shards = workers
     if panels > 100:
         shards = pl.max(workers, (work_count + 99) // 100)
@@ -1314,7 +1310,6 @@ def _score_index_rows(
                 scale_bytes = pl.tile.full([1, SCORE_TILE * 4], dtype=pl.INT8, value=127)
                 mapping = pl.tile.full([SCORE_TILE], dtype=pl.INT32, value=-1)
                 mapping = pl.tile.move(mapping, target_memory=pl.MemorySpace.Vec)
-                have_dot = pl.cast(0, pl.INT32)
                 for piece in pl.range(2):
                     logical = begin + piece * 128
                     if logical < maximum and request >= 0 and request < requests:
@@ -1339,10 +1334,8 @@ def _score_index_rows(
                                         page_addresses = pl.reg.index_gen(page_mapping_base, lanes=64, dtype=pl.UINT32)
                                         page_addresses = pl.reg.adds(page_addresses, pl.cast(page_half * 64, pl.UINT32), page_mask)
                                         _page_mapping_write = pl.reg.scatter(mapping, page_addresses, page_rows, page_mask)
-                                have_dot = pl.cast(1, pl.INT32)
                 staged_keys = pl.store(pl.reinterpret_view(keys, pl.FP8E4M3FN), [staging_slot * SCORE_TILE, 0], staged_keys)
                 staged_scales = pl.store(pl.reinterpret_view(scale_bytes, pl.UINT8), [staging_slot, 0], staged_scales)
-                pl.write(panel_valid, [staging_slot * 16], have_dot)
                 for token in pl.range(first_token, end_token):
                     token_mapping = mapping
                     token_mapping = pl.tile.full([SCORE_TILE], dtype=pl.INT32, value=-1)
@@ -1366,7 +1359,7 @@ def _score_index_rows(
                     active = pl.min(SCORE_TILE, width - begin)
                     physical = pl.store(pl.set_validshape(mapping_row, 1, active), [token, begin], physical)
 
-        with pl.spmd(workers, name_hint="idx_score_dot", deps=[gather_tid, query_tid], optimizations=[pl.cross_core_slot(slot_num=1)]) as dot_tid:
+        with pl.spmd(workers, name_hint="idx_score_mix_reg", deps=[gather_tid, query_tid, weights_ready], optimizations=[pl.cross_core_slot(slot_num=1)]) as completed:
             worker = pl.tile.get_block_idx()
             for shard in pl.range(worker, owners, workers):
                 first_work = pl.max(batch_begin, work_count * shard // owners)
@@ -1376,26 +1369,12 @@ def _score_index_rows(
                     end_run = (end_work + panels - 1) // panels
                     for run_id in pl.range(first_run, end_run):
                         first_panel = pl.max(0, first_work - run_id * panels)
-                        end_panel = pl.min(panels, end_work - run_id * panels)
-                        first_token = pl.cast(
-                            pl.read(runs, [0, run_id]),
-                            pl.INDEX,
-                        )
-                        end_token = pl.cast(
-                            pl.read(runs, [1, run_id]),
-                            pl.INDEX,
-                        )
-                        valid_query_rows = (end_token - first_token) * INDEX_H
-                        raw_query = pl.tile.load(
-                            query_carrier, [first_token * INDEX_H, 0],
-                            [SCORE_ROWS_TILE, INDEX_DIM], valid_shape=[valid_query_rows, INDEX_DIM],
-                            target_memory=pl.MemorySpace.Vec,
-                        )
-                        padded_query = pl.fillpad(raw_query, pad_value=pl.PadValue.zero)
-                        query_tile = pl.set_validshape(padded_query, SCORE_ROWS_TILE, INDEX_DIM)
-                        valid_query_scales = (end_token - first_token) * INDEX_H * 4
+                        last_panel = pl.min(panels, end_work - run_id * panels)
+                        run_begin = pl.cast(pl.read(runs, [0, run_id]), pl.INDEX)
+                        run_end = pl.cast(pl.read(runs, [1, run_id]), pl.INDEX)
+                        valid_query_scales = (run_end - run_begin) * INDEX_H * 4
                         raw_query_scale = pl.tile.load(
-                            flat_query_scales, [0, first_token * INDEX_H * 4],
+                            flat_query_scales, [0, run_begin * INDEX_H * 4],
                             [1, SCORE_ROWS_TILE * 4], valid_shape=[1, valid_query_scales],
                             target_memory=pl.MemorySpace.Vec,
                         )
@@ -1403,142 +1382,203 @@ def _score_index_rows(
                         full_query_scale = pl.set_validshape(padded_query_scale, 1, SCORE_ROWS_TILE * 4)
                         query_bytes = pl.reinterpret_view(full_query_scale, pl.UINT8)
                         query_temporary = pl.create_tile([1, 128], dtype=pl.UINT8)
-                        query_zz = pl.tmov_x2zz(query_bytes, query_temporary, group_axis=1, dst_rows=SCORE_ROWS_TILE, dst_cols=4)
-                        query_rows0 = pl.tile.slice(query_tile, [96, INDEX_DIM], [0, 0])
-                        query_mat0 = pl.tile.move(
-                            query_rows0, target_memory=pl.MemorySpace.Mat,
-                            blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major,
+                        query_zz = pl.tmov_x2zz(
+                            query_bytes, query_temporary, group_axis=1,
+                            dst_rows=SCORE_ROWS_TILE, dst_cols=4,
                         )
-                        query_left0 = pl.tile.move(query_mat0, target_memory=pl.MemorySpace.Left)
-                        query_rows1 = pl.tile.slice(query_tile, [96, INDEX_DIM], [96, 0])
-                        query_mat1 = pl.tile.move(
-                            query_rows1, target_memory=pl.MemorySpace.Mat,
-                            blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major,
-                        )
-                        query_left1 = pl.tile.move(query_mat1, target_memory=pl.MemorySpace.Left)
-                        for panel in pl.range(first_panel, end_panel):
+                        for panel in pl.range(first_panel, last_panel):
                             work = run_id * panels + panel
                             staging_slot = work - batch_begin
-                            if pl.read(panel_valid, [staging_slot * 16]) != 0:
-                                dot_keys = pl.tile.load(
-                                    staged_keys, [staging_slot * SCORE_TILE, 0],
-                                    [SCORE_TILE, INDEX_DIM],
-                                    target_memory=pl.MemorySpace.Vec,
-                                )
-                                dot_scale_bytes = pl.tile.load(staged_scales, [staging_slot, 0], [1, SCORE_TILE * 4], target_memory=pl.MemorySpace.Vec)
-                                scale_temporary = pl.create_tile([1, 128], dtype=pl.UINT8)
-                                key_zz = pl.tmov_x2zz(dot_scale_bytes, scale_temporary, group_axis=1, dst_rows=SCORE_TILE, dst_cols=4)
-                                key_scale_nn = pl.tile.transpose_view(pl.reinterpret_view(key_zz, pl.FP8E8M0))
-                                keys_i8 = pl.reinterpret_view(dot_keys, pl.INT8)
-                                keys_kn_i8 = pl.tile.transpose(keys_i8, 0, 1)
-                                keys_kn = pl.reinterpret_view(keys_kn_i8, pl.FP8E4M3FN)
-                                keys_mat = pl.tile.move(
-                                    keys_kn, target_memory=pl.MemorySpace.Mat,
-                                    blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major,
-                                )
-                                keys_right = pl.tile.move(keys_mat, target_memory=pl.MemorySpace.Right)
-                                key_scale_mat = pl.tile.move(
-                                    key_scale_nn, target_memory=pl.MemorySpace.Mat,
-                                    blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major,
-                                )
-                                key_right_scale = pl.tile.move(key_scale_mat, target_memory=pl.MemorySpace.RightScale)
-                                query_scale0 = pl.tile.slice(pl.reinterpret_view(query_zz, pl.FP8E8M0), [96, 4], [0, 0])
-                                query_scale_mat0 = pl.tile.move(
-                                    query_scale0, target_memory=pl.MemorySpace.Mat,
-                                    blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major,
-                                )
-                                query_left_scale0 = pl.tile.move(query_scale_mat0, target_memory=pl.MemorySpace.LeftScale)
-                                dot0 = pl.matmul_mx(query_left0, query_left_scale0, keys_right, key_right_scale)
-                                rounded_dot0 = pl.cast(dot0, pl.BF16, mode="rint")
-                                dot_backing = pl.store(rounded_dot0, [staging_slot * SCORE_ROWS_TILE, 0], dot_backing)
-                                query_scale1 = pl.tile.slice(pl.reinterpret_view(query_zz, pl.FP8E8M0), [96, 4], [96, 0])
-                                query_scale_mat1 = pl.tile.move(
-                                    query_scale1, target_memory=pl.MemorySpace.Mat,
-                                    blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major,
-                                )
-                                query_left_scale1 = pl.tile.move(query_scale_mat1, target_memory=pl.MemorySpace.LeftScale)
-                                dot1 = pl.matmul_mx(query_left1, query_left_scale1, keys_right, key_right_scale)
-                                rounded_dot1 = pl.cast(dot1, pl.BF16, mode="rint")
-                                dot_backing = pl.store(rounded_dot1, [staging_slot * SCORE_ROWS_TILE + 96, 0], dot_backing)
-
-        with pl.spmd(workers, name_hint="idx_score_reduce", deps=[dot_tid, weights_ready]) as completed:
-            worker = pl.tile.get_block_idx()
-            for work in pl.range(batch_begin + worker, batch_end, workers):
-                staging_slot = work - batch_begin
-                run_id = work // panels
-                begin = (work % panels) * SCORE_TILE
-                first_token = pl.cast(
-                    pl.read(runs, [0, run_id]),
-                    pl.INDEX,
-                )
-                end_token = pl.cast(
-                    pl.read(runs, [1, run_id]),
-                    pl.INDEX,
-                )
-                for run_row in pl.range(end_token - first_token):
-                    token = first_token + run_row
-                    active = pl.min(SCORE_TILE, width - begin)
-                    reduce_dot = pl.tile.full([INDEX_H, SCORE_TILE], dtype=pl.BF16, value=0.0)
-                    if pl.read(panel_valid, [staging_slot * 16]) != 0:
-                        reduce_dot = pl.tile.load(
-                            dot_backing, [staging_slot * SCORE_ROWS_TILE + run_row * INDEX_H, 0],
-                            [INDEX_H, SCORE_TILE],
-                            target_memory=pl.MemorySpace.Vec,
-                        )
-                    weight_row = pl.tile.load(weights, [token, 0], [1, INDEX_H], target_memory=pl.MemorySpace.Vec)
-                    weight_pad = pl.tile.full([1, 64], dtype=pl.BF16, value=0.0)
-                    weight_pad = pl.tile.assemble(weight_pad, weight_row, [0, 0])
-                    weight_vec = pl.reshape(pl.tile.move(weight_pad, target_memory=pl.MemorySpace.Vec), [64])
-                    total = pl.tile.full([SCORE_TILE], dtype=pl.FP32, value=0.0)
-                    total = pl.tile.move(total, target_memory=pl.MemorySpace.Vec)
-                    reduce_dot = pl.reshape(reduce_dot, [INDEX_H * SCORE_TILE])
-                    reduce_mapping = pl.tile.load(
-                        physical, [token, begin],
-                        [1, SCORE_TILE], valid_shape=[1, active],
-                        target_memory=pl.MemorySpace.Vec,
-                    )
-                    reduce_mapping = pl.fillpad(reduce_mapping, pad_value=pl.PadValue.min)
-                    mapping_vec = pl.reshape(pl.set_validshape(reduce_mapping, 1, SCORE_TILE), [SCORE_TILE])
-                    with pl.reg_scope():
-                        r0_mask64 = pl.reg.full_mask(lanes=64)
-                        r0_mask = pl.reg.full_mask(lanes=128)
-                        r0_raw_weights = pl.reg.load(weight_vec, lanes=64)
-                        r0_weight_bits16 = pl.reg.interpret_cast(r0_raw_weights, dtype=pl.UINT16)
-                        r0_weight_bits = pl.reg.convert(r0_weight_bits16, dtype=pl.UINT32)
-                        r0_weight_bits = pl.reg.shift_lefts(r0_weight_bits, 16, r0_mask64)
-                        r0_weight_values = pl.reg.interpret_cast(r0_weight_bits, dtype=pl.FP32)
-                        r0_weight_values = pl.reg.muls(r0_weight_values, 0.015625, r0_mask64)
-                        r0_scaled_bits = pl.reg.interpret_cast(r0_weight_values, dtype=pl.UINT32)
-                        r0_high = pl.reg.shift_rights(r0_scaled_bits, 16, r0_mask64)
-                        r0_one = pl.reg.broadcast(1, lanes=64, dtype=pl.UINT32)
-                        r0_lsb = pl.reg.bitwise_and(r0_high, r0_one)
-                        r0_bias = pl.reg.broadcast(32767, lanes=64, dtype=pl.UINT32)
-                        r0_rounded = pl.reg.add(pl.reg.add(r0_scaled_bits, r0_bias), r0_lsb)
-                        r0_halfwords = pl.reg.interpret_cast(r0_rounded, dtype=pl.UINT16)
-                        r0_even, r0_weights_bits = pl.reg.dintlv(r0_halfwords, r0_halfwords, r0_mask)
-                        r0_zero = pl.reg.broadcast(0.0, lanes=128, dtype=pl.BF16)
-                        for reduce_part in pl.hardware_loop(SCORE_TILE // 128):
-                            r0_acc = r0_zero
-                            for head in pl.unroll(INDEX_H):
-                                r0_dots = pl.reg.load(reduce_dot, head * SCORE_TILE + reduce_part * 128, lanes=128)
-                                r0_positive = pl.reg.maximum(r0_dots, r0_zero)
-                                r0_indices = pl.reg.broadcast(pl.cast(head, pl.UINT16), lanes=128, dtype=pl.UINT16)
-                                r0_repeated_bits = pl.reg.gather_lanes(r0_weights_bits, r0_indices)
-                                r0_repeated = pl.reg.interpret_cast(r0_repeated_bits, dtype=pl.BF16)
-                                r0_acc = pl.reg.mula(r0_acc, r0_positive, r0_repeated)
-                            r0_acc = pl.reg.add(r0_acc, r0_zero)
-                            r0_total_bits16 = pl.reg.interpret_cast(r0_acc, dtype=pl.UINT16)
-                            r0_total_bits = pl.reg.convert(r0_total_bits16, dtype=pl.UINT32)
-                            r0_total_bits = pl.reg.shift_lefts(r0_total_bits, 16, r0_mask)
-                            r0_values = pl.reg.interpret_cast(r0_total_bits, dtype=pl.FP32)
-                            r0_physical_ids = pl.reg.load(mapping_vec, reduce_part * 128, lanes=128)
-                            r0_valid = pl.reg.compares(r0_physical_ids, 0, r0_mask, predicate="ge")
-                            r0_invalid_bits = pl.reg.broadcast(-8388608, lanes=128, dtype=pl.INT32)
-                            r0_invalid = pl.reg.interpret_cast(r0_invalid_bits, dtype=pl.FP32)
-                            r0_values = pl.reg.select(r0_valid, r0_values, r0_invalid)
-                            _score_write = pl.reg.store(total, reduce_part * 128, r0_values)
-                    total_row = pl.reshape(total, [1, SCORE_TILE])
-                    scores = pl.store(pl.set_validshape(total_row, 1, active), [token, begin], scores)
+                            begin = panel * SCORE_TILE
+                            active = pl.min(SCORE_TILE, width - begin)
+                            dot_keys = pl.tile.load(
+                                staged_keys, [staging_slot * SCORE_TILE, 0],
+                                [SCORE_TILE, INDEX_DIM], target_memory=pl.MemorySpace.Vec,
+                            )
+                            dot_scale_bytes = pl.tile.load(
+                                staged_scales, [staging_slot, 0], [1, SCORE_TILE * 4],
+                                target_memory=pl.MemorySpace.Vec,
+                            )
+                            scale_temporary = pl.create_tile([1, 128], dtype=pl.UINT8)
+                            key_zz = pl.tmov_x2zz(
+                                dot_scale_bytes, scale_temporary, group_axis=1,
+                                dst_rows=SCORE_TILE, dst_cols=4,
+                            )
+                            key_scale_nn = pl.tile.transpose_view(pl.reinterpret_view(key_zz, pl.FP8E8M0))
+                            keys_i8 = pl.reinterpret_view(dot_keys, pl.INT8)
+                            keys_kn_i8 = pl.tile.transpose(keys_i8, 0, 1)
+                            keys_kn = pl.reinterpret_view(keys_kn_i8, pl.FP8E4M3FN)
+                            keys_mat = pl.tile.move(
+                                keys_kn, target_memory=pl.MemorySpace.Mat,
+                                blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major,
+                            )
+                            keys_right = pl.tile.move(keys_mat, target_memory=pl.MemorySpace.Right)
+                            key_scale_mat = pl.tile.move(
+                                key_scale_nn, target_memory=pl.MemorySpace.Mat,
+                                blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major,
+                            )
+                            key_right_scale = pl.tile.move(key_scale_mat, target_memory=pl.MemorySpace.RightScale)
+                            valid_query_rows = (run_end - run_begin) * INDEX_H
+                            query_rows0 = pl.min(96, valid_query_rows)
+                            raw_query0 = pl.tile.load(
+                                query_carrier, [run_begin * INDEX_H, 0], [96, INDEX_DIM],
+                                valid_shape=[query_rows0, INDEX_DIM], target_memory=pl.MemorySpace.Vec,
+                            )
+                            padded_query0 = pl.fillpad(raw_query0, pad_value=pl.PadValue.zero)
+                            query_tile0 = pl.set_validshape(padded_query0, 96, INDEX_DIM)
+                            query_mat0 = pl.tile.move(
+                                query_tile0, target_memory=pl.MemorySpace.Mat,
+                                blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major,
+                            )
+                            query_left0 = pl.tile.move(query_mat0, target_memory=pl.MemorySpace.Left)
+                            dot_scale0 = pl.tile.slice(
+                                pl.reinterpret_view(query_zz, pl.FP8E8M0), [96, 4], [0, 0],
+                            )
+                            dot_scale_mat0 = pl.tile.move(
+                                dot_scale0, target_memory=pl.MemorySpace.Mat,
+                                blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major,
+                            )
+                            query_left_scale0 = pl.tile.move(dot_scale_mat0, target_memory=pl.MemorySpace.LeftScale)
+                            dot0 = pl.matmul_mx(query_left0, query_left_scale0, keys_right, key_right_scale)
+                            dot_bf160 = pl.cast(dot0, pl.BF16, mode="rint")
+                            dot_flat0 = pl.reshape(dot_bf160, [96 * SCORE_TILE])
+                            for token_lane in pl.unroll(3):
+                                token = run_begin + 0 + token_lane
+                                if token < run_end:
+                                    weight_row = pl.tile.load(
+                                        weights, [token, 0], [1, INDEX_H], target_memory=pl.MemorySpace.Vec,
+                                    )
+                                    weight_pad = pl.tile.full([1, 64], dtype=pl.BF16, value=0.0)
+                                    weight_pad = pl.tile.assemble(weight_pad, weight_row, [0, 0])
+                                    weight_vec = pl.reshape(pl.tile.move(weight_pad, target_memory=pl.MemorySpace.Vec), [64])
+                                    reduce_mapping = pl.tile.load(
+                                        physical, [token, begin], [1, SCORE_TILE], valid_shape=[1, active],
+                                        target_memory=pl.MemorySpace.Vec,
+                                    )
+                                    reduce_mapping = pl.fillpad(reduce_mapping, pad_value=pl.PadValue.min)
+                                    mapping_vec = pl.reshape(pl.set_validshape(reduce_mapping, 1, SCORE_TILE), [SCORE_TILE])
+                                    total = pl.tile.full([SCORE_TILE], dtype=pl.FP32, value=0.0)
+                                    total = pl.tile.move(total, target_memory=pl.MemorySpace.Vec)
+                                    with pl.reg_scope():
+                                        r0_mask64 = pl.reg.full_mask(lanes=64)
+                                        r0_mask = pl.reg.full_mask(lanes=128)
+                                        r0_raw_weights = pl.reg.load(weight_vec, lanes=64)
+                                        r0_weight_bits16 = pl.reg.interpret_cast(r0_raw_weights, dtype=pl.UINT16)
+                                        r0_weight_bits = pl.reg.convert(r0_weight_bits16, dtype=pl.UINT32)
+                                        r0_weight_bits = pl.reg.shift_lefts(r0_weight_bits, 16, r0_mask64)
+                                        r0_weight_values = pl.reg.interpret_cast(r0_weight_bits, dtype=pl.FP32)
+                                        r0_weight_values = pl.reg.muls(r0_weight_values, 0.015625, r0_mask64)
+                                        r0_scaled_bits = pl.reg.interpret_cast(r0_weight_values, dtype=pl.UINT32)
+                                        r0_high = pl.reg.shift_rights(r0_scaled_bits, 16, r0_mask64)
+                                        r0_one = pl.reg.broadcast(1, lanes=64, dtype=pl.UINT32)
+                                        r0_lsb = pl.reg.bitwise_and(r0_high, r0_one)
+                                        r0_bias = pl.reg.broadcast(32767, lanes=64, dtype=pl.UINT32)
+                                        r0_rounded = pl.reg.add(pl.reg.add(r0_scaled_bits, r0_bias), r0_lsb)
+                                        r0_halfwords = pl.reg.interpret_cast(r0_rounded, dtype=pl.UINT16)
+                                        r0_even, r0_weights_bits = pl.reg.dintlv(r0_halfwords, r0_halfwords, r0_mask)
+                                        r0_zero = pl.reg.broadcast(0.0, lanes=128, dtype=pl.BF16)
+                                        for reduce_part in pl.hardware_loop(SCORE_TILE // 128):
+                                            r0_acc = r0_zero
+                                            for head in pl.unroll(INDEX_H):
+                                                r0_dots = pl.reg.load(dot_flat0, token_lane * INDEX_H * SCORE_TILE + head * SCORE_TILE + reduce_part * 128, lanes=128)
+                                                r0_positive = pl.reg.maximum(r0_dots, r0_zero)
+                                                r0_indices = pl.reg.broadcast(pl.cast(head, pl.UINT16), lanes=128, dtype=pl.UINT16)
+                                                r0_repeated_bits = pl.reg.gather_lanes(r0_weights_bits, r0_indices)
+                                                r0_repeated = pl.reg.interpret_cast(r0_repeated_bits, dtype=pl.BF16)
+                                                r0_acc = pl.reg.mula(r0_acc, r0_positive, r0_repeated)
+                                            r0_acc = pl.reg.add(r0_acc, r0_zero)
+                                            r0_total_bits16 = pl.reg.interpret_cast(r0_acc, dtype=pl.UINT16)
+                                            r0_total_bits = pl.reg.convert(r0_total_bits16, dtype=pl.UINT32)
+                                            r0_total_bits = pl.reg.shift_lefts(r0_total_bits, 16, r0_mask)
+                                            r0_values = pl.reg.interpret_cast(r0_total_bits, dtype=pl.FP32)
+                                            r0_physical_ids = pl.reg.load(mapping_vec, reduce_part * 128, lanes=128)
+                                            r0_valid = pl.reg.compares(r0_physical_ids, 0, r0_mask, predicate="ge")
+                                            r0_invalid_bits = pl.reg.broadcast(-8388608, lanes=128, dtype=pl.INT32)
+                                            r0_invalid = pl.reg.interpret_cast(r0_invalid_bits, dtype=pl.FP32)
+                                            r0_values = pl.reg.select(r0_valid, r0_values, r0_invalid)
+                                            _score_write = pl.reg.store(total, reduce_part * 128, r0_values)
+                                    total_row = pl.reshape(total, [1, SCORE_TILE])
+                                    scores = pl.store(pl.set_validshape(total_row, 1, active), [token, begin], scores)
+                            query_rows1 = pl.max(0, valid_query_rows - 96)
+                            raw_query1 = pl.tile.load(
+                                query_carrier, [run_begin * INDEX_H + 96, 0], [96, INDEX_DIM],
+                                valid_shape=[query_rows1, INDEX_DIM], target_memory=pl.MemorySpace.Vec,
+                            )
+                            padded_query1 = pl.fillpad(raw_query1, pad_value=pl.PadValue.zero)
+                            query_tile1 = pl.set_validshape(padded_query1, 96, INDEX_DIM)
+                            query_mat1 = pl.tile.move(
+                                query_tile1, target_memory=pl.MemorySpace.Mat,
+                                blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major,
+                            )
+                            query_left1 = pl.tile.move(query_mat1, target_memory=pl.MemorySpace.Left)
+                            dot_scale1 = pl.tile.slice(
+                                pl.reinterpret_view(query_zz, pl.FP8E8M0), [96, 4], [96, 0],
+                            )
+                            dot_scale_mat1 = pl.tile.move(
+                                dot_scale1, target_memory=pl.MemorySpace.Mat,
+                                blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major,
+                            )
+                            query_left_scale1 = pl.tile.move(dot_scale_mat1, target_memory=pl.MemorySpace.LeftScale)
+                            dot1 = pl.matmul_mx(query_left1, query_left_scale1, keys_right, key_right_scale)
+                            dot_bf161 = pl.cast(dot1, pl.BF16, mode="rint")
+                            dot_flat1 = pl.reshape(dot_bf161, [96 * SCORE_TILE])
+                            for token_lane in pl.unroll(3):
+                                token = run_begin + 3 + token_lane
+                                if token < run_end:
+                                    weight_row = pl.tile.load(
+                                        weights, [token, 0], [1, INDEX_H], target_memory=pl.MemorySpace.Vec,
+                                    )
+                                    weight_pad = pl.tile.full([1, 64], dtype=pl.BF16, value=0.0)
+                                    weight_pad = pl.tile.assemble(weight_pad, weight_row, [0, 0])
+                                    weight_vec = pl.reshape(pl.tile.move(weight_pad, target_memory=pl.MemorySpace.Vec), [64])
+                                    reduce_mapping = pl.tile.load(
+                                        physical, [token, begin], [1, SCORE_TILE], valid_shape=[1, active],
+                                        target_memory=pl.MemorySpace.Vec,
+                                    )
+                                    reduce_mapping = pl.fillpad(reduce_mapping, pad_value=pl.PadValue.min)
+                                    mapping_vec = pl.reshape(pl.set_validshape(reduce_mapping, 1, SCORE_TILE), [SCORE_TILE])
+                                    total = pl.tile.full([SCORE_TILE], dtype=pl.FP32, value=0.0)
+                                    total = pl.tile.move(total, target_memory=pl.MemorySpace.Vec)
+                                    with pl.reg_scope():
+                                        r4_mask64 = pl.reg.full_mask(lanes=64)
+                                        r4_mask = pl.reg.full_mask(lanes=128)
+                                        r4_raw_weights = pl.reg.load(weight_vec, lanes=64)
+                                        r4_weight_bits16 = pl.reg.interpret_cast(r4_raw_weights, dtype=pl.UINT16)
+                                        r4_weight_bits = pl.reg.convert(r4_weight_bits16, dtype=pl.UINT32)
+                                        r4_weight_bits = pl.reg.shift_lefts(r4_weight_bits, 16, r4_mask64)
+                                        r4_weight_values = pl.reg.interpret_cast(r4_weight_bits, dtype=pl.FP32)
+                                        r4_weight_values = pl.reg.muls(r4_weight_values, 0.015625, r4_mask64)
+                                        r4_scaled_bits = pl.reg.interpret_cast(r4_weight_values, dtype=pl.UINT32)
+                                        r4_high = pl.reg.shift_rights(r4_scaled_bits, 16, r4_mask64)
+                                        r4_one = pl.reg.broadcast(1, lanes=64, dtype=pl.UINT32)
+                                        r4_lsb = pl.reg.bitwise_and(r4_high, r4_one)
+                                        r4_bias = pl.reg.broadcast(32767, lanes=64, dtype=pl.UINT32)
+                                        r4_rounded = pl.reg.add(pl.reg.add(r4_scaled_bits, r4_bias), r4_lsb)
+                                        r4_halfwords = pl.reg.interpret_cast(r4_rounded, dtype=pl.UINT16)
+                                        r4_even, r4_weights_bits = pl.reg.dintlv(r4_halfwords, r4_halfwords, r4_mask)
+                                        r4_zero = pl.reg.broadcast(0.0, lanes=128, dtype=pl.BF16)
+                                        for reduce_part in pl.hardware_loop(SCORE_TILE // 128):
+                                            r4_acc = r4_zero
+                                            for head in pl.unroll(INDEX_H):
+                                                r4_dots = pl.reg.load(dot_flat1, token_lane * INDEX_H * SCORE_TILE + head * SCORE_TILE + reduce_part * 128, lanes=128)
+                                                r4_positive = pl.reg.maximum(r4_dots, r4_zero)
+                                                r4_indices = pl.reg.broadcast(pl.cast(head, pl.UINT16), lanes=128, dtype=pl.UINT16)
+                                                r4_repeated_bits = pl.reg.gather_lanes(r4_weights_bits, r4_indices)
+                                                r4_repeated = pl.reg.interpret_cast(r4_repeated_bits, dtype=pl.BF16)
+                                                r4_acc = pl.reg.mula(r4_acc, r4_positive, r4_repeated)
+                                            r4_acc = pl.reg.add(r4_acc, r4_zero)
+                                            r4_total_bits16 = pl.reg.interpret_cast(r4_acc, dtype=pl.UINT16)
+                                            r4_total_bits = pl.reg.convert(r4_total_bits16, dtype=pl.UINT32)
+                                            r4_total_bits = pl.reg.shift_lefts(r4_total_bits, 16, r4_mask)
+                                            r4_values = pl.reg.interpret_cast(r4_total_bits, dtype=pl.FP32)
+                                            r4_physical_ids = pl.reg.load(mapping_vec, reduce_part * 128, lanes=128)
+                                            r4_valid = pl.reg.compares(r4_physical_ids, 0, r4_mask, predicate="ge")
+                                            r4_invalid_bits = pl.reg.broadcast(-8388608, lanes=128, dtype=pl.INT32)
+                                            r4_invalid = pl.reg.interpret_cast(r4_invalid_bits, dtype=pl.FP32)
+                                            r4_values = pl.reg.select(r4_valid, r4_values, r4_invalid)
+                                            _score_write = pl.reg.store(total, reduce_part * 128, r4_values)
+                                    total_row = pl.reshape(total, [1, SCORE_TILE])
+                                    scores = pl.store(pl.set_validshape(total_row, 1, active), [token, begin], scores)
         previous_batch = completed
     return previous_batch
 
