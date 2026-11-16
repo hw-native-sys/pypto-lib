@@ -818,3 +818,12 @@ lifetime, and finish every copy before host refill. Retire the native metadata
 consumer before uploading the next chunk into those device roots. Account for
 each root and its alignment padding once; field views do not own additional
 device allocations.
+
+The input-only `prefill_embedding_lookup` program reads actual token IDs from
+resident BF16 embedding weights and expands each selected row to four FP32 HC
+channels with exact BF16 bit widening. Its caller must admit the complete
+resident vocabulary matrix, upload it during Worker setup, bind it as read-only
+input, and validate token bounds before submission. Request token upload and
+device lookup remain inside prepared-request timing. This optional input path
+does not change the prefill compute program or establish a performance gain
+without full output/cache and ordinary request checks.
