@@ -803,3 +803,18 @@ or post-fork allocation is not a substitute for shared backing. Reusable
 metadata buffers follow the same lifetime and must retain actual per-rank
 values, shapes and dtypes. These host changes do not alter native compute,
 weights, quantization or cache semantics.
+
+`prefill_input_plan.PreparedInputPlan` retains metadata derived from an explicit
+cache owner, page maps, positions, shapes, RoPE tables, grammar policy and revision.
+Construct and register its shared typed arenas before preparing the Worker.
+Only geometry is prepared in advance: fill real token IDs and gather actual
+prompt embeddings within request timing. A changed owner or geometry requires
+a new registered plan; it must not silently reuse the previous metadata.
+
+`DeviceMetadataArena` allocates a real device root for each dtype and borrows
+aligned same-dtype field views through the owning Worker's public API. Register
+host roots as mutable inherited tensors, retain their storage for the Worker's
+lifetime, and finish every copy before host refill. Retire the native metadata
+consumer before uploading the next chunk into those device roots. Account for
+each root and its alignment padding once; field views do not own additional
+device allocations.
