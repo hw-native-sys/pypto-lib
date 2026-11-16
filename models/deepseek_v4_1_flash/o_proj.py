@@ -201,6 +201,12 @@ def quant_o_vf_pypto(
                     maximum = pl.reg.maximum(maximum, exponent_floor, compact_mask)
                     shared = pl.reg.sub(maximum, exponent_floor, compact_mask)
                     codes8 = pl.reg.shift_rights(shared, 7, compact_mask)
+                    even_codes, odd_codes = pl.reg.dintlv(codes8, codes8)
+                    odd_codes = pl.reg.shift_lefts(odd_codes, 8, compact_mask)
+                    pairs = pl.reg.bitwise_or(even_codes, odd_codes, compact_mask)
+                    scale_base_u32 = row_u32 // 16 * 128 + row_u32 % 16 + chunk_u32 * 64
+                    scale_base = pl.cast(scale_base_u32, pl.INDEX)
+                    scattered = pl.reg.scatter(codes, scatter_offset, pairs, four, base_offset=scale_base)
                     inverse = pl.reg.sub(inverse_bias, shared, compact_mask)
                     nonzero = pl.reg.minimums(shared, 128, compact_mask)
                     nonzero = pl.reg.shift_rights(nonzero, 7, compact_mask)
@@ -217,12 +223,6 @@ def quant_o_vf_pypto(
                     word_offset_u32 = block_u32 * 64
                     word_offset = pl.cast(word_offset_u32, pl.INDEX)
                     stored = pl.reg.store(payload_words, offset=word_offset, value=packed_words)
-                    even_codes, odd_codes = pl.reg.dintlv(codes8, codes8)
-                    odd_codes = pl.reg.shift_lefts(odd_codes, 8, compact_mask)
-                    pairs = pl.reg.bitwise_or(even_codes, odd_codes, compact_mask)
-                    scale_base_u32 = row_u32 // 16 * 128 + row_u32 % 16 + chunk_u32 * 64
-                    scale_base = pl.cast(scale_base_u32, pl.INDEX)
-                    scattered = pl.reg.scatter(codes, scatter_offset, pairs, four, base_offset=scale_base)
                 for tail in pl.hardware_loop(O_QUANT_ROW_TILE - rows):
                     row_u32 = pl.cast(rows + tail, pl.UINT32)
                     for chunk in pl.hardware_loop(2):
