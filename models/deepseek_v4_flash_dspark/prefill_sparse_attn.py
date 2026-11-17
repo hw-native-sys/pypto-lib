@@ -681,6 +681,8 @@ def _sparse_attn_wave(
     gather_cmp_blocks = gather_cmp_token_blocks * (PREFILL_ATTN_BLOCKS - 1)
 
     # Stage original-window rows in reverse token-tile order.
+    sparse_ori_rows = PREFILL_QUERY_TILE * PREFILL_ATTN_TILE
+    sparse_ori_kv = sparse_kv[0:sparse_ori_rows, 0:HEAD_DIM]
     with pl.spmd(
         gather_blocks,
         name_hint="gather_ori_kv",
@@ -712,7 +714,7 @@ def _sparse_attn_wave(
             if gather_t < t_dim:
                 if gather_t < active_rows:
                     request_id = pl.read(local_request_ids, [gather_t])
-                    block_base = gather_local_t * PREFILL_SPARSE_PAD
+                    block_base = gather_local_t * PREFILL_ATTN_TILE
                     if pl.read(valid_block_mask, [gather_t, 0]) > 0:
                         stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
                         if request_id >= 0:
@@ -734,8 +736,9 @@ def _sparse_attn_wave(
                                         if gather_raw >= 0:
                                             src = pl.cast(gather_raw, pl.INDEX)
                                             stage[gather_ki : gather_ki + 1, :] = ori_kv_flat[src : src + 1, :]
-                        sparse_kv[block_base : block_base + PREFILL_ATTN_TILE, :] = stage
+                        sparse_ori_kv[block_base : block_base + PREFILL_ATTN_TILE, :] = stage
 
+    sparse_cmp_kv = sparse_kv[sparse_ori_rows:PREFILL_QUERY_TILE * PREFILL_SPARSE_PAD, 0:HEAD_DIM]
     with pl.spmd(
         gather_cmp_blocks,
         name_hint="gather_cmp_kv",
@@ -754,7 +757,7 @@ def _sparse_attn_wave(
                 if gather_t < active_rows:
                     request_id = pl.read(local_request_ids, [gather_t])
                     gather_block_valid = pl.read(valid_block_mask, [gather_t, gather_sb])
-                    block_base = gather_local_t * PREFILL_SPARSE_PAD + gather_k0
+                    block_base = ((gather_sb - 1) * PREFILL_QUERY_TILE + gather_local_t) * PREFILL_ATTN_TILE
                     if gather_block_valid > 0:
                         stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
                         if request_id >= 0:
@@ -790,7 +793,7 @@ def _sparse_attn_wave(
                                                     blk = pl.cast(blk_raw, pl.INDEX)
                                                     src = blk * BLOCK_SIZE + (gather_raw - blk_slot * BLOCK_SIZE)
                                                     stage[gather_ki : gather_ki + 1, :] = cmp_kv_flat[src : src + 1, :]
-                        sparse_kv[block_base : block_base + PREFILL_ATTN_TILE, :] = stage
+                        sparse_cmp_kv[block_base : block_base + PREFILL_ATTN_TILE, :] = stage
 
     # Pipeline K blocks and keep the online-softmax state local to each query.
     transfer_slots = NUM_QK_CORES * QK_TRANSFER_SLOTS
@@ -815,7 +818,7 @@ def _sparse_attn_wave(
                     qk_sb = qk_tick
                     if pl.read(valid_block_mask, [qk_t, qk_sb]) > 0:
                         qk_slot = qk_core * QK_TRANSFER_SLOTS + qk_sb % QK_TRANSFER_SLOTS
-                        qk_kv_row = qk_local_t * PREFILL_SPARSE_PAD + qk_sb * PREFILL_ATTN_TILE
+                        qk_kv_row = (qk_sb * PREFILL_QUERY_TILE + qk_local_t) * PREFILL_ATTN_TILE
                         qk_transfer_row = qk_slot * H
                         qk_kv = pl.load(
                             sparse_kv, [qk_kv_row, 0], [PREFILL_ATTN_TILE, HEAD_DIM],
@@ -831,7 +834,7 @@ def _sparse_attn_wave(
                     pv_sb = qk_tick - QK_PRE_LAUNCH
                     if pl.read(valid_block_mask, [qk_t, pv_sb]) > 0:
                         pv_slot = qk_core * QK_TRANSFER_SLOTS + pv_sb % QK_TRANSFER_SLOTS
-                        pv_kv_row = qk_local_t * PREFILL_SPARSE_PAD + pv_sb * PREFILL_ATTN_TILE
+                        pv_kv_row = (pv_sb * PREFILL_QUERY_TILE + qk_local_t) * PREFILL_ATTN_TILE
                         pv_transfer_row = pv_slot * H
                         pl.system.sync_wait(QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
                         pv_probability = pl.load(
