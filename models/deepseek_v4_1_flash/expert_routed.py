@@ -337,34 +337,6 @@ def _routed_w13(
     return pair, compact_weights
 
 
-@pl.jit.inline(auto_scope=False)
-def _w13_decode_fp4_nd(
-    packed: pl.Tile[[128, 128], pl.UINT8, pl.Mem.Vec],
-    lut_bytes: pl.Tile[[512], pl.UINT8, pl.Mem.Vec],
-    codes_flat: pl.Tile[[32768], pl.UINT8, pl.Mem.Vec],
-):
-    """Decode packed FP4 bytes into an ND FP8 tile."""
-    packed_flat = pl.reshape(packed, [128 * MX_PACKED_LANE_COLS])
-    codes_view = pl.reshape(codes_flat, [128 * W13_N_TILE])
-    with pl.reg_scope():
-        active = pl.reg.full_mask(lanes=256)
-        raw_table = pl.reg.load(lut_bytes, 0, lanes=256)
-        lanes = pl.reg.index_gen(0, lanes=256, dtype=pl.UINT8)
-        table_indices = pl.reg.shift_lefts(lanes, 1, active)
-        table = pl.reg.gather_lanes(raw_table, table_indices)
-        for step in pl.hardware_loop(64):
-            values = pl.reg.load(packed_flat, step * 256, lanes=256)
-            high_nibble = pl.reg.shift_rights(values, 4, active)
-            low = pl.reg.gather_lanes(table, values)
-            high = pl.reg.gather_lanes(table, high_nibble)
-            first, second = pl.reg.intlv(low, high, active)
-            first_offset = step * 512
-            second_offset = first_offset + 256
-            first_store = pl.reg.store(codes_view, first_offset, first, active)
-            second_store = pl.reg.store(codes_view, second_offset, second, active)
-    codes = pl.reshape(codes_flat, [128, W13_N_TILE])
-    signed_codes = pl.reinterpret_view(codes, pl.INT8)
-    return pl.reinterpret_view(signed_codes, pl.FP8E4M3FN)
 
 
 @pl.jit.incore(level=pl.Level.AIC)
@@ -452,10 +424,6 @@ def routed_w13_nz_vector(
     lane = pl.tile.get_subblock_idx()
     peer_ring = pl.system.import_peer_buffer(name='w13_weight_ring', peer_func='routed_w13_nz_cube')
     pl.system.aiv_initialize_pipe(v2c_consumer_buf=peer_ring, dir_mask=2, slot_size=65536, slot_num=2, id=0)
-    decoded: pl.Tile[[32768], pl.UINT8, pl.MemRef("w13_decoded"), pl.Mem.Vec] = pl.tile.create([128 * W13_N_TILE], dtype=pl.UINT8, target_memory=pl.Mem.Vec)
-    lut = pl.load(fp4_lut, [0, 0], [1, FP4_LUT_SIZE], target_memory=pl.Mem.Vec)
-    lut_codes = pl.reinterpret_view(lut, pl.UINT8)
-    lut_bytes = pl.reshape(lut_codes, [2 * FP4_LUT_SIZE])
     w1_flat = pl.tensor.view(w1, [experts * W13_PACKED_EXPERT_ROWS, MX_PACKED_LANE_COLS], layout=pl.ND)
     w3_flat = pl.tensor.view(w3, [experts * W13_PACKED_EXPERT_ROWS, MX_PACKED_LANE_COLS], layout=pl.ND)
     route_flat = pl.tensor.view(route_weights, [1, experts * stride], layout=pl.ND)
@@ -481,23 +449,23 @@ def routed_w13_nz_vector(
                             raw2: pl.Tile[[128, 128], pl.UINT8, pl.MemRef("w13_raw", slots=4)[2], pl.Mem.Vec] = pl.load(w1_flat, [panel + (2 * W13_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
                             raw3: pl.Tile[[128, 128], pl.UINT8, pl.MemRef("w13_raw", slots=4)[3], pl.Mem.Vec] = pl.load(w1_flat, [panel + (3 * W13_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
                             for batch in pl.unroll(0, D, 4 * W13_K_TILE):
-                                fp8 = _w13_decode_fp4_nd(raw0, lut_bytes, decoded)
-                                nz0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w13_nz", slots=2)[0], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.tile.move(fp8, target_memory=pl.Mem.Vec, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
+                                fp4_raw = pl.reinterpret_view(raw0, pl.FP4E2M1X2)
+                                nz0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w13_nz", slots=2)[0], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.cast(fp4_raw, pl.FP8E4M3FN, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
                                 if batch + 4 * W13_K_TILE < D:
                                     raw0: pl.Tile[[128, 128], pl.UINT8, pl.MemRef("w13_raw", slots=4)[0], pl.Mem.Vec] = pl.load(w1_flat, [panel + (batch + 4 * W13_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
                                 pl.system.tpush_to_aic(nz0, split=1, id=0)
-                                fp8 = _w13_decode_fp4_nd(raw1, lut_bytes, decoded)
-                                nz1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w13_nz", slots=2)[1], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.tile.move(fp8, target_memory=pl.Mem.Vec, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
+                                fp4_raw = pl.reinterpret_view(raw1, pl.FP4E2M1X2)
+                                nz1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w13_nz", slots=2)[1], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.cast(fp4_raw, pl.FP8E4M3FN, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
                                 if batch + 5 * W13_K_TILE < D:
                                     raw1: pl.Tile[[128, 128], pl.UINT8, pl.MemRef("w13_raw", slots=4)[1], pl.Mem.Vec] = pl.load(w1_flat, [panel + (batch + 5 * W13_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
                                 pl.system.tpush_to_aic(nz1, split=1, id=0)
-                                fp8 = _w13_decode_fp4_nd(raw2, lut_bytes, decoded)
-                                nz0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w13_nz", slots=2)[0], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.tile.move(fp8, target_memory=pl.Mem.Vec, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
+                                fp4_raw = pl.reinterpret_view(raw2, pl.FP4E2M1X2)
+                                nz0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w13_nz", slots=2)[0], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.cast(fp4_raw, pl.FP8E4M3FN, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
                                 if batch + 6 * W13_K_TILE < D:
                                     raw2: pl.Tile[[128, 128], pl.UINT8, pl.MemRef("w13_raw", slots=4)[2], pl.Mem.Vec] = pl.load(w1_flat, [panel + (batch + 6 * W13_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
                                 pl.system.tpush_to_aic(nz0, split=1, id=0)
-                                fp8 = _w13_decode_fp4_nd(raw3, lut_bytes, decoded)
-                                nz1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w13_nz", slots=2)[1], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.tile.move(fp8, target_memory=pl.Mem.Vec, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
+                                fp4_raw = pl.reinterpret_view(raw3, pl.FP4E2M1X2)
+                                nz1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w13_nz", slots=2)[1], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.cast(fp4_raw, pl.FP8E4M3FN, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
                                 if batch + 7 * W13_K_TILE < D:
                                     raw3: pl.Tile[[128, 128], pl.UINT8, pl.MemRef("w13_raw", slots=4)[3], pl.Mem.Vec] = pl.load(w1_flat, [panel + (batch + 7 * W13_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
                                 pl.system.tpush_to_aic(nz1, split=1, id=0)
@@ -507,23 +475,23 @@ def routed_w13_nz_vector(
                             raw2: pl.Tile[[128, 128], pl.UINT8, pl.MemRef("w13_raw", slots=4)[2], pl.Mem.Vec] = pl.load(w3_flat, [panel + (2 * W13_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
                             raw3: pl.Tile[[128, 128], pl.UINT8, pl.MemRef("w13_raw", slots=4)[3], pl.Mem.Vec] = pl.load(w3_flat, [panel + (3 * W13_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
                             for batch in pl.unroll(0, D, 4 * W13_K_TILE):
-                                fp8 = _w13_decode_fp4_nd(raw0, lut_bytes, decoded)
-                                nz0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w13_nz", slots=2)[0], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.tile.move(fp8, target_memory=pl.Mem.Vec, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
+                                fp4_raw = pl.reinterpret_view(raw0, pl.FP4E2M1X2)
+                                nz0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w13_nz", slots=2)[0], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.cast(fp4_raw, pl.FP8E4M3FN, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
                                 if batch + 4 * W13_K_TILE < D:
                                     raw0: pl.Tile[[128, 128], pl.UINT8, pl.MemRef("w13_raw", slots=4)[0], pl.Mem.Vec] = pl.load(w3_flat, [panel + (batch + 4 * W13_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
                                 pl.system.tpush_to_aic(nz0, split=1, id=0)
-                                fp8 = _w13_decode_fp4_nd(raw1, lut_bytes, decoded)
-                                nz1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w13_nz", slots=2)[1], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.tile.move(fp8, target_memory=pl.Mem.Vec, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
+                                fp4_raw = pl.reinterpret_view(raw1, pl.FP4E2M1X2)
+                                nz1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w13_nz", slots=2)[1], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.cast(fp4_raw, pl.FP8E4M3FN, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
                                 if batch + 5 * W13_K_TILE < D:
                                     raw1: pl.Tile[[128, 128], pl.UINT8, pl.MemRef("w13_raw", slots=4)[1], pl.Mem.Vec] = pl.load(w3_flat, [panel + (batch + 5 * W13_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
                                 pl.system.tpush_to_aic(nz1, split=1, id=0)
-                                fp8 = _w13_decode_fp4_nd(raw2, lut_bytes, decoded)
-                                nz0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w13_nz", slots=2)[0], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.tile.move(fp8, target_memory=pl.Mem.Vec, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
+                                fp4_raw = pl.reinterpret_view(raw2, pl.FP4E2M1X2)
+                                nz0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w13_nz", slots=2)[0], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.cast(fp4_raw, pl.FP8E4M3FN, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
                                 if batch + 6 * W13_K_TILE < D:
                                     raw2: pl.Tile[[128, 128], pl.UINT8, pl.MemRef("w13_raw", slots=4)[2], pl.Mem.Vec] = pl.load(w3_flat, [panel + (batch + 6 * W13_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
                                 pl.system.tpush_to_aic(nz0, split=1, id=0)
-                                fp8 = _w13_decode_fp4_nd(raw3, lut_bytes, decoded)
-                                nz1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w13_nz", slots=2)[1], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.tile.move(fp8, target_memory=pl.Mem.Vec, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
+                                fp4_raw = pl.reinterpret_view(raw3, pl.FP4E2M1X2)
+                                nz1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w13_nz", slots=2)[1], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.cast(fp4_raw, pl.FP8E4M3FN, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
                                 if batch + 7 * W13_K_TILE < D:
                                     raw3: pl.Tile[[128, 128], pl.UINT8, pl.MemRef("w13_raw", slots=4)[3], pl.Mem.Vec] = pl.load(w3_flat, [panel + (batch + 7 * W13_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
                                 pl.system.tpush_to_aic(nz1, split=1, id=0)
@@ -750,22 +718,15 @@ W2_SCALE_RESIDENT_TILE = ((H_SCALE + 31) // 32) * 32
 W2_SCALE_RESIDENT_WORD_TILE = W2_SCALE_RESIDENT_TILE // 2
 W2_SCALE_INDEX_TILE = W2_HALF_M_TILE * (W2_SCALE_K_TILE // 2)
 W2_SCALE_TMP_TILE = ((64 + (W2_HALF_M_TILE // 16) * W2_SCALE_K_TILE + 31) // 32) * 32
-W2_DECODE_LANES_TILE = 256
-W2_DECODE_STEPS_TILE = 128 * MX_PACKED_LANE_COLS // W2_DECODE_LANES_TILE
 
 
 @pl.jit.inline(auto_scope=False)
-def _w2_pack_scale_decode_fp4_nd(
-    packed: pl.Tile[[128, 128], pl.UINT8, pl.Mem.Vec],
-    lut_bytes: pl.Tile[[512], pl.UINT8, pl.Mem.Vec],
-    codes_flat: pl.Tile[[32768], pl.UINT8, pl.Mem.Vec],
+def _w2_pack_scale_packet(
     scale_source: pl.Tile[[1, W2_HALF_M_TILE * W2_SCALE_RESIDENT_WORD_TILE], pl.INT16, pl.Mem.Vec],
     scale_packet_words: pl.Tile[[W2_SCALE_INDEX_TILE], pl.INT16, pl.Mem.Vec],
     word_offset: pl.Scalar[pl.UINT16],
 ):
-    """Pack scale bytes and decode FP4 weights in one register scope."""
-    packed_flat = pl.reshape(packed, [128 * MX_PACKED_LANE_COLS])
-    codes_view = pl.reshape(codes_flat, [128 * W2_N_TILE])
+    """Pack the current activation-scale packet into its physical ZZ order."""
     source_flat = pl.reshape(scale_source, [W2_HALF_M_TILE * W2_SCALE_RESIDENT_WORD_TILE])
     words_view = pl.reshape(scale_packet_words, [W2_SCALE_INDEX_TILE])
     with pl.reg_scope():
@@ -784,24 +745,7 @@ def _w2_pack_scale_decode_fp4_nd(
         source_indices = pl.reg.adds(base, word_offset, active_scale)
         scale_codes = pl.reg.gather(source_flat, source_indices, active_scale)
         scale_stored = pl.reg.store(words_view, 0, scale_codes, active_scale)
-        active = pl.reg.full_mask(lanes=W2_DECODE_LANES_TILE)
-        raw_table = pl.reg.load(lut_bytes, 0, lanes=W2_DECODE_LANES_TILE)
-        lanes = pl.reg.index_gen(0, lanes=W2_DECODE_LANES_TILE, dtype=pl.UINT8)
-        table_indices = pl.reg.shift_lefts(lanes, 1, active)
-        table = pl.reg.gather_lanes(raw_table, table_indices)
-        for step in pl.hardware_loop(W2_DECODE_STEPS_TILE):
-            values = pl.reg.load(packed_flat, step * W2_DECODE_LANES_TILE, lanes=W2_DECODE_LANES_TILE)
-            high_nibble = pl.reg.shift_rights(values, 4, active)
-            low = pl.reg.gather_lanes(table, values)
-            high = pl.reg.gather_lanes(table, high_nibble)
-            first, second = pl.reg.intlv(low, high, active)
-            first_offset = step * 2 * W2_DECODE_LANES_TILE
-            second_offset = first_offset + W2_DECODE_LANES_TILE
-            first_store = pl.reg.store(codes_view, first_offset, first, active)
-            second_store = pl.reg.store(codes_view, second_offset, second, active)
-    codes = pl.reshape(codes_flat, [128, W2_N_TILE])
-    signed_codes = pl.reinterpret_view(codes, pl.INT8)
-    return pl.reinterpret_view(signed_codes, pl.FP8E4M3FN)
+    return scale_stored
 
 
 @pl.jit.incore(level=pl.Level.AIC)
@@ -869,14 +813,10 @@ def routed_w2_nz_vector(
     lane = pl.tile.get_subblock_idx()
     peer_ring = pl.system.import_peer_buffer(name='w2_weight_ring', peer_func='routed_w2_nz_cube')
     pl.system.aiv_initialize_pipe(v2c_consumer_buf=peer_ring, dir_mask=2, slot_size=65536, slot_num=2, id=0)
-    decoded: pl.Tile[[32768], pl.UINT8, pl.MemRef("w2_decoded"), pl.Mem.Vec] = pl.tile.create([128 * W2_N_TILE], dtype=pl.UINT8, target_memory=pl.Mem.Vec)
     scale_fp8: pl.Tile[[W2_HALF_M_TILE, W2_SCALE_K_TILE], pl.FP8E8M0, pl.MemRef("w2_scale_packet"), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([W2_HALF_M_TILE, W2_SCALE_K_TILE], dtype=pl.FP8E8M0, target_memory=pl.Mem.Vec)
     scale_packet_codes = pl.reinterpret_view(scale_fp8, pl.UINT8)
     scale_packet_bytes = pl.reshape(scale_packet_codes, [W2_HALF_M_TILE * W2_SCALE_K_TILE])
     scale_packet_words = pl.reinterpret_view(scale_packet_bytes, pl.INT16)
-    lut = pl.load(fp4_lut, [0, 0], [1, 256], target_memory=pl.Mem.Vec)
-    lut_codes = pl.reinterpret_view(lut, pl.UINT8)
-    lut_bytes = pl.reshape(lut_codes, [2 * FP4_LUT_SIZE])
     weight_flat = pl.tensor.view(weight, [experts * MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], layout=pl.ND)
     scale_nd = pl.tensor.view(scales, [payload.shape[0], H_SCALE], layout=pl.ND)
     core = pl.tile.get_block_idx()
@@ -904,52 +844,42 @@ def routed_w2_nz_vector(
                     raw2: pl.Tile[[128, 128], pl.UINT8, pl.MemRef("w2_raw", slots=4)[2], pl.Mem.Vec] = pl.load(weight_flat, [panel + (2 * W2_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
                     raw3: pl.Tile[[128, 128], pl.UINT8, pl.MemRef("w2_raw", slots=4)[3], pl.Mem.Vec] = pl.load(weight_flat, [panel + (3 * W2_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
                     scale_word_offset = pl.cast(0, pl.UINT16)
-                    fp8 = _w2_pack_scale_decode_fp4_nd(
-                        raw0, lut_bytes, decoded,
-                        scale_source, scale_packet_words, scale_word_offset,
-                    )
+                    _scale_packet_ready = _w2_pack_scale_packet(scale_source, scale_packet_words, scale_word_offset)
+                    fp4_raw = pl.reinterpret_view(raw0, pl.FP4E2M1X2)
                     pl.system.tpush_to_aic(scale_fp8, split=1, id=0)
-                    nz0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w2_nz", slots=2)[0], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.tile.move(fp8, target_memory=pl.Mem.Vec, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
+                    nz0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w2_nz", slots=2)[0], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.cast(fp4_raw, pl.FP8E4M3FN, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
                     raw0: pl.Tile[[128, 128], pl.UINT8, pl.MemRef("w2_raw", slots=4)[0], pl.Mem.Vec] = pl.load(weight_flat, [panel + (4 * W2_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
                     pl.system.tpush_to_aic(nz0, split=1, id=0)
                     for batch in pl.unroll(W2_K_TILE, MOE_INTER, 4 * W2_K_TILE):
                         scale_word_offset = pl.cast(batch // (2 * MX_GROUP), pl.UINT16)
-                        fp8 = _w2_pack_scale_decode_fp4_nd(
-                            raw1, lut_bytes, decoded,
-                            scale_source, scale_packet_words, scale_word_offset,
-                        )
+                        _scale_packet_ready = _w2_pack_scale_packet(scale_source, scale_packet_words, scale_word_offset)
+                        fp4_raw = pl.reinterpret_view(raw1, pl.FP4E2M1X2)
                         pl.system.tpush_to_aic(scale_fp8, split=1, id=0)
-                        nz1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w2_nz", slots=2)[1], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.tile.move(fp8, target_memory=pl.Mem.Vec, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
+                        nz1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w2_nz", slots=2)[1], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.cast(fp4_raw, pl.FP8E4M3FN, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
                         if batch + 4 * W2_K_TILE < MOE_INTER:
                             raw1: pl.Tile[[128, 128], pl.UINT8, pl.MemRef("w2_raw", slots=4)[1], pl.Mem.Vec] = pl.load(weight_flat, [panel + (batch + 4 * W2_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
                         pl.system.tpush_to_aic(nz1, split=1, id=0)
                         scale_word_offset = pl.cast((batch + W2_K_TILE) // (2 * MX_GROUP), pl.UINT16)
-                        fp8 = _w2_pack_scale_decode_fp4_nd(
-                            raw2, lut_bytes, decoded,
-                            scale_source, scale_packet_words, scale_word_offset,
-                        )
+                        _scale_packet_ready = _w2_pack_scale_packet(scale_source, scale_packet_words, scale_word_offset)
+                        fp4_raw = pl.reinterpret_view(raw2, pl.FP4E2M1X2)
                         pl.system.tpush_to_aic(scale_fp8, split=1, id=0)
-                        nz0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w2_nz", slots=2)[0], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.tile.move(fp8, target_memory=pl.Mem.Vec, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
+                        nz0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w2_nz", slots=2)[0], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.cast(fp4_raw, pl.FP8E4M3FN, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
                         if batch + 5 * W2_K_TILE < MOE_INTER:
                             raw2: pl.Tile[[128, 128], pl.UINT8, pl.MemRef("w2_raw", slots=4)[2], pl.Mem.Vec] = pl.load(weight_flat, [panel + (batch + 5 * W2_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
                         pl.system.tpush_to_aic(nz0, split=1, id=0)
                         scale_word_offset = pl.cast((batch + 2 * W2_K_TILE) // (2 * MX_GROUP), pl.UINT16)
-                        fp8 = _w2_pack_scale_decode_fp4_nd(
-                            raw3, lut_bytes, decoded,
-                            scale_source, scale_packet_words, scale_word_offset,
-                        )
+                        _scale_packet_ready = _w2_pack_scale_packet(scale_source, scale_packet_words, scale_word_offset)
+                        fp4_raw = pl.reinterpret_view(raw3, pl.FP4E2M1X2)
                         pl.system.tpush_to_aic(scale_fp8, split=1, id=0)
-                        nz1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w2_nz", slots=2)[1], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.tile.move(fp8, target_memory=pl.Mem.Vec, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
+                        nz1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w2_nz", slots=2)[1], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.cast(fp4_raw, pl.FP8E4M3FN, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
                         if batch + 6 * W2_K_TILE < MOE_INTER:
                             raw3: pl.Tile[[128, 128], pl.UINT8, pl.MemRef("w2_raw", slots=4)[3], pl.Mem.Vec] = pl.load(weight_flat, [panel + (batch + 6 * W2_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
                         pl.system.tpush_to_aic(nz1, split=1, id=0)
                         scale_word_offset = pl.cast((batch + 3 * W2_K_TILE) // (2 * MX_GROUP), pl.UINT16)
-                        fp8 = _w2_pack_scale_decode_fp4_nd(
-                            raw0, lut_bytes, decoded,
-                            scale_source, scale_packet_words, scale_word_offset,
-                        )
+                        _scale_packet_ready = _w2_pack_scale_packet(scale_source, scale_packet_words, scale_word_offset)
+                        fp4_raw = pl.reinterpret_view(raw0, pl.FP4E2M1X2)
                         pl.system.tpush_to_aic(scale_fp8, split=1, id=0)
-                        nz0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w2_nz", slots=2)[0], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.tile.move(fp8, target_memory=pl.Mem.Vec, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
+                        nz0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("w2_nz", slots=2)[0], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.cast(fp4_raw, pl.FP8E4M3FN, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)
                         if batch + 7 * W2_K_TILE < MOE_INTER:
                             raw0: pl.Tile[[128, 128], pl.UINT8, pl.MemRef("w2_raw", slots=4)[0], pl.Mem.Vec] = pl.load(weight_flat, [panel + (batch + 7 * W2_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
                         pl.system.tpush_to_aic(nz0, split=1, id=0)
@@ -1710,7 +1640,7 @@ def build_w13_specs(case="bounds", *, tail_offset=0, with_lut=False):
         TensorSpec("w3_scale", [N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], e8m0, init_value=lambda: routed_weights()[3]),
         TensorSpec("route_weights", [N_LOCAL_EXPERTS * RECV_MAX, 1], torch.float32, init_value=lambda: activations()[2]),
     ]
-    # Only the PyPTO entry decodes weights on device, so only it takes the table.
+    # Retain the legacy LUT argument for validation ABI compatibility; direct FP4 casts do not read it.
     if with_lut:
         specs.append(TensorSpec("fp4_lut", [1, FP4_LUT_SIZE], torch.int16, init_value=build_fp4_lut()))
     specs += [
