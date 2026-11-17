@@ -14,13 +14,13 @@
 
 using namespace pto;
 namespace {
-constexpr int Rows = 8;
+constexpr int Rows = 4;
 constexpr int TopK = 6;
 template <typename T, int R, int C>
 using Vec = Tile<TileType::Vec, T, R, C>;
 using Indices = Vec<int32_t, Rows, 8>;
 using Selected = Vec<float, Rows, 8>;
-using Denominator = Tile<TileType::Vec, float, Rows, 1, BLayout::ColMajor>;
+using Denominator = Tile<TileType::Vec, float, 8, 1, BLayout::ColMajor, Rows, 1>;
 
 template <typename T>
 __aicore__ inline __gm__ T* data(__gm__ int64_t* args, int index) {
@@ -30,73 +30,51 @@ __aicore__ inline __gm__ T* data(__gm__ int64_t* args, int index) {
 
 #if defined(__DAV_VEC__)
 #if defined(PTO_NPU_ARCH_A5)
-template <int RowStride>
-__tf__ __aicore__ inline void gather_indices(
-    Indices::TileDType __out__ output,
-    typename Vec<float, Rows, RowStride>::TileDType __in__ sorted) {
-    auto src = (__ubuf__ int32_t*)__cce_get_tile_ptr(sorted);
-    auto dst = (__ubuf__ int32_t*)__cce_get_tile_ptr(output);
+template <int Columns, int RowStride>
+__tf__ __aicore__ inline void publish_routes(
+    Indices::TileDType __out__ indices, Selected::TileDType __out__ weights,
+    typename Vec<float, Rows, RowStride>::TileDType __in__ sorted,
+    typename Vec<float, Rows, Columns>::TileDType __in__ scores, float route_scale) {
+    auto pairs = (__ubuf__ int32_t*)__cce_get_tile_ptr(sorted);
+    auto values = (__ubuf__ float*)__cce_get_tile_ptr(scores);
+    auto out_index = (__ubuf__ int32_t*)__cce_get_tile_ptr(indices);
+    auto out_weight = (__ubuf__ float*)__cce_get_tile_ptr(weights);
     __VEC_SCOPE__ {
-        MaskReg all = pset_b32(PAT_ALL);
-        RegTensor<uint32_t> lane, offset;
-        RegTensor<int32_t> index;
-        vci((RegTensor<int32_t>&)lane, 0, INC_ORDER);
-        vmuls(offset, lane, 2u, all, MODE_ZEROING);
-        if constexpr (RowStride != 16) {
-            RegTensor<uint32_t> row;
-            vshrs(row, lane, 3u, all, MODE_ZEROING);
-            vmuls(row, row, static_cast<uint32_t>(RowStride - 16), all, MODE_ZEROING);
-            vadd(offset, offset, row, all, MODE_ZEROING);
-        }
-        vadds(offset, offset, 1u, all, MODE_ZEROING);
-        vgather2(index, src, offset, all);
-        vsts(index, dst, 0, NORM_B32, all);
-    }
-}
-
-template <int Columns>
-__tf__ __aicore__ inline void gather_scores(
-    Selected::TileDType __out__ output, Indices::TileDType __in__ indices,
-    typename Vec<float, Rows, Columns>::TileDType __in__ scores) {
-    auto idx = (__ubuf__ int32_t*)__cce_get_tile_ptr(indices);
-    auto src = (__ubuf__ float*)__cce_get_tile_ptr(scores);
-    auto dst = (__ubuf__ float*)__cce_get_tile_ptr(output);
-    __VEC_SCOPE__ {
-        MaskReg all = pset_b32(PAT_ALL), active;
-        RegTensor<uint32_t> lane, row, column, bits, index, offset;
+        uint32_t count = Rows * 8;
+        MaskReg all = plt_b32(count, POST_UPDATE), active;
+        RegTensor<uint32_t> lane, row, column, bits, offset, index, ix1, ix2, ix4;
         vci((RegTensor<int32_t>&)lane, 0, INC_ORDER);
         vshrs(row, lane, 3u, all, MODE_ZEROING);
         vdup(bits, 7u, all, MODE_ZEROING);
         vand(column, lane, bits, all, MODE_ZEROING);
         vcmps_lt(active, column, static_cast<uint32_t>(TopK), all);
-        vlds((RegTensor<int32_t>&)index, idx, 0, NORM);
+        vmuls(offset, row, static_cast<uint32_t>(RowStride), all, MODE_ZEROING);
+        vmuls(index, column, 2u, all, MODE_ZEROING);
+        vadd(offset, offset, index, all, MODE_ZEROING);
+        vadds(offset, offset, 1u, all, MODE_ZEROING);
+        vgather2((RegTensor<int32_t>&)index, pairs, offset, all);
+        vsts((RegTensor<int32_t>&)index, out_index, 0, NORM_B32, all);
         vmuls(offset, row, static_cast<uint32_t>(Columns), all, MODE_ZEROING);
-        vadd(index, index, offset, all, MODE_ZEROING);
-        RegTensor<float> value, zero;
+        vadd(offset, offset, index, all, MODE_ZEROING);
+        RegTensor<float> value, zero, sum, shuffled;
         vdup(zero, 0.0f, all, MODE_ZEROING);
-        vgather2(value, src, index, all);
+        vgather2(value, values, offset, active);
         vsel(value, value, zero, active);
-        vsts(value, dst, 0, NORM_B32, all);
-    }
-}
-
-__tf__ __aicore__ inline void normalize_weights(
-    Selected::TileDType __out__ output, Selected::TileDType __in__ selected,
-    Denominator::TileDType __in__ denominator, float route_scale) {
-    auto src = (__ubuf__ float*)__cce_get_tile_ptr(selected);
-    auto inv = (__ubuf__ float*)__cce_get_tile_ptr(denominator);
-    auto dst = (__ubuf__ float*)__cce_get_tile_ptr(output);
-    __VEC_SCOPE__ {
-        MaskReg all = pset_b32(PAT_ALL);
-        RegTensor<uint32_t> lane, row;
-        vci((RegTensor<int32_t>&)lane, 0, INC_ORDER);
-        vshrs(row, lane, 3u, all, MODE_ZEROING);
-        RegTensor<float> value, divisor;
-        vlds(value, src, 0, NORM);
-        vgather2(divisor, inv, row, all);
-        vdiv(value, value, divisor, all, MODE_ZEROING);
+        vdup(bits, 1u, all, MODE_ZEROING);
+        vxor(ix1, lane, bits, all);
+        vdup(bits, 2u, all, MODE_ZEROING);
+        vxor(ix2, lane, bits, all);
+        vdup(bits, 4u, all, MODE_ZEROING);
+        vxor(ix4, lane, bits, all);
+        vselr((RegTensor<uint32_t>&)shuffled, (RegTensor<uint32_t>&)value, ix4);
+        vadd(sum, value, shuffled, all, MODE_ZEROING);
+        vselr((RegTensor<uint32_t>&)shuffled, (RegTensor<uint32_t>&)sum, ix2);
+        vadd(sum, sum, shuffled, all, MODE_ZEROING);
+        vselr((RegTensor<uint32_t>&)shuffled, (RegTensor<uint32_t>&)sum, ix1);
+        vadd(sum, sum, shuffled, all, MODE_ZEROING);
+        vdiv(value, value, sum, all, MODE_ZEROING);
         vmuls(value, value, route_scale, all, MODE_ZEROING);
-        vsts(value, dst, 0, NORM_B32, all);
+        vsts(value, out_weight, 0, NORM_B32, all);
     }
 }
 #endif
@@ -173,9 +151,13 @@ __aicore__ inline void run(__gm__ int64_t* args, int block) {
         pipe_barrier(PIPE_ALL);
     }
 #if defined(PTO_NPU_ARCH_A5)
-    if constexpr (Columns == 32) gather_indices<2 * Columns>(indices.data(), sorted32.data());
-    else if constexpr (Columns == 128) gather_indices<2 * Columns>(indices.data(), sorted64.data());
-    else gather_indices<16>(indices.data(), sorted.data());
+    if constexpr (Columns == 32) {
+        publish_routes<Columns, 2 * Columns>(indices.data(), weights.data(), sorted32.data(), scores.data(), route_scale);
+    } else if constexpr (Columns == 128) {
+        publish_routes<Columns, 2 * Columns>(indices.data(), weights.data(), sorted64.data(), scores.data(), route_scale);
+    } else {
+        publish_routes<Columns, 16>(indices.data(), weights.data(), sorted.data(), scores.data(), route_scale);
+    }
 #else
     for (int row = 0; row < Rows; ++row) {
         Vec<float, 1, 16> prefix;
@@ -186,13 +168,9 @@ __aicore__ inline void run(__gm__ int64_t* args, int block) {
         TASSIGN(row_indices, 167936 + row * 32);
         TGATHER<decltype(row_indices), decltype(prefix), MaskPattern::P1010>(row_indices, prefix);
     }
-#endif
     pipe_barrier(PIPE_ALL);
-#if defined(PTO_NPU_ARCH_A5)
-    gather_scores<Columns>(selected.data(), indices.data(), scores.data());
-#else
     Vec<int32_t, Rows, 8> offsets, row_index;
-    Vec<int32_t, 1, 64> linear;
+    Vec<int32_t, 1, Rows * 8> linear;
     Tile<TileType::Vec, float, Rows, 8, BLayout::RowMajor, DYNAMIC, DYNAMIC> gathered(Rows, 8);
     TASSIGN(offsets, 176128); TASSIGN(row_index, 176384); TASSIGN(linear, 176384);
     TASSIGN(gathered, 176640);
@@ -208,13 +186,9 @@ __aicore__ inline void run(__gm__ int64_t* args, int block) {
          SLayout::NoneBox, 512, PadValue::Zero> padded;
     TASSIGN(padded, 168192);
     TFILLPAD(padded, gathered);
-#endif
     pipe_barrier(PIPE_ALL);
     TROWSUM(denominator, selected, sum_scratch);
     pipe_barrier(PIPE_ALL);
-#if defined(PTO_NPU_ARCH_A5)
-    normalize_weights(weights.data(), selected.data(), denominator.data(), route_scale);
-#else
     TROWEXPANDDIV(weights, selected, denominator);
     TMULS(weights, weights, route_scale);
 #endif

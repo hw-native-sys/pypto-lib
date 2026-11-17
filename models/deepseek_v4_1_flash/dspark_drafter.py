@@ -11,23 +11,23 @@
 """DeepSeek V4.1 DSpark projection, metadata, and three-layer drafter."""
 
 from dataclasses import dataclass
+from pathlib import Path
 import inspect
 import pypto.language as pl
 
 from quant import unpack_quantized_cache
-from utils import packed_cache_compare
+from quant import packed_cache_compare
 
 import pypto.language.distributed as pld
 import torch
 
 import config as C
 from config import (
-    BLOCK_SIZE, B_DYN, EP_SIZE, FLASH, MOE_TOKENS, PREFILL_MAX_TOKENS, TP_SIZE, TABLE_DYN,
+    BLOCK_SIZE, B_DYN, EP_SIZE, FLASH, MOE_TOKENS, TABLE_DYN,
     WINDOW_CACHE_BYTES,
 )
-from o_proj import prefill_tp_output_all_reduce
-from rmsnorm import golden_rms_norm_tiled, rms_norm_tiled
-from hc import hc_head, hc_post, hc_pre, zero_bf16_padding
+from rmsnorm import golden_rms_norm_tiled, rms_norm
+from hc import hc_head, hc_head_norm, hc_project, hc_sinkhorn, zero_bf16_padding
 from expert_routed import (
     MX_PACKED_LANE_COLS,
     MX_W1_PACKED_ROWS,
@@ -36,11 +36,14 @@ from expert_routed import (
 )
 from input_pack import pack_x_hc
 from utils import paged_slots
-from decode_moe import AUX_WIDTH, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD, moe
+from pypto.runtime import pto_isa_include_dir
+from decode_moe import DISPATCH_PACKET_WIDTH, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD, moe
 
-from dspark_attention import dspark_attention
-from dspark_context_kv import dspark_context_kv
-from hc import golden_hc_collapse, golden_hc_post, golden_mhc_mixes
+from dspark_attention import dspark_attention_partial
+from o_proj import o_proj_hc_post
+from dspark_context_kv import dspark_context_kv_quantized
+from qkv_proj_rope import quantize_projection_input
+from hc import golden_hc_collapse, golden_hc_post, golden_hc_mixes
 from config import (
     DSPARK_DRAFT_LAYERS,
     DSPARK_N_ROUTED_EXPERTS,
@@ -58,8 +61,8 @@ MIX_HC = FLASH.mix_hc
 HEAD_DIM = FLASH.head_dim
 ROPE_DIM = FLASH.qk_rope_head_dim
 Q_LORA = FLASH.q_lora_rank
-LOCAL_H = FLASH.num_attention_heads // TP_SIZE
-LOCAL_O_GROUPS = FLASH.o_groups // TP_SIZE
+LOCAL_H = FLASH.num_attention_heads
+LOCAL_O_GROUPS = FLASH.o_groups
 O_LORA = FLASH.o_lora_rank
 O_GROUP_IN = FLASH.num_attention_heads * HEAD_DIM // FLASH.o_groups
 LOCAL_O_WIDTH = LOCAL_O_GROUPS * O_LORA
@@ -72,8 +75,8 @@ TOPK = DSPARK_NUM_EXPERTS_PER_TOK
 
 MAIN_IN = DSPARK_DRAFT_LAYERS * D
 DSPARK_WINDOW = FLASH.sliding_window
-T_DYN = pl.dynamic("V41_DSPARK_CONTEXT_T_DYN")
-DSPARK_QUERY_T_DYN = pl.dynamic("V41_DSPARK_QUERY_T_DYN")
+T_DYN = pl.dynamic("DSPARK_CONTEXT_T_DYN")
+DSPARK_QUERY_T_DYN = pl.dynamic("DSPARK_QUERY_T_DYN")
 DSPARK_CHUNK_REQUESTS = MOE_TOKENS // DSPARK_QUERY_WIDTH
 DSPARK_CHUNK_TOKENS = DSPARK_CHUNK_REQUESTS * DSPARK_QUERY_WIDTH
 assert DSPARK_CHUNK_REQUESTS > 0
@@ -181,6 +184,18 @@ def golden_query_metadata(
     return DSparkQueryMetadata(token_ids, positions, query_slots, window_indices, window_lens)
 
 
+@pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "dspark_projection.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _dspark_projection_native(
+    target_hidden: pl.Tensor,
+    main_proj_weight: pl.Tensor,
+    projected: pl.Out[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+) -> pl.Tensor:
+    """Project target taps directly into BF16 rows with Cube Fixpipe stores."""
+    ...
+
+
 @pl.jit.inline(auto_scope=False)
 def dspark_proj(
     target_hidden: pl.Tensor[[T_DYN, MAIN_IN], pl.BF16],
@@ -192,20 +207,9 @@ def dspark_proj(
     """Project the ordered target taps and normalize only active token rows."""
     tokens = pl.tensor.dim(target_hidden, 0)
     projected = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    for block in pl.spmd((num_tokens + 15) // 16 * (D // 128), name_hint="dspark_main_proj"):
-        row = block // (D // 128) * 16
-        col = block % (D // 128) * 128
-        rows = pl.min(16, num_tokens - row)
-        acc = pl.create_tensor([16, 128], dtype=pl.FP32)
-        for k in pl.range(0, MAIN_IN, 256):
-            source = pl.slice(target_hidden, [16, 256], [row, k], valid_shape=[rows, 256])
-            weight = pl.slice(main_proj_weight, [256, 128], [k, col])
-            acc = pl.matmul_acc(acc, source, weight, init_cond=(k == 0))
-        projected[row : row + 16, col : col + 128] = pl.set_validshape(
-            pl.cast(acc, pl.BF16, mode="rint"), rows, 128
-        )
-    for block in pl.spmd((num_tokens + 7) // 8, name_hint="dspark_main_norm"):
-        rms_norm_tiled(projected, main_norm_weight, main_x, block, num_tokens, output_fp32=False)
+    with pl.spmd(32, name_hint="dspark_main_proj") as projected_ready:
+        projected = _dspark_projection_native(target_hidden, main_proj_weight, projected, num_tokens)
+    rms_norm(projected, main_norm_weight, main_x, num_tokens, width=D, zero_tail=False)
     return main_x
 
 
@@ -222,6 +226,22 @@ def dspark_proj_test(
     return dspark_proj(target_hidden, main_proj_weight, main_norm_weight, main_x, num_tokens)
 
 
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "dspark_metadata.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _dspark_metadata_native(
+    anchor_ids: pl.Tensor,
+    first_query_positions: pl.Tensor,
+    block_tables: pl.Tensor,
+    query_ids: pl.Out[pl.Tensor],
+    query_positions: pl.Out[pl.Tensor],
+    query_slots: pl.Out[pl.Tensor],
+    window_indices: pl.Out[pl.Tensor],
+    window_lens: pl.Out[pl.Tensor],
+) -> pl.Tensor:
+    """Publish draft query metadata from paged request tables."""
+    ...
+
+
 @pl.jit.inline(auto_scope=False)
 def dspark_metadata(
     anchor_ids: pl.Tensor[[B_DYN], pl.INT64],
@@ -234,49 +254,34 @@ def dspark_metadata(
     window_lens: pl.Tensor[[DSPARK_DRAFT_LAYERS, B_DYN], pl.INT32],
 ):
     batch = pl.tensor.dim(anchor_ids, 0)
-    for worker in pl.spmd(1, name_hint="dspark_query_metadata"):
-        for request_offset in pl.range(batch):
-            request = worker + request_offset
-            first = pl.read(first_query_positions, [request])
-            anchor = pl.read(anchor_ids, [request])
-            active = first > 0
-            prefix_start = pl.max(first - DSPARK_WINDOW, 0)
-            context_len = first - prefix_start
-            visible_len = pl.cast(context_len + DSPARK_QUERY_WIDTH, pl.INT32)
-            if not active:
-                visible_len = pl.cast(0, pl.INT32)
-            for offset in pl.range(DSPARK_QUERY_WIDTH):
-                token = request * DSPARK_QUERY_WIDTH + offset
-                token_id = pl.cast(0, pl.INT64)
-                if active:
-                    token_id = pl.cast(DSPARK_NOISE_TOKEN_ID, pl.INT64)
-                if active and offset == 0:
-                    token_id = anchor
-                pl.write(query_ids, [token], token_id)
-                position = pl.cast(0, pl.INT32)
-                if active:
-                    position = pl.cast(first + offset, pl.INT32)
-                pl.write(query_positions, [token], position)
-            for layer in pl.range(DSPARK_DRAFT_LAYERS):
-                pl.write(window_lens, [layer, request], pl.cast(visible_len, pl.INT32))
-                for query in pl.range(DSPARK_QUERY_WIDTH):
-                    token = request * DSPARK_QUERY_WIDTH + query
-                    pl.write(query_slots, [layer, token], pl.cast(-1, pl.INT64))
-                for offset in pl.range(DSPARK_SWA_INDEX_WIDTH):
-                    slot = pl.cast(-1, pl.INT32)
-                    if offset < visible_len:
-                        position = pl.cast(prefix_start + offset, pl.INT32)
-                        logical_block = position // BLOCK_SIZE
-                        physical_block = pl.read(
-                            block_tables, [layer, request, pl.cast(logical_block, pl.INDEX)]
-                        )
-                        slot = pl.cast(physical_block * BLOCK_SIZE + position % BLOCK_SIZE, pl.INT32)
-                    for query in pl.range(DSPARK_QUERY_WIDTH):
-                        token = request * DSPARK_QUERY_WIDTH + query
-                        pl.write(window_indices, [layer, token, offset], slot)
-                        if active and offset == context_len + query:
-                            pl.write(query_slots, [layer, token], pl.cast(slot, pl.INT64))
+    workers = pl.max(1, pl.min(batch * DSPARK_DRAFT_LAYERS, 64))
+    with pl.spmd(workers, name_hint="dspark_query_metadata"):
+        query_ids = _dspark_metadata_native(
+            anchor_ids, first_query_positions, block_tables, query_ids, query_positions,
+            query_slots, window_indices, window_lens,
+        )
     return query_ids, query_positions, query_slots, window_indices, window_lens
+
+
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "dspark_pad_queries.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _dspark_pad_queries_native(
+    query_ids: pl.Tensor,
+    query_slots: pl.Tensor,
+    window_indices: pl.Tensor,
+    query_rope_cos: pl.Tensor,
+    query_rope_sin: pl.Tensor,
+    padded_ids: pl.Out[pl.Tensor],
+    padded_slots: pl.Out[pl.Tensor],
+    padded_indices: pl.Out[pl.Tensor],
+    rope_cos: pl.Out[pl.Tensor],
+    rope_sin: pl.Out[pl.Tensor],
+    pre_mix: pl.Out[pl.Tensor],
+    first_token: pl.Scalar[pl.INDEX],
+    active_tokens: pl.Scalar[pl.INDEX],
+) -> tuple[pl.Tensor, pl.Tensor, pl.Tensor, pl.Tensor, pl.Tensor, pl.Tensor]:
+    """Pack one query chunk and initialize its incoming HC coefficients."""
+    return padded_ids, padded_slots, padded_indices, rope_cos, rope_sin, pre_mix
 
 
 @pl.jit.inline
@@ -343,37 +348,26 @@ def draft_layer(
     next_pre_mix: pl.Tensor,
     x_mixed: pl.Tensor,
     x_next: pl.Tensor,
-    attention_output_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, D], pl.BF16],
-    attention_output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     recv_meta: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
-    recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
-    recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
+    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], pl.INT8],
     recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
     data_arrived: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
-    routed_output: pld.DistributedTensor[[C.ROUTE_T_DYN, D], pl.BF16],
+    routed_output: pld.DistributedTensor,
     combine_arrived: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     rank: pl.Scalar[pl.INT32],
-    attention_epoch: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
-    """Run one V4.1 draft decoder layer with delayed mHC boundaries."""
-    attention_input = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
+    """Run one V4.1 draft decoder layer with delayed HC boundaries."""
     normalized_attention = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
     attention_pre_mix = pl.create_tensor([MOE_TOKENS, HC_MULT], dtype=pl.FP32)
     post_mix = pl.create_tensor([MOE_TOKENS, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([MOE_TOKENS, HC_MULT, HC_MULT], dtype=pl.FP32)
-    hc_pre(
-        x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-        attention_input, attention_pre_mix, post_mix, residual_mix,
-        rms_worker_limit=64, head_worker_limit=64,
-    )
-    for block in pl.spmd((MOE_TOKENS + 7) // 8, name_hint="dspark_attn_norm"):
-        rms_norm_tiled(attention_input, attn_norm_weight, normalized_attention, block, MOE_TOKENS, output_fp32=False)
+    hc_head_norm(x_hc, incoming_pre_mix, attn_norm_weight, normalized_attention, worker_limit=64)
+    inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
+    hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, attention_pre_mix, post_mix, residual_mix)
     zero_bf16_padding(normalized_attention, num_tokens)
-    attention_partial = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
-    dspark_attention(
+    attended, window_cache = dspark_attention_partial(
         normalized_attention,
         wq_a,
         wq_a_scale,
@@ -384,35 +378,19 @@ def draft_layer(
         wkv_scale,
         kv_norm_weight,
         attn_sink,
-        wo_a,
-        wo_a_scale,
-        wo_b,
-        wo_b_scale,
         rope_cos,
         rope_sin,
         window_slots,
         window_indices,
         window_cache,
-        attention_partial,
         num_tokens,
     )
-    attention_output = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
-    group_base = rank // TP_SIZE * TP_SIZE
-    tp_rank = rank % TP_SIZE
-    prefill_tp_output_all_reduce(
-        attention_partial,
-        attention_output_window,
-        attention_output_arrived,
-        attention_output,
-        group_base,
-        tp_rank,
-        num_tokens,
-        attention_epoch,
-    )
-    zero_bf16_padding(attention_output, num_tokens)
     attention_hidden = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
-    hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden, deps=hc_post_deps)
+    o_proj_hc_post(
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+        x_hc, post_mix, residual_mix, attention_hidden, num_tokens,
+        oa_row_tile=80, ob_row_tile=128,
+    )
     force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
     moe(
         attention_hidden,
@@ -439,17 +417,14 @@ def draft_layer(
         x_mixed,
         x_next,
         recv_meta,
-        recv_x,
-        recv_scale,
-        recv_weights,
-        recv_routes,
+        recv_x, recv_routes,
         data_arrived,
         routed_output,
         combine_arrived,
         num_tokens,
         rank,
         moe_epoch,
-        force_topk, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
+        force_topk, local_experts=N_LOCAL_EXPERTS, topk=TOPK, dispatch_worker_limit=64,
     )
     return x_next, next_pre_mix
 
@@ -521,18 +496,13 @@ def _dspark_drafter(
     shared_w3: pl.Tensor[[DSPARK_DRAFT_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w3_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
     head_hidden: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16]],
-    attention_output_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, D], pl.BF16],
-    attention_output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     recv_meta: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
-    recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
-    recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
+    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], pl.INT8],
     recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
     data_arrived: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
-    routed_output: pld.DistributedTensor[[C.ROUTE_T_DYN, D], pl.BF16],
+    routed_output: pld.DistributedTensor,
     combine_arrived: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
     rank: pl.Scalar[pl.INT32],
-    attention_epoch: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     """Compose three draft layers and return five head rows per request.
@@ -581,10 +551,16 @@ def _dspark_drafter(
         window_lens,
     )
 
+    context_payload, context_scales, context_padded_rows = quantize_projection_input(
+        main_x, context_tokens, row_tile=80,
+    )
     for layer in pl.unroll(DSPARK_DRAFT_LAYERS):
         layer_wkv_scale: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[layer]
-        dspark_context_kv(
-            main_x,
+        context_projected = pl.create_tensor([context_tokens, HEAD_DIM], dtype=pl.BF16)
+        dspark_context_kv_quantized(
+            context_payload,
+            context_scales,
+            context_projected,
             wkv[layer],
             layer_wkv_scale,
             kv_norm_weight[layer],
@@ -605,36 +581,15 @@ def _dspark_drafter(
         )
         rope_cos = pl.create_tensor([MOE_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
         rope_sin = pl.create_tensor([MOE_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
-        for _ in pl.spmd(1, name_hint="dspark_pad_queries"):
-            for token in pl.range(MOE_TOKENS):
-                token_id = pl.cast(0, pl.INT64)
-                if token < active_tokens:
-                    source = first_token + token
-                    token_id = pl.read(query_ids, [source])
-                    rope_cos[token : token + 1, :] = query_rope_cos[source : source + 1, :]
-                    rope_sin[token : token + 1, :] = query_rope_sin[source : source + 1, :]
-                pl.write(padded_ids, [token], token_id)
-                for layer in pl.range(DSPARK_DRAFT_LAYERS):
-                    slot = pl.cast(-1, pl.INT64)
-                    if token < active_tokens:
-                        slot = pl.read(query_slots, [layer, first_token + token])
-                    pl.write(padded_slots, [layer, token], slot)
-                    for offset in pl.range(DSPARK_SWA_INDEX_WIDTH):
-                        index = pl.cast(-1, pl.INT32)
-                        if token < active_tokens:
-                            index = pl.read(window_indices, [layer, first_token + token, offset])
-                        pl.write(padded_indices, [layer, token, offset], index)
-
+        pre_mix = pl.create_tensor([MOE_TOKENS, HC_MULT], dtype=pl.FP32)
+        with pl.spmd(64, name_hint="dspark_pad_queries"):
+            padded_ids, padded_slots, padded_indices, rope_cos, rope_sin, pre_mix = _dspark_pad_queries_native(
+                query_ids, query_slots, window_indices, query_rope_cos, query_rope_sin,
+                padded_ids, padded_slots, padded_indices, rope_cos, rope_sin, pre_mix,
+                first_token, active_tokens,
+            )
         x_hc = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
         pack_x_hc(padded_ids, embedding_weight, x_hc, hidden_tile=512)
-        pre_mix = pl.create_tensor([MOE_TOKENS, HC_MULT], dtype=pl.FP32)
-        for _ in pl.spmd(1, name_hint="dspark_initial_pre_mix"):
-            for token in pl.range(MOE_TOKENS):
-                for lane in pl.range(HC_MULT):
-                    value = pl.cast(0.0, pl.FP32)
-                    if lane == 0:
-                        value = pl.cast(1.0, pl.FP32)
-                    pl.write(pre_mix, [token, lane], value)
 
         for layer in pl.unroll(DSPARK_DRAFT_LAYERS):
             layer_wq_a_scale: pl.Tensor[[D // MX_GROUP, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[
@@ -716,19 +671,13 @@ def _dspark_drafter(
                 next_pre_mix,
                 x_mixed,
                 x_next,
-                attention_output_window,
-                attention_output_arrived,
                 recv_meta,
-                recv_x,
-                recv_scale,
-                recv_weights,
-                recv_routes,
+                recv_x, recv_routes,
                 data_arrived,
                 routed_output,
                 combine_arrived,
                 active_tokens,
                 rank,
-                attention_epoch + chunk * DSPARK_DRAFT_LAYERS + layer,
                 moe_epoch + chunk * DSPARK_DRAFT_LAYERS + layer,
             )
             x_hc = x_next
@@ -815,7 +764,6 @@ def l3_dspark_drafter(
     shared_w3: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w3_scale: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
     head_hidden: pl.Out[pl.Tensor[[C.EP_SIZE, B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16]],
-    attention_epoch: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     target_hidden.bind_dynamic(1, T_DYN)
@@ -834,23 +782,15 @@ def l3_dspark_drafter(
     window_cache.bind_dynamic(2, C.ORI_BLOCKS_DYN)
     head_hidden.bind_dynamic(1, B_DYN)
 
-    attention_output_buf = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
-    attention_arrived_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     recv_meta_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-    recv_x_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
-    recv_scale_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
-    recv_weights_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
+    recv_x_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], dtype=pl.INT8)
     recv_routes_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
     data_arrived_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
     routed_output_buf = pld.alloc_window_buffer([MOE_TOKENS * TOPK, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
-        attention_output = pld.window(attention_output_buf, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
-        attention_arrived = pld.window(attention_arrived_buf, [TP_SIZE, 1], dtype=pl.INT32)
         recv_meta = pld.window(recv_meta_buf, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-        recv_x = pld.window(recv_x_buf, [N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
-        recv_scale = pld.window(recv_scale_buf, [N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
-        recv_weights = pld.window(recv_weights_buf, [N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
+        recv_x = pld.window(recv_x_buf, [N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], dtype=pl.INT8)
         recv_routes = pld.window(recv_routes_buf, [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
         data_arrived = pld.window(data_arrived_buf, [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
         routed_output = pld.window(routed_output_buf, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
@@ -910,18 +850,12 @@ def l3_dspark_drafter(
             shared_w3[rank],
             shared_w3_scale[rank],
             head_hidden[rank],
-            attention_output,
-            attention_arrived,
             recv_meta,
-            recv_x,
-            recv_scale,
-            recv_weights,
-            recv_routes,
+            recv_x, recv_routes,
             data_arrived,
             routed_output,
             combine_arrived,
             rank,
-            attention_epoch,
             moe_epoch,
             device=rank,
         )
@@ -964,11 +898,11 @@ def build_drafter_specs():
     from golden import ScalarSpec, TensorSpec
 
     dynamic_sizes = {
-        "V41_DSPARK_CONTEXT_T_DYN": 6,
-        "V41_B_DYN": 1,
-        "V41_DSPARK_QUERY_T_DYN": DSPARK_QUERY_WIDTH,
-        "V41_TABLE_DYN": 1,
-        "V41_ORI_BLOCKS_DYN": 1,
+        "DSPARK_CONTEXT_T_DYN": 6,
+        "B_DYN": 1,
+        "DSPARK_QUERY_T_DYN": DSPARK_QUERY_WIDTH,
+        "TABLE_DYN": 1,
+        "ORI_BLOCKS_DYN": 1,
     }
     dtypes = {
         "bfloat16": torch.bfloat16,
@@ -1046,7 +980,7 @@ def golden_dspark_drafter(tensors):
         incoming_pre = torch.zeros(query_tokens, HC_MULT)
         incoming_pre[:, 0] = 1
         for layer in range(DSPARK_DRAFT_LAYERS):
-            _, post, residual = golden_mhc_mixes(
+            _, post, residual = golden_hc_mixes(
                 x_hc, tensors["hc_attn_fn"][rank, layer],
                 tensors["hc_attn_scale"][rank, layer], tensors["hc_attn_base"][rank, layer],
             )
@@ -1054,7 +988,7 @@ def golden_dspark_drafter(tensors):
                 torch.zeros(query_tokens, D, dtype=torch.bfloat16), x_hc,
                 post, residual,
             ).float()
-            next_pre, moe_post, moe_residual = golden_mhc_mixes(
+            next_pre, moe_post, moe_residual = golden_hc_mixes(
                 attention_hidden, tensors["hc_ffn_fn"][rank, layer],
                 tensors["hc_ffn_scale"][rank, layer], tensors["hc_ffn_base"][rank, layer],
             )
@@ -1089,16 +1023,17 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="V4.1 DSpark drafter validation")
     parser.add_argument("--mode", choices=("projection", "metadata", "drafter", "all"), default="all")
-    parser.add_argument("--tp", type=int, default=C.TP_SIZE, choices=C.SUPPORTED_TP_SIZES)
     parser.add_argument("--dp", type=int, default=C.DP_SIZE)
     parser.add_argument("--ep", type=int, default=C.EP_SIZE, choices=C.SUPPORTED_EP_SIZES)
-    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5sim")
+    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(EP_SIZE)))
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
-    if (args.tp, args.dp, args.ep) != (C.TP_SIZE, C.DP_SIZE, C.EP_SIZE):
-        parser.error("--tp/--dp/--ep must match the import-time configuration")
+    if args.execution_mode or args.platform == "a5sim":
+        parser.error("DSpark native kernels require A5 device execution; simulator support is unavailable")
+    if (args.dp, args.ep) != (C.DP_SIZE, C.EP_SIZE):
+        parser.error("--dp/--ep must match the import-time configuration")
     if args.mode == "all":
         # Isolate L2 and L3 runtime lifetimes (hw-native-sys/simpler#2839).
         for mode in ("projection", "metadata", "drafter"):

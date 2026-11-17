@@ -16,32 +16,35 @@
 
 using namespace mxfp8_projection;
 namespace {
-using Raw = Tile<TileType::Vec, float, 80, 128>;
-using Payload = Tile<TileType::Vec, F, 80, 128>;
-using Scales = Tile<TileType::Vec, uint8_t, 5, 64>;
+template <int MT>
+using Raw = Tile<TileType::Vec, float, MT, 128>;
+template <int MT>
+using Payload = Tile<TileType::Vec, F, MT, 128>;
+template <int MT>
+using Scales = Tile<TileType::Vec, uint8_t, MT / 16, 64>;
 constexpr int RAW_UB = 0;
-constexpr int PAYLOAD_UB = 40960;
-constexpr int SCALES_UB = 51200;
 constexpr int READY = 0, RELEASE = 1, FINISH = 2, STORE_DONE = 3, VEC_OFFSET = 16;
 #if defined(__CPU_SIM)
-using SimPipe = TPipe<0, Direction::DIR_C2V, 40960, 1, 2>;
+template <int MT>
+using SimPipe = TPipe<0, Direction::DIR_C2V, MT * 128 * 4, 1, 2>;
 #endif
 
 #if defined(__DAV_CUBE__)
+template <int MT>
 struct QuantizeOutput {
 #if defined(__CPU_SIM)
-    SimPipe pipe;
+    SimPipe<MT> pipe;
     __aicore__ QuantizeOutput() : pipe(nullptr, 0, 0) {}
 #endif
-    __aicore__ inline void operator()(AC<256>& acc) {
+    __aicore__ inline void operator()(AC<256, MT>& acc) {
 #if defined(__CPU_SIM)
-        TPUSH<SimPipe, AC<256>, TileSplitAxis::TILE_LEFT_RIGHT>(pipe, acc);
+        TPUSH<SimPipe<MT>, AC<256, MT>, TileSplitAxis::TILE_LEFT_RIGHT>(pipe, acc);
 #else
         wait_intra_block(PIPE_FIX, RELEASE);
         wait_intra_block(PIPE_FIX, RELEASE + VEC_OFFSET);
-        Raw raw;
+        Raw<MT> raw;
         TASSIGN(raw, RAW_UB);
-        TMOV<Raw, AC<256>, AccToVecMode::DualModeSplitN>(raw, acc);
+        TMOV<Raw<MT>, AC<256, MT>, AccToVecMode::DualModeSplitN>(raw, acc);
         set_intra_block(PIPE_FIX, READY);
         set_intra_block(PIPE_FIX, READY + VEC_OFFSET);
 #endif
@@ -60,14 +63,15 @@ struct QuantizeOutput {
 #endif
 
 #if defined(__DAV_VEC__)
+template <int MT>
 __tf__ __aicore__ inline void quantize(
-    Payload::TileDType __out__ output, Scales::TileDType __out__ scales,
-    Raw::TileDType __in__ input, uint16_t active_rows) {
+    typename Payload<MT>::TileDType __out__ output, typename Scales<MT>::TileDType __out__ scales,
+    typename Raw<MT>::TileDType __in__ input, uint16_t active_rows) {
     auto src = (__ubuf__ float*)__cce_get_tile_ptr(input);
     auto dst = (__ubuf__ uint8_t*)__cce_get_tile_ptr(output);
     auto codes = (__ubuf__ uint16_t*)__cce_get_tile_ptr(scales);
 #if defined(__CPU_SIM)
-    for (int row = 0; row < 80; ++row) {
+    for (int row = 0; row < MT; ++row) {
         for (int group = 0; group < 4; ++group) {
             float values[32];
             float maximum = 0;
@@ -121,7 +125,7 @@ __tf__ __aicore__ inline void quantize(
         RegTensor<uint8_t> byte_index;
         vci((RegTensor<int8_t>&)byte_index, (int8_t)0, INC_ORDER);
         vmuls((RegTensor<int16_t>&)byte_index, (RegTensor<int16_t>&)byte_index, (int16_t)4, all8);
-        for (uint16_t row = 0; row < 80; ++row) {
+        for (uint16_t row = 0; row < MT; ++row) {
             for (uint16_t chunk = 0; chunk < 2; ++chunk) {
                 RegTensor<float> x, amax, shuffled, reciprocal;
                 RegTensor<int32_t> exponent, nonzero, reciprocal_bits;
@@ -166,19 +170,20 @@ __tf__ __aicore__ inline void quantize(
 #endif
 } // namespace
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
+template <int MT>
+__aicore__ inline void project_oa(__gm__ int64_t* args) {
     const int width = args[6];
     const int active = args[7];
     const int workers = get_block_num(args);
     const int padded_rows = args[8];
     const int columns = width / 256;
 #if defined(__DAV_CUBE__)
-    QuantizeOutput emit;
-    for (int tile = get_block_idx(args); tile < (padded_rows / 80) * columns; tile += workers) {
-        const int row = tile / columns * 80;
+    QuantizeOutput<MT> emit;
+    for (int tile = get_block_idx(args); tile < (padded_rows / MT) * columns; tile += workers) {
+        const int row = tile / columns * MT;
         const int column = tile % columns;
         int group = column / 4;
-        project_emit<4096, 1024, 256>(
+        project_emit<4096, 1024, 256, MT>(
             data<F>(args, 0) + (group * padded_rows + row) * 4096,
             data<F>(args, 1) + group * 4096 * 1024,
             data<S>(args, 2) + (group * padded_rows + row) * 128,
@@ -186,36 +191,38 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     }
     emit.finish();
 #elif defined(__DAV_VEC__)
-    Raw raw;
-    Payload payload;
-    Scales scales;
-    TASSIGN(raw, RAW_UB); TASSIGN(payload, PAYLOAD_UB); TASSIGN(scales, SCALES_UB);
+    Raw<MT> raw;
+    Payload<MT> payload;
+    Scales<MT> scales;
+    TASSIGN(raw, RAW_UB);
+    TASSIGN(payload, MT * 128 * 4);
+    TASSIGN(scales, MT * 128 * 5);
 #if defined(__CPU_SIM)
-    SimPipe pipe(nullptr, 0, 0);
+    SimPipe<MT> pipe(nullptr, 0, 0);
 #else
     set_intra_block(PIPE_V, RELEASE);
 #endif
     set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-    for (int tile = get_block_idx(args); tile < (padded_rows / 80) * columns; tile += workers) {
+    for (int tile = get_block_idx(args); tile < (padded_rows / MT) * columns; tile += workers) {
 #if defined(__CPU_SIM)
-        TPOP<SimPipe, Raw, TileSplitAxis::TILE_LEFT_RIGHT>(pipe, raw);
+        TPOP<SimPipe<MT>, Raw<MT>, TileSplitAxis::TILE_LEFT_RIGHT>(pipe, raw);
 #else
         wait_intra_block(PIPE_V, READY);
 #endif
         wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-        const int row = tile / columns * 80;
+        const int row = tile / columns * MT;
         const int column = tile % columns;
-        const int valid = active - row < 0 ? 0 : (active - row > 80 ? 80 : active - row);
-        quantize(payload.data(), scales.data(), raw.data(), valid);
+        const int valid = active - row < 0 ? 0 : (active - row > MT ? MT : active - row);
+        quantize<MT>(payload.data(), scales.data(), raw.data(), valid);
 #if defined(__CPU_SIM)
-        TFREE<SimPipe, TileSplitAxis::TILE_LEFT_RIGHT>(pipe);
+        TFREE<SimPipe<MT>, TileSplitAxis::TILE_LEFT_RIGHT>(pipe);
 #else
         set_intra_block(PIPE_V, RELEASE);
 #endif
         const int n = column * 256 + get_sub_block_id(args) * 128;
         using Stride = pto::Stride<1, 1, 1, DYNAMIC, 1>;
-        using PayloadShape = TileShape2D<F, 80, 128>;
-        using ScaleShape = TileShape2D<uint8_t, 5, 64>;
+        using PayloadShape = TileShape2D<F, MT, 128>;
+        using ScaleShape = TileShape2D<uint8_t, MT / 16, 64>;
         const int64_t payload_stride = reinterpret_cast<__gm__ Tensor*>(args[4])->strides[0];
         GlobalTensor<F, PayloadShape, Stride> pg(data<F>(args, 4) + row * payload_stride + n,
             PayloadShape(), Stride(1, 1, 1, payload_stride, 1));
@@ -233,4 +240,12 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 #endif
     pipe_barrier(PIPE_ALL);
 #endif
+}
+
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
+    if (args[9] == 128) {
+        project_oa<128>(args);
+    } else {
+        project_oa<80>(args);
+    }
 }

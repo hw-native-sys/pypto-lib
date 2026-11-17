@@ -20,7 +20,7 @@ from quant import quantize_mxfp8_cache, pack_quantized_cache, unpack_quantized_c
 from rmsnorm import golden_rms_norm
 
 
-T_DYN = pl.dynamic("V41_DSPARK_CONTEXT_T_DYN")
+T_DYN = pl.dynamic("DSPARK_CONTEXT_T_DYN")
 D = FLASH.hidden_size
 HEAD_DIM = FLASH.head_dim
 ROPE_DIM = FLASH.qk_rope_head_dim
@@ -82,9 +82,37 @@ def dspark_context_kv(
     """Use the draft layer's own WKV, norm, and paged cache mapping."""
     tokens = pl.tensor.dim(main_x, 0)
     projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    kv_input_payload, kv_input_scales, kv_input_payload_padded_rows = quantize_projection_input(main_x, num_tokens)
+    kv_input_payload, kv_input_scales, kv_input_payload_padded_rows = quantize_projection_input(
+        main_x, num_tokens, row_tile=80,
+    )
+    dspark_context_kv_quantized(
+        kv_input_payload, kv_input_scales, projected, wkv, wkv_scale,
+        kv_norm_weight, rope_cos, rope_sin, context_slots, window_cache, num_tokens,
+    )
+    return window_cache
+
+
+@pl.jit.inline(auto_scope=False)
+def dspark_context_kv_quantized(
+    kv_input_payload: pl.Tensor,
+    kv_input_scales: pl.Tensor,
+    projected: pl.Tensor,
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    kv_norm_weight: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    context_slots: pl.Tensor,
+    window_cache: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Project shared quantized context inputs through one layer's own weights."""
     window_input_ready = pl.system.task_dummy(deps=[])
-    projected = kv_proj(kv_input_payload, kv_input_scales, wkv, wkv_scale, projected, num_tokens, worker_limit=32)
+    projected = kv_proj(
+        kv_input_payload, kv_input_scales,
+        wkv, wkv_scale,
+        projected, num_tokens, worker_limit=32, row_tile=80,
+    )
     window_publish(
         projected, kv_norm_weight, rope_cos, rope_sin,
         context_slots, window_cache,

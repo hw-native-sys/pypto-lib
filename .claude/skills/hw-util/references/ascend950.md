@@ -26,6 +26,10 @@ FLOPs/s and TB/s is 1e12 bytes/s. The 32-AIC configuration has 64 AIVs; these do
 not add to the pure Cube GEMM denominator. Cube+Vector figures such as 919
 TFLOPS for this FP8 configuration are a different metric.
 
+For GEMM MBU, apply the skill's directional convention: divide read and write
+bandwidth separately by 4 TB/s and report the larger ratio. Keep their summed
+bytes as a diagnostic, not the utilization numerator.
+
 ## DeepGEMM cross-check
 
 [DeepGEMM-Ascend README](https://github.com/deepseek-ai/DeepGEMM-Ascend#performance)

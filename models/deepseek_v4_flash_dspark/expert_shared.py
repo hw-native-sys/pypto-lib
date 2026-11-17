@@ -47,7 +47,6 @@ MM_INTER_TILE = 128
 SH_MM_BLOCKS = 16 if SH_M_TILE == 128 else 8
 ACT_INTER_TILE = 1024
 D_OUT_TILE = 128 if SH_M_TILE == 128 or T % SH_M_TILE != 0 else 256
-W2_SPLIT_MODE = pl.SplitMode.NONE if T % SH_M_TILE != 0 else pl.SplitMode.UP_DOWN
 W2_PIPE_SLOTS = 1 if SH_M_TILE == 128 else 2
 W2_INNER = 2
 # h_tile_i8 stores use a whole number of a2a3 512-byte L2 cache lines.
@@ -218,10 +217,9 @@ def _expert_shared(
             D // (W2_INNER * D_OUT_TILE),
             name_hint="sh_w2_mm",
             allow_early_resolve=True,
-            optimizations=[pl.split(W2_SPLIT_MODE), pl.cross_core_slot(slot_num=W2_PIPE_SLOTS)],
+            optimizations=[pl.cross_core_slot(slot_num=W2_PIPE_SLOTS)],
         ):
             d_base = db_idx * (W2_INNER * D_OUT_TILE)
-            h_scale = pl.row_max(h_tile_scale_dq[:, :])
             for dg in pl.range(W2_INNER):
                 d0 = d_base + dg * D_OUT_TILE
                 y_acc = pl.create_tensor([SH_M_TILE, D_OUT_TILE], dtype=pl.INT32)
@@ -231,17 +229,30 @@ def _expert_shared(
                         d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K
                     ]
                     y_acc = pl.matmul_acc(y_acc, hs_k, sw2_k, b_trans=True, init_cond=(k0 == 0))
-                w2_scale_chunk = pl.reshape(shared_w2_scale[d0 : d0 + D_OUT_TILE], [1, D_OUT_TILE])
-                y_2d = pl.cast(y_acc, target_type=pl.FP32, mode="none")
-                y_2d = pl.col_expand_mul(
-                    pl.row_expand_mul(y_2d, h_scale), w2_scale_chunk
-                )
-                y_bf16 = pl.cast(y_2d, target_type=pl.BF16, mode="rint")
-                if T > SH_M_TILE and T % SH_M_TILE != 0:
-                    y_valid = pl.slice(y_bf16, [SH_M_TILE, D_OUT_TILE], [0, 0], valid_shape=[valid_m, D_OUT_TILE])
-                    sh = pl.assemble(sh, y_valid, [ts0, d0])
+                if T % SH_M_TILE == 0:
+                    for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                        y_shard = pl.aiv_shard(y_acc)
+                        row = lane * (SH_M_TILE // 2)
+                        out_row = ts0 + row
+                        h_scale = pl.row_max(h_tile_scale_dq[row : row + SH_M_TILE // 2, :])
+                        w2_scale = pl.reshape(shared_w2_scale[d0 : d0 + D_OUT_TILE], [1, D_OUT_TILE])
+                        y_fp32 = pl.cast(y_shard, target_type=pl.FP32, mode="none")
+                        y_scaled = pl.row_expand_mul(y_fp32, h_scale)
+                        y_dequant = pl.col_expand_mul(y_scaled, w2_scale)
+                        y_bf16 = pl.cast(y_dequant, target_type=pl.BF16, mode="rint")
+                        sh[out_row : out_row + SH_M_TILE // 2, d0 : d0 + D_OUT_TILE] = y_bf16
                 else:
-                    sh[ts0 : ts0 + SH_VALID_M, d0 : d0 + D_OUT_TILE] = y_bf16[0:SH_VALID_M, :]
+                    h_scale_full = pl.row_max(h_tile_scale_dq[:, :])
+                    w2_scale_full = pl.reshape(shared_w2_scale[d0 : d0 + D_OUT_TILE], [1, D_OUT_TILE])
+                    y_fp32_full = pl.cast(y_acc, target_type=pl.FP32, mode="none")
+                    y_scaled_full = pl.row_expand_mul(y_fp32_full, h_scale_full)
+                    y_dequant_full = pl.col_expand_mul(y_scaled_full, w2_scale_full)
+                    y_bf16_full = pl.cast(y_dequant_full, target_type=pl.BF16, mode="rint")
+                    if T > SH_M_TILE:
+                        y_valid = pl.slice(y_bf16_full, [SH_M_TILE, D_OUT_TILE], [0, 0], valid_shape=[valid_m, D_OUT_TILE])
+                        sh = pl.assemble(sh, y_valid, [ts0, d0])
+                    else:
+                        sh[ts0 : ts0 + SH_VALID_M, d0 : d0 + D_OUT_TILE] = y_bf16_full[0:SH_VALID_M, :]
 
     # The @pl.inline parser requires inline call expressions to have a return
     # value; sh is convenient because it's already pl.Out.

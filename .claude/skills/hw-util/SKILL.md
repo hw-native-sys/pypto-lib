@@ -1,6 +1,6 @@
 ---
 name: hw-util
-description: Analyze hardware utilization for one SPMD kernel execution, with matmul MFU/MBU calculations on Ascend 950, A2/910B, and A3/910C. Resolve parallelism, earliest-start/latest-end timing, and per-DIE versus card peaks from swimlanes, CANN traces, or supplied timings. Use for kernel hardware utilization, MFU, MBU, BMU, or GEMM throughput analysis.
+description: Analyze hardware utilization for one SPMD kernel execution on Ascend 950, A2/910B, and A3/910C. Calculate GEMM MFU/MBU or theoretical forward FlashAttention MFU for GQA, MQA, MLA and sparse attention; FA MBU is deferred. Resolve execution spans and device peaks from swimlanes, CANN traces or supplied timings. Use for kernel utilization, MFU, MBU, BMU, GEMM or attention throughput analysis.
 ---
 
 # SPMD Kernel Hardware Utilization
@@ -10,8 +10,10 @@ device maps to physical DIEs and the published hardware specification. Analyze a
 its block instances over the interval from the earliest execution start to
 the latest execution end. Do not assume aligned starts or finishes. Report
 multiple invocations separately, or explicitly label a requested aggregate.
-The supplied formulas and calculator cover matmul; for another kernel type,
-derive its useful work, memory traffic, and applicable execution-unit peak
+The supplied formulas and calculators cover GEMM MFU/MBU and forward FA MFU.
+For FlashAttention, read [the attention reference](references/attention.md) and
+use `scripts/calculate_fa.py`; FA MBU is not calculated. For another kernel
+type, derive useful work, memory traffic and applicable execution-unit peak
 before computing utilization.
 
 Analyze existing artifacts first. Do not launch a device benchmark, change a
@@ -109,6 +111,18 @@ statistics pool layers or repeat one task. No silent warmup/outlier removal.
 
 MFU expands to Model FLOPs Utilization. For a single kernel, call the analogous
 metric **effective compute utilization** and state the adopted MFU convention.
+Its numerator must contain theoretical useful work only. Hardware-required
+padding, masked work, tile alignment and redundant execution never increase
+the numerator, even when they consume actual execution time.
+
+For FA, use [the attention counting rules](references/attention.md): ordinary
+GQA/MQA/MLA counts mask-valid pairs; sparse attention counts all semantic selected
+entries without an additional mask discount, excluding hardware-added entries
+and repeated work. Only calculate FA MFU. The following byte formulas and
+`scripts/calculate.py` apply to GEMM.
+
+### GEMM MFU and MBU
+
 MBU expands to Memory Bandwidth Utilization; if the user says BMU, confirm the
 intended metric from context rather than assuming a universally standard acronym.
 
@@ -117,12 +131,25 @@ F = 2*M*N*K                              # one multiply-add counts as 2 FLOPs
 TFLOPS = F / (t_us * 1e6)
 effective compute utilization (%) = 100 * TFLOPS / peak_TFLOPS
 
-Q = M*K*a_bytes + K*N*b_bytes + M*N*out_bytes
-Q_MX = Q + M*ceil(K/group)*a_scale_bytes + N*ceil(K/group)*b_scale_bytes
-effective TB/s = Q_MX / (t_us * 1e6)
-effective bandwidth / peak (%) = 100 * effective_TB/s / peak_TB_s
-actual HBM MBU (%) = 100 * measured_HBM_bytes / (t_us * 1e6 * peak_TB_s)
+Q_read = M*K*a_bytes + K*N*b_bytes
+# Scaled GEMMs only:
+Q_read_MX = Q_read + M*ceil(K/group)*a_scale_bytes + N*ceil(K/group)*b_scale_bytes
+Q_write = M*N*out_bytes
+effective read TB/s = Q_read / (t_us * 1e6)
+effective write TB/s = Q_write / (t_us * 1e6)
+effective bandwidth / peak (%) = 100 * max(read_TB/s, write_TB/s) / peak_TB_s
+actual HBM MBU (%) = 100 * max(measured_HBM_read_bytes, measured_HBM_write_bytes) / (t_us * 1e6 * peak_TB_s)
 ```
+
+Use `Q_read` for GEMMs without scale inputs. For scaled GEMMs, substitute
+`Q_read_MX` in the effective read-rate formula to include scale traffic.
+
+Calculate read and write utilization separately over the same execution window,
+then use the higher value as GEMM MBU. Apply the same bandwidth denominator to
+each direction; do not add their rates for utilization. Report both rates and
+keep the sum of bytes only as a traffic diagnostic. For A2/A3, use the shared
+1.6-TB/s bandwidth specified in [the A2/A3 reference](references/ascend910.md),
+without multiplying it by the DIE count.
 
 Use valid model dimensions for effective FLOPs, not padding or redundant work.
 Native scaled matmul still uses `2MNK`; include scale traffic in bytes and scale
@@ -152,8 +179,13 @@ python .claude/skills/hw-util/scripts/calculate.py \
   --a-bytes 1 --b-bytes 1 --out-bytes 2 --scale-group 32 --scale-bytes 1
 ```
 
-Supply `--hbm-bytes` only for measured traffic covering the same device and time
-window, together with an explicit `--hbm-scope`:
+Supply `--hbm-read-bytes` and `--hbm-write-bytes` together for measured traffic
+covering the same device and time window, with an explicit `--hbm-scope`.
+Use zero for a measured zero-traffic direction; an unknown direction is not zero.
+The former combined `--hbm-bytes` input is replaced by these directional counts:
+a combined count alone cannot determine their maximum.
+
+The supported attribution scopes are:
 
 - `kernel-attributed`: the measurement identifies traffic belonging to the
   selected kernel.
@@ -165,6 +197,8 @@ window, together with an explicit `--hbm-scope`:
 
 Only the first two scopes populate `actual_hbm_mbu_pct`. The `device-wide`
 scope instead populates `device_hbm_mbu_pct`, leaving the per-kernel field null.
+Both use the maximum of the measured read and write utilization. Directional
+rates and utilization are also reported and inherit the same attribution scope.
 Matching timestamps alone does not attribute traffic: concurrent branches can
 contribute to the same device-wide counter. Scope is an evidence-backed input,
 not something the calculator can infer from a byte count.
@@ -180,7 +214,9 @@ invent a bandwidth denominator to complete a report.
 Return operator identity and source evidence, effective shape/dtype, block count,
 participating cores and observed parallelism, earliest start, latest end, span
 and timing statistic, FLOPs/byte assumptions, measured-traffic attribution,
-peaks, throughput, and utilization.
+peaks, throughput, and utilization. For GEMM, also report separate read/write
+bytes and bandwidth; for FA, report the semantic pair count and theoretical
+QK/PV FLOPs. Omit MBU and bandwidth fields entirely from FA reports.
 Mark unavailable parallelism or endpoint evidence as unknown; a whole-kernel
 duration alone cannot establish it. Preserve trace locators so the user can
 find the event. Keep generated CSV/JSON under `build_output/` when useful;
@@ -188,13 +224,17 @@ do not commit captures.
 
 For concurrent branches, report individual block counts and actual overlap.
 Partial core usage by one branch does not establish that the chip was idle.
-Use the union span and summed work for a combined metric; do not add percentages
-with different timing windows. Busy-core counts and PMU pipe-busy ratios are
-not useful-FLOP or bandwidth utilization.
+Use the union span and summed work for a combined metric. Sum reads across the
+selected branches and sum writes separately before taking their maximum; do not
+sum branch maxima or percentages with different timing windows.
+Busy-core counts and PMU pipe-busy ratios are not useful-FLOP or bandwidth
+utilization.
 
 There is no universal passing MFU threshold. For a stated read-once cold-memory
-model, `max(F/peak_compute, Q/peak_bandwidth)` is an optimistic time lower bound,
-not a prediction. A small-M GEMM may be bandwidth-limited well below 100% MFU.
+model with overlapping reads and writes,
+`max(F/peak_compute, Q_read/peak_bandwidth, Q_write/peak_bandwidth)` is an
+optimistic time lower bound, not a prediction. Include scales in `Q_read`.
+A small-M GEMM may be bandwidth-limited well below 100% MFU.
 Judge improvements by comparable whole-kernel or model latency, retaining cache,
 profiler, quantization, layout-conversion, and sampling differences. Do not compare
 a mean-core hypothesis directly with a CANN whole-kernel duration as a speedup.

@@ -158,6 +158,40 @@ observable:
 
 An edge you expected but cannot find in `deps.json` does not exist at run time.
 
+### Ordered tasks can still lack allocation retention
+
+The task that allocates scratch storage and the task that last writes its
+contents can be different. Keep both identities when auditing a manual scope:
+
+```text
+allocation creator  ---- owns ---->  scratch storage
+                                         ^
+                                         | writes / reads
+gather writer  ------ deps ------>  attention consumer  ------>  merge
+```
+
+The lower execution chain can be complete while a consumer has no retention
+relationship to the original allocation. On runtimes that reclaim the heap
+during execution, dropping the allocation's remaining ownership references
+can make that storage reusable before its consumers finish. Check the actual
+runtime's lifetime rules and `creator` edges; an arbitrary transitive execution
+path or a missing creator edge alone does not prove when storage was reclaimed.
+
+A concrete example is the DSpark HCA Prefill path in
+[`prefill_sparse_attn.py`](../../models/deepseek_v4_flash_dspark/prefill_sparse_attn.py):
+`_hca_streaming_attn_tile()` and its `_sparse_attn_o_proj()` helper changed from
+`pl.manual_scope()` to `pl.scope()` to restore automatic scratch retention.
+The existing explicit dependencies, tensor-level manual-dependency choices,
+and early-resolve hints remained. Both scope changes were needed because AUTO
+cannot nest inside MANUAL. This is a local ownership repair, not a rule that
+every manual scope is unsafe.
+
+Validate such a repair with repeated cold dispatches and numerical/cache
+checks. AUTO can add both creator retention and TensorMap ordering, so compare
+both before attributing a successful experiment exclusively to retention.
+A producer timeout or later reference assertion alone does not establish an
+observed overwrite, and a larger heap can merely change when the bug appears.
+
 ## What happens at run time
 
 Two AICPU roles run concurrently. On a2a3 the AICPU has four threads: one
