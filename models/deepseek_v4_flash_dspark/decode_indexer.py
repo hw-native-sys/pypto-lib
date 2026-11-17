@@ -1096,8 +1096,10 @@ def indexer_qr_rope(
     dq_rope_workers = pl.min(dq_rope_units, DQ_ROPE_WORKERS)
     for dq_rope_worker in pl.spmd(dq_rope_workers, name_hint="idx_qr_dequant_rope", allow_early_resolve=True):
         swap_i = pl.tile.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32)
-        swap_tmp = pl.create_tile([1, ROPE_HEAD_DIM], dtype=pl.INT32)
-        swap_lane = pl.tile.rems(swap_i, 2, swap_tmp)
+        # INT16 halfword parity; the RoPE indices have zero upper halfwords.
+        swap_i16 = pl.reinterpret_view(swap_i, pl.INT16)
+        swap_lane_i16 = pl.tile.ands(swap_i16, 1)
+        swap_lane = pl.reinterpret_view(swap_lane_i16, pl.INT32)
         swap_row = pl.tile.adds(pl.tile.sub(swap_i, pl.tile.muls(swap_lane, 2)), IDX_NOPE_HEAD_DIM + 1)
         swap_base = pl.create_tile([DEQUANT_T_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
         swap_source = pl.col_expand(swap_base, swap_row)
