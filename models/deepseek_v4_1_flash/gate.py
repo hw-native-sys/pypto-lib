@@ -26,16 +26,16 @@ TOPK = M.num_experts_per_tok
 ROUTE_SCALE = M.routed_scaling_factor
 
 # tiling
-GATE_T_TILE = 8
+GATE_T_TILE = 4
 GATE_M_TILE = 16
-GATE_N_TILE = 32
+GATE_N_TILE = 16
 T_PAD = ((T + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
 QUANT_TILE = 256
 QUANT_TASK_TILE = QUANT_TILE
 assert D % QUANT_TASK_TILE == 0
 MX_GROUP = 32
 MX_SCALE_GROUPS = D // MX_GROUP
-QUANT_WORKER_TILE = min(32, ((T_PAD // GATE_M_TILE) * (D // QUANT_TASK_TILE) + 1) // 2)
+QUANT_WORKER_TILE = 24 if T > 80 else 64
 ROUTE_WORKER_TILE = 24 if T > 80 else 64
 TOPK_PAD = 8
 SORT_PAD = TOPK_PAD * 2
@@ -213,7 +213,7 @@ def _gate_quant_vf(
     worker = pl.tile.get_block_idx()
     workers = pl.tile.get_block_num()
     iterations = ((rows // GATE_M_TILE) * chunks + workers - 1 - worker) // workers
-    for iteration in pl.pipeline(iterations, stage=2):
+    for iteration in pl.range(iterations):
         block = worker + iteration * workers
         row = block // chunks * GATE_M_TILE
         column = block % chunks * QUANT_TILE
@@ -315,7 +315,16 @@ def _gate_pre_route_vf(
     if experts < columns:
         for row in pl.range(0, padded_rows, 80):
             rows = pl.min(80, padded_rows - row)
-            padding = pl.tile.full([80, ((columns - experts + 7) // 8) * 8], dtype=pl.FP32, value=-3.4028234663852886e38)
+            padding = pl.create_tile([80, 384], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+            padding_flat = pl.reshape(padding, [80 * 384])
+            for segment in pl.unroll((columns - experts + 63) // 64):
+                with pl.reg_scope():
+                    fill = pl.reg.broadcast(-3.4028234663852886e38, lanes=64, dtype=pl.FP32)
+                    valid = pl.min(64, columns - experts - segment * 64)
+                    mask = pl.reg.active_mask(valid, lanes=64)
+                    for local in pl.hardware_loop(rows):
+                        _padding_written = pl.reg.store(padding_flat, local * 384 + segment * 64, fill, mask)
+            padding = pl.reshape(padding_flat, [80, 384])
             padding = pl.set_validshape(padding, rows, columns - experts)
             pl.store(padding, [row, experts], biased_scores)
     return indices, weights, biased_scores
