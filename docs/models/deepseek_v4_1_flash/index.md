@@ -67,20 +67,56 @@ Attention entries own chunk scheduling and dependencies around that shared
 implementation. MoE dispatches local token rows to EP expert owners and combines
 the results back into the local HC state.
 
-The native routed FFN requires a PyPTO build containing
-[direct FP4-to-FP8 cast](https://github.com/hw-native-sys/pypto/pull/3278),
-[NZ cast output](https://github.com/hw-native-sys/pypto/pull/3311), and
+The native routed FFN requires PyPTO's
+[direct FP4-to-FP8 NZ cast and V2C support](https://github.com/hw-native-sys/pypto/pull/3450).
+W2 additionally uses
 [grouped A5 VF execution](https://github.com/hw-native-sys/pypto/pull/3416) support.
-The vector peers reinterpret packed weight bytes as FP4 and cast directly into
-FP8 NZ slots. Each conversion emits one TCVT without an intermediate ND decode
-workspace or a separate ND-to-NZ move. W13 loads the dispatched MX activation
-scales directly on AIC. W2 additionally uses grouped VF support to pack activation
-scales into ZZ in a register scope with a separate scale workspace.
+The vector peers reinterpret packed weight bytes as FP4 and use
+`pl.cast(..., pl.FP8E4M3FN, layout=pl.NZ)` to write FP8 NZ slots directly.
+Each conversion emits one TCVT without an intermediate ND decode workspace or a
+separate ND-to-NZ move.
+
+Scale inputs retain their existing E8M0 encoding and packed storage. To avoid
+[PTOAS 0.74's MX scale partition defect](https://github.com/hw-native-sys/PTOAS/issues/1763),
+the native producers load physical scale boxes through ordinary ND views.
+W13 transfers its A and B scale packets from Vec; W2 retains its register-based
+activation-scale packing and adds the B scale packets. The three-slot V2C pipe
+carries A scales, B scales, then weights for each K panel. AIC copies the scale
+packets into LeftScale and RightScale before releasing their FIFO slots.
+No native global scale load uses MX_A_ZZ, MX_B_NN, or MX_A_ND addressing.
+The scale workaround can be removed after the upstream partition fix is
+validated on the native W13 and W2 paths.
 Four independent RAW slots preload four K panels; each consumed slot is
 refilled with the panel four steps ahead.
+W13 stages activation data in two K1024 Mat buffers and consumes K256 slices
+in reduction order. Its vector peers keep each projection panel's complete
+A and B scale ranges in UB and extract the K256 packets locally. Per projection
+panel, AIC performs five activation GM loads instead of twenty, and each AIV
+performs two scale GM loads instead of forty.
 W13 uses physical row tiles of at most 64 rows. A capacity tail loads a full
 aligned input window and stores only the corresponding active accumulator rows.
 The composed routed FFN continues to select the C++ kernels by default.
+
+An isolated native FFN replay on Ascend A5 measured the following on the same
+device, with PyPTO `a7b578e0`, runtime `27fe21756`, PTOAS 0.74, ISA `83b1b2b52`,
+and CANN 9.3. The EP2 fixture has 12 local experts with 36 active rows each,
+receive stride 160, compact capacity 960, width 5,120, and intermediate width
+2,304. It excludes EP communication and does not represent a full model forward.
+Results are the median of three 100-round group medians after five warmups,
+replaying the same frozen inputs and goldens.
+
+| Variant | Effective (us) | W13 (us) | SwiGLU (us) | W2 (us) |
+| --- | ---: | ---: | ---: | ---: |
+| ND scale workaround, K256 activation loads | 391.6930 | 178.3650 | 50.4710 | 119.4820 |
+| K1024 activation staging and resident W13 scales | 385.5865 | 168.8165 | 50.9105 | 120.8900 |
+
+Effective is the convex hull of the device orchestration and scheduler spans.
+Stage windows run from dispatch to finish and include waits; their independent
+medians are not additive. W2 and SwiGLU binaries are identical in this comparison.
+The selected implementation also passes W13 and whole-FFN frozen checks for
+mixed expert counts, all 960 active rows, and zero active rows, including exact
+inactive output sentinels and route weights. The M32 prefill path has compile
+and load coverage; these timings cover the M64 decode fixture.
 
 ## Parallel configuration
 
