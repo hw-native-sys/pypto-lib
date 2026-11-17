@@ -22,7 +22,7 @@ from config import (
     PREFILL_SEQ,
 )
 
-from hc_post import golden_hc_post, hc_post
+from hc_post import golden_hc_post, _hc_post_full_prefill as hc_post
 from hc_pre import golden_hc_pre, hc_pre
 from prefill_cp_token_allgather import (
     PREFILL_GROUP_CAP,

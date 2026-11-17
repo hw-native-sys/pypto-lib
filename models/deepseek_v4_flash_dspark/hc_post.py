@@ -54,12 +54,14 @@ HC_D_TILE = _hc_d_tile(D, HC_MULT)
 HC_D_BLOCKS = D // HC_D_TILE
 
 
-def _hc_post(
+@pl.jit.inline(auto_scope=False)
+def _hc_post_impl(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
     y: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+    T_TILE: pl.constexpr,
 ):
     x.bind_dynamic(0, T_DYN)
     residual.bind_dynamic(0, T_DYN)
@@ -99,7 +101,30 @@ def _hc_post(
     return y
 
 
+def _hc_post(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+    y: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+):
+    """Combine HC rows with the shared decode geometry."""
+    return _hc_post_impl(x, residual, post, comb, y, 4)
+
+
 hc_post = pl.jit.inline(_hc_post)
+
+
+@pl.jit.inline
+def _hc_post_full_prefill(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+    y: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+):
+    """Combine full prefill HC rows with the prefill geometry."""
+    return _hc_post_impl(x, residual, post, comb, y, 16)
 
 
 @pl.jit.inline

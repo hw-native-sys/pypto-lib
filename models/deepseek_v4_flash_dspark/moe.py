@@ -62,7 +62,7 @@ from config import FLASH as M, MOE_TOKENS, RECV_MAX, INT8_AMAX_EPS, INT8_SCALE_M
 from expert_routed import RECV_TILE, TILES_PER_EXPERT, expert_routed_tile
 from expert_shared import expert_shared
 from gate import gate
-from hc_post import hc_post
+from hc_post import hc_post, _hc_post_full_prefill
 from hc_pre import hc_pre
 from prefill_cp_token_allgather import (
     CP_KV_T_DYN as PREFILL_GROUP_T_DYN,
@@ -1646,7 +1646,7 @@ def prefill_moe(
                 gather_window, gather_signal,
                 group_base, tp_rank,
             )
-            hc_post(ffn_out_full, attn_out, post_ffn, comb_ffn, x_hc)
+            _hc_post_full_prefill(ffn_out_full, attn_out, post_ffn, comb_ffn, x_hc)
     return x_hc
 
 

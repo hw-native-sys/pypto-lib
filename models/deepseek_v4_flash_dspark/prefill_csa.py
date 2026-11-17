@@ -32,7 +32,7 @@ from prefill_compressor_ratio4 import (
     compressor_ratio4,
     golden_prefill_compressor_ratio4,
 )
-from hc_post import golden_hc_post, hc_post
+from hc_post import golden_hc_post, _hc_post_full_prefill as hc_post
 from hc_pre import golden_hc_pre, hc_pre
 from prefill_indexer import (
     COMPRESS_RATIO as INDEXER_COMPRESS_RATIO,

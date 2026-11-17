@@ -24,7 +24,7 @@ from config import (
     PREFILL_SEQ,
 )
 
-from hc_post import golden_hc_post, hc_post
+from hc_post import golden_hc_post, _hc_post_full_prefill as hc_post
 from hc_pre import golden_hc_pre, hc_pre
 from prefill_compressor_ratio128 import (
     HCA_STATE_BLOCK_NUM,
