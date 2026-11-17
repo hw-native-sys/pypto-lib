@@ -30,7 +30,7 @@ from config import (
 )
 from lm_head import (
     GROUP_LOGIT_ROWS, LM_HEAD_M_TILE, MAX_LOGIT_ROWS,
-    VOCAB_PER_TP, lm_head, lm_head_project,
+    VOCAB_PER_TP, lm_head, lm_head_project, lm_head_cast_logits,
 )
 from rmsnorm import rms_norm
 
@@ -334,7 +334,7 @@ def _markov_sample_from_hidden(
     confidences: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH], pl.FP32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
     hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
-    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.BF16],
     logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
     logits_epoch: pl.Scalar[pl.INT32],
@@ -354,7 +354,9 @@ def _markov_sample_from_hidden(
     base_logits = pl.create_tensor([batch, DSPARK_QUERY_WIDTH, VOCAB], dtype=pl.FP32)
     flat_logits = pl.reshape(base_logits, [rows, VOCAB])
     if LM_HEAD_TP_SIZE == 1:
-        logits_ready_tid = lm_head_project(normalized, lm_head_weight, flat_logits, LM_HEAD_M_TILE)
+        rounded_logits = pl.create_tensor([rows, VOCAB], dtype=pl.BF16)
+        projected = lm_head_project(normalized, lm_head_weight, rounded_logits, LM_HEAD_M_TILE)
+        flat_logits, logits_ready_tid = lm_head_cast_logits(rounded_logits, flat_logits, projected)
         # The caller supplies the already resolved anchor: decode passes the
         # accepted target token, while prefill passes next_prefill_tokens.
         markov_sample_inline(
@@ -398,7 +400,7 @@ def _markov_sample_from_hidden(
                 group_base,
                 tp_rank,
                 logits_epoch + chunk,
-                completed_epochs,
+                completed_epochs, logits_epoch,
             )
             with pl.spmd(MAX_LOGIT_ROWS, name_hint="dspark_pack_logits", deps=[logits_ready_tid]) as logits_ready_tid:
                 row = pl.tile.get_block_idx()
@@ -453,12 +455,12 @@ def l3_markov_sample_from_hidden(
     confidences.bind_dynamic(1, B_DYN)
     hidden_window_buf = pld.alloc_window_buffer([GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
     hidden_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-    logits_window_buf = pld.alloc_window_buffer([MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
+    logits_window_buf = pld.alloc_window_buffer([MAX_LOGIT_ROWS, VOCAB], dtype=pl.BF16)
     logits_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
         hidden_window = pld.window(hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
         hidden_done = pld.window(hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-        logits_window = pld.window(logits_window_buf, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
+        logits_window = pld.window(logits_window_buf, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.BF16)
         logits_done = pld.window(logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         l2_markov_sample_from_hidden(
             head_hidden[rank],

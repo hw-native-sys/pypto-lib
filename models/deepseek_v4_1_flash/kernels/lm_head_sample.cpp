@@ -78,6 +78,9 @@ __tf__ __aicore__ inline void reduce_panel(
                 MaskReg valid = CreatePredicate<float>(remaining);
                 RegTensor<float> current;
                 vlds(current, src, row * 512 + segment * 64, NORM);
+                RegTensor<bfloat16_t> rounded;
+                vcvt(rounded, current, valid, ROUND_R, RS_DISABLE, PART_EVEN);
+                vcvt(current, rounded, valid, PART_EVEN);
                 MaskReg better;
                 vcmp_gt(better, current, best, valid);
                 pand(better, better, valid, all);

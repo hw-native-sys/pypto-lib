@@ -15,8 +15,8 @@ template <int Vocabulary>
 __aicore__ inline void project_head(__gm__ int64_t* args) {
     auto hidden = reinterpret_cast<__gm__ Tensor*>(args[0]);
     auto output = reinterpret_cast<__gm__ Tensor*>(args[2]);
-    StoreOutput<float> emit{data<float>(args, 2), output->strides[0]};
-    project<5120, Vocabulary, 512, 128, 32, 3, Layout::NZ>(
+    StoreOutput<BFloat> emit{data<BFloat>(args, 2), output->strides[0]};
+    project<5120, Vocabulary, 256, 256, 64, 2, Layout::NZ, 192>(
         data<BFloat>(args, 0), data<BFloat>(args, 1), args[3], hidden->shapes[0],
         hidden->strides[0], 0, args[5], get_block_idx(args), get_block_num(args), emit);
 }
