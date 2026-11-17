@@ -11,9 +11,11 @@
 import pypto.language as pl
 import pypto.language.distributed as pld
 from .prefill_gate_exchange import exchange_gate_columns
-from .prefill_moe_geometry import PREFILL_MOE_SHARE_GATE, GATE_WINDOW_ROWS, N_RANKS
+from .prefill_moe_geometry import PREFILL_MOE_QUANT_GRID, PREFILL_MOE_OWNER_PREPARE, PREFILL_MOE_SHARE_GATE, GATE_WINDOW_ROWS, N_RANKS
 from .config import FLASH as M, FP32_NEG_INF, INT8_SCALE_MAX, INT8_AMAX_EPS
 from .prefill_moe_geometry import T, PREFILL_MOE_FUSED_NORM_QUANT
+
+GATE_PREP_ROWS = pl.dynamic("LOWLAT_PREFILL_GATE_PREPARATION_ROWS")
 
 D = M.hidden_size
 NORM_EPS = M.rms_norm_eps
@@ -55,18 +57,18 @@ def _router_scores(route_logits: pl.Tensor[[GATE_T_TILE, N_EXPERTS], pl.FP32]) -
 
 @pl.jit.inline(auto_scope=False)
 def gate(
-    x_mixed: pl.Tensor[[T, D], pl.BF16],
+    x_mixed: pl.Tensor[[GATE_PREP_ROWS, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.BF16],
     gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
     gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
-    input_ids: pl.Tensor[[T], pl.INT64],
-    x_norm_i8: pl.Tensor[[T, D], pl.INT8],
-    x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
-    indices: pl.Tensor[[T, ROUTE_ROW_PAD], pl.INT32],
-    weights: pl.Tensor[[T, ROUTE_ROW_PAD], pl.FP32],
+    input_ids: pl.Tensor[[GATE_PREP_ROWS], pl.INT64],
+    x_norm_i8: pl.Tensor[[GATE_PREP_ROWS, D], pl.INT8],
+    x_norm_scale: pl.Tensor[[GATE_PREP_ROWS, 1], pl.FP32],
+    indices: pl.Tensor[[GATE_PREP_ROWS, ROUTE_ROW_PAD], pl.INT32],
+    weights: pl.Tensor[[GATE_PREP_ROWS, ROUTE_ROW_PAD], pl.FP32],
     gate_window: pld.DistributedTensor[[GATE_WINDOW_ROWS, N_EXPERTS], pl.FP32],
     gate_signal: pld.DistributedTensor[[N_RANKS, 16], pl.INT32],
     gate_rank: pl.Scalar[pl.INT32],
@@ -75,20 +77,25 @@ def gate(
 ):
 
 
-    xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
-    inv_rms_buf = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
+    gate_rows = pl.tensor.dim(x_mixed, 0)
+    gate_padded_rows = ((gate_rows + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
+    owner_tasks = pl.array.create(2, pl.TASK_ID)
+    owner_tasks[0] = previous_gate
+    owner_tasks[1] = previous_gate
+    xg_buf = pl.create_tensor([gate_padded_rows, D], dtype=pl.FP32)
+    inv_rms_buf = pl.create_tensor([gate_padded_rows, 1], dtype=pl.FP32)
 
 
-    xn_scale_buf = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
+    xn_scale_buf = pl.create_tensor([gate_padded_rows, 1], dtype=pl.FP32)
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
         active_tokens = pl.cast(0, pl.INDEX)
-    if active_tokens > T:
-        active_tokens = pl.cast(T, pl.INDEX)
+    if active_tokens > gate_rows:
+        active_tokens = pl.cast(gate_rows, pl.INDEX)
     active_gate_tiles = (active_tokens + GATE_M_TILE - 1) // GATE_M_TILE
     active_gate_tokens = active_gate_tiles * GATE_M_TILE
-    if active_gate_tokens > T:
-        active_gate_tokens = pl.cast(T, pl.INDEX)
+    if active_gate_tokens > gate_rows:
+        active_gate_tokens = pl.cast(gate_rows, pl.INDEX)
 
 
     norm_w_2d = pl.reshape(norm_w, [1, D])
@@ -138,31 +145,49 @@ def gate(
                 fused_xn_q_i8 = pl.cast(fused_xn_q_half, pl.INT8, mode="trunc", saturation_mode="on")
                 pl.tile.store(fused_xn_q_i8, [tok, 0], x_norm_i8, shapes=[1, D])
 
-    if PREFILL_MOE_FUSED_NORM_QUANT == 0:
-        seed_dummy = pl.system.task_dummy(deps=[])
+    if PREFILL_MOE_QUANT_GRID != 0:
+        with pl.spmd((active_gate_tokens + T_TILE - 1) // T_TILE, name_hint="x_norm_quant_owner", allow_early_resolve=True) as owner_quantized:
+            owner_t0 = pl.tile.get_block_idx() * T_TILE
+            owner_quant_rows = pl.min(T_TILE, active_gate_tokens - owner_t0)
+            owner_xn_sq_col = pl.slice(xn_scale_buf, [T_TILE, 1], [owner_t0, 0], valid_shape=[owner_quant_rows, 1])
+            for owner_xq_b_k in pl.pipeline(0, D, QUANT_TILE, stage=2):
+                owner_xn_input = pl.slice(
+                    xg_buf, [T_TILE, QUANT_TILE], [owner_t0, owner_xq_b_k], valid_shape=[owner_quant_rows, QUANT_TILE]
+                )
+                owner_xn_q_scaled = pl.row_expand_mul(owner_xn_input, owner_xn_sq_col)
+                owner_xn_q_i32 = pl.cast(owner_xn_q_scaled, pl.INT32, mode="rint")
+                owner_xn_q_half = pl.cast(owner_xn_q_i32, pl.FP16, mode="round")
+                owner_xn_q_i8 = pl.cast(owner_xn_q_half, pl.INT8, mode="trunc", saturation_mode="on")
+                owner_xn_q_valid = pl.set_validshape(owner_xn_q_i8, owner_quant_rows, QUANT_TILE)
+                x_norm_i8[owner_t0 : owner_t0 + T_TILE, owner_xq_b_k : owner_xq_b_k + QUANT_TILE] = owner_xn_q_valid
+
+        owner_tasks[0] = owner_quantized
+    else:
+        if PREFILL_MOE_FUSED_NORM_QUANT == 0:
+            seed_dummy = pl.system.task_dummy(deps=[])
 
 
-        for t0 in pl.parallel(0, active_gate_tokens, T_TILE):
-            with pl.at(
-                level=pl.Level.CORE_GROUP,
-                name_hint="x_norm_quant",
-                deps=[seed_dummy],
-                allow_early_resolve=True,
-            ):
-                quant_rows = pl.min(T_TILE, active_gate_tokens - t0)
-                xn_sq_col = pl.slice(xn_scale_buf, [T_TILE, 1], [t0, 0], valid_shape=[quant_rows, 1])
-                for xq_b_k in pl.pipeline(0, D, QUANT_TILE, stage=2):
-                    xn_input = pl.slice(
-                        xg_buf, [T_TILE, QUANT_TILE], [t0, xq_b_k], valid_shape=[quant_rows, QUANT_TILE]
-                    )
-                    xn_q_scaled = pl.row_expand_mul(xn_input, xn_sq_col)
-                    xn_q_i32 = pl.cast(xn_q_scaled, pl.INT32, mode="rint")
-                    xn_q_half = pl.cast(xn_q_i32, pl.FP16, mode="round")
-                    xn_q_i8 = pl.cast(xn_q_half, pl.INT8, mode="trunc", saturation_mode="on")
-                    xn_q_valid = pl.set_validshape(xn_q_i8, quant_rows, QUANT_TILE)
-                    x_norm_i8[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE] = xn_q_valid
+            for t0 in pl.parallel(0, active_gate_tokens, T_TILE):
+                with pl.at(
+                    level=pl.Level.CORE_GROUP,
+                    name_hint="x_norm_quant",
+                    deps=[seed_dummy],
+                    allow_early_resolve=True,
+                ):
+                    quant_rows = pl.min(T_TILE, active_gate_tokens - t0)
+                    xn_sq_col = pl.slice(xn_scale_buf, [T_TILE, 1], [t0, 0], valid_shape=[quant_rows, 1])
+                    for xq_b_k in pl.pipeline(0, D, QUANT_TILE, stage=2):
+                        xn_input = pl.slice(
+                            xg_buf, [T_TILE, QUANT_TILE], [t0, xq_b_k], valid_shape=[quant_rows, QUANT_TILE]
+                        )
+                        xn_q_scaled = pl.row_expand_mul(xn_input, xn_sq_col)
+                        xn_q_i32 = pl.cast(xn_q_scaled, pl.INT32, mode="rint")
+                        xn_q_half = pl.cast(xn_q_i32, pl.FP16, mode="round")
+                        xn_q_i8 = pl.cast(xn_q_half, pl.INT8, mode="trunc", saturation_mode="on")
+                        xn_q_valid = pl.set_validshape(xn_q_i8, quant_rows, QUANT_TILE)
+                        x_norm_i8[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE] = xn_q_valid
 
-    gate_logits_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
+    gate_logits_buf = pl.create_tensor([gate_padded_rows, SCORE_PAD], dtype=pl.FP32)
     GATE_N_BLOCKS = N_EXPERTS // GATE_N_TILE
     if PREFILL_MOE_SHARE_GATE != 0:
         GATE_N_BLOCKS = GATE_N_BLOCKS // N_RANKS
@@ -197,7 +222,8 @@ def gate(
 
     if active_route_tiles > 0:
         if layer_id < N_HASH_LAYERS:
-            for th_idx in pl.spmd(active_route_tiles, name_hint="route_hash", allow_early_resolve=True, deps=[gate_route_ready]):
+            with pl.spmd(active_route_tiles, name_hint="route_hash", allow_early_resolve=True, deps=[gate_route_ready]) as owner_hashed:
+                th_idx = pl.tile.get_block_idx()
                 t1 = th_idx * GATE_T_TILE
                 route_logits = pl.slice(gate_logits_buf, [GATE_T_TILE, N_EXPERTS], [t1, 0])
                 route_inv_rms = pl.read(inv_rms_buf, [t1, 0])
@@ -218,8 +244,11 @@ def gate(
                 hs_indices_valid = pl.set_validshape(hs_idx_tile, GATE_T_TILE, TOPK)
                 indices = pl.assemble(indices, hs_indices_valid, [t1, 0])
                 weights = pl.assemble(weights, hs_weight_mat, [t1, 0])
+            if PREFILL_MOE_OWNER_PREPARE != 0:
+                owner_tasks[1] = owner_hashed
         else:
-            for ts_idx in pl.spmd(active_route_tiles, name_hint="route_sort", allow_early_resolve=True, deps=[gate_route_ready]):
+            with pl.spmd(active_route_tiles, name_hint="route_sort", allow_early_resolve=True, deps=[gate_route_ready]) as owner_sorted:
+                ts_idx = pl.tile.get_block_idx()
                 t1 = ts_idx * GATE_T_TILE
                 route_logits = pl.slice(gate_logits_buf, [GATE_T_TILE, N_EXPERTS], [t1, 0])
                 route_inv_rms = pl.read(inv_rms_buf, [t1, 0])
@@ -254,4 +283,12 @@ def gate(
                 indices = pl.assemble(indices, nm_indices_valid, [t1, 0])
                 weights = pl.assemble(weights, nm_weight_mat, [t1, 0])
 
+            if PREFILL_MOE_OWNER_PREPARE != 0:
+                owner_tasks[1] = owner_sorted
+
+    if PREFILL_MOE_OWNER_PREPARE != 0:
+        owner_quant_scalar = owner_tasks[0]
+        owner_route_scalar = owner_tasks[1]
+        owner_gate_done = pl.system.task_dummy(deps=[owner_quant_scalar, owner_route_scalar])
+        gate_tasks[0] = owner_gate_done
     return weights, gate_tasks[0]

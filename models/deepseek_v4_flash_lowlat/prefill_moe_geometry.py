@@ -54,6 +54,18 @@ if PREFILL_MOE_FUSED_NORM_QUANT not in (0, 1):
 PREFILL_MOE_COMBINE_ROWS = _parse_int_argv("--prefill-moe-combine-rows", 1)
 if PREFILL_MOE_COMBINE_ROWS not in (1, 4, 8):
     raise ValueError("Prefill combine rows must be 1, 4 or 8")
+PREFILL_MOE_QUANT_GRID = _parse_int_argv("--prefill-moe-quant-grid", 0)
+if PREFILL_MOE_QUANT_GRID not in (0, 1):
+    raise ValueError("Quantization grid must be zero or one")
+if PREFILL_MOE_QUANT_GRID and PREFILL_MOE_FUSED_NORM_QUANT:
+    raise ValueError("Quantization grid requires separate original quantization")
+
+PREFILL_MOE_OWNER_PREPARE = _parse_int_argv("--prefill-moe-owner-prepare", 0)
+if PREFILL_MOE_OWNER_PREPARE not in (0, 1):
+    raise ValueError("Owner preparation must be zero or one")
+if PREFILL_MOE_OWNER_PREPARE and (T < 128 or T % 128):
+    raise ValueError("Owner preparation requires waves divisible by128")
+
 PREFILL_MOE_GATE_COPY_ROWS = _parse_int_argv("--prefill-moe-gate-copy-rows", 16)
 if PREFILL_MOE_GATE_COPY_ROWS not in (16, 64, 128):
     raise ValueError("Prefill gate copy rows must be16,64 or128")
@@ -61,6 +73,8 @@ if PREFILL_MOE_GATE_COPY_ROWS not in (16, 64, 128):
 PREFILL_MOE_SHARE_GATE = _parse_int_argv("--prefill-moe-share-gate", 0)
 if PREFILL_MOE_SHARE_GATE not in (0, 1):
     raise ValueError("Prefill gate sharing must be zero or one")
+if PREFILL_MOE_OWNER_PREPARE and (PREFILL_MOE_SHARE_GATE or not PREFILL_MOE_QUANT_GRID or PREFILL_MOE_FUSED_NORM_QUANT):
+    raise ValueError("Owner preparation requires unshared gate and grouped original quantization")
 
 PREFILL_MOE_LOCAL_ROUTE_STATE = _parse_int_argv("--prefill-moe-local-route-state", 0)
 if PREFILL_MOE_LOCAL_ROUTE_STATE not in (0, 1):
@@ -93,3 +107,6 @@ REDUCE_T_TILE = 8
 REDUCE_D_TILE = 512
 
 GATE_WINDOW_ROWS = 2 * T_PAD
+
+OWNER_WINDOW_ROWS = 2 * T_PAD
+PREP_OWNER_ROWS = T // N_RANKS

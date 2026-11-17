@@ -107,7 +107,7 @@ def _validate_target_capacity(metadata, profile, max_seq_len):
 
 def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=180, max_seq_len=1048576,
                     prefill_indexer_arenas=1, projection_degrees=None, prefill_moe_ready=None,
-                    prefill_moe_wave_tokens=None, prefill_moe_owner_reduce=False, prefill_moe_expert_affinity=False, prefill_moe_batched_gather=False, prefill_moe_direct_post=False, prefill_moe_combine_rows=1, prefill_moe_fused_norm_quant=False, prefill_moe_gate_copy_rows=16, prefill_moe_share_gate=False, prefill_moe_local_route_state=False, prefill_oproj_b_batched=False, prefill_oproj_a_batched=False,
+                    prefill_moe_wave_tokens=None, prefill_moe_owner_reduce=False, prefill_moe_expert_affinity=False, prefill_moe_batched_gather=False, prefill_moe_direct_post=False, prefill_moe_combine_rows=1, prefill_moe_fused_norm_quant=False, prefill_moe_gate_copy_rows=16, prefill_moe_quant_grid=False, prefill_moe_owner_prepare=False, prefill_moe_share_gate=False, prefill_moe_local_route_state=False, prefill_oproj_b_batched=False, prefill_oproj_a_batched=False,
 
                     prefill_causal_ready=False, prefill_causal_full_wait=False,
                     prefill_echo_prefetch=False, prefill_echo_diagnostics=False, prefill_mechanisms=None):
@@ -128,6 +128,13 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
         raise ValueError("Gate copy rows must be16,64 or128")
     if prefill_moe_gate_copy_rows != 16 and (profile != "prefill" or not prefill_moe_share_gate):
         raise ValueError("Gate transfer tuning requires prefill shared gate")
+    if type(prefill_moe_quant_grid) is not bool or (prefill_moe_quant_grid and (profile != "prefill" or prefill_moe_fused_norm_quant)):
+        raise ValueError("Quantization grid requires prefill and original separate quantization")
+    if type(prefill_moe_owner_prepare) is not bool or (prefill_moe_owner_prepare and profile != "prefill"):
+        raise ValueError("Owner preparation is a prefill-only boolean option")
+    owner_wave_tokens = 2048 if prefill_moe_wave_tokens is None else prefill_moe_wave_tokens
+    if prefill_moe_owner_prepare and (prefill_moe_share_gate or not prefill_moe_quant_grid or prefill_moe_fused_norm_quant or type(owner_wave_tokens) is not int or owner_wave_tokens < 128 or owner_wave_tokens % 128):
+        raise ValueError("Owner preparation requires unshared gate, original quantization and waves divisible by128")
     if type(prefill_moe_share_gate) is not bool or (prefill_moe_share_gate and profile != "prefill"):
         raise ValueError("Gate sharing is a prefill-only boolean compile option")
     if type(prefill_moe_local_route_state) is not bool or (prefill_moe_local_route_state and profile != "prefill"):
@@ -227,7 +234,7 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
 
             function = load_prefill_programs(
                 indexer_arenas=prefill_indexer_arenas, projection_degrees=projection_degrees,
-                moe_ready=prefill_moe_ready, moe_wave_tokens=prefill_moe_wave_tokens, moe_owner_reduce=prefill_moe_owner_reduce, moe_expert_affinity=prefill_moe_expert_affinity, moe_batched_gather=prefill_moe_batched_gather, moe_direct_post=prefill_moe_direct_post, moe_combine_rows=prefill_moe_combine_rows, moe_fused_norm_quant=prefill_moe_fused_norm_quant, moe_gate_copy_rows=prefill_moe_gate_copy_rows, moe_share_gate=prefill_moe_share_gate, moe_local_route_state=prefill_moe_local_route_state, oproj_b_batched=prefill_oproj_b_batched, oproj_a_batched=prefill_oproj_a_batched,
+                moe_ready=prefill_moe_ready, moe_wave_tokens=prefill_moe_wave_tokens, moe_owner_reduce=prefill_moe_owner_reduce, moe_expert_affinity=prefill_moe_expert_affinity, moe_batched_gather=prefill_moe_batched_gather, moe_direct_post=prefill_moe_direct_post, moe_combine_rows=prefill_moe_combine_rows, moe_fused_norm_quant=prefill_moe_fused_norm_quant, moe_gate_copy_rows=prefill_moe_gate_copy_rows, moe_quant_grid=prefill_moe_quant_grid, moe_owner_prepare=prefill_moe_owner_prepare, moe_share_gate=prefill_moe_share_gate, moe_local_route_state=prefill_moe_local_route_state, oproj_b_batched=prefill_oproj_b_batched, oproj_a_batched=prefill_oproj_a_batched,
                 causal_ready=prefill_causal_ready,
                 causal_full_wait=prefill_causal_full_wait,
                 echo_prefetch=prefill_echo_prefetch, echo_diagnostics=prefill_echo_diagnostics,
@@ -311,7 +318,7 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
             indexer_arenas=prefill_indexer_arenas,
             moe_ready=prefill_moe_ready,
             moe_wave_tokens=prefill_moe_wave_tokens,
-            moe_owner_reduce=prefill_moe_owner_reduce, moe_expert_affinity=prefill_moe_expert_affinity, moe_batched_gather=prefill_moe_batched_gather, moe_direct_post=prefill_moe_direct_post, moe_combine_rows=prefill_moe_combine_rows, moe_fused_norm_quant=prefill_moe_fused_norm_quant, moe_gate_copy_rows=prefill_moe_gate_copy_rows, moe_share_gate=prefill_moe_share_gate, moe_local_route_state=prefill_moe_local_route_state, oproj_b_batched=prefill_oproj_b_batched, oproj_a_batched=prefill_oproj_a_batched,
+            moe_owner_reduce=prefill_moe_owner_reduce, moe_expert_affinity=prefill_moe_expert_affinity, moe_batched_gather=prefill_moe_batched_gather, moe_direct_post=prefill_moe_direct_post, moe_combine_rows=prefill_moe_combine_rows, moe_fused_norm_quant=prefill_moe_fused_norm_quant, moe_gate_copy_rows=prefill_moe_gate_copy_rows, moe_quant_grid=prefill_moe_quant_grid, moe_owner_prepare=prefill_moe_owner_prepare, moe_share_gate=prefill_moe_share_gate, moe_local_route_state=prefill_moe_local_route_state, oproj_b_batched=prefill_oproj_b_batched, oproj_a_batched=prefill_oproj_a_batched,
             moe_expert_tile_tokens=16,
             moe_copy_tile=[4, 2048], moe_reduce_tile=[8, 512],
             moe_waves_per_chunk=(8192 + prefill_moe_wave_tokens - 1) // prefill_moe_wave_tokens,
@@ -351,6 +358,8 @@ def main():
     parser.add_argument("--prefill-mechanisms", choices=("none", "echo-only", "causal-only", "both"))
     parser.add_argument("--prefill-moe-combine-rows", type=int, choices=(1, 4, 8), default=1)
     parser.add_argument("--prefill-moe-gate-copy-rows", type=int, choices=(16, 64, 128), default=16)
+    parser.add_argument("--prefill-moe-quant-grid", action="store_true")
+    parser.add_argument("--prefill-moe-owner-prepare", action="store_true")
     parser.add_argument("--prefill-moe-share-gate", action="store_true")
     parser.add_argument("--prefill-moe-local-route-state", action="store_true")
     parser.add_argument("--prefill-moe-fused-norm-quant", action="store_true")
@@ -382,6 +391,8 @@ def main():
         prefill_oproj_a_batched=args.prefill_oproj_a_batched,
         prefill_moe_fused_norm_quant=args.prefill_moe_fused_norm_quant,
         prefill_moe_gate_copy_rows=args.prefill_moe_gate_copy_rows,
+        prefill_moe_quant_grid=args.prefill_moe_quant_grid,
+        prefill_moe_owner_prepare=args.prefill_moe_owner_prepare,
         prefill_moe_share_gate=args.prefill_moe_share_gate,
         prefill_moe_local_route_state=args.prefill_moe_local_route_state,
         prefill_moe_combine_rows=args.prefill_moe_combine_rows,

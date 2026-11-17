@@ -893,3 +893,15 @@ and ragged cases within their allocated lane. The128-row collect uses128KiB of
 vector tile storage and must pass actual native allocation checks. A larger
 copy tile may reduce task overhead while exposing less transfer parallelism;
 select it only from complete bitwise and ordinary device controls.
+
+The experimental prefill-only `--prefill-moe-quant-grid` groups the original
+M8/N256 quantization body into one SPMD grid. `--prefill-moe-owner-prepare`
+requires this grid, original separate quantization, column-gate sharing disabled,
+and a wave size divisible by128. Each TP8 rank computes one contiguous eighth
+of the original per-token HC/norm/gate/exact-selection work and exchanges real
+INT8 activations, FP32 scales/post/comb/route weights and INT32 route IDs.
+Original full-wave route allocation, expert fragments, rank sum and HC post are
+retained. The windows use two compute credits and monotonic call reservations.
+Padded rows execute real preparation on staged zeros; original active routing
+masks remain authoritative. Both options are off by default and require full
+bitwise and ordinary device qualification before performance promotion.

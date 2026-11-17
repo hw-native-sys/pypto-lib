@@ -10,7 +10,8 @@
 
 import pypto.language as pl
 import pypto.language.distributed as pld
-from .prefill_moe_geometry import GATE_WINDOW_ROWS, N_RANKS
+from .prefill_moe_geometry import GATE_WINDOW_ROWS, N_RANKS, PREFILL_MOE_OWNER_PREPARE, OWNER_WINDOW_ROWS, PREP_OWNER_ROWS
+from .prefill_owner_prepare import exchange_preparation
 from .hc_pre import hc_pre
 from .prefill_moe_gate import gate, ROUTE_ROW_PAD
 from .prefill_moe_expert import expert_routed_persistent_planned
@@ -36,6 +37,7 @@ def route_group(
     slot_expert: pl.Tensor[[N_SLOTS_B, IDX_PAD], pl.INT32],
     route_slot_row: pl.Tensor[[N_ROUTES, IDX_PAD], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
+    preparation_ready: pl.Scalar[pl.TASK_ID],
 ):
     """Group routes into bounded sixteen-row expert tiles and shared tiles."""
     recv_x_flat = pl.reshape(recv_x, [N_SLOTS_B * RECV_MAX, D])
@@ -74,7 +76,7 @@ def route_group(
         active_tokens = pl.cast(T, pl.INDEX)
 
 
-    with pl.spmd(1, name_hint="route_group_scalar", allow_early_resolve=True, deps=[init_tid]) as scalar_tid:
+    with pl.spmd(1, name_hint="route_group_scalar", allow_early_resolve=True, deps=[init_tid, preparation_ready]) as scalar_tid:
         scalar_core = pl.tile.get_block_idx()
         if PREFILL_MOE_LOCAL_ROUTE_STATE != 0:
             local_experts = pl.tile.full([1, N_EXPERTS], dtype=pl.INT32, value=-1)
@@ -239,25 +241,59 @@ def prepare_moe(
     gate_rank: pl.Scalar[pl.INT32],
     gate_epoch: pl.Scalar[pl.INT32],
     previous_gate: pl.Scalar[pl.TASK_ID],
+    owner_norm_window: pld.DistributedTensor[[OWNER_WINDOW_ROWS, D], pl.INT8],
+    owner_scale_window: pld.DistributedTensor[[1, OWNER_WINDOW_ROWS], pl.FP32],
+    owner_post_window: pld.DistributedTensor[[1, OWNER_WINDOW_ROWS * HC_MULT], pl.FP32],
+    owner_comb_window: pld.DistributedTensor[[OWNER_WINDOW_ROWS, HC_MULT * HC_MULT], pl.FP32],
+    owner_indices_window: pld.DistributedTensor[[OWNER_WINDOW_ROWS, 16], pl.INT32],
+    owner_weights_window: pld.DistributedTensor[[OWNER_WINDOW_ROWS, 16], pl.FP32],
 ):
-    x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32, manual_dep=True)
     comb_ffn = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre(
-        x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        x_mixed, post_ffn, comb_ffn,
-    )
-
     x_norm_i8 = pl.create_tensor([T, D], dtype=pl.INT8)
     x_norm_scale = pl.create_tensor([T, 1], dtype=pl.FP32, manual_dep=True)
     indices = pl.create_tensor([T, ROUTE_ROW_PAD], dtype=pl.INT32)
     weights = pl.create_tensor([T, ROUTE_ROW_PAD], dtype=pl.FP32)
-    gate_weights, gate_finished = gate(
-        x_mixed, norm_w, gate_w, gate_bias,
-        layer_id, num_tokens, tid2eid, input_ids,
-        x_norm_i8, x_norm_scale, indices, weights,
-        gate_window, gate_signal, gate_rank, gate_epoch, previous_gate,
-    )
+    prepared = pl.array.create(1, pl.TASK_ID)
+    prepared[0] = previous_gate
+    if PREFILL_MOE_OWNER_PREPARE != 0:
+        owner_offset = pl.cast(gate_rank, pl.INDEX) * PREP_OWNER_ROWS
+        owner_hc = pl.slice(x_hc, [PREP_OWNER_ROWS, HC_MULT, D], [owner_offset, 0, 0])
+        owner_ids = pl.slice(input_ids, [PREP_OWNER_ROWS], [owner_offset])
+        owner_mixed = pl.create_tensor([PREP_OWNER_ROWS, D], dtype=pl.BF16)
+        owner_post = pl.create_tensor([PREP_OWNER_ROWS, HC_MULT], dtype=pl.FP32)
+        owner_comb = pl.create_tensor([PREP_OWNER_ROWS, HC_MULT * HC_MULT], dtype=pl.FP32)
+        owner_norm = pl.create_tensor([PREP_OWNER_ROWS, D], dtype=pl.INT8)
+        owner_scale = pl.create_tensor([PREP_OWNER_ROWS, 1], dtype=pl.FP32)
+        owner_indices = pl.create_tensor([PREP_OWNER_ROWS, ROUTE_ROW_PAD], dtype=pl.INT32)
+        owner_weights = pl.create_tensor([PREP_OWNER_ROWS, ROUTE_ROW_PAD], dtype=pl.FP32)
+        hc_pre(owner_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, owner_mixed, owner_post, owner_comb)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_owner_route_padding_init"):
+            owner_indices[:, :] = pl.full([PREP_OWNER_ROWS, ROUTE_ROW_PAD], dtype=pl.INT32, value=0)
+            owner_weights[:, :] = pl.full([PREP_OWNER_ROWS, ROUTE_ROW_PAD], dtype=pl.FP32, value=0.0)
+        owner_gate_weights, owner_gate_done = gate(owner_mixed, norm_w, gate_w, gate_bias, layer_id, pl.const(PREP_OWNER_ROWS, pl.INT32), tid2eid, owner_ids, owner_norm, owner_scale, owner_indices, owner_weights, gate_window, gate_signal, gate_rank, gate_epoch, previous_gate)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_owner_hc_completion") as owner_hc_done:
+            pl.write(owner_post, [0, 0], pl.read(owner_post, [0, 0]))
+            pl.write(owner_comb, [0, 0], pl.read(owner_comb, [0, 0]))
+        owner_fields_done = pl.system.task_dummy(deps=[owner_gate_done, owner_hc_done])
+        owner_collected = exchange_preparation(owner_norm, owner_scale, owner_post, owner_comb, owner_indices, owner_weights, x_norm_i8, x_norm_scale, post_ffn, comb_ffn, indices, weights, owner_norm_window, owner_scale_window, owner_post_window, owner_comb_window, owner_indices_window, owner_weights_window, gate_signal, gate_rank, gate_epoch, owner_fields_done, previous_gate)
+        prepared[0] = owner_collected
+    else:
+        x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+        hc_pre(
+            x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+            x_mixed, post_ffn, comb_ffn,
+        )
+
+        gate_weights, legacy_gate_finished = gate(
+            x_mixed, norm_w, gate_w, gate_bias,
+            layer_id, num_tokens, tid2eid, input_ids,
+            x_norm_i8, x_norm_scale, indices, weights,
+            gate_window, gate_signal, gate_rank, gate_epoch, previous_gate,
+        )
+
+        prepared[0] = legacy_gate_finished
+    gate_finished = prepared[0]
 
     recv_x = pl.create_tensor([N_SLOTS_B, RECV_MAX, D], dtype=pl.INT8)
     recv_scale = pl.create_tensor([N_SLOTS_B, RECV_MAX], dtype=pl.FP32)
@@ -269,7 +305,7 @@ def prepare_moe(
     route_group(
         indices, weights, x_norm_i8, x_norm_scale,
         recv_x, recv_scale, recv_w, work_slot, work_rows, slot_expert, route_slot_row,
-        num_tokens,
+        num_tokens, gate_finished,
     )
     return post_ffn, comb_ffn, recv_x, recv_scale, recv_w, work_slot, work_rows, slot_expert, route_slot_row, gate_finished
 

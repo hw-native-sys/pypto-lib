@@ -20,7 +20,7 @@ import pypto.language.distributed as pld
 
 from models.deepseek_v4_flash_lowlat.prefill_moe import (
     D, HC_DIM, HC_MULT, MIX_HC, MOE_INTER, N_BANK, N_EXPERTS, N_RANKS,
-    PREFILL_MOE_SHARE_GATE, GATE_WINDOW_ROWS, REDUCE_WINDOW_ROWS, RESULT_WINDOW_ROWS, PREFILL_MOE_OWNER_REDUCE, PREFILL_MOE_EXPERT_AFFINITY, PREFILL_MOE_BATCHED_GATHER, PREFILL_MOE_DIRECT_POST, T as MOE_WAVE_TOKENS, TOPK, VOCAB, prefill_moe_tp, clear_prefill_moe_tp_signals,
+    PREFILL_MOE_OWNER_PREPARE, OWNER_WINDOW_ROWS, PREFILL_MOE_SHARE_GATE, GATE_WINDOW_ROWS, REDUCE_WINDOW_ROWS, RESULT_WINDOW_ROWS, PREFILL_MOE_OWNER_REDUCE, PREFILL_MOE_EXPERT_AFFINITY, PREFILL_MOE_BATCHED_GATHER, PREFILL_MOE_DIRECT_POST, T as MOE_WAVE_TOKENS, TOPK, VOCAB, prefill_moe_tp, clear_prefill_moe_tp_signals,
 )
 N_LOCAL = N_BANK
 N_EXPERTS_GLOBAL = N_EXPERTS
@@ -257,6 +257,12 @@ def prefill_tp8_fwd(
     terminal: pl.Scalar[pl.INT32],
     gate_window: pld.DistributedTensor[[GATE_WINDOW_ROWS, N_EXPERTS], pl.FP32],
     gate_signal: pld.DistributedTensor[[N_RANKS, 16], pl.INT32],
+    owner_norm_window: pld.DistributedTensor[[OWNER_WINDOW_ROWS, D], pl.INT8],
+    owner_scale_window: pld.DistributedTensor[[1, OWNER_WINDOW_ROWS], pl.FP32],
+    owner_post_window: pld.DistributedTensor[[1, OWNER_WINDOW_ROWS * HC_MULT], pl.FP32],
+    owner_comb_window: pld.DistributedTensor[[OWNER_WINDOW_ROWS, HC_MULT * HC_MULT], pl.FP32],
+    owner_indices_window: pld.DistributedTensor[[OWNER_WINDOW_ROWS, 16], pl.INT32],
+    owner_weights_window: pld.DistributedTensor[[OWNER_WINDOW_ROWS, 16], pl.FP32],
     tp_reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.FP32],
     tp_reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     tp_result_window: pld.DistributedTensor[[RESULT_WINDOW_ROWS, D], pl.BF16],
@@ -425,6 +431,7 @@ def prefill_tp8_fwd(
                 tp_reduce_window, tp_reduce_signal, tp_result_window, tp_result_signal, layer_l0, group_tokens, my_rank,
                 layer_l0 * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
                 gate_window, gate_signal, causal_epoch_base, previous_gate_1,
+                owner_norm_window, owner_scale_window, owner_post_window, owner_comb_window, owner_indices_window, owner_weights_window,
             )
             gate_previous[0] = moe_gate_finished_1
 
@@ -508,6 +515,7 @@ def prefill_tp8_fwd(
                 tp_reduce_window, tp_reduce_signal, tp_result_window, tp_result_signal, layer_l1, group_tokens, my_rank,
                 layer_l1 * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
                 gate_window, gate_signal, causal_epoch_base, previous_gate_2,
+                owner_norm_window, owner_scale_window, owner_post_window, owner_comb_window, owner_indices_window, owner_weights_window,
             )
             gate_previous[0] = moe_gate_finished_2
 
@@ -664,6 +672,7 @@ def prefill_tp8_fwd(
                     tp_reduce_window, tp_reduce_signal, tp_result_window, tp_result_signal, csa_layer, group_tokens, my_rank,
                     csa_layer * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
                     gate_window, gate_signal, causal_epoch_base, previous_gate_3,
+                owner_norm_window, owner_scale_window, owner_post_window, owner_comb_window, owner_indices_window, owner_weights_window,
                 )
                 gate_previous[0] = moe_gate_finished_3
                 if group_tokens > 0:
@@ -786,6 +795,7 @@ def prefill_tp8_fwd(
                     tp_reduce_window, tp_reduce_signal, tp_result_window, tp_result_signal, hca_layer, group_tokens, my_rank,
                     hca_layer * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
                     gate_window, gate_signal, causal_epoch_base, previous_gate_4,
+                owner_norm_window, owner_scale_window, owner_post_window, owner_comb_window, owner_indices_window, owner_weights_window,
                 )
                 gate_previous[0] = moe_gate_finished_4
                 if group_tokens > 0:
@@ -947,10 +957,11 @@ def prefill_tp8_fwd(
                 tp_reduce_window, tp_reduce_signal, tp_result_window, tp_result_signal, layer_last, group_tokens, my_rank,
                 layer_last * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
                 gate_window, gate_signal, causal_epoch_base, previous_gate_5,
+                owner_norm_window, owner_scale_window, owner_post_window, owner_comb_window, owner_indices_window, owner_weights_window,
             )
             gate_previous[0] = moe_gate_finished_5
 
-    if PREFILL_MOE_SHARE_GATE != 0:
+    if PREFILL_MOE_SHARE_GATE != 0 or PREFILL_MOE_OWNER_PREPARE != 0:
         gate_finished_scalar = gate_previous[0]
         gate_reservation = pl.cast(pl.tensor.dim(position_ids_full, 0) * FWD_NUM_LAYERS, pl.INT32)
         gate_unused = gate_reservation - pl.read(stage_token, [0])
@@ -1160,6 +1171,12 @@ def l3_prefill_tp8_fwd(
     csa_state_slot_mapping_full.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     csa_inner_state_slot_mapping_full.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
 
+    owner_norm_window_buf = pld.alloc_window_buffer([OWNER_WINDOW_ROWS, D], dtype=pl.INT8)
+    owner_scale_window_buf = pld.alloc_window_buffer([1, OWNER_WINDOW_ROWS], dtype=pl.FP32)
+    owner_post_window_buf = pld.alloc_window_buffer([1, OWNER_WINDOW_ROWS * HC_MULT], dtype=pl.FP32)
+    owner_comb_window_buf = pld.alloc_window_buffer([OWNER_WINDOW_ROWS, HC_MULT * HC_MULT], dtype=pl.FP32)
+    owner_indices_window_buf = pld.alloc_window_buffer([OWNER_WINDOW_ROWS, 16], dtype=pl.INT32)
+    owner_weights_window_buf = pld.alloc_window_buffer([OWNER_WINDOW_ROWS, 16], dtype=pl.FP32)
     gate_window_buf = pld.alloc_window_buffer([GATE_WINDOW_ROWS, N_EXPERTS], dtype=pl.FP32)
     gate_signal_buf = pld.alloc_window_buffer([N_RANKS, 16], dtype=pl.INT32)
     tp_reduce_window_buf = pld.alloc_window_buffer([REDUCE_WINDOW_ROWS, D], dtype=pl.FP32)
@@ -1194,6 +1211,12 @@ def l3_prefill_tp8_fwd(
         projection_consumed = pld.window(projection_consumed_buf, [PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
         causal_ready_signal = pld.window(causal_ready_buf, [CAUSAL_FAMILIES, 1], dtype=pl.INT32)
 
+        owner_norm_window = pld.window(owner_norm_window_buf, [OWNER_WINDOW_ROWS, D], dtype=pl.INT8)
+        owner_scale_window = pld.window(owner_scale_window_buf, [1, OWNER_WINDOW_ROWS], dtype=pl.FP32)
+        owner_post_window = pld.window(owner_post_window_buf, [1, OWNER_WINDOW_ROWS * HC_MULT], dtype=pl.FP32)
+        owner_comb_window = pld.window(owner_comb_window_buf, [OWNER_WINDOW_ROWS, HC_MULT * HC_MULT], dtype=pl.FP32)
+        owner_indices_window = pld.window(owner_indices_window_buf, [OWNER_WINDOW_ROWS, 16], dtype=pl.INT32)
+        owner_weights_window = pld.window(owner_weights_window_buf, [OWNER_WINDOW_ROWS, 16], dtype=pl.FP32)
         gate_window = pld.window(gate_window_buf, [GATE_WINDOW_ROWS, N_EXPERTS], dtype=pl.FP32)
         gate_signal = pld.window(gate_signal_buf, [N_RANKS, 16], dtype=pl.INT32)
         tp_reduce_window = pld.window(tp_reduce_window_buf, [REDUCE_WINDOW_ROWS, D], dtype=pl.FP32)
@@ -1257,6 +1280,7 @@ def l3_prefill_tp8_fwd(
             dspark_target_hidden[r],
             x_out[r], logits[r], grammar_mask[r], sampled_ids[r], terminal,
             gate_window, gate_signal,
+            owner_norm_window, owner_scale_window, owner_post_window, owner_comb_window, owner_indices_window, owner_weights_window,
             tp_reduce_window, tp_reduce_signal, tp_result_window, tp_result_signal,
             gather_window, gather_signal,
             o_proj_wo_a_window, o_proj_wo_b_window,

@@ -12,7 +12,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 
 from .prefill_moe_geometry import (
-    PREFILL_MOE_SHARE_GATE, GATE_WINDOW_ROWS, D, HC_DIM, HC_MULT, MIX_HC, MOE_INTER, N_BANK, N_EXPERTS, N_RANKS,
+    PREFILL_MOE_OWNER_PREPARE, OWNER_WINDOW_ROWS, PREFILL_MOE_SHARE_GATE, GATE_WINDOW_ROWS, D, HC_DIM, HC_MULT, MIX_HC, MOE_INTER, N_BANK, N_EXPERTS, N_RANKS,
     REDUCE_WINDOW_ROWS, REDUCE_LANE_ROWS, REDUCE_D_TILE, T_PAD, T, TOPK, VOCAB,
     COPY_T_TILE, COPY_D_TILE, REDUCE_T_TILE,
     PREFILL_MOE_BATCHED_GATHER as PREFILL_MOE_BATCHED_GATHER, PREFILL_MOE_DIRECT_POST,
@@ -271,6 +271,12 @@ def prefill_moe_tp(
     gate_signal: pld.DistributedTensor[[N_RANKS, 16], pl.INT32],
     gate_epoch_base: pl.Scalar[pl.INT32],
     prior_gate: pl.Scalar[pl.TASK_ID],
+    owner_norm_window: pld.DistributedTensor[[OWNER_WINDOW_ROWS, D], pl.INT8],
+    owner_scale_window: pld.DistributedTensor[[1, OWNER_WINDOW_ROWS], pl.FP32],
+    owner_post_window: pld.DistributedTensor[[1, OWNER_WINDOW_ROWS * HC_MULT], pl.FP32],
+    owner_comb_window: pld.DistributedTensor[[OWNER_WINDOW_ROWS, HC_MULT * HC_MULT], pl.FP32],
+    owner_indices_window: pld.DistributedTensor[[OWNER_WINDOW_ROWS, 16], pl.INT32],
+    owner_weights_window: pld.DistributedTensor[[OWNER_WINDOW_ROWS, 16], pl.FP32],
 ):
     """Run independent prefill slabs with bounded compute and ordered TP publication."""
     attn_out.bind_dynamic(0, PREFILL_ROWS)
@@ -315,6 +321,7 @@ def prefill_moe_tp(
                 wave_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_w, gate_w, gate_bias,
                 tid2eid, wave_ids, layer_id, pl.cast(active, pl.INT32),
                 gate_window, gate_signal, my_rank, gate_epoch_base + epoch, previous_gate_scalar,
+                owner_norm_window, owner_scale_window, owner_post_window, owner_comb_window, owner_indices_window, owner_weights_window,
             )
             gate_previous[0] = gate_finished
             ffn_partial = moe_local(
@@ -387,6 +394,12 @@ def l2_prefill_moe_tp(
     rank: pl.Scalar[pl.INT32],
     gate_window: pld.DistributedTensor[[GATE_WINDOW_ROWS, N_EXPERTS], pl.FP32],
     gate_signal: pld.DistributedTensor[[N_RANKS, 16], pl.INT32],
+    owner_norm_window: pld.DistributedTensor[[OWNER_WINDOW_ROWS, D], pl.INT8],
+    owner_scale_window: pld.DistributedTensor[[1, OWNER_WINDOW_ROWS], pl.FP32],
+    owner_post_window: pld.DistributedTensor[[1, OWNER_WINDOW_ROWS * HC_MULT], pl.FP32],
+    owner_comb_window: pld.DistributedTensor[[OWNER_WINDOW_ROWS, HC_MULT * HC_MULT], pl.FP32],
+    owner_indices_window: pld.DistributedTensor[[OWNER_WINDOW_ROWS, 16], pl.INT32],
+    owner_weights_window: pld.DistributedTensor[[OWNER_WINDOW_ROWS, 16], pl.FP32],
 ):
     x.bind_dynamic(0, PREFILL_ROWS)
     ids.bind_dynamic(0, PREFILL_ROWS)
@@ -400,8 +413,8 @@ def l2_prefill_moe_tp(
     component_out, component_gate_done = prefill_moe_tp(x, hc_fn, hc_scale, hc_base, norm_w, gate_w, gate_bias,
                    tid2eid, ids, w1, s1, w3, s3, w2, s2, out, stage, completion,
                    reduce_window, reduce_signal, result_window, result_signal, layer_id, group_tokens, rank, pl.const(0, pl.INT32),
-                   gate_window, gate_signal, pl.const(0, pl.INT32), gate_seed)
-    if PREFILL_MOE_SHARE_GATE != 0:
+                   gate_window, gate_signal, pl.const(0, pl.INT32), gate_seed, owner_norm_window, owner_scale_window, owner_post_window, owner_comb_window, owner_indices_window, owner_weights_window)
+    if PREFILL_MOE_SHARE_GATE != 0 or PREFILL_MOE_OWNER_PREPARE != 0:
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_gate_component_cleanup", deps=[component_gate_done]):
             for source in pl.range(N_RANKS):
                 pl.write(gate_signal, [source, 0], pl.const(0, pl.INT32))
@@ -432,6 +445,12 @@ def l3_prefill_moe_tp(
     x.bind_dynamic(1, PREFILL_ROWS)
     ids.bind_dynamic(1, PREFILL_ROWS)
     out.bind_dynamic(1, PREFILL_ROWS)
+    owner_norm_window_buf = pld.alloc_window_buffer([OWNER_WINDOW_ROWS, D], dtype=pl.INT8)
+    owner_scale_window_buf = pld.alloc_window_buffer([1, OWNER_WINDOW_ROWS], dtype=pl.FP32)
+    owner_post_window_buf = pld.alloc_window_buffer([1, OWNER_WINDOW_ROWS * HC_MULT], dtype=pl.FP32)
+    owner_comb_window_buf = pld.alloc_window_buffer([OWNER_WINDOW_ROWS, HC_MULT * HC_MULT], dtype=pl.FP32)
+    owner_indices_window_buf = pld.alloc_window_buffer([OWNER_WINDOW_ROWS, 16], dtype=pl.INT32)
+    owner_weights_window_buf = pld.alloc_window_buffer([OWNER_WINDOW_ROWS, 16], dtype=pl.FP32)
     gate_window_buf = pld.alloc_window_buffer([GATE_WINDOW_ROWS, N_EXPERTS], dtype=pl.FP32)
     gate_signal_buf = pld.alloc_window_buffer([N_RANKS, 16], dtype=pl.INT32)
     rw_buf = pld.alloc_window_buffer([REDUCE_WINDOW_ROWS, D], dtype=pl.FP32)
@@ -439,6 +458,12 @@ def l3_prefill_moe_tp(
     result_buf = pld.alloc_window_buffer([RESULT_WINDOW_ROWS, D], dtype=pl.BF16)
     result_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     for r in pl.range(pld.world_size()):
+        owner_norm_window = pld.window(owner_norm_window_buf, [OWNER_WINDOW_ROWS, D], dtype=pl.INT8)
+        owner_scale_window = pld.window(owner_scale_window_buf, [1, OWNER_WINDOW_ROWS], dtype=pl.FP32)
+        owner_post_window = pld.window(owner_post_window_buf, [1, OWNER_WINDOW_ROWS * HC_MULT], dtype=pl.FP32)
+        owner_comb_window = pld.window(owner_comb_window_buf, [OWNER_WINDOW_ROWS, HC_MULT * HC_MULT], dtype=pl.FP32)
+        owner_indices_window = pld.window(owner_indices_window_buf, [OWNER_WINDOW_ROWS, 16], dtype=pl.INT32)
+        owner_weights_window = pld.window(owner_weights_window_buf, [OWNER_WINDOW_ROWS, 16], dtype=pl.FP32)
         gate_window = pld.window(gate_window_buf, [GATE_WINDOW_ROWS, N_EXPERTS], dtype=pl.FP32)
         gate_signal = pld.window(gate_signal_buf, [N_RANKS, 16], dtype=pl.INT32)
         rw = pld.window(rw_buf, [REDUCE_WINDOW_ROWS, D], dtype=pl.FP32)
@@ -447,5 +472,5 @@ def l3_prefill_moe_tp(
         result_ready = pld.window(result_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         l2_prefill_moe_tp(x[r], hc_fn[r], hc_scale[r], hc_base[r], norm_w[r],
             gate_w[r], gate_bias[r], tid2eid[r], ids[r], w1[r], s1[r], w3[r], s3[r],
-            w2[r], s2[r], out[r], rw, rs, result, result_ready, layer_id, group_tokens, r, gate_window, gate_signal, device=r)
+            w2[r], s2[r], out[r], rw, rs, result, result_ready, layer_id, group_tokens, r, gate_window, gate_signal, owner_norm_window, owner_scale_window, owner_post_window, owner_comb_window, owner_indices_window, owner_weights_window, device=r)
     return out
