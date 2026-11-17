@@ -11,11 +11,13 @@
 import pypto.language as pl
 import pypto.language.distributed as pld
 
-from config import EP, TP
+from config import DECODE_SEQ, EP, MOE_TOKENS, TP
+from lm_head import SAMPLED_IDS_PAD
 
 REQUESTS_DYN = pl.dynamic("DSPARK_BOOTSTRAP_REQUESTS_DYN")
 LEASES_DYN = pl.dynamic("DSPARK_BOOTSTRAP_LEASES_DYN")
-MAX_REQUESTS = 128
+MAX_REQUESTS = MOE_TOKENS
+QUERY_WIDTH = DECODE_SEQ - 1
 DESCRIPTOR_WIDTH = 11
 PAYLOAD_WIDTH = 16
 NOISE_TOKEN_ID = 128799
@@ -24,7 +26,7 @@ NOISE_TOKEN_ID = 128799
 @pl.jit
 def prepare_bootstrap_token_rank(
     descriptors: pl.Tensor[[REQUESTS_DYN, DESCRIPTOR_WIDTH], pl.INT32],
-    sampled_ids: pl.Tensor[[MAX_REQUESTS, 8], pl.INT32],
+    sampled_ids: pl.Tensor[[MAX_REQUESTS, SAMPLED_IDS_PAD], pl.INT32],
     next_tokens: pl.Out[pl.Tensor[[REQUESTS_DYN], pl.INT64]],
     tp_rank: pl.Scalar[pl.INT32],
 ):
@@ -48,7 +50,7 @@ def prepare_bootstrap_token_rank(
 @pl.jit.host
 def l3_prepare_bootstrap_tokens(
     descriptors: pl.Tensor[[EP, REQUESTS_DYN, DESCRIPTOR_WIDTH], pl.INT32],
-    sampled_ids: pl.Tensor[[EP, MAX_REQUESTS, 8], pl.INT32],
+    sampled_ids: pl.Tensor[[EP, MAX_REQUESTS, SAMPLED_IDS_PAD], pl.INT32],
     next_tokens: pl.Out[pl.Tensor[[EP, REQUESTS_DYN], pl.INT64]],
 ):
     descriptors.bind_dynamic(1, REQUESTS_DYN)
@@ -60,9 +62,9 @@ def l3_prepare_bootstrap_tokens(
 @pl.jit
 def publish_bootstrap_rank(
     descriptors: pl.Tensor[[REQUESTS_DYN, DESCRIPTOR_WIDTH], pl.INT32],
-    sampled_ids: pl.Tensor[[MAX_REQUESTS, 8], pl.INT32],
-    drafts: pl.Tensor[[REQUESTS_DYN, 7], pl.INT32],
-    tokens: pl.InOut[pl.Tensor[[LEASES_DYN, 8], pl.INT64]],
+    sampled_ids: pl.Tensor[[MAX_REQUESTS, SAMPLED_IDS_PAD], pl.INT32],
+    drafts: pl.Tensor[[REQUESTS_DYN, QUERY_WIDTH], pl.INT32],
+    tokens: pl.InOut[pl.Tensor[[LEASES_DYN, DECODE_SEQ], pl.INT64]],
     meta: pl.InOut[pl.Tensor[[LEASES_DYN, 6], pl.INT32]],
     window: pl.InOut[pld.DistributedTensor[[TP * MAX_REQUESTS, PAYLOAD_WIDTH], pl.INT64]],
     signal: pl.InOut[pld.DistributedTensor[[TP, 1], pl.INT32]],
@@ -96,14 +98,14 @@ def publish_bootstrap_rank(
                     sampled = pl.read(sampled_ids, [sample_row, 0])
                     if resident_generation == generation and valid == 0 and sampled >= 0:
                         count = pl.cast(0, pl.INT32)
-                        if flags // 2 % 2 == 1 and prompt + 6 < limit:
-                            count = pl.cast(7, pl.INT32)
+                        if flags // 2 % 2 == 1 and prompt + QUERY_WIDTH - 1 < limit:
+                            count = pl.cast(QUERY_WIDTH, pl.INT32)
                         pl.write(payload, [request, 0], pl.cast(slot, pl.INT64))
                         pl.write(payload, [request, 1], pl.cast(generation, pl.INT64))
                         pl.write(payload, [request, 2], pl.cast(prompt, pl.INT64))
                         pl.write(payload, [request, 3], pl.cast(count, pl.INT64))
                         pl.write(payload, [request, 4], pl.cast(sampled, pl.INT64))
-                        for offset in pl.range(7):
+                        for offset in pl.range(QUERY_WIDTH):
                             token = pl.cast(NOISE_TOKEN_ID, pl.INT64)
                             if count > 0:
                                 token = pl.cast(pl.read(drafts, [request, offset]), pl.INT64)
@@ -166,7 +168,7 @@ def publish_bootstrap_rank(
                 valid = pl.read(meta, [slot, 0])
                 if generation == resident_generation and valid == 0:
                     pl.write(tokens, [slot, 0], pl.read(received, [request, 4]))
-                    for offset in pl.range(7):
+                    for offset in pl.range(QUERY_WIDTH):
                         pl.write(tokens, [slot, 1 + offset], pl.read(received, [request, 5 + offset]))
                     prompt = pl.cast(pl.read(received, [request, 2]), pl.INT32)
                     pl.write(meta, [slot, 2], prompt)
@@ -179,9 +181,9 @@ def publish_bootstrap_rank(
 @pl.jit.host
 def l3_publish_bootstrap(
     descriptors: pl.Tensor[[EP, REQUESTS_DYN, DESCRIPTOR_WIDTH], pl.INT32],
-    sampled_ids: pl.Tensor[[EP, MAX_REQUESTS, 8], pl.INT32],
-    drafts: pl.Tensor[[EP, REQUESTS_DYN, 7], pl.INT32],
-    tokens: pl.InOut[pl.Tensor[[EP, LEASES_DYN, 8], pl.INT64]],
+    sampled_ids: pl.Tensor[[EP, MAX_REQUESTS, SAMPLED_IDS_PAD], pl.INT32],
+    drafts: pl.Tensor[[EP, REQUESTS_DYN, QUERY_WIDTH], pl.INT32],
+    tokens: pl.InOut[pl.Tensor[[EP, LEASES_DYN, DECODE_SEQ], pl.INT64]],
     meta: pl.InOut[pl.Tensor[[EP, LEASES_DYN, 6], pl.INT32]],
 ):
     descriptors.bind_dynamic(1, REQUESTS_DYN)

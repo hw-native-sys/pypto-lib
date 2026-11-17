@@ -256,7 +256,7 @@ def l2_decode_fwd_dspark(
     state_generations: pl.Tensor[[DSPARK_STATE_LOCAL_BATCH], pl.INT32],
     state_tokens: pl.InOut[pl.Tensor[[DSPARK_STATE_CAPACITY, DSPARK_STATE_TOKEN_WIDTH], pl.INT64]],
     state_meta: pl.InOut[pl.Tensor[[DSPARK_STATE_CAPACITY, DSPARK_STATE_META_WIDTH], pl.INT32]],
-    accepted_token_ids: pl.Out[pl.Tensor[[DSPARK_STATE_LOCAL_BATCH, SAMPLED_IDS_PAD], pl.INT32]],
+    accepted_token_ids: pl.Out[pl.Tensor[[DSPARK_STATE_LOCAL_BATCH, DSPARK_STATE_TOKEN_WIDTH], pl.INT32]],
     accepted_counts: pl.Out[pl.Tensor[[DSPARK_STATE_LOCAL_BATCH], pl.INT32]],
     group_state_slot_ids: pl.Tensor[[DECODE_BATCH], pl.INT32],
     group_state_generations: pl.Tensor[[DECODE_BATCH], pl.INT32],
@@ -385,7 +385,7 @@ def l2_decode_fwd_dspark(
     # The drafter bridge outlives the target scope: the Markov sampler and the
     # state commit read it from their own scopes, so it is built at frame level.
     draft_batch = pl.tensor.dim(draft_head_hidden, 0)
-    draft_group_context_tokens = DRAFT_DSPARK_CP_SIZE * draft_batch * SAMPLED_IDS_PAD
+    draft_group_context_tokens = DRAFT_DSPARK_CP_SIZE * draft_batch * DSPARK_STATE_TOKEN_WIDTH
     bridge_num_sampled = pl.create_tensor([draft_batch], dtype=pl.INT32)
     bridge_last_sampled = pl.create_tensor([draft_batch], dtype=pl.INT64)
     bridge_next_prefill_tokens = pl.create_tensor([draft_batch], dtype=pl.INT64)
@@ -748,7 +748,7 @@ def l3_decode_fwd_dspark(
     state_generations: pl.Tensor[[N_RANKS, DSPARK_STATE_LOCAL_BATCH], pl.INT32],
     state_tokens: pl.InOut[pl.Tensor[[N_RANKS, DSPARK_STATE_CAPACITY, DSPARK_STATE_TOKEN_WIDTH], pl.INT64]],
     state_meta: pl.InOut[pl.Tensor[[N_RANKS, DSPARK_STATE_CAPACITY, DSPARK_STATE_META_WIDTH], pl.INT32]],
-    accepted_token_ids: pl.Out[pl.Tensor[[N_RANKS, DSPARK_STATE_LOCAL_BATCH, SAMPLED_IDS_PAD], pl.INT32]],
+    accepted_token_ids: pl.Out[pl.Tensor[[N_RANKS, DSPARK_STATE_LOCAL_BATCH, DSPARK_STATE_TOKEN_WIDTH], pl.INT32]],
     accepted_counts: pl.Out[pl.Tensor[[N_RANKS, DSPARK_STATE_LOCAL_BATCH], pl.INT32]],
     group_state_slot_ids: pl.Tensor[[N_RANKS, DECODE_BATCH], pl.INT32],
     group_state_generations: pl.Tensor[[N_RANKS, DECODE_BATCH], pl.INT32],
@@ -1022,7 +1022,7 @@ def l3_decode_fwd_dspark(
 FIXTURE_ACTIVE_REQUESTS = decode.config.DECODE_BATCH // TP_SIZE
 FIXTURE_POSITION_LIMIT = 512
 FIXTURE_ROPE_ROWS = 2048
-FIXTURE_ORI_TABLE_BLOCKS = (FIXTURE_POSITION_LIMIT + SAMPLED_IDS_PAD + BLOCK_SIZE - 1) // BLOCK_SIZE
+FIXTURE_ORI_TABLE_BLOCKS = (FIXTURE_POSITION_LIMIT + DSPARK_STATE_TOKEN_WIDTH + BLOCK_SIZE - 1) // BLOCK_SIZE
 
 
 def _fixture_dyn_bindings(param_specs):

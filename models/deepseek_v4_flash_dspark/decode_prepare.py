@@ -25,6 +25,8 @@ from config import (
     TP,
 )
 
+from lm_head import SAMPLED_IDS_PAD
+
 
 # Dynamic shape variables.
 ORI_TABLE_BLOCKS_DYN = pl.dynamic("DSPARK_PREPARE_ORI_TABLE_BLOCKS_DYN")
@@ -497,7 +499,7 @@ def accept_target_into_device_state(
     hidden_row_offsets: pl.Tensor[[LOCAL_BATCH], pl.INT32],
     state_tokens: pl.InOut[pl.Tensor[[STATE_CAPACITY, STATE_TOKEN_WIDTH], pl.INT64]],
     state_meta: pl.InOut[pl.Tensor[[STATE_CAPACITY, STATE_META_WIDTH], pl.INT32]],
-    sampled_ids: pl.Tensor[[LOCAL_T, S], pl.INT32],
+    sampled_ids: pl.Tensor[[LOCAL_T, SAMPLED_IDS_PAD], pl.INT32],
     target_hidden: pl.Tensor[[LOCAL_T, MAIN_HIDDEN_DIM], pl.BF16],
     accepted_token_ids: pl.Out[pl.Tensor[[LOCAL_BATCH, S], pl.INT32]],
     accepted_counts: pl.Out[pl.Tensor[[LOCAL_BATCH], pl.INT32]],
