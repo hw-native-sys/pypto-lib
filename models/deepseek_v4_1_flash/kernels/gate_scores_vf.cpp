@@ -232,16 +232,12 @@ __aicore__ inline void cube_gate(__gm__ int64_t* args) {
 } // namespace
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-#if !defined(__CPU_SIM)
     set_atomic_none();
-#endif
 #if defined(__DAV_CUBE__)
     cube_gate(args);
 #elif defined(__DAV_VEC__)
-#if !defined(__CPU_SIM)
     set_mask_norm();
     set_vector_mask(-1, -1);
-#endif
     vector_gate(args);
 #endif
 }

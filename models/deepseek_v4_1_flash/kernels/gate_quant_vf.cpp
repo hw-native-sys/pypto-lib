@@ -192,9 +192,7 @@ __aicore__ inline void run_tiles(__gm__ int64_t* args, int block) {
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 #if defined(__DAV_VEC__)
-#if !defined(__CPU_SIM)
     set_atomic_none(); set_mask_norm(); set_vector_mask(-1, -1);
-#endif
     auto input = reinterpret_cast<__gm__ Tensor*>(args[0]);
     int tasks = input->shapes[0] / Rows * (input->shapes[1] / Columns);
     for (int block = get_block_idx(args); block < tasks; block += get_block_num(args)) {

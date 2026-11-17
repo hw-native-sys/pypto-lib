@@ -8,11 +8,6 @@
 // -----------------------------------------------------------------------------------------------------------
 // O-A with BF16 rounding and OCP MXFP8 quantization on the paired Vector cores.
 #include "mxfp8_projection.hpp"
-#if defined(__CPU_SIM)
-#include <algorithm>
-#include <cmath>
-#include <cstring>
-#endif
 
 using namespace mxfp8_projection;
 namespace {
@@ -24,22 +19,11 @@ template <int MT>
 using Scales = Tile<TileType::Vec, uint8_t, MT / 16, 64>;
 constexpr int RAW_UB = 0;
 constexpr int READY = 0, RELEASE = 1, FINISH = 2, STORE_DONE = 3, VEC_OFFSET = 16;
-#if defined(__CPU_SIM)
-template <int MT>
-using SimPipe = TPipe<0, Direction::DIR_C2V, MT * 128 * 4, 1, 2>;
-#endif
 
 #if defined(__DAV_CUBE__)
 template <int MT>
 struct QuantizeOutput {
-#if defined(__CPU_SIM)
-    SimPipe<MT> pipe;
-    __aicore__ QuantizeOutput() : pipe(nullptr, 0, 0) {}
-#endif
     __aicore__ inline void operator()(AC<256, MT>& acc) {
-#if defined(__CPU_SIM)
-        TPUSH<SimPipe<MT>, AC<256, MT>, TileSplitAxis::TILE_LEFT_RIGHT>(pipe, acc);
-#else
         wait_intra_block(PIPE_FIX, RELEASE);
         wait_intra_block(PIPE_FIX, RELEASE + VEC_OFFSET);
         Raw<MT> raw;
@@ -47,17 +31,14 @@ struct QuantizeOutput {
         TMOV<Raw<MT>, AC<256, MT>, AccToVecMode::DualModeSplitN>(raw, acc);
         set_intra_block(PIPE_FIX, READY);
         set_intra_block(PIPE_FIX, READY + VEC_OFFSET);
-#endif
     }
     __aicore__ inline void finish() {
-#if !defined(__CPU_SIM)
         wait_intra_block(PIPE_FIX, RELEASE);
         wait_intra_block(PIPE_FIX, RELEASE + VEC_OFFSET);
         wait_intra_block(PIPE_FIX, STORE_DONE);
         wait_intra_block(PIPE_FIX, STORE_DONE + VEC_OFFSET);
         set_intra_block(PIPE_FIX, FINISH);
         set_intra_block(PIPE_FIX, FINISH + VEC_OFFSET);
-#endif
     }
 };
 #endif
@@ -70,27 +51,6 @@ __tf__ __aicore__ inline void quantize(
     auto src = (__ubuf__ float*)__cce_get_tile_ptr(input);
     auto dst = (__ubuf__ uint8_t*)__cce_get_tile_ptr(output);
     auto codes = (__ubuf__ uint16_t*)__cce_get_tile_ptr(scales);
-#if defined(__CPU_SIM)
-    for (int row = 0; row < MT; ++row) {
-        for (int group = 0; group < 4; ++group) {
-            float values[32];
-            float maximum = 0;
-            for (int i = 0; i < 32; ++i) {
-                values[i] = row < active_rows ? static_cast<float>(static_cast<bfloat16_t>(src[row * 128 + group * 32 + i])) : 0.0f;
-                maximum = std::max(maximum, std::abs(values[i]));
-            }
-            uint32_t bits;
-            std::memcpy(&bits, &maximum, 4);
-            int exponent = std::max(0, static_cast<int>(bits >> 23) - 8);
-            float reciprocal = exponent ? std::ldexp(1.0f, 127 - exponent) : 0.0f;
-            for (int i = 0; i < 32; ++i) {
-                F value(std::max(-448.0f, std::min(448.0f, values[i] * reciprocal)), RoundMode::CAST_RINT);
-                std::memcpy(dst + row * 128 + group * 32 + i, &value, 1);
-            }
-            reinterpret_cast<__ubuf__ uint8_t*>(codes)[(row / 16) * 64 + (group / 2) * 32 + row % 16 * 2 + group % 2] = exponent;
-        }
-    }
-#else
     __VEC_SCOPE__ {
         MaskReg all = pset_b32(PAT_ALL), all16 = pset_b16(PAT_ALL), all8 = pset_b8(PAT_ALL);
         uint32_t count64 = 64, count1 = 1;
@@ -165,7 +125,6 @@ __tf__ __aicore__ inline void quantize(
             }
         }
     }
-#endif
 }
 #endif
 } // namespace
@@ -197,28 +156,16 @@ __aicore__ inline void project_oa(__gm__ int64_t* args) {
     TASSIGN(raw, RAW_UB);
     TASSIGN(payload, MT * 128 * 4);
     TASSIGN(scales, MT * 128 * 5);
-#if defined(__CPU_SIM)
-    SimPipe<MT> pipe(nullptr, 0, 0);
-#else
     set_intra_block(PIPE_V, RELEASE);
-#endif
     set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
     for (int tile = get_block_idx(args); tile < (padded_rows / MT) * columns; tile += workers) {
-#if defined(__CPU_SIM)
-        TPOP<SimPipe<MT>, Raw<MT>, TileSplitAxis::TILE_LEFT_RIGHT>(pipe, raw);
-#else
         wait_intra_block(PIPE_V, READY);
-#endif
         wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
         const int row = tile / columns * MT;
         const int column = tile % columns;
         const int valid = active - row < 0 ? 0 : (active - row > MT ? MT : active - row);
         quantize<MT>(payload.data(), scales.data(), raw.data(), valid);
-#if defined(__CPU_SIM)
-        TFREE<SimPipe<MT>, TileSplitAxis::TILE_LEFT_RIGHT>(pipe);
-#else
         set_intra_block(PIPE_V, RELEASE);
-#endif
         const int n = column * 256 + get_sub_block_id(args) * 128;
         using Stride = pto::Stride<1, 1, 1, DYNAMIC, 1>;
         using PayloadShape = TileShape2D<F, MT, 128>;
@@ -234,10 +181,8 @@ __aicore__ inline void project_oa(__gm__ int64_t* args) {
         set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
     }
     wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-#if !defined(__CPU_SIM)
     set_intra_block(PIPE_MTE3, STORE_DONE);
     wait_intra_block(PIPE_V, FINISH);
-#endif
     pipe_barrier(PIPE_ALL);
 #endif
 }

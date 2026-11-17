@@ -9,9 +9,6 @@
 // Four-stream HC collapse, optional RMSNorm, and optional raw BF16 output.
 // Four-stream HC collapse and RMSNorm with optional collapsed output.
 #include <cstdint>
-#if defined(__CPU_SIM)
-#include <cmath>
-#endif
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
 #include "intrinsic.h"
@@ -41,58 +38,6 @@ __tf__ __aicore__ inline void collapse_norm(
     auto mix = (__ubuf__ float*)__cce_get_tile_ptr(premix);
     auto raw = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(collapsed);
     auto reduce = (__ubuf__ float*)__cce_get_tile_ptr(scratch);
-#if defined(__CPU_SIM)
-    for (int row = 0; row < rows; ++row) {
-
-        for (int k = 0; k < 5120; ++k) {
-            volatile float y0 = src[row * 20480 + k] * mix[(row + row_offset) * 4];
-            volatile float y1 = src[row * 20480 + 5120 + k] * mix[(row + row_offset) * 4 + 1];
-            volatile float y2 = src[row * 20480 + 10240 + k] * mix[(row + row_offset) * 4 + 2];
-            volatile float y3 = src[row * 20480 + 15360 + k] * mix[(row + row_offset) * 4 + 3];
-            volatile float first_pair = y0 + y1;
-            volatile float first_three = first_pair + y2;
-            bfloat16_t rounded = static_cast<bfloat16_t>(first_three + y3);
-            dst[row * 5120 + k] = rounded;
-            if constexpr (StoreCollapsed) {
-                raw[row * 5120 + k] = rounded;
-            }
-        }
-        float partial[64] = {};
-        for (int block = 0; block < 64; ++block) {
-            float lanes[64];
-            for (int lane = 0; lane < 64; ++lane) {
-                const int col = block * 64 + lane;
-                const float value = static_cast<float>(dst[row * 5120 + col]);
-                lanes[lane] = value * value;
-                if (col < 1024) {
-                    const float tail = static_cast<float>(dst[row * 5120 + 4096 + col]);
-                    lanes[lane] += tail * tail;
-                }
-            }
-            for (int count = 64; count > 1; count /= 2)
-                for (int lane = 0; lane < count / 2; ++lane)
-                    lanes[lane] = lanes[2 * lane] + lanes[2 * lane + 1];
-            partial[block] = lanes[0];
-        }
-        for (int count = 64; count > 1; count /= 2)
-            for (int lane = 0; lane < count / 2; ++lane)
-                partial[lane] = partial[2 * lane] + partial[2 * lane + 1];
-        float variance = partial[0] * (1.0f / 5120.0f) + 1.0e-6f;
-        float reciprocal = 1.0f / variance;
-        float root = std::sqrt(reciprocal);
-        float product = (variance * -0.5f) * root;
-        float inverse = root * std::fma(product, root, 1.5f);
-        float correction = std::fma(-variance, reciprocal, 1.0f);
-        float error = std::fma(-inverse, inverse, reciprocal);
-        correction = std::fma(variance, error, correction) * inverse;
-        inverse = std::fma(correction, 0.5f, inverse);
-        if (std::isinf(variance)) inverse = 0.0f;
-        for (int k = 0; k < 5120; ++k) {
-            dst[row * 5120 + k] = static_cast<bfloat16_t>(
-                static_cast<float>(dst[row * 5120 + k]) * inverse * static_cast<float>(gamma[k]));
-        }
-    }
-#else
     __VEC_SCOPE__ {
         MaskReg full = pset_b32(PAT_ALL);
         for (uint16_t row = 0; row < rows; ++row) {
@@ -160,7 +105,6 @@ __tf__ __aicore__ inline void collapse_norm(
             }
         }
     }
-#endif
 }
 #endif
 }
@@ -263,18 +207,6 @@ __tf__ __aicore__ inline void collapse(
     auto src = (__ubuf__ float*)__cce_get_tile_ptr(input);
     auto dst = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(output);
     auto mix = (__ubuf__ float*)__cce_get_tile_ptr(premix);
-#if defined(__CPU_SIM)
-    for (int row = 0; row < rows; ++row) {
-        for (int k = 0; k < 5120; ++k) {
-            float y0 = src[row * 20480 + k] * mix[(row + row_offset) * 4];
-            float y1 = src[row * 20480 + 5120 + k] * mix[(row + row_offset) * 4 + 1];
-            float y2 = src[row * 20480 + 10240 + k] * mix[(row + row_offset) * 4 + 2];
-            float y3 = src[row * 20480 + 15360 + k] * mix[(row + row_offset) * 4 + 3];
-            bfloat16_t rounded = static_cast<bfloat16_t>(((y0 + y1) + y2) + y3);
-            dst[row * 5120 + k] = rounded;
-        }
-    }
-#else
     __VEC_SCOPE__ {
         MaskReg full = pset_b32(PAT_ALL);
         for (uint16_t row = 0; row < rows; ++row) {
@@ -302,7 +234,6 @@ __tf__ __aicore__ inline void collapse(
             }
         }
     }
-#endif
 }
 #endif
 __aicore__ inline void run(__gm__ int64_t* args) {

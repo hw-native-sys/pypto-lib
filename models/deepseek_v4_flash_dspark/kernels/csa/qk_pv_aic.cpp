@@ -12,20 +12,13 @@
 
 #include <cstdint>
 
-#ifndef __gm__
-#define __gm__
-#endif
+#include <pto/pto-inst.hpp>
 
 #ifndef __aicore__
-#if defined(__CPU_SIM)
-#define __aicore__
-#else
-#define __aicore__ [aicore]
-#endif
+#define __aicore__ AICORE
 #endif
 
 #include "tensor.h"
-#include <pto/pto-inst.hpp>
 
 #include "intrinsic.h"
 
@@ -784,12 +777,12 @@ static __aicore__ void qk_pv_aic(__gm__ int64_t *v1, __gm__ bfloat16_t *v2, __gm
 
 // --- Kernel entry point ---
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
-#if !defined(__CPU_SIM) && !defined(__COSTMODEL)
+#if !defined(__COSTMODEL)
   // Reset AI Core atomic mode inherited from a prior kernel.
   set_atomic_none();
 #endif
 
-#if defined(__DAV_CUBE__) && !defined(__CPU_SIM) && !defined(__COSTMODEL)
+#if defined(__DAV_CUBE__) && !defined(__COSTMODEL)
   // Start cube tasks in FP32 mode, independent of a prior task's HF32 setting.
   set_ctrl(sbitset0(get_ctrl(), pto::MAD_MODE_BIT));
 #endif

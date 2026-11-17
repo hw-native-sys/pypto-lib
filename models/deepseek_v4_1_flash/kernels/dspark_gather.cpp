@@ -34,11 +34,6 @@ __tf__ __aicore__ inline void multiply_groups(
     __ubuf__ float* output = (__ubuf__ float*)__cce_get_tile_ptr(dst);
     __ubuf__ float* input = (__ubuf__ float*)__cce_get_tile_ptr(src);
     __ubuf__ float* factors = (__ubuf__ float*)__cce_get_tile_ptr(scales);
-#if defined(__CPU_SIM)
-    for (int element = 0; element < Values::Rows * Values::Cols; ++element) {
-        output[element] = input[element] * factors[element >> GroupShift];
-    }
-#else
     __VEC_SCOPE__ {
         RegTensor<uint32_t> index;
         RegTensor<float> value, factor, result;
@@ -52,7 +47,6 @@ __tf__ __aicore__ inline void multiply_groups(
             vsts(result, output, chunk * 64, NORM_B32, full);
         }
     }
-#endif
 }
 
 

@@ -212,9 +212,7 @@ __aicore__ inline void run(__gm__ int64_t* args, int block) {
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 #if defined(__DAV_VEC__)
-#if !defined(__CPU_SIM)
     set_atomic_none(); set_mask_norm(); set_vector_mask(-1, -1);
-#endif
     int columns = reinterpret_cast<__gm__ Tensor*>(args[0])->shapes[1];
     int tasks = (args[4] + Rows - 1) / Rows;
     for (int block = get_block_idx(args); block < tasks; block += get_block_num(args)) {

@@ -879,7 +879,7 @@ def build_tensor_specs(case="bounds", *, tail_offset=0):
 if __name__ == "__main__":
     from golden import run
 
-    cases = ("bounds", "tails", "zero") if args.case == "all" else (args.case,)
+    cases = ("bounds", "tails", "zero", "full") if args.case == "all" else (args.case,)
     for case in cases:
         tail_rounds = (6 + N_LOCAL_EXPERTS - 1) // N_LOCAL_EXPERTS if case == "tails" else 1
         for tail_round in range(tail_rounds):
