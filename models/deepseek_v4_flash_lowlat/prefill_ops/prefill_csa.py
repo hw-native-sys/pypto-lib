@@ -2527,10 +2527,13 @@ def build_cp_tensor_specs(
                 init_value=cp_stack(value, tp_size),
             ))
     from golden import ScalarSpec
+    # The harness specializes positional arguments in the declared spec order.
+    specs.extend(projection_tensor_specs(tp_size))
+    specs.extend(causal_tensor_specs(tp_size))
     specs.append(TensorSpec("echo_diagnostics", [tp_size, 2 * ECHO_LAYERS, 16], torch.float32, init_value=torch.zeros))
     specs.append(ScalarSpec("echo_epoch", torch.int32, 1))
     specs.append(ScalarSpec("echo_first_chunk", torch.int32, 1))
-    return (specs) + projection_tensor_specs(tp_size) + causal_tensor_specs(tp_size)
+    return specs
 
 
 def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE, checkpoint_ends: tuple[int, int] = (0, 0)):

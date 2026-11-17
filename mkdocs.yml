@@ -95,7 +95,11 @@ nav:
           - Model overview: models/deepseek_v4_flash_mtp/index.md
           - Decode optimization: models/deepseek_v4_flash_mtp/decode_optimization.md
       - DeepSeek V4-Flash (DSpark): models/deepseek_v4_flash_dspark/index.md
-      - DeepSeek V4-Flash (low latency): models/deepseek_v4_flash_lowlat/index.md
+      - DeepSeek V4-Flash (low latency):
+          - Model overview: models/deepseek_v4_flash_lowlat/index.md
+          - Compact prefill input: models/deepseek_v4_flash_lowlat/compact_prefill_input.md
+          - Prefill output projection batching: models/deepseek_v4_flash_lowlat/prefill_oproj_batch.md
+          - Prefill owner reduction: models/deepseek_v4_flash_lowlat/prefill_owner_reduce.md
       - DeepSeek V4.1-Flash:
           - Model overview: models/deepseek_v4_1_flash/index.md
           - Vision encoder and visual aligner: models/deepseek_v4_1_flash/vision.md
