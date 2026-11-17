@@ -54,6 +54,10 @@ if PREFILL_MOE_FUSED_NORM_QUANT not in (0, 1):
 PREFILL_MOE_COMBINE_ROWS = _parse_int_argv("--prefill-moe-combine-rows", 1)
 if PREFILL_MOE_COMBINE_ROWS not in (1, 4, 8):
     raise ValueError("Prefill combine rows must be 1, 4 or 8")
+PREFILL_MOE_GATE_COPY_ROWS = _parse_int_argv("--prefill-moe-gate-copy-rows", 16)
+if PREFILL_MOE_GATE_COPY_ROWS not in (16, 64, 128):
+    raise ValueError("Prefill gate copy rows must be16,64 or128")
+
 PREFILL_MOE_SHARE_GATE = _parse_int_argv("--prefill-moe-share-gate", 0)
 if PREFILL_MOE_SHARE_GATE not in (0, 1):
     raise ValueError("Prefill gate sharing must be zero or one")

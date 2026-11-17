@@ -884,3 +884,12 @@ This requires identical full HC inputs and replicated router parameters on the
 TP ranks. It is off by default. Source and native checks do not grant device
 bitwise or ordinary performance qualification; promotion requires the complete
 fixed-input request controls and matched same-worker A/B.
+
+`--prefill-moe-gate-copy-rows {16,64,128}` selects the shared-gate transport grain.
+The default16 preserves the qualified initial exchange. Larger values require
+shared gate and change only publish/copy task geometry, with no GEMM or MoE-wave
+change. The physical copy tile is capped at the padded wave size to keep small
+and ragged cases within their allocated lane. The128-row collect uses128KiB of
+vector tile storage and must pass actual native allocation checks. A larger
+copy tile may reduce task overhead while exposing less transfer parallelism;
+select it only from complete bitwise and ordinary device controls.

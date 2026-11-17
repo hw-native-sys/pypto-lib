@@ -39,11 +39,15 @@ def resolve_prefill_mechanisms(mechanisms, *, echo_prefetch=False, causal_ready=
 
 
 @contextmanager
-def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degrees=None, moe_ready=True, moe_wave_tokens=2048, moe_owner_reduce=False, moe_expert_affinity=False, moe_batched_gather=False, moe_direct_post=False, moe_combine_rows=1, moe_fused_norm_quant=False, moe_share_gate=False, moe_local_route_state=False, oproj_b_batched=False, oproj_a_batched=False,
+def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degrees=None, moe_ready=True, moe_wave_tokens=2048, moe_owner_reduce=False, moe_expert_affinity=False, moe_batched_gather=False, moe_direct_post=False, moe_combine_rows=1, moe_fused_norm_quant=False, moe_gate_copy_rows=16, moe_share_gate=False, moe_local_route_state=False, oproj_b_batched=False, oproj_a_batched=False,
                     causal_ready=False, causal_full_wait=False, echo_prefetch=False, echo_diagnostics=False):
     """Isolate the private prefill operators' import-time TP8 configuration."""
     if type(moe_combine_rows) is not int or moe_combine_rows not in (1, 4, 8):
         raise ValueError("Prefill combine rows must be 1, 4 or 8")
+    if type(moe_gate_copy_rows) is not int or moe_gate_copy_rows not in (16, 64, 128):
+        raise ValueError("Gate copy rows must be16,64 or128")
+    if moe_gate_copy_rows != 16 and not moe_share_gate:
+        raise ValueError("Gate transfer tuning requires shared gate")
     if type(moe_share_gate) is not bool:
         raise ValueError("Prefill gate sharing must be a boolean compile option")
     if type(moe_local_route_state) is not bool:
@@ -104,6 +108,7 @@ def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degree
         sys.argv += ["--prefill-moe-batched-gather", "1" if moe_batched_gather else "0"]
         sys.argv += ["--prefill-moe-direct-post", "1" if moe_direct_post else "0"]
         sys.argv += ["--prefill-moe-combine-rows", str(moe_combine_rows)]
+        sys.argv += ["--prefill-moe-gate-copy-rows", str(moe_gate_copy_rows)]
         sys.argv += ["--prefill-moe-share-gate", "1" if moe_share_gate else "0"]
         sys.argv += ["--prefill-moe-local-route-state", "1" if moe_local_route_state else "0"]
         sys.argv += ["--prefill-moe-fused-norm-quant", "1" if moe_fused_norm_quant else "0"]
@@ -127,7 +132,7 @@ def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degree
                     sys.modules[name] = module
 
 
-def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=None, moe_ready=True, moe_wave_tokens=2048, moe_owner_reduce=False, moe_expert_affinity=False, moe_batched_gather=False, moe_direct_post=False, moe_combine_rows=1, moe_fused_norm_quant=False, moe_share_gate=False, moe_local_route_state=False, oproj_b_batched=False, oproj_a_batched=False,
+def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=None, moe_ready=True, moe_wave_tokens=2048, moe_owner_reduce=False, moe_expert_affinity=False, moe_batched_gather=False, moe_direct_post=False, moe_combine_rows=1, moe_fused_norm_quant=False, moe_gate_copy_rows=16, moe_share_gate=False, moe_local_route_state=False, oproj_b_batched=False, oproj_a_batched=False,
                          causal_ready=False, causal_full_wait=False, echo_prefetch=False, echo_diagnostics=False,
                          mechanisms=None):
     """Return the TP8 attention, MoE, tap, and head entries for compilation.
@@ -150,7 +155,7 @@ def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=
     if mode == "serial" and indexer_arenas != 1:
         raise ValueError("Multiple indexer arenas require the chunk query pipeline")
     with _prefill_import(query_pipeline=mode in ("chunk", "attention"), indexer_arenas=indexer_arenas,
-                        projection_degrees=projection_degrees, moe_ready=moe_ready, moe_wave_tokens=moe_wave_tokens, moe_owner_reduce=moe_owner_reduce, moe_expert_affinity=moe_expert_affinity, moe_batched_gather=moe_batched_gather, moe_direct_post=moe_direct_post, moe_combine_rows=moe_combine_rows, moe_fused_norm_quant=moe_fused_norm_quant, moe_share_gate=moe_share_gate, moe_local_route_state=moe_local_route_state, oproj_b_batched=oproj_b_batched, oproj_a_batched=oproj_a_batched,
+                        projection_degrees=projection_degrees, moe_ready=moe_ready, moe_wave_tokens=moe_wave_tokens, moe_owner_reduce=moe_owner_reduce, moe_expert_affinity=moe_expert_affinity, moe_batched_gather=moe_batched_gather, moe_direct_post=moe_direct_post, moe_combine_rows=moe_combine_rows, moe_fused_norm_quant=moe_fused_norm_quant, moe_gate_copy_rows=moe_gate_copy_rows, moe_share_gate=moe_share_gate, moe_local_route_state=moe_local_route_state, oproj_b_batched=oproj_b_batched, oproj_a_batched=oproj_a_batched,
                         causal_ready=causal_ready, causal_full_wait=causal_full_wait,
                         echo_prefetch=echo_prefetch, echo_diagnostics=echo_diagnostics):
         qkv = importlib.import_module("qkv_proj_rope")
@@ -179,6 +184,9 @@ def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=
         if geometry.PREFILL_MOE_COMBINE_ROWS != moe_combine_rows:
             raise RuntimeError("Prefill combine geometry is frozen; use a fresh setup process")
         gate = importlib.import_module("models.deepseek_v4_flash_lowlat.prefill_moe_gate")
+        exchange = importlib.import_module("models.deepseek_v4_flash_lowlat.prefill_gate_exchange")
+        if exchange.PREFILL_MOE_GATE_COPY_ROWS != moe_gate_copy_rows:
+            raise RuntimeError("Prefill gate transfer geometry is frozen; use a fresh setup process")
         if bool(gate.PREFILL_MOE_SHARE_GATE) != moe_share_gate:
             raise RuntimeError("Prefill gate sharing is frozen; use a fresh setup process")
         if bool(geometry.PREFILL_MOE_FUSED_NORM_QUANT) != moe_fused_norm_quant or bool(gate.PREFILL_MOE_FUSED_NORM_QUANT) != moe_fused_norm_quant:

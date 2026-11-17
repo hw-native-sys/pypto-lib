@@ -11,9 +11,9 @@
 import pypto.language as pl
 import pypto.language.distributed as pld
 
-from .prefill_moe_geometry import GATE_WINDOW_ROWS, N_EXPERTS, N_RANKS, T_PAD
+from .prefill_moe_geometry import PREFILL_MOE_GATE_COPY_ROWS, GATE_WINDOW_ROWS, N_EXPERTS, N_RANKS, T_PAD
 
-GATE_COPY_TILE = 16
+GATE_COPY_TILE = min(PREFILL_MOE_GATE_COPY_ROWS, T_PAD)
 GATE_COLUMNS = N_EXPERTS // N_RANKS
 
 
