@@ -6,7 +6,7 @@
 // INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 // See LICENSE in the root of the software repository for the full text of the License.
 // -----------------------------------------------------------------------------------------------------------
-// Bounded-worker K64 online attention with paired Cube/Vector ownership.
+// Fused packed-cache gather and K64 attention. The two AIV lanes publish KV directly to L1.
 #include <cstdint>
 #if defined(__CPU_SIM)
 #error "DSpark native attention requires A5 device execution"
@@ -15,6 +15,7 @@
 #include "tensor.h"
 #include "intrinsic.h"
 #include "sparse_softmax_vf.hpp"
+#include "sparse_dequant_vf.hpp"
 #include "mixed_entry.hpp"
 
 using namespace pto;
@@ -36,6 +37,7 @@ constexpr int IDS_UB = 144000;
 constexpr int SCORE_READY = 0, SCORE_FREE = 1;
 constexpr int P_READY = 2, P_FREE = 3;
 constexpr int PV_READY = 4, PV_FREE = 5;
+constexpr int KV_READY = 6, KV_FREE = 7;
 constexpr int EXIT_C = 10, EXIT_V = 15;
 
 template <typename T, int R, int C>
@@ -74,6 +76,7 @@ __aicore__ inline void cube(__gm__ int64_t* args) {
     constexpr int V = M / 2;
     set_flag(PIPE_FIX, PIPE_MTE1, EVENT_ID7); wait_flag(PIPE_FIX, PIPE_MTE1, EVENT_ID7);
     signal_both<PIPE_MTE1>(P_FREE);
+    signal_both<PIPE_MTE1>(KV_FREE);
     set_flag(PIPE_FIX, PIPE_M, EVENT_ID4); set_flag(PIPE_FIX, PIPE_M, EVENT_ID5);
     set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0); set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
     set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID6);
@@ -90,8 +93,8 @@ __aicore__ inline void cube(__gm__ int64_t* args) {
     for (int token = worker; token < tokens; token += workers) {
         wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID6);
         GM<bfloat16_t, M, 512> q_gm(data<bfloat16_t>(args, 0) + token * row_stride(args, 0));
-        GM<bfloat16_t, 192, 512> kv_gm(data<bfloat16_t>(args, 1) + token * row_stride(args, 1));
-        TLOAD(q, q_gm); TLOAD(kv, kv_gm);
+        TLOAD(q, q_gm);
+        wait_both<PIPE_MTE1>(KV_READY);
         set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
         for (int part = 0; part < 3; ++part) {
             if (part == 0) wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
@@ -132,6 +135,7 @@ __aicore__ inline void cube(__gm__ int64_t* args) {
             signal_both<PIPE_FIX>(PV_READY);
             set_flag(PIPE_FIX, PIPE_M, EVENT_ID5);
         }
+        signal_both<PIPE_MTE1>(KV_FREE);
         set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID6);
     }
     wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID6);
@@ -241,6 +245,56 @@ __aicore__ inline void vector(__gm__ int64_t* args) {
     PMat<M> probability_l1;
     TASSIGN(probability_l1, P_L1);
     for (int token = worker; token < tokens; token += workers) {
+        // Gather scratch aliases attention state only before its initialization.
+        wait_intra_block(PIPE_MTE3, KV_FREE);
+        Vec<int32_t, 1, 32> gather_ids;
+        using NzChunk = Tile<TileType::Vec, bfloat16_t, 16, 512, BLayout::ColMajor, 16, 512,
+                             SLayout::RowMajor, 512, PadValue::Null, CompactMode::RowPlusOne>;
+        NzChunk decoded;
+        Keys cache_l1;
+        TASSIGN(gather_ids, 135168); TASSIGN(decoded, 32768); TASSIGN(cache_l1, KV_L1);
+        for (int block = 0; block < 3; ++block) {
+            int column = lane * 96 + block * 32;
+            GM<int32_t, 1, 32> id_gm(data<int32_t>(args, 2) + token * row_stride(args, 2) + column);
+            TLOAD(gather_ids, id_gm);
+            set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0); wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+            auto cache = data<uint8_t>(args, 1);
+            int first = gather_ids.GetValue(0);
+            bool contiguous = first >= 0;
+            for (int row = 1; row < 32; ++row)
+                contiguous = contiguous && gather_ids.GetValue(row) == first + row;
+            Vec<uint8_t, 32, 544> raw;
+            TASSIGN(raw, 0);
+            if (contiguous) {
+                GM<uint8_t, 32, 544> input(cache + static_cast<int64_t>(first) * 544);
+                TLOAD(raw, input);
+            } else {
+                for (int row = 0; row < 32; ++row) {
+                    int physical = gather_ids.GetValue(row);
+                    if (physical >= 0) {
+                        Vec<uint8_t, 1, 544> raw_row;
+                        TASSIGN(raw_row, row * 544);
+                        GM<uint8_t, 1, 544> input(cache + static_cast<int64_t>(physical) * 544);
+                        TLOAD(raw_row, input);
+                    }
+                }
+            }
+            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0); wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+            for (int half = 0; half < 2; ++half) {
+                Vec<uint8_t, 16, 544> packed;
+                Vec<int32_t, 1, 16> ids_half;
+                TASSIGN(packed, half * 16 * 544);
+                TASSIGN(ids_half, 135168 + half * 16 * 4);
+                sparse_dequant::decode_nz<false, NzChunk, decltype(packed), decltype(ids_half)>(
+                    decoded.data(), packed.data(), ids_half.data());
+                set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0); wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+                TINSERT(cache_l1, decoded, column + half * 16, 0);
+                set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0); wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+            }
+            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0); wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+            set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0); wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+        }
+        set_intra_block(PIPE_MTE3, KV_READY);
         TEXPANDS(numerator, 0.0f); TEXPANDS(maximum, -1e30f); TEXPANDS(denominator, 0.0f);
         for (int part = 0; part < 3; ++part) {
             wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID2);
@@ -279,6 +333,7 @@ __aicore__ inline void vector(__gm__ int64_t* args) {
     }
     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID2);
     wait_intra_block(PIPE_MTE3, P_FREE);
+    wait_intra_block(PIPE_MTE3, KV_FREE);
     pipe_barrier(PIPE_ALL);
     wait_intra_block(PIPE_V, EXIT_C);
     set_intra_block(PIPE_V, EXIT_V);
