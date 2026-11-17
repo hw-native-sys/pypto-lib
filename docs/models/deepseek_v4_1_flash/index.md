@@ -71,21 +71,6 @@ Attention entries own chunk scheduling and dependencies around that shared
 implementation. MoE dispatches local token rows to EP expert owners and combines
 the results back into the local HC state.
 
-Engram's `engram.py` entry calls the same `engram_from_rows` function as
-both model forwards, including the in-place residual update. Its default
-hardware cases cover 17, 80, 81, 128, 129, 256 and 257 rows across tile
-boundaries and tails. Simulator defaults use 17, 81, 129 and 256 rows to
-cover each projection branch and paired gating within the CPU budget. Use `--tokens` for an explicit case and replay/capture options.
-Both model forwards and default validation retain the native C++ implementation.
-`--implementation pypto` explicitly selects the slower DSL comparison path,
-which reuses the shared DSL quantization/GEMM and the same reference and
-in-place output contract. It is never selected automatically by the forwards.
-Larger simulator cases remain selectable with `--tokens`; set
-`SIMPLER_SCHEDULER_TIMEOUT_MS` explicitly if they need a longer watchdog budget.
-Projection and gate tasks remain independently schedulable. The remaining
-PyPTO resident-scale extraction gap is tracked in
-[pypto#3470](https://github.com/hw-native-sys/pypto/issues/3470).
-
 ## Parallel configuration
 
 | Component | Contract |
