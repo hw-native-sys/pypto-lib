@@ -51,7 +51,8 @@ __tf__ __aicore__ inline void normalize_quantize(
         vci((RegTensor<int8_t>&)byte_indices, (int8_t)0, INC_ORDER);
         vmuls((RegTensor<int16_t>&)byte_indices, (RegTensor<int16_t>&)byte_indices,
               (int16_t)4, pset_b8(PAT_ALL));
-        RegTensor<int32_t> zero, one;
+        RegTensor<int32_t> zero, one, exp254;
+        RegTensor<uint8_t> scale_indices;
         vdup(zero, 0, full, MODE_ZEROING);
         vdup(one, 1, full, MODE_ZEROING);
         uint32_t one_count = 1;
@@ -86,8 +87,8 @@ __tf__ __aicore__ inline void normalize_quantize(
                 vcvt(raw, value, full, ROUND_R, RS_DISABLE, PART_EVEN);
                 vsts(raw, dst, row * 1280 + k * 64, PK_B32, full);
                 vcvt(value, raw, full, PART_EVEN);
-                quantize_pair(value, quant_dst, codes, row * 1280 + k * 64, k * 16 + row,
-                              full, lower, upper, bytes, scalar, byte_indices, zero, one);
+                quantize_pair<false>(value, quant_dst, codes, row * 1280 + k * 64, k * 16 + row,
+                              full, lower, upper, bytes, scalar, byte_indices, zero, one, scale_indices, exp254);
             }
         }
         RegTensor<uint8_t> padding;
