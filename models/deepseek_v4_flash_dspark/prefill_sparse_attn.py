@@ -70,7 +70,7 @@ CMP_BLOCK_NUM = CMP_MAX_BLOCKS
 
 # tiling
 HEAD_TILE = 16  # storage / merge head-tile
-QK_M_TILE = 32  # head rows cube-batched per QK/PV matmul
+QK_M_TILE = 64  # head rows cube-batched per QK/PV matmul
 NUM_QK_CORES = 24
 QK_PRE_LAUNCH = 2
 QK_TRANSFER_SLOTS = QK_PRE_LAUNCH + 1
