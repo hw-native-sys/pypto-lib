@@ -614,27 +614,6 @@ def o_proj_hc_post_native_validation(
     return output
 
 
-@pl.jit
-def l2_quant_o_vf_pypto(
-    attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    payload: pl.InOut[pl.Tensor[[O_GROUP_ROWS, O_GROUP_IN], pl.FP8E4M3FN]],
-    scales: pl.InOut[pl.Tensor[[LOCAL_O_GROUPS, O_IN_SCALE_COLS], pl.FP8E8M0]],
-    num_tokens: pl.Scalar[pl.INT32],
-    padded_rows: pl.Scalar[pl.INDEX],
-):
-    """Validate the same register quantizer used by output projection."""
-    attended.bind_dynamic(0, T_DYN)
-    rope_cos.bind_dynamic(0, T_DYN)
-    rope_sin.bind_dynamic(0, T_DYN)
-    payload.bind_dynamic(0, O_GROUP_ROWS)
-    scales.bind_dynamic(1, O_IN_SCALE_COLS)
-    quant_o_vf_pypto(attended, rope_cos, rope_sin, payload, scales, num_tokens, padded_rows)
-    return payload, scales
-
-
-
 def build_o_proj_specs(active_tokens: int, *, pad_to_tile: bool = True):
     """Build deterministic output-projection fixtures with padded inactive rows."""
     from golden import ScalarSpec, TensorSpec
