@@ -10,7 +10,6 @@
 """DeepSeek-V4.1 Flash vocabulary projection, distributed logits assembly and greedy sampling."""
 
 import sys
-from math import gcd
 from pathlib import Path
 
 import pypto.language as pl
@@ -54,10 +53,12 @@ GROUP_LOGIT_ROWS = LM_HEAD_TP_SIZE * MAX_LOGIT_ROWS
 LM_HEAD_M_TILE = 80
 GROUP_M_TILE = min(192, GROUP_LOGIT_ROWS)
 LOGITS_CAST_ROW_TILE = 8
-HIDDEN_OWNER_ROW_TILE = gcd(MAX_LOGIT_ROWS, 48)
-HIDDEN_PUSH_WORKER_TILE = (MAX_LOGIT_ROWS + 64 // LM_HEAD_TP_SIZE - 1) // (64 // LM_HEAD_TP_SIZE)
-HIDDEN_PUSH_ROW_TILE = gcd(HIDDEN_OWNER_ROW_TILE, HIDDEN_PUSH_WORKER_TILE)
-HIDDEN_PUSH_CHUNK_TILE = min(12, HIDDEN_PUSH_ROW_TILE)
+HIDDEN_PUSH_ROW_TILE = 3 if MAX_LOGIT_ROWS % 3 == 0 else 1
+LOGITS_TRANSFER_TILE = 8192
+LOGITS_TRANSFER_ROW_TILE = 2
+LOGITS_PUSH_ROW_TILE = (MAX_LOGIT_ROWS + 64 // LM_HEAD_TP_SIZE - 1) // (64 // LM_HEAD_TP_SIZE)
+LOGITS_PUSH_COL_TILE = min(VOCAB_PER_TP, 32768)
+LOGITS_PUSH_CHUNK_TILE = max(1, min(3, 114688 // (LOGITS_PUSH_COL_TILE * 2)))
 LOGITS_COMM_TILE = 512
 
 # Greedy reduction tiles and first-index selection.
@@ -87,40 +88,6 @@ def _lm_head_projection(
     row_tile: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor:
     """Project BF16 hidden states against packed NZ vocabulary weights."""
-    ...
-
-
-@pl.jit.extern(
-    core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "lm_head_project_push.cpp",
-    aiv_source=Path(__file__).parent / "kernels" / "lm_head_project_push.cpp", dual_aiv_dispatch=True,
-    include_dirs=(pto_isa_include_dir(),),
-)
-def _lm_head_project_push(
-    hidden_states: pl.Tensor,
-    lm_head_weight: pl.Tensor,
-    received: pl.Out[pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.BF16]],
-    tp_rank: pl.Scalar[pl.INT32],
-    group_base: pl.Scalar[pl.INT32],
-    tp_size: pl.Scalar[pl.INDEX],
-    owner_rows: pl.Scalar[pl.INDEX],
-    vocabulary: pl.Scalar[pl.INDEX],
-    row_tile: pl.Scalar[pl.INDEX],
-    owner_row_tile: pl.Scalar[pl.INDEX],
-) -> pld.DistributedTensor:
-    return received
-
-
-@pl.jit.extern(
-    core_type="aiv", source=Path(__file__).parent / "kernels" / "lm_head_panel_gather.cpp",
-    include_dirs=(pto_isa_include_dir(),),
-)
-def _lm_head_panel_gather(
-    received: pl.Tensor,
-    logits: pl.Out[pl.Tensor],
-    tp_size: pl.Scalar[pl.INDEX],
-    owner_rows: pl.Scalar[pl.INDEX],
-    vocabulary: pl.Scalar[pl.INDEX],
-) -> pl.Tensor:
     ...
 
 
@@ -208,34 +175,47 @@ def lm_head(
             for tile in pl.range(worker, LM_HEAD_TP_SIZE * row_tiles, 64):
                 peer = (tp_rank + tile // row_tiles) % LM_HEAD_TP_SIZE
                 row = tile % row_tiles * HIDDEN_PUSH_ROW_TILE
-                owner_stripe = row // HIDDEN_OWNER_ROW_TILE * LM_HEAD_TP_SIZE + tp_rank
-                destination = owner_stripe * HIDDEN_OWNER_ROW_TILE + row % HIDDEN_OWNER_ROW_TILE
+                destination = tp_rank * MAX_LOGIT_ROWS + row
                 pld.tensor.put(
                     hidden_window, peer=group_base + peer, src=selected_hidden, dst_offsets=[destination, 0],
-                    src_offsets=[row, 0], shape=[HIDDEN_PUSH_ROW_TILE, D], chunk_rows=HIDDEN_PUSH_CHUNK_TILE,
-                    chunk_cols=D, pipeline=True,
+                    src_offsets=[row, 0], shape=[HIDDEN_PUSH_ROW_TILE, D],
                 )
         with pl.spmd(LM_HEAD_TP_SIZE, name_hint="lm_head_dispatch_notify", deps=[_dispatch_push_tid]) as _dispatch_notify_tid:
             peer = pl.tile.get_block_idx()
             if peer != tp_rank:
-                pld.system.notify(
-                    hidden_done, peer=group_base + peer, offsets=[tp_rank, 0], value=64, op=pld.NotifyOp.AtomicAdd,
-                )
+                pld.system.notify(hidden_done, peer=group_base + peer, offsets=[tp_rank, 0], value=64, op=pld.NotifyOp.AtomicAdd)
 
         # Wait after all local hidden-row publishes complete.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_dispatch_wait", deps=[_dispatch_push_tid], no_dep_args=[hidden_done], allow_early_resolve=False) as _dwait_tid:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_dispatch_wait", deps=[_dispatch_push_tid], no_dep_args=[hidden_done],
+                   allow_early_resolve=False) as _dwait_tid:
             for owner_tp in pl.range(LM_HEAD_TP_SIZE):
                 if owner_tp != tp_rank:
                     pld.system.wait(
-                        signal=hidden_done, offsets=[owner_tp, 0], expected=pl.cast((done_epoch - first_epoch + 1) * 64, pl.INT32),
-                        cmp=pld.WaitCmp.Ge,
+                        signal=hidden_done, offsets=[owner_tp, 0],
+                        expected=pl.cast((done_epoch - first_epoch + 1) * 64, pl.INT32), cmp=pld.WaitCmp.Ge,
                     )
 
-        with pl.spmd(32, name_hint="lm_head_matmul_push", deps=[_dwait_tid, _dispatch_notify_tid]) as _push_tid:
-            logits_window = _lm_head_project_push(
-                hidden_window, lm_head_weight, logits_window, tp_rank, group_base, LM_HEAD_TP_SIZE,
-                MAX_LOGIT_ROWS, VOCAB_PER_TP, GROUP_M_TILE, HIDDEN_OWNER_ROW_TILE,
-            )
+        logits_shards = pl.create_tensor([GROUP_LOGIT_ROWS, VOCAB_PER_TP], dtype=pl.BF16)
+        with pl.spmd(32, name_hint="lm_head_matmul", deps=[_dwait_tid, _dispatch_notify_tid]) as _project_tid:
+            _lm_head_projection(hidden_window, lm_head_weight, logits_shards, GROUP_LOGIT_ROWS, VOCAB_PER_TP, GROUP_M_TILE)
+
+        received_shards = pl.tensor.view(logits_window, [GROUP_LOGIT_ROWS, VOCAB_PER_TP])
+
+        # Send contiguous vocabulary-shard rows through one UB staging tile.
+        with pl.spmd(64, name_hint="lm_head_combine_push", deps=[_project_tid]) as _push_tid:
+            worker = pl.tile.get_block_idx()
+            row_tiles = (MAX_LOGIT_ROWS + LOGITS_PUSH_ROW_TILE - 1) // LOGITS_PUSH_ROW_TILE
+            for tile in pl.range(worker, LM_HEAD_TP_SIZE * row_tiles, 64):
+                owner_tp = (tile // row_tiles + tp_rank) % LM_HEAD_TP_SIZE
+                row = tile % row_tiles * LOGITS_PUSH_ROW_TILE
+                rows = pl.min(LOGITS_PUSH_ROW_TILE, MAX_LOGIT_ROWS - row)
+                source_row = owner_tp * MAX_LOGIT_ROWS + row
+                pld.tensor.put(
+                    received_shards, peer=group_base + owner_tp, src=logits_shards,
+                    dst_offsets=[tp_rank * MAX_LOGIT_ROWS + row, 0], src_offsets=[source_row, 0],
+                    shape=[rows, VOCAB_PER_TP], chunk_rows=LOGITS_PUSH_CHUNK_TILE, chunk_cols=LOGITS_PUSH_COL_TILE,
+                    pipeline=True,
+                )
 
         # Publish one completion update after all vector workers finish their puts.
         with pl.spmd(LM_HEAD_TP_SIZE, name_hint="lm_head_combine_notify", deps=[_push_tid]) as _notify_tid:
@@ -246,19 +226,31 @@ def lm_head(
                 )
 
         # Wait after all local vocab-shard publishes complete.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_combine_wait", deps=[_push_tid], no_dep_args=[logits_done], allow_early_resolve=False) as _cwait_tid:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_combine_wait", deps=[_push_tid], no_dep_args=[logits_done],
+                   allow_early_resolve=False) as _cwait_tid:
             for src_tp in pl.range(LM_HEAD_TP_SIZE):
                 if src_tp != tp_rank:
                     pld.system.wait(
-                        signal=logits_done, offsets=[src_tp, 0], expected=pl.cast((done_epoch - first_epoch + 1) * 64, pl.INT32),
-                        cmp=pld.WaitCmp.Ge,
+                        signal=logits_done, offsets=[src_tp, 0],
+                        expected=pl.cast((done_epoch - first_epoch + 1) * 64, pl.INT32), cmp=pld.WaitCmp.Ge,
                     )
 
+        # Convert the assembled BF16 window to full-vocabulary FP32 logits.
         with pl.spmd(64, name_hint="lm_head_combine_gather", deps=[_cwait_tid, _notify_tid]) as _gather_tid:
-            logits = _lm_head_panel_gather(logits_window, logits, LM_HEAD_TP_SIZE, MAX_LOGIT_ROWS, VOCAB_PER_TP)
+            worker = pl.tile.get_block_idx()
+            column_tiles = (VOCAB_PER_TP + LOGITS_TRANSFER_TILE - 1) // LOGITS_TRANSFER_TILE
+            for tile in pl.range(worker, LM_HEAD_TP_SIZE * (MAX_LOGIT_ROWS // LOGITS_TRANSFER_ROW_TILE) * column_tiles, 64):
+                shard = tile // ((MAX_LOGIT_ROWS // LOGITS_TRANSFER_ROW_TILE) * column_tiles)
+                row = tile // column_tiles % (MAX_LOGIT_ROWS // LOGITS_TRANSFER_ROW_TILE) * LOGITS_TRANSFER_ROW_TILE
+                col = tile % column_tiles * LOGITS_TRANSFER_TILE
+                cols = pl.min(LOGITS_TRANSFER_TILE, VOCAB_PER_TP - col)
+                chunk = pl.slice(received_shards, [LOGITS_TRANSFER_ROW_TILE, LOGITS_TRANSFER_TILE], [shard * MAX_LOGIT_ROWS + row, col], valid_shape=[LOGITS_TRANSFER_ROW_TILE, cols])
+                vocab_col = shard * VOCAB_PER_TP + col
+                logits[row:row + LOGITS_TRANSFER_ROW_TILE, vocab_col:vocab_col + cols] = pl.cast(chunk, pl.FP32)
 
         # Clear this rank's counters after its final logits-window read.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_signal_clear", deps=[_gather_tid], allow_early_resolve=False) as _clear_tid:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_signal_clear", deps=[_gather_tid],
+                   allow_early_resolve=False) as _clear_tid:
             anchor = pl.read(logits, [0, 0])
             if done_epoch == completed_epochs:
                 zero = pl.cast(0, pl.INT32)
