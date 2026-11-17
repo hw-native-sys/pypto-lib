@@ -187,7 +187,7 @@ def _c1a_publish_quantize(
                 bf = pl.reg.load(source, row * 512 + chunk * 128, lanes=128)
                 bits = pl.reg.interpret_cast(bf, dtype=pl.UINT16)
                 abs_bits = pl.reg.bitwise_and(bits, pl.reg.broadcast(32767, lanes=128, dtype=pl.UINT16), full16)
-                compact = pl.reg.group_reduce_maxi(abs_bits, full16, num_groups=8)
+                compact = pl.reg.reduce_max(abs_bits, full16, group_size=16)
                 bf_max = pl.reg.interpret_cast(compact, dtype=pl.BF16)
                 _maxima_write = pl.reg.store(maxima, row * 32 + chunk * 8, bf_max)
             maximum = pl.reg.convert(pl.reg.load(maxima, row * 32, lanes=32), dtype=pl.FP32)
