@@ -30,3 +30,27 @@ medians of 5.112 s and 4.720 s. Prepared TTFT medians were 5.722 s and
 matched the complete frozen output/cache digests on eight ranks. This
 qualification is limited to that workload. It changes neither GEMM leaves
 nor decode execution.
+
+The opt-in prefill-only `--prefill-moe-parallel-route` option replaces the
+single-block route metadata allocator with bounded route histograms, expert
+prefixes and a stable scatter. Per-expert ordinals retain original token/top-k
+order. Physical tiles retain global first-creation order, including repeated
+expert IDs. The existing gather, expert GEMM, quantization, affinity permutation,
+ordered combine and HC postprocessing consume the original metadata layouts.
+The public prefill tensor ABI and native decode geometry are unchanged.
+
+Each parallel scalar producer owns a complete 64-byte metadata row. Histogram
+and prefix slices use aligned vector stores; the helper joins metadata writers
+before the original gather. Its temporary buffers belong to the configured
+runtime rings and the original two-slot computation backpressure remains in
+force. The option defaults off. In a fixed AgentX 16K replay with owner
+preparation and grouped quantization enabled in both arms, one warmup and six
+ordinary requests per arm measured prepared TTFT medians of 3.589 s and
+3.208 s. Full prefill submit-to-result medians were 3.474 s and 3.101 s.
+Prepared TTFT includes request input preparation, initialization and first-token
+readback. Both metrics improved in all six paired samples. All fourteen
+requests matched complete frozen output/cache digests on eight ranks. Eight
+additional concentrated, duplicate, random and tail routing cases matched all
+six metadata outputs byte for byte on every rank after poisoning their outputs.
+These measurements qualify the tested workload; they do not replace a new
+selected-plan critical-path profile or long-context qualification.

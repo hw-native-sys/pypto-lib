@@ -110,3 +110,7 @@ GATE_WINDOW_ROWS = 2 * T_PAD
 
 OWNER_WINDOW_ROWS = 2 * T_PAD
 PREP_OWNER_ROWS = T // N_RANKS
+
+PREFILL_MOE_PARALLEL_ROUTE = _parse_int_argv("--prefill-moe-parallel-route", 0)
+if PREFILL_MOE_PARALLEL_ROUTE not in (0, 1):
+    raise ValueError("Parallel routing must be zero or one")
