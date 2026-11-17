@@ -860,3 +860,17 @@ output/cache hashes. One warm request plus six ordinary requests per arm gave
 USER medians of 4.286619s versus 4.278417s, with only four of six paired samples
 improving. This small difference is inconclusive; keep fusion disabled in the
 selected plan until a phase-level comparison isolates its additional norm tail.
+
+The experimental `--prefill-moe-local-route-state` keeps expert-slot and work
+row/slot counters in bounded INT32 UB tiles during the original serial routing
+loop. The task writes the completed work vectors to their original GM outputs.
+Expert allocation order, route addresses, per-route scales and weights, shared
+tiles and expert arithmetic remain unchanged. The default is off; native and
+CPU checks alone do not qualify a latency benefit.
+
+The local-state option matched all fourteen complete output/cache hashes in a
+prepared TP8 AgentX 16K, two8K-chunk comparison. With one warm request and six
+ordinary requests per arm, USER request-to-first-token median decreased from
+4.290598s to4.265064s. All six request and submit-to-result pairs improved.
+The option remains explicit; this does not establish serving TPOT or1M-input
+performance.

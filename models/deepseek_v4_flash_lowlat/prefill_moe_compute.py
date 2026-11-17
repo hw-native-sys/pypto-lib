@@ -15,7 +15,7 @@ from .prefill_moe_expert import expert_routed_persistent_planned
 from .prefill_moe_geometry import (
     D, HC_DIM, HC_MULT, IDX_PAD, MIX_HC, MOE_INTER, N_BANK, N_EXPERTS, N_ROUTES,
     PREFILL_MOE_EXPERT_AFFINITY, EXPERT_IDS_PAD, N_SLOTS_B, RECV_MAX, SHARED_EID, SHARED_TILES, SH_SLOT, T, TOPK, VOCAB, WORK_SLOTS_PAD,
-    PREFILL_MOE_BATCHED_GATHER, GATHER_TOKEN_TILE, SHARED_GATHER_T_TILE, PREFILL_MOE_COMBINE_ROWS,
+    PREFILL_MOE_BATCHED_GATHER, GATHER_TOKEN_TILE, SHARED_GATHER_T_TILE, PREFILL_MOE_COMBINE_ROWS, PREFILL_MOE_LOCAL_ROUTE_STATE,
 )
 
 
@@ -74,40 +74,80 @@ def route_group(
 
     with pl.spmd(1, name_hint="route_group_scalar", allow_early_resolve=True, deps=[init_tid]) as scalar_tid:
         scalar_core = pl.tile.get_block_idx()
-        next_slot = pl.cast(0, pl.INDEX)
-        for token in pl.range(scalar_core, active_tokens):
-            token_scale = pl.read(x_norm_scale, [token, 0])
-            for k in pl.range(TOPK):
-                expert_id = pl.read(indices, [token, k])
-                expert_col = pl.cast(expert_id, pl.INDEX)
-                slot = pl.read(expert_slot, [0, expert_col])
-                if slot >= 0:
-                    occupied = pl.read(work_rows, [pl.cast(slot, pl.INDEX)])
-                    if occupied >= RECV_MAX:
-                        slot = pl.const(-1, pl.INT32)
-                if slot < 0:
-                    slot = pl.cast(next_slot, pl.INT32)
-                    pl.write(expert_slot, [0, expert_col], slot)
-                    pl.write(slot_expert, [next_slot, 0], expert_id)
-                    pl.write(work_slot, [next_slot], slot)
-                    next_slot = next_slot + 1
-                slot_row = pl.cast(slot, pl.INDEX)
-                count = pl.read(work_rows, [slot_row])
-                count_col = pl.cast(count, pl.INDEX)
-                pl.write(work_rows, [slot_row], pl.cast(count + 1, pl.INT32))
-                pl.write(recv_scale, [slot_row, count_col], token_scale)
-                pl.write(recv_w, [slot_row, count_col], pl.read(weights, [token, k]))
-                route = token * TOPK + k
-                pl.write(route_slot_row, [route, 0], pl.cast(slot * RECV_MAX + count, pl.INT32))
-
-            shared_slot = SH_SLOT + token // RECV_MAX
-            shared_row = token % RECV_MAX
-            pl.write(recv_scale, [shared_slot, shared_row], token_scale)
-            pl.write(recv_w, [shared_slot, shared_row], pl.cast(1.0, pl.FP32))
-        for shared_tile in pl.range(SHARED_TILES):
-            shared_count = pl.min(RECV_MAX, pl.max(active_tokens - shared_tile * RECV_MAX, 0))
-            pl.write(work_slot, [next_slot + shared_tile], pl.cast(SH_SLOT + shared_tile, pl.INT32))
-            pl.write(work_rows, [next_slot + shared_tile], pl.cast(shared_count, pl.INT32))
+        if PREFILL_MOE_LOCAL_ROUTE_STATE != 0:
+            local_experts = pl.tile.full([1, N_EXPERTS], dtype=pl.INT32, value=-1)
+            local_rows = pl.tile.full([1, WORK_SLOTS_PAD], dtype=pl.INT32, value=0)
+            local_slots = pl.tile.full([1, WORK_SLOTS_PAD], dtype=pl.INT32, value=0)
+            next_slot = pl.cast(0, pl.INDEX)
+            for token in pl.range(scalar_core, active_tokens):
+                token_scale = pl.read(x_norm_scale, [token, 0])
+                for k in pl.range(TOPK):
+                    expert_id = pl.read(indices, [token, k])
+                    expert_col = pl.cast(expert_id, pl.INDEX)
+                    slot = pl.read(local_experts, [0, expert_col])
+                    if slot >= 0:
+                        occupied = pl.read(local_rows, [0, pl.cast(slot, pl.INDEX)])
+                        if occupied >= RECV_MAX:
+                            slot = pl.const(-1, pl.INT32)
+                    if slot < 0:
+                        slot = pl.cast(next_slot, pl.INT32)
+                        pl.write(local_experts, [0, expert_col], slot)
+                        pl.write(slot_expert, [next_slot, 0], expert_id)
+                        pl.write(local_slots, [0, next_slot], slot)
+                        next_slot = next_slot + 1
+                    slot_row = pl.cast(slot, pl.INDEX)
+                    count = pl.read(local_rows, [0, slot_row])
+                    count_col = pl.cast(count, pl.INDEX)
+                    pl.write(local_rows, [0, slot_row], pl.cast(count + 1, pl.INT32))
+                    pl.write(recv_scale, [slot_row, count_col], token_scale)
+                    pl.write(recv_w, [slot_row, count_col], pl.read(weights, [token, k]))
+                    route = token * TOPK + k
+                    pl.write(route_slot_row, [route, 0], pl.cast(slot * RECV_MAX + count, pl.INT32))
+                shared_slot = SH_SLOT + token // RECV_MAX
+                shared_row = token % RECV_MAX
+                pl.write(recv_scale, [shared_slot, shared_row], token_scale)
+                pl.write(recv_w, [shared_slot, shared_row], pl.cast(1.0, pl.FP32))
+            for shared_tile in pl.range(SHARED_TILES):
+                shared_count = pl.min(RECV_MAX, pl.max(active_tokens - shared_tile * RECV_MAX, 0))
+                pl.write(local_slots, [0, next_slot + shared_tile], pl.cast(SH_SLOT + shared_tile, pl.INT32))
+                pl.write(local_rows, [0, next_slot + shared_tile], pl.cast(shared_count, pl.INT32))
+            pl.store(local_slots, [0, 0], work_slot_2d)
+            pl.store(local_rows, [0, 0], work_rows_2d)
+        else:
+            next_slot = pl.cast(0, pl.INDEX)
+            for token in pl.range(scalar_core, active_tokens):
+                token_scale = pl.read(x_norm_scale, [token, 0])
+                for k in pl.range(TOPK):
+                    expert_id = pl.read(indices, [token, k])
+                    expert_col = pl.cast(expert_id, pl.INDEX)
+                    slot = pl.read(expert_slot, [0, expert_col])
+                    if slot >= 0:
+                        occupied = pl.read(work_rows, [pl.cast(slot, pl.INDEX)])
+                        if occupied >= RECV_MAX:
+                            slot = pl.const(-1, pl.INT32)
+                    if slot < 0:
+                        slot = pl.cast(next_slot, pl.INT32)
+                        pl.write(expert_slot, [0, expert_col], slot)
+                        pl.write(slot_expert, [next_slot, 0], expert_id)
+                        pl.write(work_slot, [next_slot], slot)
+                        next_slot = next_slot + 1
+                    slot_row = pl.cast(slot, pl.INDEX)
+                    count = pl.read(work_rows, [slot_row])
+                    count_col = pl.cast(count, pl.INDEX)
+                    pl.write(work_rows, [slot_row], pl.cast(count + 1, pl.INT32))
+                    pl.write(recv_scale, [slot_row, count_col], token_scale)
+                    pl.write(recv_w, [slot_row, count_col], pl.read(weights, [token, k]))
+                    route = token * TOPK + k
+                    pl.write(route_slot_row, [route, 0], pl.cast(slot * RECV_MAX + count, pl.INT32))
+    
+                shared_slot = SH_SLOT + token // RECV_MAX
+                shared_row = token % RECV_MAX
+                pl.write(recv_scale, [shared_slot, shared_row], token_scale)
+                pl.write(recv_w, [shared_slot, shared_row], pl.cast(1.0, pl.FP32))
+            for shared_tile in pl.range(SHARED_TILES):
+                shared_count = pl.min(RECV_MAX, pl.max(active_tokens - shared_tile * RECV_MAX, 0))
+                pl.write(work_slot, [next_slot + shared_tile], pl.cast(SH_SLOT + shared_tile, pl.INT32))
+                pl.write(work_rows, [next_slot + shared_tile], pl.cast(shared_count, pl.INT32))
 
 
     if PREFILL_MOE_BATCHED_GATHER != 0:

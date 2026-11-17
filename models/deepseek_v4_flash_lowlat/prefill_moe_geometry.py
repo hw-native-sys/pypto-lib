@@ -54,6 +54,9 @@ if PREFILL_MOE_FUSED_NORM_QUANT not in (0, 1):
 PREFILL_MOE_COMBINE_ROWS = _parse_int_argv("--prefill-moe-combine-rows", 1)
 if PREFILL_MOE_COMBINE_ROWS not in (1, 4, 8):
     raise ValueError("Prefill combine rows must be 1, 4 or 8")
+PREFILL_MOE_LOCAL_ROUTE_STATE = _parse_int_argv("--prefill-moe-local-route-state", 0)
+if PREFILL_MOE_LOCAL_ROUTE_STATE not in (0, 1):
+    raise ValueError("Prefill local route state must be zero or one")
 EXPERT_IDS_PAD = (N_BANK + 7) // 8 * 8
 
 # Expert and transport tiling.
