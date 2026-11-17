@@ -1,0 +1,39 @@
+{
+  "status": "PASS_STATIC_VIRTUAL_PREDICATES_ONLY",
+  "M01_math_baseline_UNAPPLIED_sha256": "eb90ea56e26d0cb97dd12d330559c2ae1b53f4ae5cbf866cc01bfbbb150fecf2",
+  "M02_producer_UNAPPLIED_sha256": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "would_be_generate_sha256": "f7b772cfa62ea38ebc9228e0230b770d8cf29a76527071cfe75b0c2bd5035e76",
+  "literal_patch_sha256": "e5f740cef48c32df63ae791cd96e7eb0dd39fcc138c4a3a15004b9980f15e4f0",
+  "resource_ledger_unchanged_digest": "e13c5fd6d98de327a24427b5efc0a9be4e9c30a89e757ac6c377e73b6ffc10ff",
+  "resource_counts": {
+    "prefill": {
+      "targets": 912,
+      "initialized_device_bytes": 633997065216,
+      "source_read_calls": 164192,
+      "cumulative_source_bytes": 745846365184
+    },
+    "decode": {
+      "targets": 912,
+      "initialized_device_bytes": 633997065216,
+      "source_read_calls": 164192,
+      "cumulative_source_bytes": 745846365184
+    }
+  },
+  "rejected": [
+    "current_guard_newmath_oldplan",
+    "current_guard_newbaseline",
+    "newguard_oldplan",
+    "newguard_wrong_HC",
+    "newguard_missing_path"
+  ],
+  "exact44_hashcheck_preserved": true,
+  "no_hash_cycle": "M01 uses appliedfba8 driver plus HC2; M02 differs only literal baseline binding; newplan expects M01 math44 and receipt binds M02 actualproducer45.",
+  "live45_unchanged": true,
+  "shared_docs_writes": 0,
+  "compiles": 0,
+  "NPU": false,
+  "payload_bytes": 0,
+  "headers_reread": 0,
+  "fullplan_rebuilt": false,
+  "positive_constructor_or_grant": false
+}

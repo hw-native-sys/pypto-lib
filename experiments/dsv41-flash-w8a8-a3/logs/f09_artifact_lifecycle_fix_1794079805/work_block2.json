@@ -1,0 +1,8 @@
+{
+  "record_id": "main-f09-artifact-lifecycle-1794079805-block2",
+  "start_epoch": 1794081179,
+  "end_epoch": 1794081333,
+  "elapsed_seconds": 154,
+  "category": "validate-cpu",
+  "activity": "Releasedhold ONE035312 tiny metadata/mock suite PASS; no prepare/compile/NPU"
+}

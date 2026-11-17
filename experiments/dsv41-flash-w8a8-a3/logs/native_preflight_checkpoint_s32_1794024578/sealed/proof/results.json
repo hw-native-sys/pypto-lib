@@ -1,0 +1,227 @@
+{
+  "threads": 16,
+  "torch": "2.14.1+cpu",
+  "torch_config": "PyTorch built with:\n  - GCC 13.3\n  - C++ Version: 202002\n  - Intel(R) MKL-DNN v3.12.0 (Git Hash 80afa71049cd69a3df32adcccb623b12cd7baa22)\n  - OpenMP 201511 (a.k.a. OpenMP 4.5)\n  - LAPACK is enabled (usually provided by MKL)\n  - NNPACK is enabled\n  - CPU capability usage: SVE256\n  - Build settings: BLAS_INFO=open, BUILD_TYPE=Release, COMMIT_SHA=5c4886908584029761b579af026dcfb627c84070, CUDA_FLAGS= -DLIBCUDACXX_ENABLE_SIMPLIFIED_COMPLEX_OPERATIONS -Xfatbin -compress-all  -Wno-deprecated-gpu-targets --expt-extended-lambda -DCUB_WRAPPED_NAMESPACE=at_cuda_detail -DDISABLE_CUSPARSE_DEPRECATED -DCUDA_HAS_FP16=1 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -DC10_NODEPRECATED, CXX_COMPILER=/opt/rh/gcc-toolset-13/root/usr/bin/c++, CXX_FLAGS= -ffunction-sections -fdata-sections -fvisibility-inlines-hidden -DUSE_PTHREADPOOL -DNDEBUG -DUSE_KINETO -DUSE_FBGEMM -DUSE_PYTORCH_QNNPACK -DAT_BUILD_ARM_VEC256_WITH_SLEEF -DSYMBOLICATE_MOBILE_DEBUG_HANDLE -O2 -fPIC -DC10_NODEPRECATED -Wall -Wextra -Werror=return-type -Werror=non-virtual-dtor -Werror=range-loop-construct -Werror=bool-operation -Wnarrowing -Wno-missing-field-initializers -Wno-unknown-pragmas -Wno-unused-parameter -Wno-strict-overflow -Wno-strict-aliasing -Wno-stringop-overflow -Wsuggest-override -Wno-psabi -Wno-error=old-style-cast -faligned-new -Wno-maybe-uninitialized -fno-omit-frame-pointer -fno-math-errno -fno-trapping-math -Werror=format -Wno-dangling-reference -Wno-error=dangling-reference -Wno-stringop-overflow, LAPACK_INFO=open, TORCH_VERSION=2.14.1, USE_CUDA=0, USE_CUDNN=OFF, USE_CUSPARSELT=OFF, USE_GFLAGS=OFF, USE_GLOG=OFF, USE_GLOO=ON, USE_HIPSPARSELT=OFF, USE_MKLDNN=1, USE_MPI=OFF, USE_NCCL=OFF, USE_NNPACK=ON, USE_OPENMP=ON, USE_ROCM=OFF, USE_ROCM_KERNEL_ASSERT=OFF, USE_XCCL=OFF, USE_XPU=OFF, \n",
+  "platform": "CPU",
+  "source45_before_after": true,
+  "proof_cases": [
+    {
+      "K": 1280,
+      "case": "random",
+      "bitwise_i32": true,
+      "independent_i64": true,
+      "max_abs": 548231
+    },
+    {
+      "K": 1280,
+      "case": "minmin",
+      "bitwise_i32": true,
+      "independent_i64": true,
+      "max_abs": 20971520
+    },
+    {
+      "K": 1280,
+      "case": "maxmax",
+      "bitwise_i32": true,
+      "independent_i64": true,
+      "max_abs": 20645120
+    },
+    {
+      "K": 1280,
+      "case": "minmax",
+      "bitwise_i32": true,
+      "independent_i64": true,
+      "max_abs": 20807680
+    },
+    {
+      "K": 1280,
+      "case": "cancel",
+      "bitwise_i32": true,
+      "independent_i64": true,
+      "max_abs": 81920
+    },
+    {
+      "K": 1280,
+      "case": "noncontiguous_NZ",
+      "bitwise_i32": true,
+      "independent_i64": true,
+      "max_abs": 454904
+    },
+    {
+      "K": 2304,
+      "case": "random",
+      "bitwise_i32": true,
+      "independent_i64": true,
+      "max_abs": 746305
+    },
+    {
+      "K": 2304,
+      "case": "minmin",
+      "bitwise_i32": true,
+      "independent_i64": true,
+      "max_abs": 37748736
+    },
+    {
+      "K": 2304,
+      "case": "maxmax",
+      "bitwise_i32": true,
+      "independent_i64": true,
+      "max_abs": 37161216
+    },
+    {
+      "K": 2304,
+      "case": "minmax",
+      "bitwise_i32": true,
+      "independent_i64": true,
+      "max_abs": 37453824
+    },
+    {
+      "K": 2304,
+      "case": "cancel",
+      "bitwise_i32": true,
+      "independent_i64": true,
+      "max_abs": 147456
+    },
+    {
+      "K": 2304,
+      "case": "noncontiguous_NZ",
+      "bitwise_i32": true,
+      "independent_i64": true,
+      "max_abs": 656533
+    },
+    {
+      "K": 5120,
+      "case": "random",
+      "bitwise_i32": true,
+      "independent_i64": true,
+      "max_abs": 1130194
+    },
+    {
+      "K": 5120,
+      "case": "minmin",
+      "bitwise_i32": true,
+      "independent_i64": true,
+      "max_abs": 83886080
+    },
+    {
+      "K": 5120,
+      "case": "maxmax",
+      "bitwise_i32": true,
+      "independent_i64": true,
+      "max_abs": 82580480
+    },
+    {
+      "K": 5120,
+      "case": "minmax",
+      "bitwise_i32": true,
+      "independent_i64": true,
+      "max_abs": 83230720
+    },
+    {
+      "K": 5120,
+      "case": "cancel",
+      "bitwise_i32": true,
+      "independent_i64": true,
+      "max_abs": 327680
+    },
+    {
+      "K": 5120,
+      "case": "noncontiguous_NZ",
+      "bitwise_i32": true,
+      "independent_i64": true,
+      "max_abs": 885802
+    }
+  ],
+  "fp32_wrong_control": {
+    "original": 83885825,
+    "fp32": 83885824
+  },
+  "rejections": [
+    {
+      "case": "overflow_bound",
+      "error": "possible INT32 overflow; use original S32 reference instead"
+    },
+    {
+      "case": "domain",
+      "error": "operands outside original signed INT8 domain"
+    },
+    {
+      "case": "dtype",
+      "error": "INT8 or checked INT32 operands required"
+    },
+    {
+      "case": "shape",
+      "error": "two compatible matrices required"
+    }
+  ],
+  "four_consumer_output_checks": [
+    {
+      "consumer": "moe_experts",
+      "source_sha256": "5d9d95bb6826d6d93cc24b1c2e2ec3e1cbe9442a0338272d79ac536a17a9d875",
+      "scales_casts_AST_preserved": true,
+      "output_bitwise": true,
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "consumer": "gemm_w8a8",
+      "source_sha256": "162cfd228d882ecb041a34c751643a8712f5f7a2538f2ea7c0cc8bff73a317ed",
+      "scales_casts_AST_preserved": true,
+      "output_bitwise": true,
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "consumer": "mla_proj",
+      "source_sha256": "c8acc26cf76936995e049d51cc163f9aebf4acc332f6901d13d0302a6458592b",
+      "scales_casts_AST_preserved": true,
+      "output_bitwise": true,
+      "dtype": "torch.float32"
+    },
+    {
+      "consumer": "indexer",
+      "source_sha256": "5568b7aae5f43c9f0e335161b9103aa483e2a3606b94473fd6194994f93bc8b4",
+      "scales_casts_AST_preserved": true,
+      "output_bitwise": true,
+      "dtype": "torch.float32"
+    }
+  ],
+  "SAFE_K": 131071,
+  "benchmark": {
+    "shape": [
+      128,
+      64,
+      5120
+    ],
+    "warmup": 2,
+    "rounds": 7,
+    "seconds_samples": {
+      "original_s32": [
+        0.003864870988763869,
+        0.0038910999428480864,
+        0.0038979609962552786,
+        0.003860880038700998,
+        0.0038978710072115064,
+        0.0038612999487668276,
+        0.0038915809709578753
+      ],
+      "checked_fp64_to_i32": [
+        0.0008863449329510331,
+        0.0008128639310598373,
+        0.0008654650300741196,
+        0.0008106540190055966,
+        0.0008826450211927295,
+        0.0008149140048772097,
+        0.0008815840119495988
+      ]
+    },
+    "median_seconds": {
+      "original_s32": 0.0038910999428480864,
+      "checked_fp64_to_i32": 0.0008654650300741196
+    },
+    "smallcase_speedup": 4.495964374799577,
+    "includes": "operandconversion/domainminmax/FP64dot/toINT32; no persistent weightcache",
+    "metric": "CPU wall seconds, process repeated alternating order; not NPU/fullmodel speedup"
+  },
+  "NPU": 0,
+  "payload_reads": 0,
+  "production_reference_edits": 0
+}

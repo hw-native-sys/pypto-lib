@@ -1,0 +1,214 @@
+{
+  "schema": 3,
+  "supported_execution_modes": [
+    "program"
+  ],
+  "params": [
+    {
+      "name": "x__ssa_v0",
+      "direction": "In",
+      "shape": [
+        16,
+        2,
+        5120
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "indices__ssa_v0",
+      "direction": "In",
+      "shape": [
+        16,
+        2,
+        6
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "weights__ssa_v0",
+      "direction": "In",
+      "shape": [
+        16,
+        2,
+        6
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "w1__ssa_v0",
+      "direction": "In",
+      "shape": [
+        24,
+        5120,
+        2304
+      ],
+      "dtype": "int8",
+      "layout": "ND"
+    },
+    {
+      "name": "w1_scale__ssa_v0",
+      "direction": "In",
+      "shape": [
+        24,
+        2304
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "w3__ssa_v0",
+      "direction": "In",
+      "shape": [
+        24,
+        5120,
+        2304
+      ],
+      "dtype": "int8",
+      "layout": "ND"
+    },
+    {
+      "name": "w3_scale__ssa_v0",
+      "direction": "In",
+      "shape": [
+        24,
+        2304
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "w2__ssa_v0",
+      "direction": "In",
+      "shape": [
+        24,
+        2304,
+        5120
+      ],
+      "dtype": "int8",
+      "layout": "ND"
+    },
+    {
+      "name": "w2_scale__ssa_v0",
+      "direction": "In",
+      "shape": [
+        24,
+        5120
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "shared_w1__ssa_v0",
+      "direction": "In",
+      "shape": [
+        5120,
+        2304
+      ],
+      "dtype": "int8",
+      "layout": "ND"
+    },
+    {
+      "name": "shared_w1_scale__ssa_v0",
+      "direction": "In",
+      "shape": [
+        2304
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "shared_w3__ssa_v0",
+      "direction": "In",
+      "shape": [
+        5120,
+        2304
+      ],
+      "dtype": "int8",
+      "layout": "ND"
+    },
+    {
+      "name": "shared_w3_scale__ssa_v0",
+      "direction": "In",
+      "shape": [
+        2304
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "shared_w2__ssa_v0",
+      "direction": "In",
+      "shape": [
+        2304,
+        5120
+      ],
+      "dtype": "int8",
+      "layout": "ND"
+    },
+    {
+      "name": "shared_w2_scale__ssa_v0",
+      "direction": "In",
+      "shape": [
+        5120
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "routed__ssa_v0",
+      "direction": "InOut",
+      "shape": [
+        16,
+        2,
+        5120
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "epoch__ssa_v0",
+      "direction": "In",
+      "shape": null,
+      "dtype": "int32",
+      "layout": null
+    },
+    {
+      "name": "active_counts__ssa_v0",
+      "direction": "In",
+      "shape": [
+        16
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    }
+  ],
+  "num_return_types": 0,
+  "platform": "a2a3sim",
+  "backend_type": "Ascend910",
+  "distributed_config": {
+    "device_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "num_sub_workers": 0,
+    "runtime": "tensormap_and_ringbuffer",
+    "aicpu_thread_num": 0
+  }
+}

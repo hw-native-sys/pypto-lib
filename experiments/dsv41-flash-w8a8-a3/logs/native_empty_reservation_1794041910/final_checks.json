@@ -1,0 +1,51 @@
+{
+  "record_id": "native-empty-reservation-1794041910-1794042651",
+  "start_epoch": 1794041910,
+  "end_epoch": 1794042651,
+  "elapsed_seconds": 741,
+  "status": "FINAL/PARK after this queued collector completes",
+  "scope": "noEngram; EMPTY reservation only",
+  "prior_jobs": {
+    "task_20261107_170442_307058025803": "completed (exit=0)",
+    "task_20261107_170050_30608372498": "completed (exit=0)",
+    "task_20261107_170742_308264929763": "completed (exit=0)",
+    "task_20261107_170305_306661928588": "completed (exit=0)"
+  },
+  "all_prior_jobs_terminal0": true,
+  "native_job_count": 1,
+  "actual_handle_counts": [
+    16,
+    912,
+    0
+  ],
+  "validator_sha256": "bac7748403064849ea05ee4c450061425d7e8194c738d9310696b4213fc32523",
+  "probe_sha256": "c4b62d80662c62058f4ba4a237e606e745b07d8506eb45c0e9ccb098aeec953e",
+  "accepted_calibration_sha256": "3bc7291e174cccc8a8f0272d9786716a78bccb2ae8336c33fdfd4e10a16927f0",
+  "native_artifacts_sha256": "3d072b3ec15a2e00f41aa2c9af97e5684be6672e46f8d7e196108fa9e65094ed",
+  "internal_status": "EMPTY_RESERVATIONS_ONLY",
+  "external_verdict": "PASS_EMPTY_RESERVATION_WITH_FINAL_AFTER_FREE_GATE",
+  "all50_recorded_process_identities_absent": true,
+  "wrapper_absent": true,
+  "native_ready_events": 48,
+  "native_callable_registrations": 48,
+  "queue_snapshot_device_occupancy": 0,
+  "protected_pins_unchanged": true,
+  "observed_memory": {
+    "largest_prewarm_min_free": 59884064768,
+    "largest_after_alloc_min_free": 48557408256,
+    "aggregate_prewarm_min_free": 59885076480,
+    "aggregate_after_last_alloc_min_free": 20251516928,
+    "aggregate_after_last_alloc_max_committed": 45077665637,
+    "final_prewarm_min_free": 59884154880,
+    "final_after_free_min_free": 59884154880
+  },
+  "unknown_peaks": {
+    "full40_physical_firsttouch_peak_bytes": null,
+    "full40_upload_peak_bytes": null,
+    "full40_forward_peak_bytes": null
+  },
+  "model_weight_payload_reads": 0,
+  "initialized_model_weight_uploads": 0,
+  "model_forward_dispatches": 0,
+  "production_fullweight_guard": "HARD/unchanged/HELD"
+}

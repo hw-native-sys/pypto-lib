@@ -1,0 +1,30 @@
+{
+  "step_count": 15,
+  "all_steps_have_eight16hex_prefixes": true,
+  "fields": [
+    "window_cache_sha1",
+    "compressed_cache_c2a_sha1",
+    "index_cache_c2a_sha1",
+    "state_cache_c2a_sha1",
+    "compressed_cache_c1a_sha1",
+    "index_cache_c1a_sha1",
+    "x_hc_sha1",
+    "pre_mix_sha1"
+  ],
+  "last_step_state": {
+    "window_cache_sha1": "b65211cc901b9fcd",
+    "compressed_cache_c2a_sha1": "dd74c65d1afb16c2",
+    "index_cache_c2a_sha1": "db1b149b01c5746a",
+    "state_cache_c2a_sha1": "34eda82525798c6a",
+    "compressed_cache_c1a_sha1": "99bc29f6945e52e1",
+    "index_cache_c1a_sha1": "85df88f8ad46a7de",
+    "x_hc_sha1": "ae85eea8c8eeb48b",
+    "pre_mix_sha1": "1c7218c4746ade2e",
+    "topk_indices_nonzero": 1872,
+    "pool_block_ids_nonzero": 144,
+    "position_ids": [
+      17
+    ]
+  },
+  "scope": "Source generate.py223-225: contiguous FP32-converted host tensor values/SHA1[:16]; not original storage-byte hashes, raw tensor snapshots or independent parity."
+}

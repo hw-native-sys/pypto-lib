@@ -1,0 +1,23 @@
+{
+  "after_actual_allocation_stage_receipt_required": true,
+  "approved": true,
+  "case_sha256": "436754be1f55dcf64acc184de31522d58cc9354038d4f6106bc4037ff7150d48",
+  "client_timeout": 2400,
+  "created_at_epoch": 1794085688.095356,
+  "expires_at_epoch": 1794089188.095356,
+  "launch_sha256": "b340b6dc8cc6ed018e9e5686bd5dcd1ad8f706db5eb91f5a5b0daef7727d9942",
+  "lifecycle_acceptance_sha256": "90d995759c4639637cf6f7c5ea0a014331b2912b26b4fede740fd576f12d5597",
+  "native16_authorized": true,
+  "native_max_time": 1800,
+  "no_full_PSS_peak_claim": true,
+  "no_retry_or_heap_change": true,
+  "pins_sha256": "57b9010fe50ebe4ad4484db3b79507261bfbc51163832e74f7991f55e2845b35",
+  "prequeue_sha256": "ed38110a3e9829e8cfb1115a8e8e99cd8d14de1c695e62057aa86882120784c2",
+  "requested_role": "active",
+  "root_go_id": "observer-20261108-f09-active-count16-v405",
+  "schema": "Root-F09-count-active-operation/1",
+  "scope": "ONE auto16 count-active native stage, three fixed calls with expected route populations192/96/192. E1 synthetic fixture only. No count-old/full-capture/CPU-reference/model application authority.",
+  "source_manifest_sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "stage": "count-active",
+  "work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_count_active_1794084730/work"
+}

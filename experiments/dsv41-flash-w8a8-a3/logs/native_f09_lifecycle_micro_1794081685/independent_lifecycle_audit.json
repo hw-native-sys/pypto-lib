@@ -1,0 +1,20 @@
+{
+  "status": "PASS_TINY_PUBLIC_LIFECYCLE_ONLY",
+  "native_task": "task_20261108_042113_142720411936",
+  "known_identity_count": 5,
+  "known_births_absent": true,
+  "raw_queue_two_device_release": [
+    0,
+    1
+  ],
+  "prepared_receipt_verified": true,
+  "frozen_origin_unchanged": true,
+  "independent_exact_toy_elements": 32768,
+  "expected": 12,
+  "full_PSS_or_continuous_tree_claim": false,
+  "raw_NPU_snapshots": [
+    "raw_before.json",
+    "raw_after_close.json"
+  ],
+  "F09_fullfixture_or_native_model_acceptance": false
+}

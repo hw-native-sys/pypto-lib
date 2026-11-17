@@ -1,0 +1,1 @@
+FAILED terminal metadata only. See ../native_f09_count_active_identity_1794086934/work/ACTUAL_REPORT.md. Raw status exit1; all16 locks released; all16ready PID numbers currently absent; launcher/stage known identities absent. Historical worker/manager/helper birth completeness UNKNOWN. No whole success/count result/peak claim.

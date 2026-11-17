@@ -1,0 +1,6 @@
+NO CURRENT ACTUAL-AUDIT AUTHORIZATION. After fit PREQUEUE, separate SourceB actualRootGO, and SAME actualtask+externalPOST terminal/stable plus Root followup: create NEW same-depth execution bytefork; preserve this preparation immutable and adapt only outer command/handoff/output paths.
+
+Prepared CPU entry (not submitted):
+task-submit --no-device --max-time 600 --run 'source activate-pypto.sh && PYTHONDONTWRITEBYTECODE=1 python experiments/dsv41-flash-w8a8-a3/logs/independent_f09_real_B_generation_prepare_1794099369/audit.py --handoff experiments/dsv41-flash-w8a8-a3/logs/independent_f09_real_B_generation_prepare_1794099369/handoff.json'
+
+Source/plan/helper/signature/F09 lineage gates reject historical M02/611/old actual cases; missing futureRootGO/task/terminal flags stop before any actual audit. No native task, positivegrant, nestedtask-submit, payload, golden, model imports or compile by this preparation.

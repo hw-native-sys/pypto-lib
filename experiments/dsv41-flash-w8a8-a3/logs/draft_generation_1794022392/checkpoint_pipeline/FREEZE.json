@@ -1,0 +1,12 @@
+{
+  "epoch": 1794022858,
+  "manifest_sha256": "92a810332a3effa61ed56fc8770fbbdb095359e7506a9274dd375a104e800642",
+  "prototype_sha256": "a685a1d2e36daf544c12c8aca45c699e3c0b0ffb1269d217aa9ffcef0896d002",
+  "files": 19,
+  "root45_equal": true,
+  "NPU": 0,
+  "realpayload": 0,
+  "ownjobs": "twoCPUcompleteexit0",
+  "status": "PARKED/partialartifactprep",
+  "record_id": "checkpoint-pipeline-1794022446-1794022858"
+}

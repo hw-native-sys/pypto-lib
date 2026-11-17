@@ -1,0 +1,61 @@
+{
+  "status": "PASS_CORRECTED_TWO_SIGNATURES_HOST_WHOLESHARD_CHIP_SLICE_ONLY",
+  "changed_functions": [
+    "decode_chip",
+    "decode"
+  ],
+  "all_other_helpers_byteidentical": true,
+  "same_HOST_formal_ABI_as_old": true,
+  "source45_all_unchanged": true,
+  "compiled_program_proof": [
+    {
+      "phase": "prefill",
+      "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/tiny_shared_host_slice_correction_1794072874/signature_build/_jit_prefill_20261108_013531_vh1i5zrc",
+      "HOST_sha256": "ce9d16a7c888f2640bbb8d6e0b7a1e4ebf00b6cf226af6794f97379d497b2fd9",
+      "HOST_C1_whole_shard": [
+        {
+          "line": 12,
+          "expression": "tensors['c1a_comp_norm__ssa_v0'][rank__idx_v0, 0:128, 0:128]"
+        }
+      ],
+      "CHIP_sha256": "ae790c56bb93ba0036dd50aa26214f4fbf3c0de4a632b32c5800dd54371877d4",
+      "CHIP_singleton_selection": []
+    },
+    {
+      "phase": "decode",
+      "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/tiny_shared_host_slice_correction_1794072874/signature_build/_jit_decode_20261108_013532_8mazfz8m",
+      "HOST_sha256": "620ae6acd87fd4ec51b9930ca885b10e7712383bbf35ef2ff96983e5aeafe553",
+      "HOST_C1_whole_shard": [
+        {
+          "line": 12,
+          "expression": "tensors['c1a_comp_norm__ssa_v0'][rank__idx_v0, 0:1, 0:128, 0:128]"
+        }
+      ],
+      "CHIP_sha256": "ca54bf6532ec4b2036e8dc9f0f01e13c7ac37aa18160fd4c6ca20e49eb100afe",
+      "CHIP_singleton_selection": [
+        {
+          "line": 32,
+          "text": "        Tensor t_view = ext_c.view(t_shapes, t_offsets);"
+        },
+        {
+          "line": 35,
+          "text": "        t.ndims = 2;"
+        }
+      ]
+    }
+  ],
+  "dependency_pins": {
+    "tiny_shared.py": "38e92714a550407727a4a7d816c1e9c8fc711519cc73ecdcf89c1f8d6caa9d59",
+    "tiny_programs.py": "94f3290e98ceefdba48fa61c372130a7176199b19802d1633152dc9d9619ef60",
+    "owner_adapter.py": "188cf41eafb1e6b6bdece83188a52b1a0e3336c6e5fb80a0d62b547223f31a41",
+    "public_contract.py": "7fb8b40dc98a473de56a162031453bfe3fcce481af4cd999181987ecf6409508",
+    "frozen_draft/generate.proposed.py": "fba8a4ef9a06f694fa53278bb80ae2ad70d111336dbead938ab9f8511d27e16e"
+  },
+  "compile_receipt_sha256": "5c8a53cf595e17907bd9e6dd3d80733249d62d1c3e3ff62af7da37d1815a5937",
+  "native": false,
+  "prepare": false,
+  "samples": 0,
+  "actual_allocated_devices": null,
+  "own_pid": 3331540,
+  "own_starttick": "107285020"
+}

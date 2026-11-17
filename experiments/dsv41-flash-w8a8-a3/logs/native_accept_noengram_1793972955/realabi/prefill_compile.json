@@ -1,0 +1,8 @@
+{
+  "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_noengram_1793972955/realabi/build_output/_jit_prefill_fwd_20261106_220614_icw0u58e",
+  "logical_bytes": 635057126660,
+  "storage_bytes": 99186818308,
+  "per_rank_logical_bytes": 39691070416,
+  "mode": "ONBOARD",
+  "engram_enabled": 0
+}

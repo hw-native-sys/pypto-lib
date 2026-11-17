@@ -1,0 +1,16 @@
+{
+  "positive_exact_bytes": true,
+  "stats": {
+    "resident_upload_bytes": 24576,
+    "resident_allocations": 1,
+    "dispatches": 3,
+    "rank_allocations": 2,
+    "copy_calls": 192,
+    "max_leaf_bytes": 2048,
+    "max_copy_bytes": 128,
+    "state_transport": "shared-host H2D/D2H each dispatch",
+    "protocol_domains": "fresh each dispatch"
+  },
+  "coverage_cleanup_controls": 6,
+  "device_execution": false
+}

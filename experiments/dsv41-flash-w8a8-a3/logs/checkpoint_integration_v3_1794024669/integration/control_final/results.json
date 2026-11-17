@@ -1,0 +1,17 @@
+{
+  "status": "PASS_CPU_TOY_ORIGINAL_ROW_COMPARATOR",
+  "correct_oracle_slots": [
+    [
+      129,
+      64
+    ]
+  ],
+  "original_full_cache_tolerant_but_published_row_rejects": true,
+  "golden_body": "CPU_MOCKED only; original compare_published_fwd_cache executes unchanged",
+  "numerical_rejections": {
+    "window_cache": "\n    published step rows:     ratio_allclose fail: error_count=640/640 (ratio=100.0000%, allowed<=1.0000%, threshold=6 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=1 at (0, 0) (tol=0.035625)\n    first 10 mismatches:\n    [0] actual=0, expected=1, diff=1, tol=0.03562\n    [1] actual=0, expected=1, diff=1, tol=0.03562\n    [2] actual=0, expected=1, diff=1, tol=0.03562\n    [3] actual=0, expected=1, diff=1, tol=0.03562\n    [4] actual=0, expected=1, diff=1, tol=0.03562\n    [5] actual=0, expected=1, diff=1, tol=0.03562\n    [6] actual=0, expected=1, diff=1, tol=0.03562\n    [7] actual=0, expected=1, diff=1, tol=0.03562\n    [8] actual=0, expected=1, diff=1, tol=0.03562\n    [9] actual=0, expected=1, diff=1, tol=0.03562",
+    "compressed_cache_c2a": "\n    published step rows:     ratio_allclose fail: error_count=48/48 (ratio=100.0000%, allowed<=1.0000%, threshold=0 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=1 at (0, 0) (tol=0.035625)\n    first 10 mismatches:\n    [0] actual=0, expected=1, diff=1, tol=0.03562\n    [1] actual=0, expected=1, diff=1, tol=0.03562\n    [2] actual=0, expected=1, diff=1, tol=0.03562\n    [3] actual=0, expected=1, diff=1, tol=0.03562\n    [4] actual=0, expected=1, diff=1, tol=0.03562\n    [5] actual=0, expected=1, diff=1, tol=0.03562\n    [6] actual=0, expected=1, diff=1, tol=0.03562\n    [7] actual=0, expected=1, diff=1, tol=0.03562\n    [8] actual=0, expected=1, diff=1, tol=0.03562\n    [9] actual=0, expected=1, diff=1, tol=0.03562"
+  },
+  "native_grant": false,
+  "NPU": 0
+}

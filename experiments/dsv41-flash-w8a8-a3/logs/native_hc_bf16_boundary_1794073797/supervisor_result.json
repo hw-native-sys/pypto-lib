@@ -1,0 +1,73 @@
+{
+  "start_epoch": 1794073902.294583,
+  "end_epoch": 1794073919.150956,
+  "own_identity": {
+    "pid": 3371364,
+    "birth": "107382356",
+    "ppid": 3371001,
+    "comm": "python"
+  },
+  "known_process_identities": [
+    {
+      "pid": 3371400,
+      "birth": "107382422",
+      "ppid": 3371364,
+      "comm": "python"
+    },
+    {
+      "pid": 3371590,
+      "birth": "107382686",
+      "ppid": 3371400,
+      "comm": "git"
+    },
+    {
+      "pid": 3371591,
+      "birth": "107382689",
+      "ppid": 3371400,
+      "comm": "git"
+    },
+    {
+      "pid": 3371631,
+      "birth": "107382743",
+      "ppid": 3371400,
+      "comm": "git"
+    },
+    {
+      "pid": 3372060,
+      "birth": "107383144",
+      "ppid": 3371400,
+      "comm": "git"
+    },
+    {
+      "pid": 3372061,
+      "birth": "107383146",
+      "ppid": 3371400,
+      "comm": "git"
+    },
+    {
+      "pid": 3372139,
+      "birth": "107383200",
+      "ppid": 3371400,
+      "comm": "aarch64-target-"
+    },
+    {
+      "pid": 3372332,
+      "birth": "107383370",
+      "ppid": 3371400,
+      "comm": "python"
+    },
+    {
+      "pid": 3372335,
+      "birth": "107383375",
+      "ppid": 3371400,
+      "comm": "git"
+    }
+  ],
+  "child_exit": 1,
+  "first_error": null,
+  "normal_child_exit": false,
+  "actual_ordered_device_ids": [
+    0
+  ],
+  "native_result_exists": false
+}

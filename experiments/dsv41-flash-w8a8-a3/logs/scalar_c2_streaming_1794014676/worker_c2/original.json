@@ -1,0 +1,40 @@
+{
+  "original_sha256": "1c26f996fa91bcd3ae497e1ae33e88a2e0bf38c2e734f8af85baee06492a87ee",
+  "archive_verified": true,
+  "records": [
+    {
+      "threads": 1,
+      "original_cpu_fp64_max": 0.00147247314453125,
+      "native_original_cpu_max": 0.00147247314453125,
+      "native_fp64_max": 8.940696716308594e-08,
+      "original_value": -10.073726654052734,
+      "exact_value": -10.074462890625
+    },
+    {
+      "threads": 2,
+      "original_cpu_fp64_max": 0.00147247314453125,
+      "native_original_cpu_max": 0.00147247314453125,
+      "native_fp64_max": 8.940696716308594e-08,
+      "original_value": -10.073726654052734,
+      "exact_value": -10.074462890625
+    },
+    {
+      "threads": 8,
+      "original_cpu_fp64_max": 0.00147247314453125,
+      "native_original_cpu_max": 0.00147247314453125,
+      "native_fp64_max": 8.940696716308594e-08,
+      "original_value": -10.073726654052734,
+      "exact_value": -10.074462890625
+    },
+    {
+      "threads": 16,
+      "original_cpu_fp64_max": 0.00147247314453125,
+      "native_original_cpu_max": 0.00147247314453125,
+      "native_fp64_max": 8.940696716308594e-08,
+      "original_value": -10.073726654052734,
+      "exact_value": -10.074462890625
+    }
+  ],
+  "torch_npu_installed": false,
+  "original_contract": "FP32 linear state from BF16-representable operands; CPU evaluation error compared independently to exact FP64 and analytic dot"
+}

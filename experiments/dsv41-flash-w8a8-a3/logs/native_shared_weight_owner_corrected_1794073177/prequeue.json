@@ -1,0 +1,16 @@
+{
+  "stage": "PASS_PREQUEUE_SOURCE_AND_REAL_CAPACITY",
+  "root_go_id": "observer-20261108-shared-owner-tiny2-hostfix",
+  "helper_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/tiny_shared_host_slice_correction_1794072874",
+  "helper39_manifest": "4b419932dd59ca3c15941ddfc7a837ca8e9babd34eadcac66e60e49fd88d4d00",
+  "old_failed46_preserved": true,
+  "fresh_capacity": {
+    "HOST": 1723058659328,
+    "DISK": 8366484094976,
+    "SHM": 1079343157248,
+    "epoch": 1794073177.758458,
+    "units": "bytes"
+  },
+  "source45": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "runtime_all_pins_match": true
+}

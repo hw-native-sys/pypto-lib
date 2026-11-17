@@ -1,0 +1,20 @@
+{
+  "status": "FINAL/PARK",
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "artifacts_manifest_sha256": "e2bbc2ad1054802135cc9d0bcfea7f01ff91face1c385b141976db50c74de362",
+  "artifact_files": 240,
+  "static_plan_sha256": "6f9568a4fdfcb7c3fcb5d816025007f3601e78e24e4b85a392cb3e7854a9b850",
+  "reference_context_sha256": "95fa7a9b88dca411484d12bee71b5d1eaed97beea50d5963075c5f0219285a16",
+  "derived_receipt_sha256": "54dd589e994da582e9b3de992bdb31ea993a23295cdf97a0ce64367606ff6f76",
+  "stage_helper_sha256": "61a92083ba76ec604b0461c9e72a18709dadc243494307a1a349c39cd4d3bb30",
+  "reference_policy_sha256": "c8a0cc3d7c8ba7f208257e483013e9190124b8743d993ea6363aee0370054fb0",
+  "work_record": "review-exact-prompt-1794036903-1794038387",
+  "all_own_jobs_terminal": true,
+  "NPU_jobs": 0,
+  "operational_exceptions": "none; entire preflight unit immutable",
+  "future_capture_fork": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_exact_prompt_capture_1794038189",
+    "fork_receipt_sha256": "c2f06ee6f66f142691862c3e9f3b0536a3df3e94c255408291faf47c93eec361",
+    "static_plan_sha256": "6f9568a4fdfcb7c3fcb5d816025007f3601e78e24e4b85a392cb3e7854a9b850"
+  }
+}

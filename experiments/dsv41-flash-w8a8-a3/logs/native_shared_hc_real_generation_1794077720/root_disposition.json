@@ -1,0 +1,12 @@
+{
+  "authority": "Root formal closeout after reading independent actual audit44 REPORT and summary",
+  "closeout_authorized": true,
+  "whole_case_accepted": false,
+  "native_job": "task_20261108_030353_356363116294",
+  "audit_job": "task_20261108_034146_133529425143",
+  "audit_manifest_sha256": "73055a54a2b6d6841898b7f4417c4aa7c8aa31ceab444ac43ee99967bcec3702",
+  "audit_report_sha256": "f67d313e2d1d35859600f882904622b973b1ba5d36bc5eeda7c4e43ed0bec745",
+  "audit_summary_sha256": "9e59d861925f98cc198631d86148d3483be0f6aa69c259fe3e84deafdc2eec12",
+  "scope": "Whole case FAILED/NOT_ACCEPTED: preserve strict4504passed5unmet, nativequeue1, outerFAIL,183noncritical telemetry gaps and wholePSSnull. Accept only independently verified boundedactualstaticreuse one633997065216/912/read164192/source745846365184; decode0newstaticIO+borrowed912/112C1;15actualprior-greedy4DP/history, actualruntimeHCchangedgeneratedcode, normalcleanup16workers/1001recordedbirthsabsent/raw16release/queue0. Visible16token text has no quality/fullmath/originalparity/HCcausality PASS.",
+  "permitted_final_action": "One owner finalmetadata/protectedsource+oldhash collector, honestFAILED report/manifest/FREEZE and onlyown ACTIVE time row close at real completion; no model/NPU/retry/policy edit"
+}

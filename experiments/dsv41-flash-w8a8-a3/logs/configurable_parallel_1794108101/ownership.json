@@ -1,0 +1,23 @@
+{
+  "Main": "all other A3 model files, generator/metadata/admission/callers/goldens/integration/docs",
+  "parallel_config_collectives": [
+    "config.py",
+    "tp_reduce.py",
+    "moe_exchange.py"
+  ],
+  "parallel_weight_loader": [
+    "weight_map.py",
+    "weight_loader.py"
+  ],
+  "protected": [
+    "A5 files",
+    "old sealed experiment bundles",
+    "runtime/dependencies",
+    "checkpoint",
+    "tests/contract"
+  ],
+  "worker_artifacts": {
+    "parallel_config_collectives": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/configurable_parallel_1794108101/worker_config",
+    "parallel_weight_loader": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/configurable_parallel_1794108101/worker_loader"
+  }
+}

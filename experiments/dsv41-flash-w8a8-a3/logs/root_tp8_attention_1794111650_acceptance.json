@@ -1,0 +1,31 @@
+{
+  "schema": "observer-bounded-acceptance/1",
+  "recorded_epoch": 1794112389.7307122,
+  "kind": "HEADS8_THREE_ORIGINAL_ATTENTION_CASES",
+  "accepted": true,
+  "validation_actor": "/root/reviewer_engram; observer read sealed receipts, did not execute tests",
+  "native_task": "task_20261108_122101_13767445722",
+  "receipt": "logs/native_tp8_attention_1794111650/native_results.json",
+  "receipt_sha256": "c74581710d0272c3640f32bd3d7b02d7cfe32f550d28e00da778f73105f5b0f9",
+  "manifest58_sha256": "44dbd88e5bf47d33e01e6016d1b4a0ea82c05d67f5e87300f648bfd796ca80fc",
+  "cases": [
+    "core16",
+    "packed640",
+    "window128"
+  ],
+  "tolerances": {
+    "atol": 0.02,
+    "rtol": 0.02,
+    "max_error_ratio": 0.005
+  },
+  "shape": [
+    3,
+    8,
+    512
+  ],
+  "mode": "ONBOARD/a2a3",
+  "scope_limit": "Singlecard rank-local attention only; no fullTP8 model/realtext/parity/peak claim",
+  "known_birth_identities": [],
+  "birth_limitation": "first observation after completion; two logged PID numbers absent, original birth ticks unknown",
+  "source": "562cda314635c65823e639d02a7e8db7100a65ef6d7006ff50bbd608d72e0cf7"
+}

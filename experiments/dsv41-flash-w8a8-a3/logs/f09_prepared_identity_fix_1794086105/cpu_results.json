@@ -1,0 +1,118 @@
+{
+  "pass": true,
+  "checks": [
+    {
+      "case": "all32_retained_actual_objects_exact_identity_text_cache",
+      "pass": true,
+      "old_glob_collisions": 4
+    },
+    {
+      "case": "new_receipt_roundtrip_on_cpu_copy_of_actual_images",
+      "pass": true,
+      "new_native_prepare": false
+    },
+    {
+      "case": "missing_own_object",
+      "rejected": true,
+      "error": "missing exact registered prepared object for next_levels/probe_rank/kernels/aiv/int8_quant_per_token.cpp"
+    },
+    {
+      "case": "wrong_identity_object",
+      "rejected": true,
+      "error": "missing exact registered prepared object for next_levels/probe_rank/kernels/aiv/int8_quant_per_token.cpp"
+    },
+    {
+      "case": "malformed_extra_object",
+      "rejected": true,
+      "error": "extra/unregistered/cross-identity prepared object inventory"
+    },
+    {
+      "case": "unregistered_object",
+      "rejected": true,
+      "error": "extra/unregistered/cross-identity prepared object inventory"
+    },
+    {
+      "case": "wrong_cache_identity",
+      "rejected": true,
+      "error": "missing/cross-identity device cache .text binding for next_levels/probe_rank/kernels/aiv/int8_quant_per_token.cpp"
+    },
+    {
+      "case": "cache_text_not_own_ELF_text",
+      "rejected": true,
+      "error": "missing/cross-identity device cache .text binding for next_levels/probe_rank/kernels/aiv/int8_quant_per_token.cpp"
+    },
+    {
+      "case": "source_projection_mutation",
+      "rejected": true,
+      "error": "original compiled source subset changed"
+    },
+    {
+      "case": "unsupported_local_include",
+      "rejected": true,
+      "error": "unsupported local include identity dependency"
+    },
+    {
+      "case": "unregistered_source_binding",
+      "rejected": true,
+      "error": "registered prepared sources differ from binding"
+    },
+    {
+      "case": "base_base0_base1_stems_are_distinct",
+      "pass": true,
+      "CPU_structural_ELF_copy_not_actual_compile": true
+    },
+    {
+      "case": "actual_context_first_error_preserved_attempt_close",
+      "pass": true
+    }
+  ],
+  "actual_retained_registration_count": 32,
+  "profile_source_layouts": [
+    {
+      "profile": "count_active",
+      "registrations": 32,
+      "cores": [
+        "aic",
+        "aiv"
+      ],
+      "unsupported_include_external_layout": false,
+      "status": "SOURCE_ONLY_NOT_PREPARED",
+      "config_hashes": {
+        "next_levels/probe_rank/kernel_config.py": "2dc959de442f2c85d546d2280645a638fc7773909b21ba02c7618f8e2da7e41b"
+      }
+    },
+    {
+      "profile": "count_old_physical",
+      "registrations": 32,
+      "cores": [
+        "aic",
+        "aiv"
+      ],
+      "unsupported_include_external_layout": false,
+      "status": "SOURCE_ONLY_NOT_PREPARED",
+      "config_hashes": {
+        "next_levels/probe_rank/kernel_config.py": "2dc959de442f2c85d546d2280645a638fc7773909b21ba02c7618f8e2da7e41b"
+      }
+    },
+    {
+      "profile": "decode_capacity2",
+      "registrations": 119,
+      "cores": [
+        "aic",
+        "aiv"
+      ],
+      "unsupported_include_external_layout": false,
+      "status": "SOURCE_ONLY_NOT_PREPARED",
+      "config_hashes": {
+        "next_levels/decode_fwd_rank/kernel_config.py": "1eae0edc03e9fa7d7c2cb41149c469174808e3187695428fc2e23f66dd2b47e0"
+      }
+    }
+  ],
+  "no_old_receipts_written": true,
+  "compile": false,
+  "public_prepare": false,
+  "NPU": false,
+  "fixture_or_real_payload": false,
+  "grants": 0,
+  "root_failed_case_still_FAILED": true
+}

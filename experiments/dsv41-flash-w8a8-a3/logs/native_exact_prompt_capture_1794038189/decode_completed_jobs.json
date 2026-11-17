@@ -1,0 +1,50 @@
+[
+  {
+    "task_id": "task_20261107_163209_247501212372",
+    "kind": "CPU-decode-preconditions",
+    "returncode": 0,
+    "stdout": "completed (exit=0)\n",
+    "stderr": "",
+    "epoch": 1794041498.314573
+  },
+  {
+    "task_id": "task_20261107_163417_24812212428",
+    "kind": "native-decode",
+    "returncode": 0,
+    "stdout": "completed (exit=0)\n",
+    "stderr": "",
+    "epoch": 1794041498.4954185
+  },
+  {
+    "task_id": "task_20261107_164045_252846412704",
+    "kind": "CPU-decode-capsule-preconditions",
+    "returncode": 0,
+    "stdout": "completed (exit=0)\n",
+    "stderr": "",
+    "epoch": 1794041498.6766315
+  },
+  {
+    "task_id": "task_20261107_164200_25324854470",
+    "kind": "CPU-decode19",
+    "returncode": 0,
+    "stdout": "completed (exit=0)\n",
+    "stderr": "",
+    "epoch": 1794041498.8639715
+  },
+  {
+    "task_id": "task_20261107_165022_303664014448",
+    "kind": "CPU-decode-sampling",
+    "returncode": 0,
+    "stdout": "completed (exit=0)\n",
+    "stderr": "",
+    "epoch": 1794041499.0312755
+  },
+  {
+    "task_id": "task_20261107_165139_303959327980",
+    "kind": "CPU-decode-final",
+    "returncode": 0,
+    "stdout": "completed (exit=0)\n",
+    "stderr": "",
+    "epoch": 1794041638.46923
+  }
+]

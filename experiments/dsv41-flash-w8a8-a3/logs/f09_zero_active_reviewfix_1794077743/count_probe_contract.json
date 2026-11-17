@@ -1,0 +1,33 @@
+{
+  "same_moe_ffn_function_AST_sha256": "0892262e1d19ca7a173afb96cc7763b10361c45425521d8495d8e3bb51f562ad",
+  "source_sha256": "4fc355b970b069df9c5d2862eec539efdb18c45f6236586d2c777e208035533b",
+  "diagnostic_only": true,
+  "copy_of_model_compute": false,
+  "recv_meta_export_shape": [
+    16,
+    16,
+    24
+  ],
+  "runtime_counts_input": [
+    16
+  ],
+  "physical_capacity": 2,
+  "positive_routes": [
+    192,
+    96,
+    192
+  ],
+  "old_physical_middle_routes": 192,
+  "forced_gate_experts": [
+    192,
+    193,
+    194,
+    195,
+    196,
+    197
+  ],
+  "remote_dest_rank8_active_source0": true,
+  "export_dependency": "deps=[ffn_done] from fixed-capacity combine/return-consumed TASK_ID; no x_hc_out read; generated graph branch reachability remains REQUIRED",
+  "compile": "PENDING",
+  "native": "PENDING"
+}

@@ -1,0 +1,21 @@
+{
+  "native_f09_lifecycle_micro_1794081685": {
+    "manifest_sha256": "c94d3bee25cc2e6fe676a1844390e3299c38818b4c9c715da07731e2da0340bf",
+    "selected_metadata_sha256": {
+      "REPORT.md": "adb238c2d78e9d146ec5c5577b3a58b43b850fc0ba0e9ec11b6555c51853fa3c",
+      "independent_lifecycle_audit.json": "a6a547c910cecd6d2d8696b3c0abcef98c3692002afe64b2d49918c0876a622d",
+      "normal_close.json": "fc164025f4c10f6167a88ba3e756855078a9f43603de141606915821274da002",
+      "binding_prepared.json": "ef4f29bf08902ebd532986adf6b3c8fec50335689cc73ac9ec8a5db2dcc057f5",
+      "PARK.json": "c793ddf8e6114a4967725cf5eb5761354fb59e80e43b05d261480f7607fb0182"
+    },
+    "payload_reread": false
+  },
+  "native_f09_lifecycle_micro_1794081685_launch": {
+    "manifest_sha256": "adb0a4392589f55621d3aca25ea510a1a753c6418ea2461bd0d61cd560fbcf2e",
+    "selected_metadata_sha256": {
+      "REPORT.md": "c608e3f8f969b0f92b09af77af8a24464315fc6ffe0740b7454868e9cd86815a",
+      "PARK.json": "aa7d128a5ed8d722d86310600fea5d427146934e860236e754987967ba44e862"
+    },
+    "payload_reread": false
+  }
+}

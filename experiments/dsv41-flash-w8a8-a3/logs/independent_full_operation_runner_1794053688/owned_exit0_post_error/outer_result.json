@@ -1,0 +1,39 @@
+{
+  "started_epoch": 1794055039.5714939,
+  "command": [
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+    "-c",
+    "print(\"OWNED_CPU_FAKE_ONLY\")"
+  ],
+  "CLI_returncode": 0,
+  "launch_error": null,
+  "postcheck_error": "ValueError('OWNED_POST_SUCCESS_ERROR')",
+  "observation_errors": [],
+  "wait_errors": [],
+  "CLI_terminal": true,
+  "postcheck_skipped_reason": null,
+  "CLI_pid": 3598686,
+  "CLI_identity": {
+    "pid": 3598686,
+    "start_ticks": "105496151",
+    "state": "R",
+    "parent_pid": 3598628
+  },
+  "ended_epoch": 1794055039.6461613,
+  "monitor_errors": [],
+  "monitor_thread_alive": false,
+  "known_process_identities": [
+    [
+      3598628,
+      "105496073"
+    ],
+    [
+      3598686,
+      "105496151"
+    ]
+  ],
+  "sample_count": 3,
+  "peak_sampled_own_tree_pss": 15581184,
+  "peak_sampled_own_tree_uss": 15319040,
+  "status": "FAIL"
+}

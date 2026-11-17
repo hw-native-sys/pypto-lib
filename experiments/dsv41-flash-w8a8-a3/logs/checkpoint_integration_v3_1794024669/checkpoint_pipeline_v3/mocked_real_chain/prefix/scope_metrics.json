@@ -1,0 +1,7 @@
+{
+  "scopes": {
+    "unconditioned": true,
+    "staged": true
+  },
+  "phase": "prefix"
+}

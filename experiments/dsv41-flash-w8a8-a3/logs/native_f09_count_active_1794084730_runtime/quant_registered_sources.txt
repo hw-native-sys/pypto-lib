@@ -1,0 +1,2 @@
+38:	{"func_id": 15, "name": "int8_quant_per_token", "source": str(_ROOT_DIR / "kernels" / "aiv" / "int8_quant_per_token.cpp"), "core_type": "aiv", "code_name": "int8_quant_per_token", "signature": [_D.IN, _D.INOUT, _D.INOUT]},
+42:	{"func_id": 19, "name": "int8_quant_per_token_0", "source": str(_ROOT_DIR / "kernels" / "aiv" / "int8_quant_per_token_0.cpp"), "core_type": "aiv", "code_name": "int8_quant_per_token_0", "signature": [_D.IN, _D.INOUT, _D.INOUT]},

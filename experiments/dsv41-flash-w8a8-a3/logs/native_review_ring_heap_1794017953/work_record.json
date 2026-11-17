@@ -1,0 +1,9 @@
+{
+  "record_id": "review-ring-config-1794017953-1794018164",
+  "agent": "review-agent",
+  "start_epoch": 1794017953,
+  "end_epoch": 1794018164,
+  "elapsed_seconds": 211,
+  "scope": "bounded public-source-only runtime config review; no imports/tests/NPU",
+  "status": "PARKED"
+}

@@ -1,0 +1,15 @@
+{
+  "checkpoint_manifest_sha256": "a79a30e204362c8de1b61119af1327d1b42e844d06424c1163b3be3c60e9c0e5",
+  "evidence_mode": "toy-only-prototype",
+  "all_outputs_pass": true,
+  "output_names": [
+    "state"
+  ],
+  "scope": "toy analytic only, no model/npu",
+  "validated_scopes": {
+    "unconditioned": true,
+    "staged": true
+  },
+  "phase": "prefix",
+  "native_resume_authorized": false
+}

@@ -1,0 +1,11 @@
+{
+  "epoch": 1794022156,
+  "source_manifest_sha256": "ab1ced6d6ecbf9887297458703ba9b74e2c9b8bc57608370b4c2e0310e027e37",
+  "artifact_manifest_sha256": "be8c7621a8cd553608a637f2634fd33783a38771d047f18eb8a0efa56a899775",
+  "artifact_count": 857,
+  "CPU_job": "task112436_323729726258COMPLETEexit0",
+  "NPU": 0,
+  "payload": 0,
+  "source45": "unchanged",
+  "status": "READONLYPLAN/PARKED;generate-onlysourceGOstillrequiredafterreviewerPARK"
+}

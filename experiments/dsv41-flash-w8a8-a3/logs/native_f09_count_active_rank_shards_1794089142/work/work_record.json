@@ -1,0 +1,17 @@
+{
+  "agent": "/root/reviewer_f09",
+  "accounting": "ONE combined native+CPU owner window; runtimefacts not additive",
+  "start_epoch": 1794089706.1072714,
+  "end_epoch": 1794090027.5725389,
+  "native_owner_start_epoch": 1794089711.8522499,
+  "native_stage_terminal_epoch": 1794089753.5098798,
+  "native_owner_wall_seconds": 41.65762996673584,
+  "cpu_authorization_entry_epoch": 1794089906.8609138,
+  "cpu_terminal_observed_by_epoch": 1794090027.5725389,
+  "cpu_elapsed_is_observation_upper_bound_not_CPU_consumption": true,
+  "native_task": "task_20261108_061506_170748215003",
+  "cpu_task": "task_20261108_061820_172295116184",
+  "shared_writes": 0,
+  "ownjobs": 0,
+  "status": "BOUNDED_COUNT_ACTIVE_PASS_FINAL_PARK"
+}

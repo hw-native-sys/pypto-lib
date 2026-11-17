@@ -1,0 +1,18 @@
+{
+  "record_id": "main-f09-fullcapture-prepare-1794090318",
+  "role": "main-agent",
+  "start_epoch": 1794090318,
+  "end_epoch": 1794090852.4404407,
+  "measured_wall_seconds": 534.4404406547546,
+  "shared_writes": 0,
+  "worker_records_imported": 0,
+  "CPU_tasks": [],
+  "NPU_tasks": [],
+  "imports_or_tests": false,
+  "compile": false,
+  "prepare": false,
+  "fixtures_or_references": false,
+  "real_payload_bytes": 0,
+  "positive_grants": 0,
+  "status": "FINAL_PARK_READY_SOURCE_ONLY_PREQUEUE_PENDING"
+}

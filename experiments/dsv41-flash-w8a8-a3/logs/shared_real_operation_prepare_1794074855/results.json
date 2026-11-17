@@ -1,0 +1,31 @@
+{
+  "status": "PASS_TINY_SHARED_ADAPTER_CONTROLS_ONLY",
+  "checks": [
+    "telemetry29-strict-observer-lifecycle-and-fixed-command-exact-inheritance",
+    "outer-main-only-operation-and-accounting-field-amended",
+    "afterallocation-entry-TTL-and-oneattempt-inherited",
+    "source-tokenizer-header-query-caps-and-strict44-inherited-no-header-read",
+    "fixed-normal-CLI-Onceupona-max16-no-alternate-driver",
+    "actual-inmemory-receipt-exact-shared-accounting-source-TTL-no-grant",
+    "adapter-and-product-accounting-exact",
+    "adapter-and-product-accounting-decode-upload-one",
+    "adapter-and-product-accounting-decode-read-false",
+    "adapter-and-product-accounting-upload-float",
+    "adapter-and-product-accounting-base-count-bool",
+    "adapter-and-product-accounting-wrong-phase",
+    "adapter-and-product-accounting-wrong-source-bytes",
+    "adapter-and-product-accounting-extra-key",
+    "future-HC-explicit-pending-refuses-without-relaxing44",
+    "outer-and-entry-default-refuse-before-grants-model-or-allocation",
+    "strict-telemetry-durable-context-while-owned-child-live-nullwholememory-wait-POST"
+  ],
+  "checkpoint_header_bytes_read": 0,
+  "tensor_payload_bytes": 0,
+  "actual_grants": 0,
+  "native_jobs": 0,
+  "signature_compiles": 0,
+  "product_edits": 0,
+  "math_scope": "PRE_HC_B3E_SNAPSHOT_ONLY; FUTURE_HC_PENDING_NOT_ACCEPTED",
+  "telemetry_policy": "STRICT_FAIL_RETAINED",
+  "limits": "Frozen applied shared producer source snapshot/in-memory accounting controls and one tiny owned process; no moving live-source validation, physical shared-real40 fit/parity/HC/611-source rebind claim."
+}

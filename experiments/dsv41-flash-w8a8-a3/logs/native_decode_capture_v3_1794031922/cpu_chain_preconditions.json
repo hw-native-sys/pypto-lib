@@ -1,0 +1,345 @@
+{
+  "native_task": {
+    "command": [
+      "task-submit",
+      "--status",
+      "task_20261107_142329_327923712677"
+    ],
+    "returncode": 0,
+    "stdout": "completed (exit=0)\n",
+    "stderr": "",
+    "time": 1794033349
+  },
+  "actual64worker_outcomes": [
+    [
+      3,
+      0
+    ],
+    [
+      6,
+      0
+    ],
+    [
+      9,
+      0
+    ],
+    [
+      8,
+      0
+    ],
+    [
+      7,
+      0
+    ],
+    [
+      2,
+      0
+    ],
+    [
+      5,
+      0
+    ],
+    [
+      15,
+      0
+    ],
+    [
+      4,
+      0
+    ],
+    [
+      14,
+      0
+    ],
+    [
+      10,
+      0
+    ],
+    [
+      12,
+      0
+    ],
+    [
+      0,
+      0
+    ],
+    [
+      1,
+      0
+    ],
+    [
+      11,
+      0
+    ],
+    [
+      13,
+      0
+    ],
+    [
+      8,
+      0
+    ],
+    [
+      4,
+      0
+    ],
+    [
+      6,
+      0
+    ],
+    [
+      1,
+      0
+    ],
+    [
+      9,
+      0
+    ],
+    [
+      13,
+      0
+    ],
+    [
+      10,
+      0
+    ],
+    [
+      2,
+      0
+    ],
+    [
+      3,
+      0
+    ],
+    [
+      11,
+      0
+    ],
+    [
+      0,
+      0
+    ],
+    [
+      14,
+      0
+    ],
+    [
+      15,
+      0
+    ],
+    [
+      7,
+      0
+    ],
+    [
+      5,
+      0
+    ],
+    [
+      12,
+      0
+    ],
+    [
+      8,
+      0
+    ],
+    [
+      9,
+      0
+    ],
+    [
+      2,
+      0
+    ],
+    [
+      6,
+      0
+    ],
+    [
+      4,
+      0
+    ],
+    [
+      1,
+      0
+    ],
+    [
+      15,
+      0
+    ],
+    [
+      5,
+      0
+    ],
+    [
+      12,
+      0
+    ],
+    [
+      13,
+      0
+    ],
+    [
+      10,
+      0
+    ],
+    [
+      14,
+      0
+    ],
+    [
+      3,
+      0
+    ],
+    [
+      7,
+      0
+    ],
+    [
+      0,
+      0
+    ],
+    [
+      11,
+      0
+    ],
+    [
+      11,
+      0
+    ],
+    [
+      10,
+      0
+    ],
+    [
+      3,
+      0
+    ],
+    [
+      15,
+      0
+    ],
+    [
+      0,
+      0
+    ],
+    [
+      7,
+      0
+    ],
+    [
+      12,
+      0
+    ],
+    [
+      13,
+      0
+    ],
+    [
+      14,
+      0
+    ],
+    [
+      8,
+      0
+    ],
+    [
+      1,
+      0
+    ],
+    [
+      2,
+      0
+    ],
+    [
+      5,
+      0
+    ],
+    [
+      6,
+      0
+    ],
+    [
+      4,
+      0
+    ],
+    [
+      9,
+      0
+    ]
+  ],
+  "all_observed_native_pids_present": {
+    "3279907": false,
+    "3307136": false,
+    "3307137": false,
+    "3307139": false,
+    "3307141": false,
+    "3307156": false,
+    "3307161": false,
+    "3307174": false,
+    "3307181": false,
+    "3307187": false,
+    "3307204": false,
+    "3307209": false,
+    "3307213": false,
+    "3307218": false,
+    "3307225": false,
+    "3307239": false,
+    "3307245": false,
+    "3307253": false,
+    "3279352": false
+  },
+  "source45_V3_old579_unchanged": true,
+  "capsules_verified": {
+    "decode128": {
+      "manifest_sha256": "52847e6bd94d6b5012b17dd6c63898b16f5d3b65184b32083eac96b9702b1afc",
+      "owner_closed_sha256": "fc7c12dbf809874ad897b09f4a23520c9aa9119e3a51f6b1154bc216175daac1",
+      "payload_hashes": {
+        "actual": "8975e91bb5c27e485290b427b6b20d1c2f1c204be23844d2eb296389d0456101",
+        "initial": "3ef87dac861614a84b947cadcfb2279db9230c676ac5ea2f8d4fc2c399c43e96"
+      }
+    },
+    "decode129": {
+      "manifest_sha256": "c60022a1cb58b4d002491c3ea55b9f2840a81375e2aa52298364eaf2c1d2adb0",
+      "owner_closed_sha256": "a8af059b04bd4d8378815a7bc4f85b4b73d396343dcb72c97ee9d4713b4e0b6e",
+      "payload_hashes": {
+        "actual": "d47cc6130d421ebfc11a3239af27b809a9e9c0db12b3d404e4515753517e8523",
+        "initial": "acf60edea322e13e911217e37a955e02e3d55ed9eb2692d59364c8e0b6a7818c"
+      }
+    },
+    "decode130": {
+      "manifest_sha256": "d11feba59123892dbda87a833e2f4909ef15462b52c58333159784647114b822",
+      "owner_closed_sha256": "7f77fe9c345af51266337036c6962af94e40f23310ae887008d5ebdd457905e3",
+      "payload_hashes": {
+        "actual": "cb08b9da19429a578e10e38eec3488cde70f165250458ff02b3acb8271489ec3",
+        "initial": "82b50dc10f7608c2a5d9c5317c9009e5a107d6a069197fcf52de1492d666b488"
+      }
+    },
+    "stale129": {
+      "manifest_sha256": "afe69304d7b28d9588ef84e712916af3ce71ef8816421309a7525524c566afbf",
+      "owner_closed_sha256": "ad33f4df7e10d769453a5ff08cd3030092ff8a63d8a6936b1b396b437f3c54ed",
+      "payload_hashes": {
+        "actual": "c2337109c075a3ad3b24c03f917c9e57275ebcb8b0b8504f6984452f3dd2b50b",
+        "initial": "effd5f6d165059dcb29094ac5d58e11521d21dd09533faec299184e2822c2cc5"
+      }
+    }
+  },
+  "same_owner_artifact_ABI": [
+    "decode-3279907-a0c0ee08f50246a9af467089c7a04388",
+    "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770",
+    "{\"compile_seconds\": 24.996228218078613, \"metadata_sha256\": \"8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770\", \"path\": \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_decode_capture_v3_1794031922/build/_jit_decode_fwd_20261107_142723_4bpmehp7\"}"
+  ],
+  "actual_available": {
+    "host": 1722087157760,
+    "disk": 9527818715136,
+    "shm": 1079343157248
+  },
+  "required": {
+    "host": 306003115008,
+    "disk": 8657043456,
+    "shm": 8589934592
+  },
+  "policy_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_prefix_capture_v3_1794027615/cpu_reference_policy.json",
+  "derived_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/evaluator/derived_model",
+  "NPU": 0
+}

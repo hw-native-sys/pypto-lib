@@ -1,0 +1,16 @@
+{
+  "schema": "independent-configurable-audit-outside-closure/1",
+  "epoch": 1794126892.8239944,
+  "checks": {
+    "own_audit_terminal0": true,
+    "own_audit_PID_birth_absent": true,
+    "all_consumed_inputs_still_identical": true,
+    "queue_no_pending_or_running": true,
+    "queue_zero_used": true,
+    "auditor_completed": true
+  },
+  "status": "CLOSED_METADATA_FACTS",
+  "whole_case_status_unchanged": "NOT_ACCEPTED",
+  "audit_result_sha256": "ca80ff1c46bf70b3ddcad9d2eaa92ad6c54da5c2987839e35eb45af5128ea549",
+  "scope": "Recorded identities and metadata stability only; no full process-history or continuous memory-peak claim"
+}

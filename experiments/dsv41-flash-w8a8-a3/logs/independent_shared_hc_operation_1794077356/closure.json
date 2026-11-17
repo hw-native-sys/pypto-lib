@@ -1,0 +1,19 @@
+{
+  "CPU_birth_absent": true,
+  "actualNPU": 0,
+  "actual_source45": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "all_pins_after_unchanged": true,
+  "end_epoch": 1794078121,
+  "final_CPU_task": "task_20261108_025852_355144221348",
+  "final_exit": 0,
+  "helper15_manifest": "0a879238b20ca62ec096f3ee6b4afb9b81f29e8691389971219a462149bd0861",
+  "metadata_plan": "806852d5baec99a522f5adc3015bdd204d9ac6b17244a29cb26445cbd55fda89",
+  "payload_bytes": 0,
+  "prior_025715_exit": 1,
+  "prior_cause": "own stderr marker omitted argparse-required refusal",
+  "real_operation_readiness_or_grant": false,
+  "rejections": 13,
+  "signature600_manifest": "4ec39ab4506fe6d388fab0d7503f3be4d6b47d72faac0fbbda978f6a473a42a5",
+  "signature_receipt": "3f5441beade418bf307463188a7b5a52c733299cf6dffde0fe501d4df5fbefd4",
+  "state": "PASS_FINAL_PARK_OUTER_CPU_ONLY"
+}

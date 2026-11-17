@@ -1,0 +1,14 @@
+{
+  "schema": "independent-sourceB-real-postcase-handoff/1",
+  "case": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_real_B_generation_1794098661",
+  "native_task_id": null,
+  "root_go_id": null,
+  "source45_sha256": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+  "operation_binding_sha256": "cc2132a8e7bf0b36110f7a99f68d244a8b98e0f0299d8a9b8e897cec1dde5937",
+  "fresh_signature_receipt_sha256": "704eb14f6ff186cedf451830e3c38c303b43a3bce201395e78fd3e044b0ba357",
+  "native_terminal_confirmed": false,
+  "executor_external_POST_terminal_confirmed": false,
+  "outer_queue_snapshot": null,
+  "external_POST": null,
+  "note": "TEMPLATE ONLY. Requires separate actual RootGO and SAME future SourceB case terminal + stable POST + Root followup. Reviewer fills only in a NEW execution bytefork after that authorization."
+}

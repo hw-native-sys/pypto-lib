@@ -1,0 +1,134 @@
+{
+  "status": "PASS_FRESH_EP_THREE_DISTINCT_NATIVE_CAPSULES",
+  "rows": [
+    {
+      "label": "both",
+      "active": [
+        1,
+        1
+      ],
+      "total": 12,
+      "full_matrix_exact_independent": true,
+      "receive_totals_by_destination": [
+        6,
+        6
+      ],
+      "source_totals": [
+        6,
+        6
+      ],
+      "nonzero_local_experts": [
+        186,
+        187,
+        188,
+        189,
+        190,
+        191
+      ],
+      "nonzero_entry_count": 12,
+      "max_abs": 0.0,
+      "outlier_fraction": 0.0,
+      "inactive_output_exact": true,
+      "reference_storage_independent": true,
+      "count_sha256": "eceb0be0a6fcbd04ab30577f7e4240a4620698699344f7f82a6341aa445e63e4",
+      "routed_sha256": "bdff9a35bec13b9b7831325b39d30d2fbcc3e1c3a3708833a8ecb22ff1a95570"
+    },
+    {
+      "label": "idle_rank1",
+      "active": [
+        1,
+        0
+      ],
+      "total": 6,
+      "full_matrix_exact_independent": true,
+      "receive_totals_by_destination": [
+        0,
+        6
+      ],
+      "source_totals": [
+        6,
+        0
+      ],
+      "nonzero_local_experts": [
+        186,
+        187,
+        188,
+        189,
+        190,
+        191
+      ],
+      "nonzero_entry_count": 6,
+      "max_abs": 0.0,
+      "outlier_fraction": 0.0,
+      "inactive_output_exact": true,
+      "reference_storage_independent": true,
+      "count_sha256": "2122d946587fa247f74b06e13fee639a13d1f8ffb1314874357d728e25e6af14",
+      "routed_sha256": "0d38ed22d50fdcea8f282d8e28960e9560e5b833f1f7ba8878b696f903f862db"
+    },
+    {
+      "label": "idle_rank0",
+      "active": [
+        0,
+        1
+      ],
+      "total": 6,
+      "full_matrix_exact_independent": true,
+      "receive_totals_by_destination": [
+        6,
+        0
+      ],
+      "source_totals": [
+        0,
+        6
+      ],
+      "nonzero_local_experts": [
+        186,
+        187,
+        188,
+        189,
+        190,
+        191
+      ],
+      "nonzero_entry_count": 6,
+      "max_abs": 0.0,
+      "outlier_fraction": 0.0,
+      "inactive_output_exact": true,
+      "reference_storage_independent": true,
+      "count_sha256": "e08560ec5fe74005e5cd2969ef03bf69a31ad0ebfb602a9ea7cbf7f61d53c655",
+      "routed_sha256": "b50940169257e63f5dea8976d80b072b48f2b87b17bdf9d18811d50c4416f870"
+    }
+  ],
+  "three_count_payloads_distinct": true,
+  "three_routed_payloads_distinct": true,
+  "all_six_packet_hashes_preserved_before_after": true,
+  "capsules_before": {
+    "ep/work/both/counts_actual_expected.pt": "eceb0be0a6fcbd04ab30577f7e4240a4620698699344f7f82a6341aa445e63e4",
+    "ep/work/both/routed_actual_expected.pt": "bdff9a35bec13b9b7831325b39d30d2fbcc3e1c3a3708833a8ecb22ff1a95570",
+    "ep/work/idle_rank0/counts_actual_expected.pt": "e08560ec5fe74005e5cd2969ef03bf69a31ad0ebfb602a9ea7cbf7f61d53c655",
+    "ep/work/idle_rank0/routed_actual_expected.pt": "b50940169257e63f5dea8976d80b072b48f2b87b17bdf9d18811d50c4416f870",
+    "ep/work/idle_rank1/counts_actual_expected.pt": "2122d946587fa247f74b06e13fee639a13d1f8ffb1314874357d728e25e6af14",
+    "ep/work/idle_rank1/routed_actual_expected.pt": "0d38ed22d50fdcea8f282d8e28960e9560e5b833f1f7ba8878b696f903f862db"
+  },
+  "capsules_after": {
+    "ep/work/both/counts_actual_expected.pt": "eceb0be0a6fcbd04ab30577f7e4240a4620698699344f7f82a6341aa445e63e4",
+    "ep/work/both/routed_actual_expected.pt": "bdff9a35bec13b9b7831325b39d30d2fbcc3e1c3a3708833a8ecb22ff1a95570",
+    "ep/work/idle_rank0/counts_actual_expected.pt": "e08560ec5fe74005e5cd2969ef03bf69a31ad0ebfb602a9ea7cbf7f61d53c655",
+    "ep/work/idle_rank0/routed_actual_expected.pt": "b50940169257e63f5dea8976d80b072b48f2b87b17bdf9d18811d50c4416f870",
+    "ep/work/idle_rank1/counts_actual_expected.pt": "2122d946587fa247f74b06e13fee639a13d1f8ffb1314874357d728e25e6af14",
+    "ep/work/idle_rank1/routed_actual_expected.pt": "0d38ed22d50fdcea8f282d8e28960e9560e5b833f1f7ba8878b696f903f862db"
+  },
+  "original_active_gate": {
+    "atol": 0.02,
+    "rtol": 0.02,
+    "max_error_ratio": 0.01
+  },
+  "old_LOST_case": "untouched and not accepted",
+  "source_dependencies_and_frozen162_9_28_unchanged": true,
+  "CPU_only": true,
+  "expert_references_recomputed": 0,
+  "large_fixtures": 0,
+  "compile": 0,
+  "prepare": 0,
+  "NPU": 0,
+  "completed_utc": "2026-11-08T05:02:09.709559+00:00"
+}

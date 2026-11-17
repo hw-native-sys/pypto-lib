@@ -1,0 +1,18 @@
+{
+  "owner": "/root/reviewer_f09",
+  "unit": "independent_configurable_capture_fix_1794113378",
+  "start_utc": "2026-11-08T04:49:38+00:00",
+  "end_utc": "2026-11-08T04:56:34.070199+00:00",
+  "elapsed_seconds": 416.070199,
+  "CPU_jobs": 2,
+  "CPU_tasks": [
+    "task_20261108_125148_145847622054",
+    "task_20261108_125254_146155913183"
+  ],
+  "NPU_jobs": 0,
+  "shared_writes": 0,
+  "product_writes": 0,
+  "old_artifact_writes": 0,
+  "unique_to_Root_import": true,
+  "jobs_active": 0
+}

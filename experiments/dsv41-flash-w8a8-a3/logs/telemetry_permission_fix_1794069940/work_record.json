@@ -1,0 +1,22 @@
+{
+  "role": "review-agent",
+  "start_epoch": 1794069940,
+  "end_epoch": 1794070950,
+  "elapsed_seconds": 1010,
+  "CPU_job": "task_20261108_005737_323739021370",
+  "CPU_terminal": "COMPLETE0",
+  "CPU_checks": 10,
+  "own_test_birth_identities_absent": 5,
+  "prior_units_unchanged": {
+    "longer_generation_operation_prepare_1794063015": "f2cef526699b5b8a3b4a0f2e6184a80a22ab6798e30066afe204b6d8ca0d9f27",
+    "native_longer_real_generation_1794064297": "4ec4ebed3a0a0412970fa12bb880742a404044846b4a28637a06092abf18f3c0",
+    "independent_longer_real_generation_1794064471": "3a442d9c6e9671b1c362de1a9a8b056b02e5adaa86203763f62ad33a6b6081c4"
+  },
+  "source45_sha256": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "actual_grants": 0,
+  "native_jobs": 0,
+  "tensor_payload_bytes": 0,
+  "product_edits": 0,
+  "shared_ledger_writes": 0,
+  "policy_approved": false
+}

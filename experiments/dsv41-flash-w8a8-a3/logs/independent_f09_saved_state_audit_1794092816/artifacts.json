@@ -1,0 +1,12 @@
+{
+  "PARK.json": "6a60bad18845072d04e674ad953f5dd80dfc0e1923a58ee886a3a334f3842318",
+  "REPORT.md": "c07f18f0ab428bfc4732db8ec4ea57bf2aeaceecb1c74d9a90594def836a6c0e",
+  "audit.py": "ab8146039357d1b5a7f4b556380226a6a498bb9fb4daea9f75d61b065e6466f6",
+  "cpu_task_raw.log": "07b6b59940a4267321cb8342bc20ed90f61c051315fb52457a8e18bd61eea564",
+  "cpu_task_receipt.json": "c80ecff5eb08861effa2f22a9461057fcc705a63e65c90883bb8f46b50f9bfdc",
+  "cpu_task_status.txt": "e9d1ff712f06bb1de067759e33a7004938e8ac346c8609ffd9b60aa081851ac4",
+  "input_pins.json": "3107d89550c09bf91656aeb388b3ce1ac19f9ef5036c3d60de998356090746da",
+  "measured_start_epoch.txt": "2c8cf643457e82edda631d7b0085b1cc54cc69bcb53084f1c842bd019cf4832c",
+  "result.json": "bd0a86fdf4ef3e1eb0150b560706b20dcbae0a5356454f733466984607911ba2",
+  "work_record.json": "fef5dcf8af4e8a9d42c47de1c0883c6cee5db8e9f0c20a43e5cd37d43a63d1f4"
+}

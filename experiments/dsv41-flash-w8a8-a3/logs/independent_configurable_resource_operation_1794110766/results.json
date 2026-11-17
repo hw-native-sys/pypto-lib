@@ -1,0 +1,830 @@
+{
+  "status": "READY_PREPARATION_ONLY",
+  "start_epoch": 1794112871.1026201,
+  "end_epoch": 1794112885.3993273,
+  "checks": [
+    {
+      "name": "Main1550-manifest-pin",
+      "pass": true
+    },
+    {
+      "name": "operation14-manifest-pin",
+      "pass": true
+    },
+    {
+      "name": "all-operation14-bytes",
+      "pass": true
+    },
+    {
+      "name": "source45-pin",
+      "pass": true
+    },
+    {
+      "name": "all45-current-source-bytes",
+      "pass": true
+    },
+    {
+      "name": "v1-to-v3-only-attention-source-change",
+      "pass": true
+    },
+    {
+      "name": "strict-only-two-source-fields-rebound-tp8_ep16",
+      "pass": true
+    },
+    {
+      "name": "new-full-source-binding-tp8_ep16",
+      "pass": true
+    },
+    {
+      "name": "strict-only-two-source-fields-rebound-tp4_ep16",
+      "pass": true
+    },
+    {
+      "name": "new-full-source-binding-tp4_ep16",
+      "pass": true
+    },
+    {
+      "name": "TP8-plan-pin",
+      "pass": true
+    },
+    {
+      "name": "binding-pin",
+      "pass": true
+    },
+    {
+      "name": "actual-imported-topology",
+      "pass": true
+    },
+    {
+      "name": "actual-57-static-resources",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-embed_weight",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-final_norm",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-lm_head_weight",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-hc_attn_fn",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-hc_attn_scale",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-hc_attn_base",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-attn_norm_w",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-wq_a",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-wq_a_scale",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-q_norm_w",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-wq_b",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-wq_b_scale",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-wkv",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-wkv_scale",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-kv_norm_w",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-sink",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-wo_a",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-wo_b",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-hc_ffn_fn",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-hc_ffn_scale",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-hc_ffn_base",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-ffn_norm_w",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-gate_weight",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-gate_bias",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-shared_w1",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-shared_w1_scale",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-shared_w3",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-shared_w3_scale",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-shared_w2",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-shared_w2_scale",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-w1",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-w1_scale",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-w3",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-w3_scale",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-w2",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-w2_scale",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-c2a_comp_wkv",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-c2a_comp_wgate",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-c2a_comp_norm",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-c2a_idx_wq_b",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-c2a_idx_wq_b_scale",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-c2a_idx_weights_proj",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-c2a_idx_wk",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-c2a_idx_k_norm",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-c1a_comp_wkv",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-c1a_comp_norm",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-c1a_idx_wq_b",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-c1a_idx_wq_b_scale",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-c1a_idx_weights_proj",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-c1a_idx_wk",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-c1a_idx_k_norm",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-re_idx_wq_b",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-re_idx_wq_b_scale",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-re_idx_weights_proj",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-engram_wkv",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-engram_qk",
+      "pass": true
+    },
+    {
+      "name": "prefill-rank-axis-engram_rotation",
+      "pass": true
+    },
+    {
+      "name": "prefill-static-arithmetic",
+      "pass": true
+    },
+    {
+      "name": "prefill-all912-unique-keys",
+      "pass": true
+    },
+    {
+      "name": "prefill-all912-shape-dtype-bytes",
+      "pass": true
+    },
+    {
+      "name": "prefill-every-rank-total",
+      "pass": true
+    },
+    {
+      "name": "prefill-global-static-counter",
+      "pass": true
+    },
+    {
+      "name": "prefill-source-map-count-and-bytes",
+      "pass": true
+    },
+    {
+      "name": "prefill-leaves",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-embed_weight",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-hc_attn_fn",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-hc_attn_scale",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-hc_attn_base",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-attn_norm_w",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-wq_a",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-wq_a_scale",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-q_norm_w",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-wq_b",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-wq_b_scale",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-wkv",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-wkv_scale",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-kv_norm_w",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-sink",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-wo_a",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-wo_b",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-hc_ffn_fn",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-hc_ffn_scale",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-hc_ffn_base",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-ffn_norm_w",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-gate_weight",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-gate_bias",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-shared_w1",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-shared_w1_scale",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-shared_w3",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-shared_w3_scale",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-shared_w2",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-shared_w2_scale",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-w1",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-w1_scale",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-w3",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-w3_scale",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-w2",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-w2_scale",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-c2a_comp_wkv",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-c2a_comp_wgate",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-c2a_comp_norm",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-c2a_idx_wq_b",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-c2a_idx_wq_b_scale",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-c2a_idx_weights_proj",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-c2a_idx_wk",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-c2a_idx_k_norm",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-c1a_comp_wkv",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-c1a_comp_norm",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-c1a_idx_wq_b",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-c1a_idx_wq_b_scale",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-c1a_idx_weights_proj",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-c1a_idx_wk",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-c1a_idx_k_norm",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-re_idx_wq_b",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-re_idx_wq_b_scale",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-re_idx_weights_proj",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-engram_wkv",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-engram_qk",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-engram_rotation",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-final_norm",
+      "pass": true
+    },
+    {
+      "name": "decode-rank-axis-lm_head_weight",
+      "pass": true
+    },
+    {
+      "name": "decode-static-arithmetic",
+      "pass": true
+    },
+    {
+      "name": "decode-all912-unique-keys",
+      "pass": true
+    },
+    {
+      "name": "decode-all912-shape-dtype-bytes",
+      "pass": true
+    },
+    {
+      "name": "decode-every-rank-total",
+      "pass": true
+    },
+    {
+      "name": "decode-global-static-counter",
+      "pass": true
+    },
+    {
+      "name": "decode-source-map-count-and-bytes",
+      "pass": true
+    },
+    {
+      "name": "decode-leaves",
+      "pass": true
+    },
+    {
+      "name": "typed-global-IO",
+      "pass": true
+    },
+    {
+      "name": "budget-exact-plan-and-binding",
+      "pass": true
+    },
+    {
+      "name": "positive-policy-not-measured-peak",
+      "pass": true
+    },
+    {
+      "name": "budget-source-calculation",
+      "pass": true
+    },
+    {
+      "name": "unchanged-source-host-floor",
+      "pass": true
+    },
+    {
+      "name": "one-canonical-upload-accounting",
+      "pass": true
+    },
+    {
+      "name": "fresh-v3-signature-pair-pin",
+      "pass": true
+    },
+    {
+      "name": "prefill3-compiled-all-parameters",
+      "pass": true
+    },
+    {
+      "name": "prefill3-compiled-types-and-static-dimensions",
+      "pass": true
+    },
+    {
+      "name": "prefill3-static-compiled-shapes-exact",
+      "pass": true
+    },
+    {
+      "name": "prefill3-six-persistent-InOut",
+      "pass": true
+    },
+    {
+      "name": "prefill3-configured-program-mode",
+      "pass": true
+    },
+    {
+      "name": "decode1-compiled-all-parameters",
+      "pass": true
+    },
+    {
+      "name": "decode1-compiled-types-and-static-dimensions",
+      "pass": true
+    },
+    {
+      "name": "decode1-static-compiled-shapes-exact",
+      "pass": true
+    },
+    {
+      "name": "decode1-six-persistent-InOut",
+      "pass": true
+    },
+    {
+      "name": "decode1-configured-program-mode",
+      "pass": true
+    },
+    {
+      "name": "public-normalized-config-no-prepare",
+      "pass": true
+    },
+    {
+      "name": "actual-class-CPU-inmemory-positive-only",
+      "pass": true
+    },
+    {
+      "name": "actual-product-HARD-even-with-old-optin",
+      "pass": true,
+      "rejection": "host-materialization-overlap: full weights remain held: streaming source/owner is implemented but bounded native reuse, functional continuation and measured real host/HBM fit are unproved (allow_full_materialize=True); no real payload allocation is authorized by this switch"
+    },
+    {
+      "name": "actual-class-reject-false-as-zero-accounting",
+      "pass": true,
+      "rejection": "shared-weights: new Root receipt must bind one-upload/borrowed-consumer accounting"
+    },
+    {
+      "name": "actual-class-reject-stale-v1-plan",
+      "pass": true,
+      "rejection": "first-real-admission: new topology/full-source plan binding required"
+    },
+    {
+      "name": "actual-class-reject-TP4-shaped-contract",
+      "pass": true,
+      "rejection": "first-real-admission: E40 phase/dtype/shape mismatch before allocation"
+    },
+    {
+      "name": "actual-class-future-IO-exact-boundary",
+      "pass": true
+    },
+    {
+      "name": "actual-class-future-IO-rank7-one-byte-short",
+      "pass": true,
+      "rejection": "first-real-memory: before-forward rank7: free=13241343999 total=65787658240 committed=123 remaining=0 reserve=13241344000"
+    },
+    {
+      "name": "strict-observer-lifecycle-all-other-functions-unchanged",
+      "pass": true
+    },
+    {
+      "name": "normal-product-CLI-with-explicit-TP8-EP16",
+      "pass": true
+    },
+    {
+      "name": "fixed-once-cap16-noEngram",
+      "pass": true
+    },
+    {
+      "name": "outer-default-refusal",
+      "pass": true
+    },
+    {
+      "name": "entry-no-allocation-refusal",
+      "pass": true
+    },
+    {
+      "name": "fresh-proposed-case-absent",
+      "pass": true
+    },
+    {
+      "name": "ONE-fresh-PREQUEUE-exit0",
+      "pass": true
+    },
+    {
+      "name": "header-only-no-grant",
+      "pass": true
+    },
+    {
+      "name": "no-actual-output-or-assignment",
+      "pass": true
+    },
+    {
+      "name": "current-source-and-operation-still-frozen",
+      "pass": true
+    }
+  ],
+  "passed": 177,
+  "unmet": 0,
+  "source45_sha256": "f0e91a30e4117e110be183ef44acf2874eea813cc6f72ac7c7fa44bc4ede3a7f",
+  "plan_sha256": "a7b187a084e304b5203aeb2b0897dcb291550fbcf6c5bbaea6d1fe42f49a2a46",
+  "topology": {
+    "tp": 8,
+    "ep": 16,
+    "dp": 2,
+    "world": 16,
+    "local_experts": 24
+  },
+  "budget": {
+    "schema": "configurable-real-resource-budget/1",
+    "topology": {
+      "tp": 8,
+      "ep": 16,
+      "dp": 2,
+      "world": 16,
+      "local_experts": 24
+    },
+    "host_floor_bytes": 68719476736,
+    "disk_floor_bytes": 2147483648,
+    "shm_floor_bytes": 17179869184,
+    "static_per_rank_bytes": 38328513216,
+    "nonstatic_global_IO_bytes": {
+      "prefill": 359958016,
+      "decode": 246077440
+    },
+    "full_global_window_planning_bytes": {
+      "prefill": 2876676096,
+      "decode": 74618880
+    },
+    "communication_reserve_bytes": 2951294976,
+    "unspent_reserve_bytes": 9797894144,
+    "initial_reserve_bytes": 18088299200,
+    "max_new_tokens": 16,
+    "measurement_kind": "CONSERVATIVE_SOURCE_PLANNING_NOT_PEAK",
+    "whole_source_backing_host_allowance_bytes": 5362417664
+  },
+  "compiled_ABI": [
+    {
+      "phase": "prefill3",
+      "formals": 100,
+      "metadata_sha256": "4b5f4876d75282cb34c84975ec27d0e812526866cd815eb76751c356c977de8d",
+      "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/configurable_parallel_1794108101/main/compiled_v3_tp8_ep16/prefill3"
+    },
+    {
+      "phase": "decode1",
+      "formals": 96,
+      "metadata_sha256": "98555b7f185806bab22a72fbe02136740d1678206ff40f0dd40dfb855d718af9",
+      "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/configurable_parallel_1794108101/main/compiled_v3_tp8_ep16/decode1"
+    }
+  ],
+  "PREQUEUE_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_configurable_real_generation_1794111133/prequeue/PREQUEUE.json",
+  "PREQUEUE_sha256": "1acdacf14932b139a94b496397fdd31756b91bc8ba8928f8c42b473b91f39482",
+  "PREQUEUE": {
+    "status": "PASS_IDENTITY_METADATA_ONLY",
+    "stage": "PREQUEUE",
+    "epoch": 1794112885.29996,
+    "source_manifest_sha256": "f0e91a30e4117e110be183ef44acf2874eea813cc6f72ac7c7fa44bc4ede3a7f",
+    "binding_sha256": "d01fe5a625b4102d3fffe509e89485f6fa438a9c67b1ffa32e96c3fe548e3e9d",
+    "checker_sha256": "b751e8cd8dc5ae23d84754b640f160c902066a5e2708580a8e06b09f9ec06b66",
+    "tokenizer_files": {
+      "tokenizer.json": "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b",
+      "tokenizer_config.json": "6ac8c8dc065ed118161d02dd532749ae3f52c243deac27872134fae2f50d8547"
+    },
+    "exact_model_root": "/mnt/data/models/DeepSeek-V4.1-Flash-w8a8",
+    "source_headers": {
+      "source_keys": 139614,
+      "shards": 263,
+      "metadata_bytes_read": 15912800,
+      "tensor_payload_bytes_read": 0
+    },
+    "library_sha256": "24434f8879030ef1b1f31e5fc2ecce683e392d4f1baeb5bcee852fb183976e5c",
+    "resources": {
+      "host_available": 1721204322304,
+      "disk_available": 6873961988096,
+      "shm_available": 1079343157248,
+      "shm_used": 557056
+    },
+    "device_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "full_upload_forward_peaks": null,
+    "grant_created": false,
+    "HC_signature_evidence": {
+      "new_configured_signature_receipt_sha256": "c11948187a3f2e3675d5fe9e0fd0a47f20af67ecbeac4866f947cb7aefca75e4",
+      "historical_ancestry_scope": "HISTORICAL_ONLY_NOT_NEW_TOPOLOGY_NATIVE_ACCEPTANCE"
+    }
+  },
+  "CPU_FAKE_units_not_measurements": true,
+  "actual_grants_created": 0,
+  "NPU_submissions": 0,
+  "tensor_payload_bytes_read": 0,
+  "shared_writes": 0
+}

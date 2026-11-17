@@ -1,0 +1,14 @@
+{
+  "CPU_birth_absent": true,
+  "CPU_exit": 0,
+  "CPU_task": "task_20261108_013524_333123225033",
+  "actualNPU": 0,
+  "actual_grant": 0,
+  "all_other_helpers_byteidentical_old79": true,
+  "currentCC45_unchanged": true,
+  "epoch": 1794073013,
+  "old79_Main25_failed46_all_unchanged": true,
+  "prepare": 0,
+  "samples": 0,
+  "state": "FINAL_PARK_NO_NEW_NATIVE_GO"
+}

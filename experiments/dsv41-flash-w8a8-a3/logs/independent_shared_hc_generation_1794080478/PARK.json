@@ -1,0 +1,19 @@
+{
+  "epoch": 1794080725.3640814,
+  "role": "review-agent",
+  "status": "FINAL/PARK_NOT_ACCEPTED_STRICT_TELEMETRY",
+  "shared_writes": 0,
+  "root_imports": "once, owned by Root",
+  "native_task": "task_20261108_030353_356363116294",
+  "native_exit": 1,
+  "CLI_exit": 0,
+  "audit_task": "task_20261108_034146_133529425143",
+  "audit_exit": 0,
+  "passed_checks": 4504,
+  "unmet_checks": 5,
+  "manifest_sha256": "73055a54a2b6d6841898b7f4417c4aa7c8aa31ceab444ac43ee99967bcec3702",
+  "report_sha256": "f67d313e2d1d35859600f882904622b973b1ba5d36bc5eeda7c4e43ed0bec745",
+  "summary_sha256": "9e59d861925f98cc198631d86148d3483be0f6aa69c259fe3e84deafdc2eec12",
+  "files": 44,
+  "remaining_tasks": []
+}

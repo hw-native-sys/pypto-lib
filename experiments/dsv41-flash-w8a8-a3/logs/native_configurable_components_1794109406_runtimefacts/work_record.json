@@ -1,0 +1,15 @@
+{
+  "owner": "/root/reviewer_f09",
+  "unit": "native_configurable_components_1794109406_runtimefacts",
+  "start_utc": "2026-11-08T04:26:02+00:00",
+  "end_utc": "2026-11-08T04:32:29.614342+00:00",
+  "elapsed_seconds": 387.614342,
+  "actual_allocated_jobs": 1,
+  "actual_dispatches": 0,
+  "NPU_compute_seconds": 0,
+  "NPU_lock_occupancy_seconds": "UNKNOWN_not_measured",
+  "CPU_jobs": 0,
+  "shared_writes": 0,
+  "unique_to_Root_import": true,
+  "runtimefacts_nonadditive": true
+}

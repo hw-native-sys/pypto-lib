@@ -1,0 +1,17 @@
+{
+  "schema": "Root-F09-count-old-operation/1",
+  "approved": true,
+  "stage": "count-old",
+  "requested_role": "old-physical",
+  "pins_sha256": "608fb407d2aef7944b5190ebaa2afdfeb125785a1fa2efeb3fd59c01cd9e722c",
+  "prequeue_sha256": "53e695ae03656bb821f9ce5a737d8a70f1ad29e3e01ee347aed451b2578f0029",
+  "lifecycle_acceptance": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/root_f09_count_probe_rank_acceptance_1794089142.json",
+  "lifecycle_acceptance_sha256": "e76b9984db86a27c3c1b4ebd32ab7de97af91357af4c6784746e5e9a3ade0ffa",
+  "source_manifest_sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_count_old_rank_shards_1794090082/work",
+  "root_go_id": "observer-20261108-f09-old-physical-count-control-native16",
+  "created_at_epoch": 1794090244.5620675,
+  "expires_at_epoch": 1794093744.5620675,
+  "native16_authorized": true,
+  "scope": "ONE count-old 3-call synthetic native control only; full valid INT32 matrices expected192/192/192 and later separateCPU must specifically rejectmiddle vs logical96. Positive stage only after actual16 allocation. No active/full/offline/live-source authority. Firstfailure stop/no blindretry."
+}

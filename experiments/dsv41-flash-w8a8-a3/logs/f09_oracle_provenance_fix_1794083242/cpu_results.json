@@ -1,0 +1,90 @@
+{
+  "pass": true,
+  "checks": [
+    {
+      "case": "native_functions_kernel_source_lifecycle_inheritance",
+      "pass": true
+    },
+    {
+      "case": "actual_count_validator_both_roles_correct_profile",
+      "pass": true,
+      "prepared_branch": "CPU_MOCK_ONLY"
+    },
+    {
+      "case": "active_work_under_old_request",
+      "rejected": true,
+      "error": "captured count role differs from REQUESTED role"
+    },
+    {
+      "case": "count_mutant_source_manifest_sha256",
+      "rejected": true,
+      "error": "count requested-role/source/phase/compiled profile binding changed"
+    },
+    {
+      "case": "count_mutant_origin_path",
+      "rejected": true,
+      "error": "count requested-role/source/phase/compiled profile binding changed"
+    },
+    {
+      "case": "count_mutant_metadata_sha256",
+      "rejected": true,
+      "error": "count requested-role/source/phase/compiled profile binding changed"
+    },
+    {
+      "case": "success",
+      "pass": true,
+      "primary_preserved": null
+    },
+    {
+      "case": "static_mutation",
+      "pass": true,
+      "primary_preserved": null
+    },
+    {
+      "case": "static_mutation_and_raise",
+      "pass": true,
+      "primary_preserved": true
+    },
+    {
+      "case": "initial_mutation_and_raise",
+      "pass": true,
+      "primary_preserved": true
+    },
+    {
+      "case": "earlier_candidate_cache_poison_within_call_pass_but_independent_rollout_rejects",
+      "pass": true,
+      "independent_cache_selection_carry": true,
+      "current_token_HC_reset": true,
+      "toy_not_model_numerics": true
+    },
+    {
+      "case": "active_opposite_C2_parity",
+      "rejected": true,
+      "error": "unwritten C2 state changed rank0 request0"
+    },
+    {
+      "case": "idle_whole_C2_block",
+      "rejected": true,
+      "error": "unwritten C2 state changed rank8 request1"
+    },
+    {
+      "case": "new_route_default",
+      "rejected": true,
+      "error": "DEFAULT_REFUSE: no actual scope was granted by this preparation"
+    },
+    {
+      "case": "root_lifecycle_wrapper_missing",
+      "rejected": true,
+      "error": "PENDING: Root-accepted actual public-prepare lifecycle microproof required"
+    }
+  ],
+  "model_fixture_run": false,
+  "original_model_reference_run": false,
+  "compile": false,
+  "prepare": false,
+  "native": false,
+  "real_header_bytes": 0,
+  "Root_grants_created": 0,
+  "prepared_profile_tests": "actual validator profile checks; public image verification mocked CPU-only",
+  "full_model_branch": "SOURCE_ONLY_PENDING_INDEPENDENT_REVIEW_AND_REAL_CASE"
+}

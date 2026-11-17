@@ -1,0 +1,52 @@
+{
+  "schema": "first-real-generation-authorization/1",
+  "approved": true,
+  "kind": "ACTUAL_DEVICE_FIRST_REAL_GENERATION",
+  "operation": "bounded-full-real40-noEngram-greedy-N3",
+  "expires_at_epoch": 1794067930,
+  "device_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "expert_layers": 40,
+  "execution_mode": "ONBOARD",
+  "ring_heap": [
+    0,
+    0,
+    4294967296,
+    0
+  ],
+  "max_new_tokens": 16,
+  "prompt_text": "Once upon a",
+  "prompt_ids": [
+    16600,
+    4465,
+    260
+  ],
+  "source_manifest": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/longer_generation_admission_apply_1794062947/source45.json",
+  "source_manifest_sha256": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "metadata_plan": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/full_real_generation_prepare_1794048884/metadata_plan.json",
+  "metadata_plan_sha256": "3dd67b88683d0de1f5fbd8e889c0c1a875eeecf671263fca4c64061637ecd9c0",
+  "weight_map_sha256": "51c154211e0fc558ef88c8d099e9fdde515f6fc936ae628297a216664298a82c",
+  "progress_jsonl": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_longer_real_generation_1794064297/actual/progress.jsonl",
+  "outer_runner_sha256": "d1010fc0053422db137e59c8c3ed8cb4ca8c13df323b4ce0561df4598f241fd9",
+  "outer_checker_sha256": "6947863b5268351c03a55cafc94c00688f660c68572adae3af34fcb0079de31a",
+  "outer_binding_sha256": "93922612fc602dfe79cd3dab64b2a24b78cbd57237756bdcd56f404b222cef65",
+  "outer_root_assignment_sha256": "5c02d03787bce188662620165fffc0467c132a39dd1cf946b8d8101d69056916",
+  "prequeue_receipt_sha256": "e5878d2a22ae4fb88878ac94013267439bd61a549786eecd9748c2593dd3a402",
+  "allocated_check_sha256": "415b1d8b1a9257e1be22afe214df8950ae76b6ef60c408b1cf6406f2dd908175"
+}

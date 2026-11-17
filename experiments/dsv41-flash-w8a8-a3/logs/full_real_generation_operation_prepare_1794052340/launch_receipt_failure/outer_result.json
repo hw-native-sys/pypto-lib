@@ -1,0 +1,44 @@
+{
+  "started_epoch": 1794054173.9806736,
+  "command": [
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+    "-c",
+    "import time; time.sleep(.15); raise SystemExit(7)"
+  ],
+  "CLI_returncode": 7,
+  "launch_error": null,
+  "postcheck_error": null,
+  "observation_errors": [
+    "launch-receipt: OSError('injected launch receipt failure')"
+  ],
+  "wait_errors": [],
+  "CLI_terminal": true,
+  "postcheck_skipped_reason": null,
+  "CLI_pid": 3565532,
+  "CLI_identity": {
+    "pid": 3565532,
+    "start_ticks": "105409592",
+    "state": "R",
+    "parent_pid": 3565477
+  },
+  "postcheck": {
+    "stage": "CPU_FAKE_POST_EXEC"
+  },
+  "ended_epoch": 1794054174.1977603,
+  "monitor_errors": [],
+  "monitor_thread_alive": false,
+  "known_process_identities": [
+    [
+      3565477,
+      "105409549"
+    ],
+    [
+      3565532,
+      "105409592"
+    ]
+  ],
+  "sample_count": 3,
+  "peak_sampled_own_tree_pss": 20288512,
+  "peak_sampled_own_tree_uss": 20074496,
+  "status": "FAIL"
+}

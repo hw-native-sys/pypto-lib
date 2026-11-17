@@ -1,0 +1,6 @@
+{
+  "returncode": 2,
+  "stdout": "",
+  "stderr": "usage: task_entry.py [-h] --root-operation-go ROOT_OPERATION_GO --binding\n                     BINDING --prequeue PREQUEUE --output OUTPUT\ntask_entry.py: error: the following arguments are required: --root-operation-go, --prequeue\n",
+  "output_exists": false
+}

@@ -1,0 +1,14 @@
+{
+  "epoch": 1794055188.21303,
+  "status": "PASS_IMMUTABLE_OUTER_PIN_CHECK",
+  "root_go_id": "observer-20261107-first-full-real4-d77d",
+  "outer_manifest_sha256": "f9197cab999b4b5b1a8897d09bc46db62f84615c39b5a0d53506476ea207a8be",
+  "source45_sha256": "d77d196be6541b4a87aef07cf0e5e02eac68cefa9fc245f3742e4c14606555aa",
+  "runner_sha256": "ce8682e1f9616c96c1f5a8878481ce46560b9d0a0d1be67c577d5d074d0fe2aa",
+  "checker_sha256": "83e155c8f413c97b8416e0486824b923e65d05adb48230c028c4bf03162d4d3e",
+  "task_entry_sha256": "47349facd97a2de9f33c2f9a8d88d1c33a14d59ceba489ec9b65659bf535646f",
+  "binding_sha256": "7799f10808df5ce7e7fa27ca3d975dea05fffcaa4f48c5d8361d67d596a7b5b1",
+  "NPU_jobs_in_this_check": 0,
+  "tensor_payload_bytes": 0,
+  "actual_assignment_created": false
+}

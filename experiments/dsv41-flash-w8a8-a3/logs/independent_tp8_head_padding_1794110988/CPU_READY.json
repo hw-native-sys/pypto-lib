@@ -1,0 +1,40 @@
+{
+  "PASS": true,
+  "programs": [
+    {
+      "case": "core16",
+      "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_tp8_head_padding_1794110988/cpu_build/_jit_attention_core_test_20261108_121813_i3wf1rcy",
+      "seconds": 0.8974442481994629,
+      "zero_tensor_samples": true,
+      "actual_devices": null,
+      "execution_mode": "ExecutionMode.ONBOARD",
+      "platform_expected": "a2a3",
+      "HEADS": 8,
+      "HEAD_TILE": 16
+    },
+    {
+      "case": "packed640",
+      "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_tp8_head_padding_1794110988/cpu_build/_jit_packed_attention_test_20261108_121814_n5vl531u",
+      "seconds": 0.6106526851654053,
+      "zero_tensor_samples": true,
+      "actual_devices": null,
+      "execution_mode": "ExecutionMode.ONBOARD",
+      "platform_expected": "a2a3",
+      "HEADS": 8,
+      "HEAD_TILE": 16
+    },
+    {
+      "case": "window128",
+      "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_tp8_head_padding_1794110988/cpu_build/_jit_window_attention_test_20261108_121815_drp8rnli",
+      "seconds": 0.6021895408630371,
+      "zero_tensor_samples": true,
+      "actual_devices": null,
+      "execution_mode": "ExecutionMode.ONBOARD",
+      "platform_expected": "a2a3",
+      "HEADS": 8,
+      "HEAD_TILE": 16
+    }
+  ],
+  "source_pins_after": true,
+  "numerical_gates_run": 0
+}

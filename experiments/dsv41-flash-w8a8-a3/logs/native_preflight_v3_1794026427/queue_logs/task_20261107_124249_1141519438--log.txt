@@ -1,0 +1,105 @@
+PyPTO environment activated: /mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local
+PYPTO_ROOT=/mnt/data/pyptouser/yangyaodong/code/pypto
+PTOAS_ROOT=/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local
+PTO_ISA_ROOT=/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/build/pto-isa
+PASS CPU_MOCKED real parser guard8negative, logical viewstorage, provenance and dual-scope controls
+PASS assigned policy+derived pins and2no-import bridge corruption controls
+PASS physicalgrowingretention {'permuted_physical_pages': True, 'growing_rows_preserved_128_129_130': True, 'excludes_only_current_writes': True, 'C1_ratio': 1, 'C2_ratio': 2, 'state_cache_row_rule': 'excluded; own numerical comparator required', 'poison_controls': ['recent_WINDOW128', 'recent_C1_128', 'recent_WINDOW129_at130', 'recent_C1_129_at130', 'completed_C2_64_at130', 'C1ratio1_emits_even']}
+PASS REAL CLI parser/tinyprovider fullchain labels TOY_ONLY_PASS and refuses native resume
+PASS actualfrozenmodel imports/schema17-19/metaIO binding, fixture/prepare denied
+{
+  "status": "PASS_CPU_MOCKED_ONLY",
+  "phases": [
+    {
+      "phase": "prefix",
+      "mutable_names": [
+        "window_cache",
+        "compressed_cache_c2a",
+        "index_cache_c2a",
+        "state_cache_c2a",
+        "compressed_cache_c1a",
+        "index_cache_c1a",
+        "topk_indices_c2a",
+        "topk_values_c2a",
+        "pool_block_ids_c2a",
+        "pool_block_counts_c2a",
+        "topk_indices_c1a",
+        "topk_values_c1a",
+        "pool_block_ids_c1a",
+        "pool_block_counts_c1a",
+        "x_hc",
+        "pre_mix"
+      ],
+      "missing_mutable_initialization_alias_negative": true,
+      "source_clone_prelude_both_passes": true,
+      "initial_all_bytes_unchanged": true,
+      "CPU_MOCKED_reference_events": [
+        "unconditioned",
+        "staged"
+      ],
+      "reject_controls": [
+        "toy_cannot_native_resume",
+        "owner_capsule_changed",
+        "exact_output_schema_changed",
+        "initial_alias",
+        "producer_policy_changed",
+        "derived_corruption"
+      ]
+    },
+    {
+      "phase": "decode",
+      "mutable_names": [
+        "window_cache",
+        "compressed_cache_c2a",
+        "index_cache_c2a",
+        "state_cache_c2a",
+        "compressed_cache_c1a",
+        "index_cache_c1a",
+        "topk_indices",
+        "topk_values",
+        "pool_block_ids",
+        "pool_block_counts",
+        "x_hc",
+        "pre_mix"
+      ],
+      "missing_mutable_initialization_alias_negative": true,
+      "source_clone_prelude_both_passes": true,
+      "initial_all_bytes_unchanged": true,
+      "CPU_MOCKED_reference_events": [
+        "unconditioned",
+        "staged"
+      ],
+      "reject_controls": [
+        "toy_cannot_native_resume",
+        "owner_capsule_changed",
+        "exact_output_schema_changed",
+        "initial_alias",
+        "producer_policy_changed",
+        "derived_corruption"
+      ]
+    }
+  ],
+  "original_source45_unchanged": true,
+  "NPU": 0,
+  "actual_model_goldens": 0,
+  "large_fixture": 0,
+  "native_grant": false
+}
+{
+  "status": "PASS_CPU_TOY_ORIGINAL_ROW_COMPARATOR",
+  "correct_oracle_slots": [
+    [
+      129,
+      64
+    ]
+  ],
+  "original_full_cache_tolerant_but_published_row_rejects": true,
+  "golden_body": "CPU_MOCKED only; original compare_published_fwd_cache executes unchanged",
+  "numerical_rejections": {
+    "window_cache": "\n    published step rows:     ratio_allclose fail: error_count=640/640 (ratio=100.0000%, allowed<=1.0000%, threshold=6 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=1 at (0, 0) (tol=0.035625)\n    first 10 mismatches:\n    [0] actual=0, expected=1, diff=1, tol=0.03562\n    [1] actual=0, expected=1, diff=1, tol=0.03562\n    [2] actual=0, expected=1, diff=1, tol=0.03562\n    [3] actual=0, expected=1, diff=1, tol=0.03562\n    [4] actual=0, expected=1, diff=1, tol=0.03562\n    [5] actual=0, expected=1, diff=1, tol=0.03562\n    [6] actual=0, expected=1, diff=1, tol=0.03562\n    [7] actual=0, expected=1, diff=1, tol=0.03562\n    [8] actual=0, expected=1, diff=1, tol=0.03562\n    [9] actual=0, expected=1, diff=1, tol=0.03562",
+    "compressed_cache_c2a": "\n    published step rows:     ratio_allclose fail: error_count=48/48 (ratio=100.0000%, allowed<=1.0000%, threshold=0 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=1 at (0, 0) (tol=0.035625)\n    first 10 mismatches:\n    [0] actual=0, expected=1, diff=1, tol=0.03562\n    [1] actual=0, expected=1, diff=1, tol=0.03562\n    [2] actual=0, expected=1, diff=1, tol=0.03562\n    [3] actual=0, expected=1, diff=1, tol=0.03562\n    [4] actual=0, expected=1, diff=1, tol=0.03562\n    [5] actual=0, expected=1, diff=1, tol=0.03562\n    [6] actual=0, expected=1, diff=1, tol=0.03562\n    [7] actual=0, expected=1, diff=1, tol=0.03562\n    [8] actual=0, expected=1, diff=1, tol=0.03562\n    [9] actual=0, expected=1, diff=1, tol=0.03562"
+  },
+  "native_grant": false,
+  "NPU": 0
+}
+INDEPENDENT_V3_TARGETED_SMALL_PREFLIGHT_PASS

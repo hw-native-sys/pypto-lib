@@ -1,0 +1,29 @@
+{
+  "started_epoch": 1794052974.6173077,
+  "command": [
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+    "-c",
+    "raise SystemExit(7)"
+  ],
+  "CLI_returncode": 7,
+  "launch_error": null,
+  "postcheck_error": "ValueError('independent postcheck failure')",
+  "CLI_pid": 3507587,
+  "ended_epoch": 1794052974.6828377,
+  "monitor_errors": [],
+  "monitor_thread_alive": false,
+  "known_process_identities": [
+    [
+      3507571,
+      "105289640"
+    ],
+    [
+      3507587,
+      "105289656"
+    ]
+  ],
+  "sample_count": 4,
+  "peak_sampled_own_tree_pss": 14665728,
+  "peak_sampled_own_tree_uss": 10465280,
+  "status": "FAIL"
+}

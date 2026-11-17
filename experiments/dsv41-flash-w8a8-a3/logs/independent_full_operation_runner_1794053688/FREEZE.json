@@ -1,0 +1,21 @@
+{
+  "status": "FINAL/PARK",
+  "epoch": 1794055260,
+  "artifact_count": 31,
+  "artifacts_sha256": "8f7fdaecae75265c76c745ae7dfadf32440fc971f484cf1343870c4d459eab46",
+  "source45_sha256": "d77d196be6541b4a87aef07cf0e5e02eac68cefa9fc245f3742e4c14606555aa",
+  "producer48_sha256": "f9197cab999b4b5b1a8897d09bc46db62f84615c39b5a0d53506476ea207a8be",
+  "helper_pins": {
+    "outer_runner.py": "ce8682e1f9616c96c1f5a8878481ce46560b9d0a0d1be67c577d5d074d0fe2aa",
+    "check_identity.py": "83e155c8f413c97b8416e0486824b923e65d05adb48230c028c4bf03162d4d3e",
+    "task_entry.py": "47349facd97a2de9f33c2f9a8d88d1c33a14d59ceba489ec9b65659bf535646f",
+    "operation_binding.json": "7799f10808df5ce7e7fa27ca3d975dea05fffcaa4f48c5d8361d67d596a7b5b1"
+  },
+  "CPU_task": "task_20261107_203714_359829711388",
+  "all_own_jobs_terminal": true,
+  "actual_grants_created": 0,
+  "normal_product_CLI_runs": 0,
+  "own_native_jobs": 0,
+  "real_payload_reads": 0,
+  "operational_mutable_files": []
+}

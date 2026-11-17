@@ -1,0 +1,1 @@
+Root-assigned bounded independent applied shared-owner acceptance. WAIT Main FINAL/PARK+actual45 before producer imports/checks. One small no-device CPU delta check only; no sourcewrites/NPU/payload/signaturecompile/oldproof repeats.

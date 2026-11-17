@@ -1,0 +1,7 @@
+{
+  "start_epoch": 1793928204,
+  "repository_head": "b6d17d9fa7a1e3420fbb7ac3c108fee194ec06fc",
+  "scope": "read-only A5-first then V4 DSpark differential; no NPU runs or implementation",
+  "observer_layer_task": "task_20261106_092049_8323516296",
+  "source_file_count": 140
+}

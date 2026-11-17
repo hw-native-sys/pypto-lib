@@ -1,0 +1,10 @@
+{
+  "record_id": "main-fit-post-guard-1794037055-1794037451",
+  "agent": "/root/main_native",
+  "start_epoch": 1794037055,
+  "end_epoch": 1794037451,
+  "elapsed_wall_seconds": 396,
+  "basis": "actual source/ownership/reproduction through narrowrepair/CPUchecks/seal, wallincludesqueue",
+  "status": "PARKED",
+  "workers": 0
+}

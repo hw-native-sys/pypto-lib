@@ -1,0 +1,11 @@
+[
+  {
+    "id": "f08-router-1793949482-1793950226",
+    "start_epoch": 1793949482,
+    "end_epoch": 1793950226,
+    "duration_seconds": 744,
+    "phase": "implement-validate",
+    "summary": "Narrow single-expert tie selection/suppression; original-source CPU reference and legality/weight controls; three negative-before device cases, four default positives and three repeated repaired tie checks pass. Source frozen; only moe_gate.py and assigned artifacts edited.",
+    "evidence": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/cohort_f03_f08_f14_1793949344/worker_f08/REPORT.md"
+  }
+]

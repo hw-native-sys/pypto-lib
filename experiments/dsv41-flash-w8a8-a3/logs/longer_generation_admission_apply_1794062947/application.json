@@ -1,0 +1,10 @@
+{
+  "source45_sha256": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "source_manifest_bytes": 5534,
+  "base_source45_sha256": "d77d196be6541b4a87aef07cf0e5e02eac68cefa9fc245f3742e4c14606555aa",
+  "generate_sha256": "41651e5af3b94223b645d4bfb52010e52ea7350aa3f3637cbcca6e29e093e609",
+  "changed_paths": [
+    "models/deepseek_v4_1_flash_a3_w8a8/generate.py"
+  ],
+  "other44_unchanged": true
+}

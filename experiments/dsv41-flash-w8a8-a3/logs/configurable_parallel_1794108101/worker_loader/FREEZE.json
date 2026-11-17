@@ -1,0 +1,11 @@
+{
+  "status": "FINAL_PARK",
+  "source_hashes": {
+    "models/deepseek_v4_1_flash_a3_w8a8/weight_map.py": "b102abdbed4c104603ee937242bbb438e160f4fd5bedbcce0ac479502513e466",
+    "models/deepseek_v4_1_flash_a3_w8a8/weight_loader.py": "16d0259bc9e98ec2e0fc57e96e37026163ca45a50761bff767d62f659fc4fb69"
+  },
+  "manifest_sha256": "9e0c4b562871ddab8dc6ac85ee7f7475ab1e4541ae936411c5eb89d205f2efb9",
+  "report_sha256": "ba02657d7ae5cef7407832470d1e5ff5c9e31650c31ac6aa4bfb97d20eb8e629",
+  "source_mutations_after_freeze": false,
+  "all_jobs_terminal": true
+}

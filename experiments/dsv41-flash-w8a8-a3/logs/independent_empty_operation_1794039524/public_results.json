@@ -1,0 +1,27 @@
+{
+  "scope": "CPU public config/Torch dtype/installed contract with from_dir+prepare MOCKED; NO NPU",
+  "actual_public_make_run_config": true,
+  "one_normalized_config_for_all_three_prepares": true,
+  "dtype_map": "actual torch.int8/bfloat16/float32",
+  "stage_handles": [
+    0,
+    16,
+    0
+  ],
+  "actual_from_dir_calls": 0,
+  "actual_prepare_calls": 0,
+  "auth_rejections": {
+    "calibrate_scope_cannot_probe": "wrong separate operation scope",
+    "fake_cannot_authorize_actual": "operation/source/artifact/policy/16rank/config binding mismatch",
+    "binding_world32": "operation/source/artifact/policy/16rank/config binding mismatch",
+    "binding_source_changed": "operation/source/artifact/policy/16rank/config binding mismatch",
+    "expired": "assignment absent/stale/overlong"
+  },
+  "from_dir_backend_type": "BackendType.Ascend910",
+  "resource_snapshot_only_not_fit_guarantee": {
+    "host_available_bytes": 1722754654208,
+    "disk_free_bytes": 9526936862720,
+    "shm_free_bytes": 1079343157248,
+    "artifact_bytes": 9992067
+  }
+}

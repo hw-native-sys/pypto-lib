@@ -1,0 +1,5 @@
+AFTER explicit Root GO and current shared-owner native2 + post-audit seal only:
+
+task-submit --device auto --device-num 1 --max-time 600 --run 'bash experiments/dsv41-flash-w8a8-a3/logs/hc_bf16_boundary_validation_1794072636/run_native_AFTER_ROOT_GO.sh'
+
+Not submitted. One allocated device via TASK_DEVICE; a2a3/ONBOARD only; two finite L2 dispatches (candidate and old control), T=5/H=4/D=5120; ring_heap=64MiB.

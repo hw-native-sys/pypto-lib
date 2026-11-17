@@ -1,0 +1,41 @@
+{
+  "status": "PASS_COMBINED_APPLIED_AND_OUTER_LONGER_N3_DELTA_CPU_ONLY",
+  "source45_sha256": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "actual_prompt_ids": [
+    16600,
+    4465,
+    260
+  ],
+  "actual_prompt_text": "Once upon a",
+  "max_new_tokens": 16,
+  "rejects": [
+    "old-operation",
+    "N2",
+    "bool-ID",
+    "empty-text",
+    "cap17",
+    "bool-cap",
+    "float-cap",
+    "text-whitespace-mismatch",
+    "actual-default-HARD",
+    "actual-tokenizer-IDs-mismatch",
+    "outer-changed-text",
+    "outer-changed-ID",
+    "outer-changed-cap",
+    "outer-changed-code",
+    "outer-changed-source"
+  ],
+  "other44_unchanged": true,
+  "old611_keeps_D77_provenance_no_new_compile": true,
+  "kernel_entry_compile_ABI_methods_inherited": true,
+  "outer_lifecycle_resource_POST_methods_AST_inherited": true,
+  "receipt_literal_test_in_memory_invalid_source_and_IDs": true,
+  "actual_valid_grants_created": 0,
+  "header_fullscan_calls": 0,
+  "compiler_calls": 0,
+  "NPU": 0,
+  "actual_checkpoint_tensor_reads": 0,
+  "own_pid": 3487935,
+  "own_starttick": 106395791,
+  "limits": "narrow changed predicates and source inheritance only; not actual15decode/longerquality or full constructor/device admission"
+}

@@ -1,0 +1,47 @@
+{
+  "schema": "observer-configurable-task-closeout/1",
+  "recorded_epoch": 1794127703.4912252,
+  "status": "COMPLETE_USER_BOUNDED_CONFIGURABLE_REAL_TEXT",
+  "source_hold": "RELEASED after independent audit58 and owner49 FINAL seals",
+  "source45": "f0e91a30e4117e110be183ef44acf2874eea813cc6f72ac7c7fa44bc4ede3a7f",
+  "Root_disposition": "logs/root_configurable_real_generation_1794111133_disposition.json",
+  "Root_disposition_sha256": "c66550dd667eae41a925dee4be4b18683c313f2965c59f19e15b76eafe07979b",
+  "audit58_sha256": "d876b17e7d029eaf0ee8fa8aac1a07a4368fd5e88d2e4acf79dd7f37bcf3136d",
+  "owner49_sha256": "c68352003faaaf0bf2ac524c977e69ca79fafda8cd916c37fb862aea8c1b3ed1",
+  "owner_FREEZE_sha256": "c485d4044e50ba8decdfab251f639201775e93e2a4f5310c989e659a29162118",
+  "owner_final_metadata_task": "task_20261108_164203_384137511381 COMPLETE0",
+  "owner_wall_interval": [
+    1794113727,
+    1794127569
+  ],
+  "owner_wall_seconds": 13842,
+  "owner_time_limit": "Includes waits and unexplained notification gap; not continuous computation/NPU time; priorREADY2649s excluded",
+  "Main_docs18_sha256": "8638b714fef43f9d6e137dc0cfc1f2002670138e407cbcdf8d1b23fe249cebc1",
+  "Main_docs_status": "FINAL; published ownerpending truth at that time, superseded by this final state",
+  "generated_text": "Once upon a time, there was...",
+  "termination": "eos",
+  "generated_token_ids": [
+    1014,
+    14,
+    1031,
+    515,
+    1613,
+    1
+  ],
+  "actual_decode_calls": 5,
+  "actual_topology": {
+    "tp": 8,
+    "ep": 16,
+    "dp": 2,
+    "world": 16
+  },
+  "independent_checks": {
+    "passed": 4363,
+    "unmet_strict_only": 5,
+    "bounded_unmet": 0
+  },
+  "whole_case_status": "NOT_ACCEPTED",
+  "whole_case_limit": "native1/CLI0/strict259noncriticalgaps/PSSnull; quality/originalparity/fullpeak/alltopologyfullmodel/generalserving/Engram/MTP remainopen",
+  "all_jobs": "ENDED; all agents PARK; raw16released,1050recordedbirthsabsent,savedqueue0used/allidle",
+  "next_action_authority": "No additional implementation/tests/NPU authorized by this closeout; future work needs new task scope. No ended-session monitoring scheduler."
+}

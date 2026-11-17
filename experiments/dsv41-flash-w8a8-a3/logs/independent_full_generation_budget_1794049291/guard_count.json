@@ -1,0 +1,37 @@
+{
+  "scope": "Observed draft callsites plus metadata schedule arithmetic, NOT timing/throughput; plan mapping pending independent acceptance",
+  "phases": {
+    "prefill": {
+      "source_reads": 164192,
+      "leaves": 110368,
+      "public_copy_calls": 110496,
+      "allocations": 912,
+      "rank_local_guard_events": 551200,
+      "public_device_memory_IPCs": 1102400,
+      "host_proc_reads": 551200,
+      "statvfs_calls": 1102400,
+      "jsonl_open_write_flush_close_events": 551200
+    },
+    "decode": {
+      "source_reads": 164192,
+      "leaves": 110368,
+      "public_copy_calls": 110496,
+      "allocations": 912,
+      "rank_local_guard_events": 551200,
+      "public_device_memory_IPCs": 1102400,
+      "host_proc_reads": 551200,
+      "statvfs_calls": 1102400,
+      "jsonl_open_write_flush_close_events": 551200
+    }
+  },
+  "two_phase_rank_local_guards": 1102400,
+  "two_phase_rank_local_device_memory_IPCs": 2204800,
+  "plus_allrank_prewarm_events": 2,
+  "plus_allrank_prewarm_IPCs": 64,
+  "four_generated_tokens_max_forward_guard_events": 8,
+  "forward_guard_IPCs": 256,
+  "two_phase_device_memory_IPCs_including_2prewarm_4forward": 2205120,
+  "raw_source_bytes_two_phases": 1491692730368,
+  "condition_not_prediction": "21600s/IPC_count is an arithmetic maximum average IPC budget if all other work cost zero",
+  "21600s_average_IPC_budget_ms_no_other_work": 9.79538528515455
+}

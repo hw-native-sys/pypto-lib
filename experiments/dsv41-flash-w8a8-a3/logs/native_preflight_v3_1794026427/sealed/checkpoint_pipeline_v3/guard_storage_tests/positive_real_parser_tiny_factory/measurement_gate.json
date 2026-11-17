@@ -1,0 +1,16 @@
+{
+  "execution_kind": "CPU_MOCKED_GRANT_ONLY",
+  "stage": "static-plan",
+  "required_bytes": {
+    "host": 222063884800,
+    "disk": 67108864,
+    "shm": 0
+  },
+  "fresh_available_bytes": {
+    "host": 4398046511104,
+    "disk": 4398046511104,
+    "shm": 4398046511104
+  },
+  "receipt_sha256": "8cd0595defa9a78c40b68d8f71f7a2e055cb0c79ec91f469aeafbf3f4966adf0",
+  "numerical_or_native_pass": false
+}

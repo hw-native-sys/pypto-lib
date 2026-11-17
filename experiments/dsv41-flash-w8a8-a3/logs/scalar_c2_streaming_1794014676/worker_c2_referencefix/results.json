@@ -1,0 +1,414 @@
+{
+  "permanent_analytic_even_odd_remapped_state_check": "PASS",
+  "permanent_old_reference_negative": "REJECTED",
+  "entire_source_scope_check": "PASS",
+  "actual_input_cases": 48,
+  "corrected_bad_lanes": 0,
+  "old_fp32_negative_bad_lanes": 49152,
+  "actual_native_maxabs": 1.71661376953125e-05,
+  "old_original_cpu_analytic_bad_lanes": 384,
+  "original_sha256": "1c26f996fa91bcd3ae497e1ae33e88a2e0bf38c2e734f8af85baee06492a87ee",
+  "archive_verified": true,
+  "archive_sha256": "48c797546805b04ffde118c506f8902e37e19bf2cb5d1713097056a4c93e998c",
+  "torch_npu_installed": false,
+  "unchanged_functions": [
+    "bf16_project",
+    "c2a_compressor",
+    "c1a_compressor",
+    "c1a_compressor_test",
+    "c2a_compressor_test",
+    "_golden_rms",
+    "golden_c1a_compressor",
+    "_position_ids",
+    "build_c1a_specs",
+    "build_c2a_specs"
+  ],
+  "inputs_sha256": "8ec920d1b7f8b0d7c70029a70a21945b52feb4f4d42dcb77746916d67cc01b66",
+  "source_sha256": "5575fea0bb02a73ebd58dbabd2a9f0a9fe71c53510b15f22c8d05687d8f48031",
+  "rows": [
+    {
+      "rank": 0,
+      "slot": 0,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 5.7220458984375e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 1,
+      "slot": 0,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 5.7220458984375e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 2,
+      "slot": 0,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 5.7220458984375e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 3,
+      "slot": 0,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 5.7220458984375e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 4,
+      "slot": 0,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 3.814697265625e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 5,
+      "slot": 0,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 3.814697265625e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 6,
+      "slot": 0,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 3.814697265625e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 7,
+      "slot": 0,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 3.814697265625e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 8,
+      "slot": 0,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 1.9073486328125e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 9,
+      "slot": 0,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 1.9073486328125e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 10,
+      "slot": 0,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 1.9073486328125e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 11,
+      "slot": 0,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 1.9073486328125e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 12,
+      "slot": 0,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 0.0,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 13,
+      "slot": 0,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 0.0,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 14,
+      "slot": 0,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 0.0,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 15,
+      "slot": 0,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 0.0,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 0,
+      "slot": 1,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 5.7220458984375e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 1,
+      "slot": 1,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 5.7220458984375e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 2,
+      "slot": 1,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 5.7220458984375e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 3,
+      "slot": 1,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 5.7220458984375e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 4,
+      "slot": 1,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 1.1444091796875e-05,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 5,
+      "slot": 1,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 1.1444091796875e-05,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 6,
+      "slot": 1,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 1.1444091796875e-05,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 7,
+      "slot": 1,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 1.1444091796875e-05,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 8,
+      "slot": 1,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 2.86102294921875e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 9,
+      "slot": 1,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 2.86102294921875e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 10,
+      "slot": 1,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 2.86102294921875e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 11,
+      "slot": 1,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 2.86102294921875e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 12,
+      "slot": 1,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 0.0,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 13,
+      "slot": 1,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 0.0,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 14,
+      "slot": 1,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 0.0,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 15,
+      "slot": 1,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 0.0,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 0,
+      "slot": 2,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 0.0,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 1,
+      "slot": 2,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 0.0,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 2,
+      "slot": 2,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 0.0,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 3,
+      "slot": 2,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 0.0,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 4,
+      "slot": 2,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 5.7220458984375e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 5,
+      "slot": 2,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 5.7220458984375e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 6,
+      "slot": 2,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 5.7220458984375e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 7,
+      "slot": 2,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 5.7220458984375e-06,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 8,
+      "slot": 2,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 1.71661376953125e-05,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 9,
+      "slot": 2,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 1.71661376953125e-05,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 10,
+      "slot": 2,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 1.71661376953125e-05,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 11,
+      "slot": 2,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 1.71661376953125e-05,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 12,
+      "slot": 2,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 1.33514404296875e-05,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 13,
+      "slot": 2,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 1.33514404296875e-05,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 14,
+      "slot": 2,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 1.33514404296875e-05,
+      "analytic_bitwise_equal": true
+    },
+    {
+      "rank": 15,
+      "slot": 2,
+      "corrected_bad": 0,
+      "old_fp32_bad": 1024,
+      "corrected_native_maxabs": 1.33514404296875e-05,
+      "analytic_bitwise_equal": true
+    }
+  ]
+}

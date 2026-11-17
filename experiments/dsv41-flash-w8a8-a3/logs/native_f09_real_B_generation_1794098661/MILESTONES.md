@@ -1,0 +1,28 @@
+# Native SourceB owner milestones
+
+- 1794100004: measured actual owner interval begins; verified RootGO7b82/entry670b/bindingcc213/PREQUEUE85f3; actual output absent.
+- 1794100026: submitted ONE task_20261108_090706_320779619842 auto16/max21600/client22200, no duplicate. Raw lock acquisition reports0..15 and PID3207904 (label, not release proof).
+- 1794100035.049776: durable normalCLI3208727/start109995698, outer3208526/start109995358. ALLOCATED_PRE_EXEC and task-local receipts created afterallocation.
+- 1794100049.1395829: first noncritical telemetry ProcessLookupError3 read-smaps-rollup /proc/3209481/smaps_rollup, birth109996765. Strict whole status cannotPASS, whole memory UNKNOWN. Root and auditor notified; same healthy model path continues per explicit GO, no observer/source change or cause attribution.
+- 1794100204.751988: prepared-prewarm all16,16ready. Publicfree59,877,154,816..60,185,571,328B, committed5,455,278,117B/rank. First public allocation guard immediately follows; oneowner/two registeredprograms, no dispatch yet.
+- 1794100250.4443793: canonical prefill rank0,2390 reads/12,304,696,768 sourceB/380publicqueries/7851boundaries. HOST1,710,935,420,928B;SHM1,078,731,194,368Bavailable. Root notified first real source progress; not a forward/peak result.
+- 1794100552.7157388: ~5min checkpoint canonicalprefillrank2,25,095reads/112,761,147,712sourceB/2060queries/84,258boundaries. HOST1,710,671,187,968B/DISK7,552,681,115,648B/SHM1,078,731,194,368Bavailable; no forward or criticalproducterror observed. Source/helper/observer unchanged. Terminal-only externalPOST collector prepared, not executed.
+- 1794100862.7123477: rank4 source215,428,020,416B/48,173reads (~28.9% planned source745,846,365,184B);3,748queries. Root notified; no forward.
+- 1794100949.2136738: rank5 source250,716,648,064B/55,562reads (~33.6% source);4,446queries. HOST1,710,679,318,528B/DISK7,519,900,532,736B/SHM1,078,731,194,368Bavailable; guardsPASS. Reporting cadence tightened perRoot to~5% or<=120sec using existing raw counters only, no newinstrumentation/jobs. StrictFAILUNKNOWN retained.
+- 1794101080.3558996: rank6 source298,655,524,928B/66,047reads (~40.0%);5,256publicqueries. GuardsPASS/no forward; Root notified.
+- 1794101202.1615071: rank7 source343,876,541,952B/76,074reads (~46.1%);6,044queries. Separate prior initializedH2D279,744,427,008B. GuardsPASS/no forward; Root notified.
+- 1794101292.0338821: rank8 initializedH2D320,314,152,384B, publicfree45,238,603,776B afterallocation;6,726queries. No forward/criticalproductfailure observed. Ongoing noncritical thread-children ENOENT raw retained; strictFAILUNKNOWN unchanged.
+- 1794101307.0462055: rank8 source382,701,460,416B/84,058reads (~51.3%), separateinitializedH2D320,314,152,384B. Root notified halfway source/H2D distinction.
+- 1794101440.8948221: rank9 source426,814,041,472B/93,895reads (~57.2%). GuardsPASS, strictFAILUNKNOWN unchanged.
+- 1794101523.7935538: rank9 source451,928,661,376B/100,063reads (~60.6%). No forward/criticalerror observed; Root notified.
+- 1794101593.997015: rank10 source480,937,861,952B/105,429reads (~64.5%); separatelatestinitializedH2D410,897,253,696B. Root notified/no forward.
+- 1794101707.0839186: rank11 source522,630,284,544B/114,857reads (~70.1%);9,170publicqueries. HOST1,710,601,891,840B/DISK7,485,678,157,824B/SHM1,078,731,194,368Bavailable; guardsPASS. StrictwholeFAILUNKNOWN/rawgaps remain; no newsource/helper/job.
+- 1794101883.7676308: rank12 source585,579,911,872B/128,844reads (~78.5%), initializedH2D501,471,507,648B separately. GuardsPASS/no forward; Root notified.
+- 1794101979.5970619: rank13 source618,989,598,848B/135,912reads (~83.0%). No forward/criticalproducterror; Root notified.
+- 1794102072.5011847: latestsource643,620,176,000B/141,997reads (~86.3%), movedrank14 initializedH2D558,063,051,840B. GuardsPASS/no forward; Root notified.
+- 1794102161.7310817: rank14 source674,592,052,800B/148,654reads (~90.4%). Existinglogwatch tightened; no instrumentation/job added.
+- 1794102257.025288: finalrank15 source708,891,179,008B/155,871reads (~95.0%). GuardsPASS/no forward; Root notified.
+- 1794102336.8212137: finalrank15 source736,071,804,928B/162,390reads (~98.7%). Separate2341.575initializedH2D631,690,238,976B; rawafterallocationfree22,838,206,464B. No newly namedresource attribution from retainedprogress.argument.
+- 1794102365.2747633: all16 decode-final-beforefree after actualdispatches; canonicalinitializedH2D633,997,065,216B. ActualCLI printed prefill1.96s/firsttoken1014 text=' time'/logit26.4177/repeat1stabletrue. Sequence/history needs independentpostcase audit.
+- 1794102394.9439154: all16 final-afterfree publicqueries retained, committed5,478,039,140B/rank/free59.776..60.086GB. CLI resultwritten/samplerstopfalsealive/device-run2357.25s. SAME090706 terminalcompletedexit1/raw16released/clientexit1; strictobserverwholeFAIL retained, no NPUretry.
+- ExternalPOSTtask task_20261108_094741_97834220909 submitted ONLYafterterminal, COMPLETE0. POSTreceiptf204e88d7a38df18f5def6f18ef65b10a1eec885719a98365ae7161772a904cb; zero tensorpayload. 1160recordedactualbirthsabsent; parentstatincluded/locklabelnotproof. CLI0/max16/15decode/end18; outerFAIL218noncriticalgaps/wholePSSnull; knownpartialpeak12,962,226,176B only. Root/auditor notified stablegate; TIMEOPEN pending audit/disposition.

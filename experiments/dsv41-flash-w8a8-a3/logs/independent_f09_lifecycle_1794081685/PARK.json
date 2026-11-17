@@ -1,0 +1,17 @@
+{
+  "status": "FINAL/PARK",
+  "reviewed_bundle88_manifest_sha256": "7fb949a6ed09aa8e5ad68b1aa16ffd932804f7a331b5fd0fcbb7cbe624ce5c4d",
+  "kernel45_UNAPPLIED": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "lifecycle_source_review": "PASS_KNOWN_INTERNAL_GENERATED_LAYOUT",
+  "actual_generated_CPU_clone_public_from_dir": "PASS_NO_PREPARE",
+  "future_native_microtest": "READY_NOT_RUN",
+  "dependencies_manifest_sha256": "f91ffadae62417e705e9f90fa43cc10a178b331914de6d036b6610390c0fdd8a",
+  "micro_sha256": "2d20411f3c7500238abde5288383de30ff442c0456ac5517f21faa36a136cbab",
+  "audit_sha256": "4baa6c35c877701295b4be30b63c406b7afb0aff6fcec44455a1272e35a2c5b3",
+  "positive_native_authorization": false,
+  "native_preparation_or_acceptance": false,
+  "running_jobs": [],
+  "shared_writes": 0,
+  "source_intact": true,
+  "recovery": "Root reviews exact helper/template/commands and separately issues auto2 native microtest GO. Do not write this sealed unit/origins or reuse CPU clone for native. Real16F09 count/state work still separate GO after accepted microproof. No full-PSS/continuous process-tree gate; required knownbirth/normalclose/raw2queue release remain."
+}

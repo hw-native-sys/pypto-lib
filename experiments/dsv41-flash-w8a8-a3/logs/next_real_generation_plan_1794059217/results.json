@@ -1,0 +1,180 @@
+{
+  "status": "PASS_SMALL_METADATA_AND_PLANNING_ONLY",
+  "cases": [
+    {
+      "prefill_tokens": 2,
+      "max_new_tokens": 16,
+      "pages": 2,
+      "same_static57_as_N3": true,
+      "expert_layers": 40,
+      "nonstatic_global_logical_bytes": {
+        "prefill": 305086208,
+        "decode": 247111680
+      },
+      "last_sample_row": 1,
+      "decode_positions": [
+        2,
+        16
+      ],
+      "runtime": "UNTESTED_METADATA_ONLY"
+    },
+    {
+      "prefill_tokens": 3,
+      "max_new_tokens": 16,
+      "pages": 2,
+      "same_static57_as_N3": true,
+      "expert_layers": 40,
+      "nonstatic_global_logical_bytes": {
+        "prefill": 363060736,
+        "decode": 247111680
+      },
+      "last_sample_row": 2,
+      "decode_positions": [
+        3,
+        17
+      ],
+      "runtime": "UNTESTED_METADATA_ONLY"
+    },
+    {
+      "prefill_tokens": 17,
+      "max_new_tokens": 16,
+      "pages": 2,
+      "same_static57_as_N3": true,
+      "expert_layers": 40,
+      "nonstatic_global_logical_bytes": {
+        "prefill": 1174704128,
+        "decode": 247111680
+      },
+      "last_sample_row": 16,
+      "decode_positions": [
+        17,
+        31
+      ],
+      "runtime": "UNTESTED_METADATA_ONLY"
+    },
+    {
+      "prefill_tokens": 128,
+      "max_new_tokens": 16,
+      "pages": 2,
+      "same_static57_as_N3": true,
+      "expert_layers": 40,
+      "nonstatic_global_logical_bytes": {
+        "prefill": 7609876736,
+        "decode": 247111680
+      },
+      "last_sample_row": 127,
+      "decode_positions": [
+        128,
+        142
+      ],
+      "runtime": "UNTESTED_METADATA_ONLY"
+    }
+  ],
+  "chosen_prompt": {
+    "text": "Once upon a",
+    "ids": [
+      16600,
+      4465,
+      260
+    ],
+    "template": "plain"
+  },
+  "max16_decode_budget": [
+    {
+      "decode_call": 1,
+      "remaining_calls_including_this": 15,
+      "before_forward_free_floor": 18088299200,
+      "after_forward_policy_floor": 9797894144
+    },
+    {
+      "decode_call": 2,
+      "remaining_calls_including_this": 14,
+      "before_forward_free_floor": 13937985984,
+      "after_forward_policy_floor": 9797894144
+    },
+    {
+      "decode_call": 3,
+      "remaining_calls_including_this": 13,
+      "before_forward_free_floor": 13690874304,
+      "after_forward_policy_floor": 9797894144
+    },
+    {
+      "decode_call": 4,
+      "remaining_calls_including_this": 12,
+      "before_forward_free_floor": 13443762624,
+      "after_forward_policy_floor": 9797894144
+    },
+    {
+      "decode_call": 5,
+      "remaining_calls_including_this": 11,
+      "before_forward_free_floor": 13196650944,
+      "after_forward_policy_floor": 9797894144
+    },
+    {
+      "decode_call": 6,
+      "remaining_calls_including_this": 10,
+      "before_forward_free_floor": 12949539264,
+      "after_forward_policy_floor": 9797894144
+    },
+    {
+      "decode_call": 7,
+      "remaining_calls_including_this": 9,
+      "before_forward_free_floor": 12702427584,
+      "after_forward_policy_floor": 9797894144
+    },
+    {
+      "decode_call": 8,
+      "remaining_calls_including_this": 8,
+      "before_forward_free_floor": 12455315904,
+      "after_forward_policy_floor": 9797894144
+    },
+    {
+      "decode_call": 9,
+      "remaining_calls_including_this": 7,
+      "before_forward_free_floor": 12208204224,
+      "after_forward_policy_floor": 9797894144
+    },
+    {
+      "decode_call": 10,
+      "remaining_calls_including_this": 6,
+      "before_forward_free_floor": 11961092544,
+      "after_forward_policy_floor": 9797894144
+    },
+    {
+      "decode_call": 11,
+      "remaining_calls_including_this": 5,
+      "before_forward_free_floor": 11713980864,
+      "after_forward_policy_floor": 9797894144
+    },
+    {
+      "decode_call": 12,
+      "remaining_calls_including_this": 4,
+      "before_forward_free_floor": 11466869184,
+      "after_forward_policy_floor": 9797894144
+    },
+    {
+      "decode_call": 13,
+      "remaining_calls_including_this": 3,
+      "before_forward_free_floor": 11219757504,
+      "after_forward_policy_floor": 9797894144
+    },
+    {
+      "decode_call": 14,
+      "remaining_calls_including_this": 2,
+      "before_forward_free_floor": 10972645824,
+      "after_forward_policy_floor": 9797894144
+    },
+    {
+      "decode_call": 15,
+      "remaining_calls_including_this": 1,
+      "before_forward_free_floor": 10725534144,
+      "after_forward_policy_floor": 9797894144
+    }
+  ],
+  "static57_unchanged_across_representative_N": true,
+  "source45_before_after_unchanged": true,
+  "signature_compile": false,
+  "native": false,
+  "checkpoint_tensor_payload_bytes": 0,
+  "actual_grant": false
+}

@@ -1,0 +1,60 @@
+{
+  "schema": "observer-configurable-parallel-work/1",
+  "recorded_start_epoch": 1794108004.1890733,
+  "earlier_turn_setup_start": "not recorded; excluded from measured interval",
+  "role": "observer",
+  "objective": "Configurable A3 EP/TP following A5 interface, validated real checkpoint text on nondefault topology",
+  "baseline_source45": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+  "status": "COMPLETE_USER_BOUNDED_CONFIGURABLE_REAL_TEXT",
+  "implementation_owner": "/root/main_native",
+  "source_review": "/root/reviewer_engram",
+  "resource_review": "/root/reviewer_fit",
+  "last_checkpoint_epoch": 1794127703.4912252,
+  "checkpoints": [
+    {
+      "record_id": "observer-configurable-first-checkpoint-1794108870",
+      "start_epoch": 1794108004.1890733,
+      "end_epoch": 1794108870.7283704,
+      "note": "Main ownership published; two workers FINAL CPU topology13/loader asymmetric controls and smallEP signature evidence self-only. Independent source resource review confirms TP8EP16DP2 candidate static38328513216/rank and EP8 realE40 unfit. Main integrating fresh exactALL45 topology admission/metadata; F09 native plan source-only. No new NPU/realtext acceptance; observer no implementation/tests."
+    },
+    {
+      "record_id": "observer-configurable-integration-1794110667",
+      "start_epoch": 1794108870.7283704,
+      "end_epoch": 1794110667.3917098,
+      "note": "Early independent source checkpoint50 sealed5ed41eb8 no blocking in inspected bytes; Main actual13ABI/DP self-controls ran, ownershipnegative fixture rankmod5 collision failed honestly and targetedfix pending. Metadata newsourcev1 datajob active; F09 separate120225 CPU oracle/compile prep for EP2TP1/EP4TP2. No new NPU/fulltext acceptance. Root no implementation/tests."
+    },
+    {
+      "record_id": "observer-configurable-native-readiness-1794112389",
+      "start_epoch": 1794110667.3917098,
+      "end_epoch": 1794112389.7307122,
+      "note": "Mainf0e9/newplana7b1/E40pairc119+operation14sealed9205 FINAL. DelegatedHEADS8native122101 all3originalgatesPASS/sealed58acceptedbounded. ComponentEP122653 FAILED ownqueueinjecteddevice argparse beforequery/prepare; rawlocksreleased/TPnotsubmitted, launcher-onlyfixauthorized. FitcurrentindependentPREQUEUE next; executableauditor29ready. No fullreal16GO/text yet; alloldfailurespreserved; observernoimplementation/tests."
+    },
+    {
+      "record_id": "observer-configurable-capture-audit-1794113459",
+      "start_epoch": 1794112389.7307122,
+      "end_epoch": 1794113459.5916247,
+      "note": "FreshEP123737 actual3math/exactcountsPASS thenTP124231 native2PASS/cleanup; offline124633 found OWNsharedcomparatordict overwrotefirst2EPcapsules, durablerequirementUNMET/LOST. Artifact-onlydictcopy+closureCPUregression+TPsavedpacket audit/newEPcase authorized, kernels unchanged. Fit124106 independent177PASS/PREQUEUE1acd headeronly0payload; READYsealpending. No fullreal16GO or text."
+    },
+    {
+      "record_id": "observer-configurable-actual16-start-1794114778",
+      "start_epoch": 1794113459.5916247,
+      "end_epoch": 1794114778.4109855,
+      "note": "Allcomponentfreshdurability58e4accepted, conditionalrealGOactivatedbyFit afterfinalmetadata1306470+outsidequeueall16idle. ONEactual130915_150556113554 allocated0..15/RootTP8EP16DP2/sourcef0/a7/c119, runtimeprefill26.62s/decode24.65s complete. FirstnoncritprocESRCHgap preserved\u2192strictwholeFAIL/PSSUNKNOWN; healthyCLIcontinues/SAMEtask/no retries. No forward/textyet; ownerOPEN1794113727, allsourcesfrozen; auditor source-onlyactualbindings prep. Observernoimplementation/tests."
+    },
+    {
+      "record_id": "observer-configurable-real-terminal-notification-1794126658",
+      "start_epoch": 1794114778.4109855,
+      "end_epoch": 1794126658.8813074,
+      "note": "Elapsed observer wall interval including waits/notification gap; continuous sampler/proactivecoverage NOT asserted. SAMEactual130915 TERMINALnative1/CLItext normalEOS suffix time,therewas.../prefill2.16s/canonical613256211456/all16finalfree reported; rawterminaltime1794116619 differs substantially from currentclock, no backfilled monitoring/events/cause. OwnerdoingmandatoryPOST; conditionalactualauditCPUdelegated afterSAMEterminal+POST evidence. No final wholePASS/audit/quality claim yet; observernoimplementation/tests."
+    },
+    {
+      "record_id": "observer-configurable-final-closeout-1794127703",
+      "start_epoch": 1794126658.8813074,
+      "end_epoch": 1794127703.4912252,
+      "note": "Actualaudit58FINAL4363PASS5strictUNMET/boundedEMPTY andRootc665 accepteduserconfigurable-realtextbounded; owner49FINALc683/metadata1642030/actualWALL13842closedtruthfully; Maindocs18FINAL8638/TIMEselfimported. Sourcesf0/a7/c119/rawstable, alljobsended/allPARK/sourceholdRELEASED. WholeNOT_ACCEPTED259/native1CLI0/PSSnull/qualityoriginalparitygeneralservingopen, oldfailures preserved. Observernoimplementation/tests; elapsedwaits included/no continuousmonitoring claim."
+    }
+  ],
+  "closed_epoch": 1794127703.4912252,
+  "source_hold": "RELEASED",
+  "closeout": "logs/observer_configurable_parallel_1794108004_closeout.json"
+}

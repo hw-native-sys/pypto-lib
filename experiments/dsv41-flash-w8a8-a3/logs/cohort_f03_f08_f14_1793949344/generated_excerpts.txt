@@ -1,0 +1,359 @@
+downstream/build_output/_jit_decode_c1a_full_attention_test_20261106_154027_xt1g2a1t/orchestration/decode_c1a_full_attention_test.cpp:159
+156:         uint32_t latent_inline1427_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 512};
+157:         TensorCreateInfo latent_inline1427_ci(latent_inline1427_ci_shapes, 2, DataType::BFLOAT16);
+158:         uint32_t attention_latent_inline1083_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 512};
+159:         TensorCreateInfo attention_latent_inline1083_ci(attention_latent_inline1083_ci_shapes, 2, DataType::BFLOAT16);
+160:         uint32_t target_inline1493_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 512};
+161:         TensorCreateInfo target_inline1493_ci(target_inline1493_ci_shapes, 2, DataType::BFLOAT16);
+162:         uint32_t projected_inline1510_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 128};
+163:         TensorCreateInfo projected_inline1510_ci(projected_inline1510_ci_shapes, 2, DataType::BFLOAT16);
+
+downstream/build_output/_jit_decode_c1a_full_attention_test_20261106_154027_xt1g2a1t/orchestration/decode_c1a_full_attention_test.cpp:593
+590: 
+591:                 // Spmd rms_norm_spmd_1: rms_norm_0
+592:                 CoreTaskArgs params_t16;
+593:                 params_t16.add_input(latent_inline1427__ssa_v2);
+594:                 params_t16.add_output(latent_inline1081);
+595:                 params_t16.add_input(ext_compressor_norm);
+596:                 params_t16.add_scalar(T_DYN);
+597:                 params_t16.launch_spec.set_block_num(blocks_inline1444);
+
+downstream/build_output/_jit_decode_c1a_full_attention_test_20261106_154027_xt1g2a1t/orchestration/decode_c1a_full_attention_test.cpp:614
+611:                 CoreTaskArgs params_t17;
+612:                 params_t17.add_input(ext_compressed_cos);
+613:                 params_t17.add_input(ext_compressed_sin);
+614:                 params_t17.add_input(latent_inline1081__rv_v2);
+615:                 params_t17.add_output(attention_latent_inline1083);
+616:                 params_t17.add_scalar(T_DYN);
+617:                 params_t17.launch_spec.set_block_num(blocks_inline1462);
+618:                 rt_submit_aiv_task(11, params_t17);
+
+downstream/build_output/_jit_decode_c1a_full_attention_test_20261106_154027_xt1g2a1t/orchestration/decode_c1a_full_attention_test.cpp:615
+612:                 params_t17.add_input(ext_compressed_cos);
+613:                 params_t17.add_input(ext_compressed_sin);
+614:                 params_t17.add_input(latent_inline1081__rv_v2);
+615:                 params_t17.add_output(attention_latent_inline1083);
+616:                 params_t17.add_scalar(T_DYN);
+617:                 params_t17.launch_spec.set_block_num(blocks_inline1462);
+618:                 rt_submit_aiv_task(11, params_t17);
+619:                 attention_latent_inline1083__ssa_v4 = attention_latent_inline1083;
+
+downstream/build_output/_jit_decode_c1a_full_attention_test_20261106_154027_xt1g2a1t/orchestration/decode_c1a_full_attention_test.cpp:633
+630: 
+631:                 // Spmd snapshot_rows_spmd_1: snapshot_rows_0
+632:                 CoreTaskArgs params_t18;
+633:                 params_t18.add_input(attention_latent_inline1083__ssa_v4);
+634:                 params_t18.add_output(target_inline1493);
+635:                 params_t18.add_scalar(T_DYN);
+636:                 params_t18.launch_spec.set_block_num(spmd_core_num_4);
+637:                 TaskOutputTensors task_18_outs = rt_submit_aiv_task(13, params_t18);
+
+downstream/build_output/_jit_decode_c1a_full_attention_test_20261106_154027_xt1g2a1t/orchestration/decode_c1a_full_attention_test.cpp:686
+683: 
+684:                 // Group compressor_project_0: MixedKernels (AIC + AIV lanes)
+685:                 CoreTaskArgs params_t20;
+686:                 params_t20.add_input(latent_inline1081__rv_v2);
+687:                 params_t20.add_input(ext_index_wk);
+688:                 params_t20.add_output(projected_inline1510);
+689:                 params_t20.add_output(gm_pipe_buffer_6);
+690:                 params_t20.add_scalar(T_DYN);
+
+downstream/build_output/_jit_prefill_attention_test_20261106_154049_v_461jlv/orchestration/prefill_attention_test.cpp:159
+156:         uint32_t latent_inline1427_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 512};
+157:         TensorCreateInfo latent_inline1427_ci(latent_inline1427_ci_shapes, 2, DataType::BFLOAT16);
+158:         uint32_t attention_latent_inline1083_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 512};
+159:         TensorCreateInfo attention_latent_inline1083_ci(attention_latent_inline1083_ci_shapes, 2, DataType::BFLOAT16);
+160:         uint32_t target_inline1493_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 512};
+161:         TensorCreateInfo target_inline1493_ci(target_inline1493_ci_shapes, 2, DataType::BFLOAT16);
+162:         uint32_t projected_inline1510_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 128};
+163:         TensorCreateInfo projected_inline1510_ci(projected_inline1510_ci_shapes, 2, DataType::BFLOAT16);
+
+downstream/build_output/_jit_prefill_attention_test_20261106_154049_v_461jlv/orchestration/prefill_attention_test.cpp:593
+590: 
+591:                 // Spmd rms_norm_spmd_1: rms_norm_0
+592:                 CoreTaskArgs params_t16;
+593:                 params_t16.add_input(latent_inline1427__ssa_v2);
+594:                 params_t16.add_output(latent_inline1081);
+595:                 params_t16.add_input(ext_compressor_norm);
+596:                 params_t16.add_scalar(T_DYN);
+597:                 params_t16.launch_spec.set_block_num(blocks_inline1444);
+
+downstream/build_output/_jit_prefill_attention_test_20261106_154049_v_461jlv/orchestration/prefill_attention_test.cpp:614
+611:                 CoreTaskArgs params_t17;
+612:                 params_t17.add_input(ext_compressed_cos);
+613:                 params_t17.add_input(ext_compressed_sin);
+614:                 params_t17.add_input(latent_inline1081__rv_v2);
+615:                 params_t17.add_output(attention_latent_inline1083);
+616:                 params_t17.add_scalar(T_DYN);
+617:                 params_t17.launch_spec.set_block_num(blocks_inline1462);
+618:                 rt_submit_aiv_task(11, params_t17);
+
+downstream/build_output/_jit_prefill_attention_test_20261106_154049_v_461jlv/orchestration/prefill_attention_test.cpp:615
+612:                 params_t17.add_input(ext_compressed_cos);
+613:                 params_t17.add_input(ext_compressed_sin);
+614:                 params_t17.add_input(latent_inline1081__rv_v2);
+615:                 params_t17.add_output(attention_latent_inline1083);
+616:                 params_t17.add_scalar(T_DYN);
+617:                 params_t17.launch_spec.set_block_num(blocks_inline1462);
+618:                 rt_submit_aiv_task(11, params_t17);
+619:                 attention_latent_inline1083__ssa_v4 = attention_latent_inline1083;
+
+downstream/build_output/_jit_prefill_attention_test_20261106_154049_v_461jlv/orchestration/prefill_attention_test.cpp:633
+630: 
+631:                 // Spmd snapshot_rows_spmd_1: snapshot_rows_0
+632:                 CoreTaskArgs params_t18;
+633:                 params_t18.add_input(attention_latent_inline1083__ssa_v4);
+634:                 params_t18.add_output(target_inline1493);
+635:                 params_t18.add_scalar(T_DYN);
+636:                 params_t18.launch_spec.set_block_num(spmd_core_num_4);
+637:                 TaskOutputTensors task_18_outs = rt_submit_aiv_task(13, params_t18);
+
+downstream/build_output/_jit_prefill_attention_test_20261106_154049_v_461jlv/orchestration/prefill_attention_test.cpp:686
+683: 
+684:                 // Group compressor_project_0: MixedKernels (AIC + AIV lanes)
+685:                 CoreTaskArgs params_t20;
+686:                 params_t20.add_input(latent_inline1081__rv_v2);
+687:                 params_t20.add_input(ext_index_wk);
+688:                 params_t20.add_output(projected_inline1510);
+689:                 params_t20.add_output(gm_pipe_buffer_6);
+690:                 params_t20.add_scalar(T_DYN);
+
+downstream/build_output/_jit_decode_c2a_full_attention_test_20261106_153900_dhjyzdl7/orchestration/decode_c2a_full_attention_test.cpp:169
+166:         uint32_t latent_inline1489_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 512};
+167:         TensorCreateInfo latent_inline1489_ci(latent_inline1489_ci_shapes, 2, DataType::BFLOAT16);
+168:         uint32_t attention_latent_inline1143_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 512};
+169:         TensorCreateInfo attention_latent_inline1143_ci(attention_latent_inline1143_ci_shapes, 2, DataType::BFLOAT16);
+170:         uint32_t target_inline1598_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 512};
+171:         TensorCreateInfo target_inline1598_ci(target_inline1598_ci_shapes, 2, DataType::BFLOAT16);
+172:         uint32_t projected_inline1615_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 128};
+173:         TensorCreateInfo projected_inline1615_ci(projected_inline1615_ci_shapes, 2, DataType::BFLOAT16);
+
+downstream/build_output/_jit_decode_c2a_full_attention_test_20261106_153900_dhjyzdl7/orchestration/decode_c2a_full_attention_test.cpp:665
+662: 
+663:                 // Spmd rms_norm_spmd_1: rms_norm_0
+664:                 CoreTaskArgs params_t19;
+665:                 params_t19.add_input(latent_inline1489);
+666:                 params_t19.add_output(latent_inline1141);
+667:                 params_t19.add_input(ext_compressor_norm);
+668:                 params_t19.add_scalar(T_DYN);
+669:                 params_t19.launch_spec.set_block_num(blocks_inline1549);
+
+downstream/build_output/_jit_decode_c2a_full_attention_test_20261106_153900_dhjyzdl7/orchestration/decode_c2a_full_attention_test.cpp:686
+683:                 CoreTaskArgs params_t20;
+684:                 params_t20.add_input(ext_compressed_cos);
+685:                 params_t20.add_input(ext_compressed_sin);
+686:                 params_t20.add_input(latent_inline1141__rv_v2);
+687:                 params_t20.add_output(attention_latent_inline1143);
+688:                 params_t20.add_scalar(T_DYN);
+689:                 params_t20.launch_spec.set_block_num(blocks_inline1567);
+690:                 rt_submit_aiv_task(11, params_t20);
+
+downstream/build_output/_jit_decode_c2a_full_attention_test_20261106_153900_dhjyzdl7/orchestration/decode_c2a_full_attention_test.cpp:687
+684:                 params_t20.add_input(ext_compressed_cos);
+685:                 params_t20.add_input(ext_compressed_sin);
+686:                 params_t20.add_input(latent_inline1141__rv_v2);
+687:                 params_t20.add_output(attention_latent_inline1143);
+688:                 params_t20.add_scalar(T_DYN);
+689:                 params_t20.launch_spec.set_block_num(blocks_inline1567);
+690:                 rt_submit_aiv_task(11, params_t20);
+691:                 attention_latent_inline1143__ssa_v4 = attention_latent_inline1143;
+
+downstream/build_output/_jit_decode_c2a_full_attention_test_20261106_153900_dhjyzdl7/orchestration/decode_c2a_full_attention_test.cpp:705
+702: 
+703:                 // Spmd snapshot_rows_spmd_1: snapshot_rows_0
+704:                 CoreTaskArgs params_t21;
+705:                 params_t21.add_input(attention_latent_inline1143__ssa_v4);
+706:                 params_t21.add_output(target_inline1598);
+707:                 params_t21.add_scalar(T_DYN);
+708:                 params_t21.launch_spec.set_block_num(spmd_core_num_5);
+709:                 TaskOutputTensors task_21_outs = rt_submit_aiv_task(13, params_t21);
+
+downstream/build_output/_jit_decode_c2a_full_attention_test_20261106_153900_dhjyzdl7/orchestration/decode_c2a_full_attention_test.cpp:758
+755: 
+756:                 // Group compressor_project_1: MixedKernels (AIC + AIV lanes)
+757:                 CoreTaskArgs params_t23;
+758:                 params_t23.add_input(latent_inline1141__rv_v2);
+759:                 params_t23.add_input(ext_index_wk);
+760:                 params_t23.add_output(projected_inline1615);
+761:                 params_t23.add_output(gm_pipe_buffer_7);
+762:                 params_t23.add_scalar(T_DYN);
+
+downstream/build_output/_jit_prefill_c2a_full_test_20261106_153924_7ij6fwny/orchestration/prefill_c2a_full_test.cpp:163
+160:         const Tensor& score_proj_inline1424 = alloc_0.get_ref(14);
+161:         const Tensor& latent_inline1425 = alloc_0.get_ref(15);
+162:         uint32_t attention_latent_inline1137_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 512};
+163:         TensorCreateInfo attention_latent_inline1137_ci(attention_latent_inline1137_ci_shapes, 2, DataType::BFLOAT16);
+164:         uint32_t target_inline1534_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 512};
+165:         TensorCreateInfo target_inline1534_ci(target_inline1534_ci_shapes, 2, DataType::BFLOAT16);
+166:         uint32_t projected_inline1551_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 128};
+167:         TensorCreateInfo projected_inline1551_ci(projected_inline1551_ci_shapes, 2, DataType::BFLOAT16);
+
+downstream/build_output/_jit_prefill_c2a_full_test_20261106_153924_7ij6fwny/orchestration/prefill_c2a_full_test.cpp:584
+581: 
+582:                 // Spmd rms_norm_spmd_1: rms_norm_0
+583:                 CoreTaskArgs params_t16;
+584:                 params_t16.add_input(latent_inline1425);
+585:                 params_t16.add_output(latent_inline1135);
+586:                 params_t16.add_input(ext_compressor_norm);
+587:                 params_t16.add_scalar(T_DYN);
+588:                 params_t16.launch_spec.set_block_num(blocks_inline1485);
+
+downstream/build_output/_jit_prefill_c2a_full_test_20261106_153924_7ij6fwny/orchestration/prefill_c2a_full_test.cpp:605
+602:                 CoreTaskArgs params_t17;
+603:                 params_t17.add_input(ext_compressed_cos);
+604:                 params_t17.add_input(ext_compressed_sin);
+605:                 params_t17.add_input(latent_inline1135__rv_v2);
+606:                 params_t17.add_output(attention_latent_inline1137);
+607:                 params_t17.add_scalar(T_DYN);
+608:                 params_t17.launch_spec.set_block_num(blocks_inline1503);
+609:                 rt_submit_aiv_task(11, params_t17);
+
+downstream/build_output/_jit_prefill_c2a_full_test_20261106_153924_7ij6fwny/orchestration/prefill_c2a_full_test.cpp:606
+603:                 params_t17.add_input(ext_compressed_cos);
+604:                 params_t17.add_input(ext_compressed_sin);
+605:                 params_t17.add_input(latent_inline1135__rv_v2);
+606:                 params_t17.add_output(attention_latent_inline1137);
+607:                 params_t17.add_scalar(T_DYN);
+608:                 params_t17.launch_spec.set_block_num(blocks_inline1503);
+609:                 rt_submit_aiv_task(11, params_t17);
+610:                 attention_latent_inline1137__ssa_v4 = attention_latent_inline1137;
+
+downstream/build_output/_jit_prefill_c2a_full_test_20261106_153924_7ij6fwny/orchestration/prefill_c2a_full_test.cpp:624
+621: 
+622:                 // Spmd snapshot_rows_spmd_1: snapshot_rows_0
+623:                 CoreTaskArgs params_t18;
+624:                 params_t18.add_input(attention_latent_inline1137__ssa_v4);
+625:                 params_t18.add_output(target_inline1534);
+626:                 params_t18.add_scalar(T_DYN);
+627:                 params_t18.launch_spec.set_block_num(spmd_core_num_4);
+628:                 TaskOutputTensors task_18_outs = rt_submit_aiv_task(13, params_t18);
+
+downstream/build_output/_jit_prefill_c2a_full_test_20261106_153924_7ij6fwny/orchestration/prefill_c2a_full_test.cpp:677
+674: 
+675:                 // Group compressor_project_1: MixedKernels (AIC + AIV lanes)
+676:                 CoreTaskArgs params_t20;
+677:                 params_t20.add_input(latent_inline1135__rv_v2);
+678:                 params_t20.add_input(ext_index_wk);
+679:                 params_t20.add_output(projected_inline1551);
+680:                 params_t20.add_output(gm_pipe_buffer_5);
+681:                 params_t20.add_scalar(T_DYN);
+
+compile/full_compile/_jit_decode_fwd_20261106_153833_mrz02vac/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp:1778
+1775:                                 uint32_t latent_inline14581_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 512};
+1776:                                 TensorCreateInfo latent_inline14581_ci(latent_inline14581_ci_shapes, 2, DataType::BFLOAT16);
+1777:                                 uint32_t attention_latent_inline14235_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 512};
+1778:                                 TensorCreateInfo attention_latent_inline14235_ci(attention_latent_inline14235_ci_shapes, 2, DataType::BFLOAT16);
+1779:                                 uint32_t target_inline14690_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 512};
+1780:                                 TensorCreateInfo target_inline14690_ci(target_inline14690_ci_shapes, 2, DataType::BFLOAT16);
+1781:                                 uint32_t projected_inline14707_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 128};
+1782:                                 TensorCreateInfo projected_inline14707_ci(projected_inline14707_ci_shapes, 2, DataType::BFLOAT16);
+
+compile/full_compile/_jit_decode_fwd_20261106_153833_mrz02vac/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp:2522
+2519: 
+2520:                                         // Spmd rms_norm_spmd_5: rms_norm_1
+2521:                                         CoreTaskArgs params_t67;
+2522:                                         params_t67.add_input(latent_inline14581);
+2523:                                         params_t67.add_inout(latent_inline14233);
+2524:                                         params_t67.add_input(layer_c2a_comp_norm_inline13526);
+2525:                                         params_t67.add_scalar(T_DYN);
+2526:                                         params_t67.launch_spec.set_block_num(blocks_inline14641);
+
+compile/full_compile/_jit_decode_fwd_20261106_153833_mrz02vac/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp:2543
+2540:                                         CoreTaskArgs params_t68;
+2541:                                         params_t68.add_input(ext_c2a_compressed_cos);
+2542:                                         params_t68.add_input(ext_c2a_compressed_sin);
+2543:                                         params_t68.add_input(latent_inline14233__rv_v2);
+2544:                                         params_t68.add_inout(attention_latent_inline14235);
+2545:                                         params_t68.add_scalar(T_DYN);
+2546:                                         params_t68.launch_spec.set_block_num(blocks_inline14659);
+2547:                                         rt_submit_aiv_task(28, params_t68);
+
+compile/full_compile/_jit_decode_fwd_20261106_153833_mrz02vac/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp:2562
+2559: 
+2560:                                         // Spmd snapshot_rows_spmd_3: snapshot_rows_0
+2561:                                         CoreTaskArgs params_t69;
+2562:                                         params_t69.add_input(attention_latent_inline14235__ssa_v4);
+2563:                                         params_t69.add_inout(target_inline14690);
+2564:                                         params_t69.add_scalar(T_DYN);
+2565:                                         params_t69.launch_spec.set_block_num(spmd_core_num_14);
+2566:                                         TaskOutputTensors task_69_outs = rt_submit_aiv_task(30, params_t69);
+
+compile/full_compile/_jit_decode_fwd_20261106_153833_mrz02vac/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp:2615
+2612: 
+2613:                                         // Group compressor_project_1: MixedKernels (AIC + AIV lanes)
+2614:                                         CoreTaskArgs params_t71;
+2615:                                         params_t71.add_input(latent_inline14233__rv_v2);
+2616:                                         params_t71.add_input(layer_c2a_idx_wk_inline13530);
+2617:                                         params_t71.add_inout(projected_inline14707);
+2618:                                         params_t71.add_inout(gm_pipe_buffer_15);
+2619:                                         params_t71.add_scalar(T_DYN);
+
+compile/full_compile/_jit_decode_fwd_20261106_153833_mrz02vac/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp:6822
+6819:                         uint32_t latent_inline17236_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 512};
+6820:                         TensorCreateInfo latent_inline17236_ci(latent_inline17236_ci_shapes, 2, DataType::BFLOAT16);
+6821:                         uint32_t attention_latent_inline16892_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 512};
+6822:                         TensorCreateInfo attention_latent_inline16892_ci(attention_latent_inline16892_ci_shapes, 2, DataType::BFLOAT16);
+6823:                         uint32_t target_inline17302_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 512};
+6824:                         TensorCreateInfo target_inline17302_ci(target_inline17302_ci_shapes, 2, DataType::BFLOAT16);
+6825:                         uint32_t projected_inline17319_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 128};
+6826:                         TensorCreateInfo projected_inline17319_ci(projected_inline17319_ci_shapes, 2, DataType::BFLOAT16);
+
+compile/full_compile/_jit_prefill_fwd_20261106_153903_0qu5tv_s/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp:2274
+2271:                                 uint32_t latent_inline20113_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 512};
+2272:                                 TensorCreateInfo latent_inline20113_ci(latent_inline20113_ci_shapes, 2, DataType::BFLOAT16);
+2273:                                 uint32_t attention_latent_inline19825_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 512};
+2274:                                 TensorCreateInfo attention_latent_inline19825_ci(attention_latent_inline19825_ci_shapes, 2, DataType::BFLOAT16);
+2275:                                 uint32_t target_inline20222_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 512};
+2276:                                 TensorCreateInfo target_inline20222_ci(target_inline20222_ci_shapes, 2, DataType::BFLOAT16);
+2277:                                 uint32_t projected_inline20239_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 128};
+2278:                                 TensorCreateInfo projected_inline20239_ci(projected_inline20239_ci_shapes, 2, DataType::BFLOAT16);
+
+compile/full_compile/_jit_prefill_fwd_20261106_153903_0qu5tv_s/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp:2809
+2806: 
+2807:                                         // Spmd rms_norm_spmd_5: rms_norm_1
+2808:                                         CoreTaskArgs params_t64;
+2809:                                         params_t64.add_input(latent_inline20113);
+2810:                                         params_t64.add_inout(latent_inline19823);
+2811:                                         params_t64.add_input(compressor_norm_inline19152);
+2812:                                         params_t64.add_scalar(T_DYN);
+2813:                                         params_t64.launch_spec.set_block_num(blocks_inline20173);
+
+compile/full_compile/_jit_prefill_fwd_20261106_153903_0qu5tv_s/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp:2830
+2827:                                         CoreTaskArgs params_t65;
+2828:                                         params_t65.add_input(ext_c2a_compressed_cos);
+2829:                                         params_t65.add_input(ext_c2a_compressed_sin);
+2830:                                         params_t65.add_input(latent_inline19823__rv_v2);
+2831:                                         params_t65.add_inout(attention_latent_inline19825);
+2832:                                         params_t65.add_scalar(T_DYN);
+2833:                                         params_t65.launch_spec.set_block_num(blocks_inline20191);
+2834:                                         rt_submit_aiv_task(28, params_t65);
+
+compile/full_compile/_jit_prefill_fwd_20261106_153903_0qu5tv_s/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp:2849
+2846: 
+2847:                                         // Spmd snapshot_rows_spmd_3: snapshot_rows_0
+2848:                                         CoreTaskArgs params_t66;
+2849:                                         params_t66.add_input(attention_latent_inline19825__ssa_v4);
+2850:                                         params_t66.add_inout(target_inline20222);
+2851:                                         params_t66.add_scalar(T_DYN);
+2852:                                         params_t66.launch_spec.set_block_num(spmd_core_num_13);
+2853:                                         TaskOutputTensors task_66_outs = rt_submit_aiv_task(30, params_t66);
+
+compile/full_compile/_jit_prefill_fwd_20261106_153903_0qu5tv_s/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp:2902
+2899: 
+2900:                                         // Group compressor_project_1: MixedKernels (AIC + AIV lanes)
+2901:                                         CoreTaskArgs params_t68;
+2902:                                         params_t68.add_input(latent_inline19823__rv_v2);
+2903:                                         params_t68.add_input(layer_index_wk_inline19136);
+2904:                                         params_t68.add_inout(projected_inline20239);
+2905:                                         params_t68.add_inout(gm_pipe_buffer_13);
+2906:                                         params_t68.add_scalar(T_DYN);
+
+compile/full_compile/_jit_prefill_fwd_20261106_153903_0qu5tv_s/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp:6241
+6238:                         uint32_t latent_inline22296_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 512};
+6239:                         TensorCreateInfo latent_inline22296_ci(latent_inline22296_ci_shapes, 2, DataType::BFLOAT16);
+6240:                         uint32_t attention_latent_inline21952_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 512};
+6241:                         TensorCreateInfo attention_latent_inline21952_ci(attention_latent_inline21952_ci_shapes, 2, DataType::BFLOAT16);
+6242:                         uint32_t target_inline22362_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 512};
+6243:                         TensorCreateInfo target_inline22362_ci(target_inline22362_ci_shapes, 2, DataType::BFLOAT16);
+6244:                         uint32_t projected_inline22379_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 128};
+6245:                         TensorCreateInfo projected_inline22379_ci(projected_inline22379_ci_shapes, 2, DataType::BFLOAT16);

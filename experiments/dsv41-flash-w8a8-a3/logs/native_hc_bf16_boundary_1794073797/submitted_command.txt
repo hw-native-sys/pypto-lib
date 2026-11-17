@@ -1,0 +1,1 @@
+task-submit --timeout 1200 --device auto --device-num 1 --max-time 600 --run 'bash experiments/dsv41-flash-w8a8-a3/logs/native_hc_bf16_boundary_1794073797/run_native_case.sh'

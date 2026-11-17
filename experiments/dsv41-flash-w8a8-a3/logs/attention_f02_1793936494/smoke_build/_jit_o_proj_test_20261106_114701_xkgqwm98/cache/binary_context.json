@@ -1,0 +1,22 @@
+{
+  "context": {
+    "platform": "a2a3",
+    "pto_isa_revision": "f83d4b7e4be0a4ca9805944ae2d9ce8c84e581f7",
+    "runtime_name": "tensormap_and_ringbuffer",
+    "runtime_revision": "31f9e72ee6832cd198b77df18c1c305e7fd83676",
+    "schema": 2
+  },
+  "files": {
+    "cache/incore_1088e2efdcb07ea5b1597469_aic_o_proj_a_aic_a2a3.bin": "5c1d3e17ba0f62d8cc9e6fadf5ff94e54e400c646380331b3b74fa68f8bccdf3",
+    "cache/incore_48606ff10cd829f135ba51f0_aiv_o_proj_b_aiv_a2a3.bin": "7806870e696e3b3c6df27e31ab0c6283e3190f5d772b928fae15c1504dcafec9",
+    "cache/incore_813fa63e8f10bf4e31793499_aiv_rope_tail_bf16_a2a3.bin": "432df2d81d7755c69cfabb3ff081fddfac3e17f8b07fd0497ac33f34c468c660",
+    "cache/incore_abd4e4822ed826120649511f_aiv_o_proj_a_aiv_a2a3.bin": "2f0a790e01928292923517b7b8ecd3628dabb2671072eb9ce5b6fd34597382f6",
+    "cache/incore_b81729b070345fbc02c19abd_aic_o_proj_b_aic_a2a3.bin": "8af2c03a7285fd32abceb55a4970b70307ba6080b7efa5d7a04dfdcb6affb63a",
+    "kernels/aic/o_proj_a_aic_1088e2efdcb07ea5b1597469.o": "d307522f6465106ac24b2003172f19fd3b4dab4cd1c6d1a7abf93a49bd97742d",
+    "kernels/aic/o_proj_b_aic_b81729b070345fbc02c19abd.o": "6d15806bfd0b4503e6393ae79db718bc7682170d41149a562fcd4ffcaaf0fd02",
+    "kernels/aiv/o_proj_a_aiv_abd4e4822ed826120649511f.o": "51a3f610e4eb89194e153e4f4736e42d0e9b9a688c00715f4a9afc0efeabd664",
+    "kernels/aiv/o_proj_b_aiv_48606ff10cd829f135ba51f0.o": "70c5472bd9443d0affc1ae82226835427677b6056bfb4a43ec0739da9dbb09ec",
+    "kernels/aiv/rope_tail_bf16_813fa63e8f10bf4e31793499.o": "45b3cb52cd62d845c9d79de6ae3f53756fc19d93bdb0dde40e8ef43980233544",
+    "orchestration/o_proj_test.so": "954d467e27e10e3bc39653d6bc1e3cedddf21ef68efacdc984e58477fb53f969"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "status": "FINAL/PARK",
+  "reviewed_bundle93_manifest_sha256": "188d06bcf2695519e392a91161fab6bef270d136f9cf5d5768e7a9b468b8590f",
+  "copied_source45_sha256": "f08bb59b008df8ee1f2d4588414de9ff52976848f85e089d57d4dac47257401f",
+  "acceptance": false,
+  "task": "task_20261108_031644_2608314306",
+  "task_exit": 1,
+  "failure": "count_active public signature parser moe_ffn tuple unpack: TupleGetItemExpr requires tuple to have TupleType, got TensorType",
+  "successful_artifacts": [],
+  "unattempted": ["count_old_physical", "decode_capacity2"],
+  "running_jobs": [],
+  "native_allocations": 0,
+  "model_payloads": 0,
+  "shared_writes": 0,
+  "source_intact": true,
+  "cleanup": "Queue task completed exit1; exec session ended; no native owner/handles/windows ever prepared; no generated build artifact directory was emitted.",
+  "recovery": "Root assigned Main separate typed-completion source repair. Preserve this FAILED evidence; no retry or frozen93 edits. Future new revision needs separate source review and compile GO."
+}

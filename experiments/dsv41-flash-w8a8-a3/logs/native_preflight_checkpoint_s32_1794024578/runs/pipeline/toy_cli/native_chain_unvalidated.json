@@ -1,0 +1,14 @@
+{
+  "positions": [
+    128,
+    129,
+    130
+  ],
+  "same_artifact": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/toy_cli/toy_decode_artifact",
+    "CPU_FAKE": true
+  },
+  "same_owner": "decode-63416-029da5b19add4fad9a6166f47adaee92",
+  "status": "NATIVE_BYTES_ONLY_NOT_PASS",
+  "evidence_mode": "toy-only-prototype"
+}

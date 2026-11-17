@@ -1,0 +1,55 @@
+{
+  "status": "PASS",
+  "topology": {
+    "tp": 8,
+    "ep": 16,
+    "dp": 2,
+    "world": 16,
+    "local_experts": 24
+  },
+  "COUNT_PAD": 32,
+  "N_LOCAL": 24,
+  "normalized_mode": "ONBOARD",
+  "platform": "a2a3",
+  "ring_heap": [
+    0,
+    0,
+    4294967296,
+    0
+  ],
+  "programs": [
+    {
+      "label": "tp_group",
+      "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/configurable_parallel_1794108101/worker_config/build_tp=8_ep=16_onlytp/_jit_tp_reduce_test_20261108_112912_ncfmp1jk",
+      "seconds": 0.983565092086792,
+      "files": {
+        "debug/run.py": "25cca48b7382081d6af9b2c22ad9286c2efae69d8604e19ba0735d9c0c31515b",
+        "distributed_meta.json": "62cd4426a4abfef4993ee820b2223b07d97b05a2925b90f1d89163cab5da895e",
+        "next_levels/tp_reduce_test_rank/kernel_config.py": "f668f3c2a673bbef4c4b08e6340118cf8da24bb2d1bb55ee79377e861c4da645",
+        "next_levels/tp_reduce_test_rank/kernels/aiv/tp_out_consumed.cpp": "6d0fd04998a38e5c045156cc45203a8bdb39aa522fe44b950f4ca89d8b2a0fd9",
+        "next_levels/tp_reduce_test_rank/kernels/aiv/tp_out_publish.cpp": "ce2b26217e87a432efa344cc79592de450a8f5afffecfef6c309b959adb472ae",
+        "next_levels/tp_reduce_test_rank/kernels/aiv/tp_out_ready.cpp": "9e219b71d0efbb86c7187fea48615db12f368e60b9843bbc8949f6f7dd461d76",
+        "next_levels/tp_reduce_test_rank/kernels/aiv/tp_out_reuse.cpp": "4250fcdfa369bd5b08204b50abe2cfd543748921344c128d6845ba7f70f90724",
+        "next_levels/tp_reduce_test_rank/kernels/aiv/tp_out_sum.cpp": "19255cfc0ea2e15ff0d6575029c1ca9700d71b2fd6887972d43ac0c50ce6ef3f",
+        "next_levels/tp_reduce_test_rank/kernels/aiv/tp_out_wait.cpp": "ae642be1367025ebc602b8aac2ae6e61f11f1e496b361cfcbff2f42ef7af6c87",
+        "next_levels/tp_reduce_test_rank/orchestration/tp_reduce_test_rank.cpp": "62aaee36dee232a18113bb030f8254ce49a65971e6486b7728daa80f4f0a5717",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_consumed.cpp": "f57882425a931087364cbdbb01a0ab135560e0681f3353421668e926297d4ff3",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_consumed.pto": "458d030914ccc3a95c13d864a6224d23c1173a0dea5351d637be65f8601c50bf",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_publish.cpp": "4a6f7da7ff423670d551222af477966cbee5ddfdad5743a607b500a3ccfbf11c",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_publish.pto": "0743c996a9734b72a4d809df8853ae4ac742f5218b1acc311c1f445c35a586ab",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_ready.cpp": "e765092c427b86dfd075f555bba8a2215844cc1d3470a294a3d1e8a78a6611b4",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_ready.pto": "8801facb14e8b8c12ab76e72d5785ca479216c617489881bce310d768ae20f28",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_reuse.cpp": "41165c5c935ffd8fef0efaa01bfc9f7a53b6c0a5334e0a25223aaed3d1e83390",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_reuse.pto": "cd2f9e14da88cf0484bbe8448617580773078d33d2ef010ea2294d7e9dd2ed0e",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_sum.cpp": "1956dc95c71ae5b66eb6ed2942d3c12c74a8fcc007c5fdf9a130607ceacdcd1c",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_sum.pto": "8505728c38d6a9e7be563ccd06adc1b9c5ff98e92e3d79e4b77fa8f13a58cead",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_wait.cpp": "b56ef075faaebee08fe3901260aea1ee190a9b40031e4f6cdb944b2c14a84e03",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_wait.pto": "808020d74c44ba42992ef4b3a60142eb1daf378a8630130d1b40e4b2773f9273",
+        "orchestration/host_orch.py": "48b09b33bb71a524154ffffbbfc2ea590689c5f4d17a9e791d00670acb2bb2e5"
+      }
+    }
+  ],
+  "samples": 0,
+  "prepare": 0,
+  "native": 0
+}

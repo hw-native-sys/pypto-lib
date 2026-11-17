@@ -1,0 +1,22 @@
+{
+  "status": "FINAL/PARK_FAILED_NATIVE_ADMISSION",
+  "native_task": "task_20261108_051030_154183210543",
+  "native_exit": 1,
+  "actual_devices": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],
+  "first_error": "ValueError: missing/ambiguous prepared object for next_levels/probe_rank/kernels/aiv/int8_quant_per_token.cpp",
+  "failure_owner": "own lifecycle helper overbroad source.stem prefix glob",
+  "public_prepare_completed_before_inventory": true,
+  "probe_static_upload_started": false,
+  "count_dispatches": 0,
+  "count_capsules": 0,
+  "normal_owner_close_receipt": false,
+  "public_context_finally_raw_image_free_all16": true,
+  "cleanup_errors_recorded": [],
+  "raw16_locks_released": true,
+  "reported_ready_worker_PIDs_currently_absent": 16,
+  "historical_worker_startticks": "UNKNOWN",
+  "manager_adapter_helper_historical_coverage": "UNKNOWN",
+  "CPU_count_reference_authorized_or_run": false,
+  "running_jobs": [],
+  "recovery": "Preserve failed work/source/native images immutable. Root owns NEW helper source regression/fix and any new count scope. Do not rerun old after_public_prepare on this work or issue count CPU validation without capsules."
+}

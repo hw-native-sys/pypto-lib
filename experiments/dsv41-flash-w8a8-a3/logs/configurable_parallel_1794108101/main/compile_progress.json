@@ -1,0 +1,66 @@
+[
+  {
+    "phase": "prefill3",
+    "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/configurable_parallel_1794108101/main/compiled_v3_tp8_ep16/prefill3",
+    "elapsed_seconds": 45.97580289840698,
+    "topology": {
+      "tp": 8,
+      "ep": 16,
+      "dp": 2,
+      "world": 16,
+      "local_experts": 24
+    },
+    "formal_count": 100,
+    "static_count": 57,
+    "static_per_rank_bytes": 38328513216,
+    "expert_layers": 40,
+    "source_manifest_sha256": "f0e91a30e4117e110be183ef44acf2874eea813cc6f72ac7c7fa44bc4ede3a7f",
+    "platform": "a2a3",
+    "execution_mode": "ONBOARD",
+    "ring_heap": [
+      0,
+      0,
+      4294967296,
+      0
+    ],
+    "metadata_sha256": "4b5f4876d75282cb34c84975ec27d0e812526866cd815eb76751c356c977de8d",
+    "artifact_files": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/configurable_parallel_1794108101/main/prefill3_files.json",
+    "artifact_manifest_sha256": "e9af67f0b7f4e523d84f317a0a8e25ed40fe7e3673a2ef06ecf427643793de18",
+    "tensor_samples": 0,
+    "prepare": 0,
+    "checkpoint_reads": 0,
+    "NPU": 0
+  },
+  {
+    "phase": "decode1",
+    "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/configurable_parallel_1794108101/main/compiled_v3_tp8_ep16/decode1",
+    "elapsed_seconds": 43.460283279418945,
+    "topology": {
+      "tp": 8,
+      "ep": 16,
+      "dp": 2,
+      "world": 16,
+      "local_experts": 24
+    },
+    "formal_count": 96,
+    "static_count": 57,
+    "static_per_rank_bytes": 38328513216,
+    "expert_layers": 40,
+    "source_manifest_sha256": "f0e91a30e4117e110be183ef44acf2874eea813cc6f72ac7c7fa44bc4ede3a7f",
+    "platform": "a2a3",
+    "execution_mode": "ONBOARD",
+    "ring_heap": [
+      0,
+      0,
+      4294967296,
+      0
+    ],
+    "metadata_sha256": "98555b7f185806bab22a72fbe02136740d1678206ff40f0dd40dfb855d718af9",
+    "artifact_files": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/configurable_parallel_1794108101/main/decode1_files.json",
+    "artifact_manifest_sha256": "8503d5275dcee06477ede92057e4836ef9a50cb9443f9f22b5e5c60695ddfd02",
+    "tensor_samples": 0,
+    "prepare": 0,
+    "checkpoint_reads": 0,
+    "NPU": 0
+  }
+]

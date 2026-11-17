@@ -1,0 +1,8 @@
+{
+  "status": "FINAL_READY_PARK",
+  "ownjobs": 0,
+  "shared_writes": 0,
+  "valid_grants": 0,
+  "work_exists": false,
+  "native_authorized": false
+}

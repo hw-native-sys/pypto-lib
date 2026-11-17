@@ -1,0 +1,321 @@
+{
+  "status": "PASS_SCOPED_ACTUAL_CALIBRATION_EXTERNAL_CPU_AUDIT",
+  "epoch": 1794041135.355461,
+  "scope": "noEngram; actual16 tiny empty A/B/C only; no large/firsttouch/upload/forward/fullfit",
+  "native_job": "task_20261107_164303_25365942563",
+  "calibration_sha256": "3bc7291e174cccc8a8f0272d9786716a78bccb2ae8336c33fdfd4e10a16927f0",
+  "protected_pins_unchanged": true,
+  "owner_handle_counts": [
+    0,
+    16,
+    0
+  ],
+  "distinct_recorded_process_identities": 50,
+  "all_recorded_process_identities_absent": true,
+  "A_prewarm": [
+    {
+      "rank": 0,
+      "free": 59883593728,
+      "total": 65787658240,
+      "committed": 5452849061
+    },
+    {
+      "rank": 1,
+      "free": 60188319744,
+      "total": 65796046848,
+      "committed": 5452849061
+    },
+    {
+      "rank": 2,
+      "free": 59900784640,
+      "total": 65787658240,
+      "committed": 5452849061
+    },
+    {
+      "rank": 3,
+      "free": 60174540800,
+      "total": 65796046848,
+      "committed": 5452849061
+    },
+    {
+      "rank": 4,
+      "free": 59902328832,
+      "total": 65787658240,
+      "committed": 5452849061
+    },
+    {
+      "rank": 5,
+      "free": 60175200256,
+      "total": 65796046848,
+      "committed": 5452849061
+    },
+    {
+      "rank": 6,
+      "free": 59902410752,
+      "total": 65787658240,
+      "committed": 5452849061
+    },
+    {
+      "rank": 7,
+      "free": 60174012416,
+      "total": 65796046848,
+      "committed": 5452849061
+    },
+    {
+      "rank": 8,
+      "free": 59891425280,
+      "total": 65787658240,
+      "committed": 5452849061
+    },
+    {
+      "rank": 9,
+      "free": 60187881472,
+      "total": 65796046848,
+      "committed": 5452849061
+    },
+    {
+      "rank": 10,
+      "free": 59901865984,
+      "total": 65787658240,
+      "committed": 5452849061
+    },
+    {
+      "rank": 11,
+      "free": 60175642624,
+      "total": 65796046848,
+      "committed": 5452849061
+    },
+    {
+      "rank": 12,
+      "free": 59893063680,
+      "total": 65787658240,
+      "committed": 5452849061
+    },
+    {
+      "rank": 13,
+      "free": 60189544448,
+      "total": 65796046848,
+      "committed": 5452849061
+    },
+    {
+      "rank": 14,
+      "free": 59901030400,
+      "total": 65787658240,
+      "committed": 5452849061
+    },
+    {
+      "rank": 15,
+      "free": 60177154048,
+      "total": 65796046848,
+      "committed": 5452849061
+    }
+  ],
+  "B_observations": [
+    {
+      "rank": 0,
+      "positive_free_drop": 1105920,
+      "positive_committed_rise": 1048576,
+      "tolerance_bytes": 68214784
+    },
+    {
+      "rank": 1,
+      "positive_free_drop": 520192,
+      "positive_committed_rise": 1048576,
+      "tolerance_bytes": 68157440
+    },
+    {
+      "rank": 2,
+      "positive_free_drop": 0,
+      "positive_committed_rise": 1048576,
+      "tolerance_bytes": 68157440
+    },
+    {
+      "rank": 3,
+      "positive_free_drop": 155648,
+      "positive_committed_rise": 1048576,
+      "tolerance_bytes": 68157440
+    },
+    {
+      "rank": 4,
+      "positive_free_drop": 24576,
+      "positive_committed_rise": 1048576,
+      "tolerance_bytes": 68157440
+    },
+    {
+      "rank": 5,
+      "positive_free_drop": 61440,
+      "positive_committed_rise": 1048576,
+      "tolerance_bytes": 68157440
+    },
+    {
+      "rank": 6,
+      "positive_free_drop": 0,
+      "positive_committed_rise": 1048576,
+      "tolerance_bytes": 68157440
+    },
+    {
+      "rank": 7,
+      "positive_free_drop": 352256,
+      "positive_committed_rise": 1048576,
+      "tolerance_bytes": 68157440
+    },
+    {
+      "rank": 8,
+      "positive_free_drop": 724992,
+      "positive_committed_rise": 1048576,
+      "tolerance_bytes": 68157440
+    },
+    {
+      "rank": 9,
+      "positive_free_drop": 368640,
+      "positive_committed_rise": 1048576,
+      "tolerance_bytes": 68157440
+    },
+    {
+      "rank": 10,
+      "positive_free_drop": 638976,
+      "positive_committed_rise": 1048576,
+      "tolerance_bytes": 68157440
+    },
+    {
+      "rank": 11,
+      "positive_free_drop": 253952,
+      "positive_committed_rise": 1048576,
+      "tolerance_bytes": 68157440
+    },
+    {
+      "rank": 12,
+      "positive_free_drop": 2506752,
+      "positive_committed_rise": 1048576,
+      "tolerance_bytes": 69615616
+    },
+    {
+      "rank": 13,
+      "positive_free_drop": 679936,
+      "positive_committed_rise": 1048576,
+      "tolerance_bytes": 68157440
+    },
+    {
+      "rank": 14,
+      "positive_free_drop": 0,
+      "positive_committed_rise": 1048576,
+      "tolerance_bytes": 68157440
+    },
+    {
+      "rank": 15,
+      "positive_free_drop": 81920,
+      "positive_committed_rise": 1048576,
+      "tolerance_bytes": 68157440
+    }
+  ],
+  "C_prewarm": [
+    {
+      "rank": 0,
+      "free": 59883397120,
+      "total": 65787658240,
+      "committed": 5452849061
+    },
+    {
+      "rank": 1,
+      "free": 60187299840,
+      "total": 65796046848,
+      "committed": 5452849061
+    },
+    {
+      "rank": 2,
+      "free": 59900645376,
+      "total": 65787658240,
+      "committed": 5452849061
+    },
+    {
+      "rank": 3,
+      "free": 60174475264,
+      "total": 65796046848,
+      "committed": 5452849061
+    },
+    {
+      "rank": 4,
+      "free": 59902619648,
+      "total": 65787658240,
+      "committed": 5452849061
+    },
+    {
+      "rank": 5,
+      "free": 60175175680,
+      "total": 65796046848,
+      "committed": 5452849061
+    },
+    {
+      "rank": 6,
+      "free": 59901104128,
+      "total": 65787658240,
+      "committed": 5452849061
+    },
+    {
+      "rank": 7,
+      "free": 60173352960,
+      "total": 65796046848,
+      "committed": 5452849061
+    },
+    {
+      "rank": 8,
+      "free": 59890913280,
+      "total": 65787658240,
+      "committed": 5452849061
+    },
+    {
+      "rank": 9,
+      "free": 60187582464,
+      "total": 65796046848,
+      "committed": 5452849061
+    },
+    {
+      "rank": 10,
+      "free": 59901906944,
+      "total": 65787658240,
+      "committed": 5452849061
+    },
+    {
+      "rank": 11,
+      "free": 60175257600,
+      "total": 65796046848,
+      "committed": 5452849061
+    },
+    {
+      "rank": 12,
+      "free": 59891326976,
+      "total": 65787658240,
+      "committed": 5452849061
+    },
+    {
+      "rank": 13,
+      "free": 60189462528,
+      "total": 65796046848,
+      "committed": 5452849061
+    },
+    {
+      "rank": 14,
+      "free": 59901046784,
+      "total": 65787658240,
+      "committed": 5452849061
+    },
+    {
+      "rank": 15,
+      "free": 60177145856,
+      "total": 65796046848,
+      "committed": 5452849061
+    }
+  ],
+  "resource_sample_count": 38,
+  "resource_sample_minima": {
+    "host_available_bytes": 1617710747648,
+    "disk_free_bytes": 9526359097344,
+    "shm_free_bytes": 1079341670400
+  },
+  "unknown_peaks": {
+    "full40_physical_firsttouch_peak_bytes": null,
+    "full40_upload_peak_bytes": null,
+    "full40_forward_peak_bytes": null
+  },
+  "policy_allowance_not_measurement": 17954081472
+}

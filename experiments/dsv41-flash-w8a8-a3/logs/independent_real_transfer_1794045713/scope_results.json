@@ -1,0 +1,24 @@
+{
+  "status": "PASS_ACTUAL_METADATA_SCOPE_NEGATIVES_CPU_ONLY",
+  "controls": [
+    {
+      "case": "CPU_fake_cannot_authorize_actual_data_or_NPU",
+      "reason": "separate exact allowlist/bytes/source/policy/device root scope required"
+    },
+    {
+      "case": "actual57_scale_dtype_not_byte_equivalent",
+      "reason": "plan target ABI differs from actual generated57 headers"
+    },
+    {
+      "case": "actual_TP_DP_rank_order_changed",
+      "reason": "independent TP/DP embedding selection mismatch"
+    }
+  ],
+  "old_calibration_age_seconds": 5808.948339700699,
+  "reached_new_authorization_gate_without_historical_age_gate": true,
+  "old_times_and_evidence_unchanged": true,
+  "only_fake_authorization_in_memory": true,
+  "actual_grant_written": false,
+  "real_checkpoint_tensor_reads": 0,
+  "NPU": 0
+}

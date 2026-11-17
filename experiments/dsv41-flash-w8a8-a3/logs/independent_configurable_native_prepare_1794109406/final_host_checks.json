@@ -1,0 +1,10 @@
+{
+  "status": "PASS_FINAL_HOST_FAILURE_GATE_ONLY",
+  "run_result_false_rejected": true,
+  "public_publisher_proof_bound": true,
+  "all_native_sources_parse": true,
+  "model_sources_unchanged": true,
+  "compile": 0,
+  "prepare": 0,
+  "native": 0
+}

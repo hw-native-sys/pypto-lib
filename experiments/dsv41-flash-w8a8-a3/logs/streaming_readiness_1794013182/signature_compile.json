@@ -1,0 +1,15 @@
+{
+  "mode": "ONBOARD compile only",
+  "platform": "a2a3",
+  "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/streaming_readiness_1794013182/signature_build/_jit_decode_fwd_20261107_090903_i6_2lgd7",
+  "metadata_sha256": "6a2d2c6f6b0d62453aed6bb501cb7070d208d4d069648bd0ee20bc7fa9073001",
+  "expert_prefix": [
+    16,
+    40,
+    24
+  ],
+  "tensor_arguments_supplied": 0,
+  "fixture_build_calls": 0,
+  "device_dispatches": 0,
+  "model_source_before_after": "all45 equal frozen manifest"
+}

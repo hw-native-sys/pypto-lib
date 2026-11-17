@@ -1,0 +1,12 @@
+{
+  "CPU_audit_jobs": 1,
+  "NPU_jobs": 1,
+  "agent": "review-agent",
+  "elapsed_seconds": 290,
+  "end_epoch": 1794073467,
+  "id": "native-shared-owner-corrected-1794073177-1794073467",
+  "protected_source_writes": 0,
+  "real_checkpoint_payload": 0,
+  "start_epoch": 1794073177,
+  "state": "PASS_FINAL_PARK"
+}

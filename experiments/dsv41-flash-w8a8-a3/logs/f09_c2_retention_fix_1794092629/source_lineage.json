@@ -1,0 +1,10 @@
+{
+  "new_source45": "8153c7f040bef51900a6e6c9ff27b018279b7503f31d50ec5488457e49770b28",
+  "parent405": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "only_kernel_delta": "compressor.c2a_compressor state flush range+last-of-request active bound",
+  "golden_changed": false,
+  "fullentry_ABI_changed": false,
+  "full_signature": "PENDING_FRESH_AFTER_CPU_RELEASE",
+  "count_artifacts": "KEEP_OLD405_DEPENDENCY_ANCESTRY_NO_RECOMPILE_OR_RELABEL",
+  "actual_failed_postcall1": "LOST_UNKNOWN"
+}

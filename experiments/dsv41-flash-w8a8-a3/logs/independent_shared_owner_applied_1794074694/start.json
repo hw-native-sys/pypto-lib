@@ -1,0 +1,6 @@
+{
+  "start_epoch": 1794074694,
+  "state": "WAIT_MAIN_FINAL_FREEZE",
+  "expected_generate_sha256": "fba8a4ef9a06f694fa53278bb80ae2ad70d111336dbead938ab9f8511d27e16e",
+  "expected_exactpatch": "366ed05e9b51f26771cb4e63beedb1fa2f8049019e2685ba529dc85571002c8e"
+}

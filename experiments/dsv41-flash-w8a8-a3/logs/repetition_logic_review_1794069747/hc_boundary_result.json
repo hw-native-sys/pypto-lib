@@ -1,0 +1,84 @@
+{
+  "epoch": 1794069930.5755281,
+  "torch": "2.14.1+cpu",
+  "device": "cpu",
+  "NPU_execution": false,
+  "functions_executed_unchanged_via_AST": [
+    {
+      "path": "experiments/dsv41-flash-w8a8-a3/logs/logic_review_1793929657/upstream_rc2/tests/deepseek_v41_utils.py",
+      "function": "hc_post_reference",
+      "first_line": 266,
+      "last_line": 270,
+      "function_source_sha256": "a51b53d475db02841630c5d00ed18a3c7afb2de526962f0e0e59c7293f25abd5"
+    },
+    {
+      "path": "models/deepseek_v4_1_flash_a3_w8a8/hc.py",
+      "function": "golden_hc_post",
+      "first_line": 328,
+      "last_line": 331,
+      "function_source_sha256": "9c6ec36a2c981f1b24dc1aa22eee7ef7c93b278e595e4ea99920ab1d6160cf1d"
+    }
+  ],
+  "dtypes": {
+    "sublayer": "torch.bfloat16",
+    "original_residual": "torch.bfloat16",
+    "current_residual": "torch.float32",
+    "coefficients": "torch.float32",
+    "original_output": "torch.bfloat16",
+    "current_output": "torch.float32"
+  },
+  "shape": [
+    1,
+    4,
+    5120
+  ],
+  "post_coefficients": [
+    [
+      0.001953125,
+      0.00390625,
+      0.005859375,
+      0.0078125
+    ]
+  ],
+  "original_first_two_channels_per_HC": [
+    [
+      1.0,
+      -1.0
+    ],
+    [
+      1.0,
+      -1.0
+    ],
+    [
+      1.0078125,
+      -1.0078125
+    ],
+    [
+      1.0078125,
+      -1.0078125
+    ]
+  ],
+  "current_first_two_channels_per_HC": [
+    [
+      1.001953125,
+      -1.001953125
+    ],
+    [
+      1.00390625,
+      -1.00390625
+    ],
+    [
+      1.005859375,
+      -1.005859375
+    ],
+    [
+      1.0078125,
+      -1.0078125
+    ]
+  ],
+  "max_abs_difference": 0.00390625,
+  "differing_elements": 15360,
+  "total_elements": 20480,
+  "current_BF16_rounded_equals_original": true,
+  "claim": "CPU reference semantic mismatch only; not NPU execution or repetition causality"
+}

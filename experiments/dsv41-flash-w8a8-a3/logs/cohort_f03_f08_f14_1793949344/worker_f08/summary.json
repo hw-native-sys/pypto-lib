@@ -1,0 +1,11 @@
+{
+  "source": "models/deepseek_v4_1_flash_a3_w8a8/moe_gate.py",
+  "before_sha256": "c559151b8c29df5216f9118240e3409ab95558969680d3b4368dec59f7fa12e2",
+  "after_sha256": "040019c27390f3bc5355af1b1964c19dc3ec347a6e719fe795adedc047b4f872",
+  "device_task": "task_20261106_152322_332092917320",
+  "device": 0,
+  "device_exit": 0,
+  "permanent_positives": 4,
+  "repeated_tie_positives": 3,
+  "old_kernel_numerical_rejections": 3
+}

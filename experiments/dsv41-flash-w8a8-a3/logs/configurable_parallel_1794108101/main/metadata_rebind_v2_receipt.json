@@ -1,0 +1,76 @@
+[
+  {
+    "input": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/configurable_parallel_1794108101/worker_metadata/metadata_tp8_ep16.json",
+    "input_sha256": "0b42980f2f7c4ea8bfc237683e930ae3e92fc1f6220563da02d275cb7f36800f",
+    "output": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/configurable_parallel_1794108101/main/metadata_v2_tp8_ep16.json",
+    "output_sha256": "847ba0c4bbbbad98fbd21a5242d5b73a4b28239e29701edf2c7799b972db4b78",
+    "source_v1": "651580ea4f88a065a91182faa455b361278dc10dd6b739ed499c9f5545dac23d",
+    "source_v2": "2ea8b00af574c0d582792cf67b65892e1e9986d4b42230a05b78f820b383d3af",
+    "only_source_fields_changed": true,
+    "other_root_keys_equal": [
+      "checkpoint",
+      "checkpoint_header_bytes_read",
+      "expert_layers",
+      "index_sha256",
+      "operation",
+      "parent_reference_plan_sha256",
+      "payload_bytes_read",
+      "phases",
+      "prompt_candidates",
+      "resource_budget",
+      "runtime_grant_created",
+      "schema",
+      "selected_prompt",
+      "separate_phase_schedule_only",
+      "shared_weight_accounting",
+      "source_descriptors",
+      "static_arguments_per_rank",
+      "static_global_bytes",
+      "static_per_rank_bytes",
+      "tokenizer_files",
+      "topology",
+      "unknown_peaks",
+      "value_proof"
+    ],
+    "changed_source_paths": [
+      "models/deepseek_v4_1_flash_a3_w8a8/attention.py"
+    ]
+  },
+  {
+    "input": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/configurable_parallel_1794108101/worker_metadata/metadata_tp4_ep16.json",
+    "input_sha256": "4c4f3847ee569224ba7709ad99b69f4b94a11605425a823c3944825e1b808fa4",
+    "output": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/configurable_parallel_1794108101/main/metadata_v2_tp4_ep16.json",
+    "output_sha256": "5dc2ff2c50b6534b1ca534d0c5c75480b8e23d29d82001ac618ef8d2e40edbcc",
+    "source_v1": "651580ea4f88a065a91182faa455b361278dc10dd6b739ed499c9f5545dac23d",
+    "source_v2": "2ea8b00af574c0d582792cf67b65892e1e9986d4b42230a05b78f820b383d3af",
+    "only_source_fields_changed": true,
+    "other_root_keys_equal": [
+      "checkpoint",
+      "checkpoint_header_bytes_read",
+      "expert_layers",
+      "index_sha256",
+      "operation",
+      "parent_reference_plan_sha256",
+      "payload_bytes_read",
+      "phases",
+      "prompt_candidates",
+      "resource_budget",
+      "runtime_grant_created",
+      "schema",
+      "selected_prompt",
+      "separate_phase_schedule_only",
+      "shared_weight_accounting",
+      "source_descriptors",
+      "static_arguments_per_rank",
+      "static_global_bytes",
+      "static_per_rank_bytes",
+      "tokenizer_files",
+      "topology",
+      "unknown_peaks",
+      "value_proof"
+    ],
+    "changed_source_paths": [
+      "models/deepseek_v4_1_flash_a3_w8a8/attention.py"
+    ]
+  }
+]

@@ -1,0 +1,8 @@
+{
+  "task_id": "task_20261108_061047_169706113133",
+  "exit_code": 0,
+  "terminal": "COMPLETE",
+  "device": "no-device",
+  "prequeue_sha256": "2481d80db4853de235dcbee11a23892abc7478192db46625d980b08a7c10f41f",
+  "compile_prepare_NPU": 0
+}

@@ -1,0 +1,17 @@
+{
+  "status": "FINAL/PARK_WHOLE_NATIVE_FAILED",
+  "native_task": "task_20261108_051030_154183210543 exit1",
+  "metadata_audit_task": "task_20261108_051737_15606103351 exit0",
+  "registered_object_cache_mappings": 32,
+  "old_helper_prefix_collisions": 4,
+  "original_source_ABI_files_unchanged": 158,
+  "model45_after_checks": "ALL_OK",
+  "frozen_preparation_after_checks": "ALL13_OK",
+  "normal_owner_close": false,
+  "raw_public_context_free_all16_and_lock_release": true,
+  "historical_rank_worker_manager_helper_birth_complete": false,
+  "count_numerical_acceptance": false,
+  "running_jobs": [],
+  "shared_writes": 0,
+  "recovery": "No count-offline grant/NPU retry. Main's NEW identity-fix artifact may read/fork retained prepared images only under Root assignment; never modify this sealed failed case."
+}

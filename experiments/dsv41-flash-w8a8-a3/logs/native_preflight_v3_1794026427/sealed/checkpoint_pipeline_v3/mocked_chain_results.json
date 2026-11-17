@@ -1,0 +1,35 @@
+{
+  "status": "PASS_CPU_MOCKED_LABEL_GUARD",
+  "stages": [
+    {
+      "stage": "static-plan",
+      "REAL_parser_executed": true,
+      "actual_provider": "CPU_MOCKED_TOY"
+    },
+    {
+      "stage": "prefix",
+      "REAL_parser_executed": true,
+      "actual_provider": "CPU_MOCKED_TOY"
+    },
+    {
+      "stage": "validate",
+      "REAL_parser_executed": true,
+      "actual_provider": "CPU_MOCKED_TOY"
+    },
+    {
+      "stage": "decode",
+      "REAL_parser_executed": true,
+      "actual_provider": "CPU_MOCKED_TOY"
+    },
+    {
+      "stage": "validate-chain",
+      "REAL_parser_executed": true,
+      "actual_provider": "CPU_MOCKED_TOY"
+    }
+  ],
+  "chain_status": "TOY_ONLY_PASS",
+  "native_grant": false,
+  "NPU": 0,
+  "real_fixture": 0,
+  "measured_capacity_claim": false
+}

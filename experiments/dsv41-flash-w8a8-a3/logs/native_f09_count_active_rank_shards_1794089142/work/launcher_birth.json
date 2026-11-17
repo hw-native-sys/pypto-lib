@@ -1,0 +1,26 @@
+{
+  "identity": {
+    "pid": 1708256,
+    "starttick": "108963288"
+  },
+  "device_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "root_go_id": "observer-20261108-f09-count-active-rank-shards-native16",
+  "epoch": 1794089711.8522499
+}

@@ -1,0 +1,23 @@
+{
+  "record_id": "independent-fit-source-1794036966-1794037609",
+  "start_epoch_first_measured": 1794036916,
+  "end_epoch": 1794037609,
+  "elapsed_seconds": 693,
+  "role": "review-agent",
+  "scope": "noEngram; source/API/guard CPU review only",
+  "jobs": {
+    "task_20261107_153727_96880910110": "completed (exit=0)",
+    "task_20261107_153844_97183731254": "completed (exit=0)",
+    "task_20261107_154503_99005219350": "completed (exit=0)",
+    "task_20261107_154614_9930505208": "completed (exit=1)"
+  },
+  "own_cpu_review_pid_absent": true,
+  "production45_and_old31_unchanged": true,
+  "NPU_jobs": 0,
+  "payload_reads": 0,
+  "real_allocations": 0,
+  "full40_peak": null,
+  "status": "FINAL/PARK",
+  "candidate_independent_results": "candidate_results.json",
+  "seal_collector": "This final CPU-only collector must complete before FINAL declaration; prior submitted jobs verified terminal here."
+}

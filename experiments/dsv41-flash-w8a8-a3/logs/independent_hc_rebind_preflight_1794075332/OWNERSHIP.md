@@ -1,0 +1,1 @@
+Bounded READONLY HC source/math/admission rebind + telemetry source preflight. No virtualguard reruns/currentmodel imports/CPUtests/compile/NPU/payload/header/largefixture/source/dependency edits. Future apply and fresh2signatures require separateRootGO after HC native acceptance.

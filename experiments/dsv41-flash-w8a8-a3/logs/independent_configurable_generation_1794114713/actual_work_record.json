@@ -1,0 +1,28 @@
+{
+  "schema": "measured-independent-actual-post-audit/1",
+  "unique_id": "review-agent-configurable-actual-audit-1794126623",
+  "role": "review-agent",
+  "agent": "/root/repetition_review",
+  "status": "FINAL_PARK_WHOLE_NOT_ACCEPTED_BOUNDED_FACTS_VERIFIED",
+  "start_epoch": 1794126623,
+  "end_epoch": 1794127085,
+  "elapsed_seconds": 462,
+  "CPU_tasks": [
+    "task_20261108_163217_381875127764"
+  ],
+  "CPU_terminal": "completed(exit0)",
+  "actual_audit_invocations": 1,
+  "actual_audit_passed": 4363,
+  "actual_audit_unmet": 5,
+  "scaffolding_retries": 0,
+  "model_runtime_imports": 0,
+  "header_scans": 0,
+  "tensor_payload_bytes_read": 0,
+  "compile_prepare_NPU": 0,
+  "source_runtime_protected_writes": 0,
+  "shared_writes": 0,
+  "new_native_positive_grants": 0,
+  "Root_import": "ONCE; sealed270s assembly and1367s preparation excluded",
+  "whole_case": "NOT_ACCEPTED native1/CLI0/strictouterFAIL259/PSSnull",
+  "scope": "Postterminal metadata/source/receipt audit only; no original mathematical parity/quality/fullpeak acceptance"
+}

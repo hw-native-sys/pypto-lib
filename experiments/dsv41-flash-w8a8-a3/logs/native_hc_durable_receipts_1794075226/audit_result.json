@@ -1,0 +1,307 @@
+{
+  "status": "PASS_INDEPENDENT_AUDIT",
+  "native_case_status": "FAILED; no retry",
+  "started_epoch": 1794075502.5606391,
+  "ended_epoch": 1794075503.469542,
+  "checks": [
+    {
+      "check": "independent-original-expected-BF16-representable",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "candidate-one-durable-comparison",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "candidate-saved-tensor-hashes",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "candidate-dtype-shape",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "candidate-receipt-counts-and-bits-recomputed",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "candidate-all-perrow-counts-recomputed",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "old_control-one-durable-comparison",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "old_control-saved-tensor-hashes",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "old_control-dtype-shape",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "old_control-receipt-counts-and-bits-recomputed",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "old_control-all-perrow-counts-recomputed",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "candidate-independent-original-bit-exact-102400",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "old-actual-independent-original-difference-and-nonrepresentability61440",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "old-saved-expected-is-overwritten-value-not-original",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "public-TensorSpec-exact-output-init-reproduces-golden-overwrite-alias",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "honest-native-FAILED-exit1",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "exact-unchanged-strict-old-assert-firstcause",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "both-native-runtime-calls-returned-no-runtime-exception",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "exact-GO-device0-fixed64MiB",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "unchanged-authorized-helper",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "both-native-callable-images-freed",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "raw-one-lock0-release",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "all-own-recorded-PID-births-absent",
+      "pass": true,
+      "detail": []
+    },
+    {
+      "check": "global-post-native-queue0-empty",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "all-runtime-pins-unchanged",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "current45b3e-and-live-fba8-unchanged",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "original140compiled-inputs-unchanged",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "all-original-proposed-old-config-sources-unchanged",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "frozen-correction237-unchanged",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "previous-failed-native194-unchanged",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "post-terminal-resource-floors",
+      "pass": true,
+      "detail": {
+        "HOST": 1722876919808,
+        "DISK": 8342161326080,
+        "SHM": 1079343157248
+      }
+    }
+  ],
+  "passed": 31,
+  "unmet": [],
+  "numeric": [
+    {
+      "role": "candidate",
+      "actual_vs_original": {
+        "bit_exact": true,
+        "different_values": 0,
+        "max_abs": 0.0,
+        "first_mismatch": null,
+        "per_row": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "saved_expected_vs_original": {
+        "bit_exact": true,
+        "different_values": 0,
+        "max_abs": 0.0,
+        "first_mismatch": null,
+        "per_row": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "actual_vs_saved_expected": {
+        "bit_exact": true,
+        "different_values": 0,
+        "max_abs": 0.0,
+        "first_mismatch": null,
+        "per_row": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "actual_nonrepresentable": 0,
+      "actual_vs_own_CPU_golden": {
+        "bit_exact": true,
+        "different_values": 0,
+        "max_abs": 0.0,
+        "first_mismatch": null,
+        "per_row": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "role": "old_control",
+      "actual_vs_original": {
+        "bit_exact": false,
+        "different_values": 61440,
+        "max_abs": 0.00390625,
+        "first_mismatch": {
+          "flat_index": 0,
+          "actual": 1.001953125,
+          "expected_original": 1.0,
+          "actual_bits": 1065369600,
+          "expected_bits": 1065353216
+        },
+        "per_row": [
+          15360,
+          20480,
+          20480,
+          5120,
+          0
+        ]
+      },
+      "saved_expected_vs_original": {
+        "bit_exact": false,
+        "different_values": 61440,
+        "max_abs": 0.00390625,
+        "first_mismatch": {
+          "flat_index": 0,
+          "actual": 1.001953125,
+          "expected_original": 1.0,
+          "actual_bits": 1065369600,
+          "expected_bits": 1065353216
+        },
+        "per_row": [
+          15360,
+          20480,
+          20480,
+          5120,
+          0
+        ]
+      },
+      "actual_vs_saved_expected": {
+        "bit_exact": true,
+        "different_values": 0,
+        "max_abs": 0.0,
+        "first_mismatch": null,
+        "per_row": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "actual_nonrepresentable": 61440,
+      "actual_vs_own_CPU_golden": {
+        "bit_exact": true,
+        "different_values": 0,
+        "max_abs": 0.0,
+        "first_mismatch": null,
+        "per_row": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    }
+  ],
+  "output_alias_CPU_proof": {
+    "same_data_ptr": true,
+    "pointer": 4896871284736,
+    "original_write_seen_by_both": true,
+    "dispatch_write_overwrites_golden": true,
+    "native_pointer_capture": false
+  },
+  "fixture_provenance": "reconstructed exactly from frozen fixtures source; native did not save input snapshots",
+  "separate_fit_CPU_task": "task_20261108_021440_342919127289 terminal exit1 syntax error per Root; unrelated to own PID tree/NPU",
+  "known_own_births": 9,
+  "own_pid": 3440206,
+  "own_birth": "107542237"
+}

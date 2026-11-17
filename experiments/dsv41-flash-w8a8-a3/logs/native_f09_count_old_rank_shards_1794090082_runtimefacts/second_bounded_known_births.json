@@ -1,0 +1,89 @@
+{
+  "observed_epoch": 1794090335.8398094,
+  "scope": "second bounded observation; phase is actual at read, not claimed pre-prepare",
+  "known_identities": [],
+  "ready_log_count": 16,
+  "ready_with_observed_stat": [
+    {
+      "pid": 1741596,
+      "device": 1,
+      "current": null
+    },
+    {
+      "pid": 1741594,
+      "device": 0,
+      "current": null
+    },
+    {
+      "pid": 1741625,
+      "device": 3,
+      "current": null
+    },
+    {
+      "pid": 1741608,
+      "device": 2,
+      "current": null
+    },
+    {
+      "pid": 1741633,
+      "device": 4,
+      "current": null
+    },
+    {
+      "pid": 1741640,
+      "device": 5,
+      "current": null
+    },
+    {
+      "pid": 1741656,
+      "device": 7,
+      "current": null
+    },
+    {
+      "pid": 1741647,
+      "device": 6,
+      "current": null
+    },
+    {
+      "pid": 1741672,
+      "device": 8,
+      "current": null
+    },
+    {
+      "pid": 1741680,
+      "device": 9,
+      "current": null
+    },
+    {
+      "pid": 1741692,
+      "device": 11,
+      "current": null
+    },
+    {
+      "pid": 1741687,
+      "device": 10,
+      "current": null
+    },
+    {
+      "pid": 1741700,
+      "device": 12,
+      "current": null
+    },
+    {
+      "pid": 1741714,
+      "device": 13,
+      "current": null
+    },
+    {
+      "pid": 1741729,
+      "device": 15,
+      "current": null
+    },
+    {
+      "pid": 1741721,
+      "device": 14,
+      "current": null
+    }
+  ],
+  "complete_history_claim": false
+}

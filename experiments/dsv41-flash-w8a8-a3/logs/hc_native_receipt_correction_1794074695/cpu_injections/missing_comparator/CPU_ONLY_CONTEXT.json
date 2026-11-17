@@ -1,0 +1,6 @@
+{
+  "scenario": "missing_comparator",
+  "NPU": false,
+  "real_run_called": false,
+  "note": "ONBOARD config is inert; run callable is an explicit CPU fake."
+}

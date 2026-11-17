@@ -1,0 +1,9 @@
+{
+  "epoch": 1794017475,
+  "decode_all24": "PASS task100351_126889319863",
+  "stream_native": "PASS task100416_12713951128",
+  "metadata_dualABI": "PASS task100416_12713947306",
+  "continuation": "RUNNING task100912_177992928812",
+  "signature_dual40": "PENDING task101019_178466616543",
+  "fullweights": "HELD"
+}

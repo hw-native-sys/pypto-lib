@@ -1,0 +1,10 @@
+{
+  "artifact_count": 46,
+  "artifacts_sha256": "4afa706f0e44385039eecb16e485211efe3593eb10098311691ddadbe2b4b563",
+  "audit_results_sha256": "60f0c73c35afc3a2bd05d2fda95e4758295d66a79ba8910aa1f7472f5669bb23",
+  "epoch": 1794072829,
+  "first_error": "ValueError('StackedDeviceTensor only supports whole-shard slicing on the leading dim; got partial slice 0 on axis 1 (shard shape (1, 128, 128))')",
+  "normal_close": true,
+  "source45": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "state": "FAILED_FINAL_PARK"
+}

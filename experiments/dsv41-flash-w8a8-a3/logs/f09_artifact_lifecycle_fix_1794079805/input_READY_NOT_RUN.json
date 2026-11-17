@@ -1,0 +1,13 @@
+{
+  "status": "READY_NOT_RUN",
+  "CPU_submitted": false,
+  "outstanding_tasks": [],
+  "reason": "Root resource/PID-audit hold; no new noncase CPU untilRoot/fitrelease",
+  "live_M02_unchanged": true,
+  "kernel45_expected_sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "adapter_sha256": "6a2d8cb9fbddcee72c27a0892ad2730b571167f323af5a45cd9abebdab271b40",
+  "lifecycle_sha256": "1cc9c0b792b93a3c9d83b3461fd327d21f0bcd4872c289f76f3ab61e70c14a0d",
+  "test_sha256": "a1c835ea8337b48cd0e0adec261a8fabddccce9032a8dddefbaa91326a3cfcee",
+  "final_seal": false,
+  "writers_parked_pending_release": true
+}

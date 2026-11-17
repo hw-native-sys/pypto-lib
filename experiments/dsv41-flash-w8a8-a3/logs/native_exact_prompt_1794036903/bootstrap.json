@@ -1,0 +1,8 @@
+{
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "source45_verified": true,
+  "only_generate_changed": true,
+  "other44_exact_old": true,
+  "start_epoch": 1794036903,
+  "copy_scope": "45 source files; unnecessary partial generated build copy discarded before checks"
+}

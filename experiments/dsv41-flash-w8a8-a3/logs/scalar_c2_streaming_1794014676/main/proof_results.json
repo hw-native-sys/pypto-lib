@@ -1,0 +1,59 @@
+{
+  "mode": "ONBOARD",
+  "platform": "a2a3",
+  "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/scalar_c2_streaming_1794014676/main/scalar_native_build/_jit_entry_20261107_092927_5xmishxz",
+  "records": [
+    {
+      "step": 0,
+      "state_sum": 2160.0,
+      "handle_identity": 281461551652560
+    },
+    {
+      "step": 1,
+      "state_sum": 4704.0,
+      "handle_identity": 281461551652560
+    },
+    {
+      "step": 2,
+      "state_sum": 7888.0,
+      "handle_identity": 281461551652560
+    }
+  ],
+  "stats": {
+    "resident_upload_bytes": 512,
+    "resident_allocations": 1,
+    "dispatches": 3,
+    "state_transport": "shared-host H2D/D2H each dispatch",
+    "protocol_domains": "fresh each dispatch"
+  },
+  "weight_payload_bytes": 512,
+  "mutable_per_call_host_io_bytes": 1024,
+  "weight_change_after_upload_ignored": true,
+  "transfer_counter_semantics": "Requested alloc_stacked_tensor payload bytes, not measured bus traffic or bandwidth",
+  "scope": "tiny2rank synthetic exact driver PreparedDispatch; no full model/residency fit claim",
+  "hbm": {
+    "0": {
+      "peak_mb": 4580,
+      "samples": 4
+    },
+    "1": {
+      "peak_mb": 4297,
+      "samples": 4
+    }
+  },
+  "hbm_samples_mb": {
+    "0": [
+      3143,
+      3143,
+      3143,
+      4580
+    ],
+    "1": [
+      2871,
+      2871,
+      2871,
+      4297
+    ]
+  },
+  "hbm_limit": "Absolute npu-smi samples; tiny512B residency delta may be below sampling resolution. No full-model memory-fit extrapolation."
+}

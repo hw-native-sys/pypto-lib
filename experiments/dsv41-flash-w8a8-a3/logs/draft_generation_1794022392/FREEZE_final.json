@@ -1,0 +1,14 @@
+{
+  "epoch": 1794024303,
+  "status": "PARKED;CPU self-evidence, independent acceptance pending",
+  "artifacts_manifest_sha256": "445c147634e2916c1c7bb8b197cfd0b6572bf1b0a0f349cb2a51410301e91672",
+  "files": 135,
+  "source45_manifest_sha256": "ab1ced6d6ecbf9887297458703ba9b74e2c9b8bc57608370b4c2e0310e027e37",
+  "root45_equal": true,
+  "own_jobs": "all ended;CPU only",
+  "workers": "checkpoint_pipeline FINAL/PARK",
+  "NPU": 0,
+  "payload_reads": 0,
+  "root_source_edits": 0,
+  "large_allocations": 0
+}

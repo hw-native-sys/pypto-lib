@@ -1,0 +1,1 @@
+task-submit --timeout 1200 --device auto --device-num 1 --max-time 600 --run 'bash experiments/dsv41-flash-w8a8-a3/logs/native_hc_durable_receipts_1794075226/run_native_clone.sh'

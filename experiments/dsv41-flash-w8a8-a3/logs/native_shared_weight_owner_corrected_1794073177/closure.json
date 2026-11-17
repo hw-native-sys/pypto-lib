@@ -1,0 +1,21 @@
+{
+  "CPU_audit_task": "task_20261108_014142_334740428347",
+  "CPU_birth_absent": true,
+  "CPU_exit": 0,
+  "audit_checks_failed": 0,
+  "audit_checks_passed": 33,
+  "audit_sha256": "f15fc0d845e68535a6fa879225eb4f651f9e9f35b96cdebd49b5d483406bb9c9",
+  "canonical_frees": 4,
+  "end_epoch": 1794073467,
+  "minimum_observed_free": 59884040192,
+  "native_exit": 0,
+  "native_task": "task_20261108_013957_334252213408",
+  "normal_close": true,
+  "old_protected_units_unchanged": true,
+  "raw_two_locks_released": true,
+  "recorded_native_case_births_absent": 4,
+  "result_sha256": "d0ba5c332464f84bc9bb9b21d185c851487568edcea7c188efaf9c197fd3c3c0",
+  "scope": "tiny2 exact proposed class + explicit toy admission, NOT fullmodel",
+  "source45": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "state": "PASS_FINAL_PARK"
+}

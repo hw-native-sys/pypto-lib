@@ -1,0 +1,75 @@
+{
+  "status": "PASS_EXTERNAL_ACTUAL_EMPTY_RESERVATION_AUDIT",
+  "epoch": 1794042468.1124587,
+  "internal_status": "EMPTY_RESERVATIONS_ONLY",
+  "external_verdict": {
+    "external_verdict": "PASS_EMPTY_RESERVATION_WITH_FINAL_AFTER_FREE_GATE",
+    "internal_status": "EMPTY_RESERVATIONS_ONLY",
+    "validator_sha256": "bac7748403064849ea05ee4c450061425d7e8194c738d9310696b4213fc32523",
+    "calibration_sha256": "3bc7291e174cccc8a8f0272d9786716a78bccb2ae8336c33fdfd4e10a16927f0",
+    "probe_sha256": "c4b62d80662c62058f4ba4a237e606e745b07d8506eb45c0e9ccb098aeec953e",
+    "owner_handle_counts": [
+      16,
+      912,
+      0
+    ],
+    "rank_static_bytes": 39624816576,
+    "largest_bytes": 11324620800,
+    "final_after_free_compared_to": [
+      "calibration A",
+      "aggregate prewarm"
+    ],
+    "scope": "empty reservations only; full40 firsttouch/upload/forward peaks remain null"
+  },
+  "protected_pins_unchanged": true,
+  "calibration_age_at_allocated_preflight": 1232.2568290233612,
+  "ordered_actual_device_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "actual_handle_counts": [
+    16,
+    912,
+    0
+  ],
+  "all_recorded_process_identities_absent": true,
+  "recorded_process_identity_count": 50,
+  "lock_wrapper_absent": true,
+  "native_ready_and_registration_events": 48,
+  "queue_snapshot_device_occupancy": 0,
+  "observed_public_memory": {
+    "largest_prewarm_min_free": 59884064768,
+    "largest_after_alloc_min_free": 48557408256,
+    "aggregate_prewarm_min_free": 59885076480,
+    "aggregate_after_last_alloc_min_free": 20251516928,
+    "aggregate_after_last_alloc_max_committed": 45077665637,
+    "final_prewarm_min_free": 59884154880,
+    "final_after_free_min_free": 59884154880
+  },
+  "resource_samples": 51,
+  "resource_minima": {
+    "host_available_bytes": 1719528116224,
+    "disk_free_bytes": 9526328688640,
+    "shm_free_bytes": 1079341514752
+  },
+  "unknown_peaks": {
+    "full40_physical_firsttouch_peak_bytes": null,
+    "full40_upload_peak_bytes": null,
+    "full40_forward_peak_bytes": null
+  },
+  "claim": "EMPTY reservation/contiguous allocation only; no initialized weight touch/upload/forward/fullfit/text"
+}

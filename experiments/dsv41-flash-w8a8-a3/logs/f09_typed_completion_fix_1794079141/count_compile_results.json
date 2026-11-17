@@ -1,0 +1,22 @@
+{
+  "status": "PASS_ZERO_SAMPLE_COUNT_SIGNATURE_ONLY",
+  "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_typed_completion_fix_1794079141/count_signature_build",
+  "elapsed_seconds": 4.432431697845459,
+  "source_manifest_sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "metadata_sha256": "189381005f808c601c93286c4ef8022e54e160f99a2c144d527608df90dd9fb9",
+  "compiled_files_manifest_sha256": "17cf1cc77c5262aeb55cdff780f5e285e655afa4a7a52b327db17f236161bc1c",
+  "compiled_files": 94,
+  "mode": "ExecutionMode.ONBOARD",
+  "ring_heap": [
+    0,
+    0,
+    4294967296,
+    0
+  ],
+  "runtime_library_sha256": "24434f8879030ef1b1f31e5fc2ecce683e392d4f1baeb5bcee852fb183976e5c",
+  "samples": 0,
+  "forbidden_calls": [],
+  "fullentry_or_oldprobe_compiles": 0,
+  "native": false,
+  "runtime_deps_graph": "NOT_CAPTURED; generatedorchestration/sourcepinned only"
+}

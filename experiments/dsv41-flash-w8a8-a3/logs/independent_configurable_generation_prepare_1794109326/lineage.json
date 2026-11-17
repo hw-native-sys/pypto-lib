@@ -1,0 +1,49 @@
+{
+  "schema": "source-only-configurable-audit-lineage/1",
+  "references": [
+    {
+      "path": ".claude/CLAUDE.md",
+      "sha256": "6a8703419d9105c130365ca8b467897d3ec013a7801a17a69d1b537883923fb8"
+    },
+    {
+      "path": ".claude/rules/models.md",
+      "sha256": "3fb46845f579a4a4b75de4c35f6e48ee30b25a5bd198f06e0efecedf17a9dc99"
+    },
+    {
+      "path": ".claude/rules/problem-handling.md",
+      "sha256": "0cc110ae0a73c7ae0626262f2e2cbbc130c0de4fdd0a9756707c036d2836688f"
+    },
+    {
+      "path": "experiments/dsv41-flash-w8a8-a3/goal.md",
+      "sha256": "af7236d4f68bbf9a6a49c866b4509e828f19b7197104d8cae1409effb452c78e"
+    },
+    {
+      "path": "experiments/dsv41-flash-w8a8-a3/logs/configurable_parallel_1794108101/PLAN.md",
+      "sha256": "d57c97e8a2d316710adfc90090814272aa57176fba842c267db2b9a4b82ed916"
+    },
+    {
+      "path": "experiments/dsv41-flash-w8a8-a3/logs/configurable_topology_resource_review_1794108116/SOURCE_REVIEW.md",
+      "sha256": "3e4743144b5a6af04ab21bbaf22def69638d8d680266d9dfa37805f9cbddbc4f"
+    },
+    {
+      "path": "experiments/dsv41-flash-w8a8-a3/logs/configurable_topology_resource_review_1794108116/FREEZE.json",
+      "sha256": "2b9dea2e6aea0e31128ae0b88ffb7d84cad88c7c10a09f67baf7bdb14cb2c5fb"
+    }
+  ],
+  "historical_input_copies": [
+    {
+      "path": "input_sourceB_audit.py",
+      "sha256": "b9683fa7ecf759a729e8d3f062ee487fa05c4e69734bcc388092eaea1b1fbc3a"
+    },
+    {
+      "path": "input_sourceB_shared_delta.py",
+      "sha256": "a09f63dd0d9a4fe27e0bdcd6ee5398fb2f596e646eac2dbd5f41980eb4fffdcb"
+    }
+  ],
+  "historical_only": "SourceB inputs cannot be executed or accepted as new producer evidence",
+  "live_source_observation": "Unfrozen Main source read only for proposed topology/rank_mapping/FLOAT32 fingerprint contract; no live source candidate bound or frozen here",
+  "Main_proposed_operation": "configurable-shared-real40-noEngram-greedy-N3",
+  "Main_proposed_authorization_schema": "configurable-real-generation-authorization/1",
+  "all_future_concrete_pins": "REQUIRED",
+  "validation_jobs": []
+}

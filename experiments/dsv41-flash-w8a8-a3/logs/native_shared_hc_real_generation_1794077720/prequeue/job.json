@@ -1,0 +1,11 @@
+{
+  "job": "task_20261108_025637_354541924212",
+  "device_mode": "--no-device",
+  "max_time_seconds": 600,
+  "terminal": "COMPLETE0",
+  "scope": "PREPARATION_ONLY_FRESH_PREQUEUE",
+  "output": "prequeue/PREQUEUE.json",
+  "native_jobs": 0,
+  "actual_grants": 0,
+  "checkpoint_tensor_payload_bytes": 0
+}

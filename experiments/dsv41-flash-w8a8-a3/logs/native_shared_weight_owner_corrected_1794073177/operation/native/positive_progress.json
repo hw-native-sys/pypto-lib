@@ -1,0 +1,33 @@
+[
+  {
+    "phase": "prefill",
+    "actual_state_unique": [
+      6.0
+    ],
+    "expected": 6
+  },
+  {
+    "phase": "decode",
+    "input": 1,
+    "actual_state_unique": [
+      12.0
+    ],
+    "expected": 12
+  },
+  {
+    "phase": "decode",
+    "input": 2,
+    "actual_state_unique": [
+      19.0
+    ],
+    "expected": 19
+  },
+  {
+    "phase": "decode",
+    "input": 3,
+    "actual_state_unique": [
+      27.0
+    ],
+    "expected": 27
+  }
+]

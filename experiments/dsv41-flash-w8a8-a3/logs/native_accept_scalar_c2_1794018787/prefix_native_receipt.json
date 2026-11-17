@@ -1,0 +1,57 @@
+{
+  "task_id": "task_20261107_111437_25465236862",
+  "native_terminal_by_rank": {
+    "0": [
+      0
+    ],
+    "1": [
+      0
+    ],
+    "2": [
+      0
+    ],
+    "3": [
+      0
+    ],
+    "4": [
+      0
+    ],
+    "5": [
+      0
+    ],
+    "6": [
+      0
+    ],
+    "7": [
+      0
+    ],
+    "8": [
+      0
+    ],
+    "9": [
+      0
+    ],
+    "10": [
+      0
+    ],
+    "11": [
+      0
+    ],
+    "12": [
+      0
+    ],
+    "13": [
+      0
+    ],
+    "14": [
+      0
+    ],
+    "15": [
+      0
+    ]
+  },
+  "all16_terminal_outcome0": true,
+  "public_after_dispatch_copyback_receipt_exists": true,
+  "numerical_status": "PENDING",
+  "scope": "native terminal/copyback only; no numerical or continuation acceptance yet"
+}

@@ -1,0 +1,11 @@
+{
+  "all_own_CPU_children_ended": true,
+  "applied": false,
+  "artifact_count": 68,
+  "artifacts_sha256": "f4813c9efc4eb741fc2f48e1ef8d3719da632dd99ef19559d35d639d4637dc48",
+  "candidate_runner_sha256": "133fac01012a5197a66a3fa2260e363c95e45b25a4eb61d808b24f39e000a651",
+  "epoch": 1794079711,
+  "patch_sha256": "465e302d811e85b81c5e6f7fe5bf343535834e6c4f99921022ff0cef8c82be67",
+  "policy_approved": false,
+  "state": "FINAL_PARK_CANDIDATE_ONLY"
+}

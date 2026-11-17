@@ -1,0 +1,34 @@
+{
+  "schema": "agent-work-record/1",
+  "owner": "/root/reviewer_f09",
+  "unit": "independent_configurable_native_prepare_1794109406",
+  "status": "FINAL_CPU_READY_PARK",
+  "start_utc": "2026-11-08T03:43:26+00:00",
+  "end_utc": "2026-11-08T04:23:02.870827+00:00",
+  "elapsed_seconds": 2376.870827,
+  "measurement": "wall clock for this exclusive owner unit; includes source work, own scaffolding correction and queue waits; earlier unmetered source reconnaissance excluded",
+  "shared_writes": 0,
+  "product_writes": 0,
+  "protected_old_artifact_writes": 0,
+  "NPU_seconds": 0,
+  "NPU_jobs": 0,
+  "CPU_jobs": 8,
+  "CPU_jobs_note": "queued preparation attempts including own failures; no exact whole-process CPU-time sum claimed",
+  "zero_sample_compile_seconds": [
+    {
+      "label": "ep_actual_capacity1",
+      "seconds": 2.6615121364593506
+    },
+    {
+      "label": "tp_output_groups",
+      "seconds": 0.8471405506134033
+    },
+    {
+      "label": "tp_score_tail",
+      "seconds": 0.5485339164733887
+    }
+  ],
+  "unique_row_import_to_ROOT_ONLY": true,
+  "runtimefacts_additive": false,
+  "jobs_active_at_final": 0
+}

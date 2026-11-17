@@ -1,0 +1,7 @@
+{
+  "two_own_exploratory_read_path_errors": [
+    "models/deepseek_v4_1_flash/generate.py absent; actualsource45 correctly identifies deepseek_v4_1_flash_a3_w8a8",
+    "HC_MATH_LINEAGE.json absent; actual frozen file metadata_lineage.json read"
+  ],
+  "tests_or_model_failure": false
+}

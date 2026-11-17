@@ -1,0 +1,6 @@
+{
+  "jobs": ["task_20261107_154503_99005219350"],
+  "observed_completion": "completed (exit=0)",
+  "candidate_sha256": "1542c1848227a0326655dc809ede1c71bca1e3d71d67f77a11e604741b924865",
+  "scope": "CPU tiny mocked post-allocation guard validation only"
+}

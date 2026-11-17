@@ -1,0 +1,22 @@
+{
+  "schema": "hc-boundary-native-micro/1",
+  "root_go_id": "observer-20261108-hc-bf16-native-micro",
+  "created_epoch": 1794073902.277546,
+  "created_after_allocation": true,
+  "actual_ordered_device_ids": [
+    0
+  ],
+  "ring_heap": 67108864,
+  "phase_calls": [
+    "candidate",
+    "old_control"
+  ],
+  "T": 5,
+  "H": 4,
+  "D": 5120,
+  "max_native_cases": 1,
+  "no_model_or_weights": true,
+  "source45": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "probe_sha256": "c6899e05f3574ddb25d51264a0f37f7ab9a6cdebde4b5e32b90de830e54098f6",
+  "compiled_pins_sha256": "362195d79e7d86e0bada585b655b67f9cf3b769a061e40c55ca13853b991a145"
+}

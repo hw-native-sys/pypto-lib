@@ -1,0 +1,480 @@
+{
+  "resources": [
+    "tiny-empty"
+  ],
+  "allocations": [
+    {
+      "rank": 0,
+      "name": "tiny-empty",
+      "bytes": 1048576,
+      "before": {
+        "rank": 0,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936
+      },
+      "after": {
+        "rank": 0,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584
+      }
+    },
+    {
+      "rank": 1,
+      "name": "tiny-empty",
+      "bytes": 1048576,
+      "before": {
+        "rank": 1,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936
+      },
+      "after": {
+        "rank": 1,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584
+      }
+    },
+    {
+      "rank": 2,
+      "name": "tiny-empty",
+      "bytes": 1048576,
+      "before": {
+        "rank": 2,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936
+      },
+      "after": {
+        "rank": 2,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584
+      }
+    },
+    {
+      "rank": 3,
+      "name": "tiny-empty",
+      "bytes": 1048576,
+      "before": {
+        "rank": 3,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936
+      },
+      "after": {
+        "rank": 3,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584
+      }
+    },
+    {
+      "rank": 4,
+      "name": "tiny-empty",
+      "bytes": 1048576,
+      "before": {
+        "rank": 4,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936
+      },
+      "after": {
+        "rank": 4,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584
+      }
+    },
+    {
+      "rank": 5,
+      "name": "tiny-empty",
+      "bytes": 1048576,
+      "before": {
+        "rank": 5,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936
+      },
+      "after": {
+        "rank": 5,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584
+      }
+    },
+    {
+      "rank": 6,
+      "name": "tiny-empty",
+      "bytes": 1048576,
+      "before": {
+        "rank": 6,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936
+      },
+      "after": {
+        "rank": 6,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584
+      }
+    },
+    {
+      "rank": 7,
+      "name": "tiny-empty",
+      "bytes": 1048576,
+      "before": {
+        "rank": 7,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936
+      },
+      "after": {
+        "rank": 7,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584
+      }
+    },
+    {
+      "rank": 8,
+      "name": "tiny-empty",
+      "bytes": 1048576,
+      "before": {
+        "rank": 8,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936
+      },
+      "after": {
+        "rank": 8,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584
+      }
+    },
+    {
+      "rank": 9,
+      "name": "tiny-empty",
+      "bytes": 1048576,
+      "before": {
+        "rank": 9,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936
+      },
+      "after": {
+        "rank": 9,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584
+      }
+    },
+    {
+      "rank": 10,
+      "name": "tiny-empty",
+      "bytes": 1048576,
+      "before": {
+        "rank": 10,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936
+      },
+      "after": {
+        "rank": 10,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584
+      }
+    },
+    {
+      "rank": 11,
+      "name": "tiny-empty",
+      "bytes": 1048576,
+      "before": {
+        "rank": 11,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936
+      },
+      "after": {
+        "rank": 11,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584
+      }
+    },
+    {
+      "rank": 12,
+      "name": "tiny-empty",
+      "bytes": 1048576,
+      "before": {
+        "rank": 12,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936
+      },
+      "after": {
+        "rank": 12,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584
+      }
+    },
+    {
+      "rank": 13,
+      "name": "tiny-empty",
+      "bytes": 1048576,
+      "before": {
+        "rank": 13,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936
+      },
+      "after": {
+        "rank": 13,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584
+      }
+    },
+    {
+      "rank": 14,
+      "name": "tiny-empty",
+      "bytes": 1048576,
+      "before": {
+        "rank": 14,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936
+      },
+      "after": {
+        "rank": 14,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584
+      }
+    },
+    {
+      "rank": 15,
+      "name": "tiny-empty",
+      "bytes": 1048576,
+      "before": {
+        "rank": 15,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936
+      },
+      "after": {
+        "rank": 15,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584
+      }
+    }
+  ],
+  "cleanup_errors": [],
+  "prewarm": [
+    {
+      "rank": 0,
+      "free": 85630910464,
+      "total": 107374182400,
+      "committed": 21743271936
+    },
+    {
+      "rank": 1,
+      "free": 85630910464,
+      "total": 107374182400,
+      "committed": 21743271936
+    },
+    {
+      "rank": 2,
+      "free": 85630910464,
+      "total": 107374182400,
+      "committed": 21743271936
+    },
+    {
+      "rank": 3,
+      "free": 85630910464,
+      "total": 107374182400,
+      "committed": 21743271936
+    },
+    {
+      "rank": 4,
+      "free": 85630910464,
+      "total": 107374182400,
+      "committed": 21743271936
+    },
+    {
+      "rank": 5,
+      "free": 85630910464,
+      "total": 107374182400,
+      "committed": 21743271936
+    },
+    {
+      "rank": 6,
+      "free": 85630910464,
+      "total": 107374182400,
+      "committed": 21743271936
+    },
+    {
+      "rank": 7,
+      "free": 85630910464,
+      "total": 107374182400,
+      "committed": 21743271936
+    },
+    {
+      "rank": 8,
+      "free": 85630910464,
+      "total": 107374182400,
+      "committed": 21743271936
+    },
+    {
+      "rank": 9,
+      "free": 85630910464,
+      "total": 107374182400,
+      "committed": 21743271936
+    },
+    {
+      "rank": 10,
+      "free": 85630910464,
+      "total": 107374182400,
+      "committed": 21743271936
+    },
+    {
+      "rank": 11,
+      "free": 85630910464,
+      "total": 107374182400,
+      "committed": 21743271936
+    },
+    {
+      "rank": 12,
+      "free": 85630910464,
+      "total": 107374182400,
+      "committed": 21743271936
+    },
+    {
+      "rank": 13,
+      "free": 85630910464,
+      "total": 107374182400,
+      "committed": 21743271936
+    },
+    {
+      "rank": 14,
+      "free": 85630910464,
+      "total": 107374182400,
+      "committed": 21743271936
+    },
+    {
+      "rank": 15,
+      "free": 85630910464,
+      "total": 107374182400,
+      "committed": 21743271936
+    }
+  ],
+  "status": "EMPTY_ALLOCATIONS_PASS",
+  "compute_dispatches": 0,
+  "payload_bytes": 0,
+  "after_free_before_close": [
+    {
+      "rank": 0,
+      "free": 85630779392,
+      "total": 107374182400,
+      "committed": 21743403008
+    },
+    {
+      "rank": 1,
+      "free": 85630779392,
+      "total": 107374182400,
+      "committed": 21743403008
+    },
+    {
+      "rank": 2,
+      "free": 85630779392,
+      "total": 107374182400,
+      "committed": 21743403008
+    },
+    {
+      "rank": 3,
+      "free": 85630779392,
+      "total": 107374182400,
+      "committed": 21743403008
+    },
+    {
+      "rank": 4,
+      "free": 85630779392,
+      "total": 107374182400,
+      "committed": 21743403008
+    },
+    {
+      "rank": 5,
+      "free": 85630779392,
+      "total": 107374182400,
+      "committed": 21743403008
+    },
+    {
+      "rank": 6,
+      "free": 85630779392,
+      "total": 107374182400,
+      "committed": 21743403008
+    },
+    {
+      "rank": 7,
+      "free": 85630779392,
+      "total": 107374182400,
+      "committed": 21743403008
+    },
+    {
+      "rank": 8,
+      "free": 85630779392,
+      "total": 107374182400,
+      "committed": 21743403008
+    },
+    {
+      "rank": 9,
+      "free": 85630779392,
+      "total": 107374182400,
+      "committed": 21743403008
+    },
+    {
+      "rank": 10,
+      "free": 85630779392,
+      "total": 107374182400,
+      "committed": 21743403008
+    },
+    {
+      "rank": 11,
+      "free": 85630779392,
+      "total": 107374182400,
+      "committed": 21743403008
+    },
+    {
+      "rank": 12,
+      "free": 85630779392,
+      "total": 107374182400,
+      "committed": 21743403008
+    },
+    {
+      "rank": 13,
+      "free": 85630779392,
+      "total": 107374182400,
+      "committed": 21743403008
+    },
+    {
+      "rank": 14,
+      "free": 85630779392,
+      "total": 107374182400,
+      "committed": 21743403008
+    },
+    {
+      "rank": 15,
+      "free": 85630779392,
+      "total": 107374182400,
+      "committed": 21743403008
+    }
+  ],
+  "owner_closed": true
+}

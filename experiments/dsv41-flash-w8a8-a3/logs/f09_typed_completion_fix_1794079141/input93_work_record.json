@@ -1,0 +1,16 @@
+{
+  "record_id": "main-f09-zero-active-reviewfix-1794077743",
+  "role": "main-agent",
+  "start_epoch": 1794077743,
+  "end_epoch": 1794078838,
+  "elapsed_seconds": 1095,
+  "shared_writes": 0,
+  "imported_shared_ledger": false,
+  "workers": [],
+  "task_ids": [
+    "task_20261108_030750_36553178537",
+    "task_20261108_030833_371166424137",
+    "task_20261108_030941_378341024182"
+  ],
+  "scope": "Artifact-only ownzeroactive/control/reference/retention/countnegative fixes+onefocusedCPU suite; no compile/NPU/payload/fixture/grant"
+}

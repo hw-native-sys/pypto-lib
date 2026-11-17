@@ -1,0 +1,121 @@
+{
+  "ranks": [
+    {
+      "rank": 0,
+      "committed_bytes": 11916731557,
+      "free_bytes": 53416534016,
+      "total_bytes": 65787658240
+    },
+    {
+      "rank": 1,
+      "committed_bytes": 11916731557,
+      "free_bytes": 53721038848,
+      "total_bytes": 65796046848
+    },
+    {
+      "rank": 2,
+      "committed_bytes": 11916731557,
+      "free_bytes": 53434200064,
+      "total_bytes": 65787658240
+    },
+    {
+      "rank": 3,
+      "committed_bytes": 11916731557,
+      "free_bytes": 53707198464,
+      "total_bytes": 65796046848
+    },
+    {
+      "rank": 4,
+      "committed_bytes": 11916731557,
+      "free_bytes": 53433499648,
+      "total_bytes": 65787658240
+    },
+    {
+      "rank": 5,
+      "committed_bytes": 11916731557,
+      "free_bytes": 53707374592,
+      "total_bytes": 65796046848
+    },
+    {
+      "rank": 6,
+      "committed_bytes": 11916731557,
+      "free_bytes": 53434687488,
+      "total_bytes": 65787658240
+    },
+    {
+      "rank": 7,
+      "committed_bytes": 11916731557,
+      "free_bytes": 53707231232,
+      "total_bytes": 65796046848
+    },
+    {
+      "rank": 8,
+      "committed_bytes": 11916731557,
+      "free_bytes": 53423419392,
+      "total_bytes": 65787658240
+    },
+    {
+      "rank": 9,
+      "committed_bytes": 11916731557,
+      "free_bytes": 53720571904,
+      "total_bytes": 65796046848
+    },
+    {
+      "rank": 10,
+      "committed_bytes": 11916731557,
+      "free_bytes": 53432512512,
+      "total_bytes": 65787658240
+    },
+    {
+      "rank": 11,
+      "committed_bytes": 11916731557,
+      "free_bytes": 53708382208,
+      "total_bytes": 65796046848
+    },
+    {
+      "rank": 12,
+      "committed_bytes": 11916731557,
+      "free_bytes": 53422866432,
+      "total_bytes": 65787658240
+    },
+    {
+      "rank": 13,
+      "committed_bytes": 11916731557,
+      "free_bytes": 53722427392,
+      "total_bytes": 65796046848
+    },
+    {
+      "rank": 14,
+      "committed_bytes": 11916731557,
+      "free_bytes": 53433921536,
+      "total_bytes": 65787658240
+    },
+    {
+      "rank": 15,
+      "committed_bytes": 11916731557,
+      "free_bytes": 53710233600,
+      "total_bytes": 65796046848
+    }
+  ],
+  "bank_grants": [
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168
+  ],
+  "bank_grants_provenance": "read-only private startup metadata; not a public API guarantee",
+  "counter_scope": "public committed excludes HCCL/VMM; free/total is device wide",
+  "maxrss_kib": 140205984
+}

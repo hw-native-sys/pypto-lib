@@ -1,0 +1,66 @@
+{
+  "schema": "Root-F09-active-S/1",
+  "approved": true,
+  "operation": "bounded-synthetic-active-S-B2-3call",
+  "stage": "capture",
+  "kind": "ACTUAL_F09_NATIVE_CAPTURE",
+  "source_manifest_sha256": "8153c7f040bef51900a6e6c9ff27b018279b7503f31d50ec5488457e49770b28",
+  "scenario_sha256": "c7b6ab942f5ea17758389aa5a53dafbb1de79e68dbb6f41c4614d66dd6b6dbb1",
+  "route_sha256": "9057c519fb056e1ca48cc736044748d79db9a4c03c88a2d0c245870a7e120faf",
+  "lifecycle_root_receipt_sha256": "775dc927e7b77bf372582495d31a907b6bea96152fc47422f75a68e9f6db0825",
+  "execution_mode": "ONBOARD",
+  "minimum_bytes": {
+    "HOST": 322122547200,
+    "DISK": 17179869184,
+    "SHM": 34359738368
+  },
+  "public_hbm_reserve": 10157899716,
+  "compiled_source_manifest_sha256": "8153c7f040bef51900a6e6c9ff27b018279b7503f31d50ec5488457e49770b28",
+  "compiled_file_manifest": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/decode_capacity2_files.json",
+  "compiled_file_manifest_sha256": "510dd3c7b72a1c36291ff8ff0b167ce0ac8204d2cd6a957eae0a8ea6641f8642",
+  "compiled_metadata_sha256": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770",
+  "requested_profile": "decode_capacity2",
+  "root_go_id": "observer-20261108-f09-c2-active-write-threecall-native16",
+  "delegation_sha256": "36354385c9b9c981cc56dbaeb89d8e22e6f2d12d2f1a3122ada5c241358f5fa0",
+  "prepared_case_pins_sha256": "7a2038e79d439d490cdc380dfbd9170a935914c222038648256882a35d9417b2",
+  "communication_epoch_policy": "fresh domains each dispatch; unchanged FFN layer+1 within call",
+  "scenario_call_indices": [
+    0,
+    1,
+    2
+  ],
+  "scenario_logical_routes_per_FFN_reference": [
+    192,
+    96,
+    192
+  ],
+  "ring_heap": [
+    0,
+    0,
+    4294967296,
+    0
+  ],
+  "expert_layers": 1,
+  "scope": "FULLENTRY E1 SYNTHETIC THREECALL CAPTURE or separately admitted OFFLINE171 ONLY; no count-controls/modelapplication/realweights authority",
+  "device_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "expires_at_epoch": 1794096797.414151,
+  "created_after_queue_allocation": true,
+  "allocation_sha256": "92f33de169f97a337ec45f8b75a8a2847aaad03d81937cae6e3d19935ac83e7a"
+}

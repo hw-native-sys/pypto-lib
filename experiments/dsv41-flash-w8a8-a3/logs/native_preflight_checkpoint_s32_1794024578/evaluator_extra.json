@@ -1,0 +1,73 @@
+{
+  "boundary_cases": [
+    {
+      "shape": [
+        0,
+        7,
+        3
+      ],
+      "int64_bitwise": true
+    },
+    {
+      "shape": [
+        3,
+        0,
+        4
+      ],
+      "int64_bitwise": true
+    },
+    {
+      "shape": [
+        3,
+        7,
+        0
+      ],
+      "int64_bitwise": true
+    },
+    {
+      "shape": [
+        0,
+        0,
+        0
+      ],
+      "int64_bitwise": true
+    },
+    {
+      "shape": [
+        2,
+        131071,
+        1
+      ],
+      "int64_bitwise": true
+    },
+    {
+      "above_2pow24": 83885825,
+      "fp32_rejected_as_exact": true
+    }
+  ],
+  "strided_both_operands": true,
+  "rejections": [
+    "unsafe_K",
+    "range_low",
+    "rank"
+  ],
+  "mutable_contract_offline_blocker": {
+    "prefix": {
+      "fresh_import_mutable_count": 0,
+      "source_contract_count": 16,
+      "empty_contract_alias_reproduced": true,
+      "exact_contract_prelude_initial_bytes_unchanged_both_passes": true,
+      "scope": "actual copied modules + exact clone prelude on tiny tensors, not full reference compute"
+    },
+    "decode": {
+      "fresh_import_mutable_count": 0,
+      "source_contract_count": 12,
+      "empty_contract_alias_reproduced": true,
+      "exact_contract_prelude_initial_bytes_unchanged_both_passes": true,
+      "scope": "actual copied modules + exact clone prelude on tiny tensors, not full reference compute"
+    }
+  },
+  "global_torch_unchanged": true,
+  "NPU": 0,
+  "large_fixture": 0
+}

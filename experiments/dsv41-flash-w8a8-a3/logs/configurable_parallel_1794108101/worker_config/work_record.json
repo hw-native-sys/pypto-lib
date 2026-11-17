@@ -1,0 +1,44 @@
+{
+  "record_id": "worker-parallel-config-collectives-1794108101",
+  "role": "worker-agent",
+  "start_epoch": 1794108197.6730607,
+  "end_epoch": 1794108637.9916697,
+  "elapsed_seconds": 440.3186089992523,
+  "owned_product_files": [
+    "config.py",
+    "tp_reduce.py",
+    "moe_exchange.py"
+  ],
+  "source_pins": {
+    "config.py": "abfb39922b4c340f443c5d3e8869ee2c76344f7b03781702f845055abdd552c1",
+    "tp_reduce.py": "66105a076e9ea9246ab071d3f0d5d33c423accea9d7456fdf7880a42cc441171",
+    "moe_exchange.py": "bd36e338ba72ba27b323d3c10172020cba5af3341464212f8ac39a6be8fbf495"
+  },
+  "CPU_tasks": [
+    {
+      "task": "task_20261108_112536_120403119287",
+      "exit": 0
+    },
+    {
+      "task": "task_20261108_112737_121474511280",
+      "exit": 0
+    },
+    {
+      "task": "task_20261108_112737_121474626844",
+      "exit": 0
+    },
+    {
+      "task": "task_20261108_112905_12247186866",
+      "exit": 0
+    },
+    {
+      "task": "task_20261108_112905_122472127228",
+      "exit": 0
+    }
+  ],
+  "shared_ledger_writes": 0,
+  "NPU_jobs": 0,
+  "checkpoint_reads": 0,
+  "all_jobs_ended": true,
+  "status": "FINAL_PARK"
+}

@@ -1,0 +1,1482 @@
+[
+  {
+    "owner_epoch": "b475c638-08df-457d-ab85-7a92ee7d26a7",
+    "created_epoch": 1794038749.5957417,
+    "parent_pid": 1058228,
+    "queries": [
+      {
+        "rank": 0,
+        "query_started_epoch": 1794038749.595888,
+        "query_finished_epoch": 1794038749.5958903,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 1,
+        "query_started_epoch": 1794038749.5958948,
+        "query_finished_epoch": 1794038749.5958958,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 2,
+        "query_started_epoch": 1794038749.5958986,
+        "query_finished_epoch": 1794038749.5958993,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 3,
+        "query_started_epoch": 1794038749.5959017,
+        "query_finished_epoch": 1794038749.5959027,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 4,
+        "query_started_epoch": 1794038749.595905,
+        "query_finished_epoch": 1794038749.5959058,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 5,
+        "query_started_epoch": 1794038749.5959082,
+        "query_finished_epoch": 1794038749.5959094,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 6,
+        "query_started_epoch": 1794038749.5959115,
+        "query_finished_epoch": 1794038749.5959125,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 7,
+        "query_started_epoch": 1794038749.5959146,
+        "query_finished_epoch": 1794038749.5959153,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 8,
+        "query_started_epoch": 1794038749.5959172,
+        "query_finished_epoch": 1794038749.5959182,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 9,
+        "query_started_epoch": 1794038749.5959203,
+        "query_finished_epoch": 1794038749.5959215,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 10,
+        "query_started_epoch": 1794038749.5959237,
+        "query_finished_epoch": 1794038749.5959249,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 11,
+        "query_started_epoch": 1794038749.5959268,
+        "query_finished_epoch": 1794038749.5959277,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 12,
+        "query_started_epoch": 1794038749.5959299,
+        "query_finished_epoch": 1794038749.5959306,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 13,
+        "query_started_epoch": 1794038749.5959327,
+        "query_finished_epoch": 1794038749.5959337,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 14,
+        "query_started_epoch": 1794038749.5959358,
+        "query_finished_epoch": 1794038749.5959365,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 15,
+        "query_started_epoch": 1794038749.595939,
+        "query_finished_epoch": 1794038749.5959399,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 0,
+        "query_started_epoch": 1794038749.5959492,
+        "query_finished_epoch": 1794038749.5959501,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 1,
+        "query_started_epoch": 1794038749.5959527,
+        "query_finished_epoch": 1794038749.5959535,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 2,
+        "query_started_epoch": 1794038749.5959554,
+        "query_finished_epoch": 1794038749.5959566,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 3,
+        "query_started_epoch": 1794038749.5959585,
+        "query_finished_epoch": 1794038749.5959597,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 4,
+        "query_started_epoch": 1794038749.5959613,
+        "query_finished_epoch": 1794038749.5959623,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 5,
+        "query_started_epoch": 1794038749.5959644,
+        "query_finished_epoch": 1794038749.5959651,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 6,
+        "query_started_epoch": 1794038749.5959673,
+        "query_finished_epoch": 1794038749.595968,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 7,
+        "query_started_epoch": 1794038749.5959702,
+        "query_finished_epoch": 1794038749.5959709,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 8,
+        "query_started_epoch": 1794038749.5959728,
+        "query_finished_epoch": 1794038749.595974,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 9,
+        "query_started_epoch": 1794038749.595976,
+        "query_finished_epoch": 1794038749.595977,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 10,
+        "query_started_epoch": 1794038749.595979,
+        "query_finished_epoch": 1794038749.59598,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 11,
+        "query_started_epoch": 1794038749.595982,
+        "query_finished_epoch": 1794038749.5959828,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 12,
+        "query_started_epoch": 1794038749.595985,
+        "query_finished_epoch": 1794038749.5959857,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 13,
+        "query_started_epoch": 1794038749.5959878,
+        "query_finished_epoch": 1794038749.5959888,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 14,
+        "query_started_epoch": 1794038749.595991,
+        "query_finished_epoch": 1794038749.5959918,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 15,
+        "query_started_epoch": 1794038749.5959938,
+        "query_finished_epoch": 1794038749.5959947,
+        "free": 85899345920,
+        "total": 107374182400,
+        "committed": 21474836480,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      }
+    ],
+    "handles": [],
+    "frees": [],
+    "entered": true,
+    "normal_close": true,
+    "entered_epoch": 1794038749.5957456,
+    "processes_after_enter": [
+      {
+        "pid": 1058228,
+        "start_ticks": "103866797",
+        "cmdline": "python experiments/dsv41-flash-w8a8-a3/logs/empty_fit_operation_1794037635/check_operation.py cpu_fake_final2 "
+      }
+    ],
+    "before_close_epoch": 1794038749.5959966,
+    "processes_before_close": [
+      {
+        "pid": 1058228,
+        "start_ticks": "103866797",
+        "cmdline": "python experiments/dsv41-flash-w8a8-a3/logs/empty_fit_operation_1794037635/check_operation.py cpu_fake_final2 "
+      }
+    ],
+    "after_close_epoch": 1794038749.596087,
+    "processes_after_close": [
+      {
+        "pid": 1058228,
+        "start_ticks": "103866797",
+        "cmdline": "python experiments/dsv41-flash-w8a8-a3/logs/empty_fit_operation_1794037635/check_operation.py cpu_fake_final2 "
+      }
+    ]
+  },
+  {
+    "owner_epoch": "0ced7708-0ba2-4641-9e0d-0c654de88aef",
+    "created_epoch": 1794038749.6039913,
+    "parent_pid": 1058228,
+    "queries": [
+      {
+        "rank": 0,
+        "query_started_epoch": 1794038749.604111,
+        "query_finished_epoch": 1794038749.6041126,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 1,
+        "query_started_epoch": 1794038749.6041167,
+        "query_finished_epoch": 1794038749.6041179,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 2,
+        "query_started_epoch": 1794038749.6041203,
+        "query_finished_epoch": 1794038749.604121,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 3,
+        "query_started_epoch": 1794038749.6041234,
+        "query_finished_epoch": 1794038749.604124,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 4,
+        "query_started_epoch": 1794038749.6041265,
+        "query_finished_epoch": 1794038749.6041274,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 5,
+        "query_started_epoch": 1794038749.6041296,
+        "query_finished_epoch": 1794038749.6041307,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 6,
+        "query_started_epoch": 1794038749.604133,
+        "query_finished_epoch": 1794038749.6041336,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 7,
+        "query_started_epoch": 1794038749.6041358,
+        "query_finished_epoch": 1794038749.6041365,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 8,
+        "query_started_epoch": 1794038749.6041386,
+        "query_finished_epoch": 1794038749.6041396,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 9,
+        "query_started_epoch": 1794038749.6041417,
+        "query_finished_epoch": 1794038749.604143,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 10,
+        "query_started_epoch": 1794038749.6041448,
+        "query_finished_epoch": 1794038749.604146,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 11,
+        "query_started_epoch": 1794038749.604148,
+        "query_finished_epoch": 1794038749.6041486,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 12,
+        "query_started_epoch": 1794038749.6041508,
+        "query_finished_epoch": 1794038749.6041517,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 13,
+        "query_started_epoch": 1794038749.6041539,
+        "query_finished_epoch": 1794038749.6041546,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 14,
+        "query_started_epoch": 1794038749.6041567,
+        "query_finished_epoch": 1794038749.6041577,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 15,
+        "query_started_epoch": 1794038749.60416,
+        "query_finished_epoch": 1794038749.6041608,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 0,
+        "query_started_epoch": 1794038749.6041687,
+        "query_finished_epoch": 1794038749.6041698,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 0,
+        "query_started_epoch": 1794038749.604183,
+        "query_finished_epoch": 1794038749.6041842,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584,
+        "logical_outstanding_bytes": 1048576,
+        "observed_free_drop": 1179648,
+        "observed_committed_rise": 1179648,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 1,
+        "query_started_epoch": 1794038749.6116984,
+        "query_finished_epoch": 1794038749.6117005,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 1,
+        "query_started_epoch": 1794038749.611713,
+        "query_finished_epoch": 1794038749.6117141,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584,
+        "logical_outstanding_bytes": 1048576,
+        "observed_free_drop": 1179648,
+        "observed_committed_rise": 1179648,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 2,
+        "query_started_epoch": 1794038749.615196,
+        "query_finished_epoch": 1794038749.6151977,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 2,
+        "query_started_epoch": 1794038749.6152086,
+        "query_finished_epoch": 1794038749.6152098,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584,
+        "logical_outstanding_bytes": 1048576,
+        "observed_free_drop": 1179648,
+        "observed_committed_rise": 1179648,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 3,
+        "query_started_epoch": 1794038749.6172872,
+        "query_finished_epoch": 1794038749.6172886,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 3,
+        "query_started_epoch": 1794038749.6172986,
+        "query_finished_epoch": 1794038749.6172998,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584,
+        "logical_outstanding_bytes": 1048576,
+        "observed_free_drop": 1179648,
+        "observed_committed_rise": 1179648,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 4,
+        "query_started_epoch": 1794038749.6192527,
+        "query_finished_epoch": 1794038749.619254,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 4,
+        "query_started_epoch": 1794038749.6192644,
+        "query_finished_epoch": 1794038749.6192653,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584,
+        "logical_outstanding_bytes": 1048576,
+        "observed_free_drop": 1179648,
+        "observed_committed_rise": 1179648,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 5,
+        "query_started_epoch": 1794038749.6225145,
+        "query_finished_epoch": 1794038749.6225162,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 5,
+        "query_started_epoch": 1794038749.6225262,
+        "query_finished_epoch": 1794038749.6225271,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584,
+        "logical_outstanding_bytes": 1048576,
+        "observed_free_drop": 1179648,
+        "observed_committed_rise": 1179648,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 6,
+        "query_started_epoch": 1794038749.6246915,
+        "query_finished_epoch": 1794038749.6246932,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 6,
+        "query_started_epoch": 1794038749.6247025,
+        "query_finished_epoch": 1794038749.6247034,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584,
+        "logical_outstanding_bytes": 1048576,
+        "observed_free_drop": 1179648,
+        "observed_committed_rise": 1179648,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 7,
+        "query_started_epoch": 1794038749.6267228,
+        "query_finished_epoch": 1794038749.6267242,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 7,
+        "query_started_epoch": 1794038749.6267338,
+        "query_finished_epoch": 1794038749.6267347,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584,
+        "logical_outstanding_bytes": 1048576,
+        "observed_free_drop": 1179648,
+        "observed_committed_rise": 1179648,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 8,
+        "query_started_epoch": 1794038749.6288059,
+        "query_finished_epoch": 1794038749.6288078,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 8,
+        "query_started_epoch": 1794038749.628817,
+        "query_finished_epoch": 1794038749.6288183,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584,
+        "logical_outstanding_bytes": 1048576,
+        "observed_free_drop": 1179648,
+        "observed_committed_rise": 1179648,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 9,
+        "query_started_epoch": 1794038749.630787,
+        "query_finished_epoch": 1794038749.6307883,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 9,
+        "query_started_epoch": 1794038749.6307976,
+        "query_finished_epoch": 1794038749.6307983,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584,
+        "logical_outstanding_bytes": 1048576,
+        "observed_free_drop": 1179648,
+        "observed_committed_rise": 1179648,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 10,
+        "query_started_epoch": 1794038749.6327841,
+        "query_finished_epoch": 1794038749.632786,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 10,
+        "query_started_epoch": 1794038749.6327946,
+        "query_finished_epoch": 1794038749.6327956,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584,
+        "logical_outstanding_bytes": 1048576,
+        "observed_free_drop": 1179648,
+        "observed_committed_rise": 1179648,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 11,
+        "query_started_epoch": 1794038749.6347432,
+        "query_finished_epoch": 1794038749.6347446,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 11,
+        "query_started_epoch": 1794038749.6347537,
+        "query_finished_epoch": 1794038749.634755,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584,
+        "logical_outstanding_bytes": 1048576,
+        "observed_free_drop": 1179648,
+        "observed_committed_rise": 1179648,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 12,
+        "query_started_epoch": 1794038749.6383097,
+        "query_finished_epoch": 1794038749.6383116,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 12,
+        "query_started_epoch": 1794038749.6383228,
+        "query_finished_epoch": 1794038749.638324,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584,
+        "logical_outstanding_bytes": 1048576,
+        "observed_free_drop": 1179648,
+        "observed_committed_rise": 1179648,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 13,
+        "query_started_epoch": 1794038749.6404185,
+        "query_finished_epoch": 1794038749.6404197,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 13,
+        "query_started_epoch": 1794038749.6404288,
+        "query_finished_epoch": 1794038749.6404295,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584,
+        "logical_outstanding_bytes": 1048576,
+        "observed_free_drop": 1179648,
+        "observed_committed_rise": 1179648,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 14,
+        "query_started_epoch": 1794038749.6434414,
+        "query_finished_epoch": 1794038749.643443,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 14,
+        "query_started_epoch": 1794038749.6434522,
+        "query_finished_epoch": 1794038749.6434531,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584,
+        "logical_outstanding_bytes": 1048576,
+        "observed_free_drop": 1179648,
+        "observed_committed_rise": 1179648,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 15,
+        "query_started_epoch": 1794038749.6454692,
+        "query_finished_epoch": 1794038749.6454709,
+        "free": 85630910464,
+        "total": 107374182400,
+        "committed": 21743271936,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 15,
+        "query_started_epoch": 1794038749.64548,
+        "query_finished_epoch": 1794038749.6454809,
+        "free": 85629730816,
+        "total": 107374182400,
+        "committed": 21744451584,
+        "logical_outstanding_bytes": 1048576,
+        "observed_free_drop": 1179648,
+        "observed_committed_rise": 1179648,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 0,
+        "query_started_epoch": 1794038749.6474288,
+        "query_finished_epoch": 1794038749.6474304,
+        "free": 85630779392,
+        "total": 107374182400,
+        "committed": 21743403008,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 131072,
+        "observed_committed_rise": 131072,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 1,
+        "query_started_epoch": 1794038749.6474335,
+        "query_finished_epoch": 1794038749.6474347,
+        "free": 85630779392,
+        "total": 107374182400,
+        "committed": 21743403008,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 131072,
+        "observed_committed_rise": 131072,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 2,
+        "query_started_epoch": 1794038749.647437,
+        "query_finished_epoch": 1794038749.647438,
+        "free": 85630779392,
+        "total": 107374182400,
+        "committed": 21743403008,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 131072,
+        "observed_committed_rise": 131072,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 3,
+        "query_started_epoch": 1794038749.6474404,
+        "query_finished_epoch": 1794038749.6474416,
+        "free": 85630779392,
+        "total": 107374182400,
+        "committed": 21743403008,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 131072,
+        "observed_committed_rise": 131072,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 4,
+        "query_started_epoch": 1794038749.6474438,
+        "query_finished_epoch": 1794038749.6474447,
+        "free": 85630779392,
+        "total": 107374182400,
+        "committed": 21743403008,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 131072,
+        "observed_committed_rise": 131072,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 5,
+        "query_started_epoch": 1794038749.647447,
+        "query_finished_epoch": 1794038749.647448,
+        "free": 85630779392,
+        "total": 107374182400,
+        "committed": 21743403008,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 131072,
+        "observed_committed_rise": 131072,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 6,
+        "query_started_epoch": 1794038749.6474504,
+        "query_finished_epoch": 1794038749.6474514,
+        "free": 85630779392,
+        "total": 107374182400,
+        "committed": 21743403008,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 131072,
+        "observed_committed_rise": 131072,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 7,
+        "query_started_epoch": 1794038749.6474535,
+        "query_finished_epoch": 1794038749.6474545,
+        "free": 85630779392,
+        "total": 107374182400,
+        "committed": 21743403008,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 131072,
+        "observed_committed_rise": 131072,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 8,
+        "query_started_epoch": 1794038749.6474564,
+        "query_finished_epoch": 1794038749.6474576,
+        "free": 85630779392,
+        "total": 107374182400,
+        "committed": 21743403008,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 131072,
+        "observed_committed_rise": 131072,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 9,
+        "query_started_epoch": 1794038749.64746,
+        "query_finished_epoch": 1794038749.6474612,
+        "free": 85630779392,
+        "total": 107374182400,
+        "committed": 21743403008,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 131072,
+        "observed_committed_rise": 131072,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 10,
+        "query_started_epoch": 1794038749.647463,
+        "query_finished_epoch": 1794038749.6474643,
+        "free": 85630779392,
+        "total": 107374182400,
+        "committed": 21743403008,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 131072,
+        "observed_committed_rise": 131072,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 11,
+        "query_started_epoch": 1794038749.6474662,
+        "query_finished_epoch": 1794038749.6474674,
+        "free": 85630779392,
+        "total": 107374182400,
+        "committed": 21743403008,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 131072,
+        "observed_committed_rise": 131072,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 12,
+        "query_started_epoch": 1794038749.6474693,
+        "query_finished_epoch": 1794038749.6474702,
+        "free": 85630779392,
+        "total": 107374182400,
+        "committed": 21743403008,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 131072,
+        "observed_committed_rise": 131072,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 13,
+        "query_started_epoch": 1794038749.6474724,
+        "query_finished_epoch": 1794038749.6474733,
+        "free": 85630779392,
+        "total": 107374182400,
+        "committed": 21743403008,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 131072,
+        "observed_committed_rise": 131072,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 14,
+        "query_started_epoch": 1794038749.6474755,
+        "query_finished_epoch": 1794038749.6474767,
+        "free": 85630779392,
+        "total": 107374182400,
+        "committed": 21743403008,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 131072,
+        "observed_committed_rise": 131072,
+        "signed_free_residual_minus_requested": 131072
+      },
+      {
+        "rank": 15,
+        "query_started_epoch": 1794038749.6474788,
+        "query_finished_epoch": 1794038749.6474798,
+        "free": 85630779392,
+        "total": 107374182400,
+        "committed": 21743403008,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 131072,
+        "observed_committed_rise": 131072,
+        "signed_free_residual_minus_requested": 131072
+      }
+    ],
+    "handles": [
+      {
+        "rank": 0,
+        "cookie": 281473844121936,
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.int8",
+        "nbytes": 1048576,
+        "allocated_epoch": 1794038749.6041794
+      },
+      {
+        "rank": 1,
+        "cookie": 281473844122032,
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.int8",
+        "nbytes": 1048576,
+        "allocated_epoch": 1794038749.6117103
+      },
+      {
+        "rank": 2,
+        "cookie": 281473844121552,
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.int8",
+        "nbytes": 1048576,
+        "allocated_epoch": 1794038749.6152065
+      },
+      {
+        "rank": 3,
+        "cookie": 281473844121744,
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.int8",
+        "nbytes": 1048576,
+        "allocated_epoch": 1794038749.6172965
+      },
+      {
+        "rank": 4,
+        "cookie": 281473844121456,
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.int8",
+        "nbytes": 1048576,
+        "allocated_epoch": 1794038749.619262
+      },
+      {
+        "rank": 5,
+        "cookie": 281473844120784,
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.int8",
+        "nbytes": 1048576,
+        "allocated_epoch": 1794038749.622524
+      },
+      {
+        "rank": 6,
+        "cookie": 281473844120208,
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.int8",
+        "nbytes": 1048576,
+        "allocated_epoch": 1794038749.6247
+      },
+      {
+        "rank": 7,
+        "cookie": 281473844120352,
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.int8",
+        "nbytes": 1048576,
+        "allocated_epoch": 1794038749.6267316
+      },
+      {
+        "rank": 8,
+        "cookie": 281473844133792,
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.int8",
+        "nbytes": 1048576,
+        "allocated_epoch": 1794038749.6288147
+      },
+      {
+        "rank": 9,
+        "cookie": 281473844133696,
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.int8",
+        "nbytes": 1048576,
+        "allocated_epoch": 1794038749.630795
+      },
+      {
+        "rank": 10,
+        "cookie": 281473844120640,
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.int8",
+        "nbytes": 1048576,
+        "allocated_epoch": 1794038749.6327925
+      },
+      {
+        "rank": 11,
+        "cookie": 281473844121168,
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.int8",
+        "nbytes": 1048576,
+        "allocated_epoch": 1794038749.6347513
+      },
+      {
+        "rank": 12,
+        "cookie": 281473844122320,
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.int8",
+        "nbytes": 1048576,
+        "allocated_epoch": 1794038749.6383204
+      },
+      {
+        "rank": 13,
+        "cookie": 281473844122512,
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.int8",
+        "nbytes": 1048576,
+        "allocated_epoch": 1794038749.6404264
+      },
+      {
+        "rank": 14,
+        "cookie": 281473844130336,
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.int8",
+        "nbytes": 1048576,
+        "allocated_epoch": 1794038749.64345
+      },
+      {
+        "rank": 15,
+        "cookie": 281473844120544,
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.int8",
+        "nbytes": 1048576,
+        "allocated_epoch": 1794038749.6454775
+      }
+    ],
+    "frees": [
+      {
+        "rank": 15,
+        "cookie": 281473844120544,
+        "attempt_epoch": 1794038749.647396,
+        "success": true
+      },
+      {
+        "rank": 14,
+        "cookie": 281473844130336,
+        "attempt_epoch": 1794038749.6474004,
+        "success": true
+      },
+      {
+        "rank": 13,
+        "cookie": 281473844122512,
+        "attempt_epoch": 1794038749.6474025,
+        "success": true
+      },
+      {
+        "rank": 12,
+        "cookie": 281473844122320,
+        "attempt_epoch": 1794038749.6474042,
+        "success": true
+      },
+      {
+        "rank": 11,
+        "cookie": 281473844121168,
+        "attempt_epoch": 1794038749.6474059,
+        "success": true
+      },
+      {
+        "rank": 10,
+        "cookie": 281473844120640,
+        "attempt_epoch": 1794038749.6474075,
+        "success": true
+      },
+      {
+        "rank": 9,
+        "cookie": 281473844133696,
+        "attempt_epoch": 1794038749.6474094,
+        "success": true
+      },
+      {
+        "rank": 8,
+        "cookie": 281473844133792,
+        "attempt_epoch": 1794038749.647411,
+        "success": true
+      },
+      {
+        "rank": 7,
+        "cookie": 281473844120352,
+        "attempt_epoch": 1794038749.6474128,
+        "success": true
+      },
+      {
+        "rank": 6,
+        "cookie": 281473844120208,
+        "attempt_epoch": 1794038749.6474144,
+        "success": true
+      },
+      {
+        "rank": 5,
+        "cookie": 281473844120784,
+        "attempt_epoch": 1794038749.6474164,
+        "success": true
+      },
+      {
+        "rank": 4,
+        "cookie": 281473844121456,
+        "attempt_epoch": 1794038749.6474178,
+        "success": true
+      },
+      {
+        "rank": 3,
+        "cookie": 281473844121744,
+        "attempt_epoch": 1794038749.6474195,
+        "success": true
+      },
+      {
+        "rank": 2,
+        "cookie": 281473844121552,
+        "attempt_epoch": 1794038749.6474211,
+        "success": true
+      },
+      {
+        "rank": 1,
+        "cookie": 281473844122032,
+        "attempt_epoch": 1794038749.647423,
+        "success": true
+      },
+      {
+        "rank": 0,
+        "cookie": 281473844121936,
+        "attempt_epoch": 1794038749.6474245,
+        "success": true
+      }
+    ],
+    "entered": true,
+    "normal_close": true,
+    "entered_epoch": 1794038749.6039948,
+    "processes_after_enter": [
+      {
+        "pid": 1058228,
+        "start_ticks": "103866797",
+        "cmdline": "python experiments/dsv41-flash-w8a8-a3/logs/empty_fit_operation_1794037635/check_operation.py cpu_fake_final2 "
+      }
+    ],
+    "before_close_epoch": 1794038749.647482,
+    "processes_before_close": [
+      {
+        "pid": 1058228,
+        "start_ticks": "103866797",
+        "cmdline": "python experiments/dsv41-flash-w8a8-a3/logs/empty_fit_operation_1794037635/check_operation.py cpu_fake_final2 "
+      }
+    ],
+    "after_close_epoch": 1794038749.6476045,
+    "processes_after_close": [
+      {
+        "pid": 1058228,
+        "start_ticks": "103866797",
+        "cmdline": "python experiments/dsv41-flash-w8a8-a3/logs/empty_fit_operation_1794037635/check_operation.py cpu_fake_final2 "
+      }
+    ]
+  }
+]

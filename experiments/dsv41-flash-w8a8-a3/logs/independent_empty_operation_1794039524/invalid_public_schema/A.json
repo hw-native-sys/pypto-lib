@@ -1,0 +1,13 @@
+{
+  "resources": [],
+  "allocations": [],
+  "cleanup_errors": [
+    "invalid public memory query"
+  ],
+  "prewarm": [],
+  "status": "FAIL",
+  "compute_dispatches": 0,
+  "payload_bytes": 0,
+  "error": "Refused: invalid public memory query",
+  "owner_closed": true
+}

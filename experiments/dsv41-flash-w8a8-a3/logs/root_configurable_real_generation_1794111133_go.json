@@ -1,0 +1,76 @@
+{
+  "schema": "observer-configurable-real-operation-scope/1",
+  "root_id": "observer-20261108-configurable-tp8ep16-real16-shared-w8a8",
+  "approved": true,
+  "issued_epoch": 1794113569.6352978,
+  "owner": "/root/reviewer_fit",
+  "operation": "configurable-shared-real40-noEngram-greedy-N3",
+  "topology": {
+    "tp": 8,
+    "ep": 16,
+    "dp": 2,
+    "world": 16,
+    "local_experts": 24
+  },
+  "case": "logs/native_configurable_real_generation_1794111133",
+  "producer_bundle_manifest_sha256": "9205eb161aaf83edabf516c1a6cab5c1f666a894a99116f04d312cf311926dae",
+  "binding_sha256": "d01fe5a625b4102d3fffe509e89485f6fa438a9c67b1ffa32e96c3fe548e3e9d",
+  "source45_sha256": "f0e91a30e4117e110be183ef44acf2874eea813cc6f72ac7c7fa44bc4ede3a7f",
+  "metadata_plan_sha256": "a7b187a084e304b5203aeb2b0897dcb291550fbcf6c5bbaea6d1fe42f49a2a46",
+  "signature_pair_sha256": "c11948187a3f2e3675d5fe9e0fd0a47f20af67ecbeac4866f947cb7aefca75e4",
+  "independent_ready_manifest_sha256": "cd15b9bf438806ff055a98a5ad72e67464b83ac9890ac98877ce3cfca9ed6165",
+  "independent_checks": {
+    "task": "task_20261108_124106_143172810976",
+    "passed": 177,
+    "unmet": 0
+  },
+  "PREQUEUE_sha256": "1acdacf14932b139a94b496397fdd31756b91bc8ba8928f8c42b473b91f39482",
+  "required_before_submit": [
+    "Reviewer F09 NEW EP-only capture-fix CPU regression passes, actual three scenarios pass original math/exact counts12,6,6/idle output; all three distinct actual-expected capsules preserved and independently reloaded/verified; bounded terminal/normalclose/raw2release/sourcepins evidence final",
+    "Reviewer F09 TP124231 saved output/score257 capsule audit passes, terminal/normalclose/raw4release evidence final; no nativeTP repeat",
+    "Outside queue all16 idle/no allocated previous component tasks",
+    "All frozen product/producer/metadata/compiled/reviewer inputs unchanged; if any precondition fails remain NOT_SUBMITTED and report Root; no blindretry"
+  ],
+  "already_accepted_attention": "root_tp8_attention_1794111650_acceptance.json: actual3originalHEADS8cases PASS only",
+  "allocation": "task-submit --device auto --device-num 16; ordered actual TASK_DEVICE must be0..15 per frozen binding; no affinity override",
+  "command_source": "logs/configurable_real_operation_prepare_1794111133/COMMANDS.md",
+  "after_allocation_authority": "SAME frozen task_entry may create NEW task-local assignment TTL3500 only after actual16 allocation; mandatory fresh ALLOCATED_PRE_EXEC headers-only/source/tokenizer/index/library/resources before NEW production receipt; no preallocation grant",
+  "request": {
+    "prompt": "Once upon a",
+    "prompt_ids": [
+      16600,
+      4465,
+      260
+    ],
+    "template": "plain",
+    "start_position": 0,
+    "max_new_tokens": 16,
+    "repeat": 1,
+    "engram": "disabled",
+    "MTP": false,
+    "strict_all_DP_groups": 2
+  },
+  "weight_accounting": {
+    "canonical_upload_bytes": 613256211456,
+    "per_rank_static_bytes": 38328513216,
+    "base_allocations": 912,
+    "source_reads": 164192,
+    "source_bytes": 745846365184,
+    "decode_new_static_reads_bytes_upload_allocation_copy": 0,
+    "C1_views": 112,
+    "same_shape_aliases": 800
+  },
+  "timeboxes": {
+    "product_soft_seconds": 20400,
+    "queue_seconds": 21600,
+    "client_seconds": 22200
+  },
+  "telemetry": "UNCHANGED STRICT; noncritical process gaps durably makewholeFAIL/PSSnull but do not invent kill/retry of healthyCLI; bounded model facts separate. Criticalproduct/source/query/DP/nonfinite/resource/deadline/cleanup stops unchanged. No hidden reruns/policy/heap/source changes.",
+  "terminal_obligations": [
+    "Preserve native/CLI/strictouter statuses and partials separately",
+    "AfterSAMEterminal mandatory external POST_EXEC via--no-device evenfailure, headers0payload",
+    "Raw16release/currentqueue/knownPIDbirthfacts, unknown historical identities remainunknown",
+    "Independent actual post-auditor Root followup; frozen source throughaudit/disposition/ownerFINAL; normal ownedcleanup, no adminreset/otherjobs"
+  ],
+  "authorization_limit": "ONE actual16 normal realW8A8 operation only after explicit conditions; not a whole-case/quality/parity/peak PASS. Root does not execute tests."
+}

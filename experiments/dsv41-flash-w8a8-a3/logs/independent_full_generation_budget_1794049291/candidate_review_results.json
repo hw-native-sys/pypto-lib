@@ -1,0 +1,27 @@
+{
+  "scope": "noEngram; independent actual frozen-class CPU fakes only; no data/device",
+  "candidate_sha256": "975d555439c064b0d37fa0f2dc14c2a5204cbd9675c656997d4617ca4d99531e",
+  "tests": {
+    "cleanup": {
+      "upload_primary_preserved_and_all_free_exit_attempted": true,
+      "fields_cleared": true,
+      "dispatch_primary_and_attemptall": true
+    },
+    "bounded_cadence_first_resource_256MiB_crossing_1s_large_source_rank_switch_and_queryerror": "PASS",
+    "later_decode_floor_boundaries": {
+      "1": 10972645824,
+      "2": 10725534144
+    },
+    "final_query_wiring": {
+      "actual_public_IPCs": 64,
+      "before_and_afterfree_queried": true,
+      "durable_final_events": 0,
+      "finding": "both final success snapshots can be lost by5s throttle"
+    },
+    "coverage_summary": {
+      "internal_complete_compare": true,
+      "durable_complete_counters_summary": false
+    }
+  },
+  "disposition": "cleanup/cadence/futureIO logic PASS; durable final snapshots and complete phase summary require narrow amendment before actual trial acceptance"
+}

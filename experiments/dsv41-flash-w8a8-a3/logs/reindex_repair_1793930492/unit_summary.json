@@ -1,0 +1,237 @@
+{
+  "epoch": 1793933523,
+  "changed_sources": [
+    "decode_c1a_full.py",
+    "decode_c1a_reindex.py",
+    "decode_c2a_full.py",
+    "decode_fwd.py",
+    "indexer.py",
+    "layer_reference.py",
+    "prefill_c1a_full.py",
+    "prefill_c1a_reindex.py",
+    "prefill_c2a_full.py",
+    "prefill_fwd.py"
+  ],
+  "total_sources": 45,
+  "component_case_counts": {
+    "indexer": 6,
+    "decode_c1a_full": 2,
+    "decode_c1a_reindex": 2,
+    "decode_c2a_full": 2,
+    "prefill_c1a_full": 1,
+    "prefill_c1a_reindex": 1,
+    "prefill_c2a_full": 1
+  },
+  "unchanged_shared_functions": [
+    "index_query",
+    "index_weights",
+    "index_key",
+    "index_scores",
+    "select_candidate_block_pool",
+    "golden_index_keys",
+    "golden_index_scores",
+    "golden_index_select",
+    "index_score_compare",
+    "pool_set_compare",
+    "golden_lightning_indexer",
+    "golden_lightning_indexer_full_pool"
+  ],
+  "queue_results": [
+    {
+      "log": "isolated_layers_queue.log",
+      "tasks": [
+        "task_20261106_102937_139737530967"
+      ],
+      "verdicts": [
+        "=== \u4efb\u52a1\u5931\u8d25 (exit=1) ==="
+      ]
+    },
+    {
+      "log": "evidence_queue.log",
+      "tasks": [
+        "task_20261106_102050_130071030137"
+      ],
+      "verdicts": [
+        "=== \u4efb\u52a1\u5b8c\u6210 (exit=0) ==="
+      ]
+    },
+    {
+      "log": "phases_retry_queue.log",
+      "tasks": [
+        "task_20261106_101007_119304620492"
+      ],
+      "verdicts": [
+        "=== \u4efb\u52a1\u5b8c\u6210 (exit=0) ==="
+      ]
+    },
+    {
+      "log": "consumers_queue.log",
+      "tasks": [
+        "task_20261106_101941_127899028578"
+      ],
+      "verdicts": [
+        "=== \u4efb\u52a1\u5b8c\u6210 (exit=0) ==="
+      ]
+    },
+    {
+      "log": "hbm_queue.log",
+      "tasks": [
+        "task_20261106_101420_121784823036"
+      ],
+      "verdicts": [
+        "=== \u4efb\u52a1\u5b8c\u6210 (exit=0) ==="
+      ]
+    },
+    {
+      "log": "lint_import_queue.log",
+      "tasks": [
+        "task_20261106_101146_120150726055"
+      ],
+      "verdicts": [
+        "=== \u4efb\u52a1\u5b8c\u6210 (exit=0) ==="
+      ]
+    },
+    {
+      "log": "isolated_layers_padding_queue.log",
+      "tasks": [
+        "task_20261106_104341_14597368219"
+      ],
+      "verdicts": [
+        "=== \u4efb\u52a1\u5b8c\u6210 (exit=0) ==="
+      ]
+    },
+    {
+      "log": "negative_selector_queue.log",
+      "tasks": [
+        "task_20261106_102132_132654727492"
+      ],
+      "verdicts": [
+        "=== \u4efb\u52a1\u5b8c\u6210 (exit=0) ==="
+      ]
+    },
+    {
+      "log": "consumers_padding_queue.log",
+      "tasks": [
+        "task_20261106_104531_147345915467"
+      ],
+      "verdicts": [
+        "=== \u4efb\u52a1\u5b8c\u6210 (exit=0) ==="
+      ]
+    },
+    {
+      "log": "preflight_queue.log",
+      "tasks": [
+        "task_20261106_100537_112790311286"
+      ],
+      "verdicts": [
+        "=== \u4efb\u52a1\u5b8c\u6210 (exit=0) ==="
+      ]
+    },
+    {
+      "log": "compile_queue.log",
+      "tasks": [
+        "task_20261106_101629_122967030312"
+      ],
+      "verdicts": [
+        "=== \u4efb\u52a1\u5b8c\u6210 (exit=0) ==="
+      ]
+    },
+    {
+      "log": "isolated_layers_final_queue.log",
+      "tasks": [
+        "task_20261106_103723_14249186461"
+      ],
+      "verdicts": [
+        "=== \u4efb\u52a1\u5931\u8d25 (exit=1) ==="
+      ]
+    },
+    {
+      "log": "final_host_queue.log",
+      "tasks": [
+        "task_20261106_103950_144565813536"
+      ],
+      "verdicts": [
+        "=== \u4efb\u52a1\u5b8c\u6210 (exit=0) ==="
+      ]
+    },
+    {
+      "log": "collection_queue.log",
+      "tasks": [
+        "task_20261106_105159_153436118037"
+      ],
+      "verdicts": []
+    },
+    {
+      "log": "indexer_queue.log",
+      "tasks": [
+        "task_20261106_101215_120389919877"
+      ],
+      "verdicts": [
+        "=== \u4efb\u52a1\u5931\u8d25 (exit=1) ==="
+      ]
+    },
+    {
+      "log": "negative_queue.log",
+      "tasks": [
+        "task_20261106_100621_114259824307"
+      ],
+      "verdicts": [
+        "=== \u4efb\u52a1\u5b8c\u6210 (exit=0) ==="
+      ]
+    },
+    {
+      "log": "indexer_retry_queue.log",
+      "tasks": [
+        "task_20261106_101356_12136063361"
+      ],
+      "verdicts": [
+        "=== \u4efb\u52a1\u5b8c\u6210 (exit=0) ==="
+      ]
+    },
+    {
+      "log": "layers_queue.log",
+      "tasks": [
+        "task_20261106_101523_122118621643"
+      ],
+      "verdicts": [
+        "=== \u4efb\u52a1\u5931\u8d25 (exit=1) ==="
+      ]
+    },
+    {
+      "log": "padding_host_queue.log",
+      "tasks": [
+        "task_20261106_104531_147307825056"
+      ],
+      "verdicts": [
+        "=== \u4efb\u52a1\u5b8c\u6210 (exit=0) ==="
+      ]
+    },
+    {
+      "log": "layers_retry_queue.log",
+      "tasks": [
+        "task_20261106_101900_127349727504"
+      ],
+      "verdicts": [
+        "=== \u4efb\u52a1\u5931\u8d25 (exit=1) ==="
+      ]
+    },
+    {
+      "log": "phases_queue.log",
+      "tasks": [
+        "task_20261106_100854_118814614207"
+      ],
+      "verdicts": [
+        "=== \u4efb\u52a1\u5931\u8d25 (exit=1) ==="
+      ]
+    }
+  ],
+  "generated_orchestration_hashes": {
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/reindex_repair_1793930492/build_output/_jit_prefill_fwd_20261106_101740_sfv_e2e6/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp": "379415731b24508e71ad4d9889f60cd54b96b619e561f37baaefe19c0eb74c9e",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/reindex_repair_1793930492/build_output/_jit_decode_fwd_20261106_101709_qp_e22h7/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp": "dff7887bb280f953caf4666305bb87e5da687999a07907596853ef90e6eaf0f1"
+  },
+  "native_goal_observed": null,
+  "observer_acceptance": "pending",
+  "generation": "HELD",
+  "decode_layer_16_devices": true,
+  "prefill_layer_16_devices": true
+}

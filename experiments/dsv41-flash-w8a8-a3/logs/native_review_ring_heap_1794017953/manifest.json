@@ -1,0 +1,15 @@
+{
+  "MULTI_RING.md": "43f04987d48c9c681e15143f4b45d6747128a8340829771afb03f120f76d6e28",
+  "REVIEW.md": "70ef6d6bdd9ffd8254dfbfb71e86eb3dc45631f0fe07babbf15544fcb33c9eb3",
+  "call_config.h": "456b849596654f9a441c9e0c27e3e46b45afdd80dd3f877a2b671d6a6c67e648",
+  "device_runner.py": "489be9499afd907530e6bf52cf2b9164e5a9269266bef9019a5f73b27717d3e6",
+  "device_runner_base.cpp": "39cd6d242d506c44edbb2327bff5a56794848a2e66f0148dff4e7b9c90e30cc1",
+  "distributed_compiled_program.py": "b523ea389350c9d1f9880a101ec66ceb36d2a8202a5fb1976a77be3310444e2a",
+  "distributed_runner.py": "ca496829a240c81df3c29e77d8ef696bd1e2a7b0f31b9d5c2dcb3b3d82923148",
+  "ring_buffer.h": "65b5c5d54dcb48110a9d6c5fd1ad79d1f26743139341cfb6d080ec58a191d5c9",
+  "runtime_init.cpp": "3ea5bbee168f13a8b8b1d96f4f181c4c35762af7b4b56e9e5188debafea6b27f",
+  "runtime_maker.cpp": "58c508e0aaffc786526c83b9f84e903d787731ad7213f69f8a5ccb5fdee4f4c9",
+  "sources.json": "c5df0829f9f5f5202707175e7302832857b7d3b6b7286940a9df928a0395262f",
+  "work_record.json": "fd1a1333396b0283092d4411757e83da7869e263d49dd919ba11fb4a94b2b122",
+  "worker.py": "55cdf965dc0f220e645c4595d39989a655e3745559091a2b3effc40cd04cbe82"
+}

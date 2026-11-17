@@ -1,0 +1,303 @@
+{
+  "schema": 3,
+  "supported_execution_modes": [
+    "program"
+  ],
+  "params": [
+    {
+      "name": "x_hc__ssa_v0",
+      "direction": "In",
+      "shape": [
+        16,
+        2,
+        4,
+        5120
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "pre_mix__ssa_v0",
+      "direction": "In",
+      "shape": [
+        16,
+        2,
+        4
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "hc_ffn_fn__ssa_v0",
+      "direction": "In",
+      "shape": [
+        16,
+        32,
+        20480
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "hc_ffn_scale__ssa_v0",
+      "direction": "In",
+      "shape": [
+        16,
+        3
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "hc_ffn_base__ssa_v0",
+      "direction": "In",
+      "shape": [
+        16,
+        24
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "norm_weight__ssa_v0",
+      "direction": "In",
+      "shape": [
+        16,
+        5120
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "gate_weight__ssa_v0",
+      "direction": "In",
+      "shape": [
+        16,
+        384,
+        5120
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "gate_bias__ssa_v0",
+      "direction": "In",
+      "shape": [
+        16,
+        384
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "w1__ssa_v0",
+      "direction": "In",
+      "shape": [
+        384,
+        72,
+        320,
+        16,
+        32
+      ],
+      "dtype": "int8",
+      "layout": "NZ"
+    },
+    {
+      "name": "w1_scale__ssa_v0",
+      "direction": "In",
+      "shape": [
+        16,
+        24,
+        2304
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "w3__ssa_v0",
+      "direction": "In",
+      "shape": [
+        384,
+        72,
+        320,
+        16,
+        32
+      ],
+      "dtype": "int8",
+      "layout": "NZ"
+    },
+    {
+      "name": "w3_scale__ssa_v0",
+      "direction": "In",
+      "shape": [
+        16,
+        24,
+        2304
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "w2__ssa_v0",
+      "direction": "In",
+      "shape": [
+        384,
+        160,
+        144,
+        16,
+        32
+      ],
+      "dtype": "int8",
+      "layout": "NZ"
+    },
+    {
+      "name": "w2_scale__ssa_v0",
+      "direction": "In",
+      "shape": [
+        16,
+        24,
+        5120
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "shared_w1__ssa_v0",
+      "direction": "In",
+      "shape": [
+        16,
+        72,
+        320,
+        16,
+        32
+      ],
+      "dtype": "int8",
+      "layout": "NZ"
+    },
+    {
+      "name": "shared_w1_scale__ssa_v0",
+      "direction": "In",
+      "shape": [
+        16,
+        2304
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "shared_w3__ssa_v0",
+      "direction": "In",
+      "shape": [
+        16,
+        72,
+        320,
+        16,
+        32
+      ],
+      "dtype": "int8",
+      "layout": "NZ"
+    },
+    {
+      "name": "shared_w3_scale__ssa_v0",
+      "direction": "In",
+      "shape": [
+        16,
+        2304
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "shared_w2__ssa_v0",
+      "direction": "In",
+      "shape": [
+        16,
+        160,
+        144,
+        16,
+        32
+      ],
+      "dtype": "int8",
+      "layout": "NZ"
+    },
+    {
+      "name": "shared_w2_scale__ssa_v0",
+      "direction": "In",
+      "shape": [
+        16,
+        5120
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "x_hc_out__ssa_v0",
+      "direction": "Out",
+      "shape": [
+        16,
+        2,
+        4,
+        5120
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "next_pre_mix__ssa_v0",
+      "direction": "Out",
+      "shape": [
+        16,
+        2,
+        4
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "token_counts__ssa_v0",
+      "direction": "In",
+      "shape": [
+        16
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "recv_meta_counts__ssa_v0",
+      "direction": "Out",
+      "shape": [
+        16,
+        16,
+        24
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    }
+  ],
+  "num_return_types": 1,
+  "platform": "a2a3",
+  "backend_type": "Ascend910",
+  "distributed_config": {
+    "device_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "num_sub_workers": 0,
+    "runtime": "tensormap_and_ringbuffer",
+    "aicpu_thread_num": 0
+  }
+}

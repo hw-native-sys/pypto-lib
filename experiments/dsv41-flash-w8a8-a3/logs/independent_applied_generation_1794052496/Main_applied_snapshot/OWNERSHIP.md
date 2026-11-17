@@ -1,0 +1,1 @@
+Main exclusive this NEW directory plus ONLY product models/deepseek_v4_1_flash_a3_w8a8/generate.py for EXACT reviewed522dae patch ->d057. Other44/allsealed bundles immutable. Main narrow current overlays MODULES/INTERFACE/HANDOFF and append-only TASKS/TIME_LOG. Queued tiny appliedCPU only, no compile/NPU/payload/largefixture/actualgrant.

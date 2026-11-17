@@ -1,0 +1,23 @@
+{
+  "OWNERSHIP.md": "5bdf94d104f357c88f63246c672d1da2bf301f74c4ad9169ff1abc65a22909b5",
+  "REPORT.md": "ed95e887dd2d7e3b551f5d9e5af148a4e2b8e2d83e601542066915ec2cecca8d",
+  "closure.json": "e5555c65465896a25ecdd9f5499bd277133d397346d75b727c967ad0a85d34f5",
+  "matrix.json": "04a14717e459c58623506354ff7f0a9d13ffd3890ad71457b34a0833b6643015",
+  "source_pins.json": "f5c78d8fcc0f8fe6cfea1b4d0f64f71c0684ca3e3c4c73cdb90d6b486814475d",
+  "sources/HC_capture.py": "d0b281499e0e93ccd70cf3f95bfc7683a2dd44d59bb8b086ee848534c7e4fb1c",
+  "sources/HC_offline.py": "5f0b7cbf518dd2f3aa9a02034d581f688a55c0018b8d6fd5994bbf64e9730dc3",
+  "sources/HC_probe.py": "6d7d3a3b0f9143c4add4a950667d33c4afc5c7e1ea2832171ac5ce5d4e044030",
+  "sources/N3_extra_published.py": "36fb1afe7fb281bb0b4c8c4ff8d3d4b26c25ce19e26d625effb2240808ec7ac6",
+  "sources/S32_evaluator.py": "0929a54ecb9022259152692c8dfb6e166237ed5cb99359b231334c7db2515ddf",
+  "sources/V3_bridge.py": "c1f942c90ccb4fbec3fe3e3852b51ac64c616f1607076b55f486a30864026834",
+  "sources/V3_pipeline.py": "814d7e43cadc0c1f4eb80140f29b92f0275c9fd0c86bc9664f988c6e6d683ea5",
+  "sources/V3_store.py": "07d23973b94d4b8b22ec124b63945f4a6842e77996267e6da7f226f066557faa",
+  "sources/decode19_frozen_module.py": "ed39c749b0d4cf5344fcf7a8f9b63fd0259cbb21496729ef425a09fb6d73ee1a",
+  "sources/decode19_helper.py": "2841367a73404654518ab5f05231a7220fa21370c427f90c5db2c8ab168b747f",
+  "sources/harness_runner.py": "3b7d37753b5b0fedc36f2ae425043b256aa5da8230689b3e222ac06dff0b53c5",
+  "sources/harness_spec.py": "a206fed7122ba6c065f77f8be6549c1fe8515b3108782405183a8f104953534a",
+  "sources/tiny_manual.py": "38e92714a550407727a4a7d816c1e9c8fc711519cc73ecdcf89c1f8d6caa9d59",
+  "sources/tiny_programs.py": "94f3290e98ceefdba48fa61c372130a7176199b19802d1633152dc9d9619ef60",
+  "start.json": "d2fb6850f26120388ca590d447edeaa7518d00b3d9e05ed59a673c8f44f73447",
+  "work_record.json": "d18888cb80dec7cf9e868a2ea385b45ff2a27d08b2dc5d7e76f0e2131ce750e1"
+}

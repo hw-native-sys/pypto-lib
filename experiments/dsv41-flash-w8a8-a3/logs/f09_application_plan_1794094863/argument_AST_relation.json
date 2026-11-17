@@ -1,0 +1,217 @@
+{
+  "models/deepseek_v4_1_flash_a3_w8a8/compressor.py": {
+    "modified_arguments": [],
+    "common_arg_contracts_equal": [
+      "bf16_project",
+      "golden_c2a_compressor",
+      "build_c2a_specs",
+      "build_c1a_specs",
+      "validate_c2a_reference_precision",
+      "_position_ids",
+      "_golden_rms",
+      "c2a_compressor_test",
+      "c2a_compressor",
+      "c1a_compressor",
+      "c1a_compressor_test",
+      "golden_c1a_compressor"
+    ]
+  },
+  "models/deepseek_v4_1_flash_a3_w8a8/decode_fwd.py": {
+    "modified_arguments": [
+      "pool_compare",
+      "direct"
+    ],
+    "common_arg_contracts_equal": [
+      "decode_fwd_rank",
+      "_run_composed_golden",
+      "staged",
+      "_layer_weight",
+      "check_weight_contract",
+      "add",
+      "build_fwd_specs",
+      "_c2a_slot",
+      "_layer_expert_weight",
+      "_run_fwd",
+      "_final_head",
+      "_source_arguments",
+      "decode_encoder",
+      "_seed_embed",
+      "_source_weight",
+      "_rope_tables",
+      "main",
+      "compare",
+      "decode_decoder",
+      "_entry_specs",
+      "_layer_family",
+      "_group_outputs",
+      "compare_published_fwd_cache",
+      "_device_outputs",
+      "_stack_source",
+      "decode_fwd",
+      "published_cache",
+      "_index_slot",
+      "prepare_fwd_weights",
+      "_rank_repeat",
+      "staged_compare",
+      "make_fwd_comparators",
+      "_layer_reference_dict"
+    ]
+  },
+  "models/deepseek_v4_1_flash_a3_w8a8/decode_layer.py": {
+    "modified_arguments": [],
+    "common_arg_contracts_equal": [
+      "decode_layer",
+      "decode_layer_moe_entry",
+      "layer_unpad_moe_rank",
+      "decode_layer_rank",
+      "_build_layer_entries",
+      "layer_epilogue_rank",
+      "layer_moe_tile_rank",
+      "decode_layer_epilogue_entry",
+      "_run_staged_layer",
+      "layer_pad_moe_rank",
+      "decode_layer_entry"
+    ]
+  },
+  "models/deepseek_v4_1_flash_a3_w8a8/decode_moe.py": {
+    "modified_arguments": [],
+    "common_arg_contracts_equal": [
+      "build_tensor_specs",
+      "_shared_expert",
+      "decode_moe_rank",
+      "decode_moe",
+      "_stacked_experts"
+    ]
+  },
+  "models/deepseek_v4_1_flash_a3_w8a8/layer_reference.py": {
+    "modified_arguments": [],
+    "common_arg_contracts_equal": [
+      "stacked_rep",
+      "_score_rows",
+      "_staged_ratio_compare",
+      "single",
+      "_rms_reference",
+      "stacked_group",
+      "_staged_topk_indices_compare",
+      "_expert_fixture",
+      "_selection_input",
+      "_fixture",
+      "_precision_report",
+      "staged_gate_compare",
+      "_partial_rows",
+      "run_staged_programs",
+      "_gather_rows",
+      "_rope_tables",
+      "_mla_rows",
+      "compare",
+      "golden",
+      "stacked",
+      "staged_moe_compare",
+      "_selection_rows",
+      "capture_fixture",
+      "_compressor_rows",
+      "quantized",
+      "_report_staged",
+      "_staged_index_score_compare",
+      "_hc_post_reference",
+      "_tp_sum",
+      "staged_rms_compare",
+      "_row_maxima",
+      "_staged_pool_compare",
+      "build_layer_specs",
+      "_moe_weight_shard",
+      "_staged_references",
+      "make_layer_golden",
+      "_build_staged_references",
+      "staged_hc_post_compare",
+      "_staged_state_compare",
+      "build_compare",
+      "_dispatch_prepared",
+      "_staged_cache_compare"
+    ]
+  },
+  "models/deepseek_v4_1_flash_a3_w8a8/moe_exchange.py": {
+    "modified_arguments": [
+      "moe_ffn"
+    ],
+    "common_arg_contracts_equal": [
+      "moe_ep16",
+      "golden_moe_ep16"
+    ]
+  },
+  "models/deepseek_v4_1_flash_a3_w8a8/prefill_fwd.py": {
+    "modified_arguments": [],
+    "common_arg_contracts_equal": [
+      "_prefill_encoder_layer",
+      "_run_composed_golden",
+      "pool_compare",
+      "staged",
+      "_layer_weight",
+      "check_weight_contract",
+      "add",
+      "build_fwd_specs",
+      "_c2a_slot",
+      "_layer_expert_weight",
+      "_prefill_decoder_layer",
+      "direct",
+      "_source_weight",
+      "_rope_tables",
+      "main",
+      "compare",
+      "_entry_specs",
+      "_layer_family",
+      "prefill_fwd",
+      "_token_tile",
+      "_group_outputs",
+      "prefill_decoder",
+      "_layer_source_arguments",
+      "_prefill_entry",
+      "_prefill_layer_snapshot",
+      "_device_outputs",
+      "_share_base_tensors",
+      "_build_prefill_entry",
+      "_stack_source",
+      "prepare_fwd_weights",
+      "run_prefill_fwd",
+      "_prefill_embed",
+      "_c1a_slot",
+      "_rank_repeat",
+      "staged_compare",
+      "make_fwd_comparators",
+      "prefill_encoder",
+      "l2_prefill_fwd",
+      "_layer_reference_dict"
+    ]
+  },
+  "models/deepseek_v4_1_flash_a3_w8a8/prefill_layer.py": {
+    "modified_arguments": [],
+    "common_arg_contracts_equal": [
+      "prefill_layer_moe_entry",
+      "prefill_layer_c2a_full",
+      "prefill_layer_epilogue_entry",
+      "prefill_layer_rank",
+      "layer_unpad_moe_rank",
+      "prefill_layer_c2a_reuse",
+      "_build_layer_entries",
+      "prefill_layer_c1a_full",
+      "layer_moe_tile_rank",
+      "layer_epilogue_rank",
+      "_run_staged_layer",
+      "prefill_layer_c1a_reuse",
+      "prefill_layer_entry",
+      "prefill_layer_swa",
+      "prefill_layer_c1a_reindex",
+      "layer_pad_moe_rank"
+    ]
+  },
+  "models/deepseek_v4_1_flash_a3_w8a8/prefill_moe.py": {
+    "modified_arguments": [],
+    "common_arg_contracts_equal": [
+      "prefill_moe",
+      "prefill_moe_rank",
+      "build_tensor_specs",
+      "_shared_expert",
+      "_stacked_experts"
+    ]
+  }
+}

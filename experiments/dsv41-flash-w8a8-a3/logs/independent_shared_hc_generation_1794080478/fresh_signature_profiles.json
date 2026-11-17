@@ -1,0 +1,109 @@
+{
+  "signature_receipt_sha256": "3f5441beade418bf307463188a7b5a52c733299cf6dffde0fe501d4df5fbefd4",
+  "programs": {
+    "prefill3": {
+      "counts": {
+        "PTO_RINT_down": 2,
+        "PTO_FP32_expansion": 2,
+        "CPP_RINT_down": 1,
+        "CPP_FP32_expansion": 1
+      },
+      "PTO": [
+        {
+          "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_hc_applied_signatures_1794076423/signature_build/_jit_prefill_fwd_20261108_023951_v2hdljxq/next_levels/l2_prefill_fwd/ptoas/hc_post.pto",
+          "sha256": "b3c0c1357751cc5c9f1fd14b8b3d999afb497300171155bd8f1bdf153662e3f6",
+          "RINT_down": [
+            {
+              "line": 154,
+              "text": "pto.tcvt ins(%value_inline19917__ssa_v4 {rmode = #pto<round_mode RINT>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%rounded_bf16_inline19921__ssa_v0 : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":214:13)"
+            },
+            {
+              "line": 184,
+              "text": "pto.tcvt ins(%14 {rmode = #pto<round_mode RINT>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%15 : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":214:13)"
+            }
+          ],
+          "FP32_expansion": [
+            {
+              "line": 156,
+              "text": "pto.tcvt ins(%rounded_bf16_inline19921__ssa_v0 {rmode = #pto<round_mode ROUND>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%rounded_fp32_inline19922__ssa_v0 : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":215:13)"
+            },
+            {
+              "line": 186,
+              "text": "pto.tcvt ins(%15 {rmode = #pto<round_mode ROUND>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%16 : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":215:13)"
+            }
+          ]
+        }
+      ],
+      "CPP": [
+        {
+          "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_hc_applied_signatures_1794076423/signature_build/_jit_prefill_fwd_20261108_023951_v2hdljxq/next_levels/l2_prefill_fwd/kernels/aiv/hc_post.cpp",
+          "sha256": "f2879e6ed94f8aa59d660a11510e6c19d9eee89e1da3795632177c488b3ac402",
+          "RINT_down": [
+            {
+              "line": 650,
+              "text": "RoundMode v204 = RoundMode::CAST_RINT;"
+            }
+          ],
+          "FP32_expansion": [
+            {
+              "line": 661,
+              "text": "RoundMode v208 = RoundMode::CAST_ROUND;"
+            }
+          ]
+        }
+      ]
+    },
+    "decode1": {
+      "counts": {
+        "PTO_RINT_down": 2,
+        "PTO_FP32_expansion": 2,
+        "CPP_RINT_down": 1,
+        "CPP_FP32_expansion": 1
+      },
+      "PTO": [
+        {
+          "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_hc_applied_signatures_1794076423/signature_build/_jit_decode_fwd_20261108_024248_tjwch92s/next_levels/decode_fwd_rank/ptoas/hc_post.pto",
+          "sha256": "2ac28283b6d77ef12a12c63d5e16034c706d5af70e2d78d0fe1396083e074050",
+          "RINT_down": [
+            {
+              "line": 154,
+              "text": "pto.tcvt ins(%value_inline13690__ssa_v4 {rmode = #pto<round_mode RINT>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%rounded_bf16_inline13694__ssa_v0 : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":214:13)"
+            },
+            {
+              "line": 184,
+              "text": "pto.tcvt ins(%14 {rmode = #pto<round_mode RINT>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%15 : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":214:13)"
+            }
+          ],
+          "FP32_expansion": [
+            {
+              "line": 156,
+              "text": "pto.tcvt ins(%rounded_bf16_inline13694__ssa_v0 {rmode = #pto<round_mode ROUND>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%rounded_fp32_inline13695__ssa_v0 : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":215:13)"
+            },
+            {
+              "line": 186,
+              "text": "pto.tcvt ins(%15 {rmode = #pto<round_mode ROUND>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%16 : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":215:13)"
+            }
+          ]
+        }
+      ],
+      "CPP": [
+        {
+          "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_hc_applied_signatures_1794076423/signature_build/_jit_decode_fwd_20261108_024248_tjwch92s/next_levels/decode_fwd_rank/kernels/aiv/hc_post.cpp",
+          "sha256": "c529ea36ddb3c0fd8f3bf87a94c801d18687da90b133d70f1e0aa7150bfb9c8d",
+          "RINT_down": [
+            {
+              "line": 650,
+              "text": "RoundMode v204 = RoundMode::CAST_RINT;"
+            }
+          ],
+          "FP32_expansion": [
+            {
+              "line": 661,
+              "text": "RoundMode v208 = RoundMode::CAST_ROUND;"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

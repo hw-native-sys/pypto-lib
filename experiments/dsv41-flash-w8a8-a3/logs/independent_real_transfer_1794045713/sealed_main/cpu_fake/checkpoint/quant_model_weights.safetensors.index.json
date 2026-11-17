@@ -1,0 +1,1 @@
+{"weight_map": {"embed.weight": "tiny.safetensors", "layers.1.ffn.experts.1.w1.weight": "tiny.safetensors", "layers.1.ffn.experts.1.w1.weight_offset": "tiny.safetensors", "layers.1.ffn.experts.1.w1.weight_scale": "tiny.safetensors", "head.weight": "tiny.safetensors"}}

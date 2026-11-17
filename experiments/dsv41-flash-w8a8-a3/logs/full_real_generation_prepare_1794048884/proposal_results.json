@@ -1,0 +1,16 @@
+{
+  "status": "PASS_UNAPPLIED_CANDIDATE_TINY_ONLY",
+  "cases": [
+    "default-HARD",
+    "all-free+exit-failure-references-cleared",
+    "upload-first-error-preserved",
+    "forward-first-error+all-cleanup",
+    "cleanup-only-error-reported",
+    "publicfree-boundary-and-postpolicy",
+    "actual-public-copy-guard-hooks",
+    "source/queue/forward-callsite-presence"
+  ],
+  "payload_bytes": 0,
+  "native": false,
+  "live_full_operation_tested": false
+}

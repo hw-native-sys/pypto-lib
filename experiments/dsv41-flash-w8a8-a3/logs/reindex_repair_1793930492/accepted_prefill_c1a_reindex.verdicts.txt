@@ -1,0 +1,7 @@
+[RUN]   'window_cache' PASS  shape=(2, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+[RUN]   'topk_indices' PASS  shape=(8, 512) dtype=torch.int32 (index_topk_compare)
+[RUN]   'topk_values' PASS  shape=(8, 512) dtype=torch.float32 (index_score_compare)
+[RUN]   'pool_block_ids' PASS  shape=(8, 64) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+[RUN]   'pool_block_counts' PASS  shape=(8,) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+[RUN]   'partial' PASS  shape=(8, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+[RUN] PASS (15.90s)

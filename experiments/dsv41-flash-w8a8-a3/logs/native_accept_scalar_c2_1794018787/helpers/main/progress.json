@@ -1,0 +1,9 @@
+{
+  "checkpoint_epoch": 1794016178,
+  "main_interval_start": 1794015323,
+  "capture_task": "task_20261107_094906_98427432350",
+  "capture_status": "submitted result pending",
+  "stream_cpu": "PASS",
+  "stream_native": "not submitted",
+  "full_weights": "HELD"
+}

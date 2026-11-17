@@ -1,0 +1,1 @@
+Independent frozen shared-owner draft review and runnable tiny2 proof preparation ONLY. No NPU/native execution yet; no live product/old artifact/runtime/dependency/real payload writes. Root will separately review helper and authorize hardware.

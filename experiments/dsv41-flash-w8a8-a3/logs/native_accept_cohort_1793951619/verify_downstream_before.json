@@ -1,0 +1,18 @@
+{
+  "sources": 45,
+  "main_evidence": 128,
+  "f08_manifest_entries": 22,
+  "f14_manifest_entries": 13,
+  "changed": [
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_c1a_full.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_c2a_full.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/layer_reference.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/moe_gate.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/paged_cache.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_c1a_full.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_c2a_full.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/rope.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/weight_loader.py"
+  ],
+  "protected_kernel_ASTs": "identical"
+}

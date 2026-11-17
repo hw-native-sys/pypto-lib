@@ -1,0 +1,20 @@
+{
+  "record_id": "main-f09-docs-recovery-1794089733",
+  "role": "main-agent",
+  "start_epoch": 1794089733,
+  "end_epoch": 1794089860.5170395,
+  "measured_wall_seconds": 127.51703953742981,
+  "category": "docs-report",
+  "shared_writes": [
+    "MODULES.md",
+    "INTERFACE.md",
+    "HANDOFF.md"
+  ],
+  "lock": ".coordination.lock/flock",
+  "CPU_tasks": [],
+  "NPU_tasks": [],
+  "worker_records_imported": 0,
+  "queued_checks": false,
+  "shared_ledger_imported_once": false,
+  "status": "FINAL_PARK_DOCS_ONLY"
+}

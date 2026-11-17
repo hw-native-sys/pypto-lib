@@ -1,0 +1,13 @@
+{
+  "CPU_jobs": 2,
+  "NPU_jobs": 0,
+  "active_helper_writes": 0,
+  "agent": "review-agent",
+  "elapsed_seconds": 1045,
+  "end_epoch": 1794079711,
+  "id": "observer-exited-process-race-1794078666-1794079711",
+  "protected_source_writes": 0,
+  "shared_writes": 0,
+  "start_epoch": 1794078666,
+  "state": "FINAL_PARK_CANDIDATE"
+}

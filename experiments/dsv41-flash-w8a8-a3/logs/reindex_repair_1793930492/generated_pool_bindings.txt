@@ -1,0 +1,120 @@
+FILE /mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/reindex_repair_1793930492/build_output/_jit_prefill_fwd_20261106_101740_sfv_e2e6/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp
+SHA256 379415731b24508e71ad4d9889f60cd54b96b619e561f37baaefe19c0eb74c9e
+5760:                 }
+5761:                 layer_topk_values_inline20974.is_contiguous = layer_topk_values_inline20974_empty || layer_topk_values_inline20974_contiguous;
+5762:                 uint32_t layer_pool_ids_inline20975_offsets[3] = {0, 0, 0};
+5763:                 uint32_t layer_pool_ids_inline20975_shapes[3] = {(layer_pool_ids_inline20975_offsets[0] >= ext_pool_block_ids_c1a.shapes[0] ? 0u : std::min<uint32_t>(1, ext_pool_block_ids_c1a.shapes[0] - layer_pool_ids_inline20975_offsets[0])), (layer_pool_ids_inline20975_offsets[1] >= ext_pool_block_ids_c1a.shapes[1] ? 0u : std::min<uint32_t>(static_cast<uint32_t>(T_DYN), ext_pool_block_ids_c1a.shapes[1] - layer_pool_ids_inline20975_offsets[1])), (layer_pool_ids_inline20975_offsets[2] >= ext_pool_block_ids_c1a.shapes[2] ? 0u : std::min<uint32_t>(static_cast<uint32_t>(POOL_BLOCKS_DYN), ext_pool_block_ids_c1a.shapes[2] - layer_pool_ids_inline20975_offsets[2]))};
+5764:                 Tensor layer_pool_ids_inline20975_view = ext_pool_block_ids_c1a.view(layer_pool_ids_inline20975_shapes, layer_pool_ids_inline20975_offsets);
+5765:                 bool layer_pool_ids_inline20975_empty = layer_pool_ids_inline20975_view.numel() == 0;
+5766:                 Tensor layer_pool_ids_inline20975 = layer_pool_ids_inline20975_view;
+5767:                 layer_pool_ids_inline20975.ndims = 2;
+5768:                 layer_pool_ids_inline20975.shapes[0] = layer_pool_ids_inline20975_view.shapes[1];
+5769:                 layer_pool_ids_inline20975.strides[0] = layer_pool_ids_inline20975_view.strides[1];
+5770:                 layer_pool_ids_inline20975.shapes[1] = layer_pool_ids_inline20975_view.shapes[2];
+5771:                 layer_pool_ids_inline20975.strides[1] = layer_pool_ids_inline20975_view.strides[2];
+5772:                 if (layer_pool_ids_inline20975_empty) layer_pool_ids_inline20975.shapes[0] = 0;
+5773:                 uint64_t layer_pool_ids_inline20975_expected_stride = 1;
+5774:                 bool layer_pool_ids_inline20975_contiguous = true;
+5775:                 for (int32_t i = static_cast<int32_t>(layer_pool_ids_inline20975.ndims) - 1; i >= 0; --i) {
+5776:                   layer_pool_ids_inline20975_contiguous = layer_pool_ids_inline20975_contiguous && (layer_pool_ids_inline20975.strides[i] == layer_pool_ids_inline20975_expected_stride);
+5777:                   layer_pool_ids_inline20975_expected_stride *= layer_pool_ids_inline20975.shapes[i];
+5778:                 }
+5779:                 layer_pool_ids_inline20975.is_contiguous = layer_pool_ids_inline20975_empty || layer_pool_ids_inline20975_contiguous;
+5780:                 uint32_t layer_pool_counts_inline20976_offsets[2] = {0, 0};
+5781:                 uint32_t layer_pool_counts_inline20976_shapes[2] = {(layer_pool_counts_inline20976_offsets[0] >= ext_pool_block_counts_c1a.shapes[0] ? 0u : std::min<uint32_t>(1, ext_pool_block_counts_c1a.shapes[0] - layer_pool_counts_inline20976_offsets[0])), (layer_pool_counts_inline20976_offsets[1] >= ext_pool_block_counts_c1a.shapes[1] ? 0u : std::min<uint32_t>(static_cast<uint32_t>(T_DYN), ext_pool_block_counts_c1a.shapes[1] - layer_pool_counts_inline20976_offsets[1]))};
+5782:                 Tensor layer_pool_counts_inline20976_view = ext_pool_block_counts_c1a.view(layer_pool_counts_inline20976_shapes, layer_pool_counts_inline20976_offsets);
+5783:                 bool layer_pool_counts_inline20976_empty = layer_pool_counts_inline20976_view.numel() == 0;
+5784:                 Tensor layer_pool_counts_inline20976 = layer_pool_counts_inline20976_view;
+5785:                 layer_pool_counts_inline20976.ndims = 1;
+5786:                 layer_pool_counts_inline20976.shapes[0] = layer_pool_counts_inline20976_view.shapes[1];
+5787:                 layer_pool_counts_inline20976.strides[0] = layer_pool_counts_inline20976_view.strides[1];
+5788:                 if (layer_pool_counts_inline20976_empty) layer_pool_counts_inline20976.shapes[0] = 0;
+5789:                 uint64_t layer_pool_counts_inline20976_expected_stride = 1;
+5790:                 bool layer_pool_counts_inline20976_contiguous = true;
+5791:                 for (int32_t i = static_cast<int32_t>(layer_pool_counts_inline20976.ndims) - 1; i >= 0; --i) {
+5792:                   layer_pool_counts_inline20976_contiguous = layer_pool_counts_inline20976_contiguous && (layer_pool_counts_inline20976.strides[i] == layer_pool_counts_inline20976_expected_stride);
+5793:                   layer_pool_counts_inline20976_expected_stride *= layer_pool_counts_inline20976.shapes[i];
+5794:                 }
+5795:                 layer_pool_counts_inline20976.is_contiguous = layer_pool_counts_inline20976_empty || layer_pool_counts_inline20976_contiguous;
+5796:                 uint32_t layer_reindex_wq_b_inline20977_offsets[3] = {static_cast<uint32_t>(reindex_slot_inline20956), 0, 0};
+5797:                 uint32_t layer_reindex_wq_b_inline20977_shapes[3] = {(layer_reindex_wq_b_inline20977_offsets[0] >= ext_re_idx_wq_b.shapes[0] ? 0u : std::min<uint32_t>(1, ext_re_idx_wq_b.shapes[0] - layer_reindex_wq_b_inline20977_offsets[0])), (layer_reindex_wq_b_inline20977_offsets[1] >= ext_re_idx_wq_b.shapes[1] ? 0u : std::min<uint32_t>(1280, ext_re_idx_wq_b.shapes[1] - layer_reindex_wq_b_inline20977_offsets[1])), (layer_reindex_wq_b_inline20977_offsets[2] >= ext_re_idx_wq_b.shapes[2] ? 0u : std::min<uint32_t>(4096, ext_re_idx_wq_b.shapes[2] - layer_reindex_wq_b_inline20977_offsets[2]))};
+8082:                                     SIMPLER_SCOPE() {
+8083: 
+8084:                                         // Spmd index_candidate_filter_spmd: index_candidate_filter
+8085:                                         CoreTaskArgs params_t226;
+8086:                                         params_t226.add_inout(filtered_inline21996);
+8087:                                         params_t226.add_input(ext_c1a_compressed_lens);
+8088:                                         params_t226.add_input(layer_pool_counts_inline20976);
+8089:                                         params_t226.add_input(layer_pool_ids_inline20975);
+8090:                                         params_t226.add_input(scores_inline21993__rv_v5);
+8091:                                         params_t226.add_scalar(POOL_BLOCKS_DYN);
+8092:                                         params_t226.add_scalar(width_inline22365);
+8093:                                         params_t226.launch_spec.set_block_num(num_tokens);
+8094:                                         TaskId params_t226_deps[1];
+8095:                                         uint32_t params_t226_deps_count = 0;
+8096:                                         if (scoring_ready_inline21994.is_valid()) params_t226_deps[params_t226_deps_count++] = scoring_ready_inline21994;
+8097:                                         params_t226.set_dependencies(params_t226_deps, params_t226_deps_count);
+8098:                                         TaskOutputTensors task_226_outs = rt_submit_aiv_task(100, params_t226);
+8099:                                         TaskId ret__tmp_v0_nonempty_1_46 = task_226_outs.task_id();
+8100:                                         ret__tmp_v0_guarded_0_51 = filtered_inline21996;
+8101:                                         ret__tmp_v0_guarded_1_44 = ret__tmp_v0_nonempty_1_46;
+FILE /mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/reindex_repair_1793930492/build_output/_jit_decode_fwd_20261106_101709_qp_e22h7/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp
+SHA256 dff7887bb280f953caf4666305bb87e5da687999a07907596853ef90e6eaf0f1
+8237:                                 }
+8238:                                 topk_values_inline17000.is_contiguous = topk_values_inline17000_empty || topk_values_inline17000_contiguous;
+8239:                                 uint32_t pool_block_ids_inline17001_offsets[3] = {3, 0, 0};
+8240:                                 uint32_t pool_block_ids_inline17001_shapes[3] = {(pool_block_ids_inline17001_offsets[0] >= ext_pool_block_ids.shapes[0] ? 0u : std::min<uint32_t>(1, ext_pool_block_ids.shapes[0] - pool_block_ids_inline17001_offsets[0])), (pool_block_ids_inline17001_offsets[1] >= ext_pool_block_ids.shapes[1] ? 0u : std::min<uint32_t>(static_cast<uint32_t>(T_DYN), ext_pool_block_ids.shapes[1] - pool_block_ids_inline17001_offsets[1])), (pool_block_ids_inline17001_offsets[2] >= ext_pool_block_ids.shapes[2] ? 0u : std::min<uint32_t>(static_cast<uint32_t>(POOL_BLOCKS_DYN), ext_pool_block_ids.shapes[2] - pool_block_ids_inline17001_offsets[2]))};
+8241:                                 Tensor pool_block_ids_inline17001_view = ext_pool_block_ids.view(pool_block_ids_inline17001_shapes, pool_block_ids_inline17001_offsets);
+8242:                                 bool pool_block_ids_inline17001_empty = pool_block_ids_inline17001_view.numel() == 0;
+8243:                                 Tensor pool_block_ids_inline17001 = pool_block_ids_inline17001_view;
+8244:                                 pool_block_ids_inline17001.ndims = 2;
+8245:                                 pool_block_ids_inline17001.shapes[0] = pool_block_ids_inline17001_view.shapes[1];
+8246:                                 pool_block_ids_inline17001.strides[0] = pool_block_ids_inline17001_view.strides[1];
+8247:                                 pool_block_ids_inline17001.shapes[1] = pool_block_ids_inline17001_view.shapes[2];
+8248:                                 pool_block_ids_inline17001.strides[1] = pool_block_ids_inline17001_view.strides[2];
+8249:                                 if (pool_block_ids_inline17001_empty) pool_block_ids_inline17001.shapes[0] = 0;
+8250:                                 uint64_t pool_block_ids_inline17001_expected_stride = 1;
+8251:                                 bool pool_block_ids_inline17001_contiguous = true;
+8252:                                 for (int32_t i = static_cast<int32_t>(pool_block_ids_inline17001.ndims) - 1; i >= 0; --i) {
+8253:                                   pool_block_ids_inline17001_contiguous = pool_block_ids_inline17001_contiguous && (pool_block_ids_inline17001.strides[i] == pool_block_ids_inline17001_expected_stride);
+8254:                                   pool_block_ids_inline17001_expected_stride *= pool_block_ids_inline17001.shapes[i];
+8255:                                 }
+8256:                                 pool_block_ids_inline17001.is_contiguous = pool_block_ids_inline17001_empty || pool_block_ids_inline17001_contiguous;
+8257:                                 uint32_t pool_block_counts_inline17002_offsets[2] = {3, 0};
+8258:                                 uint32_t pool_block_counts_inline17002_shapes[2] = {(pool_block_counts_inline17002_offsets[0] >= ext_pool_block_counts.shapes[0] ? 0u : std::min<uint32_t>(1, ext_pool_block_counts.shapes[0] - pool_block_counts_inline17002_offsets[0])), (pool_block_counts_inline17002_offsets[1] >= ext_pool_block_counts.shapes[1] ? 0u : std::min<uint32_t>(static_cast<uint32_t>(T_DYN), ext_pool_block_counts.shapes[1] - pool_block_counts_inline17002_offsets[1]))};
+8259:                                 Tensor pool_block_counts_inline17002_view = ext_pool_block_counts.view(pool_block_counts_inline17002_shapes, pool_block_counts_inline17002_offsets);
+8260:                                 bool pool_block_counts_inline17002_empty = pool_block_counts_inline17002_view.numel() == 0;
+8261:                                 Tensor pool_block_counts_inline17002 = pool_block_counts_inline17002_view;
+8262:                                 pool_block_counts_inline17002.ndims = 1;
+8263:                                 pool_block_counts_inline17002.shapes[0] = pool_block_counts_inline17002_view.shapes[1];
+8264:                                 pool_block_counts_inline17002.strides[0] = pool_block_counts_inline17002_view.strides[1];
+8265:                                 if (pool_block_counts_inline17002_empty) pool_block_counts_inline17002.shapes[0] = 0;
+8266:                                 uint64_t pool_block_counts_inline17002_expected_stride = 1;
+8267:                                 bool pool_block_counts_inline17002_contiguous = true;
+8268:                                 for (int32_t i = static_cast<int32_t>(pool_block_counts_inline17002.ndims) - 1; i >= 0; --i) {
+8269:                                   pool_block_counts_inline17002_contiguous = pool_block_counts_inline17002_contiguous && (pool_block_counts_inline17002.strides[i] == pool_block_counts_inline17002_expected_stride);
+8270:                                   pool_block_counts_inline17002_expected_stride *= pool_block_counts_inline17002.shapes[i];
+8271:                                 }
+8272:                                 pool_block_counts_inline17002.is_contiguous = pool_block_counts_inline17002_empty || pool_block_counts_inline17002_contiguous;
+8273:                                 uint32_t x_flat_inline17026_shapes[2] = {static_cast<uint32_t>(T_DYN), 20480};
+8274:                                 Tensor x_flat_inline17026 = ext_x_hc.reshape(x_flat_inline17026_shapes, 2);
+8841:                                     SIMPLER_SCOPE() {
+8842: 
+8843:                                         // Spmd index_candidate_filter_spmd: index_candidate_filter
+8844:                                         CoreTaskArgs params_t261;
+8845:                                         params_t261.add_inout(filtered_inline17148);
+8846:                                         params_t261.add_input(ext_c1a_compressed_lens);
+8847:                                         params_t261.add_input(pool_block_counts_inline17002);
+8848:                                         params_t261.add_input(pool_block_ids_inline17001);
+8849:                                         params_t261.add_input(scores_inline17145__rv_v5);
+8850:                                         params_t261.add_scalar(POOL_BLOCKS_DYN);
+8851:                                         params_t261.add_scalar(width_inline17517);
+8852:                                         params_t261.launch_spec.set_block_num(num_tokens);
+8853:                                         TaskId params_t261_deps[1];
+8854:                                         uint32_t params_t261_deps_count = 0;
+8855:                                         if (scoring_ready_inline17146.is_valid()) params_t261_deps[params_t261_deps_count++] = scoring_ready_inline17146;
+8856:                                         params_t261.set_dependencies(params_t261_deps, params_t261_deps_count);
+8857:                                         TaskOutputTensors task_261_outs = rt_submit_aiv_task(121, params_t261);
+8858:                                         TaskId ret__tmp_v0_nonempty_1_51 = task_261_outs.task_id();
+8859:                                         ret__tmp_v0_guarded_0_54 = filtered_inline17148;
+8860:                                         ret__tmp_v0_guarded_1_47 = ret__tmp_v0_nonempty_1_51;

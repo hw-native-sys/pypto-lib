@@ -1,0 +1,9 @@
+{
+  "task_id": "task_20261108_060741_168971624009",
+  "exit_code": 0,
+  "device": "no-device",
+  "max_time": 180,
+  "timeout": 240,
+  "result_sha256": "d16165fa023d41b6f45bc19c0bd90207910479a57f95592714910f72bd39903e",
+  "no_compile_prepare_NPU": true
+}

@@ -1,0 +1,1302 @@
+{
+  "changed": [
+    "models/deepseek_v4_1_flash_a3_w8a8/config.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_c1a_full.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_c1a_reindex.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_c2a_full.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_fwd.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_layer.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/engram.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/generate.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/indexer.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/layer_reference.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_c1a_full.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_c1a_reindex.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_c2a_full.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_fwd.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_layer.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/weight_loader.py"
+  ],
+  "source_count": 45,
+  "manifest_sha256": "7c5b8df2d57ca06a49106b528c2a018d36cd1524f4df8418e59ffa64b7d24d7f",
+  "main_positive_executions": 51,
+  "main_negative_order_controls": 2,
+  "default_numerical_cases": 45,
+  "downstream_rows": [
+    {
+      "entry": "mla_proj",
+      "start": "1793964824",
+      "end": "1793964845",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "o_proj",
+      "start": "1793964845",
+      "end": "1793964865",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "engram",
+      "start": "1793964865",
+      "end": "1793964890",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "moe_gate",
+      "start": "1793964890",
+      "end": "1793964909",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "compressor",
+      "start": "1793964909",
+      "end": "1793964928",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "indexer",
+      "start": "1793964928",
+      "end": "1793964960",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "decode_swa",
+      "start": "1793964960",
+      "end": "1793964980",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "prefill_swa",
+      "start": "1793964980",
+      "end": "1793965001",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "decode_c2a_full",
+      "start": "1793965001",
+      "end": "1793965027",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "prefill_c2a_full",
+      "start": "1793965027",
+      "end": "1793965052",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "decode_c2a_reuse",
+      "start": "1793965052",
+      "end": "1793965071",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "prefill_c2a_reuse",
+      "start": "1793965071",
+      "end": "1793965090",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "decode_c1a_full",
+      "start": "1793965090",
+      "end": "1793965116",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "prefill_c1a_full",
+      "start": "1793965116",
+      "end": "1793965139",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "decode_c1a_reindex",
+      "start": "1793965139",
+      "end": "1793965163",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "prefill_c1a_reindex",
+      "start": "1793965163",
+      "end": "1793965185",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "decode_c1a_reuse",
+      "start": "1793965185",
+      "end": "1793965205",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "prefill_c1a_reuse",
+      "start": "1793965205",
+      "end": "1793965223",
+      "exit": "0",
+      "device": "0"
+    }
+  ],
+  "downstream": {
+    "mla_proj": {
+      "positive_cases": 3,
+      "output_verdicts": [
+        [
+          "q",
+          "PASS"
+        ],
+        [
+          "kv",
+          "PASS"
+        ],
+        [
+          "qr",
+          "PASS"
+        ],
+        [
+          "qr_scale",
+          "PASS"
+        ],
+        [
+          "q",
+          "PASS"
+        ],
+        [
+          "kv",
+          "PASS"
+        ],
+        [
+          "qr",
+          "PASS"
+        ],
+        [
+          "qr_scale",
+          "PASS"
+        ],
+        [
+          "q",
+          "PASS"
+        ],
+        [
+          "kv",
+          "PASS"
+        ],
+        [
+          "qr",
+          "PASS"
+        ],
+        [
+          "qr_scale",
+          "PASS"
+        ]
+      ]
+    },
+    "o_proj": {
+      "positive_cases": 4,
+      "output_verdicts": [
+        [
+          "output",
+          "PASS"
+        ],
+        [
+          "output",
+          "PASS"
+        ],
+        [
+          "output",
+          "PASS"
+        ],
+        [
+          "output",
+          "PASS"
+        ]
+      ]
+    },
+    "engram": {
+      "positive_cases": 5,
+      "output_verdicts": [
+        [
+          "output",
+          "PASS"
+        ],
+        [
+          "output",
+          "PASS"
+        ],
+        [
+          "output",
+          "PASS"
+        ],
+        [
+          "output",
+          "PASS"
+        ],
+        [
+          "output",
+          "PASS"
+        ]
+      ]
+    },
+    "moe_gate": {
+      "positive_cases": 4,
+      "output_verdicts": [
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "weights",
+          "PASS"
+        ],
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "weights",
+          "PASS"
+        ],
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "weights",
+          "PASS"
+        ],
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "weights",
+          "PASS"
+        ]
+      ]
+    },
+    "compressor": {
+      "positive_cases": 2,
+      "output_verdicts": [
+        [
+          "output",
+          "PASS"
+        ],
+        [
+          "state_cache",
+          "PASS"
+        ],
+        [
+          "output",
+          "PASS"
+        ]
+      ]
+    },
+    "indexer": {
+      "positive_cases": 9,
+      "output_verdicts": [
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "scores",
+          "PASS"
+        ],
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "values",
+          "PASS"
+        ],
+        [
+          "pool_ids",
+          "PASS"
+        ],
+        [
+          "pool_counts",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "scores",
+          "PASS"
+        ],
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "values",
+          "PASS"
+        ],
+        [
+          "pool_ids",
+          "PASS"
+        ],
+        [
+          "pool_counts",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "scores",
+          "PASS"
+        ],
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "values",
+          "PASS"
+        ],
+        [
+          "pool_ids",
+          "PASS"
+        ],
+        [
+          "pool_counts",
+          "PASS"
+        ],
+        [
+          "pool_ids",
+          "PASS"
+        ],
+        [
+          "pool_counts",
+          "PASS"
+        ],
+        [
+          "pool_ids",
+          "PASS"
+        ],
+        [
+          "pool_counts",
+          "PASS"
+        ],
+        [
+          "pool_ids",
+          "PASS"
+        ],
+        [
+          "pool_counts",
+          "PASS"
+        ],
+        [
+          "pool_ids",
+          "PASS"
+        ],
+        [
+          "pool_counts",
+          "PASS"
+        ],
+        [
+          "pool_ids",
+          "PASS"
+        ],
+        [
+          "pool_counts",
+          "PASS"
+        ],
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "values",
+          "PASS"
+        ],
+        [
+          "pool_ids",
+          "PASS"
+        ],
+        [
+          "pool_counts",
+          "PASS"
+        ],
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "values",
+          "PASS"
+        ]
+      ]
+    },
+    "decode_swa": {
+      "positive_cases": 2,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ],
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    "prefill_swa": {
+      "positive_cases": 1,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    "decode_c2a_full": {
+      "positive_cases": 2,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "state_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ],
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "state_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    "prefill_c2a_full": {
+      "positive_cases": 1,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "state_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    "decode_c2a_reuse": {
+      "positive_cases": 2,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ],
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    "prefill_c2a_reuse": {
+      "positive_cases": 1,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    "decode_c1a_full": {
+      "positive_cases": 2,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ],
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    "prefill_c1a_full": {
+      "positive_cases": 1,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    "decode_c1a_reindex": {
+      "positive_cases": 2,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ],
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    "prefill_c1a_reindex": {
+      "positive_cases": 1,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    "decode_c1a_reuse": {
+      "positive_cases": 2,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ],
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    "prefill_c1a_reuse": {
+      "positive_cases": 1,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    }
+  },
+  "order_records": {
+    "prefill_swa_before": {
+      "post_mutant": false,
+      "error": null,
+      "phase": "prefill",
+      "mode": "swa",
+      "real_rotation_map": false
+    },
+    "decode_c2_post": {
+      "post_mutant": true,
+      "error": "Output(s) does not match golden: ['hidden', 'attn_input', 'window_cache', 'compressed_cache']\n  'hidden' FAIL (ratio_allclose(atol=0.01, rtol=0.01, max_error_ratio=0.05, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))  shape=(16, 2, 5120) dtype=torch.bfloat16\n    ratio_allclose fail: error_count=88352/163840 (ratio=53.9258%, allowed<=5.0000%, threshold=8192 pts)\n    atol=0.01 rtol=0.01\n    max abs diff=0.166016 at (4, 1, 1817) (tol=0.0150781)\n    first 10 mismatches:\n    [1] actual=-0.96875, expected=-1.015625, diff=0.04688, tol=0.02016\n    [2] actual=0.038818359, expected=0.018554688, diff=0.02026, tol=0.01019\n    [3] actual=0.34960938, expected=0.33007812, diff=0.01953, tol=0.0133\n    [4] actual=1.125, expected=1.1484375, diff=0.02344, tol=0.02148\n    [7] actual=-1.6328125, expected=-1.6796875, diff=0.04688, tol=0.0268\n    [8] actual=0.41601562, expected=0.3984375, diff=0.01758, tol=0.01398\n    [9] actual=0.55859375, expected=0.5078125, diff=0.05078, tol=0.01508\n    [10] actual=-0.35546875, expected=-0.3828125, diff=0.02734, tol=0.01383\n    [11] actual=1.796875, expected=1.7578125, diff=0.03906, tol=0.02758\n    [14] actual=0.5859375, expected=0.609375, diff=0.02344, tol=0.01609\n  'attn_input' FAIL (ratio_allclose(atol=0.01, rtol=0.01, max_error_ratio=0.05, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))  shape=(16, 2, 5120) dtype=torch.bfloat16\n    ratio_allclose fail: error_count=89308/163840 (ratio=54.5093%, allowed<=5.0000%, threshold=8192 pts)\n    atol=0.01 rtol=0.01\n    max abs diff=0.158203 at (4, 1, 1817) (tol=0.0148633)\n    first 10 mismatches:\n    [1] actual=-0.875, expected=-0.9140625, diff=0.03906, tol=0.01914\n    [2] actual=0.030761719, expected=0.014709473, diff=0.01605, tol=0.01015\n    [3] actual=0.27539062, expected=0.25976562, diff=0.01562, tol=0.0126\n    [4] actual=0.91796875, expected=0.9375, diff=0.01953, tol=0.01938\n    [7] actual=-1.4609375, expected=-1.5, diff=0.03906, tol=0.025\n    [8] actual=0.37304688, expected=0.35742188, diff=0.01562, tol=0.01357\n    [9] actual=0.4921875, expected=0.44726562, diff=0.04492, tol=0.01447\n    [10] actual=-0.35351562, expected=-0.38085938, diff=0.02734, tol=0.01381\n    [11] actual=1.2890625, expected=1.265625, diff=0.02344, tol=0.02266\n    [13] actual=-1.859375, expected=-1.890625, diff=0.03125, tol=0.02891\n  'window_cache' FAIL (compare)  shape=(16, 20, 128, 1, 512) dtype=torch.bfloat16\noriginal Engram before-attention window_cache rank0:     ratio_allclose fail: error_count=371/1024 (ratio=36.2305%, allowed<=1.0000%, threshold=10 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=0.155029 at (1, 350) (tol=0.0220447)\n    first 10 mismatches:\n    [0] actual=-0.23535156, expected=-0.3046875, diff=0.06934, tol=0.02476\n    [1] actual=-1.5625, expected=-1.6171875, diff=0.05469, tol=0.04527\n    [3] actual=0.91015625, expected=0.828125, diff=0.08203, tol=0.03294\n    [4] actual=-0.042480469, expected=-0.069335938, diff=0.02686, tol=0.02108\n    [7] actual=-0.5390625, expected=-0.5859375, diff=0.04688, tol=0.02916\n    [8] actual=0.10791016, expected=0.051757812, diff=0.05615, tol=0.02081\n    [10] actual=-1.2578125, expected=-1.3046875, diff=0.04688, tol=0.04039\n    [13] actual=1.125, expected=1.0546875, diff=0.07031, tol=0.03648\n    [15] actual=1.796875, expected=1.8671875, diff=0.07031, tol=0.04917\n    [20] actual=1.171875, expected=1.1171875, diff=0.05469, tol=0.03746\n  'compressed_cache' FAIL (compare)  shape=(16, 20, 128, 1, 512) dtype=torch.bfloat16\noriginal Engram before-attention compressed_cache rank0:     ratio_allclose fail: error_count=128/512 (ratio=25.0000%, allowed<=1.0000%, threshold=5 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=0.113281 at (0, 483) (tol=0.0298267)\n    first 10 mismatches:\n    [3] actual=0.49804688, expected=0.54296875, diff=0.04492, tol=0.02848\n    [20] actual=-0.12695312, expected=-0.10205078, diff=0.0249, tol=0.02159\n    [22] actual=-0.67578125, expected=-0.62109375, diff=0.05469, tol=0.0297\n    [26] actual=0.26171875, expected=0.1875, diff=0.07422, tol=0.02293\n    [30] actual=0.43945312, expected=0.50390625, diff=0.06445, tol=0.02787\n    [35] actual=0.8203125, expected=0.87109375, diff=0.05078, tol=0.03361\n    [37] actual=0.20214844, expected=0.14355469, diff=0.05859, tol=0.02224\n    [43] actual=-0.21191406, expected=-0.23828125, diff=0.02637, tol=0.02372\n    [53] actual=1.140625, expected=1.1796875, diff=0.03906, tol=0.03843\n    [66] actual=-1.7734375, expected=-1.7109375, diff=0.0625, tol=0.04673",
+      "phase": "decode",
+      "mode": "c2",
+      "real_rotation_map": true,
+      "full_layer": false,
+      "failure_counts": [
+        [
+          "88352",
+          "163840"
+        ],
+        [
+          "89308",
+          "163840"
+        ],
+        [
+          "371",
+          "1024"
+        ],
+        [
+          "128",
+          "512"
+        ]
+      ]
+    },
+    "decode_swa_before": {
+      "post_mutant": false,
+      "error": null,
+      "phase": "decode",
+      "mode": "swa",
+      "real_rotation_map": false,
+      "full_layer": false
+    },
+    "prefill_swa_post": {
+      "post_mutant": true,
+      "error": "Output(s) does not match golden: ['hidden', 'attn_input', 'window_cache']\n  'hidden' FAIL (ratio_allclose(atol=0.01, rtol=0.01, max_error_ratio=0.05, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))  shape=(16, 16, 5120) dtype=torch.bfloat16\n    ratio_allclose fail: error_count=741104/1310720 (ratio=56.5417%, allowed<=5.0000%, threshold=65536 pts)\n    atol=0.01 rtol=0.01\n    max abs diff=0.179688 at (12, 8, 3611) (tol=0.0272656)\n    first 10 mismatches:\n    [6] actual=-0.25585938, expected=-0.28125, diff=0.02539, tol=0.01281\n    [8] actual=0.27929688, expected=0.25976562, diff=0.01953, tol=0.0126\n    [9] actual=0.067382812, expected=0.087890625, diff=0.02051, tol=0.01088\n    [10] actual=0.065917969, expected=0.043945312, diff=0.02197, tol=0.01044\n    [13] actual=-0.72265625, expected=-0.69921875, diff=0.02344, tol=0.01699\n    [14] actual=0.328125, expected=0.37695312, diff=0.04883, tol=0.01377\n    [20] actual=0.071289062, expected=0.0859375, diff=0.01465, tol=0.01086\n    [21] actual=-0.77734375, expected=-0.7578125, diff=0.01953, tol=0.01758\n    [22] actual=-0.28125, expected=-0.33203125, diff=0.05078, tol=0.01332\n    [23] actual=0.16308594, expected=0.11621094, diff=0.04688, tol=0.01116\n  'attn_input' FAIL (ratio_allclose(atol=0.01, rtol=0.01, max_error_ratio=0.05, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))  shape=(16, 16, 5120) dtype=torch.bfloat16\n    ratio_allclose fail: error_count=722092/1310720 (ratio=55.0912%, allowed<=5.0000%, threshold=65536 pts)\n    atol=0.01 rtol=0.01\n    max abs diff=0.15625 at (8, 3, 3081) (tol=0.0467187)\n    first 10 mismatches:\n    [3] actual=0.55078125, expected=0.53515625, diff=0.01562, tol=0.01535\n    [6] actual=-0.40820312, expected=-0.44921875, diff=0.04102, tol=0.01449\n    [7] actual=-0.94140625, expected=-0.91796875, diff=0.02344, tol=0.01918\n    [8] actual=0.41992188, expected=0.390625, diff=0.0293, tol=0.01391\n    [9] actual=0.10009766, expected=0.12988281, diff=0.02979, tol=0.0113\n    [10] actual=0.11035156, expected=0.073730469, diff=0.03662, tol=0.01074\n    [13] actual=-1.0390625, expected=-1.0078125, diff=0.03125, tol=0.02008\n    [14] actual=0.60546875, expected=0.6953125, diff=0.08984, tol=0.01695\n    [20] actual=0.11523438, expected=0.13867188, diff=0.02344, tol=0.01139\n    [21] actual=-1.25, expected=-1.21875, diff=0.03125, tol=0.02219\n  'window_cache' FAIL (compare)  shape=(16, 20, 128, 1, 512) dtype=torch.bfloat16\noriginal Engram before-attention window_cache rank0:     ratio_allclose fail: error_count=2819/8192 (ratio=34.4116%, allowed<=1.0000%, threshold=82 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=0.171875 at (12, 107) (tol=0.0341602)\n    first 10 mismatches:\n    [1] actual=-1.3828125, expected=-1.3359375, diff=0.04688, tol=0.04087\n    [2] actual=0.66015625, expected=0.70703125, diff=0.04688, tol=0.03105\n    [3] actual=0.85546875, expected=0.8203125, diff=0.03516, tol=0.03282\n    [7] actual=-0.7578125, expected=-0.71875, diff=0.03906, tol=0.03123\n    [9] actual=0.40234375, expected=0.35351562, diff=0.04883, tol=0.02552\n    [10] actual=-0.55078125, expected=-0.58203125, diff=0.03125, tol=0.02909\n    [11] actual=0.040771484, expected=-0.0076599121, diff=0.04843, tol=0.02012\n    [14] actual=-0.375, expected=-0.42382812, diff=0.04883, tol=0.02662\n    [17] actual=-0.390625, expected=-0.359375, diff=0.03125, tol=0.02562\n    [18] actual=-0.51953125, expected=-0.5703125, diff=0.05078, tol=0.02891",
+      "phase": "prefill",
+      "mode": "swa",
+      "real_rotation_map": false,
+      "full_layer": false,
+      "failure_counts": [
+        [
+          "741104",
+          "1310720"
+        ],
+        [
+          "722092",
+          "1310720"
+        ],
+        [
+          "2819",
+          "8192"
+        ]
+      ]
+    },
+    "decode_c2_before": {
+      "post_mutant": false,
+      "error": null,
+      "phase": "decode",
+      "mode": "c2",
+      "real_rotation_map": true,
+      "full_layer": false
+    },
+    "prefill_c2_before": {
+      "post_mutant": false,
+      "error": null,
+      "phase": "prefill",
+      "mode": "c2",
+      "real_rotation_map": true,
+      "full_layer": false
+    }
+  },
+  "order_rows": [
+    {
+      "case": "prefill_c2",
+      "start": "1793965367",
+      "end": "1793965455",
+      "exit": "0",
+      "devices": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+    },
+    {
+      "case": "decode_swa",
+      "start": "1793965455",
+      "end": "1793965532",
+      "exit": "0",
+      "devices": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+    },
+    {
+      "case": "decode_c2",
+      "start": "1793965532",
+      "end": "1793965627",
+      "exit": "0",
+      "devices": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+    },
+    {
+      "case": "prefill_swa_post",
+      "start": "1793965627",
+      "end": "1793965702",
+      "exit": "0",
+      "devices": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+    },
+    {
+      "case": "decode_c2_post",
+      "start": "1793965702",
+      "end": "1793965794",
+      "exit": "0",
+      "devices": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+    }
+  ],
+  "full_layer_rows": [
+    {
+      "case": "prefill_swa",
+      "start": "1793965799",
+      "end": "1793965938",
+      "exit": "0",
+      "devices": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+    },
+    {
+      "case": "decode_c2",
+      "start": "1793965938",
+      "end": "1793966071",
+      "exit": "0",
+      "devices": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+    }
+  ],
+  "compile_rows": [
+    {
+      "entry": "decode_fwd",
+      "start": "1793964844",
+      "end": "1793964874",
+      "exit": "0"
+    },
+    {
+      "entry": "prefill_fwd",
+      "start": "1793964874",
+      "end": "1793964903",
+      "exit": "0"
+    }
+  ],
+  "loader": {
+    "synthetic_stored_orientation_exact": true,
+    "cache_reused": true,
+    "invalid_controls": {
+      "off_block": "Engram gate requires repeated block32 global rotation",
+      "different_block": "Engram gate requires repeated block32 global rotation",
+      "wrong_shape": "global rotation shape must match hidden size",
+      "metadata": "unsupported Engram rotation contract",
+      "missing_map": "explicit FileNotFoundError"
+    },
+    "real_rotation_map_only": {
+      "shape": [
+        32,
+        32
+      ],
+      "dtype": "torch.float32",
+      "block_sha256": "68fef81121ad4d31c34d7659a684bff34d2fc1de23bc46201cf6cf35606fca1a",
+      "orthogonality_max_abs": 5.960464477539063e-08
+    },
+    "limits": "Only optional rotation map/config read from real checkpoint; no model/Engram table weights loaded, no checkpoint writes."
+  },
+  "bindings": {
+    "actual_top_loader_and_rank_carrier_preserve_resource": true,
+    "actual_entry_contract_and_assembler": {
+      "prefill": {
+        "rotation_shape": [
+          16,
+          32,
+          32
+        ],
+        "rotation_binding_exact": true,
+        "actual_pool_cap": 2048,
+        "actual_pool_arguments": [
+          "pool_block_ids_c2a",
+          "pool_block_ids_c1a"
+        ]
+      },
+      "decode": {
+        "rotation_shape": [
+          16,
+          32,
+          32
+        ],
+        "rotation_binding_exact": true,
+        "actual_pool_cap": 2048,
+        "actual_pool_arguments": [
+          "pool_block_ids"
+        ]
+      }
+    },
+    "limits": "Real optional rotation map only; model weight methods stubbed to avoid full loads. Actual bounded fixture contracts inspected, no claim that other generator F11-F13 values are valid or generation executes."
+  },
+  "worker_engram": {
+    "source_sha256": "bffe927ae1db89fef4dcc8384d32ed56687cfc2a7fce1e65a9c01a66174d1f51",
+    "reference_sources": {
+      "vllm_ascend/models/deepseek_v41/engram/common.py": "4797b8962264d137cdb142a9988825288283092fb797ddbd334c6ab2223eb58d",
+      "vllm_ascend/models/deepseek_v41/engram/layer.py": "dc9457c88aa3c90133115bc608447e037b0693f8db71bb8da37f1ead44021f80"
+    },
+    "default_cases": 5,
+    "positive_executions": 7,
+    "negative_controls": {
+      "before": {
+        "counts": [
+          [
+            "114298",
+            "143360"
+          ]
+        ],
+        "max_abs": [
+          "0.872661"
+        ]
+      },
+      "missing": {
+        "counts": [
+          [
+            "114102",
+            "143360"
+          ]
+        ],
+        "max_abs": [
+          "0.872539"
+        ]
+      },
+      "transpose": {
+        "counts": [
+          [
+            "136184",
+            "143360"
+          ]
+        ],
+        "max_abs": [
+          "1.17527"
+        ]
+      },
+      "double_value": {
+        "counts": [
+          [
+            "139453",
+            "143360"
+          ]
+        ],
+        "max_abs": [
+          "1.89674"
+        ]
+      },
+      "fp32_projection": {
+        "counts": [
+          [
+            "45810",
+            "61440"
+          ]
+        ],
+        "max_abs": [
+          "0.00939989"
+        ]
+      },
+      "bf16_output": {
+        "counts": [
+          [
+            "112239",
+            "143360"
+          ]
+        ],
+        "max_abs": [
+          "0.00725031"
+        ]
+      }
+    },
+    "device_rows": [
+      {
+        "mode": "before",
+        "start": "1793958132",
+        "end": "1793958149",
+        "exit": "0",
+        "device": "0"
+      },
+      {
+        "mode": "missing",
+        "start": "1793958149",
+        "end": "1793958165",
+        "exit": "0",
+        "device": "0"
+      },
+      {
+        "mode": "transpose",
+        "start": "1793958165",
+        "end": "1793958182",
+        "exit": "0",
+        "device": "0"
+      },
+      {
+        "mode": "double_value",
+        "start": "1793958182",
+        "end": "1793958199",
+        "exit": "0",
+        "device": "0"
+      },
+      {
+        "mode": "random",
+        "start": "1793958199",
+        "end": "1793958218",
+        "exit": "0",
+        "device": "0"
+      },
+      {
+        "mode": "fp32_projection",
+        "start": "1793958218",
+        "end": "1793958236",
+        "exit": "0",
+        "device": "0"
+      },
+      {
+        "mode": "bf16_output",
+        "start": "1793958236",
+        "end": "1793958252",
+        "exit": "0",
+        "device": "0"
+      },
+      {
+        "mode": "after",
+        "start": "1793958252",
+        "end": "1793958269",
+        "exit": "0",
+        "device": "0"
+      }
+    ]
+  },
+  "worker_cap": {
+    "scoped_sources": {
+      "config.py": {
+        "before": "89769114dfe8965bf133496d283244ea7a9d284c3186321daafc406c4731ddb0",
+        "after": "e0542e042be6019f51ec367801565bd9fc8a48ecddd00ce980d60659e638ff19"
+      },
+      "indexer.py": {
+        "before": "8f998dc7ae8773e67acda854af515f9ae7625374ba101b71152e243b0585df43",
+        "after": "5568b7aae5f43c9f0e335161b9103aa483e2a3606b94473fd6194994f93bc8b4"
+      },
+      "prefill_c1a_full.py": {
+        "before": "fb3042a3acc1416dc15dd4910534051b96e57aafeb4b2feb58c52e7766a79c12",
+        "after": "f6b0572623a262f32af5c8974cbf55e12c09b615a71b2e427a777a9d2fdfb0f6"
+      },
+      "prefill_c2a_full.py": {
+        "before": "719280b7760e9b886f47daf25c20a9298340a9f2520e070815a7ee182acde934",
+        "after": "0ae33b6f810d0a9012de0ba75f1fd57e749be45a205963628fb9c327e4a5f045"
+      },
+      "decode_c1a_full.py": {
+        "before": "414fc8f4b9b60bf129542e27b55a15ab694659295fac41f1144398f84770001a",
+        "after": "6d9e1534fa67818b5d3d431e75bd1399940215312d4d195b92d270dba0614623"
+      },
+      "decode_c2a_full.py": {
+        "before": "99224d64b90218d5d511b7c27ddc0df58ae25164689c404785261cce56a66a1f",
+        "after": "66a55b42800b5d1d311c7f6442e941546453a7adebd54a861679c7baf2d18f37"
+      },
+      "prefill_c1a_reindex.py": {
+        "before": "ea1e1fbb857698f89b4bdaabe6a151d50921c14fdd5fac9c5a635b812c2b4842",
+        "after": "59c745a848900488a5f1dbd300ba58861d241042da44bc39ccdcdf005edb9818"
+      },
+      "decode_c1a_reindex.py": {
+        "before": "ea0a3666749b188a5ebeace4a2496e5fb11eee79d6ccc50f02af6c32097a8926",
+        "after": "89913fbffa08bac0f053d851999357276f51d2d3d1c0c34b3bd5d4ae638a876e"
+      }
+    },
+    "device_rows": [
+      {
+        "entry": "negative64",
+        "start": "1793957818",
+        "end": "1793957831",
+        "exit": "0",
+        "device": "1"
+      },
+      {
+        "entry": "indexer",
+        "start": "1793957831",
+        "end": "1793957861",
+        "exit": "0",
+        "device": "1"
+      },
+      {
+        "entry": "prefill_c1a_full",
+        "start": "1793957861",
+        "end": "1793957884",
+        "exit": "0",
+        "device": "1"
+      },
+      {
+        "entry": "prefill_c2a_full",
+        "start": "1793957884",
+        "end": "1793957909",
+        "exit": "0",
+        "device": "1"
+      },
+      {
+        "entry": "decode_c1a_full",
+        "start": "1793957909",
+        "end": "1793957933",
+        "exit": "0",
+        "device": "1"
+      },
+      {
+        "entry": "decode_c2a_full",
+        "start": "1793957933",
+        "end": "1793957959",
+        "exit": "0",
+        "device": "1"
+      },
+      {
+        "entry": "prefill_c1a_reindex",
+        "start": "1793957959",
+        "end": "1793957980",
+        "exit": "0",
+        "device": "1"
+      },
+      {
+        "entry": "decode_c1a_reindex",
+        "start": "1793957980",
+        "end": "1793958003",
+        "exit": "0",
+        "device": "1"
+      }
+    ],
+    "positive_cases": {
+      "negative": 0,
+      "indexer": 9,
+      "prefill_c1a_full": 1,
+      "prefill_c2a_full": 1,
+      "decode_c1a_full": 2,
+      "decode_c2a_full": 2,
+      "prefill_c1a_reindex": 1,
+      "decode_c1a_reindex": 2
+    },
+    "total_positive_cases": 18,
+    "negative64": {
+      "passed": false,
+      "error": "Output(s) does not match golden: ['pool_counts']\n  'pool_counts' FAIL (ratio_allclose(atol=0, rtol=0, max_error_ratio=0, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))  shape=(1,) dtype=torch.int32\n    ratio_allclose fail: error_count=1/1 (ratio=100.0000%, allowed<=0.0000%, threshold=0 pts)\n    atol=0 rtol=0\n    max abs diff=1 at (0,) (tol=0)\n    first 1 mismatches:\n    [0] actual=64, expected=65, diff=1, tol=0",
+      "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/cohort_engram_f07_1793957136/worker_cap/final/build_output/_jit_prior64_pool_test_20261106_173700_8ql3912y"
+    }
+  }
+}

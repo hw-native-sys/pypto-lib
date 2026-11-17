@@ -1,0 +1,11 @@
+{
+  "state": "PARK",
+  "epoch": 1794071868.841333,
+  "writers": [],
+  "own_jobs_running": false,
+  "source45_unchanged": true,
+  "application": "UNAPPLIED",
+  "NPU": false,
+  "compile": false,
+  "real_payload": false
+}

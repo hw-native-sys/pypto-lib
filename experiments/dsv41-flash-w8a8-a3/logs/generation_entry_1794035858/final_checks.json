@@ -1,0 +1,21 @@
+{
+  "source45_before": "ab1ced6d6ecbf9887297458703ba9b74e2c9b8bc57608370b4c2e0310e027e37",
+  "source45_after": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "changed_product_files": [
+    "models/deepseek_v4_1_flash_a3_w8a8/generate.py"
+  ],
+  "unchanged_model_files": 44,
+  "fresh_applied_CPU": "task_20261107_152005_92670518025 COMPLETE0",
+  "fit_metadata_initial_CPU": "task_20261107_152251_9335458061 COMPLETE0",
+  "fit_metadata_final_CPU": "task_20261107_152352_9373759600 COMPLETE0",
+  "all_owned_jobs_terminal": true,
+  "NPU": 0,
+  "real_checkpoint_tensor_payload_reads": 0,
+  "large_fixture_allocations": 0,
+  "actual_forward_checks": 0,
+  "fullweight_guard": "HARD HELD",
+  "independent_acceptance": "PENDING next assignment",
+  "workers": "none needed",
+  "PreparedDispatch_AST_unchanged": true,
+  "require_full_materialization_budget_AST_unchanged": true
+}

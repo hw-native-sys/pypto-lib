@@ -1,0 +1,60 @@
+[
+  {
+    "path": "compiled/candidate/kernels/aiv/hc_post.cpp",
+    "first_line": 642,
+    "lines": [
+      "    // pto: %rounded_bf16_inline13__ssa_v0",
+      "    ;",
+      "    Tile<TileType::Vec, bfloat16_t, 1, 512, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v202 = Tile<TileType::Vec, bfloat16_t, 1, 512, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v22, v30);",
+      "    // pto: %rounded_bf16_inline13__ssa_v0",
+      "    ;",
+      "    uint64_t v203 = (uint64_t) v11;",
+      "    TASSIGN(v202, v203);",
+      "    pipe_barrier(PIPE_V);",
+      "    RoundMode v204 = RoundMode::CAST_RINT;",
+      "    SaturationMode v205 = SaturationMode::OFF;",
+      "    TCVT(v202, v200, v204, v205);",
+      "    // pto: %rounded_fp32_inline14__ssa_v0",
+      "    ;",
+      "    Tile<TileType::Vec, float, 1, 512, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v206 = Tile<TileType::Vec, float, 1, 512, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v22, v30);",
+      "    // pto: %rounded_fp32_inline14__ssa_v0",
+      "    ;",
+      "    uint64_t v207 = (uint64_t) v10;",
+      "    TASSIGN(v206, v207);",
+      "    pipe_barrier(PIPE_V);",
+      "    RoundMode v208 = RoundMode::CAST_ROUND;",
+      "    SaturationMode v209 = SaturationMode::OFF;",
+      "    TCVT(v206, v202, v208, v209);",
+      "    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);"
+    ]
+  },
+  {
+    "path": "compiled/candidate/kernels/aiv/hc_post.cpp",
+    "first_line": 791,
+    "lines": [
+      "    // pto: %15",
+      "    ;",
+      "    Tile<TileType::Vec, bfloat16_t, 1, 512, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v241 = Tile<TileType::Vec, bfloat16_t, 1, 512, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v22, v30);",
+      "    // pto: %15",
+      "    ;",
+      "    uint64_t v242 = (uint64_t) v16;",
+      "    TASSIGN(v241, v242);",
+      "    pipe_barrier(PIPE_V);",
+      "    RoundMode v243 = RoundMode::CAST_RINT;",
+      "    SaturationMode v244 = SaturationMode::OFF;",
+      "    TCVT(v241, v239, v243, v244);",
+      "    // pto: %16",
+      "    ;",
+      "    Tile<TileType::Vec, float, 1, 512, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v245 = Tile<TileType::Vec, float, 1, 512, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v22, v30);",
+      "    // pto: %16",
+      "    ;",
+      "    uint64_t v246 = (uint64_t) v15;",
+      "    TASSIGN(v245, v246);",
+      "    pipe_barrier(PIPE_V);",
+      "    RoundMode v247 = RoundMode::CAST_ROUND;",
+      "    SaturationMode v248 = SaturationMode::OFF;",
+      "    TCVT(v245, v241, v247, v248);",
+      "    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);"
+    ]
+  }
+]

@@ -1,0 +1,510 @@
+{
+  "status": "PASS_SMALL_PLAN_ONLY",
+  "sourceCC_unchanged": true,
+  "compile": false,
+  "native": false,
+  "tensor_payload_bytes": 0,
+  "contract": {
+    "capacity": 2,
+    "batch": 2,
+    "logical_pages_per_request": 2,
+    "physical_pages": 4,
+    "state_blocks": 2,
+    "expert_layers": 1
+  },
+  "page_table": [
+    [
+      3,
+      1
+    ],
+    [
+      0,
+      2
+    ]
+  ],
+  "state_table": [
+    [
+      1
+    ],
+    [
+      0
+    ]
+  ],
+  "calls": [
+    {
+      "epoch": 0,
+      "token_counts": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "groups": [
+        {
+          "dp": 0,
+          "active": 2,
+          "positions": [
+            126,
+            126
+          ],
+          "requests": [
+            0,
+            1
+          ],
+          "window_slots": [
+            510,
+            126
+          ],
+          "c1_slots": [
+            510,
+            126
+          ],
+          "c2_slots": [
+            -1,
+            -1
+          ],
+          "c1_lens": [
+            127,
+            127
+          ],
+          "c2_lens": [
+            63,
+            63
+          ],
+          "idle_requests": []
+        },
+        {
+          "dp": 1,
+          "active": 2,
+          "positions": [
+            126,
+            126
+          ],
+          "requests": [
+            0,
+            1
+          ],
+          "window_slots": [
+            510,
+            126
+          ],
+          "c1_slots": [
+            510,
+            126
+          ],
+          "c2_slots": [
+            -1,
+            -1
+          ],
+          "c1_lens": [
+            127,
+            127
+          ],
+          "c2_lens": [
+            63,
+            63
+          ],
+          "idle_requests": []
+        },
+        {
+          "dp": 2,
+          "active": 2,
+          "positions": [
+            126,
+            126
+          ],
+          "requests": [
+            0,
+            1
+          ],
+          "window_slots": [
+            510,
+            126
+          ],
+          "c1_slots": [
+            510,
+            126
+          ],
+          "c2_slots": [
+            -1,
+            -1
+          ],
+          "c1_lens": [
+            127,
+            127
+          ],
+          "c2_lens": [
+            63,
+            63
+          ],
+          "idle_requests": []
+        },
+        {
+          "dp": 3,
+          "active": 2,
+          "positions": [
+            126,
+            126
+          ],
+          "requests": [
+            0,
+            1
+          ],
+          "window_slots": [
+            510,
+            126
+          ],
+          "c1_slots": [
+            510,
+            126
+          ],
+          "c2_slots": [
+            -1,
+            -1
+          ],
+          "c1_lens": [
+            127,
+            127
+          ],
+          "c2_lens": [
+            63,
+            63
+          ],
+          "idle_requests": []
+        }
+      ]
+    },
+    {
+      "epoch": 1,
+      "token_counts": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+        2,
+        2,
+        2,
+        2
+      ],
+      "groups": [
+        {
+          "dp": 0,
+          "active": 1,
+          "positions": [
+            127,
+            127
+          ],
+          "requests": [
+            0,
+            1
+          ],
+          "window_slots": [
+            511,
+            127
+          ],
+          "c1_slots": [
+            511,
+            127
+          ],
+          "c2_slots": [
+            447,
+            63
+          ],
+          "c1_lens": [
+            128,
+            128
+          ],
+          "c2_lens": [
+            64,
+            64
+          ],
+          "idle_requests": [
+            1
+          ]
+        },
+        {
+          "dp": 1,
+          "active": 1,
+          "positions": [
+            127,
+            127
+          ],
+          "requests": [
+            0,
+            1
+          ],
+          "window_slots": [
+            511,
+            127
+          ],
+          "c1_slots": [
+            511,
+            127
+          ],
+          "c2_slots": [
+            447,
+            63
+          ],
+          "c1_lens": [
+            128,
+            128
+          ],
+          "c2_lens": [
+            64,
+            64
+          ],
+          "idle_requests": [
+            1
+          ]
+        },
+        {
+          "dp": 2,
+          "active": 0,
+          "positions": [
+            127,
+            127
+          ],
+          "requests": [
+            0,
+            1
+          ],
+          "window_slots": [
+            511,
+            127
+          ],
+          "c1_slots": [
+            511,
+            127
+          ],
+          "c2_slots": [
+            447,
+            63
+          ],
+          "c1_lens": [
+            128,
+            128
+          ],
+          "c2_lens": [
+            64,
+            64
+          ],
+          "idle_requests": [
+            0,
+            1
+          ]
+        },
+        {
+          "dp": 3,
+          "active": 2,
+          "positions": [
+            127,
+            127
+          ],
+          "requests": [
+            0,
+            1
+          ],
+          "window_slots": [
+            511,
+            127
+          ],
+          "c1_slots": [
+            511,
+            127
+          ],
+          "c2_slots": [
+            447,
+            63
+          ],
+          "c1_lens": [
+            128,
+            128
+          ],
+          "c2_lens": [
+            64,
+            64
+          ],
+          "idle_requests": []
+        }
+      ]
+    },
+    {
+      "epoch": 2,
+      "token_counts": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "groups": [
+        {
+          "dp": 0,
+          "active": 2,
+          "positions": [
+            128,
+            127
+          ],
+          "requests": [
+            0,
+            1
+          ],
+          "window_slots": [
+            128,
+            127
+          ],
+          "c1_slots": [
+            128,
+            127
+          ],
+          "c2_slots": [
+            -1,
+            63
+          ],
+          "c1_lens": [
+            129,
+            128
+          ],
+          "c2_lens": [
+            64,
+            64
+          ],
+          "idle_requests": []
+        },
+        {
+          "dp": 1,
+          "active": 2,
+          "positions": [
+            128,
+            127
+          ],
+          "requests": [
+            0,
+            1
+          ],
+          "window_slots": [
+            128,
+            127
+          ],
+          "c1_slots": [
+            128,
+            127
+          ],
+          "c2_slots": [
+            -1,
+            63
+          ],
+          "c1_lens": [
+            129,
+            128
+          ],
+          "c2_lens": [
+            64,
+            64
+          ],
+          "idle_requests": []
+        },
+        {
+          "dp": 2,
+          "active": 2,
+          "positions": [
+            127,
+            127
+          ],
+          "requests": [
+            0,
+            1
+          ],
+          "window_slots": [
+            511,
+            127
+          ],
+          "c1_slots": [
+            511,
+            127
+          ],
+          "c2_slots": [
+            447,
+            63
+          ],
+          "c1_lens": [
+            128,
+            128
+          ],
+          "c2_lens": [
+            64,
+            64
+          ],
+          "idle_requests": []
+        },
+        {
+          "dp": 3,
+          "active": 2,
+          "positions": [
+            128,
+            128
+          ],
+          "requests": [
+            0,
+            1
+          ],
+          "window_slots": [
+            128,
+            256
+          ],
+          "c1_slots": [
+            128,
+            256
+          ],
+          "c2_slots": [
+            -1,
+            -1
+          ],
+          "c1_lens": [
+            129,
+            129
+          ],
+          "c2_lens": [
+            64,
+            64
+          ],
+          "idle_requests": []
+        }
+      ]
+    }
+  ],
+  "current_FFN_active_scalar_absent": true,
+  "small_isolation_and_valid_address_alias_controls": true,
+  "meaning": "plan/arithmetic/sourceproof only; current fullentry runtimeS not accepted"
+}

@@ -1,0 +1,15 @@
+{
+  "status": "FINAL_PARK_READY_SOURCE_ONLY",
+  "files": 10,
+  "manifest_sha256": "66e7200a3fd49a20159e4ab2fb16fd2f67a2e1001e1254e21cef913046280770",
+  "case": "7aa9a74e3f6a6f7a848a0ba73f56c49fe764b4178c7c16245f66d41d9d132818",
+  "launcher": "6630f59b0ec151b0a74de8f20a34177b38f2e9932c9c18aaf7a31697a4241401",
+  "pins": "8be91dde598ac894cb5be3ed3f5927a736931a8fb3bec3fff7dc4aac3b5f084e",
+  "fullprofile5262_meta8ba_unchanged": true,
+  "work_exists": false,
+  "prequeue_run": false,
+  "imports_tests_compile_prepare_NPU": false,
+  "positive_grants": 0,
+  "own_jobs": 0,
+  "writers": 0
+}

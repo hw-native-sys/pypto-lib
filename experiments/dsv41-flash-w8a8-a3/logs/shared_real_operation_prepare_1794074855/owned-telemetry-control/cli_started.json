@@ -1,0 +1,21 @@
+{
+  "epoch": 1794075879.598792,
+  "outer_identity": {
+    "pid": 3456938,
+    "start_ticks": "107580095",
+    "state": "R",
+    "parent_pid": 3456595
+  },
+  "CLI_identity": {
+    "pid": 3457298,
+    "start_ticks": "107580152",
+    "state": "R",
+    "parent_pid": 3456938
+  },
+  "CLI_pid": 3457298,
+  "command": [
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+    "-c",
+    "import time;time.sleep(0.35)"
+  ]
+}

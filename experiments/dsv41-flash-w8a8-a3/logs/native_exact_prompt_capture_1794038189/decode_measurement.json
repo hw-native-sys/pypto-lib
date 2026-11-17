@@ -1,0 +1,19 @@
+{
+  "schema": "exact-n3-measured-budget/1",
+  "measurement_kind": "MEASURED_REAL_PROC_STATVFS",
+  "measured_at_epoch": 1794040340,
+  "stage": "decode",
+  "provider": "REAL_SYNTHETIC_E1",
+  "units": "bytes",
+  "source_manifest_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "required_bytes": {
+    "host": 290783361536,
+    "disk": 10633936896,
+    "shm": 37231460864
+  },
+  "measured_available_bytes": {
+    "host": 1722609369088,
+    "disk": 9526934765568,
+    "shm": 1079343157248
+  }
+}

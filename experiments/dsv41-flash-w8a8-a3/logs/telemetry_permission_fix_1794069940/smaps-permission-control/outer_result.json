@@ -1,0 +1,64 @@
+{
+  "started_epoch": 1794070662.2731347,
+  "command": [
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+    "-c",
+    "import time; time.sleep(0.4)"
+  ],
+  "CLI_returncode": 0,
+  "launch_error": null,
+  "postcheck_error": null,
+  "observation_errors": [],
+  "wait_errors": [],
+  "CLI_terminal": true,
+  "postcheck_skipped_reason": null,
+  "CLI_pid": 3237751,
+  "CLI_identity": {
+    "pid": 3237751,
+    "start_ticks": "107058421",
+    "state": "R",
+    "parent_pid": 3237715
+  },
+  "postcheck": {
+    "status": "PASS_CPU_POST_CONTROL_ONLY"
+  },
+  "ended_epoch": 1794070662.7347984,
+  "monitor_errors": [],
+  "monitor_thread_alive": false,
+  "telemetry_errors": [
+    {
+      "epoch": 1794070662.2944286,
+      "pid": 3237751,
+      "start_ticks": "107058421",
+      "operation": "read-smaps-rollup",
+      "path": "/proc/3237751/smaps_rollup",
+      "errno": 13,
+      "exception_type": "PermissionError",
+      "error": "PermissionError(13, 'CPU injected EACCES')",
+      "critical": false
+    }
+  ],
+  "critical_telemetry_errors": [],
+  "full_own_tree_memory_measurement_complete": false,
+  "telemetry_status": "PARTIAL_OR_UNKNOWN",
+  "known_process_identities": [
+    [
+      3237715,
+      "107058353"
+    ],
+    [
+      3237751,
+      "107058421"
+    ]
+  ],
+  "sample_count": 11,
+  "peak_sampled_own_tree_pss": null,
+  "peak_sampled_own_tree_uss": null,
+  "max_complete_sample_pss": 24839168,
+  "max_complete_sample_uss": 21889024,
+  "peak_known_partial_own_tree_pss": 24839168,
+  "peak_known_partial_own_tree_uss": 21889024,
+  "status": "FAIL",
+  "proposed_future_classification": "MODEL_COMPLETED_WITH_PARTIAL_TELEMETRY",
+  "telemetry_policy": "EXISTING_STRICT_FAIL_ON_INCOMPLETE; proposed classification is NOT policy approval"
+}

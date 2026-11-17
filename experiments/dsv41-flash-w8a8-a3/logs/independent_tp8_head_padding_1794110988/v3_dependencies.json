@@ -1,0 +1,20 @@
+{
+  "epoch": 1794111486.783758,
+  "files": {
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/attention.py": "562cda314635c65823e639d02a7e8db7100a65ef6d7006ff50bbd608d72e0cf7",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/config.py": "abfb39922b4c340f443c5d3e8869ee2c76344f7b03781702f845055abdd552c1",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/ptoas": "132f5970d59c9fab664535a024c0942fa3663e4ef5993b1fe3355686f75b4e64",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/ptoas/_cli.py": "d02e236f0f221fb67c65cd0997eb0179d84ea75385c4788e91005724578363e4",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/ptoas/_loader.py": "2e76d6ff1ddb24630bb399baa98f589d0e6db2f4ab5984b08b1e8ca8ff0c8131",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/golden/runner.py": "3b7d37753b5b0fedc36f2ae425043b256aa5da8230689b3e222ac06dff0b53c5",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/golden/spec.py": "a206fed7122ba6c065f77f8be6549c1fe8515b3108782405183a8f104953534a",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto/python/pypto/ir/distributed_compiled_program.py": "b523ea389350c9d1f9880a101ec66ceb36d2a8202a5fb1976a77be3310444e2a",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto/python/pypto/runtime/runner.py": "b282e63422d4e6d3821fcd88ea207a23bf81c2fc7bd6a6634d1bd9dc40b7f295",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto/runtime/pto_isa.pin": "1608007d9cc02f6d9d562cf6cb3c2a709893454c4f0919d38bf90ab5927be652",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto/toolchain/versions.env": "15067c515da2dfb9768e61ef28d88debf817066ca2163a32c9fe36c9d4c2c53f",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/build/lib/a2a3/onboard/tensormap_and_ringbuffer/libhost_runtime.so": "24434f8879030ef1b1f31e5fc2ecce683e392d4f1baeb5bcee852fb183976e5c",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/golden/validation.py": "8d6ff1f87011d4e036c25f14fb41f98faff980b40ffe4b645a7af7719cd399b6"
+  },
+  "scope": "attention/config + pinned harness/compiler/runtime files; not a whole-model freeze",
+  "library": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/build/lib/a2a3/onboard/tensormap_and_ringbuffer/libhost_runtime.so"
+}

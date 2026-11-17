@@ -1,0 +1,14 @@
+{
+  "nonzero_negative_before": {
+    "mode": "nonzero",
+    "matrices": 9,
+    "mismatched_bytes": 18432
+  },
+  "zero_baseline": {
+    "mode": "zero",
+    "matrices": 9,
+    "mismatched_bytes": 0
+  },
+  "source_sha256": "437b2b2308aba48912592a0ae676cf12e8cee0a48b7ae20e81372cece6d77f54",
+  "limitations": "In-memory synthetic fixture only; no checkpoint read, current-checkpoint incidence or original NPU primitive parity claim."
+}

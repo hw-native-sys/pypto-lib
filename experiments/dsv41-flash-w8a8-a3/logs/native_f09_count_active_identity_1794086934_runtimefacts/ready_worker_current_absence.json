@@ -1,0 +1,104 @@
+{
+  "observed_epoch": 1794088193.336505,
+  "workers": [
+    {
+      "pid": 1635902,
+      "device": 1,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1635900,
+      "device": 0,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1635920,
+      "device": 3,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1635914,
+      "device": 2,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1635927,
+      "device": 4,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1635934,
+      "device": 5,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1635941,
+      "device": 6,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1635958,
+      "device": 7,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1635975,
+      "device": 8,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1635995,
+      "device": 9,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1636010,
+      "device": 11,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1636002,
+      "device": 10,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1636031,
+      "device": 13,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1636024,
+      "device": 12,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1636045,
+      "device": 15,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1636038,
+      "device": 14,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    }
+  ],
+  "known_ready_count": 16,
+  "all_currently_absent": true,
+  "historical_birth_completeness": "UNKNOWN; no retrospectively invented startticks/manager/helper identities"
+}

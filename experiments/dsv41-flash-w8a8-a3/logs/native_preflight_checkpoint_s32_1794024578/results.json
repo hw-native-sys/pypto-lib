@@ -1,0 +1,33 @@
+{
+  "disposition": "CPU_ARTIFACT_PREFLIGHT; V2_FIXES_REQUIRED; NO_V3_NATIVE_LARGE_IO_ACCEPTANCE",
+  "source45_unchanged": true,
+  "sealed_bundles_unchanged": true,
+  "exact_s32_math_AST_small_numeric": "PASS",
+  "mutable_contract_empty_alias": "CONFIRMED_OFFLINE_ADAPTER_BUG",
+  "V2_findings": [
+    "preallocation_META_geometry_missing",
+    "budget_receipt_semantics_and_SHM_missing",
+    "growing_publication_retention_missing",
+    "derived_evaluator_receipt_provenance_dropped"
+  ],
+  "checkpoint_compact_storage_tiny_CLI": "PASS",
+  "metadata_only_geometry": "PASS",
+  "actual_stale129_native_control": "NOT_RUN",
+  "prefix17": "OPEN",
+  "chain": "OPEN",
+  "fullweights_fit_text": "HELD",
+  "NPU_submissions": 0,
+  "large_fixture_bytes_allocated": 0,
+  "tasks": [
+    "task_20261107_121054_264295690",
+    "task_20261107_121701_4064411349",
+    "task_20261107_122205_5455915721",
+    "task_20261107_122220_560176577",
+    "task_20261107_122308_6130619024",
+    "task_20261107_122320_6222531224",
+    "task_20261107_122406_6658631685",
+    "task_20261107_122519_700877405"
+  ],
+  "all_jobs_ended": true,
+  "state": "PARK"
+}

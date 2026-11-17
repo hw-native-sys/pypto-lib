@@ -1,0 +1,9 @@
+{
+  "status": "FINAL_READY_PARK",
+  "files": 15,
+  "artifacts_sha256": "bacea214ef14aff41f41c3bbf1f136655e492b7be75ba2c790f93244a4a6c449",
+  "proof_sha256": "28b8c8d5f28cfa074012cef9f366fbf1942ef47c2fc844129808bcec1613ee3e",
+  "report_sha256": "78217545d4da6b2af9784246b871ca5e7671fd5139a3f24ed46c9d9880e06095",
+  "prequeue_sha256": "acfa5038f919c82ef015736afe9011d6c97d87a11b10cb89a288ecfeebe5a8f6",
+  "shared_writes": 0
+}

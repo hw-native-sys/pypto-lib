@@ -1,0 +1,10 @@
+{
+  "status": "PARK",
+  "all_own_jobs_terminal": true,
+  "writers": [],
+  "live_M02_unchanged": true,
+  "old76_unchanged": true,
+  "application": "UNAPPLIED",
+  "generated_graph_native_proof": "PENDING",
+  "shared_writes": 0
+}

@@ -1,0 +1,40 @@
+{
+  "pass": true,
+  "proof_kind": "SOURCE_AST_RESOLVED_METADATA_NOT_MEASURED_RUNTIME_SUM",
+  "runtime_value_names": 96,
+  "tensor_ABI_values": 95,
+  "static_values": 57,
+  "tensor_IO_values": 38,
+  "fixture_scalar_values": 1,
+  "fixture_scalar_bytes": 4,
+  "tensor_ABI_IO_bytes": 494223296,
+  "full_raw_fixture_nonstatic_bytes": 494223300,
+  "nominal_comm_bytes": 1073741824,
+  "safety_bytes": 8589934592,
+  "old_reserve": 10157899712,
+  "required_corrected_reserve": 10157899716,
+  "shortfall_bytes": 4,
+  "full_postprewarm_prestatic_required_per_rank": 16621778820,
+  "six_nonstatic_payload_logical_bytes": 2965339800,
+  "old_six_payload_undercharge": 24,
+  "unchanged_probe_reserve": 9668944960,
+  "exact_guard_AST_sha256": "ee4c1b975fd14757c2995c2f5ab82070c1f0101f43a55f039d19e33e9093fefc",
+  "boundary_rejections": [
+    {
+      "reserve": 10157899712,
+      "error": "positive IO+comm+8GiB planning reserve missing"
+    },
+    {
+      "reserve": 10157899715,
+      "error": "positive IO+comm+8GiB planning reserve missing"
+    }
+  ],
+  "equality_and_plus1_pass": true,
+  "dynamic_shape_source_scope": {
+    "table_width": 2,
+    "pages": 4,
+    "tokens": 2
+  },
+  "no_tensors_models_fixtures_or_imported_original_model": true,
+  "no_compile_prepare_NPU": true
+}

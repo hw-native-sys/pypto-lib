@@ -1,0 +1,12 @@
+{
+  "REPORT.md": "8571319a8a8c630f0059b2f4f43e50b1f43c1a31bbe7bd59f5d3a4929c4b633f",
+  "failure_terminal_receipt.json": "db63bc781dbed0ec6731b037f6293b95489918e6f0d4fbad1d288f0a6a4039c7",
+  "full_registry_native_file_mapping.json": "33091d5135f840db99e04986a4daa781f8f8f61e91ddb28914f40a5fc82d7768",
+  "measured_start_epoch.txt": "3129f32a7382cd03778ffe073c0e0f56a2c988eed3332ab1b55665c5cb6df0f9",
+  "native_task_raw.log": "0a06e8d501170d35fafb8358423a9362dfd5c7e723917882cb6610630a7eca58",
+  "native_task_status.txt": "01bfb2e626d2cc2e8ad91de8062b83360fa3e484f651fe851c255c2022cf3253",
+  "passive_birth_samples.json": "8b18c7c9597a70a4fc330bed1a7eaa7bbb721bfaff1fdc6b2c33ceb9ab4b256d",
+  "sample_known_births.py": "49644edb41aa335dd9edde034bbcf423d278a5453d72fbc264bf5fd3a6ae54bc",
+  "sealed_work.json": "e9153552351f552d363430e005eafb2cec9fced909edd7d53ec4f4861fe36c40",
+  "work_record.json": "a468a0785f3485277de5745a7bb6788823d7688c98297eeda435bf15e29658b7"
+}

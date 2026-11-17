@@ -1,0 +1,41 @@
+{
+  "actual_model_CHIP": {
+    "lines5817_5823": [
+      "                uint32_t layer_c1a_comp_wkv_inline40393_offsets[3] = {0, 0, 0};",
+      "                uint32_t layer_c1a_comp_wkv_inline40393_shapes[3] = {(layer_c1a_comp_wkv_inline40393_offsets[0] >= ext_c1a_comp_wkv.shapes[0] ? 0u : std::min<uint32_t>(1, ext_c1a_comp_wkv.shapes[0] - layer_c1a_comp_wkv_inline40393_offsets[0])), (layer_c1a_comp_wkv_inline40393_offsets[1] >= ext_c1a_comp_wkv.shapes[1] ? 0u : std::min<uint32_t>(512, ext_c1a_comp_wkv.shapes[1] - layer_c1a_comp_wkv_inline40393_offsets[1])), (layer_c1a_comp_wkv_inline40393_offsets[2] >= ext_c1a_comp_wkv.shapes[2] ? 0u : std::min<uint32_t>(5120, ext_c1a_comp_wkv.shapes[2] - layer_c1a_comp_wkv_inline40393_offsets[2]))};",
+      "                Tensor layer_c1a_comp_wkv_inline40393_view = ext_c1a_comp_wkv.view(layer_c1a_comp_wkv_inline40393_shapes, layer_c1a_comp_wkv_inline40393_offsets);",
+      "                bool layer_c1a_comp_wkv_inline40393_empty = layer_c1a_comp_wkv_inline40393_view.numel() == 0;",
+      "                Tensor layer_c1a_comp_wkv_inline40393 = layer_c1a_comp_wkv_inline40393_view;",
+      "                layer_c1a_comp_wkv_inline40393.ndims = 2;",
+      "                layer_c1a_comp_wkv_inline40393.shapes[0] = layer_c1a_comp_wkv_inline40393_view.shapes[1];"
+    ],
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/build_output/_jit_decode_fwd_20261107_235141_xdtgsk5g/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp",
+    "sha256": "1ed07739fa1bdb9589fe207f04059b2bddff6a6596bb57ae15033247ea4c6ca9"
+  },
+  "actual_model_HOST": {
+    "already_bound_by_sealed_longer_audit16": true,
+    "anchors": [
+      {
+        "line": 87,
+        "text": "            tensors[\"t__tmp_v47\"] = tensors[\"c1a_comp_wkv__ssa_v0\"][rank__idx_v0, 0:1, 0:512, 0:5120]"
+      },
+      {
+        "line": 88,
+        "text": "            tensors[\"t__tmp_v48\"] = tensors[\"c1a_comp_norm__ssa_v0\"][rank__idx_v0, 0:1, 0:512]"
+      }
+    ],
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/build_output/_jit_decode_fwd_20261107_235141_xdtgsk5g/orchestration/host_orch.py",
+    "sha256": "d8534fe9751d12b94074e2dc4583a70ff6a0c9ecc96e31fd618c2fef737eef34"
+  },
+  "conclusion": "Actual E40 model uses whole shard HOST slices and CHIP layer selection. Failed toy alone squeezes axis1 at HOST. No runtime workaround or model patch authorized.",
+  "public_StackedDeviceTensor_boundary": {
+    "line": 259,
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto/python/pypto/runtime/device_tensor.py",
+    "sha256": "72dc6701eca6dc10a2155773b35a37dee1551c89a89ecf08a8c244571395e8e3"
+  },
+  "toy_HOST": {
+    "line12": "        tensors[\"t__tmp_v1\"] = tensors[\"c1a_comp_norm__ssa_v0\"][rank__idx_v0, 0, 0:128, 0:128]",
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_shared_weight_owner_1794072445/operation/build/_jit_decode_20261108_012749_skcco7fj/orchestration/host_orch.py",
+    "sha256": "5ad8c4ced005dc5bdd7cad60ccbb136135ff6586c5f0465094206d758f5e2a12"
+  }
+}

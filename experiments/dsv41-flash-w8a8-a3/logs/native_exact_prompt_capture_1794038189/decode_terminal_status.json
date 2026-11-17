@@ -1,0 +1,11 @@
+{
+  "task_id": "task_20261107_163417_24812212428",
+  "returncode": 0,
+  "stdout": "completed (exit=0)\n",
+  "stderr": "",
+  "epoch": 1794040845.3106012,
+  "additional_known_own_pids": [
+    2481328
+  ],
+  "all16_locks_release_logged": true
+}

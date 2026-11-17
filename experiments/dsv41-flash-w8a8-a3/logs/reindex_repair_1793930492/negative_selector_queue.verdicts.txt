@@ -1,0 +1,5 @@
+[RUN]   'pool_ids' PASS  shape=(5, 4) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+[RUN]   'pool_counts' PASS  shape=(5,) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+[RUN]   'indices' FAIL  shape=(5, 512) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+[RUN]   'values' FAIL  shape=(5, 512) dtype=torch.float32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+EXPECTED NEGATIVE: frozen global Top-K rejected by restricted-pool IDs and values gates

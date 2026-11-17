@@ -1,0 +1,8 @@
+{
+  "agent": "main-agent",
+  "start": 1794019305,
+  "end": 1794019935,
+  "duration": 630,
+  "status": "PARKED",
+  "measurement": "realpreviouscheckpoint throughreadinessseal; earlier8846-9305alreadylogged; wallnotCPUtime"
+}

@@ -1,0 +1,1 @@
+Main /root/main_native exclusively owns this NEW artifact directory. Product source45 762dc and all prior evidence are read-only. Scope: zero-payload header/ABI ledger, actual-tokenizer N3 selection, proposed narrow explicit production admission diff and bounded CPU tests. No NPU, real tensor payload, full fixture, forward, guard release, or workers.

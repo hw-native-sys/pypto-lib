@@ -1,0 +1,14 @@
+{
+  "required": {
+    "host": 306003115008,
+    "disk": 8657043456,
+    "shm": 8589934592
+  },
+  "fresh": {
+    "host": 1723277193216,
+    "disk": 9526949445632,
+    "shm": 1079343157248
+  },
+  "measurement_sha256": "9cd282d9037eead6bd437147911de1900dd2a32904a5d97bb6e4d358cfcdc023",
+  "stage": "validate"
+}

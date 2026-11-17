@@ -1,0 +1,12 @@
+{
+  "CPU_audit_jobs": 1,
+  "NPU_jobs": 1,
+  "agent": "review-agent",
+  "elapsed_seconds": 384,
+  "end_epoch": 1794072829,
+  "id": "native-shared-owner-failed-1794072445-1794072829",
+  "real_checkpoint_payload": 0,
+  "source_or_runtime_edits": 0,
+  "start_epoch": 1794072445,
+  "state": "FAILED_FINAL_PARK"
+}

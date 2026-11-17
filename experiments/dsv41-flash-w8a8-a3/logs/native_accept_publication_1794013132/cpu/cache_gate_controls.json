@@ -1,0 +1,32 @@
+{
+  "window_cache": {
+    "positive": true,
+    "whole_cache_admits_one_missing_row": true,
+    "published_row_control_rejects": true,
+    "detail": "\n    published step rows:     ratio_allclose fail: error_count=2560/2560 (ratio=100.0000%, allowed<=1.0000%, threshold=26 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=1 at (0, 0) (tol=0.035625)\n    first 10 mismatches:\n    [0] actual=0, expected=1, diff=1, tol=0.03562\n    [1] actual=0, expected=1, diff=1, tol=0.03562\n    [2] actual=0, expected=1, diff=1, tol=0.03562\n    [3] actual=0, expected=1, diff=1, tol=0.03562\n    [4] actual=0, expected=1, diff=1, tol=0.03562\n    [5] actual=0, expected=1, diff=1, tol=0.03562\n    [6] actual=0, expected=1, diff=1, tol=0.03562\n    [7] actual=0, expected=1, diff=1, tol=0.03562\n    [8] actual=0, expected=1, diff=1, tol=0.03562\n    [9] actual=0, expected=1, diff=1, tol=0.03562"
+  },
+  "compressed_cache_c2a": {
+    "positive": true,
+    "whole_cache_admits_one_missing_row": true,
+    "published_row_control_rejects": true,
+    "detail": "\n    published step rows:     ratio_allclose fail: error_count=192/192 (ratio=100.0000%, allowed<=1.0000%, threshold=2 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=1 at (0, 0) (tol=0.035625)\n    first 10 mismatches:\n    [0] actual=0, expected=1, diff=1, tol=0.03562\n    [1] actual=0, expected=1, diff=1, tol=0.03562\n    [2] actual=0, expected=1, diff=1, tol=0.03562\n    [3] actual=0, expected=1, diff=1, tol=0.03562\n    [4] actual=0, expected=1, diff=1, tol=0.03562\n    [5] actual=0, expected=1, diff=1, tol=0.03562\n    [6] actual=0, expected=1, diff=1, tol=0.03562\n    [7] actual=0, expected=1, diff=1, tol=0.03562\n    [8] actual=0, expected=1, diff=1, tol=0.03562\n    [9] actual=0, expected=1, diff=1, tol=0.03562"
+  },
+  "index_cache_c2a": {
+    "positive": true,
+    "whole_cache_admits_one_missing_row": true,
+    "published_row_control_rejects": true,
+    "detail": "\n    published step rows:     ratio_allclose fail: error_count=192/192 (ratio=100.0000%, allowed<=1.0000%, threshold=2 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=1 at (0, 0) (tol=0.035625)\n    first 10 mismatches:\n    [0] actual=0, expected=1, diff=1, tol=0.03562\n    [1] actual=0, expected=1, diff=1, tol=0.03562\n    [2] actual=0, expected=1, diff=1, tol=0.03562\n    [3] actual=0, expected=1, diff=1, tol=0.03562\n    [4] actual=0, expected=1, diff=1, tol=0.03562\n    [5] actual=0, expected=1, diff=1, tol=0.03562\n    [6] actual=0, expected=1, diff=1, tol=0.03562\n    [7] actual=0, expected=1, diff=1, tol=0.03562\n    [8] actual=0, expected=1, diff=1, tol=0.03562\n    [9] actual=0, expected=1, diff=1, tol=0.03562"
+  },
+  "compressed_cache_c1a": {
+    "positive": true,
+    "whole_cache_admits_one_missing_row": true,
+    "published_row_control_rejects": true,
+    "detail": "\n    published step rows:     ratio_allclose fail: error_count=64/64 (ratio=100.0000%, allowed<=1.0000%, threshold=1 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=1 at (0, 0) (tol=0.035625)\n    first 10 mismatches:\n    [0] actual=0, expected=1, diff=1, tol=0.03562\n    [1] actual=0, expected=1, diff=1, tol=0.03562\n    [2] actual=0, expected=1, diff=1, tol=0.03562\n    [3] actual=0, expected=1, diff=1, tol=0.03562\n    [4] actual=0, expected=1, diff=1, tol=0.03562\n    [5] actual=0, expected=1, diff=1, tol=0.03562\n    [6] actual=0, expected=1, diff=1, tol=0.03562\n    [7] actual=0, expected=1, diff=1, tol=0.03562\n    [8] actual=0, expected=1, diff=1, tol=0.03562\n    [9] actual=0, expected=1, diff=1, tol=0.03562"
+  },
+  "index_cache_c1a": {
+    "positive": true,
+    "whole_cache_admits_one_missing_row": true,
+    "published_row_control_rejects": true,
+    "detail": "\n    published step rows:     ratio_allclose fail: error_count=64/64 (ratio=100.0000%, allowed<=1.0000%, threshold=1 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=1 at (0, 0) (tol=0.035625)\n    first 10 mismatches:\n    [0] actual=0, expected=1, diff=1, tol=0.03562\n    [1] actual=0, expected=1, diff=1, tol=0.03562\n    [2] actual=0, expected=1, diff=1, tol=0.03562\n    [3] actual=0, expected=1, diff=1, tol=0.03562\n    [4] actual=0, expected=1, diff=1, tol=0.03562\n    [5] actual=0, expected=1, diff=1, tol=0.03562\n    [6] actual=0, expected=1, diff=1, tol=0.03562\n    [7] actual=0, expected=1, diff=1, tol=0.03562\n    [8] actual=0, expected=1, diff=1, tol=0.03562\n    [9] actual=0, expected=1, diff=1, tol=0.03562"
+  }
+}

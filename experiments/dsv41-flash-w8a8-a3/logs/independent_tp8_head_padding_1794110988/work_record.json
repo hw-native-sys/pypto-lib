@@ -1,0 +1,11 @@
+{
+  "id": "independent-tp8-head-padding-1794110988-1794111596",
+  "role": "review-agent",
+  "start_epoch": 1794110988.0,
+  "end_epoch": 1794111596.297636,
+  "elapsed_seconds": 608.2976360321045,
+  "scope": "focused attention v3 source + original3 zero-sample signatures; no native or numerical verdict",
+  "cpu_task": "task_20261108_121806_13687553828",
+  "protected_writes": 0,
+  "TIME_LOG_self_imported_once": true
+}

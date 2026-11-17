@@ -1,0 +1,39 @@
+{
+  "source45": {
+    "path": "experiments/dsv41-flash-w8a8-a3/logs/f09_prepared_identity_fix_1794086105/source45_rebased_UNAPPLIED.json",
+    "sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+    "all45_files_match": true
+  },
+  "live_M02": {
+    "path": "experiments/dsv41-flash-w8a8-a3/logs/hc_boundary_apply_1794075705/source45.json",
+    "sha256": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+    "all45_files_match": true
+  },
+  "new_helper_sha256": "ee648c64b8477cc98b2f3083a6b16c9b6b92cc4612cc3228391dbe53aef1858d",
+  "new_route_sha256": "a91557c329aa8dff120ce3f141afcdde5c2371c6e4a659107911720f7c64d4cb",
+  "unchanged_support": {
+    "f09_decode_case.py": "412cb48d4625d54958f949588cdf9d9d0b6457137b4e27a6de17c0d84582e295",
+    "oracle_integrity.py": "e45c7529d6c34cd57712a7d346ec612641896e38ab98ff88017ceafd87d999d3",
+    "count_probe.py": "277f405a5ebb50853a6dfad5407d5b2ead3961980dcf114cd2a092f2da828913",
+    "count_probe_old_physical.py": "3d90753e2ae608305b907248b7f58ae957b5e0874e2a7e67b467008351b70e29",
+    "scenario.json": "c7b6ab942f5ea17758389aa5a53dafbb1de79e68dbb6f41c4614d66dd6b6dbb1",
+    "source45_rebased_UNAPPLIED.json": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+    "native_stage.sh": "caf30d0d1dafe8f108684ad146ae610ec3dd5221fd3b0c10635f56134539306e",
+    "resource_plan.json": "451d7686e2252d6cdf13b25a54089be5a600d7dcbdd119d0aa22ae3982c6c68f"
+  },
+  "signature_inputs": {
+    "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/count_active_files.json": "4c226662c16675febc4eea21c4de345a79e6562dc078549df46185212cabfaba",
+    "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/count_old_physical_files.json": "484bbb7d6c22475edbb725186e59b9dc1ff32118edfac9fa2dc3a33afc36a414",
+    "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/decode_capacity2_files.json": "5262e68afa0b53291ed285e31170b3c017674c3c25dfa9aec78eb7fab5777532"
+  },
+  "retained_actual": {
+    "path": "experiments/dsv41-flash-w8a8-a3/logs/native_f09_count_active_1794084730/work/prepared_artifact",
+    "inspection": "READ_ONLY",
+    "all158_bytes_unchanged": true,
+    "work_seal": "0f065e947a2013b6c06f6b5e5ec8f175d09ff23927ad00f54101e88a5f1e1cd3",
+    "runtime_seal": "7dc4c73fa13dc3c1298cc2af094ed9e697fe667d8bc5dc3cfe80f65814d54e2c",
+    "actual_task_status": "FAILED_no_static_no_count_capsules"
+  },
+  "new_Root_wrapper": "PENDING",
+  "actual16_GO": "ABSENT"
+}

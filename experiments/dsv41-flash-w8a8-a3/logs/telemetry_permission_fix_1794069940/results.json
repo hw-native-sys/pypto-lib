@@ -1,0 +1,87 @@
+{
+  "status": "PASS_TINY_CPU_OBSERVER_CONTROLS",
+  "epoch": 1794070663.6934657,
+  "checks": [
+    "CLI-receipt-code-caps-default-main-and-checker-exact-inheritance",
+    "CPUFAKE-smaps-EACCES-retains-PID-birth-and-both-thread-children-unknown-not-zero",
+    "CPUFAKE-critical-path-/proc/101/stat",
+    "CPUFAKE-critical-path-/proc/101/task/101/children",
+    "CPUFAKE-critical-path-/proc/101/task",
+    "CPUFAKE-critical-path-/proc/101/smaps_rollup",
+    "normal-tiny-control-same-child-wait-POST-and-explicit-coverage-policy",
+    "smaps-permission-control-same-child-wait-POST-and-explicit-coverage-policy",
+    "identity-permission-control-same-child-wait-POST-and-explicit-coverage-policy",
+    "error-receipt-fsync-control-same-child-wait-POST-and-explicit-coverage-policy"
+  ],
+  "live_controls": {
+    "normal-tiny-control": {
+      "CLI_returncode": 0,
+      "status": "CLI_SUCCESS_POSTCHECK_PASS_PENDING_EXTERNAL_AUDIT",
+      "telemetry_status": "COMPLETE",
+      "critical_errors": [],
+      "proposed_future_classification": null,
+      "one_child_reaped": true,
+      "POST_after_terminal": true,
+      "error_receipt_fsynced_while_child_live": false
+    },
+    "smaps-permission-control": {
+      "CLI_returncode": 0,
+      "status": "FAIL",
+      "telemetry_status": "PARTIAL_OR_UNKNOWN",
+      "critical_errors": [],
+      "proposed_future_classification": "MODEL_COMPLETED_WITH_PARTIAL_TELEMETRY",
+      "one_child_reaped": true,
+      "POST_after_terminal": true,
+      "error_receipt_fsynced_while_child_live": true
+    },
+    "identity-permission-control": {
+      "CLI_returncode": 0,
+      "status": "FAIL",
+      "telemetry_status": "PARTIAL_OR_UNKNOWN",
+      "critical_errors": [
+        {
+          "epoch": 1794070662.758583,
+          "pid": 3237773,
+          "start_ticks": null,
+          "operation": "read-parse-proc-stat",
+          "path": "/proc/3237773/stat",
+          "errno": 13,
+          "exception_type": "PermissionError",
+          "error": "PermissionError(13, 'CPU injected EACCES')",
+          "critical": true
+        }
+      ],
+      "proposed_future_classification": null,
+      "one_child_reaped": true,
+      "POST_after_terminal": true,
+      "error_receipt_fsynced_while_child_live": true
+    },
+    "error-receipt-fsync-control": {
+      "CLI_returncode": 0,
+      "status": "FAIL",
+      "telemetry_status": "PARTIAL_OR_UNKNOWN",
+      "critical_errors": [
+        {
+          "epoch": 1794070663.2462106,
+          "pid": 3237789,
+          "start_ticks": "107058516",
+          "operation": "fsync-telemetry-error-receipt",
+          "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/telemetry_permission_fix_1794069940/error-receipt-fsync-control/telemetry_errors.jsonl",
+          "errno": 13,
+          "exception_type": "PermissionError",
+          "error": "PermissionError(13, 'CPU injected error-receipt fsync')",
+          "critical": true
+        }
+      ],
+      "proposed_future_classification": null,
+      "one_child_reaped": true,
+      "POST_after_terminal": true,
+      "error_receipt_fsynced_while_child_live": false
+    }
+  },
+  "native_jobs": 0,
+  "tensor_payload_bytes": 0,
+  "actual_grants": 0,
+  "product_edits": 0,
+  "limits": "Injected CPU EACCES does not identify the failed native process/path/epoch; strict status remains FAIL for partial telemetry, future classification policy is unapproved."
+}

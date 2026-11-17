@@ -1,0 +1,12 @@
+{
+  "id": "independent-f09-native-route-1794082891-1794083206",
+  "agent": "review-agent",
+  "start_epoch": 1794082891,
+  "end_epoch": 1794083206,
+  "elapsed_seconds": 315,
+  "state": "FINAL_PARK_SOURCE_ONLY_WITH_FINDING",
+  "CPU_jobs": 0,
+  "NPU_jobs": 0,
+  "protected_source_writes": 0,
+  "shared_writes": 0
+}

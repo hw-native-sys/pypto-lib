@@ -1,0 +1,18 @@
+{
+  "COMMANDS.md": "a35fc37a32c117a4840696a887315ab4189704e1ae57d9a72ca8875a7c799444",
+  "OWNERSHIP.md": "b9eaf2efc6fe4a22329f97afafb241c066d5f6477dc295dc8b88876b3ff35fa5",
+  "REPORT.md": "27e1c391400c8dae81cefcd6115ee1143ba1cc0eb6b956b6e3ade276c50e28e9",
+  "adapt.py": "ce80f9cbfcb83cdfccb0d2396c3d8804fab83767cc09d9c381b94eea1f946c99",
+  "adaptation.patch": "9f585559a8d351479419d3f90fa9fc71bd2c6e4fc81ffbd3255c515bd0916df3",
+  "ancestry_pins.json": "e753c71d43a28928a20b1f8e2f6d45a900b30b3a0f30702244064a97389e31d9",
+  "check_identity.py": "f95eaf38916b645642ebfd4d307b85a64a17ec7ca027c55e0f8585c1590816c4",
+  "future_root_scope.template.json": "410cbdd1902bb4d6bcf64b0219ecc7fedc9687269e8c9a96855bfc9c79e562d8",
+  "operation_binding.json": "cc2132a8e7bf0b36110f7a99f68d244a8b98e0f0299d8a9b8e897cec1dde5937",
+  "outer_runner.py": "28b8c268c5530197273754325aeba978dad1d44428f4f33fe4e5bf13dfcb3d7c",
+  "prepared_pins.json": "88cf294ac9a4b628c18da9cf4ed5b7b0cbd10b671736b43121001b5f15873277",
+  "seal.py": "0d0c47981dc150530436a1275e2736e0b3113ca9964569086b0b0ac865b8e169",
+  "source_after.json": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+  "source_before.json": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+  "task_entry.py": "670b126af3b878f8b4e2c6cbbc3a716bb9a0ac6c043bedda49b5c18d0eda02b6",
+  "work_record.json": "c7f56f36d4332a392067b3fb162aca9b0949184f524a920bf9b6fd179979a655"
+}

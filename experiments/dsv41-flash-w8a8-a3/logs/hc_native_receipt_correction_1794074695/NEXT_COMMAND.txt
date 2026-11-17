@@ -1,0 +1,5 @@
+NOT AUTHORIZED / NOT SUBMITTED. After NEW explicit Root GO, execute a NEW bytefork of this sealed unit; rebind the outer shell path to that new unit. Frozen corrected entry and fixed flags:
+
+task-submit --timeout 1200 --device auto --device-num 1 --max-time 600 --run 'bash experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/run_native_AFTER_NEW_ROOT_GO.sh'
+
+This records the exact prepared shell/entry; do not execute against immutable preparation artifacts. Inside the new unit the unchanged probe runs native --root-go with actual TASK_DEVICE; current45 b3e19fd... and source/compiled checks run before pair. Fixed64MiB ring, 2 finite L2 calls, no recompile.

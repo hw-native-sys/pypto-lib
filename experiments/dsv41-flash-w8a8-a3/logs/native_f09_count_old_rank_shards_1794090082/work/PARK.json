@@ -1,0 +1,14 @@
+{
+  "status": "BOUNDED_OLD_COUNT_CONTROL_PASS_FINAL_PARK",
+  "physical_totals": [
+    192,
+    192,
+    192
+  ],
+  "required_middle_specific_numeric_reject": true,
+  "middle_actual": 192,
+  "middle_expected": 96,
+  "fullmodel_math_pass": false,
+  "ownjobs": 0,
+  "shared_writes": 0
+}

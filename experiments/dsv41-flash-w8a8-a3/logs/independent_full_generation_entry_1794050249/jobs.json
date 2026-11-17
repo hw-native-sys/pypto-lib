@@ -1,0 +1,38 @@
+[
+  {
+    "id": "task_20261107_192702_342054612061",
+    "status_query_exit": 0,
+    "raw_status": "completed (exit=1)",
+    "log_query_exit": 0
+  },
+  {
+    "id": "task_20261107_192811_342354617409",
+    "status_query_exit": 0,
+    "raw_status": "completed (exit=0)",
+    "log_query_exit": 0
+  },
+  {
+    "id": "task_20261107_193539_344169022760",
+    "status_query_exit": 0,
+    "raw_status": "completed (exit=1)",
+    "log_query_exit": 0
+  },
+  {
+    "id": "task_20261107_193636_344476918087",
+    "status_query_exit": 0,
+    "raw_status": "completed (exit=0)",
+    "log_query_exit": 0
+  },
+  {
+    "id": "task_20261107_193750_344791028145",
+    "status_query_exit": 0,
+    "raw_status": "completed (exit=0)",
+    "log_query_exit": 0
+  },
+  {
+    "id": "task_20261107_194000_345357413758",
+    "status_query_exit": 0,
+    "raw_status": "completed (exit=0)",
+    "log_query_exit": 0
+  }
+]

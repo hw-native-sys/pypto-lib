@@ -1,0 +1,20 @@
+{
+  "epoch": 1794037451,
+  "status": "PARKED narrowartifactpatch/CPUselfPASS;independentacceptancepending",
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "source45_unchanged": true,
+  "old31_unchanged": true,
+  "candidate_sha256": "1542c1848227a0326655dc809ede1c71bca1e3d71d67f77a11e604741b924865",
+  "baseline_sha256": "0b75f689b9b02fc147747a57ea0321980851735f6c23cc99272e326148dbaafb",
+  "patch_sha256": "2f9ab4f48b49dfa3b48c777bc5e6bb60956a6cd2d6cb3efc482bd5bf842a48a6",
+  "sources_sha256": "2944340b841433e9c39134b3cd72a6eec83727fed2b875b8d9a449734967f311",
+  "artifacts_sha256": "184fc558f8c08bc5c9f1a839da73b68ce9665f0fdc483632377c99508a38340b",
+  "artifact_files": 48,
+  "all_jobs_terminal": true,
+  "workers": 0,
+  "NPU": 0,
+  "real_allocations": 0,
+  "payload_reads": 0,
+  "calibration_or_guard_unblock": false,
+  "work_record": "main-fit-post-guard-1794037055-1794037451"
+}

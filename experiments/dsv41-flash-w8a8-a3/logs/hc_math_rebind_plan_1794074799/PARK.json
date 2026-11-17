@@ -1,0 +1,10 @@
+{
+  "status": "PARK",
+  "all_own_jobs_terminal": true,
+  "writers": [],
+  "live_source45_b3e_unchanged": true,
+  "application": "NOT_AUTHORIZED_UNAPPLIED",
+  "NPU": false,
+  "compile": false,
+  "shared_writes": 0
+}

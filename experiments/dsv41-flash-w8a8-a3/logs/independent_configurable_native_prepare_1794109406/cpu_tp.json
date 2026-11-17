@@ -1,0 +1,118 @@
+{
+  "status": "PASS_CPU_PREPARATION_ONLY",
+  "profile": "tp",
+  "checks": [
+    {
+      "groups": [
+        [
+          0,
+          1
+        ],
+        [
+          2,
+          3
+        ]
+      ],
+      "output_identity_allworld_wronggroup_rejected": true,
+      "score_col257_exact": true
+    }
+  ],
+  "programs": [
+    {
+      "label": "tp_output_groups",
+      "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_configurable_native_prepare_1794109406/build_tp/_jit_tp_reduce_test_20261108_120412__krj9l8c",
+      "seconds": 0.8471405506134033,
+      "files": {
+        "debug/run.py": "cf2329bd9635aecefc5b1da7f5715ac7177833e40d626e11f6054592cbda7d84",
+        "distributed_meta.json": "e8008d9b94dc8aa87eb308f53f1df211e8366a673aa613142ff3fb11ef56b316",
+        "next_levels/tp_reduce_test_rank/kernel_config.py": "f668f3c2a673bbef4c4b08e6340118cf8da24bb2d1bb55ee79377e861c4da645",
+        "next_levels/tp_reduce_test_rank/kernels/aiv/tp_out_consumed.cpp": "5bc1e38d1a01e10eb514f391294e163e69a1dd3dd18b489676f33c74cf55b58f",
+        "next_levels/tp_reduce_test_rank/kernels/aiv/tp_out_publish.cpp": "ce2b26217e87a432efa344cc79592de450a8f5afffecfef6c309b959adb472ae",
+        "next_levels/tp_reduce_test_rank/kernels/aiv/tp_out_ready.cpp": "bc79b3710d1ef2b42869367b8d9a25470addee9ba1b6818cd4d9f9ecc5ba2256",
+        "next_levels/tp_reduce_test_rank/kernels/aiv/tp_out_reuse.cpp": "5bf8d987915882167438045c9cc59840b907ddd1394a8acb038d634309b8032e",
+        "next_levels/tp_reduce_test_rank/kernels/aiv/tp_out_sum.cpp": "bee69cfb147a54942ea8100fb60ac1285a2d4278c86a3f7558c5c9125a867992",
+        "next_levels/tp_reduce_test_rank/kernels/aiv/tp_out_wait.cpp": "dc2e8f166050d3d8159cf876a6e36e2e3f5e85eb9ce62883cece1118b44aaee7",
+        "next_levels/tp_reduce_test_rank/orchestration/tp_reduce_test_rank.cpp": "62aaee36dee232a18113bb030f8254ce49a65971e6486b7728daa80f4f0a5717",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_consumed.cpp": "d16fb453e290cabcbab76d9e5cddafbbee343be068517ebca66d7136c3374b20",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_consumed.pto": "4d4f51b374dd037ea7cc210e1f3b98a24fe1a7f2d4da437a7ea133ffb337da67",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_publish.cpp": "4a6f7da7ff423670d551222af477966cbee5ddfdad5743a607b500a3ccfbf11c",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_publish.pto": "0743c996a9734b72a4d809df8853ae4ac742f5218b1acc311c1f445c35a586ab",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_ready.cpp": "444745048fa0b335c14cb32d0710bf8a3fe09ef601841a6bfa2d16ec737f38f6",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_ready.pto": "a21de07f4b85e1858aba7c131a5c4f877a41edbfa1162a4e6893b2f6757196e9",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_reuse.cpp": "6475ec0b9397bc67fdd413ba4fa0e02d07a4defd712ae68dc9f48ce2c9c8d588",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_reuse.pto": "d3a20306806289940f92b06d7e38f888ef3fccf2b07c5497ed2574b28436bd51",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_sum.cpp": "4827c946421b351dd83a6553a83c1ba8258aa5d510a4351a627f070b05fffb23",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_sum.pto": "74b9f8856869bdf456c274a527514f55d89372ec610523d23c482308cb11c498",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_wait.cpp": "12e0ee8f3cdc6b44c9a26dde49d6f7ef5226b83772e18aaa038baebb03e1173c",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_wait.pto": "eecc5611423aec5dd040b47a8cbf4c346d75adff6eff0143a9a2ce39dce66ff0",
+        "orchestration/host_orch.py": "a253a5f11ffb9b77b322eadce6829ad08b8ce8882f2daf411e7f3d938c3fd8f7"
+      }
+    },
+    {
+      "label": "tp_score_tail",
+      "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_configurable_native_prepare_1794109406/build_tp/_jit_score_test_20261108_120413_tx17ecu9",
+      "seconds": 0.5485339164733887,
+      "files": {
+        "debug/run.py": "23b3b0085de2addc37e353d54c1ffab6aaa7c9efa14ffccea7b461568b396b55",
+        "distributed_meta.json": "32bb4da5930ac3075b7af17de613dfc659facfa98046c3c2ad4d575d27774ce3",
+        "next_levels/score_rank/kernel_config.py": "04aa1235c5137d49d809a60adb0dce98c16bd6d8fa540c79f266d4b3b2ba8426",
+        "next_levels/score_rank/kernels/aiv/tp_score_consumed.cpp": "79c51ce5cd6eb43ea52ccfe6d48e65955c41ed65e5dc2f32225e744d0409aa18",
+        "next_levels/score_rank/kernels/aiv/tp_score_publish.cpp": "c1735de47e1ad4a8eb329abd9d3e86f3fbff7b63b31d3c4597b388206abeedf6",
+        "next_levels/score_rank/kernels/aiv/tp_score_ready.cpp": "b351d6f63e1b7f4ba1b0ed3fa8a00d5e30f8be23bc3b43650db56c888ce9c1f9",
+        "next_levels/score_rank/kernels/aiv/tp_score_reuse.cpp": "1ddf2bd83bff619f39ecf30f00e7c5cd9b288210d269cf1e994a233481a84819",
+        "next_levels/score_rank/kernels/aiv/tp_score_sum.cpp": "9d36c746b102dff8e2449a04fddeeb61f82a38d3b4586cd85157dd8df0be7b8e",
+        "next_levels/score_rank/kernels/aiv/tp_score_wait.cpp": "173d71ba373969b11c679173177eaf748c913760868880b222b2e8a481102b35",
+        "next_levels/score_rank/orchestration/score_rank.cpp": "7fe04cdad1fd0879c19ecd72790dbc9f11ea94b9d74a8caa00ae07d0d33cb259",
+        "next_levels/score_rank/ptoas/tp_score_consumed.cpp": "d88bd5936a326bbaecfc9fe3da625abf047d2c413c33ddfee58150a5f4890e3e",
+        "next_levels/score_rank/ptoas/tp_score_consumed.pto": "b8f2693f3a635762b04ac046f4313753a6296b2de8a491d6cd697ee97134a36e",
+        "next_levels/score_rank/ptoas/tp_score_publish.cpp": "a7ca87f309061faf7c20e26f974d9fa5bf95f3d2efa42daf432c8a536281012f",
+        "next_levels/score_rank/ptoas/tp_score_publish.pto": "418b34e44ef9bdec5d7d83b5c8eb67cf86e32602a4f0d0496ed60110535fbecd",
+        "next_levels/score_rank/ptoas/tp_score_ready.cpp": "26f8bc3cd56816a0c0d765204b561fab9d6f040bb331961a3dea545ac0e655a4",
+        "next_levels/score_rank/ptoas/tp_score_ready.pto": "6d6ec29461a3291852bb31eb049dd9caeee54829ca98b605f3fd27ee47e0c666",
+        "next_levels/score_rank/ptoas/tp_score_reuse.cpp": "9d90ddc7b3d9994bf867d8683e6d6b5089dba0e02b0d3791067f48f503a0a1bf",
+        "next_levels/score_rank/ptoas/tp_score_reuse.pto": "8981b6946a8d1c0ae021868757f1e9e27db408cd99b73d21c22234a03badcc69",
+        "next_levels/score_rank/ptoas/tp_score_sum.cpp": "e732bd4eb58c7fb88a5a3271d3c41b97723b2f91b1ca60a00ab34412d77cd601",
+        "next_levels/score_rank/ptoas/tp_score_sum.pto": "f20dbcbf032e4df84c8fde52eddfc2f464d9b96db0fecfd7c13a05c5278c17cf",
+        "next_levels/score_rank/ptoas/tp_score_wait.cpp": "44e835fb8a6ce53426ec79fbdb8152a4ed7c6331073ae3d8f161be2f3a347f24",
+        "next_levels/score_rank/ptoas/tp_score_wait.pto": "988ead6996bbdefc19051ab946245685adf06531c742f293d8b67f133941ef7c",
+        "orchestration/host_orch.py": "b09f0644bc9a22a95ecf06f1b0ce1ffe7397c860fec548f3e73487726c810fba"
+      }
+    }
+  ],
+  "seconds": 1.7999496459960938,
+  "source_before": {
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/config.py": "abfb39922b4c340f443c5d3e8869ee2c76344f7b03781702f845055abdd552c1",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/gemm_w8a8.py": "97b8ca009cf383eaba0dd59bad9759d7e2139b712d5d4e69aa9ee6e16382fe62",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py": "60046ce7f2c03e4e2bc756a050f6283cf65196c96a44492ec89fc88b3c178d31",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/moe_exchange.py": "650273d771f0468cd0c6088f2adb20fd93e0b542de036fd419dc7e780210a454",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/moe_experts.py": "50c1c3a533dd27f9ae958588f1de7fb6a450c5a8d980285cbccaefe44badc00a",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/moe_gate.py": "ad219161acccb3623e64e75fec152ab81bb83f66596cfbf0f5a62c84d6073eea",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/quant.py": "344de41d0d0748905b85cafd2ae3b7e85560e0ca7d0b52615b1d3c866e6aa3dc",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/rmsnorm.py": "f9f67d05d426fec058a0e1eb2edc69c704d3af15251f32f47cf12ada8b68d540",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/tp_reduce.py": "66105a076e9ea9246ab071d3f0d5d33c423accea9d7456fdf7880a42cc441171",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/utils.py": "96817adec5584eeab2940dab0faf42078fc257995021899e6dbe9e55e00c36d3"
+  },
+  "source_after": {
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/config.py": "abfb39922b4c340f443c5d3e8869ee2c76344f7b03781702f845055abdd552c1",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/gemm_w8a8.py": "97b8ca009cf383eaba0dd59bad9759d7e2139b712d5d4e69aa9ee6e16382fe62",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py": "60046ce7f2c03e4e2bc756a050f6283cf65196c96a44492ec89fc88b3c178d31",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/moe_exchange.py": "650273d771f0468cd0c6088f2adb20fd93e0b542de036fd419dc7e780210a454",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/moe_experts.py": "50c1c3a533dd27f9ae958588f1de7fb6a450c5a8d980285cbccaefe44badc00a",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/moe_gate.py": "ad219161acccb3623e64e75fec152ab81bb83f66596cfbf0f5a62c84d6073eea",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/quant.py": "344de41d0d0748905b85cafd2ae3b7e85560e0ca7d0b52615b1d3c866e6aa3dc",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/rmsnorm.py": "f9f67d05d426fec058a0e1eb2edc69c704d3af15251f32f47cf12ada8b68d540",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/tp_reduce.py": "66105a076e9ea9246ab071d3f0d5d33c423accea9d7456fdf7880a42cc441171",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/utils.py": "96817adec5584eeab2940dab0faf42078fc257995021899e6dbe9e55e00c36d3"
+  },
+  "samples_created": 0,
+  "public_prepare": 0,
+  "native": 0,
+  "platform": "a2a3",
+  "mode": "ONBOARD",
+  "ring_heap": [
+    0,
+    0,
+    4294967296,
+    0
+  ]
+}

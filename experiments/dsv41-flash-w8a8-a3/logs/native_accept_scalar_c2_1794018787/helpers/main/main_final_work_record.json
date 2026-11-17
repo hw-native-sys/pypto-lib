@@ -1,0 +1,9 @@
+{
+  "start": 1794017939,
+  "end": 1794018682,
+  "duration": 743,
+  "agent": "main-agent",
+  "unit": "scalar_c2_streaming_1794014676",
+  "status": "PARKED",
+  "basis": "Actual previous measured checkpoint through final report/source/evidence seal; includes own queued job wait, not CPU usage"
+}

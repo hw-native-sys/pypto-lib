@@ -1,0 +1,1602 @@
+{
+  "f03": [
+    {
+      "entry": "prefill_c1a_full",
+      "mode": "before",
+      "start": "1793951818",
+      "end": "1793951870",
+      "exit": "0",
+      "device": "0",
+      "cases": 0,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "FAIL"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ],
+      "error": "Output(s) does not match golden: ['compressed_cache']\n  'compressed_cache' FAIL (compare_published_source_cache)  shape=(2, 128, 1, 512) dtype=torch.bfloat16\n\n    published source rows:     ratio_allclose fail: error_count=506/4096 (ratio=12.3535%, allowed<=1.0000%, threshold=41 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=5.17188 at (7, 504) (tol=0.0661426)\n    first 10 mismatches:\n    [448] actual=-1.4296875, expected=-0.65625, diff=0.7734, tol=0.03025\n    [449] actual=-1.8671875, expected=-2.265625, diff=0.3984, tol=0.0554\n    [450] actual=-0.43554688, expected=-0.3828125, diff=0.05273, tol=0.02598\n    [451] actual=-0.046142578, expected=-0.21191406, diff=0.1658, tol=0.02331\n    [452] actual=0.97265625, expected=1.0234375, diff=0.05078, tol=0.03599\n    [453] actual=-0.34179688, expected=0.092773438, diff=0.4346, tol=0.02145\n    [454] actual=2.21875, expected=1.8984375, diff=0.3203, tol=0.04966\n    [455] actual=0.20898438, expected=1.1640625, diff=0.9551, tol=0.03819\n    [456] actual=0.62109375, expected=0.35546875, diff=0.2656, tol=0.02555\n    [457] actual=0.4140625, expected=0.65625, diff=0.2422, tol=0.03025",
+      "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/build_output/_jit_prefill_attention_test_20261106_155702_pc45u0r9",
+      "counts": [
+        [
+          "506",
+          "4096"
+        ]
+      ]
+    },
+    {
+      "entry": "prefill_c2a_full",
+      "mode": "before",
+      "start": "1793951870",
+      "end": "1793951922",
+      "exit": "0",
+      "device": "0",
+      "cases": 0,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "FAIL"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "state_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ],
+      "error": "Output(s) does not match golden: ['compressed_cache']\n  'compressed_cache' FAIL (compare_published_source_cache)  shape=(2, 128, 1, 512) dtype=torch.bfloat16\n\n    published source rows:     ratio_allclose fail: error_count=242/2048 (ratio=11.8164%, allowed<=1.0000%, threshold=20 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=3.72656 at (2, 449) (tol=0.0489307)\n    first 10 mismatches:\n    [448] actual=-0.15625, expected=0.13574219, diff=0.292, tol=0.02212\n    [450] actual=-0.5, expected=-0.57421875, diff=0.07422, tol=0.02897\n    [451] actual=0.28710938, expected=0.0703125, diff=0.2168, tol=0.0211\n    [453] actual=0.16601562, expected=-0.18945312, diff=0.3555, tol=0.02296\n    [455] actual=0.48632812, expected=-0.5859375, diff=1.072, tol=0.02916\n    [456] actual=-0.36914062, expected=-0.42578125, diff=0.05664, tol=0.02665\n    [457] actual=0.21191406, expected=0.014953613, diff=0.197, tol=0.02023\n    [458] actual=1.2265625, expected=0.92578125, diff=0.3008, tol=0.03447\n    [459] actual=0.28515625, expected=0.8515625, diff=0.5664, tol=0.03331\n    [460] actual=0.060791016, expected=0.56640625, diff=0.5056, tol=0.02885",
+      "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/build_output/_jit_prefill_c2a_full_test_20261106_155754_yo9u2k94",
+      "counts": [
+        [
+          "242",
+          "2048"
+        ]
+      ]
+    },
+    {
+      "entry": "decode_c1a_full",
+      "mode": "before",
+      "start": "1793951922",
+      "end": "1793951973",
+      "exit": "0",
+      "device": "0",
+      "cases": 0,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "FAIL"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ],
+      "error": "Output(s) does not match golden: ['compressed_cache']\n  'compressed_cache' FAIL (compare_published_source_cache)  shape=(20, 128, 1, 512) dtype=torch.bfloat16\n\n    published source rows:     ratio_allclose fail: error_count=121/1024 (ratio=11.8164%, allowed<=1.0000%, threshold=10 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=3.04688 at (1, 509) (tol=0.0496631)\n    first 10 mismatches:\n    [448] actual=1.3515625, expected=0.90234375, diff=0.4492, tol=0.0341\n    [449] actual=0.9921875, expected=1.4140625, diff=0.4219, tol=0.04209\n    [450] actual=-1.390625, expected=-1.671875, diff=0.2812, tol=0.04612\n    [451] actual=1.0078125, expected=0.38867188, diff=0.6191, tol=0.02607\n    [452] actual=-0.94140625, expected=0.31054688, diff=1.252, tol=0.02485\n    [453] actual=-2.8125, expected=-2.953125, diff=0.1406, tol=0.06614\n    [454] actual=0.15820312, expected=1.234375, diff=1.076, tol=0.03929\n    [455] actual=-2.46875, expected=-2.140625, diff=0.3281, tol=0.05345\n    [456] actual=-1.859375, expected=-1.75, diff=0.1094, tol=0.04734\n    [457] actual=0.22363281, expected=-0.671875, diff=0.8955, tol=0.0305",
+      "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/build_output/_jit_decode_c1a_full_attention_test_20261106_155847_fde6p2s_",
+      "counts": [
+        [
+          "121",
+          "1024"
+        ]
+      ]
+    },
+    {
+      "entry": "decode_c2a_full",
+      "mode": "before",
+      "start": "1793951973",
+      "end": "1793952026",
+      "exit": "0",
+      "device": "0",
+      "cases": 0,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "FAIL"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "state_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ],
+      "error": "Output(s) does not match golden: ['compressed_cache']\n  'compressed_cache' FAIL (compare_published_source_cache)  shape=(20, 128, 1, 512) dtype=torch.bfloat16\n\n    published source rows:     ratio_allclose fail: error_count=125/1024 (ratio=12.2070%, allowed<=1.0000%, threshold=10 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=3.39746 at (1, 511) (tol=0.0754199)\n    first 10 mismatches:\n    [448] actual=0.40820312, expected=0.095214844, diff=0.313, tol=0.02149\n    [449] actual=0.7890625, expected=0.8828125, diff=0.09375, tol=0.03379\n    [450] actual=-0.2109375, expected=-0.39257812, diff=0.1816, tol=0.02613\n    [451] actual=0.5078125, expected=0.38671875, diff=0.1211, tol=0.02604\n    [452] actual=-1.4375, expected=-0.9140625, diff=0.5234, tol=0.03428\n    [453] actual=-0.953125, expected=-1.4609375, diff=0.5078, tol=0.04283\n    [454] actual=1.1171875, expected=1.0546875, diff=0.0625, tol=0.03648\n    [455] actual=-0.11035156, expected=0.39453125, diff=0.5049, tol=0.02616\n    [456] actual=-0.36132812, expected=-0.1328125, diff=0.2285, tol=0.02208\n    [457] actual=-0.40039062, expected=-0.5234375, diff=0.123, tol=0.02818",
+      "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/build_output/_jit_decode_c2a_full_attention_test_20261106_155939_21oxg7ur",
+      "counts": [
+        [
+          "125",
+          "1024"
+        ]
+      ]
+    },
+    {
+      "entry": "prefill_c1a_full",
+      "mode": "after",
+      "start": "1793952026",
+      "end": "1793952078",
+      "exit": "0",
+      "device": "0",
+      "cases": 1,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ],
+      "error": null,
+      "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/build_output/_jit_prefill_attention_test_20261106_160031_e4vnq9ko"
+    },
+    {
+      "entry": "prefill_c2a_full",
+      "mode": "after",
+      "start": "1793952078",
+      "end": "1793952131",
+      "exit": "0",
+      "device": "0",
+      "cases": 1,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "state_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ],
+      "error": null,
+      "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/build_output/_jit_prefill_c2a_full_test_20261106_160123_0_von6xk"
+    },
+    {
+      "entry": "decode_c1a_full",
+      "mode": "after",
+      "start": "1793952131",
+      "end": "1793952184",
+      "exit": "0",
+      "device": "0",
+      "cases": 1,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ],
+      "error": null,
+      "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/build_output/_jit_decode_c1a_full_attention_test_20261106_160217_21x5s3gb"
+    },
+    {
+      "entry": "decode_c2a_full",
+      "mode": "after",
+      "start": "1793952184",
+      "end": "1793952235",
+      "exit": "0",
+      "device": "0",
+      "cases": 1,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "state_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ],
+      "error": null,
+      "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/build_output/_jit_decode_c2a_full_attention_test_20261106_160309_dv4w2kk_"
+    },
+    {
+      "entry": "prefill_c1a_full",
+      "mode": "rotated_index",
+      "start": "1793952235",
+      "end": "1793952287",
+      "exit": "0",
+      "device": "0",
+      "cases": 0,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "FAIL"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "FAIL"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ],
+      "error": "Output(s) does not match golden: ['index_cache', 'topk_values']\n  'index_cache' FAIL (compare_published_source_cache)  shape=(2, 128, 1, 128) dtype=torch.bfloat16\n    ratio_allclose fail: error_count=960/32768 (ratio=2.9297%, allowed<=1.0000%, threshold=328 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=1.78027 at (1, 13, 0, 82) (tol=0.0231891)\n    first 10 mismatches:\n    [1281] actual=0.047119141, expected=0.0093383789, diff=0.03778, tol=0.02015\n    [1282] actual=-0.25, expected=-0.44140625, diff=0.1914, tol=0.0269\n    [1283] actual=-0.59375, expected=-0.7734375, diff=0.1797, tol=0.03208\n    [1284] actual=-1.2421875, expected=-1.1640625, diff=0.07812, tol=0.03819\n    [1285] actual=0.11279297, expected=0.0045776367, diff=0.1082, tol=0.02007\n    [1286] actual=-0.30859375, expected=-0.26953125, diff=0.03906, tol=0.02421\n    [1287] actual=-1.1953125, expected=-1.2578125, diff=0.0625, tol=0.03965\n    [1288] actual=0.39453125, expected=0.6484375, diff=0.2539, tol=0.03013\n    [1290] actual=2.390625, expected=2.328125, diff=0.0625, tol=0.05638\n    [1291] actual=0.265625, expected=0.39648438, diff=0.1309, tol=0.0262\n  'topk_values' FAIL (index_score_compare)  shape=(8, 512) dtype=torch.float32\n; rel_l2=32.5404%",
+      "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/build_output/_jit_prefill_attention_test_20261106_160359_24_h54ut",
+      "counts": [
+        [
+          "960",
+          "32768"
+        ]
+      ]
+    },
+    {
+      "entry": "prefill_c2a_full",
+      "mode": "rotated_index",
+      "start": "1793952287",
+      "end": "1793952339",
+      "exit": "0",
+      "device": "0",
+      "cases": 0,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "FAIL"
+        ],
+        [
+          "state_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "FAIL"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ],
+      "error": "Output(s) does not match golden: ['index_cache', 'topk_values']\n  'index_cache' FAIL (compare_published_source_cache)  shape=(2, 128, 1, 128) dtype=torch.bfloat16\n    ratio_allclose fail: error_count=480/32768 (ratio=1.4648%, allowed<=1.0000%, threshold=328 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=1.85254 at (1, 6, 0, 84) (tol=0.0222125)\n    first 10 mismatches:\n    [640] actual=0.82421875, expected=0.73046875, diff=0.09375, tol=0.03141\n    [641] actual=-0.028076172, expected=-0.27539062, diff=0.2473, tol=0.0243\n    [642] actual=-2.625, expected=-2.40625, diff=0.2188, tol=0.0576\n    [643] actual=0.29492188, expected=0.56640625, diff=0.2715, tol=0.02885\n    [644] actual=0.64453125, expected=0.44726562, diff=0.1973, tol=0.02699\n    [645] actual=0.85546875, expected=1.0390625, diff=0.1836, tol=0.03624\n    [646] actual=0.45507812, expected=0.8046875, diff=0.3496, tol=0.03257\n    [647] actual=-1.3359375, expected=-1.859375, diff=0.5234, tol=0.04905\n    [648] actual=1.140625, expected=1.234375, diff=0.09375, tol=0.03929\n    [650] actual=0.42382812, expected=0.65234375, diff=0.2285, tol=0.03019\n  'topk_values' FAIL (index_score_compare)  shape=(8, 512) dtype=torch.float32\n; rel_l2=51.5625%",
+      "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/build_output/_jit_prefill_c2a_full_test_20261106_160452_crygop1b",
+      "counts": [
+        [
+          "480",
+          "32768"
+        ]
+      ]
+    },
+    {
+      "entry": "decode_c1a_full",
+      "mode": "rotated_index",
+      "start": "1793952339",
+      "end": "1793952391",
+      "exit": "0",
+      "device": "0",
+      "cases": 0,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "FAIL"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ],
+      "error": "Output(s) does not match golden: ['index_cache']\n  'index_cache' FAIL (compare_published_source_cache)  shape=(20, 128, 1, 128) dtype=torch.bfloat16\n\n    published source rows:     ratio_allclose fail: error_count=237/256 (ratio=92.5781%, allowed<=1.0000%, threshold=3 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=0.996094 at (0, 92) (tol=0.0339771)\n    first 10 mismatches:\n    [0] actual=0.84765625, expected=1.0390625, diff=0.1914, tol=0.03624\n    [1] actual=0.18261719, expected=0.24414062, diff=0.06152, tol=0.02381\n    [2] actual=2.109375, expected=2.46875, diff=0.3594, tol=0.05857\n    [3] actual=-2.234375, expected=-2.015625, diff=0.2188, tol=0.05149\n    [4] actual=-1, expected=-0.53125, diff=0.4688, tol=0.0283\n    [5] actual=0.83203125, expected=1.0625, diff=0.2305, tol=0.0366\n    [6] actual=0.1640625, expected=0.41601562, diff=0.252, tol=0.0265\n    [7] actual=0.78515625, expected=1.21875, diff=0.4336, tol=0.03904\n    [8] actual=-0.4609375, expected=-0.13476562, diff=0.3262, tol=0.02211\n    [9] actual=-1.40625, expected=-1.515625, diff=0.1094, tol=0.04368",
+      "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/build_output/_jit_decode_c1a_full_attention_test_20261106_160545_y16kukq0",
+      "counts": [
+        [
+          "237",
+          "256"
+        ]
+      ]
+    },
+    {
+      "entry": "decode_c2a_full",
+      "mode": "rotated_index",
+      "start": "1793952391",
+      "end": "1793952442",
+      "exit": "0",
+      "device": "0",
+      "cases": 0,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "FAIL"
+        ],
+        [
+          "state_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "FAIL"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ],
+      "error": "Output(s) does not match golden: ['index_cache', 'topk_values']\n  'index_cache' FAIL (compare_published_source_cache)  shape=(20, 128, 1, 128) dtype=torch.bfloat16\n\n    published source rows:     ratio_allclose fail: error_count=234/256 (ratio=91.4062%, allowed<=1.0000%, threshold=3 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=1.1875 at (1, 18) (tol=0.0424609)\n    first 10 mismatches:\n    [0] actual=1.296875, expected=1.71875, diff=0.4219, tol=0.04686\n    [1] actual=-1.1328125, expected=-1.515625, diff=0.3828, tol=0.04368\n    [2] actual=1.3359375, expected=1.4296875, diff=0.09375, tol=0.04234\n    [3] actual=0.16503906, expected=-0.390625, diff=0.5557, tol=0.0261\n    [4] actual=-0.94140625, expected=-1.078125, diff=0.1367, tol=0.03685\n    [5] actual=-1.0546875, expected=-0.546875, diff=0.5078, tol=0.02854\n    [6] actual=0.6796875, expected=0.55859375, diff=0.1211, tol=0.02873\n    [7] actual=0.27734375, expected=0.20117188, diff=0.07617, tol=0.02314\n    [8] actual=0.020141602, expected=0.66015625, diff=0.64, tol=0.03031\n    [9] actual=-1.2109375, expected=-0.88671875, diff=0.3242, tol=0.03385\n  'topk_values' FAIL (index_score_compare)  shape=(2, 512) dtype=torch.float32\n; rel_l2=29.0506%",
+      "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/build_output/_jit_decode_c2a_full_attention_test_20261106_160637_szjo3cmv",
+      "counts": [
+        [
+          "234",
+          "256"
+        ]
+      ]
+    }
+  ],
+  "downstream": [
+    {
+      "entry": "mla_proj",
+      "start": "1793951819",
+      "end": "1793951835",
+      "exit": "0",
+      "device": "1",
+      "cases": 3,
+      "outputs": [
+        [
+          "q",
+          "PASS"
+        ],
+        [
+          "kv",
+          "PASS"
+        ],
+        [
+          "qr",
+          "PASS"
+        ],
+        [
+          "qr_scale",
+          "PASS"
+        ],
+        [
+          "q",
+          "PASS"
+        ],
+        [
+          "kv",
+          "PASS"
+        ],
+        [
+          "qr",
+          "PASS"
+        ],
+        [
+          "qr_scale",
+          "PASS"
+        ],
+        [
+          "q",
+          "PASS"
+        ],
+        [
+          "kv",
+          "PASS"
+        ],
+        [
+          "qr",
+          "PASS"
+        ],
+        [
+          "qr_scale",
+          "PASS"
+        ]
+      ]
+    },
+    {
+      "entry": "o_proj",
+      "start": "1793951835",
+      "end": "1793951852",
+      "exit": "0",
+      "device": "1",
+      "cases": 4,
+      "outputs": [
+        [
+          "output",
+          "PASS"
+        ],
+        [
+          "output",
+          "PASS"
+        ],
+        [
+          "output",
+          "PASS"
+        ],
+        [
+          "output",
+          "PASS"
+        ]
+      ]
+    },
+    {
+      "entry": "moe_gate",
+      "start": "1793951852",
+      "end": "1793951867",
+      "exit": "0",
+      "device": "1",
+      "cases": 4,
+      "outputs": [
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "weights",
+          "PASS"
+        ],
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "weights",
+          "PASS"
+        ],
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "weights",
+          "PASS"
+        ],
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "weights",
+          "PASS"
+        ]
+      ]
+    },
+    {
+      "entry": "compressor",
+      "start": "1793951867",
+      "end": "1793951886",
+      "exit": "0",
+      "device": "1",
+      "cases": 2,
+      "outputs": [
+        [
+          "output",
+          "PASS"
+        ],
+        [
+          "state_cache",
+          "PASS"
+        ],
+        [
+          "output",
+          "PASS"
+        ]
+      ]
+    },
+    {
+      "entry": "indexer",
+      "start": "1793951886",
+      "end": "1793951918",
+      "exit": "0",
+      "device": "1",
+      "cases": 6,
+      "outputs": [
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "scores",
+          "PASS"
+        ],
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "values",
+          "PASS"
+        ],
+        [
+          "pool_ids",
+          "PASS"
+        ],
+        [
+          "pool_counts",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "scores",
+          "PASS"
+        ],
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "values",
+          "PASS"
+        ],
+        [
+          "pool_ids",
+          "PASS"
+        ],
+        [
+          "pool_counts",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "scores",
+          "PASS"
+        ],
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "values",
+          "PASS"
+        ],
+        [
+          "pool_ids",
+          "PASS"
+        ],
+        [
+          "pool_counts",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "scores",
+          "PASS"
+        ],
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "values",
+          "PASS"
+        ],
+        [
+          "pool_ids",
+          "PASS"
+        ],
+        [
+          "pool_counts",
+          "PASS"
+        ],
+        [
+          "pool_ids",
+          "PASS"
+        ],
+        [
+          "pool_counts",
+          "PASS"
+        ],
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "values",
+          "PASS"
+        ],
+        [
+          "pool_ids",
+          "PASS"
+        ],
+        [
+          "pool_counts",
+          "PASS"
+        ],
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "values",
+          "PASS"
+        ]
+      ]
+    },
+    {
+      "entry": "decode_swa",
+      "start": "1793951918",
+      "end": "1793951937",
+      "exit": "0",
+      "device": "1",
+      "cases": 2,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ],
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    {
+      "entry": "prefill_swa",
+      "start": "1793951937",
+      "end": "1793951956",
+      "exit": "0",
+      "device": "1",
+      "cases": 1,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    {
+      "entry": "decode_c2a_full",
+      "start": "1793951956",
+      "end": "1793951981",
+      "exit": "0",
+      "device": "1",
+      "cases": 2,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "state_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ],
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "state_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    {
+      "entry": "prefill_c2a_full",
+      "start": "1793951981",
+      "end": "1793952005",
+      "exit": "0",
+      "device": "1",
+      "cases": 1,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "state_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    {
+      "entry": "decode_c2a_reuse",
+      "start": "1793952005",
+      "end": "1793952026",
+      "exit": "0",
+      "device": "1",
+      "cases": 2,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ],
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    {
+      "entry": "prefill_c2a_reuse",
+      "start": "1793952026",
+      "end": "1793952045",
+      "exit": "0",
+      "device": "1",
+      "cases": 1,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    {
+      "entry": "decode_c1a_full",
+      "start": "1793952045",
+      "end": "1793952070",
+      "exit": "0",
+      "device": "1",
+      "cases": 2,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ],
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    {
+      "entry": "prefill_c1a_full",
+      "start": "1793952070",
+      "end": "1793952092",
+      "exit": "0",
+      "device": "1",
+      "cases": 1,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    {
+      "entry": "decode_c1a_reindex",
+      "start": "1793952092",
+      "end": "1793952117",
+      "exit": "0",
+      "device": "1",
+      "cases": 2,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ],
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    {
+      "entry": "prefill_c1a_reindex",
+      "start": "1793952117",
+      "end": "1793952138",
+      "exit": "0",
+      "device": "1",
+      "cases": 1,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    {
+      "entry": "decode_c1a_reuse",
+      "start": "1793952138",
+      "end": "1793952162",
+      "exit": "0",
+      "device": "1",
+      "cases": 2,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ],
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    {
+      "entry": "prefill_c1a_reuse",
+      "start": "1793952162",
+      "end": "1793952181",
+      "exit": "0",
+      "device": "1",
+      "cases": 1,
+      "outputs": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    }
+  ],
+  "f08": {
+    "before": [
+      {
+        "kind": "zero",
+        "tokens": 1,
+        "passed": false,
+        "error": "Output(s) does not match golden: ['indices', 'weights']\n  'indices' FAIL (compare_moe_indices)  shape=(1, 6) dtype=torch.int32\nexpert IDs outside [0,384): [[73536, 73536, 73536, 73536, 73536, 73536]]\n  'weights' FAIL (compare_moe_weights)  shape=(1, 6) dtype=torch.float32\ncannot normalize invalid expert IDs",
+        "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f08/build_output/_jit_moe_gate_test_20261106_160307_wctj5zho"
+      },
+      {
+        "kind": "equal",
+        "tokens": 7,
+        "passed": false,
+        "error": "Output(s) does not match golden: ['indices', 'weights']\n  'indices' FAIL (compare_moe_indices)  shape=(7, 6) dtype=torch.int32\nexpert IDs outside [0,384): [[73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536]]\n  'weights' FAIL (compare_moe_weights)  shape=(7, 6) dtype=torch.float32\ncannot normalize invalid expert IDs",
+        "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f08/build_output/_jit_moe_gate_test_20261106_160307_wctj5zho"
+      },
+      {
+        "kind": "partial",
+        "tokens": 17,
+        "passed": false,
+        "error": "Output(s) does not match golden: ['indices', 'weights']\n  'indices' FAIL (compare_moe_indices)  shape=(17, 6) dtype=torch.int32\nexpert IDs outside [0,384): [[9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536]]\n  'weights' FAIL (compare_moe_weights)  shape=(17, 6) dtype=torch.float32\ncannot normalize invalid expert IDs",
+        "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f08/build_output/_jit_moe_gate_test_20261106_160307_wctj5zho"
+      }
+    ],
+    "after": [
+      {
+        "kind": "zero",
+        "tokens": 1,
+        "passed": true,
+        "error": null,
+        "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f08/build_output/_jit_moe_gate_test_20261106_160345_8mk93usi"
+      },
+      {
+        "kind": "equal",
+        "tokens": 7,
+        "passed": true,
+        "error": null,
+        "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f08/build_output/_jit_moe_gate_test_20261106_160345_8mk93usi"
+      },
+      {
+        "kind": "partial",
+        "tokens": 17,
+        "passed": true,
+        "error": null,
+        "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f08/build_output/_jit_moe_gate_test_20261106_160345_8mk93usi"
+      }
+    ]
+  },
+  "f14": {
+    "before": {
+      "nonzero_negative_before": {
+        "mode": "nonzero",
+        "matrices": 9,
+        "mismatched_bytes": 18432
+      },
+      "zero_baseline": {
+        "mode": "zero",
+        "matrices": 9,
+        "mismatched_bytes": 0
+      },
+      "source_sha256": "437b2b2308aba48912592a0ae676cf12e8cee0a48b7ae20e81372cece6d77f54",
+      "limitations": "In-memory synthetic fixture only; no checkpoint read, current-checkpoint incidence or original NPU primitive parity claim."
+    },
+    "after": {
+      "payload_cases": [
+        {
+          "mode": "nonzero",
+          "matrices": 9,
+          "mismatched_bytes": 0
+        },
+        {
+          "mode": "zero",
+          "matrices": 9,
+          "mismatched_bytes": 0
+        }
+      ],
+      "rejections": [
+        {
+          "mode": "fractional",
+          "error": "layers.0.ffn.experts.72.w1.weight_offset: nonzero offset is not representable after the INT8 fold"
+        },
+        {
+          "mode": "overflow_low",
+          "error": "layers.0.ffn.experts.72.w1.weight_offset: nonzero offset is not representable after the INT8 fold"
+        },
+        {
+          "mode": "overflow_high",
+          "error": "layers.0.ffn.experts.72.w1.weight_offset: nonzero offset is not representable after the INT8 fold"
+        }
+      ],
+      "shard_matrices_exact": 72,
+      "shard_scales_exact": 72,
+      "validation_errors": [],
+      "endpoint_cases_exact": 2,
+      "source_sha256": "46d42683c2450ebb49947df2bd823dc3659d66cf5ba4c5ce12d0f92faf51aa9e",
+      "limitations": "In-memory synthetic fixture only; no checkpoint read, current-checkpoint incidence or original NPU primitive parity claim."
+    }
+  },
+  "f08_host": {
+    "reference_sha256": "2c952bfe7d39809f1e01944e5c6461ab16bcf778338393ef7c911cdeef18520f",
+    "archive_sha256": "48c797546805b04ffde118c506f8902e37e19bf2cb5d1713097056a4c93e998c",
+    "cases": [
+      {
+        "kind": "zero",
+        "tokens": 1,
+        "original_routing_pass": true
+      },
+      {
+        "kind": "equal",
+        "tokens": 7,
+        "original_routing_pass": true
+      },
+      {
+        "kind": "partial",
+        "tokens": 17,
+        "original_routing_pass": true
+      }
+    ],
+    "controls": {
+      "out_of_range": "expert IDs outside [0,384): [[73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536]]",
+      "duplicate": "duplicate expert IDs: [[9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9]]",
+      "missed_winner": "    ratio_allclose fail: error_count=102/102 (ratio=100.0000%, allowed<=0.0000%, threshold=0 pts)\n    atol=0.001 rtol=0.001\n    max abs diff=2 at (0, 0) (tol=0.00335627)\n    first 10 mismatches:\n    [0] actual=0.3562696, expected=2.3562696, diff=2, tol=0.003356\n    [1] actual=0.3562696, expected=1.8562696, diff=1.5, tol=0.002856\n    [2] actual=0.3562696, expected=1.4583992, diff=1.102, tol=0.002458\n    [3] actual=0.3562696, expected=1.4583992, diff=1.102, tol=0.002458\n    [4] actual=0.3562696, expected=1.0662415, diff=0.71, tol=0.002066\n    [5] actual=0.3562696, expected=1.0662415, diff=0.71, tol=0.002066\n    [6] actual=0.3562696, expected=2.3562696, diff=2, tol=0.003356\n    [7] actual=0.3562696, expected=1.8562696, diff=1.5, tol=0.002856\n    [8] actual=0.3562696, expected=1.4583992, diff=1.102, tol=0.002458\n    [9] actual=0.3562696, expected=1.4583992, diff=1.102, tol=0.002458",
+      "wrong_weights": "    ratio_allclose fail: error_count=102/102 (ratio=100.0000%, allowed<=1.0000%, threshold=1 pts)\n    atol=0.001 rtol=0.01\n    max abs diff=0.379671 at (0, 2) (tol=0.00479671)\n    first 10 mismatches:\n    [0] actual=0, expected=0.092749223, diff=0.09275, tol=0.001927\n    [1] actual=0, expected=0.092749223, diff=0.09275, tol=0.001927\n    [2] actual=0, expected=0.37967142, diff=0.3797, tol=0.004797\n    [3] actual=0, expected=0.37967142, diff=0.3797, tol=0.004797\n    [4] actual=0, expected=0.27757931, diff=0.2776, tol=0.003776\n    [5] actual=0, expected=0.27757931, diff=0.2776, tol=0.003776\n    [6] actual=0, expected=0.092749223, diff=0.09275, tol=0.001927\n    [7] actual=0, expected=0.092749223, diff=0.09275, tol=0.001927\n    [8] actual=0, expected=0.37967142, diff=0.3797, tol=0.004797\n    [9] actual=0, expected=0.37967142, diff=0.3797, tol=0.004797",
+      "biased_normalization": "    ratio_allclose fail: error_count=102/102 (ratio=100.0000%, allowed<=1.0000%, threshold=1 pts)\n    atol=0.001 rtol=0.01\n    max abs diff=0.288861 at (0, 0) (tol=0.00192749)\n    first 10 mismatches:\n    [0] actual=0.38161013, expected=0.092749223, diff=0.2889, tol=0.001927\n    [1] actual=0.30063251, expected=0.092749223, diff=0.2079, tol=0.001927\n    [2] actual=0.23619533, expected=0.37967142, diff=0.1435, tol=0.004797\n    [3] actual=0.23619533, expected=0.37967142, diff=0.1435, tol=0.004797\n    [4] actual=0.17268336, expected=0.27757931, diff=0.1049, tol=0.003776\n    [5] actual=0.17268336, expected=0.27757931, diff=0.1049, tol=0.003776\n    [6] actual=0.38161013, expected=0.092749223, diff=0.2889, tol=0.001927\n    [7] actual=0.30063251, expected=0.092749223, diff=0.2079, tol=0.001927\n    [8] actual=0.23619533, expected=0.37967142, diff=0.1435, tol=0.004797\n    [9] actual=0.23619533, expected=0.37967142, diff=0.1435, tol=0.004797"
+    }
+  },
+  "f03_host": {
+    "provenance": {
+      "revision": "8fde6d4e335fe300e2b949aab0e31659cce0811d",
+      "archive_sha256": "48c797546805b04ffde118c506f8902e37e19bf2cb5d1713097056a4c93e998c",
+      "sources": {
+        "vllm_ascend/attention/dsa_v41.py": "3505769857f83fa7e67f652984f50bd0478158f1d24f185cab091203e70392fd",
+        "tests/e2e/nightly/single_node/ops/singlecard_ops/test_inplace_partial_rotary_mul.py": "078470b8443b8991f23f977c9e898c5263659f733aad1a8254ee9c9671953139"
+      }
+    },
+    "cases": [
+      {
+        "ratio": 1,
+        "tokens": 1,
+        "original_flow_exact": true,
+        "unrotated_index_input_exact": true
+      },
+      {
+        "ratio": 1,
+        "tokens": 7,
+        "original_flow_exact": true,
+        "unrotated_index_input_exact": true
+      },
+      {
+        "ratio": 1,
+        "tokens": 17,
+        "original_flow_exact": true,
+        "unrotated_index_input_exact": true
+      },
+      {
+        "ratio": 2,
+        "tokens": 1,
+        "original_flow_exact": true,
+        "unrotated_index_input_exact": true
+      },
+      {
+        "ratio": 2,
+        "tokens": 7,
+        "original_flow_exact": true,
+        "unrotated_index_input_exact": true
+      },
+      {
+        "ratio": 2,
+        "tokens": 17,
+        "original_flow_exact": true,
+        "unrotated_index_input_exact": true
+      },
+      {
+        "entry": "prefill_c1a_full",
+        "compressor_equation_exact": true
+      },
+      {
+        "entry": "prefill_c2a_full",
+        "compressor_equation_exact": true
+      },
+      {
+        "entry": "decode_c1a_full",
+        "compressor_equation_exact": true
+      },
+      {
+        "entry": "decode_c2a_full",
+        "compressor_equation_exact": true
+      }
+    ]
+  },
+  "integration": {
+    "published_rows": {
+      "ordinary_whole_cache_dilutes_failure": true,
+      "strengthened_comparator_rejects": true,
+      "positive": true,
+      "detail": "\n    published source rows:     ratio_allclose fail: error_count=64/512 (ratio=12.5000%, allowed<=1.0000%, threshold=5 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=1 at (0, 448) (tol=0.035625)\n    first 10 mismatches:\n    [448] actual=0, expected=1, diff=1, tol=0.03562\n    [449] actual=0, expected=1, diff=1, tol=0.03562\n    [450] actual=0, expected=1, diff=1, tol=0.03562\n    [451] actual=0, expected=1, diff=1, tol=0.03562\n    [452] actual=0, expected=1, diff=1, tol=0.03562\n    [453] actual=0, expected=1, diff=1, tol=0.03562\n    [454] actual=0, expected=1, diff=1, tol=0.03562\n    [455] actual=0, expected=1, diff=1, tol=0.03562\n    [456] actual=0, expected=1, diff=1, tol=0.03562\n    [457] actual=0, expected=1, diff=1, tol=0.03562"
+    },
+    "staged_routing": {
+      "two_legal_tie_orders": true,
+      "biased_ties_with_distinct_unbiased_weights": true,
+      "biased_normalization_rejected": true,
+      "invalid_id_rejected": true,
+      "wrong_weights_rejected": true
+    }
+  },
+  "compile": [
+    {
+      "entry": "decode_fwd",
+      "start": "1793951818",
+      "end": "1793951848",
+      "exit": "0"
+    },
+    {
+      "entry": "prefill_fwd",
+      "start": "1793951848",
+      "end": "1793951876",
+      "exit": "0"
+    }
+  ],
+  "source_manifest_sha256": "0bba0d6b19f91da52bf5c23e466cbf44d7edbc326e5dadeb25f3ecd43d7ad6f2",
+  "summary": {
+    "F03_positive": 4,
+    "F03_numerical_controls": 8,
+    "downstream_positive": 37,
+    "F08_separate_positive": 7,
+    "F08_separate_negative": 3,
+    "F14": "conditional synthetic only",
+    "sources_stable": 10,
+    "generated_files": 6
+  }
+}

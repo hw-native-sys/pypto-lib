@@ -1,0 +1,9 @@
+TP,EP,WORLD,DP,local_routed_experts,static_bytes_per_rank,largest_rank_allocation_bytes,classification
+1,16,16,16,24,47402636736,11324620800,logical_only_new_admission_required
+2,16,16,8,24,42217423296,11324620800,logical_only_new_admission_required
+4,16,16,4,24,39624816576,11324620800,historical_default_logical_anchor
+8,16,16,2,24,38328513216,11324620800,preferred_nondefault_candidate_not_measured_fit
+4,8,8,2,48,73636034496,22649241600,full_E40_static_unfit
+8,8,8,1,48,72339731136,22649241600,full_E40_static_unfit
+4,4,4,1,96,141658470336,45298483200,full_E40_static_unfit
+2,2,2,1,192,280295948736,90596966400,full_E40_static_unfit

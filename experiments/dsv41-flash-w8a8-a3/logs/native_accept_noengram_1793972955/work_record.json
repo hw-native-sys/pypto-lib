@@ -1,0 +1,8 @@
+{
+  "record_id": "review-noengram-1793972955-1793976226",
+  "agent": "review-agent",
+  "start": 1793972955,
+  "end": 1793976226,
+  "duration": 3271,
+  "activity": "Independent frozen noEngram CPU/ABI/header/residency review; native16decode1 numericalFAIL7state-selection outputs and bounded40dense/reused1expert prefillPASS; continuation unrun and fullweightsHELD; no source changes"
+}

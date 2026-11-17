@@ -1,0 +1,10 @@
+{
+  "id": "main-generation-admission-durability-1794051220-1794051451",
+  "agent": "/root/main_native",
+  "start_epoch": 1794051220,
+  "end_epoch": 1794051451,
+  "elapsed_seconds": 231,
+  "status": "FINAL/PARK",
+  "scope": "NEW artifact-only durability amendment; directold/new queuedtinyCPU and hashseal; no NPU/payload/productapply",
+  "workers": []
+}

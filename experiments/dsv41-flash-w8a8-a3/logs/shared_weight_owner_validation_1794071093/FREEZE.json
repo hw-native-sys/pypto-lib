@@ -1,0 +1,12 @@
+{
+  "adapter_sha256": "188cf41eafb1e6b6bdece83188a52b1a0e3336c6e5fb80a0d62b547223f31a41",
+  "artifacts_count": 79,
+  "artifacts_sha256": "978131cb00ec93ad03aebd277efdab5cd8baf7cb0d7922d8fb527f4158f9d6dd",
+  "epoch": 1794072302,
+  "helper_sha256": "38e92714a550407727a4a7d816c1e9c8fc711519cc73ecdcf89c1f8d6caa9d59",
+  "native_authorized_by_this_unit": false,
+  "programs_sha256": "e98d344af586a40e2adfa443b048cbcda3c576c531b90edba0468ccd13f08240",
+  "source45": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "state": "FINAL_PARK",
+  "task_entry_sha256": "4f0af75139b6c08f4324d46889de9180a1e1b51a036a8aacac24586f567366ac"
+}

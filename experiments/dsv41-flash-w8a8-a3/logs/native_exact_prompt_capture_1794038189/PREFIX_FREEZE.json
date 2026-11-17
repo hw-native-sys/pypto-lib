@@ -1,0 +1,17 @@
+{
+  "status": "PREFIX_PHASE_SEALED/PARK",
+  "manifest_sha256": "abc8f0c14937eab817681fdf1bdddb3bfce5adfc24f3fbf22f8d8a967faffa91",
+  "files": 683,
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "prefix_manifest_sha256": "f4ca9d488b7e27c6388ff2aa68a71d122a1df5e7d9b2eb186f1321ad0cf28daf",
+  "CPU_receipt_sha256": "95046fb12a3c88775b563a2bedf26c1b6f9ec08eca7168fd08e96d4668bf0ad7",
+  "static_plan_sha256": "6f9568a4fdfcb7c3fcb5d816025007f3601e78e24e4b85a392cb3e7854a9b850",
+  "reference_policy_sha256": "c8a0cc3d7c8ba7f208257e483013e9190124b8743d993ea6363aee0370054fb0",
+  "stage_helper_sha256": "61a92083ba76ec604b0461c9e72a18709dadc243494307a1a349c39cd4d3bb30",
+  "native_jobs_complete0": 1,
+  "decode_jobs": 0,
+  "all_own_assigned_jobs_complete0": true,
+  "known21PIDs_absent": true,
+  "work_record": "review-exactN3-prefix-1794038541-1794039895",
+  "lifecycle": "All enumerated prefix/helper/source/recipe/CPU/measurement files are immutable. Future stage append ownership in SAME physical work requires observer GO. No overwrite/relocation/rebinding authorized; no NPU decode GO yet."
+}

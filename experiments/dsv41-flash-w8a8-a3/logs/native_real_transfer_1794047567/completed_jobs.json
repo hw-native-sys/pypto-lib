@@ -1,0 +1,34 @@
+[
+  {
+    "task_id": "task_20261107_183523_328902725914",
+    "kind": "CPU-preflight",
+    "returncode": 0,
+    "stdout": "completed (exit=0)\n",
+    "stderr": "",
+    "epoch": 1794048693.3445737
+  },
+  {
+    "task_id": "task_20261107_183643_329223520113",
+    "kind": "native-selected-real-transfer",
+    "returncode": 0,
+    "stdout": "completed (exit=0)\n",
+    "stderr": "",
+    "epoch": 1794048693.5124393
+  },
+  {
+    "task_id": "task_20261107_184349_331508815146",
+    "kind": "CPU-audit-tuple-failure",
+    "returncode": 0,
+    "stdout": "completed (exit=1)\n",
+    "stderr": "",
+    "epoch": 1794048693.671638
+  },
+  {
+    "task_id": "task_20261107_184502_33186239724",
+    "kind": "CPU-audit-corrected",
+    "returncode": 0,
+    "stdout": "completed (exit=0)\n",
+    "stderr": "",
+    "epoch": 1794048693.8262746
+  }
+]

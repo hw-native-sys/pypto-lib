@@ -1,0 +1,18 @@
+{
+  "status": "FINAL/SEALED/PARK",
+  "end_epoch": 1794062861,
+  "artifact_count": 34,
+  "artifact_manifest_sha256": "531d0c118b33117ef2a28aa45d1457f4647034b846a15a2fb9defef5ef000c1a",
+  "native_job": "task_20261107_204310_361283812010",
+  "actual_generated_ids": [
+    3,
+    1
+  ],
+  "actual_decode_calls": 1,
+  "termination": "eos",
+  "source45_sha256": "d77d196be6541b4a87aef07cf0e5e02eac68cefa9fc245f3742e4c14606555aa",
+  "independent_audit_manifest_sha256": "3e9f22d8dff50cb3de4ed0485e6d3cbd20cf1f7ac2275ea1cbb07723cd508999",
+  "Root_accepted": true,
+  "no_source_changes": true,
+  "all_own_jobs_terminal": true
+}

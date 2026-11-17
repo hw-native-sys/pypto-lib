@@ -1,0 +1,27 @@
+# Independent longer real-generation audit
+
+FINAL / SEALED / PARK. The ONE CPU receipt audit completed: **281 checks passed, 2 unmet**. Overall operation is **NOT accepted by this audit**: native task_20261107_231342_350351328582 completed with exit1; outer status FAIL records one `PermissionError(13, 'Permission denied')` in monitor_errors. Product CLI itself returned0/statusok with no error/blockers/sampling failure. The queue/monitor failures are retained; this report does not recast them as a model numerical failure or an overall PASS. Root decides final scoped acceptance.
+
+Actual original prompt: `Once upon a`, IDs[16600,4465,260], N3/start0/max16/noEngram. Actual generated IDs: [1014, 1613, 21908, 515, 260, 1722, 260, 1722, 260, 1722, 260, 1722, 260, 1722, 260, 1722]. Raw suffix:
+
+` time...there was a way a way a way a way a way a way`
+
+Readable concatenation:
+
+`Once upon a time...there was a way a way a way a way a way a way`
+
+Termination is max_new_tokens, not EOS. There were exactly15 actual decode calls, consuming prior greedy IDs at positions3 through17, with positions_end18. The output is repetitive; no coherence/quality proxy or full-original parity is claimed. First token1014 has recorded score26.67154884338379; native prefill wall reported1.88s (rounded log display). Neither text content nor performance is a mathematical parity result.
+
+Independent CPU task_20261108_002821_316722226445 COMPLETE0, --no-device/max600. It audited the SAME failed native case only after terminal + external POST task_20261108_002515_315943019711 COMPLETE0. Native/external task statuses and current queue/list/policy were captured OUTSIDE the queued CPU; there were no nested queue commands, model/golden executions, compilation, tensor payload/header rereads or new NPU submissions. The own auditor exactSHA ce9063d63d7623fc975bcea691feb1b14c2ef06d622766fc187dc931e4c4c21d was prepared before terminal and unchanged. The two unmet gates are exactly native-queue-COMPLETE0 and primary-CLI0-and-no-post-observation-monitor-errors. CPU process exit0 means the receipt audit completed and wrote its findings, not that the native operation passed.
+
+Verified scoped facts: current CC source45/gen41651 plus reviewed source/normalCLI/runtime3/prompt/newoperation/binding; after-allocation Rootassignment/productionreceipt/ordered16/entryTTL chain; tokenizer exactroot+files PREQUEUE/ALLOCATED/POST/externalPOST; actual ONBOARD guarded config4GiB/a2a3/TMR library chain and generated E40/57 typed static ABI. Each of prefill and decode completed the original full-phase source-read map (139614 keys,164192 reads,745846365184 source bytes),912 exact target endpoints and633997065216 H2D bytes. This current case has TWO separate phase uploads; the future same-owner reuse review is separate and cannot relabel these counters. Full raw phase-final before/after-free memory for all16 and final normal return/cleanup were present.
+
+All16 recorded selections (first +15 decode) had finite TP shard candidates, consistent TP-global selection, all4DP votes and strict agreement. Actual history, prior-greedy inputs, positions, ordinary returned-state hashes and shared-host transport counts matched the normal driver. This verifies recorded sampling/driver facts; it does not independently recompute argmax from saved raw logits or prove saved cache byte/math equivalence. Complete public-copy/source-map accounting is not full D2H weight parity or evidence every source transform is mathematically correct. GeneralF09, Engram/MTP/full-original parity remain open.
+
+Cleanup evidence:32 native worker PIDs were matched to recorded birth identities. All1117 recorded process identities are absent. Raw native log released ordered locks0..15; fresh outer queue snapshot shows0/16 and no Pending/Running tasks. Acquisition-reported PID3503621 remains only a label and its absence is not used as lock proof. All consumed evidence, tokenizer files, source45 and runtime bindings stayed byte-identical through the audit and final seal. Own audit PID/starttick is absent.
+
+Monitor scope:1880 samples; sampled own-tree proportional PSS peak13,255,596,032 bytes (USS peak12,501,909,504). This is sampled evidence, not continuous peak or complete monitoring success. One permission error is durable and makes outer/task FAIL. Pinned outer process_tree reads /proc identities/smaps_rollup/task children and catches disappearing-process exceptions but not PermissionError inside that traversal; monitor records repr(error). Existing evidence does not identify which exact PID/path caused it, so no narrower cause, permission workaround or false complete-memory claim is made. No monitoring/source fix or retry was performed.
+
+Source freeze remains CC cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c; all45 current files verified unchanged. ExternalPOST SHA08101bf2c06a91be2d79bfed2acb7d8380c16ddf430896c391f58b656ed46373; generation JSON f2e52e53c96df7154ed5aaf84fee863114df3f9819511127b9f8c19f4a037dca; outer_result48ca36a73864e6e660738c4effc1d30381e018dab38fe7537b75453f7657d194. Old first-audit13 and all native evidence remain unchanged. No acceptance decision/source/threshold/guard/token edits or grants created by reviewer.
+
+Actual results/check labels/input digests are in audit_results.json. Measured review-agent ledger excludes separately sealed reuse-review interval[1794067346,1794068775], avoiding double counting. All owned tasks ended; no further tests requested or run.

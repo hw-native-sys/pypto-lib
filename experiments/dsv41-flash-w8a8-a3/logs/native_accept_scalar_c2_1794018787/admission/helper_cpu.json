@@ -1,0 +1,113 @@
+{
+  "exact_both_phase_helper_ast": true,
+  "actual_installed_program_contract": {
+    "backend": "tensormap_and_ringbuffer",
+    "platform": "a2a3",
+    "mode": "PROGRAM",
+    "library_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/build/lib/a2a3/onboard/tensormap_and_ringbuffer/libhost_runtime.so",
+    "library_sha256": "24434f8879030ef1b1f31e5fc2ecce683e392d4f1baeb5bcee852fb183976e5c",
+    "abi_version": 1,
+    "resource_count": 6,
+    "pipeline_directory_capacity": 4294967295,
+    "resources": [
+      {
+        "kind": 4,
+        "resource_class": 0,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 1,
+        "resource_class": 1,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 2,
+        "resource_class": 1,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 3,
+        "resource_class": 1,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 5,
+        "resource_class": 2,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 6,
+        "resource_class": 2,
+        "bytes_per_copy": 0
+      }
+    ],
+    "shared_arena_bank": 0,
+    "query_scope": "read-only exported get_pipeline_contract; no init/prepare/device call"
+  },
+  "phases": [
+    {
+      "phase": "prefill128",
+      "forwarded": [
+        [
+          "prepare",
+          [
+            0,
+            0,
+            4294967296,
+            0
+          ]
+        ],
+        [
+          "dispatch",
+          [
+            0,
+            0,
+            4294967296,
+            0
+          ]
+        ]
+      ],
+      "actual_archived_168_memory_guard": "PASS",
+      "native_worker": false
+    },
+    {
+      "phase": "decode1",
+      "forwarded": [
+        [
+          "prepare",
+          null
+        ],
+        [
+          "dispatch",
+          null
+        ],
+        [
+          "dispatch",
+          null
+        ],
+        [
+          "dispatch",
+          null
+        ],
+        [
+          "dispatch",
+          null
+        ]
+      ],
+      "actual_archived_168_memory_guard": "PASS",
+      "native_worker": false
+    }
+  ],
+  "negative_guard_controls": [
+    "unknown_backend",
+    "nonshared",
+    "changed_library",
+    "low_free",
+    "missing_rank",
+    "query_failure_before_prepare"
+  ],
+  "unknown_or_nonshared_backend_fails_closed": true,
+  "no_heap_double_charge_after_prewarm": true,
+  "actual_observed_168_capacity_is_metadata_only": true,
+  "scope": "CPU replay of real archived prefix telemetry using fake worker; no new native prepare or numerical proof"
+}

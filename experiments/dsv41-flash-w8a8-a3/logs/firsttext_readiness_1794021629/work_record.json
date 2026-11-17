@@ -1,0 +1,12 @@
+{
+  "start": 1794021629,
+  "end": 1794021746,
+  "duration": 117,
+  "agent": "main-agent",
+  "measurement": "firstexplicitclockafterinitialsourcereadthroughreportseal;earlierunmeasuredsourceinspectionexcluded",
+  "status": "PARKED",
+  "tests": "none,sourceclear",
+  "NPU": 0,
+  "payload": 0,
+  "source45": "unchanged"
+}

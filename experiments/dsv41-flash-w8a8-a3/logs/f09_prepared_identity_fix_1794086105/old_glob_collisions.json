@@ -1,0 +1,36 @@
+[
+  {
+    "source": "next_levels/probe_rank/kernels/aiv/moe_compact.cpp",
+    "old_matches": [
+      "moe_compact_b6278e66f11b37f2e0187a25.o",
+      "moe_compact_clear_a9287775e6cc47a833ab924a.o"
+    ],
+    "new_exact": "next_levels/probe_rank/kernels/aiv/moe_compact_b6278e66f11b37f2e0187a25.o"
+  },
+  {
+    "source": "next_levels/probe_rank/kernels/aiv/int8_quant_per_token.cpp",
+    "old_matches": [
+      "int8_quant_per_token_0_1016ae116568bb477cc59edc.o",
+      "int8_quant_per_token_71fb5240c76d065d3477f02f.o"
+    ],
+    "new_exact": "next_levels/probe_rank/kernels/aiv/int8_quant_per_token_71fb5240c76d065d3477f02f.o"
+  },
+  {
+    "source": "next_levels/probe_rank/kernels/aiv/swiglu.cpp",
+    "old_matches": [
+      "swiglu_498c8b9acd87133a7fb3201e.o",
+      "swiglu_shared_7c845bfdd242bce0a89ea322.o"
+    ],
+    "new_exact": "next_levels/probe_rank/kernels/aiv/swiglu_498c8b9acd87133a7fb3201e.o"
+  },
+  {
+    "source": "next_levels/probe_rank/kernels/aiv/moe_return.cpp",
+    "old_matches": [
+      "moe_return_9ef7506b0c8baacec596d1aa.o",
+      "moe_return_consumed_cf7a02211c800b309c79b99b.o",
+      "moe_return_reuse_d5a751b5735b74acd717a6c3.o",
+      "moe_return_signal_0cc0214c2aa5a06e4c1f645c.o"
+    ],
+    "new_exact": "next_levels/probe_rank/kernels/aiv/moe_return_9ef7506b0c8baacec596d1aa.o"
+  }
+]

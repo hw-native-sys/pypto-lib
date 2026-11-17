@@ -1,0 +1,16 @@
+{
+  "status": "FINAL_PARK_SOURCE_PLAN_UNAPPLIED",
+  "files": 27,
+  "manifest_sha256": "2353c44e40d8ccfbe18a1394dad2272bf3f589cc16fff7dee2458cc16c35e0a4",
+  "patch": "504b1830b2f4e6333a01a900fa579ef9de69e017ee20523e8fcbf10850881e46",
+  "math_baseline_A8153": "8153c7f040bef51900a6e6c9ff27b018279b7503f31d50ec5488457e49770b28",
+  "target_B": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+  "target_generate": "5de1656a99e85699138879b2f577f4eed2639779937a7cdc91ae843fcef6e34c",
+  "metadata_updater_run": false,
+  "tests_or_compile_or_NPU": false,
+  "protected_writes": 0,
+  "Root_apply_GO": "ABSENT",
+  "independent171": "PENDING",
+  "own_jobs": 0,
+  "writers": 0
+}

@@ -1,0 +1,84 @@
+{
+  "output_names": [
+    "layer_x_hc",
+    "layer_pre_mix",
+    "x_hc_final",
+    "pre_mix_final",
+    "logits",
+    "window_cache",
+    "compressed_cache_c2a",
+    "index_cache_c2a",
+    "state_cache_c2a",
+    "compressed_cache_c1a",
+    "index_cache_c1a",
+    "topk_indices_c2a",
+    "topk_values_c2a",
+    "pool_block_ids_c2a",
+    "pool_block_counts_c2a",
+    "topk_indices_c1a",
+    "topk_values_c1a",
+    "pool_block_ids_c1a",
+    "pool_block_counts_c1a"
+  ],
+  "all_outputs_pass": true,
+  "validated_scopes": {
+    "unconditioned": true,
+    "staged": true
+  },
+  "oracle_integrity": [
+    {
+      "scope": "unconditioned",
+      "initial_before_sha256": "8a2ee5656d2c88e434cd0caa6d4de6119056edc1b109e118c7aa0ec8fcdd91a7",
+      "initial_after_sha256": "8a2ee5656d2c88e434cd0caa6d4de6119056edc1b109e118c7aa0ec8fcdd91a7",
+      "tensor_count": 39,
+      "mutable_names": [
+        "window_cache",
+        "compressed_cache_c2a",
+        "index_cache_c2a",
+        "state_cache_c2a",
+        "compressed_cache_c1a",
+        "index_cache_c1a",
+        "topk_indices",
+        "topk_values",
+        "pool_block_ids",
+        "pool_block_counts",
+        "x_hc",
+        "pre_mix"
+      ]
+    },
+    {
+      "scope": "staged",
+      "initial_before_sha256": "8a2ee5656d2c88e434cd0caa6d4de6119056edc1b109e118c7aa0ec8fcdd91a7",
+      "initial_after_sha256": "8a2ee5656d2c88e434cd0caa6d4de6119056edc1b109e118c7aa0ec8fcdd91a7",
+      "tensor_count": 39,
+      "mutable_names": [
+        "window_cache",
+        "compressed_cache_c2a",
+        "index_cache_c2a",
+        "state_cache_c2a",
+        "compressed_cache_c1a",
+        "index_cache_c1a",
+        "topk_indices",
+        "topk_values",
+        "pool_block_ids",
+        "pool_block_counts",
+        "x_hc",
+        "pre_mix"
+      ]
+    }
+  ],
+  "unconditioned_logit_max_abs": 9.059906005859375e-06,
+  "producer_manifest_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "reference_context_sha256": "95fa7a9b88dca411484d12bee71b5d1eaed97beea50d5963075c5f0219285a16",
+  "derived_receipt_sha256": "54dd589e994da582e9b3de992bdb31ea993a23295cdf97a0ce64367606ff6f76",
+  "scope": "original owning unconditioned plus staged gates; not strict whole-history equivalence",
+  "reference_provenance": {
+    "schema": "exact-n3-bound-reference/1",
+    "checkpoint_manifest_sha256": "424269b3042c1845802bee6ef0f14daddc08ffc6f32c6f5c043607e3ff03c33f",
+    "owner_closed_sha256": "0f89991d91f4b48e4f4a9b37891d43c5cde19a6df4c75de6516bd272a7f381fd",
+    "producer_manifest_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+    "stage_adapter_sha256": "61a92083ba76ec604b0461c9e72a18709dadc243494307a1a349c39cd4d3bb30",
+    "reference_policy_sha256": "c8a0cc3d7c8ba7f208257e483013e9190124b8743d993ea6363aee0370054fb0",
+    "derived_receipt_sha256": "54dd589e994da582e9b3de992bdb31ea993a23295cdf97a0ce64367606ff6f76"
+  }
+}

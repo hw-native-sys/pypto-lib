@@ -1,0 +1,572 @@
+
+FILE models/deepseek_v4_1_flash/compressor.py:158-211
+SHA256 16648a8386351e8fa269ebe98984fb7252ce0eb7946f4031be72422c5c35e715
+158: @pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "compressor_pool.cpp",
+159:                include_dirs=(pto_isa_include_dir(), str(Path(__file__).parent / "kernels")))
+160: def _c2a_compress(
+161:     kv_proj: pl.Tensor,
+162:     score_proj: pl.Tensor,
+163:     state_cache: pl.InOut[pl.Tensor],
+164:     position_ids: pl.Tensor,
+165:     norm_weight: pl.Tensor,
+166:     latent: pl.InOut[pl.Tensor],
+167:     query_start_loc: pl.Tensor,
+168:     token_to_req_indices: pl.Tensor,
+169:     state_block_table: pl.Tensor,
+170:     slots: pl.Tensor,
+171:     cosine: pl.Tensor,
+172:     sine: pl.Tensor,
+173:     cache: pl.InOut[pl.Tensor],
+174:     scales: pl.InOut[pl.Tensor],
+175:     num_tokens: pl.Scalar[pl.INT32],
+176:     num_state_blocks: pl.Scalar[pl.INT32],
+177: ) -> pl.Tensor:
+178:     """Pool, normalize, publish compressed rows, and update request ring state."""
+179:     ...
+180: 
+181: 
+182: @pl.jit.inline(auto_scope=False)
+183: def c2a_compressor_publish(
+184:     kv_proj: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
+185:     score_proj: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
+186:     query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
+187:     position_ids: pl.Tensor[[T_DYN], pl.INT32],
+188:     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
+189:     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
+190:     state_cache: pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32],
+191:     norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+192:     latent: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+193:     num_tokens: pl.Scalar[pl.INT32],
+194:     state_ready: pl.Scalar[pl.TASK_ID],
+195:     cosine: pl.Tensor,
+196:     sine: pl.Tensor,
+197:     slots: pl.Tensor[[T_DYN], pl.INT64],
+198:     cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
+199:     scales: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16],
+200: ):
+201:     """Pool and publish rows with state reads and writes owned by physical block."""
+202:     active_tokens = pl.cast(num_tokens, pl.INT32)
+203:     blocks = pl.cast(pl.tensor.dim(state_cache, 0), pl.INT32)
+204:     workers = pl.max(pl.min(pl.tensor.dim(state_block_table, 0), 16), 1)
+205:     with pl.spmd(workers, name_hint="c2a_compress", deps=[state_ready]) as completed:
+206:         _c2a_compress(
+207:             kv_proj, score_proj, state_cache, position_ids, norm_weight, latent,
+208:             query_start_loc, token_to_req_indices, state_block_table,
+209:             slots, cosine, sine, cache, scales, active_tokens, blocks,
+210:         )
+211:     return completed
+
+FILE models/deepseek_v4_1_flash/compressor.py:249-275
+SHA256 16648a8386351e8fa269ebe98984fb7252ce0eb7946f4031be72422c5c35e715
+249:     for request in range(state_block_table.shape[0]):
+250:         start = int(query_start_loc[request])
+251:         end = min(int(query_start_loc[request + 1]), x.shape[0])
+252:         block = int(state_block_table[request, 0])
+253:         if start >= end or not 0 <= block < blocks:
+254:             continue
+255:         for token in range(start, end):
+256:             position = int(position_ids[token])
+257:             if int(token_to_req_indices[token]) != request or position < 0:
+258:                 continue
+259:             if position % 2:
+260:                 if token > start:
+261:                     previous_kv, previous_score = kv[token - 1], score[token - 1]
+262:                 else:
+263:                     previous = state_cache[block, (position - 1) % capacity]
+264:                     previous_kv, previous_score = previous[:head_dim], previous[head_dim:]
+265:                 pair_kv = torch.stack((previous_kv, kv[token]))
+266:                 pair_score = torch.stack((previous_score, score[token]))
+267:                 pooled = (pair_kv * pair_score.softmax(dim=0)).sum(dim=0)
+268:                 latent[token] = golden_rms_norm(pooled.to(x.dtype), norm_weight)
+269:                 publish[token] = True
+270:         for token in range(max(start, end - capacity), end):
+271:             position = int(position_ids[token])
+272:             if int(token_to_req_indices[token]) == request and position >= 0:
+273:                 state_cache[block, position % capacity, :head_dim] = kv[token]
+274:                 state_cache[block, position % capacity, head_dim:] = score[token]
+275:     return latent, publish
+
+FILE models/deepseek_v4_1_flash/kernels/compressor_pool.cpp:228-271
+SHA256 f17a5eeb150b7df44a052f62687888ac526ec7b982409f1f118ed973f21ed42d
+228:     // A physical state block has one owner; all its historical reads precede writes.
+229:     for (int phase = 0; phase < 2; ++phase) {
+230:         int pending = 0;
+231:         uint16_t active = 0;
+232:         for (int request = 0; request < request_count + 2; ++request) {
+233:             int lookup = request < request_count ? request : (request == request_count ? 0 : request_count);
+234:             int request_base = lookup / 128 * 128;
+235:             if (cached_base != request_base) {
+236:                 int request_rows = request_count - request_base < 128 ? request_count - request_base : 128;
+237:                 state_blocks.SetValidCol(request_rows);
+238:                 boundaries.SetValidCol(request_rows + 1);
+239:                 BoundsGM bounds_gm(data<int32_t>(args, 6) + request_base,
+240:                                   TileShape2D<int32_t, 1, DYNAMIC>(1, request_rows + 1));
+241:                 set_flag(PIPE_S, PIPE_MTE2, EVENT_ID1);
+242:                 wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID1);
+243:                 TLOAD(boundaries, bounds_gm);
+244:                 if (request_rows > 0) {
+245:                     BlocksGM block_gm(data<int32_t>(args, 8) + request_base,
+246:                                       TileShape2D<int32_t, 1, DYNAMIC>(1, request_rows));
+247:                     TLOAD(state_blocks, block_gm);
+248:                 }
+249:                 set_flag(PIPE_MTE2, PIPE_S, EVENT_ID1);
+250:                 wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID1);
+251:                 cached_base = request_base;
+252:             }
+253:             int block = request < request_count ? state_blocks.GetValue(request - cached_base) : -1;
+254:             bool valid_block = block >= 0 && block < blocks;
+255:             int owner = valid_block ? block % workers : request % workers;
+256:             if (owner != worker) continue;
+257:             int start, end;
+258:             if (request < request_count) {
+259:                 start = boundaries.GetValue(request - cached_base);
+260:                 end = boundaries.GetValue(request - cached_base + 1);
+261:             } else if (request == request_count) {
+262:                 start = 0;
+263:                 end = boundaries.GetValue(0);
+264:             } else {
+265:                 start = boundaries.GetValue(request_count - cached_base);
+266:                 end = count_tokens;
+267:             }
+268:             if (start < 0) start = 0;
+269:             if (end > count_tokens) end = count_tokens;
+270:             if (phase == 1 && !valid_block) continue;
+271:             int begin = phase == 1 && end - 4 > start ? end - 4 : start;
+
+FILE models/deepseek_v4_1_flash/kernels/compressor_pool.cpp:287-307
+SHA256 f17a5eeb150b7df44a052f62687888ac526ec7b982409f1f118ed973f21ed42d
+287:                 for (int lane = 0; lane < count; ++lane) {
+288:                     int token = base + lane, position = positions.GetValue(lane);
+289:                     bool valid = valid_block && requests.GetValue(lane) == request && position >= 0;
+290:                     if (phase == 1) {
+291:                         if (!valid) continue;
+292:                         Vec<float, 512> kv, score;
+293:                         TASSIGN(kv, 0);
+294:                         TASSIGN(score, 16384);
+295:                         GM<float, 512> kv_gm(data<float>(args, 0) + (int64_t)token * 512);
+296:                         GM<float, 512> score_gm(data<float>(args, 1) + (int64_t)token * 512);
+297:                         TLOAD(kv, kv_gm);
+298:                         TLOAD(score, score_gm);
+299:                         set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+300:                         wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+301:                         int64_t slot = (int64_t)block * 4 + position % 4;
+302:                         GM<float, 512> state_kv(data<float>(args, 2) + slot * 1024);
+303:                         GM<float, 512> state_score(data<float>(args, 2) + slot * 1024 + 512);
+304:                         TSTORE(state_kv, kv);
+305:                         TSTORE(state_score, score);
+306:                         pipe_barrier(PIPE_ALL);
+307:                         continue;
+
+FILE models/deepseek_v4_1_flash/kernels/compressor_pool.cpp:318-355
+SHA256 f17a5eeb150b7df44a052f62687888ac526ec7b982409f1f118ed973f21ed42d
+318:                     if (valid && position % 2) {
+319:                         active |= 1u << pending;
+320:                         Vec<float, 512> ck, cs, pk, ps;
+321:                         TASSIGN(ck, pending * 2048);
+322:                         TASSIGN(cs, 16384 + pending * 2048);
+323:                         TASSIGN(pk, 32768 + pending * 2048);
+324:                         TASSIGN(ps, 49152 + pending * 2048);
+325:                         GM<float, 512> ck_gm(data<float>(args, 0) + (int64_t)token * 512);
+326:                         GM<float, 512> cs_gm(data<float>(args, 1) + (int64_t)token * 512);
+327:                         __gm__ float* prev_kv;
+328:                         __gm__ float* prev_score;
+329:                         if (token > start) {
+330:                             prev_kv = data<float>(args, 0) + (int64_t)(token - 1) * 512;
+331:                             prev_score = data<float>(args, 1) + (int64_t)(token - 1) * 512;
+332:                         } else {
+333:                             int64_t slot = (int64_t)block * 4 + (position - 1) % 4;
+334:                             prev_kv = data<float>(args, 2) + slot * 1024;
+335:                             prev_score = prev_kv + 512;
+336:                         }
+337:                         GM<float, 512> pk_gm(prev_kv), ps_gm(prev_score);
+338:                         TLOAD(ck, ck_gm);
+339:                         TLOAD(cs, cs_gm);
+340:                         TLOAD(pk, pk_gm);
+341:                         TLOAD(ps, ps_gm);
+342:                     }
+343:                     if (++pending == 8) {
+344:                         flush(args, pending, active, targets, tokens);
+345:                         pending = 0;
+346:                         active = 0;
+347:                     }
+348:                 }
+349:                 set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+350:                 wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+351:             }
+352:         }
+353:         if (pending > 0) flush(args, pending, active, targets, tokens);
+354:         pipe_barrier(PIPE_ALL);
+355:     }
+
+FILE models/deepseek_v4_1_flash/decode_fwd.py:227-238
+SHA256 b87a29e9ab68a7b0b362c821b689d34451dc45df38c55bd8fc67a5de1b27ba14
+227:     c2a_compressed_lens = pl.create_tensor([global_tokens], dtype=pl.INT32)
+228:     prepare_compressed_lens(position_ids, c2a_compressed_lens, 1)
+229:     window_blocks_per_layer = pl.tensor.dim(window_cache_pool, 0) // N_LAYERS
+230:     compressed_blocks_per_source = pl.tensor.dim(compressed_cache_pool, 0) // KV_SOURCE_COUNT
+231:     index_blocks_per_source = pl.tensor.dim(index_cache_pool, 0) // KV_SOURCE_COUNT
+232:     state_blocks_per_source = pl.tensor.dim(state_cache_pool, 0) // C2A_SOURCE_COUNT
+233:     attention_hidden = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
+234:     attention_pre_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
+235:     topk_indices = pl.create_tensor([global_tokens, INDEX_TOPK], dtype=pl.INT32)
+236:     x_mixed = pl.create_tensor([tokens, D], dtype=pl.BF16)
+237:     local_moe_tokens = pl.read(moe_num_tokens, [rank])
+238:     for layer in pl.range(0, 20):
+
+FILE models/deepseek_v4_1_flash/decode_fwd.py:286-299
+SHA256 b87a29e9ab68a7b0b362c821b689d34451dc45df38c55bd8fc67a5de1b27ba14
+286:                 )
+287:             elif (layer - 2) % 6 == 0:
+288:                 full_source_id = (layer - 2) // 6
+289:                 full_compressed_cache = pl.slice(compressed_cache_pool, [compressed_blocks_per_source, BLOCK_SIZE, 1, HEAD_DIM // 2], [full_source_id * compressed_blocks_per_source, 0, 0, 0])
+290:                 full_compressed_cache_scale = pl.slice(compressed_cache_scale_pool, [compressed_blocks_per_source, BLOCK_SIZE, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], [full_source_id * compressed_blocks_per_source, 0, 0, 0])
+291:                 full_index_cache = pl.slice(index_cache_pool, [index_blocks_per_source, BLOCK_SIZE, 1, INDEX_DIM // 2], [full_source_id * index_blocks_per_source, 0, 0, 0])
+292:                 full_index_cache_scale = pl.slice(index_cache_scale_pool, [index_blocks_per_source, BLOCK_SIZE, 1, INDEX_DIM // INDEX_CACHE_GROUP], [full_source_id * index_blocks_per_source, 0, 0, 0])
+293:                 full_state_cache = pl.slice(state_cache_pool, [state_blocks_per_source, STATE_CAPACITY, STATE_WIDTH], [full_source_id * state_blocks_per_source, 0, 0])
+294:                 full_index_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(index_wq_b_scale, [Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], [(layer - 2) // 6 * (Q_LORA // MX_GROUP), 0])
+295:                 full_c2a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ] = c2a_compressor_wkv[full_source_id]
+296:                 full_c2a_compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ] = c2a_compressor_wgate[full_source_id]
+297:                 full_compressor_norm: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(compressor_norm_weight, [HEAD_DIM], [full_source_id * HEAD_DIM])
+298:                 full_index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16, pl.NZ] = index_wk[full_source_id]
+299:                 full_index_norm: pl.Tensor[[INDEX_DIM], pl.BF16] = pl.slice(index_norm_weight, [INDEX_DIM], [full_source_id * INDEX_DIM])
+
+FILE models/deepseek_v4_1_flash/decode_fwd.py:505-515
+SHA256 b87a29e9ab68a7b0b362c821b689d34451dc45df38c55bd8fc67a5de1b27ba14
+505:     index_blocks_per_source = pl.tensor.dim(index_cache_pool, 0) // KV_SOURCE_COUNT
+506:     attention_hidden = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
+507:     attention_pre_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
+508:     topk_indices = pl.create_tensor([global_tokens, INDEX_TOPK], dtype=pl.INT32)
+509:     pool_blocks_raw = pl.tensor.dim(c1a_index_block_table, 1) * (BLOCK_SIZE // CANDIDATE_BLOCK_SIZE)
+510:     pool_block_capacity = pl.min(CANDIDATE_TOPK_BLOCKS, pl.max(32, (pool_blocks_raw + 31) // 32 * 32))
+511:     pool_block_ids = pl.create_tensor([global_tokens, pool_block_capacity], dtype=pl.INT32)
+512:     pool_block_counts = pl.create_tensor([global_tokens], dtype=pl.INT32)
+513:     x_mixed = pl.create_tensor([tokens, D], dtype=pl.BF16)
+514:     local_moe_tokens = pl.read(moe_num_tokens, [rank])
+515:     for layer in pl.range(20, 40):
+
+FILE models/deepseek_v4_1_flash/decode_c2a_full.py:130-146
+SHA256 92659cdc2049edb632906c37996586c5001152b92cb336d0e11d682e47558e25
+130:     c2a_compressor_project(x_norm, compressor_wkv, compressor_wgate, compressor_kv, compressor_score, num_tokens)
+131:     latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+132:     compressed_publish_tid = c2a_compressor_publish(
+133:         compressor_kv, compressor_score, query_start_loc, position_ids, token_to_req_indices,
+134:         state_block_table, state_cache, compressor_norm_weight, latent, num_tokens, cache_ready,
+135:         compressed_rope_cos, compressed_rope_sin, compressed_slots, compressed_cache, compressed_cache_scale,
+136:     )
+137: 
+138:     select_tid = decode_c2a_indexer(
+139:         x_norm, qb_payload, qb_scales, latent, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
+140:         index_weights_proj, rope_cos, rope_sin, compressed_rope_cos, compressed_rope_sin,
+141:         compressed_slots, index_cache, index_cache_scale, index_block_table, token_to_req_indices,
+142:         compressed_lens, topk_indices, num_tokens, cache_ready, compressed_publish_tid,
+143:     )
+144: 
+145:     chunk_done = pl.system.task_dummy(deps=[select_tid, compressed_publish_tid])
+146: 
+
+FILE models/deepseek_v4_1_flash/decode_indexer.py:210-265
+SHA256 0cadba1e897fbf4964f07f5a676985bd9282d2e8e9fed3f043ba2db1c1813457
+210: @pl.jit.inline(auto_scope=False)
+211: def _publish_candidate_counts(
+212:     compressed_lens: pl.Tensor,
+213:     pool_block_counts: pl.Tensor,
+214:     active_tokens: pl.Scalar[pl.INDEX],
+215:     positions: pl.Scalar[pl.INDEX],
+216:     capacity: pl.Scalar[pl.INDEX],
+217: ):
+218:     """Publish the complete count vector from one worker."""
+219:     tokens = pl.tensor.dim(pool_block_counts, 0)
+220:     for publish_token in pl.range(tokens):
+221:         published_count = pl.cast(0, pl.INT32)
+222:         if publish_token < active_tokens:
+223:             publish_visible = pl.min(pl.max(pl.read(compressed_lens, [publish_token]), 0), positions)
+224:             publish_blocks = (publish_visible + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+225:             published_count = pl.cast(pl.min(pl.min(publish_blocks, CANDIDATE_TOPK_BLOCKS), capacity), pl.INT32)
+226:         pl.write(pool_block_counts, [publish_token], published_count)
+227:     return pool_block_counts
+228: 
+229: 
+230: @pl.jit.inline(auto_scope=False)
+231: def select_candidate_block_pool(
+232:     index_scores: pl.Tensor[[T_DYN, INDEX_SCORE_POSITIONS_DYN], pl.FP32],
+233:     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
+234:     pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
+235:     pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
+236:     num_tokens: pl.Scalar[pl.INT32],
+237:     scores_ready: pl.Scalar[pl.TASK_ID],
+238: ):
+239:     """Publish sorted logical candidate block IDs and per-query counts."""
+240:     tokens = pl.tensor.dim(pool_block_ids, 0)
+241:     positions = pl.tensor.dim(index_scores, 1)
+242:     capacity = pl.tensor.dim(pool_block_ids, 1)
+243:     active_tokens = pl.cast(num_tokens, pl.INDEX)
+244:     if active_tokens < 0:
+245:         active_tokens = pl.cast(0, pl.INDEX)
+246:     if active_tokens > tokens:
+247:         active_tokens = pl.cast(tokens, pl.INDEX)
+248:     block_count = (positions + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+249:     if block_count <= pl.min(capacity, CANDIDATE_TOPK_BLOCKS):
+250:         all_workers = pl.max(1, pl.min(tokens, CANDIDATE_WORKER_TILE))
+251:         with pl.spmd(all_workers, name_hint="pool_all") as all_tid:
+252:             worker = pl.tile.get_block_idx()
+253:             lane_tmp = pl.create_tile([1, 256], dtype=pl.FP32)
+254:             lanes = pl.tile.arange(0, [1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32, tmp=lane_tmp)
+255:             for token in pl.range(worker, tokens, all_workers):
+256:                 ids = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32, value=-1)
+257:                 if token < active_tokens:
+258:                     visible = pl.min(pl.max(pl.read(compressed_lens, [token]), 0), positions)
+259:                     visible_blocks = (visible + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+260:                     valid = pl.tile.cmps(lanes, pl.cast(visible_blocks, pl.INT32), cmp_type=2)
+261:                     ids = pl.tile.select(valid, lanes, ids)
+262:                 pl.store(pl.tile.set_validshape(ids, 1, capacity), [token, 0], pool_block_ids)
+263:             if worker == 0:
+264:                 _publish_candidate_counts(compressed_lens, pool_block_counts, active_tokens, positions, capacity)
+265:         pool_tid = pl.yield_(all_tid)
+
+FILE models/deepseek_v4_1_flash/decode_indexer.py:301-349
+SHA256 0cadba1e897fbf4964f07f5a676985bd9282d2e8e9fed3f043ba2db1c1813457
+301:         arena = pl.create_tensor([tokens * CANDIDATE_MAX_LEAVES, CANDIDATE_PAIR_WIDTH], dtype=pl.FP32)
+302:         with pl.spmd(tokens, name_hint="pool_select", deps=[score_tid]) as selected_tid:
+303:             token = pl.tile.get_block_idx()
+304:             sorted_ids = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32, value=-1)
+305:             if token < active_tokens:
+306:                 visible = pl.min(pl.max(pl.read(compressed_lens, [token]), 0), positions)
+307:                 visible_blocks = (visible + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+308:                 arena_base = token * CANDIDATE_MAX_LEAVES
+309:                 count = 0
+310:                 if visible_blocks > 0 and visible_blocks <= CANDIDATE_SHORT_LEAF_TILE:
+311:                     _sort_candidate_short_leaf(block_scores, arena, token, visible_blocks, arena_base)
+312:                     count = 1
+313:                 elif visible_blocks > 0:
+314:                     leaf_count = (visible_blocks + CANDIDATE_LEAF_TILE - 1) // CANDIDATE_LEAF_TILE
+315:                     for leaf in pl.range(leaf_count):
+316:                         block_begin = leaf * CANDIDATE_LEAF_TILE
+317:                         valid_count = pl.min(CANDIDATE_LEAF_TILE, visible_blocks - block_begin)
+318:                         _sort_candidate_leaf(block_scores, arena, token, block_begin, valid_count, arena_base + leaf)
+319:                     count = leaf_count
+320:                 if count > 1:
+321:                     count = _merge_candidate_level(arena, arena_base, count)
+322:                 if count > 1:
+323:                     count = _merge_candidate_level(arena, arena_base, count)
+324:                 if count > 1:
+325:                     count = _merge_candidate_level(arena, arena_base, count)
+326:                 if count > 1:
+327:                     count = _merge_candidate_level(arena, arena_base, count)
+328: 
+329:                 selected_count = pl.min(pl.min(visible_blocks, CANDIDATE_TOPK_BLOCKS), capacity)
+330:                 ordered_scores = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.FP32, value=-1e30)
+331:                 ordered_indices = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32, value=-1)
+332:                 if selected_count > 0:
+333:                     root = pl.load(arena, [arena_base, 0], [1, CANDIDATE_PAIR_WIDTH])
+334:                     selected = pl.tile.gather_mask(root, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+335:                     for lane in pl.range(selected_count):
+336:                         block_id = pl.tile.read(selected, [0, lane])
+337:                         pl.tile.write(ordered_scores, [0, lane], -pl.cast(block_id, pl.FP32))
+338:                         pl.tile.write(ordered_indices, [0, lane], block_id)
+339:                 ordered = pl.tile.sort32(ordered_scores, pl.reinterpret_view(ordered_indices, pl.UINT32))
+340:                 ordered = pl.tile.mrgsort(ordered, block_len=64)
+341:                 ordered = pl.tile.mrgsort(ordered, block_len=256)
+342:                 ordered = pl.tile.mrgsort(ordered, block_len=1024)
+343:                 sorted_ids = pl.tile.gather_mask(ordered, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+344:             # Publish the sorted prefix and -1 padding as one aligned pool row.
+345:             pl.store(pl.tile.set_validshape(sorted_ids, 1, capacity), [token, 0], pool_block_ids)
+346:         with pl.at(level=pl.Level.CORE_GROUP, name_hint="pool_count", deps=[selected_tid]) as counts_tid:
+347:             _publish_candidate_counts(compressed_lens, pool_block_counts, active_tokens, positions, capacity)
+348:         pool_tid = pl.yield_(counts_tid)
+349:     return pool_tid
+
+FILE models/deepseek_v4_1_flash/decode_indexer.py:782-832
+SHA256 0cadba1e897fbf4964f07f5a676985bd9282d2e8e9fed3f043ba2db1c1813457
+782: def decode_c2a_indexer(
+783:     x: pl.Tensor[[T_DYN, D], pl.BF16],
+784:     projection_payload: pl.Tensor,
+785:     projection_scales: pl.Tensor,
+786:     latent: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+787:     index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16, pl.NZ],
+788:     index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
+789:     index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
+790:     index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
+791:     index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ],
+792:     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+793:     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+794:     compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+795:     compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+796:     compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
+797:     index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, (INDEX_DIM // 2)], pl.UINT8],
+798:     index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, (INDEX_DIM // INDEX_CACHE_GROUP)], pl.FP8E8M0],
+799:     index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
+800:     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
+801:     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
+802:     topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+803:     num_tokens: pl.Scalar[pl.INT32],
+804:     cache_ready: pl.Scalar[pl.TASK_ID],
+805:     latent_ready: pl.Scalar[pl.TASK_ID],
+806: ):
+807:     """Publish C2A keys and select long histories through the shared MX scorer."""
+808:     tokens = pl.tensor.dim(latent, 0)
+809:     projected_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
+810:     projected_tid = project_index_key(latent, index_wk, projected_key, num_tokens, latent_ready, max_workers=32)
+811:     index_publish_tid = publish_index_rows(
+812:         projected_key, index_norm_weight, compressed_rope_cos, compressed_rope_sin, compressed_slots,
+813:         index_cache, index_cache_scale, num_tokens, cache_ready, projected_tid,
+814:     )
+815:     # The dense arena follows logical page-table capacity, never allocated cache pages.
+816:     score_width = pl.tensor.dim(index_block_table, 1) * 128
+817:     query, query_scale, raw_weights, scores, query_tid, weights_tid = c1a_index(
+818:         x,
+819:         index_wq_b, index_wq_b_scale, index_weights_proj,
+820:         rope_cos, rope_sin,
+821:         num_tokens, score_width,
+822:         cache_ready,
+823:         projection_payload, projection_scales,
+824:     )
+825:     selected_tid, scores_tid = score_select_paged(
+826:         query, query_scale, raw_weights, index_cache, index_cache_scale,
+827:         index_block_table, token_to_req_indices, compressed_lens, scores, topk_indices,
+828:         num_tokens, index_publish_tid, query_tid, weights_tid, score_width // CANDIDATE_BLOCK_SIZE, True,
+829:     )
+830:     return selected_tid
+831: 
+832: 
+
+FILE models/deepseek_v4_1_flash/decode_c1a_full.py:135-158
+SHA256 0276c653187054de2a1be21f02a11e1b916abee864da4adf4f4e4fce23ab7a38
+135:     # Logical index score capacity.
+136:     score_width = pl.tensor.dim(index_block_table, 1) * 128
+137:     (index_query, index_query_scale, index_weights, scores, query_tid, weights_tid) = c1a_index(
+138:         x_norm, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
+139:         num_tokens, score_width, x_ready,
+140:         qb_payload, qb_scales,
+141:     )
+142:     topk_tid, scores_tid = score_select_paged(
+143:         index_query, index_query_scale, index_weights,
+144:         index_cache, index_cache_scale, index_block_table, request_ids, compressed_lens,
+145:         scores, topk_indices,
+146:         num_tokens, index_ready, query_tid, weights_tid,
+147:         pl.tensor.dim(pool_block_ids, 1), False,
+148:     )
+149:     pool_tid = select_candidate_block_pool(
+150:         scores, compressed_lens, pool_block_ids, pool_block_counts, num_tokens, scores_tid,
+151:     )
+152:     selection_ready = pl.system.task_dummy(deps=[topk_tid, pool_tid, compressed_ready])
+153:     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
+154:     _attend_project(
+155:         query, window_indices, window_cache, window_cache_scale, topk_indices,
+156:         compressed_cache, compressed_cache_scale, attn_sink,
+157:         wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, attn_out,
+158:         num_tokens, selection_ready, compressed_keys=INDEX_TOPK,
+
+FILE models/deepseek_v4_1_flash/decode_c1a_reindex.py:108-118
+SHA256 b816216359417955666a42c08cf022b88b292acd652be8d0b50aa61ea9035aea
+108:     score_width = pl.tensor.dim(pool_block_ids, 1) * 8
+109:     index_query, index_query_scale, index_weights, scores, query_tid, weights_tid = c1a_index(
+110:         x_norm, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
+111:         num_tokens, score_width, x_ready,
+112:         qb_payload, qb_scales,
+113:     )
+114:     selection_ready = score_select_reindex(
+115:         index_query, index_query_scale, index_weights, index_cache, index_cache_scale,
+116:         index_block_table, request_ids, compressed_lens, pool_block_ids, pool_block_counts,
+117:         scores, topk_indices, num_tokens, x_ready, query_tid, weights_tid, x_ready,
+118:     )
+
+FILE models/deepseek_v4_1_flash/prefill_indexer.py:484-538
+SHA256 d2d69a7d61dd74828931b013c78df6d0fa61c2f1cced6c1eee9f819038aa0a20
+484:     with pl.spmd(tokens, name_hint="c1a_pool_block_select", deps=[score_tid]) as pool_tid:
+485:         token = pl.tile.get_block_idx()
+486:         sorted_ids = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32, value=-1)
+487:         if token < active_tokens:
+488:             visible = pl.min(pl.max(pl.read(compressed_lens, [token]), 0), positions)
+489:             visible_blocks = (visible + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+490:             arena_base = token * CANDIDATE_MAX_LEAVES
+491:             count = 0
+492:             if visible_blocks > 0 and visible_blocks <= CANDIDATE_SHORT_LEAF_TILE:
+493:                 _sort_candidate_short_leaf(block_scores, arena, token, visible_blocks, arena_base)
+494:                 count = 1
+495:             elif visible_blocks > 0:
+496:                 leaf_count = (visible_blocks + CANDIDATE_LEAF_TILE - 1) // CANDIDATE_LEAF_TILE
+497:                 for leaf in pl.range(leaf_count):
+498:                     block_begin = leaf * CANDIDATE_LEAF_TILE
+499:                     valid_count = pl.min(CANDIDATE_LEAF_TILE, visible_blocks - block_begin)
+500:                     _sort_candidate_leaf(block_scores, arena, token, block_begin, valid_count, arena_base + leaf)
+501:                 count = leaf_count
+502:             if count > 1:
+503:                 count = _merge_candidate_level(arena, arena_base, count)
+504:             if count > 1:
+505:                 count = _merge_candidate_level(arena, arena_base, count)
+506:             if count > 1:
+507:                 count = _merge_candidate_level(arena, arena_base, count)
+508:             if count > 1:
+509:                 count = _merge_candidate_level(arena, arena_base, count)
+510: 
+511:             selected_count = pl.min(pl.min(visible_blocks, CANDIDATE_TOPK_BLOCKS), capacity)
+512:             ordered_scores = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.FP32, value=-1e30)
+513:             ordered_indices = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32, value=-1)
+514:             if selected_count > 0:
+515:                 root = pl.load(arena, [arena_base, 0], [1, CANDIDATE_PAIR_WIDTH])
+516:                 selected = pl.tile.gather_mask(root, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+517:                 for lane in pl.range(selected_count):
+518:                     block_id = pl.tile.read(selected, [0, lane])
+519:                     pl.tile.write(ordered_scores, [0, lane], -pl.cast(block_id, pl.FP32))
+520:                     pl.tile.write(ordered_indices, [0, lane], block_id)
+521:             ordered = pl.tile.sort32(ordered_scores, pl.reinterpret_view(ordered_indices, pl.UINT32))
+522:             ordered = pl.tile.mrgsort(ordered, block_len=64)
+523:             ordered = pl.tile.mrgsort(ordered, block_len=256)
+524:             ordered = pl.tile.mrgsort(ordered, block_len=1024)
+525:             sorted_ids = pl.tile.gather_mask(ordered, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+526:         # Publish the sorted prefix and -1 padding as one aligned pool row.
+527:         pl.store(pl.tile.set_validshape(sorted_ids, 1, capacity), [token, 0], pool_block_ids)
+528:     # Publish cache-line-sharing counts from one worker after the ID rows.
+529:     with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_pool_count_publish", deps=[pool_tid]) as counts_tid:
+530:         for publish_token in pl.range(tokens):
+531:             published_count = pl.cast(0, pl.INT32)
+532:             if publish_token < active_tokens:
+533:                 publish_visible = pl.min(pl.max(pl.read(compressed_lens, [publish_token]), 0), positions)
+534:                 publish_blocks = (publish_visible + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+535:                 published_count = pl.cast(pl.min(pl.min(publish_blocks, CANDIDATE_TOPK_BLOCKS), capacity), pl.INT32)
+536:             pl.write(pool_block_counts, [publish_token], published_count)
+537:     return counts_tid
+538: 
+
+FILE models/deepseek_v4_1_flash/prefill_indexer.py:1306-1313
+SHA256 d2d69a7d61dd74828931b013c78df6d0fa61c2f1cced6c1eee9f819038aa0a20
+1306:                     selection[0] = selected
+1307:                 topk_ready = selection[0]
+1308:                 completion[0] = topk_ready
+1309:                 if not pool and not c2a:
+1310:                     pool_ready = select_candidate_block_pool(chunk_scores, chunk_lengths, chunk_pool,
+1311:                                                             chunk_counts, count, score_ready)
+1312:                     completion[0] = pl.system.task_dummy(deps=[topk_ready, pool_ready])
+1313:     return completion[0]
+
+FILE models/deepseek_v4_1_flash/prefill_c2a_full.py:158-176
+SHA256 99e3e2d68cbde02c322e7b0de87f6aee86784d8dd56d985841db90682e39a0fb
+158:     compressor_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
+159:     compressor_score = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
+160:     c2a_compressor_project(x, compressor_wkv, compressor_wgate, compressor_kv, compressor_score, num_tokens)
+161:     latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+162:     compressed_publish_tid = c2a_compressor_publish(
+163:         compressor_kv, compressor_score, query_start_loc, position_ids, token_to_req_indices,
+164:         state_block_table, state_cache, compressor_norm_weight, latent, num_tokens, cache_ready,
+165:         compressed_rope_cos, compressed_rope_sin, compressed_slots, compressed_cache, compressed_cache_scale,
+166:     )
+167: 
+168:     # Index keys come from the unrotated latent; the compressed cache stores the rotated one.
+169:     index_publish_tid = publish_c2a_index_key(
+170:         latent, index_wk, index_norm_weight, compressed_rope_cos, compressed_rope_sin,
+171:         compressed_slots, index_cache, index_cache_scale, num_tokens, compressed_publish_tid, cache_ready,
+172:     )
+173: 
+174:     select_tid = prefill_indexer(
+175:         x, qr, token_to_req_indices, compressed_lens, index_cache, index_cache_scale, index_block_table,
+176:         rope_cos, rope_sin, index_wq_b, index_wq_b_scale, index_weights_proj,
+
+FILE models/deepseek_v4_1_flash/config.py:236-242
+SHA256 25d1ee3545cb4b7513ea5fff77da3e576256d8ea6b47babecd9404647bb16b0b
+236: )
+237: 
+238: 
+239: BLOCK_SIZE = 128
+240: STATE_CAPACITY = 4
+241: MAX_BATCH_PER_DP = 12
+242: DSPARK_SPEC_TOKENS = 5

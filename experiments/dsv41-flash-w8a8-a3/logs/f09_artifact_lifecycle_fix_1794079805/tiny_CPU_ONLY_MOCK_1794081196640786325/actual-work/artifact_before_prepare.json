@@ -1,0 +1,29 @@
+{
+  "phase": "GENERATED_BEFORE_PUBLIC_PREPARE",
+  "origin_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_artifact_lifecycle_fix_1794079805/tiny_CPU_ONLY_MOCK_1794081196640786325/generated",
+  "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_artifact_lifecycle_fix_1794079805/tiny_CPU_ONLY_MOCK_1794081196640786325/actual-work/prepared_artifact",
+  "manifest": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_artifact_lifecycle_fix_1794079805/tiny_CPU_ONLY_MOCK_1794081196640786325/files.json",
+  "manifest_sha256": "131e3e2cd714b2c127a7196a53827f3d101a71e69f3f24d3333d7110a87d76eb",
+  "metadata_sha256": "d88312cf37b67df318d02d218c8d2ed94f7468425e68fed50dc40f7b364b902b",
+  "source_manifest": "MOCK_ONLY_NOT_NATIVE_SOURCE",
+  "platform": "a2a3",
+  "source_projection": {
+    "distributed_meta.json": "d88312cf37b67df318d02d218c8d2ed94f7468425e68fed50dc40f7b364b902b",
+    "next_levels/test/kernel_config.py": "8e1d9a9d811d2eee916e1f5b352f279eea68d1afe5c60e9f6cfaf3cf1547f4e2",
+    "next_levels/test/kernels/aiv/test.pto": "9ceed6783b78cfdde8d04b6caec87908beea40e8e8b81deea549b32e35b04d48",
+    "next_levels/test/kernels/aiv/test.cpp": "acf69fa4580a719ed3b361c0a2ae55c69048606db566c37b30d537a4f17745ff",
+    "next_levels/test/orchestration/test.cpp": "ab4364757d8a408b7aceca5bf5abae7adca7de7f0ca97252a7292833bdaaf455"
+  },
+  "registered_units": [
+    {
+      "config": "next_levels/test/kernel_config.py",
+      "kernels": [
+        "next_levels/test/kernels/aiv/test.cpp"
+      ],
+      "orchestration": "next_levels/test/orchestration/test.cpp"
+    }
+  ],
+  "native_images": null,
+  "prepared_receipt": null,
+  "preparation_authorized_by_this_binding": false
+}

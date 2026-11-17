@@ -1,0 +1,10 @@
+{
+  "id": "main-full-real-generation-prepare-1794048884-1794050736",
+  "agent": "/root/main_native",
+  "start_epoch": 1794048884,
+  "end_epoch": 1794050736,
+  "elapsed_seconds": 1852,
+  "scope": "artifact-only preparation; includes source/header inspection, queuedCPU waits, proposal and documentation; no NPU or tensor payload",
+  "status": "FINAL/PARK",
+  "workers": []
+}

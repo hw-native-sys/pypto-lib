@@ -1,0 +1,18 @@
+{
+  "schema": "independent-configurable-real-postcase-handoff/1",
+  "native_terminal_confirmed": false,
+  "executor_external_POST_terminal_confirmed": false,
+  "source45_sha256": null,
+  "operation_binding_sha256": null,
+  "fresh_signature_receipt_sha256": null,
+  "native_task_id": null,
+  "root_go_id": null,
+  "case": null,
+  "outer_queue_snapshot": null,
+  "external_POST": null,
+  "owner_identity_postcheck": {
+    "path": null,
+    "sha256": null
+  },
+  "note": "Outside-queue captured status/list snapshot JSON must include task_id,status_stdout,list_stdout,captured_epoch; real terminal/POST facts only under later Root audit GO. No old case fallback."
+}

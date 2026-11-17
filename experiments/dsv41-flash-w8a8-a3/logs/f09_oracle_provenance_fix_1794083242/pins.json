@@ -1,0 +1,38 @@
+{
+  "live_source45": {
+    "path": "experiments/dsv41-flash-w8a8-a3/logs/hc_boundary_apply_1794075705/source45.json",
+    "sha256": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+    "all45_files_match": true
+  },
+  "candidate_source45": {
+    "path": "experiments/dsv41-flash-w8a8-a3/logs/f09_oracle_provenance_fix_1794083242/source45_rebased_UNAPPLIED.json",
+    "sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+    "all45_files_match": true
+  },
+  "new_adapter": "412cb48d4625d54958f949588cdf9d9d0b6457137b4e27a6de17c0d84582e295",
+  "new_route": "12872cd0f5b8d5a12b84a329e66017f498381c727c1a44bff7cd251e2b877bf8",
+  "new_oracle_integrity": "e45c7529d6c34cd57712a7d346ec612641896e38ab98ff88017ceafd87d999d3",
+  "unchanged_copied_support": {
+    "artifact_lifecycle.py": "1cc9c0b792b93a3c9d83b3461fd327d21f0bcd4872c289f76f3ab61e70c14a0d",
+    "scenario.json": "c7b6ab942f5ea17758389aa5a53dafbb1de79e68dbb6f41c4614d66dd6b6dbb1",
+    "count_probe.py": "277f405a5ebb50853a6dfad5407d5b2ead3961980dcf114cd2a092f2da828913",
+    "count_probe_old_physical.py": "3d90753e2ae608305b907248b7f58ae957b5e0874e2a7e67b467008351b70e29",
+    "source45_rebased_UNAPPLIED.json": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31"
+  },
+  "signature_inputs": {
+    "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/compile_results.json": "9287896f499c9bb7b62f474b9d6eff2e930c29e2258408f08dc97d940d51f686",
+    "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/count_active_files.json": "4c226662c16675febc4eea21c4de345a79e6562dc078549df46185212cabfaba",
+    "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/count_old_physical_files.json": "484bbb7d6c22475edbb725186e59b9dc1ff32118edfac9fa2dc3a33afc36a414",
+    "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/decode_capacity2_files.json": "5262e68afa0b53291ed285e31170b3c017674c3c25dfa9aec78eb7fab5777532"
+  },
+  "accepted_lifecycle_scope": {
+    "operation_manifest": "c94d3bee25cc2e6fe676a1844390e3299c38818b4c9c715da07731e2da0340bf",
+    "launch_manifest": "adb0a4392589f55621d3aca25ea510a1a753c6418ea2461bd0d61cd560fbcf2e",
+    "native_task": "task_20261108_042113_142720411936",
+    "audit_task": "task_20261108_042213_14304572871",
+    "scope": "helper1cc9 knownpublicprepare/toy32768/12 only; NOT full16 candidate405"
+  },
+  "new_Root_wrapper": "PENDING",
+  "actual16_scope": "ABSENT",
+  "no_compile_required_for_host_only_delta": true
+}

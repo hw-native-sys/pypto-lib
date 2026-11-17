@@ -1,0 +1,23 @@
+{
+  "schema": "configured-actual-post-audit-entry/1",
+  "epoch": 1794126737.185376,
+  "source_ready_files_unchanged": true,
+  "source_ready_manifest_sha256": "3bfd0440fc11f1fe8177ec44dcf8c38404e0898483b420a6c06b4ef5e6d9f726",
+  "sealed_auditor_sha256": "d0734c462329dafbb7db978657cfbb9b4eaa23b762072cab76bd8583b7369a94",
+  "protected_actual_inputs": {
+    "native.log": "d6b9b83fac9809f1d4500df9095ddc104515dd22a07b0bad0dadd90b609438cf",
+    "external_postqueue/POST_EXEC.json": "6a3866ec92c217ee9e1b9d16811bd7212e4106f8bfa57638628048f097f9ec54",
+    "actual/generation.json": "c50070ec1e70f3b9d8fd5990b43be58c863a90a6a982051c7c06364a3a7b9a48",
+    "actual/outer_result.json": "dea32c0cca540f4ebec74c94034fc175a7dc02f5f127f2f46cc649571ccfd27d",
+    "terminal_facts.json": "1a7d4fb25d254bb60d1e7113d5008c7d4e7c4ec9ae35b8bd3ec2cedec3c345e7",
+    "known_identity_postcheck.json": "f0fe048d44e076f24340dcad70a18346afdd5661fc0fa2482ba571a0a5a863a6"
+  },
+  "native_status": "completed (exit=1)",
+  "external_POST_status": "completed (exit=0)",
+  "raw16release": "Owner supplied native.log protected above; independent auditor checks raw release itself",
+  "Root_audit_authority": "Root conditional ONE actual --no-device post-audit max600/client900 in this exact unit; SAMEterminal+mandatoryPOST+rawrelease/birth/queue conditions supplied and observed",
+  "CPU_actual_audit_started_yet": false,
+  "source_headers_or_tensor_payload_read": 0,
+  "model_runtime_imports": 0,
+  "unchanged_native_whole_status": "FAILED_STRICT_TELEMETRY259; no reclassification"
+}

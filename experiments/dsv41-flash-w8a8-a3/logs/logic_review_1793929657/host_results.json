@@ -1,0 +1,120 @@
+{
+  "snapshot": {
+    "files": 45,
+    "all_hashes_match": true
+  },
+  "nz_roundtrip": true,
+  "extra_q_norm": {
+    "candidate_golden": [
+      0.1669921875,
+      0.5,
+      0.9921875,
+      1.65625
+    ],
+    "no_post_wqb_norm": [
+      0.734375,
+      2.203125,
+      4.375,
+      7.3125
+    ]
+  },
+  "engram_basis": {
+    "candidate_golden": [
+      1.765625,
+      0.765625
+    ],
+    "upstream_original_basis": [
+      1.500249981880188,
+      0.500249981880188
+    ]
+  },
+  "routing_ties": {
+    "kernel_mask_sum_index": 73536,
+    "golden_valid_ids": [
+      3,
+      4,
+      1,
+      0,
+      2,
+      5
+    ]
+  },
+  "ep_aux_overlap": {
+    "capacity": 16,
+    "tokens": 1,
+    "two_adjacent_lanes_overlap_rows": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ]
+  },
+  "metadata_127_to_128": {
+    "changed": [
+      "window_slots",
+      "window_indices",
+      "compressed_slots"
+    ],
+    "slots": [
+      127,
+      128
+    ],
+    "compressed_slots": [
+      63,
+      -1
+    ]
+  },
+  "expert_offset_return_ignored": {
+    "candidate": [
+      [
+        2,
+        4
+      ],
+      [
+        3,
+        5
+      ]
+    ],
+    "folded": [
+      [
+        1,
+        3
+      ],
+      [
+        2,
+        4
+      ]
+    ]
+  },
+  "engram_hash_decode_empty": {
+    "provided_rows": 20,
+    "retained_rows": 16,
+    "first_decode_rows": 0
+  },
+  "swa_unwanted_yarn": {
+    "position": 4096,
+    "cos_max_abs_error": 1.1001094579696655
+  },
+  "c2_source_position": {
+    "emitting_token_position": 1253,
+    "candidate_rope_position": 626,
+    "upstream_rope_position": 1252
+  },
+  "per_profile_fallthrough": {
+    "resolved_mode": "per-profile",
+    "main_rope_is_base": true
+  },
+  "required_swa_argument_missing": "missing dispatch value for 'rope_cos_swa'",
+  "hc_coefficient_equation_matches_upstream": true
+}

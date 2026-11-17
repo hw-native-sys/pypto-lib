@@ -1,0 +1,14 @@
+{
+  "schema": "exact-n3-cpu-reference-policy/1",
+  "scope": "CPU_PREPARATION_ONLY_NO_NATIVE_GRANT",
+  "producer_source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "producer_generate_sha256": "685cf3cfadf36c92b5f9c6280f9f9d90ebf0e3244133a2b550adea83ceb29cfb",
+  "math44_old_manifest_sha256": "ab1ced6d6ecbf9887297458703ba9b74e2c9b8bc57608370b4c2e0310e027e37",
+  "reference_context_sha256": "95fa7a9b88dca411484d12bee71b5d1eaed97beea50d5963075c5f0219285a16",
+  "derived_receipt_sha256": "54dd589e994da582e9b3de992bdb31ea993a23295cdf97a0ce64367606ff6f76",
+  "small_binding_result_sha256": "21994b835108bf8557475c8b54330e266eaa007f2c0606bec78511b9dd04f409",
+  "original_comparators": "unchanged44 source; N3 prefix17/decode19; both references and original direct pool/count gates; no numerical claim before execution",
+  "prefix_tokens": 3,
+  "decode_position": 3,
+  "pending": "Root separate native capture authorization plus capsule adapter review"
+}

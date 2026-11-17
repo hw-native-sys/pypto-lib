@@ -1,0 +1,67 @@
+{
+  "schema": "Root-F09-active-S/1",
+  "approved": true,
+  "operation": "bounded-synthetic-active-S-B2-3call",
+  "stage": "count-capture",
+  "kind": "ACTUAL_F09_NATIVE_CAPTURE",
+  "source_manifest_sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "scenario_sha256": "c7b6ab942f5ea17758389aa5a53dafbb1de79e68dbb6f41c4614d66dd6b6dbb1",
+  "route_sha256": "a91557c329aa8dff120ce3f141afcdde5c2371c6e4a659107911720f7c64d4cb",
+  "lifecycle_root_receipt_sha256": "b86552ad5604173cb897c0eeaf4d14cfcdef15e9425e306e66b9f318802b6d02",
+  "execution_mode": "ONBOARD",
+  "minimum_bytes": {
+    "HOST": 322122547200,
+    "DISK": 17179869184,
+    "SHM": 34359738368
+  },
+  "public_hbm_reserve": 9668944960,
+  "compiled_source_manifest_sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "compiled_file_manifest": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/count_active_files.json",
+  "compiled_file_manifest_sha256": "4c226662c16675febc4eea21c4de345a79e6562dc078549df46185212cabfaba",
+  "compiled_metadata_sha256": "189381005f808c601c93286c4ef8022e54e160f99a2c144d527608df90dd9fb9",
+  "probe_source_sha256": "277f405a5ebb50853a6dfad5407d5b2ead3961980dcf114cd2a092f2da828913",
+  "requested_probe_kind": "active",
+  "root_go_id": "observer-20261108-f09-count-active-exact-identity-native16",
+  "delegation_sha256": "d88a691256d7cd469a5f950928a49b80f939fd94c1b2352b0c40a666885e3f5c",
+  "prepared_case_pins_sha256": "6de71ae70f5fdbf849abebb05cbbdcacaa016cfad22cb38bd5ff8e36e2e9829d",
+  "communication_epoch_each_dispatch": 1,
+  "scenario_call_indices": [
+    0,
+    1,
+    2
+  ],
+  "planned_count_totals": [
+    192,
+    96,
+    192
+  ],
+  "ring_heap": [
+    0,
+    0,
+    4294967296,
+    0
+  ],
+  "expert_layers": 1,
+  "scope": "COUNT-ACTIVE ONLY; no count-old/full-capture/full-reference authority",
+  "device_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "expires_at_epoch": 1794090397.4272547,
+  "created_after_queue_allocation": true,
+  "allocation_sha256": "6747311020258de705dc45d9d7b397284604063cdf52dffbd9e3e509dd210730"
+}

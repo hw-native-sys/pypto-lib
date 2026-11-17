@@ -1,0 +1,56 @@
+[
+  {
+    "tokens": 3,
+    "status": "ONBOARD_SIGNATURE_COMPILE_PASS",
+    "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/exact_prompt_readiness_1794021821/build_output/_jit_prefill_fwd_20261107_112449_xj61r5wv",
+    "platform": "a2a3",
+    "real_expert_shape": [
+      16,
+      40,
+      24
+    ],
+    "receive_x_bytes": 11796480,
+    "expected_receive_x_bytes": 11796480,
+    "tensor_samples": 0,
+    "fixture_calls": 0,
+    "payload_reads": 0,
+    "NPU_dispatches": 0,
+    "native_correctness": "UNTESTED"
+  },
+  {
+    "tokens": 6,
+    "status": "ONBOARD_SIGNATURE_COMPILE_PASS",
+    "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/exact_prompt_readiness_1794021821/build_output/_jit_prefill_fwd_20261107_112515_foxppm2u",
+    "platform": "a2a3",
+    "real_expert_shape": [
+      16,
+      40,
+      24
+    ],
+    "receive_x_bytes": 23592960,
+    "expected_receive_x_bytes": 23592960,
+    "tensor_samples": 0,
+    "fixture_calls": 0,
+    "payload_reads": 0,
+    "NPU_dispatches": 0,
+    "native_correctness": "UNTESTED"
+  },
+  {
+    "tokens": 17,
+    "status": "ONBOARD_SIGNATURE_COMPILE_PASS",
+    "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/exact_prompt_readiness_1794021821/build_output/_jit_prefill_fwd_20261107_112541_8xo7h0c7",
+    "platform": "a2a3",
+    "real_expert_shape": [
+      16,
+      40,
+      24
+    ],
+    "receive_x_bytes": 66846720,
+    "expected_receive_x_bytes": 66846720,
+    "tensor_samples": 0,
+    "fixture_calls": 0,
+    "payload_reads": 0,
+    "NPU_dispatches": 0,
+    "native_correctness": "UNTESTED"
+  }
+]

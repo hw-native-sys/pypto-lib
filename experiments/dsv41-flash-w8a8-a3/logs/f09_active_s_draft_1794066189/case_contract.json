@@ -1,0 +1,85 @@
+{
+  "schema": "F09-active-S-draft/1",
+  "physical_token_capacity": 2,
+  "request_capacity": 2,
+  "logical_pages_per_request": 2,
+  "physical_pages": 4,
+  "state_blocks": 2,
+  "index_block_table": [
+    [
+      3,
+      1
+    ],
+    [
+      0,
+      2
+    ]
+  ],
+  "state_block_table": [
+    [
+      1
+    ],
+    [
+      0
+    ]
+  ],
+  "active_count_vectors": [
+    [
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2
+    ],
+    [
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      0,
+      0,
+      2,
+      2,
+      2,
+      2
+    ],
+    [
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2
+    ]
+  ],
+  "compile_evidence": "PENDING",
+  "native_capture_adapter": "NOT_IMPLEMENTED",
+  "actual_grants": false
+}

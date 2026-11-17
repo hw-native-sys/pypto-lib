@@ -1,0 +1,187 @@
+{
+  "schema": 3,
+  "supported_execution_modes": [
+    "program"
+  ],
+  "params": [
+    {
+      "name": "scores",
+      "direction": "In",
+      "shape": [
+        -1,
+        -1
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "compressed_lens",
+      "direction": "In",
+      "shape": [
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "request_ids",
+      "direction": "In",
+      "shape": [
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "index_block_table",
+      "direction": "In",
+      "shape": [
+        -1,
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "pool_ids",
+      "direction": "InOut",
+      "shape": [
+        -1,
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "pool_counts",
+      "direction": "InOut",
+      "shape": [
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "indices",
+      "direction": "InOut",
+      "shape": [
+        -1,
+        512
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "values",
+      "direction": "InOut",
+      "shape": [
+        -1,
+        512
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "num_tokens",
+      "direction": "In",
+      "shape": null,
+      "dtype": "int32",
+      "layout": null
+    }
+  ],
+  "lowered_params": [
+    {
+      "name": "scores",
+      "direction": "In",
+      "shape": [
+        -1,
+        -1
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "compressed_lens",
+      "direction": "In",
+      "shape": [
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "request_ids",
+      "direction": "In",
+      "shape": [
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "index_block_table",
+      "direction": "In",
+      "shape": [
+        -1,
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "pool_ids",
+      "direction": "InOut",
+      "shape": [
+        -1,
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "pool_counts",
+      "direction": "InOut",
+      "shape": [
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "indices",
+      "direction": "InOut",
+      "shape": [
+        -1,
+        512
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "values",
+      "direction": "InOut",
+      "shape": [
+        -1,
+        512
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "num_tokens",
+      "direction": "In",
+      "shape": null,
+      "dtype": "int32",
+      "layout": null
+    }
+  ],
+  "num_return_types": 4,
+  "return_aliases": [
+    6,
+    7,
+    4,
+    5
+  ],
+  "platform": "a2a3",
+  "backend_type": "Ascend910"
+}

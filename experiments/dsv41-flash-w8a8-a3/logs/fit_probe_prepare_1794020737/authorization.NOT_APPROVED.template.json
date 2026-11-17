@@ -1,0 +1,6 @@
+{
+  "approved": false,
+  "scope": "empty-allocation-probe",
+  "source_manifest_sha256": "ab1ced6d6ecbf9887297458703ba9b74e2c9b8bc57608370b4c2e0310e027e37",
+  "empty_probe_artifact_metadata_sha256": "REQUIRED_AFTER_LATER_ROOT_GO"
+}

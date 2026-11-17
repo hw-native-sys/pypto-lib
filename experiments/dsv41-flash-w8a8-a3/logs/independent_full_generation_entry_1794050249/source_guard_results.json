@@ -1,0 +1,22 @@
+{
+  "status": "PASS_ACTUAL_SOURCE_AND_COVERAGE_METHODS_OWNED_TINY_ONLY",
+  "rejects": [
+    "unknown-key-before-read",
+    "dtype-before-read",
+    "absolute_byte_range-before-read",
+    "file_mtime_ns-before-read",
+    "shape-before-read",
+    "prior-leaf-live-before-read",
+    "over-read-cap-before-read",
+    "coverage-gap",
+    "coverage-overflow",
+    "coverage-overlap",
+    "NoForward-missing-source-count",
+    "NoForward-missing-target-byte",
+    "NoForward-index-changed"
+  ],
+  "owned_reader_payload_calls": 1,
+  "actual_checkpoint_tensor_payload_reads": 0,
+  "NPU": 0,
+  "limits": "reader/guard/stream factory are explicit CPU fakes; source and coverage methods are unchanged candidate AST"
+}

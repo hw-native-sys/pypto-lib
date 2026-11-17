@@ -1,0 +1,14 @@
+{
+  "job": "task_20261107_231342_350351328582",
+  "root_go_id": "observer-20261107-once-real16-cc15877",
+  "max_time_seconds": 21600,
+  "client_timeout_seconds": 22200,
+  "allocation": "auto16",
+  "lock_acquisition_reported_pid": 3503621,
+  "PID_label_limit": "raw task-submit lock-acquisition label only; absence alone is not native worker/allocator release proof",
+  "actual_output": "actual",
+  "source45_sha256": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "outer_manifest_sha256": "f2cef526699b5b8a3b4a0f2e6184a80a22ab6798e30066afe204b6d8ca0d9f27",
+  "binding_sha256": "93922612fc602dfe79cd3dab64b2a24b78cbd57237756bdcd56f404b222cef65",
+  "command": "task-submit --timeout 22200 --device auto --device-num 16 --max-time 21600 --run 'cd /mnt/data/pyptouser/yangyaodong/code/pypto-lib && source activate-pypto.sh && PYTHONDONTWRITEBYTECODE=1 python experiments/dsv41-flash-w8a8-a3/logs/longer_generation_operation_prepare_1794063015/task_entry.py --root-operation-go observer-20261107-once-real16-cc15877 --binding experiments/dsv41-flash-w8a8-a3/logs/longer_generation_operation_prepare_1794063015/operation_binding.json --prequeue experiments/dsv41-flash-w8a8-a3/logs/native_longer_real_generation_1794064297/prequeue/PREQUEUE.json --output experiments/dsv41-flash-w8a8-a3/logs/native_longer_real_generation_1794064297/actual'"
+}

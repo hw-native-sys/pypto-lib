@@ -1,0 +1,26 @@
+{
+  "status": "PASS_NARROW_ADAPTATION_ONLY",
+  "checks": [
+    "check_identity.py-exact-inheritance-except-listed-amendment",
+    "outer_runner.py-exact-inheritance-except-listed-amendment",
+    "task_entry.py-exact-inheritance-except-listed-amendment",
+    "binding-inherited-identity-caps-and-prerequisites",
+    "finite-normal-product-CLI-command",
+    "actual-receipt-AST-fixed-fields-TTL-source-in-memory-only",
+    "fixed-binding-reject-old-operation",
+    "fixed-binding-reject-text",
+    "fixed-binding-reject-ids",
+    "fixed-binding-reject-ids-float",
+    "fixed-binding-reject-cap4",
+    "fixed-binding-reject-capbool",
+    "fixed-binding-reject-capfloat",
+    "runtime-code-binding-accept-exact",
+    "runtime-code-binding-reject-changed",
+    "outer_runner.py-default-refuses-before-assignment-or-CLI",
+    "task_entry.py-default-refuses-before-assignment-or-CLI"
+  ],
+  "actual_grants_created": 0,
+  "native_jobs": 0,
+  "tensor_payload_bytes": 0,
+  "limits": "No process/lifecycle/header suites repeated; inherited AST exactness and prior accepted native100 proof remain separately bound. Max15 decode call resource peaks and lifecycle are untested."
+}

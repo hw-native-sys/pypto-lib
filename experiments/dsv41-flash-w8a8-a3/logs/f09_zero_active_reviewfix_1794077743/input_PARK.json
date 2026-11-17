@@ -1,0 +1,11 @@
+{
+  "status": "PARK",
+  "writers": [],
+  "all_own_jobs_terminal": true,
+  "live_M02_unchanged": true,
+  "application": "UNAPPLIED",
+  "compile": "PENDING",
+  "native": "PENDING",
+  "real_payload": 0,
+  "shared_writes": 0
+}

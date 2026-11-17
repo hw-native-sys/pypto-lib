@@ -1,0 +1,16 @@
+1: [DECODE] decode_c1a_reindex
+80: [RUN]   'window_cache' PASS  shape=(20, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+81: [RUN]   'topk_indices' PASS  shape=(2, 512) dtype=torch.int32 (topk_pair_compare)
+82: [RUN]   'topk_values' PASS  shape=(2, 512) dtype=torch.float32 (index_score_compare)
+83: [RUN]   'pool_block_ids' PASS  shape=(2, 64) dtype=torch.int32 (compare)
+84: [RUN]   'pool_block_counts' PASS  shape=(2,) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+85: [RUN]   'partial' PASS  shape=(2, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+87: [RUN] PASS (14.58s)
+88: [DECODE] decode_c1a_reindex_handoff
+156: [RUN]   'window_cache' PASS  shape=(2, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+157: [RUN]   'topk_indices' PASS  shape=(18, 512) dtype=torch.int32 (topk_pair_compare)
+158: [RUN]   'topk_values' PASS  shape=(18, 512) dtype=torch.float32 (index_score_compare)
+159: [RUN]   'pool_block_ids' PASS  shape=(18, 64) dtype=torch.int32 (compare)
+160: [RUN]   'pool_block_counts' PASS  shape=(18,) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+161: [RUN]   'partial' PASS  shape=(18, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+163: [RUN] PASS (0.73s)

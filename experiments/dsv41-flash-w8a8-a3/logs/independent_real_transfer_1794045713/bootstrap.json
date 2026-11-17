@@ -1,0 +1,7 @@
+{
+  "start_epoch": 1794045713,
+  "Main46_manifest": "cb07b6a92a1b4f509068a8308f48a0d29960c6d8175572a18d7d1cb50283d723",
+  "code_sha256": "5e364da73ac36d59bce09f92dc4efb8501e900175fc91afc08f91cf0da9dfbb5",
+  "plan_sha256": "6172ee8e67687d176a2ed3e4441c7d2d858ac0e5a5271e3600648721aafda28e",
+  "scope": "CPU metadata/tiny only; no realtensor/NPU/nativegrant"
+}

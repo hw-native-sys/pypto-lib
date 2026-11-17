@@ -1,0 +1,12 @@
+{
+  "status": "FAILED_BEFORE_PREPARE_FINAL_PARK",
+  "native_exit": 1,
+  "owner_normal_close": false,
+  "owner_never_opened": true,
+  "ready_workers": 0,
+  "call_snapshots": 0,
+  "full119_or_171_acceptance": false,
+  "retry_authorized": false,
+  "ownjobs": 0,
+  "shared_writes": 0
+}

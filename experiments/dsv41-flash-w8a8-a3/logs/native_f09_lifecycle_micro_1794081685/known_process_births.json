@@ -1,0 +1,22 @@
+{
+  "last_stage": "after-close",
+  "identities": [
+    {
+      "pid": 1427839,
+      "starttick": "108280253"
+    },
+    {
+      "pid": 1428412,
+      "starttick": "108281018"
+    },
+    {
+      "pid": 1428410,
+      "starttick": "108281017"
+    },
+    {
+      "pid": 1428409,
+      "starttick": "108281016"
+    }
+  ],
+  "scope": "known OS identities at public boundaries; no continuous tree/PSS/peak claim"
+}

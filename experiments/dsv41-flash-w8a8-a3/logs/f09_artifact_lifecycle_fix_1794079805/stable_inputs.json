@@ -1,0 +1,10 @@
+{
+  "copied_kernel45_UNAPPLIED_sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "typed207_manifest_sha256": "08991711288e13970e27c8b39f5bf0ceb6a2da564c01049275473acaf10ac241",
+  "typed_count94_files_manifest_sha256": "17cf1cc77c5262aeb55cdff780f5e285e655afa4a7a52b327db17f236161bc1c",
+  "actual_model_source45_sha256": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "new_model_writes": 0,
+  "new_compile_prepare_native": 0,
+  "previous_independent_typed3_signature_unit": "independent_f09_typed_completion_1794079859",
+  "previous_typed_acceptance_scope": "source+compile only; no native/fixture/state semantics"
+}

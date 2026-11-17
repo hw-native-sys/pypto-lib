@@ -1,0 +1,41 @@
+{
+  "record_id": "main-f09-artifact-lifecycle-1794079805",
+  "role": "main-agent",
+  "blocks": [
+    {
+      "record_id": "main-f09-artifact-lifecycle-1794079805-block1",
+      "start_epoch": 1794079805,
+      "end_epoch": 1794080469,
+      "elapsed_seconds": 664,
+      "status": "READY_NOT_RUN_CPU_HELD_BY_ROOT_RESOURCE_AUDIT",
+      "shared_writes": 0,
+      "CPU_tasks": [],
+      "NPU": false,
+      "prepare": false,
+      "compile": false
+    },
+    {
+      "record_id": "main-f09-artifact-lifecycle-1794079805-block2",
+      "start_epoch": 1794081179,
+      "end_epoch": 1794081333,
+      "elapsed_seconds": 154,
+      "category": "validate-cpu",
+      "activity": "Releasedhold ONE035312 tiny metadata/mock suite PASS; no prepare/compile/NPU"
+    },
+    {
+      "record_id": "main-f09-artifact-lifecycle-1794079805-docs",
+      "start_epoch": 1794081333,
+      "end_epoch": 1794081603,
+      "elapsed_seconds": 270,
+      "category": "docs-report",
+      "activity": "Read-onlyactual41/audit44 scope recoveryoverlay; artifactdiff/pins/report/freeze, no modelwrites"
+    }
+  ],
+  "measured_active_seconds": 1088,
+  "audit_hold_seconds_excluded": 710,
+  "shared_ledger_imported_once": true,
+  "task_ids": [
+    "task_20261108_035312_13624207646"
+  ],
+  "compile_prepare_NPU_payload": false
+}

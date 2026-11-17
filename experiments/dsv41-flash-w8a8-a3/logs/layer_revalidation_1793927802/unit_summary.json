@@ -1,0 +1,21 @@
+{
+  "epoch": 1793928019,
+  "status": "BLOCKED_BEFORE_QUEUE_SUBMISSION",
+  "queue_client_exit_code": 1,
+  "task_id": null,
+  "allocated_devices": [],
+  "device_cases_run": 0,
+  "prefill_cases": "NOT_RUN",
+  "decode_cases": "NOT_RUN",
+  "cpu_direct_preflight_exit_code": 0,
+  "revision_3_matches": true,
+  "source_manifest_unchanged": true,
+  "recursive_manifest_sha256": "4c9bddee414725c200cdb5bcef841ba357b7d40285e95707e82aae526c9dbbb2",
+  "recursive_manifest_note": "Includes historical generated Python files inside model/build_output; do not compare with source-only digests.",
+  "top_level_source_manifest_sha256": "1d0a6ffc50f93bbb47d281dce79e1f7bfdae9f0ba2c8319134de551478100cf6",
+  "top_level_source_files": 45,
+  "resume_command": "task-submit --device auto --device-num 16 --max-time 7200 --timeout 7500 --run \"bash /mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/layer_revalidation_1793927802/run_layers.sh\"",
+  "blocker": "task-submit cannot open /home/pypto-tools/pto-task/state/locks/update-reservation.lock: Read-only file system; no valid task id created",
+  "observer_steering": "Reference comparison of V4.1 A5 first, then V4 DSpark, precedes routing i/ii/iii; separate next unit per Observer directives.",
+  "end_epoch": 1793928067
+}

@@ -1,0 +1,77 @@
+{
+  "positive_two_fresh_owners": true,
+  "largest_handles": 16,
+  "aggregate_handles": 912,
+  "rank_identities": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "full_static_per_rank": 39624816576,
+  "largest_rank_buffer": 11324620800,
+  "all_dtype_shapes_verified": true,
+  "all_handles_free_attempted_and_owners_closed": true,
+  "committed_not_subtracted_from_free": true,
+  "allocator_retention_until_close_control": true,
+  "negative_controls": [
+    {
+      "mode": "low_free",
+      "created_handles": 0,
+      "all_free_attempted": true,
+      "owner_closed": true
+    },
+    {
+      "mode": "query_error",
+      "created_handles": 0,
+      "all_free_attempted": true,
+      "owner_closed": true
+    },
+    {
+      "mode": "partial_alloc_fail",
+      "created_handles": 24,
+      "all_free_attempted": true,
+      "owner_closed": true
+    },
+    {
+      "mode": "wrong_shape",
+      "created_handles": 1,
+      "all_free_attempted": true,
+      "owner_closed": true
+    },
+    {
+      "mode": "free_error",
+      "created_handles": 912,
+      "all_free_attempted": true,
+      "owner_closed": true
+    },
+    {
+      "mode": "fresh_owner_baseline_regression",
+      "reject_before_aggregate": true
+    },
+    {
+      "mode": "reused_owner",
+      "rejected": true
+    },
+    {
+      "mode": "default_execution",
+      "rejected_before_native_imports": true
+    }
+  ],
+  "payload_reads": 0,
+  "native_compute_calls": 0,
+  "real_device_allocations": 0,
+  "scope": "CPU integer-accounting fake only, no actual fit or hardware permission"
+}

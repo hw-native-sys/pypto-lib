@@ -1,0 +1,1 @@
+{"epoch": 1794070662.758583, "pid": 3237773, "start_ticks": null, "operation": "read-parse-proc-stat", "path": "/proc/3237773/stat", "errno": 13, "exception_type": "PermissionError", "error": "PermissionError(13, 'CPU injected EACCES')", "critical": true}

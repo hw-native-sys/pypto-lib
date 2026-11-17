@@ -1,0 +1,1 @@
+Root conditional CPU/appliedsource+fresh2normal signatures acceptance ONLY after alias coherentcheckpoint/MainFINAL. No NPU/payload/header/fullfixture/realgrant/sourcewrites. ActualM02e07b,newplan806852 strictresourceprojection; old611 metadata ABI only/no artifactrelabel.

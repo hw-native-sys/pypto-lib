@@ -1,0 +1,10 @@
+{
+  "phase": "prefill",
+  "mode": "ONBOARD",
+  "engram_enabled": 0,
+  "tokens": 2,
+  "logical_bytes": 104482127108,
+  "elapsed": 243.0293743610382,
+  "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/generation_noengram_1793970065/worker_fwd/prefill_native_final/_jit_prefill_fwd_20261106_211701_nb9bqkdf",
+  "passed": true
+}

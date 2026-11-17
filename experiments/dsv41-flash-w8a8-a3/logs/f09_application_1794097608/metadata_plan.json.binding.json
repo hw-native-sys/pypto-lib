@@ -1,0 +1,9 @@
+{
+  "new_plan_sha256": "cd8b17741688eeb9ef39d8c0925dbb74a8f9a1cfcc0052db2e0a8c1aacb48cf7",
+  "original_resource_canonical_sha256": "e13c5fd6d98de327a24427b5efc0a9be4e9c30a89e757ac6c377e73b6ffc10ff",
+  "only_added_root_key": "f09_math_lineage",
+  "lineage_canonical_sha256": "13b80364bce7729fb36aa51c231ceb6966f2fe59ce6d211ccedd6c7cfc046004",
+  "source_math_baseline": "8153c7f040bef51900a6e6c9ff27b018279b7503f31d50ec5488457e49770b28",
+  "actual_producer_B": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+  "Root_runtime_authorization_created": false
+}

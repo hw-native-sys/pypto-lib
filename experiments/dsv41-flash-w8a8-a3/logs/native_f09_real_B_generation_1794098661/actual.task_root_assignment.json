@@ -1,0 +1,32 @@
+{
+  "schema": "normal-full-generation-outer-root-assignment/1",
+  "approved": true,
+  "operation": "shared-full-real40-noEngram-greedy-N3",
+  "root_operation_go_id": "observer-20261108-sourceB-real16-shared-w8a8",
+  "binding_sha256": "cc2132a8e7bf0b36110f7a99f68d244a8b98e0f0299d8a9b8e897cec1dde5937",
+  "runner_sha256": "28b8c268c5530197273754325aeba978dad1d44428f4f33fe4e5bf13dfcb3d7c",
+  "checker_sha256": "f95eaf38916b645642ebfd4d307b85a64a17ec7ca027c55e0f8585c1590816c4",
+  "task_entry_sha256": "670b126af3b878f8b4e2c6cbbc3a716bb9a0ac6c043bedda49b5c18d0eda02b6",
+  "expires_at_epoch": 1794103531,
+  "actual_ordered_device_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "created_after_queue_allocation": true,
+  "prequeue_receipt": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_real_B_generation_1794098661/prequeue/PREQUEUE.json",
+  "prequeue_receipt_sha256": "85f3596243b4c474e35c9c33bc65e0d13e83e19cda5b126d6d676f5eb9221825"
+}

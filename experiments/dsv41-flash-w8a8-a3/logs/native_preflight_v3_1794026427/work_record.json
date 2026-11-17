@@ -1,0 +1,11 @@
+{
+  "id": "review-v3-static-1794026427-1794027429",
+  "agent": "review-agent",
+  "start_epoch": 1794026427,
+  "end_epoch": 1794027429,
+  "duration_seconds": 1002,
+  "category": "review-cpu-static",
+  "state": "FINAL_PARK",
+  "NPU": 0,
+  "actual_cpu_static_task": "task_20261107_124539_1218943453"
+}

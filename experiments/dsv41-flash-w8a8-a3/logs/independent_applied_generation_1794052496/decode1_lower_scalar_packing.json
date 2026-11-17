@@ -1,0 +1,1842 @@
+[
+  {
+    "line": 245,
+    "text": "params_t0.add_scalar(T_DYN);"
+  },
+  {
+    "line": 246,
+    "text": "params_t0.add_scalar(tp_rank);"
+  },
+  {
+    "line": 286,
+    "text": "params_t3.add_scalar(embed_arrived_ctx);"
+  },
+  {
+    "line": 297,
+    "text": "params_t4.add_scalar(group_base);"
+  },
+  {
+    "line": 298,
+    "text": "params_t4.add_scalar(tp_rank);"
+  },
+  {
+    "line": 299,
+    "text": "params_t4.add_scalar(embed_window_ctx);"
+  },
+  {
+    "line": 331,
+    "text": "params_t5.add_scalar(group_base);"
+  },
+  {
+    "line": 332,
+    "text": "params_t5.add_scalar(tp_rank);"
+  },
+  {
+    "line": 333,
+    "text": "params_t5.add_scalar(embed_arrived_ctx);"
+  },
+  {
+    "line": 344,
+    "text": "params_t6.add_scalar(embed_arrived_ctx);"
+  },
+  {
+    "line": 359,
+    "text": "params_t7.add_scalar(group_base);"
+  },
+  {
+    "line": 360,
+    "text": "params_t7.add_scalar(embed_window_ctx);"
+  },
+  {
+    "line": 394,
+    "text": "params_t8.add_scalar(group_base);"
+  },
+  {
+    "line": 395,
+    "text": "params_t8.add_scalar(tp_rank);"
+  },
+  {
+    "line": 396,
+    "text": "params_t8.add_scalar(embed_arrived_ctx);"
+  },
+  {
+    "line": 408,
+    "text": "params_t9.add_scalar(embed_arrived_ctx);"
+  },
+  {
+    "line": 435,
+    "text": "params_t11.add_scalar(T_DYN);"
+  },
+  {
+    "line": 859,
+    "text": "params_t12.add_scalar(T_DYN);"
+  },
+  {
+    "line": 888,
+    "text": "params_t13.add_scalar(rotation_rows_inline37793);"
+  },
+  {
+    "line": 913,
+    "text": "params_t14.add_scalar(T_DYN);"
+  },
+  {
+    "line": 1041,
+    "text": "params_t16.add_scalar(T_DYN);"
+  },
+  {
+    "line": 1066,
+    "text": "params_t17.add_scalar(T_DYN);"
+  },
+  {
+    "line": 1129,
+    "text": "params_t20.add_scalar(T_DYN);"
+  },
+  {
+    "line": 1148,
+    "text": "params_t21.add_scalar(T_DYN);"
+  },
+  {
+    "line": 1178,
+    "text": "params_t22.add_scalar(t0_inline38024);"
+  },
+  {
+    "line": 1179,
+    "text": "params_t22.add_scalar(rows_inline38025);"
+  },
+  {
+    "line": 1194,
+    "text": "params_t23.add_scalar(T_DYN);"
+  },
+  {
+    "line": 1213,
+    "text": "params_t24.add_scalar(T_DYN);"
+  },
+  {
+    "line": 1243,
+    "text": "params_t25.add_scalar(t0_inline38085);"
+  },
+  {
+    "line": 1244,
+    "text": "params_t25.add_scalar(rows_inline38086);"
+  },
+  {
+    "line": 1262,
+    "text": "params_t26.add_scalar(T_DYN);"
+  },
+  {
+    "line": 1288,
+    "text": "params_t27.add_scalar(t0_inline38135);"
+  },
+  {
+    "line": 1289,
+    "text": "params_t27.add_scalar(rows_inline38136);"
+  },
+  {
+    "line": 1304,
+    "text": "params_t28.add_scalar(T_DYN);"
+  },
+  {
+    "line": 1324,
+    "text": "params_t29.add_scalar(T_DYN);"
+  },
+  {
+    "line": 1350,
+    "text": "params_t30.add_scalar(rows_inline38199);"
+  },
+  {
+    "line": 1379,
+    "text": "params_t31.add_scalar(T_DYN);"
+  },
+  {
+    "line": 1422,
+    "text": "params_t32.add_scalar(num_tokens);"
+  },
+  {
+    "line": 1423,
+    "text": "params_t32.add_scalar(step_inline38217);"
+  },
+  {
+    "line": 1475,
+    "text": "params_t33.add_scalar(active_inline37975);"
+  },
+  {
+    "line": 1476,
+    "text": "params_t33.add_scalar(step_inline38229);"
+  },
+  {
+    "line": 1551,
+    "text": "params_t35.add_scalar(T_DYN);"
+  },
+  {
+    "line": 1571,
+    "text": "params_t36.add_scalar(T_DYN);"
+  },
+  {
+    "line": 1601,
+    "text": "params_t37.add_scalar(T_DYN);"
+  },
+  {
+    "line": 1602,
+    "text": "params_t37.add_scalar(group_col_inline38279);"
+  },
+  {
+    "line": 1603,
+    "text": "params_t37.add_scalar(group_inline38278);"
+  },
+  {
+    "line": 1604,
+    "text": "params_t37.add_scalar(mid_col_inline38280);"
+  },
+  {
+    "line": 1632,
+    "text": "params_t38.add_scalar(T_DYN);"
+  },
+  {
+    "line": 1648,
+    "text": "params_t39.add_scalar(attention_epoch_inline37706);"
+  },
+  {
+    "line": 1649,
+    "text": "params_t39.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 1660,
+    "text": "params_t40.add_scalar(group_base);"
+  },
+  {
+    "line": 1661,
+    "text": "params_t40.add_scalar(tp_rank);"
+  },
+  {
+    "line": 1662,
+    "text": "params_t40.add_scalar(output_window_ctx);"
+  },
+  {
+    "line": 1694,
+    "text": "params_t41.add_scalar(group_base);"
+  },
+  {
+    "line": 1695,
+    "text": "params_t41.add_scalar(tp_rank);"
+  },
+  {
+    "line": 1696,
+    "text": "params_t41.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 1707,
+    "text": "params_t42.add_scalar(attention_epoch_inline37706);"
+  },
+  {
+    "line": 1708,
+    "text": "params_t42.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 1723,
+    "text": "params_t43.add_scalar(group_base);"
+  },
+  {
+    "line": 1724,
+    "text": "params_t43.add_scalar(output_window_ctx);"
+  },
+  {
+    "line": 1758,
+    "text": "params_t44.add_scalar(group_base);"
+  },
+  {
+    "line": 1759,
+    "text": "params_t44.add_scalar(tp_rank);"
+  },
+  {
+    "line": 1760,
+    "text": "params_t44.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 1772,
+    "text": "params_t45.add_scalar(attention_epoch_inline37706);"
+  },
+  {
+    "line": 1773,
+    "text": "params_t45.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 2224,
+    "text": "params_t47.add_scalar(T_DYN);"
+  },
+  {
+    "line": 2249,
+    "text": "params_t48.add_scalar(T_DYN);"
+  },
+  {
+    "line": 2312,
+    "text": "params_t51.add_scalar(T_DYN);"
+  },
+  {
+    "line": 2331,
+    "text": "params_t52.add_scalar(T_DYN);"
+  },
+  {
+    "line": 2361,
+    "text": "params_t53.add_scalar(t0_inline38593);"
+  },
+  {
+    "line": 2362,
+    "text": "params_t53.add_scalar(rows_inline38594);"
+  },
+  {
+    "line": 2377,
+    "text": "params_t54.add_scalar(T_DYN);"
+  },
+  {
+    "line": 2396,
+    "text": "params_t55.add_scalar(T_DYN);"
+  },
+  {
+    "line": 2426,
+    "text": "params_t56.add_scalar(t0_inline38654);"
+  },
+  {
+    "line": 2427,
+    "text": "params_t56.add_scalar(rows_inline38655);"
+  },
+  {
+    "line": 2445,
+    "text": "params_t57.add_scalar(T_DYN);"
+  },
+  {
+    "line": 2471,
+    "text": "params_t58.add_scalar(t0_inline38704);"
+  },
+  {
+    "line": 2472,
+    "text": "params_t58.add_scalar(rows_inline38705);"
+  },
+  {
+    "line": 2487,
+    "text": "params_t59.add_scalar(T_DYN);"
+  },
+  {
+    "line": 2507,
+    "text": "params_t60.add_scalar(T_DYN);"
+  },
+  {
+    "line": 2532,
+    "text": "params_t61.add_scalar(rows_inline38768);"
+  },
+  {
+    "line": 2556,
+    "text": "params_t62.add_scalar(T_DYN);"
+  },
+  {
+    "line": 2594,
+    "text": "params_t63.add_scalar(t0_inline38789);"
+  },
+  {
+    "line": 2595,
+    "text": "params_t63.add_scalar(rows_inline38790);"
+  },
+  {
+    "line": 2611,
+    "text": "params_t64.add_scalar(T_DYN);"
+  },
+  {
+    "line": 2636,
+    "text": "params_t65.add_scalar(T_DYN);"
+  },
+  {
+    "line": 2680,
+    "text": "params_t66.add_scalar(num_tokens);"
+  },
+  {
+    "line": 2681,
+    "text": "params_t66.add_scalar(step_inline38850);"
+  },
+  {
+    "line": 2705,
+    "text": "params_t67.add_scalar(T_DYN);"
+  },
+  {
+    "line": 2731,
+    "text": "params_t68.add_scalar(T_DYN);"
+  },
+  {
+    "line": 2756,
+    "text": "params_t69.add_scalar(num_tokens);"
+  },
+  {
+    "line": 2757,
+    "text": "params_t69.add_scalar(step_inline38864);"
+  },
+  {
+    "line": 2770,
+    "text": "params_t70.add_scalar(T_DYN);"
+  },
+  {
+    "line": 2785,
+    "text": "params_t71.add_scalar(T_DYN);"
+  },
+  {
+    "line": 2805,
+    "text": "params_t72.add_scalar(T_DYN);"
+  },
+  {
+    "line": 2824,
+    "text": "params_t73.add_scalar(T_DYN);"
+  },
+  {
+    "line": 2855,
+    "text": "params_t74.add_scalar(num_tokens);"
+  },
+  {
+    "line": 2856,
+    "text": "params_t74.add_scalar(step_inline38978);"
+  },
+  {
+    "line": 2879,
+    "text": "params_t75.add_scalar(T_DYN);"
+  },
+  {
+    "line": 2899,
+    "text": "params_t76.add_scalar(T_DYN);"
+  },
+  {
+    "line": 2919,
+    "text": "params_t77.add_scalar(T_DYN);"
+  },
+  {
+    "line": 2938,
+    "text": "params_t78.add_scalar(T_DYN);"
+  },
+  {
+    "line": 2969,
+    "text": "params_t79.add_scalar(num_tokens);"
+  },
+  {
+    "line": 2970,
+    "text": "params_t79.add_scalar(step_inline39064);"
+  },
+  {
+    "line": 3019,
+    "text": "params_t80.add_scalar(TABLE_DYN);"
+  },
+  {
+    "line": 3045,
+    "text": "params_t81.add_scalar(width_inline39096);"
+  },
+  {
+    "line": 3092,
+    "text": "params_t82.add_scalar(score_width_inline38528);"
+  },
+  {
+    "line": 3093,
+    "text": "params_t82.add_scalar(block_width_inline39129);"
+  },
+  {
+    "line": 3126,
+    "text": "params_t83.add_scalar(t_dim_inline39128);"
+  },
+  {
+    "line": 3127,
+    "text": "params_t83.add_scalar(score_width_inline38528);"
+  },
+  {
+    "line": 3128,
+    "text": "params_t83.add_scalar(block_width_inline39129);"
+  },
+  {
+    "line": 3189,
+    "text": "params_t84.add_scalar(active_inline38543);"
+  },
+  {
+    "line": 3190,
+    "text": "params_t84.add_scalar(step_inline39175);"
+  },
+  {
+    "line": 3265,
+    "text": "params_t86.add_scalar(T_DYN);"
+  },
+  {
+    "line": 3285,
+    "text": "params_t87.add_scalar(T_DYN);"
+  },
+  {
+    "line": 3315,
+    "text": "params_t88.add_scalar(T_DYN);"
+  },
+  {
+    "line": 3316,
+    "text": "params_t88.add_scalar(group_col_inline39227);"
+  },
+  {
+    "line": 3317,
+    "text": "params_t88.add_scalar(group_inline39226);"
+  },
+  {
+    "line": 3318,
+    "text": "params_t88.add_scalar(mid_col_inline39228);"
+  },
+  {
+    "line": 3346,
+    "text": "params_t89.add_scalar(T_DYN);"
+  },
+  {
+    "line": 3362,
+    "text": "params_t90.add_scalar(attention_epoch_inline37706);"
+  },
+  {
+    "line": 3363,
+    "text": "params_t90.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 3374,
+    "text": "params_t91.add_scalar(group_base);"
+  },
+  {
+    "line": 3375,
+    "text": "params_t91.add_scalar(tp_rank);"
+  },
+  {
+    "line": 3376,
+    "text": "params_t91.add_scalar(output_window_ctx);"
+  },
+  {
+    "line": 3408,
+    "text": "params_t92.add_scalar(group_base);"
+  },
+  {
+    "line": 3409,
+    "text": "params_t92.add_scalar(tp_rank);"
+  },
+  {
+    "line": 3410,
+    "text": "params_t92.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 3421,
+    "text": "params_t93.add_scalar(attention_epoch_inline37706);"
+  },
+  {
+    "line": 3422,
+    "text": "params_t93.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 3437,
+    "text": "params_t94.add_scalar(group_base);"
+  },
+  {
+    "line": 3438,
+    "text": "params_t94.add_scalar(output_window_ctx);"
+  },
+  {
+    "line": 3472,
+    "text": "params_t95.add_scalar(group_base);"
+  },
+  {
+    "line": 3473,
+    "text": "params_t95.add_scalar(tp_rank);"
+  },
+  {
+    "line": 3474,
+    "text": "params_t95.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 3486,
+    "text": "params_t96.add_scalar(attention_epoch_inline37706);"
+  },
+  {
+    "line": 3487,
+    "text": "params_t96.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 3658,
+    "text": "params_t98.add_scalar(T_DYN);"
+  },
+  {
+    "line": 3683,
+    "text": "params_t99.add_scalar(T_DYN);"
+  },
+  {
+    "line": 3746,
+    "text": "params_t102.add_scalar(T_DYN);"
+  },
+  {
+    "line": 3765,
+    "text": "params_t103.add_scalar(T_DYN);"
+  },
+  {
+    "line": 3795,
+    "text": "params_t104.add_scalar(t0_inline39495);"
+  },
+  {
+    "line": 3796,
+    "text": "params_t104.add_scalar(rows_inline39496);"
+  },
+  {
+    "line": 3811,
+    "text": "params_t105.add_scalar(T_DYN);"
+  },
+  {
+    "line": 3830,
+    "text": "params_t106.add_scalar(T_DYN);"
+  },
+  {
+    "line": 3860,
+    "text": "params_t107.add_scalar(t0_inline39556);"
+  },
+  {
+    "line": 3861,
+    "text": "params_t107.add_scalar(rows_inline39557);"
+  },
+  {
+    "line": 3879,
+    "text": "params_t108.add_scalar(T_DYN);"
+  },
+  {
+    "line": 3905,
+    "text": "params_t109.add_scalar(t0_inline39606);"
+  },
+  {
+    "line": 3906,
+    "text": "params_t109.add_scalar(rows_inline39607);"
+  },
+  {
+    "line": 3921,
+    "text": "params_t110.add_scalar(T_DYN);"
+  },
+  {
+    "line": 3941,
+    "text": "params_t111.add_scalar(T_DYN);"
+  },
+  {
+    "line": 3967,
+    "text": "params_t112.add_scalar(rows_inline39670);"
+  },
+  {
+    "line": 3996,
+    "text": "params_t113.add_scalar(T_DYN);"
+  },
+  {
+    "line": 4039,
+    "text": "params_t114.add_scalar(num_tokens);"
+  },
+  {
+    "line": 4040,
+    "text": "params_t114.add_scalar(step_inline39688);"
+  },
+  {
+    "line": 4100,
+    "text": "params_t115.add_scalar(active_inline39445);"
+  },
+  {
+    "line": 4101,
+    "text": "params_t115.add_scalar(step_inline39702);"
+  },
+  {
+    "line": 4176,
+    "text": "params_t117.add_scalar(T_DYN);"
+  },
+  {
+    "line": 4196,
+    "text": "params_t118.add_scalar(T_DYN);"
+  },
+  {
+    "line": 4226,
+    "text": "params_t119.add_scalar(T_DYN);"
+  },
+  {
+    "line": 4227,
+    "text": "params_t119.add_scalar(group_col_inline39754);"
+  },
+  {
+    "line": 4228,
+    "text": "params_t119.add_scalar(group_inline39753);"
+  },
+  {
+    "line": 4229,
+    "text": "params_t119.add_scalar(mid_col_inline39755);"
+  },
+  {
+    "line": 4257,
+    "text": "params_t120.add_scalar(T_DYN);"
+  },
+  {
+    "line": 4273,
+    "text": "params_t121.add_scalar(attention_epoch_inline37706);"
+  },
+  {
+    "line": 4274,
+    "text": "params_t121.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 4285,
+    "text": "params_t122.add_scalar(group_base);"
+  },
+  {
+    "line": 4286,
+    "text": "params_t122.add_scalar(tp_rank);"
+  },
+  {
+    "line": 4287,
+    "text": "params_t122.add_scalar(output_window_ctx);"
+  },
+  {
+    "line": 4319,
+    "text": "params_t123.add_scalar(group_base);"
+  },
+  {
+    "line": 4320,
+    "text": "params_t123.add_scalar(tp_rank);"
+  },
+  {
+    "line": 4321,
+    "text": "params_t123.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 4332,
+    "text": "params_t124.add_scalar(attention_epoch_inline37706);"
+  },
+  {
+    "line": 4333,
+    "text": "params_t124.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 4348,
+    "text": "params_t125.add_scalar(group_base);"
+  },
+  {
+    "line": 4349,
+    "text": "params_t125.add_scalar(output_window_ctx);"
+  },
+  {
+    "line": 4383,
+    "text": "params_t126.add_scalar(group_base);"
+  },
+  {
+    "line": 4384,
+    "text": "params_t126.add_scalar(tp_rank);"
+  },
+  {
+    "line": 4385,
+    "text": "params_t126.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 4397,
+    "text": "params_t127.add_scalar(attention_epoch_inline37706);"
+  },
+  {
+    "line": 4398,
+    "text": "params_t127.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 4670,
+    "text": "params_t129.add_scalar(T_DYN);"
+  },
+  {
+    "line": 4695,
+    "text": "params_t130.add_scalar(T_DYN);"
+  },
+  {
+    "line": 4758,
+    "text": "params_t133.add_scalar(T_DYN);"
+  },
+  {
+    "line": 4784,
+    "text": "params_t134.add_scalar(T_DYN);"
+  },
+  {
+    "line": 4807,
+    "text": "params_t135.add_scalar(rank);"
+  },
+  {
+    "line": 4808,
+    "text": "params_t135.add_scalar(layer_inline37705);"
+  },
+  {
+    "line": 4809,
+    "text": "params_t135.add_scalar(consumed_ctx);"
+  },
+  {
+    "line": 4820,
+    "text": "params_t136.add_scalar(rank);"
+  },
+  {
+    "line": 4821,
+    "text": "params_t136.add_scalar(layer_inline37705);"
+  },
+  {
+    "line": 4822,
+    "text": "params_t136.add_scalar(recv_meta_ctx);"
+  },
+  {
+    "line": 4823,
+    "text": "params_t136.add_scalar(meta_ready_ctx);"
+  },
+  {
+    "line": 4839,
+    "text": "params_t137.add_scalar(rank);"
+  },
+  {
+    "line": 4840,
+    "text": "params_t137.add_scalar(recv_x_ctx);"
+  },
+  {
+    "line": 4841,
+    "text": "params_t137.add_scalar(recv_aux_ctx);"
+  },
+  {
+    "line": 4854,
+    "text": "params_t138.add_scalar(rank);"
+  },
+  {
+    "line": 4855,
+    "text": "params_t138.add_scalar(layer_inline37705);"
+  },
+  {
+    "line": 4856,
+    "text": "params_t138.add_scalar(data_ready_ctx);"
+  },
+  {
+    "line": 4881,
+    "text": "params_t140.add_scalar(recv_meta_ctx);"
+  },
+  {
+    "line": 4882,
+    "text": "params_t140.add_scalar(recv_x_ctx);"
+  },
+  {
+    "line": 4883,
+    "text": "params_t140.add_scalar(recv_aux_ctx);"
+  },
+  {
+    "line": 4898,
+    "text": "params_t141.add_scalar(rank);"
+  },
+  {
+    "line": 4899,
+    "text": "params_t141.add_scalar(consumed_ctx);"
+  },
+  {
+    "line": 5058,
+    "text": "params_t142.add_scalar(t_dim_inline40132);"
+  },
+  {
+    "line": 5089,
+    "text": "params_t143.add_scalar(t0_inline40160);"
+  },
+  {
+    "line": 5090,
+    "text": "params_t143.add_scalar(rows_inline40161);"
+  },
+  {
+    "line": 5115,
+    "text": "params_t144.add_scalar(t0_inline40179);"
+  },
+  {
+    "line": 5116,
+    "text": "params_t144.add_scalar(rows_inline40180);"
+  },
+  {
+    "line": 5140,
+    "text": "params_t146.add_scalar(t_dim_inline40194);"
+  },
+  {
+    "line": 5171,
+    "text": "params_t147.add_scalar(t0_inline40222);"
+  },
+  {
+    "line": 5172,
+    "text": "params_t147.add_scalar(rows_inline40223);"
+  },
+  {
+    "line": 5187,
+    "text": "params_t148.add_scalar(rank);"
+  },
+  {
+    "line": 5188,
+    "text": "params_t148.add_scalar(layer_inline37705);"
+  },
+  {
+    "line": 5189,
+    "text": "params_t148.add_scalar(return_consumed_ctx);"
+  },
+  {
+    "line": 5200,
+    "text": "params_t149.add_scalar(recv_meta_ctx);"
+  },
+  {
+    "line": 5201,
+    "text": "params_t149.add_scalar(return_slots_ctx);"
+  },
+  {
+    "line": 5214,
+    "text": "params_t150.add_scalar(rank);"
+  },
+  {
+    "line": 5215,
+    "text": "params_t150.add_scalar(layer_inline37705);"
+  },
+  {
+    "line": 5216,
+    "text": "params_t150.add_scalar(return_ready_ctx);"
+  },
+  {
+    "line": 5239,
+    "text": "params_t152.add_scalar(t_dim_inline40251);"
+  },
+  {
+    "line": 5270,
+    "text": "params_t153.add_scalar(t0_inline40279);"
+  },
+  {
+    "line": 5271,
+    "text": "params_t153.add_scalar(rows_inline40280);"
+  },
+  {
+    "line": 5296,
+    "text": "params_t154.add_scalar(t0_inline40298);"
+  },
+  {
+    "line": 5297,
+    "text": "params_t154.add_scalar(rows_inline40299);"
+  },
+  {
+    "line": 5320,
+    "text": "params_t156.add_scalar(t_dim_inline40313);"
+  },
+  {
+    "line": 5351,
+    "text": "params_t157.add_scalar(t0_inline40341);"
+  },
+  {
+    "line": 5352,
+    "text": "params_t157.add_scalar(rows_inline40342);"
+  },
+  {
+    "line": 5370,
+    "text": "params_t159.add_scalar(return_slots_ctx);"
+  },
+  {
+    "line": 5383,
+    "text": "params_t160.add_scalar(rank);"
+  },
+  {
+    "line": 5384,
+    "text": "params_t160.add_scalar(return_consumed_ctx);"
+  },
+  {
+    "line": 5427,
+    "text": "params_t162.add_scalar(T_DYN);"
+  },
+  {
+    "line": 5428,
+    "text": "params_t162.add_scalar(layer_inline37705);"
+  },
+  {
+    "line": 5443,
+    "text": "params_t163.add_scalar(T_DYN);"
+  },
+  {
+    "line": 5444,
+    "text": "params_t163.add_scalar(layer_inline37705);"
+  },
+  {
+    "line": 5468,
+    "text": "params_t165.add_scalar(T_DYN);"
+  },
+  {
+    "line": 6137,
+    "text": "params_t166.add_scalar(T_DYN);"
+  },
+  {
+    "line": 6162,
+    "text": "params_t167.add_scalar(T_DYN);"
+  },
+  {
+    "line": 6225,
+    "text": "params_t170.add_scalar(T_DYN);"
+  },
+  {
+    "line": 6244,
+    "text": "params_t171.add_scalar(T_DYN);"
+  },
+  {
+    "line": 6274,
+    "text": "params_t172.add_scalar(t0_inline40663);"
+  },
+  {
+    "line": 6275,
+    "text": "params_t172.add_scalar(rows_inline40664);"
+  },
+  {
+    "line": 6290,
+    "text": "params_t173.add_scalar(T_DYN);"
+  },
+  {
+    "line": 6309,
+    "text": "params_t174.add_scalar(T_DYN);"
+  },
+  {
+    "line": 6339,
+    "text": "params_t175.add_scalar(t0_inline40724);"
+  },
+  {
+    "line": 6340,
+    "text": "params_t175.add_scalar(rows_inline40725);"
+  },
+  {
+    "line": 6358,
+    "text": "params_t176.add_scalar(T_DYN);"
+  },
+  {
+    "line": 6384,
+    "text": "params_t177.add_scalar(t0_inline40774);"
+  },
+  {
+    "line": 6385,
+    "text": "params_t177.add_scalar(rows_inline40775);"
+  },
+  {
+    "line": 6400,
+    "text": "params_t178.add_scalar(T_DYN);"
+  },
+  {
+    "line": 6420,
+    "text": "params_t179.add_scalar(T_DYN);"
+  },
+  {
+    "line": 6445,
+    "text": "params_t180.add_scalar(rows_inline40838);"
+  },
+  {
+    "line": 6469,
+    "text": "params_t181.add_scalar(T_DYN);"
+  },
+  {
+    "line": 6507,
+    "text": "params_t182.add_scalar(t0_inline40859);"
+  },
+  {
+    "line": 6508,
+    "text": "params_t182.add_scalar(rows_inline40860);"
+  },
+  {
+    "line": 6524,
+    "text": "params_t183.add_scalar(T_DYN);"
+  },
+  {
+    "line": 6549,
+    "text": "params_t184.add_scalar(T_DYN);"
+  },
+  {
+    "line": 6593,
+    "text": "params_t185.add_scalar(num_tokens);"
+  },
+  {
+    "line": 6594,
+    "text": "params_t185.add_scalar(step_inline40920);"
+  },
+  {
+    "line": 6618,
+    "text": "params_t186.add_scalar(T_DYN);"
+  },
+  {
+    "line": 6638,
+    "text": "params_t187.add_scalar(T_DYN);"
+  },
+  {
+    "line": 6658,
+    "text": "params_t188.add_scalar(T_DYN);"
+  },
+  {
+    "line": 6677,
+    "text": "params_t189.add_scalar(T_DYN);"
+  },
+  {
+    "line": 6708,
+    "text": "params_t190.add_scalar(num_tokens);"
+  },
+  {
+    "line": 6709,
+    "text": "params_t190.add_scalar(step_inline41003);"
+  },
+  {
+    "line": 6732,
+    "text": "params_t191.add_scalar(T_DYN);"
+  },
+  {
+    "line": 6752,
+    "text": "params_t192.add_scalar(T_DYN);"
+  },
+  {
+    "line": 6772,
+    "text": "params_t193.add_scalar(T_DYN);"
+  },
+  {
+    "line": 6791,
+    "text": "params_t194.add_scalar(T_DYN);"
+  },
+  {
+    "line": 6822,
+    "text": "params_t195.add_scalar(num_tokens);"
+  },
+  {
+    "line": 6823,
+    "text": "params_t195.add_scalar(step_inline41089);"
+  },
+  {
+    "line": 6872,
+    "text": "params_t196.add_scalar(TABLE_DYN);"
+  },
+  {
+    "line": 6898,
+    "text": "params_t197.add_scalar(width_inline41121);"
+  },
+  {
+    "line": 6945,
+    "text": "params_t198.add_scalar(score_width_inline40598);"
+  },
+  {
+    "line": 6946,
+    "text": "params_t198.add_scalar(block_width_inline41154);"
+  },
+  {
+    "line": 6979,
+    "text": "params_t199.add_scalar(t_dim_inline41153);"
+  },
+  {
+    "line": 6980,
+    "text": "params_t199.add_scalar(score_width_inline40598);"
+  },
+  {
+    "line": 6981,
+    "text": "params_t199.add_scalar(block_width_inline41154);"
+  },
+  {
+    "line": 7042,
+    "text": "params_t200.add_scalar(active_inline40613);"
+  },
+  {
+    "line": 7043,
+    "text": "params_t200.add_scalar(step_inline41200);"
+  },
+  {
+    "line": 7118,
+    "text": "params_t202.add_scalar(T_DYN);"
+  },
+  {
+    "line": 7138,
+    "text": "params_t203.add_scalar(T_DYN);"
+  },
+  {
+    "line": 7168,
+    "text": "params_t204.add_scalar(T_DYN);"
+  },
+  {
+    "line": 7169,
+    "text": "params_t204.add_scalar(group_col_inline41252);"
+  },
+  {
+    "line": 7170,
+    "text": "params_t204.add_scalar(group_inline41251);"
+  },
+  {
+    "line": 7171,
+    "text": "params_t204.add_scalar(mid_col_inline41253);"
+  },
+  {
+    "line": 7199,
+    "text": "params_t205.add_scalar(T_DYN);"
+  },
+  {
+    "line": 7215,
+    "text": "params_t206.add_scalar(attention_epoch_inline40376);"
+  },
+  {
+    "line": 7216,
+    "text": "params_t206.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 7227,
+    "text": "params_t207.add_scalar(group_base);"
+  },
+  {
+    "line": 7228,
+    "text": "params_t207.add_scalar(tp_rank);"
+  },
+  {
+    "line": 7229,
+    "text": "params_t207.add_scalar(output_window_ctx);"
+  },
+  {
+    "line": 7261,
+    "text": "params_t208.add_scalar(group_base);"
+  },
+  {
+    "line": 7262,
+    "text": "params_t208.add_scalar(tp_rank);"
+  },
+  {
+    "line": 7263,
+    "text": "params_t208.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 7274,
+    "text": "params_t209.add_scalar(attention_epoch_inline40376);"
+  },
+  {
+    "line": 7275,
+    "text": "params_t209.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 7290,
+    "text": "params_t210.add_scalar(group_base);"
+  },
+  {
+    "line": 7291,
+    "text": "params_t210.add_scalar(output_window_ctx);"
+  },
+  {
+    "line": 7325,
+    "text": "params_t211.add_scalar(group_base);"
+  },
+  {
+    "line": 7326,
+    "text": "params_t211.add_scalar(tp_rank);"
+  },
+  {
+    "line": 7327,
+    "text": "params_t211.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 7339,
+    "text": "params_t212.add_scalar(attention_epoch_inline40376);"
+  },
+  {
+    "line": 7340,
+    "text": "params_t212.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 7603,
+    "text": "params_t214.add_scalar(T_DYN);"
+  },
+  {
+    "line": 7628,
+    "text": "params_t215.add_scalar(T_DYN);"
+  },
+  {
+    "line": 7691,
+    "text": "params_t218.add_scalar(T_DYN);"
+  },
+  {
+    "line": 7710,
+    "text": "params_t219.add_scalar(T_DYN);"
+  },
+  {
+    "line": 7740,
+    "text": "params_t220.add_scalar(t0_inline41545);"
+  },
+  {
+    "line": 7741,
+    "text": "params_t220.add_scalar(rows_inline41546);"
+  },
+  {
+    "line": 7756,
+    "text": "params_t221.add_scalar(T_DYN);"
+  },
+  {
+    "line": 7775,
+    "text": "params_t222.add_scalar(T_DYN);"
+  },
+  {
+    "line": 7805,
+    "text": "params_t223.add_scalar(t0_inline41606);"
+  },
+  {
+    "line": 7806,
+    "text": "params_t223.add_scalar(rows_inline41607);"
+  },
+  {
+    "line": 7824,
+    "text": "params_t224.add_scalar(T_DYN);"
+  },
+  {
+    "line": 7850,
+    "text": "params_t225.add_scalar(t0_inline41656);"
+  },
+  {
+    "line": 7851,
+    "text": "params_t225.add_scalar(rows_inline41657);"
+  },
+  {
+    "line": 7866,
+    "text": "params_t226.add_scalar(T_DYN);"
+  },
+  {
+    "line": 7886,
+    "text": "params_t227.add_scalar(T_DYN);"
+  },
+  {
+    "line": 7912,
+    "text": "params_t228.add_scalar(rows_inline41720);"
+  },
+  {
+    "line": 7941,
+    "text": "params_t229.add_scalar(T_DYN);"
+  },
+  {
+    "line": 7979,
+    "text": "params_t230.add_scalar(t0_inline41741);"
+  },
+  {
+    "line": 7980,
+    "text": "params_t230.add_scalar(rows_inline41742);"
+  },
+  {
+    "line": 7996,
+    "text": "params_t231.add_scalar(T_DYN);"
+  },
+  {
+    "line": 8021,
+    "text": "params_t232.add_scalar(T_DYN);"
+  },
+  {
+    "line": 8065,
+    "text": "params_t233.add_scalar(num_tokens);"
+  },
+  {
+    "line": 8066,
+    "text": "params_t233.add_scalar(step_inline41802);"
+  },
+  {
+    "line": 8115,
+    "text": "params_t234.add_scalar(TABLE_DYN);"
+  },
+  {
+    "line": 8142,
+    "text": "params_t235.add_scalar(POOL_BLOCKS_DYN);"
+  },
+  {
+    "line": 8143,
+    "text": "params_t235.add_scalar(width_inline41833);"
+  },
+  {
+    "line": 8189,
+    "text": "params_t236.add_scalar(width_inline41847);"
+  },
+  {
+    "line": 8271,
+    "text": "params_t237.add_scalar(active_inline41495);"
+  },
+  {
+    "line": 8272,
+    "text": "params_t237.add_scalar(step_inline41887);"
+  },
+  {
+    "line": 8347,
+    "text": "params_t239.add_scalar(T_DYN);"
+  },
+  {
+    "line": 8367,
+    "text": "params_t240.add_scalar(T_DYN);"
+  },
+  {
+    "line": 8397,
+    "text": "params_t241.add_scalar(T_DYN);"
+  },
+  {
+    "line": 8398,
+    "text": "params_t241.add_scalar(group_col_inline41939);"
+  },
+  {
+    "line": 8399,
+    "text": "params_t241.add_scalar(group_inline41938);"
+  },
+  {
+    "line": 8400,
+    "text": "params_t241.add_scalar(mid_col_inline41940);"
+  },
+  {
+    "line": 8428,
+    "text": "params_t242.add_scalar(T_DYN);"
+  },
+  {
+    "line": 8444,
+    "text": "params_t243.add_scalar(attention_epoch_inline40376);"
+  },
+  {
+    "line": 8445,
+    "text": "params_t243.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 8456,
+    "text": "params_t244.add_scalar(group_base);"
+  },
+  {
+    "line": 8457,
+    "text": "params_t244.add_scalar(tp_rank);"
+  },
+  {
+    "line": 8458,
+    "text": "params_t244.add_scalar(output_window_ctx);"
+  },
+  {
+    "line": 8490,
+    "text": "params_t245.add_scalar(group_base);"
+  },
+  {
+    "line": 8491,
+    "text": "params_t245.add_scalar(tp_rank);"
+  },
+  {
+    "line": 8492,
+    "text": "params_t245.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 8503,
+    "text": "params_t246.add_scalar(attention_epoch_inline40376);"
+  },
+  {
+    "line": 8504,
+    "text": "params_t246.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 8519,
+    "text": "params_t247.add_scalar(group_base);"
+  },
+  {
+    "line": 8520,
+    "text": "params_t247.add_scalar(output_window_ctx);"
+  },
+  {
+    "line": 8554,
+    "text": "params_t248.add_scalar(group_base);"
+  },
+  {
+    "line": 8555,
+    "text": "params_t248.add_scalar(tp_rank);"
+  },
+  {
+    "line": 8556,
+    "text": "params_t248.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 8568,
+    "text": "params_t249.add_scalar(attention_epoch_inline40376);"
+  },
+  {
+    "line": 8569,
+    "text": "params_t249.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 8719,
+    "text": "params_t251.add_scalar(T_DYN);"
+  },
+  {
+    "line": 8744,
+    "text": "params_t252.add_scalar(T_DYN);"
+  },
+  {
+    "line": 8807,
+    "text": "params_t255.add_scalar(T_DYN);"
+  },
+  {
+    "line": 8826,
+    "text": "params_t256.add_scalar(T_DYN);"
+  },
+  {
+    "line": 8856,
+    "text": "params_t257.add_scalar(t0_inline42206);"
+  },
+  {
+    "line": 8857,
+    "text": "params_t257.add_scalar(rows_inline42207);"
+  },
+  {
+    "line": 8872,
+    "text": "params_t258.add_scalar(T_DYN);"
+  },
+  {
+    "line": 8891,
+    "text": "params_t259.add_scalar(T_DYN);"
+  },
+  {
+    "line": 8921,
+    "text": "params_t260.add_scalar(t0_inline42267);"
+  },
+  {
+    "line": 8922,
+    "text": "params_t260.add_scalar(rows_inline42268);"
+  },
+  {
+    "line": 8940,
+    "text": "params_t261.add_scalar(T_DYN);"
+  },
+  {
+    "line": 8966,
+    "text": "params_t262.add_scalar(t0_inline42317);"
+  },
+  {
+    "line": 8967,
+    "text": "params_t262.add_scalar(rows_inline42318);"
+  },
+  {
+    "line": 8982,
+    "text": "params_t263.add_scalar(T_DYN);"
+  },
+  {
+    "line": 9002,
+    "text": "params_t264.add_scalar(T_DYN);"
+  },
+  {
+    "line": 9028,
+    "text": "params_t265.add_scalar(rows_inline42381);"
+  },
+  {
+    "line": 9057,
+    "text": "params_t266.add_scalar(T_DYN);"
+  },
+  {
+    "line": 9100,
+    "text": "params_t267.add_scalar(num_tokens);"
+  },
+  {
+    "line": 9101,
+    "text": "params_t267.add_scalar(step_inline42399);"
+  },
+  {
+    "line": 9161,
+    "text": "params_t268.add_scalar(active_inline42156);"
+  },
+  {
+    "line": 9162,
+    "text": "params_t268.add_scalar(step_inline42413);"
+  },
+  {
+    "line": 9237,
+    "text": "params_t270.add_scalar(T_DYN);"
+  },
+  {
+    "line": 9257,
+    "text": "params_t271.add_scalar(T_DYN);"
+  },
+  {
+    "line": 9287,
+    "text": "params_t272.add_scalar(T_DYN);"
+  },
+  {
+    "line": 9288,
+    "text": "params_t272.add_scalar(group_col_inline42465);"
+  },
+  {
+    "line": 9289,
+    "text": "params_t272.add_scalar(group_inline42464);"
+  },
+  {
+    "line": 9290,
+    "text": "params_t272.add_scalar(mid_col_inline42466);"
+  },
+  {
+    "line": 9318,
+    "text": "params_t273.add_scalar(T_DYN);"
+  },
+  {
+    "line": 9334,
+    "text": "params_t274.add_scalar(attention_epoch_inline40376);"
+  },
+  {
+    "line": 9335,
+    "text": "params_t274.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 9346,
+    "text": "params_t275.add_scalar(group_base);"
+  },
+  {
+    "line": 9347,
+    "text": "params_t275.add_scalar(tp_rank);"
+  },
+  {
+    "line": 9348,
+    "text": "params_t275.add_scalar(output_window_ctx);"
+  },
+  {
+    "line": 9380,
+    "text": "params_t276.add_scalar(group_base);"
+  },
+  {
+    "line": 9381,
+    "text": "params_t276.add_scalar(tp_rank);"
+  },
+  {
+    "line": 9382,
+    "text": "params_t276.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 9393,
+    "text": "params_t277.add_scalar(attention_epoch_inline40376);"
+  },
+  {
+    "line": 9394,
+    "text": "params_t277.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 9409,
+    "text": "params_t278.add_scalar(group_base);"
+  },
+  {
+    "line": 9410,
+    "text": "params_t278.add_scalar(output_window_ctx);"
+  },
+  {
+    "line": 9444,
+    "text": "params_t279.add_scalar(group_base);"
+  },
+  {
+    "line": 9445,
+    "text": "params_t279.add_scalar(tp_rank);"
+  },
+  {
+    "line": 9446,
+    "text": "params_t279.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 9458,
+    "text": "params_t280.add_scalar(attention_epoch_inline40376);"
+  },
+  {
+    "line": 9459,
+    "text": "params_t280.add_scalar(output_arrived_ctx);"
+  },
+  {
+    "line": 9731,
+    "text": "params_t282.add_scalar(T_DYN);"
+  },
+  {
+    "line": 9756,
+    "text": "params_t283.add_scalar(T_DYN);"
+  },
+  {
+    "line": 9819,
+    "text": "params_t286.add_scalar(T_DYN);"
+  },
+  {
+    "line": 9845,
+    "text": "params_t287.add_scalar(T_DYN);"
+  },
+  {
+    "line": 9868,
+    "text": "params_t288.add_scalar(rank);"
+  },
+  {
+    "line": 9869,
+    "text": "params_t288.add_scalar(layer_inline40375);"
+  },
+  {
+    "line": 9870,
+    "text": "params_t288.add_scalar(consumed_ctx);"
+  },
+  {
+    "line": 9881,
+    "text": "params_t289.add_scalar(rank);"
+  },
+  {
+    "line": 9882,
+    "text": "params_t289.add_scalar(layer_inline40375);"
+  },
+  {
+    "line": 9883,
+    "text": "params_t289.add_scalar(recv_meta_ctx);"
+  },
+  {
+    "line": 9884,
+    "text": "params_t289.add_scalar(meta_ready_ctx);"
+  },
+  {
+    "line": 9900,
+    "text": "params_t290.add_scalar(rank);"
+  },
+  {
+    "line": 9901,
+    "text": "params_t290.add_scalar(recv_x_ctx);"
+  },
+  {
+    "line": 9902,
+    "text": "params_t290.add_scalar(recv_aux_ctx);"
+  },
+  {
+    "line": 9915,
+    "text": "params_t291.add_scalar(rank);"
+  },
+  {
+    "line": 9916,
+    "text": "params_t291.add_scalar(layer_inline40375);"
+  },
+  {
+    "line": 9917,
+    "text": "params_t291.add_scalar(data_ready_ctx);"
+  },
+  {
+    "line": 9942,
+    "text": "params_t293.add_scalar(recv_meta_ctx);"
+  },
+  {
+    "line": 9943,
+    "text": "params_t293.add_scalar(recv_x_ctx);"
+  },
+  {
+    "line": 9944,
+    "text": "params_t293.add_scalar(recv_aux_ctx);"
+  },
+  {
+    "line": 9959,
+    "text": "params_t294.add_scalar(rank);"
+  },
+  {
+    "line": 9960,
+    "text": "params_t294.add_scalar(consumed_ctx);"
+  },
+  {
+    "line": 10119,
+    "text": "params_t295.add_scalar(t_dim_inline42843);"
+  },
+  {
+    "line": 10150,
+    "text": "params_t296.add_scalar(t0_inline42871);"
+  },
+  {
+    "line": 10151,
+    "text": "params_t296.add_scalar(rows_inline42872);"
+  },
+  {
+    "line": 10176,
+    "text": "params_t297.add_scalar(t0_inline42890);"
+  },
+  {
+    "line": 10177,
+    "text": "params_t297.add_scalar(rows_inline42891);"
+  },
+  {
+    "line": 10201,
+    "text": "params_t299.add_scalar(t_dim_inline42905);"
+  },
+  {
+    "line": 10232,
+    "text": "params_t300.add_scalar(t0_inline42933);"
+  },
+  {
+    "line": 10233,
+    "text": "params_t300.add_scalar(rows_inline42934);"
+  },
+  {
+    "line": 10248,
+    "text": "params_t301.add_scalar(rank);"
+  },
+  {
+    "line": 10249,
+    "text": "params_t301.add_scalar(layer_inline40375);"
+  },
+  {
+    "line": 10250,
+    "text": "params_t301.add_scalar(return_consumed_ctx);"
+  },
+  {
+    "line": 10261,
+    "text": "params_t302.add_scalar(recv_meta_ctx);"
+  },
+  {
+    "line": 10262,
+    "text": "params_t302.add_scalar(return_slots_ctx);"
+  },
+  {
+    "line": 10275,
+    "text": "params_t303.add_scalar(rank);"
+  },
+  {
+    "line": 10276,
+    "text": "params_t303.add_scalar(layer_inline40375);"
+  },
+  {
+    "line": 10277,
+    "text": "params_t303.add_scalar(return_ready_ctx);"
+  },
+  {
+    "line": 10300,
+    "text": "params_t305.add_scalar(t_dim_inline42962);"
+  },
+  {
+    "line": 10331,
+    "text": "params_t306.add_scalar(t0_inline42990);"
+  },
+  {
+    "line": 10332,
+    "text": "params_t306.add_scalar(rows_inline42991);"
+  },
+  {
+    "line": 10357,
+    "text": "params_t307.add_scalar(t0_inline43009);"
+  },
+  {
+    "line": 10358,
+    "text": "params_t307.add_scalar(rows_inline43010);"
+  },
+  {
+    "line": 10381,
+    "text": "params_t309.add_scalar(t_dim_inline43024);"
+  },
+  {
+    "line": 10412,
+    "text": "params_t310.add_scalar(t0_inline43052);"
+  },
+  {
+    "line": 10413,
+    "text": "params_t310.add_scalar(rows_inline43053);"
+  },
+  {
+    "line": 10431,
+    "text": "params_t312.add_scalar(return_slots_ctx);"
+  },
+  {
+    "line": 10444,
+    "text": "params_t313.add_scalar(rank);"
+  },
+  {
+    "line": 10445,
+    "text": "params_t313.add_scalar(return_consumed_ctx);"
+  },
+  {
+    "line": 10488,
+    "text": "params_t315.add_scalar(T_DYN);"
+  },
+  {
+    "line": 10489,
+    "text": "params_t315.add_scalar(layer_inline40375);"
+  },
+  {
+    "line": 10504,
+    "text": "params_t316.add_scalar(T_DYN);"
+  },
+  {
+    "line": 10505,
+    "text": "params_t316.add_scalar(layer_inline40375);"
+  },
+  {
+    "line": 10529,
+    "text": "params_t318.add_scalar(T_DYN);"
+  },
+  {
+    "line": 10541,
+    "text": "params_t319.add_scalar(embed_window_ctx);"
+  },
+  {
+    "line": 10571,
+    "text": "params_t321.add_scalar(T_DYN);"
+  },
+  {
+    "line": 10597,
+    "text": "params_t322.add_scalar(t0_inline43099);"
+  },
+  {
+    "line": 10598,
+    "text": "params_t322.add_scalar(rows_inline43100);"
+  }
+]

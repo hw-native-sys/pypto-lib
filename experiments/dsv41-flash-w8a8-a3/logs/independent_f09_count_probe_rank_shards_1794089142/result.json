@@ -1,0 +1,1031 @@
+{
+  "scope": "SOURCE_AND_CPU_PUBLIC_GETTER_ONLY",
+  "model_tensors": 0,
+  "fixture": 0,
+  "compile": 0,
+  "prepare": 0,
+  "NPU": 0,
+  "positive_grants": 0,
+  "status": "PASS_SOURCE_GENERATED_HOST_AND_CPU_PUBLIC_GETTER_ONLY",
+  "started_epoch": 1794089269.300745,
+  "ended_epoch": 1794089269.7937486,
+  "static_contracts": [
+    {
+      "label": "count_active",
+      "name": "gate_bias",
+      "producer": {
+        "shape": [
+          16,
+          384
+        ],
+        "dtype": "torch.float32",
+        "packed": false,
+        "family": "_layer_weight",
+        "source_shape_ast": "(N_EXPERTS,)"
+      },
+      "HOST_shape": [
+        16,
+        384
+      ],
+      "post_contiguous_strides": [
+        384,
+        1
+      ],
+      "bytes": 24576,
+      "generated_expression": "tensors['gate_bias__ssa_v0'][rank__idx_v0, 0:384]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_active",
+      "name": "gate_weight",
+      "producer": {
+        "shape": [
+          16,
+          384,
+          5120
+        ],
+        "dtype": "torch.float32",
+        "packed": false,
+        "family": "_layer_weight",
+        "source_shape_ast": "(N_EXPERTS, D)"
+      },
+      "HOST_shape": [
+        16,
+        384,
+        5120
+      ],
+      "post_contiguous_strides": [
+        1966080,
+        5120,
+        1
+      ],
+      "bytes": 125829120,
+      "generated_expression": "tensors['gate_weight__ssa_v0'][rank__idx_v0, 0:384, 0:5120]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_active",
+      "name": "hc_ffn_base",
+      "producer": {
+        "shape": [
+          16,
+          24
+        ],
+        "dtype": "torch.float32",
+        "packed": false,
+        "family": "_layer_weight",
+        "source_shape_ast": "(MIX_HC,)"
+      },
+      "HOST_shape": [
+        16,
+        24
+      ],
+      "post_contiguous_strides": [
+        24,
+        1
+      ],
+      "bytes": 1536,
+      "generated_expression": "tensors['hc_ffn_base__ssa_v0'][rank__idx_v0, 0:24]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_active",
+      "name": "hc_ffn_fn",
+      "producer": {
+        "shape": [
+          16,
+          32,
+          20480
+        ],
+        "dtype": "torch.float32",
+        "packed": false,
+        "family": "_layer_weight",
+        "source_shape_ast": "(MIX_PAD, HC_DIM)"
+      },
+      "HOST_shape": [
+        16,
+        32,
+        20480
+      ],
+      "post_contiguous_strides": [
+        655360,
+        20480,
+        1
+      ],
+      "bytes": 41943040,
+      "generated_expression": "tensors['hc_ffn_fn__ssa_v0'][rank__idx_v0, 0:32, 0:20480]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_active",
+      "name": "hc_ffn_scale",
+      "producer": {
+        "shape": [
+          16,
+          3
+        ],
+        "dtype": "torch.float32",
+        "packed": false,
+        "family": "_layer_weight",
+        "source_shape_ast": "(3,)"
+      },
+      "HOST_shape": [
+        16,
+        3
+      ],
+      "post_contiguous_strides": [
+        3,
+        1
+      ],
+      "bytes": 192,
+      "generated_expression": "tensors['hc_ffn_scale__ssa_v0'][rank__idx_v0, 0:3]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_active",
+      "name": "norm_weight",
+      "producer": {
+        "shape": [
+          16,
+          5120
+        ],
+        "dtype": "torch.bfloat16",
+        "packed": false,
+        "family": "_layer_weight",
+        "source_shape_ast": "(D,)"
+      },
+      "HOST_shape": [
+        16,
+        5120
+      ],
+      "post_contiguous_strides": [
+        5120,
+        1
+      ],
+      "bytes": 163840,
+      "generated_expression": "tensors['norm_weight__ssa_v0'][rank__idx_v0, 0:5120]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_active",
+      "name": "shared_w1",
+      "producer": {
+        "shape": [
+          16,
+          5120,
+          2304
+        ],
+        "dtype": "torch.int8",
+        "packed": true,
+        "family": "_layer_weight",
+        "source_shape_ast": "(D, INTER)"
+      },
+      "HOST_shape": [
+        16,
+        5120,
+        2304
+      ],
+      "post_contiguous_strides": [
+        11796480,
+        2304,
+        1
+      ],
+      "bytes": 188743680,
+      "generated_expression": "tensors['shared_w1__ssa_v0'][rank__idx_v0, 0:5120, 0:2304]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_active",
+      "name": "shared_w1_scale",
+      "producer": {
+        "shape": [
+          16,
+          2304
+        ],
+        "dtype": "torch.float32",
+        "packed": false,
+        "family": "_layer_weight",
+        "source_shape_ast": "(INTER,)"
+      },
+      "HOST_shape": [
+        16,
+        2304
+      ],
+      "post_contiguous_strides": [
+        2304,
+        1
+      ],
+      "bytes": 147456,
+      "generated_expression": "tensors['shared_w1_scale__ssa_v0'][rank__idx_v0, 0:2304]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_active",
+      "name": "shared_w2",
+      "producer": {
+        "shape": [
+          16,
+          2304,
+          5120
+        ],
+        "dtype": "torch.int8",
+        "packed": true,
+        "family": "_layer_weight",
+        "source_shape_ast": "(INTER, D)"
+      },
+      "HOST_shape": [
+        16,
+        2304,
+        5120
+      ],
+      "post_contiguous_strides": [
+        11796480,
+        5120,
+        1
+      ],
+      "bytes": 188743680,
+      "generated_expression": "tensors['shared_w2__ssa_v0'][rank__idx_v0, 0:2304, 0:5120]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_active",
+      "name": "shared_w2_scale",
+      "producer": {
+        "shape": [
+          16,
+          5120
+        ],
+        "dtype": "torch.float32",
+        "packed": false,
+        "family": "_layer_weight",
+        "source_shape_ast": "(D,)"
+      },
+      "HOST_shape": [
+        16,
+        5120
+      ],
+      "post_contiguous_strides": [
+        5120,
+        1
+      ],
+      "bytes": 327680,
+      "generated_expression": "tensors['shared_w2_scale__ssa_v0'][rank__idx_v0, 0:5120]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_active",
+      "name": "shared_w3",
+      "producer": {
+        "shape": [
+          16,
+          5120,
+          2304
+        ],
+        "dtype": "torch.int8",
+        "packed": true,
+        "family": "_layer_weight",
+        "source_shape_ast": "(D, INTER)"
+      },
+      "HOST_shape": [
+        16,
+        5120,
+        2304
+      ],
+      "post_contiguous_strides": [
+        11796480,
+        2304,
+        1
+      ],
+      "bytes": 188743680,
+      "generated_expression": "tensors['shared_w3__ssa_v0'][rank__idx_v0, 0:5120, 0:2304]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_active",
+      "name": "shared_w3_scale",
+      "producer": {
+        "shape": [
+          16,
+          2304
+        ],
+        "dtype": "torch.float32",
+        "packed": false,
+        "family": "_layer_weight",
+        "source_shape_ast": "(INTER,)"
+      },
+      "HOST_shape": [
+        16,
+        2304
+      ],
+      "post_contiguous_strides": [
+        2304,
+        1
+      ],
+      "bytes": 147456,
+      "generated_expression": "tensors['shared_w3_scale__ssa_v0'][rank__idx_v0, 0:2304]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_active",
+      "name": "w1",
+      "producer": {
+        "shape": [
+          16,
+          24,
+          5120,
+          2304
+        ],
+        "dtype": "torch.int8",
+        "packed": true,
+        "family": "_layer_expert_weight",
+        "source_shape_ast": "(N_LOCAL_EXPERTS, D, INTER)"
+      },
+      "HOST_shape": [
+        16,
+        24,
+        5120,
+        2304
+      ],
+      "post_contiguous_strides": [
+        283115520,
+        11796480,
+        2304,
+        1
+      ],
+      "bytes": 4529848320,
+      "generated_expression": "tensors['w1__ssa_v0'][rank__idx_v0, 0:24, 0:5120, 0:2304]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_active",
+      "name": "w1_scale",
+      "producer": {
+        "shape": [
+          16,
+          24,
+          2304
+        ],
+        "dtype": "torch.float32",
+        "packed": false,
+        "family": "_layer_expert_weight",
+        "source_shape_ast": "(N_LOCAL_EXPERTS, INTER)"
+      },
+      "HOST_shape": [
+        16,
+        24,
+        2304
+      ],
+      "post_contiguous_strides": [
+        55296,
+        2304,
+        1
+      ],
+      "bytes": 3538944,
+      "generated_expression": "tensors['w1_scale__ssa_v0'][rank__idx_v0, 0:24, 0:2304]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_active",
+      "name": "w2",
+      "producer": {
+        "shape": [
+          16,
+          24,
+          2304,
+          5120
+        ],
+        "dtype": "torch.int8",
+        "packed": true,
+        "family": "_layer_expert_weight",
+        "source_shape_ast": "(N_LOCAL_EXPERTS, INTER, D)"
+      },
+      "HOST_shape": [
+        16,
+        24,
+        2304,
+        5120
+      ],
+      "post_contiguous_strides": [
+        283115520,
+        11796480,
+        5120,
+        1
+      ],
+      "bytes": 4529848320,
+      "generated_expression": "tensors['w2__ssa_v0'][rank__idx_v0, 0:24, 0:2304, 0:5120]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_active",
+      "name": "w2_scale",
+      "producer": {
+        "shape": [
+          16,
+          24,
+          5120
+        ],
+        "dtype": "torch.float32",
+        "packed": false,
+        "family": "_layer_expert_weight",
+        "source_shape_ast": "(N_LOCAL_EXPERTS, D)"
+      },
+      "HOST_shape": [
+        16,
+        24,
+        5120
+      ],
+      "post_contiguous_strides": [
+        122880,
+        5120,
+        1
+      ],
+      "bytes": 7864320,
+      "generated_expression": "tensors['w2_scale__ssa_v0'][rank__idx_v0, 0:24, 0:5120]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_active",
+      "name": "w3",
+      "producer": {
+        "shape": [
+          16,
+          24,
+          5120,
+          2304
+        ],
+        "dtype": "torch.int8",
+        "packed": true,
+        "family": "_layer_expert_weight",
+        "source_shape_ast": "(N_LOCAL_EXPERTS, D, INTER)"
+      },
+      "HOST_shape": [
+        16,
+        24,
+        5120,
+        2304
+      ],
+      "post_contiguous_strides": [
+        283115520,
+        11796480,
+        2304,
+        1
+      ],
+      "bytes": 4529848320,
+      "generated_expression": "tensors['w3__ssa_v0'][rank__idx_v0, 0:24, 0:5120, 0:2304]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_active",
+      "name": "w3_scale",
+      "producer": {
+        "shape": [
+          16,
+          24,
+          2304
+        ],
+        "dtype": "torch.float32",
+        "packed": false,
+        "family": "_layer_expert_weight",
+        "source_shape_ast": "(N_LOCAL_EXPERTS, INTER)"
+      },
+      "HOST_shape": [
+        16,
+        24,
+        2304
+      ],
+      "post_contiguous_strides": [
+        55296,
+        2304,
+        1
+      ],
+      "bytes": 3538944,
+      "generated_expression": "tensors['w3_scale__ssa_v0'][rank__idx_v0, 0:24, 0:2304]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_old_physical",
+      "name": "gate_bias",
+      "producer": {
+        "shape": [
+          16,
+          384
+        ],
+        "dtype": "torch.float32",
+        "packed": false,
+        "family": "_layer_weight",
+        "source_shape_ast": "(N_EXPERTS,)"
+      },
+      "HOST_shape": [
+        16,
+        384
+      ],
+      "post_contiguous_strides": [
+        384,
+        1
+      ],
+      "bytes": 24576,
+      "generated_expression": "tensors['gate_bias__ssa_v0'][rank__idx_v0, 0:384]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_old_physical",
+      "name": "gate_weight",
+      "producer": {
+        "shape": [
+          16,
+          384,
+          5120
+        ],
+        "dtype": "torch.float32",
+        "packed": false,
+        "family": "_layer_weight",
+        "source_shape_ast": "(N_EXPERTS, D)"
+      },
+      "HOST_shape": [
+        16,
+        384,
+        5120
+      ],
+      "post_contiguous_strides": [
+        1966080,
+        5120,
+        1
+      ],
+      "bytes": 125829120,
+      "generated_expression": "tensors['gate_weight__ssa_v0'][rank__idx_v0, 0:384, 0:5120]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_old_physical",
+      "name": "hc_ffn_base",
+      "producer": {
+        "shape": [
+          16,
+          24
+        ],
+        "dtype": "torch.float32",
+        "packed": false,
+        "family": "_layer_weight",
+        "source_shape_ast": "(MIX_HC,)"
+      },
+      "HOST_shape": [
+        16,
+        24
+      ],
+      "post_contiguous_strides": [
+        24,
+        1
+      ],
+      "bytes": 1536,
+      "generated_expression": "tensors['hc_ffn_base__ssa_v0'][rank__idx_v0, 0:24]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_old_physical",
+      "name": "hc_ffn_fn",
+      "producer": {
+        "shape": [
+          16,
+          32,
+          20480
+        ],
+        "dtype": "torch.float32",
+        "packed": false,
+        "family": "_layer_weight",
+        "source_shape_ast": "(MIX_PAD, HC_DIM)"
+      },
+      "HOST_shape": [
+        16,
+        32,
+        20480
+      ],
+      "post_contiguous_strides": [
+        655360,
+        20480,
+        1
+      ],
+      "bytes": 41943040,
+      "generated_expression": "tensors['hc_ffn_fn__ssa_v0'][rank__idx_v0, 0:32, 0:20480]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_old_physical",
+      "name": "hc_ffn_scale",
+      "producer": {
+        "shape": [
+          16,
+          3
+        ],
+        "dtype": "torch.float32",
+        "packed": false,
+        "family": "_layer_weight",
+        "source_shape_ast": "(3,)"
+      },
+      "HOST_shape": [
+        16,
+        3
+      ],
+      "post_contiguous_strides": [
+        3,
+        1
+      ],
+      "bytes": 192,
+      "generated_expression": "tensors['hc_ffn_scale__ssa_v0'][rank__idx_v0, 0:3]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_old_physical",
+      "name": "norm_weight",
+      "producer": {
+        "shape": [
+          16,
+          5120
+        ],
+        "dtype": "torch.bfloat16",
+        "packed": false,
+        "family": "_layer_weight",
+        "source_shape_ast": "(D,)"
+      },
+      "HOST_shape": [
+        16,
+        5120
+      ],
+      "post_contiguous_strides": [
+        5120,
+        1
+      ],
+      "bytes": 163840,
+      "generated_expression": "tensors['norm_weight__ssa_v0'][rank__idx_v0, 0:5120]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_old_physical",
+      "name": "shared_w1",
+      "producer": {
+        "shape": [
+          16,
+          5120,
+          2304
+        ],
+        "dtype": "torch.int8",
+        "packed": true,
+        "family": "_layer_weight",
+        "source_shape_ast": "(D, INTER)"
+      },
+      "HOST_shape": [
+        16,
+        5120,
+        2304
+      ],
+      "post_contiguous_strides": [
+        11796480,
+        2304,
+        1
+      ],
+      "bytes": 188743680,
+      "generated_expression": "tensors['shared_w1__ssa_v0'][rank__idx_v0, 0:5120, 0:2304]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_old_physical",
+      "name": "shared_w1_scale",
+      "producer": {
+        "shape": [
+          16,
+          2304
+        ],
+        "dtype": "torch.float32",
+        "packed": false,
+        "family": "_layer_weight",
+        "source_shape_ast": "(INTER,)"
+      },
+      "HOST_shape": [
+        16,
+        2304
+      ],
+      "post_contiguous_strides": [
+        2304,
+        1
+      ],
+      "bytes": 147456,
+      "generated_expression": "tensors['shared_w1_scale__ssa_v0'][rank__idx_v0, 0:2304]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_old_physical",
+      "name": "shared_w2",
+      "producer": {
+        "shape": [
+          16,
+          2304,
+          5120
+        ],
+        "dtype": "torch.int8",
+        "packed": true,
+        "family": "_layer_weight",
+        "source_shape_ast": "(INTER, D)"
+      },
+      "HOST_shape": [
+        16,
+        2304,
+        5120
+      ],
+      "post_contiguous_strides": [
+        11796480,
+        5120,
+        1
+      ],
+      "bytes": 188743680,
+      "generated_expression": "tensors['shared_w2__ssa_v0'][rank__idx_v0, 0:2304, 0:5120]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_old_physical",
+      "name": "shared_w2_scale",
+      "producer": {
+        "shape": [
+          16,
+          5120
+        ],
+        "dtype": "torch.float32",
+        "packed": false,
+        "family": "_layer_weight",
+        "source_shape_ast": "(D,)"
+      },
+      "HOST_shape": [
+        16,
+        5120
+      ],
+      "post_contiguous_strides": [
+        5120,
+        1
+      ],
+      "bytes": 327680,
+      "generated_expression": "tensors['shared_w2_scale__ssa_v0'][rank__idx_v0, 0:5120]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_old_physical",
+      "name": "shared_w3",
+      "producer": {
+        "shape": [
+          16,
+          5120,
+          2304
+        ],
+        "dtype": "torch.int8",
+        "packed": true,
+        "family": "_layer_weight",
+        "source_shape_ast": "(D, INTER)"
+      },
+      "HOST_shape": [
+        16,
+        5120,
+        2304
+      ],
+      "post_contiguous_strides": [
+        11796480,
+        2304,
+        1
+      ],
+      "bytes": 188743680,
+      "generated_expression": "tensors['shared_w3__ssa_v0'][rank__idx_v0, 0:5120, 0:2304]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_old_physical",
+      "name": "shared_w3_scale",
+      "producer": {
+        "shape": [
+          16,
+          2304
+        ],
+        "dtype": "torch.float32",
+        "packed": false,
+        "family": "_layer_weight",
+        "source_shape_ast": "(INTER,)"
+      },
+      "HOST_shape": [
+        16,
+        2304
+      ],
+      "post_contiguous_strides": [
+        2304,
+        1
+      ],
+      "bytes": 147456,
+      "generated_expression": "tensors['shared_w3_scale__ssa_v0'][rank__idx_v0, 0:2304]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_old_physical",
+      "name": "w1",
+      "producer": {
+        "shape": [
+          16,
+          24,
+          5120,
+          2304
+        ],
+        "dtype": "torch.int8",
+        "packed": true,
+        "family": "_layer_expert_weight",
+        "source_shape_ast": "(N_LOCAL_EXPERTS, D, INTER)"
+      },
+      "HOST_shape": [
+        16,
+        24,
+        5120,
+        2304
+      ],
+      "post_contiguous_strides": [
+        283115520,
+        11796480,
+        2304,
+        1
+      ],
+      "bytes": 4529848320,
+      "generated_expression": "tensors['w1__ssa_v0'][rank__idx_v0, 0:24, 0:5120, 0:2304]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_old_physical",
+      "name": "w1_scale",
+      "producer": {
+        "shape": [
+          16,
+          24,
+          2304
+        ],
+        "dtype": "torch.float32",
+        "packed": false,
+        "family": "_layer_expert_weight",
+        "source_shape_ast": "(N_LOCAL_EXPERTS, INTER)"
+      },
+      "HOST_shape": [
+        16,
+        24,
+        2304
+      ],
+      "post_contiguous_strides": [
+        55296,
+        2304,
+        1
+      ],
+      "bytes": 3538944,
+      "generated_expression": "tensors['w1_scale__ssa_v0'][rank__idx_v0, 0:24, 0:2304]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_old_physical",
+      "name": "w2",
+      "producer": {
+        "shape": [
+          16,
+          24,
+          2304,
+          5120
+        ],
+        "dtype": "torch.int8",
+        "packed": true,
+        "family": "_layer_expert_weight",
+        "source_shape_ast": "(N_LOCAL_EXPERTS, INTER, D)"
+      },
+      "HOST_shape": [
+        16,
+        24,
+        2304,
+        5120
+      ],
+      "post_contiguous_strides": [
+        283115520,
+        11796480,
+        5120,
+        1
+      ],
+      "bytes": 4529848320,
+      "generated_expression": "tensors['w2__ssa_v0'][rank__idx_v0, 0:24, 0:2304, 0:5120]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_old_physical",
+      "name": "w2_scale",
+      "producer": {
+        "shape": [
+          16,
+          24,
+          5120
+        ],
+        "dtype": "torch.float32",
+        "packed": false,
+        "family": "_layer_expert_weight",
+        "source_shape_ast": "(N_LOCAL_EXPERTS, D)"
+      },
+      "HOST_shape": [
+        16,
+        24,
+        5120
+      ],
+      "post_contiguous_strides": [
+        122880,
+        5120,
+        1
+      ],
+      "bytes": 7864320,
+      "generated_expression": "tensors['w2_scale__ssa_v0'][rank__idx_v0, 0:24, 0:5120]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_old_physical",
+      "name": "w3",
+      "producer": {
+        "shape": [
+          16,
+          24,
+          5120,
+          2304
+        ],
+        "dtype": "torch.int8",
+        "packed": true,
+        "family": "_layer_expert_weight",
+        "source_shape_ast": "(N_LOCAL_EXPERTS, D, INTER)"
+      },
+      "HOST_shape": [
+        16,
+        24,
+        5120,
+        2304
+      ],
+      "post_contiguous_strides": [
+        283115520,
+        11796480,
+        2304,
+        1
+      ],
+      "bytes": 4529848320,
+      "generated_expression": "tensors['w3__ssa_v0'][rank__idx_v0, 0:24, 0:5120, 0:2304]",
+      "public_getitem_rank": 8
+    },
+    {
+      "label": "count_old_physical",
+      "name": "w3_scale",
+      "producer": {
+        "shape": [
+          16,
+          24,
+          2304
+        ],
+        "dtype": "torch.float32",
+        "packed": false,
+        "family": "_layer_expert_weight",
+        "source_shape_ast": "(N_LOCAL_EXPERTS, INTER)"
+      },
+      "HOST_shape": [
+        16,
+        24,
+        2304
+      ],
+      "post_contiguous_strides": [
+        55296,
+        2304,
+        1
+      ],
+      "bytes": 3538944,
+      "generated_expression": "tensors['w3_scale__ssa_v0'][rank__idx_v0, 0:24, 0:2304]",
+      "public_getitem_rank": 8
+    }
+  ],
+  "public_getter_checks": 36,
+  "old_generated_slice_rejections": [
+    {
+      "label": "count_active",
+      "name": "w1",
+      "error": "StackedDeviceTensor leading index must be int, got slice"
+    },
+    {
+      "label": "count_active",
+      "name": "shared_w1",
+      "error": "StackedDeviceTensor leading index must be int, got slice"
+    },
+    {
+      "label": "count_old_physical",
+      "name": "w1",
+      "error": "StackedDeviceTensor leading index must be int, got slice"
+    },
+    {
+      "label": "count_old_physical",
+      "name": "shared_w1",
+      "error": "StackedDeviceTensor leading index must be int, got slice"
+    }
+  ],
+  "only_six_HOST_NZ_removed_each": true,
+  "rank_compute_and_HOST_body_unchanged": true,
+  "mixed_profile_table_verified": true,
+  "default_execution_refused": true,
+  "old_adapter_receipt_refused": true,
+  "new_Root_wrapper": "PENDING",
+  "new_helper_native_prepare": "prior054811 inventory PASS; new398 not prepared",
+  "fullentry_native": "NOT_TESTED",
+  "numerical_acceptance": false,
+  "public_device_tensor_sha256": "72dc6701eca6dc10a2155773b35a37dee1551c89a89ecf08a8c244571395e8e3"
+}

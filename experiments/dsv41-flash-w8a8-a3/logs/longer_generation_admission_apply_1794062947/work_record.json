@@ -1,0 +1,10 @@
+{
+  "id": "main-longer-generation-admission-apply-1794062947-1794063512",
+  "agent": "/root/main_native",
+  "start_epoch": 1794062947,
+  "end_epoch": 1794063512,
+  "elapsed_seconds": 565,
+  "status": "FINAL/PARK",
+  "scope": "exactgenerate-onlyapply+new45+onequeuedtinyCPU+recovery; no compile/NPU/payload/grant",
+  "workers": []
+}

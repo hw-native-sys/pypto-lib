@@ -1,0 +1,120 @@
+{
+  "variant": "CANDIDATE_CPU_SELF_PASS",
+  "cases": [
+    {
+      "case": "largest_post_reserve_reject",
+      "rejected": true,
+      "status": "FAIL",
+      "primary_error": "Refused: postallocation free/remaining/IO/comm/headroom guard",
+      "cleanup_errors": [],
+      "created": 16,
+      "free_attempts": 16,
+      "normal_close": true,
+      "bad_rank": 15,
+      "after_last_free": 50,
+      "reserve": 100
+    },
+    {
+      "case": "final_57th_post_reserve_reject",
+      "rejected": true,
+      "status": "FAIL",
+      "primary_error": "Refused: postallocation free/remaining/IO/comm/headroom guard",
+      "cleanup_errors": [],
+      "created": 912,
+      "free_attempts": 912,
+      "normal_close": true,
+      "bad_rank": 15,
+      "after_last_free": 80,
+      "reserve": 100
+    },
+    {
+      "case": "normal_57_all16_exact_boundary",
+      "rejected": false,
+      "status": "EMPTY_ALLOCATIONS_PASS",
+      "primary_error": null,
+      "cleanup_errors": [],
+      "created": 912,
+      "free_attempts": 912,
+      "normal_close": true,
+      "bad_rank": null,
+      "after_last_free": 100,
+      "reserve": 100
+    },
+    {
+      "case": "asymmetric_rank7_reject",
+      "rejected": true,
+      "status": "FAIL",
+      "primary_error": "Refused: postallocation free/remaining/IO/comm/headroom guard",
+      "cleanup_errors": [],
+      "created": 456,
+      "free_attempts": 456,
+      "normal_close": true,
+      "bad_rank": 7,
+      "after_last_free": 99,
+      "reserve": 100
+    },
+    {
+      "case": "post_query_failure_cleanup",
+      "rejected": true,
+      "status": "FAIL",
+      "primary_error": "RuntimeError: FIRST injected post-allocation query failure",
+      "cleanup_errors": [],
+      "created": 912,
+      "free_attempts": 912,
+      "normal_close": true,
+      "bad_rank": 15,
+      "after_last_free": 108,
+      "reserve": 100
+    },
+    {
+      "case": "guard_primary_free_and_close_errors",
+      "rejected": true,
+      "status": "FAIL",
+      "primary_error": "Refused: postallocation free/remaining/IO/comm/headroom guard",
+      "cleanup_errors": [
+        "SECOND injected free failure",
+        "THIRD injected close failure"
+      ],
+      "created": 912,
+      "free_attempts": 912,
+      "normal_close": false,
+      "bad_rank": 15,
+      "after_last_free": 80,
+      "reserve": 100
+    },
+    {
+      "case": "query_primary_free_error",
+      "rejected": true,
+      "status": "FAIL",
+      "primary_error": "RuntimeError: FIRST injected post-allocation query failure",
+      "cleanup_errors": [
+        "SECOND injected free failure"
+      ],
+      "created": 912,
+      "free_attempts": 912,
+      "normal_close": true,
+      "bad_rank": 15,
+      "after_last_free": 108,
+      "reserve": 100
+    },
+    {
+      "case": "cleanup_only_reject",
+      "rejected": true,
+      "status": "FAIL",
+      "primary_error": null,
+      "cleanup_errors": [
+        "SECOND injected free failure"
+      ],
+      "created": 912,
+      "free_attempts": 912,
+      "normal_close": true,
+      "bad_rank": null,
+      "after_last_free": 100,
+      "reserve": 100
+    }
+  ],
+  "scope": "tiny Python integer fake only;57 resources of8bytes/rank;NO real tensor/device/allocator owner",
+  "actual_device_allocations": 0,
+  "tensor_payload_reads": 0,
+  "compute_dispatches": 0
+}

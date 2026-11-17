@@ -1,0 +1,122 @@
+{
+  "schema": 3,
+  "supported_execution_modes": [
+    "program"
+  ],
+  "params": [
+    {
+      "name": "sublayer",
+      "direction": "In",
+      "shape": [
+        -1,
+        5120
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "residual",
+      "direction": "In",
+      "shape": [
+        -1,
+        4,
+        5120
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "post_mix",
+      "direction": "In",
+      "shape": [
+        -1,
+        4
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "residual_mix",
+      "direction": "In",
+      "shape": [
+        -1,
+        4,
+        4
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "output",
+      "direction": "Out",
+      "shape": [
+        -1,
+        4,
+        5120
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    }
+  ],
+  "lowered_params": [
+    {
+      "name": "sublayer",
+      "direction": "In",
+      "shape": [
+        -1,
+        5120
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "residual",
+      "direction": "In",
+      "shape": [
+        -1,
+        4,
+        5120
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "post_mix",
+      "direction": "In",
+      "shape": [
+        -1,
+        4
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "residual_mix",
+      "direction": "In",
+      "shape": [
+        -1,
+        4,
+        4
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "output",
+      "direction": "Out",
+      "shape": [
+        -1,
+        4,
+        5120
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    }
+  ],
+  "num_return_types": 1,
+  "return_aliases": [
+    4
+  ],
+  "platform": "a2a3",
+  "backend_type": "Ascend910"
+}

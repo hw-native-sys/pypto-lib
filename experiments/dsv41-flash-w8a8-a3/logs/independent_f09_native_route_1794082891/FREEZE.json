@@ -1,0 +1,14 @@
+{
+  "state": "FINAL_PARK_SOURCE_REVIEW_WITH_FINDING",
+  "artifact_count": 16,
+  "artifacts_sha256": "ce7bf263dfc591ec98059f7b2b3b759fa5841e8ad07332d4236a71c9b3d3dc7d",
+  "source45_M02_sha256": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "source45_candidate_sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "Main12_sha256": "2a9e22d759f360062972eab81c5d5348860be6dba138201999374fbbe5d5b30c",
+  "CPU_tasks": 0,
+  "NPU_tasks": 0,
+  "source_only": true,
+  "actual16_ready": false,
+  "issue": "count validate role not bound to requested role",
+  "epoch": 1794083206
+}

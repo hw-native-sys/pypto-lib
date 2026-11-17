@@ -1,0 +1,16 @@
+{
+  "epoch": 1794074110.3696733,
+  "role": "review-agent",
+  "status": "FAILED_NATIVE_AUDITED",
+  "shared_writes": 0,
+  "root_imports": "once, owned by Root",
+  "native_task": "task_20261108_015136_337085225477",
+  "native_exit": 1,
+  "audit_task": "task_20261108_015341_33775953750",
+  "audit_passed": 18,
+  "audit_unmet": 0,
+  "report_sha256": "ab43929695303a7c0992db6c0c24b4a49ee8bfd086bfbd1f2b143bfff289b4fd",
+  "manifest_sha256": "31731a5902348a664cb4c07dcfa9374770334f73ee99b166c383c698d5ebf794",
+  "file_count": 194,
+  "remaining_tasks": []
+}

@@ -1,0 +1,10 @@
+{
+  "status": "FAILED",
+  "started_epoch": 1794075287.1841094,
+  "first_error": {
+    "type": "AssertionError",
+    "message": "",
+    "traceback": "Traceback (most recent call last):\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_hc_durable_receipts_1794075226/probe.py\", line 230, in native\n    execute_pair(device)\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_hc_durable_receipts_1794075226/probe.py\", line 199, in execute_pair\n    assert seen[0]['different_values'] > 0 and seen[0]['nonrepresentable_values'] > 0\nAssertionError\n"
+  },
+  "ended_epoch": 1794075299.0550976
+}

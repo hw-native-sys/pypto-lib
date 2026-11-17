@@ -1,0 +1,8 @@
+{
+  "baseline": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_shared_hc_generation_1794080478",
+  "baseline_manifest_sha256": "73055a54a2b6d6841898b7f4417c4aa7c8aa31ceab444ac43ee99967bcec3702",
+  "baseline_audit_sha256": "e3e566b1922c262b02dc96cc6c7b7ac2670427180c3e836cc1227264a49a0ba7",
+  "baseline_delta_sha256": "cc93659af09aab8a88ff56d4cf1e31466652513046f4d314e8b663ec5ea4081c",
+  "historical_case_status": "M02 nativequeue1/CLI0/outerFAIL183;4504passed5unmet strictNOT_ACCEPTED; not relabeled",
+  "delta_scope": "SourceB/plan/normal-signature767/helper16 and separate F09 evidence identity only; one-owner/history/stricttelemetry criteria retained"
+}

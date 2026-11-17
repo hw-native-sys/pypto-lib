@@ -1,0 +1,35 @@
+{
+  "provenance": {
+    "revision": "8fde6d4e335fe300e2b949aab0e31659cce0811d",
+    "archive_sha256": "48c797546805b04ffde118c506f8902e37e19bf2cb5d1713097056a4c93e998c",
+    "sources": {
+      "tests/e2e/nightly/single_node/ops/singlecard_ops/test_inplace_partial_rotary_mul.py": "078470b8443b8991f23f977c9e898c5263659f733aad1a8254ee9c9671953139",
+      "vllm_ascend/attention/dsa_v1.py": "698765a3662332ad108fd9ef128eb87fd313544cd887f5154f924a5915ee123a",
+      "vllm_ascend/device/device_op.py": "01ce13ea60e46f901ad69ad4c71e4be0e31cd69fbc56ebb7d898f957d5e54f67",
+      "vllm_ascend/attention/dsa_v41.py": "3505769857f83fa7e67f652984f50bd0478158f1d24f185cab091203e70392fd"
+    }
+  },
+  "cases": [
+    {
+      "tokens": 1,
+      "original_comparison": {
+        "ordinary": "EXACT",
+        "permanent_semantic": "EXACT"
+      }
+    },
+    {
+      "tokens": 7,
+      "original_comparison": {
+        "ordinary": "EXACT",
+        "permanent_semantic": "EXACT"
+      }
+    },
+    {
+      "tokens": 17,
+      "original_comparison": {
+        "ordinary": "EXACT",
+        "permanent_semantic": "EXACT"
+      }
+    }
+  ]
+}

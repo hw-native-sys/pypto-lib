@@ -1,0 +1,5 @@
+{
+  "exit": 1,
+  "stderr": "Traceback (most recent call last):\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/fit_probe_prepare_1794020737/fit_probe.py\", line 316, in <module>\n    main()\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/fit_probe_prepare_1794020737/fit_probe.py\", line 262, in main\n    calibration = authorize(args)\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/fit_probe_prepare_1794020737/fit_probe.py\", line 163, in authorize\n    raise Refused('default execution refused: later rootGO authorization and measured bounded calibration required')\n__main__.Refused: default execution refused: later rootGO authorization and measured bounded calibration required\n",
+  "scope": "actualCLIdefault refuses before runtime imports/prepare"
+}

@@ -1,0 +1,11 @@
+{
+  "start_epoch": 1794210811.8736835,
+  "role": "main-agent",
+  "initial_reading_before_this_record": "UNMETERED_NOT_BACKDATED",
+  "primary_topology": {
+    "tp": 4,
+    "dp": 4,
+    "ep": 16,
+    "world": 16
+  }
+}

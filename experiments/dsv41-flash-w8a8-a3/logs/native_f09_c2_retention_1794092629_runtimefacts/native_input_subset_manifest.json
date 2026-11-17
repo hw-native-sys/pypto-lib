@@ -1,0 +1,17 @@
+{
+  "artifact_after_prepare.json": "bed518802d89c389024f547714616501321d14b9a1456156e434d112eb539d30",
+  "artifact_before_prepare.json": "9bc76a8fa41b8c403837f9f38154026a9d346dc66dd050ebbad8710a3cec0be3",
+  "call0.actual.pt": "ebde6dc674ec9762a8c1c8eb311a3023c1b05cf94f613ef7337bf4c741858398",
+  "call0.initial.pt": "3be42107cca0be664c2aa0f9eee48cdb6889550c67b3683ba14594343ab01b8a",
+  "call0.json": "e69d4b0cf061678b2f6ff3de538861836b1ff0d022ec3ba9b908c85741811d09",
+  "call1.actual.pt": "1bbd201be955ca7d2f79324b6114a54831a065c11e4e875b029cd8b642e791fc",
+  "call1.initial.pt": "63febd76ba3f40c0113dbb74cf3793dae488d0aef230e3e720cd5edb0ebb374c",
+  "call1.json": "e12ab59ad459c7b10643442fedbd2b2b1550c1093c74eed60e4f842b666f7006",
+  "call2.actual.pt": "fe6d7327968b347071f003ac248bb544afa23d300d1980eb069438c40d8cc176",
+  "call2.initial.pt": "4168122be999818115ccf6e731e2c422dde9880cd8edcc179add1c6a7f0cb741",
+  "call2.json": "1838431ef58ff8767af5bcdf80424358a8ea8248807e07b832c831b736c18389",
+  "native_stage_terminal.json": "a324db4360aac3ae808548c083ef8a89617a6d1472e2327e5837a7c57ae7d462",
+  "owner_closed.json": "4742ab64f85ff2054465e1e891eac1ef72e4a6dfb90fe0d753937acd5981a977",
+  "public_memory.json": "78179bb553c9ed20cbd142fd4bac209cd3a3e477b9cdb765cc71be5ec4317227",
+  "static_recipe.json": "4e73e5d8e2a03cedb309f0a3bde16fb5d4a806c4b6ee5039f5c28a8034872e75"
+}

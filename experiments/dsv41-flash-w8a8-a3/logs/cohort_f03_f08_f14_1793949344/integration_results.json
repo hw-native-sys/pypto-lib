@@ -1,0 +1,15 @@
+{
+  "published_rows": {
+    "ordinary_whole_cache_dilutes_failure": true,
+    "strengthened_comparator_rejects": true,
+    "positive": true,
+    "detail": "\n    published source rows:     ratio_allclose fail: error_count=64/512 (ratio=12.5000%, allowed<=1.0000%, threshold=5 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=1 at (0, 448) (tol=0.035625)\n    first 10 mismatches:\n    [448] actual=0, expected=1, diff=1, tol=0.03562\n    [449] actual=0, expected=1, diff=1, tol=0.03562\n    [450] actual=0, expected=1, diff=1, tol=0.03562\n    [451] actual=0, expected=1, diff=1, tol=0.03562\n    [452] actual=0, expected=1, diff=1, tol=0.03562\n    [453] actual=0, expected=1, diff=1, tol=0.03562\n    [454] actual=0, expected=1, diff=1, tol=0.03562\n    [455] actual=0, expected=1, diff=1, tol=0.03562\n    [456] actual=0, expected=1, diff=1, tol=0.03562\n    [457] actual=0, expected=1, diff=1, tol=0.03562"
+  },
+  "staged_routing": {
+    "two_legal_tie_orders": true,
+    "biased_ties_with_distinct_unbiased_weights": true,
+    "biased_normalization_rejected": true,
+    "invalid_id_rejected": true,
+    "wrong_weights_rejected": true
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "schema": "Configurable-components-native-readiness/1",
+  "status": "PASS_BOUNDED_EP2TP1_AND_TP2EP4_COMPONENTS",
+  "fresh_EP_terminal_receipt": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_configurable_component_capture_1794113378_runtimefacts/terminal_receipt.json",
+  "fresh_EP_terminal_sha256": "38d9a93db23233921e638d2835e49b642ca3bb337f70303a5d8d5880121fe46a",
+  "fresh_EP_capsule_audit": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_configurable_component_capture_1794113378_runtimefacts/capsule_audit_result.json",
+  "fresh_EP_capsule_audit_sha256": "1da9ab534f24081eec87d0c0f599217578a47832f1573b73515a23062734ab00",
+  "fresh_EP_native_task": "task_20261108_125856_147560021682",
+  "fresh_EP_CPU_task": "task_20261108_130203_148823526489",
+  "TP_saved_receipt": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_configurable_capture_fix_1794113378/TP_SAVED_RECEIPT.json",
+  "TP_saved_receipt_sha256": "e48c69f6e2b97112cff252df3f7796935efe1f85c44b54c1efb765bfd54115cb",
+  "TP_native_task": "task_20261108_124231_143528315331",
+  "TP_saved_CPU_task": "task_20261108_125254_146155913183",
+  "source_dependency_pins_sha256": "42b3b07abb096d53415aa022592412b7bcd64fdc797e45e39f8af3282694b05c",
+  "new_capture_CPU_closure_proof_sha256": "86560f3a8ef4e2ba3b4632fed2a47ed18e937040e46f6acefd3620a11ea8be07",
+  "fullreal16_readiness": "Fit must independently recheck its exact conditional Root scope, actual source/config and outsidequeue0/all16idle; this receipt is component evidence only",
+  "fullreal_or_text_proven": false,
+  "no_more_jobs_from_owner": true,
+  "shared_writes": 0
+}

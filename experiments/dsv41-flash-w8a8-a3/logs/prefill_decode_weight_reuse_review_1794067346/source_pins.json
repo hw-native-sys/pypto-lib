@@ -1,0 +1,48 @@
+{
+  "inputs": {
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_applied_generation_1794052496/decode1_concrete_contract.json": {
+      "sha256": "2022c3d8be008e11f3120c6ab27ad0e6d5c325d73229131e0b8df648acce4616"
+    },
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_applied_generation_1794052496/prefill3_concrete_contract.json": {
+      "sha256": "8c58d1f9cbd1ce214a96cf51e2c79420b8cc119cb2f4073d2c6dad21eaa89d75"
+    },
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/real_fit_readiness_1794018846/static57.tsv": {
+      "sha256": "0617e6c64ee7111c5574cbf8df0d4ecf99542247ff903a28eefcde128402be75"
+    },
+    "/mnt/data/pyptouser/yangyaodong/code/pypto/docs/en/dev/06-persistent-l3.md": {
+      "copy": "source_snapshot/docs/en/dev/06-persistent-l3.md",
+      "sha256": "adcdf4a682fb81b23daca247ea91d6bf09b21b3e149dbee8b0c787b2a569fafc"
+    },
+    "/mnt/data/pyptouser/yangyaodong/code/pypto/docs/en/user/00-getting_started.md": {
+      "copy": "source_snapshot/docs/en/user/00-getting_started.md",
+      "sha256": "ce6ac9e14d4749d90bbf35fe5e9b1cf2e7cdd5ae7c28b27a00ac835d1db206be"
+    },
+    "/mnt/data/pyptouser/yangyaodong/code/pypto/docs/en/user/distributed/03-execution.md": {
+      "copy": "source_snapshot/docs/en/user/distributed/03-execution.md",
+      "sha256": "09310b79bc81bc946a15b62fd29df565be4c3f565b51e3d0aa8ad032a6f50eec"
+    },
+    "/mnt/data/pyptouser/yangyaodong/code/pypto/examples/runtime/multi_program_kv_cache.py": {
+      "copy": "source_snapshot/examples/runtime/multi_program_kv_cache.py",
+      "sha256": "5bcd1f88d8514294ba208547a7228dd224868c3d2bfef2796d2c421e61770324"
+    },
+    "/mnt/data/pyptouser/yangyaodong/code/pypto/python/pypto/ir/distributed_compiled_program.py": {
+      "copy": "source_snapshot/python/pypto/ir/distributed_compiled_program.py",
+      "sha256": "b523ea389350c9d1f9880a101ec66ceb36d2a8202a5fb1976a77be3310444e2a"
+    },
+    "/mnt/data/pyptouser/yangyaodong/code/pypto/python/pypto/runtime/device_tensor.py": {
+      "copy": "source_snapshot/python/pypto/runtime/device_tensor.py",
+      "sha256": "72dc6701eca6dc10a2155773b35a37dee1551c89a89ecf08a8c244571395e8e3"
+    },
+    "/mnt/data/pyptouser/yangyaodong/code/pypto/python/pypto/runtime/distributed_runner.py": {
+      "copy": "source_snapshot/python/pypto/runtime/distributed_runner.py",
+      "sha256": "ca496829a240c81df3c29e77d8ef696bd1e2a7b0f31b9d5c2dcb3b3d82923148"
+    },
+    "/mnt/data/pyptouser/yangyaodong/code/pypto/python/pypto/runtime/runtime_base.py": {
+      "copy": "source_snapshot/python/pypto/runtime/runtime_base.py",
+      "sha256": "81a319a9e412d5a618de343c5c54103aa14fb2ec2613a6455e3592b797662704"
+    }
+  },
+  "product_source45": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "pypto_head": "38a8aa6da24c62bf0c6f6f9ef94deb513fbb4d2e",
+  "runtime_gitlink": "160000 commit 31f9e72ee6832cd198b77df18c1c305e7fd83676\truntime"
+}

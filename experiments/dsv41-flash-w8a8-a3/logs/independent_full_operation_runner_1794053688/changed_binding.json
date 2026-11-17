@@ -1,0 +1,36 @@
+{
+  "schema": "full-real-operation-binding/1",
+  "operation": "first-full-real40-noEngram-greedy-N3",
+  "source_manifest": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/generation_admission_apply_1794052225/source45.json",
+  "source_manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "metadata_plan": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/full_real_generation_prepare_1794048884/metadata_plan.json",
+  "checkpoint": "/mnt/data/models/DeepSeek-V4.1-Flash-w8a8",
+  "model_root": "/mnt/data/models/DeepSeek-V4.1-Flash-w8a8",
+  "device_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "weight_map": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/weight_map.json",
+  "weight_map_sha256": "51c154211e0fc558ef88c8d099e9fdde515f6fc936ae628297a216664298a82c",
+  "calibration": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_empty_calibration_1794040381/actual/calibration.json",
+  "prerequisites": {
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_empty_calibration_1794040381/actual/calibration.json": "3bc7291e174cccc8a8f0272d9786716a78bccb2ae8336c33fdfd4e10a16927f0",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_empty_reservation_1794041910/actual/probe.json": "c4b62d80662c62058f4ba4a237e606e745b07d8506eb45c0e9ccb098aeec953e",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_real_transfer_1794047567/actual/result.json": "2d0a4bd282bdb24a7620e36bd2c9a45ee46005893d5ff9363fca30047cf8b4ee"
+  },
+  "limits": "identity preparation only; NO actual grant/NPU/full tensor payload in this unit"
+}

@@ -1,0 +1,14 @@
+{
+  "state": "FINAL_PARK_SOURCE_REVIEW_WITH_FINDING",
+  "end_epoch": 1794083206,
+  "Main12_and_copied_inputs_unchanged": true,
+  "live_M02_45_unchanged": true,
+  "unapplied_405_45_unchanged": true,
+  "CPU_tasks": 0,
+  "NPU_tasks": 0,
+  "tensor_payload_bytes": 0,
+  "grants_created": 0,
+  "source_only_role_binding_finding": true,
+  "lifecycle_micro_acceptance": "PENDING_SEPARATELY_OWNED",
+  "test_verdict": "NOT_RUN_ROOT_MICRO_AUDIT_WINDOW"
+}

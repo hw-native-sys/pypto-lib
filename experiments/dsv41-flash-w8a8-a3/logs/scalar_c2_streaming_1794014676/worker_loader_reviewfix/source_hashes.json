@@ -1,0 +1,12 @@
+{
+  "sources": {
+    "models/deepseek_v4_1_flash_a3_w8a8/weight_loader.py": "70244d047e4705dfe5f7101c5dc046b6f66d146027241524bb4d494823fcfe5f"
+  },
+  "before_review_source_sha256": "219fab14e3d6ec3b66d4bc87c57b9926621a8c5c361dbe38e7f10be8c68dc763",
+  "frozen_prior_manifest_verified": "4c521253f20f29d27057d9919e093de7393e0c5d15ad6f632305afddc6aaf286",
+  "final_task": "task_20261107_100322_126563330433",
+  "coverage": {
+    "decode": 57,
+    "prefill": 57
+  }
+}

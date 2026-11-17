@@ -1,0 +1,12 @@
+{
+  "pass": true,
+  "host_semantics_capture_byte_checks": true,
+  "fresh_full_compile_seconds": 45.014118909835815,
+  "source45": "8153c7f040bef51900a6e6c9ff27b018279b7503f31d50ec5488457e49770b28",
+  "full_metadata_sha256": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770",
+  "full_ABI_same_old8ba": true,
+  "count_recompiled": false,
+  "prepare": false,
+  "NPU": false,
+  "largefixture_or_fullreference_or_weights": false
+}

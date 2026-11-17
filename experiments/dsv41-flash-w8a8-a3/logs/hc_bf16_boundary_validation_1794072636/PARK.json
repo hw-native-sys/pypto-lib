@@ -1,0 +1,13 @@
+{
+  "epoch": 1794072889.995651,
+  "role": "review-agent",
+  "state": "PARKED",
+  "shared_writes": 0,
+  "root_imports": "once, owned by Root",
+  "report_sha256": "4f9f2a53322a8254db9b54ceda32d5815684cf21aa9ec0d74312775034627e89",
+  "manifest_sha256": "7546c8fa98d4a5c09313b35e8b612de106d276b5aae1ec8f1e16454136e54093",
+  "files": 159,
+  "native_submitted": false,
+  "scope": "independent CPU and signature compile PASS; native PREPARATION ONLY",
+  "outstanding_tasks": []
+}

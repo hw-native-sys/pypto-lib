@@ -1,0 +1,182 @@
+{
+  "status": "PASS_INDEPENDENT_METADATA_AUDIT",
+  "checks": [
+    {
+      "check": "same-native-queue-COMPLETE0",
+      "pass": true,
+      "detail": "completed (exit=0)\n"
+    },
+    {
+      "check": "native-numeric-and-normal-close",
+      "pass": true,
+      "detail": {
+        "status": "PASS_TINY_ACTUAL_CLASS_WITH_DECLARED_TOY_ADMISSION",
+        "first": null,
+        "cleanup": null
+      }
+    },
+    {
+      "check": "exact-new-Root-tiny-only-scope",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "actual-ordered-two-mapping",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "grant-created-after-allocation-entryTTL",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "exact-auth-byte-source-binding",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "frozen-corrected-prep39-unchanged",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "native-dependency-code-identity",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "task-entry-and-runtime-pins",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "installed-runtime-source-library-unchanged",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "all45-current-CC-source-unchanged",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "actual-pinned-TMR-library-contract",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "actual-normalized-ONBOARD-four-GiB-config",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "both-actual-allocated-a2a3-TMR-programs",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "all-native-generated-artifact-bytes",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "all-elements-positive-actual-state-continuation-6-12-19-27",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "honest-positive-and-extra-negative-call-counts",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "legal-wrong-C1-NUMERICAL-reject-11-not12",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "same-actual-worker-and-selected-p-d-d-d-plus-negative",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "every-actual-call-public-normalized-config",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "one-canonical-static-initialization",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "zero-decode-static-read-copy-allocation",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "four-canonical-bases-free-once",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "durable-canonical-versus-borrowed-coverage",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "all-four-full-byte-same-address-views",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "both-C1-singleton-insert-views",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "actual-public-preweight-dispatch-and-free-memory-boundaries",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "positive-live-public-HBM-floors",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "baseline_capacity-actual-resource-floors",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "after_close_capacity-actual-resource-floors",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "all-recorded-own-process-births-absent",
+      "pass": true,
+      "detail": []
+    },
+    {
+      "check": "raw-actual-two-lock-release",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "fresh-queue0-no-running-or-pending",
+      "pass": true,
+      "detail": null
+    }
+  ],
+  "passed": 33,
+  "failed": [],
+  "result_sha256": "d0ba5c332464f84bc9bb9b21d185c851487568edcea7c188efaf9c197fd3c3c0",
+  "recorded_identity_count": 4,
+  "native_task": "task_20261108_013957_334252213408",
+  "scope": "tiny actual-class plus explicit toy admission/schema only; no fullmodel/realweights/HC/F09 proof",
+  "own_pid": 3348303,
+  "own_starttick": "107322840"
+}

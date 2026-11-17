@@ -1,0 +1,41 @@
+{
+  "source": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_shared_hc_real_generation_1794077720/actual/telemetry_errors.jsonl",
+  "captured_epoch": 1794078707.718415,
+  "scope": "first3 complete rawJSONL lines only; active append-only file NOT frozen or changed",
+  "prefix_sha256": "47bc32910737c32905671042caadceea49de54514038afd9b4ba64364c2571c6",
+  "lines": [
+    {
+      "epoch": 1794078254.505134,
+      "pid": 3565647,
+      "start_ticks": "107817320",
+      "operation": "read-smaps-rollup",
+      "path": "/proc/3565647/smaps_rollup",
+      "errno": 3,
+      "exception_type": "ProcessLookupError",
+      "error": "ProcessLookupError(3, 'No such process')",
+      "critical": false
+    },
+    {
+      "epoch": 1794078256.5326424,
+      "pid": 3565647,
+      "start_ticks": "107817320",
+      "operation": "read-smaps-rollup",
+      "path": "/proc/3565647/smaps_rollup",
+      "errno": 3,
+      "exception_type": "ProcessLookupError",
+      "error": "ProcessLookupError(3, 'No such process')",
+      "critical": false
+    },
+    {
+      "epoch": 1794078258.5511801,
+      "pid": 3565647,
+      "start_ticks": "107817320",
+      "operation": "read-smaps-rollup",
+      "path": "/proc/3565647/smaps_rollup",
+      "errno": 3,
+      "exception_type": "ProcessLookupError",
+      "error": "ProcessLookupError(3, 'No such process')",
+      "critical": false
+    }
+  ]
+}

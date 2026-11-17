@@ -1,0 +1,55 @@
+{
+  "started_epoch": 1794079145.4679005,
+  "command": [
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+    "-c",
+    "import time; time.sleep(0.12)"
+  ],
+  "CLI_returncode": 0,
+  "launch_error": null,
+  "postcheck_error": null,
+  "observation_errors": [],
+  "wait_errors": [],
+  "CLI_terminal": true,
+  "postcheck_skipped_reason": null,
+  "CLI_pid": 175310,
+  "CLI_identity": {
+    "pid": 175310,
+    "start_ticks": "107906741",
+    "state": "R",
+    "parent_pid": 175169
+  },
+  "postcheck": {
+    "status": "OWNED_POST_ONLY"
+  },
+  "ended_epoch": 1794079145.657161,
+  "monitor_errors": [],
+  "monitor_thread_alive": false,
+  "telemetry_errors": [],
+  "critical_telemetry_errors": [],
+  "full_own_tree_memory_measurement_complete": true,
+  "live_own_tree_observation_complete": true,
+  "confirmed_exits": [],
+  "confirmed_exit_receipt_errors": [],
+  "telemetry_status": "COMPLETE",
+  "known_process_identities": [
+    [
+      175169,
+      "107906721"
+    ],
+    [
+      175310,
+      "107906741"
+    ]
+  ],
+  "sample_count": 3,
+  "peak_sampled_own_tree_pss": 15681536,
+  "peak_sampled_own_tree_uss": 13770752,
+  "max_complete_sample_pss": 15681536,
+  "max_complete_sample_uss": 13770752,
+  "peak_known_partial_own_tree_pss": 15681536,
+  "peak_known_partial_own_tree_uss": 13770752,
+  "status": "CLI_SUCCESS_POSTCHECK_PASS_PENDING_EXTERNAL_AUDIT",
+  "proposed_future_classification": null,
+  "telemetry_policy": "FUTURE_CANDIDATE_STRICT_UNKNOWN_LIVE_FAIL; only recorded-birth confirmed exit after complete child inventory retires from live sample; Root+independent approval required"
+}

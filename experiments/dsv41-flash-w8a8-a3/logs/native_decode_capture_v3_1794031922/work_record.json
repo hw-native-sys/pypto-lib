@@ -1,0 +1,13 @@
+{
+  "id": "review-decode-chain-1794031922-1794035732",
+  "start_epoch": 1794031922,
+  "end_epoch": 1794035732,
+  "duration_seconds": 3810,
+  "agent": "review-agent",
+  "category": "native-and-offline-validate",
+  "state": "FINAL_PARK",
+  "native_task": "task_20261107_142329_327923712677",
+  "CPU_task": "task_20261107_143821_334854715135",
+  "original_positive_gates": 57,
+  "negative_control": "original correct129 published WINDOW+C2 numerical rejection"
+}

@@ -1,0 +1,118 @@
+{
+  "source_count": 45,
+  "changed": [
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_fwd.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/generate.py"
+  ],
+  "source_manifest_sha256": "1e9496bfdeb177c13f00a2c813a3ecde3242b5bbb622ae44c5a1b5a14377ae43",
+  "native_runs_allocated_this_unit": 0,
+  "native_repair_validation": "OPEN",
+  "residency_native_reuse_and_peak": "OPEN",
+  "continuation_native": "NOT RUN",
+  "full_weights": "HELD: host-materialization-overlap",
+  "independent_acceptance": "PENDING",
+  "blocker": "All16 shared devices occupied; owned native jobs cancelled after queue waits before allocation",
+  "source_scope": {
+    "annotation_changes": [
+      "compressed_cache_c1a",
+      "compressed_cache_c2a",
+      "index_cache_c1a",
+      "index_cache_c2a",
+      "pool_block_counts",
+      "pool_block_ids",
+      "state_cache_c2a",
+      "topk_indices",
+      "topk_values",
+      "window_cache"
+    ],
+    "rank_computation_unchanged": true,
+    "unchanged_functions_including_owning_goldens": [
+      "_c2a_slot",
+      "_device_outputs",
+      "_entry_specs",
+      "_final_head",
+      "_group_outputs",
+      "_index_slot",
+      "_layer_expert_weight",
+      "_layer_family",
+      "_layer_reference_dict",
+      "_layer_weight",
+      "_rank_repeat",
+      "_rope_tables",
+      "_run_composed_golden",
+      "_run_fwd",
+      "_seed_embed",
+      "_source_arguments",
+      "_source_weight",
+      "_stack_source",
+      "build_fwd_specs",
+      "check_weight_contract",
+      "decode_decoder",
+      "decode_encoder",
+      "decode_fwd",
+      "main",
+      "prepare_fwd_weights"
+    ],
+    "only_new_function": [
+      "compare_published_fwd_cache"
+    ],
+    "comparator_change": "same-threshold additional published-row check",
+    "original_archive_member": "vllm-ascend-8fde6d4e335fe300e2b949aab0e31659cce0811d/vllm_ascend/ops/triton/compressor/compressor_triton.py",
+    "original_sha256": "1c26f996fa91bcd3ae497e1ae33e88a2e0bf38c2e734f8af85baee06492a87ee"
+  },
+  "generated_directions": {
+    "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/decode_publication_residency_1793979114/main/final_cpu_build/_jit_decode_fwd_20261107_005152_o41i7fgq",
+    "mode": "ONBOARD",
+    "platform": "a2a3",
+    "mutations": [
+      "window_cache",
+      "compressed_cache_c2a",
+      "index_cache_c2a",
+      "state_cache_c2a",
+      "compressed_cache_c1a",
+      "index_cache_c1a",
+      "topk_indices",
+      "topk_values",
+      "pool_block_ids",
+      "pool_block_counts"
+    ],
+    "inout_bindings": [
+      "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v4\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 3)",
+      "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v5\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 4)",
+      "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v79\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 79)",
+      "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v80\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 80)",
+      "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v81\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 81)",
+      "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v82\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 82)",
+      "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v83\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 83)",
+      "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v84\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 84)",
+      "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v85\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 85)",
+      "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v86\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 86)",
+      "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v87\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 87)",
+      "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v88\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 88)"
+    ]
+  },
+  "original_state": {
+    "original_sha256": "1c26f996fa91bcd3ae497e1ae33e88a2e0bf38c2e734f8af85baee06492a87ee",
+    "states": [
+      {
+        "position": 1250,
+        "slot": 0,
+        "original_and_own_state_exact": true,
+        "zero_return_would_mismatch": 8
+      },
+      {
+        "position": 1251,
+        "slot": 1,
+        "original_and_own_state_exact": true,
+        "zero_return_would_mismatch": 8
+      }
+    ],
+    "independent_counts": {
+      "c2_visible_rows": 625,
+      "c2_blocks": 79,
+      "c1_visible_rows": 1251,
+      "c1_blocks": 157,
+      "candidate_cap": 2048
+    }
+  }
+}

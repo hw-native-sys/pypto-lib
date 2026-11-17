@@ -1,0 +1,9 @@
+{
+  "task": "task_20261108_055723_166107514759",
+  "stage": "own_static_count_assertion_before_any_compile",
+  "error": "expected20 but exactstaticlist18",
+  "corrected": 18,
+  "probes_changed_by_failure": false,
+  "compiler_attempted": false,
+  "native": false
+}

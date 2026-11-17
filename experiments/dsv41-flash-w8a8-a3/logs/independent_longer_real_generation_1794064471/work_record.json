@@ -1,0 +1,27 @@
+{
+  "active_intervals": [
+    {
+      "elapsed_seconds": 2875,
+      "end_epoch": 1794067346,
+      "start_epoch": 1794064471
+    },
+    {
+      "elapsed_seconds": 270,
+      "end_epoch": 1794069045,
+      "start_epoch": 1794068775
+    }
+  ],
+  "agent": "review-agent",
+  "elapsed_seconds_excluding_reuse": 3145,
+  "excluded_reuse_interval": {
+    "end_epoch": 1794068775,
+    "postcase_audit_not_run_yet": true,
+    "separately_accounted_reuse_work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/prefill_decode_weight_reuse_review_1794067346/work_record.json",
+    "start_epoch": 1794067346
+  },
+  "id": "independent-longer-post-audit-1794064471-1794069045",
+  "includes_case_wait": true,
+  "own_CPU_audit_tasks": 1,
+  "own_NPU_jobs": 0,
+  "state": "FINAL_PARK"
+}

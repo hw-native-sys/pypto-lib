@@ -1,0 +1,16 @@
+{
+  "checkpoint_manifest_sha256": "5068b88abc40e58cb55ee65b7b7b349deed0642ebffa0e7211cceca3d05d51d6",
+  "evidence_mode": "toy-only-prototype",
+  "all_outputs_pass": true,
+  "output_names": [
+    "slice"
+  ],
+  "scope": "CPU MOCK ONLY",
+  "validated_scopes": {
+    "unconditioned": true,
+    "staged": true
+  },
+  "phase": "prefix",
+  "unconditioned_logit_max_abs": null,
+  "native_resume_authorized": false
+}

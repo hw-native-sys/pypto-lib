@@ -1,0 +1,31 @@
+{
+  "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_publication_1794013132/cpu/build_output/_jit_decode_fwd_20261107_090150_8dzl65va",
+  "mode": "ONBOARD",
+  "platform": "a2a3",
+  "mutations": [
+    "window_cache",
+    "compressed_cache_c2a",
+    "index_cache_c2a",
+    "state_cache_c2a",
+    "compressed_cache_c1a",
+    "index_cache_c1a",
+    "topk_indices",
+    "topk_values",
+    "pool_block_ids",
+    "pool_block_counts"
+  ],
+  "inout_bindings": [
+    "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v4\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 3)",
+    "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v5\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 4)",
+    "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v79\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 79)",
+    "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v80\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 80)",
+    "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v81\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 81)",
+    "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v82\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 82)",
+    "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v83\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 83)",
+    "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v84\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 84)",
+    "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v85\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 85)",
+    "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v86\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 86)",
+    "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v87\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 87)",
+    "add_chip_tensor_arg(_ta_0, orch._worker, tensors[\"t__tmp_v88\"], TensorArgType.INOUT, callables, \"decode_fwd_rank\", 88)"
+  ]
+}

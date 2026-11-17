@@ -1,0 +1,113 @@
+{
+  "disposition": "PASS_TARGETED_V3_PREFLIGHT_AND_ACTUAL_CPU_SYNTHETIC_STATIC_PLAN_ONLY",
+  "state": "FINAL_PARK",
+  "scope": {
+    "NPU": 0,
+    "actual_model_forward_reference_passes": 0,
+    "real_checkpoint_tensor_reads": 0,
+    "global_static_tensor_checkpoints": 0,
+    "synthetic_expert_layers": 1
+  },
+  "targeted_small_preflight": "PASS; heavy golden bodies CPU_MOCKED",
+  "static_plan": {
+    "status": "PASS_ACTUAL_CPU_SYNTHETIC_STATIC_PLAN_ONLY",
+    "canonical_pipeline_sha256": "814d7e43cadc0c1f4eb80140f29b92f0275c9fd0c86bc9664f988c6e6d683ea5",
+    "canonical_store_sha256": "07d23973b94d4b8b22ec124b63945f4a6842e77996267e6da7f226f066557faa",
+    "static_plan_sha256": "dbca1fb4dd503b7d8b38e54bae4782c6e38f496bd405dd4637376ebd06487735",
+    "source_manifest_sha256": "ab1ced6d6ecbf9887297458703ba9b74e2c9b8bc57608370b4c2e0310e027e37",
+    "57_static_seed_reproduction": true,
+    "prefix_decode_static_same_content": true,
+    "C1_singleton_is_view": true,
+    "simultaneous_fixture_count": 2,
+    "fixture_expert_layers": 1,
+    "static_global_logical_bytes": 103422065664,
+    "static_perrank_logical_bytes": 6463879104,
+    "no_static_tensor_checkpoint_saved": true,
+    "forbidden_operation_calls": [],
+    "native_prepares": 0,
+    "real_checkpoint_reader_calls": 0,
+    "NPU": 0,
+    "CPU_forward_reference_passes": 0,
+    "duration_seconds": 500.0403019799851,
+    "original_sources_and_V3_unchanged": true,
+    "claim_limits": "synthetic statics only; not native prefix, numerical forward, chain, fullweight fit or text"
+  },
+  "memory": {
+    "sampler": "own PID/descendants smaps_rollup; summed PSS/USS only, per-PID RSS; no global RSS sum",
+    "sample_count": 252,
+    "own_tree_peak_pss_bytes": 241637581824,
+    "own_tree_peak_uss_bytes": 241637396480,
+    "own_pid_peak_rss_bytes": 241639567360,
+    "minimum_host_available_bytes": 1480336945152,
+    "minimum_disk_available_bytes": 9545979002880,
+    "minimum_shm_available_bytes": 1079343157248,
+    "maximum_shm_used_bytes": 557056,
+    "parent_pid": 122212,
+    "all_observed_own_pids": [
+      122212
+    ],
+    "events": [
+      {
+        "event": "actual_META_pass_before_fixture",
+        "time": 1794026746.9359915,
+        "geometry": {
+          "prefix": {
+            "static_arguments": 57,
+            "expert_layers": 1,
+            "static_bytes_per_rank": 6463879104,
+            "nonstatic_tensor_bytes": 7609876736,
+            "largest_static_host_argument_bytes": 13421772800
+          },
+          "decode": {
+            "static_arguments": 57,
+            "expert_layers": 1,
+            "static_bytes_per_rank": 6463879104,
+            "nonstatic_tensor_bytes": 247111680,
+            "largest_static_host_argument_bytes": 13421772800
+          }
+        }
+      },
+      {
+        "event": "prefix_decode_same_static_bytes_with_C1_singleton_views",
+        "count": 57,
+        "time": 1794027124.9965339
+      }
+    ],
+    "limits": "2s sampled peaks, not exact allocation high-water; shared system free can change due other users"
+  },
+  "final_checks": {
+    "root45_and_V3_sources_and630_artifacts_unchanged": true,
+    "owned_sealed630_unchanged": true,
+    "exact_s32_evaluator_unchanged": true,
+    "actual_static_plan_sha256": "dbca1fb4dd503b7d8b38e54bae4782c6e38f496bd405dd4637376ebd06487735",
+    "actual_cpu_worker_and_wrapper_pids_present": {
+      "122212": false,
+      "121971": false
+    },
+    "post_job_host_available_bytes": 1722411900928,
+    "post_job_shm_used_bytes": 557056,
+    "post_job_disk_available_bytes": 9545979002880,
+    "native_jobs": 0,
+    "no_static_tensor_payload_files": true,
+    "time": 1794027335
+  },
+  "tasks": {
+    "task_20261107_124125_110820574": "completed (exit=0)",
+    "task_20261107_124249_1141519438": "completed (exit=0)",
+    "task_20261107_124406_11847511384": "completed (exit=0)",
+    "task_20261107_124539_1218943453": "completed (exit=0)",
+    "task_20261107_125530_1542426971": "completed (exit=0)"
+  },
+  "limits": [
+    "no native capture",
+    "no actual prefix17 numerical receipt",
+    "no returned-state chain/control acceptance",
+    "no fullweight fit/text",
+    "two-fixture validation memory is not production streaming residency"
+  ],
+  "mutable_contract_count_erratum": {
+    "prefix": 16,
+    "decode": 12,
+    "frozen_documentation_18_count_only": true
+  }
+}

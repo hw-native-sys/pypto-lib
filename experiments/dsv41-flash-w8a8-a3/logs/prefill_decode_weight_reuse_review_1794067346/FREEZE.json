@@ -1,0 +1,10 @@
+{
+  "REPORT_sha256": "acd3ffcf20f3ff48cff236ab81a8196cbb0d9f398fa8a521b4f5b8c72752e619",
+  "artifacts_count": 19,
+  "artifacts_sha256": "60b4a583803a9df34ee872decab725a9dbab9255478d643103fcb7e9848667f5",
+  "epoch": 1794068775,
+  "future_authorization_required": true,
+  "native_scope": "NONE",
+  "source45": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "state": "FINAL_PARK"
+}

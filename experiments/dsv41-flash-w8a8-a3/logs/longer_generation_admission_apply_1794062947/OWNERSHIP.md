@@ -1,0 +1,1 @@
+Main exclusive NEW artifact dir plus ONLY productgenerate.py EXACTreviewed41linec825 patch to41651. Other44/alloldsealed immutable. Recoveryoverlays MODULES/INTERFACE/HANDOFF and lockedMainledgers perRootGO. ONEtinyappliedCPU only; no header/Golden/signaturecompile/NPU/payload/fixture/actualgrant. Firstacceptedshort[3,1]/oneDecode distinguishedfromfuture15callsuntested.

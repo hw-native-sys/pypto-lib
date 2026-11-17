@@ -1,0 +1,27 @@
+{
+  "record_id": "worker-configurable-weight-loader-1794108310",
+  "role": "worker-agent",
+  "start_epoch": 1794108310.7173681,
+  "end_epoch": 1794108564.4361053,
+  "measured_wall_seconds": 253.71873712539673,
+  "owned_files": [
+    "models/deepseek_v4_1_flash_a3_w8a8/weight_map.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/weight_loader.py"
+  ],
+  "CPU_tasks": [
+    {
+      "id": "task_20261108_112658_12111105507",
+      "exit": 0
+    },
+    {
+      "id": "task_20261108_112819_122227522312",
+      "exit": 0
+    }
+  ],
+  "checkpoint_header_payload_bytes": 0,
+  "signature_compiles": 0,
+  "NPU": 0,
+  "shared_ledger_writes": 0,
+  "all_jobs_terminal": true,
+  "status": "FINAL_PARK"
+}

@@ -1,0 +1,94 @@
+{
+  "status": "PASS_BOUNDED_HOST_FUNCTIONS_ONLY",
+  "checks": [
+    {
+      "name": "requested_old_control",
+      "pass": true,
+      "actual": 192,
+      "expected": 96,
+      "CPU_MOCK_SCOPE": true
+    },
+    {
+      "name": "wrong_role_at_0",
+      "rejected": true,
+      "error": "captured count role differs from REQUESTED role"
+    },
+    {
+      "name": "wrong_role_at_1",
+      "rejected": true,
+      "error": "captured count role differs from REQUESTED role"
+    },
+    {
+      "name": "wrong_role_at_2",
+      "rejected": true,
+      "error": "captured count role differs from REQUESTED role"
+    },
+    {
+      "name": "wrong_profile",
+      "rejected": true,
+      "error": "count requested-role/source/phase/compiled profile binding changed"
+    },
+    {
+      "name": "wrong_source",
+      "rejected": true,
+      "error": "count requested-role/source/phase/compiled profile binding changed"
+    },
+    {
+      "name": "static_return",
+      "pass": true,
+      "first_error_preserved": false
+    },
+    {
+      "name": "static_raise",
+      "pass": true,
+      "first_error_preserved": true
+    },
+    {
+      "name": "initial_raise",
+      "pass": true,
+      "first_error_preserved": true
+    },
+    {
+      "name": "three_call_oracle_vs_earlier_candidate_poison",
+      "pass": true,
+      "toy_not_original_model_math": true,
+      "six_caches_four_selection_families": true
+    },
+    {
+      "name": "exact_new_wrapper_predicate",
+      "pass": true,
+      "controlled_in_memory_only": true
+    },
+    {
+      "name": "old_adapter_wrapper",
+      "rejected": true,
+      "error": "not an accepted actual lifecycle proof for this exact helper"
+    },
+    {
+      "name": "missing_wrapper",
+      "rejected": true,
+      "error": "PENDING: Root-accepted actual public-prepare lifecycle microproof required"
+    },
+    {
+      "name": "default_no_execute",
+      "rejected": true,
+      "error": "DEFAULT_REFUSE: no actual scope was granted by this preparation"
+    },
+    {
+      "name": "resource_dtype_shape_and_18P_plan",
+      "pass": true,
+      "bytes": 259763565440,
+      "not_measured_peak": true
+    }
+  ],
+  "check_count": 15,
+  "PID": 1475706,
+  "task_id": null,
+  "CPU_MOCKS": [
+    "count authorization resource checks",
+    "public prepared image verification",
+    "wrapper JSON in-memory only"
+  ],
+  "real_grants_created": 0,
+  "fixture_or_original_model_ref_or_NPU": false
+}

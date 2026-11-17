@@ -1,0 +1,15 @@
+{
+  "status": "FINAL/PARK",
+  "epoch": 1794064250,
+  "artifact_count": 31,
+  "artifacts_sha256": "0f6bea62302e2a6e52cf5199439f553ae670e6495fd28440e853e77045d5a732",
+  "results_sha256": "69ed05d5376b988bd8ff74d7a82561703d87071d8d5d12cac1df476a439f05f1",
+  "closure_sha256": "0ea312b60a96b63e2f4acbdbb5e6d27598658fa92daa6aad312485cc4f4a0607",
+  "source45_sha256": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "CPU_task": "task_20261107_230711_34875926974",
+  "all_own_jobs_terminal": true,
+  "own_NPU_jobs": 0,
+  "actual_grants_created": 0,
+  "real_payload_reads": 0,
+  "operational_mutable_files": []
+}

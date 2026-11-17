@@ -1,0 +1,20 @@
+{
+  "epoch": 1794045240,
+  "status": "PARKED artifact+metadata+CPU ready; independent review/actual RootGO pending",
+  "product_manifest_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "product45_unchanged": true,
+  "old31_post48_empty478_unchanged": true,
+  "transport_sha256": "5e364da73ac36d59bce09f92dc4efb8501e900175fc91afc08f91cf0da9dfbb5",
+  "plan_sha256": "6172ee8e67687d176a2ed3e4441c7d2d858ac0e5a5271e3600648721aafda28e",
+  "sources_sha256": "9cbd983d87905aa80a9cd899424228ba9474bd28167a9d80f9c70a8c9e49b8e8",
+  "artifacts_sha256": "cb07b6a92a1b4f509068a8308f48a0d29960c6d8175572a18d7d1cb50283d723",
+  "artifact_files": 46,
+  "all_4_CPU_jobs_terminal0": true,
+  "workers": 0,
+  "real_checkpoint_tensor_reads": 0,
+  "NPU": 0,
+  "real_large_allocations": 0,
+  "forward_calls": 0,
+  "actual_payload_authorization_supplied": false,
+  "work_record": "main-transfer-prepare-1794042741-1794045240"
+}

@@ -1,0 +1,10 @@
+{
+  "scope": "Worker-exclusive weight_loader.py only; other writers remain active.",
+  "sources": {
+    "models/deepseek_v4_1_flash_a3_w8a8/weight_loader.py": "219fab14e3d6ec3b66d4bc87c57b9926621a8c5c361dbe38e7f10be8c68dc763"
+  },
+  "before_source_sha256": "f05950fb2c1fdd0e524c04b6e20c177d157f3946ad10d7511b90d224fa794c48",
+  "final_validation_task": "task_20261107_093733_94784622146",
+  "native_tests": false,
+  "real_payload_reads": 0
+}

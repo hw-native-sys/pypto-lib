@@ -1,0 +1,16 @@
+{
+  "status": "FINAL_PARK_APPLIED_PENDING_INDEPENDENT_CHECK",
+  "files": 33,
+  "manifest_sha256": "8ef49e7ac94161285e1dbadd3c6435c95220de11e113c80ee6fbea24f5da8c79",
+  "actual_source45": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+  "actual_generate": "5de1656a99e85699138879b2f577f4eed2639779937a7cdc91ae843fcef6e34c",
+  "metadata_plan": "cd8b17741688eeb9ef39d8c0925dbb74a8f9a1cfcc0052db2e0a8c1aacb48cf7",
+  "metadata_binding": "534266dd8bf0e40cb49418eb4ffbb72a3bef9f2d0d01f1c41a81818ef22d3a0c",
+  "resource_projection": "e13c5fd6d98de327a24427b5efc0a9be4e9c30a89e757ac6c377e73b6ffc10ff",
+  "metadata_writer_task": "task_20261108_082840_310517212116",
+  "metadata_writer_exit": 0,
+  "Main_tests_compile_NPU": false,
+  "own_jobs": 0,
+  "writers": 0,
+  "independent_applied_checks_fresh_E40pair": "PENDING"
+}

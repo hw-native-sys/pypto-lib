@@ -1,0 +1,11 @@
+[
+  {
+    "id": "f14_loader-1793949519-1793949813",
+    "start_epoch": 1793949519,
+    "end_epoch": 1793949813,
+    "duration_seconds": 294,
+    "phase": "implement-validate-host",
+    "summary": "Reproduced discarded expert offset-fold result through actual loader and independent NZ byte oracle; retained payload return plus routed validator q-offset reference. CPU before/after/final reruns pass, nonzero failure18432bytes before, zero/nonzero/shard/scales/endpoints/rejections exact after. No checkpoint reads; incidence unestablished. Initial reads before measured start uncharged.",
+    "evidence": "logs/cohort_f03_f08_f14_1793949344/worker_f14/REPORT.md; before_results.json; after_results.json; final_queue.log"
+  }
+]

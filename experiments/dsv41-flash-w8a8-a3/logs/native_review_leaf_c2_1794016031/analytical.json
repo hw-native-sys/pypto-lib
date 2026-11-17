@@ -1,0 +1,376 @@
+{
+  "scope": "archived method and saved synthetic operands only; no current model imports or NPU",
+  "top_level_prevalidation_gap": [
+    {
+      "shape": [
+        1
+      ],
+      "dtype": "torch.float32",
+      "calls_before_rejection": [
+        "payload_read"
+      ],
+      "error": "embed_weight: leaf shape/dtype does not match rank contract"
+    },
+    {
+      "shape": [
+        2,
+        2
+      ],
+      "dtype": "torch.float64",
+      "calls_before_rejection": [
+        "payload_read"
+      ],
+      "error": "embed_weight: leaf shape/dtype does not match rank contract"
+    }
+  ],
+  "controlled": {
+    "rational_equals_saved_fp64": true,
+    "native_rational_maxabs": 8.940696716308594e-08,
+    "cpu_rational_maxabs": 0.00147247314453125
+  },
+  "actual_capture": {
+    "saved_payloads_equal": true,
+    "stage_inputs_equal": 48,
+    "rational_exact_equals_fp64_all_lanes": true,
+    "native_rational_bad": 0,
+    "native_cpu_fp32_bad": 49152,
+    "records": [
+      {
+        "rank": 0,
+        "slot": 0,
+        "native_rational_maxabs": 5.7220458984375e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 1,
+        "slot": 0,
+        "native_rational_maxabs": 5.7220458984375e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 2,
+        "slot": 0,
+        "native_rational_maxabs": 5.7220458984375e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 3,
+        "slot": 0,
+        "native_rational_maxabs": 5.7220458984375e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 4,
+        "slot": 0,
+        "native_rational_maxabs": 3.814697265625e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 5,
+        "slot": 0,
+        "native_rational_maxabs": 3.814697265625e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 6,
+        "slot": 0,
+        "native_rational_maxabs": 3.814697265625e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 7,
+        "slot": 0,
+        "native_rational_maxabs": 3.814697265625e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 8,
+        "slot": 0,
+        "native_rational_maxabs": 1.9073486328125e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 9,
+        "slot": 0,
+        "native_rational_maxabs": 1.9073486328125e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 10,
+        "slot": 0,
+        "native_rational_maxabs": 1.9073486328125e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 11,
+        "slot": 0,
+        "native_rational_maxabs": 1.9073486328125e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 12,
+        "slot": 0,
+        "native_rational_maxabs": 0.0,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 13,
+        "slot": 0,
+        "native_rational_maxabs": 0.0,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 14,
+        "slot": 0,
+        "native_rational_maxabs": 0.0,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 15,
+        "slot": 0,
+        "native_rational_maxabs": 0.0,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 0,
+        "slot": 1,
+        "native_rational_maxabs": 5.7220458984375e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 1,
+        "slot": 1,
+        "native_rational_maxabs": 5.7220458984375e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 2,
+        "slot": 1,
+        "native_rational_maxabs": 5.7220458984375e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 3,
+        "slot": 1,
+        "native_rational_maxabs": 5.7220458984375e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 4,
+        "slot": 1,
+        "native_rational_maxabs": 1.1444091796875e-05,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 5,
+        "slot": 1,
+        "native_rational_maxabs": 1.1444091796875e-05,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 6,
+        "slot": 1,
+        "native_rational_maxabs": 1.1444091796875e-05,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 7,
+        "slot": 1,
+        "native_rational_maxabs": 1.1444091796875e-05,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 8,
+        "slot": 1,
+        "native_rational_maxabs": 2.86102294921875e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 9,
+        "slot": 1,
+        "native_rational_maxabs": 2.86102294921875e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 10,
+        "slot": 1,
+        "native_rational_maxabs": 2.86102294921875e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 11,
+        "slot": 1,
+        "native_rational_maxabs": 2.86102294921875e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 12,
+        "slot": 1,
+        "native_rational_maxabs": 0.0,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 13,
+        "slot": 1,
+        "native_rational_maxabs": 0.0,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 14,
+        "slot": 1,
+        "native_rational_maxabs": 0.0,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 15,
+        "slot": 1,
+        "native_rational_maxabs": 0.0,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 0,
+        "slot": 2,
+        "native_rational_maxabs": 0.0,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 1,
+        "slot": 2,
+        "native_rational_maxabs": 0.0,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 2,
+        "slot": 2,
+        "native_rational_maxabs": 0.0,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 3,
+        "slot": 2,
+        "native_rational_maxabs": 0.0,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 4,
+        "slot": 2,
+        "native_rational_maxabs": 5.7220458984375e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 5,
+        "slot": 2,
+        "native_rational_maxabs": 5.7220458984375e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 6,
+        "slot": 2,
+        "native_rational_maxabs": 5.7220458984375e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 7,
+        "slot": 2,
+        "native_rational_maxabs": 5.7220458984375e-06,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 8,
+        "slot": 2,
+        "native_rational_maxabs": 1.71661376953125e-05,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 9,
+        "slot": 2,
+        "native_rational_maxabs": 1.71661376953125e-05,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 10,
+        "slot": 2,
+        "native_rational_maxabs": 1.71661376953125e-05,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 11,
+        "slot": 2,
+        "native_rational_maxabs": 1.71661376953125e-05,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 12,
+        "slot": 2,
+        "native_rational_maxabs": 1.33514404296875e-05,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 13,
+        "slot": 2,
+        "native_rational_maxabs": 1.33514404296875e-05,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 14,
+        "slot": 2,
+        "native_rational_maxabs": 1.33514404296875e-05,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      },
+      {
+        "rank": 15,
+        "slot": 2,
+        "native_rational_maxabs": 1.33514404296875e-05,
+        "native_rational_bad": 0,
+        "native_cpu_fp32_bad": 1024
+      }
+    ]
+  }
+}

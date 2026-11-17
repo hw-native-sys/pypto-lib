@@ -1,0 +1,23 @@
+{
+  "product45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "product45_unchanged": true,
+  "protected_artifacts_unchanged": {
+    "generation_entry_1794035858": "a37109462df44b9416c7401ced49c881628a0ccbe059e277126e1115c428b1cc",
+    "fit_post_guard_1794037055": "184fc558f8c08bc5c9f1a839da73b68ce9665f0fdc483632377c99508a38340b"
+  },
+  "signature_samples": 0,
+  "signature_device_prepares": 0,
+  "signature_files": 283,
+  "real40E40_static57": true,
+  "all_actual_generated57_ABI_checked": true,
+  "signature_real_static_per_rank": 39624816576,
+  "signature_largest_per_rank": 11324620800,
+  "current_adapter_CPU_controls": 23,
+  "all_own_jobs": "154957/155800/160019/160203/160541 COMPLETE0",
+  "NPU": 0,
+  "real_allocations": 0,
+  "real_payload_reads": 0,
+  "forward_calls": 0,
+  "unknown_full40_peaks": null,
+  "next": "independent CPU review, then separate actualcalibrateGO, then separate largeemptyGO"
+}

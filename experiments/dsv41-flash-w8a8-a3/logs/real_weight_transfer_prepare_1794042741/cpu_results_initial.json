@@ -1,0 +1,67 @@
+{
+  "status": "PASS_CPU_TINY_ONLY",
+  "real_payload_reads": 0,
+  "NPU": 0,
+  "real_allocations": 0,
+  "source_data": "owned tiny fixture only",
+  "actual_WeightLoader_direct_methods": true,
+  "existing_PreparedDispatch_upload_consumer": true,
+  "independent_NZ_offset_oracle_nonzero": true,
+  "full57_fake_handles": 912,
+  "embedding_DP_TP_exact_all16": true,
+  "W1_and_FP32_nonzero_offsets": true,
+  "independent_ABI_byte_read_address": true,
+  "source_bytes_fake": 70144,
+  "initialized_and_readback_fake": 69888,
+  "backing_released_between_groups": true,
+  "controls": [
+    {
+      "case": "discarded_offset_fold_return",
+      "error": "source mapping/fold/NZ oracle or independent byte address failed"
+    },
+    {
+      "case": "wrong_NZ_order",
+      "error": "source mapping/fold/NZ oracle or independent byte address failed"
+    },
+    {
+      "case": "wrong_TP_source_rows",
+      "error": "embedding TP source view address mismatch"
+    },
+    {
+      "case": "FP32_element_vs_BYTE_offset",
+      "error": "writer vs independent ABI readback BYTE offset mismatch"
+    },
+    {
+      "case": "independent_read_address_wrong_dtype",
+      "error": "writer vs independent ABI readback BYTE offset mismatch"
+    },
+    {
+      "case": "copy_query_firsterror_cleanup",
+      "error": "FIRST after-copy public query"
+    },
+    {
+      "case": "unallowlisted_head_BEFORE_payload",
+      "error": "unallowlisted source/read order BEFORE payload open"
+    },
+    {
+      "case": "retained_source_backing_before_next",
+      "error": "source backing/leaf still retained before next source group"
+    },
+    {
+      "case": "NoForward",
+      "error": "NoForward: other weights are uninitialized"
+    },
+    {
+      "case": "uninitialized_readback",
+      "error": "D2H uninitialized interval/cap"
+    },
+    {
+      "case": "default_real_payload_refuse",
+      "error": "DEFAULT REFUSE before real payload/runtime"
+    },
+    {
+      "case": "wrong_actual_target_ABI",
+      "error": "plan target ABI differs from actual generated57 headers"
+    }
+  ]
+}

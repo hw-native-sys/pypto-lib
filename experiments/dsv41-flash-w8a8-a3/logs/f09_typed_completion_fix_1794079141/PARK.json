@@ -1,0 +1,11 @@
+{
+  "status": "PARK",
+  "all_own_jobs_terminal": true,
+  "writers": [],
+  "live_M02_old93_76_unchanged": true,
+  "application": "UNAPPLIED",
+  "count_signature": "PASS",
+  "fullentry_oldprobe_native": "PENDING",
+  "helper_bin_precondition": "KNOWN_FUTURE_HOLD",
+  "shared_writes": 0
+}

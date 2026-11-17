@@ -1,0 +1,26 @@
+{
+  "roundtrip_exact": true,
+  "copied_bytes_survive_mutation": true,
+  "clone_isolation": true,
+  "no_static_payload": true,
+  "static_expanded_hash_matches_materialized": true,
+  "atomic_visibility_and_no_pending_dirs": true,
+  "negative_controls": [
+    "native-only-not-pass",
+    "toy-receipt-cannot-native-resume",
+    "wrong-phase",
+    "wrong-seed-static",
+    "sourcehash",
+    "SIM-mode",
+    "clone-alias",
+    "incomplete-owning-gates",
+    "missing-required-reference-scope",
+    "payload-corruption",
+    "tensor-header-corruption"
+  ],
+  "toy_receipt_never_native_pass": true,
+  "per_step_save_example": "decode128 toy only",
+  "model_sources_modified": false,
+  "payload_reads": 0,
+  "NPU": 0
+}

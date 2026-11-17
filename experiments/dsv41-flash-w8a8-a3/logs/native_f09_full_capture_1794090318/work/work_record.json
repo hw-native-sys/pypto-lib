@@ -1,0 +1,16 @@
+{
+  "agent": "/root/reviewer_f09",
+  "accounting": "ONE nativeowner combinedwindow; runtimefacts NOT additive",
+  "start_epoch": 1794091229.8021698,
+  "end_epoch": 1794091501.8309157,
+  "native_owner_start_epoch": 1794091235.1470478,
+  "native_stage_terminal_epoch": 1794091319.9693325,
+  "native_owner_wall_seconds": 84.82228469848633,
+  "native_task": "task_20261108_064029_17824732938",
+  "native_tasks": 1,
+  "CPU_reference_tasks": 0,
+  "owner_open_called": false,
+  "shared_writes": 0,
+  "ownjobs": 0,
+  "status": "FAILED_BEFORE_PREPARE_FINAL_PARK"
+}

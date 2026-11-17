@@ -1,0 +1,108 @@
+{
+  "scope": "CPUhostspies,noNPU/numericalmodelclaim",
+  "positive_cases": [
+    {
+      "tokens": 3,
+      "unchanged_prompt": true,
+      "exact_factory_rows_handoff": true,
+      "generated": [
+        6,
+        9,
+        11,
+        11
+      ],
+      "decode_inputs": [
+        {
+          "token": 6,
+          "position": 128
+        },
+        {
+          "token": 9,
+          "position": 129
+        },
+        {
+          "token": 11,
+          "position": 130
+        }
+      ],
+      "votes_every_step": true
+    },
+    {
+      "tokens": 6,
+      "unchanged_prompt": true,
+      "exact_factory_rows_handoff": true,
+      "generated": [
+        6,
+        9,
+        11,
+        11
+      ],
+      "decode_inputs": [
+        {
+          "token": 6,
+          "position": 131
+        },
+        {
+          "token": 9,
+          "position": 132
+        },
+        {
+          "token": 11,
+          "position": 133
+        }
+      ],
+      "votes_every_step": true
+    },
+    {
+      "tokens": 17,
+      "unchanged_prompt": true,
+      "exact_factory_rows_handoff": true,
+      "generated": [
+        6,
+        9,
+        11,
+        11
+      ],
+      "decode_inputs": [
+        {
+          "token": 6,
+          "position": 142
+        },
+        {
+          "token": 9,
+          "position": 143
+        },
+        {
+          "token": 11,
+          "position": 144
+        }
+      ],
+      "votes_every_step": true
+    }
+  ],
+  "old_prompt_append_poison_tail_negative": {
+    "old_length": 16,
+    "old_token": 15,
+    "old_decode_position": 141
+  },
+  "old_DP_nongating_negative": true,
+  "strict_DP_cases": 6,
+  "structured_main_failure_phases": [
+    "prefill",
+    "decode2"
+  ],
+  "global_TP_reconstruction": true,
+  "ties": true,
+  "EOS_history_boundaries": true,
+  "unsupported_lengths": [
+    0,
+    1,
+    129
+  ],
+  "fullweight_guard_false_and_true_rejected": true,
+  "root45_unchanged": true,
+  "readonly44support_copies_unchanged": true,
+  "payload_reads": 0,
+  "NPU": 0,
+  "stubbed_backend": "CPUfakeonly,neveracceptasnative"
+}

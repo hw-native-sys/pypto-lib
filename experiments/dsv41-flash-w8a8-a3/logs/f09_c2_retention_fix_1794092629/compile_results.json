@@ -1,0 +1,12 @@
+[
+  {
+    "label": "decode_capacity2",
+    "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/build/decode_capacity2",
+    "elapsed_seconds": 45.014118909835815,
+    "metadata": [
+      "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/build/decode_capacity2/distributed_meta.json"
+    ],
+    "file_manifest_sha256": "510dd3c7b72a1c36291ff8ff0b167ce0ac8204d2cd6a957eae0a8ea6641f8642",
+    "status": "FRESH_NEW_SOURCE_FULL_SIGNATURE_ONLY"
+  }
+]

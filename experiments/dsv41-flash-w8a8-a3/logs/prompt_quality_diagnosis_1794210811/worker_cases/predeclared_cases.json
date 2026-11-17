@@ -1,0 +1,121 @@
+{
+  "schema": "semantic-fixed-six-prompts/1",
+  "cases": [
+    {
+      "id": "fact_plain",
+      "template": "plain",
+      "prompt": "What is the capital of France? Answer in one word.",
+      "expectation": "Paris; plain continuation may quote/restate prompt, so compare raw completion to paired chat rather than demand identical surface form.",
+      "thinking_mode": null,
+      "max_new_tokens": 32,
+      "token_ids": null,
+      "effective_prompt_length": null,
+      "tokenizer_status": "PENDING authorized CPU encoding; NOT fabricated N3",
+      "sampling": "greedy",
+      "topology": {
+        "TP": 4,
+        "DP": 4,
+        "EP": 16
+      },
+      "engram_mode": "disabled",
+      "start_position": 0
+    },
+    {
+      "id": "fact_chat",
+      "template": "chat",
+      "prompt": "What is the capital of France? Answer in one word.",
+      "expectation": "Paris, with relevant concise answer; exactly same user content as fact_plain.",
+      "thinking_mode": "chat",
+      "max_new_tokens": 32,
+      "token_ids": null,
+      "effective_prompt_length": null,
+      "tokenizer_status": "PENDING authorized CPU encoding; NOT fabricated N3",
+      "sampling": "greedy",
+      "topology": {
+        "TP": 4,
+        "DP": 4,
+        "EP": 16
+      },
+      "engram_mode": "disabled",
+      "start_position": 0
+    },
+    {
+      "id": "arithmetic_chat",
+      "template": "chat",
+      "prompt": "What is 2 + 3? Reply with only the number.",
+      "expectation": "5; diagnose any unrelated answer, arithmetic error or role/control-token leak.",
+      "thinking_mode": "chat",
+      "max_new_tokens": 32,
+      "token_ids": null,
+      "effective_prompt_length": null,
+      "tokenizer_status": "PENDING authorized CPU encoding; NOT fabricated N3",
+      "sampling": "greedy",
+      "topology": {
+        "TP": 4,
+        "DP": 4,
+        "EP": 16
+      },
+      "engram_mode": "disabled",
+      "start_position": 0
+    },
+    {
+      "id": "chinese_fact_chat",
+      "template": "chat",
+      "prompt": "中国的首都是哪里？只回答城市名。",
+      "expectation": "北京; inspect full decoded Unicode text, no English-only token-count assumptions.",
+      "thinking_mode": "chat",
+      "max_new_tokens": 32,
+      "token_ids": null,
+      "effective_prompt_length": null,
+      "tokenizer_status": "PENDING authorized CPU encoding; NOT fabricated N3",
+      "sampling": "greedy",
+      "topology": {
+        "TP": 4,
+        "DP": 4,
+        "EP": 16
+      },
+      "engram_mode": "disabled",
+      "start_position": 0
+    },
+    {
+      "id": "english_completion",
+      "template": "plain",
+      "prompt": "The opposite of hot is",
+      "expectation": "natural continuation expressing cold; evaluate all raw output, not keyword occurrence alone.",
+      "thinking_mode": null,
+      "max_new_tokens": 32,
+      "token_ids": null,
+      "effective_prompt_length": null,
+      "tokenizer_status": "PENDING authorized CPU encoding; NOT fabricated N3",
+      "sampling": "greedy",
+      "topology": {
+        "TP": 4,
+        "DP": 4,
+        "EP": 16
+      },
+      "engram_mode": "disabled",
+      "start_position": 0
+    },
+    {
+      "id": "chinese_completion",
+      "template": "plain",
+      "prompt": "一年有十二个",
+      "expectation": "natural continuation 月; evaluate full continuation and early stopping.",
+      "thinking_mode": null,
+      "max_new_tokens": 32,
+      "token_ids": null,
+      "effective_prompt_length": null,
+      "tokenizer_status": "PENDING authorized CPU encoding; NOT fabricated N3",
+      "sampling": "greedy",
+      "topology": {
+        "TP": 4,
+        "DP": 4,
+        "EP": 16
+      },
+      "engram_mode": "disabled",
+      "start_position": 0
+    }
+  ],
+  "quality_status": "UNASSESSED; not executed",
+  "human_review": "Read full raw suffix and prompt+suffix; judge relevance, factual/arithmetic correctness, repetition, script corruption, role leakage, EOS/truncation. Expectations are diagnostics, not a keyword proxy or full-model parity test."
+}

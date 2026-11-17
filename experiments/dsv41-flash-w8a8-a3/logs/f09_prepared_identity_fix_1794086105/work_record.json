@@ -1,0 +1,20 @@
+{
+  "record_id": "main-f09-prepared-identity-1794086105",
+  "role": "main-agent",
+  "start_epoch": 1794086105,
+  "end_epoch": 1794086862.0024962,
+  "measured_wall_seconds": 757.0024962425232,
+  "interval_note": "includes explicit Root coordination hold; not claimed CPU execution time",
+  "shared_writes": 0,
+  "worker_records_imported": 0,
+  "CPU_tasks": [
+    "task_20261108_052537_158040813056"
+  ],
+  "CPU_PASS": true,
+  "compile": false,
+  "prepare": false,
+  "NPU": false,
+  "real_tensor_payload_bytes": 0,
+  "retained_actual_readonly": true,
+  "status": "FINAL_PARK_HELPER_ONLY"
+}

@@ -1,0 +1,10 @@
+{
+  "record_id": "main-empty-operation-1794037635-1794039332",
+  "agent": "/root/main_native",
+  "start_epoch": 1794037635,
+  "end_epoch": 1794039332,
+  "elapsed_wall_seconds": 1697,
+  "basis": "actual ownership/source review through compile/adapter/necessaryCPU/interfaces/report/freeze, includes queuedwall",
+  "status": "PARKED",
+  "workers": 0
+}

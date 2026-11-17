@@ -1,0 +1,6 @@
+name	task_id	result
+cpu	task_20261107_090121_83480917442	exit0
+tiny	task_20261107_090214_8386618278	exit1_FP32_scalar_before_chip_execution
+decode	task_20261107_090340_84319715825	exit1_residual_C2_state_numerical
+scalar_cpu	task_20261107_090440_8513569047	exit0
+collect	task_20261107_090901_86731910240	exit0

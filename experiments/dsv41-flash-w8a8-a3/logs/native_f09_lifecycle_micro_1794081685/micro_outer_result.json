@@ -1,0 +1,14 @@
+{
+  "owner_returncode": 0,
+  "postcheck": {
+    "source_unchanged": true,
+    "prepared_receipt_verified": true,
+    "observed_births_gone": true,
+    "raw_release_requires_independent_review": true
+  },
+  "postcheck_error": null,
+  "owner_failure_remains_primary": false,
+  "full_PSS_or_continuous_tree_gate": false,
+  "native_queue_release_pending_external_audit": true,
+  "status": "NATIVE_MICRO_COMPLETE_PENDING_QUEUE_RELEASE_AUDIT"
+}

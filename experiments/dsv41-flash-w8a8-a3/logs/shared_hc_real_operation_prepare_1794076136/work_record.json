@@ -1,0 +1,32 @@
+{
+  "role": "review-agent",
+  "start_epoch": 1794076136,
+  "end_epoch": 1794077556,
+  "elapsed_seconds": 1420,
+  "CPU_job": "task_20261108_025003_353007219646",
+  "CPU_terminal": "COMPLETE0",
+  "tiny_controls": 16,
+  "source45_sha256": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "metadata_plan_sha256": "806852d5baec99a522f5adc3015bdd204d9ac6b17244a29cb26445cbd55fda89",
+  "math_baseline_M01": "eb90ea56e26d0cb97dd12d330559c2ae1b53f4ae5cbf866cc01bfbbb150fecf2",
+  "HC_native_whole_case": "FAILED retained; separate Root-accepted original offline31/0",
+  "fresh_signature_receipt": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_hc_applied_signatures_1794076423/signature_receipt.json",
+    "sha256": "3f5441beade418bf307463188a7b5a52c733299cf6dffde0fe501d4df5fbefd4",
+    "manifest_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_hc_applied_signatures_1794076423/artifacts.json",
+    "manifest_sha256": "4ec39ab4506fe6d388fab0d7503f3be4d6b47d72faac0fbbda978f6a473a42a5"
+  },
+  "prior_units_unchanged": {
+    "shared_real_operation_prepare_1794074855": "6b1c09090fe5b7409a2eb4833ad18e3a081c5b4a2de42aaf818c5e096691b1ad",
+    "hc_boundary_apply_1794075705": "9970561c56cd6b6fd564196795b66c78a23303cf5e18191c690a37524303994f",
+    "independent_hc_applied_signatures_1794076423": "4ec39ab4506fe6d388fab0d7503f3be4d6b47d72faac0fbbda978f6a473a42a5"
+  },
+  "checkpoint_header_bytes_read": 0,
+  "tensor_payload_bytes": 0,
+  "signature_compiles": 0,
+  "native_jobs": 0,
+  "actual_grants": 0,
+  "product_edits": 0,
+  "shared_ledger_writes": 0,
+  "all_own_jobs_terminal": true
+}

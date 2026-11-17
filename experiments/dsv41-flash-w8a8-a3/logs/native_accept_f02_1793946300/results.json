@@ -1,0 +1,971 @@
+{
+  "disposition": "Independent assigned checks passed; observer records acceptance decision",
+  "source_manifest_sha256": "d36bb70d6d4b285785fb92c7c435f8fd99651b895ed91e3a32a675acb016cf7f",
+  "sources": 45,
+  "unchanged_manifest_checks": [
+    "source_before.json",
+    "source_compile_after.json",
+    "source_compile_before.json",
+    "source_device_after.json",
+    "source_device_before.json",
+    "source_final.json",
+    "source_host_after.json",
+    "source_host_before.json"
+  ],
+  "public_phase_ABIs_and_existing_comparators_verified": [
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_c1a_full.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_c1a_reindex.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_c2a_full.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_c2a_reuse.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_swa.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_c1a_full.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_c1a_reindex.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_c1a_reuse.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_c2a_full.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_c2a_reuse.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_swa.py"
+  ],
+  "positive_device_cases": 33,
+  "numerical_mutant_controls": 2,
+  "device_results": [
+    {
+      "entry": "missing",
+      "start": "1793946466",
+      "end": "1793946488",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 0,
+      "output_checks": [
+        [
+          "output",
+          "FAIL",
+          "shape=(17, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.02, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ]
+      ],
+      "log": "device/missing_device.log",
+      "numerical_rejection": {
+        "count": 81523,
+        "elements": 87040,
+        "max_abs_from_log": 2.53125,
+        "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/device/build_output/_jit_o_proj_test_20261106_142748_3_mfgkag"
+      }
+    },
+    {
+      "entry": "forward",
+      "start": "1793946488",
+      "end": "1793946511",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 0,
+      "output_checks": [
+        [
+          "output",
+          "FAIL",
+          "shape=(17, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.02, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ]
+      ],
+      "log": "device/forward_device.log",
+      "numerical_rejection": {
+        "count": 79691,
+        "elements": 87040,
+        "max_abs_from_log": 2.55469,
+        "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/device/build_output/_jit_o_proj_test_20261106_142811_3joxr34w"
+      }
+    },
+    {
+      "entry": "baseline",
+      "start": "1793946511",
+      "end": "1793946534",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 1,
+      "output_checks": [
+        [
+          "output",
+          "PASS",
+          "shape=(17, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.02, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ]
+      ],
+      "log": "device/baseline_device.log"
+    },
+    {
+      "entry": "sparse",
+      "start": "1793946534",
+      "end": "1793946558",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 1,
+      "output_checks": [
+        [
+          "output",
+          "PASS",
+          "shape=(17, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.02, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ]
+      ],
+      "log": "device/sparse_device.log"
+    },
+    {
+      "entry": "o_proj",
+      "start": "1793946558",
+      "end": "1793946574",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 4,
+      "output_checks": [
+        [
+          "output",
+          "PASS",
+          "shape=(16, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.02, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "output",
+          "PASS",
+          "shape=(1, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0, rtol=0, max_error_ratio=0, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "output",
+          "PASS",
+          "shape=(7, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0, rtol=0, max_error_ratio=0, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "output",
+          "PASS",
+          "shape=(17, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0, rtol=0, max_error_ratio=0, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ]
+      ],
+      "log": "device/o_proj.log"
+    },
+    {
+      "entry": "mla_proj",
+      "start": "1793946574",
+      "end": "1793946591",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 3,
+      "output_checks": [
+        [
+          "q",
+          "PASS",
+          "shape=(32, 16, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "kv",
+          "PASS",
+          "shape=(32, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "qr",
+          "PASS",
+          "shape=(32, 1280) dtype=torch.int8 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "qr_scale",
+          "PASS",
+          "shape=(32, 1) dtype=torch.float32"
+        ],
+        [
+          "q",
+          "PASS",
+          "shape=(1, 16, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0, rtol=0, max_error_ratio=0, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "kv",
+          "PASS",
+          "shape=(1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0, rtol=0, max_error_ratio=0, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "qr",
+          "PASS",
+          "shape=(1, 1280) dtype=torch.int8 (ratio_allclose(atol=0, rtol=0, max_error_ratio=0, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "qr_scale",
+          "PASS",
+          "shape=(1, 1) dtype=torch.float32"
+        ],
+        [
+          "q",
+          "PASS",
+          "shape=(7, 16, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0, rtol=0, max_error_ratio=0, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "kv",
+          "PASS",
+          "shape=(7, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0, rtol=0, max_error_ratio=0, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "qr",
+          "PASS",
+          "shape=(7, 1280) dtype=torch.int8 (ratio_allclose(atol=0, rtol=0, max_error_ratio=0, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "qr_scale",
+          "PASS",
+          "shape=(7, 1) dtype=torch.float32"
+        ]
+      ],
+      "log": "device/mla_proj.log"
+    },
+    {
+      "entry": "decode_swa",
+      "start": "1793946591",
+      "end": "1793946612",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 2,
+      "output_checks": [
+        [
+          "window_cache",
+          "PASS",
+          "shape=(20, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "partial",
+          "PASS",
+          "shape=(2, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "window_cache",
+          "PASS",
+          "shape=(20, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "partial",
+          "PASS",
+          "shape=(18, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ]
+      ],
+      "log": "device/decode_swa.log"
+    },
+    {
+      "entry": "prefill_swa",
+      "start": "1793946612",
+      "end": "1793946631",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 1,
+      "output_checks": [
+        [
+          "window_cache",
+          "PASS",
+          "shape=(2, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "partial",
+          "PASS",
+          "shape=(8, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ]
+      ],
+      "log": "device/prefill_swa.log"
+    },
+    {
+      "entry": "decode_c2a_full",
+      "start": "1793946631",
+      "end": "1793946655",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 2,
+      "output_checks": [
+        [
+          "window_cache",
+          "PASS",
+          "shape=(20, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "compressed_cache",
+          "PASS",
+          "shape=(20, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "index_cache",
+          "PASS",
+          "shape=(20, 128, 1, 128) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "state_cache",
+          "PASS",
+          "shape=(2, 2, 1024) dtype=torch.float32 (ratio_allclose(atol=0.0001, rtol=0.0001, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "topk_indices",
+          "PASS",
+          "shape=(2, 512) dtype=torch.int32 (index_topk_compare)"
+        ],
+        [
+          "topk_values",
+          "PASS",
+          "shape=(2, 512) dtype=torch.float32 (index_score_compare)"
+        ],
+        [
+          "pool_block_ids",
+          "PASS",
+          "shape=(2, 64) dtype=torch.int32 (compare)"
+        ],
+        [
+          "pool_block_counts",
+          "PASS",
+          "shape=(2,) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "partial",
+          "PASS",
+          "shape=(2, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "window_cache",
+          "PASS",
+          "shape=(20, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "compressed_cache",
+          "PASS",
+          "shape=(20, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "index_cache",
+          "PASS",
+          "shape=(20, 128, 1, 128) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "state_cache",
+          "PASS",
+          "shape=(2, 2, 1024) dtype=torch.float32 (ratio_allclose(atol=0.0001, rtol=0.0001, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "topk_indices",
+          "PASS",
+          "shape=(18, 512) dtype=torch.int32 (index_topk_compare)"
+        ],
+        [
+          "topk_values",
+          "PASS",
+          "shape=(18, 512) dtype=torch.float32 (index_score_compare)"
+        ],
+        [
+          "pool_block_ids",
+          "PASS",
+          "shape=(18, 64) dtype=torch.int32 (compare)"
+        ],
+        [
+          "pool_block_counts",
+          "PASS",
+          "shape=(18,) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "partial",
+          "PASS",
+          "shape=(18, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ]
+      ],
+      "log": "device/decode_c2a_full.log"
+    },
+    {
+      "entry": "prefill_c2a_full",
+      "start": "1793946655",
+      "end": "1793946679",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 1,
+      "output_checks": [
+        [
+          "window_cache",
+          "PASS",
+          "shape=(2, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "compressed_cache",
+          "PASS",
+          "shape=(2, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "index_cache",
+          "PASS",
+          "shape=(2, 128, 1, 128) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "state_cache",
+          "PASS",
+          "shape=(2, 2, 1024) dtype=torch.float32 (ratio_allclose(atol=0.0001, rtol=0.0001, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "topk_indices",
+          "PASS",
+          "shape=(8, 512) dtype=torch.int32 (index_topk_compare)"
+        ],
+        [
+          "topk_values",
+          "PASS",
+          "shape=(8, 512) dtype=torch.float32 (index_score_compare)"
+        ],
+        [
+          "pool_block_ids",
+          "PASS",
+          "shape=(8, 64) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "pool_block_counts",
+          "PASS",
+          "shape=(8,) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "partial",
+          "PASS",
+          "shape=(8, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ]
+      ],
+      "log": "device/prefill_c2a_full.log"
+    },
+    {
+      "entry": "decode_c2a_reuse",
+      "start": "1793946679",
+      "end": "1793946699",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 2,
+      "output_checks": [
+        [
+          "window_cache",
+          "PASS",
+          "shape=(20, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "partial",
+          "PASS",
+          "shape=(2, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "window_cache",
+          "PASS",
+          "shape=(20, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "partial",
+          "PASS",
+          "shape=(18, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ]
+      ],
+      "log": "device/decode_c2a_reuse.log"
+    },
+    {
+      "entry": "prefill_c2a_reuse",
+      "start": "1793946699",
+      "end": "1793946717",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 1,
+      "output_checks": [
+        [
+          "window_cache",
+          "PASS",
+          "shape=(2, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "partial",
+          "PASS",
+          "shape=(8, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ]
+      ],
+      "log": "device/prefill_c2a_reuse.log"
+    },
+    {
+      "entry": "decode_c1a_full",
+      "start": "1793946717",
+      "end": "1793946742",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 2,
+      "output_checks": [
+        [
+          "window_cache",
+          "PASS",
+          "shape=(20, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "compressed_cache",
+          "PASS",
+          "shape=(20, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "index_cache",
+          "PASS",
+          "shape=(20, 128, 1, 128) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "topk_indices",
+          "PASS",
+          "shape=(2, 512) dtype=torch.int32 (index_topk_compare)"
+        ],
+        [
+          "topk_values",
+          "PASS",
+          "shape=(2, 512) dtype=torch.float32 (index_score_compare)"
+        ],
+        [
+          "pool_block_ids",
+          "PASS",
+          "shape=(2, 64) dtype=torch.int32 (compare)"
+        ],
+        [
+          "pool_block_counts",
+          "PASS",
+          "shape=(2,) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "partial",
+          "PASS",
+          "shape=(2, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "window_cache",
+          "PASS",
+          "shape=(20, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "compressed_cache",
+          "PASS",
+          "shape=(20, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "index_cache",
+          "PASS",
+          "shape=(20, 128, 1, 128) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "topk_indices",
+          "PASS",
+          "shape=(18, 512) dtype=torch.int32 (index_topk_compare)"
+        ],
+        [
+          "topk_values",
+          "PASS",
+          "shape=(18, 512) dtype=torch.float32 (index_score_compare)"
+        ],
+        [
+          "pool_block_ids",
+          "PASS",
+          "shape=(18, 64) dtype=torch.int32 (compare)"
+        ],
+        [
+          "pool_block_counts",
+          "PASS",
+          "shape=(18,) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "partial",
+          "PASS",
+          "shape=(18, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ]
+      ],
+      "log": "device/decode_c1a_full.log"
+    },
+    {
+      "entry": "prefill_c1a_full",
+      "start": "1793946742",
+      "end": "1793946766",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 1,
+      "output_checks": [
+        [
+          "window_cache",
+          "PASS",
+          "shape=(2, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "compressed_cache",
+          "PASS",
+          "shape=(2, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "index_cache",
+          "PASS",
+          "shape=(2, 128, 1, 128) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "topk_indices",
+          "PASS",
+          "shape=(8, 512) dtype=torch.int32 (index_topk_compare)"
+        ],
+        [
+          "topk_values",
+          "PASS",
+          "shape=(8, 512) dtype=torch.float32 (index_score_compare)"
+        ],
+        [
+          "pool_block_ids",
+          "PASS",
+          "shape=(8, 64) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "pool_block_counts",
+          "PASS",
+          "shape=(8,) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "partial",
+          "PASS",
+          "shape=(8, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ]
+      ],
+      "log": "device/prefill_c1a_full.log"
+    },
+    {
+      "entry": "decode_c1a_reindex",
+      "start": "1793946766",
+      "end": "1793946789",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 2,
+      "output_checks": [
+        [
+          "window_cache",
+          "PASS",
+          "shape=(20, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "topk_indices",
+          "PASS",
+          "shape=(2, 512) dtype=torch.int32 (index_topk_compare)"
+        ],
+        [
+          "topk_values",
+          "PASS",
+          "shape=(2, 512) dtype=torch.float32 (index_score_compare)"
+        ],
+        [
+          "pool_block_ids",
+          "PASS",
+          "shape=(2, 64) dtype=torch.int32 (compare)"
+        ],
+        [
+          "pool_block_counts",
+          "PASS",
+          "shape=(2,) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "partial",
+          "PASS",
+          "shape=(2, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "window_cache",
+          "PASS",
+          "shape=(2, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "topk_indices",
+          "PASS",
+          "shape=(18, 512) dtype=torch.int32 (index_topk_compare)"
+        ],
+        [
+          "topk_values",
+          "PASS",
+          "shape=(18, 512) dtype=torch.float32 (index_score_compare)"
+        ],
+        [
+          "pool_block_ids",
+          "PASS",
+          "shape=(18, 64) dtype=torch.int32 (compare)"
+        ],
+        [
+          "pool_block_counts",
+          "PASS",
+          "shape=(18,) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "partial",
+          "PASS",
+          "shape=(18, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ]
+      ],
+      "log": "device/decode_c1a_reindex.log"
+    },
+    {
+      "entry": "prefill_c1a_reindex",
+      "start": "1793946789",
+      "end": "1793946811",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 1,
+      "output_checks": [
+        [
+          "window_cache",
+          "PASS",
+          "shape=(2, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "topk_indices",
+          "PASS",
+          "shape=(8, 512) dtype=torch.int32 (index_topk_compare)"
+        ],
+        [
+          "topk_values",
+          "PASS",
+          "shape=(8, 512) dtype=torch.float32 (index_score_compare)"
+        ],
+        [
+          "pool_block_ids",
+          "PASS",
+          "shape=(8, 64) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "pool_block_counts",
+          "PASS",
+          "shape=(8,) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "partial",
+          "PASS",
+          "shape=(8, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ]
+      ],
+      "log": "device/prefill_c1a_reindex.log"
+    },
+    {
+      "entry": "decode_c1a_reuse",
+      "start": "1793946811",
+      "end": "1793946831",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 2,
+      "output_checks": [
+        [
+          "window_cache",
+          "PASS",
+          "shape=(20, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "partial",
+          "PASS",
+          "shape=(2, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "window_cache",
+          "PASS",
+          "shape=(20, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "partial",
+          "PASS",
+          "shape=(18, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ]
+      ],
+      "log": "device/decode_c1a_reuse.log"
+    },
+    {
+      "entry": "prefill_c1a_reuse",
+      "start": "1793946831",
+      "end": "1793946849",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 1,
+      "output_checks": [
+        [
+          "window_cache",
+          "PASS",
+          "shape=(2, 128, 1, 512) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.015625, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "partial",
+          "PASS",
+          "shape=(8, 5120) dtype=torch.bfloat16 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ]
+      ],
+      "log": "device/prefill_c1a_reuse.log"
+    },
+    {
+      "entry": "indexer",
+      "start": "1793946849",
+      "end": "1793946880",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 6,
+      "output_checks": [
+        [
+          "index_cache",
+          "PASS",
+          "shape=(2, 128, 1, 128) dtype=torch.bfloat16"
+        ],
+        [
+          "scores",
+          "PASS",
+          "shape=(8, 128) dtype=torch.float32 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "indices",
+          "PASS",
+          "shape=(8, 512) dtype=torch.int32 (index_topk_compare)"
+        ],
+        [
+          "values",
+          "PASS",
+          "shape=(8, 512) dtype=torch.float32"
+        ],
+        [
+          "pool_ids",
+          "PASS",
+          "shape=(8, 64) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "pool_counts",
+          "PASS",
+          "shape=(8,) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "index_cache",
+          "PASS",
+          "shape=(2, 128, 1, 128) dtype=torch.bfloat16"
+        ],
+        [
+          "scores",
+          "PASS",
+          "shape=(16, 128) dtype=torch.float32 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "indices",
+          "PASS",
+          "shape=(16, 512) dtype=torch.int32 (index_topk_compare)"
+        ],
+        [
+          "values",
+          "PASS",
+          "shape=(16, 512) dtype=torch.float32"
+        ],
+        [
+          "pool_ids",
+          "PASS",
+          "shape=(16, 64) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "pool_counts",
+          "PASS",
+          "shape=(16,) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "index_cache",
+          "PASS",
+          "shape=(4, 128, 1, 128) dtype=torch.bfloat16"
+        ],
+        [
+          "scores",
+          "PASS",
+          "shape=(8, 256) dtype=torch.float32 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "indices",
+          "PASS",
+          "shape=(8, 512) dtype=torch.int32 (index_topk_compare)"
+        ],
+        [
+          "values",
+          "PASS",
+          "shape=(8, 512) dtype=torch.float32"
+        ],
+        [
+          "pool_ids",
+          "PASS",
+          "shape=(8, 64) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "pool_counts",
+          "PASS",
+          "shape=(8,) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "index_cache",
+          "PASS",
+          "shape=(4, 128, 1, 128) dtype=torch.bfloat16"
+        ],
+        [
+          "scores",
+          "PASS",
+          "shape=(8, 256) dtype=torch.float32 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "indices",
+          "PASS",
+          "shape=(8, 512) dtype=torch.int32 (index_topk_compare)"
+        ],
+        [
+          "values",
+          "PASS",
+          "shape=(8, 512) dtype=torch.float32"
+        ],
+        [
+          "pool_ids",
+          "PASS",
+          "shape=(8, 2048) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "pool_counts",
+          "PASS",
+          "shape=(8,) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "pool_ids",
+          "PASS",
+          "shape=(5, 4) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "pool_counts",
+          "PASS",
+          "shape=(5,) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "indices",
+          "PASS",
+          "shape=(5, 512) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "values",
+          "PASS",
+          "shape=(5, 512) dtype=torch.float32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "pool_ids",
+          "PASS",
+          "shape=(5, 4) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "pool_counts",
+          "PASS",
+          "shape=(5,) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "indices",
+          "PASS",
+          "shape=(5, 512) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ],
+        [
+          "values",
+          "PASS",
+          "shape=(5, 512) dtype=torch.float32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))"
+        ]
+      ],
+      "log": "device/indexer.log"
+    }
+  ],
+  "compile_results": [
+    {
+      "entry": "decode_fwd",
+      "start": "1793946466",
+      "end": "1793946495",
+      "exit": "0"
+    },
+    {
+      "entry": "prefill_fwd",
+      "start": "1793946495",
+      "end": "1793946522",
+      "exit": "0"
+    }
+  ],
+  "permanent_o_proj_dynamic_build": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/device/build_output/_jit_o_proj_test_20261106_142920_b1o4qeib",
+  "protected_hashes": {
+    "mla_proj.py": "c8acc26cf76936995e049d51cc163f9aebf4acc332f6901d13d0302a6458592b",
+    "indexer.py": "8f998dc7ae8773e67acda854af515f9ae7625374ba101b71152e243b0585df43",
+    "o_proj.py": "11c2c872c91f485bc91f68d3ea4ae08672d3395539e2b390f147efd650a29668",
+    "rope.py": "d21e15e8bb37f5f49a1dd4257a276b2c9de1d6b1e51f7a521e38c903c0b85e3d"
+  },
+  "main_evidence_versus_independent": "All device_results/compile_results here are reviewer-executed fresh outputs; Main results not counted",
+  "limits": "Rank-local F02 only; original torch_npu primitives CPU-modeled, no exact primitive/tie parity,16-device/full-model execution or checkpoint generation proof."
+}

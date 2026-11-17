@@ -1,0 +1,140 @@
+{
+  "8": {
+    "topology": {
+      "tp": 8,
+      "ep": 16,
+      "dp": 2,
+      "world": 16,
+      "local_experts": 24
+    },
+    "static_per_rank_bytes": 38328513216,
+    "static_global_bytes": 613256211456,
+    "resource_budget": {
+      "schema": "configurable-real-resource-budget/1",
+      "topology": {
+        "tp": 8,
+        "ep": 16,
+        "dp": 2,
+        "world": 16,
+        "local_experts": 24
+      },
+      "host_floor_bytes": 68719476736,
+      "disk_floor_bytes": 2147483648,
+      "shm_floor_bytes": 17179869184,
+      "static_per_rank_bytes": 38328513216,
+      "nonstatic_global_IO_bytes": {
+        "prefill": 359958016,
+        "decode": 246077440
+      },
+      "full_global_window_planning_bytes": {
+        "prefill": 2876676096,
+        "decode": 74618880
+      },
+      "communication_reserve_bytes": 2951294976,
+      "unspent_reserve_bytes": 9797894144,
+      "initial_reserve_bytes": 18088299200,
+      "max_new_tokens": 16,
+      "measurement_kind": "CONSERVATIVE_SOURCE_PLANNING_NOT_PEAK",
+      "whole_source_backing_host_allowance_bytes": 5362417664
+    },
+    "shared_weight_accounting": {
+      "canonical_phase": "prefill",
+      "static_upload_bytes": 613256211456,
+      "static_source_reads": 164192,
+      "static_source_bytes": 745846365184,
+      "base_rank_allocations": 912,
+      "decode_static_upload_bytes": 0,
+      "decode_static_source_reads": 0
+    },
+    "plan_sha256": "0b42980f2f7c4ea8bfc237683e930ae3e92fc1f6220563da02d275cb7f36800f",
+    "phases": {
+      "prefill": {
+        "leaf_count": 110368,
+        "initialized_device_bytes": 613256211456,
+        "generated_zero_bytes": 10069016576,
+        "source_read_calls": 164192,
+        "cumulative_source_bytes": 745846365184,
+        "unique_source_keys": 139614,
+        "unique_source_bytes": 557336782272
+      },
+      "decode": {
+        "leaf_count": 110368,
+        "initialized_device_bytes": 613256211456,
+        "generated_zero_bytes": 10069016576,
+        "source_read_calls": 164192,
+        "cumulative_source_bytes": 745846365184,
+        "unique_source_keys": 139614,
+        "unique_source_bytes": 557336782272
+      }
+    }
+  },
+  "4": {
+    "topology": {
+      "tp": 4,
+      "ep": 16,
+      "dp": 4,
+      "world": 16,
+      "local_experts": 24
+    },
+    "static_per_rank_bytes": 39624816576,
+    "static_global_bytes": 633997065216,
+    "resource_budget": {
+      "schema": "configurable-real-resource-budget/1",
+      "topology": {
+        "tp": 4,
+        "ep": 16,
+        "dp": 4,
+        "world": 16,
+        "local_experts": 24
+      },
+      "host_floor_bytes": 68719476736,
+      "disk_floor_bytes": 2147483648,
+      "shm_floor_bytes": 17179869184,
+      "static_per_rank_bytes": 39624816576,
+      "nonstatic_global_IO_bytes": {
+        "prefill": 363060736,
+        "decode": 247111680
+      },
+      "full_global_window_planning_bytes": {
+        "prefill": 2876675584,
+        "decode": 74618368
+      },
+      "communication_reserve_bytes": 2951293952,
+      "unspent_reserve_bytes": 9797894144,
+      "initial_reserve_bytes": 18088299200,
+      "max_new_tokens": 16,
+      "measurement_kind": "CONSERVATIVE_SOURCE_PLANNING_NOT_PEAK",
+      "whole_source_backing_host_allowance_bytes": 5362417664
+    },
+    "shared_weight_accounting": {
+      "canonical_phase": "prefill",
+      "static_upload_bytes": 633997065216,
+      "static_source_reads": 164192,
+      "static_source_bytes": 745846365184,
+      "base_rank_allocations": 912,
+      "decode_static_upload_bytes": 0,
+      "decode_static_source_reads": 0
+    },
+    "plan_sha256": "4c4f3847ee569224ba7709ad99b69f4b94a11605425a823c3944825e1b808fa4",
+    "phases": {
+      "prefill": {
+        "leaf_count": 110368,
+        "initialized_device_bytes": 633997065216,
+        "generated_zero_bytes": 10069016576,
+        "source_read_calls": 164192,
+        "cumulative_source_bytes": 745846365184,
+        "unique_source_keys": 139614,
+        "unique_source_bytes": 557336782272
+      },
+      "decode": {
+        "leaf_count": 110368,
+        "initialized_device_bytes": 633997065216,
+        "generated_zero_bytes": 10069016576,
+        "source_read_calls": 164192,
+        "cumulative_source_bytes": 745846365184,
+        "unique_source_keys": 139614,
+        "unique_source_bytes": 557336782272
+      }
+    }
+  }
+}

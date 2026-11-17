@@ -1,0 +1,15 @@
+{
+  "canonical398": {
+    "source45_rebased_UNAPPLIED.json": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+    "f09_decode_case.py": "e3bc87daec2a39c6a555b194ec7d9f9a42d8483e36fcabaf1ec448000284ac20",
+    "route.py": "c53c5fd537ecc1bfbf8e228cf691107fda2fb1748dfcb9e5aa09a0d9a3915d43",
+    "artifact_lifecycle.py": "ee648c64b8477cc98b2f3083a6b16c9b6b92cc4612cc3228391dbe53aef1858d",
+    "oracle_integrity.py": "e45c7529d6c34cd57712a7d346ec612641896e38ab98ff88017ceafd87d999d3",
+    "decode_capacity2_files.json": "5262e68afa0b53291ed285e31170b3c017674c3c25dfa9aec78eb7fab5777532"
+  },
+  "live_M02": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "all45_live_files_match": true,
+  "same_e76": "e76b9984db86a27c3c1b4ebd32ab7de97af91357af4c6784746e5e9a3ade0ffa",
+  "full5262_meta8ba_unchanged": true,
+  "old_actual_failed_sum_unlogged": true
+}

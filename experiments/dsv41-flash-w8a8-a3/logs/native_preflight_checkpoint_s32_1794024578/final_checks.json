@@ -1,0 +1,23 @@
+{
+  "all45_root_and_both_owned_copies_unchanged": true,
+  "bundles": [
+    {
+      "bundle": "pipeline",
+      "source_and_owned_sealed_unchanged": true,
+      "manifest": "c60959169836de8c9917e71dcf3360a8295fbf75c7686886cc7833c4a1abd7ac"
+    },
+    {
+      "bundle": "evaluator",
+      "source_and_owned_sealed_unchanged": true,
+      "manifest": "169b9a29fc623098f80ce174a319c8330477020356ce0980838fd1437f72dcb0"
+    },
+    {
+      "bundle": "proof",
+      "source_and_owned_sealed_unchanged": true,
+      "manifest": "970c4ea69962ae695bab4da507d9d6baf07456246a6d9aab3261d2d009b3fc79"
+    }
+  ],
+  "NPU_submitted": 0,
+  "large_fixture_allocated": 0,
+  "checkpoint_real_payload_reads": 0
+}

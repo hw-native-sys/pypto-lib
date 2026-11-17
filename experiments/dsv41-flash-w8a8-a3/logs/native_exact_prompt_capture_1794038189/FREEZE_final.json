@@ -1,0 +1,17 @@
+{
+  "status": "FINAL/PARK",
+  "artifact_files": 1252,
+  "artifacts_manifest_sha256": "99400bf3d9a0a40b4a3d4a2367b094b43a645b50c1c9310cc25eb35bc2d9491e",
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "old_prefix683_unchanged": true,
+  "prefix_manifest_sha256": "f4ca9d488b7e27c6388ff2aa68a71d122a1df5e7d9b2eb186f1321ad0cf28daf",
+  "prefix_CPU_receipt_sha256": "95046fb12a3c88775b563a2bedf26c1b6f9ec08eca7168fd08e96d4668bf0ad7",
+  "decode_manifest_sha256": "424269b3042c1845802bee6ef0f14daddc08ffc6f32c6f5c043607e3ff03c33f",
+  "decode_CPU_receipt_sha256": "e20e195d886c320a1d427cbec05701f79cdaba48142f700c244bc3465fbef4aa",
+  "policy_sha256": "c8a0cc3d7c8ba7f208257e483013e9190124b8743d993ea6363aee0370054fb0",
+  "helper_sha256": "61a92083ba76ec604b0461c9e72a18709dadc243494307a1a349c39cd4d3bb30",
+  "all_own_jobs_complete0": true,
+  "all_known_own_decode21PIDs_absent": true,
+  "work_record": "review-exactN3-decode-1794040149-1794041638",
+  "lifecycle": "Whole unit immutable. Same physical work retained for absolute ABI. No operational exceptions, further append, relocation/rebinding, or device job authorized."
+}

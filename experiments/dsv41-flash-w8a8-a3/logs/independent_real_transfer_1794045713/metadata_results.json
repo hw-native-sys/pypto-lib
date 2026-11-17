@@ -1,0 +1,155 @@
+{
+  "status": "PASS_REAL_HEADERS_AND_ABI_CPU_METADATA_ONLY",
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "independently_rederived_sources": {
+    "embed.weight": {
+      "key": "embed.weight",
+      "shard": "quant_model_weights-00001-of-00272.safetensors",
+      "shape": [
+        129280,
+        5120
+      ],
+      "dtype": "torch.bfloat16",
+      "itemsize": 2,
+      "nbytes": 1323827200,
+      "data_offsets": [
+        146821120,
+        1470648320
+      ],
+      "absolute_data_range": [
+        146821600,
+        1470648800
+      ],
+      "header_bytes": 472,
+      "header_sha256": "560e86a3680d507fef117612058039679d9f935c1c30adb957d54ab9c18c9c2b",
+      "file_size": 1470648800,
+      "mtime_ns": 1793175905827738085,
+      "max_reads": 4
+    },
+    "layers.1.ffn.experts.1.w1.weight": {
+      "key": "layers.1.ffn.experts.1.w1.weight",
+      "shard": "quant_model_weights-00009-of-00272.safetensors",
+      "shape": [
+        2304,
+        5120
+      ],
+      "dtype": "torch.int8",
+      "itemsize": 1,
+      "nbytes": 11796480,
+      "data_offsets": [
+        761392088,
+        773188568
+      ],
+      "absolute_data_range": [
+        761441344,
+        773237824
+      ],
+      "header_bytes": 49248,
+      "header_sha256": "5986239b07de9825dd04984a259a2e96e0c7b0ebf2f904445c3045c9f3843f72",
+      "file_size": 2144664640,
+      "mtime_ns": 1793178764186616066,
+      "max_reads": 1
+    },
+    "layers.1.ffn.experts.1.w1.weight_offset": {
+      "key": "layers.1.ffn.experts.1.w1.weight_offset",
+      "shard": "quant_model_weights-00009-of-00272.safetensors",
+      "shape": [
+        2304,
+        1
+      ],
+      "dtype": "torch.float32",
+      "itemsize": 4,
+      "nbytes": 9216,
+      "data_offsets": [
+        773197784,
+        773207000
+      ],
+      "absolute_data_range": [
+        773247040,
+        773256256
+      ],
+      "header_bytes": 49248,
+      "header_sha256": "5986239b07de9825dd04984a259a2e96e0c7b0ebf2f904445c3045c9f3843f72",
+      "file_size": 2144664640,
+      "mtime_ns": 1793178764186616066,
+      "max_reads": 1
+    },
+    "layers.1.ffn.experts.1.w1.weight_scale": {
+      "key": "layers.1.ffn.experts.1.w1.weight_scale",
+      "shard": "quant_model_weights-00009-of-00272.safetensors",
+      "shape": [
+        2304,
+        1
+      ],
+      "dtype": "torch.float32",
+      "itemsize": 4,
+      "nbytes": 9216,
+      "data_offsets": [
+        773188568,
+        773197784
+      ],
+      "absolute_data_range": [
+        773237824,
+        773247040
+      ],
+      "header_bytes": 49248,
+      "header_sha256": "5986239b07de9825dd04984a259a2e96e0c7b0ebf2f904445c3045c9f3843f72",
+      "file_size": 2144664640,
+      "mtime_ns": 1793178764186616066,
+      "max_reads": 1
+    }
+  },
+  "actual57_resources": 57,
+  "static_bytes_per_rank": 39624816576,
+  "independent_ABI_addresses": [
+    {
+      "argument": "embed_weight",
+      "prefix": [],
+      "BYTE_offset": 0
+    },
+    {
+      "argument": "embed_weight",
+      "prefix": [],
+      "BYTE_offset": 0
+    },
+    {
+      "argument": "embed_weight",
+      "prefix": [],
+      "BYTE_offset": 0
+    },
+    {
+      "argument": "embed_weight",
+      "prefix": [],
+      "BYTE_offset": 0
+    },
+    {
+      "argument": "w1",
+      "prefix": [
+        1,
+        1
+      ],
+      "BYTE_offset": 294912000
+    },
+    {
+      "argument": "w1_scale",
+      "prefix": [
+        1,
+        1
+      ],
+      "BYTE_offset": 230400
+    }
+  ],
+  "independent_byte_counts": {
+    "unique_source_bytes": 1335642112,
+    "cumulative_source_bytes": 5307123712,
+    "initialized_device_bytes": 5307114496
+  },
+  "checkpoint_payload_bytes_read": 0,
+  "NPU": 0,
+  "large_allocations": 0,
+  "history_age_gate": "none on old calib/empty in transport path; only NEW authorization has <=3600 expiry",
+  "old_operation_validate_calibration_exists": true,
+  "old_age_gate_not_called_here": true,
+  "policy_floor_per_rank": 18088299200,
+  "policy_PLANNING_not_measured_peak": true
+}

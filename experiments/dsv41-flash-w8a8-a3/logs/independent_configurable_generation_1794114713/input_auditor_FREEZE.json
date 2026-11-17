@@ -1,0 +1,13 @@
+{
+  "schema": "independent-configurable-executable-auditor-freeze/1",
+  "status": "FINAL_EXECUTABLE_READY_PARK",
+  "manifest_path": "artifacts.json",
+  "manifest_sha256": "497be161cbb684f2e9da5e1ddc95770cdfe1131b6b0b8669d62fc55f138cc70a",
+  "file_count": 29,
+  "end_epoch": 1794112269,
+  "shared_writes": 0,
+  "actual_bindings": "REQUIRED_NO_ACTUAL_GO",
+  "CPU_scaffolding": "37PASS0unmet; late source alignment explicitly not rerun",
+  "actual_auditor_invocations": 0,
+  "immutable_after_seal": true
+}

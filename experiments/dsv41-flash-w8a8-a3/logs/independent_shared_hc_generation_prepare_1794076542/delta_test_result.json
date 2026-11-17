@@ -1,0 +1,65 @@
+{
+  "status": "PASS_SYNTHETIC_DELTA_ONLY",
+  "started_epoch": 1794076759.9097416,
+  "ended_epoch": 1794076759.9952629,
+  "no_model_or_NPU": true,
+  "historical281_not_executed": true,
+  "borrowed_alias_count": 912,
+  "C1_views": 112,
+  "same_shape": 800,
+  "EOS_before_decode_branch_passed": true,
+  "negative_controls": [
+    {
+      "negative": "false_two_upload_account",
+      "rejected_by": [
+        "one-owner-exact-typed-reuse-accounting"
+      ]
+    },
+    {
+      "negative": "decode_static_second_read",
+      "rejected_by": [
+        "one-owner-exact-typed-reuse-accounting"
+      ]
+    },
+    {
+      "negative": "decode_false_zero_bool",
+      "rejected_by": [
+        "one-owner-exact-typed-reuse-accounting"
+      ]
+    },
+    {
+      "negative": "borrowed_wrong_base",
+      "rejected_by": [
+        "borrowed112-C1-full-byte-views800-same-unique-canonical-rank-bases"
+      ]
+    },
+    {
+      "negative": "borrowed_duplicate_canonical_base",
+      "rejected_by": [
+        "borrowed112-C1-full-byte-views800-same-unique-canonical-rank-bases"
+      ]
+    },
+    {
+      "negative": "wrong_C1_consumer",
+      "rejected_by": [
+        "borrowed112-C1-full-byte-views800-same-unique-canonical-rank-bases"
+      ]
+    },
+    {
+      "negative": "second_complete_upload",
+      "rejected_by": [
+        "shared-only-one-canonical-upload-no-decode-upload"
+      ]
+    },
+    {
+      "negative": "fabricated_prefill_free",
+      "rejected_by": [
+        "one-owner-phase-final-after-free-only-actual-closingphase"
+      ]
+    }
+  ],
+  "old_signature_replacement_rejected": true,
+  "current_PENDING_external_pins_rejected": true,
+  "actual_text_quality_never_autoPASS": true,
+  "fixture_note": "metadata-only synthetic target names/sizes; no tensor allocation/read/full fixtures or actual receipt claimed"
+}

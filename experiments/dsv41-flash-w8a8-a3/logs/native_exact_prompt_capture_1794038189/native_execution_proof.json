@@ -1,0 +1,198 @@
+{
+  "status": "NATIVE_EXECUTION_CAPTURE_ONLY_NOT_NUMERICAL",
+  "worker_terminals": [
+    {
+      "pid": "1052644",
+      "run_id": "1",
+      "task_slot": "14",
+      "worker_id": "14",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "hid": "3df760bcce899bc9"
+    },
+    {
+      "pid": "1052644",
+      "run_id": "1",
+      "task_slot": "13",
+      "worker_id": "13",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "hid": "3df760bcce899bc9"
+    },
+    {
+      "pid": "1052644",
+      "run_id": "1",
+      "task_slot": "2",
+      "worker_id": "2",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "hid": "3df760bcce899bc9"
+    },
+    {
+      "pid": "1052644",
+      "run_id": "1",
+      "task_slot": "12",
+      "worker_id": "12",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "hid": "3df760bcce899bc9"
+    },
+    {
+      "pid": "1052644",
+      "run_id": "1",
+      "task_slot": "10",
+      "worker_id": "10",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "hid": "3df760bcce899bc9"
+    },
+    {
+      "pid": "1052644",
+      "run_id": "1",
+      "task_slot": "11",
+      "worker_id": "11",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "hid": "3df760bcce899bc9"
+    },
+    {
+      "pid": "1052644",
+      "run_id": "1",
+      "task_slot": "15",
+      "worker_id": "15",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "hid": "3df760bcce899bc9"
+    },
+    {
+      "pid": "1052644",
+      "run_id": "1",
+      "task_slot": "3",
+      "worker_id": "3",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "hid": "3df760bcce899bc9"
+    },
+    {
+      "pid": "1052644",
+      "run_id": "1",
+      "task_slot": "9",
+      "worker_id": "9",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "hid": "3df760bcce899bc9"
+    },
+    {
+      "pid": "1052644",
+      "run_id": "1",
+      "task_slot": "1",
+      "worker_id": "1",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "hid": "3df760bcce899bc9"
+    },
+    {
+      "pid": "1052644",
+      "run_id": "1",
+      "task_slot": "6",
+      "worker_id": "6",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "hid": "3df760bcce899bc9"
+    },
+    {
+      "pid": "1052644",
+      "run_id": "1",
+      "task_slot": "0",
+      "worker_id": "0",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "hid": "3df760bcce899bc9"
+    },
+    {
+      "pid": "1052644",
+      "run_id": "1",
+      "task_slot": "4",
+      "worker_id": "4",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "hid": "3df760bcce899bc9"
+    },
+    {
+      "pid": "1052644",
+      "run_id": "1",
+      "task_slot": "8",
+      "worker_id": "8",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "hid": "3df760bcce899bc9"
+    },
+    {
+      "pid": "1052644",
+      "run_id": "1",
+      "task_slot": "5",
+      "worker_id": "5",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "hid": "3df760bcce899bc9"
+    },
+    {
+      "pid": "1052644",
+      "run_id": "1",
+      "task_slot": "7",
+      "worker_id": "7",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "hid": "3df760bcce899bc9"
+    }
+  ],
+  "actual_npu_ranks": 16,
+  "public_memory": {
+    "before_weights": {
+      "ranks": 16,
+      "min_free": 59884150784,
+      "committed_min": 5452929509,
+      "committed_max": 5452929509
+    },
+    "after_upload": {
+      "ranks": 16,
+      "min_free": 53415735296,
+      "committed_min": 11916808613,
+      "committed_max": 11916808613
+    },
+    "after_dispatch": {
+      "ranks": 16,
+      "min_free": 53385281536,
+      "committed_min": 11939569636,
+      "committed_max": 11939569636
+    },
+    "before_close": {
+      "ranks": 16,
+      "min_free": 53385261056,
+      "committed_min": 11939569636,
+      "committed_max": 11939569636
+    }
+  },
+  "runtime_configuration": {
+    "execution_mode": "ExecutionMode.ONBOARD",
+    "ring_heap": [
+      0,
+      0,
+      4294967296,
+      0
+    ]
+  },
+  "host_orch_sha256": "45676dff5566fc7cd7b06cf4acc33771ae82e95df2e39e1572f4967f412678e2",
+  "kernel_config_sha256": "c6c1f032d6a622402754ad74367900f4ec8efb08cadb3395613ef45ce7f15aaf",
+  "host_dynamic_N_binding": "T_DYN = tensors[\"input_ids__ssa_v0\"].shape[1], then per-rank0:T_DYN slices",
+  "generic_ABI_SHA": "9734f8235dd25d522bb24300a6b801d8d412eaf7202a10973b322fa258262620",
+  "generic_ABI_scope": "parameter directions/dtypes/layouts and fixed dimensions; token dimensions -1, hash alone does not prove N3",
+  "N3_concrete_evidence": [
+    "fixed case build_fwd_specs3/_prefill_entry3",
+    "input_ids384B in actual spec memory plan",
+    "43 nonstatic and57 static headers and bytes in capsule",
+    "initial/actual IDs100-101-102 shape16x3 andtoken_counts3/positions0-1-2",
+    "native16 terminals outcome0 +copyback/normalclose"
+  ],
+  "committed_scope": "public excludesHCCL/VMM; free/total device-wide;168directory not constructedbank count"
+}

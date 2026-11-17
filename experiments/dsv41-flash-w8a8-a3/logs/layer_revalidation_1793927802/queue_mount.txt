@@ -1,0 +1,2 @@
+TARGET SOURCE    FSTYPE OPTIONS
+/      /dev/sda2 ext4   ro,nosuid,nodev,relatime

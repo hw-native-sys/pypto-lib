@@ -1,0 +1,62 @@
+{
+  "schema": "F09-independent-full-prequeue/1",
+  "status": "PASS_SOURCE_PROFILE_RESOURCES_AND_FALSE_SCOPE_ONLY",
+  "started_epoch": 1794091039.2252786,
+  "ended_epoch": 1794091040.1093264,
+  "Main_manifest_sha256": "66e7200a3fd49a20159e4ab2fb16fd2f67a2e1001e1254e21cef913046280770",
+  "case_sha256": "7aa9a74e3f6a6f7a848a0ba73f56c49fe764b4178c7c16245f66d41d9d132818",
+  "launcher_sha256": "6630f59b0ec151b0a74de8f20a34177b38f2e9932c9c18aaf7a31697a4241401",
+  "pins_sha256": "8be91dde598ac894cb5be3ed3f5927a736931a8fb3bec3fff7dc4aac3b5f084e",
+  "prequeue_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_full_capture_1794090318_launch/prequeue.json",
+  "prequeue_sha256": "acfa5038f919c82ef015736afe9011d6c97d87a11b10cb89a288ecfeebe5a8f6",
+  "full_profile": {
+    "origin_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/build/decode_capacity2",
+    "manifest": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/decode_capacity2_files.json",
+    "manifest_sha256": "5262e68afa0b53291ed285e31170b3c017674c3c25dfa9aec78eb7fab5777532",
+    "metadata_sha256": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770"
+  },
+  "resources": {
+    "epoch": 1794091039.8048675,
+    "observed": {
+      "HOST": 1722197925888,
+      "DISK": 7876193026048,
+      "SHM": 1079343157248
+    },
+    "minimum_bytes": {
+      "HOST": 322122547200,
+      "DISK": 17179869184,
+      "SHM": 34359738368
+    },
+    "measured_peak_claim": false
+  },
+  "schema_profile_countcontrols_checked_from_source": {
+    "schema": "Root-F09-fullentry-operation/1",
+    "approved": true,
+    "requested_profile": "decode_capacity2",
+    "count_controls_accepted": true
+  },
+  "executed_default_scope_refusal": true,
+  "executed_false_parent_refusals": [
+    {
+      "mode": "native",
+      "approved": false,
+      "returncode": 1,
+      "future_scope_refused": true
+    },
+    {
+      "mode": "cpu",
+      "approved": false,
+      "returncode": 1,
+      "future_scope_refused": true
+    }
+  ],
+  "native_work_exists": false,
+  "valid_grants": 0,
+  "fixture_tensor_reader_compile_prepare_NPU_calls": 0,
+  "accepted_active_and_old_count_receipts": true,
+  "full57_source_preflight_manifest": "2b0d43109e78210571f647300b10b125b036f147ce5e314be6c104f42872f60b",
+  "full119_native_inventory_or_dispatch": "NOT_RUN",
+  "full171_reference": "NOT_RUN",
+  "count32_proof_is_not_full119_native_proof": true,
+  "measured_peak_claim": false
+}

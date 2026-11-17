@@ -1,0 +1,16 @@
+{
+  "prefix": {
+    "static_arguments": 57,
+    "expert_layers": 1,
+    "static_bytes_per_rank": 6463879104,
+    "nonstatic_tensor_bytes": 7609876736,
+    "largest_static_host_argument_bytes": 13421772800
+  },
+  "decode": {
+    "static_arguments": 57,
+    "expert_layers": 1,
+    "static_bytes_per_rank": 6463879104,
+    "nonstatic_tensor_bytes": 247111680,
+    "largest_static_host_argument_bytes": 13421772800
+  }
+}

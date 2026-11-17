@@ -1,0 +1,109 @@
+{
+  "resources": [],
+  "allocations": [],
+  "cleanup_errors": [],
+  "prewarm": [],
+  "status": "FAIL",
+  "compute_dispatches": 0,
+  "payload_bytes": 0,
+  "error": "Refused: invalid public memory query",
+  "after_free_before_close": [
+    {
+      "rank": 0,
+      "free": 85899345920,
+      "total": 107374182400,
+      "committed": 21474836480
+    },
+    {
+      "rank": 1,
+      "free": 85899345920,
+      "total": 107374182400,
+      "committed": 21474836480
+    },
+    {
+      "rank": 2,
+      "free": 85899345920,
+      "total": 107374182400,
+      "committed": 21474836480
+    },
+    {
+      "rank": 3,
+      "free": 85899345920,
+      "total": 107374182400,
+      "committed": 21474836480
+    },
+    {
+      "rank": 4,
+      "free": 85899345920,
+      "total": 107374182400,
+      "committed": 21474836480
+    },
+    {
+      "rank": 5,
+      "free": 85899345920,
+      "total": 107374182400,
+      "committed": 21474836480
+    },
+    {
+      "rank": 6,
+      "free": 85899345920,
+      "total": 107374182400,
+      "committed": 21474836480
+    },
+    {
+      "rank": 7,
+      "free": 85899345920,
+      "total": 107374182400,
+      "committed": 21474836480
+    },
+    {
+      "rank": 8,
+      "free": 85899345920,
+      "total": 107374182400,
+      "committed": 21474836480
+    },
+    {
+      "rank": 9,
+      "free": 85899345920,
+      "total": 107374182400,
+      "committed": 21474836480
+    },
+    {
+      "rank": 10,
+      "free": 85899345920,
+      "total": 107374182400,
+      "committed": 21474836480
+    },
+    {
+      "rank": 11,
+      "free": 85899345920,
+      "total": 107374182400,
+      "committed": 21474836480
+    },
+    {
+      "rank": 12,
+      "free": 85899345920,
+      "total": 107374182400,
+      "committed": 21474836480
+    },
+    {
+      "rank": 13,
+      "free": 85899345920,
+      "total": 107374182400,
+      "committed": 21474836480
+    },
+    {
+      "rank": 14,
+      "free": 85899345920,
+      "total": 107374182400,
+      "committed": 21474836480
+    },
+    {
+      "rank": 15,
+      "free": 85899345920,
+      "total": 107374182400,
+      "committed": 21474836480
+    }
+  ],
+  "owner_closed": true
+}

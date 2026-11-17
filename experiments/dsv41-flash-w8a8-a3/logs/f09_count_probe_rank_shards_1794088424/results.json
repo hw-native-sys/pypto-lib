@@ -1,0 +1,17 @@
+{
+  "pass": true,
+  "two_count_signatures": true,
+  "generated_static_checks": 576,
+  "all18_shape_dtype_contiguous_stride_contracts": true,
+  "selected_static_global_bytes_unchanged": 14339303104,
+  "probe_rank_AST_unchanged": true,
+  "HOST_body_AST_unchanged": true,
+  "actual_NZ_packed_shape_roundtrip_small": true,
+  "old_public_leading_slice_reject": true,
+  "fullentry_recompiled": false,
+  "prepare": false,
+  "NPU": false,
+  "model_fixture": false,
+  "real_header_or_weight_payload": false,
+  "actual_Root_grants": 0
+}

@@ -1,0 +1,15 @@
+{
+  "CPU_audit_raw.log": "5c9704c05b6ad5842aaed35a2bd526c4e24759874fd4b95ef541d494eb14cd03",
+  "READINESS.json": "58e4be00f18eff1f1d1cec7c897bd2f81ebb00ccce4b4e1313d50701edd37442",
+  "REPORT.md": "58832f89b1702a9dbdc02d30c6ef6900a868da424875ee86a30abbffe5a67589",
+  "audit_capsules.py": "a9384d099909f806999990fde5f375a42433447cd205d5b2ec768d57ee96116f",
+  "before_submit.json": "e670af9475193a857c42a88342bda69e2f5297c7fc6b5eba77745d3b5ca81695",
+  "capsule_audit_result.json": "1da9ab534f24081eec87d0c0f599217578a47832f1573b73515a23062734ab00",
+  "locks_after.txt": "598cd338ea94be36cce4419d9041d8c65917e8db9a8ed6423bace051d32976f7",
+  "native_raw.log": "0b0ca9566c41b388ab4c1dc1482a46833966aa2b48ca931eee15e7183f17f171",
+  "native_status.txt": "e9d1ff712f06bb1de067759e33a7004938e8ac346c8609ffd9b60aa081851ac4",
+  "npu_after.txt": "ec05b995ded78724ad18098b336a949c341be5230345781144a7fe2d63061383",
+  "observed_births.jsonl": "037049748eb93ee663649cde83d29a9eed6e1e5a501895acb8f7eb88a2c7da9a",
+  "terminal_receipt.json": "38d9a93db23233921e638d2835e49b642ca3bb337f70303a5d8d5880121fe46a",
+  "work_record.json": "7ce24bbe8ca6ff27f95a8f7211e51b6ea21f40420b480bc78bea8da0410eb40e"
+}

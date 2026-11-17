@@ -1,0 +1,16 @@
+{
+  "source45_sha256": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "math_baseline_sha256": "eb90ea56e26d0cb97dd12d330559c2ae1b53f4ae5cbf866cc01bfbbb150fecf2",
+  "new_plan_sha256": "806852d5baec99a522f5adc3015bdd204d9ac6b17244a29cb26445cbd55fda89",
+  "HC_evidence": "native_whole_FAILED; Root-accepted separate offline31/0 bounded values",
+  "fresh_signature_receipt": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_hc_applied_signatures_1794076423/signature_receipt.json",
+    "sha256": "3f5441beade418bf307463188a7b5a52c733299cf6dffde0fe501d4df5fbefd4",
+    "manifest_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_hc_applied_signatures_1794076423/artifacts.json",
+    "manifest_sha256": "4ec39ab4506fe6d388fab0d7503f3be4d6b47d72faac0fbbda978f6a473a42a5"
+  },
+  "checkpoint_header_bytes_read": 0,
+  "tensor_payload_bytes": 0,
+  "signature_compiles": 0,
+  "actual_grants": 0
+}

@@ -1,0 +1,21 @@
+{
+  "stage": "FINAL/PARK",
+  "epoch": 1794051756.1606586,
+  "own_jobs": 6,
+  "all_own_jobs_terminal": true,
+  "preserved_reviewer_failures": [
+    "task_20261107_192702_342054612061",
+    "task_20261107_193539_344169022760"
+  ],
+  "own_native_jobs": 0,
+  "last_recorded_cpu_identity": {
+    "pid": 3454084,
+    "starttick": 105152693,
+    "present": false
+  },
+  "actual_checkpoint_tensor_payload_reads": 0,
+  "product_applied": false,
+  "source45_unchanged": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "resource_query_exit": 0,
+  "no_pending_independent_execution": true
+}

@@ -1,0 +1,36 @@
+{
+  "complete_forward_compiles": {
+    "compile/full_compile/_jit_decode_fwd_20261106_201518_n7gbv22t/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp": {
+      "sha256": "2db12db1c8c8c372bcb612b430e87f3a86d444037cf0e3f01c04f218cbb5a8af",
+      "lines": [
+        126,
+        430,
+        882,
+        885,
+        905,
+        931,
+        5455,
+        5467,
+        10520,
+        10532
+      ],
+      "restore_before_gate": true
+    },
+    "compile/full_compile/_jit_prefill_fwd_20261106_201544_0m2ujapj/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp": {
+      "sha256": "ee474e680e43287d7c3d6ac55679498b32225f6efe40bc6d5594aedc586c0a55",
+      "lines": [
+        115,
+        1415,
+        1418,
+        1438,
+        1464,
+        6209
+      ],
+      "restore_before_gate": true
+    }
+  },
+  "all_existing_F14_loader_methods_except_resource_binding_AST_unchanged": true,
+  "new_loader_methods_only": [
+    "engram_rotation"
+  ]
+}

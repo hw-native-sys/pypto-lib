@@ -1,0 +1,13 @@
+# Continuation review — not executed
+
+The actual16-device decode1 numerical prerequisite failed, so the128prefix->3decode chain and a stale-metadata device mutant were not launched. This prevents spending device time on a chain whose isolated decode step already fails its exported-state contract.
+
+The prepared worker helper cannot be accepted as delivered: d.MUTABLE_NAMES must refer to owning d._MUTABLE_NAMES. Its intended prefix positions0..127 and decode128/129/130 are a valid page/parity crossing; driver builders refresh both query profiles, request/window/compressed positions/slots/lens and index/state tables. Handoff carries only six exported persistent buffers, with per-query topk/pool/hidden/mix scratch rebuilt for capacity1. TensorSpec.create_tensor returns a supplied same-dtype tensor directly, so actual buffers can carry through run(); expected mutable buffers must remain separately cloned before each dispatch to avoid host alias masking.
+
+For future execution, prove this explicitly: save returned-device cache/state checksums and unaffected prefix regions before handoff; show those exact tensors or copied bytes feed the next step; inspect each decode step against an oracle grounded in its actual prior state and report separately any unconditioned cumulative-reference result. Owning full-forward comparators are staged: most expectations are recomputed from actual previous-layer snapshots. Their PASS is per-layer/staged acceptance, not a strict unconditioned40-layer end-to-end equivalence claim.
+
+runtime_dir reload can reuse the compiled decode artifact, but keep the exact artifact identity and ABI proof for all3 steps. The existing staged helper uses a newly prepared worker/reset protocol windows to avoid stale CommDomain/window state. A future replacement of direct driver dispatch by prepared dispatch would need its own explicit review: it cannot silently demonstrate that the current driver's repeated one-shot calls or resident ownership work.
+
+A meaningful stale-metadata negative can retain position128 slots/lens/RoPE while expecting129: it must numerically reject newly published WINDOW/C2 rows and preserve old-prefix rows. Select published rows explicitly with the standard comparator so a whole-cache outlier allowance cannot hide one wrong slot. Compiler/runtime exceptions cannot satisfy the control. No new threshold or golden change is authorized.
+
+No continuous decode, persistent device residency, stale-metadata numerical rejection, generated-token history or text is claimed by this review. General unequal/idle/multi-request F09 remains open even after a future capacity1 chain succeeds.

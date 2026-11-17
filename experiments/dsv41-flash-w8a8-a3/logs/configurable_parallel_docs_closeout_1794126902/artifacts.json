@@ -1,0 +1,20 @@
+{
+  "DRAFT_STATUS.json": "4b03c476aeb140aa7b85e65076f4deace2aa521978d86768cfd4158cbe1fc751",
+  "FINAL_STATUS.json": "d23ff48287abb064641bace4ade0539c1ab6f1ac9572b95484d12db88d4323d8",
+  "HANDOFF.md.after": "32280fe6b1298aae3383d5f1569ccb2eb17e543d14e47979315bf52c1981377e",
+  "HANDOFF.md.before": "af410fe52150795fc9a647d8d6d917692a342d9d3b2a62f77df39db0022e7ff0",
+  "INTERFACE.md.after": "b93b73b5f64353be0c5c21566b568f20bed2362af3a651fb527514eaa06756c4",
+  "INTERFACE.md.before": "280f04b6b822a48ef14491c2dd59599b915b172efb605206a2ff560257d8b374",
+  "MODULES.md.after": "7b581ef155b9e7dff710465b2d2376f0cdaf44a7dee408bf80f15a841f470ed5",
+  "MODULES.md.before": "a34dec86f1b10d42102efa1fc281a1449f9180448e9a0fbf4a42c00834438e93",
+  "OWNERSHIP.md": "3c2cfdcddb4fe763aa7076b49a94081066c85bbe6f154fcc3be8f6fe3251cd2d",
+  "PUBLISHED.json": "faac809edbb262bacaef68158630e1bfc20a439738074809408b505185664df5",
+  "REPORT.md": "31fd9ccf89f7421ff5faafaa747750b2881f1d2ea6cb5cc91bd37d0362c6a51b",
+  "changes.json": "c54ea9f6dabbc5bf879301db732e634e6538b6972f7771f85f88db438887cda6",
+  "current_overlay.DRAFT.md": "f5b3b26bfd3efafc44c44008209df341d5d342cc532b50a8a85bd1312ca30190",
+  "current_overlay.FINAL.md": "acc3da84acc630cca11555b5ea80792db1b50a664107773ef7d6aa5f103455f1",
+  "publish.py": "6f6be4511cd9b0c6404239ac14333408abe220f9c362aa1a42b6b95128627b5d",
+  "source_before.json": "f0e91a30e4117e110be183ef44acf2874eea813cc6f72ac7c7fa44bc4ede3a7f",
+  "start.json": "3c843ee3ddea40c6d4778ad636ebf59dfeaff60a04ab922bece151a24cc0a56c",
+  "work_record.json": "e9b1910d676af8c175668f6d2824104a498bfdba4040243237857a0b0315607e"
+}

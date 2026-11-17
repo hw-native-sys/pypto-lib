@@ -1,0 +1,12 @@
+{
+  "agent": "/root/reviewer_f09",
+  "start_epoch": 1794092816.1907218,
+  "end_epoch": 1794092930.8919792,
+  "CPUtask": "task_20261108_070731_18717497373",
+  "checker_seconds": 5.986390829086304,
+  "accounting": "unique snapshot-onlyCPU diagnostic, no additive duplicate of sealed065800nativeinterval",
+  "shared_writes": 0,
+  "ownjobs": 0,
+  "NPU": 0,
+  "status": "DIAGNOSTIC_COMPLETE_FINAL_PARK"
+}

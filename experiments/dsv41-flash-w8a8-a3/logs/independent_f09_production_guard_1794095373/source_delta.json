@@ -1,0 +1,55 @@
+{
+  "kind": "SOURCE_MANIFEST_COMPARISON_NOT_RUNTIME_TEST",
+  "old_M02_sha256": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "candidate8153_sha256": "8153c7f040bef51900a6e6c9ff27b018279b7503f31d50ec5488457e49770b28",
+  "same45pathset": true,
+  "changed_files": [
+    {
+      "path": "models/deepseek_v4_1_flash_a3_w8a8/compressor.py",
+      "M02": "5575fea0bb02a73ebd58dbabd2a9f0a9fe71c53510b15f22c8d05687d8f48031",
+      "candidate8153": "dd9180f03a15ab4b735342259cc46de2dbd517e012ecce6f38c8e4483834cfaa"
+    },
+    {
+      "path": "models/deepseek_v4_1_flash_a3_w8a8/decode_fwd.py",
+      "M02": "ed39c749b0d4cf5344fcf7a8f9b63fd0259cbb21496729ef425a09fb6d73ee1a",
+      "candidate8153": "db733af729160a1b7c02ecc6bcad88ad01199eedbe29144cdfc0e4ca7b84af3b"
+    },
+    {
+      "path": "models/deepseek_v4_1_flash_a3_w8a8/decode_layer.py",
+      "M02": "eb7b5df1dc0eba07df6e6b700af8b12819d7e2ef11742ed41e65e2028ca35311",
+      "candidate8153": "f1144be6bf2c46dade8ef1dfba9fe1b9dc27e9feb4c5b23926fbeeb47d63b605"
+    },
+    {
+      "path": "models/deepseek_v4_1_flash_a3_w8a8/decode_moe.py",
+      "M02": "92ed8131e2bd618b044f33ac036c7962ffdf0cf9e88a6498c94552b29adb8872",
+      "candidate8153": "3183a459f3648cd4355586ebd4e8a42cbb741901fb779a756f2e7ee66d9b385b"
+    },
+    {
+      "path": "models/deepseek_v4_1_flash_a3_w8a8/layer_reference.py",
+      "M02": "c382bc7131c4bfd3f159d291c99de7e0d9f3368e5b25e1c3515b96f825dedda0",
+      "candidate8153": "fa80a548d28b07f8ff90bdaa8fd311d9d188352bd0246cef7b59b15321010b3b"
+    },
+    {
+      "path": "models/deepseek_v4_1_flash_a3_w8a8/moe_exchange.py",
+      "M02": "951378f40c2ab7cb4f1573aeda72548bab017ed76c545641620e6e3502b4c780",
+      "candidate8153": "294385aa179fd083ee79a6db0603416b92cd36e7b7ea71e82d0e87a536e6c640"
+    },
+    {
+      "path": "models/deepseek_v4_1_flash_a3_w8a8/prefill_fwd.py",
+      "M02": "5f51f3b23fe08100b4893bdd039e71666f6bfc0a8697ebb1049321e8bde52ac6",
+      "candidate8153": "cd3c06ee8b449d6a17cc519aec1aefcd0dbdee0a61a65cf957797fe2602057f8"
+    },
+    {
+      "path": "models/deepseek_v4_1_flash_a3_w8a8/prefill_layer.py",
+      "M02": "e5fef468b644c6ce41c19df2fe3fcd9a37d9b341204d9bdc96364d6c6dcb49a1",
+      "candidate8153": "ce428032daab6a263fe2b3eb335a8ec198731955f9be570b83bd1c58624cf928"
+    },
+    {
+      "path": "models/deepseek_v4_1_flash_a3_w8a8/prefill_moe.py",
+      "M02": "2e738fb7efdda6318dba23ad8d0cc715145fc246b20e7cc3f02371a3d8d9d6aa",
+      "candidate8153": "6f0bf553d77a63f06d63f5baeabeffae73d9642744b0af9a2a2ac21b2894b021"
+    }
+  ],
+  "generate_identical": true,
+  "actual_source_changed": false
+}

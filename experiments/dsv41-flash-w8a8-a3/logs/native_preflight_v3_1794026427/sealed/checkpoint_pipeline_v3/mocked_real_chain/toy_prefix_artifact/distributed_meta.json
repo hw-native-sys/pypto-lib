@@ -1,0 +1,1 @@
+{"platform": "a2a3", "params": ["w", "x", "state", "logits", "position", "slot", "index_block_table", "window_cache", "compressed_cache_c1a", "index_cache_c1a", "compressed_cache_c2a", "index_cache_c2a", "position_ids", "request_ids", "window_slots", "c1a_compressed_slots", "c2a_compressed_slots"], "fake": true}

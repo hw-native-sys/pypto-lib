@@ -1,0 +1,17 @@
+{
+  "status": "FINAL_CPU_READY_PARK",
+  "files": 162,
+  "manifest_sha256": "6a9f5f7640ef9e5a1c914d2f44affb2401e590bd35cf89acee9bbcaad77defe9",
+  "report_sha256": "6be5934b4c7064e19ce53b1f2bb99d5d4d4757aaea1c327d4c7148ffdecb6c57",
+  "contract_sha256": "7f89838f3cf9407bf5b86a4231a7b2ad420a12f7c687883640e8b0c4e7091f46",
+  "commands_sha256": "1cd7b52b8081ae8b732f42680a0e9a5aaf705069160d13169487210b1da19b8f",
+  "publisher_sha256": "2ef962f952a9c1a5fc3ecd233471a6d66b7a7f59bf53cceac93a35530f1f3e4c",
+  "driver_sha256": "f83f89b1f589b0ec41347fde4897dc7275d1142382ff5f3e61390634779ad26a",
+  "source_pins_sha256": "42b3b07abb096d53415aa022592412b7bcd64fdc797e45e39f8af3282694b05c",
+  "source_review_sha256": "3a3d6e01add3d207e0074a672884ca5a42158012468e0204567e5983f40a426f",
+  "CPU_pass": true,
+  "native": 0,
+  "actual_positive_grants": 0,
+  "shared_writes": 0,
+  "closed_utc": "2026-11-08T04:23:02.870827+00:00"
+}

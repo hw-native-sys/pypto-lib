@@ -1,0 +1,11 @@
+{
+  "status": "BOUNDED_F09_171_PASS_FINAL_PARK",
+  "files": 641,
+  "manifest_sha256": "ec3aaee0c8e80c01eeca867835fa4365783f7de5b9bb95670edadefb9a30443a",
+  "actual_report_sha256": "27149130d08d31b1edc4d9ba85337d25ffd2f8517c0f84c6f32d4a946195080b",
+  "cpu_numerical_receipt_sha256": "6ce38e890b642908c731fb247accc302938846f892142471d26715398e96c851",
+  "reference_integrity_sha256": "768b2d588c776dfd2cfea415a3eec222942b0e002959898ac0acca56c0371857",
+  "static_recipe_sha256": "4e73e5d8e2a03cedb309f0a3bde16fb5d4a806c4b6ee5039f5c28a8034872e75",
+  "native_terminal_receipt_sha256": "8345cf33f8f4b7542f1cb1d3aff9efbdfeba566f8e740eb6e254dfb5b69df6d0",
+  "shared_writes": 0
+}

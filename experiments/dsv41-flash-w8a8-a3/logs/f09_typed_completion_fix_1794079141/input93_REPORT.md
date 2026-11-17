@@ -1,0 +1,37 @@
+# F09 own-draft zero-active/reference review fixes — FINAL/PARK, UNAPPLIED
+
+MainonlyNEWartifactcopies; no worker/sharedwrites/live/docs edits. Live45M02e07b and currentreal16case remainfrozen. Old76manifestfe2f88f1680989429074557b9c3ef440a3b146db6c78fad15c942032581a87f7/allfiles reverified unchanged. Newcopiedsource45 `f08bb59b008df8ee1f2d4588414de9ff52976848f85e089d57d4dac47257401f`, fullpatchagainstliveM02 `c8224fb95c18f3e23f1a43a77c6547173b67fd386f76096b513c95b8942351ab`, narrowdeltafromold76 `4832628f310a4363b23addaa6d5cf502025ffdd6a75281865b6ca82fdb845a35`. HCc611/currentgenf7b/BF16layerboundary preserved; ONLYmodel/moe_exchange differsfromold76. No signatures/NPU/header/payload/fullfixture/actualgrant; privatecontrolcompletioncompileandrealgraphproofPENDING.
+
+## 1. Legal zero-active source anchors and explicit completion
+
+Oldprimitive receives logicalindices[0,6]/routed[0,D] whenlocalactive0, thenunconditionallyreadsindex0. The countprobe additionallyreadpureOutx_hc_out[0] withouta produceratlocal0. Sourceproofdoesnotestablishcompilerfault oractualfailedruntime.
+
+Newmoe_reuse_wait readanchors initializedconsumed[self,0]protocolwindow; moe_return_signal usesexpert_counts[0], alwayswrittenbycountscopeincludingzeroreceive (oldreturn_stage[0] may beunwritten); moe_return_consumed anchors initializedreturn_consumed[self,0]. Signalwindows are positive16x1/64B anddocumentedzero-initialized. These arelogicalvalidreads independentofundefinedquerytails. Datawait/notifyprotocols unchanged. Everyrankpublishesmetadata/servespeers atlocal0; noEPskip.
+
+Combine isfixedcapacitySPMD withinneractiveguard: semanticmath/writes onlyvalidtokens, positivecapacitysourcecompletion exists evenlocal0. Release keeps deps=[combine_tid]. Optionalprivateconstexprreturn_completion=False preservesTensorreturnforallpreviouscallers; requestingTrue exposesTensor+return_consumed_tid. FFNrequestsprimitivetaskcompletion; probe requestsFFNcompletionandexportsmetadatawith explicitdeps=[ffn_done], nox_hcoutanchor. No model19ABIchange, duplicatedmodelcompute, dummychain/barrier/deferwait/runtimepatch. ConditionalTASK_IDreturn support/generatedreachabilityremainUNPROVENuntilfuturecompile/graphcapture.
+
+Useddependency-liveness skill andreaddependency/scheduling,L3,l2/debuggingdocs. SourcecontrolcontractinCONTROL_AND_VERDICT_CONTRACT.json is intendededges, notactualgeneratedTaskIds. Futurebalanced/local0/zeroreceive graphs andnativefulltopologyrequired; no simplificationtoonecardacceptance.
+
+## 2. Independent reference verdict semantics
+
+Oldadaptercomputesunconditionedexpected butoriginalstagedclosures ignorethatargumentforsnapshot/logit/cachegates; oldclaim19x3/BOTHwasstrongerthanitsgates. Newadapterderives directunconditionedgatesfrom the SAMEactualmake_fwd_comparators source, replacingONLYnested stagedselector withfixedindependentexpected. Everygateexpression/tolerance/mask is unchanged. Originalstaged19 runsseparately, retainingitsoriginaldirectpoolsubset. Fullindependentexpectedbytes andoracleinitialbytes checkedunchanged. Per-calljsonrecords BOTH groups; BOTH_numeric_pass/BOTH_ALL_PASS onlyifbothgroupspass, elsepreservedverdicts+failure. No candidateoutput usedasindependentexpected. This iswithin-callunconditionedinitialactualstate, notstrictwholehistoryrollout.
+
+## 3. Active C2 nonwritten rows
+
+PinnedsourceSTATE_CAPACITY2/compressor155-161 writeslastquery/request tostate[block,position%2,:] only. Newretention preservesallotherrows foractiverequests andwholeblocks foridle. No naivewholeactiveblockexclusion; B/historycachechecks remain. Sourcecontractverifiesboundedcapacity2; currentscenarioonequeryperrequest. No compressor/mathchange. Sparseoppositeparitypoison isexactlyrejected independentofexisting0.5%state tolerance.
+
+## 4. Specific oldphysical negative, not exception-based acceptance
+
+Beforedeclaringnegative requireINT32/nonnegativeexact[16,16,24] and thepinnedforceddestination8/localexperts0..5 matrix: source2forallranks inoldphysicalcase. Thenrequirethe specific192actualvs96independentruntimeper-sourcevector mismatch. Dtype/shape/negative/wrongsource/wrongdestinationfields totaling192 failbeforeverdict. Source/probe/call/role/mode/artifact receiptchecks precedearithmetic; capturewritesexplicitnativekind. No catchANYValueError->PASS remains. No runtimeexceptions substitute numericalcontrol.
+
+## Focused CPU self-evidence
+
+Task030750_36553178537 failed ownast.unparse tuple-returnstringassert; task030833_371166424137 failed sameformatassumptionfortupleassignment. Rawlogs/scriptsretained. These two avoidabletestassertionmistakes were correctedtoASTstructuralchecks; candidateoperator/adapterunchangedforthosefailures. Finaltask_20261108_030941_378341024182 COMPLETE0 runsONE focusedtinysuite, no broadoldcase/fullfixture:
+
+```bash
+task-submit --no-device --max-time 180 --run 'cd /mnt/data/pyptouser/yangyaodong/code/pypto-lib && source activate-pypto.sh && PYTHONDONTWRITEBYTECODE=1 python experiments/dsv41-flash-w8a8-a3/logs/f09_zero_active_reviewfix_1794077743/check_reviewfix.py'
+```
+
+ActualselectedprimitiveASTscopesexecutedunderOWNEDcheckedtinyDSLbuffers, notPyPTOcompiler/runtime: oldzero-view/unwrittenanchorchecksfail; newlocal0has16countputs/45notifiesand96remoteexpertrows, capacity2completions, noempty/NaNanchorreads, selectedactivecombinevalue8unchanged. ProbepublicJITimportandexplicitcompletionASTcontractchecked, notcompiled. Actualgatefactoryoldstagedhidesunconditionalmismatch reproduced; newdirectexpectedrejects, orthogonalstagedmutantrejects. Oldretentionacceptsactiveoppositeparitypoison,newrejects+idlepoisonrejects. Validoldmatrixspecific192vs96reportsnegative;5malformedmatrixcontrolsFAIL. Old76/liveM02 bytepins unchanged.
+
+CPUfakeTaskIds/notificationcounts are source-contractevidence ONLY. Fulllargecapture/referencebranches, all19fullmathoutputs, constexprreturnlowering/nativecountmetadata/actualliveness/slotadmission/physicalruntimeTvariation untested. FUTURE_COMMANDS lists review/compile/graph/nativeholdpoints. No compiler/upstreamissueclaimed; theseareown-draftbugs. F09remainsUNAPPLIED/OPEN, currentrealshared+HCroutepriorityunchanged. Allownjobs/writersPARK.

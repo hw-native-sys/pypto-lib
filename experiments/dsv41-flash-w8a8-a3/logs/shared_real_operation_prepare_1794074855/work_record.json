@@ -1,0 +1,29 @@
+{
+  "role": "review-agent",
+  "start_epoch": 1794074855,
+  "end_epoch": 1794076006,
+  "elapsed_seconds": 1151,
+  "initial_parse_failure_job": "task_20261108_021440_342919127289",
+  "initial_terminal": "COMPLETE1_HELPER_SYNTAX_BEFORE_TEST_CHILD",
+  "corrected_CPU_job": "task_20261108_022435_345651017672",
+  "corrected_terminal": "COMPLETE0",
+  "checks": 17,
+  "source_scope": "FROZEN_PRE_HC_B3E_SNAPSHOT_ONLY",
+  "live_source_followed_during_HC_application": false,
+  "future_HC_authorized": false,
+  "checkpoint_header_bytes_read": 0,
+  "tensor_payload_bytes": 0,
+  "native_jobs": 0,
+  "actual_grants": 0,
+  "signature_compiles": 0,
+  "product_edits": 0,
+  "shared_ledger_writes": 0,
+  "CPU_control_birth_identities_absent": 2,
+  "prior_manifest_pins": {
+    "longer_generation_operation_prepare_1794063015": "f2cef526699b5b8a3b4a0f2e6184a80a22ab6798e30066afe204b6d8ca0d9f27",
+    "telemetry_permission_fix_1794069940": "217ec5e7b28b5f071a0f4de90012bd0b8f49505b92d90eea1cfb41f869771edd",
+    "shared_weight_owner_apply_1794074398": "9aeb50ef3e9f5b8e90993063d7ccb03a668010a310cd16aa83063ee69d94ede5",
+    "shared_weight_owner_draft_1794068025": "a984e4225975cec7e4b7b55dd92276aaab7433d848631958af4eeaacef850581",
+    "hc_math_rebind_plan_1794074799": "4b7fec1eb0618550bdfb9b449ad0c0b0ec49a7db76ab74fa88b779b2f428709f"
+  }
+}

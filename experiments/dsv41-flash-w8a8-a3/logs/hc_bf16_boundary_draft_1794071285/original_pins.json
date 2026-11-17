@@ -1,0 +1,9 @@
+{
+  "experiments/dsv41-flash-w8a8-a3/logs/logic_review_1793929657/upstream_rc2/tests/deepseek_v41_utils.py": "577c667fbf8f8b6f20de8a0ac54c6c0435605aaee1f6c2ccc463b446055bd286",
+  "experiments/dsv41-flash-w8a8-a3/logs/logic_review_1793929657/upstream_rc2/vllm_ascend/models/deepseek_v41/model.py": "101f96b38e9fc47e7be147ddfe56976aee896867c73a33a7d95c3e3c833a6e91",
+  "experiments/dsv41-flash-w8a8-a3/logs/logic_review_1793929657/upstream_rc2/csrc/moe/hc_post/op_host/hc_post_proto.cpp": "904a73ac6281026ff30fed72da4fad3e799b1358152efb0b401deb582e4fe41f",
+  "experiments/dsv41-flash-w8a8-a3/logs/logic_review_1793929657/upstream_rc2/csrc/moe/hc_post/op_kernel/hc_post.cpp": "c735e1e4534bc2d701fbd06636e42082567c81ea3f0ed24e4e10b9a71867eda4",
+  "experiments/dsv41-flash-w8a8-a3/logs/logic_review_1793929657/upstream_rc2/csrc/moe/hc_post/op_kernel/hc_post_d_split.h": "9b7a4a6e1d0fde01632813589566f173ac6561522d0c0cf62463589004f2d58a",
+  "experiments/dsv41-flash-w8a8-a3/logs/repetition_logic_review_1794069747/REPORT.md": "dfc5ba0c508f63ae22e289cca5fdf0faeb32576e614a0c301bd1d90283a0737b",
+  "experiments/dsv41-flash-w8a8-a3/logs/repetition_logic_review_1794069747/hc_boundary_result.json": "95988e0c96867c626eca7891b9cacd78fc946f2bd114329d3765a1a1bafb8d9a"
+}

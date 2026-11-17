@@ -1,0 +1,9 @@
+{
+  "status": "PARK",
+  "writers": [],
+  "all_own_jobs_terminal": true,
+  "source405_liveM02_oldunits_unchanged": true,
+  "CPU_metadata_mock": "PASS",
+  "actual_public_prepare_native": "UNTESTED",
+  "independent_acceptance": "PENDING"
+}

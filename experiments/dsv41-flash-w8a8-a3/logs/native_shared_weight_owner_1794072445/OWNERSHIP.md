@@ -1,0 +1,1 @@
+ONE Root-authorized tiny synthetic native2 shared-owner proof. Frozen79/Main25/19/CC and old cases immutable. Only own new operation output/build/auth/audit/seal. No model or real checkpoint payload or full57 grant.

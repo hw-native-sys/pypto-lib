@@ -1,0 +1,82 @@
+[
+  {
+    "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/downstream/build_output/_jit_decode_c2a_full_attention_test_20261106_155923_kmy9kgpc/orchestration/decode_c2a_full_attention_test.cpp",
+    "sha256": "749703445e1b571c5ad47c09ba30fad0f8978d274e52ac083558feaa1f49bbf4",
+    "excerpts": [
+      "169: TensorCreateInfo attention_latent_inline1143_ci(attention_latent_inline1143_ci_shapes, 2, DataType::BFLOAT16);",
+      "665: params_t19.add_input(latent_inline1489);",
+      "686: params_t20.add_input(latent_inline1141__rv_v2);",
+      "687: params_t20.add_output(attention_latent_inline1143);",
+      "705: params_t21.add_input(attention_latent_inline1143__ssa_v4);",
+      "758: params_t23.add_input(latent_inline1141__rv_v2);"
+    ]
+  },
+  {
+    "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/downstream/build_output/_jit_prefill_c2a_full_test_20261106_155946_xblixtfd/orchestration/prefill_c2a_full_test.cpp",
+    "sha256": "1e01cfaf7137359f07bcc4c68c3ca8f6edaf85c9b6a1b471366ecd5b93a237c8",
+    "excerpts": [
+      "163: TensorCreateInfo attention_latent_inline1137_ci(attention_latent_inline1137_ci_shapes, 2, DataType::BFLOAT16);",
+      "584: params_t16.add_input(latent_inline1425);",
+      "605: params_t17.add_input(latent_inline1135__rv_v2);",
+      "606: params_t17.add_output(attention_latent_inline1137);",
+      "624: params_t18.add_input(attention_latent_inline1137__ssa_v4);",
+      "677: params_t20.add_input(latent_inline1135__rv_v2);"
+    ]
+  },
+  {
+    "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/downstream/build_output/_jit_prefill_attention_test_20261106_160114_gp7wnybe/orchestration/prefill_attention_test.cpp",
+    "sha256": "a1b8c96ce251684c88877a842e717dad3881d595db54706f889a6180187aca7d",
+    "excerpts": [
+      "159: TensorCreateInfo attention_latent_inline1083_ci(attention_latent_inline1083_ci_shapes, 2, DataType::BFLOAT16);",
+      "593: params_t16.add_input(latent_inline1427__ssa_v2);",
+      "614: params_t17.add_input(latent_inline1081__rv_v2);",
+      "615: params_t17.add_output(attention_latent_inline1083);",
+      "633: params_t18.add_input(attention_latent_inline1083__ssa_v4);",
+      "686: params_t20.add_input(latent_inline1081__rv_v2);"
+    ]
+  },
+  {
+    "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/downstream/build_output/_jit_decode_c1a_full_attention_test_20261106_160051__17vbxo9/orchestration/decode_c1a_full_attention_test.cpp",
+    "sha256": "ffd7dabd1e98ecade4c06cbdaed7e36804c19d21aa13e7953b09e83da5d2cfcd",
+    "excerpts": [
+      "159: TensorCreateInfo attention_latent_inline1083_ci(attention_latent_inline1083_ci_shapes, 2, DataType::BFLOAT16);",
+      "593: params_t16.add_input(latent_inline1427__ssa_v2);",
+      "614: params_t17.add_input(latent_inline1081__rv_v2);",
+      "615: params_t17.add_output(attention_latent_inline1083);",
+      "633: params_t18.add_input(attention_latent_inline1083__ssa_v4);",
+      "686: params_t20.add_input(latent_inline1081__rv_v2);"
+    ]
+  },
+  {
+    "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/compile/full_compile/_jit_decode_fwd_20261106_155706_6fi1_yrt/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp",
+    "sha256": "a7ed09753805581284fd54b789e0914d122bd9bf4171d8794686b268f74c07d3",
+    "excerpts": [
+      "1778: TensorCreateInfo attention_latent_inline14235_ci(attention_latent_inline14235_ci_shapes, 2, DataType::BFLOAT16);",
+      "2522: params_t67.add_input(latent_inline14581);",
+      "2543: params_t68.add_input(latent_inline14233__rv_v2);",
+      "2562: params_t69.add_input(attention_latent_inline14235__ssa_v4);",
+      "2615: params_t71.add_input(latent_inline14233__rv_v2);",
+      "6822: TensorCreateInfo attention_latent_inline16892_ci(attention_latent_inline16892_ci_shapes, 2, DataType::BFLOAT16);",
+      "7440: params_t218.add_input(latent_inline17236__ssa_v2);",
+      "7461: params_t219.add_input(latent_inline16890__rv_v2);",
+      "7480: params_t220.add_input(attention_latent_inline16892__ssa_v4);",
+      "7533: params_t222.add_input(latent_inline16890__rv_v2);"
+    ]
+  },
+  {
+    "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/compile/full_compile/_jit_prefill_fwd_20261106_155737_1wdev7ok/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp",
+    "sha256": "0dbef1d974af741101bb7b43fcbf90083ae5c1f805cc07ffd48a8f60118c611a",
+    "excerpts": [
+      "2274: TensorCreateInfo attention_latent_inline19825_ci(attention_latent_inline19825_ci_shapes, 2, DataType::BFLOAT16);",
+      "2809: params_t64.add_input(latent_inline20113);",
+      "2830: params_t65.add_input(latent_inline19823__rv_v2);",
+      "2849: params_t66.add_input(attention_latent_inline19825__ssa_v4);",
+      "2902: params_t68.add_input(latent_inline19823__rv_v2);",
+      "6241: TensorCreateInfo attention_latent_inline21952_ci(attention_latent_inline21952_ci_shapes, 2, DataType::BFLOAT16);",
+      "6789: params_t183.add_input(latent_inline22296__ssa_v2);",
+      "6810: params_t184.add_input(latent_inline21950__rv_v2);",
+      "6829: params_t185.add_input(attention_latent_inline21952__ssa_v4);",
+      "6882: params_t187.add_input(latent_inline21950__rv_v2);"
+    ]
+  }
+]

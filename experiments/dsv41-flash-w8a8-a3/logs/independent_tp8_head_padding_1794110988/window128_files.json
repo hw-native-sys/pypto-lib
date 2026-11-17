@@ -1,0 +1,11 @@
+{
+  "compiled_meta.json": "160e88dd788970ae79aeb4faf765a796a1e4d2e1a224c10c6e4d1c57ab5ff528",
+  "debug/run.py": "f54b697bd63ff00678586e8c44ce728c7351847050f7f89b1b89313cb0418e68",
+  "kernel_config.py": "ee60fccf5164f4582bebe55132d769ea263c69d1e2fc46d3fe148fe53e698085",
+  "kernels/aic/attention_core_aic.cpp": "dc5ea424bb34ff7be51c1097ce94dca676eb560b4d086e51c1dd0a8c3fb71572",
+  "kernels/aiv/attention_core_aiv.cpp": "8c001d62aa0156e50cbb7caac27011a4071b17119b21b9097b43aac8a0ad0f0e",
+  "orchestration/window_attention_test.cpp": "939c9f0d8e4e858ef29c171c88016ebf0c3dfb7c6dac372439072aae0e0aeb36",
+  "ptoas/attention_core.cpp": "8cba1c7c6ed4ac05e29bc8fa83ad4d045d8058cd00a4e3b6e4a30311e158c3c1",
+  "ptoas/attention_core.pto": "3fef28d573746cc793d53bcd4b417419ae9120fdf6bdff23e5ca2e8625a15971",
+  "report/perf_hints.log": "a71d7bdc952f13d7f58ee6cbef60a195c260aa9a7d8988dfb051020ed75114a8"
+}

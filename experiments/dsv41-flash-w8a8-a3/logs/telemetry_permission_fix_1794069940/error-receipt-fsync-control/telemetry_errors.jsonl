@@ -1,0 +1,1 @@
+{"epoch": 1794070663.2402592, "pid": 3237789, "start_ticks": "107058516", "operation": "read-smaps-rollup", "path": "/proc/3237789/smaps_rollup", "errno": 13, "exception_type": "PermissionError", "error": "PermissionError(13, 'CPU injected EACCES')", "critical": false}

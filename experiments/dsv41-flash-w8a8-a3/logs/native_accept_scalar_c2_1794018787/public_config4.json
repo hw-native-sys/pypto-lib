@@ -1,0 +1,60 @@
+{
+  "exact_prefix_entry_compile": "PASS",
+  "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_scalar_c2_1794018787/public4_build/_jit_prefill_fwd_20261107_105046_axx6zqmk",
+  "compile_seconds": 26.7452654838562,
+  "mode": "ONBOARD",
+  "platform": "a2a3",
+  "expert_shape": [
+    16,
+    1,
+    24
+  ],
+  "fixtures_or_tensor_samples": 0,
+  "ring_heap": [
+    0,
+    0,
+    4294967296,
+    0
+  ],
+  "current_owner_public_config_forwarding": [
+    [
+      "prepare",
+      [
+        0,
+        0,
+        4294967296,
+        0
+      ]
+    ],
+    [
+      "dispatch",
+      [
+        0,
+        0,
+        4294967296,
+        0
+      ]
+    ],
+    [
+      "dispatch",
+      [
+        0,
+        0,
+        4294967296,
+        0
+      ]
+    ],
+    [
+      "dispatch",
+      [
+        0,
+        0,
+        4294967296,
+        0
+      ]
+    ]
+  ],
+  "forwarding_scope": "same PreparedDispatch implementation on bounded synthetic IO and fake worker; no native prepare",
+  "heap_per_bank_per_rank_bytes": 5100273664,
+  "before_weights_required_free_bytes": 23344218656
+}

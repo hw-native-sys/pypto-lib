@@ -1,0 +1,796 @@
+{
+  "calls": [
+    {
+      "call": 0,
+      "unconditioned_per_call19": {
+        "all_pass": true,
+        "checks": {
+          "layer_x_hc": {
+            "pass": true,
+            "detail": ""
+          },
+          "layer_pre_mix": {
+            "pass": true,
+            "detail": ""
+          },
+          "x_hc_final": {
+            "pass": true,
+            "detail": ""
+          },
+          "pre_mix_final": {
+            "pass": true,
+            "detail": ""
+          },
+          "logits": {
+            "pass": true,
+            "detail": ""
+          },
+          "window_cache": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "compressed_cache_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "compressed_cache_c1a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "index_cache_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "index_cache_c1a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "state_cache_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_values_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_values_c1a": {
+            "pass": true,
+            "detail": ""
+          },
+          "pool_block_ids_c2a": {
+            "pass": true,
+            "detail": "pool sets match"
+          },
+          "pool_block_ids_c1a": {
+            "pass": true,
+            "detail": "pool sets match"
+          },
+          "pool_block_counts_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "pool_block_counts_c1a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_indices_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_indices_c1a": {
+            "pass": true,
+            "detail": ""
+          }
+        }
+      },
+      "original_staged19": {
+        "all_pass": true,
+        "checks": {
+          "layer_x_hc": {
+            "pass": true,
+            "detail": ""
+          },
+          "layer_pre_mix": {
+            "pass": true,
+            "detail": ""
+          },
+          "x_hc_final": {
+            "pass": true,
+            "detail": ""
+          },
+          "pre_mix_final": {
+            "pass": true,
+            "detail": ""
+          },
+          "logits": {
+            "pass": true,
+            "detail": ""
+          },
+          "window_cache": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "compressed_cache_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "compressed_cache_c1a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "index_cache_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "index_cache_c1a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "state_cache_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_values_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_values_c1a": {
+            "pass": true,
+            "detail": ""
+          },
+          "pool_block_ids_c2a": {
+            "pass": true,
+            "detail": "pool sets match"
+          },
+          "pool_block_ids_c1a": {
+            "pass": true,
+            "detail": "pool sets match"
+          },
+          "pool_block_counts_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "pool_block_counts_c1a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_indices_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_indices_c1a": {
+            "pass": true,
+            "detail": ""
+          }
+        }
+      },
+      "independent_three_call_oracle19": {
+        "all_pass": true,
+        "checks": {
+          "layer_x_hc": {
+            "pass": true,
+            "detail": ""
+          },
+          "layer_pre_mix": {
+            "pass": true,
+            "detail": ""
+          },
+          "x_hc_final": {
+            "pass": true,
+            "detail": ""
+          },
+          "pre_mix_final": {
+            "pass": true,
+            "detail": ""
+          },
+          "logits": {
+            "pass": true,
+            "detail": ""
+          },
+          "window_cache": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "compressed_cache_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "compressed_cache_c1a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "index_cache_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "index_cache_c1a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "state_cache_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_values_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_values_c1a": {
+            "pass": true,
+            "detail": ""
+          },
+          "pool_block_ids_c2a": {
+            "pass": true,
+            "detail": "pool sets match"
+          },
+          "pool_block_ids_c1a": {
+            "pass": true,
+            "detail": "pool sets match"
+          },
+          "pool_block_counts_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "pool_block_counts_c1a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_indices_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_indices_c1a": {
+            "pass": true,
+            "detail": ""
+          }
+        }
+      },
+      "oracle_persistent_after": {
+        "window_cache": "a24b6f28256d38da29ad2d76b38bc9639b191ad03353dcb6fd1de9b9dad71c15",
+        "compressed_cache_c2a": "671eaa71ab8f0f77ecdd16378be1ad842ba9240f53e6e2f6056e75204bf7fbfe",
+        "index_cache_c2a": "f4bc3f2b56c78aa8cdc0025657010b02326f707c4ad6215f3b0281d96077e62c",
+        "state_cache_c2a": "da3b4c6c86e65e931f1ebab3d4aa54fe953d6d0a8a4cee0d429ff529b85d99f9",
+        "compressed_cache_c1a": "c9edf993285476d9179ad924b63afd8586ce41d4be9f60f4df12e6d7cf0c7530",
+        "index_cache_c1a": "7b2913465355c32608a20f3ba5933d6aa46d9b259d9638e4a6efaa73fe6e4b94",
+        "topk_indices": "a6a5c4af7ca62d05d3ae18c926891271a8b732bf20459a96eb87248dfdbc54cc",
+        "topk_values": "68816dd3b3b9885b7679b523c9395670d49becf9068635aedffcf35c67901df3",
+        "pool_block_ids": "b07991afd81747768272a94f03a966409d642816b0f2ffc871621c0f2e5511a2",
+        "pool_block_counts": "d6de4f99b3a4b473fe893b0145d8ccbf0c2eb383f2e7669f70903932275a8f09"
+      },
+      "ALL_THREE_GROUPS_PASS": true
+    },
+    {
+      "call": 1,
+      "unconditioned_per_call19": {
+        "all_pass": true,
+        "checks": {
+          "layer_x_hc": {
+            "pass": true,
+            "detail": ""
+          },
+          "layer_pre_mix": {
+            "pass": true,
+            "detail": ""
+          },
+          "x_hc_final": {
+            "pass": true,
+            "detail": ""
+          },
+          "pre_mix_final": {
+            "pass": true,
+            "detail": ""
+          },
+          "logits": {
+            "pass": true,
+            "detail": ""
+          },
+          "window_cache": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "compressed_cache_c2a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "compressed_cache_c1a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "index_cache_c2a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "index_cache_c1a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "state_cache_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_values_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_values_c1a": {
+            "pass": true,
+            "detail": ""
+          },
+          "pool_block_ids_c2a": {
+            "pass": true,
+            "detail": "pool sets match"
+          },
+          "pool_block_ids_c1a": {
+            "pass": true,
+            "detail": "pool sets match"
+          },
+          "pool_block_counts_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "pool_block_counts_c1a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_indices_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_indices_c1a": {
+            "pass": true,
+            "detail": ""
+          }
+        }
+      },
+      "original_staged19": {
+        "all_pass": true,
+        "checks": {
+          "layer_x_hc": {
+            "pass": true,
+            "detail": ""
+          },
+          "layer_pre_mix": {
+            "pass": true,
+            "detail": ""
+          },
+          "x_hc_final": {
+            "pass": true,
+            "detail": ""
+          },
+          "pre_mix_final": {
+            "pass": true,
+            "detail": ""
+          },
+          "logits": {
+            "pass": true,
+            "detail": ""
+          },
+          "window_cache": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "compressed_cache_c2a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "compressed_cache_c1a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "index_cache_c2a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "index_cache_c1a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "state_cache_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_values_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_values_c1a": {
+            "pass": true,
+            "detail": ""
+          },
+          "pool_block_ids_c2a": {
+            "pass": true,
+            "detail": "pool sets match"
+          },
+          "pool_block_ids_c1a": {
+            "pass": true,
+            "detail": "pool sets match"
+          },
+          "pool_block_counts_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "pool_block_counts_c1a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_indices_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_indices_c1a": {
+            "pass": true,
+            "detail": ""
+          }
+        }
+      },
+      "independent_three_call_oracle19": {
+        "all_pass": true,
+        "checks": {
+          "layer_x_hc": {
+            "pass": true,
+            "detail": ""
+          },
+          "layer_pre_mix": {
+            "pass": true,
+            "detail": ""
+          },
+          "x_hc_final": {
+            "pass": true,
+            "detail": ""
+          },
+          "pre_mix_final": {
+            "pass": true,
+            "detail": ""
+          },
+          "logits": {
+            "pass": true,
+            "detail": ""
+          },
+          "window_cache": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "compressed_cache_c2a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "compressed_cache_c1a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "index_cache_c2a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "index_cache_c1a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "state_cache_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_values_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_values_c1a": {
+            "pass": true,
+            "detail": ""
+          },
+          "pool_block_ids_c2a": {
+            "pass": true,
+            "detail": "pool sets match"
+          },
+          "pool_block_ids_c1a": {
+            "pass": true,
+            "detail": "pool sets match"
+          },
+          "pool_block_counts_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "pool_block_counts_c1a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_indices_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_indices_c1a": {
+            "pass": true,
+            "detail": ""
+          }
+        }
+      },
+      "oracle_persistent_after": {
+        "window_cache": "840fc7dbf39ed9056ae9391ef5cedb1024740dce8da21ac74eaa1492fca4195d",
+        "compressed_cache_c2a": "a7db0b642427ade9041955a44a78aa5253e590fcbcbc5758d929fce3901f5835",
+        "index_cache_c2a": "2fb7589192cecf4b85f2515246b0346c5adcc41199b255b17ff51060728f64a0",
+        "state_cache_c2a": "4a179246fd2f2bfac1d921cd5d26d88d218d1ac07e8baea7296128c3c1ea3aff",
+        "compressed_cache_c1a": "a4b80ee82a70268aeda3fc6dd43952844fda43a5d678a7a12285066ce3fbd8af",
+        "index_cache_c1a": "1c7516de9a212d05eab90b787a20c15ae02c03746ba0f259f845d9b90dbd61c5",
+        "topk_indices": "1fb9e5b3342c027daecbfacc2d821654d96ad6a401aab549b898eaa8e41c261e",
+        "topk_values": "d662600ea10502aaf85f347eea3ab98e2c25ba4cabac43722a0efdfa0ef1370b",
+        "pool_block_ids": "b07991afd81747768272a94f03a966409d642816b0f2ffc871621c0f2e5511a2",
+        "pool_block_counts": "d6de4f99b3a4b473fe893b0145d8ccbf0c2eb383f2e7669f70903932275a8f09"
+      },
+      "ALL_THREE_GROUPS_PASS": true
+    },
+    {
+      "call": 2,
+      "unconditioned_per_call19": {
+        "all_pass": true,
+        "checks": {
+          "layer_x_hc": {
+            "pass": true,
+            "detail": ""
+          },
+          "layer_pre_mix": {
+            "pass": true,
+            "detail": ""
+          },
+          "x_hc_final": {
+            "pass": true,
+            "detail": ""
+          },
+          "pre_mix_final": {
+            "pass": true,
+            "detail": ""
+          },
+          "logits": {
+            "pass": true,
+            "detail": ""
+          },
+          "window_cache": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "compressed_cache_c2a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "compressed_cache_c1a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "index_cache_c2a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "index_cache_c1a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "state_cache_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_values_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_values_c1a": {
+            "pass": true,
+            "detail": ""
+          },
+          "pool_block_ids_c2a": {
+            "pass": true,
+            "detail": "pool sets match"
+          },
+          "pool_block_ids_c1a": {
+            "pass": true,
+            "detail": "pool sets match"
+          },
+          "pool_block_counts_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "pool_block_counts_c1a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_indices_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_indices_c1a": {
+            "pass": true,
+            "detail": ""
+          }
+        }
+      },
+      "original_staged19": {
+        "all_pass": true,
+        "checks": {
+          "layer_x_hc": {
+            "pass": true,
+            "detail": ""
+          },
+          "layer_pre_mix": {
+            "pass": true,
+            "detail": ""
+          },
+          "x_hc_final": {
+            "pass": true,
+            "detail": ""
+          },
+          "pre_mix_final": {
+            "pass": true,
+            "detail": ""
+          },
+          "logits": {
+            "pass": true,
+            "detail": ""
+          },
+          "window_cache": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "compressed_cache_c2a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "compressed_cache_c1a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "index_cache_c2a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "index_cache_c1a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "state_cache_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_values_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_values_c1a": {
+            "pass": true,
+            "detail": ""
+          },
+          "pool_block_ids_c2a": {
+            "pass": true,
+            "detail": "pool sets match"
+          },
+          "pool_block_ids_c1a": {
+            "pass": true,
+            "detail": "pool sets match"
+          },
+          "pool_block_counts_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "pool_block_counts_c1a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_indices_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_indices_c1a": {
+            "pass": true,
+            "detail": ""
+          }
+        }
+      },
+      "independent_three_call_oracle19": {
+        "all_pass": true,
+        "checks": {
+          "layer_x_hc": {
+            "pass": true,
+            "detail": ""
+          },
+          "layer_pre_mix": {
+            "pass": true,
+            "detail": ""
+          },
+          "x_hc_final": {
+            "pass": true,
+            "detail": ""
+          },
+          "pre_mix_final": {
+            "pass": true,
+            "detail": ""
+          },
+          "logits": {
+            "pass": true,
+            "detail": ""
+          },
+          "window_cache": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "compressed_cache_c2a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "compressed_cache_c1a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "index_cache_c2a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "index_cache_c1a": {
+            "pass": true,
+            "detail": "\n    published step rows: "
+          },
+          "state_cache_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_values_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_values_c1a": {
+            "pass": true,
+            "detail": ""
+          },
+          "pool_block_ids_c2a": {
+            "pass": true,
+            "detail": "pool sets match"
+          },
+          "pool_block_ids_c1a": {
+            "pass": true,
+            "detail": "pool sets match"
+          },
+          "pool_block_counts_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "pool_block_counts_c1a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_indices_c2a": {
+            "pass": true,
+            "detail": ""
+          },
+          "topk_indices_c1a": {
+            "pass": true,
+            "detail": ""
+          }
+        }
+      },
+      "oracle_persistent_after": {
+        "window_cache": "ef12fa74cb7139377e878dc3d1563a101e2788e5e0693a29920bef69f14e6b89",
+        "compressed_cache_c2a": "9d4cd56ec03be0c2cd3aec003ee2d28a93d22c669a84f8661355aa03dba1ac24",
+        "index_cache_c2a": "b3610bb7f842927675bb8d73dee55dd9bd66ed7a36b09b80c5c9e1c374579f8f",
+        "state_cache_c2a": "cb4c46cc99d7c3898cfbe1303b036f476436bb54a810c1418d4781ec8fb289de",
+        "compressed_cache_c1a": "24c5115b857f83c91043b8eb51c47f28271a012355ac632a67ad49c5610006cf",
+        "index_cache_c1a": "114f07a069107e34ac53601c62dbd498fc173f37b7cdf681bef7c7768e470c94",
+        "topk_indices": "73b095d527bac1bfc5bd9fe2392437489b7891a5b151d11167fc68989023b94e",
+        "topk_values": "f89d6344a22e522b7d7564ee7123327433214920ebb7ebf760cc2d810e308dce",
+        "pool_block_ids": "97ef183112bfd1ed0ac01bb271febd0d5b170dfdb16b2f1376902c6220bb4406",
+        "pool_block_counts": "eafb4a1bc8fb39bb641d4880e8105146ba880e4e97b1622712fbf9410bea28bb"
+      },
+      "ALL_THREE_GROUPS_PASS": true
+    }
+  ],
+  "ALL_GROUPS_PASS": true,
+  "numerical_gate_count": 171,
+  "reference_policy": {
+    "gate_factory_source": "db733af729160a1b7c02ecc6bcad88ad01199eedbe29144cdfc0e4ca7b84af3b",
+    "expressions_and_tolerances": "unchanged",
+    "per_call": "independent within each saved ACTUAL initial; not oracle history",
+    "staged": "unchanged original mixed staged/direct19",
+    "rollout": "FIRST pristine initial plus previous ORACLE six caches/four selection outputs, fixed independent metadata; current-token embedding/initial_pre reset, no prior finalHC or candidate snapshots"
+  },
+  "integrity_receipt_sha256": "768b2d588c776dfd2cfea415a3eec222942b0e002959898ac0acca56c0371857",
+  "count_probe": "SEPARATE_REQUIRED_GATE",
+  "synthetic_history_starts_at": 125,
+  "original_prefill_history_parity": false,
+  "physical_shape_variation": false,
+  "general_F09": false
+}

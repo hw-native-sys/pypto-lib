@@ -1,0 +1,16 @@
+[
+  {
+    "phase": "prefill3",
+    "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_applied_signatures_1794097836/helper_compile_output/prefill3",
+    "elapsed_seconds": 45.36242318153381,
+    "source_manifest": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+    "zero_samples": true
+  },
+  {
+    "phase": "decode1",
+    "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_applied_signatures_1794097836/helper_compile_output/decode1",
+    "elapsed_seconds": 43.5948588848114,
+    "source_manifest": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+    "zero_samples": true
+  }
+]

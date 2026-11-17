@@ -1,0 +1,6 @@
+PyPTO environment activated: /mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local
+PYPTO_ROOT=/mnt/data/pyptouser/yangyaodong/code/pypto
+PTOAS_ROOT=/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local
+PTO_ISA_ROOT=/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/build/pto-isa
+PASS actualCLI splitstage fakeprovider allstages, corruption/native-only/defaultguards, source45 and fullIOmetadata
+INDEPENDENT_STORAGE_RETENTION_PREFLIGHT_PASS

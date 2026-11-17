@@ -1,0 +1,12 @@
+{
+  "authority": "/root formal failure closeout disposition message",
+  "closeout_authorized": true,
+  "whole_case_accepted": false,
+  "native_job": "task_20261107_231342_350351328582",
+  "audit_job": "task_20261108_002821_316722226445",
+  "audit_manifest_sha256": "3a442d9c6e9671b1c362de1a9a8b056b02e5adaa86203763f62ad33a6b6081c4",
+  "audit_FREEZE_sha256": "0b43bfb51f08d46d0c735522f78eb5402acf8e63e36cd43dfef595073c808d31",
+  "audit_results_sha256": "1126bf4f8b34a0d4171ffcceb041a8e7102e380f2677da8a290e4cc156be59a9",
+  "scope": "Archive exact FAILED/NOT_ACCEPTED operation preserving nativequeue1/outerFAIL/monitorPermissionError13 with unknown PID/path/epoch. Independently verified limited CLI0/16tokens/15actual-prior-greedy calls/all4DPfiniteconsistent/twofullcoveragephases/sourceCC/normalclose/recordedPIDbirthabsence/16release/queue0 facts only. No repeated-suffix qualityPASS, full parity or generalF09 closure; no native rerun/threshold change/overallPASS relabel.",
+  "permitted_final_action": "final sourceCC/outer16/audit16 pin check, close only own ACTIVE time row at actual completion and seal/PARK failed unit; no old-case/raw/monitor patch"
+}

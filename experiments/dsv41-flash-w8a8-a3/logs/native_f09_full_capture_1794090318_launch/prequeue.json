@@ -1,0 +1,50 @@
+{
+  "status": "SOURCE_PROFILE_RESOURCES_ONLY_NO_NATIVE_AUTHORITY",
+  "source_manifest": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "full_profile": {
+    "origin_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/build/decode_capacity2",
+    "manifest": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/decode_capacity2_files.json",
+    "manifest_sha256": "5262e68afa0b53291ed285e31170b3c017674c3c25dfa9aec78eb7fab5777532",
+    "metadata_sha256": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770"
+  },
+  "scenario_sha256": "c7b6ab942f5ea17758389aa5a53dafbb1de79e68dbb6f41c4614d66dd6b6dbb1",
+  "lifecycle_acceptance": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/root_f09_count_probe_rank_acceptance_1794089142.json",
+  "lifecycle_acceptance_sha256": "e76b9984db86a27c3c1b4ebd32ab7de97af91357af4c6784746e5e9a3ade0ffa",
+  "fullentry_signature_provenance": "OLD405 independent3signatures, NOT recompiled/relabelled countprofiles",
+  "full119_prepared_inventory": "FUTURE_ACTUAL_ONLY; EE accepted count32 evidence is not full prepared evidence",
+  "groups": [
+    "unconditioned_per_call19",
+    "original_staged19",
+    "independent_three_call_oracle19"
+  ],
+  "numerical_gate_count": 171,
+  "durable_before_reference": [
+    "three initial snapshots",
+    "three actual snapshots",
+    "owner normalclose"
+  ],
+  "full_static_global": 103422065664,
+  "full_static_per_rank": 6463879104,
+  "full_nonstatic_global": 494223296,
+  "full_hbm_postprewarm_prestatic_each_rank": 16621778816,
+  "full_hbm_poststatic_each_call_each_rank": 10157899712,
+  "offline_host_planning_formula": "2S+2G+18P+16GiB, within300GiBfloor; NOT measuredpeak/fit",
+  "resources": {
+    "epoch": 1794091039.8048675,
+    "observed": {
+      "HOST": 1722197925888,
+      "DISK": 7876193026048,
+      "SHM": 1079343157248
+    },
+    "minimum_bytes": {
+      "HOST": 322122547200,
+      "DISK": 17179869184,
+      "SHM": 34359738368
+    },
+    "measured_peak_claim": false
+  },
+  "fixture_or_tensor_or_header_or_prepare_or_compile_calls": 0,
+  "NPU": false,
+  "new_valid_stage_grants": 0,
+  "default_refusal_without_work": true
+}

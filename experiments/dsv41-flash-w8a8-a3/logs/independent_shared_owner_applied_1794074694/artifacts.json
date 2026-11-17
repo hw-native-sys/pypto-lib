@@ -1,0 +1,19 @@
+{
+  "OWNERSHIP.md": "f5cc51a06117a88cab601ea750de260941d532ec90a525e3ef6505ca4b0799b7",
+  "REPORT.md": "e32d677f3a48e9b35ff49f687f96f5cab0da4fd6f5c1ecf37233c7bcaa95cfdc",
+  "check.py": "9c09d5326a3e501bfc111f59cc8679508d5ef2d67f1579c712d16324bced988e",
+  "closure.json": "75ea9934e9bdc6f7e7b0b6d70a028f3fcae62fa4d3f2776e4e1b1694512c9d1d",
+  "cpu.log": "1eda03c1de986c1952d1e2397445618226343af34ff56fbb4045ce43085fc049",
+  "cpu_events.jsonl": "5da148f556ea36c26d40634af19923cc8949d4a7fc228b781e9f0eb6ceb8b301",
+  "frozen_apply/FREEZE.json": "6fcfcf20af6470c206d0eda368c0b26a935170f4a1e442e058b954b2aa4785e9",
+  "frozen_apply/REPORT.md": "9c533dc9cce5751b4cd34a02bdc3350bc8d2795bf9f860afda70a98897255308",
+  "frozen_apply/applied.patch": "366ed05e9b51f26771cb4e63beedb1fa2f8049019e2685ba529dc85571002c8e",
+  "frozen_apply/artifacts.json": "9aeb50ef3e9f5b8e90993063d7ccb03a668010a310cd16aa83063ee69d94ede5",
+  "frozen_apply/generate.applied.py": "fba8a4ef9a06f694fa53278bb80ae2ad70d111336dbead938ab9f8511d27e16e",
+  "frozen_apply/inheritance.json": "51d105ae4fc9a7b0b1b33285e8217feefcd989fe96a6273bceea9ff6efeb7c95",
+  "frozen_apply/source45.json": "b3e19fd001c74f7a5b497c791c01924ca09c0678df66114fce599e890d8fee06",
+  "frozen_apply/source45_predecessor_CC.json": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "results.json": "eb5f58e22b6cb0e5cde656bc7daec1fc3b40d119e1d227935587565219ebccdf",
+  "start.json": "21ce801bcee7b4e7e9926477ef5b2e2572f94628aa27640a9d23c622a1d930e9",
+  "work_record.json": "2b20ee754ff5cafe3076595831b51cfd159e9264a9204b8e6716c4e61c3c30fa"
+}

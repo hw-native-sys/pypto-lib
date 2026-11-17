@@ -1,0 +1,248 @@
+{
+  "status": "PASS_PREPARATION_ONLY",
+  "checks": [
+    {
+      "name": "frozen16-manifest",
+      "pass": true
+    },
+    {
+      "name": "all16-frozen-files",
+      "pass": true
+    },
+    {
+      "name": "binding-pin",
+      "pass": true
+    },
+    {
+      "name": "entry-byte-identical",
+      "pass": true
+    },
+    {
+      "name": "observer-command-lifecycle-strict-verdict-unchanged",
+      "pass": true
+    },
+    {
+      "name": "checker-other-functions-unchanged",
+      "pass": true
+    },
+    {
+      "name": "outer-main-only-F09-receipt-addition",
+      "pass": true
+    },
+    {
+      "name": "HC-is-historical-M02-not-SourceB",
+      "pass": true
+    },
+    {
+      "name": "normal-product-command",
+      "pass": true
+    },
+    {
+      "name": "fixed-command---prompt",
+      "pass": true
+    },
+    {
+      "name": "fixed-command---max-new-tokens",
+      "pass": true
+    },
+    {
+      "name": "fixed-command---engram-mode",
+      "pass": true
+    },
+    {
+      "name": "fixed-command---max-time",
+      "pass": true
+    },
+    {
+      "name": "fixed-command---template",
+      "pass": true
+    },
+    {
+      "name": "fixed-command---start-position",
+      "pass": true
+    },
+    {
+      "name": "fixed-command---repeat",
+      "pass": true
+    },
+    {
+      "name": "reject-old-operation",
+      "pass": true,
+      "rejection": "wrong fixed longer-N3 operation/prompt/cap binding"
+    },
+    {
+      "name": "reject-old-prompt",
+      "pass": true,
+      "rejection": "wrong fixed longer-N3 operation/prompt/cap binding"
+    },
+    {
+      "name": "reject-cap-bool",
+      "pass": true,
+      "rejection": "wrong fixed longer-N3 operation/prompt/cap binding"
+    },
+    {
+      "name": "reject-cap17",
+      "pass": true,
+      "rejection": "wrong fixed longer-N3 operation/prompt/cap binding"
+    },
+    {
+      "name": "reject-ID-bool",
+      "pass": true,
+      "rejection": "wrong fixed longer-N3 operation/prompt/cap binding"
+    },
+    {
+      "name": "reject-decode-upload-bool",
+      "pass": true,
+      "rejection": "exact true-integer shared static accounting required"
+    },
+    {
+      "name": "reject-second-upload",
+      "pass": true,
+      "rejection": "exact true-integer shared static accounting required"
+    },
+    {
+      "name": "reject-wrong-readcount",
+      "pass": true,
+      "rejection": "exact true-integer shared static accounting required"
+    },
+    {
+      "name": "reject-historical-HC-as-current-F09",
+      "pass": true,
+      "rejection": "exact new SourceB F09 binding required"
+    },
+    {
+      "name": "reject-old600-signatures",
+      "pass": true,
+      "rejection": "fresh independent SourceB signature receipt changed"
+    },
+    {
+      "name": "outer-default-refusal",
+      "pass": true
+    },
+    {
+      "name": "entry-no-allocation-refusal",
+      "pass": true
+    },
+    {
+      "name": "negative-controls-created-no-output-or-grant",
+      "pass": true
+    },
+    {
+      "name": "fresh-proposed-case-absent",
+      "pass": true
+    },
+    {
+      "name": "one-fresh-PREQUEUE-exit0",
+      "pass": true
+    },
+    {
+      "name": "prequeue-no-payload-no-grant",
+      "pass": true
+    },
+    {
+      "name": "prequeue-stage-source-code-binding",
+      "pass": true
+    },
+    {
+      "name": "prequeue-actual-output-absent",
+      "pass": true
+    },
+    {
+      "name": "frozen16-unchanged-after",
+      "pass": true
+    }
+  ],
+  "passed": 35,
+  "unmet": 0,
+  "start_epoch": 1794099574.140679,
+  "end_epoch": 1794099578.965019,
+  "prequeue_receipt": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_real_B_generation_1794098661/prequeue/PREQUEUE.json",
+  "prequeue_sha256": "85f3596243b4c474e35c9c33bc65e0d13e83e19cda5b126d6d676f5eb9221825",
+  "prequeue": {
+    "status": "PASS_IDENTITY_METADATA_ONLY",
+    "stage": "PREQUEUE",
+    "epoch": 1794099578.8701777,
+    "source_manifest_sha256": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+    "binding_sha256": "cc2132a8e7bf0b36110f7a99f68d244a8b98e0f0299d8a9b8e897cec1dde5937",
+    "checker_sha256": "f95eaf38916b645642ebfd4d307b85a64a17ec7ca027c55e0f8585c1590816c4",
+    "tokenizer_files": {
+      "tokenizer.json": "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b",
+      "tokenizer_config.json": "6ac8c8dc065ed118161d02dd532749ae3f52c243deac27872134fae2f50d8547"
+    },
+    "exact_model_root": "/mnt/data/models/DeepSeek-V4.1-Flash-w8a8",
+    "source_headers": {
+      "source_keys": 139614,
+      "shards": 263,
+      "metadata_bytes_read": 15912800,
+      "tensor_payload_bytes_read": 0
+    },
+    "library_sha256": "24434f8879030ef1b1f31e5fc2ecce683e392d4f1baeb5bcee852fb183976e5c",
+    "resources": {
+      "host_available": 1721757810688,
+      "disk_available": 7573540438016,
+      "shm_available": 1079343157248,
+      "shm_used": 557056
+    },
+    "device_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "full_upload_forward_peaks": null,
+    "grant_created": false,
+    "HC_signature_evidence": {
+      "historical_hc_lineage_sha256": "ebac3e1980d2e0db67fe23ef2be16362c1b23246b3a4c12812e97c7b5d6af2d8",
+      "F09_math_binding": {
+        "schema": "sourceB-F09-bounded-math-binding/1",
+        "actual_source_manifest_sha256": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+        "math_baseline_manifest_sha256": "8153c7f040bef51900a6e6c9ff27b018279b7503f31d50ec5488457e49770b28",
+        "metadata_plan_sha256": "cd8b17741688eeb9ef39d8c0925dbb74a8f9a1cfcc0052db2e0a8c1aacb48cf7",
+        "metadata_binding_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_application_1794097608/metadata_plan.json.binding.json",
+        "metadata_binding_sha256": "534266dd8bf0e40cb49418eb4ffbb72a3bef9f2d0d01f1c41a81818ef22d3a0c",
+        "lineage_canonical_sha256": "13b80364bce7729fb36aa51c231ceb6966f2fe59ce6d211ccedd6c7cfc046004",
+        "Root_bounded_acceptance_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/root_f09_8153_bounded_acceptance_1794092629.json",
+        "Root_bounded_acceptance_sha256": "74358e14367ce660d4942d7f2d71a1b706079253ef412bd68c3abe8b9a4a2fa4",
+        "numeric_receipt_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_c2_retention_1794092629/work/cpu_numerical_receipt.json",
+        "numeric_receipt_sha256": "6ce38e890b642908c731fb247accc302938846f892142471d26715398e96c851",
+        "static_recipe_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_c2_retention_1794092629/work/static_recipe.json",
+        "static_recipe_sha256": "4e73e5d8e2a03cedb309f0a3bde16fb5d4a806c4b6ee5039f5c28a8034872e75"
+      },
+      "fresh_signature_receipt_sha256": "704eb14f6ff186cedf451830e3c38c303b43a3bce201395e78fd3e044b0ba357"
+    }
+  },
+  "source45_sha256": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+  "code_pins": {
+    "COMMANDS.md": "a35fc37a32c117a4840696a887315ab4189704e1ae57d9a72ca8875a7c799444",
+    "OWNERSHIP.md": "b9eaf2efc6fe4a22329f97afafb241c066d5f6477dc295dc8b88876b3ff35fa5",
+    "REPORT.md": "27e1c391400c8dae81cefcd6115ee1143ba1cc0eb6b956b6e3ade276c50e28e9",
+    "adapt.py": "ce80f9cbfcb83cdfccb0d2396c3d8804fab83767cc09d9c381b94eea1f946c99",
+    "adaptation.patch": "9f585559a8d351479419d3f90fa9fc71bd2c6e4fc81ffbd3255c515bd0916df3",
+    "ancestry_pins.json": "e753c71d43a28928a20b1f8e2f6d45a900b30b3a0f30702244064a97389e31d9",
+    "check_identity.py": "f95eaf38916b645642ebfd4d307b85a64a17ec7ca027c55e0f8585c1590816c4",
+    "future_root_scope.template.json": "410cbdd1902bb4d6bcf64b0219ecc7fedc9687269e8c9a96855bfc9c79e562d8",
+    "operation_binding.json": "cc2132a8e7bf0b36110f7a99f68d244a8b98e0f0299d8a9b8e897cec1dde5937",
+    "outer_runner.py": "28b8c268c5530197273754325aeba978dad1d44428f4f33fe4e5bf13dfcb3d7c",
+    "prepared_pins.json": "88cf294ac9a4b628c18da9cf4ed5b7b0cbd10b671736b43121001b5f15873277",
+    "seal.py": "0d0c47981dc150530436a1275e2736e0b3113ca9964569086b0b0ac865b8e169",
+    "source_after.json": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+    "source_before.json": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+    "task_entry.py": "670b126af3b878f8b4e2c6cbbc3a716bb9a0ac6c043bedda49b5c18d0eda02b6",
+    "work_record.json": "c7f56f36d4332a392067b3fb162aca9b0949184f524a920bf9b6fd179979a655"
+  },
+  "NPU_submissions": 0,
+  "actual_grants_created": 0,
+  "shared_writes": 0
+}

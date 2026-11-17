@@ -1,0 +1,1 @@
+TypeError: @pl.jit function 'index_topk': constexpr parameter 'masked' is not bound at the call site in 'lightning_indexer'. A 'pl.constexpr' parameter is resolved at compile time, so every call must pass it — a signature default is not read for a dep call.

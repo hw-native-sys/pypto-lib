@@ -1,0 +1,8 @@
+{
+  "status": "PASS_METADATA_AND_TINY_ARITHMETIC_ONLY",
+  "reserve": 18088299200,
+  "real_payload_bytes": 0,
+  "native": false,
+  "production_guard_released": false,
+  "note": "Prototype is not a live admission implementation; integration hooks and independent review remain."
+}

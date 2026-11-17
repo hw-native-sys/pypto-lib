@@ -1,0 +1,41 @@
+{
+  "source405": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "mode": "ONBOARD",
+  "platform": "a2a3",
+  "config": {
+    "distributed_config": "DistributedConfig(device_ids=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], num_sub_workers=0, runtime='tensormap_and_ringbuffer', aicpu_thread_num=0)",
+    "backend_type": "a2a3",
+    "execution_mode": false,
+    "ring_heap": [
+      0,
+      0,
+      4294967296,
+      0
+    ]
+  },
+  "logical_topology": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "actual_device_ids": "NONE_COMPILE_ONLY",
+  "zero_tensor_samples": true,
+  "probes": {
+    "count_probe.py": "f4bf50aebbbbb8b0a7c6a230e5e3acd810b607bdc2624091a46b660709c1b42c",
+    "count_probe_old_physical.py": "02879526d209c2f7a4c8ff664bc30201ff23d6cfdd7d124ff315ef8505a86e04"
+  },
+  "public_device_tensor_source": "72dc6701eca6dc10a2155773b35a37dee1551c89a89ecf08a8c244571395e8e3"
+}

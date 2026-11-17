@@ -1,0 +1,11 @@
+{
+  "task_id": "task_20261108_053443_160105428565",
+  "terminal": "COMPLETE",
+  "exit_code": 0,
+  "device": "no-device",
+  "max_time": 180,
+  "client_timeout": 240,
+  "result_sha256": "faaf5fd55c4982d26ad64a65d744c8918dd86ba5c46e20f1364679a8012a99a7",
+  "observed_output": "PASS_INDEPENDENT_PREPARED_FILE_IDENTITY_ONLY actual32 public32 negatives3; no native",
+  "note": "Tool-observed queue completion metadata; not a fabricated raw log."
+}

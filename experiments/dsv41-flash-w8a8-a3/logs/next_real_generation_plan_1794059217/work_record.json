@@ -1,0 +1,11 @@
+{
+  "id": "main-next-real-generation-plan-1794059217-1794059697",
+  "agent": "/root/main_native",
+  "start_epoch": 1794059217,
+  "end_epoch": 1794059697,
+  "elapsed_seconds": 480,
+  "status": "FINAL/PARK",
+  "scope": "NEWartifact-onlypreciseplan+onequeuedtinyCPUmetadata/tokenizer/arithmetic; no sharedwrites/product/NPU/payload/grant",
+  "workers": [],
+  "shared_ledger_imported": false
+}

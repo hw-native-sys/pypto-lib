@@ -1,0 +1,18 @@
+{
+  "record_id": "main-f09-application-plan-1794094863",
+  "role": "main-agent",
+  "start_epoch": 1794094863,
+  "end_epoch": 1794095464.815496,
+  "measured_wall_seconds": 601.815495967865,
+  "shared_writes": 0,
+  "worker_records_imported": 0,
+  "CPU_tasks": [],
+  "NPU_tasks": [],
+  "tests_importedmodel_compile_prepare": false,
+  "metadata_updater_executed": false,
+  "full_plan_materialized": false,
+  "real_payload_bytes": 0,
+  "positive_grants": 0,
+  "source_write_note": "one unintended trailing redirect to absent log/fake path failed; no outside file created; updater file had completed",
+  "status": "FINAL_PARK_SOURCE_PLAN_UNAPPLIED_PENDING171"
+}

@@ -1,0 +1,21 @@
+{
+  "status": "FINAL_PARK",
+  "artifacts": 398,
+  "manifest_sha256": "4615debdad437d799834c68515a8e8c55185710f9627eb751902bbcb8212a90f",
+  "adapter": "e3bc87daec2a39c6a555b194ec7d9f9a42d8483e36fcabaf1ec448000284ac20",
+  "route": "c53c5fd537ecc1bfbf8e228cf691107fda2fb1748dfcb9e5aa09a0d9a3915d43",
+  "probes": {
+    "count_probe.py": "f4bf50aebbbbb8b0a7c6a230e5e3acd810b607bdc2624091a46b660709c1b42c",
+    "count_probe_old_physical.py": "02879526d209c2f7a4c8ff664bc30201ff23d6cfdd7d124ff315ef8505a86e04"
+  },
+  "helper": "ee648c64b8477cc98b2f3083a6b16c9b6b92cc4612cc3228391dbe53aef1858d",
+  "oracle": "e45c7529d6c34cd57712a7d346ec612641896e38ab98ff88017ceafd87d999d3",
+  "source45": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "live45": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "CPU_final": "task_20261108_055920_166633523902",
+  "two_count_signatures_PASS": true,
+  "fullentry_recompiled": false,
+  "writers": 0,
+  "own_jobs": 0,
+  "actual16_GO": "ABSENT"
+}

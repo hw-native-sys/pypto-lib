@@ -1,0 +1,20 @@
+{
+  "status": "PASS_TINY_METADATA_FILE_MOCKS_ONLY",
+  "source-only-before-prepare-accepted": true,
+  "fresh-owned-clone": true,
+  "post-prepare-structure-mock-only": true,
+  "rejected": [
+    "no-prepared-native-files",
+    "changed-native-image",
+    "changed-original-source",
+    "wrong-source",
+    "wrong-manifest",
+    "prepare-under-frozen-origin"
+  ],
+  "immutable-input-unchanged": true,
+  "actual_compile": false,
+  "actual_public_prepare": false,
+  "NPU": false,
+  "payload": false,
+  "no_native_proof": true
+}

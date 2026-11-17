@@ -1,0 +1,61 @@
+{
+  "manifest_sha256": "9352242dc8b16f94343ed6cc9c0e05e16d69ad3a92ca7c0ee65d408898f16881",
+  "model_files_verified": 45,
+  "artifacts_verified": 42,
+  "main_report_sha256": "a68ad56b5258aa6ec21e06d284e6dde78bde26f14c7841a8ba0e8c2347dd44d4",
+  "mutant_equation_counts": {
+    "original_normalized": {
+      "total": 57344,
+      "nonrotary": 50176,
+      "rotary": 7168,
+      "max_abs": 3.078125
+    },
+    "no_norm_fp32": {
+      "total": 2255,
+      "nonrotary": 0,
+      "rotary": 2255,
+      "max_abs": 0.03125
+    },
+    "norm_with_bf16_boundary": {
+      "total": 57344,
+      "nonrotary": 50176
+    }
+  },
+  "random_T17_seed2906": {
+    "q": {
+      "exact_mismatches": 28568,
+      "elements": 139264,
+      "max_abs": 0.0625,
+      "outside_existing_tolerance": 146,
+      "outside_existing_ratio": 0.0010483685182407498
+    },
+    "kv": {
+      "exact_mismatches": 649,
+      "elements": 8704,
+      "max_abs": 0.015625,
+      "outside_existing_tolerance": 0,
+      "outside_existing_ratio": 0.0
+    },
+    "qr": {
+      "exact_mismatches": 141,
+      "elements": 21760,
+      "max_abs": 1.0
+    },
+    "qr_scale": {
+      "exact_mismatches": 7,
+      "elements": 17,
+      "max_abs": 3.725290298461914e-09
+    },
+    "input_quantization_arithmetic": {
+      "int8_mismatches": 25,
+      "scale_max_abs": 3.725290298461914e-09,
+      "note": "Independent oracle divides by amax then multiplies 127; model multiplies reciprocal. Original NPU primitive is modeled, so random bit-exact equality was exploratory, not a required F01 gate."
+    }
+  },
+  "source_hashes": {
+    "experiments/dsv41-flash-w8a8-a3/logs/logic_review_1793929657/upstream_rc2/vllm_ascend/attention/dsa_v41.py": "3505769857f83fa7e67f652984f50bd0478158f1d24f185cab091203e70392fd",
+    "experiments/dsv41-flash-w8a8-a3/logs/logic_review_1793929657/upstream_rc2/vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py": "a67601ee596d9aa4ae72ea3638f67ff7236cd8df884564bcd19f33653a1e0910",
+    "experiments/dsv41-flash-w8a8-a3/logs/logic_review_1793929657/upstream_rc2/tests/e2e/nightly/single_node/ops/singlecard_ops/test_inplace_partial_rotary_mul.py": "078470b8443b8991f23f977c9e898c5263659f733aad1a8254ee9c9671953139"
+  },
+  "limits": "CPU math and archived source proof; no new device execution."
+}

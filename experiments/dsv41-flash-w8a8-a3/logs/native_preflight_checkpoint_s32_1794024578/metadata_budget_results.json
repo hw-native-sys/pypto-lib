@@ -1,0 +1,458 @@
+{
+  "records": {
+    "prefix": {
+      "static_global_logical_bytes": 103422065664,
+      "static_per_rank_bytes": 6463879104,
+      "nonstatic_payload_bytes": 7609876736,
+      "two_saved_copies_min_bytes": 15219753472,
+      "output_count": 17,
+      "tensor_shapes": {
+        "input_ids": [
+          16,
+          128
+        ],
+        "initial_pre": [
+          16,
+          128,
+          4
+        ],
+        "position_ids": [
+          16,
+          128
+        ],
+        "request_ids": [
+          16,
+          128
+        ],
+        "window_slots": [
+          16,
+          128
+        ],
+        "window_indices": [
+          16,
+          128,
+          128
+        ],
+        "index_block_table": [
+          16,
+          1,
+          2
+        ],
+        "state_block_table": [
+          16,
+          1,
+          1
+        ],
+        "rope_cos": [
+          16,
+          128,
+          32
+        ],
+        "rope_sin": [
+          16,
+          128,
+          32
+        ],
+        "rope_cos_swa": [
+          16,
+          128,
+          32
+        ],
+        "rope_sin_swa": [
+          16,
+          128,
+          32
+        ],
+        "c2a_compressed_slots": [
+          16,
+          128
+        ],
+        "c2a_compressed_lens": [
+          16,
+          128
+        ],
+        "c2a_compressed_cos": [
+          16,
+          128,
+          32
+        ],
+        "c2a_compressed_sin": [
+          16,
+          128,
+          32
+        ],
+        "c1a_compressed_slots": [
+          16,
+          128
+        ],
+        "c1a_compressed_lens": [
+          16,
+          128
+        ],
+        "c1a_compressed_cos": [
+          16,
+          128,
+          32
+        ],
+        "c1a_compressed_sin": [
+          16,
+          128,
+          32
+        ],
+        "engram_lookup": [
+          16,
+          2,
+          128,
+          6144
+        ],
+        "window_cache": [
+          16,
+          40,
+          2,
+          128,
+          1,
+          512
+        ],
+        "compressed_cache_c2a": [
+          16,
+          3,
+          2,
+          128,
+          1,
+          512
+        ],
+        "index_cache_c2a": [
+          16,
+          3,
+          2,
+          128,
+          1,
+          128
+        ],
+        "state_cache_c2a": [
+          16,
+          3,
+          1,
+          2,
+          1024
+        ],
+        "compressed_cache_c1a": [
+          16,
+          2,
+          128,
+          1,
+          512
+        ],
+        "index_cache_c1a": [
+          16,
+          2,
+          128,
+          1,
+          128
+        ],
+        "topk_indices_c2a": [
+          16,
+          3,
+          128,
+          512
+        ],
+        "topk_values_c2a": [
+          16,
+          3,
+          128,
+          512
+        ],
+        "pool_block_ids_c2a": [
+          16,
+          3,
+          128,
+          2048
+        ],
+        "pool_block_counts_c2a": [
+          16,
+          3,
+          128
+        ],
+        "topk_indices_c1a": [
+          16,
+          5,
+          128,
+          512
+        ],
+        "topk_values_c1a": [
+          16,
+          5,
+          128,
+          512
+        ],
+        "pool_block_ids_c1a": [
+          16,
+          5,
+          128,
+          2048
+        ],
+        "pool_block_counts_c1a": [
+          16,
+          5,
+          128
+        ],
+        "token_counts": [
+          16
+        ],
+        "x_hc": [
+          16,
+          128,
+          4,
+          5120
+        ],
+        "pre_mix": [
+          16,
+          128,
+          4
+        ],
+        "layer_x_hc": [
+          16,
+          40,
+          128,
+          4,
+          5120
+        ],
+        "layer_pre_mix": [
+          16,
+          40,
+          128,
+          4
+        ],
+        "final_hidden": [
+          16,
+          128,
+          5120
+        ],
+        "logits": [
+          16,
+          128,
+          32320
+        ]
+      },
+      "expert_layers": 1,
+      "actual_tensor_payload_allocation_bytes": 0
+    },
+    "decode": {
+      "static_global_logical_bytes": 103422065664,
+      "static_per_rank_bytes": 6463879104,
+      "nonstatic_payload_bytes": 247111680,
+      "two_saved_copies_min_bytes": 494223360,
+      "output_count": 19,
+      "tensor_shapes": {
+        "input_ids": [
+          16,
+          1
+        ],
+        "initial_pre": [
+          16,
+          1,
+          4
+        ],
+        "x_hc": [
+          16,
+          1,
+          4,
+          5120
+        ],
+        "pre_mix": [
+          16,
+          1,
+          4
+        ],
+        "token_counts": [
+          16
+        ],
+        "position_ids": [
+          16,
+          1
+        ],
+        "request_ids": [
+          16,
+          1
+        ],
+        "rope_cos": [
+          16,
+          1,
+          32
+        ],
+        "rope_sin": [
+          16,
+          1,
+          32
+        ],
+        "rope_cos_swa": [
+          16,
+          1,
+          32
+        ],
+        "rope_sin_swa": [
+          16,
+          1,
+          32
+        ],
+        "c2a_compressed_slots": [
+          16,
+          1
+        ],
+        "c2a_compressed_lens": [
+          16,
+          1
+        ],
+        "c2a_compressed_cos": [
+          16,
+          1,
+          32
+        ],
+        "c2a_compressed_sin": [
+          16,
+          1,
+          32
+        ],
+        "c1a_compressed_slots": [
+          16,
+          1
+        ],
+        "c1a_compressed_lens": [
+          16,
+          1
+        ],
+        "c1a_compressed_cos": [
+          16,
+          1,
+          32
+        ],
+        "c1a_compressed_sin": [
+          16,
+          1,
+          32
+        ],
+        "window_slots": [
+          16,
+          1
+        ],
+        "window_indices": [
+          16,
+          1,
+          128
+        ],
+        "index_block_table": [
+          16,
+          1,
+          2
+        ],
+        "state_block_table": [
+          16,
+          1,
+          1
+        ],
+        "engram_lookup": [
+          16,
+          2,
+          1,
+          6144
+        ],
+        "window_cache": [
+          16,
+          40,
+          2,
+          128,
+          1,
+          512
+        ],
+        "compressed_cache_c2a": [
+          16,
+          3,
+          2,
+          128,
+          1,
+          512
+        ],
+        "index_cache_c2a": [
+          16,
+          3,
+          2,
+          128,
+          1,
+          128
+        ],
+        "state_cache_c2a": [
+          16,
+          3,
+          1,
+          2,
+          1024
+        ],
+        "compressed_cache_c1a": [
+          16,
+          2,
+          128,
+          1,
+          512
+        ],
+        "index_cache_c1a": [
+          16,
+          2,
+          128,
+          1,
+          128
+        ],
+        "topk_indices": [
+          16,
+          8,
+          1,
+          512
+        ],
+        "topk_values": [
+          16,
+          8,
+          1,
+          512
+        ],
+        "pool_block_ids": [
+          16,
+          8,
+          1,
+          2048
+        ],
+        "pool_block_counts": [
+          16,
+          8,
+          1
+        ],
+        "layer_x_hc": [
+          16,
+          40,
+          1,
+          4,
+          5120
+        ],
+        "layer_pre_mix": [
+          16,
+          40,
+          1,
+          4
+        ],
+        "final_hidden": [
+          16,
+          1,
+          5120
+        ],
+        "logits": [
+          16,
+          1,
+          32320
+        ]
+      },
+      "expert_layers": 1,
+      "actual_tensor_payload_allocation_bytes": 0
+    }
+  },
+  "current_v2_immediately_enters_full_fixture_builder": true,
+  "NPU": 0,
+  "large_payload": 0
+}

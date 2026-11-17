@@ -1,0 +1,28 @@
+{
+  "epoch": 1794102875.451069,
+  "from": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_real_B_generation_prepare_1794099369",
+  "input_manifest_sha256": "08f70c924d3fbabaf28e4b848ba9b2c75292352061976918d1b830d4ac594d39",
+  "input_files": {
+    "NEXT_COMMAND.txt": "875b224e10738b4c33d7c4f0d61f261d20af0e6eddeae6903e65510146a9d6c8",
+    "REPORT.md": "7cd626c0dbcae68d83e374e55e1a5db2f6db575670ba35aa1397eafb902eecc9",
+    "audit.py": "b9683fa7ecf759a729e8d3f062ee487fa05c4e69734bcc388092eaea1b1fbc3a",
+    "audit_sourceB.patch": "f844e2723da58bfefb7ca66df4f0cce02e5e7c0af0983b11c5effbfa2464c057",
+    "baseline_M02_audit.py": "e3e566b1922c262b02dc96cc6c7b7ac2670427180c3e836cc1227264a49a0ba7",
+    "baseline_M02_shared_delta.py": "cc93659af09aab8a88ff56d4cf1e31466652513046f4d314e8b663ec5ea4081c",
+    "delta_sourceB.patch": "8efb75af8adea24e8665b220d685e2163aa3fd51b52c3404da3bed5ddb62e55e",
+    "fresh_signature_profiles.json": "b95d6a0f876e4263e08a9647570b2f6add8b0d977f72e9867f5bce967a2bcc17",
+    "handoff_TEMPLATE_ONLY.json": "148cd6142e1257739e25e96d4614d03357d4b9395fcd9324751167366acc9c6f",
+    "lineage.json": "e0d314e4181641a9e3c7c0e4047f8927179031dc57cd7a033b401892255ec3f0",
+    "outer_FINAL_FREEZE.json": "07e372cb25d18f94b4e821a5d5b1aca8eb7f5ac274564b9e161f36aecc06462a",
+    "outer_operation_binding.json": "cc2132a8e7bf0b36110f7a99f68d244a8b98e0f0299d8a9b8e897cec1dde5937",
+    "pins.json": "60f4e23c0076c5b862a3020fcff8479adab3b2ae77c27efd664cd29879ba80ac",
+    "profile_source_binding.json": "a67435021ed0ca375e7a1d555423a6efe24294d3674f46189f553f550c54aef2",
+    "shared_delta.py": "a09f63dd0d9a4fe27e0bdcd6ee5398fb2f596e646eac2dbd5f41980eb4fffdcb",
+    "sourceB_signature_receipt.json": "704eb14f6ff186cedf451830e3c38c303b43a3bce201395e78fd3e044b0ba357",
+    "source_review.json": "24e597a25481fba48fdafebe63c859eb9e14c9fed86cc005dd9989abfff351d6",
+    "work_record.json": "6c6c53bb0f8e511611c22e67d27c6b3d7bc047e5cf5e022d75f74bb7a8e6970c"
+  },
+  "criteria_unchanged": true,
+  "root_go": "observer-20261108-sourceB-real16-shared-w8a8",
+  "native_task_id": "task_20261108_090706_320779619842"
+}

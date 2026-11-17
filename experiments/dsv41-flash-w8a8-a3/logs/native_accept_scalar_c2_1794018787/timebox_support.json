@@ -1,0 +1,13 @@
+{
+  "cli_path": "/usr/local/bin/task-submit",
+  "sha256": "ae01340e05ddaf11588b4b1c08690fb4a5bde7bfbab754fd55caf47ca602cabb",
+  "extension_publicly_supported": false,
+  "evidence": "help and main CLI dispatch cases list no update/extend command; max-time is submission-only",
+  "job_max_time_seconds": 2400,
+  "initial_wait_client_timeout_seconds": 600,
+  "initial_wait_client_exit": 1,
+  "job_status_after_client_timeout": "RUNNING",
+  "reconnected_wait_timeout_seconds": 3600,
+  "actual_tensor_checkpoint_available": false,
+  "no_supervisor_state_modification": true
+}

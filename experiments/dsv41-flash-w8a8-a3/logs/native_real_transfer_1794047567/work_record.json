@@ -1,0 +1,18 @@
+{
+  "record_id": "review-selected-real-transfer-1794047567-1794048693",
+  "agent": "review-agent",
+  "start_epoch": 1794047567,
+  "end_epoch": 1794048693,
+  "duration_seconds": 1126,
+  "status": "FINAL/PARK",
+  "native_jobs": 1,
+  "actual_selected_byte_transfers": 18,
+  "copy_calls": 164,
+  "source_unique": 1335642112,
+  "source_cumulative": 5307123712,
+  "H2D_D2H_each": 5307114496,
+  "actual_offset_nonzero": 0,
+  "actual_offset_numel": 2304,
+  "all36_recorded_identity_absent": true,
+  "fit_text_guard_release": false
+}

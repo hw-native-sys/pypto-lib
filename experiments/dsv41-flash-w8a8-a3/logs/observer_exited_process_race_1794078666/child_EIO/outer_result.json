@@ -1,0 +1,81 @@
+{
+  "started_epoch": 1794079146.0944107,
+  "command": [
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+    "-c",
+    "import time; time.sleep(0.12)"
+  ],
+  "CLI_returncode": 0,
+  "launch_error": null,
+  "postcheck_error": null,
+  "observation_errors": [
+    "post-launch-sample: OSError(5, 'owned IO')"
+  ],
+  "wait_errors": [],
+  "CLI_terminal": true,
+  "postcheck_skipped_reason": null,
+  "CLI_pid": 175729,
+  "CLI_identity": {
+    "pid": 175729,
+    "start_ticks": "107906803",
+    "state": "R",
+    "parent_pid": 175169
+  },
+  "postcheck": {
+    "status": "OWNED_POST_ONLY"
+  },
+  "ended_epoch": 1794079146.281856,
+  "monitor_errors": [],
+  "monitor_thread_alive": false,
+  "telemetry_errors": [
+    {
+      "epoch": 1794079146.1187818,
+      "pid": 175729,
+      "start_ticks": "107906803",
+      "operation": "read-parse-smaps-rollup",
+      "path": "/proc/175729/smaps_rollup",
+      "errno": 5,
+      "exception_type": "OSError",
+      "error": "OSError(5, 'owned IO')",
+      "critical": true
+    }
+  ],
+  "critical_telemetry_errors": [
+    {
+      "epoch": 1794079146.1187818,
+      "pid": 175729,
+      "start_ticks": "107906803",
+      "operation": "read-parse-smaps-rollup",
+      "path": "/proc/175729/smaps_rollup",
+      "errno": 5,
+      "exception_type": "OSError",
+      "error": "OSError(5, 'owned IO')",
+      "critical": true
+    }
+  ],
+  "full_own_tree_memory_measurement_complete": false,
+  "live_own_tree_observation_complete": false,
+  "confirmed_exits": [],
+  "confirmed_exit_receipt_errors": [],
+  "telemetry_status": "PARTIAL_OR_UNKNOWN",
+  "known_process_identities": [
+    [
+      175169,
+      "107906721"
+    ],
+    [
+      175729,
+      "107906803"
+    ]
+  ],
+  "sample_count": 2,
+  "peak_sampled_own_tree_pss": null,
+  "peak_sampled_own_tree_uss": null,
+  "max_complete_sample_pss": 15163392,
+  "max_complete_sample_uss": 13279232,
+  "peak_known_partial_own_tree_pss": 15163392,
+  "peak_known_partial_own_tree_uss": 13279232,
+  "status": "FAIL",
+  "proposed_future_classification": null,
+  "telemetry_policy": "FUTURE_CANDIDATE_STRICT_UNKNOWN_LIVE_FAIL; only recorded-birth confirmed exit after complete child inventory retires from live sample; Root+independent approval required"
+}

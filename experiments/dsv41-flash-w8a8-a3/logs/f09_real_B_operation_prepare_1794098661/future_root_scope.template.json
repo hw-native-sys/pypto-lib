@@ -1,0 +1,50 @@
+{
+  "schema": "SourceB-real-operation-Root-delegation-template/1",
+  "approved": false,
+  "actual16_authorized": false,
+  "Root_operation_GO_id": null,
+  "operation": "shared-full-real40-noEngram-greedy-N3",
+  "binding_sha256": "cc2132a8e7bf0b36110f7a99f68d244a8b98e0f0299d8a9b8e897cec1dde5937",
+  "source45_sha256": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+  "metadata_plan_sha256": "cd8b17741688eeb9ef39d8c0925dbb74a8f9a1cfcc0052db2e0a8c1aacb48cf7",
+  "fresh_signature_receipt": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_applied_signatures_1794097836/signature_receipt.json",
+    "sha256": "704eb14f6ff186cedf451830e3c38c303b43a3bce201395e78fd3e044b0ba357",
+    "manifest_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_applied_signatures_1794097836/artifacts.json",
+    "manifest_sha256": "1a4a8d75e383e4b8001c1c33d574ee5ae5c83654079dee732b49cdac3b931294"
+  },
+  "future_case": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_real_B_generation_1794098661",
+  "PREQUEUE_receipt": null,
+  "PREQUEUE_sha256": null,
+  "actual_ordered_device_ids": null,
+  "task_local_assignment_only_after_actual_allocation": true,
+  "entry_TTL_seconds": 3500,
+  "soft_runtime_seconds": 20400,
+  "queue_hard_seconds": 21600,
+  "client_timeout_seconds": 22200,
+  "tokenizer_root": "/mnt/data/models/DeepSeek-V4.1-Flash-w8a8",
+  "prompt_text": "Once upon a",
+  "prompt_ids": [
+    16600,
+    4465,
+    260
+  ],
+  "max_new_tokens": 16,
+  "runtime_code": {
+    "check_identity.py": "f95eaf38916b645642ebfd4d307b85a64a17ec7ca027c55e0f8585c1590816c4",
+    "outer_runner.py": "28b8c268c5530197273754325aeba978dad1d44428f4f33fe4e5bf13dfcb3d7c",
+    "task_entry.py": "670b126af3b878f8b4e2c6cbbc3a716bb9a0ac6c043bedda49b5c18d0eda02b6"
+  },
+  "weight_accounting": {
+    "canonical_phase": "prefill",
+    "static_upload_bytes": 633997065216,
+    "static_source_reads": 164192,
+    "static_source_bytes": 745846365184,
+    "base_rank_allocations": 912,
+    "decode_static_upload_bytes": 0,
+    "decode_static_source_reads": 0
+  },
+  "strict_telemetry_policy": "UNCHANGED_FAIL_ON_INCOMPLETE",
+  "old_real41_status": "FAILED_183_GAPS",
+  "whole_history_PSS_forward_peak_quality_acceptance": null
+}

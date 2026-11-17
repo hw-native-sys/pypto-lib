@@ -1,0 +1,738 @@
+{
+  "status": "PASS_TINY_ACTUAL_CLASS_WITH_DECLARED_TOY_ADMISSION",
+  "first_error": null,
+  "cleanup_error": null,
+  "normal_close": true,
+  "actual_ordered_device_ids": [
+    0,
+    1
+  ],
+  "owner_ast_sha256": "74a00c6cc0a56c05e90fe4daad2faac9412966832226c589fe3bc7cc93d0cd45",
+  "dependency_pins": {
+    "tiny_shared.py": "38e92714a550407727a4a7d816c1e9c8fc711519cc73ecdcf89c1f8d6caa9d59",
+    "tiny_programs.py": "94f3290e98ceefdba48fa61c372130a7176199b19802d1633152dc9d9619ef60",
+    "owner_adapter.py": "188cf41eafb1e6b6bdece83188a52b1a0e3336c6e5fb80a0d62b547223f31a41",
+    "public_contract.py": "7fb8b40dc98a473de56a162031453bfe3fcce481af4cd999181987ecf6409508",
+    "frozen_draft/generate.proposed.py": "fba8a4ef9a06f694fa53278bb80ae2ad70d111336dbead938ab9f8511d27e16e"
+  },
+  "authorization_sha256": "6486a614721bafc49b600dc42dff90a7da842c6b97811583e0158a42597d0d4e",
+  "baseline_capacity": {
+    "epoch": 1794073207.1727433,
+    "HOST": 1722888015872,
+    "DISK": 8356338073600,
+    "SHM": 1079343157248,
+    "units": "bytes"
+  },
+  "after_close_capacity": {
+    "epoch": 1794073219.0627892,
+    "HOST": 1722306424832,
+    "DISK": 8356335976448,
+    "SHM": 1079342891008,
+    "units": "bytes"
+  },
+  "source_tensor_hashes": [
+    {
+      "key": "0:c1a_comp_norm",
+      "nbytes": 32768,
+      "sha256": "70e5ef9e0c8aa7e0ba8e4276d397164259c3cfa25b0de39f76b4d3e6a37c8329"
+    },
+    {
+      "key": "0:embed_weight",
+      "nbytes": 32768,
+      "sha256": "3ee6d0365f9d1e5297cff3c44da13ac69e147d518f411bd33cc9f5e40166c94d"
+    },
+    {
+      "key": "1:c1a_comp_norm",
+      "nbytes": 32768,
+      "sha256": "70e5ef9e0c8aa7e0ba8e4276d397164259c3cfa25b0de39f76b4d3e6a37c8329"
+    },
+    {
+      "key": "1:embed_weight",
+      "nbytes": 32768,
+      "sha256": "3ee6d0365f9d1e5297cff3c44da13ac69e147d518f411bd33cc9f5e40166c94d"
+    }
+  ],
+  "states": [
+    {
+      "phase": "prefill",
+      "actual_state_unique": [
+        6.0
+      ],
+      "expected": 6
+    },
+    {
+      "phase": "decode",
+      "input": 1,
+      "actual_state_unique": [
+        12.0
+      ],
+      "expected": 12
+    },
+    {
+      "phase": "decode",
+      "input": 2,
+      "actual_state_unique": [
+        19.0
+      ],
+      "expected": 19
+    },
+    {
+      "phase": "decode",
+      "input": 3,
+      "actual_state_unique": [
+        27.0
+      ],
+      "expected": 27
+    },
+    {
+      "phase": "wrong-C1-control",
+      "actual_state_unique": [
+        11.0
+      ],
+      "expected_correct_C1": 12,
+      "numerical_rejection": true,
+      "runtime_exception": false,
+      "scope": "public API extra call, no alteration of canonical owner handles"
+    }
+  ],
+  "reuse_record": {
+    "mode": "one-worker/two-registered-programs",
+    "canonical_phase": "prefill",
+    "static_upload_bytes_total": 131072,
+    "base_rank_allocations_total": 4,
+    "static_source_reads_total": 4,
+    "static_source_bytes_total": 131072,
+    "decode_new_static_source_reads": 0,
+    "decode_new_static_source_bytes": 0,
+    "decode_new_static_upload_bytes": 0,
+    "decode_new_static_allocations": 0,
+    "decode_static_binding": "same initialized bases via public same-worker views",
+    "borrowed_consumer_rank_views": 4
+  },
+  "completed_positive_checkpoints": 4,
+  "completed_public_negative_checkpoints": 1,
+  "observed_runs": [
+    {
+      "phase": "prefill",
+      "compiled_identity": 281461858627120,
+      "actual_worker_identity": 281461714576736,
+      "config_mode": "ExecutionMode.ONBOARD",
+      "config_ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ]
+    },
+    {
+      "phase": "decode",
+      "compiled_identity": 281461714524656,
+      "actual_worker_identity": 281461714576736,
+      "config_mode": "ExecutionMode.ONBOARD",
+      "config_ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ]
+    },
+    {
+      "phase": "decode",
+      "compiled_identity": 281461714524656,
+      "actual_worker_identity": 281461714576736,
+      "config_mode": "ExecutionMode.ONBOARD",
+      "config_ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ]
+    },
+    {
+      "phase": "decode",
+      "compiled_identity": 281461714524656,
+      "actual_worker_identity": 281461714576736,
+      "config_mode": "ExecutionMode.ONBOARD",
+      "config_ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ]
+    },
+    {
+      "phase": "decode",
+      "compiled_identity": 281461714524656,
+      "actual_worker_identity": 281461714576736,
+      "config_mode": "ExecutionMode.ONBOARD",
+      "config_ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ]
+    }
+  ],
+  "canonical_frees": [
+    {
+      "rank": 0,
+      "data_ptr": 20619065585664,
+      "tensor_identity": 281461707990176,
+      "nbytes": 32768
+    },
+    {
+      "rank": 1,
+      "data_ptr": 20619065585664,
+      "tensor_identity": 281461707989936,
+      "nbytes": 32768
+    },
+    {
+      "rank": 0,
+      "data_ptr": 20619065618432,
+      "tensor_identity": 281461707989984,
+      "nbytes": 32768
+    },
+    {
+      "rank": 1,
+      "data_ptr": 20619065618432,
+      "tensor_identity": 281461707987104,
+      "nbytes": 32768
+    }
+  ],
+  "postupload_static_copy_calls": [],
+  "public_memory": [
+    {
+      "phase": "prefill",
+      "stage": "prepared-prewarm",
+      "memory": [
+        {
+          "rank": 0,
+          "free": 59884912640,
+          "total": 65787658240,
+          "committed": 5451744205
+        },
+        {
+          "rank": 1,
+          "free": 60188938240,
+          "total": 65796046848,
+          "committed": 5451744205
+        }
+      ]
+    },
+    {
+      "phase": "prefill",
+      "stage": "before-allocation",
+      "memory": [
+        {
+          "rank": 0,
+          "free": 59884912640,
+          "total": 65787658240,
+          "committed": 5451744205
+        }
+      ]
+    },
+    {
+      "phase": "prefill",
+      "stage": "after-allocation",
+      "memory": [
+        {
+          "rank": 0,
+          "free": 59884912640,
+          "total": 65787658240,
+          "committed": 5451776973
+        }
+      ]
+    },
+    {
+      "phase": "prefill",
+      "stage": "before-copy",
+      "memory": [
+        {
+          "rank": 0,
+          "free": 59884912640,
+          "total": 65787658240,
+          "committed": 5451776973
+        }
+      ]
+    },
+    {
+      "phase": "prefill",
+      "stage": "after-copy",
+      "memory": [
+        {
+          "rank": 0,
+          "free": 59884912640,
+          "total": 65787658240,
+          "committed": 5451776973
+        }
+      ]
+    },
+    {
+      "phase": "prefill",
+      "stage": "before-allocation",
+      "memory": [
+        {
+          "rank": 0,
+          "free": 59884912640,
+          "total": 65787658240,
+          "committed": 5451776973
+        }
+      ]
+    },
+    {
+      "phase": "prefill",
+      "stage": "after-allocation",
+      "memory": [
+        {
+          "rank": 0,
+          "free": 59884912640,
+          "total": 65787658240,
+          "committed": 5451809741
+        }
+      ]
+    },
+    {
+      "phase": "prefill",
+      "stage": "before-copy",
+      "memory": [
+        {
+          "rank": 0,
+          "free": 59884912640,
+          "total": 65787658240,
+          "committed": 5451809741
+        }
+      ]
+    },
+    {
+      "phase": "prefill",
+      "stage": "after-copy",
+      "memory": [
+        {
+          "rank": 0,
+          "free": 59884912640,
+          "total": 65787658240,
+          "committed": 5451809741
+        }
+      ]
+    },
+    {
+      "phase": "prefill",
+      "stage": "before-allocation",
+      "memory": [
+        {
+          "rank": 1,
+          "free": 60188938240,
+          "total": 65796046848,
+          "committed": 5451744205
+        }
+      ]
+    },
+    {
+      "phase": "prefill",
+      "stage": "after-allocation",
+      "memory": [
+        {
+          "rank": 1,
+          "free": 60188938240,
+          "total": 65796046848,
+          "committed": 5451776973
+        }
+      ]
+    },
+    {
+      "phase": "prefill",
+      "stage": "before-copy",
+      "memory": [
+        {
+          "rank": 1,
+          "free": 60188938240,
+          "total": 65796046848,
+          "committed": 5451776973
+        }
+      ]
+    },
+    {
+      "phase": "prefill",
+      "stage": "after-copy",
+      "memory": [
+        {
+          "rank": 1,
+          "free": 60188938240,
+          "total": 65796046848,
+          "committed": 5451776973
+        }
+      ]
+    },
+    {
+      "phase": "prefill",
+      "stage": "before-allocation",
+      "memory": [
+        {
+          "rank": 1,
+          "free": 60188938240,
+          "total": 65796046848,
+          "committed": 5451776973
+        }
+      ]
+    },
+    {
+      "phase": "prefill",
+      "stage": "after-allocation",
+      "memory": [
+        {
+          "rank": 1,
+          "free": 60188938240,
+          "total": 65796046848,
+          "committed": 5451809741
+        }
+      ]
+    },
+    {
+      "phase": "prefill",
+      "stage": "before-copy",
+      "memory": [
+        {
+          "rank": 1,
+          "free": 60188938240,
+          "total": 65796046848,
+          "committed": 5451809741
+        }
+      ]
+    },
+    {
+      "phase": "prefill",
+      "stage": "after-copy",
+      "memory": [
+        {
+          "rank": 1,
+          "free": 60188938240,
+          "total": 65796046848,
+          "committed": 5451809741
+        }
+      ]
+    },
+    {
+      "phase": "prefill",
+      "stage": "before-forward",
+      "memory": [
+        {
+          "rank": 0,
+          "free": 59884040192,
+          "total": 65787658240,
+          "committed": 5451809741
+        },
+        {
+          "rank": 1,
+          "free": 60188938240,
+          "total": 65796046848,
+          "committed": 5451809741
+        }
+      ]
+    },
+    {
+      "phase": "prefill",
+      "stage": "after-forward",
+      "memory": [
+        {
+          "rank": 0,
+          "free": 59884040192,
+          "total": 65787658240,
+          "committed": 5451922956
+        },
+        {
+          "rank": 1,
+          "free": 60188647424,
+          "total": 65796046848,
+          "committed": 5451922956
+        }
+      ]
+    },
+    {
+      "phase": "decode",
+      "stage": "shared-phase-boundary",
+      "memory": [
+        {
+          "rank": 0,
+          "free": 59884040192,
+          "total": 65787658240,
+          "committed": 5451922956
+        },
+        {
+          "rank": 1,
+          "free": 60188647424,
+          "total": 65796046848,
+          "committed": 5451922956
+        }
+      ]
+    },
+    {
+      "phase": "decode",
+      "stage": "before-forward",
+      "memory": [
+        {
+          "rank": 0,
+          "free": 59884040192,
+          "total": 65787658240,
+          "committed": 5451922956
+        },
+        {
+          "rank": 1,
+          "free": 60188647424,
+          "total": 65796046848,
+          "committed": 5451922956
+        }
+      ]
+    },
+    {
+      "phase": "decode",
+      "stage": "after-forward",
+      "memory": [
+        {
+          "rank": 0,
+          "free": 59884040192,
+          "total": 65787658240,
+          "committed": 5451922956
+        },
+        {
+          "rank": 1,
+          "free": 60188647424,
+          "total": 65796046848,
+          "committed": 5451922956
+        }
+      ]
+    },
+    {
+      "phase": "decode",
+      "stage": "before-forward",
+      "memory": [
+        {
+          "rank": 0,
+          "free": 59884130304,
+          "total": 65787658240,
+          "committed": 5451922956
+        },
+        {
+          "rank": 1,
+          "free": 60188647424,
+          "total": 65796046848,
+          "committed": 5451922956
+        }
+      ]
+    },
+    {
+      "phase": "decode",
+      "stage": "after-forward",
+      "memory": [
+        {
+          "rank": 0,
+          "free": 59884130304,
+          "total": 65787658240,
+          "committed": 5451922956
+        },
+        {
+          "rank": 1,
+          "free": 60188647424,
+          "total": 65796046848,
+          "committed": 5451922956
+        }
+      ]
+    },
+    {
+      "phase": "decode",
+      "stage": "before-forward",
+      "memory": [
+        {
+          "rank": 0,
+          "free": 59884130304,
+          "total": 65787658240,
+          "committed": 5451922956
+        },
+        {
+          "rank": 1,
+          "free": 60188647424,
+          "total": 65796046848,
+          "committed": 5451922956
+        }
+      ]
+    },
+    {
+      "phase": "decode",
+      "stage": "after-forward",
+      "memory": [
+        {
+          "rank": 0,
+          "free": 59884130304,
+          "total": 65787658240,
+          "committed": 5451922956
+        },
+        {
+          "rank": 1,
+          "free": 60188647424,
+          "total": 65796046848,
+          "committed": 5451922956
+        }
+      ]
+    },
+    {
+      "phase": "decode",
+      "stage": "before-numerical-control",
+      "memory": [
+        {
+          "rank": 0,
+          "free": 59884130304,
+          "total": 65787658240,
+          "committed": 5451922956
+        },
+        {
+          "rank": 1,
+          "free": 60188647424,
+          "total": 65796046848,
+          "committed": 5451922956
+        }
+      ]
+    },
+    {
+      "phase": "decode",
+      "stage": "after-numerical-control",
+      "memory": [
+        {
+          "rank": 0,
+          "free": 59884130304,
+          "total": 65787658240,
+          "committed": 5451922956
+        },
+        {
+          "rank": 1,
+          "free": 60188647424,
+          "total": 65796046848,
+          "committed": 5451922956
+        }
+      ]
+    },
+    {
+      "phase": "decode",
+      "stage": "phase-final-before-free",
+      "memory": [
+        {
+          "rank": 0,
+          "free": 59884130304,
+          "total": 65787658240,
+          "committed": 5451922956
+        },
+        {
+          "rank": 1,
+          "free": 60188647424,
+          "total": 65796046848,
+          "committed": 5451922956
+        }
+      ]
+    },
+    {
+      "phase": "decode",
+      "stage": "phase-final-after-free",
+      "memory": [
+        {
+          "rank": 0,
+          "free": 59884130304,
+          "total": 65787658240,
+          "committed": 5451857420
+        },
+        {
+          "rank": 1,
+          "free": 60188647424,
+          "total": 65796046848,
+          "committed": 5451857420
+        }
+      ]
+    }
+  ],
+  "known_process_identities": [
+    {
+      "pid": 3343088,
+      "starttick": "107312428"
+    },
+    {
+      "pid": 3343088,
+      "starttick": "107312428"
+    },
+    {
+      "pid": 3344539,
+      "starttick": "107313940"
+    },
+    {
+      "pid": 3344536,
+      "starttick": "107313939"
+    },
+    {
+      "pid": 3344535,
+      "starttick": "107313938"
+    },
+    {
+      "pid": 3343088,
+      "starttick": "107312428"
+    },
+    {
+      "pid": 3344539,
+      "starttick": "107313940"
+    },
+    {
+      "pid": 3344536,
+      "starttick": "107313939"
+    },
+    {
+      "pid": 3344535,
+      "starttick": "107313938"
+    },
+    {
+      "pid": 3343088,
+      "starttick": "107312428"
+    },
+    {
+      "pid": 3344539,
+      "starttick": "107313940"
+    },
+    {
+      "pid": 3344536,
+      "starttick": "107313939"
+    },
+    {
+      "pid": 3344535,
+      "starttick": "107313938"
+    },
+    {
+      "pid": 3343088,
+      "starttick": "107312428"
+    },
+    {
+      "pid": 3344539,
+      "starttick": "107313940"
+    },
+    {
+      "pid": 3344536,
+      "starttick": "107313939"
+    },
+    {
+      "pid": 3344535,
+      "starttick": "107313938"
+    },
+    {
+      "pid": 3343088,
+      "starttick": "107312428"
+    },
+    {
+      "pid": 3344539,
+      "starttick": "107313940"
+    },
+    {
+      "pid": 3344536,
+      "starttick": "107313939"
+    },
+    {
+      "pid": 3344535,
+      "starttick": "107313938"
+    }
+  ],
+  "own_pid": 3343088,
+  "own_starttick": "107312428",
+  "scope": "Exact proposed SharedWeightOwner/PreparedDispatch AST; explicit tiny2 schema/source/resource guard subclass, NOT production admission, model or real weights."
+}

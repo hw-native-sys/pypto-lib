@@ -1,0 +1,42 @@
+{
+  "statuses": {
+    "task_20261107_130545_17984923672": {
+      "returncode": 0,
+      "stdout": "completed (exit=0)\n",
+      "stderr": "",
+      "time": 1794031400
+    },
+    "task_20261107_131609_23982214151": {
+      "returncode": 0,
+      "stdout": "completed (exit=0)\n",
+      "stderr": "",
+      "time": 1794031400
+    }
+  },
+  "recorded_own_pids_present": {
+    "179990": false,
+    "180708": false,
+    "203231": false,
+    "203232": false,
+    "203238": false,
+    "203244": false,
+    "203257": false,
+    "203264": false,
+    "203270": false,
+    "203276": false,
+    "203282": false,
+    "203289": false,
+    "203302": false,
+    "203308": false,
+    "203314": false,
+    "203320": false,
+    "203326": false,
+    "203340": false,
+    "203346": false,
+    "240146": false
+  },
+  "original_prefix_compiled_metadata": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_prefix_capture_v3_1794027615/work/prefix/compiled_metadata.json",
+  "original_compiled_metadata": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_prefix_capture_v3_1794027615/build/_jit_prefill_fwd_20261107_130816_psh7ea4w/distributed_meta.json",
+  "current_final_seal_completed": false,
+  "work_measurement_gate_sealed": false
+}

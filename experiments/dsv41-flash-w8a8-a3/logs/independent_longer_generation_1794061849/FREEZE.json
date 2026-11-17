@@ -1,0 +1,9 @@
+{
+  "status": "FINAL/SEALED/PARK",
+  "scope": "unapplied longer-N3 changed predicates and source inheritance",
+  "artifact_count": 7,
+  "artifact_manifest_sha256": "03a6d73385839fc71792e00b2cf7f10b153eeb3a47b85b1090151fbbabf0f1ee",
+  "end_epoch": 1794062016,
+  "all_own_jobs_terminal": true,
+  "candidate_applied": false
+}

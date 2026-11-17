@@ -1,0 +1,12 @@
+{
+  "agent": "/root/reviewer_f09",
+  "recorded_start_epoch": 1794094092.8879435,
+  "end_epoch": 1794094429.768171,
+  "CPUtask": "task_20261108_073142_193517817822",
+  "checker_seconds": 1.4366483688354492,
+  "scope": "source-phaseimmutable proof thenseparate one metadataPREQUEUE",
+  "shared_writes": 0,
+  "ownjobs": 0,
+  "NPU": 0,
+  "status": "FINAL_READY_PARK"
+}

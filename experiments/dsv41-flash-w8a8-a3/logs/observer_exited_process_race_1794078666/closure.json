@@ -1,0 +1,20 @@
+{
+  "NPU": 0,
+  "active_case_not_modified_or_reclassified": true,
+  "candidate_applied_or_policy_approved": false,
+  "candidate_outer_sha256": "133fac01012a5197a66a3fa2260e363c95e45b25a4eb61d808b24f39e000a651",
+  "current_outer15_unchanged": true,
+  "end_epoch": 1794079711,
+  "fake_cases_final": 11,
+  "final_CPU_exit": 0,
+  "final_CPU_task": "task_20261108_032238_40403327276",
+  "first_CPU_exit": 0,
+  "first_CPU_task": "task_20261108_031900_1718674222",
+  "known_CPU_child_identities_absent": true,
+  "known_CPU_child_identity_count": 12,
+  "modelM02_unchanged": true,
+  "patch_sha256": "465e302d811e85b81c5e6f7fe5bf343535834e6c4f99921022ff0cef8c82be67",
+  "short_children_final": 5,
+  "state": "FINAL_PARK_CANDIDATE_ONLY",
+  "tensor_payload_bytes": 0
+}

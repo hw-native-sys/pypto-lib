@@ -1,0 +1,23 @@
+{
+  "status": "PASS_FINAL_CPU_CHECKS",
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "Main31_byte_verified_before_after": true,
+  "other44_exact_old_ab1": true,
+  "old_sealed_manifest_pins_unchanged": {
+    "native_preflight_checkpoint_s32_1794024578/artifacts.json": "e6de196f770de05a0556f273fbbe8bb4525dccfdf31713fbabe4380c26202c7b",
+    "native_preflight_v3_1794026427/artifacts_final.json": "144340c9026c61e501d4e677fdccff33d380b5a9958a12fd831c9f5e9dc6c558",
+    "native_prefix_capture_v3_1794027615/artifacts_final.json": "65e98cacd561c78a1f3a9a059ba059674076978e700143ed6cdbb2d317d64591",
+    "native_decode_capture_v3_1794031922/artifacts_final.json": "fbff5e23845e15f3c1eaba9bb96afa644dd5b1aae1675f3ea60fb564e257fdd5",
+    "checkpoint_integration_v3_1794024669/artifacts.json": "cc8822c6803f6b10dd3d8a4f3ac913ca9b86f4eaa4f4a95b9a17efaa18b32f46"
+  },
+  "old_large_capsule_payloads": "not reread in this unit; no old path was written",
+  "new_static_plan_sha256": "6f9568a4fdfcb7c3fcb5d816025007f3601e78e24e4b85a392cb3e7854a9b850",
+  "observed_own_processes": [
+    994092
+  ],
+  "all_observed_own_processes_absent": true,
+  "own_jobs_terminal": true,
+  "NPU_jobs": 0,
+  "real_checkpoint_payload_reads": 0,
+  "limits": "CPU/source/static preflight only; no forward/native/fit/text acceptance"
+}

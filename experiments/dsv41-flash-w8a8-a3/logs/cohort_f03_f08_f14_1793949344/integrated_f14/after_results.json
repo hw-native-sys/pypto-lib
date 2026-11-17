@@ -1,0 +1,34 @@
+{
+  "payload_cases": [
+    {
+      "mode": "nonzero",
+      "matrices": 9,
+      "mismatched_bytes": 0
+    },
+    {
+      "mode": "zero",
+      "matrices": 9,
+      "mismatched_bytes": 0
+    }
+  ],
+  "rejections": [
+    {
+      "mode": "fractional",
+      "error": "layers.0.ffn.experts.72.w1.weight_offset: nonzero offset is not representable after the INT8 fold"
+    },
+    {
+      "mode": "overflow_low",
+      "error": "layers.0.ffn.experts.72.w1.weight_offset: nonzero offset is not representable after the INT8 fold"
+    },
+    {
+      "mode": "overflow_high",
+      "error": "layers.0.ffn.experts.72.w1.weight_offset: nonzero offset is not representable after the INT8 fold"
+    }
+  ],
+  "shard_matrices_exact": 72,
+  "shard_scales_exact": 72,
+  "validation_errors": [],
+  "endpoint_cases_exact": 2,
+  "source_sha256": "46d42683c2450ebb49947df2bd823dc3659d66cf5ba4c5ce12d0f92faf51aa9e",
+  "limitations": "In-memory synthetic fixture only; no checkpoint read, current-checkpoint incidence or original NPU primitive parity claim."
+}

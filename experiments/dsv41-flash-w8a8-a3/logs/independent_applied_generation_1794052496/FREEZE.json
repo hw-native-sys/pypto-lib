@@ -1,0 +1,13 @@
+{
+  "status": "FINAL/PARK",
+  "epoch": 1794053405,
+  "artifact_count": 611,
+  "artifacts_sha256": "fe8f9d5f5d6f20fbd7f1b644256c0f25ecede302850dd46afcb4912971c38622",
+  "source45_sha256": "d77d196be6541b4a87aef07cf0e5e02eac68cefa9fc245f3742e4c14606555aa",
+  "generate_sha256": "d057012464331b10b0bdc7f406925ee0c552dd298a1db171a93b0b1595769598",
+  "CPU_task": "task_20261107_200408_351083432494",
+  "all_own_jobs_terminal": true,
+  "own_native_jobs": 0,
+  "real_payload_reads": 0,
+  "operational_mutable_files": []
+}

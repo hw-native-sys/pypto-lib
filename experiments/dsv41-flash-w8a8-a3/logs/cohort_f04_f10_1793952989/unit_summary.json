@@ -1,0 +1,885 @@
+{
+  "changed": [
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_c2a_full.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_fwd.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/generate.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/layer_reference.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/moe_exchange.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_c2a_full.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_fwd.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/utils.py"
+  ],
+  "manifest_sha256": "bf635491416ffc893715041588683492547d3560ac9d7f1f07572bbfd652f089",
+  "f04_compute_kernel_asts_unchanged": true,
+  "coordinate_checks": {
+    "wrong": [
+      {
+        "step": 0,
+        "requests": [
+          [
+            1249,
+            1
+          ],
+          [
+            1253,
+            1
+          ]
+        ],
+        "passed": false,
+        "error": "Output(s) does not match golden: ['compressed_cache', 'index_cache', 'partial']\n  'compressed_cache' FAIL (capture)  shape=(20, 128, 1, 512) dtype=torch.bfloat16\n\n    published source rows:     ratio_allclose fail: error_count=115/1024 (ratio=11.2305%, allowed<=1.0000%, threshold=10 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=3.42188 at (0, 485) (tol=0.0436816)\n    first 10 mismatches:\n    [448] actual=-0.7109375, expected=0.026611328, diff=0.7375, tol=0.02042\n    [449] actual=0.26757812, expected=-0.7578125, diff=1.025, tol=0.03184\n    [450] actual=-1.1171875, expected=1.3515625, diff=2.469, tol=0.04112\n    [451] actual=-1.53125, expected=1.3359375, diff=2.867, tol=0.04087\n    [452] actual=0.19140625, expected=-0.890625, diff=1.082, tol=0.03392\n    [453] actual=-1.21875, expected=-0.859375, diff=0.3594, tol=0.03343\n    [454] actual=0.2890625, expected=1.1171875, diff=0.8281, tol=0.03746\n    [455] actual=1.328125, expected=0.76953125, diff=0.5586, tol=0.03202\n    [457] actual=-0.359375, expected=0.36328125, diff=0.7227, tol=0.02568\n    [458] actual=-0.76171875, expected=0.734375, diff=1.496, tol=0.03147\n  'index_cache' FAIL (capture)  shape=(20, 128, 1, 128) dtype=torch.bfloat16\n\n    published source rows:     ratio_allclose fail: error_count=118/256 (ratio=46.0938%, allowed<=1.0000%, threshold=3 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=5.26562 at (1, 100) (tol=0.0585742)\n    first 10 mismatches:\n    [64] actual=-0.65234375, expected=-0.265625, diff=0.3867, tol=0.02415\n    [65] actual=0.55859375, expected=-0.81640625, diff=1.375, tol=0.03276\n    [66] actual=2.40625, expected=-2.5625, diff=4.969, tol=0.06004\n    [67] actual=1.15625, expected=-0.75, diff=1.906, tol=0.03172\n    [68] actual=-0.25195312, expected=-0.51171875, diff=0.2598, tol=0.028\n    [69] actual=-0.45117188, expected=-0.053710938, diff=0.3975, tol=0.02084\n    [70] actual=0.0054626465, expected=1.0078125, diff=1.002, tol=0.03575\n    [71] actual=1.4609375, expected=1.0625, diff=0.3984, tol=0.0366\n    [72] actual=-1.0859375, expected=1.421875, diff=2.508, tol=0.04222\n    [73] actual=-0.92578125, expected=0.15820312, diff=1.084, tol=0.02247\n  'partial' FAIL (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))  shape=(2, 5120) dtype=torch.bfloat16\n    ratio_allclose fail: error_count=398/10240 (ratio=3.8867%, allowed<=1.0000%, threshold=102 pts)\n    atol=0.02 rtol=0.01\n    max abs diff=0.0457001 at (1, 4072) (tol=0.0204346)\n    first 10 mismatches:\n    [5123] actual=-0.14648438, expected=-0.1171875, diff=0.0293, tol=0.02117\n    [5126] actual=-0.058349609, expected=-0.080078125, diff=0.02173, tol=0.0208\n    [5136] actual=0.074707031, expected=0.053710938, diff=0.021, tol=0.02054\n    [5141] actual=0.11376953, expected=0.087402344, diff=0.02637, tol=0.02087\n    [5147] actual=-0.041259766, expected=-0.067382812, diff=0.02612, tol=0.02067\n    [5149] actual=0.052490234, expected=0.073730469, diff=0.02124, tol=0.02074\n    [5162] actual=0.14257812, expected=0.12109375, diff=0.02148, tol=0.02121\n    [5250] actual=-0.076171875, expected=-0.055175781, diff=0.021, tol=0.02055\n    [5255] actual=-0.010864258, expected=-0.037353516, diff=0.02649, tol=0.02037\n    [5268] actual=-0.037597656, expected=-0.062255859, diff=0.02466, tol=0.02062",
+        "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/cohort_f04_f10_1793952989/f04/device/build_output/_jit_decode_c2a_full_attention_test_20261106_163409_drp78fqm",
+        "actual_state_carried": false,
+        "failure_counts": [
+          [
+            "115",
+            "1024"
+          ],
+          [
+            "118",
+            "256"
+          ],
+          [
+            "398",
+            "10240"
+          ]
+        ]
+      }
+    ],
+    "positive": [
+      {
+        "step": 0,
+        "requests": [
+          [
+            1249,
+            1
+          ],
+          [
+            1253,
+            1
+          ]
+        ],
+        "passed": true,
+        "error": null,
+        "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/cohort_f04_f10_1793952989/f04/device/build_output/_jit_decode_c2a_full_attention_test_20261106_163500_lp7y7m4z",
+        "actual_state_carried": false
+      }
+    ],
+    "continuation": [
+      {
+        "step": 0,
+        "requests": [
+          [
+            1248,
+            1
+          ],
+          [
+            1250,
+            1
+          ]
+        ],
+        "passed": true,
+        "error": null,
+        "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/cohort_f04_f10_1793952989/f04/device/build_output/_jit_decode_c2a_full_attention_test_20261106_163550_pbvxcang",
+        "actual_state_carried": false
+      },
+      {
+        "step": 1,
+        "requests": [
+          [
+            1249,
+            1
+          ],
+          [
+            1251,
+            1
+          ]
+        ],
+        "passed": true,
+        "error": null,
+        "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/cohort_f04_f10_1793952989/f04/device/build_output/_jit_decode_c2a_full_attention_test_20261106_163550_pbvxcang",
+        "actual_state_carried": true
+      }
+    ]
+  },
+  "coordinate_rows": [
+    {
+      "mode": "wrong",
+      "start": "1793954042",
+      "end": "1793954095",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "mode": "positive",
+      "start": "1793954095",
+      "end": "1793954145",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "mode": "continuation",
+      "start": "1793954145",
+      "end": "1793954200",
+      "exit": "0",
+      "device": "0"
+    }
+  ],
+  "downstream_rows": [
+    {
+      "entry": "mla_proj",
+      "start": "1793954171",
+      "end": "1793954187",
+      "exit": "0",
+      "device": "1"
+    },
+    {
+      "entry": "o_proj",
+      "start": "1793954187",
+      "end": "1793954202",
+      "exit": "0",
+      "device": "1"
+    },
+    {
+      "entry": "moe_gate",
+      "start": "1793954202",
+      "end": "1793954217",
+      "exit": "0",
+      "device": "1"
+    },
+    {
+      "entry": "compressor",
+      "start": "1793954217",
+      "end": "1793954236",
+      "exit": "0",
+      "device": "1"
+    },
+    {
+      "entry": "indexer",
+      "start": "1793954236",
+      "end": "1793954268",
+      "exit": "0",
+      "device": "1"
+    },
+    {
+      "entry": "decode_swa",
+      "start": "1793954268",
+      "end": "1793954288",
+      "exit": "0",
+      "device": "1"
+    },
+    {
+      "entry": "prefill_swa",
+      "start": "1793954288",
+      "end": "1793954306",
+      "exit": "0",
+      "device": "1"
+    },
+    {
+      "entry": "decode_c2a_full",
+      "start": "1793954306",
+      "end": "1793954330",
+      "exit": "0",
+      "device": "1"
+    },
+    {
+      "entry": "prefill_c2a_full",
+      "start": "1793954330",
+      "end": "1793954354",
+      "exit": "0",
+      "device": "1"
+    },
+    {
+      "entry": "decode_c2a_reuse",
+      "start": "1793954354",
+      "end": "1793954374",
+      "exit": "0",
+      "device": "1"
+    },
+    {
+      "entry": "prefill_c2a_reuse",
+      "start": "1793954374",
+      "end": "1793954393",
+      "exit": "0",
+      "device": "1"
+    },
+    {
+      "entry": "decode_c1a_full",
+      "start": "1793954393",
+      "end": "1793954418",
+      "exit": "0",
+      "device": "1"
+    },
+    {
+      "entry": "prefill_c1a_full",
+      "start": "1793954418",
+      "end": "1793954441",
+      "exit": "0",
+      "device": "1"
+    },
+    {
+      "entry": "decode_c1a_reindex",
+      "start": "1793954441",
+      "end": "1793954464",
+      "exit": "0",
+      "device": "1"
+    },
+    {
+      "entry": "prefill_c1a_reindex",
+      "start": "1793954464",
+      "end": "1793954486",
+      "exit": "0",
+      "device": "1"
+    },
+    {
+      "entry": "decode_c1a_reuse",
+      "start": "1793954486",
+      "end": "1793954505",
+      "exit": "0",
+      "device": "1"
+    },
+    {
+      "entry": "prefill_c1a_reuse",
+      "start": "1793954505",
+      "end": "1793954524",
+      "exit": "0",
+      "device": "1"
+    }
+  ],
+  "downstream_verdicts": {
+    "mla_proj": [
+      [
+        "q",
+        "PASS"
+      ],
+      [
+        "kv",
+        "PASS"
+      ],
+      [
+        "qr",
+        "PASS"
+      ],
+      [
+        "qr_scale",
+        "PASS"
+      ],
+      [
+        "q",
+        "PASS"
+      ],
+      [
+        "kv",
+        "PASS"
+      ],
+      [
+        "qr",
+        "PASS"
+      ],
+      [
+        "qr_scale",
+        "PASS"
+      ],
+      [
+        "q",
+        "PASS"
+      ],
+      [
+        "kv",
+        "PASS"
+      ],
+      [
+        "qr",
+        "PASS"
+      ],
+      [
+        "qr_scale",
+        "PASS"
+      ]
+    ],
+    "o_proj": [
+      [
+        "output",
+        "PASS"
+      ],
+      [
+        "output",
+        "PASS"
+      ],
+      [
+        "output",
+        "PASS"
+      ],
+      [
+        "output",
+        "PASS"
+      ]
+    ],
+    "moe_gate": [
+      [
+        "indices",
+        "PASS"
+      ],
+      [
+        "weights",
+        "PASS"
+      ],
+      [
+        "indices",
+        "PASS"
+      ],
+      [
+        "weights",
+        "PASS"
+      ],
+      [
+        "indices",
+        "PASS"
+      ],
+      [
+        "weights",
+        "PASS"
+      ],
+      [
+        "indices",
+        "PASS"
+      ],
+      [
+        "weights",
+        "PASS"
+      ]
+    ],
+    "compressor": [
+      [
+        "output",
+        "PASS"
+      ],
+      [
+        "state_cache",
+        "PASS"
+      ],
+      [
+        "output",
+        "PASS"
+      ]
+    ],
+    "indexer": [
+      [
+        "index_cache",
+        "PASS"
+      ],
+      [
+        "scores",
+        "PASS"
+      ],
+      [
+        "indices",
+        "PASS"
+      ],
+      [
+        "values",
+        "PASS"
+      ],
+      [
+        "pool_ids",
+        "PASS"
+      ],
+      [
+        "pool_counts",
+        "PASS"
+      ],
+      [
+        "index_cache",
+        "PASS"
+      ],
+      [
+        "scores",
+        "PASS"
+      ],
+      [
+        "indices",
+        "PASS"
+      ],
+      [
+        "values",
+        "PASS"
+      ],
+      [
+        "pool_ids",
+        "PASS"
+      ],
+      [
+        "pool_counts",
+        "PASS"
+      ],
+      [
+        "index_cache",
+        "PASS"
+      ],
+      [
+        "scores",
+        "PASS"
+      ],
+      [
+        "indices",
+        "PASS"
+      ],
+      [
+        "values",
+        "PASS"
+      ],
+      [
+        "pool_ids",
+        "PASS"
+      ],
+      [
+        "pool_counts",
+        "PASS"
+      ],
+      [
+        "index_cache",
+        "PASS"
+      ],
+      [
+        "scores",
+        "PASS"
+      ],
+      [
+        "indices",
+        "PASS"
+      ],
+      [
+        "values",
+        "PASS"
+      ],
+      [
+        "pool_ids",
+        "PASS"
+      ],
+      [
+        "pool_counts",
+        "PASS"
+      ],
+      [
+        "pool_ids",
+        "PASS"
+      ],
+      [
+        "pool_counts",
+        "PASS"
+      ],
+      [
+        "indices",
+        "PASS"
+      ],
+      [
+        "values",
+        "PASS"
+      ],
+      [
+        "pool_ids",
+        "PASS"
+      ],
+      [
+        "pool_counts",
+        "PASS"
+      ],
+      [
+        "indices",
+        "PASS"
+      ],
+      [
+        "values",
+        "PASS"
+      ]
+    ],
+    "decode_swa": [
+      [
+        "window_cache",
+        "PASS"
+      ],
+      [
+        "partial",
+        "PASS"
+      ],
+      [
+        "window_cache",
+        "PASS"
+      ],
+      [
+        "partial",
+        "PASS"
+      ]
+    ],
+    "prefill_swa": [
+      [
+        "window_cache",
+        "PASS"
+      ],
+      [
+        "partial",
+        "PASS"
+      ]
+    ],
+    "decode_c2a_full": [
+      [
+        "window_cache",
+        "PASS"
+      ],
+      [
+        "compressed_cache",
+        "PASS"
+      ],
+      [
+        "index_cache",
+        "PASS"
+      ],
+      [
+        "state_cache",
+        "PASS"
+      ],
+      [
+        "topk_indices",
+        "PASS"
+      ],
+      [
+        "topk_values",
+        "PASS"
+      ],
+      [
+        "pool_block_ids",
+        "PASS"
+      ],
+      [
+        "pool_block_counts",
+        "PASS"
+      ],
+      [
+        "partial",
+        "PASS"
+      ],
+      [
+        "window_cache",
+        "PASS"
+      ],
+      [
+        "compressed_cache",
+        "PASS"
+      ],
+      [
+        "index_cache",
+        "PASS"
+      ],
+      [
+        "state_cache",
+        "PASS"
+      ],
+      [
+        "topk_indices",
+        "PASS"
+      ],
+      [
+        "topk_values",
+        "PASS"
+      ],
+      [
+        "pool_block_ids",
+        "PASS"
+      ],
+      [
+        "pool_block_counts",
+        "PASS"
+      ],
+      [
+        "partial",
+        "PASS"
+      ]
+    ],
+    "prefill_c2a_full": [
+      [
+        "window_cache",
+        "PASS"
+      ],
+      [
+        "compressed_cache",
+        "PASS"
+      ],
+      [
+        "index_cache",
+        "PASS"
+      ],
+      [
+        "state_cache",
+        "PASS"
+      ],
+      [
+        "topk_indices",
+        "PASS"
+      ],
+      [
+        "topk_values",
+        "PASS"
+      ],
+      [
+        "pool_block_ids",
+        "PASS"
+      ],
+      [
+        "pool_block_counts",
+        "PASS"
+      ],
+      [
+        "partial",
+        "PASS"
+      ]
+    ],
+    "decode_c2a_reuse": [
+      [
+        "window_cache",
+        "PASS"
+      ],
+      [
+        "partial",
+        "PASS"
+      ],
+      [
+        "window_cache",
+        "PASS"
+      ],
+      [
+        "partial",
+        "PASS"
+      ]
+    ],
+    "prefill_c2a_reuse": [
+      [
+        "window_cache",
+        "PASS"
+      ],
+      [
+        "partial",
+        "PASS"
+      ]
+    ],
+    "decode_c1a_full": [
+      [
+        "window_cache",
+        "PASS"
+      ],
+      [
+        "compressed_cache",
+        "PASS"
+      ],
+      [
+        "index_cache",
+        "PASS"
+      ],
+      [
+        "topk_indices",
+        "PASS"
+      ],
+      [
+        "topk_values",
+        "PASS"
+      ],
+      [
+        "pool_block_ids",
+        "PASS"
+      ],
+      [
+        "pool_block_counts",
+        "PASS"
+      ],
+      [
+        "partial",
+        "PASS"
+      ],
+      [
+        "window_cache",
+        "PASS"
+      ],
+      [
+        "compressed_cache",
+        "PASS"
+      ],
+      [
+        "index_cache",
+        "PASS"
+      ],
+      [
+        "topk_indices",
+        "PASS"
+      ],
+      [
+        "topk_values",
+        "PASS"
+      ],
+      [
+        "pool_block_ids",
+        "PASS"
+      ],
+      [
+        "pool_block_counts",
+        "PASS"
+      ],
+      [
+        "partial",
+        "PASS"
+      ]
+    ],
+    "prefill_c1a_full": [
+      [
+        "window_cache",
+        "PASS"
+      ],
+      [
+        "compressed_cache",
+        "PASS"
+      ],
+      [
+        "index_cache",
+        "PASS"
+      ],
+      [
+        "topk_indices",
+        "PASS"
+      ],
+      [
+        "topk_values",
+        "PASS"
+      ],
+      [
+        "pool_block_ids",
+        "PASS"
+      ],
+      [
+        "pool_block_counts",
+        "PASS"
+      ],
+      [
+        "partial",
+        "PASS"
+      ]
+    ],
+    "decode_c1a_reindex": [
+      [
+        "window_cache",
+        "PASS"
+      ],
+      [
+        "topk_indices",
+        "PASS"
+      ],
+      [
+        "topk_values",
+        "PASS"
+      ],
+      [
+        "pool_block_ids",
+        "PASS"
+      ],
+      [
+        "pool_block_counts",
+        "PASS"
+      ],
+      [
+        "partial",
+        "PASS"
+      ],
+      [
+        "window_cache",
+        "PASS"
+      ],
+      [
+        "topk_indices",
+        "PASS"
+      ],
+      [
+        "topk_values",
+        "PASS"
+      ],
+      [
+        "pool_block_ids",
+        "PASS"
+      ],
+      [
+        "pool_block_counts",
+        "PASS"
+      ],
+      [
+        "partial",
+        "PASS"
+      ]
+    ],
+    "prefill_c1a_reindex": [
+      [
+        "window_cache",
+        "PASS"
+      ],
+      [
+        "topk_indices",
+        "PASS"
+      ],
+      [
+        "topk_values",
+        "PASS"
+      ],
+      [
+        "pool_block_ids",
+        "PASS"
+      ],
+      [
+        "pool_block_counts",
+        "PASS"
+      ],
+      [
+        "partial",
+        "PASS"
+      ]
+    ],
+    "decode_c1a_reuse": [
+      [
+        "window_cache",
+        "PASS"
+      ],
+      [
+        "partial",
+        "PASS"
+      ],
+      [
+        "window_cache",
+        "PASS"
+      ],
+      [
+        "partial",
+        "PASS"
+      ]
+    ],
+    "prefill_c1a_reuse": [
+      [
+        "window_cache",
+        "PASS"
+      ],
+      [
+        "partial",
+        "PASS"
+      ]
+    ]
+  },
+  "main_positive_device_cases": 40,
+  "main_negative_coordinate_controls": 1,
+  "compile_rows": [
+    {
+      "entry": "decode_fwd",
+      "start": "1793954175",
+      "end": "1793954205",
+      "exit": "0"
+    },
+    {
+      "entry": "prefill_fwd",
+      "start": "1793954205",
+      "end": "1793954233",
+      "exit": "0"
+    }
+  ],
+  "f10_source_sha256": "951378f40c2ab7cb4f1573aeda72548bab017ed76c545641620e6e3502b4c780"
+}

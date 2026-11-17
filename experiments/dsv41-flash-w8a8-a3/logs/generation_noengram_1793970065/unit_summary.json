@@ -1,0 +1,95 @@
+{
+  "source_count": 45,
+  "changed": [
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_fwd.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/generate.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_fwd.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/weight_loader.py"
+  ],
+  "source_manifest_sha256": "19ce138488ed96a4230045a032cad426abbbaa333b65cd73af20338a819462de",
+  "native_positive_full_entries": 1,
+  "native_decode_blocked": 1,
+  "native_prefill_scope": "40 dense layers with reused one-layer synthetic expert shard",
+  "continuation": "NOT RUN",
+  "real_weights": "NOT LOADED",
+  "independent_acceptance": "PENDING",
+  "native_mode": "ONBOARD",
+  "native_platform": "a2a3",
+  "native_prefill_meta_sha256": "9734f8235dd25d522bb24300a6b801d8d412eaf7202a10973b322fa258262620",
+  "worker": {
+    "source_hashes": {
+      "models/deepseek_v4_1_flash_a3_w8a8/prefill_fwd.py": "5f51f3b23fe08100b4893bdd039e71666f6bfc0a8697ebb1049321e8bde52ac6",
+      "models/deepseek_v4_1_flash_a3_w8a8/decode_fwd.py": "270acabd7cdb48d42ed906fcb878a6c8cfb9b38c3e43a7d0ec330c6cfa012f4a",
+      "models/deepseek_v4_1_flash_a3_w8a8/moe_exchange.py": "951378f40c2ab7cb4f1573aeda72548bab017ed76c545641620e6e3502b4c780",
+      "models/deepseek_v4_1_flash_a3_w8a8/layer_reference.py": "2d9dab1c154c6ddad9f92c7fb120c992ae202496cef993226f716f0b50396098"
+    },
+    "mode": "ONBOARD",
+    "generated_platform": "a2a3",
+    "actual_prefill40layer_numerical": "PASS",
+    "actual_decode1": "BLOCKED halMemCtl EACCES/RunPreparationRefused13",
+    "continuation": "NOT RUN",
+    "realweights": "NOT LOADED",
+    "peak_hbm": "NOT MEASURED",
+    "record": {
+      "id": "fullentry-noengram-1793970258-1793972408",
+      "start": 1793970258,
+      "end": 1793972408,
+      "duration": 2150,
+      "basis": "measured from first implementation artifact timestamp;initial read-only preparation excluded",
+      "agent": "fullentry_noengram",
+      "status": "PARKED",
+      "positive_actual_onboard_full_entries": 1,
+      "blocked_actual_decode_entries": 1
+    },
+    "actual_prefill_expert_layers": 1,
+    "actual_prefill_dense_layers": 40,
+    "real_expert_layers40": "COMPILE ONLY"
+  },
+  "headers": {
+    "categories": {
+      "dense_and_top": {
+        "tensors": 1790,
+        "storage_bytes": 17196936008
+      },
+      "experts": {
+        "tensors": 141696,
+        "storage_bytes": 558396604416
+      },
+      "engram": {
+        "tensors": 10,
+        "storage_bytes": 221819890240
+      }
+    },
+    "sample_shapes": {
+      "layers.0.ffn.experts.0.w1.weight": {
+        "shape": [
+          2304,
+          5120
+        ],
+        "dtype": "torch.int8",
+        "bytes": 11796480
+      },
+      "layers.0.attn.wq_a.weight": {
+        "shape": [
+          1280,
+          5120
+        ],
+        "dtype": "torch.int8",
+        "bytes": 6553600
+      },
+      "layers.39.ffn.experts.383.w2.weight": {
+        "shape": [
+          5120,
+          2304
+        ],
+        "dtype": "torch.int8",
+        "bytes": 11796480
+      }
+    },
+    "header_shards_read": 274,
+    "weight_payload_bytes_read": 0,
+    "full_materialization": false,
+    "allocation_allowed": false,
+    "limits": "Storage bytes are not runtime peak HBM. Rank residency, uploads, compile buffers, snapshots, EP windows and transients still require native measurement."
+  }
+}

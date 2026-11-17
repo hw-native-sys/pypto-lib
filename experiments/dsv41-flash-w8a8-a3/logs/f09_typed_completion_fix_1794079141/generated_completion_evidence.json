@@ -1,0 +1,22 @@
+{
+  "generated_CPP": "count_signature_build/next_levels/probe_rank/orchestration/probe_rank.cpp",
+  "sha256": "8e6f95a26639cb34b9b7470901e70a02ef508e034fd5aeb17d03f291ad2854ce",
+  "source_lines": {
+    "positive_capacity_combine": "943-956, block_num2/noactiveouterpredicate",
+    "return_consumed_explicit_dep": "958-968",
+    "inline_typed_TaskId_alias": "969/995",
+    "probeexport_explicit_dep": "997-1007"
+  },
+  "actual_generated_fields": [
+    "params_t30.launch_spec.set_block_num(2)",
+    "params_t31_deps[...] = combine_tid_inline1333",
+    "TaskId ep_done_inline1086 = return_consumed_tid_inline1341",
+    "TaskId ffn_done = ep_done_inline1086",
+    "params_t33_deps[...] = return_consumed_tid_inline1341"
+  ],
+  "runtime_graph_or_native_branch_proof": false,
+  "metadata_sha256": "189381005f808c601c93286c4ef8022e54e160f99a2c144d527608df90dd9fb9",
+  "compiled_files_manifest_sha256": "17cf1cc77c5262aeb55cdff780f5e285e655afa4a7a52b327db17f236161bc1c",
+  "native_binary_files": 0,
+  "artifact_kind": "publicsignaturecompile output C++/PTO/metadata, not preparednativeimage"
+}

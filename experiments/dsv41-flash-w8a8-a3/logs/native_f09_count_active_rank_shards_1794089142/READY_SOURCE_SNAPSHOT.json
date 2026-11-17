@@ -1,0 +1,17 @@
+{
+  "status": "READY_SOURCE_RESOURCES_ONLY_NO_NATIVE_AUTHORITY",
+  "source405": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "active_profile": {
+    "origin_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/build/count_active",
+    "manifest": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/count_active_files.json",
+    "manifest_sha256": "45c3b4c710e9592127dcde62a1d1f2502ea42fc01843895362150aa56b1b8c54",
+    "metadata_sha256": "7ec1d89d657653d9bf2ec179f75cc8421dc05477771e5dee2af088d3554972a8",
+    "source_manifest": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31"
+  },
+  "pins_sha256": "97d681ed869fe34a5d6e72b8e030f7622cb10fafec5650801eb1aa8d9edf3e7d",
+  "prequeue_sha256": "2481d80db4853de235dcbee11a23892abc7478192db46625d980b08a7c10f41f",
+  "wrapper_sha256": "e76b9984db86a27c3c1b4ebd32ab7de97af91357af4c6784746e5e9a3ade0ffa",
+  "native_authorized": false,
+  "valid_stage_grants": 0,
+  "work_exists": false
+}

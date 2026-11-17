@@ -1,0 +1,13 @@
+{
+  "status": "FINAL_SOURCE_FROZEN_OPERATION_PREP_CONTINUES_SEPARATELY",
+  "count": 1550,
+  "manifest_sha256": "1d51c2fe79e84b7bccb4404017686b166ebca54b711352eaa618137b02826c25",
+  "source45_sha256": "f0e91a30e4117e110be183ef44acf2874eea813cc6f72ac7c7fa44bc4ede3a7f",
+  "report_sha256": "ede7bab80d6ceda64b848473ca0ff1c43de1c6936c88e3d59d04190e25864768",
+  "TP8_plan_sha256": "a7b187a084e304b5203aeb2b0897dcb291550fbcf6c5bbaea6d1fe42f49a2a46",
+  "fresh_pair_sha256": "c11948187a3f2e3675d5fe9e0fd0a47f20af67ecbeac4866f947cb7aefca75e4",
+  "model_writers_parked": true,
+  "all_own_jobs_ended": true,
+  "NPU": 0,
+  "independent_acceptance": false
+}

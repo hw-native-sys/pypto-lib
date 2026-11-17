@@ -1,0 +1,10 @@
+{
+  "models/deepseek_v4_1_flash_a3_w8a8/generate.py": "26b6db8451afa4488bff71699b94b7ffcf86abcec08e2919912e388fa904c8fd",
+  "models/deepseek_v4_1_flash_a3_w8a8/weight_loader.py": "70244d047e4705dfe5f7101c5dc046b6f66d146027241524bb4d494823fcfe5f",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto/python/pypto/ir/distributed_compiled_program.py": "b523ea389350c9d1f9880a101ec66ceb36d2a8202a5fb1976a77be3310444e2a",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto/python/pypto/runtime/runtime_base.py": "81a319a9e412d5a618de343c5c54103aa14fb2ec2613a6455e3592b797662704",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto/python/pypto/runtime/distributed_runner.py": "ca496829a240c81df3c29e77d8ef696bd1e2a7b0f31b9d5c2dcb3b3d82923148",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/host/runtime_maker.cpp": "58c508e0aaffc786526c83b9f84e903d787731ad7213f69f8a5ccb5fdee4f4c9",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto/runtime/src/common/worker/pipeline_contract.h": "35a993f57176909b03572c68b91f517fb729c8e3b31d374bfd315a518fe888e2",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto/runtime/src/common/platform/onboard/host/c_api_shared.cpp": "35262e2284ed26cd6c1f98ccb0f21bcca531dd877298689927b6c852af67ce04"
+}

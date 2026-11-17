@@ -1,0 +1,13 @@
+{
+  "accepted_prefix_manifest_sha256": "7d36fe16c04494b4f5da2fd812766edb99a2b730546fdd194097bc7d6e55addd",
+  "accepted_CPUreceipt_sha256": "d8b1a90ec674af84c2f67da4e8d0e295b81f3a0b3ee8ffc91e6f8fb78c3e163d",
+  "persistent_cache_hashes": {
+    "window_cache": "85c7b470ceabf86e4028e0ad153dbfdaca627d181e748d1ef28d0bd33eb00fa8",
+    "compressed_cache_c2a": "c95be27705fd059ee8936e4a6204d72dc083662a21147af84a1dcef7960366b2",
+    "index_cache_c2a": "263b61b5e7256b5f02339f700b06bef3dbb27bc82e80ca07421ab8a57fa02b4c",
+    "state_cache_c2a": "83aff74ec09d37c0eeb7013cc0fd6579279eeb0ed3d01b6ebc3fcdb3e62f9d9c",
+    "compressed_cache_c1a": "b319203b79a884a28951fc649fa8f7a4ee547e5000b94c25ae2b8ec9283de351",
+    "index_cache_c1a": "511dfdcf0881224788476fa457266eadb932375311d0acd37ba872e8c320d61b"
+  },
+  "actual_prefix_bytes_not_golden": true
+}

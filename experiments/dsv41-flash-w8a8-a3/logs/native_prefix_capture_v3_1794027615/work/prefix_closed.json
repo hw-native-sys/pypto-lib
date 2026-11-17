@@ -1,0 +1,6 @@
+{
+  "owner_closed": true,
+  "static_handles_released": true,
+  "post_close_public_counter": "unavailable: public methods require an open worker; next phase preweight counters provide next live baseline",
+  "constructed_bank_count_not_inferred": true
+}

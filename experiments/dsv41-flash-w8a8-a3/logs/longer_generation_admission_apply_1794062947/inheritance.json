@@ -1,0 +1,20 @@
+{
+  "new_host_source45_sha256": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "new_generate_sha256": "41651e5af3b94223b645d4bfb52010e52ea7350aa3f3637cbcca6e29e093e609",
+  "predecessor_host_source45_sha256": "d77d196be6541b4a87aef07cf0e5e02eac68cefa9fc245f3742e4c14606555aa",
+  "other44_file_hashes_unchanged": true,
+  "compile_and_entry_factory_AST_unchanged": true,
+  "old_signature_unit": "logs/independent_applied_generation_1794052496",
+  "old_signature_artifact_manifest_sha256": "fe8f9d5f5d6f20fbd7f1b644256c0f25ecede302850dd46afcb4912971c38622",
+  "old_signature_source45": "d77d196be6541b4a87aef07cf0e5e02eac68cefa9fc245f3742e4c14606555aa",
+  "shape_relation": {
+    "prefill_tokens": 3,
+    "decode_tokens": 1,
+    "pages": 2,
+    "expert_layers": 40,
+    "static_parameters": 57,
+    "new_max16_changes_shapes": false
+  },
+  "new_compile_performed": false,
+  "old_artifacts_relabelled": false
+}

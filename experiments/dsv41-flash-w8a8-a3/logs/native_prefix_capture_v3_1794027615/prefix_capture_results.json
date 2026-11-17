@@ -1,0 +1,50 @@
+{
+  "status": "NATIVE_PREFIX_CAPTURE_DURABLE_CLOSED_NOT_NUMERICALLY_VALIDATED",
+  "mode": "ONBOARD",
+  "platform": "a2a3",
+  "device_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "ring_heap": [
+    0,
+    0,
+    4294967296,
+    0
+  ],
+  "checkpoint": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_prefix_capture_v3_1794027615/work/prefix",
+  "manifest_sha256": "7d36fe16c04494b4f5da2fd812766edb99a2b730546fdd194097bc7d6e55addd",
+  "owner_closed_sha256": "fb9f65721492d066ea3fc89200cfc415bdcc61e1810d6112b073d107d2f0408f",
+  "payloads": {
+    "actual": {
+      "bytes": 7609887945,
+      "sha256": "a1a7500c2322987a206233afaa95c8b6678650e509b8cecf9757feee387c438b"
+    },
+    "initial": {
+      "bytes": 7609889786,
+      "sha256": "d1db7626fbc4103c43c268bc8404ce282abb80db9f5cd14e6e150cb64eca37c6"
+    }
+  },
+  "static_plan_sha256": "dbca1fb4dd503b7d8b38e54bae4782c6e38f496bd405dd4637376ebd06487735",
+  "native_owner_normal_closed": true,
+  "source45_V3_and_old864_unchanged": true,
+  "initial_and_actual_saved_before_any_reference": true,
+  "CPU_reference_calls": 0,
+  "forbidden_calls": [],
+  "duration_seconds": 381.97030423907563,
+  "scope": "40 dense/reused1 synthetic expert layer/noEngram; native terminal+copyback and durable bytes only;17 numerical gates OPEN"
+}

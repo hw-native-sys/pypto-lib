@@ -1,0 +1,11 @@
+{
+  "normal_close": false,
+  "primary_error": {
+    "type": "ValueError",
+    "error": "positive IO+comm+8GiB planning reserve missing",
+    "traceback": "Traceback (most recent call last):\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/f09_decode_case.py\", line 289, in capture\n    memory_events=[];reserve=planning_reserve(auth,values,static)\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/f09_decode_case.py\", line 264, in planning_reserve\n    if type(reserve) is not int or reserve<required:raise ValueError('positive IO+comm+8GiB planning reserve missing')\nValueError: positive IO+comm+8GiB planning reserve missing\n"
+  },
+  "cleanup_errors": [],
+  "records": 0,
+  "source_manifest": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31"
+}

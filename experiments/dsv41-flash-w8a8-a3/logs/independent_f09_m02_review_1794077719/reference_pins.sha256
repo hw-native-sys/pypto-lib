@@ -1,0 +1,3 @@
+577c667fbf8f8b6f20de8a0ac54c6c0435605aaee1f6c2ccc463b446055bd286  experiments/dsv41-flash-w8a8-a3/logs/logic_review_1793929657/upstream_rc2/tests/deepseek_v41_utils.py
+101f96b38e9fc47e7be147ddfe56976aee896867c73a33a7d95c3e3c833a6e91  experiments/dsv41-flash-w8a8-a3/logs/logic_review_1793929657/upstream_rc2/vllm_ascend/models/deepseek_v41/model.py
+a5d32c875617fe0e6c85061c7152328b3c20830a1cdf5a27698ee0d45db22ae3  experiments/dsv41-flash-w8a8-a3/logs/logic_review_1793929657/upstream_rc2/vllm_ascend/models/deepseek_v41/mixed_quant_attention.py

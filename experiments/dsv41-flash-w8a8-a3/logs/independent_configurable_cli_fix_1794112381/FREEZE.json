@@ -1,0 +1,15 @@
+{
+  "status": "FINAL_CPU_READY_PARK",
+  "files": 9,
+  "manifest_sha256": "f357f91db5b8bc5e8ba3a933d51fcfbeddfe8b27c021088c4105411156ef423c",
+  "publisher_sha256": "7d7a79993633a411cc1f8d8aa8697258b7351d92504260cf6a0d6ad256cf7325",
+  "launcher_sha256": "ccc1be18cec6fe34e0b93828a7ac3c96597dd149ecdaf3e5e30b47c5c77f90d0",
+  "CPU_result_sha256": "a5d710592abaddab8dbfdb7576734175c3cbc5085ae807aeef8cadb9a9d9774b",
+  "contract_sha256": "30f2e79fae3e1828fdb73d641ebce0cca340af06f9e50cfa5dce58c5c73e46c1",
+  "commands_sha256": "c640b227016a8267ba7b7bfb069db330b5292eadf18bd3b32abf6e4d29416a0d",
+  "base162_unchanged": true,
+  "source_dependencies_unchanged": true,
+  "native": 0,
+  "positive_grants": 0,
+  "shared_writes": 0
+}

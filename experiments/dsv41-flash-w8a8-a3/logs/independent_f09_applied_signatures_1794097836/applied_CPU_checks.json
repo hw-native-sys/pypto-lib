@@ -1,0 +1,50 @@
+{
+  "status": "PASS_ACTUAL_APPLIED_B_SOURCE_PLAN_PREDICATES",
+  "source45": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+  "math_baseline": "8153c7f040bef51900a6e6c9ff27b018279b7503f31d50ec5488457e49770b28",
+  "metadata_plan": "cd8b17741688eeb9ef39d8c0925dbb74a8f9a1cfcc0052db2e0a8c1aacb48cf7",
+  "resource_projection": "e13c5fd6d98de327a24427b5efc0a9be4e9c30a89e757ac6c377e73b6ffc10ff",
+  "hc_lineage": "e9b0e71dd5d2909d007a4d762ca92ff83e1940630251fae7bb98216f8e10983c",
+  "f09_lineage": "13b80364bce7729fb36aa51c231ceb6966f2fe59ce6d211ccedd6c7cfc046004",
+  "accepted171_sha256": "6ce38e890b642908c731fb247accc302938846f892142471d26715398e96c851",
+  "static_recipe_sha256": "4e73e5d8e2a03cedb309f0a3bde16fb5d4a806c4b6ee5039f5c28a8034872e75",
+  "unchanged35": true,
+  "rejections": [
+    {
+      "name": "actual_default_HARD_allow_full_true",
+      "error": "ContractGap('host-materialization-overlap: full weights remain held: streaming source/owner is implemented but bounded native reuse, functional continuation and measured real host/HBM fit are unproved (allow_full_materialize=True); no real payload allocation is authorized by this switch')"
+    },
+    {
+      "name": "old806_math_baseline",
+      "error": "ContractGap('first-real-admission: reviewed producer base/real40 schema mismatch')"
+    },
+    {
+      "name": "source_missing_path",
+      "error": "ContractGap('first-real-admission: new applied product source45 changed')"
+    },
+    {
+      "name": "source_old_M02_actual_hashes",
+      "error": "ContractGap('first-real-admission: new applied product source45 changed')"
+    },
+    {
+      "name": "strict44_mismatch_besides_only_generate_exception",
+      "error": "ContractGap('first-real-admission: new source manifest binding mismatch')"
+    },
+    {
+      "name": "metadata_extra_key",
+      "error": "ValueError('exact old806keys plus ONLY named F09 lineage')"
+    },
+    {
+      "name": "metadata_missing_key",
+      "error": "ValueError('exact old806keys plus ONLY named F09 lineage')"
+    },
+    {
+      "name": "metadata_HC_history_drift",
+      "error": "ValueError('old806 resource/HC drift')"
+    }
+  ],
+  "source_predicate_scope": "exact3actualIfnodesonly; not whole RuntimeAdmission or a Rootgrant",
+  "resource_negative_scope": "reviewed exact806non-source+HC+rootkey policy",
+  "forbidden_calls": [],
+  "real_grants_created": 0
+}

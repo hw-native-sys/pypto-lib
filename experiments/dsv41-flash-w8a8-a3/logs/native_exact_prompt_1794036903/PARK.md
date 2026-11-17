@@ -1,0 +1,1 @@
+FINAL/PARK. All eleven own queued CPU jobs are terminal; two scaffolding failures preserved. No NPU job or real checkpoint payload. Product source45 remains762dc; old packages and this whole unit immutable. A fresh small-input capture fork exists but has no native authorization. Await observer separate prefix-capture GO.

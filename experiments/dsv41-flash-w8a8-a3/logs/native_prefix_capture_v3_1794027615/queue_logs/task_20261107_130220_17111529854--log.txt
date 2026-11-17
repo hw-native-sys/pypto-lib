@@ -1,0 +1,5 @@
+PyPTO environment activated: /mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local
+PYPTO_ROOT=/mnt/data/pyptouser/yangyaodong/code/pypto
+PTOAS_ROOT=/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local
+PTO_ISA_ROOT=/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/build/pto-isa
+PREFIX_SOURCE_CAPACITY_PREFLIGHT_PASS {"host": 1722188386304, "disk": 9545981100032, "shm": 1079343157248}

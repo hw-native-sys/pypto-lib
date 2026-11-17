@@ -1,0 +1,24 @@
+{
+  "devices": [
+    0,
+    1
+  ],
+  "resources": {
+    "host": 1721841356800,
+    "disk": 6873880199168,
+    "shm": 1079343157248
+  },
+  "root_id": "observer-20261108-configurable-ep2-distinct-captures",
+  "source": {
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/config.py": "abfb39922b4c340f443c5d3e8869ee2c76344f7b03781702f845055abdd552c1",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/gemm_w8a8.py": "97b8ca009cf383eaba0dd59bad9759d7e2139b712d5d4e69aa9ee6e16382fe62",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py": "60046ce7f2c03e4e2bc756a050f6283cf65196c96a44492ec89fc88b3c178d31",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/moe_exchange.py": "650273d771f0468cd0c6088f2adb20fd93e0b542de036fd419dc7e780210a454",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/moe_experts.py": "50c1c3a533dd27f9ae958588f1de7fb6a450c5a8d980285cbccaefe44badc00a",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/moe_gate.py": "ad219161acccb3623e64e75fec152ab81bb83f66596cfbf0f5a62c84d6073eea",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/quant.py": "344de41d0d0748905b85cafd2ae3b7e85560e0ca7d0b52615b1d3c866e6aa3dc",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/rmsnorm.py": "f9f67d05d426fec058a0e1eb2edc69c704d3af15251f32f47cf12ada8b68d540",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/tp_reduce.py": "66105a076e9ea9246ab071d3f0d5d33c423accea9d7456fdf7880a42cc441171",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/utils.py": "96817adec5584eeab2940dab0faf42078fc257995021899e6dbe9e55e00c36d3"
+  }
+}

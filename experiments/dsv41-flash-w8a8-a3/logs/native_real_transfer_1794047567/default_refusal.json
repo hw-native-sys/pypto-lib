@@ -1,0 +1,5 @@
+{
+  "returncode": 1,
+  "stdout": "",
+  "stderr": "Traceback (most recent call last):\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_real_transfer_1794047567/observer_cli.py\", line 15, in <module>\n    raise t.Refused('DEFAULT REFUSE: no separate actual-data/NPU Root assignment')\ntransport.Refused: DEFAULT REFUSE: no separate actual-data/NPU Root assignment\n"
+}

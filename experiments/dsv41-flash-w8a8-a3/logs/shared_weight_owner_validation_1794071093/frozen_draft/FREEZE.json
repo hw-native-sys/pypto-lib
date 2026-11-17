@@ -1,0 +1,15 @@
+{
+  "status": "FINAL/PARK",
+  "artifact_count": 25,
+  "artifact_manifest_sha256": "a984e4225975cec7e4b7b55dd92276aaab7433d848631958af4eeaacef850581",
+  "proposed_generate_sha256": "fba8a4ef9a06f694fa53278bb80ae2ad70d111336dbead938ab9f8511d27e16e",
+  "proposed_patch_sha256": "366ed05e9b51f26771cb4e63beedb1fa2f8049019e2685ba529dc85571002c8e",
+  "live_source45CC_unchanged": true,
+  "protected34_13_36_unchanged": true,
+  "compile_jobs": 0,
+  "native_jobs": 0,
+  "real_payload_bytes": 0,
+  "positive_actual_grants": 0,
+  "all_own_jobs_writers_parked": true,
+  "end_epoch": 1794070347
+}

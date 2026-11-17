@@ -1,0 +1,10 @@
+{
+  "status": "PASS_FINAL_SYNTAX_DEFAULT_REFUSAL_ONLY",
+  "micro_sha256": "2d20411f3c7500238abde5288383de30ff442c0456ac5517f21faa36a136cbab",
+  "audit_sha256": "4baa6c35c877701295b4be30b63c406b7afb0aff6fcec44455a1272e35a2c5b3",
+  "root_scope": "known OS birth/close/raw release, no PSS gate; exact32768 toy12",
+  "output_created": false,
+  "prepare": false,
+  "NPU": false,
+  "tensor_inputs": 0
+}

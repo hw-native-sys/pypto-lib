@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_full_reserve_fix_1794091408/launch.py", line 127, in <module>
+    main()
+  File "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_full_reserve_fix_1794091408/launch.py", line 42, in main
+    raise ValueError("future Root exact scope/pins/TTL required")
+ValueError: future Root exact scope/pins/TTL required

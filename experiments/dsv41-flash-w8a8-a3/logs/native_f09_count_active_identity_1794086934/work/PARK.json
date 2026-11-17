@@ -1,0 +1,13 @@
+{
+  "status": "FAILED_FINAL_PARK",
+  "native_task": "task_20261108_054811_163250428454",
+  "exit_code": 1,
+  "count_capsules": 0,
+  "normal_owner_close": true,
+  "cleanup_errors": [],
+  "new_helper_native_prepared_inventory_pass": true,
+  "successful_count_dispatch": false,
+  "cpu_reference_authorized": false,
+  "shared_writes": 0,
+  "own_running_jobs": 0
+}

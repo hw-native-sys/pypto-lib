@@ -1,0 +1,18 @@
+{
+  "resources": {
+    "epoch": 1794111650.2652886,
+    "HOST_AVAILABLE": 1721898889216,
+    "DISK_AVAILABLE": 6904791171072,
+    "SHM_AVAILABLE": 1079343157248,
+    "floors": {
+      "HOST": 8589934592,
+      "DISK": 2147483648,
+      "SHM": 4294967296
+    }
+  },
+  "prep_manifest_sha256": "e3fb76f173e99f9ca9f87876d25931b0145d81173f49a2722ed326d85de62dee",
+  "helper_sha256": "73f0492102c6cc55a0c46192f0e7942d3b63f1ec73f3cd069aefda23d0f0e2e4",
+  "dependencies_sha256": "ed1a01ebddf8bf0db953a93f47b398167d20e7b81a3e12c8c2b3209362cc2491",
+  "GO_ID": "observer-20261108-tp8-heads8-attention-three-original-cases",
+  "start_epoch": 1794111650.2675257
+}

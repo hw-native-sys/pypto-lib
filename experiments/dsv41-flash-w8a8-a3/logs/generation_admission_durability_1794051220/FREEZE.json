@@ -1,0 +1,15 @@
+{
+  "status": "FINAL/PARK",
+  "candidate_sha256": "d057012464331b10b0bdc7f406925ee0c552dd298a1db171a93b0b1595769598",
+  "whole_patch_sha256": "522dae74110e5e1725e9b36a399c6919138b1937d900a593ffc26ab3ca0f1dca",
+  "durability_patch_sha256": "202e870d67c96d83753d02cbc9b5432480e135412952b99418464766f0f736ce",
+  "metadata_plan_sha256": "3dd67b88683d0de1f5fbd8e889c0c1a875eeecf671263fca4c64061637ecd9c0",
+  "artifacts_sha256": "4b5e8de462dc6064ad4aa833033c4b493042597902599a681dbfec6fe8e104d6",
+  "artifact_count": 10,
+  "product_source45_unchanged": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "old32_unchanged": true,
+  "all_writers_jobs_parked": true,
+  "native_jobs": 0,
+  "payload_bytes": 0,
+  "end_epoch": 1794051451
+}

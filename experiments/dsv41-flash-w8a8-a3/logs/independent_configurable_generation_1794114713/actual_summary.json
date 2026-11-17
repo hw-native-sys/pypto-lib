@@ -1,0 +1,143 @@
+{
+  "schema": "independent-configurable-actual-post-audit-summary/1",
+  "audit_task": "task_20261108_163217_381875127764",
+  "audit_terminal": "completed (exit=0)",
+  "native_task": "task_20261108_130915_150556113554",
+  "root_id": "observer-20261108-configurable-tp8ep16-real16-shared-w8a8",
+  "topology": {
+    "tp": 8,
+    "ep": 16,
+    "dp": 2,
+    "world": 16,
+    "local_experts": 24
+  },
+  "audit_status": "TRANSPORT_AUDIT_NOT_ACCEPTED",
+  "whole_case_status": "NOT_ACCEPTED",
+  "passed_checks": 4363,
+  "unmet_names": [
+    "native-queue-COMPLETE0",
+    "primary-CLI0-and-no-post-observation-monitor-errors",
+    "strict-telemetry-complete-no-descriptive-partial-PASS",
+    "strict-all-samples-known-inventory-memory-and-process-births",
+    "PSS-proportional-sample-consistency"
+  ],
+  "bounded_unmet": [],
+  "bounded_receipt_facts_status": "VERIFIED_WITH_RECORDED_LIMITS",
+  "native_exit": 1,
+  "CLI_exit": 0,
+  "outer_status": "FAIL",
+  "telemetry_noncritical_gaps": 259,
+  "critical_errors": [],
+  "monitor_errors": [],
+  "whole_PSS": null,
+  "known_partial_PSS_max_bytes": 12300867584,
+  "complete_memory_peak_proven": false,
+  "generated_ids": [
+    1014,
+    14,
+    1031,
+    515,
+    1613,
+    1
+  ],
+  "raw_generated_text": " time, there was...<\uff5cend\u2581of\u2581sentence\uff5c>",
+  "full_text_without_final_EOS": "Once upon a time, there was...",
+  "termination": "eos",
+  "decode_calls": 5,
+  "decode_positions": [
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "positions_end": 8,
+  "prefill_seconds_normal_dispatch_wall": 2.160069704055786,
+  "shared_summary": {
+    "active_decode": true,
+    "canonical_coverage": 1,
+    "borrowed_coverage": 1,
+    "closing_phase": "decode"
+  },
+  "canonical_H2D_bytes": 613256211456,
+  "canonical_source_reads": 164192,
+  "canonical_source_bytes": 745846365184,
+  "canonical_bases": 912,
+  "borrowed_C1_views": 112,
+  "borrowed_same_shape_views": 800,
+  "decode_new_static_IO_allocation_copy": 0,
+  "native_worker_count": 16,
+  "recorded_identity_count": 1050,
+  "recorded_cleanup_scope": "All1050 owner/post-auditor reconciled births absent, raw16release/outside0of16; not complete historical process inventory",
+  "actual_runtime_HC_source_extraction": [
+    {
+      "phase": "prefill",
+      "actual_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/build_output/_jit_prefill_fwd_20261108_130934_cz8iowwh",
+      "counts": {
+        "PTO_RINT_down": 8,
+        "PTO_FP32_expansion": 16,
+        "CPP_RINT_down": 2,
+        "CPP_FP32_expansion": 2
+      },
+      "reviewed_exact_kernel_hash_matches": 6
+    },
+    {
+      "phase": "decode",
+      "actual_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/build_output/_jit_decode_fwd_20261108_131000_4gn67yw7",
+      "counts": {
+        "PTO_RINT_down": 8,
+        "PTO_FP32_expansion": 16,
+        "CPP_RINT_down": 2,
+        "CPP_FP32_expansion": 2
+      },
+      "reviewed_exact_kernel_hash_matches": 6
+    }
+  ],
+  "HC_extraction_limit": "Counts are typed source witnesses from fresh pair versus actual runtime (PTO8 RINTdown/16 expansions; CPP2/2), not operator-task counts or additional complete HC numerical proof. Full witness paths/lines/hashes remain in audit_results.",
+  "state_diagnostics_limit": "Eight FLOAT32-contiguous-value/SHA1 first16hex prefixes perstep; not original cache storage-byte hashes or original parity",
+  "quality": {
+    "actual_text": " time, there was...<\uff5cend\u2581of\u2581sentence\uff5c>",
+    "generated_ids": [
+      1014,
+      14,
+      1031,
+      515,
+      1613,
+      1
+    ],
+    "repeated_token_suffix_observed": null,
+    "quality_status": "UNASSESSED_REQUIRES_ACTUAL_TEXT_REVIEW",
+    "original_model_parity": false,
+    "observation_limit": "Only exact repeated token suffix; no automated coherence or no-repetition claim."
+  },
+  "event_time_limit": "Recorded last final-query event1794116619.793 and outer completion1794116626.3205981 versus later notice/externalPOST are distinct; intervening interval remains unobserved, no fabricated progress",
+  "consumed_input_files": 1646,
+  "integrity_checks": {
+    "source_ready39_unchanged": true,
+    "protected_owner_raws_unchanged": true,
+    "parent29_manifest_unchanged": true,
+    "root_model_GO_unchanged": true
+  },
+  "outside_closure": {
+    "schema": "independent-configurable-audit-outside-closure/1",
+    "epoch": 1794126892.8239944,
+    "checks": {
+      "own_audit_terminal0": true,
+      "own_audit_PID_birth_absent": true,
+      "all_consumed_inputs_still_identical": true,
+      "queue_no_pending_or_running": true,
+      "queue_zero_used": true,
+      "auditor_completed": true
+    },
+    "status": "CLOSED_METADATA_FACTS",
+    "whole_case_status_unchanged": "NOT_ACCEPTED",
+    "audit_result_sha256": "ca80ff1c46bf70b3ddcad9d2eaa92ad6c54da5c2987839e35eb45af5128ea549",
+    "scope": "Recorded identities and metadata stability only; no full process-history or continuous memory-peak claim"
+  },
+  "audit_result_sha256": "ca80ff1c46bf70b3ddcad9d2eaa92ad6c54da5c2987839e35eb45af5128ea549",
+  "actual_model_tensor_payload_bytes_read_by_auditor": 0,
+  "header_scans_by_auditor": 0,
+  "model_runtime_imports": 0,
+  "compile_prepare_NPU": 0,
+  "source_or_protected_raw_writes": 0
+}

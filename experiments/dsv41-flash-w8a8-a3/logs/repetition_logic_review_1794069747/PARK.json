@@ -1,0 +1,13 @@
+{
+  "epoch": 1794069995,
+  "role": "review-agent",
+  "state": "PARKED",
+  "shared_writes": 0,
+  "root_imports": "once, owned by Root",
+  "outstanding_tasks": [],
+  "cpu_task_id": "task_20261108_004524_320911724075",
+  "cpu_task_exit": 0,
+  "report_sha256": "dfc5ba0c508f63ae22e289cca5fdf0faeb32576e614a0c301bd1d90283a0737b",
+  "manifest_sha256": "ed42f73feea22f37c85534021cb67b1686e7ea0d423812ee8dfaa5802522f818",
+  "result": "R01 original BF16 HC-post boundary absent in kernel and golden; actual-reference CPU microproof confirms; repetition causality unproven"
+}

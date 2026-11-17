@@ -1,0 +1,15 @@
+{
+  "physical_work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_prefix_capture_v3_1794027615/work",
+  "accepted_prefix_files": "work/prefix/** byte-immutable including manifest/CPUreceipt/ownerclose/actual/initial/copiedABI/scope_metrics",
+  "static_plan": "work/static_plan.json byte-immutable dbca1fb4dd503b7d8b38e54bae4782c6e38f496bd405dd4637376ebd06487735",
+  "exclude_current_final_manifest": [
+    "work/measurement_gate.json"
+  ],
+  "frozen_current_cpu_measurement_snapshot": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_prefix_capture_v3_1794027615/frozen_cpu_measurement_gate.json",
+  "frozen_current_cpu_measurement_sha256": "1b34a8e29b6cd6037ac97818b6dce8cea9bc5b45dad08fc5df9ca297fb27ee56",
+  "operational_gate_lifecycle": "canonical guard replaces per stage; observer explicit amendment transfers this sole existing mutable gate to next assigned stage",
+  "META_geometry": "included by content hash; next canonical replacement is allowed only byte-identical",
+  "next_authorized_new_writes": "decode1*, decode_after_dispatch*, decode128/,decode129/,decode130/,stale129/,native_chain_unvalidated.json and corresponding NEW decode close/memory evidence; newunit runner/auth/measurement/report elsewhere",
+  "protected_old_prefix_patterns": "prefix/, prefix*, prefill128*; no existing-file overwrite",
+  "root_amendment": "observer explicit same-physical-work ownership amendment received before current final seal; replaces proposed relocation; no symlinks/rebinding/policy edits"
+}

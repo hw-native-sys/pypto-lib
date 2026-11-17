@@ -1,0 +1,24 @@
+{
+  "births": [
+    [
+      1427839,
+      "108280253"
+    ],
+    [
+      1428409,
+      "108281016"
+    ],
+    [
+      1428410,
+      "108281017"
+    ],
+    [
+      1428412,
+      "108281018"
+    ]
+  ],
+  "remaining": [],
+  "public_boundary_OS_identities_only": true,
+  "complete_unsampled_birth_claim": false,
+  "raw_after_close": "raw_after_close.json"
+}

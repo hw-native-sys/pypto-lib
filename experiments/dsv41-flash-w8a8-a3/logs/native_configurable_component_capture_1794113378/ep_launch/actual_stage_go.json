@@ -1,0 +1,43 @@
+{
+  "approved": true,
+  "profile": "ep",
+  "tp": 1,
+  "ep": 2,
+  "work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_configurable_component_capture_1794113378/ep/work",
+  "dependency_pins_sha256": "42b3b07abb096d53415aa022592412b7bcd64fdc797e45e39f8af3282694b05c",
+  "entries_sha256": "85da069d517a34efce492d6f393edb5c3aadb845c272257629014d463d097b38",
+  "fixture_sha256": "914457368aed57489129a4d11afa6b785380e9ac87da9dd23e953b03f0c52f45",
+  "driver_sha256": "9410991b71c32ad6fb65289e4660f5e701bbc7c226cf2bdc9ffe701f1d60f139",
+  "root_id": "observer-20261108-configurable-ep2-distinct-captures",
+  "schema": "Root-configurable-component-native/1",
+  "allow_after_allocation": true,
+  "allocated_hbm_preflight": {
+    "free_bytes": {
+      "0": 59888259072,
+      "1": 60189204480
+    },
+    "total_bytes": {
+      "0": 65787658240,
+      "1": 65796046848
+    },
+    "committed_bytes": {
+      "0": 5451626021,
+      "1": 5451626021
+    },
+    "observed_unix": 1794113953.2840617,
+    "api": "DistributedWorker.device_memory_info",
+    "devices": [
+      0,
+      1
+    ],
+    "normal_public_close": true,
+    "public_prepare_no_dispatch": true,
+    "api_source_sha256": "ca496829a240c81df3c29e77d8ef696bd1e2a7b0f31b9d5c2dcb3b3d82923148"
+  },
+  "expires_unix": 1794115754.1198351,
+  "actual_devices": [
+    0,
+    1
+  ],
+  "parent_sha256": "d054c83f3d342488cee6c962ade17c216e496bf775945e13267215a5c2de7e6b"
+}

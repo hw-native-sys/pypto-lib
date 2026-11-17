@@ -1,0 +1,42 @@
+[
+  {
+    "path": "models/deepseek_v4_1_flash_a3_w8a8/generate.py",
+    "sha256": "41651e5af3b94223b645d4bfb52010e52ea7350aa3f3637cbcca6e29e093e609"
+  },
+  {
+    "path": "models/deepseek_v4_1_flash_a3_w8a8/hc.py",
+    "sha256": "55ef4ccb102d62f2c2b42fd8084385ed2d83191e8f17db31e6193826e3129d73"
+  },
+  {
+    "path": "models/deepseek_v4_1_flash_a3_w8a8/decode_fwd.py",
+    "sha256": "ed39c749b0d4cf5344fcf7a8f9b63fd0259cbb21496729ef425a09fb6d73ee1a"
+  },
+  {
+    "path": "models/deepseek_v4_1_flash_a3_w8a8/prefill_layer.py",
+    "sha256": "e5fef468b644c6ce41c19df2fe3fcd9a37d9b341204d9bdc96364d6c6dcb49a1"
+  },
+  {
+    "path": "models/deepseek_v4_1_flash_a3_w8a8/moe_exchange.py",
+    "sha256": "951378f40c2ab7cb4f1573aeda72548bab017ed76c545641620e6e3502b4c780"
+  },
+  {
+    "path": "models/deepseek_v4_1_flash_a3_w8a8/layer_reference.py",
+    "sha256": "2d9dab1c154c6ddad9f92c7fb120c992ae202496cef993226f716f0b50396098"
+  },
+  {
+    "path": "models/deepseek_v4_1_flash_a3_w8a8/rmsnorm.py",
+    "sha256": "f85cbe2a16f52490b24a0d1c9cd46b8661fbe322ac961cb6a37b5c651c9fcd78"
+  },
+  {
+    "path": "models/deepseek_v4_1_flash_a3_w8a8/mla_proj.py",
+    "sha256": "c8acc26cf76936995e049d51cc163f9aebf4acc332f6901d13d0302a6458592b"
+  },
+  {
+    "path": "models/deepseek_v4_1_flash_a3_w8a8/o_proj.py",
+    "sha256": "11c2c872c91f485bc91f68d3ea4ae08672d3395539e2b390f147efd650a29668"
+  },
+  {
+    "path": "models/deepseek_v4_1_flash_a3_w8a8/weight_loader.py",
+    "sha256": "70244d047e4705dfe5f7101c5dc046b6f66d146027241524bb4d494823fcfe5f"
+  }
+]

@@ -1,0 +1,7 @@
+{
+  "task": "task_20261108_011439_32768461697",
+  "exit": 1,
+  "first_error": "owned toy full128 FP32 live tiles Vec229376 >188416 bytes",
+  "scope": "compile before prepare/native",
+  "not_model_or_runtime_fault": true
+}

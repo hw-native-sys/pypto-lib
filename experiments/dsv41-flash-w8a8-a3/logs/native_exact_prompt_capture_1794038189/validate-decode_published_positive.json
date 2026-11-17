@@ -1,0 +1,24 @@
+{
+  "status": "PASS_ORIGINAL_PUBLISHED_WINDOW3_C2ROW1",
+  "reference_reexecutions": 0,
+  "same_original_staged_expected": true,
+  "records": {
+    "window_cache": {
+      "pass": true,
+      "physical_slot": 3,
+      "published_lanes": 327680,
+      "detail": "\n    published step rows: ",
+      "same_staged_return_object": 281461466104576,
+      "original_gate_source": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_exact_prompt_capture_1794038189/derived_model/decode_fwd.py"
+    },
+    "compressed_cache_c2a": {
+      "pass": true,
+      "physical_slot": 1,
+      "published_lanes": 24576,
+      "detail": "\n    published step rows: ",
+      "same_staged_return_object": 281461466104576,
+      "original_gate_source": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_exact_prompt_capture_1794038189/derived_model/decode_fwd.py"
+    }
+  },
+  "initial_pristine_before_after_additional_readonly_gates": true
+}

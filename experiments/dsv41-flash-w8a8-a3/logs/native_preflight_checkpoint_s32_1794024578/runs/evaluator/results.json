@@ -1,0 +1,46 @@
+{
+  "status": "PASS_CPU_ONLY",
+  "complete_expert_chains": [
+    {
+      "routed": false,
+      "case": "random_asymmetric",
+      "complete_quant_NZ_swiglu_requant_down_chain_bitwise": true,
+      "output_sha256": "b6a5f2f250106f7a59f66944f90de58878ee15a4b83bf251f956644b6d276839"
+    },
+    {
+      "routed": false,
+      "case": "zero_and_extreme",
+      "complete_quant_NZ_swiglu_requant_down_chain_bitwise": true,
+      "output_sha256": "11eec192b0ed3f54d5b6e2beab2dfe5db23bb8161cd6935445588cf3092e0b04"
+    },
+    {
+      "routed": true,
+      "case": "random_asymmetric",
+      "complete_quant_NZ_swiglu_requant_down_chain_bitwise": true,
+      "output_sha256": "bf7a4c36bed4c0a15a6d01e2230607809a30d1a363d6dd8bce15fc62953fd2d2"
+    },
+    {
+      "routed": true,
+      "case": "zero_and_extreme",
+      "complete_quant_NZ_swiglu_requant_down_chain_bitwise": true,
+      "output_sha256": "89bc79e5aa2ed275129927e2e9d2721783d137cd93086bc787b6734b3f64d98f"
+    }
+  ],
+  "dense_NZ_chain_bitwise": true,
+  "AST_only_four_dot_callees_plus_import": true,
+  "guard_rejections": [
+    "overflow",
+    "domain",
+    "floating",
+    "derived_source_corruption"
+  ],
+  "full_entry_reference_imports": true,
+  "both_composed_golden_bodies_unchanged": true,
+  "module_context_restored": true,
+  "full40_fixture_runs": 0,
+  "NPU": 0,
+  "payload_reads": 0,
+  "root45_unchanged": true,
+  "evaluator_receipt_sha256": "8ceac8fcab327b6e31b8016b9b66b60d11f64d2bb493fbb6f9b7c666eb05f778",
+  "adapter_controlflow_CPU_MOCKED_both_phases": true
+}

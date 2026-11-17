@@ -1,0 +1,17 @@
+{
+  "status": "PASS_BOUNDED_CPU_PREFLIGHT_STATIC_ONLY",
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "static_plan_sha256": "6f9568a4fdfcb7c3fcb5d816025007f3601e78e24e4b85a392cb3e7854a9b850",
+  "host_regression": "PASS_CPU_MOCKED",
+  "small_binding": "PASS",
+  "actual_static_rebuild57": "PASS",
+  "native_N3_prefix17": "OPEN_NOT_EXECUTED",
+  "native_partial_C2_decode19": "OPEN_NOT_EXECUTED",
+  "fit": "HELD",
+  "realweights": "HELD",
+  "text": "HELD",
+  "future_capture_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_exact_prompt_capture_1794038189",
+  "NPU": 0,
+  "CPU_forward_passes": 0,
+  "PARK": "waiting observer separate NPU GO after sealed handoff"
+}

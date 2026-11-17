@@ -1,0 +1,946 @@
+{
+  "count_active": {
+    "gate_bias": {
+      "producer": "gate_bias[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        384
+      ],
+      "producer_selected_shape": [
+        16,
+        384
+      ],
+      "HOST_shape": [
+        16,
+        384
+      ],
+      "dtype": "torch.float32",
+      "contiguous_element_strides": [
+        384,
+        1
+      ],
+      "global_bytes": 24576,
+      "logical_shape_preserved_NZ_bytes": false
+    },
+    "gate_weight": {
+      "producer": "gate_weight[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        384,
+        5120
+      ],
+      "producer_selected_shape": [
+        16,
+        384,
+        5120
+      ],
+      "HOST_shape": [
+        16,
+        384,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "contiguous_element_strides": [
+        1966080,
+        5120,
+        1
+      ],
+      "global_bytes": 125829120,
+      "logical_shape_preserved_NZ_bytes": false
+    },
+    "hc_ffn_base": {
+      "producer": "hc_ffn_base[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        24
+      ],
+      "producer_selected_shape": [
+        16,
+        24
+      ],
+      "HOST_shape": [
+        16,
+        24
+      ],
+      "dtype": "torch.float32",
+      "contiguous_element_strides": [
+        24,
+        1
+      ],
+      "global_bytes": 1536,
+      "logical_shape_preserved_NZ_bytes": false
+    },
+    "hc_ffn_fn": {
+      "producer": "hc_ffn_fn[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        32,
+        20480
+      ],
+      "producer_selected_shape": [
+        16,
+        32,
+        20480
+      ],
+      "HOST_shape": [
+        16,
+        32,
+        20480
+      ],
+      "dtype": "torch.float32",
+      "contiguous_element_strides": [
+        655360,
+        20480,
+        1
+      ],
+      "global_bytes": 41943040,
+      "logical_shape_preserved_NZ_bytes": false
+    },
+    "hc_ffn_scale": {
+      "producer": "hc_ffn_scale[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        3
+      ],
+      "producer_selected_shape": [
+        16,
+        3
+      ],
+      "HOST_shape": [
+        16,
+        3
+      ],
+      "dtype": "torch.float32",
+      "contiguous_element_strides": [
+        3,
+        1
+      ],
+      "global_bytes": 192,
+      "logical_shape_preserved_NZ_bytes": false
+    },
+    "norm_weight": {
+      "producer": "ffn_norm_w[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        5120
+      ],
+      "producer_selected_shape": [
+        16,
+        5120
+      ],
+      "HOST_shape": [
+        16,
+        5120
+      ],
+      "dtype": "torch.bfloat16",
+      "contiguous_element_strides": [
+        5120,
+        1
+      ],
+      "global_bytes": 163840,
+      "logical_shape_preserved_NZ_bytes": false
+    },
+    "shared_w1": {
+      "producer": "shared_w1[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        5120,
+        2304
+      ],
+      "producer_selected_shape": [
+        16,
+        5120,
+        2304
+      ],
+      "HOST_shape": [
+        16,
+        5120,
+        2304
+      ],
+      "dtype": "torch.int8",
+      "contiguous_element_strides": [
+        11796480,
+        2304,
+        1
+      ],
+      "global_bytes": 188743680,
+      "logical_shape_preserved_NZ_bytes": true
+    },
+    "shared_w1_scale": {
+      "producer": "shared_w1_scale[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        2304
+      ],
+      "producer_selected_shape": [
+        16,
+        2304
+      ],
+      "HOST_shape": [
+        16,
+        2304
+      ],
+      "dtype": "torch.float32",
+      "contiguous_element_strides": [
+        2304,
+        1
+      ],
+      "global_bytes": 147456,
+      "logical_shape_preserved_NZ_bytes": false
+    },
+    "shared_w2": {
+      "producer": "shared_w2[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        2304,
+        5120
+      ],
+      "producer_selected_shape": [
+        16,
+        2304,
+        5120
+      ],
+      "HOST_shape": [
+        16,
+        2304,
+        5120
+      ],
+      "dtype": "torch.int8",
+      "contiguous_element_strides": [
+        11796480,
+        5120,
+        1
+      ],
+      "global_bytes": 188743680,
+      "logical_shape_preserved_NZ_bytes": true
+    },
+    "shared_w2_scale": {
+      "producer": "shared_w2_scale[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        5120
+      ],
+      "producer_selected_shape": [
+        16,
+        5120
+      ],
+      "HOST_shape": [
+        16,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "contiguous_element_strides": [
+        5120,
+        1
+      ],
+      "global_bytes": 327680,
+      "logical_shape_preserved_NZ_bytes": false
+    },
+    "shared_w3": {
+      "producer": "shared_w3[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        5120,
+        2304
+      ],
+      "producer_selected_shape": [
+        16,
+        5120,
+        2304
+      ],
+      "HOST_shape": [
+        16,
+        5120,
+        2304
+      ],
+      "dtype": "torch.int8",
+      "contiguous_element_strides": [
+        11796480,
+        2304,
+        1
+      ],
+      "global_bytes": 188743680,
+      "logical_shape_preserved_NZ_bytes": true
+    },
+    "shared_w3_scale": {
+      "producer": "shared_w3_scale[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        2304
+      ],
+      "producer_selected_shape": [
+        16,
+        2304
+      ],
+      "HOST_shape": [
+        16,
+        2304
+      ],
+      "dtype": "torch.float32",
+      "contiguous_element_strides": [
+        2304,
+        1
+      ],
+      "global_bytes": 147456,
+      "logical_shape_preserved_NZ_bytes": false
+    },
+    "w1": {
+      "producer": "w1[:,0].contiguous()",
+      "full_shape": [
+        16,
+        1,
+        24,
+        5120,
+        2304
+      ],
+      "producer_selected_shape": [
+        16,
+        24,
+        5120,
+        2304
+      ],
+      "HOST_shape": [
+        16,
+        24,
+        5120,
+        2304
+      ],
+      "dtype": "torch.int8",
+      "contiguous_element_strides": [
+        283115520,
+        11796480,
+        2304,
+        1
+      ],
+      "global_bytes": 4529848320,
+      "logical_shape_preserved_NZ_bytes": true
+    },
+    "w1_scale": {
+      "producer": "w1_scale[:,0].contiguous()",
+      "full_shape": [
+        16,
+        1,
+        24,
+        2304
+      ],
+      "producer_selected_shape": [
+        16,
+        24,
+        2304
+      ],
+      "HOST_shape": [
+        16,
+        24,
+        2304
+      ],
+      "dtype": "torch.float32",
+      "contiguous_element_strides": [
+        55296,
+        2304,
+        1
+      ],
+      "global_bytes": 3538944,
+      "logical_shape_preserved_NZ_bytes": false
+    },
+    "w2": {
+      "producer": "w2[:,0].contiguous()",
+      "full_shape": [
+        16,
+        1,
+        24,
+        2304,
+        5120
+      ],
+      "producer_selected_shape": [
+        16,
+        24,
+        2304,
+        5120
+      ],
+      "HOST_shape": [
+        16,
+        24,
+        2304,
+        5120
+      ],
+      "dtype": "torch.int8",
+      "contiguous_element_strides": [
+        283115520,
+        11796480,
+        5120,
+        1
+      ],
+      "global_bytes": 4529848320,
+      "logical_shape_preserved_NZ_bytes": true
+    },
+    "w2_scale": {
+      "producer": "w2_scale[:,0].contiguous()",
+      "full_shape": [
+        16,
+        1,
+        24,
+        5120
+      ],
+      "producer_selected_shape": [
+        16,
+        24,
+        5120
+      ],
+      "HOST_shape": [
+        16,
+        24,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "contiguous_element_strides": [
+        122880,
+        5120,
+        1
+      ],
+      "global_bytes": 7864320,
+      "logical_shape_preserved_NZ_bytes": false
+    },
+    "w3": {
+      "producer": "w3[:,0].contiguous()",
+      "full_shape": [
+        16,
+        1,
+        24,
+        5120,
+        2304
+      ],
+      "producer_selected_shape": [
+        16,
+        24,
+        5120,
+        2304
+      ],
+      "HOST_shape": [
+        16,
+        24,
+        5120,
+        2304
+      ],
+      "dtype": "torch.int8",
+      "contiguous_element_strides": [
+        283115520,
+        11796480,
+        2304,
+        1
+      ],
+      "global_bytes": 4529848320,
+      "logical_shape_preserved_NZ_bytes": true
+    },
+    "w3_scale": {
+      "producer": "w3_scale[:,0].contiguous()",
+      "full_shape": [
+        16,
+        1,
+        24,
+        2304
+      ],
+      "producer_selected_shape": [
+        16,
+        24,
+        2304
+      ],
+      "HOST_shape": [
+        16,
+        24,
+        2304
+      ],
+      "dtype": "torch.float32",
+      "contiguous_element_strides": [
+        55296,
+        2304,
+        1
+      ],
+      "global_bytes": 3538944,
+      "logical_shape_preserved_NZ_bytes": false
+    }
+  },
+  "count_old_physical": {
+    "gate_bias": {
+      "producer": "gate_bias[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        384
+      ],
+      "producer_selected_shape": [
+        16,
+        384
+      ],
+      "HOST_shape": [
+        16,
+        384
+      ],
+      "dtype": "torch.float32",
+      "contiguous_element_strides": [
+        384,
+        1
+      ],
+      "global_bytes": 24576,
+      "logical_shape_preserved_NZ_bytes": false
+    },
+    "gate_weight": {
+      "producer": "gate_weight[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        384,
+        5120
+      ],
+      "producer_selected_shape": [
+        16,
+        384,
+        5120
+      ],
+      "HOST_shape": [
+        16,
+        384,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "contiguous_element_strides": [
+        1966080,
+        5120,
+        1
+      ],
+      "global_bytes": 125829120,
+      "logical_shape_preserved_NZ_bytes": false
+    },
+    "hc_ffn_base": {
+      "producer": "hc_ffn_base[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        24
+      ],
+      "producer_selected_shape": [
+        16,
+        24
+      ],
+      "HOST_shape": [
+        16,
+        24
+      ],
+      "dtype": "torch.float32",
+      "contiguous_element_strides": [
+        24,
+        1
+      ],
+      "global_bytes": 1536,
+      "logical_shape_preserved_NZ_bytes": false
+    },
+    "hc_ffn_fn": {
+      "producer": "hc_ffn_fn[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        32,
+        20480
+      ],
+      "producer_selected_shape": [
+        16,
+        32,
+        20480
+      ],
+      "HOST_shape": [
+        16,
+        32,
+        20480
+      ],
+      "dtype": "torch.float32",
+      "contiguous_element_strides": [
+        655360,
+        20480,
+        1
+      ],
+      "global_bytes": 41943040,
+      "logical_shape_preserved_NZ_bytes": false
+    },
+    "hc_ffn_scale": {
+      "producer": "hc_ffn_scale[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        3
+      ],
+      "producer_selected_shape": [
+        16,
+        3
+      ],
+      "HOST_shape": [
+        16,
+        3
+      ],
+      "dtype": "torch.float32",
+      "contiguous_element_strides": [
+        3,
+        1
+      ],
+      "global_bytes": 192,
+      "logical_shape_preserved_NZ_bytes": false
+    },
+    "norm_weight": {
+      "producer": "ffn_norm_w[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        5120
+      ],
+      "producer_selected_shape": [
+        16,
+        5120
+      ],
+      "HOST_shape": [
+        16,
+        5120
+      ],
+      "dtype": "torch.bfloat16",
+      "contiguous_element_strides": [
+        5120,
+        1
+      ],
+      "global_bytes": 163840,
+      "logical_shape_preserved_NZ_bytes": false
+    },
+    "shared_w1": {
+      "producer": "shared_w1[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        5120,
+        2304
+      ],
+      "producer_selected_shape": [
+        16,
+        5120,
+        2304
+      ],
+      "HOST_shape": [
+        16,
+        5120,
+        2304
+      ],
+      "dtype": "torch.int8",
+      "contiguous_element_strides": [
+        11796480,
+        2304,
+        1
+      ],
+      "global_bytes": 188743680,
+      "logical_shape_preserved_NZ_bytes": true
+    },
+    "shared_w1_scale": {
+      "producer": "shared_w1_scale[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        2304
+      ],
+      "producer_selected_shape": [
+        16,
+        2304
+      ],
+      "HOST_shape": [
+        16,
+        2304
+      ],
+      "dtype": "torch.float32",
+      "contiguous_element_strides": [
+        2304,
+        1
+      ],
+      "global_bytes": 147456,
+      "logical_shape_preserved_NZ_bytes": false
+    },
+    "shared_w2": {
+      "producer": "shared_w2[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        2304,
+        5120
+      ],
+      "producer_selected_shape": [
+        16,
+        2304,
+        5120
+      ],
+      "HOST_shape": [
+        16,
+        2304,
+        5120
+      ],
+      "dtype": "torch.int8",
+      "contiguous_element_strides": [
+        11796480,
+        5120,
+        1
+      ],
+      "global_bytes": 188743680,
+      "logical_shape_preserved_NZ_bytes": true
+    },
+    "shared_w2_scale": {
+      "producer": "shared_w2_scale[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        5120
+      ],
+      "producer_selected_shape": [
+        16,
+        5120
+      ],
+      "HOST_shape": [
+        16,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "contiguous_element_strides": [
+        5120,
+        1
+      ],
+      "global_bytes": 327680,
+      "logical_shape_preserved_NZ_bytes": false
+    },
+    "shared_w3": {
+      "producer": "shared_w3[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        5120,
+        2304
+      ],
+      "producer_selected_shape": [
+        16,
+        5120,
+        2304
+      ],
+      "HOST_shape": [
+        16,
+        5120,
+        2304
+      ],
+      "dtype": "torch.int8",
+      "contiguous_element_strides": [
+        11796480,
+        2304,
+        1
+      ],
+      "global_bytes": 188743680,
+      "logical_shape_preserved_NZ_bytes": true
+    },
+    "shared_w3_scale": {
+      "producer": "shared_w3_scale[:,0].contiguous()",
+      "full_shape": [
+        16,
+        40,
+        2304
+      ],
+      "producer_selected_shape": [
+        16,
+        2304
+      ],
+      "HOST_shape": [
+        16,
+        2304
+      ],
+      "dtype": "torch.float32",
+      "contiguous_element_strides": [
+        2304,
+        1
+      ],
+      "global_bytes": 147456,
+      "logical_shape_preserved_NZ_bytes": false
+    },
+    "w1": {
+      "producer": "w1[:,0].contiguous()",
+      "full_shape": [
+        16,
+        1,
+        24,
+        5120,
+        2304
+      ],
+      "producer_selected_shape": [
+        16,
+        24,
+        5120,
+        2304
+      ],
+      "HOST_shape": [
+        16,
+        24,
+        5120,
+        2304
+      ],
+      "dtype": "torch.int8",
+      "contiguous_element_strides": [
+        283115520,
+        11796480,
+        2304,
+        1
+      ],
+      "global_bytes": 4529848320,
+      "logical_shape_preserved_NZ_bytes": true
+    },
+    "w1_scale": {
+      "producer": "w1_scale[:,0].contiguous()",
+      "full_shape": [
+        16,
+        1,
+        24,
+        2304
+      ],
+      "producer_selected_shape": [
+        16,
+        24,
+        2304
+      ],
+      "HOST_shape": [
+        16,
+        24,
+        2304
+      ],
+      "dtype": "torch.float32",
+      "contiguous_element_strides": [
+        55296,
+        2304,
+        1
+      ],
+      "global_bytes": 3538944,
+      "logical_shape_preserved_NZ_bytes": false
+    },
+    "w2": {
+      "producer": "w2[:,0].contiguous()",
+      "full_shape": [
+        16,
+        1,
+        24,
+        2304,
+        5120
+      ],
+      "producer_selected_shape": [
+        16,
+        24,
+        2304,
+        5120
+      ],
+      "HOST_shape": [
+        16,
+        24,
+        2304,
+        5120
+      ],
+      "dtype": "torch.int8",
+      "contiguous_element_strides": [
+        283115520,
+        11796480,
+        5120,
+        1
+      ],
+      "global_bytes": 4529848320,
+      "logical_shape_preserved_NZ_bytes": true
+    },
+    "w2_scale": {
+      "producer": "w2_scale[:,0].contiguous()",
+      "full_shape": [
+        16,
+        1,
+        24,
+        5120
+      ],
+      "producer_selected_shape": [
+        16,
+        24,
+        5120
+      ],
+      "HOST_shape": [
+        16,
+        24,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "contiguous_element_strides": [
+        122880,
+        5120,
+        1
+      ],
+      "global_bytes": 7864320,
+      "logical_shape_preserved_NZ_bytes": false
+    },
+    "w3": {
+      "producer": "w3[:,0].contiguous()",
+      "full_shape": [
+        16,
+        1,
+        24,
+        5120,
+        2304
+      ],
+      "producer_selected_shape": [
+        16,
+        24,
+        5120,
+        2304
+      ],
+      "HOST_shape": [
+        16,
+        24,
+        5120,
+        2304
+      ],
+      "dtype": "torch.int8",
+      "contiguous_element_strides": [
+        283115520,
+        11796480,
+        2304,
+        1
+      ],
+      "global_bytes": 4529848320,
+      "logical_shape_preserved_NZ_bytes": true
+    },
+    "w3_scale": {
+      "producer": "w3_scale[:,0].contiguous()",
+      "full_shape": [
+        16,
+        1,
+        24,
+        2304
+      ],
+      "producer_selected_shape": [
+        16,
+        24,
+        2304
+      ],
+      "HOST_shape": [
+        16,
+        24,
+        2304
+      ],
+      "dtype": "torch.float32",
+      "contiguous_element_strides": [
+        55296,
+        2304,
+        1
+      ],
+      "global_bytes": 3538944,
+      "logical_shape_preserved_NZ_bytes": false
+    }
+  }
+}

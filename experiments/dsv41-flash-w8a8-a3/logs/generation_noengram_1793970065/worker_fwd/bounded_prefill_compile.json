@@ -1,0 +1,8 @@
+{
+  "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/generation_noengram_1793970065/worker_fwd/compile_build_allfixed/_jit_prefill_fwd_20261106_211345_fxos30t8",
+  "logical_bytes": 104482127108,
+  "storage_bytes": 99186818308,
+  "per_rank_logical_bytes": 6530132944,
+  "mode": "ONBOARD",
+  "engram_enabled": 0
+}

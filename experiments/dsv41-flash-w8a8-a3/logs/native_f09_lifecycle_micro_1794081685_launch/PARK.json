@@ -1,0 +1,12 @@
+{
+  "status": "FINAL/PARK",
+  "root_go": "observer-20261108-f09-lifecycle-public-native2",
+  "native_task_terminal": "task_20261108_042113_142720411936 exit0",
+  "audit_task_terminal": "task_20261108_042213_14304572871 exit0",
+  "scope": "tiny lifecycle interface on actualauto2 only",
+  "frozen_prep_unchanged": true,
+  "old_native_output_or_model_source_writes": false,
+  "running_jobs": [],
+  "shared_writes": 0,
+  "recovery": "No continuation or NPU retry. Root bounded-acceptance disposition then separate full16 F09 GO if desired."
+}

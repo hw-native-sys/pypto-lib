@@ -1,0 +1,12 @@
+{
+  "root_go_id": "observer-20261107-first-full-real4-d77d",
+  "conditional_gate": "SATISFIED: independent outer reviewer FINAL/SEALED/PARK confirmed by reviewer and Root",
+  "review_unit": "independent_full_operation_runner_1794053688",
+  "review_artifact_files": 31,
+  "review_manifest_sha256": "8f7fdaecae75265c76c745ae7dfadf32440fc971f484cf1343870c4d459eab46",
+  "review_FREEZE_sha256": "71f78dff5c873eb5eab1b70b6062d6a5234c3f29ad087a3e30f0eef0055a285c",
+  "review_CPU_job": "task_20261107_203714_359829711388",
+  "review_CPU_scope": "independent tiny CPU/source only; no NPU/grant/payload",
+  "fresh_prequeue_job": "task_20261107_203943_360374030422",
+  "authorization": "Root explicit FIRST full-real operation; exactly ONE auto16/21600 job; task-local assignment and production receipt after allocation; no retry/source edits"
+}

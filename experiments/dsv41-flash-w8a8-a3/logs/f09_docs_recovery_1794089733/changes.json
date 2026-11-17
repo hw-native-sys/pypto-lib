@@ -1,0 +1,14 @@
+{
+  "MODULES.md": {
+    "before_sha256": "f422792fcaa0570c9e7bbacd58c95008b89648ec68ce5a19dddaa7fe27d63908",
+    "after_sha256": "01f410f5d7c1f399bec561c94409bb7f1f8d3cbcc199c8c493ebb33365901b3c"
+  },
+  "INTERFACE.md": {
+    "before_sha256": "f8da07ba3ae2ba2b05dd168982290970ec267454307293aa3951a98e81bb0261",
+    "after_sha256": "9a54f391c6e19d58b1329fb3362843f1824bf532a07a428f30fe52f152140430"
+  },
+  "HANDOFF.md": {
+    "before_sha256": "b3f11579a0f201e63a280cf612ba2d16556994abbf261c4c6e0758a3f40f32cc",
+    "after_sha256": "475fcc51271d1a70e4255a9620597388cdc392171116fb13588dd03c7f3d80fe"
+  }
+}

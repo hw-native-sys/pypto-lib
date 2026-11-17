@@ -1,0 +1,7 @@
+A NEW Root-issued receipt is required; this review does not issue approval.
+
+The exact canonical312 route requires schema Root-F09-lifecycle-acceptance/1, approved=true, source_manifest_sha256=405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31, adapter_sha256=412cb48d4625d54958f949588cdf9d9d0b6457137b4e27a6de17c0d84582e295, lifecycle_sha256=ee648c64b8477cc98b2f3083a6b16c9b6b92cc4612cc3228391dbe53aef1858d, oracle_integrity_sha256=e45c7529d6c34cd57712a7d346ec612641896e38ab98ff88017ceafd87d999d3, actual_public_prepare_pass=true, proof_receipt absolute path and exact proof_receipt_sha256. The reviewed route hash is a91557c329aa8dff120ce3f141afcdde5c2371c6e4a659107911720f7c64d4cb. No stage authorization follows from lifecycle acceptance.
+
+Suggested composed evidence: this result.json (faaf5fd55c4982d26ad64a65d744c8918dd86ba5c46e20f1364679a8012a99a7), actual failed051030 prepare/finally-close facts and accepted tiny public lifecycle manifests c94d3bee25cc2e6fe676a1844390e3299c38818b4c9c715da07731e2da0340bf / adb0a4392589f55621d3aca25ea510a1a753c6418ea2461bd0d61cd560fbcf2e. Explicit limits should include new_helper_native_execution=false, native16_authorized=false, old_actual_case_status=FAILED, count_dispatch_performed=false. actual_public_prepare_pass refers to the composed underlying public interface fact, not a whole-case PASS.
+
+Old Root90d pins helper1cc and cannot authorize helperEE. No new positive wrapper or actual-stage grant is present in this unit. Root owns acceptance and subsequent separate actual16 GO.

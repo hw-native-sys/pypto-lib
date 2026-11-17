@@ -1,0 +1,16 @@
+{
+  "REPORT.md": "ff6901c1617e945d8cc8db4beb2b32901c1505122165bc45576361dfb964efc9",
+  "cpu_submission_observed_epoch.json": "e3ebfc6b6cd5406f06b94250965b117e68c9664681c580a71651a3b31304f783",
+  "cpu_task_raw.log": "7d8716f17973df730ed8b5797adca044b9ad0e9363c30bfde08222300a32e1a2",
+  "cpu_task_status.txt": "e9d1ff712f06bb1de067759e33a7004938e8ac346c8609ffd9b60aa081851ac4",
+  "final_numeric_evidence_check.json": "570eb6d8f1730c1456ffe3225084f1daafce33bb983969f36f6683287e759647",
+  "measured_start_epoch.txt": "690f225b8757a9bb87d39a66b6a4e6aaffb2b4e615a6e79a100ad388d4687630",
+  "native_input_subset_manifest.json": "5705d0b5e071d4e5666ce8941503180a1ad043fa4f5af81996d64edd042be527",
+  "native_task_raw.log": "42cbd64c23e0e7193f7c324cb74bdf84690eeaa97926aa6409e1958b60dd916f",
+  "native_task_status.txt": "e9d1ff712f06bb1de067759e33a7004938e8ac346c8609ffd9b60aa081851ac4",
+  "native_terminal_receipt.json": "8345cf33f8f4b7542f1cb1d3aff9efbdfeba566f8e740eb6e254dfb5b69df6d0",
+  "passive_birth_samples.json": "03cb24bcb98248ce39d1b924d1e8a82121b06c0c2c69aafa546211d96308c956",
+  "sample_known_births.py": "924df7acc2454f30df328d9e40d11c2ec6b878d3d002caea25641ca228834aa2",
+  "sealed_work.json": "2959f3f9693bea010baad147079e595169164c0e5e0b98edb59fd04351d21f75",
+  "work_record.json": "b343a52872a73f8c9f2ac8d8f38c1878d423c4dddf68b0d1c524d2551ca45392"
+}

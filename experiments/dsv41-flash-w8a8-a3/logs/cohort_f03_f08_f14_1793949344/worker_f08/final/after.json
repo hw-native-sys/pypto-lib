@@ -1,0 +1,23 @@
+[
+  {
+    "kind": "zero",
+    "tokens": 1,
+    "passed": true,
+    "error": null,
+    "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/cohort_f03_f08_f14_1793949344/worker_f08/final/build_output/_jit_moe_gate_test_20261106_152412_6umpf1pd"
+  },
+  {
+    "kind": "equal",
+    "tokens": 7,
+    "passed": true,
+    "error": null,
+    "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/cohort_f03_f08_f14_1793949344/worker_f08/final/build_output/_jit_moe_gate_test_20261106_152412_6umpf1pd"
+  },
+  {
+    "kind": "partial",
+    "tokens": 17,
+    "passed": true,
+    "error": null,
+    "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/cohort_f03_f08_f14_1793949344/worker_f08/final/build_output/_jit_moe_gate_test_20261106_152412_6umpf1pd"
+  }
+]

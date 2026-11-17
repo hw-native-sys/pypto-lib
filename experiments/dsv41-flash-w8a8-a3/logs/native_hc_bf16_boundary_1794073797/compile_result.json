@@ -1,0 +1,34 @@
+{
+  "status": "PASS",
+  "artifacts": [
+    {
+      "role": "candidate",
+      "source_sha256": "c6111634f78d53ad0cb4196a533a2d89097d4cfa0859688382c0072b60840885",
+      "started_epoch": 1794072762.212246,
+      "ended_epoch": 1794072764.7155983,
+      "backend_type": "BackendType.Ascend910",
+      "execution_mode": "ExecutionMode.ONBOARD",
+      "output_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_bf16_boundary_validation_1794072636/compiled/candidate",
+      "compile_call": "module.hc_post_test.compile(config=cfg)",
+      "tensor_sample_arguments": 0,
+      "prepare_calls": 0,
+      "device_calls": 0
+    },
+    {
+      "role": "old_control",
+      "source_sha256": "55ef4ccb102d62f2c2b42fd8084385ed2d83191e8f17db31e6193826e3129d73",
+      "started_epoch": 1794072764.721707,
+      "ended_epoch": 1794072766.8762388,
+      "backend_type": "BackendType.Ascend910",
+      "execution_mode": "ExecutionMode.ONBOARD",
+      "output_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_bf16_boundary_validation_1794072636/compiled/old_control",
+      "compile_call": "module.hc_post_test.compile(config=cfg)",
+      "tensor_sample_arguments": 0,
+      "prepare_calls": 0,
+      "device_calls": 0
+    }
+  ],
+  "files": 140,
+  "NPU_execution": false,
+  "prepared": false
+}

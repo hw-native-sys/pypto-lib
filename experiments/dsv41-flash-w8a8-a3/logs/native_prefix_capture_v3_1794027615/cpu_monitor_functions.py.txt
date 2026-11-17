@@ -1,0 +1,24 @@
+def descendants(parent):
+ result=[parent]
+ try:children=Path(f'/proc/{parent}/task/{parent}/children').read_text().split()
+ except FileNotFoundError:return result
+ for child in children:result.extend(descendants(int(child)))
+ return result
+
+def sample(label):
+ processes=[]
+ for process in descendants(pid):
+  try:
+   values={s.split(':')[0]:int(s.split()[1])*1024 for s in Path(f'/proc/{process}/smaps_rollup').read_text().splitlines() if ':' in s and len(s.split())>1 and s.split()[1].isdigit()}
+   processes.append({'pid':process,'pss':values.get('Pss',0),'uss':sum(values.get(n,0) for n in ('Private_Clean','Private_Dirty','Private_Hugetlb')),'rss':values.get('Rss',0)})
+  except (FileNotFoundError,ProcessLookupError,PermissionError):pass
+ fresh=p.measured_free(WORK);fs=os.statvfs('/dev/shm')
+ record={'time':time.time(),'label':label,'processes':processes,'tree_pss':sum(n['pss'] for n in processes),'tree_uss':sum(n['uss'] for n in processes),'available':fresh,'shm_used':(fs.f_blocks-fs.f_bfree)*fs.f_frsize};samples.append(record)
+ with (ROOT/'cpu_memory_samples.jsonl').open('a') as stream:stream.write(json.dumps(record)+'\n')
+ return record
+
+def monitor():
+ while not stop.wait(3):
+  try:sample('periodic')
+  except BaseException as error:
+   with (ROOT/'cpu_monitor_errors.txt').open('a') as stream:stream.write(repr(error)+'\n')

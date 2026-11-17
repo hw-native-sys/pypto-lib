@@ -1,0 +1,1024 @@
+{
+  "schema": "F09-8153-full-native-terminal/1",
+  "status": "THREE_CALL_NATIVE_CAPTURE_RETENTION_PASS_PENDING_CPU171",
+  "native_task_id": "task_20261108_073451_194268324897",
+  "native_exit": 0,
+  "source_manifest_sha256": "8153c7f040bef51900a6e6c9ff27b018279b7503f31d50ec5488457e49770b28",
+  "full_profile_manifest_sha256": "510dd3c7b72a1c36291ff8ff0b167ce0ac8204d2cd6a957eae0a8ea6641f8642",
+  "full_metadata_sha256": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770",
+  "closed": {
+    "normal_close": true,
+    "primary_error": null,
+    "cleanup_errors": [],
+    "records": 3,
+    "records_returned_by_drive": 3,
+    "durable_post_dispatch_records": [
+      "call0.json",
+      "call1.json",
+      "call2.json"
+    ],
+    "retention_validated_call_records": [
+      "call0.json",
+      "call1.json",
+      "call2.json"
+    ],
+    "checkpoint_record_errors": [],
+    "source_manifest": "8153c7f040bef51900a6e6c9ff27b018279b7503f31d50ec5488457e49770b28"
+  },
+  "six_actual_initial_post_capsules": [
+    {
+      "call": 0,
+      "role": "initial",
+      "file": "call0.initial.pt",
+      "sha256": "3be42107cca0be664c2aa0f9eee48cdb6889550c67b3683ba14594343ab01b8a",
+      "file_bytes": 494235772
+    },
+    {
+      "call": 0,
+      "role": "actual",
+      "file": "call0.actual.pt",
+      "sha256": "ebde6dc674ec9762a8c1c8eb311a3023c1b05cf94f613ef7337bf4c741858398",
+      "file_bytes": 494235727
+    },
+    {
+      "call": 1,
+      "role": "initial",
+      "file": "call1.initial.pt",
+      "sha256": "63febd76ba3f40c0113dbb74cf3793dae488d0aef230e3e720cd5edb0ebb374c",
+      "file_bytes": 494235772
+    },
+    {
+      "call": 1,
+      "role": "actual",
+      "file": "call1.actual.pt",
+      "sha256": "1bbd201be955ca7d2f79324b6114a54831a065c11e4e875b029cd8b642e791fc",
+      "file_bytes": 494235727
+    },
+    {
+      "call": 2,
+      "role": "initial",
+      "file": "call2.initial.pt",
+      "sha256": "4168122be999818115ccf6e731e2c422dde9880cd8edcc179add1c6a7f0cb741",
+      "file_bytes": 494235772
+    },
+    {
+      "call": 2,
+      "role": "actual",
+      "file": "call2.actual.pt",
+      "sha256": "fe6d7327968b347071f003ac248bb544afa23d300d1980eb069438c40d8cc176",
+      "file_bytes": 494235727
+    }
+  ],
+  "one_owner_and_artifact": true,
+  "six_cache_hash_carry_metadata_consistent": true,
+  "three_retention_PASS": true,
+  "static_recipe_sha256": "4e73e5d8e2a03cedb309f0a3bde16fb5d4a806c4b6ee5039f5c28a8034872e75",
+  "prepared_receipt_sha256": "bed518802d89c389024f547714616501321d14b9a1456156e434d112eb539d30",
+  "registry_rows": 119,
+  "unique_objects": 116,
+  "unique_cache": 116,
+  "orchestrations": 1,
+  "source_projection_unchanged": 376,
+  "Main64bb_unchanged": true,
+  "known_observed_births": [
+    {
+      "identity": {
+        "pid": 1943625,
+        "ppid": 1943152,
+        "starttick": "109441870",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1943672,
+        "ppid": 1943625,
+        "starttick": "109441922",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1943783,
+        "ppid": 1943672,
+        "starttick": "109442046",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949870,
+        "ppid": 1943783,
+        "starttick": "109452151",
+        "comm": "aarch64-target-"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949897,
+        "ppid": 1943783,
+        "starttick": "109452156",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949908,
+        "ppid": 1943783,
+        "starttick": "109452159",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949910,
+        "ppid": 1943783,
+        "starttick": "109452159",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949912,
+        "ppid": 1943783,
+        "starttick": "109452160",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949913,
+        "ppid": 1943783,
+        "starttick": "109452161",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949922,
+        "ppid": 1943783,
+        "starttick": "109452167",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949923,
+        "ppid": 1943783,
+        "starttick": "109452167",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949924,
+        "ppid": 1943783,
+        "starttick": "109452167",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949925,
+        "ppid": 1943783,
+        "starttick": "109452167",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949926,
+        "ppid": 1943783,
+        "starttick": "109452167",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949927,
+        "ppid": 1943783,
+        "starttick": "109452167",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949928,
+        "ppid": 1943783,
+        "starttick": "109452167",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949929,
+        "ppid": 1943783,
+        "starttick": "109452168",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949930,
+        "ppid": 1943783,
+        "starttick": "109452168",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949931,
+        "ppid": 1943783,
+        "starttick": "109452168",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949932,
+        "ppid": 1943783,
+        "starttick": "109452168",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949933,
+        "ppid": 1943783,
+        "starttick": "109452168",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949934,
+        "ppid": 1943783,
+        "starttick": "109452168",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949936,
+        "ppid": 1943783,
+        "starttick": "109452169",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949939,
+        "ppid": 1943783,
+        "starttick": "109452169",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949941,
+        "ppid": 1943783,
+        "starttick": "109452170",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949943,
+        "ppid": 1943783,
+        "starttick": "109452171",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949944,
+        "ppid": 1943783,
+        "starttick": "109452171",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949946,
+        "ppid": 1943783,
+        "starttick": "109452171",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949948,
+        "ppid": 1943783,
+        "starttick": "109452172",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949949,
+        "ppid": 1943783,
+        "starttick": "109452172",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949950,
+        "ppid": 1943783,
+        "starttick": "109452172",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949951,
+        "ppid": 1943783,
+        "starttick": "109452173",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949952,
+        "ppid": 1943783,
+        "starttick": "109452173",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949953,
+        "ppid": 1943783,
+        "starttick": "109452173",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949954,
+        "ppid": 1943783,
+        "starttick": "109452173",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949956,
+        "ppid": 1943783,
+        "starttick": "109452174",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949957,
+        "ppid": 1943783,
+        "starttick": "109452174",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949959,
+        "ppid": 1943783,
+        "starttick": "109452175",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949960,
+        "ppid": 1943783,
+        "starttick": "109452175",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1949962,
+        "ppid": 1943783,
+        "starttick": "109452175",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1950080,
+        "ppid": 1943783,
+        "starttick": "109452324",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1950081,
+        "ppid": 1943783,
+        "starttick": "109452326",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1950096,
+        "ppid": 1943783,
+        "starttick": "109452327",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1950107,
+        "ppid": 1943783,
+        "starttick": "109452332",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1950178,
+        "ppid": 1949870,
+        "starttick": "109452339",
+        "comm": "cc1plus"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1950179,
+        "ppid": 1943783,
+        "starttick": "109452339",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1950180,
+        "ppid": 1943783,
+        "starttick": "109452340",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1950182,
+        "ppid": 1943783,
+        "starttick": "109452342",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1950200,
+        "ppid": 1943783,
+        "starttick": "109452348",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1950271,
+        "ppid": 1943783,
+        "starttick": "109452354",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1950301,
+        "ppid": 1943783,
+        "starttick": "109452358",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1950324,
+        "ppid": 1943783,
+        "starttick": "109452359",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1950325,
+        "ppid": 1943783,
+        "starttick": "109452359",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1950369,
+        "ppid": 1943783,
+        "starttick": "109452362",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1950371,
+        "ppid": 1943783,
+        "starttick": "109452365",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1950375,
+        "ppid": 1943783,
+        "starttick": "109452366",
+        "comm": "ccec"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1956244,
+        "ppid": 1943783,
+        "starttick": "109457574",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1956245,
+        "ppid": 1943783,
+        "starttick": "109457577",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1956247,
+        "ppid": 1943783,
+        "starttick": "109457581",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1956249,
+        "ppid": 1943783,
+        "starttick": "109457584",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1956252,
+        "ppid": 1943783,
+        "starttick": "109457587",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1956254,
+        "ppid": 1943783,
+        "starttick": "109457590",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1956256,
+        "ppid": 1943783,
+        "starttick": "109457592",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1956265,
+        "ppid": 1943783,
+        "starttick": "109457595",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1956267,
+        "ppid": 1943783,
+        "starttick": "109457598",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1956272,
+        "ppid": 1943783,
+        "starttick": "109457601",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1956276,
+        "ppid": 1943783,
+        "starttick": "109457605",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1956279,
+        "ppid": 1943783,
+        "starttick": "109457608",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1956284,
+        "ppid": 1943783,
+        "starttick": "109457611",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1956294,
+        "ppid": 1943783,
+        "starttick": "109457615",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1956298,
+        "ppid": 1943783,
+        "starttick": "109457618",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1956305,
+        "ppid": 1943783,
+        "starttick": "109457622",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1956314,
+        "ppid": 1943783,
+        "starttick": "109457626",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    }
+  ],
+  "all_known_birth_identities_absent": true,
+  "ready_workers": [
+    {
+      "pid": 1956245,
+      "device": 0,
+      "observed_birth_startticks": [
+        "109457577"
+      ],
+      "current_proc_exists": false
+    },
+    {
+      "pid": 1956247,
+      "device": 1,
+      "observed_birth_startticks": [
+        "109457581"
+      ],
+      "current_proc_exists": false
+    },
+    {
+      "pid": 1956252,
+      "device": 3,
+      "observed_birth_startticks": [
+        "109457587"
+      ],
+      "current_proc_exists": false
+    },
+    {
+      "pid": 1956256,
+      "device": 5,
+      "observed_birth_startticks": [
+        "109457592"
+      ],
+      "current_proc_exists": false
+    },
+    {
+      "pid": 1956249,
+      "device": 2,
+      "observed_birth_startticks": [
+        "109457584"
+      ],
+      "current_proc_exists": false
+    },
+    {
+      "pid": 1956254,
+      "device": 4,
+      "observed_birth_startticks": [
+        "109457590"
+      ],
+      "current_proc_exists": false
+    },
+    {
+      "pid": 1956267,
+      "device": 7,
+      "observed_birth_startticks": [
+        "109457598"
+      ],
+      "current_proc_exists": false
+    },
+    {
+      "pid": 1956265,
+      "device": 6,
+      "observed_birth_startticks": [
+        "109457595"
+      ],
+      "current_proc_exists": false
+    },
+    {
+      "pid": 1956276,
+      "device": 9,
+      "observed_birth_startticks": [
+        "109457605"
+      ],
+      "current_proc_exists": false
+    },
+    {
+      "pid": 1956279,
+      "device": 10,
+      "observed_birth_startticks": [
+        "109457608"
+      ],
+      "current_proc_exists": false
+    },
+    {
+      "pid": 1956272,
+      "device": 8,
+      "observed_birth_startticks": [
+        "109457601"
+      ],
+      "current_proc_exists": false
+    },
+    {
+      "pid": 1956284,
+      "device": 11,
+      "observed_birth_startticks": [
+        "109457611"
+      ],
+      "current_proc_exists": false
+    },
+    {
+      "pid": 1956294,
+      "device": 12,
+      "observed_birth_startticks": [
+        "109457615"
+      ],
+      "current_proc_exists": false
+    },
+    {
+      "pid": 1956298,
+      "device": 13,
+      "observed_birth_startticks": [
+        "109457618"
+      ],
+      "current_proc_exists": false
+    },
+    {
+      "pid": 1956314,
+      "device": 15,
+      "observed_birth_startticks": [
+        "109457626"
+      ],
+      "current_proc_exists": false
+    },
+    {
+      "pid": 1956305,
+      "device": 14,
+      "observed_birth_startticks": [
+        "109457622"
+      ],
+      "current_proc_exists": false
+    }
+  ],
+  "ready_worker_births_observed_count": 16,
+  "all16_current_ready_PIDs_absent": true,
+  "all16image_free_devices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "raw16_lock_release_observed": true,
+  "native_raw16_cleanup_audit_pass": true,
+  "cleanup_scope": "bounded recordedbirth/current16ready/raw16/terminal only; no completehistory/PSSclaim",
+  "actual_public_memory_discrete_samples": [
+    {
+      "stage": "pre-static",
+      "rank_rows": 16,
+      "minimum_free": 59885383680,
+      "maximum_committed": 5452897141
+    },
+    {
+      "stage": "post-static",
+      "rank_rows": 16,
+      "minimum_free": 53418291200,
+      "maximum_committed": 11916776245
+    },
+    {
+      "stage": "before-forward",
+      "rank_rows": 16,
+      "minimum_free": 53417103360,
+      "maximum_committed": 11916776245
+    },
+    {
+      "stage": "after-forward",
+      "rank_rows": 16,
+      "minimum_free": 53377175552,
+      "maximum_committed": 11947735412
+    },
+    {
+      "stage": "before-forward",
+      "rank_rows": 16,
+      "minimum_free": 53377495040,
+      "maximum_committed": 11947735412
+    },
+    {
+      "stage": "after-forward",
+      "rank_rows": 16,
+      "minimum_free": 53377495040,
+      "maximum_committed": 11947735412
+    },
+    {
+      "stage": "before-forward",
+      "rank_rows": 16,
+      "minimum_free": 53377224704,
+      "maximum_committed": 11947735412
+    },
+    {
+      "stage": "after-forward",
+      "rank_rows": 16,
+      "minimum_free": 53377224704,
+      "maximum_committed": 11947735412
+    }
+  ],
+  "memory_samples_not_peak": true,
+  "new_numeric171_acceptance": false,
+  "CPU_reference_executed": false,
+  "observed_epoch": 1794094842.3301334,
+  "shared_writes": 0
+}

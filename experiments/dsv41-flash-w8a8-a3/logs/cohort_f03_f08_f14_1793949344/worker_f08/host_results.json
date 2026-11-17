@@ -1,0 +1,28 @@
+{
+  "reference_sha256": "2c952bfe7d39809f1e01944e5c6461ab16bcf778338393ef7c911cdeef18520f",
+  "archive_sha256": "48c797546805b04ffde118c506f8902e37e19bf2cb5d1713097056a4c93e998c",
+  "cases": [
+    {
+      "kind": "zero",
+      "tokens": 1,
+      "original_routing_pass": true
+    },
+    {
+      "kind": "equal",
+      "tokens": 7,
+      "original_routing_pass": true
+    },
+    {
+      "kind": "partial",
+      "tokens": 17,
+      "original_routing_pass": true
+    }
+  ],
+  "controls": {
+    "out_of_range": "expert IDs outside [0,384): [[73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536]]",
+    "duplicate": "duplicate expert IDs: [[9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9], [9, 9, 9, 9, 9, 9]]",
+    "missed_winner": "    ratio_allclose fail: error_count=102/102 (ratio=100.0000%, allowed<=0.0000%, threshold=0 pts)\n    atol=0.001 rtol=0.001\n    max abs diff=2 at (0, 0) (tol=0.00335627)\n    first 10 mismatches:\n    [0] actual=0.3562696, expected=2.3562696, diff=2, tol=0.003356\n    [1] actual=0.3562696, expected=1.8562696, diff=1.5, tol=0.002856\n    [2] actual=0.3562696, expected=1.4583992, diff=1.102, tol=0.002458\n    [3] actual=0.3562696, expected=1.4583992, diff=1.102, tol=0.002458\n    [4] actual=0.3562696, expected=1.0662415, diff=0.71, tol=0.002066\n    [5] actual=0.3562696, expected=1.0662415, diff=0.71, tol=0.002066\n    [6] actual=0.3562696, expected=2.3562696, diff=2, tol=0.003356\n    [7] actual=0.3562696, expected=1.8562696, diff=1.5, tol=0.002856\n    [8] actual=0.3562696, expected=1.4583992, diff=1.102, tol=0.002458\n    [9] actual=0.3562696, expected=1.4583992, diff=1.102, tol=0.002458",
+    "wrong_weights": "    ratio_allclose fail: error_count=102/102 (ratio=100.0000%, allowed<=1.0000%, threshold=1 pts)\n    atol=0.001 rtol=0.01\n    max abs diff=0.379671 at (0, 2) (tol=0.00479671)\n    first 10 mismatches:\n    [0] actual=0, expected=0.092749223, diff=0.09275, tol=0.001927\n    [1] actual=0, expected=0.092749223, diff=0.09275, tol=0.001927\n    [2] actual=0, expected=0.37967142, diff=0.3797, tol=0.004797\n    [3] actual=0, expected=0.37967142, diff=0.3797, tol=0.004797\n    [4] actual=0, expected=0.27757931, diff=0.2776, tol=0.003776\n    [5] actual=0, expected=0.27757931, diff=0.2776, tol=0.003776\n    [6] actual=0, expected=0.092749223, diff=0.09275, tol=0.001927\n    [7] actual=0, expected=0.092749223, diff=0.09275, tol=0.001927\n    [8] actual=0, expected=0.37967142, diff=0.3797, tol=0.004797\n    [9] actual=0, expected=0.37967142, diff=0.3797, tol=0.004797",
+    "biased_normalization": "    ratio_allclose fail: error_count=102/102 (ratio=100.0000%, allowed<=1.0000%, threshold=1 pts)\n    atol=0.001 rtol=0.01\n    max abs diff=0.288861 at (0, 0) (tol=0.00192749)\n    first 10 mismatches:\n    [0] actual=0.38161013, expected=0.092749223, diff=0.2889, tol=0.001927\n    [1] actual=0.30063251, expected=0.092749223, diff=0.2079, tol=0.001927\n    [2] actual=0.23619533, expected=0.37967142, diff=0.1435, tol=0.004797\n    [3] actual=0.23619533, expected=0.37967142, diff=0.1435, tol=0.004797\n    [4] actual=0.17268336, expected=0.27757931, diff=0.1049, tol=0.003776\n    [5] actual=0.17268336, expected=0.27757931, diff=0.1049, tol=0.003776\n    [6] actual=0.38161013, expected=0.092749223, diff=0.2889, tol=0.001927\n    [7] actual=0.30063251, expected=0.092749223, diff=0.2079, tol=0.001927\n    [8] actual=0.23619533, expected=0.37967142, diff=0.1435, tol=0.004797\n    [9] actual=0.23619533, expected=0.37967142, diff=0.1435, tol=0.004797"
+  }
+}

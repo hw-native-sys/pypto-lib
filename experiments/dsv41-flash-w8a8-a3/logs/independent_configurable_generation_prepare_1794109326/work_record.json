@@ -1,0 +1,22 @@
+{
+  "schema": "measured-source-review/1",
+  "unique_id": "review-agent-configurable-post-auditor-1794109326",
+  "role": "review-agent",
+  "agent": "/root/repetition_review",
+  "status": "FINAL_SOURCE_ONLY_PARK",
+  "start_epoch": 1794109326,
+  "end_epoch": 1794110789,
+  "elapsed_seconds": 1463,
+  "start_note": "first measured clock; earlier unmeasured work excluded",
+  "CPU_jobs": 0,
+  "tests": 0,
+  "model_runtime_imports": 0,
+  "header_scans": 0,
+  "tensor_payload_bytes_read": 0,
+  "compile_prepare_NPU": 0,
+  "model_writes": 0,
+  "shared_writes": 0,
+  "positive_grants": 0,
+  "Root_import": "once; reviewer did not edit shared ledger",
+  "scope": "Source-only contract/delta/template; no actual auditor execution or topology acceptance"
+}

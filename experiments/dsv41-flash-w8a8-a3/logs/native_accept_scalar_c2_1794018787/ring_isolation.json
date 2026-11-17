@@ -1,0 +1,11 @@
+{
+  "source_sha256": "65b5c5d54dcb48110a9d6c5fd1ad79d1f26743139341cfb6d080ec58a191d5c9",
+  "method_exact_copy": true,
+  "recorded_2GiB_equality_failure_reproduced": true,
+  "incident_end_placement_min_bytes": 2541850624,
+  "trial_ring2_bytes": 3221225472,
+  "conservative_pair_plus_largest_allocation_plus_12KiB": 2541862912,
+  "placement_test": "PINNED_METHOD_PLACEMENT_PASS cases=49163",
+  "scope_assumption": "previous closed scope can fully retire; isolated pair does not test real graph task retirement or dependencies",
+  "device_test": false
+}

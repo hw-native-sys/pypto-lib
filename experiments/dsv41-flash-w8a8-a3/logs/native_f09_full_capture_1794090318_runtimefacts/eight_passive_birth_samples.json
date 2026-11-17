@@ -1,0 +1,35 @@
+{
+  "scope": "this operation only; finite8 samples; no full history/PSS/process control",
+  "interval_seconds": 5,
+  "samples": [
+    {
+      "observed_epoch": 1794091316.1650658,
+      "known_descendants": [
+        {
+          "pid": 1783150,
+          "ppid": 1782904,
+          "starttick": "109115658",
+          "comm": "python"
+        },
+        {
+          "pid": 1783176,
+          "ppid": 1783150,
+          "starttick": "109115710",
+          "comm": "python"
+        },
+        {
+          "pid": 1783229,
+          "ppid": 1783176,
+          "starttick": "109115832",
+          "comm": "python"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794091321.2899983,
+      "known_descendants": [],
+      "stage_terminal_file_present": true
+    }
+  ]
+}

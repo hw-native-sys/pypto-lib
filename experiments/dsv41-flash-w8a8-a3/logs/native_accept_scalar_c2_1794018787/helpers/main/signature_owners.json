@@ -1,0 +1,30 @@
+[
+  {
+    "phase": "prefill128",
+    "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_scalar_c2_1794018787/cpu_build/_jit_prefill_fwd_20261107_103734_pz2z2auh",
+    "mode": "ONBOARD",
+    "platform": "a2a3",
+    "expert_shape": [
+      16,
+      40,
+      24
+    ],
+    "seconds": 26.654398202896118,
+    "tensor_samples": 0,
+    "fixture_calls": 0
+  },
+  {
+    "phase": "decode1",
+    "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_scalar_c2_1794018787/cpu_build/_jit_decode_fwd_20261107_103800_slrgx0np",
+    "mode": "ONBOARD",
+    "platform": "a2a3",
+    "expert_shape": [
+      16,
+      40,
+      24
+    ],
+    "seconds": 24.58104109764099,
+    "tensor_samples": 0,
+    "fixture_calls": 0
+  }
+]

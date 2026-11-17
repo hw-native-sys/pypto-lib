@@ -1,0 +1,65 @@
+{
+  "status": "PASS_NEW_FORK_PREQUEUE_METADATA_RESOURCE_ONLY",
+  "epoch": 1794047736.3730328,
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "copied_file_hashes": {
+    "transport.py": "5e364da73ac36d59bce09f92dc4efb8501e900175fc91afc08f91cf0da9dfbb5",
+    "plan.json": "6172ee8e67687d176a2ed3e4441c7d2d858ac0e5a5271e3600648721aafda28e",
+    "source45.json": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+    "offset_observer.py": "31cd56f5bff3dd6db0f24d47ed2534efbbbe0ec46c68b256b65b0ae3d3eb7892",
+    "observer_cli.py": "8fed1c1f6be60e959a8d74f19f83c554b38f7b1b4f34b915ff8deba1a8a57786"
+  },
+  "parent115_all_bytes_unchanged": true,
+  "protected_bundles_all_bytes_unchanged": {
+    "real_weight_transfer_prepare_1794042741/artifacts.json": {
+      "sha256": "cb07b6a92a1b4f509068a8308f48a0d29960c6d8175572a18d7d1cb50283d723",
+      "files": 46,
+      "all_bytes_verified": true
+    },
+    "native_empty_reservation_1794041910/artifacts.json": {
+      "sha256": "4821819e9d91aa87e0ca6514ef70f1fe221f968e7e93df620b1e65bbf0451290",
+      "files": 77,
+      "all_bytes_verified": true
+    },
+    "native_exact_prompt_capture_1794038189/artifacts_final.json": {
+      "sha256": "99400bf3d9a0a40b4a3d4a2367b094b43a645b50c1c9310cc25eb35bc2d9491e",
+      "files": 1252,
+      "all_bytes_verified": true
+    },
+    "generation_entry_1794035858/artifacts.json": {
+      "sha256": "a37109462df44b9416c7401ced49c881628a0ccbe059e277126e1115c428b1cc",
+      "files": 31,
+      "all_bytes_verified": true
+    },
+    "fit_post_guard_1794037055/artifacts.json": {
+      "sha256": "184fc558f8c08bc5c9f1a839da73b68ce9665f0fdc483632377c99508a38340b",
+      "files": 48,
+      "all_bytes_verified": true
+    },
+    "empty_fit_operation_1794037635/artifacts.json": {
+      "sha256": "f55ce7d59678f0977d466e673e3c0ad0429b5c26cdddf6253bf059cb9630c556",
+      "files": 478,
+      "all_bytes_verified": true
+    },
+    "native_empty_calibration_1794040381/artifacts.json": {
+      "sha256": "8d44ec536c3c98d228e109f591e5a65d392cb2d5034af786e295a3941cff8551",
+      "files": 38
+    }
+  },
+  "actual_generated_signature_files": 283,
+  "actual57": 57,
+  "default_refusal_verified": true,
+  "current_resources": {
+    "epoch": 1794047736.3729923,
+    "host": 1722690035712,
+    "disk": 9436802318336,
+    "shm": 1079343157248,
+    "parent_memory_sample": {
+      "Rss": 784117760,
+      "Pss": 781631488
+    }
+  },
+  "real_checkpoint_tensor_bytes_read": 0,
+  "NPU": 0,
+  "actual_grant_created": false
+}

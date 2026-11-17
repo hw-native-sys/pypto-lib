@@ -1,0 +1,26 @@
+{
+  "source_only": true,
+  "inputs": {
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_application_plan_1794094863/artifacts.json": "2353c44e40d8ccfbe18a1394dad2272bf3f589cc16fff7dee2458cc16c35e0a4",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_application_plan_1794094863/FREEZE.json": "dfdaed7b3c60087a477cda4aacc9a1a7a08b37e1d6e435ba733d16009cff9f47",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_application_plan_1794094863/REPORT.md": "e693fcda6b8bdb2bbbffa84b7797f472600dd015203233fa6561f0f2eb4d8329",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_application_plan_1794094863/PLAN.md": "7e5d2edc1cf735f6b706a09ea443563cd533ba3f50e42806e318ab763c76c9b0",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_application_plan_1794094863/generate_baseline.patch": "ce2af97404aa0222da46a8b2f71bcbcb10cf84019416ca983ca446ed1983c81a",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_application_plan_1794094863/update_metadata_AFTER_GO.py": "21236b772de6065069e323881c7dd4d5b6a5524be3b7451b6fbde51a91f5f7e9",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_application_plan_1794094863/compile_E40_AFTER_APPLY_GO.py": "2f92c9748c6615b59dee6f2107b3346fe460e6dbfa823d3640985886235c7691",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_application_plan_1794094863/metadata_recipe.json": "e017a52fc7b481dd917cf390d088236672fd8970306773adefbf33f2467264d5",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_application_plan_1794094863/math_baseline_A8153.json": "8153c7f040bef51900a6e6c9ff27b018279b7503f31d50ec5488457e49770b28",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_application_plan_1794094863/target_producer_B_source45_UNAPPLIED.json": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_application_plan_1794094863/production_apply_UNAPPLIED.patch": "504b1830b2f4e6333a01a900fa579ef9de69e017ee20523e8fcbf10850881e46",
+    "experiments/dsv41-flash-w8a8-a3/logs/hc_boundary_apply_1794075705/source45.json": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+    "experiments/dsv41-flash-w8a8-a3/logs/hc_boundary_apply_1794075705/metadata_binding.json": "ce12fbb15ae23adabc113443eb0ee8dca848567ce143ff2cfc273a575a8f0825",
+    "experiments/dsv41-flash-w8a8-a3/logs/hc_boundary_apply_1794075705/metadata_lineage.json": "ebac3e1980d2e0db67fe23ef2be16362c1b23246b3a4c12812e97c7b5d6af2d8",
+    "models/deepseek_v4_1_flash_a3_w8a8/generate.py": "f7b772cfa62ea38ebc9228e0230b770d8cf29a76527071cfe75b0c2bd5035e76"
+  },
+  "plan_read_only_after_FINAL": true,
+  "mutable_draft_read": false,
+  "CPU171_disposition": "PENDING_NOT_ASSERTED_BY_THIS_UNIT",
+  "old_full_metadata_plan_read_or_copied": false,
+  "input_copies": 0,
+  "imports_tests_compile_NPU_payload": false
+}

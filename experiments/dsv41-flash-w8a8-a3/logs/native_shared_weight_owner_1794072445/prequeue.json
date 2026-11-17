@@ -1,0 +1,19 @@
+{
+  "stage": "PREQUEUE_SOURCE_RESOURCE_PINS_PASS",
+  "root_go_id": "observer-20261108-shared-owner-tiny2",
+  "helper_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/shared_weight_owner_validation_1794071093",
+  "prep79_sha256": "978131cb00ec93ad03aebd277efdab5cd8baf7cb0d7922d8fb527f4158f9d6dd",
+  "Main25_sha256": "a984e4225975cec7e4b7b55dd92276aaab7433d848631958af4eeaacef850581",
+  "source45": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "fresh_capacity": {
+    "HOST": 1722989715456,
+    "DISK": 8509963894784,
+    "SHM": 1079343157248,
+    "units": "bytes",
+    "epoch": 1794072445.4700236
+  },
+  "helper_sha256": "38e92714a550407727a4a7d816c1e9c8fc711519cc73ecdcf89c1f8d6caa9d59",
+  "entry_sha256": "4f0af75139b6c08f4324d46889de9180a1e1b51a036a8aacac24586f567366ac",
+  "no_prior_own_native_active": true,
+  "epoch": 1794072447.3184543
+}

@@ -1,0 +1,7 @@
+{
+  "task": "task_20261108_055827_166384210700",
+  "stage": "own_config_key_assertion_before_any_compile",
+  "error": "KeyError platform; rawconfig has backend_type, normalize_config has platform",
+  "compiler_attempted": false,
+  "native": false
+}

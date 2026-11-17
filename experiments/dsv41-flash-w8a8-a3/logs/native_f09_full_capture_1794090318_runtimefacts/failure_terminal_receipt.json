@@ -1,0 +1,59 @@
+{
+  "status": "FAILED_BEFORE_PUBLIC_PREPARE_NO_CALLS",
+  "native_task_id": "task_20261108_064029_17824732938",
+  "native_exit": 1,
+  "first_error": "ValueError positive IO+comm+8GiB planning reserve missing",
+  "configured_reserve": 10157899712,
+  "planned_nonstatic_tensor_bytes": 494223296,
+  "actual_nonstatic_sum": "NOT_LOGGED; no rematerialization",
+  "owner_open_called": false,
+  "normal_owner_close": false,
+  "cleanup_errors": [],
+  "ready_worker_lines": 0,
+  "actual_prepared_native_inventory": "NONE; publicprepare not entered",
+  "count_or_full_snapshots": 0,
+  "artifact_before_prepare_sha256": "0df45dd1be88133426f0512d1183bac358817bfe2242dd4c2d2ba02727feceb2",
+  "artifact_after_prepare_exists": false,
+  "source_projection_unchanged": 376,
+  "native_file_count": 0,
+  "frozen_Main_prep_unchanged": true,
+  "known_observed_births": [
+    {
+      "identity": {
+        "pid": 1783150,
+        "ppid": 1782904,
+        "starttick": "109115658",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1783176,
+        "ppid": 1783150,
+        "starttick": "109115710",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1783229,
+        "ppid": 1783176,
+        "starttick": "109115832",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    }
+  ],
+  "all_genuinely_observed_birth_identities_absent": true,
+  "historical_worker_manager_helper_birth_completeness": "No ready/prepare observed; no whole history claim",
+  "raw16_lock_release_observed": true,
+  "no_full119_or_dispatch_or_171_proof": true,
+  "no_CPU_or_NPU_retry": true,
+  "shared_writes": 0,
+  "observed_epoch": 1794091461.5672278
+}

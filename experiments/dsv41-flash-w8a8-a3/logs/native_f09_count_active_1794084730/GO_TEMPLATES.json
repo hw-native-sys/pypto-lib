@@ -1,0 +1,32 @@
+{
+  "native_READY_NOT_AUTHORIZED": {
+    "schema": "Root-F09-count-active-operation/1",
+    "approved": false,
+    "root_go_id": "PENDING_SEPARATE_ROOT_ACTUAL16_GO",
+    "stage": "count-active",
+    "requested_role": "active",
+    "native16_authorized": false,
+    "source_manifest_sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+    "lifecycle_acceptance_sha256": "90d995759c4639637cf6f7c5ea0a014331b2912b26b4fede740fd576f12d5597",
+    "pins_sha256": "57b9010fe50ebe4ad4484db3b79507261bfbc51163832e74f7991f55e2845b35",
+    "prequeue_sha256": "ed38110a3e9829e8cfb1115a8e8e99cd8d14de1c695e62057aa86882120784c2",
+    "work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_count_active_1794084730/work",
+    "expires_at_epoch": 0
+  },
+  "cpu_READY_NOT_AUTHORIZED": {
+    "schema": "Root-F09-count-active-operation/1",
+    "approved": false,
+    "root_go_id": "PENDING_SEPARATE_ROOT_CPU_SCOPE_AFTER_NATIVE_TERMINAL_AND_RAW16_AUDIT",
+    "stage": "count-active-offline",
+    "requested_role": "active",
+    "native16_authorized": false,
+    "source_manifest_sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+    "lifecycle_acceptance_sha256": "90d995759c4639637cf6f7c5ea0a014331b2912b26b4fede740fd576f12d5597",
+    "pins_sha256": "57b9010fe50ebe4ad4484db3b79507261bfbc51163832e74f7991f55e2845b35",
+    "prequeue_sha256": "ed38110a3e9829e8cfb1115a8e8e99cd8d14de1c695e62057aa86882120784c2",
+    "work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_count_active_1794084730/work",
+    "native_task_id": "PENDING",
+    "native_raw16_cleanup_audit_pass": false,
+    "expires_at_epoch": 0
+  }
+}

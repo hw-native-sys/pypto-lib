@@ -1,0 +1,106 @@
+{
+  "status": "PASS_ORIGINAL_N3_PREFIX17",
+  "CPU_receipt_sha256": "95046fb12a3c88775b563a2bedf26c1b6f9ec08eca7168fd08e96d4668bf0ad7",
+  "output_names": [
+    "layer_x_hc",
+    "layer_pre_mix",
+    "logits",
+    "window_cache",
+    "compressed_cache_c2a",
+    "index_cache_c2a",
+    "state_cache_c2a",
+    "compressed_cache_c1a",
+    "index_cache_c1a",
+    "topk_indices_c2a",
+    "topk_values_c2a",
+    "pool_block_ids_c2a",
+    "pool_block_counts_c2a",
+    "topk_indices_c1a",
+    "topk_values_c1a",
+    "pool_block_ids_c1a",
+    "pool_block_counts_c1a"
+  ],
+  "oracle_integrity": [
+    {
+      "scope": "unconditioned",
+      "initial_before_sha256": "c41fc4fb70f02f33e1331b958dfb4e4bdfded6109e0a36f1dfa57565be243ea7",
+      "initial_after_sha256": "c41fc4fb70f02f33e1331b958dfb4e4bdfded6109e0a36f1dfa57565be243ea7",
+      "tensor_count": 43,
+      "mutable_names": [
+        "window_cache",
+        "compressed_cache_c2a",
+        "index_cache_c2a",
+        "state_cache_c2a",
+        "compressed_cache_c1a",
+        "index_cache_c1a",
+        "topk_indices_c2a",
+        "topk_values_c2a",
+        "pool_block_ids_c2a",
+        "pool_block_counts_c2a",
+        "topk_indices_c1a",
+        "topk_values_c1a",
+        "pool_block_ids_c1a",
+        "pool_block_counts_c1a",
+        "x_hc",
+        "pre_mix"
+      ]
+    },
+    {
+      "scope": "staged",
+      "initial_before_sha256": "c41fc4fb70f02f33e1331b958dfb4e4bdfded6109e0a36f1dfa57565be243ea7",
+      "initial_after_sha256": "c41fc4fb70f02f33e1331b958dfb4e4bdfded6109e0a36f1dfa57565be243ea7",
+      "tensor_count": 43,
+      "mutable_names": [
+        "window_cache",
+        "compressed_cache_c2a",
+        "index_cache_c2a",
+        "state_cache_c2a",
+        "compressed_cache_c1a",
+        "index_cache_c1a",
+        "topk_indices_c2a",
+        "topk_values_c2a",
+        "pool_block_ids_c2a",
+        "pool_block_counts_c2a",
+        "topk_indices_c1a",
+        "topk_values_c1a",
+        "pool_block_ids_c1a",
+        "pool_block_counts_c1a",
+        "x_hc",
+        "pre_mix"
+      ]
+    }
+  ],
+  "reference_events": [
+    {
+      "epoch": 1794039274.2105875,
+      "event": "ENTER",
+      "scope": "unconditioned",
+      "tokens": 3,
+      "instrumentation": "observational sys.setprofile; no execution/function replacement"
+    },
+    {
+      "epoch": 1794039360.42754,
+      "event": "RETURN",
+      "scope": "unconditioned",
+      "tokens": 3,
+      "instrumentation": "observational sys.setprofile; no execution/function replacement"
+    },
+    {
+      "epoch": 1794039360.9156168,
+      "event": "ENTER",
+      "scope": "staged",
+      "tokens": 3,
+      "instrumentation": "observational sys.setprofile; no execution/function replacement"
+    },
+    {
+      "epoch": 1794039446.1949844,
+      "event": "RETURN",
+      "scope": "staged",
+      "tokens": 3,
+      "instrumentation": "observational sys.setprofile; no execution/function replacement"
+    }
+  ],
+  "capsule_before_after_unchanged": true,
+  "NPU_prepares": 0,
+  "scope": "owning original unconditioned plus actual-snapshot staged comparators; not strict whole-history/fullweights equivalence"
+}

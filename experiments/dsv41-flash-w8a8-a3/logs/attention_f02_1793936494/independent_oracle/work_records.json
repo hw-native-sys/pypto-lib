@@ -1,0 +1,11 @@
+[
+  {
+    "id": "f02_oracle-1793936635-1793936866",
+    "start_epoch": 1793936635,
+    "end_epoch": 1793936866,
+    "duration_seconds": 231,
+    "phase": "validate-host",
+    "summary": "Grounded inverse rotary/output cast boundaries in archived rc2; implemented candidate-independent sparse oracle and AST original-source CPU execution; queue task task_20261106_114552_1950517298 exit0 with exact T1/T7/T17 parity and effective missing/forward controls. Artifact-only scope; initial reads before measured epoch uncharged.",
+    "evidence": "logs/attention_f02_1793936494/independent_oracle/REPORT.md; host_results.json; host_queue.log"
+  }
+]

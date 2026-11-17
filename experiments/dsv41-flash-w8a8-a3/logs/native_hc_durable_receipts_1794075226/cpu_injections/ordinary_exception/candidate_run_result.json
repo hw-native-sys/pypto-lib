@@ -1,0 +1,9 @@
+{
+  "role": "candidate",
+  "started_epoch": 1794074952.4307513,
+  "status": "RUN_EXCEPTION",
+  "exception_type": "ValueError",
+  "error": "injected CPU ordinary comparator exception after tensor capture",
+  "traceback": "Traceback (most recent call last):\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/probe.py\", line 183, in execute_pair\n    result = run_impl(fn=module.hc_post_test, specs=specs, golden_fn=golden,\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/check_receipts.py\", line 59, in fake_run\n    ok, detail = kwargs['compare_fn']['output'](actual, expected,\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/receipt_store.py\", line 82, in compare\n    normal_ok, normal_detail = ordinary(actual, expected, **kwargs)\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/check_receipts.py\", line 64, in faulty_ordinary\n    raise ValueError('injected CPU ordinary comparator exception after tensor capture')\nValueError: injected CPU ordinary comparator exception after tensor capture\n",
+  "ended_epoch": 1794074952.5576391
+}

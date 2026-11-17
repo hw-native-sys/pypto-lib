@@ -1,0 +1,26 @@
+{
+  "all_consumed_bytes_unchanged": true,
+  "audit_disposition": "NOT_ACCEPTED_TWO_UNMET_GATES",
+  "audit_identity": {
+    "pid": 3168218,
+    "same_identity_alive": false,
+    "starttick": 106882812
+  },
+  "audit_task": "task_20261108_002821_316722226445",
+  "audit_task_exit": 0,
+  "epoch": 1794069045,
+  "monitor_errors": [
+    "PermissionError(13, 'Permission denied')"
+  ],
+  "native_task_exit": 1,
+  "native_workers": 32,
+  "passed_checks": 281,
+  "recorded_case_identities_absent": 1117,
+  "source45": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "source_NPU_payload_edits": 0,
+  "state": "FINAL_PARK",
+  "unmet_checks": [
+    "native-queue-COMPLETE0",
+    "primary-CLI0-and-no-post-observation-monitor-errors"
+  ]
+}

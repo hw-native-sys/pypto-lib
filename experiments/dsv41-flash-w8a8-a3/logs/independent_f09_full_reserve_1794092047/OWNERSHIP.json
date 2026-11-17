@@ -1,0 +1,8 @@
+{
+  "agent": "/root/reviewer_f09",
+  "review_unit": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_full_reserve_1794092047",
+  "external_prequeue": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_full_capture_reserve_1794091408_launch/prequeue.json",
+  "reserved_work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_full_capture_reserve_1794091408/work",
+  "Root_authorization": "independent source+ONEmetadataresources/default PREQUEUE only; no NPU/grant",
+  "Main18_verified_before_imports": true
+}

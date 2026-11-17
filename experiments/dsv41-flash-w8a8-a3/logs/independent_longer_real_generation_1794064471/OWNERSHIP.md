@@ -1,0 +1,1 @@
+Independent longer actual post-case audit. New own unit; prior13 immutable. Prepare only while nativecase runs; ONEactualCPU waits newNPUterminal+executor externalPOST. No NPU/payload/header/compiler/golden/old100suite execution.

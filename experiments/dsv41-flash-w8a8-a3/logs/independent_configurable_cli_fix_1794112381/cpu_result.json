@@ -1,0 +1,30 @@
+{
+  "status": "PASS_CPU_CLI_DELTA_ONLY",
+  "rows": [
+    {
+      "profile": "ep",
+      "positive_forms": 2,
+      "strict_negative_controls": 12,
+      "new_parent_binding_pass": true,
+      "old_publisher_hash_rejected": true
+    },
+    {
+      "profile": "tp",
+      "positive_forms": 2,
+      "strict_negative_controls": 12,
+      "new_parent_binding_pass": true,
+      "old_publisher_hash_rejected": true
+    }
+  ],
+  "public_prepare": 0,
+  "public_query": 0,
+  "fixture": 0,
+  "compile": 0,
+  "native": 0,
+  "grants_written": 0,
+  "old_native_logic_AST_unchanged": true,
+  "dependency_pins_sha256": "42b3b07abb096d53415aa022592412b7bcd64fdc797e45e39f8af3282694b05c",
+  "queue_source": "/home/pypto-tools/pto-task/app/task-daemon",
+  "queue_source_sha256": "30270cb071b958968e9e0a9d033d8bb227719535b4ae428da6638d6bc01adada",
+  "queue_injection": "only --device DEVICE appended at555-576; other TASKQUEUE fields are environment variables; unknown CLI flags remain rejected"
+}

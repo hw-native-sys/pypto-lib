@@ -1,0 +1,30 @@
+{
+  "status": "PASS_TINY_M02_BINDING_CONTROLS_ONLY",
+  "checks": [
+    "source-header-tokenizer-public-resource-functions-exact-inheritance",
+    "strict-telemetry-CLI-op-accounting-lifecycle-entry-byte-AST-inheritance",
+    "actual-frozen-M02-HC-nativeFAILED-offline31-0-and-fresh-two-signature-bindings",
+    "all-actual-applied-M02-source45-byte-pins",
+    "old-b3e-source-refuses",
+    "new806852-plan-positive-old3dd-negative-no-header-read",
+    "newM01-exact44-preserved-wrongHC-refuses",
+    "missing-HC-refuses",
+    "old-HC-baseline-refuses",
+    "missing-fresh-signature-refuses",
+    "stale611-spec-refuses",
+    "pending-signatures-failclosed",
+    "D77-signature-source-rejects-inmemory-receipt-control",
+    "old-plan-signature-rejects-inmemory-receipt-control",
+    "one-program-only-rejects-inmemory-receipt-control",
+    "outer-and-taskentry-default-refuse-no-allocation-or-grant"
+  ],
+  "source45_sha256": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "metadata_plan_sha256": "806852d5baec99a522f5adc3015bdd204d9ac6b17244a29cb26445cbd55fda89",
+  "checkpoint_header_bytes_read": 0,
+  "tensor_payload_bytes": 0,
+  "signature_compiles": 0,
+  "native_jobs": 0,
+  "actual_grants": 0,
+  "product_edits": 0,
+  "limits": "Fresh independent signatures and Root-accepted bounded HC captured-value math only; no current helper model/prepare/shared-real fit/text/full-parity execution."
+}

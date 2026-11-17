@@ -1,0 +1,32 @@
+[
+  {
+    "label": "count_active",
+    "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/build/count_active",
+    "elapsed_seconds": 9.954537630081177,
+    "metadata": [
+      "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/build/count_active/distributed_meta.json"
+    ],
+    "file_manifest_sha256": "4c226662c16675febc4eea21c4de345a79e6562dc078549df46185212cabfaba",
+    "status": "COMPILE_ONLY_PASS"
+  },
+  {
+    "label": "count_old_physical",
+    "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/build/count_old_physical",
+    "elapsed_seconds": 9.285625457763672,
+    "metadata": [
+      "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/build/count_old_physical/distributed_meta.json"
+    ],
+    "file_manifest_sha256": "484bbb7d6c22475edbb725186e59b9dc1ff32118edfac9fa2dc3a33afc36a414",
+    "status": "COMPILE_ONLY_PASS"
+  },
+  {
+    "label": "decode_capacity2",
+    "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/build/decode_capacity2",
+    "elapsed_seconds": 42.27102494239807,
+    "metadata": [
+      "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/build/decode_capacity2/distributed_meta.json"
+    ],
+    "file_manifest_sha256": "5262e68afa0b53291ed285e31170b3c017674c3c25dfa9aec78eb7fab5777532",
+    "status": "COMPILE_ONLY_PASS"
+  }
+]

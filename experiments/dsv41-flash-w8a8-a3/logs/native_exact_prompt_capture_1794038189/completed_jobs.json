@@ -1,0 +1,50 @@
+[
+  {
+    "task_id": "task_20261107_160340_10500611796",
+    "kind": "CPU-preconditions",
+    "returncode": 0,
+    "stdout": "completed (exit=0)\n",
+    "stderr": "",
+    "epoch": 1794039741.05083
+  },
+  {
+    "task_id": "task_20261107_160407_105194727933",
+    "kind": "native",
+    "returncode": 0,
+    "stdout": "completed (exit=0)\n",
+    "stderr": "",
+    "epoch": 1794039741.22167
+  },
+  {
+    "task_id": "task_20261107_160954_109652910642",
+    "kind": "CPU-capsule-preconditions",
+    "returncode": 0,
+    "stdout": "completed (exit=0)\n",
+    "stderr": "",
+    "epoch": 1794039741.391382
+  },
+  {
+    "task_id": "task_20261107_161044_109851823191",
+    "kind": "CPU-prefix17",
+    "returncode": 0,
+    "stdout": "completed (exit=0)\n",
+    "stderr": "",
+    "epoch": 1794039741.5578508
+  },
+  {
+    "task_id": "task_20261107_162049_244642115300",
+    "kind": "CPU-sampling",
+    "returncode": 0,
+    "stdout": "completed (exit=0)\n",
+    "stderr": "",
+    "epoch": 1794039741.7265134
+  },
+  {
+    "task_id": "task_20261107_162221_245151810610",
+    "kind": "CPU-prefix-final",
+    "returncode": 0,
+    "stdout": "completed (exit=0)\n",
+    "stderr": "",
+    "epoch": 1794039895.262696
+  }
+]

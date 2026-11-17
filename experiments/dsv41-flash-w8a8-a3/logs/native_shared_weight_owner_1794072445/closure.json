@@ -1,0 +1,20 @@
+{
+  "canonical_frees": 4,
+  "cleanup_error": null,
+  "completed_decode_checks": 0,
+  "completed_numerical_negative": 0,
+  "completed_prefill_checks": 1,
+  "end_epoch": 1794072829,
+  "first_error": "ValueError('StackedDeviceTensor only supports whole-shard slicing on the leading dim; got partial slice 0 on axis 1 (shard shape (1, 128, 128))')",
+  "frozen79_unchanged": true,
+  "metadata_CPU_exit": 0,
+  "metadata_CPU_identity_absent": true,
+  "metadata_CPU_task": "task_20261108_013111_33203276489",
+  "native_exit": 1,
+  "native_task": "task_20261108_012738_330997124898",
+  "normal_close": true,
+  "raw_two_locks_released": true,
+  "recorded_native_case_identities_absent": 4,
+  "source45_unchanged": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "state": "FAILED_FINAL_PARK"
+}

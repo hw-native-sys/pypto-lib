@@ -1,0 +1,84 @@
+{
+  "status": "PASS_INDEPENDENT_E40_INTEGER_HEADER_SCHEDULE_ONLY",
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "method": "independent model-axis/source-semantic enumeration; no iter_argument_leaves/meta-tensor/fold/WeightLeaf monkeypatch rerun",
+  "header_files_read": 263,
+  "source_descriptors_checked": 139614,
+  "phases": {
+    "prefill": {
+      "leaf_count": 110368,
+      "initialized_device_bytes": 633997065216,
+      "generated_zero_bytes": 10069016576,
+      "source_read_calls": 164192,
+      "unique_source_keys": 139614,
+      "unique_source_bytes": 557336782272,
+      "cumulative_source_bytes": 745846365184
+    },
+    "decode": {
+      "leaf_count": 110368,
+      "initialized_device_bytes": 633997065216,
+      "generated_zero_bytes": 10069016576,
+      "source_read_calls": 164192,
+      "unique_source_keys": 139614,
+      "unique_source_bytes": 557336782272,
+      "cumulative_source_bytes": 745846365184
+    }
+  },
+  "full57_targets_per_phase": 912,
+  "expert_layers": 40,
+  "target_coverage_no_gaps": true,
+  "config_source_slots": {
+    "C2": [
+      2,
+      8,
+      14
+    ],
+    "C1": [
+      20
+    ],
+    "reindex": [
+      24,
+      28,
+      32,
+      36
+    ]
+  },
+  "Main_snapshot_comparison_equal": true,
+  "Main_snapshot_is_final_candidate": false,
+  "prompt": {
+    "template": "plain",
+    "source": "plain",
+    "thinking_mode": null,
+    "reasoning_effort": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello, world"
+      }
+    ],
+    "rendered": "Hello, world",
+    "ids": [
+      19923,
+      14,
+      2058
+    ],
+    "length": 3,
+    "bos_id": 0,
+    "eos_id": 1,
+    "pad_id": 2,
+    "decode_roundtrip": true,
+    "images": 0
+  },
+  "all16_originalIDs_active": true,
+  "sampling_row": 2,
+  "next_decode_position": 3,
+  "next_C2_logical_physical_row": 1,
+  "tokenizer_files": {
+    "tokenizer.json": "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b",
+    "tokenizer_config.json": "6ac8c8dc065ed118161d02dd532749ae3f52c243deac27872134fae2f50d8547"
+  },
+  "payload_tensor_reads": 0,
+  "NPU": 0,
+  "large_fixture_allocations": 0,
+  "limits": "source/shape/schedule/metadata only; no offset-value domain, payload byte, forward, actual greedy, fit or candidate acceptance"
+}

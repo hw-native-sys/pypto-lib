@@ -1,0 +1,17 @@
+[
+  {
+    "label": "both",
+    "status": "GOLDEN_PASS_PUBLIC_RUN_RETURNED",
+    "seconds": 26.07104802131653
+  },
+  {
+    "label": "idle_rank1",
+    "status": "GOLDEN_PASS_PUBLIC_RUN_RETURNED",
+    "seconds": 22.804858684539795
+  },
+  {
+    "label": "idle_rank0",
+    "status": "GOLDEN_PASS_PUBLIC_RUN_RETURNED",
+    "seconds": 24.074049949645996
+  }
+]

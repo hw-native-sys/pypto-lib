@@ -1,0 +1,51 @@
+{
+  "status": "PASS_FINAL_CPU_SOURCE_METADATA_TINY_REVIEW",
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "all_protected_bundles_verified": {
+    "real_weight_transfer_prepare_1794042741/artifacts.json": {
+      "sha256": "cb07b6a92a1b4f509068a8308f48a0d29960c6d8175572a18d7d1cb50283d723",
+      "files": 46,
+      "all_bytes_verified": true
+    },
+    "native_empty_reservation_1794041910/artifacts.json": {
+      "sha256": "4821819e9d91aa87e0ca6514ef70f1fe221f968e7e93df620b1e65bbf0451290",
+      "files": 77,
+      "all_bytes_verified": true
+    },
+    "native_exact_prompt_capture_1794038189/artifacts_final.json": {
+      "sha256": "99400bf3d9a0a40b4a3d4a2367b094b43a645b50c1c9310cc25eb35bc2d9491e",
+      "files": 1252,
+      "all_bytes_verified": true
+    },
+    "generation_entry_1794035858/artifacts.json": {
+      "sha256": "a37109462df44b9416c7401ced49c881628a0ccbe059e277126e1115c428b1cc",
+      "files": 31,
+      "all_bytes_verified": true
+    },
+    "fit_post_guard_1794037055/artifacts.json": {
+      "sha256": "184fc558f8c08bc5c9f1a839da73b68ce9665f0fdc483632377c99508a38340b",
+      "files": 48,
+      "all_bytes_verified": true
+    },
+    "empty_fit_operation_1794037635/artifacts.json": {
+      "sha256": "f55ce7d59678f0977d466e673e3c0ad0429b5c26cdddf6253bf059cb9630c556",
+      "files": 478,
+      "all_bytes_verified": true
+    }
+  },
+  "known_prior_tiny_CPU_pids": [
+    3224671,
+    3246253,
+    3253526
+  ],
+  "all_absent": true,
+  "all_prior_assigned_CPU_jobs_terminal": true,
+  "observer_profile_attempt_failure_preserved": true,
+  "effective_observer_sha256": "31cd56f5bff3dd6db0f24d47ed2534efbbbe0ec46c68b256b65b0ae3d3eb7892",
+  "observer_cli_sha256": "8fed1c1f6be60e959a8d74f19f83c554b38f7b1b4f34b915ff8deba1a8a57786",
+  "real_tensor_payload_reads": 0,
+  "NPU_jobs": 0,
+  "large_real_allocations": 0,
+  "actual_grant_created": false,
+  "future_data_device_branch": "UNEXECUTED_REQUIRES_NEW_ROOT_GO"
+}

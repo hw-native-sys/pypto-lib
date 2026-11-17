@@ -1,0 +1,14 @@
+{
+  "status": "BOUNDED_COUNT_ACTIVE_PASS_FINAL_PARK",
+  "count_totals": [
+    192,
+    96,
+    192
+  ],
+  "exact_matrix_pass": true,
+  "middle_destination8_receive96_while_local0": true,
+  "full_model_math_pass": false,
+  "future_stage_go": false,
+  "jobs": 0,
+  "shared_writes": 0
+}

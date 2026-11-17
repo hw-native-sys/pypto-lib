@@ -1,0 +1,8 @@
+{
+  "start_epoch": 1794077356,
+  "state": "WAIT_OUTER_FINAL",
+  "source45": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "plan": "806852d5baec99a522f5adc3015bdd204d9ac6b17244a29cb26445cbd55fda89",
+  "signature600manifest": "4ec39ab4506fe6d388fab0d7503f3be4d6b47d72faac0fbbda978f6a473a42a5",
+  "signature_receipt": "3f5441beade418bf307463188a7b5a52c733299cf6dffde0fe501d4df5fbefd4"
+}

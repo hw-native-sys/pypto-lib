@@ -1,0 +1,147 @@
+{
+  "status": "PASS_PUBLIC_MULTI_PROGRAM_CPU_METADATA_MOCK_ONLY",
+  "prepare_forwards_two_programs_one_worker": true,
+  "persistent_false_preserves_fresh_domains": true,
+  "dispatches": [
+    {
+      "program": "prefill",
+      "shape": [
+        2,
+        2,
+        3
+      ],
+      "config_same": true
+    },
+    {
+      "program": "decode",
+      "shape": [
+        2,
+        1,
+        2,
+        3
+      ],
+      "config_same": true
+    },
+    {
+      "program": "decode",
+      "shape": [
+        2,
+        1,
+        2,
+        3
+      ],
+      "config_same": true
+    }
+  ],
+  "fake_base_allocations": 2,
+  "copies": 0,
+  "base_frees": 2,
+  "rejects": [
+    "foreign-owner",
+    "borrowed-zerooffset-free",
+    "view-after-base-free",
+    "ambiguous-multiprogram-call"
+  ],
+  "accepted_static57_shape_dtypes_bytecounts_equal": true,
+  "C1_public_view_adapters": [
+    {
+      "name": "c1a_comp_norm",
+      "prefill": [
+        16,
+        512
+      ],
+      "decode": [
+        16,
+        1,
+        512
+      ]
+    },
+    {
+      "name": "c1a_comp_wkv",
+      "prefill": [
+        16,
+        512,
+        5120
+      ],
+      "decode": [
+        16,
+        1,
+        512,
+        5120
+      ]
+    },
+    {
+      "name": "c1a_idx_k_norm",
+      "prefill": [
+        16,
+        128
+      ],
+      "decode": [
+        16,
+        1,
+        128
+      ]
+    },
+    {
+      "name": "c1a_idx_weights_proj",
+      "prefill": [
+        16,
+        5120,
+        32
+      ],
+      "decode": [
+        16,
+        1,
+        5120,
+        32
+      ]
+    },
+    {
+      "name": "c1a_idx_wk",
+      "prefill": [
+        16,
+        128,
+        512
+      ],
+      "decode": [
+        16,
+        1,
+        128,
+        512
+      ]
+    },
+    {
+      "name": "c1a_idx_wq_b",
+      "prefill": [
+        16,
+        1280,
+        4096
+      ],
+      "decode": [
+        16,
+        1,
+        1280,
+        4096
+      ]
+    },
+    {
+      "name": "c1a_idx_wq_b_scale",
+      "prefill": [
+        16,
+        4096
+      ],
+      "decode": [
+        16,
+        1,
+        4096
+      ]
+    }
+  ],
+  "NPU": 0,
+  "actual_worker_constructors": 0,
+  "compile_calls": 0,
+  "checkpoint_tensor_reads": 0,
+  "scope": "actual public prepare/run/alloc/view methods with CPU fakes; not a native multi-program proof",
+  "own_pid": 3153855,
+  "own_starttick": 106854698
+}

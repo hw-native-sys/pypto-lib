@@ -1,0 +1,8 @@
+{
+  "experiments/dsv41-flash-w8a8-a3/logs/indexer_repair_1793929524/build_output/_jit_lightning_indexer_test_20261106_094714_jbiqoivf/orchestration/lightning_indexer_test.cpp": "b6dddf0bc8a35fd57f41cef520fa79abc21b663392201059cf741957007e8d4c",
+  "experiments/dsv41-flash-w8a8-a3/logs/indexer_repair_1793929524/build_output/_jit_lightning_indexer_test_20261106_094714_jbiqoivf/ptoas/index_scores.cpp": "649eb4c0e52d7e2e4ea8ba1b8e3c1df2a608a1556ce4d876654b454d5d312f74",
+  "experiments/dsv41-flash-w8a8-a3/logs/indexer_repair_1793929524/build_output/_jit_lightning_indexer_full_pool_test_20261106_095053_mjvma1no/orchestration/lightning_indexer_full_pool_test.cpp": "ea715b442ea3e26350a2e8351987fa755cd1fde49ae5297c585212c5d1b1545f",
+  "experiments/dsv41-flash-w8a8-a3/logs/indexer_repair_1793929524/build_output/_jit_lightning_indexer_full_pool_test_20261106_095053_mjvma1no/ptoas/index_scores.cpp": "5335ec7b73697f51d88c8f88beb363b721fcb190398677f1ce2c36782febc0e8",
+  "experiments/dsv41-flash-w8a8-a3/logs/indexer_repair_1793929524/build_output/_jit_lightning_indexer_test_20261106_095041_xr6oflus/orchestration/lightning_indexer_test.cpp": "4b22ea4e5f3b6bae5a14ec9dc5aa38359d350e11cdbca7c59332b0fae10f7596",
+  "experiments/dsv41-flash-w8a8-a3/logs/indexer_repair_1793929524/build_output/_jit_lightning_indexer_test_20261106_095041_xr6oflus/ptoas/index_scores.cpp": "1bb57152fdfe804461ba45cc32cc5310be6fca316a20198ac2998945c0ed083f"
+}

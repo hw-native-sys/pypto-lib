@@ -1,0 +1,11 @@
+当前可用设备白名单: 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 (静态配置 /home/pypto-tools/pto-task/app/../config/taskqueue.conf)
+
+=== Auto 设备策略来源 ===
+  运行时覆盖 未设置  /home/pypto-tools/pto-task/state/available_devices
+  静态配置   [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15] (16 张)  /home/pypto-tools/pto-task/app/../config/taskqueue.conf
+  自动探测   [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15] (16 张)  /dev/davinci*（当前未采用）
+  全局生效池 [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15] (16 张)  来源=config:/home/pypto-tools/pto-task/app/../config/taskqueue.conf
+  卡组拓扑   未设置  DEVICE_GROUPS@/home/pypto-tools/pto-task/app/../config/taskqueue.conf（同组约束无从生效）
+  环境卡组   未设置
+  仓库配置   从 /mnt/data/pyptouser/yangyaodong/code/pypto-lib 向上搜索，未找到 task-submit.conf
+  最终 auto 候选 [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15] (16 张)

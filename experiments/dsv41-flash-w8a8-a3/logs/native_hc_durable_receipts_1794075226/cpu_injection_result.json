@@ -1,0 +1,80 @@
+{
+  "status": "PASS_CPU_FAILURE_INJECTION",
+  "started_epoch": 1794074950.4098933,
+  "ended_epoch": 1794074952.6928642,
+  "torch": "2.14.1+cpu",
+  "NPU_execution": false,
+  "signature_recompile": false,
+  "unchanged_functions": [
+    "sha",
+    "write",
+    "verify_sources",
+    "function",
+    "bitwise",
+    "fixtures",
+    "original_expected",
+    "old_or_new_golden",
+    "cpu_check",
+    "load_module",
+    "compile_only"
+  ],
+  "preserved_acceptance_asserts": [
+    "'ONBOARD' in str(cfg.execution_mode)",
+    "sha(HERE / name) == digest",
+    "len(seen) == 1",
+    "result.passed == (current_role == 'candidate')",
+    "seen[0]['different_values'] > 0 and seen[0]['nonrepresentable_values'] > 0"
+  ],
+  "cases": [
+    {
+      "scenario": "success_control",
+      "status": "EXPECTED_CPU_RESULT",
+      "caught": null,
+      "durable_tensor_pairs": 2,
+      "durable_final_receipt": true,
+      "final_status": "PASS"
+    },
+    {
+      "scenario": "candidate_bad",
+      "status": "EXPECTED_CPU_RESULT",
+      "caught": "AssertionError",
+      "durable_tensor_pairs": 1,
+      "durable_final_receipt": true,
+      "final_status": "FAILED"
+    },
+    {
+      "scenario": "old_BF16_wrong_assert",
+      "status": "EXPECTED_CPU_RESULT",
+      "caught": "AssertionError",
+      "durable_tensor_pairs": 2,
+      "durable_final_receipt": true,
+      "final_status": "FAILED"
+    },
+    {
+      "scenario": "runtime_exception_old",
+      "status": "EXPECTED_CPU_RESULT",
+      "caught": "RuntimeError",
+      "durable_tensor_pairs": 1,
+      "durable_final_receipt": true,
+      "final_status": "FAILED"
+    },
+    {
+      "scenario": "ordinary_exception",
+      "status": "EXPECTED_CPU_RESULT",
+      "caught": "ValueError",
+      "durable_tensor_pairs": 1,
+      "durable_final_receipt": true,
+      "final_status": "FAILED"
+    },
+    {
+      "scenario": "missing_comparator",
+      "status": "EXPECTED_CPU_RESULT",
+      "caught": "AssertionError",
+      "durable_tensor_pairs": 0,
+      "durable_final_receipt": true,
+      "final_status": "FAILED"
+    }
+  ],
+  "current_producer45": "b3e19fd001c74f7a5b497c791c01924ca09c0678df66114fce599e890d8fee06",
+  "claim": "CPU fake-run evidence durability only; failed native old discrepancy still UNKNOWN."
+}

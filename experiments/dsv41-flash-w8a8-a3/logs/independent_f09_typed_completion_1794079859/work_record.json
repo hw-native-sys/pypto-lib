@@ -1,0 +1,19 @@
+{
+  "record_id": "reviewer_f09-typed207-independent-signatures-1794079859",
+  "role": "review-agent",
+  "measured_start_epoch": 1794079859,
+  "measured_end_epoch": 1794080218,
+  "interval_scope": "Independent frozen207 source/docs/callsite review, one authorized zero-sample compile job, generated source and ABI review, report and seal.",
+  "shared_writes": 0,
+  "live_source_writes": 0,
+  "old_artifact_writes": 0,
+  "task_ids": ["task_20261108_033145_97507819480"],
+  "task_exit": 0,
+  "successful_signature_compiles": 3,
+  "native_calls": 0,
+  "tensor_samples": 0,
+  "model_fixture_calls": 0,
+  "payload_bytes_created": 0,
+  "disposition": "PASS_SOURCE_AND_SIGNATURES_ONLY; NO_NATIVE_ACCEPTANCE; FINAL_PARK",
+  "root_imports_shared_ledgers": true
+}

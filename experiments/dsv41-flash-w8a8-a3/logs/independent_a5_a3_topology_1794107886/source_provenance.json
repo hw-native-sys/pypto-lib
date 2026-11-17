@@ -1,0 +1,43 @@
+{
+  "kind": "READ_ONLY_SOURCE_SNAPSHOT_NOT_TEST",
+  "A3_baseline_B45": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+  "A3_math_A8153": "8153c7f040bef51900a6e6c9ff27b018279b7503f31d50ec5488457e49770b28",
+  "A3_generate_B_snapshot": "experiments/dsv41-flash-w8a8-a3/logs/f09_application_plan_1794094863/target/generate.py",
+  "Main_evolving_topology_implementation_reviewed": false,
+  "A5_current_files_digest_snapshot_at_seal_only": true,
+  "paths": {
+    "models/deepseek_v4_1_flash/config.py": "25d1ee3545cb4b7513ea5fff77da3e576256d8ea6b47babecd9404647bb16b0b",
+    "models/deepseek_v4_1_flash/decode_fwd.py": "b87a29e9ab68a7b0b362c821b689d34451dc45df38c55bd8fc67a5de1b27ba14",
+    "models/deepseek_v4_1_flash/prefill_fwd.py": "fc6b45871fc8afb1d75f80e12ae9269bc33d5c60d3824026e4e2e9d2359e7126",
+    "models/deepseek_v4_1_flash/prefill_layer.py": "3c8c84c010d7255daef74777893ad2b1841453bd2ada9f78569a2b59043d2477",
+    "models/deepseek_v4_1_flash/decode_layer.py": "4fe9592e56cb4cd40bcec01dd3c3cf4e76365ccb3728e2f36d251e5bf52d7488",
+    "models/deepseek_v4_1_flash/decode_moe.py": "6f7c558a92b6e75ec7905a1349164eaf8c4e84a3bdbcecfeed4d70194f8c1d77",
+    "models/deepseek_v4_1_flash/decode_c2a_full.py": "92659cdc2049edb632906c37996586c5001152b92cb336d0e11d682e47558e25",
+    "models/deepseek_v4_1_flash/lm_head.py": "8c9db5837e077bbb38fd3368fd9018174376c4b92e62db0feda4aff48c6bab0e",
+    "models/deepseek_v4_1_flash/dspark_attention.py": "a5d91a00b7d461d94cf7ab93716bf2d73be43cbe2f22a42fd80290e5631ee0d3",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/model/config.py": "e0542e042be6019f51ec367801565bd9fc8a48ecddd00ce980d60659e638ff19",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/model/decode_fwd.py": "db733af729160a1b7c02ecc6bcad88ad01199eedbe29144cdfc0e4ca7b84af3b",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/model/prefill_fwd.py": "cd3c06ee8b449d6a17cc519aec1aefcd0dbdee0a61a65cf957797fe2602057f8",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/model/layer_reference.py": "fa80a548d28b07f8ff90bdaa8fd311d9d188352bd0246cef7b59b15321010b3b",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/model/moe_exchange.py": "294385aa179fd083ee79a6db0603416b92cd36e7b7ea71e82d0e87a536e6c640",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/model/weight_loader.py": "70244d047e4705dfe5f7101c5dc046b6f66d146027241524bb4d494823fcfe5f",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/model/tp_reduce.py": "fbbf2e0b758b9889efd526a19c64fb0364f1dcf9abe3a8bb5da691935c4d909f",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/model/embedding.py": "13f69fed957c9d184c2881e5dbd73316359b5e949d56bba33325350e203a46e0",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/model/lm_head.py": "aa1c25b5a23457b17e126b106285767dcaa0ec2df57dff548c2b65003fbb8075",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/model/attention.py": "baa7456926bd64bf5ab14c08cf6a4e2040059be8d117778fd10b460694f466ff",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/model/indexer.py": "5568b7aae5f43c9f0e335161b9103aa483e2a3606b94473fd6194994f93bc8b4",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/model/moe_gate.py": "040019c27390f3bc5355af1b1964c19dc3ec347a6e719fe795adedc047b4f872",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/source45_rebased_UNAPPLIED.json": "8153c7f040bef51900a6e6c9ff27b018279b7503f31d50ec5488457e49770b28",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_application_1794097608/source45.json": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_application_plan_1794094863/target/generate.py": "5de1656a99e85699138879b2f577f4eed2639779937a7cdc91ae843fcef6e34c",
+    "docs/models/deepseek_v4_1_flash/index.md": "6c2e9c02ab418730ad7c174761786403da848fff455e81b4e76edef4b6d57562"
+  },
+  "no_model_runtime_import_or_test": true,
+  "smaller_EP_findings": [
+    "COUNT_PAD32 smaller than N_LOCAL",
+    "floor EP*capacity/16 per-expert slab chunks"
+  ],
+  "indexer_replication_precision": "all32heads remain replicated; early extra divisibility note superseded",
+  "EP8_routed_only_bytes_source_formula": 68022435840,
+  "measured_new_fit_or_peak": false
+}

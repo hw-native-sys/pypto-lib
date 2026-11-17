@@ -1,0 +1,83 @@
+worker-4 Engram evidence note (2026-11-03)
+
+1. Engram n-gram hash derivation: NOT DERIVABLE FROM LOCAL MATERIAL
+
+Searches executed (pypto-lib root, excluding build_output):
+  grep -rn "hash_ids|ngram|n_gram|hash(" models docs examples tests --include=*.py --include=*.md
+  grep -rn "engram" /mnt/data/models/DeepSeek-V4.1-Flash-w8a8/README.md \
+       Aurora_best_practice.yaml encoding/README.md encoding/encoding.py
+  find /mnt/data/pyptouser -path "*site-packages/transformers/models*" -iname "*deepseek*"
+
+Findings:
+- models/deepseek_v4_1_flash/engram.py exposes `engram(hash_ids, engram_table,
+  wkv_weight, weight, x, out)` and `N_HASH_COLS = (max_ngram_size - 1) * n_heads`
+  = 24.  It consumes hash ids; it never computes them.
+- The A5 fixture `build_tensor_specs()` fills `hash_ids` with
+  `torch.randint(0, table_rows, (tokens, N_HASH_COLS))`; no production derivation.
+- No other pypto-lib model, doc, example or test contains an n-gram hash function.
+- MODEL_ROOT/README.md says "Engram hash, projection, gate and V rotation
+  contract remains unchanged" -- i.e. the hash contract is external to the
+  shipped checkpoint; README/Aurora describe storage only (int8_sym group 32,
+  fp32 scales, bf16 output) and the rotation fold.
+- MODEL_ROOT/encoding/encoding.py is the prompt-format reference and does not
+  mention Engram.
+- The installed transformers tree only has `deepseek_v3` (no DeepSeek-V4.1
+  modeling code with an Engram hash implementation).
+- config.json supplies the hash *shape* inputs (engram_max_ngram_size=4,
+  engram_n_heads=8, engram_vocab_size=16,000,000, engram_pad_token_id=2,
+  engram_compressed_vocab_size=99,092, two tables of 384,006,168 / 384,016,682
+  rows) but no hash formula or salt.
+
+Conclusion: the row-id mapping from token ids cannot be reproduced from local
+artifacts.  generate.py reports a contract gap and offers two user choices:
+
+  (a) --engram-mode zero-diagnostic
+      Zero the host lookup rows.  Since kv = lookup @ W = 0, the gate is
+      sigmoid(0) = 0.5 and value = 0, so the Engram residual added to layers
+      1/14 is exactly zero.  This is DIAGNOSTIC-ONLY: it changes model
+      semantics (Engram memory disabled) and must never be reported as a real
+      checkpoint generation result.  Recorded as diagnostic_only=true in the
+      result JSON.
+
+  (b) --engram-hash-ids <path>
+      User-supplied n-gram hash spec: dict layer -> int64 tensor [rows, 24]
+      covering the generated positions.  The driver validates ids against the
+      table row counts and gathers rows through HostEngramTable.row (no full
+      table load).
+
+2. Engram FLOAT projections: CONFIRMED A5-MATCHING
+
+Checkpoint headers: layers.{1,14}.engram.wkv.weight = [25600, 6144] BF16 =
+[KV_OUT, ENGRAM_K]; q_weight/k_weight = [4, 5120] (transposed to elementwise
+product [4, 5120] F32).
+
+- A3 composition: WeightLoader returns wkv as-is [25600, 6144] and engram_qk =
+  q_weight * k_weight.  compressor.bf16_project documents a logical [out, in]
+  weight and uses b_trans=True, i.e. lookup[T,6144] @ W[25600,6144]^T ->
+  [T,25600].
+- A5 composition: its loader transposes the same tensor to [ENGRAM_K, KV_OUT] =
+  [6144, 25600] and computes lookup @ weight -> [T,25600]; engram_gate takes the
+  same q*k fold.
+Both stacks compute the same projection; only the storage layout differs.
+
+Host evidence (generate.py --dry-run):
+  [GENERATE][engram-float] layer=1  wkv=[25600, 6144] bfloat16 qk=[4, 5120] q*k=True sha1=965ebb59835483fb
+  [GENERATE][engram-float] layer=14 wkv=[25600, 6144] bfloat16 qk=[4, 5120] q*k=True sha1=374305ea913a1b92
+
+Residual documented gap (not changed by worker-4): WEIGHT_MANIFEST records that
+the Engram gate input still needs `h_rot @ Q.T` because q_weight/k_weight are in
+the original basis (checkpoint README, engram_rotation_config
+key_and_gate_basis="original").  The A3 engram_gate applies engram_qk directly to
+the rotated residual stream; that basis composition remains an open model-side
+item independent of the hash function.
+
+3. Prompt format
+   generate.py now renders `chat`/`encoding` through MODEL_ROOT/encoding/
+   encoding.py and reproduces all five shipped test pairs byte-exactly with the
+   shipped tokenizer round-trip:
+     case 1: 2363 chars / 548 tokens
+     case 2:  250 chars /  40 tokens
+     case 3: 2241 chars / 579 tokens
+     case 4:  306 chars / 101 tokens
+     case 5:  280 chars /  74 tokens (2 image placeholders; text-only run refused)
+   Command: python models/deepseek_v4_1_flash_a3_w8a8/generate.py --prompt-fixtures

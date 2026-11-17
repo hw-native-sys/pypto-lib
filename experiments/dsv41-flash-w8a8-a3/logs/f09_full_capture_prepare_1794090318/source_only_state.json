@@ -1,0 +1,11 @@
+{
+  "live_M02_sha256": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "all45_live_files_match": true,
+  "canonical405": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "work_exists": false,
+  "prequeue_exists": false,
+  "Main_imports_or_tests": false,
+  "fullentry_manifest": "5262e68afa0b53291ed285e31170b3c017674c3c25dfa9aec78eb7fab5777532",
+  "fullentry_metadata": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770",
+  "oldcontrol_Root_accepted_receipt": "70f485895064d3319d4aa1c44aded2bb51a407ba56e1432bc70a143fa2a37c5d"
+}

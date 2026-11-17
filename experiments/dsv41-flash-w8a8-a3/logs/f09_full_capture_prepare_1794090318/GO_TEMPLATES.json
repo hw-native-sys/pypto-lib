@@ -1,0 +1,38 @@
+{
+  "native": {
+    "schema": "Root-F09-fullentry-operation/1",
+    "approved": false,
+    "native16_authorized": false,
+    "count_controls_accepted": false,
+    "stage": "full-capture",
+    "requested_profile": "decode_capacity2",
+    "pins_sha256": "8be91dde598ac894cb5be3ed3f5927a736931a8fb3bec3fff7dc4aac3b5f084e",
+    "prequeue_sha256": null,
+    "lifecycle_acceptance": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/root_f09_count_probe_rank_acceptance_1794089142.json",
+    "lifecycle_acceptance_sha256": "e76b9984db86a27c3c1b4ebd32ab7de97af91357af4c6784746e5e9a3ade0ffa",
+    "source_manifest_sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+    "work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_full_capture_1794090318/work",
+    "root_go_id": null,
+    "expires_at_epoch": 0,
+    "scope": "FALSE_EXPIRED_PREPARATION_TEMPLATE_ONLY_NO_GRANT"
+  },
+  "cpu": {
+    "schema": "Root-F09-fullentry-operation/1",
+    "approved": false,
+    "native16_authorized": false,
+    "count_controls_accepted": false,
+    "stage": "full-offline",
+    "requested_profile": "decode_capacity2",
+    "pins_sha256": "8be91dde598ac894cb5be3ed3f5927a736931a8fb3bec3fff7dc4aac3b5f084e",
+    "prequeue_sha256": null,
+    "lifecycle_acceptance": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/root_f09_count_probe_rank_acceptance_1794089142.json",
+    "lifecycle_acceptance_sha256": "e76b9984db86a27c3c1b4ebd32ab7de97af91357af4c6784746e5e9a3ade0ffa",
+    "source_manifest_sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+    "work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_full_capture_1794090318/work",
+    "root_go_id": null,
+    "expires_at_epoch": 0,
+    "scope": "FALSE_EXPIRED_PREPARATION_TEMPLATE_ONLY_NO_GRANT",
+    "native_task_id": null,
+    "native_raw16_cleanup_audit_pass": false
+  }
+}

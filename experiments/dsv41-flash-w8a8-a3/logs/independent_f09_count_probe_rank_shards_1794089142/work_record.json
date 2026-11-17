@@ -1,0 +1,12 @@
+{
+  "agent": "/root/reviewer_f09",
+  "start_epoch": 1794089142.6472263,
+  "end_epoch": 1794089395.8124542,
+  "elapsed_seconds": 253.16522789001465,
+  "cpu_task": "task_20261108_060741_168971624009",
+  "checker_seconds": 0.49300360679626465,
+  "shared_writes": 0,
+  "NPU_tasks": 0,
+  "ownjobs": 0,
+  "status": "FINAL_PARK"
+}

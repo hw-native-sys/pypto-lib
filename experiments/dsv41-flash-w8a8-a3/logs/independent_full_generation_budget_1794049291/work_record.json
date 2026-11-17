@@ -1,0 +1,56 @@
+{
+  "record_id": "independent-full-generation-budget-1794049291-1794052040",
+  "role": "review-agent",
+  "start_epoch": 1794049291,
+  "end_epoch": 1794052040,
+  "elapsed_seconds": 2749,
+  "waiting_included": true,
+  "status": "FINAL/PARK after this CPU collector completes",
+  "scope": "noEngram; independent resource/cleanup/cadence/durability CPU/source proposal review",
+  "prior_jobs": {
+    "task_20261107_191233_338488820834": "completed (exit=0)",
+    "task_20261107_191018_337916919090": "completed (exit=0)",
+    "task_20261107_194238_34599812092": "completed (exit=0)",
+    "task_20261107_193339_34364495432": "completed (exit=0)",
+    "task_20261107_190729_337194915904": "completed (exit=0)"
+  },
+  "all_prior_jobs_terminal0": true,
+  "protected_evidence": {
+    "full_real_generation_prepare_1794048884": {
+      "manifest_sha256": "3be79eba56628bf610baec131680ea1bb7fa276af2123873475a2fa591a680fc",
+      "files": 32,
+      "unchanged": true
+    },
+    "generation_admission_durability_1794051220": {
+      "manifest_sha256": "4b5e8de462dc6064ad4aa833033c4b493042597902599a681dbfec6fe8e104d6",
+      "files": 10,
+      "unchanged": true
+    },
+    "native_real_transfer_1794047567": {
+      "manifest_sha256": "767f72dd7d9c3e5573fb62892933ca530506ea123883cb959d53020527995fa9",
+      "files": 34,
+      "unchanged": true
+    },
+    "native_empty_reservation_1794041910": {
+      "manifest_sha256": "4821819e9d91aa87e0ca6514ef70f1fe221f968e7e93df620b1e65bbf0451290",
+      "files": 77,
+      "unchanged": true
+    },
+    "generation_entry_1794035858": {
+      "manifest_sha256": "a37109462df44b9416c7401ced49c881628a0ccbe059e277126e1115c428b1cc",
+      "files": 31,
+      "unchanged": true
+    }
+  },
+  "source45_unchanged": true,
+  "candidate_sha256": "d057012464331b10b0bdc7f406925ee0c552dd298a1db171a93b0b1595769598",
+  "candidate_status": "UNAPPLIED",
+  "disposition": "PASS scoped proposal; actual apply/payload/NPU require separate Root assignment",
+  "NPU_jobs": 0,
+  "checkpoint_tensor_payload_bytes": 0,
+  "large_fixtures": 0,
+  "product_edits": 0,
+  "shared_ledger_writes": 0,
+  "full_upload_forward_peaks": null,
+  "production_hard_guard": "HELD/unchanged"
+}

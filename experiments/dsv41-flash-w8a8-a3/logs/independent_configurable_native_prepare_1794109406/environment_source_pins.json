@@ -1,0 +1,8 @@
+{
+  "pypto_HEAD": "38a8aa6da24c62bf0c6f6f9ef94deb513fbb4d2e",
+  "simpler_HEAD": "31f9e72ee6832cd198b77df18c1c305e7fd83676",
+  "runtime_public_api_source": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/pypto/runtime/distributed_runner.py",
+  "runtime_public_api_sha256": "ca496829a240c81df3c29e77d8ef696bd1e2a7b0f31b9d5c2dcb3b3d82923148",
+  "mode": "all signature configs normalized ONBOARD/a2a3/ring4GiB/subworkers0",
+  "device_queries": 0
+}

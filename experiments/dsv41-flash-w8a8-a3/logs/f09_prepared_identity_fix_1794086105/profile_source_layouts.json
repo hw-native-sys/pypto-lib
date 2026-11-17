@@ -1,0 +1,41 @@
+[
+  {
+    "profile": "count_active",
+    "registrations": 32,
+    "cores": [
+      "aic",
+      "aiv"
+    ],
+    "unsupported_include_external_layout": false,
+    "status": "SOURCE_ONLY_NOT_PREPARED",
+    "config_hashes": {
+      "next_levels/probe_rank/kernel_config.py": "2dc959de442f2c85d546d2280645a638fc7773909b21ba02c7618f8e2da7e41b"
+    }
+  },
+  {
+    "profile": "count_old_physical",
+    "registrations": 32,
+    "cores": [
+      "aic",
+      "aiv"
+    ],
+    "unsupported_include_external_layout": false,
+    "status": "SOURCE_ONLY_NOT_PREPARED",
+    "config_hashes": {
+      "next_levels/probe_rank/kernel_config.py": "2dc959de442f2c85d546d2280645a638fc7773909b21ba02c7618f8e2da7e41b"
+    }
+  },
+  {
+    "profile": "decode_capacity2",
+    "registrations": 119,
+    "cores": [
+      "aic",
+      "aiv"
+    ],
+    "unsupported_include_external_layout": false,
+    "status": "SOURCE_ONLY_NOT_PREPARED",
+    "config_hashes": {
+      "next_levels/decode_fwd_rank/kernel_config.py": "1eae0edc03e9fa7d7c2cb41149c469174808e3187695428fc2e23f66dd2b47e0"
+    }
+  }
+]

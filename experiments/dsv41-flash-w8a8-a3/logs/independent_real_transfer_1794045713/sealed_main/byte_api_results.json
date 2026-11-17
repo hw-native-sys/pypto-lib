@@ -1,0 +1,12 @@
+{
+  "status": "PASS_ACTUAL_PUBLIC_METHOD_CPU_SPY",
+  "offset_unit": "BYTES independent ofFP32elementsize4",
+  "H2D_dst": 28,
+  "H2D_src": 12,
+  "D2H_src": 28,
+  "D2H_dst": 8,
+  "nbytes": 20,
+  "staging_released_before_return": true,
+  "real_runtime_objects": 0,
+  "NPU": 0
+}

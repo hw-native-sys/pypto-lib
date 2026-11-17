@@ -1,0 +1,206 @@
+{
+  "resources": [],
+  "allocations": [],
+  "cleanup_errors": [],
+  "prewarm": [
+    {
+      "rank": 0,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 1,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 2,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 3,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 4,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 5,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 6,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 7,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 8,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 9,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 10,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 11,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 12,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 13,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 14,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 15,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    }
+  ],
+  "status": "FAIL",
+  "compute_dispatches": 0,
+  "payload_bytes": 0,
+  "error": "Refused: fresh owner free baseline regressed after largest phase close",
+  "after_free_before_close": [
+    {
+      "rank": 0,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 1,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 2,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 3,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 4,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 5,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 6,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 7,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 8,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 9,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 10,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 11,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 12,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 13,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 14,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    },
+    {
+      "rank": 15,
+      "free": 68650270720,
+      "total": 74088185856,
+      "committed": 5368709120
+    }
+  ],
+  "owner_closed": true
+}

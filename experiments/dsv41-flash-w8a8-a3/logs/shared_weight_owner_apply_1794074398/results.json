@@ -1,0 +1,65 @@
+{
+  "status": "PASS_APPLIED_TINY_CPU_ONLY",
+  "applied_generate_sha256": "fba8a4ef9a06f694fa53278bb80ae2ad70d111336dbead938ab9f8511d27e16e",
+  "source45_sha256": "b3e19fd001c74f7a5b497c791c01924ca09c0678df66114fce599e890d8fee06",
+  "owner": {
+    "one_prepare": true,
+    "successful_programs": [
+      "prefill",
+      "decode",
+      "decode",
+      "decode"
+    ],
+    "successful_base_handles": 4,
+    "successful_H2D_bytes": 32,
+    "successful_source_reads": 4,
+    "decode_H2D_bytes": 0,
+    "decode_source_reads": 0,
+    "normal_free_exact_once": true,
+    "early_shared_IO_actual_handoff": true,
+    "primary_error_preserved": true,
+    "public_view_free_methods": true,
+    "toy_fixture_only_not_actual_grant": true
+  },
+  "default_HARD": true,
+  "legacy_trace": [
+    "legacy-prepare",
+    "legacy-call",
+    "legacy-close"
+  ],
+  "new_shared_accounting_trueint_and_negative_controls": true,
+  "other44_unchanged": true,
+  "unchanged_host_functions": [
+    "greedy_sample",
+    "build_prefill_inputs",
+    "build_decode_state",
+    "advance_decode_inputs",
+    "handoff_to_decode",
+    "query_rope_inputs",
+    "make_run_config",
+    "scalar_dispatch_value",
+    "streaming_weight_source",
+    "HbmSampler"
+  ],
+  "compile_entry_relation_unchanged": [
+    "compile_entry",
+    "reload_compiled",
+    "build_entry_contracts",
+    "load_entries",
+    "make_run_config"
+  ],
+  "protected_frozen_bundles": {
+    "shared_weight_owner_draft_1794068025": {
+      "manifest_sha256": "a984e4225975cec7e4b7b55dd92276aaab7433d848631958af4eeaacef850581",
+      "file_count": 25
+    },
+    "hc_bf16_boundary_draft_1794071285": {
+      "manifest_sha256": "5a2ccfb048c16742248c158708711d8ac6bd7e3ae586528336d5065b1d02586f",
+      "file_count": 17
+    }
+  },
+  "compile": false,
+  "NPU": false,
+  "real_payload_bytes": 0,
+  "full_constructor_positive_actual_grant": false
+}

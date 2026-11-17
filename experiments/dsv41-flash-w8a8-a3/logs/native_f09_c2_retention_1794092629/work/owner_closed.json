@@ -1,0 +1,19 @@
+{
+  "normal_close": true,
+  "primary_error": null,
+  "cleanup_errors": [],
+  "records": 3,
+  "records_returned_by_drive": 3,
+  "durable_post_dispatch_records": [
+    "call0.json",
+    "call1.json",
+    "call2.json"
+  ],
+  "retention_validated_call_records": [
+    "call0.json",
+    "call1.json",
+    "call2.json"
+  ],
+  "checkpoint_record_errors": [],
+  "source_manifest": "8153c7f040bef51900a6e6c9ff27b018279b7503f31d50ec5488457e49770b28"
+}

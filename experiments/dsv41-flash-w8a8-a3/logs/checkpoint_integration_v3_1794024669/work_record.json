@@ -1,0 +1,11 @@
+{
+  "record_id": "main-v3-final-1794025377-1794026054",
+  "agent": "/root/main_native",
+  "start_epoch": 1794025377,
+  "end_epoch": 1794026054,
+  "elapsed_seconds": 677,
+  "kind": "measured_wall_interval",
+  "status": "PARKED",
+  "prior_Main_block": "1794024669\u20131794025377 already recorded; no overlap",
+  "NPU": 0
+}

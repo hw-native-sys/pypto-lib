@@ -1,0 +1,18 @@
+{
+  "schema": "offset-source-observations/1",
+  "records": [
+    {
+      "schema": "offset-source-observation/1",
+      "epoch": 1794047876.370325,
+      "evidence_scope": "ACTUAL_DEVICE_BOUNDED_TRANSFER",
+      "key": "layers.1.ffn.experts.1.w1.weight_offset",
+      "numel": 2304,
+      "dtype": "torch.float32",
+      "nonzero_elements": 0,
+      "original_source_sha256": "2d07a41ae992770085117e9815300bfd0730745883e60b24aaad5e69dfc087ae",
+      "status": "OBSERVED_RETURNED_SOURCE_SCALAR",
+      "transport_sha256": "5e364da73ac36d59bce09f92dc4efb8501e900175fc91afc08f91cf0da9dfbb5",
+      "observer_sha256": "31cd56f5bff3dd6db0f24d47ed2534efbbbe0ec46c68b256b65b0ae3d3eb7892"
+    }
+  ]
+}

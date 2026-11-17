@@ -1,0 +1,19 @@
+{
+  "NEXT_COMMANDS.md": "a2aa6e0bfe6324ed9ae167d3bc5ab04f0944d4c666ace5d4c6454cea4028a2c2",
+  "OWNERSHIP.md": "549fde2e574d3dc1cda8b3877ec23c5a26dbd41e1a99ca3a2ecedfb5c5766d4c",
+  "PARK.json": "06aba44cf2e6cfb6f4ea82cfaa67818fe142bb70485ecd061de75311dc86f060",
+  "REPORT.md": "9c533dc9cce5751b4cd34a02bdc3350bc8d2795bf9f860afda70a98897255308",
+  "application.log": "a7fb65d882f15f5b11661038dc7464e8693b395d9ade372a896e8e4696bfa796",
+  "applied.patch": "366ed05e9b51f26771cb4e63beedb1fa2f8049019e2685ba529dc85571002c8e",
+  "check_applied.py": "b2391c15e80f4c14015e21370a483c7f77f6cbe343729c9c8b19302cbb6a3b31",
+  "cpu_queue.log": "ebd5d9ae538ac2a855dc71db31873475532db02d2af2754d6d332741d7ed66dc",
+  "docs_after.json": "146de19ef50f2556f8927490ad3196ae9672576ef996de5dd873ee433f24ae35",
+  "finalize.py": "9c607d2e12df091fb1b9ce57d73e8baff0cc0bcf6e57e3bb7f26964a0bcac571",
+  "generate.applied.py": "fba8a4ef9a06f694fa53278bb80ae2ad70d111336dbead938ab9f8511d27e16e",
+  "generate.before.py": "41651e5af3b94223b645d4bfb52010e52ea7350aa3f3637cbcca6e29e093e609",
+  "inheritance.json": "51d105ae4fc9a7b0b1b33285e8217feefcd989fe96a6273bceea9ff6efeb7c95",
+  "results.json": "163de474f06e11e2beb49c0f3b8ed7c36b743447bf96f339673dbf00ec2fe611",
+  "source45.json": "b3e19fd001c74f7a5b497c791c01924ca09c0678df66114fce599e890d8fee06",
+  "source45_predecessor_CC.json": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "work_record.json": "d623b86444a05b33bf42a7a492dfbf75aaff804a6bce2541ca9e3a96be16fa98"
+}

@@ -1,0 +1,20 @@
+{
+  "schema": "checkpoint-exact-reference-policy/1",
+  "approved": true,
+  "purpose": "INDEPENDENTLY_REVIEWED_CPU_REFERENCE",
+  "bridge_sha256": "c1f942c90ccb4fbec3fe3e3852b51ac64c616f1607076b55f486a30864026834",
+  "producer_manifest_sha256": "ab1ced6d6ecbf9887297458703ba9b74e2c9b8bc57608370b4c2e0310e027e37",
+  "derived_receipt_sha256": "8ceac8fcab327b6e31b8016b9b66b60d11f64d2bb493fbb6f9b7c666eb05f778",
+  "independent_review": {
+    "status": "PASS_CPU_REVIEW",
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_v3_1794026427/REVIEW.md",
+    "sha256": "ca8438f0608ed9cdaa28448a754b60194b67be9f79a910fb667c5bd451a7cd58"
+  },
+  "mathematical_review": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/REVIEW.md",
+    "sha256": "b744c1341c9f5caa2a389c7e629ed815949eb4df7ffbc629206bad15489eb068"
+  },
+  "authorizer": "observer /root conditional CPU17 directive received1794027615",
+  "action_scope": "CPU OFFLINE PREFIX validate ONLY after completed durable native capture; no decode action authorized",
+  "preserved_numerics": "original unconditioned then staged17/directpoolcounts/unchanged thresholds; no candidate-derived expected"
+}

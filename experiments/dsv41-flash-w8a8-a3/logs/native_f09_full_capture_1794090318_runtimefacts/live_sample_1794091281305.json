@@ -1,0 +1,26 @@
+{
+  "observed_epoch": 1794091281.305653,
+  "scope": "bounded passive sample, no full history/PSS",
+  "known_descendants": [
+    {
+      "pid": 1783150,
+      "ppid": 1782904,
+      "starttick": "109115658",
+      "comm": "python"
+    },
+    {
+      "pid": 1783176,
+      "ppid": 1783150,
+      "starttick": "109115710",
+      "comm": "python"
+    },
+    {
+      "pid": 1783229,
+      "ppid": 1783176,
+      "starttick": "109115832",
+      "comm": "python"
+    }
+  ],
+  "ready_log_count": 0,
+  "ready_observed": []
+}

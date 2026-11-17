@@ -1,0 +1,13 @@
+{
+  "state": "FINAL_PARK_COMBINED_HOST_READINESS_PASS",
+  "epoch": 1794084273,
+  "artifact_count": 34,
+  "artifacts_sha256": "934407c73e22b1e92ddbfd0b09db5dabbf16653be87883ff27d5281e3a1b8151",
+  "Main83_sha256": "bb1b9c6fedf69cd205218550b0cecf4d58ca5b537ae867ba829b3ee808e677d1",
+  "source45_M02": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "source45_candidate": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "CPU_task": "task_20261108_044112_14753283812",
+  "checks": 15,
+  "all_own_jobs_ended": true,
+  "actual16_authorized_by_this_unit": false
+}

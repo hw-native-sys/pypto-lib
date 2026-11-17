@@ -1,0 +1,55 @@
+{
+  "status": "PASS",
+  "topology": {
+    "tp": 1,
+    "ep": 2,
+    "dp": 2,
+    "world": 2,
+    "local_experts": 192
+  },
+  "COUNT_PAD": 192,
+  "N_LOCAL": 192,
+  "normalized_mode": "ONBOARD",
+  "platform": "a2a3",
+  "ring_heap": [
+    0,
+    0,
+    4294967296,
+    0
+  ],
+  "programs": [
+    {
+      "label": "tp_group",
+      "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/configurable_parallel_1794108101/worker_config/build_tp_1_ep_2_onlytp/_jit_tp_reduce_test_20261108_112912_pkciyl86",
+      "seconds": 1.0317118167877197,
+      "files": {
+        "debug/run.py": "2b813192abc51378aad569c952dae40f42b4ff3d2eb2335ecb73a5cbb73fc2a7",
+        "distributed_meta.json": "e3e3bfb1e5b61578768a36e5fd5119db7f89f63a4d6aaf359a3466df473432a5",
+        "next_levels/tp_reduce_test_rank/kernel_config.py": "f668f3c2a673bbef4c4b08e6340118cf8da24bb2d1bb55ee79377e861c4da645",
+        "next_levels/tp_reduce_test_rank/kernels/aiv/tp_out_consumed.cpp": "e5449c6ef334428f0912a85acd3e2d20956a1bd117395470306145806a77bd5a",
+        "next_levels/tp_reduce_test_rank/kernels/aiv/tp_out_publish.cpp": "ce2b26217e87a432efa344cc79592de450a8f5afffecfef6c309b959adb472ae",
+        "next_levels/tp_reduce_test_rank/kernels/aiv/tp_out_ready.cpp": "006ca942a3afe0c0f2a0cf1cda5b3a737cd8f8e02faeca3585a21d0a4a48e523",
+        "next_levels/tp_reduce_test_rank/kernels/aiv/tp_out_reuse.cpp": "0e0b28ec384aa7589598ea988e63f7196489b0a22df75926706c787ccec939a6",
+        "next_levels/tp_reduce_test_rank/kernels/aiv/tp_out_sum.cpp": "de8108c47fa4d81292a698b0986fadec4682e6b56dc8eb6da004de7967fccff5",
+        "next_levels/tp_reduce_test_rank/kernels/aiv/tp_out_wait.cpp": "2ef0cb2d99ea6031c5924f0e78be9a733349bc3b396b60bb87e6a31a47428681",
+        "next_levels/tp_reduce_test_rank/orchestration/tp_reduce_test_rank.cpp": "62aaee36dee232a18113bb030f8254ce49a65971e6486b7728daa80f4f0a5717",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_consumed.cpp": "a5fff0bc425f25f30ad2db4faf535e9bf01633598d1f183153bf2981117080b8",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_consumed.pto": "fb1288cdc9ea81b5b8809016fd8cfba3c1695ea47fe3505fce14f016abe428bb",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_publish.cpp": "4a6f7da7ff423670d551222af477966cbee5ddfdad5743a607b500a3ccfbf11c",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_publish.pto": "0743c996a9734b72a4d809df8853ae4ac742f5218b1acc311c1f445c35a586ab",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_ready.cpp": "aa4e362f60f068724b6c365c743b30133ced5f753d77f54303b617df52658cca",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_ready.pto": "63aeb5fa2a45923da69df6936e7e412a4904085614f76b6c76aed56531dc3950",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_reuse.cpp": "178d939dd3cbe6201d55193779815e824e6d40eedef1708a1c455dc6672de587",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_reuse.pto": "c3be305cdf52b4fc89a3a110cd66bb16b1bc7a15948ce5fe1d4503ce864843aa",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_sum.cpp": "00c71217fd49a94b7d1ad05048473908263ce77bf0e256f6677c8fda7577a659",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_sum.pto": "095842c5d1ec6c8a474bdc64e7459cdb6aaa74545cf58a9d41cfcc1995fb50b7",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_wait.cpp": "76468f28b4714ea2c8a5bd10e8c1414bbc5ce2fdd4de8d3ae9b364869408799d",
+        "next_levels/tp_reduce_test_rank/ptoas/tp_out_wait.pto": "340a1eeb2b2b2c8742725c565bcb0c0344c3e3b63837409720349a2f9f2c735d",
+        "orchestration/host_orch.py": "f4320ef933b1f6401af7f78832e345eaf285eac79b33115739601e9e98d07351"
+      }
+    }
+  ],
+  "samples": 0,
+  "prepare": 0,
+  "native": 0
+}

@@ -1,0 +1,24 @@
+[
+  {
+    "reference": "initial_raise",
+    "primary_error": {
+      "type": "RuntimeError",
+      "error": "preserved primary initial_raise"
+    },
+    "integrity_error": "reference mutated static or initial tensor bytes",
+    "static_before": {
+      "w": "f9b72756b8fe71cc2aeca83f488e816573e11fbe431ce0ad23ce06c661d10158"
+    },
+    "initial_before": {
+      "cache": "d99e7d9857573b549e6365926b268de524fb1d244684a755d48e7ca4d15bec0f"
+    },
+    "static_after": {
+      "w": "f9b72756b8fe71cc2aeca83f488e816573e11fbe431ce0ad23ce06c661d10158"
+    },
+    "initial_after": {
+      "cache": "22f4432d9608be55b989f58dd2519a9ad43d271300b56ddca02e0c3351a8480c"
+    },
+    "static_unchanged": true,
+    "initial_unchanged": false
+  }
+]

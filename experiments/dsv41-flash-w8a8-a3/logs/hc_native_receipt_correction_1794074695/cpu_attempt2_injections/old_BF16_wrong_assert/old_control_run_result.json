@@ -1,0 +1,9 @@
+{
+  "role": "old_control",
+  "started_epoch": 1794074895.3395553,
+  "status": "RUN_EXCEPTION",
+  "exception_type": "AssertionError",
+  "error": "",
+  "traceback": "Traceback (most recent call last):\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/probe.py\", line 183, in execute_pair\n    result = run_impl(fn=module.hc_post_test, specs=specs, golden_fn=golden,\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/check_receipts.py\", line 58, in fake_run\n    assert probe.bitwise(actual.bfloat16().float(), actual)\nAssertionError\n",
+  "ended_epoch": 1794074895.3608904
+}

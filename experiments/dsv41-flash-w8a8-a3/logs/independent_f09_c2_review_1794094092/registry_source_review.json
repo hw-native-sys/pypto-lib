@@ -1,0 +1,20 @@
+{
+  "status": "INDEPENDENT_SOURCE_ONLY_REGISTRY_VERIFIED",
+  "registered_rows": 119,
+  "statewriter_rows": [
+    {
+      "func_id": 59,
+      "code_name": "c2a_state_write",
+      "core_type": "aiv"
+    }
+  ],
+  "generated_calls": [
+    [
+      "70",
+      "c2a_state_write"
+    ]
+  ],
+  "no_C2B_or_suffixed_registered_variant": true,
+  "no_runtime_graph_proof": true,
+  "Main_manifest_sha256": "64bb4e1b837faa8cf607b5b6cc66621b58975582eddd1489888782c74835ff5b"
+}

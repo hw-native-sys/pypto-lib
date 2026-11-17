@@ -1,0 +1,21 @@
+[
+  {
+    "reference": "success",
+    "primary_error": null,
+    "integrity_error": null,
+    "static_before": {
+      "weight": "db2fe3483ab3db83c9e1e5c5c06d3cd1ea21bfff92eef54430ee7221b1040648"
+    },
+    "initial_before": {
+      "cache": "4db94a61e12b88cad168b3a30118fc0d1cd3d5c1201f4b76a378df7921119bd9"
+    },
+    "static_after": {
+      "weight": "db2fe3483ab3db83c9e1e5c5c06d3cd1ea21bfff92eef54430ee7221b1040648"
+    },
+    "initial_after": {
+      "cache": "4db94a61e12b88cad168b3a30118fc0d1cd3d5c1201f4b76a378df7921119bd9"
+    },
+    "static_unchanged": true,
+    "initial_unchanged": true
+  }
+]

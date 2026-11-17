@@ -1,0 +1,23 @@
+[
+  {
+    "kind": "zero",
+    "tokens": 1,
+    "passed": false,
+    "error": "Output(s) does not match golden: ['indices', 'weights']\n  'indices' FAIL (compare_moe_indices)  shape=(1, 6) dtype=torch.int32\nexpert IDs outside [0,384): [[73536, 73536, 73536, 73536, 73536, 73536]]\n  'weights' FAIL (compare_moe_weights)  shape=(1, 6) dtype=torch.float32\ncannot normalize invalid expert IDs",
+    "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/cohort_f03_f08_f14_1793949344/worker_f08/final/build_output/_jit_moe_gate_test_20261106_152328_94cl0r7r"
+  },
+  {
+    "kind": "equal",
+    "tokens": 7,
+    "passed": false,
+    "error": "Output(s) does not match golden: ['indices', 'weights']\n  'indices' FAIL (compare_moe_indices)  shape=(7, 6) dtype=torch.int32\nexpert IDs outside [0,384): [[73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536], [73536, 73536, 73536, 73536, 73536, 73536]]\n  'weights' FAIL (compare_moe_weights)  shape=(7, 6) dtype=torch.float32\ncannot normalize invalid expert IDs",
+    "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/cohort_f03_f08_f14_1793949344/worker_f08/final/build_output/_jit_moe_gate_test_20261106_152328_94cl0r7r"
+  },
+  {
+    "kind": "partial",
+    "tokens": 17,
+    "passed": false,
+    "error": "Output(s) does not match golden: ['indices', 'weights']\n  'indices' FAIL (compare_moe_indices)  shape=(17, 6) dtype=torch.int32\nexpert IDs outside [0,384): [[9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536], [9, 10, 1, 35, 73481, 73536]]\n  'weights' FAIL (compare_moe_weights)  shape=(17, 6) dtype=torch.float32\ncannot normalize invalid expert IDs",
+    "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/cohort_f03_f08_f14_1793949344/worker_f08/final/build_output/_jit_moe_gate_test_20261106_152328_94cl0r7r"
+  }
+]

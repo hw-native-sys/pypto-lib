@@ -1,0 +1,205 @@
+{
+  "schema": "F09-old-count-native-terminal/1",
+  "status": "NATIVE_OLD_CONTROL_CAPTURE_COMPLETE_PENDING_CPU",
+  "native_task_id": "task_20261108_062438_17376705030",
+  "native_exit": 0,
+  "observed_epoch": 1794090387.6149626,
+  "normal_close": true,
+  "primary_error": null,
+  "cleanup_errors": [],
+  "old_physical_capsules": [
+    {
+      "call": 0,
+      "file": "counts0.pt",
+      "sha256": "428232e11b5bcbb03f9d72e227d9f47f95d03a05ede2e96631df03b75cda4609"
+    },
+    {
+      "call": 1,
+      "file": "counts1.pt",
+      "sha256": "6503ca29806e30efd2bfe1317b694d34be8c217b5643ac44180fd604e470797a"
+    },
+    {
+      "call": 2,
+      "file": "counts2.pt",
+      "sha256": "587ea64d4351d0b74dab368d21c7952619649fb4624eb632de3a752af3850749"
+    }
+  ],
+  "count_matrix_not_loaded": true,
+  "numeric_control_acceptance": false,
+  "known4_live_observed_births": [
+    {
+      "identity": {
+        "pid": 1738384,
+        "ppid": 1738112,
+        "starttick": "109020554",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1738425,
+        "ppid": 1738384,
+        "starttick": "109020648",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1738478,
+        "ppid": 1738425,
+        "starttick": "109020772",
+        "comm": "python"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "identity": {
+        "pid": 1741549,
+        "ppid": 1738478,
+        "starttick": "109023274",
+        "comm": "git"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    }
+  ],
+  "all_known4_birth_identities_absent": true,
+  "known16_ready_workers": [
+    {
+      "pid": 1741596,
+      "device": 1,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1741594,
+      "device": 0,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1741625,
+      "device": 3,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1741608,
+      "device": 2,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1741633,
+      "device": 4,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1741640,
+      "device": 5,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1741656,
+      "device": 7,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1741647,
+      "device": 6,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1741672,
+      "device": 8,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1741680,
+      "device": 9,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1741692,
+      "device": 11,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1741687,
+      "device": 10,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1741700,
+      "device": 12,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1741714,
+      "device": 13,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1741729,
+      "device": 15,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1741721,
+      "device": 14,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    }
+  ],
+  "all16_current_ready_PID_numbers_absent": true,
+  "historical_worker_manager_helper_birth_completeness": "UNKNOWN; bounded observations only",
+  "image_free_devices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "raw16_lock_release_observed": true,
+  "external_task_terminal_exit0": true,
+  "native_raw16_cleanup_audit_pass": true,
+  "audit_scope": "bounded terminal/raw16/current16ready/known4actualbirthabsence only; not completehistory/PSS",
+  "prepared_receipt_sha256": "08eff2dbc01ae8e9b87b2fcb16ffb73483a4caeeae61a84afc420f14093232ad",
+  "prepared_native_inventory": [
+    32,
+    32,
+    1
+  ],
+  "source_projection_unchanged": 156,
+  "prep_manifest_unchanged": true,
+  "raw_task_log_sha256": "9682b362bf40a761eacca2b2db1907fab42f4ccbb9ca3415b4f583dc9f55dcc2",
+  "task_status_sha256": "e9d1ff712f06bb1de067759e33a7004938e8ac346c8609ffd9b60aa081851ac4",
+  "shared_writes": 0
+}

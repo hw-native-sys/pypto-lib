@@ -1,0 +1,35 @@
+{
+  "disabled_rank_loader_calls": [
+    [
+      1,
+      false
+    ],
+    [
+      14,
+      false
+    ]
+  ],
+  "disabled_engram_tables": false,
+  "actual_dispatch_expert_types": {
+    "w1": "Tensor",
+    "w1_scale": "Tensor",
+    "w3": "Tensor",
+    "w3_scale": "Tensor",
+    "w2": "Tensor",
+    "w2_scale": "Tensor"
+  },
+  "resident_spec_flags_do_not_allocate_or_retain_in_direct_dispatch": true,
+  "memory_fit_proven": false,
+  "profile_override_rejections": {
+    "base": "the complete model requires both RoPE profiles; use --rope-profile auto",
+    "compressed": "the complete model requires both RoPE profiles; use --rope-profile auto"
+  },
+  "header_only_inventory": {
+    "dense_and_top": 17196936008,
+    "experts": 558396604416,
+    "engram": 221819890240
+  },
+  "header_shards": 274,
+  "payload_method_forbidden": true,
+  "limits": "Spy/source and CPU checks only; no hardware residency claim. Real upload/root-storage transfer and HBM peak remain unmeasured."
+}

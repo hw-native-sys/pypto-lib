@@ -1,0 +1,22 @@
+{
+  "schema": "independent-configurable-actual-audit-final-freeze/1",
+  "status": "FINAL_PARK",
+  "whole_case_status": "NOT_ACCEPTED",
+  "bounded_receipt_facts_status": "VERIFIED_WITH_RECORDED_LIMITS",
+  "manifest": "artifacts.json",
+  "manifest_sha256": "d876b17e7d029eaf0ee8fa8aac1a07a4368fd5e88d2e4acf79dd7f37bcf3136d",
+  "file_count": 58,
+  "report_sha256": "d8c3a39619a3db4b9b230d06ce219e95cebc0d2c115a4b23da62200518962fcb",
+  "summary_sha256": "4bceaf3e8bce1c25e5fc37b1b8dbe5db12016eec46fbc048a2a64b739b94be2d",
+  "result_sha256": "ca80ff1c46bf70b3ddcad9d2eaa92ad6c54da5c2987839e35eb45af5128ea549",
+  "closure_sha256": "9313e3a8e3ca1ceff75c96a837e24dfe9d2e8d317f8b59a8d91626311a81d788",
+  "actual_work_record_sha256": "768311b597431feff8780d641cf5b2f37809daceabb423e1c04b385828f3debc",
+  "actual_CPU_task": "task_20261108_163217_381875127764",
+  "CPU_exit": 0,
+  "checks_passed": 4363,
+  "checks_unmet": 5,
+  "end_epoch": 1794127085,
+  "shared_writes": 0,
+  "immutable_after_final": true,
+  "old_source_ready_and_parent_inputs_unchanged": true
+}

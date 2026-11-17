@@ -1,0 +1,32 @@
+1: [IDX] tokens=8 pool=64
+58: [RUN]   'index_cache' PASS  shape=(2, 128, 1, 128) dtype=torch.bfloat16
+59: [RUN]   'scores' PASS  shape=(8, 128) dtype=torch.float32 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+60: [RUN]   'indices' PASS  shape=(8, 512) dtype=torch.int32 (topk_pair_compare)
+61: [RUN]   'values' PASS  shape=(8, 512) dtype=torch.float32
+62: [RUN]   'pool_ids' PASS  shape=(8, 64) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+63: [RUN]   'pool_counts' PASS  shape=(8,) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+65: [RUN] PASS (10.57s)
+66: [IDX] tokens=16 pool=64
+117: [RUN]   'index_cache' PASS  shape=(2, 128, 1, 128) dtype=torch.bfloat16
+118: [RUN]   'scores' PASS  shape=(16, 128) dtype=torch.float32 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+119: [RUN]   'indices' PASS  shape=(16, 512) dtype=torch.int32 (topk_pair_compare)
+120: [RUN]   'values' PASS  shape=(16, 512) dtype=torch.float32
+121: [RUN]   'pool_ids' PASS  shape=(16, 64) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+122: [RUN]   'pool_counts' PASS  shape=(16,) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+124: [RUN] PASS (0.86s)
+125: [IDX] page-boundary tokens=8 pool=64
+176: [RUN]   'index_cache' PASS  shape=(4, 128, 1, 128) dtype=torch.bfloat16
+177: [RUN]   'scores' PASS  shape=(8, 256) dtype=torch.float32 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+178: [RUN]   'indices' PASS  shape=(8, 512) dtype=torch.int32 (topk_pair_compare)
+179: [RUN]   'values' PASS  shape=(8, 512) dtype=torch.float32
+180: [RUN]   'pool_ids' PASS  shape=(8, 64) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+181: [RUN]   'pool_counts' PASS  shape=(8,) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+183: [RUN] PASS (0.66s)
+184: [IDX] page-boundary tokens=8 pool=2048
+241: [RUN]   'index_cache' PASS  shape=(4, 128, 1, 128) dtype=torch.bfloat16
+242: [RUN]   'scores' PASS  shape=(8, 256) dtype=torch.float32 (ratio_allclose(atol=0.02, rtol=0.01, max_error_ratio=0.01, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+243: [RUN]   'indices' PASS  shape=(8, 512) dtype=torch.int32 (topk_pair_compare)
+244: [RUN]   'values' PASS  shape=(8, 512) dtype=torch.float32
+245: [RUN]   'pool_ids' PASS  shape=(8, 2048) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+246: [RUN]   'pool_counts' PASS  shape=(8,) dtype=torch.int32 (ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.005, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))
+248: [RUN] PASS (7.44s)

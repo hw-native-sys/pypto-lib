@@ -1,0 +1,13 @@
+{
+  "schema": "source-preparation-freeze/1",
+  "status": "FINAL_SOURCE_ONLY_PARK",
+  "manifest_path": "artifacts.json",
+  "manifest_sha256": "f0926693acb2a7d6d39f072211e1ad633936b8f2f3785c3da18d9f71c6f7c386",
+  "file_count": 10,
+  "end_epoch": 1794110789,
+  "shared_writes": 0,
+  "immutable_after_seal": true,
+  "positive_authorization": false,
+  "actual_auditor_status": "REQUIRED_BINDINGS_AND_INTEGRATION",
+  "tests_or_jobs_run": 0
+}

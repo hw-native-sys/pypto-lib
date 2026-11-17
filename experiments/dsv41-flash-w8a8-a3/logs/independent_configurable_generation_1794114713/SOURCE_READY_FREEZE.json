@@ -1,0 +1,14 @@
+{
+  "schema": "source-ready-configurable-real-audit-assembly-freeze/1",
+  "status": "FINAL_SOURCE_READY_PARK",
+  "manifest": "SOURCE_READY_MANIFEST.json",
+  "manifest_sha256": "3bfd0440fc11f1fe8177ec44dcf8c38404e0898483b420a6c06b4ef5e6d9f726",
+  "file_count": 39,
+  "end_epoch": 1794114983,
+  "auditor_code_changed": false,
+  "auditor_parent_manifest_sha256": "497be161cbb684f2e9da5e1ddc95770cdfe1131b6b0b8669d62fc55f138cc70a",
+  "shared_writes": 0,
+  "actual_audits": 0,
+  "positive_audit_GO": false,
+  "immutability": "All listed source-ready files immutable. Only NEW actual input/output/report files may be added after explicit later Root actual-audit GO; no listed file overwritten."
+}

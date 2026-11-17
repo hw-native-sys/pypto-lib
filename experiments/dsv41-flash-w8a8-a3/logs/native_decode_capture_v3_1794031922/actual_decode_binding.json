@@ -1,0 +1,138 @@
+{
+  "mode": "ExecutionMode.ONBOARD",
+  "ring_heap": [
+    0,
+    0,
+    4294967296,
+    0
+  ],
+  "device_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "generated_platform": "a2a3",
+  "artifact": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_decode_capture_v3_1794031922/build/_jit_decode_fwd_20261107_142723_4bpmehp7",
+    "metadata_sha256": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770",
+    "compile_seconds": 24.996228218078613
+  },
+  "owner_python_identity": 281461228851152,
+  "handle_python_identities": {
+    "attn_norm_w": 281461020120144,
+    "c1a_comp_norm": 281461020127488,
+    "c1a_comp_wkv": 281461020120384,
+    "c1a_idx_k_norm": 281461020115872,
+    "c1a_idx_weights_proj": 281460278932384,
+    "c1a_idx_wk": 281460278928160,
+    "c1a_idx_wq_b": 281460278930752,
+    "c1a_idx_wq_b_scale": 281461022210992,
+    "c2a_comp_norm": 281460278922544,
+    "c2a_comp_wgate": 281461020123744,
+    "c2a_comp_wkv": 281461022199376,
+    "c2a_idx_k_norm": 281461022210560,
+    "c2a_idx_weights_proj": 281461022201968,
+    "c2a_idx_wk": 281460278928976,
+    "c2a_idx_wq_b": 281461019631936,
+    "c2a_idx_wq_b_scale": 281461019628384,
+    "embed_weight": 281461019625312,
+    "engram_qk": 281460278988080,
+    "engram_rotation": 281460278985872,
+    "engram_wkv": 281460278997008,
+    "ffn_norm_w": 281460278986784,
+    "final_norm": 281461022946448,
+    "gate_bias": 281461022945776,
+    "gate_weight": 281461022939872,
+    "hc_attn_base": 281461022938672,
+    "hc_attn_fn": 281460279337328,
+    "hc_attn_scale": 281460279337136,
+    "hc_ffn_base": 281460279334208,
+    "hc_ffn_fn": 281461022934016,
+    "hc_ffn_scale": 281460279335648,
+    "kv_norm_w": 281460277812320,
+    "lm_head_weight": 281460277810976,
+    "q_norm_w": 281460277813616,
+    "re_idx_weights_proj": 281460279342032,
+    "re_idx_wq_b": 281461019598640,
+    "re_idx_wq_b_scale": 281460277805216,
+    "shared_w1": 281461022795536,
+    "shared_w1_scale": 281460277809248,
+    "shared_w2": 281461019596048,
+    "shared_w2_scale": 281461022793136,
+    "shared_w3": 281461022794912,
+    "shared_w3_scale": 281461022790784,
+    "sink": 281461019589792,
+    "w1": 281461019576112,
+    "w1_scale": 281461019583216,
+    "w2": 281461021177504,
+    "w2_scale": 281461021172704,
+    "w3": 281461019584752,
+    "w3_scale": 281461021174912,
+    "wkv": 281461021459024,
+    "wkv_scale": 281460278172384,
+    "wo_a": 281461021460896,
+    "wo_b": 281461020618528,
+    "wq_a": 281461021468384,
+    "wq_a_scale": 281461020610992,
+    "wq_b": 281461020609888,
+    "wq_b_scale": 281461020606768
+  },
+  "runtime_contract": {
+    "backend": "tensormap_and_ringbuffer",
+    "platform": "a2a3",
+    "mode": "PROGRAM",
+    "library_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/build/lib/a2a3/onboard/tensormap_and_ringbuffer/libhost_runtime.so",
+    "library_sha256": "24434f8879030ef1b1f31e5fc2ecce683e392d4f1baeb5bcee852fb183976e5c",
+    "abi_version": 1,
+    "resource_count": 6,
+    "pipeline_directory_capacity": 4294967295,
+    "resources": [
+      {
+        "kind": 4,
+        "resource_class": 0,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 1,
+        "resource_class": 1,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 2,
+        "resource_class": 1,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 3,
+        "resource_class": 1,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 5,
+        "resource_class": 2,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 6,
+        "resource_class": 2,
+        "bytes_per_copy": 0
+      }
+    ],
+    "shared_arena_bank": 0,
+    "query_scope": "read-only exported get_pipeline_contract; no init/prepare/device call"
+  },
+  "scope": "public ring override only; all entry/spec/compile/owner/input algorithms canonical"
+}

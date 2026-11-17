@@ -1,0 +1,13 @@
+{
+  "role": "Main",
+  "unit": "hc_bf16_boundary_draft_1794071285",
+  "record_id": "main_hc_bf16_boundary_draft_1794071285",
+  "start_epoch": 1794071285,
+  "end_epoch": 1794071868.841333,
+  "elapsed_seconds": 583.8413329124451,
+  "imported_shared_ledger": false,
+  "work": "Artifact-only two-file draft, original-backed small CPU proof, sourcepins/report/seal. No worker, compile, NPU or live edits.",
+  "task_ids": [
+    "task_20261108_011604_328135122247"
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "role": "review-agent",
+  "start_epoch": 1794075229.816338,
+  "shared_writes": 0,
+  "state": "PREQUEUE",
+  "root_go": "observer-20261108-hc-durable-receipts-native1",
+  "end_epoch": 1794075619.027457,
+  "status": "FINAL/PARK_NATIVE_FAILED_OFFLINE_ORIGINAL_COMPARISON_PASS",
+  "native_task": "task_20261108_021439_342901924784",
+  "native_exit": 1,
+  "offline_audit_task": "task_20261108_021816_343981631498",
+  "audit_exit": 0,
+  "audit_passed": 31,
+  "audit_unmet": 0,
+  "candidate_actual_original_mismatches": 0,
+  "old_actual_original_mismatches": 61440,
+  "own_helper_alias_identified": true,
+  "root_imports": "once, owned by Root",
+  "remaining_tasks": []
+}

@@ -1,0 +1,4 @@
+{"event": "reference_compute_start", "scope": "unconditioned", "time": 1794028874.7197063, "output_count": null, "numerical_verdict": false}
+{"event": "reference_compute_return", "scope": "unconditioned", "time": 1794029754.093902, "output_count": 17, "numerical_verdict": false}
+{"event": "reference_compute_start", "scope": "staged", "time": 1794029763.38974, "output_count": null, "numerical_verdict": false}
+{"event": "reference_compute_return", "scope": "staged", "time": 1794030640.920596, "output_count": 17, "numerical_verdict": false}

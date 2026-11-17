@@ -1,0 +1,84 @@
+{
+  "requested_role": "active",
+  "profile": {
+    "origin_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/build/count_active",
+    "manifest": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/count_active_files.json",
+    "manifest_sha256": "4c226662c16675febc4eea21c4de345a79e6562dc078549df46185212cabfaba",
+    "metadata_sha256": "189381005f808c601c93286c4ef8022e54e160f99a2c144d527608df90dd9fb9",
+    "source_manifest": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31"
+  },
+  "verdict": [
+    {
+      "positive": true,
+      "source_routes": [
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12
+      ],
+      "total_routes": 192,
+      "valid_capture_matrix": true
+    },
+    {
+      "positive": true,
+      "source_routes": [
+        6,
+        6,
+        6,
+        6,
+        6,
+        6,
+        6,
+        6,
+        0,
+        0,
+        0,
+        0,
+        12,
+        12,
+        12,
+        12
+      ],
+      "total_routes": 96,
+      "valid_capture_matrix": true
+    },
+    {
+      "positive": true,
+      "source_routes": [
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12
+      ],
+      "total_routes": 192,
+      "valid_capture_matrix": true
+    }
+  ],
+  "required_middle_negative": false,
+  "fullentry_three_groups19x3": "SEPARATE_REQUIRED",
+  "native_status_not_replaced": true
+}

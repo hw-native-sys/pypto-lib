@@ -1,0 +1,1 @@
+task-submit --timeout 900 --no-device --max-time 600 --run 'PYTHONDONTWRITEBYTECODE=1 .venv-local/bin/python experiments/dsv41-flash-w8a8-a3/logs/independent_f09_real_B_generation_1794102875/audit.py --handoff experiments/dsv41-flash-w8a8-a3/logs/independent_f09_real_B_generation_1794102875/handoff.json'

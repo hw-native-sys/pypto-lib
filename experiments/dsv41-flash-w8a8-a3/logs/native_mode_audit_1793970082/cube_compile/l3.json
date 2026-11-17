@@ -1,0 +1,16 @@
+{
+  "mode": "l3",
+  "execution_mode": "ExecutionMode.ONBOARD",
+  "device": 0,
+  "uid": 2011,
+  "gid": 2011,
+  "groups": [
+    1000,
+    1002,
+    2011
+  ],
+  "compile_only": true,
+  "passed": true,
+  "error": null,
+  "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_mode_audit_1793970082/cube_compile/build_output/_jit_add_one_host_20261106_211241_zec873q_"
+}

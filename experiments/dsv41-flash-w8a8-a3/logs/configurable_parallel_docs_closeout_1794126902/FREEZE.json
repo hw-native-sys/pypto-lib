@@ -1,0 +1,12 @@
+{
+  "status": "FINAL_PARK_DOCS_ONLY",
+  "count": 18,
+  "manifest_sha256": "8638b714fef43f9d6e137dc0cfc1f2002670138e407cbcdf8d1b23fe249cebc1",
+  "report_sha256": "31fd9ccf89f7421ff5faafaa747750b2881f1d2ea6cb5cc91bd37d0362c6a51b",
+  "work_record_sha256": "e9b1910d676af8c175668f6d2824104a498bfdba4040243237857a0b0315607e",
+  "Root_disposition_sha256": "c66550dd667eae41a925dee4be4b18683c313f2965c59f19e15b76eafe07979b",
+  "shared_docs_published": true,
+  "source45_unchanged": true,
+  "owner_final_at_publication": "PENDING",
+  "all_Main_writers_jobs_parked": true
+}

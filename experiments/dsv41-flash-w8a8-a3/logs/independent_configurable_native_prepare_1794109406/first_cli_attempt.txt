@@ -1,0 +1,2 @@
+Rejected before task creation: task-submit --no-device --max-running-time 1200 --timeout 1500 --run <cpu_batch.sh>
+exit1: unknown --max-running-time. Installed help documents --max-time. No imports/compile/device happened in this attempt.

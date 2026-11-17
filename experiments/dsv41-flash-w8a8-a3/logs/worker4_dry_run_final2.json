@@ -1,0 +1,793 @@
+{
+  "schema": "worker4-generate/1",
+  "mode": "host",
+  "commands": [
+    "generate.py --dry-run --check-layers 0 --check-ranks 0 --log-file ../../experiments/dsv41-flash-w8a8-a3/logs/worker4_dry_run_final2.log --result-json ../../experiments/dsv41-flash-w8a8-a3/logs/worker4_dry_run_final2.json"
+  ],
+  "rank_mapping": [
+    {
+      "rank": 0,
+      "dp_rank": 0,
+      "tp_rank": 0,
+      "group_base": 0,
+      "ep_rank": 0,
+      "expert_begin": 0,
+      "expert_end": 24
+    },
+    {
+      "rank": 1,
+      "dp_rank": 0,
+      "tp_rank": 1,
+      "group_base": 0,
+      "ep_rank": 1,
+      "expert_begin": 24,
+      "expert_end": 48
+    },
+    {
+      "rank": 2,
+      "dp_rank": 0,
+      "tp_rank": 2,
+      "group_base": 0,
+      "ep_rank": 2,
+      "expert_begin": 48,
+      "expert_end": 72
+    },
+    {
+      "rank": 3,
+      "dp_rank": 0,
+      "tp_rank": 3,
+      "group_base": 0,
+      "ep_rank": 3,
+      "expert_begin": 72,
+      "expert_end": 96
+    },
+    {
+      "rank": 4,
+      "dp_rank": 1,
+      "tp_rank": 0,
+      "group_base": 4,
+      "ep_rank": 4,
+      "expert_begin": 96,
+      "expert_end": 120
+    },
+    {
+      "rank": 5,
+      "dp_rank": 1,
+      "tp_rank": 1,
+      "group_base": 4,
+      "ep_rank": 5,
+      "expert_begin": 120,
+      "expert_end": 144
+    },
+    {
+      "rank": 6,
+      "dp_rank": 1,
+      "tp_rank": 2,
+      "group_base": 4,
+      "ep_rank": 6,
+      "expert_begin": 144,
+      "expert_end": 168
+    },
+    {
+      "rank": 7,
+      "dp_rank": 1,
+      "tp_rank": 3,
+      "group_base": 4,
+      "ep_rank": 7,
+      "expert_begin": 168,
+      "expert_end": 192
+    },
+    {
+      "rank": 8,
+      "dp_rank": 2,
+      "tp_rank": 0,
+      "group_base": 8,
+      "ep_rank": 8,
+      "expert_begin": 192,
+      "expert_end": 216
+    },
+    {
+      "rank": 9,
+      "dp_rank": 2,
+      "tp_rank": 1,
+      "group_base": 8,
+      "ep_rank": 9,
+      "expert_begin": 216,
+      "expert_end": 240
+    },
+    {
+      "rank": 10,
+      "dp_rank": 2,
+      "tp_rank": 2,
+      "group_base": 8,
+      "ep_rank": 10,
+      "expert_begin": 240,
+      "expert_end": 264
+    },
+    {
+      "rank": 11,
+      "dp_rank": 2,
+      "tp_rank": 3,
+      "group_base": 8,
+      "ep_rank": 11,
+      "expert_begin": 264,
+      "expert_end": 288
+    },
+    {
+      "rank": 12,
+      "dp_rank": 3,
+      "tp_rank": 0,
+      "group_base": 12,
+      "ep_rank": 12,
+      "expert_begin": 288,
+      "expert_end": 312
+    },
+    {
+      "rank": 13,
+      "dp_rank": 3,
+      "tp_rank": 1,
+      "group_base": 12,
+      "ep_rank": 13,
+      "expert_begin": 312,
+      "expert_end": 336
+    },
+    {
+      "rank": 14,
+      "dp_rank": 3,
+      "tp_rank": 2,
+      "group_base": 12,
+      "ep_rank": 14,
+      "expert_begin": 336,
+      "expert_end": 360
+    },
+    {
+      "rank": 15,
+      "dp_rank": 3,
+      "tp_rank": 3,
+      "group_base": 12,
+      "ep_rank": 15,
+      "expert_begin": 360,
+      "expert_end": 384
+    }
+  ],
+  "queue_submit_epoch": null,
+  "start_epoch": 1793681885,
+  "status": "ok",
+  "blockers": [],
+  "prompt": {
+    "template": "chat",
+    "source": "shipped_encoding",
+    "thinking_mode": null,
+    "reasoning_effort": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Who are you?"
+      }
+    ],
+    "rendered": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cUser\uff5c>Who are you?<\uff5cAssistant\uff5c></think>",
+    "ids": [
+      0,
+      128803,
+      18387,
+      477,
+      440,
+      33,
+      128804,
+      128822
+    ],
+    "length": 8,
+    "bos_id": 0,
+    "eos_id": 1,
+    "pad_id": 2,
+    "decode_roundtrip": true,
+    "images": 0
+  },
+  "contract_gaps": [
+    "prefill argument w1_scale has shape [40, 24, 2304] without a leading EP16 rank axis; the host driver broadcasts one expert shard to every rank, so real EP16 generation cannot be wired through the current prefill entry",
+    "rope-profile: entry_mode=compressed carries one table for all 40 layers; the checkpoint plan needs base (0-1) and compressed (2-39); mismatched layers [0, 1]",
+    "prefill-tile: prompt length 8 != prefill tile 16: padding tokens advance the carried compressor state, append pad KV rows and can emit pad compressed rows; use a prompt whose length equals the compiled tile for a real handoff",
+    "engram-hash: no --engram-hash-ids; host lookup rows cannot be built. Options: (a) --engram-mode zero-diagnostic (DIAGNOSTIC-ONLY, Engram residual omitted) or (b) a user-supplied n-gram hash spec"
+  ],
+  "prompt_fixtures": [
+    {
+      "case": 1,
+      "cases": 1,
+      "chars": 2363,
+      "tokens": 548,
+      "prompt_match": true,
+      "tokenizer_roundtrip": true
+    },
+    {
+      "case": 2,
+      "cases": 1,
+      "chars": 250,
+      "tokens": 40,
+      "prompt_match": true,
+      "tokenizer_roundtrip": true
+    },
+    {
+      "case": 3,
+      "cases": 1,
+      "chars": 2241,
+      "tokens": 579,
+      "prompt_match": true,
+      "tokenizer_roundtrip": true
+    },
+    {
+      "case": 4,
+      "cases": 1,
+      "chars": 306,
+      "tokens": 101,
+      "prompt_match": true,
+      "tokenizer_roundtrip": true
+    },
+    {
+      "case": 5,
+      "cases": 1,
+      "chars": 280,
+      "tokens": 74,
+      "prompt_match": true,
+      "tokenizer_roundtrip": true
+    }
+  ],
+  "rope": {
+    "requested": "auto",
+    "entry_mode": "compressed",
+    "per_layer": [
+      {
+        "layer": 0,
+        "profile": "base",
+        "theta": 10000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 1,
+        "profile": "base",
+        "theta": 10000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 2,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 3,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 4,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 5,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 6,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 7,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 8,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 9,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 10,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 11,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 12,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 13,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 14,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 15,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 16,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 17,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 18,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 19,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 20,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 21,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 22,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 23,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 24,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 25,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 26,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 27,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 28,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 29,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 30,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 31,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 32,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 33,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 34,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 35,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 36,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 37,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 38,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      },
+      {
+        "layer": 39,
+        "profile": "compressed",
+        "theta": 160000.0,
+        "yarn": {
+          "rope_type": "yarn",
+          "factor": 16.0,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        }
+      }
+    ],
+    "mismatched_layers": [
+      0,
+      1
+    ],
+    "checkpoint_rope_scaling": {
+      "rope_type": "yarn",
+      "factor": 16.0,
+      "beta_fast": 32,
+      "beta_slow": 1,
+      "original_max_position_embeddings": 65536
+    },
+    "note": "single-table entry: the host cannot mix base (layers 0-1) and compressed (layers 2-39) profiles"
+  },
+  "engram": [
+    {
+      "layer": 1,
+      "wkv_shape": [
+        25600,
+        6144
+      ],
+      "wkv_dtype": "torch.bfloat16",
+      "qk_shape": [
+        4,
+        5120
+      ],
+      "qk_dtype": "torch.float32",
+      "qk_matches_product": true,
+      "a5_layout": "checkpoint [KV_OUT, ENGRAM_K] transposed to [ENGRAM_K, KV_OUT]",
+      "a3_layout": "[KV_OUT, ENGRAM_K] with b_trans=True; same lookup @ W^T",
+      "entry_prefill_slice": [
+        25600,
+        6144
+      ],
+      "entry_decode_slice": [
+        25600,
+        6144
+      ],
+      "sha1": "965ebb59835483fb"
+    },
+    {
+      "layer": 14,
+      "wkv_shape": [
+        25600,
+        6144
+      ],
+      "wkv_dtype": "torch.bfloat16",
+      "qk_shape": [
+        4,
+        5120
+      ],
+      "qk_dtype": "torch.float32",
+      "qk_matches_product": true,
+      "a5_layout": "checkpoint [KV_OUT, ENGRAM_K] transposed to [ENGRAM_K, KV_OUT]",
+      "a3_layout": "[KV_OUT, ENGRAM_K] with b_trans=True; same lookup @ W^T",
+      "entry_prefill_slice": [
+        25600,
+        6144
+      ],
+      "entry_decode_slice": [
+        25600,
+        6144
+      ],
+      "sha1": "374305ea913a1b92"
+    }
+  ],
+  "diagnostic_only": false,
+  "engram_mode": "host-ids",
+  "timing": {
+    "total_seconds": 7.175527095794678,
+    "device_wall_seconds": null,
+    "queue_wait_seconds": null
+  },
+  "exit_code": 0,
+  "log_file": "../../experiments/dsv41-flash-w8a8-a3/logs/worker4_dry_run_final2.log"
+}

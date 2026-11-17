@@ -1,0 +1,114 @@
+{
+  "call": 0,
+  "initial": {
+    "file": "call0.initial.pt",
+    "sha256": "ce85844faa82368dec5ccebb7c7df20910a1654c397e5fcc7137abf979b4c21e",
+    "tensors": {
+      "window_cache": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+      "compressed_cache_c2a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+      "index_cache_c2a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+      "compressed_cache_c1a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+      "index_cache_c1a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+      "state_cache_c2a": "795fec509275a731b5bfb6b837dc56bfa03d52a5f8a7e8951b5b89643c1a2cde",
+      "token_counts": "ef2becea88733d6c825e7f8da54f4ec3e76adc4df18be29e0694832c88d3bc66",
+      "position_ids": "fd66e2d65e8631082053e615029a1f069d5621dcd4bc03d185a08327ceb2faeb",
+      "window_slots": "ff5d0079c80e1945aa3580a055181e6d8af8360d51e5beb7a3b1d454ddfd3fcd",
+      "c1a_compressed_slots": "ff5d0079c80e1945aa3580a055181e6d8af8360d51e5beb7a3b1d454ddfd3fcd",
+      "c2a_compressed_slots": "c124027140c0b4e602dff5bb185cb1d147bc3b75f3f3f97b1f29674d1296ffec"
+    }
+  },
+  "actual": {
+    "file": "call0.actual.pt",
+    "sha256": "bbdccf905fd8197cf1f3854a7fad0d2594f8db0d82281788c2193f184dd0c23b",
+    "tensors": {
+      "window_cache": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+      "compressed_cache_c2a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+      "index_cache_c2a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+      "compressed_cache_c1a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+      "index_cache_c1a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+      "state_cache_c2a": "795fec509275a731b5bfb6b837dc56bfa03d52a5f8a7e8951b5b89643c1a2cde",
+      "token_counts": "ef2becea88733d6c825e7f8da54f4ec3e76adc4df18be29e0694832c88d3bc66",
+      "position_ids": "fd66e2d65e8631082053e615029a1f069d5621dcd4bc03d185a08327ceb2faeb",
+      "window_slots": "ff5d0079c80e1945aa3580a055181e6d8af8360d51e5beb7a3b1d454ddfd3fcd",
+      "c1a_compressed_slots": "ff5d0079c80e1945aa3580a055181e6d8af8360d51e5beb7a3b1d454ddfd3fcd",
+      "c2a_compressed_slots": "c124027140c0b4e602dff5bb185cb1d147bc3b75f3f3f97b1f29674d1296ffec"
+    }
+  },
+  "cache_after": {
+    "window_cache": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+    "compressed_cache_c2a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+    "index_cache_c2a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+    "state_cache_c2a": "795fec509275a731b5bfb6b837dc56bfa03d52a5f8a7e8951b5b89643c1a2cde",
+    "compressed_cache_c1a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+    "index_cache_c1a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f"
+  },
+  "history_before": [
+    [
+      125,
+      125
+    ],
+    [
+      125,
+      125
+    ],
+    [
+      125,
+      125
+    ],
+    [
+      125,
+      125
+    ]
+  ],
+  "active_counts": [
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2
+  ],
+  "metadata_hashes": {
+    "token_counts": "ef2becea88733d6c825e7f8da54f4ec3e76adc4df18be29e0694832c88d3bc66",
+    "position_ids": "fd66e2d65e8631082053e615029a1f069d5621dcd4bc03d185a08327ceb2faeb",
+    "window_slots": "ff5d0079c80e1945aa3580a055181e6d8af8360d51e5beb7a3b1d454ddfd3fcd",
+    "c1a_compressed_slots": "ff5d0079c80e1945aa3580a055181e6d8af8360d51e5beb7a3b1d454ddfd3fcd",
+    "c2a_compressed_slots": "c124027140c0b4e602dff5bb185cb1d147bc3b75f3f3f97b1f29674d1296ffec"
+  },
+  "mode": "CPU_TOY_NOT_NATIVE",
+  "owner_identity": 281473592079216,
+  "artifact": {
+    "CPU_ONLY": true
+  },
+  "retention": {
+    "status": "PASS"
+  },
+  "history_after": [
+    [
+      126,
+      126
+    ],
+    [
+      126,
+      126
+    ],
+    [
+      126,
+      126
+    ],
+    [
+      126,
+      126
+    ]
+  ]
+}

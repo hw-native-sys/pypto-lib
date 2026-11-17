@@ -1,0 +1,11 @@
+{
+  "state": "FINAL_PARK_SOURCE_BUG_FOUND",
+  "all_own_jobs_ended": true,
+  "source405_and_M02_unchanged": true,
+  "old5262_sources_unchanged": true,
+  "actual_post_call1_delta": "UNKNOWN_NOT_SAVED",
+  "no_model_or_runtime_or_golden_change": true,
+  "tensor_payload_bytes": 0,
+  "input_copies": 0,
+  "epoch": 1794092912
+}

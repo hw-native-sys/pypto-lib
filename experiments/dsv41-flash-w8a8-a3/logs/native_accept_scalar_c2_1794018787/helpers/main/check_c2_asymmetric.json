@@ -1,0 +1,7 @@
+{
+  "asymmetric_nonconstant_K_fourterm_analytic": "PASS",
+  "two_requests_remapped_state": "PASS",
+  "untouched_parity": "PASS",
+  "candidate_kernel_called": false,
+  "threshold_change": false
+}

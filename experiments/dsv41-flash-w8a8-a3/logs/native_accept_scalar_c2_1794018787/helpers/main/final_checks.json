@@ -1,0 +1,14 @@
+{
+  "changed": [
+    "models/deepseek_v4_1_flash_a3_w8a8/compressor.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/generate.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/weight_loader.py"
+  ],
+  "unchanged_count": 42,
+  "stream_native_class_AST_equal_final": true,
+  "own_jobs": {
+    "audit": "Queue CLI job-status collected separately by Main host administrative tool after this CPU check; do not recursively query task-submit inside queue job."
+  },
+  "no_realweight_payload": "guard HELD",
+  "continuation": "BLOCKED, no successful copyback/steps/control"
+}

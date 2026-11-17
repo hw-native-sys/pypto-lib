@@ -1,0 +1,18 @@
+{
+  "role": "review-agent",
+  "unique_id": "independent_shared_hc_generation_prepare_1794076542",
+  "start_epoch": 1794076351,
+  "artifact_epoch": 1794076542.1267738,
+  "shared_writes": 0,
+  "state": "FINAL/PARK_READY_POSTTERMINAL_ONLY",
+  "native_or_oldcase_audit_executed": false,
+  "end_epoch": 1794077887.1343925,
+  "root_imports": "once, owned by Root",
+  "synthetic_delta_task": "task_20261108_023919_349171726849",
+  "synthetic_delta_exit": 0,
+  "actual_case_audit_executed": false,
+  "native_submitted": false,
+  "required_external_pins": "ALL_CONCRETE",
+  "actual_handoff": "PENDING_ACTUAL_TASK_ROOT_GO_AND_TERMINAL",
+  "remaining_tasks": []
+}

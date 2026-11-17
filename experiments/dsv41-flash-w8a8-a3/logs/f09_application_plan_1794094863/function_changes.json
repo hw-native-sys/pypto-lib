@@ -1,0 +1,78 @@
+{
+  "models/deepseek_v4_1_flash_a3_w8a8/compressor.py": {
+    "modified": [
+      "c2a_compressor"
+    ],
+    "added": [],
+    "removed": []
+  },
+  "models/deepseek_v4_1_flash_a3_w8a8/decode_fwd.py": {
+    "modified": [
+      "decode_encoder",
+      "decode_decoder",
+      "make_fwd_comparators",
+      "_layer_reference_dict"
+    ],
+    "added": [],
+    "removed": []
+  },
+  "models/deepseek_v4_1_flash_a3_w8a8/decode_layer.py": {
+    "modified": [
+      "_build_layer_entries"
+    ],
+    "added": [],
+    "removed": []
+  },
+  "models/deepseek_v4_1_flash_a3_w8a8/decode_moe.py": {
+    "modified": [
+      "decode_moe_rank"
+    ],
+    "added": [],
+    "removed": []
+  },
+  "models/deepseek_v4_1_flash_a3_w8a8/layer_reference.py": {
+    "modified": [
+      "make_layer_golden",
+      "_build_staged_references"
+    ],
+    "added": [
+      "_active_reference_inputs",
+      "active_output_rows",
+      "reference_active_counts"
+    ],
+    "removed": []
+  },
+  "models/deepseek_v4_1_flash_a3_w8a8/moe_exchange.py": {
+    "modified": [
+      "moe_ffn",
+      "moe_ep16",
+      "golden_moe_ep16"
+    ],
+    "added": [],
+    "removed": []
+  },
+  "models/deepseek_v4_1_flash_a3_w8a8/prefill_fwd.py": {
+    "modified": [
+      "_prefill_encoder_layer",
+      "_run_composed_golden",
+      "_prefill_decoder_layer",
+      "_layer_reference_dict"
+    ],
+    "added": [],
+    "removed": []
+  },
+  "models/deepseek_v4_1_flash_a3_w8a8/prefill_layer.py": {
+    "modified": [
+      "_build_layer_entries"
+    ],
+    "added": [],
+    "removed": []
+  },
+  "models/deepseek_v4_1_flash_a3_w8a8/prefill_moe.py": {
+    "modified": [
+      "prefill_moe_rank"
+    ],
+    "added": [],
+    "removed": []
+  }
+}

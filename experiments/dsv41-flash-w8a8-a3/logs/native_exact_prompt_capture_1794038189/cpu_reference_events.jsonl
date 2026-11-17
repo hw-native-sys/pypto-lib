@@ -1,0 +1,4 @@
+{"epoch": 1794039274.2105875, "event": "ENTER", "scope": "unconditioned", "tokens": 3, "instrumentation": "observational sys.setprofile; no execution/function replacement"}
+{"epoch": 1794039360.42754, "event": "RETURN", "scope": "unconditioned", "tokens": 3, "instrumentation": "observational sys.setprofile; no execution/function replacement"}
+{"epoch": 1794039360.9156168, "event": "ENTER", "scope": "staged", "tokens": 3, "instrumentation": "observational sys.setprofile; no execution/function replacement"}
+{"epoch": 1794039446.1949844, "event": "RETURN", "scope": "staged", "tokens": 3, "instrumentation": "observational sys.setprofile; no execution/function replacement"}

@@ -1,0 +1,84 @@
+{
+  "status": "READY_SOURCE_RESOURCES_ONLY_NO_NATIVE_AUTHORITY",
+  "source_manifest": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "lifecycle_acceptance": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/root_f09_count_probe_rank_acceptance_1794089142.json",
+  "lifecycle_acceptance_sha256": "e76b9984db86a27c3c1b4ebd32ab7de97af91357af4c6784746e5e9a3ade0ffa",
+  "actual_lifecycle_predicate_passed_empty_stage_scope_refused": true,
+  "inventories": [
+    {
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424",
+      "files": 398,
+      "manifest_sha256": "4615debdad437d799834c68515a8e8c55185710f9627eb751902bbcb8212a90f"
+    },
+    {
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_oracle_route_1794083897",
+      "files": 34,
+      "manifest_sha256": "934407c73e22b1e92ddbfd0b09db5dabbf16653be87883ff27d5281e3a1b8151"
+    }
+  ],
+  "signatures": [
+    {
+      "label": "count_active",
+      "origin": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/build/count_active",
+      "files": 158,
+      "manifest": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/count_active_files.json",
+      "manifest_sha256": "45c3b4c710e9592127dcde62a1d1f2502ea42fc01843895362150aa56b1b8c54",
+      "metadata_sha256": "7ec1d89d657653d9bf2ec179f75cc8421dc05477771e5dee2af088d3554972a8"
+    },
+    {
+      "label": "count_old_physical",
+      "origin": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/build/count_old_physical",
+      "files": 158,
+      "manifest": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/count_old_physical_files.json",
+      "manifest_sha256": "1c09c6ced987a6ed53cdb8036a8ed6cc8d4c6d78c9d1df3a7278db21b7f29c53",
+      "metadata_sha256": "7ec1d89d657653d9bf2ec179f75cc8421dc05477771e5dee2af088d3554972a8"
+    },
+    {
+      "label": "decode_capacity2",
+      "origin": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/build/decode_capacity2",
+      "files": 378,
+      "manifest": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/decode_capacity2_files.json",
+      "manifest_sha256": "5262e68afa0b53291ed285e31170b3c017674c3c25dfa9aec78eb7fab5777532",
+      "metadata_sha256": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770"
+    }
+  ],
+  "active_profile": {
+    "origin_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/build/count_active",
+    "manifest": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/count_active_files.json",
+    "manifest_sha256": "45c3b4c710e9592127dcde62a1d1f2502ea42fc01843895362150aa56b1b8c54",
+    "metadata_sha256": "7ec1d89d657653d9bf2ec179f75cc8421dc05477771e5dee2af088d3554972a8",
+    "source_manifest": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31"
+  },
+  "probe_sha256": "f4bf50aebbbbb8b0a7c6a230e5e3acd810b607bdc2624091a46b660709c1b42c",
+  "scenario_sha256": "c7b6ab942f5ea17758389aa5a53dafbb1de79e68dbb6f41c4614d66dd6b6dbb1",
+  "count_totals": [
+    192,
+    96,
+    192
+  ],
+  "communication_epoch_each_dispatch": 1,
+  "scenario_indices_are_not_comm_epochs": true,
+  "resources": {
+    "epoch": 1794089453.0335763,
+    "observed": {
+      "HOST": 1722167029760,
+      "DISK": 7893673836544,
+      "SHM": 1079343157248
+    },
+    "minimum_bytes": {
+      "HOST": 322122547200,
+      "DISK": 17179869184,
+      "SHM": 34359738368
+    }
+  },
+  "full_fixture_static_global": 103422065664,
+  "selected_probe_static_global": 14339303104,
+  "probe_hbm_before_static_each_rank": 10565151404,
+  "probe_hbm_after_static_each_call_each_rank": 9668944960,
+  "fixture_or_tensor_or_header_or_prepare_or_compile_calls": 0,
+  "NPU": false,
+  "new_valid_stage_grants": 0,
+  "requested_role": "active",
+  "topology": "TP4/DP4/EP16; E1 synthetic only",
+  "delegated_native_launcher_default_refused_without_creating_work": true
+}

@@ -1,0 +1,756 @@
+{
+  "epoch": 1793969272,
+  "reviewer": "/root/reviewer_engram",
+  "reference_revision": "8fde6d4e335fe300e2b949aab0e31659cce0811d",
+  "frozen_manifest_sha256": "7c5b8df2d57ca06a49106b528c2a018d36cd1524f4df8418e59ffa64b7d24d7f",
+  "onboard_order_rows": [
+    {
+      "case": "prefill_swa",
+      "start": "1793968558",
+      "end": "1793968617",
+      "exit": "0",
+      "devices": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+    },
+    {
+      "case": "prefill_c2",
+      "start": "1793968617",
+      "end": "1793968675",
+      "exit": "0",
+      "devices": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+    },
+    {
+      "case": "decode_swa",
+      "start": "1793968675",
+      "end": "1793968734",
+      "exit": "0",
+      "devices": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+    },
+    {
+      "case": "decode_c2",
+      "start": "1793968734",
+      "end": "1793968794",
+      "exit": "0",
+      "devices": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+    },
+    {
+      "case": "prefill_swa_post",
+      "start": "1793968794",
+      "end": "1793968844",
+      "exit": "0",
+      "devices": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+    },
+    {
+      "case": "decode_c2_post",
+      "start": "1793968844",
+      "end": "1793968908",
+      "exit": "0",
+      "devices": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+    }
+  ],
+  "onboard_order_results": {
+    "decode_c2_post": {
+      "post_mutant": true,
+      "error": "Output(s) does not match golden: ['hidden', 'attn_input', 'window_cache', 'compressed_cache']\n  'hidden' FAIL (ratio_allclose(atol=0.01, rtol=0.01, max_error_ratio=0.05, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))  shape=(16, 2, 5120) dtype=torch.bfloat16\n    ratio_allclose fail: error_count=88352/163840 (ratio=53.9258%, allowed<=5.0000%, threshold=8192 pts)\n    atol=0.01 rtol=0.01\n    max abs diff=0.166016 at (4, 1, 1817) (tol=0.0150781)\n    first 10 mismatches:\n    [1] actual=-0.96875, expected=-1.015625, diff=0.04688, tol=0.02016\n    [2] actual=0.038818359, expected=0.018554688, diff=0.02026, tol=0.01019\n    [3] actual=0.34960938, expected=0.33007812, diff=0.01953, tol=0.0133\n    [4] actual=1.125, expected=1.1484375, diff=0.02344, tol=0.02148\n    [7] actual=-1.6328125, expected=-1.6796875, diff=0.04688, tol=0.0268\n    [8] actual=0.41601562, expected=0.3984375, diff=0.01758, tol=0.01398\n    [9] actual=0.55859375, expected=0.5078125, diff=0.05078, tol=0.01508\n    [10] actual=-0.35546875, expected=-0.3828125, diff=0.02734, tol=0.01383\n    [11] actual=1.796875, expected=1.7578125, diff=0.03906, tol=0.02758\n    [14] actual=0.5859375, expected=0.609375, diff=0.02344, tol=0.01609\n  'attn_input' FAIL (ratio_allclose(atol=0.01, rtol=0.01, max_error_ratio=0.05, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))  shape=(16, 2, 5120) dtype=torch.bfloat16\n    ratio_allclose fail: error_count=89308/163840 (ratio=54.5093%, allowed<=5.0000%, threshold=8192 pts)\n    atol=0.01 rtol=0.01\n    max abs diff=0.158203 at (4, 1, 1817) (tol=0.0148633)\n    first 10 mismatches:\n    [1] actual=-0.875, expected=-0.9140625, diff=0.03906, tol=0.01914\n    [2] actual=0.030761719, expected=0.014709473, diff=0.01605, tol=0.01015\n    [3] actual=0.27539062, expected=0.25976562, diff=0.01562, tol=0.0126\n    [4] actual=0.91796875, expected=0.9375, diff=0.01953, tol=0.01938\n    [7] actual=-1.4609375, expected=-1.5, diff=0.03906, tol=0.025\n    [8] actual=0.37304688, expected=0.35742188, diff=0.01562, tol=0.01357\n    [9] actual=0.4921875, expected=0.44726562, diff=0.04492, tol=0.01447\n    [10] actual=-0.35351562, expected=-0.38085938, diff=0.02734, tol=0.01381\n    [11] actual=1.2890625, expected=1.265625, diff=0.02344, tol=0.02266\n    [13] actual=-1.859375, expected=-1.890625, diff=0.03125, tol=0.02891\n  'window_cache' FAIL (compare)  shape=(16, 20, 128, 1, 512) dtype=torch.bfloat16\noriginal Engram before-attention window_cache rank0:     ratio_allclose fail: error_count=371/1024 (ratio=36.2305%, allowed<=1.0000%, threshold=10 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=0.155029 at (1, 350) (tol=0.0220447)\n    first 10 mismatches:\n    [0] actual=-0.23535156, expected=-0.3046875, diff=0.06934, tol=0.02476\n    [1] actual=-1.5625, expected=-1.6171875, diff=0.05469, tol=0.04527\n    [3] actual=0.91015625, expected=0.828125, diff=0.08203, tol=0.03294\n    [4] actual=-0.042480469, expected=-0.069335938, diff=0.02686, tol=0.02108\n    [7] actual=-0.5390625, expected=-0.5859375, diff=0.04688, tol=0.02916\n    [8] actual=0.10791016, expected=0.051757812, diff=0.05615, tol=0.02081\n    [10] actual=-1.2578125, expected=-1.3046875, diff=0.04688, tol=0.04039\n    [13] actual=1.125, expected=1.0546875, diff=0.07031, tol=0.03648\n    [15] actual=1.796875, expected=1.8671875, diff=0.07031, tol=0.04917\n    [20] actual=1.171875, expected=1.1171875, diff=0.05469, tol=0.03746\n  'compressed_cache' FAIL (compare)  shape=(16, 20, 128, 1, 512) dtype=torch.bfloat16\noriginal Engram before-attention compressed_cache rank0:     ratio_allclose fail: error_count=128/512 (ratio=25.0000%, allowed<=1.0000%, threshold=5 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=0.113281 at (0, 483) (tol=0.0298267)\n    first 10 mismatches:\n    [3] actual=0.49804688, expected=0.54296875, diff=0.04492, tol=0.02848\n    [20] actual=-0.12695312, expected=-0.10205078, diff=0.0249, tol=0.02159\n    [22] actual=-0.67578125, expected=-0.62109375, diff=0.05469, tol=0.0297\n    [26] actual=0.26171875, expected=0.1875, diff=0.07422, tol=0.02293\n    [30] actual=0.43945312, expected=0.50390625, diff=0.06445, tol=0.02787\n    [35] actual=0.8203125, expected=0.87109375, diff=0.05078, tol=0.03361\n    [37] actual=0.20214844, expected=0.14355469, diff=0.05859, tol=0.02224\n    [43] actual=-0.21191406, expected=-0.23828125, diff=0.02637, tol=0.02372\n    [53] actual=1.140625, expected=1.1796875, diff=0.03906, tol=0.03843\n    [66] actual=-1.7734375, expected=-1.7109375, diff=0.0625, tol=0.04673",
+      "phase": "decode",
+      "mode": "c2",
+      "real_rotation_map": true,
+      "full_layer": false
+    },
+    "decode_swa_before": {
+      "post_mutant": false,
+      "error": null,
+      "phase": "decode",
+      "mode": "swa",
+      "real_rotation_map": false,
+      "full_layer": false
+    },
+    "prefill_swa_post": {
+      "post_mutant": true,
+      "error": "Output(s) does not match golden: ['hidden', 'attn_input', 'window_cache']\n  'hidden' FAIL (ratio_allclose(atol=0.01, rtol=0.01, max_error_ratio=0.05, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))  shape=(16, 16, 5120) dtype=torch.bfloat16\n    ratio_allclose fail: error_count=741104/1310720 (ratio=56.5417%, allowed<=5.0000%, threshold=65536 pts)\n    atol=0.01 rtol=0.01\n    max abs diff=0.179688 at (12, 8, 3611) (tol=0.0272656)\n    first 10 mismatches:\n    [6] actual=-0.25585938, expected=-0.28125, diff=0.02539, tol=0.01281\n    [8] actual=0.27929688, expected=0.25976562, diff=0.01953, tol=0.0126\n    [9] actual=0.067382812, expected=0.087890625, diff=0.02051, tol=0.01088\n    [10] actual=0.065917969, expected=0.043945312, diff=0.02197, tol=0.01044\n    [13] actual=-0.72265625, expected=-0.69921875, diff=0.02344, tol=0.01699\n    [14] actual=0.328125, expected=0.37695312, diff=0.04883, tol=0.01377\n    [20] actual=0.071289062, expected=0.0859375, diff=0.01465, tol=0.01086\n    [21] actual=-0.77734375, expected=-0.7578125, diff=0.01953, tol=0.01758\n    [22] actual=-0.28125, expected=-0.33203125, diff=0.05078, tol=0.01332\n    [23] actual=0.16308594, expected=0.11621094, diff=0.04688, tol=0.01116\n  'attn_input' FAIL (ratio_allclose(atol=0.01, rtol=0.01, max_error_ratio=0.05, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))  shape=(16, 16, 5120) dtype=torch.bfloat16\n    ratio_allclose fail: error_count=722092/1310720 (ratio=55.0912%, allowed<=5.0000%, threshold=65536 pts)\n    atol=0.01 rtol=0.01\n    max abs diff=0.15625 at (8, 3, 3081) (tol=0.0467187)\n    first 10 mismatches:\n    [3] actual=0.55078125, expected=0.53515625, diff=0.01562, tol=0.01535\n    [6] actual=-0.40820312, expected=-0.44921875, diff=0.04102, tol=0.01449\n    [7] actual=-0.94140625, expected=-0.91796875, diff=0.02344, tol=0.01918\n    [8] actual=0.41992188, expected=0.390625, diff=0.0293, tol=0.01391\n    [9] actual=0.10009766, expected=0.12988281, diff=0.02979, tol=0.0113\n    [10] actual=0.11035156, expected=0.073730469, diff=0.03662, tol=0.01074\n    [13] actual=-1.0390625, expected=-1.0078125, diff=0.03125, tol=0.02008\n    [14] actual=0.60546875, expected=0.6953125, diff=0.08984, tol=0.01695\n    [20] actual=0.11523438, expected=0.13867188, diff=0.02344, tol=0.01139\n    [21] actual=-1.25, expected=-1.21875, diff=0.03125, tol=0.02219\n  'window_cache' FAIL (compare)  shape=(16, 20, 128, 1, 512) dtype=torch.bfloat16\noriginal Engram before-attention window_cache rank0:     ratio_allclose fail: error_count=2822/8192 (ratio=34.4482%, allowed<=1.0000%, threshold=82 pts)\n    atol=0.02 rtol=0.015625\n    max abs diff=0.171875 at (12, 107) (tol=0.0341602)\n    first 10 mismatches:\n    [1] actual=-1.3828125, expected=-1.3359375, diff=0.04688, tol=0.04087\n    [2] actual=0.66015625, expected=0.70703125, diff=0.04688, tol=0.03105\n    [3] actual=0.85546875, expected=0.8203125, diff=0.03516, tol=0.03282\n    [7] actual=-0.7578125, expected=-0.71875, diff=0.03906, tol=0.03123\n    [9] actual=0.40234375, expected=0.35351562, diff=0.04883, tol=0.02552\n    [10] actual=-0.55078125, expected=-0.58203125, diff=0.03125, tol=0.02909\n    [11] actual=0.040771484, expected=-0.0076599121, diff=0.04843, tol=0.02012\n    [14] actual=-0.375, expected=-0.42382812, diff=0.04883, tol=0.02662\n    [17] actual=-0.390625, expected=-0.359375, diff=0.03125, tol=0.02562\n    [18] actual=-0.51953125, expected=-0.5703125, diff=0.05078, tol=0.02891",
+      "phase": "prefill",
+      "mode": "swa",
+      "real_rotation_map": false,
+      "full_layer": false
+    },
+    "decode_c2_before": {
+      "post_mutant": false,
+      "error": null,
+      "phase": "decode",
+      "mode": "c2",
+      "real_rotation_map": true,
+      "full_layer": false
+    },
+    "prefill_c2_before": {
+      "post_mutant": false,
+      "error": null,
+      "phase": "prefill",
+      "mode": "c2",
+      "real_rotation_map": true,
+      "full_layer": false
+    },
+    "prefill_swa_before": {
+      "post_mutant": false,
+      "error": null,
+      "phase": "prefill",
+      "mode": "swa",
+      "real_rotation_map": false,
+      "full_layer": false
+    }
+  },
+  "onboard_order_platforms": {
+    "onboard_order/build_output/_jit_decode_layer_entry_20261106_203919_werctajl/distributed_meta.json": "a2a3",
+    "onboard_order/build_output/_jit_decode_layer_entry_20261106_203822_pfimj566/distributed_meta.json": "a2a3",
+    "onboard_order/build_output/_jit_decode_layer_entry_20261106_204111_yom1i4fw/distributed_meta.json": "a2a3",
+    "onboard_order/build_output/_jit_prefill_layer_entry_20261106_203722_ww7ireno/distributed_meta.json": "a2a3",
+    "onboard_order/build_output/_jit_prefill_layer_entry_20261106_204017_evml4k8k/distributed_meta.json": "a2a3",
+    "onboard_order/build_output/_jit_prefill_layer_entry_20261106_203621_y_d5mntg/distributed_meta.json": "a2a3"
+  },
+  "onboard_order_output_verdicts": {
+    "prefill_c2.log": [
+      [
+        "hidden",
+        "PASS"
+      ],
+      [
+        "attn_input",
+        "PASS"
+      ],
+      [
+        "window_cache",
+        "PASS"
+      ],
+      [
+        "compressed_cache",
+        "PASS"
+      ]
+    ],
+    "decode_c2_post.log": [
+      [
+        "hidden",
+        "FAIL"
+      ],
+      [
+        "attn_input",
+        "FAIL"
+      ],
+      [
+        "window_cache",
+        "FAIL"
+      ],
+      [
+        "compressed_cache",
+        "FAIL"
+      ]
+    ],
+    "prefill_swa.log": [
+      [
+        "hidden",
+        "PASS"
+      ],
+      [
+        "attn_input",
+        "PASS"
+      ],
+      [
+        "window_cache",
+        "PASS"
+      ]
+    ],
+    "prefill_swa_post.log": [
+      [
+        "hidden",
+        "FAIL"
+      ],
+      [
+        "attn_input",
+        "FAIL"
+      ],
+      [
+        "window_cache",
+        "FAIL"
+      ]
+    ],
+    "decode_swa.log": [
+      [
+        "hidden",
+        "PASS"
+      ],
+      [
+        "attn_input",
+        "PASS"
+      ],
+      [
+        "window_cache",
+        "PASS"
+      ]
+    ],
+    "decode_c2.log": [
+      [
+        "hidden",
+        "PASS"
+      ],
+      [
+        "attn_input",
+        "PASS"
+      ],
+      [
+        "window_cache",
+        "PASS"
+      ],
+      [
+        "compressed_cache",
+        "PASS"
+      ]
+    ]
+  },
+  "onboard_layers_rows": [
+    {
+      "case": "prefill_swa",
+      "start": "1793969029",
+      "end": "1793969147",
+      "exit": "0",
+      "devices": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+    },
+    {
+      "case": "decode_c2",
+      "start": "1793969147",
+      "end": "1793969242",
+      "exit": "0",
+      "devices": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+    }
+  ],
+  "onboard_layers_results": {
+    "prefill_swa_before_full": {
+      "post_mutant": false,
+      "error": null,
+      "phase": "prefill",
+      "mode": "swa",
+      "real_rotation_map": true,
+      "full_layer": true
+    },
+    "decode_c2_before_full": {
+      "post_mutant": false,
+      "error": null,
+      "phase": "decode",
+      "mode": "c2",
+      "real_rotation_map": true,
+      "full_layer": true
+    }
+  },
+  "onboard_layers_platforms": {
+    "onboard_layers/build_output/_jit_decode_layer_entry_20261106_204615_9vrzctiw/distributed_meta.json": "a2a3",
+    "onboard_layers/build_output/_jit_decode_layer_moe_entry_20261106_204630_ge570n8h/distributed_meta.json": "a2a3",
+    "onboard_layers/build_output/_jit_prefill_layer_epilogue_entry_20261106_204434_fwj6us7g/distributed_meta.json": "a2a3",
+    "onboard_layers/build_output/_jit_prefill_layer_entry_20261106_204414_ntme_unq/distributed_meta.json": "a2a3",
+    "onboard_layers/build_output/_jit_prefill_layer_moe_entry_20261106_204433_ysgq7uby/distributed_meta.json": "a2a3",
+    "onboard_layers/build_output/_jit_decode_layer_epilogue_entry_20261106_204631_8u9l3ub7/distributed_meta.json": "a2a3"
+  },
+  "onboard_layers_output_verdicts": {
+    "prefill_swa.log": [
+      [
+        "hidden",
+        "PASS"
+      ],
+      [
+        "attn_input",
+        "PASS"
+      ],
+      [
+        "attn_out",
+        "PASS"
+      ],
+      [
+        "x_hc_mid",
+        "PASS"
+      ],
+      [
+        "ffn_input",
+        "PASS"
+      ],
+      [
+        "next_pre_mix",
+        "PASS"
+      ],
+      [
+        "ffn_normed",
+        "PASS"
+      ],
+      [
+        "route_indices",
+        "PASS"
+      ],
+      [
+        "route_weights",
+        "PASS"
+      ],
+      [
+        "ffn_owned",
+        "PASS"
+      ],
+      [
+        "x_hc_out",
+        "PASS"
+      ],
+      [
+        "window_cache",
+        "PASS"
+      ],
+      [
+        "compressed_cache",
+        "PASS"
+      ],
+      [
+        "index_cache",
+        "PASS"
+      ],
+      [
+        "topk_indices",
+        "PASS"
+      ],
+      [
+        "topk_values",
+        "PASS"
+      ],
+      [
+        "pool_block_ids",
+        "PASS"
+      ],
+      [
+        "pool_block_counts",
+        "PASS"
+      ],
+      [
+        "state_cache",
+        "PASS"
+      ]
+    ],
+    "decode_c2.log": [
+      [
+        "hidden",
+        "PASS"
+      ],
+      [
+        "attn_input",
+        "PASS"
+      ],
+      [
+        "attn_out",
+        "PASS"
+      ],
+      [
+        "x_hc_mid",
+        "PASS"
+      ],
+      [
+        "ffn_input",
+        "PASS"
+      ],
+      [
+        "next_pre_mix",
+        "PASS"
+      ],
+      [
+        "ffn_normed",
+        "PASS"
+      ],
+      [
+        "route_indices",
+        "PASS"
+      ],
+      [
+        "route_weights",
+        "PASS"
+      ],
+      [
+        "ffn_owned",
+        "PASS"
+      ],
+      [
+        "x_hc_out",
+        "PASS"
+      ],
+      [
+        "window_cache",
+        "PASS"
+      ],
+      [
+        "compressed_cache",
+        "PASS"
+      ],
+      [
+        "index_cache",
+        "PASS"
+      ],
+      [
+        "topk_indices",
+        "PASS"
+      ],
+      [
+        "topk_values",
+        "PASS"
+      ],
+      [
+        "pool_block_ids",
+        "PASS"
+      ],
+      [
+        "pool_block_counts",
+        "PASS"
+      ],
+      [
+        "state_cache",
+        "PASS"
+      ]
+    ]
+  },
+  "invalid_initial_simulator_platforms": {
+    "order/build_output/_jit_decode_layer_entry_20261106_201754_4qs_sig4/distributed_meta.json": "a2a3sim",
+    "order/build_output/_jit_prefill_layer_entry_20261106_201508_7u4_giso/distributed_meta.json": "a2a3sim",
+    "order/build_output/_jit_prefill_layer_entry_20261106_201621_2xtxpgzc/distributed_meta.json": "a2a3sim",
+    "order/build_output/_jit_decode_layer_entry_20261106_202157_gtjm6ege/distributed_meta.json": "a2a3sim",
+    "order/build_output/_jit_decode_layer_entry_20261106_201912_xta6cton/distributed_meta.json": "a2a3sim",
+    "order/build_output/_jit_prefill_layer_entry_20261106_202042_ym8u0vn_/distributed_meta.json": "a2a3sim",
+    "layers/build_output/_jit_prefill_layer_entry_20261106_202336_ks0w5xpc/distributed_meta.json": "a2a3sim",
+    "layers/build_output/_jit_decode_layer_moe_entry_20261106_202618_3t6mkdev/distributed_meta.json": "a2a3sim",
+    "layers/build_output/_jit_prefill_layer_moe_entry_20261106_202351_4uta2on2/distributed_meta.json": "a2a3sim",
+    "layers/build_output/_jit_decode_layer_entry_20261106_202606_xraojy11/distributed_meta.json": "a2a3sim",
+    "layers/build_output/_jit_decode_layer_epilogue_entry_20261106_202619_fa592tdd/distributed_meta.json": "a2a3sim",
+    "layers/build_output/_jit_prefill_layer_epilogue_entry_20261106_202353_sluogqd6/distributed_meta.json": "a2a3sim"
+  },
+  "frozen_main_simulator_platforms": {
+    "main/order_suite/build_output/_jit_prefill_layer_entry_20261106_194310_jtujzniy/distributed_meta.json": "a2a3sim",
+    "main/order_suite/build_output/_jit_prefill_layer_entry_20261106_194731_jkf_lswl/distributed_meta.json": "a2a3sim",
+    "main/order_suite/build_output/_jit_decode_layer_entry_20261106_194442_ugqwqv9x/distributed_meta.json": "a2a3sim",
+    "main/order_suite/build_output/_jit_decode_layer_entry_20261106_194558_ir0ci6uo/distributed_meta.json": "a2a3sim",
+    "main/order_suite/build_output/_jit_decode_layer_entry_20261106_194847_mt2rpcpu/distributed_meta.json": "a2a3sim",
+    "main/full_layers/build_output/_jit_decode_layer_moe_entry_20261106_195255_9zmmb0y5/distributed_meta.json": "a2a3sim",
+    "main/full_layers/build_output/_jit_prefill_layer_entry_20261106_195020_zrv34wmr/distributed_meta.json": "a2a3sim",
+    "main/full_layers/build_output/_jit_decode_layer_entry_20261106_195243_ur4ojz6b/distributed_meta.json": "a2a3sim",
+    "main/full_layers/build_output/_jit_prefill_layer_moe_entry_20261106_195036_v9skrw0d/distributed_meta.json": "a2a3sim",
+    "main/full_layers/build_output/_jit_prefill_layer_epilogue_entry_20261106_195037_no2fz3wh/distributed_meta.json": "a2a3sim",
+    "main/full_layers/build_output/_jit_decode_layer_epilogue_entry_20261106_195256_k61im18b/distributed_meta.json": "a2a3sim"
+  },
+  "loader_results": {
+    "synthetic_stored_orientation_exact": true,
+    "cache_reused": true,
+    "invalid_controls": {
+      "off_block": "Engram gate requires repeated block32 global rotation",
+      "different_block": "Engram gate requires repeated block32 global rotation",
+      "wrong_shape": "global rotation shape must match hidden size",
+      "metadata": "unsupported Engram rotation contract",
+      "missing_map": "explicit FileNotFoundError"
+    },
+    "real_rotation_map_only": {
+      "shape": [
+        32,
+        32
+      ],
+      "dtype": "torch.float32",
+      "block_sha256": "68fef81121ad4d31c34d7659a684bff34d2fc1de23bc46201cf6cf35606fca1a",
+      "orthogonality_max_abs": 5.960464477539063e-08
+    },
+    "limits": "Only optional rotation map/config read from real checkpoint; no model/Engram table weights loaded, no checkpoint writes."
+  },
+  "binding_results": {
+    "actual_top_loader_and_rank_carrier_preserve_resource": true,
+    "actual_entry_contract_and_assembler": {
+      "prefill": {
+        "rotation_shape": [
+          16,
+          32,
+          32
+        ],
+        "rotation_binding_exact": true,
+        "actual_pool_cap": 2048,
+        "actual_pool_arguments": [
+          "pool_block_ids_c2a",
+          "pool_block_ids_c1a"
+        ]
+      },
+      "decode": {
+        "rotation_shape": [
+          16,
+          32,
+          32
+        ],
+        "rotation_binding_exact": true,
+        "actual_pool_cap": 2048,
+        "actual_pool_arguments": [
+          "pool_block_ids"
+        ]
+      }
+    },
+    "limits": "Real optional rotation map only; model weight methods stubbed to avoid full loads. Actual bounded fixture contracts inspected, no claim that other generator F11-F13 values are valid or generation executes."
+  },
+  "semantics": {
+    "archive_exact_original_sources": {
+      "engram/common.py": "4797b8962264d137cdb142a9988825288283092fb797ddbd334c6ab2223eb58d",
+      "engram/layer.py": "dc9457c88aa3c90133115bc608447e037b0693f8db71bb8da37f1ead44021f80",
+      "model.py": "101f96b38e9fc47e7be147ddfe56976aee896867c73a33a7d95c3e3c833a6e91"
+    },
+    "original_positive_zero_and_tiny_signed_clamp": [
+      1.500249981880188,
+      1.500249981880188,
+      1.499750018119812
+    ],
+    "rotation_stored_R_inverse_RT_verified": true,
+    "source_BF16_projection_FP32_gate_and_residual": true,
+    "reference_revision": "8fde6d4e335fe300e2b949aab0e31659cce0811d",
+    "limits": "CPU Torch stand-ins; original torch_npu reduction/tie behavior unproven; no weights/table loads."
+  },
+  "generated_review": {
+    "complete_forward_compiles": {
+      "compile/full_compile/_jit_decode_fwd_20261106_201518_n7gbv22t/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp": {
+        "sha256": "2db12db1c8c8c372bcb612b430e87f3a86d444037cf0e3f01c04f218cbb5a8af",
+        "lines": [
+          126,
+          430,
+          882,
+          885,
+          905,
+          931,
+          5455,
+          5467,
+          10520,
+          10532
+        ],
+        "restore_before_gate": true
+      },
+      "compile/full_compile/_jit_prefill_fwd_20261106_201544_0m2ujapj/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp": {
+        "sha256": "ee474e680e43287d7c3d6ac55679498b32225f6efe40bc6d5594aedc586c0a55",
+        "lines": [
+          115,
+          1415,
+          1418,
+          1438,
+          1464,
+          6209
+        ],
+        "restore_before_gate": true
+      }
+    },
+    "all_existing_F14_loader_methods_except_resource_binding_AST_unchanged": true,
+    "new_loader_methods_only": [
+      "engram_rotation"
+    ]
+  },
+  "mode_audit": {
+    "runtime_RunConfig_source": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/pypto/runtime/runner.py",
+    "configurations": {
+      "helper": {
+        "execution_mode": "ExecutionMode.SIM",
+        "is_sim": true,
+        "is_onboard": false
+      },
+      "standalone": {
+        "execution_mode": "ExecutionMode.ONBOARD",
+        "is_sim": false,
+        "is_onboard": true
+      },
+      "corrected": {
+        "execution_mode": "ExecutionMode.ONBOARD",
+        "is_sim": false,
+        "is_onboard": true
+      }
+    }
+  },
+  "complete_forward_cpu_compiles": [
+    {
+      "entry": "decode_fwd",
+      "start": "1793967309",
+      "end": "1793967336",
+      "exit": "0"
+    },
+    {
+      "entry": "prefill_fwd",
+      "start": "1793967336",
+      "end": "1793967364",
+      "exit": "0"
+    }
+  ],
+  "failed_actual_onecard_rows": {
+    "defaults_attempt1": [
+      {
+        "entry": "mla_proj",
+        "start": "1793968228",
+        "end": "1793968245",
+        "exit": "1",
+        "device": "1"
+      },
+      {
+        "entry": "o_proj",
+        "start": "1793968245",
+        "end": "1793968261",
+        "exit": "1",
+        "device": "1"
+      },
+      {
+        "entry": "engram",
+        "start": "1793968261",
+        "end": "1793968278",
+        "exit": "1",
+        "device": "1"
+      },
+      {
+        "entry": "moe_gate",
+        "start": "1793968278",
+        "end": "1793968294",
+        "exit": "1",
+        "device": "1"
+      },
+      {
+        "entry": "compressor",
+        "start": "1793968294",
+        "end": "1793968310",
+        "exit": "1",
+        "device": "1"
+      },
+      {
+        "entry": "indexer",
+        "start": "1793968310",
+        "end": "1793968329",
+        "exit": "1",
+        "device": "1"
+      },
+      {
+        "entry": "decode_swa",
+        "start": "1793968329",
+        "end": "1793968349",
+        "exit": "1",
+        "device": "1"
+      }
+    ],
+    "cap_attempt1": [
+      {
+        "entry": "negative64",
+        "start": "1793968229",
+        "end": "1793968243",
+        "exit": "0",
+        "device": "2"
+      },
+      {
+        "entry": "indexer",
+        "start": "1793968243",
+        "end": "1793968261",
+        "exit": "1",
+        "device": "2"
+      },
+      {
+        "entry": "prefill_c1a_full",
+        "start": "1793968261",
+        "end": "1793968286",
+        "exit": "1",
+        "device": "2"
+      },
+      {
+        "entry": "prefill_c2a_full",
+        "start": "1793968286",
+        "end": "1793968311",
+        "exit": "1",
+        "device": "2"
+      },
+      {
+        "entry": "decode_c1a_full",
+        "start": "1793968311",
+        "end": "1793968337",
+        "exit": "1",
+        "device": "2"
+      }
+    ],
+    "basis": [
+      {
+        "mode": "before",
+        "start": "1793968228",
+        "end": "1793968245",
+        "exit": "0",
+        "device": "0"
+      },
+      {
+        "mode": "missing",
+        "start": "1793968245",
+        "end": "1793968262",
+        "exit": "0",
+        "device": "0"
+      },
+      {
+        "mode": "transpose",
+        "start": "1793968262",
+        "end": "1793968280",
+        "exit": "0",
+        "device": "0"
+      },
+      {
+        "mode": "double_value",
+        "start": "1793968280",
+        "end": "1793968298",
+        "exit": "0",
+        "device": "0"
+      },
+      {
+        "mode": "random",
+        "start": "1793968298",
+        "end": "1793968317",
+        "exit": "0",
+        "device": "0"
+      },
+      {
+        "mode": "fp32_projection",
+        "start": "1793968317",
+        "end": "1793968337",
+        "exit": "0",
+        "device": "0"
+      },
+      {
+        "mode": "bf16_output",
+        "start": "1793968337",
+        "end": "1793968354",
+        "exit": "0",
+        "device": "0"
+      },
+      {
+        "mode": "after",
+        "start": "1793968354",
+        "end": "1793968371",
+        "exit": "0",
+        "device": "0"
+      }
+    ],
+    "defaults": [
+      {
+        "entry": "mla_proj",
+        "start": "1793968453",
+        "end": "1793968471",
+        "exit": "0",
+        "device": "0"
+      },
+      {
+        "entry": "o_proj",
+        "start": "1793968471",
+        "end": "1793968487",
+        "exit": "0",
+        "device": "0"
+      },
+      {
+        "entry": "engram",
+        "start": "1793968487",
+        "end": "1793968507",
+        "exit": "0",
+        "device": "0"
+      }
+    ]
+  },
+  "dispositions": {
+    "F05": "OPEN: source/CPU and real16-layer evidence support repair; required actual onecard default/original controls incomplete due nativeL2 EACCES; simulated controls invalid as device evidence",
+    "F06": "PASS bounded actual16-device order4positives/2numerical controls and2staged layers with real rotation; no40-layer/full-model acceptance",
+    "F07": "OPEN: source/CPU contract passes; actual18positives/publication boundaries/old64 numerical control incomplete due nativeL2 EACCES; simulated control invalid as device evidence"
+  },
+  "cohort_acceptance": "INCOMPLETE; observer decision required; no whole-cohort acceptance recommended",
+  "limits": [
+    "F09/F11-F13 OPEN/HELD",
+    "No40-layer device or checkpoint/full-model/generation parity",
+    "No original torch_npu primitive/reduction/quantization-tie parity",
+    "Full-model pool-state/standaloneTP/CI/ordinary layer suite/offset-incidence remain open",
+    "No full model weights or Engram tables loaded",
+    "Allocated simulator runs and runtime exceptions never count as onboard numerical acceptance"
+  ]
+}

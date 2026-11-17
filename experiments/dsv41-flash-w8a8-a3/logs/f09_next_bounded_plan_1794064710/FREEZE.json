@@ -1,0 +1,16 @@
+{
+  "status": "FINAL/PARK",
+  "artifact_count": 8,
+  "artifact_manifest_sha256": "1d2798b31dc11684ca528c54286114684389365160393276dfa9422643f9b199",
+  "source45_base_sha256": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "productCC_unchanged": true,
+  "product_edits": 0,
+  "shared_docs_ledgers_edits": 0,
+  "native_jobs": 0,
+  "payload_bytes": 0,
+  "compile_jobs": 0,
+  "actual_grants": 0,
+  "all_own_jobs_writers_parked": true,
+  "scope": "capacity2 active-S/two-request isolation PLAN; not physicalaxis/generalF09 acceptance",
+  "end_epoch": 1794065754
+}

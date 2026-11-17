@@ -1,0 +1,13 @@
+{
+  "CPU_test_jobs": 0,
+  "NPU_jobs": 0,
+  "agent": "review-agent",
+  "elapsed_seconds": 410,
+  "end_epoch": 1794075742,
+  "id": "independent-hc-rebind-preflight-1794075332-1794075742",
+  "payload_bytes": 0,
+  "producer_imports": 0,
+  "protected_source_writes": 0,
+  "start_epoch": 1794075332,
+  "state": "FINAL_PARK_SOURCE_ONLY"
+}

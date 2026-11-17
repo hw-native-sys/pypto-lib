@@ -1,0 +1,9 @@
+{
+  "state": "FINAL_PARK_PROVISIONAL_SOURCE_CHECKPOINT",
+  "epoch": 1794109591,
+  "files": 50,
+  "manifest_sha256": "5ed41eb8082b0a9e05138d29d3ac87b16a413d7d0977ba95ba46be6b60f77b61",
+  "source_only": true,
+  "coherent_freeze_or_implementation_acceptance": false,
+  "TIME_LOG_self_imported_id": "independent-configurable-integration-1794109023-1794109591"
+}

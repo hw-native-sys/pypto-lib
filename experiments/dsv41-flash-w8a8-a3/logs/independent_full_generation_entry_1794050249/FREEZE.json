@@ -1,0 +1,17 @@
+{
+  "status": "FINAL/PARK",
+  "epoch": 1794051756,
+  "artifact_count": 92,
+  "artifacts_sha256": "9b1c7182a27f29b7584f2c309fdc3b8ff361368721517fd2108bad062a765920",
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "candidate_v2_sha256": "d057012464331b10b0bdc7f406925ee0c552dd298a1db171a93b0b1595769598",
+  "metadata_plan_sha256": "3dd67b88683d0de1f5fbd8e889c0c1a875eeecf671263fca4c64061637ecd9c0",
+  "all_own_jobs_terminal": true,
+  "own_native_jobs": 0,
+  "checkpoint_tensor_payload_reads": 0,
+  "excluded_recursive_files": [
+    "artifacts.json",
+    "FREEZE.json"
+  ],
+  "operational_mutable_files": []
+}

@@ -1,0 +1,42 @@
+{
+  "checks": [
+    {
+      "source": "checkpoint_pipeline_v3/check_guards_storage.py",
+      "sha256": "a0311f3713421e044f13bac55ec6b029dc2918f496b390741f8810f976e5988b",
+      "scope": "small CPU / mocked heavy bodies; no full fixture"
+    },
+    {
+      "source": "checkpoint_pipeline_v3/check_preimport_policy.py",
+      "sha256": "624cc46dcdab0e20d0489710e4f8332f67cf5edebfeb8dca0fd3ca1e93c78137",
+      "scope": "small CPU / mocked heavy bodies; no full fixture"
+    },
+    {
+      "source": "checkpoint_pipeline_v3/check_retention.py",
+      "sha256": "b98e7f72bc3b4f8f7ab14a1b1620a47e3746eae6697dde05daa3e78755ad4eb3",
+      "scope": "small CPU / mocked heavy bodies; no full fixture"
+    },
+    {
+      "source": "checkpoint_pipeline_v3/check_mocked_chain_label.py",
+      "sha256": "2538990028cd03d17da83aac8bfe787aef19714a426b2f2bb59d722755ecf9a2",
+      "scope": "small CPU / mocked heavy bodies; no full fixture"
+    },
+    {
+      "source": "checkpoint_pipeline_v3/check_real_bindings.py",
+      "sha256": "24f9577458f15a7adeef35d26530be12985da8af22dfc23afeb1c88d1bab9496",
+      "scope": "small CPU / mocked heavy bodies; no full fixture"
+    },
+    {
+      "source": "integration/check_bridge.py",
+      "sha256": "5f51b8a5afd6779b1cc0daa59c1777c9adafcfb793c78318f714b2409eb67f11",
+      "scope": "small CPU / mocked heavy bodies; no full fixture"
+    },
+    {
+      "source": "integration/check_control.py",
+      "sha256": "fdbe0ae343efe51ccbf85703ff789e4cfbf27a99b07bc8c476b420451b3ae51c",
+      "scope": "small CPU / mocked heavy bodies; no full fixture"
+    }
+  ],
+  "NPU": 0,
+  "large_fixture": 0,
+  "native_acceptance": false
+}

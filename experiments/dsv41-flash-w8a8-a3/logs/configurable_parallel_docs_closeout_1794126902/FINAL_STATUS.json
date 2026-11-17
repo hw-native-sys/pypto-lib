@@ -1,0 +1,23 @@
+{
+  "status": "FINAL_PARK_DOCS_ONLY",
+  "published": {
+    "published": true,
+    "Root_disposition_sha256": "c66550dd667eae41a925dee4be4b18683c313f2965c59f19e15b76eafe07979b",
+    "owner_seal_status": "PENDING",
+    "docs_after": {
+      "MODULES.md": "7b581ef155b9e7dff710465b2d2376f0cdaf44a7dee408bf80f15a841f470ed5",
+      "INTERFACE.md": "b93b73b5f64353be0c5c21566b568f20bed2362af3a651fb527514eaa06756c4",
+      "HANDOFF.md": "32280fe6b1298aae3383d5f1569ccb2eb17e543d14e47979315bf52c1981377e"
+    },
+    "source_unchanged": true
+  },
+  "Root_bounded_milestone": "ACCEPTED_BOUNDED_CONFIGURABLE_REAL_TEXT",
+  "whole_case": "NOT_ACCEPTED_STRICT_TELEMETRY259",
+  "source45": "f0e91a30e4117e110be183ef44acf2874eea813cc6f72ac7c7fa44bc4ede3a7f",
+  "tests_CPU_NPU": 0,
+  "model_runtime_oldseal_writes": 0,
+  "Root_TASKS_STATE_writes": 0,
+  "Main_interval_imported_once": true,
+  "owner_final_at_publication": "PENDING",
+  "source_hold_release": "ONLY_ROOT_AFTER_OWNER_FINAL"
+}

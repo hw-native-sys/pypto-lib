@@ -1,0 +1,59 @@
+{
+  "status": "PASS_REAL_EXECUTE_RECORDING_MOCK_AND_SAVED_TP_ONLY",
+  "actual_driver_main_execute_record_compare_exercised": true,
+  "three_cases": [
+    {
+      "label": "both",
+      "sentinel": 1,
+      "active": [
+        1,
+        1
+      ],
+      "total": 12
+    },
+    {
+      "label": "idle_rank1",
+      "sentinel": 2,
+      "active": [
+        1,
+        0
+      ],
+      "total": 6
+    },
+    {
+      "label": "idle_rank0",
+      "sentinel": 3,
+      "active": [
+        0,
+        1
+      ],
+      "total": 6
+    }
+  ],
+  "earlier_capsule_bytes_unchanged_after_later_callbacks": true,
+  "six_mock_capsules": {
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_configurable_capture_fix_1794113378/cpu_mock_execute/both/routed_actual_expected.pt": "98907a9c6c7f73599983d99bd1037c56115af1538e0d7eb711c6fea9e8d0e72e",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_configurable_capture_fix_1794113378/cpu_mock_execute/both/counts_actual_expected.pt": "eceb0be0a6fcbd04ab30577f7e4240a4620698699344f7f82a6341aa445e63e4",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_configurable_capture_fix_1794113378/cpu_mock_execute/idle_rank1/routed_actual_expected.pt": "8acf5264aa66616168762054dbf3be01079734d3c23f69e4df4747a6dccd13b0",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_configurable_capture_fix_1794113378/cpu_mock_execute/idle_rank1/counts_actual_expected.pt": "2122d946587fa247f74b06e13fee639a13d1f8ffb1314874357d728e25e6af14",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_configurable_capture_fix_1794113378/cpu_mock_execute/idle_rank0/routed_actual_expected.pt": "5be10849f1d56e92b3b3d8b86d473e52a77ac9c9b883b6946820be99c07b0331",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_configurable_capture_fix_1794113378/cpu_mock_execute/idle_rank0/counts_actual_expected.pt": "e08560ec5fe74005e5cd2969ef03bf69a31ad0ebfb602a9ea7cbf7f61d53c655"
+  },
+  "driver_main_AST_delta": "only configured=dict(comparators or {})",
+  "saved_TP_exact_two_groups_and_score_tail": true,
+  "saved_TP_capsules_before_after": {
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_configurable_components_cli_1794112381/tp/work/tp_output/partial_actual_expected.pt": "3fbfd5ca60b9fe1aa0e77c93d570bceba1f28835d860a0bcd4f152fae682bef6",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_configurable_components_cli_1794112381/tp/work/tp_output/summed_actual_expected.pt": "4028e229c4dcb0dbff23e2a4dbd7a77cd0ba0d9724d0d0872effe7773bec3ebd",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_configurable_components_cli_1794112381/tp/work/tp_score/scores_actual_expected.pt": "31189095802bbde8ed0c25bac92a2de1bc202db1523ecefade27573fb8f49cd8"
+  },
+  "TP_cleanup_rechecked": true,
+  "old_EP_first2_snapshots_still_LOST_UNKNOWN": true,
+  "model_sources_unchanged": true,
+  "large_fixtures": 0,
+  "original_expert_references": 0,
+  "compile": 0,
+  "public_prepare_query": 0,
+  "native": 0,
+  "real_grants_written": 0,
+  "completed_utc": "2026-11-08T04:53:03.131094+00:00"
+}

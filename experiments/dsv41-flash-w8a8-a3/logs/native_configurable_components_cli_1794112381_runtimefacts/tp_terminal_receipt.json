@@ -1,0 +1,35 @@
+{
+  "status": "TP_NATIVE_GATES_AND_BOUNDED_CLEANUP_PASS_PENDING_TARGETED_SAVEDPACKET_AUDIT",
+  "task": "task_20261108_124231_143528315331",
+  "exit": 0,
+  "actual": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "both_RunResult_passed": true,
+  "raw_image_frees": 8,
+  "query_normal_public_close": true,
+  "query_birth": {
+    "pid": 1435755,
+    "start_ticks": "111287860"
+  },
+  "query_same_birth_absent": true,
+  "logged_PIDs_currently_absent": [
+    1435395,
+    1436542,
+    1437578,
+    1437580,
+    1437582,
+    1437584,
+    1438682,
+    1438684,
+    1438686,
+    1438688
+  ],
+  "historical_unobserved_birth_start_ticks": "UNKNOWN",
+  "raw_locks0123_released": true,
+  "board0_1_no_processes": true,
+  "baseline_HBM_not_zero_claimed": true
+}

@@ -1,0 +1,121 @@
+{
+  "capacity": 2,
+  "active": 1,
+  "old_overlap_pairs": [
+    [
+      0,
+      1,
+      [
+        1
+      ]
+    ],
+    [
+      1,
+      2,
+      [
+        2
+      ]
+    ],
+    [
+      2,
+      3,
+      [
+        3
+      ]
+    ],
+    [
+      3,
+      4,
+      [
+        4
+      ]
+    ],
+    [
+      4,
+      5,
+      [
+        5
+      ]
+    ],
+    [
+      5,
+      6,
+      [
+        6
+      ]
+    ],
+    [
+      6,
+      7,
+      [
+        7
+      ]
+    ],
+    [
+      7,
+      8,
+      [
+        8
+      ]
+    ],
+    [
+      8,
+      9,
+      [
+        9
+      ]
+    ],
+    [
+      9,
+      10,
+      [
+        10
+      ]
+    ],
+    [
+      10,
+      11,
+      [
+        11
+      ]
+    ],
+    [
+      11,
+      12,
+      [
+        12
+      ]
+    ],
+    [
+      12,
+      13,
+      [
+        13
+      ]
+    ],
+    [
+      13,
+      14,
+      [
+        14
+      ]
+    ],
+    [
+      14,
+      15,
+      [
+        15
+      ]
+    ]
+  ],
+  "new_overlap_pairs": [],
+  "unequal_peer_example": {
+    "source_rank": 1,
+    "source_active": 1,
+    "destination_active": 2,
+    "old_push_offset": 1,
+    "old_compact_offset": 2,
+    "fixed_both": 2
+  },
+  "limits": "CPU geometry proves overlap and mismatched addresses, not a particular NPU overwrite schedule."
+}

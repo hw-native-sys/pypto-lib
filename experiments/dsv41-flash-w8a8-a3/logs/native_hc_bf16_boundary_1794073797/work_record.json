@@ -1,0 +1,19 @@
+{
+  "role": "review-agent",
+  "start_epoch": 1794073737,
+  "artifact_epoch": 1794073799.4765208,
+  "shared_writes": 0,
+  "root_go": "observer-20261108-hc-bf16-native-micro",
+  "state": "PARKED_FAILED_NATIVE_AUDITED",
+  "end_epoch": 1794074110.1245697,
+  "native_task": "task_20261108_015136_337085225477",
+  "native_exit": 1,
+  "audit_task": "task_20261108_015341_33775953750",
+  "audit_exit": 0,
+  "audit_passed": 18,
+  "audit_unmet": 0,
+  "no_retry": true,
+  "first_cause": "probe.py:187 old_control positive-difference AND positive-nonrepresentability assertion; exact counts not persisted",
+  "normal_child_exit": false,
+  "remaining_tasks": []
+}

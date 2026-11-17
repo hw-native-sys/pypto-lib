@@ -1,0 +1,14 @@
+{
+  "pypto_checkout": "38a8aa6da24c62bf0c6f6f9ef94deb513fbb4d2e",
+  "simpler_checkout": "31f9e72ee6832cd198b77df18c1c305e7fd83676",
+  "pto_isa_pin": "f83d4b7e4be0a4ca9805944ae2d9ce8c84e581f7",
+  "toolchain_versions_env_sha256": "15067c515da2dfb9768e61ef28d88debf817066ca2163a32c9fe36c9d4c2c53f",
+  "ptoas_executable_sha256": "132f5970d59c9fab664535a024c0942fa3663e4ef5993b1fe3355686f75b4e64",
+  "source45_manifest_sha256": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "source45_verified_unchanged": 45,
+  "draft_manifest_sha256": "5a2ccfb048c16742248c158708711d8ac6bd7e3ae586528336d5065b1d02586f",
+  "draft_patch_sha256": "7520f4c6d7f144b0a2937751b9f43ad6c45c653c4b8fca49606c8d0dc4134c72",
+  "original_archive_sha256": "48c797546805b04ffde118c506f8902e37e19bf2cb5d1713097056a4c93e998c",
+  "compile_result_sha256": "bb0ab874fe9c8b3f2fb902c324df6faf6490d98edb1d60af2be40c7ca5d03b13",
+  "installed_pypto_note": "Compilation uses existing .venv-local installed pypto; checkout refs identify selected environment source, compiled code/metadata hashes are definitive. No installs or dependency edits."
+}

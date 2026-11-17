@@ -1,0 +1,8 @@
+{
+  "start": 1794021821,
+  "end": 1794022156,
+  "duration": 335,
+  "agent": "main-agent",
+  "basis": "actualfirstclockthroughsourceconstraints/queuedexactNcompiles/planseal;wallnotCPUtime",
+  "status": "PARKED"
+}

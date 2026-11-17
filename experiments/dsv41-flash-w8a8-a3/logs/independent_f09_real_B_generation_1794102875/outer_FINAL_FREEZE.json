@@ -1,0 +1,17 @@
+{
+  "status": "FINAL_PARK_SOURCE_ONLY_READY_FOR_INDEPENDENT_REVIEW",
+  "artifact_count": 16,
+  "manifest_sha256": "f9aba24b6e7014427923b0ffc87a25798b4850cfc32f90c2c0b3f3fe23481558",
+  "report_sha256": "27e1c391400c8dae81cefcd6115ee1143ba1cc0eb6b956b6e3ade276c50e28e9",
+  "binding_sha256": "cc2132a8e7bf0b36110f7a99f68d244a8b98e0f0299d8a9b8e897cec1dde5937",
+  "runtime_code": {
+    "check_identity.py": "f95eaf38916b645642ebfd4d307b85a64a17ec7ca027c55e0f8585c1590816c4",
+    "outer_runner.py": "28b8c268c5530197273754325aeba978dad1d44428f4f33fe4e5bf13dfcb3d7c",
+    "task_entry.py": "670b126af3b878f8b4e2c6cbbc3a716bb9a0ac6c043bedda49b5c18d0eda02b6"
+  },
+  "source45_sha256": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+  "no_positive_grant": true,
+  "all_writers_parked": true,
+  "all_own_jobs_ended": true,
+  "future_native_authorized": false
+}

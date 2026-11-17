@@ -1,0 +1,1 @@
+FINAL/PARK. All assigned native/CPU work complete. Native142329 actual16/sameowner4calls/durable normalclose; CPU143821 original19x3+correct129 publishedWINDOW/C2 numerical rejection PASS. No additional NPU/model/realweight/fit/text authorization. See REPORT.md/results.json/FREEZE_final.json/shared_outputs.json. Prior RESUME.md is historical active-run context.

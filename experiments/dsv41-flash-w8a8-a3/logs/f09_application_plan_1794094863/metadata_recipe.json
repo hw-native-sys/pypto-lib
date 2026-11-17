@@ -1,0 +1,40 @@
+{
+  "status": "UNEXECUTED_SOURCE_RECIPE_NOT_NEW_PLAN",
+  "parent_plan806": "806852d5baec99a522f5adc3015bdd204d9ac6b17244a29cb26445cbd55fda89",
+  "math_A8153": "8153c7f040bef51900a6e6c9ff27b018279b7503f31d50ec5488457e49770b28",
+  "target_producer_B": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+  "replace_only_source_fields": [
+    "source_manifest_sha256",
+    "source_manifest_files"
+  ],
+  "preserve_hc_math_lineage": true,
+  "only_added_root_key": "f09_math_lineage",
+  "original_resource_keys": [
+    "checkpoint",
+    "expert_layers",
+    "index_sha256",
+    "operation",
+    "payload_bytes_read",
+    "phases",
+    "prompt_candidates",
+    "schema",
+    "selected_prompt",
+    "source_descriptors",
+    "static_arguments_per_rank",
+    "static_global_bytes",
+    "static_per_rank_bytes",
+    "tokenizer_files",
+    "two_phase_H2D_static_bytes",
+    "two_phase_cumulative_source_bytes",
+    "unknown_peaks"
+  ],
+  "expected_original_resource_projection_e13": "e13c5fd6d98de327a24427b5efc0a9be4e9c30a89e757ac6c377e73b6ffc10ff",
+  "e13_status": "unchanged by data-writer construction/source preservation; NOT recomputed/executed in this unit",
+  "new_full_metadata_plan_materialized": false,
+  "required_before_write": [
+    "independent canonical171PASS accepted by Root with source8153 same-work static recipe",
+    "independent sourceplan review",
+    "explicit Root application/plan-write GO"
+  ],
+  "resource_or_header_regeneration": false
+}

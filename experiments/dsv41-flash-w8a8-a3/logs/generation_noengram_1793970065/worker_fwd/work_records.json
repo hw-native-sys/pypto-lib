@@ -1,0 +1,13 @@
+[
+  {
+    "id": "fullentry-noengram-1793970258-1793972408",
+    "start": 1793970258,
+    "end": 1793972408,
+    "duration": 2150,
+    "basis": "measured from first implementation artifact timestamp;initial read-only preparation excluded",
+    "agent": "fullentry_noengram",
+    "status": "PARKED",
+    "positive_actual_onboard_full_entries": 1,
+    "blocked_actual_decode_entries": 1
+  }
+]

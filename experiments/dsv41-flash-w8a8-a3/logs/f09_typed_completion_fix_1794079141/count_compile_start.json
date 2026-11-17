@@ -1,0 +1,14 @@
+{
+  "epoch": 1794079524.9070487,
+  "source_manifest": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "samples": 0,
+  "mode": "ExecutionMode.ONBOARD",
+  "ring_heap": [
+    0,
+    0,
+    4294967296,
+    0
+  ],
+  "runtime_library_sha256": "24434f8879030ef1b1f31e5fc2ecce683e392d4f1baeb5bcee852fb183976e5c",
+  "allowed": "count_active signature ONLY, no fullentry/oldprobe/fixtures/readers/prepare/NPU"
+}

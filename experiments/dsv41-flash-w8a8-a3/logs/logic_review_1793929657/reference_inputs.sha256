@@ -1,0 +1,7 @@
+3505769857f83fa7e67f652984f50bd0478158f1d24f185cab091203e70392fd  experiments/dsv41-flash-w8a8-a3/logs/logic_review_1793929657/upstream_rc2/vllm_ascend/attention/dsa_v41.py
+101f96b38e9fc47e7be147ddfe56976aee896867c73a33a7d95c3e3c833a6e91  experiments/dsv41-flash-w8a8-a3/logs/logic_review_1793929657/upstream_rc2/vllm_ascend/models/deepseek_v41/model.py
+d5d6a438bbced4e63d729dac94c08869df30dab4a71ceacecdea211386b3db33  experiments/dsv41-flash-w8a8-a3/logs/logic_review_1793929657/upstream_rc2/vllm_ascend/models/deepseek_v41/indexer.py
+31516e5ba234e34fa01e73e864fbc88bd6473d4a5274a1d43da8a79bab3cf494  experiments/dsv41-flash-w8a8-a3/logs/logic_review_1793929657/upstream_rc2/vllm_ascend/models/deepseek_v41/compressor.py
+4797b8962264d137cdb142a9988825288283092fb797ddbd334c6ab2223eb58d  experiments/dsv41-flash-w8a8-a3/logs/logic_review_1793929657/upstream_rc2/vllm_ascend/models/deepseek_v41/engram/common.py
+1b2ed579c6a221f68f49222d470dab2068b23a3efc17d969b7a909e684e06316  /mnt/data/models/DeepSeek-V4.1-Flash-w8a8/config.json
+fe0edcfd5750ddf9675866ff7d5c7f69fdccb86ef7bf2a1f88ddb5e2b706e1f8  /mnt/data/models/DeepSeek-V4.1-Flash-w8a8/README.md

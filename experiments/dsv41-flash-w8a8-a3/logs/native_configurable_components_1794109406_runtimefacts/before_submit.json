@@ -1,0 +1,18 @@
+{
+  "started_utc": "2026-11-08T04:26:02Z",
+  "checked_utc": "2026-11-08T04:26:53.199024+00:00",
+  "manifest_verified": 162,
+  "source_dependencies_unchanged": true,
+  "host_available_bytes": 1721894076416,
+  "root_scopes": {
+    "ep": {
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/root_configurable_component_ep_1794109406_go.json",
+      "sha256": "e3baab7047ab61b126ff6ebb76b6dda6914a6887bd0d9b4c95f82f33733d8566"
+    },
+    "tp": {
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/root_configurable_component_tp_1794109406_go.json",
+      "sha256": "848ba0d2dedd8897e2b456bcba155ccc3af24cc3bea427f14c2f9b5d73484338"
+    }
+  },
+  "native_submitted": false
+}

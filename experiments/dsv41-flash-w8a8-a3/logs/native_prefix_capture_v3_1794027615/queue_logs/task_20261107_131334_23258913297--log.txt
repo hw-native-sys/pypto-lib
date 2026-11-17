@@ -1,0 +1,10 @@
+PyPTO environment activated: /mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local
+PYPTO_ROOT=/mnt/data/pyptouser/yangyaodong/code/pypto
+PTOAS_ROOT=/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local
+PTO_ISA_ROOT=/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/build/pto-isa
+Traceback (most recent call last):
+  File "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_prefix_capture_v3_1794027615/prepare_cpu_validate.py", line 7, in <module>
+    status=subprocess.run(['task-submit','--status',task],capture_output=True,text=True,check=True).stdout.strip();assert 'completed (exit=0)' in status,status
+  File "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv/lib/python3.10/subprocess.py", line 526, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['task-submit', '--status', 'task_20261107_130545_17984923672']' returned non-zero exit status 1.

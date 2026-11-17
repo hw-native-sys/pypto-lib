@@ -1,0 +1,13 @@
+{
+  "identity": {
+    "pid": 1542549,
+    "starttick": "108575847"
+  },
+  "command": [
+    "bash",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_oracle_provenance_fix_1794083242/native_stage.sh",
+    "count-active",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_count_active_1794084730/work",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/root_f09_lifecycle_acceptance_1794084808.json"
+  ]
+}

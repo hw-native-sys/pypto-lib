@@ -1,0 +1,16 @@
+[
+  {
+    "record_id": "streaming-loader-1794014821-1794015686",
+    "agent": "/root/main_native/streaming_loader",
+    "unit": "scalar_c2_streaming_1794014676",
+    "start_epoch": 1794014821,
+    "end_epoch": 1794015686,
+    "elapsed_wall_seconds": 865,
+    "measurement": "First recorded worker shell clock through final evidence collector; earlier unmeasured preparation excluded. Wall time includes queued CPU checks, not CPU usage.",
+    "exclusive_model_paths": [
+      "models/deepseek_v4_1_flash_a3_w8a8/weight_loader.py"
+    ],
+    "disposition": "CPU validated; model writer stopped; no native fit/reuse or independent acceptance claim.",
+    "import_once": true
+  }
+]

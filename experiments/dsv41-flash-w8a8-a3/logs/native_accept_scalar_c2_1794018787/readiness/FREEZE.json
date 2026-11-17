@@ -1,0 +1,12 @@
+{
+  "epoch": 1794019935,
+  "source_manifest_sha256": "ab1ced6d6ecbf9887297458703ba9b74e2c9b8bc57608370b4c2e0310e027e37",
+  "artifact_manifest_sha256": "ff6d5df96ab2531db84e4d35f56174bdf3be1396dbb6aa036b9a9b40d659b6dc",
+  "artifacts": 23,
+  "source45": "unchangedfrozen",
+  "payload_reads": 0,
+  "NPU_dispatches": 0,
+  "own_jobs": "all5complete,oneinitialmetadataaliasfailurepreserved",
+  "workers": 0,
+  "status": "MainPARKED;guardHELD;readonlyreadinessnotfitproof"
+}

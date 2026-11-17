@@ -1,0 +1,17 @@
+{
+  "verification": "task_20261107_103359_192334829125",
+  "cpu": "task_20261107_103645_192980325604",
+  "stream_native": "task_20261107_103711_19324148097",
+  "decode_native": "task_20261107_103754_194255510331",
+  "placement3": "task_20261107_104054_220244714655",
+  "prefix3_config_rejected": "task_20261107_104722_245616122833",
+  "public4_compile_placement": "task_20261107_105033_246663829216",
+  "source_final_audit_before_resumption": "task_20261107_105716_250366821610",
+  "startup_replay": "task_20261107_110037_251166930896",
+  "real_host_replay": "task_20261107_110239_251704221980",
+  "installed_contract": "task_20261107_110809_253029318278",
+  "both_phase_guard": "task_20261107_111204_25397505487",
+  "prefix4_guard_refused": "task_20261107_105225_24784504908",
+  "prefix_shared_timeboxed": "task_20261107_111437_25465236862",
+  "final_hash_audit": "task_20261107_115720_418631630107"
+}

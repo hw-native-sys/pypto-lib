@@ -1,0 +1,80 @@
+main/order_suite/build_output/_jit_prefill_layer_entry_20261106_194310_jtujzniy/next_levels/prefill_layer_rank/orchestration/prefill_layer_rank.cpp:327
+325:                 CoreTaskArgs params_t1;
+326:                 params_t1.add_input(x_blocks_inline3376);
+327:                 params_t1.add_input(ext_engram_rotation);
+328:                 params_t1.add_output(restored_inline3377);
+329:                 params_t1.add_scalar(rotation_rows_inline3375);
+330:                 params_t1.launch_spec.set_block_num(spmd_core_num_1);
+331:                 rt_submit_aiv_task(2, params_t1);
+
+main/order_suite/build_output/_jit_prefill_layer_entry_20261106_194731_jkf_lswl/next_levels/prefill_layer_rank/orchestration/prefill_layer_rank.cpp:1058
+1056:                 CoreTaskArgs params_t33;
+1057:                 params_t33.add_input(x_blocks_inline2665);
+1058:                 params_t33.add_input(ext_engram_rotation);
+1059:                 params_t33.add_output(restored_inline2666);
+1060:                 params_t33.add_scalar(rotation_rows_inline2664);
+1061:                 params_t33.launch_spec.set_block_num(spmd_core_num_9);
+1062:                 rt_submit_aiv_task(40, params_t33);
+
+main/order_suite/build_output/_jit_decode_layer_entry_20261106_194442_ugqwqv9x/next_levels/decode_layer_rank/orchestration/decode_layer_rank.cpp:267
+265:                 CoreTaskArgs params_t1;
+266:                 params_t1.add_input(x_blocks_inline10994);
+267:                 params_t1.add_input(ext_engram_rotation);
+268:                 params_t1.add_output(restored_inline10995);
+269:                 params_t1.add_scalar(rotation_rows_inline10993);
+270:                 params_t1.launch_spec.set_block_num(spmd_core_num_1);
+271:                 rt_submit_aiv_task(2, params_t1);
+
+main/order_suite/build_output/_jit_decode_layer_entry_20261106_194558_ir0ci6uo/next_levels/decode_layer_rank/orchestration/decode_layer_rank.cpp:327
+325:                 CoreTaskArgs params_t1;
+326:                 params_t1.add_input(x_blocks_inline10994);
+327:                 params_t1.add_input(ext_engram_rotation);
+328:                 params_t1.add_output(restored_inline10995);
+329:                 params_t1.add_scalar(rotation_rows_inline10993);
+330:                 params_t1.launch_spec.set_block_num(spmd_core_num_1);
+331:                 rt_submit_aiv_task(2, params_t1);
+
+main/order_suite/build_output/_jit_decode_layer_entry_20261106_194847_mt2rpcpu/next_levels/decode_layer_rank/orchestration/decode_layer_rank.cpp:1649
+1647:                 CoreTaskArgs params_t53;
+1648:                 params_t53.add_input(x_blocks_inline15224);
+1649:                 params_t53.add_input(ext_engram_rotation);
+1650:                 params_t53.add_output(restored_inline15225);
+1651:                 params_t53.add_scalar(rotation_rows_inline15223);
+1652:                 params_t53.launch_spec.set_block_num(spmd_core_num_15);
+1653:                 rt_submit_aiv_task(60, params_t53);
+
+main/full_layers/build_output/_jit_prefill_layer_entry_20261106_195020_zrv34wmr/next_levels/prefill_layer_rank/orchestration/prefill_layer_rank.cpp:267
+265:                 CoreTaskArgs params_t1;
+266:                 params_t1.add_input(x_blocks_inline2005);
+267:                 params_t1.add_input(ext_engram_rotation);
+268:                 params_t1.add_output(restored_inline2006);
+269:                 params_t1.add_scalar(rotation_rows_inline2004);
+270:                 params_t1.launch_spec.set_block_num(spmd_core_num_1);
+271:                 rt_submit_aiv_task(2, params_t1);
+
+main/full_layers/build_output/_jit_decode_layer_entry_20261106_195243_ur4ojz6b/next_levels/decode_layer_rank/orchestration/decode_layer_rank.cpp:327
+325:                 CoreTaskArgs params_t1;
+326:                 params_t1.add_input(x_blocks_inline10994);
+327:                 params_t1.add_input(ext_engram_rotation);
+328:                 params_t1.add_output(restored_inline10995);
+329:                 params_t1.add_scalar(rotation_rows_inline10993);
+330:                 params_t1.launch_spec.set_block_num(spmd_core_num_1);
+331:                 rt_submit_aiv_task(2, params_t1);
+
+main/final_compile/full_compile/_jit_decode_fwd_20261106_193414_misu9r1x/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp:885
+883:                                 CoreTaskArgs params_t13;
+884:                                 params_t13.add_input(x_blocks_inline13098);
+885:                                 params_t13.add_input(ext_engram_rotation);
+886:                                 params_t13.add_inout(restored_inline13099);
+887:                                 params_t13.add_scalar(rotation_rows_inline13097);
+888:                                 params_t13.launch_spec.set_block_num(spmd_core_num_1);
+889:                                 rt_submit_aiv_task(13, params_t13);
+
+main/final_compile/full_compile/_jit_prefill_fwd_20261106_193444_h_r1m649/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp:1418
+1416:                                 CoreTaskArgs params_t13;
+1417:                                 params_t13.add_input(x_blocks_inline19308);
+1418:                                 params_t13.add_input(ext_engram_rotation);
+1419:                                 params_t13.add_inout(restored_inline19309);
+1420:                                 params_t13.add_scalar(rotation_rows_inline19307);
+1421:                                 params_t13.launch_spec.set_block_num(spmd_core_num_1);
+1422:                                 rt_submit_aiv_task(13, params_t13);

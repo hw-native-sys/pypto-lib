@@ -1,0 +1,12 @@
+{
+  "imported_once": [
+    "main-f09-artifact-lifecycle-1794079805-block1",
+    "main-f09-artifact-lifecycle-1794079805-block2",
+    "main-f09-artifact-lifecycle-1794079805-docs"
+  ],
+  "audit_hold_interval_excluded": [
+    1794080469,
+    1794081179
+  ],
+  "native_case_time_reimported": false
+}

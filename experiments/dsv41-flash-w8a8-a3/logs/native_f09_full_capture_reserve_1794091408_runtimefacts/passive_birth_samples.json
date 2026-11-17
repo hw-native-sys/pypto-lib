@@ -1,0 +1,1356 @@
+{
+  "scope": "this operation only; finite32 samples; no full history/PSS/process control",
+  "interval_seconds": 5,
+  "samples": [
+    {
+      "observed_epoch": 1794092305.085489,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092310.2163172,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092315.340178,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092320.4612606,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092325.58059,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092330.7016652,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092335.8330727,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092340.955323,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092346.0763607,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092351.1956537,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092356.3167574,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092361.4392571,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092366.5615473,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092371.6818185,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092376.800529,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092381.9184613,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092387.0389824,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092392.1635935,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        },
+        {
+          "pid": 1832470,
+          "ppid": 1826230,
+          "starttick": "109231404",
+          "comm": "git"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092397.2934144,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        },
+        {
+          "pid": 1832588,
+          "ppid": 1826230,
+          "starttick": "109231448",
+          "comm": "aarch64-target-"
+        },
+        {
+          "pid": 1832910,
+          "ppid": 1826230,
+          "starttick": "109231623",
+          "comm": "ccec"
+        },
+        {
+          "pid": 1832994,
+          "ppid": 1832588,
+          "starttick": "109231640",
+          "comm": "cc1plus"
+        },
+        {
+          "pid": 1833168,
+          "ppid": 1826230,
+          "starttick": "109231660",
+          "comm": "ccec"
+        },
+        {
+          "pid": 1833278,
+          "ppid": 1826230,
+          "starttick": "109231677",
+          "comm": "ccec"
+        },
+        {
+          "pid": 1833566,
+          "ppid": 1826230,
+          "starttick": "109231696",
+          "comm": "ccec"
+        },
+        {
+          "pid": 1833619,
+          "ppid": 1826230,
+          "starttick": "109231700",
+          "comm": "ccec"
+        },
+        {
+          "pid": 1834111,
+          "ppid": 1826230,
+          "starttick": "109231739",
+          "comm": "ccec"
+        },
+        {
+          "pid": 1834141,
+          "ppid": 1826230,
+          "starttick": "109231741",
+          "comm": "ccec"
+        },
+        {
+          "pid": 1834258,
+          "ppid": 1826230,
+          "starttick": "109231746",
+          "comm": "ccec"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092402.4280393,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        },
+        {
+          "pid": 1832588,
+          "ppid": 1826230,
+          "starttick": "109231448",
+          "comm": "aarch64-target-"
+        },
+        {
+          "pid": 1832994,
+          "ppid": 1832588,
+          "starttick": "109231640",
+          "comm": "cc1plus"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092407.5512717,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        },
+        {
+          "pid": 1832588,
+          "ppid": 1826230,
+          "starttick": "109231448",
+          "comm": "aarch64-target-"
+        },
+        {
+          "pid": 1832994,
+          "ppid": 1832588,
+          "starttick": "109231640",
+          "comm": "cc1plus"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092412.6735692,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        },
+        {
+          "pid": 1832588,
+          "ppid": 1826230,
+          "starttick": "109231448",
+          "comm": "aarch64-target-"
+        },
+        {
+          "pid": 1832994,
+          "ppid": 1832588,
+          "starttick": "109231640",
+          "comm": "cc1plus"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092417.7952473,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        },
+        {
+          "pid": 1832588,
+          "ppid": 1826230,
+          "starttick": "109231448",
+          "comm": "aarch64-target-"
+        },
+        {
+          "pid": 1832994,
+          "ppid": 1832588,
+          "starttick": "109231640",
+          "comm": "cc1plus"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092422.913753,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        },
+        {
+          "pid": 1832588,
+          "ppid": 1826230,
+          "starttick": "109231448",
+          "comm": "aarch64-target-"
+        },
+        {
+          "pid": 1832994,
+          "ppid": 1832588,
+          "starttick": "109231640",
+          "comm": "cc1plus"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092428.033048,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        },
+        {
+          "pid": 1832588,
+          "ppid": 1826230,
+          "starttick": "109231448",
+          "comm": "aarch64-target-"
+        },
+        {
+          "pid": 1832994,
+          "ppid": 1832588,
+          "starttick": "109231640",
+          "comm": "cc1plus"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092433.1484687,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        },
+        {
+          "pid": 1832588,
+          "ppid": 1826230,
+          "starttick": "109231448",
+          "comm": "aarch64-target-"
+        },
+        {
+          "pid": 1832994,
+          "ppid": 1832588,
+          "starttick": "109231640",
+          "comm": "cc1plus"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092438.2669199,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        },
+        {
+          "pid": 1832588,
+          "ppid": 1826230,
+          "starttick": "109231448",
+          "comm": "aarch64-target-"
+        },
+        {
+          "pid": 1832994,
+          "ppid": 1832588,
+          "starttick": "109231640",
+          "comm": "cc1plus"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092443.3831644,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        },
+        {
+          "pid": 1832588,
+          "ppid": 1826230,
+          "starttick": "109231448",
+          "comm": "aarch64-target-"
+        },
+        {
+          "pid": 1832994,
+          "ppid": 1832588,
+          "starttick": "109231640",
+          "comm": "cc1plus"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092448.4981074,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        },
+        {
+          "pid": 1838602,
+          "ppid": 1826230,
+          "starttick": "109236792",
+          "comm": "python"
+        },
+        {
+          "pid": 1838604,
+          "ppid": 1826230,
+          "starttick": "109236796",
+          "comm": "python"
+        },
+        {
+          "pid": 1838613,
+          "ppid": 1826230,
+          "starttick": "109236799",
+          "comm": "python"
+        },
+        {
+          "pid": 1838615,
+          "ppid": 1826230,
+          "starttick": "109236803",
+          "comm": "python"
+        },
+        {
+          "pid": 1838617,
+          "ppid": 1826230,
+          "starttick": "109236806",
+          "comm": "python"
+        },
+        {
+          "pid": 1838619,
+          "ppid": 1826230,
+          "starttick": "109236809",
+          "comm": "python"
+        },
+        {
+          "pid": 1838621,
+          "ppid": 1826230,
+          "starttick": "109236812",
+          "comm": "python"
+        },
+        {
+          "pid": 1838623,
+          "ppid": 1826230,
+          "starttick": "109236814",
+          "comm": "python"
+        },
+        {
+          "pid": 1838626,
+          "ppid": 1826230,
+          "starttick": "109236817",
+          "comm": "python"
+        },
+        {
+          "pid": 1838638,
+          "ppid": 1826230,
+          "starttick": "109236821",
+          "comm": "python"
+        },
+        {
+          "pid": 1838640,
+          "ppid": 1826230,
+          "starttick": "109236824",
+          "comm": "python"
+        },
+        {
+          "pid": 1838644,
+          "ppid": 1826230,
+          "starttick": "109236828",
+          "comm": "python"
+        },
+        {
+          "pid": 1838649,
+          "ppid": 1826230,
+          "starttick": "109236831",
+          "comm": "python"
+        },
+        {
+          "pid": 1838652,
+          "ppid": 1826230,
+          "starttick": "109236835",
+          "comm": "python"
+        },
+        {
+          "pid": 1838656,
+          "ppid": 1826230,
+          "starttick": "109236839",
+          "comm": "python"
+        },
+        {
+          "pid": 1838677,
+          "ppid": 1826230,
+          "starttick": "109236842",
+          "comm": "python"
+        },
+        {
+          "pid": 1838700,
+          "ppid": 1826230,
+          "starttick": "109236847",
+          "comm": "python"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092453.6296864,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        },
+        {
+          "pid": 1838602,
+          "ppid": 1826230,
+          "starttick": "109236792",
+          "comm": "python"
+        },
+        {
+          "pid": 1838604,
+          "ppid": 1826230,
+          "starttick": "109236796",
+          "comm": "python"
+        },
+        {
+          "pid": 1838613,
+          "ppid": 1826230,
+          "starttick": "109236799",
+          "comm": "python"
+        },
+        {
+          "pid": 1838615,
+          "ppid": 1826230,
+          "starttick": "109236803",
+          "comm": "python"
+        },
+        {
+          "pid": 1838617,
+          "ppid": 1826230,
+          "starttick": "109236806",
+          "comm": "python"
+        },
+        {
+          "pid": 1838619,
+          "ppid": 1826230,
+          "starttick": "109236809",
+          "comm": "python"
+        },
+        {
+          "pid": 1838621,
+          "ppid": 1826230,
+          "starttick": "109236812",
+          "comm": "python"
+        },
+        {
+          "pid": 1838623,
+          "ppid": 1826230,
+          "starttick": "109236814",
+          "comm": "python"
+        },
+        {
+          "pid": 1838626,
+          "ppid": 1826230,
+          "starttick": "109236817",
+          "comm": "python"
+        },
+        {
+          "pid": 1838638,
+          "ppid": 1826230,
+          "starttick": "109236821",
+          "comm": "python"
+        },
+        {
+          "pid": 1838640,
+          "ppid": 1826230,
+          "starttick": "109236824",
+          "comm": "python"
+        },
+        {
+          "pid": 1838644,
+          "ppid": 1826230,
+          "starttick": "109236828",
+          "comm": "python"
+        },
+        {
+          "pid": 1838649,
+          "ppid": 1826230,
+          "starttick": "109236831",
+          "comm": "python"
+        },
+        {
+          "pid": 1838652,
+          "ppid": 1826230,
+          "starttick": "109236835",
+          "comm": "python"
+        },
+        {
+          "pid": 1838656,
+          "ppid": 1826230,
+          "starttick": "109236839",
+          "comm": "python"
+        },
+        {
+          "pid": 1838677,
+          "ppid": 1826230,
+          "starttick": "109236842",
+          "comm": "python"
+        },
+        {
+          "pid": 1838700,
+          "ppid": 1826230,
+          "starttick": "109236847",
+          "comm": "python"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092458.7579353,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        },
+        {
+          "pid": 1838602,
+          "ppid": 1826230,
+          "starttick": "109236792",
+          "comm": "python"
+        },
+        {
+          "pid": 1838604,
+          "ppid": 1826230,
+          "starttick": "109236796",
+          "comm": "python"
+        },
+        {
+          "pid": 1838613,
+          "ppid": 1826230,
+          "starttick": "109236799",
+          "comm": "python"
+        },
+        {
+          "pid": 1838615,
+          "ppid": 1826230,
+          "starttick": "109236803",
+          "comm": "python"
+        },
+        {
+          "pid": 1838617,
+          "ppid": 1826230,
+          "starttick": "109236806",
+          "comm": "python"
+        },
+        {
+          "pid": 1838619,
+          "ppid": 1826230,
+          "starttick": "109236809",
+          "comm": "python"
+        },
+        {
+          "pid": 1838621,
+          "ppid": 1826230,
+          "starttick": "109236812",
+          "comm": "python"
+        },
+        {
+          "pid": 1838623,
+          "ppid": 1826230,
+          "starttick": "109236814",
+          "comm": "python"
+        },
+        {
+          "pid": 1838626,
+          "ppid": 1826230,
+          "starttick": "109236817",
+          "comm": "python"
+        },
+        {
+          "pid": 1838638,
+          "ppid": 1826230,
+          "starttick": "109236821",
+          "comm": "python"
+        },
+        {
+          "pid": 1838640,
+          "ppid": 1826230,
+          "starttick": "109236824",
+          "comm": "python"
+        },
+        {
+          "pid": 1838644,
+          "ppid": 1826230,
+          "starttick": "109236828",
+          "comm": "python"
+        },
+        {
+          "pid": 1838649,
+          "ppid": 1826230,
+          "starttick": "109236831",
+          "comm": "python"
+        },
+        {
+          "pid": 1838652,
+          "ppid": 1826230,
+          "starttick": "109236835",
+          "comm": "python"
+        },
+        {
+          "pid": 1838656,
+          "ppid": 1826230,
+          "starttick": "109236839",
+          "comm": "python"
+        },
+        {
+          "pid": 1838677,
+          "ppid": 1826230,
+          "starttick": "109236842",
+          "comm": "python"
+        },
+        {
+          "pid": 1838700,
+          "ppid": 1826230,
+          "starttick": "109236847",
+          "comm": "python"
+        }
+      ],
+      "stage_terminal_file_present": false
+    },
+    {
+      "observed_epoch": 1794092463.887587,
+      "known_descendants": [
+        {
+          "pid": 1826113,
+          "ppid": 1825666,
+          "starttick": "109220685",
+          "comm": "python"
+        },
+        {
+          "pid": 1826143,
+          "ppid": 1826113,
+          "starttick": "109220740",
+          "comm": "python"
+        },
+        {
+          "pid": 1826230,
+          "ppid": 1826143,
+          "starttick": "109220862",
+          "comm": "python"
+        },
+        {
+          "pid": 1838602,
+          "ppid": 1826230,
+          "starttick": "109236792",
+          "comm": "python"
+        },
+        {
+          "pid": 1838604,
+          "ppid": 1826230,
+          "starttick": "109236796",
+          "comm": "python"
+        },
+        {
+          "pid": 1838613,
+          "ppid": 1826230,
+          "starttick": "109236799",
+          "comm": "python"
+        },
+        {
+          "pid": 1838615,
+          "ppid": 1826230,
+          "starttick": "109236803",
+          "comm": "python"
+        },
+        {
+          "pid": 1838617,
+          "ppid": 1826230,
+          "starttick": "109236806",
+          "comm": "python"
+        },
+        {
+          "pid": 1838619,
+          "ppid": 1826230,
+          "starttick": "109236809",
+          "comm": "python"
+        },
+        {
+          "pid": 1838621,
+          "ppid": 1826230,
+          "starttick": "109236812",
+          "comm": "python"
+        },
+        {
+          "pid": 1838623,
+          "ppid": 1826230,
+          "starttick": "109236814",
+          "comm": "python"
+        },
+        {
+          "pid": 1838626,
+          "ppid": 1826230,
+          "starttick": "109236817",
+          "comm": "python"
+        },
+        {
+          "pid": 1838638,
+          "ppid": 1826230,
+          "starttick": "109236821",
+          "comm": "python"
+        },
+        {
+          "pid": 1838640,
+          "ppid": 1826230,
+          "starttick": "109236824",
+          "comm": "python"
+        },
+        {
+          "pid": 1838644,
+          "ppid": 1826230,
+          "starttick": "109236828",
+          "comm": "python"
+        },
+        {
+          "pid": 1838649,
+          "ppid": 1826230,
+          "starttick": "109236831",
+          "comm": "python"
+        },
+        {
+          "pid": 1838652,
+          "ppid": 1826230,
+          "starttick": "109236835",
+          "comm": "python"
+        },
+        {
+          "pid": 1838656,
+          "ppid": 1826230,
+          "starttick": "109236839",
+          "comm": "python"
+        },
+        {
+          "pid": 1838677,
+          "ppid": 1826230,
+          "starttick": "109236842",
+          "comm": "python"
+        },
+        {
+          "pid": 1838700,
+          "ppid": 1826230,
+          "starttick": "109236847",
+          "comm": "python"
+        }
+      ],
+      "stage_terminal_file_present": false
+    }
+  ]
+}

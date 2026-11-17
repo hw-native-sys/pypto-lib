@@ -1,0 +1,236 @@
+{
+  "stage": "SIGNATURE_COMPILE_ONLY",
+  "logical_or_allocated_ids": [
+    0,
+    1
+  ],
+  "execution_mode": "ExecutionMode.ONBOARD",
+  "backend_type": "BackendType.Ascend910",
+  "ring_heap": [
+    0,
+    0,
+    4294967296,
+    0
+  ],
+  "library": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/build/lib/a2a3/onboard/tensormap_and_ringbuffer/libhost_runtime.so",
+  "library_sha256": "24434f8879030ef1b1f31e5fc2ecce683e392d4f1baeb5bcee852fb183976e5c",
+  "shared_contract": {
+    "backend": "tensormap_and_ringbuffer",
+    "platform": "a2a3",
+    "mode": "PROGRAM",
+    "library_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/build/lib/a2a3/onboard/tensormap_and_ringbuffer/libhost_runtime.so",
+    "library_sha256": "24434f8879030ef1b1f31e5fc2ecce683e392d4f1baeb5bcee852fb183976e5c",
+    "abi_version": 1,
+    "resource_count": 6,
+    "pipeline_directory_capacity": 4294967295,
+    "resources": [
+      {
+        "kind": 4,
+        "resource_class": 0,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 1,
+        "resource_class": 1,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 2,
+        "resource_class": 1,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 3,
+        "resource_class": 1,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 5,
+        "resource_class": 2,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 6,
+        "resource_class": 2,
+        "bytes_per_copy": 0
+      }
+    ],
+    "shared_arena_bank": 0,
+    "query_scope": "read-only exported get_pipeline_contract; no init/prepare/device call"
+  },
+  "programs": [
+    {
+      "phase": "prefill",
+      "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/shared_weight_owner_validation_1794071093/cpu_signature_build/_jit_prefill_20261108_011604_2jtgtvs6",
+      "seconds": 0.7642638683319092,
+      "samples": 0,
+      "metadata": {
+        "schema": 3,
+        "supported_execution_modes": [
+          "program"
+        ],
+        "params": [
+          {
+            "name": "embed_weight__ssa_v0",
+            "direction": "In",
+            "shape": [
+              2,
+              128,
+              128
+            ],
+            "dtype": "bfloat16",
+            "layout": "ND"
+          },
+          {
+            "name": "c1a_comp_norm__ssa_v0",
+            "direction": "In",
+            "shape": [
+              2,
+              128,
+              128
+            ],
+            "dtype": "bfloat16",
+            "layout": "ND"
+          },
+          {
+            "name": "token__ssa_v0",
+            "direction": "In",
+            "shape": [
+              2,
+              128,
+              128
+            ],
+            "dtype": "bfloat16",
+            "layout": "ND"
+          },
+          {
+            "name": "state__ssa_v0",
+            "direction": "Out",
+            "shape": [
+              2,
+              128,
+              128
+            ],
+            "dtype": "bfloat16",
+            "layout": "ND"
+          }
+        ],
+        "num_return_types": 1,
+        "platform": "a2a3",
+        "backend_type": "Ascend910",
+        "distributed_config": {
+          "device_ids": [
+            0,
+            1
+          ],
+          "num_sub_workers": 0,
+          "runtime": "tensormap_and_ringbuffer",
+          "aicpu_thread_num": 0
+        }
+      },
+      "file_hashes": {
+        "debug/run.py": "7795fe1d2a4cd7958d5b30f72ea043cc9942afcb80a50615dca0e982074a2793",
+        "distributed_meta.json": "30ac269b7450a58f8185e264e3e4279a7ed1eeee3d9bb226a394c854c36daa29",
+        "next_levels/prefill_chip/kernel_config.py": "188b4b2ff2d318ba33a149eb3468f4b35eb76df0577166f16a6237806a4d5fde",
+        "next_levels/prefill_chip/kernels/aiv/prefill_core.cpp": "4f1646187284065604e9b85179acf221da4290c9d9d7ad8e3839450546b168ed",
+        "next_levels/prefill_chip/orchestration/prefill_chip.cpp": "ae790c56bb93ba0036dd50aa26214f4fbf3c0de4a632b32c5800dd54371877d4",
+        "next_levels/prefill_chip/ptoas/prefill_core.cpp": "575282cfdf25709cd5fe96f25f1e1109e4bf864ac6baad37a609be1b36effae5",
+        "next_levels/prefill_chip/ptoas/prefill_core.pto": "07cb1df401de34c7e14bf31e8abb29807e4612323128c316e9087a525c85de80",
+        "orchestration/host_orch.py": "ce9d16a7c888f2640bbb8d6e0b7a1e4ebf00b6cf226af6794f97379d497b2fd9",
+        "report/perf_hints.log": "02ad8c1ac3f194b1d045723d7a8f61764321302bad4f15a73810a46877e7b84e"
+      }
+    },
+    {
+      "phase": "decode",
+      "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/shared_weight_owner_validation_1794071093/cpu_signature_build/_jit_decode_20261108_011605_ll94nhb2",
+      "seconds": 0.4682958126068115,
+      "samples": 0,
+      "metadata": {
+        "schema": 3,
+        "supported_execution_modes": [
+          "program"
+        ],
+        "params": [
+          {
+            "name": "embed_weight__ssa_v0",
+            "direction": "In",
+            "shape": [
+              2,
+              128,
+              128
+            ],
+            "dtype": "bfloat16",
+            "layout": "ND"
+          },
+          {
+            "name": "c1a_comp_norm__ssa_v0",
+            "direction": "In",
+            "shape": [
+              2,
+              1,
+              128,
+              128
+            ],
+            "dtype": "bfloat16",
+            "layout": "ND"
+          },
+          {
+            "name": "token__ssa_v0",
+            "direction": "In",
+            "shape": [
+              2,
+              128,
+              128
+            ],
+            "dtype": "bfloat16",
+            "layout": "ND"
+          },
+          {
+            "name": "state__ssa_v0",
+            "direction": "InOut",
+            "shape": [
+              2,
+              128,
+              128
+            ],
+            "dtype": "bfloat16",
+            "layout": "ND"
+          }
+        ],
+        "num_return_types": 1,
+        "platform": "a2a3",
+        "backend_type": "Ascend910",
+        "distributed_config": {
+          "device_ids": [
+            0,
+            1
+          ],
+          "num_sub_workers": 0,
+          "runtime": "tensormap_and_ringbuffer",
+          "aicpu_thread_num": 0
+        }
+      },
+      "file_hashes": {
+        "debug/run.py": "2f5c5f83cb03425743feebb226a573e99fdd1922e6a0f8dc640159b287fff325",
+        "distributed_meta.json": "61b8d09e31b67d55559a06ca69020339c423bd089a179564675bdc030b937ab2",
+        "next_levels/decode_chip/kernel_config.py": "7451e053717a80da2dec86cad9baf36244d4e8df3545abb154008833a66a715c",
+        "next_levels/decode_chip/kernels/aiv/decode_core.cpp": "6d484e81a0fcc8a7d760bcd589be5d9a3d1d205c505289183820d4f3cfdd2b3f",
+        "next_levels/decode_chip/orchestration/decode_chip.cpp": "3fffc412048d919a0328a5ab310f9c776769fdc576a646236ae2b5fa50551ab8",
+        "next_levels/decode_chip/ptoas/decode_core.cpp": "a0b109455eb822657df33666390c3ee0d4cbfe99ec72903911692e840581f2e3",
+        "next_levels/decode_chip/ptoas/decode_core.pto": "182e8cc805311fe173f9530210f7ee17479ec69b300316ebeef2d99f5d0531ba",
+        "orchestration/host_orch.py": "5ad8c4ced005dc5bdd7cad60ccbb136135ff6586c5f0465094206d758f5e2a12",
+        "report/perf_hints.log": "26fa2162bc3dc6d5618300027a763ca196fe0ca34d29a02fae1d2e5de156820a"
+      }
+    }
+  ],
+  "dependency_pins": {
+    "tiny_shared.py": "0042507d1ad5747f21f184e5439b31e1c97ca94b259890225a0b1cf1443dee89",
+    "tiny_programs.py": "e98d344af586a40e2adfa443b048cbcda3c576c531b90edba0468ccd13f08240",
+    "owner_adapter.py": "188cf41eafb1e6b6bdece83188a52b1a0e3336c6e5fb80a0d62b547223f31a41",
+    "public_contract.py": "7fb8b40dc98a473de56a162031453bfe3fcce481af4cd999181987ecf6409508",
+    "frozen_draft/generate.proposed.py": "fba8a4ef9a06f694fa53278bb80ae2ad70d111336dbead938ab9f8511d27e16e"
+  },
+  "samples": 0,
+  "prepare": false,
+  "native": false
+}

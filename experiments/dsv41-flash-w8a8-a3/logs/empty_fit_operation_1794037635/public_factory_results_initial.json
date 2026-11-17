@@ -1,0 +1,43 @@
+{
+  "status": "PASS_PUBLIC_FACTORY_CPU_MOCK",
+  "actual_public_make_run_config": true,
+  "same_normalized_config_each_prepare": true,
+  "actual_Torch_dtype_mapping": true,
+  "reload_and_prepare": "MOCKED; no native worker created",
+  "prepared_calls": [
+    {
+      "ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ],
+      "execution_mode": "ExecutionMode.ONBOARD",
+      "persistent": false
+    },
+    {
+      "ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ],
+      "execution_mode": "ExecutionMode.ONBOARD",
+      "persistent": false
+    },
+    {
+      "ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ],
+      "execution_mode": "ExecutionMode.ONBOARD",
+      "persistent": false
+    }
+  ],
+  "CPU_readonly_installed_contract_query": true,
+  "NPU": 0,
+  "device_prepare_calls": 0,
+  "payload_reads": 0
+}

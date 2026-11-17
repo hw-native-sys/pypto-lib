@@ -1,0 +1,9 @@
+{
+  "status": "FINAL_READY_PARK",
+  "jobs": 0,
+  "native_authorized": false,
+  "runtime_write_paths_after_separate_GO": [
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_count_active_identity_1794086934/work",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_count_active_identity_1794086934_launch"
+  ]
+}

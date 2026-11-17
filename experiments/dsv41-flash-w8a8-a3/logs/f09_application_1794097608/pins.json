@@ -1,0 +1,22 @@
+{
+  "actualsource45": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+  "actual_generate": "5de1656a99e85699138879b2f577f4eed2639779937a7cdc91ae843fcef6e34c",
+  "math_A8153": "8153c7f040bef51900a6e6c9ff27b018279b7503f31d50ec5488457e49770b28",
+  "metadata_plan": "cd8b17741688eeb9ef39d8c0925dbb74a8f9a1cfcc0052db2e0a8c1aacb48cf7",
+  "metadata_plan_bytes": 66956505,
+  "metadata_binding": "534266dd8bf0e40cb49418eb4ffbb72a3bef9f2d0d01f1c41a81818ef22d3a0c",
+  "resource_projection": "e13c5fd6d98de327a24427b5efc0a9be4e9c30a89e757ac6c377e73b6ffc10ff",
+  "f09_lineage_canonical": "13b80364bce7729fb36aa51c231ceb6966f2fe59ce6d211ccedd6c7cfc046004",
+  "RootGO": "5fe3cca1bcd96cb7f9bc8c89c1301a94662e1b370e9c98389670cbb8913e1c14",
+  "patch": "504b1830b2f4e6333a01a900fa579ef9de69e017ee20523e8fcbf10850881e46",
+  "Main_plan27": "2353c44e40d8ccfbe18a1394dad2272bf3f589cc16fff7dee2458cc16c35e0a4",
+  "accepted171": {
+    "receipt_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_c2_retention_1794092629/work/cpu_numerical_receipt.json",
+    "receipt_sha256": "6ce38e890b642908c731fb247accc302938846f892142471d26715398e96c851",
+    "recipe_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_c2_retention_1794092629/work/static_recipe.json",
+    "recipe_sha256": "4e73e5d8e2a03cedb309f0a3bde16fb5d4a806c4b6ee5039f5c28a8034872e75",
+    "scope": "bounded8153E1/T2/B2/3calls only; notnewBE40execution"
+  },
+  "status": "APPLIED_PENDING_INDEPENDENT_CHECK",
+  "Main_tests_compile_NPU": false
+}

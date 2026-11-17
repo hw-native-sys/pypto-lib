@@ -1,0 +1,238 @@
+{
+  "status": "TRANSPORT_AUDIT_NOT_ACCEPTED",
+  "passed_checks": 4504,
+  "unmet_checks": [
+    "native-queue-COMPLETE0",
+    "primary-CLI0-and-no-post-observation-monitor-errors",
+    "strict-telemetry-complete-no-descriptive-partial-PASS",
+    "strict-all-samples-known-inventory-memory-and-process-births",
+    "PSS-proportional-sample-consistency"
+  ],
+  "native_queue_exit": 1,
+  "CLI_exit": 0,
+  "outer_status": "FAIL",
+  "telemetry_error_count": 183,
+  "critical_telemetry_errors": [],
+  "first_telemetry_error": {
+    "epoch": 1794078254.505134,
+    "pid": 3565647,
+    "start_ticks": "107817320",
+    "operation": "read-smaps-rollup",
+    "path": "/proc/3565647/smaps_rollup",
+    "errno": 3,
+    "exception_type": "ProcessLookupError",
+    "error": "ProcessLookupError(3, 'No such process')",
+    "critical": false
+  },
+  "telemetry_status": "PARTIAL_OR_UNKNOWN",
+  "whole_own_PSS_complete": false,
+  "whole_own_PSS_peak": null,
+  "known_partial_own_PSS_max": 13825544192,
+  "weight_residency": {
+    "mode": "one-worker/two-registered-programs",
+    "canonical_phase": "prefill",
+    "static_upload_bytes_total": 633997065216,
+    "base_rank_allocations_total": 912,
+    "static_source_reads_total": 164192,
+    "static_source_bytes_total": 745846365184,
+    "decode_new_static_source_reads": 0,
+    "decode_new_static_source_bytes": 0,
+    "decode_new_static_upload_bytes": 0,
+    "decode_new_static_allocations": 0,
+    "decode_static_binding": "same initialized bases via public same-worker views",
+    "borrowed_consumer_rank_views": 912
+  },
+  "prefill_residency": {
+    "resident_upload_bytes": 633997065216,
+    "resident_allocations": 57,
+    "dispatches": 1,
+    "rank_allocations": 912,
+    "copy_calls": 110496,
+    "max_leaf_bytes": 330956800,
+    "max_copy_bytes": 67108864,
+    "state_transport": "shared-host H2D/D2H each dispatch",
+    "protocol_domains": "fresh each dispatch"
+  },
+  "decode_residency": {
+    "resident_upload_bytes": 0,
+    "resident_allocations": 0,
+    "dispatches": 15,
+    "rank_allocations": 0,
+    "copy_calls": 0,
+    "max_leaf_bytes": 0,
+    "max_copy_bytes": 0,
+    "state_transport": "shared-host H2D/D2H each dispatch",
+    "protocol_domains": "fresh each dispatch",
+    "static_binding": "borrowed from prefill bases",
+    "borrowed_views": 912
+  },
+  "generated_ids": [
+    1014,
+    1613,
+    3305,
+    1999,
+    344,
+    270,
+    5281,
+    294,
+    270,
+    17132,
+    582,
+    32568,
+    4465,
+    260,
+    1014,
+    57008
+  ],
+  "actual_text": " time...\". What is the meaning of the phrase \"once upon a time\"?",
+  "readable_full_text": "Once upon a time...\". What is the meaning of the phrase \"once upon a time\"?",
+  "quality": {
+    "actual_text": " time...\". What is the meaning of the phrase \"once upon a time\"?",
+    "generated_ids": [
+      1014,
+      1613,
+      3305,
+      1999,
+      344,
+      270,
+      5281,
+      294,
+      270,
+      17132,
+      582,
+      32568,
+      4465,
+      260,
+      1014,
+      57008
+    ],
+    "repeated_token_suffix_observed": null,
+    "quality_status": "UNASSESSED_REQUIRES_ACTUAL_TEXT_REVIEW",
+    "original_model_parity": false,
+    "observation_limit": "Only exact repeated token suffix; no automated coherence or no-repetition claim."
+  },
+  "decode_calls": 15,
+  "termination": "max_new_tokens",
+  "workers": 16,
+  "PID_births": 1001,
+  "actual_compiled_artifacts": [
+    {
+      "phase": "prefill",
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/build_output/_jit_prefill_fwd_20261108_030411_y6d0g2j8",
+      "HC_cast_witnesses": {
+        "counts": {
+          "PTO_RINT_down": 2,
+          "PTO_FP32_expansion": 2,
+          "CPP_RINT_down": 1,
+          "CPP_FP32_expansion": 1
+        },
+        "PTO": [
+          {
+            "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/build_output/_jit_prefill_fwd_20261108_030411_y6d0g2j8/next_levels/l2_prefill_fwd/ptoas/hc_post.pto",
+            "sha256": "b3c0c1357751cc5c9f1fd14b8b3d999afb497300171155bd8f1bdf153662e3f6",
+            "RINT_down": [
+              {
+                "line": 154,
+                "text": "pto.tcvt ins(%value_inline19917__ssa_v4 {rmode = #pto<round_mode RINT>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%rounded_bf16_inline19921__ssa_v0 : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":214:13)"
+              },
+              {
+                "line": 184,
+                "text": "pto.tcvt ins(%14 {rmode = #pto<round_mode RINT>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%15 : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":214:13)"
+              }
+            ],
+            "FP32_expansion": [
+              {
+                "line": 156,
+                "text": "pto.tcvt ins(%rounded_bf16_inline19921__ssa_v0 {rmode = #pto<round_mode ROUND>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%rounded_fp32_inline19922__ssa_v0 : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":215:13)"
+              },
+              {
+                "line": 186,
+                "text": "pto.tcvt ins(%15 {rmode = #pto<round_mode ROUND>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%16 : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":215:13)"
+              }
+            ]
+          }
+        ],
+        "CPP": [
+          {
+            "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/build_output/_jit_prefill_fwd_20261108_030411_y6d0g2j8/next_levels/l2_prefill_fwd/kernels/aiv/hc_post.cpp",
+            "sha256": "f2879e6ed94f8aa59d660a11510e6c19d9eee89e1da3795632177c488b3ac402",
+            "RINT_down": [
+              {
+                "line": 650,
+                "text": "RoundMode v204 = RoundMode::CAST_RINT;"
+              }
+            ],
+            "FP32_expansion": [
+              {
+                "line": 661,
+                "text": "RoundMode v208 = RoundMode::CAST_ROUND;"
+              }
+            ]
+          }
+        ],
+        "reviewed_exact_kernel_hash_matches": 2,
+        "note": "Actual runtime compiled source only; CPU signature dirs remain independent compile evidence, not execution artifacts."
+      },
+      "metadata_sha256": "3ef340dbe30e192bddd20ab2ec26bbe33b86453ffb0c6ce37d1512b847a50715"
+    },
+    {
+      "phase": "decode",
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/build_output/_jit_decode_fwd_20261108_030437_pqciq4wi",
+      "HC_cast_witnesses": {
+        "counts": {
+          "PTO_RINT_down": 2,
+          "PTO_FP32_expansion": 2,
+          "CPP_RINT_down": 1,
+          "CPP_FP32_expansion": 1
+        },
+        "PTO": [
+          {
+            "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/build_output/_jit_decode_fwd_20261108_030437_pqciq4wi/next_levels/decode_fwd_rank/ptoas/hc_post.pto",
+            "sha256": "daf575ae25e6a936528fd63b612a5ed47df1ee53f9e6d10c725dec80d3f2dd83",
+            "RINT_down": [
+              {
+                "line": 154,
+                "text": "pto.tcvt ins(%value_inline38448__ssa_v4 {rmode = #pto<round_mode RINT>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%rounded_bf16_inline38452__ssa_v0 : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":214:13)"
+              },
+              {
+                "line": 184,
+                "text": "pto.tcvt ins(%14 {rmode = #pto<round_mode RINT>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%15 : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":214:13)"
+              }
+            ],
+            "FP32_expansion": [
+              {
+                "line": 156,
+                "text": "pto.tcvt ins(%rounded_bf16_inline38452__ssa_v0 {rmode = #pto<round_mode ROUND>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%rounded_fp32_inline38453__ssa_v0 : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":215:13)"
+              },
+              {
+                "line": 186,
+                "text": "pto.tcvt ins(%15 {rmode = #pto<round_mode ROUND>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%16 : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":215:13)"
+              }
+            ]
+          }
+        ],
+        "CPP": [
+          {
+            "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/build_output/_jit_decode_fwd_20261108_030437_pqciq4wi/next_levels/decode_fwd_rank/kernels/aiv/hc_post.cpp",
+            "sha256": "834f6f7eed9acf0991ebe499a793fa853c7ee20d2297792953674864d2dfc0dd",
+            "RINT_down": [
+              {
+                "line": 650,
+                "text": "RoundMode v204 = RoundMode::CAST_RINT;"
+              }
+            ],
+            "FP32_expansion": [
+              {
+                "line": 661,
+                "text": "RoundMode v208 = RoundMode::CAST_ROUND;"
+              }
+            ]
+          }
+        ],
+        "reviewed_exact_kernel_hash_matches": 0,
+        "note": "Actual runtime compiled source only; CPU signature dirs remain independent compile evidence, not execution artifacts."
+      },
+      "metadata_sha256": "6a2d2c6f6b0d62453aed6bb501cb7070d208d4d069648bd0ee20bc7fa9073001"
+    }
+  ]
+}

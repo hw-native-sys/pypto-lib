@@ -1,0 +1,21 @@
+{
+  "approved": true,
+  "scope": "EXACT_N3_VALIDATE",
+  "stage": "validate",
+  "source_manifest_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "policy_sha256": "c8a0cc3d7c8ba7f208257e483013e9190124b8743d993ea6363aee0370054fb0",
+  "dependency_pins": {
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_exact_prompt_capture_1794038189/n3_stages.py": "61a92083ba76ec604b0461c9e72a18709dadc243494307a1a349c39cd4d3bb30",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_exact_prompt_capture_1794038189/case_n3.py": "22b64bd136bf3b3a24f11501e78d714a6c1d885260ff283bc3396c4384eb5cbb",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_exact_prompt_capture_1794038189/reference_n3.py": "95fa7a9b88dca411484d12bee71b5d1eaed97beea50d5963075c5f0219285a16",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_scalar_c2_1794018787/prefix_trial_sharedbank.py": "76c4bdcb0710a549dd67b73e510c2c3f2a2fe5d6ac49111c1d64ac2a800a1a8d",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_scalar_c2_1794018787/admission/contract.py": "0d21cab59173e350c4b74318c9fefc770af16188ba40d425aa2fce2dcc28ed54",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_scalar_c2_1794018787/admission/guard.py": "83b8ef22bbcfe1f8c0bff55e78fff10b5ea9a0c556079120458b4285814bb0ed",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/checkpoint_integration_v3_1794024669/checkpoint_pipeline_v3/store.py": "07d23973b94d4b8b22ec124b63945f4a6842e77996267e6da7f226f066557faa"
+  },
+  "static_plan_sha256": "6f9568a4fdfcb7c3fcb5d816025007f3601e78e24e4b85a392cb3e7854a9b850",
+  "measurement_receipt": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_exact_prompt_capture_1794038189/cpu_measurement.json",
+  "measurement_receipt_sha256": "9cd282d9037eead6bd437147911de1900dd2a32904a5d97bb6e4d358cfcdc023",
+  "encoded_at_epoch": 1794038916,
+  "directive": "Root conditional GO: offline original prefix17 CPU only after durable capture/normalclose/native COMPLETE/own PIDs absent/fresh HOST306003115008 DISK8657043456 SHM8589934592; both original references/direct gates/exact16mutable/perpass pristine/statics/ABI/source integrity. No decode/real payload/NPUprepare; CPU failure never reruns native."
+}

@@ -1,0 +1,253 @@
+{
+  "status": "PASS_INDEPENDENT_SELECTED_REAL_BYTES_AUDIT_ONLY",
+  "epoch": 1794048310.7344081,
+  "native_job": "task_20261107_183643_329223520113",
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "NoForward": true,
+  "source_schedule_and_exact_ranges": true,
+  "source_payload_rereads_in_audit": 0,
+  "selected_transfers": 18,
+  "copy_calls": 164,
+  "independent_ABI_addresses_and_initialized_coverage": true,
+  "unique_source_bytes": 1335642112,
+  "cumulative_source_bytes": 5307123712,
+  "H2D_bytes": 5307114496,
+  "D2H_bytes": 5307114496,
+  "byte_hash_proof": "Pinned actual loader/source-oracle/upload/readback live checks plus logged exact hashes; audit does not recompute raw NZ bytes from hashes or reread payload",
+  "registered_handles": 912,
+  "all912_free_success": true,
+  "two_normal_closed_distinct_owners": true,
+  "prepost_allocation_copy_host_guards_rechecked": true,
+  "final_fresh_before_after_vs_own_and_historicalA_original_tol": true,
+  "actual_offsets": {
+    "nonzero": 0,
+    "numel": 2304,
+    "allzero_rawSHA_confirmed": true,
+    "nonzero_fold_hardware_claim": false
+  },
+  "source_backing_lifetime_proof": "Unchanged strict release fences passed before every next group; source callbacks/sample records retained, no payload references saved",
+  "PID_identity_checks": [
+    {
+      "pid": 3292663,
+      "recorded_start_ticks": "104772614",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3293036,
+      "recorded_start_ticks": "104773026",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3293540,
+      "recorded_start_ticks": "104773450",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3293727,
+      "recorded_start_ticks": "104773566",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3293728,
+      "recorded_start_ticks": "104773567",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3293746,
+      "recorded_start_ticks": "104773568",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3293764,
+      "recorded_start_ticks": "104773568",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3293782,
+      "recorded_start_ticks": "104773569",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3293810,
+      "recorded_start_ticks": "104773569",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3293831,
+      "recorded_start_ticks": "104773570",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3293853,
+      "recorded_start_ticks": "104773571",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3293874,
+      "recorded_start_ticks": "104773571",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3293894,
+      "recorded_start_ticks": "104773572",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3293915,
+      "recorded_start_ticks": "104773572",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3293936,
+      "recorded_start_ticks": "104773573",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3293957,
+      "recorded_start_ticks": "104773574",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3293978,
+      "recorded_start_ticks": "104773574",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3293999,
+      "recorded_start_ticks": "104773575",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3294020,
+      "recorded_start_ticks": "104773575",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3294041,
+      "recorded_start_ticks": "104773576",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3302680,
+      "recorded_start_ticks": "104783075",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3302683,
+      "recorded_start_ticks": "104783076",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3302686,
+      "recorded_start_ticks": "104783077",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3302692,
+      "recorded_start_ticks": "104783078",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3302698,
+      "recorded_start_ticks": "104783079",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3302704,
+      "recorded_start_ticks": "104783079",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3302710,
+      "recorded_start_ticks": "104783080",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3302716,
+      "recorded_start_ticks": "104783081",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3302722,
+      "recorded_start_ticks": "104783082",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3302728,
+      "recorded_start_ticks": "104783083",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3302739,
+      "recorded_start_ticks": "104783083",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3302747,
+      "recorded_start_ticks": "104783084",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3302753,
+      "recorded_start_ticks": "104783085",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3302759,
+      "recorded_start_ticks": "104783086",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3302765,
+      "recorded_start_ticks": "104783087",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    },
+    {
+      "pid": 3302771,
+      "recorded_start_ticks": "104783087",
+      "current_start_ticks": null,
+      "recorded_identity_absent": true
+    }
+  ],
+  "all_recorded_identities_absent": true,
+  "all16_lock_release_logged": true,
+  "protected_source_evidence_bytes_unchanged": true,
+  "NPU_tests_in_audit": 0,
+  "full40_physical_firsttouch_upload_forward_peaks": null,
+  "production_guard_fit_text": "HELD"
+}

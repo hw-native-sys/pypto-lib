@@ -1,0 +1,40 @@
+{
+  "record_id": "main-f09-application-1794097608",
+  "role": "main-agent",
+  "start_epoch": 1794097671,
+  "end_epoch": 1794097960.059732,
+  "measured_wall_seconds": 289.05973196029663,
+  "source_apply_epoch": 1794097720.059598,
+  "RootGO_id": "observer-20261108-apply-F09-B30b-strict44",
+  "protected_model_paths": [
+    "models/deepseek_v4_1_flash_a3_w8a8/compressor.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_fwd.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_layer.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_moe.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/generate.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/layer_reference.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/moe_exchange.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_fwd.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_layer.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_moe.py"
+  ],
+  "shared_doc_writes": [
+    "MODULES.md",
+    "INTERFACE.md",
+    "HANDOFF.md"
+  ],
+  "lock": ".coordination.lock/flock",
+  "worker_records_imported": 0,
+  "CPU_tasks": [
+    {
+      "task": "task_20261108_082840_310517212116",
+      "kind": "FROZEN_METADATA_DATA_GENERATION_NOT_TEST",
+      "exit": 0
+    }
+  ],
+  "Main_tests": false,
+  "Main_compile": false,
+  "NPU": false,
+  "checkpoint_payload_bytes": 0,
+  "status": "FINAL_PARK_APPLIED_PENDING_INDEPENDENT_CHECK"
+}

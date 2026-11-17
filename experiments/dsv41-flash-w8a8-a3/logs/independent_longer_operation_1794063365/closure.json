@@ -1,0 +1,27 @@
+{
+  "status": "FINAL/PARK",
+  "epoch": 1794064250.0475664,
+  "task": "task_20261107_230711_34875926974",
+  "raw_status": "completed (exit=0)",
+  "own_pid": 3487935,
+  "own_starttick": 106395791,
+  "same_identity_present": false,
+  "source45": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "protected": {
+    "longer_generation_admission_apply_1794062947": {
+      "manifest": "f23eed7cdf0a20a51099c7b906feaccbe00d3f1590c9139d754aec1497e1a662",
+      "count": 17,
+      "unchanged": true
+    },
+    "longer_generation_operation_prepare_1794063015": {
+      "manifest": "f2cef526699b5b8a3b4a0f2e6184a80a22ab6798e30066afe204b6d8ca0d9f27",
+      "count": 16,
+      "unchanged": true
+    }
+  },
+  "valid_actual_grants_created": 0,
+  "own_NPU_jobs": 0,
+  "real_payload_reads": 0,
+  "compiler_header_lifecycle_repeats": 0,
+  "no_more_tests": true
+}

@@ -1,0 +1,123 @@
+{
+  "schema": "observer-configurable-realtext-bounded-disposition/1",
+  "recorded_epoch": 1794127109.0987208,
+  "user_objective": "Configurable A3 EP/TP following A5 configuration approach, verified actual real-checkpoint text",
+  "user_milestone_status": "ACCEPTED_BOUNDED_CONFIGURABLE_REAL_TEXT",
+  "whole_case_status": "NOT_ACCEPTED",
+  "implementation": {
+    "source45": "f0e91a30e4117e110be183ef44acf2874eea813cc6f72ac7c7fa44bc4ede3a7f",
+    "default": {
+      "tp": 4,
+      "ep": 16
+    },
+    "discrete_domains": {
+      "tp": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "ep": [
+        2,
+        4,
+        8,
+        16
+      ]
+    },
+    "validity": "EP>=TP and EP%TP==0; WORLD=EP, DP=EP//TP;13legalpairs",
+    "reference_scope": "A5 configuration/CLI approach; A3 W8A8 and replicated32head indexer retained",
+    "actual_nondefault": {
+      "tp": 8,
+      "ep": 16,
+      "dp": 2,
+      "world": 16
+    },
+    "fullE40_smallEP_fit": "EP8 and smaller unfit with current whole-expert static residency; component native proof is separate"
+  },
+  "validation_actor": "Main/workers and independent reviewers; observer read receipts and coordinates, did not execute tests",
+  "independent_audit": {
+    "task": "task_20261108_163217_381875127764",
+    "path": "experiments/dsv41-flash-w8a8-a3/logs/independent_configurable_generation_1794114713/actual_audit/audit_results.json",
+    "sha256": "ca80ff1c46bf70b3ddcad9d2eaa92ad6c54da5c2987839e35eb45af5128ea549",
+    "passed": 4363,
+    "unmet": 5,
+    "bounded_unmet": [],
+    "unmet_names": [
+      "native-queue-COMPLETE0",
+      "primary-CLI0-and-no-post-observation-monitor-errors",
+      "strict-telemetry-complete-no-descriptive-partial-PASS",
+      "strict-all-samples-known-inventory-memory-and-process-births",
+      "PSS-proportional-sample-consistency"
+    ],
+    "audit_result_complete": true,
+    "final_metadata_seal": "pending reviewer final report; protected result hash bound here"
+  },
+  "actual": {
+    "native_task": "task_20261108_130915_150556113554",
+    "CLI_exit": 0,
+    "native_exit": 1,
+    "generated_ids": [
+      1014,
+      14,
+      1031,
+      515,
+      1613,
+      1
+    ],
+    "full_text": "Once upon a time, there was...",
+    "termination": "eos",
+    "decode_calls": 5,
+    "position_range": [
+      3,
+      7
+    ],
+    "end_position": 8,
+    "prefill_seconds": 2.16,
+    "W8A8_real_E40": true,
+    "Engram": "disabled",
+    "strict_DP_groups": 2,
+    "actual_TP_shards_per_DP": 8,
+    "canonical_upload_bytes": 613256211456,
+    "static_bases": 912,
+    "source_reads": 164192,
+    "source_bytes": 745846365184,
+    "decode_new_static_reads_bytes_upload_allocation_copy": 0,
+    "borrowed_C1_views": 112,
+    "borrowed_same_shape_aliases": 800,
+    "one_owner_one_free": true,
+    "POST_task": "task_20261108_162902_380987212187",
+    "POST_exit": 0,
+    "POST_sha256": "6a3866ec92c217ee9e1b9d16811bd7212e4106f8bfa57638628048f097f9ec54",
+    "recorded_births_absent": 1050,
+    "raw16released": true,
+    "outside_queue": "0/16 used, allidle, PendingRunningempty as saved observations"
+  },
+  "strict_limitations": {
+    "outer": "FAIL",
+    "noncritical_gaps": 259,
+    "critical_errors": [],
+    "monitor_errors": [],
+    "whole_PSS": null,
+    "known_partial_PSS_bytes": 12300867584,
+    "partial_is_whole_peak": false,
+    "telemetry_policy": "unchanged; no posthoc PASS/kill/retry",
+    "intermediate_notification_gap": "observed; causeUNKNOWN; raw eventtime and late notification recorded separately, no backfilledmonitoring"
+  },
+  "not_claimed": [
+    "full-original-model numerical/quantization parity",
+    "all13topologies realnative/fullE40fit",
+    "text quality assessment",
+    "complete process history/PSS or measured full peaks",
+    "general serving/dynamic shapes",
+    "Engram or MTP",
+    "causal speedup"
+  ],
+  "accepted_bounded_facts": [
+    "config propagation/shards/collectives/loader and fresh resource/ABI/source guards",
+    "HEADS8 original3attention native cases and EP2/TP1 three durable MoE scenarios plusTP2/EP4 output+score257",
+    "actualTP8EP16DP2 realcheckpoint 6token EOS/5actual greedy decode with bothDP groups and returnedstate history",
+    "one static upload/publicsame-worker borrowedviews and decodezeroSTATIC",
+    "actualfreshcompiledcode/cacheInOut/publicguards/normalownedcleanup within recordedproof"
+  ],
+  "next": "Owner metadata-only finalcollector/seal/TIMEactualclose after independent audit finalseal, Main docs-only currentoverlays maypublish now with owner-final honestlypending; sourcehold releases only after both finalseals, observer records finalcheckpoint; no more NPU authorized"
+}

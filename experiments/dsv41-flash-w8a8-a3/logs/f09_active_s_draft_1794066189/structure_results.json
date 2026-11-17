@@ -1,0 +1,14 @@
+{
+  "status": "PASS_CALLER_AND_VALID_QUERY_GATE_TINY_ONLY",
+  "all_four_callers_pass_runtime_count": true,
+  "moe_ep16_F10_AST_unchanged": true,
+  "threshold_call_ASTs_unchanged": true,
+  "all_query_gates_ignore_only_inactive_rows": true,
+  "active_logit_count_index_poison_rejects": true,
+  "persistent_state_not_query_masked": true,
+  "active_prefill_oracle_failclosed": true,
+  "liveCC_and_worker8_unchanged": true,
+  "compile": false,
+  "native": false,
+  "payload_bytes": 0
+}

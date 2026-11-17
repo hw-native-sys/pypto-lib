@@ -1,0 +1,73 @@
+{
+  "schema": "Configurable-native-PARENT-CONTRACT-ONLY/1",
+  "is_authorization": false,
+  "actual_go_issued": false,
+  "profiles": {
+    "ep": {
+      "required_parent_fields": {
+        "schema": "Root-configurable-native-parent/1",
+        "approved": true,
+        "profile": "ep",
+        "tp": 1,
+        "ep": 2,
+        "work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_configurable_components_1794109406/ep/work",
+        "dependency_pins_sha256": "42b3b07abb096d53415aa022592412b7bcd64fdc797e45e39f8af3282694b05c",
+        "entries_sha256": "85da069d517a34efce492d6f393edb5c3aadb845c272257629014d463d097b38",
+        "fixture_sha256": "914457368aed57489129a4d11afa6b785380e9ac87da9dd23e953b03f0c52f45",
+        "driver_sha256": "f83f89b1f589b0ec41347fde4897dc7275d1142382ff5f3e61390634779ad26a",
+        "publisher_sha256": "2ef962f952a9c1a5fc3ecd233471a6d66b7a7f59bf53cceac93a35530f1f3e4c",
+        "query_sha256": "6943a03a563930ff9fc1987bc61954f94da753db0ac1a615c392239e543149b7",
+        "cpu_manifest_sha256": "45aa17ba826c4e689c85d29a8b29a548795c8e905b648876e46c15db7185c419",
+        "budget_sha256": "09ed71ca558a668c836386d0c2b74f83775b13a23f176224b83c2017279f6dbc",
+        "publisher_proof_sha256": "1bac1fafef47c52d5a7e15a6a98b5bbe65a240076c283d2cc7214f7fb5b8b55d"
+      },
+      "Root_must_add": {
+        "root_id": "Root-chosen explicit actual native scope",
+        "expires_unix": "future <=now+7200",
+        "allow_after_allocation_public_query": true
+      },
+      "launch": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_configurable_components_1794109406/ep_launch",
+      "output": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_configurable_components_1794109406/ep/work",
+      "actual_devices": "all distinct actual TASK_DEVICE; length EP",
+      "hbm_floor_bytes_per_rank": 25769803776,
+      "max_running_seconds": 1200,
+      "client_seconds": 1500
+    },
+    "tp": {
+      "required_parent_fields": {
+        "schema": "Root-configurable-native-parent/1",
+        "approved": true,
+        "profile": "tp",
+        "tp": 2,
+        "ep": 4,
+        "work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_configurable_components_1794109406/tp/work",
+        "dependency_pins_sha256": "42b3b07abb096d53415aa022592412b7bcd64fdc797e45e39f8af3282694b05c",
+        "entries_sha256": "85da069d517a34efce492d6f393edb5c3aadb845c272257629014d463d097b38",
+        "fixture_sha256": "914457368aed57489129a4d11afa6b785380e9ac87da9dd23e953b03f0c52f45",
+        "driver_sha256": "f83f89b1f589b0ec41347fde4897dc7275d1142382ff5f3e61390634779ad26a",
+        "publisher_sha256": "2ef962f952a9c1a5fc3ecd233471a6d66b7a7f59bf53cceac93a35530f1f3e4c",
+        "query_sha256": "6943a03a563930ff9fc1987bc61954f94da753db0ac1a615c392239e543149b7",
+        "cpu_manifest_sha256": "d4700f1a14bc7a886167dd7ec27eced2100f1e6afa469969ef5054779379fd7b",
+        "budget_sha256": "09ed71ca558a668c836386d0c2b74f83775b13a23f176224b83c2017279f6dbc",
+        "publisher_proof_sha256": "1bac1fafef47c52d5a7e15a6a98b5bbe65a240076c283d2cc7214f7fb5b8b55d"
+      },
+      "Root_must_add": {
+        "root_id": "Root-chosen explicit actual native scope",
+        "expires_unix": "future <=now+7200",
+        "allow_after_allocation_public_query": true
+      },
+      "launch": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_configurable_components_1794109406/tp_launch",
+      "output": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_configurable_components_1794109406/tp/work",
+      "actual_devices": "all distinct actual TASK_DEVICE; length EP",
+      "hbm_floor_bytes_per_rank": 12884901888,
+      "max_running_seconds": 600,
+      "client_seconds": 900
+    }
+  },
+  "publisher": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_configurable_native_prepare_1794109406/publish_after_allocation.py",
+  "launcher": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_configurable_native_prepare_1794109406/publisher_stage.sh",
+  "launcher_sha256": "9858054b3090d535b86b8d7084e28db58a7c6c868356ab80ee5d84841b325dbf",
+  "public_query_requires_actual_native_GO": true,
+  "query_scope": "exact compiled artifact fresh clone/public from_dir/public prepare/query/normalclose; no samples or dispatch",
+  "future_native_dispatch_scope": "EP3scenario actual moe_ep vs original-math reference; TP output and scores only"
+}

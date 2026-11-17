@@ -1,0 +1,26 @@
+{
+  "Main25_all_unchanged": true,
+  "all_own_CPU_tasks_terminal": true,
+  "current45_all_unchanged": true,
+  "final_helper_sha256": "38e92714a550407727a4a7d816c1e9c8fc711519cc73ecdcf89c1f8d6caa9d59",
+  "final_observation_delta_sha256": "739fbbd11778a55acf9d362f60094a376159eae4364e800be4f80f9b46e23bca",
+  "full_production_admission_positive": false,
+  "known_CPU_identities": [
+    {
+      "pid": 3280964,
+      "same_identity_alive": false,
+      "starttick": "107168298"
+    },
+    {
+      "pid": 3294736,
+      "same_identity_alive": false,
+      "starttick": "107202522"
+    }
+  ],
+  "native_executed": false,
+  "real_grants_created": 0,
+  "source45": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "state": "FINAL_PARK",
+  "task_entry_sha256": "4f0af75139b6c08f4324d46889de9180a1e1b51a036a8aacac24586f567366ac",
+  "tiny_schema_adaptation_explicit": true
+}

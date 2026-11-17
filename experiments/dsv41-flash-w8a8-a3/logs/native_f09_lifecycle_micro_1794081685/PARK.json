@@ -1,0 +1,22 @@
+{
+  "status": "FINAL/PARK",
+  "verdict": "PASS_TINY_PUBLIC_ARTIFACT_LIFECYCLE_ONLY",
+  "native_task": "task_20261108_042113_142720411936",
+  "native_exit": 0,
+  "actual_devices": [0, 1],
+  "audit_task": "task_20261108_042213_14304572871",
+  "audit_exit": 0,
+  "toy_exact_elements": 32768,
+  "expected": 12,
+  "normal_close": true,
+  "known_births_absent": 5,
+  "raw_two_lock_release": true,
+  "frozen_origin_unchanged": true,
+  "private_runtime_API": false,
+  "device_memory_fingerprint_claim": false,
+  "full_PSS_or_continuous_tree_claim": false,
+  "F09_native_model_count_or_state_acceptance": false,
+  "running_jobs": [],
+  "shared_writes": 0,
+  "recovery": "Root decides bounded tiny acceptance. Keep actual paths and receipts immutable; no further native jobs or full16 F09 grant."
+}

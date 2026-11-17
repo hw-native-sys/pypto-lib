@@ -1,0 +1,14 @@
+{
+  "record_id": "review-real-transfer-prepare-1794045713-1794047351",
+  "agent": "review-agent",
+  "start_epoch": 1794045713,
+  "end_epoch": 1794047351,
+  "duration_seconds": 1638,
+  "status": "FINAL/PARK",
+  "scope": "Independent source/header0payload/nonsquaretiny/publicBYTE/scalarobserver CPU only",
+  "NPU_jobs": 0,
+  "real_tensor_payload_reads": 0,
+  "actual_grant_created": false,
+  "own9jobs_terminal": true,
+  "one_profile_observer_failure_preserved": true
+}

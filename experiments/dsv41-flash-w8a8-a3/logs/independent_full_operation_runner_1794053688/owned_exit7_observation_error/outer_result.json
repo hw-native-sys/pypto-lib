@@ -1,0 +1,41 @@
+{
+  "started_epoch": 1794055039.3347602,
+  "command": [
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+    "-c",
+    "import time;time.sleep(.15);raise SystemExit(7)"
+  ],
+  "CLI_returncode": 7,
+  "launch_error": null,
+  "postcheck_error": "ValueError('OWNED_POSTCHECK_ERROR')",
+  "observation_errors": [
+    "post-launch-sample: OSError('OWNED_POSTSPAWN_OBSERVATION_ERROR')"
+  ],
+  "wait_errors": [],
+  "CLI_terminal": true,
+  "postcheck_skipped_reason": null,
+  "CLI_pid": 3598671,
+  "CLI_identity": {
+    "pid": 3598671,
+    "start_ticks": "105496128",
+    "state": "R",
+    "parent_pid": 3598628
+  },
+  "ended_epoch": 1794055039.5522075,
+  "monitor_errors": [],
+  "monitor_thread_alive": false,
+  "known_process_identities": [
+    [
+      3598628,
+      "105496073"
+    ],
+    [
+      3598671,
+      "105496128"
+    ]
+  ],
+  "sample_count": 2,
+  "peak_sampled_own_tree_pss": 15428608,
+  "peak_sampled_own_tree_uss": 15298560,
+  "status": "FAIL"
+}

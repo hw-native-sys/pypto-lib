@@ -1,0 +1,9 @@
+Task task_20261108_021440_342919127289 terminated exit1.
+prepare_binding.py completed current b3e/code binding metadata first.
+check_adapter.py failed at Python parsing, before any control or owned child:
+line65 SimpleNamespace(...,PLAN_SHA:c.PLAN_SHA,__file__=c.__file__)
+SyntaxError: positional argument follows keyword argument
+Correction: PLAN_SHA=c.PLAN_SHA. This is a test-helper typo, not an adapter,
+model, shared-owner, header, payload, native or HC validation failure.
+Raw queue log/status will be collected after the sibling HC PID-audit hold.
+No retry/process is submitted during that hold.

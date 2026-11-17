@@ -1,0 +1,101 @@
+{
+  "status": "PASS_ORIGINAL_DECODE19_AND_PUBLISHED_POSITIVES",
+  "CPU_receipt_sha256": "e20e195d886c320a1d427cbec05701f79cdaba48142f700c244bc3465fbef4aa",
+  "original19_names": [
+    "layer_x_hc",
+    "layer_pre_mix",
+    "x_hc_final",
+    "pre_mix_final",
+    "logits",
+    "window_cache",
+    "compressed_cache_c2a",
+    "index_cache_c2a",
+    "state_cache_c2a",
+    "compressed_cache_c1a",
+    "index_cache_c1a",
+    "topk_indices_c2a",
+    "topk_values_c2a",
+    "pool_block_ids_c2a",
+    "pool_block_counts_c2a",
+    "topk_indices_c1a",
+    "topk_values_c1a",
+    "pool_block_ids_c1a",
+    "pool_block_counts_c1a"
+  ],
+  "oracle_integrity": [
+    {
+      "scope": "unconditioned",
+      "initial_before_sha256": "8a2ee5656d2c88e434cd0caa6d4de6119056edc1b109e118c7aa0ec8fcdd91a7",
+      "initial_after_sha256": "8a2ee5656d2c88e434cd0caa6d4de6119056edc1b109e118c7aa0ec8fcdd91a7",
+      "tensor_count": 39,
+      "mutable_names": [
+        "window_cache",
+        "compressed_cache_c2a",
+        "index_cache_c2a",
+        "state_cache_c2a",
+        "compressed_cache_c1a",
+        "index_cache_c1a",
+        "topk_indices",
+        "topk_values",
+        "pool_block_ids",
+        "pool_block_counts",
+        "x_hc",
+        "pre_mix"
+      ]
+    },
+    {
+      "scope": "staged",
+      "initial_before_sha256": "8a2ee5656d2c88e434cd0caa6d4de6119056edc1b109e118c7aa0ec8fcdd91a7",
+      "initial_after_sha256": "8a2ee5656d2c88e434cd0caa6d4de6119056edc1b109e118c7aa0ec8fcdd91a7",
+      "tensor_count": 39,
+      "mutable_names": [
+        "window_cache",
+        "compressed_cache_c2a",
+        "index_cache_c2a",
+        "state_cache_c2a",
+        "compressed_cache_c1a",
+        "index_cache_c1a",
+        "topk_indices",
+        "topk_values",
+        "pool_block_ids",
+        "pool_block_counts",
+        "x_hc",
+        "pre_mix"
+      ]
+    }
+  ],
+  "reference_events": [
+    {
+      "epoch": 1794041136.4086905,
+      "scope": "unconditioned",
+      "event": "ENTER",
+      "tokens": 1,
+      "instrumentation": "read-only profile entry/return; original execution unchanged"
+    },
+    {
+      "epoch": 1794041181.649696,
+      "scope": "unconditioned",
+      "event": "RETURN",
+      "tokens": 1,
+      "instrumentation": "read-only profile entry/return; original execution unchanged"
+    },
+    {
+      "epoch": 1794041181.996293,
+      "scope": "staged",
+      "event": "ENTER",
+      "tokens": 1,
+      "instrumentation": "read-only profile entry/return; original execution unchanged"
+    },
+    {
+      "epoch": 1794041229.9749534,
+      "scope": "staged",
+      "event": "RETURN",
+      "tokens": 1,
+      "instrumentation": "read-only profile entry/return; original execution unchanged"
+    }
+  ],
+  "published_positive_sha256": "52c2a836bced79eb8ae38caa4800a2f191cdd0312e5ec15e79876251bf7d4720",
+  "capsule_before_after_unchanged": true,
+  "NPU_prepares": 0,
+  "scope": "owning unconditioned plus staged gates and original current published rows; not strict whole-history parity"
+}

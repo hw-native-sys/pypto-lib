@@ -1,0 +1,6 @@
+{
+  "scope": "post-close capacity query failure must not hide first_error or suppress result; no compiler/kernel/config/owner-class changes",
+  "CPU_pass_helper_sha256": "0042507d1ad5747f21f184e5439b31e1c97ca94b259890225a0b1cf1443dee89",
+  "final_helper_sha256": "38e92714a550407727a4a7d816c1e9c8fc711519cc73ecdcf89c1f8d6caa9d59",
+  "native_branch_never_executed": "both versions untested before Root hardware GO"
+}

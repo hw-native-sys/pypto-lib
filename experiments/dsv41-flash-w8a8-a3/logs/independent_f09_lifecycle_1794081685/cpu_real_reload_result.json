@@ -1,0 +1,26 @@
+{
+  "status": "PASS_ACTUAL_GENERATED_CLONE_PUBLIC_FROM_DIR_ONLY",
+  "origin": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/tiny_shared_host_slice_correction_1794072874/signature_build/_jit_decode_20261108_013532_8mazfz8m",
+  "cloned_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_lifecycle_1794081685/CPU_REAL_GENERATED_RELOAD_ONLY/prepared_artifact",
+  "default_refused": true,
+  "original_unchanged": true,
+  "registered_units": [
+    {
+      "config": "next_levels/decode_chip/kernel_config.py",
+      "kernels": [
+        "next_levels/decode_chip/kernels/aiv/decode_core.cpp"
+      ],
+      "orchestration": "next_levels/decode_chip/orchestration/decode_chip.cpp"
+    }
+  ],
+  "source_only_postinventory_rejected": "missing/ambiguous prepared object for next_levels/decode_chip/kernels/aiv/decode_core.cpp",
+  "compile": false,
+  "prepare": false,
+  "NPU": false,
+  "tensor_inputs": 0,
+  "mode": "ExecutionMode.ONBOARD",
+  "logical_compile_ids_not_allocated_devices": [
+    0,
+    1
+  ]
+}

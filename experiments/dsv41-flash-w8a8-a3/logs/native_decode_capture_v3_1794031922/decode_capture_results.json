@@ -1,0 +1,367 @@
+{
+  "status": "DURABLE_CLOSED_NATIVE_DECODE_CHAIN_NOT_NUMERICALLY_VALIDATED",
+  "mode": "ONBOARD",
+  "platform": "a2a3",
+  "ring_heap": [
+    0,
+    0,
+    4294967296,
+    0
+  ],
+  "same_owner_epoch": "decode-3279907-a0c0ee08f50246a9af467089c7a04388",
+  "same_compiled_artifact": {
+    "compile_seconds": 24.996228218078613,
+    "metadata_sha256": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770",
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_decode_capture_v3_1794031922/build/_jit_decode_fwd_20261107_142723_4bpmehp7"
+  },
+  "actual_state_handoff": {
+    "accepted_prefix_manifest_sha256": "7d36fe16c04494b4f5da2fd812766edb99a2b730546fdd194097bc7d6e55addd",
+    "accepted_CPUreceipt_sha256": "d8b1a90ec674af84c2f67da4e8d0e295b81f3a0b3ee8ffc91e6f8fb78c3e163d",
+    "persistent_cache_hashes": {
+      "window_cache": "85c7b470ceabf86e4028e0ad153dbfdaca627d181e748d1ef28d0bd33eb00fa8",
+      "compressed_cache_c2a": "c95be27705fd059ee8936e4a6204d72dc083662a21147af84a1dcef7960366b2",
+      "index_cache_c2a": "263b61b5e7256b5f02339f700b06bef3dbb27bc82e80ca07421ab8a57fa02b4c",
+      "state_cache_c2a": "83aff74ec09d37c0eeb7013cc0fd6579279eeb0ed3d01b6ebc3fcdb3e62f9d9c",
+      "compressed_cache_c1a": "b319203b79a884a28951fc649fa8f7a4ee547e5000b94c25ae2b8ec9283de351",
+      "index_cache_c1a": "511dfdcf0881224788476fa457266eadb932375311d0acd37ba872e8c320d61b"
+    },
+    "actual_prefix_bytes_not_golden": true
+  },
+  "dispatch_count": 4,
+  "checkpoints": {
+    "decode128": {
+      "manifest_sha256": "52847e6bd94d6b5012b17dd6c63898b16f5d3b65184b32083eac96b9702b1afc",
+      "owner_closed_sha256": "fc7c12dbf809874ad897b09f4a23520c9aa9119e3a51f6b1154bc216175daac1",
+      "position": 128,
+      "payloads": {
+        "actual": {
+          "bytes": 247121409,
+          "sha256": "8975e91bb5c27e485290b427b6b20d1c2f1c204be23844d2eb296389d0456101"
+        },
+        "initial": {
+          "bytes": 247123310,
+          "sha256": "3ef87dac861614a84b947cadcfb2279db9230c676ac5ea2f8d4fc2c399c43e96"
+        }
+      },
+      "growing_retention": {
+        "checked_rows": 8192,
+        "failures": [],
+        "pass": true
+      },
+      "negative_retention_observation": null
+    },
+    "decode129": {
+      "manifest_sha256": "c60022a1cb58b4d002491c3ea55b9f2840a81375e2aa52298364eaf2c1d2adb0",
+      "owner_closed_sha256": "a8af059b04bd4d8378815a7bc4f85b4b73d396343dcb72c97ee9d4713b4e0b6e",
+      "position": 129,
+      "payloads": {
+        "actual": {
+          "bytes": 247121409,
+          "sha256": "d47cc6130d421ebfc11a3239af27b809a9e9c0db12b3d404e4515753517e8523"
+        },
+        "initial": {
+          "bytes": 247123310,
+          "sha256": "acf60edea322e13e911217e37a955e02e3d55ed9eb2692d59364c8e0b6a7818c"
+        }
+      },
+      "growing_retention": {
+        "checked_rows": 8240,
+        "failures": [],
+        "pass": true
+      },
+      "negative_retention_observation": null
+    },
+    "decode130": {
+      "manifest_sha256": "d11feba59123892dbda87a833e2f4909ef15462b52c58333159784647114b822",
+      "owner_closed_sha256": "7f77fe9c345af51266337036c6962af94e40f23310ae887008d5ebdd457905e3",
+      "position": 130,
+      "payloads": {
+        "actual": {
+          "bytes": 247121409,
+          "sha256": "cb08b9da19429a578e10e38eec3488cde70f165250458ff02b3acb8271489ec3"
+        },
+        "initial": {
+          "bytes": 247123310,
+          "sha256": "82b50dc10f7608c2a5d9c5317c9009e5a107d6a069197fcf52de1492d666b488"
+        }
+      },
+      "growing_retention": {
+        "checked_rows": 8320,
+        "failures": [],
+        "pass": true
+      },
+      "negative_retention_observation": null
+    },
+    "stale129": {
+      "manifest_sha256": "afe69304d7b28d9588ef84e712916af3ce71ef8816421309a7525524c566afbf",
+      "owner_closed_sha256": "ad33f4df7e10d769453a5ff08cd3030092ff8a63d8a6936b1b396b437f3c54ed",
+      "position": 129,
+      "payloads": {
+        "actual": {
+          "bytes": 247121409,
+          "sha256": "c2337109c075a3ad3b24c03f917c9e57275ebcb8b0b8504f6984452f3dd2b50b"
+        },
+        "initial": {
+          "bytes": 247123310,
+          "sha256": "effd5f6d165059dcb29094ac5d58e11521d21dd09533faec299184e2822c2cc5"
+        }
+      },
+      "growing_retention": null,
+      "negative_retention_observation": {
+        "checked_rows": 8240,
+        "failures": [
+          {
+            "cache": "window_cache",
+            "rank": 0,
+            "physical_row": 128
+          },
+          {
+            "cache": "window_cache",
+            "rank": 1,
+            "physical_row": 128
+          },
+          {
+            "cache": "window_cache",
+            "rank": 2,
+            "physical_row": 128
+          },
+          {
+            "cache": "window_cache",
+            "rank": 3,
+            "physical_row": 128
+          },
+          {
+            "cache": "window_cache",
+            "rank": 4,
+            "physical_row": 128
+          },
+          {
+            "cache": "window_cache",
+            "rank": 5,
+            "physical_row": 128
+          },
+          {
+            "cache": "window_cache",
+            "rank": 6,
+            "physical_row": 128
+          },
+          {
+            "cache": "window_cache",
+            "rank": 7,
+            "physical_row": 128
+          },
+          {
+            "cache": "window_cache",
+            "rank": 8,
+            "physical_row": 128
+          },
+          {
+            "cache": "window_cache",
+            "rank": 9,
+            "physical_row": 128
+          },
+          {
+            "cache": "window_cache",
+            "rank": 10,
+            "physical_row": 128
+          },
+          {
+            "cache": "window_cache",
+            "rank": 11,
+            "physical_row": 128
+          },
+          {
+            "cache": "window_cache",
+            "rank": 12,
+            "physical_row": 128
+          },
+          {
+            "cache": "window_cache",
+            "rank": 13,
+            "physical_row": 128
+          },
+          {
+            "cache": "window_cache",
+            "rank": 14,
+            "physical_row": 128
+          },
+          {
+            "cache": "window_cache",
+            "rank": 15,
+            "physical_row": 128
+          },
+          {
+            "cache": "compressed_cache_c1a",
+            "rank": 0,
+            "physical_row": 128
+          },
+          {
+            "cache": "compressed_cache_c1a",
+            "rank": 1,
+            "physical_row": 128
+          },
+          {
+            "cache": "compressed_cache_c1a",
+            "rank": 2,
+            "physical_row": 128
+          },
+          {
+            "cache": "compressed_cache_c1a",
+            "rank": 3,
+            "physical_row": 128
+          },
+          {
+            "cache": "compressed_cache_c1a",
+            "rank": 4,
+            "physical_row": 128
+          },
+          {
+            "cache": "compressed_cache_c1a",
+            "rank": 5,
+            "physical_row": 128
+          },
+          {
+            "cache": "compressed_cache_c1a",
+            "rank": 6,
+            "physical_row": 128
+          },
+          {
+            "cache": "compressed_cache_c1a",
+            "rank": 7,
+            "physical_row": 128
+          },
+          {
+            "cache": "compressed_cache_c1a",
+            "rank": 8,
+            "physical_row": 128
+          },
+          {
+            "cache": "compressed_cache_c1a",
+            "rank": 9,
+            "physical_row": 128
+          },
+          {
+            "cache": "compressed_cache_c1a",
+            "rank": 10,
+            "physical_row": 128
+          },
+          {
+            "cache": "compressed_cache_c1a",
+            "rank": 11,
+            "physical_row": 128
+          },
+          {
+            "cache": "compressed_cache_c1a",
+            "rank": 12,
+            "physical_row": 128
+          },
+          {
+            "cache": "compressed_cache_c1a",
+            "rank": 13,
+            "physical_row": 128
+          },
+          {
+            "cache": "compressed_cache_c1a",
+            "rank": 14,
+            "physical_row": 128
+          },
+          {
+            "cache": "compressed_cache_c1a",
+            "rank": 15,
+            "physical_row": 128
+          },
+          {
+            "cache": "index_cache_c1a",
+            "rank": 0,
+            "physical_row": 128
+          },
+          {
+            "cache": "index_cache_c1a",
+            "rank": 1,
+            "physical_row": 128
+          },
+          {
+            "cache": "index_cache_c1a",
+            "rank": 2,
+            "physical_row": 128
+          },
+          {
+            "cache": "index_cache_c1a",
+            "rank": 3,
+            "physical_row": 128
+          },
+          {
+            "cache": "index_cache_c1a",
+            "rank": 4,
+            "physical_row": 128
+          },
+          {
+            "cache": "index_cache_c1a",
+            "rank": 5,
+            "physical_row": 128
+          },
+          {
+            "cache": "index_cache_c1a",
+            "rank": 6,
+            "physical_row": 128
+          },
+          {
+            "cache": "index_cache_c1a",
+            "rank": 7,
+            "physical_row": 128
+          },
+          {
+            "cache": "index_cache_c1a",
+            "rank": 8,
+            "physical_row": 128
+          },
+          {
+            "cache": "index_cache_c1a",
+            "rank": 9,
+            "physical_row": 128
+          },
+          {
+            "cache": "index_cache_c1a",
+            "rank": 10,
+            "physical_row": 128
+          },
+          {
+            "cache": "index_cache_c1a",
+            "rank": 11,
+            "physical_row": 128
+          },
+          {
+            "cache": "index_cache_c1a",
+            "rank": 12,
+            "physical_row": 128
+          },
+          {
+            "cache": "index_cache_c1a",
+            "rank": 13,
+            "physical_row": 128
+          },
+          {
+            "cache": "index_cache_c1a",
+            "rank": 14,
+            "physical_row": 128
+          },
+          {
+            "cache": "index_cache_c1a",
+            "rank": 15,
+            "physical_row": 128
+          }
+        ],
+        "pass": false
+      }
+    }
+  },
+  "normal_owner_closed": true,
+  "accepted_old579_root45_V3_unchanged": true,
+  "operational_gate_only_existing_content_change": true,
+  "CPU_reference_calls": 0,
+  "negative_control_numerical_PASS": false,
+  "CPU19_PASS": false,
+  "forbidden_calls": [],
+  "duration_seconds": 365.21714248508215,
+  "scope": "actual128prefix -> planned128/129/130 and stale129;40dense/reused1syntheticexpert/noEngram, notgreedytext/fullweights/fit"
+}

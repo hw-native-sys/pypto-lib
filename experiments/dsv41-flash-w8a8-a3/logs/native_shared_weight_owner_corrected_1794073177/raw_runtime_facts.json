@@ -1,0 +1,56 @@
+{
+  "chip_run_events": [
+    {
+      "pid": 3344539,
+      "run_id": 1
+    },
+    {
+      "pid": 3344536,
+      "run_id": 1
+    },
+    {
+      "pid": 3344539,
+      "run_id": 2
+    },
+    {
+      "pid": 3344536,
+      "run_id": 2
+    },
+    {
+      "pid": 3344536,
+      "run_id": 3
+    },
+    {
+      "pid": 3344539,
+      "run_id": 3
+    },
+    {
+      "pid": 3344536,
+      "run_id": 4
+    },
+    {
+      "pid": 3344539,
+      "run_id": 4
+    },
+    {
+      "pid": 3344536,
+      "run_id": 5
+    },
+    {
+      "pid": 3344539,
+      "run_id": 5
+    }
+  ],
+  "native_log_sha256": "bec7289d1acf1a5ad75a35ff710786c43ffb7e2e2ecf11e809a52afc910559c5",
+  "note": "Raw observed native trace summaries; public config passed is recorded separately, no invented runtime mode/ring field.",
+  "ready": [
+    {
+      "device": 0,
+      "pid": 3344536
+    },
+    {
+      "device": 1,
+      "pid": 3344539
+    }
+  ]
+}

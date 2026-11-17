@@ -1,0 +1,323 @@
+{
+  "actual_PyPTO_route_knob_available": false,
+  "public_RunConfig_fields": [
+    "arch",
+    "execution_mode",
+    "device_id",
+    "rtol",
+    "atol",
+    "strategy",
+    "dump_passes",
+    "save_kernels",
+    "save_kernels_dir",
+    "codegen_only",
+    "enable_chip_swimlane",
+    "enable_dump_args",
+    "enable_pmu",
+    "enable_dep_gen",
+    "enable_scope_stats",
+    "compile_profiling",
+    "diagnostic_phase",
+    "disabled_diagnostics",
+    "golden_data_dir",
+    "aicpu_thread_num",
+    "ring_task_window",
+    "ring_heap",
+    "ring_dep_pool",
+    "cache_config",
+    "distributed_config",
+    "analyze_auto_scopes_for_deps",
+    "memory_planner",
+    "dump_ptoas_passes",
+    "enable_software_pipeline"
+  ],
+  "rejections": [
+    {
+      "knob": "pipeline_depth",
+      "route": "RunConfig",
+      "error": "RunConfig.__init__() got an unexpected keyword argument 'pipeline_depth'"
+    },
+    {
+      "knob": "pipeline_depth",
+      "route": "normalize_config",
+      "error": "RunConfig.__init__() got an unexpected keyword argument 'pipeline_depth'"
+    },
+    {
+      "knob": "pipeline_depth",
+      "route": "prepare_signature",
+      "error": "got an unexpected keyword argument 'pipeline_depth'"
+    },
+    {
+      "knob": "pipeline_depth",
+      "route": "DistributedWorker_signature",
+      "error": "got an unexpected keyword argument 'pipeline_depth'"
+    },
+    {
+      "knob": "pipeline_depth",
+      "route": "DistributedConfig",
+      "error": "DistributedConfig.__init__() got an unexpected keyword argument 'pipeline_depth'"
+    },
+    {
+      "knob": "pipeline_depth",
+      "route": "CallConfig",
+      "error": "'CallConfig' object has no attribute 'pipeline_depth'"
+    },
+    {
+      "knob": "pipeline_depth",
+      "route": "CallConfig_runtime_env",
+      "error": "'RuntimeEnv' object has no attribute 'pipeline_depth'"
+    },
+    {
+      "knob": "pending_run_depth",
+      "route": "RunConfig",
+      "error": "RunConfig.__init__() got an unexpected keyword argument 'pending_run_depth'"
+    },
+    {
+      "knob": "pending_run_depth",
+      "route": "normalize_config",
+      "error": "RunConfig.__init__() got an unexpected keyword argument 'pending_run_depth'"
+    },
+    {
+      "knob": "pending_run_depth",
+      "route": "prepare_signature",
+      "error": "got an unexpected keyword argument 'pending_run_depth'"
+    },
+    {
+      "knob": "pending_run_depth",
+      "route": "DistributedWorker_signature",
+      "error": "got an unexpected keyword argument 'pending_run_depth'"
+    },
+    {
+      "knob": "pending_run_depth",
+      "route": "DistributedConfig",
+      "error": "DistributedConfig.__init__() got an unexpected keyword argument 'pending_run_depth'"
+    },
+    {
+      "knob": "pending_run_depth",
+      "route": "CallConfig",
+      "error": "'CallConfig' object has no attribute 'pending_run_depth'"
+    },
+    {
+      "knob": "pending_run_depth",
+      "route": "CallConfig_runtime_env",
+      "error": "'RuntimeEnv' object has no attribute 'pending_run_depth'"
+    },
+    {
+      "knob": "launch_depth",
+      "route": "RunConfig",
+      "error": "RunConfig.__init__() got an unexpected keyword argument 'launch_depth'"
+    },
+    {
+      "knob": "launch_depth",
+      "route": "normalize_config",
+      "error": "RunConfig.__init__() got an unexpected keyword argument 'launch_depth'"
+    },
+    {
+      "knob": "launch_depth",
+      "route": "prepare_signature",
+      "error": "got an unexpected keyword argument 'launch_depth'"
+    },
+    {
+      "knob": "launch_depth",
+      "route": "DistributedWorker_signature",
+      "error": "got an unexpected keyword argument 'launch_depth'"
+    },
+    {
+      "knob": "launch_depth",
+      "route": "DistributedConfig",
+      "error": "DistributedConfig.__init__() got an unexpected keyword argument 'launch_depth'"
+    },
+    {
+      "knob": "launch_depth",
+      "route": "CallConfig",
+      "error": "'CallConfig' object has no attribute 'launch_depth'"
+    },
+    {
+      "knob": "launch_depth",
+      "route": "CallConfig_runtime_env",
+      "error": "'RuntimeEnv' object has no attribute 'launch_depth'"
+    },
+    {
+      "knob": "max_in_flight",
+      "route": "RunConfig",
+      "error": "RunConfig.__init__() got an unexpected keyword argument 'max_in_flight'"
+    },
+    {
+      "knob": "max_in_flight",
+      "route": "normalize_config",
+      "error": "RunConfig.__init__() got an unexpected keyword argument 'max_in_flight'"
+    },
+    {
+      "knob": "max_in_flight",
+      "route": "prepare_signature",
+      "error": "got an unexpected keyword argument 'max_in_flight'"
+    },
+    {
+      "knob": "max_in_flight",
+      "route": "DistributedWorker_signature",
+      "error": "got an unexpected keyword argument 'max_in_flight'"
+    },
+    {
+      "knob": "max_in_flight",
+      "route": "DistributedConfig",
+      "error": "DistributedConfig.__init__() got an unexpected keyword argument 'max_in_flight'"
+    },
+    {
+      "knob": "max_in_flight",
+      "route": "CallConfig",
+      "error": "'CallConfig' object has no attribute 'max_in_flight'"
+    },
+    {
+      "knob": "max_in_flight",
+      "route": "CallConfig_runtime_env",
+      "error": "'RuntimeEnv' object has no attribute 'max_in_flight'"
+    },
+    {
+      "knob": "max_inflight",
+      "route": "RunConfig",
+      "error": "RunConfig.__init__() got an unexpected keyword argument 'max_inflight'"
+    },
+    {
+      "knob": "max_inflight",
+      "route": "normalize_config",
+      "error": "RunConfig.__init__() got an unexpected keyword argument 'max_inflight'"
+    },
+    {
+      "knob": "max_inflight",
+      "route": "prepare_signature",
+      "error": "got an unexpected keyword argument 'max_inflight'"
+    },
+    {
+      "knob": "max_inflight",
+      "route": "DistributedWorker_signature",
+      "error": "got an unexpected keyword argument 'max_inflight'"
+    },
+    {
+      "knob": "max_inflight",
+      "route": "DistributedConfig",
+      "error": "DistributedConfig.__init__() got an unexpected keyword argument 'max_inflight'"
+    },
+    {
+      "knob": "max_inflight",
+      "route": "CallConfig",
+      "error": "'CallConfig' object has no attribute 'max_inflight'"
+    },
+    {
+      "knob": "max_inflight",
+      "route": "CallConfig_runtime_env",
+      "error": "'RuntimeEnv' object has no attribute 'max_inflight'"
+    }
+  ],
+  "underlying_public_Worker_configs": [
+    {
+      "underlying_Worker_public_constructor_config": {
+        "pipeline_depth": 1
+      },
+      "source_validator_tuple": [
+        1,
+        0,
+        1
+      ]
+    },
+    {
+      "underlying_Worker_public_constructor_config": {
+        "pipeline_depth": 1,
+        "pending_run_depth": 1,
+        "launch_depth": 1
+      },
+      "source_validator_tuple": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "underlying_Worker_public_constructor_config": {
+        "pipeline_depth": 2,
+        "pending_run_depth": 0,
+        "launch_depth": 1
+      },
+      "source_validator_tuple": [
+        2,
+        0,
+        1
+      ]
+    }
+  ],
+  "underlying_invalid_types": [
+    {
+      "knob": "pipeline_depth",
+      "value": "True",
+      "error": "Worker pipeline_depth must be an int, got bool"
+    },
+    {
+      "knob": "pipeline_depth",
+      "value": "1.0",
+      "error": "Worker pipeline_depth must be an int, got float"
+    },
+    {
+      "knob": "pipeline_depth",
+      "value": "'1'",
+      "error": "Worker pipeline_depth must be an int, got str"
+    },
+    {
+      "knob": "pipeline_depth",
+      "value": "-1",
+      "error": "Worker pipeline_depth must be >= 1, got -1"
+    },
+    {
+      "knob": "pending_run_depth",
+      "value": "True",
+      "error": "Worker pending_run_depth must be an int, got bool"
+    },
+    {
+      "knob": "pending_run_depth",
+      "value": "1.0",
+      "error": "Worker pending_run_depth must be an int, got float"
+    },
+    {
+      "knob": "pending_run_depth",
+      "value": "'1'",
+      "error": "Worker pending_run_depth must be an int, got str"
+    },
+    {
+      "knob": "pending_run_depth",
+      "value": "-1",
+      "error": "Worker pending_run_depth must be >= 0, got -1"
+    },
+    {
+      "knob": "launch_depth",
+      "value": "True",
+      "error": "Worker launch_depth must be an int, got bool"
+    },
+    {
+      "knob": "launch_depth",
+      "value": "1.0",
+      "error": "Worker launch_depth must be an int, got float"
+    },
+    {
+      "knob": "launch_depth",
+      "value": "'1'",
+      "error": "Worker launch_depth must be an int, got str"
+    },
+    {
+      "knob": "launch_depth",
+      "value": "-1",
+      "error": "Worker launch_depth must be >= 1, got -1"
+    }
+  ],
+  "validation_limit": "Pure underlying source validator evaluated on CPU; no Worker init/prewarm, no private production control, no native admission proof.",
+  "construct_worker_forwarded_keys": [
+    "level",
+    "device_ids",
+    "num_sub_workers",
+    "platform",
+    "runtime",
+    "enable_sdma",
+    "startup_timeout_s"
+  ],
+  "prepare_signature": "(self, config: 'RunConfig | None' = None, *, extra_compiled: collections.abc.Sequence['DistributedCompiledProgram'] = (), persistent: bool = False, reset_persistent_windows: bool | None = None, callbacks: dict[str, collections.abc.Callable[..., typing.Any]] | None = None, sub_worker_overrides: dict[str, collections.abc.Callable[..., typing.Any]] | None = None, inherited_host_tensors: 'Sequence[torch.Tensor | ReadOnlyHostTensor] | None' = None, startup_timeout_s: float | None = None) -> 'DistributedWorker'",
+  "DistributedWorker_signature": "(compiled: 'DistributedCompiledProgram | Sequence[DistributedCompiledProgram]', config: 'RunConfig | None' = None, *, persistent: 'bool' = False, reset_persistent_windows: 'bool | None' = None, callbacks: 'dict[str, Callable[..., Any]] | None' = None, sub_worker_overrides: 'dict[str, Callable[..., Any]] | None' = None, inherited_host_tensors: 'Sequence[torch.Tensor | ReadOnlyHostTensor] | None' = None, startup_timeout_s: 'float | None' = None) -> 'None'",
+  "scope": "no compilation needed: rejectedbeforecompile; no model/runtime edits,payload/devicecalls",
+  "frozen45_before_after": true
+}

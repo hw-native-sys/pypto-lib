@@ -1,0 +1,10 @@
+{
+  "state": "FINAL_PARK_SOURCE_ONLY_CONDITIONAL_PLAN_APPROVAL",
+  "epoch": 1794095704,
+  "artifacts": 7,
+  "manifest_sha256": "2159d7a3a3d64ed8bc69d31f4739ccddb4741a250c48038558747479ddadcd84",
+  "source_only": true,
+  "Main27_sha256": "2353c44e40d8ccfbe18a1394dad2272bf3f589cc16fff7dee2458cc16c35e0a4",
+  "actual_apply_GO": false,
+  "numerical_acceptance_claim": false
+}

@@ -1,0 +1,40 @@
+{
+  "tp": 8,
+  "ep": 16,
+  "dp": 2,
+  "budget": {
+    "schema": "configurable-real-resource-budget/1",
+    "topology": {
+      "tp": 8,
+      "ep": 16,
+      "dp": 2,
+      "world": 16,
+      "local_experts": 24
+    },
+    "host_floor_bytes": 68719476736,
+    "disk_floor_bytes": 2147483648,
+    "shm_floor_bytes": 17179869184,
+    "static_per_rank_bytes": 38328513216,
+    "nonstatic_global_IO_bytes": {
+      "prefill": 359958016,
+      "decode": 246077440
+    },
+    "full_global_window_planning_bytes": {
+      "prefill": 2876676096,
+      "decode": 74618880
+    },
+    "communication_reserve_bytes": 2951294976,
+    "unspent_reserve_bytes": 9797894144,
+    "initial_reserve_bytes": 18088299200,
+    "max_new_tokens": 16,
+    "measurement_kind": "CONSERVATIVE_SOURCE_PLANNING_NOT_PEAK",
+    "whole_source_backing_host_allowance_bytes": 5362417664
+  },
+  "status": "PASS",
+  "matrix": [],
+  "nonhomogeneous_owner_original_math": true,
+  "wrong_rank0_mutant_rejected": true,
+  "idle_carry_bitexact": true,
+  "configured_admission_fake": true,
+  "CPU_ONLY_NOT_ACTUAL_GRANT": true
+}

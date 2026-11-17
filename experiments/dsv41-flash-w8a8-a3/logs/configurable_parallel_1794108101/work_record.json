@@ -1,0 +1,24 @@
+{
+  "record_id": "main-configurable-parallel-1794108101",
+  "role": "main-agent",
+  "start_epoch": 1794108101.2561505,
+  "end_epoch": 1794111649.7666855,
+  "measured_wall_seconds": 3548.5105350017548,
+  "worker_records_imported": 3,
+  "source45_sha256": "f0e91a30e4117e110be183ef44acf2874eea813cc6f72ac7c7fa44bc4ede3a7f",
+  "CPU_self_checks": [
+    "114340_FAILED_OWN_FIXTURE",
+    "120237_COMPLETE0"
+  ],
+  "CPU_full_signatures": [
+    "120530_FAILED_OWN_HEAD_TILE",
+    "121110_FAILED_OWN_SCOPE",
+    "121454_COMPLETE0_BOTH"
+  ],
+  "new_metadata_source_rebind": "ONLY_SOURCE_FIELDS_ALL_OTHER_ROOT_VALUES_EQUAL",
+  "checkpoint_header_payload_bytes": 0,
+  "NPU_jobs": 0,
+  "runtime_dependency_edits": 0,
+  "default_HARD_preserved": true,
+  "status": "FINAL_FROZEN_SOURCE_MILESTONE_OPERATION_PREP_SEPARATE"
+}

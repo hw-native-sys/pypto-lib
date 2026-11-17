@@ -1,0 +1,1420 @@
+{
+  "native_review_f01_1793935855": {
+    "manifest_sha256": "3a5b4b19f3dfa3e36a62c591af3996003b23f42c9dd71fc269af47445e3da00c",
+    "artifact_checks": [
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_review_f01_1793935855/REVIEW.md",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_review_f01_1793935855/review_cpu.py",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_review_f01_1793935855/cpu_results.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_review_f01_1793935855/model_manifest.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_review_f01_1793935855/reviewed_files.sha256",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_review_f01_1793935855/cpu_queue.log",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_review_f01_1793935855/cpu_queue_rerun.log",
+        "exists": true,
+        "matches": true
+      }
+    ],
+    "frozen_source_checks": []
+  },
+  "native_accept_f02_1793946300": {
+    "manifest_sha256": "28e84692eb924f1cd5d5dca04b04a1f3d7b809933904557247274696db09304c",
+    "artifact_checks": [
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/REVIEW.md",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/collect_review.py",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/collect_status.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/commands.sh",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/compile/compile.tsv",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/compile_status.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/device/baseline_device.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/device/forward_device.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/device/missing_device.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/device/o_proj_forward.py",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/device/o_proj_missing.py",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/device/results.tsv",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/device/sparse_device.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/device_allocation.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/device_status.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/generated_review.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/host/host_results.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/host/host_semantics.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/host/reviewer_equations.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/host_status.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/results.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/review_cpu.py",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/run_collect.sh",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/run_compile.sh",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/run_device.sh",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/run_host.sh",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/source_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/source_compile_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/source_compile_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/source_device_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/source_device_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/source_final.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/source_host_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/source_host_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/verification_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/verification_compile_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/verification_compile_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/verification_device_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/verification_device_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/verification_final.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/verification_host_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/verification_host_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f02_1793946300/verify_snapshot.py",
+        "exists": true,
+        "matches": true
+      }
+    ],
+    "frozen_source_checks": [
+      {
+        "name": "prefill_moe.py",
+        "matches": true
+      },
+      {
+        "name": "decode_swa.py",
+        "matches": true
+      },
+      {
+        "name": "decode_c1a_reuse.py",
+        "matches": true
+      },
+      {
+        "name": "gemm_w8a8.py",
+        "matches": true
+      },
+      {
+        "name": "paged_cache.py",
+        "matches": true
+      },
+      {
+        "name": "weight_loader.py",
+        "matches": true
+      },
+      {
+        "name": "lm_head.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_c1a_full.py",
+        "matches": true
+      },
+      {
+        "name": "embedding.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_c2a_reuse.py",
+        "matches": true
+      },
+      {
+        "name": "moe_gate.py",
+        "matches": true
+      },
+      {
+        "name": "decode_moe.py",
+        "matches": true
+      },
+      {
+        "name": "tp_reduce.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_c1a_reuse.py",
+        "matches": true
+      },
+      {
+        "name": "decode_c2a_reuse.py",
+        "matches": true
+      },
+      {
+        "name": "attention.py",
+        "matches": true
+      },
+      {
+        "name": "attention_gather.py",
+        "matches": true
+      },
+      {
+        "name": "mla_proj.py",
+        "matches": true
+      },
+      {
+        "name": "decode_c1a_full.py",
+        "matches": true
+      },
+      {
+        "name": "quant.py",
+        "matches": true
+      },
+      {
+        "name": "moe_exchange.py",
+        "matches": true
+      },
+      {
+        "name": "compressor.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_c2a_full.py",
+        "matches": true
+      },
+      {
+        "name": "o_proj.py",
+        "matches": true
+      },
+      {
+        "name": "moe_experts.py",
+        "matches": true
+      },
+      {
+        "name": "weight_map.py",
+        "matches": true
+      },
+      {
+        "name": "utils.py",
+        "matches": true
+      },
+      {
+        "name": "generate.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_c1a_reindex.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_swa.py",
+        "matches": true
+      },
+      {
+        "name": "indexer.py",
+        "matches": true
+      },
+      {
+        "name": "config.py",
+        "matches": true
+      },
+      {
+        "name": "layer_reference.py",
+        "matches": true
+      },
+      {
+        "name": "structural_check.py",
+        "matches": true
+      },
+      {
+        "name": "tokenizer.py",
+        "matches": true
+      },
+      {
+        "name": "decode_c1a_reindex.py",
+        "matches": true
+      },
+      {
+        "name": "decode_layer.py",
+        "matches": true
+      },
+      {
+        "name": "hc.py",
+        "matches": true
+      },
+      {
+        "name": "decode_c2a_full.py",
+        "matches": true
+      },
+      {
+        "name": "engram.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_fwd.py",
+        "matches": true
+      },
+      {
+        "name": "rope.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_layer.py",
+        "matches": true
+      },
+      {
+        "name": "rmsnorm.py",
+        "matches": true
+      },
+      {
+        "name": "decode_fwd.py",
+        "matches": true
+      }
+    ]
+  },
+  "native_accept_cohort_1793951619": {
+    "manifest_sha256": "bbd2fc25bfb723af9f784106daa1cc15715a680809f1048afc80d83783dc5038",
+    "artifact_checks": [
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/REVIEW.md",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/SOURCE_REVIEW.md",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/cache_controls.py",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/cache_status.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/collect.py",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/collect_status.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/commands.sh",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/compile/compile.tsv",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/compile_execution.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/compile_status.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/downstream/results.tsv",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/downstream_execution.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/downstream_status.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/decode_c1a_full_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/decode_c1a_full_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/decode_c1a_full_rotated_index.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/decode_c1a_full_rotated_index.py",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/decode_c2a_full_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/decode_c2a_full_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/decode_c2a_full_rotated_index.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/decode_c2a_full_rotated_index.py",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/prefill_c1a_full_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/prefill_c1a_full_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/prefill_c1a_full_rotated_index.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/prefill_c1a_full_rotated_index.py",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/prefill_c2a_full_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/prefill_c2a_full_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/prefill_c2a_full_rotated_index.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/prefill_c2a_full_rotated_index.py",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03/results.tsv",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03_execution.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f03_status.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f08/after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f08/before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f08_host/host.py",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f08_host/host_results.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f14/after_results.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/f14/before_results.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/generated.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/host/host_results.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/host/integration_results.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/host/reviewer_cache_controls.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/host_execution.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/host_status.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/results.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/run.sh",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/run_collect.sh",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/source_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/source_compile_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/source_compile_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/source_downstream_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/source_downstream_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/source_f03_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/source_f03_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/source_final.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/source_host_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/source_host_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/verify.py",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/verify_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/verify_compile_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/verify_compile_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/verify_downstream_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/verify_downstream_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/verify_f03_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/verify_f03_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/verify_final.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/verify_host_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_cohort_1793951619/verify_host_before.json",
+        "exists": true,
+        "matches": true
+      }
+    ],
+    "frozen_source_checks": [
+      {
+        "name": "prefill_moe.py",
+        "matches": true
+      },
+      {
+        "name": "decode_swa.py",
+        "matches": true
+      },
+      {
+        "name": "decode_c1a_reuse.py",
+        "matches": true
+      },
+      {
+        "name": "gemm_w8a8.py",
+        "matches": true
+      },
+      {
+        "name": "paged_cache.py",
+        "matches": true
+      },
+      {
+        "name": "weight_loader.py",
+        "matches": true
+      },
+      {
+        "name": "lm_head.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_c1a_full.py",
+        "matches": true
+      },
+      {
+        "name": "embedding.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_c2a_reuse.py",
+        "matches": true
+      },
+      {
+        "name": "moe_gate.py",
+        "matches": true
+      },
+      {
+        "name": "decode_moe.py",
+        "matches": true
+      },
+      {
+        "name": "tp_reduce.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_c1a_reuse.py",
+        "matches": true
+      },
+      {
+        "name": "decode_c2a_reuse.py",
+        "matches": true
+      },
+      {
+        "name": "attention.py",
+        "matches": true
+      },
+      {
+        "name": "attention_gather.py",
+        "matches": true
+      },
+      {
+        "name": "mla_proj.py",
+        "matches": true
+      },
+      {
+        "name": "decode_c1a_full.py",
+        "matches": true
+      },
+      {
+        "name": "quant.py",
+        "matches": true
+      },
+      {
+        "name": "moe_exchange.py",
+        "matches": true
+      },
+      {
+        "name": "compressor.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_c2a_full.py",
+        "matches": true
+      },
+      {
+        "name": "o_proj.py",
+        "matches": true
+      },
+      {
+        "name": "moe_experts.py",
+        "matches": true
+      },
+      {
+        "name": "weight_map.py",
+        "matches": true
+      },
+      {
+        "name": "utils.py",
+        "matches": true
+      },
+      {
+        "name": "generate.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_c1a_reindex.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_swa.py",
+        "matches": true
+      },
+      {
+        "name": "indexer.py",
+        "matches": true
+      },
+      {
+        "name": "config.py",
+        "matches": true
+      },
+      {
+        "name": "layer_reference.py",
+        "matches": true
+      },
+      {
+        "name": "structural_check.py",
+        "matches": true
+      },
+      {
+        "name": "tokenizer.py",
+        "matches": true
+      },
+      {
+        "name": "decode_c1a_reindex.py",
+        "matches": true
+      },
+      {
+        "name": "decode_layer.py",
+        "matches": true
+      },
+      {
+        "name": "hc.py",
+        "matches": true
+      },
+      {
+        "name": "decode_c2a_full.py",
+        "matches": true
+      },
+      {
+        "name": "engram.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_fwd.py",
+        "matches": true
+      },
+      {
+        "name": "rope.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_layer.py",
+        "matches": true
+      },
+      {
+        "name": "rmsnorm.py",
+        "matches": true
+      },
+      {
+        "name": "decode_fwd.py",
+        "matches": true
+      }
+    ]
+  },
+  "native_accept_f04_f10_1793955766": {
+    "manifest_sha256": "6d5f3615eb040680780c2bba9562efb038a6e001f8c55dc222a43bee8afd5689",
+    "artifact_checks": [
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/REVIEW.md",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/collect.py",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/collect_status.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/commands.sh",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/compile/compile.tsv",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/compile_execution.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/compile_status.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/coordinates/continuation.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/coordinates/positive.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/coordinates/results.tsv",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/coordinates/wrong.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/coordinates_execution.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/coordinates_status.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/downstream/results.tsv",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/downstream_execution.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/downstream_status.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/f10/results.tsv",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/f10_execution.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/f10_status.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/generated.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/host/geometry_results.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/host/host_results.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/host_execution.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/host_status.txt",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/results.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/run.sh",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/run_collect.sh",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/source_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/source_compile_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/source_compile_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/source_coordinates_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/source_coordinates_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/source_downstream_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/source_downstream_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/source_f10_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/source_f10_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/source_final.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/source_host_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/source_host_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/verify.py",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/verify_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/verify_compile_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/verify_compile_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/verify_coordinates_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/verify_coordinates_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/verify_downstream_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/verify_downstream_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/verify_f10_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/verify_f10_before.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/verify_final.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/verify_host_after.json",
+        "exists": true,
+        "matches": true
+      },
+      {
+        "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/verify_host_before.json",
+        "exists": true,
+        "matches": true
+      }
+    ],
+    "frozen_source_checks": [
+      {
+        "name": "prefill_moe.py",
+        "matches": true
+      },
+      {
+        "name": "decode_swa.py",
+        "matches": true
+      },
+      {
+        "name": "decode_c1a_reuse.py",
+        "matches": true
+      },
+      {
+        "name": "gemm_w8a8.py",
+        "matches": true
+      },
+      {
+        "name": "paged_cache.py",
+        "matches": true
+      },
+      {
+        "name": "weight_loader.py",
+        "matches": true
+      },
+      {
+        "name": "lm_head.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_c1a_full.py",
+        "matches": true
+      },
+      {
+        "name": "embedding.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_c2a_reuse.py",
+        "matches": true
+      },
+      {
+        "name": "moe_gate.py",
+        "matches": true
+      },
+      {
+        "name": "decode_moe.py",
+        "matches": true
+      },
+      {
+        "name": "tp_reduce.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_c1a_reuse.py",
+        "matches": true
+      },
+      {
+        "name": "decode_c2a_reuse.py",
+        "matches": true
+      },
+      {
+        "name": "attention.py",
+        "matches": true
+      },
+      {
+        "name": "attention_gather.py",
+        "matches": true
+      },
+      {
+        "name": "mla_proj.py",
+        "matches": true
+      },
+      {
+        "name": "decode_c1a_full.py",
+        "matches": true
+      },
+      {
+        "name": "quant.py",
+        "matches": true
+      },
+      {
+        "name": "moe_exchange.py",
+        "matches": true
+      },
+      {
+        "name": "compressor.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_c2a_full.py",
+        "matches": true
+      },
+      {
+        "name": "o_proj.py",
+        "matches": true
+      },
+      {
+        "name": "moe_experts.py",
+        "matches": true
+      },
+      {
+        "name": "weight_map.py",
+        "matches": true
+      },
+      {
+        "name": "utils.py",
+        "matches": true
+      },
+      {
+        "name": "generate.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_c1a_reindex.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_swa.py",
+        "matches": true
+      },
+      {
+        "name": "indexer.py",
+        "matches": true
+      },
+      {
+        "name": "config.py",
+        "matches": true
+      },
+      {
+        "name": "layer_reference.py",
+        "matches": true
+      },
+      {
+        "name": "structural_check.py",
+        "matches": true
+      },
+      {
+        "name": "tokenizer.py",
+        "matches": true
+      },
+      {
+        "name": "decode_c1a_reindex.py",
+        "matches": true
+      },
+      {
+        "name": "decode_layer.py",
+        "matches": true
+      },
+      {
+        "name": "hc.py",
+        "matches": true
+      },
+      {
+        "name": "decode_c2a_full.py",
+        "matches": true
+      },
+      {
+        "name": "engram.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_fwd.py",
+        "matches": true
+      },
+      {
+        "name": "rope.py",
+        "matches": true
+      },
+      {
+        "name": "prefill_layer.py",
+        "matches": true
+      },
+      {
+        "name": "rmsnorm.py",
+        "matches": true
+      },
+      {
+        "name": "decode_fwd.py",
+        "matches": true
+      }
+    ]
+  },
+  "audit_inputs_changed_after_read": []
+}

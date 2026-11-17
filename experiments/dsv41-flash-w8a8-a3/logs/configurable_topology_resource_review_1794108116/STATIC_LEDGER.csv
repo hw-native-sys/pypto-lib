@@ -1,0 +1,16 @@
+category,resource_count,rank_bytes_at_TP4_EP16,scaling
+routed_int8_matrices,3,33973862400,16/EP
+routed_fp32_scales,3,37355520,16/EP
+embedding_and_lm_head,2,661913600,4/TP
+attention_sink,1,2560,4/TP
+attention_wq_b_and_scale,2,420741120,4/TP
+attention_wo_a,1,671088640,4/TP
+attention_wo_b,1,838860800,4/TP
+shared_FFN_matrices_and_scales,6,1417134080,replicated
+wq_a_and_wkv_with_scales,4,367288320,replicated
+normalizations_including_final,5,972800,replicated
+HC_functions_scales_bases,6,209723840,replicated
+router_gate_weight_bias,2,314634240,replicated
+C1_C2_compressor_weights_norms,5,36704256,replicated
+C1_C2_reindex_indexer_weights_scales,13,45220864,replicated_32_index_heads
+retained_disabled_Engram_ABI_buffers,3,629313536,replicated_zero_when_disabled

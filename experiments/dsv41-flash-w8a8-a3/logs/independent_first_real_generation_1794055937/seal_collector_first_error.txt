@@ -1,0 +1,1 @@
+Own metadata collector failed before ledger/manifest: AttributeError: str object has no attribute read_bytes. sha helper expected Path but audited input dictionary keys are strings. Corrected only collector Path conversion. Original queued audit100/0 is unchanged; no test/model/native rerun.

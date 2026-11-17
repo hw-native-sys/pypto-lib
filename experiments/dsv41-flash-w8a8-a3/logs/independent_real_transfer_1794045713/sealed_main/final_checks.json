@@ -1,0 +1,32 @@
+{
+  "product45_unchanged": true,
+  "product_manifest_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "protected_old_manifests_unchanged": {
+    "generation_entry_1794035858": "a37109462df44b9416c7401ced49c881628a0ccbe059e277126e1115c428b1cc",
+    "fit_post_guard_1794037055": "184fc558f8c08bc5c9f1a839da73b68ce9665f0fdc483632377c99508a38340b",
+    "empty_fit_operation_1794037635": "f55ce7d59678f0977d466e673e3c0ad0429b5c26cdddf6253bf059cb9630c556"
+  },
+  "actual_source_metadata_payload_reads": 0,
+  "selected_source_keys": [
+    "embed.weight",
+    "layers.1.ffn.experts.1.w1.weight",
+    "layers.1.ffn.experts.1.w1.weight_offset",
+    "layers.1.ffn.experts.1.w1.weight_scale"
+  ],
+  "actual_metadata_byte_caps": {
+    "unique_source_bytes": 1335642112,
+    "cumulative_source_bytes": 5307123712,
+    "initialized_device_bytes": 5307114496,
+    "readback_bytes": 5307114496,
+    "copy_chunk_bytes": 67108864
+  },
+  "actual_generated57_ABI_binding": true,
+  "actual_installed_publiccopy_byte_spy_PASS": true,
+  "final_tiny_CPU_controls": 15,
+  "all_own_jobs": "172445/174007/174310/174607 COMPLETE0",
+  "NPU": 0,
+  "real_checkpoint_tensor_reads": 0,
+  "real_large_allocations": 0,
+  "forward_calls": 0,
+  "guard_unblock": false
+}

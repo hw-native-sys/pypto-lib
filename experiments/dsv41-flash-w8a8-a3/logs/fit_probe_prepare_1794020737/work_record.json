@@ -1,0 +1,8 @@
+{
+  "start": 1794020988,
+  "end": 1794021592,
+  "duration": 604,
+  "agent": "main-agent",
+  "basis": "actualpreviouscheckpointthroughartifactseal;earlier0737-0988alreadylogged;wallnotCPUtime",
+  "status": "PARKED"
+}

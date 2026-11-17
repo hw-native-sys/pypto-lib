@@ -1,0 +1,5 @@
+{
+  "start_epoch": 1794075807,
+  "scope": "pure-out TensorSpec Tensor init alias vs independent offline/manualbytes",
+  "current_model_mutation_owned_by_Main": true
+}

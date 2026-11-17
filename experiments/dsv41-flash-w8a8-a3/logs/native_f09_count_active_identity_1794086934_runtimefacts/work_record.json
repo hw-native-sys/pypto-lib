@@ -1,0 +1,8 @@
+{
+  "agent": "/root/reviewer_f09",
+  "start_epoch": 1794088180.5271177,
+  "end_epoch": 1794088312.1316543,
+  "scope": "terminal metadata/source pins only; no queue CPU tests/reference or NPU rerun",
+  "shared_writes": 0,
+  "status": "PARK"
+}

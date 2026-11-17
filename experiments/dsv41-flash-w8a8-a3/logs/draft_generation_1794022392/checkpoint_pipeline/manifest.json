@@ -1,0 +1,21 @@
+{
+  "PLAN.md": "3cf43f0e2b54454c87c7af956c0b00110e90ac9f3d94d208d7acab4814b97feb",
+  "REPORT.md": "69c6835ddebafff5af1ddeb3d4017c04da3ec9ba2ccf9f9e38915c3295914c9d",
+  "check_toy.py": "96d6b6bc262ec4afe5ba449d98e5222b0869c670ef2fe6d1da1092d81dfa3551",
+  "cpu_queue.log": "f33b809a1e2660523248e5b9188819df96a5b7ce137a9fabfe85b388fb2aa832",
+  "final_cpu_queue.log": "a6b4642020718b2eac04dba58b303e05b034e8fe8ed422299156e795903e412e",
+  "reviewer_helper_reference.py": "76c4bdcb0710a549dd67b73e510c2c3f2a2fe5d6ac49111c1d64ac2a800a1a8d",
+  "run_cpu.sh": "fc8b6e6b8fb37260b6ccc9b49cd11faf3ec81b1234f333b72d585c2cf0afe3eb",
+  "source_hashes.json": "6fa87fae9ef5d2b183284789b5bc96e13232901a697cb262c466062622ffb3da",
+  "split_checkpoint.py": "a685a1d2e36daf544c12c8aca45c699e3c0b0ffb1269d217aa9ffcef0896d002",
+  "toy/compiled_metadata.json": "bbcd3061ed5521e6d246b627f730d9c0252b14b967b217a5628fc95af9f310ae",
+  "toy/decode128/actual.pt": "fbee8715f8a68b19ed5c2013328c2526173ee856ed434db44c34addef072adf8",
+  "toy/decode128/initial.pt": "32f3265ab2ad4248ac94639b8045a8917d3114a083c30c6f7cba68742ef66fb4",
+  "toy/prefix/actual.pt": "fbee8715f8a68b19ed5c2013328c2526173ee856ed434db44c34addef072adf8",
+  "toy/prefix/cpu_receipt.json": "78610698e5ca3b92855db9bb5437fd71bee75f2281b8fcc27ada14df2cdf781b",
+  "toy/prefix/initial.pt": "32f3265ab2ad4248ac94639b8045a8917d3114a083c30c6f7cba68742ef66fb4",
+  "toy_results.json": "4020fc54fc8c9042ab06019dd3a4005084d8dd4cffc2ee3490aca74d0b89e531",
+  "work_record.json": "ae8be119866cae79ba66b99e62b6341f9416efe813aaea4ed3a8ebc327f28080",
+  "toy/decode128/manifest.json": "142752dc58dfe3f158e1c8a71a0b923597b80e8264b8c05953148aff243f8b64",
+  "toy/prefix/manifest.json": "a79a30e204362c8de1b61119af1327d1b42e844d06424c1163b3be3c60e9c0e5"
+}

@@ -1,0 +1,41 @@
+{
+  "physical_work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_prefix_capture_v3_1794027615/work",
+  "owned_new_output_hashes": {
+    "decode128/actual.pt": "8975e91bb5c27e485290b427b6b20d1c2f1c204be23844d2eb296389d0456101",
+    "decode128/compiled_metadata.json": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770",
+    "decode128/cpu_receipt.json": "c17809703cc231bba98bc3b2be19a6b4e42b0241325bc5332c871ebcfa9d96aa",
+    "decode128/initial.pt": "3ef87dac861614a84b947cadcfb2279db9230c676ac5ea2f8d4fc2c399c43e96",
+    "decode128/manifest.json": "52847e6bd94d6b5012b17dd6c63898b16f5d3b65184b32083eac96b9702b1afc",
+    "decode128/owner_closed.json": "fc7c12dbf809874ad897b09f4a23520c9aa9119e3a51f6b1154bc216175daac1",
+    "decode129/actual.pt": "d47cc6130d421ebfc11a3239af27b809a9e9c0db12b3d404e4515753517e8523",
+    "decode129/compiled_metadata.json": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770",
+    "decode129/cpu_receipt.json": "07ee88bd8f2382557e04d09b54b08b8722d109ace18f2189b64f1cc5bbc4d994",
+    "decode129/initial.pt": "acf60edea322e13e911217e37a955e02e3d55ed9eb2692d59364c8e0b6a7818c",
+    "decode129/manifest.json": "c60022a1cb58b4d002491c3ea55b9f2840a81375e2aa52298364eaf2c1d2adb0",
+    "decode129/owner_closed.json": "a8af059b04bd4d8378815a7bc4f85b4b73d396343dcb72c97ee9d4713b4e0b6e",
+    "decode130/actual.pt": "cb08b9da19429a578e10e38eec3488cde70f165250458ff02b3acb8271489ec3",
+    "decode130/compiled_metadata.json": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770",
+    "decode130/cpu_receipt.json": "b4059a5d4eeffc8fda3ba96dde90a3d97a28ed79d2c2ff154a64b0d77b293e4a",
+    "decode130/initial.pt": "82b50dc10f7608c2a5d9c5317c9009e5a107d6a069197fcf52de1492d666b488",
+    "decode130/manifest.json": "d11feba59123892dbda87a833e2f4909ef15462b52c58333159784647114b822",
+    "decode130/owner_closed.json": "7f77fe9c345af51266337036c6962af94e40f23310ae887008d5ebdd457905e3",
+    "decode1_after_upload_public_memory.json": "34d08362c745e23b611dc1371459aa177692b48f631461ac5083dcf813cf4d2b",
+    "decode1_before_weights_public_memory.json": "f490aa160852a856cb7d6eb7a6e257d3eff9b3d95a13610d689f646d3d270a9e",
+    "decode1_memory.json": "6788a41e42bfb066bb323c658874bb9be06ee4fb44470e885a49159e7ea2aa02",
+    "decode1_public_runtime_config.json": "6e4dc0478fd4f52ab524864baf92a34eae8305d59b47834cdff72c5890d27adf",
+    "decode_after_dispatch_public_memory.json": "8a6ac629a7660b30db77c966093bc1e0f0d19cfd9cb08ea1ab3c57706abcf097",
+    "decode_before_close_public_memory.json": "a0c8539140619aaa9d13fe3ca47fed830fd7e1856b04e7935a471c1961b02575",
+    "decode_closed.json": "cda8eebc2a896c6ea1aa4e044d43a2970f2ddcc4647238fc67b1c5c341395ce1",
+    "native_chain_unvalidated.json": "dcf17a3df4b01f00b496a2958ff3437261e8fac058493d88a928bc5114c8e4fc",
+    "stale129/actual.pt": "c2337109c075a3ad3b24c03f917c9e57275ebcb8b0b8504f6984452f3dd2b50b",
+    "stale129/compiled_metadata.json": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770",
+    "stale129/initial.pt": "effd5f6d165059dcb29094ac5d58e11521d21dd09533faec299184e2822c2cc5",
+    "stale129/manifest.json": "afe69304d7b28d9588ef84e712916af3ce71ef8816421309a7525524c566afbf",
+    "stale129/owner_closed.json": "ad33f4df7e10d769453a5ff08cd3030092ff8a63d8a6936b1b396b437f3c54ed",
+    "validated_chain.json": "30afd8bb39dd054ff09e64c311123d93c3a474fd8cfda2a3fe5d9aee3f8bd71a"
+  },
+  "excluded_operational": [
+    "measurement_gate.json"
+  ],
+  "protected_prefix_old579_manifest_sha256": "65e98cacd561c78a1f3a9a059ba059674076978e700143ed6cdbb2d317d64591"
+}

@@ -1,0 +1,15 @@
+[
+  {
+    "id": "continuation-plan-1793981474-1793981673",
+    "start": 1793981474,
+    "end": 1793981673,
+    "duration": 199,
+    "basis": "completed chain.py patch mtime through finalization; earlier study/writing excluded",
+    "status": "PARKED",
+    "model_edits": 0,
+    "native_jobs": 0,
+    "native_chain": "NOT RUN",
+    "prefix_compile": "NOT RUN",
+    "cpu_task": "task_20261107_001114_409790928721"
+  }
+]

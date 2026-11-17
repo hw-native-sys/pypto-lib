@@ -1,0 +1,38 @@
+{
+  "schema": "split-stage-measured-budget/1",
+  "measurement_kind": "MEASURED_REAL_SPLIT_VALIDATION",
+  "units": "bytes",
+  "stage": "decode",
+  "provider": "REAL_FROZEN_SYNTHETIC",
+  "measured_at_epoch": 1794032366,
+  "source_manifest_sha256": "ab1ced6d6ecbf9887297458703ba9b74e2c9b8bc57608370b4c2e0310e027e37",
+  "META_geometry": {
+    "expert_layers": 1,
+    "static_arguments": 57,
+    "static_bytes_per_rank": 6463879104,
+    "prefix_nonstatic_bytes": 7609876736,
+    "decode_nonstatic_bytes": 247111680,
+    "prefix_tokens": 128
+  },
+  "required_bytes": {
+    "host": 290783361536,
+    "disk": 10633936896,
+    "shm": 37231460864
+  },
+  "measured_available_bytes": {
+    "host": 1722085285888,
+    "disk": 9529934741504,
+    "shm": 1079343157248
+  },
+  "explicit_margins": {
+    "host": 68719476736,
+    "disk": 8589934592,
+    "shm": 8589934592
+  },
+  "measurement_sources": {
+    "host": "/proc/meminfo MemAvailable KiB times1024",
+    "disk": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_prefix_capture_v3_1794027615/work statvfs f_bavail*f_frsize",
+    "shm": "/dev/shm statvfs f_bavail*f_frsize"
+  },
+  "scope": "native4call decode CAPTURE ONLY; no19golden/negativePASS/weights/fit/text"
+}

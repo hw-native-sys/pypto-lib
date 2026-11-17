@@ -1,0 +1,11 @@
+{
+  "start_epoch": 1794050249,
+  "Main_metadata_source": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/full_real_generation_prepare_1794048884/metadata_plan.json",
+  "sha256_before": "3dd67b88683d0de1f5fbd8e889c0c1a875eeecf671263fca4c64061637ecd9c0",
+  "sha256_after": "3dd67b88683d0de1f5fbd8e889c0c1a875eeecf671263fca4c64061637ecd9c0",
+  "copy_sha256": "3dd67b88683d0de1f5fbd8e889c0c1a875eeecf671263fca4c64061637ecd9c0",
+  "Main_metadata_bytes": 66953090,
+  "candidate_final": false,
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "scope": "current frozen loader/header/target/tokenizer0payload independent derivation; candidate finalaudit waitsfreeze"
+}

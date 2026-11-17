@@ -1,0 +1,10 @@
+{
+  "task": "task_20261108_065435_181707910721",
+  "exit_code": 0,
+  "device": "no-device",
+  "max_time": 180,
+  "client_timeout": 240,
+  "proof_sha256": "5b3fb1bebcf1f3c8665dca3b37e06a6613a0937fc8a6ea8a2e024548d8866721",
+  "isolated_guard_repeated": false,
+  "fixture_compile_prepare_NPU": 0
+}

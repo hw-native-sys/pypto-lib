@@ -1,0 +1,80 @@
+{
+  "baseline_payload_reads_before_rejection": 8,
+  "pre_read_rejections": [
+    {
+      "argument": "embed_weight",
+      "mutation": "shape",
+      "payload_reads": 0
+    },
+    {
+      "argument": "embed_weight",
+      "mutation": "dtype",
+      "payload_reads": 0
+    },
+    {
+      "argument": "lm_head_weight",
+      "mutation": "shape",
+      "payload_reads": 0
+    },
+    {
+      "argument": "lm_head_weight",
+      "mutation": "dtype",
+      "payload_reads": 0
+    },
+    {
+      "argument": "final_norm",
+      "mutation": "shape",
+      "payload_reads": 0
+    },
+    {
+      "argument": "final_norm",
+      "mutation": "dtype",
+      "payload_reads": 0
+    },
+    {
+      "argument": "engram_rotation",
+      "mutation": "shape",
+      "payload_reads": 0
+    },
+    {
+      "argument": "engram_rotation",
+      "mutation": "dtype",
+      "payload_reads": 0
+    }
+  ],
+  "normal_output_exact_cases": [
+    {
+      "rank": 0,
+      "argument": "embed_weight"
+    },
+    {
+      "rank": 0,
+      "argument": "lm_head_weight"
+    },
+    {
+      "rank": 0,
+      "argument": "final_norm"
+    },
+    {
+      "rank": 0,
+      "argument": "engram_rotation"
+    },
+    {
+      "rank": 1,
+      "argument": "embed_weight"
+    },
+    {
+      "rank": 1,
+      "argument": "lm_head_weight"
+    },
+    {
+      "rank": 1,
+      "argument": "final_norm"
+    },
+    {
+      "rank": 1,
+      "argument": "engram_rotation"
+    }
+  ],
+  "source_sha256": "70244d047e4705dfe5f7101c5dc046b6f66d146027241524bb4d494823fcfe5f"
+}

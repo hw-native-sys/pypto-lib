@@ -1,0 +1,13 @@
+{
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "source45_unchanged": true,
+  "old31_artifacts_manifest_sha256": "a37109462df44b9416c7401ced49c881628a0ccbe059e277126e1115c428b1cc",
+  "old31_unchanged": true,
+  "candidate_base_exact": true,
+  "only_added_two_line_post_guard": true,
+  "default_refuse_budget_calibration_sourcepins_ring4GiB_targets_algorithms": "unchanged",
+  "actual_device_allocations": 0,
+  "tensor_payload_reads": 0,
+  "NPU": 0,
+  "jobs": "baseline154012/candidate154106/remaining154246 COMPLETE0;initial testsyntax153948 FAIL preserved"
+}

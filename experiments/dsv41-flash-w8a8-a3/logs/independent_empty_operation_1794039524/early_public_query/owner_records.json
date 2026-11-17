@@ -1,0 +1,205 @@
+[
+  {
+    "owner_epoch": "46cd165b-fb81-49f9-a68a-d2d1b63d4754",
+    "created_epoch": 1794039655.4783993,
+    "parent_pid": 2447387,
+    "queries": [
+      {
+        "rank": 0,
+        "query_started_epoch": 1794039655.4785395,
+        "query_finished_epoch": 1794039655.4785416,
+        "free": 68719476736,
+        "total": 74088185856,
+        "committed": 5368709120,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 1,
+        "query_started_epoch": 1794039655.4785466,
+        "query_finished_epoch": 1794039655.4785478,
+        "free": 68719476736,
+        "total": 74088185856,
+        "committed": 5368709120,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 2,
+        "query_started_epoch": 1794039655.4785502,
+        "query_finished_epoch": 1794039655.4785511,
+        "free": 68719476736,
+        "total": 74088185856,
+        "committed": 5368709120,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 3,
+        "query_started_epoch": 1794039655.4785535,
+        "query_finished_epoch": 1794039655.4785542,
+        "free": 68719476736,
+        "total": 74088185856,
+        "committed": 5368709120,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 4,
+        "query_started_epoch": 1794039655.4785566,
+        "query_finished_epoch": 1794039655.478557,
+        "free": 68719476736,
+        "total": 74088185856,
+        "committed": 5368709120,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 5,
+        "query_started_epoch": 1794039655.4785595,
+        "query_finished_epoch": 1794039655.4785602,
+        "free": 68719476736,
+        "total": 74088185856,
+        "committed": 5368709120,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 6,
+        "query_started_epoch": 1794039655.4785626,
+        "query_finished_epoch": 1794039655.4785633,
+        "free": 68719476736,
+        "total": 74088185856,
+        "committed": 5368709120,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 0,
+        "query_started_epoch": 1794039655.4785724,
+        "query_finished_epoch": 1794039655.4785733,
+        "free": 68719476736,
+        "total": 74088185856,
+        "committed": 5368709120,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 1,
+        "query_started_epoch": 1794039655.478576,
+        "query_finished_epoch": 1794039655.4785767,
+        "free": 68719476736,
+        "total": 74088185856,
+        "committed": 5368709120,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 2,
+        "query_started_epoch": 1794039655.4785788,
+        "query_finished_epoch": 1794039655.4785795,
+        "free": 68719476736,
+        "total": 74088185856,
+        "committed": 5368709120,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 3,
+        "query_started_epoch": 1794039655.4785814,
+        "query_finished_epoch": 1794039655.4785824,
+        "free": 68719476736,
+        "total": 74088185856,
+        "committed": 5368709120,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 4,
+        "query_started_epoch": 1794039655.4785845,
+        "query_finished_epoch": 1794039655.4785852,
+        "free": 68719476736,
+        "total": 74088185856,
+        "committed": 5368709120,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 5,
+        "query_started_epoch": 1794039655.4785874,
+        "query_finished_epoch": 1794039655.478588,
+        "free": 68719476736,
+        "total": 74088185856,
+        "committed": 5368709120,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      },
+      {
+        "rank": 6,
+        "query_started_epoch": 1794039655.4785903,
+        "query_finished_epoch": 1794039655.478591,
+        "free": 68719476736,
+        "total": 74088185856,
+        "committed": 5368709120,
+        "logical_outstanding_bytes": 0,
+        "observed_free_drop": 0,
+        "observed_committed_rise": 0,
+        "signed_free_residual_minus_requested": 0
+      }
+    ],
+    "handles": [],
+    "frees": [],
+    "entered": true,
+    "normal_close": true,
+    "entered_epoch": 1794039655.4784026,
+    "processes_after_enter": [
+      {
+        "pid": 2447387,
+        "start_ticks": "103957671",
+        "cmdline": "python experiments/dsv41-flash-w8a8-a3/logs/independent_empty_operation_1794039524/review.py "
+      }
+    ],
+    "before_close_epoch": 1794039655.4785955,
+    "processes_before_close": [
+      {
+        "pid": 2447387,
+        "start_ticks": "103957671",
+        "cmdline": "python experiments/dsv41-flash-w8a8-a3/logs/independent_empty_operation_1794039524/review.py "
+      }
+    ],
+    "after_close_epoch": 1794039655.4786854,
+    "processes_after_close": [
+      {
+        "pid": 2447387,
+        "start_ticks": "103957671",
+        "cmdline": "python experiments/dsv41-flash-w8a8-a3/logs/independent_empty_operation_1794039524/review.py "
+      }
+    ]
+  }
+]

@@ -1,0 +1,23 @@
+{
+  "status": "PASS",
+  "source_hashes": {
+    "weight_map.py": "b102abdbed4c104603ee937242bbb438e160f4fd5bedbcce0ac479502513e466",
+    "weight_loader.py": "16d0259bc9e98ec2e0fc57e96e37026163ca45a50761bff767d62f659fc4fb69"
+  },
+  "topology": {
+    "TP": 8,
+    "EP": 16,
+    "DP": 2,
+    "WORLD": 16,
+    "local_experts": 24
+  },
+  "controls": [
+    "legacy_summary_keys+DP/WORLD",
+    "replicated_indexer_map",
+    "fractional_offset_reject",
+    "overflow_offset_reject",
+    "both_cli_help_forms"
+  ],
+  "actual_checkpoint_reads": 0,
+  "native": 0
+}

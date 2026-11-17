@@ -1,0 +1,76 @@
+{
+  "scope": "noEngram,40 dense layers,reused1 synthetic expert layer",
+  "mode": "ONBOARD",
+  "prerequisite_hashes": {
+    "experiments/dsv41-flash-w8a8-a3/logs/native_accept_scalar_c2_1794018787/helpers/main/production_decode/trace_result.json": "02b1f2048e7765334c003010638e89e63d937a5cf900bc20ff359d4fc11f157c",
+    "experiments/dsv41-flash-w8a8-a3/logs/native_accept_scalar_c2_1794018787/helpers/main/stream_native.json": "647312c325160cc3dd9f0a3efab81c986df381984e86a5d50c3572716e575a23"
+  },
+  "records": [],
+  "complete": false,
+  "hbm": {
+    "0": {
+      "peak_mb": 3145,
+      "samples": 14
+    },
+    "1": {
+      "peak_mb": 2871,
+      "samples": 14
+    },
+    "2": {
+      "peak_mb": 3128,
+      "samples": 14
+    },
+    "3": {
+      "peak_mb": 2884,
+      "samples": 14
+    },
+    "4": {
+      "peak_mb": 3126,
+      "samples": 14
+    },
+    "5": {
+      "peak_mb": 2884,
+      "samples": 14
+    },
+    "6": {
+      "peak_mb": 3127,
+      "samples": 14
+    },
+    "7": {
+      "peak_mb": 2884,
+      "samples": 14
+    },
+    "8": {
+      "peak_mb": 3139,
+      "samples": 14
+    },
+    "9": {
+      "peak_mb": 2871,
+      "samples": 14
+    },
+    "10": {
+      "peak_mb": 3128,
+      "samples": 14
+    },
+    "11": {
+      "peak_mb": 2883,
+      "samples": 14
+    },
+    "12": {
+      "peak_mb": 3137,
+      "samples": 14
+    },
+    "13": {
+      "peak_mb": 2870,
+      "samples": 14
+    },
+    "14": {
+      "peak_mb": 3127,
+      "samples": 14
+    },
+    "15": {
+      "peak_mb": 2881,
+      "samples": 14
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "state": "FINAL_PARK_APPLIED_B_AND_TWO_FRESH_E40_SIGNATURES_PASS",
+  "epoch": 1794098455,
+  "files": 767,
+  "manifest_sha256": "1a4a8d75e383e4b8001c1c33d574ee5ae5c83654079dee732b49cdac3b931294",
+  "signature_receipt_sha256": "704eb14f6ff186cedf451830e3c38c303b43a3bce201395e78fd3e044b0ba357",
+  "actual_source45": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+  "metadata_plan_sha256": "cd8b17741688eeb9ef39d8c0925dbb74a8f9a1cfcc0052db2e0a8c1aacb48cf7",
+  "CPU_task": "task_20261108_083640_312359524414",
+  "own_jobs": 0,
+  "NPU_or_runtime_GO": false
+}

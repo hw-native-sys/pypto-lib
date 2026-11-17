@@ -1,0 +1,76 @@
+{
+  "downstream/build_output/_jit_decode_c1a_full_attention_test_20261106_154027_xt1g2a1t/orchestration/decode_c1a_full_attention_test.cpp": {
+    "sha256": "ffd7dabd1e98ecade4c06cbdaed7e36804c19d21aa13e7953b09e83da5d2cfcd",
+    "binding_lines": [
+      159,
+      593,
+      614,
+      615,
+      633,
+      686
+    ]
+  },
+  "downstream/build_output/_jit_prefill_attention_test_20261106_154049_v_461jlv/orchestration/prefill_attention_test.cpp": {
+    "sha256": "a1b8c96ce251684c88877a842e717dad3881d595db54706f889a6180187aca7d",
+    "binding_lines": [
+      159,
+      593,
+      614,
+      615,
+      633,
+      686
+    ]
+  },
+  "downstream/build_output/_jit_decode_c2a_full_attention_test_20261106_153900_dhjyzdl7/orchestration/decode_c2a_full_attention_test.cpp": {
+    "sha256": "749703445e1b571c5ad47c09ba30fad0f8978d274e52ac083558feaa1f49bbf4",
+    "binding_lines": [
+      169,
+      665,
+      686,
+      687,
+      705,
+      758
+    ]
+  },
+  "downstream/build_output/_jit_prefill_c2a_full_test_20261106_153924_7ij6fwny/orchestration/prefill_c2a_full_test.cpp": {
+    "sha256": "1e01cfaf7137359f07bcc4c68c3ca8f6edaf85c9b6a1b471366ecd5b93a237c8",
+    "binding_lines": [
+      163,
+      584,
+      605,
+      606,
+      624,
+      677
+    ]
+  },
+  "compile/full_compile/_jit_decode_fwd_20261106_153833_mrz02vac/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp": {
+    "sha256": "a7ed09753805581284fd54b789e0914d122bd9bf4171d8794686b268f74c07d3",
+    "binding_lines": [
+      1778,
+      2522,
+      2543,
+      2562,
+      2615,
+      6822,
+      7440,
+      7461,
+      7480,
+      7533
+    ]
+  },
+  "compile/full_compile/_jit_prefill_fwd_20261106_153903_0qu5tv_s/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp": {
+    "sha256": "0dbef1d974af741101bb7b43fcbf90083ae5c1f805cc07ffd48a8f60118c611a",
+    "binding_lines": [
+      2274,
+      2809,
+      2830,
+      2849,
+      2902,
+      6241,
+      6789,
+      6810,
+      6829,
+      6882
+    ]
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "scope": "noEngram; independent CPU integer fakes/source/API only; no NPU/real tensors/payload",
+  "pid": 2447387,
+  "adapter_sha256": "8d3ad68504cef4f0527594a37daa9dd8ef90041c0b56b8e199af30c99a5b83aa",
+  "tests": {
+    "source_and_all_old_manifests": "PASS",
+    "positive_stage_0_16_0": "PASS",
+    "tolerance65MiB": "PASS",
+    "early_public_query": "Refused: RuntimeError: independent early rank7 public query error",
+    "invalid_public_schema": "Refused: Refused: invalid public memory query",
+    "tolerance_cap": "Refused: observed tolerance exceeds256MiB STOP; no clamp",
+    "C_regression": "Refused: Refused: fresh owner free baseline regressed after largest phase close",
+    "wrong_actual_kind": "wrong calibration status/scope",
+    "wrong_operation": "wrong/null/fake calibration operation or pins",
+    "unknown_peak_zero": "planning policy or unknown peaks relabeled as measured",
+    "missing_rank": "missing16rank raw observations",
+    "stale": "calibration stale/missing timestamp",
+    "separate_probe_16_912_0": "PASS",
+    "final_fresh_baseline_regression": "Refused: fresh owner free baseline regressed after largest phase close",
+    "final_after_free_drift_observation": {
+      "status": "CPU_FAKE_ONLY_NO_NATIVE_GRANT",
+      "recorded_after_free_drop": 69206016,
+      "scope": "late final query is recorded but not compared to tolerance"
+    }
+  },
+  "reserve_per_rank": 17954081472,
+  "full40_peak": null,
+  "device_prepare_calls": 0,
+  "signature_artifact_files": 283
+}

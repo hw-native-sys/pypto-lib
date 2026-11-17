@@ -1,0 +1,7 @@
+{
+  "task": "task_20261108_025715_35476121268",
+  "exit": 1,
+  "first_cause": "own default-stderr marker failed to accept argparse-required root-operation-go/prequeue refusal",
+  "no_product_or_guard_failure": true,
+  "no_model_cli_launched": true
+}

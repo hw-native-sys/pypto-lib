@@ -1,0 +1,159 @@
+compile/full_compile/_jit_decode_fwd_20261106_201518_n7gbv22t/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp:126
+    const Tensor& ext_engram_wkv = orch_args.tensor(76).ref();
+    const Tensor& ext_engram_qk = orch_args.tensor(77).ref();
+    const Tensor& ext_engram_rotation = orch_args.tensor(78).ref();
+    const Tensor& ext_window_cache = orch_args.tensor(79).ref();
+    const Tensor& ext_compressed_cache_c2a = orch_args.tensor(80).ref();
+    const Tensor& ext_index_cache_c2a = orch_args.tensor(81).ref();
+    const Tensor& ext_state_cache_c2a = orch_args.tensor(82).ref();
+    const Tensor& ext_compressed_cache_c1a = orch_args.tensor(83).ref();
+
+compile/full_compile/_jit_decode_fwd_20261106_201518_n7gbv22t/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp:430
+        }
+
+        // Task 11: decode_carry_pre
+        CoreTaskArgs params_t11;
+        params_t11.add_input(ext_initial_pre);
+        params_t11.add_inout(ext_pre_mix);
+        params_t11.add_scalar(T_DYN);
+        rt_submit_aiv_task(10, params_t11);
+
+compile/full_compile/_jit_decode_fwd_20261106_201518_n7gbv22t/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp:882
+                            SIMPLER_SCOPE() {
+
+                                // Spmd engram_restore_basis_spmd: engram_restore_basis
+                                CoreTaskArgs params_t13;
+                                params_t13.add_input(x_blocks_inline13098);
+                                params_t13.add_input(ext_engram_rotation);
+                                params_t13.add_inout(restored_inline13099);
+                                params_t13.add_scalar(rotation_rows_inline13097);
+
+compile/full_compile/_jit_decode_fwd_20261106_201518_n7gbv22t/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp:885
+                                CoreTaskArgs params_t13;
+                                params_t13.add_input(x_blocks_inline13098);
+                                params_t13.add_input(ext_engram_rotation);
+                                params_t13.add_inout(restored_inline13099);
+                                params_t13.add_scalar(rotation_rows_inline13097);
+                                params_t13.launch_spec.set_block_num(spmd_core_num_1);
+                                rt_submit_aiv_task(13, params_t13);
+                                restored_inline13099__ssa_v1 = restored_inline13099;
+
+compile/full_compile/_jit_decode_fwd_20261106_201518_n7gbv22t/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp:905
+                            SIMPLER_SCOPE() {
+
+                                // Spmd engram_gate_spmd: engram_gate
+                                CoreTaskArgs params_t14;
+                                params_t14.add_input(restored_flat_inline13112);
+                                params_t14.add_input(kv_inline13077__ssa_v2);
+                                params_t14.add_input(weight_inline13075);
+                                params_t14.add_inout(out_flat_inline13113);
+
+compile/full_compile/_jit_decode_fwd_20261106_201518_n7gbv22t/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp:931
+                            SIMPLER_SCOPE() {
+
+                                // Spmd attention_input_copy_spmd: attention_input_copy
+                                CoreTaskArgs params_t15;
+                                params_t15.add_input(source_hc_inline13030);
+                                params_t15.add_inout(target_hc_inline13031);
+                                params_t15.launch_spec.set_block_num(spmd_core_num_3);
+                                rt_submit_aiv_task(15, params_t15);
+
+compile/full_compile/_jit_decode_fwd_20261106_201518_n7gbv22t/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp:5455
+                    SIMPLER_SCOPE() {
+
+                        // Spmd decode_carry_x_spmd: decode_carry_x
+                        CoreTaskArgs params_t164;
+                        params_t164.add_input(x_flat_inline13063);
+                        params_t164.add_inout(x_carry_flat_inline13069);
+                        params_t164.launch_spec.set_block_num(spmd_core_num_35);
+                        rt_submit_aiv_task(100, params_t164);
+
+compile/full_compile/_jit_decode_fwd_20261106_201518_n7gbv22t/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp:5467
+                }
+
+                // Task 165: decode_carry_pre
+                CoreTaskArgs params_t165;
+                params_t165.add_input(ret__tmp_v0_guarded_0_27);
+                params_t165.add_inout(ext_pre_mix);
+                params_t165.add_scalar(T_DYN);
+                rt_submit_aiv_task(10, params_t165);
+
+compile/full_compile/_jit_decode_fwd_20261106_201518_n7gbv22t/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp:10520
+                    SIMPLER_SCOPE() {
+
+                        // Spmd decode_carry_x_spmd_0: decode_carry_x
+                        CoreTaskArgs params_t317;
+                        params_t317.add_input(x_flat_inline15730);
+                        params_t317.add_inout(x_carry_flat_inline15736);
+                        params_t317.launch_spec.set_block_num(spmd_core_num_68);
+                        rt_submit_aiv_task(100, params_t317);
+
+compile/full_compile/_jit_decode_fwd_20261106_201518_n7gbv22t/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp:10532
+                }
+
+                // Task 318: decode_carry_pre
+                CoreTaskArgs params_t318;
+                params_t318.add_input(ret__tmp_v0_guarded_0_60);
+                params_t318.add_inout(ext_pre_mix);
+                params_t318.add_scalar(T_DYN);
+                rt_submit_aiv_task(10, params_t318);
+
+compile/full_compile/_jit_prefill_fwd_20261106_201544_0m2ujapj/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp:115
+    const Tensor& ext_engram_wkv = orch_args.tensor(75).ref();
+    const Tensor& ext_engram_qk = orch_args.tensor(76).ref();
+    const Tensor& ext_engram_rotation = orch_args.tensor(77).ref();
+    const Tensor& ext_window_cache = orch_args.tensor(78).ref();
+    const Tensor& ext_compressed_cache_c2a = orch_args.tensor(79).ref();
+    const Tensor& ext_index_cache_c2a = orch_args.tensor(80).ref();
+    const Tensor& ext_state_cache_c2a = orch_args.tensor(81).ref();
+    const Tensor& ext_compressed_cache_c1a = orch_args.tensor(82).ref();
+
+compile/full_compile/_jit_prefill_fwd_20261106_201544_0m2ujapj/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp:1415
+                            SIMPLER_SCOPE() {
+
+                                // Spmd engram_restore_basis_spmd: engram_restore_basis
+                                CoreTaskArgs params_t13;
+                                params_t13.add_input(x_blocks_inline19308);
+                                params_t13.add_input(ext_engram_rotation);
+                                params_t13.add_inout(restored_inline19309);
+                                params_t13.add_scalar(rotation_rows_inline19307);
+
+compile/full_compile/_jit_prefill_fwd_20261106_201544_0m2ujapj/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp:1418
+                                CoreTaskArgs params_t13;
+                                params_t13.add_input(x_blocks_inline19308);
+                                params_t13.add_input(ext_engram_rotation);
+                                params_t13.add_inout(restored_inline19309);
+                                params_t13.add_scalar(rotation_rows_inline19307);
+                                params_t13.launch_spec.set_block_num(spmd_core_num_1);
+                                rt_submit_aiv_task(13, params_t13);
+                                restored_inline19309__ssa_v1 = restored_inline19309;
+
+compile/full_compile/_jit_prefill_fwd_20261106_201544_0m2ujapj/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp:1438
+                            SIMPLER_SCOPE() {
+
+                                // Spmd engram_gate_spmd: engram_gate
+                                CoreTaskArgs params_t14;
+                                params_t14.add_input(restored_flat_inline19322);
+                                params_t14.add_input(kv_inline19287__ssa_v2);
+                                params_t14.add_input(weight_inline19285);
+                                params_t14.add_inout(out_flat_inline19323);
+
+compile/full_compile/_jit_prefill_fwd_20261106_201544_0m2ujapj/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp:1464
+                            SIMPLER_SCOPE() {
+
+                                // Spmd attention_input_copy_spmd: attention_input_copy
+                                CoreTaskArgs params_t15;
+                                params_t15.add_input(source_hc_inline19265);
+                                params_t15.add_inout(target_hc_inline19266);
+                                params_t15.launch_spec.set_block_num(spmd_core_num_3);
+                                rt_submit_aiv_task(15, params_t15);
+
+compile/full_compile/_jit_prefill_fwd_20261106_201544_0m2ujapj/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp:6209
+                    SIMPLER_SCOPE() {
+
+                        // Spmd attention_input_copy_spmd_0: attention_input_copy
+                        CoreTaskArgs params_t164;
+                        params_t164.add_input(source_hc_inline21925);
+                        params_t164.add_inout(target_hc_inline21926);
+                        params_t164.launch_spec.set_block_num(spmd_core_num_35);
+                        rt_submit_aiv_task(15, params_t164);

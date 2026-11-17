@@ -1,0 +1,23 @@
+{
+  "actual_capacity": {
+    "host": 1722141548544,
+    "disk": 9545980051456,
+    "shm": 1079343157248
+  },
+  "required_bytes": {
+    "host": 290783361536,
+    "disk": 23876796928,
+    "shm": 37231460864
+  },
+  "old_own864_manifest_verified_before_continuation": true,
+  "static_work_archived": {
+    "static_plan.json": "dbca1fb4dd503b7d8b38e54bae4782c6e38f496bd405dd4637376ebd06487735",
+    "META_geometry.json": "23ceafafb34242c84a7dfbb1db09108acfc796f691a963b1cb302f5110d6d608",
+    "measurement_gate.json": "f161a9493d38ec9746e8a9d755443cb4956c97388eeb24858f46738c01d3c0f5",
+    "repro_metadata/META_geometry.json": "23ceafafb34242c84a7dfbb1db09108acfc796f691a963b1cb302f5110d6d608"
+  },
+  "source45_V3_evaluator_hashes_verified": true,
+  "old_pids_absent": true,
+  "canonical_measurement_parser_pass": true,
+  "NPU_preparation": 0
+}

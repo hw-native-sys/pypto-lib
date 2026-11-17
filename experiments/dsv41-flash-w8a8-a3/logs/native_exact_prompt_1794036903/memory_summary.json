@@ -1,0 +1,32 @@
+{
+  "sampler": "own descendants smaps_rollup; summed PSS/USS, per-PID RSS; sampled2s, not exact high-water",
+  "peak_pss_bytes": 226216275968,
+  "peak_uss_bytes": 226216058880,
+  "own_pid_peak_rss_bytes": 226218221568,
+  "minimum_available_bytes": {
+    "host": 1496411889664,
+    "disk": 9527779917824,
+    "shm": 1079343157248
+  },
+  "maximum_shm_used_bytes": 557056,
+  "maximum_own_output_file_bytes": 6688466,
+  "observed_pids": [
+    994092
+  ],
+  "events": [
+    {
+      "event": "META_BEFORE_FACTORY",
+      "epoch": 1794037601.3472974,
+      "geometry_sha256": "3dd2fd8a1d394d072ac12fb5c8c7ccaaf9f4c15eeb66a01865b556108826758b"
+    },
+    {
+      "event": "FIRST_57_HASHES_AND_PHASE_CONTENT_EQUAL",
+      "epoch": 1794037795.0311804
+    },
+    {
+      "event": "INDEPENDENT_SEED0_REBUILD_57_HASHES_EQUAL",
+      "epoch": 1794037985.4262872
+    }
+  ],
+  "validation_instrumentation": "two simultaneous synthetic fixtures for independent hash reproduction; not production streaming RSS"
+}

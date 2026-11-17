@@ -1,0 +1,19 @@
+{
+  "external_verdict": "PASS_EMPTY_RESERVATION_WITH_FINAL_AFTER_FREE_GATE",
+  "internal_status": "EMPTY_RESERVATIONS_ONLY",
+  "validator_sha256": "bac7748403064849ea05ee4c450061425d7e8194c738d9310696b4213fc32523",
+  "calibration_sha256": "3bc7291e174cccc8a8f0272d9786716a78bccb2ae8336c33fdfd4e10a16927f0",
+  "probe_sha256": "c4b62d80662c62058f4ba4a237e606e745b07d8506eb45c0e9ccb098aeec953e",
+  "owner_handle_counts": [
+    16,
+    912,
+    0
+  ],
+  "rank_static_bytes": 39624816576,
+  "largest_bytes": 11324620800,
+  "final_after_free_compared_to": [
+    "calibration A",
+    "aggregate prewarm"
+  ],
+  "scope": "empty reservations only; full40 firsttouch/upload/forward peaks remain null"
+}

@@ -1,0 +1,49 @@
+{
+  "status": "BOUNDED_F09_THREECALL_NATIVE_AND_171_PASS",
+  "native_task": "task_20261108_073451_194268324897",
+  "cpu_task": "task_20261108_074310_198714624539",
+  "native_exit": 0,
+  "cpu_exit": 0,
+  "numeric_checks": 171,
+  "calls": [
+    {
+      "call": 0,
+      "passing_numeric_checks": 57,
+      "groups": {
+        "unconditioned_per_call19": 19,
+        "original_staged19": 19,
+        "independent_three_call_oracle19": 19
+      }
+    },
+    {
+      "call": 1,
+      "passing_numeric_checks": 57,
+      "groups": {
+        "unconditioned_per_call19": 19,
+        "original_staged19": 19,
+        "independent_three_call_oracle19": 19
+      }
+    },
+    {
+      "call": 2,
+      "passing_numeric_checks": 57,
+      "groups": {
+        "unconditioned_per_call19": 19,
+        "original_staged19": 19,
+        "independent_three_call_oracle19": 19
+      }
+    }
+  ],
+  "nine_pristine_reference_integrity_rows": true,
+  "six_native_input_post_files_unchanged": true,
+  "native_terminal_receipt_sha256": "8345cf33f8f4b7542f1cb1d3aff9efbdfeba566f8e740eb6e254dfb5b69df6d0",
+  "cpu_numerical_receipt_sha256": "6ce38e890b642908c731fb247accc302938846f892142471d26715398e96c851",
+  "reference_integrity_sha256": "768b2d588c776dfd2cfea415a3eec222942b0e002959898ac0acca56c0371857",
+  "cpu_reference_verdicts_sha256": "e3a51d942353f99e5f6e54dac4ca1bdce0ba61b7acbae4f05ec5594c39011d9d",
+  "Main64bb_and_review5510_sourceproof889b_unchanged": true,
+  "source8153_UNAPPLIED_liveM02_unchanged": true,
+  "original_numeric_tolerances_unchanged": true,
+  "scope": "E1synthetic fixedphysicalT2/B2/pages4/state2 TP4DP4EP16; no generalphysicalvariation/realcheckpoint/originalprefillparity",
+  "observed_epoch": 1794097272.4368596,
+  "shared_writes": 0
+}

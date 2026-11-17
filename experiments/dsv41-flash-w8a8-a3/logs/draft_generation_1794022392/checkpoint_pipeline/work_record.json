@@ -1,0 +1,10 @@
+{
+  "record_id": "checkpoint-pipeline-1794022446-1794022858",
+  "agent": "/root/main_native/checkpoint_pipeline",
+  "start_epoch": 1794022446,
+  "end_epoch": 1794022858,
+  "elapsed_wall_seconds": 412,
+  "basis": "actualfirstworkerclockthroughartifactreportseal;earlierdispatch/readtimeexcluded;wallnotCPUusage",
+  "status": "PARKED",
+  "scope": "artifact-only partialprototype, no native/fullprefix integration claim"
+}

@@ -1,0 +1,33 @@
+{
+  "schema": "HC-math-resource-binding/1",
+  "new_plan_sha256": "806852d5baec99a522f5adc3015bdd204d9ac6b17244a29cb26445cbd55fda89",
+  "new_plan_bytes": 66955067,
+  "old_plan_sha256": "3dd67b88683d0de1f5fbd8e889c0c1a875eeecf671263fca4c64061637ecd9c0",
+  "resource_key_rule": "EXACT old root-key projection minus source_manifest_sha256 and source_manifest_files",
+  "resource_keys": [
+    "checkpoint",
+    "expert_layers",
+    "index_sha256",
+    "operation",
+    "payload_bytes_read",
+    "phases",
+    "prompt_candidates",
+    "schema",
+    "selected_prompt",
+    "source_descriptors",
+    "static_arguments_per_rank",
+    "static_global_bytes",
+    "static_per_rank_bytes",
+    "tokenizer_files",
+    "two_phase_H2D_static_bytes",
+    "two_phase_cumulative_source_bytes",
+    "unknown_peaks"
+  ],
+  "resource_canonical_sha256": "e13c5fd6d98de327a24427b5efc0a9be4e9c30a89e757ac6c377e73b6ffc10ff",
+  "only_allowed_added_root_key": "hc_math_lineage",
+  "lineage_canonical_sha256": "e9b0e71dd5d2909d007a4d762ca92ff83e1940630251fae7bb98216f8e10983c",
+  "lineage_file_sha256": "ebac3e1980d2e0db67fe23ef2be16362c1b23246b3a4c12812e97c7b5d6af2d8",
+  "actual_source45_sha256": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "math_baseline_M01_sha256": "eb90ea56e26d0cb97dd12d330559c2ae1b53f4ae5cbf866cc01bfbbb150fecf2",
+  "whole_native_case": "FAILED; offline independentlyoriginal bounded comparison accepted"
+}

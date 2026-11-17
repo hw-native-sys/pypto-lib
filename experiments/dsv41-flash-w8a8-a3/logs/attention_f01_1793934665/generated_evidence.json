@@ -1,0 +1,18 @@
+[
+  {
+    "path": "experiments/dsv41-flash-w8a8-a3/logs/attention_f01_1793934665/build_output/_jit_mla_proj_test_20261106_111836_s6bal_8j/orchestration/mla_proj_test.cpp",
+    "sha256": "d48fc6f4783dcfa9337b17f226074a8bbdee1d4de325153931f2f82f90604618",
+    "excerpts": [
+      "68:         uint32_t q_bf16_inline208_ci_shapes[2] = {static_cast<uint32_t>(T_DYN), 8192};",
+      "69:         TensorCreateInfo q_bf16_inline208_ci(q_bf16_inline208_ci_shapes, 2, DataType::BFLOAT16);",
+      "74:         TaskOutputTensors alloc_0 = alloc_tensors(x_i8_inline204_ci, x_scale_inline205_ci, qr_bf16_inline206_ci, qr_norm_inline207_ci, q_bf16_inline208_ci, kv_bf16_inline210_ci, kv_norm_inline211_ci);",
+      "79:         const Tensor& q_bf16_inline208 = alloc_0.get_ref(4);",
+      "132:                 // Spmd rms_norm_spmd: rms_norm",
+      "184:                 params_t4.add_output(q_bf16_inline208);",
+      "199:                 // Spmd rope_tail_bf16_spmd: rope_tail_bf16",
+      "204:                 params_t5.add_input(q_bf16_inline208);",
+      "242:                 // Spmd rms_norm_spmd_0: rms_norm_0",
+      "261:                 // Spmd rope_tail_bf16_spmd_0: rope_tail_bf16_0"
+    ]
+  }
+]

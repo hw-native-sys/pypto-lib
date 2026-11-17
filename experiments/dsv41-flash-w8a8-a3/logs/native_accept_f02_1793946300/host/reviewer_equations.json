@@ -1,0 +1,26 @@
+[
+  {
+    "tokens": 1,
+    "separate_equation_original_exact": true,
+    "preserved_nonrotary_exact": true,
+    "omitted_pre_Woa_BF16_rounding_exact_mismatches": 1604,
+    "omitted_rounding_max_abs": 0.0078125,
+    "layer_partial_original_exact": true
+  },
+  {
+    "tokens": 7,
+    "separate_equation_original_exact": true,
+    "preserved_nonrotary_exact": true,
+    "omitted_pre_Woa_BF16_rounding_exact_mismatches": 12017,
+    "omitted_rounding_max_abs": 0.0078125,
+    "layer_partial_original_exact": true
+  },
+  {
+    "tokens": 17,
+    "separate_equation_original_exact": true,
+    "preserved_nonrotary_exact": true,
+    "omitted_pre_Woa_BF16_rounding_exact_mismatches": 29577,
+    "omitted_rounding_max_abs": 0.0078125,
+    "layer_partial_original_exact": true
+  }
+]

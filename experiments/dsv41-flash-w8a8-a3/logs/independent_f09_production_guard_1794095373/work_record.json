@@ -1,0 +1,12 @@
+{
+  "id": "independent-f09-production-guard-1794095373-1794095704",
+  "agent": "review-agent",
+  "start_epoch": 1794095373,
+  "end_epoch": 1794095704,
+  "elapsed_seconds": 331,
+  "state": "FINAL_PARK_SOURCE_ONLY_CONDITIONAL_PLAN_APPROVAL",
+  "CPU_test_jobs": 0,
+  "NPU_jobs": 0,
+  "shared_writes": 0,
+  "protected_source_writes": 0
+}

@@ -1,0 +1,52 @@
+[
+  {
+    "script": "worker_loader_reviewfix/check_top.py",
+    "exit_code": 0,
+    "log": "worker_loader_reviewfix_check_top.py.log"
+  },
+  {
+    "script": "worker_loader_reviewfix/check.py",
+    "exit_code": 0,
+    "log": "worker_loader_reviewfix_check.py.log"
+  },
+  {
+    "script": "worker_loader_reviewfix/check_headers.py",
+    "exit_code": 0,
+    "log": "worker_loader_reviewfix_check_headers.py.log"
+  },
+  {
+    "script": "main/check_scalar.py",
+    "exit_code": 0,
+    "log": "main_check_scalar.py.log"
+  },
+  {
+    "script": "main/check_stream_owner.py",
+    "exit_code": 0,
+    "log": "main_check_stream_owner.py.log"
+  },
+  {
+    "script": "main/check_metadata_owner.py",
+    "exit_code": 0,
+    "log": "main_check_metadata_owner.py.log"
+  },
+  {
+    "script": "main/check_c2_asymmetric.py",
+    "exit_code": 0,
+    "log": "main_check_c2_asymmetric.py.log"
+  },
+  {
+    "script": "worker_c2_referencefix/check.py",
+    "exit_code": 0,
+    "log": "worker_c2_referencefix_check.py.log"
+  },
+  {
+    "script": "main/check_source_backing.py",
+    "exit_code": 0,
+    "log": "main_check_source_backing.py.log"
+  },
+  {
+    "script": "main/check_signature_owners.py",
+    "exit_code": 0,
+    "log": "main_check_signature_owners.py.log"
+  }
+]

@@ -1,0 +1,153 @@
+{
+  "status": "CPU_FAKE_ONLY_PASS",
+  "binding": {
+    "operation": "empty-allocation",
+    "source_manifest_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+    "adapter_sha256": "0b806c817e30a446159def00b001d7f7597c57adf30d04135d4f4d76d4c54db2",
+    "guard_core_sha256": "1542c1848227a0326655dc809ede1c71bca1e3d71d67f77a11e604741b924865",
+    "artifact_receipt_sha256": "c2cc6c2b1db13a67e202b160e4abd4c1434a9fe9f6825be9e1e629f05234fe2f",
+    "policy_sha256": "47350e83d8cd6253b0cdb2b2c244e065a7817998325575fccfe773e92de77ac9",
+    "device_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "world": 16,
+    "platform": "a2a3",
+    "execution_mode": "ONBOARD",
+    "ring_heap": [
+      0,
+      0,
+      4294967296,
+      0
+    ],
+    "library_sha256": "24434f8879030ef1b1f31e5fc2ecce683e392d4f1baeb5bcee852fb183976e5c"
+  },
+  "calibrate_created_handles": [
+    0,
+    16,
+    0
+  ],
+  "probe_created_handles": [
+    16,
+    912,
+    0
+  ],
+  "policy_sidecost_is_planning_not_measured": true,
+  "reserve_per_rank": 17954081472,
+  "tolerance": [
+    69337088,
+    69337088,
+    69337088,
+    69337088,
+    69337088,
+    69337088,
+    69337088,
+    69337088,
+    69337088,
+    69337088,
+    69337088,
+    69337088,
+    69337088,
+    69337088,
+    69337088,
+    69337088
+  ],
+  "raw_requested_committed_free_residual_kept_separate": true,
+  "full40_peaks_remain_null": true,
+  "controls": [
+    {
+      "case": "fake_receipt_cannot_actual_probe",
+      "error": "wrong calibration status/scope"
+    },
+    {
+      "case": "wrongoperation",
+      "error": "wrong/null/fake calibration operation or pins"
+    },
+    {
+      "case": "wrongsourcepin",
+      "error": "wrong/null/fake calibration operation or pins"
+    },
+    {
+      "case": "wrongconfig",
+      "error": "wrong/null/fake calibration operation or pins"
+    },
+    {
+      "case": "wrongpolicy_measured",
+      "error": "planning policy or unknown peaks relabeled as measured"
+    },
+    {
+      "case": "unknown_peak_zero",
+      "error": "planning policy or unknown peaks relabeled as measured"
+    },
+    {
+      "case": "nulltol",
+      "error": "tolerance must derive from actual A->B observations"
+    },
+    {
+      "case": "missingrank",
+      "error": "missing16rank raw observations"
+    },
+    {
+      "case": "wrong16rank",
+      "error": "wrong/null/fake calibration operation or pins"
+    },
+    {
+      "case": "stale",
+      "error": "calibration stale/missing timestamp"
+    },
+    {
+      "case": "observed_tolerance_over256_STOP",
+      "error": "observed tolerance exceeds256MiB STOP; no clamp"
+    },
+    {
+      "case": "C_exceeds_established_tolerance",
+      "error": "Refused: fresh owner free baseline regressed after largest phase close"
+    },
+    {
+      "case": "first_query_error_cleanup",
+      "error": "RuntimeError: FIRST post tiny allocation query failure"
+    },
+    {
+      "case": "final_fresh_probe_baseline",
+      "error": "Refused: fresh owner free baseline regressed after largest phase close"
+    },
+    {
+      "case": "lastaggregate_postguard",
+      "error": "Refused: postallocation free/remaining/IO/comm/headroom guard"
+    },
+    {
+      "case": "calibration_auth_not_large_scope",
+      "error": "wrong separate operation scope"
+    },
+    {
+      "case": "fake_auth_not_native_grant",
+      "error": "operation/source/artifact/policy/16rank/config binding mismatch"
+    },
+    {
+      "case": "default_refused",
+      "error": "DEFAULT REFUSE before device/runtime owner creation"
+    },
+    {
+      "case": "duplicate_physical_rank",
+      "error": "exact16 distinct physical IDs required"
+    }
+  ],
+  "NPU": 0,
+  "real_device_allocations": 0,
+  "tensor_payload_reads": 0,
+  "actual_forward": 0
+}

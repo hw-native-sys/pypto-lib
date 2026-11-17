@@ -1,0 +1,12 @@
+{
+  "status": "FINAL/PARK",
+  "artifact_count": 17,
+  "artifact_manifest_sha256": "9aeb50ef3e9f5b8e90993063d7ccb03a668010a310cd16aa83063ee69d94ede5",
+  "actual_source45_sha256": "b3e19fd001c74f7a5b497c791c01924ca09c0678df66114fce599e890d8fee06",
+  "actual_source45_bytes": 5534,
+  "actual_generate_sha256": "fba8a4ef9a06f694fa53278bb80ae2ad70d111336dbead938ab9f8511d27e16e",
+  "exactpatch_sha256": "366ed05e9b51f26771cb4e63beedb1fa2f8049019e2685ba529dc85571002c8e",
+  "other44_unchanged": true,
+  "all_jobs_writers_parked": true,
+  "no_compile_NPU_payload_actualgrant": true
+}

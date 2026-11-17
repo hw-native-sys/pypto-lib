@@ -1,0 +1,17 @@
+{
+  "status": "TOY_ONLY_PASS",
+  "prefix_receipt": "9114258a3825b02ed0844e475d8e5413022136293b03c339db24bb4f7bb4e73d",
+  "step_receipts": {
+    "128": "67dedbeac65bc7c312317264a30681cb7da25187e9f93836e21f1f72808d1108",
+    "129": "a517c6f0568ff2ab0d025998cd3e4eabe29057fabfff7be739fb3c593286d1f9",
+    "130": "3e2fb71f1698290e60994df214f114d370e0cb0aa564a54d50d28fa041be0d5b"
+  },
+  "control": {
+    "state": "CPU FAKE numerical stale-row rejection"
+  },
+  "scopes": [
+    "unconditioned",
+    "staged"
+  ],
+  "evidence_mode": "toy-only-prototype"
+}

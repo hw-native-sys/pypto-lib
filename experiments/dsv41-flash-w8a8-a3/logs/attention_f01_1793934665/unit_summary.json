@@ -1,0 +1,157 @@
+{
+  "changed_sources": [
+    "models/deepseek_v4_1_flash_a3_w8a8/mla_proj.py"
+  ],
+  "unchanged_sources": 44,
+  "source_manifest_sha256": "9352242dc8b16f94343ed6cc9c0e05e16d69ad3a92ca7c0ee65d408898f16881",
+  "device_results": [
+    {
+      "entry": "negative_original",
+      "start": "1793935078",
+      "end": "1793935096",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 0
+    },
+    {
+      "entry": "negative_fp32",
+      "start": "1793935096",
+      "end": "1793935113",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 0
+    },
+    {
+      "entry": "mla_proj",
+      "start": "1793935113",
+      "end": "1793935129",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 3
+    },
+    {
+      "entry": "decode_swa",
+      "start": "1793935129",
+      "end": "1793935148",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 2
+    },
+    {
+      "entry": "prefill_swa",
+      "start": "1793935148",
+      "end": "1793935166",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 1
+    },
+    {
+      "entry": "decode_c2a_full",
+      "start": "1793935166",
+      "end": "1793935190",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 2
+    },
+    {
+      "entry": "prefill_c2a_full",
+      "start": "1793935190",
+      "end": "1793935214",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 1
+    },
+    {
+      "entry": "decode_c2a_reuse",
+      "start": "1793935214",
+      "end": "1793935233",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 2
+    },
+    {
+      "entry": "prefill_c2a_reuse",
+      "start": "1793935233",
+      "end": "1793935251",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 1
+    },
+    {
+      "entry": "decode_c1a_full",
+      "start": "1793935251",
+      "end": "1793935275",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 2
+    },
+    {
+      "entry": "prefill_c1a_full",
+      "start": "1793935275",
+      "end": "1793935298",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 1
+    },
+    {
+      "entry": "decode_c1a_reindex",
+      "start": "1793935298",
+      "end": "1793935320",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 2
+    },
+    {
+      "entry": "prefill_c1a_reindex",
+      "start": "1793935320",
+      "end": "1793935342",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 1
+    },
+    {
+      "entry": "decode_c1a_reuse",
+      "start": "1793935342",
+      "end": "1793935362",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 2
+    },
+    {
+      "entry": "prefill_c1a_reuse",
+      "start": "1793935362",
+      "end": "1793935379",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 1
+    },
+    {
+      "entry": "indexer",
+      "start": "1793935379",
+      "end": "1793935411",
+      "exit": "0",
+      "device": "0",
+      "positive_cases": 6
+    }
+  ],
+  "positive_component_cases": 27,
+  "independent_random_baseline_cases": 1,
+  "negative_device_controls": 2,
+  "compile_results": [
+    {
+      "entry": "decode_fwd",
+      "start": "1793935252",
+      "end": "1793935280",
+      "exit": "0"
+    },
+    {
+      "entry": "prefill_fwd",
+      "start": "1793935280",
+      "end": "1793935306",
+      "exit": "0"
+    }
+  ],
+  "original_archive_provenance_verified": true,
+  "native_goal": "Observed null; no create/complete operation",
+  "limits": "F01 rank-local projection only; no F02-F04, full-model device, layer-suite, TP or generation acceptance."
+}

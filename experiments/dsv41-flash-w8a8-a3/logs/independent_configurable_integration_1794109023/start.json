@@ -1,0 +1,6 @@
+{
+  "start_epoch": 1794109023,
+  "scope": "EARLY_SOURCE_ONLY_CONFIGURABLE_INTEGRATION",
+  "coherent_freeze_assumed": false,
+  "CPU_or_NPU_test_jobs": 0
+}

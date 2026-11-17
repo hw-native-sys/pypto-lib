@@ -1,0 +1,17 @@
+{
+  "status": "FINAL/PARK",
+  "epoch": 1794062797,
+  "artifact_count": 13,
+  "artifacts_sha256": "3e9f22d8dff50cb3de4ed0485e6d3cbd20cf1f7ac2275ea1cbb07723cd508999",
+  "audit_results_sha256": "6883761968eb3fddf4afc6e1b4fa26629f3f290a0036974191aaf6b5a3d1cd72",
+  "closure_sha256": "1b65aadab4371f5f7135507e2478336ba16d02ad30c0391a60c40deb96128d75",
+  "source45_sha256": "d77d196be6541b4a87aef07cf0e5e02eac68cefa9fc245f3742e4c14606555aa",
+  "audit_task": "task_20261107_222727_339490027353",
+  "case_native_task": "task_20261107_204310_361283812010",
+  "passed_checks": 100,
+  "unmet_checks": 0,
+  "all_own_jobs_terminal": true,
+  "own_NPU_jobs": 0,
+  "payload_rereads": 0,
+  "operational_mutable_files": []
+}

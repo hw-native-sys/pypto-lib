@@ -1,0 +1,1 @@
+{"schema": "checkpoint-exact-reference-policy/1", "approved": true, "purpose": "CPU_TOY_ONLY", "bridge_sha256": "72566429dd1397e15f20a3c43584b43d5830f23953bdaeadfaf8d0ee61e81868", "producer_manifest_sha256": "ab1ced6d6ecbf9887297458703ba9b74e2c9b8bc57608370b4c2e0310e027e37", "derived_receipt_sha256": "8ceac8fcab327b6e31b8016b9b66b60d11f64d2bb493fbb6f9b7c666eb05f778"}

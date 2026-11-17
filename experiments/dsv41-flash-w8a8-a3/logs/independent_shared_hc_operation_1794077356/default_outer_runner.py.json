@@ -1,0 +1,6 @@
+{
+  "returncode": 1,
+  "stdout": "",
+  "stderr": "Traceback (most recent call last):\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/shared_hc_real_operation_prepare_1794076136/outer_runner.py\", line 238, in <module>\n    if __name__=='__main__':main()\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/shared_hc_real_operation_prepare_1794076136/outer_runner.py\", line 207, in main\n    if not args.execute or not args.root_assignment:raise RuntimeError('DEFAULT REFUSE: separate explicit future Root full-operation GO required')\nRuntimeError: DEFAULT REFUSE: separate explicit future Root full-operation GO required\n",
+  "output_exists": false
+}

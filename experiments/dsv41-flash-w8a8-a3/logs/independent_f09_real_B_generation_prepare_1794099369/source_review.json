@@ -1,0 +1,16 @@
+{
+  "epoch": 1794099537.9388957,
+  "scope": "source text/JSON/generated code/hash inspection only; no test/job/compile/model import/header/payload/native",
+  "live_SourceB45_exact": true,
+  "current_generate_sha256": "5de1656a99e85699138879b2f577f4eed2639779937a7cdc91ae843fcef6e34c",
+  "historical_hc_source_sha256": "c6111634f78d53ad0cb4196a533a2d89097d4cfa0859688382c0072b60840885",
+  "outer_runtime3_exact": true,
+  "outer_binding_sha256": "cc2132a8e7bf0b36110f7a99f68d244a8b98e0f0299d8a9b8e897cec1dde5937",
+  "SourceB_signature_receipt_sha256": "704eb14f6ff186cedf451830e3c38c303b43a3bce201395e78fd3e044b0ba357",
+  "SourceB_signature_manifest_sha256": "1a4a8d75e383e4b8001c1c33d574ee5ae5c83654079dee732b49cdac3b931294",
+  "metadata_plan_sha256_bound_not_reread_or_rebuilt": "cd8b17741688eeb9ef39d8c0925dbb74a8f9a1cfcc0052db2e0a8c1aacb48cf7",
+  "future_case": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_real_B_generation_1794098661",
+  "actual_task_and_RootGO": null,
+  "fit_PREQUEUE": "Separate fitter-owned pending; this unit does not execute/duplicate it",
+  "changed_auditor_behavior": "Only source/plan/signature/helper/F09 identity and cache InOut metadata check; one-owner/accounting/stricttelemetry/quality criteria retained"
+}

@@ -1,0 +1,8 @@
+{
+  "agent": "/root/reviewer_f09",
+  "source_review_only": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_c2_review_1794094092",
+  "future_external_prequeue": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_c2_retention_1794092629_launch/prequeue.json",
+  "reserved_work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_c2_retention_1794092629/work",
+  "CPU_prequeue": "FORBIDDEN_UNTIL_NEW_ROOT_WRAPPER",
+  "native_grants": false
+}

@@ -1,0 +1,36 @@
+[
+  {
+    "step": 0,
+    "requests": [
+      [
+        1248,
+        1
+      ],
+      [
+        1250,
+        1
+      ]
+    ],
+    "passed": true,
+    "error": null,
+    "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/cohort_f04_f10_1793952989/f04/device/build_output/_jit_decode_c2a_full_attention_test_20261106_163550_pbvxcang",
+    "actual_state_carried": false
+  },
+  {
+    "step": 1,
+    "requests": [
+      [
+        1249,
+        1
+      ],
+      [
+        1251,
+        1
+      ]
+    ],
+    "passed": true,
+    "error": null,
+    "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/cohort_f04_f10_1793952989/f04/device/build_output/_jit_decode_c2a_full_attention_test_20261106_163550_pbvxcang",
+    "actual_state_carried": true
+  }
+]

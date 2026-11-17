@@ -1,0 +1,18 @@
+{
+  "status": "FINAL/PARK_READY_FOR_SEPARATE_ROOT_COUNT_ACTIVE16_GO",
+  "PREQUEUE_task": "task_20261108_050241_152375314110",
+  "PREQUEUE_exit": 0,
+  "PREQUEUE_sha256": "ed38110a3e9829e8cfb1115a8e8e99cd8d14de1c695e62057aa86882120784c2",
+  "pins_sha256": "57b9010fe50ebe4ad4484db3b79507261bfbc51163832e74f7991f55e2845b35",
+  "launcher_sha256": "b340b6dc8cc6ed018e9e5686bd5dcd1ad8f706db5eb91f5a5b0daef7727d9942",
+  "corrected_lifecycle_root_sha256": "90d995759c4639637cf6f7c5ea0a014331b2912b26b4fede740fd576f12d5597",
+  "requested_role": "active",
+  "communication_epoch_per_dispatch": 1,
+  "planned_counts": [192, 96, 192],
+  "actual16_authorization": false,
+  "actual_work_exists": false,
+  "NPU_submitted": false,
+  "running_jobs": [],
+  "shared_writes": 0,
+  "recovery": "Root may separately issue exact external native GO, then ONE auto16 native launch. Work is created only after actual GO/allocation; frozen native_stage publishes allocation before delegated stage authorization. SAME work CPU count-active only after native terminal/PID/raw16 audit and fresh Root CPU GO. No old/full authority."
+}

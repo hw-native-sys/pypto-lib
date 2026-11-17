@@ -1,0 +1,63 @@
+{
+  "scope": "noEngram; empty A/B/C only",
+  "pid": 2480971,
+  "source45": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "runner_sha256": "bbb31a14c05bee04c7bee9fe82d26d61e998939aab95ef027cda9096fd0013ce",
+  "adapter_sha256": "8d3ad68504cef4f0527594a37daa9dd8ef90041c0b56b8e199af30c99a5b83aa",
+  "artifact_receipt_sha256": "c2cc6c2b1db13a67e202b160e4abd4c1434a9fe9f6825be9e1e629f05234fe2f",
+  "artifact_files": 283,
+  "threshold_policy": {
+    "host_available_bytes": 68719476736,
+    "disk_free_bytes": 2147483648,
+    "shm_free_bytes": 17179869184
+  },
+  "actual_resources": {
+    "epoch": 1794040452.1920195,
+    "host_available_bytes": 1722919424000,
+    "disk_free_bytes": 9526934765568,
+    "shm_free_bytes": 1079343157248,
+    "admission": true
+  },
+  "contract": {
+    "platform": "a2a3",
+    "runtime": "tensormap_and_ringbuffer",
+    "library_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/build/lib/a2a3/onboard/tensormap_and_ringbuffer/libhost_runtime.so",
+    "library_sha256": "24434f8879030ef1b1f31e5fc2ecce683e392d4f1baeb5bcee852fb183976e5c",
+    "resources": [
+      {
+        "kind": 4,
+        "resource_class": 0,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 1,
+        "resource_class": 1,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 2,
+        "resource_class": 1,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 3,
+        "resource_class": 1,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 5,
+        "resource_class": 2,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 6,
+        "resource_class": 2,
+        "bytes_per_copy": 0
+      }
+    ],
+    "shared_GM_copy_count": 1,
+    "limit": "selected pinned PROGRAM backend only; identity capacity is not resident GM banks"
+  },
+  "actual_prepare_calls": 0,
+  "NPU_execution_requested": false
+}

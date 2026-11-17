@@ -1,0 +1,19 @@
+{
+  "parent_pid": 3348898,
+  "all_observed_own_pids": [
+    3348898
+  ],
+  "sample_count": 589,
+  "sampled_tree_peak_pss": 133950324736,
+  "sampled_tree_peak_uss": 133950144512,
+  "minimum_available": {
+    "host": 1588325322752,
+    "disk": 9527816617984,
+    "shm": 1079343157248
+  },
+  "maximum_shm_used": 557056,
+  "per_pid_peak_rss": {
+    "3348898": 133952372736
+  },
+  "scope": "3s public own PSS/USS, perPID RSS; sampling can miss transients, no global RSS sum"
+}

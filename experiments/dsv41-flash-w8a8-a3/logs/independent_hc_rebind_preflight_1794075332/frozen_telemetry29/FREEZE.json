@@ -1,0 +1,13 @@
+{
+  "status": "FINAL/SEALED/PARK",
+  "artifact_count": 29,
+  "artifact_manifest_sha256": "217ec5e7b28b5f071a0f4de90012bd0b8f49505b92d90eea1cfb41f869771edd",
+  "candidate_runner_sha256": "5c9957c4892bd7ea2aff67d77a4d1a300eaa874b5e7a918b941b0f5ce8842352",
+  "unchanged_checker_sha256": "6947863b5268351c03a55cafc94c00688f660c68572adae3af34fcb0079de31a",
+  "patch_sha256": "78dd8c6db5580626307d6b2ef581a70fecb424bc402236fbdab6bb9c7bbd44be",
+  "policy_sha256": "0cd8081d753cc948f9a75e3934da0e327f2896ca9edc7da8dbb1655034fab9ac",
+  "policy_approved": false,
+  "applied": false,
+  "all_own_jobs_terminal": true,
+  "end_epoch": 1794070950
+}

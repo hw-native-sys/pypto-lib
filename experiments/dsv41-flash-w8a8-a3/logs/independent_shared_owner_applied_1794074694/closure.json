@@ -1,0 +1,16 @@
+{
+  "CPU_exit": 0,
+  "CPU_identity_absent": true,
+  "CPU_task": "task_20261108_020810_341293027489",
+  "Main17_Main25_native46_failed46_unchanged": true,
+  "actualNPU": 0,
+  "compile": 0,
+  "end_epoch": 1794075030,
+  "generate": "fba8a4ef9a06f694fa53278bb80ae2ad70d111336dbead938ab9f8511d27e16e",
+  "other44_identical_CC": true,
+  "production_positive_auth": 0,
+  "real_payload": 0,
+  "source45": "b3e19fd001c74f7a5b497c791c01924ca09c0678df66114fce599e890d8fee06",
+  "source45_after_unchanged": true,
+  "state": "PASS_FINAL_PARK_CPU_ONLY"
+}

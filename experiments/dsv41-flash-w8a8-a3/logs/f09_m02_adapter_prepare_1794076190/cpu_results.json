@@ -1,0 +1,42 @@
+{
+  "status": "PASS_TINY_ADAPTER_AND_PUBLIC_JIT_IMPORT_ONLY",
+  "physical_geometry": {
+    "capacity2": true,
+    "B2": true,
+    "physical_pages4": true,
+    "logical_pages_per_request2": true,
+    "state_blocks2": true
+  },
+  "three_actual_fake_candidate_state_calls": true,
+  "leaf_math": "OWNED_SENTINEL_WRITES_NOT_MODEL_MATH",
+  "idle_B_carry_and_recent_publication_retention": true,
+  "counts_positive": [
+    192,
+    96,
+    192
+  ],
+  "old_count_negative": 192,
+  "expected_middle": 96,
+  "remote_rank8_at_local_zero": 96,
+  "pureOut_serialization_no_alias": true,
+  "default_capture_REFUSE": true,
+  "new_HC_inherited": true,
+  "live_M02_unchanged": true,
+  "diagnostic_probe_public_JIT_import": true,
+  "diagnostic_probe_compile": "PENDING",
+  "fullentry_compile": "PENDING",
+  "native": false,
+  "large_fixture": false,
+  "weights_read": false,
+  "actual_grant": false,
+  "fixture_AST_receipt": {
+    "original_builder_AST": "a88d33321d78fc190665f73d00c484d3ce5f2637f8e57566f7dececcd27617f1",
+    "derived_builder_AST": "1decaeef1327018797bf9da3058e0d6df878fec4d4149db195537ec5d3ae6c03",
+    "changes": [
+      "function name",
+      "remove local build_request_plan import",
+      "requests126/126; fixed geometry provider injected"
+    ],
+    "kernel_or_golden_changed": false
+  }
+}

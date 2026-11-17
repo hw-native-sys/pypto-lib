@@ -1,0 +1,54 @@
+{
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_native_route_prepare_1794081950/REPORT.md": {
+    "sha256": "15913f19c885cc05fde5b1f0babc003551f9cc58dc23a6531499963c2fd1ba7b",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_native_route_1794082891/inputs/f09_native_route_prepare_1794081950/REPORT.md"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_native_route_prepare_1794081950/EXECUTION_PLAN.md": {
+    "sha256": "8fc885d3d478eabd761e89ead358d3485dddbbd3b46687cbb5e5c5d216498f32",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_native_route_1794082891/inputs/f09_native_route_prepare_1794081950/EXECUTION_PLAN.md"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_native_route_prepare_1794081950/route.py": {
+    "sha256": "6f9ad3c698e1cbaaa4f4119c57b1a5a06a3737372bda6cfe0eeea3ad44c255b2",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_native_route_1794082891/inputs/f09_native_route_prepare_1794081950/route.py"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_native_route_prepare_1794081950/native_stage.sh": {
+    "sha256": "caf30d0d1dafe8f108684ad146ae610ec3dd5221fd3b0c10635f56134539306e",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_native_route_1794082891/inputs/f09_native_route_prepare_1794081950/native_stage.sh"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_native_route_prepare_1794081950/resource_plan.json": {
+    "sha256": "e897ebf222eb0ef0744484237b9ac6edb2dd002d3c7d20e85d2db886a0be47cc",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_native_route_1794082891/inputs/f09_native_route_prepare_1794081950/resource_plan.json"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_native_route_prepare_1794081950/pins.json": {
+    "sha256": "d90931c9052205365556fbeb336f506e688fff211bdb8134861c525fd13f75b0",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_native_route_1794082891/inputs/f09_native_route_prepare_1794081950/pins.json"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_native_route_prepare_1794081950/FREEZE.json": {
+    "sha256": "2eafdb1065a649b7ba9a608635429b300b1b042e1b379e52663825dc9dfa4ed9",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_native_route_1794082891/inputs/f09_native_route_prepare_1794081950/FREEZE.json"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_native_route_prepare_1794081950/artifacts.json": {
+    "sha256": "2a9e22d759f360062972eab81c5d5348860be6dba138201999374fbbe5d5b30c",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_native_route_1794082891/inputs/f09_native_route_prepare_1794081950/artifacts.json"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_artifact_lifecycle_fix_1794079805/f09_decode_case.py": {
+    "sha256": "6a2d8cb9fbddcee72c27a0892ad2730b571167f323af5a45cd9abebdab271b40",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_native_route_1794082891/inputs/f09_artifact_lifecycle_fix_1794079805/f09_decode_case.py"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_artifact_lifecycle_fix_1794079805/artifact_lifecycle.py": {
+    "sha256": "1cc9c0b792b93a3c9d83b3461fd327d21f0bcd4872c289f76f3ab61e70c14a0d",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_native_route_1794082891/inputs/f09_artifact_lifecycle_fix_1794079805/artifact_lifecycle.py"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_artifact_lifecycle_fix_1794079805/scenario.json": {
+    "sha256": "c7b6ab942f5ea17758389aa5a53dafbb1de79e68dbb6f41c4614d66dd6b6dbb1",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_native_route_1794082891/inputs/f09_artifact_lifecycle_fix_1794079805/scenario.json"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_artifact_lifecycle_fix_1794079805/count_probe.py": {
+    "sha256": "277f405a5ebb50853a6dfad5407d5b2ead3961980dcf114cd2a092f2da828913",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_native_route_1794082891/inputs/f09_artifact_lifecycle_fix_1794079805/count_probe.py"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_artifact_lifecycle_fix_1794079805/count_probe_old_physical.py": {
+    "sha256": "3d90753e2ae608305b907248b7f58ae957b5e0874e2a7e67b467008351b70e29",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_native_route_1794082891/inputs/f09_artifact_lifecycle_fix_1794079805/count_probe_old_physical.py"
+  }
+}

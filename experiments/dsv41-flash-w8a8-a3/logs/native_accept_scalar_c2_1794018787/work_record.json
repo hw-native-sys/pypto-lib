@@ -1,0 +1,11 @@
+{
+  "record_id": "review-scalar-c2-1794018787-1794024042",
+  "agent": "review-agent",
+  "native_agent": "/root/reviewer_engram",
+  "start_epoch": 1794018787,
+  "end_epoch": 1794024042,
+  "elapsed_seconds": 5255,
+  "time_scope": "measured wall including CPU/NPU validation and reference waits, not CPU duration",
+  "status": "PARKED",
+  "evidence": "logs/native_accept_scalar_c2_1794018787/REVIEW.md"
+}

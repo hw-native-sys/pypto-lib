@@ -1,0 +1,24 @@
+{
+  "python_sources_unchanged": true,
+  "python_source_count": 140,
+  "orchestrations_searched": 2418,
+  "a5_state_cache_pool_matches": [],
+  "selected_builds": {
+    "a3_decode": {
+      "path": "build_output/_jit_decode_fwd_20261106_081644_8sx2hdyn",
+      "runtime_evidence_files": []
+    },
+    "a3_prefill": {
+      "path": "build_output/_jit_prefill_fwd_20261106_081049_ksr_kp03",
+      "runtime_evidence_files": []
+    },
+    "dspark_decode": {
+      "path": "build_output/_jit_l3_decode_fwd_20261106_024437_3y8qfqeb",
+      "runtime_evidence_files": []
+    }
+  },
+  "dspark_pool_symbol_matches": {
+    "decode_indexer.py": [],
+    "prefill_indexer.py": []
+  }
+}

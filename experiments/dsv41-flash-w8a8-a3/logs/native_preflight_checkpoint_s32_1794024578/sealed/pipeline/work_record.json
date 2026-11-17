@@ -1,0 +1,10 @@
+{
+  "record_id": "checkpoint-pipeline-v2-1794023045-1794023707",
+  "agent": "/root/main_native/checkpoint_pipeline",
+  "start_epoch": 1794023045,
+  "end_epoch": 1794023707,
+  "elapsed_wall_seconds": 662,
+  "basis": "actualfirstv2workerclockthroughartifactseal;wallnotCPUtime",
+  "status": "PARKED",
+  "scope": "v2actualwiring,CPUCLI-mocked/meta-tested,native/largeIOuntested"
+}

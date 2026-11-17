@@ -1,0 +1,15 @@
+{
+  "epoch": 1794075151.3384852,
+  "role": "review-agent",
+  "status": "FINAL/PARK_PREPARATION_PASS",
+  "shared_writes": 0,
+  "root_imports": "once, owned by Root",
+  "report_sha256": "81ab6d7316b453ff5060f234b6894a5fcc38d5d393881c9d80e92a1c183d72f0",
+  "manifest_sha256": "bab7d916f2f27c58c413189aff3915ac2b09dda243db1b2aee2ce5ef2864ca18",
+  "file_count": 237,
+  "probe_sha256": "6d7d3a3b0f9143c4add4a950667d33c4afc5c7e1ea2832171ac5ce5d4e044030",
+  "receipt_store_sha256": "d0b281499e0e93ccd70cf3f95bfc7683a2dd44d59bb8b086ee848534c7e4fb1c",
+  "current45": "b3e19fd001c74f7a5b497c791c01924ca09c0678df66114fce599e890d8fee06",
+  "NPU_execution": false,
+  "remaining_tasks": []
+}

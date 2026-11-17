@@ -1,0 +1,1 @@
+Independent reviewer exclusive artifact directory. PREPARE ONLY until observer binds final applied source45. No evolving producer import/compile, payload, fixture, preparation, NPU or model writes. All tests through task-submit --no-device.

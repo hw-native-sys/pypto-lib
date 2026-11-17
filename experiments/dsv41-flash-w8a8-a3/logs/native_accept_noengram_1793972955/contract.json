@@ -1,0 +1,165 @@
+{
+  "schema": "worker4-generate/1",
+  "mode": "host",
+  "commands": [
+    "models/deepseek_v4_1_flash_a3_w8a8/generate.py --contract-report --tokens 2 --engram-mode disabled --log-file /mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_noengram_1793972955/contract.log --result-json /mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_noengram_1793972955/contract.json"
+  ],
+  "rank_mapping": [
+    {
+      "rank": 0,
+      "dp_rank": 0,
+      "tp_rank": 0,
+      "group_base": 0,
+      "ep_rank": 0,
+      "expert_begin": 0,
+      "expert_end": 24
+    },
+    {
+      "rank": 1,
+      "dp_rank": 0,
+      "tp_rank": 1,
+      "group_base": 0,
+      "ep_rank": 1,
+      "expert_begin": 24,
+      "expert_end": 48
+    },
+    {
+      "rank": 2,
+      "dp_rank": 0,
+      "tp_rank": 2,
+      "group_base": 0,
+      "ep_rank": 2,
+      "expert_begin": 48,
+      "expert_end": 72
+    },
+    {
+      "rank": 3,
+      "dp_rank": 0,
+      "tp_rank": 3,
+      "group_base": 0,
+      "ep_rank": 3,
+      "expert_begin": 72,
+      "expert_end": 96
+    },
+    {
+      "rank": 4,
+      "dp_rank": 1,
+      "tp_rank": 0,
+      "group_base": 4,
+      "ep_rank": 4,
+      "expert_begin": 96,
+      "expert_end": 120
+    },
+    {
+      "rank": 5,
+      "dp_rank": 1,
+      "tp_rank": 1,
+      "group_base": 4,
+      "ep_rank": 5,
+      "expert_begin": 120,
+      "expert_end": 144
+    },
+    {
+      "rank": 6,
+      "dp_rank": 1,
+      "tp_rank": 2,
+      "group_base": 4,
+      "ep_rank": 6,
+      "expert_begin": 144,
+      "expert_end": 168
+    },
+    {
+      "rank": 7,
+      "dp_rank": 1,
+      "tp_rank": 3,
+      "group_base": 4,
+      "ep_rank": 7,
+      "expert_begin": 168,
+      "expert_end": 192
+    },
+    {
+      "rank": 8,
+      "dp_rank": 2,
+      "tp_rank": 0,
+      "group_base": 8,
+      "ep_rank": 8,
+      "expert_begin": 192,
+      "expert_end": 216
+    },
+    {
+      "rank": 9,
+      "dp_rank": 2,
+      "tp_rank": 1,
+      "group_base": 8,
+      "ep_rank": 9,
+      "expert_begin": 216,
+      "expert_end": 240
+    },
+    {
+      "rank": 10,
+      "dp_rank": 2,
+      "tp_rank": 2,
+      "group_base": 8,
+      "ep_rank": 10,
+      "expert_begin": 240,
+      "expert_end": 264
+    },
+    {
+      "rank": 11,
+      "dp_rank": 2,
+      "tp_rank": 3,
+      "group_base": 8,
+      "ep_rank": 11,
+      "expert_begin": 264,
+      "expert_end": 288
+    },
+    {
+      "rank": 12,
+      "dp_rank": 3,
+      "tp_rank": 0,
+      "group_base": 12,
+      "ep_rank": 12,
+      "expert_begin": 288,
+      "expert_end": 312
+    },
+    {
+      "rank": 13,
+      "dp_rank": 3,
+      "tp_rank": 1,
+      "group_base": 12,
+      "ep_rank": 13,
+      "expert_begin": 312,
+      "expert_end": 336
+    },
+    {
+      "rank": 14,
+      "dp_rank": 3,
+      "tp_rank": 2,
+      "group_base": 12,
+      "ep_rank": 14,
+      "expert_begin": 336,
+      "expert_end": 360
+    },
+    {
+      "rank": 15,
+      "dp_rank": 3,
+      "tp_rank": 3,
+      "group_base": 12,
+      "ep_rank": 15,
+      "expert_begin": 360,
+      "expert_end": 384
+    }
+  ],
+  "queue_submit_epoch": null,
+  "start_epoch": 1793973884,
+  "status": "ok",
+  "blockers": [],
+  "contract_gaps": [],
+  "timing": {
+    "total_seconds": 0.45572471618652344,
+    "device_wall_seconds": null,
+    "queue_wait_seconds": null
+  },
+  "exit_code": 0,
+  "log_file": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_noengram_1793972955/contract.log"
+}

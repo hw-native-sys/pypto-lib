@@ -1,0 +1,19 @@
+{
+  "approved": true,
+  "scope": "CPU_N3_SYNTHETIC_E1_STATIC_PLAN_ONLY",
+  "source_manifest_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "directive": "Root NEW_TASK authorizes exactly one actual CPU N3 seed/static-plan rebuild after small binding PASS and real capacity guards. No native/forward/real checkpoint payload/global static tensor save.",
+  "stage": "static-plan",
+  "required_bytes": {
+    "host": 290783361536,
+    "disk": 23876796928,
+    "shm": 37231460864
+  },
+  "owned_pins": {
+    "reference_n3.py": "95fa7a9b88dca411484d12bee71b5d1eaed97beea50d5963075c5f0219285a16",
+    "case_n3.py": "22b64bd136bf3b3a24f11501e78d714a6c1d885260ff283bc3396c4384eb5cbb",
+    "run_static_plan.py": "21218b53eaf6849627065eaca59b35363c83449257e7f47cb271b9c03ca20e4f",
+    "binding_results.json": "21994b835108bf8557475c8b54330e266eaa007f2c0606bec78511b9dd04f409"
+  },
+  "encoded_at_epoch": 1794037593
+}

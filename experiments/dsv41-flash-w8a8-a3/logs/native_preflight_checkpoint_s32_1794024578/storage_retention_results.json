@@ -1,0 +1,20 @@
+{
+  "five_stage_toy_cli": "PASS; not model math or native acceptance",
+  "budget_semantic_gap_reproduced": "guard accepts arbitrary hashed JSON/threshold1/no SHM; NO provider construction",
+  "storage": "PASS self-contained slice/expanded/scalar bytes, distinct initial/actual, no static payload",
+  "receipt_provenance_gap_reproduced": true,
+  "retention_controls": {
+    "window_cache": {
+      "historical_poison_missed_by_currentrow_and_globalratio": true,
+      "growing_retention_rejects": true,
+      "legitimate_current_update_excluded": true,
+      "correct129_currentrow_numerical_rejection": true
+    },
+    "compressed_cache_c2a": {
+      "historical_poison_missed_by_currentrow_and_globalratio": true,
+      "growing_retention_rejects": true,
+      "legitimate_current_update_excluded": true,
+      "correct129_currentrow_numerical_rejection": true
+    }
+  }
+}

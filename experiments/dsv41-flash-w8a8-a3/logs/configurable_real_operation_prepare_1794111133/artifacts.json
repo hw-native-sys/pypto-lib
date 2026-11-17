@@ -1,0 +1,16 @@
+{
+  "COMMANDS.md": "b5847b6e678bfff55d9a18cd89e9ff0820eae0e2fae77f69c6d7390dc63c5181",
+  "OWNERSHIP.md": "3121d2b25f096a039217ac7a40ca6991d7d08a247a7fe04c64eaf5eb655c29bd",
+  "REPORT.md": "4128235f220fc5e22bf4b02a3208bc07f440a486b9016b185465afc1d9329de7",
+  "adapt.py": "4f46ba043691cd72c74473ba72bca68d1b9331e81a133485fa6c191964307084",
+  "adaptation.patch": "fcac8181298385af57a14ca27755b95ecd6bbf689cca6607c83484212ae1352c",
+  "check_identity.py": "b751e8cd8dc5ae23d84754b640f160c902066a5e2708580a8e06b09f9ec06b66",
+  "future_root_scope.template.json": "cf850411c9f27f4aa9688924de090db6f3aef0b2d73c12796f941cb17aa168ac",
+  "operation_binding.json": "d01fe5a625b4102d3fffe509e89485f6fa438a9c67b1ffa32e96c3fe548e3e9d",
+  "outer_runner.py": "e8a28d35ffa794cbabc3486cd4b8f6238d82626158ffae4e25298bec36820f00",
+  "prepared_pins.json": "5f4164752ebc34453d636919abc8ae146525adc35b222763da20a82e8f4fa7b6",
+  "seal.py": "06facddc2877e35dd9859abcfddd11244179bc1c29c7443820ec033440c36833",
+  "start.json": "4e45e8702c71c9c77ce893c64c495da021e25731cf68b97b6ea0f7ece1798761",
+  "task_entry.py": "f3ce9d43c65d8aa6ab09534b1af3c4ead2dcd8e2230efeab54869deb17dbaf4c",
+  "work_record.json": "c797be7725aaa9580643365a9256769863c45dd0f2a748339f1b1da832efb758"
+}

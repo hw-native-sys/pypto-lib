@@ -1,0 +1,5 @@
+PyPTO environment activated: /mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local
+PYPTO_ROOT=/mnt/data/pyptouser/yangyaodong/code/pypto
+PTOAS_ROOT=/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local
+PTO_ISA_ROOT=/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/build/pto-isa
+V3_FINAL_HASH_AND_OWN_CLEANUP_PASS {"root45_and_V3_sources_and630_artifacts_unchanged": true, "owned_sealed630_unchanged": true, "exact_s32_evaluator_unchanged": true, "actual_static_plan_sha256": "dbca1fb4dd503b7d8b38e54bae4782c6e38f496bd405dd4637376ebd06487735", "actual_cpu_worker_and_wrapper_pids_present": {"122212": false, "121971": false}, "post_job_host_available_bytes": 1722411900928, "post_job_shm_used_bytes": 557056, "post_job_disk_available_bytes": 9545979002880, "native_jobs": 0, "no_static_tensor_payload_files": true, "time": 1794027335}

@@ -1,0 +1,13 @@
+{
+  "schema": "Root-F09-lifecycle-micro/1",
+  "approved": false,
+  "operation": "existing-toy-auto2-public-artifact-lifecycle",
+  "device_policy": "auto2",
+  "execution_mode": "ONBOARD",
+  "platform": "a2a3",
+  "ring_heap": [0, 0, 4294967296, 0],
+  "output_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_lifecycle_micro_1794081685",
+  "expires_at_epoch": 0,
+  "dependencies_manifest_sha256": "f91ffadae62417e705e9f90fa43cc10a178b331914de6d036b6610390c0fdd8a",
+  "scope": "NOT A GRANT. Existing corrected toy, two actual automatically allocated devices, public clone/from_dir/prepare/one exact32768 output12/close plus external terminal/raw lock-release audit. No F09 model fixture/weights, no new kernel compute, no full-PSS gate or model parity acceptance."
+}

@@ -1,0 +1,1 @@
+{"time": 1794032837.6758342, "changed_public_field_only": "ring_heap", "ring_heap": [0, 0, 4294967296, 0], "canonical_base_keys": ["backend_type", "distributed_config", "execution_mode"], "all_non_ring_fields_same_objects": true, "mode": "ExecutionMode.ONBOARD"}

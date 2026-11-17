@@ -1,0 +1,10 @@
+{
+  "status": "FAILED",
+  "started_epoch": 1794075053.2646527,
+  "first_error": {
+    "type": "SystemExit",
+    "message": "Native requires a NEW later explicit Root GO and --root-go; no native authorization in this unit.",
+    "traceback": "Traceback (most recent call last):\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/probe.py\", line 224, in native\n    raise SystemExit('Native requires a NEW later explicit Root GO and --root-go; no native authorization in this unit.')\nSystemExit: Native requires a NEW later explicit Root GO and --root-go; no native authorization in this unit.\n"
+  },
+  "ended_epoch": 1794075053.2647388
+}

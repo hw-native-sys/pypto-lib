@@ -1,0 +1,161 @@
+{
+  "schema": "configurable-postcase-bytefork/1",
+  "parent": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_configurable_generation_auditor_1794110902",
+  "parent_manifest_sha256": "497be161cbb684f2e9da5e1ddc95770cdfe1131b6b0b8669d62fc55f138cc70a",
+  "parent_FREEZE_sha256": "8298e9745586639e7184600a57c75c96169a0f39ccc9812de2abfcec1a351f88",
+  "byte_identical_inputs": [
+    {
+      "input_relative_path": "COMMANDS.md",
+      "owned_relative_path": "COMMANDS.md",
+      "sha256": "14fbef24ed89ad73a921fd040adb8ee736e61aad196d33e75c9781381b1cb2f5"
+    },
+    {
+      "input_relative_path": "REPORT.md",
+      "owned_relative_path": "input_auditor_REPORT.md",
+      "sha256": "b10bb9c22bca9edae184696a9165f2e35a7aa78fe6a1b381c033f0ff51cde09f"
+    },
+    {
+      "input_relative_path": "audit.py",
+      "owned_relative_path": "audit.py",
+      "sha256": "d0734c462329dafbb7db978657cfbb9b4eaa23b762072cab76bd8583b7369a94"
+    },
+    {
+      "input_relative_path": "bindings.REQUIRED.json",
+      "owned_relative_path": "bindings.REQUIRED.json",
+      "sha256": "c1cc61a2d1c69373dab3b7a63d6f0020a4396bc9251e68bd2446a9171acbcb83"
+    },
+    {
+      "input_relative_path": "cpu.log",
+      "owned_relative_path": "cpu.log",
+      "sha256": "5e268e122d53cf2d12f537ed26b797b7191d11fdc7f5c4da8d7e3bb24cb94d0d"
+    },
+    {
+      "input_relative_path": "cpu.status",
+      "owned_relative_path": "cpu.status",
+      "sha256": "e9d1ff712f06bb1de067759e33a7004938e8ac346c8609ffd9b60aa081851ac4"
+    },
+    {
+      "input_relative_path": "cpu_tested_core/runner.py",
+      "owned_relative_path": "cpu_tested_core/runner.py",
+      "sha256": "7db02d9610009223d8d0aa7a7f7686e7a26ab14157a2db10eff86f6911ca865e"
+    },
+    {
+      "input_relative_path": "cpu_tested_core/selfcheck.py",
+      "owned_relative_path": "cpu_tested_core/selfcheck.py",
+      "sha256": "bb456b91a79861eb5334c35575a752c82f6c90cd3c08eb57c449bb37bce6cf59"
+    },
+    {
+      "input_relative_path": "cpu_tested_core/shared_delta.py",
+      "owned_relative_path": "cpu_tested_core/shared_delta.py",
+      "sha256": "d1a9d1b777353c97848f245dad1b78b7623120b17a4ccec020430a4c0f6c0f0e"
+    },
+    {
+      "input_relative_path": "cpu_tested_core/topology_delta.py",
+      "owned_relative_path": "cpu_tested_core/topology_delta.py",
+      "sha256": "0b3d4d61f6cb374a3a86cd9debd896f866a4d047a2993fb702ab18cf83b1d419"
+    },
+    {
+      "input_relative_path": "finalize.py",
+      "owned_relative_path": "finalize.py",
+      "sha256": "4a992ba18a3243617ed4ad362e915b1d1df450a6412c769a77f44f9d5a425733"
+    },
+    {
+      "input_relative_path": "handoff.REQUIRED.json",
+      "owned_relative_path": "handoff.REQUIRED.json",
+      "sha256": "355e217b2dfd1ec27b4fd619adce9c72ffa73a6f7c75940b54728f5b9903a1ed"
+    },
+    {
+      "input_relative_path": "historical_to_final.patch",
+      "owned_relative_path": "historical_to_final.patch",
+      "sha256": "3a821246071e4ef859040329cd4e99e480c3039c51f87bb82debe8c18b470a5e"
+    },
+    {
+      "input_relative_path": "input_author_delta.py",
+      "owned_relative_path": "input_author_delta.py",
+      "sha256": "ed247c6fdf568c738422496edd8424fb7d7444ccdb8edc10d30f34a1dc349f89"
+    },
+    {
+      "input_relative_path": "post_cpu_core_delta.patch",
+      "owned_relative_path": "post_cpu_core_delta.patch",
+      "sha256": "0643627b30c9791044cf18b270f8e8ac3ab43fbafea27dceb81d928b32c686c2"
+    },
+    {
+      "input_relative_path": "runner.py",
+      "owned_relative_path": "runner.py",
+      "sha256": "7db02d9610009223d8d0aa7a7f7686e7a26ab14157a2db10eff86f6911ca865e"
+    },
+    {
+      "input_relative_path": "selfcheck.py",
+      "owned_relative_path": "selfcheck.py",
+      "sha256": "bb456b91a79861eb5334c35575a752c82f6c90cd3c08eb57c449bb37bce6cf59"
+    },
+    {
+      "input_relative_path": "selfcheck_output/durable_missing_bindings/execution.json",
+      "owned_relative_path": "selfcheck_output/durable_missing_bindings/execution.json",
+      "sha256": "c2b93897ad0088938c9021bd51ec6a19befe15ada6a99a6023a68a805b39d9fe"
+    },
+    {
+      "input_relative_path": "selfcheck_output/empty_bindings.json",
+      "owned_relative_path": "selfcheck_output/empty_bindings.json",
+      "sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+    },
+    {
+      "input_relative_path": "selfcheck_output/empty_handoff.json",
+      "owned_relative_path": "selfcheck_output/empty_handoff.json",
+      "sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+    },
+    {
+      "input_relative_path": "selfcheck_output/missing_entry.stderr",
+      "owned_relative_path": "selfcheck_output/missing_entry.stderr",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "input_relative_path": "selfcheck_output/missing_entry.stdout",
+      "owned_relative_path": "selfcheck_output/missing_entry.stdout",
+      "sha256": "899ea96ff9c50c5f5cf1fc95b3b29673b771f0414d71fe2d18282ccee1c54386"
+    },
+    {
+      "input_relative_path": "selfcheck_output/receipt.json",
+      "owned_relative_path": "selfcheck_output/receipt.json",
+      "sha256": "91bf4e03127b69afd3f5f1eefcaa3380c72714337121ab1a7376dcb1d0f62e5f"
+    },
+    {
+      "input_relative_path": "selfcheck_output/signature.json",
+      "owned_relative_path": "selfcheck_output/signature.json",
+      "sha256": "a793d4a3a6c281224833c5b29758b3265e0be122e7056615b4a6185275b0139e"
+    },
+    {
+      "input_relative_path": "shared_delta.py",
+      "owned_relative_path": "shared_delta.py",
+      "sha256": "70847573a89e59e40da87fc9b1f2352399cdefd82f9662add35109bfa20df6e8"
+    },
+    {
+      "input_relative_path": "tokenizer_reference.py",
+      "owned_relative_path": "tokenizer_reference.py",
+      "sha256": "817928b6591a59f13b48e8d06271e58840dc70a3bfbbb79eaeb18a6342c06fb1"
+    },
+    {
+      "input_relative_path": "topology_delta.py",
+      "owned_relative_path": "topology_delta.py",
+      "sha256": "0b3d4d61f6cb374a3a86cd9debd896f866a4d047a2993fb702ab18cf83b1d419"
+    },
+    {
+      "input_relative_path": "validation_lineage.json",
+      "owned_relative_path": "validation_lineage.json",
+      "sha256": "eeae285a21087a6eff1a4129acf828b39fcbf15ecdac42639516f6dfc7dffbe8"
+    },
+    {
+      "input_relative_path": "work_record.json",
+      "owned_relative_path": "input_auditor_work_record.json",
+      "sha256": "47366f4483d358aafba79dbf7914217e2f7adc5537f69e691d0cd2bfa8af6e1b"
+    }
+  ],
+  "renamed_inherited_seals": {
+    "FREEZE.json": "input_auditor_FREEZE.json",
+    "artifacts.json": "input_auditor_artifacts.json",
+    "REPORT.md": "input_auditor_REPORT.md",
+    "work_record.json": "input_auditor_work_record.json"
+  },
+  "auditor_code_modified": false,
+  "assembly_only_no_execution": true
+}

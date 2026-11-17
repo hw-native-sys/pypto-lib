@@ -1,0 +1,9 @@
+{
+  "status": "FINAL_READY_PARK",
+  "jobs": 0,
+  "native_authorized": false,
+  "future_runtime_write_paths": [
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_count_active_rank_shards_1794089142/work",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_count_active_rank_shards_1794089142_launch"
+  ]
+}

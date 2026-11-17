@@ -1,0 +1,2007 @@
+{
+  "status": "PASS_SMALL_N3_BINDING_ONLY",
+  "new_source45": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "reference_sha256": "95fa7a9b88dca411484d12bee71b5d1eaed97beea50d5963075c5f0219285a16",
+  "derived_receipt_sha256": "54dd589e994da582e9b3de992bdb31ea993a23295cdf97a0ce64367606ff6f76",
+  "geometry": {
+    "prefix": {
+      "tokens": 3,
+      "expert_layers": 1,
+      "static_arguments": 57,
+      "static_bytes_per_rank": 6463879104,
+      "nonstatic_tensor_bytes": 363060736,
+      "nonstatic_upper_bound_bytes": 7609876736,
+      "input_ids": [
+        16,
+        3
+      ],
+      "last_valid_row": 2,
+      "parameters": {
+        "input_ids": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3
+          ],
+          "dtype": "torch.int64"
+        },
+        "embed_weight": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            32320,
+            5120
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "initial_pre": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            4
+          ],
+          "dtype": "torch.float32"
+        },
+        "final_norm": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            5120
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "lm_head_weight": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            32320,
+            5120
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "position_ids": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3
+          ],
+          "dtype": "torch.int32"
+        },
+        "request_ids": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3
+          ],
+          "dtype": "torch.int32"
+        },
+        "window_slots": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3
+          ],
+          "dtype": "torch.int64"
+        },
+        "window_indices": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            128
+          ],
+          "dtype": "torch.int32"
+        },
+        "index_block_table": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            2
+          ],
+          "dtype": "torch.int32"
+        },
+        "state_block_table": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            1
+          ],
+          "dtype": "torch.int32"
+        },
+        "rope_cos": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            32
+          ],
+          "dtype": "torch.float32"
+        },
+        "rope_sin": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            32
+          ],
+          "dtype": "torch.float32"
+        },
+        "rope_cos_swa": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            32
+          ],
+          "dtype": "torch.float32"
+        },
+        "rope_sin_swa": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            32
+          ],
+          "dtype": "torch.float32"
+        },
+        "c2a_compressed_slots": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3
+          ],
+          "dtype": "torch.int64"
+        },
+        "c2a_compressed_lens": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3
+          ],
+          "dtype": "torch.int32"
+        },
+        "c2a_compressed_cos": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            32
+          ],
+          "dtype": "torch.float32"
+        },
+        "c2a_compressed_sin": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            32
+          ],
+          "dtype": "torch.float32"
+        },
+        "c1a_compressed_slots": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3
+          ],
+          "dtype": "torch.int64"
+        },
+        "c1a_compressed_lens": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3
+          ],
+          "dtype": "torch.int32"
+        },
+        "c1a_compressed_cos": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            32
+          ],
+          "dtype": "torch.float32"
+        },
+        "c1a_compressed_sin": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            32
+          ],
+          "dtype": "torch.float32"
+        },
+        "hc_attn_fn": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            32,
+            20480
+          ],
+          "dtype": "torch.float32"
+        },
+        "hc_attn_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            3
+          ],
+          "dtype": "torch.float32"
+        },
+        "hc_attn_base": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            24
+          ],
+          "dtype": "torch.float32"
+        },
+        "attn_norm_w": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            5120
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "wq_a": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            5120,
+            1280
+          ],
+          "dtype": "torch.int8"
+        },
+        "wq_a_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            1280
+          ],
+          "dtype": "torch.float32"
+        },
+        "q_norm_w": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            1280
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "wq_b": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            1280,
+            8192
+          ],
+          "dtype": "torch.int8"
+        },
+        "wq_b_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            8192
+          ],
+          "dtype": "torch.float32"
+        },
+        "wkv": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            5120,
+            512
+          ],
+          "dtype": "torch.int8"
+        },
+        "wkv_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            512
+          ],
+          "dtype": "torch.float32"
+        },
+        "kv_norm_w": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            512
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "sink": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            16
+          ],
+          "dtype": "torch.float32"
+        },
+        "wo_a": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            2,
+            1024,
+            4096
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "wo_b": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            5120,
+            2048
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "hc_ffn_fn": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            32,
+            20480
+          ],
+          "dtype": "torch.float32"
+        },
+        "hc_ffn_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            3
+          ],
+          "dtype": "torch.float32"
+        },
+        "hc_ffn_base": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            24
+          ],
+          "dtype": "torch.float32"
+        },
+        "ffn_norm_w": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            5120
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "gate_weight": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            384,
+            5120
+          ],
+          "dtype": "torch.float32"
+        },
+        "gate_bias": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            384
+          ],
+          "dtype": "torch.float32"
+        },
+        "shared_w1": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            5120,
+            2304
+          ],
+          "dtype": "torch.int8"
+        },
+        "shared_w1_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            2304
+          ],
+          "dtype": "torch.float32"
+        },
+        "shared_w3": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            5120,
+            2304
+          ],
+          "dtype": "torch.int8"
+        },
+        "shared_w3_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            2304
+          ],
+          "dtype": "torch.float32"
+        },
+        "shared_w2": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            2304,
+            5120
+          ],
+          "dtype": "torch.int8"
+        },
+        "shared_w2_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            5120
+          ],
+          "dtype": "torch.float32"
+        },
+        "w1": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            24,
+            5120,
+            2304
+          ],
+          "dtype": "torch.int8"
+        },
+        "w1_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            24,
+            2304
+          ],
+          "dtype": "torch.float32"
+        },
+        "w3": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            24,
+            5120,
+            2304
+          ],
+          "dtype": "torch.int8"
+        },
+        "w3_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            24,
+            2304
+          ],
+          "dtype": "torch.float32"
+        },
+        "w2": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            24,
+            2304,
+            5120
+          ],
+          "dtype": "torch.int8"
+        },
+        "w2_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            24,
+            5120
+          ],
+          "dtype": "torch.float32"
+        },
+        "c2a_comp_wkv": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            512,
+            5120
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "c2a_comp_wgate": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            512,
+            5120
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "c2a_comp_norm": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            512
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "c2a_idx_wq_b": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            1280,
+            4096
+          ],
+          "dtype": "torch.int8"
+        },
+        "c2a_idx_wq_b_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            4096
+          ],
+          "dtype": "torch.float32"
+        },
+        "c2a_idx_weights_proj": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            5120,
+            32
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "c2a_idx_wk": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            128,
+            512
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "c2a_idx_k_norm": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            128
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "c1a_comp_wkv": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            512,
+            5120
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "c1a_comp_norm": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            512
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "c1a_idx_wq_b": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1280,
+            4096
+          ],
+          "dtype": "torch.int8"
+        },
+        "c1a_idx_wq_b_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            4096
+          ],
+          "dtype": "torch.float32"
+        },
+        "c1a_idx_weights_proj": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            5120,
+            32
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "c1a_idx_wk": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            128,
+            512
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "c1a_idx_k_norm": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            128
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "re_idx_wq_b": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            4,
+            1280,
+            4096
+          ],
+          "dtype": "torch.int8"
+        },
+        "re_idx_wq_b_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            4,
+            4096
+          ],
+          "dtype": "torch.float32"
+        },
+        "re_idx_weights_proj": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            4,
+            5120,
+            32
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "engram_lookup": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            2,
+            3,
+            6144
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "engram_wkv": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            2,
+            25600,
+            6144
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "engram_qk": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            2,
+            4,
+            5120
+          ],
+          "dtype": "torch.float32"
+        },
+        "engram_rotation": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            32,
+            32
+          ],
+          "dtype": "torch.float32"
+        },
+        "engram_enabled": {
+          "kind": "scalar",
+          "shape": [],
+          "dtype": "torch.int32"
+        },
+        "window_cache": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            2,
+            128,
+            1,
+            512
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "compressed_cache_c2a": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            2,
+            128,
+            1,
+            512
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "index_cache_c2a": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            2,
+            128,
+            1,
+            128
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "state_cache_c2a": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            1,
+            2,
+            1024
+          ],
+          "dtype": "torch.float32"
+        },
+        "compressed_cache_c1a": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            2,
+            128,
+            1,
+            512
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "index_cache_c1a": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            2,
+            128,
+            1,
+            128
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "topk_indices_c2a": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            3,
+            512
+          ],
+          "dtype": "torch.int32"
+        },
+        "topk_values_c2a": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            3,
+            512
+          ],
+          "dtype": "torch.float32"
+        },
+        "pool_block_ids_c2a": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            3,
+            2048
+          ],
+          "dtype": "torch.int32"
+        },
+        "pool_block_counts_c2a": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            3
+          ],
+          "dtype": "torch.int32"
+        },
+        "topk_indices_c1a": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            5,
+            3,
+            512
+          ],
+          "dtype": "torch.int32"
+        },
+        "topk_values_c1a": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            5,
+            3,
+            512
+          ],
+          "dtype": "torch.float32"
+        },
+        "pool_block_ids_c1a": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            5,
+            3,
+            2048
+          ],
+          "dtype": "torch.int32"
+        },
+        "pool_block_counts_c1a": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            5,
+            3
+          ],
+          "dtype": "torch.int32"
+        },
+        "token_counts": {
+          "kind": "tensor",
+          "shape": [
+            16
+          ],
+          "dtype": "torch.int32"
+        },
+        "x_hc": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            4,
+            5120
+          ],
+          "dtype": "torch.float32"
+        },
+        "pre_mix": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            4
+          ],
+          "dtype": "torch.float32"
+        },
+        "layer_x_hc": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            3,
+            4,
+            5120
+          ],
+          "dtype": "torch.float32"
+        },
+        "layer_pre_mix": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            3,
+            4
+          ],
+          "dtype": "torch.float32"
+        },
+        "final_hidden": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            5120
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "logits": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            32320
+          ],
+          "dtype": "torch.float32"
+        }
+      }
+    },
+    "decode": {
+      "tokens": 1,
+      "expert_layers": 1,
+      "static_arguments": 57,
+      "static_bytes_per_rank": 6463879104,
+      "nonstatic_tensor_bytes": 247111680,
+      "nonstatic_upper_bound_bytes": 247111680,
+      "input_ids": [
+        16,
+        1
+      ],
+      "last_valid_row": 0,
+      "parameters": {
+        "input_ids": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1
+          ],
+          "dtype": "torch.int64"
+        },
+        "embed_weight": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            32320,
+            5120
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "initial_pre": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            4
+          ],
+          "dtype": "torch.float32"
+        },
+        "x_hc": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            4,
+            5120
+          ],
+          "dtype": "torch.float32"
+        },
+        "pre_mix": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            4
+          ],
+          "dtype": "torch.float32"
+        },
+        "token_counts": {
+          "kind": "tensor",
+          "shape": [
+            16
+          ],
+          "dtype": "torch.int32"
+        },
+        "hc_attn_fn": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            32,
+            20480
+          ],
+          "dtype": "torch.float32"
+        },
+        "hc_attn_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            3
+          ],
+          "dtype": "torch.float32"
+        },
+        "hc_attn_base": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            24
+          ],
+          "dtype": "torch.float32"
+        },
+        "attn_norm_w": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            5120
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "wq_a": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            5120,
+            1280
+          ],
+          "dtype": "torch.int8"
+        },
+        "wq_a_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            1280
+          ],
+          "dtype": "torch.float32"
+        },
+        "q_norm_w": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            1280
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "wq_b": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            1280,
+            8192
+          ],
+          "dtype": "torch.int8"
+        },
+        "wq_b_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            8192
+          ],
+          "dtype": "torch.float32"
+        },
+        "wkv": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            5120,
+            512
+          ],
+          "dtype": "torch.int8"
+        },
+        "wkv_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            512
+          ],
+          "dtype": "torch.float32"
+        },
+        "kv_norm_w": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            512
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "sink": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            16
+          ],
+          "dtype": "torch.float32"
+        },
+        "wo_a": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            2,
+            1024,
+            4096
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "wo_b": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            5120,
+            2048
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "hc_ffn_fn": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            32,
+            20480
+          ],
+          "dtype": "torch.float32"
+        },
+        "hc_ffn_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            3
+          ],
+          "dtype": "torch.float32"
+        },
+        "hc_ffn_base": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            24
+          ],
+          "dtype": "torch.float32"
+        },
+        "ffn_norm_w": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            5120
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "gate_weight": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            384,
+            5120
+          ],
+          "dtype": "torch.float32"
+        },
+        "gate_bias": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            384
+          ],
+          "dtype": "torch.float32"
+        },
+        "shared_w1": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            5120,
+            2304
+          ],
+          "dtype": "torch.int8"
+        },
+        "shared_w1_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            2304
+          ],
+          "dtype": "torch.float32"
+        },
+        "shared_w3": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            5120,
+            2304
+          ],
+          "dtype": "torch.int8"
+        },
+        "shared_w3_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            2304
+          ],
+          "dtype": "torch.float32"
+        },
+        "shared_w2": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            2304,
+            5120
+          ],
+          "dtype": "torch.int8"
+        },
+        "shared_w2_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            5120
+          ],
+          "dtype": "torch.float32"
+        },
+        "w1": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            24,
+            5120,
+            2304
+          ],
+          "dtype": "torch.int8"
+        },
+        "w1_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            24,
+            2304
+          ],
+          "dtype": "torch.float32"
+        },
+        "w3": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            24,
+            5120,
+            2304
+          ],
+          "dtype": "torch.int8"
+        },
+        "w3_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            24,
+            2304
+          ],
+          "dtype": "torch.float32"
+        },
+        "w2": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            24,
+            2304,
+            5120
+          ],
+          "dtype": "torch.int8"
+        },
+        "w2_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            24,
+            5120
+          ],
+          "dtype": "torch.float32"
+        },
+        "c2a_comp_wkv": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            512,
+            5120
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "c2a_comp_wgate": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            512,
+            5120
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "c2a_comp_norm": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            512
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "c2a_idx_wq_b": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            1280,
+            4096
+          ],
+          "dtype": "torch.int8"
+        },
+        "c2a_idx_wq_b_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            4096
+          ],
+          "dtype": "torch.float32"
+        },
+        "c2a_idx_weights_proj": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            5120,
+            32
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "c2a_idx_wk": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            128,
+            512
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "c2a_idx_k_norm": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            128
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "c1a_comp_wkv": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            512,
+            5120
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "c1a_comp_norm": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            512
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "c1a_idx_wq_b": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            1280,
+            4096
+          ],
+          "dtype": "torch.int8"
+        },
+        "c1a_idx_wq_b_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            4096
+          ],
+          "dtype": "torch.float32"
+        },
+        "c1a_idx_weights_proj": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            5120,
+            32
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "c1a_idx_wk": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            128,
+            512
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "c1a_idx_k_norm": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            128
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "re_idx_wq_b": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            4,
+            1280,
+            4096
+          ],
+          "dtype": "torch.int8"
+        },
+        "re_idx_wq_b_scale": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            4,
+            4096
+          ],
+          "dtype": "torch.float32"
+        },
+        "re_idx_weights_proj": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            4,
+            5120,
+            32
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "position_ids": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1
+          ],
+          "dtype": "torch.int32"
+        },
+        "request_ids": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1
+          ],
+          "dtype": "torch.int32"
+        },
+        "rope_cos": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            32
+          ],
+          "dtype": "torch.float32"
+        },
+        "rope_sin": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            32
+          ],
+          "dtype": "torch.float32"
+        },
+        "rope_cos_swa": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            32
+          ],
+          "dtype": "torch.float32"
+        },
+        "rope_sin_swa": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            32
+          ],
+          "dtype": "torch.float32"
+        },
+        "c2a_compressed_slots": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1
+          ],
+          "dtype": "torch.int64"
+        },
+        "c2a_compressed_lens": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1
+          ],
+          "dtype": "torch.int32"
+        },
+        "c2a_compressed_cos": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            32
+          ],
+          "dtype": "torch.float32"
+        },
+        "c2a_compressed_sin": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            32
+          ],
+          "dtype": "torch.float32"
+        },
+        "c1a_compressed_slots": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1
+          ],
+          "dtype": "torch.int64"
+        },
+        "c1a_compressed_lens": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1
+          ],
+          "dtype": "torch.int32"
+        },
+        "c1a_compressed_cos": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            32
+          ],
+          "dtype": "torch.float32"
+        },
+        "c1a_compressed_sin": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            32
+          ],
+          "dtype": "torch.float32"
+        },
+        "window_slots": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1
+          ],
+          "dtype": "torch.int64"
+        },
+        "window_indices": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            128
+          ],
+          "dtype": "torch.int32"
+        },
+        "index_block_table": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            2
+          ],
+          "dtype": "torch.int32"
+        },
+        "state_block_table": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            1
+          ],
+          "dtype": "torch.int32"
+        },
+        "engram_lookup": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            2,
+            1,
+            6144
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "engram_wkv": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            2,
+            25600,
+            6144
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "engram_qk": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            2,
+            4,
+            5120
+          ],
+          "dtype": "torch.float32"
+        },
+        "engram_rotation": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            32,
+            32
+          ],
+          "dtype": "torch.float32"
+        },
+        "engram_enabled": {
+          "kind": "scalar",
+          "shape": [],
+          "dtype": "torch.int32"
+        },
+        "window_cache": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            2,
+            128,
+            1,
+            512
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "compressed_cache_c2a": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            2,
+            128,
+            1,
+            512
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "index_cache_c2a": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            2,
+            128,
+            1,
+            128
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "state_cache_c2a": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            3,
+            1,
+            2,
+            1024
+          ],
+          "dtype": "torch.float32"
+        },
+        "compressed_cache_c1a": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            2,
+            128,
+            1,
+            512
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "index_cache_c1a": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            2,
+            128,
+            1,
+            128
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "topk_indices": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            8,
+            1,
+            512
+          ],
+          "dtype": "torch.int32"
+        },
+        "topk_values": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            8,
+            1,
+            512
+          ],
+          "dtype": "torch.float32"
+        },
+        "pool_block_ids": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            8,
+            1,
+            2048
+          ],
+          "dtype": "torch.int32"
+        },
+        "pool_block_counts": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            8,
+            1
+          ],
+          "dtype": "torch.int32"
+        },
+        "layer_x_hc": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            1,
+            4,
+            5120
+          ],
+          "dtype": "torch.float32"
+        },
+        "layer_pre_mix": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            40,
+            1,
+            4
+          ],
+          "dtype": "torch.float32"
+        },
+        "final_norm": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            5120
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "lm_head_weight": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            32320,
+            5120
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "final_hidden": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "logits": {
+          "kind": "tensor",
+          "shape": [
+            16,
+            1,
+            32320
+          ],
+          "dtype": "torch.float32"
+        }
+      }
+    }
+  },
+  "source_and_ABI_negatives": [
+    {
+      "label": "old-source-producer",
+      "reason": "derived/reference inventory cannot replace current producer"
+    },
+    {
+      "label": "one-math-source-mutant",
+      "reason": "derived/reference inventory cannot replace current producer"
+    },
+    {
+      "label": "derived-inventory-as-producer",
+      "reason": "derived/reference inventory cannot replace current producer"
+    },
+    {
+      "label": "receipt-wrong-N-2",
+      "reason": "reference recipe/source/Torch pin mismatch"
+    },
+    {
+      "label": "receipt-wrong-N-128",
+      "reason": "reference recipe/source/Torch pin mismatch"
+    },
+    {
+      "label": "ABI-wrong-N-prefix",
+      "reason": "wrong phase/N/concrete ABI"
+    },
+    {
+      "label": "ABI-wrong-N-decode",
+      "reason": "wrong phase/N/concrete ABI"
+    },
+    {
+      "label": "ABI-wrong-input-shape",
+      "reason": "wrong phase/N/concrete ABI"
+    },
+    {
+      "label": "ABI-real40-not-E1",
+      "reason": "wrong expert ABI"
+    }
+  ],
+  "clone_proofs": [
+    {
+      "phase": "prefix",
+      "mutable_count": 16,
+      "passes": [
+        "unconditioned",
+        "staged"
+      ],
+      "initial_pristine": true,
+      "scope": "actual copied clone prelude only; no forward arithmetic"
+    },
+    {
+      "phase": "decode",
+      "mutable_count": 12,
+      "passes": [
+        "unconditioned",
+        "staged"
+      ],
+      "initial_pristine": true,
+      "scope": "actual copied clone prelude only; no forward arithmetic"
+    }
+  ],
+  "decode3_C2_plan": {
+    "position": 3,
+    "logical_row": 1,
+    "physical_slots": [
+      [
+        1
+      ],
+      [
+        1
+      ],
+      [
+        1
+      ],
+      [
+        1
+      ],
+      [
+        1
+      ],
+      [
+        1
+      ],
+      [
+        1
+      ],
+      [
+        1
+      ],
+      [
+        1
+      ],
+      [
+        1
+      ],
+      [
+        1
+      ],
+      [
+        1
+      ],
+      [
+        1
+      ],
+      [
+        1
+      ],
+      [
+        1
+      ],
+      [
+        1
+      ]
+    ],
+    "source_pair": [
+      2,
+      3
+    ],
+    "metadata_only": true,
+    "actual_returned_partial_state": "future native gate, not executed"
+  },
+  "import_restore": true,
+  "four_whitelisted_AST_modules_verified": true,
+  "NPU": 0,
+  "full_fixture": 0,
+  "forward_refs": 0
+}

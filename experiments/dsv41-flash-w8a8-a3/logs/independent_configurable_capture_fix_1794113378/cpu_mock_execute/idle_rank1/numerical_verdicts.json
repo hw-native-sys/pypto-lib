@@ -1,0 +1,22 @@
+{
+  "routed": {
+    "passed": true,
+    "detail": "",
+    "shape": [
+      2,
+      1,
+      5120
+    ],
+    "dtype": "torch.bfloat16"
+  },
+  "counts": {
+    "passed": true,
+    "detail": "",
+    "shape": [
+      2,
+      2,
+      192
+    ],
+    "dtype": "torch.int32"
+  }
+}

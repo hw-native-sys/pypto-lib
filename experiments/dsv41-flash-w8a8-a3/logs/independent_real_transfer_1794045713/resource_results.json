@@ -1,0 +1,77 @@
+{
+  "status": "PASS_CPU_RESOURCE_METADATA_PLANNING_ONLY",
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "fresh_review_process_resources": {
+    "epoch": 1794046309.4351325,
+    "host": 1722714181632,
+    "disk": 9469605969920,
+    "shm": 1079343157248,
+    "parent_memory_sample": {
+      "Rss": 781254656,
+      "Pss": 778079232
+    }
+  },
+  "installed_contract": {
+    "platform": "a2a3",
+    "runtime": "tensormap_and_ringbuffer",
+    "library_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/build/lib/a2a3/onboard/tensormap_and_ringbuffer/libhost_runtime.so",
+    "library_sha256": "24434f8879030ef1b1f31e5fc2ecce683e392d4f1baeb5bcee852fb183976e5c",
+    "resources": [
+      {
+        "kind": 4,
+        "resource_class": 0,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 1,
+        "resource_class": 1,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 2,
+        "resource_class": 1,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 3,
+        "resource_class": 1,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 5,
+        "resource_class": 2,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 6,
+        "resource_class": 2,
+        "bytes_per_copy": 0
+      }
+    ],
+    "shared_GM_copy_count": 1,
+    "limit": "selected pinned PROGRAM backend only; identity capacity is not resident GM banks"
+  },
+  "requirements_PLANNING": {
+    "HOST": 68719476736,
+    "DISK": 2147483648,
+    "SHM": 17179869184,
+    "per_rank_after_full57": 18088299200,
+    "prewarm_before_full57_minimum": 57713115776
+  },
+  "largest_source_raw_plus_bytearray_bytes": 2647654400,
+  "retained_embedding_backing_bytes": 1323827200,
+  "visible_embedding_shard_bytes": 330956800,
+  "readback_serial_bytes": 330956800,
+  "public_staging_chunk_bytes": 67108864,
+  "additional128MiB": "conservative NEW device reserve policy, not measured staging; public fallback staging itself is host/shared",
+  "old_calibration_created_at_epoch": 1794041056.8035889,
+  "old_calibration_age_seconds_observed_now": 5252.633667945862,
+  "old_calibration_not_refreshed_or_reauthorized": true,
+  "new_operation_authorization_required": true,
+  "current_device_free": null,
+  "full40_initialized_upload_or_forward_peak": null,
+  "NPU": 0,
+  "real_checkpoint_tensor_payload": 0,
+  "actual_grant_created": false,
+  "limits": "fresh CPU resource snapshot only; device live pre/post/final-fresh strict guards remain future execution prerequisites"
+}

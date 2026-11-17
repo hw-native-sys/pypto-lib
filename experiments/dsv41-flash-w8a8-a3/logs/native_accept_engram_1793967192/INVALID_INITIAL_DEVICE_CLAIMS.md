@@ -1,0 +1,5 @@
+# Initial allocated-helper runs are simulator evidence
+
+Do not use order/,layers/,basis custom controls or cap_attempt1/negative.json as onboard acceptance. Helpers omitted execution_mode; golden.normalize_config produces ExecutionMode.SIM. Original order/layer distributed_meta.json explicitly says a2a3sim. Six basis custom controls and cap old64 control likewise ran SIM. Allocating devices did not change execution mode. Initial progress messages and interim REVIEW claims were retracted immediately after discovery. Current corrected evidence is onboard_order/ and onboard_layers/, explicit execution_mode=False, metadata a2a3 and native Callable images.
+
+Standalone default invocations passed execution_mode=False correctly; their halMemCtl EACCES/RunPreparationRefused failures are actual ONBOARD runtime blockers, not numerical controls or passes. defaults_attempt1/,cap_attempt1/,basis/default.log and sequential defaults/ preserve these failures. All source/evidence hashes stay fixed. No model or protected-runtime fixes applied.

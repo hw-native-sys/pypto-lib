@@ -1,0 +1,12 @@
+{
+  "scope": "CPU fake child processes only; no actual grant/productCLI/NPU",
+  "runner_sha256": "ce8682e1f9616c96c1f5a8878481ce46560b9d0a0d1be67c577d5d074d0fe2aa",
+  "immediate_observation_failure_still_waits_terminal": true,
+  "failed_atomic_launch_receipt_still_waits_terminal": true,
+  "first_wait_interruption_supervises_same_child": true,
+  "POST_EXEC_only_after_terminal": true,
+  "primary_CLI_exit7_preserved": true,
+  "thread_spawned_child_in_own_tree": true,
+  "launch_identity_receipt_atomic_fsynced_by_checked_write": true,
+  "all_fake_children_reaped": true
+}

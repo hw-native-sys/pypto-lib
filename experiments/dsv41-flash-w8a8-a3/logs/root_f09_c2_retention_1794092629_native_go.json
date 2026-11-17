@@ -1,0 +1,23 @@
+{
+  "schema": "Root-F09-fullentry-operation/1",
+  "approved": true,
+  "native16_authorized": true,
+  "count_controls_accepted": true,
+  "stage": "full-capture",
+  "requested_profile": "decode_capacity2",
+  "pins_sha256": "7a2038e79d439d490cdc380dfbd9170a935914c222038648256882a35d9417b2",
+  "prequeue_sha256": "ba7b594b84742d7d26a2b9fc852e7de095199696585e009e6af27dba4a941bee",
+  "lifecycle_acceptance": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/root_f09_c2_lifecycle_acceptance_1794094092.json",
+  "lifecycle_acceptance_sha256": "775dc927e7b77bf372582495d31a907b6bea96152fc47422f75a68e9f6db0825",
+  "source_manifest_sha256": "8153c7f040bef51900a6e6c9ff27b018279b7503f31d50ec5488457e49770b28",
+  "work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_c2_retention_1794092629/work",
+  "root_go_id": "observer-20261108-f09-c2-active-write-threecall-native16",
+  "expires_at_epoch": 1794097925.2582917,
+  "scope": "ONE new8153 C2-active-write E1 synthetic THREECALL full native capture ONLY, exactd5e8 launcher/newwork/new775dc lifecycleprereq. Stage after actual16distinct allocation false receipt/fresh resources. Freshfull510dd/meta8ba; require actualregistry119rows116unique coverage/newpreparedreceipt. Sameowner3calls6durableinitialactual payloads+PASSretention descriptors/normalclose. Firstfailure preserveactualpostBEFOREgate/partialcounts/primary+cleanup STOP/no blindretry. Separate CPU171 RootGO only after same terminal0/raw16/knownbirthcleanup. No sourceapplication/realweights/genericshape/wholeparity authority; oldfailed8a37/fdec immutable.",
+  "created_at_epoch": 1794094425.2582917,
+  "independent_source_review_sha256": "889b3d8db668c2f32fb49e2c15043a9f5e7af9adbed5b8bd5859e4bc3c932b7a",
+  "independent_prequeue_result_sha256": "abf9e67b568dee9dca3138c7cdf9e68f1b0a46f05ca2083e2e21890a59f9816a",
+  "public_hbm_reserve": 10157899716,
+  "postprewarm_prestatic_hbm_each_rank": 16621778820,
+  "execution_prerequisite": "Review FINAL seal completed before submit; Main64bb/source889b/prequeue resultabf9 and pins7a20 immutable. No further Root/user question needed when this prerequisite holds."
+}

@@ -1,0 +1,11 @@
+[
+  {
+    "id": "c2-referencefix-1794016901-1794017055",
+    "start": 1794016901,
+    "end": 1794017055,
+    "duration": 154,
+    "basis": "measured new unit baseline preservation mtime to final seal",
+    "agent": "c2_state_precision",
+    "status": "PARKED"
+  }
+]

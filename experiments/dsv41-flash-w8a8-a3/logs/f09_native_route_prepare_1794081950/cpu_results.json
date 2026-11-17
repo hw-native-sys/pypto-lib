@@ -1,0 +1,20 @@
+{
+  "pass": true,
+  "controls": [
+    "default_refusal",
+    "missing_actual_lifecycle_prerequisite"
+  ],
+  "resource_plan_sha256": "e897ebf222eb0ef0744484237b9ac6edb2dd002d3c7d20e85d2db886a0be47cc",
+  "materialized_tensor_bytes": 0,
+  "checkpoint_header_bytes": 0,
+  "compiled": false,
+  "prepared": false,
+  "native": false,
+  "schema_assertions": [
+    "E1/57static",
+    "B2/T2/pages4/state2",
+    "192/96/192",
+    "probe16x16x24"
+  ],
+  "scope": "metadata/import/defaults only; no lifecycle or native correctness proof"
+}

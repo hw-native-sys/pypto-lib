@@ -1,0 +1,18 @@
+{
+  "OWNERSHIP.md": "6842837d5e855716fe66b1ff6a424ab75e295aacb29f771a2eb793e5a4a14edf",
+  "PREPARED.md": "62020044539418a0821e520f555239922d8e6e23929e73f0041452b1aa899876",
+  "REPORT.md": "f94d85f5be6c5d857c447fea479f5bc656c45ba45c3b75783a5b890277ccf7ba",
+  "audit.py": "ce9063d63d7623fc975bcea691feb1b14c2ef06d622766fc187dc931e4c4c21d",
+  "audit_results.json": "1126bf4f8b34a0d4171ffcceb041a8e7102e380f2677da8a290e4cc156be59a9",
+  "audit_task.log": "040b4d802768cfc9189f15b8cd124d6f814d47e792600ec60d6afa33bee6deb3",
+  "audit_task.status": "e9d1ff712f06bb1de067759e33a7004938e8ac346c8609ffd9b60aa081851ac4",
+  "closure.json": "a6e0835fada30239a88b42ae13c12e29c344596639e1e14b438c9e5579c78dd8",
+  "delta_from_first_audit.patch": "3a1d0502a8df9c673ecb71fb7e4af541a6d0bb286d2ac1f3069b81696e2f56fb",
+  "first_audit_source.py": "91f779a578bfd1828bc2d5cb02405b32e7a715b2583063dc7a168ba59e665f0c",
+  "handoff.json": "df2365ddb5ff79ece01e516596e7c19e687818d7a7d604ac9a12baf1a7d15edf",
+  "lineage.json": "fcea6db7aaab3c88f7d0ddbbbcb10cbac9a5dd9565f2f4f77fc3b848d161831f",
+  "prepared_receipt.json": "64dc22aabaf29e2adddbf8c339fc188d1a9e7c7ee78ade3ae36d7bf6c167ed84",
+  "queue_snapshot.json": "881f2c0ae64fa2147c9de2d6d83532f48f4ac5490bdd4b941d9fa789720655f1",
+  "reuse_interruption.json": "0365b65ff5a3e22ceec627d71e512ba31de1678cf04a68f74f5417fde910e1e2",
+  "work_record.json": "cdeb58a327dfab1a68048537fa7acc67be68655eab6c1efaf080f4f14ad31879"
+}

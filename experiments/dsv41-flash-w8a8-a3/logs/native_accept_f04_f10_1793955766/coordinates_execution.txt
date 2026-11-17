@@ -1,0 +1,4 @@
+start=1793956114
+devices=0
+end=1793956274
+exit=0

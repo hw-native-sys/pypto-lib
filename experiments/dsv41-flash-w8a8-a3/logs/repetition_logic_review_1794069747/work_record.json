@@ -1,0 +1,18 @@
+{
+  "role": "review-agent",
+  "artifact_started_epoch": 1794069747,
+  "earlier_read_start_epoch": null,
+  "earlier_read_start_note": "Read-only investigation preceded first timestamp capture; exact beginning not recorded.",
+  "owned_directory": "experiments/dsv41-flash-w8a8-a3/logs/repetition_logic_review_1794069747",
+  "shared_writes": 0,
+  "root_import_policy": "Root imports findings once; this review does not modify shared records.",
+  "scope": "source/log/checkpoint JSON plus one authorized synthetic CPU actual-reference comparison; no payload/NPU/model forward",
+  "report_written_epoch": 1794069995,
+  "state": "PARKED",
+  "final_sealed_epoch": 1794069995,
+  "cpu_task_id": "task_20261108_004524_320911724075",
+  "cpu_task_exit": 0,
+  "cpu_result_epoch": 1794069930.5755281,
+  "cpu_device_allocation": "none",
+  "earlier_seal_note": "Initial source-evidence seal superseded by Root-requested CPU microproof and this final seal."
+}

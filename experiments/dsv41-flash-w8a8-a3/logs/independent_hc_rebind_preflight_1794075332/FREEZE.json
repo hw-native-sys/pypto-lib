@@ -1,0 +1,9 @@
+{
+  "HC_apply_compile_native": false,
+  "REPORT_sha256": "7941f1c47ca204d6c793a620c23a942ece1af2a457df28a5ecefd3d693a3ad2c",
+  "artifacts_count": 23,
+  "artifacts_sha256": "e8abd71dcca0932eda0764f7ac068d3600d53708ceb6d7b6d5a2497d0ec7ebc5",
+  "epoch": 1794075742,
+  "source45": "b3e19fd001c74f7a5b497c791c01924ca09c0678df66114fce599e890d8fee06",
+  "state": "FINAL_PARK_READONLY"
+}

@@ -1,0 +1,16 @@
+{
+  "context": {
+    "platform": "a2a3",
+    "pto_isa_revision": "f83d4b7e4be0a4ca9805944ae2d9ce8c84e581f7",
+    "runtime_name": "tensormap_and_ringbuffer",
+    "runtime_revision": "31f9e72ee6832cd198b77df18c1c305e7fd83676",
+    "schema": 2
+  },
+  "files": {
+    "cache/incore_a8356761868a6eb2f4dd230d_aiv_compressor_project_aiv_a2a3.bin": "efb465ddb8ea94be4dce7c4e476c9f0d9ea21abea10a2af9b527ac573a4d86a6",
+    "cache/incore_fc854cb95ed87c6a3bdde3d5_aic_compressor_project_aic_a2a3.bin": "67a6693fbdaf6809765b83a81e83dc0f52caea1ecd26d36e0cea12f21f72f535",
+    "kernels/aic/compressor_project_aic_fc854cb95ed87c6a3bdde3d5.o": "2180174d10bf4791a044734b7bc5ecb3e043e6d4d08cc593ee69e1da2cc7b779",
+    "kernels/aiv/compressor_project_aiv_a8356761868a6eb2f4dd230d.o": "a31ee8e8f63c8f5b5f9a3b30c181f28e624b57d0c0d2a57fe92900abdf56d226",
+    "orchestration/entry.so": "357ce1cb0da22f6e3343bd642c02943c29e52795a09598a1e6debae75aecb5a0"
+  }
+}

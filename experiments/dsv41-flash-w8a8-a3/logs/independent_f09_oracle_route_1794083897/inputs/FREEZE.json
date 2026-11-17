@@ -1,0 +1,17 @@
+{
+  "status": "FINAL_PARK",
+  "artifacts": 83,
+  "manifest_sha256": "bb1b9c6fedf69cd205218550b0cecf4d58ca5b537ae867ba829b3ee808e677d1",
+  "adapter": "412cb48d4625d54958f949588cdf9d9d0b6457137b4e27a6de17c0d84582e295",
+  "route": "12872cd0f5b8d5a12b84a329e66017f498381c727c1a44bff7cd251e2b877bf8",
+  "oracle_integrity": "e45c7529d6c34cd57712a7d346ec612641896e38ab98ff88017ceafd87d999d3",
+  "candidate45": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "live45": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "CPU_task": "task_20261108_043340_145760814651",
+  "CPU_PASS": true,
+  "all_own_jobs_ended": true,
+  "writers": 0,
+  "no_worker": true,
+  "new_Root_wrapper": "PENDING",
+  "actual16_scope": "ABSENT"
+}

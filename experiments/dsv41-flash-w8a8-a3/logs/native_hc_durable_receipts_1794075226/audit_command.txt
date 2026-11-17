@@ -1,0 +1,1 @@
+task-submit --no-device --max-time 180 --run 'source activate-pypto.sh && PYTHONDONTWRITEBYTECODE=1 python experiments/dsv41-flash-w8a8-a3/logs/native_hc_durable_receipts_1794075226/audit_native_receipts.py'

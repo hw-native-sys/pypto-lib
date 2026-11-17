@@ -1,0 +1,11 @@
+{
+  "COMMANDS.md": "c640b227016a8267ba7b7bfb069db330b5292eadf18bd3b32abf6e4d29416a0d",
+  "REPORT.md": "301a18062f77d10f079dea4d48c0f56b86d1456274a034d9c48e5bc236c9539d",
+  "ROOT_CONTRACT.json": "30f2e79fae3e1828fdb73d641ebce0cca340af06f9e50cfa5dce58c5c73e46c1",
+  "check.py": "4d8768da7f96b8140d33e45a7b3075c2bc7f33c99a45a91b4a8dbef03f1ebcb3",
+  "cpu_raw.log": "5161b64c9dfc2b6112a55972f6e3e6121a8e5c0e45fd7188f0dd69e1b22f70d5",
+  "cpu_result.json": "a5d710592abaddab8dbfdb7576734175c3cbc5085ae807aeef8cadb9a9d9774b",
+  "publish_after_allocation.py": "7d7a79993633a411cc1f8d8aa8697258b7351d92504260cf6a0d6ad256cf7325",
+  "publisher_stage.sh": "ccc1be18cec6fe34e0b93828a7ac3c96597dd149ecdaf3e5e30b47c5c77f90d0",
+  "work_record.json": "9e76a6e9cdfdca4c8c3c9f5852817bd1247dfbf3de1ae7936d1cf632c845671a"
+}

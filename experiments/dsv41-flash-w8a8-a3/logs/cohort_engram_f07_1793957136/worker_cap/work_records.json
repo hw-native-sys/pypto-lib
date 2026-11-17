@@ -1,0 +1,11 @@
+[
+  {
+    "id": "f07-cap-1793957452-1793964171",
+    "start_epoch": 1793957452,
+    "end_epoch": 1793964171,
+    "duration_seconds": 6719,
+    "phase": "implement-validate",
+    "summary": "Restored actual2048-cap config/indexer/six phase contracts; independent metadata/closed-form boundaries65/2048/2049/4097,old64 numerical rejection,18 scoped device positives,CPU compile and protected-consumption checks pass. Only8 owned sources,initial reads uncharged; no shared ledgers or whole-tree claim.",
+    "evidence": "logs/cohort_engram_f07_1793957136/worker_cap/REPORT.md; summary.json; final/results.tsv"
+  }
+]

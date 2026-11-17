@@ -1,0 +1,4 @@
+{
+  "models/deepseek_v4_1_flash_a3_w8a8/weight_map.py": "b102abdbed4c104603ee937242bbb438e160f4fd5bedbcce0ac479502513e466",
+  "models/deepseek_v4_1_flash_a3_w8a8/weight_loader.py": "16d0259bc9e98ec2e0fc57e96e37026163ca45a50761bff767d62f659fc4fb69"
+}

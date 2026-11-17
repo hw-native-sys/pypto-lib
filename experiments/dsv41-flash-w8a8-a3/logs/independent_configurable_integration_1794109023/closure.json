@@ -1,0 +1,11 @@
+{
+  "state": "FINAL_PARK_PROVISIONAL_SOURCE_CHECKPOINT",
+  "snapshot45_content_verified": true,
+  "coherent_Main_freeze_assumed": false,
+  "live_files_after_snapshot_not_reclassified": true,
+  "model_runtime_imports_or_tests": false,
+  "headers_or_payload_or_fixture_or_compile_or_prepare_or_NPU": false,
+  "positive_grants_created": 0,
+  "all_own_jobs_ended": true,
+  "epoch": 1794109591
+}

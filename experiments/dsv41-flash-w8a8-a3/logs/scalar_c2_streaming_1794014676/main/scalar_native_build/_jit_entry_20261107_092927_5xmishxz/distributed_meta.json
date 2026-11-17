@@ -1,0 +1,60 @@
+{
+  "schema": 3,
+  "supported_execution_modes": [
+    "program"
+  ],
+  "params": [
+    {
+      "name": "w__ssa_v0",
+      "direction": "In",
+      "shape": [
+        2,
+        1,
+        64
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "x__ssa_v0",
+      "direction": "In",
+      "shape": [
+        2,
+        1,
+        64
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "state__ssa_v0",
+      "direction": "InOut",
+      "shape": [
+        2,
+        1,
+        64
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "alpha__ssa_v0",
+      "direction": "In",
+      "shape": null,
+      "dtype": "fp32",
+      "layout": null
+    }
+  ],
+  "num_return_types": 0,
+  "platform": "a2a3",
+  "backend_type": "Ascend910",
+  "distributed_config": {
+    "device_ids": [
+      0,
+      1
+    ],
+    "num_sub_workers": 0,
+    "runtime": "tensormap_and_ringbuffer",
+    "aicpu_thread_num": 0
+  }
+}

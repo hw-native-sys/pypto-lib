@@ -1,0 +1,19 @@
+{
+  "state": "FINAL_CURRENT_UNIT_HANDOFF",
+  "artifact_count": 579,
+  "artifact_manifest_sha256": "65e98cacd561c78a1f3a9a059ba059674076978e700143ed6cdbb2d317d64591",
+  "source45_sha256": "ab1ced6d6ecbf9887297458703ba9b74e2c9b8bc57608370b4c2e0310e027e37",
+  "prefix_manifest_sha256": "7d36fe16c04494b4f5da2fd812766edb99a2b730546fdd194097bc7d6e55addd",
+  "CPU_receipt_sha256": "d8b1a90ec674af84c2f67da4e8d0e295b81f3a0b3ee8ffc91e6f8fb78c3e163d",
+  "operational_exclusions": [
+    "work/measurement_gate.json"
+  ],
+  "frozen_measurement_snapshot": "frozen_cpu_measurement_gate.json",
+  "META_geometry_rewrite": "byte-identical only",
+  "new_next_stage_outputs": "explicit observer handoff; accepted prefix and all listed files remain immutable",
+  "recorded_own_pids_absent": true,
+  "native_and_CPU17_jobs_complete": true,
+  "next_decode_executed": false,
+  "end_epoch": 1794031783,
+  "measured_seconds": 4168
+}

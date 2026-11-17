@@ -1,0 +1,20 @@
+{
+  "record_id": "reviewer_f09-lifecycle88-review-micro-preparation-1794081685",
+  "role": "review-agent",
+  "measured_start_epoch": 1794081685,
+  "measured_end_epoch": 1794082596,
+  "interval_scope": "Frozen88 source/public API review, real tiny generatedartifact clone/from_dir CPU proof, concrete future native microtest/audit preparation, prospective Root minimal-scope correction and necessary syntax/refusal partialcheck, report and freeze.",
+  "shared_writes": 0,
+  "live_source_writes": 0,
+  "old_artifact_writes": 0,
+  "task_ids": ["task_20261108_040834_139733911207", "task_20261108_041311_140885816260"],
+  "task_exits": [0, 0],
+  "signature_compiles": 0,
+  "public_prepare_calls": 0,
+  "NPU_calls": 0,
+  "tensor_inputs_created": 0,
+  "model_fixture_calls": 0,
+  "payload_bytes_created": 0,
+  "disposition": "PASS_SOURCE_CPU_CLONE_RELOAD; MICRO_NATIVE_READY_NOT_RUN; FINAL_PARK",
+  "root_imports_shared_ledgers": true
+}

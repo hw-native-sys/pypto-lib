@@ -1,0 +1,12 @@
+{
+  "READINESS.md": "ca65883275eb714441fc9de044e28c0259f30d7ecf9588b3224d5e92d4467655",
+  "check_metadata.py": "bc0d85550df00f4286398a642a7b636664f679ff9b7727c45c8e2414a9d64285",
+  "check_signature_compile.py": "34df625362b0c7a5fc6d1747534c3132c648f063547decfab4a7e94547262681",
+  "finalize.py": "5f480a70b2260f3dcbd968527451b889d9ab3035dfb0a4cd2df932b34f2ab6ee",
+  "metadata_attempt1.log": "70c7884eafeaeed36e62ceea1cc8ad27e683f5e67b723d30fc6695db89d6e7aa",
+  "metadata_attempt2.log": "aedc37a5ebee591a98d3c469276128ce3e7c2c40f13c5df6bad4649b72c5a47f",
+  "metadata_queue.log": "1e9bf311dc444889b9d658d863bbb9f00c8dfb616dc112b2932ca17b9bf64bed",
+  "metadata_results.json": "96406fe31a8f1347deed0a929be8d73f0f693cb4f3b892e0b632f1fa422a2fed",
+  "signature_compile.json": "42b8015552dbc7c051ed5db915bfdb85f366f2d05ea71ccfc1d50b464978539b",
+  "signature_queue.log": "20bffaf2828a624254d8c2e03eab71fc0e9b5f3b4dcbff3a3989acae6395f072"
+}

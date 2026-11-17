@@ -1,0 +1,48 @@
+{
+  "status": "PASS_DURABLE_DECODE_CPU_PRECONDITIONS",
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "own_decode_job_complete0": true,
+  "own_decode_pids": [
+    2481328,
+    2481951,
+    2500681,
+    2506787,
+    2506789,
+    2506798,
+    2506800,
+    2506802,
+    2506804,
+    2506809,
+    2506821,
+    2506830,
+    2506832,
+    2506836,
+    2506840,
+    2506842,
+    2506845,
+    2506860,
+    2506876,
+    2506878
+  ],
+  "all_absent": true,
+  "prefix683_parent240_and_accepted_receipt_unchanged": true,
+  "decode_capsule_pins": {
+    "compiled_metadata.json": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770",
+    "manifest.json": "424269b3042c1845802bee6ef0f14daddc08ffc6f32c6f5c043607e3ff03c33f",
+    "initial.pt": "529eb07aab61ac548dd1fabbbe06a8dd0b57221bf0be1eb1d4e9820e90ed1534",
+    "actual.pt": "cf5d477a0255158b4d8ca09cf95abc0369e7ec43103fe061c4c9c3640eb29669",
+    "owner_closed.json": "0f89991d91f4b48e4f4a9b37891d43c5cde19a6df4c75de6516bd272a7f381fd"
+  },
+  "fresh_capacity": {
+    "host": 1723184001024,
+    "disk": 9526377971712,
+    "shm": 1079343157248
+  },
+  "required_bytes": {
+    "host": 306003115008,
+    "disk": 8657043456,
+    "shm": 8589934592
+  },
+  "NPU_prepares": 0,
+  "other_independent_fit_calibration_jobs": "not a global barrier; only this case owner/job must end"
+}

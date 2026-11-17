@@ -1,0 +1,44 @@
+[
+  {
+    "cohort": "HC native pure-OUT harness comparisons",
+    "disposition": "AFFECTED: do not accept raw candidate/old selfcompare counts or old numerical-rejection inference; preserve whole native failure. Offline independent original recompute from savedACTUAL is separate evidence.",
+    "lifetime": "_prepare_inputs spec.create_tensor ->initTensor; _compute_golden pureOUT spec.create_tensor ->SAME initTensor when dtype equal; device output then overwrites expected storage; receipt_store clones expected only after runtime",
+    "rely": "compare_fn actual-vs-harness-expected alone is compromised",
+    "spec_path": "HC_probe:178 output init_value=v.clone; hc_post_test pure OUT"
+  },
+  {
+    "cohort": "Independent decode19 task103754",
+    "disposition": "NOT affected by this pureOUT init alias. Existing staged/E1/synthetic/old-source scope limitations remain.",
+    "lifetime": "harness computes NO expected; production_decode.py separately calls _run_composed_golden(_FIXTURE_INITIAL) AFTER native; builder clones all12mutable state/input names; reference allocates fresh snapshots/logits",
+    "rely": "independent manual validate_golden with original staged+direct comparators, not _compute_golden spec OUT scratch",
+    "spec_path": "frozen decode_fwd _entry_specs Tensor init; _run_fwd1424 invokes run WITHOUT golden_fn"
+  },
+  {
+    "cohort": "N128 saved prefix17 and decode19x3/stale chain",
+    "disposition": "NOT affected by this mechanism; actual-snapshot conditioning remains explicit, not strict cumulative full-model equivalence.",
+    "lifetime": "clone_initial clones nonstatic BEFORE dispatch; save rejects actual/initial nonstatic storagealias and serializes independent contiguous clones; load separate files; reference initial cloned mutables and per-pass integrity hashes",
+    "rely": "offline original unconditioned+staged+direct gates on saved actual/initial; no Golden TensorSpec expected creation",
+    "spec_path": "V3 PreparedDispatch direct owner; store.save_checkpoint"
+  },
+  {
+    "cohort": "N3 saved prefix17/decode19+new published WINDOW/C2 positive",
+    "disposition": "NOT affected by this mechanism; preserve bounded/source/synthetic/threshold scope.",
+    "lifetime": "initial native capsule clones distinct; expected computed offline and captured readonly; extra published cache gates run without reexecuting candidate/native",
+    "rely": "original CPU references+published-row data comparisons; no _compute_golden",
+    "spec_path": "same split-capsule pattern, validate-decode_run uses same original staged returnedexpected"
+  },
+  {
+    "cohort": "Corrected native tiny shared actual-class proof013957",
+    "disposition": "NOT affected. Toy admission/public API evidence only, no full16 model claim.",
+    "lifetime": "actual shared IO read immediately, all-elements torch.equal against independently constructed constants6/12/19/27; extra legalwrongC1 actual11 checked against unchanged12",
+    "rely": "direct returned values/manual exact expected, counters/view/cleanup audit33/0",
+    "spec_path": "tiny_shared.run_native +annotated compile; no TensorSpec/golden.run/golden_fn"
+  },
+  {
+    "cohort": "Real normal CLI short and longer generation",
+    "disposition": "Separate from Golden alias. Short accepted bounded text remains; longer overallFAIL/qualityNOTPASSED remains; no raw-logit recompute/cachemath/fullparity inference.",
+    "lifetime": "actual runtime logits sampled/strict4DP and source/coverage/cleanup receipt auditing",
+    "rely": "actual text/token/history/transport records; no mathematical golden equivalence ever accepted",
+    "spec_path": "normal annotated compile+PreparedDispatch; no Golden expected"
+  }
+]

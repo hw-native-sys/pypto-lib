@@ -1,0 +1,50 @@
+{
+  "schema": "configured-real-post-audit-precursor-pins/1",
+  "references": [
+    {
+      "name": "independent_READY15_manifest",
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_configurable_resource_operation_1794110766/artifacts.sha256",
+      "sha256": "cd15b9bf438806ff055a98a5ad72e67464b83ac9890ac98877ce3cfca9ed6165",
+      "scope": "CURRENT_SOURCE_RESOURCE_PREQUEUE_GATE_NOT_ACTUAL_RESULT"
+    },
+    {
+      "name": "PREQUEUE",
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_configurable_real_generation_1794111133/prequeue/PREQUEUE.json",
+      "sha256": "1acdacf14932b139a94b496397fdd31756b91bc8ba8928f8c42b473b91f39482",
+      "scope": "CURRENT_PREQUEUE_NOT_POST"
+    },
+    {
+      "name": "Main14_manifest",
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/configurable_real_operation_prepare_1794111133/artifacts.json",
+      "sha256": "9205eb161aaf83edabf516c1a6cab5c1f666a894a99116f04d312cf311926dae",
+      "scope": "FROZEN_PRODUCER"
+    },
+    {
+      "name": "Root_model_GO",
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/root_configurable_real_generation_1794111133_go.json",
+      "sha256": "4f7c4b19fa9b84e96a1a062b7dbbfbb69a69d47db7af76bf13eeca9d0757e755",
+      "scope": "MODEL_OPERATION_SCOPE_NOT_CPU_AUDIT_GO"
+    },
+    {
+      "name": "component_readiness",
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_configurable_component_capture_1794113378_runtimefacts/READINESS.json",
+      "sha256": "58e4be00f18eff1f1d1cec7c897bd2f81ebb00ccce4b4e1313d50701edd37442",
+      "scope": "BOUNDED_COMPONENT_ONLY_NOT_FULL_REAL_MODEL"
+    },
+    {
+      "name": "Root_component_acceptance",
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/root_configurable_components_1794113378_acceptance.json",
+      "sha256": "97063ec6b4eabd95c7981701b2f8b119a53393dd0c93fd2a6316a29b777683c0",
+      "scope": "BOUNDED_EP_AND_TP_ONLY"
+    },
+    {
+      "name": "Root_HEADS8_attention_acceptance",
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/root_tp8_attention_1794111650_acceptance.json",
+      "sha256": "9e45983a36059c7f1bf1265fa69dcef794c3c6ba56f4e8f4db1b498ee01f29cb",
+      "scope": "BOUNDED_THREE_LOCAL_ATTENTION_CASES_ONLY"
+    }
+  ],
+  "no_actual_result_or_full_parity_inferred": true,
+  "actual_audit_GO": "REQUIRED_FUTURE_ROOT_FOLLOWUP",
+  "headers_or_payload_read": 0
+}

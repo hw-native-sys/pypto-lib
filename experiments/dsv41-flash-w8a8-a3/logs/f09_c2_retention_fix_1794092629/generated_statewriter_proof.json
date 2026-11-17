@@ -1,0 +1,12 @@
+{
+  "pass": true,
+  "proofs": [
+    {
+      "file": "next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp",
+      "active_scalar_num_tokens": true,
+      "pool_dependency_and_projection_inputs": true,
+      "excerpt": "                                CoreTaskArgs params_t70;\n                                params_t70.add_input(kv_proj_inline14223__ssa_v1);\n                                params_t70.add_input(score_proj_inline14224__ssa_v1);\n                                params_t70.add_inout(flat_inline14227);\n                                params_t70.add_input(ext_position_ids);\n                                params_t70.add_input(ext_request_ids);\n                                params_t70.add_input(ext_state_block_table);\n                                params_t70.add_scalar(num_tokens);\n                                TaskId params_t70_deps[1];\n                                uint32_t params_t70_deps_count = 0;\n                                params_t70_deps[params_t70_deps_count++] = pool_tid_inline14231;\n                                params_t70.set_dependencies(params_t70_deps, params_t70_deps_count);\n                                TaskOutputTensors task_70_outs = rt_submit_aiv_task(59, params_t70);\n                                int64_t blocks_inline14285 = ((T_DYN + 7) / 8);\n                                if ((0 < blocks_inline14285)) {\n                                    SIMPLER_SCOPE() {\n\n                                        "
+    }
+  ],
+  "native_graph_or_liveness_proof": false
+}

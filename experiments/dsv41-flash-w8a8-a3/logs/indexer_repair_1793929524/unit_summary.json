@@ -1,0 +1,199 @@
+{
+  "epoch": 1793930076,
+  "scope": "generic indexer repair milestone only",
+  "changed_model_files": [
+    "models/deepseek_v4_1_flash_a3_w8a8/indexer.py"
+  ],
+  "goldens_and_comparators_ast_unchanged": true,
+  "runs": {
+    "before": {
+      "numerical_case_passes": 0,
+      "per_output_failures": 4,
+      "builds": [
+        "build_output/_jit_lightning_indexer_test_20261106_094714_jbiqoivf"
+      ],
+      "log_sha256": "e3a300571ca0e8f4d73dfdeb911dd801c6fc43a637c3446d677d30db27d95df4"
+    },
+    "after": {
+      "numerical_case_passes": 2,
+      "per_output_failures": 2,
+      "builds": [
+        "build_output/_jit_lightning_indexer_full_pool_test_20261106_094856_bfk9n_s2",
+        "build_output/_jit_lightning_indexer_test_20261106_094843_tw4jh0iz"
+      ],
+      "log_sha256": "f085c3cde9e357c1a142a1c5b8b0eacb9be4ee55c856ed005c4e4a0da74f8b13"
+    },
+    "final": {
+      "numerical_case_passes": 4,
+      "per_output_failures": 0,
+      "builds": [
+        "build_output/_jit_lightning_indexer_full_pool_test_20261106_095053_mjvma1no",
+        "build_output/_jit_lightning_indexer_test_20261106_095041_xr6oflus"
+      ],
+      "log_sha256": "99beb7bdf6f1486ad6d8004a7db23c73364e1ef9a2aa0411b215d19c996e0880"
+    },
+    "decode_c1a_full": {
+      "numerical_case_passes": 2,
+      "per_output_failures": 0,
+      "builds": [
+        "build_output/_jit_decode_c1a_full_attention_test_20261106_095101__7_bjo69"
+      ],
+      "log_sha256": "e53da43c118b91c2649e97ba48f9dbffdec00928d7924288030c76de3375d722"
+    },
+    "decode_c1a_reindex": {
+      "numerical_case_passes": 2,
+      "per_output_failures": 0,
+      "builds": [
+        "build_output/_jit_decode_c1a_reindex_attention_test_20261106_095125_dsn6loid"
+      ],
+      "log_sha256": "6060db20a1929fc1d799b608d91016719b97dcb0a339432d271c0be3e554a439"
+    },
+    "decode_c2a_full": {
+      "numerical_case_passes": 2,
+      "per_output_failures": 0,
+      "builds": [
+        "build_output/_jit_decode_c2a_full_attention_test_20261106_095148_gqmtq_hm"
+      ],
+      "log_sha256": "c2d7e23863a32cbfa0c2abab57c22b6b5d4eaba533be4f002d8a389bbfcf3a83"
+    },
+    "prefill_c1a_full": {
+      "numerical_case_passes": 1,
+      "per_output_failures": 0,
+      "builds": [
+        "build_output/_jit_prefill_attention_test_20261106_095211_tndooqbt"
+      ],
+      "log_sha256": "e5f024c067759fe8e22b11ebf557839e99fd420457b115851cabdbf286f686f4"
+    },
+    "prefill_c1a_reindex": {
+      "numerical_case_passes": 1,
+      "per_output_failures": 0,
+      "builds": [
+        "build_output/_jit_prefill_c1a_reindex_test_20261106_095232_oufnkupd"
+      ],
+      "log_sha256": "4456789bd5f7e9a0cc56366c19f9e48c12afd055915f268636884ddaf0791a90"
+    },
+    "prefill_c2a_full": {
+      "numerical_case_passes": 1,
+      "per_output_failures": 0,
+      "builds": [
+        "build_output/_jit_prefill_c2a_full_test_20261106_095255_1o1ufi8l"
+      ],
+      "log_sha256": "b0e7d146c976742eb8941761c92cd731f3986a13fd6e4f3e5008eca34ffdee58"
+    }
+  },
+  "consumer_exits": [
+    {
+      "entry": "decode_c1a_full",
+      "start": "1793929855",
+      "end": "1793929880",
+      "exit": "0",
+      "device": "1"
+    },
+    {
+      "entry": "decode_c1a_reindex",
+      "start": "1793929880",
+      "end": "1793929902",
+      "exit": "0",
+      "device": "1"
+    },
+    {
+      "entry": "decode_c2a_full",
+      "start": "1793929902",
+      "end": "1793929927",
+      "exit": "0",
+      "device": "1"
+    },
+    {
+      "entry": "prefill_c1a_full",
+      "start": "1793929927",
+      "end": "1793929949",
+      "exit": "0",
+      "device": "1"
+    },
+    {
+      "entry": "prefill_c1a_reindex",
+      "start": "1793929949",
+      "end": "1793929970",
+      "exit": "0",
+      "device": "1"
+    },
+    {
+      "entry": "prefill_c2a_full",
+      "start": "1793929970",
+      "end": "1793929994",
+      "exit": "0",
+      "device": "1"
+    }
+  ],
+  "queue_tasks": {
+    "before": {
+      "task_ids": [
+        "task_20261106_094708_100509323718"
+      ],
+      "status_lines": [
+        "START 1793929631 TASK_DEVICE=0",
+        "=== \u4efb\u52a1\u5931\u8d25 (exit=1) ==="
+      ]
+    },
+    "after": {
+      "task_ids": [
+        "task_20261106_094837_101094710289"
+      ],
+      "status_lines": [
+        "START 1793929720 TASK_DEVICE=0",
+        "END 1793929745 exit=1 TASK_DEVICE=0",
+        "=== \u4efb\u52a1\u5931\u8d25 (exit=1) ==="
+      ]
+    },
+    "final": {
+      "task_ids": [
+        "task_20261106_095035_102062026383"
+      ],
+      "status_lines": [
+        "START 1793929838 TASK_DEVICE=0",
+        "END 1793929864 exit=0 TASK_DEVICE=0",
+        "=== \u4efb\u52a1\u5b8c\u6210 (exit=0) ==="
+      ]
+    },
+    "consumers": {
+      "task_ids": [
+        "task_20261106_095052_10230038801"
+      ],
+      "status_lines": [
+        "START 1793929855 decode_c1a_full TASK_DEVICE=1",
+        "END decode_c1a_full exit=0",
+        "START 1793929880 decode_c1a_reindex TASK_DEVICE=1",
+        "END decode_c1a_reindex exit=0",
+        "START 1793929902 decode_c2a_full TASK_DEVICE=1",
+        "END decode_c2a_full exit=0",
+        "START 1793929927 prefill_c1a_full TASK_DEVICE=1",
+        "END prefill_c1a_full exit=0",
+        "START 1793929949 prefill_c1a_reindex TASK_DEVICE=1",
+        "END prefill_c1a_reindex exit=0",
+        "START 1793929970 prefill_c2a_full TASK_DEVICE=1",
+        "END prefill_c2a_full exit=0",
+        "=== \u4efb\u52a1\u5b8c\u6210 (exit=0) ==="
+      ]
+    },
+    "host": {
+      "task_ids": [
+        "task_20261106_094906_101512713191"
+      ],
+      "status_lines": [
+        "=== \u4efb\u52a1\u5931\u8d25 (exit=1) ==="
+      ]
+    },
+    "host_final": {
+      "task_ids": [
+        "task_20261106_095127_10286554765"
+      ],
+      "status_lines": [
+        "=== \u4efb\u52a1\u5b8c\u6210 (exit=0) ==="
+      ]
+    }
+  },
+  "device_validated_cases": 13,
+  "ci_discovery": "OPEN: existing missing A3 model directory platform rule; host task exit1",
+  "native_goal": "null, no goal created or completed",
+  "remaining": "C1A reindex pool consumption, composed decode pools/state, full-composition/layer/TP revalidation and generation HELD"
+}

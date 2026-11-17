@@ -1,0 +1,9 @@
+{
+  "state": "FINAL_PARK",
+  "source45_manifest_sha256": "ab1ced6d6ecbf9887297458703ba9b74e2c9b8bc57608370b4c2e0310e027e37",
+  "artifact_count": 403,
+  "artifact_manifest_sha256": "e6de196f770de05a0556f273fbbe8bb4525dccfdf31713fbabe4380c26202c7b",
+  "end_epoch": 1794025601,
+  "all_jobs_ended": true,
+  "NPU": 0
+}

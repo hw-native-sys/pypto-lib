@@ -1,0 +1,23 @@
+{
+  "role": "review-agent",
+  "start_epoch": 1794102842,
+  "artifact_epoch": 1794102875.4601192,
+  "shared_writes": 0,
+  "state": "FINAL/PARK_NOT_ACCEPTED_STRICT_TELEMETRY",
+  "native_task_id": "task_20261108_090706_320779619842",
+  "root_go": "observer-20261108-sourceB-real16-shared-w8a8",
+  "end_epoch": 1794103199.7870786,
+  "audit_task": "task_20261108_095507_99694925565",
+  "audit_exit": 0,
+  "passed_checks": 4638,
+  "unmet_checks": 5,
+  "native_exit": 1,
+  "CLI_exit": 0,
+  "outer_status": "FAIL",
+  "root_imports": "once, owned by Root",
+  "criteria_changed": false,
+  "prep18_unchanged": true,
+  "actual_audit_count": 1,
+  "NPU_submitted": false,
+  "remaining_tasks": []
+}

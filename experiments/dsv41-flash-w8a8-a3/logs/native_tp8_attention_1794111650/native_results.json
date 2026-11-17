@@ -1,0 +1,254 @@
+{
+  "status": "PASS_THREE_ORIGINAL_NUMERICAL_CASES",
+  "job": "task_20261108_122101_13767445722",
+  "terminal": "COMPLETE0",
+  "actual_DEVICE": [
+    0
+  ],
+  "cases": [
+    {
+      "case": "core16",
+      "original_output_gate": "PASS",
+      "shape": [
+        3,
+        8,
+        512
+      ],
+      "dtype": "BF16",
+      "original_atol": 0.02,
+      "original_rtol": 0.02,
+      "original_max_error_ratio": 0.005,
+      "native_callable_and_device_wall": true
+    },
+    {
+      "case": "packed640",
+      "original_output_gate": "PASS",
+      "shape": [
+        3,
+        8,
+        512
+      ],
+      "dtype": "BF16",
+      "original_atol": 0.02,
+      "original_rtol": 0.02,
+      "original_max_error_ratio": 0.005,
+      "native_callable_and_device_wall": true
+    },
+    {
+      "case": "window128",
+      "original_output_gate": "PASS",
+      "shape": [
+        3,
+        8,
+        512
+      ],
+      "dtype": "BF16",
+      "original_atol": 0.02,
+      "original_rtol": 0.02,
+      "original_max_error_ratio": 0.005,
+      "native_callable_and_device_wall": true
+    }
+  ],
+  "metadata": [
+    {
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_tp8_attention_1794111650/actual/build/_jit_attention_core_test_20261108_122107_91ue2b63/compiled_meta.json",
+      "sha256": "7f74f718a2f0d0c89c7e78dac2d3f96f8f1abe9576c077757077791b3c4ffc61",
+      "platform": "a2a3",
+      "params": [
+        {
+          "name": "q",
+          "direction": "In",
+          "shape": [
+            -1,
+            8,
+            512
+          ],
+          "dtype": "bfloat16",
+          "layout": "ND"
+        },
+        {
+          "name": "selected",
+          "direction": "In",
+          "shape": [
+            -1,
+            16,
+            512
+          ],
+          "dtype": "bfloat16",
+          "layout": "ND"
+        },
+        {
+          "name": "combined",
+          "direction": "In",
+          "shape": [
+            -1,
+            16
+          ],
+          "dtype": "int32",
+          "layout": "ND"
+        },
+        {
+          "name": "sink",
+          "direction": "In",
+          "shape": [
+            8
+          ],
+          "dtype": "fp32",
+          "layout": "ND"
+        },
+        {
+          "name": "output",
+          "direction": "Out",
+          "shape": [
+            -1,
+            8,
+            512
+          ],
+          "dtype": "bfloat16",
+          "layout": "ND"
+        }
+      ]
+    },
+    {
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_tp8_attention_1794111650/actual/build/_jit_packed_attention_test_20261108_122115_d_hkgv0y/compiled_meta.json",
+      "sha256": "bb66b7bf8cdbc173325f71922aea14b5871a25aebbe7e8bf801c5fd709947857",
+      "platform": "a2a3",
+      "params": [
+        {
+          "name": "q",
+          "direction": "In",
+          "shape": [
+            -1,
+            8,
+            512
+          ],
+          "dtype": "bfloat16",
+          "layout": "ND"
+        },
+        {
+          "name": "selected",
+          "direction": "In",
+          "shape": [
+            -1,
+            640,
+            512
+          ],
+          "dtype": "bfloat16",
+          "layout": "ND"
+        },
+        {
+          "name": "combined",
+          "direction": "In",
+          "shape": [
+            -1,
+            640
+          ],
+          "dtype": "int32",
+          "layout": "ND"
+        },
+        {
+          "name": "sink",
+          "direction": "In",
+          "shape": [
+            8
+          ],
+          "dtype": "fp32",
+          "layout": "ND"
+        },
+        {
+          "name": "output",
+          "direction": "Out",
+          "shape": [
+            -1,
+            8,
+            512
+          ],
+          "dtype": "bfloat16",
+          "layout": "ND"
+        }
+      ]
+    },
+    {
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_tp8_attention_1794111650/actual/build/_jit_window_attention_test_20261108_122120_1j7_5g6l/compiled_meta.json",
+      "sha256": "160e88dd788970ae79aeb4faf765a796a1e4d2e1a224c10c6e4d1c57ab5ff528",
+      "platform": "a2a3",
+      "params": [
+        {
+          "name": "q",
+          "direction": "In",
+          "shape": [
+            -1,
+            8,
+            512
+          ],
+          "dtype": "bfloat16",
+          "layout": "ND"
+        },
+        {
+          "name": "selected",
+          "direction": "In",
+          "shape": [
+            -1,
+            128,
+            512
+          ],
+          "dtype": "bfloat16",
+          "layout": "ND"
+        },
+        {
+          "name": "combined",
+          "direction": "In",
+          "shape": [
+            -1,
+            128
+          ],
+          "dtype": "int32",
+          "layout": "ND"
+        },
+        {
+          "name": "sink",
+          "direction": "In",
+          "shape": [
+            8
+          ],
+          "dtype": "fp32",
+          "layout": "ND"
+        },
+        {
+          "name": "output",
+          "direction": "Out",
+          "shape": [
+            -1,
+            8,
+            512
+          ],
+          "dtype": "bfloat16",
+          "layout": "ND"
+        }
+      ]
+    }
+  ],
+  "mode_proof": "unchanged CLI no --sim => False; pinned normalize_config False=>ExecutionMode.ONBOARD; actual nativeCallable/device_wall per case",
+  "raw_lock_release": true,
+  "normal_callable_images_freed": true,
+  "known_birth_identities": [],
+  "logged_pid_checks": [
+    {
+      "pid": 1376864,
+      "exists_now": false,
+      "starttick_at_observation": null,
+      "identity_scope": "number recorded in native runtime/lock log; no birth tick captured before completion"
+    },
+    {
+      "pid": 1377279,
+      "exists_now": false,
+      "starttick_at_observation": null,
+      "identity_scope": "number recorded in native runtime/lock log; no birth tick captured before completion"
+    }
+  ],
+  "observed_birth_limitation": "first process observation occurred after quick completion; no original birth ticks available, never invented",
+  "prep53_and_dependency_pins_after": true,
+  "source_attention": "562cda314635c65823e639d02a7e8db7100a65ef6d7006ff50bbd608d72e0cf7",
+  "new_native_requests": 1,
+  "retries": 0
+}

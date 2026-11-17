@@ -1,0 +1,196 @@
+{
+  "status": "NATIVE_CAPTURE_ONLY_NOT_NUMERICAL",
+  "native_worker_terminals": [
+    {
+      "worker_id": "3",
+      "run_id": "1",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "pid": "2481951",
+      "hid": "c45fa84b45c7c85f"
+    },
+    {
+      "worker_id": "13",
+      "run_id": "1",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "pid": "2481951",
+      "hid": "c45fa84b45c7c85f"
+    },
+    {
+      "worker_id": "15",
+      "run_id": "1",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "pid": "2481951",
+      "hid": "c45fa84b45c7c85f"
+    },
+    {
+      "worker_id": "9",
+      "run_id": "1",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "pid": "2481951",
+      "hid": "c45fa84b45c7c85f"
+    },
+    {
+      "worker_id": "10",
+      "run_id": "1",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "pid": "2481951",
+      "hid": "c45fa84b45c7c85f"
+    },
+    {
+      "worker_id": "14",
+      "run_id": "1",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "pid": "2481951",
+      "hid": "c45fa84b45c7c85f"
+    },
+    {
+      "worker_id": "5",
+      "run_id": "1",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "pid": "2481951",
+      "hid": "c45fa84b45c7c85f"
+    },
+    {
+      "worker_id": "0",
+      "run_id": "1",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "pid": "2481951",
+      "hid": "c45fa84b45c7c85f"
+    },
+    {
+      "worker_id": "12",
+      "run_id": "1",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "pid": "2481951",
+      "hid": "c45fa84b45c7c85f"
+    },
+    {
+      "worker_id": "1",
+      "run_id": "1",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "pid": "2481951",
+      "hid": "c45fa84b45c7c85f"
+    },
+    {
+      "worker_id": "4",
+      "run_id": "1",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "pid": "2481951",
+      "hid": "c45fa84b45c7c85f"
+    },
+    {
+      "worker_id": "6",
+      "run_id": "1",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "pid": "2481951",
+      "hid": "c45fa84b45c7c85f"
+    },
+    {
+      "worker_id": "8",
+      "run_id": "1",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "pid": "2481951",
+      "hid": "c45fa84b45c7c85f"
+    },
+    {
+      "worker_id": "11",
+      "run_id": "1",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "pid": "2481951",
+      "hid": "c45fa84b45c7c85f"
+    },
+    {
+      "worker_id": "2",
+      "run_id": "1",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "pid": "2481951",
+      "hid": "c45fa84b45c7c85f"
+    },
+    {
+      "worker_id": "7",
+      "run_id": "1",
+      "dispatch_id": "1",
+      "outcome": "0",
+      "pid": "2481951",
+      "hid": "c45fa84b45c7c85f"
+    }
+  ],
+  "public_memory": {
+    "before_weights": {
+      "ranks": 16,
+      "minimum_free": 59884830720,
+      "committed_min": 5452987693,
+      "committed_max": 5452987693
+    },
+    "after_upload": {
+      "ranks": 16,
+      "minimum_free": 53417054208,
+      "committed_min": 11916866797,
+      "committed_max": 11916866797
+    },
+    "after_dispatch": {
+      "ranks": 16,
+      "minimum_free": 53391839232,
+      "committed_min": 11932383020,
+      "committed_max": 11932383020
+    },
+    "before_close": {
+      "ranks": 16,
+      "minimum_free": 53392355328,
+      "committed_min": 11932383020,
+      "committed_max": 11932383020
+    }
+  },
+  "payloads": {
+    "actual": {
+      "bytes": 247121409,
+      "sha256": "cf5d477a0255158b4d8ca09cf95abc0369e7ec43103fe061c4c9c3640eb29669",
+      "tensor_count": 39
+    },
+    "initial": {
+      "bytes": 247123310,
+      "sha256": "529eb07aab61ac548dd1fabbbe06a8dd0b57221bf0be1eb1d4e9820e90ed1534",
+      "tensor_count": 39
+    }
+  },
+  "owner_epoch": "decode-2481951-8d4c8245d6e84aac987f492e6f163b41",
+  "artifact": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_exact_prompt_capture_1794038189/decode_build/_jit_decode_fwd_20261107_163731_1prm5qcn",
+    "metadata_sha256": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770",
+    "compile_seconds": 24.37156867980957
+  },
+  "runtime_configuration": {
+    "execution_mode": "ExecutionMode.ONBOARD",
+    "ring_heap": [
+      0,
+      0,
+      4294967296,
+      0
+    ]
+  },
+  "generic_ABI_sha256": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770",
+  "dynamicN": "Actual initial/actual input shape16x1 andruntimeplan position3; sharedABI alone doesnotproveN",
+  "runner_seconds": 309.55068254470825,
+  "all6persistenthandoff": true,
+  "positive_retention": {
+    "checked_rows": 176,
+    "failures": [],
+    "pass": true
+  },
+  "counter_scope": "PubliccommittedexcludesHCCL/VMM;freedevicewide;no fabricatedpostclosezero"
+}

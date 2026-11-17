@@ -1,0 +1,17 @@
+{
+  "record_id": "reviewer_f09-count-active-preparation-1794084730",
+  "role": "review-agent",
+  "measured_start_epoch": 1794084730,
+  "measured_end_epoch": 1794085580,
+  "scope": "Prerequisite key mismatch STOP/corrected Root receipt, exact frozen count-active case and delegated allocation-first launcher preparation, ONE fresh source/resources/default-refusal PREQUEUE, minimal command/templates/report/freeze.",
+  "task_ids": ["task_20261108_050241_152375314110"],
+  "task_exits": [0],
+  "model_fixture_tensor_header_payload_calls": 0,
+  "compile_prepare_NPU_calls": 0,
+  "valid_actual_stage_grants_created": 0,
+  "shared_writes": 0,
+  "live_source_writes": 0,
+  "old_artifact_writes": 0,
+  "disposition": "READY_SOURCE_RESOURCES_ONLY_NO_NATIVE_AUTHORITY; FINAL_PARK",
+  "root_imports_shared_ledgers": true
+}

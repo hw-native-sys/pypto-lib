@@ -1,0 +1,17 @@
+{
+  "role": "review-agent",
+  "start_epoch": 1794210582.4862745,
+  "end_epoch": 1794210582.5592384,
+  "measured_seconds": 0.07296395301818848,
+  "measurement_scope": "final artifact materialization interval only; preceding source-reading interval was not timestamped and is unmeasured, not invented",
+  "preceding_review_seconds": null,
+  "shared_writes": 0,
+  "shared_TIME_LOG_imported": false,
+  "imports": 0,
+  "CPU_tests": 0,
+  "tokenizer_execution": 0,
+  "NPU": 0,
+  "weight_headers": 0,
+  "tensor_payload_bytes": 0,
+  "state": "FINAL/PARK"
+}

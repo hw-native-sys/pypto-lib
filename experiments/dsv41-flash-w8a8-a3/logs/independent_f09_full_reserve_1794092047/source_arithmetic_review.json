@@ -1,0 +1,20 @@
+{
+  "status": "PASS_SOURCE_ONLY_NO_GUARD_REEXECUTION",
+  "Main_manifest": "72ab1fd5ebeb197cec65569e8f99eb36ccd659ff51973fbf88c8101e5321e5c8",
+  "launcher_only_reserve_literal_changed": true,
+  "typed_tensor_and_probe_schema_unchanged": true,
+  "runtime_scalar_bookkeeping_bytes": 4,
+  "corrected_reserve": 10157899716,
+  "prestatic": 16621778820,
+  "sixlogical": 2965339800,
+  "capturepolicy_delta": 24,
+  "offlinepolicy_delta": 72,
+  "guard_boundary_proof_reused": {
+    "task": "task_20261108_064834_180327519068",
+    "proof": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_full_reserve_fix_1794091408/meta_results.json",
+    "sha256": "bfa72c2f969251b81a6292454689c84a2aa23a4cbb9747dad8a2bccbf33b842e"
+  },
+  "measured_failed_actual_sum": false,
+  "physical_device_scalar_allocation_claim": false,
+  "canonical_model_changes": false
+}

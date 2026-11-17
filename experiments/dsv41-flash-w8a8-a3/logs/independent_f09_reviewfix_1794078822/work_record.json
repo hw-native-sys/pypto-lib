@@ -1,0 +1,19 @@
+{
+  "record_id": "reviewer_f09-repaired93-compile-failure-1794078822",
+  "role": "review-agent",
+  "measured_start_epoch": 1794078822,
+  "measured_end_epoch": 1794079185,
+  "interval_scope": "Frozen93 source review, single authorized zero-sample queue compilation, read-only diagnosis, report and seal; initial skill reads before8822 excluded.",
+  "shared_writes": 0,
+  "live_source_writes": 0,
+  "old_artifact_writes": 0,
+  "task_ids": ["task_20261108_031644_2608314306"],
+  "task_exit": 1,
+  "successful_compiles": 0,
+  "native_calls": 0,
+  "tensor_samples": 0,
+  "model_fixture_calls": 0,
+  "payload_bytes_created": 0,
+  "disposition": "FAILED_OWN_RETURN_CONTRACT; FINAL_PARK",
+  "root_imports_shared_ledgers": true
+}

@@ -1,0 +1,45 @@
+{
+  "actual_startup_168_directory_replay": [
+    {
+      "args": [
+        168,
+        0,
+        168
+      ],
+      "kwargs": {
+        "initial_admission_depth": 1
+      }
+    }
+  ],
+  "unsupported_high_level_concurrency_knobs": [
+    {
+      "api": "RunConfig",
+      "result": "unsupported keyword",
+      "error": "RunConfig.__init__() got an unexpected keyword argument 'pipeline_depth'"
+    },
+    {
+      "api": "DistributedConfig",
+      "result": "unsupported keyword",
+      "error": "DistributedConfig.__init__() got an unexpected keyword argument 'pipeline_depth'"
+    },
+    {
+      "api": "CallConfig",
+      "result": "unsupported keyword",
+      "error": "__init__(): incompatible function arguments. The following argument types are supported:\n    1. __init__(self) -> None\n\nInvoked with types: _task_interface.CallConfig, kwargs = { pipeline_depth: int }"
+    }
+  ],
+  "public_chip_telemetry_exists": [
+    "admissible_run_resource_sets",
+    "arena_bank_gm_heap_base"
+  ],
+  "telemetry_not_forwarded_by_pinned_pypto_facade": true,
+  "prewarm_bank0_exact_source": true,
+  "archived_all_rank_base_free_guard_pass": true,
+  "archived_granted_capacity_multiplier_refusal_reproduced": true,
+  "baseline_required_free": 23344218656,
+  "heap_per_bank": 5100273664,
+  "first_synchronous_call_bank_bound": "prewarm bank0 plus at most one execution bank; source-based, not observed constructed count",
+  "extra_one_bank_fits_existing_8GiB_reserve": true,
+  "graph_retirement_and_full_fit": "unproved",
+  "npu": false
+}

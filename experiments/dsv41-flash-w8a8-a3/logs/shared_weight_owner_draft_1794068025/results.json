@@ -1,0 +1,38 @@
+{
+  "status": "PASS_PUBLIC_METHOD_TINY_OWNER_SPY_ONLY",
+  "prepare_count": 1,
+  "selected_runs": [
+    "prefill",
+    "decode",
+    "decode",
+    "decode"
+  ],
+  "base_allocations": 4,
+  "static_h2d_bytes": 32,
+  "static_source_reads": 4,
+  "decode_static_h2d_bytes": 0,
+  "decode_static_source_reads": 0,
+  "base_frees_exactly_once": 4,
+  "borrowed_alias_free_rejected": true,
+  "foreign_and_stale_view_rejected": true,
+  "early_shared_IO_and_actual_state_copy": true,
+  "primary_error_preserved": true,
+  "actual_public_Worker_view_and_free_methods": true,
+  "real57_metadata_only": {
+    "global_bytes": 633997065216,
+    "c1_decode_singleton_insertions": [
+      "c1a_comp_norm",
+      "c1a_comp_wkv",
+      "c1a_idx_k_norm",
+      "c1a_idx_weights_proj",
+      "c1a_idx_wk",
+      "c1a_idx_wq_b",
+      "c1a_idx_wq_b_scale"
+    ]
+  },
+  "liveCC_unchanged": true,
+  "compile": false,
+  "native": false,
+  "payload_bytes": 0,
+  "positive_actual_grant": false
+}

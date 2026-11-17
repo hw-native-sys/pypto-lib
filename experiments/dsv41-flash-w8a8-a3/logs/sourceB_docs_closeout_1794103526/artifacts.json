@@ -1,0 +1,17 @@
+{
+  "HANDOFF.md.after": "4550d1587b2cdc3f618ffa553702752b74d4aba55e308edbd5321d00751659c4",
+  "HANDOFF.md.before": "fc4321ff3729ac1d5cbbe49486e17f694543791b4be0c1086e104781e5eae5e6",
+  "INTERFACE.md.after": "8645fedaf6519ecabdec93daa2ec79f0cc92e1394a8b9b8924d5e4ad8e7b8dad",
+  "INTERFACE.md.before": "b145947eb02a37f9daa5acdb0770d1fb41b80301d7b4c39e4cb711128373c37c",
+  "MODULES.md.after": "7db271e345be62b7a7fb40822879ef91211849a6a7ef15df5ed5790195585cc0",
+  "MODULES.md.before": "d9169d952dc478ee9f5cc7dfd609a0c0eab4df7422f0362dd985d26bed743415",
+  "OWNERSHIP.md": "275743249bdb1e3ba20b0998208eb5a9afc0d9d21c28661c459ad951fdbaa563",
+  "REPORT.md": "1a07943604aedaea9f48cb4dae0c280b2f701a018ed0ed9030b9f81a177b0509",
+  "changes.json": "2b623161d8344e2a6f1acd8315456651ac214b632905ea61d456daf908e895be",
+  "current_overlay.md": "3f1f52f2e7ce87105c846a04a3f3916dcae021c226a3974df4c8e3f784eb6354",
+  "ledger_append.json": "4a5200e74b935def09055ac6974d79c47a5b60085ff2aefeed3c0580f91cd2fa",
+  "seal.py": "2747bbab6c8e80432ebf6f55bcad310ee6c34fe8660f43f5fc3c05d27269b08f",
+  "start.json": "fdb1998bb1f252eff9e59ab52c40b7de99e7952b15ba7953fea4f168fc7968ae",
+  "update_docs.py": "77f3a4c5179c09c76f403ae8c008d1ddda923a84ebdeff65779d19523958455d",
+  "work_record.json": "4a3e4e48ee02e86be8ce34350f08901b56efb7b7ff340bada3a5dd1457784a63"
+}

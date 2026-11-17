@@ -1,0 +1,116 @@
+{
+  "call": 1,
+  "initial": {
+    "file": "call1.initial.pt",
+    "sha256": "720c1469c2dc3c6457e18328688f78d856e578e767d726a65f82dbab2c1d96c1",
+    "tensors": {
+      "window_cache": "bec5bb641e6eae5115bd1b2c7781c342eaa296ca9212eecfdf24a700fe96ee54",
+      "compressed_cache_c2a": "063b7286e1944c0cbda80394c7bec511cfe6be43d80d11eec7c744938e19921d",
+      "index_cache_c2a": "063b7286e1944c0cbda80394c7bec511cfe6be43d80d11eec7c744938e19921d",
+      "compressed_cache_c1a": "bec5bb641e6eae5115bd1b2c7781c342eaa296ca9212eecfdf24a700fe96ee54",
+      "index_cache_c1a": "bec5bb641e6eae5115bd1b2c7781c342eaa296ca9212eecfdf24a700fe96ee54",
+      "state_cache_c2a": "632024a79c111a6643d667ede9092cf17311a28c0b83a8f434c0cf350bdd0e61",
+      "input_ids": "e25186642d54bf218f2c3a1f0f2db3e07acddc3c94a1206f8956a650261fa14d",
+      "token_counts": "430cfcf74b4597ef8ede3d0f8780b6797240a089776a45003b5b8084c4c70d5f",
+      "position_ids": "e209a2bb40c536f2a1c085c46fe40013e4eecebb7f868adeead3b3159283ffe8",
+      "request_ids": "792f614114165bd67d0a07161894d2c06ffb56a0f658ef963fa06cc0e9e72616",
+      "index_block_table": "b8025284c8ec6c7f341e9bad5766cdf919dfdf37068997850810f071fc37a1c8",
+      "state_block_table": "57fe3cae3267e9f413a0e855d88f17357890e3a491ca0d0b7ebfe0fe1013d1a3",
+      "window_slots": "a71b51b0d758d9d9925edc7dc381665273b5abaca72b62f6971d3295fe820177",
+      "window_indices": "e5f6e7e536d3e46c63f0480be06472e6716c42ca691744ec7e163894ece257a2",
+      "c1a_compressed_slots": "a71b51b0d758d9d9925edc7dc381665273b5abaca72b62f6971d3295fe820177",
+      "c1a_compressed_lens": "c6441eb703c80cb79ac62edd61bbd5ac494ad60917f309f215f9201012afed96",
+      "c2a_compressed_slots": "edd065e72383741f1d7218fd90bfaf46146afd1aeef534a19c947e92ddffc750",
+      "c2a_compressed_lens": "f82deee77a22f812ccdfad81b340ef8d816ecfddc746807789e0bbf8295e540c",
+      "rope_cos": "a2b1b9e7b1987fbfe111c532382c0ca0f362f0c26e2ffc8f5c638d0511202709",
+      "rope_sin": "6f728e66eb77277104d47f98b283f87cd631dc4e74cc4871de81f59945cc30d7",
+      "rope_cos_swa": "453baf1b26278f084730d602379557c146f97371e6f5534de928e038097d094d",
+      "rope_sin_swa": "fd698b67523de93457992989428e3f83ee92760602a09b3b6aaf668644f96a7d",
+      "c1a_compressed_cos": "a2b1b9e7b1987fbfe111c532382c0ca0f362f0c26e2ffc8f5c638d0511202709",
+      "c1a_compressed_sin": "6f728e66eb77277104d47f98b283f87cd631dc4e74cc4871de81f59945cc30d7",
+      "c2a_compressed_cos": "e9222e0f96e0916fa51353a6d23f644d45dd8372bbdb4cc088c4e0072471676d",
+      "c2a_compressed_sin": "509c6300999431eac74a14fef40e56ecfe818174e0d831ca090d61f3d843527b"
+    }
+  },
+  "actual": {
+    "file": "call1.actual.pt",
+    "sha256": "95c510f7977a8d3d39c5ce1b0e6048f88570e397606429598504ed67d12c7fa0",
+    "tensors": {
+      "window_cache": "b1d24d32a80d7b2ea050c074258c0395946b9a97eafa2480ae940fa565deba16",
+      "compressed_cache_c2a": "edd735dc640d73c546cb3ed3c266ed44b8aa3fec477ba7f747913a7171798d00",
+      "index_cache_c2a": "edd735dc640d73c546cb3ed3c266ed44b8aa3fec477ba7f747913a7171798d00",
+      "compressed_cache_c1a": "b1d24d32a80d7b2ea050c074258c0395946b9a97eafa2480ae940fa565deba16",
+      "index_cache_c1a": "b1d24d32a80d7b2ea050c074258c0395946b9a97eafa2480ae940fa565deba16",
+      "state_cache_c2a": "2ae8741086aeac7053150d9dbba367d67194e70058118b684007cc4afdda0feb",
+      "input_ids": "e25186642d54bf218f2c3a1f0f2db3e07acddc3c94a1206f8956a650261fa14d",
+      "token_counts": "430cfcf74b4597ef8ede3d0f8780b6797240a089776a45003b5b8084c4c70d5f",
+      "position_ids": "e209a2bb40c536f2a1c085c46fe40013e4eecebb7f868adeead3b3159283ffe8",
+      "request_ids": "792f614114165bd67d0a07161894d2c06ffb56a0f658ef963fa06cc0e9e72616",
+      "index_block_table": "b8025284c8ec6c7f341e9bad5766cdf919dfdf37068997850810f071fc37a1c8",
+      "state_block_table": "57fe3cae3267e9f413a0e855d88f17357890e3a491ca0d0b7ebfe0fe1013d1a3",
+      "window_slots": "a71b51b0d758d9d9925edc7dc381665273b5abaca72b62f6971d3295fe820177",
+      "window_indices": "e5f6e7e536d3e46c63f0480be06472e6716c42ca691744ec7e163894ece257a2",
+      "c1a_compressed_slots": "a71b51b0d758d9d9925edc7dc381665273b5abaca72b62f6971d3295fe820177",
+      "c1a_compressed_lens": "c6441eb703c80cb79ac62edd61bbd5ac494ad60917f309f215f9201012afed96",
+      "c2a_compressed_slots": "edd065e72383741f1d7218fd90bfaf46146afd1aeef534a19c947e92ddffc750",
+      "c2a_compressed_lens": "f82deee77a22f812ccdfad81b340ef8d816ecfddc746807789e0bbf8295e540c",
+      "rope_cos": "a2b1b9e7b1987fbfe111c532382c0ca0f362f0c26e2ffc8f5c638d0511202709",
+      "rope_sin": "6f728e66eb77277104d47f98b283f87cd631dc4e74cc4871de81f59945cc30d7",
+      "rope_cos_swa": "453baf1b26278f084730d602379557c146f97371e6f5534de928e038097d094d",
+      "rope_sin_swa": "fd698b67523de93457992989428e3f83ee92760602a09b3b6aaf668644f96a7d",
+      "c1a_compressed_cos": "a2b1b9e7b1987fbfe111c532382c0ca0f362f0c26e2ffc8f5c638d0511202709",
+      "c1a_compressed_sin": "6f728e66eb77277104d47f98b283f87cd631dc4e74cc4871de81f59945cc30d7",
+      "c2a_compressed_cos": "e9222e0f96e0916fa51353a6d23f644d45dd8372bbdb4cc088c4e0072471676d",
+      "c2a_compressed_sin": "509c6300999431eac74a14fef40e56ecfe818174e0d831ca090d61f3d843527b"
+    }
+  },
+  "cache_after": {
+    "window_cache": "b1d24d32a80d7b2ea050c074258c0395946b9a97eafa2480ae940fa565deba16",
+    "compressed_cache_c2a": "edd735dc640d73c546cb3ed3c266ed44b8aa3fec477ba7f747913a7171798d00",
+    "index_cache_c2a": "edd735dc640d73c546cb3ed3c266ed44b8aa3fec477ba7f747913a7171798d00",
+    "state_cache_c2a": "2ae8741086aeac7053150d9dbba367d67194e70058118b684007cc4afdda0feb",
+    "compressed_cache_c1a": "b1d24d32a80d7b2ea050c074258c0395946b9a97eafa2480ae940fa565deba16",
+    "index_cache_c1a": "b1d24d32a80d7b2ea050c074258c0395946b9a97eafa2480ae940fa565deba16"
+  },
+  "history_after": [
+    [
+      127,
+      126
+    ],
+    [
+      127,
+      126
+    ],
+    [
+      126,
+      126
+    ],
+    [
+      127,
+      127
+    ]
+  ],
+  "active_counts": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    0,
+    0,
+    0,
+    0,
+    2,
+    2,
+    2,
+    2
+  ],
+  "mode": "TOY_OWNED_STATE_WRITES_NOT_MATH_OR_NATIVE",
+  "owner_identity": 281461905348864,
+  "artifact": {
+    "kind": "TOY_NOT_NATIVE"
+  }
+}

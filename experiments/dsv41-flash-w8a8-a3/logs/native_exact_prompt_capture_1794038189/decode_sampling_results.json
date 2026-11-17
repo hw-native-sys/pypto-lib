@@ -1,0 +1,291 @@
+{
+  "status": "PASS_SAVED_ACTUAL_DECODE_STRICT4DP_AND_COPY_NEGATIVE",
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "producer_generate_sha256": "685cf3cfadf36c92b5f9c6280f9f9d90ebf0e3244133a2b550adea83ceb29cfb",
+  "decode_manifest_sha256": "424269b3042c1845802bee6ef0f14daddc08ffc6f32c6f5c043607e3ff03c33f",
+  "cpu_receipt_sha256": "e20e195d886c320a1d427cbec05701f79cdaba48142f700c244bc3465fbef4aa",
+  "actual_logits_sha256_before_after": "15a0991e9b176ca494079a73f7acf214391d772bcc7c5f5bba6a9ae27784b687",
+  "sample": {
+    "token_id": 16684,
+    "logit": 5.91607666015625,
+    "shard_argmax": [
+      [
+        5.91607666015625,
+        16684
+      ],
+      [
+        5.91607666015625,
+        49004
+      ],
+      [
+        5.91607666015625,
+        81324
+      ],
+      [
+        5.91607666015625,
+        113644
+      ]
+    ],
+    "dp_disagreements": [],
+    "dp_votes": [
+      {
+        "dp_group": 0,
+        "token_id": 16684,
+        "logit": 5.91607666015625,
+        "shard_argmax": [
+          [
+            5.91607666015625,
+            16684
+          ],
+          [
+            5.91607666015625,
+            49004
+          ],
+          [
+            5.91607666015625,
+            81324
+          ],
+          [
+            5.91607666015625,
+            113644
+          ]
+        ]
+      },
+      {
+        "dp_group": 1,
+        "token_id": 16684,
+        "logit": 5.91607666015625,
+        "shard_argmax": [
+          [
+            5.91607666015625,
+            16684
+          ],
+          [
+            5.91607666015625,
+            49004
+          ],
+          [
+            5.91607666015625,
+            81324
+          ],
+          [
+            5.91607666015625,
+            113644
+          ]
+        ]
+      },
+      {
+        "dp_group": 2,
+        "token_id": 16684,
+        "logit": 5.91607666015625,
+        "shard_argmax": [
+          [
+            5.91607666015625,
+            16684
+          ],
+          [
+            5.91607666015625,
+            49004
+          ],
+          [
+            5.91607666015625,
+            81324
+          ],
+          [
+            5.91607666015625,
+            113644
+          ]
+        ]
+      },
+      {
+        "dp_group": 3,
+        "token_id": 16684,
+        "logit": 5.91607666015625,
+        "shard_argmax": [
+          [
+            5.91607666015625,
+            16684
+          ],
+          [
+            5.91607666015625,
+            49004
+          ],
+          [
+            5.91607666015625,
+            81324
+          ],
+          [
+            5.91607666015625,
+            113644
+          ]
+        ]
+      }
+    ],
+    "agreement_checked": true,
+    "context": {
+      "phase": "decode",
+      "step": 1,
+      "position": 3,
+      "input_token": 17,
+      "prompt_ids": [
+        100,
+        101,
+        102
+      ],
+      "generated_ids": [],
+      "numerical_input_history": [
+        17
+      ],
+      "scope": "fixed token17 numerical case, not greedy text; prefixgreedy16684 was not consumed"
+    }
+  },
+  "copied_one_DP_negative": {
+    "kind": "dp_greedy_disagreement",
+    "selected_dp_group": 0,
+    "row": 0,
+    "selection": {
+      "token_id": 16684,
+      "logit": 5.91607666015625,
+      "shard_argmax": [
+        [
+          5.91607666015625,
+          16684
+        ],
+        [
+          5.91607666015625,
+          49004
+        ],
+        [
+          5.91607666015625,
+          81324
+        ],
+        [
+          5.91607666015625,
+          113644
+        ]
+      ],
+      "dp_disagreements": [
+        {
+          "dp_group": 3,
+          "token_id": 16685,
+          "value": 6.91607666015625
+        }
+      ],
+      "dp_votes": [
+        {
+          "dp_group": 0,
+          "token_id": 16684,
+          "logit": 5.91607666015625,
+          "shard_argmax": [
+            [
+              5.91607666015625,
+              16684
+            ],
+            [
+              5.91607666015625,
+              49004
+            ],
+            [
+              5.91607666015625,
+              81324
+            ],
+            [
+              5.91607666015625,
+              113644
+            ]
+          ]
+        },
+        {
+          "dp_group": 1,
+          "token_id": 16684,
+          "logit": 5.91607666015625,
+          "shard_argmax": [
+            [
+              5.91607666015625,
+              16684
+            ],
+            [
+              5.91607666015625,
+              49004
+            ],
+            [
+              5.91607666015625,
+              81324
+            ],
+            [
+              5.91607666015625,
+              113644
+            ]
+          ]
+        },
+        {
+          "dp_group": 2,
+          "token_id": 16684,
+          "logit": 5.91607666015625,
+          "shard_argmax": [
+            [
+              5.91607666015625,
+              16684
+            ],
+            [
+              5.91607666015625,
+              49004
+            ],
+            [
+              5.91607666015625,
+              81324
+            ],
+            [
+              5.91607666015625,
+              113644
+            ]
+          ]
+        },
+        {
+          "dp_group": 3,
+          "token_id": 16685,
+          "logit": 6.91607666015625,
+          "shard_argmax": [
+            [
+              6.91607666015625,
+              16685
+            ],
+            [
+              5.91607666015625,
+              49004
+            ],
+            [
+              5.91607666015625,
+              81324
+            ],
+            [
+              5.91607666015625,
+              113644
+            ]
+          ]
+        }
+      ],
+      "agreement_checked": true,
+      "context": {
+        "phase": "decode",
+        "step": 1,
+        "position": 3,
+        "input_token": 17,
+        "prompt_ids": [
+          100,
+          101,
+          102
+        ],
+        "generated_ids": [],
+        "numerical_input_history": [
+          17
+        ],
+        "scope": "fixed token17 numerical case, not greedy text; prefixgreedy16684 was not consumed"
+      }
+    }
+  },
+  "original_context_history_and_payload_unchanged": true,
+  "fixture_rebuilds": 0,
+  "NPU": 0,
+  "text_generation": false
+}

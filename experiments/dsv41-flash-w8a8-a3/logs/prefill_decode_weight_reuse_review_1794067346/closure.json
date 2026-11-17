@@ -1,0 +1,17 @@
+{
+  "completed_epoch": 1794068775,
+  "corrected_cpu_identity": {
+    "pid": 3153855,
+    "same_identity_alive": false,
+    "starttick": 106854698
+  },
+  "cpu_tasks": {
+    "task_20261108_001622_27262562150": 1,
+    "task_20261108_002340_315344413623": 0
+  },
+  "native_jobs_submitted": 0,
+  "scope": "CPU mocks/public source only; not current native generation outcome",
+  "source45_all45_match": true,
+  "source45_before_after": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "state": "FINAL_PARK"
+}

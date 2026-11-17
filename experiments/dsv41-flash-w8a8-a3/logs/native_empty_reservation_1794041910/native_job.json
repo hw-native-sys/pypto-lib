@@ -1,0 +1,14 @@
+{
+  "job": "task_20261107_170442_307058025803",
+  "lock_wrapper_pid": 3070688,
+  "allocation": "auto16",
+  "max_time_seconds": 1800,
+  "client_timeout_seconds": 2400,
+  "mode": "probe",
+  "authorization_scope": "empty-allocation-large-probe",
+  "root_scope_correction": "Root explicitly corrected earlier short typo empty-allocation-probe to frozen exact literal empty-allocation-large-probe before submission",
+  "external_validator_sha256": "bac7748403064849ea05ee4c450061425d7e8194c738d9310696b4213fc32523",
+  "accepted_calibration_sha256": "3bc7291e174cccc8a8f0272d9786716a78bccb2ae8336c33fdfd4e10a16927f0",
+  "scope": "noEngram; EMPTY largest16 then57x16 thenfreshbaseline0; no initialized weights/upload/forward",
+  "command": "task-submit --timeout 2400 --device auto --device-num 16 --max-time 1800 --run 'cd /mnt/data/pyptouser/yangyaodong/code/pypto-lib && source activate-pypto.sh && PYTHONDONTWRITEBYTECODE=1 python experiments/dsv41-flash-w8a8-a3/logs/native_empty_reservation_1794041910/run_reservation.py --execute'"
+}

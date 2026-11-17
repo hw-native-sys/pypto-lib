@@ -1,0 +1,19 @@
+{
+  "scope": "noEngram; tiny actual frozen-class CPU persistence tests only; no payload/NPU/validactualgrant",
+  "candidate_sha256": "d057012464331b10b0bdc7f406925ee0c552dd298a1db171a93b0b1595769598",
+  "durability_patch_sha256": "202e870d67c96d83753d02cbc9b5432480e135412952b99418464766f0f736ce",
+  "final_events": 2,
+  "ranks_per_final": 16,
+  "coverage_events": 2,
+  "phases": [
+    "prefill",
+    "decode"
+  ],
+  "critical_fsync_calls": 4,
+  "exact_tiny_maps_endpoints_and_counters_reconstructed": true,
+  "repeat_phase_summary_not_duplicated": true,
+  "incomplete_coverage_refused_before_summary": true,
+  "fsync_failure_refused_before_emitted_or_forward": true,
+  "old32_unchanged": true,
+  "disposition": "PASS narrow durability amendment; combines with prior independent resource/cleanup/cadence CPU proof; product remains HARD/unapplied"
+}

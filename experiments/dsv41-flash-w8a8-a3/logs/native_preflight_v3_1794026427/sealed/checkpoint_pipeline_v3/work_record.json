@@ -1,0 +1,25 @@
+{
+  "record_id": "checkpoint_pipeline_v3_1794024716",
+  "agent": "/root/main_native/checkpoint_pipeline",
+  "scope": "experiments/dsv41-flash-w8a8-a3/logs/checkpoint_integration_v3_1794024669/checkpoint_pipeline_v3",
+  "start_epoch": 1794024716,
+  "end_epoch": 1794025906,
+  "elapsed_seconds": 1190,
+  "kind": "measured_wall_interval",
+  "status": "COMPLETE_PARKED",
+  "task_ids": [
+    "task_20261107_122210_550669820",
+    "task_20261107_122356_652939034",
+    "task_20261107_122451_6832423910",
+    "task_20261107_122558_7177823661",
+    "task_20261107_122751_786953258",
+    "task_20261107_123025_851818822",
+    "task_20261107_123043_8561924152"
+  ],
+  "all_jobs_terminal": true,
+  "NPU_jobs": 0,
+  "real_fixture_calls": 0,
+  "model_sources_modified": false,
+  "shared_ledger_written": false,
+  "Main_import_once": true
+}

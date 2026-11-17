@@ -1,0 +1,15 @@
+{
+  "status": "FAILED_EP_DURABLE_CAPTURE_OWN_SHARED_DICT_CALLBACK",
+  "native_EP_task": "task_20261108_123737_141799917058",
+  "native_TP_task": "task_20261108_124231_143528315331",
+  "live_EP_3gates_PASS": true,
+  "live_TP_2gates_PASS": true,
+  "first_two_EP_durable_snapshots": "LOST_OVERWRITTEN; original bytes UNKNOWN",
+  "last_EP_snapshot": "retained idle_rank0; provenance audit failed first at both",
+  "source_cause": "native_run.py configured=comparators or {} mutates shared comparison dict; later recording wrappers invoke earlier recorders and overwrite earlier paths",
+  "failed_CPU_task": "task_20261108_124633_144643925478",
+  "NPU_retry": 0,
+  "TP_snapshot_source_analysis": "fresh dictionary per execute when comparators=None; targeted savedpacket CPU pending NEW authorized unit",
+  "normal_native_context_returns": "all five live RunResult passed, raw image frees and lock release",
+  "source_or_operator_fault": false
+}

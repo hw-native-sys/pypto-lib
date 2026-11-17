@@ -1,0 +1,44 @@
+{
+  "status": "PASS_FROZEN_APPLIED_SOURCE_AND_CONTRACT_PRECOMPILE",
+  "source45": "d77d196be6541b4a87aef07cf0e5e02eac68cefa9fc245f3742e4c14606555aa",
+  "generate": "d057012464331b10b0bdc7f406925ee0c552dd298a1db171a93b0b1595769598",
+  "rejects": [
+    "default-HARD-even-allow-true",
+    "CPU-receipt-not-real-admission",
+    "SIM-rejected"
+  ],
+  "exact_applied_reviewed_AST": true,
+  "mode": "ExecutionMode.ONBOARD",
+  "backend": "BackendType.Ascend910",
+  "ring_heap": [
+    0,
+    0,
+    4294967296,
+    0
+  ],
+  "logical_compile_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "physical_allocation": null,
+  "prefill_factory_tokens": 3,
+  "decode_MOE_ROWS": 1,
+  "pages": 2,
+  "batch": 1,
+  "static57_per_rank": 39624816576,
+  "samples": 0
+}

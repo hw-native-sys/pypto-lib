@@ -1,0 +1,1 @@
+Bounded read-only source/evidence alias audit: accepted decode19, saved-state chains/N3, tinyactualclass, HCcohort. No tests/producerimports/NPU/payload/newprocess jobs or currentmodel assumptions; no blanket historical retractions. All oldevidence remainsimmutable.

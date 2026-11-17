@@ -1,0 +1,883 @@
+{
+  "changed": [
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_c1a_full.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_c1a_reindex.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_c2a_full.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_c2a_reuse.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_swa.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/layer_reference.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/o_proj.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_c1a_full.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_c1a_reindex.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_c1a_reuse.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_c2a_full.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_c2a_reuse.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_swa.py"
+  ],
+  "source_count": 45,
+  "callers": {
+    "decode_c1a_full.py": [
+      177
+    ],
+    "decode_c1a_reindex.py": [
+      143
+    ],
+    "decode_c2a_full.py": [
+      184
+    ],
+    "decode_c2a_reuse.py": [
+      116
+    ],
+    "decode_swa.py": [
+      107
+    ],
+    "prefill_c1a_full.py": [
+      174
+    ],
+    "prefill_c1a_reindex.py": [
+      144
+    ],
+    "prefill_c1a_reuse.py": [
+      117
+    ],
+    "prefill_c2a_full.py": [
+      186
+    ],
+    "prefill_c2a_reuse.py": [
+      117
+    ],
+    "prefill_swa.py": [
+      109
+    ]
+  },
+  "device_task": "task_20261106_115421_216587328948",
+  "compile_task": "task_20261106_115421_216584112484",
+  "device_rows": [
+    {
+      "entry": "missing",
+      "start": "1793937265",
+      "end": "1793937288",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "forward",
+      "start": "1793937288",
+      "end": "1793937311",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "baseline",
+      "start": "1793937311",
+      "end": "1793937334",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "sparse",
+      "start": "1793937334",
+      "end": "1793937359",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "o_proj",
+      "start": "1793937359",
+      "end": "1793937375",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "mla_proj",
+      "start": "1793937375",
+      "end": "1793937392",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "decode_swa",
+      "start": "1793937392",
+      "end": "1793937412",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "prefill_swa",
+      "start": "1793937412",
+      "end": "1793937431",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "decode_c2a_full",
+      "start": "1793937431",
+      "end": "1793937457",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "prefill_c2a_full",
+      "start": "1793937457",
+      "end": "1793937480",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "decode_c2a_reuse",
+      "start": "1793937480",
+      "end": "1793937500",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "prefill_c2a_reuse",
+      "start": "1793937500",
+      "end": "1793937519",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "decode_c1a_full",
+      "start": "1793937519",
+      "end": "1793937544",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "prefill_c1a_full",
+      "start": "1793937544",
+      "end": "1793937568",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "decode_c1a_reindex",
+      "start": "1793937568",
+      "end": "1793937592",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "prefill_c1a_reindex",
+      "start": "1793937592",
+      "end": "1793937615",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "decode_c1a_reuse",
+      "start": "1793937615",
+      "end": "1793937636",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "prefill_c1a_reuse",
+      "start": "1793937636",
+      "end": "1793937655",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "entry": "indexer",
+      "start": "1793937655",
+      "end": "1793937688",
+      "exit": "0",
+      "device": "0"
+    }
+  ],
+  "compile_rows": [
+    {
+      "entry": "decode_fwd",
+      "start": "1793937266",
+      "end": "1793937294",
+      "exit": "0"
+    },
+    {
+      "entry": "prefill_fwd",
+      "start": "1793937294",
+      "end": "1793937322",
+      "exit": "0"
+    }
+  ],
+  "logs": {
+    "missing": {
+      "run_passes": 0,
+      "output_verdicts": [
+        [
+          "output",
+          "FAIL"
+        ]
+      ]
+    },
+    "forward": {
+      "run_passes": 0,
+      "output_verdicts": [
+        [
+          "output",
+          "FAIL"
+        ]
+      ]
+    },
+    "baseline": {
+      "run_passes": 1,
+      "output_verdicts": [
+        [
+          "output",
+          "PASS"
+        ]
+      ]
+    },
+    "sparse": {
+      "run_passes": 1,
+      "output_verdicts": [
+        [
+          "output",
+          "PASS"
+        ]
+      ]
+    },
+    "o_proj": {
+      "run_passes": 4,
+      "output_verdicts": [
+        [
+          "output",
+          "PASS"
+        ],
+        [
+          "output",
+          "PASS"
+        ],
+        [
+          "output",
+          "PASS"
+        ],
+        [
+          "output",
+          "PASS"
+        ]
+      ]
+    },
+    "mla_proj": {
+      "run_passes": 3,
+      "output_verdicts": [
+        [
+          "q",
+          "PASS"
+        ],
+        [
+          "kv",
+          "PASS"
+        ],
+        [
+          "qr",
+          "PASS"
+        ],
+        [
+          "qr_scale",
+          "PASS"
+        ],
+        [
+          "q",
+          "PASS"
+        ],
+        [
+          "kv",
+          "PASS"
+        ],
+        [
+          "qr",
+          "PASS"
+        ],
+        [
+          "qr_scale",
+          "PASS"
+        ],
+        [
+          "q",
+          "PASS"
+        ],
+        [
+          "kv",
+          "PASS"
+        ],
+        [
+          "qr",
+          "PASS"
+        ],
+        [
+          "qr_scale",
+          "PASS"
+        ]
+      ]
+    },
+    "decode_swa": {
+      "run_passes": 2,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ],
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    "prefill_swa": {
+      "run_passes": 1,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    "decode_c2a_full": {
+      "run_passes": 2,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "state_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ],
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "state_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    "prefill_c2a_full": {
+      "run_passes": 1,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "state_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    "decode_c2a_reuse": {
+      "run_passes": 2,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ],
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    "prefill_c2a_reuse": {
+      "run_passes": 1,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    "decode_c1a_full": {
+      "run_passes": 2,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ],
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    "prefill_c1a_full": {
+      "run_passes": 1,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "compressed_cache",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    "decode_c1a_reindex": {
+      "run_passes": 2,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ],
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    "prefill_c1a_reindex": {
+      "run_passes": 1,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "topk_indices",
+          "PASS"
+        ],
+        [
+          "topk_values",
+          "PASS"
+        ],
+        [
+          "pool_block_ids",
+          "PASS"
+        ],
+        [
+          "pool_block_counts",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    "decode_c1a_reuse": {
+      "run_passes": 2,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ],
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    "prefill_c1a_reuse": {
+      "run_passes": 1,
+      "output_verdicts": [
+        [
+          "window_cache",
+          "PASS"
+        ],
+        [
+          "partial",
+          "PASS"
+        ]
+      ]
+    },
+    "indexer": {
+      "run_passes": 6,
+      "output_verdicts": [
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "scores",
+          "PASS"
+        ],
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "values",
+          "PASS"
+        ],
+        [
+          "pool_ids",
+          "PASS"
+        ],
+        [
+          "pool_counts",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "scores",
+          "PASS"
+        ],
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "values",
+          "PASS"
+        ],
+        [
+          "pool_ids",
+          "PASS"
+        ],
+        [
+          "pool_counts",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "scores",
+          "PASS"
+        ],
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "values",
+          "PASS"
+        ],
+        [
+          "pool_ids",
+          "PASS"
+        ],
+        [
+          "pool_counts",
+          "PASS"
+        ],
+        [
+          "index_cache",
+          "PASS"
+        ],
+        [
+          "scores",
+          "PASS"
+        ],
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "values",
+          "PASS"
+        ],
+        [
+          "pool_ids",
+          "PASS"
+        ],
+        [
+          "pool_counts",
+          "PASS"
+        ],
+        [
+          "pool_ids",
+          "PASS"
+        ],
+        [
+          "pool_counts",
+          "PASS"
+        ],
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "values",
+          "PASS"
+        ],
+        [
+          "pool_ids",
+          "PASS"
+        ],
+        [
+          "pool_counts",
+          "PASS"
+        ],
+        [
+          "indices",
+          "PASS"
+        ],
+        [
+          "values",
+          "PASS"
+        ]
+      ]
+    }
+  },
+  "numerical": {
+    "missing": {
+      "failed_at_existing_gate": 81523,
+      "total": 87040,
+      "max_abs": 2.53125,
+      "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/attention_f02_1793936494/device_v3/build_output/_jit_o_proj_test_20261106_115428_9974xtob"
+    },
+    "forward": {
+      "failed_at_existing_gate": 79691,
+      "total": 87040,
+      "max_abs": 2.55469,
+      "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/attention_f02_1793936494/device_v3/build_output/_jit_o_proj_test_20261106_115451_tig3xk2q"
+    },
+    "baseline": {
+      "passed_existing_gate": true,
+      "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/attention_f02_1793936494/device_v3/build_output/_jit_o_proj_test_20261106_115514_0p419p9a",
+      "exact_error_statistics": "not captured by successful ratio comparator"
+    },
+    "sparse": {
+      "passed_existing_gate": true,
+      "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/attention_f02_1793936494/device_v3/build_output/_jit_o_proj_test_20261106_115538_o7n9nzr6",
+      "exact_error_statistics": "not captured by successful ratio comparator"
+    }
+  },
+  "after_manifest_sha256": "d36bb70d6d4b285785fb92c7c435f8fd99651b895ed91e3a32a675acb016cf7f",
+  "positive_device_cases": 33
+}

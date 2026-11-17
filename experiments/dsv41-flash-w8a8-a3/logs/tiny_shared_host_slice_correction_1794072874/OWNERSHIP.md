@@ -1,0 +1,1 @@
+Root-authorized helper-only correction PREPARATION, no new NPU yet. Original79, failednative46, Main25/currentCC/oldunits immutable. Only singleton slice moves from HOST into CHIP; all owner/admission/config/IO/counters/control semantics unchanged.

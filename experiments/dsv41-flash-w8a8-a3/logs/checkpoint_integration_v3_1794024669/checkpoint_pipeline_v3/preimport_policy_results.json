@@ -1,0 +1,29 @@
+{
+  "status": "PASS_CPU_MOCKED_PREIMPORT_PIN",
+  "controls": [
+    {
+      "name": "missing_external_reference_pin",
+      "reason": "assigned reference policy hash mismatch"
+    },
+    {
+      "name": "changed_policy_external_pin",
+      "reason": "assigned reference policy hash mismatch"
+    },
+    {
+      "name": "changed_derived_external_pin",
+      "reason": "assigned derived receipt hash mismatch"
+    },
+    {
+      "name": "changed_bridge_denied_before_import",
+      "reason": "bridge source changed BEFORE import"
+    },
+    {
+      "name": "unknown_bridge_pin_denied_before_import",
+      "reason": "bridge source changed BEFORE import"
+    }
+  ],
+  "actual_Main_bridge_modified": false,
+  "untrusted_module_execution": false,
+  "NPU": 0,
+  "native_grant": false
+}

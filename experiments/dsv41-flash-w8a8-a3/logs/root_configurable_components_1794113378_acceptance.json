@@ -1,0 +1,44 @@
+{
+  "schema": "observer-bounded-component-acceptance/1",
+  "recorded_epoch": 1794114500.1671839,
+  "accepted": true,
+  "validation_actor": "reviewer_f09 native+savedcapsuleCPU; reviewer_fit independently checked readiness; observer read sealed receipts only",
+  "readiness": "logs/native_configurable_component_capture_1794113378_runtimefacts/READINESS.json",
+  "readiness_sha256": "58e4be00f18eff1f1d1cec7c897bd2f81ebb00ccce4b4e1313d50701edd37442",
+  "EP": {
+    "tp": 1,
+    "ep": 2,
+    "native_task": "task_20261108_125856_147560021682",
+    "saved_CPU_task": "task_20261108_130203_148823526489",
+    "audit_sha256": "1da9ab534f24081eec87d0c0f599217578a47832f1573b73515a23062734ab00",
+    "count_totals": [
+      12,
+      6,
+      6
+    ],
+    "original_output_max_abs_error": [
+      0,
+      0,
+      0
+    ],
+    "durable_case_payloads": "three distinct actual count matrices and three distinct routed outputs; all6 hashes stable; actual/ref separate storage; inactiveexact; idle remote6 service"
+  },
+  "TP": {
+    "tp": 2,
+    "ep": 4,
+    "native_task": "task_20261108_124231_143528315331",
+    "saved_CPU_task": "task_20261108_125254_146155913183",
+    "packet_receipt_sha256": "e48c69f6e2b97112cff252df3f7796935efe1f85c44b54c1efb765bfd54115cb",
+    "scope": "twoTPgroups outputsum and FP32score tail257, originalgates+savedpacket proof"
+  },
+  "known_cleanup": "normal public close/image frees/raw assigned locks release/observed births absent as bounded receipts; unobserved historical identities remainUNKNOWN",
+  "preserved_failures": "first CLI launch failed beforequery; laterEP runtime gatespassed but first2capsulesLOST and saved auditfailed; sealed oldcases not relabeled",
+  "not_claimed": [
+    "all13native",
+    "fullrealE40",
+    "text",
+    "fullparity",
+    "complete process history",
+    "measured peak"
+  ]
+}

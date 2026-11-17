@@ -1,0 +1,21 @@
+{
+  "FUTURE_PROOF.md": "6d935e3b6d516325455bb6e43536db17e7babe575ea2e5b830d62d381f6298ea",
+  "OWNERSHIP.md": "53cd6f293d7cf8381cec513e31fa739dea8bf147ebd9607908160e852834f373",
+  "REPORT.md": "acd3ffcf20f3ff48cff236ab81a8196cbb0d9f398fa8a521b4f5b8c72752e619",
+  "check_public.py": "736309cba270ea0b24d8af4b63a8951d053f9214725c581b5800f038d581d3c3",
+  "check_public_failed_001622.py": "39876ec5c2d4f1dbfb3fae2a5bc274e397a5beb38e3880927fe7e9fc463dba26",
+  "closure.json": "25f2fd82e365be00cc737d92c0904d5bbd5fe0949af04eb66cc633065921a9b5",
+  "results.json": "19e873ab071ceecef42da7d72c06f3914310f6fa9c35c3a49f009f6311b4188c",
+  "source_pins.json": "f83eb8b36d8571bf5583e675e9343a24b00f7e121a7d7afb5374b7495cc10ebf",
+  "source_snapshot/docs/en/dev/06-persistent-l3.md": "adcdf4a682fb81b23daca247ea91d6bf09b21b3e149dbee8b0c787b2a569fafc",
+  "source_snapshot/docs/en/user/00-getting_started.md": "ce6ac9e14d4749d90bbf35fe5e9b1cf2e7cdd5ae7c28b27a00ac835d1db206be",
+  "source_snapshot/docs/en/user/distributed/03-execution.md": "09310b79bc81bc946a15b62fd29df565be4c3f565b51e3d0aa8ad032a6f50eec",
+  "source_snapshot/examples/runtime/multi_program_kv_cache.py": "5bcd1f88d8514294ba208547a7228dd224868c3d2bfef2796d2c421e61770324",
+  "source_snapshot/python/pypto/ir/distributed_compiled_program.py": "b523ea389350c9d1f9880a101ec66ceb36d2a8202a5fb1976a77be3310444e2a",
+  "source_snapshot/python/pypto/runtime/device_tensor.py": "72dc6701eca6dc10a2155773b35a37dee1551c89a89ecf08a8c244571395e8e3",
+  "source_snapshot/python/pypto/runtime/distributed_runner.py": "ca496829a240c81df3c29e77d8ef696bd1e2a7b0f31b9d5c2dcb3b3d82923148",
+  "source_snapshot/python/pypto/runtime/runtime_base.py": "81a319a9e412d5a618de343c5c54103aa14fb2ec2613a6455e3592b797662704",
+  "task_001622.log": "53644050cb4733f97ceecaeb76ba99b1e236a2d413480661dcd32d530465b63f",
+  "task_002340.log": "38785754b03973dba50068524a6c81060a7704fec1d161ee07743b68b6cacba2",
+  "work_record.json": "f68799108a1db3dea4d8f25f9d91224579eee1839ce029d726845ac3aaf722c8"
+}

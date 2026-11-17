@@ -1,0 +1,20 @@
+{
+  "runtime_RunConfig_source": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/pypto/runtime/runner.py",
+  "configurations": {
+    "helper": {
+      "execution_mode": "ExecutionMode.SIM",
+      "is_sim": true,
+      "is_onboard": false
+    },
+    "standalone": {
+      "execution_mode": "ExecutionMode.ONBOARD",
+      "is_sim": false,
+      "is_onboard": true
+    },
+    "corrected": {
+      "execution_mode": "ExecutionMode.ONBOARD",
+      "is_sim": false,
+      "is_onboard": true
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "scope": "noEngram; CPU fake contexts/tiny exact-current-source cleanup only; no NPU/data",
+  "source45": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "open_upload_failure": {
+    "returned_error": {
+      "type": "RuntimeError",
+      "message": "secondary context-close"
+    },
+    "events": [
+      "enter",
+      "upload",
+      "free:a",
+      "free:b",
+      "exit"
+    ],
+    "primary_preserved": false,
+    "fields_cleared": false
+  },
+  "device_run_finally": {
+    "returned_error": {
+      "type": "RuntimeError",
+      "message": "secondary decode-close"
+    },
+    "events": [
+      "decode-close"
+    ],
+    "primary_preserved": false,
+    "remaining_cleanup_attempted": false
+  }
+}

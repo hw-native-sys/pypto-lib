@@ -1,0 +1,33 @@
+{
+  "schema": "observer-prompt-quality-work/1",
+  "role": "observer",
+  "status": "ACTIVE",
+  "recorded_start_epoch": 1794209793.0,
+  "start_basis": "first explicitly recorded clock 2026-11-09 07:36:33 UTC; earlier setup/read time unrecorded and excluded",
+  "record_created_epoch": 1794210474.3904405,
+  "objective": "Real checkpoint multi-prompt quality/diagnosis primarily TP4DP4EP16, not just text/finite/EOS success",
+  "primary_topology": {
+    "tp": 4,
+    "dp": 4,
+    "ep": 16,
+    "world": 16
+  },
+  "baseline_source45": "f0e91a30e4117e110be183ef44acf2874eea813cc6f72ac7c7fa44bc4ede3a7f",
+  "implementation_owner": "/root/main_native",
+  "independent_source_reviewers": [
+    "/root/reviewer_engram",
+    "/root/reviewer_f09",
+    "/root/reviewer_fit"
+  ],
+  "validation_delegated": true,
+  "previous_interturn_gap": "excluded; previous task/observer interval closed",
+  "current_scope": "Source-only planning/reviews plus Main queued CPU preparation; no new actual NPU GO yet",
+  "last_checkpoint_epoch": 1794210474.3904405,
+  "checkpoints": [
+    {
+      "start_epoch": 1794209793.0,
+      "end_epoch": 1794210474.3904405,
+      "note": "Read latest task/project/skills; reactivatedMain and3 source reviewers; latestusersteerprimaryTP4 notTP8; no tests or model implementation byobserver"
+    }
+  ]
+}

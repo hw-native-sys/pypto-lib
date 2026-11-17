@@ -1,0 +1,89 @@
+{
+  "started_epoch": 1794070663.218528,
+  "command": [
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+    "-c",
+    "import time; time.sleep(0.4)"
+  ],
+  "CLI_returncode": 0,
+  "launch_error": null,
+  "postcheck_error": null,
+  "observation_errors": [
+    "post-launch-sample: PermissionError(13, 'CPU injected error-receipt fsync')"
+  ],
+  "wait_errors": [],
+  "CLI_terminal": true,
+  "postcheck_skipped_reason": null,
+  "CLI_pid": 3237789,
+  "CLI_identity": {
+    "pid": 3237789,
+    "start_ticks": "107058516",
+    "state": "R",
+    "parent_pid": 3237715
+  },
+  "postcheck": {
+    "status": "PASS_CPU_POST_CONTROL_ONLY"
+  },
+  "ended_epoch": 1794070663.6838045,
+  "monitor_errors": [],
+  "monitor_thread_alive": false,
+  "telemetry_errors": [
+    {
+      "epoch": 1794070663.2402592,
+      "pid": 3237789,
+      "start_ticks": "107058516",
+      "operation": "read-smaps-rollup",
+      "path": "/proc/3237789/smaps_rollup",
+      "errno": 13,
+      "exception_type": "PermissionError",
+      "error": "PermissionError(13, 'CPU injected EACCES')",
+      "critical": false
+    },
+    {
+      "epoch": 1794070663.2462106,
+      "pid": 3237789,
+      "start_ticks": "107058516",
+      "operation": "fsync-telemetry-error-receipt",
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/telemetry_permission_fix_1794069940/error-receipt-fsync-control/telemetry_errors.jsonl",
+      "errno": 13,
+      "exception_type": "PermissionError",
+      "error": "PermissionError(13, 'CPU injected error-receipt fsync')",
+      "critical": true
+    }
+  ],
+  "critical_telemetry_errors": [
+    {
+      "epoch": 1794070663.2462106,
+      "pid": 3237789,
+      "start_ticks": "107058516",
+      "operation": "fsync-telemetry-error-receipt",
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/telemetry_permission_fix_1794069940/error-receipt-fsync-control/telemetry_errors.jsonl",
+      "errno": 13,
+      "exception_type": "PermissionError",
+      "error": "PermissionError(13, 'CPU injected error-receipt fsync')",
+      "critical": true
+    }
+  ],
+  "full_own_tree_memory_measurement_complete": false,
+  "telemetry_status": "PARTIAL_OR_UNKNOWN",
+  "known_process_identities": [
+    [
+      3237715,
+      "107058353"
+    ],
+    [
+      3237789,
+      "107058516"
+    ]
+  ],
+  "sample_count": 10,
+  "peak_sampled_own_tree_pss": null,
+  "peak_sampled_own_tree_uss": null,
+  "max_complete_sample_pss": 24836096,
+  "max_complete_sample_uss": 21905408,
+  "peak_known_partial_own_tree_pss": 24836096,
+  "peak_known_partial_own_tree_uss": 21905408,
+  "status": "FAIL",
+  "proposed_future_classification": null,
+  "telemetry_policy": "EXISTING_STRICT_FAIL_ON_INCOMPLETE; proposed classification is NOT policy approval"
+}

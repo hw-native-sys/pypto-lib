@@ -1,0 +1,13 @@
+{
+  "identity": {
+    "pid": 1738425,
+    "starttick": "109020648"
+  },
+  "command": [
+    "bash",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/native_stage.sh",
+    "count-old",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_count_old_rank_shards_1794090082/work",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/root_f09_count_probe_rank_acceptance_1794089142.json"
+  ]
+}

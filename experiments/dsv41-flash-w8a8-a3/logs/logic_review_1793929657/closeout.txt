@@ -1,0 +1,11 @@
+status=PARKED
+start_epoch=1793929688
+end_epoch=1793931558
+duration_seconds=1870
+review=REVIEW.md
+verified_findings=15
+final_cpu_task=task_20261106_101043_119692330493
+final_cpu_exit=0
+no_npu_jobs=true
+no_model_or_golden_edits=true
+resumption=Observer relays findings and assigns repairs; reviewer stops.

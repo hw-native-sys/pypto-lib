@@ -1,0 +1,17 @@
+{
+  "schema": "Root-F09-count-active-operation/1",
+  "approved": true,
+  "stage": "count-active",
+  "requested_role": "active",
+  "pins_sha256": "97d681ed869fe34a5d6e72b8e030f7622cb10fafec5650801eb1aa8d9edf3e7d",
+  "prequeue_sha256": "2481d80db4853de235dcbee11a23892abc7478192db46625d980b08a7c10f41f",
+  "lifecycle_acceptance": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/root_f09_count_probe_rank_acceptance_1794089142.json",
+  "lifecycle_acceptance_sha256": "e76b9984db86a27c3c1b4ebd32ab7de97af91357af4c6784746e5e9a3ade0ffa",
+  "source_manifest_sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_count_active_rank_shards_1794089142/work",
+  "root_go_id": "observer-20261108-f09-count-active-rank-shards-native16",
+  "created_at_epoch": 1794089673.4780965,
+  "expires_at_epoch": 1794093173.4780965,
+  "native16_authorized": true,
+  "scope": "ONE count-active 3-call synthetic capture only; stage scope only after actual16 allocation. No old/full/offline/live-source authority. First failure stop, preserve evidence, normal cleanup, no blind retry."
+}

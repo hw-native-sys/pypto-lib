@@ -1,0 +1,42 @@
+{
+  "schema": "bounded-real-weight-transfer-authorization/1",
+  "approved": true,
+  "execution_kind": "ACTUAL_DEVICE_BOUNDED_TRANSFER",
+  "expires_at_epoch": 1794051310,
+  "binding": {
+    "operation": "bounded-real-weight-transfer",
+    "plan_sha256": "6172ee8e67687d176a2ed3e4441c7d2d858ac0e5a5271e3600648721aafda28e",
+    "code_sha256": "5e364da73ac36d59bce09f92dc4efb8501e900175fc91afc08f91cf0da9dfbb5",
+    "policy_sha256": "cc5bc1c4d4dca238e95e3995f13d8570e82c70eea8b5096d67b82f6ad1fa8097",
+    "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+    "device_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "byte_caps": {
+      "unique_source_bytes": 1335642112,
+      "cumulative_source_bytes": 5307123712,
+      "initialized_device_bytes": 5307114496,
+      "readback_bytes": 5307114496,
+      "copy_chunk_bytes": 67108864
+    }
+  },
+  "observer_sha256": "31cd56f5bff3dd6db0f24d47ed2534efbbbe0ec46c68b256b65b0ae3d3eb7892",
+  "observer_cli_sha256": "8fed1c1f6be60e959a8d74f19f83c554b38f7b1b4f34b915ff8deba1a8a57786",
+  "directive": "Root explicit FIRST REAL TENSOR/NPU GO: ONE auto16/max1800 selected four-key bounded-real-weight-transfer only, no model dispatch, all strict source/byte/memory/freshbaseline/close checks, STOP no retry; source762dc and all prior evidence immutable",
+  "encoded_at_epoch": 1794047810.5655744
+}

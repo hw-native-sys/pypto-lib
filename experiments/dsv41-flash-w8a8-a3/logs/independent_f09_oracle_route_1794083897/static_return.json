@@ -1,0 +1,21 @@
+[
+  {
+    "reference": "static_return",
+    "primary_error": null,
+    "integrity_error": "reference mutated static or initial tensor bytes",
+    "static_before": {
+      "w": "f9b72756b8fe71cc2aeca83f488e816573e11fbe431ce0ad23ce06c661d10158"
+    },
+    "initial_before": {
+      "cache": "d99e7d9857573b549e6365926b268de524fb1d244684a755d48e7ca4d15bec0f"
+    },
+    "static_after": {
+      "w": "7222275636e803e633a39911b4ac3f2e296beb5dea540c2d59dd6c2a51203998"
+    },
+    "initial_after": {
+      "cache": "d99e7d9857573b549e6365926b268de524fb1d244684a755d48e7ca4d15bec0f"
+    },
+    "static_unchanged": false,
+    "initial_unchanged": true
+  }
+]

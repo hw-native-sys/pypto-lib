@@ -1,0 +1,14 @@
+{
+  "status": "FINAL_PARK",
+  "artifacts": 12,
+  "artifacts_manifest_sha256": "2a9e22d759f360062972eab81c5d5348860be6dba138201999374fbbe5d5b30c",
+  "live_source45": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "candidate_source45": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "CPU_task": "task_20261108_041243_14069746504",
+  "CPU_PASS": true,
+  "all_own_jobs_ended": true,
+  "no_worker": true,
+  "no_NPU_or_prepare_or_compile_or_fixture_or_headers_or_payload": true,
+  "lifecycle_microproof": "PENDING",
+  "actual16_GO": "PENDING"
+}

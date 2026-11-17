@@ -1,0 +1,5 @@
+{
+  "normal_close": true,
+  "primary_error": "TypeError('StackedDeviceTensor leading index must be int, got slice')",
+  "cleanup_errors": []
+}

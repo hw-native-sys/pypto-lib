@@ -1,0 +1,16 @@
+{
+  "permuted_physical_pages": true,
+  "growing_rows_preserved_128_129_130": true,
+  "excludes_only_current_writes": true,
+  "C1_ratio": 1,
+  "C2_ratio": 2,
+  "state_cache_row_rule": "excluded; own numerical comparator required",
+  "poison_controls": [
+    "recent_WINDOW128",
+    "recent_C1_128",
+    "recent_WINDOW129_at130",
+    "recent_C1_129_at130",
+    "completed_C2_64_at130",
+    "C1ratio1_emits_even"
+  ]
+}

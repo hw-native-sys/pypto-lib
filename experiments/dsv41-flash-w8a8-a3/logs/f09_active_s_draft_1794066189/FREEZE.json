@@ -1,0 +1,20 @@
+{
+  "status": "FINAL/PARK",
+  "artifact_count": 36,
+  "artifact_manifest_sha256": "b25d4222551cc63a91c3412acc21c6dd0a99201072c93e49816e422775120b4e",
+  "whole_patch_sha256": "087ac5af3002ee718bfc4cbb3405abc7d6175e49470e6ba515124b200dc215f3",
+  "proposed_file_sha256": {
+    "moe_exchange.py": "52be1ffae5c3a6956ce17745b5e7d15f3facc35fe9a48f12319ddd6914494bdc",
+    "decode_fwd.py": "ac0ec203d5134a441e5cf0fe7460dee9e24cb8a6d79234495ed83549dcc09bb4",
+    "prefill_fwd.py": "27caa1880383cca8d7e25ad66d58ee8cb8c5aebf2995048978b64263cf23fc88",
+    "layer_reference.py": "9331521c2782e6464baaf799ad7538fe763029e915bacc06a89c1826a1cb9706"
+  },
+  "live_source45CC_unchanged": true,
+  "worker_raw8_unchanged": true,
+  "compile": "PENDING_NOT_RUN",
+  "native": "PENDING_NOT_RUN",
+  "payload_bytes": 0,
+  "actual_grants": 0,
+  "all_own_and_worker_jobs_writers_parked": true,
+  "end_epoch": 1794067711
+}

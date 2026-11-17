@@ -1,0 +1,139 @@
+{
+  "epoch": 1794022038,
+  "parent_pid": 2547220,
+  "phase": "CPU owning prefix golden after native terminal/copyback",
+  "processes": [
+    {
+      "pid": 2547220,
+      "comm": "python",
+      "rss_kib": 120689712,
+      "pss_kib": 18991079,
+      "uss_kib": 9151244
+    },
+    {
+      "pid": 2566505,
+      "comm": "python",
+      "rss_kib": 114494616,
+      "pss_kib": 7116504,
+      "uss_kib": 149484
+    },
+    {
+      "pid": 2566492,
+      "comm": "python",
+      "rss_kib": 114494812,
+      "pss_kib": 7116576,
+      "uss_kib": 149532
+    },
+    {
+      "pid": 2566474,
+      "comm": "python",
+      "rss_kib": 114494800,
+      "pss_kib": 7116572,
+      "uss_kib": 149548
+    },
+    {
+      "pid": 2566468,
+      "comm": "python",
+      "rss_kib": 114494480,
+      "pss_kib": 7116520,
+      "uss_kib": 149520
+    },
+    {
+      "pid": 2566462,
+      "comm": "python",
+      "rss_kib": 114494712,
+      "pss_kib": 7116515,
+      "uss_kib": 149520
+    },
+    {
+      "pid": 2566449,
+      "comm": "python",
+      "rss_kib": 114495016,
+      "pss_kib": 7116577,
+      "uss_kib": 149508
+    },
+    {
+      "pid": 2566442,
+      "comm": "python",
+      "rss_kib": 114494752,
+      "pss_kib": 7116529,
+      "uss_kib": 149508
+    },
+    {
+      "pid": 2566436,
+      "comm": "python",
+      "rss_kib": 114494556,
+      "pss_kib": 7116532,
+      "uss_kib": 149520
+    },
+    {
+      "pid": 2566430,
+      "comm": "python",
+      "rss_kib": 114494772,
+      "pss_kib": 7116551,
+      "uss_kib": 149528
+    },
+    {
+      "pid": 2566423,
+      "comm": "python",
+      "rss_kib": 114494968,
+      "pss_kib": 7116583,
+      "uss_kib": 149520
+    },
+    {
+      "pid": 2566410,
+      "comm": "python",
+      "rss_kib": 114494688,
+      "pss_kib": 7116569,
+      "uss_kib": 149532
+    },
+    {
+      "pid": 2566404,
+      "comm": "python",
+      "rss_kib": 114494780,
+      "pss_kib": 7116562,
+      "uss_kib": 149536
+    },
+    {
+      "pid": 2566398,
+      "comm": "python",
+      "rss_kib": 114494776,
+      "pss_kib": 7116571,
+      "uss_kib": 149536
+    },
+    {
+      "pid": 2566391,
+      "comm": "python",
+      "rss_kib": 114494748,
+      "pss_kib": 7116556,
+      "uss_kib": 149516
+    },
+    {
+      "pid": 2566383,
+      "comm": "python",
+      "rss_kib": 114494748,
+      "pss_kib": 7116594,
+      "uss_kib": 149556
+    },
+    {
+      "pid": 2566372,
+      "comm": "python",
+      "rss_kib": 114493080,
+      "pss_kib": 7116765,
+      "uss_kib": 149840
+    },
+    {
+      "pid": 2566371,
+      "comm": "python",
+      "rss_kib": 10772,
+      "pss_kib": 5802,
+      "uss_kib": 5196
+    }
+  ],
+  "summed_pss_kib": 132861957,
+  "summed_uss_kib": 11549144,
+  "rss_scope": "per-process RSS shown, never summed because fork-shared pages overlap",
+  "system_memavailable_kib": 1544508424,
+  "dev_shm_used_bytes_filesystem_wide": 7612284928,
+  "scope": "bounded legacy validation fixture and independent golden clones; not production streaming or real-weight host fit"
+}

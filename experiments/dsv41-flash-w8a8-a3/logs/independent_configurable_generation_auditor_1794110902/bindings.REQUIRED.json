@@ -1,0 +1,44 @@
+{
+  "schema": "independent-configurable-postcase-pins/1",
+  "status": "REQUIRED_NOT_AUTHORIZED",
+  "topology": {
+    "tp": 8,
+    "ep": 16,
+    "dp": 2,
+    "world": 16,
+    "local_experts": 24
+  },
+  "operation": "configurable-shared-real40-noEngram-greedy-N3",
+  "producer_dir": null,
+  "operation_binding_sha256": null,
+  "runtime_code": {
+    "check_identity.py": null,
+    "outer_runner.py": null,
+    "task_entry.py": null
+  },
+  "source_manifest": null,
+  "source_manifest_sha256": null,
+  "metadata_plan": null,
+  "metadata_plan_sha256": null,
+  "library_sha256": null,
+  "resource_budget": null,
+  "weight_accounting": null,
+  "ancestry": null,
+  "fresh_signature_receipt": {
+    "path": null,
+    "sha256": null,
+    "manifest_path": null,
+    "manifest_sha256": null
+  },
+  "signature_source_field": "source_manifest_sha256",
+  "actual_parameter_counts": null,
+  "identity_signature_evidence": null,
+  "expected_case": null,
+  "actual_task_id": null,
+  "actual_root_go": null,
+  "root_go_receipt": {
+    "path": null,
+    "sha256": null
+  },
+  "root_go_id_field": "root_operation_go_id"
+}

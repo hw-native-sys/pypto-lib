@@ -1,0 +1,11 @@
+{
+  "scope": "CPU tiny integer fake",
+  "free_after": 547,
+  "remaining_target": 448,
+  "reserve": 100,
+  "required_after": 548,
+  "rejected_before_second_allocation": true,
+  "all_handles_freed": true,
+  "normal_close": true,
+  "NPU": 0
+}

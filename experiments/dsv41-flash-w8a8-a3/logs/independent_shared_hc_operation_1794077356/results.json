@@ -1,0 +1,109 @@
+{
+  "status": "PASS_INDEPENDENT_SHARED_HC_OUTER_DELTA_CPU",
+  "actual_binding_sha256": "aee30bb487c41dd8acc6b4a674615e9a6b699dd699f652b291b91c1c35752c07",
+  "source45": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "newplan": "806852d5baec99a522f5adc3015bdd204d9ac6b17244a29cb26445cbd55fda89",
+  "signature_receipt_sha256": "3f5441beade418bf307463188a7b5a52c733299cf6dffde0fe501d4df5fbefd4",
+  "rejected": [
+    {
+      "check": "missing-HC",
+      "error": "ValueError('exact Root-accepted HC math evidence binding required')"
+    },
+    {
+      "check": "missing-signature",
+      "error": "ValueError('fresh independent signature receipt binding changed')"
+    },
+    {
+      "check": "HC-bool-not-int",
+      "error": "ValueError('exact Root-accepted HC math evidence binding required')"
+    },
+    {
+      "check": "PENDING-signature",
+      "error": "ValueError('PENDING fresh independent M02 prefill3+decode1 signatures; old611 forbidden')"
+    },
+    {
+      "check": "stale-D77-611-signature-source",
+      "error": "ValueError('stale/unaccepted signature source/math/plan receipt')"
+    },
+    {
+      "check": "old-plan-signature",
+      "error": "ValueError('stale/unaccepted signature source/math/plan receipt')"
+    },
+    {
+      "check": "one-program-signature",
+      "error": "ValueError('both fresh normal signatures required')"
+    },
+    {
+      "check": "missing-cast-witness",
+      "error": "ValueError('fresh HC cast witnesses required: prefill3')"
+    },
+    {
+      "check": "stale-b3e-source",
+      "error": "ValueError('not the Root-frozen applied source')"
+    },
+    {
+      "check": "old-resource-plan",
+      "error": "ValueError('metadata plan changed')"
+    },
+    {
+      "check": "second-static-upload",
+      "error": "ValueError('exact true-integer shared static accounting required')"
+    },
+    {
+      "check": "bool-static-count",
+      "error": "ValueError('exact true-integer shared static accounting required')"
+    },
+    {
+      "check": "wrong-prompt",
+      "error": "ValueError('wrong fixed longer-N3 operation/prompt/cap binding')"
+    }
+  ],
+  "normal_command": [
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/generate.py",
+    "--device-run",
+    "--device",
+    "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15",
+    "--backend-type",
+    "a2a3",
+    "--model-root",
+    "/mnt/data/models/DeepSeek-V4.1-Flash-w8a8",
+    "--checkpoint",
+    "/mnt/data/models/DeepSeek-V4.1-Flash-w8a8",
+    "--template",
+    "plain",
+    "--prompt",
+    "Once upon a",
+    "--start-position",
+    "0",
+    "--rope-profile",
+    "auto",
+    "--engram-mode",
+    "disabled",
+    "--max-new-tokens",
+    "16",
+    "--repeat",
+    "1",
+    "--max-time",
+    "21600",
+    "--first-real-generation-authorization",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_shared_hc_operation_1794077356/NO_AUTH.json",
+    "--result-json",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_shared_hc_operation_1794077356/NO_PRODUCT/generation.json",
+    "--log-file",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_shared_hc_operation_1794077356/NO_PRODUCT/generation.log"
+  ],
+  "telemetry_strictFAIL_samechild_AST_inherited": true,
+  "resource_header_tokenizer_functions_AST_inherited": true,
+  "task_entry_byteidentical": true,
+  "actual_full_checker_run": false,
+  "front_predicates_real_metadata_only": true,
+  "in_memory_negative_scope": "only mocked read+sha for one signature receipt to reach semantic rejections; finally restored, no file/authority changes",
+  "header_bytes_read": 0,
+  "tensor_payload_bytes": 0,
+  "production_grants_created": 0,
+  "compile": 0,
+  "native": 0,
+  "own_pid": 3552004,
+  "own_starttick": "107785837"
+}

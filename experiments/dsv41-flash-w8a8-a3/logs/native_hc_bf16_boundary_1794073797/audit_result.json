@@ -1,0 +1,112 @@
+{
+  "epoch": 1794074022.6241667,
+  "status": "METADATA_AUDIT_PASS",
+  "checks": [
+    {
+      "check": "honest-terminal-failed-native-status",
+      "pass": true,
+      "detail": "completed (exit=1)\n"
+    },
+    {
+      "check": "post-native-queue0-empty",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "exact-native-GO-created-after-allocation",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "fixed-operator-scope-no-adaptive-heap",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "actual-bytefork-probe-unchanged",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "honest-abnormal-child-no-result",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "first-cause-old-control-receipt-assertion",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "candidate-pass-old-comparison-fail-observed",
+      "pass": true,
+      "detail": {
+        "candidate_pass_lines": 1,
+        "old_fail_lines": 1
+      }
+    },
+    {
+      "check": "both-runtime-callable-images-freed",
+      "pass": true,
+      "detail": 2
+    },
+    {
+      "check": "raw-one-device-lock0-release",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "all-recorded-PID-births-absent",
+      "pass": true,
+      "detail": []
+    },
+    {
+      "check": "recorded-lock-process-absent",
+      "pass": true,
+      "detail": [
+        "3370963"
+      ]
+    },
+    {
+      "check": "runtime-source-and-libraries-unchanged",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "live45CC-unchanged",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "immutable-parent159-unchanged",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "candidate-old-config-original-sources-unchanged",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "all-original-compiled-input-files-unchanged",
+      "pass": true,
+      "detail": []
+    },
+    {
+      "check": "post-terminal-resource-floors",
+      "pass": true,
+      "detail": {
+        "HOST": 1723025633280,
+        "DISK": 8324261085184,
+        "SHM": 1079343157248
+      }
+    }
+  ],
+  "passed": 18,
+  "unmet": [],
+  "recorded_process_births": 10,
+  "native_case_status": "FAILED; not accepted",
+  "native_task": "task_20261108_015136_337085225477",
+  "own_pid": 3377687,
+  "own_birth": "107394376"
+}

@@ -1,0 +1,13 @@
+{
+  "id": "independent-configurable-integration-1794109023-1794109591",
+  "agent": "review-agent",
+  "start_epoch": 1794109023,
+  "end_epoch": 1794109591,
+  "elapsed_seconds": 568,
+  "state": "FINAL_PARK_PROVISIONAL_SOURCE_CHECKPOINT",
+  "CPU_test_jobs": 0,
+  "NPU_jobs": 0,
+  "protected_source_writes": 0,
+  "shared_writes": 0,
+  "TIME_LOG_self_imported_once": true
+}

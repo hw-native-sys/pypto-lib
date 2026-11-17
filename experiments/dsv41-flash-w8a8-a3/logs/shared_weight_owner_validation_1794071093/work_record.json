@@ -1,0 +1,17 @@
+{
+  "CPU_tasks": {
+    "011250": "failed-own-BF16-add-toy",
+    "011439": "failed-own-Vec-tile-toy",
+    "011556": "PASS-signatures-and-source",
+    "012138": "PASS-final-default-and-observation-delta"
+  },
+  "agent": "review-agent",
+  "elapsed_seconds": 1209,
+  "end_epoch": 1794072302,
+  "id": "independent-shared-owner-validation-1794071093-1794072302",
+  "own_native_jobs": 0,
+  "protected_source_writes": 0,
+  "real_payload_bytes": 0,
+  "start_epoch": 1794071093,
+  "state": "FINAL_PARK"
+}

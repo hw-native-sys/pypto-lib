@@ -1,0 +1,9 @@
+{
+  "state": "FINAL_PARK_SOURCE_ONLY_COMPATIBLE",
+  "epoch": 1794090119,
+  "artifact_count": 5,
+  "manifest_sha256": "2b0d43109e78210571f647300b10b125b036f147ce5e314be6c104f42872f60b",
+  "source_only": true,
+  "actual_fullcapture_authorized": false,
+  "all_own_jobs_ended": true
+}

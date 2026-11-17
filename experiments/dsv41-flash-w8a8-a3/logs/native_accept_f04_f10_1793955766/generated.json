@@ -1,0 +1,30 @@
+[
+  {
+    "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/compile/full_compile/_jit_decode_fwd_20261106_170528_y_saw5v5/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp",
+    "sha256": "a7ed09753805581284fd54b789e0914d122bd9bf4171d8794686b268f74c07d3",
+    "bindings": [
+      "2541: params_t68.add_input(ext_c2a_compressed_cos);",
+      "2542: params_t68.add_input(ext_c2a_compressed_sin);",
+      "2655: params_t73.add_input(ext_c2a_compressed_cos);",
+      "2656: params_t73.add_input(ext_c2a_compressed_sin);",
+      "7459: params_t219.add_input(ext_c1a_compressed_cos);",
+      "7460: params_t219.add_input(ext_c1a_compressed_sin);",
+      "7573: params_t224.add_input(ext_c1a_compressed_cos);",
+      "7574: params_t224.add_input(ext_c1a_compressed_sin);"
+    ]
+  },
+  {
+    "path": "experiments/dsv41-flash-w8a8-a3/logs/native_accept_f04_f10_1793955766/compile/full_compile/_jit_prefill_fwd_20261106_170558_jnejmwmh/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp",
+    "sha256": "0dbef1d974af741101bb7b43fcbf90083ae5c1f805cc07ffd48a8f60118c611a",
+    "bindings": [
+      "2828: params_t65.add_input(ext_c2a_compressed_cos);",
+      "2829: params_t65.add_input(ext_c2a_compressed_sin);",
+      "2942: params_t70.add_input(ext_c2a_compressed_cos);",
+      "2943: params_t70.add_input(ext_c2a_compressed_sin);",
+      "6808: params_t184.add_input(ext_c1a_compressed_cos);",
+      "6809: params_t184.add_input(ext_c1a_compressed_sin);",
+      "6922: params_t189.add_input(ext_c1a_compressed_cos);",
+      "6923: params_t189.add_input(ext_c1a_compressed_sin);"
+    ]
+  }
+]

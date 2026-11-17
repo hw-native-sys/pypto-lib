@@ -1,0 +1,532 @@
+device_v3/build_output/_jit_prefill_c2a_reuse_test_20261106_115824_krg3y4fe/orchestration/prefill_c2a_reuse_test.cpp:537
+534:         if ((0 < spmd_core_num_2)) {
+535:             SIMPLER_SCOPE() {
+536: 
+537:                 // Spmd output_inverse_sine_spmd: output_inverse_sine
+538:                 CoreTaskArgs params_t14;
+539:                 params_t14.add_input(ext_rope_sin);
+540:                 params_t14.add_output(inverse_sin_inline899);
+541:                 params_t14.add_scalar(T_DYN);
+542:                 params_t14.launch_spec.set_block_num(spmd_core_num_2);
+543:                 rt_submit_aiv_task(18, params_t14);
+544:                 inverse_sin_inline899__ssa_v1 = inverse_sin_inline899;
+
+device_v3/build_output/_jit_prefill_c2a_reuse_test_20261106_115824_krg3y4fe/orchestration/prefill_c2a_reuse_test.cpp:587
+584: 
+585:                         // Group o_proj_a: MixedKernels (AIC + AIV lanes)
+586:                         CoreTaskArgs params_t16;
+587:                         params_t16.add_input(restored_inline905__rv_v2);
+588:                         params_t16.add_input(ext_wo_a);
+589:                         params_t16.add_inout(mid_inline908__rv_v2);
+590:                         params_t16.add_inout(gm_pipe_buffer_4);
+591:                         params_t16.add_scalar(T_DYN);
+592:                         params_t16.add_scalar(group_col_inline910);
+593:                         params_t16.add_scalar(group_inline909);
+594:                         params_t16.add_scalar(mid_col_inline911);
+
+device_v3/build_output/_jit_prefill_swa_test_20261106_115656_ah0jdbte/orchestration/prefill_swa_test.cpp:526
+523:         if ((0 < spmd_core_num_2)) {
+524:             SIMPLER_SCOPE() {
+525: 
+526:                 // Spmd output_inverse_sine_spmd: output_inverse_sine
+527:                 CoreTaskArgs params_t14;
+528:                 params_t14.add_input(ext_rope_sin);
+529:                 params_t14.add_output(inverse_sin_inline890);
+530:                 params_t14.add_scalar(T_DYN);
+531:                 params_t14.launch_spec.set_block_num(spmd_core_num_2);
+532:                 rt_submit_aiv_task(18, params_t14);
+533:                 inverse_sin_inline890__ssa_v1 = inverse_sin_inline890;
+
+device_v3/build_output/_jit_prefill_swa_test_20261106_115656_ah0jdbte/orchestration/prefill_swa_test.cpp:576
+573: 
+574:                         // Group o_proj_a: MixedKernels (AIC + AIV lanes)
+575:                         CoreTaskArgs params_t16;
+576:                         params_t16.add_input(restored_inline896__rv_v2);
+577:                         params_t16.add_input(ext_wo_a);
+578:                         params_t16.add_inout(mid_inline899__rv_v2);
+579:                         params_t16.add_inout(gm_pipe_buffer_4);
+580:                         params_t16.add_scalar(T_DYN);
+581:                         params_t16.add_scalar(group_col_inline901);
+582:                         params_t16.add_scalar(group_inline900);
+583:                         params_t16.add_scalar(mid_col_inline902);
+
+device_v3/build_output/_jit_decode_swa_attention_test_20261106_115637_x7gzt815/orchestration/decode_swa_attention_test.cpp:526
+523:         if ((0 < spmd_core_num_2)) {
+524:             SIMPLER_SCOPE() {
+525: 
+526:                 // Spmd output_inverse_sine_spmd: output_inverse_sine
+527:                 CoreTaskArgs params_t14;
+528:                 params_t14.add_input(ext_rope_sin);
+529:                 params_t14.add_output(inverse_sin_inline890);
+530:                 params_t14.add_scalar(T_DYN);
+531:                 params_t14.launch_spec.set_block_num(spmd_core_num_2);
+532:                 rt_submit_aiv_task(18, params_t14);
+533:                 inverse_sin_inline890__ssa_v1 = inverse_sin_inline890;
+
+device_v3/build_output/_jit_decode_swa_attention_test_20261106_115637_x7gzt815/orchestration/decode_swa_attention_test.cpp:576
+573: 
+574:                         // Group o_proj_a: MixedKernels (AIC + AIV lanes)
+575:                         CoreTaskArgs params_t16;
+576:                         params_t16.add_input(restored_inline896__rv_v2);
+577:                         params_t16.add_input(ext_wo_a);
+578:                         params_t16.add_inout(mid_inline899__rv_v2);
+579:                         params_t16.add_inout(gm_pipe_buffer_4);
+580:                         params_t16.add_scalar(T_DYN);
+581:                         params_t16.add_scalar(group_col_inline901);
+582:                         params_t16.add_scalar(group_inline900);
+583:                         params_t16.add_scalar(mid_col_inline902);
+
+device_v3/build_output/_jit_decode_reuse_attention_test_20261106_115806_2lz3xima/orchestration/decode_reuse_attention_test.cpp:537
+534:         if ((0 < spmd_core_num_2)) {
+535:             SIMPLER_SCOPE() {
+536: 
+537:                 // Spmd output_inverse_sine_spmd: output_inverse_sine
+538:                 CoreTaskArgs params_t14;
+539:                 params_t14.add_input(ext_rope_sin);
+540:                 params_t14.add_output(inverse_sin_inline899);
+541:                 params_t14.add_scalar(T_DYN);
+542:                 params_t14.launch_spec.set_block_num(spmd_core_num_2);
+543:                 rt_submit_aiv_task(18, params_t14);
+544:                 inverse_sin_inline899__ssa_v1 = inverse_sin_inline899;
+
+device_v3/build_output/_jit_decode_reuse_attention_test_20261106_115806_2lz3xima/orchestration/decode_reuse_attention_test.cpp:587
+584: 
+585:                         // Group o_proj_a: MixedKernels (AIC + AIV lanes)
+586:                         CoreTaskArgs params_t16;
+587:                         params_t16.add_input(restored_inline905__rv_v2);
+588:                         params_t16.add_input(ext_wo_a);
+589:                         params_t16.add_inout(mid_inline908__rv_v2);
+590:                         params_t16.add_inout(gm_pipe_buffer_4);
+591:                         params_t16.add_scalar(T_DYN);
+592:                         params_t16.add_scalar(group_col_inline910);
+593:                         params_t16.add_scalar(group_inline909);
+594:                         params_t16.add_scalar(mid_col_inline911);
+
+device_v3/build_output/_jit_prefill_c2a_full_test_20261106_115742_gu0f17z6/orchestration/prefill_c2a_full_test.cpp:1121
+1118:         if ((0 < spmd_core_num_8)) {
+1119:             SIMPLER_SCOPE() {
+1120: 
+1121:                 // Spmd output_inverse_sine_spmd: output_inverse_sine
+1122:                 CoreTaskArgs params_t33;
+1123:                 params_t33.add_input(ext_rope_sin);
+1124:                 params_t33.add_output(inverse_sin_inline1782);
+1125:                 params_t33.add_scalar(T_DYN);
+1126:                 params_t33.launch_spec.set_block_num(spmd_core_num_8);
+1127:                 rt_submit_aiv_task(38, params_t33);
+1128:                 inverse_sin_inline1782__ssa_v1 = inverse_sin_inline1782;
+
+device_v3/build_output/_jit_prefill_c2a_full_test_20261106_115742_gu0f17z6/orchestration/prefill_c2a_full_test.cpp:1171
+1168: 
+1169:                         // Group o_proj_a: MixedKernels (AIC + AIV lanes)
+1170:                         CoreTaskArgs params_t35;
+1171:                         params_t35.add_input(restored_inline1788__rv_v2);
+1172:                         params_t35.add_input(ext_wo_a);
+1173:                         params_t35.add_inout(mid_inline1791__rv_v2);
+1174:                         params_t35.add_inout(gm_pipe_buffer_10);
+1175:                         params_t35.add_scalar(T_DYN);
+1176:                         params_t35.add_scalar(group_col_inline1793);
+1177:                         params_t35.add_scalar(group_inline1792);
+1178:                         params_t35.add_scalar(mid_col_inline1794);
+
+device_v3/build_output/_jit_decode_c1a_full_attention_test_20261106_115846_iz9m9dph/orchestration/decode_c1a_full_attention_test.cpp:1052
+1049:         if ((0 < spmd_core_num_7)) {
+1050:             SIMPLER_SCOPE() {
+1051: 
+1052:                 // Spmd output_inverse_sine_spmd: output_inverse_sine
+1053:                 CoreTaskArgs params_t30;
+1054:                 params_t30.add_input(ext_rope_sin);
+1055:                 params_t30.add_output(inverse_sin_inline1677);
+1056:                 params_t30.add_scalar(T_DYN);
+1057:                 params_t30.launch_spec.set_block_num(spmd_core_num_7);
+1058:                 rt_submit_aiv_task(36, params_t30);
+1059:                 inverse_sin_inline1677__ssa_v1 = inverse_sin_inline1677;
+
+device_v3/build_output/_jit_decode_c1a_full_attention_test_20261106_115846_iz9m9dph/orchestration/decode_c1a_full_attention_test.cpp:1102
+1099: 
+1100:                         // Group o_proj_a: MixedKernels (AIC + AIV lanes)
+1101:                         CoreTaskArgs params_t32;
+1102:                         params_t32.add_input(restored_inline1683__rv_v2);
+1103:                         params_t32.add_input(ext_wo_a);
+1104:                         params_t32.add_inout(mid_inline1686__rv_v2);
+1105:                         params_t32.add_inout(gm_pipe_buffer_9);
+1106:                         params_t32.add_scalar(T_DYN);
+1107:                         params_t32.add_scalar(group_col_inline1688);
+1108:                         params_t32.add_scalar(group_inline1687);
+1109:                         params_t32.add_scalar(mid_col_inline1689);
+
+device_v3/build_output/_jit_o_proj_test_20261106_115538_o7n9nzr6/orchestration/o_proj_test.cpp:55
+52:         if ((0 < spmd_core_num)) {
+53:             SIMPLER_SCOPE() {
+54: 
+55:                 // Spmd output_inverse_sine_spmd: output_inverse_sine
+56:                 CoreTaskArgs params_t0;
+57:                 params_t0.add_input(ext_sin);
+58:                 params_t0.add_output(inverse_sin_inline32);
+59:                 params_t0.add_scalar(T_DYN);
+60:                 params_t0.launch_spec.set_block_num(spmd_core_num);
+61:                 rt_submit_aiv_task(0, params_t0);
+62:                 inverse_sin_inline32__ssa_v1 = inverse_sin_inline32;
+
+device_v3/build_output/_jit_o_proj_test_20261106_115538_o7n9nzr6/orchestration/o_proj_test.cpp:105
+102: 
+103:                         // Group o_proj_a: MixedKernels (AIC + AIV lanes)
+104:                         CoreTaskArgs params_t2;
+105:                         params_t2.add_input(restored_inline38__rv_v2);
+106:                         params_t2.add_input(ext_wo_a);
+107:                         params_t2.add_inout(mid_inline41__rv_v2);
+108:                         params_t2.add_inout(gm_pipe_buffer_0);
+109:                         params_t2.add_scalar(T_DYN);
+110:                         params_t2.add_scalar(group_col_inline43);
+111:                         params_t2.add_scalar(group_inline42);
+112:                         params_t2.add_scalar(mid_col_inline44);
+
+device_v3/build_output/_jit_o_proj_test_20261106_115602_zd6j84q7/orchestration/o_proj_test.cpp:55
+52:         if ((0 < spmd_core_num)) {
+53:             SIMPLER_SCOPE() {
+54: 
+55:                 // Spmd output_inverse_sine_spmd: output_inverse_sine
+56:                 CoreTaskArgs params_t0;
+57:                 params_t0.add_input(ext_sin);
+58:                 params_t0.add_output(inverse_sin_inline32);
+59:                 params_t0.add_scalar(T_DYN);
+60:                 params_t0.launch_spec.set_block_num(spmd_core_num);
+61:                 rt_submit_aiv_task(0, params_t0);
+62:                 inverse_sin_inline32__ssa_v1 = inverse_sin_inline32;
+
+device_v3/build_output/_jit_o_proj_test_20261106_115602_zd6j84q7/orchestration/o_proj_test.cpp:105
+102: 
+103:                         // Group o_proj_a: MixedKernels (AIC + AIV lanes)
+104:                         CoreTaskArgs params_t2;
+105:                         params_t2.add_input(restored_inline38__rv_v2);
+106:                         params_t2.add_input(ext_wo_a);
+107:                         params_t2.add_inout(mid_inline41__rv_v2);
+108:                         params_t2.add_inout(gm_pipe_buffer_0);
+109:                         params_t2.add_scalar(T_DYN);
+110:                         params_t2.add_scalar(group_col_inline43);
+111:                         params_t2.add_scalar(group_inline42);
+112:                         params_t2.add_scalar(mid_col_inline44);
+
+device_v3/build_output/_jit_decode_reuse_attention_test_20261106_120021_jz4ugcqc/orchestration/decode_reuse_attention_test.cpp:537
+534:         if ((0 < spmd_core_num_2)) {
+535:             SIMPLER_SCOPE() {
+536: 
+537:                 // Spmd output_inverse_sine_spmd: output_inverse_sine
+538:                 CoreTaskArgs params_t14;
+539:                 params_t14.add_input(ext_rope_sin);
+540:                 params_t14.add_output(inverse_sin_inline899);
+541:                 params_t14.add_scalar(T_DYN);
+542:                 params_t14.launch_spec.set_block_num(spmd_core_num_2);
+543:                 rt_submit_aiv_task(18, params_t14);
+544:                 inverse_sin_inline899__ssa_v1 = inverse_sin_inline899;
+
+device_v3/build_output/_jit_decode_reuse_attention_test_20261106_120021_jz4ugcqc/orchestration/decode_reuse_attention_test.cpp:587
+584: 
+585:                         // Group o_proj_a: MixedKernels (AIC + AIV lanes)
+586:                         CoreTaskArgs params_t16;
+587:                         params_t16.add_input(restored_inline905__rv_v2);
+588:                         params_t16.add_input(ext_wo_a);
+589:                         params_t16.add_inout(mid_inline908__rv_v2);
+590:                         params_t16.add_inout(gm_pipe_buffer_4);
+591:                         params_t16.add_scalar(T_DYN);
+592:                         params_t16.add_scalar(group_col_inline910);
+593:                         params_t16.add_scalar(group_inline909);
+594:                         params_t16.add_scalar(mid_col_inline911);
+
+device_v3/build_output/_jit_decode_c2a_full_attention_test_20261106_115718_xh11imaw/orchestration/decode_c2a_full_attention_test.cpp:1124
+1121:         if ((0 < spmd_core_num_8)) {
+1122:             SIMPLER_SCOPE() {
+1123: 
+1124:                 // Spmd output_inverse_sine_spmd: output_inverse_sine
+1125:                 CoreTaskArgs params_t33;
+1126:                 params_t33.add_input(ext_rope_sin);
+1127:                 params_t33.add_output(inverse_sin_inline1782);
+1128:                 params_t33.add_scalar(T_DYN);
+1129:                 params_t33.launch_spec.set_block_num(spmd_core_num_8);
+1130:                 rt_submit_aiv_task(38, params_t33);
+1131:                 inverse_sin_inline1782__ssa_v1 = inverse_sin_inline1782;
+
+device_v3/build_output/_jit_decode_c2a_full_attention_test_20261106_115718_xh11imaw/orchestration/decode_c2a_full_attention_test.cpp:1174
+1171: 
+1172:                         // Group o_proj_a: MixedKernels (AIC + AIV lanes)
+1173:                         CoreTaskArgs params_t35;
+1174:                         params_t35.add_input(restored_inline1788__rv_v2);
+1175:                         params_t35.add_input(ext_wo_a);
+1176:                         params_t35.add_inout(mid_inline1791__rv_v2);
+1177:                         params_t35.add_inout(gm_pipe_buffer_10);
+1178:                         params_t35.add_scalar(T_DYN);
+1179:                         params_t35.add_scalar(group_col_inline1793);
+1180:                         params_t35.add_scalar(group_inline1792);
+1181:                         params_t35.add_scalar(mid_col_inline1794);
+
+device_v3/build_output/_jit_o_proj_test_20261106_115451_tig3xk2q/orchestration/o_proj_test.cpp:54
+51:         if ((0 < spmd_core_num)) {
+52:             SIMPLER_SCOPE() {
+53: 
+54:                 // Spmd output_inverse_sine_spmd: output_inverse_sine
+55:                 CoreTaskArgs params_t0;
+56:                 params_t0.add_input(ext_sin);
+57:                 params_t0.add_output(inverse_sin_inline32);
+58:                 params_t0.add_scalar(T_DYN);
+59:                 params_t0.launch_spec.set_block_num(spmd_core_num);
+60:                 rt_submit_aiv_task(0, params_t0);
+61:             }
+
+device_v3/build_output/_jit_o_proj_test_20261106_115451_tig3xk2q/orchestration/o_proj_test.cpp:102
+99: 
+100:                         // Group o_proj_a: MixedKernels (AIC + AIV lanes)
+101:                         CoreTaskArgs params_t2;
+102:                         params_t2.add_input(restored_inline38__rv_v2);
+103:                         params_t2.add_input(ext_wo_a);
+104:                         params_t2.add_inout(mid_inline41__rv_v2);
+105:                         params_t2.add_inout(gm_pipe_buffer_0);
+106:                         params_t2.add_scalar(T_DYN);
+107:                         params_t2.add_scalar(group_col_inline43);
+108:                         params_t2.add_scalar(group_inline42);
+109:                         params_t2.add_scalar(mid_col_inline44);
+
+device_v3/build_output/_jit_prefill_attention_test_20261106_115909_s_lxula4/orchestration/prefill_attention_test.cpp:1049
+1046:         if ((0 < spmd_core_num_7)) {
+1047:             SIMPLER_SCOPE() {
+1048: 
+1049:                 // Spmd output_inverse_sine_spmd: output_inverse_sine
+1050:                 CoreTaskArgs params_t30;
+1051:                 params_t30.add_input(ext_rope_sin);
+1052:                 params_t30.add_output(inverse_sin_inline1677);
+1053:                 params_t30.add_scalar(T_DYN);
+1054:                 params_t30.launch_spec.set_block_num(spmd_core_num_7);
+1055:                 rt_submit_aiv_task(36, params_t30);
+1056:                 inverse_sin_inline1677__ssa_v1 = inverse_sin_inline1677;
+
+device_v3/build_output/_jit_prefill_attention_test_20261106_115909_s_lxula4/orchestration/prefill_attention_test.cpp:1099
+1096: 
+1097:                         // Group o_proj_a: MixedKernels (AIC + AIV lanes)
+1098:                         CoreTaskArgs params_t32;
+1099:                         params_t32.add_input(restored_inline1683__rv_v2);
+1100:                         params_t32.add_input(ext_wo_a);
+1101:                         params_t32.add_inout(mid_inline1686__rv_v2);
+1102:                         params_t32.add_inout(gm_pipe_buffer_9);
+1103:                         params_t32.add_scalar(T_DYN);
+1104:                         params_t32.add_scalar(group_col_inline1688);
+1105:                         params_t32.add_scalar(group_inline1687);
+1106:                         params_t32.add_scalar(mid_col_inline1689);
+
+device_v3/build_output/_jit_o_proj_test_20261106_115514_0p419p9a/orchestration/o_proj_test.cpp:55
+52:         if ((0 < spmd_core_num)) {
+53:             SIMPLER_SCOPE() {
+54: 
+55:                 // Spmd output_inverse_sine_spmd: output_inverse_sine
+56:                 CoreTaskArgs params_t0;
+57:                 params_t0.add_input(ext_sin);
+58:                 params_t0.add_output(inverse_sin_inline32);
+59:                 params_t0.add_scalar(T_DYN);
+60:                 params_t0.launch_spec.set_block_num(spmd_core_num);
+61:                 rt_submit_aiv_task(0, params_t0);
+62:                 inverse_sin_inline32__ssa_v1 = inverse_sin_inline32;
+
+device_v3/build_output/_jit_o_proj_test_20261106_115514_0p419p9a/orchestration/o_proj_test.cpp:105
+102: 
+103:                         // Group o_proj_a: MixedKernels (AIC + AIV lanes)
+104:                         CoreTaskArgs params_t2;
+105:                         params_t2.add_input(restored_inline38__rv_v2);
+106:                         params_t2.add_input(ext_wo_a);
+107:                         params_t2.add_inout(mid_inline41__rv_v2);
+108:                         params_t2.add_inout(gm_pipe_buffer_0);
+109:                         params_t2.add_scalar(T_DYN);
+110:                         params_t2.add_scalar(group_col_inline43);
+111:                         params_t2.add_scalar(group_inline42);
+112:                         params_t2.add_scalar(mid_col_inline44);
+
+device_v3/build_output/_jit_decode_c1a_reindex_attention_test_20261106_115934_ecp0vypz/orchestration/decode_c1a_reindex_attention_test.cpp:799
+796:         if ((0 < spmd_core_num_4)) {
+797:             SIMPLER_SCOPE() {
+798: 
+799:                 // Spmd output_inverse_sine_spmd: output_inverse_sine
+800:                 CoreTaskArgs params_t20;
+801:                 params_t20.add_input(ext_rope_sin);
+802:                 params_t20.add_output(inverse_sin_inline1237);
+803:                 params_t20.add_scalar(T_DYN);
+804:                 params_t20.launch_spec.set_block_num(spmd_core_num_4);
+805:                 rt_submit_aiv_task(27, params_t20);
+806:                 inverse_sin_inline1237__ssa_v1 = inverse_sin_inline1237;
+
+device_v3/build_output/_jit_decode_c1a_reindex_attention_test_20261106_115934_ecp0vypz/orchestration/decode_c1a_reindex_attention_test.cpp:849
+846: 
+847:                         // Group o_proj_a: MixedKernels (AIC + AIV lanes)
+848:                         CoreTaskArgs params_t22;
+849:                         params_t22.add_input(restored_inline1243__rv_v2);
+850:                         params_t22.add_input(ext_wo_a);
+851:                         params_t22.add_inout(mid_inline1246__rv_v2);
+852:                         params_t22.add_inout(gm_pipe_buffer_7);
+853:                         params_t22.add_scalar(T_DYN);
+854:                         params_t22.add_scalar(group_col_inline1248);
+855:                         params_t22.add_scalar(group_inline1247);
+856:                         params_t22.add_scalar(mid_col_inline1249);
+
+device_v3/build_output/_jit_o_proj_test_20261106_115428_9974xtob/orchestration/o_proj_test.cpp:53
+50:         if ((0 < spmd_core_num)) {
+51:             SIMPLER_SCOPE() {
+52: 
+53:                 // Spmd output_inverse_sine_spmd: output_inverse_sine
+54:                 CoreTaskArgs params_t0;
+55:                 params_t0.add_input(ext_sin);
+56:                 params_t0.add_output(inverse_sin_inline1);
+57:                 params_t0.add_scalar(T_DYN);
+58:                 params_t0.launch_spec.set_block_num(spmd_core_num);
+59:                 rt_submit_aiv_task(0, params_t0);
+60:             }
+
+device_v3/build_output/_jit_prefill_c1a_reindex_test_20261106_115956_qposy760/orchestration/prefill_c1a_reindex_test.cpp:799
+796:         if ((0 < spmd_core_num_4)) {
+797:             SIMPLER_SCOPE() {
+798: 
+799:                 // Spmd output_inverse_sine_spmd: output_inverse_sine
+800:                 CoreTaskArgs params_t20;
+801:                 params_t20.add_input(ext_rope_sin);
+802:                 params_t20.add_output(inverse_sin_inline1237);
+803:                 params_t20.add_scalar(T_DYN);
+804:                 params_t20.launch_spec.set_block_num(spmd_core_num_4);
+805:                 rt_submit_aiv_task(27, params_t20);
+806:                 inverse_sin_inline1237__ssa_v1 = inverse_sin_inline1237;
+
+device_v3/build_output/_jit_prefill_c1a_reindex_test_20261106_115956_qposy760/orchestration/prefill_c1a_reindex_test.cpp:849
+846: 
+847:                         // Group o_proj_a: MixedKernels (AIC + AIV lanes)
+848:                         CoreTaskArgs params_t22;
+849:                         params_t22.add_input(restored_inline1243__rv_v2);
+850:                         params_t22.add_input(ext_wo_a);
+851:                         params_t22.add_inout(mid_inline1246__rv_v2);
+852:                         params_t22.add_inout(gm_pipe_buffer_7);
+853:                         params_t22.add_scalar(T_DYN);
+854:                         params_t22.add_scalar(group_col_inline1248);
+855:                         params_t22.add_scalar(group_inline1247);
+856:                         params_t22.add_scalar(mid_col_inline1249);
+
+device_v3/build_output/_jit_prefill_c1a_reuse_test_20261106_120040_zhdnzjzj/orchestration/prefill_c1a_reuse_test.cpp:537
+534:         if ((0 < spmd_core_num_2)) {
+535:             SIMPLER_SCOPE() {
+536: 
+537:                 // Spmd output_inverse_sine_spmd: output_inverse_sine
+538:                 CoreTaskArgs params_t14;
+539:                 params_t14.add_input(ext_rope_sin);
+540:                 params_t14.add_output(inverse_sin_inline899);
+541:                 params_t14.add_scalar(T_DYN);
+542:                 params_t14.launch_spec.set_block_num(spmd_core_num_2);
+543:                 rt_submit_aiv_task(18, params_t14);
+544:                 inverse_sin_inline899__ssa_v1 = inverse_sin_inline899;
+
+device_v3/build_output/_jit_prefill_c1a_reuse_test_20261106_120040_zhdnzjzj/orchestration/prefill_c1a_reuse_test.cpp:587
+584: 
+585:                         // Group o_proj_a: MixedKernels (AIC + AIV lanes)
+586:                         CoreTaskArgs params_t16;
+587:                         params_t16.add_input(restored_inline905__rv_v2);
+588:                         params_t16.add_input(ext_wo_a);
+589:                         params_t16.add_inout(mid_inline908__rv_v2);
+590:                         params_t16.add_inout(gm_pipe_buffer_4);
+591:                         params_t16.add_scalar(T_DYN);
+592:                         params_t16.add_scalar(group_col_inline910);
+593:                         params_t16.add_scalar(group_inline909);
+594:                         params_t16.add_scalar(mid_col_inline911);
+
+compile_v3/full_compile/_jit_prefill_fwd_20261106_115503_fwo8ur79/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp:1911
+1908:                         if ((0 < spmd_core_num_4)) {
+1909:                             SIMPLER_SCOPE() {
+1910: 
+1911:                                 // Spmd output_inverse_sine_spmd: output_inverse_sine
+1912:                                 CoreTaskArgs params_t31;
+1913:                                 params_t31.add_input(ext_rope_sin_swa);
+1914:                                 params_t31.add_inout(inverse_sin_inline19315);
+1915:                                 params_t31.add_scalar(T_DYN);
+1916:                                 params_t31.launch_spec.set_block_num(spmd_core_num_4);
+1917:                                 rt_submit_aiv_task(35, params_t31);
+1918:                                 inverse_sin_inline19315__ssa_v1 = inverse_sin_inline19315;
+
+compile_v3/full_compile/_jit_prefill_fwd_20261106_115503_fwo8ur79/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp:1961
+1958: 
+1959:                                         // Group o_proj_a: MixedKernels (AIC + AIV lanes)
+1960:                                         CoreTaskArgs params_t33;
+1961:                                         params_t33.add_input(restored_inline19321__rv_v2);
+1962:                                         params_t33.add_input(layer_wo_a_inline18838);
+1963:                                         params_t33.add_inout(mid_inline19324__rv_v2);
+1964:                                         params_t33.add_inout(gm_pipe_buffer_5);
+1965:                                         params_t33.add_scalar(T_DYN);
+1966:                                         params_t33.add_scalar(group_col_inline19326);
+1967:                                         params_t33.add_scalar(group_inline19325);
+1968:                                         params_t33.add_scalar(mid_col_inline19327);
+
+compile_v3/full_compile/_jit_prefill_fwd_20261106_115503_fwo8ur79/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp:3346
+3343:                                 if ((0 < spmd_core_num_17)) {
+3344:                                     SIMPLER_SCOPE() {
+3345: 
+3346:                                         // Spmd output_inverse_sine_spmd_0: output_inverse_sine
+3347:                                         CoreTaskArgs params_t81;
+3348:                                         params_t81.add_input(ext_rope_sin);
+3349:                                         params_t81.add_inout(inverse_sin_inline20216);
+3350:                                         params_t81.add_scalar(T_DYN);
+3351:                                         params_t81.launch_spec.set_block_num(spmd_core_num_17);
+3352:                                         rt_submit_aiv_task(35, params_t81);
+3353:                                         inverse_sin_inline20216__ssa_v1 = inverse_sin_inline20216;
+
+compile_v3/full_compile/_jit_prefill_fwd_20261106_115503_fwo8ur79/next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp:3396
+3393: 
+3394:                                                 // Group o_proj_a: MixedKernels (AIC + AIV lanes)
+3395:                                                 CoreTaskArgs params_t83;
+3396:                                                 params_t83.add_input(restored_inline20222__rv_v2);
+3397:                                                 params_t83.add_input(layer_wo_a_inline18838);
+3398:                                                 params_t83.add_inout(mid_inline20225__rv_v2);
+3399:                                                 params_t83.add_inout(gm_pipe_buffer_18);
+3400:                                                 params_t83.add_scalar(T_DYN);
+3401:                                                 params_t83.add_scalar(group_col_inline20227);
+3402:                                                 params_t83.add_scalar(group_inline20226);
+3403:                                                 params_t83.add_scalar(mid_col_inline20228);
+
+compile_v3/full_compile/_jit_decode_fwd_20261106_115434_z4l_d89z/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp:1287
+1284:                         if ((0 < spmd_core_num_4)) {
+1285:                             SIMPLER_SCOPE() {
+1286: 
+1287:                                 // Spmd output_inverse_sine_spmd: output_inverse_sine
+1288:                                 CoreTaskArgs params_t31;
+1289:                                 params_t31.add_input(ext_rope_sin_swa);
+1290:                                 params_t31.add_inout(inverse_sin_inline13776);
+1291:                                 params_t31.add_scalar(T_DYN);
+1292:                                 params_t31.launch_spec.set_block_num(spmd_core_num_4);
+1293:                                 rt_submit_aiv_task(35, params_t31);
+1294:                                 inverse_sin_inline13776__ssa_v1 = inverse_sin_inline13776;
+
+compile_v3/full_compile/_jit_decode_fwd_20261106_115434_z4l_d89z/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp:1337
+1334: 
+1335:                                         // Group o_proj_a: MixedKernels (AIC + AIV lanes)
+1336:                                         CoreTaskArgs params_t33;
+1337:                                         params_t33.add_input(restored_inline13782__rv_v2);
+1338:                                         params_t33.add_input(layer_wo_a_inline13306);
+1339:                                         params_t33.add_inout(mid_inline13785__rv_v2);
+1340:                                         params_t33.add_inout(gm_pipe_buffer_5);
+1341:                                         params_t33.add_scalar(T_DYN);
+1342:                                         params_t33.add_scalar(group_col_inline13787);
+1343:                                         params_t33.add_scalar(group_inline13786);
+1344:                                         params_t33.add_scalar(mid_col_inline13788);
+
+compile_v3/full_compile/_jit_decode_fwd_20261106_115434_z4l_d89z/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp:2977
+2974:                                 if ((0 < spmd_core_num_17)) {
+2975:                                     SIMPLER_SCOPE() {
+2976: 
+2977:                                         // Spmd output_inverse_sine_spmd_0: output_inverse_sine
+2978:                                         CoreTaskArgs params_t81;
+2979:                                         params_t81.add_input(ext_rope_sin);
+2980:                                         params_t81.add_inout(inverse_sin_inline14691);
+2981:                                         params_t81.add_scalar(T_DYN);
+2982:                                         params_t81.launch_spec.set_block_num(spmd_core_num_17);
+2983:                                         rt_submit_aiv_task(35, params_t81);
+2984:                                         inverse_sin_inline14691__ssa_v1 = inverse_sin_inline14691;
+
+compile_v3/full_compile/_jit_decode_fwd_20261106_115434_z4l_d89z/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp:3027
+3024: 
+3025:                                                 // Group o_proj_a: MixedKernels (AIC + AIV lanes)
+3026:                                                 CoreTaskArgs params_t83;
+3027:                                                 params_t83.add_input(restored_inline14697__rv_v2);
+3028:                                                 params_t83.add_input(layer_wo_a_inline13306);
+3029:                                                 params_t83.add_inout(mid_inline14700__rv_v2);
+3030:                                                 params_t83.add_inout(gm_pipe_buffer_18);
+3031:                                                 params_t83.add_scalar(T_DYN);
+3032:                                                 params_t83.add_scalar(group_col_inline14702);
+3033:                                                 params_t83.add_scalar(group_inline14701);
+3034:                                                 params_t83.add_scalar(mid_col_inline14703);

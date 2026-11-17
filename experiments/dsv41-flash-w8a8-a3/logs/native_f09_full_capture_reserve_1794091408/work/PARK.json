@@ -1,0 +1,13 @@
+{
+  "status": "FAILED_RETENTION_SECOND_DISPATCH_FINAL_PARK",
+  "native_exit": 1,
+  "normal_owner_close": true,
+  "saved_call_records": 1,
+  "outer_owner_records": 0,
+  "partial_snapshots": 3,
+  "call1_actual_lost": true,
+  "full_threecall_or_171_pass": false,
+  "future_grant": false,
+  "ownjobs": 0,
+  "shared_writes": 0
+}

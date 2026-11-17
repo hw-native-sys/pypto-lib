@@ -1,0 +1,23 @@
+{
+  "schema": "measured-source-only-actual-audit-binding/1",
+  "unique_id": "review-agent-configurable-running-case-binding-1794114713",
+  "role": "review-agent",
+  "agent": "/root/repetition_review",
+  "status": "FINAL_SOURCE_READY_PARK",
+  "start_epoch": 1794114713,
+  "end_epoch": 1794114983,
+  "elapsed_seconds": 270,
+  "CPU_jobs": 0,
+  "tests": 0,
+  "model_runtime_imports": 0,
+  "header_scans": 0,
+  "tensor_payload_bytes_read": 0,
+  "compile_prepare_NPU": 0,
+  "actual_audits": 0,
+  "model_writes": 0,
+  "shared_writes": 0,
+  "protected_raw_writes": 0,
+  "new_positive_authorizations": 0,
+  "Root_import": "once, source-only interval; inherited1367s and37checks excluded",
+  "next_stage": "SAME terminal+mandatoryPOST+Rootfollowup; create only NEW real input/output files"
+}

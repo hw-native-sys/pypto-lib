@@ -1,0 +1,33 @@
+{
+  "status": "SOURCE_REVIEW_PASS_CPU_PREPARATION_ONLY",
+  "worker_ancestry": {
+    "moe_ep_AST_sha256": "def5b9a44ffd8b7893758b155250f1691b6677cb9dac0c681b6902d56bc98b0f",
+    "moe_ffn_AST_sha256": "e574fd1fded69bc98007e28bbba52cf4eca7a3ff5f1f872fb675ae82a93b1835",
+    "operator_AST_same_as_worker_FINAL": true,
+    "golden_only_wholefile_change": "650273d771f0468cd0c6088f2adb20fd93e0b542de036fd419dc7e780210a454"
+  },
+  "dependency_pins_sha256": "42b3b07abb096d53415aa022592412b7bcd64fdc797e45e39f8af3282694b05c",
+  "generated_ep": {
+    "compact_clear_blocks": 192,
+    "slab_shape": [
+      192,
+      16,
+      5120
+    ],
+    "flat_slab_rows": 3072,
+    "distributed_rows": 384,
+    "HOST_static_whole_rank_shards": 12,
+    "counts_shape": [
+      2,
+      2,
+      192
+    ],
+    "counts_dtype": "INT32",
+    "active_count_dynamic_cpp_read": true,
+    "combine_block_num": 1,
+    "combine_inner_PTO_guard": "v42 < v4",
+    "completion_chain": "Task24 moe_combine -> Task25 moe_return_consumed -> Task26 independent_route_counts explicit TaskId edges"
+  },
+  "native_executed": false,
+  "full_real_text_proven": false
+}

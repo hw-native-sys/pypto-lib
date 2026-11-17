@@ -1,0 +1,1087 @@
+{
+  "arguments": [
+    {
+      "argument": "embed_weight",
+      "source_count": 1,
+      "first": "embed.weight",
+      "last": "embed.weight",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            129280,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "bytes_each": 1323827200,
+          "count": 1
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "hc_attn_fn",
+      "source_count": 40,
+      "first": "layers.0.hc_attn_fn",
+      "last": "layers.39.hc_attn_fn",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            24,
+            20480
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 1966080,
+          "count": 40
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "hc_attn_scale",
+      "source_count": 40,
+      "first": "layers.0.hc_attn_scale",
+      "last": "layers.39.hc_attn_scale",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            3
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 12,
+          "count": 40
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "hc_attn_base",
+      "source_count": 40,
+      "first": "layers.0.hc_attn_base",
+      "last": "layers.39.hc_attn_base",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            24
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 96,
+          "count": 40
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "attn_norm_w",
+      "source_count": 40,
+      "first": "layers.0.attn_norm.weight",
+      "last": "layers.39.attn_norm.weight",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "bytes_each": 10240,
+          "count": 40
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "wq_a",
+      "source_count": 120,
+      "first": "layers.0.attn.wq_a.weight",
+      "last": "layers.39.attn.wq_a.weight_offset",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            1280,
+            5120
+          ],
+          "dtype": "torch.int8",
+          "bytes_each": 6553600,
+          "count": 40
+        },
+        {
+          "shape": [
+            1280,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 5120,
+          "count": 80
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "wq_a_scale",
+      "source_count": 40,
+      "first": "layers.0.attn.wq_a.weight_scale",
+      "last": "layers.39.attn.wq_a.weight_scale",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            1280,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 5120,
+          "count": 40
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "q_norm_w",
+      "source_count": 40,
+      "first": "layers.0.attn.q_norm.weight",
+      "last": "layers.39.attn.q_norm.weight",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            1280
+          ],
+          "dtype": "torch.bfloat16",
+          "bytes_each": 2560,
+          "count": 40
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "wq_b",
+      "source_count": 120,
+      "first": "layers.0.attn.wq_b.weight",
+      "last": "layers.39.attn.wq_b.weight_offset",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            32768,
+            1280
+          ],
+          "dtype": "torch.int8",
+          "bytes_each": 41943040,
+          "count": 40
+        },
+        {
+          "shape": [
+            32768,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 131072,
+          "count": 80
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "wq_b_scale",
+      "source_count": 40,
+      "first": "layers.0.attn.wq_b.weight_scale",
+      "last": "layers.39.attn.wq_b.weight_scale",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            32768,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 131072,
+          "count": 40
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "wkv",
+      "source_count": 120,
+      "first": "layers.0.attn.wkv.weight",
+      "last": "layers.39.attn.wkv.weight_offset",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            512,
+            5120
+          ],
+          "dtype": "torch.int8",
+          "bytes_each": 2621440,
+          "count": 40
+        },
+        {
+          "shape": [
+            512,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 2048,
+          "count": 80
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "wkv_scale",
+      "source_count": 40,
+      "first": "layers.0.attn.wkv.weight_scale",
+      "last": "layers.39.attn.wkv.weight_scale",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            512,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 2048,
+          "count": 40
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "kv_norm_w",
+      "source_count": 40,
+      "first": "layers.0.attn.kv_norm.weight",
+      "last": "layers.39.attn.kv_norm.weight",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            512
+          ],
+          "dtype": "torch.bfloat16",
+          "bytes_each": 1024,
+          "count": 40
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "sink",
+      "source_count": 40,
+      "first": "layers.0.attn.attn_sink",
+      "last": "layers.39.attn.attn_sink",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            64
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 256,
+          "count": 40
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "wo_a",
+      "source_count": 40,
+      "first": "layers.0.attn.wo_a.weight",
+      "last": "layers.39.attn.wo_a.weight",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            8192,
+            4096
+          ],
+          "dtype": "torch.bfloat16",
+          "bytes_each": 67108864,
+          "count": 40
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "wo_b",
+      "source_count": 40,
+      "first": "layers.0.attn.wo_b.weight",
+      "last": "layers.39.attn.wo_b.weight",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            5120,
+            8192
+          ],
+          "dtype": "torch.bfloat16",
+          "bytes_each": 83886080,
+          "count": 40
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "hc_ffn_fn",
+      "source_count": 40,
+      "first": "layers.0.hc_ffn_fn",
+      "last": "layers.39.hc_ffn_fn",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            24,
+            20480
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 1966080,
+          "count": 40
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "hc_ffn_scale",
+      "source_count": 40,
+      "first": "layers.0.hc_ffn_scale",
+      "last": "layers.39.hc_ffn_scale",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            3
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 12,
+          "count": 40
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "hc_ffn_base",
+      "source_count": 40,
+      "first": "layers.0.hc_ffn_base",
+      "last": "layers.39.hc_ffn_base",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            24
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 96,
+          "count": 40
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "ffn_norm_w",
+      "source_count": 40,
+      "first": "layers.0.ffn_norm.weight",
+      "last": "layers.39.ffn_norm.weight",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "bytes_each": 10240,
+          "count": 40
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "gate_weight",
+      "source_count": 40,
+      "first": "layers.0.ffn.gate.weight",
+      "last": "layers.39.ffn.gate.weight",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            384,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "bytes_each": 3932160,
+          "count": 40
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "gate_bias",
+      "source_count": 40,
+      "first": "layers.0.ffn.gate.bias",
+      "last": "layers.39.ffn.gate.bias",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            384
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 1536,
+          "count": 40
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "shared_w1",
+      "source_count": 120,
+      "first": "layers.0.ffn.shared_experts.w1.weight",
+      "last": "layers.39.ffn.shared_experts.w1.weight_offset",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            2304,
+            5120
+          ],
+          "dtype": "torch.int8",
+          "bytes_each": 11796480,
+          "count": 40
+        },
+        {
+          "shape": [
+            2304,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 9216,
+          "count": 80
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "shared_w1_scale",
+      "source_count": 40,
+      "first": "layers.0.ffn.shared_experts.w1.weight_scale",
+      "last": "layers.39.ffn.shared_experts.w1.weight_scale",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            2304,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 9216,
+          "count": 40
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "shared_w3",
+      "source_count": 120,
+      "first": "layers.0.ffn.shared_experts.w3.weight",
+      "last": "layers.39.ffn.shared_experts.w3.weight_offset",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            2304,
+            5120
+          ],
+          "dtype": "torch.int8",
+          "bytes_each": 11796480,
+          "count": 40
+        },
+        {
+          "shape": [
+            2304,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 9216,
+          "count": 80
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "shared_w3_scale",
+      "source_count": 40,
+      "first": "layers.0.ffn.shared_experts.w3.weight_scale",
+      "last": "layers.39.ffn.shared_experts.w3.weight_scale",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            2304,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 9216,
+          "count": 40
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "shared_w2",
+      "source_count": 120,
+      "first": "layers.0.ffn.shared_experts.w2.weight",
+      "last": "layers.39.ffn.shared_experts.w2.weight_offset",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            5120,
+            2304
+          ],
+          "dtype": "torch.int8",
+          "bytes_each": 11796480,
+          "count": 40
+        },
+        {
+          "shape": [
+            5120,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 20480,
+          "count": 80
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "shared_w2_scale",
+      "source_count": 40,
+      "first": "layers.0.ffn.shared_experts.w2.weight_scale",
+      "last": "layers.39.ffn.shared_experts.w2.weight_scale",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            5120,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 20480,
+          "count": 40
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "w1",
+      "source_count": 30720,
+      "first": "layers.0.ffn.experts.0.w1.weight",
+      "last": "layers.39.ffn.experts.383.w1.weight_offset",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            2304,
+            5120
+          ],
+          "dtype": "torch.int8",
+          "bytes_each": 11796480,
+          "count": 15360
+        },
+        {
+          "shape": [
+            2304,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 9216,
+          "count": 15360
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "w1_scale",
+      "source_count": 15360,
+      "first": "layers.0.ffn.experts.0.w1.weight_scale",
+      "last": "layers.39.ffn.experts.383.w1.weight_scale",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            2304,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 9216,
+          "count": 15360
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "w3",
+      "source_count": 30720,
+      "first": "layers.0.ffn.experts.0.w3.weight",
+      "last": "layers.39.ffn.experts.383.w3.weight_offset",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            2304,
+            5120
+          ],
+          "dtype": "torch.int8",
+          "bytes_each": 11796480,
+          "count": 15360
+        },
+        {
+          "shape": [
+            2304,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 9216,
+          "count": 15360
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "w3_scale",
+      "source_count": 15360,
+      "first": "layers.0.ffn.experts.0.w3.weight_scale",
+      "last": "layers.39.ffn.experts.383.w3.weight_scale",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            2304,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 9216,
+          "count": 15360
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "w2",
+      "source_count": 30720,
+      "first": "layers.0.ffn.experts.0.w2.weight",
+      "last": "layers.39.ffn.experts.383.w2.weight_offset",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            5120,
+            2304
+          ],
+          "dtype": "torch.int8",
+          "bytes_each": 11796480,
+          "count": 15360
+        },
+        {
+          "shape": [
+            5120,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 20480,
+          "count": 15360
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "w2_scale",
+      "source_count": 15360,
+      "first": "layers.0.ffn.experts.0.w2.weight_scale",
+      "last": "layers.39.ffn.experts.383.w2.weight_scale",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            5120,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 20480,
+          "count": 15360
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "c2a_comp_wkv",
+      "source_count": 3,
+      "first": "layers.2.attn.compressor.wkv.weight",
+      "last": "layers.14.attn.compressor.wkv.weight",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            512,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "bytes_each": 5242880,
+          "count": 3
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "c2a_comp_wgate",
+      "source_count": 3,
+      "first": "layers.2.attn.compressor.wgate.weight",
+      "last": "layers.14.attn.compressor.wgate.weight",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            512,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "bytes_each": 5242880,
+          "count": 3
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "c2a_comp_norm",
+      "source_count": 3,
+      "first": "layers.2.attn.compressor.norm.weight",
+      "last": "layers.14.attn.compressor.norm.weight",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            512
+          ],
+          "dtype": "torch.bfloat16",
+          "bytes_each": 1024,
+          "count": 3
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "c2a_idx_wq_b",
+      "source_count": 9,
+      "first": "layers.2.attn.indexer.wq_b.weight",
+      "last": "layers.14.attn.indexer.wq_b.weight_offset",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            4096,
+            1280
+          ],
+          "dtype": "torch.int8",
+          "bytes_each": 5242880,
+          "count": 3
+        },
+        {
+          "shape": [
+            4096,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 16384,
+          "count": 6
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "c2a_idx_wq_b_scale",
+      "source_count": 3,
+      "first": "layers.2.attn.indexer.wq_b.weight_scale",
+      "last": "layers.14.attn.indexer.wq_b.weight_scale",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            4096,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 16384,
+          "count": 3
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "c2a_idx_weights_proj",
+      "source_count": 3,
+      "first": "layers.2.attn.indexer.weights_proj.weight",
+      "last": "layers.14.attn.indexer.weights_proj.weight",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            32,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "bytes_each": 327680,
+          "count": 3
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "c2a_idx_wk",
+      "source_count": 3,
+      "first": "layers.2.attn.indexer.wk.weight",
+      "last": "layers.14.attn.indexer.wk.weight",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            128,
+            512
+          ],
+          "dtype": "torch.bfloat16",
+          "bytes_each": 131072,
+          "count": 3
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "c2a_idx_k_norm",
+      "source_count": 3,
+      "first": "layers.2.attn.indexer.k_norm.weight",
+      "last": "layers.14.attn.indexer.k_norm.weight",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            128
+          ],
+          "dtype": "torch.bfloat16",
+          "bytes_each": 256,
+          "count": 3
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "c1a_comp_wkv",
+      "source_count": 1,
+      "first": "layers.20.attn.compressor.wkv.weight",
+      "last": "layers.20.attn.compressor.wkv.weight",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            512,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "bytes_each": 5242880,
+          "count": 1
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "c1a_comp_norm",
+      "source_count": 1,
+      "first": "layers.20.attn.compressor.norm.weight",
+      "last": "layers.20.attn.compressor.norm.weight",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            512
+          ],
+          "dtype": "torch.bfloat16",
+          "bytes_each": 1024,
+          "count": 1
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "c1a_idx_wq_b",
+      "source_count": 3,
+      "first": "layers.20.attn.indexer.wq_b.weight",
+      "last": "layers.20.attn.indexer.wq_b.weight_offset",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            4096,
+            1280
+          ],
+          "dtype": "torch.int8",
+          "bytes_each": 5242880,
+          "count": 1
+        },
+        {
+          "shape": [
+            4096,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 16384,
+          "count": 2
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "c1a_idx_wq_b_scale",
+      "source_count": 1,
+      "first": "layers.20.attn.indexer.wq_b.weight_scale",
+      "last": "layers.20.attn.indexer.wq_b.weight_scale",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            4096,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 16384,
+          "count": 1
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "c1a_idx_weights_proj",
+      "source_count": 1,
+      "first": "layers.20.attn.indexer.weights_proj.weight",
+      "last": "layers.20.attn.indexer.weights_proj.weight",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            32,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "bytes_each": 327680,
+          "count": 1
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "c1a_idx_wk",
+      "source_count": 1,
+      "first": "layers.20.attn.indexer.wk.weight",
+      "last": "layers.20.attn.indexer.wk.weight",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            128,
+            512
+          ],
+          "dtype": "torch.bfloat16",
+          "bytes_each": 131072,
+          "count": 1
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "c1a_idx_k_norm",
+      "source_count": 1,
+      "first": "layers.20.attn.indexer.k_norm.weight",
+      "last": "layers.20.attn.indexer.k_norm.weight",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            128
+          ],
+          "dtype": "torch.bfloat16",
+          "bytes_each": 256,
+          "count": 1
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "re_idx_wq_b",
+      "source_count": 12,
+      "first": "layers.24.attn.indexer.wq_b.weight",
+      "last": "layers.36.attn.indexer.wq_b.weight_offset",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            4096,
+            1280
+          ],
+          "dtype": "torch.int8",
+          "bytes_each": 5242880,
+          "count": 4
+        },
+        {
+          "shape": [
+            4096,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 16384,
+          "count": 8
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "re_idx_wq_b_scale",
+      "source_count": 4,
+      "first": "layers.24.attn.indexer.wq_b.weight_scale",
+      "last": "layers.36.attn.indexer.wq_b.weight_scale",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            4096,
+            1
+          ],
+          "dtype": "torch.float32",
+          "bytes_each": 16384,
+          "count": 4
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "re_idx_weights_proj",
+      "source_count": 4,
+      "first": "layers.24.attn.indexer.weights_proj.weight",
+      "last": "layers.36.attn.indexer.weights_proj.weight",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            32,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "bytes_each": 327680,
+          "count": 4
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "engram_wkv",
+      "binding": "runtime-disabled boundedzero generator; no real Engram source requested",
+      "source_count": 0
+    },
+    {
+      "argument": "engram_qk",
+      "binding": "runtime-disabled boundedzero generator; no real Engram source requested",
+      "source_count": 0
+    },
+    {
+      "argument": "engram_rotation",
+      "binding": "runtime-disabled boundedzero generator; no real Engram source requested",
+      "source_count": 0
+    },
+    {
+      "argument": "final_norm",
+      "source_count": 1,
+      "first": "norm.weight",
+      "last": "norm.weight",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "bytes_each": 10240,
+          "count": 1
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    },
+    {
+      "argument": "lm_head_weight",
+      "source_count": 1,
+      "first": "head.weight",
+      "last": "head.weight",
+      "shape_dtype_byte_histogram": [
+        {
+          "shape": [
+            129280,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "bytes_each": 1323827200,
+          "count": 1
+        }
+      ],
+      "binding_limit": "header names/shapes/dtypes only; offset values/representability, numeric scales and NZ payload correctness require established bounded tests and real payload gates"
+    }
+  ],
+  "payload_reads": 0,
+  "header_shards": 263,
+  "source_before_after_equal": true
+}

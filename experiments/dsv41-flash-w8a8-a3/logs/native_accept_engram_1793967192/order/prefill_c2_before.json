@@ -1,0 +1,8 @@
+{
+  "post_mutant": false,
+  "error": null,
+  "phase": "prefill",
+  "mode": "c2",
+  "real_rotation_map": true,
+  "full_layer": false
+}

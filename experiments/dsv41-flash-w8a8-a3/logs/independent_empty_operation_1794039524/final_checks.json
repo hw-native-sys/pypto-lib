@@ -1,0 +1,45 @@
+{
+  "record_id": "independent-empty-operation-1794039524-1794039963",
+  "start_epoch_first_measured": 1794039524,
+  "end_epoch": 1794039963,
+  "elapsed_seconds": 439,
+  "status": "FINAL/PARK after this seal collector completes",
+  "scope": "noEngram; CPU/source only",
+  "jobs": {
+    "task_20261107_162209_245073721350": "completed (exit=1)",
+    "task_20261107_162244_245263731619": "completed (exit=0)",
+    "task_20261107_162051_24467694384": "completed (exit=0)"
+  },
+  "prior_jobs_all_terminal": true,
+  "own_review_pid_absent": true,
+  "protected_manifests": {
+    "empty_fit_operation_1794037635": {
+      "manifest_sha256": "f55ce7d59678f0977d466e673e3c0ad0429b5c26cdddf6253bf059cb9630c556",
+      "files": 478,
+      "unchanged": true
+    },
+    "generation_entry_1794035858": {
+      "manifest_sha256": "a37109462df44b9416c7401ced49c881628a0ccbe059e277126e1115c428b1cc",
+      "files": 31,
+      "unchanged": true
+    },
+    "fit_post_guard_1794037055": {
+      "manifest_sha256": "184fc558f8c08bc5c9f1a839da73b68ce9665f0fdc483632377c99508a38340b",
+      "files": 48,
+      "unchanged": true
+    },
+    "independent_fit_review_1794036966": {
+      "manifest_sha256": "19c8e3bf2a7604ac1981a710c56debab93f4023d9e06a574c9af8205f52518ff",
+      "files": 35,
+      "unchanged": true
+    }
+  },
+  "production45_unchanged": true,
+  "NPU_jobs": 0,
+  "actual_device_prepare_calls": 0,
+  "real_allocations": 0,
+  "payload_reads": 0,
+  "full40_peak": null,
+  "acceptance": "calibrate-only CPU/source ready for separate root assignment; no NPU GO",
+  "later_probe_limitation": "final after-free query drift beyond tolerance is recorded, not checked; notify root before large-probe scope"
+}

@@ -1,0 +1,10 @@
+{
+  "state": "FINAL/PARK",
+  "epoch": 1794111596.297636,
+  "cpu_task": "COMPLETE0",
+  "no_owned_jobs_running": true,
+  "source_dependencies_after": true,
+  "numerical_gates_run": 0,
+  "native_submissions": 0,
+  "self_import_id": "independent-tp8-head-padding-1794110988-1794111596"
+}

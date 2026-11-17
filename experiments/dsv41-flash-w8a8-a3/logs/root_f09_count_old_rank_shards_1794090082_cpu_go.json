@@ -1,0 +1,21 @@
+{
+  "schema": "Root-F09-count-old-operation/1",
+  "approved": true,
+  "stage": "count-old-offline",
+  "requested_role": "old-physical",
+  "pins_sha256": "608fb407d2aef7944b5190ebaa2afdfeb125785a1fa2efeb3fd59c01cd9e722c",
+  "prequeue_sha256": "53e695ae03656bb821f9ce5a737d8a70f1ad29e3e01ee347aed451b2578f0029",
+  "lifecycle_acceptance": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/root_f09_count_probe_rank_acceptance_1794089142.json",
+  "lifecycle_acceptance_sha256": "e76b9984db86a27c3c1b4ebd32ab7de97af91357af4c6784746e5e9a3ade0ffa",
+  "source_manifest_sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_count_old_rank_shards_1794090082/work",
+  "root_go_id": "observer-20261108-f09-old-physical-count-control-offline",
+  "created_at_epoch": 1794090424.7640612,
+  "expires_at_epoch": 1794093924.7640612,
+  "native16_authorized": false,
+  "scope": "ONE same-work count-old-offline CPU only. Require actual oldvalid192/192/192 matrices THEN specific middle numeric192vslogical96 reject; no exception-as-pass. No NPU/full/liveauthority. HistoricalworkerbirthUNKNOWN/noPSS.",
+  "native_task_id": "task_20261108_062438_17376705030",
+  "native_raw16_cleanup_audit_pass": true,
+  "native_terminal_receipt": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_count_old_rank_shards_1794090082_runtimefacts/native_terminal_receipt.json",
+  "native_terminal_receipt_sha256": "70558951fdf1ea33756cbc5776d527b0571725371ed688c11d6ffa77f9fb6439"
+}

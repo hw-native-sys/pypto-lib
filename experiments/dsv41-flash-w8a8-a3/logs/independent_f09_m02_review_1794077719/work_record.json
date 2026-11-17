@@ -1,0 +1,18 @@
+{
+  "record_id": "reviewer_f09-old76-source-review-1794077719",
+  "role": "review-agent",
+  "task": "independent_f09_m02_review",
+  "measured_start_epoch": 1794077719,
+  "measured_end_epoch": 1794077856,
+  "interval_scope": "Measured artifact drafting, shell source/reference pin verification, reporting and sealing. Earlier exploratory read-only review was not clocked and is excluded; no invented start time.",
+  "shared_writes": 0,
+  "live_source_writes": 0,
+  "tests": 0,
+  "imports": 0,
+  "compile": 0,
+  "NPU_calls": 0,
+  "payload_bytes_created": 0,
+  "task_ids": [],
+  "disposition": "SOURCE_REVIEW_FINDINGS_R1_R2_R3_R4; NO_ACCEPTANCE; FINAL_PARK",
+  "root_imports_shared_ledgers": true
+}

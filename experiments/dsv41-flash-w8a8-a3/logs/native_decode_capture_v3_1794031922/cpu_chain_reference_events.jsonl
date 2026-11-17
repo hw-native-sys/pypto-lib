@@ -1,0 +1,14 @@
+{"reference_call": 1, "position": 128, "scope": "unconditioned", "scheduled_role": "positive", "event": "reference_compute_start", "time": 1794033928.1773283, "output_count": null, "numerical_verdict": false}
+{"reference_call": 1, "position": 128, "scope": "unconditioned", "scheduled_role": "positive", "event": "reference_compute_return", "time": 1794033980.0773249, "output_count": 19, "numerical_verdict": false}
+{"reference_call": 2, "position": 128, "scope": "staged", "scheduled_role": "positive", "event": "reference_compute_start", "time": 1794033980.3950524, "output_count": null, "numerical_verdict": false}
+{"reference_call": 2, "position": 128, "scope": "staged", "scheduled_role": "positive", "event": "reference_compute_return", "time": 1794034028.675251, "output_count": 19, "numerical_verdict": false}
+{"reference_call": 3, "position": 129, "scope": "unconditioned", "scheduled_role": "positive", "event": "reference_compute_start", "time": 1794034356.5667517, "output_count": null, "numerical_verdict": false}
+{"reference_call": 3, "position": 129, "scope": "unconditioned", "scheduled_role": "positive", "event": "reference_compute_return", "time": 1794034409.5215821, "output_count": 19, "numerical_verdict": false}
+{"reference_call": 4, "position": 129, "scope": "staged", "scheduled_role": "positive", "event": "reference_compute_start", "time": 1794034409.8558114, "output_count": null, "numerical_verdict": false}
+{"reference_call": 4, "position": 129, "scope": "staged", "scheduled_role": "positive", "event": "reference_compute_return", "time": 1794034460.1272233, "output_count": 19, "numerical_verdict": false}
+{"reference_call": 5, "position": 130, "scope": "unconditioned", "scheduled_role": "positive", "event": "reference_compute_start", "time": 1794034786.5436215, "output_count": null, "numerical_verdict": false}
+{"reference_call": 5, "position": 130, "scope": "unconditioned", "scheduled_role": "positive", "event": "reference_compute_return", "time": 1794034839.686463, "output_count": 19, "numerical_verdict": false}
+{"reference_call": 6, "position": 130, "scope": "staged", "scheduled_role": "positive", "event": "reference_compute_start", "time": 1794034840.0227904, "output_count": null, "numerical_verdict": false}
+{"reference_call": 6, "position": 130, "scope": "staged", "scheduled_role": "positive", "event": "reference_compute_return", "time": 1794034889.6352885, "output_count": 19, "numerical_verdict": false}
+{"reference_call": 7, "position": 129, "scope": "staged", "scheduled_role": "stale129_control", "event": "reference_compute_start", "time": 1794035169.9633567, "output_count": null, "numerical_verdict": false}
+{"reference_call": 7, "position": 129, "scope": "staged", "scheduled_role": "stale129_control", "event": "reference_compute_return", "time": 1794035220.6226082, "output_count": 19, "numerical_verdict": false}

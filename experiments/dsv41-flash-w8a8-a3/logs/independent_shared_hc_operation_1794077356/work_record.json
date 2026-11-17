@@ -1,0 +1,13 @@
+{
+  "CPU_jobs": 2,
+  "NPU_jobs": 0,
+  "agent": "review-agent",
+  "compile": 0,
+  "elapsed_seconds": 765,
+  "end_epoch": 1794078121,
+  "id": "independent-shared-HC-outer-1794077356-1794078121",
+  "protected_source_writes": 0,
+  "real_checkpoint_payload": 0,
+  "start_epoch": 1794077356,
+  "state": "FINAL_PARK_CPU_ONLY"
+}

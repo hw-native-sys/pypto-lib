@@ -1,0 +1,9 @@
+{
+  "start_epoch": 1794108197.6730607,
+  "role": "worker-agent",
+  "ownership": [
+    "config.py",
+    "tp_reduce.py",
+    "moe_exchange.py"
+  ]
+}

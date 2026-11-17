@@ -1,0 +1,27 @@
+{
+  "metadata_only_contracts": true,
+  "fixture_calls": 0,
+  "real_expert_shape": [
+    16,
+    40,
+    24
+  ],
+  "prefill_arguments": {
+    "arguments": 100,
+    "streamed_static_arguments": 57,
+    "engram_enabled": 0
+  },
+  "decode_arguments": {
+    "arguments": 96,
+    "streamed_static_arguments": 57,
+    "engram_enabled": 0
+  },
+  "positions": [
+    128,
+    129,
+    130
+  ],
+  "actual_driver_bulk_materialization_calls": 0,
+  "full_weights_guard": "HELD",
+  "host_payload_scope": "bounded mutable IO only"
+}

@@ -1,0 +1,43 @@
+{
+  "scope": "CPU metadata/source/ringbinding only; NO allocation/native/fit proof",
+  "source_manifest_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "required_public_ring_heap": [
+    0,
+    0,
+    4294967296,
+    0
+  ],
+  "phases": {
+    "prefill": {
+      "resources": 57,
+      "per_rank_bytes": 39624816576,
+      "largest_bytes": 11324620800,
+      "phase_IO_conservative_bytes": 7609876736
+    },
+    "decode": {
+      "resources": 57,
+      "per_rank_bytes": 39624816576,
+      "largest_bytes": 11324620800,
+      "phase_IO_conservative_bytes": 247111680
+    }
+  },
+  "default_refused": true,
+  "non4GiB_ring_rejections": [
+    null,
+    [
+      0,
+      0,
+      2147483648,
+      0
+    ],
+    [
+      0,
+      0,
+      3221225472,
+      0
+    ]
+  ],
+  "NPU": 0,
+  "tensor_payload_reads": 0,
+  "allocation_calls": 0
+}

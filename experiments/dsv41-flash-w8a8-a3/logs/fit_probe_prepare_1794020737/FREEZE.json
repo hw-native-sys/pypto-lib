@@ -1,0 +1,13 @@
+{
+  "epoch": 1794021592,
+  "source_manifest_sha256": "ab1ced6d6ecbf9887297458703ba9b74e2c9b8bc57608370b4c2e0310e027e37",
+  "artifact_manifest_sha256": "d6b0c13e31e671fdf4916b14781554ebadefcd5b2be5855bf99cc80a8fbaeea4",
+  "helper_sha256": "66ba318ae1e59ebd79ec7dc8bc3f2e36f581c9c926ad47666d8a0c594d114463",
+  "artifact_count": 36,
+  "status": "PARKED; artifact-only CPU preparation; actual hardware NOT authorized",
+  "jobs": "3CPUcompleteexit0",
+  "source45": "unchanged",
+  "NPU": 0,
+  "real_payload": 0,
+  "actual_large_allocations": 0
+}

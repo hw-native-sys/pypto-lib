@@ -1,0 +1,21 @@
+{
+  "scope": "noEngram; CPU integer/raw-JSON controls only, no device or tensor allocation",
+  "validator_sha256": "bac7748403064849ea05ee4c450061425d7e8194c738d9310696b4213fc32523",
+  "original_falsePASS_case": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_empty_operation_1794039524/probe_late_final_drift",
+  "original_case_probe_sha256": "ac3c792de29ec82a5b7480ce7a5f31b6352b0350f9e3acbefea69e92427524de",
+  "original_internal_status": "CPU_FAKE_ONLY_NO_NATIVE_GRANT",
+  "outcomes": {
+    "original_saved_falsePASS_external_reject": "final after-free vs calibration A rank0 free-drop exceeds original tolerance",
+    "exact_boundary_free_and_committed": "PASS",
+    "free_drop_one_over": "final after-free vs calibration A rank15 free-drop exceeds original tolerance",
+    "committed_rise_one_over": "final after-free vs calibration A rank15 committed-rise exceeds original tolerance",
+    "missing_rank": "raw query shape must be16 ranks",
+    "wrong_rank": "wrong raw rank/order",
+    "wrong_source": "wrong source/artifact/config/rank binding",
+    "wrong_calibSHA": "wrong calibration SHA",
+    "rawshape": "raw query shape must be16 ranks",
+    "null_query": "null/noninteger raw query",
+    "not_normal_close": "not normal-close"
+  },
+  "actual_calibration_sha256": "3bc7291e174cccc8a8f0272d9786716a78bccb2ae8336c33fdfd4e10a16927f0"
+}

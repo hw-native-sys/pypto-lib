@@ -1,0 +1,8 @@
+{
+  "pid": 1098893,
+  "peak_sampled_pss": 115037093888,
+  "peak_sampled_uss": 115036921856,
+  "peak_sampled_rss": 115039170560,
+  "max_shm_used": 557056,
+  "scope": "own CPU PID smaps_rollup sampled2s; no native or global RSS sums"
+}

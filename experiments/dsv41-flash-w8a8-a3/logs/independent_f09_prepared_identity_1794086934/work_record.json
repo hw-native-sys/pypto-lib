@@ -1,0 +1,18 @@
+{
+  "agent": "/root/reviewer_f09",
+  "scope": "independent prepared-identity source/retained-image review and one CPU task; next blueprint only",
+  "started_epoch": 1794086934,
+  "ended_epoch": 1794087800.397682,
+  "elapsed_seconds": 866.3976819515228,
+  "cpu_task": "task_20261108_053443_160105428565",
+  "checker_seconds": 5.839300870895386,
+  "npu_tasks": 0,
+  "shared_writes": 0,
+  "old_case_writes": 0,
+  "source_or_model_writes": 0,
+  "own_running_jobs": 0,
+  "status": "PARK",
+  "old_native_case": "FAILED unchanged",
+  "future_native": "NOT_AUTHORIZED",
+  "next_prequeue": "NOT_RUN_NEW_ROOT_WRAPPER_PENDING"
+}

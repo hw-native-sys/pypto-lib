@@ -1,0 +1,31 @@
+{
+  "pids": [
+    2546628,
+    2546950,
+    2547220,
+    2566371,
+    2566372,
+    2566383,
+    2566391,
+    2566398,
+    2566404,
+    2566410,
+    2566423,
+    2566430,
+    2566436,
+    2566442,
+    2566449,
+    2566462,
+    2566468,
+    2566474,
+    2566492,
+    2566505
+  ],
+  "still_present": [],
+  "task_status": "completed exit130",
+  "all16_lock_release_seen": true,
+  "resource_tracker_warning_preserved": true,
+  "dev_shm_used_bytes_filesystem_wide": 557056,
+  "shm_scope": "global filesystem observation; no manual deletion or attribution of unknown objects",
+  "actual_tensor_checkpoint_present": false
+}

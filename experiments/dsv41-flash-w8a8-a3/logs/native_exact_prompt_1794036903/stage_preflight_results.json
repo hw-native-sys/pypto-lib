@@ -1,0 +1,72 @@
+{
+  "status": "PASS_CPU_TOY_STAGE_BINDING_ONLY",
+  "negatives": [
+    {
+      "label": "default-refuse-prefix",
+      "reason": "DEFAULT REFUSE: this phase has no separate Root authorization"
+    },
+    {
+      "label": "default-refuse-validate",
+      "reason": "DEFAULT REFUSE: this phase has no separate Root authorization"
+    },
+    {
+      "label": "default-refuse-decode",
+      "reason": "DEFAULT REFUSE: this phase has no separate Root authorization"
+    },
+    {
+      "label": "default-refuse-validate-decode",
+      "reason": "DEFAULT REFUSE: this phase has no separate Root authorization"
+    },
+    {
+      "label": "static-only-grant-cannot-unlock-prefix",
+      "reason": "wrong Root stage scope"
+    },
+    {
+      "label": "capsule-rehashed-ABI-direction-mutant",
+      "reason": "compiled parameter/direction/layout ABI changed"
+    },
+    {
+      "label": "capsule-old-producer",
+      "reason": "wrong producer/native evidence scope"
+    },
+    {
+      "label": "capsule-derived-as-producer",
+      "reason": "wrong producer/native evidence scope"
+    },
+    {
+      "label": "capsule-wrong-case-N",
+      "reason": "wrong N3 case binding"
+    },
+    {
+      "label": "capsule-wrong-payload-N",
+      "reason": "wrong actual tensor N or corrupt payload"
+    },
+    {
+      "label": "capsule-wrong-ABI-sha",
+      "reason": "capsule copied ABI path/bytes mismatch"
+    },
+    {
+      "label": "capsule-wrong-ABI-path",
+      "reason": "capsule copied ABI path/bytes mismatch"
+    },
+    {
+      "label": "capsule-wrong-runtime-ring",
+      "reason": "effective public mode/ring config mismatch"
+    },
+    {
+      "label": "capsule-wrong-scope-toy",
+      "reason": "wrong producer/native evidence scope"
+    },
+    {
+      "label": "capsule-owner-not-closed",
+      "reason": "native owner not normally closed/hash bound"
+    }
+  ],
+  "helper_AST_current_generate_binding": true,
+  "old_helper_never_imported": true,
+  "tiny_capsule_positive": "FAKE_LABELLED_METADATA_ONLY_NOT_NATIVE_RECEIPT",
+  "NPU": 0,
+  "fixture_allocations": 0,
+  "forward_refs": 0,
+  "no_native_grant": true
+}

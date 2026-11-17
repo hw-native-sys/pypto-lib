@@ -1,0 +1,54 @@
+{
+  "live45": {
+    "path": "experiments/dsv41-flash-w8a8-a3/logs/hc_boundary_apply_1794075705/source45.json",
+    "sha256": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+    "all45_files_match": true
+  },
+  "source45": {
+    "path": "experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/source45_rebased_UNAPPLIED.json",
+    "sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+    "all45_files_match": true
+  },
+  "new_adapter": "e3bc87daec2a39c6a555b194ec7d9f9a42d8483e36fcabaf1ec448000284ac20",
+  "new_route": "c53c5fd537ecc1bfbf8e228cf691107fda2fb1748dfcb9e5aa09a0d9a3915d43",
+  "new_probes": {
+    "count_probe.py": "f4bf50aebbbbb8b0a7c6a230e5e3acd810b607bdc2624091a46b660709c1b42c",
+    "count_probe_old_physical.py": "02879526d209c2f7a4c8ff664bc30201ff23d6cfdd7d124ff315ef8505a86e04"
+  },
+  "unchanged_support": {
+    "artifact_lifecycle.py": "ee648c64b8477cc98b2f3083a6b16c9b6b92cc4612cc3228391dbe53aef1858d",
+    "oracle_integrity.py": "e45c7529d6c34cd57712a7d346ec612641896e38ab98ff88017ceafd87d999d3",
+    "scenario.json": "c7b6ab942f5ea17758389aa5a53dafbb1de79e68dbb6f41c4614d66dd6b6dbb1",
+    "source45_rebased_UNAPPLIED.json": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+    "native_stage.sh": "caf30d0d1dafe8f108684ad146ae610ec3dd5221fd3b0c10635f56134539306e",
+    "resource_plan.json": "451d7686e2252d6cdf13b25a54089be5a600d7dcbdd119d0aa22ae3982c6c68f"
+  },
+  "compiled_profiles": {
+    "count_active": {
+      "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/build/count_active",
+      "manifest": "experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/count_active_files.json",
+      "file_manifest_sha256": "45c3b4c710e9592127dcde62a1d1f2502ea42fc01843895362150aa56b1b8c54",
+      "metadata_sha256": "7ec1d89d657653d9bf2ec179f75cc8421dc05477771e5dee2af088d3554972a8",
+      "status": "ZERO_SAMPLE_COMPILE_ONLY_PASS",
+      "provenance": "NEW_TWO_COUNT_SIGNATURES"
+    },
+    "count_old_physical": {
+      "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/build/count_old_physical",
+      "manifest": "experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/count_old_physical_files.json",
+      "file_manifest_sha256": "1c09c6ced987a6ed53cdb8036a8ed6cc8d4c6d78c9d1df3a7278db21b7f29c53",
+      "metadata_sha256": "7ec1d89d657653d9bf2ec179f75cc8421dc05477771e5dee2af088d3554972a8",
+      "status": "ZERO_SAMPLE_COMPILE_ONLY_PASS",
+      "provenance": "NEW_TWO_COUNT_SIGNATURES"
+    },
+    "decode_capacity2": {
+      "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/build/decode_capacity2",
+      "manifest": "experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/decode_capacity2_files.json",
+      "file_manifest_sha256": "5262e68afa0b53291ed285e31170b3c017674c3c25dfa9aec78eb7fab5777532",
+      "metadata_sha256": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770",
+      "status": "COMPILE_ONLY_PASS",
+      "provenance": "UNCHANGED_OLD_FULLENTRY_NOT_RECOMPILED"
+    }
+  },
+  "actual_Root_wrapper": "PENDING",
+  "actual16_GO": "ABSENT"
+}

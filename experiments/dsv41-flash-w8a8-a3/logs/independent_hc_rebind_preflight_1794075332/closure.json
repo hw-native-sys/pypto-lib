@@ -1,0 +1,12 @@
+{
+  "HC_HOLD0": "UNRESOLVED_OUTPUT_INIT_ALIAS_ORACLE_PROVENANCE",
+  "HC_application_authorized": false,
+  "M01_M02": "UNAPPLIED_ONLY",
+  "Main13_telemetry29_immutable": true,
+  "current45_unchanged": true,
+  "end_epoch": 1794075742,
+  "pending_current_b3e_outer_final_review": true,
+  "source45": "b3e19fd001c74f7a5b497c791c01924ca09c0678df66114fce599e890d8fee06",
+  "state": "FINAL_PARK_READONLY",
+  "virtual_guard_tests_repeated": false
+}

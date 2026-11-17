@@ -1,0 +1,76 @@
+{
+  "schema": 3,
+  "supported_execution_modes": [
+    "program"
+  ],
+  "params": [
+    {
+      "name": "x",
+      "direction": "In",
+      "shape": [
+        8,
+        5120
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "w",
+      "direction": "In",
+      "shape": [
+        512,
+        5120
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "out",
+      "direction": "Out",
+      "shape": [
+        8,
+        512
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    }
+  ],
+  "lowered_params": [
+    {
+      "name": "x",
+      "direction": "In",
+      "shape": [
+        8,
+        5120
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "w",
+      "direction": "In",
+      "shape": [
+        512,
+        5120
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "out",
+      "direction": "Out",
+      "shape": [
+        8,
+        512
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    }
+  ],
+  "num_return_types": 1,
+  "return_aliases": [
+    2
+  ],
+  "platform": "a2a3",
+  "backend_type": "Ascend910"
+}

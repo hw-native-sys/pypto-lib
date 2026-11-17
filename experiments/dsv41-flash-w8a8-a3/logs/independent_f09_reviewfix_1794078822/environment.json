@@ -1,0 +1,15 @@
+{
+  "python": "3.10.22 | packaged by conda-forge | (main, Oct  6 2026, 22:53:30) [GCC 14.4.0]",
+  "pypto_import": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/pypto/__init__.py",
+  "torch_import": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/torch/__init__.py",
+  "pypto_revision": "38a8aa6da24c62bf0c6f6f9ef94deb513fbb4d2e",
+  "simpler_revision": "31f9e72ee6832cd198b77df18c1c305e7fd83676",
+  "isa_revision": "f83d4b7e4be0a4ca9805944ae2d9ce8c84e581f7",
+  "isa_pin": "f83d4b7e4be0a4ca9805944ae2d9ce8c84e581f7",
+  "ptoas_root": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local",
+  "mode": "ExecutionMode.ONBOARD",
+  "physical_device_allocation": "NONE; compile-only logical topology IDs 0..15",
+  "profile": "E1 synthetic ABI, physical EP capacity2; dynamic T/B annotations retained; future dispatch contract T2/B2/logical2/pages4/state2",
+  "samples": 0,
+  "input_tensor_construction": false
+}

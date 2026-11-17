@@ -1,0 +1,29 @@
+{
+  "schema": "HC-math-lineage/1",
+  "original_archive_revision": "8fde6d4e335fe300e2b949aab0e31659cce0811d",
+  "original_archive_sha256": "48c797546805b04ffde118c506f8902e37e19bf2cb5d1713097056a4c93e998c",
+  "original_helper_function_sha256": "a51b53d475db02841630c5d00ed18a3c7afb2de526962f0e0e59c7293f25abd5",
+  "resource_ancestor_plan_sha256": "3dd67b88683d0de1f5fbd8e889c0c1a875eeecf671263fca4c64061637ecd9c0",
+  "resource_ancestor_source45": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "math_baseline_M01_sha256": "eb90ea56e26d0cb97dd12d330559c2ae1b53f4ae5cbf866cc01bfbbb150fecf2",
+  "actual_producer_M02_sha256": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "HC_patch_sha256": "7520f4c6d7f144b0a2937751b9f43ad6c45c653c4b8fca49606c8d0dc4134c72",
+  "captured_native_proof": {
+    "path": "experiments/dsv41-flash-w8a8-a3/logs/native_hc_durable_receipts_1794075226",
+    "manifest_sha256": "ba800da431c200dcefebc75179ff9f24e737d612f73691121a97835c18b9a08f",
+    "native_task": "task_20261108_021439_342901924784",
+    "native_whole_case_status": "FAILED own TensorSpec expected/output alias; never relabeledPASS",
+    "offline_original_audit_task": "task_20261108_021816_343981631498",
+    "offline_audit_sha256": "92f6e846267526059967806ac931a35322e59c67ce1b98af4bf6cec4343f3e58",
+    "numerical_proof_pins_sha256": "3d59c0994ec801130bf420af102652e416e330dcfe9d2b14e6322f4809059e0b",
+    "offline_passed": 31,
+    "offline_unmet": 0,
+    "candidate_values": 102400,
+    "candidate_diff": 0,
+    "old_diff": 61440,
+    "old_max_abs": 0.00390625,
+    "scope": "synthetic HC BF16 boundary captured values only; no native input snapshots/fullmodel/repetition-causality claim"
+  },
+  "fresh_E40_prefill3_decode1_signature_status": "PENDING; old611D77 not candidate compile",
+  "fullreal_shared_quality_status": "UNTESTED; separateRootGO required"
+}

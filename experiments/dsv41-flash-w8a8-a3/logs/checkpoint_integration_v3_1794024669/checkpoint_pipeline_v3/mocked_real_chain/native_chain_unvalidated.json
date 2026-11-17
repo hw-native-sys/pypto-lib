@@ -1,0 +1,14 @@
+{
+  "positions": [
+    128,
+    129,
+    130
+  ],
+  "same_artifact": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/checkpoint_integration_v3_1794024669/checkpoint_pipeline_v3/mocked_real_chain/toy_decode_artifact",
+    "CPU_FAKE": true
+  },
+  "same_owner": "decode-86631-872739c7e7344266a0191eb29eac6f68",
+  "status": "NATIVE_BYTES_ONLY_NOT_PASS",
+  "evidence_mode": "toy-only-prototype"
+}

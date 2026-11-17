@@ -1,0 +1,264 @@
+{
+  "resources": [
+    "attn_norm_w",
+    "c1a_comp_norm",
+    "c1a_comp_wkv",
+    "c1a_idx_k_norm",
+    "c1a_idx_weights_proj",
+    "c1a_idx_wk",
+    "c1a_idx_wq_b",
+    "c1a_idx_wq_b_scale",
+    "c2a_comp_norm",
+    "c2a_comp_wgate",
+    "c2a_comp_wkv",
+    "c2a_idx_k_norm",
+    "c2a_idx_weights_proj",
+    "c2a_idx_wk",
+    "c2a_idx_wq_b",
+    "c2a_idx_wq_b_scale",
+    "embed_weight",
+    "engram_qk",
+    "engram_rotation",
+    "engram_wkv",
+    "ffn_norm_w",
+    "final_norm",
+    "gate_bias",
+    "gate_weight",
+    "hc_attn_base",
+    "hc_attn_fn",
+    "hc_attn_scale",
+    "hc_ffn_base",
+    "hc_ffn_fn",
+    "hc_ffn_scale",
+    "kv_norm_w",
+    "lm_head_weight",
+    "q_norm_w",
+    "re_idx_weights_proj",
+    "re_idx_wq_b",
+    "re_idx_wq_b_scale",
+    "shared_w1",
+    "shared_w1_scale",
+    "shared_w2",
+    "shared_w2_scale",
+    "shared_w3",
+    "shared_w3_scale",
+    "sink",
+    "w1",
+    "w1_scale",
+    "w2",
+    "w2_scale",
+    "w3",
+    "w3_scale",
+    "wkv",
+    "wkv_scale",
+    "wo_a",
+    "wo_b",
+    "wq_a",
+    "wq_a_scale",
+    "wq_b",
+    "wq_b_scale"
+  ],
+  "allocations": [],
+  "cleanup_errors": [],
+  "prewarm": [
+    {
+      "rank": 0,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 1,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 2,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 3,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 4,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 5,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 6,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 7,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 8,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 9,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 10,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 11,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 12,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 13,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 14,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 15,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    }
+  ],
+  "status": "FAIL",
+  "compute_dispatches": 0,
+  "payload_bytes": 0,
+  "error": "Refused: allocated handle shape/dtype/byte mismatch",
+  "after_free_before_close": [
+    {
+      "rank": 0,
+      "free": 75161518080,
+      "total": 128849018880,
+      "committed": 53687500800
+    },
+    {
+      "rank": 1,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 2,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 3,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 4,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 5,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 6,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 7,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 8,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 9,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 10,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 11,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 12,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 13,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 14,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    },
+    {
+      "rank": 15,
+      "free": 75161927680,
+      "total": 128849018880,
+      "committed": 53687091200
+    }
+  ],
+  "owner_closed": true
+}

@@ -1,0 +1,10 @@
+{
+  "role": "candidate",
+  "started_epoch": 1794074951.846569,
+  "status": "RUN_RETURNED",
+  "passed": true,
+  "error": null,
+  "execution_time": 0.0,
+  "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/cpu_injections/old_BF16_wrong_assert",
+  "ended_epoch": 1794074951.9672306
+}

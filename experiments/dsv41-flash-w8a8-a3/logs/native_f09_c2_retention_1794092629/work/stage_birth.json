@@ -1,0 +1,13 @@
+{
+  "identity": {
+    "pid": 1943672,
+    "starttick": "109441922"
+  },
+  "command": [
+    "bash",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/native_stage.sh",
+    "full-capture",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_c2_retention_1794092629/work",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/root_f09_c2_lifecycle_acceptance_1794094092.json"
+  ]
+}

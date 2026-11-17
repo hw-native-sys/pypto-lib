@@ -1,0 +1,11 @@
+{
+  "status": "READY_SOURCE_RESOURCES_ONLY_NO_NATIVE_AUTHORITY",
+  "source_manifest": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "pins_sha256": "6de71ae70f5fdbf849abebb05cbbdcacaa016cfad22cb38bd5ff8e36e2e9829d",
+  "prequeue_sha256": "73765b3f9d077048c4526f3564187881d7f7795a53a8f5e7253ad4b3ae5335de",
+  "lifecycle_sha256": "b86552ad5604173cb897c0eeaf4d14cfcdef15e9425e306e66b9f318802b6d02",
+  "work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_count_active_identity_1794086934/work",
+  "work_exists": false,
+  "new_actual_stage_grants": 0,
+  "native16_authorized": false
+}

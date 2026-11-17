@@ -1,0 +1,53 @@
+{
+  "status": "SOURCE_PROFILE_RESOURCES_ONLY_NO_NATIVE_AUTHORITY",
+  "source_manifest": "8153c7f040bef51900a6e6c9ff27b018279b7503f31d50ec5488457e49770b28",
+  "full_profile": {
+    "origin_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/build/decode_capacity2",
+    "manifest": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/decode_capacity2_files.json",
+    "manifest_sha256": "510dd3c7b72a1c36291ff8ff0b167ce0ac8204d2cd6a957eae0a8ea6641f8642",
+    "metadata_sha256": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770"
+  },
+  "scenario_sha256": "c7b6ab942f5ea17758389aa5a53dafbb1de79e68dbb6f41c4614d66dd6b6dbb1",
+  "lifecycle_acceptance": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/root_f09_c2_lifecycle_acceptance_1794094092.json",
+  "lifecycle_acceptance_sha256": "775dc927e7b77bf372582495d31a907b6bea96152fc47422f75a68e9f6db0825",
+  "fullentry_signature_provenance": "FRESH8153 full signature; count profiles retain OLD405 ancestry separately",
+  "full119_prepared_inventory": "FUTURE_ACTUAL_ONLY; prior405 EE119registrations/116uniqueobjects is helper ancestry only",
+  "groups": [
+    "unconditioned_per_call19",
+    "original_staged19",
+    "independent_three_call_oracle19"
+  ],
+  "numerical_gate_count": 171,
+  "durable_before_reference": [
+    "three initial snapshots",
+    "three actual snapshots",
+    "owner normalclose"
+  ],
+  "full_static_global": 103422065664,
+  "full_static_per_rank": 6463879104,
+  "full_nonstatic_global": 494223296,
+  "full_nonstatic_global_definition": "TENSOR_ABI_ONLY",
+  "full_runtime_values_nonstatic_global": 494223300,
+  "fixture_scalar_bookkeeping_bytes": 4,
+  "full_hbm_postprewarm_prestatic_each_rank": 16621778820,
+  "full_hbm_poststatic_each_call_each_rank": 10157899716,
+  "offline_host_planning_formula": "2S+2G+18P+16GiB, within300GiBfloor; NOT measuredpeak/fit",
+  "resources": {
+    "epoch": 1794094307.5956898,
+    "observed": {
+      "HOST": 1721959043072,
+      "DISK": 7718000656384,
+      "SHM": 1079343157248
+    },
+    "minimum_bytes": {
+      "HOST": 322122547200,
+      "DISK": 17179869184,
+      "SHM": 34359738368
+    },
+    "measured_peak_claim": false
+  },
+  "fixture_or_tensor_or_header_or_prepare_or_compile_calls": 0,
+  "NPU": false,
+  "new_valid_stage_grants": 0,
+  "default_refusal_without_work": true
+}

@@ -1,0 +1,20 @@
+{
+  "state": "FINAL_PARK",
+  "artifact_count": 571,
+  "artifact_manifest_sha256": "fbff5e23845e15f3c1eaba9bb96afa644dd5b1aae1675f3ea60fb564e257fdd5",
+  "shared_output_manifest_sha256": "3401c5d93aaf132a197ba7ebdeac1c37f9be379b31100f22cc3c5608365f718b",
+  "shared_owned_output_files": 32,
+  "operational_exclusion": "shared physical work/measurement_gate.json; frozen native and CPU snapshots included",
+  "source45_sha256": "ab1ced6d6ecbf9887297458703ba9b74e2c9b8bc57608370b4c2e0310e027e37",
+  "old_prefix579_manifest_sha256": "65e98cacd561c78a1f3a9a059ba059674076978e700143ed6cdbb2d317d64591",
+  "validated_chain_sha256": "30afd8bb39dd054ff09e64c311123d93c3a474fd8cfda2a3fe5d9aee3f8bd71a",
+  "native64_outcome0": true,
+  "original_positive_gates_PASS": 57,
+  "negative_numerical_WINDOW_C2_reject": true,
+  "computed_unique_own_pids": 20,
+  "all_recorded_pids_absent": true,
+  "all_assigned_jobs_complete": true,
+  "end_epoch": 1794035732,
+  "measured_seconds": 3810,
+  "realweights_fit_text": "HELD_NOT_RUN"
+}

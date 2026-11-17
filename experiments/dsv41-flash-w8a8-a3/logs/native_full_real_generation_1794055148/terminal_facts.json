@@ -1,0 +1,411 @@
+{
+  "epoch": 1794061240.005392,
+  "native_job": "task_20261107_204310_361283812010",
+  "queue_status": "completed (exit=0)",
+  "CLI_status": "ok",
+  "CLI_exit_code": 0,
+  "CLI_error": null,
+  "CLI_blockers": [],
+  "outer_status": "CLI_SUCCESS_POSTCHECK_PASS_PENDING_EXTERNAL_AUDIT",
+  "outer_returncode": 0,
+  "outer_postcheck_error": null,
+  "outer_observation_errors": [],
+  "scope": "noEngram",
+  "prefill_tokens": 3,
+  "prompt_ids": [
+    19923,
+    14,
+    2058
+  ],
+  "generated_ids": [
+    3,
+    1
+  ],
+  "generated_text": "!<\uff5cend\u2581of\u2581sentence\uff5c>",
+  "termination": "eos",
+  "first_token": {
+    "token_id": 3,
+    "logit": 23.072988510131836,
+    "shard_argmax": [
+      [
+        23.072988510131836,
+        3
+      ],
+      [
+        19.0150089263916,
+        56630
+      ],
+      [
+        20.394798278808594,
+        70866
+      ],
+      [
+        16.387231826782227,
+        124112
+      ]
+    ],
+    "dp_disagreements": [],
+    "dp_votes": [
+      {
+        "dp_group": 0,
+        "token_id": 3,
+        "logit": 23.072988510131836,
+        "shard_argmax": [
+          [
+            23.072988510131836,
+            3
+          ],
+          [
+            19.0150089263916,
+            56630
+          ],
+          [
+            20.394798278808594,
+            70866
+          ],
+          [
+            16.387231826782227,
+            124112
+          ]
+        ]
+      },
+      {
+        "dp_group": 1,
+        "token_id": 3,
+        "logit": 23.072988510131836,
+        "shard_argmax": [
+          [
+            23.072988510131836,
+            3
+          ],
+          [
+            19.0150089263916,
+            56630
+          ],
+          [
+            20.394798278808594,
+            70866
+          ],
+          [
+            16.387231826782227,
+            124112
+          ]
+        ]
+      },
+      {
+        "dp_group": 2,
+        "token_id": 3,
+        "logit": 23.072988510131836,
+        "shard_argmax": [
+          [
+            23.072988510131836,
+            3
+          ],
+          [
+            19.0150089263916,
+            56630
+          ],
+          [
+            20.394798278808594,
+            70866
+          ],
+          [
+            16.387231826782227,
+            124112
+          ]
+        ]
+      },
+      {
+        "dp_group": 3,
+        "token_id": 3,
+        "logit": 23.072988510131836,
+        "shard_argmax": [
+          [
+            23.072988510131836,
+            3
+          ],
+          [
+            19.0150089263916,
+            56630
+          ],
+          [
+            20.394798278808594,
+            70866
+          ],
+          [
+            16.387231826782227,
+            124112
+          ]
+        ]
+      }
+    ],
+    "agreement_checked": true,
+    "context": {
+      "phase": "prefill",
+      "repeat": 0,
+      "position": 2,
+      "prompt_ids": [
+        19923,
+        14,
+        2058
+      ],
+      "generated_ids": []
+    }
+  },
+  "decode_steps": 1,
+  "steps": [
+    {
+      "step": 1,
+      "input_token": 3,
+      "position": 3,
+      "seconds": 1.548222303390503,
+      "decode_compile_seconds": 24.028196334838867,
+      "token_id": 1,
+      "logit": 21.486370086669922,
+      "sampling": {
+        "token_id": 1,
+        "logit": 21.486370086669922,
+        "shard_argmax": [
+          [
+            21.486370086669922,
+            1
+          ],
+          [
+            17.655982971191406,
+            45948
+          ],
+          [
+            14.43724250793457,
+            68629
+          ],
+          [
+            15.606719017028809,
+            128822
+          ]
+        ],
+        "dp_disagreements": [],
+        "dp_votes": [
+          {
+            "dp_group": 0,
+            "token_id": 1,
+            "logit": 21.486370086669922,
+            "shard_argmax": [
+              [
+                21.486370086669922,
+                1
+              ],
+              [
+                17.655982971191406,
+                45948
+              ],
+              [
+                14.43724250793457,
+                68629
+              ],
+              [
+                15.606719017028809,
+                128822
+              ]
+            ]
+          },
+          {
+            "dp_group": 1,
+            "token_id": 1,
+            "logit": 21.486370086669922,
+            "shard_argmax": [
+              [
+                21.486370086669922,
+                1
+              ],
+              [
+                17.655982971191406,
+                45948
+              ],
+              [
+                14.43724250793457,
+                68629
+              ],
+              [
+                15.606719017028809,
+                128822
+              ]
+            ]
+          },
+          {
+            "dp_group": 2,
+            "token_id": 1,
+            "logit": 21.486370086669922,
+            "shard_argmax": [
+              [
+                21.486370086669922,
+                1
+              ],
+              [
+                17.655982971191406,
+                45948
+              ],
+              [
+                14.43724250793457,
+                68629
+              ],
+              [
+                15.606719017028809,
+                128822
+              ]
+            ]
+          },
+          {
+            "dp_group": 3,
+            "token_id": 1,
+            "logit": 21.486370086669922,
+            "shard_argmax": [
+              [
+                21.486370086669922,
+                1
+              ],
+              [
+                17.655982971191406,
+                45948
+              ],
+              [
+                14.43724250793457,
+                68629
+              ],
+              [
+                15.606719017028809,
+                128822
+              ]
+            ]
+          }
+        ],
+        "agreement_checked": true,
+        "context": {
+          "phase": "decode",
+          "step": 1,
+          "position": 3,
+          "input_token": 3,
+          "prompt_ids": [
+            19923,
+            14,
+            2058
+          ],
+          "generated_ids": [
+            3
+          ]
+        }
+      },
+      "state": {
+        "window_cache_sha1": "f8b20a7cee3d6070",
+        "compressed_cache_c2a_sha1": "15b0937166c2445d",
+        "index_cache_c2a_sha1": "3a633ccb168e7f10",
+        "state_cache_c2a_sha1": "091e927e9ce22be8",
+        "compressed_cache_c1a_sha1": "e0c7e6868c659613",
+        "index_cache_c1a_sha1": "da4acad133153f6b",
+        "x_hc_sha1": "eb6cfb0fe44501e7",
+        "pre_mix_sha1": "0f2c95cea85b453b",
+        "topk_indices_nonzero": 416,
+        "pool_block_ids_nonzero": 64,
+        "position_ids": [
+          3
+        ]
+      }
+    }
+  ],
+  "positions": {
+    "prefill_start": 0,
+    "prefill_length": 3
+  },
+  "positions_end": 4,
+  "prefill_residency": {
+    "resident_upload_bytes": 633997065216,
+    "resident_allocations": 57,
+    "dispatches": 1,
+    "rank_allocations": 912,
+    "copy_calls": 110496,
+    "max_leaf_bytes": 330956800,
+    "max_copy_bytes": 67108864,
+    "state_transport": "shared-host H2D/D2H each dispatch",
+    "protocol_domains": "fresh each dispatch"
+  },
+  "decode_residency": {
+    "resident_upload_bytes": 633997065216,
+    "resident_allocations": 57,
+    "dispatches": 1,
+    "rank_allocations": 912,
+    "copy_calls": 110496,
+    "max_leaf_bytes": 330956800,
+    "max_copy_bytes": 67108864,
+    "state_transport": "shared-host H2D/D2H each dispatch",
+    "protocol_domains": "fresh each dispatch"
+  },
+  "hbm_CLI_reported_sampling_only": {
+    "0": {
+      "peak_mb": 46225,
+      "samples": 1925
+    },
+    "1": {
+      "peak_mb": 45933,
+      "samples": 1925
+    },
+    "2": {
+      "peak_mb": 46210,
+      "samples": 1925
+    },
+    "3": {
+      "peak_mb": 45946,
+      "samples": 1925
+    },
+    "4": {
+      "peak_mb": 46211,
+      "samples": 1925
+    },
+    "5": {
+      "peak_mb": 45945,
+      "samples": 1925
+    },
+    "6": {
+      "peak_mb": 46209,
+      "samples": 1925
+    },
+    "7": {
+      "peak_mb": 45946,
+      "samples": 1925
+    },
+    "8": {
+      "peak_mb": 46220,
+      "samples": 1925
+    },
+    "9": {
+      "peak_mb": 45935,
+      "samples": 1925
+    },
+    "10": {
+      "peak_mb": 46209,
+      "samples": 1925
+    },
+    "11": {
+      "peak_mb": 45947,
+      "samples": 1925
+    },
+    "12": {
+      "peak_mb": 46218,
+      "samples": 1925
+    },
+    "13": {
+      "peak_mb": 45934,
+      "samples": 1925
+    },
+    "14": {
+      "peak_mb": 46210,
+      "samples": 1925
+    },
+    "15": {
+      "peak_mb": 45945,
+      "samples": 1925
+    }
+  },
+  "result_sha256": "23e0f4daec020a625a8b483185c045928842d208aca272854486be8e14198f90",
+  "outer_result_sha256": "f35d865cc2266774ebb3125bcf249d520a47acc0907e89e2a1d3dcf4eabe892e",
+  "release_note": "3612959 was reported in lock acquisition output; absence alone is NOT release evidence",
+  "acceptance": "RAW terminal facts only; independent audit pending"
+}

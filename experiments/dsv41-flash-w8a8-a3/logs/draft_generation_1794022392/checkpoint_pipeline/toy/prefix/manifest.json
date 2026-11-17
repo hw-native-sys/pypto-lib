@@ -1,0 +1,80 @@
+{
+  "schema": "split-validation-prototype/1",
+  "context": {
+    "mode": "ONBOARD",
+    "platform": "a2a3",
+    "phase": "prefix",
+    "owner_epoch": "toy-prefix-owner1",
+    "source_hashes": {
+      "models/deepseek_v4_1_flash_a3_w8a8/generate.py": "26b6db8451afa4488bff71699b94b7ffcf86abcec08e2919912e388fa904c8fd"
+    },
+    "compiled_metadata": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/draft_generation_1794022392/checkpoint_pipeline/toy/compiled_metadata.json",
+    "compiled_metadata_sha256": "bbcd3061ed5521e6d246b627f730d9c0252b14b967b217a5628fc95af9f310ae"
+  },
+  "fixture_recipe": {
+    "seed": 7,
+    "fixture": "toy-only"
+  },
+  "static_names": [
+    "w"
+  ],
+  "static_manifest": {
+    "w": {
+      "shape": [
+        2,
+        3
+      ],
+      "dtype": "torch.float32",
+      "sha256": "76d71bb75595470421ccfb4c760c3600a787c9b5cb1ad86ac2e2f36a4585dfad"
+    }
+  },
+  "payloads": {
+    "actual": {
+      "file": "actual.pt",
+      "file_sha256": "fbee8715f8a68b19ed5c2013328c2526173ee856ed434db44c34addef072adf8",
+      "tensors": {
+        "x": {
+          "shape": [
+            2,
+            3
+          ],
+          "dtype": "torch.float32",
+          "sha256": "f46913286d895f62d646314f400fc3d7a543cf34eb4ae56df87f43dc4582a36b"
+        },
+        "state": {
+          "shape": [
+            2,
+            3
+          ],
+          "dtype": "torch.float32",
+          "sha256": "f3e5da6ea1f0f7e1d62f0cc41df540d185f74ad92135f4cb7c270a1cb4a50243"
+        }
+      }
+    },
+    "initial": {
+      "file": "initial.pt",
+      "file_sha256": "32f3265ab2ad4248ac94639b8045a8917d3114a083c30c6f7cba68742ef66fb4",
+      "tensors": {
+        "x": {
+          "shape": [
+            2,
+            3
+          ],
+          "dtype": "torch.float32",
+          "sha256": "f46913286d895f62d646314f400fc3d7a543cf34eb4ae56df87f43dc4582a36b"
+        },
+        "state": {
+          "shape": [
+            2,
+            3
+          ],
+          "dtype": "torch.float32",
+          "sha256": "9d908ecfb6b256def8b49a7c504e6c889c4b0e41fe6ce3e01863dd7b61a20aa0"
+        }
+      }
+    }
+  },
+  "status": "NATIVE_BYTES_SAVED_NOT_VALIDATED",
+  "evidence_mode": "toy-only-prototype",
+  "static_payload_saved": false
+}

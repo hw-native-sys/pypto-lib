@@ -1,0 +1,152 @@
+{
+  "commands": [
+    {
+      "stage": "static-plan",
+      "command": [
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/pipeline.py",
+        "--provider",
+        "toy",
+        "--cpu-demo",
+        "--stage",
+        "static-plan",
+        "--work",
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/toy_cli"
+      ],
+      "exit": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "stage": "prefix",
+      "command": [
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/pipeline.py",
+        "--provider",
+        "toy",
+        "--cpu-demo",
+        "--stage",
+        "prefix",
+        "--work",
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/toy_cli"
+      ],
+      "exit": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "stage": "decode",
+      "command": [
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/pipeline.py",
+        "--provider",
+        "toy",
+        "--cpu-demo",
+        "--stage",
+        "decode",
+        "--work",
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/toy_cli"
+      ],
+      "exit": 1,
+      "stdout": "",
+      "stderr": "Traceback (most recent call last):\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/pipeline.py\", line 235, in <module>\n    if __name__=='__main__':main()\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/pipeline.py\", line 189, in main\n    cp=work/'prefix';check_closed(cp);s.require_resume(cp,production=args.provider=='real')\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/store.py\", line 161, in require_resume\n    if not (destination/'cpu_receipt.json').is_file():raise Rejected('native-only state has no CPU receipt')\nstore.Rejected: native-only state has no CPU receipt\n"
+    },
+    {
+      "stage": "validate",
+      "command": [
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/pipeline.py",
+        "--provider",
+        "toy",
+        "--cpu-demo",
+        "--stage",
+        "validate",
+        "--work",
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/toy_cli"
+      ],
+      "exit": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "stage": "decode",
+      "command": [
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/pipeline.py",
+        "--provider",
+        "toy",
+        "--cpu-demo",
+        "--stage",
+        "decode",
+        "--work",
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/toy_cli"
+      ],
+      "exit": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "stage": "validate-chain",
+      "command": [
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/pipeline.py",
+        "--provider",
+        "toy",
+        "--cpu-demo",
+        "--stage",
+        "validate-chain",
+        "--work",
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/toy_cli"
+      ],
+      "exit": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "stage": "validate-chain",
+      "command": [
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/pipeline.py",
+        "--provider",
+        "toy",
+        "--cpu-demo",
+        "--stage",
+        "validate-chain",
+        "--work",
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/toy_cli"
+      ],
+      "exit": 1,
+      "stdout": "",
+      "stderr": "Traceback (most recent call last):\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/pipeline.py\", line 235, in <module>\n    if __name__=='__main__':main()\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/pipeline.py\", line 223, in main\n    if ctx.get('parent_checkpoint_manifest_sha256')!=s.file_hash(parent/'manifest.json'):raise s.Rejected('step parent checkpoint mismatch')\nstore.Rejected: step parent checkpoint mismatch\n"
+    },
+    {
+      "stage": "validate",
+      "command": [
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/pipeline.py",
+        "--provider",
+        "toy",
+        "--cpu-demo",
+        "--stage",
+        "validate",
+        "--work",
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/toy_cli",
+        "--checkpoint",
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/toy_cli/decode130"
+      ],
+      "exit": 1,
+      "stdout": "",
+      "stderr": "Traceback (most recent call last):\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/pipeline.py\", line 235, in <module>\n    if __name__=='__main__':main()\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/pipeline.py\", line 186, in main\n    receipt=s.cpu_validate(cp,lambda recipe:provider.static(recipe,phase),lambda a,i:provider.validate(phase,a,i),list(provider.expected_names(phase)) if hasattr(provider,'expected_names') else list((provider.p if phase=='prefix' else provider.d).make_fwd_comparators(128 if phase=='prefix' else 1)))\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/store.py\", line 140, in cpu_validate\n    manifest,values=load_checkpoint(destination,reconstruct_static)\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/pipeline/store.py\", line 124, in load_checkpoint\n    if file_hash(path)!=record['file_sha256']:raise Rejected('payload file corruption')\nstore.Rejected: payload file corruption\n"
+    }
+  ],
+  "default_real_refused": true,
+  "real_native_largeIO_branch": "UNTESTED",
+  "same_decode_artifact_owner": true,
+  "no_static_payload": true,
+  "full_IO_schema_metadata_only": {
+    "prefill_bytes": 7609876736,
+    "decode_bytes": 247111680
+  },
+  "receipt_scope": "TOY ONLY, no NPU or model math",
+  "source45_unchanged": true
+}

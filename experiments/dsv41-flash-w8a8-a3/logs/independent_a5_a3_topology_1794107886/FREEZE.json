@@ -1,0 +1,8 @@
+{
+  "state": "FINAL_PARK_SOURCE_FINDINGS_AND_VALIDATION_RECOMMENDATIONS",
+  "epoch": 1794108796,
+  "files": 4,
+  "manifest_sha256": "829cca3a20e36bdb7e9642263baddc94e5e6aabcc894d594a7dd514ef2e09fea",
+  "source_only": true,
+  "no_implementation_acceptance_or_runtime_GO": true
+}

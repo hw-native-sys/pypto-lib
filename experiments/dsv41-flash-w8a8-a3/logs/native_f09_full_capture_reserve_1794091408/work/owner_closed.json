@@ -1,0 +1,11 @@
+{
+  "normal_close": true,
+  "primary_error": {
+    "type": "ValueError",
+    "error": "unwritten C2 state changed rank0 request1",
+    "traceback": "Traceback (most recent call last):\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/f09_decode_case.py\", line 305, in capture\n    records=drive(p,args.work)\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/f09_decode_case.py\", line 204, in drive\n    retained_equal(before,values,history,meta)\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/f09_decode_case.py\", line 127, in retained_equal\n    if keep and not torch.equal(before[name][rank,:,block,keep],after[name][rank,:,block,keep]):raise ValueError(f'unwritten C2 state changed rank{rank} request{request}')\nValueError: unwritten C2 state changed rank0 request1\n"
+  },
+  "cleanup_errors": [],
+  "records": 0,
+  "source_manifest": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31"
+}

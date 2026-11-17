@@ -1,0 +1,11 @@
+[
+  {
+    "id": "engram_basis-1793957377-1793964185",
+    "start_epoch": 1793957377,
+    "end_epoch": 1793964185,
+    "duration_seconds": 6808,
+    "phase": "implement-validate",
+    "summary": "F05 FP32 original-basis restoration with BF16 projection/FP32 residual; original-source/analytic CPU checks, five permanent defaults and six numerical mutation controls; only engram.py and exclusive artifacts changed.",
+    "evidence": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/cohort_engram_f07_1793957136/worker_engram/REPORT.md"
+  }
+]

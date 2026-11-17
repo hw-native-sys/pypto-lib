@@ -1,0 +1,13 @@
+{
+  "stage": "PREPARED_NOT_EXECUTED",
+  "epoch": 1794060484.9064085,
+  "native_task": "task_20261107_204310_361283812010",
+  "Root_authorized_condition": "native terminal plus executor external queuedCPU POST receipt before ONE actualCPUaudit",
+  "auditor_sha256": "920edfcf59f9e35b71365b16add240769e1ed7ee61c9648945fc4384066fd149",
+  "prepared_notes_sha256": "6f6f83a290cc7db3110a7ff47ce6d2d0702161d147e7e95ed9f168fe84dcb262",
+  "actual_audit_jobs": 0,
+  "actual_grants_created": 0,
+  "own_NPU_jobs": 0,
+  "actual_checkpoint_tensor_reads": 0,
+  "notes": "No numerical/cache-byte/full-model-parity claim; no fullmetadata/golden rerun. Waiting native case, source held."
+}

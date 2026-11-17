@@ -1,0 +1,103 @@
+{
+  "requested_role": "old-physical",
+  "profile": {
+    "origin_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/build/count_old_physical",
+    "manifest": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/count_old_physical_files.json",
+    "manifest_sha256": "484bbb7d6c22475edbb725186e59b9dc1ff32118edfac9fa2dc3a33afc36a414",
+    "metadata_sha256": "189381005f808c601c93286c4ef8022e54e160f99a2c144d527608df90dd9fb9",
+    "source_manifest": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31"
+  },
+  "verdict": [
+    {
+      "positive": true,
+      "source_routes": [
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12
+      ],
+      "total_routes": 192,
+      "valid_capture_matrix": true
+    },
+    {
+      "specific_numeric_reject": true,
+      "actual_source_routes": [
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12
+      ],
+      "expected_source_routes": [
+        6,
+        6,
+        6,
+        6,
+        6,
+        6,
+        6,
+        6,
+        0,
+        0,
+        0,
+        0,
+        12,
+        12,
+        12,
+        12
+      ],
+      "actual_total": 192,
+      "expected_total": 96,
+      "valid_capture_matrix": true
+    },
+    {
+      "positive": true,
+      "source_routes": [
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12,
+        12
+      ],
+      "total_routes": 192,
+      "valid_capture_matrix": true
+    }
+  ],
+  "required_middle_negative": true,
+  "fullentry_three_groups19x3": "SEPARATE_REQUIRED",
+  "native_status_not_replaced": true
+}

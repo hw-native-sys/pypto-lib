@@ -1,0 +1,17 @@
+{
+  "identity": {
+    "pid": 1427839,
+    "starttick": "108280253"
+  },
+  "command": [
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_lifecycle_1794081685/future_microtest.py",
+    "--execute",
+    "--authorization",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_lifecycle_micro_1794081685_launch/native_authorization.json",
+    "--output",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_lifecycle_micro_1794081685",
+    "--child"
+  ],
+  "epoch": 1794082880.6032717
+}

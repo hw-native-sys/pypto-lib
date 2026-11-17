@@ -1,0 +1,5 @@
+{
+  "stage": "lifecycle-cleanup-error",
+  "primary": "ValueError('extra/unregistered/cross-identity prepared object inventory')",
+  "secondary": "RuntimeError('secondary close')"
+}

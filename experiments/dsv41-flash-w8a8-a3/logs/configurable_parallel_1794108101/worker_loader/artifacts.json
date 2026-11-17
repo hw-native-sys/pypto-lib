@@ -1,0 +1,14 @@
+{
+  "REPORT.md": "ba02657d7ae5cef7407832470d1e5ff5c9e31650c31ac6aa4bfb97d20eb8e629",
+  "changes.patch": "51391d8ac5a0b7d8e3f49186ffca5bbd295e66183360adcc636d93252af78d7c",
+  "check.py": "2cf692a4ca40a0c17a01683818a32a5bfcc3b18c61dabf0e31a71b78109ce1fc",
+  "check_final.py": "f6e8b18b3dcda7f9736cf5f4d6b159a2aad3e6d676889927d9ebfa51761af43e",
+  "final_results.json": "ce1ae0376974114082d1546591d843f0dc99d7a4d1dee1f268bfbd1cf4313ba5",
+  "partial.json": "2027097af2e7966e58fbd3d7be8ae56c9d250a9be5a9ce064bcd81625e5e3fbf",
+  "results.json": "31df82cc50c8461e1c0e34e424b447d7fa1225172cbdcc0ef6464de69b57afeb",
+  "source_hashes.json": "8d4dbf4c8080a5fc4695c53371d76dfeb042296b0e31fff99d7fafa7ee245fea",
+  "start.json": "76544ae27cb4c41fc1b6b7cef7786cb1031a5c7aa272608ad0b51943f80eee41",
+  "task_final.log": "06c4758dfab82e244cf91ea3bc872cb04db981c33d65b1bb0105df639d9b7694",
+  "task_v1.log": "6f59e064b2709d128f63127080a288ead32cac6110b8e32fd98ed7c00772f1f8",
+  "work_record.json": "c6b1acb11fac8f5be72f0071a208daa28584f8e8b628ac688db074006c972174"
+}

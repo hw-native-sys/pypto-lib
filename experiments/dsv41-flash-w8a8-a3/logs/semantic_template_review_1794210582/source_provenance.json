@@ -1,0 +1,78 @@
+{
+  "epoch": 1794210582.4862745,
+  "files": [
+    {
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/generate.py",
+      "sha256": "bc3cd736df208251f3787fd0fccbee1abccf9ee52dba4d810b1b1c0dfad7f4b7",
+      "bytes": 159718,
+      "mtime_ns": 1794109032582891839,
+      "kind": "source/tokenizer/config/readme only, no weight header/payload"
+    },
+    {
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/tokenizer.py",
+      "sha256": "817928b6591a59f13b48e8d06271e58840dc70a3bfbbb79eaeb18a6342c06fb1",
+      "bytes": 24346,
+      "mtime_ns": 1793670312942910030,
+      "kind": "source/tokenizer/config/readme only, no weight header/payload"
+    },
+    {
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/config.py",
+      "sha256": "abfb39922b4c340f443c5d3e8869ee2c76344f7b03781702f845055abdd552c1",
+      "bytes": 9714,
+      "mtime_ns": 1794108228233450138,
+      "kind": "source/tokenizer/config/readme only, no weight header/payload"
+    },
+    {
+      "path": "/mnt/data/models/DeepSeek-V4.1-Flash-w8a8/README.md",
+      "sha256": "fe0edcfd5750ddf9675866ff7d5c7f69fdccb86ef7bf2a1f88ddb5e2b706e1f8",
+      "bytes": 2744,
+      "mtime_ns": 1793168087762945268,
+      "kind": "source/tokenizer/config/readme only, no weight header/payload"
+    },
+    {
+      "path": "/mnt/data/models/DeepSeek-V4.1-Flash-w8a8/config.json",
+      "sha256": "1b2ed579c6a221f68f49222d470dab2068b23a3efc17d969b7a909e684e06316",
+      "bytes": 3395,
+      "mtime_ns": 1793168088783363112,
+      "kind": "source/tokenizer/config/readme only, no weight header/payload"
+    },
+    {
+      "path": "/mnt/data/models/DeepSeek-V4.1-Flash-w8a8/tokenizer_config.json",
+      "sha256": "6ac8c8dc065ed118161d02dd532749ae3f52c243deac27872134fae2f50d8547",
+      "bytes": 801,
+      "mtime_ns": 1793262699529205948,
+      "kind": "source/tokenizer/config/readme only, no weight header/payload"
+    },
+    {
+      "path": "/mnt/data/models/DeepSeek-V4.1-Flash-w8a8/tokenizer.json",
+      "sha256": "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b",
+      "bytes": 6367257,
+      "mtime_ns": 1793262698725323358,
+      "kind": "source/tokenizer/config/readme only, no weight header/payload"
+    },
+    {
+      "path": "/mnt/data/models/DeepSeek-V4.1-Flash-w8a8/encoding/README.md",
+      "sha256": "5c13c17f96400c66c288dcc96bc9e17a3c6ec6e0771aff5870abad4dd7f920e3",
+      "bytes": 10962,
+      "mtime_ns": 1793168089204542314,
+      "kind": "source/tokenizer/config/readme only, no weight header/payload"
+    },
+    {
+      "path": "/mnt/data/models/DeepSeek-V4.1-Flash-w8a8/encoding/encoding.py",
+      "sha256": "f64a67e5680a5621b9320585a9684967cd5c75a9b82e19d914cbc02845d72cab",
+      "bytes": 35338,
+      "mtime_ns": 1793168089533924568,
+      "kind": "source/tokenizer/config/readme only, no weight header/payload"
+    },
+    {
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-serving/pypto_serving/model/deepseek_v41/encoding.py",
+      "sha256": "fa6824b63457d77801da1293f61fda54e334b557305f88e88fc939b54956cd81",
+      "bytes": 10945,
+      "mtime_ns": 1793345927286103390,
+      "kind": "source/tokenizer/config/readme only, no weight header/payload"
+    }
+  ],
+  "source_manifest_reported_by_Root": "f0e91a30e4117e110be183ef44acf2874eea813cc6f72ac7c7fa44bc4ede3a7f",
+  "whole45_recomputed": false,
+  "imports_or_tokenizer_execution": false
+}

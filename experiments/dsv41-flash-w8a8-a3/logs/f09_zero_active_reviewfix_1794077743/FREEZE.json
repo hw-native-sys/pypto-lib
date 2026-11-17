@@ -1,0 +1,14 @@
+{
+  "status": "FINAL/PARK",
+  "artifact_count": 93,
+  "artifact_manifest_sha256": "188d06bcf2695519e392a91161fab6bef270d136f9cf5d5768e7a9b468b8590f",
+  "new_source45_UNAPPLIED_sha256": "f08bb59b008df8ee1f2d4588414de9ff52976848f85e089d57d4dac47257401f",
+  "proposed_patch_against_M02_sha256": "c8224fb95c18f3e23f1a43a77c6547173b67fd386f76096b513c95b8942351ab",
+  "reviewfix_delta_sha256": "4832628f310a4363b23addaa6d5cf502025ffdd6a75281865b6ca82fdb845a35",
+  "operator_sha256": "4fc355b970b069df9c5d2862eec539efdb18c45f6236586d2c777e208035533b",
+  "adapter_sha256": "b48405c45e46c6185b730bd1711154a2cb74c31e4fbd19228130b2a472587589",
+  "probe_sha256": "c3aad8e9ad2596545557d092587584be471bc8da0fad5364bade7f3608a1391e",
+  "live_M02_old76_unchanged": true,
+  "all_jobs_writers_parked": true,
+  "no_compile_NPU_payload_fixture_grant_sharedwrites": true
+}

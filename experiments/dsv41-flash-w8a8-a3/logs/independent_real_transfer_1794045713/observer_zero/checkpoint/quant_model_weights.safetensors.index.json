@@ -1,0 +1,1 @@
+{"weight_map": {"embed.weight": "reviewer_non_square.safetensors", "layers.1.ffn.experts.1.w1.weight": "reviewer_non_square.safetensors", "layers.1.ffn.experts.1.w1.weight_offset": "reviewer_non_square.safetensors", "layers.1.ffn.experts.1.w1.weight_scale": "reviewer_non_square.safetensors", "head.weight": "reviewer_non_square.safetensors"}}

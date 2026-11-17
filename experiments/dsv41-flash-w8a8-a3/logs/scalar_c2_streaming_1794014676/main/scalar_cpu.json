@@ -1,0 +1,42 @@
+{
+  "cases": [
+    {
+      "case": "fp32_tensor",
+      "python_type": "float",
+      "value": 1.25,
+      "public_abi_accepted": true
+    },
+    {
+      "case": "fp32_python",
+      "python_type": "float",
+      "value": -2.5,
+      "public_abi_accepted": true
+    },
+    {
+      "case": "int32_tensor",
+      "python_type": "int",
+      "value": 3,
+      "public_abi_accepted": true
+    },
+    {
+      "case": "int32_python",
+      "python_type": "int",
+      "value": 4,
+      "public_abi_accepted": true
+    },
+    {
+      "case": "bool_tensor",
+      "python_type": "bool",
+      "value": true,
+      "public_abi_accepted": true
+    },
+    {
+      "case": "bool_python",
+      "python_type": "bool",
+      "value": false,
+      "public_abi_accepted": true
+    }
+  ],
+  "old_fp32_tensor_rejected": true,
+  "nonscalar_shape_controls": 2
+}

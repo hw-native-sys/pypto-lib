@@ -1,0 +1,67 @@
+{
+  "start_epoch": 1794075284.9985068,
+  "end_epoch": 1794075302.3048527,
+  "own_identity": {
+    "pid": 3429781,
+    "birth": "107520628",
+    "ppid": 3429163,
+    "comm": "python"
+  },
+  "known_process_identities": [
+    {
+      "pid": 3429830,
+      "birth": "107520693",
+      "ppid": 3429781,
+      "comm": "python"
+    },
+    {
+      "pid": 3430130,
+      "birth": "107520967",
+      "ppid": 3429830,
+      "comm": "git"
+    },
+    {
+      "pid": 3430183,
+      "birth": "107521018",
+      "ppid": 3429830,
+      "comm": "aarch64-target-"
+    },
+    {
+      "pid": 3430193,
+      "birth": "107521023",
+      "ppid": 3429830,
+      "comm": "git"
+    },
+    {
+      "pid": 3430635,
+      "birth": "107521434",
+      "ppid": 3429830,
+      "comm": "git"
+    },
+    {
+      "pid": 3430697,
+      "birth": "107521489",
+      "ppid": 3429830,
+      "comm": "g++"
+    },
+    {
+      "pid": 3430903,
+      "birth": "107521676",
+      "ppid": 3429830,
+      "comm": "python"
+    },
+    {
+      "pid": 3430904,
+      "birth": "107521678",
+      "ppid": 3429830,
+      "comm": "git"
+    }
+  ],
+  "child_exit": 1,
+  "first_error": null,
+  "normal_child_exit": false,
+  "actual_ordered_device_ids": [
+    0
+  ],
+  "native_result_exists": true
+}

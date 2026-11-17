@@ -1,0 +1,13 @@
+entry	mode	start	end	exit	device
+prefill_c1a_full	before	1793951818	1793951870	0	0
+prefill_c2a_full	before	1793951870	1793951922	0	0
+decode_c1a_full	before	1793951922	1793951973	0	0
+decode_c2a_full	before	1793951973	1793952026	0	0
+prefill_c1a_full	after	1793952026	1793952078	0	0
+prefill_c2a_full	after	1793952078	1793952131	0	0
+decode_c1a_full	after	1793952131	1793952184	0	0
+decode_c2a_full	after	1793952184	1793952235	0	0
+prefill_c1a_full	rotated_index	1793952235	1793952287	0	0
+prefill_c2a_full	rotated_index	1793952287	1793952339	0	0
+decode_c1a_full	rotated_index	1793952339	1793952391	0	0
+decode_c2a_full	rotated_index	1793952391	1793952442	0	0

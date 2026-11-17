@@ -1,0 +1,31 @@
+{
+  "status": "PASS_INDEPENDENT_FROZEN_OUTER_TINY_CPU_ONLY",
+  "checks": [
+    "normal-product-CLI-exact-command-no-alternate-driver",
+    "outer-default-reject-before-any-grant",
+    "task-emptyGO-reject-before-any-grant",
+    "task-no-allocation-reject-before-any-grant",
+    "changed-source-binding-refused-before-whole-metadata",
+    "wrong-token-root",
+    "wrong-token-hash",
+    "own-header-range-mismatch",
+    "postspawn-observation-error-does-not-abandon-child-or-mask-exit7",
+    "immediate-durable-CLI-identity-and-own-PSS-sum",
+    "CLIzero-posterror-is-not-PASS",
+    "nonleader-thread-child-PID-and-PSS-visible"
+  ],
+  "header_bytes": {
+    "source_keys": 1,
+    "shards": 1,
+    "metadata_bytes_read": 72,
+    "tensor_payload_bytes_read": 0
+  },
+  "actual_grants_created": 0,
+  "actual_checkpoint_tensor_reads": 0,
+  "NPU": 0,
+  "fake_CLI_exit7": 7,
+  "fake_CLI_exit0_posterror_status": "FAIL",
+  "own_pid": 3598628,
+  "own_starttick": 105496073,
+  "limits": "owned tiny files/processes only; no real whole-header rerun/fullmodel/forward/native/actual valid Root receipt"
+}

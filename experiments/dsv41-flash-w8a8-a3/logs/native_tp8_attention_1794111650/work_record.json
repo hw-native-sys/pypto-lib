@@ -1,0 +1,11 @@
+{
+  "id": "native-tp8-original-attention-1794111650-1794111980",
+  "role": "review-agent",
+  "start_epoch": 1794111650.2675257,
+  "end_epoch": 1794111980.4459724,
+  "elapsed_seconds": 330.17844676971436,
+  "scope": "ONE native original attention3cases+terminal metadata/source/cleanup seal",
+  "task": "task_20261108_122101_13767445722",
+  "protected_writes": 0,
+  "TIME_LOG_self_imported_once": true
+}

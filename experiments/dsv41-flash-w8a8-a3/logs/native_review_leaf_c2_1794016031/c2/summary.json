@@ -1,0 +1,45 @@
+{
+  "source_unchanged": true,
+  "native_projection_math_gate": "PASS vs exact FP64",
+  "old_CPU_FP32_reference_gate": "FAIL384/4096",
+  "full_entry_actual_input_capture": "v2 signature compile PASS; native run NOT performed by worker; Main integration pending",
+  "golden_change": "PROPOSED NOT APPLIED",
+  "capture_v2": {
+    "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/build_output/_jit_decode_fwd_20261107_094411_1ish_u4a",
+    "capture_param": {
+      "name": "captured_input__ssa_v0",
+      "direction": "Out",
+      "shape": [
+        16,
+        3,
+        -1,
+        5120
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    "mode": "ONBOARD compile only",
+    "platform": "a2a3",
+    "device_dispatches": 0
+  },
+  "records": [
+    {
+      "id": "c2-localization-1794014835-1794015711",
+      "start": 1794014835,
+      "end": 1794015711,
+      "duration": 876,
+      "basis": "measured baseline preservation mtime to finalization;earlier read-only study excluded",
+      "agent": "c2_state_precision",
+      "status": "PARKED"
+    },
+    {
+      "id": "c2-capture-v2-1794015838-1794015926",
+      "start": 1794015838,
+      "end": 1794015926,
+      "duration": 88,
+      "basis": "measured v2 artifact creation mtime to seal; separate nonoverlapping interval",
+      "agent": "c2_state_precision",
+      "status": "PARKED"
+    }
+  ]
+}

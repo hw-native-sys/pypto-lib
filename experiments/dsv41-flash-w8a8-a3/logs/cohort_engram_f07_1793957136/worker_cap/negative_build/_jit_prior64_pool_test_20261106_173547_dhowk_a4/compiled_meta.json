@@ -1,0 +1,90 @@
+{
+  "schema": 3,
+  "supported_execution_modes": [
+    "program"
+  ],
+  "params": [
+    {
+      "name": "scores",
+      "direction": "In",
+      "shape": [
+        -1,
+        -1
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "compressed_lens",
+      "direction": "In",
+      "shape": [
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "pool_ids",
+      "direction": "Out",
+      "shape": [
+        -1,
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "pool_counts",
+      "direction": "Out",
+      "shape": [
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    }
+  ],
+  "lowered_params": [
+    {
+      "name": "scores",
+      "direction": "In",
+      "shape": [
+        -1,
+        -1
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "compressed_lens",
+      "direction": "In",
+      "shape": [
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "pool_ids",
+      "direction": "Out",
+      "shape": [
+        -1,
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "pool_counts",
+      "direction": "Out",
+      "shape": [
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    }
+  ],
+  "num_return_types": 0,
+  "return_aliases": null,
+  "platform": "a2a3sim",
+  "backend_type": "Ascend910"
+}

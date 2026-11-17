@@ -1,0 +1,14 @@
+{
+  "status": "PASS_SCOPED_CPU_SOURCE_METADATA_TRANSPORT_PREPARATION_WITH_NEW_SCALAR_OBSERVER",
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "Main46_unchanged": true,
+  "old77_1252_31_48_478_unchanged": true,
+  "offset_statistic_gap": "original helper omits durable count; approved new temporary wrapper CPUproof resolves recording preparation only",
+  "observer_sha256": "31cd56f5bff3dd6db0f24d47ed2534efbbbe0ec46c68b256b65b0ae3d3eb7892",
+  "real_offset_nonzero_count": null,
+  "actual_payload_NPU_branch": "UNEXECUTED_REQUIRES_SEPARATE_ROOT_GO",
+  "current_device_free": null,
+  "full40_initialized_upload_forward_peak": null,
+  "fullweights_fit_text_guard": "HELD",
+  "PARK": true
+}

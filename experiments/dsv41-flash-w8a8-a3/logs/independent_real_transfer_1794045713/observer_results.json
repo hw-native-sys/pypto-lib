@@ -1,0 +1,55 @@
+{
+  "status": "PASS_SCALAR_RETURN_OBSERVER_ZERO_NONZERO_FAILURE_CPU_ONLY",
+  "variants": [
+    {
+      "variant": "nonzero",
+      "observed_count": 51,
+      "numel": 64,
+      "source_read_copy_counters_hashes_and18transfers_unchanged": true,
+      "all912_free_attempts_and_close_unchanged": true,
+      "source_backing_released": true,
+      "durable_scalar": {
+        "schema": "offset-source-observation/1",
+        "epoch": 1794046819.2433329,
+        "evidence_scope": "CPU_OWN_TINY_ONLY",
+        "key": "layers.1.ffn.experts.1.w1.weight_offset",
+        "numel": 64,
+        "dtype": "torch.float32",
+        "nonzero_elements": 51,
+        "original_source_sha256": "60579433b8b739f4c2c902a79001d38f6274beb10faff0ce1a87ba628b851e07",
+        "status": "OBSERVED_RETURNED_SOURCE_SCALAR",
+        "transport_sha256": "5e364da73ac36d59bce09f92dc4efb8501e900175fc91afc08f91cf0da9dfbb5",
+        "observer_sha256": "31cd56f5bff3dd6db0f24d47ed2534efbbbe0ec46c68b256b65b0ae3d3eb7892"
+      }
+    },
+    {
+      "variant": "zero",
+      "observed_count": 0,
+      "numel": 64,
+      "source_read_copy_counters_hashes_and18transfers_unchanged": true,
+      "all912_free_attempts_and_close_unchanged": true,
+      "source_backing_released": true,
+      "durable_scalar": {
+        "schema": "offset-source-observation/1",
+        "epoch": 1794046821.043624,
+        "evidence_scope": "CPU_OWN_TINY_ONLY",
+        "key": "layers.1.ffn.experts.1.w1.weight_offset",
+        "numel": 64,
+        "dtype": "torch.float32",
+        "nonzero_elements": 0,
+        "original_source_sha256": "5341e6b2646979a70e57653007a1f310169421ec9bdd9f1a5648f75ade005af1",
+        "status": "OBSERVED_RETURNED_SOURCE_SCALAR",
+        "transport_sha256": "5e364da73ac36d59bce09f92dc4efb8501e900175fc91afc08f91cf0da9dfbb5",
+        "observer_sha256": "31cd56f5bff3dd6db0f24d47ed2534efbbbe0ec46c68b256b65b0ae3d3eb7892"
+      }
+    }
+  ],
+  "observer_sha256": "31cd56f5bff3dd6db0f24d47ed2534efbbbe0ec46c68b256b65b0ae3d3eb7892",
+  "original_transport_unchanged": true,
+  "return_value_and_execution_not_replaced": "thin wrapper calls original once and returns identical Tensor; no model/data computation replaced",
+  "records_retain_only_JSON_scalars": true,
+  "unknown_failure_nonzero_count_and_source_SHA": null,
+  "real_checkpoint_payload": 0,
+  "NPU": 0,
+  "actual_grant": false
+}

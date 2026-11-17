@@ -1,0 +1,17 @@
+{
+  "scope": "copied once into Main-owned artifact; observer still imports sharedledger separately",
+  "records": [
+    {
+      "id": "worker-f09-operator-draft-1794066473-1794066732",
+      "agent": "/root/main_native/f09_operator_draft",
+      "start_epoch": 1794066473,
+      "end_epoch": 1794066732,
+      "elapsed_seconds": 259,
+      "status": "FINAL/PARK",
+      "scope": "artifactoperatorcopy+tinyactualgoldenwithaffineexpertstub; no live source/compile/NPU/payload",
+      "imported_to_shared_ledger": false
+    }
+  ],
+  "source_record_sha256": "ac9b080a499bf68f9c35fff50b50d16db163786b21a2062b044f51a881e41b73",
+  "source_raw_worker_manifest_sha256": "14ca20064efab4cafd3cf0e21119593696064bdd0aada75be17b622e58c84427"
+}

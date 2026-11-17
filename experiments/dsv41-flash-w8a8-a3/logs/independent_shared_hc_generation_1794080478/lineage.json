@@ -1,0 +1,6 @@
+{
+  "baseline_audit": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_longer_real_generation_1794064471/audit.py",
+  "sha256": "ce9063d63d7623fc975bcea691feb1b14c2ef06d622766fc187dc931e4c4c21d",
+  "baseline_status": "historical281passed/2unmet; not rerun",
+  "scope": "necessary source/math/signatures/shared-accounting/terminal-context delta only"
+}

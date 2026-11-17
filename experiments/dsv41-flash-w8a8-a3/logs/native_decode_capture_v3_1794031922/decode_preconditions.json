@@ -1,0 +1,44 @@
+{
+  "accepted_old579_unchanged": true,
+  "source45_V3_unchanged": true,
+  "accepted_prefix_CPUreceipt_ABI_source_static_verified": true,
+  "native_CPU_pids_present": {
+    "179990": false,
+    "180708": false,
+    "203231": false,
+    "203232": false,
+    "203238": false,
+    "203244": false,
+    "203257": false,
+    "203264": false,
+    "203270": false,
+    "203276": false,
+    "203282": false,
+    "203289": false,
+    "203302": false,
+    "203308": false,
+    "203314": false,
+    "203320": false,
+    "203326": false,
+    "203340": false,
+    "203346": false,
+    "240146": false
+  },
+  "actual_available": {
+    "host": 1722085285888,
+    "disk": 9529934741504,
+    "shm": 1079343157248
+  },
+  "required": {
+    "host": 290783361536,
+    "disk": 10633936896,
+    "shm": 37231460864
+  },
+  "same_physical_work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_prefix_capture_v3_1794027615/work",
+  "META_sha256": "23ceafafb34242c84a7dfbb1db09108acfc796f691a963b1cb302f5110d6d608",
+  "policy_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_prefix_capture_v3_1794027615/cpu_reference_policy.json",
+  "derived_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/runs/evaluator/derived_model",
+  "public_adapter_sha256": "6c1064667906fc24e9e2f68e1fa03e15a7907fa2da030fb3345a5044639ef103",
+  "NPU_prepared": false,
+  "native_action_only": true
+}

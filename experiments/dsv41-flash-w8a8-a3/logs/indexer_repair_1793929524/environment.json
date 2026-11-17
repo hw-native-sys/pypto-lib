@@ -1,0 +1,37 @@
+{
+  "epoch": 1793929752,
+  "python": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+  "host": "liteserver-hps-f7e5-00002.novalocal",
+  "architecture": "aarch64",
+  "pypto_lib": "b6d17d9fa7a1e3420fbb7ac3c108fee194ec06fc",
+  "pypto": "38a8aa6da24c62bf0c6f6f9ef94deb513fbb4d2e",
+  "simpler": "31f9e72ee6832cd198b77df18c1c305e7fd83676",
+  "pto_isa": "f83d4b7e4be0a4ca9805944ae2d9ce8c84e581f7",
+  "ptoas": "ptoas 0.72",
+  "pypto_module": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/pypto/__init__.py",
+  "torch_version": "2.14.1+cpu",
+  "golden_run_module": "golden.runner",
+  "tile_view": "<pypto.pypto_core.ir.TileView object at 0xfffd01c738a0>",
+  "source_manifest_sha256": "2320f56c20e1ae1bd5ac2f8233cc4f705377bfda9a30eb00a6704c35c3c01e83",
+  "build_inputs": {
+    "nanobind": "2.15.0",
+    "cmake": "4.4.2",
+    "ninja": "1.13.0",
+    "scikit-build-core": "1.0.3"
+  },
+  "package_provenance": {
+    "pypto": {
+      "dir_info": {},
+      "url": "file:///mnt/data/pyptouser/yangyaodong/code/pypto"
+    },
+    "simpler": {
+      "dir_info": {},
+      "url": "file:///mnt/data/pyptouser/yangyaodong/code/pypto/runtime"
+    }
+  },
+  "ptoas_pin": "# Single source of truth for the pypto-owned external toolchain versions (ptoas).\n#\n# Every CI workflow reads these values via the `toolchain` lead job (see\n# .github/workflows/ci.yml) instead of hardcoding them. Bump a version HERE and\n# nowhere else \u2014 the `toolchain` job's guard step fails the build if a literal\n# PTOAS sha256 (or pto-isa commit) reappears inline in a workflow.\n#\n# ptoas: the assembler release used by the codegen -> device path. The runtime\n#        does not use ptoas. sha256 is for the CPython 3.10 manylinux wheel for\n#        each architecture (aarch64 / x86_64). PTOAS_VERSION is also the\n#        minimum codegen accepts at run time: bump PTOAS_MIN_VERSION in\n#        python/pypto/backend/_ptoas_locate.py in the same change (an installed\n#        wheel does not ship this file); tests/ut/backend/test_ptoas_locate.py\n#        fails while the two differ.\n#\n# pto-isa is NOT declared here. It is derived from the pinned `runtime/`\n# submodule's committed `runtime/pto_isa.pin` (the runtime is the source of\n# truth \u2014 it enforces build == run, see simpler #1096). The `toolchain` job\n# reads that file, so bumping the runtime submodule automatically moves pypto's\n# pto-isa in lockstep with the runtime it builds against.\n#\n# Shell-sourceable `KEY=value` (no spaces) so\n# `grep -E '^[A-Z0-9_]+=' toolchain/versions.env >> \"$GITHUB_OUTPUT\"` works directly.\n# HF32 requires v0.70. InsertMxScaleAddr avoids the unchanged-pair rebinding\n# rejected by v0.70 (PTOAS #1691); native MX tests guard this compatibility.\nPTOAS_VERSION=v0.72\nPTOAS_SHA256_AARCH64=69bd51ccd3d9cc4ad0a6a7b296b46dc533d60b214ded9450fb0f90a83a765ca6\nPTOAS_SHA256_X86_64=2cc47b1d4c8ace884fb12f7691e0c368132fefef401060c920bed2a5210e3db7\n",
+  "isa_pin": "f83d4b7e4be0a4ca9805944ae2d9ce8c84e581f7\n",
+  "runtime_gitlink": "160000 commit 31f9e72ee6832cd198b77df18c1c305e7fd83676\truntime",
+  "revision_3_matches": true,
+  "build_inputs_match": true
+}

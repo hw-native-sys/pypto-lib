@@ -1,0 +1,18 @@
+{
+  "inspection": "freshfull generated registration+orchestration source; not runtime graph",
+  "registered_statewriter_variants": [
+    "c2a_state_write"
+  ],
+  "registered_func_ids": [
+    59
+  ],
+  "generated_calls": [
+    70
+  ],
+  "C2B_or_suffixed_variants_registered": false,
+  "active_num_tokens_scalar": true,
+  "pool_tid_dependency": true,
+  "kv_and_score_projection_inputs": true,
+  "physical_projection_storage_and_anchors_unchanged": true,
+  "other_profiles_NOT_claimed": true
+}

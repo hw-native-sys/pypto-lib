@@ -1,0 +1,17 @@
+{
+  "artifacts_count": 39,
+  "artifacts_sha256": "4b419932dd59ca3c15941ddfc7a837ca8e9babd34eadcac66e60e49fd88d4d00",
+  "epoch": 1794073013,
+  "native_authorized_by_this_report": false,
+  "pins": {
+    "frozen_draft/generate.proposed.py": "fba8a4ef9a06f694fa53278bb80ae2ad70d111336dbead938ab9f8511d27e16e",
+    "future_task_entry.py": "4f0af75139b6c08f4324d46889de9180a1e1b51a036a8aacac24586f567366ac",
+    "owner_adapter.py": "188cf41eafb1e6b6bdece83188a52b1a0e3336c6e5fb80a0d62b547223f31a41",
+    "public_contract.py": "7fb8b40dc98a473de56a162031453bfe3fcce481af4cd999181987ecf6409508",
+    "runtime_pins.json": "b1ba689ff3db8b6ef3a9ce31c63b1d85857a11efd6004d643e7b7c05bb026d7a",
+    "tiny_programs.py": "94f3290e98ceefdba48fa61c372130a7176199b19802d1633152dc9d9619ef60",
+    "tiny_shared.py": "38e92714a550407727a4a7d816c1e9c8fc711519cc73ecdcf89c1f8d6caa9d59"
+  },
+  "source45": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "state": "FINAL_PARK"
+}

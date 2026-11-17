@@ -1,0 +1,32 @@
+{
+  "CPU_identity_absent": true,
+  "Main23_unchanged": true,
+  "NPU": 0,
+  "before_after_source_unchanged": true,
+  "end_epoch": 1794077287,
+  "final_CPU_exit": 0,
+  "final_CPU_task": "task_20261108_024230_350535511631",
+  "new_plan": "806852d5baec99a522f5adc3015bdd204d9ac6b17244a29cb26445cbd55fda89",
+  "old611_metadata_only": true,
+  "payload": 0,
+  "prepare": 0,
+  "prior_tasks": [
+    {
+      "exit": 1,
+      "model_failure": false,
+      "stage": "before producer import: own HC manifest filename assumption",
+      "task": "task_20261108_023659_348614111959"
+    },
+    {
+      "exit": 1,
+      "prefill_compile_succeeded": true,
+      "stage": "applied CPU gates PASS, actual prefill entry.compile RETURN, own HOST string checker later failed",
+      "task": "task_20261108_023933_349216314444",
+      "whole_task_PASS": false
+    }
+  ],
+  "samples": 0,
+  "signature_receipt_sha256": "3f5441beade418bf307463188a7b5a52c733299cf6dffde0fe501d4df5fbefd4",
+  "source45": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "state": "PASS_FINAL_PARK_SIGNATURE_CPU_ONLY"
+}

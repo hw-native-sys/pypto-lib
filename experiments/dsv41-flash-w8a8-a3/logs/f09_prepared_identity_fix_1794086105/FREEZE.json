@@ -1,0 +1,17 @@
+{
+  "status": "FINAL_PARK",
+  "artifacts": 312,
+  "manifest_sha256": "bf30573385c6a52859e1b66f835c56185a7bc7f9a259558d40ce9256de91666a",
+  "helper": "ee648c64b8477cc98b2f3083a6b16c9b6b92cc4612cc3228391dbe53aef1858d",
+  "route": "a91557c329aa8dff120ce3f141afcdde5c2371c6e4a659107911720f7c64d4cb",
+  "adapter": "412cb48d4625d54958f949588cdf9d9d0b6457137b4e27a6de17c0d84582e295",
+  "source45": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "live45": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "CPU_task": "task_20261108_052537_158040813056",
+  "CPU_PASS": true,
+  "writers": 0,
+  "own_jobs": 0,
+  "no_worker": true,
+  "new_Root_wrapper": "PENDING",
+  "actual16_GO": "ABSENT"
+}

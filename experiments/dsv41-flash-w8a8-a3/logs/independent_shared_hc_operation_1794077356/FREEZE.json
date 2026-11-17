@@ -1,0 +1,10 @@
+{
+  "REPORT_sha256": "1da846c99d0aef5f99a234a62bba3e2126a573c9698bec096575d40e5ea7894a",
+  "actual_source45": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "artifact_count": 26,
+  "artifacts_sha256": "5f30ab62889daf26ff3f92385412acfc1d73bd6ad34f7413af0451293ce82e8a",
+  "epoch": 1794078121,
+  "fullmodel_actual_generation_authorized": false,
+  "results_sha256": "1c5c9b6744807078d1f84acc14ebd66c9cfcb6f5c260e7d58e334b408221cd00",
+  "state": "PASS_FINAL_PARK_CPU_ONLY"
+}

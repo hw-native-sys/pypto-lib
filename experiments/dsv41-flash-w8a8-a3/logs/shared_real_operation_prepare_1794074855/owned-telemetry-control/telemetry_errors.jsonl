@@ -1,0 +1,1 @@
+{"epoch": 1794075879.6144955, "pid": 3457298, "start_ticks": "107580152", "operation": "read-smaps-rollup", "path": "/proc/3457298/smaps_rollup", "errno": 13, "exception_type": "PermissionError", "error": "PermissionError(13, 'CPU shared-adapter injected memory gap')", "critical": false}

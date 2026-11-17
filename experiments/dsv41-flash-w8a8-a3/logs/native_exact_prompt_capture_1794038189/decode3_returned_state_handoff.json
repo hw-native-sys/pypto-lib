@@ -1,0 +1,10 @@
+{
+  "prefix_state_cache_c2a_sha256": "78e8cf15c202f269b2ee5056f24abcc6e01aec199251b9eb2922172762ec7a2d",
+  "decode_initial_state_cache_c2a_sha256": "78e8cf15c202f269b2ee5056f24abcc6e01aec199251b9eb2922172762ec7a2d",
+  "source_pair": [
+    2,
+    3
+  ],
+  "publish_logical_row": 1,
+  "parent_prefix_manifest_sha256": "f4ca9d488b7e27c6388ff2aa68a71d122a1df5e7d9b2eb186f1321ad0cf28daf"
+}

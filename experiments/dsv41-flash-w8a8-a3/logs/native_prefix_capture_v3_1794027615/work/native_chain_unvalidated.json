@@ -1,0 +1,15 @@
+{
+  "positions": [
+    128,
+    129,
+    130
+  ],
+  "same_artifact": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_decode_capture_v3_1794031922/build/_jit_decode_fwd_20261107_142723_4bpmehp7",
+    "metadata_sha256": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770",
+    "compile_seconds": 24.996228218078613
+  },
+  "same_owner": "decode-3279907-a0c0ee08f50246a9af467089c7a04388",
+  "status": "NATIVE_BYTES_ONLY_NOT_PASS",
+  "evidence_mode": "native-unvalidated-bytes"
+}

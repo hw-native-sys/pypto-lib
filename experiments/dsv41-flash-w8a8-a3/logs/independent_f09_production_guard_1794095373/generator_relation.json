@@ -1,0 +1,11 @@
+{
+  "kind": "FILE_SOURCE_COMPARISON_NOT_EXECUTED_PREDICATE_TEST",
+  "oldgen_sha256": "f7b772cfa62ea38ebc9228e0230b770d8cf29a76527071cfe75b0c2bd5035e76",
+  "newgen_sha256": "5de1656a99e85699138879b2f577f4eed2639779937a7cdc91ae843fcef6e34c",
+  "exactly_one_old_baseline_literal_replaced": true,
+  "all_other_generator_source_identical": true,
+  "strict44_runtime_predicate_unchanged": true,
+  "M02_to8153_changed_model_files": 9,
+  "A_toB_only_generate": true,
+  "full_new_metadata_plan_materialized_or_resource_projection_reexecuted": false
+}

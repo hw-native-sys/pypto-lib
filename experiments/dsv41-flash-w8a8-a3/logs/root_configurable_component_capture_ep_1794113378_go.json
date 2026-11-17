@@ -1,0 +1,20 @@
+{
+  "schema": "Root-configurable-native-parent/1",
+  "approved": true,
+  "profile": "ep",
+  "tp": 1,
+  "ep": 2,
+  "work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_configurable_component_capture_1794113378/ep/work",
+  "dependency_pins_sha256": "42b3b07abb096d53415aa022592412b7bcd64fdc797e45e39f8af3282694b05c",
+  "entries_sha256": "85da069d517a34efce492d6f393edb5c3aadb845c272257629014d463d097b38",
+  "fixture_sha256": "914457368aed57489129a4d11afa6b785380e9ac87da9dd23e953b03f0c52f45",
+  "driver_sha256": "9410991b71c32ad6fb65289e4660f5e701bbc7c226cf2bdc9ffe701f1d60f139",
+  "publisher_sha256": "8426b32c99d3c33035e6c0bbf212ed53f0e42abc710f86a35891fe35de7362ff",
+  "query_sha256": "6943a03a563930ff9fc1987bc61954f94da753db0ac1a615c392239e543149b7",
+  "cpu_manifest_sha256": "45aa17ba826c4e689c85d29a8b29a548795c8e905b648876e46c15db7185c419",
+  "budget_sha256": "09ed71ca558a668c836386d0c2b74f83775b13a23f176224b83c2017279f6dbc",
+  "publisher_proof_sha256": "1bac1fafef47c52d5a7e15a6a98b5bbe65a240076c283d2cc7214f7fb5b8b55d",
+  "root_id": "observer-20261108-configurable-ep2-distinct-captures",
+  "expires_unix": 1794120882.764579,
+  "allow_after_allocation_public_query": true
+}

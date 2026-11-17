@@ -1,0 +1,34 @@
+{
+  "epoch": 1794047810.5734818,
+  "identity": {
+    "pid": 3293036,
+    "start_ticks": "104773026",
+    "state": "R",
+    "parent_pid": 3292663
+  },
+  "own_parent_identity": {
+    "pid": 3292663,
+    "start_ticks": "104772614",
+    "state": "S",
+    "parent_pid": 3292342
+  },
+  "actual_ordered_device_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "no_model_dispatch": true
+}

@@ -1,0 +1,18 @@
+{
+  "accepted": true,
+  "authority": "/root formal scoped acceptance message",
+  "native_job": "task_20261107_204310_361283812010",
+  "audit_job": "task_20261107_222727_339490027353",
+  "audit_manifest_sha256": "3e9f22d8dff50cb3de4ed0485e6d3cbd20cf1f7ac2275ea1cbb07723cd508999",
+  "audit_FREEZE_sha256": "8c9e569939140c9d1a77cc2c255caeb6095a8a97fe60d630667ddcc86a2fd8a9",
+  "audit_results_sha256": "6883761968eb3fddf4afc6e1b4fa26629f3f290a0036974191aaf6b5a3d1cd72",
+  "scope": "one actual D77 normal-CLI full-real16 E40 W8A8 noEngram N3 Hello, world operation; [3,1] EOS; one actual decode input3 at position3; all4DP finite consistent recorded votes; both full source/H2D coverage phases; normalclose, recorded PID identity absence, raw16 release and queue0",
+  "exclusions": [
+    "three actual decode calls or positions4/5",
+    "long text or coherent text quality acceptance",
+    "full original numerical parity",
+    "independent cache-byte mathematical correctness",
+    "general F09 or Engram/MTP closure"
+  ],
+  "next_action": "auditor FINAL bound; final sourceD77 rehash and owner seal only; no new native grant"
+}

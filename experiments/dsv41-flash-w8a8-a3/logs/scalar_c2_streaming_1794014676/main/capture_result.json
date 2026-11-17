@@ -1,0 +1,492 @@
+{
+  "mode": "ONBOARD",
+  "platform": "a2a3",
+  "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/scalar_c2_streaming_1794014676/main/capture_build/_jit_decode_fwd_20261107_094927_8h9eibw7",
+  "native_capture_saved": true,
+  "capture_nonzero": 245760,
+  "projection_checks": [
+    {
+      "rank": 0,
+      "slot": 0,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 5.7220458984375e-06,
+      "actual_cpu_fp32_maxabs": 0.0002498626708984375,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 1,
+      "slot": 0,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 5.7220458984375e-06,
+      "actual_cpu_fp32_maxabs": 0.0002498626708984375,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 2,
+      "slot": 0,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 5.7220458984375e-06,
+      "actual_cpu_fp32_maxabs": 0.0002498626708984375,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 3,
+      "slot": 0,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 5.7220458984375e-06,
+      "actual_cpu_fp32_maxabs": 0.0002498626708984375,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 4,
+      "slot": 0,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 3.814697265625e-06,
+      "actual_cpu_fp32_maxabs": 0.00021266937255859375,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 5,
+      "slot": 0,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 3.814697265625e-06,
+      "actual_cpu_fp32_maxabs": 0.00021266937255859375,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 6,
+      "slot": 0,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 3.814697265625e-06,
+      "actual_cpu_fp32_maxabs": 0.00021266937255859375,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 7,
+      "slot": 0,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 3.814697265625e-06,
+      "actual_cpu_fp32_maxabs": 0.00021266937255859375,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 8,
+      "slot": 0,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 1.9073486328125e-06,
+      "actual_cpu_fp32_maxabs": 0.00018787384033203125,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 9,
+      "slot": 0,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 1.9073486328125e-06,
+      "actual_cpu_fp32_maxabs": 0.00018787384033203125,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 10,
+      "slot": 0,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 1.9073486328125e-06,
+      "actual_cpu_fp32_maxabs": 0.00018787384033203125,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 11,
+      "slot": 0,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 1.9073486328125e-06,
+      "actual_cpu_fp32_maxabs": 0.00018787384033203125,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 12,
+      "slot": 0,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 0.0,
+      "actual_cpu_fp32_maxabs": 0.00022029876708984375,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 13,
+      "slot": 0,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 0.0,
+      "actual_cpu_fp32_maxabs": 0.00022029876708984375,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 14,
+      "slot": 0,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 0.0,
+      "actual_cpu_fp32_maxabs": 0.00022029876708984375,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 15,
+      "slot": 0,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 0.0,
+      "actual_cpu_fp32_maxabs": 0.00022029876708984375,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 0,
+      "slot": 1,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 5.7220458984375e-06,
+      "actual_cpu_fp32_maxabs": 0.0005102157592773438,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 1,
+      "slot": 1,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 5.7220458984375e-06,
+      "actual_cpu_fp32_maxabs": 0.0005102157592773438,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 2,
+      "slot": 1,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 5.7220458984375e-06,
+      "actual_cpu_fp32_maxabs": 0.0005102157592773438,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 3,
+      "slot": 1,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 5.7220458984375e-06,
+      "actual_cpu_fp32_maxabs": 0.0005102157592773438,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 4,
+      "slot": 1,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 1.1444091796875e-05,
+      "actual_cpu_fp32_maxabs": 0.00046539306640625,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 5,
+      "slot": 1,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 1.1444091796875e-05,
+      "actual_cpu_fp32_maxabs": 0.00046539306640625,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 6,
+      "slot": 1,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 1.1444091796875e-05,
+      "actual_cpu_fp32_maxabs": 0.00046539306640625,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 7,
+      "slot": 1,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 1.1444091796875e-05,
+      "actual_cpu_fp32_maxabs": 0.00046539306640625,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 8,
+      "slot": 1,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 2.86102294921875e-06,
+      "actual_cpu_fp32_maxabs": 0.0001850128173828125,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 9,
+      "slot": 1,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 2.86102294921875e-06,
+      "actual_cpu_fp32_maxabs": 0.0001850128173828125,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 10,
+      "slot": 1,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 2.86102294921875e-06,
+      "actual_cpu_fp32_maxabs": 0.0001850128173828125,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 11,
+      "slot": 1,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 2.86102294921875e-06,
+      "actual_cpu_fp32_maxabs": 0.0001850128173828125,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 12,
+      "slot": 1,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 0.0,
+      "actual_cpu_fp32_maxabs": 0.000530242919921875,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 13,
+      "slot": 1,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 0.0,
+      "actual_cpu_fp32_maxabs": 0.000530242919921875,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 14,
+      "slot": 1,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 0.0,
+      "actual_cpu_fp32_maxabs": 0.000530242919921875,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 15,
+      "slot": 1,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 0.0,
+      "actual_cpu_fp32_maxabs": 0.000530242919921875,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 0,
+      "slot": 2,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 0.0,
+      "actual_cpu_fp32_maxabs": 0.00054931640625,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 1,
+      "slot": 2,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 0.0,
+      "actual_cpu_fp32_maxabs": 0.00054931640625,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 2,
+      "slot": 2,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 0.0,
+      "actual_cpu_fp32_maxabs": 0.00054931640625,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 3,
+      "slot": 2,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 0.0,
+      "actual_cpu_fp32_maxabs": 0.00054931640625,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 4,
+      "slot": 2,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 5.7220458984375e-06,
+      "actual_cpu_fp32_maxabs": 0.0008602142333984375,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 5,
+      "slot": 2,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 5.7220458984375e-06,
+      "actual_cpu_fp32_maxabs": 0.0008602142333984375,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 6,
+      "slot": 2,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 5.7220458984375e-06,
+      "actual_cpu_fp32_maxabs": 0.0008602142333984375,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 7,
+      "slot": 2,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 5.7220458984375e-06,
+      "actual_cpu_fp32_maxabs": 0.0008602142333984375,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 8,
+      "slot": 2,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 1.71661376953125e-05,
+      "actual_cpu_fp32_maxabs": 0.0005359649658203125,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 9,
+      "slot": 2,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 1.71661376953125e-05,
+      "actual_cpu_fp32_maxabs": 0.0005359649658203125,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 10,
+      "slot": 2,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 1.71661376953125e-05,
+      "actual_cpu_fp32_maxabs": 0.0005359649658203125,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 11,
+      "slot": 2,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 1.71661376953125e-05,
+      "actual_cpu_fp32_maxabs": 0.0005359649658203125,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 12,
+      "slot": 2,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 1.33514404296875e-05,
+      "actual_cpu_fp32_maxabs": 0.000629425048828125,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 13,
+      "slot": 2,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 1.33514404296875e-05,
+      "actual_cpu_fp32_maxabs": 0.000629425048828125,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 14,
+      "slot": 2,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 1.33514404296875e-05,
+      "actual_cpu_fp32_maxabs": 0.000629425048828125,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    },
+    {
+      "rank": 15,
+      "slot": 2,
+      "stage_input_equal": true,
+      "stage_input_mismatch": 0,
+      "actual_exact_maxabs": 1.33514404296875e-05,
+      "actual_cpu_fp32_maxabs": 0.000629425048828125,
+      "actual_exact_bad": 0,
+      "actual_cpu_fp32_bad": 1024
+    }
+  ],
+  "all_stage_inputs_equal": true,
+  "all_actual_exact_gates_pass": true,
+  "unmodified_golden_cpu_bad_lanes": 49152
+}

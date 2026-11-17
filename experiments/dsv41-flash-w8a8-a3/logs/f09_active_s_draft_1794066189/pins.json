@@ -1,0 +1,22 @@
+{
+  "moe_exchange.py": {
+    "base_sha256": "951378f40c2ab7cb4f1573aeda72548bab017ed76c545641620e6e3502b4c780",
+    "proposed_sha256": "52be1ffae5c3a6956ce17745b5e7d15f3facc35fe9a48f12319ddd6914494bdc",
+    "patch_sha256": "ea2ef47fa26a9a7df6e6cb525248af147ca815977fb8c9171927bef47475ea47"
+  },
+  "decode_fwd.py": {
+    "base_sha256": "ed39c749b0d4cf5344fcf7a8f9b63fd0259cbb21496729ef425a09fb6d73ee1a",
+    "proposed_sha256": "ac0ec203d5134a441e5cf0fe7460dee9e24cb8a6d79234495ed83549dcc09bb4",
+    "patch_sha256": "be032872f4353e06fc87ad9701bf0016a93c46d4b8e9e747e663b317771c895c"
+  },
+  "prefill_fwd.py": {
+    "base_sha256": "5f51f3b23fe08100b4893bdd039e71666f6bfc0a8697ebb1049321e8bde52ac6",
+    "proposed_sha256": "27caa1880383cca8d7e25ad66d58ee8cb8c5aebf2995048978b64263cf23fc88",
+    "patch_sha256": "7cadaf97c7bd4fc8f7f62a64d494fad54815b532737b477f424f28e0ebfb5978"
+  },
+  "layer_reference.py": {
+    "base_sha256": "2d9dab1c154c6ddad9f92c7fb120c992ae202496cef993226f716f0b50396098",
+    "proposed_sha256": "9331521c2782e6464baaf799ad7538fe763029e915bacc06a89c1826a1cb9706",
+    "patch_sha256": "ee35c317023a180b696da43b2cc0fd7f803bdbe6ca7f5dc16fa7a28d78933f45"
+  }
+}

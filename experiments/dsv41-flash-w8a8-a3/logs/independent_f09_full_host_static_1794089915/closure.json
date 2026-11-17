@@ -1,0 +1,17 @@
+{
+  "state": "FINAL_PARK_SOURCE_ONLY_COMPATIBLE",
+  "static_resources": 57,
+  "named_counterexamples": 0,
+  "full_generated_manifest_sha256": "5262e68afa0b53291ed285e31170b3c017674c3c25dfa9aec78eb7fab5777532",
+  "full_generated_manifest_all_files_unchanged": true,
+  "adapter398_manifest_sha256": "4615debdad437d799834c68515a8e8c55185710f9627eb751902bbcb8212a90f",
+  "source405_and_liveM02_45_unchanged": true,
+  "CPU_test_jobs": 0,
+  "NPU_jobs": 0,
+  "model_or_runtime_imports": 0,
+  "getter_execution": false,
+  "tensor_payload_bytes": 0,
+  "input_copies": 0,
+  "real_grants_created": 0,
+  "epoch": 1794090119
+}

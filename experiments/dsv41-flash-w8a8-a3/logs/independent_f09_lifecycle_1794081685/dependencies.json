@@ -1,0 +1,16 @@
+{
+  "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_lifecycle_1794081685/future_microtest.py": "2d20411f3c7500238abde5288383de30ff442c0456ac5517f21faa36a136cbab",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_lifecycle_1794081685/future_audit.py": "4baa6c35c877701295b4be30b63c406b7afb0aff6fcec44455a1272e35a2c5b3",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_lifecycle_1794081685/toy_compiled_files.json": "63ab8e6eed74221f654b581f131bd59f8c280dcc6647e64859311662c99edf70",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_artifact_lifecycle_fix_1794079805/artifact_lifecycle.py": "1cc9c0b792b93a3c9d83b3461fd327d21f0bcd4872c289f76f3ab61e70c14a0d",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_artifact_lifecycle_fix_1794079805/f09_decode_case.py": "6a2d8cb9fbddcee72c27a0892ad2730b571167f323af5a45cd9abebdab271b40",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_artifact_lifecycle_fix_1794079805/artifacts.json": "7fb949a6ed09aa8e5ad68b1aa16ffd932804f7a331b5fd0fcbb7cbe624ce5c4d",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_artifact_lifecycle_fix_1794079805/source45_rebased_UNAPPLIED.json": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/tiny_shared_host_slice_correction_1794072874/tiny_programs.py": "94f3290e98ceefdba48fa61c372130a7176199b19802d1633152dc9d9619ef60",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/tiny_shared_host_slice_correction_1794072874/tiny_shared.py": "38e92714a550407727a4a7d816c1e9c8fc711519cc73ecdcf89c1f8d6caa9d59",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/pypto/runtime/device_runner.py": "489be9499afd907530e6bf52cf2b9164e5a9269266bef9019a5f73b27717d3e6",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/pypto/runtime/distributed_runner.py": "ca496829a240c81df3c29e77d8ef696bd1e2a7b0f31b9d5c2dcb3b3d82923148",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/pypto/ir/distributed_compiled_program.py": "b523ea389350c9d1f9880a101ec66ceb36d2a8202a5fb1976a77be3310444e2a",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/golden/runner.py": "3b7d37753b5b0fedc36f2ae425043b256aa5da8230689b3e222ac06dff0b53c5",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/build/lib/a2a3/onboard/tensormap_and_ringbuffer/libhost_runtime.so": "24434f8879030ef1b1f31e5fc2ecce683e392d4f1baeb5bcee852fb183976e5c"
+}

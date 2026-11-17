@@ -1,0 +1,13 @@
+{
+  "status": "DURABLE_NATIVE_DECODE3_NORMAL_CLOSE_RETENTION_ONLY",
+  "manifest_sha256": "424269b3042c1845802bee6ef0f14daddc08ffc6f32c6f5c043607e3ff03c33f",
+  "owner_closed_sha256": "0f89991d91f4b48e4f4a9b37891d43c5cde19a6df4c75de6516bd272a7f381fd",
+  "parent_prefix_manifest_sha256": "f4ca9d488b7e27c6388ff2aa68a71d122a1df5e7d9b2eb186f1321ad0cf28daf",
+  "all_persistent_cache_handoff_verified": true,
+  "retention": {
+    "checked_rows": 176,
+    "failures": [],
+    "pass": true
+  },
+  "numerical_pass": false
+}

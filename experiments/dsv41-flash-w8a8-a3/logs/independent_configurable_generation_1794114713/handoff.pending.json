@@ -1,0 +1,18 @@
+{
+  "schema": "independent-configurable-real-postcase-handoff/1",
+  "native_terminal_confirmed": false,
+  "executor_external_POST_terminal_confirmed": false,
+  "source45_sha256": "f0e91a30e4117e110be183ef44acf2874eea813cc6f72ac7c7fa44bc4ede3a7f",
+  "operation_binding_sha256": "d01fe5a625b4102d3fffe509e89485f6fa438a9c67b1ffa32e96c3fe548e3e9d",
+  "fresh_signature_receipt_sha256": "c11948187a3f2e3675d5fe9e0fd0a47f20af67ecbeac4866f947cb7aefca75e4",
+  "native_task_id": "task_20261108_130915_150556113554",
+  "root_go_id": "observer-20261108-configurable-tp8ep16-real16-shared-w8a8",
+  "case": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_configurable_real_generation_1794111133",
+  "outer_queue_snapshot": null,
+  "external_POST": null,
+  "owner_identity_postcheck": {
+    "path": null,
+    "sha256": null
+  },
+  "note": "Source-only assembled during running SAME task; native_terminal_confirmed=false, executor_external_POST_terminal_confirmed=false. Actual paths/statuses remain REQUIRED. Later Root actual-audit GO must create NEW actual input files, never edit this pending artifact."
+}

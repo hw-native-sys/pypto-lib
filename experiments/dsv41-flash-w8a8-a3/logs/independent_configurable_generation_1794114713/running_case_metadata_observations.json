@@ -1,0 +1,58 @@
+{
+  "schema": "configured-running-case-source-observation/1",
+  "recorded_epoch": 1794114839.5287666,
+  "case": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_configurable_real_generation_1794111133",
+  "task": "task_20261108_130915_150556113554",
+  "RootID": "observer-20261108-configurable-tp8ep16-real16-shared-w8a8",
+  "owner_control": "owner_1794113727",
+  "state": "RUNNING_REPORTED_BY_ROOT_AND_OWNER; no terminal status inferred",
+  "actual_ordered_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "CLI_identity": {
+    "pid": 1506538,
+    "start_ticks": "111448550"
+  },
+  "outer_identity": {
+    "pid": 1506308,
+    "start_ticks": "111448212"
+  },
+  "outer_parent_pid": 1506006,
+  "actual_runtime_jit_paths": {
+    "prefill": "build_output/_jit_prefill_fwd_20261108_130934_cz8iowwh",
+    "decode": "build_output/_jit_decode_fwd_20261108_131000_4gn67yw7"
+  },
+  "jit_path_scope": "Observed compile log/owner report only; not execution/parity/profile acceptance. Actual audit independently rereads actual paths later.",
+  "native_log_current": "native_task_submit.log",
+  "native_log_terminal_expected_alias": "native.log",
+  "first_noncritical_gap_owner_report": {
+    "epoch": 1794114577.657,
+    "pid": 1507158,
+    "start_ticks": "111449642",
+    "kind": "ESRCH"
+  },
+  "strict_policy": "UNCHANGED; observed noncritical gap makes wholeFAIL/PSSUNKNOWN; terminal counts/CLI/native statuses remain unassigned.",
+  "future_required": [
+    "SAME terminal native_job.json/job/native_job.status/raw native.log release",
+    "stable mandatory external_POST receipt path/SHA/task/status",
+    "outside queue snapshot task_id/status_stdout/list_stdout/captured_epoch",
+    "owner known_identity_postcheck path/SHA",
+    "Root explicit actual-audit followup"
+  ],
+  "source_only_no_audit": true
+}

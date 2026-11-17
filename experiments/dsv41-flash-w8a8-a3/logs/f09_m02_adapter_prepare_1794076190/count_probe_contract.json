@@ -1,0 +1,33 @@
+{
+  "same_moe_ffn_function_AST_sha256": "d7cb0d9e521e89d9d3c4f86e672eef9c1cfbc33c4e44986df61fc0fae625b695",
+  "source_sha256": "52be1ffae5c3a6956ce17745b5e7d15f3facc35fe9a48f12319ddd6914494bdc",
+  "diagnostic_only": true,
+  "copy_of_model_compute": false,
+  "recv_meta_export_shape": [
+    16,
+    16,
+    24
+  ],
+  "runtime_counts_input": [
+    16
+  ],
+  "physical_capacity": 2,
+  "positive_routes": [
+    192,
+    96,
+    192
+  ],
+  "old_physical_middle_routes": 192,
+  "forced_gate_experts": [
+    192,
+    193,
+    194,
+    195,
+    196,
+    197
+  ],
+  "remote_dest_rank8_active_source0": true,
+  "export_dependency": "reads actual DistributedTensor recv_meta plus x_hc_out anchor; generated source/count->view->publish->export reachability MUST be reviewed after future compile, no proof claimed now",
+  "compile": "PENDING",
+  "native": "PENDING"
+}

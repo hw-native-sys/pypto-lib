@@ -1,0 +1,19 @@
+{
+  "owner": "/root/reviewer_f09",
+  "unit": "native_configurable_components_cli_1794112381",
+  "start_utc": "2026-11-08T04:37:37.880313+00:00",
+  "end_utc": "2026-11-08T04:49:37.220905+00:00",
+  "elapsed_seconds": 719.340592,
+  "native_jobs": 2,
+  "EP_task": "task_20261108_123737_141799917058",
+  "TP_task": "task_20261108_124231_143528315331",
+  "CPU_audit_jobs": 1,
+  "CPU_audit_task": "task_20261108_124633_144643925478",
+  "CPU_audit_exit": 1,
+  "runtimefacts_nonadditive": true,
+  "shared_writes": 0,
+  "product_writes": 0,
+  "NPU_peak_or_kernel_sum": "NOT_MEASURED",
+  "owner_intervals": "one combined operation interval; do not also import runtimefacts additively",
+  "jobs_active": 0
+}

@@ -1,0 +1,37 @@
+{
+  "status": "PASS_INDEPENDENT_SOURCE_TINY_IO_AND_TWO_SIGNATURE_COMPILES",
+  "rejects": [
+    "production-default-HARD",
+    "native-helper-default-refuse-no-output",
+    "accounting-static_upload_bytes",
+    "accounting-decode_static_upload_bytes",
+    "accounting-decode_static_source_reads",
+    "accounting-static_source_reads",
+    "activate-before-live-prefill",
+    "borrowed-missing",
+    "borrowed-duplicate",
+    "borrowed-offset",
+    "borrowed-different-base",
+    "borrowed-before-durable-prefill",
+    "decode-source-reread",
+    "decode-second-H2D",
+    "decode-copycursor-nonzero"
+  ],
+  "source45": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "source45_after_unchanged": true,
+  "owner_AST": "74a00c6cc0a56c05e90fe4daad2faac9412966832226c589fe3bc7cc93d0cd45",
+  "dependency_pins": {
+    "tiny_shared.py": "0042507d1ad5747f21f184e5439b31e1c97ca94b259890225a0b1cf1443dee89",
+    "tiny_programs.py": "e98d344af586a40e2adfa443b048cbcda3c576c531b90edba0468ccd13f08240",
+    "owner_adapter.py": "188cf41eafb1e6b6bdece83188a52b1a0e3336c6e5fb80a0d62b547223f31a41",
+    "public_contract.py": "7fb8b40dc98a473de56a162031453bfe3fcce481af4cd999181987ecf6409508",
+    "frozen_draft/generate.proposed.py": "fba8a4ef9a06f694fa53278bb80ae2ad70d111336dbead938ab9f8511d27e16e"
+  },
+  "samples": 0,
+  "prepare": 0,
+  "native": 0,
+  "payload": 0,
+  "scope": "actual frozen owner source+original admission predicate bodies with explicit tiny2 schema adapters; compile-only actual tiny programs; no hardware proof",
+  "own_pid": 3280964,
+  "own_starttick": "107168298"
+}

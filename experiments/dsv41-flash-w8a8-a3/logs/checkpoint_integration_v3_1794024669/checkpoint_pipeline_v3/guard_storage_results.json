@@ -1,0 +1,68 @@
+{
+  "controls": [
+    {
+      "name": "positive_real_parser_tiny_factory",
+      "positive_REAL_parser_branch": true,
+      "provider": "tiny CPU_MOCKED allocator; no native grant",
+      "factory_calls": 1
+    },
+    {
+      "name": "reject_stage",
+      "rejected": "measurement stage/provider mismatch",
+      "factory_calls": 0
+    },
+    {
+      "name": "reject_units",
+      "rejected": "measurement schema/units/source mismatch",
+      "factory_calls": 0
+    },
+    {
+      "name": "reject_provider",
+      "rejected": "measurement stage/provider mismatch",
+      "factory_calls": 0
+    },
+    {
+      "name": "reject_source_manifest_sha256",
+      "rejected": "measurement schema/units/source mismatch",
+      "factory_calls": 0
+    },
+    {
+      "name": "reject_measured_at_epoch",
+      "rejected": "measurement stale/unknown timestamp",
+      "factory_calls": 0
+    },
+    {
+      "name": "reject_omitted_clone_static_bound",
+      "rejected": "stage live/static/IO/clone/storage lower bounds omitted",
+      "factory_calls": 0
+    },
+    {
+      "name": "reject_fresh_shm_low",
+      "rejected": "fresh host/disk/SHM capacity below measured plan",
+      "factory_calls": 0
+    },
+    {
+      "name": "reject_query_failure",
+      "rejected": "public query failure",
+      "factory_calls": 0
+    },
+    {
+      "name": "toy_receipt_production_resume_rejected",
+      "rejected": true
+    },
+    {
+      "name": "missing_unconditioned_scope_rejected",
+      "rejected": true
+    }
+  ],
+  "logical_storage_selfcontained_bytes": 32,
+  "original_backing_bytes": 16777216,
+  "clone_isolation": true,
+  "copied_payload_release_before_next_clone": [
+    "previous clone dictionary released before next serialization"
+  ],
+  "reference_provenance_retained": true,
+  "NPU": 0,
+  "real_fixture_calls": 0,
+  "scope": "CPU_MOCKED guards/storage only, not real fit/numerical/native proof"
+}

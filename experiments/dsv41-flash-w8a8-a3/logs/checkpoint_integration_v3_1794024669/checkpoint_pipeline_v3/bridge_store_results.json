@@ -1,0 +1,23 @@
+{
+  "status": "PASS_CPU_MOCKED_REFERENCE_AND_STORE",
+  "bridge_sha256": "c1f942c90ccb4fbec3fe3e3852b51ac64c616f1607076b55f486a30864026834",
+  "records": [
+    {
+      "phase": "prefix",
+      "source_output_count": 17,
+      "exact_reference_capsule_retained": true,
+      "stored_receipt_bridge_verified": true,
+      "native_grant": false
+    },
+    {
+      "phase": "decode",
+      "source_output_count": 19,
+      "exact_reference_capsule_retained": true,
+      "stored_receipt_bridge_verified": true,
+      "native_grant": false
+    }
+  ],
+  "full_model_golden_runs": 0,
+  "NPU": 0,
+  "native_grant": false
+}

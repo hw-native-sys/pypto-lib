@@ -1,0 +1,13 @@
+{
+  "record_id": "main-hc-boundary-apply-1794075705",
+  "role": "main-agent",
+  "start_epoch": 1794075705,
+  "end_epoch": 1794076054,
+  "elapsed_seconds": 349,
+  "shared_ledger_imported_once": true,
+  "worker_records": [],
+  "task_ids": [
+    "task_20261108_022432_345625531465"
+  ],
+  "scope": "Exact3sourceapplication+newresourceplan+oneCPU+recoverydocs; no compile/NPU/payload/grant"
+}

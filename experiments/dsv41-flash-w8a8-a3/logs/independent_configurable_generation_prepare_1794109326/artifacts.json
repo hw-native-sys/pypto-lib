@@ -1,0 +1,55 @@
+{
+  "schema": "owned-source-preparation-artifact-manifest/1",
+  "files": [
+    {
+      "path": "MIGRATION.md",
+      "bytes": 4047,
+      "sha256": "be5e9880d71168fe73859f58cc31e1e3093eba508816245c74fd6ce4277a4992"
+    },
+    {
+      "path": "NEXT_STAGE.md",
+      "bytes": 1482,
+      "sha256": "1a0beb478f48ebb5d778af439e2a8fe6c9d04f9a1c87e712fa8a88c38baedeb6"
+    },
+    {
+      "path": "RAW_OUTPUT_CONTRACT.md",
+      "bytes": 4338,
+      "sha256": "3f599cb3ff238aff466bd31f1dab506b611f09333f41f0be5382a6a0ba91e4b3"
+    },
+    {
+      "path": "REPORT.md",
+      "bytes": 3497,
+      "sha256": "3a2707b7e05040b4e44331baa9bc4cba88c3cb4dd3f255731cda002e606b7545"
+    },
+    {
+      "path": "bindings.required.json",
+      "bytes": 1456,
+      "sha256": "ad6b72aee9fb3680b5b244dbc26b182c7dbb70df26b3267ccaf21571c7f631bf"
+    },
+    {
+      "path": "input_sourceB_audit.py",
+      "bytes": 30749,
+      "sha256": "b9683fa7ecf759a729e8d3f062ee487fa05c4e69734bcc388092eaea1b1fbc3a"
+    },
+    {
+      "path": "input_sourceB_shared_delta.py",
+      "bytes": 9995,
+      "sha256": "a09f63dd0d9a4fe27e0bdcd6ee5398fb2f596e646eac2dbd5f41980eb4fffdcb"
+    },
+    {
+      "path": "lineage.json",
+      "bytes": 2083,
+      "sha256": "99b80a75adfe9f1edde5900917623b0236e39310f6418632aa14aa193c206258"
+    },
+    {
+      "path": "topology_delta.py",
+      "bytes": 5259,
+      "sha256": "0b3d4d61f6cb374a3a86cd9debd896f866a4d047a2993fb702ab18cf83b1d419"
+    },
+    {
+      "path": "work_record.json",
+      "bytes": 745,
+      "sha256": "f4cded48873559cc22ea77953fdf8b2e68d5cfd26c63bc7ed1b655680532f083"
+    }
+  ]
+}

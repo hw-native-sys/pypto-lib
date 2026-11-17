@@ -1,0 +1,282 @@
+{
+  "resources": [
+    "r0",
+    "r1",
+    "r2",
+    "r3",
+    "r4",
+    "r5",
+    "r6",
+    "r7",
+    "r8",
+    "r9",
+    "r10",
+    "r11",
+    "r12",
+    "r13",
+    "r14",
+    "r15",
+    "r16",
+    "r17",
+    "r18",
+    "r19",
+    "r20",
+    "r21",
+    "r22",
+    "r23",
+    "r24",
+    "r25",
+    "r26",
+    "r27",
+    "r28",
+    "r29",
+    "r30",
+    "r31",
+    "r32",
+    "r33",
+    "r34",
+    "r35",
+    "r36",
+    "r37",
+    "r38",
+    "r39",
+    "r40",
+    "r41",
+    "r42",
+    "r43",
+    "r44",
+    "r45",
+    "r46",
+    "r47",
+    "r48",
+    "r49",
+    "r50",
+    "r51",
+    "r52",
+    "r53",
+    "r54",
+    "r55",
+    "r56"
+  ],
+  "allocations": [
+    {
+      "rank": 0,
+      "name": "r0",
+      "bytes": 8,
+      "before": {
+        "rank": 0,
+        "free": 556,
+        "total": 1000000,
+        "committed": 999444
+      },
+      "after": {
+        "rank": 0,
+        "free": 547,
+        "total": 1000000,
+        "committed": 999453
+      }
+    }
+  ],
+  "cleanup_errors": [],
+  "prewarm": [
+    {
+      "rank": 0,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 1,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 2,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 3,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 4,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 5,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 6,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 7,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 8,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 9,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 10,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 11,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 12,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 13,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 14,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 15,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    }
+  ],
+  "status": "FAIL",
+  "compute_dispatches": 0,
+  "payload_bytes": 0,
+  "error": "Refused: postallocation free/remaining/IO/comm/headroom guard",
+  "after_free_before_close": [
+    {
+      "rank": 0,
+      "free": 555,
+      "total": 1000000,
+      "committed": 999445
+    },
+    {
+      "rank": 1,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 2,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 3,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 4,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 5,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 6,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 7,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 8,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 9,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 10,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 11,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 12,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 13,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 14,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    },
+    {
+      "rank": 15,
+      "free": 556,
+      "total": 1000000,
+      "committed": 999444
+    }
+  ],
+  "owner_closed": true
+}

@@ -1,0 +1,140 @@
+{
+  "source_manifest_unchanged": true,
+  "resolver": [
+    "per-profile",
+    []
+  ],
+  "main_equals_base": true,
+  "main_equals_compressed": false,
+  "hash_supplied_rows": 20,
+  "hash_retained_rows": {
+    "1": 16,
+    "14": 16
+  },
+  "first_decode_hash_rows": {
+    "1": 0,
+    "14": 0
+  },
+  "plans": {
+    "126": {
+      "1": {
+        "position_ids": [
+          126
+        ],
+        "window_slots": [
+          126
+        ],
+        "compressed_slots": [
+          126
+        ],
+        "compressed_lens": [
+          127
+        ]
+      },
+      "2": {
+        "position_ids": [
+          126
+        ],
+        "window_slots": [
+          126
+        ],
+        "compressed_slots": [
+          -1
+        ],
+        "compressed_lens": [
+          63
+        ]
+      }
+    },
+    "127": {
+      "1": {
+        "position_ids": [
+          127
+        ],
+        "window_slots": [
+          127
+        ],
+        "compressed_slots": [
+          127
+        ],
+        "compressed_lens": [
+          128
+        ]
+      },
+      "2": {
+        "position_ids": [
+          127
+        ],
+        "window_slots": [
+          127
+        ],
+        "compressed_slots": [
+          63
+        ],
+        "compressed_lens": [
+          64
+        ]
+      }
+    },
+    "128": {
+      "1": {
+        "position_ids": [
+          128
+        ],
+        "window_slots": [
+          128
+        ],
+        "compressed_slots": [
+          128
+        ],
+        "compressed_lens": [
+          129
+        ]
+      },
+      "2": {
+        "position_ids": [
+          128
+        ],
+        "window_slots": [
+          128
+        ],
+        "compressed_slots": [
+          -1
+        ],
+        "compressed_lens": [
+          64
+        ]
+      }
+    },
+    "129": {
+      "1": {
+        "position_ids": [
+          129
+        ],
+        "window_slots": [
+          129
+        ],
+        "compressed_slots": [
+          129
+        ],
+        "compressed_lens": [
+          130
+        ]
+      },
+      "2": {
+        "position_ids": [
+          129
+        ],
+        "window_slots": [
+          129
+        ],
+        "compressed_slots": [
+          64
+        ],
+        "compressed_lens": [
+          65
+        ]
+      }
+    }
+  }
+}

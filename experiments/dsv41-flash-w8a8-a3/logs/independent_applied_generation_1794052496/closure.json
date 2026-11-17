@@ -1,0 +1,29 @@
+{
+  "status": "FINAL/PARK",
+  "epoch": 1794053405.0622149,
+  "task": "task_20261107_200408_351083432494",
+  "raw_status": "completed (exit=0)",
+  "status_query_exit": 0,
+  "log_query_exit": 0,
+  "known_cpu_pid": 3511204,
+  "starttick": 105297505,
+  "same_identity_present": false,
+  "own_native_jobs": 0,
+  "protected": {
+    "generation_admission_apply_1794052225": {
+      "manifest": "7402f715fd2acd0ea4574821e7be1637ff6b00923207949d79430d1357a45e11",
+      "count": 17,
+      "all_entries_unchanged": true
+    },
+    "independent_full_generation_entry_1794050249": {
+      "manifest": "9b1c7182a27f29b7584f2c309fdc3b8ff361368721517fd2108bad062a765920",
+      "count": 92,
+      "all_entries_unchanged": true
+    }
+  },
+  "source45_unchanged": "d77d196be6541b4a87aef07cf0e5e02eac68cefa9fc245f3742e4c14606555aa",
+  "device_prepare_calls": 0,
+  "fixture_calls": 0,
+  "real_payload_reads": 0,
+  "no_more_tests": true
+}

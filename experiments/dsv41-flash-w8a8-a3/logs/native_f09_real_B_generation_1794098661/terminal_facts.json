@@ -1,0 +1,2683 @@
+{
+  "epoch": 1794102469.3319,
+  "native_job": "task_20261108_090706_320779619842",
+  "root_go_id": "observer-20261108-sourceB-real16-shared-w8a8",
+  "queue_status": "completed (exit=1)",
+  "CLI_status": "ok",
+  "CLI_exit_code": 0,
+  "CLI_error": null,
+  "outer_status": "FAIL",
+  "outer_CLI_returncode": 0,
+  "outer_CLI_terminal": true,
+  "outer_launch_error": null,
+  "outer_postcheck_error": null,
+  "outer_observation_errors": [],
+  "outer_wait_errors": [],
+  "outer_monitor_errors": [],
+  "outer_critical_telemetry_errors": [],
+  "telemetry_error_count": 218,
+  "first_telemetry_error": {
+    "epoch": 1794100049.1395829,
+    "pid": 3209481,
+    "start_ticks": "109996765",
+    "operation": "read-smaps-rollup",
+    "path": "/proc/3209481/smaps_rollup",
+    "errno": 3,
+    "exception_type": "ProcessLookupError",
+    "error": "ProcessLookupError(3, 'No such process')",
+    "critical": false
+  },
+  "telemetry_status": "PARTIAL_OR_UNKNOWN",
+  "full_memory_measurement_complete": false,
+  "peak_complete_own_tree_PSS": null,
+  "peak_known_partial_PSS": 12962226176,
+  "prompt_ids": [
+    16600,
+    4465,
+    260
+  ],
+  "generated_ids": [
+    1014,
+    1613,
+    3305,
+    1999,
+    344,
+    270,
+    5281,
+    294,
+    270,
+    17132,
+    582,
+    32568,
+    4465,
+    260,
+    1014,
+    57008
+  ],
+  "generated_text": " time...\". What is the meaning of the phrase \"once upon a time\"?",
+  "termination": "max_new_tokens",
+  "decode_steps": 15,
+  "positions_end": 18,
+  "first_token": {
+    "token_id": 1014,
+    "logit": 26.417667388916016,
+    "shard_argmax": [
+      [
+        26.417667388916016,
+        1014
+      ],
+      [
+        18.52762794494629,
+        32568
+      ],
+      [
+        18.3245849609375,
+        96492
+      ],
+      [
+        16.35074806213379,
+        99717
+      ]
+    ],
+    "dp_disagreements": [],
+    "dp_votes": [
+      {
+        "dp_group": 0,
+        "token_id": 1014,
+        "logit": 26.417667388916016,
+        "shard_argmax": [
+          [
+            26.417667388916016,
+            1014
+          ],
+          [
+            18.52762794494629,
+            32568
+          ],
+          [
+            18.3245849609375,
+            96492
+          ],
+          [
+            16.35074806213379,
+            99717
+          ]
+        ]
+      },
+      {
+        "dp_group": 1,
+        "token_id": 1014,
+        "logit": 26.417667388916016,
+        "shard_argmax": [
+          [
+            26.417667388916016,
+            1014
+          ],
+          [
+            18.52762794494629,
+            32568
+          ],
+          [
+            18.3245849609375,
+            96492
+          ],
+          [
+            16.35074806213379,
+            99717
+          ]
+        ]
+      },
+      {
+        "dp_group": 2,
+        "token_id": 1014,
+        "logit": 26.417667388916016,
+        "shard_argmax": [
+          [
+            26.417667388916016,
+            1014
+          ],
+          [
+            18.52762794494629,
+            32568
+          ],
+          [
+            18.3245849609375,
+            96492
+          ],
+          [
+            16.35074806213379,
+            99717
+          ]
+        ]
+      },
+      {
+        "dp_group": 3,
+        "token_id": 1014,
+        "logit": 26.417667388916016,
+        "shard_argmax": [
+          [
+            26.417667388916016,
+            1014
+          ],
+          [
+            18.52762794494629,
+            32568
+          ],
+          [
+            18.3245849609375,
+            96492
+          ],
+          [
+            16.35074806213379,
+            99717
+          ]
+        ]
+      }
+    ],
+    "agreement_checked": true,
+    "context": {
+      "phase": "prefill",
+      "repeat": 0,
+      "position": 2,
+      "prompt_ids": [
+        16600,
+        4465,
+        260
+      ],
+      "generated_ids": []
+    }
+  },
+  "steps": [
+    {
+      "step": 1,
+      "input_token": 1014,
+      "position": 3,
+      "seconds": 0.462665319442749,
+      "decode_compile_seconds": 24.921968936920166,
+      "token_id": 1613,
+      "logit": 22.16008949279785,
+      "sampling": {
+        "token_id": 1613,
+        "logit": 22.16008949279785,
+        "shard_argmax": [
+          [
+            22.16008949279785,
+            1613
+          ],
+          [
+            15.299459457397461,
+            32568
+          ],
+          [
+            15.362223625183105,
+            88026
+          ],
+          [
+            15.745548248291016,
+            124112
+          ]
+        ],
+        "dp_disagreements": [],
+        "dp_votes": [
+          {
+            "dp_group": 0,
+            "token_id": 1613,
+            "logit": 22.16008949279785,
+            "shard_argmax": [
+              [
+                22.16008949279785,
+                1613
+              ],
+              [
+                15.299459457397461,
+                32568
+              ],
+              [
+                15.362223625183105,
+                88026
+              ],
+              [
+                15.745548248291016,
+                124112
+              ]
+            ]
+          },
+          {
+            "dp_group": 1,
+            "token_id": 1613,
+            "logit": 22.16008949279785,
+            "shard_argmax": [
+              [
+                22.16008949279785,
+                1613
+              ],
+              [
+                15.299459457397461,
+                32568
+              ],
+              [
+                15.362223625183105,
+                88026
+              ],
+              [
+                15.745548248291016,
+                124112
+              ]
+            ]
+          },
+          {
+            "dp_group": 2,
+            "token_id": 1613,
+            "logit": 22.16008949279785,
+            "shard_argmax": [
+              [
+                22.16008949279785,
+                1613
+              ],
+              [
+                15.299459457397461,
+                32568
+              ],
+              [
+                15.362223625183105,
+                88026
+              ],
+              [
+                15.745548248291016,
+                124112
+              ]
+            ]
+          },
+          {
+            "dp_group": 3,
+            "token_id": 1613,
+            "logit": 22.16008949279785,
+            "shard_argmax": [
+              [
+                22.16008949279785,
+                1613
+              ],
+              [
+                15.299459457397461,
+                32568
+              ],
+              [
+                15.362223625183105,
+                88026
+              ],
+              [
+                15.745548248291016,
+                124112
+              ]
+            ]
+          }
+        ],
+        "agreement_checked": true,
+        "context": {
+          "phase": "decode",
+          "step": 1,
+          "position": 3,
+          "input_token": 1014,
+          "prompt_ids": [
+            16600,
+            4465,
+            260
+          ],
+          "generated_ids": [
+            1014
+          ]
+        }
+      },
+      "state": {
+        "window_cache_sha1": "f809282657816483",
+        "compressed_cache_c2a_sha1": "5d2753e718ed2476",
+        "index_cache_c2a_sha1": "b1fd00dd1fd884bd",
+        "state_cache_c2a_sha1": "ee9deb4639bef9d4",
+        "compressed_cache_c1a_sha1": "ce26c47de62af593",
+        "index_cache_c1a_sha1": "6c828f86e014d12e",
+        "x_hc_sha1": "f70b10da37717fb9",
+        "pre_mix_sha1": "14a365adb74d2a20",
+        "topk_indices_nonzero": 416,
+        "pool_block_ids_nonzero": 64,
+        "position_ids": [
+          3
+        ]
+      }
+    },
+    {
+      "step": 2,
+      "input_token": 1613,
+      "position": 4,
+      "seconds": 0.45011162757873535,
+      "decode_compile_seconds": null,
+      "token_id": 3305,
+      "logit": 18.287757873535156,
+      "sampling": {
+        "token_id": 3305,
+        "logit": 18.287757873535156,
+        "shard_argmax": [
+          [
+            18.287757873535156,
+            3305
+          ],
+          [
+            14.121459007263184,
+            34258
+          ],
+          [
+            12.657694816589355,
+            77616
+          ],
+          [
+            11.88035774230957,
+            104253
+          ]
+        ],
+        "dp_disagreements": [],
+        "dp_votes": [
+          {
+            "dp_group": 0,
+            "token_id": 3305,
+            "logit": 18.287757873535156,
+            "shard_argmax": [
+              [
+                18.287757873535156,
+                3305
+              ],
+              [
+                14.121459007263184,
+                34258
+              ],
+              [
+                12.657694816589355,
+                77616
+              ],
+              [
+                11.88035774230957,
+                104253
+              ]
+            ]
+          },
+          {
+            "dp_group": 1,
+            "token_id": 3305,
+            "logit": 18.287757873535156,
+            "shard_argmax": [
+              [
+                18.287757873535156,
+                3305
+              ],
+              [
+                14.121459007263184,
+                34258
+              ],
+              [
+                12.657694816589355,
+                77616
+              ],
+              [
+                11.88035774230957,
+                104253
+              ]
+            ]
+          },
+          {
+            "dp_group": 2,
+            "token_id": 3305,
+            "logit": 18.287757873535156,
+            "shard_argmax": [
+              [
+                18.287757873535156,
+                3305
+              ],
+              [
+                14.121459007263184,
+                34258
+              ],
+              [
+                12.657694816589355,
+                77616
+              ],
+              [
+                11.88035774230957,
+                104253
+              ]
+            ]
+          },
+          {
+            "dp_group": 3,
+            "token_id": 3305,
+            "logit": 18.287757873535156,
+            "shard_argmax": [
+              [
+                18.287757873535156,
+                3305
+              ],
+              [
+                14.121459007263184,
+                34258
+              ],
+              [
+                12.657694816589355,
+                77616
+              ],
+              [
+                11.88035774230957,
+                104253
+              ]
+            ]
+          }
+        ],
+        "agreement_checked": true,
+        "context": {
+          "phase": "decode",
+          "step": 2,
+          "position": 4,
+          "input_token": 1613,
+          "prompt_ids": [
+            16600,
+            4465,
+            260
+          ],
+          "generated_ids": [
+            1014,
+            1613
+          ]
+        }
+      },
+      "state": {
+        "window_cache_sha1": "9df925940ee04a7b",
+        "compressed_cache_c2a_sha1": "5d2753e718ed2476",
+        "index_cache_c2a_sha1": "b1fd00dd1fd884bd",
+        "state_cache_c2a_sha1": "c4b7f7fe6fcfa97a",
+        "compressed_cache_c1a_sha1": "b42acd1bae0510e7",
+        "index_cache_c1a_sha1": "c8f3fe9b422f7037",
+        "x_hc_sha1": "4a7f36a7706e3753",
+        "pre_mix_sha1": "1c3e8202f6706a53",
+        "topk_indices_nonzero": 496,
+        "pool_block_ids_nonzero": 64,
+        "position_ids": [
+          4
+        ]
+      }
+    },
+    {
+      "step": 3,
+      "input_token": 3305,
+      "position": 5,
+      "seconds": 0.4195740222930908,
+      "decode_compile_seconds": null,
+      "token_id": 1999,
+      "logit": 17.33350944519043,
+      "sampling": {
+        "token_id": 1999,
+        "logit": 17.33350944519043,
+        "shard_argmax": [
+          [
+            17.33350944519043,
+            1999
+          ],
+          [
+            15.010954856872559,
+            41223
+          ],
+          [
+            14.239391326904297,
+            95092
+          ],
+          [
+            12.819541931152344,
+            117406
+          ]
+        ],
+        "dp_disagreements": [],
+        "dp_votes": [
+          {
+            "dp_group": 0,
+            "token_id": 1999,
+            "logit": 17.33350944519043,
+            "shard_argmax": [
+              [
+                17.33350944519043,
+                1999
+              ],
+              [
+                15.010954856872559,
+                41223
+              ],
+              [
+                14.239391326904297,
+                95092
+              ],
+              [
+                12.819541931152344,
+                117406
+              ]
+            ]
+          },
+          {
+            "dp_group": 1,
+            "token_id": 1999,
+            "logit": 17.33350944519043,
+            "shard_argmax": [
+              [
+                17.33350944519043,
+                1999
+              ],
+              [
+                15.010954856872559,
+                41223
+              ],
+              [
+                14.239391326904297,
+                95092
+              ],
+              [
+                12.819541931152344,
+                117406
+              ]
+            ]
+          },
+          {
+            "dp_group": 2,
+            "token_id": 1999,
+            "logit": 17.33350944519043,
+            "shard_argmax": [
+              [
+                17.33350944519043,
+                1999
+              ],
+              [
+                15.010954856872559,
+                41223
+              ],
+              [
+                14.239391326904297,
+                95092
+              ],
+              [
+                12.819541931152344,
+                117406
+              ]
+            ]
+          },
+          {
+            "dp_group": 3,
+            "token_id": 1999,
+            "logit": 17.33350944519043,
+            "shard_argmax": [
+              [
+                17.33350944519043,
+                1999
+              ],
+              [
+                15.010954856872559,
+                41223
+              ],
+              [
+                14.239391326904297,
+                95092
+              ],
+              [
+                12.819541931152344,
+                117406
+              ]
+            ]
+          }
+        ],
+        "agreement_checked": true,
+        "context": {
+          "phase": "decode",
+          "step": 3,
+          "position": 5,
+          "input_token": 3305,
+          "prompt_ids": [
+            16600,
+            4465,
+            260
+          ],
+          "generated_ids": [
+            1014,
+            1613,
+            3305
+          ]
+        }
+      },
+      "state": {
+        "window_cache_sha1": "237e53b42411a0ab",
+        "compressed_cache_c2a_sha1": "03a89db3b128d9b2",
+        "index_cache_c2a_sha1": "ec70efbabd8d992a",
+        "state_cache_c2a_sha1": "0165e6daeb710c08",
+        "compressed_cache_c1a_sha1": "4b07275d5bcb1dc1",
+        "index_cache_c1a_sha1": "149f26435a0ea8e6",
+        "x_hc_sha1": "0ee99bfee749fa69",
+        "pre_mix_sha1": "a24ebbf3b5e3073a",
+        "topk_indices_nonzero": 624,
+        "pool_block_ids_nonzero": 64,
+        "position_ids": [
+          5
+        ]
+      }
+    },
+    {
+      "step": 4,
+      "input_token": 1999,
+      "position": 6,
+      "seconds": 0.4312303066253662,
+      "decode_compile_seconds": null,
+      "token_id": 344,
+      "logit": 23.744083404541016,
+      "sampling": {
+        "token_id": 344,
+        "logit": 23.744083404541016,
+        "shard_argmax": [
+          [
+            23.744083404541016,
+            344
+          ],
+          [
+            17.340787887573242,
+            42362
+          ],
+          [
+            17.3283634185791,
+            67835
+          ],
+          [
+            16.22104835510254,
+            120471
+          ]
+        ],
+        "dp_disagreements": [],
+        "dp_votes": [
+          {
+            "dp_group": 0,
+            "token_id": 344,
+            "logit": 23.744083404541016,
+            "shard_argmax": [
+              [
+                23.744083404541016,
+                344
+              ],
+              [
+                17.340787887573242,
+                42362
+              ],
+              [
+                17.3283634185791,
+                67835
+              ],
+              [
+                16.22104835510254,
+                120471
+              ]
+            ]
+          },
+          {
+            "dp_group": 1,
+            "token_id": 344,
+            "logit": 23.744083404541016,
+            "shard_argmax": [
+              [
+                23.744083404541016,
+                344
+              ],
+              [
+                17.340787887573242,
+                42362
+              ],
+              [
+                17.3283634185791,
+                67835
+              ],
+              [
+                16.22104835510254,
+                120471
+              ]
+            ]
+          },
+          {
+            "dp_group": 2,
+            "token_id": 344,
+            "logit": 23.744083404541016,
+            "shard_argmax": [
+              [
+                23.744083404541016,
+                344
+              ],
+              [
+                17.340787887573242,
+                42362
+              ],
+              [
+                17.3283634185791,
+                67835
+              ],
+              [
+                16.22104835510254,
+                120471
+              ]
+            ]
+          },
+          {
+            "dp_group": 3,
+            "token_id": 344,
+            "logit": 23.744083404541016,
+            "shard_argmax": [
+              [
+                23.744083404541016,
+                344
+              ],
+              [
+                17.340787887573242,
+                42362
+              ],
+              [
+                17.3283634185791,
+                67835
+              ],
+              [
+                16.22104835510254,
+                120471
+              ]
+            ]
+          }
+        ],
+        "agreement_checked": true,
+        "context": {
+          "phase": "decode",
+          "step": 4,
+          "position": 6,
+          "input_token": 1999,
+          "prompt_ids": [
+            16600,
+            4465,
+            260
+          ],
+          "generated_ids": [
+            1014,
+            1613,
+            3305,
+            1999
+          ]
+        }
+      },
+      "state": {
+        "window_cache_sha1": "9c462159db16ed00",
+        "compressed_cache_c2a_sha1": "03a89db3b128d9b2",
+        "index_cache_c2a_sha1": "ec70efbabd8d992a",
+        "state_cache_c2a_sha1": "c01b29d3a7892cc1",
+        "compressed_cache_c1a_sha1": "b0ca49c3063a03ff",
+        "index_cache_c1a_sha1": "2935843b4bda15be",
+        "x_hc_sha1": "8ada995b2c0bd1d9",
+        "pre_mix_sha1": "c1b8309f94a74431",
+        "topk_indices_nonzero": 704,
+        "pool_block_ids_nonzero": 64,
+        "position_ids": [
+          6
+        ]
+      }
+    },
+    {
+      "step": 5,
+      "input_token": 344,
+      "position": 7,
+      "seconds": 0.4165024757385254,
+      "decode_compile_seconds": null,
+      "token_id": 270,
+      "logit": 25.044849395751953,
+      "sampling": {
+        "token_id": 270,
+        "logit": 25.044849395751953,
+        "shard_argmax": [
+          [
+            25.044849395751953,
+            270
+          ],
+          [
+            16.626249313354492,
+            37376
+          ],
+          [
+            17.191293716430664,
+            66107
+          ],
+          [
+            14.85920524597168,
+            123301
+          ]
+        ],
+        "dp_disagreements": [],
+        "dp_votes": [
+          {
+            "dp_group": 0,
+            "token_id": 270,
+            "logit": 25.044849395751953,
+            "shard_argmax": [
+              [
+                25.044849395751953,
+                270
+              ],
+              [
+                16.626249313354492,
+                37376
+              ],
+              [
+                17.191293716430664,
+                66107
+              ],
+              [
+                14.85920524597168,
+                123301
+              ]
+            ]
+          },
+          {
+            "dp_group": 1,
+            "token_id": 270,
+            "logit": 25.044849395751953,
+            "shard_argmax": [
+              [
+                25.044849395751953,
+                270
+              ],
+              [
+                16.626249313354492,
+                37376
+              ],
+              [
+                17.191293716430664,
+                66107
+              ],
+              [
+                14.85920524597168,
+                123301
+              ]
+            ]
+          },
+          {
+            "dp_group": 2,
+            "token_id": 270,
+            "logit": 25.044849395751953,
+            "shard_argmax": [
+              [
+                25.044849395751953,
+                270
+              ],
+              [
+                16.626249313354492,
+                37376
+              ],
+              [
+                17.191293716430664,
+                66107
+              ],
+              [
+                14.85920524597168,
+                123301
+              ]
+            ]
+          },
+          {
+            "dp_group": 3,
+            "token_id": 270,
+            "logit": 25.044849395751953,
+            "shard_argmax": [
+              [
+                25.044849395751953,
+                270
+              ],
+              [
+                16.626249313354492,
+                37376
+              ],
+              [
+                17.191293716430664,
+                66107
+              ],
+              [
+                14.85920524597168,
+                123301
+              ]
+            ]
+          }
+        ],
+        "agreement_checked": true,
+        "context": {
+          "phase": "decode",
+          "step": 5,
+          "position": 7,
+          "input_token": 344,
+          "prompt_ids": [
+            16600,
+            4465,
+            260
+          ],
+          "generated_ids": [
+            1014,
+            1613,
+            3305,
+            1999,
+            344
+          ]
+        }
+      },
+      "state": {
+        "window_cache_sha1": "e7ac989555db7cc0",
+        "compressed_cache_c2a_sha1": "325916a0171984dc",
+        "index_cache_c2a_sha1": "053e80b6c5e77f62",
+        "state_cache_c2a_sha1": "bb76292ffa806773",
+        "compressed_cache_c1a_sha1": "6e14376665dfcda3",
+        "index_cache_c1a_sha1": "412829c805355d42",
+        "x_hc_sha1": "7d1a5ab41273abac",
+        "pre_mix_sha1": "1fd12826cf79a0e3",
+        "topk_indices_nonzero": 832,
+        "pool_block_ids_nonzero": 64,
+        "position_ids": [
+          7
+        ]
+      }
+    },
+    {
+      "step": 6,
+      "input_token": 270,
+      "position": 8,
+      "seconds": 0.46288371086120605,
+      "decode_compile_seconds": null,
+      "token_id": 5281,
+      "logit": 23.587512969970703,
+      "sampling": {
+        "token_id": 5281,
+        "logit": 23.587512969970703,
+        "shard_argmax": [
+          [
+            23.587512969970703,
+            5281
+          ],
+          [
+            20.36687469482422,
+            54353
+          ],
+          [
+            21.271257400512695,
+            66107
+          ],
+          [
+            17.531940460205078,
+            125951
+          ]
+        ],
+        "dp_disagreements": [],
+        "dp_votes": [
+          {
+            "dp_group": 0,
+            "token_id": 5281,
+            "logit": 23.587512969970703,
+            "shard_argmax": [
+              [
+                23.587512969970703,
+                5281
+              ],
+              [
+                20.36687469482422,
+                54353
+              ],
+              [
+                21.271257400512695,
+                66107
+              ],
+              [
+                17.531940460205078,
+                125951
+              ]
+            ]
+          },
+          {
+            "dp_group": 1,
+            "token_id": 5281,
+            "logit": 23.587512969970703,
+            "shard_argmax": [
+              [
+                23.587512969970703,
+                5281
+              ],
+              [
+                20.36687469482422,
+                54353
+              ],
+              [
+                21.271257400512695,
+                66107
+              ],
+              [
+                17.531940460205078,
+                125951
+              ]
+            ]
+          },
+          {
+            "dp_group": 2,
+            "token_id": 5281,
+            "logit": 23.587512969970703,
+            "shard_argmax": [
+              [
+                23.587512969970703,
+                5281
+              ],
+              [
+                20.36687469482422,
+                54353
+              ],
+              [
+                21.271257400512695,
+                66107
+              ],
+              [
+                17.531940460205078,
+                125951
+              ]
+            ]
+          },
+          {
+            "dp_group": 3,
+            "token_id": 5281,
+            "logit": 23.587512969970703,
+            "shard_argmax": [
+              [
+                23.587512969970703,
+                5281
+              ],
+              [
+                20.36687469482422,
+                54353
+              ],
+              [
+                21.271257400512695,
+                66107
+              ],
+              [
+                17.531940460205078,
+                125951
+              ]
+            ]
+          }
+        ],
+        "agreement_checked": true,
+        "context": {
+          "phase": "decode",
+          "step": 6,
+          "position": 8,
+          "input_token": 270,
+          "prompt_ids": [
+            16600,
+            4465,
+            260
+          ],
+          "generated_ids": [
+            1014,
+            1613,
+            3305,
+            1999,
+            344,
+            270
+          ]
+        }
+      },
+      "state": {
+        "window_cache_sha1": "f9305e70eb4d86d5",
+        "compressed_cache_c2a_sha1": "325916a0171984dc",
+        "index_cache_c2a_sha1": "053e80b6c5e77f62",
+        "state_cache_c2a_sha1": "b6b5c97675b5ab01",
+        "compressed_cache_c1a_sha1": "42bafad460d8dd61",
+        "index_cache_c1a_sha1": "9d0cc84fab1741a7",
+        "x_hc_sha1": "b025a17e924b7af1",
+        "pre_mix_sha1": "96f29599cad316d9",
+        "topk_indices_nonzero": 912,
+        "pool_block_ids_nonzero": 80,
+        "position_ids": [
+          8
+        ]
+      }
+    },
+    {
+      "step": 7,
+      "input_token": 5281,
+      "position": 9,
+      "seconds": 0.4240753650665283,
+      "decode_compile_seconds": null,
+      "token_id": 294,
+      "logit": 28.772979736328125,
+      "sampling": {
+        "token_id": 294,
+        "logit": 28.772979736328125,
+        "shard_argmax": [
+          [
+            28.772979736328125,
+            294
+          ],
+          [
+            19.113231658935547,
+            56413
+          ],
+          [
+            19.908126831054688,
+            84841
+          ],
+          [
+            19.199310302734375,
+            106787
+          ]
+        ],
+        "dp_disagreements": [],
+        "dp_votes": [
+          {
+            "dp_group": 0,
+            "token_id": 294,
+            "logit": 28.772979736328125,
+            "shard_argmax": [
+              [
+                28.772979736328125,
+                294
+              ],
+              [
+                19.113231658935547,
+                56413
+              ],
+              [
+                19.908126831054688,
+                84841
+              ],
+              [
+                19.199310302734375,
+                106787
+              ]
+            ]
+          },
+          {
+            "dp_group": 1,
+            "token_id": 294,
+            "logit": 28.772979736328125,
+            "shard_argmax": [
+              [
+                28.772979736328125,
+                294
+              ],
+              [
+                19.113231658935547,
+                56413
+              ],
+              [
+                19.908126831054688,
+                84841
+              ],
+              [
+                19.199310302734375,
+                106787
+              ]
+            ]
+          },
+          {
+            "dp_group": 2,
+            "token_id": 294,
+            "logit": 28.772979736328125,
+            "shard_argmax": [
+              [
+                28.772979736328125,
+                294
+              ],
+              [
+                19.113231658935547,
+                56413
+              ],
+              [
+                19.908126831054688,
+                84841
+              ],
+              [
+                19.199310302734375,
+                106787
+              ]
+            ]
+          },
+          {
+            "dp_group": 3,
+            "token_id": 294,
+            "logit": 28.772979736328125,
+            "shard_argmax": [
+              [
+                28.772979736328125,
+                294
+              ],
+              [
+                19.113231658935547,
+                56413
+              ],
+              [
+                19.908126831054688,
+                84841
+              ],
+              [
+                19.199310302734375,
+                106787
+              ]
+            ]
+          }
+        ],
+        "agreement_checked": true,
+        "context": {
+          "phase": "decode",
+          "step": 7,
+          "position": 9,
+          "input_token": 5281,
+          "prompt_ids": [
+            16600,
+            4465,
+            260
+          ],
+          "generated_ids": [
+            1014,
+            1613,
+            3305,
+            1999,
+            344,
+            270,
+            5281
+          ]
+        }
+      },
+      "state": {
+        "window_cache_sha1": "8a8babe23463274d",
+        "compressed_cache_c2a_sha1": "8d0924bfea93cc54",
+        "index_cache_c2a_sha1": "90b0328f44929a2d",
+        "state_cache_c2a_sha1": "bbf808c4d0133e65",
+        "compressed_cache_c1a_sha1": "b5de2d2e9ea39980",
+        "index_cache_c1a_sha1": "6198bc6043816f48",
+        "x_hc_sha1": "a6827de07016c7e6",
+        "pre_mix_sha1": "6d856f33c7087202",
+        "topk_indices_nonzero": 1040,
+        "pool_block_ids_nonzero": 80,
+        "position_ids": [
+          9
+        ]
+      }
+    },
+    {
+      "step": 8,
+      "input_token": 294,
+      "position": 10,
+      "seconds": 0.4254486560821533,
+      "decode_compile_seconds": null,
+      "token_id": 270,
+      "logit": 25.695024490356445,
+      "sampling": {
+        "token_id": 270,
+        "logit": 25.695024490356445,
+        "shard_argmax": [
+          [
+            25.695024490356445,
+            270
+          ],
+          [
+            17.62881851196289,
+            37650
+          ],
+          [
+            20.159082412719727,
+            95972
+          ],
+          [
+            18.428897857666016,
+            125214
+          ]
+        ],
+        "dp_disagreements": [],
+        "dp_votes": [
+          {
+            "dp_group": 0,
+            "token_id": 270,
+            "logit": 25.695024490356445,
+            "shard_argmax": [
+              [
+                25.695024490356445,
+                270
+              ],
+              [
+                17.62881851196289,
+                37650
+              ],
+              [
+                20.159082412719727,
+                95972
+              ],
+              [
+                18.428897857666016,
+                125214
+              ]
+            ]
+          },
+          {
+            "dp_group": 1,
+            "token_id": 270,
+            "logit": 25.695024490356445,
+            "shard_argmax": [
+              [
+                25.695024490356445,
+                270
+              ],
+              [
+                17.62881851196289,
+                37650
+              ],
+              [
+                20.159082412719727,
+                95972
+              ],
+              [
+                18.428897857666016,
+                125214
+              ]
+            ]
+          },
+          {
+            "dp_group": 2,
+            "token_id": 270,
+            "logit": 25.695024490356445,
+            "shard_argmax": [
+              [
+                25.695024490356445,
+                270
+              ],
+              [
+                17.62881851196289,
+                37650
+              ],
+              [
+                20.159082412719727,
+                95972
+              ],
+              [
+                18.428897857666016,
+                125214
+              ]
+            ]
+          },
+          {
+            "dp_group": 3,
+            "token_id": 270,
+            "logit": 25.695024490356445,
+            "shard_argmax": [
+              [
+                25.695024490356445,
+                270
+              ],
+              [
+                17.62881851196289,
+                37650
+              ],
+              [
+                20.159082412719727,
+                95972
+              ],
+              [
+                18.428897857666016,
+                125214
+              ]
+            ]
+          }
+        ],
+        "agreement_checked": true,
+        "context": {
+          "phase": "decode",
+          "step": 8,
+          "position": 10,
+          "input_token": 294,
+          "prompt_ids": [
+            16600,
+            4465,
+            260
+          ],
+          "generated_ids": [
+            1014,
+            1613,
+            3305,
+            1999,
+            344,
+            270,
+            5281,
+            294
+          ]
+        }
+      },
+      "state": {
+        "window_cache_sha1": "37f37ef52b4fad1b",
+        "compressed_cache_c2a_sha1": "8d0924bfea93cc54",
+        "index_cache_c2a_sha1": "90b0328f44929a2d",
+        "state_cache_c2a_sha1": "81ff3e73da283738",
+        "compressed_cache_c1a_sha1": "a5970dd6c2d4b729",
+        "index_cache_c1a_sha1": "ef1195b069f6fc13",
+        "x_hc_sha1": "f87d528e9147df55",
+        "pre_mix_sha1": "1294896ace12450f",
+        "topk_indices_nonzero": 1120,
+        "pool_block_ids_nonzero": 80,
+        "position_ids": [
+          10
+        ]
+      }
+    },
+    {
+      "step": 9,
+      "input_token": 270,
+      "position": 11,
+      "seconds": 0.42034316062927246,
+      "decode_compile_seconds": null,
+      "token_id": 17132,
+      "logit": 24.981733322143555,
+      "sampling": {
+        "token_id": 17132,
+        "logit": 24.981733322143555,
+        "shard_argmax": [
+          [
+            24.981733322143555,
+            17132
+          ],
+          [
+            19.603824615478516,
+            37136
+          ],
+          [
+            22.719640731811523,
+            95972
+          ],
+          [
+            19.816572189331055,
+            122251
+          ]
+        ],
+        "dp_disagreements": [],
+        "dp_votes": [
+          {
+            "dp_group": 0,
+            "token_id": 17132,
+            "logit": 24.981733322143555,
+            "shard_argmax": [
+              [
+                24.981733322143555,
+                17132
+              ],
+              [
+                19.603824615478516,
+                37136
+              ],
+              [
+                22.719640731811523,
+                95972
+              ],
+              [
+                19.816572189331055,
+                122251
+              ]
+            ]
+          },
+          {
+            "dp_group": 1,
+            "token_id": 17132,
+            "logit": 24.981733322143555,
+            "shard_argmax": [
+              [
+                24.981733322143555,
+                17132
+              ],
+              [
+                19.603824615478516,
+                37136
+              ],
+              [
+                22.719640731811523,
+                95972
+              ],
+              [
+                19.816572189331055,
+                122251
+              ]
+            ]
+          },
+          {
+            "dp_group": 2,
+            "token_id": 17132,
+            "logit": 24.981733322143555,
+            "shard_argmax": [
+              [
+                24.981733322143555,
+                17132
+              ],
+              [
+                19.603824615478516,
+                37136
+              ],
+              [
+                22.719640731811523,
+                95972
+              ],
+              [
+                19.816572189331055,
+                122251
+              ]
+            ]
+          },
+          {
+            "dp_group": 3,
+            "token_id": 17132,
+            "logit": 24.981733322143555,
+            "shard_argmax": [
+              [
+                24.981733322143555,
+                17132
+              ],
+              [
+                19.603824615478516,
+                37136
+              ],
+              [
+                22.719640731811523,
+                95972
+              ],
+              [
+                19.816572189331055,
+                122251
+              ]
+            ]
+          }
+        ],
+        "agreement_checked": true,
+        "context": {
+          "phase": "decode",
+          "step": 9,
+          "position": 11,
+          "input_token": 270,
+          "prompt_ids": [
+            16600,
+            4465,
+            260
+          ],
+          "generated_ids": [
+            1014,
+            1613,
+            3305,
+            1999,
+            344,
+            270,
+            5281,
+            294,
+            270
+          ]
+        }
+      },
+      "state": {
+        "window_cache_sha1": "4262ff36df87710e",
+        "compressed_cache_c2a_sha1": "4edf7eac44e804b7",
+        "index_cache_c2a_sha1": "1c9e861592e4c9e6",
+        "state_cache_c2a_sha1": "b27f1555cef81ec1",
+        "compressed_cache_c1a_sha1": "ab8967e2e377e2fd",
+        "index_cache_c1a_sha1": "a8f24016aeee3d0e",
+        "x_hc_sha1": "070da39a560a4c19",
+        "pre_mix_sha1": "15fbbffd7d1bfb39",
+        "topk_indices_nonzero": 1248,
+        "pool_block_ids_nonzero": 80,
+        "position_ids": [
+          11
+        ]
+      }
+    },
+    {
+      "step": 10,
+      "input_token": 17132,
+      "position": 12,
+      "seconds": 0.4231874942779541,
+      "decode_compile_seconds": null,
+      "token_id": 582,
+      "logit": 27.00476837158203,
+      "sampling": {
+        "token_id": 582,
+        "logit": 27.00476837158203,
+        "shard_argmax": [
+          [
+            27.00476837158203,
+            582
+          ],
+          [
+            20.07400131225586,
+            45372
+          ],
+          [
+            19.399215698242188,
+            76256
+          ],
+          [
+            17.65304946899414,
+            106787
+          ]
+        ],
+        "dp_disagreements": [],
+        "dp_votes": [
+          {
+            "dp_group": 0,
+            "token_id": 582,
+            "logit": 27.00476837158203,
+            "shard_argmax": [
+              [
+                27.00476837158203,
+                582
+              ],
+              [
+                20.07400131225586,
+                45372
+              ],
+              [
+                19.399215698242188,
+                76256
+              ],
+              [
+                17.65304946899414,
+                106787
+              ]
+            ]
+          },
+          {
+            "dp_group": 1,
+            "token_id": 582,
+            "logit": 27.00476837158203,
+            "shard_argmax": [
+              [
+                27.00476837158203,
+                582
+              ],
+              [
+                20.07400131225586,
+                45372
+              ],
+              [
+                19.399215698242188,
+                76256
+              ],
+              [
+                17.65304946899414,
+                106787
+              ]
+            ]
+          },
+          {
+            "dp_group": 2,
+            "token_id": 582,
+            "logit": 27.00476837158203,
+            "shard_argmax": [
+              [
+                27.00476837158203,
+                582
+              ],
+              [
+                20.07400131225586,
+                45372
+              ],
+              [
+                19.399215698242188,
+                76256
+              ],
+              [
+                17.65304946899414,
+                106787
+              ]
+            ]
+          },
+          {
+            "dp_group": 3,
+            "token_id": 582,
+            "logit": 27.00476837158203,
+            "shard_argmax": [
+              [
+                27.00476837158203,
+                582
+              ],
+              [
+                20.07400131225586,
+                45372
+              ],
+              [
+                19.399215698242188,
+                76256
+              ],
+              [
+                17.65304946899414,
+                106787
+              ]
+            ]
+          }
+        ],
+        "agreement_checked": true,
+        "context": {
+          "phase": "decode",
+          "step": 10,
+          "position": 12,
+          "input_token": 17132,
+          "prompt_ids": [
+            16600,
+            4465,
+            260
+          ],
+          "generated_ids": [
+            1014,
+            1613,
+            3305,
+            1999,
+            344,
+            270,
+            5281,
+            294,
+            270,
+            17132
+          ]
+        }
+      },
+      "state": {
+        "window_cache_sha1": "b74b8e99b3a5dd06",
+        "compressed_cache_c2a_sha1": "4edf7eac44e804b7",
+        "index_cache_c2a_sha1": "1c9e861592e4c9e6",
+        "state_cache_c2a_sha1": "caa899d0e2535fb9",
+        "compressed_cache_c1a_sha1": "b2a1c111e49f99ed",
+        "index_cache_c1a_sha1": "2b802a0772a4e5ce",
+        "x_hc_sha1": "1db51ce7715f6345",
+        "pre_mix_sha1": "17e168f89541afa2",
+        "topk_indices_nonzero": 1328,
+        "pool_block_ids_nonzero": 80,
+        "position_ids": [
+          12
+        ]
+      }
+    },
+    {
+      "step": 11,
+      "input_token": 582,
+      "position": 13,
+      "seconds": 0.42310237884521484,
+      "decode_compile_seconds": null,
+      "token_id": 32568,
+      "logit": 21.404016494750977,
+      "sampling": {
+        "token_id": 32568,
+        "logit": 21.404016494750977,
+        "shard_argmax": [
+          [
+            20.15764808654785,
+            16600
+          ],
+          [
+            21.404016494750977,
+            32568
+          ],
+          [
+            13.69937801361084,
+            95594
+          ],
+          [
+            13.914490699768066,
+            115030
+          ]
+        ],
+        "dp_disagreements": [],
+        "dp_votes": [
+          {
+            "dp_group": 0,
+            "token_id": 32568,
+            "logit": 21.404016494750977,
+            "shard_argmax": [
+              [
+                20.15764808654785,
+                16600
+              ],
+              [
+                21.404016494750977,
+                32568
+              ],
+              [
+                13.69937801361084,
+                95594
+              ],
+              [
+                13.914490699768066,
+                115030
+              ]
+            ]
+          },
+          {
+            "dp_group": 1,
+            "token_id": 32568,
+            "logit": 21.404016494750977,
+            "shard_argmax": [
+              [
+                20.15764808654785,
+                16600
+              ],
+              [
+                21.404016494750977,
+                32568
+              ],
+              [
+                13.69937801361084,
+                95594
+              ],
+              [
+                13.914490699768066,
+                115030
+              ]
+            ]
+          },
+          {
+            "dp_group": 2,
+            "token_id": 32568,
+            "logit": 21.404016494750977,
+            "shard_argmax": [
+              [
+                20.15764808654785,
+                16600
+              ],
+              [
+                21.404016494750977,
+                32568
+              ],
+              [
+                13.69937801361084,
+                95594
+              ],
+              [
+                13.914490699768066,
+                115030
+              ]
+            ]
+          },
+          {
+            "dp_group": 3,
+            "token_id": 32568,
+            "logit": 21.404016494750977,
+            "shard_argmax": [
+              [
+                20.15764808654785,
+                16600
+              ],
+              [
+                21.404016494750977,
+                32568
+              ],
+              [
+                13.69937801361084,
+                95594
+              ],
+              [
+                13.914490699768066,
+                115030
+              ]
+            ]
+          }
+        ],
+        "agreement_checked": true,
+        "context": {
+          "phase": "decode",
+          "step": 11,
+          "position": 13,
+          "input_token": 582,
+          "prompt_ids": [
+            16600,
+            4465,
+            260
+          ],
+          "generated_ids": [
+            1014,
+            1613,
+            3305,
+            1999,
+            344,
+            270,
+            5281,
+            294,
+            270,
+            17132,
+            582
+          ]
+        }
+      },
+      "state": {
+        "window_cache_sha1": "98f5a2aa0ad1eb6e",
+        "compressed_cache_c2a_sha1": "58c5760f41aa134b",
+        "index_cache_c2a_sha1": "943e5569e3a6c92a",
+        "state_cache_c2a_sha1": "eba497b7b82aef33",
+        "compressed_cache_c1a_sha1": "6bc26c6b897d9366",
+        "index_cache_c1a_sha1": "36bda3318d1b2f8c",
+        "x_hc_sha1": "45d7add5878ddc15",
+        "pre_mix_sha1": "f44316db09dfd786",
+        "topk_indices_nonzero": 1456,
+        "pool_block_ids_nonzero": 80,
+        "position_ids": [
+          13
+        ]
+      }
+    },
+    {
+      "step": 12,
+      "input_token": 32568,
+      "position": 14,
+      "seconds": 0.42459988594055176,
+      "decode_compile_seconds": null,
+      "token_id": 4465,
+      "logit": 30.323667526245117,
+      "sampling": {
+        "token_id": 4465,
+        "logit": 30.323667526245117,
+        "shard_argmax": [
+          [
+            30.323667526245117,
+            4465
+          ],
+          [
+            24.419010162353516,
+            57008
+          ],
+          [
+            16.4749813079834,
+            72027
+          ],
+          [
+            22.935029983520508,
+            107265
+          ]
+        ],
+        "dp_disagreements": [],
+        "dp_votes": [
+          {
+            "dp_group": 0,
+            "token_id": 4465,
+            "logit": 30.323667526245117,
+            "shard_argmax": [
+              [
+                30.323667526245117,
+                4465
+              ],
+              [
+                24.419010162353516,
+                57008
+              ],
+              [
+                16.4749813079834,
+                72027
+              ],
+              [
+                22.935029983520508,
+                107265
+              ]
+            ]
+          },
+          {
+            "dp_group": 1,
+            "token_id": 4465,
+            "logit": 30.323667526245117,
+            "shard_argmax": [
+              [
+                30.323667526245117,
+                4465
+              ],
+              [
+                24.419010162353516,
+                57008
+              ],
+              [
+                16.4749813079834,
+                72027
+              ],
+              [
+                22.935029983520508,
+                107265
+              ]
+            ]
+          },
+          {
+            "dp_group": 2,
+            "token_id": 4465,
+            "logit": 30.323667526245117,
+            "shard_argmax": [
+              [
+                30.323667526245117,
+                4465
+              ],
+              [
+                24.419010162353516,
+                57008
+              ],
+              [
+                16.4749813079834,
+                72027
+              ],
+              [
+                22.935029983520508,
+                107265
+              ]
+            ]
+          },
+          {
+            "dp_group": 3,
+            "token_id": 4465,
+            "logit": 30.323667526245117,
+            "shard_argmax": [
+              [
+                30.323667526245117,
+                4465
+              ],
+              [
+                24.419010162353516,
+                57008
+              ],
+              [
+                16.4749813079834,
+                72027
+              ],
+              [
+                22.935029983520508,
+                107265
+              ]
+            ]
+          }
+        ],
+        "agreement_checked": true,
+        "context": {
+          "phase": "decode",
+          "step": 12,
+          "position": 14,
+          "input_token": 32568,
+          "prompt_ids": [
+            16600,
+            4465,
+            260
+          ],
+          "generated_ids": [
+            1014,
+            1613,
+            3305,
+            1999,
+            344,
+            270,
+            5281,
+            294,
+            270,
+            17132,
+            582,
+            32568
+          ]
+        }
+      },
+      "state": {
+        "window_cache_sha1": "182a32fc3db33063",
+        "compressed_cache_c2a_sha1": "58c5760f41aa134b",
+        "index_cache_c2a_sha1": "943e5569e3a6c92a",
+        "state_cache_c2a_sha1": "493e0bec43cbd127",
+        "compressed_cache_c1a_sha1": "46c50d9e892c985e",
+        "index_cache_c1a_sha1": "11505a67421acd34",
+        "x_hc_sha1": "1567804e3aa0fb84",
+        "pre_mix_sha1": "a17f34a1153f19c0",
+        "topk_indices_nonzero": 1536,
+        "pool_block_ids_nonzero": 80,
+        "position_ids": [
+          14
+        ]
+      }
+    },
+    {
+      "step": 13,
+      "input_token": 4465,
+      "position": 15,
+      "seconds": 0.42931199073791504,
+      "decode_compile_seconds": null,
+      "token_id": 260,
+      "logit": 30.442060470581055,
+      "sampling": {
+        "token_id": 260,
+        "logit": 30.442060470581055,
+        "shard_argmax": [
+          [
+            30.442060470581055,
+            260
+          ],
+          [
+            22.50507164001465,
+            57008
+          ],
+          [
+            16.141626358032227,
+            90445
+          ],
+          [
+            21.319822311401367,
+            107265
+          ]
+        ],
+        "dp_disagreements": [],
+        "dp_votes": [
+          {
+            "dp_group": 0,
+            "token_id": 260,
+            "logit": 30.442060470581055,
+            "shard_argmax": [
+              [
+                30.442060470581055,
+                260
+              ],
+              [
+                22.50507164001465,
+                57008
+              ],
+              [
+                16.141626358032227,
+                90445
+              ],
+              [
+                21.319822311401367,
+                107265
+              ]
+            ]
+          },
+          {
+            "dp_group": 1,
+            "token_id": 260,
+            "logit": 30.442060470581055,
+            "shard_argmax": [
+              [
+                30.442060470581055,
+                260
+              ],
+              [
+                22.50507164001465,
+                57008
+              ],
+              [
+                16.141626358032227,
+                90445
+              ],
+              [
+                21.319822311401367,
+                107265
+              ]
+            ]
+          },
+          {
+            "dp_group": 2,
+            "token_id": 260,
+            "logit": 30.442060470581055,
+            "shard_argmax": [
+              [
+                30.442060470581055,
+                260
+              ],
+              [
+                22.50507164001465,
+                57008
+              ],
+              [
+                16.141626358032227,
+                90445
+              ],
+              [
+                21.319822311401367,
+                107265
+              ]
+            ]
+          },
+          {
+            "dp_group": 3,
+            "token_id": 260,
+            "logit": 30.442060470581055,
+            "shard_argmax": [
+              [
+                30.442060470581055,
+                260
+              ],
+              [
+                22.50507164001465,
+                57008
+              ],
+              [
+                16.141626358032227,
+                90445
+              ],
+              [
+                21.319822311401367,
+                107265
+              ]
+            ]
+          }
+        ],
+        "agreement_checked": true,
+        "context": {
+          "phase": "decode",
+          "step": 13,
+          "position": 15,
+          "input_token": 4465,
+          "prompt_ids": [
+            16600,
+            4465,
+            260
+          ],
+          "generated_ids": [
+            1014,
+            1613,
+            3305,
+            1999,
+            344,
+            270,
+            5281,
+            294,
+            270,
+            17132,
+            582,
+            32568,
+            4465
+          ]
+        }
+      },
+      "state": {
+        "window_cache_sha1": "e5531eb36ac1c50b",
+        "compressed_cache_c2a_sha1": "7051f0ff31b79093",
+        "index_cache_c2a_sha1": "b4c06ad418695905",
+        "state_cache_c2a_sha1": "07911ebe30fb293c",
+        "compressed_cache_c1a_sha1": "6d1b83779b636200",
+        "index_cache_c1a_sha1": "27fab066bbef0bd2",
+        "x_hc_sha1": "398135cabb3cc5fb",
+        "pre_mix_sha1": "e2bfa263dc607862",
+        "topk_indices_nonzero": 1664,
+        "pool_block_ids_nonzero": 80,
+        "position_ids": [
+          15
+        ]
+      }
+    },
+    {
+      "step": 14,
+      "input_token": 260,
+      "position": 16,
+      "seconds": 0.41643691062927246,
+      "decode_compile_seconds": null,
+      "token_id": 1014,
+      "logit": 31.009952545166016,
+      "sampling": {
+        "token_id": 1014,
+        "logit": 31.009952545166016,
+        "shard_argmax": [
+          [
+            31.009952545166016,
+            1014
+          ],
+          [
+            21.647428512573242,
+            57008
+          ],
+          [
+            17.002424240112305,
+            90445
+          ],
+          [
+            19.35377311706543,
+            107265
+          ]
+        ],
+        "dp_disagreements": [],
+        "dp_votes": [
+          {
+            "dp_group": 0,
+            "token_id": 1014,
+            "logit": 31.009952545166016,
+            "shard_argmax": [
+              [
+                31.009952545166016,
+                1014
+              ],
+              [
+                21.647428512573242,
+                57008
+              ],
+              [
+                17.002424240112305,
+                90445
+              ],
+              [
+                19.35377311706543,
+                107265
+              ]
+            ]
+          },
+          {
+            "dp_group": 1,
+            "token_id": 1014,
+            "logit": 31.009952545166016,
+            "shard_argmax": [
+              [
+                31.009952545166016,
+                1014
+              ],
+              [
+                21.647428512573242,
+                57008
+              ],
+              [
+                17.002424240112305,
+                90445
+              ],
+              [
+                19.35377311706543,
+                107265
+              ]
+            ]
+          },
+          {
+            "dp_group": 2,
+            "token_id": 1014,
+            "logit": 31.009952545166016,
+            "shard_argmax": [
+              [
+                31.009952545166016,
+                1014
+              ],
+              [
+                21.647428512573242,
+                57008
+              ],
+              [
+                17.002424240112305,
+                90445
+              ],
+              [
+                19.35377311706543,
+                107265
+              ]
+            ]
+          },
+          {
+            "dp_group": 3,
+            "token_id": 1014,
+            "logit": 31.009952545166016,
+            "shard_argmax": [
+              [
+                31.009952545166016,
+                1014
+              ],
+              [
+                21.647428512573242,
+                57008
+              ],
+              [
+                17.002424240112305,
+                90445
+              ],
+              [
+                19.35377311706543,
+                107265
+              ]
+            ]
+          }
+        ],
+        "agreement_checked": true,
+        "context": {
+          "phase": "decode",
+          "step": 14,
+          "position": 16,
+          "input_token": 260,
+          "prompt_ids": [
+            16600,
+            4465,
+            260
+          ],
+          "generated_ids": [
+            1014,
+            1613,
+            3305,
+            1999,
+            344,
+            270,
+            5281,
+            294,
+            270,
+            17132,
+            582,
+            32568,
+            4465,
+            260
+          ]
+        }
+      },
+      "state": {
+        "window_cache_sha1": "fb98c5ae26816dff",
+        "compressed_cache_c2a_sha1": "7051f0ff31b79093",
+        "index_cache_c2a_sha1": "b4c06ad418695905",
+        "state_cache_c2a_sha1": "d0c53b889158f855",
+        "compressed_cache_c1a_sha1": "f54d951d585ff2d9",
+        "index_cache_c1a_sha1": "715b8924bd40bd16",
+        "x_hc_sha1": "c4305c9394c1b0a9",
+        "pre_mix_sha1": "b607de9d0952d422",
+        "topk_indices_nonzero": 1744,
+        "pool_block_ids_nonzero": 96,
+        "position_ids": [
+          16
+        ]
+      }
+    },
+    {
+      "step": 15,
+      "input_token": 1014,
+      "position": 17,
+      "seconds": 0.4138164520263672,
+      "decode_compile_seconds": null,
+      "token_id": 57008,
+      "logit": 29.312089920043945,
+      "sampling": {
+        "token_id": 57008,
+        "logit": 29.312089920043945,
+        "shard_argmax": [
+          [
+            26.972272872924805,
+            4
+          ],
+          [
+            29.312089920043945,
+            57008
+          ],
+          [
+            20.37473487854004,
+            66570
+          ],
+          [
+            27.717082977294922,
+            107265
+          ]
+        ],
+        "dp_disagreements": [],
+        "dp_votes": [
+          {
+            "dp_group": 0,
+            "token_id": 57008,
+            "logit": 29.312089920043945,
+            "shard_argmax": [
+              [
+                26.972272872924805,
+                4
+              ],
+              [
+                29.312089920043945,
+                57008
+              ],
+              [
+                20.37473487854004,
+                66570
+              ],
+              [
+                27.717082977294922,
+                107265
+              ]
+            ]
+          },
+          {
+            "dp_group": 1,
+            "token_id": 57008,
+            "logit": 29.312089920043945,
+            "shard_argmax": [
+              [
+                26.972272872924805,
+                4
+              ],
+              [
+                29.312089920043945,
+                57008
+              ],
+              [
+                20.37473487854004,
+                66570
+              ],
+              [
+                27.717082977294922,
+                107265
+              ]
+            ]
+          },
+          {
+            "dp_group": 2,
+            "token_id": 57008,
+            "logit": 29.312089920043945,
+            "shard_argmax": [
+              [
+                26.972272872924805,
+                4
+              ],
+              [
+                29.312089920043945,
+                57008
+              ],
+              [
+                20.37473487854004,
+                66570
+              ],
+              [
+                27.717082977294922,
+                107265
+              ]
+            ]
+          },
+          {
+            "dp_group": 3,
+            "token_id": 57008,
+            "logit": 29.312089920043945,
+            "shard_argmax": [
+              [
+                26.972272872924805,
+                4
+              ],
+              [
+                29.312089920043945,
+                57008
+              ],
+              [
+                20.37473487854004,
+                66570
+              ],
+              [
+                27.717082977294922,
+                107265
+              ]
+            ]
+          }
+        ],
+        "agreement_checked": true,
+        "context": {
+          "phase": "decode",
+          "step": 15,
+          "position": 17,
+          "input_token": 1014,
+          "prompt_ids": [
+            16600,
+            4465,
+            260
+          ],
+          "generated_ids": [
+            1014,
+            1613,
+            3305,
+            1999,
+            344,
+            270,
+            5281,
+            294,
+            270,
+            17132,
+            582,
+            32568,
+            4465,
+            260,
+            1014
+          ]
+        }
+      },
+      "state": {
+        "window_cache_sha1": "b65211cc901b9fcd",
+        "compressed_cache_c2a_sha1": "dd74c65d1afb16c2",
+        "index_cache_c2a_sha1": "db1b149b01c5746a",
+        "state_cache_c2a_sha1": "34eda82525798c6a",
+        "compressed_cache_c1a_sha1": "99bc29f6945e52e1",
+        "index_cache_c1a_sha1": "85df88f8ad46a7de",
+        "x_hc_sha1": "ae85eea8c8eeb48b",
+        "pre_mix_sha1": "1c7218c4746ade2e",
+        "topk_indices_nonzero": 1872,
+        "pool_block_ids_nonzero": 144,
+        "position_ids": [
+          17
+        ]
+      }
+    }
+  ],
+  "prefill_residency": {
+    "resident_upload_bytes": 633997065216,
+    "resident_allocations": 57,
+    "dispatches": 1,
+    "rank_allocations": 912,
+    "copy_calls": 110496,
+    "max_leaf_bytes": 330956800,
+    "max_copy_bytes": 67108864,
+    "state_transport": "shared-host H2D/D2H each dispatch",
+    "protocol_domains": "fresh each dispatch"
+  },
+  "decode_residency": {
+    "resident_upload_bytes": 0,
+    "resident_allocations": 0,
+    "dispatches": 15,
+    "rank_allocations": 0,
+    "copy_calls": 0,
+    "max_leaf_bytes": 0,
+    "max_copy_bytes": 0,
+    "state_transport": "shared-host H2D/D2H each dispatch",
+    "protocol_domains": "fresh each dispatch",
+    "static_binding": "borrowed from prefill bases",
+    "borrowed_views": 912
+  },
+  "weight_residency": {
+    "mode": "one-worker/two-registered-programs",
+    "canonical_phase": "prefill",
+    "static_upload_bytes_total": 633997065216,
+    "base_rank_allocations_total": 912,
+    "static_source_reads_total": 164192,
+    "static_source_bytes_total": 745846365184,
+    "decode_new_static_source_reads": 0,
+    "decode_new_static_source_bytes": 0,
+    "decode_new_static_upload_bytes": 0,
+    "decode_new_static_allocations": 0,
+    "decode_static_binding": "same initialized bases via public same-worker views",
+    "borrowed_consumer_rank_views": 912
+  },
+  "result_sha256": "9e30c0d0369af44d6ff3fbd764b6206854503d37b472b222e7d93532f6fac0ff",
+  "outer_result_sha256": "7838a6389bb25ebb19fe4a2e0180dd0ddba8e92f476c27fd278e6f3fe190238f",
+  "external_POST_sha256": "f204e88d7a38df18f5def6f18ef65b10a1eec885719a98365ae7161772a904cb",
+  "external_POST_error": null,
+  "metadata_errors": {},
+  "known_births": 1160,
+  "all_known_births_absent": true,
+  "acceptance": "Raw terminal facts only; strict verdict preserved; independent audit and Root disposition pending"
+}

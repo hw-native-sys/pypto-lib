@@ -1,0 +1,17 @@
+{
+  "epoch": 1794099628.241224,
+  "role": "review-agent",
+  "status": "FINAL/PARK_SOURCE_ONLY_READY",
+  "shared_writes": 0,
+  "root_imports": "once, owned by Root",
+  "manifest_sha256": "08f70c924d3fbabaf28e4b848ba9b2c75292352061976918d1b830d4ac594d39",
+  "report_sha256": "7cd626c0dbcae68d83e374e55e1a5db2f6db575670ba35aa1397eafb902eecc9",
+  "audit_sha256": "b9683fa7ecf759a729e8d3f062ee487fa05c4e69734bcc388092eaea1b1fbc3a",
+  "delta_sha256": "a09f63dd0d9a4fe27e0bdcd6ee5398fb2f596e646eac2dbd5f41980eb4fffdcb",
+  "pins_sha256": "60f4e23c0076c5b862a3020fcff8479adab3b2ae77c27efd664cd29879ba80ac",
+  "files": 18,
+  "CPU_tests_or_jobs": 0,
+  "NPU": false,
+  "actual_case_audit": false,
+  "remaining_tasks": []
+}

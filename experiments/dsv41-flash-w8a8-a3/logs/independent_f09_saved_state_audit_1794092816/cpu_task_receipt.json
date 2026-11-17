@@ -1,0 +1,11 @@
+{
+  "task": "task_20261108_070731_18717497373",
+  "exit_code": 0,
+  "device": "no-device",
+  "max_time": 180,
+  "client_timeout": 240,
+  "checker_seconds": 5.986390829086304,
+  "result_sha256": "bd0a86fdf4ef3e1eb0150b560706b20dcbae0a5356454f733466984607911ba2",
+  "saved_snapshots_only": true,
+  "model_fixture_reference_NPU": false
+}

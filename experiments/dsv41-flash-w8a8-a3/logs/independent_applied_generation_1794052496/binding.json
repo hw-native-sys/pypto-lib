@@ -1,0 +1,9 @@
+{
+  "schema": "independent-applied-signature-binding/1",
+  "Root_FINAL_notice": true,
+  "source45_sha256": "d77d196be6541b4a87aef07cf0e5e02eac68cefa9fc245f3742e4c14606555aa",
+  "generate_sha256": "d057012464331b10b0bdc7f406925ee0c552dd298a1db171a93b0b1595769598",
+  "Main17_manifest_sha256": "7402f715fd2acd0ea4574821e7be1637ff6b00923207949d79430d1357a45e11",
+  "predecessor45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "scope": "CPU both signature-only; no sample/fixture/prepare/native/payload"
+}

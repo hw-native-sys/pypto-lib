@@ -1,0 +1,32 @@
+{
+  "schema": "Root-configurable-real-operation-template/1",
+  "approved": false,
+  "actual16_authorized": false,
+  "operation": "configurable-shared-real40-noEngram-greedy-N3",
+  "Root_GO_id": null,
+  "binding_sha256": "d01fe5a625b4102d3fffe509e89485f6fa438a9c67b1ffa32e96c3fe548e3e9d",
+  "topology": {
+    "tp": 8,
+    "ep": 16,
+    "dp": 2,
+    "world": 16,
+    "local_experts": 24
+  },
+  "source_manifest_sha256": "f0e91a30e4117e110be183ef44acf2874eea813cc6f72ac7c7fa44bc4ede3a7f",
+  "metadata_plan_sha256": "a7b187a084e304b5203aeb2b0897dcb291550fbcf6c5bbaea6d1fe42f49a2a46",
+  "fresh_signature_receipt": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/configurable_parallel_1794108101/main/signature_receipt.json",
+    "sha256": "c11948187a3f2e3675d5fe9e0fd0a47f20af67ecbeac4866f947cb7aefca75e4",
+    "manifest_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/configurable_parallel_1794108101/artifacts.json",
+    "manifest_sha256": "1d51c2fe79e84b7bccb4404017686b166ebca54b711352eaa618137b02826c25"
+  },
+  "future_case": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_configurable_real_generation_1794111133",
+  "PREQUEUE_receipt_sha256": null,
+  "actual_ordered_device_ids": null,
+  "task_local_assignment_after_allocation_only": true,
+  "TTL_seconds": 3500,
+  "soft_seconds": 20400,
+  "queue_seconds": 21600,
+  "client_seconds": 22200,
+  "strict_telemetry_policy": "UNCHANGED_FAIL_ON_INCOMPLETE"
+}

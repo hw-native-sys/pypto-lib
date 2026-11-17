@@ -1,0 +1,27 @@
+{
+  "status": "read-only study milestone complete; observer verification pending",
+  "start_epoch": 1793928204,
+  "evidence_check_epoch": 1793928957,
+  "model_python_sources_unchanged": true,
+  "model_python_source_count": 140,
+  "model_implementation_edits": false,
+  "compile_runs": 0,
+  "npu_submissions": 0,
+  "external_filings": 0,
+  "commits": 0,
+  "shared_state_pool_mechanism": "not established",
+  "routing_i_ii_iii": "pending; reference study completed before routing",
+  "layer_task": "observer-owned; latest observer directive reports HBM allocation failure and termination",
+  "open_gates": [
+    "decode state_cache_c2a",
+    "decode pool ids/counts C2A and C1A",
+    "standalone TP",
+    "layer-suite revalidation",
+    "generation HELD"
+  ],
+  "native_goal_observation": null,
+  "report_sha256": "0a04b2f557443e32ddda458ab76d96605b4bbbf69f68beb97f368b33905a5796",
+  "source_manifest_sha256": "0198bdc825d5fafff6c6a860d9013f412ce106087bf2718309e6cff40c36a84c",
+  "stop_epoch": 1793928998,
+  "writer_runtime_execution_evidence_available": false
+}

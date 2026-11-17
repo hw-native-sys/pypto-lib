@@ -1,0 +1,191 @@
+
+FILE models/deepseek_v4_flash_dspark/decode_compressor_ratio4.py:294-323
+SHA256 83baf8261b424a1d29e4dbf035966cda4ce7481d425f6656a3efedc18f261e01
+294:     """State commit, RMSNorm + RoPE over the pooled rows, and the compressed KV cache write."""
+295:     b_dim = pl.tensor.dim(compress_state_block_table, 0)
+296:     bs = pl.tensor.dim(position_ids, 0)
+297:     s_dim = bs // b_dim
+298:     rms_blocks = (bs + RMS_PAD_TILE - 1) // RMS_PAD_TILE
+299:     cmp_block_num = pl.tensor.dim(cmp_kv_cache, 0)
+300:     kv_flat = kv
+301:     cmp_kv_cache_flat = pl.reshape(cmp_kv_cache, [cmp_block_num * BLOCK_SIZE, HEAD_DIM])
+302:     compress_state_block_num = pl.tensor.dim(compress_state, 0)
+303:     compress_state_rows = compress_state_block_num * COMPRESS_STATE_BLOCK_SIZE
+304:     compress_state_flat = pl.reshape(compress_state, [compress_state_rows, COMPRESS_STATE_DIM])
+305:     cmp4_kv_proj_pad = kv_proj_pad
+306:     cmp4_score_proj_pad = score_proj_pad
+307: 
+308:     # Recurrent state-ring commit.
+309:     commit_workers = pl.min(b_dim, COMMIT_WORKERS)
+310:     with pl.spmd(commit_workers, name_hint="compress_state_commit", deps=[pool_tid, late_write_dep]):
+311:         commit_worker = pl.tile.get_block_idx()
+312:         for c_idx in pl.range(commit_worker, b_dim, commit_workers):
+313:             for s_idx in pl.range(s_dim):
+314:                 token = c_idx * s_dim + s_idx
+315:                 state_row_i64 = pl.read(state_slot_mapping, [token])
+316:                 if state_row_i64 >= 0:
+317:                     state_row = pl.cast(state_row_i64, pl.INDEX)
+318:                     token_pos = pl.read(position_ids, [token])
+319:                     ape_row = pl.cast(token_pos % COMPRESS_RATIO, target_type=pl.INDEX)
+320:                     compress_state_flat[state_row : state_row + 1, 0 : OUT_DIM] = cmp4_kv_proj_pad[
+321:                         token : token + 1, 0 : OUT_DIM]
+322:                     compress_state_flat[state_row : state_row + 1, OUT_DIM : COMPRESS_STATE_DIM] = pl.add(
+323:                         cmp4_score_proj_pad[token : token + 1, 0 : OUT_DIM], ape[ape_row : ape_row + 1, 0 : OUT_DIM])
+
+FILE models/deepseek_v4_flash_dspark/decode_csa.py:504-525
+SHA256 11175af95af5a79d6c031b7cbd3c349db8fb37a118f226cad1e9b083844e391f
+504:             indexer_phase_deps[IDX_LEAF_DEP_SLOT] = all_visible_tid
+505:         else:
+506:             idx_topk_scores, idx_topk, scored_leaf_tid = indexer_weights_score(
+507:                 x_normed_t, weights_proj, qr_hadamard_i8, qr_hadamard_scale_dq,
+508:                 idx_kv_cache, idx_kv_scale, idx_block_table,
+509:                 idx_topk_scores, idx_topk,
+510:                 idx_positions, kv_seq_lens,
+511:                 idx_cache_write_tid, idx_hadamard_tid, qh_quant_tid, IDX_WEIGHTS_WORKERS,
+512:             )
+513:             indexer_phase_deps[IDX_LEAF_DEP_SLOT] = scored_leaf_tid
+514:         leaf_tid = indexer_phase_deps[IDX_LEAF_DEP_SLOT]
+515:         # Fence non-Top-K successors behind the completed leaf wave.
+516:         post_leaf_fence_tid = pl.system.task_dummy(deps=[leaf_tid])
+517: 
+518:         # Indexer score and Top-K selection.
+519:         compressor_ratio4_cache_write(
+520:             cmp_out, cmp_pooled_kv, cmp_norm_w,
+521:             cmp_cos_il_full, cmp_sin_signed_full, cmp_kv, cmp_slots,
+522:             compress_state, cmp_state_table, cmp_ape,
+523:             cmp_kv_proj_pad, cmp_score_proj_pad, cmp_positions, cmp_state_slots,
+524:             cmp_pool_tid, post_leaf_fence_tid,
+525:         )
+
+FILE models/deepseek_v4_flash_dspark/decode_fwd.py:493-498
+SHA256 adf951441cb0d638b5bb34977ae2efbab8ca085d2d1ce26159c701e051fb89b2
+493:     csa_state_blocks_per_layer = pl.tensor.dim(csa_compress_state, 0) // CSA_LAYER_COUNT
+494:     csa_cmp_blocks_per_layer = pl.tensor.dim(csa_cmp_kv, 0) // CSA_LAYER_COUNT
+495:     csa_inner_state_blocks_per_layer = pl.tensor.dim(csa_inner_compress_state, 0) // CSA_LAYER_COUNT
+496:     csa_idx_blocks_per_layer = pl.tensor.dim(csa_idx_kv_cache, 0) // CSA_LAYER_COUNT
+497:     hca_state_blocks_per_layer = pl.tensor.dim(hca_compress_state, 0) // HCA_LAYER_COUNT
+498:     hca_cmp_blocks_per_layer = pl.tensor.dim(hca_cmp_kv, 0) // HCA_LAYER_COUNT
+
+FILE models/deepseek_v4_flash_dspark/decode_fwd.py:704-730
+SHA256 adf951441cb0d638b5bb34977ae2efbab8ca085d2d1ce26159c701e051fb89b2
+704:     for ordinal in pl.range(HCA_LAYER_COUNT):
+705:         csa_model_layer = pl.cast(ordinal * 2 + 2, pl.INT32)
+706:         hca_model_layer = pl.cast(ordinal * 2 + 3, pl.INT32)
+707:         csa_weight_layer = csa_model_layer % FWD_WEIGHT_BANK_SIZE
+708:         hca_weight_layer = hca_model_layer % FWD_WEIGHT_BANK_SIZE
+709:         csa_extra_layer = ordinal % FWD_CSA_WEIGHT_BANK_SIZE
+710:         hca_extra_layer = ordinal % FWD_HCA_WEIGHT_BANK_SIZE
+711: 
+712:         with pl.scope():
+713:             hc_attn_fn_layer_csa = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [csa_weight_layer * HC_FN_STORAGE_ROWS, 0])
+714:             hc_ffn_fn_layer_csa = pl.slice(hc_ffn_fn, [MIX_HC, HC_DIM], [csa_weight_layer * HC_FN_STORAGE_ROWS, 0])
+715:             wq_a_layer_csa: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ] = wq_a[csa_weight_layer]
+716:             wq_b_layer_csa: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ] = wq_b[csa_weight_layer]
+717:             wq_b_scale_layer_csa: pl.Tensor[[H * HEAD_DIM], pl.FP32] = pl.slice(wq_b_scale, [H * HEAD_DIM], [csa_weight_layer * H * HEAD_DIM])
+718:             wkv_layer_csa: pl.Tensor[[D, HEAD_DIM], pl.BF16] = pl.slice(wkv, [D, HEAD_DIM], [csa_weight_layer * D, 0])
+719:             gamma_cq_layer_csa: pl.Tensor[[Q_LORA], pl.BF16] = pl.slice(gamma_cq, [Q_LORA], [csa_weight_layer * Q_LORA])
+720:             gamma_ckv_layer_csa: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(gamma_ckv, [HEAD_DIM], [csa_weight_layer * HEAD_DIM])
+721:             wo_a_layer_csa: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(wo_a, [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], [csa_weight_layer * LOCAL_O_GROUPS, 0, 0])
+722:             routed_w1_layer_csa: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ] = pl.slice(routed_w1, [N_LOCAL, MOE_INTER, D], [csa_weight_layer * N_LOCAL, 0, 0])
+723:             routed_w3_layer_csa: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ] = pl.slice(routed_w3, [N_LOCAL, MOE_INTER, D], [csa_weight_layer * N_LOCAL, 0, 0])
+724:             routed_w2_layer_csa: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ] = pl.slice(routed_w2, [N_LOCAL, D, MOE_INTER], [csa_weight_layer * N_LOCAL, 0, 0])
+725:             raw_kv_layer_csa = pl.slice(raw_kv_pool, [raw_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM], [csa_model_layer * raw_blocks_per_layer, 0, 0, 0])
+726:             csa_state_layer_csa = pl.slice(csa_compress_state, [csa_state_blocks_per_layer, CSA_MAIN_STATE_BLOCK_SIZE, CSA_MAIN_STATE_DIM], [ordinal * csa_state_blocks_per_layer, 0, 0])
+727:             csa_cmp_kv_layer_csa = pl.slice(csa_cmp_kv, [csa_cmp_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM], [ordinal * csa_cmp_blocks_per_layer, 0, 0, 0])
+728:             csa_inner_state_layer_csa = pl.slice(csa_inner_compress_state, [csa_inner_state_blocks_per_layer, CSA_INNER_STATE_BLOCK_SIZE, CSA_INNER_STATE_DIM], [ordinal * csa_inner_state_blocks_per_layer, 0, 0])
+729:             csa_idx_cache_layer_csa = pl.slice(csa_idx_kv_cache, [csa_idx_blocks_per_layer, BLOCK_SIZE, 1, CSA_IDX_HEAD_DIM], [ordinal * csa_idx_blocks_per_layer, 0, 0, 0])
+730:             csa_idx_scale_layer_csa = pl.slice(csa_idx_kv_scale, [csa_idx_blocks_per_layer, BLOCK_SIZE, 1, 1], [ordinal * csa_idx_blocks_per_layer, 0, 0, 0])
+
+FILE models/deepseek_v4_flash_dspark/prefill_compressor_ratio4.py:355-395
+SHA256 737d3346722d1f2b48c451423e9dca8f3b5b72a9fc6ad88d9073181a5bf67b7b
+355:     # Persistent recurrent-state tail.
+356:     publish_rows = pl.min(tile_rows, STATE_LEN)
+357:     publish_base = tile_rows - publish_rows
+358:     with pl.spmd(STATE_LEN, name_hint="prefill_c4_state_tail_publish", deps=[pool_tid]) as state_publish_tid:
+359:         publish_i = pl.tile.get_block_idx()
+360:         if publish_i < publish_rows:
+361:             publish_local = publish_base + publish_i
+362:             publish_global = tile_base + publish_local
+363:             publish_row_raw = pl.read(state_slot_mapping, [publish_global])
+364:             if publish_row_raw >= 0:
+365:                 publish_row = pl.cast(publish_row_raw, pl.INDEX)
+366:                 publish_pos = pl.read(position_ids, [publish_global])
+367:                 publish_ape_offset = publish_pos % COMPRESS_RATIO
+368:                 publish_ape_slot = pl.cast(publish_ape_offset, pl.INDEX)
+369:                 for publish_ob in pl.range(OUT_DIM // OUT_TILE):
+370:                     publish_o0 = publish_ob * OUT_TILE
+371:                     compress_state_flat[
+372:                         publish_row : publish_row + 1,
+373:                         publish_o0 : publish_o0 + OUT_TILE,
+374:                     ] = kv_proj_scratch[
+375:                         publish_local : publish_local + 1,
+376:                         publish_o0 : publish_o0 + OUT_TILE,
+377:                     ]
+378:                     publish_score = pl.add(
+379:                         score_proj_scratch[
+380:                             publish_local : publish_local + 1,
+381:                             publish_o0 : publish_o0 + OUT_TILE,
+382:                         ],
+383:                         ape[
+384:                             publish_ape_slot : publish_ape_slot + 1,
+385:                             publish_o0 : publish_o0 + OUT_TILE,
+386:                         ],
+387:                     )
+388:                     compress_state_flat[
+389:                         publish_row : publish_row + 1,
+390:                         OUT_DIM + publish_o0 : OUT_DIM + publish_o0 + OUT_TILE,
+391:                     ] = publish_score
+392: 
+393:     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_c4_state_order_commit", deps=[state_publish_tid]):
+394:         state_order_value = pl.cast(1, pl.INT32)
+395:         pl.write(state_order_fence, [0], state_order_value)
+
+FILE models/deepseek_v4_flash_dspark/decode_indexer.py:29-64
+SHA256 1706d966fd09e594bd07c7bd67c4a62f37b4184a9e17c9534f383d1e9979102e
+29: # Dynamic shape variables.
+30: B_DYN = pl.dynamic("B_DYN")
+31: T_DYN = pl.dynamic("T_DYN")  # T = B * S
+32: 
+33: # model config
+34: B = DECODE_BATCH // TP
+35: S = DECODE_SEQ
+36: T = B * S
+37: D = M.hidden_size
+38: Q_LORA = M.q_lora_rank
+39: ROPE_HEAD_DIM = M.qk_rope_head_dim
+40: IDX_N_HEADS = M.index_n_heads
+41: IDX_HEAD_DIM = M.index_head_dim
+42: IDX_NOPE_HEAD_DIM = M.index_nope_head_dim
+43: WEIGHTS_SCALE = M.index_weights_scale
+44: MAX_SEQ_LEN = M.max_position_embeddings
+45: 
+46: # kernel constants
+47: COMPRESS_RATIO = 4   # the indexer only runs on ratio-4 layers
+48: IDX_TOPK = M.index_topk
+49: INNER_OVERLAP = COMPRESS_RATIO == 4
+50: INNER_COFF = 1 + int(INNER_OVERLAP)
+51: INNER_HEAD_DIM = IDX_HEAD_DIM
+52: INNER_OUT_DIM = INNER_COFF * INNER_HEAD_DIM
+53: INNER_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
+54: INNER_STATE_LEN = INNER_COFF * COMPRESS_RATIO
+55: INNER_STATE_STORAGE_LEN = INNER_STATE_LEN + S
+56: INNER_STATE_MAX_BLOCKS = (
+57:     INNER_STATE_STORAGE_LEN + INNER_STATE_BLOCK_SIZE - 1
+58: ) // INNER_STATE_BLOCK_SIZE
+59: INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("INNER_STATE_BLOCK_NUM_DYN")
+60: INNER_STATE_DIM = 2 * INNER_OUT_DIM
+61: 
+62: IDX_MAX_ROWS = MAX_SEQ_LEN // COMPRESS_RATIO
+63: IDX_MAX_BLOCKS = (IDX_MAX_ROWS + BLOCK_SIZE - 1) // BLOCK_SIZE
+64: IDX_CACHE_BLOCK_NUM_DYN = pl.dynamic("IDX_CACHE_BLOCK_NUM_DYN")
+
+FILE models/deepseek_v4_flash_dspark/decode_indexer.py:1672-1679
+SHA256 1706d966fd09e594bd07c7bd67c4a62f37b4184a9e17c9534f383d1e9979102e
+1672:         TensorSpec("inner_ape", [COMPRESS_RATIO, INNER_OUT_DIM], torch.float32, init_value=init_inner_ape),
+1673:         TensorSpec("inner_norm_w", [INNER_HEAD_DIM], torch.bfloat16, init_value=init_inner_norm_w),
+1674:         TensorSpec("idx_kv_cache", [idx_physical_blocks, BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.int8, init_value=lambda: idx_kv_i8),
+1675:         TensorSpec("idx_kv_scale", [idx_physical_blocks, BLOCK_SIZE, 1, 1], torch.float32, init_value=lambda: idx_kv_sc),
+1676:         TensorSpec("idx_block_table", [batch, IDX_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
+1677:         TensorSpec("topk_scores", [tokens, IDX_TOPK], torch.float32),
+1678:         TensorSpec("topk_idxs", [tokens, IDX_TOPK], torch.int32),
+1679:         TensorSpec("position_ids", [batch * S], torch.int32, init_value=lambda: init_position_ids().reshape(-1)),

@@ -1,0 +1,29 @@
+{
+  "source_hashes": {
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_fwd.py": "5f51f3b23fe08100b4893bdd039e71666f6bfc0a8697ebb1049321e8bde52ac6",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_fwd.py": "270acabd7cdb48d42ed906fcb878a6c8cfb9b38c3e43a7d0ec330c6cfa012f4a",
+    "models/deepseek_v4_1_flash_a3_w8a8/moe_exchange.py": "951378f40c2ab7cb4f1573aeda72548bab017ed76c545641620e6e3502b4c780",
+    "models/deepseek_v4_1_flash_a3_w8a8/layer_reference.py": "2d9dab1c154c6ddad9f92c7fb120c992ae202496cef993226f716f0b50396098"
+  },
+  "mode": "ONBOARD",
+  "generated_platform": "a2a3",
+  "actual_prefill40layer_numerical": "PASS",
+  "actual_decode1": "BLOCKED halMemCtl EACCES/RunPreparationRefused13",
+  "continuation": "NOT RUN",
+  "realweights": "NOT LOADED",
+  "peak_hbm": "NOT MEASURED",
+  "record": {
+    "id": "fullentry-noengram-1793970258-1793972408",
+    "start": 1793970258,
+    "end": 1793972408,
+    "duration": 2150,
+    "basis": "measured from first implementation artifact timestamp;initial read-only preparation excluded",
+    "agent": "fullentry_noengram",
+    "status": "PARKED",
+    "positive_actual_onboard_full_entries": 1,
+    "blocked_actual_decode_entries": 1
+  },
+  "actual_prefill_expert_layers": 1,
+  "actual_prefill_dense_layers": 40,
+  "real_expert_layers40": "COMPILE ONLY"
+}

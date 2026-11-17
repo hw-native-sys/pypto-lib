@@ -1,0 +1,1 @@
+No NPU authorized by this review. Future two-device public multi-program proof is specified in REPORT.md; no real checkpoint payload or full-model fixture is required. Root must separately authorize execution after current longer case and independent audit.

@@ -1,0 +1,15 @@
+[
+  {
+    "record_id": "streaming-loader-reviewfix-1794016301-1794017085",
+    "agent": "/root/main_native/streaming_loader",
+    "start_epoch": 1794016301,
+    "end_epoch": 1794017085,
+    "elapsed_wall_seconds": 784,
+    "measurement": "First recorded resumption shell clock through collector; wall time includes queued CPU tests, not CPU usage.",
+    "exclusive_model_paths": [
+      "models/deepseek_v4_1_flash_a3_w8a8/weight_loader.py"
+    ],
+    "import_once": true,
+    "disposition": "CPU reviewfix complete; no native/fullweight/independent acceptance claim; writer stopped."
+  }
+]

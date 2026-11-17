@@ -1,0 +1,93 @@
+[
+  {
+    "tp": 1,
+    "ep": 2,
+    "exit": 0,
+    "stdout": "{\"tp\": 1, \"ep\": 2, \"all_ranks\": 2, \"checks\": \"contracts+independentNZ+offset+FP32scale+vocab/head/group+preflight+expertcoverage+lifetime\"}\n",
+    "stderr": ""
+  },
+  {
+    "tp": 2,
+    "ep": 2,
+    "exit": 0,
+    "stdout": "{\"tp\": 2, \"ep\": 2, \"all_ranks\": 2, \"checks\": \"contracts+independentNZ+offset+FP32scale+vocab/head/group+preflight+expertcoverage+lifetime\"}\n",
+    "stderr": ""
+  },
+  {
+    "tp": 1,
+    "ep": 4,
+    "exit": 0,
+    "stdout": "{\"tp\": 1, \"ep\": 4, \"all_ranks\": 4, \"checks\": \"contracts+independentNZ+offset+FP32scale+vocab/head/group+preflight+expertcoverage+lifetime\"}\n",
+    "stderr": ""
+  },
+  {
+    "tp": 2,
+    "ep": 4,
+    "exit": 0,
+    "stdout": "{\"tp\": 2, \"ep\": 4, \"all_ranks\": 4, \"checks\": \"contracts+independentNZ+offset+FP32scale+vocab/head/group+preflight+expertcoverage+lifetime\"}\n",
+    "stderr": ""
+  },
+  {
+    "tp": 4,
+    "ep": 4,
+    "exit": 0,
+    "stdout": "{\"tp\": 4, \"ep\": 4, \"all_ranks\": 4, \"checks\": \"contracts+independentNZ+offset+FP32scale+vocab/head/group+preflight+expertcoverage+lifetime\"}\n",
+    "stderr": ""
+  },
+  {
+    "tp": 1,
+    "ep": 8,
+    "exit": 0,
+    "stdout": "{\"tp\": 1, \"ep\": 8, \"all_ranks\": 8, \"checks\": \"contracts+independentNZ+offset+FP32scale+vocab/head/group+preflight+expertcoverage+lifetime\"}\n",
+    "stderr": ""
+  },
+  {
+    "tp": 2,
+    "ep": 8,
+    "exit": 0,
+    "stdout": "{\"tp\": 2, \"ep\": 8, \"all_ranks\": 8, \"checks\": \"contracts+independentNZ+offset+FP32scale+vocab/head/group+preflight+expertcoverage+lifetime\"}\n",
+    "stderr": ""
+  },
+  {
+    "tp": 4,
+    "ep": 8,
+    "exit": 0,
+    "stdout": "{\"tp\": 4, \"ep\": 8, \"all_ranks\": 8, \"checks\": \"contracts+independentNZ+offset+FP32scale+vocab/head/group+preflight+expertcoverage+lifetime\"}\n",
+    "stderr": ""
+  },
+  {
+    "tp": 8,
+    "ep": 8,
+    "exit": 0,
+    "stdout": "{\"tp\": 8, \"ep\": 8, \"all_ranks\": 8, \"checks\": \"contracts+independentNZ+offset+FP32scale+vocab/head/group+preflight+expertcoverage+lifetime\"}\n",
+    "stderr": ""
+  },
+  {
+    "tp": 1,
+    "ep": 16,
+    "exit": 0,
+    "stdout": "{\"tp\": 1, \"ep\": 16, \"all_ranks\": 16, \"checks\": \"contracts+independentNZ+offset+FP32scale+vocab/head/group+preflight+expertcoverage+lifetime\"}\n",
+    "stderr": ""
+  },
+  {
+    "tp": 2,
+    "ep": 16,
+    "exit": 0,
+    "stdout": "{\"tp\": 2, \"ep\": 16, \"all_ranks\": 16, \"checks\": \"contracts+independentNZ+offset+FP32scale+vocab/head/group+preflight+expertcoverage+lifetime\"}\n",
+    "stderr": ""
+  },
+  {
+    "tp": 4,
+    "ep": 16,
+    "exit": 0,
+    "stdout": "{\"tp\": 4, \"ep\": 16, \"all_ranks\": 16, \"checks\": \"contracts+independentNZ+offset+FP32scale+vocab/head/group+preflight+expertcoverage+lifetime\"}\n",
+    "stderr": ""
+  },
+  {
+    "tp": 8,
+    "ep": 16,
+    "exit": 0,
+    "stdout": "{\"tp\": 8, \"ep\": 16, \"all_ranks\": 16, \"checks\": \"contracts+independentNZ+offset+FP32scale+vocab/head/group+preflight+expertcoverage+lifetime\"}\n",
+    "stderr": ""
+  }
+]

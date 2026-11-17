@@ -1,0 +1,10 @@
+{
+  "role": "candidate",
+  "started_epoch": 1794075287.5094144,
+  "status": "RUN_RETURNED",
+  "passed": true,
+  "error": null,
+  "execution_time": 7.212690114974976,
+  "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_hc_durable_receipts_1794075226/compiled/candidate",
+  "ended_epoch": 1794075294.736852
+}

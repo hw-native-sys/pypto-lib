@@ -1,0 +1,9 @@
+{
+  "record_id": "main-exact-s32-integration-1794023355-1794024303",
+  "agent": "/root/main_native",
+  "start_epoch": 1794023355,
+  "end_epoch": 1794024303,
+  "elapsed_wall_seconds": 948,
+  "basis": "actual unit start through final seal, wall includes queued CPU/review",
+  "status": "PARKED"
+}

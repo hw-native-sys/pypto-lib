@@ -1,0 +1,23 @@
+{
+  "epoch": 1794075083.5429945,
+  "unchanged_math_and_fixture_functions": [
+    "bitwise",
+    "compile_only",
+    "cpu_check",
+    "fixtures",
+    "function",
+    "load_module",
+    "old_or_new_golden",
+    "original_expected",
+    "sha",
+    "verify_sources",
+    "write"
+  ],
+  "all_acceptance_asserts_AST_unchanged": true,
+  "compiled_original140_files_unchanged": true,
+  "signature_recompile": false,
+  "current45_verified": 45,
+  "current45_sha256": "b3e19fd001c74f7a5b497c791c01924ca09c0678df66114fce599e890d8fee06",
+  "corrected_probe_sha256": "6d7d3a3b0f9143c4add4a950667d33c4afc5c7e1ea2832171ac5ce5d4e044030",
+  "receipt_store_sha256": "d0b281499e0e93ccd70cf3f95bfc7683a2dd44d59bb8b086ee848534c7e4fb1c"
+}

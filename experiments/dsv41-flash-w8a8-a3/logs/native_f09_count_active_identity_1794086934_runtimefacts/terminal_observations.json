@@ -1,0 +1,28 @@
+{
+  "observed_epoch": 1794088180.5817244,
+  "known_births": [
+    {
+      "source": "launcher_birth.json",
+      "identity": {
+        "pid": 1633261,
+        "starttick": "108801825"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "source": "stage_birth.json",
+      "identity": {
+        "pid": 1633317,
+        "starttick": "108801924"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    }
+  ],
+  "raw16_release": "observed client task054811 reported release0..15; queued rawlog capture follows",
+  "historical_worker_startticks": "UNKNOWN; not captured before fast terminal",
+  "new_helper_native_prepare_pass": true,
+  "count_captures_exists": false,
+  "callable_image_free_lines": 16
+}

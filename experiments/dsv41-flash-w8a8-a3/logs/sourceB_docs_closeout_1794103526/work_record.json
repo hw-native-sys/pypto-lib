@@ -1,0 +1,27 @@
+{
+  "record_id": "main-sourceB-docs-closeout-1794103526",
+  "role": "main-agent",
+  "start_epoch": 1794103526.231587,
+  "end_epoch": 1794103604.3917475,
+  "measured_wall_seconds": 78.16016054153442,
+  "scope": "DOCS_ONLY",
+  "shared_doc_writes": [
+    "MODULES.md",
+    "INTERFACE.md",
+    "HANDOFF.md"
+  ],
+  "lock": ".coordination.lock/flock",
+  "TIME_LOG_append_once": true,
+  "Root_TASKS_STATE_writes": 0,
+  "product_edits": 0,
+  "tests": 0,
+  "CPU_jobs": 0,
+  "NPU_jobs": 0,
+  "header_reads": 0,
+  "tensor_payload_bytes": 0,
+  "source45_sha256": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+  "worker_records_imported": 0,
+  "Root_disposition_sha256": "c57a0f21a42d7c0ff39d8188eb92b15f7091a4ce51a073af28e185a57af6b298",
+  "owner_final_seal_status_at_update": "PENDING",
+  "status": "FINAL_PARK"
+}

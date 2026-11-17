@@ -1,0 +1,10 @@
+{
+  "pipeline_contract.h": {
+    "source": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/src/common/worker/pipeline_contract.h",
+    "sha256": "35a993f57176909b03572c68b91f517fb729c8e3b31d374bfd315a518fe888e2"
+  },
+  "runtime_c_api.h": {
+    "source": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/src/common/worker/runtime_c_api.h",
+    "sha256": "6c073459302558438ba76f3690f470ae6fe4a4d80d2b3af88994ce5704b5d55e"
+  }
+}

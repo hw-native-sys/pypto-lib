@@ -1,0 +1,18 @@
+{
+  "Main": [
+    "models/deepseek_v4_1_flash_a3_w8a8/generate.py",
+    "ownunit host integration/metadata/admission/docs"
+  ],
+  "prompt_cases": [
+    "worker_cases/** only"
+  ],
+  "protected": [
+    "44otherA3files initially",
+    "A5",
+    "kernels/goldens/math/tolerances",
+    "old sealed artifacts",
+    "runtime/deps",
+    "checkpoint weights",
+    "tests/contract"
+  ]
+}

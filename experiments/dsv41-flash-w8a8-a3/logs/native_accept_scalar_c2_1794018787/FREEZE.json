@@ -1,0 +1,23 @@
+{
+  "epoch": 1794018682,
+  "source_manifest_sha256": "ab1ced6d6ecbf9887297458703ba9b74e2c9b8bc57608370b4c2e0310e027e37",
+  "artifact_manifest_sha256": "63f32ae5ba9ca9986f8ce77c0c2c577aba41b3c08239b57fb07c1e48c8432c5e",
+  "source_count": 45,
+  "source_changes": [
+    "compressor.py",
+    "generate.py",
+    "weight_loader.py"
+  ],
+  "unchanged_count": 42,
+  "artifact_count": 2792,
+  "writers": "Main and both workers PARKED",
+  "jobs": "all27 recorded tasks COMPLETE; two own failed chain jobs terminatedexit130",
+  "source_hashes": {
+    "models/deepseek_v4_1_flash_a3_w8a8/compressor.py": "5575fea0bb02a73ebd58dbabd2a9f0a9fe71c53510b15f22c8d05687d8f48031",
+    "models/deepseek_v4_1_flash_a3_w8a8/generate.py": "26b6db8451afa4488bff71699b94b7ffcf86abcec08e2919912e388fa904c8fd",
+    "models/deepseek_v4_1_flash_a3_w8a8/weight_loader.py": "70244d047e4705dfe5f7101c5dc046b6f66d146027241524bb4d494823fcfe5f"
+  },
+  "self_validation": "native uninstrumenteddecode24PASS, scalarandstream3callPASS; prefix128/continuationBLOCKED; independentacceptancePENDING",
+  "next_owner": "observer-assigned independent sibling reviewer; no Main jobs/edits until nextscope",
+  "fullweights": "HELD"
+}

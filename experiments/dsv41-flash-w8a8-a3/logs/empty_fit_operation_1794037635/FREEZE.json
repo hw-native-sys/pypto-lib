@@ -1,0 +1,21 @@
+{
+  "epoch": 1794039332,
+  "status": "PARKED empty-operation CPUprepared;independentacceptancepending",
+  "product45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "product45_unchanged": true,
+  "old31_and_postguard48_unchanged": true,
+  "adapter_sha256": "8d3ad68504cef4f0527594a37daa9dd8ef90041c0b56b8e199af30c99a5b83aa",
+  "sources_sha256": "16a6db8a0bfd8a3fc26fec0a3f95ae051423342103dc2c2f9bfaf959813280a8",
+  "artifact_receipt_sha256": "c2cc6c2b1db13a67e202b160e4abd4c1434a9fe9f6825be9e1e629f05234fe2f",
+  "artifacts_sha256": "f55ce7d59678f0977d466e673e3c0ad0429b5c26cdddf6253bf059cb9630c556",
+  "artifact_files": 478,
+  "all_5_CPU_jobs_terminal0": true,
+  "workers": 0,
+  "NPU": 0,
+  "real_allocations": 0,
+  "real_payload_reads": 0,
+  "forward_calls": 0,
+  "actual_calibration_receipt_supplied": false,
+  "actual_authorization_supplied": false,
+  "work_record": "main-empty-operation-1794037635-1794039332"
+}

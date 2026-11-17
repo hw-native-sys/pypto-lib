@@ -1,0 +1,13 @@
+{
+  "epoch": 1794020601,
+  "source_manifest_sha256": "ab1ced6d6ecbf9887297458703ba9b74e2c9b8bc57608370b4c2e0310e027e37",
+  "artifact_manifest_sha256": "506566ed24dd13fdb87168fdf0eb77997ae189586e46eae3253da800f8486e71",
+  "artifacts": 11,
+  "source45": "unchanged",
+  "own_jobs": "twoCPUjobscompletedexit0",
+  "NPU": 0,
+  "payload_reads": 0,
+  "workers": 0,
+  "result": "no forwardedpublicPyPTOadmissionknob; actualfrozenHOST1chipcall/rankperinvocation",
+  "status": "PARKED"
+}

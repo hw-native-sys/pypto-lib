@@ -1,0 +1,16 @@
+{
+  "owner": "/root/reviewer_f09",
+  "unit": "independent_configurable_cli_fix_1794112381",
+  "status": "FINAL_CPU_READY_PARK",
+  "start_utc": "2026-11-08T04:33:01+00:00",
+  "end_utc": "2026-11-08T04:35:25.323580+00:00",
+  "elapsed_seconds": 144.32358,
+  "CPU_jobs": 1,
+  "CPU_task": "task_20261108_123413_141037114404",
+  "NPU_jobs": 0,
+  "shared_writes": 0,
+  "product_writes": 0,
+  "old_artifact_writes": 0,
+  "unique_to_Root_import": true,
+  "jobs_active": 0
+}

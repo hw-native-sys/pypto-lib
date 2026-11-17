@@ -1,0 +1,8 @@
+{
+  "input_preparation": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_bf16_boundary_validation_1794072636",
+  "input_manifest_sha256": "7546c8fa98d4a5c09313b35e8b612de106d276b5aae1ec8f1e16454136e54093",
+  "failed_native_case": "native_hc_bf16_boundary_1794073797",
+  "failed_native_manifest_sha256": "31731a5902348a664cb4c07dcfa9374770334f73ee99b166c383c698d5ebf794",
+  "input_probe_sha256": "c6899e05f3574ddb25d51264a0f37f7ab9a6cdebde4b5e32b90de830e54098f6",
+  "source_compiled_reuse": "byte-identical snapshots; no signature recompile"
+}

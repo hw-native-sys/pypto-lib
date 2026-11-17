@@ -1,0 +1,35 @@
+{
+  "variant": "OLD_BASELINE_FALSE_PASS_REPRO",
+  "cases": [
+    {
+      "case": "old_largest_false_PASS",
+      "rejected": false,
+      "status": "EMPTY_ALLOCATIONS_PASS",
+      "primary_error": null,
+      "cleanup_errors": [],
+      "created": 16,
+      "free_attempts": 16,
+      "normal_close": true,
+      "bad_rank": 15,
+      "after_last_free": 50,
+      "reserve": 100
+    },
+    {
+      "case": "old_final_57th_false_PASS",
+      "rejected": false,
+      "status": "EMPTY_ALLOCATIONS_PASS",
+      "primary_error": null,
+      "cleanup_errors": [],
+      "created": 912,
+      "free_attempts": 912,
+      "normal_close": true,
+      "bad_rank": 15,
+      "after_last_free": 80,
+      "reserve": 100
+    }
+  ],
+  "scope": "tiny Python integer fake only;57 resources of8bytes/rank;NO real tensor/device/allocator owner",
+  "actual_device_allocations": 0,
+  "tensor_payload_reads": 0,
+  "compute_dispatches": 0
+}

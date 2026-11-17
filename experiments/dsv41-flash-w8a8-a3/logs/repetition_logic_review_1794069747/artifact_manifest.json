@@ -1,0 +1,46 @@
+{
+  "created_epoch": 1794069995,
+  "files": [
+    {
+      "path": "REPORT.md",
+      "bytes": 11168,
+      "sha256": "dfc5ba0c508f63ae22e289cca5fdf0faeb32576e614a0c301bd1d90283a0737b"
+    },
+    {
+      "path": "evidence.json",
+      "bytes": 12432,
+      "sha256": "003dfc927db0b8a50298e43aa1ba62f8b8f834fbfc73ef05af040f8b48a035df"
+    },
+    {
+      "path": "hc_boundary_probe.py",
+      "bytes": 3025,
+      "sha256": "1b6b910775cb0542f5986ffa113c3b7adc4adc602bf82e4809de918cdee08dd8"
+    },
+    {
+      "path": "hc_boundary_result.json",
+      "bytes": 1823,
+      "sha256": "95988e0c96867c626eca7891b9cacd78fc946f2bd114329d3765a1a1bafb8d9a"
+    },
+    {
+      "path": "run_hc_boundary.sh",
+      "bytes": 248,
+      "sha256": "0e69568233e4ef8f9e29dc7de7eaac51902d26cd23c3331dde1b73e452c653bc"
+    },
+    {
+      "path": "source_manifest.json",
+      "bytes": 1536,
+      "sha256": "7460d69e7b6e822dd724514c4c892107c6547183f4954571a0984e1c1462782e"
+    },
+    {
+      "path": "task_submit.log",
+      "bytes": 2407,
+      "sha256": "9b9d64e505d6c8267a59e5911cdeb219d8a0fadd08f701b9b588f4a980a65cfd"
+    },
+    {
+      "path": "work_record.json",
+      "bytes": 943,
+      "sha256": "5bf2e6c173c92fb46cf88de6a69e96c09c8a08151a54e6e788e28a34de84b159"
+    }
+  ],
+  "excludes": "artifact_manifest.json and PARK.json (seal metadata)"
+}

@@ -1,0 +1,242 @@
+{
+  "status": "AUDIT_COMPLETE_NATIVE_CASE_FAILED",
+  "checks": [
+    {
+      "check": "same-native-queue-COMPLETE0",
+      "pass": false,
+      "detail": "completed (exit=1)\n"
+    },
+    {
+      "check": "native-numeric-and-normal-close",
+      "pass": false,
+      "detail": {
+        "status": "FAIL",
+        "first": "ValueError('StackedDeviceTensor only supports whole-shard slicing on the leading dim; got partial slice 0 on axis 1 (shard shape (1, 128, 128))')",
+        "cleanup": null
+      }
+    },
+    {
+      "check": "exact-new-Root-tiny-only-scope",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "actual-ordered-two-mapping",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "grant-created-after-allocation-entryTTL",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "exact-auth-byte-source-binding",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "frozen-prep79-unchanged",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "native-dependency-code-identity",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "task-entry-and-runtime-pins",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "installed-runtime-source-library-unchanged",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "all45-current-CC-source-unchanged",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "actual-pinned-TMR-library-contract",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "actual-normalized-ONBOARD-four-GiB-config",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "both-actual-allocated-a2a3-TMR-programs",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "all-native-generated-artifact-bytes",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "all-elements-positive-actual-state-continuation-6-12-19-27",
+      "pass": false,
+      "detail": null
+    },
+    {
+      "check": "honest-positive-and-extra-negative-call-counts",
+      "pass": false,
+      "detail": null
+    },
+    {
+      "check": "legal-wrong-C1-NUMERICAL-reject-11-not12",
+      "pass": false,
+      "detail": null
+    },
+    {
+      "check": "same-actual-worker-and-selected-p-d-d-d-plus-negative",
+      "pass": false,
+      "detail": null
+    },
+    {
+      "check": "every-actual-call-public-normalized-config",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "one-canonical-static-initialization",
+      "pass": false,
+      "detail": null
+    },
+    {
+      "check": "zero-decode-static-read-copy-allocation",
+      "pass": false,
+      "detail": null
+    },
+    {
+      "check": "four-canonical-bases-free-once",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "durable-canonical-versus-borrowed-coverage",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "all-four-full-byte-same-address-views",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "both-C1-singleton-insert-views",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "actual-public-preweight-dispatch-and-free-memory-boundaries",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "positive-live-public-HBM-floors",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "baseline_capacity-actual-resource-floors",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "after_close_capacity-actual-resource-floors",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "all-recorded-own-process-births-absent",
+      "pass": true,
+      "detail": []
+    },
+    {
+      "check": "raw-actual-two-lock-release",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "fresh-queue0-no-running-or-pending",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "preserved-partial-prefill6-no-decode-no-negative-pass",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "exact-first-HOST-slice-error-normalcleanup",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "check": "actual-canonical-initialization-completed-before-failure",
+      "pass": true,
+      "detail": null
+    }
+  ],
+  "passed": 28,
+  "failed": [
+    {
+      "check": "same-native-queue-COMPLETE0",
+      "pass": false,
+      "detail": "completed (exit=1)\n"
+    },
+    {
+      "check": "native-numeric-and-normal-close",
+      "pass": false,
+      "detail": {
+        "status": "FAIL",
+        "first": "ValueError('StackedDeviceTensor only supports whole-shard slicing on the leading dim; got partial slice 0 on axis 1 (shard shape (1, 128, 128))')",
+        "cleanup": null
+      }
+    },
+    {
+      "check": "all-elements-positive-actual-state-continuation-6-12-19-27",
+      "pass": false,
+      "detail": null
+    },
+    {
+      "check": "honest-positive-and-extra-negative-call-counts",
+      "pass": false,
+      "detail": null
+    },
+    {
+      "check": "legal-wrong-C1-NUMERICAL-reject-11-not12",
+      "pass": false,
+      "detail": null
+    },
+    {
+      "check": "same-actual-worker-and-selected-p-d-d-d-plus-negative",
+      "pass": false,
+      "detail": null
+    },
+    {
+      "check": "one-canonical-static-initialization",
+      "pass": false,
+      "detail": null
+    },
+    {
+      "check": "zero-decode-static-read-copy-allocation",
+      "pass": false,
+      "detail": null
+    }
+  ],
+  "result_sha256": "e405b7e24f67657a9e2fe7f9d5f4621a387296b3c9dcc4d188cbb152f1f736a4",
+  "recorded_identity_count": 4,
+  "native_task": "task_20261108_012738_330997124898",
+  "scope": "tiny actual-class plus explicit toy admission/schema only; no fullmodel/realweights/HC/F09 proof",
+  "own_pid": 3320662,
+  "own_starttick": "107259793"
+}

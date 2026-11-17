@@ -1,0 +1,8 @@
+{
+  "status": "FINAL_FAILED_PARK",
+  "files": 10,
+  "manifest_sha256": "6a2f76ecce7ac37df860923e573cfb008b78ce385a77048aa590c74db592cf0d",
+  "receipt_sha256": "810d52a623231a1a2cca13eb6ff7d46e2dc1a218828f5af12d901e9fc8318f13",
+  "shared_writes": 0,
+  "active_jobs": 0
+}

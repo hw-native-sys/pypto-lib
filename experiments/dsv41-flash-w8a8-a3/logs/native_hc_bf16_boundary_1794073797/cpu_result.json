@@ -1,0 +1,62 @@
+{
+  "status": "PASS",
+  "started_epoch": 1794072761.945278,
+  "ended_epoch": 1794072762.0108483,
+  "torch": "2.14.1+cpu",
+  "shape": [
+    5,
+    4,
+    5120
+  ],
+  "cases": [
+    {
+      "row": 0,
+      "old_bad": 15360,
+      "candidate_bad": 0,
+      "old_nonrepresentable": 15360,
+      "max_abs_old": 0.00390625
+    },
+    {
+      "row": 1,
+      "old_bad": 20480,
+      "candidate_bad": 0,
+      "old_nonrepresentable": 20480,
+      "max_abs_old": 0.00390625
+    },
+    {
+      "row": 2,
+      "old_bad": 20480,
+      "candidate_bad": 0,
+      "old_nonrepresentable": 20480,
+      "max_abs_old": 0.0039052963256835938
+    },
+    {
+      "row": 3,
+      "old_bad": 5120,
+      "candidate_bad": 0,
+      "old_nonrepresentable": 5120,
+      "max_abs_old": 0.00390625
+    },
+    {
+      "row": 4,
+      "old_bad": 0,
+      "candidate_bad": 0,
+      "old_nonrepresentable": 0,
+      "max_abs_old": 0.0
+    }
+  ],
+  "changed_functions_only": [
+    "hc_post",
+    "golden_hc_post"
+  ],
+  "actual_proposed_layer_matches_original": true,
+  "kernel_final_cast_calls": [
+    "pl.cast(value, target_type=pl.BF16, mode='rint')",
+    "pl.cast(rounded_bf16, target_type=pl.FP32)"
+  ],
+  "old_control_rejected": true,
+  "trunc_control_bad": 30720,
+  "away_control_bad": 15360,
+  "new_BF16_representable": true,
+  "NPU_execution": false
+}

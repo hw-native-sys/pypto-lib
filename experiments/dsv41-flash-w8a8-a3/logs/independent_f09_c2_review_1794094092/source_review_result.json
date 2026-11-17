@@ -1,0 +1,95 @@
+{
+  "schema": "F09-independent-C2-source-review/1",
+  "status": "PASS_SOURCE_ONLY_NOT_RUNTIME_OR_NUMERICAL",
+  "Main_manifest_sha256": "64bb4e1b837faa8cf607b5b6cc66621b58975582eddd1489888782c74835ff5b",
+  "Main_verified_files": 462,
+  "source_manifest_sha256": "8153c7f040bef51900a6e6c9ff27b018279b7503f31d50ec5488457e49770b28",
+  "parent_source_manifest_sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "adapter_sha256": "50d11ffed9f2dba5fedbe73c6c3040e5e943ee29ff15052bc907514460c32c04",
+  "route_sha256": "9057c519fb056e1ca48cc736044748d79db9a4c03c88a2d0c245870a7e120faf",
+  "lifecycle_sha256": "ee648c64b8477cc98b2f3083a6b16c9b6b92cc4612cc3228391dbe53aef1858d",
+  "oracle_integrity_sha256": "e45c7529d6c34cd57712a7d346ec612641896e38ab98ff88017ceafd87d999d3",
+  "full_compiled_file_manifest": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/decode_capacity2_files.json",
+  "full_compiled_file_manifest_sha256": "510dd3c7b72a1c36291ff8ff0b167ce0ac8204d2cd6a957eae0a8ea6641f8642",
+  "full_compiled_origin": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/build/decode_capacity2",
+  "full_compiled_metadata_sha256": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770",
+  "case_sha256": "e9f9cac097e4e1a33b445e7ece0e6d49472b553c71f573a39f1637aa80c05b20",
+  "launcher_sha256": "d5e82b054e51b6cec4e3fad70bd17b13b81510bc07569a695f069758956ab404",
+  "case_pins_sha256": "7a2038e79d439d490cdc380dfbd9170a935914c222038648256882a35d9417b2",
+  "model_files_changed_relative_parent": [
+    "models/deepseek_v4_1_flash_a3_w8a8/compressor.py"
+  ],
+  "other_model_files_unchanged": 44,
+  "compressor_only_two_active_bounds": true,
+  "golden_and_original171_AST_unchanged": true,
+  "unchanged_adapter_API_functions_AST": [
+    "save_nonstatic",
+    "checked_program",
+    "planning_reserve",
+    "artifact_binding",
+    "fixture_factory",
+    "validate",
+    "unconditioned_gates",
+    "verdict_group"
+  ],
+  "helper_bytes_and_public_clone_prepare_cleanup_API_unchanged": true,
+  "statewriter": {
+    "func_id": 59,
+    "Task": 70,
+    "runtime_active_scalar": "num_tokens",
+    "pool_dependency_preserved": true,
+    "kv_score_input_edges_preserved": true,
+    "pool_has_minimum_one_worker_zeroactive": true,
+    "writer_submitted_outside_active_predicate": true,
+    "physical_positive_projection_anchors_unchanged": true,
+    "all_registered_variants": [
+      "c2a_state_write"
+    ],
+    "no_C2B_suffixed_registered_variant": true,
+    "generated_cpp_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/build/decode_capacity2/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp",
+    "generated_cpp_sha256": "9aa390d42d9a87a6c570e789607ddfe0ab34857cffc3e928d6931789d983177d",
+    "runtime_graph_or_chip_liveness_proven": false
+  },
+  "capture": {
+    "actual_post_saved_before_retention": true,
+    "pending_record_before_retention": true,
+    "failure_keeps_post_payload_and_FAIL_receipt": true,
+    "durable_vs_validated_vs_outer_records_separate": true,
+    "CPU_requires_three_PASS_records": true,
+    "ownership_shape_dtype_exact_byte_semantics": true,
+    "numeric171_tolerances_changed": false
+  },
+  "Main_evidence_reused_without_test": {
+    "task": "task_20261108_071536_1890249939",
+    "host_results_sha256": "4eed7a9b561be69c50e4b62a70aad5c6f4600c09e7a3b7fed330e073db0f627c",
+    "results_sha256": "d3ece620e2a7a8b386312f0df8e057195b71c288af0d10aad5c248e863198c82",
+    "compile_seconds": 45.014118909835815,
+    "not_independent_execution": true
+  },
+  "prior_actual_public_prepare_interface_fact": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_full_capture_reserve_1794091408/work/artifact_after_prepare.json",
+    "sha256": "f23c2641450cb81467c360be560ea64da0f980082da22b49b7fd17dfdde741e8",
+    "source": "PARENT405",
+    "registered_rows": 119,
+    "unique_objects_cache": 116,
+    "orchestrations": 1,
+    "scope": "unchanged helper/API ancestry only, not new8153 prepare/dispatch/math"
+  },
+  "count_proofs": {
+    "source": "PARENT405",
+    "profile_lineage_sha256": "eb49d040752cf0d453447b9fa680defd4cccd7824341e239d4f3ae14593f5027",
+    "no_recompile_or_relabel": true,
+    "new_route_full_only": true
+  },
+  "failed065800_retained_failed": true,
+  "saved_before_finite_carry_audit_manifest": "957ad51f31c7847de34cd6fa7d00980cc3e5e0c97fc055e232f61798e5748791",
+  "postcall1_actual_bytes": "LOST; no reconstructed mutation detail",
+  "new_candidate_actual_public_prepare_executed": false,
+  "new_candidate_actual_threecall_or171_executed": false,
+  "old_e76_wrapper_invalid_for_new_source": true,
+  "new_Root_lifecycle_wrapper": "PENDING_REQUIRED_BEFORE_ANY_CPU_PREQUEUE",
+  "valid_grants": 0,
+  "source_review_CPU_test_or_import_or_compile_or_prepare_NPU": 0,
+  "shared_writes": 0,
+  "created_epoch": 1794094092.9251423
+}

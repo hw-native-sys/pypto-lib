@@ -1,0 +1,16 @@
+{
+  "status": "FINAL/SEALED/PARK",
+  "case_outcome": "NOT_ACCEPTED_STRICT_TELEMETRY",
+  "native_job": "task_20261108_030353_356363116294",
+  "native_exit_code": 1,
+  "CLI_exit_code": 0,
+  "audit_passed": 4504,
+  "audit_unmet": 5,
+  "artifact_count": 41,
+  "artifact_manifest_sha256": "5bbea517098f0a8b57c940263ea1fa71272060918472e12788895c672060788e",
+  "source45_sha256": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "audit_manifest_sha256": "73055a54a2b6d6841898b7f4417c4aa7c8aa31ceab444ac43ee99967bcec3702",
+  "all_own_jobs_terminal": true,
+  "no_source_changes": true,
+  "end_epoch": 1794080995
+}

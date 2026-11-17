@@ -1,0 +1,379 @@
+
+FILE models/deepseek_v4_1_flash_a3_w8a8/compressor.py:89-162
+SHA256 94373976e138a7d92112397d30fd779872897eecf9885a2c4695d84db6ecc57b
+89:     """Pool consecutive row pairs per request and carry the trailing projection.
+90: 
+91:     ``state_cache[block, position % 2, :]`` holds the ``(kv, score)``
+92:     projections of the request's most recent token, so a chunk can start on an
+93:     odd position.  The state is written after every pooling read completes.
+94:     """
+95:     t_dim = pl.tensor.dim(x, 0)
+96:     kv_proj = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.FP32)
+97:     score_proj = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.FP32)
+98:     bf16_project(x, wkv, kv_proj, width=D, output_width=HEAD_DIM, output_fp32=True)
+99:     bf16_project(x, wgate, score_proj, width=D, output_width=HEAD_DIM, output_fp32=True)
+100:     latent = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.BF16)
+101:     blocks = pl.tensor.dim(state_cache, 0)
+102:     flat = pl.reshape(state_cache, [blocks * STATE_CAPACITY, STATE_WIDTH])
+103:     tokens = pl.tensor.dim(x, 0)
+104:     workers = pl.max(1, pl.min(num_tokens, POOL_WORKERS))
+105:     step = workers
+106:     with pl.spmd(workers, name_hint="c2a_pair_pool") as pool_tid:
+107:         worker = pl.tile.get_block_idx()
+108:         for token in pl.range(worker, num_tokens, step):
+109:             position = pl.read(position_ids, [token])
+110:             if position % 2 == 1:
+111:                 request = pl.cast(pl.read(request_ids, [token]), pl.INDEX)
+112:                 block = pl.cast(pl.read(state_block_table, [request, 0]), pl.INDEX)
+113:                 current_kv = kv_proj[token : token + 1, 0:HEAD_DIM]
+114:                 current_score = score_proj[token : token + 1, 0:HEAD_DIM]
+115:                 at_chunk_start = pl.cast(0, pl.INT32)
+116:                 if token == 0:
+117:                     at_chunk_start = pl.cast(1, pl.INT32)
+118:                 else:
+119:                     if pl.read(request_ids, [token - 1]) != pl.read(request_ids, [token]):
+120:                         at_chunk_start = pl.cast(1, pl.INT32)
+121:                 if at_chunk_start == 1:
+122:                     slot = block * STATE_CAPACITY + (position - 1) % STATE_CAPACITY
+123:                     previous_kv = flat[slot : slot + 1, 0:HEAD_DIM]
+124:                     previous_score = flat[slot : slot + 1, HEAD_DIM:STATE_WIDTH]
+125:                 else:
+126:                     previous_kv = kv_proj[token - 1 : token, 0:HEAD_DIM]
+127:                     previous_score = score_proj[token - 1 : token, 0:HEAD_DIM]
+128:                 highest = pl.maximum(previous_score, current_score)
+129:                 previous_weight = pl.exp(pl.sub(previous_score, highest))
+130:                 current_weight = pl.exp(pl.sub(current_score, highest))
+131:                 weighted = pl.add(
+132:                     pl.mul(previous_kv, previous_weight),
+133:                     pl.mul(current_kv, current_weight),
+134:                 )
+135:                 pooled = pl.div(weighted, pl.add(previous_weight, current_weight))
+136:                 latent[token : token + 1, 0:HEAD_DIM] = pl.cast(pooled, target_type=pl.BF16, mode="rint")
+137:     # One writer: a per-worker round-robin store can drop an even-position
+138:     # token's final state row when that worker's pool body is empty, so the
+139:     # single-instance loop writes every row after the pool dependency.
+140:     with pl.at(level=pl.Level.CORE_GROUP, name_hint="c2a_state_write", deps=[pool_tid]) as state_tid:
+141:         # Read anchors: order the state write after the projection writes even
+142:         # when the token's pool path was skipped (even position), which would
+143:         # otherwise let the composed scheduler store zeros for that slot.
+144:         _kv_anchor = pl.read(kv_proj, [0, 0])
+145:         _score_anchor = pl.read(score_proj, [0, 0])
+146:         for token in pl.range(tokens):
+147:             position = pl.read(position_ids, [token])
+148:             last_of_request = pl.cast(0, pl.INT32)
+149:             if token + 1 == tokens:
+150:                 last_of_request = pl.cast(1, pl.INT32)
+151:             else:
+152:                 if pl.read(request_ids, [token + 1]) != pl.read(request_ids, [token]):
+153:                     last_of_request = pl.cast(1, pl.INT32)
+154:             if last_of_request == 1:
+155:                 if position >= 0:
+156:                     request = pl.cast(pl.read(request_ids, [token]), pl.INDEX)
+157:                     block = pl.cast(pl.read(state_block_table, [request, 0]), pl.INDEX)
+158:                     slot = block * STATE_CAPACITY + position % STATE_CAPACITY
+159:                     flat[slot : slot + 1, 0:HEAD_DIM] = kv_proj[token : token + 1, 0:HEAD_DIM]
+160:                     flat[slot : slot + 1, HEAD_DIM:STATE_WIDTH] = score_proj[token : token + 1, 0:HEAD_DIM]
+161:     output = rms_norm(latent, norm_w, output, width=HEAD_DIM, output_fp32=False, column_tile=256)
+162:     return output
+
+FILE models/deepseek_v4_1_flash_a3_w8a8/indexer.py:227-300
+SHA256 7cdb9b5b421dac20b46679f1b917055d01e8c38d8201dff66158546d4d22f1c7
+227: def select_candidate_block_pool(
+228:     scores: pl.Tensor,
+229:     compressed_lens: pl.Tensor,
+230:     pool_ids: pl.Tensor,
+231:     pool_counts: pl.Tensor,
+232:     width: pl.Scalar[pl.INT32],
+233:     rows: pl.Scalar[pl.INT32],
+234:     topk_blocks: pl.constexpr,
+235:     block_size: pl.constexpr,
+236:     ready: pl.Scalar[pl.TASK_ID],
+237: ):
+238:     """Select the highest logical block maxima (diagnostic candidate set).
+239: 
+240:     ``width`` is the score width passed in by the caller.  Reading it back with
+241:     ``pl.tensor.dim(scores, 1)`` loses the value when the scores buffer is a
+242:     chain-local ``create_tensor`` inside the composed fwd program (the
+243:     publisher then publishes zero blocks); the caller's score-width scalar is
+244:     a host-derived runtime value and stays valid at every inline depth.
+245:     """
+246:     t_dim = pl.cast(rows, pl.INDEX)
+247:     block_width = (width + block_size - 1) // block_size
+248:     arena = pl.create_tensor([t_dim, ARENA_WIDTH], dtype=pl.FP32)
+249:     with pl.spmd(t_dim, name_hint="index_block_pool", deps=[ready]) as selected_tid:
+250:         token = pl.tile.get_block_idx()
+251:         visible = pl.min(pl.max(pl.read(compressed_lens, [token]), 0), width)
+252:         visible_blocks = (visible + block_size - 1) // block_size
+253:         leaf_count = (visible_blocks + BLOCK_LEAF - 1) // BLOCK_LEAF
+254:         for leaf in pl.range(leaf_count):
+255:             begin = leaf * BLOCK_LEAF
+256:             valid_blocks = pl.min(BLOCK_LEAF, visible_blocks - begin)
+257:             maxima = pl.tile.full([1, BLOCK_LEAF], dtype=pl.FP32, value=-MASK_FLOOR)
+258:             for block_tile in pl.range(0, valid_blocks, 64):
+259:                 count = pl.min(64, valid_blocks - block_tile)
+260:                 position = (begin + block_tile) * block_size
+261:                 valid_positions = pl.min(count * block_size, pl.max(visible - position, 0))
+262:                 raw = pl.load(scores, [token, position], [1, 64 * block_size], valid_shape=[1, valid_positions])
+263:                 grouped = pl.reshape(pl.tile.fillpad(raw, pad_value=pl.PadValue.min), [64, block_size])
+264:                 reduce_tmp = pl.create_tile([64, block_size], dtype=pl.FP32)
+265:                 reduced = pl.reshape(pl.row_max(grouped, tmp_tile=reduce_tmp), [1, 64])
+266:                 maxima[0 : 1, block_tile : block_tile + 64] = pl.set_validshape(reduced, 1, count)
+267:             if leaf == (visible_blocks - 1) // BLOCK_LEAF:
+268:                 pl.tile.write(maxima, [0, visible_blocks - 1 - begin], MASK_FLOOR)
+269:             lane_ids = pl.tile.arange(0, [1, BLOCK_LEAF], dtype=pl.INT32)
+270:             lane_ids = pl.add(lane_ids, pl.cast(begin, pl.INT32))
+271:             pairs = pl.tile.sort32(maxima, pl.reinterpret_view(lane_ids, pl.UINT32))
+272:             pairs = pl.tile.mrgsort(pairs, block_len=64)
+273:             pairs = pl.tile.mrgsort(pairs, block_len=256)
+274:             leaf_pairs = pl.tile.assemble(
+275:                 pl.tile.full([1, ARENA_WIDTH], dtype=pl.FP32, value=-MASK_FLOOR),
+276:                 pl.tile.slice(pairs, [1, 2 * BLOCK_LEAF], [0, 0]),
+277:                 [0, 0],
+278:             )
+279:             if leaf == 0:
+280:                 pl.store(leaf_pairs, [token, 0], arena)
+281:             else:
+282:                 running = pl.load(arena, [token, 0], [1, ARENA_WIDTH])
+283:                 temporary = pl.tile.create([1, 2 * ARENA_WIDTH], dtype=pl.FP32)
+284:                 merged = pl.tile.mrgsort(running, leaf_pairs, tmp=temporary)
+285:                 pl.store(pl.tile.slice(merged, [1, ARENA_WIDTH], [0, 0]), [token, 0], arena)
+286:         selected_count = pl.min(pl.min(visible_blocks, topk_blocks), block_width)
+287:         selected_ids = pl.tile.full([1, topk_blocks], dtype=pl.INT32, value=-1)
+288:         if selected_count > 0:
+289:             root = pl.load(arena, [token, 0], [1, ARENA_WIDTH])
+290:             selected = pl.tile.gather_mask(root, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+291:             for position in pl.range(selected_count):
+292:                 pl.tile.write(selected_ids, [0, position], pl.tile.read(selected, [0, position]))
+293:         pl.store(selected_ids, [token, 0], pool_ids)
+294:     with pl.at(level=pl.Level.CORE_GROUP, name_hint="index_pool_counts", deps=[selected_tid]) as counts_tid:
+295:         for publish_token in pl.range(t_dim):
+296:             publish_visible = pl.min(pl.max(pl.read(compressed_lens, [publish_token]), 0), width)
+297:             publish_blocks = (publish_visible + block_size - 1) // block_size
+298:             published = pl.min(pl.min(publish_blocks, topk_blocks), block_width)
+299:             pl.write(pool_counts, [publish_token], pl.cast(published, pl.INT32))
+300:     return pool_ids, pool_counts, counts_tid
+
+FILE models/deepseek_v4_1_flash_a3_w8a8/decode_c2a_full.py:130-175
+SHA256 5ea2b9183532cef16e6d6ea0b0ea1d30a7b14ff917558fc7e71f5f91dbec16cf
+130:     latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+131:     latent_out = c2a_compressor(
+132:         x, compressor_wkv, compressor_wgate, compressor_norm, position_ids,
+133:         request_ids, state_block_table, state_cache, latent, num_tokens,
+134:     )
+135:     latent_snapshot, latent_tid = snapshot_rows(latent_out, width=HEAD_DIM)
+136:     compressed_cache_out, compressed_tid = publish_cache_row(
+137:         latent_snapshot, compressed_slots, compressed_cache, num_tokens, width=HEAD_DIM, ready=latent_tid,
+138:     )
+139: 
+140:     key = index_key(latent_out, index_wk, index_norm_w, compressed_cos, compressed_sin)
+141:     key_snapshot, key_snapshot_tid = snapshot_rows(key, width=IDX_DIM)
+142:     index_cache_out, key_tid = publish_cache_row(
+143:         key_snapshot, compressed_slots, index_cache, num_tokens, width=IDX_DIM, ready=key_snapshot_tid,
+144:     )
+145: 
+146:     score_width = pl.tensor.dim(index_block_table, 1) * BLOCK_SIZE
+147:     scores = pl.create_tensor([tokens, score_width], dtype=pl.FP32)
+148:     scoring_ready = pl.system.task_dummy(deps=[key_tid, weights_tid])
+149:     scores_out = index_scores(
+150:         query_out, weights_out, index_cache, index_block_table, request_ids, compressed_lens,
+151:         scores, num_tokens, scoring_ready,
+152:     )
+153:     topk_idx_out, topk_val_out, topk_tid = index_topk(
+154:         scores_out, compressed_lens, request_ids, index_block_table, topk_indices, topk_values,
+155:         num_tokens, scoring_ready,
+156:     )
+157:     pool_ids_out, pool_counts_out, pool_tid = select_candidate_block_pool(
+158:         scores_out, compressed_lens, pool_block_ids, pool_block_counts,
+159:         width=score_width,
+160:         rows=num_tokens,
+161:         topk_blocks=POOL_BLOCKS, block_size=CANDIDATE_BLOCK,
+162:         ready=scoring_ready,
+163:     )
+164: 
+165:     attended = pl.create_tensor([tokens, LOCAL_Q], dtype=pl.BF16)
+166:     gather_ready = pl.system.task_dummy(deps=[topk_tid, pool_tid, compressed_tid, window_tid])
+167:     for begin in pl.range(0, num_tokens, QUERY_CHUNK):
+168:         active = pl.min(QUERY_CHUNK, num_tokens - begin)
+169:         window_chunk = pl.slice(window_indices, [active, WINDOW_KEYS], [begin, 0])
+170:         topk_chunk = pl.slice(topk_indices, [active, INDEX_TOPK], [begin, 0])
+171:         selected = pl.create_tensor([active, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
+172:         combined = pl.create_tensor([active, SELECTED_KEYS], dtype=pl.INT32)
+173:         selected_gathered, combined_gathered, gathered = gather_selected_keys(
+174:             window_cache, window_chunk, compressed_cache, topk_chunk,
+175:             selected, combined, active, gather_ready,
+
+FILE models/deepseek_v4_1_flash_a3_w8a8/prefill_c2a_full.py:151-169
+SHA256 6c1114067306b859f9beefba08837e4df857b00382c8597528e2aec81b961429
+151:     scores_out = index_scores(
+152:         query_out, weights_out, index_cache, index_block_table, request_ids, compressed_lens,
+153:         scores, num_tokens, scoring_ready,
+154:     )
+155:     topk_idx_out, topk_val_out, topk_tid = index_topk(
+156:         scores_out, compressed_lens, request_ids, index_block_table, topk_indices, topk_values,
+157:         num_tokens, scoring_ready,
+158:     )
+159:     pool_ids_out, pool_counts_out, pool_tid = select_candidate_block_pool(
+160:         scores_out, compressed_lens, pool_block_ids, pool_block_counts,
+161:         width=score_width,
+162:         rows=num_tokens,
+163:         topk_blocks=POOL_BLOCKS, block_size=CANDIDATE_BLOCK,
+164:         ready=scoring_ready,
+165:     )
+166: 
+167:     attended = pl.create_tensor([tokens, LOCAL_Q], dtype=pl.BF16)
+168:     gather_ready = pl.system.task_dummy(deps=[topk_tid, compressed_tid, window_tid])
+169:     for begin in pl.range(0, num_tokens, QUERY_CHUNK):
+
+FILE models/deepseek_v4_1_flash_a3_w8a8/decode_c1a_reindex.py:114-134
+SHA256 5273f838d8bf9eeb6f0cd2c827a8698df26baaa4c4e339d13560fe7035539b16
+114:     score_width = pl.tensor.dim(index_block_table, 1) * BLOCK_SIZE
+115:     scores = pl.create_tensor([tokens, score_width], dtype=pl.FP32)
+116:     scoring_ready = pl.system.task_dummy(deps=[weights_tid, q_tid])
+117:     scores_out = index_scores(
+118:         query_out, weights_out, index_cache, index_block_table, request_ids, compressed_lens,
+119:         scores, num_tokens, scoring_ready,
+120:     )
+121:     topk_idx_out, topk_val_out, topk_tid = index_topk(
+122:         scores_out, compressed_lens, request_ids, index_block_table, topk_indices, topk_values,
+123:         num_tokens, scoring_ready,
+124:     )
+125:     pool_ids_out, pool_counts_out, pool_tid = select_candidate_block_pool(
+126:         scores_out, compressed_lens, pool_block_ids, pool_block_counts,
+127:         width=score_width,
+128:         rows=num_tokens,
+129:         topk_blocks=POOL_BLOCKS, block_size=CANDIDATE_BLOCK,
+130:         ready=scoring_ready,
+131:     )
+132: 
+133:     attended = pl.create_tensor([tokens, LOCAL_Q], dtype=pl.BF16)
+134:     gather_ready = pl.system.task_dummy(deps=[topk_tid, pool_tid, window_tid])
+
+FILE models/deepseek_v4_1_flash_a3_w8a8/decode_fwd.py:1031-1040
+SHA256 f7f418d5cfa2f3f4496379a269e99d1f2596c86681c655769ef0be734685f4b2
+1031:     window_cache: pl.Tensor[[N_LAYERS, ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+1032:     compressed_cache_c2a: pl.Tensor[[N_C2A, CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+1033:     index_cache_c2a: pl.Tensor[[N_C2A, INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, IDX_DIM], pl.BF16],
+1034:     state_cache_c2a: pl.Tensor[[N_C2A, STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32],
+1035:     compressed_cache_c1a: pl.Tensor[[CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+1036:     index_cache_c1a: pl.Tensor[[INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, IDX_DIM], pl.BF16],
+1037:     topk_indices: pl.Tensor[[N_INDEX_SLOTS, T_DYN, INDEX_TOPK], pl.INT32],
+1038:     topk_values: pl.Tensor[[N_INDEX_SLOTS, T_DYN, INDEX_TOPK], pl.FP32],
+1039:     pool_block_ids: pl.Tensor[[N_INDEX_SLOTS, T_DYN, POOL_BLOCKS_DYN], pl.INT32],
+1040:     pool_block_counts: pl.Tensor[[N_INDEX_SLOTS, T_DYN], pl.INT32],
+
+FILE models/deepseek_v4_1_flash_a3_w8a8/decode_fwd.py:1603-1612
+SHA256 f7f418d5cfa2f3f4496379a269e99d1f2596c86681c655769ef0be734685f4b2
+1603:     global _FIXTURE, _FIXTURE_INITIAL, _MUTABLE_NAMES
+1604: 
+1605:     torch.manual_seed(seed)
+1606:     requests = [(1250, 1), (1253, 1)] if tokens == 2 else [(1250, tokens)]
+1607:     plan1 = build_request_plan(requests, ratio=1)
+1608:     plan2 = build_request_plan(requests, ratio=2)
+1609:     positions = plan1["position_ids"]
+1610:     max_position = int(positions.max())
+1611:     pages = plan1["pages"]
+1612:     batch = plan1["index_block_table"].shape[0]
+
+FILE models/deepseek_v4_1_flash_a3_w8a8/decode_fwd.py:1811-1828
+SHA256 f7f418d5cfa2f3f4496379a269e99d1f2596c86681c655769ef0be734685f4b2
+1811:     add("state_cache_c2a", torch.zeros(
+1812:         EP_SIZE, N_C2A, batch, STATE_CAPACITY, STATE_WIDTH, dtype=torch.float32))
+1813:     mutable.append("state_cache_c2a")
+1814:     add("compressed_cache_c1a", torch.zeros(
+1815:         EP_SIZE, pages, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16))
+1816:     mutable.append("compressed_cache_c1a")
+1817:     add("index_cache_c1a", torch.zeros(
+1818:         EP_SIZE, pages, BLOCK_SIZE, 1, IDX_DIM, dtype=torch.bfloat16))
+1819:     mutable.append("index_cache_c1a")
+1820:     for name, shape, dtype, fill in (
+1821:         ("topk_indices", (EP_SIZE, N_INDEX_SLOTS, tokens, INDEX_TOPK), torch.int32, -1),
+1822:         ("topk_values", (EP_SIZE, N_INDEX_SLOTS, tokens, INDEX_TOPK), torch.float32, 0.0),
+1823:         ("pool_block_ids", (EP_SIZE, N_INDEX_SLOTS, tokens, CANDIDATE_POOL_BLOCKS),
+1824:          torch.int32, -1),
+1825:         ("pool_block_counts", (EP_SIZE, N_INDEX_SLOTS, tokens), torch.int32, 0),
+1826:     ):
+1827:         add(name, torch.full(shape, fill, dtype=dtype))
+1828:         mutable.append(name)
+
+FILE models/deepseek_v4_1_flash_a3_w8a8/prefill_fwd.py:1734-1742
+SHA256 7810211686472e65a1f89f524b64893b5228fa5753bba4c6013c6e5ef9ef358e
+1734:     torch.manual_seed(seed)
+1735:     start = 1248
+1736:     requests = [(start, tokens)]
+1737:     plan1 = build_request_plan(requests, ratio=1)
+1738:     plan2 = build_request_plan(requests, ratio=2)
+1739:     positions = plan1["position_ids"]
+1740:     max_position = int(positions.max())
+1741:     pages = plan1["pages"]
+1742:     batch = plan1["index_block_table"].shape[0]
+
+FILE models/deepseek_v4_1_flash_a3_w8a8/prefill_fwd.py:1929-1944
+SHA256 7810211686472e65a1f89f524b64893b5228fa5753bba4c6013c6e5ef9ef358e
+1929:     add("state_cache_c2a",
+1930:         torch.zeros(EP_SIZE, len(C2A_SOURCES), batch, STATE_CAPACITY, STATE_WIDTH,
+1931:                     dtype=torch.float32))
+1932:     add("compressed_cache_c1a",
+1933:         torch.zeros(EP_SIZE, pages, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16))
+1934:     add("index_cache_c1a",
+1935:         torch.zeros(EP_SIZE, pages, BLOCK_SIZE, 1, IDX_DIM, dtype=torch.bfloat16))
+1936:     for family, slots in (("c2a", len(C2A_SOURCES)), ("c1a", N_C1A_SLOTS)):
+1937:         add(f"topk_indices_{family}",
+1938:             torch.full((EP_SIZE, slots, tokens, INDEX_TOPK), -1, dtype=torch.int32))
+1939:         add(f"topk_values_{family}",
+1940:             torch.zeros(EP_SIZE, slots, tokens, INDEX_TOPK, dtype=torch.float32))
+1941:         add(f"pool_block_ids_{family}",
+1942:             torch.full((EP_SIZE, slots, tokens, CANDIDATE_POOL_BLOCKS), -1, dtype=torch.int32))
+1943:         add(f"pool_block_counts_{family}",
+1944:             torch.zeros(EP_SIZE, slots, tokens, dtype=torch.int32))
+
+FILE models/deepseek_v4_1_flash_a3_w8a8/utils.py:227-265
+SHA256 98f94f8ee4b71307e848ff027a399ae931c185a00a6ebb288d8dc5d341d89379
+227: def build_request_plan(
+228:     requests: list[tuple[int, int]],
+229:     ratio: int = 1,
+230:     window: int = 128,
+231: ) -> dict:
+232:     """Build the paged metadata for a batch of ``(start_position, query_length)``.
+233: 
+234:     The physical page allocator hands out one page per logical page of the
+235:     longest request; the same table addresses the window, compressed and index
+236:     caches of every source, so the returned page counts size all three pools.
+237:     ``state_block_table`` assigns one compressor-state block per request.
+238:     """
+239:     if not requests:
+240:         raise ValueError("a request plan needs at least one request")
+241:     if any(length <= 0 or start < 0 for start, length in requests):
+242:         raise ValueError("request positions must be non-negative and lengths positive")
+243:     max_position = max(start + length - 1 for start, length in requests)
+244:     table_width = (max_position + 1 + 127) // 128
+245:     batch = len(requests)
+246:     table = torch.full((batch, table_width), -1, dtype=torch.int32)
+247:     next_page = 0
+248:     positions = []
+249:     request_rows = []
+250:     for index, (start, length) in enumerate(requests):
+251:         pages = (start + length + 127) // 128
+252:         table[index, :pages] = torch.arange(next_page, next_page + pages, dtype=torch.int32)
+253:         next_page += pages
+254:         positions.append(torch.arange(start, start + length, dtype=torch.int32))
+255:         request_rows.append(torch.full((length,), index, dtype=torch.int32))
+256:     positions = torch.cat(positions)
+257:     request_ids = torch.cat(request_rows)
+258:     window_slots, window_indices, window_lens = window_metadata(positions, request_ids, table, window)
+259:     compressed_slots, compressed_lens = compressed_metadata(positions, request_ids, table, ratio)
+260:     state_table = torch.arange(batch, dtype=torch.int32).reshape(batch, 1)
+261:     return {
+262:         "position_ids": positions,
+263:         "request_ids": request_ids,
+264:         "index_block_table": table,
+265:         "state_block_table": state_table,
+
+FILE models/deepseek_v4_1_flash_a3_w8a8/config.py:186-192
+SHA256 89769114dfe8965bf133496d283244ea7a9d284c3186321daafc406c4731ddb0
+186: PREFILL_MAX_TOKENS = 8192
+187: DECODE_MAX_TOKENS = MAX_BATCH_PER_DP
+188: WINDOW_KEYS = FLASH.sliding_window
+189: SELECTED_KEYS = WINDOW_KEYS + FLASH.index_topk
+190: STATE_CAPACITY = 2
+191: CANDIDATE_POOL_BLOCKS = 64
+192: 

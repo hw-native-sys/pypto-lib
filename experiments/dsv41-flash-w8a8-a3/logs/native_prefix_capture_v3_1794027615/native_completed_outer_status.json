@@ -1,0 +1,12 @@
+{
+  "command": [
+    "task-submit",
+    "--status",
+    "task_20261107_130545_17984923672"
+  ],
+  "returncode": 0,
+  "stdout": "completed (exit=0)\n",
+  "stderr": "",
+  "queried_at_epoch": 1794028517,
+  "scope": "actual outer CLI receipt; no nested queued CLI query"
+}

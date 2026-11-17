@@ -1,0 +1,16 @@
+{
+  "execution_kind": "MEASURED_REAL_SPLIT_VALIDATION",
+  "stage": "prefix",
+  "required_bytes": {
+    "host": 290783361536,
+    "disk": 23876796928,
+    "shm": 37231460864
+  },
+  "fresh_available_bytes": {
+    "host": 1722186612736,
+    "disk": 9545981100032,
+    "shm": 1079343157248
+  },
+  "receipt_sha256": "363718238c8171b80c2b303974e2d97113b21c0d7179e16a5ba73c7069a5b025",
+  "numerical_or_native_pass": false
+}

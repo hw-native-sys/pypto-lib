@@ -1,0 +1,21 @@
+{
+  "case": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_longer_real_generation_1794064297",
+  "native_terminal_confirmed": true,
+  "executor_external_POST_terminal_confirmed": true,
+  "outer_queue_snapshot": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_longer_real_generation_1794064471/queue_snapshot.json",
+  "external_POST": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_longer_real_generation_1794064297/external_postqueue/POST_EXEC.json",
+  "external_POST_task": "task_20261108_002515_315943019711",
+  "stable_executor_pins": {
+    "external_postqueue/POST_EXEC.json": "08101bf2c06a91be2d79bfed2acb7d8380c16ddf430896c391f58b656ed46373",
+    "terminal_facts.json": "d14c523f4b0e6fc74c3989eacec21b3b0ee6f714636e72969d090dc9b1eeb9a5",
+    "actual/generation.json": "f2e52e53c96df7154ed5aaf84fee863114df3f9819511127b9f8c19f4a037dca",
+    "actual/outer_result.json": "48ca36a73864e6e660738c4effc1d30381e018dab38fe7537b75453f7657d194"
+  },
+  "auditor_sha256": "ce9063d63d7623fc975bcea691feb1b14c2ef06d622766fc187dc931e4c4c21d",
+  "expected_known_failures": [
+    "native queue exit1",
+    "outer monitor PermissionError13"
+  ],
+  "does_not_grant_NPU_or_payload": true,
+  "epoch": 1794068901.8801346
+}

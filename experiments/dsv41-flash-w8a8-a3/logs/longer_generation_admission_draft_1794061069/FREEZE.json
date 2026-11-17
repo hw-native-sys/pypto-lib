@@ -1,0 +1,17 @@
+{
+  "status": "FINAL/PARK",
+  "candidate_generate_sha256": "41651e5af3b94223b645d4bfb52010e52ea7350aa3f3637cbcca6e29e093e609",
+  "patch_sha256": "c825c3d8cba936d7b74abf59edd00be67700083b0225461d28e40d09f83cfa9a",
+  "source45_base_sha256": "d77d196be6541b4a87aef07cf0e5e02eac68cefa9fc245f3742e4c14606555aa",
+  "product_D77_unchanged": true,
+  "artifact_manifest_sha256": "8f8098b2422f699c470ea89bf51aa5e1476b1bac938c41f9ee2aa454a6259313",
+  "artifact_count": 11,
+  "N3_only": true,
+  "current_case_independent_acceptance_prerequisite": true,
+  "all_own_jobs_writers_parked": true,
+  "native_jobs": 0,
+  "payload_bytes": 0,
+  "actual_grants": 0,
+  "product_edits": 0,
+  "end_epoch": 1794061467
+}

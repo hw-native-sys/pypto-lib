@@ -1,0 +1,23 @@
+{
+  "root_go_id": "observer-20261108-shared-hc-real16-e07b",
+  "authority": "Root explicit ACTUAL16 GO, after fresh PREQUEUE and independent combined FINAL gate",
+  "operation": "shared-full-real40-noEngram-greedy-N3",
+  "prompt_text": "Once upon a",
+  "prompt_ids": [16600, 4465, 260],
+  "max_new_tokens": 16,
+  "noEngram": true,
+  "native_attempts_authorized": 1,
+  "allocation": "auto16_actual_ordered_mapping_required",
+  "queue_max_seconds": 21600,
+  "client_timeout_seconds": 22200,
+  "soft_deadline_seconds": 20400,
+  "entry_TTL_seconds": 3500,
+  "prequeue_sha256": "d2f6d55c516a627081526b1cdedd6dad811ee6d19fe3f194bede380ac8170829",
+  "combined_review_manifest_sha256": "5f30ab62889daf26ff3f92385412acfc1d73bd6ad34f7413af0451293ce82e8a",
+  "combined_review_FREEZE_sha256": "49fd510e494b6c8f7f04226580c18d966d111be87b60203bd3c7c4d991648931",
+  "delegation": "Only after actual ordered16 allocation, frozen task_entry may create a fresh task-local Root assignment under this GO; frozen outer may create fresh production receipt only after ALLOCATED_PRE_EXEC pins/tokenizer/headers/resources PASS",
+  "accounting": "One canonical prefill633997065216B/912bases/164192reads745846365184B; decode0newstaticIO with borrowed coverage, genuine greedy/EOS",
+  "strict_telemetry": true,
+  "stops": "First source/code/query/cap/DP/telemetry/deadline/cleanup failure, preserve CLI versus observer verdicts; no retry/resize/source/heap/threshold change; client timeout reconnects SAME task",
+  "closeout": "Mandatory external queued CPU POST even failure then independent postcase audit/Root disposition; actual source/helpers held through both seals, no payload reread/native repeat for audit"
+}

@@ -1,0 +1,27 @@
+{
+  "status": "CONFIRMED_DURABLE_OFFSET_STATISTIC_GAP_WITH_TINY_OBSERVER_PROOF",
+  "internal_nonzero_count_in_tiny_source": 51,
+  "count_missing_from_original_success_record": true,
+  "new_outer_observer_tiny_records": [
+    {
+      "source_key": "layers.1.ffn.experts.1.w1.weight_offset",
+      "nonzero_elements": 51,
+      "total_elements": 64,
+      "dtype": "torch.float32",
+      "source_reads_so_far": {
+        "embed.weight": 0,
+        "layers.1.ffn.experts.1.w1.weight": 1,
+        "layers.1.ffn.experts.1.w1.weight_offset": 1,
+        "layers.1.ffn.experts.1.w1.weight_scale": 0
+      },
+      "source_bytes_so_far": 6400,
+      "scope": "OWN_TINY_ONLY; future actual observer needs separate Root scope"
+    }
+  ],
+  "no_extra_source_reads_or_retained_backing": true,
+  "transport_source_unchanged": true,
+  "real_source_offsets": "UNKNOWN_NOT_READ",
+  "real_checkpoint_payload": 0,
+  "NPU": 0,
+  "disposition": "require explicit new observer or separate new artifact fix before claiming actual nonzero/allzero statistic"
+}

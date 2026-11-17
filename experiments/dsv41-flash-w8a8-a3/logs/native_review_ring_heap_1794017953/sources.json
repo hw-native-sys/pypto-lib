@@ -1,0 +1,42 @@
+{
+  "worker.py": {
+    "source": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler/worker.py",
+    "sha256": "55cdf965dc0f220e645c4595d39989a655e3745559091a2b3effc40cd04cbe82"
+  },
+  "call_config.h": {
+    "source": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/src/common/task_interface/call_config.h",
+    "sha256": "456b849596654f9a441c9e0c27e3e46b45afdd80dd3f877a2b671d6a6c67e648"
+  },
+  "runtime_maker.cpp": {
+    "source": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/src/a2a3/runtime/tensormap_and_ringbuffer/host/runtime_maker.cpp",
+    "sha256": "58c508e0aaffc786526c83b9f84e903d787731ad7213f69f8a5ccb5fdee4f4c9"
+  },
+  "runtime_init.cpp": {
+    "source": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp",
+    "sha256": "3ea5bbee168f13a8b8b1d96f4f181c4c35762af7b4b56e9e5188debafea6b27f"
+  },
+  "ring_buffer.h": {
+    "source": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/ring_buffer.h",
+    "sha256": "65b5c5d54dcb48110a9d6c5fd1ad79d1f26743139341cfb6d080ec58a191d5c9"
+  },
+  "MULTI_RING.md": {
+    "source": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/src/a2a3/runtime/tensormap_and_ringbuffer/docs/MULTI_RING.md",
+    "sha256": "43f04987d48c9c681e15143f4b45d6747128a8340829771afb03f120f76d6e28"
+  },
+  "distributed_runner.py": {
+    "source": "/mnt/data/pyptouser/yangyaodong/code/pypto/python/pypto/runtime/distributed_runner.py",
+    "sha256": "ca496829a240c81df3c29e77d8ef696bd1e2a7b0f31b9d5c2dcb3b3d82923148"
+  },
+  "device_runner.py": {
+    "source": "/mnt/data/pyptouser/yangyaodong/code/pypto/python/pypto/runtime/device_runner.py",
+    "sha256": "489be9499afd907530e6bf52cf2b9164e5a9269266bef9019a5f73b27717d3e6"
+  },
+  "distributed_compiled_program.py": {
+    "source": "/mnt/data/pyptouser/yangyaodong/code/pypto/python/pypto/ir/distributed_compiled_program.py",
+    "sha256": "b523ea389350c9d1f9880a101ec66ceb36d2a8202a5fb1976a77be3310444e2a"
+  },
+  "device_runner_base.cpp": {
+    "source": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/src/common/platform/onboard/host/device_runner_base.cpp",
+    "sha256": "39cd6d242d506c44edbb2327bff5a56794848a2e66f0148dff4e7b9c90e30cc1"
+  }
+}

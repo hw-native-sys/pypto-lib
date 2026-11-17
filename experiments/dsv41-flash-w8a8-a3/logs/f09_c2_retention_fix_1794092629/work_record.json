@@ -1,0 +1,21 @@
+{
+  "record_id": "main-f09-c2retention-1794092629",
+  "role": "main-agent",
+  "start_epoch": 1794092629,
+  "end_epoch": 1794093868.0614977,
+  "measured_wall_seconds": 1239.0614976882935,
+  "interval_note": "includes Root failedcase/finite-audit hold, source work and ONECPU batch; not CPU execution seconds",
+  "shared_writes": 0,
+  "worker_records_imported": 0,
+  "CPU_tasks": [
+    "task_20261108_071536_1890249939"
+  ],
+  "CPU_PASS": true,
+  "fresh_full_compile_seconds": 45.014118909835815,
+  "count_recompiled": false,
+  "prepare": false,
+  "NPU": false,
+  "largefixture_fullrefs_or_realweights": false,
+  "positive_grants": 0,
+  "status": "FINAL_PARK_SOURCE_HOST_CPU_FULL_COMPILE_ONLY"
+}

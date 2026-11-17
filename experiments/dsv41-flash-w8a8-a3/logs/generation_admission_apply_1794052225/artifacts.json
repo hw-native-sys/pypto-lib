@@ -1,0 +1,19 @@
+{
+  "NEXT_COMMANDS.md": "7457277dbd2814df8356312a06e24d38608f09f0d292a60eabaa792d69e717a0",
+  "OWNERSHIP.md": "1fde7d62d25c107caa997c415499f8dc20b3d631b6dc8109ec6227b26f4d641e",
+  "REPORT.md": "d44c760739fc9b40e2534f4b0cc018294c4a7808d93654e291a24d47295bd60a",
+  "TOY_applied_events.jsonl": "518cb462ae10d0fa4c52d9a7e93692e53f30e5d83913ea567d141c177d1684d9",
+  "application.json": "512d3a7a1678e19dc7fcb127f28e77a9280e614b042675af3dfb559fdb274bea",
+  "applied.patch": "522dae74110e5e1725e9b36a399c6919138b1937d900a593ffc26ab3ca0f1dca",
+  "check_applied.py": "dc8dacc4b6facfa70363038fa6eb6819cb4bac00840308307532a3188846f39a",
+  "cpu_queue.log": "d697e8fbf67954c66d510116a0d9dc9559492f0b53795767fc64e55ba06efb86",
+  "cpu_results.json": "a665388c8f540dba3e98c6935b2d9c75f68b06cf3e3562936e6f7fce68b59fa9",
+  "docs_snapshot/HANDOFF.md": "db7c8b9ac0bfb5f3449cf89a865198d080efff0ce2877c4736d44d32fa3a6dba",
+  "docs_snapshot/INTERFACE.md": "878f1679a1e743aaeaf084f0ba16f23d66277259336695f5e6dce8658cf7b13f",
+  "docs_snapshot/MODULES.md": "87adb8de39cfa51bad846514ec6cba1bc429876d7a708d9893ce4b3f954dadf9",
+  "generate_before.py": "685cf3cfadf36c92b5f9c6280f9f9d90ebf0e3244133a2b550adea83ceb29cfb",
+  "review_pins.json": "2410b600711d0fda8fc954dfe35b5105ea8a6d51312027470331bf9910a36018",
+  "source45.json": "d77d196be6541b4a87aef07cf0e5e02eac68cefa9fc245f3742e4c14606555aa",
+  "source45_before.json": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "work_record.json": "ced7a51852232b8ad1f84d78df7b948f1ccaa20ec412d6cb8f4d189ded06337d"
+}

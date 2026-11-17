@@ -1,0 +1,18 @@
+{
+  "epoch": 1794111665.7088883,
+  "TASK_DEVICE": [
+    "0"
+  ],
+  "HEADS": 8,
+  "HEAD_TILE": 16,
+  "tokens": 3,
+  "source": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/attention.py",
+  "source_sha256": "562cda314635c65823e639d02a7e8db7100a65ef6d7006ff50bbd608d72e0cf7",
+  "command": "attention.py --tp 8 --ep 16 --tokens 3 -p a2a3 -d TASK_DEVICE; --sim absent",
+  "original_golden": true,
+  "tolerances": {
+    "atol": 0.02,
+    "rtol": 0.02,
+    "max_error_ratio": 0.005
+  }
+}

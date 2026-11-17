@@ -1,0 +1,13 @@
+{
+  "parent": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_real_transfer_1794045713",
+  "parent115_manifest_sha256": "0ee2a16e567487752325cd5e163905976501377eb4004fd79e49e239925bae35",
+  "files": {
+    "transport.py": "5e364da73ac36d59bce09f92dc4efb8501e900175fc91afc08f91cf0da9dfbb5",
+    "plan.json": "6172ee8e67687d176a2ed3e4441c7d2d858ac0e5a5271e3600648721aafda28e",
+    "source45.json": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+    "offset_observer.py": "31cd56f5bff3dd6db0f24d47ed2534efbbbe0ec46c68b256b65b0ae3d3eb7892",
+    "observer_cli.py": "8fed1c1f6be60e959a8d74f19f83c554b38f7b1b4f34b915ff8deba1a8a57786"
+  },
+  "scope": "NEW_ROOT_EXPLICIT_SELECTED_REAL_PAYLOAD_AND_NATIVE_TRANSFER_ONLY",
+  "start_epoch": 1794047567
+}

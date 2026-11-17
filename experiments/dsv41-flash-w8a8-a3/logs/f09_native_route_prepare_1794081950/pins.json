@@ -1,0 +1,26 @@
+{
+  "live_source45": {
+    "path": "experiments/dsv41-flash-w8a8-a3/logs/hc_boundary_apply_1794075705/source45.json",
+    "sha256": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+    "all45_file_hashes_match": true
+  },
+  "unapplied_source45": {
+    "path": "experiments/dsv41-flash-w8a8-a3/logs/f09_artifact_lifecycle_fix_1794079805/source45_rebased_UNAPPLIED.json",
+    "sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+    "all45_file_hashes_match": true
+  },
+  "frozen_inputs": {
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_artifact_lifecycle_fix_1794079805/f09_decode_case.py": "6a2d8cb9fbddcee72c27a0892ad2730b571167f323af5a45cd9abebdab271b40",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_artifact_lifecycle_fix_1794079805/artifact_lifecycle.py": "1cc9c0b792b93a3c9d83b3461fd327d21f0bcd4872c289f76f3ab61e70c14a0d",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_artifact_lifecycle_fix_1794079805/scenario.json": "c7b6ab942f5ea17758389aa5a53dafbb1de79e68dbb6f41c4614d66dd6b6dbb1",
+    "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/compile_results.json": "9287896f499c9bb7b62f474b9d6eff2e930c29e2258408f08dc97d940d51f686",
+    "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/count_active_files.json": "4c226662c16675febc4eea21c4de345a79e6562dc078549df46185212cabfaba",
+    "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/count_old_physical_files.json": "484bbb7d6c22475edbb725186e59b9dc1ff32118edfac9fa2dc3a33afc36a414",
+    "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/decode_capacity2_files.json": "5262e68afa0b53291ed285e31170b3c017674c3c25dfa9aec78eb7fab5777532"
+  },
+  "public_runtime_sources": {
+    ".venv-local/lib/python3.10/site-packages/pypto/runtime/distributed_runner.py": "ca496829a240c81df3c29e77d8ef696bd1e2a7b0f31b9d5c2dcb3b3d82923148",
+    ".venv-local/lib/python3.10/site-packages/pypto/runtime/runtime_base.py": "81a319a9e412d5a618de343c5c54103aa14fb2ec2613a6455e3592b797662704"
+  },
+  "inherited_scope": "source/compile only; lifecycle actualmicroproof and native16 NOT_GRANTED"
+}

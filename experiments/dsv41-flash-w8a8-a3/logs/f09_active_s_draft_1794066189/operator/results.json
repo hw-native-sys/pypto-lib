@@ -1,0 +1,17 @@
+{
+  "status": "PASS_TINY_OPERATOR_DRAFT_ONLY",
+  "actual_golden_affine_leaf_stub": true,
+  "expected_active_route_rows": 96,
+  "legacy_physical_route_rows": 192,
+  "idle_destination_serves_remote_rows": true,
+  "inactive_routed_sentinel_preserved": true,
+  "all_zero_no_local_or_remote_routes": true,
+  "all_active_matches_original_and_default": true,
+  "count_reject_controls": 5,
+  "moe_ep16_F10_AST_unchanged": true,
+  "physical_backing_allocations": 7,
+  "live_CC_unchanged": true,
+  "signature_compile": false,
+  "native": false,
+  "real_payload_bytes": 0
+}

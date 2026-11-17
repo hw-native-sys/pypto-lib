@@ -1,0 +1,208 @@
+{
+  "resources": [
+    "tiny"
+  ],
+  "allocations": [],
+  "cleanup_errors": [],
+  "prewarm": [
+    {
+      "rank": 0,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 1,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 2,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 3,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 4,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 5,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 6,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 7,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 8,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 9,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 10,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 11,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 12,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 13,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 14,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 15,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    }
+  ],
+  "status": "FAIL",
+  "compute_dispatches": 0,
+  "payload_bytes": 0,
+  "error": "Refused: preallocation free/remaining/IO/comm/headroom guard",
+  "after_free_before_close": [
+    {
+      "rank": 0,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 1,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 2,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 3,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 4,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 5,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 6,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 7,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 8,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 9,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 10,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 11,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 12,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 13,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 14,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    },
+    {
+      "rank": 15,
+      "free": 899,
+      "total": 2000,
+      "committed": 600
+    }
+  ],
+  "owner_closed": true
+}

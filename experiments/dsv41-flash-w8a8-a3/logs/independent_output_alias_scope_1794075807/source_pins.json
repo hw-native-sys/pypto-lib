@@ -1,0 +1,72 @@
+{
+  "HC_capture": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_hc_durable_receipts_1794075226/receipt_store.py",
+    "sha256": "d0b281499e0e93ccd70cf3f95bfc7683a2dd44d59bb8b086ee848534c7e4fb1c",
+    "snapshot": "sources/HC_capture.py"
+  },
+  "HC_offline": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_hc_durable_receipts_1794075226/audit_native_receipts.py",
+    "sha256": "5f0b7cbf518dd2f3aa9a02034d581f688a55c0018b8d6fd5994bbf64e9730dc3",
+    "snapshot": "sources/HC_offline.py"
+  },
+  "HC_probe": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_hc_durable_receipts_1794075226/probe.py",
+    "sha256": "6d7d3a3b0f9143c4add4a950667d33c4afc5c7e1ea2832171ac5ce5d4e044030",
+    "snapshot": "sources/HC_probe.py"
+  },
+  "N3_extra_published": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_exact_prompt_capture_1794038189/validate-decode_run.py",
+    "sha256": "36fb1afe7fb281bb0b4c8c4ff8d3d4b26c25ce19e26d625effb2240808ec7ac6",
+    "snapshot": "sources/N3_extra_published.py"
+  },
+  "S32_evaluator": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/exact_s32_evaluator_1794024036/evaluator.py",
+    "sha256": "0929a54ecb9022259152692c8dfb6e166237ed5cb99359b231334c7db2515ddf",
+    "snapshot": "sources/S32_evaluator.py"
+  },
+  "V3_bridge": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/checkpoint_integration_v3_1794024669/integration/evaluator_bridge.py",
+    "sha256": "c1f942c90ccb4fbec3fe3e3852b51ac64c616f1607076b55f486a30864026834",
+    "snapshot": "sources/V3_bridge.py"
+  },
+  "V3_pipeline": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/checkpoint_integration_v3_1794024669/checkpoint_pipeline_v3/pipeline.py",
+    "sha256": "814d7e43cadc0c1f4eb80140f29b92f0275c9fd0c86bc9664f988c6e6d683ea5",
+    "snapshot": "sources/V3_pipeline.py"
+  },
+  "V3_store": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/checkpoint_integration_v3_1794024669/checkpoint_pipeline_v3/store.py",
+    "sha256": "07d23973b94d4b8b22ec124b63945f4a6842e77996267e6da7f226f066557faa",
+    "snapshot": "sources/V3_store.py"
+  },
+  "decode19_frozen_module": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_scalar_c2_1794018787/frozen_source/decode_fwd.py",
+    "sha256": "ed39c749b0d4cf5344fcf7a8f9b63fd0259cbb21496729ef425a09fb6d73ee1a",
+    "snapshot": "sources/decode19_frozen_module.py"
+  },
+  "decode19_helper": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_accept_scalar_c2_1794018787/helpers/main/production_decode.py",
+    "sha256": "2841367a73404654518ab5f05231a7220fa21370c427f90c5db2c8ab168b747f",
+    "snapshot": "sources/decode19_helper.py"
+  },
+  "harness_runner": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/golden/runner.py",
+    "sha256": "3b7d37753b5b0fedc36f2ae425043b256aa5da8230689b3e222ac06dff0b53c5",
+    "snapshot": "sources/harness_runner.py"
+  },
+  "harness_spec": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/golden/spec.py",
+    "sha256": "a206fed7122ba6c065f77f8be6549c1fe8515b3108782405183a8f104953534a",
+    "snapshot": "sources/harness_spec.py"
+  },
+  "tiny_manual": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/tiny_shared_host_slice_correction_1794072874/tiny_shared.py",
+    "sha256": "38e92714a550407727a4a7d816c1e9c8fc711519cc73ecdcf89c1f8d6caa9d59",
+    "snapshot": "sources/tiny_manual.py"
+  },
+  "tiny_programs": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/tiny_shared_host_slice_correction_1794072874/tiny_programs.py",
+    "sha256": "94f3290e98ceefdba48fa61c372130a7176199b19802d1633152dc9d9619ef60",
+    "snapshot": "sources/tiny_programs.py"
+  }
+}

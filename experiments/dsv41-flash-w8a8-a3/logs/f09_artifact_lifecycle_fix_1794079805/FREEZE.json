@@ -1,0 +1,13 @@
+{
+  "status": "FINAL/PARK",
+  "artifact_count": 88,
+  "artifact_manifest_sha256": "7fb949a6ed09aa8e5ad68b1aa16ffd932804f7a331b5fd0fcbb7cbe624ce5c4d",
+  "adapter_lifecycle_patch_sha256": "2c64464fcff7fae2a8b91806c63becae2b76bdc647e94ce2a025c80be8e7a8cc",
+  "adapter_sha256": "6a2d8cb9fbddcee72c27a0892ad2730b571167f323af5a45cd9abebdab271b40",
+  "lifecycle_sha256": "1cc9c0b792b93a3c9d83b3461fd327d21f0bcd4872c289f76f3ab61e70c14a0d",
+  "kernel45_UNAPPLIED_sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "old207_count94_liveM02_unchanged": true,
+  "metadata_mock_CPU": "PASS",
+  "actual_compile_prepare_NPU_payload": false,
+  "all_jobs_writers_parked": true
+}

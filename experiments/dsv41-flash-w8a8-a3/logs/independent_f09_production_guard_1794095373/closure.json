@@ -1,0 +1,11 @@
+{
+  "state": "FINAL_PARK_SOURCE_ONLY_CONDITIONAL_PLAN_APPROVAL",
+  "Main27_all_files_unchanged": true,
+  "M02_live45_unchanged": true,
+  "A8153_still_unapplied": true,
+  "B_target_still_unapplied": true,
+  "metadata_writer_not_run": true,
+  "no_actual_apply_or_NPU_GO": true,
+  "all_own_jobs_ended": true,
+  "epoch": 1794095704
+}

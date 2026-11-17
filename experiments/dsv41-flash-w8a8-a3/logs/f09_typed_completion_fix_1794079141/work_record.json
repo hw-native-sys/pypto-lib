@@ -1,0 +1,15 @@
+{
+  "record_id": "main-f09-typed-completion-fix-1794079141",
+  "role": "main-agent",
+  "start_epoch": 1794079141,
+  "end_epoch": 1794079748,
+  "elapsed_seconds": 607,
+  "shared_writes": 0,
+  "imported_shared_ledger": false,
+  "workers": [],
+  "task_ids": [
+    "task_20261108_032350_4838487518",
+    "task_20261108_032514_5653956905"
+  ],
+  "scope": "Artifact-only stabletypedoperator+allcallers, tinyCPU +RootauthorizedONEcountsignature; no fullentry/oldprobe/NPU/payload/fixture/grant"
+}

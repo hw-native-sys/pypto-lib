@@ -1,0 +1,71 @@
+{
+  "status": "PASS_TYPED_TUPLE_PUBLIC_IMPORT_AND_ALL_CALLERS",
+  "stable_typed_tuple_functions": [
+    "moe_ep16",
+    "moe_ffn"
+  ],
+  "actual_callers": [
+    {
+      "file": "decode_fwd.py",
+      "line": 539,
+      "callee": "moe_ffn",
+      "unpack": "(_ffn_value, _ffn_done)"
+    },
+    {
+      "file": "decode_fwd.py",
+      "line": 826,
+      "callee": "moe_ffn",
+      "unpack": "(_ffn_value, _ffn_done)"
+    },
+    {
+      "file": "decode_layer.py",
+      "line": 466,
+      "callee": "moe_ep16",
+      "unpack": "(_moe_value, _moe_done)"
+    },
+    {
+      "file": "decode_moe.py",
+      "line": 65,
+      "callee": "moe_ep16",
+      "unpack": "(routed_value, _moe_done)"
+    },
+    {
+      "file": "moe_exchange.py",
+      "line": 432,
+      "callee": "moe_ep16",
+      "unpack": "(routed_active, ep_done)"
+    },
+    {
+      "file": "prefill_fwd.py",
+      "line": 470,
+      "callee": "moe_ffn",
+      "unpack": "(_ffn_out, _ffn_done)"
+    },
+    {
+      "file": "prefill_fwd.py",
+      "line": 628,
+      "callee": "moe_ffn",
+      "unpack": "(_ffn_out, _ffn_done)"
+    },
+    {
+      "file": "prefill_layer.py",
+      "line": 1011,
+      "callee": "moe_ep16",
+      "unpack": "(_moe_value, _moe_done)"
+    },
+    {
+      "file": "prefill_moe.py",
+      "line": 66,
+      "callee": "moe_ep16",
+      "unpack": "(routed_value, _moe_done)"
+    }
+  ],
+  "all_actual_calls_explicit_tuple_unpack": true,
+  "standalone_public_tensor_returns_preserved": true,
+  "previous_four_review_fixes_inherited": true,
+  "liveM02_old93_unchanged": true,
+  "public_JIT_import_only": true,
+  "lower_or_compile": false,
+  "NPU": false,
+  "header_payload_fixture": false
+}

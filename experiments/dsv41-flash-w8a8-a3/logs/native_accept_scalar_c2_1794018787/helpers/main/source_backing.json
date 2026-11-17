@@ -1,0 +1,17 @@
+{
+  "synthetic_reader": "PASS",
+  "visible_leaf_bytes": 64,
+  "retained_storage_bytes": 256,
+  "source_reader_payload_cache": false,
+  "real_largest_BF16_source_bytes": 5295308800,
+  "real_reader_raw_plus_bytearray_lower_bound": 10590617600,
+  "serial_copy_chunk_allowance": 67108864,
+  "full_real_peak_RSS_or_HBM_measured": false,
+  "remaining_allowances": [
+    "mutable shared host IO and reference clones",
+    "JSON/map metadata",
+    "allocator retention",
+    "runtime/compiler device and host scratch"
+  ],
+  "guard": "HELD pending separate measured real-fit gate"
+}

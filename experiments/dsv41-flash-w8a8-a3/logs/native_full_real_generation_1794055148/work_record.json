@@ -1,0 +1,25 @@
+{
+  "role": "review-agent",
+  "start_epoch": 1794055148,
+  "end_epoch": 1794062861,
+  "elapsed_seconds": 7713,
+  "native_job": "task_20261107_204310_361283812010",
+  "native_terminal": "COMPLETE0",
+  "external_post_job": "task_20261107_222032_337703113829",
+  "external_post_terminal": "COMPLETE0",
+  "independent_audit_manifest": "3e9f22d8dff50cb3de4ed0485e6d3cbd20cf1f7ac2275ea1cbb07723cd508999",
+  "independent_audit_status": "AUDIT_COMPLETE_CASE_PASS_WITH_SCOPED_LIMITS",
+  "Root_accepted_scope": "one actual D77 normal-CLI full-real16 E40 W8A8 noEngram N3 Hello, world operation; [3,1] EOS; one actual decode input3 at position3; all4DP finite consistent recorded votes; both full source/H2D coverage phases; normalclose, recorded PID identity absence, raw16 release and queue0",
+  "actual_generated_ids": [
+    3,
+    1
+  ],
+  "actual_decode_calls": 1,
+  "termination": "eos",
+  "normal_cleanup": "independent audit confirms normalclose/raw16release/queue0/recordedPID-birth-identities absent; acquisitionPID absence alone unused",
+  "source45_final_rehash": "d77d196be6541b4a87aef07cf0e5e02eac68cefa9fc245f3742e4c14606555aa",
+  "outer48_final_rehash": "f9197cab999b4b5b1a8897d09bc46db62f84615c39b5a0d53506476ea207a8be",
+  "payload_bytes_in_collector": 0,
+  "all_own_jobs_terminal": true,
+  "no_native_retry": true
+}

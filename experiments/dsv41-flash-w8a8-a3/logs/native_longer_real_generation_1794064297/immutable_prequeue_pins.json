@@ -1,0 +1,20 @@
+{
+  "epoch": 1794064357.094917,
+  "root_go_id": "observer-20261107-once-real16-cc15877",
+  "status": "PASS_FROZEN_LONGER_GATES",
+  "pins": {
+    "longer_generation_operation_prepare_1794063015": "f2cef526699b5b8a3b4a0f2e6184a80a22ab6798e30066afe204b6d8ca0d9f27",
+    "longer_generation_admission_apply_1794062947": "f23eed7cdf0a20a51099c7b906feaccbe00d3f1590c9139d754aec1497e1a662",
+    "independent_longer_operation_1794063365": "0f6bea62302e2a6e52cf5199439f553ae670e6495fd28440e853e77045d5a732"
+  },
+  "runtime_code": {
+    "check_identity.py": "6947863b5268351c03a55cafc94c00688f660c68572adae3af34fcb0079de31a",
+    "outer_runner.py": "d1010fc0053422db137e59c8c3ed8cb4ca8c13df323b4ce0561df4598f241fd9",
+    "task_entry.py": "dbb86b580baae5d981949250f28482409f42feca1de3bbc091241e3fc5a2c572"
+  },
+  "binding_sha256": "93922612fc602dfe79cd3dab64b2a24b78cbd57237756bdcd56f404b222cef65",
+  "source45_sha256": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "actual_grant_created_in_prequeue": false,
+  "tensor_payload_bytes": 0,
+  "native_jobs_in_prequeue": 0
+}

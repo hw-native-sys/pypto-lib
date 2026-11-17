@@ -1,0 +1,6 @@
+{
+  "start_epoch": 1794211028.543119,
+  "role": "worker-agent",
+  "earlier_reading": "UNMETERED_NOT_BACKDATED",
+  "scope": "worker_cases/** only"
+}

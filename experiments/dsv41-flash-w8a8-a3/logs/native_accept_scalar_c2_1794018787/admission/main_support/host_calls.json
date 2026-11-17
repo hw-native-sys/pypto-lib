@@ -1,0 +1,94 @@
+{
+  "actual_generated_host_orch": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/scalar_c2_streaming_1794014676/main/continuation/build_output/_jit_prefill_fwd_20261107_102100_pd4n_k5v/orchestration/host_orch.py",
+  "sha256": "7247c4309f2ce528fdd1b9af16a4815e7ebd1839b58417bd92555c8955578932",
+  "_submit_chip_syntactic_sites": 1,
+  "CPU_meta_only_actual_orchestration_trace": [
+    {
+      "worker": 0,
+      "callee": "l2_prefill_fwd"
+    },
+    {
+      "worker": 1,
+      "callee": "l2_prefill_fwd"
+    },
+    {
+      "worker": 2,
+      "callee": "l2_prefill_fwd"
+    },
+    {
+      "worker": 3,
+      "callee": "l2_prefill_fwd"
+    },
+    {
+      "worker": 4,
+      "callee": "l2_prefill_fwd"
+    },
+    {
+      "worker": 5,
+      "callee": "l2_prefill_fwd"
+    },
+    {
+      "worker": 6,
+      "callee": "l2_prefill_fwd"
+    },
+    {
+      "worker": 7,
+      "callee": "l2_prefill_fwd"
+    },
+    {
+      "worker": 8,
+      "callee": "l2_prefill_fwd"
+    },
+    {
+      "worker": 9,
+      "callee": "l2_prefill_fwd"
+    },
+    {
+      "worker": 10,
+      "callee": "l2_prefill_fwd"
+    },
+    {
+      "worker": 11,
+      "callee": "l2_prefill_fwd"
+    },
+    {
+      "worker": 12,
+      "callee": "l2_prefill_fwd"
+    },
+    {
+      "worker": 13,
+      "callee": "l2_prefill_fwd"
+    },
+    {
+      "worker": 14,
+      "callee": "l2_prefill_fwd"
+    },
+    {
+      "worker": 15,
+      "callee": "l2_prefill_fwd"
+    }
+  ],
+  "per_rank_calls": {
+    "0": 1,
+    "1": 1,
+    "2": 1,
+    "3": 1,
+    "4": 1,
+    "5": 1,
+    "6": 1,
+    "7": 1,
+    "8": 1,
+    "9": 1,
+    "10": 1,
+    "11": 1,
+    "12": 1,
+    "13": 1,
+    "14": 1,
+    "15": 1
+  },
+  "world_size": 16,
+  "enable_chip_swimlane": 0,
+  "two_pass_profile": false,
+  "scope": "ONE generated HOST invocation, exact frozen source, meta tensors/fake ABI sinks: no native submit, allocation, weight payload or admission/bank telemetry; native single-graph evidence remains reviewer-owned",
+  "frozen45_unchanged": true
+}

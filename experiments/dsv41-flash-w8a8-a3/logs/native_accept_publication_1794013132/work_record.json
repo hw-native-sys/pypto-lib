@@ -1,0 +1,8 @@
+{
+  "record_id": "review-publication-1794013132-1794013882",
+  "agent": "review-agent",
+  "start": 1794013132,
+  "end": 1794013882,
+  "duration": 750,
+  "activity": "Independent frozen publication/residency CPU/native acceptance; sixselectionoutputs recovered, C2state residualnumericalFAIL; exact PreparedDispatch tinyFP32scalarFAIL before execution; chainunrun/fullweightsheld; no source changes"
+}

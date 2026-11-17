@@ -1,0 +1,8 @@
+{
+  "scope": "CPU fake subprocess only; no grant/productCLI/device",
+  "runner_sha256": "3232d18acb3328fa4ac6d0f74a7947ef4bba17ea52b42264c6c931299252b934",
+  "short_CLI_starttick_captured": true,
+  "short_CLI_absent_after_wait": true,
+  "primary_exit7_and_postcheck_error_retained": true,
+  "monitor_stopped": true
+}

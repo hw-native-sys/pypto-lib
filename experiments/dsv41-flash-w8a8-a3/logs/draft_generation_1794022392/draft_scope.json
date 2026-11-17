@@ -1,0 +1,21 @@
+{
+  "base_sha256": "26b6db8451afa4488bff71699b94b7ffcf86abcec08e2919912e388fa904c8fd",
+  "draft_sha256": "dbeb7dba1dad600689954c893d110817337fb3e57c3aa9045ea1c5e20fa03cd8",
+  "changed_functions": [
+    "build_parser",
+    "device_run",
+    "dry_run",
+    "greedy_sample",
+    "main"
+  ],
+  "added": [
+    "SamplingDisagreement",
+    "exact_prompt_tokens"
+  ],
+  "removed": [
+    "fit_prompt_to_tile"
+  ],
+  "hardguard_AST_equal": true,
+  "PreparedDispatch_AST_equal": true,
+  "root_apply": "NOT AUTHORIZED/NOT APPLIED"
+}

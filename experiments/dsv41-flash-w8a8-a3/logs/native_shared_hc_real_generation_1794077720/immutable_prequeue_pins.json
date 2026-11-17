@@ -1,0 +1,29 @@
+{
+  "epoch": 1794077802.1138601,
+  "status": "PASS_FROZEN_SHARED_HC_PREPARATION_PINS",
+  "scope": "PREPARATION_ONLY_EXPLICIT_ACTUAL_GO_REQUIRED",
+  "pins": {
+    "shared_hc_real_operation_prepare_1794076136": "0a879238b20ca62ec096f3ee6b4afb9b81f29e8691389971219a462149bd0861",
+    "hc_boundary_apply_1794075705": "9970561c56cd6b6fd564196795b66c78a23303cf5e18191c690a37524303994f",
+    "independent_hc_applied_signatures_1794076423": "4ec39ab4506fe6d388fab0d7503f3be4d6b47d72faac0fbbda978f6a473a42a5"
+  },
+  "runtime_code": {
+    "check_identity.py": "e388da42cde32f0d0c8917e1e1ca1f405aafda89d0af470650d7bba9af1c9c6b",
+    "outer_runner.py": "4aec58e092826116b846aa2c960f5ac989d94a09a44bfa89fe161677051da70d",
+    "task_entry.py": "670b126af3b878f8b4e2c6cbbc3a716bb9a0ac6c043bedda49b5c18d0eda02b6"
+  },
+  "binding_sha256": "aee30bb487c41dd8acc6b4a674615e9a6b699dd699f652b291b91c1c35752c07",
+  "source45_sha256": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "native_submission_authorized": false,
+  "afterallocation_grant_authorized": false,
+  "native_jobs": 0,
+  "actual_grants": 0,
+  "tensor_payload_bytes": 0,
+  "planning_floors": {
+    "host_available": 68719476736,
+    "disk_available": 2147483648,
+    "shm_available": 17179869184,
+    "source_component_bytes": 5362417664
+  },
+  "planning_note": "No source-component or forward peak measurement implied."
+}

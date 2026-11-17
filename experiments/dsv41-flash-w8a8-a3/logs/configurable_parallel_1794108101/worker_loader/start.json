@@ -1,0 +1,8 @@
+{
+  "start_epoch": 1794108310.7173681,
+  "role": "worker-agent",
+  "scope": [
+    "weight_map.py",
+    "weight_loader.py"
+  ]
+}

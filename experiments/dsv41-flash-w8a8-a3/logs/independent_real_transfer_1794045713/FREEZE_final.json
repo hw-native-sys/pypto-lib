@@ -1,0 +1,16 @@
+{
+  "status": "FINAL/PARK",
+  "artifact_files": 115,
+  "artifacts_manifest_sha256": "0ee2a16e567487752325cd5e163905976501377eb4004fd79e49e239925bae35",
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "transport_sha256": "5e364da73ac36d59bce09f92dc4efb8501e900175fc91afc08f91cf0da9dfbb5",
+  "plan_sha256": "6172ee8e67687d176a2ed3e4441c7d2d858ac0e5a5271e3600648721aafda28e",
+  "observer_sha256": "31cd56f5bff3dd6db0f24d47ed2534efbbbe0ec46c68b256b65b0ae3d3eb7892",
+  "observer_cli_sha256": "8fed1c1f6be60e959a8d74f19f83c554b38f7b1b4f34b915ff8deba1a8a57786",
+  "all_own_CPU_jobs_terminal": true,
+  "NPU_jobs": 0,
+  "real_checkpoint_tensor_payload_reads": 0,
+  "actual_grant_created": false,
+  "work_record": "review-real-transfer-prepare-1794045713-1794047351",
+  "future_scope": "Separate Root authorization only; no operational exceptions or old evidence writes"
+}

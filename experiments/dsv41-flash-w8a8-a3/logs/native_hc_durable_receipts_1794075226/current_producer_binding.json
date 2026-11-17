@@ -1,0 +1,7 @@
+{
+  "source45_sha256": "b3e19fd001c74f7a5b497c791c01924ca09c0678df66114fce599e890d8fee06",
+  "generate_sha256": "fba8a4ef9a06f694fa53278bb80ae2ad70d111336dbead938ab9f8511d27e16e",
+  "main_final_artifacts_sha256": "9aeb50ef3e9f5b8e90993063d7ccb03a668010a310cd16aa83063ee69d94ede5",
+  "source": "shared_weight_owner_apply_1794074398",
+  "historical_CC_note": "CC is historical; only generate differs; HC and other math unchanged."
+}

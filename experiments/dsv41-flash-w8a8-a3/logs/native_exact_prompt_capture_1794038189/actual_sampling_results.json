@@ -1,0 +1,281 @@
+{
+  "status": "PASS_SAVED_ACTUAL_N3_STRICT_DP_SAMPLING_AND_COPIED_CONTROL",
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "producer_generate_sha256": "685cf3cfadf36c92b5f9c6280f9f9d90ebf0e3244133a2b550adea83ceb29cfb",
+  "prefix_manifest_sha256": "f4ca9d488b7e27c6388ff2aa68a71d122a1df5e7d9b2eb186f1321ad0cf28daf",
+  "cpu_receipt_sha256": "95046fb12a3c88775b563a2bedf26c1b6f9ec08eca7168fd08e96d4668bf0ad7",
+  "actual_logits_sha256_before_after": "7c54ac9530e377772d24f42aebb308812b7d5cf60415ebc17aa77c722f32d88a",
+  "sample": {
+    "token_id": 16684,
+    "logit": 5.91607666015625,
+    "shard_argmax": [
+      [
+        5.91607666015625,
+        16684
+      ],
+      [
+        5.91607666015625,
+        49004
+      ],
+      [
+        5.91607666015625,
+        81324
+      ],
+      [
+        5.91607666015625,
+        113644
+      ]
+    ],
+    "dp_disagreements": [],
+    "dp_votes": [
+      {
+        "dp_group": 0,
+        "token_id": 16684,
+        "logit": 5.91607666015625,
+        "shard_argmax": [
+          [
+            5.91607666015625,
+            16684
+          ],
+          [
+            5.91607666015625,
+            49004
+          ],
+          [
+            5.91607666015625,
+            81324
+          ],
+          [
+            5.91607666015625,
+            113644
+          ]
+        ]
+      },
+      {
+        "dp_group": 1,
+        "token_id": 16684,
+        "logit": 5.91607666015625,
+        "shard_argmax": [
+          [
+            5.91607666015625,
+            16684
+          ],
+          [
+            5.91607666015625,
+            49004
+          ],
+          [
+            5.91607666015625,
+            81324
+          ],
+          [
+            5.91607666015625,
+            113644
+          ]
+        ]
+      },
+      {
+        "dp_group": 2,
+        "token_id": 16684,
+        "logit": 5.91607666015625,
+        "shard_argmax": [
+          [
+            5.91607666015625,
+            16684
+          ],
+          [
+            5.91607666015625,
+            49004
+          ],
+          [
+            5.91607666015625,
+            81324
+          ],
+          [
+            5.91607666015625,
+            113644
+          ]
+        ]
+      },
+      {
+        "dp_group": 3,
+        "token_id": 16684,
+        "logit": 5.91607666015625,
+        "shard_argmax": [
+          [
+            5.91607666015625,
+            16684
+          ],
+          [
+            5.91607666015625,
+            49004
+          ],
+          [
+            5.91607666015625,
+            81324
+          ],
+          [
+            5.91607666015625,
+            113644
+          ]
+        ]
+      }
+    ],
+    "agreement_checked": true,
+    "context": {
+      "phase": "prefill",
+      "position": 2,
+      "prompt_ids": [
+        100,
+        101,
+        102
+      ],
+      "generated_ids": [],
+      "scope": "saved actual prefix3 logits only; not text generation"
+    }
+  },
+  "copied_one_DP_control": {
+    "kind": "dp_greedy_disagreement",
+    "selected_dp_group": 0,
+    "row": 2,
+    "selection": {
+      "token_id": 16684,
+      "logit": 5.91607666015625,
+      "shard_argmax": [
+        [
+          5.91607666015625,
+          16684
+        ],
+        [
+          5.91607666015625,
+          49004
+        ],
+        [
+          5.91607666015625,
+          81324
+        ],
+        [
+          5.91607666015625,
+          113644
+        ]
+      ],
+      "dp_disagreements": [
+        {
+          "dp_group": 3,
+          "token_id": 16685,
+          "value": 6.91607666015625
+        }
+      ],
+      "dp_votes": [
+        {
+          "dp_group": 0,
+          "token_id": 16684,
+          "logit": 5.91607666015625,
+          "shard_argmax": [
+            [
+              5.91607666015625,
+              16684
+            ],
+            [
+              5.91607666015625,
+              49004
+            ],
+            [
+              5.91607666015625,
+              81324
+            ],
+            [
+              5.91607666015625,
+              113644
+            ]
+          ]
+        },
+        {
+          "dp_group": 1,
+          "token_id": 16684,
+          "logit": 5.91607666015625,
+          "shard_argmax": [
+            [
+              5.91607666015625,
+              16684
+            ],
+            [
+              5.91607666015625,
+              49004
+            ],
+            [
+              5.91607666015625,
+              81324
+            ],
+            [
+              5.91607666015625,
+              113644
+            ]
+          ]
+        },
+        {
+          "dp_group": 2,
+          "token_id": 16684,
+          "logit": 5.91607666015625,
+          "shard_argmax": [
+            [
+              5.91607666015625,
+              16684
+            ],
+            [
+              5.91607666015625,
+              49004
+            ],
+            [
+              5.91607666015625,
+              81324
+            ],
+            [
+              5.91607666015625,
+              113644
+            ]
+          ]
+        },
+        {
+          "dp_group": 3,
+          "token_id": 16685,
+          "logit": 6.91607666015625,
+          "shard_argmax": [
+            [
+              6.91607666015625,
+              16685
+            ],
+            [
+              5.91607666015625,
+              49004
+            ],
+            [
+              5.91607666015625,
+              81324
+            ],
+            [
+              5.91607666015625,
+              113644
+            ]
+          ]
+        }
+      ],
+      "agreement_checked": true,
+      "context": {
+        "phase": "prefill",
+        "position": 2,
+        "prompt_ids": [
+          100,
+          101,
+          102
+        ],
+        "generated_ids": [],
+        "scope": "saved actual prefix3 logits only; not text generation"
+      }
+    }
+  },
+  "original_payload_and_logits_unchanged": true,
+  "fixture_rebuilds": 0,
+  "NPU": 0,
+  "text_generation": false
+}

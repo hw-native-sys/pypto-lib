@@ -1,0 +1,12 @@
+{
+  "status": "FINAL_PARK",
+  "files": 11,
+  "manifest_sha256": "cfca1440fbd50b135a73aa9980936a4b88ed24e93e9fc86d4370def43c7c5a5e",
+  "report_sha256": "982bee9ef91db92fcee6a7984951727c93f7461ba6acd96b4161566a64eb939a",
+  "live_M02_unchanged": true,
+  "queued_tasks": 0,
+  "model_writes": 0,
+  "shared_docs": 3,
+  "own_jobs": 0,
+  "writers": 0
+}

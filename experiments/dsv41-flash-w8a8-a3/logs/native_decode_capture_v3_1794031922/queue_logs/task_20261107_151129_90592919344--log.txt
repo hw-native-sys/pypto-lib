@@ -1,0 +1,5 @@
+PyPTO environment activated: /mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local
+PYPTO_ROOT=/mnt/data/pyptouser/yangyaodong/code/pypto
+PTOAS_ROOT=/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local
+PTO_ISA_ROOT=/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/build/pto-isa
+FINAL_CHAIN57_NEGATIVE_HASH_RESOURCE_CLEANUP_PASS {"gatePASS": 57, "nativeTerminals": 64, "recorded_pids_count": 20, "all_absent": true, "shared_output_files": 32, "host_available": 1722276978688, "shm_used": 557056}

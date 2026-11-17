@@ -1,0 +1,17 @@
+{
+  "status": "FINAL/PARK",
+  "applied_source45_sha256": "d77d196be6541b4a87aef07cf0e5e02eac68cefa9fc245f3742e4c14606555aa",
+  "source_manifest_bytes": 5534,
+  "predecessor_source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "generate_sha256": "d057012464331b10b0bdc7f406925ee0c552dd298a1db171a93b0b1595769598",
+  "other44_unchanged": true,
+  "applied_patch_sha256": "522dae74110e5e1725e9b36a399c6919138b1937d900a593ffc26ab3ca0f1dca",
+  "artifacts_sha256": "7402f715fd2acd0ea4574821e7be1637ff6b00923207949d79430d1357a45e11",
+  "artifact_count": 17,
+  "all_own_jobs_writers_parked": true,
+  "compile_jobs": 0,
+  "native_jobs": 0,
+  "real_payload_bytes": 0,
+  "positive_actual_grants": 0,
+  "end_epoch": 1794052695
+}

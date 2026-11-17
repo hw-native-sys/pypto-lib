@@ -1,0 +1,27 @@
+{
+  "status": "FAILED_OWN_PUBLISHER_CLI_BEFORE_PUBLIC_QUERY",
+  "task_id": "task_20261108_122653_139314330834",
+  "exit": 2,
+  "allocated": [
+    0,
+    1
+  ],
+  "public_prepare": 0,
+  "fixture_created": false,
+  "device_dispatches": 0,
+  "stage_grants": 0,
+  "primary": "argparse rejected queue-injected --device 0,1",
+  "normal_owner_close": "NOT_ENTERED",
+  "raw_queue_locks_released": true,
+  "observed_lock_holder_pid": 1393279,
+  "observed_pid_currently_absent": true,
+  "historical_start_ticks": "UNKNOWN_NOT_OBSERVED",
+  "native_ready_workers": 0,
+  "HBM_query": 0,
+  "no_running_processes_in_board_NPU0_for_physical01": true,
+  "raw_hbm_baseline_nonzero": "raw npu_smi_after.txt records3145/2870MiB; no zero-HBM claim",
+  "TP_submitted": false,
+  "frozen162_unchanged": true,
+  "whole_attempt": "FAILED",
+  "shared_writes": 0
+}

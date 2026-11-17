@@ -1,0 +1,104 @@
+{
+  "checkpoint_manifest_sha256": "f3b90ddddd2fd8f6c0db2e70b61ed8b558c8ff17e5a006a8afa7b3204d9dee75",
+  "evidence_mode": "CPU_MOCKED_TOY_ONLY",
+  "all_outputs_pass": true,
+  "output_names": [
+    "layer_x_hc",
+    "layer_pre_mix",
+    "logits",
+    "window_cache",
+    "compressed_cache_c2a",
+    "compressed_cache_c1a",
+    "index_cache_c2a",
+    "index_cache_c1a",
+    "state_cache_c2a",
+    "topk_values_c2a",
+    "topk_values_c1a",
+    "pool_block_ids_c2a",
+    "pool_block_ids_c1a",
+    "pool_block_counts_c2a",
+    "pool_block_counts_c1a",
+    "topk_indices_c2a",
+    "topk_indices_c1a"
+  ],
+  "scope": "owning unconditioned plus actual-snapshot staged comparators; exact CPU integer reference",
+  "validated_scopes": {
+    "unconditioned": true,
+    "staged": true
+  },
+  "reference_provenance": {
+    "schema": "bound-original-producer-exact-cpu-reference/1",
+    "checkpoint_manifest_sha256": "f3b90ddddd2fd8f6c0db2e70b61ed8b558c8ff17e5a006a8afa7b3204d9dee75",
+    "producer_manifest_sha256": "ab1ced6d6ecbf9887297458703ba9b74e2c9b8bc57608370b4c2e0310e027e37",
+    "compiled_metadata_sha256": "b4be8cc653a15e911287d2ec9fcaa3b2dc1193271321db684a6770a7af58a68a",
+    "owner_epoch": "CPU_MOCKED-prefix",
+    "owner_closed_sha256": "e69cc11dd76cdaa706e9e9e27c8accf8247bd2f751d80b597aad135f958a346c",
+    "mode": "ONBOARD",
+    "phase": "prefix",
+    "fixture_recipe": {
+      "seed": 0,
+      "provider": "CPU_MOCKED_TOY_ONLY"
+    },
+    "static_manifest_sha256": "de23fd9f16110bb58e312223319e60f12873118a20ea608f903635705c567f41",
+    "policy_sha256": "e8b66329567fcebc0f5dfbbf7a612b0220877eabca376f2c891d467e7252a117",
+    "bridge_sha256": "c1f942c90ccb4fbec3fe3e3852b51ac64c616f1607076b55f486a30864026834",
+    "evaluator_sha256": "0929a54ecb9022259152692c8dfb6e166237ed5cb99359b231334c7db2515ddf",
+    "derived_receipt_sha256": "8ceac8fcab327b6e31b8016b9b66b60d11f64d2bb493fbb6f9b7c666eb05f778",
+    "evidence_scope": "CPU_TOY_ONLY",
+    "initial_pristine": true,
+    "static_bytes_verified_before_after_cpu": true,
+    "oracle_integrity": [
+      {
+        "scope": "unconditioned",
+        "initial_before_sha256": "23cad58740790952c5b499adad0b502a95e9a77a731b34265bcdfe3dfe2ee4bb",
+        "initial_after_sha256": "23cad58740790952c5b499adad0b502a95e9a77a731b34265bcdfe3dfe2ee4bb",
+        "tensor_count": 17,
+        "mutable_names": [
+          "window_cache",
+          "compressed_cache_c2a",
+          "index_cache_c2a",
+          "state_cache_c2a",
+          "compressed_cache_c1a",
+          "index_cache_c1a",
+          "topk_indices_c2a",
+          "topk_values_c2a",
+          "pool_block_ids_c2a",
+          "pool_block_counts_c2a",
+          "topk_indices_c1a",
+          "topk_values_c1a",
+          "pool_block_ids_c1a",
+          "pool_block_counts_c1a",
+          "x_hc",
+          "pre_mix"
+        ]
+      },
+      {
+        "scope": "staged",
+        "initial_before_sha256": "23cad58740790952c5b499adad0b502a95e9a77a731b34265bcdfe3dfe2ee4bb",
+        "initial_after_sha256": "23cad58740790952c5b499adad0b502a95e9a77a731b34265bcdfe3dfe2ee4bb",
+        "tensor_count": 17,
+        "mutable_names": [
+          "window_cache",
+          "compressed_cache_c2a",
+          "index_cache_c2a",
+          "state_cache_c2a",
+          "compressed_cache_c1a",
+          "index_cache_c1a",
+          "topk_indices_c2a",
+          "topk_values_c2a",
+          "pool_block_ids_c2a",
+          "pool_block_counts_c2a",
+          "topk_indices_c1a",
+          "topk_values_c1a",
+          "pool_block_ids_c1a",
+          "pool_block_counts_c1a",
+          "x_hc",
+          "pre_mix"
+        ]
+      }
+    ]
+  },
+  "phase": "prefix",
+  "unconditioned_logit_max_abs": 0.0,
+  "native_resume_authorized": false
+}

@@ -1,0 +1,20 @@
+[
+  {
+    "task": "task_20261107_111125_253782231836",
+    "status": "completed (exit=0)",
+    "log": "cpu_initial_queue.log",
+    "log_exit": 0
+  },
+  {
+    "task": "task_20261107_111241_254109111179",
+    "status": "completed (exit=0)",
+    "log": "cpu_contract_queue.log",
+    "log_exit": 0
+  },
+  {
+    "task": "task_20261107_111623_256301127842",
+    "status": "completed (exit=0)",
+    "log": "cpu_final_queue.log",
+    "log_exit": 0
+  }
+]

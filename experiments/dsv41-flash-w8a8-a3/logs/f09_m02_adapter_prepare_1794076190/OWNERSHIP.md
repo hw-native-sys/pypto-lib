@@ -1,0 +1,1 @@
+Main exclusive NEWartifact only: rebased4F09draftfiles plus read-onlysupportcopies, bounded3calladapter/teacherforcedfixture/count-receiptvalidator/tinyCPU/report. No worker. LiveM02/source45/recoverydocs/alloldbundlesimmutable. No compile/NPU/realpayload/fullfixture/grant. Start1794076190.

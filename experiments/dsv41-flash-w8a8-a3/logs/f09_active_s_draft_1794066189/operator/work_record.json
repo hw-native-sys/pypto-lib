@@ -1,0 +1,10 @@
+{
+  "id": "worker-f09-operator-draft-1794066473-1794066732",
+  "agent": "/root/main_native/f09_operator_draft",
+  "start_epoch": 1794066473,
+  "end_epoch": 1794066732,
+  "elapsed_seconds": 259,
+  "status": "FINAL/PARK",
+  "scope": "artifactoperatorcopy+tinyactualgoldenwithaffineexpertstub; no live source/compile/NPU/payload",
+  "imported_to_shared_ledger": false
+}

@@ -1,0 +1,62 @@
+{
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_oracle_provenance_fix_1794083242/REPORT.md": {
+    "sha256": "38755fcab03477d6172d35e0416a0be9246aa865ba00fe6aadd5e013ababbcf1",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_oracle_route_1794083897/inputs/REPORT.md"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_oracle_provenance_fix_1794083242/EXECUTION_PLAN.md": {
+    "sha256": "3bfeef8520a949a6c1e2256139c7704ff8e931af76454ec9f53b03b53bfd63c6",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_oracle_route_1794083897/inputs/EXECUTION_PLAN.md"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_oracle_provenance_fix_1794083242/FREEZE.json": {
+    "sha256": "e9d5bb239d95e603937e681599bf7882d5a2bc0018c39b56b921b120edd17224",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_oracle_route_1794083897/inputs/FREEZE.json"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_oracle_provenance_fix_1794083242/pins.json": {
+    "sha256": "2c2b5971799c6de37c821be7fc548fa74a74868c6e22077136a0906b176c86d1",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_oracle_route_1794083897/inputs/pins.json"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_oracle_provenance_fix_1794083242/artifacts.json": {
+    "sha256": "bb1b9c6fedf69cd205218550b0cecf4d58ca5b537ae867ba829b3ee808e677d1",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_oracle_route_1794083897/inputs/artifacts.json"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_oracle_provenance_fix_1794083242/route.py": {
+    "sha256": "12872cd0f5b8d5a12b84a329e66017f498381c727c1a44bff7cd251e2b877bf8",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_oracle_route_1794083897/inputs/route.py"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_oracle_provenance_fix_1794083242/native_stage.sh": {
+    "sha256": "caf30d0d1dafe8f108684ad146ae610ec3dd5221fd3b0c10635f56134539306e",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_oracle_route_1794083897/inputs/native_stage.sh"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_oracle_provenance_fix_1794083242/oracle_integrity.py": {
+    "sha256": "e45c7529d6c34cd57712a7d346ec612641896e38ab98ff88017ceafd87d999d3",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_oracle_route_1794083897/inputs/oracle_integrity.py"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_oracle_provenance_fix_1794083242/f09_decode_case.py": {
+    "sha256": "412cb48d4625d54958f949588cdf9d9d0b6457137b4e27a6de17c0d84582e295",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_oracle_route_1794083897/inputs/f09_decode_case.py"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_oracle_provenance_fix_1794083242/f09_decode_case.py.patch": {
+    "sha256": "0828c55eea184c46ea2241bba881ead0c9cab53204b7d30a5dfef9814a47340a",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_oracle_route_1794083897/inputs/f09_decode_case.py.patch"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_oracle_provenance_fix_1794083242/route.py.patch": {
+    "sha256": "68e23c283c58fedbe99d125e2caa71f1579119685f56c166397afa62693219ca",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_oracle_route_1794083897/inputs/route.py.patch"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_oracle_provenance_fix_1794083242/resource_plan.json": {
+    "sha256": "451d7686e2252d6cdf13b25a54089be5a600d7dcbdd119d0aa22ae3982c6c68f",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_oracle_route_1794083897/inputs/resource_plan.json"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_oracle_provenance_fix_1794083242/source45_rebased_UNAPPLIED.json": {
+    "sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_oracle_route_1794083897/inputs/source45_rebased_UNAPPLIED.json"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_oracle_provenance_fix_1794083242/artifact_lifecycle.py": {
+    "sha256": "1cc9c0b792b93a3c9d83b3461fd327d21f0bcd4872c289f76f3ab61e70c14a0d",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_oracle_route_1794083897/inputs/artifact_lifecycle.py"
+  },
+  "experiments/dsv41-flash-w8a8-a3/logs/f09_oracle_provenance_fix_1794083242/scenario.json": {
+    "sha256": "c7b6ab942f5ea17758389aa5a53dafbb1de79e68dbb6f41c4614d66dd6b6dbb1",
+    "copy": "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_oracle_route_1794083897/inputs/scenario.json"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "agent": "/root/reviewer_f09",
+  "accounting": "ONE nativeownerwindow includes passiveaudit/runtimefacts; NOT additive",
+  "start_epoch": 1794092280.012301,
+  "end_epoch": 1794092753.945623,
+  "native_owner_start_epoch": 1794092285.402418,
+  "native_stage_terminal_epoch": 1794092498.325278,
+  "native_owner_wall_seconds": 212.92286014556885,
+  "native_task": "task_20261108_065800_182518612591",
+  "native_tasks": 1,
+  "CPU_reference_tasks": 0,
+  "shared_writes": 0,
+  "ownjobs": 0,
+  "status": "FAILED_RETENTION_SECOND_DISPATCH_FINAL_PARK"
+}

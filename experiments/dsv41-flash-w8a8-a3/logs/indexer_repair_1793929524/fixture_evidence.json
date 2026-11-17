@@ -1,0 +1,538 @@
+[
+  {
+    "tokens": 8,
+    "pool_cap": 64,
+    "requests": [
+      [
+        10,
+        4
+      ],
+      [
+        13,
+        4
+      ]
+    ],
+    "table_width": 1,
+    "old_width": 8,
+    "score_width": 128,
+    "visible_lens": [
+      11,
+      12,
+      13,
+      14,
+      14,
+      15,
+      16,
+      17
+    ],
+    "expected_counts": [
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      3
+    ],
+    "spec_shapes": {
+      "x": [
+        8,
+        5120
+      ],
+      "qr": [
+        8,
+        1280
+      ],
+      "qr_scale": [
+        8,
+        1
+      ],
+      "wq_b": [
+        1280,
+        4096
+      ],
+      "wq_b_scale": [
+        4096
+      ],
+      "weights_proj": [
+        5120,
+        32
+      ],
+      "wk": [
+        128,
+        512
+      ],
+      "k_norm": [
+        128
+      ],
+      "latent": [
+        8,
+        512
+      ],
+      "cos": [
+        8,
+        32
+      ],
+      "sin": [
+        8,
+        32
+      ],
+      "compressed_cos": [
+        8,
+        32
+      ],
+      "compressed_sin": [
+        8,
+        32
+      ],
+      "compressed_slots": [
+        8
+      ],
+      "position_ids": [
+        8
+      ],
+      "request_ids": [
+        8
+      ],
+      "compressed_lens": [
+        8
+      ],
+      "index_cache": [
+        2,
+        128,
+        1,
+        128
+      ],
+      "index_block_table": [
+        2,
+        1
+      ],
+      "scores": [
+        8,
+        128
+      ],
+      "indices": [
+        8,
+        512
+      ],
+      "values": [
+        8,
+        512
+      ],
+      "pool_ids": [
+        8,
+        64
+      ],
+      "pool_counts": [
+        8
+      ]
+    }
+  },
+  {
+    "tokens": 16,
+    "pool_cap": 64,
+    "requests": [
+      [
+        18,
+        8
+      ],
+      [
+        21,
+        8
+      ]
+    ],
+    "table_width": 1,
+    "old_width": 8,
+    "score_width": 128,
+    "visible_lens": [
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29
+    ],
+    "expected_counts": [
+      3,
+      3,
+      3,
+      3,
+      3,
+      3,
+      4,
+      4,
+      3,
+      3,
+      3,
+      4,
+      4,
+      4,
+      4,
+      4
+    ],
+    "spec_shapes": {
+      "x": [
+        16,
+        5120
+      ],
+      "qr": [
+        16,
+        1280
+      ],
+      "qr_scale": [
+        16,
+        1
+      ],
+      "wq_b": [
+        1280,
+        4096
+      ],
+      "wq_b_scale": [
+        4096
+      ],
+      "weights_proj": [
+        5120,
+        32
+      ],
+      "wk": [
+        128,
+        512
+      ],
+      "k_norm": [
+        128
+      ],
+      "latent": [
+        16,
+        512
+      ],
+      "cos": [
+        16,
+        32
+      ],
+      "sin": [
+        16,
+        32
+      ],
+      "compressed_cos": [
+        16,
+        32
+      ],
+      "compressed_sin": [
+        16,
+        32
+      ],
+      "compressed_slots": [
+        16
+      ],
+      "position_ids": [
+        16
+      ],
+      "request_ids": [
+        16
+      ],
+      "compressed_lens": [
+        16
+      ],
+      "index_cache": [
+        2,
+        128,
+        1,
+        128
+      ],
+      "index_block_table": [
+        2,
+        1
+      ],
+      "scores": [
+        16,
+        128
+      ],
+      "indices": [
+        16,
+        512
+      ],
+      "values": [
+        16,
+        512
+      ],
+      "pool_ids": [
+        16,
+        64
+      ],
+      "pool_counts": [
+        16
+      ]
+    }
+  },
+  {
+    "tokens": 8,
+    "pool_cap": 64,
+    "requests": [
+      [
+        125,
+        4
+      ],
+      [
+        129,
+        4
+      ]
+    ],
+    "table_width": 2,
+    "old_width": 16,
+    "score_width": 256,
+    "visible_lens": [
+      126,
+      127,
+      128,
+      129,
+      130,
+      131,
+      132,
+      133
+    ],
+    "expected_counts": [
+      16,
+      16,
+      16,
+      17,
+      17,
+      17,
+      17,
+      17
+    ],
+    "spec_shapes": {
+      "x": [
+        8,
+        5120
+      ],
+      "qr": [
+        8,
+        1280
+      ],
+      "qr_scale": [
+        8,
+        1
+      ],
+      "wq_b": [
+        1280,
+        4096
+      ],
+      "wq_b_scale": [
+        4096
+      ],
+      "weights_proj": [
+        5120,
+        32
+      ],
+      "wk": [
+        128,
+        512
+      ],
+      "k_norm": [
+        128
+      ],
+      "latent": [
+        8,
+        512
+      ],
+      "cos": [
+        8,
+        32
+      ],
+      "sin": [
+        8,
+        32
+      ],
+      "compressed_cos": [
+        8,
+        32
+      ],
+      "compressed_sin": [
+        8,
+        32
+      ],
+      "compressed_slots": [
+        8
+      ],
+      "position_ids": [
+        8
+      ],
+      "request_ids": [
+        8
+      ],
+      "compressed_lens": [
+        8
+      ],
+      "index_cache": [
+        4,
+        128,
+        1,
+        128
+      ],
+      "index_block_table": [
+        2,
+        2
+      ],
+      "scores": [
+        8,
+        256
+      ],
+      "indices": [
+        8,
+        512
+      ],
+      "values": [
+        8,
+        512
+      ],
+      "pool_ids": [
+        8,
+        64
+      ],
+      "pool_counts": [
+        8
+      ]
+    }
+  },
+  {
+    "tokens": 8,
+    "pool_cap": 2048,
+    "requests": [
+      [
+        125,
+        4
+      ],
+      [
+        129,
+        4
+      ]
+    ],
+    "table_width": 2,
+    "old_width": 16,
+    "score_width": 256,
+    "visible_lens": [
+      126,
+      127,
+      128,
+      129,
+      130,
+      131,
+      132,
+      133
+    ],
+    "expected_counts": [
+      16,
+      16,
+      16,
+      17,
+      17,
+      17,
+      17,
+      17
+    ],
+    "spec_shapes": {
+      "x": [
+        8,
+        5120
+      ],
+      "qr": [
+        8,
+        1280
+      ],
+      "qr_scale": [
+        8,
+        1
+      ],
+      "wq_b": [
+        1280,
+        4096
+      ],
+      "wq_b_scale": [
+        4096
+      ],
+      "weights_proj": [
+        5120,
+        32
+      ],
+      "wk": [
+        128,
+        512
+      ],
+      "k_norm": [
+        128
+      ],
+      "latent": [
+        8,
+        512
+      ],
+      "cos": [
+        8,
+        32
+      ],
+      "sin": [
+        8,
+        32
+      ],
+      "compressed_cos": [
+        8,
+        32
+      ],
+      "compressed_sin": [
+        8,
+        32
+      ],
+      "compressed_slots": [
+        8
+      ],
+      "position_ids": [
+        8
+      ],
+      "request_ids": [
+        8
+      ],
+      "compressed_lens": [
+        8
+      ],
+      "index_cache": [
+        4,
+        128,
+        1,
+        128
+      ],
+      "index_block_table": [
+        2,
+        2
+      ],
+      "scores": [
+        8,
+        256
+      ],
+      "indices": [
+        8,
+        512
+      ],
+      "values": [
+        8,
+        512
+      ],
+      "pool_ids": [
+        8,
+        2048
+      ],
+      "pool_counts": [
+        8
+      ]
+    }
+  }
+]

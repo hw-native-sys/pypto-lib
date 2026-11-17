@@ -1,0 +1,44 @@
+{
+  "status": "FINAL/PARK",
+  "epoch": 1794055260.0130072,
+  "task": "task_20261107_203714_359829711388",
+  "raw_status": "completed (exit=0)",
+  "status_query_exit": 0,
+  "log_query_exit": 0,
+  "recorded_identity_checks": [
+    {
+      "pid": 3598628,
+      "start_ticks": "105496073",
+      "same_identity_present": false
+    },
+    {
+      "pid": 3598671,
+      "start_ticks": "105496128",
+      "same_identity_present": false
+    },
+    {
+      "pid": 3598686,
+      "start_ticks": "105496151",
+      "same_identity_present": false
+    }
+  ],
+  "protected": {
+    "full_real_generation_operation_prepare_1794052340": {
+      "manifest_sha256": "f9197cab999b4b5b1a8897d09bc46db62f84615c39b5a0d53506476ea207a8be",
+      "entries": 48,
+      "all_unchanged": true
+    },
+    "generation_admission_apply_1794052225": {
+      "manifest_sha256": "7402f715fd2acd0ea4574821e7be1637ff6b00923207949d79430d1357a45e11",
+      "entries": 17,
+      "all_unchanged": true
+    }
+  },
+  "source45_sha256": "d77d196be6541b4a87aef07cf0e5e02eac68cefa9fc245f3742e4c14606555aa",
+  "actual_grants_created": 0,
+  "normal_product_CLI_runs": 0,
+  "own_native_jobs": 0,
+  "actual_checkpoint_tensor_reads": 0,
+  "all_own_children_reaped_by_test": true,
+  "no_more_tests": true
+}

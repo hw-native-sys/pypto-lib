@@ -1,0 +1,15 @@
+{
+  "role": "review-agent",
+  "measured_start_epoch": 1794072527,
+  "artifact_created_epoch": 1794072636.8485968,
+  "shared_writes": 0,
+  "scope": "independent frozen draft review, tiny CPU and signature compile; native PREPARATION ONLY",
+  "state": "PARKED",
+  "measured_end_epoch": 1794072889.912681,
+  "root_imports": "once, owned by Root",
+  "cpu_compile_task": "task_20261108_013235_332385828347",
+  "cpu_compile_exit": 0,
+  "failed_helper_task": "task_20261108_013152_33218937137",
+  "native_submitted": false,
+  "outstanding_tasks": []
+}

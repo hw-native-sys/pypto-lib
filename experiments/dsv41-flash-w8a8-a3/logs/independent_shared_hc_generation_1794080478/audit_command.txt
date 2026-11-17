@@ -1,0 +1,1 @@
+task-submit --no-device --max-time 600 --run 'source activate-pypto.sh && PYTHONDONTWRITEBYTECODE=1 python experiments/dsv41-flash-w8a8-a3/logs/independent_shared_hc_generation_1794080478/audit.py --handoff experiments/dsv41-flash-w8a8-a3/logs/independent_shared_hc_generation_1794080478/handoff.json'

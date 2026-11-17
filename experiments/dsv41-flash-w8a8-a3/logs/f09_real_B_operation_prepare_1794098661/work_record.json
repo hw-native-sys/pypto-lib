@@ -1,0 +1,22 @@
+{
+  "record_id": "main-f09-real-B-operation-prepare-1794098661",
+  "role": "main-agent",
+  "start_epoch": 1794098661,
+  "end_epoch": 1794099080.6587646,
+  "elapsed_seconds": 419.6587646007538,
+  "exclusive_directory": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_real_B_operation_prepare_1794098661",
+  "CPU_validation_tasks": [],
+  "source_only_preparation": true,
+  "source45_sha256": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+  "product_edits": 0,
+  "checkpoint_header_reads": 0,
+  "tensor_payload_bytes": 0,
+  "prepare": 0,
+  "NPU_jobs": 0,
+  "actual_grants": 0,
+  "shared_overlay_writes": 0,
+  "shared_ledger_writes": 0,
+  "workers": [],
+  "all_own_jobs_ended": true,
+  "status": "FINAL_PARK"
+}

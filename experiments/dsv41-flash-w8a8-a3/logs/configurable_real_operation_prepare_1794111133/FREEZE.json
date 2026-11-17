@@ -1,0 +1,16 @@
+{
+  "status": "FINAL_PARK_READY_FOR_INDEPENDENT_COMBINED_REVIEW_PREQUEUE",
+  "count": 14,
+  "manifest_sha256": "9205eb161aaf83edabf516c1a6cab5c1f666a894a99116f04d312cf311926dae",
+  "binding_sha256": "d01fe5a625b4102d3fffe509e89485f6fa438a9c67b1ffa32e96c3fe548e3e9d",
+  "report_sha256": "4128235f220fc5e22bf4b02a3208bc07f440a486b9016b185465afc1d9329de7",
+  "runtime_code": {
+    "check_identity.py": "b751e8cd8dc5ae23d84754b640f160c902066a5e2708580a8e06b09f9ec06b66",
+    "outer_runner.py": "e8a28d35ffa794cbabc3486cd4b8f6238d82626158ffae4e25298bec36820f00",
+    "task_entry.py": "f3ce9d43c65d8aa6ab09534b1af3c4ead2dcd8e2230efeab54869deb17dbaf4c"
+  },
+  "source45_sha256": "f0e91a30e4117e110be183ef44acf2874eea813cc6f72ac7c7fa44bc4ede3a7f",
+  "plan_sha256": "a7b187a084e304b5203aeb2b0897dcb291550fbcf6c5bbaea6d1fe42f49a2a46",
+  "all_writers_jobs_parked": true,
+  "NPU_authorized": false
+}

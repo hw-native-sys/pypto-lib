@@ -1,0 +1,11 @@
+{
+  "state": "FINAL_PARK_SOURCE_FINDINGS_AND_VALIDATION_RECOMMENDATIONS",
+  "A3_frozen_A8153_all45_files_unchanged": true,
+  "A5_or_A3_writes": 0,
+  "CPU_test_tasks": 0,
+  "compile_or_fixture_or_header_payload_or_prepare_or_NPU": false,
+  "no_grants_created": true,
+  "all_own_jobs_ended": true,
+  "candidate_implementation_acceptance": "PENDING_NEW_ROOT_ASSIGNMENT",
+  "epoch": 1794108796
+}

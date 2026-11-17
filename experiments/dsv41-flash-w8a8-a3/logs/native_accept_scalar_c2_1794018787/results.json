@@ -1,0 +1,119 @@
+{
+  "status": "FINAL_PARKED_PARTIAL",
+  "scope": "observer-owned independent frozen acceptance; observer decides gates",
+  "source_manifest_sha256": "ab1ced6d6ecbf9887297458703ba9b74e2c9b8bc57608370b4c2e0310e027e37",
+  "frozen_artifact_manifest_sha256": "63f32ae5ba9ca9986f8ce77c0c2c577aba41b3c08239b57fb07c1e48c8432c5e",
+  "source_count": 45,
+  "changed_count": 3,
+  "protected_count": 42,
+  "final_source_evidence_hashes_match": true,
+  "cpu_source_loader_scalar_owner_contracts": "PASS",
+  "actual40_expert_abi_compile": "PASS; compile only, no payload/samples",
+  "c2_golden_only_math_and_scope": "SUPPORTED; kernel/pool/casts/thresholds unchanged; original torch_npu unavailable",
+  "native_stream2": {
+    "task": "task_20261107_103711_19324148097",
+    "status": "PASS",
+    "calls": 3,
+    "uploaded_bytes": 3072,
+    "copy_calls": 24,
+    "copy_chunk_max": 128,
+    "scope": "current synthetic FP32 transport/scalars/readback/reuse/cleanup"
+  },
+  "native_decode16": {
+    "task": "task_20261107_103754_194255510331",
+    "status": "PASS",
+    "owning_exports": 19,
+    "scope": "40dense/reused1synthetic expert layer, noEngram, staged previous-layer comparisons"
+  },
+  "prefix_attempts": [
+    {
+      "task": "task_20261107_104722_245616122833",
+      "exit": 1,
+      "stage": "actual PyPTO RunConfig3GiB rejection before compile/prepare/deviceexecution"
+    },
+    {
+      "task": "task_20261107_105225_24784504908",
+      "exit": 1,
+      "stage": "reviewer false168-capacity multiplier guard afterprewarm, before weights/dispatch"
+    },
+    {
+      "task": "task_20261107_111437_25465236862",
+      "exit": 130,
+      "stage": "2400s CPU-reference timebox after successful native prefix terminal/copyback",
+      "native_terminal_outcome0_ranks": 16,
+      "prefix_export_count": 17,
+      "prefix_numeric_verdicts_completed": 0,
+      "decode_steps_executed": 0,
+      "stale_control_executed": false,
+      "tensor_checkpoint_saved": false,
+      "classification": "numerical UNKNOWN/timebox, not observed hardware/numerical failure"
+    }
+  ],
+  "program_bank_contract": {
+    "backend": "tensormap_and_ringbuffer",
+    "platform": "a2a3",
+    "mode": "PROGRAM",
+    "library_sha256": "24434f8879030ef1b1f31e5fc2ecce683e392d4f1baeb5bcee852fb183976e5c",
+    "shared_scratch_bank_selector": 0,
+    "contract_copies": 1,
+    "observed_constructed_bank_count": null,
+    "identity_capacity": 168,
+    "scope": "exact installed CAPI and pinned selector proof, not a general runtime assumption"
+  },
+  "prefix_memory": {
+    "before_weights_committed_per_rank": 5452852453,
+    "after_upload_committed_per_rank": 11916731557,
+    "static_delta_per_rank": 6463879104,
+    "after_dispatch_committed_per_rank": 12392403684,
+    "after_dispatch_min_free": 52932378624,
+    "preweight_min_free": 59885068288,
+    "sampled_hbm_max_reported_mb": 15705,
+    "scope": "completed native prefix resource execution; no prefix numerical/lifecycle/fullfit acceptance"
+  },
+  "cleanup": {
+    "pids": [
+      2546628,
+      2546950,
+      2547220,
+      2566371,
+      2566372,
+      2566383,
+      2566391,
+      2566398,
+      2566404,
+      2566410,
+      2566423,
+      2566430,
+      2566436,
+      2566442,
+      2566449,
+      2566462,
+      2566468,
+      2566474,
+      2566492,
+      2566505
+    ],
+    "still_present": [],
+    "task_status": "completed exit130",
+    "all16_lock_release_seen": true,
+    "resource_tracker_warning_preserved": true,
+    "dev_shm_used_bytes_filesystem_wide": 557056,
+    "shm_scope": "global filesystem observation; no manual deletion or attribution of unknown objects",
+    "actual_tensor_checkpoint_present": false
+  },
+  "all_jobs_ended": true,
+  "npu_locks_free": true,
+  "no_real_payload_or_source_edits": true,
+  "fullweights_and_text": "HELD",
+  "prefix_numerical_and_continuation": "OPEN",
+  "next": "observer-assigned recoverable capture -> offline CPU reference -> decoded returned-state validation; no reviewer relaunch",
+  "limits": [
+    "strict cumulative/original parity open",
+    "native reader-to-real-NZ weight compute not tested",
+    "forty distinct real expert layers compile only",
+    "F05/F07 historical hardware controls remain open",
+    "F09 general lifecycle open",
+    "prompt validity/DP enforcement next parent-owned source scope",
+    "resource tracker warning retained; no manual shm deletion"
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "bundles": [
+    {
+      "bundle": "pipeline",
+      "source": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/draft_generation_1794022392/checkpoint_pipeline_v2",
+      "manifest": "c60959169836de8c9917e71dcf3360a8295fbf75c7686886cc7833c4a1abd7ac",
+      "verified_files": 50
+    },
+    {
+      "bundle": "evaluator",
+      "source": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/exact_s32_evaluator_1794024036",
+      "manifest": "169b9a29fc623098f80ce174a319c8330477020356ce0980838fd1437f72dcb0",
+      "verified_files": 106
+    },
+    {
+      "bundle": "proof",
+      "source": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/cpu_s32_readiness_1794023355",
+      "manifest": "970c4ea69962ae695bab4da507d9d6baf07456246a6d9aab3261d2d009b3fc79",
+      "verified_files": 12
+    }
+  ],
+  "root45_and_owned45_exact": true
+}

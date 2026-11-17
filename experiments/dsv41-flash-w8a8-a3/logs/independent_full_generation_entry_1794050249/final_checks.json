@@ -1,0 +1,47 @@
+{
+  "status": "PASS_FROZEN_V2_INHERITS_REVIEWED_MAPPING_AUTH_AND_HOST_SCOPE",
+  "source45_current_unchanged": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "protected": {
+    "full_real_generation_prepare_1794048884": {
+      "manifest_sha256": "3be79eba56628bf610baec131680ea1bb7fa276af2123873475a2fa591a680fc",
+      "files": 32,
+      "original_and_copy_equal": true
+    },
+    "generation_admission_durability_1794051220": {
+      "manifest_sha256": "4b5e8de462dc6064ad4aa833033c4b493042597902599a681dbfec6fe8e104d6",
+      "files": 10,
+      "original_and_copy_equal": true
+    }
+  },
+  "v2_same_AST_functions": [
+    "greedy_sample",
+    "_shard_argmax",
+    "build_prompt",
+    "exact_prompt_tokens",
+    "build_prefill_inputs",
+    "build_decode_state",
+    "advance_decode_inputs",
+    "handoff_to_decode",
+    "make_run_config",
+    "require_full_materialization_budget",
+    "device_run",
+    "build_parser",
+    "submit"
+  ],
+  "v2_auth_initializer_same_except_empty_coverage_set": true,
+  "v2_source_pathset_actual_hash_binding_unchanged": true,
+  "v2_source_guard_and_NoForward_prerequisites_unchanged": true,
+  "metadata_snapshot_now_verified_final_Main32_equal": true,
+  "tokenizer_root": "/mnt/data/models/DeepSeek-V4.1-Flash-w8a8",
+  "tokenizer_files": {
+    "tokenizer.json": "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b",
+    "tokenizer_config.json": "6ac8c8dc065ed118161d02dd532749ae3f52c243deac27872134fae2f50d8547"
+  },
+  "future_inventory_is_PROPOSED_NOT_APPLIED": true,
+  "native": false,
+  "checkpoint_tensor_payload_reads": 0,
+  "own_pid": 3454084,
+  "own_starttick": 105152693,
+  "epoch": 1794051606.3227053,
+  "limits": "durability behavior independently owned by reviewer_fit; no repeated loop/mapping, no applied product or positive native receipt"
+}

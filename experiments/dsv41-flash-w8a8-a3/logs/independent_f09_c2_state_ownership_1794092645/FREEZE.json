@@ -1,0 +1,9 @@
+{
+  "state": "FINAL_PARK_SOURCE_BUG_FOUND",
+  "epoch": 1794092912,
+  "artifacts": 4,
+  "manifest_sha256": "905069c9647be985796a32a7abd1a6bfc9d0f1f0900f7664a77fd761cdba98e9",
+  "source_only": true,
+  "actual_failed_case_not_reclassified": true,
+  "CPU_or_NPU_jobs": 0
+}

@@ -1,0 +1,81 @@
+{
+  "status": "PASS_INDEPENDENT_NON_SQUARE_TINY_CPU_ONLY",
+  "source_shape_q": [
+    64,
+    96
+  ],
+  "packed_logical_shape": [
+    96,
+    64
+  ],
+  "independent_scalar_NZ_oracle": true,
+  "nonzero_integer_offsets": true,
+  "full57_fake_handle_count": 912,
+  "all912_free_attempts_and_normalclose": true,
+  "independent_TP_DP_expected_bytes": true,
+  "fake_unique_bytes": 31232,
+  "fake_cumulative_bytes": 104960,
+  "fake_H2D_and_D2H_bytes": 104704,
+  "controls": [
+    {
+      "case": "discard_nonzero_fold_return",
+      "actual_rejection": "source mapping/fold/NZ oracle or independent byte address failed"
+    },
+    {
+      "case": "wrong_non_square_NZ_order",
+      "actual_rejection": "source mapping/fold/NZ oracle or independent byte address failed"
+    },
+    {
+      "case": "TP2_wrong_source_rows",
+      "actual_rejection": "embedding TP source view address mismatch"
+    },
+    {
+      "case": "FP32_element_offset_is_not_bytes",
+      "actual_rejection": "writer vs independent ABI readback BYTE offset mismatch"
+    },
+    {
+      "case": "first_H2D_error_preserved_over_cleanup",
+      "actual_rejection": "FIRST independent H2D failure with unknown partial effect"
+    },
+    {
+      "case": "unallowlisted_head_before_payload",
+      "actual_rejection": "unallowlisted source/read order BEFORE payload open"
+    },
+    {
+      "case": "backing_retained_before_next_group",
+      "actual_rejection": "source backing/leaf still retained before next source group"
+    },
+    {
+      "case": "header_dtype_before_payload",
+      "actual_rejection": "source header dtype/byte units changed BEFORE payload"
+    },
+    {
+      "case": "absolute_range_before_payload",
+      "actual_rejection": "absolute source range mismatch BEFORE payload"
+    },
+    {
+      "case": "mtime_before_payload",
+      "actual_rejection": "checkpoint file identity changed"
+    },
+    {
+      "case": "NoForward",
+      "actual_rejection": "NoForward: other weights are uninitialized"
+    },
+    {
+      "case": "uninitialized_D2H",
+      "actual_rejection": "D2H uninitialized interval/cap"
+    },
+    {
+      "case": "D2H_gap_not_covered",
+      "actual_rejection": "D2H uninitialized interval/cap"
+    },
+    {
+      "case": "default_actual_refusal",
+      "actual_rejection": "DEFAULT REFUSE before real payload/runtime"
+    }
+  ],
+  "real_checkpoint_payload_bytes": 0,
+  "large_real_allocations": 0,
+  "NPU": 0,
+  "actual_authorization_created": false
+}

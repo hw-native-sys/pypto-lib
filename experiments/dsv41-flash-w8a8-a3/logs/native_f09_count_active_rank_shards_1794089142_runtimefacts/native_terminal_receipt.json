@@ -1,0 +1,183 @@
+{
+  "schema": "F09-native-count-terminal/1",
+  "status": "NATIVE_CAPTURE_COMPLETE_PENDING_CPU_COUNT_VALIDATION",
+  "native_task_id": "task_20261108_061506_170748215003",
+  "native_exit": 0,
+  "observed_epoch": 1794089818.2305388,
+  "normal_close": true,
+  "primary_error": null,
+  "cleanup_errors": [],
+  "active_capsules": [
+    {
+      "call": 0,
+      "file": "counts0.pt",
+      "sha256": "428232e11b5bcbb03f9d72e227d9f47f95d03a05ede2e96631df03b75cda4609"
+    },
+    {
+      "call": 1,
+      "file": "counts1.pt",
+      "sha256": "ed414c99e29d92ae8d8b0a5c0e15e4827b0b577f8532498359479e356793e3e5"
+    },
+    {
+      "call": 2,
+      "file": "counts2.pt",
+      "sha256": "587ea64d4351d0b74dab368d21c7952619649fb4624eb632de3a752af3850749"
+    }
+  ],
+  "count_matrix_not_loaded": true,
+  "count_or_math_acceptance": false,
+  "known_launcher_stage": [
+    {
+      "source": "launcher_birth.json",
+      "identity": {
+        "pid": 1708256,
+        "starttick": "108963288"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    },
+    {
+      "source": "stage_birth.json",
+      "identity": {
+        "pid": 1708320,
+        "starttick": "108963380"
+      },
+      "proc_exists": false,
+      "same_identity_present": false
+    }
+  ],
+  "known_ready_workers": [
+    {
+      "pid": 1710794,
+      "device": 0,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1710797,
+      "device": 1,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1710813,
+      "device": 3,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1710805,
+      "device": 2,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1710827,
+      "device": 5,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1710818,
+      "device": 4,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1710834,
+      "device": 6,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1710842,
+      "device": 7,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1710856,
+      "device": 8,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1710863,
+      "device": 9,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1710871,
+      "device": 10,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1710879,
+      "device": 11,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1710887,
+      "device": 12,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1710901,
+      "device": 13,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1710909,
+      "device": 14,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    },
+    {
+      "pid": 1710916,
+      "device": 15,
+      "current_proc_exists": false,
+      "historical_starttick": "UNKNOWN"
+    }
+  ],
+  "all16_current_ready_PID_numbers_absent": true,
+  "all_known_birth_identities_absent": true,
+  "historical_worker_manager_helper_birth_completeness": "UNKNOWN; not reconstructed",
+  "all16_image_free_devices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "prepared_object_count": 32,
+  "prepared_text_count": 32,
+  "prepared_receipt_sha256": "d1dc79cd6908492167d395ae5ae4fc92150465b37db629783e086c46dfefa1ff",
+  "source_projection_unchanged": 156,
+  "prep_manifest_unchanged": true,
+  "source405_unchanged": true,
+  "PSS_or_peak_measured": false,
+  "raw16_release": "separate exact task rawlog saved alongside",
+  "shared_writes": 0,
+  "raw16_lock_release_observed": true,
+  "external_task_terminal_exit0": true,
+  "native_raw16_cleanup_audit_pass": true,
+  "cleanup_audit_scope": "terminal+raw16release+all16readyPID_current_absence+recordedlauncher_stage_birth_absence; historicalunknownexplicit",
+  "raw_task_log_sha256": "fcba2ccb7c0e46ff4ff3cd76b38ab27ed72384fd980c33ef98adc9968b3f4539",
+  "external_task_status_sha256": "e9d1ff712f06bb1de067759e33a7004938e8ac346c8609ffd9b60aa081851ac4"
+}

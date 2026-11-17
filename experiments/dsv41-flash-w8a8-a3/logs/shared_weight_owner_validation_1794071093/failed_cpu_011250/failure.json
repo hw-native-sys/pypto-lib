@@ -1,0 +1,7 @@
+{
+  "task": "task_20261108_011250_327214615725",
+  "exit": 1,
+  "scope": "own tiny BF16 tadd rejected at PTOAS compile, before prepare/native",
+  "first_error": "pto.tadd expects i32/i16/f16/f32; BF16 storage requires FP32 arithmetic casts",
+  "not_model_or_runtime_fault": true
+}

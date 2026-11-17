@@ -1,0 +1,2571 @@
+{
+  "kind": "SOURCE_AST_METADATA_INSPECTION_NOT_RUNTIME_TEST",
+  "static_resources": 57,
+  "resource_names": [
+    "attn_norm_w",
+    "c1a_comp_norm",
+    "c1a_comp_wkv",
+    "c1a_idx_k_norm",
+    "c1a_idx_weights_proj",
+    "c1a_idx_wk",
+    "c1a_idx_wq_b",
+    "c1a_idx_wq_b_scale",
+    "c2a_comp_norm",
+    "c2a_comp_wgate",
+    "c2a_comp_wkv",
+    "c2a_idx_k_norm",
+    "c2a_idx_weights_proj",
+    "c2a_idx_wk",
+    "c2a_idx_wq_b",
+    "c2a_idx_wq_b_scale",
+    "embed_weight",
+    "engram_qk",
+    "engram_rotation",
+    "engram_wkv",
+    "ffn_norm_w",
+    "final_norm",
+    "gate_bias",
+    "gate_weight",
+    "hc_attn_base",
+    "hc_attn_fn",
+    "hc_attn_scale",
+    "hc_ffn_base",
+    "hc_ffn_fn",
+    "hc_ffn_scale",
+    "kv_norm_w",
+    "lm_head_weight",
+    "q_norm_w",
+    "re_idx_weights_proj",
+    "re_idx_wq_b",
+    "re_idx_wq_b_scale",
+    "shared_w1",
+    "shared_w1_scale",
+    "shared_w2",
+    "shared_w2_scale",
+    "shared_w3",
+    "shared_w3_scale",
+    "sink",
+    "w1",
+    "w1_scale",
+    "w2",
+    "w2_scale",
+    "w3",
+    "w3_scale",
+    "wkv",
+    "wkv_scale",
+    "wo_a",
+    "wo_b",
+    "wq_a",
+    "wq_a_scale",
+    "wq_b",
+    "wq_b_scale"
+  ],
+  "counterexamples": [],
+  "all_static_metadata_layouts": [
+    "ND"
+  ],
+  "all_57_full_whole_shard_forms_by_source": true,
+  "named_counterexample_search": [
+    "leading rank Slice instead of Python int range index",
+    "trailing partial or stepped slice",
+    "extra or missing indexed dimensions",
+    "static producer vs formal metadata shape mismatch",
+    "multiple or missing static HOST use"
+  ],
+  "rows": [
+    {
+      "name": "attn_norm_w",
+      "producer_logical_shape": [
+        16,
+        40,
+        5120
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        5120
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "bfloat16",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 49,
+          "expression": "tensors['attn_norm_w__ssa_v0'][rank__idx_v0, 0:40, 0:5120]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "c1a_comp_norm",
+      "producer_logical_shape": [
+        16,
+        1,
+        512
+      ],
+      "metadata_shape": [
+        16,
+        1,
+        512
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "bfloat16",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 88,
+          "expression": "tensors['c1a_comp_norm__ssa_v0'][rank__idx_v0, 0:1, 0:512]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 1,
+              "slice": "0:1",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 512,
+              "slice": "0:512",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "c1a_comp_wkv",
+      "producer_logical_shape": [
+        16,
+        1,
+        512,
+        5120
+      ],
+      "metadata_shape": [
+        16,
+        1,
+        512,
+        5120
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "bfloat16",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 87,
+          "expression": "tensors['c1a_comp_wkv__ssa_v0'][rank__idx_v0, 0:1, 0:512, 0:5120]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 1,
+              "slice": "0:1",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 512,
+              "slice": "0:512",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "c1a_idx_k_norm",
+      "producer_logical_shape": [
+        16,
+        1,
+        128
+      ],
+      "metadata_shape": [
+        16,
+        1,
+        128
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "bfloat16",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 93,
+          "expression": "tensors['c1a_idx_k_norm__ssa_v0'][rank__idx_v0, 0:1, 0:128]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 1,
+              "slice": "0:1",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 128,
+              "slice": "0:128",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "c1a_idx_weights_proj",
+      "producer_logical_shape": [
+        16,
+        1,
+        5120,
+        32
+      ],
+      "metadata_shape": [
+        16,
+        1,
+        5120,
+        32
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "bfloat16",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 91,
+          "expression": "tensors['c1a_idx_weights_proj__ssa_v0'][rank__idx_v0, 0:1, 0:5120, 0:32]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 1,
+              "slice": "0:1",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 32,
+              "slice": "0:32",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "c1a_idx_wk",
+      "producer_logical_shape": [
+        16,
+        1,
+        128,
+        512
+      ],
+      "metadata_shape": [
+        16,
+        1,
+        128,
+        512
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "bfloat16",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 92,
+          "expression": "tensors['c1a_idx_wk__ssa_v0'][rank__idx_v0, 0:1, 0:128, 0:512]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 1,
+              "slice": "0:1",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 128,
+              "slice": "0:128",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 512,
+              "slice": "0:512",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "c1a_idx_wq_b",
+      "producer_logical_shape": [
+        16,
+        1,
+        1280,
+        4096
+      ],
+      "metadata_shape": [
+        16,
+        1,
+        1280,
+        4096
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "int8",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 89,
+          "expression": "tensors['c1a_idx_wq_b__ssa_v0'][rank__idx_v0, 0:1, 0:1280, 0:4096]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 1,
+              "slice": "0:1",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 1280,
+              "slice": "0:1280",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 4096,
+              "slice": "0:4096",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "c1a_idx_wq_b_scale",
+      "producer_logical_shape": [
+        16,
+        1,
+        4096
+      ],
+      "metadata_shape": [
+        16,
+        1,
+        4096
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "fp32",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 90,
+          "expression": "tensors['c1a_idx_wq_b_scale__ssa_v0'][rank__idx_v0, 0:1, 0:4096]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 1,
+              "slice": "0:1",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 4096,
+              "slice": "0:4096",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "c2a_comp_norm",
+      "producer_logical_shape": [
+        16,
+        3,
+        512
+      ],
+      "metadata_shape": [
+        16,
+        3,
+        512
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "bfloat16",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 81,
+          "expression": "tensors['c2a_comp_norm__ssa_v0'][rank__idx_v0, 0:3, 0:512]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 3,
+              "slice": "0:3",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 512,
+              "slice": "0:512",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "c2a_comp_wgate",
+      "producer_logical_shape": [
+        16,
+        3,
+        512,
+        5120
+      ],
+      "metadata_shape": [
+        16,
+        3,
+        512,
+        5120
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "bfloat16",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 80,
+          "expression": "tensors['c2a_comp_wgate__ssa_v0'][rank__idx_v0, 0:3, 0:512, 0:5120]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 3,
+              "slice": "0:3",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 512,
+              "slice": "0:512",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "c2a_comp_wkv",
+      "producer_logical_shape": [
+        16,
+        3,
+        512,
+        5120
+      ],
+      "metadata_shape": [
+        16,
+        3,
+        512,
+        5120
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "bfloat16",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 79,
+          "expression": "tensors['c2a_comp_wkv__ssa_v0'][rank__idx_v0, 0:3, 0:512, 0:5120]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 3,
+              "slice": "0:3",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 512,
+              "slice": "0:512",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "c2a_idx_k_norm",
+      "producer_logical_shape": [
+        16,
+        3,
+        128
+      ],
+      "metadata_shape": [
+        16,
+        3,
+        128
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "bfloat16",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 86,
+          "expression": "tensors['c2a_idx_k_norm__ssa_v0'][rank__idx_v0, 0:3, 0:128]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 3,
+              "slice": "0:3",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 128,
+              "slice": "0:128",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "c2a_idx_weights_proj",
+      "producer_logical_shape": [
+        16,
+        3,
+        5120,
+        32
+      ],
+      "metadata_shape": [
+        16,
+        3,
+        5120,
+        32
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "bfloat16",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 84,
+          "expression": "tensors['c2a_idx_weights_proj__ssa_v0'][rank__idx_v0, 0:3, 0:5120, 0:32]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 3,
+              "slice": "0:3",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 32,
+              "slice": "0:32",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "c2a_idx_wk",
+      "producer_logical_shape": [
+        16,
+        3,
+        128,
+        512
+      ],
+      "metadata_shape": [
+        16,
+        3,
+        128,
+        512
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "bfloat16",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 85,
+          "expression": "tensors['c2a_idx_wk__ssa_v0'][rank__idx_v0, 0:3, 0:128, 0:512]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 3,
+              "slice": "0:3",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 128,
+              "slice": "0:128",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 512,
+              "slice": "0:512",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "c2a_idx_wq_b",
+      "producer_logical_shape": [
+        16,
+        3,
+        1280,
+        4096
+      ],
+      "metadata_shape": [
+        16,
+        3,
+        1280,
+        4096
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "int8",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 82,
+          "expression": "tensors['c2a_idx_wq_b__ssa_v0'][rank__idx_v0, 0:3, 0:1280, 0:4096]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 3,
+              "slice": "0:3",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 1280,
+              "slice": "0:1280",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 4096,
+              "slice": "0:4096",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "c2a_idx_wq_b_scale",
+      "producer_logical_shape": [
+        16,
+        3,
+        4096
+      ],
+      "metadata_shape": [
+        16,
+        3,
+        4096
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "fp32",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 83,
+          "expression": "tensors['c2a_idx_wq_b_scale__ssa_v0'][rank__idx_v0, 0:3, 0:4096]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 3,
+              "slice": "0:3",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 4096,
+              "slice": "0:4096",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "embed_weight",
+      "producer_logical_shape": [
+        16,
+        32320,
+        5120
+      ],
+      "metadata_shape": [
+        16,
+        32320,
+        5120
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "bfloat16",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 42,
+          "expression": "tensors['embed_weight__ssa_v0'][rank__idx_v0, 0:32320, 0:5120]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 32320,
+              "slice": "0:32320",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "engram_qk",
+      "producer_logical_shape": [
+        16,
+        2,
+        4,
+        5120
+      ],
+      "metadata_shape": [
+        16,
+        2,
+        4,
+        5120
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "fp32",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 117,
+          "expression": "tensors['engram_qk__ssa_v0'][rank__idx_v0, 0:2, 0:4, 0:5120]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 2,
+              "slice": "0:2",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 4,
+              "slice": "0:4",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "engram_rotation",
+      "producer_logical_shape": [
+        16,
+        32,
+        32
+      ],
+      "metadata_shape": [
+        16,
+        32,
+        32
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "fp32",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 118,
+          "expression": "tensors['engram_rotation__ssa_v0'][rank__idx_v0, 0:32, 0:32]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 32,
+              "slice": "0:32",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 32,
+              "slice": "0:32",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "engram_wkv",
+      "producer_logical_shape": [
+        16,
+        2,
+        25600,
+        6144
+      ],
+      "metadata_shape": [
+        16,
+        2,
+        25600,
+        6144
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "bfloat16",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 116,
+          "expression": "tensors['engram_wkv__ssa_v0'][rank__idx_v0, 0:2, 0:25600, 0:6144]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 2,
+              "slice": "0:2",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 25600,
+              "slice": "0:25600",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 6144,
+              "slice": "0:6144",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ffn_norm_w",
+      "producer_logical_shape": [
+        16,
+        40,
+        5120
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        5120
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "bfloat16",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 64,
+          "expression": "tensors['ffn_norm_w__ssa_v0'][rank__idx_v0, 0:40, 0:5120]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "final_norm",
+      "producer_logical_shape": [
+        16,
+        5120
+      ],
+      "metadata_shape": [
+        16,
+        5120
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "bfloat16",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 131,
+          "expression": "tensors['final_norm__ssa_v0'][rank__idx_v0, 0:5120]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "gate_bias",
+      "producer_logical_shape": [
+        16,
+        40,
+        384
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        384
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "fp32",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 66,
+          "expression": "tensors['gate_bias__ssa_v0'][rank__idx_v0, 0:40, 0:384]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 384,
+              "slice": "0:384",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "gate_weight",
+      "producer_logical_shape": [
+        16,
+        40,
+        384,
+        5120
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        384,
+        5120
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "fp32",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 65,
+          "expression": "tensors['gate_weight__ssa_v0'][rank__idx_v0, 0:40, 0:384, 0:5120]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 384,
+              "slice": "0:384",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hc_attn_base",
+      "producer_logical_shape": [
+        16,
+        40,
+        24
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        24
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "fp32",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 48,
+          "expression": "tensors['hc_attn_base__ssa_v0'][rank__idx_v0, 0:40, 0:24]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 24,
+              "slice": "0:24",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hc_attn_fn",
+      "producer_logical_shape": [
+        16,
+        40,
+        32,
+        20480
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        32,
+        20480
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "fp32",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 46,
+          "expression": "tensors['hc_attn_fn__ssa_v0'][rank__idx_v0, 0:40, 0:32, 0:20480]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 32,
+              "slice": "0:32",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 20480,
+              "slice": "0:20480",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hc_attn_scale",
+      "producer_logical_shape": [
+        16,
+        40,
+        3
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        3
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "fp32",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 47,
+          "expression": "tensors['hc_attn_scale__ssa_v0'][rank__idx_v0, 0:40, 0:3]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 3,
+              "slice": "0:3",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hc_ffn_base",
+      "producer_logical_shape": [
+        16,
+        40,
+        24
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        24
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "fp32",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 63,
+          "expression": "tensors['hc_ffn_base__ssa_v0'][rank__idx_v0, 0:40, 0:24]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 24,
+              "slice": "0:24",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hc_ffn_fn",
+      "producer_logical_shape": [
+        16,
+        40,
+        32,
+        20480
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        32,
+        20480
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "fp32",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 61,
+          "expression": "tensors['hc_ffn_fn__ssa_v0'][rank__idx_v0, 0:40, 0:32, 0:20480]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 32,
+              "slice": "0:32",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 20480,
+              "slice": "0:20480",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hc_ffn_scale",
+      "producer_logical_shape": [
+        16,
+        40,
+        3
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        3
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "fp32",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 62,
+          "expression": "tensors['hc_ffn_scale__ssa_v0'][rank__idx_v0, 0:40, 0:3]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 3,
+              "slice": "0:3",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "kv_norm_w",
+      "producer_logical_shape": [
+        16,
+        40,
+        512
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        512
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "bfloat16",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 57,
+          "expression": "tensors['kv_norm_w__ssa_v0'][rank__idx_v0, 0:40, 0:512]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 512,
+              "slice": "0:512",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "lm_head_weight",
+      "producer_logical_shape": [
+        16,
+        32320,
+        5120
+      ],
+      "metadata_shape": [
+        16,
+        32320,
+        5120
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "bfloat16",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 132,
+          "expression": "tensors['lm_head_weight__ssa_v0'][rank__idx_v0, 0:32320, 0:5120]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 32320,
+              "slice": "0:32320",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "q_norm_w",
+      "producer_logical_shape": [
+        16,
+        40,
+        1280
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        1280
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "bfloat16",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 52,
+          "expression": "tensors['q_norm_w__ssa_v0'][rank__idx_v0, 0:40, 0:1280]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 1280,
+              "slice": "0:1280",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "re_idx_weights_proj",
+      "producer_logical_shape": [
+        16,
+        4,
+        5120,
+        32
+      ],
+      "metadata_shape": [
+        16,
+        4,
+        5120,
+        32
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "bfloat16",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 96,
+          "expression": "tensors['re_idx_weights_proj__ssa_v0'][rank__idx_v0, 0:4, 0:5120, 0:32]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 4,
+              "slice": "0:4",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 32,
+              "slice": "0:32",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "re_idx_wq_b",
+      "producer_logical_shape": [
+        16,
+        4,
+        1280,
+        4096
+      ],
+      "metadata_shape": [
+        16,
+        4,
+        1280,
+        4096
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "int8",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 94,
+          "expression": "tensors['re_idx_wq_b__ssa_v0'][rank__idx_v0, 0:4, 0:1280, 0:4096]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 4,
+              "slice": "0:4",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 1280,
+              "slice": "0:1280",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 4096,
+              "slice": "0:4096",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "re_idx_wq_b_scale",
+      "producer_logical_shape": [
+        16,
+        4,
+        4096
+      ],
+      "metadata_shape": [
+        16,
+        4,
+        4096
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "fp32",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 95,
+          "expression": "tensors['re_idx_wq_b_scale__ssa_v0'][rank__idx_v0, 0:4, 0:4096]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 4,
+              "slice": "0:4",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 4096,
+              "slice": "0:4096",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "shared_w1",
+      "producer_logical_shape": [
+        16,
+        40,
+        5120,
+        2304
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        5120,
+        2304
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "int8",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 67,
+          "expression": "tensors['shared_w1__ssa_v0'][rank__idx_v0, 0:40, 0:5120, 0:2304]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 2304,
+              "slice": "0:2304",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "shared_w1_scale",
+      "producer_logical_shape": [
+        16,
+        40,
+        2304
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        2304
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "fp32",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 68,
+          "expression": "tensors['shared_w1_scale__ssa_v0'][rank__idx_v0, 0:40, 0:2304]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 2304,
+              "slice": "0:2304",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "shared_w2",
+      "producer_logical_shape": [
+        16,
+        40,
+        2304,
+        5120
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        2304,
+        5120
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "int8",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 71,
+          "expression": "tensors['shared_w2__ssa_v0'][rank__idx_v0, 0:40, 0:2304, 0:5120]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 2304,
+              "slice": "0:2304",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "shared_w2_scale",
+      "producer_logical_shape": [
+        16,
+        40,
+        5120
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        5120
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "fp32",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 72,
+          "expression": "tensors['shared_w2_scale__ssa_v0'][rank__idx_v0, 0:40, 0:5120]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "shared_w3",
+      "producer_logical_shape": [
+        16,
+        40,
+        5120,
+        2304
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        5120,
+        2304
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "int8",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 69,
+          "expression": "tensors['shared_w3__ssa_v0'][rank__idx_v0, 0:40, 0:5120, 0:2304]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 2304,
+              "slice": "0:2304",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "shared_w3_scale",
+      "producer_logical_shape": [
+        16,
+        40,
+        2304
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        2304
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "fp32",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 70,
+          "expression": "tensors['shared_w3_scale__ssa_v0'][rank__idx_v0, 0:40, 0:2304]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 2304,
+              "slice": "0:2304",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "sink",
+      "producer_logical_shape": [
+        16,
+        40,
+        16
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        16
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "fp32",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 58,
+          "expression": "tensors['sink__ssa_v0'][rank__idx_v0, 0:40, 0:16]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 16,
+              "slice": "0:16",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "w1",
+      "producer_logical_shape": [
+        16,
+        1,
+        24,
+        5120,
+        2304
+      ],
+      "metadata_shape": [
+        16,
+        1,
+        24,
+        5120,
+        2304
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "int8",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 73,
+          "expression": "tensors['w1__ssa_v0'][rank__idx_v0, 0:1, 0:24, 0:5120, 0:2304]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 1,
+              "slice": "0:1",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 24,
+              "slice": "0:24",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            },
+            {
+              "axis": 4,
+              "extent": 2304,
+              "slice": "0:2304",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "w1_scale",
+      "producer_logical_shape": [
+        16,
+        1,
+        24,
+        2304
+      ],
+      "metadata_shape": [
+        16,
+        1,
+        24,
+        2304
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "fp32",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 74,
+          "expression": "tensors['w1_scale__ssa_v0'][rank__idx_v0, 0:1, 0:24, 0:2304]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 1,
+              "slice": "0:1",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 24,
+              "slice": "0:24",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 2304,
+              "slice": "0:2304",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "w2",
+      "producer_logical_shape": [
+        16,
+        1,
+        24,
+        2304,
+        5120
+      ],
+      "metadata_shape": [
+        16,
+        1,
+        24,
+        2304,
+        5120
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "int8",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 77,
+          "expression": "tensors['w2__ssa_v0'][rank__idx_v0, 0:1, 0:24, 0:2304, 0:5120]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 1,
+              "slice": "0:1",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 24,
+              "slice": "0:24",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 2304,
+              "slice": "0:2304",
+              "full_extent": true
+            },
+            {
+              "axis": 4,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "w2_scale",
+      "producer_logical_shape": [
+        16,
+        1,
+        24,
+        5120
+      ],
+      "metadata_shape": [
+        16,
+        1,
+        24,
+        5120
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "fp32",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 78,
+          "expression": "tensors['w2_scale__ssa_v0'][rank__idx_v0, 0:1, 0:24, 0:5120]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 1,
+              "slice": "0:1",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 24,
+              "slice": "0:24",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "w3",
+      "producer_logical_shape": [
+        16,
+        1,
+        24,
+        5120,
+        2304
+      ],
+      "metadata_shape": [
+        16,
+        1,
+        24,
+        5120,
+        2304
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "int8",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 75,
+          "expression": "tensors['w3__ssa_v0'][rank__idx_v0, 0:1, 0:24, 0:5120, 0:2304]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 1,
+              "slice": "0:1",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 24,
+              "slice": "0:24",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            },
+            {
+              "axis": 4,
+              "extent": 2304,
+              "slice": "0:2304",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "w3_scale",
+      "producer_logical_shape": [
+        16,
+        1,
+        24,
+        2304
+      ],
+      "metadata_shape": [
+        16,
+        1,
+        24,
+        2304
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "fp32",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 76,
+          "expression": "tensors['w3_scale__ssa_v0'][rank__idx_v0, 0:1, 0:24, 0:2304]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 1,
+              "slice": "0:1",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 24,
+              "slice": "0:24",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 2304,
+              "slice": "0:2304",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "wkv",
+      "producer_logical_shape": [
+        16,
+        40,
+        5120,
+        512
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        5120,
+        512
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "int8",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 55,
+          "expression": "tensors['wkv__ssa_v0'][rank__idx_v0, 0:40, 0:5120, 0:512]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 512,
+              "slice": "0:512",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "wkv_scale",
+      "producer_logical_shape": [
+        16,
+        40,
+        512
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        512
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "fp32",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 56,
+          "expression": "tensors['wkv_scale__ssa_v0'][rank__idx_v0, 0:40, 0:512]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 512,
+              "slice": "0:512",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "wo_a",
+      "producer_logical_shape": [
+        16,
+        40,
+        2,
+        1024,
+        4096
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        2,
+        1024,
+        4096
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "bfloat16",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 59,
+          "expression": "tensors['wo_a__ssa_v0'][rank__idx_v0, 0:40, 0:2, 0:1024, 0:4096]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 2,
+              "slice": "0:2",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 1024,
+              "slice": "0:1024",
+              "full_extent": true
+            },
+            {
+              "axis": 4,
+              "extent": 4096,
+              "slice": "0:4096",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "wo_b",
+      "producer_logical_shape": [
+        16,
+        40,
+        5120,
+        2048
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        5120,
+        2048
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "bfloat16",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 60,
+          "expression": "tensors['wo_b__ssa_v0'][rank__idx_v0, 0:40, 0:5120, 0:2048]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 2048,
+              "slice": "0:2048",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "wq_a",
+      "producer_logical_shape": [
+        16,
+        40,
+        5120,
+        1280
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        5120,
+        1280
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "int8",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 50,
+          "expression": "tensors['wq_a__ssa_v0'][rank__idx_v0, 0:40, 0:5120, 0:1280]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 5120,
+              "slice": "0:5120",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 1280,
+              "slice": "0:1280",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "wq_a_scale",
+      "producer_logical_shape": [
+        16,
+        40,
+        1280
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        1280
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "fp32",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 51,
+          "expression": "tensors['wq_a_scale__ssa_v0'][rank__idx_v0, 0:40, 0:1280]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 1280,
+              "slice": "0:1280",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "wq_b",
+      "producer_logical_shape": [
+        16,
+        40,
+        1280,
+        8192
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        1280,
+        8192
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "int8",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 53,
+          "expression": "tensors['wq_b__ssa_v0'][rank__idx_v0, 0:40, 0:1280, 0:8192]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 1280,
+              "slice": "0:1280",
+              "full_extent": true
+            },
+            {
+              "axis": 3,
+              "extent": 8192,
+              "slice": "0:8192",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "wq_b_scale",
+      "producer_logical_shape": [
+        16,
+        40,
+        8192
+      ],
+      "metadata_shape": [
+        16,
+        40,
+        8192
+      ],
+      "metadata_layout": "ND",
+      "metadata_dtype": "fp32",
+      "source_shape_matches_schema": true,
+      "HOST_occurrences": 1,
+      "uses": [
+        {
+          "line": 54,
+          "expression": "tensors['wq_b_scale__ssa_v0'][rank__idx_v0, 0:40, 0:8192]",
+          "trailing_extents": [
+            {
+              "axis": 1,
+              "extent": 40,
+              "slice": "0:40",
+              "full_extent": true
+            },
+            {
+              "axis": 2,
+              "extent": 8192,
+              "slice": "0:8192",
+              "full_extent": true
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "pins": {
+    "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/build/decode_capacity2/orchestration/host_orch.py": "9c7293be934b8b65018535af56c4619da9bfccb1d3b3c32fde6af6668b236050",
+    "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/build/decode_capacity2/distributed_meta.json": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770",
+    "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/decode_capacity2_files.json": "5262e68afa0b53291ed285e31170b3c017674c3c25dfa9aec78eb7fab5777532",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/f09_decode_case.py": "e3bc87daec2a39c6a555b194ec7d9f9a42d8483e36fcabaf1ec448000284ac20",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/route.py": "c53c5fd537ecc1bfbf8e228cf691107fda2fb1748dfcb9e5aa09a0d9a3915d43",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/source45_rebased_UNAPPLIED.json": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/resource_plan.json": "451d7686e2252d6cdf13b25a54089be5a600d7dcbdd119d0aa22ae3982c6c68f",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/compile_results.json": "2dc991782ab073f9276119e898eb4b891592247857118c0e4703d92b151dd98a",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/model/decode_fwd.py": "db733af729160a1b7c02ecc6bcad88ad01199eedbe29144cdfc0e4ca7b84af3b",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/model/generate.py": "f7b772cfa62ea38ebc9228e0230b770d8cf29a76527071cfe75b0c2bd5035e76",
+    ".venv-local/lib/python3.10/site-packages/pypto/runtime/device_tensor.py": "72dc6701eca6dc10a2155773b35a37dee1551c89a89ecf08a8c244571395e8e3"
+  },
+  "mixed_profiles": [
+    {
+      "label": "count_active",
+      "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/build/count_active",
+      "elapsed_seconds": 10.24669098854065,
+      "metadata": [
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/build/count_active/distributed_meta.json"
+      ],
+      "file_manifest_sha256": "45c3b4c710e9592127dcde62a1d1f2502ea42fc01843895362150aa56b1b8c54",
+      "status": "ZERO_SAMPLE_COMPILE_ONLY_PASS",
+      "generated_HOST_static_whole_shard_checks": 288,
+      "statics": 18,
+      "old_CPP_PTO_byte_relation": {
+        "next_levels/probe_rank/kernels/aiv/w8a8_gemm_aiv.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_consumed_signal.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/capture_exact_ffn_counts.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_return_signal.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_shared_stage.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_reuse_wait.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/swiglu_shared.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_dispatch_signal.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/int8_quant_per_token.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_return_reuse.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/w8a8_gemm_1_aiv.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_dispatch_push.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_compact_clear.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/rms_norm.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/swiglu.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/hc_inv_rms.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_return_consumed.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/hc_post.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_compact.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/int8_quant_per_token_0.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_return.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/hc_coefficients.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/hc_head.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/hc_project_aiv.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_shared_store.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_gate_aiv.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_combine.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_dispatch_count.cpp": true,
+        "next_levels/probe_rank/kernels/aic/hc_project_aic.cpp": true,
+        "next_levels/probe_rank/kernels/aic/w8a8_gemm_1_aic.cpp": true,
+        "next_levels/probe_rank/kernels/aic/moe_gate_aic.cpp": true,
+        "next_levels/probe_rank/kernels/aic/w8a8_gemm_aic.cpp": true
+      }
+    },
+    {
+      "label": "count_old_physical",
+      "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/build/count_old_physical",
+      "elapsed_seconds": 9.528697967529297,
+      "metadata": [
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/build/count_old_physical/distributed_meta.json"
+      ],
+      "file_manifest_sha256": "1c09c6ced987a6ed53cdb8036a8ed6cc8d4c6d78c9d1df3a7278db21b7f29c53",
+      "status": "ZERO_SAMPLE_COMPILE_ONLY_PASS",
+      "generated_HOST_static_whole_shard_checks": 288,
+      "statics": 18,
+      "old_CPP_PTO_byte_relation": {
+        "next_levels/probe_rank/kernels/aiv/w8a8_gemm_aiv.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_consumed_signal.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/capture_exact_ffn_counts.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_return_signal.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_shared_stage.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_reuse_wait.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/swiglu_shared.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_dispatch_signal.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/int8_quant_per_token.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_return_reuse.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/w8a8_gemm_1_aiv.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_dispatch_push.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_compact_clear.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/rms_norm.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/swiglu.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/hc_inv_rms.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_return_consumed.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/hc_post.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_compact.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/int8_quant_per_token_0.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_return.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/hc_coefficients.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/hc_head.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/hc_project_aiv.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_shared_store.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_gate_aiv.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_combine.cpp": true,
+        "next_levels/probe_rank/kernels/aiv/moe_dispatch_count.cpp": true,
+        "next_levels/probe_rank/kernels/aic/hc_project_aic.cpp": true,
+        "next_levels/probe_rank/kernels/aic/w8a8_gemm_1_aic.cpp": true,
+        "next_levels/probe_rank/kernels/aic/moe_gate_aic.cpp": true,
+        "next_levels/probe_rank/kernels/aic/w8a8_gemm_aic.cpp": true
+      }
+    },
+    {
+      "label": "decode_capacity2",
+      "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/build/decode_capacity2",
+      "elapsed_seconds": 42.27102494239807,
+      "metadata": [
+        "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/build/decode_capacity2/distributed_meta.json"
+      ],
+      "file_manifest_sha256": "5262e68afa0b53291ed285e31170b3c017674c3c25dfa9aec78eb7fab5777532",
+      "status": "COMPILE_ONLY_PASS",
+      "provenance": "UNCHANGED_OLD_FULLENTRY_NOT_RECOMPILED"
+    }
+  ],
+  "CPU_test_tasks": 0,
+  "imports_model_or_runtime": false,
+  "tensor_or_fixture_or_compile_or_prepare_or_NPU": false
+}

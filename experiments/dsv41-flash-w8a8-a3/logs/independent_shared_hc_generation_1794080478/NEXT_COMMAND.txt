@@ -1,0 +1,5 @@
+POSTTERMINAL ONLY; NOT AUTHORIZED, NOT SUBMITTED. pins.json is now READY with exact FINAL fresh2 signature and shared-HC outer/math/code bindings. A Root-controlled handoff.json must then identify only the SAME new actual native case, actual allocated16 Root scope, external POST terminal receipts and outside-queue terminal/list snapshot.
+
+task-submit --no-device --max-time 600 --run 'source activate-pypto.sh && PYTHONDONTWRITEBYTECODE=1 python experiments/dsv41-flash-w8a8-a3/logs/independent_shared_hc_generation_prepare_1794076542/audit.py --handoff experiments/dsv41-flash-w8a8-a3/logs/independent_shared_hc_generation_prepare_1794076542/handoff.json'
+
+This auditor never submits a native task or nested task-submit, never reads real payload or computes golden/model math. The actual handoff still does not exist; null task/RootGO and false terminal flags in the template force STOP. Post-run audit may be byteforked to a NEW unit with binding updates after Root authorizes; frozen preparation is not edited.

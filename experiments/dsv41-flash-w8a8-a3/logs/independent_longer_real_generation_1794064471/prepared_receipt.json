@@ -1,0 +1,13 @@
+{
+  "stage": "PREPARED_NOT_EXECUTED",
+  "epoch": 1794064775.9374542,
+  "native_case": "native_longer_real_generation_1794064297",
+  "native_task": "task_20261107_231342_350351328582",
+  "source45": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "auditor_sha256": "ce9063d63d7623fc975bcea691feb1b14c2ef06d622766fc187dc931e4c4c21d",
+  "actual_audit_jobs": 0,
+  "actual_grants_created": 0,
+  "own_NPU_jobs": 0,
+  "actual_payload_reads": 0,
+  "Root_condition": "native terminal plus executor externalPOST terminal before ONE CPUaudit"
+}

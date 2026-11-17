@@ -1,0 +1,24 @@
+{
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "source45_unchanged": true,
+  "protected_bundles": {
+    "generation_entry_1794035858": {
+      "manifest_sha256": "a37109462df44b9416c7401ced49c881628a0ccbe059e277126e1115c428b1cc",
+      "files": 31
+    },
+    "fit_post_guard_1794037055": {
+      "manifest_sha256": "184fc558f8c08bc5c9f1a839da73b68ce9665f0fdc483632377c99508a38340b",
+      "files": 48
+    },
+    "empty_fit_operation_1794037635": {
+      "manifest_sha256": "f55ce7d59678f0977d466e673e3c0ad0429b5c26cdddf6253bf059cb9630c556",
+      "files": 478
+    },
+    "real_weight_transfer_prepare_1794042741": {
+      "manifest_sha256": "cb07b6a92a1b4f509068a8308f48a0d29960c6d8175572a18d7d1cb50283d723",
+      "files": 46
+    }
+  },
+  "payload_reads": 0,
+  "no_native_jobs": true
+}

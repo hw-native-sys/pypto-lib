@@ -1,0 +1,14 @@
+[
+  {
+    "width": 128,
+    "duplicate_and_sentinel_positive": true,
+    "published_error_rejected": true,
+    "empty_or_all_skipped_still_enforces_whole_cache": true
+  },
+  {
+    "width": 512,
+    "duplicate_and_sentinel_positive": true,
+    "published_error_rejected": true,
+    "empty_or_all_skipped_still_enforces_whole_cache": true
+  }
+]

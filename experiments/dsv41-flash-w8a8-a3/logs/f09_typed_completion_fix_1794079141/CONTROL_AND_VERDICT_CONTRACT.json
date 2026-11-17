@@ -1,0 +1,34 @@
+{
+  "source_scope_only_no_generated_graph": true,
+  "read_anchors": {
+    "moe_reuse_wait": "consumed[my_rank,0], initialized64Bprotocolwindow/selfslot",
+    "moe_return_signal": "expert_counts[0], writtenforallempty/nonemptydestinations",
+    "moe_return_consumed": "return_consumed[my_rank,0], initializedprotocolwindow/selfslot"
+  },
+  "always_present_source_launch": "moe_combine capacity>0 with inner combine_token<tokens; no inactive outputwrites",
+  "explicit_source_control_edges": [
+    "return_tid->ready_tid",
+    "ready_tid->fixed-capacity combine_tid",
+    "combine_tid->return_consumed_tid",
+    "return_consumed_tid->ep_done->ffn_done->probeexport deps"
+  ],
+  "existing_optional_paths": "expert tasks may be absent whenrecvcount0; no control completion depends on their existence",
+  "inline_completion_contract": "ONE unconditional typedtuple Tensor+Scalar[TASK_ID] per moe_ep16/moe_ffn; all9modelcalls+2diagnosticprobe calls unpack; no variablearity/defaultflag/wrapperduplicate",
+  "compiler_branch_support": "COUNT_ACTIVE ZERO-SAMPLE SIGNATURE PASS; fullentry/defaultstandalone/oldprobe compile+native remainpending",
+  "collectives": "EveryEP16rank publishescounts/notifies/servespeers, includinglocalactive0; noearlyreturn",
+  "state_write_source": {
+    "config_STATE_CAPACITY": 2,
+    "compressor_file_sha256": "5575fea0bb02a73ebd58dbabd2a9f0a9fe71c53510b15f22c8d05687d8f48031",
+    "source_lines": "c2a_state_write compressor.py149-161",
+    "legal_slot": "block*STATE_CAPACITY+position%STATE_CAPACITY, lasttoken/request",
+    "protection": "allotherstate rows preservebitwise foractiverequests; wholeblockforidle"
+  },
+  "gate_policy": {
+    "unconditioned_direct19": "samegatefactory with ONLYnested stagedexpectedselector boundtoindependentunconditionedoutputs",
+    "original_staged19": "unchangedsourcefactory, includingoriginaldirectpoolsubset",
+    "both_flag": "trueONLYifbothgroupspass; exactgroupfailuresdurable, elsevalidatorraises",
+    "thresholds": "originalgateexpressions unchanged",
+    "scope": "within-callunconditioned, actualpreviousstateinitial; notfullstrictwholehistoryrollout"
+  },
+  "old_physical_negative": "firstexactINT32nonnegative[16,16,24] forceddestination8/expert0..5/source2matrix, then specificper-sourceruntimecounts/192vs96mismatch; malformed/provenancemismatchisFAIL"
+}

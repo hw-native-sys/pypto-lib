@@ -1,0 +1,6 @@
+{
+  "status": "DIAGNOSTIC_COMPLETE_FINAL_PARK",
+  "ownjobs": 0,
+  "shared_writes": 0,
+  "future_NPU_or_reference_authority": false
+}

@@ -1,0 +1,200 @@
+{
+  "terminal_actual16": {
+    "14": 0,
+    "15": 0,
+    "11": 0,
+    "0": 0,
+    "13": 0,
+    "7": 0,
+    "10": 0,
+    "8": 0,
+    "6": 0,
+    "12": 0,
+    "9": 0,
+    "1": 0,
+    "2": 0,
+    "5": 0,
+    "4": 0,
+    "3": 0
+  },
+  "native_binding": {
+    "mode": "ExecutionMode.ONBOARD",
+    "ring_heap": [
+      0,
+      0,
+      4294967296,
+      0
+    ],
+    "device_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "generated_platform": "a2a3",
+    "artifact": {
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_prefix_capture_v3_1794027615/build/_jit_prefill_fwd_20261107_130816_psh7ea4w",
+      "metadata_sha256": "9734f8235dd25d522bb24300a6b801d8d412eaf7202a10973b322fa258262620",
+      "compile_seconds": 26.52668261528015
+    },
+    "actual_library_contract": {
+      "backend": "tensormap_and_ringbuffer",
+      "platform": "a2a3",
+      "mode": "PROGRAM",
+      "library_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/build/lib/a2a3/onboard/tensormap_and_ringbuffer/libhost_runtime.so",
+      "library_sha256": "24434f8879030ef1b1f31e5fc2ecce683e392d4f1baeb5bcee852fb183976e5c",
+      "abi_version": 1,
+      "resource_count": 6,
+      "pipeline_directory_capacity": 4294967295,
+      "resources": [
+        {
+          "kind": 4,
+          "resource_class": 0,
+          "bytes_per_copy": 0
+        },
+        {
+          "kind": 1,
+          "resource_class": 1,
+          "bytes_per_copy": 0
+        },
+        {
+          "kind": 2,
+          "resource_class": 1,
+          "bytes_per_copy": 0
+        },
+        {
+          "kind": 3,
+          "resource_class": 1,
+          "bytes_per_copy": 0
+        },
+        {
+          "kind": 5,
+          "resource_class": 2,
+          "bytes_per_copy": 0
+        },
+        {
+          "kind": 6,
+          "resource_class": 2,
+          "bytes_per_copy": 0
+        }
+      ],
+      "shared_arena_bank": 0,
+      "query_scope": "read-only exported get_pipeline_contract; no init/prepare/device call"
+    },
+    "scope": "normalized owner config used by PreparedDispatch on every call"
+  },
+  "public_stages": {
+    "prefill128_before_weights_public_memory.json": {
+      "rank_count": 16,
+      "committed_bytes_per_rank": [
+        5452852389,
+        5452852389,
+        5452852389,
+        5452852389,
+        5452852389,
+        5452852389,
+        5452852389,
+        5452852389,
+        5452852389,
+        5452852389,
+        5452852389,
+        5452852389,
+        5452852389,
+        5452852389,
+        5452852389,
+        5452852389
+      ],
+      "minimum_free_bytes": 59886718976,
+      "committed_scope": "public committed excludes HCCL/VMM; free/total is device wide"
+    },
+    "prefill128_after_upload_public_memory.json": {
+      "rank_count": 16,
+      "committed_bytes_per_rank": [
+        11916731493,
+        11916731493,
+        11916731493,
+        11916731493,
+        11916731493,
+        11916731493,
+        11916731493,
+        11916731493,
+        11916731493,
+        11916731493,
+        11916731493,
+        11916731493,
+        11916731493,
+        11916731493,
+        11916731493,
+        11916731493
+      ],
+      "minimum_free_bytes": 53418291200,
+      "committed_scope": "public committed excludes HCCL/VMM; free/total is device wide"
+    },
+    "prefix_after_dispatch_public_memory.json": {
+      "rank_count": 16,
+      "committed_bytes_per_rank": [
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620
+      ],
+      "minimum_free_bytes": 52933468160,
+      "committed_scope": "public committed excludes HCCL/VMM; free/total is device wide"
+    },
+    "prefix_before_close_public_memory.json": {
+      "rank_count": 16,
+      "committed_bytes_per_rank": [
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620,
+        12392403620
+      ],
+      "minimum_free_bytes": 52934574080,
+      "committed_scope": "public committed excludes HCCL/VMM; free/total is device wide"
+    }
+  },
+  "normal_close": {
+    "owner_closed": true,
+    "static_handles_released": true,
+    "post_close_public_counter": "unavailable: public methods require an open worker; next phase preweight counters provide next live baseline",
+    "constructed_bank_count_not_inferred": true
+  },
+  "actual17_numeric": "OPEN_CPU_RUNNING",
+  "claim": "native execution+copyback+durable closed capture only"
+}

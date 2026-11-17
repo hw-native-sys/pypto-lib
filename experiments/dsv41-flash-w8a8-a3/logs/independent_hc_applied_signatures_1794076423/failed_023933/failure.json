@@ -1,0 +1,10 @@
+{
+  "phase": "prefill3",
+  "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_hc_applied_signatures_1794076423/signature_build/_jit_prefill_fwd_20261108_023951_v2hdljxq",
+  "compile_task": "task_20261108_023933_349216314444",
+  "compile_task_exit": 1,
+  "entry_compile_returned_before_checker_error": true,
+  "source45": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "first_error": "own brittle HOST T_DYN substring omitted closingbracket; source has tensors[input_ids].shape[1]",
+  "metadata_sha256": "3ef340dbe30e192bddd20ab2ec26bbe33b86453ffb0c6ce37d1512b847a50715"
+}

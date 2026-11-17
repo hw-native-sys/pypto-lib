@@ -1,0 +1,6 @@
+{
+  "status": "FAILED_BEFORE_PREPARE_FINAL_PARK",
+  "files": 390,
+  "manifest_sha256": "6fdf6f7ff5c195d064e843eaf73738c4a70961b53bec524a4a0ea0c0920e7b1f",
+  "actual_report_sha256": "6b253ed49a7f58020b111e898f9383751ceb02ce6cdbb6c910c913c3507ef2f3"
+}

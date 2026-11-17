@@ -1,0 +1,13 @@
+{
+  "status": "FINAL/PARK",
+  "operator_sha256": "52be1ffae5c3a6956ce17745b5e7d15f3facc35fe9a48f12319ddd6914494bdc",
+  "patch_sha256": "ea2ef47fa26a9a7df6e6cb525248af147ca815977fb8c9171927bef47475ea47",
+  "base_operator_sha256": "951378f40c2ab7cb4f1573aeda72548bab017ed76c545641620e6e3502b4c780",
+  "artifact_manifest_sha256": "14ca20064efab4cafd3cf0e21119593696064bdd0aada75be17b622e58c84427",
+  "files": 8,
+  "jobs_terminal": true,
+  "compile": false,
+  "native": false,
+  "live_sources_unchanged": true,
+  "end_epoch": 1794066732
+}

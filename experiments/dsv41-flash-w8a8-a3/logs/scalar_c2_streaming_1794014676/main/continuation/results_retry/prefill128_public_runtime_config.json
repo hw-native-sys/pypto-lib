@@ -1,0 +1,10 @@
+{
+  "mode": "ONBOARD",
+  "ring_heap": [
+    0,
+    0,
+    2147483648,
+    0
+  ],
+  "persistent": false
+}

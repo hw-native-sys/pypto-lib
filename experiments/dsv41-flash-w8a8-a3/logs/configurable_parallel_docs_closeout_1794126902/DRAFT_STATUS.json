@@ -1,0 +1,10 @@
+{
+  "status": "DRAFT_READY_NOT_PUBLISHED",
+  "Root_final_bounded_disposition_received": false,
+  "independent_actual_audit": "163217 COMPLETE0 reported 4363PASS/5UNMET; final seal pending",
+  "whole_case": "NOT_ACCEPTED_STRICT_TELEMETRY259",
+  "owner_final_metadata_seal": "PENDING",
+  "shared_overlays_edited": false,
+  "tests_CPU_NPU_jobs": 0,
+  "model_edits": 0
+}

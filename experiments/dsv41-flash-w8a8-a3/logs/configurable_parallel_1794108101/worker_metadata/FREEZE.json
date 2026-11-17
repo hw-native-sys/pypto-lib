@@ -1,0 +1,9 @@
+{
+  "status": "FINAL_PARK",
+  "manifest_sha256": "00e9b82ff3c0559bc885c31b61eb69397559c1be2c630dff5462c15b4d8ec6ca",
+  "report_sha256": "4f50f2c4824a13711166b100d455193f8ce503d00a9da0553ef15040df40e164",
+  "script_sha256": "5a0db9e9128d762051f898d16b1f75bd7aa2ab354e6eab4aa9f3259666fe2292",
+  "source_snapshot_sha256": "651580ea4f88a065a91182faa455b361278dc10dd6b739ed499c9f5545dac23d",
+  "product_edits": 0,
+  "all_jobs_terminal": true
+}

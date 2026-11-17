@@ -1,0 +1,8 @@
+{
+  "task": "task_20261108_023659_348614111959",
+  "exit": 1,
+  "first_cause": "reviewer assumed artifacts.json but accepted HC unit uses artifact_manifest.json",
+  "producer_imports": 0,
+  "compile_calls": 0,
+  "not_model_or_guard_failure": true
+}

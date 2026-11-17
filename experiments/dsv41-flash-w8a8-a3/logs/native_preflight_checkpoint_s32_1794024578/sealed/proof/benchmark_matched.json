@@ -1,0 +1,48 @@
+{
+  "platform": "CPU",
+  "threads": 16,
+  "shape_M_N_K": [
+    128,
+    64,
+    5120
+  ],
+  "seed": 2842,
+  "rounds": 9,
+  "warmup": 2,
+  "samples_seconds": {
+    "original_s32_expression": [
+      0.003900649957358837,
+      0.0038822810165584087,
+      0.004054820979945362,
+      0.0038980299141258,
+      0.0039179709274321795,
+      0.003879761090502143,
+      0.003938851063139737,
+      0.003902380936779082,
+      0.00404625094961375
+    ],
+    "exact_AST_substitution": [
+      0.0008636550046503544,
+      0.0008027340518310666,
+      0.0008446049178019166,
+      0.0007873339345678687,
+      0.0007909939158707857,
+      0.0007675840752199292,
+      0.0008320939959958196,
+      0.0007791640236973763,
+      0.0008293850114569068
+    ]
+  },
+  "median_seconds": {
+    "original_s32_expression": 0.003902380936779082,
+    "exact_AST_substitution": 0.0008027340518310666
+  },
+  "matched_expression_speedup": 4.861362150861302,
+  "both_original_int32_casts_preserved": true,
+  "domain_checks_and_fp64_casts_included": true,
+  "both_operands_strided_equivalence": true,
+  "scope": "CPU microbenchmark only, no full40 oracle timing/cache/NPU speedup",
+  "shared_host_loadavg": "35.31 36.51 34.81 18/10980 4176982",
+  "NPU": 0,
+  "payload": 0
+}

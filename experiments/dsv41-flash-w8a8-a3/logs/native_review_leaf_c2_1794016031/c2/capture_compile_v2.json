@@ -1,0 +1,18 @@
+{
+  "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/build_output/_jit_decode_fwd_20261107_094411_1ish_u4a",
+  "capture_param": {
+    "name": "captured_input__ssa_v0",
+    "direction": "Out",
+    "shape": [
+      16,
+      3,
+      -1,
+      5120
+    ],
+    "dtype": "bfloat16",
+    "layout": "ND"
+  },
+  "mode": "ONBOARD compile only",
+  "platform": "a2a3",
+  "device_dispatches": 0
+}

@@ -1,0 +1,11 @@
+{
+  "id": "main-f09-next-bounded-plan-1794064710-1794065754",
+  "agent": "/root/main_native",
+  "start_epoch": 1794064710,
+  "end_epoch": 1794065754,
+  "elapsed_seconds": 1044,
+  "status": "FINAL/PARK",
+  "scope": "NEWartifact-only ONEactiveS/B2 plan+onequeuedtinyCPUmetadata/slots/AST, no product/sharedwrites/payload/NPU/compile/grant",
+  "shared_ledger_imported": false,
+  "workers": []
+}

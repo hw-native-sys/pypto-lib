@@ -1,0 +1,1 @@
+Root-authorized future observer helper repair ARTIFACT ONLY. Currentactual030353/frozenouter15/modelM02/oldunits unchanged. No model/runtime/payload/NPU/header/broad lifecycle tests. Distinguish same recordedbirth confirmedgone from unknownlive, keepstrict errors/fsync/samechildsupervision, no retrospectivePASS or memoryinventing.

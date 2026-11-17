@@ -1,0 +1,84 @@
+{
+  "parent_pid": 180708,
+  "all_observed_own_pids": [
+    180708,
+    203231,
+    203232,
+    203238,
+    203244,
+    203257,
+    203264,
+    203270,
+    203276,
+    203282,
+    203289,
+    203302,
+    203308,
+    203314,
+    203320,
+    203326,
+    203340,
+    203346
+  ],
+  "sample_count": 93,
+  "sampled_tree_peak_pss": 133653403648,
+  "sampled_tree_peak_uss": 123542523904,
+  "per_pid_peak_rss": {
+    "203232": 116366077952,
+    "203264": 116365217792,
+    "180708": 130614640640,
+    "203238": 116365000704,
+    "203270": 116365275136,
+    "203302": 116365287424,
+    "203244": 116365144064,
+    "203276": 116365139968,
+    "203289": 116365082624,
+    "203308": 116365205504,
+    "203340": 116365742080,
+    "203282": 116365037568,
+    "203314": 116365197312,
+    "203346": 116365869056,
+    "203320": 116365352960,
+    "203257": 116365078528,
+    "203326": 116365545472,
+    "203231": 10915840
+  },
+  "minimum_available": {
+    "host": 1584079581184,
+    "disk": 9529945227264,
+    "shm": 1064479948800
+  },
+  "maximum_shm_used": 14863847424,
+  "events": [
+    {
+      "event": "actual_META_before_fixture",
+      "geometry": {
+        "prefix": {
+          "static_arguments": 57,
+          "expert_layers": 1,
+          "static_bytes_per_rank": 6463879104,
+          "nonstatic_tensor_bytes": 7609876736,
+          "largest_static_host_argument_bytes": 13421772800
+        },
+        "decode": {
+          "static_arguments": 57,
+          "expert_layers": 1,
+          "static_bytes_per_rank": 6463879104,
+          "nonstatic_tensor_bytes": 247111680,
+          "largest_static_host_argument_bytes": 13421772800
+        }
+      },
+      "time": 1794027953.5101714
+    },
+    {
+      "event": "before_prepare_and_prewarm",
+      "devicewide": {
+        "reader": "npu-smi info",
+        "returncode": 0,
+        "worker_public_committed_counter": "unavailable before worker construction; no fabricated value"
+      },
+      "time": 1794028090.3744364
+    }
+  ],
+  "counter_scope": "3s sampled own-tree PSS/USS; perPID RSS only; devicewide npu-smi beforeprepare plus public rank counters afterprewarm/upload/dispatch/beforeclose in work; postclose worker counters unavailable"
+}

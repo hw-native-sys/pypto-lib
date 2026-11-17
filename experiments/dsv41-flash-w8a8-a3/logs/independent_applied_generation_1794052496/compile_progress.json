@@ -1,0 +1,270 @@
+[
+  {
+    "phase": "prefill3",
+    "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_applied_generation_1794052496/signature_build/_jit_prefill_fwd_20261107_200422_vdk4cbk8",
+    "seconds": 26.398257970809937,
+    "artifact_manifest_sha256": "0cb1d541ef1dfb16fa915d59f6defecc4bdc186cecbec7c6ae1e11763241fd96",
+    "metadata_sha256": "3ef340dbe30e192bddd20ab2ec26bbe33b86453ffb0c6ce37d1512b847a50715",
+    "host_sha256": "6d4f744d144e076f59a9c1867a4f21e55219931f82e6320ee4c48e49576bd748",
+    "parameter_count": 100,
+    "concrete_input_shape": [
+      16,
+      3
+    ],
+    "concrete_logits_shape": [
+      16,
+      3,
+      32320
+    ],
+    "generated_input_shape": [
+      16,
+      -1
+    ],
+    "dynamic_bindings": {
+      "T_DYN": "tensors['input_ids__ssa_v0'].shape[1]",
+      "B_DYN": "tensors['index_block_table__ssa_v0'].shape[1]",
+      "TABLE_DYN": "tensors['index_block_table__ssa_v0'].shape[2]",
+      "ORI_BLOCKS_DYN": "tensors['window_cache__ssa_v0'].shape[2]",
+      "CMP_BLOCKS_DYN": "tensors['compressed_cache_c2a__ssa_v0'].shape[2]",
+      "INDEX_BLOCKS_DYN": "tensors['index_cache_c2a__ssa_v0'].shape[2]",
+      "STATE_BLOCKS_DYN": "tensors['state_cache_c2a__ssa_v0'].shape[2]",
+      "POOL_BLOCKS_DYN": "tensors['pool_block_ids_c2a__ssa_v0'].shape[3]"
+    },
+    "static_arguments": 57,
+    "static_per_rank_bytes": 39624816576,
+    "expert_axes": [
+      16,
+      40,
+      24
+    ],
+    "formal_scalars": {
+      "engram_enabled": {
+        "name": "engram_enabled__ssa_v0",
+        "direction": "In",
+        "shape": null,
+        "dtype": "int32",
+        "layout": null
+      }
+    },
+    "lower_orchestration_scalar_inventory": [
+      {
+        "path": "next_levels/l2_prefill_fwd/orchestration/l2_prefill_fwd.cpp",
+        "formal_scalar_unpack": [
+          {
+            "line": 152,
+            "text": "int32_t engram_enabled = orch_args.scalar<int32_t>(0);"
+          },
+          {
+            "line": 153,
+            "text": "int32_t rank = orch_args.scalar<int32_t>(1);"
+          },
+          {
+            "line": 154,
+            "text": "uint64_t recv_x_ctx = orch_args.scalar<uint64_t>(2);"
+          },
+          {
+            "line": 155,
+            "text": "uint64_t recv_aux_ctx = orch_args.scalar<uint64_t>(3);"
+          },
+          {
+            "line": 156,
+            "text": "uint64_t recv_meta_ctx = orch_args.scalar<uint64_t>(4);"
+          },
+          {
+            "line": 157,
+            "text": "uint64_t meta_ready_ctx = orch_args.scalar<uint64_t>(5);"
+          },
+          {
+            "line": 158,
+            "text": "uint64_t data_ready_ctx = orch_args.scalar<uint64_t>(6);"
+          },
+          {
+            "line": 159,
+            "text": "uint64_t return_slots_ctx = orch_args.scalar<uint64_t>(7);"
+          },
+          {
+            "line": 160,
+            "text": "uint64_t return_ready_ctx = orch_args.scalar<uint64_t>(8);"
+          },
+          {
+            "line": 161,
+            "text": "uint64_t consumed_ctx = orch_args.scalar<uint64_t>(9);"
+          },
+          {
+            "line": 162,
+            "text": "uint64_t return_consumed_ctx = orch_args.scalar<uint64_t>(10);"
+          },
+          {
+            "line": 163,
+            "text": "uint64_t output_window_ctx = orch_args.scalar<uint64_t>(11);"
+          },
+          {
+            "line": 164,
+            "text": "uint64_t output_arrived_ctx = orch_args.scalar<uint64_t>(12);"
+          },
+          {
+            "line": 165,
+            "text": "uint64_t embed_window_ctx = orch_args.scalar<uint64_t>(13);"
+          },
+          {
+            "line": 166,
+            "text": "uint64_t embed_arrived_ctx = orch_args.scalar<uint64_t>(14);"
+          }
+        ],
+        "all_scalar_packing_sha256": "a7932868de85b050d6787e66b0be31bf3d72835ddd3572a1e08214d0e19ab488",
+        "scalar_pack_calls": 460,
+        "float_declarations": 0,
+        "bool_declarations": 192,
+        "typed_scalar_template_counts": {
+          "int32_t": 2,
+          "uint64_t": 13
+        }
+      }
+    ],
+    "runtime_configs": [
+      {
+        "runtime": "tensormap_and_ringbuffer",
+        "aicpu_thread_num": 0
+      }
+    ],
+    "platform": "a2a3",
+    "normalized_mode": "ExecutionMode.ONBOARD",
+    "requested_compile_token_bound": 3,
+    "samples": 0,
+    "NPU": 0
+  },
+  {
+    "phase": "decode1",
+    "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_applied_generation_1794052496/signature_build/_jit_decode_fwd_20261107_200448__v9ntozt",
+    "seconds": 24.403010368347168,
+    "artifact_manifest_sha256": "d3c231ffaeff9d6104a12366ad4c156ebc0488fb954dd55d9e08f9e19f42e1c7",
+    "metadata_sha256": "6a2d2c6f6b0d62453aed6bb501cb7070d208d4d069648bd0ee20bc7fa9073001",
+    "host_sha256": "d8534fe9751d12b94074e2dc4583a70ff6a0c9ecc96e31fd618c2fef737eef34",
+    "parameter_count": 96,
+    "concrete_input_shape": [
+      16,
+      1
+    ],
+    "concrete_logits_shape": [
+      16,
+      1,
+      32320
+    ],
+    "generated_input_shape": [
+      16,
+      -1
+    ],
+    "dynamic_bindings": {
+      "T_DYN": "tensors['input_ids__ssa_v0'].shape[1]",
+      "B_DYN": "tensors['index_block_table__ssa_v0'].shape[1]",
+      "TABLE_DYN": "tensors['index_block_table__ssa_v0'].shape[2]",
+      "ORI_BLOCKS_DYN": "tensors['window_cache__ssa_v0'].shape[2]",
+      "CMP_BLOCKS_DYN": "tensors['compressed_cache_c2a__ssa_v0'].shape[2]",
+      "INDEX_BLOCKS_DYN": "tensors['index_cache_c2a__ssa_v0'].shape[2]",
+      "STATE_BLOCKS_DYN": "tensors['state_cache_c2a__ssa_v0'].shape[2]",
+      "POOL_BLOCKS_DYN": "tensors['pool_block_ids__ssa_v0'].shape[3]"
+    },
+    "static_arguments": 57,
+    "static_per_rank_bytes": 39624816576,
+    "expert_axes": [
+      16,
+      40,
+      24
+    ],
+    "formal_scalars": {
+      "engram_enabled": {
+        "name": "engram_enabled__ssa_v0",
+        "direction": "In",
+        "shape": null,
+        "dtype": "int32",
+        "layout": null
+      }
+    },
+    "lower_orchestration_scalar_inventory": [
+      {
+        "path": "next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp",
+        "formal_scalar_unpack": [
+          {
+            "line": 158,
+            "text": "int32_t engram_enabled = orch_args.scalar<int32_t>(0);"
+          },
+          {
+            "line": 159,
+            "text": "int32_t rank = orch_args.scalar<int32_t>(1);"
+          },
+          {
+            "line": 160,
+            "text": "uint64_t output_window_ctx = orch_args.scalar<uint64_t>(2);"
+          },
+          {
+            "line": 161,
+            "text": "uint64_t output_arrived_ctx = orch_args.scalar<uint64_t>(3);"
+          },
+          {
+            "line": 162,
+            "text": "uint64_t embed_window_ctx = orch_args.scalar<uint64_t>(4);"
+          },
+          {
+            "line": 163,
+            "text": "uint64_t embed_arrived_ctx = orch_args.scalar<uint64_t>(5);"
+          },
+          {
+            "line": 164,
+            "text": "uint64_t recv_x_ctx = orch_args.scalar<uint64_t>(6);"
+          },
+          {
+            "line": 165,
+            "text": "uint64_t recv_aux_ctx = orch_args.scalar<uint64_t>(7);"
+          },
+          {
+            "line": 166,
+            "text": "uint64_t recv_meta_ctx = orch_args.scalar<uint64_t>(8);"
+          },
+          {
+            "line": 167,
+            "text": "uint64_t meta_ready_ctx = orch_args.scalar<uint64_t>(9);"
+          },
+          {
+            "line": 168,
+            "text": "uint64_t data_ready_ctx = orch_args.scalar<uint64_t>(10);"
+          },
+          {
+            "line": 169,
+            "text": "uint64_t return_slots_ctx = orch_args.scalar<uint64_t>(11);"
+          },
+          {
+            "line": 170,
+            "text": "uint64_t return_ready_ctx = orch_args.scalar<uint64_t>(12);"
+          },
+          {
+            "line": 171,
+            "text": "uint64_t consumed_ctx = orch_args.scalar<uint64_t>(13);"
+          },
+          {
+            "line": 172,
+            "text": "uint64_t return_consumed_ctx = orch_args.scalar<uint64_t>(14);"
+          }
+        ],
+        "all_scalar_packing_sha256": "fa52b816b9de0e5879b7903c6e7f114dac561700777db68279758743809f34a8",
+        "scalar_pack_calls": 460,
+        "float_declarations": 0,
+        "bool_declarations": 196,
+        "typed_scalar_template_counts": {
+          "int32_t": 2,
+          "uint64_t": 13
+        }
+      }
+    ],
+    "runtime_configs": [
+      {
+        "runtime": "tensormap_and_ringbuffer",
+        "aicpu_thread_num": 0
+      }
+    ],
+    "platform": "a2a3",
+    "normalized_mode": "ExecutionMode.ONBOARD",
+    "requested_compile_token_bound": 1,
+    "samples": 0,
+    "NPU": 0
+  }
+]

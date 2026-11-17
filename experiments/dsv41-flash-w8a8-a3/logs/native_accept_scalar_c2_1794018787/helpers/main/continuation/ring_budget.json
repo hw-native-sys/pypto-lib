@@ -1,0 +1,32 @@
+{
+  "old_heap_bytes": 268435456,
+  "device_requested_bytes": 525635584,
+  "allocations": {
+    "alloc_1": {
+      "visible_tensor_bytes": 525634144,
+      "aligned64_bytes": 525634176,
+      "tensor_count": 16,
+      "device_request_minus_aligned_tensor_bytes": 1408
+    },
+    "alloc_2": {
+      "visible_tensor_bytes": 1008107520,
+      "aligned64_bytes": 1008107520,
+      "tensor_count": 4
+    }
+  },
+  "co_live_alloc1_alloc2_bytes": 1533747200,
+  "corrected_public_ring_heap": [
+    0,
+    0,
+    2147483648,
+    0
+  ],
+  "corrected_ring2_bytes": 2147483648,
+  "all4_ring_heap_bound_if_other_defaults256MiB": 2952790016,
+  "additional_ring2_bytes_per_rank": 1879048192,
+  "input_per_rank_upper_bound": 14073755840,
+  "comm_window_bytes_per_rank": 680528224,
+  "measured_peak_available": false,
+  "remaining_unknowns": "allocator/compiler/runtime overhead and transient lifetimes; bounded synthetic only; no real-fit claim",
+  "model_or_runtime_source_changes": false
+}

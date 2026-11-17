@@ -1,0 +1,17 @@
+{
+  "record_id": "main-configurable-operation-prepare-1794111133",
+  "role": "main-agent",
+  "artifact_start_epoch": 1794111133.6084697,
+  "start_epoch": 1794111649.7666855,
+  "end_epoch": 1794112079.7340717,
+  "measured_wall_seconds": 429.96738624572754,
+  "overlap_already_counted_in": "main-configurable-parallel-1794108101",
+  "overlap_excluded_seconds": 516.1582157611847,
+  "source_only": true,
+  "model_edits": 0,
+  "tests_CPU_NPU_jobs": 0,
+  "headers_payload_bytes": 0,
+  "positive_actual_grants": 0,
+  "source45": "f0e91a30e4117e110be183ef44acf2874eea813cc6f72ac7c7fa44bc4ede3a7f",
+  "status": "FINAL_PARK"
+}

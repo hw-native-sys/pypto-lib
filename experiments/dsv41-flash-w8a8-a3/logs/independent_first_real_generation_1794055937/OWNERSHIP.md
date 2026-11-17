@@ -1,0 +1,1 @@
+Independent finite post-case audit only. Prepare while native204310 runs; actual queuedCPU audit waits NPUterminal+executor externalPOST receipt. No NPU/payload/product/historical writes or nestedqueuequeries.

@@ -1,0 +1,20 @@
+{
+  "role": "review-agent",
+  "unique_id": "independent_f09_real_B_generation_prepare_1794099369",
+  "start_epoch": 1794099230,
+  "artifact_epoch": 1794099369.194012,
+  "shared_writes": 0,
+  "state": "FINAL/PARK_SOURCE_ONLY_READY",
+  "CPU_tests_or_jobs": 0,
+  "NPU": false,
+  "end_epoch": 1794099628.2050717,
+  "root_imports": "once, owned by Root",
+  "model_imports": 0,
+  "checkpoint_headers_or_payload": 0,
+  "compile": 0,
+  "prepare": 0,
+  "positive_grants_created": 0,
+  "actual_case_audit": false,
+  "fit_PREQUEUE": "separate fitter-owned pending; not duplicated",
+  "remaining_tasks": []
+}

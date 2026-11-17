@@ -1,0 +1,25 @@
+{
+  "phase": "AFTER_SUCCESSFUL_PUBLIC_PREPARE_BEFORE_WEIGHTS",
+  "epoch": 1794081196.8695729,
+  "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_artifact_lifecycle_fix_1794079805/tiny_CPU_ONLY_MOCK_1794081196640786325/actual-work/prepared_artifact",
+  "source_manifest": "MOCK_ONLY_NOT_NATIVE_SOURCE",
+  "source_projection": {
+    "distributed_meta.json": "d88312cf37b67df318d02d218c8d2ed94f7468425e68fed50dc40f7b364b902b",
+    "next_levels/test/kernel_config.py": "8e1d9a9d811d2eee916e1f5b352f279eea68d1afe5c60e9f6cfaf3cf1547f4e2",
+    "next_levels/test/kernels/aiv/test.pto": "9ceed6783b78cfdde8d04b6caec87908beea40e8e8b81deea549b32e35b04d48",
+    "next_levels/test/kernels/aiv/test.cpp": "acf69fa4580a719ed3b361c0a2ae55c69048606db566c37b30d537a4f17745ff",
+    "next_levels/test/orchestration/test.cpp": "ab4364757d8a408b7aceca5bf5abae7adca7de7f0ca97252a7292833bdaaf455"
+  },
+  "prepared_kernel_objects": {
+    "next_levels/test/kernels/aiv/test.o": "78354d7f5ca8788d32cb88ba2300361c8bb6d128b84f51748c1924b3d7f5dfb9"
+  },
+  "prepared_orchestrations": {
+    "next_levels/test/orchestration/test.so": "bf0143b870c87d8a971651fed5a920dbd19c3df40357496f8f664f44d34996e7"
+  },
+  "prepared_device_text_images": {
+    "next_levels/test/cache/text.bin": "fa391f10898e8b743918d4bdc2968881c16b0a8c874aa305afd857c30efff252"
+  },
+  "private_runtime_API_used": false,
+  "device_memory_fingerprint_claim": false,
+  "native_dispatch_claim": false
+}

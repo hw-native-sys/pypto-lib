@@ -1,0 +1,11 @@
+{
+  "record_id": "review-exact-prompt-1794036903-1794038387",
+  "agent": "review-agent",
+  "start_epoch": 1794036903,
+  "end_epoch": 1794038387,
+  "duration_seconds": 1484,
+  "scope": "Independent new-generate CPU host/binding/static preflight; no NPU/forward/real payload",
+  "status": "FINAL/PARK",
+  "NPU_jobs": 0,
+  "jobs_terminal": true
+}

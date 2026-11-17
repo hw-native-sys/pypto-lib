@@ -1,0 +1,13 @@
+{
+  "record_id": "main-shared-weight-owner-apply-1794074398",
+  "role": "main-agent",
+  "start_epoch": 1794074398,
+  "end_epoch": 1794074673,
+  "elapsed_seconds": 275,
+  "imported_shared_ledger_once": true,
+  "task_ids": [
+    "task_20261108_020157_33976591118"
+  ],
+  "worker_records": [],
+  "scope": "Exactgenerateapplication+tinyCPU+recoverydocs; no compile/NPU/payload/grant"
+}

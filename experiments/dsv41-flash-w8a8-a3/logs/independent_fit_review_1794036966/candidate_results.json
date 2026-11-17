@@ -1,0 +1,37 @@
+{
+  "scope": "noEngram; TINY CPU MOCKS ONLY, no NPU/allocations/payload/forward",
+  "candidate_path": "experiments/dsv41-flash-w8a8-a3/logs/fit_post_guard_1794037055/fit_probe.py",
+  "candidate_sha256": "1542c1848227a0326655dc809ede1c71bca1e3d71d67f77a11e604741b924865",
+  "checks": {
+    "candidate_largest_last_rank_overrun": {
+      "status": "FAIL",
+      "allocations": 16,
+      "frees": 16,
+      "owner_closed": true,
+      "error": "Refused: postallocation free/remaining/IO/comm/headroom guard"
+    },
+    "candidate_aggregate_last_rank_last_resource_overrun": {
+      "status": "FAIL",
+      "allocations": 912,
+      "frees": 912,
+      "owner_closed": true,
+      "error": "Refused: postallocation free/remaining/IO/comm/headroom guard"
+    },
+    "candidate_equal_headroom_boundary": {
+      "status": "EMPTY_ALLOCATIONS_PASS",
+      "allocations": 16,
+      "frees": 16,
+      "owner_closed": true,
+      "error": null
+    },
+    "candidate_after_query_failure": {
+      "status": "FAIL",
+      "allocations": 16,
+      "frees": 16,
+      "owner_closed": true,
+      "error": "RuntimeError: independent injected postallocation public query failure"
+    }
+  },
+  "production45_and_old31_unchanged": true,
+  "claim": "post-allocation admission/cleanup fix only; calibration attribution still unresolved; no fit GO"
+}

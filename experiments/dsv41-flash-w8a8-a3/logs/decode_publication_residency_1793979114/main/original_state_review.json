@@ -1,0 +1,24 @@
+{
+  "original_sha256": "1c26f996fa91bcd3ae497e1ae33e88a2e0bf38c2e734f8af85baee06492a87ee",
+  "states": [
+    {
+      "position": 1250,
+      "slot": 0,
+      "original_and_own_state_exact": true,
+      "zero_return_would_mismatch": 8
+    },
+    {
+      "position": 1251,
+      "slot": 1,
+      "original_and_own_state_exact": true,
+      "zero_return_would_mismatch": 8
+    }
+  ],
+  "independent_counts": {
+    "c2_visible_rows": 625,
+    "c2_blocks": 79,
+    "c1_visible_rows": 1251,
+    "c1_blocks": 157,
+    "candidate_cap": 2048
+  }
+}

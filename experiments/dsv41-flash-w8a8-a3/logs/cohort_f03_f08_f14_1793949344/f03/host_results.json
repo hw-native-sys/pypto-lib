@@ -1,0 +1,64 @@
+{
+  "provenance": {
+    "revision": "8fde6d4e335fe300e2b949aab0e31659cce0811d",
+    "archive_sha256": "48c797546805b04ffde118c506f8902e37e19bf2cb5d1713097056a4c93e998c",
+    "sources": {
+      "vllm_ascend/attention/dsa_v41.py": "3505769857f83fa7e67f652984f50bd0478158f1d24f185cab091203e70392fd",
+      "tests/e2e/nightly/single_node/ops/singlecard_ops/test_inplace_partial_rotary_mul.py": "078470b8443b8991f23f977c9e898c5263659f733aad1a8254ee9c9671953139"
+    }
+  },
+  "cases": [
+    {
+      "ratio": 1,
+      "tokens": 1,
+      "original_flow_exact": true,
+      "unrotated_index_input_exact": true
+    },
+    {
+      "ratio": 1,
+      "tokens": 7,
+      "original_flow_exact": true,
+      "unrotated_index_input_exact": true
+    },
+    {
+      "ratio": 1,
+      "tokens": 17,
+      "original_flow_exact": true,
+      "unrotated_index_input_exact": true
+    },
+    {
+      "ratio": 2,
+      "tokens": 1,
+      "original_flow_exact": true,
+      "unrotated_index_input_exact": true
+    },
+    {
+      "ratio": 2,
+      "tokens": 7,
+      "original_flow_exact": true,
+      "unrotated_index_input_exact": true
+    },
+    {
+      "ratio": 2,
+      "tokens": 17,
+      "original_flow_exact": true,
+      "unrotated_index_input_exact": true
+    },
+    {
+      "entry": "prefill_c1a_full",
+      "compressor_equation_exact": true
+    },
+    {
+      "entry": "prefill_c2a_full",
+      "compressor_equation_exact": true
+    },
+    {
+      "entry": "decode_c1a_full",
+      "compressor_equation_exact": true
+    },
+    {
+      "entry": "decode_c2a_full",
+      "compressor_equation_exact": true
+    }
+  ]
+}

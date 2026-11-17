@@ -1,0 +1,47 @@
+{
+  "categories": {
+    "dense_and_top": {
+      "tensors": 1790,
+      "storage_bytes": 17196936008
+    },
+    "experts": {
+      "tensors": 141696,
+      "storage_bytes": 558396604416
+    },
+    "engram": {
+      "tensors": 10,
+      "storage_bytes": 221819890240
+    }
+  },
+  "sample_shapes": {
+    "layers.0.ffn.experts.0.w1.weight": {
+      "shape": [
+        2304,
+        5120
+      ],
+      "dtype": "torch.int8",
+      "bytes": 11796480
+    },
+    "layers.0.attn.wq_a.weight": {
+      "shape": [
+        1280,
+        5120
+      ],
+      "dtype": "torch.int8",
+      "bytes": 6553600
+    },
+    "layers.39.ffn.experts.383.w2.weight": {
+      "shape": [
+        5120,
+        2304
+      ],
+      "dtype": "torch.int8",
+      "bytes": 11796480
+    }
+  },
+  "header_shards_read": 274,
+  "weight_payload_bytes_read": 0,
+  "full_materialization": false,
+  "allocation_allowed": false,
+  "limits": "Storage bytes are not runtime peak HBM. Rank residency, uploads, compile buffers, snapshots, EP windows and transients still require native measurement."
+}

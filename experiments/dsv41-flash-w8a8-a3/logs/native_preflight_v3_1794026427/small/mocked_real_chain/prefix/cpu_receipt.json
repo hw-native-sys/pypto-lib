@@ -1,0 +1,18 @@
+{
+  "checkpoint_manifest_sha256": "c56971583a8747fc547aa796333b0a7e596fa518576e3f1dc17923b6ed94f1d4",
+  "evidence_mode": "toy-only-prototype",
+  "all_outputs_pass": true,
+  "output_names": [
+    "state",
+    "logits"
+  ],
+  "scope": "CPU FAKE toy analytic only",
+  "validated_scopes": {
+    "unconditioned": true,
+    "staged": true
+  },
+  "reference_provenance": null,
+  "phase": "prefix",
+  "unconditioned_logit_max_abs": 0.0,
+  "native_resume_authorized": false
+}

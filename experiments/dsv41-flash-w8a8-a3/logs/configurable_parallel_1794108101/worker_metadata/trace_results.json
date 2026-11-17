@@ -1,0 +1,26 @@
+{
+  "status": "PASS_METADATA_DATA_GENERATION_NOT_NUMERICAL",
+  "source_snapshot_sha256": "651580ea4f88a065a91182faa455b361278dc10dd6b739ed499c9f5545dac23d",
+  "traces": [
+    {
+      "tp": 8,
+      "ep": 16,
+      "exit": 0,
+      "seconds": 28.57832145690918,
+      "plan_sha256": "0b42980f2f7c4ea8bfc237683e930ae3e92fc1f6220563da02d275cb7f36800f",
+      "static_per_rank_bytes": 38328513216,
+      "static_global_bytes": 613256211456
+    },
+    {
+      "tp": 4,
+      "ep": 16,
+      "exit": 0,
+      "seconds": 27.94628930091858,
+      "plan_sha256": "4c4f3847ee569224ba7709ad99b69f4b94a11605425a823c3944825e1b808fa4",
+      "static_per_rank_bytes": 39624816576,
+      "static_global_bytes": 633997065216
+    }
+  ],
+  "checkpoint_header_payload_bytes": 0,
+  "NPU": 0
+}

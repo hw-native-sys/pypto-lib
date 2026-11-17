@@ -1,0 +1,32 @@
+{
+  "models/deepseek_v4_1_flash_a3_w8a8/attention.py": {
+    "snapshot": "experiments/dsv41-flash-w8a8-a3/logs/independent_tp8_head_padding_1794110988/attention.py",
+    "sha256": "5d45e978f80b922cfcacc8a1d4027c0bd57f5e90fd5743ba9ee6f75a14c99e94",
+    "epoch": 1794110988.3735557
+  },
+  "models/deepseek_v4_1_flash_a3_w8a8/o_proj.py": {
+    "snapshot": "experiments/dsv41-flash-w8a8-a3/logs/independent_tp8_head_padding_1794110988/o_proj.py",
+    "sha256": "fd51f122c8c791ef3c9b0c832bce4093474dfc4f29a0de476f38c99612281990",
+    "epoch": 1794110988.385543
+  },
+  "models/deepseek_v4_1_flash_a3_w8a8/mla_proj.py": {
+    "snapshot": "experiments/dsv41-flash-w8a8-a3/logs/independent_tp8_head_padding_1794110988/mla_proj.py",
+    "sha256": "6bf4af21af460c499cc809791b5ce77ffeae556293262d231b4accb1fb876bcd",
+    "epoch": 1794110988.3979642
+  },
+  "models/deepseek_v4_1_flash_a3_w8a8/config.py": {
+    "snapshot": "experiments/dsv41-flash-w8a8-a3/logs/independent_tp8_head_padding_1794110988/config.py",
+    "sha256": "abfb39922b4c340f443c5d3e8869ee2c76344f7b03781702f845055abdd552c1",
+    "epoch": 1794110988.4086254
+  },
+  "models/deepseek_v4_1_flash_a3_w8a8/indexer.py": {
+    "snapshot": "experiments/dsv41-flash-w8a8-a3/logs/independent_tp8_head_padding_1794110988/indexer.py",
+    "sha256": "d8f5d0b1f9f5ed2ff804f2c70d0996f08ebb4cd0af95ea62b8714895257f9435",
+    "epoch": 1794110988.429038
+  },
+  "models/deepseek_v4_1_flash_a3_w8a8/lm_head.py": {
+    "snapshot": "experiments/dsv41-flash-w8a8-a3/logs/independent_tp8_head_padding_1794110988/lm_head.py",
+    "sha256": "09edd3134aa96c76d4dd543be53dd346ede7d2605ba649477fe6a5718b99df81",
+    "epoch": 1794110988.4411225
+  }
+}

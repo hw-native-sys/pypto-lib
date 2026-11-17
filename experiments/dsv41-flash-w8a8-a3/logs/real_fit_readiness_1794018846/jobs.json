@@ -1,0 +1,32 @@
+[
+  {
+    "task": "task_20261107_103448_192507022525",
+    "status": "completed (exit=0)",
+    "log": "headers_queue.log",
+    "log_exit": 0
+  },
+  {
+    "task": "task_20261107_104008_20064916879",
+    "status": "completed (exit=1)",
+    "log": "budget_initial_failure.log",
+    "log_exit": 0
+  },
+  {
+    "task": "task_20261107_104145_242179823401",
+    "status": "completed (exit=0)",
+    "log": "budget_queue.log",
+    "log_exit": 0
+  },
+  {
+    "task": "task_20261107_104558_245194114764",
+    "status": "completed (exit=0)",
+    "log": "header_bindings_queue.log",
+    "log_exit": 0
+  },
+  {
+    "task": "task_20261107_105016_246569223784",
+    "status": "completed (exit=0)",
+    "log": "final_queue.log",
+    "log_exit": 0
+  }
+]

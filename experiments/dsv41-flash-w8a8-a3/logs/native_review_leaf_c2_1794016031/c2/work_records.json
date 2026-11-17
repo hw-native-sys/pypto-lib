@@ -1,0 +1,20 @@
+[
+  {
+    "id": "c2-localization-1794014835-1794015711",
+    "start": 1794014835,
+    "end": 1794015711,
+    "duration": 876,
+    "basis": "measured baseline preservation mtime to finalization;earlier read-only study excluded",
+    "agent": "c2_state_precision",
+    "status": "PARKED"
+  },
+  {
+    "id": "c2-capture-v2-1794015838-1794015926",
+    "start": 1794015838,
+    "end": 1794015926,
+    "duration": 88,
+    "basis": "measured v2 artifact creation mtime to seal; separate nonoverlapping interval",
+    "agent": "c2_state_precision",
+    "status": "PARKED"
+  }
+]

@@ -1,0 +1,46 @@
+{
+  "scope": "read-only generated source/hash inspection, no compiler/model import/execution",
+  "verified_profile_files": [
+    {
+      "phase": "prefill3",
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_applied_signatures_1794097836/helper_compile_output/prefill3/next_levels/l2_prefill_fwd/ptoas/hc_post.pto",
+      "sha256": "9c3dc0646596bead3eda5d9357ba40bb468619599d49f500a83083775901280f"
+    },
+    {
+      "phase": "prefill3",
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_applied_signatures_1794097836/helper_compile_output/prefill3/next_levels/l2_prefill_fwd/ptoas/hc_post_2.pto",
+      "sha256": "e0307a15b94955adb94a13f6dca277635c4ed39637c43776f76d3eeb1053c49c"
+    },
+    {
+      "phase": "prefill3",
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_applied_signatures_1794097836/helper_compile_output/prefill3/next_levels/l2_prefill_fwd/kernels/aiv/hc_post.cpp",
+      "sha256": "eb0125d7c577416a9b6a9684a1db434dbd706eabd7a28807f01141c7237e3d61"
+    },
+    {
+      "phase": "prefill3",
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_applied_signatures_1794097836/helper_compile_output/prefill3/next_levels/l2_prefill_fwd/kernels/aiv/hc_post_2.cpp",
+      "sha256": "296c566153c149648f609a1524760ec93c65a075e962b3b794422a827ef433c5"
+    },
+    {
+      "phase": "decode1",
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_applied_signatures_1794097836/helper_compile_output/decode1/next_levels/decode_fwd_rank/ptoas/hc_post.pto",
+      "sha256": "8e8f5bf4adceb4c7ec8c2b6adae19814bbb8b6560dacd6ff5fbfd7e36695c465"
+    },
+    {
+      "phase": "decode1",
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_applied_signatures_1794097836/helper_compile_output/decode1/next_levels/decode_fwd_rank/ptoas/hc_post_2.pto",
+      "sha256": "5a70048a196ea2269a553d5ae1e8817bdfb06f066cbd5b0911eadd33432f72ca"
+    },
+    {
+      "phase": "decode1",
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_applied_signatures_1794097836/helper_compile_output/decode1/next_levels/decode_fwd_rank/kernels/aiv/hc_post.cpp",
+      "sha256": "f7d67e5e1551c3f5ce5de254798a7c9616feac3d1a7115282d5471c5e293b21a"
+    },
+    {
+      "phase": "decode1",
+      "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_applied_signatures_1794097836/helper_compile_output/decode1/next_levels/decode_fwd_rank/kernels/aiv/hc_post_2.cpp",
+      "sha256": "6c9be86c029bc929ebf116b0f26e8e4c318a2364c383cabb66b2db1a3d644054"
+    }
+  ],
+  "signature767_manifest_sha256": "1a4a8d75e383e4b8001c1c33d574ee5ae5c83654079dee732b49cdac3b931294"
+}

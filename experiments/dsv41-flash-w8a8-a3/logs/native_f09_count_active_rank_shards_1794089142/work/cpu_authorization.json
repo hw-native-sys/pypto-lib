@@ -1,0 +1,48 @@
+{
+  "schema": "Root-F09-active-S/1",
+  "approved": true,
+  "operation": "bounded-synthetic-active-S-B2-3call",
+  "stage": "count-validate",
+  "kind": "ACTUAL_F09_CPU_REFERENCE",
+  "source_manifest_sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "scenario_sha256": "c7b6ab942f5ea17758389aa5a53dafbb1de79e68dbb6f41c4614d66dd6b6dbb1",
+  "route_sha256": "c53c5fd537ecc1bfbf8e228cf691107fda2fb1748dfcb9e5aa09a0d9a3915d43",
+  "lifecycle_root_receipt_sha256": "e76b9984db86a27c3c1b4ebd32ab7de97af91357af4c6784746e5e9a3ade0ffa",
+  "execution_mode": "ONBOARD",
+  "minimum_bytes": {
+    "HOST": 322122547200,
+    "DISK": 17179869184,
+    "SHM": 34359738368
+  },
+  "public_hbm_reserve": 9668944960,
+  "compiled_source_manifest_sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "compiled_file_manifest": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/count_active_files.json",
+  "compiled_file_manifest_sha256": "45c3b4c710e9592127dcde62a1d1f2502ea42fc01843895362150aa56b1b8c54",
+  "compiled_metadata_sha256": "7ec1d89d657653d9bf2ec179f75cc8421dc05477771e5dee2af088d3554972a8",
+  "probe_source_sha256": "f4bf50aebbbbb8b0a7c6a230e5e3acd810b607bdc2624091a46b660709c1b42c",
+  "requested_probe_kind": "active",
+  "root_go_id": "observer-20261108-f09-count-active-rank-shards-offline",
+  "delegation_sha256": "ddf068bd6aa0182defab2a8c785a6a65759d99c05a048936242fbcfa56c72e18",
+  "prepared_case_pins_sha256": "97d681ed869fe34a5d6e72b8e030f7622cb10fafec5650801eb1aa8d9edf3e7d",
+  "communication_epoch_each_dispatch": 1,
+  "scenario_call_indices": [
+    0,
+    1,
+    2
+  ],
+  "planned_count_totals": [
+    192,
+    96,
+    192
+  ],
+  "ring_heap": [
+    0,
+    0,
+    4294967296,
+    0
+  ],
+  "expert_layers": 1,
+  "scope": "COUNT-ACTIVE ONLY; no count-old/full-capture/full-reference authority",
+  "expires_at_epoch": 1794090126.8609138,
+  "native_task_id": "task_20261108_061506_170748215003"
+}

@@ -1,0 +1,8 @@
+{
+  "REPORT_sha256": "ed95e887dd2d7e3b551f5d9e5af148a4e2b8e2d83e601542066915ec2cecca8d",
+  "artifact_count": 21,
+  "artifacts_sha256": "f855d021ad5ebcd985a7902dec93c8be4f3f61f3ba1b19c0aa137b7831b4b4a5",
+  "epoch": 1794076269,
+  "scope": "named archivedcohorts only; no fullhistory blanketdisposition",
+  "state": "FINAL_PARK_READONLY"
+}

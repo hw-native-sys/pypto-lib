@@ -1,0 +1,13 @@
+{
+  "resources": [],
+  "allocations": [],
+  "cleanup_errors": [
+    "independent early rank7 public query error"
+  ],
+  "prewarm": [],
+  "status": "FAIL",
+  "compute_dispatches": 0,
+  "payload_bytes": 0,
+  "error": "RuntimeError: independent early rank7 public query error",
+  "owner_closed": true
+}

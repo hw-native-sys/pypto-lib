@@ -1,0 +1,20 @@
+{
+  "record_id": "main-configurable-docs-closeout-1794126902",
+  "role": "main-agent",
+  "start_epoch": 1794126902.0817838,
+  "end_epoch": 1794127437.5120528,
+  "measured_wall_seconds": 535.4302690029144,
+  "scope": "DOCS_ONLY",
+  "shared_doc_writes": [
+    "MODULES.md",
+    "INTERFACE.md",
+    "HANDOFF.md"
+  ],
+  "lock": ".coordination.lock/flock",
+  "Root_TASKS_STATE_writes": 0,
+  "source_model_runtime_oldseal_writes": 0,
+  "tests_CPU_NPU_jobs": 0,
+  "checkpoint_header_payload_bytes": 0,
+  "worker_records_imported": 0,
+  "status": "FINAL_PARK"
+}

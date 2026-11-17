@@ -1,0 +1,90 @@
+{
+  "observed_epoch": 1794089759.6825256,
+  "ready_log_count_at_snapshot": 16,
+  "snapshot_only_not_full_history": true,
+  "known_descendants": [],
+  "ready_pids": [
+    {
+      "pid": 1710794,
+      "device": 0,
+      "current": null
+    },
+    {
+      "pid": 1710797,
+      "device": 1,
+      "current": null
+    },
+    {
+      "pid": 1710813,
+      "device": 3,
+      "current": null
+    },
+    {
+      "pid": 1710805,
+      "device": 2,
+      "current": null
+    },
+    {
+      "pid": 1710827,
+      "device": 5,
+      "current": null
+    },
+    {
+      "pid": 1710818,
+      "device": 4,
+      "current": null
+    },
+    {
+      "pid": 1710834,
+      "device": 6,
+      "current": null
+    },
+    {
+      "pid": 1710842,
+      "device": 7,
+      "current": null
+    },
+    {
+      "pid": 1710856,
+      "device": 8,
+      "current": null
+    },
+    {
+      "pid": 1710863,
+      "device": 9,
+      "current": null
+    },
+    {
+      "pid": 1710871,
+      "device": 10,
+      "current": null
+    },
+    {
+      "pid": 1710879,
+      "device": 11,
+      "current": null
+    },
+    {
+      "pid": 1710887,
+      "device": 12,
+      "current": null
+    },
+    {
+      "pid": 1710901,
+      "device": 13,
+      "current": null
+    },
+    {
+      "pid": 1710909,
+      "device": 14,
+      "current": null
+    },
+    {
+      "pid": 1710916,
+      "device": 15,
+      "current": null
+    }
+  ],
+  "phase": "LATE_TERMINAL_OBSERVATION_NOT_PREPARE_BOUNDARY",
+  "historical_birth_coverage": "UNKNOWN; no live descendants remained at observation"
+}

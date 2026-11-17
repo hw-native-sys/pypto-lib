@@ -1,0 +1,19 @@
+{
+  "status": "FINAL_PARK_CALLER_ONLY",
+  "files": 18,
+  "manifest_sha256": "72ab1fd5ebeb197cec65569e8f99eb36ccd659ff51973fbf88c8101e5321e5c8",
+  "case": "8281478a8f5dc72ac6dda241904f8dd8826495fa0350d23aa56a9eade061953c",
+  "launcher": "7b587e2233dc1e01ee1c295d5fbfb2f53d72304c25507cc3bf3fb27d88b1ac57",
+  "pins": "f79d2991ba36256033b3b1a4dfca8833223e9eaec54529653c4a3c02256307d0",
+  "reserve": 10157899716,
+  "prestatic": 16621778820,
+  "canonical398_e76_405_full5262_unchanged": true,
+  "CPU_META": "task_20261108_064834_180327519068",
+  "META_PASS": true,
+  "future_work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_full_capture_reserve_1794091408/work",
+  "work_exists": false,
+  "prequeue_run": false,
+  "positive_grants": 0,
+  "own_jobs": 0,
+  "writers": 0
+}

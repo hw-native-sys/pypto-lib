@@ -1,0 +1,30 @@
+{
+  "status": "PASS_UNAPPLIED_CHANGED_PREDICATES_TINY_ONLY",
+  "N3_only": true,
+  "cap_2_and_16_pass": true,
+  "changed_predicate_rejects": [
+    "operation='first-full-real40-noEngram-greedy-N3'",
+    "prompt_text=''",
+    "prompt_text=None",
+    "prompt_ids=[1, 2]",
+    "prompt_ids=[1, 2, 3, 4]",
+    "prompt_ids=[True, 2, 3]",
+    "prompt_ids=[1, -1, 3]",
+    "prompt_ids=[1, 129280, 3]",
+    "max_new_tokens=16.0",
+    "cap=1",
+    "cap=17",
+    "cap=True",
+    "cap=16.0",
+    "text mismatch"
+  ],
+  "actual_tokenizer_boundary_rejects": 3,
+  "default_HARD": true,
+  "unchanged_definitions": true,
+  "sourceD77_unchanged": true,
+  "full_admission_executed": false,
+  "receipts": "IN_MEMORY_CHANGED_AST_ONLY_NOT_ACTUAL_GRANT",
+  "native": false,
+  "payload_bytes": 0,
+  "compile": false
+}

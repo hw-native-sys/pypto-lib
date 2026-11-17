@@ -1,0 +1,30 @@
+{
+  "main_hashes": {
+    "REPORT.md": "a55280585e1bbc917725855c3ac288e418f879b3b0bb61a4ad9b507c26629656",
+    "after.json": "d36bb70d6d4b285785fb92c7c435f8fd99651b895ed91e3a32a675acb016cf7f",
+    "artifacts.json": "0ff6deda1fe501da84fc73be881da65811e05508142b08e1e0f9c5cc1cf81e8f"
+  },
+  "sources_verified": 45,
+  "evidence_files_verified": 156,
+  "changed_sources": [
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_c1a_full.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_c1a_reindex.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_c2a_full.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_c2a_reuse.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_swa.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/layer_reference.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/o_proj.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_c1a_full.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_c1a_reindex.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_c1a_reuse.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_c2a_full.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_c2a_reuse.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_swa.py"
+  ],
+  "protected_hashes": {
+    "mla_proj.py": "c8acc26cf76936995e049d51cc163f9aebf4acc332f6901d13d0302a6458592b",
+    "indexer.py": "8f998dc7ae8773e67acda854af515f9ae7625374ba101b71152e243b0585df43",
+    "o_proj.py": "11c2c872c91f485bc91f68d3ea4ae08672d3395539e2b390f147efd650a29668",
+    "rope.py": "d21e15e8bb37f5f49a1dd4257a276b2c9de1d6b1e51f7a521e38c903c0b85e3d"
+  }
+}

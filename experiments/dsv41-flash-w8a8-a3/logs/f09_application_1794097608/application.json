@@ -1,0 +1,23 @@
+{
+  "status": "APPLIED_PENDING_INDEPENDENT_CHECK",
+  "start_epoch": 1794097719.6901245,
+  "applied_epoch": 1794097720.059598,
+  "RootGO_sha256": "5fe3cca1bcd96cb7f9bc8c89c1301a94662e1b370e9c98389670cbb8913e1c14",
+  "patch_sha256": "504b1830b2f4e6333a01a900fa579ef9de69e017ee20523e8fcbf10850881e46",
+  "actual_source45_sha256": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+  "actual_generate_sha256": "5de1656a99e85699138879b2f577f4eed2639779937a7cdc91ae843fcef6e34c",
+  "changed_paths": [
+    "models/deepseek_v4_1_flash_a3_w8a8/compressor.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_fwd.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_layer.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/decode_moe.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/generate.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/layer_reference.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/moe_exchange.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_fwd.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_layer.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/prefill_moe.py"
+  ],
+  "other35_exact": true,
+  "Main_tests_compile_NPU": false
+}

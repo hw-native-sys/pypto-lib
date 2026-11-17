@@ -1,0 +1,86 @@
+{
+  "schema": "split-validation-prototype/1",
+  "context": {
+    "mode": "ONBOARD",
+    "platform": "a2a3",
+    "phase": "prefix",
+    "owner_epoch": "CPU_FAKE_STORAGE",
+    "source_hashes": {},
+    "compiled_metadata": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/storage_toy/checkpoint/compiled_metadata.json",
+    "compiled_metadata_sha256": "6f4e0f7ad78e3d339f92cbab8c3310f5a3314b3d290d04da5953bb1dfa333ca1",
+    "evidence_mode": "toy-only-prototype",
+    "original_compiled_metadata": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/storage_toy/abi.json"
+  },
+  "fixture_recipe": {
+    "toy": true
+  },
+  "static_names": [
+    "w"
+  ],
+  "static_manifest": {
+    "w": {
+      "shape": [
+        1
+      ],
+      "dtype": "torch.float32",
+      "sha256": "d88c86f15bbea365d658ad95a81d45367c465f7af6f7264fb077f01747ddc77d"
+    }
+  },
+  "payloads": {
+    "actual": {
+      "file": "actual.pt",
+      "file_sha256": "5675ceff55d13f4ee73ef47b043a9c02abf6f30a652ab89a09d75535c3c7af2c",
+      "tensors": {
+        "slice": {
+          "shape": [
+            3
+          ],
+          "dtype": "torch.float32",
+          "sha256": "47d20e728d35ef7a14c23880e9fc3fc0e1b6452f8dad77d23320eb2ab441bafa"
+        },
+        "expanded": {
+          "shape": [
+            4,
+            3
+          ],
+          "dtype": "torch.float32",
+          "sha256": "8c75c96b18ee9935f57ddb545544b46be72d119e50344e10d40499a3b173a956"
+        },
+        "scalar": {
+          "shape": [],
+          "dtype": "torch.bool",
+          "sha256": "4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a"
+        }
+      }
+    },
+    "initial": {
+      "file": "initial.pt",
+      "file_sha256": "b3c0a20067af745877f010ecf04df3ad85509301f8cd321eff08aa408abe1994",
+      "tensors": {
+        "slice": {
+          "shape": [
+            3
+          ],
+          "dtype": "torch.float32",
+          "sha256": "47d20e728d35ef7a14c23880e9fc3fc0e1b6452f8dad77d23320eb2ab441bafa"
+        },
+        "expanded": {
+          "shape": [
+            4,
+            3
+          ],
+          "dtype": "torch.float32",
+          "sha256": "8c75c96b18ee9935f57ddb545544b46be72d119e50344e10d40499a3b173a956"
+        },
+        "scalar": {
+          "shape": [],
+          "dtype": "torch.bool",
+          "sha256": "4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a"
+        }
+      }
+    }
+  },
+  "status": "NATIVE_BYTES_SAVED_NOT_VALIDATED",
+  "evidence_mode": "toy-only-prototype",
+  "static_payload_saved": false
+}

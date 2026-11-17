@@ -1,0 +1,166 @@
+{
+  "role": "candidate",
+  "epoch": 1794074952.223416,
+  "status": "COMPARISON_COMPLETE",
+  "error": null,
+  "actual": {
+    "file": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/cpu_injections/runtime_exception_old/receipts/candidate/000/actual.pt",
+    "sha256": "781d0ea95687297833b8a1e933d4ebf8b6cf1f73e45e6a2ad3b42a2421c386e9",
+    "shape": [
+      5,
+      4,
+      5120
+    ],
+    "dtype": "torch.float32",
+    "bytes": 409600
+  },
+  "expected": {
+    "file": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/cpu_injections/runtime_exception_old/receipts/candidate/000/expected.pt",
+    "sha256": "781d0ea95687297833b8a1e933d4ebf8b6cf1f73e45e6a2ad3b42a2421c386e9",
+    "shape": [
+      5,
+      4,
+      5120
+    ],
+    "dtype": "torch.float32",
+    "bytes": 409600
+  },
+  "bit_exact": true,
+  "BF16_representable": true,
+  "different_values": 0,
+  "nonrepresentable_values": 0,
+  "bit_different_values": 0,
+  "max_abs": 0.0,
+  "elements": 102400,
+  "actual_finite": true,
+  "expected_finite": true,
+  "top_differences": [
+    {
+      "flat_index": 8,
+      "actual": 1.0,
+      "expected": 1.0,
+      "absolute_difference": 0.0,
+      "actual_bits": 1065353216,
+      "expected_bits": 1065353216
+    },
+    {
+      "flat_index": 10,
+      "actual": 1.0,
+      "expected": 1.0,
+      "absolute_difference": 0.0,
+      "actual_bits": 1065353216,
+      "expected_bits": 1065353216
+    },
+    {
+      "flat_index": 4,
+      "actual": 1.0,
+      "expected": 1.0,
+      "absolute_difference": 0.0,
+      "actual_bits": 1065353216,
+      "expected_bits": 1065353216
+    },
+    {
+      "flat_index": 7,
+      "actual": -1.0,
+      "expected": -1.0,
+      "absolute_difference": 0.0,
+      "actual_bits": -1082130432,
+      "expected_bits": -1082130432
+    },
+    {
+      "flat_index": 11,
+      "actual": -1.0,
+      "expected": -1.0,
+      "absolute_difference": 0.0,
+      "actual_bits": -1082130432,
+      "expected_bits": -1082130432
+    },
+    {
+      "flat_index": 3,
+      "actual": -1.0,
+      "expected": -1.0,
+      "absolute_difference": 0.0,
+      "actual_bits": -1082130432,
+      "expected_bits": -1082130432
+    },
+    {
+      "flat_index": 9,
+      "actual": -1.0,
+      "expected": -1.0,
+      "absolute_difference": 0.0,
+      "actual_bits": -1082130432,
+      "expected_bits": -1082130432
+    },
+    {
+      "flat_index": 1,
+      "actual": -1.0,
+      "expected": -1.0,
+      "absolute_difference": 0.0,
+      "actual_bits": -1082130432,
+      "expected_bits": -1082130432
+    },
+    {
+      "flat_index": 5,
+      "actual": -1.0,
+      "expected": -1.0,
+      "absolute_difference": 0.0,
+      "actual_bits": -1082130432,
+      "expected_bits": -1082130432
+    },
+    {
+      "flat_index": 0,
+      "actual": 1.0,
+      "expected": 1.0,
+      "absolute_difference": 0.0,
+      "actual_bits": 1065353216,
+      "expected_bits": 1065353216
+    },
+    {
+      "flat_index": 2,
+      "actual": 1.0,
+      "expected": 1.0,
+      "absolute_difference": 0.0,
+      "actual_bits": 1065353216,
+      "expected_bits": 1065353216
+    },
+    {
+      "flat_index": 6,
+      "actual": 1.0,
+      "expected": 1.0,
+      "absolute_difference": 0.0,
+      "actual_bits": 1065353216,
+      "expected_bits": 1065353216
+    }
+  ],
+  "per_row": [
+    {
+      "row": 0,
+      "different_values": 0,
+      "nonrepresentable_values": 0
+    },
+    {
+      "row": 1,
+      "different_values": 0,
+      "nonrepresentable_values": 0
+    },
+    {
+      "row": 2,
+      "different_values": 0,
+      "nonrepresentable_values": 0
+    },
+    {
+      "row": 3,
+      "different_values": 0,
+      "nonrepresentable_values": 0
+    },
+    {
+      "row": 4,
+      "different_values": 0,
+      "nonrepresentable_values": 0
+    }
+  ],
+  "ordinary_gate_passed": true,
+  "ordinary_detail": "",
+  "gate_passed": true,
+  "finished_epoch": 1794074952.2974427
+}

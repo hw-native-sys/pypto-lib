@@ -1,0 +1,65 @@
+{
+  "reference_revision": "8fde6d4e335fe300e2b949aab0e31659cce0811d",
+  "archive_sha256": "48c797546805b04ffde118c506f8902e37e19bf2cb5d1713097056a4c93e998c",
+  "references": {
+    "vllm_ascend/models/deepseek_v41/indexer.py": "d5d6a438bbced4e63d729dac94c08869df30dab4a71ceacecdea211386b3db33",
+    "vllm_ascend/models/deepseek_v41/model.py": "101f96b38e9fc47e7be147ddfe56976aee896867c73a33a7d95c3e3c833a6e91"
+  },
+  "checkpoint_config_sha256": "1b2ed579c6a221f68f49222d470dab2068b23a3efc17d969b7a909e684e06316",
+  "checkpoint_cap": 2048,
+  "checkpoint_block": 8,
+  "phase_pool_shapes": {
+    "prefill_c1a_full": [
+      8,
+      2048
+    ],
+    "prefill_c2a_full": [
+      8,
+      2048
+    ],
+    "decode_c1a_full": [
+      2,
+      2048
+    ],
+    "decode_c2a_full": [
+      2,
+      2048
+    ],
+    "prefill_c1a_reindex": [
+      8,
+      2048
+    ],
+    "decode_c1a_reindex": [
+      2,
+      2048
+    ]
+  },
+  "boundary_oracle": [
+    {
+      "blocks": 65,
+      "count": 65,
+      "latest_forced": 64,
+      "exact_padding": true
+    },
+    {
+      "blocks": 2048,
+      "count": 2048,
+      "latest_forced": 2047,
+      "exact_padding": true
+    },
+    {
+      "blocks": 2049,
+      "count": 2048,
+      "latest_forced": 2048,
+      "exact_padding": true
+    },
+    {
+      "blocks": 4097,
+      "count": 2048,
+      "latest_forced": 4096,
+      "exact_padding": true
+    }
+  ],
+  "protected_compute_asts_unchanged": true,
+  "limits": "Metadata/source/closed-form CPU checks; no original QLI hardware or full-model/checkpoint weight execution."
+}

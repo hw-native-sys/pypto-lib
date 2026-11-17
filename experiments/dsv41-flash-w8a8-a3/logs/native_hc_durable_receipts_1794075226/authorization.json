@@ -1,0 +1,22 @@
+{
+  "schema": "hc-boundary-native-micro/1",
+  "root_go_id": "observer-20261108-hc-durable-receipts-native1",
+  "created_epoch": 1794075284.9859884,
+  "created_after_allocation": true,
+  "actual_ordered_device_ids": [
+    0
+  ],
+  "ring_heap": 67108864,
+  "phase_calls": [
+    "candidate",
+    "old_control"
+  ],
+  "T": 5,
+  "H": 4,
+  "D": 5120,
+  "max_native_cases": 1,
+  "no_model_or_weights": true,
+  "source45": "b3e19fd001c74f7a5b497c791c01924ca09c0678df66114fce599e890d8fee06",
+  "probe_sha256": "6d7d3a3b0f9143c4add4a950667d33c4afc5c7e1ea2832171ac5ce5d4e044030",
+  "compiled_pins_sha256": "362195d79e7d86e0bada585b655b67f9cf3b769a061e40c55ca13853b991a145"
+}

@@ -1,0 +1,70 @@
+{
+  "status": "PASS_INDEPENDENT_APPLIED_SHARED_OWNER_CPU_DELTA",
+  "source45": "b3e19fd001c74f7a5b497c791c01924ca09c0678df66114fce599e890d8fee06",
+  "actual_imported_generate": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/generate.py",
+  "actual_generate_sha256": "fba8a4ef9a06f694fa53278bb80ae2ad70d111336dbead938ab9f8511d27e16e",
+  "other44_same_CC": true,
+  "rejected": [
+    {
+      "label": "actual-default-HARD-even-allow",
+      "exception": "ContractGap('host-materialization-overlap: full weights remain held: streaming source/owner is implemented but bounded native reuse, functional continuation and measured real host/HBM fit are unproved (allow_full_materialize=True); no real payload allocation is authorized by this switch')"
+    },
+    {
+      "label": "unknown-operation",
+      "exception": "ContractGap('first-real-admission: separate exact Root generation scope required')"
+    },
+    {
+      "label": "accounting-static_upload_bytes",
+      "exception": "ContractGap('shared-weights: new Root receipt must bind one-upload/borrowed-consumer accounting')"
+    },
+    {
+      "label": "accounting-decode_static_upload_bytes",
+      "exception": "ContractGap('shared-weights: new Root receipt must bind one-upload/borrowed-consumer accounting')"
+    },
+    {
+      "label": "accounting-decode_static_source_reads",
+      "exception": "ContractGap('shared-weights: new Root receipt must bind one-upload/borrowed-consumer accounting')"
+    },
+    {
+      "label": "accounting-static_source_reads",
+      "exception": "ContractGap('shared-weights: new Root receipt must bind one-upload/borrowed-consumer accounting')"
+    },
+    {
+      "label": "bind-before-canonical",
+      "exception": "ContractGap('shared-weights: canonical upload must complete before binding borrowed views')"
+    },
+    {
+      "label": "decode-before-completed-prefill",
+      "exception": "RuntimeError('decode requires a live shared owner and completed prefill')"
+    }
+  ],
+  "success_scope": {
+    "one_fake_prepare": true,
+    "selected": [
+      "prefill",
+      "decode"
+    ],
+    "canonical_frees": 4,
+    "close_calls": 1,
+    "static_H2D": 16,
+    "decode_static_H2D": 0,
+    "read_calls": 4,
+    "decode_reads": 0,
+    "actual_early_shared_IO": true
+  },
+  "legacy_single_program": true,
+  "sourceFIRST_cleanupSECOND_preserved": true,
+  "full_production_admission_positive": false,
+  "CPU_fake_Admission_overrides": [
+    "__init__",
+    "validate_contract",
+    "guard",
+    "weight_source"
+  ],
+  "actual_public_prepare_run_view_alloc_free_methods": true,
+  "native": 0,
+  "compile": 0,
+  "checkpoint_payload": 0,
+  "own_pid": 3413383,
+  "own_starttick": "107481611"
+}

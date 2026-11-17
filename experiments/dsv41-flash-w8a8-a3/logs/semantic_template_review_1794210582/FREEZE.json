@@ -1,0 +1,8 @@
+{
+  "state": "FINAL/PARK",
+  "files": 8,
+  "artifacts_sha256": "303bbafe4688a94165cb35fd28f252a7fdf54241cb92d00ddd1eb30eb748894d",
+  "proposals_sha256": "b54eab700590d6f1bb245164baa6abef95a7e990834ed305b1270da07664820a",
+  "report_sha256": "5848a4b0616499b9f7efc8a9b9bf1cc72abb7d82298f3a617e54e83d721ec1fe",
+  "shared_writes": 0
+}

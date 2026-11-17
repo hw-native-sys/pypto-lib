@@ -1,0 +1,76 @@
+{
+  "status": "PASS_CPU_MOCKED_ONLY",
+  "phases": [
+    {
+      "phase": "prefix",
+      "mutable_names": [
+        "window_cache",
+        "compressed_cache_c2a",
+        "index_cache_c2a",
+        "state_cache_c2a",
+        "compressed_cache_c1a",
+        "index_cache_c1a",
+        "topk_indices_c2a",
+        "topk_values_c2a",
+        "pool_block_ids_c2a",
+        "pool_block_counts_c2a",
+        "topk_indices_c1a",
+        "topk_values_c1a",
+        "pool_block_ids_c1a",
+        "pool_block_counts_c1a",
+        "x_hc",
+        "pre_mix"
+      ],
+      "source_clone_prelude_both_passes": true,
+      "initial_all_bytes_unchanged": true,
+      "CPU_MOCKED_reference_events": [
+        "unconditioned",
+        "staged"
+      ],
+      "reject_controls": [
+        "toy_cannot_native_resume",
+        "owner_capsule_changed",
+        "exact_output_schema_changed",
+        "initial_alias",
+        "producer_policy_changed",
+        "derived_corruption"
+      ]
+    },
+    {
+      "phase": "decode",
+      "mutable_names": [
+        "window_cache",
+        "compressed_cache_c2a",
+        "index_cache_c2a",
+        "state_cache_c2a",
+        "compressed_cache_c1a",
+        "index_cache_c1a",
+        "topk_indices",
+        "topk_values",
+        "pool_block_ids",
+        "pool_block_counts",
+        "x_hc",
+        "pre_mix"
+      ],
+      "source_clone_prelude_both_passes": true,
+      "initial_all_bytes_unchanged": true,
+      "CPU_MOCKED_reference_events": [
+        "unconditioned",
+        "staged"
+      ],
+      "reject_controls": [
+        "toy_cannot_native_resume",
+        "owner_capsule_changed",
+        "exact_output_schema_changed",
+        "initial_alias",
+        "producer_policy_changed",
+        "derived_corruption"
+      ]
+    }
+  ],
+  "original_source45_unchanged": true,
+  "NPU": 0,
+  "actual_model_goldens": 0,
+  "large_fixture": 0,
+  "native_grant": false
+}

@@ -1,0 +1,21 @@
+{
+  "epoch": 1794103036.8763463,
+  "frozen_audit_recorded_count": 1159,
+  "owner_recorded_count": 1160,
+  "additional_owner_records": [
+    {
+      "pid": 3208241,
+      "start_ticks": "109994965"
+    }
+  ],
+  "audit_records_not_in_owner": [],
+  "all1160_matching_births_absent_now": true,
+  "present": [],
+  "source_sha256": "924db4ec2c9c047e16d99a6c9a5f20ff9d108cd21fac1ae8442a57c13b702063",
+  "scope": "Recorded metadata births only; not complete process history or lock ownership.",
+  "owner_extra_matches_saved_outer_parent": {
+    "pid": 3208241,
+    "start_ticks": "109994965"
+  },
+  "saved_outer_parent_stat_sha256": "1b572faae7dc29246e8834501442b4834e145166b3f70d0394e22833b3259e08"
+}

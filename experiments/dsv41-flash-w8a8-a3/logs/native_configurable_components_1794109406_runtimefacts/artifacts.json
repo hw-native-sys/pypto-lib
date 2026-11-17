@@ -1,0 +1,12 @@
+{
+  "REPORT.md": "4e699a4ab95f512b3a5ee3c7b63e0eb295f04c32a1ffcc512d1872ac18224e6f",
+  "before_submit.json": "64b0a13528174d5b1a26853ba2a73f3c858ae223f86b25d36cbb5f3d32101692",
+  "devices_after.txt": "6c936a71e523c41713abc0957919ccfe8cfe115fe6277908cf82e0a0c7797375",
+  "ep_raw.log": "f8b82a54c0c4fa78e74b3aee5c48ccd68798377fd862e69b4eb4795eb9c037e1",
+  "ep_status.txt": "f3d5d9e545cebbcf78976730eeb987ee4f16e540f2c5360dedc7936d0d3efc91",
+  "failure_receipt.json": "810d52a623231a1a2cca13eb6ff7d46e2dc1a218828f5af12d901e9fc8318f13",
+  "lslocks_after.txt": "06356f16ceeb8f3d447b6d4caa62a73e5b27ce869b99a81f55a4b26deb8de063",
+  "npu_smi_after.txt": "9dac773bddc76ab19524d523c685b711decd1349a521bc9f7d746089fed5f442",
+  "ps_after.txt": "f57f30ed5ca3d23ecf1149df868b305230f5f0ed53837c6f2c9267615a8cd556",
+  "work_record.json": "039637d5cd7cdb501a935e5ae75db6e1e72a4e2ad9591becfa5ae2a07ede609c"
+}

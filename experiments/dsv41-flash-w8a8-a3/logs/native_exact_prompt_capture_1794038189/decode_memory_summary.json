@@ -1,0 +1,27 @@
+{
+  "peak_sampled_own_tree_pss": 109375384576,
+  "peak_sampled_own_tree_uss": 109375193088,
+  "max_shm_used": 13671026688,
+  "all_sampled_own_pids": [
+    2481951,
+    2500681,
+    2506787,
+    2506789,
+    2506798,
+    2506800,
+    2506802,
+    2506804,
+    2506809,
+    2506821,
+    2506830,
+    2506832,
+    2506836,
+    2506840,
+    2506842,
+    2506845,
+    2506860,
+    2506876,
+    2506878
+  ],
+  "scope": "own descendant PSS/USS, perPID RSS, sampled2s; not global RSS sum or realweight fit"
+}

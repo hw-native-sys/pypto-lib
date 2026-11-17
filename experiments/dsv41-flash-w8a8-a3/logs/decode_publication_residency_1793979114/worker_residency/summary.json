@@ -1,0 +1,19 @@
+{
+  "verdict": "BLOCKED queue timeout before device allocation; native reuse/peak UNVALIDATED",
+  "source_hashes": {
+    "models/deepseek_v4_1_flash_a3_w8a8/generate.py": "6cad44acba95f43f5e778885d86d5447b14f93b356d110a833f8dbd0c3fbad71",
+    "models/deepseek_v4_1_flash_a3_w8a8/weight_loader.py": "f05950fb2c1fdd0e524c04b6e20c177d157f3946ad10d7511b90d224fa794c48"
+  },
+  "proof": null,
+  "full_weights": "HELD by mandatory host-materialization-overlap guard",
+  "streaming_materialization": "NOT IMPLEMENTED; separate first-generation gate",
+  "record": {
+    "id": "resident-dispatch-1793979514-1793984509",
+    "start": 1793979514,
+    "end": 1793984509,
+    "duration": 4995,
+    "basis": "measured from first recorded CPU task submission233834; earlier preparation/source work excluded; wall includes queue wait, not CPU time",
+    "agent": "resident_dispatch",
+    "status": "PARKED"
+  }
+}

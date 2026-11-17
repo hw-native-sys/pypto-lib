@@ -1,0 +1,23 @@
+{
+  "static_global_bytes": 13675343872,
+  "static_per_rank_bytes": 6837671936,
+  "routed_global_bytes": 13604487168,
+  "shared_global_bytes": 70856704,
+  "host_static_copy_envelope_bytes": 82052063232,
+  "host_other_reserve_bytes": 17179869184,
+  "host_planning_envelope_bytes": 99231932416,
+  "host_floor_bytes": 137438953472,
+  "shm_floor_bytes": 34359738368,
+  "disk_floor_bytes": 8589934592,
+  "initial_public_hbm_floor_per_rank_bytes": 25769803776,
+  "local_slab_stride": 16,
+  "local_slab_rows": 3072,
+  "distributed_rows": 384,
+  "recv_meta_row_bytes": 768,
+  "expected_count_totals": [
+    12,
+    6,
+    6
+  ],
+  "measured_peak": false
+}

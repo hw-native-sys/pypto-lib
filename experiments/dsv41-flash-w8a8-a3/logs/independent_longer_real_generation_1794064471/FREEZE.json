@@ -1,0 +1,10 @@
+{
+  "REPORT_sha256": "f94d85f5be6c5d857c447fea479f5bc656c45ba45c3b75783a5b890277ccf7ba",
+  "artifacts_sha256": "3a442d9c6e9671b1c362de1a9a8b056b02e5adaa86203763f62ad33a6b6081c4",
+  "audit_results_sha256": "1126bf4f8b34a0d4171ffcceb041a8e7102e380f2677da8a290e4cc156be59a9",
+  "epoch": 1794069045,
+  "manifest_count": 16,
+  "scope": "independent receipt audit complete; native operation NOT_ACCEPTED two unmet gates",
+  "source45": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "state": "FINAL_PARK"
+}

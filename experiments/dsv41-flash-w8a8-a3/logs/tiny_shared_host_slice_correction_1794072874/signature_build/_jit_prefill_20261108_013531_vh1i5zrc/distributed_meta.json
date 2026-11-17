@@ -1,0 +1,64 @@
+{
+  "schema": 3,
+  "supported_execution_modes": [
+    "program"
+  ],
+  "params": [
+    {
+      "name": "embed_weight__ssa_v0",
+      "direction": "In",
+      "shape": [
+        2,
+        128,
+        128
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "c1a_comp_norm__ssa_v0",
+      "direction": "In",
+      "shape": [
+        2,
+        128,
+        128
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "token__ssa_v0",
+      "direction": "In",
+      "shape": [
+        2,
+        128,
+        128
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "state__ssa_v0",
+      "direction": "Out",
+      "shape": [
+        2,
+        128,
+        128
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    }
+  ],
+  "num_return_types": 1,
+  "platform": "a2a3",
+  "backend_type": "Ascend910",
+  "distributed_config": {
+    "device_ids": [
+      0,
+      1
+    ],
+    "num_sub_workers": 0,
+    "runtime": "tensormap_and_ringbuffer",
+    "aicpu_thread_num": 0
+  }
+}

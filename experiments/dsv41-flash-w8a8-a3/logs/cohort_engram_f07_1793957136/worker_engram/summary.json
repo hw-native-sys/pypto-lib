@@ -1,0 +1,135 @@
+{
+  "source_sha256": "bffe927ae1db89fef4dcc8384d32ed56687cfc2a7fce1e65a9c01a66174d1f51",
+  "reference_sources": {
+    "vllm_ascend/models/deepseek_v41/engram/common.py": "4797b8962264d137cdb142a9988825288283092fb797ddbd334c6ab2223eb58d",
+    "vllm_ascend/models/deepseek_v41/engram/layer.py": "dc9457c88aa3c90133115bc608447e037b0693f8db71bb8da37f1ead44021f80"
+  },
+  "default_cases": 5,
+  "positive_executions": 7,
+  "negative_controls": {
+    "before": {
+      "counts": [
+        [
+          "114298",
+          "143360"
+        ]
+      ],
+      "max_abs": [
+        "0.872661"
+      ]
+    },
+    "missing": {
+      "counts": [
+        [
+          "114102",
+          "143360"
+        ]
+      ],
+      "max_abs": [
+        "0.872539"
+      ]
+    },
+    "transpose": {
+      "counts": [
+        [
+          "136184",
+          "143360"
+        ]
+      ],
+      "max_abs": [
+        "1.17527"
+      ]
+    },
+    "double_value": {
+      "counts": [
+        [
+          "139453",
+          "143360"
+        ]
+      ],
+      "max_abs": [
+        "1.89674"
+      ]
+    },
+    "fp32_projection": {
+      "counts": [
+        [
+          "45810",
+          "61440"
+        ]
+      ],
+      "max_abs": [
+        "0.00939989"
+      ]
+    },
+    "bf16_output": {
+      "counts": [
+        [
+          "112239",
+          "143360"
+        ]
+      ],
+      "max_abs": [
+        "0.00725031"
+      ]
+    }
+  },
+  "device_rows": [
+    {
+      "mode": "before",
+      "start": "1793958132",
+      "end": "1793958149",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "mode": "missing",
+      "start": "1793958149",
+      "end": "1793958165",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "mode": "transpose",
+      "start": "1793958165",
+      "end": "1793958182",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "mode": "double_value",
+      "start": "1793958182",
+      "end": "1793958199",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "mode": "random",
+      "start": "1793958199",
+      "end": "1793958218",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "mode": "fp32_projection",
+      "start": "1793958218",
+      "end": "1793958236",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "mode": "bf16_output",
+      "start": "1793958236",
+      "end": "1793958252",
+      "exit": "0",
+      "device": "0"
+    },
+    {
+      "mode": "after",
+      "start": "1793958252",
+      "end": "1793958269",
+      "exit": "0",
+      "device": "0"
+    }
+  ]
+}

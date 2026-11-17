@@ -1,0 +1,23 @@
+{
+  "role": "review-agent",
+  "start_epoch": 1794063015,
+  "end_epoch": 1794063809,
+  "elapsed_seconds": 794,
+  "combined_CPU_job": "task_20261107_230124_347388931621",
+  "combined_CPU_terminal": "COMPLETE0",
+  "scope": "fixed longer-N3 helper adaptation/17tinychecks/one metadata PREQUEUE readiness",
+  "native_jobs": 0,
+  "actual_grants": 0,
+  "tensor_payload_bytes": 0,
+  "product_edits": 0,
+  "shared_ledger_writes": 0,
+  "prior_manifest_pins": {
+    "full_real_generation_operation_prepare_1794052340": "f9197cab999b4b5b1a8897d09bc46db62f84615c39b5a0d53506476ea207a8be",
+    "native_full_real_generation_1794055148": "531d0c118b33117ef2a28aa45d1457f4647034b846a15a2fb9defef5ef000c1a",
+    "independent_first_real_generation_1794055937": "3e9f22d8dff50cb3de4ed0485e6d3cbd20cf1f7ac2275ea1cbb07723cd508999",
+    "independent_longer_generation_1794061849": "03a6d73385839fc71792e00b2cf7f10b153eeb3a47b85b1090151fbbabf0f1ee",
+    "longer_generation_admission_apply_1794062947": "f23eed7cdf0a20a51099c7b906feaccbe00d3f1590c9139d754aec1497e1a662"
+  },
+  "source45_sha256": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "all_own_jobs_terminal": true
+}

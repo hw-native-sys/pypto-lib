@@ -1,0 +1,140 @@
+[
+  {
+    "phase": "prefill3",
+    "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_applied_signatures_1794097836/helper_compile_output/prefill3",
+    "source45": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+    "seconds": 45.36242318153381,
+    "entry_compile_returned": true,
+    "artifact_manifest_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_applied_signatures_1794097836/prefill3_artifact_files.json",
+    "artifact_manifest_sha256": "bd292cf92d9314c0077ba231611f8901ec7c2d066c308bdab0b48f18a43ffd24",
+    "metadata_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_applied_signatures_1794097836/helper_compile_output/prefill3/distributed_meta.json",
+    "metadata_sha256": "3ef340dbe30e192bddd20ab2ec26bbe33b86453ffb0c6ce37d1512b847a50715",
+    "host_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_applied_signatures_1794097836/helper_compile_output/prefill3/orchestration/host_orch.py",
+    "host_sha256": "6d4f744d144e076f59a9c1867a4f21e55219931f82e6320ee4c48e49576bd748",
+    "formal_count": 100,
+    "static_count": 57,
+    "static_per_rank_bytes": 39624816576,
+    "formal_scalars": {
+      "engram_enabled": {
+        "name": "engram_enabled__ssa_v0",
+        "direction": "In",
+        "shape": null,
+        "dtype": "int32",
+        "layout": null
+      }
+    },
+    "concrete_input_shape": [
+      16,
+      3
+    ],
+    "generated_input_shape": [
+      16,
+      -1
+    ],
+    "factory_profile": {
+      "prefill_tokens": 3,
+      "decode_tokens": 1,
+      "pages": 2,
+      "batch": 1,
+      "expert_layers": 40
+    },
+    "platform": "a2a3",
+    "execution_mode": "ONBOARD",
+    "ring_heap": [
+      0,
+      0,
+      4294967296,
+      0
+    ],
+    "samples": 0,
+    "actual_devices": null,
+    "logical_compile_device_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "old_M02_usage": "publicABI/directions metadata ONLY; no numerical/kernel reuse"
+  },
+  {
+    "phase": "decode1",
+    "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_applied_signatures_1794097836/helper_compile_output/decode1",
+    "source45": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+    "seconds": 43.5948588848114,
+    "entry_compile_returned": true,
+    "artifact_manifest_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_applied_signatures_1794097836/decode1_artifact_files.json",
+    "artifact_manifest_sha256": "3ee89ac6787d53a20d339719675b0c1a40b1f3fa6bc51fd83f0ad557a0e9062d",
+    "metadata_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_applied_signatures_1794097836/helper_compile_output/decode1/distributed_meta.json",
+    "metadata_sha256": "6a2d2c6f6b0d62453aed6bb501cb7070d208d4d069648bd0ee20bc7fa9073001",
+    "host_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_applied_signatures_1794097836/helper_compile_output/decode1/orchestration/host_orch.py",
+    "host_sha256": "d8534fe9751d12b94074e2dc4583a70ff6a0c9ecc96e31fd618c2fef737eef34",
+    "formal_count": 96,
+    "static_count": 57,
+    "static_per_rank_bytes": 39624816576,
+    "formal_scalars": {
+      "engram_enabled": {
+        "name": "engram_enabled__ssa_v0",
+        "direction": "In",
+        "shape": null,
+        "dtype": "int32",
+        "layout": null
+      }
+    },
+    "concrete_input_shape": [
+      16,
+      1
+    ],
+    "generated_input_shape": [
+      16,
+      -1
+    ],
+    "factory_profile": {
+      "prefill_tokens": 3,
+      "decode_tokens": 1,
+      "pages": 2,
+      "batch": 1,
+      "expert_layers": 40
+    },
+    "platform": "a2a3",
+    "execution_mode": "ONBOARD",
+    "ring_heap": [
+      0,
+      0,
+      4294967296,
+      0
+    ],
+    "samples": 0,
+    "actual_devices": null,
+    "logical_compile_device_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "old_M02_usage": "publicABI/directions metadata ONLY; no numerical/kernel reuse"
+  }
+]

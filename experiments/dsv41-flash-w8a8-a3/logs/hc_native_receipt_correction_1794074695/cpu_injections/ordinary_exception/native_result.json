@@ -1,0 +1,194 @@
+{
+  "status": "FAILED",
+  "started_epoch": 1794074952.3960884,
+  "device": "0",
+  "first_error": {
+    "type": "ValueError",
+    "message": "injected CPU ordinary comparator exception after tensor capture",
+    "role": "candidate",
+    "traceback": "Traceback (most recent call last):\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/probe.py\", line 183, in execute_pair\n    result = run_impl(fn=module.hc_post_test, specs=specs, golden_fn=golden,\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/check_receipts.py\", line 59, in fake_run\n    ok, detail = kwargs['compare_fn']['output'](actual, expected,\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/receipt_store.py\", line 82, in compare\n    normal_ok, normal_detail = ordinary(actual, expected, **kwargs)\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/check_receipts.py\", line 64, in faulty_ordinary\n    raise ValueError('injected CPU ordinary comparator exception after tensor capture')\nValueError: injected CPU ordinary comparator exception after tensor capture\n"
+  },
+  "claim": "Synthetic HC boundary only; no text causality claim.",
+  "mode": "ExecutionMode.ONBOARD",
+  "ended_epoch": 1794074952.5682395,
+  "receipts": [
+    {
+      "role": "candidate",
+      "epoch": 1794074952.4589422,
+      "status": "COMPARATOR_EXCEPTION",
+      "error": {
+        "type": "ValueError",
+        "message": "injected CPU ordinary comparator exception after tensor capture",
+        "traceback": "Traceback (most recent call last):\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/receipt_store.py\", line 82, in compare\n    normal_ok, normal_detail = ordinary(actual, expected, **kwargs)\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/check_receipts.py\", line 64, in faulty_ordinary\n    raise ValueError('injected CPU ordinary comparator exception after tensor capture')\nValueError: injected CPU ordinary comparator exception after tensor capture\n"
+      },
+      "actual": {
+        "file": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/cpu_injections/ordinary_exception/receipts/candidate/000/actual.pt",
+        "sha256": "781d0ea95687297833b8a1e933d4ebf8b6cf1f73e45e6a2ad3b42a2421c386e9",
+        "shape": [
+          5,
+          4,
+          5120
+        ],
+        "dtype": "torch.float32",
+        "bytes": 409600
+      },
+      "expected": {
+        "file": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/cpu_injections/ordinary_exception/receipts/candidate/000/expected.pt",
+        "sha256": "781d0ea95687297833b8a1e933d4ebf8b6cf1f73e45e6a2ad3b42a2421c386e9",
+        "shape": [
+          5,
+          4,
+          5120
+        ],
+        "dtype": "torch.float32",
+        "bytes": 409600
+      },
+      "bit_exact": true,
+      "BF16_representable": true,
+      "different_values": 0,
+      "nonrepresentable_values": 0,
+      "bit_different_values": 0,
+      "max_abs": 0.0,
+      "elements": 102400,
+      "actual_finite": true,
+      "expected_finite": true,
+      "top_differences": [
+        {
+          "flat_index": 8,
+          "actual": 1.0,
+          "expected": 1.0,
+          "absolute_difference": 0.0,
+          "actual_bits": 1065353216,
+          "expected_bits": 1065353216
+        },
+        {
+          "flat_index": 10,
+          "actual": 1.0,
+          "expected": 1.0,
+          "absolute_difference": 0.0,
+          "actual_bits": 1065353216,
+          "expected_bits": 1065353216
+        },
+        {
+          "flat_index": 4,
+          "actual": 1.0,
+          "expected": 1.0,
+          "absolute_difference": 0.0,
+          "actual_bits": 1065353216,
+          "expected_bits": 1065353216
+        },
+        {
+          "flat_index": 7,
+          "actual": -1.0,
+          "expected": -1.0,
+          "absolute_difference": 0.0,
+          "actual_bits": -1082130432,
+          "expected_bits": -1082130432
+        },
+        {
+          "flat_index": 11,
+          "actual": -1.0,
+          "expected": -1.0,
+          "absolute_difference": 0.0,
+          "actual_bits": -1082130432,
+          "expected_bits": -1082130432
+        },
+        {
+          "flat_index": 3,
+          "actual": -1.0,
+          "expected": -1.0,
+          "absolute_difference": 0.0,
+          "actual_bits": -1082130432,
+          "expected_bits": -1082130432
+        },
+        {
+          "flat_index": 9,
+          "actual": -1.0,
+          "expected": -1.0,
+          "absolute_difference": 0.0,
+          "actual_bits": -1082130432,
+          "expected_bits": -1082130432
+        },
+        {
+          "flat_index": 1,
+          "actual": -1.0,
+          "expected": -1.0,
+          "absolute_difference": 0.0,
+          "actual_bits": -1082130432,
+          "expected_bits": -1082130432
+        },
+        {
+          "flat_index": 5,
+          "actual": -1.0,
+          "expected": -1.0,
+          "absolute_difference": 0.0,
+          "actual_bits": -1082130432,
+          "expected_bits": -1082130432
+        },
+        {
+          "flat_index": 0,
+          "actual": 1.0,
+          "expected": 1.0,
+          "absolute_difference": 0.0,
+          "actual_bits": 1065353216,
+          "expected_bits": 1065353216
+        },
+        {
+          "flat_index": 2,
+          "actual": 1.0,
+          "expected": 1.0,
+          "absolute_difference": 0.0,
+          "actual_bits": 1065353216,
+          "expected_bits": 1065353216
+        },
+        {
+          "flat_index": 6,
+          "actual": 1.0,
+          "expected": 1.0,
+          "absolute_difference": 0.0,
+          "actual_bits": 1065353216,
+          "expected_bits": 1065353216
+        }
+      ],
+      "per_row": [
+        {
+          "row": 0,
+          "different_values": 0,
+          "nonrepresentable_values": 0
+        },
+        {
+          "row": 1,
+          "different_values": 0,
+          "nonrepresentable_values": 0
+        },
+        {
+          "row": 2,
+          "different_values": 0,
+          "nonrepresentable_values": 0
+        },
+        {
+          "row": 3,
+          "different_values": 0,
+          "nonrepresentable_values": 0
+        },
+        {
+          "row": 4,
+          "different_values": 0,
+          "nonrepresentable_values": 0
+        }
+      ],
+      "finished_epoch": 1794074952.532474
+    }
+  ],
+  "run_results": [
+    {
+      "role": "candidate",
+      "started_epoch": 1794074952.4307513,
+      "status": "RUN_EXCEPTION",
+      "exception_type": "ValueError",
+      "error": "injected CPU ordinary comparator exception after tensor capture",
+      "traceback": "Traceback (most recent call last):\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/probe.py\", line 183, in execute_pair\n    result = run_impl(fn=module.hc_post_test, specs=specs, golden_fn=golden,\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/check_receipts.py\", line 59, in fake_run\n    ok, detail = kwargs['compare_fn']['output'](actual, expected,\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/receipt_store.py\", line 82, in compare\n    normal_ok, normal_detail = ordinary(actual, expected, **kwargs)\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/check_receipts.py\", line 64, in faulty_ordinary\n    raise ValueError('injected CPU ordinary comparator exception after tensor capture')\nValueError: injected CPU ordinary comparator exception after tensor capture\n",
+      "ended_epoch": 1794074952.5576391
+    }
+  ]
+}

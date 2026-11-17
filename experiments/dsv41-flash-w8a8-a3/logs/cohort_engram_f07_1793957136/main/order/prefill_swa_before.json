@@ -1,0 +1,7 @@
+{
+  "post_mutant": false,
+  "error": null,
+  "phase": "prefill",
+  "mode": "swa",
+  "real_rotation_map": false
+}

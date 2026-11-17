@@ -1,0 +1,22 @@
+{
+  "proposed_hc.py": {
+    "source": "experiments/dsv41-flash-w8a8-a3/logs/hc_bf16_boundary_draft_1794071285/proposed/hc.py",
+    "sha256": "c6111634f78d53ad0cb4196a533a2d89097d4cfa0859688382c0072b60840885"
+  },
+  "proposed_layer_reference.py": {
+    "source": "experiments/dsv41-flash-w8a8-a3/logs/hc_bf16_boundary_draft_1794071285/proposed/layer_reference.py",
+    "sha256": "c382bc7131c4bfd3f159d291c99de7e0d9f3368e5b25e1c3515b96f825dedda0"
+  },
+  "old_hc.py": {
+    "source": "models/deepseek_v4_1_flash_a3_w8a8/hc.py",
+    "sha256": "55ef4ccb102d62f2c2b42fd8084385ed2d83191e8f17db31e6193826e3129d73"
+  },
+  "config.py": {
+    "source": "models/deepseek_v4_1_flash_a3_w8a8/config.py",
+    "sha256": "e0542e042be6019f51ec367801565bd9fc8a48ecddd00ce980d60659e638ff19"
+  },
+  "original_utils.py": {
+    "source": "experiments/dsv41-flash-w8a8-a3/logs/logic_review_1793929657/upstream_rc2/tests/deepseek_v41_utils.py",
+    "sha256": "577c667fbf8f8b6f20de8a0ac54c6c0435605aaee1f6c2ccc463b446055bd286"
+  }
+}

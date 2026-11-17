@@ -1,0 +1,98 @@
+{
+  "status": "PASS_EP_NATIVE_COMPUTE_NUMERIC_AND_BOUNDED_CLEANUP",
+  "task": "task_20261108_123737_141799917058",
+  "allocated": [
+    0,
+    1
+  ],
+  "exit": 0,
+  "all_three_RunResult_passed": true,
+  "original_numeric_gate": {
+    "atol": 0.02,
+    "rtol": 0.02,
+    "max_error_ratio": 0.01
+  },
+  "exact_INT32_count_expected_totals": [
+    12,
+    6,
+    6
+  ],
+  "count_receipt_scope": "native comparator checked exact full matrix; no separate CPU capsule reload yet",
+  "idle_output_exact": true,
+  "capsules": {
+    "ep/work/both/routed_actual_expected.pt": "b50940169257e63f5dea8976d80b072b48f2b87b17bdf9d18811d50c4416f870",
+    "ep/work/both/counts_actual_expected.pt": "e08560ec5fe74005e5cd2969ef03bf69a31ad0ebfb602a9ea7cbf7f61d53c655",
+    "ep/work/idle_rank1/routed_actual_expected.pt": "b50940169257e63f5dea8976d80b072b48f2b87b17bdf9d18811d50c4416f870",
+    "ep/work/idle_rank1/counts_actual_expected.pt": "e08560ec5fe74005e5cd2969ef03bf69a31ad0ebfb602a9ea7cbf7f61d53c655",
+    "ep/work/idle_rank0/routed_actual_expected.pt": "b50940169257e63f5dea8976d80b072b48f2b87b17bdf9d18811d50c4416f870",
+    "ep/work/idle_rank0/counts_actual_expected.pt": "e08560ec5fe74005e5cd2969ef03bf69a31ad0ebfb602a9ea7cbf7f61d53c655"
+  },
+  "known_observed_births_absent": [
+    {
+      "pid": 1417999,
+      "start_ticks": "111257963",
+      "same_birth_absent": true
+    },
+    {
+      "pid": 1418167,
+      "start_ticks": "111258031",
+      "same_birth_absent": true
+    },
+    {
+      "pid": 1418426,
+      "start_ticks": "111258437",
+      "same_birth_absent": true
+    },
+    {
+      "pid": 1420186,
+      "start_ticks": "111259729",
+      "same_birth_absent": true
+    },
+    {
+      "pid": 1422582,
+      "start_ticks": "111262379",
+      "same_birth_absent": true
+    },
+    {
+      "pid": 1422587,
+      "start_ticks": "111262380",
+      "same_birth_absent": true
+    },
+    {
+      "pid": 1418469,
+      "start_ticks": "111258544",
+      "same_birth_absent": true
+    }
+  ],
+  "logged_trace_pids_currently_absent": [
+    1418113,
+    1420186,
+    1422582,
+    1422587,
+    1424411,
+    1424414,
+    1427112,
+    1427120
+  ],
+  "historical_unobserved_start_ticks": "UNKNOWN",
+  "all_image_freed_lines_native": 6,
+  "query_public_prepare_normal_close": true,
+  "native_golden_harness_public_contexts_returned_PASS": 3,
+  "raw_locks01_released": true,
+  "board0_physical01_no_current_NPU_processes": true,
+  "baseline_HBM_nonzero": "raw npu_smi_after; no zero HBM claim",
+  "source_after": {
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/config.py": "abfb39922b4c340f443c5d3e8869ee2c76344f7b03781702f845055abdd552c1",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/gemm_w8a8.py": "97b8ca009cf383eaba0dd59bad9759d7e2139b712d5d4e69aa9ee6e16382fe62",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py": "60046ce7f2c03e4e2bc756a050f6283cf65196c96a44492ec89fc88b3c178d31",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/moe_exchange.py": "650273d771f0468cd0c6088f2adb20fd93e0b542de036fd419dc7e780210a454",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/moe_experts.py": "50c1c3a533dd27f9ae958588f1de7fb6a450c5a8d980285cbccaefe44badc00a",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/moe_gate.py": "ad219161acccb3623e64e75fec152ab81bb83f66596cfbf0f5a62c84d6073eea",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/quant.py": "344de41d0d0748905b85cafd2ae3b7e85560e0ca7d0b52615b1d3c866e6aa3dc",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/rmsnorm.py": "f9f67d05d426fec058a0e1eb2edc69c704d3af15251f32f47cf12ada8b68d540",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/tp_reduce.py": "66105a076e9ea9246ab071d3f0d5d33c423accea9d7456fdf7880a42cc441171",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/utils.py": "96817adec5584eeab2940dab0faf42078fc257995021899e6dbe9e55e00c36d3"
+  },
+  "old162_new9_unchanged": true,
+  "recorded_utc": "2026-11-08T04:41:01.461400+00:00"
+}

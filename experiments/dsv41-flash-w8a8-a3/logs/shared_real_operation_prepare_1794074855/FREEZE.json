@@ -1,0 +1,18 @@
+{
+  "status": "FINAL/SEALED/PARK",
+  "artifact_count": 24,
+  "artifact_manifest_sha256": "6b1c09090fe5b7409a2eb4833ad18e3a081c5b4a2de42aaf818c5e096691b1ad",
+  "source_scope": "FROZEN_PRE_HC_B3E_SNAPSHOT_ONLY",
+  "source45_sha256": "b3e19fd001c74f7a5b497c791c01924ca09c0678df66114fce599e890d8fee06",
+  "runtime_code": {
+    "check_identity.py": "f9db191263f96ee27baf6a6c0a71d909107613fb0dd1314d226cc7e63af50f0d",
+    "outer_runner.py": "9ec7c8a5cb4ffb2fd5a2c5c93d090fdfd0bd4f3f80df4c9181feb96fbd9a8995",
+    "task_entry.py": "670b126af3b878f8b4e2c6cbbc3a716bb9a0ac6c043bedda49b5c18d0eda02b6"
+  },
+  "binding_sha256": "a33cc44c3149a439b26c7d1c2e37bc6f4419ff36fa524ade02a066fc61714ba2",
+  "adaptation_patch_sha256": "b4647b78fb073542c99c90dd4c0dd10f97b90a5572473a7550442d4d019c4c44",
+  "future_HC_authorized": false,
+  "no_actual_grant_or_NPU": true,
+  "all_own_jobs_terminal": true,
+  "end_epoch": 1794076006
+}

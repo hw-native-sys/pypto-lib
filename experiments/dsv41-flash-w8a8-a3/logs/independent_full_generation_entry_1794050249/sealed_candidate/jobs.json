@@ -1,0 +1,68 @@
+[
+  {
+    "log": "cadence_final_queue.log",
+    "task": "task_20261107_192127_340739122473",
+    "passed": true,
+    "failed": false
+  },
+  {
+    "log": "contract_queue.log",
+    "task": "task_20261107_190251_33609691947",
+    "passed": true,
+    "failed": false
+  },
+  {
+    "log": "final_checks_queue.log",
+    "task": "task_20261107_191241_33853064931",
+    "passed": true,
+    "failed": false
+  },
+  {
+    "log": "final_verified_queue.log",
+    "task": "task_20261107_191545_339299228058",
+    "passed": true,
+    "failed": false
+  },
+  {
+    "log": "freeze_validation_queue.log",
+    "task": "task_20261107_191704_339725918998",
+    "passed": true,
+    "failed": false
+  },
+  {
+    "log": "metadata_queue.log",
+    "task": "task_20261107_185751_334757815352",
+    "passed": false,
+    "failed": true
+  },
+  {
+    "log": "metadata_queue_final.log",
+    "task": "task_20261107_185913_335196822868",
+    "passed": true,
+    "failed": false
+  },
+  {
+    "log": "metadata_queue_v2.log",
+    "task": "task_20261107_185838_334975028185",
+    "passed": false,
+    "failed": true
+  },
+  {
+    "log": "proposal_build_queue.log",
+    "task": "task_20261107_190903_337604617455",
+    "passed": true,
+    "failed": false
+  },
+  {
+    "log": "proposal_checks_queue.log",
+    "task": "task_20261107_191022_337950831495",
+    "passed": true,
+    "failed": false
+  },
+  {
+    "log": "seal_checks_queue.log",
+    "task": "task_20261107_191515_33918417734",
+    "passed": true,
+    "failed": false
+  }
+]

@@ -1,0 +1,22 @@
+{
+  "epoch": 1794026054,
+  "status": "PARKED;implemented CPU-prepared V3, independent acceptance pending",
+  "source45_manifest_sha256": "ab1ced6d6ecbf9887297458703ba9b74e2c9b8bc57608370b4c2e0310e027e37",
+  "source45_unchanged": true,
+  "old_three_bundles_unchanged": true,
+  "sources_sha256": "210d8f98750df3fac5b795cadb3598cdd63be8db1f08fb692bdd68a93d75c798",
+  "artifacts_sha256": "cc8822c6803f6b10dd3d8a4f3ac913ca9b86f4eaa4f4a95b9a17efaa18b32f46",
+  "artifact_files": 630,
+  "bridge_sha256": "c1f942c90ccb4fbec3fe3e3852b51ac64c616f1607076b55f486a30864026834",
+  "worker_sources_sha256": "bd8920c41dcce3ca04a53ff5a734c65946814c5c6eccde0ab1662d746759f0f4",
+  "worker_artifacts_sha256": "d5630cd61cd27eb6eaa64e47d9ec3893e00d60b6f0a5e2c83d890b7186509aae",
+  "Main_jobs": "all CPU terminal",
+  "worker_jobs": "all CPU terminal;worker FINAL/PARK",
+  "NPU": 0,
+  "largeIO": 0,
+  "real_fixture_calls": 0,
+  "root_model_edits": 0,
+  "native_and_full40_validation": "OPEN",
+  "production_policy_supplied": false,
+  "worker_record_imported_once": "checkpoint_pipeline_v3_1794024716"
+}

@@ -1,0 +1,20 @@
+{
+  "role": "review-agent",
+  "unique_unit_id": "hc_native_receipt_correction_1794074695",
+  "measured_start_epoch": 1794074652,
+  "artifact_created_epoch": 1794074696.9065924,
+  "state": "FINAL/PARK",
+  "shared_writes": 0,
+  "scope": "durable evidence correction only; CPU injection; NO NPU/compile",
+  "measured_end_epoch": 1794075151.0786648,
+  "root_imports": "once, owned by Root",
+  "cpu_injection_task": "task_20261108_020903_341558728088",
+  "cpu_injection_exit": 0,
+  "cpu_entry_guard_task": "task_20261108_021046_341972114274",
+  "cpu_entry_guard_exit": 0,
+  "NPU_execution": false,
+  "signature_recompile": false,
+  "current45": "b3e19fd001c74f7a5b497c791c01924ca09c0678df66114fce599e890d8fee06",
+  "old_native_discrepancy": "UNKNOWN; no actual old tensor was saved in prior case",
+  "remaining_tasks": []
+}

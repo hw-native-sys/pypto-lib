@@ -1,0 +1,20 @@
+{
+  "record_id": "main-f09-fullreserve-1794091408",
+  "role": "main-agent",
+  "start_epoch": 1794091408,
+  "end_epoch": 1794091934.3113084,
+  "measured_wall_seconds": 526.3113083839417,
+  "shared_writes": 0,
+  "worker_records_imported": 0,
+  "CPU_tasks": [
+    "task_20261108_064834_180327519068"
+  ],
+  "META_PASS": true,
+  "imported_model": false,
+  "tensor_or_fixture_or_reference": false,
+  "compile": false,
+  "prepare": false,
+  "NPU": false,
+  "positive_grants": 0,
+  "status": "FINAL_PARK_CALLER_ONLY_4B"
+}

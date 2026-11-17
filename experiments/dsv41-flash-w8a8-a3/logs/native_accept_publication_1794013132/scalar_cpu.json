@@ -1,0 +1,16 @@
+{
+  "tensor_fp32": {
+    "accepted": false,
+    "error_type": "TypeError",
+    "error": "only integer tensors of a single element can be converted to an index"
+  },
+  "tensor_int32": {
+    "accepted": true
+  },
+  "python_float": {
+    "accepted": true
+  },
+  "python_int": {
+    "accepted": true
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "schema": "observer-bounded-native-scope/1",
+  "root_id": "observer-20261108-tp8-heads8-attention-three-original-cases",
+  "approved": true,
+  "recorded_epoch": 1794111599.1854806,
+  "owner": "/root/reviewer_engram",
+  "CPU_prerequisite": "task_20261108_121806_13687553828 COMPLETE0",
+  "wrapper": "experiments/dsv41-flash-w8a8-a3/logs/independent_tp8_head_padding_1794110988/native_cli.py",
+  "wrapper_sha256": "73f0492102c6cc55a0c46192f0e7942d3b63f1ec73f3cd069aefda23d0f0e2e4",
+  "dependencies": "experiments/dsv41-flash-w8a8-a3/logs/independent_tp8_head_padding_1794110988/v3_dependencies.json",
+  "dependencies_sha256": "ed1a01ebddf8bf0db953a93f47b398167d20e7b81a3e12c8c2b3209362cc2491",
+  "attention_sha256": "562cda314635c65823e639d02a7e8db7100a65ef6d7006ff50bbd608d72e0cf7",
+  "native_go_environment": "observer-approved-heads8-attention-three-original-cases",
+  "allocation": "task-submit --device auto --device-num 1",
+  "max_time_seconds": 600,
+  "client_time_seconds": 1200,
+  "execution": "ONBOARD/a2a3, no --sim",
+  "cases": [
+    "core16",
+    "packed640",
+    "window128"
+  ],
+  "tokens": 3,
+  "original_golden_tolerances": {
+    "atol": 0.02,
+    "rtol": 0.02,
+    "max_error_ratio": 0.005
+  },
+  "scope": "ONE existing attention CLI with three original cases; fresh exclusive output; no checkpoint/largefixture/fullmodel; normal owned cleanup, task terminal/lock/knownbirth/source checks then finite actual report. No blind retry.",
+  "planning_floors_bytes": {
+    "HOST": 8589934592,
+    "DISK": 2147483648,
+    "SHM": 4294967296
+  },
+  "planning_max_case_bytes": "approximately 2.1MiB, not measured peak"
+}

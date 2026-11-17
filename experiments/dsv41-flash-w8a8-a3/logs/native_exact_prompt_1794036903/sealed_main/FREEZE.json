@@ -1,0 +1,20 @@
+{
+  "epoch": 1794036675,
+  "status": "APPLIED + CPU checks PASS; PARKED for independent review",
+  "source45_before_sha256": "ab1ced6d6ecbf9887297458703ba9b74e2c9b8bc57608370b4c2e0310e027e37",
+  "source45_after_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "new_generate_sha256": "685cf3cfadf36c92b5f9c6280f9f9d90ebf0e3244133a2b550adea83ceb29cfb",
+  "other44_unchanged": true,
+  "sources_sha256": "e21ac37651e451e48d8879187c3054d0acd693705906a1a1a1420c79d31756f4",
+  "artifacts_sha256": "a37109462df44b9416c7401ced49c881628a0ccbe059e277126e1115c428b1cc",
+  "artifact_files": 31,
+  "all_jobs_terminal": true,
+  "workers": 0,
+  "NPU": 0,
+  "payload_reads": 0,
+  "large_allocations": 0,
+  "actual_forward_checks": 0,
+  "hard_fullweight_guard": "unchanged/HELD",
+  "next": "independent applied-source exactN3/config/DP review and separately authorized empty-fit ramp",
+  "work_record": "main-generation-entry-1794035858-1794036675"
+}

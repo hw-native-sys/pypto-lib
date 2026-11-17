@@ -1,0 +1,20 @@
+{
+  "status": "PASS_BOUNDED_SYNTHETIC_EXACT_PREFIX3_RETURNED_STATE_DECODE3",
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "prefix_original_gates": 17,
+  "decode_original_gates": 19,
+  "all6persistent_handoff_equal": true,
+  "prior_physical_retention_checks": 176,
+  "same_staged_published_WINDOW3_C2row1": "PASS",
+  "prefix_and_decode_savedactual_strict4DP": "PASS",
+  "copied_one_DP_negative_both_phases": "EXPECTED_STRUCTURED_REJECTION",
+  "fixed_decode_input_token": 17,
+  "prefix_greedy_token_evidence_only": 16684,
+  "native_prefix_jobs": 1,
+  "native_decode_jobs": 1,
+  "known_native_decode20_plusCPU1_pids_absent": true,
+  "all_assigned_jobs_complete0": true,
+  "other_fit_jobs": "separately owned/calibration only, not inspected or controlled",
+  "scope": "40dense/reused1syntheticexpertlayer/noEngram; original staged owning tolerances; not strict fullCPUhistory/realcheckpoint/fit/text",
+  "PARK": true
+}

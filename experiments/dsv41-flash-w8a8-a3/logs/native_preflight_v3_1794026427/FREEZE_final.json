@@ -1,0 +1,11 @@
+{
+  "state": "FINAL_PARK",
+  "end_epoch": 1794027429,
+  "source45_sha256": "ab1ced6d6ecbf9887297458703ba9b74e2c9b8bc57608370b4c2e0310e027e37",
+  "input_v3_artifacts_sha256": "cc8822c6803f6b10dd3d8a4f3ac913ca9b86f4eaa4f4a95b9a17efaa18b32f46",
+  "own_artifacts_sha256": "144340c9026c61e501d4e677fdccff33d380b5a9958a12fd831c9f5e9dc6c558",
+  "artifact_count": 864,
+  "actual_static_plan_sha256": "dbca1fb4dd503b7d8b38e54bae4782c6e38f496bd405dd4637376ebd06487735",
+  "all_jobs_complete": true,
+  "NPU": 0
+}

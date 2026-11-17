@@ -1,0 +1,13 @@
+{
+  "agent": "/root/reviewer_f09",
+  "start_epoch": 1794088097.2809238,
+  "terminal_epoch": 1794088139.7622886,
+  "native_wall_seconds": 42.481364727020264,
+  "seal_epoch": 1794088311.8978908,
+  "native_task": "task_20261108_054811_163250428454",
+  "native_tasks": 1,
+  "cpu_reference_tasks": 0,
+  "shared_writes": 0,
+  "status": "FAILED_FINAL_PARK",
+  "historical_worker_birth_coverage": "UNKNOWN"
+}

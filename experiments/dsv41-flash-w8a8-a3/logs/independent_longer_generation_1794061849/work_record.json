@@ -1,0 +1,14 @@
+{
+  "role": "review-agent",
+  "start_epoch": 1794061849,
+  "end_epoch": 1794062016,
+  "elapsed_seconds": 167,
+  "checker_job": "task_20261107_223152_340502018197",
+  "checker_terminal": "COMPLETE0",
+  "scope": "unapplied longer-N3 changed predicates and source inheritance",
+  "actual_grants": 0,
+  "native_jobs": 0,
+  "payload_bytes": 0,
+  "product_edits": 0,
+  "shared_ledger_writes": 0
+}

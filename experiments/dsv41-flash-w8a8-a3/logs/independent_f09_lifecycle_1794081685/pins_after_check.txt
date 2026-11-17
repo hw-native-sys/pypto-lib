@@ -1,0 +1,5 @@
+experiments/dsv41-flash-w8a8-a3/logs/f09_artifact_lifecycle_fix_1794079805/artifacts.json: OK
+experiments/dsv41-flash-w8a8-a3/logs/f09_artifact_lifecycle_fix_1794079805/artifact_lifecycle.py: OK
+experiments/dsv41-flash-w8a8-a3/logs/f09_artifact_lifecycle_fix_1794079805/f09_decode_case.py: OK
+experiments/dsv41-flash-w8a8-a3/logs/f09_artifact_lifecycle_fix_1794079805/source45_rebased_UNAPPLIED.json: OK
+experiments/dsv41-flash-w8a8-a3/logs/f09_artifact_lifecycle_fix_1794079805/adapter_lifecycle.patch: OK

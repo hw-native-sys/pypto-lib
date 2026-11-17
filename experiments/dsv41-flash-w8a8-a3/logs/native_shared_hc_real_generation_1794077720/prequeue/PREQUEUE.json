@@ -1,0 +1,50 @@
+{
+  "status": "PASS_IDENTITY_METADATA_ONLY",
+  "stage": "PREQUEUE",
+  "epoch": 1794077804.5885494,
+  "source_manifest_sha256": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "binding_sha256": "aee30bb487c41dd8acc6b4a674615e9a6b699dd699f652b291b91c1c35752c07",
+  "checker_sha256": "e388da42cde32f0d0c8917e1e1ca1f405aafda89d0af470650d7bba9af1c9c6b",
+  "tokenizer_files": {
+    "tokenizer.json": "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b",
+    "tokenizer_config.json": "6ac8c8dc065ed118161d02dd532749ae3f52c243deac27872134fae2f50d8547"
+  },
+  "exact_model_root": "/mnt/data/models/DeepSeek-V4.1-Flash-w8a8",
+  "source_headers": {
+    "source_keys": 139614,
+    "shards": 263,
+    "metadata_bytes_read": 15912800,
+    "tensor_payload_bytes_read": 0
+  },
+  "library_sha256": "24434f8879030ef1b1f31e5fc2ecce683e392d4f1baeb5bcee852fb183976e5c",
+  "resources": {
+    "host_available": 1722813984768,
+    "disk_available": 8279525687296,
+    "shm_available": 1079343157248,
+    "shm_used": 557056
+  },
+  "device_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "full_upload_forward_peaks": null,
+  "grant_created": false,
+  "HC_signature_evidence": {
+    "hc_math_lineage_sha256": "ebac3e1980d2e0db67fe23ef2be16362c1b23246b3a4c12812e97c7b5d6af2d8",
+    "fresh_signature_receipt_sha256": "3f5441beade418bf307463188a7b5a52c733299cf6dffde0fe501d4df5fbefd4"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "schema": "independent-configurable-audit-execution/1",
+  "started_epoch": 1794111271.101946,
+  "pid": 1344685,
+  "start_ticks": "111119292",
+  "bindings": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_configurable_generation_auditor_1794110902/selfcheck_output/empty_bindings.json",
+  "handoff": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_configurable_generation_auditor_1794110902/selfcheck_output/empty_handoff.json",
+  "status": "AUDIT_STOPPED",
+  "exception": {
+    "type": "SystemExit",
+    "message": "STOP REQUIRED fresh bindings and SAME actual terminal inputs",
+    "traceback": "Traceback (most recent call last):\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_configurable_generation_auditor_1794110902/audit.py\", line 20, in <module>\n    TOPOLOGY=require_ready(pins)\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_configurable_generation_auditor_1794110902/shared_delta.py\", line 15, in require_ready\n    raise ValueError('STOP REQUIRED fresh bindings and SAME actual terminal inputs')\nValueError: STOP REQUIRED fresh bindings and SAME actual terminal inputs\n\nDuring handling of the above exception, another exception occurred:\n\nTraceback (most recent call last):\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_configurable_generation_auditor_1794110902/runner.py\", line 34, in <module>\n    runpy.run_path(str(HERE/'audit.py'), run_name='__main__')\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv/lib/python3.10/runpy.py\", line 289, in run_path\n    return _run_module_code(code, init_globals, run_name,\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv/lib/python3.10/runpy.py\", line 96, in _run_module_code\n    _run_code(code, mod_globals, init_globals,\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv/lib/python3.10/runpy.py\", line 86, in _run_code\n    exec(code, run_globals)\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_configurable_generation_auditor_1794110902/audit.py\", line 22, in <module>\n    raise SystemExit(str(error))\nSystemExit: STOP REQUIRED fresh bindings and SAME actual terminal inputs\n"
+  },
+  "audit_result": null,
+  "bindings_sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+  "handoff_sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+  "ended_epoch": 1794111271.141348,
+  "elapsed_seconds": 0.03940176963806152,
+  "process_exit_code": 1
+}

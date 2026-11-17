@@ -1,0 +1,11 @@
+{
+  "state": "PRE_HC_B3E_SNAPSHOT_ONLY",
+  "applied_source45_manifest": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/shared_weight_owner_apply_1794074398/source45.json",
+  "applied_source45_sha256": "b3e19fd001c74f7a5b497c791c01924ca09c0678df66114fce599e890d8fee06",
+  "frozen_applied_generate_snapshot": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/shared_weight_owner_draft_1794068025/generate.proposed.py",
+  "generate_sha256": "fba8a4ef9a06f694fa53278bb80ae2ad70d111336dbead938ab9f8511d27e16e",
+  "live_b3e_check_before_HC_transition_job": "task_20261108_021440_342919127289",
+  "live_source_rechecked_during_HC_transition": false,
+  "future_HC_authorized": false,
+  "runtime_checker_must_still_require_exact_live_b3e": true
+}

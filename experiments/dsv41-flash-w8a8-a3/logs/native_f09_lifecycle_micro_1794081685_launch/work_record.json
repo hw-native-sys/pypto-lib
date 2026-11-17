@@ -1,0 +1,21 @@
+{
+  "record_id": "reviewer_f09-lifecycle-native2-execution-audit-1794082830",
+  "role": "review-agent",
+  "measured_start_epoch": 1794082830,
+  "measured_end_epoch": 1794083097,
+  "scope": "Root-authorized allocation-first tiny2 wrapper, one exact frozen native microtest, one exact frozen same-terminal CPU audit, byte/integrity/status review and sealing.",
+  "root_go": "observer-20261108-f09-lifecycle-public-native2",
+  "task_ids": ["task_20261108_042113_142720411936", "task_20261108_042213_14304572871"],
+  "task_exits": [0, 0],
+  "allocated_devices": [0, 1],
+  "public_prepare": 1,
+  "native_dispatches": 1,
+  "new_DSL_or_signature_compiles": 0,
+  "model_fixture_or_real_weight_payload": 0,
+  "shared_writes": 0,
+  "live_source_writes": 0,
+  "old_artifact_writes": 0,
+  "native_retries": 0,
+  "disposition": "PASS_TINY_PUBLIC_LIFECYCLE_AND_INDEPENDENT_BYTE_AUDIT; FINAL_PARK",
+  "root_imports_shared_ledgers": true
+}

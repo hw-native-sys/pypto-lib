@@ -1,0 +1,3671 @@
+{
+  "scope": "first single request / decode capacity1 / prefill128 / noEngram / TP4DP4EP16; two pages; no payload or NPU",
+  "phases": {
+    "prefill": {
+      "static_resources": [
+        {
+          "phase": "prefill",
+          "argument": "embed_weight",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            32320,
+            5120
+          ],
+          "real_rank_bytes": 330956800,
+          "bounded_rank_shape": [
+            32320,
+            5120
+          ],
+          "bounded_rank_bytes": 330956800,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 5295308800,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "final_norm",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            5120
+          ],
+          "real_rank_bytes": 10240,
+          "bounded_rank_shape": [
+            5120
+          ],
+          "bounded_rank_bytes": 10240,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 163840,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "lm_head_weight",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            32320,
+            5120
+          ],
+          "real_rank_bytes": 330956800,
+          "bounded_rank_shape": [
+            32320,
+            5120
+          ],
+          "bounded_rank_bytes": 330956800,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 5295308800,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "hc_attn_fn",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            32,
+            20480
+          ],
+          "real_rank_bytes": 104857600,
+          "bounded_rank_shape": [
+            40,
+            32,
+            20480
+          ],
+          "bounded_rank_bytes": 104857600,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 1677721600,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "hc_attn_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            3
+          ],
+          "real_rank_bytes": 480,
+          "bounded_rank_shape": [
+            40,
+            3
+          ],
+          "bounded_rank_bytes": 480,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 7680,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "hc_attn_base",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            24
+          ],
+          "real_rank_bytes": 3840,
+          "bounded_rank_shape": [
+            40,
+            24
+          ],
+          "bounded_rank_bytes": 3840,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 61440,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "attn_norm_w",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            40,
+            5120
+          ],
+          "real_rank_bytes": 409600,
+          "bounded_rank_shape": [
+            40,
+            5120
+          ],
+          "bounded_rank_bytes": 409600,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 6553600,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "wq_a",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            40,
+            5120,
+            1280
+          ],
+          "real_rank_bytes": 262144000,
+          "bounded_rank_shape": [
+            40,
+            5120,
+            1280
+          ],
+          "bounded_rank_bytes": 262144000,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 4194304000,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "wq_a_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            1280
+          ],
+          "real_rank_bytes": 204800,
+          "bounded_rank_shape": [
+            40,
+            1280
+          ],
+          "bounded_rank_bytes": 204800,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 3276800,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "q_norm_w",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            40,
+            1280
+          ],
+          "real_rank_bytes": 102400,
+          "bounded_rank_shape": [
+            40,
+            1280
+          ],
+          "bounded_rank_bytes": 102400,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 1638400,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "wq_b",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            40,
+            1280,
+            8192
+          ],
+          "real_rank_bytes": 419430400,
+          "bounded_rank_shape": [
+            40,
+            1280,
+            8192
+          ],
+          "bounded_rank_bytes": 419430400,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 6710886400,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "wq_b_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            8192
+          ],
+          "real_rank_bytes": 1310720,
+          "bounded_rank_shape": [
+            40,
+            8192
+          ],
+          "bounded_rank_bytes": 1310720,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 20971520,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "wkv",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            40,
+            5120,
+            512
+          ],
+          "real_rank_bytes": 104857600,
+          "bounded_rank_shape": [
+            40,
+            5120,
+            512
+          ],
+          "bounded_rank_bytes": 104857600,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 1677721600,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "wkv_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            512
+          ],
+          "real_rank_bytes": 81920,
+          "bounded_rank_shape": [
+            40,
+            512
+          ],
+          "bounded_rank_bytes": 81920,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 1310720,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "kv_norm_w",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            40,
+            512
+          ],
+          "real_rank_bytes": 40960,
+          "bounded_rank_shape": [
+            40,
+            512
+          ],
+          "bounded_rank_bytes": 40960,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 655360,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "sink",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            16
+          ],
+          "real_rank_bytes": 2560,
+          "bounded_rank_shape": [
+            40,
+            16
+          ],
+          "bounded_rank_bytes": 2560,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 40960,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "wo_a",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            40,
+            2,
+            1024,
+            4096
+          ],
+          "real_rank_bytes": 671088640,
+          "bounded_rank_shape": [
+            40,
+            2,
+            1024,
+            4096
+          ],
+          "bounded_rank_bytes": 671088640,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 10737418240,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "wo_b",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            40,
+            5120,
+            2048
+          ],
+          "real_rank_bytes": 838860800,
+          "bounded_rank_shape": [
+            40,
+            5120,
+            2048
+          ],
+          "bounded_rank_bytes": 838860800,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 13421772800,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "hc_ffn_fn",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            32,
+            20480
+          ],
+          "real_rank_bytes": 104857600,
+          "bounded_rank_shape": [
+            40,
+            32,
+            20480
+          ],
+          "bounded_rank_bytes": 104857600,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 1677721600,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "hc_ffn_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            3
+          ],
+          "real_rank_bytes": 480,
+          "bounded_rank_shape": [
+            40,
+            3
+          ],
+          "bounded_rank_bytes": 480,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 7680,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "hc_ffn_base",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            24
+          ],
+          "real_rank_bytes": 3840,
+          "bounded_rank_shape": [
+            40,
+            24
+          ],
+          "bounded_rank_bytes": 3840,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 61440,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "ffn_norm_w",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            40,
+            5120
+          ],
+          "real_rank_bytes": 409600,
+          "bounded_rank_shape": [
+            40,
+            5120
+          ],
+          "bounded_rank_bytes": 409600,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 6553600,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "gate_weight",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            384,
+            5120
+          ],
+          "real_rank_bytes": 314572800,
+          "bounded_rank_shape": [
+            40,
+            384,
+            5120
+          ],
+          "bounded_rank_bytes": 314572800,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 5033164800,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "gate_bias",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            384
+          ],
+          "real_rank_bytes": 61440,
+          "bounded_rank_shape": [
+            40,
+            384
+          ],
+          "bounded_rank_bytes": 61440,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 983040,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "shared_w1",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            40,
+            5120,
+            2304
+          ],
+          "real_rank_bytes": 471859200,
+          "bounded_rank_shape": [
+            40,
+            5120,
+            2304
+          ],
+          "bounded_rank_bytes": 471859200,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 7549747200,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "shared_w1_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            2304
+          ],
+          "real_rank_bytes": 368640,
+          "bounded_rank_shape": [
+            40,
+            2304
+          ],
+          "bounded_rank_bytes": 368640,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 5898240,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "shared_w3",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            40,
+            5120,
+            2304
+          ],
+          "real_rank_bytes": 471859200,
+          "bounded_rank_shape": [
+            40,
+            5120,
+            2304
+          ],
+          "bounded_rank_bytes": 471859200,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 7549747200,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "shared_w3_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            2304
+          ],
+          "real_rank_bytes": 368640,
+          "bounded_rank_shape": [
+            40,
+            2304
+          ],
+          "bounded_rank_bytes": 368640,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 5898240,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "shared_w2",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            40,
+            2304,
+            5120
+          ],
+          "real_rank_bytes": 471859200,
+          "bounded_rank_shape": [
+            40,
+            2304,
+            5120
+          ],
+          "bounded_rank_bytes": 471859200,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 7549747200,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "shared_w2_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            5120
+          ],
+          "real_rank_bytes": 819200,
+          "bounded_rank_shape": [
+            40,
+            5120
+          ],
+          "bounded_rank_bytes": 819200,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 13107200,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "w1",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            40,
+            24,
+            5120,
+            2304
+          ],
+          "real_rank_bytes": 11324620800,
+          "bounded_rank_shape": [
+            1,
+            24,
+            5120,
+            2304
+          ],
+          "bounded_rank_bytes": 283115520,
+          "rank_delta_bytes": 11041505280,
+          "logical_world_bytes": 181193932800,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "w1_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            24,
+            2304
+          ],
+          "real_rank_bytes": 8847360,
+          "bounded_rank_shape": [
+            1,
+            24,
+            2304
+          ],
+          "bounded_rank_bytes": 221184,
+          "rank_delta_bytes": 8626176,
+          "logical_world_bytes": 141557760,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "w3",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            40,
+            24,
+            5120,
+            2304
+          ],
+          "real_rank_bytes": 11324620800,
+          "bounded_rank_shape": [
+            1,
+            24,
+            5120,
+            2304
+          ],
+          "bounded_rank_bytes": 283115520,
+          "rank_delta_bytes": 11041505280,
+          "logical_world_bytes": 181193932800,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "w3_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            24,
+            2304
+          ],
+          "real_rank_bytes": 8847360,
+          "bounded_rank_shape": [
+            1,
+            24,
+            2304
+          ],
+          "bounded_rank_bytes": 221184,
+          "rank_delta_bytes": 8626176,
+          "logical_world_bytes": 141557760,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "w2",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            40,
+            24,
+            2304,
+            5120
+          ],
+          "real_rank_bytes": 11324620800,
+          "bounded_rank_shape": [
+            1,
+            24,
+            2304,
+            5120
+          ],
+          "bounded_rank_bytes": 283115520,
+          "rank_delta_bytes": 11041505280,
+          "logical_world_bytes": 181193932800,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "w2_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            24,
+            5120
+          ],
+          "real_rank_bytes": 19660800,
+          "bounded_rank_shape": [
+            1,
+            24,
+            5120
+          ],
+          "bounded_rank_bytes": 491520,
+          "rank_delta_bytes": 19169280,
+          "logical_world_bytes": 314572800,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "c2a_comp_wkv",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            3,
+            512,
+            5120
+          ],
+          "real_rank_bytes": 15728640,
+          "bounded_rank_shape": [
+            3,
+            512,
+            5120
+          ],
+          "bounded_rank_bytes": 15728640,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 251658240,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "c2a_comp_wgate",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            3,
+            512,
+            5120
+          ],
+          "real_rank_bytes": 15728640,
+          "bounded_rank_shape": [
+            3,
+            512,
+            5120
+          ],
+          "bounded_rank_bytes": 15728640,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 251658240,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "c2a_comp_norm",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            3,
+            512
+          ],
+          "real_rank_bytes": 3072,
+          "bounded_rank_shape": [
+            3,
+            512
+          ],
+          "bounded_rank_bytes": 3072,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 49152,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "c2a_idx_wq_b",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            3,
+            1280,
+            4096
+          ],
+          "real_rank_bytes": 15728640,
+          "bounded_rank_shape": [
+            3,
+            1280,
+            4096
+          ],
+          "bounded_rank_bytes": 15728640,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 251658240,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "c2a_idx_wq_b_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            3,
+            4096
+          ],
+          "real_rank_bytes": 49152,
+          "bounded_rank_shape": [
+            3,
+            4096
+          ],
+          "bounded_rank_bytes": 49152,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 786432,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "c2a_idx_weights_proj",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            3,
+            5120,
+            32
+          ],
+          "real_rank_bytes": 983040,
+          "bounded_rank_shape": [
+            3,
+            5120,
+            32
+          ],
+          "bounded_rank_bytes": 983040,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 15728640,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "c2a_idx_wk",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            3,
+            128,
+            512
+          ],
+          "real_rank_bytes": 393216,
+          "bounded_rank_shape": [
+            3,
+            128,
+            512
+          ],
+          "bounded_rank_bytes": 393216,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 6291456,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "c2a_idx_k_norm",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            3,
+            128
+          ],
+          "real_rank_bytes": 768,
+          "bounded_rank_shape": [
+            3,
+            128
+          ],
+          "bounded_rank_bytes": 768,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 12288,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "c1a_comp_wkv",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            512,
+            5120
+          ],
+          "real_rank_bytes": 5242880,
+          "bounded_rank_shape": [
+            512,
+            5120
+          ],
+          "bounded_rank_bytes": 5242880,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 83886080,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "c1a_comp_norm",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            512
+          ],
+          "real_rank_bytes": 1024,
+          "bounded_rank_shape": [
+            512
+          ],
+          "bounded_rank_bytes": 1024,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 16384,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "c1a_idx_wq_b",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            1280,
+            4096
+          ],
+          "real_rank_bytes": 5242880,
+          "bounded_rank_shape": [
+            1280,
+            4096
+          ],
+          "bounded_rank_bytes": 5242880,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 83886080,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "c1a_idx_wq_b_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            4096
+          ],
+          "real_rank_bytes": 16384,
+          "bounded_rank_shape": [
+            4096
+          ],
+          "bounded_rank_bytes": 16384,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 262144,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "c1a_idx_weights_proj",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            5120,
+            32
+          ],
+          "real_rank_bytes": 327680,
+          "bounded_rank_shape": [
+            5120,
+            32
+          ],
+          "bounded_rank_bytes": 327680,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 5242880,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "c1a_idx_wk",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            128,
+            512
+          ],
+          "real_rank_bytes": 131072,
+          "bounded_rank_shape": [
+            128,
+            512
+          ],
+          "bounded_rank_bytes": 131072,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 2097152,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "c1a_idx_k_norm",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            128
+          ],
+          "real_rank_bytes": 256,
+          "bounded_rank_shape": [
+            128
+          ],
+          "bounded_rank_bytes": 256,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 4096,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "re_idx_wq_b",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            4,
+            1280,
+            4096
+          ],
+          "real_rank_bytes": 20971520,
+          "bounded_rank_shape": [
+            4,
+            1280,
+            4096
+          ],
+          "bounded_rank_bytes": 20971520,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 335544320,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "re_idx_wq_b_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            4,
+            4096
+          ],
+          "real_rank_bytes": 65536,
+          "bounded_rank_shape": [
+            4,
+            4096
+          ],
+          "bounded_rank_bytes": 65536,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 1048576,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "re_idx_weights_proj",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            4,
+            5120,
+            32
+          ],
+          "real_rank_bytes": 1310720,
+          "bounded_rank_shape": [
+            4,
+            5120,
+            32
+          ],
+          "bounded_rank_bytes": 1310720,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 20971520,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "prefill",
+          "argument": "engram_wkv",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            2,
+            25600,
+            6144
+          ],
+          "real_rank_bytes": 629145600,
+          "bounded_rank_shape": [
+            2,
+            25600,
+            6144
+          ],
+          "bounded_rank_bytes": 629145600,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 10066329600,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": true
+        },
+        {
+          "phase": "prefill",
+          "argument": "engram_qk",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            2,
+            4,
+            5120
+          ],
+          "real_rank_bytes": 163840,
+          "bounded_rank_shape": [
+            2,
+            4,
+            5120
+          ],
+          "bounded_rank_bytes": 163840,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 2621440,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": true
+        },
+        {
+          "phase": "prefill",
+          "argument": "engram_rotation",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            32,
+            32
+          ],
+          "real_rank_bytes": 4096,
+          "bounded_rank_shape": [
+            32,
+            32
+          ],
+          "bounded_rank_bytes": 4096,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 65536,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": true
+        }
+      ],
+      "io_resources": [
+        {
+          "argument": "input_ids",
+          "shape": [
+            16,
+            128
+          ],
+          "dtype": "torch.int64",
+          "logical_host_bytes": 16384,
+          "per_rank_slice_payload_if_slice_materialization_proven": 1024,
+          "device_conservative_full_storage_upper_per_rank": 16384
+        },
+        {
+          "argument": "initial_pre",
+          "shape": [
+            16,
+            128,
+            4
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 32768,
+          "per_rank_slice_payload_if_slice_materialization_proven": 2048,
+          "device_conservative_full_storage_upper_per_rank": 32768
+        },
+        {
+          "argument": "position_ids",
+          "shape": [
+            16,
+            128
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 8192,
+          "per_rank_slice_payload_if_slice_materialization_proven": 512,
+          "device_conservative_full_storage_upper_per_rank": 8192
+        },
+        {
+          "argument": "request_ids",
+          "shape": [
+            16,
+            128
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 8192,
+          "per_rank_slice_payload_if_slice_materialization_proven": 512,
+          "device_conservative_full_storage_upper_per_rank": 8192
+        },
+        {
+          "argument": "window_slots",
+          "shape": [
+            16,
+            128
+          ],
+          "dtype": "torch.int64",
+          "logical_host_bytes": 16384,
+          "per_rank_slice_payload_if_slice_materialization_proven": 1024,
+          "device_conservative_full_storage_upper_per_rank": 16384
+        },
+        {
+          "argument": "window_indices",
+          "shape": [
+            16,
+            128,
+            128
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 1048576,
+          "per_rank_slice_payload_if_slice_materialization_proven": 65536,
+          "device_conservative_full_storage_upper_per_rank": 1048576
+        },
+        {
+          "argument": "index_block_table",
+          "shape": [
+            16,
+            1,
+            2
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 128,
+          "per_rank_slice_payload_if_slice_materialization_proven": 8,
+          "device_conservative_full_storage_upper_per_rank": 128
+        },
+        {
+          "argument": "state_block_table",
+          "shape": [
+            16,
+            1,
+            1
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 64,
+          "per_rank_slice_payload_if_slice_materialization_proven": 4,
+          "device_conservative_full_storage_upper_per_rank": 64
+        },
+        {
+          "argument": "rope_cos",
+          "shape": [
+            16,
+            128,
+            32
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 262144,
+          "per_rank_slice_payload_if_slice_materialization_proven": 16384,
+          "device_conservative_full_storage_upper_per_rank": 262144
+        },
+        {
+          "argument": "rope_sin",
+          "shape": [
+            16,
+            128,
+            32
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 262144,
+          "per_rank_slice_payload_if_slice_materialization_proven": 16384,
+          "device_conservative_full_storage_upper_per_rank": 262144
+        },
+        {
+          "argument": "rope_cos_swa",
+          "shape": [
+            16,
+            128,
+            32
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 262144,
+          "per_rank_slice_payload_if_slice_materialization_proven": 16384,
+          "device_conservative_full_storage_upper_per_rank": 262144
+        },
+        {
+          "argument": "rope_sin_swa",
+          "shape": [
+            16,
+            128,
+            32
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 262144,
+          "per_rank_slice_payload_if_slice_materialization_proven": 16384,
+          "device_conservative_full_storage_upper_per_rank": 262144
+        },
+        {
+          "argument": "c2a_compressed_slots",
+          "shape": [
+            16,
+            128
+          ],
+          "dtype": "torch.int64",
+          "logical_host_bytes": 16384,
+          "per_rank_slice_payload_if_slice_materialization_proven": 1024,
+          "device_conservative_full_storage_upper_per_rank": 16384
+        },
+        {
+          "argument": "c2a_compressed_lens",
+          "shape": [
+            16,
+            128
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 8192,
+          "per_rank_slice_payload_if_slice_materialization_proven": 512,
+          "device_conservative_full_storage_upper_per_rank": 8192
+        },
+        {
+          "argument": "c2a_compressed_cos",
+          "shape": [
+            16,
+            128,
+            32
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 262144,
+          "per_rank_slice_payload_if_slice_materialization_proven": 16384,
+          "device_conservative_full_storage_upper_per_rank": 262144
+        },
+        {
+          "argument": "c2a_compressed_sin",
+          "shape": [
+            16,
+            128,
+            32
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 262144,
+          "per_rank_slice_payload_if_slice_materialization_proven": 16384,
+          "device_conservative_full_storage_upper_per_rank": 262144
+        },
+        {
+          "argument": "c1a_compressed_slots",
+          "shape": [
+            16,
+            128
+          ],
+          "dtype": "torch.int64",
+          "logical_host_bytes": 16384,
+          "per_rank_slice_payload_if_slice_materialization_proven": 1024,
+          "device_conservative_full_storage_upper_per_rank": 16384
+        },
+        {
+          "argument": "c1a_compressed_lens",
+          "shape": [
+            16,
+            128
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 8192,
+          "per_rank_slice_payload_if_slice_materialization_proven": 512,
+          "device_conservative_full_storage_upper_per_rank": 8192
+        },
+        {
+          "argument": "c1a_compressed_cos",
+          "shape": [
+            16,
+            128,
+            32
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 262144,
+          "per_rank_slice_payload_if_slice_materialization_proven": 16384,
+          "device_conservative_full_storage_upper_per_rank": 262144
+        },
+        {
+          "argument": "c1a_compressed_sin",
+          "shape": [
+            16,
+            128,
+            32
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 262144,
+          "per_rank_slice_payload_if_slice_materialization_proven": 16384,
+          "device_conservative_full_storage_upper_per_rank": 262144
+        },
+        {
+          "argument": "engram_lookup",
+          "shape": [
+            16,
+            2,
+            128,
+            6144
+          ],
+          "dtype": "torch.bfloat16",
+          "logical_host_bytes": 50331648,
+          "per_rank_slice_payload_if_slice_materialization_proven": 3145728,
+          "device_conservative_full_storage_upper_per_rank": 50331648
+        },
+        {
+          "argument": "window_cache",
+          "shape": [
+            16,
+            40,
+            2,
+            128,
+            1,
+            512
+          ],
+          "dtype": "torch.bfloat16",
+          "logical_host_bytes": 167772160,
+          "per_rank_slice_payload_if_slice_materialization_proven": 10485760,
+          "device_conservative_full_storage_upper_per_rank": 167772160
+        },
+        {
+          "argument": "compressed_cache_c2a",
+          "shape": [
+            16,
+            3,
+            2,
+            128,
+            1,
+            512
+          ],
+          "dtype": "torch.bfloat16",
+          "logical_host_bytes": 12582912,
+          "per_rank_slice_payload_if_slice_materialization_proven": 786432,
+          "device_conservative_full_storage_upper_per_rank": 12582912
+        },
+        {
+          "argument": "index_cache_c2a",
+          "shape": [
+            16,
+            3,
+            2,
+            128,
+            1,
+            128
+          ],
+          "dtype": "torch.bfloat16",
+          "logical_host_bytes": 3145728,
+          "per_rank_slice_payload_if_slice_materialization_proven": 196608,
+          "device_conservative_full_storage_upper_per_rank": 3145728
+        },
+        {
+          "argument": "state_cache_c2a",
+          "shape": [
+            16,
+            3,
+            1,
+            2,
+            1024
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 393216,
+          "per_rank_slice_payload_if_slice_materialization_proven": 24576,
+          "device_conservative_full_storage_upper_per_rank": 393216
+        },
+        {
+          "argument": "compressed_cache_c1a",
+          "shape": [
+            16,
+            2,
+            128,
+            1,
+            512
+          ],
+          "dtype": "torch.bfloat16",
+          "logical_host_bytes": 4194304,
+          "per_rank_slice_payload_if_slice_materialization_proven": 262144,
+          "device_conservative_full_storage_upper_per_rank": 4194304
+        },
+        {
+          "argument": "index_cache_c1a",
+          "shape": [
+            16,
+            2,
+            128,
+            1,
+            128
+          ],
+          "dtype": "torch.bfloat16",
+          "logical_host_bytes": 1048576,
+          "per_rank_slice_payload_if_slice_materialization_proven": 65536,
+          "device_conservative_full_storage_upper_per_rank": 1048576
+        },
+        {
+          "argument": "topk_indices_c2a",
+          "shape": [
+            16,
+            3,
+            128,
+            512
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 12582912,
+          "per_rank_slice_payload_if_slice_materialization_proven": 786432,
+          "device_conservative_full_storage_upper_per_rank": 12582912
+        },
+        {
+          "argument": "topk_values_c2a",
+          "shape": [
+            16,
+            3,
+            128,
+            512
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 12582912,
+          "per_rank_slice_payload_if_slice_materialization_proven": 786432,
+          "device_conservative_full_storage_upper_per_rank": 12582912
+        },
+        {
+          "argument": "pool_block_ids_c2a",
+          "shape": [
+            16,
+            3,
+            128,
+            2048
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 50331648,
+          "per_rank_slice_payload_if_slice_materialization_proven": 3145728,
+          "device_conservative_full_storage_upper_per_rank": 50331648
+        },
+        {
+          "argument": "pool_block_counts_c2a",
+          "shape": [
+            16,
+            3,
+            128
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 24576,
+          "per_rank_slice_payload_if_slice_materialization_proven": 1536,
+          "device_conservative_full_storage_upper_per_rank": 24576
+        },
+        {
+          "argument": "topk_indices_c1a",
+          "shape": [
+            16,
+            5,
+            128,
+            512
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 20971520,
+          "per_rank_slice_payload_if_slice_materialization_proven": 1310720,
+          "device_conservative_full_storage_upper_per_rank": 20971520
+        },
+        {
+          "argument": "topk_values_c1a",
+          "shape": [
+            16,
+            5,
+            128,
+            512
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 20971520,
+          "per_rank_slice_payload_if_slice_materialization_proven": 1310720,
+          "device_conservative_full_storage_upper_per_rank": 20971520
+        },
+        {
+          "argument": "pool_block_ids_c1a",
+          "shape": [
+            16,
+            5,
+            128,
+            2048
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 83886080,
+          "per_rank_slice_payload_if_slice_materialization_proven": 5242880,
+          "device_conservative_full_storage_upper_per_rank": 83886080
+        },
+        {
+          "argument": "pool_block_counts_c1a",
+          "shape": [
+            16,
+            5,
+            128
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 40960,
+          "per_rank_slice_payload_if_slice_materialization_proven": 2560,
+          "device_conservative_full_storage_upper_per_rank": 40960
+        },
+        {
+          "argument": "token_counts",
+          "shape": [
+            16
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 64,
+          "per_rank_slice_payload_if_slice_materialization_proven": 4,
+          "device_conservative_full_storage_upper_per_rank": 64
+        },
+        {
+          "argument": "x_hc",
+          "shape": [
+            16,
+            128,
+            4,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 167772160,
+          "per_rank_slice_payload_if_slice_materialization_proven": 10485760,
+          "device_conservative_full_storage_upper_per_rank": 167772160
+        },
+        {
+          "argument": "pre_mix",
+          "shape": [
+            16,
+            128,
+            4
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 32768,
+          "per_rank_slice_payload_if_slice_materialization_proven": 2048,
+          "device_conservative_full_storage_upper_per_rank": 32768
+        },
+        {
+          "argument": "layer_x_hc",
+          "shape": [
+            16,
+            40,
+            128,
+            4,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 6710886400,
+          "per_rank_slice_payload_if_slice_materialization_proven": 419430400,
+          "device_conservative_full_storage_upper_per_rank": 6710886400
+        },
+        {
+          "argument": "layer_pre_mix",
+          "shape": [
+            16,
+            40,
+            128,
+            4
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 1310720,
+          "per_rank_slice_payload_if_slice_materialization_proven": 81920,
+          "device_conservative_full_storage_upper_per_rank": 1310720
+        },
+        {
+          "argument": "final_hidden",
+          "shape": [
+            16,
+            128,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "logical_host_bytes": 20971520,
+          "per_rank_slice_payload_if_slice_materialization_proven": 1310720,
+          "device_conservative_full_storage_upper_per_rank": 20971520
+        },
+        {
+          "argument": "logits",
+          "shape": [
+            16,
+            128,
+            32320
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 264765440,
+          "per_rank_slice_payload_if_slice_materialization_proven": 16547840,
+          "device_conservative_full_storage_upper_per_rank": 264765440
+        }
+      ],
+      "real_static_per_rank": 39624816576,
+      "bounded_static_per_rank": 6463879104,
+      "static_delta_per_rank": 33160937472,
+      "host_io_payload_bytes": 7609876736,
+      "io_device_slice_only_sum_if_proven": 475617296,
+      "io_device_full_storage_conservative_upper_per_rank": 7609876736,
+      "snapshot_host_bytes": 6712197120,
+      "persistent_cache_host_bytes": 189136896,
+      "one_reference_clone_of_every_nonstatic_tensor_bytes": 7609876736,
+      "maximum_individual_rank_allocation": {
+        "phase": "prefill",
+        "argument": "w1",
+        "dtype": "torch.int8",
+        "real_rank_shape": [
+          40,
+          24,
+          5120,
+          2304
+        ],
+        "real_rank_bytes": 11324620800,
+        "bounded_rank_shape": [
+          1,
+          24,
+          5120,
+          2304
+        ],
+        "bounded_rank_bytes": 283115520,
+        "rank_delta_bytes": 11041505280,
+        "logical_world_bytes": 181193932800,
+        "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+        "noEngram_inert": false
+      },
+      "metadata_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/scalar_c2_streaming_1794014676/main/continuation/build_output/_jit_prefill_fwd_20261107_102100_pd4n_k5v/distributed_meta.json",
+      "metadata_sha256": "9734f8235dd25d522bb24300a6b801d8d412eaf7202a10973b322fa258262620",
+      "nonstatic_argument_count": 42
+    },
+    "decode": {
+      "static_resources": [
+        {
+          "phase": "decode",
+          "argument": "embed_weight",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            32320,
+            5120
+          ],
+          "real_rank_bytes": 330956800,
+          "bounded_rank_shape": [
+            32320,
+            5120
+          ],
+          "bounded_rank_bytes": 330956800,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 5295308800,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "hc_attn_fn",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            32,
+            20480
+          ],
+          "real_rank_bytes": 104857600,
+          "bounded_rank_shape": [
+            40,
+            32,
+            20480
+          ],
+          "bounded_rank_bytes": 104857600,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 1677721600,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "hc_attn_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            3
+          ],
+          "real_rank_bytes": 480,
+          "bounded_rank_shape": [
+            40,
+            3
+          ],
+          "bounded_rank_bytes": 480,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 7680,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "hc_attn_base",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            24
+          ],
+          "real_rank_bytes": 3840,
+          "bounded_rank_shape": [
+            40,
+            24
+          ],
+          "bounded_rank_bytes": 3840,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 61440,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "attn_norm_w",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            40,
+            5120
+          ],
+          "real_rank_bytes": 409600,
+          "bounded_rank_shape": [
+            40,
+            5120
+          ],
+          "bounded_rank_bytes": 409600,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 6553600,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "wq_a",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            40,
+            5120,
+            1280
+          ],
+          "real_rank_bytes": 262144000,
+          "bounded_rank_shape": [
+            40,
+            5120,
+            1280
+          ],
+          "bounded_rank_bytes": 262144000,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 4194304000,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "wq_a_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            1280
+          ],
+          "real_rank_bytes": 204800,
+          "bounded_rank_shape": [
+            40,
+            1280
+          ],
+          "bounded_rank_bytes": 204800,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 3276800,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "q_norm_w",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            40,
+            1280
+          ],
+          "real_rank_bytes": 102400,
+          "bounded_rank_shape": [
+            40,
+            1280
+          ],
+          "bounded_rank_bytes": 102400,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 1638400,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "wq_b",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            40,
+            1280,
+            8192
+          ],
+          "real_rank_bytes": 419430400,
+          "bounded_rank_shape": [
+            40,
+            1280,
+            8192
+          ],
+          "bounded_rank_bytes": 419430400,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 6710886400,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "wq_b_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            8192
+          ],
+          "real_rank_bytes": 1310720,
+          "bounded_rank_shape": [
+            40,
+            8192
+          ],
+          "bounded_rank_bytes": 1310720,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 20971520,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "wkv",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            40,
+            5120,
+            512
+          ],
+          "real_rank_bytes": 104857600,
+          "bounded_rank_shape": [
+            40,
+            5120,
+            512
+          ],
+          "bounded_rank_bytes": 104857600,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 1677721600,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "wkv_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            512
+          ],
+          "real_rank_bytes": 81920,
+          "bounded_rank_shape": [
+            40,
+            512
+          ],
+          "bounded_rank_bytes": 81920,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 1310720,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "kv_norm_w",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            40,
+            512
+          ],
+          "real_rank_bytes": 40960,
+          "bounded_rank_shape": [
+            40,
+            512
+          ],
+          "bounded_rank_bytes": 40960,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 655360,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "sink",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            16
+          ],
+          "real_rank_bytes": 2560,
+          "bounded_rank_shape": [
+            40,
+            16
+          ],
+          "bounded_rank_bytes": 2560,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 40960,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "wo_a",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            40,
+            2,
+            1024,
+            4096
+          ],
+          "real_rank_bytes": 671088640,
+          "bounded_rank_shape": [
+            40,
+            2,
+            1024,
+            4096
+          ],
+          "bounded_rank_bytes": 671088640,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 10737418240,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "wo_b",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            40,
+            5120,
+            2048
+          ],
+          "real_rank_bytes": 838860800,
+          "bounded_rank_shape": [
+            40,
+            5120,
+            2048
+          ],
+          "bounded_rank_bytes": 838860800,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 13421772800,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "hc_ffn_fn",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            32,
+            20480
+          ],
+          "real_rank_bytes": 104857600,
+          "bounded_rank_shape": [
+            40,
+            32,
+            20480
+          ],
+          "bounded_rank_bytes": 104857600,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 1677721600,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "hc_ffn_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            3
+          ],
+          "real_rank_bytes": 480,
+          "bounded_rank_shape": [
+            40,
+            3
+          ],
+          "bounded_rank_bytes": 480,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 7680,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "hc_ffn_base",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            24
+          ],
+          "real_rank_bytes": 3840,
+          "bounded_rank_shape": [
+            40,
+            24
+          ],
+          "bounded_rank_bytes": 3840,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 61440,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "ffn_norm_w",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            40,
+            5120
+          ],
+          "real_rank_bytes": 409600,
+          "bounded_rank_shape": [
+            40,
+            5120
+          ],
+          "bounded_rank_bytes": 409600,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 6553600,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "gate_weight",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            384,
+            5120
+          ],
+          "real_rank_bytes": 314572800,
+          "bounded_rank_shape": [
+            40,
+            384,
+            5120
+          ],
+          "bounded_rank_bytes": 314572800,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 5033164800,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "gate_bias",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            384
+          ],
+          "real_rank_bytes": 61440,
+          "bounded_rank_shape": [
+            40,
+            384
+          ],
+          "bounded_rank_bytes": 61440,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 983040,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "shared_w1",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            40,
+            5120,
+            2304
+          ],
+          "real_rank_bytes": 471859200,
+          "bounded_rank_shape": [
+            40,
+            5120,
+            2304
+          ],
+          "bounded_rank_bytes": 471859200,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 7549747200,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "shared_w1_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            2304
+          ],
+          "real_rank_bytes": 368640,
+          "bounded_rank_shape": [
+            40,
+            2304
+          ],
+          "bounded_rank_bytes": 368640,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 5898240,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "shared_w3",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            40,
+            5120,
+            2304
+          ],
+          "real_rank_bytes": 471859200,
+          "bounded_rank_shape": [
+            40,
+            5120,
+            2304
+          ],
+          "bounded_rank_bytes": 471859200,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 7549747200,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "shared_w3_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            2304
+          ],
+          "real_rank_bytes": 368640,
+          "bounded_rank_shape": [
+            40,
+            2304
+          ],
+          "bounded_rank_bytes": 368640,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 5898240,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "shared_w2",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            40,
+            2304,
+            5120
+          ],
+          "real_rank_bytes": 471859200,
+          "bounded_rank_shape": [
+            40,
+            2304,
+            5120
+          ],
+          "bounded_rank_bytes": 471859200,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 7549747200,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "shared_w2_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            5120
+          ],
+          "real_rank_bytes": 819200,
+          "bounded_rank_shape": [
+            40,
+            5120
+          ],
+          "bounded_rank_bytes": 819200,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 13107200,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "w1",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            40,
+            24,
+            5120,
+            2304
+          ],
+          "real_rank_bytes": 11324620800,
+          "bounded_rank_shape": [
+            1,
+            24,
+            5120,
+            2304
+          ],
+          "bounded_rank_bytes": 283115520,
+          "rank_delta_bytes": 11041505280,
+          "logical_world_bytes": 181193932800,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "w1_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            24,
+            2304
+          ],
+          "real_rank_bytes": 8847360,
+          "bounded_rank_shape": [
+            1,
+            24,
+            2304
+          ],
+          "bounded_rank_bytes": 221184,
+          "rank_delta_bytes": 8626176,
+          "logical_world_bytes": 141557760,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "w3",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            40,
+            24,
+            5120,
+            2304
+          ],
+          "real_rank_bytes": 11324620800,
+          "bounded_rank_shape": [
+            1,
+            24,
+            5120,
+            2304
+          ],
+          "bounded_rank_bytes": 283115520,
+          "rank_delta_bytes": 11041505280,
+          "logical_world_bytes": 181193932800,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "w3_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            24,
+            2304
+          ],
+          "real_rank_bytes": 8847360,
+          "bounded_rank_shape": [
+            1,
+            24,
+            2304
+          ],
+          "bounded_rank_bytes": 221184,
+          "rank_delta_bytes": 8626176,
+          "logical_world_bytes": 141557760,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "w2",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            40,
+            24,
+            2304,
+            5120
+          ],
+          "real_rank_bytes": 11324620800,
+          "bounded_rank_shape": [
+            1,
+            24,
+            2304,
+            5120
+          ],
+          "bounded_rank_bytes": 283115520,
+          "rank_delta_bytes": 11041505280,
+          "logical_world_bytes": 181193932800,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "w2_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            40,
+            24,
+            5120
+          ],
+          "real_rank_bytes": 19660800,
+          "bounded_rank_shape": [
+            1,
+            24,
+            5120
+          ],
+          "bounded_rank_bytes": 491520,
+          "rank_delta_bytes": 19169280,
+          "logical_world_bytes": 314572800,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "c2a_comp_wkv",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            3,
+            512,
+            5120
+          ],
+          "real_rank_bytes": 15728640,
+          "bounded_rank_shape": [
+            3,
+            512,
+            5120
+          ],
+          "bounded_rank_bytes": 15728640,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 251658240,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "c2a_comp_wgate",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            3,
+            512,
+            5120
+          ],
+          "real_rank_bytes": 15728640,
+          "bounded_rank_shape": [
+            3,
+            512,
+            5120
+          ],
+          "bounded_rank_bytes": 15728640,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 251658240,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "c2a_comp_norm",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            3,
+            512
+          ],
+          "real_rank_bytes": 3072,
+          "bounded_rank_shape": [
+            3,
+            512
+          ],
+          "bounded_rank_bytes": 3072,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 49152,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "c2a_idx_wq_b",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            3,
+            1280,
+            4096
+          ],
+          "real_rank_bytes": 15728640,
+          "bounded_rank_shape": [
+            3,
+            1280,
+            4096
+          ],
+          "bounded_rank_bytes": 15728640,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 251658240,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "c2a_idx_wq_b_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            3,
+            4096
+          ],
+          "real_rank_bytes": 49152,
+          "bounded_rank_shape": [
+            3,
+            4096
+          ],
+          "bounded_rank_bytes": 49152,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 786432,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "c2a_idx_weights_proj",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            3,
+            5120,
+            32
+          ],
+          "real_rank_bytes": 983040,
+          "bounded_rank_shape": [
+            3,
+            5120,
+            32
+          ],
+          "bounded_rank_bytes": 983040,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 15728640,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "c2a_idx_wk",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            3,
+            128,
+            512
+          ],
+          "real_rank_bytes": 393216,
+          "bounded_rank_shape": [
+            3,
+            128,
+            512
+          ],
+          "bounded_rank_bytes": 393216,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 6291456,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "c2a_idx_k_norm",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            3,
+            128
+          ],
+          "real_rank_bytes": 768,
+          "bounded_rank_shape": [
+            3,
+            128
+          ],
+          "bounded_rank_bytes": 768,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 12288,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "c1a_comp_wkv",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            1,
+            512,
+            5120
+          ],
+          "real_rank_bytes": 5242880,
+          "bounded_rank_shape": [
+            1,
+            512,
+            5120
+          ],
+          "bounded_rank_bytes": 5242880,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 83886080,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "c1a_comp_norm",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            1,
+            512
+          ],
+          "real_rank_bytes": 1024,
+          "bounded_rank_shape": [
+            1,
+            512
+          ],
+          "bounded_rank_bytes": 1024,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 16384,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "c1a_idx_wq_b",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            1,
+            1280,
+            4096
+          ],
+          "real_rank_bytes": 5242880,
+          "bounded_rank_shape": [
+            1,
+            1280,
+            4096
+          ],
+          "bounded_rank_bytes": 5242880,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 83886080,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "c1a_idx_wq_b_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            1,
+            4096
+          ],
+          "real_rank_bytes": 16384,
+          "bounded_rank_shape": [
+            1,
+            4096
+          ],
+          "bounded_rank_bytes": 16384,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 262144,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "c1a_idx_weights_proj",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            1,
+            5120,
+            32
+          ],
+          "real_rank_bytes": 327680,
+          "bounded_rank_shape": [
+            1,
+            5120,
+            32
+          ],
+          "bounded_rank_bytes": 327680,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 5242880,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "c1a_idx_wk",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            1,
+            128,
+            512
+          ],
+          "real_rank_bytes": 131072,
+          "bounded_rank_shape": [
+            1,
+            128,
+            512
+          ],
+          "bounded_rank_bytes": 131072,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 2097152,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "c1a_idx_k_norm",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            1,
+            128
+          ],
+          "real_rank_bytes": 256,
+          "bounded_rank_shape": [
+            1,
+            128
+          ],
+          "bounded_rank_bytes": 256,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 4096,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "re_idx_wq_b",
+          "dtype": "torch.int8",
+          "real_rank_shape": [
+            4,
+            1280,
+            4096
+          ],
+          "real_rank_bytes": 20971520,
+          "bounded_rank_shape": [
+            4,
+            1280,
+            4096
+          ],
+          "bounded_rank_bytes": 20971520,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 335544320,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "re_idx_wq_b_scale",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            4,
+            4096
+          ],
+          "real_rank_bytes": 65536,
+          "bounded_rank_shape": [
+            4,
+            4096
+          ],
+          "bounded_rank_bytes": 65536,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 1048576,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "re_idx_weights_proj",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            4,
+            5120,
+            32
+          ],
+          "real_rank_bytes": 1310720,
+          "bounded_rank_shape": [
+            4,
+            5120,
+            32
+          ],
+          "bounded_rank_bytes": 1310720,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 20971520,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "engram_wkv",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            2,
+            25600,
+            6144
+          ],
+          "real_rank_bytes": 629145600,
+          "bounded_rank_shape": [
+            2,
+            25600,
+            6144
+          ],
+          "bounded_rank_bytes": 629145600,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 10066329600,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": true
+        },
+        {
+          "phase": "decode",
+          "argument": "engram_qk",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            2,
+            4,
+            5120
+          ],
+          "real_rank_bytes": 163840,
+          "bounded_rank_shape": [
+            2,
+            4,
+            5120
+          ],
+          "bounded_rank_bytes": 163840,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 2621440,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": true
+        },
+        {
+          "phase": "decode",
+          "argument": "engram_rotation",
+          "dtype": "torch.float32",
+          "real_rank_shape": [
+            32,
+            32
+          ],
+          "real_rank_bytes": 4096,
+          "bounded_rank_shape": [
+            32,
+            32
+          ],
+          "bounded_rank_bytes": 4096,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 65536,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": true
+        },
+        {
+          "phase": "decode",
+          "argument": "final_norm",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            5120
+          ],
+          "real_rank_bytes": 10240,
+          "bounded_rank_shape": [
+            5120
+          ],
+          "bounded_rank_bytes": 10240,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 163840,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        },
+        {
+          "phase": "decode",
+          "argument": "lm_head_weight",
+          "dtype": "torch.bfloat16",
+          "real_rank_shape": [
+            32320,
+            5120
+          ],
+          "real_rank_bytes": 330956800,
+          "bounded_rank_shape": [
+            32320,
+            5120
+          ],
+          "bounded_rank_bytes": 330956800,
+          "rank_delta_bytes": 0,
+          "logical_world_bytes": 5295308800,
+          "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+          "noEngram_inert": false
+        }
+      ],
+      "io_resources": [
+        {
+          "argument": "input_ids",
+          "shape": [
+            16,
+            1
+          ],
+          "dtype": "torch.int64",
+          "logical_host_bytes": 128,
+          "per_rank_slice_payload_if_slice_materialization_proven": 8,
+          "device_conservative_full_storage_upper_per_rank": 128
+        },
+        {
+          "argument": "initial_pre",
+          "shape": [
+            16,
+            1,
+            4
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 256,
+          "per_rank_slice_payload_if_slice_materialization_proven": 16,
+          "device_conservative_full_storage_upper_per_rank": 256
+        },
+        {
+          "argument": "x_hc",
+          "shape": [
+            16,
+            1,
+            4,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 1310720,
+          "per_rank_slice_payload_if_slice_materialization_proven": 81920,
+          "device_conservative_full_storage_upper_per_rank": 1310720
+        },
+        {
+          "argument": "pre_mix",
+          "shape": [
+            16,
+            1,
+            4
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 256,
+          "per_rank_slice_payload_if_slice_materialization_proven": 16,
+          "device_conservative_full_storage_upper_per_rank": 256
+        },
+        {
+          "argument": "token_counts",
+          "shape": [
+            16
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 64,
+          "per_rank_slice_payload_if_slice_materialization_proven": 4,
+          "device_conservative_full_storage_upper_per_rank": 64
+        },
+        {
+          "argument": "position_ids",
+          "shape": [
+            16,
+            1
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 64,
+          "per_rank_slice_payload_if_slice_materialization_proven": 4,
+          "device_conservative_full_storage_upper_per_rank": 64
+        },
+        {
+          "argument": "request_ids",
+          "shape": [
+            16,
+            1
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 64,
+          "per_rank_slice_payload_if_slice_materialization_proven": 4,
+          "device_conservative_full_storage_upper_per_rank": 64
+        },
+        {
+          "argument": "rope_cos",
+          "shape": [
+            16,
+            1,
+            32
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 2048,
+          "per_rank_slice_payload_if_slice_materialization_proven": 128,
+          "device_conservative_full_storage_upper_per_rank": 2048
+        },
+        {
+          "argument": "rope_sin",
+          "shape": [
+            16,
+            1,
+            32
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 2048,
+          "per_rank_slice_payload_if_slice_materialization_proven": 128,
+          "device_conservative_full_storage_upper_per_rank": 2048
+        },
+        {
+          "argument": "rope_cos_swa",
+          "shape": [
+            16,
+            1,
+            32
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 2048,
+          "per_rank_slice_payload_if_slice_materialization_proven": 128,
+          "device_conservative_full_storage_upper_per_rank": 2048
+        },
+        {
+          "argument": "rope_sin_swa",
+          "shape": [
+            16,
+            1,
+            32
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 2048,
+          "per_rank_slice_payload_if_slice_materialization_proven": 128,
+          "device_conservative_full_storage_upper_per_rank": 2048
+        },
+        {
+          "argument": "c2a_compressed_slots",
+          "shape": [
+            16,
+            1
+          ],
+          "dtype": "torch.int64",
+          "logical_host_bytes": 128,
+          "per_rank_slice_payload_if_slice_materialization_proven": 8,
+          "device_conservative_full_storage_upper_per_rank": 128
+        },
+        {
+          "argument": "c2a_compressed_lens",
+          "shape": [
+            16,
+            1
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 64,
+          "per_rank_slice_payload_if_slice_materialization_proven": 4,
+          "device_conservative_full_storage_upper_per_rank": 64
+        },
+        {
+          "argument": "c2a_compressed_cos",
+          "shape": [
+            16,
+            1,
+            32
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 2048,
+          "per_rank_slice_payload_if_slice_materialization_proven": 128,
+          "device_conservative_full_storage_upper_per_rank": 2048
+        },
+        {
+          "argument": "c2a_compressed_sin",
+          "shape": [
+            16,
+            1,
+            32
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 2048,
+          "per_rank_slice_payload_if_slice_materialization_proven": 128,
+          "device_conservative_full_storage_upper_per_rank": 2048
+        },
+        {
+          "argument": "c1a_compressed_slots",
+          "shape": [
+            16,
+            1
+          ],
+          "dtype": "torch.int64",
+          "logical_host_bytes": 128,
+          "per_rank_slice_payload_if_slice_materialization_proven": 8,
+          "device_conservative_full_storage_upper_per_rank": 128
+        },
+        {
+          "argument": "c1a_compressed_lens",
+          "shape": [
+            16,
+            1
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 64,
+          "per_rank_slice_payload_if_slice_materialization_proven": 4,
+          "device_conservative_full_storage_upper_per_rank": 64
+        },
+        {
+          "argument": "c1a_compressed_cos",
+          "shape": [
+            16,
+            1,
+            32
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 2048,
+          "per_rank_slice_payload_if_slice_materialization_proven": 128,
+          "device_conservative_full_storage_upper_per_rank": 2048
+        },
+        {
+          "argument": "c1a_compressed_sin",
+          "shape": [
+            16,
+            1,
+            32
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 2048,
+          "per_rank_slice_payload_if_slice_materialization_proven": 128,
+          "device_conservative_full_storage_upper_per_rank": 2048
+        },
+        {
+          "argument": "window_slots",
+          "shape": [
+            16,
+            1
+          ],
+          "dtype": "torch.int64",
+          "logical_host_bytes": 128,
+          "per_rank_slice_payload_if_slice_materialization_proven": 8,
+          "device_conservative_full_storage_upper_per_rank": 128
+        },
+        {
+          "argument": "window_indices",
+          "shape": [
+            16,
+            1,
+            128
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 8192,
+          "per_rank_slice_payload_if_slice_materialization_proven": 512,
+          "device_conservative_full_storage_upper_per_rank": 8192
+        },
+        {
+          "argument": "index_block_table",
+          "shape": [
+            16,
+            1,
+            2
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 128,
+          "per_rank_slice_payload_if_slice_materialization_proven": 8,
+          "device_conservative_full_storage_upper_per_rank": 128
+        },
+        {
+          "argument": "state_block_table",
+          "shape": [
+            16,
+            1,
+            1
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 64,
+          "per_rank_slice_payload_if_slice_materialization_proven": 4,
+          "device_conservative_full_storage_upper_per_rank": 64
+        },
+        {
+          "argument": "engram_lookup",
+          "shape": [
+            16,
+            2,
+            1,
+            6144
+          ],
+          "dtype": "torch.bfloat16",
+          "logical_host_bytes": 393216,
+          "per_rank_slice_payload_if_slice_materialization_proven": 24576,
+          "device_conservative_full_storage_upper_per_rank": 393216
+        },
+        {
+          "argument": "window_cache",
+          "shape": [
+            16,
+            40,
+            2,
+            128,
+            1,
+            512
+          ],
+          "dtype": "torch.bfloat16",
+          "logical_host_bytes": 167772160,
+          "per_rank_slice_payload_if_slice_materialization_proven": 10485760,
+          "device_conservative_full_storage_upper_per_rank": 167772160
+        },
+        {
+          "argument": "compressed_cache_c2a",
+          "shape": [
+            16,
+            3,
+            2,
+            128,
+            1,
+            512
+          ],
+          "dtype": "torch.bfloat16",
+          "logical_host_bytes": 12582912,
+          "per_rank_slice_payload_if_slice_materialization_proven": 786432,
+          "device_conservative_full_storage_upper_per_rank": 12582912
+        },
+        {
+          "argument": "index_cache_c2a",
+          "shape": [
+            16,
+            3,
+            2,
+            128,
+            1,
+            128
+          ],
+          "dtype": "torch.bfloat16",
+          "logical_host_bytes": 3145728,
+          "per_rank_slice_payload_if_slice_materialization_proven": 196608,
+          "device_conservative_full_storage_upper_per_rank": 3145728
+        },
+        {
+          "argument": "state_cache_c2a",
+          "shape": [
+            16,
+            3,
+            1,
+            2,
+            1024
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 393216,
+          "per_rank_slice_payload_if_slice_materialization_proven": 24576,
+          "device_conservative_full_storage_upper_per_rank": 393216
+        },
+        {
+          "argument": "compressed_cache_c1a",
+          "shape": [
+            16,
+            2,
+            128,
+            1,
+            512
+          ],
+          "dtype": "torch.bfloat16",
+          "logical_host_bytes": 4194304,
+          "per_rank_slice_payload_if_slice_materialization_proven": 262144,
+          "device_conservative_full_storage_upper_per_rank": 4194304
+        },
+        {
+          "argument": "index_cache_c1a",
+          "shape": [
+            16,
+            2,
+            128,
+            1,
+            128
+          ],
+          "dtype": "torch.bfloat16",
+          "logical_host_bytes": 1048576,
+          "per_rank_slice_payload_if_slice_materialization_proven": 65536,
+          "device_conservative_full_storage_upper_per_rank": 1048576
+        },
+        {
+          "argument": "topk_indices",
+          "shape": [
+            16,
+            8,
+            1,
+            512
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 262144,
+          "per_rank_slice_payload_if_slice_materialization_proven": 16384,
+          "device_conservative_full_storage_upper_per_rank": 262144
+        },
+        {
+          "argument": "topk_values",
+          "shape": [
+            16,
+            8,
+            1,
+            512
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 262144,
+          "per_rank_slice_payload_if_slice_materialization_proven": 16384,
+          "device_conservative_full_storage_upper_per_rank": 262144
+        },
+        {
+          "argument": "pool_block_ids",
+          "shape": [
+            16,
+            8,
+            1,
+            2048
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 1048576,
+          "per_rank_slice_payload_if_slice_materialization_proven": 65536,
+          "device_conservative_full_storage_upper_per_rank": 1048576
+        },
+        {
+          "argument": "pool_block_counts",
+          "shape": [
+            16,
+            8,
+            1
+          ],
+          "dtype": "torch.int32",
+          "logical_host_bytes": 512,
+          "per_rank_slice_payload_if_slice_materialization_proven": 32,
+          "device_conservative_full_storage_upper_per_rank": 512
+        },
+        {
+          "argument": "layer_x_hc",
+          "shape": [
+            16,
+            40,
+            1,
+            4,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 52428800,
+          "per_rank_slice_payload_if_slice_materialization_proven": 3276800,
+          "device_conservative_full_storage_upper_per_rank": 52428800
+        },
+        {
+          "argument": "layer_pre_mix",
+          "shape": [
+            16,
+            40,
+            1,
+            4
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 10240,
+          "per_rank_slice_payload_if_slice_materialization_proven": 640,
+          "device_conservative_full_storage_upper_per_rank": 10240
+        },
+        {
+          "argument": "final_hidden",
+          "shape": [
+            16,
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "logical_host_bytes": 163840,
+          "per_rank_slice_payload_if_slice_materialization_proven": 10240,
+          "device_conservative_full_storage_upper_per_rank": 163840
+        },
+        {
+          "argument": "logits",
+          "shape": [
+            16,
+            1,
+            32320
+          ],
+          "dtype": "torch.float32",
+          "logical_host_bytes": 2068480,
+          "per_rank_slice_payload_if_slice_materialization_proven": 129280,
+          "device_conservative_full_storage_upper_per_rank": 2068480
+        }
+      ],
+      "real_static_per_rank": 39624816576,
+      "bounded_static_per_rank": 6463879104,
+      "static_delta_per_rank": 33160937472,
+      "host_io_payload_bytes": 247111680,
+      "io_device_slice_only_sum_if_proven": 15444480,
+      "io_device_full_storage_conservative_upper_per_rank": 247111680,
+      "snapshot_host_bytes": 52439040,
+      "persistent_cache_host_bytes": 189136896,
+      "one_reference_clone_of_every_nonstatic_tensor_bytes": 247111680,
+      "maximum_individual_rank_allocation": {
+        "phase": "decode",
+        "argument": "w1",
+        "dtype": "torch.int8",
+        "real_rank_shape": [
+          40,
+          24,
+          5120,
+          2304
+        ],
+        "real_rank_bytes": 11324620800,
+        "bounded_rank_shape": [
+          1,
+          24,
+          5120,
+          2304
+        ],
+        "bounded_rank_bytes": 283115520,
+        "rank_delta_bytes": 11041505280,
+        "logical_world_bytes": 181193932800,
+        "actual_residency": "public empty rank allocation / StackedDeviceTensor per worker",
+        "noEngram_inert": false
+      },
+      "metadata_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/scalar_c2_streaming_1794014676/main/production_decode_build/_jit_decode_fwd_20261107_100412_m_5n8b8m/distributed_meta.json",
+      "metadata_sha256": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770",
+      "nonstatic_argument_count": 38
+    }
+  },
+  "headers": {
+    "included_noEngram_source_count": 1374,
+    "largest20": [
+      {
+        "name": "embed.weight",
+        "shape": [
+          129280,
+          5120
+        ],
+        "dtype": "torch.bfloat16",
+        "bytes": 1323827200
+      },
+      {
+        "name": "head.weight",
+        "shape": [
+          129280,
+          5120
+        ],
+        "dtype": "torch.bfloat16",
+        "bytes": 1323827200
+      },
+      {
+        "name": "layers.0.attn.wo_b.weight",
+        "shape": [
+          5120,
+          8192
+        ],
+        "dtype": "torch.bfloat16",
+        "bytes": 83886080
+      },
+      {
+        "name": "layers.1.attn.wo_b.weight",
+        "shape": [
+          5120,
+          8192
+        ],
+        "dtype": "torch.bfloat16",
+        "bytes": 83886080
+      },
+      {
+        "name": "layers.10.attn.wo_b.weight",
+        "shape": [
+          5120,
+          8192
+        ],
+        "dtype": "torch.bfloat16",
+        "bytes": 83886080
+      },
+      {
+        "name": "layers.11.attn.wo_b.weight",
+        "shape": [
+          5120,
+          8192
+        ],
+        "dtype": "torch.bfloat16",
+        "bytes": 83886080
+      },
+      {
+        "name": "layers.12.attn.wo_b.weight",
+        "shape": [
+          5120,
+          8192
+        ],
+        "dtype": "torch.bfloat16",
+        "bytes": 83886080
+      },
+      {
+        "name": "layers.13.attn.wo_b.weight",
+        "shape": [
+          5120,
+          8192
+        ],
+        "dtype": "torch.bfloat16",
+        "bytes": 83886080
+      },
+      {
+        "name": "layers.14.attn.wo_b.weight",
+        "shape": [
+          5120,
+          8192
+        ],
+        "dtype": "torch.bfloat16",
+        "bytes": 83886080
+      },
+      {
+        "name": "layers.15.attn.wo_b.weight",
+        "shape": [
+          5120,
+          8192
+        ],
+        "dtype": "torch.bfloat16",
+        "bytes": 83886080
+      },
+      {
+        "name": "layers.16.attn.wo_b.weight",
+        "shape": [
+          5120,
+          8192
+        ],
+        "dtype": "torch.bfloat16",
+        "bytes": 83886080
+      },
+      {
+        "name": "layers.17.attn.wo_b.weight",
+        "shape": [
+          5120,
+          8192
+        ],
+        "dtype": "torch.bfloat16",
+        "bytes": 83886080
+      },
+      {
+        "name": "layers.18.attn.wo_b.weight",
+        "shape": [
+          5120,
+          8192
+        ],
+        "dtype": "torch.bfloat16",
+        "bytes": 83886080
+      },
+      {
+        "name": "layers.19.attn.wo_b.weight",
+        "shape": [
+          5120,
+          8192
+        ],
+        "dtype": "torch.bfloat16",
+        "bytes": 83886080
+      },
+      {
+        "name": "layers.2.attn.wo_b.weight",
+        "shape": [
+          5120,
+          8192
+        ],
+        "dtype": "torch.bfloat16",
+        "bytes": 83886080
+      },
+      {
+        "name": "layers.20.attn.wo_b.weight",
+        "shape": [
+          5120,
+          8192
+        ],
+        "dtype": "torch.bfloat16",
+        "bytes": 83886080
+      },
+      {
+        "name": "layers.21.attn.wo_b.weight",
+        "shape": [
+          5120,
+          8192
+        ],
+        "dtype": "torch.bfloat16",
+        "bytes": 83886080
+      },
+      {
+        "name": "layers.22.attn.wo_b.weight",
+        "shape": [
+          5120,
+          8192
+        ],
+        "dtype": "torch.bfloat16",
+        "bytes": 83886080
+      },
+      {
+        "name": "layers.23.attn.wo_b.weight",
+        "shape": [
+          5120,
+          8192
+        ],
+        "dtype": "torch.bfloat16",
+        "bytes": 83886080
+      },
+      {
+        "name": "layers.24.attn.wo_b.weight",
+        "shape": [
+          5120,
+          8192
+        ],
+        "dtype": "torch.bfloat16",
+        "bytes": 83886080
+      }
+    ],
+    "largest_int8_source_bytes": 41943040,
+    "largest_BF16_source_bytes": 1323827200,
+    "reader_raw_plus_bytearray_component_bytes": 2647654400,
+    "retained_global_backing_bytes": 1323827200,
+    "visible_TP_vocab_leaf_bytes": 330956800,
+    "conservative_serial_payload_transform_and_copy_allowance": 5362417664,
+    "allowance_formula": "max(4*largest_BF16_source_bytes,24*largest_INT8_source_bytes)+64MiB",
+    "bound_limit": "planning allowance, not observed RSS; no host IO, metadata, allocator retention or runtime buffers",
+    "frozen_report_erratum": "old5295308800 source label equals16 ranks times330956800B local slice: 4DP replicas of1323827200B actual source. Old10590617600B raw+bytearray was fourfold conservative overstatement; original4*S+64MiB planning bound remains valid as allowance."
+  },
+  "host_budget": {
+    "prefill_IO": 7609876736,
+    "decode_IO": 247111680,
+    "prefill_shared_conversion_additional_upper": 7609876736,
+    "validation_one_reference_clone_prefill": 7609876736,
+    "validation_one_reference_clone_decode": 247111680,
+    "snapshots_are_already_in_IO_not_additive": true,
+    "persistent_caches_are_already_in_IO_not_additive": true,
+    "production_prefill_dict_retained_during_decode": true,
+    "production_no_reference_clone_by_default": true,
+    "handoff_equal_shape_cache_alias_saves_bytes_if_verified": 189136896,
+    "conservative_two_phase_host_IO_during_decode_bound": 8104100096,
+    "serial_source_allowance": 5362417664,
+    "formula_production_prefill": "2*P + source_allowance + metadata + allocator_retention + runtime_host_buffers + compile/tokenizer + margin",
+    "formula_production_decode_with_retained_prefill": "P + 2*D + source_allowance + same unknown terms; subtract shared cache alias only after measured pointer/storage proof",
+    "formula_bounded_validation": "add actual reference clones/saved128/stale/control/staged expectations; do not treat as production requirements",
+    "static_host_aggregate": "zero by intended streaming path; bounded legacy fixture statichostpayload is separatelylarge and cannotbeassumed in real path"
+  },
+  "ring_config_scenarios": [
+    {
+      "ring_heap_bytes": [
+        268435456,
+        268435456,
+        268435456,
+        268435456
+      ],
+      "bank_bytes_per_rank": 1073741824,
+      "bank_GiB_per_rank": 1.0,
+      "delta_to_default_bank_bytes": 0,
+      "all16_one_bank_bytes": 17179869184,
+      "bank_count_parameter": "multiply bank by actual constructed/reserved bank count per rank; not by Python frames",
+      "supported_actual_PyPTO_RunConfig_route": true,
+      "API_constraint": "Actual PyPTO RunConfig requires power-of-two entries>=1024; zero leaves default. Lower CallConfig/runtime may accept other sizes but does not bypass this route.",
+      "native_validation": "default256MiB failedsinglealloc;2GiB applied butfailedcircularplacement;other sizes unvalidated; NO TRIAL from readiness"
+    },
+    {
+      "ring_heap_bytes": [
+        268435456,
+        268435456,
+        1073741824,
+        268435456
+      ],
+      "bank_bytes_per_rank": 1879048192,
+      "bank_GiB_per_rank": 1.75,
+      "delta_to_default_bank_bytes": 805306368,
+      "all16_one_bank_bytes": 30064771072,
+      "bank_count_parameter": "multiply bank by actual constructed/reserved bank count per rank; not by Python frames",
+      "supported_actual_PyPTO_RunConfig_route": true,
+      "API_constraint": "Actual PyPTO RunConfig requires power-of-two entries>=1024; zero leaves default. Lower CallConfig/runtime may accept other sizes but does not bypass this route.",
+      "native_validation": "default256MiB failedsinglealloc;2GiB applied butfailedcircularplacement;other sizes unvalidated; NO TRIAL from readiness"
+    },
+    {
+      "ring_heap_bytes": [
+        268435456,
+        268435456,
+        2147483648,
+        268435456
+      ],
+      "bank_bytes_per_rank": 2952790016,
+      "bank_GiB_per_rank": 2.75,
+      "delta_to_default_bank_bytes": 1879048192,
+      "all16_one_bank_bytes": 47244640256,
+      "bank_count_parameter": "multiply bank by actual constructed/reserved bank count per rank; not by Python frames",
+      "supported_actual_PyPTO_RunConfig_route": true,
+      "API_constraint": "Actual PyPTO RunConfig requires power-of-two entries>=1024; zero leaves default. Lower CallConfig/runtime may accept other sizes but does not bypass this route.",
+      "native_validation": "default256MiB failedsinglealloc;2GiB applied butfailedcircularplacement;other sizes unvalidated; NO TRIAL from readiness"
+    },
+    {
+      "ring_heap_bytes": [
+        268435456,
+        268435456,
+        3221225472,
+        268435456
+      ],
+      "bank_bytes_per_rank": 4026531840,
+      "bank_GiB_per_rank": 3.75,
+      "delta_to_default_bank_bytes": 2952790016,
+      "all16_one_bank_bytes": 64424509440,
+      "bank_count_parameter": "multiply bank by actual constructed/reserved bank count per rank; not by Python frames",
+      "supported_actual_PyPTO_RunConfig_route": false,
+      "API_constraint": "Actual PyPTO RunConfig requires power-of-two entries>=1024; zero leaves default. Lower CallConfig/runtime may accept other sizes but does not bypass this route.",
+      "native_validation": "default256MiB failedsinglealloc;2GiB applied butfailedcircularplacement;other sizes unvalidated; NO TRIAL from readiness"
+    },
+    {
+      "ring_heap_bytes": [
+        268435456,
+        268435456,
+        4294967296,
+        268435456
+      ],
+      "bank_bytes_per_rank": 5100273664,
+      "bank_GiB_per_rank": 4.75,
+      "delta_to_default_bank_bytes": 4026531840,
+      "all16_one_bank_bytes": 81604378624,
+      "bank_count_parameter": "multiply bank by actual constructed/reserved bank count per rank; not by Python frames",
+      "supported_actual_PyPTO_RunConfig_route": true,
+      "API_constraint": "Actual PyPTO RunConfig requires power-of-two entries>=1024; zero leaves default. Lower CallConfig/runtime may accept other sizes but does not bypass this route.",
+      "native_validation": "default256MiB failedsinglealloc;2GiB applied butfailedcircularplacement;other sizes unvalidated; NO TRIAL from readiness"
+    }
+  ],
+  "comm": {
+    "prefill": {
+      "generated_named_window_bytes_per_rank": 680528320,
+      "buffer_count": 13,
+      "excludes": "HCCL/VMM mapping reservation, allocator alignment, domain/epoch metadata, device runtime and bank resources"
+    },
+    "decode": {
+      "generated_named_window_bytes_per_rank": 4663744,
+      "buffer_count": 13,
+      "excludes": "HCCL/VMM mapping reservation, allocator alignment, domain/epoch metadata, device runtime and bank resources"
+    }
+  },
+  "payload_calls": [],
+  "source_before_after_equal": true,
+  "device_prediction_formula": "Dreal_peak = Dbounded_observed_peak - Wbounded_resident_counted_once + Wreal + delta_IO + delta_live_scratch/banks + delta_alloc_padding/reservation + margin, ONLY under matching owner/phase/config and measured allocation binding; otherwise use component sum and unknown terms",
+  "do_not_double_count": "committed memory already contains weights+device IO+allocator reservations+arenas+runtime buffers; adding component counts to that total again is invalid. Device-wide used includes committed plus other processes/driver/HCCL/VMM; separate baseline changes.",
+  "actual_fit_measured": false
+}

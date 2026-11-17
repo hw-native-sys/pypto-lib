@@ -1,0 +1,15 @@
+{
+  "status": "PASS_TINY_REFERENCE_PLUMBING_ONLY",
+  "leaf_math": "OWNED_AFFINE_STUBS_NOT_QUANTIZATION_OR_DEVICE_PROOF",
+  "actual_composed_reference_allactive_bitwise_old": true,
+  "old_physical_routes": 192,
+  "new_active_routes": 96,
+  "idle_request_pages_and_C2_carry_preserved": true,
+  "three_reference_calls": true,
+  "pureOut_active_mask": true,
+  "TP_inconsistent_rejected": true,
+  "module_imports_restored": true,
+  "compile": false,
+  "native": false,
+  "fixture_or_payload": false
+}

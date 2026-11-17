@@ -1,0 +1,47 @@
+{
+  "platform": "a2a3",
+  "runtime": "tensormap_and_ringbuffer",
+  "library_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/build/lib/a2a3/onboard/tensormap_and_ringbuffer/libhost_runtime.so",
+  "library_sha256": "24434f8879030ef1b1f31e5fc2ecce683e392d4f1baeb5bcee852fb183976e5c",
+  "resources": [
+    {
+      "kind": 4,
+      "resource_class": 0,
+      "bytes_per_copy": 0
+    },
+    {
+      "kind": 1,
+      "resource_class": 1,
+      "bytes_per_copy": 0
+    },
+    {
+      "kind": 2,
+      "resource_class": 1,
+      "bytes_per_copy": 0
+    },
+    {
+      "kind": 3,
+      "resource_class": 1,
+      "bytes_per_copy": 0
+    },
+    {
+      "kind": 5,
+      "resource_class": 2,
+      "bytes_per_copy": 0
+    },
+    {
+      "kind": 6,
+      "resource_class": 2,
+      "bytes_per_copy": 0
+    }
+  ],
+  "shared_GM_copy_count": 1,
+  "limit": "selected pinned PROGRAM backend only; identity capacity is not resident GM banks",
+  "public_api_source_sha256": {
+    "/mnt/data/pyptouser/yangyaodong/code/pypto/python/pypto/runtime/runtime_base.py": "81a319a9e412d5a618de343c5c54103aa14fb2ec2613a6455e3592b797662704",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto/python/pypto/runtime/distributed_runner.py": "ca496829a240c81df3c29e77d8ef696bd1e2a7b0f31b9d5c2dcb3b3d82923148",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto/python/pypto/runtime/device_tensor.py": "72dc6701eca6dc10a2155773b35a37dee1551c89a89ecf08a8c244571395e8e3"
+  },
+  "distributed_program_source_sha256": "b523ea389350c9d1f9880a101ec66ceb36d2a8202a5fb1976a77be3310444e2a",
+  "scope": "CPU exported contract query only; no owner/device/allocation/forward/payload"
+}

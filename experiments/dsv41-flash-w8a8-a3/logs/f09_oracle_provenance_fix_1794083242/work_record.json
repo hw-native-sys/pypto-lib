@@ -1,0 +1,20 @@
+{
+  "record_id": "main-f09-oracle-provenance-1794083242",
+  "role": "main-agent",
+  "start_epoch": 1794083242,
+  "end_epoch": 1794083833.6417472,
+  "elapsed_seconds": 591.6417472362518,
+  "shared_writes": 0,
+  "worker_records_imported": 0,
+  "CPU_tasks": [
+    "task_20261108_043340_145760814651"
+  ],
+  "CPU_checks": 15,
+  "CPU_PASS": true,
+  "compile": false,
+  "prepare": false,
+  "NPU": false,
+  "real_tensor_payload_bytes": 0,
+  "original_fullmodel_reference_run": false,
+  "status": "FINAL_PARK_HOST_VALIDATOR_ONLY"
+}

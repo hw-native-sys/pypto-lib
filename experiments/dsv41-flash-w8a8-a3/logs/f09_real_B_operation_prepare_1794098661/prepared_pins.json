@@ -1,0 +1,48 @@
+{
+  "source_manifest_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_application_1794097608/source45.json",
+  "source_manifest_sha256": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+  "plan_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_application_1794097608/metadata_plan.json",
+  "plan_sha256": "cd8b17741688eeb9ef39d8c0925dbb74a8f9a1cfcc0052db2e0a8c1aacb48cf7",
+  "binding_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_real_B_operation_prepare_1794098661/operation_binding.json",
+  "binding_sha256": "cc2132a8e7bf0b36110f7a99f68d244a8b98e0f0299d8a9b8e897cec1dde5937",
+  "runtime_code": {
+    "check_identity.py": "f95eaf38916b645642ebfd4d307b85a64a17ec7ca027c55e0f8585c1590816c4",
+    "outer_runner.py": "28b8c268c5530197273754325aeba978dad1d44428f4f33fe4e5bf13dfcb3d7c",
+    "task_entry.py": "670b126af3b878f8b4e2c6cbbc3a716bb9a0ac6c043bedda49b5c18d0eda02b6"
+  },
+  "signature_receipt": {
+    "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_applied_signatures_1794097836/signature_receipt.json",
+    "sha256": "704eb14f6ff186cedf451830e3c38c303b43a3bce201395e78fd3e044b0ba357",
+    "manifest_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_applied_signatures_1794097836/artifacts.json",
+    "manifest_sha256": "1a4a8d75e383e4b8001c1c33d574ee5ae5c83654079dee732b49cdac3b931294"
+  },
+  "f09_math_binding": {
+    "schema": "sourceB-F09-bounded-math-binding/1",
+    "actual_source_manifest_sha256": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+    "math_baseline_manifest_sha256": "8153c7f040bef51900a6e6c9ff27b018279b7503f31d50ec5488457e49770b28",
+    "metadata_plan_sha256": "cd8b17741688eeb9ef39d8c0925dbb74a8f9a1cfcc0052db2e0a8c1aacb48cf7",
+    "metadata_binding_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_application_1794097608/metadata_plan.json.binding.json",
+    "metadata_binding_sha256": "534266dd8bf0e40cb49418eb4ffbb72a3bef9f2d0d01f1c41a81818ef22d3a0c",
+    "lineage_canonical_sha256": "13b80364bce7729fb36aa51c231ceb6966f2fe59ce6d211ccedd6c7cfc046004",
+    "Root_bounded_acceptance_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/root_f09_8153_bounded_acceptance_1794092629.json",
+    "Root_bounded_acceptance_sha256": "74358e14367ce660d4942d7f2d71a1b706079253ef412bd68c3abe8b9a4a2fa4",
+    "numeric_receipt_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_c2_retention_1794092629/work/cpu_numerical_receipt.json",
+    "numeric_receipt_sha256": "6ce38e890b642908c731fb247accc302938846f892142471d26715398e96c851",
+    "static_recipe_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_c2_retention_1794092629/work/static_recipe.json",
+    "static_recipe_sha256": "4e73e5d8e2a03cedb309f0a3bde16fb5d4a806c4b6ee5039f5c28a8034872e75"
+  },
+  "actual_source_unchanged": true,
+  "ancestor_manifests_unchanged": {
+    "old_helper_manifest": "0a879238b20ca62ec096f3ee6b4afb9b81f29e8691389971219a462149bd0861",
+    "application33": "8ef49e7ac94161285e1dbadd3c6435c95220de11e113c80ee6fbea24f5da8c79",
+    "new_signature767": "1a4a8d75e383e4b8001c1c33d574ee5ae5c83654079dee732b49cdac3b931294",
+    "old_real41_manifest": "5bbea517098f0a8b57c940263ea1fa71272060918472e12788895c672060788e"
+  },
+  "task_entry_byte_identical": true,
+  "CPU_validation_tasks": [],
+  "signature_compiles": 0,
+  "checkpoint_header_reads": 0,
+  "tensor_payload_bytes": 0,
+  "native_jobs": 0,
+  "actual_grants": 0
+}

@@ -1,0 +1,10 @@
+{
+  "job": "task_20261107_164303_25365942563",
+  "queue": "auto16",
+  "max_time_seconds": 1800,
+  "client_timeout_seconds": 2400,
+  "lock_wrapper_pid": 2536729,
+  "scope": "noEngram; ACTUAL empty-only A/B/C calibration; no large probe/upload/forward",
+  "prerequisite": "decode_prerequisite.json",
+  "command": "task-submit --timeout 2400 --device auto --device-num 16 --max-time 1800 --run 'cd /mnt/data/pyptouser/yangyaodong/code/pypto-lib && source activate-pypto.sh && PYTHONDONTWRITEBYTECODE=1 python experiments/dsv41-flash-w8a8-a3/logs/native_empty_calibration_1794040381/run_calibration.py --execute'"
+}

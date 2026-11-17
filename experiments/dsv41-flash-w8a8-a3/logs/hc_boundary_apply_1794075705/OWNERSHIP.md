@@ -1,0 +1,1 @@
+Main exclusively live hc.py/layer_reference.py exact7520 +generate.py exacte5f740 baseline literal, NEWartifact, Mainrecoverydocs. Other42/oldbundles/runtime/deps/F09 immutable. No worker. No compile/NPU/payload/grant. One queued appliedCPU +resourceplan copy; acceptedcapturednative/offlineoriginal boundeddifference, nativewholecaseFAILED persists. Start1794075705.

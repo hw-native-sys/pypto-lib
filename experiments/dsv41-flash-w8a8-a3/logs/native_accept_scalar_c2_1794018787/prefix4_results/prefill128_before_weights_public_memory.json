@@ -1,0 +1,140 @@
+{
+  "ranks": [
+    {
+      "rank": 0,
+      "committed_bytes": 5452852389,
+      "free_bytes": 59884552192,
+      "total_bytes": 65787658240,
+      "required_free_before_weights": 875089920544
+    },
+    {
+      "rank": 1,
+      "committed_bytes": 5452852389,
+      "free_bytes": 60187602944,
+      "total_bytes": 65796046848,
+      "required_free_before_weights": 875089920544
+    },
+    {
+      "rank": 2,
+      "committed_bytes": 5452852389,
+      "free_bytes": 59902070784,
+      "total_bytes": 65787658240,
+      "required_free_before_weights": 875089920544
+    },
+    {
+      "rank": 3,
+      "committed_bytes": 5452852389,
+      "free_bytes": 60173766656,
+      "total_bytes": 65796046848,
+      "required_free_before_weights": 875089920544
+    },
+    {
+      "rank": 4,
+      "committed_bytes": 5452852389,
+      "free_bytes": 59904217088,
+      "total_bytes": 65787658240,
+      "required_free_before_weights": 875089920544
+    },
+    {
+      "rank": 5,
+      "committed_bytes": 5452852389,
+      "free_bytes": 60174028800,
+      "total_bytes": 65796046848,
+      "required_free_before_weights": 875089920544
+    },
+    {
+      "rank": 6,
+      "committed_bytes": 5452852389,
+      "free_bytes": 59903188992,
+      "total_bytes": 65787658240,
+      "required_free_before_weights": 875089920544
+    },
+    {
+      "rank": 7,
+      "committed_bytes": 5452852389,
+      "free_bytes": 60173881344,
+      "total_bytes": 65796046848,
+      "required_free_before_weights": 875089920544
+    },
+    {
+      "rank": 8,
+      "committed_bytes": 5452852389,
+      "free_bytes": 59891957760,
+      "total_bytes": 65787658240,
+      "required_free_before_weights": 875089920544
+    },
+    {
+      "rank": 9,
+      "committed_bytes": 5452852389,
+      "free_bytes": 60187168768,
+      "total_bytes": 65796046848,
+      "required_free_before_weights": 875089920544
+    },
+    {
+      "rank": 10,
+      "committed_bytes": 5452852389,
+      "free_bytes": 59901632512,
+      "total_bytes": 65787658240,
+      "required_free_before_weights": 875089920544
+    },
+    {
+      "rank": 11,
+      "committed_bytes": 5452852389,
+      "free_bytes": 60175212544,
+      "total_bytes": 65796046848,
+      "required_free_before_weights": 875089920544
+    },
+    {
+      "rank": 12,
+      "committed_bytes": 5452852389,
+      "free_bytes": 59891945472,
+      "total_bytes": 65787658240,
+      "required_free_before_weights": 875089920544
+    },
+    {
+      "rank": 13,
+      "committed_bytes": 5452852389,
+      "free_bytes": 60189044736,
+      "total_bytes": 65796046848,
+      "required_free_before_weights": 875089920544
+    },
+    {
+      "rank": 14,
+      "committed_bytes": 5452852389,
+      "free_bytes": 59903377408,
+      "total_bytes": 65787658240,
+      "required_free_before_weights": 875089920544
+    },
+    {
+      "rank": 15,
+      "committed_bytes": 5452852389,
+      "free_bytes": 60177027072,
+      "total_bytes": 65796046848,
+      "required_free_before_weights": 875089920544
+    }
+  ],
+  "bank_grants": [
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168
+  ],
+  "bank_grants_provenance": "read-only private startup metadata; not a public API guarantee",
+  "counter_scope": "public committed excludes HCCL/VMM; free/total is device wide",
+  "maxrss_kib": 140205500,
+  "required_free_before_weights_base": 23344218656,
+  "heap_bytes_per_bank": 5100273664,
+  "extra_bank_bound": "reserve every granted extra bank at full configured heap size beyond prewarmed bank"
+}

@@ -1,0 +1,14 @@
+{
+  "epoch": 1794080595.4160838,
+  "audit_task": "task_20261108_034146_133529425143",
+  "audit_status": "completed (exit=0)\n",
+  "audit_identity": {
+    "pid": 1335845,
+    "starttick": 108043337,
+    "absent": true
+  },
+  "parent_prep26_manifest_unchanged": true,
+  "parent_criteria_hashes_unchanged": true,
+  "owner_terminal_files_unchanged": true,
+  "final_queue_empty": true
+}

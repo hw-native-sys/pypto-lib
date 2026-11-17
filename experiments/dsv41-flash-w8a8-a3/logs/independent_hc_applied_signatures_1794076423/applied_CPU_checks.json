@@ -1,0 +1,64 @@
+{
+  "status": "PASS_ACTUAL_HC_APPLICATION_GUARDS_RESOURCES_AND_SMALL_TIES",
+  "source": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "math_baseline": "eb90ea56e26d0cb97dd12d330559c2ae1b53f4ae5cbf866cc01bfbbb150fecf2",
+  "metadata_plan": "806852d5baec99a522f5adc3015bdd204d9ac6b17244a29cb26445cbd55fda89",
+  "rejected": [
+    {
+      "name": "actual-default-HARD",
+      "exception": "ContractGap('host-materialization-overlap: full weights remain held: streaming source/owner is implemented but bounded native reuse, functional continuation and measured real host/HBM fit are unproved (allow_full_materialize=True); no real payload allocation is authorized by this switch')"
+    },
+    {
+      "name": "actual-guard-old-plan",
+      "exception": "ContractGap('first-real-admission: reviewed producer base/real40 schema mismatch')"
+    },
+    {
+      "name": "actual-guard-missing-source-path",
+      "exception": "ContractGap('first-real-admission: new applied product source45 changed')"
+    },
+    {
+      "name": "actual-guard-wrong-HC-hash",
+      "exception": "ContractGap('first-real-admission: new applied product source45 changed')"
+    },
+    {
+      "name": "resource-unapproved-added-key",
+      "exception": "ValueError('exact old keys plus only hc_math_lineage')"
+    },
+    {
+      "name": "resource-missing-key",
+      "exception": "ValueError('exact old keys plus only hc_math_lineage')"
+    },
+    {
+      "name": "resource-byte-drift",
+      "exception": "ValueError('old resource value drift')"
+    }
+  ],
+  "resource_projection": "e13c5fd6d98de327a24427b5efc0a9be4e9c30a89e757ac6c377e73b6ffc10ff",
+  "lineage": "e9b0e71dd5d2909d007a4d762ca92ff83e1940630251fae7bb98216f8e10983c",
+  "original_offline_proof": {
+    "path": "experiments/dsv41-flash-w8a8-a3/logs/native_hc_durable_receipts_1794075226",
+    "manifest_sha256": "ba800da431c200dcefebc75179ff9f24e737d612f73691121a97835c18b9a08f",
+    "native_task": "task_20261108_021439_342901924784",
+    "native_whole_case_status": "FAILED own TensorSpec expected/output alias; never relabeledPASS",
+    "offline_original_audit_task": "task_20261108_021816_343981631498",
+    "offline_audit_sha256": "92f6e846267526059967806ac931a35322e59c67ce1b98af4bf6cec4343f3e58",
+    "numerical_proof_pins_sha256": "3d59c0994ec801130bf420af102652e416e330dcfe9d2b14e6322f4809059e0b",
+    "offline_passed": 31,
+    "offline_unmet": 0,
+    "candidate_values": 102400,
+    "candidate_diff": 0,
+    "old_diff": 61440,
+    "old_max_abs": 0.00390625,
+    "scope": "synthetic HC BF16 boundary captured values only; no native input snapshots/fullmodel/repetition-causality claim"
+  },
+  "small_tie_expected": [
+    [
+      1.0,
+      1.015625,
+      -1.0,
+      -1.015625
+    ]
+  ],
+  "forbidden_calls": [],
+  "no_actual_grant": true
+}

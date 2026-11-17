@@ -1,0 +1,22 @@
+{
+  "actual_source45_sha256": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "actual_source45_bytes": 5534,
+  "M01_math_baseline_sha256": "eb90ea56e26d0cb97dd12d330559c2ae1b53f4ae5cbf866cc01bfbbb150fecf2",
+  "predecessor_b3e_sha256": "b3e19fd001c74f7a5b497c791c01924ca09c0678df66114fce599e890d8fee06",
+  "changed_paths": [
+    "models/deepseek_v4_1_flash_a3_w8a8/generate.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/hc.py",
+    "models/deepseek_v4_1_flash_a3_w8a8/layer_reference.py"
+  ],
+  "other42_unchanged": true,
+  "new_metadata_plan_sha256": "806852d5baec99a522f5adc3015bdd204d9ac6b17244a29cb26445cbd55fda89",
+  "old611_source45_D77": "d77d196be6541b4a87aef07cf0e5e02eac68cefa9fc245f3742e4c14606555aa",
+  "old611_artifact_manifest_sha256": "fe8f9d5f5d6f20fbd7f1b644256c0f25ecede302850dd46afcb4912971c38622",
+  "entry_ABI_unchanged": true,
+  "inlined_HC_numerical_code_changed": true,
+  "old611_numerical_code_valid_for_candidate": false,
+  "fresh_prefill3_decode1_signatures": "PENDING separate independent reviewer",
+  "new_compile_performed": false,
+  "native_whole_HC_case_status": "FAILED own output/expected alias; offline original captured-value comparison accepted bounded synthetic scope only",
+  "fullreal_shared_text_quality": "UNTESTED; no actual production grant"
+}

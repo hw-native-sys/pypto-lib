@@ -1,0 +1,40 @@
+{
+  "scope": "noEngram; CPU-only source/pin and TINY MOCKED guard checks; no NPU/tensors/payload",
+  "pid": 969146,
+  "source45": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "main31_artifacts_verified": 31,
+  "phases": {
+    "prefill": {
+      "statics": 57,
+      "static_bytes_per_rank": 39624816576,
+      "largest_bytes": 11324620800,
+      "phase_io_planning_bytes": 7609876736,
+      "nominal_comm_bytes": 680528320,
+      "static_plus_io_plus_comm": 47915221632
+    },
+    "decode": {
+      "statics": 57,
+      "static_bytes_per_rank": 39624816576,
+      "largest_bytes": 11324620800,
+      "phase_io_planning_bytes": 247111680,
+      "nominal_comm_bytes": 4663744,
+      "static_plus_io_plus_comm": 39876592000
+    }
+  },
+  "toolchain": {
+    "pypto": "38a8aa6da24c62bf0c6f6f9ef94deb513fbb4d2e",
+    "simpler": "31f9e72ee6832cd198b77df18c1c305e7fd83676",
+    "pto_isa": "f83d4b7e4be0a4ca9805944ae2d9ce8c84e581f7",
+    "ptoas": "ptoas 0.72"
+  },
+  "default_refused": true,
+  "free_not_double_subtracted": true,
+  "preallocation_insufficient_refused_before_alloc": true,
+  "close_failure_refused": true,
+  "postallocation_guard_gap_reproduced": true,
+  "postallocation_gap": "16 tiny mocked final allocations each leave free50 below reserve100 yet return PASS",
+  "aggregate_postallocation_gap": "57 tiny mocked resources/rank, 912handles; last allocation leaves free80 below reserve100 on each rank yet PASS",
+  "additional_peak_validation": "16 integer zero values accepted syntactically; provenance/operation attribution not checked here",
+  "hardware_peak_measurements": null,
+  "full40_forward_peak_bytes": null
+}

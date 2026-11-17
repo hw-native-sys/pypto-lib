@@ -1,0 +1,10 @@
+{
+  "record_id": "main-transfer-prepare-1794042741-1794045240",
+  "agent": "/root/main_native",
+  "start_epoch": 1794042741,
+  "end_epoch": 1794045240,
+  "elapsed_wall_seconds": 2499,
+  "basis": "actual source/header/API review through helper/necessaryCPU/commands/report/seal; includes queuedwall",
+  "status": "PARKED",
+  "workers": 0
+}

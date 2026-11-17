@@ -1,0 +1,43 @@
+{
+  "status": "PASS_DEFAULT_LEGACY_AND_NEW_ACCOUNTING_TINY_ONLY",
+  "legacy_separate_path": [
+    "legacy-prepare",
+    "legacy-call",
+    "legacy-close"
+  ],
+  "new_shared_op_requires_one_upload_accounting": true,
+  "numeric_accounting_rejects_bool": true,
+  "default_HARD": true,
+  "unchanged_functions": [
+    "greedy_sample",
+    "build_prefill_inputs",
+    "build_decode_state",
+    "advance_decode_inputs",
+    "handoff_to_decode",
+    "query_rope_inputs",
+    "make_run_config",
+    "scalar_dispatch_value",
+    "streaming_weight_source",
+    "HbmSampler"
+  ],
+  "protected": {
+    "native_full_real_generation_1794055148": {
+      "manifest": "531d0c118b33117ef2a28aa45d1457f4647034b846a15a2fb9defef5ef000c1a",
+      "files": 34
+    },
+    "independent_first_real_generation_1794055937": {
+      "manifest": "3e9f22d8dff50cb3de4ed0485e6d3cbd20cf1f7ac2275ea1cbb07723cd508999",
+      "files": 13
+    },
+    "f09_active_s_draft_1794066189": {
+      "manifest": "b25d4222551cc63a91c3412acc21c6dd0a99201072c93e49816e422775120b4e",
+      "files": 36
+    }
+  },
+  "liveCC_unchanged": true,
+  "full_constructor_admission": false,
+  "actual_grant": false,
+  "compile": false,
+  "native": false,
+  "payload_bytes": 0
+}

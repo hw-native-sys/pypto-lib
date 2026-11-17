@@ -1,0 +1,75 @@
+{
+  "public_normalize_config_profiles": [
+    {
+      "ring2_MiB": 256,
+      "accepted": true,
+      "normalized": [
+        0,
+        0,
+        268435456,
+        0
+      ]
+    },
+    {
+      "ring2_MiB": 1024,
+      "accepted": true,
+      "normalized": [
+        0,
+        0,
+        1073741824,
+        0
+      ]
+    },
+    {
+      "ring2_MiB": 2048,
+      "accepted": true,
+      "normalized": [
+        0,
+        0,
+        2147483648,
+        0
+      ]
+    },
+    {
+      "ring2_MiB": 3072,
+      "accepted": false,
+      "error": "ring_heap entries must be a power of 2 >= 1024 (bytes per ring) (or 0 to keep default), got 3221225472"
+    },
+    {
+      "ring2_MiB": 4096,
+      "accepted": true,
+      "normalized": [
+        0,
+        0,
+        4294967296,
+        0
+      ]
+    }
+  ],
+  "source_defined_decode_comparator_keys": [
+    "layer_x_hc",
+    "layer_pre_mix",
+    "x_hc_final",
+    "pre_mix_final",
+    "logits",
+    "window_cache",
+    "compressed_cache_c2a",
+    "compressed_cache_c1a",
+    "index_cache_c2a",
+    "index_cache_c1a",
+    "state_cache_c2a",
+    "topk_values_c2a",
+    "topk_values_c1a",
+    "pool_block_ids_c2a",
+    "pool_block_ids_c1a",
+    "pool_block_counts_c2a",
+    "pool_block_counts_c1a",
+    "topk_indices_c2a",
+    "topk_indices_c1a"
+  ],
+  "source_defined_decode_export_count": 19,
+  "published_rows": "five configured conditional cache row subchecks, not extra exported outputs; may skip empty emission",
+  "frozen45_unchanged_before_after": true,
+  "payload_reads": 0,
+  "NPU_dispatches": 0
+}

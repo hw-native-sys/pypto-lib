@@ -1,0 +1,21 @@
+{
+  "epoch": 1794055039.586038,
+  "outer_identity": {
+    "pid": 3598628,
+    "start_ticks": "105496073",
+    "state": "R",
+    "parent_pid": 3598373
+  },
+  "CLI_identity": {
+    "pid": 3598686,
+    "start_ticks": "105496151",
+    "state": "R",
+    "parent_pid": 3598628
+  },
+  "CLI_pid": 3598686,
+  "command": [
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+    "-c",
+    "print(\"OWNED_CPU_FAKE_ONLY\")"
+  ]
+}

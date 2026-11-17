@@ -1,0 +1,192 @@
+{
+  "ranks": [
+    {
+      "rank": 0,
+      "committed_bytes": 5452929509,
+      "free_bytes": 59884150784,
+      "total_bytes": 65787658240
+    },
+    {
+      "rank": 1,
+      "committed_bytes": 5452929509,
+      "free_bytes": 60188766208,
+      "total_bytes": 65796046848
+    },
+    {
+      "rank": 2,
+      "committed_bytes": 5452929509,
+      "free_bytes": 59901550592,
+      "total_bytes": 65787658240
+    },
+    {
+      "rank": 3,
+      "committed_bytes": 5452929509,
+      "free_bytes": 60174094336,
+      "total_bytes": 65796046848
+    },
+    {
+      "rank": 4,
+      "committed_bytes": 5452929509,
+      "free_bytes": 59901575168,
+      "total_bytes": 65787658240
+    },
+    {
+      "rank": 5,
+      "committed_bytes": 5452929509,
+      "free_bytes": 60174979072,
+      "total_bytes": 65796046848
+    },
+    {
+      "rank": 6,
+      "committed_bytes": 5452929509,
+      "free_bytes": 59901640704,
+      "total_bytes": 65787658240
+    },
+    {
+      "rank": 7,
+      "committed_bytes": 5452929509,
+      "free_bytes": 60174381056,
+      "total_bytes": 65796046848
+    },
+    {
+      "rank": 8,
+      "committed_bytes": 5452929509,
+      "free_bytes": 59889934336,
+      "total_bytes": 65787658240
+    },
+    {
+      "rank": 9,
+      "committed_bytes": 5452929509,
+      "free_bytes": 60187430912,
+      "total_bytes": 65796046848
+    },
+    {
+      "rank": 10,
+      "committed_bytes": 5452929509,
+      "free_bytes": 59902267392,
+      "total_bytes": 65787658240
+    },
+    {
+      "rank": 11,
+      "committed_bytes": 5452929509,
+      "free_bytes": 60175331328,
+      "total_bytes": 65796046848
+    },
+    {
+      "rank": 12,
+      "committed_bytes": 5452929509,
+      "free_bytes": 59889893376,
+      "total_bytes": 65787658240
+    },
+    {
+      "rank": 13,
+      "committed_bytes": 5452929509,
+      "free_bytes": 60190019584,
+      "total_bytes": 65796046848
+    },
+    {
+      "rank": 14,
+      "committed_bytes": 5452929509,
+      "free_bytes": 59901710336,
+      "total_bytes": 65787658240
+    },
+    {
+      "rank": 15,
+      "committed_bytes": 5452929509,
+      "free_bytes": 60177764352,
+      "total_bytes": 65796046848
+    }
+  ],
+  "bank_grants": [
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168,
+    168
+  ],
+  "bank_grants_provenance": "read-only private startup metadata; not a public API guarantee",
+  "counter_scope": "public committed excludes HCCL/VMM; free/total is device wide",
+  "maxrss_kib": 126472328,
+  "guard": {
+    "required_free_before_weights": 23344218656,
+    "arena_contract_copy_count": 1,
+    "arena_contract_slot": 0,
+    "observed_constructed_bank_count": null,
+    "policy": "exact installed PROGRAM resource contract and pinned selector; capacity is identity metadata",
+    "prewarmed_heap_already_in_free_and_committed": true,
+    "directory_capacity_metadata": [
+      168,
+      168,
+      168,
+      168,
+      168,
+      168,
+      168,
+      168,
+      168,
+      168,
+      168,
+      168,
+      168,
+      168,
+      168,
+      168
+    ],
+    "scope": "both sequential phase owners; not a general backend or real-weight fit proof"
+  },
+  "runtime_contract": {
+    "backend": "tensormap_and_ringbuffer",
+    "platform": "a2a3",
+    "mode": "PROGRAM",
+    "library_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/build/lib/a2a3/onboard/tensormap_and_ringbuffer/libhost_runtime.so",
+    "library_sha256": "24434f8879030ef1b1f31e5fc2ecce683e392d4f1baeb5bcee852fb183976e5c",
+    "abi_version": 1,
+    "resource_count": 6,
+    "pipeline_directory_capacity": 4294967295,
+    "resources": [
+      {
+        "kind": 4,
+        "resource_class": 0,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 1,
+        "resource_class": 1,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 2,
+        "resource_class": 1,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 3,
+        "resource_class": 1,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 5,
+        "resource_class": 2,
+        "bytes_per_copy": 0
+      },
+      {
+        "kind": 6,
+        "resource_class": 2,
+        "bytes_per_copy": 0
+      }
+    ],
+    "shared_arena_bank": 0,
+    "query_scope": "read-only exported get_pipeline_contract; no init/prepare/device call"
+  }
+}

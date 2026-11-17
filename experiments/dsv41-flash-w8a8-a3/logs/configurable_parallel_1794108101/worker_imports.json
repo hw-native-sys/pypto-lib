@@ -1,0 +1,17 @@
+[
+  {
+    "record_id": "worker-parallel-config-collectives-1794108101",
+    "source": "experiments/dsv41-flash-w8a8-a3/logs/configurable_parallel_1794108101/worker_config/work_record.json",
+    "sha256": "0d57e7e008161de50233987a0b9e17b813898548023af0920101e4547829f3bc"
+  },
+  {
+    "record_id": "worker-configurable-weight-loader-1794108310",
+    "source": "experiments/dsv41-flash-w8a8-a3/logs/configurable_parallel_1794108101/worker_loader/work_record.json",
+    "sha256": "c6b1acb11fac8f5be72f0071a208daa28584f8e8b628ac688db074006c972174"
+  },
+  {
+    "record_id": "worker-configurable-metadata-1794109140",
+    "source": "experiments/dsv41-flash-w8a8-a3/logs/configurable_parallel_1794108101/worker_metadata/work_record.json",
+    "sha256": "7ab5e3186ff9288b6d9fcd06154250d0a42f9bd6a4219e3901ba678138079cf7"
+  }
+]

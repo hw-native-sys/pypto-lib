@@ -1,0 +1,98 @@
+{
+  "call": 1,
+  "initial": {
+    "file": "call1.initial.pt",
+    "sha256": "97dfadc77bf1fd4094844bfa2c99a7871af6cc2c4769bbcad7e0008a35bdfc92",
+    "tensors": {
+      "window_cache": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+      "compressed_cache_c2a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+      "index_cache_c2a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+      "compressed_cache_c1a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+      "index_cache_c1a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+      "state_cache_c2a": "795fec509275a731b5bfb6b837dc56bfa03d52a5f8a7e8951b5b89643c1a2cde",
+      "token_counts": "430cfcf74b4597ef8ede3d0f8780b6797240a089776a45003b5b8084c4c70d5f",
+      "position_ids": "e209a2bb40c536f2a1c085c46fe40013e4eecebb7f868adeead3b3159283ffe8",
+      "window_slots": "5de88fdb40c1c530176856d38fe3acce7544db69cc10d77fd9c839a1252e0370",
+      "c1a_compressed_slots": "5de88fdb40c1c530176856d38fe3acce7544db69cc10d77fd9c839a1252e0370",
+      "c2a_compressed_slots": "aed8b86bde8303c73d5919da6c91946bad13b4089820370a7a81ed95a1d9ecd4"
+    }
+  },
+  "actual": {
+    "file": "call1.actual.pt",
+    "sha256": "a276404229a0e09f0f2b52645c7a08e207b915a0ed702bb967942169ffe78fa9",
+    "tensors": {
+      "window_cache": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+      "compressed_cache_c2a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+      "index_cache_c2a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+      "compressed_cache_c1a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+      "index_cache_c1a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+      "state_cache_c2a": "4e7ef3801d1be174f53bc73111d593b66809fde978be803be1f34821e9db2a0c",
+      "token_counts": "430cfcf74b4597ef8ede3d0f8780b6797240a089776a45003b5b8084c4c70d5f",
+      "position_ids": "e209a2bb40c536f2a1c085c46fe40013e4eecebb7f868adeead3b3159283ffe8",
+      "window_slots": "5de88fdb40c1c530176856d38fe3acce7544db69cc10d77fd9c839a1252e0370",
+      "c1a_compressed_slots": "5de88fdb40c1c530176856d38fe3acce7544db69cc10d77fd9c839a1252e0370",
+      "c2a_compressed_slots": "aed8b86bde8303c73d5919da6c91946bad13b4089820370a7a81ed95a1d9ecd4"
+    }
+  },
+  "cache_after": {
+    "window_cache": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+    "compressed_cache_c2a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+    "index_cache_c2a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+    "state_cache_c2a": "4e7ef3801d1be174f53bc73111d593b66809fde978be803be1f34821e9db2a0c",
+    "compressed_cache_c1a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f",
+    "index_cache_c1a": "47ae7ef761aea51beb68658d4f3e9d5b836565a1c0f6d3a6f62a65cf2074c87f"
+  },
+  "history_before": [
+    [
+      126,
+      126
+    ],
+    [
+      126,
+      126
+    ],
+    [
+      126,
+      126
+    ],
+    [
+      126,
+      126
+    ]
+  ],
+  "active_counts": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    0,
+    0,
+    0,
+    0,
+    2,
+    2,
+    2,
+    2
+  ],
+  "metadata_hashes": {
+    "token_counts": "430cfcf74b4597ef8ede3d0f8780b6797240a089776a45003b5b8084c4c70d5f",
+    "position_ids": "e209a2bb40c536f2a1c085c46fe40013e4eecebb7f868adeead3b3159283ffe8",
+    "window_slots": "5de88fdb40c1c530176856d38fe3acce7544db69cc10d77fd9c839a1252e0370",
+    "c1a_compressed_slots": "5de88fdb40c1c530176856d38fe3acce7544db69cc10d77fd9c839a1252e0370",
+    "c2a_compressed_slots": "aed8b86bde8303c73d5919da6c91946bad13b4089820370a7a81ed95a1d9ecd4"
+  },
+  "mode": "CPU_TOY_NOT_NATIVE",
+  "owner_identity": 281473592079216,
+  "artifact": {
+    "CPU_ONLY": true
+  },
+  "retention": {
+    "status": "FAIL",
+    "primary_error": "ValueError('unwritten C2 state changed rank0 request1')",
+    "traceback": "Traceback (most recent call last):\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/f09_decode_case.py\", line 228, in drive\n    try:retained_equal(before,values,history,meta)\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_c2_retention_fix_1794092629/f09_decode_case.py\", line 133, in retained_equal\n    if keep and not tensor_bytes_equal(before[name][rank,:,block,keep],after[name][rank,:,block,keep]):raise ValueError(f'unwritten C2 state changed rank{rank} request{request}')\nValueError: unwritten C2 state changed rank0 request1\n"
+  }
+}

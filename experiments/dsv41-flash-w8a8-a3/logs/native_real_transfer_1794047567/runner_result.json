@@ -1,0 +1,10 @@
+{
+  "status": "COMPLETE_SELECTED_BYTES_INTERNAL_AND_OBSERVER_ONLY",
+  "duration_seconds": 100.10202872601803,
+  "result_sha256": "2d0a4bd282bdb24a7620e36bd2c9a45ee46005893d5ff9363fca30047cf8b4ee",
+  "observer_sha256": "a06247c2fd1fa56afe493f131e6897af9037a1559ea99b92eb6692be68a9159c",
+  "actual_offset_nonzero": 0,
+  "requires_independent_postjob_audit": true,
+  "full40_initialized_upload_forward_peaks": null,
+  "fit_text_guard_release": false
+}

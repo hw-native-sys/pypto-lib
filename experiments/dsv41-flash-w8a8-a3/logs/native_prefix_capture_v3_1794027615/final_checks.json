@@ -1,0 +1,67 @@
+{
+  "source45_V3_evaluator_old864_math403_unchanged": true,
+  "native_prefix_manifest_close_payloads_CPUreceipt_staticplan_verified": true,
+  "original_gate_names_PASS": [
+    "layer_x_hc",
+    "layer_pre_mix",
+    "logits",
+    "window_cache",
+    "compressed_cache_c2a",
+    "index_cache_c2a",
+    "state_cache_c2a",
+    "compressed_cache_c1a",
+    "index_cache_c1a",
+    "topk_indices_c2a",
+    "topk_values_c2a",
+    "pool_block_ids_c2a",
+    "pool_block_counts_c2a",
+    "topk_indices_c1a",
+    "topk_values_c1a",
+    "pool_block_ids_c1a",
+    "pool_block_counts_c1a"
+  ],
+  "all21_recorded_native_CPU_wrapper_pids_present": {
+    "179990": false,
+    "180708": false,
+    "203231": false,
+    "203232": false,
+    "203238": false,
+    "203244": false,
+    "203257": false,
+    "203264": false,
+    "203270": false,
+    "203276": false,
+    "203282": false,
+    "203289": false,
+    "203302": false,
+    "203308": false,
+    "203314": false,
+    "203320": false,
+    "203326": false,
+    "203340": false,
+    "203346": false,
+    "240146": false
+  },
+  "post_phase_host_available_bytes": 1722271002624,
+  "post_phase_shm_used_bytes": 557056,
+  "CPU_gate_snapshot_sha256": "1b34a8e29b6cd6037ac97818b6dce8cea9bc5b45dad08fc5df9ca297fb27ee56",
+  "operational_file_exclusion": [
+    "work/measurement_gate.json"
+  ],
+  "same_physical_work_handoff": {
+    "physical_work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_prefix_capture_v3_1794027615/work",
+    "accepted_prefix_files": "work/prefix/** byte-immutable including manifest/CPUreceipt/ownerclose/actual/initial/copiedABI/scope_metrics",
+    "static_plan": "work/static_plan.json byte-immutable dbca1fb4dd503b7d8b38e54bae4782c6e38f496bd405dd4637376ebd06487735",
+    "exclude_current_final_manifest": [
+      "work/measurement_gate.json"
+    ],
+    "frozen_current_cpu_measurement_snapshot": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_prefix_capture_v3_1794027615/frozen_cpu_measurement_gate.json",
+    "frozen_current_cpu_measurement_sha256": "1b34a8e29b6cd6037ac97818b6dce8cea9bc5b45dad08fc5df9ca297fb27ee56",
+    "operational_gate_lifecycle": "canonical guard replaces per stage; observer explicit amendment transfers this sole existing mutable gate to next assigned stage",
+    "META_geometry": "included by content hash; next canonical replacement is allowed only byte-identical",
+    "next_authorized_new_writes": "decode1*, decode_after_dispatch*, decode128/,decode129/,decode130/,stale129/,native_chain_unvalidated.json and corresponding NEW decode close/memory evidence; newunit runner/auth/measurement/report elsewhere",
+    "protected_old_prefix_patterns": "prefix/, prefix*, prefill128*; no existing-file overwrite",
+    "root_amendment": "observer explicit same-physical-work ownership amendment received before current final seal; replaces proposed relocation; no symlinks/rebinding/policy edits"
+  },
+  "time": 1794031644
+}

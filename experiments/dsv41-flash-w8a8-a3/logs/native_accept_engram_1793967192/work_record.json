@@ -1,0 +1,8 @@
+{
+  "record_id": "review-engram-1793967192-1793969411",
+  "agent": "review-agent",
+  "start": 1793967192,
+  "end": 1793969411,
+  "duration": 2219,
+  "activity": "Independent F05/F06/F07 source/CPU/onboard acceptance; caught simulated helper claims; corrected actual16 F06 passes; nativeL2 EACCES leaves F05/F07 open; no model writes"
+}

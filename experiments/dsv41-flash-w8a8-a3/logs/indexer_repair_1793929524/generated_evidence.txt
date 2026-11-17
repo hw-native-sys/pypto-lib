@@ -1,0 +1,245 @@
+before: experiments/dsv41-flash-w8a8-a3/logs/indexer_repair_1793929524/build_output/_jit_lightning_indexer_test_20261106_094714_jbiqoivf/orchestration/lightning_indexer_test.cpp sha256=b6dddf0bc8a35fd57f41cef520fa79abc21b663392201059cf741957007e8d4c
+383:         int64_t block_width_inline587 = ((static_cast<int64_t>((TABLE_DYN * 8)) + 7) / 8);
+392:                 // Spmd index_block_pool_spmd: index_block_pool
+430:         // Task 11: index_pool_counts
+before: experiments/dsv41-flash-w8a8-a3/logs/indexer_repair_1793929524/build_output/_jit_lightning_indexer_test_20261106_094714_jbiqoivf/ptoas/index_scores.cpp sha256=649eb4c0e52d7e2e4ea8ba1b8e3c1df2a608a1556ce4d876654b454d5d312f74
+final: experiments/dsv41-flash-w8a8-a3/logs/indexer_repair_1793929524/build_output/_jit_lightning_indexer_full_pool_test_20261106_095053_mjvma1no/orchestration/lightning_indexer_full_pool_test.cpp sha256=ea715b442ea3e26350a2e8351987fa755cd1fde49ae5297c585212c5d1b1545f
+384:         int64_t block_width_inline1224 = ((static_cast<int64_t>((TABLE_DYN * 128)) + 7) / 8);
+393:                 // Spmd index_block_pool_spmd: index_block_pool
+431:         // Task 11: index_pool_counts
+final: experiments/dsv41-flash-w8a8-a3/logs/indexer_repair_1793929524/build_output/_jit_lightning_indexer_full_pool_test_20261106_095053_mjvma1no/ptoas/index_scores.cpp sha256=5335ec7b73697f51d88c8f88beb363b721fcb190398677f1ce2c36782febc0e8
+6004:       Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v798 = Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v23, v23);
+6005:       // pto: %187
+6006:       ;
+6007:       uint64_t v799 = (uint64_t) v19;
+6008:       TASSIGN(v798, v799);
+6009:       pipe_barrier(PIPE_V);
+6010:       TADD(v798, v788, v796);
+6011:       // pto: %530
+6012:       ;
+6013:       const int32_t v800 = 16;
+6014:       // pto: %530
+6015:       ;
+6016:       const int32_t v801 = 128;
+6017:       // pto: %530
+6018:       ;
+6019:       Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v802 = Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v800, v801);
+6020:       v802.SetValidShape(v23, v23);
+6021:       pipe_barrier(PIPE_ALL);
+6022:       TPOP<TPipe<0, Direction::DIR_C2V, 8192, 2, 2, true>, Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>, TileSplitAxis::TILE_NO_SPLIT>(v68, v802);
+6023:       set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+6024:       // pto: %188
+6025:       ;
+6026:       Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v803 = Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v23, v23);
+6027:       // pto: %188
+6028:       ;
+6029:       uint64_t v804 = (uint64_t) v18;
+6030:       TASSIGN(v803, v804);
+6031:       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+6032:       pipe_barrier(PIPE_V);
+6033:       TMAXS(v803, v802, v25);
+6034:       TFREE<TPipe<0, Direction::DIR_C2V, 8192, 2, 2, true>, TileSplitAxis::TILE_NO_SPLIT>(v68);
+6035:       // pto: %533, %531
+6036:       ;
+6037:       float v805 = (v7)[(int64_t) ((uint64_t) v494 + (uint64_t) v55)];
+6038:       // pto: %189
+6039:       ;
+6040:       Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v806 = Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v23, v23);
+6041:       // pto: %189
+6042:       ;
+6043:       uint64_t v807 = (uint64_t) v18;
+6044:       TASSIGN(v806, v807);
+6045:       pipe_barrier(PIPE_V);
+6046:       TMULS(v806, v803, v805);
+6047:       // pto: %190
+6048:       ;
+6049:       Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v808 = Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v23, v23);
+6050:       // pto: %190
+6051:       ;
+6052:       uint64_t v809 = (uint64_t) v19;
+6053:       TASSIGN(v808, v809);
+6054:       pipe_barrier(PIPE_V);
+6055:       TADD(v808, v798, v806);
+6056:       // pto: %534
+6057:       ;
+6058:       int64_t v810 = (int64_t) ((uint64_t) v486 * (uint64_t) v21);
+6059:       // pto: %536, %535
+6060:       ;
+6061:       int32_t v811 = (int32_t) ((uint32_t) v475 - (uint32_t) ((int32_t) v810));
+6062:       // pto: %191
+6063:       ;
+6064:       Tile<TileType::Vec, float, 1, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v812 = Tile<TileType::Vec, float, 1, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v23, v23);
+6065:       // pto: %191
+6066:       ;
+6067:       uint64_t v813 = (uint64_t) v18;
+6068:       TASSIGN(v812, v813);
+6069:       pipe_barrier(PIPE_V);
+6070:       TEXPANDS(v812, v25);
+6071:       set_flag(PIPE_V, PIPE_S, EVENT_ID1);
+6072:       wait_flag(PIPE_V, PIPE_S, EVENT_ID1);
+6073:       for (int64_t v814 = v23; v814 < v21; v814 += v20) {
+6074:         // pto: %538, %539
+6075:         ;
+6076:         if (v814 < (int64_t) v811) {
+6077:           v812.SetValue(v814, v56);
+6078:         };
+6079:       };
+6080:       set_flag(PIPE_S, PIPE_V, EVENT_ID1);
+6081:       // pto: %192
+6082:       ;
+6083:       Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v815 = Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v23, v23);
+6084:       // pto: %192
+6085:       ;
+6086:       uint64_t v816 = (uint64_t) v19;
+6087:       TASSIGN(v815, v816);
+6088:       wait_flag(PIPE_S, PIPE_V, EVENT_ID1);
+6089:       pipe_barrier(PIPE_V);
+6090:       TMUL(v815, v808, v812);
+6091:     };
+6092:     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID7);
+6093:     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID6);
+6094:     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID5);
+6095:     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID4);
+6096:     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID3);
+6097:     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID2);
+6098:     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
+6099:     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+6100:     for (int64_t v817 = v485; v817 < v9; v817 += v20) {
+6101:       // pto: %193
+6102:       ;
+6103:       Tile<TileType::Vec, float, 1, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v818 = Tile<TileType::Vec, float, 1, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v23, v23);
+6104:       // pto: %193
+6105:       ;
+6106:       uint64_t v819 = (uint64_t) v19;
+6107:       TASSIGN(v818, v819);
+6108:       pipe_barrier(PIPE_V);
+6109:       TEXPANDS(v818, v25);
+6110:     };
+6111:   }
+6112:   wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+6113:   wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
+6114:   #endif // __DAV_VEC__
+6115: 
+6116:   ptoas_auto_sync_tail(PTOAutoSyncTailMode::kBarrierAll);
+6117:   return;
+6118: }
+final: experiments/dsv41-flash-w8a8-a3/logs/indexer_repair_1793929524/build_output/_jit_lightning_indexer_test_20261106_095041_xr6oflus/orchestration/lightning_indexer_test.cpp sha256=4b22ea4e5f3b6bae5a14ec9dc5aa38359d350e11cdbca7c59332b0fae10f7596
+384:         int64_t block_width_inline593 = ((static_cast<int64_t>((TABLE_DYN * 128)) + 7) / 8);
+393:                 // Spmd index_block_pool_spmd: index_block_pool
+431:         // Task 11: index_pool_counts
+final: experiments/dsv41-flash-w8a8-a3/logs/indexer_repair_1793929524/build_output/_jit_lightning_indexer_test_20261106_095041_xr6oflus/ptoas/index_scores.cpp sha256=1bb57152fdfe804461ba45cc32cc5310be6fca316a20198ac2998945c0ed083f
+6004:       Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v798 = Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v23, v23);
+6005:       // pto: %187
+6006:       ;
+6007:       uint64_t v799 = (uint64_t) v19;
+6008:       TASSIGN(v798, v799);
+6009:       pipe_barrier(PIPE_V);
+6010:       TADD(v798, v788, v796);
+6011:       // pto: %530
+6012:       ;
+6013:       const int32_t v800 = 16;
+6014:       // pto: %530
+6015:       ;
+6016:       const int32_t v801 = 128;
+6017:       // pto: %530
+6018:       ;
+6019:       Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v802 = Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v800, v801);
+6020:       v802.SetValidShape(v23, v23);
+6021:       pipe_barrier(PIPE_ALL);
+6022:       TPOP<TPipe<0, Direction::DIR_C2V, 8192, 2, 2, true>, Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>, TileSplitAxis::TILE_NO_SPLIT>(v68, v802);
+6023:       set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+6024:       // pto: %188
+6025:       ;
+6026:       Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v803 = Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v23, v23);
+6027:       // pto: %188
+6028:       ;
+6029:       uint64_t v804 = (uint64_t) v18;
+6030:       TASSIGN(v803, v804);
+6031:       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+6032:       pipe_barrier(PIPE_V);
+6033:       TMAXS(v803, v802, v25);
+6034:       TFREE<TPipe<0, Direction::DIR_C2V, 8192, 2, 2, true>, TileSplitAxis::TILE_NO_SPLIT>(v68);
+6035:       // pto: %533, %531
+6036:       ;
+6037:       float v805 = (v7)[(int64_t) ((uint64_t) v494 + (uint64_t) v55)];
+6038:       // pto: %189
+6039:       ;
+6040:       Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v806 = Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v23, v23);
+6041:       // pto: %189
+6042:       ;
+6043:       uint64_t v807 = (uint64_t) v18;
+6044:       TASSIGN(v806, v807);
+6045:       pipe_barrier(PIPE_V);
+6046:       TMULS(v806, v803, v805);
+6047:       // pto: %190
+6048:       ;
+6049:       Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v808 = Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v23, v23);
+6050:       // pto: %190
+6051:       ;
+6052:       uint64_t v809 = (uint64_t) v19;
+6053:       TASSIGN(v808, v809);
+6054:       pipe_barrier(PIPE_V);
+6055:       TADD(v808, v798, v806);
+6056:       // pto: %534
+6057:       ;
+6058:       int64_t v810 = (int64_t) ((uint64_t) v486 * (uint64_t) v21);
+6059:       // pto: %536, %535
+6060:       ;
+6061:       int32_t v811 = (int32_t) ((uint32_t) v475 - (uint32_t) ((int32_t) v810));
+6062:       // pto: %191
+6063:       ;
+6064:       Tile<TileType::Vec, float, 1, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v812 = Tile<TileType::Vec, float, 1, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v23, v23);
+6065:       // pto: %191
+6066:       ;
+6067:       uint64_t v813 = (uint64_t) v18;
+6068:       TASSIGN(v812, v813);
+6069:       pipe_barrier(PIPE_V);
+6070:       TEXPANDS(v812, v25);
+6071:       set_flag(PIPE_V, PIPE_S, EVENT_ID1);
+6072:       wait_flag(PIPE_V, PIPE_S, EVENT_ID1);
+6073:       for (int64_t v814 = v23; v814 < v21; v814 += v20) {
+6074:         // pto: %538, %539
+6075:         ;
+6076:         if (v814 < (int64_t) v811) {
+6077:           v812.SetValue(v814, v56);
+6078:         };
+6079:       };
+6080:       set_flag(PIPE_S, PIPE_V, EVENT_ID1);
+6081:       // pto: %192
+6082:       ;
+6083:       Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v815 = Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v23, v23);
+6084:       // pto: %192
+6085:       ;
+6086:       uint64_t v816 = (uint64_t) v19;
+6087:       TASSIGN(v815, v816);
+6088:       wait_flag(PIPE_S, PIPE_V, EVENT_ID1);
+6089:       pipe_barrier(PIPE_V);
+6090:       TMUL(v815, v808, v812);
+6091:     };
+6092:     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID7);
+6093:     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID6);
+6094:     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID5);
+6095:     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID4);
+6096:     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID3);
+6097:     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID2);
+6098:     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
+6099:     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+6100:     for (int64_t v817 = v485; v817 < v9; v817 += v20) {
+6101:       // pto: %193
+6102:       ;
+6103:       Tile<TileType::Vec, float, 1, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v818 = Tile<TileType::Vec, float, 1, 128, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v23, v23);
+6104:       // pto: %193
+6105:       ;
+6106:       uint64_t v819 = (uint64_t) v19;
+6107:       TASSIGN(v818, v819);
+6108:       pipe_barrier(PIPE_V);
+6109:       TEXPANDS(v818, v25);
+6110:     };
+6111:   }
+6112:   wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+6113:   wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
+6114:   #endif // __DAV_VEC__
+6115: 
+6116:   ptoas_auto_sync_tail(PTOAutoSyncTailMode::kBarrierAll);
+6117:   return;
+6118: }

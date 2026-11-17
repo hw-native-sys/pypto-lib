@@ -1,0 +1,14 @@
+{
+  "schema": "independent-F09-prepared-identity-freeze/1",
+  "status": "FINAL_PARK",
+  "artifacts": 242,
+  "artifacts_sha256": "1a32f80cc5f5fce3b8adcf74560b72b3f5659c6a17378dd923f55e2d2963e948",
+  "proof_receipt": "result.json",
+  "proof_receipt_sha256": "faaf5fd55c4982d26ad64a65d744c8918dd86ba5c46e20f1364679a8012a99a7",
+  "report_sha256": "6348544905d6c1aa272b00a881bb26a7174a32c7f0f66313f29723b3683befe7",
+  "new_helper_native_execution": false,
+  "native16_authorized": false,
+  "shared_writes": 0,
+  "next_pins_sha256": "a5b202fdc32b3198d4b43e32a83d1191b71508ef783a7492bbbb0586bf8f9017",
+  "frozen_epoch": 1794087800.6838796
+}

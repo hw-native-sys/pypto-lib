@@ -1,0 +1,14 @@
+{
+  "id": "review-recoverable-prefix17-1794027615-1794031783",
+  "start_epoch": 1794027615,
+  "end_epoch": 1794031783,
+  "duration_seconds": 4168,
+  "agent": "review-agent",
+  "state": "CURRENT_UNIT_COMPLETE_HANDOFF",
+  "category": "device-and-cpu-validate",
+  "native_task": "task_20261107_130545_17984923672",
+  "CPU17_task": "task_20261107_131609_23982214151",
+  "operational_exclusion": [
+    "work/measurement_gate.json"
+  ]
+}

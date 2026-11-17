@@ -1,0 +1,27 @@
+{
+  "schema": "Root-F09-lifecycle-micro/1",
+  "approved": true,
+  "operation": "existing-toy-auto2-public-artifact-lifecycle",
+  "device_policy": "auto2",
+  "execution_mode": "ONBOARD",
+  "platform": "a2a3",
+  "ring_heap": [
+    0,
+    0,
+    4294967296,
+    0
+  ],
+  "output_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_lifecycle_micro_1794081685",
+  "expires_at_epoch": 1794083978.5228126,
+  "dependencies_manifest_sha256": "f91ffadae62417e705e9f90fa43cc10a178b331914de6d036b6610390c0fdd8a",
+  "root_go_id": "observer-20261108-f09-lifecycle-public-native2",
+  "created_after_queue_allocation": true,
+  "actual_ordered_device_ids": [
+    0,
+    1
+  ],
+  "created_epoch": 1794082878.5228148,
+  "wrapper_sha256": "f1381cda52a331e18c63d74722e215727462b2f6ec61db3cf4dc9e6864068906",
+  "prep_manifest_sha256": "e482d0568f775fb368a72be6b86a7d4b9f155f49869d9023f735fc82b3179253",
+  "scope": "ONE existing-toy auto2 public lifecycle/32768expected12 only; no model F09 fixture or new compile"
+}

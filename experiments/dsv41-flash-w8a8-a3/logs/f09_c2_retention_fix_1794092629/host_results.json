@@ -1,0 +1,69 @@
+{
+  "pass": true,
+  "checks": [
+    {
+      "case": "actual_state_body_vs_original_golden",
+      "active": 0,
+      "requests": [
+        0,
+        1
+      ],
+      "pass": true,
+      "oldphysical_rejected": true,
+      "CPU_semantics_not_native": true
+    },
+    {
+      "case": "actual_state_body_vs_original_golden",
+      "active": 1,
+      "requests": [
+        0,
+        1
+      ],
+      "pass": true,
+      "oldphysical_rejected": true,
+      "CPU_semantics_not_native": true
+    },
+    {
+      "case": "actual_state_body_vs_original_golden",
+      "active": 2,
+      "requests": [
+        0,
+        1
+      ],
+      "pass": true,
+      "oldphysical_rejected": false,
+      "CPU_semantics_not_native": true
+    },
+    {
+      "case": "actual_state_body_vs_original_golden",
+      "active": 1,
+      "requests": [
+        0,
+        0
+      ],
+      "pass": true,
+      "oldphysical_rejected": true,
+      "CPU_semantics_not_native": true
+    },
+    {
+      "case": "byte_ownership_NaN_signedzero_noncontiguous_dtype_shape",
+      "pass": true
+    },
+    {
+      "case": "actual_drive_retention_failure_saves_post_and_partialmetadata_first",
+      "pass": true,
+      "outer_returned_records": 0,
+      "durable_post_dispatch_records": [
+        "call0.json",
+        "call1.json"
+      ],
+      "retention_validated_call_records": [
+        "call0.json"
+      ],
+      "checkpoint_record_errors": []
+    }
+  ],
+  "full_171_gates_unchanged": true,
+  "native": false,
+  "fullfixture": false
+}

@@ -1,0 +1,15 @@
+{
+  "status": "FINAL_CPU_READY_PARK",
+  "files": 28,
+  "manifest_sha256": "71ace12663d11560e17d697b24ca59cb9d29176c75fb28ac3750478ac0b4eb2a",
+  "driver_sha256": "9410991b71c32ad6fb65289e4660f5e701bbc7c226cf2bdc9ffe701f1d60f139",
+  "publisher_sha256": "8426b32c99d3c33035e6c0bbf212ed53f0e42abc710f86a35891fe35de7362ff",
+  "launcher_sha256": "4cd319ba1a41d25384db78f44e7c1d6f45c2222dc8f6a10e859ae12d32549319",
+  "CPU_result_sha256": "86560f3a8ef4e2ba3b4632fed2a47ed18e937040e46f6acefd3620a11ea8be07",
+  "TP_receipt_sha256": "e48c69f6e2b97112cff252df3f7796935efe1f85c44b54c1efb765bfd54115cb",
+  "contract_sha256": "ba51f7cbb9620438946752308c687425d1e879e3b6d82ff210da1ccbc51aebb1",
+  "commands_sha256": "edcbb523860348e66f2c087095777ec2cb8fbcfc6d6a3b1846a651ab6f3db134",
+  "source_unchanged": true,
+  "shared_writes": 0,
+  "NPU": 0
+}

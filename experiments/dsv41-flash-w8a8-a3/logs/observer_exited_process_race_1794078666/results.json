@@ -1,0 +1,702 @@
+{
+  "status": "PASS_BOUNDED_EXIT_RACE_CPU",
+  "fake_proc_cases": [
+    {
+      "case": "after",
+      "pass": true,
+      "result": {
+        "processes": [
+          {
+            "pid": 100,
+            "start_ticks": "1000",
+            "state": "S",
+            "parent_pid": 1,
+            "pss": 1024,
+            "rss": 2048,
+            "uss": 1024,
+            "memory_status": "KNOWN",
+            "child_inventory_complete": true
+          },
+          {
+            "pid": 200,
+            "start_ticks": "2000",
+            "state": "S",
+            "parent_pid": 1,
+            "pss": null,
+            "rss": null,
+            "uss": null,
+            "memory_status": "CONFIRMED_EXIT",
+            "child_inventory_complete": true,
+            "exit_classification": "RECORDED_BIRTH_NO_LONGER_PRESENT"
+          },
+          {
+            "pid": 300,
+            "start_ticks": "3000",
+            "state": "S",
+            "parent_pid": 1,
+            "pss": 1024,
+            "rss": 2048,
+            "uss": 1024,
+            "memory_status": "KNOWN",
+            "child_inventory_complete": true
+          }
+        ],
+        "inventory_complete": true,
+        "memory_complete": true,
+        "full_sample_memory_known": false,
+        "memory_scope": "discovered live identities; explicitly confirmed exited births excluded, never measured as zero"
+      },
+      "errors": [],
+      "exits": [
+        {
+          "epoch": 1794079363.4417436,
+          "pid": 200,
+          "start_ticks": "2000",
+          "retired_from_live_sample": true,
+          "child_inventory_complete": true,
+          "observed_task_ids": [
+            200
+          ],
+          "memory_values": null,
+          "original_memory_error": {
+            "epoch": 1794079363.4417324,
+            "pid": 200,
+            "start_ticks": "2000",
+            "operation": "read-smaps-rollup",
+            "path": "/proc/200/smaps_rollup",
+            "errno": 3,
+            "exception_type": "ProcessLookupError",
+            "error": "ProcessLookupError(3, 'fixture exited')",
+            "critical": false
+          },
+          "confirmed": true,
+          "classification": "RECORDED_BIRTH_NO_LONGER_PRESENT",
+          "recheck_path": "/proc/200/stat",
+          "recheck_epoch": 1794079363.441743
+        }
+      ],
+      "exception": null,
+      "scope": "OWNED_FAKE_PROC_NOT_MEASURED_MEMORY"
+    },
+    {
+      "case": "reused",
+      "pass": true,
+      "result": {
+        "processes": [
+          {
+            "pid": 100,
+            "start_ticks": "1000",
+            "state": "S",
+            "parent_pid": 1,
+            "pss": 1024,
+            "rss": 2048,
+            "uss": 1024,
+            "memory_status": "KNOWN",
+            "child_inventory_complete": true
+          },
+          {
+            "pid": 200,
+            "start_ticks": "2000",
+            "state": "S",
+            "parent_pid": 1,
+            "pss": null,
+            "rss": null,
+            "uss": null,
+            "memory_status": "CONFIRMED_EXIT",
+            "child_inventory_complete": true,
+            "exit_classification": "RECORDED_BIRTH_REPLACED"
+          },
+          {
+            "pid": 300,
+            "start_ticks": "3000",
+            "state": "S",
+            "parent_pid": 1,
+            "pss": 1024,
+            "rss": 2048,
+            "uss": 1024,
+            "memory_status": "KNOWN",
+            "child_inventory_complete": true
+          }
+        ],
+        "inventory_complete": true,
+        "memory_complete": true,
+        "full_sample_memory_known": false,
+        "memory_scope": "discovered live identities; explicitly confirmed exited births excluded, never measured as zero"
+      },
+      "errors": [],
+      "exits": [
+        {
+          "epoch": 1794079363.4418576,
+          "pid": 200,
+          "start_ticks": "2000",
+          "retired_from_live_sample": true,
+          "child_inventory_complete": true,
+          "observed_task_ids": [
+            200
+          ],
+          "memory_values": null,
+          "original_memory_error": {
+            "epoch": 1794079363.4418478,
+            "pid": 200,
+            "start_ticks": "2000",
+            "operation": "read-smaps-rollup",
+            "path": "/proc/200/smaps_rollup",
+            "errno": 3,
+            "exception_type": "ProcessLookupError",
+            "error": "ProcessLookupError(3, 'fixture exited')",
+            "critical": false
+          },
+          "confirmed": true,
+          "classification": "RECORDED_BIRTH_REPLACED",
+          "replacement_start_ticks": "9999",
+          "recheck_path": "/proc/200/stat",
+          "recheck_epoch": 1794079363.4418569,
+          "replacement_memory_read": false
+        }
+      ],
+      "exception": null,
+      "scope": "OWNED_FAKE_PROC_NOT_MEASURED_MEMORY"
+    },
+    {
+      "case": "before",
+      "pass": true,
+      "result": {
+        "processes": [
+          {
+            "pid": 100,
+            "start_ticks": "1000",
+            "state": "S",
+            "parent_pid": 1,
+            "pss": 1024,
+            "rss": 2048,
+            "uss": 1024,
+            "memory_status": "KNOWN",
+            "child_inventory_complete": true
+          },
+          {
+            "pid": 200,
+            "start_ticks": "2000",
+            "state": "S",
+            "parent_pid": 1,
+            "pss": null,
+            "rss": null,
+            "uss": null,
+            "memory_status": "EXIT_WITH_UNKNOWN_SUBTREE",
+            "child_inventory_complete": false,
+            "exit_classification": "RECORDED_BIRTH_NO_LONGER_PRESENT"
+          }
+        ],
+        "inventory_complete": false,
+        "memory_complete": false,
+        "full_sample_memory_known": false,
+        "memory_scope": "discovered live identities; explicitly confirmed exited births excluded, never measured as zero"
+      },
+      "errors": [
+        {
+          "epoch": 1794079363.441939,
+          "pid": 200,
+          "start_ticks": "2000",
+          "operation": "enumerate-thread-tasks",
+          "path": "/proc/200/task",
+          "errno": 2,
+          "exception_type": "FileNotFoundError",
+          "error": "FileNotFoundError(2, 'fixture exited')",
+          "critical": false,
+          "classification": "CHILD_INVENTORY_UNKNOWN_BEFORE_RETIREMENT"
+        }
+      ],
+      "exits": [
+        {
+          "epoch": 1794079363.4419525,
+          "pid": 200,
+          "start_ticks": "2000",
+          "retired_from_live_sample": false,
+          "child_inventory_complete": false,
+          "observed_task_ids": [],
+          "memory_values": null,
+          "original_memory_error": {
+            "epoch": 1794079363.441945,
+            "pid": 200,
+            "start_ticks": "2000",
+            "operation": "read-smaps-rollup",
+            "path": "/proc/200/smaps_rollup",
+            "errno": 3,
+            "exception_type": "ProcessLookupError",
+            "error": "ProcessLookupError(3, 'fixture exited')",
+            "critical": false
+          },
+          "confirmed": true,
+          "classification": "RECORDED_BIRTH_NO_LONGER_PRESENT",
+          "recheck_path": "/proc/200/stat",
+          "recheck_epoch": 1794079363.441952
+        }
+      ],
+      "exception": null,
+      "scope": "OWNED_FAKE_PROC_NOT_MEASURED_MEMORY"
+    },
+    {
+      "case": "live",
+      "pass": true,
+      "result": {
+        "processes": [
+          {
+            "pid": 100,
+            "start_ticks": "1000",
+            "state": "S",
+            "parent_pid": 1,
+            "pss": 1024,
+            "rss": 2048,
+            "uss": 1024,
+            "memory_status": "KNOWN",
+            "child_inventory_complete": true
+          },
+          {
+            "pid": 200,
+            "start_ticks": "2000",
+            "state": "S",
+            "parent_pid": 1,
+            "pss": null,
+            "rss": null,
+            "uss": null,
+            "memory_status": "UNKNOWN_LIVE",
+            "child_inventory_complete": true
+          },
+          {
+            "pid": 300,
+            "start_ticks": "3000",
+            "state": "S",
+            "parent_pid": 1,
+            "pss": 1024,
+            "rss": 2048,
+            "uss": 1024,
+            "memory_status": "KNOWN",
+            "child_inventory_complete": true
+          }
+        ],
+        "inventory_complete": true,
+        "memory_complete": false,
+        "full_sample_memory_known": false,
+        "memory_scope": "discovered live identities; explicitly confirmed exited births excluded, never measured as zero"
+      },
+      "errors": [
+        {
+          "epoch": 1794079363.4420164,
+          "pid": 200,
+          "start_ticks": "2000",
+          "operation": "read-smaps-rollup",
+          "path": "/proc/200/smaps_rollup",
+          "errno": 3,
+          "exception_type": "ProcessLookupError",
+          "error": "ProcessLookupError(3, 'fixture exited')",
+          "critical": false,
+          "classification": "SAME_BIRTH_STILL_PRESENT_OR_LIVE_THREADS",
+          "recheck": {
+            "confirmed": false,
+            "classification": "SAME_BIRTH_STILL_PRESENT_OR_LIVE_THREADS",
+            "observed_state": "S",
+            "recheck_path": "/proc/200/stat",
+            "recheck_epoch": 1794079363.4420228
+          }
+        }
+      ],
+      "exits": [],
+      "exception": null,
+      "scope": "OWNED_FAKE_PROC_NOT_MEASURED_MEMORY"
+    },
+    {
+      "case": "recheckpermission",
+      "pass": true,
+      "result": null,
+      "errors": [
+        {
+          "epoch": 1794079363.4421024,
+          "pid": 200,
+          "start_ticks": "2000",
+          "operation": "read-smaps-rollup",
+          "path": "/proc/200/smaps_rollup",
+          "errno": 3,
+          "exception_type": "ProcessLookupError",
+          "error": "ProcessLookupError(3, 'fixture exited')",
+          "critical": false,
+          "classification": "EXIT_RECHECK_FAILED"
+        },
+        {
+          "epoch": 1794079363.44211,
+          "pid": 200,
+          "start_ticks": "2000",
+          "operation": "recheck-recorded-birth-after-memory-race",
+          "path": "/proc/200/stat",
+          "errno": 13,
+          "exception_type": "PermissionError",
+          "error": "PermissionError(13, 'fixture deny')",
+          "critical": true
+        }
+      ],
+      "exits": [],
+      "exception": "PermissionError(13, 'fixture deny')",
+      "scope": "OWNED_FAKE_PROC_NOT_MEASURED_MEMORY"
+    },
+    {
+      "case": "zombie",
+      "pass": true,
+      "result": {
+        "processes": [
+          {
+            "pid": 100,
+            "start_ticks": "1000",
+            "state": "S",
+            "parent_pid": 1,
+            "pss": 1024,
+            "rss": 2048,
+            "uss": 1024,
+            "memory_status": "KNOWN",
+            "child_inventory_complete": true
+          },
+          {
+            "pid": 200,
+            "start_ticks": "2000",
+            "state": "S",
+            "parent_pid": 1,
+            "pss": null,
+            "rss": null,
+            "uss": null,
+            "memory_status": "CONFIRMED_EXIT",
+            "child_inventory_complete": true,
+            "exit_classification": "RECORDED_BIRTH_EXITED_SINGLE_TASK_ZOMBIE"
+          },
+          {
+            "pid": 300,
+            "start_ticks": "3000",
+            "state": "S",
+            "parent_pid": 1,
+            "pss": 1024,
+            "rss": 2048,
+            "uss": 1024,
+            "memory_status": "KNOWN",
+            "child_inventory_complete": true
+          }
+        ],
+        "inventory_complete": true,
+        "memory_complete": true,
+        "full_sample_memory_known": false,
+        "memory_scope": "discovered live identities; explicitly confirmed exited births excluded, never measured as zero"
+      },
+      "errors": [],
+      "exits": [
+        {
+          "epoch": 1794079363.4421854,
+          "pid": 200,
+          "start_ticks": "2000",
+          "retired_from_live_sample": true,
+          "child_inventory_complete": true,
+          "observed_task_ids": [
+            200
+          ],
+          "memory_values": null,
+          "original_memory_error": {
+            "epoch": 1794079363.442173,
+            "pid": 200,
+            "start_ticks": "2000",
+            "operation": "read-smaps-rollup",
+            "path": "/proc/200/smaps_rollup",
+            "errno": 3,
+            "exception_type": "ProcessLookupError",
+            "error": "ProcessLookupError(3, 'fixture exited')",
+            "critical": false
+          },
+          "confirmed": true,
+          "classification": "RECORDED_BIRTH_EXITED_SINGLE_TASK_ZOMBIE",
+          "observed_state": "Z",
+          "rechecked_task_ids": [
+            200
+          ],
+          "recheck_path": "/proc/200/stat",
+          "recheck_epoch": 1794079363.4421847
+        }
+      ],
+      "exception": null,
+      "scope": "OWNED_FAKE_PROC_NOT_MEASURED_MEMORY"
+    },
+    {
+      "case": "zombie_threads",
+      "pass": true,
+      "result": {
+        "processes": [
+          {
+            "pid": 100,
+            "start_ticks": "1000",
+            "state": "S",
+            "parent_pid": 1,
+            "pss": 1024,
+            "rss": 2048,
+            "uss": 1024,
+            "memory_status": "KNOWN",
+            "child_inventory_complete": true
+          },
+          {
+            "pid": 200,
+            "start_ticks": "2000",
+            "state": "S",
+            "parent_pid": 1,
+            "pss": null,
+            "rss": null,
+            "uss": null,
+            "memory_status": "UNKNOWN_LIVE",
+            "child_inventory_complete": true
+          },
+          {
+            "pid": 300,
+            "start_ticks": "3000",
+            "state": "S",
+            "parent_pid": 1,
+            "pss": 1024,
+            "rss": 2048,
+            "uss": 1024,
+            "memory_status": "KNOWN",
+            "child_inventory_complete": true
+          }
+        ],
+        "inventory_complete": true,
+        "memory_complete": false,
+        "full_sample_memory_known": false,
+        "memory_scope": "discovered live identities; explicitly confirmed exited births excluded, never measured as zero"
+      },
+      "errors": [
+        {
+          "epoch": 1794079363.4422731,
+          "pid": 200,
+          "start_ticks": "2000",
+          "operation": "read-smaps-rollup",
+          "path": "/proc/200/smaps_rollup",
+          "errno": 3,
+          "exception_type": "ProcessLookupError",
+          "error": "ProcessLookupError(3, 'fixture exited')",
+          "critical": false,
+          "classification": "SAME_BIRTH_STILL_PRESENT_OR_LIVE_THREADS",
+          "recheck": {
+            "confirmed": false,
+            "classification": "SAME_BIRTH_STILL_PRESENT_OR_LIVE_THREADS",
+            "observed_state": "Z",
+            "recheck_path": "/proc/200/stat",
+            "recheck_epoch": 1794079363.4422793
+          }
+        }
+      ],
+      "exits": [],
+      "exception": null,
+      "scope": "OWNED_FAKE_PROC_NOT_MEASURED_MEMORY"
+    },
+    {
+      "case": "EACCES",
+      "pass": true,
+      "result": {
+        "processes": [
+          {
+            "pid": 100,
+            "start_ticks": "1000",
+            "state": "S",
+            "parent_pid": 1,
+            "pss": 1024,
+            "rss": 2048,
+            "uss": 1024,
+            "memory_status": "KNOWN",
+            "child_inventory_complete": true
+          },
+          {
+            "pid": 200,
+            "start_ticks": "2000",
+            "state": "S",
+            "parent_pid": 1,
+            "pss": null,
+            "rss": null,
+            "uss": null,
+            "memory_status": "UNKNOWN_LIVE",
+            "child_inventory_complete": true
+          },
+          {
+            "pid": 300,
+            "start_ticks": "3000",
+            "state": "S",
+            "parent_pid": 1,
+            "pss": 1024,
+            "rss": 2048,
+            "uss": 1024,
+            "memory_status": "KNOWN",
+            "child_inventory_complete": true
+          }
+        ],
+        "inventory_complete": true,
+        "memory_complete": false,
+        "full_sample_memory_known": false,
+        "memory_scope": "discovered live identities; explicitly confirmed exited births excluded, never measured as zero"
+      },
+      "errors": [
+        {
+          "epoch": 1794079363.4423547,
+          "pid": 200,
+          "start_ticks": "2000",
+          "operation": "read-smaps-rollup",
+          "path": "/proc/200/smaps_rollup",
+          "errno": 13,
+          "exception_type": "PermissionError",
+          "error": "PermissionError(13, 'fixture deny')",
+          "critical": false,
+          "classification": "LIVE_MEMORY_INACCESSIBLE"
+        }
+      ],
+      "exits": [],
+      "exception": null,
+      "scope": "OWNED_FAKE_PROC_NOT_MEASURED_MEMORY"
+    },
+    {
+      "case": "EIO",
+      "pass": true,
+      "result": null,
+      "errors": [
+        {
+          "epoch": 1794079363.4424334,
+          "pid": 200,
+          "start_ticks": "2000",
+          "operation": "read-parse-smaps-rollup",
+          "path": "/proc/200/smaps_rollup",
+          "errno": 5,
+          "exception_type": "OSError",
+          "error": "OSError(5, 'fixture IO')",
+          "critical": true
+        }
+      ],
+      "exits": [],
+      "exception": "OSError(5, 'fixture IO')",
+      "scope": "OWNED_FAKE_PROC_NOT_MEASURED_MEMORY"
+    },
+    {
+      "case": "statpermission",
+      "pass": true,
+      "result": null,
+      "errors": [
+        {
+          "epoch": 1794079363.4424853,
+          "pid": 200,
+          "start_ticks": null,
+          "operation": "read-parse-proc-stat",
+          "path": "/proc/200/stat",
+          "errno": 13,
+          "exception_type": "PermissionError",
+          "error": "PermissionError(13, 'fixture stat')",
+          "critical": true
+        }
+      ],
+      "exits": [],
+      "exception": "PermissionError(13, 'fixture stat')",
+      "scope": "OWNED_FAKE_PROC_NOT_MEASURED_MEMORY"
+    },
+    {
+      "case": "no_observed_birth",
+      "pass": true,
+      "result": {
+        "processes": [
+          {
+            "pid": 100,
+            "start_ticks": "1000",
+            "state": "S",
+            "parent_pid": 1,
+            "pss": 1024,
+            "rss": 2048,
+            "uss": 1024,
+            "memory_status": "KNOWN",
+            "child_inventory_complete": true
+          },
+          {
+            "pid": 200,
+            "start_ticks": null,
+            "pss": null,
+            "rss": null,
+            "uss": null,
+            "memory_status": "UNKNOWN_IDENTITY"
+          }
+        ],
+        "inventory_complete": false,
+        "memory_complete": false,
+        "full_sample_memory_known": false,
+        "memory_scope": "discovered live identities; explicitly confirmed exited births excluded, never measured as zero"
+      },
+      "errors": [
+        {
+          "epoch": 1794079363.4425354,
+          "pid": 200,
+          "start_ticks": null,
+          "operation": "read-proc-stat",
+          "path": "/proc/200/stat",
+          "errno": 2,
+          "exception_type": "FileNotFoundError",
+          "error": "FileNotFoundError(2, 'fixture gone before identity')",
+          "critical": false,
+          "classification": "NO_OBSERVED_BIRTH_FOR_DISCOVERED_PID"
+        }
+      ],
+      "exits": [],
+      "exception": null,
+      "scope": "OWNED_FAKE_PROC_NOT_MEASURED_MEMORY"
+    }
+  ],
+  "owned_child_cases": [
+    {
+      "mode": "normal",
+      "status": "CLI_SUCCESS_POSTCHECK_PASS_PENDING_EXTERNAL_AUDIT",
+      "CLI_pid": 407355,
+      "one_child_reaped": true,
+      "post_after_same_child": true,
+      "exit_receipt_fsync_observed": false,
+      "critical_count": 0,
+      "scope": "OWNED_SHORT_CPU_CHILD_ONLY_NO_MODEL_OR_PEAK_CLAIM"
+    },
+    {
+      "mode": "confirmed_exit",
+      "status": "CLI_SUCCESS_POSTCHECK_PASS_PENDING_EXTERNAL_AUDIT",
+      "CLI_pid": 407473,
+      "one_child_reaped": true,
+      "post_after_same_child": true,
+      "exit_receipt_fsync_observed": true,
+      "critical_count": 0,
+      "scope": "OWNED_SHORT_CPU_CHILD_ONLY_NO_MODEL_OR_PEAK_CLAIM"
+    },
+    {
+      "mode": "live_EACCES",
+      "status": "FAIL",
+      "CLI_pid": 407614,
+      "one_child_reaped": true,
+      "post_after_same_child": true,
+      "exit_receipt_fsync_observed": false,
+      "critical_count": 0,
+      "scope": "OWNED_SHORT_CPU_CHILD_ONLY_NO_MODEL_OR_PEAK_CLAIM"
+    },
+    {
+      "mode": "EIO",
+      "status": "FAIL",
+      "CLI_pid": 407739,
+      "one_child_reaped": true,
+      "post_after_same_child": true,
+      "exit_receipt_fsync_observed": false,
+      "critical_count": 1,
+      "scope": "OWNED_SHORT_CPU_CHILD_ONLY_NO_MODEL_OR_PEAK_CLAIM"
+    },
+    {
+      "mode": "exit_fsync",
+      "status": "FAIL",
+      "CLI_pid": 407856,
+      "one_child_reaped": true,
+      "post_after_same_child": true,
+      "exit_receipt_fsync_observed": true,
+      "critical_count": 1,
+      "scope": "OWNED_SHORT_CPU_CHILD_ONLY_NO_MODEL_OR_PEAK_CLAIM"
+    }
+  ],
+  "candidate_sha256": "133fac01012a5197a66a3fa2260e363c95e45b25a4eb61d808b24f39e000a651",
+  "new_candidate_only": true,
+  "currentcase_not_changed": true,
+  "model_imports": 0,
+  "NPU": 0,
+  "payload": 0,
+  "own_pid": 407239,
+  "own_starttick": "107928519"
+}

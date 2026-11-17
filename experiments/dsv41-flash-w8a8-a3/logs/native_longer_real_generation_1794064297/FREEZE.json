@@ -1,0 +1,16 @@
+{
+  "status": "FINAL/SEALED/PARK",
+  "case_outcome": "NOT_ACCEPTED_OUTER_MONITOR_FAILURE",
+  "native_job": "task_20261107_231342_350351328582",
+  "native_exit_code": 1,
+  "CLI_exit_code": 0,
+  "audit_passed": 281,
+  "audit_unmet": 2,
+  "artifact_count": 36,
+  "artifact_manifest_sha256": "4ec4ebed3a0a0412970fa12bb880742a404044846b4a28637a06092abf18f3c0",
+  "source45_sha256": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "independent_audit_manifest_sha256": "3a442d9c6e9671b1c362de1a9a8b056b02e5adaa86203763f62ad33a6b6081c4",
+  "no_source_changes": true,
+  "all_own_jobs_terminal": true,
+  "end_epoch": 1794069415
+}

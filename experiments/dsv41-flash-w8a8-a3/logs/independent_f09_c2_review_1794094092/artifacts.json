@@ -1,0 +1,23 @@
+{
+  "EXECUTION_CONTRACT.md": "512dd5e3e70d90aec5415ad499d423cb1d9813e74aef88c0af4521bf87adfb7a",
+  "OWNERSHIP.json": "85e1d70c6d324f3a56185b4a90c56cbad7ac22f42afe2c77c7fda06332afb261",
+  "PARK.json": "4aea3c4a8273e18adb5b07213ecbcca38e26c109630bae5fbbd42f65fec3bc0c",
+  "REPORT.md": "6af10dda9da5e940f3daef87c696ec36b7ffbf4de3baac1082c7873f3cabc1df",
+  "ROOT_WRAPPER_CONTRACT.md": "6c9aa6787fc6e6c380cb5d46a94a2741448f284b1d061ad16ccf6f43180971b5",
+  "SOURCE_FREEZE.json": "75f3011dad42d74241b855906fe563b5d3dcfdf630e4b4618feb786146d2d736",
+  "check_prequeue.py": "04ee73adaf272c344698245ca458efe12f49c86ab22085026d0d985efdf344ba",
+  "cpu_task_receipt.json": "6af0e834946c0b811b23dd4d3620f30f6fb775022d6a360af059cc7ef962eec9",
+  "false_cpu_parent.json": "06dd34d1f266ad27b399a26838d5daa9457bb5fea689962c9a864b05d69536a9",
+  "false_cpu_stderr.txt": "1a0a5f915ab725614e684ad36d98f0f10081be0272f6856a383862b03b70a765",
+  "false_native_parent.json": "1c9d5c444f3e0eaa05e2d8831d2eaf76698a79ccc2ea330553e421044bd0aa3a",
+  "false_native_stderr.txt": "1a0a5f915ab725614e684ad36d98f0f10081be0272f6856a383862b03b70a765",
+  "measured_start_epoch.txt": "8b3225555a3286335f41efb59361f346a07ec1a460a1218f23a31cb7b7946ebb",
+  "prequeue_stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "prequeue_stdout.txt": "4c954dfe9cb5f8003a2fb5ebee91e0e897b067a00c176d502f41d75d830bd412",
+  "registry_source_review.json": "41408a64c33e251dd4285c8c4b334f8a627a07f475706b5cfea1920b32376f76",
+  "result.json": "abf9e67b568dee9dca3138c7cdf9e68f1b0a46f05ca2083e2e21890a59f9816a",
+  "source_phase_manifest.json": "71de5d8931413a512a9d8bfd7055156e7f899c087568024b99a9721e359006e6",
+  "source_review_result.json": "889b3d8db668c2f32fb49e2c15043a9f5e7af9adbed5b8bd5859e4bc3c932b7a",
+  "task70_source_excerpt.txt": "ac8855ed050a025ac474583d3cb467081324da597ef0abd8627ad2d1f9bc562f",
+  "work_record.json": "7c56a81d2a3153dbd37895624f5fded4dd8d263adf63eafe82666c3632fe8270"
+}

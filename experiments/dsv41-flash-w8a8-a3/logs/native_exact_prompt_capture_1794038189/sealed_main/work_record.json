@@ -1,0 +1,10 @@
+{
+  "record_id": "main-generation-entry-1794035858-1794036675",
+  "agent": "/root/main_native",
+  "start_epoch": 1794035858,
+  "end_epoch": 1794036675,
+  "elapsed_wall_seconds": 817,
+  "basis": "actual unit start through applied-source CPU checks/review/ledger/freeze, includes queue/review wall",
+  "status": "PARKED",
+  "workers": 0
+}

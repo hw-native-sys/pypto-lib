@@ -1,0 +1,11 @@
+{
+  "command": [
+    "task-submit",
+    "--status",
+    "task_20261107_142329_327923712677"
+  ],
+  "returncode": 0,
+  "stdout": "completed (exit=0)\n",
+  "stderr": "",
+  "time": 1794033349
+}

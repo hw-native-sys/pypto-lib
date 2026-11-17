@@ -1,0 +1,28 @@
+{
+  "status": "READY_SOURCE_RESOURCES_ONLY_NO_NATIVE_AUTHORITY",
+  "requested_role": "old-physical",
+  "profile": {
+    "origin_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/build/count_old_physical",
+    "manifest": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/count_old_physical_files.json",
+    "manifest_sha256": "1c09c6ced987a6ed53cdb8036a8ed6cc8d4c6d78c9d1df3a7278db21b7f29c53",
+    "metadata_sha256": "7ec1d89d657653d9bf2ec179f75cc8421dc05477771e5dee2af088d3554972a8",
+    "source_manifest": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31"
+  },
+  "pins_sha256": "608fb407d2aef7944b5190ebaa2afdfeb125785a1fa2efeb3fd59c01cd9e722c",
+  "prequeue_sha256": "53e695ae03656bb821f9ce5a737d8a70f1ad29e3e01ee347aed451b2578f0029",
+  "wrapper_sha256": "e76b9984db86a27c3c1b4ebd32ab7de97af91357af4c6784746e5e9a3ade0ffa",
+  "logical_expected": [
+    192,
+    96,
+    192
+  ],
+  "planned_old": [
+    192,
+    192,
+    192
+  ],
+  "specific_middle_reject_required": true,
+  "native_authorized": false,
+  "valid_grants": 0,
+  "work_exists": false
+}

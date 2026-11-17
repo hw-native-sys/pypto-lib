@@ -1,0 +1,9 @@
+{
+  "status": "FINAL_READY_PARK",
+  "files": 10,
+  "artifacts_sha256": "50d30b39aca87a159a55ff6a6d1763416cf9101f83e3fe1adf775b5161b15b06",
+  "pins_sha256": "6de71ae70f5fdbf849abebb05cbbdcacaa016cfad22cb38bd5ff8e36e2e9829d",
+  "prequeue_sha256": "73765b3f9d077048c4526f3564187881d7f7795a53a8f5e7253ad4b3ae5335de",
+  "native16_authorized": false,
+  "shared_writes": 0
+}

@@ -1,0 +1,10 @@
+{
+  "role": "candidate",
+  "started_epoch": 1794074952.638587,
+  "status": "RUN_RETURNED",
+  "passed": true,
+  "error": null,
+  "execution_time": null,
+  "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/cpu_injections/missing_comparator",
+  "ended_epoch": 1794074952.6544256
+}

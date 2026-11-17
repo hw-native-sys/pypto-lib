@@ -1,0 +1,15 @@
+{
+  "M01_math_baseline_UNAPPLIED.json": "eb90ea56e26d0cb97dd12d330559c2ae1b53f4ae5cbf866cc01bfbbb150fecf2",
+  "M02_producer_UNAPPLIED.json": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "OWNERSHIP.md": "0065104f29cb7bfba580dfbd165f398c85d7cf6771ad27bc22da80348983c6b3",
+  "PARK.json": "182fccc5b4b299da81d27e36e646338771f4e77c1b0b425e8956505c7c225e06",
+  "REPORT.md": "13360758d3ea089d02aa25b33a44d8de33369c4bcc13c2c8bfaf605c74e8325c",
+  "check_lineage.py": "88f875270fb97c0b39d3ca1dc523f9f5e8b289fea60f4b5dd07e6e8bf1864610",
+  "cpu_queue.log": "724064e183940be43610b3bff9b526259d2557fd07616f1ff8532bc3bf4a172c",
+  "generate_baseline_literal_UNAPPLIED.patch": "e5f740cef48c32df63ae791cd96e7eb0dd39fcc138c4a3a15004b9980f15e4f0",
+  "metadata_rebind_recipe_UNAPPLIED.json": "ece027003c7f345c8a35adc57a2820072d6027c19539d27927c70100a67cfe58",
+  "results.json": "114d1d119ea3d1cc1c68a05c65330fbf143902d606c1ca9f37e074e1df482d84",
+  "seal.py": "b59287e4761395bde9237e4ea5334ac1b1508473a401e8196ccc5ab27165d721",
+  "source45_live_b3e.json": "b3e19fd001c74f7a5b497c791c01924ca09c0678df66114fce599e890d8fee06",
+  "work_record.json": "89f82d334fb4da08d3b8b4560201e24468de17a8b82379f974a8cccc49c38dd2"
+}

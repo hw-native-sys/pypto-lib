@@ -1,0 +1,105 @@
+def confirm_observed_exit(identity, observed_task_ids):
+    """Confirm retirement of this recorded birth; ESRCH alone is not proof."""
+    pid=identity['pid'];path=Path(f'/proc/{pid}/stat')
+    try:
+        stat=path.read_text().rsplit(')',1)[1].split()
+    except (FileNotFoundError,ProcessLookupError):
+        return {'confirmed':True,'classification':'RECORDED_BIRTH_NO_LONGER_PRESENT','recheck_path':str(path),'recheck_epoch':time.time()}
+    current={'pid':pid,'start_ticks':stat[19],'state':stat[0]}
+    if current['start_ticks']!=identity['start_ticks']:
+        return {'confirmed':True,'classification':'RECORDED_BIRTH_REPLACED','replacement_start_ticks':current['start_ticks'],
+                'recheck_path':str(path),'recheck_epoch':time.time(),'replacement_memory_read':False}
+    if current['state'] in ('Z','X') and observed_task_ids==[pid]:
+        # A zombie group leader can coexist with live threads. Require the sole
+        # leader in BOTH inventories before treating this birth as fully exited.
+        task_path=Path(f'/proc/{pid}/task')
+        try:current_tasks=sorted(int(p.name) for p in task_path.iterdir())
+        except (FileNotFoundError,ProcessLookupError):
+            try:again=path.read_text().rsplit(')',1)[1].split()
+            except (FileNotFoundError,ProcessLookupError):
+                return {'confirmed':True,'classification':'RECORDED_BIRTH_NO_LONGER_PRESENT','recheck_path':str(path),'recheck_epoch':time.time()}
+            if again[19]!=identity['start_ticks']:
+                return {'confirmed':True,'classification':'RECORDED_BIRTH_REPLACED','replacement_start_ticks':again[19],
+                        'recheck_path':str(path),'recheck_epoch':time.time(),'replacement_memory_read':False}
+            return {'confirmed':False,'classification':'SAME_BIRTH_TASK_INVENTORY_UNKNOWN','recheck_epoch':time.time()}
+        if current_tasks==[pid]:
+            return {'confirmed':True,'classification':'RECORDED_BIRTH_EXITED_SINGLE_TASK_ZOMBIE','observed_state':current['state'],
+                    'rechecked_task_ids':current_tasks,'recheck_path':str(path),'recheck_epoch':time.time()}
+    return {'confirmed':False,'classification':'SAME_BIRTH_STILL_PRESENT_OR_LIVE_THREADS','observed_state':current['state'],
+            'recheck_path':str(path),'recheck_epoch':time.time()}
+
+
+def process_tree(pid,report_error,report_exit):
+    pending=[pid];rows=[];seen=set();inventory_complete=True;memory_complete=True
+    while pending:
+        current=pending.pop()
+        if current in seen:continue
+        seen.add(current)
+        identity={'pid':current,'start_ticks':None,'pss':None,'rss':None,'uss':None,'memory_status':'UNKNOWN_IDENTITY'}
+        path=Path(f'/proc/{current}/stat')
+        try:
+            stat=path.read_text().rsplit(')',1)[1].split()
+            identity={'pid':current,'start_ticks':stat[19],'state':stat[0],'parent_pid':int(stat[1]),
+                      'pss':None,'rss':None,'uss':None,'memory_status':'UNKNOWN_LIVE'}
+        except (FileNotFoundError,ProcessLookupError) as exc:
+            row=observation_error(current,identity,'read-proc-stat',path,exc,False)
+            row['classification']='NO_OBSERVED_BIRTH_FOR_DISCOVERED_PID';report_error(row)
+            rows.append(identity);inventory_complete=False;memory_complete=False;continue
+        except (OSError,ValueError,IndexError) as exc:
+            report_error(observation_error(current,identity,'read-parse-proc-stat',path,exc,True));raise
+        # Finish child discovery while the identity is observable, BEFORE the
+        # memory read. Discovered children stay queued if this birth then exits.
+        child_complete=True;task_ids=[]
+        path=Path(f'/proc/{current}/task')
+        try:
+            tasks=list(path.iterdir());task_ids=sorted(int(p.name) for p in tasks)
+        except (FileNotFoundError,ProcessLookupError) as exc:
+            row=observation_error(current,identity,'enumerate-thread-tasks',path,exc,False)
+            row['classification']='CHILD_INVENTORY_UNKNOWN_BEFORE_RETIREMENT';report_error(row)
+            inventory_complete=False;child_complete=False;tasks=[]
+        except OSError as exc:
+            report_error(observation_error(current,identity,'enumerate-thread-tasks',path,exc,True));raise
+        for task in tasks:
+            path=task/'children'
+            try:pending.extend(int(v) for v in path.read_text().split())
+            except (FileNotFoundError,ProcessLookupError) as exc:
+                row=observation_error(current,identity,'read-thread-children',path,exc,False)
+                row['classification']='CHILD_INVENTORY_UNKNOWN_BEFORE_RETIREMENT';report_error(row)
+                inventory_complete=False;child_complete=False
+            except (OSError,ValueError) as exc:
+                report_error(observation_error(current,identity,'read-parse-thread-children',path,exc,True));raise
+        identity['child_inventory_complete']=child_complete
+        path=Path(f'/proc/{current}/smaps_rollup')
+        try:
+            values={line.split(':')[0]:int(line.split()[1])*1024 for line in path.read_text().splitlines()
+                    if ':' in line and len(line.split())>1 and line.split()[1].isdigit()}
+            if not all(key in values for key in ('Pss','Rss','Private_Clean','Private_Dirty')):
+                raise ValueError('incomplete smaps_rollup fields')
+            identity.update(pss=values['Pss'],rss=values['Rss'],uss=sum(values.get(key,0) for key in ('Private_Clean','Private_Dirty','Private_Hugetlb')),memory_status='KNOWN')
+        except (FileNotFoundError,ProcessLookupError) as exc:
+            original=observation_error(current,identity,'read-smaps-rollup',path,exc,False)
+            try:proof=confirm_observed_exit(identity,task_ids if child_complete else None)
+            except (OSError,ValueError,IndexError) as recheck_error:
+                original['classification']='EXIT_RECHECK_FAILED';report_error(original)
+                report_error(observation_error(current,identity,'recheck-recorded-birth-after-memory-race',Path(f'/proc/{current}/stat'),recheck_error,True));raise
+            if proof['confirmed']:
+                exit_record={'epoch':time.time(),'pid':current,'start_ticks':identity['start_ticks'],
+                             'retired_from_live_sample':child_complete,'child_inventory_complete':child_complete,
+                             'observed_task_ids':task_ids,'memory_values':None,'original_memory_error':original,**proof}
+                report_exit(exit_record)
+                identity.update(memory_status='CONFIRMED_EXIT' if child_complete else 'EXIT_WITH_UNKNOWN_SUBTREE',exit_classification=proof['classification'])
+                if not child_complete:memory_complete=False
+            else:
+                original.update(classification=proof['classification'],recheck=proof);report_error(original);memory_complete=False
+        except PermissionError as exc:
+            # A permission denial is never converted into a successful exit,
+            # even if this process happens to exit later.
+            row=observation_error(current,identity,'read-smaps-rollup',path,exc,False)
+            row['classification']='LIVE_MEMORY_INACCESSIBLE';report_error(row);memory_complete=False
+        except (OSError,ValueError) as exc:
+            report_error(observation_error(current,identity,'read-parse-smaps-rollup',path,exc,True));raise
+        rows.append(identity)
+    live_complete=memory_complete and inventory_complete
+    return {'processes':rows,'inventory_complete':inventory_complete,'memory_complete':live_complete,
+            'full_sample_memory_known':live_complete and all(row['memory_status']=='KNOWN' for row in rows),
+            'memory_scope':'discovered live identities; explicitly confirmed exited births excluded, never measured as zero'}

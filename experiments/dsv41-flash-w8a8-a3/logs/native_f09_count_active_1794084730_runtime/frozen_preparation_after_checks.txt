@@ -1,0 +1,13 @@
+COMMANDS.md: OK
+GO_TEMPLATES.json: OK
+INITIAL_PREREQUISITE_STOP.md: OK
+PARK.json: OK
+REPORT.md: OK
+case.py: OK
+initial_prerequisite_key_evidence.txt: OK
+initial_prerequisite_pins.sha256: OK
+launch.py: OK
+measured_start_epoch.txt: OK
+pins.json: OK
+prequeue.json: OK
+work_record.json: OK

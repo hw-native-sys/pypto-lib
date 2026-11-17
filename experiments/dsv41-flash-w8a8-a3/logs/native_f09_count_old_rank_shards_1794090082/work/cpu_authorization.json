@@ -1,0 +1,54 @@
+{
+  "schema": "Root-F09-active-S/1",
+  "approved": true,
+  "operation": "bounded-synthetic-active-S-B2-3call",
+  "stage": "count-validate",
+  "kind": "ACTUAL_F09_CPU_REFERENCE",
+  "source_manifest_sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "scenario_sha256": "c7b6ab942f5ea17758389aa5a53dafbb1de79e68dbb6f41c4614d66dd6b6dbb1",
+  "route_sha256": "c53c5fd537ecc1bfbf8e228cf691107fda2fb1748dfcb9e5aa09a0d9a3915d43",
+  "lifecycle_root_receipt_sha256": "e76b9984db86a27c3c1b4ebd32ab7de97af91357af4c6784746e5e9a3ade0ffa",
+  "execution_mode": "ONBOARD",
+  "minimum_bytes": {
+    "HOST": 322122547200,
+    "DISK": 17179869184,
+    "SHM": 34359738368
+  },
+  "public_hbm_reserve": 9668944960,
+  "compiled_source_manifest_sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "compiled_file_manifest": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/count_old_physical_files.json",
+  "compiled_file_manifest_sha256": "1c09c6ced987a6ed53cdb8036a8ed6cc8d4c6d78c9d1df3a7278db21b7f29c53",
+  "compiled_metadata_sha256": "7ec1d89d657653d9bf2ec179f75cc8421dc05477771e5dee2af088d3554972a8",
+  "probe_source_sha256": "02879526d209c2f7a4c8ff664bc30201ff23d6cfdd7d124ff315ef8505a86e04",
+  "requested_probe_kind": "old-physical",
+  "root_go_id": "observer-20261108-f09-old-physical-count-control-offline",
+  "delegation_sha256": "0c7f6e31a881c4a93fe89bfa4f4fe03da186fc24367c5cfe9a43bf3d01d9580b",
+  "prepared_case_pins_sha256": "608fb407d2aef7944b5190ebaa2afdfeb125785a1fa2efeb3fd59c01cd9e722c",
+  "communication_epoch_each_dispatch": 1,
+  "scenario_call_indices": [
+    0,
+    1,
+    2
+  ],
+  "planned_count_totals": [
+    192,
+    192,
+    192
+  ],
+  "logical_active_expected_totals": [
+    192,
+    96,
+    192
+  ],
+  "required_middle_specific_numeric_reject": true,
+  "ring_heap": [
+    0,
+    0,
+    4294967296,
+    0
+  ],
+  "expert_layers": 1,
+  "scope": "COUNT-OLD-PHYSICAL CONTROL ONLY; no count-active/full-capture/full-reference authority",
+  "expires_at_epoch": 1794090680.7837393,
+  "native_task_id": "task_20261108_062438_17376705030"
+}

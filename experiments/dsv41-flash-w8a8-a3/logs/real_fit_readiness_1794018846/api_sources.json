@@ -1,0 +1,9 @@
+{
+  "models/deepseek_v4_1_flash_a3_w8a8/utils.py": "96817adec5584eeab2940dab0faf42078fc257995021899e6dbe9e55e00c36d3",
+  "models/deepseek_v4_1_flash_a3_w8a8/generate.py": "26b6db8451afa4488bff71699b94b7ffcf86abcec08e2919912e388fa904c8fd",
+  "models/deepseek_v4_1_flash_a3_w8a8/weight_loader.py": "70244d047e4705dfe5f7101c5dc046b6f66d146027241524bb4d494823fcfe5f",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto/python/pypto/runtime/distributed_runner.py": "ca496829a240c81df3c29e77d8ef696bd1e2a7b0f31b9d5c2dcb3b3d82923148",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto/python/pypto/runtime/runner.py": "b282e63422d4e6d3821fcd88ea207a23bf81c2fc7bd6a6634d1bd9dc40b7f295",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto/runtime/simpler_setup/torch_interop.py": "e916a20fe8359c56541508ac21a45667db85cb2cd25731efc76a3b39c0ae25ef",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto/runtime/src/common/worker/run_resource_arena.h": "875b60f4adf0e0ad1042dab1a5d2a678b936fa35b8beaa59ddbbf02ed46556d8"
+}

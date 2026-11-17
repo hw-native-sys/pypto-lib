@@ -1,0 +1,9 @@
+{
+  "record_id": "review-leaf-c2-1794016031-1794017097",
+  "agent": "review-agent",
+  "start_epoch": 1794016031,
+  "end_epoch": 1794017097,
+  "elapsed_seconds": 1066,
+  "scope": "read-only preparatory review; not integrated acceptance",
+  "evidence": "experiments/dsv41-flash-w8a8-a3/logs/native_review_leaf_c2_1794016031/REVIEW.md"
+}

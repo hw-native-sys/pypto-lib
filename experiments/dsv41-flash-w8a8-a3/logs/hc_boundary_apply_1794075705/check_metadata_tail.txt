@@ -1,0 +1,63 @@
+# Actual applied 3-file delta; no model source exception beyond existing generate-only rule.
+import os
+import sys
+os.environ['DEEPSEEK_PER_LAYER_EXPERTS']='1'
+sys.path.insert(0,str(MODEL))
+import generate as g
+from types import SimpleNamespace
+try:g.FirstRealGenerationAdmission(SimpleNamespace(first_real_generation_authorization=None,allow_full_materialize=True))
+except g.ContractGap as error:assert error.topic=='host-materialization-overlap'
+else:raise AssertionError('default HARD lost')
+actual=json.loads((HERE/'source45.json').read_text());before=json.loads((HERE/'source45_predecessor_b3e.json').read_text())
+changed={n for n in actual if actual[n]!=before[n]};assert changed=={str((MODEL/n).relative_to(REPO)) for n in ('hc.py','layer_reference.py','generate.py')}
+assert actual[str((MODEL/'hc.py').relative_to(REPO))]=='c6111634f78d53ad0cb4196a533a2d89097d4cfa0859688382c0072b60840885'
+assert actual[str((MODEL/'layer_reference.py').relative_to(REPO))]=='c382bc7131c4bfd3f159d291c99de7e0d9f3368e5b25e1c3515b96f825dedda0'
+assert actual[str((MODEL/'generate.py').relative_to(REPO))]=='f7b772cfa62ea38ebc9228e0230b770d8cf29a76527071cfe75b0c2bd5035e76'
+LOGS=HERE.parent
+oldpath=LOGS/'full_real_generation_prepare_1794048884/metadata_plan.json';assert sha(oldpath)=='3dd67b88683d0de1f5fbd8e889c0c1a875eeecf671263fca4c64061637ecd9c0'
+oldplan=json.loads(oldpath.read_text());m01=json.loads((HERE/'M01_math_baseline.json').read_text());m01sha=sha(HERE/'M01_math_baseline.json');assert m01sha=='eb90ea56e26d0cb97dd12d330559c2ae1b53f4ae5cbf866cc01bfbbb150fecf2'
+NATIVE=LOGS/'native_hc_durable_receipts_1794075226'
+assert sha(NATIVE/'artifact_manifest.json')=='ba800da431c200dcefebc75179ff9f24e737d612f73691121a97835c18b9a08f'
+assert sha(NATIVE/'audit_result.json')=='92f6e846267526059967806ac931a35322e59c67ce1b98af4bf6cec4343f3e58'
+audit=json.loads((NATIVE/'audit_result.json').read_text());assert audit['passed']==31 and not audit['unmet']
+num={v['role']:v for v in audit['numeric']};assert num['candidate']['actual_vs_original']['different_values']==0 and num['old_control']['actual_vs_original']['different_values']==61440
+assert audit['native_case_status']=='FAILED; no retry'
+lineage={'schema':'HC-math-lineage/1','original_archive_revision':'8fde6d4e335fe300e2b949aab0e31659cce0811d','original_archive_sha256':'48c797546805b04ffde118c506f8902e37e19bf2cb5d1713097056a4c93e998c','original_helper_function_sha256':original_hash,'resource_ancestor_plan_sha256':sha(oldpath),'resource_ancestor_source45':'762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7','math_baseline_M01_sha256':m01sha,'actual_producer_M02_sha256':sha(HERE/'source45.json'),'HC_patch_sha256':sha(HERE/'hc_applied.patch'),'captured_native_proof':{'path':str(NATIVE.relative_to(REPO)),'manifest_sha256':sha(NATIVE/'artifact_manifest.json'),'native_task':'task_20261108_021439_342901924784','native_whole_case_status':'FAILED own TensorSpec expected/output alias; never relabeledPASS','offline_original_audit_task':'task_20261108_021816_343981631498','offline_audit_sha256':sha(NATIVE/'audit_result.json'),'numerical_proof_pins_sha256':sha(NATIVE/'numerical_proof_pins.json'),'offline_passed':31,'offline_unmet':0,'candidate_values':102400,'candidate_diff':0,'old_diff':61440,'old_max_abs':0.00390625,'scope':'synthetic HC BF16 boundary captured values only; no native input snapshots/fullmodel/repetition-causality claim'},'fresh_E40_prefill3_decode1_signature_status':'PENDING; old611D77 not candidate compile','fullreal_shared_quality_status':'UNTESTED; separateRootGO required'}
+canonical=lambda v:hashlib.sha256(json.dumps(v,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+(HERE/'metadata_lineage.json').write_text(json.dumps(lineage,indent=2)+'\n');lineagepin=canonical(lineage)
+newplan=dict(oldplan);newplan['source_manifest_sha256']=m01sha;newplan['source_manifest_files']=m01;newplan['hc_math_lineage']=lineage
+resource_keys=set(oldplan)-{'source_manifest_sha256','source_manifest_files'}
+resource_digest=canonical({k:oldplan[k] for k in resource_keys})
+assert resource_digest=='e13c5fd6d98de327a24427b5efc0a9be4e9c30a89e757ac6c377e73b6ffc10ff'
+def verify_plan(value):
+ if set(value)!=(set(oldplan)|{'hc_math_lineage'}):raise ValueError('metadata rootkeys changed')
+ if any(value[k]!=oldplan[k] for k in resource_keys):raise ValueError('resource projection changed')
+ if canonical(value['hc_math_lineage'])!=lineagepin:raise ValueError('named lineage changed')
+ if value['source_manifest_sha256']!=m01sha or value['source_manifest_files']!=m01:raise ValueError('new math binding changed')
+verify_plan(newplan)
+rejections=[]
+for name,value in [('extra_field',{**newplan,'unknown':1}),('missing_field',{k:v for k,v in newplan.items() if k!='expert_layers'}),('bad_resource',{**newplan,'static_per_rank_bytes':39624816577}),('bad_lineage',{**newplan,'hc_math_lineage':{**lineage,'offline_passed':999}}),('old_plan',oldplan)]:
+ try:verify_plan(value)
+ except ValueError:rejections.append(name)
+ else:raise AssertionError(name+' admitted')
+# The exact current-source guard predicates enforce full45 actual hashes and all44 newmath hashes.
+cls=next(n for n in ast.parse((MODEL/'generate.py').read_text()).body if isinstance(n,ast.ClassDef) and n.name=='FirstRealGenerationAdmission')
+init=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='__init__')
+guards=[n for n in init.body if isinstance(n,ast.If) and any(t in ast.unparse(n) for t in ('reviewed producer base/real40 schema mismatch','new source manifest binding mismatch','new applied product source45 changed'))]
+assert len(guards)==3
+namespace={'ContractGap':g.ContractGap,'self':SimpleNamespace(plan=newplan),'source_files':actual,'expected_paths':newplan['source_manifest_files'],'repo':REPO,'sha':sha,'r':{'source_manifest':HERE/'source45.json','source_manifest_sha256':sha(HERE/'source45.json')}}
+def gate(meta,source):
+ ns={**namespace,'self':SimpleNamespace(plan=meta),'expected_paths':meta['source_manifest_files'],'source_files':source};exec(compile(ast.Module(body=copy.deepcopy(guards),type_ignores=[]),'<APPLIED_GUARDS_NO_CONSTRUCTOR_OR_GRANT>','exec'),ns)
+gate(newplan,actual)
+for name,meta,source in [('old_math',oldplan,actual),('wrong_HC',newplan,{**actual,str((MODEL/'hc.py').relative_to(REPO)):'bad'}),('missing_source',newplan,{k:v for k,v in actual.items() if not k.endswith('/hc.py')})]:
+ try:gate(meta,source)
+ except g.ContractGap:rejections.append(name)
+ else:raise AssertionError(name+' admitted')
+# No resource/header regeneration. One immutable new full-plan copy with named lineage addition.
+temp=HERE/'metadata_plan.json.tmp';temp.write_text(json.dumps(newplan,indent=2)+'\n');temp.replace(HERE/'metadata_plan.json')
+verify_plan(json.loads((HERE/'metadata_plan.json').read_text()))
+binding={'schema':'HC-math-resource-binding/1','new_plan_sha256':sha(HERE/'metadata_plan.json'),'new_plan_bytes':(HERE/'metadata_plan.json').stat().st_size,'old_plan_sha256':sha(oldpath),'resource_key_rule':'EXACT old root-key projection minus source_manifest_sha256 and source_manifest_files','resource_keys':sorted(resource_keys),'resource_canonical_sha256':resource_digest,'only_allowed_added_root_key':'hc_math_lineage','lineage_canonical_sha256':lineagepin,'lineage_file_sha256':sha(HERE/'metadata_lineage.json'),'actual_source45_sha256':sha(HERE/'source45.json'),'math_baseline_M01_sha256':m01sha,'whole_native_case':'FAILED; offline independentlyoriginal bounded comparison accepted'}
+(HERE/'metadata_binding.json').write_text(json.dumps(binding,indent=2)+'\n')
+verify_live();assert sha(oldpath)==binding['old_plan_sha256']
+result={'status':'PASS_APPLIED_HC_AND_RESOURCE_REBIND_TINY_CPU','actual_source45_sha256':sha(HERE/'source45.json'),'M01_sha256':m01sha,'other42_unchanged':True,'default_HARD':True,'math_original_cases':rows,'actual_functions':FUNCTIONS,'resource_binding':binding,'negative_rejections':rejections,'full_positive_constructor_or_actual_grant':False,'fresh_signatures':'PENDING','compile':False,'NPU':False,'headers_read':0,'real_payload_bytes':0,'fullmodel_fixture':False}
+(HERE/'results.json').write_text(json.dumps(result,indent=2)+'\n');print(json.dumps(result,indent=2))

@@ -1,0 +1,209 @@
+{
+  "host_source_sha256": "7247c4309f2ce528fdd1b9af16a4815e7ebd1839b58417bd92555c8955578932",
+  "generated_submit_callsites": 1,
+  "generated_rank_loops": 1,
+  "replayed_actual_submit_chip_public_callconfig": [
+    {
+      "worker": 0,
+      "cid": 123,
+      "ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ],
+      "tensor_args": 113,
+      "scalar_args": 15
+    },
+    {
+      "worker": 1,
+      "cid": 123,
+      "ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ],
+      "tensor_args": 113,
+      "scalar_args": 15
+    },
+    {
+      "worker": 2,
+      "cid": 123,
+      "ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ],
+      "tensor_args": 113,
+      "scalar_args": 15
+    },
+    {
+      "worker": 3,
+      "cid": 123,
+      "ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ],
+      "tensor_args": 113,
+      "scalar_args": 15
+    },
+    {
+      "worker": 4,
+      "cid": 123,
+      "ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ],
+      "tensor_args": 113,
+      "scalar_args": 15
+    },
+    {
+      "worker": 5,
+      "cid": 123,
+      "ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ],
+      "tensor_args": 113,
+      "scalar_args": 15
+    },
+    {
+      "worker": 6,
+      "cid": 123,
+      "ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ],
+      "tensor_args": 113,
+      "scalar_args": 15
+    },
+    {
+      "worker": 7,
+      "cid": 123,
+      "ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ],
+      "tensor_args": 113,
+      "scalar_args": 15
+    },
+    {
+      "worker": 8,
+      "cid": 123,
+      "ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ],
+      "tensor_args": 113,
+      "scalar_args": 15
+    },
+    {
+      "worker": 9,
+      "cid": 123,
+      "ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ],
+      "tensor_args": 113,
+      "scalar_args": 15
+    },
+    {
+      "worker": 10,
+      "cid": 123,
+      "ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ],
+      "tensor_args": 113,
+      "scalar_args": 15
+    },
+    {
+      "worker": 11,
+      "cid": 123,
+      "ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ],
+      "tensor_args": 113,
+      "scalar_args": 15
+    },
+    {
+      "worker": 12,
+      "cid": 123,
+      "ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ],
+      "tensor_args": 113,
+      "scalar_args": 15
+    },
+    {
+      "worker": 13,
+      "cid": 123,
+      "ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ],
+      "tensor_args": 113,
+      "scalar_args": 15
+    },
+    {
+      "worker": 14,
+      "cid": 123,
+      "ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ],
+      "tensor_args": 113,
+      "scalar_args": 15
+    },
+    {
+      "worker": 15,
+      "cid": 123,
+      "ring_heap": [
+        0,
+        0,
+        4294967296,
+        0
+      ],
+      "tensor_args": 113,
+      "scalar_args": 15
+    }
+  ],
+  "native_runs_per_rank_first_prefix": 1,
+  "no_diagnostic_two_pass": true,
+  "native_bank_selection": "one OnboardNativeRunContext owns one resolved arena bank; graph task scopes use that runtime",
+  "conservative_first_prefix_total_banks": 2,
+  "bank_bound_scope": "one prewarm bank0 plus one execution bank, possibly identical; no second prefix/native call before phase close",
+  "total_heap_bound_all_banks_per_rank_bytes": 10200547328,
+  "extra_heap_beyond_prewarmer_bytes": 5100273664,
+  "existing_extra_reserve_bytes": 8589934592,
+  "npu": false,
+  "numerical_or_retirement_proof": false
+}

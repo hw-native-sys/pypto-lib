@@ -1,0 +1,54 @@
+{
+  "backend": "tensormap_and_ringbuffer",
+  "platform": "a2a3",
+  "mode": "PROGRAM",
+  "library_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/build/lib/a2a3/onboard/tensormap_and_ringbuffer/libhost_runtime.so",
+  "library_sha256": "24434f8879030ef1b1f31e5fc2ecce683e392d4f1baeb5bcee852fb183976e5c",
+  "abi_version": 1,
+  "resource_count": 6,
+  "pipeline_directory_capacity": 4294967295,
+  "resources": [
+    {
+      "kind": 4,
+      "resource_class": 0,
+      "bytes_per_copy": 0
+    },
+    {
+      "kind": 1,
+      "resource_class": 1,
+      "bytes_per_copy": 0
+    },
+    {
+      "kind": 2,
+      "resource_class": 1,
+      "bytes_per_copy": 0
+    },
+    {
+      "kind": 3,
+      "resource_class": 1,
+      "bytes_per_copy": 0
+    },
+    {
+      "kind": 5,
+      "resource_class": 2,
+      "bytes_per_copy": 0
+    },
+    {
+      "kind": 6,
+      "resource_class": 2,
+      "bytes_per_copy": 0
+    }
+  ],
+  "shared_arena_bank": 0,
+  "query_scope": "read-only exported get_pipeline_contract; no init/prepare/device call",
+  "exact_pinned_selector_cases": 504,
+  "actual_168_directory_is_not_168_committed_banks": true,
+  "archived_all_rank_corrected_guard_pass": true,
+  "required_free_after_prewarm": 23344218656,
+  "heap_in_prewarmer_already_charged": true,
+  "prefix_native_calls_per_rank": 1,
+  "decode_native_calls_per_rank": 4,
+  "arena_copies_both_phase_owners": 1,
+  "phase_owners_live_together": false,
+  "no_npu": true
+}

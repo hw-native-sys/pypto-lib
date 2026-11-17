@@ -1,0 +1,5 @@
+{
+  "passed": false,
+  "error": "Output(s) does not match golden: ['pool_counts']\n  'pool_counts' FAIL (ratio_allclose(atol=0, rtol=0, max_error_ratio=0, valid_rows=None, valid_axis=0, zero_tail=False, ignore_nan=False))  shape=(1,) dtype=torch.int32\n    ratio_allclose fail: error_count=1/1 (ratio=100.0000%, allowed<=0.0000%, threshold=0 pts)\n    atol=0 rtol=0\n    max abs diff=1 at (0,) (tol=0)\n    first 1 mismatches:\n    [0] actual=64, expected=65, diff=1, tol=0",
+  "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/cohort_engram_f07_1793957136/worker_cap/negative_build/_jit_prior64_pool_test_20261106_173547_dhowk_a4"
+}

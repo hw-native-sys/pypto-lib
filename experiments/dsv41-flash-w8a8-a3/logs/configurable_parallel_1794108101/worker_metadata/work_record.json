@@ -1,0 +1,20 @@
+{
+  "record_id": "worker-configurable-metadata-1794109140",
+  "role": "worker-agent",
+  "start_epoch": 1794109140.0424032,
+  "end_epoch": 1794110663.0821154,
+  "measured_wall_seconds": 1523.039712190628,
+  "owned_files": "worker_metadata/**",
+  "source_snapshot_sha256": "651580ea4f88a065a91182faa455b361278dc10dd6b739ed499c9f5545dac23d",
+  "CPU_data_task": "task_20261108_114844_12733984717",
+  "exit": 0,
+  "product_edits": 0,
+  "checkpoint_header_payload_bytes": 0,
+  "signature_compiles": 0,
+  "prepare": 0,
+  "NPU": 0,
+  "shared_ledger_writes": 0,
+  "worker_records_imported": 0,
+  "all_jobs_terminal": true,
+  "status": "FINAL_PARK"
+}

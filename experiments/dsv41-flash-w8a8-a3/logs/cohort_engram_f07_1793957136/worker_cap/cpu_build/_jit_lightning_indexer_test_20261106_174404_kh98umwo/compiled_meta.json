@@ -1,0 +1,493 @@
+{
+  "schema": 3,
+  "supported_execution_modes": [
+    "program"
+  ],
+  "params": [
+    {
+      "name": "x",
+      "direction": "In",
+      "shape": [
+        -1,
+        5120
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "qr",
+      "direction": "In",
+      "shape": [
+        -1,
+        1280
+      ],
+      "dtype": "int8",
+      "layout": "ND"
+    },
+    {
+      "name": "qr_scale",
+      "direction": "In",
+      "shape": [
+        -1,
+        1
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "wq_b",
+      "direction": "In",
+      "shape": [
+        1280,
+        4096
+      ],
+      "dtype": "int8",
+      "layout": "NZ"
+    },
+    {
+      "name": "wq_b_scale",
+      "direction": "In",
+      "shape": [
+        4096
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "weights_proj",
+      "direction": "In",
+      "shape": [
+        5120,
+        32
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "wk",
+      "direction": "In",
+      "shape": [
+        128,
+        512
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "k_norm",
+      "direction": "In",
+      "shape": [
+        128
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "latent",
+      "direction": "In",
+      "shape": [
+        -1,
+        512
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "cos",
+      "direction": "In",
+      "shape": [
+        -1,
+        32
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "sin",
+      "direction": "In",
+      "shape": [
+        -1,
+        32
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "compressed_cos",
+      "direction": "In",
+      "shape": [
+        -1,
+        32
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "compressed_sin",
+      "direction": "In",
+      "shape": [
+        -1,
+        32
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "compressed_slots",
+      "direction": "In",
+      "shape": [
+        -1
+      ],
+      "dtype": "int64",
+      "layout": "ND"
+    },
+    {
+      "name": "position_ids",
+      "direction": "In",
+      "shape": [
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "request_ids",
+      "direction": "In",
+      "shape": [
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "compressed_lens",
+      "direction": "In",
+      "shape": [
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "index_cache",
+      "direction": "InOut",
+      "shape": [
+        -1,
+        128,
+        1,
+        128
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "index_block_table",
+      "direction": "In",
+      "shape": [
+        -1,
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "scores",
+      "direction": "Out",
+      "shape": [
+        -1,
+        -1
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "indices",
+      "direction": "Out",
+      "shape": [
+        -1,
+        512
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "values",
+      "direction": "Out",
+      "shape": [
+        -1,
+        512
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "pool_ids",
+      "direction": "Out",
+      "shape": [
+        -1,
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "pool_counts",
+      "direction": "Out",
+      "shape": [
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    }
+  ],
+  "lowered_params": [
+    {
+      "name": "x",
+      "direction": "In",
+      "shape": [
+        -1,
+        5120
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "qr",
+      "direction": "In",
+      "shape": [
+        -1,
+        1280
+      ],
+      "dtype": "int8",
+      "layout": "ND"
+    },
+    {
+      "name": "qr_scale",
+      "direction": "In",
+      "shape": [
+        -1,
+        1
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "wq_b",
+      "direction": "In",
+      "shape": [
+        1,
+        128,
+        80,
+        16,
+        32
+      ],
+      "dtype": "int8",
+      "layout": "NZ"
+    },
+    {
+      "name": "wq_b_scale",
+      "direction": "In",
+      "shape": [
+        4096
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "weights_proj",
+      "direction": "In",
+      "shape": [
+        5120,
+        32
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "wk",
+      "direction": "In",
+      "shape": [
+        128,
+        512
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "k_norm",
+      "direction": "In",
+      "shape": [
+        128
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "latent",
+      "direction": "In",
+      "shape": [
+        -1,
+        512
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "cos",
+      "direction": "In",
+      "shape": [
+        -1,
+        32
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "sin",
+      "direction": "In",
+      "shape": [
+        -1,
+        32
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "compressed_cos",
+      "direction": "In",
+      "shape": [
+        -1,
+        32
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "compressed_sin",
+      "direction": "In",
+      "shape": [
+        -1,
+        32
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "compressed_slots",
+      "direction": "In",
+      "shape": [
+        -1
+      ],
+      "dtype": "int64",
+      "layout": "ND"
+    },
+    {
+      "name": "position_ids",
+      "direction": "In",
+      "shape": [
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "request_ids",
+      "direction": "In",
+      "shape": [
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "compressed_lens",
+      "direction": "In",
+      "shape": [
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "index_cache",
+      "direction": "InOut",
+      "shape": [
+        -1,
+        128,
+        1,
+        128
+      ],
+      "dtype": "bfloat16",
+      "layout": "ND"
+    },
+    {
+      "name": "index_block_table",
+      "direction": "In",
+      "shape": [
+        -1,
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "scores",
+      "direction": "Out",
+      "shape": [
+        -1,
+        -1
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "indices",
+      "direction": "Out",
+      "shape": [
+        -1,
+        512
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "values",
+      "direction": "Out",
+      "shape": [
+        -1,
+        512
+      ],
+      "dtype": "fp32",
+      "layout": "ND"
+    },
+    {
+      "name": "pool_ids",
+      "direction": "Out",
+      "shape": [
+        -1,
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    },
+    {
+      "name": "pool_counts",
+      "direction": "Out",
+      "shape": [
+        -1
+      ],
+      "dtype": "int32",
+      "layout": "ND"
+    }
+  ],
+  "num_return_types": 5,
+  "return_aliases": [
+    19,
+    20,
+    21,
+    22,
+    23
+  ],
+  "platform": "a2a3",
+  "backend_type": "Ascend910"
+}

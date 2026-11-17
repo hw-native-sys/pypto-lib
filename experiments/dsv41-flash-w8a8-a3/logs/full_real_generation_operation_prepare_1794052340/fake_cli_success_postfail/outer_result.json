@@ -1,0 +1,29 @@
+{
+  "started_epoch": 1794052974.6916595,
+  "command": [
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+    "-c",
+    "print(\"CPU_FAKE_ONLY\")"
+  ],
+  "CLI_returncode": 0,
+  "launch_error": null,
+  "postcheck_error": "ValueError('independent postcheck failure')",
+  "CLI_pid": 3507616,
+  "ended_epoch": 1794052974.7618911,
+  "monitor_errors": [],
+  "monitor_thread_alive": false,
+  "known_process_identities": [
+    [
+      3507571,
+      "105289640"
+    ],
+    [
+      3507616,
+      "105289663"
+    ]
+  ],
+  "sample_count": 4,
+  "peak_sampled_own_tree_pss": 14623744,
+  "peak_sampled_own_tree_uss": 10416128,
+  "status": "FAIL"
+}

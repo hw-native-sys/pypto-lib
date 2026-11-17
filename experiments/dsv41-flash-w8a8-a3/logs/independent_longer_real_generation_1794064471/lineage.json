@@ -1,0 +1,9 @@
+{
+  "parent_unit": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_first_real_generation_1794055937",
+  "parent13_sha256": "3e9f22d8dff50cb3de4ed0485e6d3cbd20cf1f7ac2275ea1cbb07723cd508999",
+  "parent_auditor_sha256": "91f779a578bfd1828bc2d5cb02405b32e7a715b2583063dc7a168ba59e665f0c",
+  "new_case": "native_longer_real_generation_1794064297",
+  "root_go_id": "observer-20261107-once-real16-cc15877",
+  "source45": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "scope": "minimalfork finiteauditor; deriveactualEOS-length-history, no actualjob yet"
+}

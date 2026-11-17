@@ -1,0 +1,17 @@
+{
+  "record_id": "main-f09-native-route-1794081950",
+  "role": "main-agent",
+  "start_epoch": 1794081950,
+  "end_epoch": 1794082635.8256183,
+  "elapsed_seconds": 685.8256182670593,
+  "shared_writes": 0,
+  "worker_records_imported": 0,
+  "CPU_tasks": [
+    "task_20261108_041243_14069746504"
+  ],
+  "NPU": false,
+  "compile": false,
+  "prepare": false,
+  "tensor_payload_bytes": 0,
+  "status": "FINAL_PARK_PREPARATION_ONLY"
+}

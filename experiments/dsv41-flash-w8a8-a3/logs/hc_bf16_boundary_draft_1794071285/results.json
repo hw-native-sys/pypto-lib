@@ -1,0 +1,157 @@
+{
+  "status": "PASS",
+  "start_epoch": 1794071769.9670815,
+  "end_epoch": 1794071770.374897,
+  "torch": "2.14.1+cpu",
+  "NPU_execution": false,
+  "compilation": false,
+  "weights_read": false,
+  "functions": [
+    {
+      "path": "experiments/dsv41-flash-w8a8-a3/logs/logic_review_1793929657/upstream_rc2/tests/deepseek_v41_utils.py",
+      "function": "hc_post_reference",
+      "source_sha256": "a51b53d475db02841630c5d00ed18a3c7afb2de526962f0e0e59c7293f25abd5"
+    },
+    {
+      "path": "models/deepseek_v4_1_flash_a3_w8a8/hc.py",
+      "function": "golden_hc_post",
+      "source_sha256": "9c6ec36a2c981f1b24dc1aa22eee7ef7c93b278e595e4ea99920ab1d6160cf1d"
+    },
+    {
+      "path": "experiments/dsv41-flash-w8a8-a3/logs/hc_bf16_boundary_draft_1794071285/proposed/hc.py",
+      "function": "golden_hc_post",
+      "source_sha256": "259b18ccbfbf9f2a19476770412b4da4f90c0959e6f0215b1f92901938c04be8"
+    },
+    {
+      "path": "models/deepseek_v4_1_flash_a3_w8a8/layer_reference.py",
+      "function": "_hc_post_reference",
+      "source_sha256": "af8500f19cc6bdba1b1a2f3d025bf70a0e5551d29ed167684d80227b5ada50f2"
+    },
+    {
+      "path": "experiments/dsv41-flash-w8a8-a3/logs/hc_bf16_boundary_draft_1794071285/proposed/layer_reference.py",
+      "function": "_hc_post_reference",
+      "source_sha256": "1cd63c08e88bc23a6e87283d74eb91dfe9af1fa85a6b960913f62ec9fc613051"
+    }
+  ],
+  "cases": [
+    {
+      "name": "signed_original_reproducer",
+      "elements": 20480,
+      "old_missing_round_bad": 15360,
+      "proposed_bad": 0,
+      "wrong_truncate_bad": 5120,
+      "wrong_ties_away_bad": 5120,
+      "old_max_abs": 0.00390625,
+      "dtype": "torch.float32"
+    },
+    {
+      "name": "signed_even_odd_ties",
+      "elements": 20480,
+      "old_missing_round_bad": 20480,
+      "proposed_bad": 0,
+      "wrong_truncate_bad": 10240,
+      "wrong_ties_away_bad": 10240,
+      "old_max_abs": 0.00390625,
+      "dtype": "torch.float32"
+    },
+    {
+      "name": "signed_near_midpoints",
+      "elements": 20480,
+      "old_missing_round_bad": 20480,
+      "proposed_bad": 0,
+      "wrong_truncate_bad": 10240,
+      "wrong_ties_away_bad": 0,
+      "old_max_abs": 0.0039052963256835938,
+      "dtype": "torch.float32"
+    },
+    {
+      "name": "asymmetric_nonidentity_dyadic_mix",
+      "elements": 20480,
+      "old_missing_round_bad": 5120,
+      "proposed_bad": 0,
+      "wrong_truncate_bad": 5120,
+      "wrong_ties_away_bad": 0,
+      "old_max_abs": 0.00390625,
+      "dtype": "torch.float32"
+    },
+    {
+      "name": "already_exact",
+      "elements": 20480,
+      "old_missing_round_bad": 0,
+      "proposed_bad": 0,
+      "wrong_truncate_bad": 0,
+      "wrong_ties_away_bad": 0,
+      "old_max_abs": 0.0,
+      "dtype": "torch.float32"
+    }
+  ],
+  "inheritance": {
+    "hc.py": {
+      "only_changed_functions": [
+        "golden_hc_post",
+        "hc_post"
+      ],
+      "unchanged_functions": [
+        "hc_mixes",
+        "hc_coefficients",
+        "hc_head",
+        "hc_pre",
+        "hc_pre_test",
+        "hc_post_test",
+        "hc_head_test",
+        "golden_mhc_mixes",
+        "golden_hc_collapse",
+        "golden_hc_pre",
+        "golden_hc_head",
+        "_hc_mix_inputs",
+        "build_pre_specs",
+        "build_post_specs",
+        "build_head_specs"
+      ]
+    },
+    "layer_reference.py": {
+      "only_changed_functions": [
+        "_hc_post_reference"
+      ],
+      "unchanged_functions": [
+        "capture_fixture",
+        "_fixture",
+        "_moe_weight_shard",
+        "_rms_reference",
+        "_precision_report",
+        "_mla_rows",
+        "_compressor_rows",
+        "_score_rows",
+        "_selection_rows",
+        "_gather_rows",
+        "_partial_rows",
+        "_tp_sum",
+        "make_layer_golden",
+        "_build_staged_references",
+        "_staged_references",
+        "_report_staged",
+        "_staged_ratio_compare",
+        "_staged_cache_compare",
+        "_staged_index_score_compare",
+        "_staged_topk_indices_compare",
+        "_staged_pool_compare",
+        "_staged_state_compare",
+        "staged_moe_compare",
+        "staged_hc_post_compare",
+        "staged_rms_compare",
+        "staged_gate_compare",
+        "build_compare",
+        "_rope_tables",
+        "_expert_fixture",
+        "_selection_input",
+        "_dispatch_prepared",
+        "run_staged_programs",
+        "build_layer_specs"
+      ]
+    }
+  },
+  "kernel_cast_mode": "rint",
+  "public_storage_dtype": "FP32",
+  "source45_unchanged": true,
+  "scope": "Tiny actual CPU helpers and producer AST only; native HC and text causality untested."
+}

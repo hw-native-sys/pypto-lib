@@ -1,0 +1,41 @@
+{
+  "old_count_source45": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "new_full_source45": "8153c7f040bef51900a6e6c9ff27b018279b7503f31d50ec5488457e49770b28",
+  "count_recompiled": false,
+  "old_count_receipts_NOT_relabelled": true,
+  "dependency_hashes": {
+    "moe_exchange.py": {
+      "parent405": "294385aa179fd083ee79a6db0603416b92cd36e7b7ea71e82d0e87a536e6c640",
+      "new_full": "294385aa179fd083ee79a6db0603416b92cd36e7b7ea71e82d0e87a536e6c640"
+    },
+    "hc.py": {
+      "parent405": "c6111634f78d53ad0cb4196a533a2d89097d4cfa0859688382c0072b60840885",
+      "new_full": "c6111634f78d53ad0cb4196a533a2d89097d4cfa0859688382c0072b60840885"
+    },
+    "moe_gate.py": {
+      "parent405": "040019c27390f3bc5355af1b1964c19dc3ec347a6e719fe795adedc047b4f872",
+      "new_full": "040019c27390f3bc5355af1b1964c19dc3ec347a6e719fe795adedc047b4f872"
+    },
+    "moe_experts.py": {
+      "parent405": "5d9d95bb6826d6d93cc24b1c2e2ec3e1cbe9442a0338272d79ac536a17a9d875",
+      "new_full": "5d9d95bb6826d6d93cc24b1c2e2ec3e1cbe9442a0338272d79ac536a17a9d875"
+    },
+    "gemm_w8a8.py": {
+      "parent405": "162cfd228d882ecb041a34c751643a8712f5f7a2538f2ea7c0cc8bff73a317ed",
+      "new_full": "162cfd228d882ecb041a34c751643a8712f5f7a2538f2ea7c0cc8bff73a317ed"
+    },
+    "utils.py": {
+      "parent405": "96817adec5584eeab2940dab0faf42078fc257995021899e6dbe9e55e00c36d3",
+      "new_full": "96817adec5584eeab2940dab0faf42078fc257995021899e6dbe9e55e00c36d3"
+    },
+    "config.py": {
+      "parent405": "e0542e042be6019f51ec367801565bd9fc8a48ecddd00ce980d60659e638ff19",
+      "new_full": "e0542e042be6019f51ec367801565bd9fc8a48ecddd00ce980d60659e638ff19"
+    }
+  },
+  "actual_old405_profiles": {
+    "count_active": "45c3b4c710e9592127dcde62a1d1f2502ea42fc01843895362150aa56b1b8c54",
+    "count_old_physical": "1c09c6ced987a6ed53cdb8036a8ed6cc8d4c6d78c9d1df3a7278db21b7f29c53"
+  },
+  "reason": "count_probe imports actual moe_ffn/HC/gate/expert/GEMM, never compressor; those sources and old diagnostic probe sources stay immutable. C2 kernel change requires FRESH full source/artifact only."
+}

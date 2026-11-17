@@ -1,0 +1,27 @@
+{
+  "status": "FAILED",
+  "started_epoch": 1794074952.6035178,
+  "device": "0",
+  "first_error": {
+    "type": "AssertionError",
+    "message": "No numeric boundary receipt; runtime failure is not a successful control.",
+    "role": "candidate",
+    "traceback": "Traceback (most recent call last):\n  File \"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/probe.py\", line 196, in execute_pair\n    assert len(seen) == 1, 'No numeric boundary receipt; runtime failure is not a successful control.'\nAssertionError: No numeric boundary receipt; runtime failure is not a successful control.\n"
+  },
+  "claim": "Synthetic HC boundary only; no text causality claim.",
+  "mode": "ExecutionMode.ONBOARD",
+  "ended_epoch": 1794074952.6651022,
+  "receipts": [],
+  "run_results": [
+    {
+      "role": "candidate",
+      "started_epoch": 1794074952.638587,
+      "status": "RUN_RETURNED",
+      "passed": true,
+      "error": null,
+      "execution_time": null,
+      "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/hc_native_receipt_correction_1794074695/cpu_injections/missing_comparator",
+      "ended_epoch": 1794074952.6544256
+    }
+  ]
+}

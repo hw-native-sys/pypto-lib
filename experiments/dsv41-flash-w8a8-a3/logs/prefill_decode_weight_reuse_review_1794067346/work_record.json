@@ -1,0 +1,11 @@
+{
+  "NPU_jobs": 0,
+  "agent": "review-agent",
+  "category": "study-public-weight-reuse",
+  "elapsed_seconds": 1429,
+  "end_epoch": 1794068775,
+  "id": "reviewer-weight-reuse-1794067346-1794068775",
+  "includes_cpu_queue_and_wait": true,
+  "note": "Post-case audit waiting interval is interrupted for this exclusive reviewer work; do not double count overlap.",
+  "start_epoch": 1794067346
+}

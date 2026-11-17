@@ -1,0 +1,13 @@
+{
+  "CPU_tasks": 3,
+  "NPU_tasks": 0,
+  "actual_fresh_compiles": 2,
+  "agent": "review-agent",
+  "elapsed_seconds": 864,
+  "end_epoch": 1794077287,
+  "id": "independent-HC-applied-signatures-1794076423-1794077287",
+  "payload_bytes": 0,
+  "protected_source_writes": 0,
+  "start_epoch": 1794076423,
+  "state": "FINAL_PARK"
+}

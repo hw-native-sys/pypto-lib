@@ -1,0 +1,10 @@
+[
+  "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_real_B_operation_prepare_1794098661/check_identity.py",
+  "--binding",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_real_B_operation_prepare_1794098661/operation_binding.json",
+  "--output",
+  "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_real_B_generation_1794098661/prequeue",
+  "--stage",
+  "PREQUEUE"
+]

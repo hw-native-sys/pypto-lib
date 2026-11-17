@@ -1,0 +1,1 @@
+PASS sealed bounded bundles and own canonical45 copy; no model imports or large IO

@@ -1,0 +1,16 @@
+{
+  "epoch": 1794077887.197625,
+  "role": "review-agent",
+  "status": "FINAL/PARK_READY_POSTTERMINAL_ONLY",
+  "shared_writes": 0,
+  "root_imports": "once, owned by Root",
+  "report_sha256": "fbfda8adc5b47fe87ac6bbe7a77d73ac697834cd6043faf3bfe34307e7f26c15",
+  "manifest_sha256": "277dbd2a8a4199df33e287310e97d1f7c033de2be43904186067289ec4e8c219",
+  "audit_sha256": "e3e566b1922c262b02dc96cc6c7b7ac2670427180c3e836cc1227264a49a0ba7",
+  "delta_sha256": "cc93659af09aab8a88ff56d4cf1e31466652513046f4d314e8b663ec5ea4081c",
+  "pins_sha256": "6f825513deb428e2a948daadd96ead191634d7b84a32f60982e11ff0b31a08d3",
+  "files": 26,
+  "actual_audit_executed": false,
+  "NPU_submitted": false,
+  "remaining_tasks": []
+}

@@ -1,0 +1,18 @@
+{
+  "job": "task_20261108_030353_356363116294",
+  "root_go_id": "observer-20261108-shared-hc-real16-e07b",
+  "queue_max_seconds": 21600,
+  "client_timeout_seconds": 22200,
+  "soft_deadline_seconds": 20400,
+  "allocation": "auto16",
+  "lock_acquisition_reported_pid": 3563739,
+  "PID_label_limit": "raw lock-acquisition label only; absence alone is not worker/allocator release proof",
+  "source45_sha256": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "binding_sha256": "aee30bb487c41dd8acc6b4a674615e9a6b699dd699f652b291b91c1c35752c07",
+  "outer15_manifest_sha256": "0a879238b20ca62ec096f3ee6b4afb9b81f29e8691389971219a462149bd0861",
+  "guarded_command_script": "submit_after_explicit_root_go.sh",
+  "guarded_command_script_sha256": "8e77d2c98700c708af9e5947ae71f035f07084c0b236668e79b5cdf86d2c9561",
+  "invocation": "M02_SHARED_ACTUAL_GO_ID=observer-20261108-shared-hc-real16-e07b bash experiments/dsv41-flash-w8a8-a3/logs/native_shared_hc_real_generation_1794077720/submit_after_explicit_root_go.sh",
+  "actual_output": "actual",
+  "native_attempt": 1
+}

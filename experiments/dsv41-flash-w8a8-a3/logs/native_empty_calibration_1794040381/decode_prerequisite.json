@@ -1,0 +1,24 @@
+{
+  "job": "task_20261107_163417_24812212428",
+  "queue_status": "completed (exit=0)",
+  "durable_normal_close": true,
+  "locks_released": true,
+  "own_decode_pid_count": 20,
+  "all_pids_absent_independently_checked": true,
+  "epoch": 1794040960.1566658,
+  "actual_pre_submit_resources": {
+    "epoch": 1794040960.1561122,
+    "host_available_bytes": 1613438234624,
+    "disk_free_bytes": 9526377971712,
+    "shm_free_bytes": 1079343157248,
+    "admission": true
+  },
+  "evidence_sha256": {
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_exact_prompt_capture_1794038189/decode_terminal_status.json": "9c8a47749040c0eb22dffc78e7abece67356631f467ebd01922e3d96b7644aba",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_exact_prompt_capture_1794038189/decode_capture_result.json": "44cac3eec365a7be310a68ae7f011df81f04f399656030cfc95c6501eda2141d",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_exact_prompt_capture_1794038189/validate-decode_preconditions_results.json": "9c1fc425662a4f57da16c28e1b72dd27ecc7709e4968738645c33d0fd8309e4e",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_exact_prompt_capture_1794038189/n3_work/decode3/manifest.json": "424269b3042c1845802bee6ef0f14daddc08ffc6f32c6f5c043607e3ff03c33f",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_exact_prompt_capture_1794038189/n3_work/decode3/owner_closed.json": "0f89991d91f4b48e4f4a9b37891d43c5cde19a6df4c75de6516bd272a7f381fd",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_empty_calibration_1794040381/decode_job.status": "e9d1ff712f06bb1de067759e33a7004938e8ac346c8609ffd9b60aa081851ac4"
+  }
+}

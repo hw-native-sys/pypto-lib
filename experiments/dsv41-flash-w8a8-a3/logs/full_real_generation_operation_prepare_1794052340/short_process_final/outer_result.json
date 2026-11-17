@@ -1,0 +1,35 @@
+{
+  "started_epoch": 1794053154.32732,
+  "command": [
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+    "-c",
+    "raise SystemExit(7)"
+  ],
+  "CLI_returncode": 7,
+  "launch_error": null,
+  "postcheck_error": "ValueError('POST_EXEC preserved failure')",
+  "CLI_pid": 3527230,
+  "CLI_identity": {
+    "pid": 3527230,
+    "start_ticks": "105307627",
+    "state": "R",
+    "parent_pid": 3527215
+  },
+  "ended_epoch": 1794053154.3932874,
+  "monitor_errors": [],
+  "monitor_thread_alive": false,
+  "known_process_identities": [
+    [
+      3527215,
+      "105307614"
+    ],
+    [
+      3527230,
+      "105307627"
+    ]
+  ],
+  "sample_count": 5,
+  "peak_sampled_own_tree_pss": 17196032,
+  "peak_sampled_own_tree_uss": 14364672,
+  "status": "FAIL"
+}

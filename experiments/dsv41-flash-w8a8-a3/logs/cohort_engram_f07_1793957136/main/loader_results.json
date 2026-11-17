@@ -1,0 +1,21 @@
+{
+  "synthetic_stored_orientation_exact": true,
+  "cache_reused": true,
+  "invalid_controls": {
+    "off_block": "Engram gate requires repeated block32 global rotation",
+    "different_block": "Engram gate requires repeated block32 global rotation",
+    "wrong_shape": "global rotation shape must match hidden size",
+    "metadata": "unsupported Engram rotation contract",
+    "missing_map": "explicit FileNotFoundError"
+  },
+  "real_rotation_map_only": {
+    "shape": [
+      32,
+      32
+    ],
+    "dtype": "torch.float32",
+    "block_sha256": "68fef81121ad4d31c34d7659a684bff34d2fc1de23bc46201cf6cf35606fca1a",
+    "orthogonality_max_abs": 5.960464477539063e-08
+  },
+  "limits": "Only optional rotation map/config read from real checkpoint; no model/Engram table weights loaded, no checkpoint writes."
+}

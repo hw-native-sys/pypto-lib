@@ -1,0 +1,16 @@
+{
+  "record_id": "review-exactN3-prefix-1794038541-1794039895",
+  "agent": "review-agent",
+  "start_epoch": 1794038541,
+  "end_epoch": 1794039895,
+  "duration_seconds": 1354,
+  "status": "PREFIX_MILESTONE_COMPLETE/PARK",
+  "native_jobs": 1,
+  "native_device_ranks": 16,
+  "CPU_gates": 17,
+  "strict_actual_DP_sampling": "PASS",
+  "copied_one_DP_control": "REJECTED_EXPECTED",
+  "decode_jobs": 0,
+  "all_assigned_jobs_complete0": true,
+  "realweights_fit_text": "HELD"
+}

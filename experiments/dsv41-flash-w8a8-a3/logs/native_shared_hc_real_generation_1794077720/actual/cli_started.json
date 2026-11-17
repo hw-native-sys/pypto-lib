@@ -1,0 +1,51 @@
+{
+  "epoch": 1794078240.4034534,
+  "outer_identity": {
+    "pid": 3564529,
+    "start_ticks": "107815977",
+    "state": "R",
+    "parent_pid": 3564084
+  },
+  "CLI_identity": {
+    "pid": 3564806,
+    "start_ticks": "107816233",
+    "state": "R",
+    "parent_pid": 3564529
+  },
+  "CLI_pid": 3564806,
+  "command": [
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/bin/python",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/generate.py",
+    "--device-run",
+    "--device",
+    "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15",
+    "--backend-type",
+    "a2a3",
+    "--model-root",
+    "/mnt/data/models/DeepSeek-V4.1-Flash-w8a8",
+    "--checkpoint",
+    "/mnt/data/models/DeepSeek-V4.1-Flash-w8a8",
+    "--template",
+    "plain",
+    "--prompt",
+    "Once upon a",
+    "--start-position",
+    "0",
+    "--rope-profile",
+    "auto",
+    "--engram-mode",
+    "disabled",
+    "--max-new-tokens",
+    "16",
+    "--repeat",
+    "1",
+    "--max-time",
+    "21600",
+    "--first-real-generation-authorization",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_shared_hc_real_generation_1794077720/actual/generation_authorization.json",
+    "--result-json",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_shared_hc_real_generation_1794077720/actual/generation.json",
+    "--log-file",
+    "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_shared_hc_real_generation_1794077720/actual/generation.log"
+  ]
+}

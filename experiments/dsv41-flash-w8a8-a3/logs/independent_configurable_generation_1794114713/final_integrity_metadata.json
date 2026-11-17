@@ -1,0 +1,10 @@
+{
+  "epoch": 1794127020.567829,
+  "checks": {
+    "source_ready39_unchanged": true,
+    "protected_owner_raws_unchanged": true,
+    "parent29_manifest_unchanged": true,
+    "root_model_GO_unchanged": true
+  },
+  "status": "PASS_METADATA_INTEGRITY"
+}

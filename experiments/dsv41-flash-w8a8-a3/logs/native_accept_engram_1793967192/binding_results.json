@@ -1,0 +1,31 @@
+{
+  "actual_top_loader_and_rank_carrier_preserve_resource": true,
+  "actual_entry_contract_and_assembler": {
+    "prefill": {
+      "rotation_shape": [
+        16,
+        32,
+        32
+      ],
+      "rotation_binding_exact": true,
+      "actual_pool_cap": 2048,
+      "actual_pool_arguments": [
+        "pool_block_ids_c2a",
+        "pool_block_ids_c1a"
+      ]
+    },
+    "decode": {
+      "rotation_shape": [
+        16,
+        32,
+        32
+      ],
+      "rotation_binding_exact": true,
+      "actual_pool_cap": 2048,
+      "actual_pool_arguments": [
+        "pool_block_ids"
+      ]
+    }
+  },
+  "limits": "Real optional rotation map only; model weight methods stubbed to avoid full loads. Actual bounded fixture contracts inspected, no claim that other generator F11-F13 values are valid or generation executes."
+}

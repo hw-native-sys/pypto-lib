@@ -1,0 +1,7 @@
+{
+  "status": "BOUNDED_COUNT_ACTIVE_PASS_FINAL_PARK",
+  "files": 244,
+  "manifest_sha256": "f997c9d6dd787dde5aae74c7bcf69d1cb5c3f8dd228db59039572da233960cb0",
+  "actual_report_sha256": "9303a9dcab316678acc7771651fb73724eb9c1af4ee6484d3d6733defdbbb9a9",
+  "count_cpu_receipt_sha256": "3105dc34b1ee5558dcb5e7f099868e84679c2d7963c71fda2c005f1d28a2ac72"
+}

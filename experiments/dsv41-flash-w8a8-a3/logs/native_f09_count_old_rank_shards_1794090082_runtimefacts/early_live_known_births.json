@@ -1,0 +1,32 @@
+{
+  "observed_epoch": 1794090311.3372512,
+  "scope": "one bounded live descendants observation; not continuous history",
+  "known_identities": [
+    {
+      "pid": 1738384,
+      "ppid": 1738112,
+      "starttick": "109020554",
+      "comm": "python"
+    },
+    {
+      "pid": 1738425,
+      "ppid": 1738384,
+      "starttick": "109020648",
+      "comm": "python"
+    },
+    {
+      "pid": 1738478,
+      "ppid": 1738425,
+      "starttick": "109020772",
+      "comm": "python"
+    },
+    {
+      "pid": 1741549,
+      "ppid": 1738478,
+      "starttick": "109023274",
+      "comm": "git"
+    }
+  ],
+  "ready_at_observation": 0,
+  "all_future_children_or_complete_history_claim": false
+}

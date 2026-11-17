@@ -1,0 +1,13 @@
+{
+  "id": "independent-f09-applied-signatures-1794097836-1794098455",
+  "agent": "review-agent",
+  "start_epoch": 1794097836,
+  "end_epoch": 1794098455,
+  "elapsed_seconds": 619,
+  "state": "FINAL_PARK_APPLIED_B_AND_TWO_FRESH_E40_SIGNATURES_PASS",
+  "CPU_jobs": 1,
+  "NPU_jobs": 0,
+  "shared_writes": 0,
+  "protected_source_writes": 0,
+  "wait_before_start_not_estimated": true
+}

@@ -1,0 +1,10 @@
+{
+  "files": 17,
+  "manifest_sha256": "5a2ccfb048c16742248c158708711d8ac6bd7e3ae586528336d5065b1d02586f",
+  "patch_sha256": "7520f4c6d7f144b0a2937751b9f43ad6c45c653c4b8fca49606c8d0dc4134c72",
+  "proposed_hc_sha256": "c6111634f78d53ad0cb4196a533a2d89097d4cfa0859688382c0072b60840885",
+  "proposed_layer_sha256": "c382bc7131c4bfd3f159d291c99de7e0d9f3368e5b25e1c3515b96f825dedda0",
+  "base45_sha256": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "proposed45_UNAPPLIED_sha256": "cd9c6b61ed25d78d1000d349c3d72f7827dfb0b815ba5b56dc42a2593d583070",
+  "all_writers_jobs_PARK": true
+}

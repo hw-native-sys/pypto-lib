@@ -1,0 +1,16 @@
+{
+  "epoch": 1794023707,
+  "manifest_sha256": "c60959169836de8c9917e71dcf3360a8295fbf75c7686886cc7833c4a1abd7ac",
+  "pipeline_sha256": "05ecfa94c9af10aab157edea86a1741a805672274e14f134a98e22f46688928e",
+  "store_sha256": "2bdb07f240f2d32710b81a44638703acc6733cb56d193f5a1af8dfae9ae50b34",
+  "files": 50,
+  "root45_equal": true,
+  "old_prototype_immutable": true,
+  "own_jobs": "initial114721testpathFAILpreserved;114825/115013/115250PASSallended",
+  "NPU": 0,
+  "fullprefix": 0,
+  "largeIO": 0,
+  "actual_static_materialization": 0,
+  "status": "PARKED;actualadapterswired/nativeuntested",
+  "record_id": "checkpoint-pipeline-v2-1794023045-1794023707"
+}

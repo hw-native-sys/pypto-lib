@@ -1,0 +1,1 @@
+Combined longer-N3 applied-source/outer delta review only. Prepare before freezes; import and ONE tinyCPU only after Root BOTHfinal notice. No old proof repeats/compile/headerloop/golden/realpayload/NPU/product/oldwrites or actualgrants.

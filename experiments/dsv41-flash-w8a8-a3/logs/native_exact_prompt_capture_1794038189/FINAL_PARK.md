@@ -1,0 +1,1 @@
+FINAL/PARK. Originalprefix17+actualpartialC2returned-state decode19+same-staged publishedWINDOW3/C2row1+strictactual4DP/copycontrols PASS. All own jobs complete0, known PIDs absent, native locks released. Full unit immutable after final seal. No further append, NPU, source/helper/policy edits, weights/fit/text action authorized.

@@ -1,0 +1,17 @@
+{
+  "status": "FINAL/PARK",
+  "reviewed_bundle207_manifest_sha256": "08991711288e13970e27c8b39f5bf0ceb6a2da564c01049275473acaf10ac241",
+  "copied_source45_sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "source_review": "PASS_NARROW_TYPED_CONTRACT_AND_ALL_CALLERS",
+  "signature_compile": "PASS_THREE_INDEPENDENT_FRESH_SIGNATURES",
+  "native_acceptance": false,
+  "task": "task_20261108_033145_97507819480",
+  "task_exit": 0,
+  "running_jobs": [],
+  "generated_runtime_graph": false,
+  "NPU_prepare_calls": 0,
+  "model_payloads": 0,
+  "shared_writes": 0,
+  "source_intact": true,
+  "recovery": "Preserve compiled physical paths and manifests. All actual native/count/state/original-golden and runtime graph gates remain pending. Adapter lifecycle repair belongs to separate later frozen revision. No new CPU children/tasks until Root releases actual terminal-audit hold. No hardware grant."
+}

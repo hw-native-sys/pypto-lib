@@ -1,0 +1,24 @@
+{
+  "reference_revision": "8fde6d4e335fe300e2b949aab0e31659cce0811d",
+  "source_sha256": "4797b8962264d137cdb142a9988825288283092fb797ddbd334c6ab2223eb58d",
+  "fp32_original_gate_and_independent_equation_match": true,
+  "inactive_token_unchanged": true,
+  "controls": {
+    "missing_restore": {
+      "failing_lanes": 345,
+      "total": 768,
+      "max_abs": 4.058792591094971
+    },
+    "wrong_direction": {
+      "failing_lanes": 475,
+      "total": 768,
+      "max_abs": 4.6835856437683105
+    },
+    "double_value_rotation": {
+      "failing_lanes": 489,
+      "total": 768,
+      "max_abs": 4.456329822540283
+    }
+  },
+  "limits": "Preparation only; small synthetic FP32 hidden stream, no candidate imports, actual model/order/loader/device or cast-boundary validation; original source NPU/full-checkpoint execution not claimed."
+}

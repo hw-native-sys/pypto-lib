@@ -1,0 +1,16 @@
+{
+  "status": "FINAL/PARK",
+  "artifact_count": 207,
+  "artifact_manifest_sha256": "08991711288e13970e27c8b39f5bf0ceb6a2da564c01049275473acaf10ac241",
+  "source45_UNAPPLIED_sha256": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "full_patch_M02_sha256": "f726051f3b332e1db19daee444919b39801df1b76e56d712622f1e258c8cf0d0",
+  "typed_delta_old93_sha256": "f4dfab6461dc219d69d3ce4efa4520998286e655c60e0c5f6e9eb9c2a8e58eaf",
+  "count_compiled_files_manifest_sha256": "17cf1cc77c5262aeb55cdff780f5e285e655afa4a7a52b327db17f236161bc1c",
+  "count_metadata_sha256": "189381005f808c601c93286c4ef8022e54e160f99a2c144d527608df90dd9fb9",
+  "count_signature_compile": "PASS_ZERO_SAMPLES_ONLY",
+  "fullentry_oldprobe_compiles": 0,
+  "native": false,
+  "live_M02_old93_76_unchanged": true,
+  "all_jobs_writers_parked": true,
+  "shared_writes": 0
+}

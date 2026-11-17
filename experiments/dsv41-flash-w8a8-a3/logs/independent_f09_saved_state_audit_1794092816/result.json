@@ -1,0 +1,1440 @@
+{
+  "schema": "F09-saved-state-diagnostic/1",
+  "status": "DIAGNOSTIC_COMPLETE_NOT_MODEL_ACCEPTANCE",
+  "started_epoch": 1794092856.13258,
+  "ended_epoch": 1794092862.1189709,
+  "saved_snapshot_statistics": {
+    "call0.initial.pt": {
+      "input_ids": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int64",
+        "numel": 32
+      },
+      "initial_pre": {
+        "shape": [
+          16,
+          2,
+          4
+        ],
+        "dtype": "torch.float32",
+        "numel": 128,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "position_ids": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int32",
+        "numel": 32
+      },
+      "request_ids": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int32",
+        "numel": 32
+      },
+      "window_slots": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int64",
+        "numel": 32
+      },
+      "window_indices": {
+        "shape": [
+          16,
+          2,
+          128
+        ],
+        "dtype": "torch.int32",
+        "numel": 4096
+      },
+      "c2a_compressed_slots": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int64",
+        "numel": 32
+      },
+      "c2a_compressed_lens": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int32",
+        "numel": 32
+      },
+      "c1a_compressed_slots": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int64",
+        "numel": 32
+      },
+      "c1a_compressed_lens": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int32",
+        "numel": 32
+      },
+      "index_block_table": {
+        "shape": [
+          16,
+          2,
+          2
+        ],
+        "dtype": "torch.int32",
+        "numel": 64
+      },
+      "state_block_table": {
+        "shape": [
+          16,
+          2,
+          1
+        ],
+        "dtype": "torch.int32",
+        "numel": 32
+      },
+      "rope_cos": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "rope_sin": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "rope_cos_swa": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "rope_sin_swa": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "c2a_compressed_cos": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "c2a_compressed_sin": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "c1a_compressed_cos": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "c1a_compressed_sin": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "engram_lookup": {
+        "shape": [
+          16,
+          2,
+          2,
+          6144
+        ],
+        "dtype": "torch.bfloat16",
+        "numel": 393216,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "engram_enabled": {
+        "shape": [],
+        "dtype": "torch.int32",
+        "numel": 1
+      },
+      "window_cache": {
+        "shape": [
+          16,
+          40,
+          4,
+          128,
+          1,
+          512
+        ],
+        "dtype": "torch.bfloat16",
+        "numel": 167772160,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "compressed_cache_c2a": {
+        "shape": [
+          16,
+          3,
+          4,
+          128,
+          1,
+          512
+        ],
+        "dtype": "torch.bfloat16",
+        "numel": 12582912,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "index_cache_c2a": {
+        "shape": [
+          16,
+          3,
+          4,
+          128,
+          1,
+          128
+        ],
+        "dtype": "torch.bfloat16",
+        "numel": 3145728,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "state_cache_c2a": {
+        "shape": [
+          16,
+          3,
+          2,
+          2,
+          1024
+        ],
+        "dtype": "torch.float32",
+        "numel": 196608,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "compressed_cache_c1a": {
+        "shape": [
+          16,
+          4,
+          128,
+          1,
+          512
+        ],
+        "dtype": "torch.bfloat16",
+        "numel": 4194304,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "index_cache_c1a": {
+        "shape": [
+          16,
+          4,
+          128,
+          1,
+          128
+        ],
+        "dtype": "torch.bfloat16",
+        "numel": 1048576,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "topk_indices": {
+        "shape": [
+          16,
+          8,
+          2,
+          512
+        ],
+        "dtype": "torch.int32",
+        "numel": 131072
+      },
+      "topk_values": {
+        "shape": [
+          16,
+          8,
+          2,
+          512
+        ],
+        "dtype": "torch.float32",
+        "numel": 131072,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "pool_block_ids": {
+        "shape": [
+          16,
+          8,
+          2,
+          2048
+        ],
+        "dtype": "torch.int32",
+        "numel": 524288
+      },
+      "pool_block_counts": {
+        "shape": [
+          16,
+          8,
+          2
+        ],
+        "dtype": "torch.int32",
+        "numel": 256
+      },
+      "x_hc": {
+        "shape": [
+          16,
+          2,
+          4,
+          5120
+        ],
+        "dtype": "torch.float32",
+        "numel": 655360,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "pre_mix": {
+        "shape": [
+          16,
+          2,
+          4
+        ],
+        "dtype": "torch.float32",
+        "numel": 128,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "layer_x_hc": {
+        "shape": [
+          16,
+          40,
+          2,
+          4,
+          5120
+        ],
+        "dtype": "torch.float32",
+        "numel": 26214400,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "layer_pre_mix": {
+        "shape": [
+          16,
+          40,
+          2,
+          4
+        ],
+        "dtype": "torch.float32",
+        "numel": 5120,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "final_hidden": {
+        "shape": [
+          16,
+          2,
+          5120
+        ],
+        "dtype": "torch.bfloat16",
+        "numel": 163840,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "logits": {
+        "shape": [
+          16,
+          2,
+          32320
+        ],
+        "dtype": "torch.float32",
+        "numel": 1034240,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "token_counts": {
+        "shape": [
+          16
+        ],
+        "dtype": "torch.int32",
+        "numel": 16
+      }
+    },
+    "call0.actual.pt": {
+      "input_ids": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int64",
+        "numel": 32
+      },
+      "initial_pre": {
+        "shape": [
+          16,
+          2,
+          4
+        ],
+        "dtype": "torch.float32",
+        "numel": 128,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "position_ids": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int32",
+        "numel": 32
+      },
+      "request_ids": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int32",
+        "numel": 32
+      },
+      "window_slots": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int64",
+        "numel": 32
+      },
+      "window_indices": {
+        "shape": [
+          16,
+          2,
+          128
+        ],
+        "dtype": "torch.int32",
+        "numel": 4096
+      },
+      "c2a_compressed_slots": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int64",
+        "numel": 32
+      },
+      "c2a_compressed_lens": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int32",
+        "numel": 32
+      },
+      "c1a_compressed_slots": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int64",
+        "numel": 32
+      },
+      "c1a_compressed_lens": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int32",
+        "numel": 32
+      },
+      "index_block_table": {
+        "shape": [
+          16,
+          2,
+          2
+        ],
+        "dtype": "torch.int32",
+        "numel": 64
+      },
+      "state_block_table": {
+        "shape": [
+          16,
+          2,
+          1
+        ],
+        "dtype": "torch.int32",
+        "numel": 32
+      },
+      "rope_cos": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "rope_sin": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "rope_cos_swa": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "rope_sin_swa": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "c2a_compressed_cos": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "c2a_compressed_sin": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "c1a_compressed_cos": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "c1a_compressed_sin": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "engram_lookup": {
+        "shape": [
+          16,
+          2,
+          2,
+          6144
+        ],
+        "dtype": "torch.bfloat16",
+        "numel": 393216,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "engram_enabled": {
+        "shape": [],
+        "dtype": "torch.int32",
+        "numel": 1
+      },
+      "window_cache": {
+        "shape": [
+          16,
+          40,
+          4,
+          128,
+          1,
+          512
+        ],
+        "dtype": "torch.bfloat16",
+        "numel": 167772160,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "compressed_cache_c2a": {
+        "shape": [
+          16,
+          3,
+          4,
+          128,
+          1,
+          512
+        ],
+        "dtype": "torch.bfloat16",
+        "numel": 12582912,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "index_cache_c2a": {
+        "shape": [
+          16,
+          3,
+          4,
+          128,
+          1,
+          128
+        ],
+        "dtype": "torch.bfloat16",
+        "numel": 3145728,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "state_cache_c2a": {
+        "shape": [
+          16,
+          3,
+          2,
+          2,
+          1024
+        ],
+        "dtype": "torch.float32",
+        "numel": 196608,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "compressed_cache_c1a": {
+        "shape": [
+          16,
+          4,
+          128,
+          1,
+          512
+        ],
+        "dtype": "torch.bfloat16",
+        "numel": 4194304,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "index_cache_c1a": {
+        "shape": [
+          16,
+          4,
+          128,
+          1,
+          128
+        ],
+        "dtype": "torch.bfloat16",
+        "numel": 1048576,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "topk_indices": {
+        "shape": [
+          16,
+          8,
+          2,
+          512
+        ],
+        "dtype": "torch.int32",
+        "numel": 131072
+      },
+      "topk_values": {
+        "shape": [
+          16,
+          8,
+          2,
+          512
+        ],
+        "dtype": "torch.float32",
+        "numel": 131072,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "pool_block_ids": {
+        "shape": [
+          16,
+          8,
+          2,
+          2048
+        ],
+        "dtype": "torch.int32",
+        "numel": 524288
+      },
+      "pool_block_counts": {
+        "shape": [
+          16,
+          8,
+          2
+        ],
+        "dtype": "torch.int32",
+        "numel": 256
+      },
+      "x_hc": {
+        "shape": [
+          16,
+          2,
+          4,
+          5120
+        ],
+        "dtype": "torch.float32",
+        "numel": 655360,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "pre_mix": {
+        "shape": [
+          16,
+          2,
+          4
+        ],
+        "dtype": "torch.float32",
+        "numel": 128,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "layer_x_hc": {
+        "shape": [
+          16,
+          40,
+          2,
+          4,
+          5120
+        ],
+        "dtype": "torch.float32",
+        "numel": 26214400,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "layer_pre_mix": {
+        "shape": [
+          16,
+          40,
+          2,
+          4
+        ],
+        "dtype": "torch.float32",
+        "numel": 5120,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "final_hidden": {
+        "shape": [
+          16,
+          2,
+          5120
+        ],
+        "dtype": "torch.bfloat16",
+        "numel": 163840,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "logits": {
+        "shape": [
+          16,
+          2,
+          32320
+        ],
+        "dtype": "torch.float32",
+        "numel": 1034240,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "token_counts": {
+        "shape": [
+          16
+        ],
+        "dtype": "torch.int32",
+        "numel": 16
+      }
+    },
+    "call1.initial.pt": {
+      "input_ids": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int64",
+        "numel": 32
+      },
+      "initial_pre": {
+        "shape": [
+          16,
+          2,
+          4
+        ],
+        "dtype": "torch.float32",
+        "numel": 128,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "position_ids": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int32",
+        "numel": 32
+      },
+      "request_ids": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int32",
+        "numel": 32
+      },
+      "window_slots": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int64",
+        "numel": 32
+      },
+      "window_indices": {
+        "shape": [
+          16,
+          2,
+          128
+        ],
+        "dtype": "torch.int32",
+        "numel": 4096
+      },
+      "c2a_compressed_slots": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int64",
+        "numel": 32
+      },
+      "c2a_compressed_lens": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int32",
+        "numel": 32
+      },
+      "c1a_compressed_slots": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int64",
+        "numel": 32
+      },
+      "c1a_compressed_lens": {
+        "shape": [
+          16,
+          2
+        ],
+        "dtype": "torch.int32",
+        "numel": 32
+      },
+      "index_block_table": {
+        "shape": [
+          16,
+          2,
+          2
+        ],
+        "dtype": "torch.int32",
+        "numel": 64
+      },
+      "state_block_table": {
+        "shape": [
+          16,
+          2,
+          1
+        ],
+        "dtype": "torch.int32",
+        "numel": 32
+      },
+      "rope_cos": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "rope_sin": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "rope_cos_swa": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "rope_sin_swa": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "c2a_compressed_cos": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "c2a_compressed_sin": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "c1a_compressed_cos": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "c1a_compressed_sin": {
+        "shape": [
+          16,
+          2,
+          32
+        ],
+        "dtype": "torch.float32",
+        "numel": 1024,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "engram_lookup": {
+        "shape": [
+          16,
+          2,
+          2,
+          6144
+        ],
+        "dtype": "torch.bfloat16",
+        "numel": 393216,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "engram_enabled": {
+        "shape": [],
+        "dtype": "torch.int32",
+        "numel": 1
+      },
+      "window_cache": {
+        "shape": [
+          16,
+          40,
+          4,
+          128,
+          1,
+          512
+        ],
+        "dtype": "torch.bfloat16",
+        "numel": 167772160,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "compressed_cache_c2a": {
+        "shape": [
+          16,
+          3,
+          4,
+          128,
+          1,
+          512
+        ],
+        "dtype": "torch.bfloat16",
+        "numel": 12582912,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "index_cache_c2a": {
+        "shape": [
+          16,
+          3,
+          4,
+          128,
+          1,
+          128
+        ],
+        "dtype": "torch.bfloat16",
+        "numel": 3145728,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "state_cache_c2a": {
+        "shape": [
+          16,
+          3,
+          2,
+          2,
+          1024
+        ],
+        "dtype": "torch.float32",
+        "numel": 196608,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "compressed_cache_c1a": {
+        "shape": [
+          16,
+          4,
+          128,
+          1,
+          512
+        ],
+        "dtype": "torch.bfloat16",
+        "numel": 4194304,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "index_cache_c1a": {
+        "shape": [
+          16,
+          4,
+          128,
+          1,
+          128
+        ],
+        "dtype": "torch.bfloat16",
+        "numel": 1048576,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "topk_indices": {
+        "shape": [
+          16,
+          8,
+          2,
+          512
+        ],
+        "dtype": "torch.int32",
+        "numel": 131072
+      },
+      "topk_values": {
+        "shape": [
+          16,
+          8,
+          2,
+          512
+        ],
+        "dtype": "torch.float32",
+        "numel": 131072,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "pool_block_ids": {
+        "shape": [
+          16,
+          8,
+          2,
+          2048
+        ],
+        "dtype": "torch.int32",
+        "numel": 524288
+      },
+      "pool_block_counts": {
+        "shape": [
+          16,
+          8,
+          2
+        ],
+        "dtype": "torch.int32",
+        "numel": 256
+      },
+      "x_hc": {
+        "shape": [
+          16,
+          2,
+          4,
+          5120
+        ],
+        "dtype": "torch.float32",
+        "numel": 655360,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "pre_mix": {
+        "shape": [
+          16,
+          2,
+          4
+        ],
+        "dtype": "torch.float32",
+        "numel": 128,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "layer_x_hc": {
+        "shape": [
+          16,
+          40,
+          2,
+          4,
+          5120
+        ],
+        "dtype": "torch.float32",
+        "numel": 26214400,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "layer_pre_mix": {
+        "shape": [
+          16,
+          40,
+          2,
+          4
+        ],
+        "dtype": "torch.float32",
+        "numel": 5120,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "final_hidden": {
+        "shape": [
+          16,
+          2,
+          5120
+        ],
+        "dtype": "torch.bfloat16",
+        "numel": 163840,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "logits": {
+        "shape": [
+          16,
+          2,
+          32320
+        ],
+        "dtype": "torch.float32",
+        "numel": 1034240,
+        "nan": 0,
+        "posinf": 0,
+        "neginf": 0,
+        "all_finite": true
+      },
+      "token_counts": {
+        "shape": [
+          16
+        ],
+        "dtype": "torch.int32",
+        "numel": 16
+      }
+    }
+  },
+  "all_floating_snapshot_values_finite": true,
+  "six_cache_call0_actual_to_call1_initial": {
+    "window_cache": {
+      "same_shape": true,
+      "same_dtype": true,
+      "byte_identical": true,
+      "numeric_torch_equal": true
+    },
+    "compressed_cache_c2a": {
+      "same_shape": true,
+      "same_dtype": true,
+      "byte_identical": true,
+      "numeric_torch_equal": true
+    },
+    "index_cache_c2a": {
+      "same_shape": true,
+      "same_dtype": true,
+      "byte_identical": true,
+      "numeric_torch_equal": true
+    },
+    "state_cache_c2a": {
+      "same_shape": true,
+      "same_dtype": true,
+      "byte_identical": true,
+      "numeric_torch_equal": true
+    },
+    "compressed_cache_c1a": {
+      "same_shape": true,
+      "same_dtype": true,
+      "byte_identical": true,
+      "numeric_torch_equal": true
+    },
+    "index_cache_c1a": {
+      "same_shape": true,
+      "same_dtype": true,
+      "byte_identical": true,
+      "numeric_torch_equal": true
+    }
+  },
+  "failing_retention_before_scope": {
+    "rank": 0,
+    "request": 1,
+    "state_block": 0,
+    "active_prefix": 1,
+    "request_is_active": false,
+    "position": 127,
+    "capacity": 2,
+    "logically_writable_parity_rows": [],
+    "must_preserve_parity_rows": [
+      0,
+      1
+    ],
+    "scope_shape": [
+      3,
+      2,
+      1024
+    ],
+    "scope_nan": 0,
+    "scope_posinf": 0,
+    "scope_neginf": 0,
+    "torch_equal_to_unchanged_clone": true,
+    "byte_equal_to_unchanged_clone": true
+  },
+  "call1_actual_poststate_available": false,
+  "cannot_infer_postcall1_actual_bit_mutation": true,
+  "source_bug_evidence_separate": "Root/independentEngram source proof:compressor physical-token writer can write inactive request; not inferred from unsaved actual bits",
+  "no_guard_threshold_or_model_change": true,
+  "no_fixture_or_weight_or_reference_or_compile_or_NPU": true,
+  "protected_inputs_unchanged": true,
+  "shared_writes": 0
+}

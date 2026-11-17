@@ -1,0 +1,4 @@
+{
+  "models/deepseek_v4_1_flash_a3_w8a8/generate.py": "6cad44acba95f43f5e778885d86d5447b14f93b356d110a833f8dbd0c3fbad71",
+  "models/deepseek_v4_1_flash_a3_w8a8/weight_loader.py": "f05950fb2c1fdd0e524c04b6e20c177d157f3946ad10d7511b90d224fa794c48"
+}

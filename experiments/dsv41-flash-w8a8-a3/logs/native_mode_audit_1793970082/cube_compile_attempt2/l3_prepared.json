@@ -1,0 +1,16 @@
+{
+  "mode": "l3_prepared",
+  "execution_mode": "ExecutionMode.ONBOARD",
+  "device": 0,
+  "uid": 2011,
+  "gid": 2011,
+  "groups": [
+    1000,
+    1002,
+    2011
+  ],
+  "compile_only": true,
+  "passed": false,
+  "error_type": "ValueError",
+  "error": "Right buffer usage (1048576 bytes) exceeds platform limit (65536 bytes)\nCheck failed: limit == 0 || used <= limit at /mnt/data/pyptouser/yangyaodong/code/pypto/src/ir/transforms/allocate_memory_addr_pass.cpp:484"
+}

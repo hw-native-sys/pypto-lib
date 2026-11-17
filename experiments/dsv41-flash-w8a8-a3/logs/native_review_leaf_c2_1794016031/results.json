@@ -1,0 +1,18 @@
+{
+  "status": "PARKED",
+  "scope": "read-only preparatory review; not integrated acceptance",
+  "loader_pre_read_contract_gap": "confirmed; separately assigned fix not reviewed",
+  "loader_transform_layout_lifetimes": "source and archived CPU support; no native upload or peak proof",
+  "negative_controls": "6 rejection executions + 3 fixture inequalities",
+  "c2_reference_correction": "mathematically supported for archived controlled and 48 actual saved operand pairs by exact rational oracle",
+  "c2_actual_rational_bad": 0,
+  "c2_cpu_fp32_bad": 49152,
+  "personal_cpu_tasks": [
+    "task_20261107_094749_98066530136",
+    "task_20261107_100249_126339925195"
+  ],
+  "audited_main_native_task": "task_20261107_094906_98427432350",
+  "reviewer_npu_submissions": 0,
+  "source_golden_threshold_edits": false,
+  "next": "await new freeze; no gate closed"
+}

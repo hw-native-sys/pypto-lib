@@ -1,0 +1,1 @@
+Root conditional next combinedouterdelta acceptance. Own signature600 FINAL sealed; WAIT fit shared_hc_real_operation_prepare FINAL. One small queuedCPU changedguards/metadata predicates only, no oldlifecycle/audit/signature/headerloop/Golden/payload/NPU/actualgrant.

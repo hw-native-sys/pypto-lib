@@ -1,0 +1,38 @@
+{
+  "kind": "SOURCE_INSPECTION_ONLY_NO_TESTS",
+  "generate_preserved_AST": {
+    "PreparedDispatch": true,
+    "SharedWeightOwner": true,
+    "streaming_weight_source": true,
+    "static_weight_names": true,
+    "make_run_config": true,
+    "greedy_sample": true,
+    "device_run": true,
+    "require_full_materialization_budget": true,
+    "load_entries": true,
+    "build_entry_contracts": true
+  },
+  "only_generator_literal_changed": true,
+  "unchanged_files": {
+    "weight_loader.py": "70244d047e4705dfe5f7101c5dc046b6f66d146027241524bb4d494823fcfe5f",
+    "weight_map.py": "bd381270788987a675d4e70483c9626808b3cc9d983143f4199d87f5544d989c",
+    "config.py": "e0542e042be6019f51ec367801565bd9fc8a48ecddd00ce980d60659e638ff19",
+    "hc.py": "c6111634f78d53ad0cb4196a533a2d89097d4cfa0859688382c0072b60840885"
+  },
+  "same_candidate_files": {
+    "weight_loader.py": true,
+    "weight_map.py": true,
+    "config.py": true,
+    "hc.py": true
+  },
+  "public_full_HOST_args_source_expected_unchanged": true,
+  "actual_E40_ABI_compile": "PENDING_AFTER_APPLY",
+  "57static_shapes_layout_bytes": "source/config/loader/hostannotations unchanged; no new header scan or plan execution",
+  "same_shared_traffic_mapping": "one633997065216B canonical static init/912bases/164192reads745846365184B; decode0newSTATIC;112C1+800samealiases",
+  "new_B_actual_execution": "UNTESTED",
+  "goldens_vs_live": "CHANGED active-prefix references/masks; see patch",
+  "goldens8153_vs405": "unchanged in narrowC2 fix; not claim vsLIVE",
+  "full171_result": "PENDING_SEPARATE_ROOT_DISPOSITION",
+  "fresh_E40_signatures_required": true,
+  "no_old_M02_or_E1_artifact_relabel": true
+}

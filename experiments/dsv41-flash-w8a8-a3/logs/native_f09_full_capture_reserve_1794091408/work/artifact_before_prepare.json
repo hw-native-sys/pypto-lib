@@ -1,0 +1,1231 @@
+{
+  "phase": "GENERATED_BEFORE_PUBLIC_PREPARE",
+  "origin_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/build/decode_capacity2",
+  "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_full_capture_reserve_1794091408/work/prepared_artifact",
+  "manifest": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/decode_capacity2_files.json",
+  "manifest_sha256": "5262e68afa0b53291ed285e31170b3c017674c3c25dfa9aec78eb7fab5777532",
+  "metadata_sha256": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770",
+  "source_manifest": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "platform": "a2a3",
+  "source_projection": {
+    "debug/run.py": "3d75f3efa89f68b054a2692481a3c01f4e73ad016aaafadbd3f1a8199683a8fc",
+    "distributed_meta.json": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770",
+    "next_levels/decode_fwd_rank/kernel_config.py": "1eae0edc03e9fa7d7c2cb41149c469174808e3187695428fc2e23f66dd2b47e0",
+    "next_levels/decode_fwd_rank/kernels/aic/attention_core_0_aic.cpp": "cf391ed8f836a28ea8f7c8d5b4364461fff30950dc7550203f92c3c208b036f7",
+    "next_levels/decode_fwd_rank/kernels/aic/attention_core_aic.cpp": "6786611fc5e2e65e463b9bb11859bdf58d467003494094e55c426cdcf1295825",
+    "next_levels/decode_fwd_rank/kernels/aic/compressor_project_0_aic.cpp": "27a9b11ad39288e3c927d37129ff51a77b1a3981b9ac18c7bb10c70fced18bf5",
+    "next_levels/decode_fwd_rank/kernels/aic/compressor_project_2_aic.cpp": "476757a18eac84a3d3e00dd64451943bb426685661b02ba2731cf352373dc57b",
+    "next_levels/decode_fwd_rank/kernels/aic/compressor_project_3_aic.cpp": "2b3f7dc8ed5ed69651b2b42575073307abb2e0b9fa1dfc730862648cccdcafb5",
+    "next_levels/decode_fwd_rank/kernels/aic/compressor_project_aic.cpp": "e277e507be70d862075a0d394b968a3007e8b66f66a3ed35d23cb5049bf83ee5",
+    "next_levels/decode_fwd_rank/kernels/aic/hc_project_2_aic.cpp": "8b6128569d93b318deacb6f3b216893e698abfbb1b8bfa930021129ad8bb991e",
+    "next_levels/decode_fwd_rank/kernels/aic/hc_project_aic.cpp": "cb98e3dcb345edd868ed965fc5e1fa457473c3209cbec980d7ac775a2d38c8cb",
+    "next_levels/decode_fwd_rank/kernels/aic/index_scores_aic.cpp": "d59aa3bfd0f6fd850caf4b3ef79206b2da0202be0d5ac88c803e25ce28cd250e",
+    "next_levels/decode_fwd_rank/kernels/aic/index_weights_aic.cpp": "de37c6715f7b44446db72a76b018e42bc6f38af9b32e4de1d34dabac06060580",
+    "next_levels/decode_fwd_rank/kernels/aic/lm_head_aic.cpp": "2b898f4419109d3ac5e4817995eb158be59fb0aff2c1c827cfac7605a49e60e2",
+    "next_levels/decode_fwd_rank/kernels/aic/moe_gate_aic.cpp": "62b6f1d8bd6c184d1b9883ea9d9a855fee56eb60d4d83ff03a49b38983556b20",
+    "next_levels/decode_fwd_rank/kernels/aic/o_proj_a_aic.cpp": "603e95797913e48de626fd5ecbc6026ade078166d5bed1a87f0642e90c8e539c",
+    "next_levels/decode_fwd_rank/kernels/aic/o_proj_b_aic.cpp": "6445204d712a775a8f4f0dd64fe061e9b90a08b1ee28578f10a68ae732396095",
+    "next_levels/decode_fwd_rank/kernels/aic/w8a8_gemm_0_aic.cpp": "d44b091859374551e5c13cead46c6a55b100ce868900a8026d92251b7ea2bd3b",
+    "next_levels/decode_fwd_rank/kernels/aic/w8a8_gemm_10_aic.cpp": "8656b54fd8c4e5481260a02ed56c7b530a89c6d2b9f241552d181255f1d08952",
+    "next_levels/decode_fwd_rank/kernels/aic/w8a8_gemm_11_aic.cpp": "eed89b8ecc3226635a00f18cdc77073fcac96782c3b6a4fcf88e6789f4ccbf74",
+    "next_levels/decode_fwd_rank/kernels/aic/w8a8_gemm_18_aic.cpp": "cf92651750704e32792a89ed87f37633f64b4053e0825d6e035e73d993ddabc3",
+    "next_levels/decode_fwd_rank/kernels/aic/w8a8_gemm_1_aic.cpp": "784dbaa0c14a77ee58eda020d18f775d006e73fe6c36e12d413799f68794b8a7",
+    "next_levels/decode_fwd_rank/kernels/aic/w8a8_gemm_aic.cpp": "d5591ced0af9a62bd27b4e000d070d4bb0ee0e068db94a809c839ed9454879a3",
+    "next_levels/decode_fwd_rank/kernels/aiv/attention_core_0_aiv.cpp": "5675a1fcf040b5503fdefa08ae7a77a02a64acd71856e23bafee7323136c3274",
+    "next_levels/decode_fwd_rank/kernels/aiv/attention_core_aiv.cpp": "32d0f3770f0cc666b6dbfe0ce7e5837283346eb565407918af31097752e32316",
+    "next_levels/decode_fwd_rank/kernels/aiv/attention_input_copy.cpp": "427e3727bd7020222dc0e7d3118dbfc77e8f80f8627b4d39adb14582636afeb6",
+    "next_levels/decode_fwd_rank/kernels/aiv/c2a_pair_pool.cpp": "baaed1d389eafd017e0e6868847b20d270862d83b8454bd5616265eefd0fc5f2",
+    "next_levels/decode_fwd_rank/kernels/aiv/c2a_state_write.cpp": "e98a8bc9e57b21226620529a1c1ad556794a89715cd024fa49f0635cbca411e9",
+    "next_levels/decode_fwd_rank/kernels/aiv/cache_publish.cpp": "1decf60805ab2d3decd1d4d49b373f743e6a0926739bd4fa417d45be91557a43",
+    "next_levels/decode_fwd_rank/kernels/aiv/cache_publish_2.cpp": "a79d718ccde7cd5ac7eeba53246f379d8443d737c88139198945bb4e79e9893a",
+    "next_levels/decode_fwd_rank/kernels/aiv/compressor_project_0_aiv.cpp": "37293fa37bc7e49d4892b832dd6834c80f26fb327c186634955f6eb12d9d2d67",
+    "next_levels/decode_fwd_rank/kernels/aiv/compressor_project_2_aiv.cpp": "981c9d4439959805d230242cf5690477aaec6a66e43558c0eed6b647283d8797",
+    "next_levels/decode_fwd_rank/kernels/aiv/compressor_project_3_aiv.cpp": "62a093ca2a22d393272b9e7939ea967aae3ebf166b2c6b8e62c9a62a8085080d",
+    "next_levels/decode_fwd_rank/kernels/aiv/compressor_project_aiv.cpp": "dd3274badff91bbde6345a71dca5fc0fcbaf857173bfbc8ec446b9ec7569fe05",
+    "next_levels/decode_fwd_rank/kernels/aiv/decode_carry_pre.cpp": "2bb2b86021ed9a9267ea32053976abd009fc665b8e0f0514f9e4723241679938",
+    "next_levels/decode_fwd_rank/kernels/aiv/decode_carry_x.cpp": "6cca2a615445dbe4c504d929671b8bf9f947eb2fb8dad6fd444ecec087029941",
+    "next_levels/decode_fwd_rank/kernels/aiv/decode_snapshot_pre.cpp": "f3d5c8bee3c89ea1eb5b3220cff933169f702bf9d931a6522ea4e8436ce1fe90",
+    "next_levels/decode_fwd_rank/kernels/aiv/decode_snapshot_x.cpp": "17306027e2412b3ac698d484aa57c11cce9804f9f36c81d968e9e7b7c56282b8",
+    "next_levels/decode_fwd_rank/kernels/aiv/embed_shard_ids.cpp": "c1c179c559495d085e8c89e736b14f15ae3aa6b4c64328171ee3db824993afca",
+    "next_levels/decode_fwd_rank/kernels/aiv/embed_shard_mask.cpp": "6c1a4add4a659fb6f128355b78456e459e0933dcaa1250fa2629d8411ad4f870",
+    "next_levels/decode_fwd_rank/kernels/aiv/embed_to_hc.cpp": "b692b4c78903a50479328227b1de331b4971c79652a02c1d02728b9048ea0828",
+    "next_levels/decode_fwd_rank/kernels/aiv/embed_window_keepalive.cpp": "41803b3c8ab4892fca42f0a6b6fa0e5864492b148fa2bb993893f20dacf0afc1",
+    "next_levels/decode_fwd_rank/kernels/aiv/embedding_lookup.cpp": "aaf02662afb7a17ead9a6f279ee2b1d099a50d97160fcd124574ef75eaf75191",
+    "next_levels/decode_fwd_rank/kernels/aiv/engram_gate.cpp": "38097ee2a6ab2857983e3bf2d9548c9b1d76c7c805f1d2f93a3cc9683baf2c4b",
+    "next_levels/decode_fwd_rank/kernels/aiv/engram_restore_basis.cpp": "ce7357d5128f564aef66dda28cedb11f0099d107b9dfa6ad6fc3ffcbcf53c352",
+    "next_levels/decode_fwd_rank/kernels/aiv/gather_selected.cpp": "8417b9be18bd99cb99d17ee8ee5bfaf01d4ae1cecb0d3874c4449b17f3f94c3b",
+    "next_levels/decode_fwd_rank/kernels/aiv/gather_window.cpp": "9752f45446a02988fae785d2ee505b9401c5bcc6953c5f5ce8e6cee7b950c149",
+    "next_levels/decode_fwd_rank/kernels/aiv/hc_coefficients.cpp": "202b509ac947f620e8bcb7e96d9f55b689401eccbcdf63ce54e1cf1b30d99d28",
+    "next_levels/decode_fwd_rank/kernels/aiv/hc_coefficients_2.cpp": "f32eabe2a3b995a524e0e0386f27f02ce8d5cf6a568f20123b8016fdbffdd60d",
+    "next_levels/decode_fwd_rank/kernels/aiv/hc_head.cpp": "0881077e35b487de366dfa19e50500abdfa1fef27b91131e636e095f37f9651d",
+    "next_levels/decode_fwd_rank/kernels/aiv/hc_head_2.cpp": "f08a36b3713ce484661405de4a4a49c1437442949ed9869c0f85744e7dcef3f0",
+    "next_levels/decode_fwd_rank/kernels/aiv/hc_inv_rms.cpp": "6e356efc887a9d4455eec3cefa0abbfeb6988c889441c858137eace9c165cf50",
+    "next_levels/decode_fwd_rank/kernels/aiv/hc_post.cpp": "908f0ead8857628debf087de39c937b7eb9f59dbc50e7bc83a9e588c59860bbc",
+    "next_levels/decode_fwd_rank/kernels/aiv/hc_post_2.cpp": "c4e3f9c07a3e84a5a44e3cc8b66aaab77c9ad48c8a698b9489a782eca85f5673",
+    "next_levels/decode_fwd_rank/kernels/aiv/hc_project_2_aiv.cpp": "529ba331b7a714ec3b7aade7daa9386f992ffc8c4aa028043fc89afe76195c7e",
+    "next_levels/decode_fwd_rank/kernels/aiv/hc_project_aiv.cpp": "e346e97389702b8026b0c40577658277ef4b8d67196b04e5634ec57dfa1cee28",
+    "next_levels/decode_fwd_rank/kernels/aiv/index_block_pool.cpp": "c991578665f608b108120728bd7137caf6b3b1996e516e8142b9f4db66f86049",
+    "next_levels/decode_fwd_rank/kernels/aiv/index_candidate_filter.cpp": "499afd26ddc6aa0c6c3aedefbee84c2570040f42818de78812a428e1c0c19ee4",
+    "next_levels/decode_fwd_rank/kernels/aiv/index_pool_counts.cpp": "712fc7ab146bc41014122308d13517f35d26011b42682575daea63586d549da1",
+    "next_levels/decode_fwd_rank/kernels/aiv/index_scores_aiv.cpp": "171ae81d5292e374a6992e03cd9fcc59f77188a4259723a5f8790ccf8b80feef",
+    "next_levels/decode_fwd_rank/kernels/aiv/index_topk.cpp": "80a1b7d5ad312cf180e1ce3e1352cb597c303a038be75eda48d7ac3a08c99f0d",
+    "next_levels/decode_fwd_rank/kernels/aiv/index_topk_1.cpp": "3e5406cdaa1f92dbab753db90aadbf947f5a9a5daa748b026d59fde4226cabdb",
+    "next_levels/decode_fwd_rank/kernels/aiv/index_weights_aiv.cpp": "2cae04a54122cae4ef18428b80b066d4ce6f3ea11311672d1047b313d414154f",
+    "next_levels/decode_fwd_rank/kernels/aiv/int8_quant_per_token.cpp": "4fcbeea6c3543602ba4b5d2438958e1cf82ec9c23b0b42fbc760889c5d4a5e78",
+    "next_levels/decode_fwd_rank/kernels/aiv/int8_quant_per_token_0.cpp": "ebbad3c2da8b4f7d401d274e69fcd1cb4232e96d19e90a4c02dab35a0e56ed18",
+    "next_levels/decode_fwd_rank/kernels/aiv/int8_quant_per_token_15.cpp": "cf204ae25854d18244d8e4e721db680db7de4f7e981609eb07e8d4b45322bfb1",
+    "next_levels/decode_fwd_rank/kernels/aiv/int8_quant_per_token_16.cpp": "bb5ef5c0bc0268edb94f50985e83cf5e095e4c86915bd06c73adb883ab7320de",
+    "next_levels/decode_fwd_rank/kernels/aiv/lm_head_aiv.cpp": "32d940627c1e0d904e8e4c8e33e632688fe9a83d5fbe921ab53bd5bc1599ab02",
+    "next_levels/decode_fwd_rank/kernels/aiv/moe_combine.cpp": "ee4aeb1c1888bc1d32fe7853e5409908713ce1d105e2679157e28abfd3729a83",
+    "next_levels/decode_fwd_rank/kernels/aiv/moe_combine_0.cpp": "8d99de7f42a4a5eb2e767ad17fa7d8c93aa7d210d15528d44c1b66f85044463b",
+    "next_levels/decode_fwd_rank/kernels/aiv/moe_compact.cpp": "a3341bb1419a2a441bdae054e10d5376e438c89f8349c8bf65f9575108d22629",
+    "next_levels/decode_fwd_rank/kernels/aiv/moe_compact_clear.cpp": "8041c46a05d6b80b29b2da7eb6f28c56a8e40c00abf185b642029dbf4679a803",
+    "next_levels/decode_fwd_rank/kernels/aiv/moe_consumed_signal.cpp": "e3c3c2422d1547308ae4e5761820c444bed013d28adcdc158aa8974c7e837b37",
+    "next_levels/decode_fwd_rank/kernels/aiv/moe_dispatch_count.cpp": "fc74fbea624a83017de31b7ba127eaf899b90370cf2e69abc120a21002d874ea",
+    "next_levels/decode_fwd_rank/kernels/aiv/moe_dispatch_count_0.cpp": "eed5f7354d1a77bf57d7739b4e799ef3a388d396f9e72fe55a1a65b1d6dea0ea",
+    "next_levels/decode_fwd_rank/kernels/aiv/moe_dispatch_push.cpp": "d1f8c1b136c37c278dcda7639699e81bd2ced09fee810f4900cda93fdf7b10d8",
+    "next_levels/decode_fwd_rank/kernels/aiv/moe_dispatch_push_0.cpp": "cda325f52c3aede3980bcac1f9f039fd93999d95dac2f9467f91557e43186d47",
+    "next_levels/decode_fwd_rank/kernels/aiv/moe_dispatch_signal.cpp": "cdd0bb4556890885d9eeec0f81a6d0e4f9340f63ec5fb362c1eca07c7aa6c23c",
+    "next_levels/decode_fwd_rank/kernels/aiv/moe_gate_aiv.cpp": "663a59667e834d0b098800f5c898c5617eb8ab945d98fe926c47250d4bef0b8d",
+    "next_levels/decode_fwd_rank/kernels/aiv/moe_return.cpp": "7b36da3156ee8502b2276617e3b7e7766a7355ce26c6fdcee3731cfe1b1dc348",
+    "next_levels/decode_fwd_rank/kernels/aiv/moe_return_consumed.cpp": "c4d154d6c7addc3676c4f1e81d10cc3cbde12c07cba117046fc39e9b4ba396e0",
+    "next_levels/decode_fwd_rank/kernels/aiv/moe_return_reuse.cpp": "5bc1f4e6619841a35c9192aa73ec6b77755554abfae441acda00b8796847c6d0",
+    "next_levels/decode_fwd_rank/kernels/aiv/moe_return_signal.cpp": "23d41e091aa36138232cbe0ae0d21574db60bc89d8679fd202b5b86ea6a32476",
+    "next_levels/decode_fwd_rank/kernels/aiv/moe_reuse_wait.cpp": "808a459971bd7aeb0e1b5330600e1294164f34a1db7c7fdd38b26eaaba24c2dc",
+    "next_levels/decode_fwd_rank/kernels/aiv/moe_shared_stage.cpp": "26ca3116b748fc651cb8ea92fa1fc3c1a364ba64f4b077edb1c9eb5c00d0e7e3",
+    "next_levels/decode_fwd_rank/kernels/aiv/moe_shared_store.cpp": "b09ab49afa9fe7e83fa2d9df93f519f1f0f1a35f5ff87c73332a32a857b453fa",
+    "next_levels/decode_fwd_rank/kernels/aiv/o_proj_a_aiv.cpp": "2e997a1bf0f6c9ddae54872ba7e26170bffc85d113a8d16e71197d9d48be9e8f",
+    "next_levels/decode_fwd_rank/kernels/aiv/o_proj_b_aiv.cpp": "d9a3e90e36c2ee478f721287e919509ede71d05a8c8924fd15c236d1d406bc1f",
+    "next_levels/decode_fwd_rank/kernels/aiv/output_inverse_sine.cpp": "14e7fedccd0d1558f2ba81cf72531b53d5873112abe6001ed5123a219b464762",
+    "next_levels/decode_fwd_rank/kernels/aiv/rms_norm.cpp": "c9c4f74151352210e64e8d88173de13812c463ceb9ef024f051269a04bc7dc3d",
+    "next_levels/decode_fwd_rank/kernels/aiv/rms_norm_0.cpp": "c1a674d342ebcb66376802b60877acb86d8bf8177bc419b868c34b1f402c77bf",
+    "next_levels/decode_fwd_rank/kernels/aiv/rms_norm_1.cpp": "958ed1daa420719f461fe798807aa8d006720f3404f904ef7b661227e9916f82",
+    "next_levels/decode_fwd_rank/kernels/aiv/rms_norm_10.cpp": "eb79c1e07c946aafcb7152fd8af25e2dddbd2d5037e47846b25b73e6e5c8b167",
+    "next_levels/decode_fwd_rank/kernels/aiv/rms_norm_15.cpp": "b6a6e57e210088689906c0b0b79e2a7739d0959c6e0fddd63dc3644c85e0d72b",
+    "next_levels/decode_fwd_rank/kernels/aiv/rope_tail_bf16.cpp": "63f04d329b7cc90ccb21e6a8a423e2e786f7a3af093c6ce349b355934cf960e7",
+    "next_levels/decode_fwd_rank/kernels/aiv/rope_tail_bf16_0.cpp": "c708fa9235eb4b92572068f7155db28f65b56b2ebd2c1c5d8793fed9c7f6d0af",
+    "next_levels/decode_fwd_rank/kernels/aiv/rope_tail_bf16_1.cpp": "9e0afde2b5269ac7061401466d3b97b5de36acb6777cbd2efa4bb36ca4180bec",
+    "next_levels/decode_fwd_rank/kernels/aiv/rope_tail_bf16_13.cpp": "b3a5600a71403b9e086d31463e90fafce6bda4e7bc6b411084cb37d8326be191",
+    "next_levels/decode_fwd_rank/kernels/aiv/rope_tail_fp32.cpp": "1997ccabb9dda1039cf58140b84c0f66bfb995fa09b6fc58911e4766f0f4aef7",
+    "next_levels/decode_fwd_rank/kernels/aiv/snapshot_rows.cpp": "797e722cbbcf8d6dc079a31e7a4fd4393cc942e01dddb5b787f39db40a71b7dd",
+    "next_levels/decode_fwd_rank/kernels/aiv/snapshot_rows_0.cpp": "df4023b88c43e72f949a97d38f51a5921632c1c6978443a0dd3cbd5ebd9648b7",
+    "next_levels/decode_fwd_rank/kernels/aiv/snapshot_rows_10.cpp": "079e278fa94d9dd3e6fbcdab90479ebcbecc092e4c2c0a974b98841c43e3c821",
+    "next_levels/decode_fwd_rank/kernels/aiv/swiglu.cpp": "4a516f6020c8f0cfe853eb86f55c4224ff91958f735cadbfb5416046c5a16486",
+    "next_levels/decode_fwd_rank/kernels/aiv/swiglu_shared.cpp": "2e918119ca8db4fc15aaa8ca363c6bf3ec8e4a0aeace1bb89c8ee103e1916033",
+    "next_levels/decode_fwd_rank/kernels/aiv/tp_out_consumed.cpp": "84499435b43a47211f9aa398ac432d031c630d0f9df5a5d54bc6d67093487582",
+    "next_levels/decode_fwd_rank/kernels/aiv/tp_out_consumed_0.cpp": "09e070b9aeb1276c50344983a0c173ed085f5c98cc6e879a1221987bf204d478",
+    "next_levels/decode_fwd_rank/kernels/aiv/tp_out_publish.cpp": "e63e8076bc0eb0d517ee0dc96452ea2d9d3c613ddb6f42a3b24136a71dceb84c",
+    "next_levels/decode_fwd_rank/kernels/aiv/tp_out_ready.cpp": "8e538ad18bf20bc03b329d9c7308b437b7271a46bec0374e7d97d866d187d376",
+    "next_levels/decode_fwd_rank/kernels/aiv/tp_out_reuse.cpp": "4ed099d2b57eae3340324c0c2c7b353f1dd9ee37ade50645e77a05ed6d936215",
+    "next_levels/decode_fwd_rank/kernels/aiv/tp_out_reuse_0.cpp": "3ca51840a79cfb3995834072c2ec14e169f1aa309979b484682f5daea64a90f2",
+    "next_levels/decode_fwd_rank/kernels/aiv/tp_out_sum.cpp": "51c34daa9cfbfbfea134a69fde7bf4ab82718a628b123371e8c0845668b8ad7c",
+    "next_levels/decode_fwd_rank/kernels/aiv/tp_out_wait.cpp": "84e4fe35cc72483d55a3e1c8841b2705881971ad389f4c76f393983e5c2408f6",
+    "next_levels/decode_fwd_rank/kernels/aiv/tp_out_wait_0.cpp": "9e2271bb914f628fa31c99e2fcec8f8464f0185adcce32cf00e4df694b4ea8b8",
+    "next_levels/decode_fwd_rank/kernels/aiv/w8a8_gemm_0_aiv.cpp": "1ca55b0e3fd967eabe1a9b522a0b3c94394851fdeacd27115609102cfd87e7d2",
+    "next_levels/decode_fwd_rank/kernels/aiv/w8a8_gemm_10_aiv.cpp": "19cc725e012ee563bb06a2d07dbfeb669883c867387c4611525ee581178363f1",
+    "next_levels/decode_fwd_rank/kernels/aiv/w8a8_gemm_11_aiv.cpp": "b79bf90ab0e3446e5569554a31297fab0bb122a32d80ecd0be43532caba9f514",
+    "next_levels/decode_fwd_rank/kernels/aiv/w8a8_gemm_18_aiv.cpp": "83681727e34bc2c3dd904159261a3a75aa53cbd99feece93a3eb17692fadcc36",
+    "next_levels/decode_fwd_rank/kernels/aiv/w8a8_gemm_1_aiv.cpp": "ffa7d1251f07c2610b3085aafdd831ec6e03421f28237d66095995a42fc65698",
+    "next_levels/decode_fwd_rank/kernels/aiv/w8a8_gemm_aiv.cpp": "dc342325953afd949be15090ec8a6e6e31ce618a010b72560bce8122f39787aa",
+    "next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp": "d8dfeb0bf048f32e478d8a2d2c9c8fe776cdaff6ef42d6c2c14d583f91fe89fa",
+    "next_levels/decode_fwd_rank/ptoas/attention_core.cpp": "bef81516fd88f393b2768e119526f9d01ca0637a619d9aa1a37092bb5742c6f6",
+    "next_levels/decode_fwd_rank/ptoas/attention_core.pto": "1ba665d0d54e09d6bf5d5ba2fd1a807734e97da57391475f4ebe21350e75946a",
+    "next_levels/decode_fwd_rank/ptoas/attention_core_0.cpp": "ece983527d9ac903e2e3d362f30cca3ae2e4ecc99e0a1460ee0fd82c086ad01c",
+    "next_levels/decode_fwd_rank/ptoas/attention_core_0.pto": "77ccdd5a84873c82fa5ce3e94bb127294ba74a4c10101028d4716c01784624a6",
+    "next_levels/decode_fwd_rank/ptoas/attention_input_copy.cpp": "0bcb6e9822f9a5033e49d193d40eb46eba52ec4534e93e5b5aff292c9fdc3d17",
+    "next_levels/decode_fwd_rank/ptoas/attention_input_copy.pto": "28ab035c689c0d2539a8e4a3a63b19ad0e3f552f77ed6dbaea694b88f8ead7f7",
+    "next_levels/decode_fwd_rank/ptoas/c2a_pair_pool.cpp": "4503a5972f4112543cb3ba084cae81746ed16630f1937be3bff5866c4bcdac59",
+    "next_levels/decode_fwd_rank/ptoas/c2a_pair_pool.pto": "457b8341f72405ef42048d3f4d35a306ec8dbe281c39616f32bf7789dabef344",
+    "next_levels/decode_fwd_rank/ptoas/c2a_state_write.cpp": "062ef2bcb344c6a7516bc7f96a91e28faf3d7774d4ea97152002f9ef272c803f",
+    "next_levels/decode_fwd_rank/ptoas/c2a_state_write.pto": "bfb8e6463ea200c32f9e0cabcac72cd014a3b8fd422c5e835a93c8dd000ffa44",
+    "next_levels/decode_fwd_rank/ptoas/cache_publish.cpp": "3623e5cc83016c342b45736f748da07f2e32593f057ad215157b98c2ca3a8f5d",
+    "next_levels/decode_fwd_rank/ptoas/cache_publish.pto": "ec218c528d62a3b49ac02ea0ef775fd83cb9e6d167fdff268f1352ef214eb9b4",
+    "next_levels/decode_fwd_rank/ptoas/cache_publish_2.cpp": "d27bb669adf100fa43b253431378a88074cb9c6bbf8a03d4198d23a418fd5ce7",
+    "next_levels/decode_fwd_rank/ptoas/cache_publish_2.pto": "bdab123d93125441c702f8406aa7d46c2a6bb377b6026c14445ba456a2f8311c",
+    "next_levels/decode_fwd_rank/ptoas/compressor_project.cpp": "4c02219902fc521fb007eefc95a74d6b07d908a77732fe8d86a5e061f3f85074",
+    "next_levels/decode_fwd_rank/ptoas/compressor_project.pto": "dba6024bc5183719a0e6abe8a7e67726aa1f9f67e5af073654690224d16dd5fd",
+    "next_levels/decode_fwd_rank/ptoas/compressor_project_0.cpp": "20819e122af5e9029c36140defd99d00ebdfb8524e7e201d0eda7e3cbafbd069",
+    "next_levels/decode_fwd_rank/ptoas/compressor_project_0.pto": "a8002b4e1d816e96d7918de0fcbc23fa83d63b244efe208505bc1660d11b6f04",
+    "next_levels/decode_fwd_rank/ptoas/compressor_project_2.cpp": "c64367d5b129e684eca676ac8a4abb66f3faf8122240aae08080f50ece9ddb77",
+    "next_levels/decode_fwd_rank/ptoas/compressor_project_2.pto": "5df2de86e8a8c417b64b451521e619c511fa3d19154fff28c1b35f58cfc0ad21",
+    "next_levels/decode_fwd_rank/ptoas/compressor_project_3.cpp": "3a8477450c9f2fb96ac4f6a059a3c1b227d14ce679bbbd5399071e9482e73b9d",
+    "next_levels/decode_fwd_rank/ptoas/compressor_project_3.pto": "ab9707b9541a3d96e8c1c03db25faacae5368f7e4c2517a586eefdb283672205",
+    "next_levels/decode_fwd_rank/ptoas/decode_carry_pre.cpp": "c342f31936f09396852ae1e087c48c49fe2e820da9dca6a898b58366ace2b3e2",
+    "next_levels/decode_fwd_rank/ptoas/decode_carry_pre.pto": "d64f06258550cf3e1173695566e16c318da2248c58ac37f9e24849583d8be402",
+    "next_levels/decode_fwd_rank/ptoas/decode_carry_x.cpp": "36489e94bce5be27a40d9b96cc1ffffeb2a8d845601b7b900a63e8170b79153b",
+    "next_levels/decode_fwd_rank/ptoas/decode_carry_x.pto": "7410a39aa2c0927a868d6a41d178571bd51541a8a2592bb1417eaec5a57de26c",
+    "next_levels/decode_fwd_rank/ptoas/decode_snapshot_pre.cpp": "de1ead0ff9d9ff6833991e405b19b63de06254f5e2e8c7bed7715eb14bf04b99",
+    "next_levels/decode_fwd_rank/ptoas/decode_snapshot_pre.pto": "b3f8fb243eae53305310a690fc639aad529f9f5988d1c8e30985888bcdbe9841",
+    "next_levels/decode_fwd_rank/ptoas/decode_snapshot_x.cpp": "9d5e8e295b257bc643474d7f34f6dfca7d598b915e76f11c23f69465957365cf",
+    "next_levels/decode_fwd_rank/ptoas/decode_snapshot_x.pto": "e62c4d8fc2b9f99034ca15b5ecef4c7ee8fad084710f346a6568f7e5a4770884",
+    "next_levels/decode_fwd_rank/ptoas/embed_shard_ids.cpp": "027660fb49b3f7366058a2a9912dc9d7222727d214046d833d3f18d18e87109a",
+    "next_levels/decode_fwd_rank/ptoas/embed_shard_ids.pto": "48dc6a33dd4eb21cf43d0162fdb8414ca059d90efbc822e9b4e678080aff85d9",
+    "next_levels/decode_fwd_rank/ptoas/embed_shard_mask.cpp": "214189ea50b315d756f887749421708357137e6a36a131821cbffa641cec996b",
+    "next_levels/decode_fwd_rank/ptoas/embed_shard_mask.pto": "4e48129f41e1740df7ed276c836f472a4c9c1f7b6ac42cbbaec21b5f21b64705",
+    "next_levels/decode_fwd_rank/ptoas/embed_to_hc.cpp": "c3336f9a9e9f6eb1a36c18ce898e64f2bb31e3ee17faa8cf79297bf769fed01d",
+    "next_levels/decode_fwd_rank/ptoas/embed_to_hc.pto": "9f9f2a8246c62ff9889023115500a92ea35fb11354e64e35e2fb96416a404f5f",
+    "next_levels/decode_fwd_rank/ptoas/embed_window_keepalive.cpp": "e9ff7377701884d4b9288e77b530bee2485197e2c30710144a9b9e74d18bd36c",
+    "next_levels/decode_fwd_rank/ptoas/embed_window_keepalive.pto": "2c9b86729d095ff84454310120d44d337a9c1114a26712f8f702a90ffd2c5115",
+    "next_levels/decode_fwd_rank/ptoas/embedding_lookup.cpp": "842c399e8e32c69e32f95fd0ba78053576f742f368d9c179d169b4c8f3ffcfa1",
+    "next_levels/decode_fwd_rank/ptoas/embedding_lookup.pto": "eb51d5613cf71a7eb7f3b0802215bcbde156f103ced179c8aaebacdb60741228",
+    "next_levels/decode_fwd_rank/ptoas/engram_gate.cpp": "9dc7ff5b6907d3094c108869d3bd86e6b777938bceb2c2ba23c51916cbac12dc",
+    "next_levels/decode_fwd_rank/ptoas/engram_gate.pto": "8293de6e308399a75f6cd50ec5e8b745b81d259ead94f09d0d2679ea7063187a",
+    "next_levels/decode_fwd_rank/ptoas/engram_restore_basis.cpp": "ac00883c104fcb299282faf262c3aa14d973e397233edb71e8e6f4490f495c46",
+    "next_levels/decode_fwd_rank/ptoas/engram_restore_basis.pto": "3ea7276475ff87aae42f67795c1c949f2eec9455c4a19ae96faff80a7ede8e7f",
+    "next_levels/decode_fwd_rank/ptoas/gather_selected.cpp": "4b80524f19760cd74b582678bfc65b221fd54ca92eb8f0993af989af02557988",
+    "next_levels/decode_fwd_rank/ptoas/gather_selected.pto": "1a2497f93e7d15401696a459bf2431295c6307f6d92622e1333a9520ac4b7603",
+    "next_levels/decode_fwd_rank/ptoas/gather_window.cpp": "7f445c954067f9e0a3bdc44cde0083582426eaf9b40276d8594d3911e83d4f5a",
+    "next_levels/decode_fwd_rank/ptoas/gather_window.pto": "da6ba3c289811321d4f9dd5dc9718bae46021b0ba95cd823a502e1aa5a3cbbed",
+    "next_levels/decode_fwd_rank/ptoas/hc_coefficients.cpp": "645892106a76944a7eeb8d2b42a78feb1bb41b7cce1d08ebbb2d6181e667bbef",
+    "next_levels/decode_fwd_rank/ptoas/hc_coefficients.pto": "0b1db7e25c77f99d7008c58d6fb44d452f99c10a5b0222fba19c38394d389c5e",
+    "next_levels/decode_fwd_rank/ptoas/hc_coefficients_2.cpp": "78b11847353af4926907b1ff615b159d75b23f4702b536a3e1002d481a8551ca",
+    "next_levels/decode_fwd_rank/ptoas/hc_coefficients_2.pto": "f3a18854796ff1f28a2ae77b29160259b1359f1db57ab0934481c66938b0c72f",
+    "next_levels/decode_fwd_rank/ptoas/hc_head.cpp": "4bb7d746c32d474bafeff7888359f57f75f4942e1b3bcfcb65a7b4d21115d17a",
+    "next_levels/decode_fwd_rank/ptoas/hc_head.pto": "dcd16598d286a6ea8ed19d24c9e8f7d446351a88b3c811361e96857140228648",
+    "next_levels/decode_fwd_rank/ptoas/hc_head_2.cpp": "2d4760d873c0a779b8fa14db6500248c2218cf5cd4c9faafd997a214823d7442",
+    "next_levels/decode_fwd_rank/ptoas/hc_head_2.pto": "d07e7c4727f894fb3418b619ba19dc5a15ad01716fc3dbe00705eb13e1fe4a34",
+    "next_levels/decode_fwd_rank/ptoas/hc_inv_rms.cpp": "a65465b0fd0f3d6211c2198224b869554b05505e8e3f418bea91cf9da5c4e3f9",
+    "next_levels/decode_fwd_rank/ptoas/hc_inv_rms.pto": "cef50bef34913df97e83e2e947734723ebd796921fb7f0ad6da57f5f7fadc3e5",
+    "next_levels/decode_fwd_rank/ptoas/hc_post.cpp": "0ad916b3ea12c77e93eb3b53a90d46046ff63f1fcb40a714e9e0627b99e4f847",
+    "next_levels/decode_fwd_rank/ptoas/hc_post.pto": "1aa26eaeb351e5688433e736d3465e0dd4b9dd40ed7ee474d990ca629470e5f2",
+    "next_levels/decode_fwd_rank/ptoas/hc_post_2.cpp": "33c42139652a8f8f0cc2fe977669502c52f6e1e155a367fdb133ab683def55dd",
+    "next_levels/decode_fwd_rank/ptoas/hc_post_2.pto": "3b2baf11f9ac7dfb525f74232a3c4de0f90c2d66ca09317b72002234105c3618",
+    "next_levels/decode_fwd_rank/ptoas/hc_project.cpp": "23b2703030d0c7527dee15e63ea7656a30742a3c2e0dca03116c38ce2e7b0e67",
+    "next_levels/decode_fwd_rank/ptoas/hc_project.pto": "068848437294f87448443df8f75787aada700ba3159830294a51a7601d00e659",
+    "next_levels/decode_fwd_rank/ptoas/hc_project_2.cpp": "3e7cb85b53bb1b7485e0646d9ef06ba05123d3371b87f94f6e84c6aeb574799a",
+    "next_levels/decode_fwd_rank/ptoas/hc_project_2.pto": "34225c3eab5144b7446285a7deafe34142a35edf3058b03e80733262a2095ad4",
+    "next_levels/decode_fwd_rank/ptoas/index_block_pool.cpp": "cd783f8e2fe0979d88393dfc565e435993e501e25288b3634001f68bc4995ef1",
+    "next_levels/decode_fwd_rank/ptoas/index_block_pool.pto": "b8e99fef6a6aca145069373928f5165d3d81d152260d10216376422abfba0b91",
+    "next_levels/decode_fwd_rank/ptoas/index_candidate_filter.cpp": "5ae1646a127c0b532c732ae32f1f062680ff61fa0094be507cc487372819ae3c",
+    "next_levels/decode_fwd_rank/ptoas/index_candidate_filter.pto": "b9c02f34f7f66984d8439a21a9a22d53716f04eb7b8da920784b61afc1fe1de9",
+    "next_levels/decode_fwd_rank/ptoas/index_pool_counts.cpp": "cdb64bf39e7653a13342de5a403c3aa4311f4459f7f7c3be6044b0f63c6e4537",
+    "next_levels/decode_fwd_rank/ptoas/index_pool_counts.pto": "d5c69dc192824a909178b86d0a79a5420dfa5781e24b12c3ae9dcd7ba7c5ac29",
+    "next_levels/decode_fwd_rank/ptoas/index_scores.cpp": "61be4803a8ee8f0963ad24704619aa27f079fd052d58e845c8e8d7da0a2c8037",
+    "next_levels/decode_fwd_rank/ptoas/index_scores.pto": "6d2f975f781db44d2704a296a85dde00f588381ffe926e4feff4bba1055021ae",
+    "next_levels/decode_fwd_rank/ptoas/index_topk.cpp": "6bb597a1338fc43cac715394a2118f6277e44bc0412712ad19a9874334c0cc3d",
+    "next_levels/decode_fwd_rank/ptoas/index_topk.pto": "437377fbbf7a414c4ce148a2e27e45e6a11bbcf8c53b0f1933555a6a163c5c3e",
+    "next_levels/decode_fwd_rank/ptoas/index_topk_1.cpp": "b66be5d50111f71fd687a500c5fcf1fc462c5dacc02b6e08d8652e77fbbf68a9",
+    "next_levels/decode_fwd_rank/ptoas/index_topk_1.pto": "c1ba74021ad1ebe87eca92ea192c7be3ed490f973e9002a271583aae9e89b60e",
+    "next_levels/decode_fwd_rank/ptoas/index_weights.cpp": "f1d74d146a43a4c3faf9a58916ddf577f5934ef2cca2c2da6a143e6bc1691e54",
+    "next_levels/decode_fwd_rank/ptoas/index_weights.pto": "df78dce8d82a9a9ef3cc33c58640049df53171324dd71911f861a0206161d5c8",
+    "next_levels/decode_fwd_rank/ptoas/int8_quant_per_token.cpp": "a4ada220143aacff9c432fbca92117559d1943efe9e699e55a13051619eeb0e7",
+    "next_levels/decode_fwd_rank/ptoas/int8_quant_per_token.pto": "7c7b0a0f8d411db9e904c5a0606552447fd5bf1d2ea965417df0d2cd99ae0f6c",
+    "next_levels/decode_fwd_rank/ptoas/int8_quant_per_token_0.cpp": "be525a746e28a79c0d7d4667fccdc86eb2663cca88da73732e7e3d680ada5b0b",
+    "next_levels/decode_fwd_rank/ptoas/int8_quant_per_token_0.pto": "8dc93e0e906b0cfa0c1bae48f40cc3dc0ff243e7eb3a808252a6ae526b865224",
+    "next_levels/decode_fwd_rank/ptoas/int8_quant_per_token_15.cpp": "e5f8f3a75f4b28d75073c85772410ea9f208478b15a17ca718d16b518af6fed0",
+    "next_levels/decode_fwd_rank/ptoas/int8_quant_per_token_15.pto": "94df74f75208350943c6dde94367348d1f88ee1b79f7c2c025eb1badab376750",
+    "next_levels/decode_fwd_rank/ptoas/int8_quant_per_token_16.cpp": "0e36eff756e669996dacf0a7e78c63e800ec9e9ec428903b160e2bee5f5dd204",
+    "next_levels/decode_fwd_rank/ptoas/int8_quant_per_token_16.pto": "3801821bcd43d06faf4bd4a1c42e2e85a2e6fe7ccc573120ceef8b1558d5e2b4",
+    "next_levels/decode_fwd_rank/ptoas/lm_head.cpp": "aec7a69e7616b534c0dc4bf1649a9cf9cef4fc0dea8f7909922fb1ec67ee43e6",
+    "next_levels/decode_fwd_rank/ptoas/lm_head.pto": "4390eb313b32f5529ca39e1d204ae5fd4943fad6a3c45b16cff75d9225dc915b",
+    "next_levels/decode_fwd_rank/ptoas/moe_combine.cpp": "1919da8dcf4618a6f4f6e9af1e95d7bd10bb01d3e88f27afc600310a9c30e89a",
+    "next_levels/decode_fwd_rank/ptoas/moe_combine.pto": "5a2fc0c3e34ae72413f531b8d830f3754d5ada081b22b8a1b1f1012f254521db",
+    "next_levels/decode_fwd_rank/ptoas/moe_combine_0.cpp": "c1f2be5b2821dbd4027c7d3444167aa4dc5c487092ac5c31ddcc906831cb9e00",
+    "next_levels/decode_fwd_rank/ptoas/moe_combine_0.pto": "7cebdeddaebf28ec92222680ed58af6c3c7f43c3e46691a065ab70024aaf0898",
+    "next_levels/decode_fwd_rank/ptoas/moe_compact.cpp": "117dc7df3aadf1d44aa0f4629ea94cb54e8093a0b86a0eda53e4a8d828aae533",
+    "next_levels/decode_fwd_rank/ptoas/moe_compact.pto": "a65fad3b031dc901a12600ec65ab0d18fdbc6061d235e197fa0935194d1d2fb2",
+    "next_levels/decode_fwd_rank/ptoas/moe_compact_clear.cpp": "e2648151ef397369f7dfd32eb3d4b1ab002ee8337d4aeacaac2113a97be4ecb5",
+    "next_levels/decode_fwd_rank/ptoas/moe_compact_clear.pto": "f767d42713aab277b3295b7fd3ea80c1642e3f4a6a1b64bde23e8fc0fdad0f50",
+    "next_levels/decode_fwd_rank/ptoas/moe_consumed_signal.cpp": "35e7ec99d1df822c231a3774e29dd9e13d1c17a2818204df6a33e67cc7492cac",
+    "next_levels/decode_fwd_rank/ptoas/moe_consumed_signal.pto": "48d2f9eb734fab3a5f9b73c5132a66517c7404585057dd30832f3bfb3bf9fd7f",
+    "next_levels/decode_fwd_rank/ptoas/moe_dispatch_count.cpp": "71abe18230408e9de67734da8496b411f08a0f609987244bbb8d3bb33d870033",
+    "next_levels/decode_fwd_rank/ptoas/moe_dispatch_count.pto": "37622c8b2c99573e1610c24e4e2969f9be98a89d3ff238081a96f60c39aa4ee3",
+    "next_levels/decode_fwd_rank/ptoas/moe_dispatch_count_0.cpp": "cb4e059658d20bcb18c1c2b5f73d6f5fe9265467b136aa745509df15cc4a37e6",
+    "next_levels/decode_fwd_rank/ptoas/moe_dispatch_count_0.pto": "5cb11021fc094c4cd902ed497c1f7da18cd332c9502dd21c63bee3e8afd29bbc",
+    "next_levels/decode_fwd_rank/ptoas/moe_dispatch_push.cpp": "a0dcb99e4d648d606461ddeafcf60c3ab0d15aafff5424ee0b79e84dd34d5fcf",
+    "next_levels/decode_fwd_rank/ptoas/moe_dispatch_push.pto": "a26a3c4df277676eab8a0241f945447118946394bc729bc2106dc33437bf5900",
+    "next_levels/decode_fwd_rank/ptoas/moe_dispatch_push_0.cpp": "f728ead06912f4731dc777ced51ecb5aa1d4b5e8814b878ce0cf2868dc65093f",
+    "next_levels/decode_fwd_rank/ptoas/moe_dispatch_push_0.pto": "78b0e1c75984aeba6de5d3740cc6c42e9256ae6a4f181d12d6625424dc50f648",
+    "next_levels/decode_fwd_rank/ptoas/moe_dispatch_signal.cpp": "e9fc7e77e7703e732d322070aece8a14e43cdb5fdbbb8b981c5b00a2923e33fb",
+    "next_levels/decode_fwd_rank/ptoas/moe_dispatch_signal.pto": "1d9b8536abd38038524d791bee67fd5c5147986ee685c900726c7ee54ee1b3d8",
+    "next_levels/decode_fwd_rank/ptoas/moe_gate.cpp": "3c5a1c33abca2eb70df632ac52b4a55ddfdcfa6ac16f8ed990c656c77c15b1f4",
+    "next_levels/decode_fwd_rank/ptoas/moe_gate.pto": "93135993bf36767cdb38f6b4dc85062a09b316871f31ce94cab05ce7662ff647",
+    "next_levels/decode_fwd_rank/ptoas/moe_return.cpp": "baee942c8e264fab2c3963b7e4b6533d86d826027cb4cd8ede54c3f8865c8804",
+    "next_levels/decode_fwd_rank/ptoas/moe_return.pto": "56a61d11300dd10055e1b5fe4ff58e734a21d0dc8e90485ec3ca07ea3f306758",
+    "next_levels/decode_fwd_rank/ptoas/moe_return_consumed.cpp": "70cc8cdd68453983134445e83317742d7ae7bbe96e75886e0340b750b74b66c5",
+    "next_levels/decode_fwd_rank/ptoas/moe_return_consumed.pto": "4e4dfdf96f9510a384399e0f56007840725ea9965aece362594bb1afba09b3fb",
+    "next_levels/decode_fwd_rank/ptoas/moe_return_reuse.cpp": "b90ec9c8315f1d77e8b2c2618619ec629e63cb6c8b2da31205b84671a2809bb7",
+    "next_levels/decode_fwd_rank/ptoas/moe_return_reuse.pto": "9e8e1bb528d16be8667055060b4bb1743f6835ba89bdeb5e529e8c42fbdd7100",
+    "next_levels/decode_fwd_rank/ptoas/moe_return_signal.cpp": "8f5402da8357ed98c523ea56a43122b45cbbc50162483be9c896856b70de0ec9",
+    "next_levels/decode_fwd_rank/ptoas/moe_return_signal.pto": "6566c635f4b0789ecbf2be3b677435390f750e6e9922815bb382c67f68c22fc1",
+    "next_levels/decode_fwd_rank/ptoas/moe_reuse_wait.cpp": "db26146d0604caa4359c54f14ed8c01fa5e9bc1479680b00a72f3a1121dcd62b",
+    "next_levels/decode_fwd_rank/ptoas/moe_reuse_wait.pto": "d5679b7ed3cf287d7ab6d112b5f7507b1d7da72b1d647a732523659f4e784586",
+    "next_levels/decode_fwd_rank/ptoas/moe_shared_stage.cpp": "2a6db467d4a5ceffd97f483160cd95f5878a1db6359a29106b7eeae91a1043ba",
+    "next_levels/decode_fwd_rank/ptoas/moe_shared_stage.pto": "345498249ef483cdffedd5e9d7ffb310df6f21aefe6659217c0f99ebd7293f5d",
+    "next_levels/decode_fwd_rank/ptoas/moe_shared_store.cpp": "7126335b08d69f2e38f7caab6414a1c191033b6e1509ed39d26409f4d6cf8a00",
+    "next_levels/decode_fwd_rank/ptoas/moe_shared_store.pto": "1e73fd27bbb85b30c6fba9202f2b7741d3574f6bd18e207794f5ab99fcbc4a50",
+    "next_levels/decode_fwd_rank/ptoas/o_proj_a.cpp": "3b1d730d93169b159740acf5f9eaa03a802557a435e31ef0ade023f420f1a6e1",
+    "next_levels/decode_fwd_rank/ptoas/o_proj_a.pto": "32ae552809c7101c8c4b1d4f271a091f63adc4b789b67cf7440c466eeaf8269f",
+    "next_levels/decode_fwd_rank/ptoas/o_proj_b.cpp": "d8767b42bdfdab8a9261bbcab310ccc316aeb571ed628ba7019d79ee040bf977",
+    "next_levels/decode_fwd_rank/ptoas/o_proj_b.pto": "324d9aa0b0a2750615d3ee0368a29dfb40045ca28ddc1f980675b821bf558557",
+    "next_levels/decode_fwd_rank/ptoas/output_inverse_sine.cpp": "69944ab86bccf29d8a5b216a6851294e11dac26fead2bbd573516caa2a64d7e2",
+    "next_levels/decode_fwd_rank/ptoas/output_inverse_sine.pto": "ec005651bfa90d3d7247fe63d69c6836929bfec9c03787c6657ba37cfc2a29ee",
+    "next_levels/decode_fwd_rank/ptoas/rms_norm.cpp": "9eda6d5f9e867f5847120b5063edeaa1712594b11d2849af82acfd0d89203fba",
+    "next_levels/decode_fwd_rank/ptoas/rms_norm.pto": "b95c55278019e5bdcdaa8a89612f6c858478bb8fb66bc84d4239d7598a90e105",
+    "next_levels/decode_fwd_rank/ptoas/rms_norm_0.cpp": "0c3053d3000fedffd9d9ccecd04a54b40c16bf90c38567c91e003d7da53454b2",
+    "next_levels/decode_fwd_rank/ptoas/rms_norm_0.pto": "a87c31b9b41a006c03cf03d8a67782cf9688907fb6de5bafb0521cfb6f8c20aa",
+    "next_levels/decode_fwd_rank/ptoas/rms_norm_1.cpp": "862d8208b1bb4752a4502a8c26384185cd184d3691caa7111bec78bb13588201",
+    "next_levels/decode_fwd_rank/ptoas/rms_norm_1.pto": "83c4f497d1d33209a7bcd03e74a9adb07693bf769bda176e0d549cf763d9abf4",
+    "next_levels/decode_fwd_rank/ptoas/rms_norm_10.cpp": "f620b2abc24a00c76fe7c40841f9e54c006af05c49a66410930a9f42206235ac",
+    "next_levels/decode_fwd_rank/ptoas/rms_norm_10.pto": "2348d52560141b396649bdaf244792bb18f9d64c4281350460d253f19f8f858f",
+    "next_levels/decode_fwd_rank/ptoas/rms_norm_15.cpp": "9e6d796fcb5cd5bb27b0fa06e1575a3209f97253cb8d1ece27d63e1ee7c6b2a8",
+    "next_levels/decode_fwd_rank/ptoas/rms_norm_15.pto": "56d2f06868a8709b3e7b0764258295cc3ac06cf9e038f770eda9725d14d2852c",
+    "next_levels/decode_fwd_rank/ptoas/rope_tail_bf16.cpp": "cbd33ba34388694e3e59f4da729712b57b940c710b1a5556e9896f38aed9eb1f",
+    "next_levels/decode_fwd_rank/ptoas/rope_tail_bf16.pto": "4b08e7d0b63447843904a4948e12b684012f7939cc0acb87d87e5afa010d3c55",
+    "next_levels/decode_fwd_rank/ptoas/rope_tail_bf16_0.cpp": "9222a79b6f06c04d87b36d8d1b328a1cf89fb0c531de167bbf0d9d28f2efa485",
+    "next_levels/decode_fwd_rank/ptoas/rope_tail_bf16_0.pto": "1ea1dd153c1d904c630225dba8f28cd9470a766623132f63aa11934bbac305a2",
+    "next_levels/decode_fwd_rank/ptoas/rope_tail_bf16_1.cpp": "6d92c4806236df43850474e8fbea67056b05bb45bbec26ba2ebb27d750b6fa16",
+    "next_levels/decode_fwd_rank/ptoas/rope_tail_bf16_1.pto": "4b3e7a7f8fa0e8846e7b8647d229bf21a53349d78bb13b1b80ee4496b2fdf0cf",
+    "next_levels/decode_fwd_rank/ptoas/rope_tail_bf16_13.cpp": "3b5540c2d5eb2c4b980861b9e552686c2e361ce2d3fd279fb863e2b23088ce16",
+    "next_levels/decode_fwd_rank/ptoas/rope_tail_bf16_13.pto": "fd5d20c003092d9a3ea406e4c92e48f66102c9134b28da69acb32c6a53534cfc",
+    "next_levels/decode_fwd_rank/ptoas/rope_tail_fp32.cpp": "d11084c553db7eb7981f2992c6d90846e23e669c49d5e7f05a9c049de0a57ccd",
+    "next_levels/decode_fwd_rank/ptoas/rope_tail_fp32.pto": "b9b1a0e975bf34ea64787ac7a02a9a8f0c10ebc83ee6e4a1b9dd3e5dd4d9fdf2",
+    "next_levels/decode_fwd_rank/ptoas/snapshot_rows.cpp": "c4ba0287750d0933c281ee4ef0cabf1a33c2f5d99e1454ab60478518921d4c34",
+    "next_levels/decode_fwd_rank/ptoas/snapshot_rows.pto": "2f06b2cb6c64ac07b0e3523ff5fe7175b13e19ccd64189b473159126453431d4",
+    "next_levels/decode_fwd_rank/ptoas/snapshot_rows_0.cpp": "54a564fca5d1afb11b7133bc39874d980cbd5967c629e4dbc92a5940bed1fde1",
+    "next_levels/decode_fwd_rank/ptoas/snapshot_rows_0.pto": "cfced4bd2f1268ae664e023e23e483ebc583bef4fedaed817bd74fcf364f4f08",
+    "next_levels/decode_fwd_rank/ptoas/snapshot_rows_10.cpp": "ccf936264fdf5d55ec088c5690218a6d3e47dae2e4de634b101e7decc7bb1760",
+    "next_levels/decode_fwd_rank/ptoas/snapshot_rows_10.pto": "85b50893028ba5794da410a8d1a5e6bbcc106a5ef42621456956d5d94301092d",
+    "next_levels/decode_fwd_rank/ptoas/swiglu.cpp": "be0283592103a3240c7f79c472fb1641e39420630f82d3c6593382dc37c8b38a",
+    "next_levels/decode_fwd_rank/ptoas/swiglu.pto": "ddb52268e82ce501482ea45b19659fa9c7680d5967dc148530a2a70fb9e6d529",
+    "next_levels/decode_fwd_rank/ptoas/swiglu_shared.cpp": "545429d2bf07e5facac953f189ec0e3183650c52806f0ac923dcb1f1180aa780",
+    "next_levels/decode_fwd_rank/ptoas/swiglu_shared.pto": "6da024a662e0ae9641da758bb144bf560b326d6a3c42986a31a77bcb33647a92",
+    "next_levels/decode_fwd_rank/ptoas/tp_out_consumed.cpp": "a81f63f14c01536879047246537290c09af159c934ff6df8f5f4cc06ccaac88c",
+    "next_levels/decode_fwd_rank/ptoas/tp_out_consumed.pto": "c0d70709ce4beae7397ad8399a8d90ce76bdd8536479950363d65553bd0ac9ee",
+    "next_levels/decode_fwd_rank/ptoas/tp_out_consumed_0.cpp": "29f43d5f683579a470c3ddfc7061cfe6679867b0b46a6e7e264f0bf7e4bc57b7",
+    "next_levels/decode_fwd_rank/ptoas/tp_out_consumed_0.pto": "1a388bba5c61e366a6bc902b8ea30d564d052f4e04072d8d9c54fe8f3f969218",
+    "next_levels/decode_fwd_rank/ptoas/tp_out_publish.cpp": "643e98b2a54fda68081531047fc5f18e80fc499060a00ac1796a77aa12aa9e64",
+    "next_levels/decode_fwd_rank/ptoas/tp_out_publish.pto": "4b22fbdb75d951ecc5972ae7538aa22937ac2deea22482a86f6ce39821fa1f0a",
+    "next_levels/decode_fwd_rank/ptoas/tp_out_ready.cpp": "39cb3d877d5c8a357ebf1c3a1578259e58561be867e28e7b132a69747c43bec5",
+    "next_levels/decode_fwd_rank/ptoas/tp_out_ready.pto": "81d28294f79332a435a7c48c6afb0a0c9f9086a2132d022b589298235ed34c61",
+    "next_levels/decode_fwd_rank/ptoas/tp_out_reuse.cpp": "d03afb86af29352d8fc0ca57818e2202dff61695093823ef17cb4f38ddea3b9d",
+    "next_levels/decode_fwd_rank/ptoas/tp_out_reuse.pto": "511561684e74b355d1007cfbfd6141266dcbed4c2c785604f2e53bb878c1b670",
+    "next_levels/decode_fwd_rank/ptoas/tp_out_reuse_0.cpp": "e786453daee4e8813c26396deee2d0577aeda217026c485052c25f7ac42f661c",
+    "next_levels/decode_fwd_rank/ptoas/tp_out_reuse_0.pto": "daca1a6ee57b6f420b9fd3785f2c9f692b2749773aa222735b0e530b5615d6e6",
+    "next_levels/decode_fwd_rank/ptoas/tp_out_sum.cpp": "6e54c64a82197e382a370a7d142712fe93fbe639216505135f3c1c922a2dbe29",
+    "next_levels/decode_fwd_rank/ptoas/tp_out_sum.pto": "c63b3f9d4aca07922c8f207eadda9b89c7924434a199c783c15426e373ce93b1",
+    "next_levels/decode_fwd_rank/ptoas/tp_out_wait.cpp": "79c6f0e447e17d36703d73517c9db21439ca8f4f12eb3fa061e89afc929c2fa6",
+    "next_levels/decode_fwd_rank/ptoas/tp_out_wait.pto": "1010754256eeb856eca68ea1dcade666e5e9f50773ab63fdf536956bd561b468",
+    "next_levels/decode_fwd_rank/ptoas/tp_out_wait_0.cpp": "50f1080b79c36f626ea6626318cbd09b734623cc7bb76feda1504c017bacd00f",
+    "next_levels/decode_fwd_rank/ptoas/tp_out_wait_0.pto": "8cb909543af2e6bc20d40d9df8870b0098b77bd49f74694952ffca2d1a6ae47c",
+    "next_levels/decode_fwd_rank/ptoas/w8a8_gemm.cpp": "e291991756e856c0c3c2345e36c7861890b4e00d051cf9b889bcb18b97c342eb",
+    "next_levels/decode_fwd_rank/ptoas/w8a8_gemm.pto": "b6bba2bf259b1c82b3d0010bbc967de7ad2a40b3d4fc3d9e2caf9fb69baad593",
+    "next_levels/decode_fwd_rank/ptoas/w8a8_gemm_0.cpp": "3aed6fec8bf722c043483c6254f905e790a7f7c15e6543309f86c09091cefb8d",
+    "next_levels/decode_fwd_rank/ptoas/w8a8_gemm_0.pto": "4ca666052d5c7aeb52c58f1495d53743b27d724aa46ebe75535fa4187874c885",
+    "next_levels/decode_fwd_rank/ptoas/w8a8_gemm_1.cpp": "ff537e0fa6d09b20ff04f18f0239397bd45a54c9251aec8431ecbe8afd11b627",
+    "next_levels/decode_fwd_rank/ptoas/w8a8_gemm_1.pto": "98bb9f0c9af47dd65ff23a96fe219202bd4d3b11f5fcefcf33b9642d2f65c22e",
+    "next_levels/decode_fwd_rank/ptoas/w8a8_gemm_10.cpp": "7ceade097e7499733efd67ea9aa83f1d33c6fd4855fc0947dd22ee74569926e8",
+    "next_levels/decode_fwd_rank/ptoas/w8a8_gemm_10.pto": "e558fd6d945d3690da862222a1551b970d038e7cc90426dc4076f292856e9a50",
+    "next_levels/decode_fwd_rank/ptoas/w8a8_gemm_11.cpp": "a9b6740dbba69ab6831860d7dbde3210406f508b3e36fd3d3231dfdf286b99ee",
+    "next_levels/decode_fwd_rank/ptoas/w8a8_gemm_11.pto": "9dd36155c6e166fab4b1c5538e662e7e596f62f78f0f69c9de31a54569287f19",
+    "next_levels/decode_fwd_rank/ptoas/w8a8_gemm_18.cpp": "5cea74059c9aac3bbe4ca7fd65fab14cb3638b66db4712df25ee1abf1a486a3f",
+    "next_levels/decode_fwd_rank/ptoas/w8a8_gemm_18.pto": "bbe0e0bc26270fc8325cdee35962cc659bb96624b5f542d0fa8b7ae5b140e426",
+    "orchestration/host_orch.py": "9c7293be934b8b65018535af56c4619da9bfccb1d3b3c32fde6af6668b236050",
+    "passes_dump/00_frontend.py": "3125ad018fd104112e7e89100de4b70f78266daa88ca42baff44eb686a1db2de",
+    "passes_dump/01_after_InlineFunctions.py": "95407b12d79f0e26853b205ee72ffb5201ff64853763b00732a64c29962bb92a",
+    "passes_dump/02_after_UnrollLoops.py": "80f0b49b46a3b3ca524594a84f252cc1439227cdd93cce47a5a49a5bf7990994",
+    "passes_dump/03_after_CtrlFlowTransform.py": "80f0b49b46a3b3ca524594a84f252cc1439227cdd93cce47a5a49a5bf7990994",
+    "passes_dump/04_after_ConvertToSSA.py": "0e3b99a27dbcdb66c4d191a73ec945ac12a4893182a8f40834f8f85e22a7d0e3",
+    "passes_dump/05_after_Simplify.py": "0d95015ed46d77821a777a69fd8c66c192b1324498b435a774cf3d264d84b5f4",
+    "passes_dump/06_after_NormalizeStmtStructure.py": "0d95015ed46d77821a777a69fd8c66c192b1324498b435a774cf3d264d84b5f4",
+    "passes_dump/07_after_FlattenCallExpr.py": "50843b160d59218409617bfa179b42547a1ba80459e53a73b0896734a3dde022",
+    "passes_dump/08_after_OutlineHierarchyScopes.py": "50843b160d59218409617bfa179b42547a1ba80459e53a73b0896734a3dde022",
+    "passes_dump/09_after_OutlineGraphScopes.py": "50843b160d59218409617bfa179b42547a1ba80459e53a73b0896734a3dde022",
+    "passes_dump/10_after_OutlineIncoreScopes.py": "7dfc14ed39f4a57b158c1a66cf82a95f55372ae34f8420c6a8a8d3f909c50e0c",
+    "passes_dump/11_after_OutlineClusterScopes.py": "cd66bcdfeb7bd273aab570f665ed8f9c28a9726b918e4bacbba48ab5112f3fbb",
+    "passes_dump/12_after_DeduplicateOutlinedKernels.py": "29bdfa8a6cc7bf78e198b48f1788048ee841b863dc835a7a33f760004c6a05a6",
+    "passes_dump/13_after_ConvertTensorToTileOps.py": "5dc1c6b62d3ebe68ec0d85544bb9163c31423134e9e9e830a09f0d7fa122e5b9",
+    "passes_dump/14_after_OptimizeOrchTensors.py": "3afee56e58e2ca0e481992b8f385b3e9d651a6da7716d73caf43c89917b50fa1",
+    "passes_dump/15_after_LowerCompositeOps.py": "3afee56e58e2ca0e481992b8f385b3e9d651a6da7716d73caf43c89917b50fa1",
+    "passes_dump/16_after_FlattenTileNdTo2D.py": "04433196531d18913097dce467b610497e7f6298f5151287d05051eb8417a06a",
+    "passes_dump/17_after_BlockNzTensorViews.py": "62a6e326a14ee2f568a05881129e751af9ed0f96a704c198b5b47d0fc412d0a4",
+    "passes_dump/18_after_BlockMxScaleTensorViews.py": "96be672683a0229e68a5c896ec77d29eeaeee1cd9af0218d8fce826b0dbc7266",
+    "passes_dump/19_after_LegalizeTileCast.py": "96be672683a0229e68a5c896ec77d29eeaeee1cd9af0218d8fce826b0dbc7266",
+    "passes_dump/20_after_AutoTileMatmulL0.py": "b6655763cd203fa3558586919d4ffcbc76068c37ca7d2cb4f3c2ad53820f20aa",
+    "passes_dump/21_after_CanonicalizeTileSlice.py": "b6655763cd203fa3558586919d4ffcbc76068c37ca7d2cb4f3c2ad53820f20aa",
+    "passes_dump/22_after_InferTileMemorySpace.py": "48d164f12d5d48cdb2bf4868428d13da3391958df00d84d88bda5d617977f4b9",
+    "passes_dump/23_after_InsertMxScaleAddr.py": "48d164f12d5d48cdb2bf4868428d13da3391958df00d84d88bda5d617977f4b9",
+    "passes_dump/24_after_ResolveBackendOpLayouts.py": "9b0acd24d4689adce8701fd5a0d8185f5a80361ea865a0d480ee87129f875942",
+    "passes_dump/25_after_LowerAutoVectorSplit.py": "9b0acd24d4689adce8701fd5a0d8185f5a80361ea865a0d480ee87129f875942",
+    "passes_dump/26_after_ExpandMixedKernel.py": "e49c2d58e13f074bf49ac7b5c09328604c7da3059a9606b2ecbeadc1766b0328",
+    "passes_dump/27_after_InjectGMPipeBuffer.py": "ef81922a071e146277c6c67c3d05a29d8c9477981539260bddda6137ffb3c0e8",
+    "passes_dump/28_after_SplitVectorKernel.py": "70d802fa4f5d28748aaeace3b32fd8b53f9795457a2a43b1862b8b5169ad0967",
+    "passes_dump/29_after_StampTfreeSplit.py": "8bcd72d6cd145c95c7faaaf382293964781e97a0d09f4a61e4860b9ba53597b8",
+    "passes_dump/30_after_NormalizeReturnOrder.py": "8bcd72d6cd145c95c7faaaf382293964781e97a0d09f4a61e4860b9ba53597b8",
+    "passes_dump/31_after_SkewCrossCorePipeline.py": "8bcd72d6cd145c95c7faaaf382293964781e97a0d09f4a61e4860b9ba53597b8",
+    "passes_dump/32_after_LowerPipelineToSlots.py": "8bcd72d6cd145c95c7faaaf382293964781e97a0d09f4a61e4860b9ba53597b8",
+    "passes_dump/33_after_LowerPipelineLoops.py": "57bbbe886e1577ccd82640190625534a935699e7ea452abd4ae8a4371d5ea55f",
+    "passes_dump/34_after_CanonicalizeIOOrder.py": "b72b49a7e60df94e776fa9adb0f7a0967ba14a0742d739ec84c5c669cb86059d",
+    "passes_dump/35_after_MaterializeTensorStrides.py": "c9390504807edcc9a5a1859368d6792db247726dd049afa782566c59ecb57b4a",
+    "passes_dump/36_after_InitMemRef.py": "1235a03650f1534e2ddadf4a04b29ec1ccde337d65dc75229f5b9970d1476752",
+    "passes_dump/37_after_SelectBufferIRFunctions.py": "f8f86e4df45e88faeddec8102120b5a269caffe35335bbd0f1bc497bd22d933a",
+    "passes_dump/38_after_MaterializeSemanticAliases.py": "9670cb73874f7f9b2cbd34c1fa9ef3fb3370b610a97704a4f210fb41457e0df4",
+    "passes_dump/39_after_IRVerifier.py": "9670cb73874f7f9b2cbd34c1fa9ef3fb3370b610a97704a4f210fb41457e0df4",
+    "passes_dump/40_after_MemoryReuse.py": "758f8f0f335e4ab6ae36f9433acca4ae30594e5411b3183bbb9584d539eb09c7",
+    "passes_dump/41_after_VerifyTileStorage.py": "758f8f0f335e4ab6ae36f9433acca4ae30594e5411b3183bbb9584d539eb09c7",
+    "passes_dump/42_after_AllocateMemoryAddr.py": "c0306b43b7dcbcefb430f483d3a550a383cffa544a551dcb14d9d131292dd64a",
+    "passes_dump/43_after_VerifyTileStorageAllocated.py": "c0306b43b7dcbcefb430f483d3a550a383cffa544a551dcb14d9d131292dd64a",
+    "passes_dump/44_after_FoldNoOpReshape.py": "163b614fee96ed30e555f9246dbcbc28b059c5c130e91afba4a110169e43b18e",
+    "passes_dump/45_after_FuseCreateAssembleToSlice.py": "65eecd75daeabfcc3132868e0397c824fdde23a3991e518708f1fb7fca6aae47",
+    "passes_dump/46_after_LowerL2TensorCollectives.py": "65eecd75daeabfcc3132868e0397c824fdde23a3991e518708f1fb7fca6aae47",
+    "passes_dump/47_after_LegalizeSpmdLaunches.py": "e34973c58b86262d5384b9e702293553d1f7293f7196767ac32448e9f1de851a",
+    "passes_dump/48_after_DeriveCallDirections.py": "a891090fef67c2d8b6a2762f8b3a7547eaf0a569111832d2f78315ef8a3501a3",
+    "passes_dump/49_after_AutoDeriveTaskDependencies.py": "a891090fef67c2d8b6a2762f8b3a7547eaf0a569111832d2f78315ef8a3501a3",
+    "passes_dump/50_after_ExpandManualPhaseFence.py": "a891090fef67c2d8b6a2762f8b3a7547eaf0a569111832d2f78315ef8a3501a3",
+    "passes_dump/51_after_SynthesizeAllReduceSignals.py": "a891090fef67c2d8b6a2762f8b3a7547eaf0a569111832d2f78315ef8a3501a3",
+    "passes_dump/52_after_MaterializeCommDomainScopes.py": "4b60d2d847d8ebcef8229f9c1cbbe0fd089b8ca274041df427e3b6636e9a659e",
+    "passes_dump/53_after_LowerHostTensorCollectives.py": "4b60d2d847d8ebcef8229f9c1cbbe0fd089b8ca274041df427e3b6636e9a659e",
+    "passes_dump/54_after_MaterializeDistTensorCtx.py": "74508cc32e8012a234f480614caf78be980fee61c41bd3e801fcc7701bdd563b",
+    "passes_dump/55_after_Simplify.py": "8aabf4d7c947acdfc9178e05f747bf5dc13c3179e1f8673d50823875e2d2bcdb",
+    "passes_dump/56_after_LegalizeGraphBoundary.py": "8aabf4d7c947acdfc9178e05f747bf5dc13c3179e1f8673d50823875e2d2bcdb",
+    "passes_dump/57_after_MaterializeRuntimeScopes.py": "85a071a21ee5d6402944632a811ef934b226fa1500b54f1b4ddd4e097a39c28a",
+    "passes_dump/58_after_ClassifyIterArgCarry.py": "e156e670c10e36f84a39cab377b482d426fd99be12c891acaf22043529c9f1bc",
+    "passes_dump/59_after_InsertCommFence.py": "d7d080fa1e97fca85d93be82d811128eca3a196befd8f17e0e95e8a315619595",
+    "passes_dump/60_after_MaterializeValidShapeSymbols.py": "d7d080fa1e97fca85d93be82d811128eca3a196befd8f17e0e95e8a315619595",
+    "passes_dump/61_after_IRVerifier.py": "d7d080fa1e97fca85d93be82d811128eca3a196befd8f17e0e95e8a315619595",
+    "passes_dump/62_after_LowerTileToBuffer.py": "84d498768d3858dfc2da0b2ed4a5722c1486300d855ed20cafcc14465d74837b"
+  },
+  "registered_units": [
+    {
+      "config": "next_levels/decode_fwd_rank/kernel_config.py",
+      "kernels": [
+        "next_levels/decode_fwd_rank/kernels/aic/attention_core_0_aic.cpp",
+        "next_levels/decode_fwd_rank/kernels/aic/attention_core_aic.cpp",
+        "next_levels/decode_fwd_rank/kernels/aic/compressor_project_0_aic.cpp",
+        "next_levels/decode_fwd_rank/kernels/aic/compressor_project_2_aic.cpp",
+        "next_levels/decode_fwd_rank/kernels/aic/compressor_project_3_aic.cpp",
+        "next_levels/decode_fwd_rank/kernels/aic/compressor_project_aic.cpp",
+        "next_levels/decode_fwd_rank/kernels/aic/hc_project_2_aic.cpp",
+        "next_levels/decode_fwd_rank/kernels/aic/hc_project_aic.cpp",
+        "next_levels/decode_fwd_rank/kernels/aic/index_scores_aic.cpp",
+        "next_levels/decode_fwd_rank/kernels/aic/index_weights_aic.cpp",
+        "next_levels/decode_fwd_rank/kernels/aic/lm_head_aic.cpp",
+        "next_levels/decode_fwd_rank/kernels/aic/moe_gate_aic.cpp",
+        "next_levels/decode_fwd_rank/kernels/aic/o_proj_a_aic.cpp",
+        "next_levels/decode_fwd_rank/kernels/aic/o_proj_b_aic.cpp",
+        "next_levels/decode_fwd_rank/kernels/aic/w8a8_gemm_0_aic.cpp",
+        "next_levels/decode_fwd_rank/kernels/aic/w8a8_gemm_10_aic.cpp",
+        "next_levels/decode_fwd_rank/kernels/aic/w8a8_gemm_11_aic.cpp",
+        "next_levels/decode_fwd_rank/kernels/aic/w8a8_gemm_18_aic.cpp",
+        "next_levels/decode_fwd_rank/kernels/aic/w8a8_gemm_1_aic.cpp",
+        "next_levels/decode_fwd_rank/kernels/aic/w8a8_gemm_aic.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/attention_core_0_aiv.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/attention_core_aiv.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/attention_input_copy.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/c2a_pair_pool.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/c2a_state_write.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/cache_publish.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/cache_publish_2.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/compressor_project_0_aiv.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/compressor_project_2_aiv.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/compressor_project_3_aiv.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/compressor_project_aiv.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/decode_carry_pre.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/decode_carry_x.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/decode_snapshot_pre.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/decode_snapshot_x.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/embed_shard_ids.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/embed_shard_mask.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/embed_to_hc.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/embed_window_keepalive.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/embedding_lookup.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/engram_gate.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/engram_restore_basis.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/gather_selected.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/gather_window.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/hc_coefficients.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/hc_coefficients_2.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/hc_head.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/hc_head_2.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/hc_inv_rms.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/hc_post.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/hc_post_2.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/hc_project_2_aiv.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/hc_project_aiv.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/index_block_pool.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/index_candidate_filter.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/index_pool_counts.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/index_scores_aiv.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/index_topk.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/index_topk_1.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/index_weights_aiv.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/int8_quant_per_token.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/int8_quant_per_token_0.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/int8_quant_per_token_15.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/int8_quant_per_token_16.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/lm_head_aiv.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/moe_combine.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/moe_combine_0.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/moe_compact.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/moe_compact_clear.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/moe_consumed_signal.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/moe_dispatch_count.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/moe_dispatch_count_0.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/moe_dispatch_push.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/moe_dispatch_push_0.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/moe_dispatch_signal.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/moe_gate_aiv.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/moe_return.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/moe_return_consumed.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/moe_return_reuse.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/moe_return_signal.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/moe_reuse_wait.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/moe_shared_stage.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/moe_shared_store.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/o_proj_a_aiv.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/o_proj_b_aiv.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/output_inverse_sine.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/rms_norm.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/rms_norm_0.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/rms_norm_1.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/rms_norm_10.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/rms_norm_15.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/rope_tail_bf16.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/rope_tail_bf16_0.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/rope_tail_bf16_1.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/rope_tail_bf16_13.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/rope_tail_fp32.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/snapshot_rows.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/snapshot_rows_0.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/snapshot_rows_10.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/swiglu.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/swiglu_shared.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/tp_out_consumed.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/tp_out_consumed_0.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/tp_out_publish.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/tp_out_ready.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/tp_out_reuse.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/tp_out_reuse_0.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/tp_out_sum.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/tp_out_wait.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/tp_out_wait_0.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/w8a8_gemm_0_aiv.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/w8a8_gemm_10_aiv.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/w8a8_gemm_11_aiv.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/w8a8_gemm_18_aiv.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/w8a8_gemm_1_aiv.cpp",
+        "next_levels/decode_fwd_rank/kernels/aiv/w8a8_gemm_aiv.cpp"
+      ],
+      "orchestration": "next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp",
+      "registrations": [
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/embed_shard_ids.cpp",
+          "code_name": "embed_shard_ids",
+          "core_type": "aiv",
+          "func_id": 0
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/embedding_lookup.cpp",
+          "code_name": "embedding_lookup",
+          "core_type": "aiv",
+          "func_id": 1
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/embed_shard_mask.cpp",
+          "code_name": "embed_shard_mask",
+          "core_type": "aiv",
+          "func_id": 2
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/tp_out_reuse.cpp",
+          "code_name": "tp_out_reuse",
+          "core_type": "aiv",
+          "func_id": 3
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/tp_out_publish.cpp",
+          "code_name": "tp_out_publish",
+          "core_type": "aiv",
+          "func_id": 4
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/tp_out_ready.cpp",
+          "code_name": "tp_out_ready",
+          "core_type": "aiv",
+          "func_id": 5
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/tp_out_wait.cpp",
+          "code_name": "tp_out_wait",
+          "core_type": "aiv",
+          "func_id": 6
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/tp_out_sum.cpp",
+          "code_name": "tp_out_sum",
+          "core_type": "aiv",
+          "func_id": 7
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/tp_out_consumed.cpp",
+          "code_name": "tp_out_consumed",
+          "core_type": "aiv",
+          "func_id": 8
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/embed_to_hc.cpp",
+          "code_name": "embed_to_hc",
+          "core_type": "aiv",
+          "func_id": 9
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/decode_carry_pre.cpp",
+          "code_name": "decode_carry_pre",
+          "core_type": "aiv",
+          "func_id": 10
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aic/compressor_project_aic.cpp",
+          "code_name": "compressor_project_aic",
+          "core_type": "aic",
+          "func_id": 11
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/compressor_project_aiv.cpp",
+          "code_name": "compressor_project_aiv",
+          "core_type": "aiv",
+          "func_id": 12
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/engram_restore_basis.cpp",
+          "code_name": "engram_restore_basis",
+          "core_type": "aiv",
+          "func_id": 13
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/engram_gate.cpp",
+          "code_name": "engram_gate",
+          "core_type": "aiv",
+          "func_id": 14
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/attention_input_copy.cpp",
+          "code_name": "attention_input_copy",
+          "core_type": "aiv",
+          "func_id": 15
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/hc_inv_rms.cpp",
+          "code_name": "hc_inv_rms",
+          "core_type": "aiv",
+          "func_id": 16
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aic/hc_project_aic.cpp",
+          "code_name": "hc_project_aic",
+          "core_type": "aic",
+          "func_id": 17
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/hc_project_aiv.cpp",
+          "code_name": "hc_project_aiv",
+          "core_type": "aiv",
+          "func_id": 18
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/hc_coefficients.cpp",
+          "code_name": "hc_coefficients",
+          "core_type": "aiv",
+          "func_id": 19
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/hc_head.cpp",
+          "code_name": "hc_head",
+          "core_type": "aiv",
+          "func_id": 20
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/rms_norm.cpp",
+          "code_name": "rms_norm",
+          "core_type": "aiv",
+          "func_id": 21
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/int8_quant_per_token.cpp",
+          "code_name": "int8_quant_per_token",
+          "core_type": "aiv",
+          "func_id": 22
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aic/w8a8_gemm_aic.cpp",
+          "code_name": "w8a8_gemm_aic",
+          "core_type": "aic",
+          "func_id": 23
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/w8a8_gemm_aiv.cpp",
+          "code_name": "w8a8_gemm_aiv",
+          "core_type": "aiv",
+          "func_id": 24
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/rms_norm_0.cpp",
+          "code_name": "rms_norm_0",
+          "core_type": "aiv",
+          "func_id": 25
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/int8_quant_per_token_0.cpp",
+          "code_name": "int8_quant_per_token_0",
+          "core_type": "aiv",
+          "func_id": 26
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aic/w8a8_gemm_0_aic.cpp",
+          "code_name": "w8a8_gemm_0_aic",
+          "core_type": "aic",
+          "func_id": 27
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/w8a8_gemm_0_aiv.cpp",
+          "code_name": "w8a8_gemm_0_aiv",
+          "core_type": "aiv",
+          "func_id": 28
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/rope_tail_bf16.cpp",
+          "code_name": "rope_tail_bf16",
+          "core_type": "aiv",
+          "func_id": 29
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aic/w8a8_gemm_1_aic.cpp",
+          "code_name": "w8a8_gemm_1_aic",
+          "core_type": "aic",
+          "func_id": 30
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/w8a8_gemm_1_aiv.cpp",
+          "code_name": "w8a8_gemm_1_aiv",
+          "core_type": "aiv",
+          "func_id": 31
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/rms_norm_1.cpp",
+          "code_name": "rms_norm_1",
+          "core_type": "aiv",
+          "func_id": 32
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/rope_tail_bf16_0.cpp",
+          "code_name": "rope_tail_bf16_0",
+          "core_type": "aiv",
+          "func_id": 33
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/snapshot_rows.cpp",
+          "code_name": "snapshot_rows",
+          "core_type": "aiv",
+          "func_id": 34
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/snapshot_rows_0.cpp",
+          "code_name": "snapshot_rows_0",
+          "core_type": "aiv",
+          "func_id": 35
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/cache_publish.cpp",
+          "code_name": "cache_publish",
+          "core_type": "aiv",
+          "func_id": 36
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/gather_window.cpp",
+          "code_name": "gather_window",
+          "core_type": "aiv",
+          "func_id": 37
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aic/attention_core_aic.cpp",
+          "code_name": "attention_core_aic",
+          "core_type": "aic",
+          "func_id": 38
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/attention_core_aiv.cpp",
+          "code_name": "attention_core_aiv",
+          "core_type": "aiv",
+          "func_id": 39
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/output_inverse_sine.cpp",
+          "code_name": "output_inverse_sine",
+          "core_type": "aiv",
+          "func_id": 40
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/rope_tail_bf16_1.cpp",
+          "code_name": "rope_tail_bf16_1",
+          "core_type": "aiv",
+          "func_id": 41
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aic/o_proj_a_aic.cpp",
+          "code_name": "o_proj_a_aic",
+          "core_type": "aic",
+          "func_id": 42
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/o_proj_a_aiv.cpp",
+          "code_name": "o_proj_a_aiv",
+          "core_type": "aiv",
+          "func_id": 43
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aic/o_proj_b_aic.cpp",
+          "code_name": "o_proj_b_aic",
+          "core_type": "aic",
+          "func_id": 44
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/o_proj_b_aiv.cpp",
+          "code_name": "o_proj_b_aiv",
+          "core_type": "aiv",
+          "func_id": 45
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/tp_out_reuse_0.cpp",
+          "code_name": "tp_out_reuse_0",
+          "core_type": "aiv",
+          "func_id": 46
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/tp_out_wait_0.cpp",
+          "code_name": "tp_out_wait_0",
+          "core_type": "aiv",
+          "func_id": 47
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/tp_out_sum.cpp",
+          "code_name": "tp_out_sum",
+          "core_type": "aiv",
+          "func_id": 48
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/tp_out_consumed_0.cpp",
+          "code_name": "tp_out_consumed_0",
+          "core_type": "aiv",
+          "func_id": 49
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/hc_post.cpp",
+          "code_name": "hc_post",
+          "core_type": "aiv",
+          "func_id": 50
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aic/w8a8_gemm_18_aic.cpp",
+          "code_name": "w8a8_gemm_18_aic",
+          "core_type": "aic",
+          "func_id": 51
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/w8a8_gemm_18_aiv.cpp",
+          "code_name": "w8a8_gemm_18_aiv",
+          "core_type": "aiv",
+          "func_id": 52
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/rope_tail_fp32.cpp",
+          "code_name": "rope_tail_fp32",
+          "core_type": "aiv",
+          "func_id": 53
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aic/index_weights_aic.cpp",
+          "code_name": "index_weights_aic",
+          "core_type": "aic",
+          "func_id": 54
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/index_weights_aiv.cpp",
+          "code_name": "index_weights_aiv",
+          "core_type": "aiv",
+          "func_id": 55
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aic/compressor_project_0_aic.cpp",
+          "code_name": "compressor_project_0_aic",
+          "core_type": "aic",
+          "func_id": 56
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/compressor_project_0_aiv.cpp",
+          "code_name": "compressor_project_0_aiv",
+          "core_type": "aiv",
+          "func_id": 57
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/c2a_pair_pool.cpp",
+          "code_name": "c2a_pair_pool",
+          "core_type": "aiv",
+          "func_id": 58
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/c2a_state_write.cpp",
+          "code_name": "c2a_state_write",
+          "core_type": "aiv",
+          "func_id": 59
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aic/compressor_project_2_aic.cpp",
+          "code_name": "compressor_project_2_aic",
+          "core_type": "aic",
+          "func_id": 60
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/compressor_project_2_aiv.cpp",
+          "code_name": "compressor_project_2_aiv",
+          "core_type": "aiv",
+          "func_id": 61
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/rms_norm_15.cpp",
+          "code_name": "rms_norm_15",
+          "core_type": "aiv",
+          "func_id": 62
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/rope_tail_bf16_13.cpp",
+          "code_name": "rope_tail_bf16_13",
+          "core_type": "aiv",
+          "func_id": 63
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/snapshot_rows_10.cpp",
+          "code_name": "snapshot_rows_10",
+          "core_type": "aiv",
+          "func_id": 64
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/cache_publish_2.cpp",
+          "code_name": "cache_publish_2",
+          "core_type": "aiv",
+          "func_id": 65
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aic/index_scores_aic.cpp",
+          "code_name": "index_scores_aic",
+          "core_type": "aic",
+          "func_id": 66
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/index_scores_aiv.cpp",
+          "code_name": "index_scores_aiv",
+          "core_type": "aiv",
+          "func_id": 67
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/index_topk.cpp",
+          "code_name": "index_topk",
+          "core_type": "aiv",
+          "func_id": 68
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/index_block_pool.cpp",
+          "code_name": "index_block_pool",
+          "core_type": "aiv",
+          "func_id": 69
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/index_pool_counts.cpp",
+          "code_name": "index_pool_counts",
+          "core_type": "aiv",
+          "func_id": 70
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/gather_selected.cpp",
+          "code_name": "gather_selected",
+          "core_type": "aiv",
+          "func_id": 71
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aic/attention_core_0_aic.cpp",
+          "code_name": "attention_core_0_aic",
+          "core_type": "aic",
+          "func_id": 72
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/attention_core_0_aiv.cpp",
+          "code_name": "attention_core_0_aiv",
+          "core_type": "aiv",
+          "func_id": 73
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aic/hc_project_2_aic.cpp",
+          "code_name": "hc_project_2_aic",
+          "core_type": "aic",
+          "func_id": 74
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/hc_project_2_aiv.cpp",
+          "code_name": "hc_project_2_aiv",
+          "core_type": "aiv",
+          "func_id": 75
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/hc_coefficients_2.cpp",
+          "code_name": "hc_coefficients_2",
+          "core_type": "aiv",
+          "func_id": 76
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/hc_head_2.cpp",
+          "code_name": "hc_head_2",
+          "core_type": "aiv",
+          "func_id": 77
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/rms_norm_10.cpp",
+          "code_name": "rms_norm_10",
+          "core_type": "aiv",
+          "func_id": 78
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aic/moe_gate_aic.cpp",
+          "code_name": "moe_gate_aic",
+          "core_type": "aic",
+          "func_id": 79
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/moe_gate_aiv.cpp",
+          "code_name": "moe_gate_aiv",
+          "core_type": "aiv",
+          "func_id": 80
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/moe_reuse_wait.cpp",
+          "code_name": "moe_reuse_wait",
+          "core_type": "aiv",
+          "func_id": 81
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/moe_dispatch_count.cpp",
+          "code_name": "moe_dispatch_count",
+          "core_type": "aiv",
+          "func_id": 82
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/moe_dispatch_push.cpp",
+          "code_name": "moe_dispatch_push",
+          "core_type": "aiv",
+          "func_id": 83
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/moe_dispatch_signal.cpp",
+          "code_name": "moe_dispatch_signal",
+          "core_type": "aiv",
+          "func_id": 84
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/moe_compact_clear.cpp",
+          "code_name": "moe_compact_clear",
+          "core_type": "aiv",
+          "func_id": 85
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/moe_compact.cpp",
+          "code_name": "moe_compact",
+          "core_type": "aiv",
+          "func_id": 86
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/moe_consumed_signal.cpp",
+          "code_name": "moe_consumed_signal",
+          "core_type": "aiv",
+          "func_id": 87
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/int8_quant_per_token_15.cpp",
+          "code_name": "int8_quant_per_token_15",
+          "core_type": "aiv",
+          "func_id": 88
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aic/w8a8_gemm_10_aic.cpp",
+          "code_name": "w8a8_gemm_10_aic",
+          "core_type": "aic",
+          "func_id": 89
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/w8a8_gemm_10_aiv.cpp",
+          "code_name": "w8a8_gemm_10_aiv",
+          "core_type": "aiv",
+          "func_id": 90
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/swiglu.cpp",
+          "code_name": "swiglu",
+          "core_type": "aiv",
+          "func_id": 91
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/int8_quant_per_token_16.cpp",
+          "code_name": "int8_quant_per_token_16",
+          "core_type": "aiv",
+          "func_id": 92
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aic/w8a8_gemm_11_aic.cpp",
+          "code_name": "w8a8_gemm_11_aic",
+          "core_type": "aic",
+          "func_id": 93
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/w8a8_gemm_11_aiv.cpp",
+          "code_name": "w8a8_gemm_11_aiv",
+          "core_type": "aiv",
+          "func_id": 94
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/moe_return_reuse.cpp",
+          "code_name": "moe_return_reuse",
+          "core_type": "aiv",
+          "func_id": 95
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/moe_return.cpp",
+          "code_name": "moe_return",
+          "core_type": "aiv",
+          "func_id": 96
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/moe_return_signal.cpp",
+          "code_name": "moe_return_signal",
+          "core_type": "aiv",
+          "func_id": 97
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/moe_shared_stage.cpp",
+          "code_name": "moe_shared_stage",
+          "core_type": "aiv",
+          "func_id": 98
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/swiglu_shared.cpp",
+          "code_name": "swiglu_shared",
+          "core_type": "aiv",
+          "func_id": 99
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/moe_shared_store.cpp",
+          "code_name": "moe_shared_store",
+          "core_type": "aiv",
+          "func_id": 100
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/moe_combine.cpp",
+          "code_name": "moe_combine",
+          "core_type": "aiv",
+          "func_id": 101
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/moe_return_consumed.cpp",
+          "code_name": "moe_return_consumed",
+          "core_type": "aiv",
+          "func_id": 102
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/hc_post_2.cpp",
+          "code_name": "hc_post_2",
+          "core_type": "aiv",
+          "func_id": 103
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/decode_snapshot_x.cpp",
+          "code_name": "decode_snapshot_x",
+          "core_type": "aiv",
+          "func_id": 104
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/decode_snapshot_pre.cpp",
+          "code_name": "decode_snapshot_pre",
+          "core_type": "aiv",
+          "func_id": 105
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/decode_carry_x.cpp",
+          "code_name": "decode_carry_x",
+          "core_type": "aiv",
+          "func_id": 106
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aic/compressor_project_3_aic.cpp",
+          "code_name": "compressor_project_3_aic",
+          "core_type": "aic",
+          "func_id": 107
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/compressor_project_3_aiv.cpp",
+          "code_name": "compressor_project_3_aiv",
+          "core_type": "aiv",
+          "func_id": 108
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/index_candidate_filter.cpp",
+          "code_name": "index_candidate_filter",
+          "core_type": "aiv",
+          "func_id": 109
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/index_topk_1.cpp",
+          "code_name": "index_topk_1",
+          "core_type": "aiv",
+          "func_id": 110
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/moe_dispatch_count_0.cpp",
+          "code_name": "moe_dispatch_count_0",
+          "core_type": "aiv",
+          "func_id": 111
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/moe_dispatch_push_0.cpp",
+          "code_name": "moe_dispatch_push_0",
+          "core_type": "aiv",
+          "func_id": 112
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/moe_combine_0.cpp",
+          "code_name": "moe_combine_0",
+          "core_type": "aiv",
+          "func_id": 113
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/embed_window_keepalive.cpp",
+          "code_name": "embed_window_keepalive",
+          "core_type": "aiv",
+          "func_id": 114
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/hc_head.cpp",
+          "code_name": "hc_head",
+          "core_type": "aiv",
+          "func_id": 115
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/rms_norm.cpp",
+          "code_name": "rms_norm",
+          "core_type": "aiv",
+          "func_id": 116
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aic/lm_head_aic.cpp",
+          "code_name": "lm_head_aic",
+          "core_type": "aic",
+          "func_id": 117
+        },
+        {
+          "source": "next_levels/decode_fwd_rank/kernels/aiv/lm_head_aiv.cpp",
+          "code_name": "lm_head_aiv",
+          "core_type": "aiv",
+          "func_id": 118
+        }
+      ]
+    }
+  ],
+  "native_images": null,
+  "prepared_receipt": null,
+  "preparation_authorized_by_this_binding": false
+}

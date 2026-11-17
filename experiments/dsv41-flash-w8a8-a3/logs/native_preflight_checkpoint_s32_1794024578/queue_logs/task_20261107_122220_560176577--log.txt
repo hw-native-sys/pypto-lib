@@ -1,0 +1,10 @@
+PyPTO environment activated: /mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local
+PYPTO_ROOT=/mnt/data/pyptouser/yangyaodong/code/pypto
+PTOAS_ROOT=/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local
+PTO_ISA_ROOT=/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/build/pto-isa
+PASS actualCLI splitstage fakeprovider allstages, corruption/native-only/defaultguards, source45 and fullIOmetadata
+Traceback (most recent call last):
+  File "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_preflight_checkpoint_s32_1794024578/check_storage_retention.py", line 65, in <module>
+    ok,msg=compare(actual,expected,inputs=inputs,cache_name=name)
+  File "<exact frozen published comparator>", line 2008, in compare_published_fwd_cache
+TypeError: ratio_allclose.<locals>.cmp() missing 4 required keyword-only arguments: 'actual_outputs', 'expected_outputs', 'rtol', and 'atol'

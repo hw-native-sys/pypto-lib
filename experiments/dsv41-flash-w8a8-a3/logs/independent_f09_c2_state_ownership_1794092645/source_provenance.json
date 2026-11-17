@@ -1,0 +1,30 @@
+{
+  "kind": "SOURCE_READ_ONLY_NOT_ACTUAL_TENSOR_RECOMPUTE",
+  "failed_native_task_reported_by_Root": "task_20261108_065800_182518612591",
+  "actual_post_call1_saved": false,
+  "actual_changed_bytes": "UNKNOWN",
+  "source_violation": "persistent C2 state writer bound and last-row boundary use physical tokens instead of num_tokens active",
+  "kernel_write_loop_line": 146,
+  "kernel_last_boundary_line": 149,
+  "pool_loop_line": 108,
+  "generated_Task69_pool_scalar": "num_tokens",
+  "generated_Task70_statewrite_scalar": "T_DYN",
+  "pins": {
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/model/compressor.py": "5575fea0bb02a73ebd58dbabd2a9f0a9fe71c53510b15f22c8d05687d8f48031",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/model/decode_c2a_full.py": "66a55b42800b5d1d311c7f6442e941546453a7adebd54a861679c7baf2d18f37",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/model/decode_fwd.py": "db733af729160a1b7c02ecc6bcad88ad01199eedbe29144cdfc0e4ca7b84af3b",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/model/layer_reference.py": "fa80a548d28b07f8ff90bdaa8fd311d9d188352bd0246cef7b59b15321010b3b",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/model/config.py": "e0542e042be6019f51ec367801565bd9fc8a48ecddd00ce980d60659e638ff19",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/f09_decode_case.py": "e3bc87daec2a39c6a555b194ec7d9f9a42d8483e36fcabaf1ec448000284ac20",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/scenario.json": "c7b6ab942f5ea17758389aa5a53dafbb1de79e68dbb6f41c4614d66dd6b6dbb1",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/source45_rebased_UNAPPLIED.json": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+    "experiments/dsv41-flash-w8a8-a3/logs/f09_count_probe_rank_shards_1794088424/artifacts.json": "4615debdad437d799834c68515a8e8c55185710f9627eb751902bbcb8212a90f",
+    "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/build/decode_capacity2/next_levels/decode_fwd_rank/orchestration/decode_fwd_rank.cpp": "d8dfeb0bf048f32e478d8a2d2c9c8fe776cdaff6ef42d6c2c14d583f91fe89fa",
+    "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/build/decode_capacity2/next_levels/decode_fwd_rank/kernels/aiv/c2a_state_write.cpp": "e98a8bc9e57b21226620529a1c1ad556794a89715cd024fa49f0635cbca411e9",
+    "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/build/decode_capacity2/next_levels/decode_fwd_rank/ptoas/c2a_state_write.pto": "bfb8e6463ea200c32f9e0cabcac72cd014a3b8fd422c5e835a93c8dd000ffa44",
+    "experiments/dsv41-flash-w8a8-a3/logs/independent_f09_typed_completion_1794079859/decode_capacity2_files.json": "5262e68afa0b53291ed285e31170b3c017674c3c25dfa9aec78eb7fab5777532"
+  },
+  "payload_reads": 0,
+  "CPU_test_jobs": 0,
+  "NPU_jobs": 0
+}

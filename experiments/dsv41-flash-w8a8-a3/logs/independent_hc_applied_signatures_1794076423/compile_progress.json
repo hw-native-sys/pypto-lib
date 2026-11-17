@@ -1,0 +1,160 @@
+[
+  {
+    "phase": "prefill3",
+    "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_hc_applied_signatures_1794076423/signature_build/_jit_prefill_fwd_20261108_023951_v2hdljxq",
+    "seconds": null,
+    "verification_seconds": 0.2815232276916504,
+    "compile_provenance": {
+      "task": "task_20261108_023933_349216314444",
+      "whole_task_exit": 1,
+      "entry_compile_returned": true,
+      "later_own_checker_error_preserved": true,
+      "artifact_reverified_not_recompiled": true
+    },
+    "platform": "a2a3",
+    "execution_mode": "ONBOARD",
+    "ring_heap": [
+      0,
+      0,
+      4294967296,
+      0
+    ],
+    "metadata_sha256": "3ef340dbe30e192bddd20ab2ec26bbe33b86453ffb0c6ce37d1512b847a50715",
+    "artifact_manifest_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_hc_applied_signatures_1794076423/prefill3_artifact_files.json",
+    "artifact_manifest_sha256": "3638fda6a024dbe0c34a711b1082565832a6945ca934a2135a5e7ca53fb9fd0a",
+    "formal_count": 100,
+    "static_count": 57,
+    "static_per_rank_bytes": 39624816576,
+    "concrete_input_shape": [
+      16,
+      3
+    ],
+    "generated_input_shape": [
+      16,
+      -1
+    ],
+    "formal_scalars": {
+      "engram_enabled": {
+        "name": "engram_enabled__ssa_v0",
+        "direction": "In",
+        "shape": null,
+        "dtype": "int32",
+        "layout": null
+      }
+    },
+    "HC_cast_witnesses": [
+      {
+        "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_hc_applied_signatures_1794076423/signature_build/_jit_prefill_fwd_20261108_023951_v2hdljxq/next_levels/l2_prefill_fwd/ptoas/hc_post.pto",
+        "sha256": "b3c0c1357751cc5c9f1fd14b8b3d999afb497300171155bd8f1bdf153662e3f6",
+        "FP32_to_BF16_RINT": [
+          {
+            "line": 154,
+            "text": "    pto.tcvt ins(%value_inline19917__ssa_v4 {rmode = #pto<round_mode RINT>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%rounded_bf16_inline19921__ssa_v0 : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":214:13)"
+          },
+          {
+            "line": 184,
+            "text": "    pto.tcvt ins(%14 {rmode = #pto<round_mode RINT>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%15 : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":214:13)"
+          }
+        ],
+        "BF16_to_FP32": [
+          {
+            "line": 134,
+            "text": "    pto.tcvt ins(%t__tmp_v326 {rmode = #pto<round_mode ROUND>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%t__tmp_v327 : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":209:13)"
+          },
+          {
+            "line": 156,
+            "text": "    pto.tcvt ins(%rounded_bf16_inline19921__ssa_v0 {rmode = #pto<round_mode ROUND>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%rounded_fp32_inline19922__ssa_v0 : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":215:13)"
+          },
+          {
+            "line": 164,
+            "text": "    pto.tcvt ins(%0 {rmode = #pto<round_mode ROUND>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%5 : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":209:13)"
+          },
+          {
+            "line": 186,
+            "text": "    pto.tcvt ins(%15 {rmode = #pto<round_mode ROUND>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%16 : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":215:13)"
+          }
+        ]
+      }
+    ],
+    "host_sha256": "6d4f744d144e076f59a9c1867a4f21e55219931f82e6320ee4c48e49576bd748",
+    "samples": 0,
+    "actual_devices": null
+  },
+  {
+    "phase": "decode1",
+    "artifact": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_hc_applied_signatures_1794076423/signature_build/_jit_decode_fwd_20261108_024248_tjwch92s",
+    "seconds": 25.231945991516113,
+    "verification_seconds": 25.23194694519043,
+    "compile_provenance": {
+      "fresh_decode_compile_in_this_task": true
+    },
+    "platform": "a2a3",
+    "execution_mode": "ONBOARD",
+    "ring_heap": [
+      0,
+      0,
+      4294967296,
+      0
+    ],
+    "metadata_sha256": "6a2d2c6f6b0d62453aed6bb501cb7070d208d4d069648bd0ee20bc7fa9073001",
+    "artifact_manifest_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_hc_applied_signatures_1794076423/decode1_artifact_files.json",
+    "artifact_manifest_sha256": "9823146af6afa609b2d083f073c0206b8b7356481dd33f3ee68212df1ecc56d9",
+    "formal_count": 96,
+    "static_count": 57,
+    "static_per_rank_bytes": 39624816576,
+    "concrete_input_shape": [
+      16,
+      1
+    ],
+    "generated_input_shape": [
+      16,
+      -1
+    ],
+    "formal_scalars": {
+      "engram_enabled": {
+        "name": "engram_enabled__ssa_v0",
+        "direction": "In",
+        "shape": null,
+        "dtype": "int32",
+        "layout": null
+      }
+    },
+    "HC_cast_witnesses": [
+      {
+        "path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_hc_applied_signatures_1794076423/signature_build/_jit_decode_fwd_20261108_024248_tjwch92s/next_levels/decode_fwd_rank/ptoas/hc_post.pto",
+        "sha256": "2ac28283b6d77ef12a12c63d5e16034c706d5af70e2d78d0fe1396083e074050",
+        "FP32_to_BF16_RINT": [
+          {
+            "line": 154,
+            "text": "    pto.tcvt ins(%value_inline13690__ssa_v4 {rmode = #pto<round_mode RINT>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%rounded_bf16_inline13694__ssa_v0 : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":214:13)"
+          },
+          {
+            "line": 184,
+            "text": "    pto.tcvt ins(%14 {rmode = #pto<round_mode RINT>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%15 : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":214:13)"
+          }
+        ],
+        "BF16_to_FP32": [
+          {
+            "line": 134,
+            "text": "    pto.tcvt ins(%t__tmp_v326 {rmode = #pto<round_mode ROUND>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%t__tmp_v327 : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":209:13)"
+          },
+          {
+            "line": 156,
+            "text": "    pto.tcvt ins(%rounded_bf16_inline13694__ssa_v0 {rmode = #pto<round_mode ROUND>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%rounded_fp32_inline13695__ssa_v0 : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":215:13)"
+          },
+          {
+            "line": 164,
+            "text": "    pto.tcvt ins(%0 {rmode = #pto<round_mode ROUND>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%5 : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":209:13)"
+          },
+          {
+            "line": 186,
+            "text": "    pto.tcvt ins(%15 {rmode = #pto<round_mode ROUND>, satmode = #pto<saturation_mode OFF>} : !pto.tile_buf<loc=vec, dtype=bf16, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) outs(%16 : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=512, v_row=?, v_col=?, blayout=row_major, slayout=none_box, fractal=512, pad=0>) loc(\"/mnt/data/pyptouser/yangyaodong/code/pypto-lib/models/deepseek_v4_1_flash_a3_w8a8/hc.py\":215:13)"
+          }
+        ]
+      }
+    ],
+    "host_sha256": "d8534fe9751d12b94074e2dc4583a70ff6a0c9ecc96e31fd618c2fef737eef34",
+    "samples": 0,
+    "actual_devices": null
+  }
+]

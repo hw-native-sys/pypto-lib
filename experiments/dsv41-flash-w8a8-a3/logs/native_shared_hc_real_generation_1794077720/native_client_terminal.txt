@@ -1,0 +1,6 @@
+Original task-submit client exec session58610 drained to terminal exit_code1.
+Observed raw output:
+[npu-lock] 已释放设备 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 的锁
+=== 任务失败 (exit=1) ===
+SAME task_20261108_030353_356363116294; no duplicate/retry/native resubmission.
+CLI separately returned0; strict outer telemetry coverage failure is retained.

@@ -1,0 +1,199 @@
+{
+  "status": "PASS_SCAFFOLDING_ONLY",
+  "checks": [
+    {
+      "name": "no-model-runtime-imports-audit.py",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "no-model-runtime-imports-shared_delta.py",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "no-model-runtime-imports-topology_delta.py",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "no-model-runtime-imports-runner.py",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "no-model-runtime-imports-tokenizer_reference.py",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "explicit-ready-TP8-EP16-DP2-binding-shape",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "missing-required-source_manifest_sha256",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "missing-required-fresh_signature_receipt",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "missing-required-metadata_plan_sha256",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "missing-required-producer_dir",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "missing-required-actual_task_id",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "missing-required-actual_root_go",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "missing-required-root_go_receipt",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "old-default-topology-rejected",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "old-default-upload-rejected",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "old-operation-rejected",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "malformed-helper-hash-rejected",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "exact-synthetic-signature-file",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "stale-signature-bytes-rejected",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "contiguous-TP-groups-expert-coverage",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "all2DP-eight-shard-recorded-greedy",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "vote-negative-missingDP",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "vote-negative-old4TP",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "vote-negative-wrongGlobalSpan",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "vote-negative-nonfinite",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "vote-negative-wrongContext",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "vote-negative-disagreement",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "vote-negative-wrongWinner",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "eight-diagnostic-prefixes-present",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "missing-eighth-prefix-rejected",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "one-owner912-bases112-C1-800-same-tiny-metadata",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "borrowed-wrong-base-rejected",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "decode-static-IO-rejected",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "EOS-on-prefill-zero-decode-one-prefill-close",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "strict-known-synthetic-sample",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "noncritical-gap-and-partial-PSS-remain-FAIL-UNKNOWN",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "full-runner-failclosed-durable-receipt-before-real-path-reads",
+      "passed": true,
+      "detail": null
+    }
+  ],
+  "passed": 37,
+  "unmet": 0,
+  "started_epoch": 1794111270.6944976,
+  "ended_epoch": 1794111271.1734307,
+  "model_runtime_imports": 0,
+  "payload_bytes": 0,
+  "headers": 0,
+  "NPU": 0,
+  "scope": "Synthetic metadata/predicates, AST/full-entry rejection only; no actual case audited or acceptance claimed"
+}

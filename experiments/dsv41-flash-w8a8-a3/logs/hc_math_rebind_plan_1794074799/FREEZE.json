@@ -1,0 +1,11 @@
+{
+  "status": "FINAL/PARK",
+  "artifact_count": 13,
+  "artifact_manifest_sha256": "4b7fec1eb0618550bdfb9b449ad0c0b0ec49a7db76ab74fa88b779b2f428709f",
+  "live_source45_b3e_unchanged": true,
+  "future_M01_UNAPPLIED": "eb90ea56e26d0cb97dd12d330559c2ae1b53f4ae5cbf866cc01bfbbb150fecf2",
+  "future_M02_UNAPPLIED": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "metadata_delta_recipe_sha256": "ece027003c7f345c8a35adc57a2820072d6027c19539d27927c70100a67cfe58",
+  "literal_guard_patch_sha256": "e5f740cef48c32df63ae791cd96e7eb0dd39fcc138c4a3a15004b9980f15e4f0",
+  "no_source_shared_write_compile_NPU_payload_grant": true
+}

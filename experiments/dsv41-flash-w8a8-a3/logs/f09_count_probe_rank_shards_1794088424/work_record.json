@@ -1,0 +1,32 @@
+{
+  "record_id": "main-f09-count-rank-shards-1794088424",
+  "role": "main-agent",
+  "start_epoch": 1794088424,
+  "end_epoch": 1794088949.5222433,
+  "measured_wall_seconds": 525.5222432613373,
+  "shared_writes": 0,
+  "worker_records_imported": 0,
+  "CPU_tasks": [
+    {
+      "task": "task_20261108_055723_166107514759",
+      "exit": 1,
+      "cause": "ownchecker20vs18_beforecompiler"
+    },
+    {
+      "task": "task_20261108_055827_166384210700",
+      "exit": 1,
+      "cause": "owncheckerrawconfig_platform_key_beforecompiler"
+    },
+    {
+      "task": "task_20261108_055920_166633523902",
+      "exit": 0,
+      "cause": "tinycontract+bothzero_sample_signatures_PASS"
+    }
+  ],
+  "signature_compiles": 2,
+  "fullentry_recompile": false,
+  "prepare": false,
+  "NPU": false,
+  "real_payload_bytes": 0,
+  "status": "FINAL_PARK_HOST_CONTRACT_AND_COMPILE_ONLY"
+}

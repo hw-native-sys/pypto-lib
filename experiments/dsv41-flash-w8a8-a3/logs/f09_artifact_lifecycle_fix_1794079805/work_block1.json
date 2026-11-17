@@ -1,0 +1,12 @@
+{
+  "record_id": "main-f09-artifact-lifecycle-1794079805-block1",
+  "start_epoch": 1794079805,
+  "end_epoch": 1794080469,
+  "elapsed_seconds": 664,
+  "status": "READY_NOT_RUN_CPU_HELD_BY_ROOT_RESOURCE_AUDIT",
+  "shared_writes": 0,
+  "CPU_tasks": [],
+  "NPU": false,
+  "prepare": false,
+  "compile": false
+}

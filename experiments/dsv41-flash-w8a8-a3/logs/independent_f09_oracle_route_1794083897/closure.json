@@ -1,0 +1,20 @@
+{
+  "state": "FINAL_PARK_COMBINED_HOST_READINESS_PASS",
+  "CPU_task": "task_20261108_044112_14753283812",
+  "CPU_exit": 0,
+  "CPU_checks": 15,
+  "CPU_PID": 1475706,
+  "CPU_PID_absent": true,
+  "CPU_birth_tick_not_recorded": true,
+  "all_own_jobs_ended": true,
+  "Main83_all_files_unchanged": true,
+  "live_M02_45_unchanged": true,
+  "unapplied_source405_45_unchanged": true,
+  "NPU": 0,
+  "model_fixture_or_original_reference": false,
+  "real_checkpoint_payload_bytes": 0,
+  "real_grants_created": 0,
+  "public_prepared_branch_test": "CPU_MOCK_ONLY",
+  "actual16_GO": "SEPARATE_ROOT_ONLY",
+  "epoch": 1794084273
+}

@@ -1,0 +1,10 @@
+{
+  "status": "FINAL/PARK",
+  "reviewed_bundle": "../f09_m02_adapter_prepare_1794076190",
+  "reviewed_manifest_sha256": "fe2f88f1680989429074557b9c3ef440a3b146db6c78fad15c942032581a87f7",
+  "acceptance": false,
+  "findings": ["R1_zero_active_anchor_legality_and_reachability", "R2_reference_verdict_scope", "R3_active_state_nonpublication_parity", "R4_negative_control_specificity"],
+  "running_jobs": [],
+  "shared_writes": 0,
+  "recovery": "Root has authorized Main NEW artifact-only repair; old76 and live M02 immutable. Review future revision only after new freeze and explicit assignment. No run granted."
+}

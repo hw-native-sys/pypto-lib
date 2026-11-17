@@ -1,0 +1,23 @@
+{
+  "source45_new": "8153c7f040bef51900a6e6c9ff27b018279b7503f31d50ec5488457e49770b28",
+  "source45_parent405": "405e7857b76e4813a3bdd0ce6dd2175f09617034cd3cc9ca68906d02fbf6bb31",
+  "only_kernel_changed": [
+    "models/deepseek_v4_1_flash_a3_w8a8/compressor.py"
+  ],
+  "other44_unchanged_relative": "parent405 NOT liveM02",
+  "live_M02": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "live45_unchanged": true,
+  "adapter": "50d11ffed9f2dba5fedbe73c6c3040e5e943ee29ff15052bc907514460c32c04",
+  "route": "9057c519fb056e1ca48cc736044748d79db9a4c03c88a2d0c245870a7e120faf",
+  "helperEE": "ee648c64b8477cc98b2f3083a6b16c9b6b92cc4612cc3228391dbe53aef1858d",
+  "oraclee45": "e45c7529d6c34cd57712a7d346ec612641896e38ab98ff88017ceafd87d999d3",
+  "fresh_full_manifest": "510dd3c7b72a1c36291ff8ff0b167ce0ac8204d2cd6a957eae0a8ea6641f8642",
+  "fresh_full_meta": "8ba379ca7bd864d5d452bc82f171bb1f1d4495fea074b7607c8ba25552e78770",
+  "full_public_ABI_changed": false,
+  "internal_statewriter_scalar": "physical T_DYN\u2192active num_tokens",
+  "golden_AST_changed": false,
+  "count_profiles": "OLD405 ancestry only/not recompiled/relabelled",
+  "Root_new_wrapper": "PENDING_EXTERNAL_AFTER_SOURCEPASS",
+  "future_work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_c2_retention_1794092629/work",
+  "work_exists": false
+}

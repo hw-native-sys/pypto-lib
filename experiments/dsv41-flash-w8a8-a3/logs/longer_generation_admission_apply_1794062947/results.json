@@ -1,0 +1,24 @@
+{
+  "status": "PASS_APPLIED_TINY_N3_ONLY",
+  "source45_sha256": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "generate_sha256": "41651e5af3b94223b645d4bfb52010e52ea7350aa3f3637cbcca6e29e093e609",
+  "other44_unchanged": true,
+  "prompt": {
+    "text": "Once upon a",
+    "ids": [
+      16600,
+      4465,
+      260
+    ]
+  },
+  "changed_negative_controls": 4,
+  "actual_default_HARD": true,
+  "actual_tokenizer_checked": true,
+  "changed_AST_only_positive": true,
+  "all_other_definitions_and_methods_unchanged": true,
+  "compile_method_inherits_D77": true,
+  "signature_compiled_here": false,
+  "native": false,
+  "tensor_payload_bytes": 0,
+  "positive_actual_grant": false
+}

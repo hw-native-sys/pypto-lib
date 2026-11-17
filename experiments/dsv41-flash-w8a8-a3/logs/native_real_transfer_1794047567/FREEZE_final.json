@@ -1,0 +1,19 @@
+{
+  "status": "FINAL/PARK",
+  "artifact_files": 34,
+  "artifacts_manifest_sha256": "767f72dd7d9c3e5573fb62892933ca530506ea123883cb959d53020527995fa9",
+  "source45_sha256": "762dc4f7a64fe38ee7868bf5891411798be350ef6781ef35e4c58f7dfd2d89c7",
+  "transport_sha256": "5e364da73ac36d59bce09f92dc4efb8501e900175fc91afc08f91cf0da9dfbb5",
+  "plan_sha256": "6172ee8e67687d176a2ed3e4441c7d2d858ac0e5a5271e3600648721aafda28e",
+  "observer_sha256": "31cd56f5bff3dd6db0f24d47ed2534efbbbe0ec46c68b256b65b0ae3d3eb7892",
+  "observer_cli_sha256": "8fed1c1f6be60e959a8d74f19f83c554b38f7b1b4f34b915ff8deba1a8a57786",
+  "actual_result_sha256": "2d0a4bd282bdb24a7620e36bd2c9a45ee46005893d5ff9363fca30047cf8b4ee",
+  "offset_observations_sha256": "a06247c2fd1fa56afe493f131e6897af9037a1559ea99b92eb6692be68a9159c",
+  "independent_audit_sha256": "57dfa5bac1c52a385a8f70159e3c19b6a65a8d4fb70a4ee31df6f0d30a519374",
+  "all_own_jobs_terminal": true,
+  "native_jobs": 1,
+  "all36_recorded_PID_starttick_identities_absent": true,
+  "all16_lock_release_logged": true,
+  "work_record": "review-selected-real-transfer-1794047567-1794048693",
+  "lifecycle": "Whole new unit immutable; no further source/device/data action, grant reuse or old evidence writes authorized"
+}

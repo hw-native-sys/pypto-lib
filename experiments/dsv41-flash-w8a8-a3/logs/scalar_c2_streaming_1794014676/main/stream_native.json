@@ -1,0 +1,61 @@
+{
+  "mode": "ONBOARD",
+  "platform": "a2a3",
+  "work_dir": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/scalar_c2_streaming_1794014676/main/stream_native_build/_jit_entry_20261107_100821_x8iurl0i",
+  "records": [
+    {
+      "step": 0,
+      "alpha": 1.25,
+      "choice": 1,
+      "active": true,
+      "state_sum": 7312.0
+    },
+    {
+      "step": 1,
+      "alpha": -2.0,
+      "choice": 2,
+      "active": false,
+      "state_sum": 20864.0
+    },
+    {
+      "step": 2,
+      "alpha": 3.0,
+      "choice": 1,
+      "active": true,
+      "state_sum": 28400.0
+    }
+  ],
+  "stats": {
+    "resident_upload_bytes": 3072,
+    "resident_allocations": 1,
+    "dispatches": 3,
+    "rank_allocations": 2,
+    "copy_calls": 24,
+    "max_leaf_bytes": 256,
+    "max_copy_bytes": 128,
+    "state_transport": "shared-host H2D/D2H each dispatch",
+    "protocol_domains": "fresh each dispatch"
+  },
+  "exact_rank_readback": true,
+  "source_mutation_ignored": true,
+  "stable_device_handles": [
+    20619064971264,
+    20619064971264
+  ],
+  "maxrss_kib": 300548,
+  "scope": "two rank synthetic3072B static payload, no real-fit or bandwidth claim",
+  "hbm_samples": {
+    "0": [
+      3145,
+      3145,
+      3146,
+      4583
+    ],
+    "1": [
+      2871,
+      2871,
+      2871,
+      4297
+    ]
+  }
+}

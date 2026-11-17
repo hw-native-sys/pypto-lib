@@ -1,0 +1,38 @@
+{
+  "schema": "configurable-auditor-validation-lineage/1",
+  "CPU_task": "task_20261108_121430_1344586710",
+  "terminal": "completed (exit=0)",
+  "result": "PASS_SCAFFOLDING_ONLY",
+  "passed": 37,
+  "unmet": 0,
+  "tested_core_snapshots": {
+    "cpu_tested_core/runner.py": "7db02d9610009223d8d0aa7a7f7686e7a26ab14157a2db10eff86f6911ca865e",
+    "cpu_tested_core/selfcheck.py": "bb456b91a79861eb5334c35575a752c82f6c90cd3c08eb57c449bb37bce6cf59",
+    "cpu_tested_core/shared_delta.py": "d1a9d1b777353c97848f245dad1b78b7623120b17a4ccec020430a4c0f6c0f0e",
+    "cpu_tested_core/topology_delta.py": "0b3d4d61f6cb374a3a86cd9debd896f866a4d047a2993fb702ab18cf83b1d419"
+  },
+  "receipt_sha256": "91bf4e03127b69afd3f5f1eefcaa3380c72714337121ab1a7376dcb1d0f62e5f",
+  "cpu_log_sha256": "5e268e122d53cf2d12f537ed26b797b7191d11fdc7f5c4da8d7e3bb24cb94d0d",
+  "historical_input_audit_sha256": "b9683fa7ecf759a729e8d3f062ee487fa05c4e69734bcc388092eaea1b1fbc3a",
+  "historical_input_shared_delta_sha256": "a09f63dd0d9a4fe27e0bdcd6ee5398fb2f596e646eac2dbd5f41980eb4fffdcb",
+  "template_parent_manifest_sha256": "f0926693acb2a7d6d39f072211e1ad633936b8f2f3785c3da18d9f71c6f7c386",
+  "source_only_late_changes": [
+    "Main ancestry/identity/signature schema alignment",
+    "fresh signature artifact manifest/HC profile derivation",
+    "owner identity reconciliation including extra parent",
+    "bounded-versus-whole status fields",
+    "all direct hash reads retained for stability",
+    "worker ready device coverage",
+    "owned tokenizer equality before stdlib decode",
+    "outside finalize collector"
+  ],
+  "late_changes_CPU_executed": false,
+  "actual_case_audited": false,
+  "model_runtime_imports": 0,
+  "headers": 0,
+  "payload_bytes": 0,
+  "NPU": 0,
+  "positive_grants": 0,
+  "Main_schema_source_proposal": "experiments/dsv41-flash-w8a8-a3/logs/configurable_real_operation_prepare_1794111133/adapt.py",
+  "Main_schema_is_final_binding": false
+}

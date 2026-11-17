@@ -1,0 +1,24 @@
+{
+  "state": "FINAL_PARK_APPLIED_B_AND_TWO_FRESH_E40_SIGNATURES_PASS",
+  "CPU_task": "task_20261108_083640_312359524414",
+  "CPU_exit": 0,
+  "own_PID": 3123910,
+  "own_starttick": "109812706",
+  "known_identity_absent": true,
+  "all_own_jobs_ended": true,
+  "CPU_batches": 1,
+  "compile_attempts": {
+    "prefill3": 1,
+    "decode1": 1
+  },
+  "failed_attempts": 0,
+  "actual_source45": "30b7106a5427c283917a7eeeec65aab598ab98bf5a70f1667285169c9c6d8eca",
+  "source45_before_after_final_equal": true,
+  "metadata_plan_before_after_final_equal": true,
+  "Main33_immutable": true,
+  "forbidden_calls": [],
+  "samples": 0,
+  "fixture_or_original_ref_or_checkpoint_header_payload_or_prepare_or_NPU": false,
+  "runtime_grants_created": 0,
+  "epoch": 1794098455
+}

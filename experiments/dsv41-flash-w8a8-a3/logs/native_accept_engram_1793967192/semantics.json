@@ -1,0 +1,16 @@
+{
+  "archive_exact_original_sources": {
+    "engram/common.py": "4797b8962264d137cdb142a9988825288283092fb797ddbd334c6ab2223eb58d",
+    "engram/layer.py": "dc9457c88aa3c90133115bc608447e037b0693f8db71bb8da37f1ead44021f80",
+    "model.py": "101f96b38e9fc47e7be147ddfe56976aee896867c73a33a7d95c3e3c833a6e91"
+  },
+  "original_positive_zero_and_tiny_signed_clamp": [
+    1.500249981880188,
+    1.500249981880188,
+    1.499750018119812
+  ],
+  "rotation_stored_R_inverse_RT_verified": true,
+  "source_BF16_projection_FP32_gate_and_residual": true,
+  "reference_revision": "8fde6d4e335fe300e2b949aab0e31659cce0811d",
+  "limits": "CPU Torch stand-ins; original torch_npu reduction/tie behavior unproven; no weights/table loads."
+}

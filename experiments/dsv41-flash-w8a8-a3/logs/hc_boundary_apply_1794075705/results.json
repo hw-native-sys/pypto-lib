@@ -1,0 +1,136 @@
+{
+  "status": "PASS_APPLIED_HC_AND_RESOURCE_REBIND_TINY_CPU",
+  "actual_source45_sha256": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+  "M01_sha256": "eb90ea56e26d0cb97dd12d330559c2ae1b53f4ae5cbf866cc01bfbbb150fecf2",
+  "other42_unchanged": true,
+  "default_HARD": true,
+  "math_original_cases": [
+    {
+      "name": "signed_original_reproducer",
+      "elements": 20480,
+      "old_missing_round_bad": 15360,
+      "proposed_bad": 0,
+      "wrong_truncate_bad": 5120,
+      "wrong_ties_away_bad": 5120,
+      "old_max_abs": 0.00390625,
+      "dtype": "torch.float32"
+    },
+    {
+      "name": "signed_even_odd_ties",
+      "elements": 20480,
+      "old_missing_round_bad": 20480,
+      "proposed_bad": 0,
+      "wrong_truncate_bad": 10240,
+      "wrong_ties_away_bad": 10240,
+      "old_max_abs": 0.00390625,
+      "dtype": "torch.float32"
+    },
+    {
+      "name": "signed_near_midpoints",
+      "elements": 20480,
+      "old_missing_round_bad": 20480,
+      "proposed_bad": 0,
+      "wrong_truncate_bad": 10240,
+      "wrong_ties_away_bad": 0,
+      "old_max_abs": 0.0039052963256835938,
+      "dtype": "torch.float32"
+    },
+    {
+      "name": "asymmetric_nonidentity_dyadic_mix",
+      "elements": 20480,
+      "old_missing_round_bad": 5120,
+      "proposed_bad": 0,
+      "wrong_truncate_bad": 5120,
+      "wrong_ties_away_bad": 0,
+      "old_max_abs": 0.00390625,
+      "dtype": "torch.float32"
+    },
+    {
+      "name": "already_exact",
+      "elements": 20480,
+      "old_missing_round_bad": 0,
+      "proposed_bad": 0,
+      "wrong_truncate_bad": 0,
+      "wrong_ties_away_bad": 0,
+      "old_max_abs": 0.0,
+      "dtype": "torch.float32"
+    }
+  ],
+  "actual_functions": [
+    {
+      "path": "experiments/dsv41-flash-w8a8-a3/logs/logic_review_1793929657/upstream_rc2/tests/deepseek_v41_utils.py",
+      "function": "hc_post_reference",
+      "source_sha256": "a51b53d475db02841630c5d00ed18a3c7afb2de526962f0e0e59c7293f25abd5"
+    },
+    {
+      "path": "experiments/dsv41-flash-w8a8-a3/logs/hc_boundary_apply_1794075705/hc.before.py",
+      "function": "golden_hc_post",
+      "source_sha256": "9c6ec36a2c981f1b24dc1aa22eee7ef7c93b278e595e4ea99920ab1d6160cf1d"
+    },
+    {
+      "path": "models/deepseek_v4_1_flash_a3_w8a8/hc.py",
+      "function": "golden_hc_post",
+      "source_sha256": "259b18ccbfbf9f2a19476770412b4da4f90c0959e6f0215b1f92901938c04be8"
+    },
+    {
+      "path": "experiments/dsv41-flash-w8a8-a3/logs/hc_boundary_apply_1794075705/layer_reference.before.py",
+      "function": "_hc_post_reference",
+      "source_sha256": "af8500f19cc6bdba1b1a2f3d025bf70a0e5551d29ed167684d80227b5ada50f2"
+    },
+    {
+      "path": "models/deepseek_v4_1_flash_a3_w8a8/layer_reference.py",
+      "function": "_hc_post_reference",
+      "source_sha256": "1cd63c08e88bc23a6e87283d74eb91dfe9af1fa85a6b960913f62ec9fc613051"
+    }
+  ],
+  "resource_binding": {
+    "schema": "HC-math-resource-binding/1",
+    "new_plan_sha256": "806852d5baec99a522f5adc3015bdd204d9ac6b17244a29cb26445cbd55fda89",
+    "new_plan_bytes": 66955067,
+    "old_plan_sha256": "3dd67b88683d0de1f5fbd8e889c0c1a875eeecf671263fca4c64061637ecd9c0",
+    "resource_key_rule": "EXACT old root-key projection minus source_manifest_sha256 and source_manifest_files",
+    "resource_keys": [
+      "checkpoint",
+      "expert_layers",
+      "index_sha256",
+      "operation",
+      "payload_bytes_read",
+      "phases",
+      "prompt_candidates",
+      "schema",
+      "selected_prompt",
+      "source_descriptors",
+      "static_arguments_per_rank",
+      "static_global_bytes",
+      "static_per_rank_bytes",
+      "tokenizer_files",
+      "two_phase_H2D_static_bytes",
+      "two_phase_cumulative_source_bytes",
+      "unknown_peaks"
+    ],
+    "resource_canonical_sha256": "e13c5fd6d98de327a24427b5efc0a9be4e9c30a89e757ac6c377e73b6ffc10ff",
+    "only_allowed_added_root_key": "hc_math_lineage",
+    "lineage_canonical_sha256": "e9b0e71dd5d2909d007a4d762ca92ff83e1940630251fae7bb98216f8e10983c",
+    "lineage_file_sha256": "ebac3e1980d2e0db67fe23ef2be16362c1b23246b3a4c12812e97c7b5d6af2d8",
+    "actual_source45_sha256": "e07b28713eadd00a306fd60264223dbf6ceec53761c7ac48c347032011c9ca25",
+    "math_baseline_M01_sha256": "eb90ea56e26d0cb97dd12d330559c2ae1b53f4ae5cbf866cc01bfbbb150fecf2",
+    "whole_native_case": "FAILED; offline independentlyoriginal bounded comparison accepted"
+  },
+  "negative_rejections": [
+    "extra_field",
+    "missing_field",
+    "bad_resource",
+    "bad_lineage",
+    "old_plan",
+    "old_math",
+    "wrong_HC",
+    "missing_source"
+  ],
+  "full_positive_constructor_or_actual_grant": false,
+  "fresh_signatures": "PENDING",
+  "compile": false,
+  "NPU": false,
+  "headers_read": 0,
+  "real_payload_bytes": 0,
+  "fullmodel_fixture": false
+}

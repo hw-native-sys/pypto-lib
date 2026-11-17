@@ -1,0 +1,1228 @@
+[
+  {
+    "line": 215,
+    "scope_depth": 1,
+    "allocation": "alloc_0",
+    "tensors": [
+      "local_ids_inline19166_ci",
+      "owners_inline19167_ci",
+      "partial_inline19168_ci",
+      "hidden_inline19175_ci",
+      "hidden_inline19205_ci",
+      "attn_input_inline19206_ci",
+      "attn_out_inline19207_ci",
+      "x_hc_mid_inline19208_ci",
+      "attn_pre_mix_inline19209_ci",
+      "hidden_inline21872_ci",
+      "attn_input_inline21873_ci",
+      "attn_out_inline21874_ci",
+      "x_hc_mid_inline21875_ci",
+      "attn_pre_mix_inline21876_ci",
+      "normed_inline24663_ci"
+    ]
+  },
+  {
+    "line": 487,
+    "scope_depth": 2,
+    "allocation": "alloc_1",
+    "tensors": [
+      "attention_x_inline19262_ci",
+      "ffn_input_inline21334_ci",
+      "ffn_normed_inline21335_ci",
+      "ffn_post_mix_inline21336_ci",
+      "ffn_residual_mix_inline21337_ci",
+      "route_indices_inline21338_ci",
+      "route_weights_inline21339_ci",
+      "routed_inline21340_ci",
+      "mixes_inline21347_ci",
+      "inv_rms_inline21356_ci",
+      "expert_counts_inline21500_ci",
+      "aux_stage_inline21501_ci",
+      "meta_local_inline21502_ci",
+      "slab_x_inline21503_ci",
+      "slab_w_inline21504_ci",
+      "slab_route_inline21505_ci"
+    ]
+  },
+  {
+    "line": 512,
+    "scope_depth": 2,
+    "allocation": "alloc_2",
+    "tensors": [
+      "expert_y_inline21506_ci",
+      "return_stage_inline21507_ci",
+      "shared_input_inline21581_ci",
+      "shared_y_inline21582_ci"
+    ]
+  },
+  {
+    "line": 1292,
+    "scope_depth": 3,
+    "allocation": "alloc_3",
+    "tensors": [
+      "kv_inline19287_ci"
+    ]
+  },
+  {
+    "line": 1355,
+    "scope_depth": 4,
+    "allocation": "alloc_4",
+    "tensors": [
+      "gm_pipe_buffer_0_ci"
+    ]
+  },
+  {
+    "line": 1382,
+    "scope_depth": 3,
+    "allocation": "alloc_5",
+    "tensors": [
+      "restored_inline19309_ci"
+    ]
+  },
+  {
+    "line": 1503,
+    "scope_depth": 3,
+    "allocation": "alloc_6",
+    "tensors": [
+      "post_mix_inline19357_ci",
+      "residual_mix_inline19358_ci",
+      "mixes_inline19365_ci",
+      "inv_rms_inline19374_ci",
+      "partial_inline19361_ci",
+      "q_inline19470_ci",
+      "kv_inline19471_ci",
+      "qr_inline19472_ci",
+      "qr_scale_inline19473_ci",
+      "x_i8_inline19501_ci",
+      "x_scale_inline19502_ci",
+      "qr_bf16_inline19503_ci",
+      "qr_norm_inline19504_ci",
+      "q_bf16_inline19505_ci",
+      "kv_bf16_inline19507_ci",
+      "kv_norm_inline19508_ci"
+    ]
+  },
+  {
+    "line": 1530,
+    "scope_depth": 3,
+    "allocation": "alloc_7",
+    "tensors": [
+      "target_inline19720_ci",
+      "attended_inline19485_ci",
+      "inverse_sin_inline19781_ci",
+      "restored_inline19787_ci",
+      "mid_inline19790_ci"
+    ]
+  },
+  {
+    "line": 1561,
+    "scope_depth": 4,
+    "allocation": "alloc_8",
+    "tensors": [
+      "gm_pipe_buffer_1_ci"
+    ]
+  },
+  {
+    "line": 1670,
+    "scope_depth": 4,
+    "allocation": "alloc_9",
+    "tensors": [
+      "gm_pipe_buffer_2_ci"
+    ]
+  },
+  {
+    "line": 1735,
+    "scope_depth": 4,
+    "allocation": "alloc_10",
+    "tensors": [
+      "gm_pipe_buffer_3_ci"
+    ]
+  },
+  {
+    "line": 1780,
+    "scope_depth": 4,
+    "allocation": "alloc_11",
+    "tensors": [
+      "gm_pipe_buffer_4_ci"
+    ]
+  },
+  {
+    "line": 1844,
+    "scope_depth": 3,
+    "allocation": "alloc_12",
+    "tensors": [
+      "target_inline19713_ci"
+    ]
+  },
+  {
+    "line": 1958,
+    "scope_depth": 4,
+    "allocation": "alloc_13",
+    "tensors": [
+      "selected_inline19490_ci"
+    ]
+  },
+  {
+    "line": 1962,
+    "scope_depth": 4,
+    "allocation": "alloc_14",
+    "tensors": [
+      "combined_inline19491_ci"
+    ]
+  },
+  {
+    "line": 2011,
+    "scope_depth": 5,
+    "allocation": "alloc_15",
+    "tensors": [
+      "gm_pipe_buffer_5_ci"
+    ]
+  },
+  {
+    "line": 2097,
+    "scope_depth": 5,
+    "allocation": "alloc_16",
+    "tensors": [
+      "gm_pipe_buffer_6_ci"
+    ]
+  },
+  {
+    "line": 2128,
+    "scope_depth": 4,
+    "allocation": "alloc_17",
+    "tensors": [
+      "gm_pipe_buffer_7_ci"
+    ]
+  },
+  {
+    "line": 2387,
+    "scope_depth": 4,
+    "allocation": "alloc_18",
+    "tensors": [
+      "post_mix_inline19876_ci",
+      "residual_mix_inline19877_ci",
+      "mixes_inline19884_ci",
+      "inv_rms_inline19893_ci",
+      "partial_inline19880_ci",
+      "q_inline19989_ci",
+      "kv_inline19990_ci",
+      "qr_inline19991_ci",
+      "qr_scale_inline19992_ci",
+      "x_i8_inline20056_ci",
+      "x_scale_inline20057_ci",
+      "qr_bf16_inline20058_ci",
+      "qr_norm_inline20059_ci",
+      "q_bf16_inline20060_ci",
+      "kv_bf16_inline20062_ci",
+      "kv_norm_inline20063_ci"
+    ]
+  },
+  {
+    "line": 2436,
+    "scope_depth": 4,
+    "allocation": "alloc_19",
+    "tensors": [
+      "target_inline20275_ci",
+      "latent_inline20004_ci",
+      "kv_proj_inline20292_ci",
+      "score_proj_inline20293_ci",
+      "latent_inline20294_ci",
+      "attention_latent_inline20006_ci",
+      "target_inline20403_ci",
+      "projected_inline20420_ci",
+      "normalized_inline20421_ci",
+      "key_inline20422_ci",
+      "target_inline20489_ci",
+      "query_inline20021_ci",
+      "weights_inline20022_ci",
+      "projected_inline20506_ci",
+      "arena_inline20596_ci",
+      "attended_inline20039_ci"
+    ]
+  },
+  {
+    "line": 2459,
+    "scope_depth": 4,
+    "allocation": "alloc_20",
+    "tensors": [
+      "inverse_sin_inline20715_ci",
+      "restored_inline20721_ci",
+      "mid_inline20724_ci"
+    ]
+  },
+  {
+    "line": 2488,
+    "scope_depth": 5,
+    "allocation": "alloc_21",
+    "tensors": [
+      "gm_pipe_buffer_8_ci"
+    ]
+  },
+  {
+    "line": 2597,
+    "scope_depth": 5,
+    "allocation": "alloc_22",
+    "tensors": [
+      "gm_pipe_buffer_9_ci"
+    ]
+  },
+  {
+    "line": 2662,
+    "scope_depth": 5,
+    "allocation": "alloc_23",
+    "tensors": [
+      "gm_pipe_buffer_10_ci"
+    ]
+  },
+  {
+    "line": 2707,
+    "scope_depth": 5,
+    "allocation": "alloc_24",
+    "tensors": [
+      "gm_pipe_buffer_11_ci"
+    ]
+  },
+  {
+    "line": 2771,
+    "scope_depth": 4,
+    "allocation": "alloc_25",
+    "tensors": [
+      "target_inline20268_ci"
+    ]
+  },
+  {
+    "line": 2864,
+    "scope_depth": 5,
+    "allocation": "alloc_26",
+    "tensors": [
+      "gm_pipe_buffer_12_ci"
+    ]
+  },
+  {
+    "line": 2890,
+    "scope_depth": 5,
+    "allocation": "alloc_27",
+    "tensors": [
+      "gm_pipe_buffer_13_ci"
+    ]
+  },
+  {
+    "line": 3038,
+    "scope_depth": 5,
+    "allocation": "alloc_28",
+    "tensors": [
+      "gm_pipe_buffer_14_ci"
+    ]
+  },
+  {
+    "line": 3152,
+    "scope_depth": 5,
+    "allocation": "alloc_29",
+    "tensors": [
+      "gm_pipe_buffer_15_ci"
+    ]
+  },
+  {
+    "line": 3198,
+    "scope_depth": 5,
+    "allocation": "alloc_30",
+    "tensors": [
+      "gm_pipe_buffer_16_ci"
+    ]
+  },
+  {
+    "line": 3231,
+    "scope_depth": 4,
+    "allocation": "alloc_31",
+    "tensors": [
+      "scores_inline20028_ci"
+    ]
+  },
+  {
+    "line": 3255,
+    "scope_depth": 5,
+    "allocation": "alloc_32",
+    "tensors": [
+      "gm_pipe_buffer_17_ci"
+    ]
+  },
+  {
+    "line": 3331,
+    "scope_depth": 4,
+    "allocation": "alloc_33",
+    "tensors": [
+      "arena_inline20629_ci"
+    ]
+  },
+  {
+    "line": 3412,
+    "scope_depth": 5,
+    "allocation": "alloc_34",
+    "tensors": [
+      "selected_inline20045_ci"
+    ]
+  },
+  {
+    "line": 3416,
+    "scope_depth": 5,
+    "allocation": "alloc_35",
+    "tensors": [
+      "combined_inline20046_ci"
+    ]
+  },
+  {
+    "line": 3470,
+    "scope_depth": 6,
+    "allocation": "alloc_36",
+    "tensors": [
+      "gm_pipe_buffer_18_ci"
+    ]
+  },
+  {
+    "line": 3556,
+    "scope_depth": 6,
+    "allocation": "alloc_37",
+    "tensors": [
+      "gm_pipe_buffer_19_ci"
+    ]
+  },
+  {
+    "line": 3587,
+    "scope_depth": 5,
+    "allocation": "alloc_38",
+    "tensors": [
+      "gm_pipe_buffer_20_ci"
+    ]
+  },
+  {
+    "line": 3825,
+    "scope_depth": 4,
+    "allocation": "alloc_39",
+    "tensors": [
+      "post_mix_inline20810_ci",
+      "residual_mix_inline20811_ci",
+      "mixes_inline20818_ci",
+      "inv_rms_inline20827_ci",
+      "partial_inline20814_ci",
+      "q_inline20923_ci",
+      "kv_inline20924_ci",
+      "qr_inline20925_ci",
+      "qr_scale_inline20926_ci",
+      "x_i8_inline20955_ci",
+      "x_scale_inline20956_ci",
+      "qr_bf16_inline20957_ci",
+      "qr_norm_inline20958_ci",
+      "q_bf16_inline20959_ci",
+      "kv_bf16_inline20961_ci",
+      "kv_norm_inline20962_ci"
+    ]
+  },
+  {
+    "line": 3852,
+    "scope_depth": 4,
+    "allocation": "alloc_40",
+    "tensors": [
+      "target_inline21174_ci",
+      "attended_inline20938_ci",
+      "inverse_sin_inline21239_ci",
+      "restored_inline21245_ci",
+      "mid_inline21248_ci"
+    ]
+  },
+  {
+    "line": 3883,
+    "scope_depth": 5,
+    "allocation": "alloc_41",
+    "tensors": [
+      "gm_pipe_buffer_21_ci"
+    ]
+  },
+  {
+    "line": 3992,
+    "scope_depth": 5,
+    "allocation": "alloc_42",
+    "tensors": [
+      "gm_pipe_buffer_22_ci"
+    ]
+  },
+  {
+    "line": 4057,
+    "scope_depth": 5,
+    "allocation": "alloc_43",
+    "tensors": [
+      "gm_pipe_buffer_23_ci"
+    ]
+  },
+  {
+    "line": 4102,
+    "scope_depth": 5,
+    "allocation": "alloc_44",
+    "tensors": [
+      "gm_pipe_buffer_24_ci"
+    ]
+  },
+  {
+    "line": 4166,
+    "scope_depth": 4,
+    "allocation": "alloc_45",
+    "tensors": [
+      "target_inline21167_ci"
+    ]
+  },
+  {
+    "line": 4283,
+    "scope_depth": 5,
+    "allocation": "alloc_46",
+    "tensors": [
+      "selected_inline20944_ci"
+    ]
+  },
+  {
+    "line": 4287,
+    "scope_depth": 5,
+    "allocation": "alloc_47",
+    "tensors": [
+      "combined_inline20945_ci"
+    ]
+  },
+  {
+    "line": 4341,
+    "scope_depth": 6,
+    "allocation": "alloc_48",
+    "tensors": [
+      "gm_pipe_buffer_25_ci"
+    ]
+  },
+  {
+    "line": 4427,
+    "scope_depth": 6,
+    "allocation": "alloc_49",
+    "tensors": [
+      "gm_pipe_buffer_26_ci"
+    ]
+  },
+  {
+    "line": 4458,
+    "scope_depth": 5,
+    "allocation": "alloc_50",
+    "tensors": [
+      "gm_pipe_buffer_27_ci"
+    ]
+  },
+  {
+    "line": 4675,
+    "scope_depth": 3,
+    "allocation": "alloc_51",
+    "tensors": [
+      "gm_pipe_buffer_28_ci"
+    ]
+  },
+  {
+    "line": 4763,
+    "scope_depth": 3,
+    "allocation": "alloc_52",
+    "tensors": [
+      "gm_pipe_buffer_29_ci"
+    ]
+  },
+  {
+    "line": 4921,
+    "scope_depth": 5,
+    "allocation": "alloc_53",
+    "tensors": [
+      "x_i8_inline21610_ci",
+      "x_scale_inline21611_ci",
+      "gate_inline21612_ci",
+      "up_inline21613_ci",
+      "activated_inline21614_ci",
+      "act_i8_inline21626_ci",
+      "act_scale_inline21627_ci"
+    ]
+  },
+  {
+    "line": 5068,
+    "scope_depth": 6,
+    "allocation": "alloc_54",
+    "tensors": [
+      "gm_pipe_buffer_30_ci"
+    ]
+  },
+  {
+    "line": 5094,
+    "scope_depth": 6,
+    "allocation": "alloc_55",
+    "tensors": [
+      "gm_pipe_buffer_31_ci"
+    ]
+  },
+  {
+    "line": 5150,
+    "scope_depth": 6,
+    "allocation": "alloc_56",
+    "tensors": [
+      "gm_pipe_buffer_32_ci"
+    ]
+  },
+  {
+    "line": 5239,
+    "scope_depth": 3,
+    "allocation": "alloc_57",
+    "tensors": [
+      "shared_out_inline21588_ci",
+      "x_i8_inline21733_ci",
+      "x_scale_inline21734_ci",
+      "gate_inline21735_ci",
+      "up_inline21736_ci",
+      "activated_inline21737_ci",
+      "act_i8_inline21745_ci",
+      "act_scale_inline21746_ci"
+    ]
+  },
+  {
+    "line": 5284,
+    "scope_depth": 4,
+    "allocation": "alloc_58",
+    "tensors": [
+      "gm_pipe_buffer_33_ci"
+    ]
+  },
+  {
+    "line": 5310,
+    "scope_depth": 4,
+    "allocation": "alloc_59",
+    "tensors": [
+      "gm_pipe_buffer_34_ci"
+    ]
+  },
+  {
+    "line": 5365,
+    "scope_depth": 4,
+    "allocation": "alloc_60",
+    "tensors": [
+      "gm_pipe_buffer_35_ci"
+    ]
+  },
+  {
+    "line": 5532,
+    "scope_depth": 2,
+    "allocation": "alloc_61",
+    "tensors": [
+      "attention_x_inline21922_ci",
+      "ffn_input_inline24111_ci",
+      "ffn_normed_inline24112_ci",
+      "ffn_post_mix_inline24113_ci",
+      "ffn_residual_mix_inline24114_ci",
+      "route_indices_inline24115_ci",
+      "route_weights_inline24116_ci",
+      "routed_inline24117_ci",
+      "mixes_inline24124_ci",
+      "inv_rms_inline24133_ci",
+      "expert_counts_inline24277_ci",
+      "aux_stage_inline24278_ci",
+      "meta_local_inline24279_ci",
+      "slab_x_inline24280_ci",
+      "slab_w_inline24281_ci",
+      "slab_route_inline24282_ci"
+    ]
+  },
+  {
+    "line": 5557,
+    "scope_depth": 2,
+    "allocation": "alloc_62",
+    "tensors": [
+      "expert_y_inline24283_ci",
+      "return_stage_inline24284_ci",
+      "shared_input_inline24358_ci",
+      "shared_y_inline24359_ci"
+    ]
+  },
+  {
+    "line": 6188,
+    "scope_depth": 3,
+    "allocation": "alloc_63",
+    "tensors": [
+      "kv_inline21951_ci"
+    ]
+  },
+  {
+    "line": 6251,
+    "scope_depth": 4,
+    "allocation": "alloc_64",
+    "tensors": [
+      "gm_pipe_buffer_36_ci"
+    ]
+  },
+  {
+    "line": 6278,
+    "scope_depth": 3,
+    "allocation": "alloc_65",
+    "tensors": [
+      "restored_inline21973_ci"
+    ]
+  },
+  {
+    "line": 6413,
+    "scope_depth": 3,
+    "allocation": "alloc_66",
+    "tensors": [
+      "post_mix_inline22021_ci",
+      "residual_mix_inline22022_ci",
+      "mixes_inline22029_ci",
+      "inv_rms_inline22038_ci",
+      "partial_inline22025_ci",
+      "q_inline22134_ci",
+      "kv_inline22135_ci",
+      "qr_inline22136_ci",
+      "qr_scale_inline22137_ci",
+      "x_i8_inline22201_ci",
+      "x_scale_inline22202_ci",
+      "qr_bf16_inline22203_ci",
+      "qr_norm_inline22204_ci",
+      "q_bf16_inline22205_ci",
+      "kv_bf16_inline22207_ci",
+      "kv_norm_inline22208_ci"
+    ]
+  },
+  {
+    "line": 6462,
+    "scope_depth": 3,
+    "allocation": "alloc_67",
+    "tensors": [
+      "target_inline22420_ci",
+      "query_inline22145_ci",
+      "weights_inline22146_ci",
+      "projected_inline22427_ci",
+      "latent_inline22155_ci",
+      "latent_inline22501_ci",
+      "attention_latent_inline22157_ci",
+      "target_inline22567_ci",
+      "projected_inline22584_ci",
+      "normalized_inline22585_ci",
+      "key_inline22586_ci",
+      "target_inline22653_ci",
+      "arena_inline22696_ci",
+      "attended_inline22184_ci",
+      "inverse_sin_inline22815_ci",
+      "restored_inline22821_ci"
+    ]
+  },
+  {
+    "line": 6481,
+    "scope_depth": 3,
+    "allocation": "alloc_68",
+    "tensors": [
+      "mid_inline22824_ci"
+    ]
+  },
+  {
+    "line": 6508,
+    "scope_depth": 4,
+    "allocation": "alloc_69",
+    "tensors": [
+      "gm_pipe_buffer_37_ci"
+    ]
+  },
+  {
+    "line": 6617,
+    "scope_depth": 4,
+    "allocation": "alloc_70",
+    "tensors": [
+      "gm_pipe_buffer_38_ci"
+    ]
+  },
+  {
+    "line": 6682,
+    "scope_depth": 4,
+    "allocation": "alloc_71",
+    "tensors": [
+      "gm_pipe_buffer_39_ci"
+    ]
+  },
+  {
+    "line": 6727,
+    "scope_depth": 4,
+    "allocation": "alloc_72",
+    "tensors": [
+      "gm_pipe_buffer_40_ci"
+    ]
+  },
+  {
+    "line": 6791,
+    "scope_depth": 3,
+    "allocation": "alloc_73",
+    "tensors": [
+      "target_inline22413_ci"
+    ]
+  },
+  {
+    "line": 6850,
+    "scope_depth": 4,
+    "allocation": "alloc_74",
+    "tensors": [
+      "gm_pipe_buffer_41_ci"
+    ]
+  },
+  {
+    "line": 6896,
+    "scope_depth": 4,
+    "allocation": "alloc_75",
+    "tensors": [
+      "gm_pipe_buffer_42_ci"
+    ]
+  },
+  {
+    "line": 6965,
+    "scope_depth": 4,
+    "allocation": "alloc_76",
+    "tensors": [
+      "gm_pipe_buffer_43_ci"
+    ]
+  },
+  {
+    "line": 7079,
+    "scope_depth": 4,
+    "allocation": "alloc_77",
+    "tensors": [
+      "gm_pipe_buffer_44_ci"
+    ]
+  },
+  {
+    "line": 7191,
+    "scope_depth": 3,
+    "allocation": "alloc_78",
+    "tensors": [
+      "scores_inline22173_ci"
+    ]
+  },
+  {
+    "line": 7215,
+    "scope_depth": 4,
+    "allocation": "alloc_79",
+    "tensors": [
+      "gm_pipe_buffer_45_ci"
+    ]
+  },
+  {
+    "line": 7291,
+    "scope_depth": 3,
+    "allocation": "alloc_80",
+    "tensors": [
+      "arena_inline22729_ci"
+    ]
+  },
+  {
+    "line": 7372,
+    "scope_depth": 4,
+    "allocation": "alloc_81",
+    "tensors": [
+      "selected_inline22190_ci"
+    ]
+  },
+  {
+    "line": 7376,
+    "scope_depth": 4,
+    "allocation": "alloc_82",
+    "tensors": [
+      "combined_inline22191_ci"
+    ]
+  },
+  {
+    "line": 7430,
+    "scope_depth": 5,
+    "allocation": "alloc_83",
+    "tensors": [
+      "gm_pipe_buffer_46_ci"
+    ]
+  },
+  {
+    "line": 7516,
+    "scope_depth": 5,
+    "allocation": "alloc_84",
+    "tensors": [
+      "gm_pipe_buffer_47_ci"
+    ]
+  },
+  {
+    "line": 7547,
+    "scope_depth": 4,
+    "allocation": "alloc_85",
+    "tensors": [
+      "gm_pipe_buffer_48_ci"
+    ]
+  },
+  {
+    "line": 7797,
+    "scope_depth": 4,
+    "allocation": "alloc_86",
+    "tensors": [
+      "post_mix_inline22910_ci",
+      "residual_mix_inline22911_ci",
+      "mixes_inline22918_ci",
+      "inv_rms_inline22927_ci",
+      "partial_inline22914_ci",
+      "q_inline23023_ci",
+      "kv_inline23024_ci",
+      "qr_inline23025_ci",
+      "qr_scale_inline23026_ci",
+      "x_i8_inline23073_ci",
+      "x_scale_inline23074_ci",
+      "qr_bf16_inline23075_ci",
+      "qr_norm_inline23076_ci",
+      "q_bf16_inline23077_ci",
+      "kv_bf16_inline23079_ci",
+      "kv_norm_inline23080_ci"
+    ]
+  },
+  {
+    "line": 7832,
+    "scope_depth": 4,
+    "allocation": "alloc_87",
+    "tensors": [
+      "target_inline23292_ci",
+      "query_inline23038_ci",
+      "weights_inline23039_ci",
+      "projected_inline23309_ci",
+      "arena_inline23412_ci",
+      "attended_inline23056_ci",
+      "inverse_sin_inline23492_ci",
+      "restored_inline23498_ci",
+      "mid_inline23501_ci"
+    ]
+  },
+  {
+    "line": 7867,
+    "scope_depth": 5,
+    "allocation": "alloc_88",
+    "tensors": [
+      "gm_pipe_buffer_49_ci"
+    ]
+  },
+  {
+    "line": 7976,
+    "scope_depth": 5,
+    "allocation": "alloc_89",
+    "tensors": [
+      "gm_pipe_buffer_50_ci"
+    ]
+  },
+  {
+    "line": 8041,
+    "scope_depth": 5,
+    "allocation": "alloc_90",
+    "tensors": [
+      "gm_pipe_buffer_51_ci"
+    ]
+  },
+  {
+    "line": 8086,
+    "scope_depth": 5,
+    "allocation": "alloc_91",
+    "tensors": [
+      "gm_pipe_buffer_52_ci"
+    ]
+  },
+  {
+    "line": 8150,
+    "scope_depth": 4,
+    "allocation": "alloc_92",
+    "tensors": [
+      "target_inline23285_ci"
+    ]
+  },
+  {
+    "line": 8248,
+    "scope_depth": 5,
+    "allocation": "alloc_93",
+    "tensors": [
+      "gm_pipe_buffer_53_ci"
+    ]
+  },
+  {
+    "line": 8294,
+    "scope_depth": 5,
+    "allocation": "alloc_94",
+    "tensors": [
+      "gm_pipe_buffer_54_ci"
+    ]
+  },
+  {
+    "line": 8327,
+    "scope_depth": 4,
+    "allocation": "alloc_95",
+    "tensors": [
+      "scores_inline23045_ci"
+    ]
+  },
+  {
+    "line": 8350,
+    "scope_depth": 5,
+    "allocation": "alloc_96",
+    "tensors": [
+      "gm_pipe_buffer_55_ci"
+    ]
+  },
+  {
+    "line": 8376,
+    "scope_depth": 4,
+    "allocation": "alloc_97",
+    "tensors": [
+      "filtered_inline23048_ci"
+    ]
+  },
+  {
+    "line": 8495,
+    "scope_depth": 5,
+    "allocation": "alloc_98",
+    "tensors": [
+      "selected_inline23062_ci"
+    ]
+  },
+  {
+    "line": 8499,
+    "scope_depth": 5,
+    "allocation": "alloc_99",
+    "tensors": [
+      "combined_inline23063_ci"
+    ]
+  },
+  {
+    "line": 8553,
+    "scope_depth": 6,
+    "allocation": "alloc_100",
+    "tensors": [
+      "gm_pipe_buffer_56_ci"
+    ]
+  },
+  {
+    "line": 8639,
+    "scope_depth": 6,
+    "allocation": "alloc_101",
+    "tensors": [
+      "gm_pipe_buffer_57_ci"
+    ]
+  },
+  {
+    "line": 8670,
+    "scope_depth": 5,
+    "allocation": "alloc_102",
+    "tensors": [
+      "gm_pipe_buffer_58_ci"
+    ]
+  },
+  {
+    "line": 8908,
+    "scope_depth": 4,
+    "allocation": "alloc_103",
+    "tensors": [
+      "post_mix_inline23587_ci",
+      "residual_mix_inline23588_ci",
+      "mixes_inline23595_ci",
+      "inv_rms_inline23604_ci",
+      "partial_inline23591_ci",
+      "q_inline23700_ci",
+      "kv_inline23701_ci",
+      "qr_inline23702_ci",
+      "qr_scale_inline23703_ci",
+      "x_i8_inline23732_ci",
+      "x_scale_inline23733_ci",
+      "qr_bf16_inline23734_ci",
+      "qr_norm_inline23735_ci",
+      "q_bf16_inline23736_ci",
+      "kv_bf16_inline23738_ci",
+      "kv_norm_inline23739_ci"
+    ]
+  },
+  {
+    "line": 8935,
+    "scope_depth": 4,
+    "allocation": "alloc_104",
+    "tensors": [
+      "target_inline23951_ci",
+      "attended_inline23715_ci",
+      "inverse_sin_inline24016_ci",
+      "restored_inline24022_ci",
+      "mid_inline24025_ci"
+    ]
+  },
+  {
+    "line": 8966,
+    "scope_depth": 5,
+    "allocation": "alloc_105",
+    "tensors": [
+      "gm_pipe_buffer_59_ci"
+    ]
+  },
+  {
+    "line": 9075,
+    "scope_depth": 5,
+    "allocation": "alloc_106",
+    "tensors": [
+      "gm_pipe_buffer_60_ci"
+    ]
+  },
+  {
+    "line": 9140,
+    "scope_depth": 5,
+    "allocation": "alloc_107",
+    "tensors": [
+      "gm_pipe_buffer_61_ci"
+    ]
+  },
+  {
+    "line": 9185,
+    "scope_depth": 5,
+    "allocation": "alloc_108",
+    "tensors": [
+      "gm_pipe_buffer_62_ci"
+    ]
+  },
+  {
+    "line": 9249,
+    "scope_depth": 4,
+    "allocation": "alloc_109",
+    "tensors": [
+      "target_inline23944_ci"
+    ]
+  },
+  {
+    "line": 9366,
+    "scope_depth": 5,
+    "allocation": "alloc_110",
+    "tensors": [
+      "selected_inline23721_ci"
+    ]
+  },
+  {
+    "line": 9370,
+    "scope_depth": 5,
+    "allocation": "alloc_111",
+    "tensors": [
+      "combined_inline23722_ci"
+    ]
+  },
+  {
+    "line": 9424,
+    "scope_depth": 6,
+    "allocation": "alloc_112",
+    "tensors": [
+      "gm_pipe_buffer_63_ci"
+    ]
+  },
+  {
+    "line": 9510,
+    "scope_depth": 6,
+    "allocation": "alloc_113",
+    "tensors": [
+      "gm_pipe_buffer_64_ci"
+    ]
+  },
+  {
+    "line": 9541,
+    "scope_depth": 5,
+    "allocation": "alloc_114",
+    "tensors": [
+      "gm_pipe_buffer_65_ci"
+    ]
+  },
+  {
+    "line": 9758,
+    "scope_depth": 3,
+    "allocation": "alloc_115",
+    "tensors": [
+      "gm_pipe_buffer_66_ci"
+    ]
+  },
+  {
+    "line": 9846,
+    "scope_depth": 3,
+    "allocation": "alloc_116",
+    "tensors": [
+      "gm_pipe_buffer_67_ci"
+    ]
+  },
+  {
+    "line": 10004,
+    "scope_depth": 5,
+    "allocation": "alloc_117",
+    "tensors": [
+      "x_i8_inline24387_ci",
+      "x_scale_inline24388_ci",
+      "gate_inline24389_ci",
+      "up_inline24390_ci",
+      "activated_inline24391_ci",
+      "act_i8_inline24403_ci",
+      "act_scale_inline24404_ci"
+    ]
+  },
+  {
+    "line": 10151,
+    "scope_depth": 6,
+    "allocation": "alloc_118",
+    "tensors": [
+      "gm_pipe_buffer_68_ci"
+    ]
+  },
+  {
+    "line": 10177,
+    "scope_depth": 6,
+    "allocation": "alloc_119",
+    "tensors": [
+      "gm_pipe_buffer_69_ci"
+    ]
+  },
+  {
+    "line": 10233,
+    "scope_depth": 6,
+    "allocation": "alloc_120",
+    "tensors": [
+      "gm_pipe_buffer_70_ci"
+    ]
+  },
+  {
+    "line": 10322,
+    "scope_depth": 3,
+    "allocation": "alloc_121",
+    "tensors": [
+      "shared_out_inline24365_ci",
+      "x_i8_inline24510_ci",
+      "x_scale_inline24511_ci",
+      "gate_inline24512_ci",
+      "up_inline24513_ci",
+      "activated_inline24514_ci",
+      "act_i8_inline24522_ci",
+      "act_scale_inline24523_ci"
+    ]
+  },
+  {
+    "line": 10367,
+    "scope_depth": 4,
+    "allocation": "alloc_122",
+    "tensors": [
+      "gm_pipe_buffer_71_ci"
+    ]
+  },
+  {
+    "line": 10393,
+    "scope_depth": 4,
+    "allocation": "alloc_123",
+    "tensors": [
+      "gm_pipe_buffer_72_ci"
+    ]
+  },
+  {
+    "line": 10448,
+    "scope_depth": 4,
+    "allocation": "alloc_124",
+    "tensors": [
+      "gm_pipe_buffer_73_ci"
+    ]
+  },
+  {
+    "line": 10608,
+    "scope_depth": 2,
+    "allocation": "alloc_125",
+    "tensors": [
+      "gm_pipe_buffer_74_ci"
+    ]
+  }
+]

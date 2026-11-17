@@ -1,0 +1,11 @@
+[
+  {
+    "id": "f10_stride-1793953131-1793953986",
+    "start_epoch": 1793953131,
+    "end_epoch": 1793953986,
+    "duration_seconds": 855,
+    "phase": "implement-validate-device",
+    "summary": "Shared capacity-stride fix; CPU overlap proof,actual16-device old numerical rejection/equal/unequal/idle positives and same-artifact strict-inactive replay pass. Only moe_exchange.py edited; no F09 closure.",
+    "evidence": "logs/cohort_f04_f10_1793952989/worker_f10/REPORT.md; device/results.tsv; replay_queue.log"
+  }
+]

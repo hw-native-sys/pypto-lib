@@ -1,0 +1,13 @@
+{
+  "status": "PASS_CPU_PRE_NATIVE_FORK_ONLY",
+  "parent": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_exact_prompt_1794036903",
+  "work": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_exact_prompt_capture_1794038189/n3_work",
+  "byte_exact_files": 131,
+  "static_plan_sha256": "6f9568a4fdfcb7c3fcb5d816025007f3601e78e24e4b85a392cb3e7854a9b850",
+  "JSONs_have_no_absolute_work_binding": true,
+  "native_capsules_absent": true,
+  "after_first_capture": "same physical work required for copied compiled ABI absolute path",
+  "NPU": 0,
+  "fixture_allocations": 0,
+  "CPU_forward_passes": 0
+}

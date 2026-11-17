@@ -1,0 +1,35 @@
+# Independent cohort source/CPU review
+
+No blocking source/CPU defect found in the assigned bounded F03/F08/conditional-F14 changes. Device execution disposition is recorded separately in REVIEW.md after all acceptance jobs finish. Main and both workers are parked; all execution here is reviewer-owned. No model/golden/threshold/Main evidence modifications, workers, checkpoint reads/writes, commits or external filing.
+
+The reviewed authority remains goal decisions1–9 and vllm-ascend v0.30.0rc2 revision8fde6d4e335fe300e2b949aab0e31659cce0811d. Original archive SHA25648c797546805b04ffde118c506f8902e37e19bf2cb5d1713097056a4c93e998c and executed source bytes were checked again by the personally rerun CPU helpers. The original archive origin was established by prior independent review; no new network fetch occurred. host/host_results.json and f08_host/host_results.json retain exact reference hashes and findings.
+
+## F03 basis and publication
+
+Original dsa_v41.py:_write_compressed_source first calls indexer.update_keys with the unrotated normalized compressor latent, then applies source-position forward rotary and publishes the rotated latent to long attention cache. C1 selects current-source/query tables; C2 selects supplied compressor source tables. Source coordinate derivation is outside F03.
+
+All four full-source phase kernels retain latent_out for index_key, allocate separate BF16 attention_latent, rotate that tensor using supplied compressed_cos/sin, snapshot it and publish the snapshot with its explicit ready task. Raw compressor output therefore remains available for index projection; publication cannot mutate its basis. Four owning source goldens use the shared owning Torch rotary helper only for attention-cache scatter. Both composed/staged layer-reference branches likewise rotate a new attention value while passing the raw latent onward to index scoring. Source and public phase ABIs remain unchanged. MLA/indexer/o_proj byte hashes and both rotary kernel ASTs are independently unchanged against accepted F02.
+
+Personally rerun original AST publication/rotary methods with explicit normalized-latent compressor and index/cache recorder stand-ins: C1/C2 T1/T7/T17 publication matches a separately expressed complex rotation exactly, with index input exactly raw. Separate compressor equations match all four source golden fixtures. These prove the selected flow/basis for supplied latents and tables, not original torch_npu compressor arithmetic or complete state lifecycle. Device controls use strong nonidentity tables. Before controls override compressed-cache reference from original publication; rotated-index controls keep repaired reference and mutate only index consumption. Original source inspection and fresh generated bindings establish the raw-index branch independently of candidate/golden parity.
+
+paged_cache.compare_published_source_cache first runs the unchanged full-cache ratio gate (atol0.02,rtol1/64,outlier1%), then applies that SAME gate to unique nonnegative physical published rows. It never replaces or skips a failing whole-cache comparison. Thus this is additional coverage rather than a relaxed gate. Personally rerun dilution control shows64/512 published lanes fail while whole-cache dilution passes. Reviewer-specific width128/512 checks additionally cover duplicate/sentinel slots, empty/all-skipped publications retaining full-cache validation, exact positives and published-row failures. Full-model device publication is not inferred from these rank-local checks.
+
+## F08 selection and unbiased route weights
+
+moe_gate now finds the smallest tied ID by max reduction of reversed indices, gathers only that ID's original score, and suppresses only that ID for the next slot. Bias remains confined to expert selection. Selected unbiased sqrtsoftplus scores normalize to route scale1.5, preserving the equation. The frozen original instead sums tied IDs and scores, and suppresses all equal maxima at once, causing out-of-range IDs or missed choices.
+
+Original routing CPU methods are AST-executed by the personally rerun F08 host helper. Its grouped selector stand-in returns all experts for the selected single-group case; full distributed/grouped variants are not proved. Legal alternative tie orders are accepted; out-of-range/duplicate IDs, missed biased winners, wrong weights and biased-score normalization are rejected. Comparator source checks ordered biased Top-K scores within the numerical band and distinct legal IDs, then derives normalized unbiased weights from ACTUAL selected IDs. It does not force arbitrary Torch tie IDs or accept weights normalized from biased scores. The weight band remains atol1e-3,rtol1e-2,outlier1%.
+
+staged_gate_compare delegates those same contracts per rank, using actual ffn_normed and actual route IDs; ffn_normed retains its separate staged RMS gate. Personally rerun staged controls admit different legal tie subsets with equal biased but different unbiased scores and reject uniform biased normalization, invalid IDs and wrong weights. These CPU controls and rank-local NPU checks do not close F09/F10 inactive-row or distributed lifecycle gates.
+
+## Conditional F14 offset folding
+
+weight_loader.expert_tensor now assigns _fold_offset's returned payload before transpose/NZ packing, retaining q-offset for representable integer offsets. Scale reads and physical NZ packing are unchanged. Same-file routed validation independently derives the folded expected payload. _fold_offset still rejects fractional results and overflow rather than clamping; zero offset returns original bytes.
+
+Personally rerun synthetic before/after scripts exercise actual loader methods with small in-memory checkpoint records. Independent NZ traversal orders column blocks32, row blocks16, then local rows/columns. Frozen before loses18432 bytes across9 nonzero matrices while9 zero matrices match. Repaired18 zero/nonzero samples and72 expert-shard matrices plus72 scales match exactly; both signed INT8 endpoints succeed; fractional/lower-overflow/upper-overflow folds reject; owning validator has zero errors. Test-only shape-contract reduction occurs in the imported module's memory; no model file/config is changed.
+
+This proves a conditional loader repair. No actual checkpoint was read, no full-weight load was performed, and present-checkpoint nonzero-offset incidence remains unknown. Prior sampled zero offsets do not establish universal absence. No actual-checkpoint corruption claim follows from these synthetic controls.
+
+## Shared limits
+
+Original torch_npu primitives remain mathematical CPU stand-ins. Exact primitive reductions, rotary hardware and low-amplitude/tie quantization parity are unproved; preserve F01's exploratory random exact-equality failure and quantization-order limitation. F04 absolute C2 source coordinates is explicitly unmodified. No16-device layer/full-model execution or real-checkpoint generation is assigned here. Distributed topology remains TP4/DP4/EP16; rank-local acceptance cannot close distributed state/publication, routing lifecycle, remaining capacity, CI or generation gates.

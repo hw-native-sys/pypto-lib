@@ -1,0 +1,21 @@
+{
+  "schema": "independent-configurable-audit-execution/1",
+  "started_epoch": 1794126737.6921163,
+  "pid": 3818834,
+  "start_ticks": "112665947",
+  "bindings": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_configurable_generation_1794114713/bindings.actual.json",
+  "handoff": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/independent_configurable_generation_1794114713/handoff.actual.json",
+  "status": "AUDIT_COMPLETED",
+  "exception": null,
+  "audit_result": {
+    "status": "TRANSPORT_AUDIT_NOT_ACCEPTED",
+    "passed": 4363,
+    "unmet": 5,
+    "sha256": "ca80ff1c46bf70b3ddcad9d2eaa92ad6c54da5c2987839e35eb45af5128ea549"
+  },
+  "bindings_sha256": "408f4f15066dc201fd290581e64f70de7d806b7ff5778ab49de1ddcda5d4374a",
+  "handoff_sha256": "94697120e44758b763c485175553fa1c030793c2510fabe36d318921659dcee9",
+  "ended_epoch": 1794126744.2544634,
+  "elapsed_seconds": 6.562347173690796,
+  "process_exit_code": 0
+}

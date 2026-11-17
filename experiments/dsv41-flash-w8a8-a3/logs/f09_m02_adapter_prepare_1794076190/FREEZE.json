@@ -1,0 +1,13 @@
+{
+  "status": "FINAL/PARK",
+  "artifact_count": 76,
+  "artifact_manifest_sha256": "fe2f88f1680989429074557b9c3ef440a3b146db6c78fad15c942032581a87f7",
+  "rebased45_UNAPPLIED_sha256": "011c3e0c6d79f1b0d4f47731859e5720dd94c5a08db24cfc2d3a299a2313ca9c",
+  "rebased_patch_sha256": "7b3cabeae6583c059eb5128c04c41d4564deb402d7fc701c52e81dd0089a9c82",
+  "adapter_sha256": "8b0ad3ac5603c36a90798139c759b1ddad28e4da4841f41fbcf5d3934e52383b",
+  "count_probe_sha256": "0001e4c1d1b60da92993eca220d77d425ced44056922ab66de1ea99017dbe9c0",
+  "count_old_physical_sha256": "d2211d14e05b465807d1e2a71d5787a2a4706fc02667552e250ec9408725c4c7",
+  "live_M02_unchanged": true,
+  "no_compile_NPU_payload_fullfixture_grant": true,
+  "shared_writes": 0
+}

@@ -1,0 +1,15 @@
+{
+  "scope": "CPU tiny files/fake child processes only; no real checkpoint tensor payload/NPU/grant",
+  "token_root_and_hash_negative_controls": [
+    "wrong-root",
+    "wrong-token-hash",
+    "wrong-header-range"
+  ],
+  "header_metadata_reads_exact_no_payload": true,
+  "primary_CLI_exit7_preserved_with_postcheck_error": true,
+  "POST_EXEC_attempted_after_CLI_failure": true,
+  "CLI_success_postfailure_is_failure": true,
+  "default_refusal_before_files_or_grant": true,
+  "own_tree_PSS_USS_and_PID_sampling": true,
+  "grant_files_created": 0
+}

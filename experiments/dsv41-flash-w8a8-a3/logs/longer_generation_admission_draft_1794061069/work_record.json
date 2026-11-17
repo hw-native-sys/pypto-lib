@@ -1,0 +1,11 @@
+{
+  "id": "main-longer-generation-admission-draft-1794061069-1794061467",
+  "agent": "/root/main_native",
+  "start_epoch": 1794061069,
+  "end_epoch": 1794061467,
+  "elapsed_seconds": 398,
+  "status": "FINAL/PARK",
+  "scope": "NEW artifact-only N3 receipt/max16 small draft and onequeuedchangedAST CPU; no product/sharedwrites/payload/NPU/compile/grant",
+  "shared_ledger_imported": false,
+  "workers": []
+}

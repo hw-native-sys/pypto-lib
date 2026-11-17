@@ -1,0 +1,9 @@
+{
+  "task_id": "task_20261108_054419_162340323443",
+  "exit_code": 0,
+  "terminal": "COMPLETE",
+  "device": "no-device",
+  "prequeue": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/experiments/dsv41-flash-w8a8-a3/logs/native_f09_count_active_identity_1794086934_launch/prequeue.json",
+  "prequeue_sha256": "73765b3f9d077048c4526f3564187881d7f7795a53a8f5e7253ad4b3ae5335de",
+  "model_or_device_operations": 0
+}

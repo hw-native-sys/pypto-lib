@@ -1,0 +1,16 @@
+{
+  "execution_kind": "CPU_MOCKED_GRANT_ONLY",
+  "stage": "validate-chain",
+  "required_bytes": {
+    "host": 237283638272,
+    "disk": 15286862336,
+    "shm": 28641526272
+  },
+  "fresh_available_bytes": {
+    "host": 4398046511104,
+    "disk": 4398046511104,
+    "shm": 4398046511104
+  },
+  "receipt_sha256": "59cf4c4a16b2400db7a8de514038549cf883accb309d3e42ba6bd7bcc5eee587",
+  "numerical_or_native_pass": false
+}

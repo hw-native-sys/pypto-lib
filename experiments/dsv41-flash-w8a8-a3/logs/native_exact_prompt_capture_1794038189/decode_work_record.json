@@ -1,0 +1,15 @@
+{
+  "record_id": "review-exactN3-decode-1794040149-1794041638",
+  "agent": "review-agent",
+  "start_epoch": 1794040149,
+  "end_epoch": 1794041638,
+  "duration_seconds": 1489,
+  "status": "FINAL/PARK",
+  "native_decode_jobs": 1,
+  "native_device_ranks": 16,
+  "CPU_gates": 19,
+  "original_published_WINDOW3_C2row1": "PASS_SAME_STAGED_EXPECTED",
+  "actual_strict4DP_and_copy_negative": "PASS",
+  "all_assigned_jobs_complete0": true,
+  "fullweights_fit_text": "HELD"
+}

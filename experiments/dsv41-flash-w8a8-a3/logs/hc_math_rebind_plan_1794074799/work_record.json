@@ -1,0 +1,13 @@
+{
+  "record_id": "main-hc-math-rebind-plan-1794074799",
+  "role": "main-agent",
+  "start_epoch": 1794074799,
+  "end_epoch": 1794075148,
+  "elapsed_seconds": 349,
+  "shared_ledger_writes": 0,
+  "imported_shared_ledger": false,
+  "task_ids": [
+    "task_20261108_020941_34169709896"
+  ],
+  "scope": "Artifact-only lineage plan+one static virtual guard check; no live/shared overlay edits/compile/NPU/payload/headers/actualgrant"
+}

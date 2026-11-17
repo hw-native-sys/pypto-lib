@@ -1,0 +1,12 @@
+[
+  {
+    "tokens": 1,
+    "exact_original_match": true,
+    "missing_inverse_max_abs": 0.4248046875
+  },
+  {
+    "tokens": 7,
+    "exact_original_match": true,
+    "missing_inverse_max_abs": 0.921875
+  }
+]

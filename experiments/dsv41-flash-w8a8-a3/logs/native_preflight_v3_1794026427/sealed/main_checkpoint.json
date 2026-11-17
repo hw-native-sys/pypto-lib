@@ -1,0 +1,12 @@
+{
+  "epoch": 1794025377,
+  "start_epoch": 1794024669,
+  "elapsed_wall_seconds": 708,
+  "bridge_sha256": "c1f942c90ccb4fbec3fe3e3852b51ac64c616f1607076b55f486a30864026834",
+  "bridge_CPU_task": "task_20261107_122205_5465020481",
+  "status": "Main bridge selfchecks PASS; worker V3 implementing/testing; no unit acceptance",
+  "root45_unchanged": true,
+  "NPU": 0,
+  "payload": 0,
+  "largeIO": 0
+}

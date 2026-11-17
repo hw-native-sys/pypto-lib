@@ -1,0 +1,30 @@
+{
+  "status": "INTERNAL_AND_EXTERNAL_RESERVATION_COMPLETED_PENDING_EXTERNAL_CPU_AUDIT",
+  "started_epoch": 1794042289.0948358,
+  "device_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "pid": 3071375,
+  "scope": "noEngram; largest/57 empty reservation only; no initialized weights/model compute",
+  "internal_status": "EMPTY_RESERVATIONS_ONLY",
+  "external_verdict": "PASS_EMPTY_RESERVATION_WITH_FINAL_AFTER_FREE_GATE",
+  "ended_epoch": 1794042382.8048997,
+  "resource_violation": false,
+  "monitor_errors": [],
+  "monitor_thread_stopped": true
+}

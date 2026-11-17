@@ -1,0 +1,14 @@
+{
+  "status": "BOUNDED_F09_171_PASS_FINAL_PARK",
+  "native_exit": 0,
+  "CPU_exit": 0,
+  "native_calls": 3,
+  "numeric_checks_passed": 171,
+  "nine_reference_integrity_rows_pass": true,
+  "six_snapshots_unchanged": true,
+  "normal_owner_close": true,
+  "general_F09_or_realweights_or_quality_acceptance": false,
+  "source_apply_authority": false,
+  "ownjobs": 0,
+  "shared_writes": 0
+}

@@ -1,0 +1,16 @@
+{
+  "status": "FINAL/SEALED/PARK",
+  "artifact_count": 16,
+  "artifact_manifest_sha256": "f2cef526699b5b8a3b4a0f2e6184a80a22ab6798e30066afe204b6d8ca0d9f27",
+  "source45_sha256": "cc15877f8f4b0104a842f915d2434d9a2c9cd6f6752d6364d5d7bada26e21d8c",
+  "runtime_code": {
+    "check_identity.py": "6947863b5268351c03a55cafc94c00688f660c68572adae3af34fcb0079de31a",
+    "outer_runner.py": "d1010fc0053422db137e59c8c3ed8cb4ca8c13df323b4ce0561df4598f241fd9",
+    "task_entry.py": "dbb86b580baae5d981949250f28482409f42feca1de3bbc091241e3fc5a2c572"
+  },
+  "binding_sha256": "93922612fc602dfe79cd3dab64b2a24b78cbd57237756bdcd56f404b222cef65",
+  "adaptation_patch_sha256": "2a9161c93a1b81c832061f96ef337ba97d444fb446b85420160b829d8ac07d39",
+  "all_own_jobs_terminal": true,
+  "no_native_or_actual_grant_authorized": true,
+  "end_epoch": 1794063809
+}

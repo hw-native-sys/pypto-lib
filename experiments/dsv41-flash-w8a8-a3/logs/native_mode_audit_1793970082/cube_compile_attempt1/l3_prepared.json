@@ -1,0 +1,16 @@
+{
+  "mode": "l3_prepared",
+  "execution_mode": "ExecutionMode.ONBOARD",
+  "device": 0,
+  "uid": 2011,
+  "gid": 2011,
+  "groups": [
+    1000,
+    1002,
+    2011
+  ],
+  "compile_only": true,
+  "passed": false,
+  "error_type": "InvalidOperationError",
+  "error": "pl.matmul: cannot mix Tensor and Tile arguments (Tensor, Tile). All operands must be the same type level \u2014 either all Tensor or all Tile"
+}

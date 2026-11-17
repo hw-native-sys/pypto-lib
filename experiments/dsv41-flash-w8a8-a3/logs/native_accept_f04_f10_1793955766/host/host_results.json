@@ -1,0 +1,110 @@
+{
+  "provenance": {
+    "revision": "8fde6d4e335fe300e2b949aab0e31659cce0811d",
+    "archive_sha256": "48c797546805b04ffde118c506f8902e37e19bf2cb5d1713097056a4c93e998c",
+    "source_sha256": "3505769857f83fa7e67f652984f50bd0478158f1d24f185cab091203e70392fd"
+  },
+  "checks": [
+    {
+      "original_absolute_rows": [
+        0,
+        0,
+        0,
+        0,
+        2,
+        1248,
+        0,
+        1252
+      ],
+      "c1_preserved": true
+    },
+    {
+      "actual_builder": "prefill_c2a_full",
+      "absolute_rows": [
+        10.0,
+        0.0,
+        12.0,
+        0.0,
+        0.0,
+        12.0,
+        0.0,
+        14.0
+      ]
+    },
+    {
+      "actual_builder": "decode_c2a_full",
+      "absolute_rows": [
+        1250.0,
+        1252.0
+      ]
+    },
+    {
+      "actual_layer_prefix": [
+        "prefill",
+        1
+      ],
+      "ratio": 2,
+      "exact": true
+    },
+    {
+      "actual_layer_prefix": [
+        "prefill",
+        3
+      ],
+      "ratio": 1,
+      "exact": true
+    },
+    {
+      "actual_layer_prefix": [
+        "decode",
+        1
+      ],
+      "ratio": 2,
+      "exact": true
+    },
+    {
+      "actual_layer_prefix": [
+        "decode",
+        3
+      ],
+      "ratio": 1,
+      "exact": true
+    },
+    {
+      "actual_forward_prefix": "prefill_fwd",
+      "c2_rows": [
+        0,
+        1248
+      ],
+      "c1_preserved": true
+    },
+    {
+      "actual_forward_prefix": "decode_fwd",
+      "c2_rows": [
+        0,
+        1252
+      ],
+      "c1_preserved": true
+    },
+    {
+      "actual_generator_ratio": 1,
+      "absolute_rows": [
+        1249,
+        1250,
+        1251,
+        1253
+      ],
+      "address_lens_independent": true
+    },
+    {
+      "actual_generator_ratio": 2,
+      "absolute_rows": [
+        1248,
+        0,
+        1250,
+        1252
+      ],
+      "address_lens_independent": true
+    }
+  ]
+}

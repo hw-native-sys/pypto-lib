@@ -1,0 +1,26 @@
+{
+  "identity": {
+    "pid": 1826113,
+    "starttick": "109220685"
+  },
+  "device_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "root_go_id": "observer-20261108-f09-fullentry-reserve-scalar-native16",
+  "epoch": 1794092285.402418
+}

@@ -1,0 +1,12 @@
+{
+  "status": "PARK",
+  "epoch": 1794074673,
+  "all_own_jobs_terminal": true,
+  "writers": [],
+  "new_actual_source45": "b3e19fd001c74f7a5b497c791c01924ca09c0678df66114fce599e890d8fee06",
+  "other44_unchanged": true,
+  "compile": false,
+  "NPU": false,
+  "payload_bytes": 0,
+  "positive_actual_grant": false
+}

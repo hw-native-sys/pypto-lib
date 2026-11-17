@@ -1,0 +1,43 @@
+{
+  "platform": "a2a3",
+  "runtime": "tensormap_and_ringbuffer",
+  "library_path": "/mnt/data/pyptouser/yangyaodong/code/pypto-lib/.venv-local/lib/python3.10/site-packages/simpler_setup/_assets/build/lib/a2a3/onboard/tensormap_and_ringbuffer/libhost_runtime.so",
+  "library_sha256": "24434f8879030ef1b1f31e5fc2ecce683e392d4f1baeb5bcee852fb183976e5c",
+  "resources": [
+    {
+      "kind": 4,
+      "resource_class": 0,
+      "bytes_per_copy": 0
+    },
+    {
+      "kind": 1,
+      "resource_class": 1,
+      "bytes_per_copy": 0
+    },
+    {
+      "kind": 2,
+      "resource_class": 1,
+      "bytes_per_copy": 0
+    },
+    {
+      "kind": 3,
+      "resource_class": 1,
+      "bytes_per_copy": 0
+    },
+    {
+      "kind": 5,
+      "resource_class": 2,
+      "bytes_per_copy": 0
+    },
+    {
+      "kind": 6,
+      "resource_class": 2,
+      "bytes_per_copy": 0
+    }
+  ],
+  "shared_GM_copy_count": 1,
+  "limit": "selected pinned PROGRAM backend only; identity capacity is not resident GM banks",
+  "controls_rejected": 3,
+  "query_scope": "readonlyCAPI; noWorker/prewarm/devicecall",
+  "no_NPU": true
+}
