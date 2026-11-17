@@ -526,7 +526,7 @@ def l2_prefill_fwd(
     hc_arrived: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     head_hidden: pld.DistributedTensor[[LM_HEAD_TP_SIZE * 16, D], pl.BF16],
     head_hidden_done: pld.DistributedTensor[[C.LM_HEAD_TP_SIZE, 1], pl.INT32],
-    head_logits: pld.DistributedTensor[[16, VOCAB], pl.FP32],
+    head_logits: pld.DistributedTensor[[16, VOCAB], pl.BF16],
     head_logits_done: pld.DistributedTensor[[C.LM_HEAD_TP_SIZE, 1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
 ):
@@ -1001,7 +1001,7 @@ def l3_prefill_fwd(
     hc_arrived_buffer = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
     head_hidden_buffer = pld.alloc_window_buffer([LM_HEAD_TP_SIZE * 16, D], dtype=pl.BF16)
     head_hidden_done_buffer = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-    head_logits_buffer = pld.alloc_window_buffer([16, VOCAB], dtype=pl.FP32)
+    head_logits_buffer = pld.alloc_window_buffer([16, VOCAB], dtype=pl.BF16)
     head_logits_done_buffer = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
         recv_meta = pld.window(recv_meta_buffer, [RANKS, LOCAL_EXPERTS], dtype=pl.INT32)
@@ -1019,7 +1019,7 @@ def l3_prefill_fwd(
         hc_arrived = pld.window(hc_arrived_buffer, [CP_SIZE, 1], dtype=pl.INT32)
         head_hidden = pld.window(head_hidden_buffer, [LM_HEAD_TP_SIZE * 16, D], dtype=pl.BF16)
         head_hidden_done = pld.window(head_hidden_done_buffer, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-        head_logits = pld.window(head_logits_buffer, [16, VOCAB], dtype=pl.FP32)
+        head_logits = pld.window(head_logits_buffer, [16, VOCAB], dtype=pl.BF16)
         head_logits_done = pld.window(head_logits_done_buffer, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         l2_prefill_fwd(
             embedding[rank],

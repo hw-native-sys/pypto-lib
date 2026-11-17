@@ -35,7 +35,7 @@ def sample_target(
     sampled_ids: pl.Out[pl.Tensor[[ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
     hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
-    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.BF16],
     logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
     collapsed: pl.Tensor,
@@ -65,7 +65,7 @@ def sample_target(
                 normalized, lm_head_weight, row_indices, logits,
                 hidden_window, hidden_done, logits_window, logits_done,
                 rank // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE, rank % LM_HEAD_TP_SIZE,
-                chunk + 1, (ROWS + MAX_LOGIT_ROWS - 1) // MAX_LOGIT_ROWS,
+                chunk + 1, (ROWS + MAX_LOGIT_ROWS - 1) // MAX_LOGIT_ROWS, 1,
             )
             sampled_chunk = pl.create_tensor([MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], dtype=pl.INT32)
             greedy_sample(logits, sampled_chunk, projected)
@@ -86,7 +86,7 @@ def sample_target_rank(
     sampled_ids: pl.Out[pl.Tensor[[ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
     hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
-    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.BF16],
     logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
 ):
