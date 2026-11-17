@@ -41,52 +41,26 @@ QUERY_HEAD_TILE = max(32, LOCAL_H)
 SOFTMAX_SCALE = HEAD_DIM**-0.5
 
 
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "dspark_gather.cpp",
-               include_dirs=(pto_isa_include_dir(),))
-def _gather_dspark_window_native(
-    cache: pl.Tensor,
-    indices: pl.Tensor,
-    selected: pl.Out[pl.Tensor],
-    num_tokens: pl.Scalar[pl.INT32],
-) -> pl.Tensor:
-    """Gather and dequantize DSpark windows with guarded query reuse."""
-    ...
-
-
-@pl.jit.inline(auto_scope=False)
-def gather_dspark_window(
-    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
-    indices: pl.Tensor[[MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
-    selected: pl.Tensor[[MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    groups = (num_tokens + DSPARK_QUERY_WIDTH - 1) // DSPARK_QUERY_WIDTH
-    workers = pl.max(1, pl.min(groups * (DSPARK_SWA_INDEX_WIDTH // 32), 64))
-    with pl.spmd(workers, name_hint="dspark_cache_gather"):
-        selected = _gather_dspark_window_native(cache, indices, selected, num_tokens)
-    return selected
-
-
 @pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "dspark_attention_core.cpp",
                aiv_source=Path(__file__).parent / "kernels" / "dspark_attention_core.cpp",
                include_dirs=(pto_isa_include_dir(),), dual_aiv_dispatch=True)
 def _attend_dspark_native(
     query: pl.Tensor,
-    selected: pl.Tensor,
+    cache: pl.Tensor,
     indices: pl.Tensor,
     sink: pl.Tensor,
     output: pl.Out[pl.Tensor],
     num_tokens: pl.Scalar[pl.INT32],
     heads: pl.Scalar[pl.INT32],
 ) -> pl.Tensor:
-    """Attend selected K64 tiles with paired ownership and BF16 probabilities."""
+    """Gather packed KV into L1 and attend K64 tiles with BF16 probabilities."""
     ...
 
 
 @pl.jit.inline(auto_scope=False)
 def attend_dspark_window(
     query: pl.Tensor[[MOE_TOKENS, LOCAL_H * HEAD_DIM], pl.BF16],
-    selected: pl.Tensor[[MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], pl.BF16],
+    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     indices: pl.Tensor[[MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
     output: pl.Tensor[[MOE_TOKENS, LOCAL_H * HEAD_DIM], pl.BF16],
@@ -101,10 +75,10 @@ def attend_dspark_window(
             padded = pl.assemble(padded, active_query, [0, 0])
             padded_query[row : row + 1, :] = padded
         with pl.spmd(workers, name_hint="dspark_online_attention"):
-            output = _attend_dspark_native(padded_query, selected, indices, sink, output, num_tokens, LOCAL_H)
+            output = _attend_dspark_native(padded_query, cache, indices, sink, output, num_tokens, LOCAL_H)
     else:
         with pl.spmd(workers, name_hint="dspark_online_attention"):
-            output = _attend_dspark_native(query, selected, indices, sink, output, num_tokens, LOCAL_H)
+            output = _attend_dspark_native(query, cache, indices, sink, output, num_tokens, LOCAL_H)
     return output
 
 
@@ -152,10 +126,8 @@ def dspark_attention_partial(
         window_slots, window_cache,
         num_tokens, window_input_ready,
     )
-    selected = pl.create_tensor([MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], dtype=pl.BF16)
-    selected = gather_dspark_window(window_cache, window_indices, selected, num_tokens)
     attended = pl.create_tensor([MOE_TOKENS, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    attended = attend_dspark_window(q, selected, window_indices, attn_sink, attended, num_tokens)
+    attended = attend_dspark_window(q, window_cache, window_indices, attn_sink, attended, num_tokens)
     return attended, window_cache
 
 
@@ -241,7 +213,7 @@ def golden_dspark_attention(tensors):
 
 
 def build_attention_specs(seed: int = 43):
-    """Build five shared-history queries, HC inputs and runtime specifications."""
+    """Build five queries covering packed-cache gather boundaries and HC outputs."""
     import torch
     from golden import ScalarSpec, TensorSpec
     from o_proj import build_o_proj_hc_post_specs
@@ -286,9 +258,18 @@ def build_attention_specs(seed: int = 43):
     values["rope_sin"] = angles.sin()
     values["window_slots"] = 128 + positions
     indices = torch.full((DSPARK_QUERY_WIDTH, DSPARK_SWA_INDEX_WIDTH), -1, dtype=torch.int32)
-    indices[:, : DSPARK_QUERY_WIDTH + 2] = torch.arange(
-        128, 130 + DSPARK_QUERY_WIDTH, dtype=torch.int32
-    )
+    # Contiguous panels in both lanes, followed by a partial panel.
+    visible_keys = FLASH.sliding_window + DSPARK_QUERY_WIDTH
+    indices[0, :visible_keys] = torch.arange(128, 128 + visible_keys, dtype=torch.int32)
+    # Irregular physical slots across decode, gather, K64 and lane boundaries.
+    boundary_columns = torch.tensor([0, 15, 16, 31, 32, 63, 64, 95, 96, 127, 128, 191])
+    boundary_slots = torch.tensor([127, 128, 255, 256, 383, 384, 511, 512, 639, 640, 767, 0], dtype=torch.int32)
+    indices[1, boundary_columns] = boundary_slots
+    indices[2, boundary_columns] = boundary_slots.flip(0)
+    indices[2, 95] = indices[2, 96]
+    # Only lane one contributes; the last query remains fully masked.
+    indices[3, 96:128] = torch.arange(512, 544, dtype=torch.int32)
+    indices[3, 191] = 767
     values["window_indices"] = indices
     for name in ("x", "rope_cos", "rope_sin", "window_slots", "window_indices"):
         current = values[name]
