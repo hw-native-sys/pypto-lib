@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """DSpark batch-one TP8/DP1 prefill device forward."""
 
+from .prefill_gate_exchange import retire_gate_reservation
 import pypto.language as pl
 from causal_cache_ready import CAUSAL_READY, CAUSAL_FULL_WAIT, CAUSAL_FAMILIES
 from echo_prefetch import ECHO_PREFETCH, ECHO_DIAGNOSTICS, ECHO_STATE_ROWS, ECHO_LAYERS, ECHO_SIGNAL_COLS
@@ -19,7 +20,7 @@ import pypto.language.distributed as pld
 
 from models.deepseek_v4_flash_lowlat.prefill_moe import (
     D, HC_DIM, HC_MULT, MIX_HC, MOE_INTER, N_BANK, N_EXPERTS, N_RANKS,
-    REDUCE_WINDOW_ROWS, RESULT_WINDOW_ROWS, PREFILL_MOE_OWNER_REDUCE, PREFILL_MOE_EXPERT_AFFINITY, PREFILL_MOE_BATCHED_GATHER, PREFILL_MOE_DIRECT_POST, T as MOE_WAVE_TOKENS, TOPK, VOCAB, prefill_moe_tp, clear_prefill_moe_tp_signals,
+    PREFILL_MOE_SHARE_GATE, GATE_WINDOW_ROWS, REDUCE_WINDOW_ROWS, RESULT_WINDOW_ROWS, PREFILL_MOE_OWNER_REDUCE, PREFILL_MOE_EXPERT_AFFINITY, PREFILL_MOE_BATCHED_GATHER, PREFILL_MOE_DIRECT_POST, T as MOE_WAVE_TOKENS, TOPK, VOCAB, prefill_moe_tp, clear_prefill_moe_tp_signals,
 )
 N_LOCAL = N_BANK
 N_EXPERTS_GLOBAL = N_EXPERTS
@@ -254,6 +255,8 @@ def prefill_tp8_fwd(
     grammar_mask: pl.Tensor[[MAX_LOGIT_ROWS, GREEDY_GRID_ROWS, GRAMMAR_SEGMENT_WORDS], pl.INT16],
     sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     terminal: pl.Scalar[pl.INT32],
+    gate_window: pld.DistributedTensor[[GATE_WINDOW_ROWS, N_EXPERTS], pl.FP32],
+    gate_signal: pld.DistributedTensor[[N_RANKS, 16], pl.INT32],
     tp_reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.FP32],
     tp_reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     tp_result_window: pld.DistributedTensor[[RESULT_WINDOW_ROWS, D], pl.BF16],
@@ -283,6 +286,8 @@ def prefill_tp8_fwd(
     echo_epoch: pl.Scalar[pl.INT32],
     echo_first_chunk: pl.Scalar[pl.INT32],
 ):
+    gate_previous = pl.array.create(1, pl.TASK_ID)
+    gate_previous[0] = pl.system.task_dummy(deps=[])
     causal_epoch_base = pl.read(causal_epoch_bases, [0])
     projection_epochs = pl.array.create(PROJECTION_KINDS, pl.INT32)
     for projection_kind in pl.unroll(PROJECTION_KINDS):
@@ -411,14 +416,17 @@ def prefill_tp8_fwd(
                 )
 
         with pl.scope():
-            prefill_moe_tp(
+            previous_gate_1 = gate_previous[0]
+            moe_output_1, moe_gate_finished_1 = prefill_moe_tp(
                 attn_stage, hc_ffn_fn_l0, hc_ffn_scale_l0, hc_ffn_base_l0,
                 norm_w_l0, gate_w_l0, gate_bias_l0, tid2eid_l0, input_ids,
                 routed_w1_l0, routed_w1_scale_l0, routed_w3_l0, routed_w3_scale_l0,
                 routed_w2_l0, routed_w2_scale_l0, x_hc, stage_token, layer_completion,
                 tp_reduce_window, tp_reduce_signal, tp_result_window, tp_result_signal, layer_l0, group_tokens, my_rank,
                 layer_l0 * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
+                gate_window, gate_signal, causal_epoch_base, previous_gate_1,
             )
+            gate_previous[0] = moe_gate_finished_1
 
     # Layer 1: SWA.
     with pl.scope():
@@ -491,14 +499,17 @@ def prefill_tp8_fwd(
                 )
 
         with pl.scope():
-            prefill_moe_tp(
+            previous_gate_2 = gate_previous[0]
+            moe_output_2, moe_gate_finished_2 = prefill_moe_tp(
                 attn_stage, hc_ffn_fn_l1, hc_ffn_scale_l1, hc_ffn_base_l1,
                 norm_w_l1, gate_w_l1, gate_bias_l1, tid2eid_l1, input_ids,
                 routed_w1_l1, routed_w1_scale_l1, routed_w3_l1, routed_w3_scale_l1,
                 routed_w2_l1, routed_w2_scale_l1, x_hc, stage_token, layer_completion,
                 tp_reduce_window, tp_reduce_signal, tp_result_window, tp_result_signal, layer_l1, group_tokens, my_rank,
                 layer_l1 * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
+                gate_window, gate_signal, causal_epoch_base, previous_gate_2,
             )
+            gate_previous[0] = moe_gate_finished_2
 
     group_rows = pl.tensor.dim(x_hc, 0)
     local_tokens = pl.tensor.dim(position_ids_local, 0)
@@ -644,14 +655,17 @@ def prefill_tp8_fwd(
                     )
 
             with pl.scope():
-                prefill_moe_tp(
+                previous_gate_3 = gate_previous[0]
+                moe_output_3, moe_gate_finished_3 = prefill_moe_tp(
                     attn_stage, hc_ffn_fn_csa, hc_ffn_scale_csa, hc_ffn_base_csa,
                     norm_w_csa, gate_w_csa, gate_bias_csa, tid2eid_csa, input_ids,
                     routed_w1_csa, routed_w1_scale_csa, routed_w3_csa, routed_w3_scale_csa,
                     routed_w2_csa, routed_w2_scale_csa, x_hc, stage_token, layer_completion,
                     tp_reduce_window, tp_reduce_signal, tp_result_window, tp_result_signal, csa_layer, group_tokens, my_rank,
                     csa_layer * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
+                    gate_window, gate_signal, causal_epoch_base, previous_gate_3,
                 )
+                gate_previous[0] = moe_gate_finished_3
                 if group_tokens > 0:
                     if pair_order == HCA_NUM_LAYERS - 1:
                         target_x_hc_l40 = pl.slice(
@@ -763,14 +777,17 @@ def prefill_tp8_fwd(
                     )
 
             with pl.scope():
-                prefill_moe_tp(
+                previous_gate_4 = gate_previous[0]
+                moe_output_4, moe_gate_finished_4 = prefill_moe_tp(
                     attn_stage, hc_ffn_fn_hca, hc_ffn_scale_hca, hc_ffn_base_hca,
                     norm_w_hca, gate_w_hca, gate_bias_hca, tid2eid_hca, input_ids,
                     routed_w1_hca, routed_w1_scale_hca, routed_w3_hca, routed_w3_scale_hca,
                     routed_w2_hca, routed_w2_scale_hca, x_hc, stage_token, layer_completion,
                     tp_reduce_window, tp_reduce_signal, tp_result_window, tp_result_signal, hca_layer, group_tokens, my_rank,
                     hca_layer * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
+                    gate_window, gate_signal, causal_epoch_base, previous_gate_4,
                 )
+                gate_previous[0] = moe_gate_finished_4
                 if group_tokens > 0:
                     if pair_order == HCA_NUM_LAYERS - 1:
                         target_x_hc_l41 = pl.slice(
@@ -921,15 +938,23 @@ def prefill_tp8_fwd(
                 )
 
         with pl.scope():
-            prefill_moe_tp(
+            previous_gate_5 = gate_previous[0]
+            moe_output_5, moe_gate_finished_5 = prefill_moe_tp(
                 attn_stage, hc_ffn_fn_last, hc_ffn_scale_last, hc_ffn_base_last,
                 norm_w_last, gate_w_last, gate_bias_last, tid2eid_last, input_ids,
                 routed_w1_last, routed_w1_scale_last, routed_w3_last, routed_w3_scale_last,
                 routed_w2_last, routed_w2_scale_last, x_hc, stage_token, layer_completion,
                 tp_reduce_window, tp_reduce_signal, tp_result_window, tp_result_signal, layer_last, group_tokens, my_rank,
                 layer_last * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
+                gate_window, gate_signal, causal_epoch_base, previous_gate_5,
             )
+            gate_previous[0] = moe_gate_finished_5
 
+    if PREFILL_MOE_SHARE_GATE != 0:
+        gate_finished_scalar = gate_previous[0]
+        gate_reservation = pl.cast(pl.tensor.dim(position_ids_full, 0) * FWD_NUM_LAYERS, pl.INT32)
+        gate_unused = gate_reservation - pl.read(stage_token, [0])
+        gate_retired = retire_gate_reservation(gate_signal, my_rank, gate_unused, gate_finished_scalar)
     moe_retired_tid = clear_prefill_moe_tp_signals(stage_token, tp_reduce_signal, tp_result_signal)
     with pl.scope():
         if group_tokens > 0:
@@ -1135,6 +1160,8 @@ def l3_prefill_tp8_fwd(
     csa_state_slot_mapping_full.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     csa_inner_state_slot_mapping_full.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
 
+    gate_window_buf = pld.alloc_window_buffer([GATE_WINDOW_ROWS, N_EXPERTS], dtype=pl.FP32)
+    gate_signal_buf = pld.alloc_window_buffer([N_RANKS, 16], dtype=pl.INT32)
     tp_reduce_window_buf = pld.alloc_window_buffer([REDUCE_WINDOW_ROWS, D], dtype=pl.FP32)
     tp_reduce_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     tp_result_window_buf = pld.alloc_window_buffer([RESULT_WINDOW_ROWS, D], dtype=pl.BF16)
@@ -1167,6 +1194,8 @@ def l3_prefill_tp8_fwd(
         projection_consumed = pld.window(projection_consumed_buf, [PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
         causal_ready_signal = pld.window(causal_ready_buf, [CAUSAL_FAMILIES, 1], dtype=pl.INT32)
 
+        gate_window = pld.window(gate_window_buf, [GATE_WINDOW_ROWS, N_EXPERTS], dtype=pl.FP32)
+        gate_signal = pld.window(gate_signal_buf, [N_RANKS, 16], dtype=pl.INT32)
         tp_reduce_window = pld.window(tp_reduce_window_buf, [REDUCE_WINDOW_ROWS, D], dtype=pl.FP32)
         tp_reduce_signal = pld.window(tp_reduce_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         tp_result_window = pld.window(tp_result_window_buf, [RESULT_WINDOW_ROWS, D], dtype=pl.BF16)
@@ -1227,6 +1256,7 @@ def l3_prefill_tp8_fwd(
             final_norm_w[r], lm_head_weight[r], logit_row_indices[r],
             dspark_target_hidden[r],
             x_out[r], logits[r], grammar_mask[r], sampled_ids[r], terminal,
+            gate_window, gate_signal,
             tp_reduce_window, tp_reduce_signal, tp_result_window, tp_result_signal,
             gather_window, gather_signal,
             o_proj_wo_a_window, o_proj_wo_b_window,

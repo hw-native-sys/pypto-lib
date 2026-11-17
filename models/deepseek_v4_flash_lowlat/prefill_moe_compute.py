@@ -9,6 +9,8 @@
 """Prefill MoE preparation, bounded route tiles and ordered per-token combine."""
 
 import pypto.language as pl
+import pypto.language.distributed as pld
+from .prefill_moe_geometry import GATE_WINDOW_ROWS, N_RANKS
 from .hc_pre import hc_pre
 from .prefill_moe_gate import gate, ROUTE_ROW_PAD
 from .prefill_moe_expert import expert_routed_persistent_planned
@@ -232,6 +234,11 @@ def prepare_moe(
     input_ids: pl.Tensor[[T], pl.INT64],
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
+    gate_window: pld.DistributedTensor[[GATE_WINDOW_ROWS, N_EXPERTS], pl.FP32],
+    gate_signal: pld.DistributedTensor[[N_RANKS, 16], pl.INT32],
+    gate_rank: pl.Scalar[pl.INT32],
+    gate_epoch: pl.Scalar[pl.INT32],
+    previous_gate: pl.Scalar[pl.TASK_ID],
 ):
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32, manual_dep=True)
@@ -245,10 +252,11 @@ def prepare_moe(
     x_norm_scale = pl.create_tensor([T, 1], dtype=pl.FP32, manual_dep=True)
     indices = pl.create_tensor([T, ROUTE_ROW_PAD], dtype=pl.INT32)
     weights = pl.create_tensor([T, ROUTE_ROW_PAD], dtype=pl.FP32)
-    gate(
+    gate_weights, gate_finished = gate(
         x_mixed, norm_w, gate_w, gate_bias,
         layer_id, num_tokens, tid2eid, input_ids,
         x_norm_i8, x_norm_scale, indices, weights,
+        gate_window, gate_signal, gate_rank, gate_epoch, previous_gate,
     )
 
     recv_x = pl.create_tensor([N_SLOTS_B, RECV_MAX, D], dtype=pl.INT8)
@@ -263,7 +271,7 @@ def prepare_moe(
         recv_x, recv_scale, recv_w, work_slot, work_rows, slot_expert, route_slot_row,
         num_tokens,
     )
-    return post_ffn, comb_ffn, recv_x, recv_scale, recv_w, work_slot, work_rows, slot_expert, route_slot_row
+    return post_ffn, comb_ffn, recv_x, recv_scale, recv_w, work_slot, work_rows, slot_expert, route_slot_row, gate_finished
 
 
 @pl.jit.inline

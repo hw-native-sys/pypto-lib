@@ -9,6 +9,9 @@
 """Prefill per-token normalization, exact routing and activation quantization."""
 
 import pypto.language as pl
+import pypto.language.distributed as pld
+from .prefill_gate_exchange import exchange_gate_columns
+from .prefill_moe_geometry import PREFILL_MOE_SHARE_GATE, GATE_WINDOW_ROWS, N_RANKS
 from .config import FLASH as M, FP32_NEG_INF, INT8_SCALE_MAX, INT8_AMAX_EPS
 from .prefill_moe_geometry import T, PREFILL_MOE_FUSED_NORM_QUANT
 
@@ -50,7 +53,7 @@ def _router_scores(route_logits: pl.Tensor[[GATE_T_TILE, N_EXPERTS], pl.FP32]) -
     return gp_score
 
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def gate(
     x_mixed: pl.Tensor[[T, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.BF16],
@@ -64,6 +67,11 @@ def gate(
     x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
     indices: pl.Tensor[[T, ROUTE_ROW_PAD], pl.INT32],
     weights: pl.Tensor[[T, ROUTE_ROW_PAD], pl.FP32],
+    gate_window: pld.DistributedTensor[[GATE_WINDOW_ROWS, N_EXPERTS], pl.FP32],
+    gate_signal: pld.DistributedTensor[[N_RANKS, 16], pl.INT32],
+    gate_rank: pl.Scalar[pl.INT32],
+    gate_epoch: pl.Scalar[pl.INT32],
+    previous_gate: pl.Scalar[pl.TASK_ID],
 ):
 
 
@@ -156,14 +164,19 @@ def gate(
 
     gate_logits_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
     GATE_N_BLOCKS = N_EXPERTS // GATE_N_TILE
+    if PREFILL_MOE_SHARE_GATE != 0:
+        GATE_N_BLOCKS = GATE_N_BLOCKS // N_RANKS
+    gate_tasks = pl.array.create(1, pl.TASK_ID)
+    gate_tasks[0] = previous_gate
     if active_gate_tiles > 0:
-        for gb_idx in pl.spmd(
-            active_gate_tiles * GATE_N_BLOCKS, name_hint="gate_mm", allow_early_resolve=True
-        ):
+        with pl.spmd(active_gate_tiles * GATE_N_BLOCKS, name_hint="gate_mm", allow_early_resolve=True) as gate_computed:
+            gb_idx = pl.tile.get_block_idx()
             tg = gb_idx // GATE_N_BLOCKS
             nb = gb_idx % GATE_N_BLOCKS
             t1 = tg * GATE_M_TILE
             n0 = nb * GATE_N_TILE
+            if PREFILL_MOE_SHARE_GATE != 0:
+                n0 = (pl.cast(gate_rank, pl.INDEX) * GATE_N_BLOCKS + nb) * GATE_N_TILE
             gate_logits_tile = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
             for kb in pl.pipeline(0, D // GATE_D_TILE, stage=2):
                 gd_kd = kb * GATE_D_TILE
@@ -174,11 +187,17 @@ def gate(
                 )
             gate_logits_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gate_logits_tile
 
+        if PREFILL_MOE_SHARE_GATE != 0:
+            gate_prior_scalar = gate_tasks[0]
+            gate_copied = exchange_gate_columns(gate_logits_buf, gate_window, gate_signal, gate_rank, gate_epoch, active_gate_tokens, gate_computed, gate_prior_scalar)
+            gate_tasks[0] = gate_copied
+
+    gate_route_ready = gate_tasks[0]
     active_route_tiles = (active_tokens + GATE_T_TILE - 1) // GATE_T_TILE
 
     if active_route_tiles > 0:
         if layer_id < N_HASH_LAYERS:
-            for th_idx in pl.spmd(active_route_tiles, name_hint="route_hash", allow_early_resolve=True):
+            for th_idx in pl.spmd(active_route_tiles, name_hint="route_hash", allow_early_resolve=True, deps=[gate_route_ready]):
                 t1 = th_idx * GATE_T_TILE
                 route_logits = pl.slice(gate_logits_buf, [GATE_T_TILE, N_EXPERTS], [t1, 0])
                 route_inv_rms = pl.read(inv_rms_buf, [t1, 0])
@@ -200,7 +219,7 @@ def gate(
                 indices = pl.assemble(indices, hs_indices_valid, [t1, 0])
                 weights = pl.assemble(weights, hs_weight_mat, [t1, 0])
         else:
-            for ts_idx in pl.spmd(active_route_tiles, name_hint="route_sort", allow_early_resolve=True):
+            for ts_idx in pl.spmd(active_route_tiles, name_hint="route_sort", allow_early_resolve=True, deps=[gate_route_ready]):
                 t1 = ts_idx * GATE_T_TILE
                 route_logits = pl.slice(gate_logits_buf, [GATE_T_TILE, N_EXPERTS], [t1, 0])
                 route_inv_rms = pl.read(inv_rms_buf, [t1, 0])
@@ -235,4 +254,4 @@ def gate(
                 indices = pl.assemble(indices, nm_indices_valid, [t1, 0])
                 weights = pl.assemble(weights, nm_weight_mat, [t1, 0])
 
-    return weights
+    return weights, gate_tasks[0]

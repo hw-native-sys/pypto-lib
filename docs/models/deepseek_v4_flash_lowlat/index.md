@@ -874,3 +874,13 @@ ordinary requests per arm, USER request-to-first-token median decreased from
 4.290598s to4.265064s. All six request and submit-to-result pairs improved.
 The option remains explicit; this does not establish serving TPOT or1M-input
 performance.
+
+The experimental prefill-only `--prefill-moe-share-gate` plan assigns32 of the
+256 router columns to each TP8 rank and exchanges the exact FP32 logits before
+hash or sorted routing. It retains the original M16/N16/K2048 GEMM fragments,
+quantization and expert arithmetic. Two exchange lanes use existing MoE compute
+credits and monotonic call epochs; the public prefill ABI remains unchanged.
+This requires identical full HC inputs and replicated router parameters on the
+TP ranks. It is off by default. Source and native checks do not grant device
+bitwise or ordinary performance qualification; promotion requires the complete
+fixed-input request controls and matched same-worker A/B.

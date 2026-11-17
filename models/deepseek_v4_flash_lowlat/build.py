@@ -107,7 +107,7 @@ def _validate_target_capacity(metadata, profile, max_seq_len):
 
 def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=180, max_seq_len=1048576,
                     prefill_indexer_arenas=1, projection_degrees=None, prefill_moe_ready=None,
-                    prefill_moe_wave_tokens=None, prefill_moe_owner_reduce=False, prefill_moe_expert_affinity=False, prefill_moe_batched_gather=False, prefill_moe_direct_post=False, prefill_moe_combine_rows=1, prefill_moe_fused_norm_quant=False, prefill_moe_local_route_state=False, prefill_oproj_b_batched=False, prefill_oproj_a_batched=False,
+                    prefill_moe_wave_tokens=None, prefill_moe_owner_reduce=False, prefill_moe_expert_affinity=False, prefill_moe_batched_gather=False, prefill_moe_direct_post=False, prefill_moe_combine_rows=1, prefill_moe_fused_norm_quant=False, prefill_moe_share_gate=False, prefill_moe_local_route_state=False, prefill_oproj_b_batched=False, prefill_oproj_a_batched=False,
 
                     prefill_causal_ready=False, prefill_causal_full_wait=False,
                     prefill_echo_prefetch=False, prefill_echo_diagnostics=False, prefill_mechanisms=None):
@@ -124,6 +124,8 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
         raise ValueError("Prefill combine rows must be 1, 4 or 8")
     if profile != "prefill" and prefill_moe_combine_rows != 1:
         raise ValueError("Combine batching applies only to prefill")
+    if type(prefill_moe_share_gate) is not bool or (prefill_moe_share_gate and profile != "prefill"):
+        raise ValueError("Gate sharing is a prefill-only boolean compile option")
     if type(prefill_moe_local_route_state) is not bool or (prefill_moe_local_route_state and profile != "prefill"):
         raise ValueError("Local route state requires boolean prefill selection")
     if type(prefill_moe_fused_norm_quant) is not bool or (profile != "prefill" and prefill_moe_fused_norm_quant):
@@ -221,7 +223,7 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
 
             function = load_prefill_programs(
                 indexer_arenas=prefill_indexer_arenas, projection_degrees=projection_degrees,
-                moe_ready=prefill_moe_ready, moe_wave_tokens=prefill_moe_wave_tokens, moe_owner_reduce=prefill_moe_owner_reduce, moe_expert_affinity=prefill_moe_expert_affinity, moe_batched_gather=prefill_moe_batched_gather, moe_direct_post=prefill_moe_direct_post, moe_combine_rows=prefill_moe_combine_rows, moe_fused_norm_quant=prefill_moe_fused_norm_quant, moe_local_route_state=prefill_moe_local_route_state, oproj_b_batched=prefill_oproj_b_batched, oproj_a_batched=prefill_oproj_a_batched,
+                moe_ready=prefill_moe_ready, moe_wave_tokens=prefill_moe_wave_tokens, moe_owner_reduce=prefill_moe_owner_reduce, moe_expert_affinity=prefill_moe_expert_affinity, moe_batched_gather=prefill_moe_batched_gather, moe_direct_post=prefill_moe_direct_post, moe_combine_rows=prefill_moe_combine_rows, moe_fused_norm_quant=prefill_moe_fused_norm_quant, moe_share_gate=prefill_moe_share_gate, moe_local_route_state=prefill_moe_local_route_state, oproj_b_batched=prefill_oproj_b_batched, oproj_a_batched=prefill_oproj_a_batched,
                 causal_ready=prefill_causal_ready,
                 causal_full_wait=prefill_causal_full_wait,
                 echo_prefetch=prefill_echo_prefetch, echo_diagnostics=prefill_echo_diagnostics,
@@ -305,7 +307,7 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
             indexer_arenas=prefill_indexer_arenas,
             moe_ready=prefill_moe_ready,
             moe_wave_tokens=prefill_moe_wave_tokens,
-            moe_owner_reduce=prefill_moe_owner_reduce, moe_expert_affinity=prefill_moe_expert_affinity, moe_batched_gather=prefill_moe_batched_gather, moe_direct_post=prefill_moe_direct_post, moe_combine_rows=prefill_moe_combine_rows, moe_fused_norm_quant=prefill_moe_fused_norm_quant, moe_local_route_state=prefill_moe_local_route_state, oproj_b_batched=prefill_oproj_b_batched, oproj_a_batched=prefill_oproj_a_batched,
+            moe_owner_reduce=prefill_moe_owner_reduce, moe_expert_affinity=prefill_moe_expert_affinity, moe_batched_gather=prefill_moe_batched_gather, moe_direct_post=prefill_moe_direct_post, moe_combine_rows=prefill_moe_combine_rows, moe_fused_norm_quant=prefill_moe_fused_norm_quant, moe_share_gate=prefill_moe_share_gate, moe_local_route_state=prefill_moe_local_route_state, oproj_b_batched=prefill_oproj_b_batched, oproj_a_batched=prefill_oproj_a_batched,
             moe_expert_tile_tokens=16,
             moe_copy_tile=[4, 2048], moe_reduce_tile=[8, 512],
             moe_waves_per_chunk=(8192 + prefill_moe_wave_tokens - 1) // prefill_moe_wave_tokens,
@@ -344,6 +346,7 @@ def main():
     parser.add_argument("--prefill-echo-diagnostics", action="store_true", help="Collect ECHO recall counters")
     parser.add_argument("--prefill-mechanisms", choices=("none", "echo-only", "causal-only", "both"))
     parser.add_argument("--prefill-moe-combine-rows", type=int, choices=(1, 4, 8), default=1)
+    parser.add_argument("--prefill-moe-share-gate", action="store_true")
     parser.add_argument("--prefill-moe-local-route-state", action="store_true")
     parser.add_argument("--prefill-moe-fused-norm-quant", action="store_true")
     parser.add_argument("--prefill-oproj-a-batched", action="store_true", help="Batch prefill O-projection A N fragments per group")
@@ -373,6 +376,7 @@ def main():
         prefill_oproj_b_batched=args.prefill_oproj_b_batched,
         prefill_oproj_a_batched=args.prefill_oproj_a_batched,
         prefill_moe_fused_norm_quant=args.prefill_moe_fused_norm_quant,
+        prefill_moe_share_gate=args.prefill_moe_share_gate,
         prefill_moe_local_route_state=args.prefill_moe_local_route_state,
         prefill_moe_combine_rows=args.prefill_moe_combine_rows,
         prefill_causal_ready=args.prefill_causal_ready,
