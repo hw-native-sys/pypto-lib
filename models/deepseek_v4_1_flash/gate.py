@@ -6,12 +6,10 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4.1 MoE router: normalized BF16 input, quantization, projection, and top-k weights."""
-
-from pathlib import Path
+# ci: no-sim
+"""DeepSeek-V4.1 A5 MoE router: BF16 input, MX quantization, projection, and top-k weights."""
 
 import pypto.language as pl
-from pypto.runtime import pto_isa_include_dir
 import torch
 import torch.nn.functional as F
 
@@ -28,77 +26,298 @@ TOPK = M.num_experts_per_tok
 ROUTE_SCALE = M.routed_scaling_factor
 
 # tiling
-GATE_T_TILE = 4
-assert T % GATE_T_TILE == 0
+GATE_T_TILE = 8
 GATE_M_TILE = 16
-GATE_N_TILE = 16
+GATE_N_TILE = 32
 T_PAD = ((T + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
 QUANT_TILE = 256
 QUANT_TASK_TILE = QUANT_TILE
 assert D % QUANT_TASK_TILE == 0
 MX_GROUP = 32
 MX_SCALE_GROUPS = D // MX_GROUP
-QUANT_WORKER_TILE = 24 if T > 80 else 64
+QUANT_WORKER_TILE = min(32, ((T_PAD // GATE_M_TILE) * (D // QUANT_TASK_TILE) + 1) // 2)
 ROUTE_WORKER_TILE = 24 if T > 80 else 64
 TOPK_PAD = 8
 SORT_PAD = TOPK_PAD * 2
 
 
-@pl.jit.extern(
-    core_type="mixed",
-    aic_source=Path(__file__).parent / "kernels" / "gate_scores_vf.cpp",
-    aiv_source=Path(__file__).parent / "kernels" / "gate_scores_vf.cpp",
-    include_dirs=(pto_isa_include_dir(),),
-)
+@pl.jit.incore
 def _gate_scores_vf(
     x: pl.Tensor,
     gate_w: pl.Tensor,
     gate_bias: pl.Tensor,
-    route_scores: pl.Out[pl.Tensor],
-    biased_scores: pl.InOut[pl.Tensor],
+    route_scores: pl.Tensor,
+    biased_scores: pl.Tensor,
     tasks: pl.Scalar[pl.INDEX],
 ) -> tuple[pl.Tensor, pl.Tensor]:
     """Project router inputs and compute sqrt-softplus scores with selection bias."""
+    experts = pl.tensor.dim(gate_w, 0)
+    width = pl.tensor.dim(x, 1)
+    columns = (experts + GATE_N_TILE - 1) // GATE_N_TILE
+    worker = pl.tile.get_block_idx()
+    workers = pl.tile.get_block_num()
+    for work in pl.range(worker, tasks, workers):
+        row = work // columns * GATE_M_TILE
+        column = work % columns * GATE_N_TILE
+        valid = pl.min(GATE_N_TILE, experts - column)
+        acc = pl.create_tile([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+        for k0 in pl.pipeline(0, width, 1024, stage=2):
+            left = pl.load(x, [row, k0], [GATE_M_TILE, 1024], target_memory=pl.Mem.Mat)
+            right = pl.load(gate_w, [column, k0], [GATE_N_TILE, 1024], valid_shape=[valid, 1024], target_memory=pl.Mem.Mat)
+            right = pl.tile.transpose_view(right)
+            acc = pl.tile.matmul_acc(acc, left, right, init_cond=k0 == 0)
+        raw = pl.tile.move(acc, target_memory=pl.Mem.Vec, blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.none_box)
+        # Materialize local UB before the RegScope capture.
+        raw = pl.tile.move(raw, target_memory=pl.Mem.Vec)
+        raw = pl.reshape(raw, [GATE_M_TILE * GATE_N_TILE])
+        bias = pl.load(gate_bias, [column], [GATE_N_TILE], valid_shape=[valid], target_memory=pl.Mem.Vec)
+        scores = pl.create_tile([GATE_M_TILE * GATE_N_TILE], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+        biased = pl.create_tile([GATE_M_TILE * GATE_N_TILE], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+        with pl.reg_scope():
+            full = pl.reg.full_mask(lanes=64)
+            lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
+            low_bits = pl.reg.broadcast(GATE_N_TILE - 1, lanes=64, dtype=pl.UINT32)
+            bias_column = pl.reg.bitwise_and(lane, low_bits, full)
+            valid_columns = pl.reg.compares(bias_column, pl.cast(valid, pl.UINT32), full, predicate="lt")
+            bias_value = pl.reg.gather(bias, bias_column, valid_columns)
+            minimum = pl.reg.broadcast(-3.4028234663852886e38, lanes=64, dtype=pl.FP32)
+            bias_value = pl.reg.select(valid_columns, bias_value, minimum)
+            zero = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+            one = pl.reg.broadcast(1.0, lanes=64, dtype=pl.FP32)
+            for segment in pl.hardware_loop(GATE_M_TILE * GATE_N_TILE // 64):
+                logits = pl.reg.load(raw, segment * 64, lanes=64)
+                relu = pl.reg.maximum(logits, zero, full)
+                absolute = pl.reg.abs(logits, full)
+                tail = pl.reg.muls(absolute, -1.0, full)
+                tail = pl.reg.exp(tail, full)
+                tail = pl.reg.adds(tail, 1.0, full)
+                tail = pl.reg.log(tail, full)
+                tail = pl.reg.add(relu, tail, full)
+                mask = pl.reg.muls(logits, -1.0, full)
+                mask = pl.reg.adds(mask, -10.0, full)
+                mask = pl.reg.maximum(mask, zero, full)
+                mask = pl.reg.minimum(mask, one, full)
+                floor = pl.reg.minimum(logits, zero, full)
+                floor = pl.reg.exp(floor, full)
+                floor = pl.reg.mul(mask, floor, full)
+                score = pl.reg.maximum(tail, floor, full)
+                score = pl.reg.sqrt(score, full)
+                _scores_written = pl.reg.store(scores, segment * 64, score)
+                selection = pl.reg.add(score, bias_value, full)
+                _biased_written = pl.reg.store(biased, segment * 64, selection)
+        scores = pl.reshape(scores, [GATE_M_TILE, GATE_N_TILE])
+        biased = pl.reshape(biased, [GATE_M_TILE, GATE_N_TILE])
+        pl.store(scores, [row, column], route_scores)
+        pl.store(biased, [row, column], biased_scores)
     return route_scores, biased_scores
 
 
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "gate_route_sort_vf.cpp",
-               include_dirs=(pto_isa_include_dir(),))
+@pl.jit.incore
 def _gate_route_sort_vf(
     biased_scores: pl.Tensor,
     route_scores: pl.Tensor,
-    indices: pl.InOut[pl.Tensor],
-    weights: pl.InOut[pl.Tensor],
+    indices: pl.Tensor,
+    weights: pl.Tensor,
     active_tokens: pl.Scalar[pl.INDEX],
     route_scale: pl.Scalar[pl.FP32],
     topk: pl.constexpr,
+    columns: pl.constexpr,
 ) -> tuple[pl.Tensor, pl.Tensor]:
     """Sort router scores, normalize selected weights, and store active rows."""
+    worker = pl.tile.get_block_idx()
+    workers = pl.tile.get_block_num()
+    count = (active_tokens + GATE_T_TILE - 1) // GATE_T_TILE
+    for block in pl.range(worker, count, workers):
+        row = block * GATE_T_TILE
+        valid_rows = pl.min(GATE_T_TILE, active_tokens - row)
+        biased = pl.load(biased_scores, [row, 0], [GATE_T_TILE, columns], target_memory=pl.Mem.Vec)
+        scores = pl.load(route_scores, [row, 0], [GATE_T_TILE, columns], target_memory=pl.Mem.Vec)
+        range_row = pl.tile.arange(0, [1, columns], dtype=pl.UINT32)
+        range_tile = pl.create_tile([GATE_T_TILE, columns], dtype=pl.UINT32, target_memory=pl.Mem.Vec)
+        range_tile = pl.tile.col_expand(range_tile, range_row)
+        sorted32 = pl.tile.sort32(biased, range_tile)
+        if columns > 32:
+            sorted_flat = pl.reshape(sorted32, [1, GATE_T_TILE * columns * 2])
+            sorted64 = pl.tile.mrgsort(sorted_flat, block_len=64)
+            sorted64 = pl.reshape(sorted64, [GATE_T_TILE, columns * 2])
+        prefixes = pl.create_tile([GATE_T_TILE, SORT_PAD], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+        for local in pl.unroll(GATE_T_TILE):
+            if columns <= 32:
+                prefix = pl.tile.slice(sorted32, [1, SORT_PAD], [local, 0])
+            elif columns <= 128:
+                prefix = pl.tile.slice(sorted64, [1, SORT_PAD], [local, 0])
+            else:
+                first = pl.tile.slice(sorted64, [1, SORT_PAD], [local, 0])
+                second = pl.tile.slice(sorted64, [1, SORT_PAD], [local, 256])
+                merge_tmp = pl.create_tile([1, SORT_PAD * 3], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                if columns == 256:
+                    merged = pl.tile.mrgsort(first, second, tmp=merge_tmp)
+                else:
+                    third = pl.tile.slice(sorted64, [1, SORT_PAD], [local, 512])
+                    merged = pl.tile.mrgsort(first, second, third, tmp=merge_tmp)
+                prefix = pl.tile.slice(merged, [1, SORT_PAD], [0, 0])
+            prefixes = pl.tile.assemble(prefixes, prefix, [local, 0])
+        pairs = pl.reinterpret_view(pl.reshape(prefixes, [GATE_T_TILE * SORT_PAD]), pl.INT32)
+        score_flat = pl.reshape(scores, [GATE_T_TILE * columns])
+        index_values = pl.create_tile([1, 64], dtype=pl.INT32, target_memory=pl.Mem.Vec)
+        weight_values = pl.create_tile([1, 64], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+        index_values = pl.reshape(index_values, [64])
+        weight_values = pl.reshape(weight_values, [64])
+        with pl.reg_scope():
+            full = pl.reg.active_mask(GATE_T_TILE * TOPK_PAD, lanes=64)
+            lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
+            token = pl.reg.shift_rights(lane, 3, full)
+            low_bits = pl.reg.broadcast(7, lanes=64, dtype=pl.UINT32)
+            selected_column = pl.reg.bitwise_and(lane, low_bits, full)
+            selected_mask = pl.reg.compares(selected_column, topk, full, predicate="lt")
+            pair_offset = pl.reg.muls(token, SORT_PAD, full)
+            pair_offset = pl.reg.add(pair_offset, pl.reg.muls(selected_column, 2, full), full)
+            pair_offset = pl.reg.adds(pair_offset, 1, full)
+            selected = pl.reg.gather(pairs, pair_offset, full)
+            _indices_written = pl.reg.store(index_values, 0, selected, full)
+            score_offset = pl.reg.muls(token, columns, full)
+            score_offset = pl.reg.add(score_offset, pl.reg.interpret_cast(selected, dtype=pl.UINT32), full)
+            value = pl.reg.gather(score_flat, score_offset, selected_mask)
+            zero = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+            value = pl.reg.select(selected_mask, value, zero)
+            sum_value = value
+            for distance in pl.unroll(3):
+                bit = pl.reg.broadcast(pl.cast(4 >> distance, pl.UINT32), lanes=64, dtype=pl.UINT32)
+                shuffle_index = pl.reg.bitwise_xor(lane, bit, full)
+                shuffled = pl.reg.gather_lanes(sum_value, shuffle_index)
+                sum_value = pl.reg.add(sum_value, shuffled, full)
+            value = pl.reg.div(value, sum_value, full)
+            value = pl.reg.muls(value, route_scale, full)
+            _weights_written = pl.reg.store(weight_values, 0, value, full)
+        index_storage = pl.reshape(index_values, [1, 64])
+        weight_storage = pl.reshape(weight_values, [1, 64])
+        index_prefix = pl.tile.slice(index_storage, [1, GATE_T_TILE * TOPK_PAD], [0, 0])
+        weight_prefix = pl.tile.slice(weight_storage, [1, GATE_T_TILE * TOPK_PAD], [0, 0])
+        index_rows = pl.reshape(index_prefix, [GATE_T_TILE, TOPK_PAD])
+        weight_rows = pl.reshape(weight_prefix, [GATE_T_TILE, TOPK_PAD])
+        pl.store(pl.set_validshape(index_rows, valid_rows, topk), [row, 0], indices)
+        pl.store(pl.set_validshape(weight_rows, valid_rows, topk), [row, 0], weights)
     return indices, weights
 
 
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "gate_quant_vf.cpp",
-               include_dirs=(pto_isa_include_dir(),))
+@pl.jit.incore
 def _gate_quant_vf(
     x: pl.Tensor,
-    payload: pl.Out[pl.Tensor],
-    scales: pl.Out[pl.Tensor],
+    payload: pl.Tensor,
+    scales: pl.Tensor,
 ) -> tuple[pl.Tensor, pl.Tensor]:
     """Quantize normalized input into group-32 FP8 and MX_A_ZZ scale bytes."""
+    rows = pl.tensor.dim(x, 0)
+    width = pl.tensor.dim(x, 1)
+    chunks = width // QUANT_TILE
+    worker = pl.tile.get_block_idx()
+    workers = pl.tile.get_block_num()
+    iterations = ((rows // GATE_M_TILE) * chunks + workers - 1 - worker) // workers
+    for iteration in pl.pipeline(iterations, stage=2):
+        block = worker + iteration * workers
+        row = block // chunks * GATE_M_TILE
+        column = block % chunks * QUANT_TILE
+        source = pl.load(x, [row, column], [GATE_M_TILE, QUANT_TILE], target_memory=pl.Mem.Vec)
+        source = pl.reshape(source, [GATE_M_TILE * QUANT_TILE])
+        quantized = pl.create_tile([GATE_M_TILE * QUANT_TILE], dtype=pl.INT8, target_memory=pl.Mem.Vec)
+        scale_pairs = pl.create_tile([128], dtype=pl.UINT16, target_memory=pl.Mem.Vec)
+        with pl.reg_scope():
+            full = pl.reg.full_mask(lanes=64)
+            lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
+            first_group = pl.reg.broadcast(0, lanes=64, dtype=pl.UINT32)
+            second_group = pl.reg.broadcast(32, lanes=64, dtype=pl.UINT32)
+            packed_codes = pl.reg.broadcast(0, lanes=64, dtype=pl.INT32)
+            floor = pl.reg.broadcast(1e-4, lanes=64, dtype=pl.FP32)
+            lower = pl.reg.broadcast(-448.0, lanes=64, dtype=pl.FP32)
+            upper = pl.reg.broadcast(448.0, lanes=64, dtype=pl.FP32)
+            bit16 = pl.reg.broadcast(16, lanes=64, dtype=pl.UINT32)
+            bit8 = pl.reg.broadcast(8, lanes=64, dtype=pl.UINT32)
+            bit4 = pl.reg.broadcast(4, lanes=64, dtype=pl.UINT32)
+            bit2 = pl.reg.broadcast(2, lanes=64, dtype=pl.UINT32)
+            bit1 = pl.reg.broadcast(1, lanes=64, dtype=pl.UINT32)
+            index16 = pl.reg.bitwise_xor(lane, bit16, full)
+            index8 = pl.reg.bitwise_xor(lane, bit8, full)
+            index4 = pl.reg.bitwise_xor(lane, bit4, full)
+            index2 = pl.reg.bitwise_xor(lane, bit2, full)
+            index1 = pl.reg.bitwise_xor(lane, bit1, full)
+            for local in pl.hardware_loop(GATE_M_TILE):
+                for segment in pl.hardware_loop(QUANT_TILE // 64):
+                    offset = local * QUANT_TILE + segment * 64
+                    raw = pl.reg.load(source, offset, lanes=64)
+                    value = pl.reg.convert(raw, dtype=pl.FP32)
+                    maximum = pl.reg.abs(value, full)
+                    shuffled = pl.reg.gather_lanes(maximum, index16)
+                    maximum = pl.reg.maximum(maximum, shuffled, full)
+                    shuffled = pl.reg.gather_lanes(maximum, index8)
+                    maximum = pl.reg.maximum(maximum, shuffled, full)
+                    shuffled = pl.reg.gather_lanes(maximum, index4)
+                    maximum = pl.reg.maximum(maximum, shuffled, full)
+                    shuffled = pl.reg.gather_lanes(maximum, index2)
+                    maximum = pl.reg.maximum(maximum, shuffled, full)
+                    shuffled = pl.reg.gather_lanes(maximum, index1)
+                    maximum = pl.reg.maximum(maximum, shuffled, full)
+                    maximum = pl.reg.maximum(maximum, floor, full)
+                    maximum = pl.reg.muls(maximum, 1.0 / 448.0, full)
+                    bits = pl.reg.interpret_cast(maximum, dtype=pl.INT32)
+                    exponent = pl.reg.adds(bits, 8388607, full)
+                    exponent = pl.reg.shift_rights(exponent, 23, full)
+                    divisor_bits = pl.reg.shift_lefts(exponent, 23, full)
+                    divisor = pl.reg.interpret_cast(divisor_bits, dtype=pl.FP32)
+                    value = pl.reg.div(value, divisor, full)
+                    value = pl.reg.maximum(value, lower, full)
+                    value = pl.reg.minimum(value, upper, full)
+                    value = pl.reg.convert(value, dtype=pl.FP8E4M3FN, rounding="R", saturate=False)
+                    payload_bytes = pl.reg.interpret_cast(value, dtype=pl.INT8)
+                    _payload_written = pl.reg.store(quantized, offset, payload_bytes, full)
+                    even_code = pl.reg.gather_lanes(exponent, first_group)
+                    odd_code = pl.reg.gather_lanes(exponent, second_group)
+                    odd_code = pl.reg.shift_lefts(odd_code, 8, full)
+                    pair = pl.reg.bitwise_or(even_code, odd_code, full)
+                    pair_position = pl.cast(segment * GATE_M_TILE + local, pl.UINT32)
+                    pair_mask = pl.reg.compares(lane, pair_position, full, predicate="eq")
+                    packed_codes = pl.reg.select(pair_mask, pair, packed_codes)
+            pair_halves = pl.reg.interpret_cast(packed_codes, dtype=pl.UINT16)
+            compact_pairs, _unused_pairs = pl.reg.dintlv(pair_halves, pair_halves)
+            store_pairs_mask = pl.reg.active_mask(64, lanes=128)
+            _scale_written = pl.reg.store(scale_pairs, 0, compact_pairs, store_pairs_mask)
+        quantized = pl.reshape(quantized, [GATE_M_TILE, QUANT_TILE])
+        quantized = pl.reinterpret_view(quantized, pl.FP8E4M3FN)
+        pl.store(quantized, [row, column], payload)
+        scale_pairs = pl.reshape(scale_pairs, [1, 128])
+        scale_prefix = pl.tile.slice(scale_pairs, [1, GATE_M_TILE * (QUANT_TILE // 64)], [0, 0])
+        scale_prefix = pl.reinterpret_view(scale_prefix, pl.UINT8)
+        packed = pl.reinterpret_view(scale_prefix, pl.FP8E8M0)
+        scale_column = row * (width // MX_GROUP) + (column // MX_GROUP) * GATE_M_TILE
+        pl.store(packed, [0, scale_column], scales)
     return payload, scales
 
 
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "gate_pre_route_vf.cpp",
-               include_dirs=(pto_isa_include_dir(),))
+@pl.jit.incore
 def _gate_pre_route_vf(
-    indices: pl.Out[pl.Tensor],
-    weights: pl.Out[pl.Tensor],
-    biased_scores: pl.Out[pl.Tensor],
+    indices: pl.Tensor,
+    weights: pl.Tensor,
+    biased_scores: pl.Tensor,
     active_tokens: pl.Scalar[pl.INDEX],
-    experts: pl.Scalar[pl.INDEX],
+    experts: pl.constexpr,
     topk: pl.constexpr,
+    columns: pl.constexpr,
 ) -> tuple[pl.Tensor, pl.Tensor, pl.Tensor]:
     """Zero inactive routes and initialize padded expert scores."""
+    capacity = pl.tensor.dim(indices, 1) // topk
+    active = pl.max(pl.min(active_tokens, capacity), 0)
+    for start in pl.range(active * topk, capacity * topk, 512):
+        count = pl.min(512, capacity * topk - start)
+        zero_index = pl.tile.full([1, 512], dtype=pl.INT32, value=0)
+        zero_weight = pl.reinterpret_view(zero_index, pl.FP32)
+        pl.store(pl.set_validshape(zero_index, 1, count), [0, start], indices)
+        pl.store(pl.set_validshape(zero_weight, 1, count), [0, start], weights)
+    padded_rows = pl.tensor.dim(biased_scores, 0)
+    if experts < columns:
+        for row in pl.range(0, padded_rows, 80):
+            rows = pl.min(80, padded_rows - row)
+            padding = pl.tile.full([80, ((columns - experts + 7) // 8) * 8], dtype=pl.FP32, value=-3.4028234663852886e38)
+            padding = pl.set_validshape(padding, rows, columns - experts)
+            pl.store(padding, [row, experts], biased_scores)
     return indices, weights, biased_scores
 
 
@@ -147,9 +366,12 @@ def gate_from_bf16(
         x_norm_mx, x_norm_scale = _gate_quant_vf(xg_buf, x_norm_mx, x_norm_scale)
 
     biased_scores_buf = pl.create_tensor([T_PAD, score_pad], dtype=pl.FP32)
+    index_flat = pl.reshape(indices, [1, T * topk])
+    weight_flat = pl.reshape(weights, [1, T * topk])
     with pl.spmd(1, name_hint="gate_pre_route"):
-        indices, weights, biased_scores_buf = _gate_pre_route_vf(
-            indices, weights, biased_scores_buf, active_tokens, n_experts, topk,
+        index_flat, weight_flat, biased_scores_buf = _gate_pre_route_vf(
+            index_flat, weight_flat, biased_scores_buf, active_tokens, n_experts, topk,
+            columns=32 if n_experts <= 32 else 256 if n_experts <= 256 else 384,
         )
 
     route_scores_buf = pl.create_tensor([T_PAD, score_pad], dtype=pl.FP32)
@@ -163,69 +385,14 @@ def gate_from_bf16(
             xg_buf, gate_w, gate_bias, route_scores_buf, biased_scores_buf, gate_tasks,
         )
 
-    # V4.1 uses score-only top-k: the V4 hash-route loop is dropped so that PTOAS
-    # does not emit an invalid function for a route_hash path that does no work.
-    # The native route publisher stores six columns; odd Top-K uses aligned DSL tasks.
-    if topk == 6:
-        task_route_tiles = (task_tokens + GATE_T_TILE - 1) // GATE_T_TILE
-        with pl.spmd(pl.max(pl.min(task_route_tiles, ROUTE_WORKER_TILE), 1), name_hint="route_sort"):
-            indices, weights = _gate_route_sort_vf(
-                biased_scores_buf, route_scores_buf, indices, weights, active_tokens, ROUTE_SCALE, topk,
-            )
-    else:
-        # Scalar route stores own complete 64-byte cache lines.
-        if topk % 2 != 0:
-            route_rows = 16
-        elif topk % 4 != 0:
-            route_rows = 8
-        else:
-            route_rows = GATE_T_TILE
-        task_route_tiles = (task_tokens + route_rows - 1) // route_rows
-        for ts_idx in pl.spmd(task_route_tiles, name_hint="route_sort"):
-            t1 = ts_idx * route_rows
-            # ptoas pto.tmrgsort requires a single source row.
-            topk_idx_tile = pl.create_tensor([route_rows, TOPK_PAD], dtype=pl.INT32)
-            sr_idx_init = pl.create_tensor([1, score_pad], dtype=pl.UINT32)
-            sr_index_range = pl.arange(0, [1, score_pad], dtype=pl.UINT32)
-            sr_idx_init[:, :] = sr_index_range
-            for sr_tt in pl.range(route_rows):
-                sr_t = t1 + sr_tt
-                sr_row = pl.slice(biased_scores_buf, [1, score_pad], [sr_t, 0])
-                sorted_32 = pl.sort32(sr_row, sr_idx_init)
-                if n_experts <= 32:
-                    sorted_pairs = sorted_32
-                elif n_experts <= 256:
-                    sorted_64 = pl.mrgsort(sorted_32, block_len=64)
-                    sorted_pairs = pl.mrgsort(sorted_64[:, 0:256], sorted_64[:, 256:512])
-                else:
-                    sorted_64 = pl.mrgsort(sorted_32, block_len=64)
-                    first = sorted_64[:, 0:256]
-                    second = sorted_64[:, 256:512]
-                    third = sorted_64[:, 512:768]
-                    sorted_pairs = pl.mrgsort(first, second, third)
-                selected_pairs = sorted_pairs[:, 0:SORT_PAD]
-                sr_i = pl.gather(selected_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-                topk_idx_tile[sr_tt : sr_tt + 1, :] = sr_i
-
-            local_scores = pl.create_tensor([route_rows, score_pad], dtype=pl.FP32)
-            local_scores[:, :] = route_scores_buf[t1 : t1 + route_rows, :]
-            gather_all = pl.gather(local_scores, dim=-1, index=topk_idx_tile)
-            gather_valid = pl.set_validshape(gather_all, route_rows, topk)
-            topk_vals_pad = pl.fillpad(gather_valid, pad_value=pl.PadValue.zero)
-            topk_idx_read = pl.create_tensor([route_rows, TOPK_PAD], dtype=pl.INT32)
-            topk_idx_read[:, :] = topk_idx_tile[:, :]
-            topk_sum = pl.row_sum(topk_vals_pad)
-            denom = pl.reshape(topk_sum, [route_rows, 1])
-            topk_normalized = pl.row_expand_div(topk_vals_pad, denom)
-            normalized_weights = pl.mul(topk_normalized, ROUTE_SCALE)
-            for wt_tt in pl.range(route_rows):
-                wt_out_t = t1 + wt_tt
-                if wt_out_t < active_tokens:
-                    for wt_k in pl.range(topk):
-                        wt_out_idx = pl.read(topk_idx_read, [wt_tt, wt_k])
-                        pl.write(indices, [wt_out_t, wt_k], wt_out_idx)
-                        wt_out_weight = pl.read(normalized_weights, [wt_tt, wt_k])
-                        pl.write(weights, [wt_out_t, wt_k], wt_out_weight)
+    task_route_tiles = (task_tokens + GATE_T_TILE - 1) // GATE_T_TILE
+    route_workers = pl.max(pl.min(task_route_tiles, ROUTE_WORKER_TILE), 1)
+    with pl.spmd(route_workers, name_hint="route_sort"):
+        indices, weights = _gate_route_sort_vf(
+            biased_scores_buf, route_scores_buf, indices, weights,
+            active_tokens, ROUTE_SCALE, topk,
+            columns=32 if n_experts <= 32 else 256 if n_experts <= 256 else 384,
+        )
 
     return weights
 
@@ -339,7 +506,7 @@ def build_tensor_specs(num_tokens=T):
         TensorSpec("x_normed", [T_PAD, D], torch.bfloat16, init_value=init_x_normed),
         TensorSpec("gate_w", [N_EXPERTS, D], torch.bfloat16, init_value=init_gate_w),
         TensorSpec("gate_bias", [N_EXPERTS], torch.float32, init_value=init_gate_bias),
-        ScalarSpec("num_tokens", torch.int32, num_tokens),
+        ScalarSpec("num_tokens", torch.int32, num_tokens, compile_runtime=True),
         TensorSpec("x_norm_mx", [T_PAD, D], torch.float8_e4m3fn, init_value=lambda: init_fp8((T_PAD, D))),
         TensorSpec("x_norm_scale", [1, T_PAD * MX_SCALE_GROUPS], getattr(torch, "float8_e8m0fnu", torch.uint8), init_value=lambda: init_e8m0((1, T_PAD * MX_SCALE_GROUPS))),
         TensorSpec("indices", [T, TOPK], torch.int32),
@@ -528,40 +695,57 @@ if __name__ == "__main__":
     from golden.runner import run
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--num-tokens", type=int, default=T)
+    parser.add_argument("--num-tokens", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--save-data", action="store_true")
+    parser.add_argument("--golden-data", type=str, default=None)
     args = parser.parse_args()
-    torch.manual_seed(args.seed)
+    if args.execution_mode:
+        parser.error("Gate RegScope kernels require A5 device execution; simulation is unsupported")
+    if args.num_tokens is None and (args.runtime_dir or args.save_data or args.golden_data):
+        parser.error("--num-tokens is required when saving or replaying a case")
+    counts = [args.num_tokens] if args.num_tokens is not None else [0, 1, T - 1, T]
+    if args.compile_only:
+        counts = [T if args.num_tokens is None else args.num_tokens]
+    for active_count in counts:
+        torch.manual_seed(args.seed)
+        print(f"Gate validation: num_tokens={active_count}", flush=True)
 
-    result = run(
-        fn=l2_gate,
-        specs=build_tensor_specs(num_tokens=args.num_tokens),
-        golden_fn=golden_gate_normalized_core,
-        config=dict(
-            dump_passes=args.dump_passes,
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            device_id=args.device,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-        ),
-        rtol=1e-3,
-        atol=1e-3,
-        compare_fn={
-            # payload/scale may use a different but equivalent E8M0 representation, so
-            # compare dequantised values.
-            "x_norm_mx": mxfp8_activation_value_compare,
-            # The scale is already covered by the combined payload/scale comparator and
-            # must not be compared bitwise on its own.
-            "x_norm_scale": mxfp8_activation_value_compare,
-            "indices": gate_indices_compare(args.num_tokens),
-        },
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+        result = run(
+            fn=l2_gate,
+            specs=build_tensor_specs(num_tokens=active_count),
+            golden_fn=golden_gate_normalized_core,
+            compile_only=args.compile_only,
+            runtime_dir=args.runtime_dir,
+            save_data=args.save_data,
+            golden_data=args.golden_data,
+            config=dict(
+                dump_passes=args.dump_passes,
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                device_id=args.device,
+                enable_chip_swimlane=args.enable_chip_swimlane,
+            ),
+            rtol=1e-3,
+            atol=1e-3,
+            compare_fn={
+                # payload/scale may use a different but equivalent E8M0 representation, so
+                # compare dequantised values.
+                "x_norm_mx": mxfp8_activation_value_compare,
+                # The scale is already covered by the combined payload/scale comparator and
+                # must not be compared bitwise on its own.
+                "x_norm_scale": mxfp8_activation_value_compare,
+                "indices": gate_indices_compare(active_count),
+            },
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
