@@ -9,7 +9,10 @@
 # ci: no-sim
 """DeepSeek-V4.1 A5 MoE router: BF16 input, MX quantization, projection, and top-k weights."""
 
+from pathlib import Path
+
 import pypto.language as pl
+from pypto.runtime import pto_isa_include_dir
 import torch
 import torch.nn.functional as F
 
@@ -200,95 +203,14 @@ def _gate_route_sort_vf(
     return indices, weights
 
 
-@pl.jit.incore
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "gate_quant_vf.cpp",
+               include_dirs=(pto_isa_include_dir(),))
 def _gate_quant_vf(
     x: pl.Tensor,
-    payload: pl.Tensor,
-    scales: pl.Tensor,
+    payload: pl.Out[pl.Tensor],
+    scales: pl.Out[pl.Tensor],
 ) -> tuple[pl.Tensor, pl.Tensor]:
     """Quantize normalized input into group-32 FP8 and MX_A_ZZ scale bytes."""
-    rows = pl.tensor.dim(x, 0)
-    width = pl.tensor.dim(x, 1)
-    chunks = width // QUANT_TILE
-    worker = pl.tile.get_block_idx()
-    workers = pl.tile.get_block_num()
-    iterations = ((rows // GATE_M_TILE) * chunks + workers - 1 - worker) // workers
-    for iteration in pl.range(iterations):
-        block = worker + iteration * workers
-        row = block // chunks * GATE_M_TILE
-        column = block % chunks * QUANT_TILE
-        source = pl.load(x, [row, column], [GATE_M_TILE, QUANT_TILE], target_memory=pl.Mem.Vec)
-        source = pl.reshape(source, [GATE_M_TILE * QUANT_TILE])
-        quantized = pl.create_tile([GATE_M_TILE * QUANT_TILE], dtype=pl.INT8, target_memory=pl.Mem.Vec)
-        scale_pairs = pl.create_tile([128], dtype=pl.UINT16, target_memory=pl.Mem.Vec)
-        with pl.reg_scope():
-            full = pl.reg.full_mask(lanes=64)
-            lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
-            first_group = pl.reg.broadcast(0, lanes=64, dtype=pl.UINT32)
-            second_group = pl.reg.broadcast(32, lanes=64, dtype=pl.UINT32)
-            packed_codes = pl.reg.broadcast(0, lanes=64, dtype=pl.INT32)
-            floor = pl.reg.broadcast(1e-4, lanes=64, dtype=pl.FP32)
-            lower = pl.reg.broadcast(-448.0, lanes=64, dtype=pl.FP32)
-            upper = pl.reg.broadcast(448.0, lanes=64, dtype=pl.FP32)
-            bit16 = pl.reg.broadcast(16, lanes=64, dtype=pl.UINT32)
-            bit8 = pl.reg.broadcast(8, lanes=64, dtype=pl.UINT32)
-            bit4 = pl.reg.broadcast(4, lanes=64, dtype=pl.UINT32)
-            bit2 = pl.reg.broadcast(2, lanes=64, dtype=pl.UINT32)
-            bit1 = pl.reg.broadcast(1, lanes=64, dtype=pl.UINT32)
-            index16 = pl.reg.bitwise_xor(lane, bit16, full)
-            index8 = pl.reg.bitwise_xor(lane, bit8, full)
-            index4 = pl.reg.bitwise_xor(lane, bit4, full)
-            index2 = pl.reg.bitwise_xor(lane, bit2, full)
-            index1 = pl.reg.bitwise_xor(lane, bit1, full)
-            for local in pl.hardware_loop(GATE_M_TILE):
-                for segment in pl.hardware_loop(QUANT_TILE // 64):
-                    offset = local * QUANT_TILE + segment * 64
-                    raw = pl.reg.load(source, offset, lanes=64)
-                    value = pl.reg.convert(raw, dtype=pl.FP32)
-                    maximum = pl.reg.abs(value, full)
-                    shuffled = pl.reg.gather_lanes(maximum, index16)
-                    maximum = pl.reg.maximum(maximum, shuffled, full)
-                    shuffled = pl.reg.gather_lanes(maximum, index8)
-                    maximum = pl.reg.maximum(maximum, shuffled, full)
-                    shuffled = pl.reg.gather_lanes(maximum, index4)
-                    maximum = pl.reg.maximum(maximum, shuffled, full)
-                    shuffled = pl.reg.gather_lanes(maximum, index2)
-                    maximum = pl.reg.maximum(maximum, shuffled, full)
-                    shuffled = pl.reg.gather_lanes(maximum, index1)
-                    maximum = pl.reg.maximum(maximum, shuffled, full)
-                    maximum = pl.reg.maximum(maximum, floor, full)
-                    maximum = pl.reg.muls(maximum, 1.0 / 448.0, full)
-                    bits = pl.reg.interpret_cast(maximum, dtype=pl.INT32)
-                    exponent = pl.reg.adds(bits, 8388607, full)
-                    exponent = pl.reg.shift_rights(exponent, 23, full)
-                    divisor_bits = pl.reg.shift_lefts(exponent, 23, full)
-                    divisor = pl.reg.interpret_cast(divisor_bits, dtype=pl.FP32)
-                    value = pl.reg.div(value, divisor, full)
-                    value = pl.reg.maximum(value, lower, full)
-                    value = pl.reg.minimum(value, upper, full)
-                    value = pl.reg.convert(value, dtype=pl.FP8E4M3FN, rounding="R", saturate=False)
-                    payload_bytes = pl.reg.interpret_cast(value, dtype=pl.INT8)
-                    _payload_written = pl.reg.store(quantized, offset, payload_bytes, full)
-                    even_code = pl.reg.gather_lanes(exponent, first_group)
-                    odd_code = pl.reg.gather_lanes(exponent, second_group)
-                    odd_code = pl.reg.shift_lefts(odd_code, 8, full)
-                    pair = pl.reg.bitwise_or(even_code, odd_code, full)
-                    pair_position = pl.cast(segment * GATE_M_TILE + local, pl.UINT32)
-                    pair_mask = pl.reg.compares(lane, pair_position, full, predicate="eq")
-                    packed_codes = pl.reg.select(pair_mask, pair, packed_codes)
-            pair_halves = pl.reg.interpret_cast(packed_codes, dtype=pl.UINT16)
-            compact_pairs, _unused_pairs = pl.reg.dintlv(pair_halves, pair_halves)
-            store_pairs_mask = pl.reg.active_mask(64, lanes=128)
-            _scale_written = pl.reg.store(scale_pairs, 0, compact_pairs, store_pairs_mask)
-        quantized = pl.reshape(quantized, [GATE_M_TILE, QUANT_TILE])
-        quantized = pl.reinterpret_view(quantized, pl.FP8E4M3FN)
-        pl.store(quantized, [row, column], payload)
-        scale_pairs = pl.reshape(scale_pairs, [1, 128])
-        scale_prefix = pl.tile.slice(scale_pairs, [1, GATE_M_TILE * (QUANT_TILE // 64)], [0, 0])
-        scale_prefix = pl.reinterpret_view(scale_prefix, pl.UINT8)
-        packed = pl.reinterpret_view(scale_prefix, pl.FP8E8M0)
-        scale_column = row * (width // MX_GROUP) + (column // MX_GROUP) * GATE_M_TILE
-        pl.store(packed, [0, scale_column], scales)
     return payload, scales
 
 
