@@ -67,6 +67,17 @@ Attention entries own chunk scheduling and dependencies around that shared
 implementation. MoE dispatches local token rows to EP expert owners and combines
 the results back into the local HC state.
 
+Native routed W13 and W2 use A5 register scopes inside their AIC/AIV peer groups and
+require PyPTO's [grouped VF execution support](https://github.com/hw-native-sys/pypto/pull/3416).
+The vector peers decode FP4 weights with the existing lookup table into a
+dedicated ND workspace before NZ staging. W13 loads the dispatched MX activation
+scales directly on AIC. W2 packs activation scales into ZZ in the same register
+scope as weight decoding, with separate scale and ND workspaces.
+Four independent RAW slots preload four K panels; each consumed slot is
+refilled with the panel four steps ahead.
+W13 uses physical row tiles of at most 64 rows. A capacity tail loads a full
+aligned input window and stores only the corresponding active accumulator rows.
+
 ## Parallel configuration
 
 | Component | Contract |
