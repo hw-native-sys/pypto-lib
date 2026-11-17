@@ -16,7 +16,6 @@ to scheduler order between layers for CED replay and caller-owned state.
 Engram consumes host-gathered rows at layers 1 and 14.
 """
 
-from contextlib import nullcontext
 import struct
 import math
 from numbers import Integral
@@ -27,14 +26,9 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import sys
 import time
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-# Sibling operators share the same configuration module for script and -m entry points.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pypto.language as pl
 
@@ -78,6 +72,7 @@ from config import (
     FLASH as M, INDEX_CACHE_GROUP, CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, ORI_BLOCKS_DYN, LM_HEAD_TP_SIZE, B_DYN,
     INDEX_POOL_BLOCKS_DYN, PREFILL_MAX_TOKENS, Q_START_DYN, STATE_BLOCKS_DYN, STATE_CAPACITY, MOE_TOKENS,
     DSPARK_DRAFT_LAYERS, DSPARK_LAST_TARGET_LAYER, DSPARK_TARGET_LAYER_IDS, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
+    DECODE_INPUT_MAX_TOKENS,
 )
 
 from prefill_cp_allgather import prefill_cp_gather_hc
@@ -86,7 +81,7 @@ from input_pack import gather_rows, pack_x_hc
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, prepare_forward_rope_tables
 from utils import paged_slots, window_metadata
 from engram import ENGRAM_K, KV_OUT, HostEngram, engram_from_rows
-from lm_head import final_output
+from lm_head import MAX_LOGIT_ROWS, lm_head, greedy_sample
 from prefill_moe import AUX_WIDTH, ROUTE_WIDTH, clear_moe_signals
 from prefill_moe import prefill_moe_slabs
 from compressor import STATE_WIDTH
@@ -836,13 +831,18 @@ def l2_prefill_fwd(
             if source >= 0 and source < CAPACITY:
                 owner_source = source
             pl.write(owner_logit_rows, [row], owner_source)
-    final_logits, final_sampled_ids = final_output(
-        final_hidden, final_pre, final_norm_weight, lm_head_weight,
-        owner_logit_rows, logits, sampled_ids,
+    head_rows = pl.tensor.dim(final_hidden, 0)
+    head_collapsed = pl.create_tensor([head_rows, D], dtype=pl.BF16)
+    hc_head(final_hidden, final_pre, head_collapsed, worker_limit=64)
+    head_normalized = pl.create_tensor([head_rows, D], dtype=pl.BF16)
+    rms_norm(head_collapsed, final_norm_weight, head_normalized, head_rows, width=D, zero_tail=False)
+    lm_head(
+        head_normalized, lm_head_weight, owner_logit_rows, logits,
         head_hidden, head_hidden_done, head_logits, head_logits_done,
-        rank // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE, rank % LM_HEAD_TP_SIZE, 1, 1,
+        rank, MAX_LOGIT_ROWS,
     )
-    return final_logits, final_sampled_ids
+    greedy_sample(logits, sampled_ids)
+    return logits, sampled_ids
 
 
 @pl.jit.host
@@ -1685,13 +1685,64 @@ def decode_cache_views(cache_state):
     return {target: cache_state[source].flatten(0, 1) for target, source in DECODE_CACHE_NAMES.items()}
 
 
+@pl.jit(auto_scope=False)
+def l2_generation_head(
+    x_hc: pl.Tensor[[DECODE_INPUT_MAX_TOKENS, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[DECODE_INPUT_MAX_TOKENS, HC_MULT], pl.FP32],
+    final_norm_weight: pl.Tensor[[D], pl.BF16],
+    lm_head_weight: pl.Tensor[[D, VOCAB // LM_HEAD_TP_SIZE], pl.BF16, pl.NZ],
+    logit_rows: pl.Tensor[[16], pl.INT32],
+    logits: pl.Out[pl.Tensor[[16, VOCAB], pl.FP32]],
+    sampled_ids: pl.Out[pl.Tensor[[16, 8], pl.INT32]],
+    head_hidden: pld.DistributedTensor[[LM_HEAD_TP_SIZE * 16, D], pl.BF16],
+    head_hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
+    head_logits: pld.DistributedTensor[[16, VOCAB], pl.BF16],
+    head_logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
+    rank: pl.Scalar[pl.INT32],
+):
+    collapsed = pl.create_tensor([DECODE_INPUT_MAX_TOKENS, D], dtype=pl.BF16)
+    hc_head(x_hc, pre_mix, collapsed, worker_limit=64)
+    normalized = pl.create_tensor([DECODE_INPUT_MAX_TOKENS, D], dtype=pl.BF16)
+    rms_norm(collapsed, final_norm_weight, normalized, DECODE_INPUT_MAX_TOKENS, width=D, zero_tail=False)
+    lm_head(
+        normalized, lm_head_weight, logit_rows, logits,
+        head_hidden, head_hidden_done, head_logits, head_logits_done, rank, MAX_LOGIT_ROWS,
+    )
+    greedy_sample(logits, sampled_ids)
+
+
+@pl.jit.host
+def l3_generation_head(
+    x_hc: pl.Tensor[[RANKS, DECODE_INPUT_MAX_TOKENS, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[RANKS, DECODE_INPUT_MAX_TOKENS, HC_MULT], pl.FP32],
+    final_norm_weight: pl.Tensor[[RANKS, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[RANKS, D, VOCAB // LM_HEAD_TP_SIZE], pl.BF16],
+    logit_rows: pl.Tensor[[RANKS, 16], pl.INT32],
+    logits: pl.Out[pl.Tensor[[RANKS, 16, VOCAB], pl.FP32]],
+    sampled_ids: pl.Out[pl.Tensor[[RANKS, 16, 8], pl.INT32]],
+):
+    hidden_buffer = pld.alloc_window_buffer([LM_HEAD_TP_SIZE * 16, D], dtype=pl.BF16)
+    hidden_done_buffer = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+    logits_buffer = pld.alloc_window_buffer([16, VOCAB], dtype=pl.BF16)
+    logits_done_buffer = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+    for rank in pl.range(pld.world_size()):
+        head_hidden = pld.window(hidden_buffer, [LM_HEAD_TP_SIZE * 16, D], dtype=pl.BF16)
+        head_hidden_done = pld.window(hidden_done_buffer, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+        head_logits = pld.window(logits_buffer, [16, VOCAB], dtype=pl.BF16)
+        head_logits_done = pld.window(logits_done_buffer, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+        l2_generation_head(
+            x_hc[rank], pre_mix[rank], final_norm_weight[rank], lm_head_weight[rank], logit_rows[rank],
+            logits[rank], sampled_ids[rank], head_hidden, head_hidden_done, head_logits, head_logits_done,
+            rank, device=rank,
+        )
+
+
 def prepare_decode_inputs(values):
     """Lower one request's current prefill metadata to the decode input contract."""
     embedding = values["embedding"].float()
     result = {
         "x_hc": embedding[:, None, :].expand(-1, M.hc_mult, -1).contiguous(),
         "pre_mix": values["initial_pre"], "engram_lookup": values["engram_lookup"],
-        "logit_row_indices": values["logit_rows"],
     }
     # Prefill metadata has encoder/decoder stages; decode starts from encoder rows.
     for name in ("window_slots", "window_indices", "token_to_req_indices", "position_ids", "query_start_loc"):
@@ -1708,7 +1759,8 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
     Prefill and subsequent one-token calls retain native device caches. Only
     current-token metadata is uploaded; completed history is never recomputed.
     With decode_compiled, continuation uses decode_fwd with shared resident
-    weights and cache pools. Otherwise, one-token calls use the prefill composition.
+    weights and cache pools, followed by a separate generation head and sampler.
+    Otherwise, one-token calls use the prefill composition.
     """
     if CP_SIZE != 1:
         raise ValueError("checkpoint generation currently requires CP=1")
@@ -1728,7 +1780,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
         if decode_names[:4] != ["engram_lookup", "engram_wkv", "engram_wkv_scale", "engram_weight"]:
             raise ValueError("decode artifact must use the host-row Engram ABI")
         decode_shape = decode_parameters[0].shape
-        decode_rows = C.DECODE_INPUT_MAX_TOKENS
+        decode_rows = DECODE_INPUT_MAX_TOKENS
         if (decode_shape[:2] != [RANKS, 2] or decode_shape[2] not in (-1, decode_rows)
                 or decode_shape[3] != ENGRAM_K):
             raise ValueError("decode artifact must match EP and the configured decode capacity")
@@ -1791,7 +1843,8 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
     print("CED_RESIDENT_BYTES_PER_RANK", weights.bytes_per_rank, flush=True)
     start = time.monotonic()
     # Completed forwards retire signals; native cache allocations persist.
-    extra = [] if decode_compiled is None else [decode_compiled]
+    generation_head = None if decode_compiled is None else l3_generation_head.compile(config=config)
+    extra = [] if decode_compiled is None else [decode_compiled, generation_head]
     with compiled.prepare(
         config, extra_compiled=extra, persistent=True, reset_persistent_windows=False,
         inherited_host_tensors=list(decode_counts.values()),
@@ -1838,6 +1891,8 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
 
         decode_rank = [{} for _ in device_ids]
         decode_stacked = {}
+        head_names = ("x_hc", "pre_mix", "final_norm_weight", "lm_head_weight", "logit_rows", "logits", "sampled_ids")
+        head_stacked = {}
         if decode_compiled is not None:
             for rank, tensors in enumerate(decode_rank):
                 values = prepare_resident_inputs(
@@ -1853,7 +1908,11 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
                         source = per_rank[rank][DECODE_CACHE_NAMES[name]]
                         tensors[name] = DeviceTensor(source.data_ptr, cache_views[name].shape, source.dtype,
                                                      buffer=source.buffer)
-                    elif name in constants or name in ("logits", "sampled_ids"):
+                    elif name == "dspark_target_hidden":
+                        tensors[name] = runtime.alloc_tensor(
+                            (decode_rows, DSPARK_MAIN_IN), torch.bfloat16, worker_id=rank,
+                        )
+                    elif name in constants:
                         tensors[name] = per_rank[rank][name]
                     else:
                         value = values[name]
@@ -1865,6 +1924,10 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
                 for name in decode_names if name not in decode_counts
             }
             decode_stacked.update(decode_counts)
+            head_stacked = {
+                name: decode_stacked[name] if name in ("x_hc", "pre_mix") else stacked[name]
+                for name in head_names
+            }
 
         def run_rows(rows, *, decode=False):
             rank_tensors = decode_rank if decode else per_rank
@@ -1877,6 +1940,10 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
                     engram=engram, request_id=rank,
                 )
                 if decode:
+                    runtime.copy_to(
+                        per_rank[rank]["logit_rows"].data_ptr, inputs["logit_rows"].data_ptr(),
+                        inputs["logit_rows"].numel() * inputs["logit_rows"].element_size(), worker_id=rank,
+                    )
                     inputs = prepare_decode_inputs(inputs)
                     for counts in decode_counts.values():
                         counts[rank] = len(token_ids)
@@ -1890,8 +1957,10 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
             arguments = decode_stacked if decode else stacked
             names = decode_names if decode else PREFILL_TENSORS
             runtime.run(program, *[arguments[name] for name in names], config=config)
-            runtime.copy_stacked_from(arguments["logits"], logits)
-            runtime.copy_stacked_from(arguments["sampled_ids"], sampled_ids)
+            if decode:
+                runtime.run(generation_head, *[head_stacked[name] for name in head_names], config=config)
+            runtime.copy_stacked_from(stacked["logits"], logits)
+            runtime.copy_stacked_from(stacked["sampled_ids"], sampled_ids)
             for rank, token_ids in enumerate(rows):
                 if not token_ids:
                     continue
@@ -2152,10 +2221,7 @@ if __name__ == "__main__":
             options.report.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
         print("CED_GENERATION_COMPLETE", json.dumps(report, ensure_ascii=False), flush=True)
     else:
-        from utils import upload_forward_inputs
-        from golden import normalize_config, run
-        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
-
+        from golden import run
         from utils import parse_prefill_groups
 
         parser = argparse.ArgumentParser(description=__doc__)
@@ -2200,72 +2266,9 @@ if __name__ == "__main__":
         result = run(
             fn=l3_prefill_fwd,
             specs=specs,
+            golden_fn=None,
             config=config,
-            compile_only=True,
+            compile_only=args.compile_only,
         )
-        if result.passed and not args.compile_only:
-            cfg = normalize_config(config)
-            compiled = DistributedCompiledProgram.from_dir(
-                result.work_dir, backend_type=cfg.backend_type, execution_mode=cfg.execution_mode,
-                distributed_config=cfg.distributed_config,
-            )
-            host_inputs = {}
-            upload_buffer = torch.empty(64 * 1024**2, dtype=torch.uint8).share_memory_()
-            inherited = [*host_inputs.values(), upload_buffer]
-            from golden.runner import _bench_enabled, _bench_loop_sizes, _report_bench
-            from pypto.runtime.bench import _capture_fd_stderr, _parse_stats_from_strace
-            from pypto.runtime.log_config import configure_log, current_level
-            benchmark = _bench_enabled()
-            rounds, warmup = _bench_loop_sizes() if benchmark else (1, 0)
-            trace_path = Path(result.work_dir) / "prefill_benchmark.strace"
-            prior_level = current_level()
-            if benchmark:
-                configure_log("timing")
-            try:
-                capture = _capture_fd_stderr(trace_path) if benchmark else nullcontext()
-                with capture:
-                    with compiled.prepare(cfg, persistent=True, reset_persistent_windows=False, inherited_host_tensors=inherited) as runtime:
-                        parameters = compiled._get_metadata()[0]
-                        arguments = upload_forward_inputs(runtime, specs, parameters, len(devices), host_inputs, upload_buffer)
-                        for iteration in range(warmup + rounds):
-                            if iteration:
-                                for spec, parameter, argument in zip(specs, parameters, arguments, strict=True):
-                                    if parameter.direction.name != "InOut":
-                                        continue
-                                    for rank, handle in enumerate(argument.shards):
-                                        value = spec.init_value[rank].contiguous().view(torch.uint8).reshape(-1)
-                                        for offset in range(0, handle.nbytes, upload_buffer.numel()):
-                                            size = min(upload_buffer.numel(), handle.nbytes - offset)
-                                            upload_buffer[:size].copy_(value[offset:offset + size])
-                                            runtime.copy_to(handle.data_ptr, upload_buffer.data_ptr(), size, dst_offset=offset, worker_id=rank)
-                            runtime(*arguments, config=cfg)
-                        target_hidden = torch.empty((RANKS, CAPACITY, DSPARK_MAIN_IN), dtype=torch.bfloat16)
-                        runtime.copy_stacked_from(arguments[PREFILL_TENSORS.index("dspark_target_hidden")], target_hidden)
-                        for name in ("x_hc_out", "pre_mix_out", "logits"):
-                            index = PREFILL_TENSORS.index(name)
-                            value = torch.empty(specs[index].shape, dtype=specs[index].dtype)
-                            runtime.copy_stacked_from(arguments[index], value)
-                            if not torch.isfinite(value).all():
-                                raise AssertionError(f"prefill {name} contains non-finite values")
-            except Exception:
-                if benchmark and trace_path.exists():
-                    print(trace_path.read_text(), file=sys.stderr)
-                raise
-            finally:
-                configure_log(prior_level)
-            if benchmark:
-                stats = _parse_stats_from_strace(trace_path.read_text(), rounds=rounds, warmup=warmup, distributed=True)
-                _report_bench(stats, compiled, l3=True, resident=True)
-            if not torch.isfinite(target_hidden.float()).all():
-                raise AssertionError("DSpark prefill target hidden contains non-finite values")
-            expected_tap = torch.zeros((RANKS, CAPACITY, D), dtype=torch.bfloat16)
-            active_rows = specs[PREFILL_TENSORS.index("counts")].init_value[:, 1].tolist()
-            for rank, count in enumerate(active_rows):
-                expected_tap[rank, :count] = specs[PREFILL_TENSORS.index("embedding")].init_value[rank, :count]
-            for tap, layer in enumerate(DSPARK_TARGET_LAYER_IDS):
-                tap_rows = target_hidden[:, :, tap * D : (tap + 1) * D]
-                if not torch.equal(tap_rows, expected_tap):
-                    raise AssertionError(f"DSpark prefill layer {layer} tap differs from the zero-weight reference")
-            print("[FWD] Execution and all DSpark taps passed the zero-weight reference; full numerical accuracy was not validated.", flush=True)
         if not result.passed:
             raise SystemExit(result.error or 1)

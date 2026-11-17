@@ -7,6 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
+# ci: no-sim
 """DeepSeek-V4.1 Flash vocabulary projection, distributed logits assembly and greedy sampling."""
 
 import sys
@@ -18,9 +19,7 @@ import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 from pypto.runtime import pto_isa_include_dir
 
-from config import EP_SIZE, FLASH as M, LM_HEAD_TP_SIZE, SUPPORTED_LM_HEAD_TP_SIZES
-from hc import hc_head, golden_hc_collapse
-from rmsnorm import rms_norm, golden_rms_norm_tiled
+from config import EP_SIZE, FLASH as M, LM_HEAD_TP_SIZE as MODEL_LM_HEAD_TP_SIZE, SUPPORTED_LM_HEAD_TP_SIZES
 from quant import pack_bf16_nz, unpack_bf16_nz
 
 
@@ -30,7 +29,7 @@ T_DYN = pl.dynamic("LM_HEAD_T_DYN")
 # model config
 D = M.hidden_size
 VOCAB = M.vocab_size
-HC_MULT = M.hc_mult
+
 
 def _parse_int_argv(name, default=None):
     for i, tok in enumerate(sys.argv):
@@ -42,6 +41,7 @@ def _parse_int_argv(name, default=None):
 
 
 # DP groups built by the l3_lm_head fixture; the kernel carries no DP extent.
+LM_HEAD_TP_SIZE = _parse_int_argv("--lm-head-tp", 2) if __name__ == "__main__" else MODEL_LM_HEAD_TP_SIZE
 DP_SIZE = _parse_int_argv("--dp", 1) if __name__ == "__main__" else EP_SIZE // LM_HEAD_TP_SIZE
 WORLD_SIZE = LM_HEAD_TP_SIZE * DP_SIZE if __name__ == "__main__" else EP_SIZE
 VOCAB_PER_TP = VOCAB // LM_HEAD_TP_SIZE
@@ -52,13 +52,12 @@ GROUP_LOGIT_ROWS = LM_HEAD_TP_SIZE * MAX_LOGIT_ROWS
 
 # tiling
 LM_HEAD_M_TILE = 80
-GROUP_M_TILE = min(192, GROUP_LOGIT_ROWS)
-LOGITS_CAST_ROW_TILE = 8
+LM_HEAD_N_TILE = 256
+LM_HEAD_K_TILE = 128
 HIDDEN_OWNER_ROW_TILE = gcd(MAX_LOGIT_ROWS, 48)
 HIDDEN_PUSH_WORKER_TILE = (MAX_LOGIT_ROWS + 64 // LM_HEAD_TP_SIZE - 1) // (64 // LM_HEAD_TP_SIZE)
 HIDDEN_PUSH_ROW_TILE = gcd(HIDDEN_OWNER_ROW_TILE, HIDDEN_PUSH_WORKER_TILE)
 HIDDEN_PUSH_CHUNK_TILE = min(12, HIDDEN_PUSH_ROW_TILE)
-LOGITS_COMM_TILE = 512
 
 # Greedy reduction tiles and first-index selection.
 GREEDY_VOCAB_TILE = 8192
@@ -75,22 +74,6 @@ if __name__ == "__main__" and DP_SIZE < 1:
 
 
 @pl.jit.extern(
-    core_type="aic", source=Path(__file__).parent / "kernels" / "lm_head_projection.cpp",
-    include_dirs=(pto_isa_include_dir(),),
-)
-def _lm_head_projection(
-    hidden_states: pl.Tensor,
-    lm_head_weight: pl.Tensor,
-    logits: pl.Out[pl.Tensor],
-    rows: pl.Scalar[pl.INDEX],
-    vocabulary: pl.Scalar[pl.INDEX],
-    row_tile: pl.Scalar[pl.INDEX],
-) -> pl.Tensor:
-    """Project BF16 hidden states against packed NZ vocabulary weights."""
-    ...
-
-
-@pl.jit.extern(
     core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "lm_head_project_push.cpp",
     aiv_source=Path(__file__).parent / "kernels" / "lm_head_project_push.cpp", dual_aiv_dispatch=True,
     include_dirs=(pto_isa_include_dir(),),
@@ -98,7 +81,7 @@ def _lm_head_projection(
 def _lm_head_project_push(
     hidden_states: pl.Tensor,
     lm_head_weight: pl.Tensor,
-    received: pl.Out[pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.BF16]],
+    received: pl.Out[pld.DistributedTensor],
     tp_rank: pl.Scalar[pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_size: pl.Scalar[pl.INDEX],
@@ -127,160 +110,43 @@ def _lm_head_panel_gather(
 @pl.jit.inline(auto_scope=False)
 def lm_head_project(
     hidden_states: pl.Tensor,
-    lm_head_weight: pl.Tensor[[D, VOCAB_PER_TP], pl.BF16, pl.NZ],
+    lm_head_weight: pl.Tensor[[D, VOCAB], pl.BF16, pl.NZ],
     logits: pl.Tensor,
-    m_tile: pl.constexpr,
 ):
-    """Write vocabulary logits in place and return the completion task."""
+    """Project vocabulary logits with BF16 rounding and FP32 output."""
     rows = pl.tensor.dim(logits, 0)
-    with pl.spmd(32, name_hint="lm_head_matmul") as projected:
-        _lm_head_projection(hidden_states, lm_head_weight, logits, rows, VOCAB_PER_TP, m_tile)
-    return projected
-
-
-@pl.jit.inline(auto_scope=False)
-def lm_head_cast_logits(source: pl.Tensor, logits: pl.Tensor, ready: pl.Scalar[pl.TASK_ID]):
-    """Convert BF16 projection output to public FP32 logits."""
-    rows = pl.tensor.dim(source, 0)
-    columns = pl.tensor.dim(source, 1)
-    column_tiles = (columns + LOGITS_COMM_TILE - 1) // LOGITS_COMM_TILE
-    tiles = (rows + LOGITS_CAST_ROW_TILE - 1) // LOGITS_CAST_ROW_TILE * column_tiles
-    with pl.spmd(32, name_hint="lm_head_cast_logits", deps=[ready]) as converted:
+    hidden_rows = pl.tensor.dim(hidden_states, 0)
+    blocks = (rows + LM_HEAD_M_TILE - 1) // LM_HEAD_M_TILE * (VOCAB // LM_HEAD_N_TILE)
+    with pl.spmd(32, name_hint="lm_head_matmul", optimizations=[pl.cross_core_slot(slot_num=1)]):
         worker = pl.tile.get_block_idx()
-        for tile in pl.range(worker, tiles, 32):
-            row = tile // column_tiles * LOGITS_CAST_ROW_TILE
-            column = tile % column_tiles * LOGITS_COMM_TILE
-            valid_rows = pl.min(LOGITS_CAST_ROW_TILE, rows - row)
-            valid_columns = pl.min(LOGITS_COMM_TILE, columns - column)
-            chunk = pl.slice(source, [LOGITS_CAST_ROW_TILE, LOGITS_COMM_TILE], [row, column], valid_shape=[valid_rows, valid_columns])
-            result = pl.cast(chunk, pl.FP32)
-            logits[row:row + valid_rows, column:column + valid_columns] = result
-    return logits, converted
+        for block in pl.range(worker, blocks, 32):
+            row = block // (VOCAB // LM_HEAD_N_TILE) * LM_HEAD_M_TILE
+            column = block % (VOCAB // LM_HEAD_N_TILE) * LM_HEAD_N_TILE
+            output_rows = pl.min(LM_HEAD_M_TILE, rows - row)
+            source_rows = pl.max(pl.min(LM_HEAD_M_TILE, hidden_rows - row), 0)
+            acc = pl.tile.create([LM_HEAD_M_TILE, LM_HEAD_N_TILE], dtype=pl.FP32)
+            for k in pl.pipeline(0, D, LM_HEAD_K_TILE, stage=2):
+                a = pl.load(hidden_states, [row, k], [LM_HEAD_M_TILE, LM_HEAD_K_TILE], valid_shape=[source_rows, LM_HEAD_K_TILE])
+                a = pl.fillpad(a, pad_value=pl.PadValue.zero)
+                a = pl.set_validshape(a, LM_HEAD_M_TILE, LM_HEAD_K_TILE)
+                w = pl.load(lm_head_weight, [k, column], [LM_HEAD_K_TILE, LM_HEAD_N_TILE], target_memory=pl.MemorySpace.Mat)
+                acc = pl.matmul_acc(acc, a, w, init_cond=(k == 0))
+            rounded = pl.cast(acc, pl.BF16, mode="rint")
+            result = pl.cast(rounded, pl.FP32)
+            value = pl.set_validshape(result, output_rows, LM_HEAD_N_TILE)
+            pl.store(value, [row, column], logits)
 
 
 @pl.jit.inline(auto_scope=False)
-def lm_head(
-    hidden_states: pl.Tensor,
-    lm_head_weight: pl.Tensor[[D, VOCAB_PER_TP], pl.BF16, pl.NZ],
-    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
-    logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
-    hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
-    hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
-    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.BF16],
-    logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    done_epoch: pl.Scalar[pl.INT32],
-    completed_epochs: pl.Scalar[pl.INT32],
-    first_epoch: pl.Scalar[pl.INT32],
-) -> tuple[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32], pl.Scalar[pl.TASK_ID]]:
-    if LM_HEAD_TP_SIZE == 1:
-        selected_hidden = pl.create_tensor([MAX_LOGIT_ROWS, D], dtype=pl.BF16)
-        for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="lm_head_select_rows"):
-            source_row_raw = pl.read(logit_row_indices, [row])
-            hidden_rows = pl.tensor.dim(hidden_states, 0)
-            safe_raw = pl.max(pl.min(source_row_raw, hidden_rows - 1), 0)
-            selected_row = pl.full([1, D], dtype=pl.BF16, value=0.0)
-            if source_row_raw >= 0:
-                source_row = pl.cast(safe_raw, pl.INDEX)
-                selected_row = hidden_states[source_row : source_row + 1, :]
-            selected_hidden[row : row + 1, :] = selected_row
-        local_logits = pl.create_tensor([MAX_LOGIT_ROWS, VOCAB], dtype=pl.BF16)
-        projected = lm_head_project(selected_hidden, lm_head_weight, local_logits, MAX_LOGIT_ROWS)
-        logits, completed = lm_head_cast_logits(local_logits, logits, projected)
-    else:
-        # Selected hidden rows in GM.
-        selected_hidden = pl.create_tensor([MAX_LOGIT_ROWS, D], dtype=pl.BF16)
-
-        with pl.spmd(64, name_hint="lm_head_select_rows") as _select_tid:
-            block = pl.tile.get_block_idx()
-            hidden_rows = pl.tensor.dim(hidden_states, 0)
-            for row in pl.range(block, MAX_LOGIT_ROWS, 64):
-                source_raw = pl.read(logit_row_indices, [row])
-                source = pl.cast(pl.max(pl.min(source_raw, hidden_rows - 1), 0), pl.INDEX)
-                selected = pl.full([1, D], dtype=pl.BF16, value=0.0)
-                if source_raw >= 0:
-                    selected = hidden_states[source:source + 1, :]
-                selected_hidden[row:row + 1, :] = selected
-        with pl.spmd(64, name_hint="lm_head_dispatch_push", deps=[_select_tid]) as _dispatch_push_tid:
-            worker = pl.tile.get_block_idx()
-            row_tiles = MAX_LOGIT_ROWS // HIDDEN_PUSH_ROW_TILE
-            for tile in pl.range(worker, LM_HEAD_TP_SIZE * row_tiles, 64):
-                peer = (tp_rank + tile // row_tiles) % LM_HEAD_TP_SIZE
-                row = tile % row_tiles * HIDDEN_PUSH_ROW_TILE
-                owner_stripe = row // HIDDEN_OWNER_ROW_TILE * LM_HEAD_TP_SIZE + tp_rank
-                destination = owner_stripe * HIDDEN_OWNER_ROW_TILE + row % HIDDEN_OWNER_ROW_TILE
-                pld.tensor.put(
-                    hidden_window, peer=group_base + peer, src=selected_hidden, dst_offsets=[destination, 0],
-                    src_offsets=[row, 0], shape=[HIDDEN_PUSH_ROW_TILE, D], chunk_rows=HIDDEN_PUSH_CHUNK_TILE,
-                    chunk_cols=D, pipeline=True,
-                )
-        with pl.spmd(LM_HEAD_TP_SIZE, name_hint="lm_head_dispatch_notify", deps=[_dispatch_push_tid]) as _dispatch_notify_tid:
-            peer = pl.tile.get_block_idx()
-            if peer != tp_rank:
-                pld.system.notify(
-                    hidden_done, peer=group_base + peer, offsets=[tp_rank, 0], value=64, op=pld.NotifyOp.AtomicAdd,
-                )
-
-        # Wait after all local hidden-row publishes complete.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_dispatch_wait", deps=[_dispatch_push_tid], no_dep_args=[hidden_done], allow_early_resolve=False) as _dwait_tid:
-            for owner_tp in pl.range(LM_HEAD_TP_SIZE):
-                if owner_tp != tp_rank:
-                    pld.system.wait(
-                        signal=hidden_done, offsets=[owner_tp, 0], expected=pl.cast((done_epoch - first_epoch + 1) * 64, pl.INT32),
-                        cmp=pld.WaitCmp.Ge,
-                    )
-
-        with pl.spmd(32, name_hint="lm_head_matmul_push", deps=[_dwait_tid, _dispatch_notify_tid]) as _push_tid:
-            logits_window = _lm_head_project_push(
-                hidden_window, lm_head_weight, logits_window, tp_rank, group_base, LM_HEAD_TP_SIZE,
-                MAX_LOGIT_ROWS, VOCAB_PER_TP, GROUP_M_TILE, HIDDEN_OWNER_ROW_TILE,
-            )
-
-        # Publish one completion update after all vector workers finish their puts.
-        with pl.spmd(LM_HEAD_TP_SIZE, name_hint="lm_head_combine_notify", deps=[_push_tid]) as _notify_tid:
-            owner_tp = pl.tile.get_block_idx()
-            if owner_tp != tp_rank:
-                pld.system.notify(
-                    logits_done, peer=group_base + owner_tp, offsets=[tp_rank, 0], value=64, op=pld.NotifyOp.AtomicAdd,
-                )
-
-        # Wait after all local vocab-shard publishes complete.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_combine_wait", deps=[_push_tid], no_dep_args=[logits_done], allow_early_resolve=False) as _cwait_tid:
-            for src_tp in pl.range(LM_HEAD_TP_SIZE):
-                if src_tp != tp_rank:
-                    pld.system.wait(
-                        signal=logits_done, offsets=[src_tp, 0], expected=pl.cast((done_epoch - first_epoch + 1) * 64, pl.INT32),
-                        cmp=pld.WaitCmp.Ge,
-                    )
-
-        with pl.spmd(64, name_hint="lm_head_combine_gather", deps=[_cwait_tid, _notify_tid]) as _gather_tid:
-            logits = _lm_head_panel_gather(logits_window, logits, LM_HEAD_TP_SIZE, MAX_LOGIT_ROWS, VOCAB_PER_TP)
-
-        # Clear this rank's counters after its final logits-window read.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_signal_clear", deps=[_gather_tid], allow_early_resolve=False) as _clear_tid:
-            anchor = pl.read(logits, [0, 0])
-            if done_epoch == completed_epochs:
-                zero = pl.cast(0, pl.INT32)
-                for peer in pl.range(LM_HEAD_TP_SIZE):
-                    pl.write(hidden_done, [peer, 0], zero)
-                    pl.write(logits_done, [peer, 0], zero)
-            pl.write(logits, [0, 0], anchor)
-        completed = _clear_tid
-
-    return logits, completed
-
-
-@pl.jit.inline
 def greedy_sample(
     logits: pl.Tensor,
     sampled_ids: pl.Tensor,
-    ready: pl.Scalar[pl.TASK_ID] = None,
 ):
     """Select the first maximum token ID for each requested logits row."""
     rows = pl.tensor.dim(sampled_ids, 0)
     workers = pl.min(64, rows)
-    for worker in pl.spmd(workers, name_hint="lm_head_greedy_sample", deps=[ready]):
+    with pl.spmd(workers, name_hint="lm_head_greedy_sample"):
+        worker = pl.tile.get_block_idx()
         ramp = pl.arange(0, [1, GREEDY_ROW_TILE * GREEDY_ROW_TILE], dtype=pl.INT32)
         lane_grid = pl.reshape(ramp, [GREEDY_ROW_TILE, GREEDY_ROW_TILE])
         lane_indices = pl.shr(lane_grid, 3)
@@ -336,113 +202,105 @@ def greedy_sample(
             result = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=0)
             pl.write(result, [0, 0], best_base + index)
             sampled_ids[row : row + 1, :] = result
-    return sampled_ids
 
 
-@pl.jit.extern(
-    core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "lm_head_sample.cpp",
-    aiv_source=Path(__file__).parent / "kernels" / "lm_head_sample.cpp", dual_aiv_dispatch=True,
-    include_dirs=(pto_isa_include_dir(),),
-)
-def _lm_head_sample_partial(
+@pl.jit.inline(auto_scope=False)
+def lm_head(
     hidden_states: pl.Tensor,
-    lm_head_weight: pl.Tensor,
-    partial_values: pl.Out[pl.Tensor],
-    partial_indices: pl.Out[pl.Tensor],
-    active_widths: pl.Tensor,
-    rows: pl.Scalar[pl.INDEX],
-) -> tuple[pl.Tensor, pl.Tensor]:
-    return partial_values, partial_indices
-
-
-@pl.jit.extern(
-    core_type="aiv", source=Path(__file__).parent / "kernels" / "lm_head_sample_merge.cpp",
-    include_dirs=(pto_isa_include_dir(),),
-)
-def _lm_head_sample_merge(
-    partial_values: pl.Tensor,
-    partial_indices: pl.Tensor,
-    sampled_ids: pl.Out[pl.Tensor],
-) -> pl.Tensor:
-    ...
-
-
-@pl.jit.inline(auto_scope=False)
-def lm_head_sample(
-    hidden_states: pl.Tensor,
-    lm_head_weight: pl.Tensor[[D, VOCAB], pl.BF16, pl.NZ],
-    active_widths: pl.Tensor,
-    sampled_ids: pl.Tensor,
-    ready: pl.Scalar[pl.TASK_ID] = None,
-):
-    """Project and greedily sample the bounded TP1 verification rows."""
-    rows = pl.tensor.dim(sampled_ids, 0)
-    partial_values = pl.create_tensor([32, LM_HEAD_M_TILE], dtype=pl.FP32)
-    partial_indices = pl.create_tensor([32, LM_HEAD_M_TILE], dtype=pl.INT32)
-    with pl.spmd(32, name_hint="lm_head_sample_partial", deps=[ready], allow_early_resolve=True) as projected:
-        partial_values, partial_indices = _lm_head_sample_partial(
-            hidden_states, lm_head_weight, partial_values, partial_indices, active_widths, rows,
-        )
-    with pl.spmd((rows + SAMPLED_IDS_PAD - 1) // SAMPLED_IDS_PAD, name_hint="lm_head_sample_merge", deps=[projected]):
-        sampled_ids = _lm_head_sample_merge(partial_values, partial_indices, sampled_ids)
-    return sampled_ids
-
-
-@pl.jit.inline(auto_scope=False)
-def _lm_head_has_rows(logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32]):
-    active = pl.cast(0, pl.INT32)
-    for row in pl.range(MAX_LOGIT_ROWS):
-        if active == 0:
-            source_row = pl.read(logit_row_indices, [row])
-            if source_row >= 0:
-                active = pl.cast(1, pl.INT32)
-    return active
-
-
-@pl.jit.inline(auto_scope=False)
-def _lm_head_zero_outputs(logits: pl.Tensor, sampled_ids: pl.Tensor):
-    with pl.spmd((VOCAB + LOGITS_COMM_TILE - 1) // LOGITS_COMM_TILE, name_hint="lm_head_empty"):
-        block = pl.tile.get_block_idx()
-        col = block * LOGITS_COMM_TILE
-        cols = pl.min(LOGITS_COMM_TILE, VOCAB - col)
-        zeros = pl.tile.full([MAX_LOGIT_ROWS, LOGITS_COMM_TILE], dtype=pl.FP32, value=0.0)
-        valid_zeros = pl.set_validshape(zeros, MAX_LOGIT_ROWS, cols)
-        logits = pl.store(valid_zeros, [0, col], logits)
-        if block == 0:
-            empty_ids = pl.tile.full([MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], dtype=pl.INT32, value=0)
-            sampled_ids = pl.store(empty_ids, [0, 0], sampled_ids)
-    return logits, sampled_ids
-
-
-@pl.jit.inline(auto_scope=False)
-def lm_head_with_sampling(
-    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
     lm_head_weight: pl.Tensor[[D, VOCAB_PER_TP], pl.BF16, pl.NZ],
-    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
-    logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
-    sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
-    hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
+    logit_row_indices: pl.Tensor,
+    logits: pl.Tensor,
+    hidden_window: pld.DistributedTensor,
     hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
-    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.BF16],
+    logits_window: pld.DistributedTensor,
     logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    done_epoch: pl.Scalar[pl.INT32],
-    completed_epochs: pl.Scalar[pl.INT32],
+    rank: pl.Scalar[pl.INT32],
+    num_rows: pl.constexpr,
 ):
-    """Project logits and sample top-1 tokens in one opaque L2 entry."""
-    active = pl.cast(1, pl.INT32)
+    """Project indexed hidden rows with local or TP-sharded weights."""
+    hidden_rows = pl.tensor.dim(hidden_states, 0)
+    group_base = rank // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE
+    tp_rank = rank % LM_HEAD_TP_SIZE
+    selected_hidden = pl.create_tensor([num_rows, D], dtype=pl.BF16)
+    with pl.spmd(64, name_hint="lm_head_select_rows") as selected_ready:
+        block = pl.tile.get_block_idx()
+        for row in pl.range(block, num_rows, 64):
+            source_raw = pl.read(logit_row_indices, [row])
+            source = pl.cast(pl.max(pl.min(source_raw, hidden_rows - 1), 0), pl.INDEX)
+            selected = pl.full([1, D], dtype=pl.BF16, value=0.0)
+            if source_raw >= 0:
+                selected = hidden_states[source:source + 1, :]
+            selected_hidden[row:row + 1, :] = selected
     if LM_HEAD_TP_SIZE == 1:
-        active = _lm_head_has_rows(logit_row_indices)
-    if active > 0:
-        logits, projected = lm_head(
-            hidden_states, lm_head_weight, logit_row_indices, logits, hidden_window, hidden_done,
-            logits_window, logits_done, group_base, tp_rank, done_epoch, completed_epochs, 1,
-        )
-        greedy_sample(logits, sampled_ids, projected)
+        lm_head_project(selected_hidden, lm_head_weight, logits)
     else:
-        logits, sampled_ids = _lm_head_zero_outputs(logits, sampled_ids)
-    return logits, sampled_ids
+        pl.static_assert(num_rows % HIDDEN_OWNER_ROW_TILE == 0, "LM-head owner rows must fill complete interleaved stripes")
+        with pl.spmd(64, name_hint="lm_head_dispatch_push", deps=[selected_ready]) as dispatch_pushed:
+            worker = pl.tile.get_block_idx()
+            row_tiles = num_rows // HIDDEN_PUSH_ROW_TILE
+            for tile in pl.range(worker, LM_HEAD_TP_SIZE * row_tiles, 64):
+                peer = (tp_rank + tile // row_tiles) % LM_HEAD_TP_SIZE
+                row = tile % row_tiles * HIDDEN_PUSH_ROW_TILE
+                owner_stripe = row // HIDDEN_OWNER_ROW_TILE * LM_HEAD_TP_SIZE + tp_rank
+                destination = owner_stripe * HIDDEN_OWNER_ROW_TILE + row % HIDDEN_OWNER_ROW_TILE
+                pld.tensor.put(
+                    hidden_window, peer=group_base + peer, src=selected_hidden, dst_offsets=[destination, 0],
+                    src_offsets=[row, 0], shape=[HIDDEN_PUSH_ROW_TILE, D], chunk_rows=HIDDEN_PUSH_CHUNK_TILE,
+                    chunk_cols=D, pipeline=True,
+                )
+        with pl.spmd(LM_HEAD_TP_SIZE, name_hint="lm_head_dispatch_notify", deps=[dispatch_pushed]) as dispatch_notified:
+            peer = pl.tile.get_block_idx()
+            if peer != tp_rank:
+                pld.system.notify(
+                    hidden_done, peer=group_base + peer, offsets=[tp_rank, 0], value=64, op=pld.NotifyOp.AtomicAdd,
+                )
+
+        # Wait after all local hidden-row publishes complete.
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_dispatch_wait", deps=[dispatch_pushed], no_dep_args=[hidden_done], allow_early_resolve=False) as dispatch_ready:
+            for owner_tp in pl.range(LM_HEAD_TP_SIZE):
+                if owner_tp != tp_rank:
+                    pld.system.wait(
+                        signal=hidden_done, offsets=[owner_tp, 0], expected=pl.cast(64, pl.INT32),
+                        cmp=pld.WaitCmp.Ge,
+                    )
+
+        group_m_tile = pl.min(192, LM_HEAD_TP_SIZE * num_rows)
+        project_tp_rank = pl.cast(tp_rank, pl.INT32)
+        project_group_base = pl.cast(group_base, pl.INT32)
+        with pl.spmd(32, name_hint="lm_head_matmul_push", deps=[dispatch_ready, dispatch_notified]) as logits_pushed:
+            logits_window = _lm_head_project_push(
+                hidden_window, lm_head_weight, logits_window, project_tp_rank, project_group_base, LM_HEAD_TP_SIZE,
+                num_rows, VOCAB_PER_TP, group_m_tile, HIDDEN_OWNER_ROW_TILE,
+            )
+
+        # Publish one completion update after all vector workers finish their puts.
+        with pl.spmd(LM_HEAD_TP_SIZE, name_hint="lm_head_combine_notify", deps=[logits_pushed]) as combine_notified:
+            owner_tp = pl.tile.get_block_idx()
+            if owner_tp != tp_rank:
+                pld.system.notify(
+                    logits_done, peer=group_base + owner_tp, offsets=[tp_rank, 0], value=64, op=pld.NotifyOp.AtomicAdd,
+                )
+
+        # Wait after all local vocab-shard publishes complete.
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_combine_wait", deps=[logits_pushed], no_dep_args=[logits_done], allow_early_resolve=False) as combine_ready:
+            for src_tp in pl.range(LM_HEAD_TP_SIZE):
+                if src_tp != tp_rank:
+                    pld.system.wait(
+                        signal=logits_done, offsets=[src_tp, 0], expected=pl.cast(64, pl.INT32),
+                        cmp=pld.WaitCmp.Ge,
+                    )
+
+        with pl.spmd(64, name_hint="lm_head_combine_gather", deps=[combine_ready, combine_notified]) as gathered:
+            logits = _lm_head_panel_gather(logits_window, logits, LM_HEAD_TP_SIZE, num_rows, VOCAB_PER_TP)
+
+        # Clear this rank's counters after its final logits-window read.
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_signal_clear", deps=[gathered], allow_early_resolve=False):
+            anchor = pl.read(logits, [0, 0])
+            zero = pl.cast(0, pl.INT32)
+            for peer in pl.range(LM_HEAD_TP_SIZE):
+                pl.write(hidden_done, [peer, 0], zero)
+                pl.write(logits_done, [peer, 0], zero)
+            pl.write(logits, [0, 0], anchor)
 
 
 @pl.jit
@@ -451,91 +309,20 @@ def l2_lm_head(
     lm_head_weight: pl.Tensor[[D, VOCAB_PER_TP], pl.BF16, pl.NZ],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
-    sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
     hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.BF16],
     logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    done_epoch: pl.Scalar[pl.INT32],
-    completed_epochs: pl.Scalar[pl.INT32],
+    rank: pl.Scalar[pl.INT32],
 ):
-    """Standalone opaque entry for projection plus greedy sampling tests."""
-    return lm_head_with_sampling(
-        hidden_states, lm_head_weight, logit_row_indices, logits, sampled_ids, hidden_window,
-        hidden_done, logits_window, logits_done, group_base, tp_rank, done_epoch, completed_epochs,
+    """Validate selected-row vocabulary projection."""
+    hidden_states.bind_dynamic(0, T_DYN)
+    lm_head(
+        hidden_states, lm_head_weight, logit_row_indices, logits,
+        hidden_window, hidden_done, logits_window, logits_done,
+        rank, MAX_LOGIT_ROWS,
     )
-
-
-@pl.jit.host
-def l3_final_output(
-    x_hc: pl.Tensor[[WORLD_SIZE, T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[WORLD_SIZE, T_DYN, HC_MULT], pl.FP32],
-    final_norm_weight: pl.Tensor[[WORLD_SIZE, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[WORLD_SIZE, D, VOCAB_PER_TP], pl.BF16],
-    logit_row_indices: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS], pl.INT32],
-    logits: pl.Out[pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
-    sampled_ids: pl.Out[pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
-):
-    """Collapse final HC state, normalize, project and sample. Complete all ranks before reusing windows."""
-    x_hc.bind_dynamic(1, T_DYN)
-    hidden_buffer = pld.alloc_window_buffer([GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-    hidden_done_buffer = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-    logits_buffer = pld.alloc_window_buffer([MAX_LOGIT_ROWS, VOCAB], dtype=pl.BF16)
-    logits_done_buffer = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-    for rank in pl.range(pld.world_size()):
-        hidden_window = pld.window(hidden_buffer, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-        hidden_done = pld.window(hidden_done_buffer, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-        logits_window = pld.window(logits_buffer, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.BF16)
-        logits_done = pld.window(logits_done_buffer, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-        l2_final_output(
-            x_hc[rank], pre_mix[rank], final_norm_weight[rank], lm_head_weight[rank],
-            logit_row_indices[rank], logits[rank], sampled_ids[rank], hidden_window, hidden_done,
-            logits_window, logits_done, rank // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE, rank % LM_HEAD_TP_SIZE,
-            1, 1, device=rank,
-        )
-
-
-def _final_output(
-    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    final_norm_weight: pl.Tensor[[D], pl.BF16],
-    lm_head_weight: pl.Tensor[[D, VOCAB_PER_TP], pl.BF16, pl.NZ],
-    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
-    logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
-    sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
-    hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
-    hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
-    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.BF16],
-    logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    done_epoch: pl.Scalar[pl.INT32],
-    completed_epochs: pl.Scalar[pl.INT32],
-):
-    """Compose final HC, Norm and LM head from the current layer state."""
-    x_hc.bind_dynamic(0, T_DYN)
-    active = pl.cast(1, pl.INT32)
-    if LM_HEAD_TP_SIZE == 1:
-        active = _lm_head_has_rows(logit_row_indices)
-    if active > 0:
-        rows = pl.tensor.dim(x_hc, 0)
-        collapsed = pl.create_tensor([rows, D], dtype=pl.BF16)
-        hc_head(x_hc, pre_mix, collapsed, worker_limit=64)
-        normalized = pl.create_tensor([rows, D], dtype=pl.BF16)
-        rms_norm(collapsed, final_norm_weight, normalized, rows, width=D, zero_tail=False)
-        lm_head_with_sampling(
-            normalized, lm_head_weight, logit_row_indices, logits, sampled_ids, hidden_window, hidden_done,
-            logits_window, logits_done, group_base, tp_rank, done_epoch, completed_epochs,
-        )
-    else:
-        logits, sampled_ids = _lm_head_zero_outputs(logits, sampled_ids)
-    return logits, sampled_ids
-
-
-final_output = pl.jit.inline(_final_output)
-l2_final_output = pl.jit(_final_output)
+    return logits
 
 
 @pl.jit.host
@@ -543,7 +330,6 @@ def l3_lm_head(
     hidden_states: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, D], pl.BF16],
     lm_head_weight: pl.Tensor[[WORLD_SIZE, D, VOCAB_PER_TP], pl.BF16],
     logits: pl.Out[pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
-    sampled_ids: pl.Out[pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     logit_row_indices: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS], pl.INT32],
 ):
     # Windows are group-local: hidden_window holds one row slot per group member,
@@ -559,36 +345,9 @@ def l3_lm_head(
         logits_window = pld.window(logits_window_buf, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.BF16)
         logits_done = pld.window(logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         l2_lm_head(
-            hidden_states[r], lm_head_weight[r], logit_row_indices[r], logits[r], sampled_ids[r],
-            hidden_window, hidden_done, logits_window, logits_done, r // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE,
-            r % LM_HEAD_TP_SIZE, 1, 1, device=r,
+            hidden_states[r], lm_head_weight[r], logit_row_indices[r], logits[r],
+            hidden_window, hidden_done, logits_window, logits_done, r, device=r,
         )
-
-
-@pl.jit(auto_scope=False)
-def lm_head_sample_validation(
-    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[D, VOCAB], pl.BF16, pl.NZ],
-    active_widths: pl.Tensor[[12], pl.INT32],
-    sampled_ids: pl.Out[pl.Tensor[[72, SAMPLED_IDS_PAD], pl.INT32]],
-):
-    ready = pl.system.task_dummy(deps=[])
-    return lm_head_sample(hidden_states, lm_head_weight, active_widths, sampled_ids, ready)
-
-
-def golden_lm_head_sample(tensors):
-    import torch
-
-    hidden = tensors["hidden_states"].float()
-    weight = unpack_bf16_nz(tensors["lm_head_weight"]).float()
-    rounded_logits = torch.matmul(hidden, weight).to(torch.bfloat16).float()
-    ids = torch.argmax(rounded_logits, dim=-1).to(torch.int32)
-    output = tensors["sampled_ids"]
-    output.zero_()
-    rows = min(hidden.shape[0], output.shape[0])
-    row_indices = torch.arange(rows)
-    active = row_indices % 6 < tensors["active_widths"][row_indices // 6]
-    output[:rows, 0] = torch.where(active, ids[:rows], 0)
 
 
 def golden_lm_head(tensors):
@@ -608,64 +367,9 @@ def golden_lm_head(tensors):
                 selected[row].copy_(hidden[owner_rank, source_row])
         full_logits.append(torch.matmul(selected, full_weight).to(torch.bfloat16).float())
     tensors["logits"][:] = torch.stack(full_logits, dim=0)
-    if "sampled_ids" in tensors:
-        tensors["sampled_ids"].zero_()
-        tensors["sampled_ids"][:, :, 0] = torch.argmax(tensors["logits"], dim=-1).to(torch.int32)
 
 
-def golden_final_output(tensors):
-    """Evaluate HC collapse, BF16 Norm and head projection independently on CPU."""
-    import torch
-
-    hidden = []
-    for rank in range(WORLD_SIZE):
-        collapsed = golden_hc_collapse(tensors["x_hc"][rank], tensors["pre_mix"][rank]).to(torch.bfloat16)
-        normalized = golden_rms_norm_tiled(collapsed, tensors["final_norm_weight"][rank])
-        hidden.append(normalized.to(torch.bfloat16))
-    golden_lm_head({**tensors, "hidden_states": torch.stack(hidden)})
-
-
-def build_sample_tensor_specs():
-    import torch
-    from golden import TensorSpec
-
-    tokens = 47
-
-    def init_hidden():
-        hidden = torch.eye(tokens, D, dtype=torch.bfloat16)
-        hidden[:4, tokens] = 1.0 / 1024
-        return hidden
-
-    def init_weight():
-        weight = torch.zeros(D, VOCAB, dtype=torch.bfloat16)
-        for row in range(tokens):
-            if row % 3 == 0:
-                weight[row, 4096 + row] = 2
-                weight[row, 16384 + row] = 2
-            elif row % 3 == 1:
-                weight[row, VOCAB - 1 - row // 3] = 3
-            else:
-                weight[row, 512 * row + 31] = 4
-        # FP32-separated logits that tie after BF16 rounding.
-        for row, token_pair in enumerate(((1, 2), (1, 513), (4096, 16384), (1, VOCAB - 1))):
-            weight[row].zero_()
-            weight[row, token_pair[0]] = 1.0
-            weight[row, token_pair[1]] = 1.0
-            weight[tokens, token_pair[1]] = 1.0
-        return pack_bf16_nz(weight)
-
-    def init_widths():
-        return torch.tensor([6, 3, 0, 1, 5, 2, 6, 6, 6, 0, 4, 6], dtype=torch.int32)
-
-    return [
-        TensorSpec("hidden_states", [tokens, D], torch.bfloat16, init_value=init_hidden),
-        TensorSpec("lm_head_weight", [D, VOCAB], torch.bfloat16, init_value=init_weight),
-        TensorSpec("active_widths", [12], torch.int32, init_value=init_widths),
-        TensorSpec("sampled_ids", [72, SAMPLED_IDS_PAD], torch.int32),
-    ]
-
-
-def build_tensor_specs(num_tokens=MAX_LOGIT_ROWS, *, final=False):
+def build_tensor_specs(num_tokens=MAX_LOGIT_ROWS):
     import torch
     from golden import TensorSpec
 
@@ -682,8 +386,6 @@ def build_tensor_specs(num_tokens=MAX_LOGIT_ROWS, *, final=False):
     def init_logit_row_indices():
         indices = torch.full((WORLD_SIZE, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
         indices[:, :active] = torch.arange(active, dtype=torch.int32)
-        if final and DP_SIZE > 1:
-            indices[-LM_HEAD_TP_SIZE:] = -1
         return indices
 
     specs = [
@@ -691,31 +393,9 @@ def build_tensor_specs(num_tokens=MAX_LOGIT_ROWS, *, final=False):
         # Resident vocabulary shard per world rank.
         TensorSpec("lm_head_weight", [WORLD_SIZE, D, VOCAB_PER_TP], torch.bfloat16, init_value=init_lm_head_weight, resident="stacked"),
         TensorSpec("logits", [WORLD_SIZE, MAX_LOGIT_ROWS, VOCAB], torch.float32),
-        TensorSpec("sampled_ids", [WORLD_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], torch.int32),
         TensorSpec("logit_row_indices", [WORLD_SIZE, MAX_LOGIT_ROWS], torch.int32, init_value=init_logit_row_indices),
     ]
-    if final:
-        specs = [
-            TensorSpec("x_hc", [WORLD_SIZE, MAX_LOGIT_ROWS, HC_MULT, D], torch.float32, init_value=torch.randn),
-            TensorSpec("pre_mix", [WORLD_SIZE, MAX_LOGIT_ROWS, HC_MULT], torch.float32, init_value=torch.rand),
-            TensorSpec("final_norm_weight", [WORLD_SIZE, D], torch.bfloat16, init_value=torch.ones),
-            specs[1], specs[4], specs[2], specs[3],
-        ]
     return specs
-
-
-def compare_sampled_ids(actual, expected, *, actual_outputs, **_):
-    import torch
-
-    logits_ids = torch.zeros_like(actual)
-    logits_ids[:, :, 0] = torch.argmax(actual_outputs["logits"].cpu(), dim=-1).to(torch.int32)
-    if torch.equal(actual, expected) and torch.equal(actual, logits_ids):
-        return True, ""
-    mismatch = actual != expected
-    return False, (
-        f"sampled_ids mismatch: bad={int(mismatch.sum())}/{actual.numel()} "
-        f"actual={actual.tolist()} expected={expected.tolist()}"
-    )
 
 
 if __name__ == "__main__":
@@ -733,69 +413,43 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(WORLD_SIZE)), help=f"comma-separated device ids; need at least {WORLD_SIZE}")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--compile-only", action="store_true", default=False)
-    parser.add_argument("--final-output", action="store_true", help="include final HC collapse and Norm")
-    parser.add_argument("--fused-sample", action="store_true", help="validate only the TP1 fused sampler")
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--save-data", action="store_true")
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
+    if args.execution_mode and LM_HEAD_TP_SIZE > 1:
+        parser.error("fused TP LM head requires A5 hardware; use --lm-head-tp 1 for simulation")
 
     device_ids = [int(d) for d in args.device.split(",")]
-    if args.fused_sample and (args.execution_mode or args.final_output):
-        parser.error("--fused-sample requires device execution without --final-output")
-    required_devices = 1 if args.fused_sample else WORLD_SIZE
-    if len(device_ids) < required_devices:
-        parser.error(f"need at least {required_devices} devices, got {device_ids}")
+    if len(device_ids) < WORLD_SIZE:
+        parser.error(f"need at least {WORLD_SIZE} devices, got {device_ids}")
     if args.lm_head_tp != LM_HEAD_TP_SIZE or args.dp != DP_SIZE:
         parser.error("--lm-head-tp and --dp must match the import-time configuration")
     if not 0 <= args.num_tokens <= MAX_LOGIT_ROWS:
         parser.error(f"--num-tokens must be between 0 and {MAX_LOGIT_ROWS}")
 
-    if not args.fused_sample:
-        result = run(
-            fn=l3_final_output if args.final_output else l3_lm_head,
-            specs=build_tensor_specs(args.num_tokens, final=args.final_output),
-            golden_fn=golden_final_output if args.final_output else golden_lm_head,
-            compare_fn={
-                "logits": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
-                "sampled_ids": compare_sampled_ids,
-            },
-            compile_only=args.compile_only,
-            runtime_dir=args.runtime_dir,
-            golden_data=args.golden_data,
-            save_data=args.save_data,
-            config=dict(
-                dump_passes=args.dump_passes,
-                distributed_config=DistributedConfig( device_ids=device_ids[:required_devices], num_sub_workers=0, ),
-                backend_type=args.backend_type, execution_mode=args.execution_mode,
-                enable_chip_swimlane=args.enable_chip_swimlane,
-            ),
-            rtol=1e-3,
-            atol=1e-3,
-        )
-        if not result.passed:
-            if result.error:
-                print(result.error)
-            raise SystemExit(1)
-
-    # Default device validation also covers the TP1 sampler on the first card.
-    default_sample = not (args.execution_mode or args.final_output or args.runtime_dir)
-    if args.fused_sample or default_sample:
-        result = run(
-            fn=lm_head_sample_validation,
-            specs=build_sample_tensor_specs(),
-            golden_fn=golden_lm_head_sample,
-            compile_only=args.compile_only,
-            runtime_dir=args.runtime_dir if args.fused_sample else None,
-            config=dict(
-                dump_passes=args.dump_passes, backend_type=args.backend_type, execution_mode=False,
-                device_id=device_ids[0], enable_chip_swimlane=args.enable_chip_swimlane,
-            ),
-            rtol=0,
-            atol=0,
-        )
-        if not result.passed:
-            if result.error:
-                print(result.error)
-            raise SystemExit(1)
+    result = run(
+        fn=l3_lm_head,
+        specs=build_tensor_specs(args.num_tokens),
+        golden_fn=golden_lm_head,
+        compare_fn={
+            "logits": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
+        },
+        compile_only=args.compile_only,
+        runtime_dir=args.runtime_dir,
+        golden_data=args.golden_data,
+        save_data=args.save_data,
+        config=dict(
+            dump_passes=args.dump_passes,
+            distributed_config=DistributedConfig(device_ids=device_ids[:WORLD_SIZE], num_sub_workers=0),
+            backend_type=args.backend_type, execution_mode=args.execution_mode,
+            enable_chip_swimlane=args.enable_chip_swimlane,
+        ),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+    if not result.passed:
+        if result.error:
+            print(result.error)
+        raise SystemExit(1)

@@ -50,8 +50,12 @@ uses the shared C1A reuse kernels with ratio-2 metadata.
 
 ## Execution structure
 
-The text forward composes embedding and metadata preparation, the configured
-attention/MoE layer schedule, and final HC head normalization and LM-head output.
+Prefill composes embedding and metadata preparation, the configured attention/MoE
+layer schedule, HC collapse, RMSNorm, vocabulary projection, and greedy sampling
+for the last query row per request. The reusable `decode_fwd` and its L3 entry
+run only the backbone, retaining final HC state and DSpark target taps. DSpark
+composes the output head and sampling after that backbone. `lm_head` writes
+FP32 logits in place; `greedy_sample` and `markov_sample` are separate operations.
 Engram contributes at its configured layers. A layer follows this structure:
 
 ```text
@@ -123,7 +127,7 @@ LM-head TP1, each rank computes its own complete vocabulary projection.
 | Decode attention | Corresponding `decode_swa.py`, `decode_c1a_*` and `decode_c2a_*` files |
 | Layer composition | [`prefill_layer.py`](../../../models/deepseek_v4_1_flash/prefill_layer.py), [`decode_layer.py`](../../../models/deepseek_v4_1_flash/decode_layer.py) |
 | Text forward | [`prefill_fwd.py`](../../../models/deepseek_v4_1_flash/prefill_fwd.py), [`decode_fwd.py`](../../../models/deepseek_v4_1_flash/decode_fwd.py) |
-| Speculative decoding | [`decode_fwd_dspark.py`](../../../models/deepseek_v4_1_flash/decode_fwd_dspark.py), `dspark_drafter.py`, `dspark_state.py`, and sampling helpers |
+| Speculative decoding | [`decode_fwd_dspark.py`](../../../models/deepseek_v4_1_flash/decode_fwd_dspark.py), `dspark_drafter.py`, `dspark_init.py`, `decode_metadata.py`, `dspark_attn.py`, and `markov.py` |
 | Shared operators | `hc.py`, `qkv_proj_rope.py`, `compressor.py`, `sparse_attention.py`, `o_proj.py`, `engram.py`, and `lm_head.py` |
 
 The six standalone decode attention entries accept explicit request starts and
@@ -164,6 +168,8 @@ Use allocated devices for execution and consult each entry's `--help` for its
 options. See the [compile/runtime workflow](../../run-and-validate/compile-runtime-workflow.md)
 and [golden harness](../../run-and-validate/golden-harness.md) for artifact and
 comparison behavior. Standalone operators compare against Torch references.
+The prefill, decode, DSpark decode, and drafter smoke entries use `golden.run`
+without a numerical golden. Multi-stage initialization is owned by `dspark_init.py`.
 Forward smoke fixtures exercise composition and execution; they do not establish
 checkpoint-level generation accuracy or a complete numerical forward golden.
 The configured context ceiling and supported parallel-size choices are not a
