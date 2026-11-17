@@ -1691,9 +1691,13 @@ def build_single_layer_tensor_specs(
     ]
 
 
+# fixture
+DEFAULT_GROUP_TOKENS = TP_SIZE * (T + 1)
+
+
 def build_tensor_specs(
     start_pos=0,
-    num_tokens=TP_SIZE * T,
+    num_tokens=DEFAULT_GROUP_TOKENS,
     ori_block_num=CSA_ORI_BLOCK_NUM,
     hca_cmp_block_num=HCA_CMP_BLOCK_NUM,
     csa_cmp_block_num=CSA_CMP_BLOCK_NUM,
@@ -2244,7 +2248,7 @@ def main():
     parser.add_argument("--start-pos", type=int, default=0)
     parser.add_argument(
         "--num-tokens", type=int, default=None,
-        help=f"B1 prompt tokens per TP/CP group; defaults to {TP_SIZE * T}. ragged2 is fixed at 7.",
+        help=f"B1 prompt tokens per TP/CP group; defaults to {DEFAULT_GROUP_TOKENS}. ragged2 is fixed at 7.",
     )
     parser.add_argument(
         "--case", choices=["b1", "ragged2"], default="b1",
@@ -2293,7 +2297,7 @@ def main():
     if args.case == "ragged2" and args.start_pos != 0:
         parser.error("--case ragged2 has fixed request starts and requires --start-pos 0")
     if args.num_tokens is None:
-        args.num_tokens = 7 if args.case == "ragged2" else TP_SIZE * T
+        args.num_tokens = 7 if args.case == "ragged2" else DEFAULT_GROUP_TOKENS
     if args.case == "ragged2" and args.num_tokens != 7:
         parser.error("--case ragged2 has a fixed logical extent and requires --num-tokens 7")
     if args.num_tokens < 1 or args.num_tokens > PREFILL_GROUP_CAP:
