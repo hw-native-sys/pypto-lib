@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
 # ci: no-sim
-"""DeepSeek-V4.1-Flash 40-layer decode with final HC, RMSNorm, logits and greedy sampling."""
+"""DeepSeek-V4.1-Flash 40-layer decode backbone with retained HC state."""
 
 import argparse
 import pypto.language as pl
@@ -45,7 +45,6 @@ from decode_c2a_full import decode_c2a_full
 from decode_c2a_reuse import decode_c2a_reuse
 from decode_swa import decode_swa
 from input_pack import prepare_compressed_lens
-from lm_head import GROUP_LOGIT_ROWS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD, VOCAB, VOCAB_PER_TP, final_output
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
 from engram import ENGRAM_K, KV_OUT, engram_from_rows
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
@@ -746,16 +745,8 @@ def _l2_decode_fwd(
     shared_w1_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
     shared_w2_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
     shared_w3_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
-    final_norm_weight: pl.Tensor[[D], pl.BF16],
-    lm_head_weight: pl.Tensor[[D, VOCAB_PER_TP], pl.BF16, pl.NZ],
-    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
-    logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
-    sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
-    hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
-    hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
-    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.BF16],
-    logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
 ):
+    """Run the decode backbone and retain final HC state in the input buffers."""
     compressed_token_rope_cos = pl.create_tensor([DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
     compressed_token_rope_sin = pl.create_tensor([DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
     encoder_hidden, encoder_pre_mix, token_cos, token_sin = decode_encoder(
@@ -826,13 +817,7 @@ def _l2_decode_fwd(
         routed_w1_scale, routed_w2_scale, routed_w3_scale,
         shared_w1_scale, shared_w2_scale, shared_w3_scale,
     )
-    final_logits, final_sampled_ids = final_output(
-        result, encoder_pre_mix, final_norm_weight, lm_head_weight,
-        logit_row_indices, logits, sampled_ids,
-        hidden_window, hidden_done, logits_window, logits_done,
-        rank // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE, rank % LM_HEAD_TP_SIZE, 1, 1,
-    )
-    return final_logits, final_sampled_ids
+    return result, encoder_pre_mix
 
 decode_fwd = pl.jit.inline(auto_scope=False)(_l2_decode_fwd)
 l2_decode_fwd = pl.jit(auto_scope=False)(_l2_decode_fwd)
@@ -930,11 +915,6 @@ def l3_decode_fwd(
     shared_w3_scale: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     attention_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
-    final_norm_weight: pl.Tensor[[EP_SIZE, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[EP_SIZE, D, VOCAB_PER_TP], pl.BF16],
-    logit_row_indices: pl.Tensor[[EP_SIZE, MAX_LOGIT_ROWS], pl.INT32],
-    logits: pl.Out[pl.Tensor[[EP_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
-    sampled_ids: pl.Out[pl.Tensor[[EP_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
 ):
     """Run SWA with base RoPE and C2A/C1A with compressed-profile RoPE.
 
@@ -974,12 +954,8 @@ def l3_decode_fwd(
     Decode uses padded 80-row local x_hc/pre_mix slabs, with up to 72 active rows.
     Idle ranks use zero counts, -1 publication slots and empty query ranges;
     they still participate in EP collectives. Each new token starts from its
-    embedding and identity pre-mix. After layer 39, final HC collapse and
-    RMSNorm feed the TP-sharded LM head and greedy sampler. logit_row_indices
-    selects up to MAX_LOGIT_ROWS rank-local rows; -1 produces zero logits and
-    sampled ID zero, which the caller ignores, including on idle ranks.
-    x_hc/pre_mix retain the final layer state; logits, sampled_ids and the three
-    DSpark target-layer hidden states are outputs.
+    embedding and identity pre-mix. After layer 39, x_hc/pre_mix retain the
+    final HC state. The three DSpark target-layer hidden states are also outputs.
 
     Retain cache allocations and page ownership until runtime completion, then
     commit lengths before the next call. Completed forwards clear MoE signals;
@@ -1014,10 +990,6 @@ def l3_decode_fwd(
     combine_arrived_buffer = pld.alloc_window_buffer(
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
     )
-    head_hidden_buffer = pld.alloc_window_buffer([GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-    head_hidden_done_buffer = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-    head_logits_buffer = pld.alloc_window_buffer([MAX_LOGIT_ROWS, VOCAB], dtype=pl.BF16)
-    head_logits_done_buffer = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
         recv_meta = pld.window(recv_meta_buffer, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buffer, [N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], dtype=pl.INT8)
@@ -1035,10 +1007,6 @@ def l3_decode_fwd(
             [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD],
             dtype=pl.INT32,
         )
-        head_hidden = pld.window(head_hidden_buffer, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-        head_hidden_done = pld.window(head_hidden_done_buffer, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-        head_logits = pld.window(head_logits_buffer, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.BF16)
-        head_logits_done = pld.window(head_logits_done_buffer, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         l2_decode_fwd(
             engram_lookup[rank], engram_wkv[rank], engram_wkv_scale[rank], engram_weight[rank],
             x_hc[rank], pre_mix[rank], dspark_target_hidden[rank],
@@ -1072,13 +1040,10 @@ def l3_decode_fwd(
             index_wq_b_scale[rank],
             routed_w1_scale[rank], routed_w2_scale[rank], routed_w3_scale[rank],
             shared_w1_scale[rank], shared_w2_scale[rank], shared_w3_scale[rank],
-            final_norm_weight[rank], lm_head_weight[rank],
-            logit_row_indices[rank],
-            logits[rank], sampled_ids[rank],
-            head_hidden, head_hidden_done, head_logits, head_logits_done,
             device=rank,
         )
-    return logits, sampled_ids, dspark_target_hidden
+    return dspark_target_hidden
+
 
 
 import inspect
@@ -1175,11 +1140,6 @@ def build_tensor_specs():
             )
         elif name in ("moe_num_tokens", "attention_num_tokens"):
             init_value = torch.full(shape, FIXTURE_TOKENS, dtype=torch.int32)
-        elif name == "logit_row_indices":
-            init_value = torch.full(shape, -1, dtype=torch.int32)
-            init_value[:, :FIXTURE_BATCH] = query_starts[1:] - 1
-        elif name == "final_norm_weight":
-            init_value = 1.0
         elif name == "correction_bias":
             init_value = _route_bias().repeat(EP_SIZE, WEIGHT_BANK_SIZE)
         elif name.endswith("_scale"):
@@ -1189,9 +1149,7 @@ def build_tensor_specs():
 
 
 if __name__ == "__main__":
-    from utils import upload_forward_inputs
-    from golden import normalize_config, run
-    from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
+    from golden import run
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser()
@@ -1235,35 +1193,8 @@ if __name__ == "__main__":
         fn=l3_decode_fwd,
         specs=specs,
         config=config,
-        compile_only=True,
+        golden_fn=None,
+        compile_only=args.compile_only,
     )
-    if result.passed and not args.compile_only:
-        cfg = normalize_config(config)
-        compiled = DistributedCompiledProgram.from_dir(
-            result.work_dir, backend_type=cfg.backend_type, execution_mode=cfg.execution_mode,
-            distributed_config=cfg.distributed_config,
-        )
-        replicated = ('moe_num_tokens', 'attention_num_tokens')
-        host_inputs = {spec.name: spec.create_tensor().share_memory_() for spec in specs if spec.name in replicated}
-        output_names = ("logits", "sampled_ids")
-        host_outputs = {spec.name: spec.create_tensor().share_memory_() for spec in specs if spec.name in output_names}
-        upload_buffer = torch.empty(64 * 1024**2, dtype=torch.uint8).share_memory_()
-        inherited = [*host_inputs.values(), *host_outputs.values(), upload_buffer]
-        with compiled.prepare(cfg, persistent=True, reset_persistent_windows=False, inherited_host_tensors=inherited) as runtime:
-            parameters = compiled._get_metadata()[0]
-            arguments = upload_forward_inputs(runtime, specs, parameters, len(devices), host_inputs, upload_buffer)
-            runtime(*arguments, config=cfg)
-            stacked = dict(zip((spec.name for spec in specs), arguments, strict=True))
-            for name, tensor in host_outputs.items():
-                runtime.copy_stacked_from(stacked[name], tensor)
-        row_spec = next(spec for spec in specs if spec.name == "logit_row_indices")
-        inactive_rows = row_spec.create_tensor() < 0
-        if torch.count_nonzero(host_outputs["logits"][inactive_rows]).item():
-            raise RuntimeError("inactive decode logit rows must be zero")
-        if torch.count_nonzero(host_outputs["sampled_ids"][inactive_rows]).item():
-            raise RuntimeError("inactive decode sampled-id rows must be zero")
-        if torch.count_nonzero(host_outputs["sampled_ids"][:, :, 1:]).item():
-            raise RuntimeError("decode sampled-id padding must be zero")
-        print("[FWD] Execution and head output checks passed; numerical accuracy was not validated.", flush=True)
     if not result.passed:
         raise SystemExit(result.error or 1)
