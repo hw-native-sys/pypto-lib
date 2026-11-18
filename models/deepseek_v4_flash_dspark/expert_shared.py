@@ -19,6 +19,8 @@ amax+rescale of the same tokens.
 """
 
 
+from math import gcd
+
 import pypto.language as pl
 
 from config import (FLASH as M, MOE_TOKENS, INT8_SCALE_MAX, INT8_AMAX_EPS)
@@ -31,78 +33,63 @@ MOE_INTER = M.moe_intermediate_size
 SWIGLU_LIMIT = M.swiglu_limit
 
 # tiling
-SH_M_TILE = 64
+SH_M_TILE = 128 if T % 128 == 0 else (max(16, gcd(T, 64)) if T > 64 else 64)
 SH_ROW_PAD = 8
-SH_ROWS_PER_BLOCK = 2
 T_PAD = ((T + SH_M_TILE - 1) // SH_M_TILE) * SH_M_TILE
-# Decode (T <= SH_M_TILE, single partial block) or prefill (T a multiple of
-# SH_M_TILE, fully valid blocks); a T that is neither would need a dynamic
-# per-block row count the static valid_shape below can't express.
-assert T <= SH_M_TILE or T % SH_M_TILE == 0, \
-    "expert_shared needs T <= SH_M_TILE (decode) or T a multiple of SH_M_TILE (prefill)"
 SH_VALID_M = T if T < SH_M_TILE else SH_M_TILE
+SH_ROWS_PER_BLOCK = gcd(SH_ROW_PAD, SH_VALID_M, T)
 N_MTILES = T_PAD // SH_M_TILE
 assert SH_VALID_M % SH_ROWS_PER_BLOCK == 0
 
-K_TILE = 1024
+K_TILE = 512
 INTER_K = 512
 MM_INTER_TILE = 128
-SH_MM_BLOCKS = 6
+SH_MM_BLOCKS = 16 if SH_M_TILE == 128 else 8
 ACT_INTER_TILE = 1024
-D_OUT_TILE = 256
+D_OUT_TILE = 128 if SH_M_TILE == 128 or T % SH_M_TILE != 0 else 256
+W2_PIPE_SLOTS = 1 if SH_M_TILE == 128 else 2
 W2_INNER = 2
 # h_tile_i8 stores use a whole number of a2a3 512-byte L2 cache lines.
 QUANT_TILE = 2048
-D_OUT_TILE_ACT = 128
-W2_ACT_INNER = 8
 
 
 def _expert_shared(
     x_local_i8: pl.Tensor[[T, D], pl.INT8],
     x_local_scale_dq: pl.Tensor[[T, 1], pl.FP32],
-    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
     # One M-tile of SH_M_TILE rows per iteration.
     for mt in pl.parallel(N_MTILES):
         ts0 = mt * SH_M_TILE
+        valid_m = SH_VALID_M
+        if T > SH_M_TILE and T % SH_M_TILE != 0:
+            valid_m = pl.min(SH_M_TILE, T - ts0)
 
         gate_i32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT32)
         up_i32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT32)
 
-        # gate (w1) cube matmul -> INT32 GM accumulator.
-        for nb_idx in pl.spmd(
-            SH_MM_BLOCKS,
-            name_hint="sh_gate_mm",
-            allow_early_resolve=True,
-        ):
+        # Paired gate/up projections with a shared input tile.
+        for nb_idx in pl.spmd(SH_MM_BLOCKS, name_hint="sh_gate_up_mm", allow_early_resolve=True):
             for ng in pl.range(nb_idx, MOE_INTER // MM_INTER_TILE, SH_MM_BLOCKS):
                 n0 = ng * MM_INTER_TILE
-                gate_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
-                for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-                    xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[SH_VALID_M, K_TILE])
+                xs_first = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, 0], valid_shape=[valid_m, K_TILE])
+                sw1_first = shared_w1[n0 : n0 + MM_INTER_TILE, 0:K_TILE]
+                sw3_first = shared_w3[n0 : n0 + MM_INTER_TILE, 0:K_TILE]
+                gate_acc = pl.matmul(xs_first, sw1_first, b_trans=True, out_dtype=pl.INT32)
+                up_acc = pl.matmul(xs_first, sw3_first, b_trans=True, out_dtype=pl.INT32)
+                for k0 in pl.pipeline(K_TILE, D, K_TILE, stage=2):
+                    xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[valid_m, K_TILE])
                     sw1_k = shared_w1[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
-                    gate_acc = pl.matmul_acc(gate_acc, xs_k, sw1_k, b_trans=True, init_cond=(k0 == 0))
-                gate_i32[:, n0 : n0 + MM_INTER_TILE] = gate_acc
-
-        # up (w3) cube matmul -> INT32 GM accumulator.
-        for nb_idx in pl.spmd(
-            SH_MM_BLOCKS,
-            name_hint="sh_up_mm",
-            allow_early_resolve=True,
-        ):
-            for ng in pl.range(nb_idx, MOE_INTER // MM_INTER_TILE, SH_MM_BLOCKS):
-                n0 = ng * MM_INTER_TILE
-                up_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
-                for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-                    xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[SH_VALID_M, K_TILE])
                     sw3_k = shared_w3[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
-                    up_acc = pl.matmul_acc(up_acc, xs_k, sw3_k, b_trans=True, init_cond=(k0 == 0))
+                    gate_acc = pl.matmul_acc(gate_acc, xs_k, sw1_k, b_trans=True)
+                    up_acc = pl.matmul_acc(up_acc, xs_k, sw3_k, b_trans=True)
+                gate_i32[:, n0 : n0 + MM_INTER_TILE] = gate_acc
                 up_i32[:, n0 : n0 + MM_INTER_TILE] = up_acc
 
         # Each AIV block owns SH_ROWS_PER_BLOCK rows across the intermediate axis.
@@ -120,7 +107,7 @@ def _expert_shared(
                 mode="trunc",
             )
         for row_block in pl.spmd(
-            SH_VALID_M // SH_ROWS_PER_BLOCK,
+            valid_m // SH_ROWS_PER_BLOCK,
             name_hint="sh_gate_up_act_q",
             allow_early_resolve=True,
         ):
@@ -225,12 +212,12 @@ def _expert_shared(
                     0:SH_ROWS_PER_BLOCK, :
                 ]
 
-        # w2 (down) cube matmul -> INT32 GM accumulator.
-        y_i32 = pl.create_tensor([SH_M_TILE, D], dtype=pl.INT32)
+        # W2 matmul, dequantization, and BF16 output.
         for db_idx in pl.spmd(
             D // (W2_INNER * D_OUT_TILE),
             name_hint="sh_w2_mm",
             allow_early_resolve=True,
+            optimizations=[pl.cross_core_slot(slot_num=W2_PIPE_SLOTS)],
         ):
             d_base = db_idx * (W2_INNER * D_OUT_TILE)
             for dg in pl.range(W2_INNER):
@@ -242,27 +229,30 @@ def _expert_shared(
                         d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K
                     ]
                     y_acc = pl.matmul_acc(y_acc, hs_k, sw2_k, b_trans=True, init_cond=(k0 == 0))
-                y_i32[:, d0 : d0 + D_OUT_TILE] = y_acc
-        # Dequant w2 output (per-row h scale x per-channel w2 scale) -> BF16.
-        for db_idx in pl.spmd(
-            D // (W2_ACT_INNER * D_OUT_TILE_ACT),
-            name_hint="sh_w2_act",
-            allow_early_resolve=True,
-        ):
-            d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)
-            h_scale = pl.row_max(h_tile_scale_dq[:, :])
-            for dg in pl.pipeline(W2_ACT_INNER, stage=2):
-                d0 = d_base + dg * D_OUT_TILE_ACT
-                y_2d_i32 = y_i32[:, d0 : d0 + D_OUT_TILE_ACT]
-                w2_scale_chunk = pl.reshape(shared_w2_scale[d0 : d0 + D_OUT_TILE_ACT], [1, D_OUT_TILE_ACT])
-                y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
-                y_2d = pl.col_expand_mul(
-                    pl.row_expand_mul(y_2d, h_scale), w2_scale_chunk
-                )
-                # Write valid rows straight to the (unpadded) output, mirroring
-                # expert_routed's direct recv_y store; no sh_pad round-trip.
-                y_bf16 = pl.cast(y_2d, target_type=pl.BF16, mode="rint")
-                sh[ts0 : ts0 + SH_VALID_M, d0 : d0 + D_OUT_TILE_ACT] = y_bf16[0:SH_VALID_M, :]
+                if T % SH_M_TILE == 0:
+                    for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                        y_shard = pl.aiv_shard(y_acc)
+                        row = lane * (SH_M_TILE // 2)
+                        out_row = ts0 + row
+                        h_scale = pl.row_max(h_tile_scale_dq[row : row + SH_M_TILE // 2, :])
+                        w2_scale = pl.reshape(shared_w2_scale[d0 : d0 + D_OUT_TILE], [1, D_OUT_TILE])
+                        y_fp32 = pl.cast(y_shard, target_type=pl.FP32, mode="none")
+                        y_scaled = pl.row_expand_mul(y_fp32, h_scale)
+                        y_dequant = pl.col_expand_mul(y_scaled, w2_scale)
+                        y_bf16 = pl.cast(y_dequant, target_type=pl.BF16, mode="rint")
+                        sh[out_row : out_row + SH_M_TILE // 2, d0 : d0 + D_OUT_TILE] = y_bf16
+                else:
+                    h_scale_full = pl.row_max(h_tile_scale_dq[:, :])
+                    w2_scale_full = pl.reshape(shared_w2_scale[d0 : d0 + D_OUT_TILE], [1, D_OUT_TILE])
+                    y_fp32_full = pl.cast(y_acc, target_type=pl.FP32, mode="none")
+                    y_scaled_full = pl.row_expand_mul(y_fp32_full, h_scale_full)
+                    y_dequant_full = pl.col_expand_mul(y_scaled_full, w2_scale_full)
+                    y_bf16_full = pl.cast(y_dequant_full, target_type=pl.BF16, mode="rint")
+                    if T > SH_M_TILE:
+                        y_valid = pl.slice(y_bf16_full, [SH_M_TILE, D_OUT_TILE], [0, 0], valid_shape=[valid_m, D_OUT_TILE])
+                        sh = pl.assemble(sh, y_valid, [ts0, d0])
+                    else:
+                        sh[ts0 : ts0 + SH_VALID_M, d0 : d0 + D_OUT_TILE] = y_bf16_full[0:SH_VALID_M, :]
 
     # The @pl.inline parser requires inline call expressions to have a return
     # value; sh is convenient because it's already pl.Out.
@@ -278,13 +268,14 @@ def golden_expert_shared(tensors):
 
     Input is the per-token INT8 quant produced by gate (shared with
     dispatch / routed expert); we dequant inside to match the kernel's
-    dequant-then-matmul pattern."""
-    from utils import int8_quant_per_row
+    dequant-then-matmul pattern. The shared weights arrive in FRACTAL_NZ
+    order, as the kernel declares them."""
+    from utils import int8_quant_per_row, unpack_nz
     import torch
     import torch.nn.functional as F
 
     def dequant_w(w_i8, w_scale):
-        return w_i8.to(torch.float32) * w_scale.unsqueeze(-1)
+        return unpack_nz(w_i8).to(torch.float32) * w_scale.unsqueeze(-1)
 
     x_local_i8 = tensors["x_local_i8"]                       # [T, D] int8
     x_local_scale_dq = tensors["x_local_scale_dq"].float()   # [T, 1]
@@ -318,9 +309,13 @@ def gen_shared_weight(shape, dequant_std, chan_cv):
     expert_routed.gen_routed_weight.)
 
     ``shape`` last dim = reduction (in) dim; leading dims map to the per-output-channel
-    scale shape ([out, in] -> scale [out]).
+    scale shape ([out, in] -> scale [out]). The returned INT8 weight comes back in
+    FRACTAL_NZ order, matching what the kernel declares; the golden reads it back through
+    ``unpack_nz``.
     """
     import torch
+
+    from utils import pack_nz
 
     FP8_MAX, TINY = 448.0, 1e-20
 
@@ -337,7 +332,7 @@ def gen_shared_weight(shape, dequant_std, chan_cv):
     scale = amax / INT8_SCALE_MAX
     w_i8 = torch.round(Wq / scale).clamp_(-INT8_SCALE_MAX, INT8_SCALE_MAX).to(torch.int8)
     scale = (scale * (dequant_std / (w_i8.float() * scale).std())).squeeze(-1).float()
-    return w_i8, scale
+    return pack_nz(w_i8), scale
 
 
 def build_tensor_specs():
@@ -376,8 +371,8 @@ if __name__ == "__main__":
     from golden import ratio_reldiff, run
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
@@ -393,7 +388,8 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         config=dict(
             dump_passes=args.dump_passes,
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),

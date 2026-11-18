@@ -1,0 +1,403 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""Prefill MoE preparation, bounded route tiles and ordered per-token combine."""
+
+import pypto.language as pl
+import pypto.language.distributed as pld
+from .prefill_moe_geometry import GATE_WINDOW_ROWS, N_RANKS, PREFILL_MOE_OWNER_PREPARE, OWNER_WINDOW_ROWS, PREP_OWNER_ROWS
+from .prefill_owner_prepare import exchange_preparation
+from .prefill_parallel_route import parallel_route_metadata
+from .prefill_moe_geometry import PREFILL_MOE_PARALLEL_ROUTE
+from .prefill_hc_pre import hc_pre_with_input_ready as hc_pre
+from .prefill_moe_gate import gate, ROUTE_ROW_PAD
+from .prefill_moe_expert import expert_routed_persistent_planned
+from .prefill_moe_geometry import (
+    D, HC_DIM, HC_MULT, IDX_PAD, MIX_HC, MOE_INTER, N_BANK, N_EXPERTS, N_ROUTES,
+    PREFILL_MOE_EXPERT_AFFINITY, EXPERT_IDS_PAD, N_SLOTS_B, RECV_MAX, SHARED_EID, SHARED_TILES, SH_SLOT, T, TOPK, VOCAB, WORK_SLOTS_PAD,
+    PREFILL_MOE_BATCHED_GATHER, GATHER_TOKEN_TILE, SHARED_GATHER_T_TILE, PREFILL_MOE_COMBINE_ROWS, PREFILL_MOE_LOCAL_ROUTE_STATE,
+)
+
+
+@pl.jit.inline
+def route_group(
+    indices: pl.Tensor[[T, ROUTE_ROW_PAD], pl.INT32],
+    weights: pl.Tensor[[T, ROUTE_ROW_PAD], pl.FP32],
+    x_norm_i8: pl.Tensor[[T, D], pl.INT8],
+    x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
+
+    recv_x: pl.Tensor[[N_SLOTS_B, RECV_MAX, D], pl.INT8],
+    recv_scale: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
+    recv_w: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
+    work_slot: pl.Tensor[[WORK_SLOTS_PAD], pl.INT32],
+    work_rows: pl.Tensor[[WORK_SLOTS_PAD], pl.INT32],
+    slot_expert: pl.Tensor[[N_SLOTS_B, IDX_PAD], pl.INT32],
+    route_slot_row: pl.Tensor[[N_ROUTES, IDX_PAD], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    preparation_ready: pl.Scalar[pl.TASK_ID],
+):
+    """Group routes into bounded sixteen-row expert tiles and shared tiles."""
+    recv_x_flat = pl.reshape(recv_x, [N_SLOTS_B * RECV_MAX, D])
+    expert_slot = pl.create_tensor([1, N_EXPERTS], dtype=pl.INT32, manual_dep=True)
+    work_slot_2d = pl.reshape(work_slot, [1, WORK_SLOTS_PAD])
+    work_rows_2d = pl.reshape(work_rows, [1, WORK_SLOTS_PAD])
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_table_init", allow_early_resolve=True) as init_tid:
+        expert_slot[:, :] = pl.full([1, N_EXPERTS], dtype=pl.INT32, value=-1)
+        work_slot_2d[:, :] = pl.full([1, WORK_SLOTS_PAD], dtype=pl.INT32, value=0)
+        work_rows_2d[:, :] = pl.full([1, WORK_SLOTS_PAD], dtype=pl.INT32, value=0)
+        for slot_t0 in pl.range(0, N_SLOTS_B, 64):
+            slot_rows = pl.min(64, N_SLOTS_B - slot_t0)
+            zero_experts = pl.tile.full([64, IDX_PAD], dtype=pl.INT32, value=0)
+            valid_experts = pl.set_validshape(zero_experts, slot_rows, IDX_PAD)
+            pl.store(valid_experts, [slot_t0, 0], slot_expert)
+            zero_scales = pl.tile.full([64, RECV_MAX], dtype=pl.FP32, value=0.0)
+            valid_scales = pl.set_validshape(zero_scales, slot_rows, RECV_MAX)
+            pl.store(valid_scales, [slot_t0, 0], recv_scale)
+            zero_weights = pl.tile.full([64, RECV_MAX], dtype=pl.FP32, value=0.0)
+            valid_weights = pl.set_validshape(zero_weights, slot_rows, RECV_MAX)
+            pl.store(valid_weights, [slot_t0, 0], recv_w)
+        for route_t0 in pl.range(0, N_ROUTES, 64):
+            route_rows = pl.min(64, N_ROUTES - route_t0)
+            zero_routes = pl.tile.full([64, IDX_PAD], dtype=pl.INT32, value=0)
+            valid_routes = pl.set_validshape(zero_routes, route_rows, IDX_PAD)
+            pl.store(valid_routes, [route_t0, 0], route_slot_row)
+
+        slot_expert[SH_SLOT : SH_SLOT + SHARED_TILES, :] = pl.full(
+            [SHARED_TILES, IDX_PAD], dtype=pl.INT32, value=SHARED_EID)
+
+    active_tokens = pl.cast(num_tokens, pl.INDEX)
+    if active_tokens < 0:
+        active_tokens = pl.cast(0, pl.INDEX)
+    if active_tokens > T:
+        active_tokens = pl.cast(T, pl.INDEX)
+
+
+    route_completed = pl.array.create(1, pl.TASK_ID)
+    route_completed[0] = init_tid
+    if PREFILL_MOE_PARALLEL_ROUTE != 0:
+        parallel_done = parallel_route_metadata(indices, weights, x_norm_scale, recv_scale, recv_w, work_slot, work_rows, slot_expert, route_slot_row, active_tokens, init_tid, preparation_ready)
+        route_completed[0] = parallel_done
+    else:
+        with pl.spmd(1, name_hint="route_group_scalar", allow_early_resolve=True, deps=[init_tid, preparation_ready]) as legacy_scalar_tid:
+            scalar_core = pl.tile.get_block_idx()
+            if PREFILL_MOE_LOCAL_ROUTE_STATE != 0:
+                local_experts = pl.tile.full([1, N_EXPERTS], dtype=pl.INT32, value=-1)
+                local_rows = pl.tile.full([1, WORK_SLOTS_PAD], dtype=pl.INT32, value=0)
+                local_slots = pl.tile.full([1, WORK_SLOTS_PAD], dtype=pl.INT32, value=0)
+                next_slot = pl.cast(0, pl.INDEX)
+                for token in pl.range(scalar_core, active_tokens):
+                    token_scale = pl.read(x_norm_scale, [token, 0])
+                    for k in pl.range(TOPK):
+                        expert_id = pl.read(indices, [token, k])
+                        expert_col = pl.cast(expert_id, pl.INDEX)
+                        slot = pl.read(local_experts, [0, expert_col])
+                        if slot >= 0:
+                            occupied = pl.read(local_rows, [0, pl.cast(slot, pl.INDEX)])
+                            if occupied >= RECV_MAX:
+                                slot = pl.const(-1, pl.INT32)
+                        if slot < 0:
+                            slot = pl.cast(next_slot, pl.INT32)
+                            pl.write(local_experts, [0, expert_col], slot)
+                            pl.write(slot_expert, [next_slot, 0], expert_id)
+                            pl.write(local_slots, [0, next_slot], slot)
+                            next_slot = next_slot + 1
+                        slot_row = pl.cast(slot, pl.INDEX)
+                        count = pl.read(local_rows, [0, slot_row])
+                        count_col = pl.cast(count, pl.INDEX)
+                        pl.write(local_rows, [0, slot_row], pl.cast(count + 1, pl.INT32))
+                        pl.write(recv_scale, [slot_row, count_col], token_scale)
+                        pl.write(recv_w, [slot_row, count_col], pl.read(weights, [token, k]))
+                        route = token * TOPK + k
+                        pl.write(route_slot_row, [route, 0], pl.cast(slot * RECV_MAX + count, pl.INT32))
+                    shared_slot = SH_SLOT + token // RECV_MAX
+                    shared_row = token % RECV_MAX
+                    pl.write(recv_scale, [shared_slot, shared_row], token_scale)
+                    pl.write(recv_w, [shared_slot, shared_row], pl.cast(1.0, pl.FP32))
+                for shared_tile in pl.range(SHARED_TILES):
+                    shared_count = pl.min(RECV_MAX, pl.max(active_tokens - shared_tile * RECV_MAX, 0))
+                    pl.write(local_slots, [0, next_slot + shared_tile], pl.cast(SH_SLOT + shared_tile, pl.INT32))
+                    pl.write(local_rows, [0, next_slot + shared_tile], pl.cast(shared_count, pl.INT32))
+                pl.store(local_slots, [0, 0], work_slot_2d)
+                pl.store(local_rows, [0, 0], work_rows_2d)
+            else:
+                next_slot = pl.cast(0, pl.INDEX)
+                for token in pl.range(scalar_core, active_tokens):
+                    token_scale = pl.read(x_norm_scale, [token, 0])
+                    for k in pl.range(TOPK):
+                        expert_id = pl.read(indices, [token, k])
+                        expert_col = pl.cast(expert_id, pl.INDEX)
+                        slot = pl.read(expert_slot, [0, expert_col])
+                        if slot >= 0:
+                            occupied = pl.read(work_rows, [pl.cast(slot, pl.INDEX)])
+                            if occupied >= RECV_MAX:
+                                slot = pl.const(-1, pl.INT32)
+                        if slot < 0:
+                            slot = pl.cast(next_slot, pl.INT32)
+                            pl.write(expert_slot, [0, expert_col], slot)
+                            pl.write(slot_expert, [next_slot, 0], expert_id)
+                            pl.write(work_slot, [next_slot], slot)
+                            next_slot = next_slot + 1
+                        slot_row = pl.cast(slot, pl.INDEX)
+                        count = pl.read(work_rows, [slot_row])
+                        count_col = pl.cast(count, pl.INDEX)
+                        pl.write(work_rows, [slot_row], pl.cast(count + 1, pl.INT32))
+                        pl.write(recv_scale, [slot_row, count_col], token_scale)
+                        pl.write(recv_w, [slot_row, count_col], pl.read(weights, [token, k]))
+                        route = token * TOPK + k
+                        pl.write(route_slot_row, [route, 0], pl.cast(slot * RECV_MAX + count, pl.INT32))
+    
+                    shared_slot = SH_SLOT + token // RECV_MAX
+                    shared_row = token % RECV_MAX
+                    pl.write(recv_scale, [shared_slot, shared_row], token_scale)
+                    pl.write(recv_w, [shared_slot, shared_row], pl.cast(1.0, pl.FP32))
+                for shared_tile in pl.range(SHARED_TILES):
+                    shared_count = pl.min(RECV_MAX, pl.max(active_tokens - shared_tile * RECV_MAX, 0))
+                    pl.write(work_slot, [next_slot + shared_tile], pl.cast(SH_SLOT + shared_tile, pl.INT32))
+                    pl.write(work_rows, [next_slot + shared_tile], pl.cast(shared_count, pl.INT32))
+
+
+        route_completed[0] = legacy_scalar_tid
+    scalar_tid = route_completed[0]
+
+    if PREFILL_MOE_BATCHED_GATHER != 0:
+        routed_blocks = (T + GATHER_TOKEN_TILE - 1) // GATHER_TOKEN_TILE
+        shared_blocks = (T + SHARED_GATHER_T_TILE - 1) // SHARED_GATHER_T_TILE
+        with pl.spmd(routed_blocks + shared_blocks, name_hint="route_gather_batched", allow_early_resolve=True, deps=[scalar_tid]):
+            gather_block = pl.tile.get_block_idx()
+            if gather_block < routed_blocks:
+                token_begin = gather_block * GATHER_TOKEN_TILE
+                token_end = pl.min(token_begin + GATHER_TOKEN_TILE, active_tokens)
+                for gather_token in pl.range(token_begin, token_end):
+                    source_row = x_norm_i8[gather_token:gather_token + 1, :]
+                    for route_index in pl.range(TOPK):
+                        route_id = gather_token * TOPK + route_index
+                        destination = pl.cast(pl.read(route_slot_row, [route_id, 0]), pl.INDEX)
+                        recv_x_flat[destination:destination + 1, :] = source_row
+            else:
+                shared_begin = (gather_block - routed_blocks) * SHARED_GATHER_T_TILE
+                shared_rows = pl.min(SHARED_GATHER_T_TILE, T - shared_begin)
+                shared_value = pl.slice(x_norm_i8, [SHARED_GATHER_T_TILE, D], [shared_begin, 0], valid_shape=[shared_rows, D])
+                shared_destination = SH_SLOT * RECV_MAX + shared_begin
+                recv_x_flat[shared_destination:shared_destination + SHARED_GATHER_T_TILE, :] = shared_value
+    else:
+        with pl.spmd(T + 1, name_hint="route_gather", allow_early_resolve=True, deps=[scalar_tid]) as _gather_tid:
+            blk = pl.tile.get_block_idx()
+            if blk < T:
+                if blk < active_tokens:
+                    for k in pl.range(TOPK):
+                        dst_row = pl.cast(pl.read(route_slot_row, [blk * TOPK + k, 0]), pl.INDEX)
+                        recv_x_flat[dst_row : dst_row + 1, :] = x_norm_i8[blk : blk + 1, :]
+            else:
+                sh_base = pl.cast(SH_SLOT * RECV_MAX, pl.INDEX)
+                for shared_t0 in pl.range(0, T, 8):
+                    recv_x_flat[sh_base + shared_t0 : sh_base + shared_t0 + 8, :] = x_norm_i8[shared_t0 : shared_t0 + 8, :]
+
+
+@pl.jit.inline
+def combine_local(
+    recv_y: pl.Tensor[[N_SLOTS_B, RECV_MAX, D], pl.BF16],
+    route_slot_row: pl.Tensor[[N_ROUTES, IDX_PAD], pl.INT32],
+    ffn_partial: pl.Tensor[[T, D], pl.FP32],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """ffn_partial[t] = recv_y[SH_SLOT, t] + Sigma_k recv_y[route_slot_row[t * TOPK + k]].
+
+    The shared expert's row is just the first summand: it came out of the same
+    kernel, in the same layout, so it needs no separate operand."""
+    recv_y_flat = pl.reshape(recv_y, [N_SLOTS_B * RECV_MAX, D])
+
+    active_tokens = pl.cast(num_tokens, pl.INDEX)
+    if active_tokens < 0:
+        active_tokens = pl.cast(0, pl.INDEX)
+    if active_tokens > T:
+        active_tokens = pl.cast(T, pl.INDEX)
+
+    combine_blocks = (T + PREFILL_MOE_COMBINE_ROWS - 1) // PREFILL_MOE_COMBINE_ROWS
+    with pl.spmd(combine_blocks, name_hint="shared_routed", allow_early_resolve=True):
+        combine_block = pl.tile.get_block_idx()
+        token_begin = combine_block * PREFILL_MOE_COMBINE_ROWS
+        token_end = pl.min(token_begin + PREFILL_MOE_COMBINE_ROWS, T)
+        for t in pl.range(token_begin, token_end):
+            if t < active_tokens:
+                sh_row = pl.cast(SH_SLOT * RECV_MAX + t, pl.INDEX)
+                acc = pl.cast(recv_y_flat[sh_row : sh_row + 1, :], target_type=pl.FP32)
+                for k in pl.range(TOPK):
+                    src_row = pl.cast(pl.read(route_slot_row, [t * TOPK + k, 0]), pl.INDEX)
+                    acc = pl.add(acc, pl.cast(recv_y_flat[src_row : src_row + 1, :], target_type=pl.FP32))
+                ffn_partial[t : t + 1, :] = acc
+            else:
+                ffn_partial[t : t + 1, :] = pl.full([1, D], dtype=pl.FP32, value=0.0)
+
+@pl.jit.inline(auto_scope=False)
+def prepare_moe(
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
+    input_ids: pl.Tensor[[T], pl.INT64],
+    layer_id: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    gate_window: pld.DistributedTensor[[GATE_WINDOW_ROWS, N_EXPERTS], pl.FP32],
+    gate_signal: pld.DistributedTensor[[N_RANKS, 16], pl.INT32],
+    gate_rank: pl.Scalar[pl.INT32],
+    gate_epoch: pl.Scalar[pl.INT32],
+    previous_gate: pl.Scalar[pl.TASK_ID],
+    owner_norm_window: pld.DistributedTensor[[OWNER_WINDOW_ROWS, D], pl.INT8],
+    owner_scale_window: pld.DistributedTensor[[1, OWNER_WINDOW_ROWS], pl.FP32],
+    owner_post_window: pld.DistributedTensor[[1, OWNER_WINDOW_ROWS * HC_MULT], pl.FP32],
+    owner_comb_window: pld.DistributedTensor[[OWNER_WINDOW_ROWS, HC_MULT * HC_MULT], pl.FP32],
+    owner_indices_window: pld.DistributedTensor[[OWNER_WINDOW_ROWS, 16], pl.INT32],
+    owner_weights_window: pld.DistributedTensor[[OWNER_WINDOW_ROWS, 16], pl.FP32],
+    residual_ready: pl.Scalar[pl.TASK_ID] = None,
+):
+    post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32, manual_dep=True)
+    comb_ffn = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
+    x_norm_i8 = pl.create_tensor([T, D], dtype=pl.INT8)
+    x_norm_scale = pl.create_tensor([T, 1], dtype=pl.FP32, manual_dep=True)
+    indices = pl.create_tensor([T, ROUTE_ROW_PAD], dtype=pl.INT32)
+    weights = pl.create_tensor([T, ROUTE_ROW_PAD], dtype=pl.FP32)
+    prepared = pl.array.create(1, pl.TASK_ID)
+    prepared[0] = previous_gate
+    if PREFILL_MOE_OWNER_PREPARE != 0:
+        owner_offset = pl.cast(gate_rank, pl.INDEX) * PREP_OWNER_ROWS
+        owner_hc = pl.slice(x_hc, [PREP_OWNER_ROWS, HC_MULT, D], [owner_offset, 0, 0])
+        owner_ids = pl.slice(input_ids, [PREP_OWNER_ROWS], [owner_offset])
+        owner_mixed = pl.create_tensor([PREP_OWNER_ROWS, D], dtype=pl.BF16)
+        owner_post = pl.create_tensor([PREP_OWNER_ROWS, HC_MULT], dtype=pl.FP32)
+        owner_comb = pl.create_tensor([PREP_OWNER_ROWS, HC_MULT * HC_MULT], dtype=pl.FP32)
+        owner_norm = pl.create_tensor([PREP_OWNER_ROWS, D], dtype=pl.INT8)
+        owner_scale = pl.create_tensor([PREP_OWNER_ROWS, 1], dtype=pl.FP32)
+        owner_indices = pl.create_tensor([PREP_OWNER_ROWS, ROUTE_ROW_PAD], dtype=pl.INT32)
+        owner_weights = pl.create_tensor([PREP_OWNER_ROWS, ROUTE_ROW_PAD], dtype=pl.FP32)
+        hc_pre(owner_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, owner_mixed, owner_post, owner_comb, residual_ready)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_owner_route_padding_init"):
+            owner_indices[:, :] = pl.full([PREP_OWNER_ROWS, ROUTE_ROW_PAD], dtype=pl.INT32, value=0)
+            owner_weights[:, :] = pl.full([PREP_OWNER_ROWS, ROUTE_ROW_PAD], dtype=pl.FP32, value=0.0)
+        owner_gate_weights, owner_gate_done = gate(owner_mixed, norm_w, gate_w, gate_bias, layer_id, pl.const(PREP_OWNER_ROWS, pl.INT32), tid2eid, owner_ids, owner_norm, owner_scale, owner_indices, owner_weights, gate_window, gate_signal, gate_rank, gate_epoch, previous_gate)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_owner_hc_completion") as owner_hc_done:
+            pl.write(owner_post, [0, 0], pl.read(owner_post, [0, 0]))
+            pl.write(owner_comb, [0, 0], pl.read(owner_comb, [0, 0]))
+        owner_fields_done = pl.system.task_dummy(deps=[owner_gate_done, owner_hc_done])
+        owner_collected = exchange_preparation(owner_norm, owner_scale, owner_post, owner_comb, owner_indices, owner_weights, x_norm_i8, x_norm_scale, post_ffn, comb_ffn, indices, weights, owner_norm_window, owner_scale_window, owner_post_window, owner_comb_window, owner_indices_window, owner_weights_window, gate_signal, gate_rank, gate_epoch, owner_fields_done, previous_gate)
+        prepared[0] = owner_collected
+    else:
+        x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+        hc_pre(
+            x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+            x_mixed, post_ffn, comb_ffn, residual_ready,
+        )
+
+        gate_weights, legacy_gate_finished = gate(
+            x_mixed, norm_w, gate_w, gate_bias,
+            layer_id, num_tokens, tid2eid, input_ids,
+            x_norm_i8, x_norm_scale, indices, weights,
+            gate_window, gate_signal, gate_rank, gate_epoch, previous_gate,
+        )
+
+        prepared[0] = legacy_gate_finished
+    gate_finished = prepared[0]
+
+    recv_x = pl.create_tensor([N_SLOTS_B, RECV_MAX, D], dtype=pl.INT8)
+    recv_scale = pl.create_tensor([N_SLOTS_B, RECV_MAX], dtype=pl.FP32)
+    recv_w = pl.create_tensor([N_SLOTS_B, RECV_MAX], dtype=pl.FP32)
+    work_slot = pl.create_tensor([WORK_SLOTS_PAD], dtype=pl.INT32)
+    work_rows = pl.create_tensor([WORK_SLOTS_PAD], dtype=pl.INT32)
+    slot_expert = pl.create_tensor([N_SLOTS_B, IDX_PAD], dtype=pl.INT32)
+    route_slot_row = pl.create_tensor([N_ROUTES, IDX_PAD], dtype=pl.INT32)
+    route_group(
+        indices, weights, x_norm_i8, x_norm_scale,
+        recv_x, recv_scale, recv_w, work_slot, work_rows, slot_expert, route_slot_row,
+        num_tokens, gate_finished,
+    )
+    return post_ffn, comb_ffn, recv_x, recv_scale, recv_w, work_slot, work_rows, slot_expert, route_slot_row, gate_finished
+
+
+@pl.jit.inline
+
+def _prefill_expert_affinity_plan(
+    work_slot: pl.Tensor[[WORK_SLOTS_PAD], pl.INT32],
+    work_rows: pl.Tensor[[WORK_SLOTS_PAD], pl.INT32],
+    slot_expert: pl.Tensor[[N_SLOTS_B, IDX_PAD], pl.INT32],
+):
+    """Group independent physical tiles by expert without changing their rows."""
+    heads = pl.create_tensor([1, EXPERT_IDS_PAD], dtype=pl.INT32)
+    tails = pl.create_tensor([1, EXPERT_IDS_PAD], dtype=pl.INT32)
+    counts = pl.create_tensor([1, EXPERT_IDS_PAD], dtype=pl.INT32)
+    links = pl.create_tensor([1, WORK_SLOTS_PAD], dtype=pl.INT32)
+    slots = pl.create_tensor([1, WORK_SLOTS_PAD], dtype=pl.INT32)
+    rows = pl.create_tensor([1, WORK_SLOTS_PAD], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_expert_affinity_plan"):
+        for expert_init in pl.range(EXPERT_IDS_PAD):
+            pl.write(heads, [0, expert_init], pl.const(-1, pl.INT32))
+            pl.write(tails, [0, expert_init], pl.const(-1, pl.INT32))
+            pl.write(counts, [0, expert_init], pl.const(0, pl.INT32))
+        for work_init in pl.range(WORK_SLOTS_PAD):
+            pl.write(links, [0, work_init], pl.const(-1, pl.INT32))
+            pl.write(slots, [0, work_init], pl.const(0, pl.INT32))
+            pl.write(rows, [0, work_init], pl.const(0, pl.INT32))
+        for work in pl.range(WORK_SLOTS_PAD):
+            active_rows = pl.read(work_rows, [work])
+            if active_rows > 0:
+                slot = pl.cast(pl.read(work_slot, [work]), pl.INDEX)
+                expert = pl.cast(pl.read(slot_expert, [slot, 0]), pl.INDEX)
+                tail = pl.read(tails, [0, expert])
+                if tail < 0:
+                    pl.write(heads, [0, expert], pl.cast(work, pl.INT32))
+                else:
+                    pl.write(links, [0, pl.cast(tail, pl.INDEX)], pl.cast(work, pl.INT32))
+                pl.write(tails, [0, expert], pl.cast(work, pl.INT32))
+                pl.write(counts, [0, expert], pl.cast(pl.read(counts, [0, expert]) + 1, pl.INT32))
+        output_work = pl.cast(0, pl.INDEX)
+        for expert in pl.range(N_BANK):
+            cursor = pl.cast(pl.read(heads, [0, expert]), pl.INDEX)
+            tiles = pl.cast(pl.read(counts, [0, expert]), pl.INDEX)
+            for step in pl.range(tiles):
+                pl.write(slots, [0, output_work], pl.read(work_slot, [cursor]))
+                pl.write(rows, [0, output_work], pl.read(work_rows, [cursor]))
+                cursor = pl.cast(pl.read(links, [0, cursor]), pl.INDEX)
+                output_work = output_work + 1
+    return pl.reshape(slots, [WORK_SLOTS_PAD]), pl.reshape(rows, [WORK_SLOTS_PAD])
+
+
+@pl.jit.inline(auto_scope=False)
+def moe_local(
+    recv_x: pl.Tensor[[N_SLOTS_B, RECV_MAX, D], pl.INT8],
+    recv_scale: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
+    recv_w: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
+    work_slot: pl.Tensor[[WORK_SLOTS_PAD], pl.INT32],
+    work_rows: pl.Tensor[[WORK_SLOTS_PAD], pl.INT32],
+    slot_expert: pl.Tensor[[N_SLOTS_B, IDX_PAD], pl.INT32],
+    route_slot_row: pl.Tensor[[N_ROUTES, IDX_PAD], pl.INT32],
+    routed_w1: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_BANK, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_BANK, D], pl.FP32],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    recv_y = pl.create_tensor([N_SLOTS_B, RECV_MAX, D], dtype=pl.BF16)
+    planned_slot = work_slot
+    planned_rows = work_rows
+    if PREFILL_MOE_EXPERT_AFFINITY != 0:
+        planned_slot, planned_rows = _prefill_expert_affinity_plan(work_slot, work_rows, slot_expert)
+    expert_routed_persistent_planned(
+        recv_x, recv_scale, recv_w, planned_slot, planned_rows, slot_expert,
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+        routed_w2, routed_w2_scale,
+        recv_y,
+    )
+
+    ffn_partial = pl.create_tensor([T, D], dtype=pl.FP32)
+    combine_local(recv_y, route_slot_row, ffn_partial, num_tokens)
+    return ffn_partial

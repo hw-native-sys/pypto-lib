@@ -245,7 +245,7 @@ gained instead of the whole forward:
    a bench loop.
 
 Mechanism:
-[Timing one stage of a full network](performance-tuning.md#timing-one-stage-of-a-full-network-task-timing-slots).
+[Timing one stage of a full network](task-timing-slots.md).
 Report both numbers — the end-to-end delta decides whether it ships, the slot
 window explains why it moved.
 

@@ -139,9 +139,9 @@ def _split(which: int, t: int, hg: int, d: int, chunk: int, weights: str | None)
     """q (0) or k (1) out of the conv output: the chain keeps only their normed forms."""
     import torch
 
-    import reference
+    import block_reference
 
-    src = reference.block_inputs("qkv_conv", t, QWEN3_8_27B, chunk, weights=weights)
+    src = block_reference.block_inputs("qkv_conv", t, QWEN3_8_27B, chunk, weights=weights)
     width = hg * d
 
     def load():
@@ -154,9 +154,9 @@ def _split(which: int, t: int, hg: int, d: int, chunk: int, weights: str | None)
 def _proj(key: str, t: int, chunk: int, weights: str | None):
     import torch
 
-    import reference
+    import block_reference
 
-    src = reference.block_inputs(key, t, QWEN3_8_27B, chunk, weights=weights)
+    src = block_reference.block_inputs(key, t, QWEN3_8_27B, chunk, weights=weights)
     return lambda: src().to(torch.bfloat16)
 
 
@@ -194,7 +194,7 @@ def build_tensor_specs(t: int = T, h: int = H, hg: int = HG, d: int = D,
 
 def compare_against_reference(t: int, chunk: int, weights: str | None):
     """Report each output's distance from the float64 reference beside the golden gate."""
-    import reference
+    import block_reference
 
     def make(key, transform=None):
         def compare(actual, expected, **kw):
@@ -202,7 +202,7 @@ def compare_against_reference(t: int, chunk: int, weights: str | None):
 
             gate = ratio_allclose(atol=3e-3, rtol=3e-3, max_error_ratio=0.02)
             ok, detail = gate(actual, expected, **kw)
-            ref = reference.block_inputs(key, t, QWEN3_8_27B, chunk, weights=weights)()
+            ref = block_reference.block_inputs(key, t, QWEN3_8_27B, chunk, weights=weights)()
             if transform is not None:
                 ref = transform(ref)
             dev = actual.double().reshape(ref.shape)

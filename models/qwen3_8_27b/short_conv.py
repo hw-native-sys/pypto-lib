@@ -122,9 +122,9 @@ def _pad_input(t: int, c: int, k: int, chunk: int, weights: str | None):
     """The projection output with k-1 zero rows in front, bf16. -> [T + k - 1, C]."""
     import torch
 
-    import reference
+    import block_reference
 
-    src = reference.block_inputs("qkv", t, QWEN3_8_27B, chunk, weights=weights)
+    src = block_reference.block_inputs("qkv", t, QWEN3_8_27B, chunk, weights=weights)
 
     def load():
         x = src().to(torch.bfloat16)
@@ -165,13 +165,13 @@ def compare_y(t: int, chunk: int, weights: str | None):
     """The bf16 gate, plus the distance from the float64 reference the roadmap set."""
     from golden import ratio_allclose
 
-    import reference
+    import block_reference
 
     gate = ratio_allclose(atol=3e-3, rtol=3e-3, max_error_ratio=0.02)
 
     def compare(actual, expected, **kw):
         ok, detail = gate(actual, expected, **kw)
-        ref = reference.block_inputs("qkv_conv", t, QWEN3_8_27B, chunk, weights=weights)()
+        ref = block_reference.block_inputs("qkv_conv", t, QWEN3_8_27B, chunk, weights=weights)()
         dev = actual.double()
         max_abs = float((dev - ref).abs().max())
         frob = float((dev - ref).norm() / ref.norm())

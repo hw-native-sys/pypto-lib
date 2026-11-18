@@ -137,7 +137,7 @@ Four opt-outs, from narrowest to widest. Each is an assertion the compiler
 |-----------|--------------------|-------------------|
 | `pl.at(..., no_dep_args=[t])` | One tensor, one task | the `gate_up_dual_proj` scope in `models/qwen3_14b/decode_layer_a8w8.py` |
 | `pl.no_dep(t)` at a call argument | One tensor, one task (`@pl.program` form) | — |
-| `pl.create_tensor(..., manual_dep=True)` | One tensor, its whole lifetime | `post_ffn` in `models/deepseek_v4_pro/moe.py` |
+| `pl.create_tensor(..., manual_dep=True)` | One tensor, its whole lifetime | `post_ffn` in `models/deepseek_v4_flash_dspark/moe.py` |
 | `with pl.manual_scope():` | Every task in the region | `_decode_layer` in `models/qwen3_14b/decode_fwd.py` |
 
 Prefer the narrowest one that expresses the claim. `manual_scope` says "I own
@@ -157,6 +157,40 @@ observable:
 | `explicit` | A declared `deps=` edge; `arg` is `-1` because it belongs to no argument slot |
 
 An edge you expected but cannot find in `deps.json` does not exist at run time.
+
+### Ordered tasks can still lack allocation retention
+
+The task that allocates scratch storage and the task that last writes its
+contents can be different. Keep both identities when auditing a manual scope:
+
+```text
+allocation creator  ---- owns ---->  scratch storage
+                                         ^
+                                         | writes / reads
+gather writer  ------ deps ------>  attention consumer  ------>  merge
+```
+
+The lower execution chain can be complete while a consumer has no retention
+relationship to the original allocation. On runtimes that reclaim the heap
+during execution, dropping the allocation's remaining ownership references
+can make that storage reusable before its consumers finish. Check the actual
+runtime's lifetime rules and `creator` edges; an arbitrary transitive execution
+path or a missing creator edge alone does not prove when storage was reclaimed.
+
+A concrete example is the DSpark HCA Prefill path in
+[`prefill_sparse_attn.py`](../../models/deepseek_v4_flash_dspark/prefill_sparse_attn.py):
+`_hca_streaming_attn_tile()` and its `_sparse_attn_o_proj()` helper changed from
+`pl.manual_scope()` to `pl.scope()` to restore automatic scratch retention.
+The existing explicit dependencies, tensor-level manual-dependency choices,
+and early-resolve hints remained. Both scope changes were needed because AUTO
+cannot nest inside MANUAL. This is a local ownership repair, not a rule that
+every manual scope is unsafe.
+
+Validate such a repair with repeated cold dispatches and numerical/cache
+checks. AUTO can add both creator retention and TensorMap ordering, so compare
+both before attributing a successful experiment exclusively to retention.
+A producer timeout or later reference assertion alone does not establish an
+observed overwrite, and a larger heap can merely change when the bug appears.
 
 ## What happens at run time
 
@@ -251,7 +285,15 @@ waiting for — is settled by two artifacts and their join.
 | `chip_swimlane_records.json` | `--enable-chip-swimlane` | Per-task timing and scheduler/orchestrator phases; **no** edges |
 | `name_map*.json` | Compile | Callable id → source name |
 | `dispatch_program.json` | Compile | Which program a dispatch directory belongs to |
-| `merged_swimlane*.json` | `swimlane_converter` | The two joined, for Perfetto |
+| `merged_swimlane*.json` | `swimlane_converter` | Optional joined trace for Perfetto |
+
+For visual inspection, prefer opening `chip_swimlane_records.json` directly
+with the PyPTO3 Toolkit VSCode extension from the
+[`hw-native-sys/pypto-tools` repository](https://github.com/hw-native-sys/pypto-tools).
+Keep the
+matching `deps.json` and `name_map*.json` in the same dispatch directory.
+See [viewer instructions](performance-tuning.md#capture). The merged trace
+is a secondary option for Perfetto.
 
 Timing and topology are deliberately separate: per-task fanout on the device
 hot path would cost a ~1 KB GM store and a linked-list walk per task. The
@@ -533,8 +575,7 @@ with non-deterministic indices — the signature of a race, not of a numerics
 bug. The live fix is a no-op self-copy that marks the parameter `inout` before
 the gather, so the writeback takes a WAW edge on it; `add_inout` is a
 param-level property, so one tile touch is enough. See the `kv_touch` scope in
-`models/deepseek_v4_pro/decode_sparse_attn.py` and its siblings in the
-`_csa` variants.
+`models/deepseek_v4_flash_mtp/decode_sparse_attn_csa.py`.
 
 **A GM round-trip registered as `add_output`.** A GM tensor written by one task
 and read by a later one must be registered on the producing task as

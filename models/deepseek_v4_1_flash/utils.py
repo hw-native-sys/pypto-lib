@@ -1,0 +1,258 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""Metadata lowering and shared validation helpers for prefill and decode."""
+
+import torch
+
+
+import config as C
+from config import BLOCK_SIZE, FLASH as M
+from golden import ScalarSpec
+
+
+def parse_decode_startpos(value):
+    """Parse one absolute starting position per request."""
+    import argparse
+
+    try:
+        positions = [int(item) for item in value.split(",")]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("start-pos must be a comma-separated list of integers") from error
+    if not positions:
+        raise argparse.ArgumentTypeError("start-pos must contain at least one position")
+    max_start = M.max_position_embeddings - 1
+    if any(position < 0 or position > max_start for position in positions):
+        raise argparse.ArgumentTypeError(f"positions must be in [0, {max_start}]")
+    return positions
+
+
+def parse_decode_query_lens(value):
+    """Parse positive query lengths in request order."""
+    import argparse
+
+    try:
+        lengths = [int(item) for item in value.split(",")]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("query-lens must be a comma-separated list of integers") from error
+    if any(length <= 0 for length in lengths):
+        raise argparse.ArgumentTypeError("query-lens must contain positive lengths")
+    return lengths
+
+
+def configure_decode_workload(args, parser):
+    """Resolve query lengths, packed token count, and absolute position bounds."""
+    if args.startpos is None:
+        if args.query_lens is not None:
+            parser.error("--query-lens requires --start-pos")
+        return
+    args.requests = len(args.startpos)
+    if args.query_lens is None:
+        args.query_lens = [C.DECODE_SEQ] * args.requests
+    if len(args.query_lens) != args.requests:
+        parser.error("--query-lens must contain one length per --start-pos value")
+    args.tokens = sum(args.query_lens)
+    ends = [pos + length for pos, length in zip(args.startpos, args.query_lens)]
+    if max(ends) > M.max_position_embeddings:
+        parser.error("a query block exceeds max_position_embeddings")
+
+
+def parse_prefill_groups(value):
+    """Parse comma-separated request values, with semicolons separating DP groups."""
+    import argparse
+
+    try:
+        return [[int(item) for item in group.split(",")] for group in value.split(";")]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("use comma-separated integers and semicolons between DP groups") from error
+
+
+def prefill_batch_layout(args):
+    """Resolve independent per-DP request lengths and absolute starting positions."""
+    lengths = getattr(args, "query_lens", None)
+    counts = getattr(args, "dp_tokens", None)
+    if lengths is None:
+        counts = counts if counts is not None else [args.tokens] * args.dp
+        requests = getattr(args, "requests", 1)
+        if requests < 1 or len(counts) != args.dp:
+            raise ValueError("requests must be positive and dp-tokens must contain one count per DP")
+        lengths = [[count // requests + (index < count % requests) for index in range(requests)] for count in counts]
+    elif len(lengths) == 1:
+        lengths = lengths * args.dp
+    if len(lengths) != args.dp or any(not group for group in lengths):
+        raise ValueError("query-lens must provide one nonempty request list per DP, or one list to broadcast")
+    if counts is not None and [sum(group) for group in lengths] != list(counts):
+        raise ValueError("dp-tokens must equal the sum of query-lens in each DP")
+    if any(n < 0 for group in lengths for n in group) or any(sum(group) > args.tokens for group in lengths):
+        raise ValueError("request lengths must be nonnegative and fit the per-DP token capacity")
+    if C.CP_SIZE > 1 and any(len(group) != 1 for group in lengths):
+        raise ValueError("CP > 1 requires one prefill request per DP group")
+    starts = getattr(args, "start_pos", None)
+    if starts is None:
+        starts = [[127 if getattr(args, "case", "normal") == "prefix" else 0] * len(group) for group in lengths]
+    elif len(starts) == 1:
+        starts = starts * args.dp
+    if len(starts) != args.dp or any(len(p) != len(q) for p, q in zip(starts, lengths)):
+        raise ValueError("start-pos must match each DP group's request list")
+    if any(p < 0 or p + n > M.max_position_embeddings for ps, ns in zip(starts, lengths) for p, n in zip(ps, ns)):
+        raise ValueError("each request must fit max_position_embeddings")
+    return lengths, starts
+
+
+def prefill_fixture_lengths(lengths, tokens):
+    """Append physical padding to the final request in a packed fixture."""
+    padded = list(lengths)
+    padded[-1] += tokens - sum(padded)
+    return padded
+
+
+def prefill_window_pages(lengths, starts):
+    """Count the paged SWA fixture's retained and current rows, including its spare page."""
+    return 1 + sum((p + n + 128) // 128 - max(0, p - 127) // 128 + 1 for p, n in zip(starts, lengths))
+
+
+def packed_query_lengths(tokens, requests, query_lens=None):
+    """Use explicit request lengths or a balanced packed token split."""
+    if query_lens is None:
+        return [tokens // requests + (index < tokens % requests) for index in range(requests)]
+    if len(query_lens) != requests or sum(query_lens) != tokens or any(length < 0 for length in query_lens):
+        raise ValueError("query_lens must contain one nonnegative length per request and sum to tokens")
+    return list(query_lens)
+
+
+def paged_slots(
+    positions: torch.Tensor,
+    request_ids: torch.Tensor,
+    block_table: torch.Tensor,
+    storage_block_size: int = BLOCK_SIZE,
+    logical_divisor: int = 1,
+    publish_only_complete: bool = False,
+    *, rolling: bool = False,
+) -> torch.Tensor:
+    """Map logical token positions to flattened physical cache rows."""
+    if positions.ndim != 1 or request_ids.shape != positions.shape or block_table.ndim != 2:
+        raise ValueError("positions/request_ids must be matching vectors and block_table must be a matrix")
+    if storage_block_size <= 0 or logical_divisor <= 0:
+        raise ValueError("storage_block_size and logical_divisor must be positive")
+    if any(value.dtype not in (torch.int32, torch.int64) for value in (positions, request_ids, block_table)):
+        raise ValueError("positions, request_ids and block_table must contain integer indices")
+    publish = torch.ones_like(positions, dtype=torch.bool)
+    if publish_only_complete and logical_divisor > 1:
+        publish = (positions + 1).remainder(logical_divisor) == 0
+    slots = torch.full_like(positions, -1, dtype=torch.int64)
+    logical = torch.div(positions[publish], logical_divisor, rounding_mode="floor")
+    logical_block = torch.div(logical, storage_block_size, rounding_mode="floor")
+    if rolling:
+        logical_block = logical_block.remainder(block_table.shape[1])
+    offset = logical.remainder(storage_block_size)
+    active_requests = request_ids[publish]
+    if bool(((active_requests < 0) | (active_requests >= block_table.shape[0])).any()):
+        raise ValueError("published request id is outside the block table")
+    if bool(((logical_block < 0) | (logical_block >= block_table.shape[1])).any()):
+        raise ValueError("block table does not cover a required logical page")
+    physical = block_table[request_ids[publish].to(torch.long), logical_block.to(torch.long)]
+    if bool((physical < 0).any()):
+        raise ValueError("required logical page has no physical allocation")
+    slots[publish] = physical.to(torch.int64) * storage_block_size + offset.to(torch.int64)
+    return slots
+
+
+def window_metadata(
+    positions: torch.Tensor,
+    request_ids: torch.Tensor,
+    block_table: torch.Tensor,
+    window: int = M.sliding_window,
+    *, rolling: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build paged write slots plus causal indices for the visible sliding window."""
+    slots = paged_slots(positions, request_ids, block_table, rolling=rolling)
+    lens = torch.minimum(positions + 1, torch.full_like(positions, window)).to(torch.int32)
+    offsets = torch.arange(window, device=positions.device)
+    starts = positions - lens.to(positions.dtype) + 1
+    visible = starts.unsqueeze(-1) + offsets
+    valid = offsets.unsqueeze(0) < lens.unsqueeze(-1)
+    indices = torch.full_like(visible, -1, dtype=torch.int64)
+    visible_requests = request_ids.unsqueeze(-1).expand_as(visible)
+    indices[valid] = paged_slots(visible[valid], visible_requests[valid], block_table, rolling=rolling)
+    return slots, indices.to(torch.int32), lens
+
+
+def compact_window_table(prefixes, lengths):
+    """Map each request's visible sliding-window pages and retain one unmapped control page."""
+    columns = max((prefix + length - 1) // BLOCK_SIZE + 1 for prefix, length in zip(prefixes, lengths))
+    table = torch.full((len(prefixes), columns), -1, dtype=torch.int32)
+    next_page = 0
+    for request, (prefix, length) in enumerate(zip(prefixes, lengths)):
+        first = max(0, prefix - M.sliding_window + 1) // BLOCK_SIZE
+        end = (prefix + length - 1) // BLOCK_SIZE + 1
+        count = end - first
+        table[request, first:end] = torch.arange(next_page, next_page + count, dtype=torch.int32)
+        next_page += count
+    return table, next_page + 1
+
+
+def upload_forward_inputs(runtime, specs, parameters, ranks, host_inputs, upload_buffer):
+    """Upload rank-local storage through a shared buffer registered before runtime preparation."""
+    from pypto.ir import ParamDirection
+    from pypto.runtime import StackedDeviceTensor
+
+    chunk_bytes = upload_buffer.numel()
+    arguments = []
+    for spec, parameter in zip(specs, parameters, strict=True):
+        if isinstance(spec, ScalarSpec):
+            arguments.append(spec.to_python())
+            continue
+        if spec.name in host_inputs:
+            arguments.append(host_inputs[spec.name])
+            continue
+        shape = spec.shape[1:]
+        if spec.shape[0] != ranks:
+            raise ValueError(f"{spec.name} needs a leading rank axis of size {ranks}")
+        shards = []
+        for rank in range(ranks):
+            handle = runtime.alloc_tensor(shape, spec.dtype, worker_id=rank)
+            shards.append(handle)
+            if parameter.direction == ParamDirection.Out:
+                continue
+            tensor_value = isinstance(spec.init_value, torch.Tensor)
+            if tensor_value:
+                if list(spec.init_value.shape) != spec.shape:
+                    raise ValueError(f"{spec.name} initialization must match its tensor spec")
+                value = spec.init_value[rank].contiguous().view(torch.uint8).reshape(-1)
+            else:
+                fill = 0 if spec.init_value is None else spec.init_value
+                active_buffer = upload_buffer[:min(chunk_bytes, handle.nbytes)]
+                if spec.dtype == torch.float8_e8m0fnu:
+                    code = torch.tensor(float(fill)).to(spec.dtype).view(torch.uint8).item()
+                    active_buffer.fill_(code)
+                else:
+                    active_buffer.view(spec.dtype).fill_(fill)
+            for offset in range(0, handle.nbytes, chunk_bytes):
+                size = min(chunk_bytes, handle.nbytes - offset)
+                if tensor_value:
+                    upload_buffer[:size].copy_(value[offset:offset + size])
+                runtime.copy_to(handle.data_ptr, upload_buffer.data_ptr(), size, dst_offset=offset, worker_id=rank)
+        arguments.append(StackedDeviceTensor(shards, tuple(spec.shape), tuple(range(ranks))))
+    return arguments
+
+
+def prefill_head_tail_rows(query_lengths, cp_size):
+    """Return original packed row IDs per PCP rank using request-local DualChunkSwap."""
+    if cp_size < 1 or any(length < 0 for length in query_lengths):
+        raise ValueError("CP size must be positive and scheduled lengths nonnegative")
+    rows = [[] for _ in range(cp_size)]
+    offset = 0
+    for length in query_lengths:
+        width = (length + 2 * cp_size - 1) // (2 * cp_size)
+        for rank in range(cp_size):
+            for chunk in (rank, 2 * cp_size - 1 - rank):
+                begin = min(chunk * width, length)
+                end = min(begin + width, length)
+                rows[rank].extend(range(offset + begin, offset + end))
+        offset += length
+    return [torch.tensor(rank_rows, dtype=torch.int32) for rank_rows in rows]

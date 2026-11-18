@@ -19,12 +19,13 @@ That is why there is no `quant_y` kernel beside `quant_x`.
 """
 import a8w8_linear
 
-from config import GDN_TILING, QWEN3_8_27B
+from chunk_cumsum import CHUNK_TILE
+from config import QWEN3_8_27B
 
 # model shape
 K = QWEN3_8_27B.value_width                 # contraction: H value heads of D
 N = QWEN3_8_27B.hidden_size                 # back to the residual stream
-CHUNK = GDN_TILING.chunk                    # only picks the reference chain to draw from
+CHUNK = CHUNK_TILE                          # only picks the reference chain to draw from
 
 MODULE = "out_proj"
 
@@ -59,14 +60,14 @@ def _activation(t: int, chunk: int, weights: str | None):
     thing before this projection -- so the three tensors share one chain and
     one cache.
     """
-    import reference
+    import block_reference
 
     def load():
         key = (t, chunk, weights)
         cache = _ACT_CACHE.get(key)
         if cache is None:
             def draw(name):
-                return reference.block_inputs(name, t, QWEN3_8_27B, chunk,
+                return block_reference.block_inputs(name, t, QWEN3_8_27B, chunk,
                                               weights=weights, quant_y=True)()
             cache = _ACT_CACHE[key] = dict(
                 x=draw("y").reshape(t, -1), q=draw("y_q"),

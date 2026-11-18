@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Qwen3.8-27B configuration, and the tiling the GDN kernels choose.
+"""Qwen3.8-27B configuration, and the W8A8 scheme its projections use.
 
 Model values follow HuggingFace `config.json` and carry its field names, so a
 reader can check them against the published config without a translation table.
@@ -73,15 +73,6 @@ class Qwen38Config:
 
 
 @dataclass(frozen=True)
-class GdnTiling:
-    """Tiling the GDN kernels choose. Not from the model config."""
-
-    # The chunk length the delta rule is blocked over. megagdn-pto fixes it at 128
-    # and so do we; the reference Triton kernels default to 64.
-    chunk: int
-
-
-@dataclass(frozen=True)
 class GdnQuant:
     """The W8A8 scheme the projections use. Our choice, not from the model config.
 
@@ -117,8 +108,6 @@ QWEN3_8_27B = Qwen38Config(
     head_dim=256,
     partial_rotary_factor=0.25,
 )
-
-GDN_TILING = GdnTiling(chunk=128)
 
 GDN_QUANT = GdnQuant(
     scale_max=127.0,

@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Host-side torch helpers for the decode/prefill test fixtures.
 
-Paged-KV metadata lowering and RoPE/YaRN table generation.
+Paged-KV metadata lowering, RoPE/YaRN table generation and FRACTAL_NZ weight packing.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import math
 from typing import Any, Callable
 
 import torch
+from prefill_metadata import CHECKPOINTS_PER_TILE, METADATA_TOKEN_TILE
 
 from config import (
     BLOCK_SIZE,
@@ -32,6 +33,116 @@ from config import (
 
 
 # --- Paged-KV metadata lowering. ---
+def checkpoint_ends_tensor(checkpoints, *, starts, lengths):
+    """Pack ordered boundaries into bounded request-local projection tiles."""
+    if len(checkpoints) != len(starts) or len(starts) != len(lengths) or not lengths or min(lengths) <= 0:
+        raise ValueError("checkpoint metadata requires one positive extent per request")
+    tiles = (max(lengths) + METADATA_TOKEN_TILE - 1) // METADATA_TOKEN_TILE
+    result = torch.zeros((len(checkpoints), tiles, CHECKPOINTS_PER_TILE), dtype=torch.int32)
+    for index, values in enumerate(checkpoints):
+        values = [values] if isinstance(values, int) else list(values)
+        if any(v < 0 for v in values):
+            raise ValueError("checkpoint boundaries must be nonnegative")
+        values = sorted(set(v for v in values if v))
+        buckets = [[] for _ in range(tiles)]
+        for boundary in values:
+            if starts[index] < boundary <= starts[index] + lengths[index]:
+                buckets[(boundary - starts[index] - 1) // METADATA_TOKEN_TILE].append(boundary)
+        for tile, ends in enumerate(buckets):
+            if len(ends) > CHECKPOINTS_PER_TILE:
+                raise ValueError("at most six checkpoint boundaries may end in one projection tile")
+            result[index, tile, :len(ends)] = torch.tensor(ends, dtype=torch.int32)
+    return result
+
+
+def prefill_state_fixture(
+    start_pos, token_count, checkpoint_end, *, history, block_size, table, physical_blocks,
+):
+    """Allocate non-aliasing entry and publication rows for checkpoint fixtures."""
+    positions = torch.arange(start_pos, start_pos + token_count, dtype=torch.int64)
+    checkpoints = [checkpoint_end] if isinstance(checkpoint_end, int) else list(checkpoint_end)
+    if any(v < 0 for v in checkpoints):
+        raise ValueError("checkpoint boundaries must be nonnegative")
+    if not any(checkpoints):
+        return table, table[positions // block_size].long() * block_size + positions % block_size, physical_blocks
+    if max(checkpoints) > len(table) * block_size:
+        raise ValueError("fixture checkpoint exceeds the model context")
+    read_first = max(0, start_pos - history) // block_size
+    read_stop = (start_pos + block_size - 1) // block_size
+    read_blocks = read_stop - read_first
+    write_first = start_pos // block_size
+    write_blocks = (start_pos + token_count + block_size - 1) // block_size - write_first
+    table = torch.full_like(table, -1)
+    table[read_first:read_stop] = torch.arange(read_blocks, dtype=table.dtype).flip(0)
+    pages = torch.arange(read_blocks, read_blocks + write_blocks, dtype=torch.int64).flip(0)
+    if start_pos % block_size:
+        pages[0] = table[write_first]
+    mapping = pages[positions // block_size - write_first] * block_size + positions % block_size
+    return table, mapping, max(physical_blocks, read_blocks + write_blocks)
+
+
+def validate_prefill_state_checkpoint(
+    tensors, *, history, block_size, tail, table_name="compress_state_block_table", slot_name="state_slot_mapping",
+):
+    """Reject missing/aliased checkpoint publication in the Host reference only.
+
+    Callers retain published checkpoint pages across forwards with their normal
+    snapshot/COW lifetime rules. Kernel execution never performs this scan.
+    """
+    checkpoints = tensors["state_checkpoint_ends"][0].reshape(-1).tolist()
+    if not any(checkpoints):
+        return
+    positions = tensors["position_ids"].tolist()
+    start, end = positions[0], positions[-1] + 1
+    if positions != list(range(start, end)) or any(b < 0 for b in checkpoints):
+        raise ValueError("checkpoint validation requires consecutive positions and a nonnegative checkpoint")
+    mapping = tensors[slot_name].tolist()
+    table = tensors[table_name][0]
+    capacity = tensors["compress_state"].shape[0] * block_size
+
+    def row(position):
+        if position >= start:
+            result = int(mapping[position - start])
+        else:
+            block = position // block_size
+            result = int(table[block]) * block_size + position % block_size if block < len(table) else -1
+        if not 0 <= result < capacity:
+            raise ValueError(f"missing checkpoint state at position {position}")
+        return result
+
+    owners = {}
+    retained = {}
+    for position in range(max(0, start - history), start):
+        physical = row(position)
+        if physical in owners and owners[physical] != position:
+            raise ValueError("entry state rows alias")
+        owners[physical] = position
+        if any(b - history <= position < b for b in checkpoints):
+            retained[physical] = position
+    for offset in range(0, len(positions), 512):
+        tile_start, tile_end = start + offset, min(start + offset + 512, end)
+        published = set(range(max(tile_start, tile_end - tail), tile_end))
+        for boundary in checkpoints:
+            published.update(range(max(tile_start, boundary - history), min(tile_end, boundary)))
+        writes = {}
+        for position in published:
+            physical = row(position)
+            if (physical in writes and writes[physical] != position
+                    or physical in retained and retained[physical] != position):
+                raise ValueError("checkpoint publication rows alias")
+            writes[physical] = position
+        owners.update(writes)
+        retained.update((p, q) for p, q in writes.items() if any(b - history <= q < b for b in checkpoints))
+    # A target may lie in a later/earlier chunk. Validate this forward's
+    # checkpoint fragment and entry history, never invent an absent full window.
+    windows = [(max(0, start - history, b - history), min(b, end)) for b in checkpoints if b]
+    windows.append((max(0, end - history), end))
+    for begin, stop in windows:
+        for position in range(begin, stop):
+            if owners.get(row(position)) != position:
+                raise ValueError(f"checkpoint or terminal state was overwritten at position {position}")
+
+
 def resolve_start_positions(
     start_pos: int | list[int] | tuple[int, ...] | torch.Tensor | None,
     *,
@@ -604,3 +715,29 @@ def quant_w_per_channel(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     scaled = w.float() * scale_quant.unsqueeze(-1)
     w_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
     return w_i8, (1.0 / scale_quant).float()
+
+
+# --- FRACTAL_NZ weight packing. ---
+# A ``pl.NZ`` parameter asserts the GM bytes are already in pto-isa fractal order:
+# c0 contiguous elements form one 32-byte C0 line, 16 rows form one fractal, and
+# column blocks walk outermost. The fixture packs, the golden reads back logically.
+NZ_FRACTAL_ROWS = 16
+NZ_C0_BYTES = 32
+
+
+def pack_nz(logical: torch.Tensor) -> torch.Tensor:
+    """Reorder the trailing ``[R, C]`` of a row-major tensor into NZ fractal order."""
+    rows, cols = logical.shape[-2:]
+    c0 = NZ_C0_BYTES // logical.element_size()
+    assert rows % NZ_FRACTAL_ROWS == 0, f"NZ needs {NZ_FRACTAL_ROWS}-row fractals, got {rows} rows"
+    assert cols % c0 == 0, f"NZ needs whole C0 lines of {c0} elements, got {cols} cols"
+    blocked = logical.reshape(-1, rows // NZ_FRACTAL_ROWS, NZ_FRACTAL_ROWS, cols // c0, c0)
+    return blocked.permute(0, 3, 1, 2, 4).contiguous().reshape(logical.shape)
+
+
+def unpack_nz(packed: torch.Tensor) -> torch.Tensor:
+    """Restore NZ-ordered bytes to the logical row-major ``[..., R, C]`` tensor."""
+    rows, cols = packed.shape[-2:]
+    c0 = NZ_C0_BYTES // packed.element_size()
+    blocked = packed.reshape(-1, cols // c0, rows // NZ_FRACTAL_ROWS, NZ_FRACTAL_ROWS, c0)
+    return blocked.permute(0, 2, 3, 1, 4).contiguous().reshape(packed.shape)

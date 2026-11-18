@@ -533,11 +533,11 @@ def decode_cp_kv_allgather_step(
     ) as _readback_tid:
         worker = pl.tile.get_block_idx()
         for tile_row in pl.range(worker * READBACK_ROW_TILE, full_rows, READBACK_WORKERS * READBACK_ROW_TILE):
-            window_tile = gather_window[tile_row : tile_row + READBACK_ROW_TILE, 0:HEAD_DIM]
-            group_out[tile_row : tile_row + READBACK_ROW_TILE, 0:HEAD_DIM] = window_tile
+            window_tile = pl.load(gather_window, [tile_row, 0], [READBACK_ROW_TILE, HEAD_DIM])
+            pl.store(window_tile, [tile_row, 0], group_out)
         for tail_row in pl.range(full_rows + worker, group_rows, READBACK_WORKERS):
-            window_row = gather_window[tail_row : tail_row + 1, 0:HEAD_DIM]
-            group_out[tail_row : tail_row + 1, 0:HEAD_DIM] = window_row
+            window_row = pl.load(gather_window, [tail_row, 0], [1, HEAD_DIM])
+            pl.store(window_row, [tail_row, 0], group_out)
         for peer_tp in pl.range(TP_SIZE):
             if peer_tp != tp_rank:
                 pld.system.notify(
@@ -574,7 +574,7 @@ def decode_cp_kv_allgather_step(
                 )
         pl.write(group_out, [0, 0], completion_anchor)
 
-    return group_out, gather_signal, retire_tid
+    return gather_signal, retire_tid
 
 
 
@@ -778,7 +778,8 @@ if __name__ == "__main__":
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser(description="Standalone context-parallel decode payload all-gather test.")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=("a2a3", "a2a3sim", "a5", "a5sim"))
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(TP_SIZE)))
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=_TP_CHOICES)
     parser.add_argument("--payload-kind", choices=tuple(_PAYLOAD_FIXTURES), default=FIXTURE_KIND)
@@ -810,7 +811,8 @@ if __name__ == "__main__":
         config=dict(
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
         ),
         rtol=0.0,
         atol=0.0,

@@ -8,6 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """Device-side metadata lowering for recurrent DeepSeek-V4 DSpark decode."""
 
+from math import gcd
+
 import pypto.language as pl
 import pypto.language.distributed as pld
 
@@ -395,6 +397,7 @@ def build_group_decode_metadata(
 def prepare_target_group_from_device_state(
     group_state_slot_ids: pl.Tensor[[DECODE_BATCH], pl.INT32],
     group_state_generations: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    valid_draft_counts: pl.Tensor[[DECODE_BATCH], pl.INT32],
     state_tokens: pl.Tensor[[STATE_CAPACITY, STATE_TOKEN_WIDTH], pl.INT64],
     state_meta: pl.Tensor[[STATE_CAPACITY, STATE_META_WIDTH], pl.INT32],
     input_ids: pl.Tensor[[LOCAL_T], pl.INT64],
@@ -408,7 +411,7 @@ def prepare_target_group_from_device_state(
     group_active_widths: pl.Tensor[[DECODE_BATCH], pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
 ):
-    """Resolve the TP-group target window from replicated persistent state."""
+    """Resolve the TP-group target window, capped by valid draft counts."""
     for core in pl.spmd(1, name_hint="dspark_group_state_prepare"):
         local_begin = tp_rank * LOCAL_BATCH
         local_end = local_begin + LOCAL_BATCH
@@ -435,7 +438,10 @@ def prepare_target_group_from_device_state(
                 expected = pl.read(group_state_generations, [request])
                 if valid == 1 and generation == expected:
                     anchor = pl.read(state_meta, [slot, STATE_ANCHOR_POSITION])
-                    draft_count = pl.read(state_meta, [slot, STATE_DRAFT_COUNT])
+                    draft_count = pl.cast(pl.min(
+                        pl.read(state_meta, [slot, STATE_DRAFT_COUNT]),
+                        pl.max(pl.read(valid_draft_counts, [request]), 0),
+                    ), pl.INT32)
                     position_limit = pl.read(state_meta, [slot, STATE_POSITION_LIMIT])
                     active_width = pl.cast(1, pl.INT32)
                     if anchor + draft_count < position_limit:
@@ -485,6 +491,8 @@ def prepare_target_group_from_device_state(
 def accept_target_into_device_state(
     state_slot_ids: pl.Tensor[[LOCAL_BATCH], pl.INT32],
     state_generations: pl.Tensor[[LOCAL_BATCH], pl.INT32],
+    valid_draft_counts: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
     sampled_row_offsets: pl.Tensor[[LOCAL_BATCH], pl.INT32],
     hidden_row_offsets: pl.Tensor[[LOCAL_BATCH], pl.INT32],
     state_tokens: pl.InOut[pl.Tensor[[STATE_CAPACITY, STATE_TOKEN_WIDTH], pl.INT64]],
@@ -501,7 +509,7 @@ def accept_target_into_device_state(
     drafter_row_offsets: pl.Out[pl.Tensor[[LOCAL_BATCH], pl.INT32]],
     drafter_ready: pl.Out[pl.Tensor[[1], pl.INT32]],
 ):
-    """Accept the longest matching prefix and prepare the next drafter inputs."""
+    """Accept only a validated draft prefix and prepare the next drafter inputs."""
     for core in pl.spmd(1, name_hint="dspark_state_accept"):
         next_drafter_row = pl.cast(0, pl.INT32)
         for request in pl.range(core, LOCAL_BATCH):
@@ -524,7 +532,10 @@ def accept_target_into_device_state(
                 if valid == 1 and generation == expected:
                     sampled_row = pl.cast(sampled_row_raw, pl.INDEX)
                     old_anchor = pl.read(state_meta, [slot, STATE_ANCHOR_POSITION])
-                    draft_count = pl.read(state_meta, [slot, STATE_DRAFT_COUNT])
+                    draft_count = pl.cast(pl.min(
+                        pl.read(state_meta, [slot, STATE_DRAFT_COUNT]),
+                        pl.max(pl.read(valid_draft_counts, [tp_rank * LOCAL_BATCH + request]), 0),
+                    ), pl.INT32)
                     position_limit = pl.read(state_meta, [slot, STATE_POSITION_LIMIT])
                     effective_draft_count = pl.cast(0, pl.INT32)
                     if old_anchor + draft_count < position_limit:
@@ -681,8 +692,8 @@ CONTEXT_T = LOCAL_BATCH * S
 LOCAL_METADATA_ROWS = CONTEXT_T + T_QUERY
 GROUP_METADATA_ROWS = DSPARK_CP_SIZE * LOCAL_METADATA_ROWS
 METADATA_WIDTH = 1 + DSPARK_DRAFT_LAYERS
-META_COMM_ROWS = 16
-ROPE_COMM_ROWS = 8
+META_COMM_ROWS = gcd(GROUP_METADATA_ROWS, 16)
+ROPE_COMM_ROWS = gcd(GROUP_METADATA_ROWS, 8)
 BRIDGE_B_DYN = pl.dynamic("DSPARK_BRIDGE_B_DYN")
 BRIDGE_GROUP_CONTEXT_T_DYN = pl.dynamic("DSPARK_BRIDGE_GROUP_CONTEXT_T_DYN")
 
@@ -1031,10 +1042,10 @@ def prepare_drafter_after_target(
             pl.write(context_group_position_ids, [row], pl.cast(pl.read(group_metadata, [metadata_row, 0]), pl.INT32))
             for layer in pl.range(DSPARK_DRAFT_LAYERS):
                 pl.write(context_group_slot_mapping, [layer, row], pl.read(group_metadata, [metadata_row, 1 + layer]))
-            group_cos_src = group_rope_cos[metadata_row : metadata_row + 1, 0:ROPE_DIM]
-            context_group_freqs_cos[row : row + 1, 0:ROPE_DIM] = group_cos_src
-            group_sin_src = group_rope_sin[metadata_row : metadata_row + 1, 0:ROPE_DIM]
-            context_group_freqs_sin[row : row + 1, 0:ROPE_DIM] = group_sin_src
+            group_cos_src = pl.load(group_rope_cos, [metadata_row, 0], [1, ROPE_DIM])
+            pl.store(group_cos_src, [row, 0], context_group_freqs_cos)
+            group_sin_src = pl.load(group_rope_sin, [metadata_row, 0], [1, ROPE_DIM])
+            pl.store(group_sin_src, [row, 0], context_group_freqs_sin)
         for row in pl.range(DSPARK_CP_SIZE * T_QUERY):
             source_rank = row // T_QUERY
             source_row = row % T_QUERY
@@ -1052,12 +1063,3 @@ def prepare_drafter_after_target(
             query_freqs_cos[row : row + 1, 0:ROPE_DIM] = local_cos_src
             local_sin_src = local_rope_sin[metadata_row : metadata_row + 1, 0:ROPE_DIM]
             query_freqs_sin[row : row + 1, 0:ROPE_DIM] = local_sin_src
-    return (
-        num_sampled, compact_last_sampled, next_prefill_tokens, compact_anchor_positions,
-        compact_state_slot_ids, compact_state_generations, logit_row_indices,
-        context_group_position_ids, context_group_slot_mapping,
-        query_group_position_ids, query_group_slot_mapping,
-        context_group_freqs_cos, context_group_freqs_sin,
-        query_freqs_cos, query_freqs_sin,
-        query_group_freqs_cos, query_group_freqs_sin,
-    )

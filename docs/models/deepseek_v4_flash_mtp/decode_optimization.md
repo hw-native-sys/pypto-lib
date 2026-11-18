@@ -256,7 +256,10 @@ weight L1 tile, freeing Mat for an N fragment of 256.
   gains from a pipeline; the w2 K loop is scalar-bound (~97 %) and was
   deliberately left serial (#473). See
   [Performance Tuning](../../debug-and-tune/performance-tuning.md#4-read-pmu-utilization).
-- `pl.split(UP_DOWN)` fixes vector stragglers in mixed regions. In `proj_b` the
+- Explicit `pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN)` regions can balance
+  vector epilogues in mixed kernels. Use `pl.aiv_shard` for cube accumulators
+  and lane-specific input slices and output offsets; function-level
+  `pl.split(UP_DOWN)` no longer partitions the work. Historically, in `proj_b` the
   INT8 GEMM finished early and the whole region's wall was set by whichever of
   the two vector lanes got the larger share of the dequant epilogue; splitting
   each task halved the imbalance for −16 % (#547).

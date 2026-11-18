@@ -15,8 +15,8 @@ import pypto.language.distributed as pld
 
 import decode_fwd as decode
 
-if decode.TP_SIZE not in (2, 4):
-    raise ValueError(f"the fused DSpark one-L2 decode path supports --tp=2 or 4, got --tp={decode.TP_SIZE}")
+if decode.TP_SIZE not in (1, 2, 4):
+    raise ValueError(f"the fused DSpark one-L2 decode path supports --tp=1, 2 or 4, got --tp={decode.TP_SIZE}")
 
 import decode_prepare as prepare
 import dspark_drafter as dspark
@@ -91,7 +91,6 @@ KV_T_DYN = decode.KV_T_DYN
 LM_HEAD_TP_SIZE = decode.LM_HEAD_TP_SIZE
 LM_HEAD_VOCAB = decode.LM_HEAD_VOCAB
 LOCAL_O_GROUPS = decode.LOCAL_O_GROUPS
-LOCAL_O_WIDTH = decode.LOCAL_O_WIDTH
 MAIN_HIDDEN_DIM = decode.MAIN_HIDDEN_DIM
 MAX_LOGIT_ROWS = decode.MAX_LOGIT_ROWS
 MIX_HC = decode.MIX_HC
@@ -134,13 +133,13 @@ DRAFT_DSPARK_DRAFT_LAYERS = dspark.DSPARK_DRAFT_LAYERS
 DRAFT_DSPARK_MARKOV_RANK = markov.DSPARK_MARKOV_RANK
 DRAFT_DSPARK_QUERY_WIDTH = dspark.DSPARK_QUERY_WIDTH
 DRAFT_GROUP_LOGIT_ROWS = lmhead.GROUP_LOGIT_ROWS
+DRAFT_LM_HEAD_TP_SIZE = markov.TP_SIZE
 DRAFT_H = dspark.H
 DRAFT_HC_DIM = dspark.HC_DIM
 DRAFT_HC_MULT = dspark.HC_MULT
 DRAFT_HEAD_DIM = dspark.HEAD_DIM
 DRAFT_IDX_PAD = dspark.IDX_PAD
 DRAFT_LOCAL_O_GROUPS = dspark.LOCAL_O_GROUPS
-DRAFT_LOCAL_O_WIDTH = dspark.LOCAL_O_WIDTH
 DRAFT_MAIN_IN = dspark.MAIN_IN
 DRAFT_MAX_LOGIT_ROWS = lmhead.MAX_LOGIT_ROWS
 DRAFT_MIX_HC = dspark.MIX_HC
@@ -179,8 +178,8 @@ def l2_decode_fwd_dspark(
     hc_attn_scale: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * D], pl.BF16],
-    wq_a: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_a: pl.Tensor[[FWD_WEIGHT_BANK_SIZE, D, Q_LORA], pl.BF16, pl.NZ],
+    wq_b: pl.Tensor[[FWD_WEIGHT_BANK_SIZE, Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * Q_LORA], pl.BF16],
@@ -213,8 +212,8 @@ def l2_decode_fwd_dspark(
     hca_cmp_kv: pl.InOut[pl.Tensor[[FWD_HCA_CMP_BLOCKS_DYN, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     hca_cmp_block_table: pl.Tensor[[HCA_B_DYN, HCA_CMP_TABLE_BLOCKS_DYN], pl.INT32],
     attn_sink: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * H], pl.FP32],
-    wo_a: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * D, LOCAL_O_WIDTH], pl.INT8],
+    wo_a: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * LOCAL_O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
     wo_b_scale: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * D], pl.FP32],
     hc_ffn_fn: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * HC_FN_STORAGE_ROWS, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * 3], pl.FP32],
@@ -228,18 +227,18 @@ def l2_decode_fwd_dspark(
     hc_head_scale: pl.Tensor[[1], pl.FP32],
     hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
     final_norm_w: pl.Tensor[[D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
-    routed_w1: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * N_LOCAL, MOE_INTER, D], pl.INT8],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, pl.NZ],
+    routed_w1: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
     routed_w1_scale: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w3: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
     routed_w3_scale: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * N_LOCAL, D, MOE_INTER], pl.INT8],
+    routed_w2: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ],
     routed_w2_scale: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * N_LOCAL, D], pl.FP32],
-    shared_w1: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * MOE_INTER, D], pl.INT8],
+    shared_w1: pl.Tensor[[FWD_WEIGHT_BANK_SIZE, MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w1_scale: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * MOE_INTER, D], pl.INT8],
+    shared_w3: pl.Tensor[[FWD_WEIGHT_BANK_SIZE, MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w3_scale: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * D, MOE_INTER], pl.INT8],
+    shared_w2: pl.Tensor[[FWD_WEIGHT_BANK_SIZE, D, MOE_INTER], pl.INT8, pl.NZ],
     shared_w2_scale: pl.Tensor[[FWD_WEIGHT_BANK_SIZE * D], pl.FP32],
     hidden_workspace: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
     x_ping: pl.InOut[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
@@ -250,6 +249,8 @@ def l2_decode_fwd_dspark(
     dspark_target_hidden: pl.InOut[pl.Tensor[[T_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
     x_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
+    grammar_mask: pl.Tensor[[MAX_LOGIT_ROWS, decode.GREEDY_GRID_ROWS, decode.GRAMMAR_SEGMENT_WORDS], pl.INT16],
+    valid_draft_counts: pl.Tensor[[DECODE_BATCH], pl.INT32],
     sampled_ids: pl.InOut[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     state_slot_ids: pl.Tensor[[DSPARK_STATE_LOCAL_BATCH], pl.INT32],
     state_generations: pl.Tensor[[DSPARK_STATE_LOCAL_BATCH], pl.INT32],
@@ -301,16 +302,16 @@ def l2_decode_fwd_dspark(
     draft_hc_attn_scale: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * 3], pl.FP32],
     draft_hc_attn_base: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_MIX_HC], pl.FP32],
     draft_attn_norm_w: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_D], pl.BF16],
-    draft_wq_a: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_D, DRAFT_Q_LORA], pl.BF16],
-    draft_wq_b: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_Q_LORA, DRAFT_H * DRAFT_HEAD_DIM], pl.INT8],
+    draft_wq_a: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS, DRAFT_D, DRAFT_Q_LORA], pl.BF16, pl.NZ],
+    draft_wq_b: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS, DRAFT_Q_LORA, DRAFT_H * DRAFT_HEAD_DIM], pl.INT8, pl.NZ],
     draft_wq_b_scale: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_H * DRAFT_HEAD_DIM], pl.FP32],
     draft_wkv: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_D, DRAFT_HEAD_DIM], pl.BF16],
     draft_gamma_cq: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_Q_LORA], pl.BF16],
     draft_gamma_ckv: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_HEAD_DIM], pl.BF16],
     draft_kv_caches: pl.InOut[pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS, DRAFT_ORI_BLOCK_NUM, DRAFT_BLOCK_SIZE, 1, DRAFT_HEAD_DIM], pl.BF16]],
     draft_attn_sink: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_H], pl.FP32],
-    draft_wo_a: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_LOCAL_O_GROUPS, DRAFT_O_LORA, DRAFT_O_GROUP_IN], pl.BF16],
-    draft_wo_b: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_D, DRAFT_LOCAL_O_WIDTH], pl.INT8],
+    draft_wo_a: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_LOCAL_O_GROUPS, DRAFT_O_LORA, DRAFT_O_GROUP_IN], pl.BF16, pl.NZ],
+    draft_wo_b: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_LOCAL_O_GROUPS, DRAFT_D, DRAFT_O_LORA], pl.INT8, pl.NZ],
     draft_wo_b_scale: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_D], pl.FP32],
     draft_hc_ffn_fn: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_MIX_HC, DRAFT_HC_DIM], pl.FP32],
     draft_hc_ffn_scale: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * 3], pl.FP32],
@@ -319,17 +320,17 @@ def l2_decode_fwd_dspark(
     draft_gate_w: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_N_EXPERTS_GLOBAL, DRAFT_D], pl.FP32],
     draft_gate_bias: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_N_EXPERTS_GLOBAL], pl.FP32],
     draft_tid2eid: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_VOCAB, DRAFT_TOPK], pl.INT32],
-    draft_routed_w1: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_N_LOCAL, DRAFT_MOE_INTER, DRAFT_D], pl.INT8],
+    draft_routed_w1: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_N_LOCAL, DRAFT_MOE_INTER, DRAFT_D], pl.INT8, pl.NZ],
     draft_routed_w1_scale: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_N_LOCAL, DRAFT_MOE_INTER], pl.FP32],
-    draft_routed_w3: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_N_LOCAL, DRAFT_MOE_INTER, DRAFT_D], pl.INT8],
+    draft_routed_w3: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_N_LOCAL, DRAFT_MOE_INTER, DRAFT_D], pl.INT8, pl.NZ],
     draft_routed_w3_scale: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_N_LOCAL, DRAFT_MOE_INTER], pl.FP32],
-    draft_routed_w2: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_N_LOCAL, DRAFT_D, DRAFT_MOE_INTER], pl.INT8],
+    draft_routed_w2: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_N_LOCAL, DRAFT_D, DRAFT_MOE_INTER], pl.INT8, pl.NZ],
     draft_routed_w2_scale: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_N_LOCAL, DRAFT_D], pl.FP32],
-    draft_shared_w1: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_MOE_INTER, DRAFT_D], pl.INT8],
+    draft_shared_w1: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS, DRAFT_MOE_INTER, DRAFT_D], pl.INT8, pl.NZ],
     draft_shared_w1_scale: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_MOE_INTER], pl.FP32],
-    draft_shared_w3: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_MOE_INTER, DRAFT_D], pl.INT8],
+    draft_shared_w3: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS, DRAFT_MOE_INTER, DRAFT_D], pl.INT8, pl.NZ],
     draft_shared_w3_scale: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_MOE_INTER], pl.FP32],
-    draft_shared_w2: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_D, DRAFT_MOE_INTER], pl.INT8],
+    draft_shared_w2: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS, DRAFT_D, DRAFT_MOE_INTER], pl.INT8, pl.NZ],
     draft_shared_w2_scale: pl.Tensor[[DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_D], pl.FP32],
     draft_hc_head_fn: pl.Tensor[[DRAFT_HC_MULT, DRAFT_HC_DIM], pl.FP32],
     draft_hc_head_scale: pl.Tensor[[1], pl.FP32],
@@ -352,16 +353,16 @@ def l2_decode_fwd_dspark(
     draft_routed_y_buf: pld.DistributedTensor[[DRAFT_N_ROUTES, DRAFT_D], pl.BF16],
     draft_combine_arrived: pld.DistributedTensor[[DRAFT_N_RANKS, 1], pl.INT32],
     draft_final_norm_weight: pl.Tensor[[DRAFT_D], pl.BF16],
-    draft_lm_head_weight: pl.Tensor[[DRAFT_VOCAB_PER_TP, DRAFT_D], pl.BF16],
+    draft_lm_head_weight: pl.Tensor[[DRAFT_VOCAB_PER_TP, DRAFT_D], pl.BF16, pl.NZ],
     draft_markov_w1: pl.Tensor[[DRAFT_VOCAB, DRAFT_DSPARK_MARKOV_RANK], pl.BF16],
     draft_markov_w2: pl.Tensor[[DRAFT_VOCAB, DRAFT_DSPARK_MARKOV_RANK], pl.BF16],
     draft_confidence_head_weight: pl.Tensor[[1, DRAFT_D + DRAFT_DSPARK_MARKOV_RANK], pl.FP32],
     draft_draft_token_ids: pl.Out[pl.Tensor[[B_DYN, DRAFT_DSPARK_QUERY_WIDTH], pl.INT32]],
     draft_confidence_probs: pl.Out[pl.Tensor[[B_DYN, DRAFT_DSPARK_QUERY_WIDTH], pl.FP32]],
     draft_markov_hidden_window: pld.DistributedTensor[[DRAFT_GROUP_LOGIT_ROWS, DRAFT_D], pl.BF16],
-    draft_markov_hidden_done: pld.DistributedTensor[[DRAFT_TP_SIZE, 1], pl.INT32],
+    draft_markov_hidden_done: pld.DistributedTensor[[DRAFT_LM_HEAD_TP_SIZE, 1], pl.INT32],
     draft_markov_logits_window: pld.DistributedTensor[[DRAFT_MAX_LOGIT_ROWS, DRAFT_VOCAB], pl.FP32],
-    draft_markov_logits_done: pld.DistributedTensor[[DRAFT_TP_SIZE, 1], pl.INT32],
+    draft_markov_logits_done: pld.DistributedTensor[[DRAFT_LM_HEAD_TP_SIZE, 1], pl.INT32],
     draft_bridge_metadata_window: pld.DistributedTensor[[BRIDGE_GROUP_METADATA_ROWS, BRIDGE_METADATA_WIDTH], pl.INT64],
     draft_bridge_metadata_signal: pld.DistributedTensor[[DRAFT_DSPARK_CP_SIZE, 1], pl.INT32],
     draft_bridge_rope_cos_window: pld.DistributedTensor[[BRIDGE_GROUP_METADATA_ROWS, DRAFT_ROPE_DIM], pl.BF16],
@@ -472,7 +473,7 @@ def l2_decode_fwd_dspark(
             dtype=pl.BF16,
         )
         prepare_target_group_from_device_state(
-            group_state_slot_ids, group_state_generations,
+            group_state_slot_ids, group_state_generations, valid_draft_counts,
             state_tokens, state_meta,
             prepared_input_ids, prepared_position_ids_local, prepared_position_ids,
             prepared_csa_kv_seq_lens, prepared_hca_kv_seq_lens,
@@ -507,31 +508,55 @@ def l2_decode_fwd_dspark(
             tp_rank,
         )
         target_accept_ready = pl.create_tensor([1], dtype=pl.INT32)
+        # Target compressors consume the TP group's requests; attention consumes
+        # only this rank's requests. The outer metadata keeps its padded ABI.
+        target_group_batch = TP_SIZE * LOCAL_DECODE_BATCH
+        target_group_tokens = TP_SIZE * LOCAL_DECODE_TOKENS
+        target_swa_slot_mapping = prepared_swa_slot_mapping[:target_group_tokens]
+        target_position_ids = prepared_position_ids[:target_group_tokens]
+        target_csa_cmp_freqs_cos = prepared_csa_cmp_freqs_cos[:target_group_tokens, :]
+        target_csa_cmp_freqs_sin = prepared_csa_cmp_freqs_sin[:target_group_tokens, :]
+        target_csa_state_table = prepared_csa_compress_state_block_table[:target_group_batch, :]
+        target_csa_inner_state_table = prepared_csa_inner_compress_state_block_table[:target_group_batch, :]
+        target_csa_cmp_table = csa_cmp_block_table[:LOCAL_DECODE_BATCH, :]
+        target_csa_idx_table = csa_idx_block_table[:LOCAL_DECODE_BATCH, :]
+        target_csa_ori_slots = prepared_csa_ori_slot_mapping[:target_group_tokens]
+        target_csa_cmp_slots = prepared_csa_cmp_slot_mapping[:target_group_tokens]
+        target_csa_idx_slots = prepared_csa_idx_slot_mapping[:target_group_tokens]
+        target_csa_state_slots = prepared_csa_state_slot_mapping[:target_group_tokens]
+        target_csa_inner_state_slots = prepared_csa_inner_state_slot_mapping[:target_group_tokens]
+        target_hca_cmp_freqs_cos = prepared_hca_cmp_freqs_cos[:target_group_batch, :]
+        target_hca_cmp_freqs_sin = prepared_hca_cmp_freqs_sin[:target_group_batch, :]
+        target_hca_state_table = prepared_hca_compress_state_block_table[:target_group_batch, :]
+        target_hca_cmp_table = hca_cmp_block_table[:LOCAL_DECODE_BATCH, :]
+        target_hca_ori_slots = prepared_hca_ori_slot_mapping[:target_group_tokens]
+        target_hca_cmp_slots = prepared_hca_cmp_slot_mapping[:target_group_tokens]
+        target_hca_state_slots = prepared_hca_state_slot_mapping[:target_group_tokens]
         decode_fwd(
             embed_weight, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b,
             wq_b_scale, wkv, gamma_cq, gamma_ckv, raw_kv_pool,
             prepared_freqs_cos, prepared_freqs_sin,
             prepared_compressed_freqs_cos, prepared_compressed_freqs_sin,
-            prepared_swa_slot_mapping, prepared_swa_indices, prepared_swa_lens,
-            prepared_position_ids_local, prepared_position_ids,
-            prepared_csa_cmp_freqs_cos, prepared_csa_cmp_freqs_sin, csa_cmp_wkv,
+            target_swa_slot_mapping, prepared_swa_indices, prepared_swa_lens,
+            prepared_position_ids_local, target_position_ids,
+            target_csa_cmp_freqs_cos, target_csa_cmp_freqs_sin, csa_cmp_wkv,
             csa_cmp_wgate, csa_cmp_ape, csa_cmp_norm_w, csa_compress_state,
-            prepared_csa_compress_state_block_table,
+            target_csa_state_table,
             csa_idx_wq_b, csa_idx_wq_b_scale, csa_weights_proj,
             csa_hadamard_idx, csa_inner_wkv, csa_inner_wgate, csa_inner_ape, csa_inner_norm_w,
-            csa_inner_compress_state, prepared_csa_inner_compress_state_block_table, csa_cmp_kv,
-            csa_cmp_block_table, csa_idx_kv_cache, csa_idx_kv_scale, csa_idx_block_table,
-            prepared_csa_ori_slot_mapping,
+            csa_inner_compress_state, target_csa_inner_state_table, csa_cmp_kv,
+            target_csa_cmp_table, csa_idx_kv_cache, csa_idx_kv_scale, target_csa_idx_table,
+            target_csa_ori_slots,
             prepared_csa_window_swa_indices, prepared_csa_window_swa_lens,
-            prepared_csa_cmp_slot_mapping, prepared_csa_idx_slot_mapping,
-            prepared_csa_state_slot_mapping, prepared_csa_inner_state_slot_mapping,
+            target_csa_cmp_slots, target_csa_idx_slots,
+            target_csa_state_slots, target_csa_inner_state_slots,
             prepared_csa_kv_seq_lens,
-            prepared_hca_cmp_freqs_cos, prepared_hca_cmp_freqs_sin,
+            target_hca_cmp_freqs_cos, target_hca_cmp_freqs_sin,
             hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w, hca_compress_state,
-            prepared_hca_compress_state_block_table,
-            hca_cmp_kv, hca_cmp_block_table, prepared_hca_ori_slot_mapping,
+            target_hca_state_table,
+            hca_cmp_kv, target_hca_cmp_table, target_hca_ori_slots,
             prepared_hca_window_swa_indices, prepared_hca_window_swa_lens,
-            prepared_hca_cmp_slot_mapping, prepared_hca_state_slot_mapping,
+            target_hca_cmp_slots, target_hca_state_slots,
             prepared_hca_kv_seq_lens, attn_sink, wo_a, wo_b, wo_b_scale, hc_ffn_fn,
             hc_ffn_scale, hc_ffn_base, norm_w, gate_w, gate_bias, tid2eid,
             prepared_input_ids,
@@ -540,14 +565,14 @@ def l2_decode_fwd_dspark(
             routed_w3_scale, routed_w2, routed_w2_scale, shared_w1, shared_w1_scale, shared_w3,
             shared_w3_scale, shared_w2, shared_w2_scale, hidden_workspace, x_ping, x_pong,
             x_attn_active, x_moe_next, pre_hc_hidden_out, dspark_target_hidden, x_out, logits,
-            sampled_ids, gather_window,
+            grammar_mask, sampled_ids, gather_window,
             gather_signal, attention_window, attention_signal, o_window, o_signal, recv_meta,
             recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
             lm_head_hidden_window, lm_head_hidden_done, lm_head_logits_window, lm_head_logits_done,
             group_base, tp_rank, my_rank
         )
         accept_target_into_device_state(
-            state_slot_ids, state_generations,
+            state_slot_ids, state_generations, valid_draft_counts, tp_rank,
             prepared_sampled_row_offsets, prepared_sampled_row_offsets,
             state_tokens, state_meta,
             sampled_ids, dspark_target_hidden,
@@ -623,7 +648,7 @@ def l2_decode_fwd_dspark(
             draft_confidence_head_weight, draft_draft_token_ids, draft_confidence_probs,
             draft_markov_hidden_window, draft_markov_hidden_done,
             draft_markov_logits_window, draft_markov_logits_done,
-            group_base, tp_rank,
+            my_rank // DRAFT_LM_HEAD_TP_SIZE * DRAFT_LM_HEAD_TP_SIZE, my_rank % DRAFT_LM_HEAD_TP_SIZE,
         )
     with pl.scope():
         state_tokens, state_meta = commit_drafts_to_device_state(
@@ -645,8 +670,8 @@ def l3_decode_fwd_dspark(
     hc_attn_scale: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * D], pl.BF16],
-    wq_a: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_a: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE, D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE, Q_LORA, H * HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * Q_LORA], pl.BF16],
@@ -680,7 +705,7 @@ def l3_decode_fwd_dspark(
     hca_cmp_block_table: pl.Tensor[[N_RANKS, HCA_B_DYN, HCA_CMP_TABLE_BLOCKS_DYN], pl.INT32],
     attn_sink: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * H], pl.FP32],
     wo_a: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * D, LOCAL_O_WIDTH], pl.INT8],
+    wo_b: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * LOCAL_O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * D], pl.FP32],
     hc_ffn_fn: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * HC_FN_STORAGE_ROWS, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * 3], pl.FP32],
@@ -701,11 +726,11 @@ def l3_decode_fwd_dspark(
     routed_w3_scale: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * N_LOCAL, MOE_INTER], pl.FP32],
     routed_w2: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * N_LOCAL, D, MOE_INTER], pl.INT8],
     routed_w2_scale: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * N_LOCAL, D], pl.FP32],
-    shared_w1: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * MOE_INTER, D], pl.INT8],
+    shared_w1: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE, MOE_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * MOE_INTER, D], pl.INT8],
+    shared_w3: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE, MOE_INTER, D], pl.INT8],
     shared_w3_scale: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * D, MOE_INTER], pl.INT8],
+    shared_w2: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE, D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[N_RANKS, FWD_WEIGHT_BANK_SIZE * D], pl.FP32],
     hidden_workspace: pl.Out[pl.Tensor[[N_RANKS, T_DYN, D], pl.BF16]],
     x_ping: pl.InOut[pl.Tensor[[N_RANKS, T_DYN, HC_MULT, D], pl.FP32]],
@@ -716,6 +741,8 @@ def l3_decode_fwd_dspark(
     dspark_target_hidden: pl.InOut[pl.Tensor[[N_RANKS, T_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
     x_out: pl.Out[pl.Tensor[[N_RANKS, T_DYN, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
+    grammar_mask: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, decode.GREEDY_GRID_ROWS, decode.GRAMMAR_SEGMENT_WORDS], pl.INT16],
+    valid_draft_counts: pl.Tensor[[N_RANKS, DECODE_BATCH], pl.INT32],
     sampled_ids: pl.InOut[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     state_slot_ids: pl.Tensor[[N_RANKS, DSPARK_STATE_LOCAL_BATCH], pl.INT32],
     state_generations: pl.Tensor[[N_RANKS, DSPARK_STATE_LOCAL_BATCH], pl.INT32],
@@ -748,8 +775,8 @@ def l3_decode_fwd_dspark(
     draft_hc_attn_scale: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * 3], pl.FP32],
     draft_hc_attn_base: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_MIX_HC], pl.FP32],
     draft_attn_norm_w: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_D], pl.BF16],
-    draft_wq_a: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_D, DRAFT_Q_LORA], pl.BF16],
-    draft_wq_b: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_Q_LORA, DRAFT_H * DRAFT_HEAD_DIM], pl.INT8],
+    draft_wq_a: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS, DRAFT_D, DRAFT_Q_LORA], pl.BF16],
+    draft_wq_b: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS, DRAFT_Q_LORA, DRAFT_H * DRAFT_HEAD_DIM], pl.INT8],
     draft_wq_b_scale: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_H * DRAFT_HEAD_DIM], pl.FP32],
     draft_wkv: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_D, DRAFT_HEAD_DIM], pl.BF16],
     draft_gamma_cq: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_Q_LORA], pl.BF16],
@@ -757,7 +784,7 @@ def l3_decode_fwd_dspark(
     draft_kv_caches: pl.InOut[pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS, DRAFT_ORI_BLOCK_NUM, DRAFT_BLOCK_SIZE, 1, DRAFT_HEAD_DIM], pl.BF16]],
     draft_attn_sink: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_H], pl.FP32],
     draft_wo_a: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_LOCAL_O_GROUPS, DRAFT_O_LORA, DRAFT_O_GROUP_IN], pl.BF16],
-    draft_wo_b: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_D, DRAFT_LOCAL_O_WIDTH], pl.INT8],
+    draft_wo_b: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_LOCAL_O_GROUPS, DRAFT_D, DRAFT_O_LORA], pl.INT8],
     draft_wo_b_scale: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_D], pl.FP32],
     draft_hc_ffn_fn: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_MIX_HC, DRAFT_HC_DIM], pl.FP32],
     draft_hc_ffn_scale: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * 3], pl.FP32],
@@ -772,11 +799,11 @@ def l3_decode_fwd_dspark(
     draft_routed_w3_scale: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_N_LOCAL, DRAFT_MOE_INTER], pl.FP32],
     draft_routed_w2: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_N_LOCAL, DRAFT_D, DRAFT_MOE_INTER], pl.INT8],
     draft_routed_w2_scale: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_N_LOCAL, DRAFT_D], pl.FP32],
-    draft_shared_w1: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_MOE_INTER, DRAFT_D], pl.INT8],
+    draft_shared_w1: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS, DRAFT_MOE_INTER, DRAFT_D], pl.INT8],
     draft_shared_w1_scale: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_MOE_INTER], pl.FP32],
-    draft_shared_w3: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_MOE_INTER, DRAFT_D], pl.INT8],
+    draft_shared_w3: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS, DRAFT_MOE_INTER, DRAFT_D], pl.INT8],
     draft_shared_w3_scale: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_MOE_INTER], pl.FP32],
-    draft_shared_w2: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_D, DRAFT_MOE_INTER], pl.INT8],
+    draft_shared_w2: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS, DRAFT_D, DRAFT_MOE_INTER], pl.INT8],
     draft_shared_w2_scale: pl.Tensor[[DRAFT_N_RANKS, DRAFT_DSPARK_DRAFT_LAYERS * DRAFT_D], pl.FP32],
     draft_hc_head_fn: pl.Tensor[[DRAFT_N_RANKS, DRAFT_HC_MULT, DRAFT_HC_DIM], pl.FP32],
     draft_hc_head_scale: pl.Tensor[[DRAFT_N_RANKS, 1], pl.FP32],
@@ -861,8 +888,8 @@ def l3_decode_fwd_dspark(
     draft_combine_buf = pld.alloc_window_buffer([DRAFT_N_RANKS, 1], dtype=pl.INT32)
     draft_markov_hidden_buf = pld.alloc_window_buffer(DRAFT_GROUP_LOGIT_ROWS * DRAFT_D * 2)
     draft_markov_logits_buf = pld.alloc_window_buffer(DRAFT_MAX_LOGIT_ROWS * DRAFT_VOCAB * 4)
-    draft_markov_hidden_done_buf = pld.alloc_window_buffer(DRAFT_TP_SIZE * 4)
-    draft_markov_logits_done_buf = pld.alloc_window_buffer(DRAFT_TP_SIZE * 4)
+    draft_markov_hidden_done_buf = pld.alloc_window_buffer(DRAFT_LM_HEAD_TP_SIZE * 4)
+    draft_markov_logits_done_buf = pld.alloc_window_buffer(DRAFT_LM_HEAD_TP_SIZE * 4)
     draft_bridge_metadata_buf = pld.alloc_window_buffer(BRIDGE_GROUP_METADATA_ROWS * BRIDGE_METADATA_WIDTH * 8)
     draft_bridge_metadata_signal_buf = pld.alloc_window_buffer(DRAFT_DSPARK_CP_SIZE * 4)
     draft_bridge_rope_cos_buf = pld.alloc_window_buffer(BRIDGE_GROUP_METADATA_ROWS * DRAFT_ROPE_DIM * 2)
@@ -905,9 +932,9 @@ def l3_decode_fwd_dspark(
         draft_routed_y_window = pld.window(draft_routed_y_buf, [DRAFT_N_ROUTES, DRAFT_D], dtype=pl.BF16)
         draft_combine_window = pld.window(draft_combine_buf, [DRAFT_N_RANKS, 1], dtype=pl.INT32)
         draft_markov_hidden_window = pld.window(draft_markov_hidden_buf, [DRAFT_GROUP_LOGIT_ROWS, DRAFT_D], dtype=pl.BF16)
-        draft_markov_hidden_done = pld.window(draft_markov_hidden_done_buf, [DRAFT_TP_SIZE, 1], dtype=pl.INT32)
+        draft_markov_hidden_done = pld.window(draft_markov_hidden_done_buf, [DRAFT_LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         draft_markov_logits_window = pld.window(draft_markov_logits_buf, [DRAFT_MAX_LOGIT_ROWS, DRAFT_VOCAB], dtype=pl.FP32)
-        draft_markov_logits_done = pld.window(draft_markov_logits_done_buf, [DRAFT_TP_SIZE, 1], dtype=pl.INT32)
+        draft_markov_logits_done = pld.window(draft_markov_logits_done_buf, [DRAFT_LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         draft_bridge_metadata_window = pld.window(draft_bridge_metadata_buf, [BRIDGE_GROUP_METADATA_ROWS, BRIDGE_METADATA_WIDTH], dtype=pl.INT64)
         draft_bridge_metadata_signal = pld.window(draft_bridge_metadata_signal_buf, [DRAFT_DSPARK_CP_SIZE, 1], dtype=pl.INT32)
         draft_bridge_rope_cos_window = pld.window(draft_bridge_rope_cos_buf, [BRIDGE_GROUP_METADATA_ROWS, DRAFT_ROPE_DIM], dtype=pl.BF16)
@@ -937,7 +964,8 @@ def l3_decode_fwd_dspark(
             shared_w3_scale[rank], shared_w2[rank], shared_w2_scale[rank], hidden_workspace[rank],
             x_ping[rank], x_pong[rank], x_attn_active[rank], x_moe_next[rank],
             pre_hc_hidden_out[rank], dspark_target_hidden[rank], x_out[rank], logits[rank],
-            sampled_ids[rank], state_slot_ids[rank], state_generations[rank], state_tokens[rank],
+            grammar_mask[rank], valid_draft_counts[rank], sampled_ids[rank],
+            state_slot_ids[rank], state_generations[rank], state_tokens[rank],
             state_meta[rank], accepted_token_ids[rank], accepted_counts[rank],
             group_state_slot_ids[rank], group_state_generations[rank],
             group_ori_block_table[rank], group_hca_cmp_block_table[rank],
@@ -991,7 +1019,7 @@ def l3_decode_fwd_dspark(
 # Fixture geometry.  The group tables are indexed by logical page, so their
 # widths follow decode_prepare's own bounds; the RoPE tables only need to cover
 # the fixture's position limit.
-FIXTURE_ACTIVE_REQUESTS = 2
+FIXTURE_ACTIVE_REQUESTS = decode.config.DECODE_BATCH // TP_SIZE
 FIXTURE_POSITION_LIMIT = 512
 FIXTURE_ROPE_ROWS = 2048
 FIXTURE_ORI_TABLE_BLOCKS = (FIXTURE_POSITION_LIMIT + SAMPLED_IDS_PAD + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -1028,16 +1056,20 @@ def _fixture_device_state():
     tokens = torch.zeros((N_RANKS, DSPARK_STATE_CAPACITY, DSPARK_STATE_TOKEN_WIDTH), dtype=torch.int64)
     meta = torch.zeros((N_RANKS, DSPARK_STATE_CAPACITY, DSPARK_STATE_META_WIDTH), dtype=torch.int32)
     for slot in range(active):
-        slot_ids[:, slot] = slot
         generations[:, slot] = 1
-        group_slot_ids[:, slot] = slot
-        group_generations[:, slot] = 1
-        tokens[:, slot, :] = torch.arange(100 * (slot + 1), 100 * (slot + 1) + DSPARK_STATE_TOKEN_WIDTH)
-        meta[:, slot, prepare.STATE_VALID] = 1
-        meta[:, slot, prepare.STATE_GENERATION] = 1
-        meta[:, slot, prepare.STATE_ANCHOR_POSITION] = 64 * (slot + 1)
-        meta[:, slot, prepare.STATE_DRAFT_COUNT] = DRAFT_DSPARK_QUERY_WIDTH
-        meta[:, slot, prepare.STATE_POSITION_LIMIT] = FIXTURE_POSITION_LIMIT
+        for owner in range(TP_SIZE):
+            group_slot = owner * DSPARK_STATE_LOCAL_BATCH + slot
+            group_slot_ids[:, group_slot] = group_slot
+            group_generations[:, group_slot] = 1
+            for rank in range(owner, N_RANKS, TP_SIZE):
+                slot_ids[rank, slot] = group_slot
+            token_ids = torch.arange(100 * (group_slot + 1), 100 * (group_slot + 1) + DSPARK_STATE_TOKEN_WIDTH)
+            tokens[:, group_slot, :] = torch.remainder(token_ids, decode.RUNTIME_TEST_VOCAB)
+            meta[:, group_slot, prepare.STATE_VALID] = 1
+            meta[:, group_slot, prepare.STATE_GENERATION] = 1
+            meta[:, group_slot, prepare.STATE_ANCHOR_POSITION] = min(64 * (slot + 1), FIXTURE_POSITION_LIMIT - prepare.S)
+            meta[:, group_slot, prepare.STATE_DRAFT_COUNT] = DRAFT_DSPARK_QUERY_WIDTH
+            meta[:, group_slot, prepare.STATE_POSITION_LIMIT] = FIXTURE_POSITION_LIMIT
     return slot_ids, generations, group_slot_ids, group_generations, tokens, meta
 
 
@@ -1053,10 +1085,11 @@ def build_tensor_specs():
         copied.resident = source.resident
         return copied
 
-    specs = {spec.name: spec for spec in decode.build_tensor_specs()}
+    token_counts = [decode.config.DECODE_BATCH // TP_SIZE * prepare.S] * N_RANKS
+    specs = {spec.name: spec for spec in decode.build_tensor_specs(num_tokens_per_owner=token_counts)}
     for spec in dspark.build_tensor_specs(dspark.DSPARK_MAX_BATCH):
         specs.setdefault("draft_" + spec.name, rename("draft_" + spec.name, spec))
-    for spec in markov.build_tensor_specs(dspark.DSPARK_MAX_BATCH, distributed=True):
+    for spec in markov.build_tensor_specs(dspark.DSPARK_MAX_BATCH, distributed=True, world_size=N_RANKS):
         specs.setdefault("draft_" + spec.name, rename("draft_" + spec.name, spec))
 
     bindings = _fixture_dyn_bindings(specs)
@@ -1068,6 +1101,7 @@ def build_tensor_specs():
         "group_state_generations": group_generations,
         "state_tokens": tokens,
         "state_meta": meta,
+        "valid_draft_counts": torch.full((N_RANKS, DECODE_BATCH), DRAFT_DSPARK_QUERY_WIDTH, dtype=torch.int32),
     }
 
     def resolve(shape):
@@ -1075,7 +1109,7 @@ def build_tensor_specs():
 
     torch_dtype = {
         "bfloat16": torch.bfloat16, "fp32": torch.float32, "float32": torch.float32,
-        "int8": torch.int8, "int32": torch.int32, "int64": torch.int64,
+        "int8": torch.int8, "int16": torch.int16, "int32": torch.int32, "int64": torch.int64,
     }
     ordered = []
     for param in inspect.signature(l3_decode_fwd_dspark._func).parameters.values():
@@ -1094,6 +1128,8 @@ def build_tensor_specs():
                 angle = torch.arange(shape[1], dtype=torch.float32).unsqueeze(1) * 1e-4
                 trig = torch.cos(angle) if "cos" in param.name else torch.sin(angle)
                 value = trig.expand(-1, shape[2]).to(torch.bfloat16).expand(shape[0], -1, -1).contiguous()
+            elif param.name == "grammar_mask":
+                value = torch.full(shape, -1, dtype=dtype)
             elif value is None:
                 value = torch.full(shape, -1 if "token_ids" in param.name else 0, dtype=dtype)
             spec = TensorSpec(param.name, shape, dtype, init_value=value)
@@ -1108,8 +1144,10 @@ def main():
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser(description="DeepSeek-V4 D-Spark fused decode, drafter, and sampler")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=("a2a3", "a2a3sim", "a5", "a5sim"))
-    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=(2, 4))
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
+    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=(1, 2, 4))
+    parser.add_argument("--lm-head-tp", type=int, default=LM_HEAD_TP_SIZE, choices=(1, 2, 4, 8, 16))
     parser.add_argument("--ep", type=int, default=EP_SIZE, choices=(2, 4, 8, 16))
     parser.add_argument(
         "-d", "--device", type=str, default=None,
@@ -1124,8 +1162,10 @@ def main():
     parser.add_argument("--log-level", type=str, default=None)
     args = parser.parse_args()
 
-    if args.tp != TP_SIZE or args.ep != EP_SIZE:
-        parser.error(f"parallel sizes froze at import as TP={TP_SIZE}, EP={EP_SIZE}")
+    if args.tp != TP_SIZE or args.ep != EP_SIZE or args.lm_head_tp != LM_HEAD_TP_SIZE:
+        parser.error(
+            f"parallel sizes froze at import as TP={TP_SIZE}, EP={EP_SIZE}, LM-head TP={LM_HEAD_TP_SIZE}"
+        )
 
     if args.device is None:
         args.device = ",".join(str(rank) for rank in range(EP_SIZE))
@@ -1147,7 +1187,8 @@ def main():
         config=dict(
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             enable_scope_stats=args.enable_scope_stats,
             enable_chip_swimlane=args.enable_chip_swimlane,
             log_level=args.log_level,

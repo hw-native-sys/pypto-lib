@@ -10,6 +10,8 @@
 """DeepSeek-V4 SWA full-layer TP and TP1 entries."""
 
 
+from math import gcd
+
 import sys
 
 import config
@@ -59,11 +61,10 @@ from decode_o_proj import (
     ATTENTION_WINDOW_ROWS,
     GROUP_T_PAD,
     LOCAL_O_GROUPS,
-    LOCAL_O_WIDTH,
     LOCAL_T,
     LOCAL_T_PAD,
     O_WINDOW_ROWS,
-    decode_o_proj_tp1,
+    decode_o_proj_tp1_hc,
     o_group_a2a,
     o_proj_reduce_scatter,
 )
@@ -115,7 +116,7 @@ SPARSE_IDX_TOPK = M.index_topk      # sparse_attn module's IDX_TOPK (static shap
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK
 
 # tiling
-BIAS_T_TILE = 8  # sparse_bias row block; T is a multiple of 8 by the batch contract
+BIAS_T_TILE = 8  # sparse_bias row block, including a partial final block
 SWA_WB_TOKEN_TILE = 32  # tokens per cache-writeback SPMD block
 SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
@@ -154,8 +155,8 @@ def _decode_swa(
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
     # qkv_proj_rope weights
     attn_norm_w: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
@@ -171,8 +172,8 @@ def _decode_swa(
     # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
     # sharded o_proj
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, LOCAL_O_WIDTH], pl.INT8],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[LOCAL_O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
     # TP communication
@@ -198,7 +199,7 @@ def _decode_swa(
     x_out.bind_dynamic(0, T_DYN)
     t_dim = pl.tensor.dim(x_hc, 0)
     kv_dim = pl.tensor.dim(swa_slot_mapping, 0)
-    bias_blocks = t_dim // BIAS_T_TILE
+    bias_blocks = (t_dim + BIAS_T_TILE - 1) // BIAS_T_TILE
     # split_pre_post -> hc_post is covered by x_normed_t -> attn_out.
     post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32, manual_dep=True)
     comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
@@ -230,7 +231,7 @@ def _decode_swa(
     )
 
     kv_full = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.BF16)
-    _gathered_kv, gather_signal, gather_done_tid = decode_cp_kv_allgather_step(
+    gather_signal, gather_done_tid = decode_cp_kv_allgather_step(
         kv_local, kv_full, gather_window, gather_signal, group_base, tp_rank, rms_tid,
     )
 
@@ -255,16 +256,20 @@ def _decode_swa(
 
     with pl.spmd(bias_blocks, name_hint="swa_valid_bias"):
         bias_block = pl.tile.get_block_idx()
-        valid_col = pl.cast(pl.arange(0, [1, ATTN_K_TILE], dtype=pl.INT32), target_type=pl.FP32)
+        valid_col = pl.cast(pl.tile.arange(0, [1, ATTN_K_TILE], dtype=pl.INT32), target_type=pl.FP32)
         token_start = bias_block * BIAS_T_TILE
-        zero_rows = pl.full([BIAS_T_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0)
+        zero_rows = pl.tile.full([BIAS_T_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0)
         valid_cols = pl.col_expand(zero_rows, valid_col)
-        lens_slice = swa_lens[token_start : token_start + BIAS_T_TILE]
+        valid_rows = pl.min(BIAS_T_TILE, t_dim - token_start)
+        lens_slice = pl.load(swa_lens, [token_start], [BIAS_T_TILE], valid_shape=[valid_rows])
+        lens_slice = pl.fillpad(lens_slice, pad_value=pl.PadValue.zero)
         lens_col = pl.reshape(lens_slice, [BIAS_T_TILE, 1])
         lens_fp32 = pl.cast(lens_col, target_type=pl.FP32)
         valid = pl.minimum(pl.maximum(pl.neg(pl.row_expand_sub(valid_cols, lens_fp32)), 0.0), 1.0)
         valid_bias = pl.sub(valid, 1.0)
-        sparse_bias[token_start : token_start + BIAS_T_TILE, 0 : ATTN_K_TILE] = pl.mul(valid_bias, -NEG_INF)
+        bias_tile = pl.mul(valid_bias, -NEG_INF)
+        bias_tile = pl.set_validshape(bias_tile, valid_rows, ATTN_K_TILE)
+        pl.store(bias_tile, [token_start, 0], sparse_bias)
 
     attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
@@ -363,8 +368,7 @@ def _decode_swa(
         )
 
     with pl.scope():
-        hc_post(attn_out, x_hc, post_t, comb_t, x_out)
-    return x_out
+        hc_post(attn_out, x_hc, post_t, comb_t, x_out, T_TILE=4)
 
 
 decode_swa = pl.jit.inline(auto_scope=False)(_decode_swa)
@@ -393,7 +397,7 @@ def l3_decode_swa(
     position_ids: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
     attn_sink: pl.Tensor[[TP_SIZE, H], pl.FP32],
     wo_a: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[TP_SIZE, D, LOCAL_O_WIDTH], pl.INT8],
+    wo_b: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[TP_SIZE, D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, HC_MULT, D], pl.FP32]],
     local_t: pl.Scalar[pl.INT32],
@@ -448,8 +452,8 @@ def _decode_swa_tp1(
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
     # qkv_proj_rope weights
     attn_norm_w: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
@@ -465,8 +469,8 @@ def _decode_swa_tp1(
     # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
     # o_proj
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
 ):
@@ -484,8 +488,9 @@ def _decode_swa_tp1(
     # gathers a full-context table through position_ids. position_ids stays in
     # the ABI for host admission and golden semantics only.
     t_dim = pl.tensor.dim(x_hc, 0)
-    bias_blocks = t_dim // BIAS_T_TILE
-    post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
+    bias_blocks = (t_dim + BIAS_T_TILE - 1) // BIAS_T_TILE
+    # The attention path already orders the producer of post_t.
+    post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32, manual_dep=True)
     comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
     x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = hc_pre_norm(
@@ -504,7 +509,7 @@ def _decode_swa_tp1(
         q, kv, qr, qr_scale, late_dep,
     )
 
-    # Commit current decode KV and build its additive padding mask in one task.
+    # Commit current decode KV and build its additive padding mask in parallel.
     # The SWA attention kernel reads every visible row through metadata-expanded
     # physical cache indices, so all cache writes must complete before it starts.
     ori_block_num = pl.tensor.dim(kv_cache, 0)
@@ -512,20 +517,26 @@ def _decode_swa_tp1(
     sparse_bias = pl.create_tensor([t_dim, WIN], dtype=pl.FP32)
     # SWA_TRANSACTION_ROWS guarantees that later speculative writes cannot
     # alias history still visible to an earlier query in this same step.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_cache_insert_valid_bias"):
-        for write_t in pl.range(t_dim):
-            write_row_i64 = pl.read(swa_slot_mapping, [write_t])
-            if write_row_i64 >= 0:
-                write_row = pl.cast(write_row_i64, pl.INDEX)
-                kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
-        v_col = pl.cast(pl.arange(0, [1, WIN], dtype=pl.INT32), target_type=pl.FP32)
-        for v_blk in pl.range(bias_blocks):
-            v_t0 = v_blk * BIAS_T_TILE
-            v_col_m = pl.col_expand(pl.full([BIAS_T_TILE, WIN], dtype=pl.FP32, value=0.0), v_col)
-            v_lens = pl.cast(pl.reshape(swa_lens[v_t0 : v_t0 + BIAS_T_TILE], [BIAS_T_TILE, 1]), target_type=pl.FP32)
-            v_valid = pl.minimum(pl.maximum(pl.neg(pl.row_expand_sub(v_col_m, v_lens)), 0.0), 1.0)
-            sparse_bias[v_t0 : v_t0 + BIAS_T_TILE, 0:WIN] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
-    attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
+    for write_blk in pl.spmd(bias_blocks, name_hint="swa_cache_insert"):
+        write_t0 = write_blk * BIAS_T_TILE
+        for write_t in pl.range(write_t0, write_t0 + BIAS_T_TILE):
+            if write_t < t_dim:
+                write_row_i64 = pl.read(swa_slot_mapping, [write_t])
+                if write_row_i64 >= 0:
+                    write_row = pl.cast(write_row_i64, pl.INDEX)
+                    kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
+    for v_blk in pl.spmd(bias_blocks, name_hint="swa_valid_bias", allow_early_resolve=True):
+        v_t0 = v_blk * BIAS_T_TILE
+        v_col = pl.cast(pl.tile.arange(0, [1, WIN], dtype=pl.INT32), target_type=pl.FP32)
+        v_col_m = pl.col_expand(pl.tile.full([BIAS_T_TILE, WIN], dtype=pl.FP32, value=0.0), v_col)
+        v_rows = pl.min(BIAS_T_TILE, t_dim - v_t0)
+        v_lens_raw = pl.load(swa_lens, [v_t0], [BIAS_T_TILE], valid_shape=[v_rows])
+        v_lens_raw = pl.fillpad(v_lens_raw, pad_value=pl.PadValue.zero)
+        v_lens = pl.cast(pl.reshape(v_lens_raw, [BIAS_T_TILE, 1]), target_type=pl.FP32)
+        v_valid = pl.minimum(pl.maximum(pl.neg(pl.row_expand_sub(v_col_m, v_lens)), 0.0), 1.0)
+        v_bias = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
+        v_bias = pl.set_validshape(v_bias, v_rows, WIN)
+        pl.store(v_bias, [v_t0, 0], sparse_bias)
     o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16)
     o_packed_heads, heads_dep = sparse_attn_swa_tp1(
         q, kv_cache, swa_indices, swa_lens, sparse_bias,
@@ -533,9 +544,9 @@ def _decode_swa_tp1(
         o_packed_heads,
     )
     o_packed = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
-    attn_out = decode_o_proj_tp1(o_packed, wo_a, wo_b, wo_b_scale, attn_out, heads_dep)
-
-    hc_post(attn_out, x_hc, post_t, comb_t, x_out)
+    decode_o_proj_tp1_hc(
+        o_packed, wo_a, wo_b, wo_b_scale, x_hc, post_t, comb_t, x_out, heads_dep,
+    )
     return x_out
 
 
@@ -643,6 +654,7 @@ def build_tensor_specs(start_pos=None, batch=B):
         raise ValueError(f"batch must produce between {S} and {group_cap} tokens, got {tokens}")
     import torch
     from utils import (
+        pack_nz,
         paged_slot_mapping,
         position_ids_from_starts,
         resolve_start_positions,
@@ -787,6 +799,10 @@ def build_tensor_specs(start_pos=None, batch=B):
     wq_b_i8, wq_b_scale = quant_w_per_output_channel(wq_b_bf16)
     wo_b_bf16 = init_wo_b().to(torch.bfloat16)
     wo_b_i8, wo_b_scale = quant_w_per_row(wo_b_bf16)
+    # wo_b's group axis is the sole NZ leading/batch axis, matching wo_a's own
+    # [GROUPS, ...] convention: fold the flat [D, GROUPS*O_LORA] quant result
+    # into [GROUPS, D, O_LORA] before packing each group's fractal blocks.
+    wo_b_i8_groups = wo_b_i8.reshape(D, O_GROUPS, O_LORA).permute(1, 0, 2).contiguous()
 
     return [
         TensorSpec("x_hc", [tokens, HC_MULT, D], torch.float32, init_value=init_x_hc),
@@ -794,8 +810,8 @@ def build_tensor_specs(start_pos=None, batch=B):
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=init_hc_attn_scale),
         TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=init_hc_attn_base),
         TensorSpec("attn_norm_w", [D], torch.bfloat16, init_value=init_attn_norm_w),
-        TensorSpec("wq_a", [D, Q_LORA], torch.bfloat16, init_value=init_wq_a),
-        TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
+        TensorSpec("wq_a", [D, Q_LORA], torch.bfloat16, init_value=lambda: pack_nz(init_wq_a().to(torch.bfloat16))),
+        TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.int8, init_value=lambda: pack_nz(wq_b_i8)),
         TensorSpec("wq_b_scale", [H * HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
         TensorSpec("wkv", [D, HEAD_DIM], torch.bfloat16, init_value=init_wkv),
         TensorSpec("gamma_cq", [Q_LORA], torch.bfloat16, init_value=init_gamma_cq),
@@ -808,8 +824,8 @@ def build_tensor_specs(start_pos=None, batch=B):
         TensorSpec("swa_lens", [tokens], torch.int32, init_value=init_swa_lens),
         TensorSpec("position_ids", [tokens], torch.int32, init_value=init_position_ids),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
-        TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
-        TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
+        TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=lambda: pack_nz(init_wo_a().to(torch.bfloat16))),
+        TensorSpec("wo_b", [O_GROUPS, D, O_LORA], torch.int8, init_value=lambda: pack_nz(wo_b_i8_groups)),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
         TensorSpec("x_out", [tokens, HC_MULT, D], torch.float32),
     ]
@@ -822,8 +838,9 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
     from golden import ScalarSpec, TensorSpec
     from decode_cp_allgather import cp_split, cp_stack, materialize_spec
 
-    if local_t < BIAS_T_TILE or local_t > LOCAL_T or local_t % BIAS_T_TILE != 0 or local_t % S != 0:
-        raise ValueError(f"local_t must be a multiple of {BIAS_T_TILE} in [{BIAS_T_TILE}, {LOCAL_T}], got {local_t}")
+    token_tile = gcd(BIAS_T_TILE, S)
+    if local_t < token_tile or local_t > LOCAL_T or local_t % token_tile != 0 or local_t % S != 0:
+        raise ValueError(f"local_t must be a multiple of {token_tile} in [{token_tile}, {LOCAL_T}], got {local_t}")
 
     local_batch = local_t // S
     group_batch = TP_SIZE * local_batch
@@ -865,8 +882,9 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
             specs.append(wo_a_spec)
             continue
         if spec.name == "wo_b":
-            shards = value.reshape(D, TP_SIZE, LOCAL_O_WIDTH).permute(1, 0, 2).contiguous()
-            wo_b_spec = TensorSpec("wo_b", [TP_SIZE, D, LOCAL_O_WIDTH], spec.dtype, init_value=shards)
+            # Same leading-group-axis split as wo_a -- wo_b is now [GROUPS, D, O_LORA].
+            shards = value.reshape(TP_SIZE, LOCAL_O_GROUPS, D, O_LORA).contiguous()
+            wo_b_spec = TensorSpec("wo_b", [TP_SIZE, LOCAL_O_GROUPS, D, O_LORA], spec.dtype, init_value=shards)
             wo_b_spec.resident = "stacked"
             specs.append(wo_b_spec)
             continue
@@ -898,8 +916,10 @@ def golden_decode_swa(tensors):
     from rmsnorm import golden_rms_norm
 
     tp_size, local_t = tensors["x_hc"].shape[:2]
+    # Both weights stay NZ-packed here -- only the leading group axis is
+    # reassembled; golden_decode_o_proj_tp1 (via golden_decode_swa_tp1) unpacks them.
     full_wo_a = tensors["wo_a"].reshape(O_GROUPS, O_LORA, O_GROUP_IN)
-    full_wo_b = tensors["wo_b"].permute(1, 0, 2).reshape(D, O_GROUPS * O_LORA)
+    full_wo_b = tensors["wo_b"].reshape(O_GROUPS, D, O_LORA)
 
     # Project rank-local rows with replicated KV weights before all-gather.
     kv_chunks = []
@@ -956,7 +976,8 @@ if __name__ == "__main__":
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES), help="tensor-parallel world size")
     parser.add_argument(
         "-d", "--device", type=str, default=None,
@@ -1014,7 +1035,8 @@ if __name__ == "__main__":
                 compile_only=args.compile_only,
                 config=dict(
                     dump_passes=args.dump_passes,
-                    platform=args.platform,
+                    backend_type=args.backend_type,
+                    execution_mode=args.execution_mode,
                     device_id=device_ids[0],
                     enable_chip_swimlane=args.enable_chip_swimlane,
                     enable_dep_gen=args.enable_dep_gen,
@@ -1045,7 +1067,8 @@ if __name__ == "__main__":
                 config=dict(
                     dump_passes=args.dump_passes,
                     distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
-                    platform=args.platform,
+                    backend_type=args.backend_type,
+                    execution_mode=args.execution_mode,
                     enable_chip_swimlane=args.enable_chip_swimlane,
                     enable_dep_gen=args.enable_dep_gen,
                 ),

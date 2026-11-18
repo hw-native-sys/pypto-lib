@@ -20,13 +20,14 @@ instead of the INT8 epilogue.
 """
 import pypto.language as pl
 
-from config import GDN_QUANT, GDN_TILING, QWEN3_8_27B
+from chunk_cumsum import CHUNK_TILE
+from config import GDN_QUANT, QWEN3_8_27B
 
 # model shape
 H = QWEN3_8_27B.linear_num_value_heads      # value heads
 D = QWEN3_8_27B.linear_value_head_dim       # head dimension, the norm's axis
 EPS = QWEN3_8_27B.rms_norm_eps
-CHUNK = GDN_TILING.chunk                    # only picks the reference chain to draw from
+CHUNK = CHUNK_TILE                          # only picks the reference chain to draw from
 
 # quantization
 SCALE_MAX = GDN_QUANT.scale_max
@@ -203,10 +204,10 @@ def golden_gdn_gated_rmsnorm_bf16(tensors):
 
 def _draw(key: str, t: int, chunk: int, weights: str | None):
     """A block-chain tensor as a lazy spec value; one chain serves every spec and the compare."""
-    import reference
+    import block_reference
 
     # quant_y=True so the same cached chain also carries y_q / y_scale for the gate
-    return reference.block_inputs(key, t, QWEN3_8_27B, chunk, weights=weights, quant_y=True)
+    return block_reference.block_inputs(key, t, QWEN3_8_27B, chunk, weights=weights, quant_y=True)
 
 
 def _norm_weight(weights: str | None):

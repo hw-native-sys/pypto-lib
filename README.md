@@ -12,7 +12,6 @@ examples/        Self-contained kernels for learning the DSL
 models/          End-to-end LLM kernels, one flat directory per model build
   qwen3_14b/                   Qwen3-14B prefill + decode, BF16, serving contract
   deepseek_v4_flash_mtp/       DeepSeek V4-Flash, INT8 W8A8, MTP=1, serving contract
-  deepseek_v4_pro/             DeepSeek V4-Pro with an optional Flash preset, A5 variant
   (other directories are kernel harnesses — see the model pages)
 golden/          Test harness — compile, run on device, validate against torch
 tests/           Lint checks and golden-fn unit tests
@@ -31,11 +30,11 @@ Follow the
 run a beginner example:
 
 ```bash
-python examples/beginner/hello_world.py -p a2a3sim   # simulator
+python examples/beginner/hello_world.py -p a2a3 --sim   # simulator
 python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0   # real NPU, device 0
 ```
 
-The learning examples accept `-p {a2a3,a2a3sim,a5,a5sim}` and exit non-zero
+The learning examples accept `-p {a2a3,a5} [--sim]` and exit non-zero
 on validation mismatch. Model and distributed entry points have
 script-specific platform and device arguments; inspect `--help` and the
 [platform table](docs/get-started/first-kernel.md#platforms-and-devices). See the

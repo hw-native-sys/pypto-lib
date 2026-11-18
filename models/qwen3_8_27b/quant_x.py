@@ -21,11 +21,12 @@ Purely memory-bound: 84 MB in, 42 MB out at T = 8192.
 """
 import pypto.language as pl
 
-from config import GDN_QUANT, GDN_TILING, QWEN3_8_27B
+from chunk_cumsum import CHUNK_TILE
+from config import GDN_QUANT, QWEN3_8_27B
 
 # model shape
 C = QWEN3_8_27B.hidden_size                 # the block's input width
-CHUNK = GDN_TILING.chunk                    # only picks the reference chain to draw from
+CHUNK = CHUNK_TILE                          # only picks the reference chain to draw from
 
 # quantization
 SCALE_MAX = GDN_QUANT.scale_max

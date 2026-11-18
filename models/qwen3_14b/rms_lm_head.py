@@ -184,6 +184,7 @@ def rms_lm_head_fp32(
         name_hint="lm_head",
         allow_early_resolve=True,
     ):
+        pl.set_cache_policy(lm_head_weight, pl.CachePolicy.BYPASS)
         for b0 in pl.range(0, BATCH_PAD, BATCH_TILE):
             lm_valid_rows = pl.min(BATCH_TILE, valid_rows - b0)
             for ob in pl.range(lm_core, VOCAB // VOCAB_CHUNK, LM_HEAD_CORES):

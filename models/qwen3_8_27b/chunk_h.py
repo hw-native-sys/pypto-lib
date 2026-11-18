@@ -6,158 +6,209 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Gated DeltaNet chunk_h: the inter-chunk state recurrence. Per chunk c, per
-head, with S the state entering the chunk,
+"""Gated DeltaNet chunk_h: the inter-chunk state recurrence. Per chunk, per head,
+with S the state entering the chunk,
 
-    snapshot_c = S
-    V_new      = U - W @ S
-    S          = exp(g_last) * S + K^T (V_new * exp(g_last - g))
+    snapshot = S
+    V_new    = U - W @ S
+    S        = exp(g_last) * S + K^T (V_new * exp(g_last - g))
 
-It produces both inputs chunk_o consumes: the per-chunk state snapshots and
-V_new. Chunks carry state, so they cannot run in parallel; work is parallel over
-heads and the chunks run sequentially within a head.
-
-The decay is rebased on the chunk's last gate, exp(g_last - g_i) <= 1, because
-the algebraically equal exp(g_last) * exp(-g_i) reaches e^90 on a 128-token chunk
-and overflows FP32. The state decay therefore cannot be factored out of the
-contraction, and g_last is read as a scalar.
+Chunks carry state, so work is parallel over heads and sequential within one.
 """
 import pypto.language as pl
+import torch
 
-from config import GDN_TILING, QWEN3_8_27B
+from chunk_cumsum import cumsum_ref
+from config import QWEN3_8_27B
+from reference import REF_DTYPE, flat_state, frob_ok, make_inputs, to_hT
+from scaled_dot_kkt import kkt_ref
+from solve_tril import solve_tril_ref
+from wy_fast import CHUNK_TILE, wy_fast_ref
 
-# model shape
+# Dynamic shape variables.
+T_DYN = pl.dynamic("T_DYN")                 # tokens
+STATE_DYN = pl.dynamic("GDN_STATE_DYN")     # (T // CHUNK_TILE) * H * D, the snapshot rows
+
+# model config
 H = QWEN3_8_27B.linear_num_value_heads      # value heads
 HG = QWEN3_8_27B.linear_num_key_heads       # QK heads; H // HG value heads share one
 D = QWEN3_8_27B.linear_value_head_dim       # head dimension
-CHUNK = GDN_TILING.chunk                    # chunk size in tokens, our tiling choice
+GRP = H // HG                               # value heads sharing one key head
+KEY_WIDTH = HG * D
+VAL_WIDTH = H * D
 
-# case shape
-T = 8192                # tokens (single sequence, B = 1)
+# tiling
+AIV_LANES = 2                               # vector lanes one core group drives
+ROW_TILE = CHUNK_TILE // AIV_LANES          # chunk rows one lane owns
+STATE_TILE = D // AIV_LANES                 # state rows one lane owns
+
+# validation
+# One chunk, the cross-chunk recurrence, then eight chunks. The token count must be a
+# multiple of CHUNK_TILE.
+DEFAULT_CASES = (128, 256, 1024)
+BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 
-def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
-                 hg: int = HG, inline: bool = False):
-    """The stage kernel at one shape.
-
-    `hg` is the number of QK heads, `h` the number of value heads; they differ
-    under GQA. Pass `hg=h` for an ungrouped shape. `inline` makes the kernel a
-    callee for `gdn_layer` rather than a program of its own.
-    """
-    nchunk = t // chunk                    # sequential steps per head
-    grp = h // hg
-
-    @(pl.jit.inline if inline else pl.jit)
-    def gdn_chunk_h(
-        k: pl.Tensor[[t, hg, d], pl.FP16],
-        w: pl.Tensor[[t, h, d], pl.FP16],
-        u: pl.Tensor[[t, h, d], pl.FP16],
-        g_sum: pl.Tensor[[h, t], pl.FP32],
-        state: pl.Out[pl.Tensor[[nchunk * h * d, d], pl.FP16]],
-        v_new: pl.Out[pl.Tensor[[t, h, d], pl.FP16]],
+def _gdn_chunk_h(
+    k: pl.Tensor[[T_DYN, HG, D], pl.FP16],
+    w: pl.Tensor[[T_DYN, H, D], pl.FP16],
+    u: pl.Tensor[[T_DYN, H, D], pl.FP16],
+    g_sum: pl.Tensor[[H, T_DYN], pl.FP32],
+    state: pl.Out[pl.Tensor[[STATE_DYN, D], pl.FP16]],
+    v_new: pl.Out[pl.Tensor[[T_DYN, H, D], pl.FP16]],
+):
+    """The token count must be a multiple of CHUNK_TILE, and `state` hold (T // CHUNK_TILE) * H * D rows."""
+    k.bind_dynamic(0, T_DYN)
+    w.bind_dynamic(0, T_DYN)
+    u.bind_dynamic(0, T_DYN)
+    g_sum.bind_dynamic(1, T_DYN)
+    state.bind_dynamic(0, STATE_DYN)
+    v_new.bind_dynamic(0, T_DYN)
+    t_dim = pl.tensor.dim(k, 0)
+    k_flat = pl.reshape(k, [t_dim, KEY_WIDTH])
+    w_flat = pl.reshape(w, [t_dim, VAL_WIDTH])
+    u_flat = pl.reshape(u, [t_dim, VAL_WIDTH])
+    v_flat = pl.reshape(v_new, [t_dim, VAL_WIDTH])
+    for hh in pl.spmd(
+        H, name_hint="chunk_h",
+        optimizations=[pl.cross_core_slot(slot_num=1)],
     ):
-        k_flat = pl.reshape(k, [t, hg * d])
-        w_flat = pl.reshape(w, [t, h * d])
-        u_flat = pl.reshape(u, [t, h * d])
-        v_flat = pl.reshape(v_new, [t, h * d])
-        # pl.split is required, not a tuning choice: without it the kernel needs
-        # 197632 B of a 188416 B vector buffer and does not build.
-        for hh in pl.spmd(h, name_hint="chunk_h",
-                          optimizations=[pl.cross_core_slot(slot_num=1),
-                                         pl.split(pl.SplitMode.UP_DOWN)]):
-            s0 = pl.full([d, d], dtype=pl.FP32, value=0.0)
-            for c, (s_cur, st, vf) in pl.range(nchunk, init_values=(s0, state, v_flat)):
-                t0 = c * chunk
-                row = (c * h + hh) * d
-                d0 = hh * d
-                # GQA: K comes from key head hh // grp; W, U and the state are per
-                # value head.
-                dg0 = (hh // grp) * d
+        # The carried state is per-lane from the start: each lane owns STATE_TILE
+        # of its D rows and never holds the whole [D, D] tile.
+        for _ in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.NONE):
+            s0 = pl.full([STATE_TILE, D], dtype=pl.FP32, value=0.0)
+        for c, (s_cur,) in pl.range(t_dim // CHUNK_TILE, init_values=(s0,)):
+            t0 = c * CHUNK_TILE
+            row = (c * H + hh) * D
+            d0 = hh * D
+            # GQA: K comes from key head hh // GRP; W, U and the state are per
+            # value head.
+            dg0 = (hh // GRP) * D
+            g_last = pl.read(g_sum, [hh, t0 + CHUNK_TILE - 1])
 
+            for state_aiv in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
+                sr0 = state_aiv * STATE_TILE
                 s16 = pl.cast(s_cur, target_type=pl.FP16, mode="rint")
-                st_next = pl.assemble(st, s16, [row, 0])        # state ENTERING this chunk
+                state[row + sr0 : row + sr0 + STATE_TILE, 0:D] = s16   # state ENTERING this chunk
+                s16_full = pl.aic_gather(s16)                          # the cube needs both halves
+            wc = w_flat[t0 : t0 + CHUNK_TILE, d0 : d0 + D]
+            ws = pl.matmul(wc, s16_full, out_dtype=pl.FP32)
 
-                # coeff[i] = exp(g_last - g_i), decay = exp(g_last); both arguments <= 0.
-                # The unary exp comes BEFORE the [1,C]->[C,1] reshape: an elementwise op
-                # after that reshape loses pl.split's tracking.
-                g_last = pl.read(g_sum, [hh, t0 + chunk - 1])
-                g_row = g_sum[hh : hh + 1, t0 : t0 + chunk]
-                zero_row = pl.full([1, chunk], dtype=pl.FP32, value=0.0)
-                neg_g = pl.sub(zero_row, g_row)
-                coeff = pl.reshape(pl.exp(pl.add(neg_g, g_last)), [chunk, 1])
-                zero_d = pl.full([1, d], dtype=pl.FP32, value=0.0)
-                decay = pl.reshape(pl.exp(pl.add(zero_d, g_last)), [d, 1])
-
-                wc = w_flat[t0 : t0 + chunk, d0 : d0 + d]
-                ws = pl.matmul(wc, s16, out_dtype=pl.FP32)
-                uc = u_flat[t0 : t0 + chunk, d0 : d0 + d]
-                vc = pl.sub(pl.cast(uc, target_type=pl.FP32), ws)   # V_new = U - W @ S
+            # S = exp(g_last) * S + K^T @ (coeff * V_new). The decay goes on V, not
+            # on K: K^T (V c) == (K c)^T V. A matmul whose transposed operand came
+            # from the vector unit cannot be lowered (pypto#2902).
+            for v_aiv in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
+                r0 = v_aiv * ROW_TILE
+                # coeff[i] = exp(g_last - g_i), argument <= 0
+                g_lane = g_sum[hh : hh + 1, t0 + r0 : t0 + r0 + ROW_TILE]
+                zero_row = pl.full([1, ROW_TILE], dtype=pl.FP32, value=0.0)
+                neg_g = pl.sub(zero_row, g_lane)
+                # exp before the [1,C]->[C,1] reshape, not after (pypto#2947)
+                coeff = pl.reshape(pl.exp(pl.add(neg_g, g_last)), [ROW_TILE, 1])
+                uc = u_flat[t0 + r0 : t0 + r0 + ROW_TILE, d0 : d0 + D]
+                vc = pl.sub(pl.cast(uc, target_type=pl.FP32), pl.aiv_shard(ws))   # V_new = U - W @ S
                 vc16 = pl.cast(vc, target_type=pl.FP16, mode="rint")
-
-                # S = exp(g_last) * S + K^T @ (coeff * V_new). The decay goes on V, not
-                # on K: K^T (V c) == (K c)^T V, and under pl.split a matmul whose
-                # TRANSPOSED operand was produced on the vector unit cannot be lowered
-                # (ptoas: "'pto.tmov' op expects a supported tmov address-space pair").
-                kc = k_flat[t0 : t0 + chunk, dg0 : dg0 + d]
+                v_flat[t0 + r0 : t0 + r0 + ROW_TILE, d0 : d0 + D] = vc16
                 vs = pl.row_expand_mul(vc, coeff)
                 vs16 = pl.cast(vs, target_type=pl.FP16, mode="rint")
-                kv = pl.matmul(kc, vs16, a_trans=True, out_dtype=pl.FP32)
-                s_next = pl.add(pl.row_expand_mul(s_cur, decay), kv)
+                vs16_full = pl.aic_gather(vs16)
+            kc = k_flat[t0 : t0 + CHUNK_TILE, dg0 : dg0 + D]
+            kv = pl.matmul(kc, vs16_full, a_trans=True, out_dtype=pl.FP32)
 
-                vf_next = pl.assemble(vf, vc16, [t0, d0])
-                s_end, st_end, vf_end = pl.yield_(s_next, st_next, vf_next)
-            state = st_end
-            v_flat = vf_end
-        return state, v_new
-
-    return gdn_chunk_h
-
-
-gdn_chunk_h = build_kernel()
+            for _ in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
+                # decay = exp(g_last) on every row, so the lane builds its own width
+                zero_d = pl.full([1, STATE_TILE], dtype=pl.FP32, value=0.0)
+                decay = pl.reshape(pl.exp(pl.add(zero_d, g_last)), [STATE_TILE, 1])
+                s_next = pl.add(pl.row_expand_mul(s_cur, decay), pl.aiv_shard(kv))
+            s_end, = pl.yield_(s_next)
+    return state, v_new
 
 
-def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
-                       hg: int = HG):
-    import torch
+gdn_chunk_h = pl.jit.inline(_gdn_chunk_h)
+gdn_chunk_h_test = pl.jit(_gdn_chunk_h)
+
+
+def chunk_h_ref(
+    k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g_sum: torch.Tensor,
+    chunk: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """S6: the inter-chunk state recurrence.
+
+    Returns the state snapshot ENTERING each chunk, [NCHUNK, H, D, D]; the
+    residual-corrected values V_new, [T, H, D]; and the state LEAVING the last
+    chunk, [H, D, D], which is what an inference cache carries forward.
+    """
+    t, hg, d = k.shape
+    h = w.shape[1]
+    grp = h // hg
+    nc = t // chunk
+    kf, wf, uf, gf = (x.to(REF_DTYPE) for x in (k, w, u, g_sum))
+    state = torch.zeros(nc, h, d, d, dtype=REF_DTYPE)
+    v_new = torch.zeros(t, h, d, dtype=REF_DTYPE)
+    final_state = torch.zeros(h, d, d, dtype=REF_DTYPE)
+    for hh in range(h):
+        s = torch.zeros(d, d, dtype=REF_DTYPE)
+        for ci in range(nc):
+            t0 = ci * chunk
+            gc = gf[t0 : t0 + chunk, hh]
+            g_last = gc[-1]
+            state[ci, hh] = s
+            vc = uf[t0 : t0 + chunk, hh, :] - wf[t0 : t0 + chunk, hh, :] @ s
+            v_new[t0 : t0 + chunk, hh, :] = vc
+            vg = vc * torch.exp(g_last - gc)[:, None]
+            kv = kf[t0 : t0 + chunk, hh // grp, :].T @ vg
+            s = torch.exp(g_last) * s + kv
+        final_state[hh] = s
+    return state, v_new, final_state
+
+
+_INPUTS: dict = {}
+
+
+def _inputs(t: int) -> dict:
+    """The chain this stage consumes, memoised so the several specs pay for it once."""
+    key = t
+    if key not in _INPUTS:
+        st = make_inputs(t, H, D, HG)
+        st["g_sum"] = cumsum_ref(st["g"], CHUNK_TILE)
+        a16 = kkt_ref(st["k"], st["beta"], st["g_sum"], CHUNK_TILE).to(torch.float16)
+        a_inv16 = solve_tril_ref(a16, CHUNK_TILE).to(torch.float16)
+        w, u = wy_fast_ref(st["k"], st["v"], st["beta"], a_inv16, st["g_sum"], CHUNK_TILE)
+        st["w16"] = w.to(torch.float16)
+        st["u16"] = u.to(torch.float16)
+        _INPUTS[key] = st
+    return _INPUTS[key]
+
+
+def build_tensor_specs(t: int = BENCH_SEQ):
     from golden import TensorSpec
 
-    import reference
+    def draw(key, transform=None):
+        def make():
+            value = _inputs(t)[key]
+            return transform(value) if transform is not None else value
 
-    nc = t // chunk
+        return make
+
+    nc = t // CHUNK_TILE
 
     return [
-        TensorSpec("k", [t, hg, d], torch.float16,
-                   init_value=reference.lazy("chunk_h", "k", t, h, d, chunk, hg=hg)),
-        TensorSpec("w", [t, h, d], torch.float16,
-                   init_value=reference.lazy("chunk_h", "w16", t, h, d, chunk, hg=hg)),
-        TensorSpec("u", [t, h, d], torch.float16,
-                   init_value=reference.lazy("chunk_h", "u16", t, h, d, chunk, hg=hg)),
-        TensorSpec("g_sum", [h, t], torch.float32,
-                   init_value=reference.lazy("chunk_h", "g_sum", t, h, d, chunk, reference.to_hT, hg=hg)),
-        TensorSpec("state", [nc * h * d, d], torch.float16),
-        TensorSpec("v_new", [t, h, d], torch.float16),
+        TensorSpec("k", [t, HG, D], torch.float16, init_value=draw("k")),
+        TensorSpec("w", [t, H, D], torch.float16, init_value=draw("w16")),
+        TensorSpec("u", [t, H, D], torch.float16, init_value=draw("u16")),
+        TensorSpec("g_sum", [H, t], torch.float32, init_value=draw("g_sum", to_hT)),
+        TensorSpec("state", [nc * H * D, D], torch.float16),
+        TensorSpec("v_new", [t, H, D], torch.float16),
     ]
 
 
 def golden_gdn_chunk_h(tensors):
-    import reference
-
     t, _, d = tensors["k"].shape          # k has Hg heads under GQA
     h = tensors["w"].shape[1]             # W, U and the state are per value head
     chunk = t // (tensors["state"].shape[0] // (h * d))
-    state, v_new, _ = reference.chunk_h(tensors["k"], tensors["w"], tensors["u"],
-                                        tensors["g_sum"].t(), chunk)
-    tensors["state"].copy_(reference.flat_state(state))
+    state, v_new, _ = chunk_h_ref(tensors["k"], tensors["w"], tensors["u"], tensors["g_sum"].t(), chunk)
+    tensors["state"].copy_(flat_state(state))
     tensors["v_new"].copy_(v_new)
-
-
-def _stats_ok(actual, expected, **_kwargs):
-    """megagdn-pto's criterion for this stage (tests/utils.py: NumericalAccuracy)."""
-    import reference
-
-    ok, detail = reference.stats_ok(actual, expected, chunk=CHUNK)
-    print(f"[stats] {detail}", flush=True)
-    return ok, detail
 
 
 if __name__ == "__main__":
@@ -165,27 +216,35 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--seq-len", type=int, default=None, help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
+    cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
+    if args.seq_len and args.seq_len % CHUNK_TILE:
+        parser.error(f"--seq-len must be a multiple of CHUNK_TILE={CHUNK_TILE}")
+    if len(cases) > 1 and (args.golden_data or args.runtime_dir):
+        parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
 
-    result = run(
-        fn=gdn_chunk_h,
-        specs=build_tensor_specs(),
-        golden_fn=golden_gdn_chunk_h,
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        save_data=args.save_data,
-        config=dict(platform=args.platform, device_id=args.device),
-        rtol=1e-2,
-        atol=1e-5,
-        compare_fn={"state": _stats_ok, "v_new": _stats_ok},
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    for t in cases:
+        print(f"[case] chunk_h T={t}", flush=True)
+        result = run(
+            fn=gdn_chunk_h_test,
+            specs=build_tensor_specs(t=t),
+            golden_fn=golden_gdn_chunk_h,
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            save_data=args.save_data,
+            config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
+            compare_fn={"state": frob_ok(), "v_new": frob_ok()},
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            # Stop at the first failure: one device failure poisons the chip run lane, so
+            # every later case in this process reports a failure it did not cause.
+            raise SystemExit(f"FAILED at T={t}")

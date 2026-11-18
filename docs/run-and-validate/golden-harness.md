@@ -37,6 +37,16 @@ TensorSpec(
 Random input is therefore explicit: use `init_value=torch.randn` or another
 random factory. `init_value=None` does not generate random values.
 
+Keep expensive data generation inside the initializer. For example,
+`init_value=lambda: quantize_weights()` defers quantization until input
+creation, while computing `weights = quantize_weights()` before constructing
+the spec still pays that cost during a compile-only run. When several specs
+share generated weights and scales, cache their common factory within one
+fixture construction. Separate fixtures must keep independent tensor storage.
+Preserve explicit random generators and seeds when deferring initialization.
+The DeepSeek V4.1 MoE and standalone routed-expert fixtures use this pattern
+for packed expert weights; the decode-layer fixture inherits the MoE initializers.
+
 A spec does not declare a direction. The harness reads each parameter's
 `In` / `Out` / `InOut` from the compiled artifact and stamps it onto the spec
 before any tensor is allocated, so the kernel signature is the single source of
@@ -108,7 +118,8 @@ result = run(
     specs=build_specs(),
     golden_fn=golden_hello_world,
     config={
-        "platform": args.platform,
+        "backend_type": args.backend_type,
+        "execution_mode": args.execution_mode,
         "device_id": args.device,
     },
     rtol=1e-5,
@@ -124,7 +135,8 @@ result = run(
     specs=build_specs(),
     golden_fn=golden_fn,
     config={
-        "platform": args.platform,
+        "backend_type": args.backend_type,
+        "execution_mode": args.execution_mode,
         "device_id": args.device,
     },
 )
@@ -216,3 +228,40 @@ PYPTO_GOLDEN_NUM_THREADS=8 \
   validation fails.
 - Use [Precision Tuning](../debug-and-tune/precision-tuning.md) when the mismatch itself is
   the subject of the work.
+
+## Backend and execution mode
+
+New configurations can select `backend_type` (`BackendType.Ascend910B` or
+`BackendType.Ascend950`) and `execution_mode` (`ExecutionMode.ONBOARD` or
+`ExecutionMode.SIM`) separately. Import `BackendType` from `pypto.backend` and
+`ExecutionMode` from `pypto.runtime`. The harness passes these choices through
+`RunConfig` and uses both when reloading saved builds.
+
+Dictionary configurations also accept `backend_type="a2a3"` or `"a5"`
+and `execution_mode=True` (simulator) or `False` (hardware). The harness
+converts these CLI values to PyPTO enums before constructing `RunConfig`.
+For example, entry scripts can define:
+
+```python
+parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+parser.add_argument("--sim", dest="execution_mode", action="store_true")
+```
+
+Then pass `backend_type=args.backend_type` and
+`execution_mode=args.execution_mode` in the run configuration.
+
+Drivers that call PyPTO compilation or execution APIs directly can import
+`normalize_config` from `golden` to build a `RunConfig` with the same conversion:
+
+```python
+config = normalize_config(dict(
+    backend_type=args.backend_type,
+    execution_mode=args.execution_mode,
+    device_id=args.device,
+))
+compiled = kernel.compile(*inputs, config=config)
+```
+
+Existing `platform` configurations and `-p` command-line arguments remain
+supported. PyPTO retains the derived platform string in cache keys and artifact
+metadata, so equivalent old and new configurations select the same target.

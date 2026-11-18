@@ -100,7 +100,7 @@ assert DP_SIZE in _DP_CHOICES, f"--dp must be one of {_DP_CHOICES} (got {DP_SIZE
 
 def _lm_head(
     hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, pl.NZ],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
@@ -189,6 +189,8 @@ def _lm_head(
         name_hint="lm_head_matmul_push",
         optimizations=[pl.cross_core_slot(slot_num=2)],
     ) as _push_tid:
+        # Weight reads bypass L2.
+        pl.set_cache_policy(lm_head_weight, pl.CachePolicy.BYPASS)
         lm_core = pl.tile.get_block_idx()
         vocab_base = tp_rank * VOCAB_PER_TP
         for mm_ob in pl.range(lm_core, VOCAB_TILES, FUSED_LM_HEAD_CORES):
@@ -317,7 +319,7 @@ lm_head_test = pl.jit(_lm_head)
 
 def _lm_head_with_sampling(
     hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, pl.NZ],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     sampling_temperatures: pl.Tensor[[MAX_LOGIT_ROWS], pl.FP32],
     sampling_top_ks: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
@@ -426,10 +428,12 @@ def l3_lm_head_projection(
 def golden_lm_head(tensors):
     import torch
 
+    from utils import unpack_nz
+
     hidden = tensors["hidden_states"].float()
     # Card r holds shard r % TP_SIZE, so concatenating shards in index order
     # reproduces the global vocabulary order every owner assembles.
-    weight = tensors["lm_head_weight"].float()
+    weight = unpack_nz(tensors["lm_head_weight"]).float()
     full_weight = torch.cat([weight[tp] for tp in range(TP_SIZE)], dim=0)
     full_logits = []
     world_size = hidden.shape[0]
@@ -459,6 +463,7 @@ def golden_lm_head(tensors):
 def build_tensor_specs(num_tokens=TEST_TOKENS):
     import torch
     from golden import TensorSpec
+    from utils import pack_nz
 
     active = max(min(num_tokens, MAX_LOGIT_ROWS), 0)
 
@@ -467,7 +472,7 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
 
     def init_lm_head_weight():
         shards = (torch.randn(TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
-        return torch.stack([shards[r % TP_SIZE] for r in range(WORLD_SIZE)], dim=0)
+        return pack_nz(torch.stack([shards[r % TP_SIZE] for r in range(WORLD_SIZE)], dim=0))
 
     def init_logit_row_indices():
         indices = torch.full((WORLD_SIZE, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
@@ -579,8 +584,8 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES),
                         help="LM-head tensor-parallel world size")
     parser.add_argument("--dp", type=int, default=DP_SIZE, choices=list(_DP_CHOICES),
@@ -631,7 +636,8 @@ if __name__ == "__main__":
                 device_ids=device_ids[:required_devices],
                 num_sub_workers=0,
             ),
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),
         rtol=1e-3,

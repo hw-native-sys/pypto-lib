@@ -41,7 +41,7 @@ product get faster"; a device span answers "did the kernel get faster". They
 move independently, and this page says which one a change moved.
 
 None of the three is what a new measurement should use. Today's number is the
-`mean=` field of `PYPTO_BENCH=1`'s `[RUN] effective_us` line — see
+`median=` field of `PYPTO_BENCH=1`'s single-card `[RUN] effective_us` line — see
 [Performance Tuning](../../debug-and-tune/performance-tuning.md). Do not
 compare a fresh `effective_us` against a figure on this page.
 
@@ -70,12 +70,19 @@ Qwen3-14B has 40 attention heads over 8 KV heads, so each KV head carries
 **5** Q heads. Five is odd and prime, and that one number shaped the whole
 attention thread.
 
-Every `SplitMode.UP_DOWN` row-split fusion — the standard way to fuse a cube
-matmul with its vector epilogue on this hardware — **rejects it**:
+With the historical implicit-splitting compiler, every `SplitMode.UP_DOWN`
+row-split fusion of a cube matmul and its vector epilogue **rejected it**:
 `SplitVectorKernel requires an even split dimension, got 5`. Drop `UP_DOWN` and
 the fallback fails differently: the `row_expand_div` output's `valid_shape`
 stays uninitialised inside a mixed root, so a `[5, HEAD_DIM]` subview fails IR
 validation (#349).
+
+Current split mixed kernels use explicit `pl.split_aiv` regions with `pl.aiv_shard` /
+`pl.aic_gather` boundaries and lane-specific slices and stores; function-level
+`pl.split(UP_DOWN)` no longer halves the body. See the
+[mixed-kernel contract](../../pypto-coding/l2-programming.md#optimizations).
+The compiler diagnostics and transformations below describe the historical
+implementation.
 
 The tree spent three changes finding an answer:
 
@@ -503,10 +510,14 @@ a 2-layer makespan from 2114.6 to 2090.4 µs.
 When 50 output-projection tiles become ready at once and the consumer only needs
 some of them to start, splitting the dispatch pays.
 
-`out_proj` splits its 50 `(n, k)` tiles into two waves: the last 24 are one SPMD
-dispatch gated **directly** on the attention TaskId, and the other 26 are
-deferred behind an unflagged `pl.system.task_dummy(deps=[attn_done_tid])`. The
-direct dispatch deliberately carries no `allow_early_resolve`. #794 applied the
+`out_proj` splits its 50 `(n, k)` tiles into two waves: the last 24 go out as
+three SPMD dispatches gated **directly** on the attention TaskId, and the other
+26 are deferred behind an unflagged `pl.system.task_dummy(deps=[attn_done_tid])`.
+The direct region is segmented at residual-cast slice boundaries
+(`OUT_DIRECT_SPLIT_POINTS`, derived from the `N_PER_CAST_K * K_SPLITS_OUT` tiles
+each cast slice consumes), so a downstream cast slice starts as soon as its own
+out_proj tiles finish instead of waiting for the whole 24-tile region. The
+direct dispatches deliberately carry no `allow_early_resolve`. #794 applied the
 same pattern to `gate_proj` / `up_proj`: the leading `GATE_UP_SPMD_N = 6` N-tiles
 go out as `pl.spmd` per K-split gated on the corresponding cast, and tiles
 `n ≥ 6` route through a per-K `task_dummy` funnel.

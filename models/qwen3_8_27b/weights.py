@@ -20,7 +20,7 @@ gives every tensor's dtype, shape and byte span.
 
 The file is a `torch.save` dict keyed by the tensor names under `linear_attn.`
 -- `in_proj_qkv.weight`, `A_log`, ... -- in the checkpoint's bf16, which is what
-`reference.block` and the module's `load_state_dict` both take. Default path:
+`block_reference.block` and the module's `load_state_dict` both take. Default path:
 `build_output/qwen3_8_27b/linear_attn_layer<N>.pt`, next to the compile output
 and gitignored with it. `--quantize` writes the int8 form beside it
 (`..._int8.pt`): the projections the kernels run as W8A8 replaced by int8 plus a

@@ -9,7 +9,7 @@ tracked runnable set.
 | [qwen3_14b](qwen3_14b/index.md) | Qwen3-14B BF16 prefill and decode with the serving contract, plus A8W8 and TurboQuant variants and the sampling components | Supported — one-card A2/A3 accuracy |
 | [deepseek_v4_flash_mtp](deepseek_v4_flash_mtp/index.md) | DeepSeek V4-Flash at MTP = 1, batch 4 per card: operators, layer and MTP compositions, prefill/decode full forwards | Supported — eight-card accuracy job on relevant PRs |
 | [deepseek_v4_flash_dspark](deepseek_v4_flash_dspark/index.md) | The same V4-Flash checkpoint at batch 64 per card and S = 8 DSpark speculation, with TP-sharded DSA-CP attention; under development | Not supported |
-| [deepseek_v4_pro](deepseek_v4_pro/index.md) | Ascend A5 DeepSeek V4-Pro with an optional Flash preset, quantized Hybrid MXFP8-MXFP4 | Not supported |
+| [deepseek_v4_flash_lowlat](deepseek_v4_flash_lowlat/index.md) | The V4-Flash decode path at batch 1, S = 8 DSpark speculation, world 2, and default context capacity 1,048,576: head-group and CSA token-sharded attention, tensor-parallel MoE, embedding and LM head; under development, decode only | Not supported |
 | [deepseek_v4_1_flash](deepseek_v4_1_flash/index.md) | DeepSeek V4.1 Flash TP4/DP2/EP8 scaffold with low-bit SWA/C2A/C1A caches, hierarchical indexer, mHC, and MoE | Not supported |
 | [glm5_3_flash](glm5_3_flash/index.md) | GLM-5.3-Flash on a2a3 at TP16/EP16 with W8A8 INT8: the hybrid KDA + NoPE-MLA backbone, the kpool DSA indexer, mHC and MoE. Staging area — configuration, goldens and kernel ABIs only | Not supported |
 | [qwen3_8_27b](qwen3_8_27b/index.md) | The whole Gated DeltaNet block of Qwen3.8-27B in W8A8: fourteen operators and the block composing them, hidden states in and out. The rest of the model, and variable-length batching, are not written, so it is under development | Not supported |
@@ -26,6 +26,6 @@ Entry points take script-specific platform and device arguments; inspect
 [Golden Harness guide](../run-and-validate/golden-harness.md).
 
 ```bash
-python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0
+python models/deepseek_v4_flash_mtp/decode_csa.py -p a2a3 -d 0
 python models/deepseek_v4_flash_mtp/decode_layer.py -p a2a3 --ep 2 -d 0,1
 ```

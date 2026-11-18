@@ -1,0 +1,168 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+import pypto.language as pl
+
+from .config import FLASH as M, DECODE_BATCH, DECODE_SEQ, TP, PREFILL_BATCH, PREFILL_SEQ
+
+T_DYN = pl.dynamic("NATIVE_D_RMS_NORM_T_DYN")  # T = B * S
+
+CHUNK_D_DYN = pl.dynamic("NATIVE_D_RMS_NORM_CHUNK_D_DYN")
+
+D = M.hidden_size
+
+EPS = M.rms_norm_eps
+
+D_TILE = 128
+
+T_TILE = 8
+
+assert D % D_TILE == 0, "D must be divisible by D_TILE"
+
+assert (DECODE_BATCH // TP * DECODE_SEQ) % T_TILE == 0
+
+assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
+
+
+@pl.jit.inline
+def rms_norm_inverse(sq_sum: pl.Tensor[[1, T_TILE], pl.FP32]):
+    """Compute inverse RMS from the per-token full-width square sums."""
+    mean = pl.mul(sq_sum, 1.0 / D)
+    variance = pl.add(mean, EPS)
+    inverse = pl.rsqrt(variance, high_precision=True)
+    return inverse
+
+
+@pl.jit.inline
+def rms_norm_apply(
+    x: pl.Tensor[[T_TILE, CHUNK_D_DYN], pl.BF16],
+    norm_w: pl.Tensor[[1, CHUNK_D_DYN], pl.BF16],
+    inverse: pl.Tensor[[1, T_TILE], pl.FP32],
+):
+    """Apply inverse RMS and norm weights to one BF16 activation chunk."""
+    x_fp32 = pl.cast(x, pl.FP32)
+    inverse_col = pl.reshape(inverse, [T_TILE, 1])
+    norm_w_fp32 = pl.cast(norm_w, pl.FP32)
+    scaled = pl.row_expand_mul(x_fp32, inverse_col)
+    normed = pl.col_expand_mul(scaled, norm_w_fp32)
+    result = pl.cast(normed, pl.BF16, mode="rint")
+    return result
+
+
+@pl.jit.inline
+def _rms_norm_full_tile(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    x_normed: pl.Tensor[[T_DYN, D], pl.BF16],
+):
+    """Run the aligned token tile through the existing Tensor-level dataflow."""
+    tg = pl.tile.get_block_idx() * T_TILE
+    x_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+    for rms_db in pl.pipeline(D // D_TILE, stage=2):
+        rms_d0 = rms_db * D_TILE
+        rms_x_input = x[tg : tg + T_TILE, rms_d0 : rms_d0 + D_TILE]
+        rms_x_chunk = pl.cast(rms_x_input, target_type=pl.FP32)
+        rms_x_sq = pl.mul(rms_x_chunk, rms_x_chunk)
+        rms_x_row_sum = pl.reshape(pl.row_sum(rms_x_sq), [1, T_TILE])
+        x_sq_sum = pl.add(x_sq_sum, rms_x_row_sum)
+    norm_sq_sum = pl.create_tensor([1, T_TILE], dtype=pl.FP32)
+    norm_sq_sum[:, :] = x_sq_sum
+    x_inv_rms = pl.create_tensor([1, T_TILE], dtype=pl.FP32)
+    inverse_result = rms_norm_inverse(norm_sq_sum)
+    x_inv_rms[:, :] = inverse_result
+    for apply_db in pl.pipeline(D // D_TILE, stage=2):
+        apply_d0 = apply_db * D_TILE
+        apply_x_input = x[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE]
+        norm_w_input = norm_w[apply_d0 : apply_d0 + D_TILE]
+        norm_w_row = pl.reshape(norm_w_input, [1, D_TILE])
+        x_normed_chunk = rms_norm_apply(apply_x_input, norm_w_row, x_inv_rms)
+        x_normed[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE] = x_normed_chunk
+
+
+@pl.jit.inline
+def _rms_norm_tail_tile(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    x_normed: pl.Tensor[[T_DYN, D], pl.BF16],
+):
+    """Run the ragged last token tile through explicit `valid_shape` load/store.
+
+    Step for step the same RMSNorm as `_rms_norm_full_tile`. The two live in
+    separate scopes rather than in one `if`/`else` body because this path binds
+    the shared names (`x_sq_sum`, `x_inv_rms`, …) to Vec-space Tiles while the
+    aligned path binds them to Tensors, and a name cannot be rebound to a
+    different type inside one kernel.
+    """
+    tg = pl.tile.get_block_idx() * T_TILE
+    valid_rows = pl.min(T_TILE, pl.tensor.dim(x, 0) - tg)
+    row_reduce_tmp = pl.create_tile([T_TILE, D_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+    x_sq_sum = pl.tile.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+    for rms_db in pl.pipeline(D // D_TILE, stage=2):
+        rms_d0 = rms_db * D_TILE
+        rms_x_input = pl.load(
+            x,
+            [tg, rms_d0],
+            [T_TILE, D_TILE],
+            valid_shape=[valid_rows, D_TILE],
+            target_memory=pl.MemorySpace.Vec,
+        )
+        rms_x_chunk = pl.cast(rms_x_input, target_type=pl.FP32)
+        rms_x_sq = pl.mul(rms_x_chunk, rms_x_chunk)
+        rms_x_row_sum = pl.reshape(pl.row_sum(rms_x_sq, row_reduce_tmp), [1, T_TILE])
+        x_sq_sum = pl.add(x_sq_sum, rms_x_row_sum)
+    x_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS)))
+    x_inv_rms_t = pl.reshape(x_inv_rms, [T_TILE, 1])
+    for apply_db in pl.pipeline(D // D_TILE, stage=2):
+        apply_d0 = apply_db * D_TILE
+        apply_x_input = pl.load(
+            x,
+            [tg, apply_d0],
+            [T_TILE, D_TILE],
+            valid_shape=[valid_rows, D_TILE],
+            target_memory=pl.MemorySpace.Vec,
+        )
+        apply_x_chunk = pl.cast(apply_x_input, target_type=pl.FP32)
+        norm_w_input = pl.load(norm_w, [apply_d0], [D_TILE], target_memory=pl.MemorySpace.Vec)
+        norm_w_chunk = pl.cast(pl.reshape(norm_w_input, [1, D_TILE]), pl.FP32)
+        x_scaled = pl.row_expand_mul(apply_x_chunk, x_inv_rms_t)
+        x_normed_chunk = pl.col_expand_mul(x_scaled, norm_w_chunk)
+        x_normed_bf16 = pl.cast(x_normed_chunk, target_type=pl.BF16, mode="rint")
+        x_normed_valid = pl.set_validshape(x_normed_bf16, valid_rows, D_TILE)
+        pl.store(x_normed_valid, [tg, apply_d0], x_normed)
+
+
+@pl.jit.incore
+def rms_norm_spmd(
+    x_normed: pl.Tensor[[T_DYN, D], pl.BF16],
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    norm_w: pl.Tensor[[D], pl.BF16],
+):
+    """Normalize one token tile into the caller-owned output."""
+    t_dim = pl.tensor.dim(x, 0)
+    tg_idx = pl.tile.get_block_idx()
+    tg = tg_idx * T_TILE
+    valid_rows = pl.min(T_TILE, t_dim - tg)
+    if valid_rows == T_TILE:
+        _rms_norm_full_tile(x, norm_w, x_normed)
+    else:
+        _rms_norm_tail_tile(x, norm_w, x_normed)
+
+
+@pl.jit.inline
+def rms_norm(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    x_normed: pl.Tensor[[T_DYN, D], pl.BF16],
+):
+    t_dim = pl.tensor.dim(x, 0)
+    token_tiles = (t_dim + T_TILE - 1) // T_TILE
+    with pl.spmd(token_tiles, name_hint="rms_norm", allow_early_resolve=True) as rms_tid:
+        rms_norm_spmd(x_normed, x, norm_w)
+
+    return rms_tid

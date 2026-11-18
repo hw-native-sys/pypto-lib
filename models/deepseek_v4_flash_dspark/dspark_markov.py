@@ -8,11 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """Compose the target LM head with sequential Markov sampling and confidence."""
 
+from math import gcd
+
 import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 
-from config import FLASH as M
+from config import DECODE_SEQ, MOE_TOKENS, FLASH as M
 from lm_head import (
     DONE_VALUE,
     GROUP_LOGIT_ROWS,
@@ -30,10 +32,10 @@ B_DYN = pl.dynamic("DSPARK_MARKOV_B_DYN")
 
 # DSpark Markov program contract.
 DSPARK_MARKOV_RANK = 256
-DSPARK_QUERY_WIDTH = 7
-DSPARK_QUERY_PAD = 8
-DSPARK_SUPPORTED_BATCHES = (4, 8, 12, 16)
-DSPARK_MAX_BATCH = max(DSPARK_SUPPORTED_BATCHES)
+DSPARK_QUERY_WIDTH = DECODE_SEQ - 1
+DSPARK_QUERY_PAD = DECODE_SEQ
+DSPARK_MAX_BATCH = MOE_TOKENS // DSPARK_QUERY_PAD
+DSPARK_SUPPORTED_BATCHES = tuple(sorted({batch for batch in (2, 4, 8, 12, 16, DSPARK_MAX_BATCH) if batch <= DSPARK_MAX_BATCH}))
 DSPARK_MOE_TOKENS = DSPARK_MAX_BATCH * DSPARK_QUERY_PAD
 
 assert DSPARK_QUERY_WIDTH < DSPARK_QUERY_PAD
@@ -46,13 +48,14 @@ EPS = M.rms_norm_eps
 # tiling
 HIDDEN_TILE = 512
 RMS_M_TILE = 8
-LM_M_TILE = 16
+DSPARK_NORM_TOKENS = (DSPARK_MOE_TOKENS + RMS_M_TILE - 1) // RMS_M_TILE * RMS_M_TILE
+LM_M_TILE = gcd(16, *(batch * DSPARK_QUERY_PAD for batch in DSPARK_SUPPORTED_BATCHES))
 LM_N_TILE = 128
 LM_K_TILE = 256
-MARKOV_M_TILE = DSPARK_MAX_BATCH
+MARKOV_M_TILE = max(8, DSPARK_MAX_BATCH)
 # Keep each request's scratch row on its own 64-byte cache line. Scalar writes
 # from concurrent request blocks otherwise overwrite the neighbouring row.
-MARKOV_ID_PAD = 16
+MARKOV_ID_PAD = (DSPARK_QUERY_WIDTH + 15) // 16 * 16
 CONFIDENCE_PAD = 8
 GREEDY_VOCAB_CHUNK = 256
 GREEDY_NUM_CHUNKS = VOCAB // GREEDY_VOCAB_CHUNK
@@ -75,16 +78,16 @@ for _batch in DSPARK_SUPPORTED_BATCHES:
 def normalize_head_hidden(
     head_hidden: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
     final_norm_weight: pl.Tensor[[D], pl.BF16],
-    normalized: pl.Tensor[[DSPARK_MOE_TOKENS, D], pl.BF16],
+    normalized: pl.Tensor[[DSPARK_NORM_TOKENS, D], pl.BF16],
 ):
     batch = pl.tensor.dim(head_hidden, 0)
     active_tokens = batch * DSPARK_QUERY_WIDTH
     padded_tokens = batch * DSPARK_QUERY_PAD
     hidden_flat = pl.reshape(head_hidden, [active_tokens, D])
-    padded_hidden = pl.create_tensor([DSPARK_MOE_TOKENS, D], dtype=pl.BF16)
+    padded_hidden = pl.create_tensor([DSPARK_NORM_TOKENS, D], dtype=pl.BF16)
     hidden_blocks = D // HIDDEN_TILE
     with pl.spmd(
-        (DSPARK_MOE_TOKENS // RMS_M_TILE) * hidden_blocks,
+        (DSPARK_NORM_TOKENS // RMS_M_TILE) * hidden_blocks,
         name_hint="dspark_hidden_zero",
     ) as hidden_zero_tid:
         zero_task = pl.tile.get_block_idx()
@@ -106,7 +109,7 @@ def normalize_head_hidden(
     # the generic rms_norm inline kernel loses its inferred tensor metadata
     # during JIT specialization.
     with pl.spmd(
-        padded_tokens // RMS_M_TILE,
+        (padded_tokens + RMS_M_TILE - 1) // RMS_M_TILE,
         name_hint="dspark_final_norm",
         deps=[hidden_pad_tid],
         allow_early_resolve=True,
@@ -173,12 +176,19 @@ def normalize_head_hidden(
 def compute_base_logits(
     head_hidden: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
     final_norm_weight: pl.Tensor[[D], pl.BF16],
+    # Plain, not pl.NZ: at full un-sharded VOCAB rows, the strided GM->L1 NZ
+    # load's row gap (VOCAB - tile rows) exceeds the 16-bit encoding the
+    # hardware's TLoadGm2L1Nz2nz burst supports (pto-isa#317); the compiler
+    # rejects it as an unsafe silent-wrong-data load. The TP-sharded
+    # [VOCAB_PER_TP, D] lm_head_weight (shared with lm_head.py, consumed
+    # through the distributed lm_head() path below) stays well under that
+    # limit and keeps pl.NZ.
     lm_head_weight: pl.Tensor[[VOCAB, D], pl.BF16],
     base_logits: pl.Tensor[[DSPARK_MOE_TOKENS, VOCAB], pl.FP32],
 ):
     batch = pl.tensor.dim(head_hidden, 0)
     padded_tokens = batch * DSPARK_QUERY_PAD
-    normalized = pl.create_tensor([DSPARK_MOE_TOKENS, D], dtype=pl.BF16)
+    normalized = pl.create_tensor([DSPARK_NORM_TOKENS, D], dtype=pl.BF16)
     final_norm_tid = normalize_head_hidden(
         head_hidden,
         final_norm_weight,
@@ -191,9 +201,14 @@ def compute_base_logits(
         name_hint="dspark_base_logits",
         deps=[final_norm_tid],
     ) as base_logits_tid:
+        # Weight reads bypass L2.
+        pl.set_cache_policy(lm_head_weight, pl.CachePolicy.BYPASS)
         task = pl.tile.get_block_idx()
         row_block = task // vocab_blocks
-        vocab_block = task - row_block * vocab_blocks
+        # A true modulo (not `task - row_block * vocab_blocks`) so the NZ
+        # offset prover recognizes vocab_offset as non-negative: a difference
+        # never qualifies, but Mod(nonneg, positive constant) does.
+        vocab_block = task % vocab_blocks
         row_offset = row_block * LM_M_TILE
         vocab_offset = vocab_block * LM_N_TILE
         hidden_tile = normalized[
@@ -295,6 +310,8 @@ def greedy_markov_step(
         name_hint="dspark_confidence_head",
         deps=[markov_embedding_tid],
     ) as confidence_tid:
+        # Weight reads bypass L2.
+        pl.set_cache_policy(confidence_head_weight, pl.CachePolicy.BYPASS)
         confidence_block = pl.tile.get_block_idx()
         request_base = confidence_block * CONFIDENCE_PAD
         valid_rows = pl.min(CONFIDENCE_PAD, batch - request_base)
@@ -412,20 +429,7 @@ def greedy_markov_step(
                 request : request + 1,
                 0:MARKOV_ID_PAD,
             ]
-            if step == 0:
-                pl.write(token_row, [0, 0], winning_token)
-            if step == 1:
-                pl.write(token_row, [0, 1], winning_token)
-            if step == 2:
-                pl.write(token_row, [0, 2], winning_token)
-            if step == 3:
-                pl.write(token_row, [0, 3], winning_token)
-            if step == 4:
-                pl.write(token_row, [0, 4], winning_token)
-            if step == 5:
-                pl.write(token_row, [0, 5], winning_token)
-            if step == 6:
-                pl.write(token_row, [0, 6], winning_token)
+            pl.write(token_row, [0, pl.cast(step, pl.INDEX)], winning_token)
             draft_token_scratch[
                 request : request + 1,
                 0:MARKOV_ID_PAD,
@@ -466,52 +470,18 @@ def sample_from_base_logits(
             request : request + 1,
             0:MARKOV_ID_PAD,
         ] = pl.full([1, MARKOV_ID_PAD], dtype=pl.INT32, value=0)
-    step_0_tid = greedy_markov_step(
-        head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
-        markov_w1, markov_w2, confidence_head_weight,
-        draft_token_scratch, confidence_scratch,
-        base_logits_ready_tid, token_scratch_zero_tid, pl.cast(0, pl.INT32)
-    )
-    step_1_tid = greedy_markov_step(
-        head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
-        markov_w1, markov_w2, confidence_head_weight,
-        draft_token_scratch, confidence_scratch,
-        base_logits_ready_tid, step_0_tid, pl.cast(1, pl.INT32)
-    )
-    step_2_tid = greedy_markov_step(
-        head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
-        markov_w1, markov_w2, confidence_head_weight,
-        draft_token_scratch, confidence_scratch,
-        base_logits_ready_tid, step_1_tid, pl.cast(2, pl.INT32)
-    )
-    step_3_tid = greedy_markov_step(
-        head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
-        markov_w1, markov_w2, confidence_head_weight,
-        draft_token_scratch, confidence_scratch,
-        base_logits_ready_tid, step_2_tid, pl.cast(3, pl.INT32)
-    )
-    step_4_tid = greedy_markov_step(
-        head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
-        markov_w1, markov_w2, confidence_head_weight,
-        draft_token_scratch, confidence_scratch,
-        base_logits_ready_tid, step_3_tid, pl.cast(4, pl.INT32)
-    )
-    step_5_tid = greedy_markov_step(
-        head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
-        markov_w1, markov_w2, confidence_head_weight,
-        draft_token_scratch, confidence_scratch,
-        base_logits_ready_tid, step_4_tid, pl.cast(5, pl.INT32)
-    )
-    step_6_tid = greedy_markov_step(
-        head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
-        markov_w1, markov_w2, confidence_head_weight,
-        draft_token_scratch, confidence_scratch,
-        base_logits_ready_tid, step_5_tid, pl.cast(6, pl.INT32)
-    )
+    final_step_tid = token_scratch_zero_tid
+    for step in pl.unroll(DSPARK_QUERY_WIDTH):
+        final_step_tid = greedy_markov_step(
+            head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
+            markov_w1, markov_w2, confidence_head_weight,
+            draft_token_scratch, confidence_scratch,
+            base_logits_ready_tid, final_step_tid, pl.cast(step, pl.INT32)
+        )
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="dspark_markov_token_output_copy",
-        deps=[step_6_tid],
+        deps=[final_step_tid],
     ):
         for request in pl.range(batch):
             for output_step in pl.range(DSPARK_QUERY_WIDTH):
@@ -577,7 +547,7 @@ def markov_sample(
 def _distributed_markov_sample(
     head_hidden: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
     final_norm_weight: pl.Tensor[[D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, pl.NZ],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     num_sampled: pl.Tensor[[B_DYN], pl.INT32],
     last_sampled: pl.Tensor[[B_DYN], pl.INT64],
@@ -600,7 +570,7 @@ def _distributed_markov_sample(
     next_prefill_tokens.bind_dynamic(0, B_DYN)
     draft_token_ids.bind_dynamic(0, B_DYN)
     confidence_probs.bind_dynamic(0, B_DYN)
-    normalized = pl.create_tensor([DSPARK_MOE_TOKENS, D], dtype=pl.BF16)
+    normalized = pl.create_tensor([DSPARK_NORM_TOKENS, D], dtype=pl.BF16)
     final_norm_tid = normalize_head_hidden(
         head_hidden,
         final_norm_weight,
@@ -715,13 +685,16 @@ def l3_distributed_markov_sample(
         )
 
 
-def build_tensor_specs(batch: int, *, distributed: bool = False):
+def build_tensor_specs(batch: int, *, distributed: bool = False, world_size: int = WORLD_SIZE):
     """Build a deterministic nonzero Markov validation case."""
     import torch
     from golden import TensorSpec
+    from utils import pack_nz
 
     if batch not in DSPARK_SUPPORTED_BATCHES:
         raise ValueError(f"unsupported DSpark batch {batch}; expected one of {DSPARK_SUPPORTED_BATCHES}")
+    if distributed and (world_size < TP_SIZE or world_size % TP_SIZE):
+        raise ValueError(f"world size {world_size} must be a positive multiple of TP={TP_SIZE}")
 
     def init_head_hidden():
         hidden = torch.ones(batch, DSPARK_QUERY_WIDTH, D, dtype=torch.bfloat16)
@@ -732,7 +705,7 @@ def build_tensor_specs(batch: int, *, distributed: bool = False):
             # Every TP rank owns a distinct SP request slice. A rank-specific
             # one-hot feature makes the fused SP-gather/TP-vocab path observable.
             rank_hidden = []
-            for rank in range(WORLD_SIZE):
+            for rank in range(world_size):
                 group_hidden = hidden.clone()
                 group_hidden[:, :, 1] = 1.0 + (rank // TP_SIZE) / 8.0
                 group_hidden[:, :, 2 : 2 + TP_SIZE] = 0.0
@@ -744,18 +717,18 @@ def build_tensor_specs(batch: int, *, distributed: bool = False):
     def init_lm_head_weight():
         if distributed:
             weight = torch.zeros(
-                WORLD_SIZE,
+                world_size,
                 VOCAB_PER_TP,
                 D,
                 dtype=torch.bfloat16,
             )
-            for rank in range(WORLD_SIZE):
+            for rank in range(world_size):
                 if rank % TP_SIZE == 0:
                     # Rows 4+owner_tp have no Markov bias. Distinct winners for
                     # the SP owners prove their hidden rows are not duplicated.
                     for owner_tp in range(TP_SIZE):
                         weight[rank, 4 + owner_tp, 2 + owner_tp] = 8.0
-            return weight
+            return pack_nz(weight)
         weight = torch.zeros(VOCAB, D, dtype=torch.bfloat16)
         weight[0, :LM_K_TILE] = 1.0 / LM_K_TILE
         return weight
@@ -790,12 +763,12 @@ def build_tensor_specs(batch: int, *, distributed: bool = False):
     def replicate(init_fn):
         value = init_fn()
         if distributed:
-            return torch.stack([value] * WORLD_SIZE)
+            return torch.stack([value] * world_size)
         return value
 
     def with_world(*shape):
         if distributed:
-            return [WORLD_SIZE, *shape]
+            return [world_size, *shape]
         return list(shape)
 
     specs = [
@@ -815,7 +788,7 @@ def build_tensor_specs(batch: int, *, distributed: bool = False):
         ),
         TensorSpec(
             "lm_head_weight",
-            [WORLD_SIZE, VOCAB_PER_TP, D] if distributed else [VOCAB, D],
+            [world_size, VOCAB_PER_TP, D] if distributed else [VOCAB, D],
             torch.bfloat16,
             init_value=init_lm_head_weight,
             **({"resident": "stacked"} if distributed else {}),
@@ -826,7 +799,7 @@ def build_tensor_specs(batch: int, *, distributed: bool = False):
 
         def init_logit_row_indices():
             indices = torch.full(
-                (WORLD_SIZE, MAX_LOGIT_ROWS),
+                (world_size, MAX_LOGIT_ROWS),
                 -1,
                 dtype=torch.int32,
             )
@@ -839,7 +812,7 @@ def build_tensor_specs(batch: int, *, distributed: bool = False):
         specs.append(
             TensorSpec(
                 "logit_row_indices",
-                [WORLD_SIZE, MAX_LOGIT_ROWS],
+                [world_size, MAX_LOGIT_ROWS],
                 torch.int32,
                 init_value=init_logit_row_indices,
             )
@@ -902,7 +875,12 @@ def build_tensor_specs(batch: int, *, distributed: bool = False):
 
 
 def golden_nonzero_markov(tensors):
-    """Validate the complete nonzero support and sequential Markov chain."""
+    """Validate the complete nonzero support and sequential Markov chain.
+
+    ``tensors["lm_head_weight"]`` is always plain here: the non-distributed
+    caller's own weight never carries pl.NZ (see ``compute_base_logits``),
+    and the distributed caller unpacks its NZ-packed shards before calling in.
+    """
     import torch
 
     hidden_fp32 = tensors["head_hidden"].float()
@@ -945,11 +923,16 @@ def golden_distributed_markov(tensors):
     """Apply the single-rank golden to every DP-owned TP-group result."""
     import torch
 
+    from utils import unpack_nz
+
     for rank in range(WORLD_SIZE):
         group_base = rank // TP_SIZE * TP_SIZE
+        # Unpack before concatenating: each rank's shard is its own independent
+        # NZ block, and the packed bytes of two shards do not concatenate into
+        # a valid larger NZ block.
         full_lm_head_weight = torch.cat(
             [
-                tensors["lm_head_weight"][group_base + tp_rank]
+                unpack_nz(tensors["lm_head_weight"][group_base + tp_rank])
                 for tp_rank in range(TP_SIZE)
             ],
             dim=0,
@@ -976,9 +959,10 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Validate the DeepSeek V4 DSpark Markov sampler.")
     parser.add_argument("--batch", type=int, choices=DSPARK_SUPPORTED_BATCHES, default=4)
-    parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--distributed", action="store_true")
-    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[2, 4, 8, 16])
+    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4, 8, 16])
     parser.add_argument("--dp", type=int, default=1, choices=[1, 2, 4, 8, 16])
     parser.add_argument("-d", "--device", default="0")
     parser.add_argument("--compile-only", action="store_true")
@@ -987,7 +971,10 @@ if __name__ == "__main__":
 
     assert args.tp == TP_SIZE
     assert args.dp * args.tp == WORLD_SIZE
-    config = dict(dump_passes=args.dump_passes, platform=args.platform)
+    config = dict(
+        dump_passes=args.dump_passes, backend_type=args.backend_type,
+        execution_mode=args.execution_mode, ring_heap=LM_HEAD_RING_HEAP,
+    )
     fn = markov_sample
     golden_fn = golden_nonzero_markov
     if args.distributed:

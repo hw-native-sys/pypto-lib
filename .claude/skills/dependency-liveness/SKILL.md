@@ -127,6 +127,11 @@ rank and branch.
 
 ### Ordered graph with a runtime stall
 
+Before classifying the stall as a scheduler resource cycle, check scratch
+allocation retention when the ordered tasks run in manual scopes. Use
+[Manual Scope Buffer Lifetime](../manual-scope-lifetime/SKILL.md) for that
+audit; execution reachability alone does not prove allocation liveness.
+
 When the required path exists, use level-4 scheduler records and device logs to
 identify the stalled task, physical blocks, running/pending slots, and free
 cores. A resource deadlock is supported when evidence shows all of the

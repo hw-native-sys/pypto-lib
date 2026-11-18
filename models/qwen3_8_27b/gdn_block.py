@@ -33,8 +33,8 @@ the delta rule, is written in fp16 there rather than cast by a later pass. And
 which is the one place the block reads the hidden states twice.
 
 The dtype at each boundary is the one the standalone operators exchange, so
-this is numerically the chain `test_gdn_stages.py --chain` validates, with the
-same fp16 delta rule inside.
+this is numerically the chain `gdn_layer.py` validates, with the same fp16
+delta rule inside.
 """
 import pypto.language as pl
 
@@ -49,7 +49,8 @@ import qk_norm_gate
 import quant_x
 import short_conv
 import solve_tril
-from config import GDN_TILING, QWEN3_8_27B
+from chunk_cumsum import CHUNK_TILE
+from config import QWEN3_8_27B
 
 # model shape
 C = QWEN3_8_27B.hidden_size                 # the residual stream
@@ -59,7 +60,7 @@ H = QWEN3_8_27B.linear_num_value_heads
 HG = QWEN3_8_27B.linear_num_key_heads
 D = QWEN3_8_27B.linear_value_head_dim
 KCONV = QWEN3_8_27B.linear_conv_kernel_dim  # convolution taps
-CHUNK = GDN_TILING.chunk
+CHUNK = CHUNK_TILE
 
 # case shape
 T = 8192                # tokens (single sequence, B = 1)
@@ -101,7 +102,9 @@ def build_kernel(t: int = T, h: int = H, hg: int = HG, d: int = D, chunk: int = 
     op_conv_v = short_conv.build_kernel(**conv, c_off=2 * key_width, c_out=h * d,
                                         out_heads=h, out_dtype=pl.FP16, name="conv_v")
     op_qkng = qk_norm_gate.build_kernel(t=t, h=h, hg=hg, d=d, inline=True)
-    op_delta = gdn_layer.build_kernel(t=t, h=h, d=d, chunk=chunk, hg=hg, inline=True)
+    # The delta rule is one inline callee already, and it reads its shape off the
+    # tensors it is handed rather than off a per-shape build.
+    op_delta = gdn_layer.gdn_layer
     op_norm = gated_rmsnorm.build_kernel(t=t, h=h, d=d, inline=True)
     op_out = out_proj.build_kernel(t=t, inline=True)
 
@@ -260,6 +263,7 @@ def _chain(t: int, weights: str | None, quant: bool, chunk: int = CHUNK):
     """The float64 block, cached. *quant* picks the fake-quant chain or the truth."""
     import torch
 
+    import block_reference
     import reference
 
     a8w8_linear.host_torch_setup()
@@ -271,7 +275,7 @@ def _chain(t: int, weights: str | None, quant: bool, chunk: int = CHUNK):
             w = torch.load(weights, weights_only=True)
         if quant:
             w = reference.quantize_weights(w)
-        _CHAIN_CACHE[key] = reference.block(
+        _CHAIN_CACHE[key] = block_reference.block(
             reference.make_block_inputs(t, QWEN3_8_27B), w, QWEN3_8_27B, chunk,
             quant_x=quant, quant_y=quant)
     return _CHAIN_CACHE[key]

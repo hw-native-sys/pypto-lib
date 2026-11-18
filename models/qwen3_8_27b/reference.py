@@ -6,33 +6,23 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Float64 CPU reference for the Gated DeltaNet block.
+"""Shared host helpers for the Gated DeltaNet operators: the drawn inputs, the two layout
+conversions and the acceptance criterion.
 
-Two layers. The delta rule: one function per pipeline stage, plus :func:`compute`
-which chains all six and returns every intermediate. Each stage kernel validates
-against the matching function here, and every stage's test input is the
-reference output of the stage before it -- so no stage is ever fed data the
-pipeline could not produce. Around it the block: the projections, the short
-convolution, the qk-norm and gate, the gated RMSNorm and `out_proj`, chained by
-:func:`block` from hidden states to hidden states. That chain is checked against
-the model's own `Qwen3_5GatedDeltaNet` by `test_block_reference.py`.
+Each stage's float64 reference lives in its own operator file. The references follow the
+model's natural layout ([T, H, D] values, [T, H] per-token scalars, [NCHUNK, H, D, D]
+states); the kernels take some of those transposed or flattened, and :func:`to_hT` and
+:func:`flat_state` convert.
 
-:func:`block` is two references in one. On bf16 weights with no activation
-quantisation it is the float64 truth: how far a result is from the model. On
-int8 weights (:func:`quantize_weights`) with `quant_x` / `quant_y` it is the
-W8A8 chain the projection kernels implement, with their exact quantisation
-arithmetic -- the correctness gate for those kernels, since quantisation alone
-puts the block ~3e-2 from the truth, ten times the model's own bf16 rounding.
+Grouped-query attention is implemented: `hg` QK heads against `h` value heads, value head
+`i` reading key head `i // (h // hg)`. `hg` defaults to `h`, which makes the mapping an
+identity. Single sequence (B = 1); packed variable-length batches are a pipeline feature
 
-The stage signatures follow the model's natural layout ([T, H, D] values,
-[T, H] per-token scalars, [NCHUNK, H, D, D] states). The kernels take some of
-those transposed or flattened; :func:`to_hT` and :func:`flat_state` convert.
-
-Grouped-query attention is implemented: `hg` QK heads against `h` value heads,
-value head `i` reading key head `i // (h // hg)`. `hg` defaults to `h`, which
-makes the mapping an identity.
-
-Single sequence (B = 1). Packed variable-length batches are a pipeline feature
+Around the stage helpers sits the block: the projections, the short convolution, the
+qk-norm and gate, the gated RMSNorm and `out_proj`, each a float64 function here. The
+chain that strings them together lives in `block_reference.py`, which composes them
+with the delta rule; `test_block_reference.py` checks it against the model's own
+`Qwen3_5GatedDeltaNet`.
 the kernels do not implement yet.
 """
 from __future__ import annotations
@@ -50,19 +40,16 @@ REF_DTYPE = torch.float64
 # ---------------------------------------------------------------------------
 
 
-def make_inputs(t: int, h: int, d: int, hg: int | None = None,
-                seed: int = 42) -> dict[str, torch.Tensor]:
+def make_inputs(t: int, h: int, d: int, hg: int | None = None, seed: int = 42) -> dict[str, torch.Tensor]:
     """The model's own input distribution, in the model's dtypes.
 
     `hg` is the number of QK heads; `h` the number of value heads. They differ
     under GQA (Qwen3.8-27B is 48 against 16), and each value head reads key head
-    `h // (H // Hg)` -- the model's own implementation reaches the same place by
-    `repeat_interleave`, megagdn's reference by that index. Defaults to `h`.
+    `h // (H // Hg)`. Defaults to `h`.
 
-    Same draw as the reference harness (`megagdn-pto/tests/utils.py:
-    generate_random_inputs`): q and k L2-normalised along the head dimension, v
-    unnormalised noise, beta uniform on [0, 1) and the gate logits log-sigmoid,
-    so `g` is negative and its chunk-local prefix sum decays.
+    q and k are L2-normalised along the head dimension, v is unnormalised noise,
+    beta is uniform on [0, 1) and the gate logits are log-sigmoid, so `g` is
+    negative and its chunk-local prefix sum decays.
 
     Each tensor draws from its own generator, so changing one shape does not
     reshuffle the others -- `g` at a given (t, h) is the same whatever D is.
@@ -73,10 +60,8 @@ def make_inputs(t: int, h: int, d: int, hg: int | None = None,
         return torch.Generator().manual_seed(seed + offset)
 
     return dict(
-        q=F.normalize(torch.randn(t, hg, d, dtype=torch.float16, generator=gen(1)),
-                      dim=-1, p=2),
-        k=F.normalize(torch.randn(t, hg, d, dtype=torch.float16, generator=gen(2)),
-                      dim=-1, p=2),
+        q=F.normalize(torch.randn(t, hg, d, dtype=torch.float16, generator=gen(1)), dim=-1, p=2),
+        k=F.normalize(torch.randn(t, hg, d, dtype=torch.float16, generator=gen(2)), dim=-1, p=2),
         v=torch.randn(t, h, d, dtype=torch.float16, generator=gen(3)),
         beta=torch.rand(t, h, dtype=torch.float16, generator=gen(4)),
         g=F.logsigmoid(torch.randn(t, h, dtype=torch.float32, generator=gen(5))),
@@ -95,246 +80,6 @@ def flat_state(state: torch.Tensor, dtype=torch.float16) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# Stages
-# ---------------------------------------------------------------------------
-
-
-def cumsum(g: torch.Tensor, chunk: int) -> torch.Tensor:
-    """S1: chunk-local prefix sum of the gate logits. [T, H] -> [T, H]."""
-    out = torch.zeros_like(g, dtype=REF_DTYPE)
-    gf = g.to(REF_DTYPE)
-    for t0 in range(0, g.shape[0], chunk):
-        out[t0 : t0 + chunk] = gf[t0 : t0 + chunk].cumsum(dim=0)
-    return out
-
-
-def kkt(k: torch.Tensor, beta: torch.Tensor, g_sum: torch.Tensor,
-        chunk: int) -> torch.Tensor:
-    """S3: the gated key-key matrix, strictly lower triangular. -> [T, H, chunk].
-
-    The decay is `exp(g_i - g_j)` clamped to zero above the diagonal rather than
-    `exp(min(g_i - g_j, 0))`: on the strict lower triangle the two agree, and the
-    masked-out entries are discarded either way.
-    """
-    t, hg, _ = k.shape
-    h = beta.shape[1]
-    grp = h // hg
-    kf, bf, gf = k.to(REF_DTYPE), beta.to(REF_DTYPE), g_sum.to(REF_DTYPE)
-    out = torch.zeros(t, h, chunk, dtype=REF_DTYPE)
-    rows = torch.arange(chunk)[:, None]
-    cols = torch.arange(chunk)[None, :]
-    strict_lower = (rows > cols).to(REF_DTYPE)
-    for t0 in range(0, t, chunk):
-        for hh in range(h):
-            kc = kf[t0 : t0 + chunk, hh // grp, :]
-            gc = gf[t0 : t0 + chunk, hh]
-            diff = gc[:, None] - gc[None, :]
-            decay = torch.where(diff <= 0, torch.exp(diff), torch.zeros_like(diff))
-            out[t0 : t0 + chunk, hh, :] = (
-                (kc @ kc.T) * decay * bf[t0 : t0 + chunk, hh, None] * strict_lower)
-    return out
-
-
-def solve_tril(a: torch.Tensor, chunk: int) -> torch.Tensor:
-    """S4: `(I + A)^-1` per (chunk, head), exact in float64. -> [T, H, chunk]."""
-    t, h, _ = a.shape
-    af = a.to(REF_DTYPE)
-    out = torch.zeros_like(af)
-    eye = torch.eye(chunk, dtype=REF_DTYPE)
-    for t0 in range(0, t, chunk):
-        for hh in range(h):
-            out[t0 : t0 + chunk, hh, :] = torch.linalg.inv(
-                eye + af[t0 : t0 + chunk, hh, :])
-    return out
-
-
-def wy_fast(k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor,
-            a_inv: torch.Tensor, g_sum: torch.Tensor,
-            chunk: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """S5: the WY representation. -> (W, U), both [T, H, D]."""
-    t, hg, d = k.shape
-    h = v.shape[1]
-    grp = h // hg
-    kf, vf, bf, af, gf = (x.to(REF_DTYPE) for x in (k, v, beta, a_inv, g_sum))
-    w = torch.zeros(t, h, d, dtype=REF_DTYPE)
-    u = torch.zeros(t, h, d, dtype=REF_DTYPE)
-    for t0 in range(0, t, chunk):
-        for hh in range(h):
-            ab = af[t0 : t0 + chunk, hh, :]
-            bc = bf[t0 : t0 + chunk, hh, None]
-            gc = gf[t0 : t0 + chunk, hh, None]
-            u[t0 : t0 + chunk, hh, :] = ab @ (vf[t0 : t0 + chunk, hh, :] * bc)
-            w[t0 : t0 + chunk, hh, :] = ab @ (
-                kf[t0 : t0 + chunk, hh // grp, :] * bc * torch.exp(gc))
-    return w, u
-
-
-def chunk_h(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g_sum: torch.Tensor,
-            chunk: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """S6: the inter-chunk state recurrence.
-
-    Returns the state snapshot ENTERING each chunk, [NCHUNK, H, D, D]; the
-    residual-corrected values V_new, [T, H, D]; and the state LEAVING the last
-    chunk, [H, D, D], which is what an inference cache carries forward.
-    """
-    t, hg, d = k.shape
-    h = w.shape[1]
-    grp = h // hg
-    nc = t // chunk
-    kf, wf, uf, gf = (x.to(REF_DTYPE) for x in (k, w, u, g_sum))
-    state = torch.zeros(nc, h, d, d, dtype=REF_DTYPE)
-    v_new = torch.zeros(t, h, d, dtype=REF_DTYPE)
-    final_state = torch.zeros(h, d, d, dtype=REF_DTYPE)
-    for hh in range(h):
-        s = torch.zeros(d, d, dtype=REF_DTYPE)
-        for ci in range(nc):
-            t0 = ci * chunk
-            gc = gf[t0 : t0 + chunk, hh]
-            g_last = gc[-1]
-            state[ci, hh] = s
-            vc = uf[t0 : t0 + chunk, hh, :] - wf[t0 : t0 + chunk, hh, :] @ s
-            v_new[t0 : t0 + chunk, hh, :] = vc
-            kv = (kf[t0 : t0 + chunk, hh // grp, :].T
-                  @ (vc * torch.exp(g_last - gc)[:, None]))
-            s = torch.exp(g_last) * s + kv
-        final_state[hh] = s
-    return state, v_new, final_state
-
-
-def chunk_o(q: torch.Tensor, k: torch.Tensor, v_new: torch.Tensor,
-            state: torch.Tensor, g_sum: torch.Tensor, chunk: int) -> torch.Tensor:
-    """S7: the chunk output, inter-chunk plus intra-chunk. -> [T, H, D].
-
-    The causal mask includes the diagonal here, unlike :func:`kkt`'s.
-    """
-    t, hg, d = q.shape
-    h = v_new.shape[1]
-    grp = h // hg
-    qf, kf, vf, sf, gf = (x.to(REF_DTYPE) for x in (q, k, v_new, state, g_sum))
-    out = torch.zeros(t, h, d, dtype=REF_DTYPE)
-    rows = torch.arange(chunk)[:, None]
-    cols = torch.arange(chunk)[None, :]
-    causal = (rows >= cols).to(REF_DTYPE)
-    zero = torch.zeros(chunk, chunk, dtype=REF_DTYPE)
-    for ci in range(t // chunk):
-        t0 = ci * chunk
-        for hh in range(h):
-            qc = qf[t0 : t0 + chunk, hh // grp, :]
-            kc = kf[t0 : t0 + chunk, hh // grp, :]
-            gc = gf[t0 : t0 + chunk, hh]
-            inter = (qc @ sf[ci, hh]) * torch.exp(gc)[:, None]
-            gate = torch.exp(torch.minimum(gc[:, None] - gc[None, :], zero))
-            intra = ((qc @ kc.T) * gate * causal) @ vf[t0 : t0 + chunk, hh, :]
-            out[t0 : t0 + chunk, hh, :] = inter + intra
-    return out
-
-
-# Pipeline order. Each stage consumes the outputs of the ones before it.
-STAGES = ("chunk_cumsum", "scaled_dot_kkt", "solve_tril", "wy_fast",
-          "chunk_h", "chunk_o")
-
-_CACHE: dict[tuple, dict] = {}
-
-
-def _run_stage(st: dict, stage: str, chunk: int, narrow: bool) -> None:
-    """Advance the chain in *st* by one stage.
-
-    With *narrow*, values crossing a stage boundary are also kept narrowed to the
-    dtype the kernels exchange -- FP16 for A, A_inv, W, U, V_new and the state
-    snapshots, under the key with a `16` suffix -- and that copy is what the next
-    stage reads, so a stage's reference input is bit-identical to what the
-    preceding kernel would have handed it. Without it every stage reads float64.
-    """
-    def put(key, value):
-        st[key] = value
-        if narrow:
-            st[key + "16"] = value.to(torch.float16)
-
-    def src(key):
-        return st[key + "16"] if narrow else st[key]
-
-    if stage == "chunk_cumsum":
-        st["g_sum"] = cumsum(st["g"], chunk)
-    elif stage == "scaled_dot_kkt":
-        put("a", kkt(st["k"], st["beta"], st["g_sum"], chunk))
-    elif stage == "solve_tril":
-        put("a_inv", solve_tril(src("a"), chunk))
-    elif stage == "wy_fast":
-        w, u = wy_fast(st["k"], st["v"], st["beta"], src("a_inv"), st["g_sum"], chunk)
-        put("w", w)
-        put("u", u)
-    elif stage == "chunk_h":
-        state, v_new, final_state = chunk_h(st["k"], src("w"), src("u"),
-                                            st["g_sum"], chunk)
-        put("state", state)
-        put("v_new", v_new)
-        st["final_state"] = final_state
-    elif stage == "chunk_o":
-        st["o"] = chunk_o(st["q"], st["k"], src("v_new"), src("state"),
-                          st["g_sum"], chunk)
-
-
-def compute(upto: str, t: int, h: int, d: int, chunk: int,
-            hg: int | None = None, seed: int = 42) -> dict[str, torch.Tensor]:
-    """Reference inputs plus every stage output through *upto*, cached and extended.
-
-    Values crossing a stage boundary are narrowed to the dtype the kernels
-    exchange -- FP16 for A, A_inv, W, U, V_new and the state snapshots -- so a
-    stage's reference input is bit-identical to what the preceding kernel would
-    have handed it, and a comparison measures that stage alone.
-
-    *upto* is a stage name or ``"inputs"``. Calling it twice on the same shape
-    only computes the stages that are missing.
-    """
-    hg = h if hg is None else hg
-    want = 0 if upto == "inputs" else STAGES.index(upto) + 1
-    key = (t, h, d, chunk, hg, seed)
-    st = _CACHE.get(key)
-    if st is None:
-        st = _CACHE[key] = dict(make_inputs(t, h, d, hg, seed), _done=0)
-    while st["_done"] < want:
-        _run_stage(st, STAGES[st["_done"]], chunk, narrow=True)
-        st["_done"] += 1
-    return st
-
-
-def delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-               beta: torch.Tensor, g: torch.Tensor, chunk: int,
-               narrow: bool = False) -> dict[str, torch.Tensor]:
-    """All six stages on the given inputs; every intermediate, `o` the output.
-
-    The block's core. Float64 throughout unless *narrow*, which narrows the
-    stage boundaries exactly as :func:`compute` does.
-    """
-    st = dict(q=q, k=k, v=v, beta=beta, g=g)
-    for stage in STAGES:
-        _run_stage(st, stage, chunk, narrow)
-    return st
-
-
-def stage_inputs(stage: str, t: int, h: int, d: int, chunk: int,
-                 hg: int | None = None, seed: int = 42) -> dict[str, torch.Tensor]:
-    """Everything *stage* consumes: the reference chain up to its predecessor."""
-    i = STAGES.index(stage)
-    return compute("inputs" if i == 0 else STAGES[i - 1], t, h, d, chunk, hg, seed)
-
-
-def lazy(stage: str, key: str, t: int, h: int, d: int, chunk: int,
-         transform=None, hg: int | None = None, seed: int = 42):
-    """A no-argument callable returning one reference tensor, computed on first use.
-
-    `TensorSpec(init_value=...)` takes a callable, and deferring the chain this
-    way keeps spec construction free -- the benchmark builds specs only to read
-    their shapes and dtypes, and never pays for the host reference.
-    """
-    def load():
-        value = stage_inputs(stage, t, h, d, chunk, hg, seed)[key]
-        return transform(value) if transform is not None else value
-
-    return load
-
-
-# ---------------------------------------------------------------------------
 # The block around the delta rule
 # ---------------------------------------------------------------------------
 #
@@ -349,7 +94,7 @@ def lazy(stage: str, key: str, t: int, h: int, d: int, chunk: int,
 #   q       = l2norm(q) * D^-0.5;  k = l2norm(k)  eps = 1e-6, inside the sqrt
 #   beta    = sigmoid(b)
 #   g       = -exp(A_log) * softplus(a + dt_bias)
-#   o       = delta_rule(q, k, v, beta, g)        the six stages above
+#   o       = delta_rule(q, k, v, beta, g)        `gdn_layer.delta_rule_ref`
 #   y       = o * rsqrt(mean(o^2) + eps) * w_norm * silu(z)     per head row
 #   out     = y @ Wout^T                          out_proj, H*D -> hidden
 #
@@ -514,108 +259,61 @@ def gated_rmsnorm(o: torch.Tensor, z: torch.Tensor, weight: torch.Tensor,
     return of * torch.rsqrt(var + eps) * weight.to(REF_DTYPE) * F.silu(z.to(REF_DTYPE))
 
 
-def block(x: torch.Tensor, w: dict[str, torch.Tensor], cfg: Qwen38Config,
-          chunk: int, quant_x: bool = False, quant_y: bool = False
-          ) -> dict[str, torch.Tensor]:
-    """The whole block in float64, hidden states `[T, hidden]` to `out` of the same shape.
-
-    Returns every intermediate: the projections `qkv`, `z`, `a_proj`, `b_proj`
-    (`a` is the delta rule's key-key matrix, as everywhere else here); the conv
-    output `qkv_conv`; the delta rule's inputs `q`, `k`, `v`, `beta`, `g` and
-    its output `o` (plus everything :func:`delta_rule` keeps); the normed `y`;
-    and `out`. Nothing is narrowed anywhere.
-
-    What you pass is what you get. bf16 weights compute the truth; int8 ones
-    (:func:`quantize_weights`) are used at their dequantised values. *quant_x*
-    quantises the hidden states per token before every projection reads them,
-    *quant_y* the normed output per token before `out_proj` -- the two
-    activation quantisations a W8A8 block performs, at the places the kernels
-    do them. The int8 tensors and fp32 scales come back as `x_q`, `x_scale`,
-    `y_q`, `y_scale`, so a kernel can be checked at the quantised hand-off too.
-    `y` is quantised from its fp32 rounding, as the norm kernel that produces
-    it will hold it.
-    """
-    h, hg, d = (cfg.linear_num_value_heads, cfg.linear_num_key_heads,
-                cfg.linear_value_head_dim)
-    t = x.shape[0]
-    key_width = hg * d
-
-    st = {}
-    xf = x
-    if quant_x:
-        st["x_q"], st["x_scale"] = quantize_rows(x)
-        xf = dequantize(st["x_q"], st["x_scale"])
-    st["qkv"] = linear(xf, weight(w, "in_proj_qkv"))
-    st["z"] = linear(xf, weight(w, "in_proj_z")).reshape(t, h, d)
-    st["a_proj"] = linear(xf, weight(w, "in_proj_a"))
-    st["b_proj"] = linear(xf, weight(w, "in_proj_b"))
-    st["qkv_conv"] = short_conv(st["qkv"], w["conv1d.weight"])
-    q, k, v = torch.split(st["qkv_conv"], [key_width, key_width, h * d], dim=-1)
-    q, k, beta, g = qk_norm_gate(q.reshape(t, hg, d), k.reshape(t, hg, d),
-                                 st["a_proj"], st["b_proj"], w["A_log"], w["dt_bias"])
-    st.update(delta_rule(q, k, v.reshape(t, h, d), beta, g, chunk))
-    st["y"] = gated_rmsnorm(st["o"], st["z"], w["norm.weight"], cfg.rms_norm_eps)
-    y = st["y"].reshape(t, h * d)
-    if quant_y:
-        st["y_q"], st["y_scale"] = quantize_rows(y)
-        y = dequantize(st["y_q"], st["y_scale"])
-    st["out"] = linear(y, weight(w, "out_proj"))
-    return st
-
-
-_BLOCK_CACHE: dict[tuple, dict] = {}
-
-
-def block_inputs(key: str, t: int, cfg: Qwen38Config, chunk: int,
-                 transform=None, seed: int = 42, weights: str | None = None,
-                 quant_x: bool = False, quant_y: bool = False):
-    """A no-argument callable returning one tensor of the block chain, computed once.
-
-    What :func:`lazy` is for a stage, this is for a kernel of the block: the
-    chain runs on first use and is cached, so several specs drawing from it pay
-    for it once. *weights* is a path to a layer `weights.py` wrote, or None for
-    the random set.
-    """
-    def load():
-        cache_key = (t, cfg.name, chunk, seed, weights, quant_x, quant_y)
-        st = _BLOCK_CACHE.get(cache_key)
-        if st is None:
-            if weights is None:
-                w = make_block_weights(cfg, seed)
-            else:
-                w = torch.load(weights, weights_only=True)
-            st = _BLOCK_CACHE[cache_key] = block(
-                make_block_inputs(t, cfg, seed), w, cfg, chunk,
-                quant_x=quant_x, quant_y=quant_y)
-        value = st[key]
-        return transform(value) if transform is not None else value
-
-    return load
-
-
-# ---------------------------------------------------------------------------
 # Acceptance criterion
 # ---------------------------------------------------------------------------
 
-# megagdn-pto/tests/utils.py: NumericalAccuracy. rtol is scaled by the chunk
-# size because a chunk-length reduction accumulates that many rounding steps.
-RTOL = 5e-3
-ATOL = 1.5e-4
-FTOL = 1e-3
+# Measured on a2a3 at T = 512 and T = 8192, every output of the six stages and the layer:
+# not one point exceeds DIFF_THD, and the worst relative Frobenius norm is 3.6e-4.
+DIFF_THD = 1e-3         # per-point floored relative difference
+PCT_THD = 1e-6          # share of points allowed to exceed it
+MAX_DIFF_HD = 1.0       # one point this far out fails whatever the share
+FTOL = 1e-3             # relative Frobenius norm over the whole output
 
 
-def stats_ok(actual: torch.Tensor, expected: torch.Tensor,
-             chunk: int = 1) -> tuple[bool, str]:
-    """The reference harness's acceptance test, and the numbers behind it."""
-    act = actual.to(REF_DTYPE)
-    exp = expected.to(REF_DTYPE)
-    diff = (act - exp).abs()
-    denom = torch.sqrt((exp ** 2).sum())
-    frob = float(torch.sqrt((diff ** 2).sum()) / denom) if float(denom) > 0 else 0.0
-    bound = ATOL + min(0.5, RTOL * chunk) * exp.abs()
-    elementwise = not bool((diff > bound).all())
-    detail = (f"frob={frob:.4g} (<={FTOL}), max diff={float(diff.max()):.4g}, "
-              f"peak |ref|={float(exp.abs().max()):.4g}")
-    if not elementwise:
-        return False, "every element outside the relative bound; " + detail
-    return frob <= FTOL, detail
+def frob(actual: torch.Tensor, expected: torch.Tensor) -> float | None:
+    """Relative Frobenius norm, or None when the reference is all zeros."""
+    act = actual.cpu().to(REF_DTYPE)
+    exp = expected.cpu().to(REF_DTYPE)
+    denom = float(torch.sqrt((exp ** 2).sum()))
+    if denom == 0.0:
+        return None
+    return float(torch.sqrt(((act - exp) ** 2).sum())) / denom
+
+
+def frob_ok(ftol: float = FTOL, diff_thd: float = DIFF_THD, pct_thd: float = PCT_THD):
+    """`ratio_reldiff` per point, plus the relative Frobenius norm over the whole output.
+
+    Every per-point check is the harness comparator's: the floored relative difference,
+    its bad-point budget, the single-point cap and the non-finite rejection. The Frobenius
+    norm is the one criterion it does not carry, and a chunk-length reduction's
+    accumulated rounding shows up there and nowhere else.
+
+    An all-zero reference has no relative norm, so there the per-point check stands alone.
+    That case is reachable: `chunk_h`'s state snapshot entering a single chunk is all
+    zeros, and a criterion that scored it would accept any output at all.
+    """
+    from golden import ratio_reldiff
+
+    per_point = ratio_reldiff(diff_thd=diff_thd, pct_thd=pct_thd, max_diff_hd=MAX_DIFF_HD)
+
+    def cmp(actual, expected, **kwargs):
+        ok, detail = per_point(actual, expected, **kwargs)
+        value = frob(actual, expected)
+        if value is not None and value > ftol:
+            ok = False
+        if ok:
+            return True, ""
+        act = actual.cpu().to(REF_DTYPE)
+        exp = expected.cpu().to(REF_DTYPE)
+        if value is None:
+            stats = "frob n/a (the reference is all zeros)"
+        else:
+            # The relation, not a fixed ">": a per-point failure can carry a healthy norm.
+            stats = f"frob={value:.4g} ({'>' if value > ftol else '<='}{ftol})"
+        max_diff = float((act - exp).abs().max())
+        peak = float(exp.abs().max())
+        head = f"    {stats}, max diff={max_diff:.4g}, peak |ref|={peak:.4g}"
+        return False, f"{head}\n{detail}"
+
+    cmp.__name__ = "frob_ok"
+    return cmp

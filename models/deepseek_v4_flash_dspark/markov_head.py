@@ -44,6 +44,8 @@ def markov_head(
         deps=[token_ids_ready_tid],
         allow_early_resolve=True,
     ) as embedding_tid:
+        # Weight reads bypass L2.
+        pl.set_cache_policy(markov_w1, pl.CachePolicy.BYPASS)
         token_idx = pl.tile.get_block_idx()
         token_id = pl.read(token_ids, [token_idx])
         token_row = pl.cast(token_id, target_type=pl.INDEX)
@@ -58,6 +60,8 @@ def markov_head(
         name_hint="markov_logits",
         deps=[embedding_tid],
     ) as logits_tid:
+        # Weight reads bypass L2.
+        pl.set_cache_policy(markov_w2, pl.CachePolicy.BYPASS)
         block = pl.tile.get_block_idx()
         for work_idx in pl.range(block, work_items, SPMD_BLOCKS):
             t0 = (work_idx // (vocab_dim // VOCAB_TILE)) * T_TILE
@@ -144,7 +148,8 @@ if __name__ == "__main__":
     TEST_VOCAB_SIZE = 4096
 
     parser = argparse.ArgumentParser(description="DeepSeek-V4 DSpark Markov-head validation.")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--token-count", type=int, default=DECODE_BATCH // TP)
     parser.add_argument("--vocab-size", type=int, default=TEST_VOCAB_SIZE)
@@ -158,7 +163,8 @@ if __name__ == "__main__":
         golden_fn=golden_markov_head,
         config=dict(
             dump_passes=args.dump_passes,
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),

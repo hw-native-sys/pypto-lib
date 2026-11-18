@@ -54,7 +54,6 @@ from pathlib import Path
 import pypto.language as pl
 import torch
 from pypto.backend import BackendType, set_backend_type
-from pypto.runtime import RunConfig
 
 from config import QWEN3_14B_DIMS as D, QWEN3_14B_TILING as T, QWEN3_14B as M
 
@@ -370,8 +369,11 @@ def _backend_type(platform: str) -> BackendType:
 
 
 if __name__ == "__main__":
+    from golden import normalize_config
+
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("-p", "--platform", default="a2a3", choices=("a2a3", "a2a3sim"))
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     # CI runs every changed model file as `python <file> -p <platform> -d <device>`,
     # so the device flag must parse even though this program is compile-only and
     # never reaches a device.
@@ -389,7 +391,7 @@ if __name__ == "__main__":
                              "to preserve; diff and merge.")
     args = parser.parse_args()
 
-    set_backend_type(_backend_type(args.platform))
+    set_backend_type(_backend_type(args.backend_type))
     # compile(), NOT lower(): this module exists to produce the codegen artifact
     # that --emit-header re-wraps (_newest_artifact reads
     # build_output/_jit_rope_qkv_regen_*/kernels/aiv/rope_qkv.cpp). lower() is
@@ -401,7 +403,10 @@ if __name__ == "__main__":
     # DEFAULT backend and collide with the set_backend_type above.
     compiled = rope_qkv_regen.compile(
         *_dummy_inputs(args.batch),
-        config=RunConfig(platform=args.platform),
+        config=normalize_config(dict(
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
+        )),
     )
     post_pass = compiled.program
     print(f"Compiled program has {len(post_pass.functions)} function(s):")

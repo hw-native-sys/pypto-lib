@@ -1,499 +1,202 @@
 # DeepSeek V4.1 Flash
 
-`models/deepseek_v4_1_flash/` is the implementation staging area for the
-DeepSeek-V4.1-Flash checkpoint. The first milestone establishes the text-model
-configuration, layer schedule, cache ownership, inference metadata, Torch
-goldens, and prefill/decode kernel contracts. Checkpoint loading and optimized
-PyPTO leaf kernels remain follow-up work.
+This directory documents the Ascend A5 implementation in
+[`models/deepseek_v4_1_flash/`](../../../models/deepseek_v4_1_flash/config.py).
+It includes the text backbone, prefill and decode forwards, DSpark speculative
+decoding, and a separately callable vision encoder. Operator entries provide
+Torch references and standalone validation; forward entries compose those same
+operators.
 
-## Checkpoint shape
+## Model configuration
 
-The `FLASH` preset in
-[config.py](../../../models/deepseek_v4_1_flash/config.py) mirrors the released
-checkpoint's 40-layer text backbone and quantization metadata. Auxiliary
-drafting, n-gram, and multimodal components are intentionally out of scope.
+[`config.py`](../../../models/deepseek_v4_1_flash/config.py) owns the model
+preset, layer schedule, and parallel configuration. The tensor specs in each
+operator define its executable storage and layout contracts.
 
-| Property | Value |
-| --- | ---: |
-| Hidden size | 5,120 |
-| Backbone layers | 40 |
-| Attention heads | 64 |
-| Head dimension | 512 |
-| Routed experts / active experts | 384 / 6 |
-| Shared experts | 1 |
-| Hyper-connection width | 4 |
-| Vocabulary | 129,280 |
-| Maximum position | 1,048,576 |
-
-The attention schedule is:
-
-- Layers 0-1 use the 128-token sliding window only.
-- Layers 2-19 use ratio-2 compressed sparse attention. KV sources are layers
-  2, 8, and 14; those layers are also index sources.
-- Layers 20-39 use ratio-1 compressed sparse attention. Layer 20 owns the KV
-  cache, while layers 20, 24, 28, 32, and 36 refresh the index selection.
-
-## Serving-owned full RoPE tables
-
-V4.1 provides a PyPTO inline stage that reads caller-owned full cosine/sine
-tables and writes only the active token rows inside the compiled graph. It does
-not recompute frequencies, copy the full table per call, or invoke Torch during
-dispatch. As in V4 MTP's decode forward, prepare rows once before the attention
-layers; DSpark's decode forward likewise passes prepared token-major rows to
-its layers.
-
-`rope_tables.materialize_rope_rows` accepts:
-
-- `freqs_cos`, `freqs_sin`: read-only FP32 `[table_capacity, rope_dim // 2]`
-  tables for one profile, retained by serving across calls.
-- `position_ids`: INT32 `[T]` absolute positions.
-- `num_tokens`: the active prefix length, in `[0, T]`.
-- `rope_cos`, `rope_sin`: caller-provided FP32 `[T, rope_dim // 2]` outputs.
-
-Nonnegative positions must be below table capacity. Negative positions write
-identity rotation, used for unpublished compressed tokens. Padding output
-rows remain untouched; zero active tokens launch no row work. V4.1 retains
-FP32 half-width tables for adjacent-pair rotation, rather than adopting V4's
-BF16 full-width representation.
-
-The exported `decode_attn_c2a_full`, `decode_c2a_full`, `prefill_c2a_full` and
-`c2a_full_partial` retain
-their token-major `rope_cos`/`rope_sin` and `compressed_rope_cos`/
-`compressed_rope_sin` inputs. They do not allocate RoPE row buffers or gather
-full tables on each layer invocation.
-
-The `decode_attn_c2a_full.make_program` and `prefill_c2a_full.make_hc_program`
-forward entries accept
-`freqs_cos`/`freqs_sin`, `compressed_freqs_cos`/`compressed_freqs_sin`,
-`position_ids` and `compressed_rope_positions`. All four tables share one position
-capacity in these entries. Each rank allocates four row buffers and gathers the
-query and compressed rows once, before the repeated-attention loop. Every epoch
-in that invocation reuses those read-only rows. Table generation in the driver
-is fixture initialization, not work performed during dispatch.
-
-For a multilayer forward, prepare one pair of row buffers for each distinct
-RoPE profile, position vector and active token count. Reuse those buffers for
-all layers with that same combination. A different compression source may have
-different positions even when it shares a profile; do not reuse rows across
-such combinations. Recompute rows when the positions or active token count
-change. This is per-forward reuse, not a persistent cache of selected rows.
-
-Compose the preparation before the layers:
-
-```python
-materialize_rope_rows(
-    freqs_cos, freqs_sin, position_ids, num_tokens, rope_cos, rope_sin,
-)
-materialize_rope_rows(
-    compressed_freqs_cos, compressed_freqs_sin,
-    compressed_rope_positions, num_tokens, compressed_rope_cos, compressed_rope_sin,
-)
-# Pass these same row tensors to each matching row-based attention entry.
-```
-
-Supply `metadata.compressed_rope_position_ids[source]` as
-`compressed_rope_positions`; it contains compression-group start positions or
-`-1`. Pass the gathered tensors directly to their RoPE consumers so the normal
-tensor dependencies are visible. In an explicitly manual dependency region,
-preserve both producer TaskIds alongside the existing cache-publication and
-previous-epoch dependencies; source order alone does not establish an edge.
-Keep the row buffers alive and unchanged until all consuming layers complete.
-The external serving adapter and other attention modes are not migrated here.
-
-`precompute_rope_tables` remains a CPU initialization utility when the caller
-needs to generate a complete profile. It is not needed in the compiled dispatch
-path when serving already supplies full tables.
-
-## Parallel-development structure
-
-Each attention mode and execution phase has one ownership file. Every file
-contains a Torch golden and an explicit `@pl.jit.inline` ABI; kernel bodies are
-the remaining parallel work.
-
-Run an operator file directly to execute its deterministic CPU golden:
-
-```bash
-source .venv/bin/activate-pypto
-python models/deepseek_v4_1_flash/decode_attn_c1a_reindex.py
-```
-
-The command prints `[GOLDEN] PASS` and exits nonzero when the reference fails.
-Once a kernel body lands, its owner can extend the same file with the thin
-`@pl.jit` entry, `build_tensor_specs()`, and device `run(...)` block.
-
-| Workstream | Files |
+| Property | Configuration |
 | --- | --- |
-| Encoder SWA | `prefill_attn_swa.py` (leaf), `prefill_swa.py` (HC orchestration), `decode_attn_swa.py` (decode leaf), `decode_swa.py` (decode HC orchestration) |
-| Encoder C2A Full | `prefill_attn_c2a_full.py` (leaf), `prefill_c2a_full.py` (HC orchestration), `decode_attn_c2a_full.py` (decode leaf), `decode_c2a_full.py` (decode HC orchestration) |
-| Encoder C2A Reuse | `prefill_attn_c2a_reuse.py` (leaf), `prefill_c2a_reuse.py` (HC orchestration), `decode_attn_c2a_reuse.py` (decode leaf), `decode_c2a_reuse.py` (decode HC orchestration) |
-| Decoder C1A Full | `prefill_attn_c1a_full.py`, `decode_attn_c1a_full.py` (leaf), `prefill_c1a_full.py`, `decode_c1a_full.py` (HC orchestration) |
-| Decoder C1A Reindex | `prefill_attn_c1a_reindex.py`, `decode_attn_c1a_reindex.py` (leaf), `prefill_c1a_reindex.py`, `decode_c1a_reindex.py` (HC orchestration) |
-| Decoder C1A Reuse | `prefill_attn_c1a_reuse.py`, `decode_attn_c1a_reuse.py` (leaf), `prefill_c1a_reuse.py`, `decode_c1a_reuse.py` (HC orchestration) |
-| Hierarchical indexer | `hierarchical_sparse_indexer.py` |
-| Hyper-connections | `hc_mixes.py`, `hc_pre.py`, `hc_post.py` |
-| Attention TP transports | `attention_tp.py` |
-| Shared Attention primitives | `attention_ops.py` (`make_mx_projection`, BF16 projection, RMSNorm, RoPE, and dependency-aware variants) |
-| Shared Q/KV preprocessing | `qkv_proj_rope.py` (`q_proj_qr`, `q_proj_rope`, `kv_proj_rope`, `qkv_proj_rope` and Prefill variants) |
-| Shared output projection | `o_proj.py` (`grouped_output`, `o_proj`, `prefill_o_proj`) |
-| Expert parallelism | `moe.py` |
-| Layer composition | `prefill_layer.py` |
-| Shared configuration and goldens | `config.py`, `metadata.py`, `golden.py`, `attention_common.py` |
-| Quantization and RoPE tables | `quantization.py`, `rope_tables.py` |
+| Text backbone | 40 layers, hidden width 5,120, vocabulary 129,280 |
+| Attention | 64 heads, head width 512, rotary width 64, sliding window 128 |
+| Projections | Query LoRA rank 1,280; output LoRA rank 1,024 in 8 groups |
+| MoE | 384 routed experts, top-6 routing, one shared expert; intermediate width 2,304 |
+| Hyper-connections | 4 streams; persistent hidden state is FP32 |
+| Context ceiling | 1,048,576 positions, with 128-token cache pages |
+| Engram | Layers 1 and 14; forward consumes host-gathered embedding rows |
+| DSpark | 5 speculative tokens plus one verification row per request; default decode batch 12, or 72 rows |
 
-SWA, C2A, and C1A use the shared Attention primitives and stage compositions
-above. Decode C1A selects the dependency-aware variants because their explicit
-TaskId edges are part of the hardware schedule, while retaining its distinct MX
-projection implementation. It also uses `qkv_proj_rope_with_deps` and
-`o_proj_with_deps` as the shared composition boundaries. The specialized
-Prefill SWA Q-A projection also remains in
-`qkv_proj_rope.py` because it preserves that path's group-32 scale decoding.
+Quantized projection paths use MXFP8 weights and activations; routed expert
+weights use packed MXFP4. Scale tensors use the owning operator's MX layout.
+Norms, residual mixing, cache payloads, and unquantized weights retain their
+specified BF16 or FP32 types. Checkpoint metadata alone does not describe every
+runtime tensor's dtype.
 
-## Decode composition
+## Attention schedule and cache ownership
 
-[decode_layer_plan.py](../../../models/deepseek_v4_1_flash/decode_layer_plan.py)
-resolves all six modes and source ownership from `FLASH.layer_config`. Each
-mode has an independently executable Attention half-layer entry:
+Layer numbers below are zero-based. All attention stages include the sliding
+window; C1A and C2A also attend to selected compressed-cache entries.
 
-| Mode | Attention kernel | Composition entry | Representative layer |
-| --- | --- | --- | ---: |
-| SWA | `decode_attn_swa.py` | `decode_swa.py` | 0 |
-| C2A Full | `decode_attn_c2a_full.py` | `decode_c2a_full.py` | 2 |
-| C2A Reuse | `decode_attn_c2a_reuse.py` | `decode_c2a_reuse.py` | 3 |
-| C1A Full | `decode_attn_c1a_full.py` | `decode_c1a_full.py` | 20 |
-| C1A Reindex | `decode_attn_c1a_reindex.py` | `decode_c1a_reindex.py` | 24 |
-| C1A Reuse | `decode_attn_c1a_reuse.py` | `decode_c1a_reuse.py` | 21 |
+| Layers | Family | Cache and selection behavior |
+| --- | --- | --- |
+| 0–1 | SWA | Sliding-window attention |
+| 2–19 | C2A, ratio 2 | Full paths at 2, 8, and 14; intervening layers reuse their source's cache and selection |
+| 20–39 | C1A, ratio 1 | Full path at 20; reindex at 24, 28, 32, and 36; other layers reuse |
 
-The mode files own their entry contract and readiness state. SWA and C2A use
-the spec-driven boundary helpers in `decode_common.py`; C1A keeps its native
-static token/page ABI and validation harness. `decode_layer.py` is the thin
-complete Block integration entry. Its Torch golden preserves delayed pre-mix
-ordering: Attention consumes the incoming mix, FFN consumes the Attention
-pre-mix, and the Block returns the FFN pre-mix for the next layer. Run the six
-small CPU Block references with:
+A **full** path projects and publishes KV, updates compression and index state,
+and selects entries for attention. **Reindex** reuses the source KV cache and
+computes a new selection. **Reuse** consumes existing KV and selection state.
+The source-layer tables in `config.py` determine ownership; these are different
+roles in one forward, rather than interchangeable execution options. C2A reuse
+uses the shared C1A reuse kernels with ratio-2 metadata.
 
-```bash
-python models/deepseek_v4_1_flash/decode_layer.py --stage block --cpu-golden
-```
+## Execution structure
 
-All six Attention half-layers are implemented. The full Block device path still
-awaits EP8 MoE integration and its hardware fixture;
-`decode_layer_kernel_skip_reason` reports that dependency. Both the Block
-factory and `--stage block` device command enforce readiness before JIT
-construction. Block CPU references currently require all capacity rows active.
-
-Every mode file provides hardware validation without requiring MoE. The
-`decode_layer.py --stage attention` compatibility dispatcher accepts the
-spec-driven SWA/C2A ABI; C1A validation uses each mode's native entry directly.
-For an allocated TP4 group:
-
-```bash
-python models/deepseek_v4_1_flash/decode_c2a_reuse.py -p a5 -d 0,1,2,3 \
-  --tp 4 --tokens 33 --active-tokens 31 --requests 6 \
-  --epochs 2 --save-data
-```
-
-Each validation epoch invokes the complete production composition: mHC
-mixes/pre, input RMSNorm, one Attention call, and mHC post. Epochs repeat the
-same fixture inputs for validation and benchmarking; they do not feed one
-epoch's hidden or pre-mix output into the next. Validation reuses each leaf's
-fixture, reference, and precision checks and checks updated caches and exact
-non-owner storage.
-
-mHC boundaries cover the full token capacity. Composition owns the temporary
-collapsed and normalized Attention inputs. `attention_output` remains a
-caller-initialized `InOut` because Reuse writes only the active prefix while
-mHC post consumes the full capacity. The Reuse case validates inactive rows
-with a nonzero sentinel. `attention_hidden` and `attention_pre_mix` are fully
-written `Out` boundaries. Hidden precision statistics cover active rows only;
-the inactive suffix is checked independently so it cannot dilute the active
-error budget.
-
-Full attention owns compressed KV and index-key publication. Reindex consumes
-the C1A cache and the layer-20 candidate mask but computes a new index query.
-Reuse consumes the source layer's physical Top-K rows and has no compressor or
-indexer weights. The hierarchical indexer first selects 2,048 blocks of eight
-compressed positions at layer 20; later reindex layers select their final 512
-positions only inside that candidate mask.
-
-Each decoder C1A mode keeps its attention operator in `decode_attn_c1a_*.py` and
-adds an mHC-wired `decode_c1a_*.py` entry. V4.1 staggers the coefficients:
-the entry collapses with the `pre_mix` the previous sub-layer produced (one-hot
-lane zero at the very first site), applies this site's `post_mix` and
-`residual_mix` immediately, and hands its own computed `pre_mix` to the next
-sub-layer, so it returns the new streams and that coefficient. The full entry
-also hosts the shared HC fixture, goldens, and validation harness the other two
-entries reuse.
-
-The final HC collapse has no learned head parameters: it applies the last
-layer's delayed `pre_mix` directly to the four residual streams. HC mixes are
-depth-local values and are not persisted as sequence state.
-
-The production cache ABI uses a 128-token scheduler block and keeps payloads
-quantized in HBM:
-
-- Window KV payload: `[blocks, 128, 1, 512]`, MXFP8 E4M3, with
-  `[blocks, 128, 1, 16]` E8M0 group-of-32 scales.
-- Ratio-2 compressed KV payload: logical `[blocks, 128, 1, 512]`, packed
-  MXFP4 E2M1, with `[blocks, 128, 1, 32]` E4M3 group-of-16 scales. Layers 2,
-  8, and 14 own these pools; one physical row represents two original tokens.
-- Ratio-1 compressed KV uses the same packed FP4 payload and scale ABI and is
-  owned by layer 20.
-- Index-key payload: logical `[blocks, 128, 1, 128]`, packed MXFP4 E2M1, with
-  `[blocks, 128, 1, 4]` E8M0 group-of-32 scales.
-- Ratio-2 recurrent state: `[num_state_blocks, STATE_CAPACITY, 1024]`, FP32.
-  Each row stores the token's 512-channel KV projection followed by its
-  512-channel gate score. `STATE_CAPACITY` is a model configuration constant
-  (currently 4), independent of context length and batch size. Ratio 1 has no
-  recurrent compressor state.
-
-Compressed KV and index-key tensors for a source share the same
-`c{ratio}a_cmp_kv` block table. Compressor state uses a separate engine-owned
-`state_block_table` and must never use the current batch row as its physical
-address. Torch goldens quantize on cache publication and dequantize on cache
-reads; BF16 cache values are only an intermediate reference representation,
-not the kernel ABI.
-
-### Compressor state ownership
-
-C2A Full prefill and decode take the same state inputs:
-
-| Input | Contract |
-| --- | --- |
-| `query_start_loc` | INT32 `[B + 1]`, starts at zero; nondecreasing packed query boundaries. Equal adjacent entries represent an empty request. |
-| `position_ids` | INT32 `[T]`, nonnegative absolute positions, consecutive within each valid request chunk. |
-| `token_to_req_indices` | INT32 `[T]`, the current batch row `r` for every token in `[query_start_loc[r], query_start_loc[r + 1])`. This is not a persistent request ID. |
-| `state_block_table` | INT32 `[B, 1]`, a stable physical state block per request; `-1` disables that request's compressor. |
-| `state_cache` | FP32 `[num_state_blocks, STATE_CAPACITY, 2 * HEAD_DIM]`, an inout ring owned by the source layer. |
-
-`num_tokens` counts the valid packed prefix and equals `query_start_loc[-1]`;
-`T` may include trailing storage padding. The standalone compressor accepts
-`num_tokens=0` with a positive padded tensor extent: it performs no projection,
-state or output accesses. Empty requests perform no state accesses. Invalid
-request/block indices are checked before table/cache indexing; negative
-positions suppress publication and state writes. A live request must have a
-valid allocation; an invalid block does not provide meaningful compression.
-Callers disable the corresponding compressed/index cache slots for inactive
-tokens as well. The metadata builder produces only the packed valid prefix. The C2A rank
-drivers skip the entire sublayer when `num_tokens=0`; TP peers within a DP
-group must agree on whether that group is idle.
-
-For each valid token at absolute position `p`, the compressor computes
-`block = state_block_table[token_to_req_indices[t], 0]` and ring slot
-`block * STATE_CAPACITY + p % STATE_CAPACITY`. An odd-position token closes a
-pair. At the start of a chunk it reads the predecessor at
-`(p - 1) % STATE_CAPACITY`; within a chunk it reads the preceding projection
-directly. All historical reads complete before state writes. Only the last
-`min(chunk_length, STATE_CAPACITY)` rows of a chunk are written, giving each
-ring slot at most one writer even when the chunk is longer than the ring.
-The pooling softmax, BF16 rounding before RMSNorm, and publication parity are
-unchanged.
-
-The engine retains the same physical block while a request changes batch row.
-It may release/reassign a block only after that request's outstanding state
-users complete; distinct live requests cannot write the same block. Layers
-2, 8 and 14 own independent state caches. `ForwardMetadata.state_block_tables`
-contains a separate engine-supplied table for each source, allowing either
-shared block numbering across those pools or independent allocations. No
-payload is shared between source layers; reuse layers use their source's
-compressed outputs and do not update compressor state.
-
-A new request starts at position zero with no pending pair. Old bytes in a
-reused block are harmless only under this contract: its own even-position
-projection is written before a later call consumes it. Resuming at an odd
-position requires restoring or recomputing that request/source's matching
-predecessor KV and gate state. Restoring only compressed KV, or zeroing state,
-is insufficient. Ring storage does not implement speculative acceptance,
-rollback, or prefix-state restoration; those remain engine responsibilities.
-
-Indexer workspaces store physical flattened cache-row ids, padded with `-1`,
-so separately scheduled window and compressed sparse-attention kernels do not
-depend on a concatenated-cache offset. Candidate masks remain in request-local
-compressed-position space.
-
-`ForwardMetadata` lowers packed query starts, token-to-request indices, absolute positions,
-previous/new KV lengths, cache slot mappings, sliding-window indices,
-per-token causal compressed lengths, per-request compressed lengths and
-remainders, ragged compressor output starts, source-token rows, and compressed
-RoPE positions. The same lowering serves prefill and continuous-batch decode.
-
-The target deployment is one eight-card A5 node with TP4 attention, two DP
-groups, and EP8 routed experts. TP1/2/4/8 and compatible EP2/4/8 shapes remain
-available for bring-up. The EP world is reinterpreted as `DP = EP / TP`
-contiguous attention groups; `tp_rank = rank % TP` and
-`group_base = rank - tp_rank`.
-
-The first implementation targets pure head tensor parallelism. Every TP rank
-sees the same token batch. `wq_a`, `wkv`, compressor, indexer, and the
-single-head KV caches are replicated. `wq_b`, query heads, attention sinks,
-and output groups are sharded across TP ranks. Each rank computes
-16 query heads and two output groups; one FP32 TP all-reduce reconstructs the
-complete hidden output. Before EP8 dispatch, token-row ownership is assigned
-round-robin across the four TP ranks. This prevents replicated attention rows
-from being dispatched four times; MoE combine returns the rows to the TP
-layout. The routed result therefore arrives partitioned across the group, with
-the rows a rank does not own left at zero, and one FP32 sum over the group
-restores the replicated residual stream the next layer's attention expects.
-DSA context parallelism is intentionally out of scope.
-
-The service capacity contract is 32 active sequences and 4,096 scheduled
-prefill token rows per DP group. With five reserved DSpark draft rows plus one
-target row, the decode ABI reserves 192 token rows per DP group. DP2 therefore
-supports up to 64 active sequences globally. DSpark execution itself remains
-follow-up work.
-
-Query/output low-rank projections and shared experts use MXFP8 payloads.
-Routed expert weights remain output-major packed MXFP4 with E8M0 group-of-32
-scales in HBM. The planned kernel loads one FP4 tile, casts that tile to FP8 in
-on-chip memory, and uses the supported MXFP8 Cube path with dynamically
-quantized activations; it does not expand the complete expert tensor.
-
-The paged-attention Torch reference accumulates the BF16 compressor, index-key,
-index-weight, and grouped output projections in FP32. Compressor, index-key,
-and grouped output results are rounded back to the activation dtype before
-the next stage. The prefill C1A indexer rounds projected and scaled index
-weights, QK dot products, weighted scores, and the head-reduction result to
-BF16. Top-K scratch stores those rounded scores in FP32. The Torch reference
-uses the same rounding boundaries.
-This makes accumulation explicit rather than depending on the CPU backend's
-native BF16 matrix multiplication.
-
-C1A Full and Reindex, in both prefill and decode, temporarily order index-key
-decoding after the index-weight projection completes
-([pypto#2829](https://github.com/hw-native-sys/pypto/issues/2829)). On the pinned A5 stack,
-a mixed projection's Cube producer can start while its paired Vector core
-still executes a decoder, overwriting the decoder's UB through the local C2V
-pipe. The explicit task dependency avoids this overlap at the cost of some
-parallelism; it does not change the arithmetic or precision thresholds.
-Reuse has no index-weight projection or index-key decoder.
-
-For C1A prefill, the attention reference follows the kernel's 32-key online
-softmax tiles, BF16 probability operand for PV, and FP32 correction of the
-first 16 columns of the first head in each 16-head group. Each rank's final
-projection remains FP32 through the rank-ordered TP reduction, with one BF16
-cast after the sum.
-
-Full and Reindex validate Top-K eligibility, uniqueness, logical-position
-ordering, trailing `-1` padding, and cutoff score quality before checking
-the output. If an accepted selection differs from the nominal golden, the
-output reference is recomputed for that selection using the **reference
-cache values and original weights**. Device cache contents and output values
-do not define this reference. Reuse uses its supplied selection directly.
-
-Every output row (one token on one rank) must satisfy both bounds:
+Prefill composes embedding and metadata preparation, the configured attention/MoE
+layer schedule, HC collapse, RMSNorm, vocabulary projection, and greedy sampling
+for the last query row per request. The reusable `decode_fwd` and its L3 entry
+run only the backbone, retaining final HC state and DSpark target taps. DSpark
+composes the output head and sampling after that backbone. `lm_head` writes
+FP32 logits in place; `greedy_sample` and `markov_sample` are separate operations.
+Engram contributes at its configured layers. A layer follows this structure:
 
 ```text
-RMS(actual - reference) <= 1e-6 + 0.01 * RMS(reference)
-max(abs(actual - reference)) <= 1e-5 + 0.05 * RMS(reference)
+HC state → HC pre-mix / attention norm → Q/KV projection and RoPE
+         → cache publication / compression / selection as required
+         → sparse attention → output projection + HC post
+         → HC pre-mix / router → shared and routed experts → combine / HC post
 ```
 
-Non-finite values fail. There is no global outlier quota: a bad row cannot
-be diluted by other tokens or ranks, and a small number of large finite
-errors cannot bypass the peak bound. The absolute floors cover near-zero
-rows. Cache comparisons retain their separate quantization and ownership
-checks. Saved `data/out` snapshots encode the reference arithmetic and must
-be regenerated after these rounding rules change.
+HC-post retains its completed residual state in FP32 for the next HC-pre.
+HC collapse rounds its FP32 sum to BF16 before RMSNorm and quantized
+projections. HC coefficients and residual mixing remain FP32.
 
-At the maximum 1,048,576-token context, the low-bit attention cache is about
-0.94 GB per request per card, compared with about 3.37 GB for BF16. At 32
-requests this is about 30.2 GB/card instead of 107.8 GB/card. Ideal per-card
-weight payload is about 66 GB before alignment and runtime workspaces: 36.1 GB
-of EP8 routed experts, 25.3 GB of sharded Engram, and 4.7 GB of other TP4
-weights. These figures make eight-card A5 deployment a plausible target, but
-the issue remains open until a real-device run records peak HBM and generates
-reference-matching text.
+The output projection uses the fused O-B + HC-post implementation in
+[`o_proj.py`](../../../models/deepseek_v4_1_flash/o_proj.py).
+Attention entries own chunk scheduling and dependencies around that shared
+implementation. MoE dispatches local token rows to EP expert owners and combines
+the results back into the local HC state.
 
-## Path to token generation
+## Parallel configuration
 
-The implementation milestones are ordered by dependency:
+| Component | Contract |
+| --- | --- |
+| Attention weights | Full weights on every rank; no attention TP |
+| Prefill CP | `--cp 1/2/4/8`; CP1 uses local attention, CP>1 uses head-tail query placement and KV publication across peers |
+| MoE EP | `--ep 2/4/8`; EP1 is unsupported |
+| Prefill DP | `DP_SIZE = EP_SIZE // CP_SIZE`; CP must divide EP |
+| Decode attention | Independent requests and local KV/cache state per rank; no decode CP partitioning |
+| Decode MoE | EP dispatch/combine across ranks, while attention retains local request ownership |
+| LM-head TP | Independent `--lm-head-tp 1/2/4/8`, subject to the rank-group constraints checked by the entry |
 
-1. Implement and compile the attention TP all-reduce, mHC, and SWA.
-   Packed prefill SWA is wired through mHC: `mhc_mixes` → `mhc_pre` →
-   `prefill_attn_swa` → `mhc_post`. Run `python models/deepseek_v4_1_flash/prefill_swa.py`.
-2. Implement C2A Full, then validate Full-to-Reuse cache and Top-K replay.
-   Packed prefill C2A Full and Reuse are wired through mHC the same way,
-   with the attention RMSNorm the block runs between `mhc_pre` and the
-   leaf: `python models/deepseek_v4_1_flash/prefill_c2a_full.py`.
-3. Implement C1A Full and the level-one candidate selector, then Reindex and Reuse.
-4. Implement the three-phase EP-MoE dispatch/local-expert/combine body.
-5. Compose the operators into one layer, then into the 40-layer prefill/decode
-   token loop. `prefill_layer.py` is the prefill half of the first step: one
-   complete layer, the C2A Reuse attention sublayer followed by the EP MoE
-   sublayer, both through mHC and with the delayed pre-mix passed between them.
-   Run `python models/deepseek_v4_1_flash/prefill_layer.py`, which validates it
-   on two cards at TP1/DP2/EP2; the A5 job also runs TP2/DP2 on four cards.
+For prefill, at CP1, each DP group may pack multiple independent requests. At CP>1, each DP
+group supports one request. Different DP groups own independent requests and
+cache state. The standalone attention entries can run CP1 on a single device;
+layer and forward entries also compose EP MoE and require multiple devices.
 
-Until the leaf kernels and weight loader land, this directory is not a runnable
-model and is not exposed to `pypto-serving`.
+For a sequence divided into `2 * CP` contiguous segments, CP rank `r` owns
+segments `r` and `2 * CP - 1 - r`. Thus CP2 assigns segments `(0, 3)` to rank 0
+and `(1, 2)` to rank 1. Metadata restores chronological KV order and the caller's
+row order. CP1 avoids the CP communication path.
 
-The compressor ownership regression can run without devices:
+Prefill supports a nonzero preceding sequence length for chunked continuation.
+This requires the caller to preserve matching cache and compressor state;
+a prefix length does not populate that state or provide a prefix-cache manager.
+The checkpoint `generate` entry currently requires CP1.
+
+Decode runs attention independently on each rank, with full attention weights
+and rank-local request metadata, KV caches, and compressor state. The prefill
+formula `DP_SIZE = EP_SIZE // CP_SIZE` describes prefill grouping; decode does
+not use its head-tail CP layout. Use CP1 for the current decode deployment.
+The default per-rank batch is `DECODE_BATCH = 12`; DSpark verifies
+`DECODE_SEQ = 6` rows per request, giving 72 local rows in the default workload.
+MoE routes these local rows across the EP group and returns results to their
+originating rank.
+
+LM-head TP partitions the vocabulary projection independently of attention.
+The forward requires `EP_SIZE % LM_HEAD_TP_SIZE == 0`. Contiguous groups of
+`LM_HEAD_TP_SIZE` ranks exchange selected hidden rows, compute vocabulary
+shards, and return output to the row owners; requests remain independently
+owned by their original ranks. For example, EP8 with LM-head TP2 has eight
+local attention batches and four two-rank output-projection groups. With
+LM-head TP1, each rank computes its own complete vocabulary projection.
+
+## Entry points and validation
+
+| Purpose | Entry files |
+| --- | --- |
+| Prefill attention | `prefill_swa.py`, `prefill_c1a_full.py`, `prefill_c1a_reindex.py`, `prefill_c1a_reuse.py`, `prefill_c2a_full.py`, `prefill_c2a_reuse.py` |
+| Decode attention | Corresponding `decode_swa.py`, `decode_c1a_*` and `decode_c2a_*` files |
+| Layer composition | [`prefill_layer.py`](../../../models/deepseek_v4_1_flash/prefill_layer.py), [`decode_layer.py`](../../../models/deepseek_v4_1_flash/decode_layer.py) |
+| Text forward | [`prefill_fwd.py`](../../../models/deepseek_v4_1_flash/prefill_fwd.py), [`decode_fwd.py`](../../../models/deepseek_v4_1_flash/decode_fwd.py) |
+| Speculative decoding | [`decode_fwd_dspark.py`](../../../models/deepseek_v4_1_flash/decode_fwd_dspark.py), `dspark_drafter.py`, `dspark_init.py`, `decode_metadata.py`, `dspark_attn.py`, and `markov.py` |
+| Shared operators | `hc.py`, `qkv_proj_rope.py`, `compressor.py`, `sparse_attention.py`, `o_proj.py`, `engram.py`, and `lm_head.py` |
+
+The six standalone decode attention entries accept explicit request starts and
+query lengths through `--start-pos` and `--query-lens`. Both lists have one
+comma-separated value per request. Their lengths and sum determine the request
+and token counts; the default batch of 12 and 72-token workload are not limits
+for these standalone entries. For example, batch 64 with four query tokens per
+request uses 64 starting positions and 64 query lengths of `4` (256 tokens).
+Query blocks must remain within the model position range. This does not change
+the forward or DSpark serving capacities.
+
+Compressed-attention decode fixtures retain only the sliding-window pages visible
+to the current query block, plus an unmapped control page. Compressed and index caches retain
+their history. Random cache generation uses bounded page batches; index goldens
+batch tokens sharing one request while retaining sequential BF16 head rounding.
+C2A reuse fixture preparation computes its source compressed cache and selected
+indices without computing the source attention output.
+
+C2A reuse validates its composed HC output with `atol=0.01`, `rtol=1/128`,
+and a maximum outlier ratio of 1%. Its cache and HC-mix checks retain their
+separate tolerances.
+
+For prefill attention, `--tokens` is capacity per DP group, before CP partitioning.
+`--query-lens '65,31;96'` describes two requests in DP0 and one in DP1;
+`--start-pos '127,0;256'` supplies their respective preceding lengths.
+Commas separate requests and semicolons separate DP groups. `--requests` provides
+a balanced split when explicit query lengths are omitted. The forward entry
+uses `--capacity` for its DP capacity.
+
+For example, these commands generate SWA artifacts without executing devices:
 
 ```bash
-python -m pytest tests/contract/test_v41_compressor_state.py -q
-python tests/contract/test_v41_compressor_state.py -p a5sim
+python models/deepseek_v4_1_flash/prefill_swa.py -p a5 --cp 1 --tokens 512 --compile-only
+python models/deepseek_v4_1_flash/prefill_swa.py -p a5 --cp 2 --tokens 1024 --compile-only
 ```
 
-The second command runs two consecutive kernel calls with reordering, block
-reuse, a chunk longer than the ring, inactive requests, trailing padding, and
-an empty-work case. Use `-p a5 -d <allocated_device>` for the same test on a
-real A5 device. Full attention validation additionally uses
-`decode_c2a_full.py` and `prefill_c2a_full.py`; their fixtures use nonidentity
-state block mappings.
+Use allocated devices for execution and consult each entry's `--help` for its
+options. See the [compile/runtime workflow](../../run-and-validate/compile-runtime-workflow.md)
+and [golden harness](../../run-and-validate/golden-harness.md) for artifact and
+comparison behavior. Standalone operators compare against Torch references.
+The prefill, decode, DSpark decode, and drafter smoke entries use `golden.run`
+without a numerical golden. Multi-stage initialization is owned by `dspark_init.py`.
+Forward smoke fixtures exercise composition and execution; they do not establish
+checkpoint-level generation accuracy or a complete numerical forward golden.
+The configured context ceiling and supported parallel-size choices are not a
+claim that every size/sequence-length combination has been device validated.
 
-## Pytest precision coverage
+## Vision
 
-Each implemented A5 entry contains its own `test_precision` function. Declare
-CI coverage with ordinary pytest parameters in that file, for example:
+[`vision.py`](../../../models/deepseek_v4_1_flash/vision.py) provides a BF16 ViT
+and visual aligner on A5. The released profile has 32 blocks, width 1,024,
+16 attention heads, and 14×14 RGB patches. The aligner packs 3×3 neighborhoods
+and projects them to 5,120-channel language embeddings.
 
-```python
-@pytest.mark.parametrize("tp,dp", [(1, 1), (2, 2), (4, 1)])
-def test_precision(tp, dp, a5_args):
-    result = validate(a5_args(tp=tp, dp=dp))
-    assert result.passed, result.error
-```
+`VisionEncoder` accepts preprocessed CPU BF16 patches and a patch-grid shape;
+`load_vision_weights` loads the vision and aligner checkpoint tensors. One call
+processes one image. The caller owns resizing, normalization, image delimiters,
+and insertion of aligned rows into the language input. Vision has separate 2D
+RoPE tables. This callable component does not itself provide an end-to-end
+multimodal serving pipeline.
 
-`validate` runs the existing golden harness and returns its result, including
-output and cache precision comparisons. `main` calls the same validation path
-for local execution. CLI choices remain independent of the cases selected for
-PR CI. The standard combinations are `(tp, dp) = (1, 1), (2, 2), (4, 1)`.
-Entries supporting only DP1 or exposing only TP keep TP1 and TP4; single-card
-entries run once. MoE uses EP4 with TP2 or TP4, corresponding to DP2 or DP1.
-Daily CI retains its existing CLI-based Cartesian-product sweep.
+The standalone entry defaults to a reduced two-layer Torch comparison;
+`--checkpoint` selects the released profile and weights, while `--patches` and
+`--grid` supply preprocessed input.
 
-The CI runner collects the tests in each selected `# ci: a5` file using pytest,
-then submits each node to `task-submit` with `tp * dp` cards, or `ep` cards
-for expert-parallel entries with implicit `dp = ep / tp`. The queued command
-runs **pytest on that node**, passing declared `--tp`/`--dp`/`--ep` options and allocated `--device`
-IDs. Each node runs in a fresh process because model shapes depend on CLI
-arguments at import time. PRs retain selection by the reverse-import graph.
-Changes to the pytest queue runner or this directory's `conftest.py` select
-all marked V4.1 implementations. Validation entry points reject explicit TP
-arguments that disagree with their import-time TP size.
-Daily CI continues to invoke the local main entry points with its existing matrix.
+## Development priorities
 
-With the development environment activated, inspect a file's tests:
-
-```bash
-python -m pytest models/deepseek_v4_1_flash/decode_attn_swa.py --collect-only -q
-```
-
-Run an individual precision case through the device queue:
-
-```bash
-task-submit --device auto --device-num 4 --run \
-  'python -m pytest "models/deepseek_v4_1_flash/decode_attn_swa.py::test_precision[4-1]" --tp 4 --dp 1 --device $TASK_DEVICE -v -s'
-```
-
-The fixture checks that test parameters match the process's TP/DP/EP options and
-that the allocated device count matches. For all declared cases, the CI runner
-handles the separate processes and allocations (requires the CI `activate.sh`):
-
-```bash
-python .github/scripts/run_a5_pytest.py models/deepseek_v4_1_flash/decode_attn_swa.py
-```
-
-Local script execution is still supported with all original CLI options:
-
-```bash
-task-submit --device auto --device-num 2 --run \
-  'python models/deepseek_v4_1_flash/decode_attn_swa.py -p a5 --tp 1 --dp 2 -d $TASK_DEVICE'
-```
+| Field | Current priority |
+| --- | --- |
+| Performance target | 72-token decode and 1,024-token prefill with DP1/CP1, using full attention weights. Apply optimizations to the shared implementation across all attention layers and adapt all affected callers. |
+| Deferred performance work | Performance tuning for other token counts and prefill parallel configurations remains secondary to these targets; correctness and the shared fused output projection / HC-post implementation remain required. |
+| Compatibility requirements | Preserve correctness and interface contracts for already supported paths, including other token counts and DP/CP configurations. Update affected callers to use revised shared implementations. The optimized C++ routed FFN requires A5 device execution; simulation requests fail explicitly rather than selecting a different numerical implementation. |

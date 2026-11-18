@@ -2,7 +2,7 @@
   "platform": "a2a3",
   "sampling": {
     "rounds": 100,
-    "warmup": 500
+    "warmup": 10
   },
   "cases": [
     {
@@ -178,6 +178,8 @@
       "arguments": [
         "--ep",
         "16",
+        "--experts-per-rank",
+        "16",
         "--layer-id",
         "0",
         "--num-tokens",
@@ -232,6 +234,395 @@
         "1",
         "--start-pos",
         "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-swa-b12-8k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_swa.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-c1a-full-b12-8k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_c1a_full.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-c1a-reindex-b12-8k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_c1a_reindex.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-c1a-reuse-b12-8k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_c1a_reuse.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-c2a-full-b12-8k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_c2a_full.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-c2a-reuse-b12-8k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_c2a_reuse.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-swa-b12-128k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_swa.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-c1a-full-b12-128k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_c1a_full.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-c1a-reindex-b12-128k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_c1a_reindex.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-c1a-reuse-b12-128k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_c1a_reuse.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-c2a-full-b12-128k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_c2a_full.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-c2a-reuse-b12-128k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_c2a_reuse.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-swa-b64-128k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_swa.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-c1a-full-b64-128k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_c1a_full.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-c1a-reindex-b64-128k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_c1a_reindex.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-c1a-reuse-b64-128k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_c1a_reuse.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-c2a-full-b64-128k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_c2a_full.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-c2a-reuse-b64-128k",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_c2a_reuse.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-moe-ep8-b12-eplb",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_moe.py",
+      "platform": "a5",
+      "device_count": 8,
+      "arguments": [
+        "--ep",
+        "8",
+        "--num-tokens",
+        "72",
+        "--experts-per-rank",
+        "12",
+        "--balanced-routing"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-moe-ep8-b64-eplb",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_moe.py",
+      "platform": "a5",
+      "device_count": 8,
+      "arguments": [
+        "--ep",
+        "8",
+        "--num-tokens",
+        "384",
+        "--experts-per-rank",
+        "12",
+        "--balanced-routing"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-prefill-swa-dp1-cp1-t1024",
+      "entrypoint": "models/deepseek_v4_1_flash/prefill_swa.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--dp",
+        "1",
+        "--cp",
+        "1",
+        "--tokens",
+        "1024",
+        "--requests",
+        "1",
+        "--case",
+        "normal"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-prefill-c1a-full-dp1-cp1-t1024",
+      "entrypoint": "models/deepseek_v4_1_flash/prefill_c1a_full.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--dp",
+        "1",
+        "--cp",
+        "1",
+        "--tokens",
+        "1024",
+        "--requests",
+        "1",
+        "--case",
+        "normal"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-prefill-c1a-reindex-dp1-cp1-t1024",
+      "entrypoint": "models/deepseek_v4_1_flash/prefill_c1a_reindex.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--dp",
+        "1",
+        "--cp",
+        "1",
+        "--tokens",
+        "1024",
+        "--requests",
+        "1",
+        "--case",
+        "normal"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-prefill-c1a-reuse-dp1-cp1-t1024",
+      "entrypoint": "models/deepseek_v4_1_flash/prefill_c1a_reuse.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--dp",
+        "1",
+        "--cp",
+        "1",
+        "--tokens",
+        "1024",
+        "--requests",
+        "1",
+        "--case",
+        "normal"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-prefill-c2a-full-dp1-cp1-t1024",
+      "entrypoint": "models/deepseek_v4_1_flash/prefill_c2a_full.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--dp",
+        "1",
+        "--cp",
+        "1",
+        "--tokens",
+        "1024",
+        "--requests",
+        "1",
+        "--case",
+        "normal"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-prefill-c2a-reuse-dp1-cp1-t1024",
+      "entrypoint": "models/deepseek_v4_1_flash/prefill_c2a_reuse.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--dp",
+        "1",
+        "--cp",
+        "1",
+        "--tokens",
+        "1024",
+        "--requests",
+        "1",
+        "--case",
+        "normal"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-prefill-moe-dp8-cp1-ep8-t1024-e48",
+      "entrypoint": "models/deepseek_v4_1_flash/prefill_moe.py",
+      "platform": "a5",
+      "device_count": 8,
+      "arguments": [
+        "--ep",
+        "8",
+        "--entry",
+        "slabs",
+        "--tokens",
+        "1024",
+        "--slab-capacity",
+        "1024",
+        "--num-tokens",
+        "1024",
+        "--experts-per-rank",
+        "48"
+      ],
+      "runtime_config": {
+        "ring_heap": 2147483648
+      }
+    },
+    {
+      "case_id": "glm5.3-flash-a3-v1-kda-verify-b32q6",
+      "suite": "glm5.3-flash",
+      "entrypoint": "models/glm5_3_flash/kda.py",
+      "platform": "a2a3",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "16",
+        "--ep",
+        "16",
+        "--seed",
+        "1024",
+        "--component",
+        "decode",
+        "--requests",
+        "32",
+        "--query-len",
+        "6",
+        "--initial-state",
+        "nonzero"
+      ]
+    },
+    {
+      "case_id": "glm5.3-flash-a3-v1-sfa-verify-b32q6-hist8k-bf16",
+      "suite": "glm5.3-flash",
+      "entrypoint": "models/glm5_3_flash/attention.py",
+      "platform": "a2a3",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "16",
+        "--ep",
+        "16",
+        "--seed",
+        "1024",
+        "--component",
+        "decode",
+        "--requests",
+        "32",
+        "--query-len",
+        "6",
+        "--history-tokens",
+        "8192",
+        "--selection",
+        "pool4-causal"
       ]
     }
   ]

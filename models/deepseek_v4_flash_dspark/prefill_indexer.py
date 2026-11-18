@@ -29,7 +29,10 @@ from prefill_indexer_compressor import (
     golden_prefill_indexer_compressor,
     prefill_indexer_compressor,
 )
-from prefill_metadata import QUERY_START_LOC_DYN, REQUESTS_DYN
+from prefill_metadata import (
+    CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE,
+    QUERY_START_LOC_DYN, REQUESTS_DYN,
+)
 
 
 PREFILL_MAX_TOKENS = 8192
@@ -81,13 +84,14 @@ QR_PROJ_MM_ROW_TILE = min(128, T)  # A2/A3 L0C-bounded qr-projection row tile
 QR_PROJ_TAIL_ROW_TILE = 16
 QR_PROJ_ROW_TILE = 16
 HEAD_DIM_TILE = 32
-D_TILE = 32
+D_TILE = 256
 WEIGHTS_ROW_TILE = 32
 QH_QUANT_ROW_TILE = 64
 ROPE_ROW_TILE = IDX_N_HEADS  # one token owns IDX_N_HEADS contiguous q rows + one cos/sin
 QH_MM_TILE = 64
 WEIGHTS_TAIL_ROW_TILE = 16
 TOPK_LEAF_TILE = 8192
+TOPK_SHORT_LEAF_TILE = 2048
 TOPK_GROUP_TILE = 2
 TOPK_MAX_LEAVES = (INDEXER_MAX_CANDIDATES + TOPK_LEAF_TILE - 1) // TOPK_LEAF_TILE
 TOPK_GROUPS_PER_QUERY = (TOPK_MAX_LEAVES + TOPK_GROUP_TILE - 1) // TOPK_GROUP_TILE
@@ -96,9 +100,12 @@ TOPK_GROUP_ROOT_ROWS = PREFILL_DENSE_TILE * TOPK_GROUPS_PER_QUERY
 TOPK_GROUP_SCRATCH_ROWS = TOPK_GROUP_WORKERS * TOPK_GROUP_TILE
 TOPK_ARENA_ROWS = TOPK_GROUP_ROOT_ROWS + TOPK_GROUP_SCRATCH_ROWS
 TOPK_SCORE_WORKERS = 24
+SCORE_CANDIDATE_TILE = 64
+SCORE_QUERY_TILE = 4
 
 # Four pairwise merge levels cover at most 16 roots.
 assert TOPK_GROUPS_PER_QUERY <= 16
+assert TOPK_SHORT_LEAF_TILE >= IDX_TOPK
 
 
 @pl.jit.inline
@@ -146,19 +153,44 @@ def _topk_leaf(
     output_slot: pl.Scalar[pl.INDEX],
 ) -> None:
     logical_begin_i32 = pl.cast(logical_begin, pl.INT32)
-    leaf_index_ramp = pl.tile.arange(0, [1, TOPK_LEAF_TILE], dtype=pl.INT32)
-    leaf_indices = pl.add(leaf_index_ramp, logical_begin_i32)
-    leaf_scores_raw = pl.load(score_arena, [query, logical_begin], [1, TOPK_LEAF_TILE], valid_shape=[1, valid_count])
-    leaf_scores = pl.tile.fillpad(leaf_scores_raw, pad_value=pl.PadValue.min)
-    leaf_floor = pl.tile.full([1, TOPK_LEAF_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
-    leaf_scores = pl.maximum(leaf_scores, leaf_floor)
-    pairs = pl.tile.sort32(leaf_scores, pl.reinterpret_view(leaf_indices, pl.UINT32))
-    pairs = pl.tile.mrgsort(pairs, block_len=64)
-    pairs = pl.tile.mrgsort(pairs, block_len=256)
-    pairs = pl.tile.mrgsort(pairs, block_len=1024)
-    pairs = pl.tile.mrgsort(pairs, block_len=4096)
-    top_pairs = pl.tile.slice(pairs, [1, TOPK_PAIR_WIDTH], [0, 0])
-    pl.store(top_pairs, [output_slot, 0], pair_arena)
+    if valid_count <= TOPK_SHORT_LEAF_TILE:
+        short_index_ramp = pl.tile.arange(0, [1, TOPK_SHORT_LEAF_TILE], dtype=pl.INT32)
+        short_indices = pl.add(short_index_ramp, logical_begin_i32)
+        short_scores_raw = pl.load(
+            score_arena,
+            [query, logical_begin],
+            [1, TOPK_SHORT_LEAF_TILE],
+            valid_shape=[1, valid_count],
+        )
+        short_scores = pl.tile.fillpad(short_scores_raw, pad_value=pl.PadValue.min)
+        short_floor = pl.tile.full([1, TOPK_SHORT_LEAF_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
+        short_scores = pl.maximum(short_scores, short_floor)
+        short_pairs = pl.tile.sort32(short_scores, pl.reinterpret_view(short_indices, pl.UINT32))
+        short_pairs = pl.tile.mrgsort(short_pairs, block_len=64)
+        short_pairs = pl.tile.mrgsort(short_pairs, block_len=256)
+        if valid_count > IDX_TOPK:
+            short_pairs = pl.tile.mrgsort(short_pairs, block_len=1024)
+        short_top_pairs = pl.tile.slice(short_pairs, [1, TOPK_PAIR_WIDTH], [0, 0])
+        pl.store(short_top_pairs, [output_slot, 0], pair_arena)
+    else:
+        leaf_index_ramp = pl.tile.arange(0, [1, TOPK_LEAF_TILE], dtype=pl.INT32)
+        leaf_indices = pl.add(leaf_index_ramp, logical_begin_i32)
+        leaf_scores_raw = pl.load(
+            score_arena,
+            [query, logical_begin],
+            [1, TOPK_LEAF_TILE],
+            valid_shape=[1, valid_count],
+        )
+        leaf_scores = pl.tile.fillpad(leaf_scores_raw, pad_value=pl.PadValue.min)
+        leaf_floor = pl.tile.full([1, TOPK_LEAF_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
+        leaf_scores = pl.maximum(leaf_scores, leaf_floor)
+        pairs = pl.tile.sort32(leaf_scores, pl.reinterpret_view(leaf_indices, pl.UINT32))
+        pairs = pl.tile.mrgsort(pairs, block_len=64)
+        pairs = pl.tile.mrgsort(pairs, block_len=256)
+        pairs = pl.tile.mrgsort(pairs, block_len=1024)
+        pairs = pl.tile.mrgsort(pairs, block_len=4096)
+        top_pairs = pl.tile.slice(pairs, [1, TOPK_PAIR_WIDTH], [0, 0])
+        pl.store(top_pairs, [output_slot, 0], pair_arena)
 
 
 @pl.jit.incore
@@ -247,11 +279,12 @@ def _topk_query_merge(
 
         root_pairs = pl.load(pair_arena, [arena_base, 0], [1, TOPK_PAIR_WIDTH])
         root_indices = pl.tile.gather_mask(root_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-        output_indices = pl.tile.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
         valid_topk = pl.min(visible_count, IDX_TOPK)
-        for lane in pl.range(valid_topk):
-            output_index = pl.tile.read(root_indices, [0, lane])
-            pl.tile.write(output_indices, [0, lane], output_index)
+        index_ramp = pl.tile.arange(0, [1, IDX_TOPK], dtype=pl.INT32)
+        index_ramp_fp32 = pl.cast(index_ramp, pl.FP32)
+        valid_topk_i32 = pl.cast(valid_topk, pl.INT32)
+        valid_mask = pl.tile.cmps(index_ramp_fp32, pl.cast(valid_topk_i32, pl.FP32), cmp_type=2)
+        output_indices = pl.tile.select(valid_mask, root_indices, -1)
         pl.store(output_indices, [output_query, 0], topk_indices)
 
 
@@ -276,59 +309,119 @@ def _prefill_indexer_score_topk(
     idx_block_num = pl.tensor.dim(idx_kv_cache, 0)
     idx_cache_rows = idx_block_num * BLOCK_SIZE
     kv_cache_i8_flat = pl.reshape(idx_kv_cache, [idx_cache_rows, IDX_HEAD_DIM])
-    kv_scale_flat = pl.reshape(idx_kv_scale, [idx_cache_rows, 1])
+    kv_scale_row_flat = pl.reshape(idx_kv_scale, [1, idx_cache_rows])
     with pl.spmd(
         TOPK_SCORE_WORKERS, name_hint="prefill_idx_score_leaf_wave", deps=[completion[0]],
-        optimizations=[pl.split(pl.SplitMode.NONE, slot_num=2)],
+        optimizations=[pl.cross_core_slot(slot_num=2, local_slot_num=1)],
     ) as score_tid:
         worker = pl.tile.get_block_idx()
-        global_leaf_base = 0
-        for query in pl.range(tile_rows):
-            output_query = tile_base + query
-            position = pl.read(position_ids, [output_query])
-            request_id = pl.read(local_request_ids, [output_query])
-            visible_count = 0
-            if request_id >= 0:
-                visible_count = pl.max(pl.min((position + 1) // COMPRESS_RATIO, INDEXER_MAX_CANDIDATES), 0)
-            leaf_count = (visible_count + TOPK_LEAF_TILE - 1) // TOPK_LEAF_TILE
-            base_mod = global_leaf_base % TOPK_SCORE_WORKERS
-            first_leaf = (worker + base_mod) % TOPK_SCORE_WORKERS
-            for leaf in pl.range(first_leaf, leaf_count, TOPK_SCORE_WORKERS):
-                logical_begin = leaf * TOPK_LEAF_TILE
-                valid_count = pl.min(TOPK_LEAF_TILE, visible_count - logical_begin)
-                query_head_begin = query * IDX_N_HEADS
-                query_vector = qr_hadamard_i8[query_head_begin : query_head_begin + IDX_N_HEADS, 0:IDX_HEAD_DIM]
-                query_scale_heads = qr_hadamard_scale_dq[query_head_begin : query_head_begin + IDX_N_HEADS, 0:1]
-                query_scale = pl.reshape(query_scale_heads, [1, IDX_N_HEADS])
-                query_weight = weights[query : query + 1, 0:IDX_N_HEADS]
-                for page in pl.pipeline(0, (valid_count + BLOCK_SIZE - 1) // BLOCK_SIZE, stage=2):
-                    page_begin = page * BLOCK_SIZE
-                    logical_row = logical_begin + page_begin
-                    logical_page = logical_row // BLOCK_SIZE
-                    physical_block_raw = pl.cast(-1, pl.INT32)
-                    if request_id >= 0:
-                        physical_block_raw = pl.read(idx_block_table, [request_id, logical_page])
-                    score_valid = pl.full([1, BLOCK_SIZE], dtype=pl.FP32, value=FP32_NEG_INF)
-                    if physical_block_raw >= 0 and physical_block_raw < idx_block_num:
-                        physical_block = pl.cast(physical_block_raw, pl.INDEX)
-                        physical_row = physical_block * BLOCK_SIZE
-                        kv_i8 = kv_cache_i8_flat[physical_row : physical_row + BLOCK_SIZE, 0:IDX_HEAD_DIM]
-                        score_i32 = pl.matmul(kv_i8, query_vector, out_dtype=pl.INT32, b_trans=True)
-                        score_fp32 = pl.cast(score_i32, target_type=pl.FP32, mode="none")
-                        score_fp32 = pl.col_expand_mul(score_fp32, query_scale)
-                        score_fp32 = pl.maximum(score_fp32, 0.0)
-                        score_fp32 = pl.col_expand_mul(score_fp32, query_weight)
-                        kv_scale = kv_scale_flat[physical_row : physical_row + BLOCK_SIZE, 0:1]
-                        score_sum = pl.row_sum(score_fp32)
-                        score_scaled = pl.mul(score_sum, kv_scale)
-                        score_row = pl.reshape(score_scaled, [1, BLOCK_SIZE])
-                        valid_rows = pl.min(BLOCK_SIZE, valid_count - page_begin)
-                        score_valid_view = pl.set_validshape(score_row, 1, valid_rows)
-                        score_padded = pl.fillpad(score_valid_view, pad_value=pl.PadValue.min)
-                        score_floor = pl.full([1, BLOCK_SIZE], dtype=pl.FP32, value=FP32_NEG_INF)
-                        score_valid = pl.maximum(score_padded, score_floor)
-                    score_arena[query : query + 1, logical_row : logical_row + BLOCK_SIZE] = score_valid
-            global_leaf_base = global_leaf_base + leaf_count
+        global_block_base = 0
+        for query in pl.range(0, tile_rows, SCORE_QUERY_TILE):
+            query_requests = pl.array.create(SCORE_QUERY_TILE, pl.INT32)
+            query_counts = pl.array.create(SCORE_QUERY_TILE, pl.INT64)
+            for metadata_member in pl.range(SCORE_QUERY_TILE):
+                metadata_request = pl.cast(-1, pl.INT32)
+                metadata_count = pl.cast(0, pl.INT64)
+                if query + metadata_member < tile_rows:
+                    metadata_query = tile_base + query + metadata_member
+                    metadata_request = pl.read(local_request_ids, [metadata_query])
+                    if metadata_request >= 0:
+                        metadata_position = pl.read(position_ids, [metadata_query])
+                        metadata_visible = pl.max((metadata_position + 1) // COMPRESS_RATIO, 0)
+                        metadata_count = pl.cast(pl.min(metadata_visible, INDEXER_MAX_CANDIDATES), pl.INT64)
+                query_requests[metadata_member] = metadata_request
+                query_counts[metadata_member] = metadata_count
+            for leader in pl.range(SCORE_QUERY_TILE):
+                if query + leader < tile_rows:
+                    request_id = query_requests[leader]
+                    request_leader = 1
+                    if request_id < 0:
+                        request_leader = 0
+                    for previous in pl.range(leader):
+                        previous_request = query_requests[previous]
+                        if previous_request == request_id:
+                            request_leader = 0
+                    if request_leader > 0:
+                        visible_count = 0
+                        for member in pl.range(SCORE_QUERY_TILE):
+                            if query + member < tile_rows:
+                                member_request = query_requests[member]
+                                if member_request == request_id:
+                                    member_count = query_counts[member]
+                                    visible_count = pl.max(visible_count, member_count)
+                        block_count = (visible_count + SCORE_CANDIDATE_TILE - 1) // SCORE_CANDIDATE_TILE
+                        base_mod = global_block_base % TOPK_SCORE_WORKERS
+                        first_block = (worker + base_mod) % TOPK_SCORE_WORKERS
+                        if first_block < block_count:
+                            query_begin = query * IDX_N_HEADS
+                            query_heads = SCORE_QUERY_TILE * IDX_N_HEADS
+                            query_vector = pl.load(qr_hadamard_i8, [query_begin, 0], [query_heads, IDX_HEAD_DIM])
+                            query_transposed = pl.tile.transpose_view(query_vector)
+                            for prep_lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                                query_scale_heads = pl.load(qr_hadamard_scale_dq, [query_begin, 0], [query_heads, 1])
+                                query_scale = pl.reshape(query_scale_heads, [1, query_heads])
+                                query_weight_rows = pl.load(weights, [query, 0], [SCORE_QUERY_TILE, IDX_N_HEADS])
+                                query_weight = pl.reshape(query_weight_rows, [1, query_heads])
+                                query_factor = pl.mul(query_scale, query_weight)
+                            for block in pl.pipeline(first_block, block_count, TOPK_SCORE_WORKERS, stage=2):
+                                logical_row = block * SCORE_CANDIDATE_TILE
+                                kv_i8 = pl.tile.create([SCORE_CANDIDATE_TILE, IDX_HEAD_DIM], pl.INT8, pl.MemorySpace.Mat)
+                                for page_part in pl.unroll(SCORE_CANDIDATE_TILE // BLOCK_SIZE):
+                                    part_begin = page_part * BLOCK_SIZE
+                                    logical_page = (logical_row + part_begin) // BLOCK_SIZE
+                                    physical_block_raw = pl.read(idx_block_table, [request_id, logical_page])
+                                    physical_block_safe = pl.max(pl.min(physical_block_raw, idx_block_num - 1), 0)
+                                    physical_row = pl.cast(physical_block_safe, pl.INDEX) * BLOCK_SIZE
+                                    kv_i8 = pl.tile.gather_row(
+                                        kv_i8, kv_cache_i8_flat, [part_begin, 0],
+                                        [physical_row, 0], [BLOCK_SIZE, IDX_HEAD_DIM],
+                                    )
+                                score_i32 = pl.matmul(kv_i8, query_transposed, out_dtype=pl.INT32)
+                                for shard_lane in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
+                                    score_lane = pl.aiv_shard(score_i32)
+                                for aiv_lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                                    kv_scale = pl.tile.create([1, SCORE_CANDIDATE_TILE], pl.FP32)
+                                    page_flags = pl.tile.full([1, SCORE_CANDIDATE_TILE], pl.FP32, 0.0)
+                                    for scale_part in pl.unroll(SCORE_CANDIDATE_TILE // BLOCK_SIZE):
+                                        scale_begin = scale_part * BLOCK_SIZE
+                                        scale_logical_page = (logical_row + scale_begin) // BLOCK_SIZE
+                                        scale_block_raw = pl.read(idx_block_table, [request_id, scale_logical_page])
+                                        scale_block_safe = pl.max(pl.min(scale_block_raw, idx_block_num - 1), 0)
+                                        scale_physical_row = pl.cast(scale_block_safe, pl.INDEX) * BLOCK_SIZE
+                                        kv_scale = pl.tile.gather_row(
+                                            kv_scale, kv_scale_row_flat, [0, scale_begin],
+                                            [0, scale_physical_row], [1, BLOCK_SIZE],
+                                        )
+                                        if scale_block_raw >= 0 and scale_block_raw < idx_block_num:
+                                            part_flags = pl.tile.full([1, BLOCK_SIZE], pl.FP32, 1.0)
+                                            page_flags = pl.tile.assemble(page_flags, part_flags, [0, scale_begin])
+                                    page_mask = pl.tile.cmps(page_flags, 0, cmp_type=1)
+                                    lane_begin = aiv_lane * (SCORE_QUERY_TILE // 2)
+                                    for member in pl.range(lane_begin, lane_begin + SCORE_QUERY_TILE // 2):
+                                        if query + member < tile_rows:
+                                            member_request = query_requests[member]
+                                            if member_request == request_id:
+                                                member_count = query_counts[member]
+                                                head_begin = (member - lane_begin) * IDX_N_HEADS
+                                                factor_begin = member * IDX_N_HEADS
+                                                member_i32 = pl.tile.slice(score_lane, [SCORE_CANDIDATE_TILE, IDX_N_HEADS], [0, head_begin])
+                                                member_factor = pl.tile.slice(query_factor, [1, IDX_N_HEADS], [0, factor_begin])
+                                                score_fp32 = pl.cast(member_i32, target_type=pl.FP32, mode="none")
+                                                score_fp32 = pl.maximum(score_fp32, 0.0)
+                                                score_fp32 = pl.col_expand_mul(score_fp32, member_factor)
+                                                score_reduce_tmp = pl.tile.create([SCORE_CANDIDATE_TILE, IDX_N_HEADS], pl.FP32)
+                                                score_sum = pl.row_sum(score_fp32, tmp_tile=score_reduce_tmp)
+                                                score_row = pl.reshape(score_sum, [1, SCORE_CANDIDATE_TILE])
+                                                score_scaled = pl.mul(score_row, kv_scale)
+                                                score_masked = pl.tile.select(page_mask, score_scaled, FP32_NEG_INF)
+                                                if logical_row < member_count:
+                                                    valid_rows = pl.min(SCORE_CANDIDATE_TILE, member_count - logical_row)
+                                                    score_view = pl.set_validshape(score_masked, 1, valid_rows)
+                                                    score_padded = pl.fillpad(score_view, pad_value=pl.PadValue.min)
+                                                    score_floor = pl.tile.full([1, SCORE_CANDIDATE_TILE], pl.FP32, FP32_NEG_INF)
+                                                    score_valid = pl.maximum(score_padded, score_floor)
+                                                    pl.store(score_valid, [query + member, logical_row], score_arena)
+                        global_block_base = global_block_base + block_count
 
     with pl.spmd(TOPK_GROUP_WORKERS, name_hint="prefill_idx_topk_group_wave", deps=[score_tid]) as topk_tid:
         _topk_group_wave(position_ids, local_request_ids, score_arena, pair_arena, tile_base, tile_rows)
@@ -345,9 +438,13 @@ def _prefill_indexer_dense_tile(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
+    # NOT pl.NZ: o0/tail_o0 are formed via integer division of a flattened
+    # spmd index (qr_n = idx // qr_full_row_blocks), which NZ addressability
+    # cannot prove non-negative (only bare spmd/loop indices and their
+    # sums/products with constants are provable, not a quotient).
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, pl.NZ],
     cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
@@ -619,11 +716,16 @@ def _prefill_indexer_dense_tile(
 def prefill_indexer(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
+    # NOT pl.NZ: o0/tail_o0 are formed via integer division of a flattened
+    # spmd index (qr_n = idx // qr_full_row_blocks), which NZ addressability
+    # cannot prove non-negative (only bare spmd/loop indices and their
+    # sums/products with constants are provable, not a quotient).
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, pl.NZ],
     cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
@@ -650,7 +752,7 @@ def prefill_indexer(
     compressor_completion = pl.array.create(1, pl.TASK_ID)
     prefill_indexer_compressor(
         x,
-        query_start_loc,
+        query_start_loc, state_checkpoint_ends,
         inner_compress_state, inner_compress_state_block_table,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
         cmp_freqs_cos, cmp_freqs_sin,
@@ -678,9 +780,13 @@ def prefill_indexer_query(
     x: pl.Tensor[[Q_T_DYN, D], pl.BF16],
     qr: pl.Tensor[[Q_T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[Q_T_DYN, 1], pl.FP32],
+    # NOT pl.NZ: o0/tail_o0 are formed via integer division of a flattened
+    # spmd index (qr_n = idx // qr_full_row_blocks), which NZ addressability
+    # cannot prove non-negative (only bare spmd/loop indices and their
+    # sums/products with constants are provable, not a quotient).
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, pl.NZ],
     cos: pl.Tensor[[Q_T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[Q_T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
@@ -776,7 +882,7 @@ def topk_prefix_contract_error(topk_indices, position_ids, num_tokens=None):
 
 
 def golden_prefill_indexer_core(tensors):
-    from utils import int8_quant_per_row
+    from utils import int8_quant_per_row, unpack_nz
     import torch
 
     token_count = int(tensors["x"].shape[0])
@@ -803,6 +909,7 @@ def golden_prefill_indexer_core(tensors):
                 "idx_kv_scale": tensors["idx_kv_scale"],
                 "idx_block_table": tensors["idx_block_table"][request : request + 1],
                 "position_ids": tensors["position_ids"][request_rows],
+                "state_checkpoint_ends": tensors["state_checkpoint_ends"][request : request + 1],
                 "idx_slot_mapping": tensors["idx_slot_mapping"][request_rows],
                 "inner_state_slot_mapping": tensors["inner_state_slot_mapping"][request_rows],
             }
@@ -849,7 +956,7 @@ def golden_prefill_indexer_core(tensors):
             dim=-1,
         )
         q = q.to(torch.bfloat16).float() @ hadamard
-        weights = (tensors["x"][tile_base:tile_end].float() @ tensors["weights_proj"].float()) * WEIGHTS_SCALE
+        weights = (tensors["x"][tile_base:tile_end].float() @ unpack_nz(tensors["weights_proj"]).float()) * WEIGHTS_SCALE
 
         # Per-row INT8 query scores against pre-quantized KV.
         q_i8, q_sc = int8_quant_per_row(q.reshape(tile_rows * IDX_N_HEADS, IDX_HEAD_DIM))
@@ -897,15 +1004,44 @@ def golden_prefill_indexer(tensors):
     tensors["topk_idxs"][:] = topk_idxs
 
 
+def golden_prefill_indexer_selection(tensors):
+    import torch
+
+    output = tensors["topk_idxs"]
+    output.fill_(-1)
+    queries = tensors["query_i8"].reshape(SCORE_QUERY_TILE, IDX_N_HEADS, IDX_HEAD_DIM).to(torch.int32)
+    query_scales = tensors["query_scale"].reshape(SCORE_QUERY_TILE, IDX_N_HEADS, 1)
+    cache = tensors["idx_kv_cache"].reshape(-1, IDX_HEAD_DIM).to(torch.int32)
+    cache_scales = tensors["idx_kv_scale"].reshape(-1)
+    for query in range(output.shape[0]):
+        request = int(tensors["local_request_ids"][query])
+        visible = max(0, (int(tensors["position_ids"][query]) + 1) // COMPRESS_RATIO)
+        if request < 0 or visible == 0:
+            continue
+        logical = torch.arange(visible, dtype=torch.int64)
+        pages = tensors["idx_block_table"][request, logical // BLOCK_SIZE].to(torch.int64)
+        physical = pages * BLOCK_SIZE + logical % BLOCK_SIZE
+        dots = queries[query] @ cache[physical].T
+        scores = torch.relu(dots.float() * query_scales[query])
+        scores = (scores * tensors["weights"][query, :, None]).sum(dim=0) * cache_scales[physical]
+        count = min(visible, IDX_TOPK)
+        output[query, :count] = torch.topk(scores, count).indices.to(torch.int32)
+
+
 @pl.jit
 def prefill_indexer_test(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
+    # NOT pl.NZ: o0/tail_o0 are formed via integer division of a flattened
+    # spmd index (qr_n = idx // qr_full_row_blocks), which NZ addressability
+    # cannot prove non-negative (only bare spmd/loop indices and their
+    # sums/products with constants are provable, not a quotient).
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, pl.NZ],
     cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
@@ -930,6 +1066,8 @@ def prefill_indexer_test(
 ):
     x.bind_dynamic(0, T_DYN)
     query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
+    state_checkpoint_ends.bind_dynamic(0, REQUESTS_DYN)
+    state_checkpoint_ends.bind_dynamic(1, CHECKPOINT_TILES_DYN)
     qr.bind_dynamic(0, T_DYN)
     qr_scale.bind_dynamic(0, T_DYN)
     cos.bind_dynamic(0, T_DYN)
@@ -948,7 +1086,7 @@ def prefill_indexer_test(
 
     prefill_indexer(
         x,
-        query_start_loc,
+        query_start_loc, state_checkpoint_ends,
         qr,
         qr_scale,
         wq_b,
@@ -975,6 +1113,43 @@ def prefill_indexer_test(
         inner_state_slot_mapping,
     )
     return idx_kv_cache, idx_kv_scale, topk_idxs
+
+
+@pl.jit(auto_scope=False)
+def prefill_indexer_selection_test(
+    query_i8: pl.Tensor[[SCORE_QUERY_TILE * IDX_N_HEADS, IDX_HEAD_DIM], pl.INT8],
+    query_scale: pl.Tensor[[SCORE_QUERY_TILE * IDX_N_HEADS, 1], pl.FP32],
+    weights: pl.Tensor[[SCORE_QUERY_TILE, IDX_N_HEADS], pl.FP32],
+    idx_kv_cache: pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8],
+    idx_kv_scale: pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32],
+    idx_block_table: pl.Tensor[[REQUESTS_DYN, IDX_CACHE_MAX_BLOCKS], pl.INT32],
+    local_request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    topk_idxs: pl.Out[pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32]],
+):
+    idx_kv_cache.bind_dynamic(0, IDX_BLOCK_NUM_DYN)
+    idx_kv_scale.bind_dynamic(0, IDX_BLOCK_NUM_DYN)
+    idx_block_table.bind_dynamic(0, REQUESTS_DYN)
+    local_request_ids.bind_dynamic(0, T_DYN)
+    position_ids.bind_dynamic(0, T_DYN)
+    topk_idxs.bind_dynamic(0, T_DYN)
+    ready = pl.create_tensor([1], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_selection_ready") as ready_tid:
+        pl.write(ready, [0], pl.cast(1, pl.INT32))
+    completion = pl.array.create(1, pl.TASK_ID)
+    completion[0] = ready_tid
+    tile_base = pl.cast(0, pl.INDEX)
+    tile_rows = pl.tensor.dim(position_ids, 0)
+    score_arena = pl.create_tensor([SCORE_QUERY_TILE, TOPK_LEAF_TILE], dtype=pl.FP32, manual_dep=True)
+    pair_arena = pl.create_tensor([TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], dtype=pl.FP32, manual_dep=True)
+    _prefill_indexer_score_topk(
+        query_i8, query_scale, weights,
+        idx_kv_cache, idx_kv_scale, idx_block_table,
+        local_request_ids, position_ids,
+        topk_idxs, score_arena, pair_arena, completion,
+        tile_base, tile_rows,
+    )
+    return topk_idxs
 
 
 def gen_shared_weight(shape, dequant_std, chan_cv):
@@ -1005,8 +1180,53 @@ def gen_shared_weight(shape, dequant_std, chan_cv):
     return w_i8, scale
 
 
+def build_selection_tensor_specs(visible_counts, request_ids):
+    import torch
+    from golden import TensorSpec
+
+    query_count = len(visible_counts)
+    request_count = max(request_ids) + 1
+    page_count = (max(visible_counts) + BLOCK_SIZE - 1) // BLOCK_SIZE
+    block_count = request_count * page_count
+    heads = torch.arange(IDX_N_HEADS)
+    positive = heads % 4 < 2
+    signs = torch.where(positive, 1, -1).to(torch.int8)
+    queries = torch.zeros(SCORE_QUERY_TILE, IDX_N_HEADS, IDX_HEAD_DIM, dtype=torch.int8)
+    queries[:, :, 0] = signs
+    queries[:, :, 1] = signs * 64
+    queries = queries.reshape(SCORE_QUERY_TILE * IDX_N_HEADS, IDX_HEAD_DIM)
+    query_scales = torch.exp2(-torch.arange(1, SCORE_QUERY_TILE + 1, dtype=torch.float32))
+    query_scales = query_scales[:, None].expand(-1, IDX_N_HEADS).contiguous()
+    query_scales = query_scales.reshape(SCORE_QUERY_TILE * IDX_N_HEADS, 1)
+    head_weights = torch.where(heads % 2 == 0, 0.125, -0.0625)
+    weights = head_weights[None, :].expand(SCORE_QUERY_TILE, -1).contiguous()
+    cache = torch.zeros(block_count * BLOCK_SIZE, IDX_HEAD_DIM, dtype=torch.int8)
+    codes = torch.arange(1, cache.shape[0] + 1)
+    cache[:, 0] = (codes % 64).to(torch.int8)
+    cache[:, 1] = (codes // 64).to(torch.int8)
+    cache = cache.reshape(block_count, BLOCK_SIZE, 1, IDX_HEAD_DIM)
+    cache_scales = torch.full((block_count, BLOCK_SIZE, 1, 1), 1.0 / 32)
+    table = torch.full((request_count, IDX_CACHE_MAX_BLOCKS), -1, dtype=torch.int32)
+    pages = torch.arange(block_count, dtype=torch.int32).reshape(page_count, request_count).T
+    for request in range(request_count):
+        table[request, :page_count] = pages[request].flip(0) if request % 2 else pages[request]
+    positions = torch.tensor(visible_counts, dtype=torch.int32) * COMPRESS_RATIO - 1
+    requests = torch.tensor(request_ids, dtype=torch.int32)
+    return [
+        TensorSpec("query_i8", [SCORE_QUERY_TILE * IDX_N_HEADS, IDX_HEAD_DIM], torch.int8, init_value=queries),
+        TensorSpec("query_scale", [SCORE_QUERY_TILE * IDX_N_HEADS, 1], torch.float32, init_value=query_scales),
+        TensorSpec("weights", [SCORE_QUERY_TILE, IDX_N_HEADS], torch.float32, init_value=weights),
+        TensorSpec("idx_kv_cache", list(cache.shape), torch.int8, init_value=cache),
+        TensorSpec("idx_kv_scale", list(cache_scales.shape), torch.float32, init_value=cache_scales),
+        TensorSpec("idx_block_table", list(table.shape), torch.int32, init_value=table),
+        TensorSpec("local_request_ids", [query_count], torch.int32, init_value=requests),
+        TensorSpec("position_ids", [query_count], torch.int32, init_value=positions),
+        TensorSpec("topk_idxs", [query_count, IDX_TOPK], torch.int32),
+    ]
+
+
 def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SEQ):
-    from utils import int8_quant_per_row
+    from utils import checkpoint_ends_tensor, int8_quant_per_row, pack_nz
     import torch
     from golden import TensorSpec
     from utils import token_local_rope
@@ -1187,15 +1407,17 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
     )
     wq_b_i8 = wq_b_i8_T.t().contiguous()
     qr_i8, qr_scale = int8_quant_per_row(torch.rand(token_count, Q_LORA))
+    checkpoint_tensor = checkpoint_ends_tensor([0], starts=[start_pos], lengths=[token_count])
 
     return [
         TensorSpec("x", [token_count, D], torch.bfloat16, init_value=init_x),
         TensorSpec("query_start_loc", [2], torch.int32, init_value=torch.tensor([0, token_count], dtype=torch.int32)),
+        TensorSpec("state_checkpoint_ends", list(checkpoint_tensor.shape), torch.int32, init_value=checkpoint_tensor),
         TensorSpec("qr", [token_count, Q_LORA], torch.int8, init_value=lambda: qr_i8),
         TensorSpec("qr_scale", [token_count, 1], torch.float32, init_value=lambda: qr_scale),
         TensorSpec("wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
         TensorSpec("wq_b_scale", [IDX_N_HEADS * IDX_HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
-        TensorSpec("weights_proj", [D, IDX_N_HEADS], torch.bfloat16, init_value=init_weights_proj),
+        TensorSpec("weights_proj", [D, IDX_N_HEADS], torch.bfloat16, init_value=lambda: pack_nz(init_weights_proj().to(torch.bfloat16))),
         TensorSpec("cos", [token_count, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
         TensorSpec("sin", [token_count, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
         TensorSpec("cmp_freqs_cos", [token_count, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_cmp_freqs_cos),
@@ -1254,12 +1476,20 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run
     from utils import int8_quant_per_row
 
+    CASES = {
+        "main": None,
+        "short-merge-boundary": ((512, 513, 1), (1, 0, 1)),
+        "short-long-boundary": ((2048, 2049, 0), (0, 1, -1)),
+        "empty-and-prefix": ((0, 1, 511), (0, 1, 0)),
+    }
+
     parser = argparse.ArgumentParser(
         description="Standalone token-major DeepSeek V4 prefill indexer validation."
     )
-    parser.add_argument(
-        "-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"]
-    )
+    case_help = "Run all validation cases or select one case for profiling and replay."
+    parser.add_argument("--case", choices=["all", *CASES], default="all", help=case_help)
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument(
         "--compile-only",
@@ -1271,7 +1501,7 @@ if __name__ == "__main__":
         "--start-pos",
         type=int,
         default=START_POS,
-        help="Fixture-only absolute position for token 0; lowered into position_ids and dense idx_slot_mapping.",
+        help="Main-case absolute position for token 0; select the matching value when replaying saved data.",
     )
     parser.add_argument(
         "--token-count",
@@ -1279,13 +1509,20 @@ if __name__ == "__main__":
         dest="token_count",
         type=int,
         default=PREFILL_SEQ,
-        help=f"Physical token length in [1, {PREFILL_MAX_TOKENS}].",
+        help=f"Main-case token length in [1, {PREFILL_MAX_TOKENS}]; select the matching length for replay.",
     )
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--save-data", action="store_true", help="Persist inputs and golden outputs for replay.")
+    parser.add_argument("--golden-data", type=str, default=None, help="Replay a saved golden data directory.")
+    parser.add_argument("--runtime-dir", type=str, default=None, help="Reuse a compatible compiled work directory.")
     args = parser.parse_args()
+    if args.case == "all" and (args.golden_data or args.runtime_dir or args.enable_chip_swimlane):
+        parser.error("profiling and replay require a single --case instead of --case all")
 
     def score_selected_indices(token_id, indices, expected_outputs, inputs):
+        from utils import unpack_nz
+
         qr = inputs["qr"][token_id : token_id + 1]
         qr_scale = inputs["qr_scale"][token_id : token_id + 1].float()
         q_i32 = qr.to(torch.int32) @ inputs["wq_b"].to(torch.int32)
@@ -1301,7 +1538,7 @@ if __name__ == "__main__":
         )
         q = q.to(torch.bfloat16).float() @ inputs["hadamard"].float()
         q_i8, q_scale = int8_quant_per_row(q.reshape(IDX_N_HEADS, IDX_HEAD_DIM))
-        weights = (inputs["x"][token_id].float() @ inputs["weights_proj"].float()) * WEIGHTS_SCALE
+        weights = (inputs["x"][token_id].float() @ unpack_nz(inputs["weights_proj"]).float()) * WEIGHTS_SCALE
 
         logical_rows = indices.to(torch.int64)
         request_id = int(inputs["local_request_ids"][token_id].item())
@@ -1389,41 +1626,55 @@ if __name__ == "__main__":
         compare.__name__ = f"mapped_active_rows({mapping_name})"
         return compare
 
-    result = run(
-        fn=prefill_indexer_test,
-        specs=build_tensor_specs(args.start_pos, args.token_count),
-        golden_fn=golden_prefill_indexer,
-        config=dict(
-            dump_passes=args.dump_passes,
-            platform=args.platform,
-            device_id=args.device,
-            enable_chip_swimlane=args.enable_chip_swimlane,
+    main_compare_fn = {
+        "topk_idxs": topk_idxs_compare,
+        # C8 cache: INT8 rows exact bar boundary +/-1 LSB; scale rides alongside.
+        "idx_kv_cache": mapped_active_rows(
+            "idx_slot_mapping", ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
         ),
-        rtol=1e-3,
-        atol=1e-3,
-        compile_only=args.compile_only,
-        compare_fn={
-            "topk_idxs": topk_idxs_compare,
-            # C8 cache: INT8 rows exact bar boundary +/-1 LSB; scale rides alongside.
-            "idx_kv_cache": mapped_active_rows(
-                "idx_slot_mapping",
-                ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
+        "idx_kv_scale": mapped_active_rows(
+            "idx_slot_mapping", ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
+        ),
+        "inner_compress_state": mapped_active_rows(
+            "inner_state_slot_mapping", ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
+        ),
+    }
+    cases_to_run = list(CASES) if args.case == "all" else [args.case]
+    for case_name in cases_to_run:
+        print(f"[RUN] prefill indexer case: {case_name}", flush=True)
+        if case_name == "main":
+            fn = prefill_indexer_test
+            specs = build_tensor_specs(args.start_pos, args.token_count)
+            golden_fn = golden_prefill_indexer
+            compare_fn = main_compare_fn
+            rtol, atol = 1e-3, 1e-3
+        else:
+            visible_counts, request_ids = CASES[case_name]
+            fn = prefill_indexer_selection_test
+            specs = build_selection_tensor_specs(visible_counts, request_ids)
+            golden_fn = golden_prefill_indexer_selection
+            compare_fn = None
+            rtol, atol = 0, 0
+        result = run(
+            fn=fn,
+            specs=specs,
+            golden_fn=golden_fn,
+            save_data=args.save_data,
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            config=dict(
+                dump_passes=args.dump_passes,
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                device_id=args.device,
+                enable_chip_swimlane=args.enable_chip_swimlane,
             ),
-            "idx_kv_scale": mapped_active_rows(
-                "idx_slot_mapping",
-                ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
-            ),
-            "inner_compress_state": mapped_active_rows(
-                "inner_state_slot_mapping",
-                ratio_allclose(
-                    atol=1e-4,
-                    rtol=1.0 / 128,
-                    max_error_ratio=0.01,
-                ),
-            ),
-        },
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+            rtol=rtol,
+            atol=atol,
+            compile_only=args.compile_only,
+            compare_fn=compare_fn,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)

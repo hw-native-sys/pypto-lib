@@ -6,53 +6,152 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4.1 MoE shared-expert FFN with MXFP8 W1/W3/W2."""
+# ci: no-sim
+"""DeepSeek-V4.1 shared MXFP8 W13, SwiGLU requantization, and W2."""
+
+import sys
+from math import gcd
+from pathlib import Path
 
 import pypto.language as pl
 
-from models.deepseek_v4_1_flash.config import FLASH as M, MOE_TOKENS
+from pypto.runtime import pto_isa_include_dir
+
+import config
+
+
+def _parse_int_option(flag, default):
+    for index, argument in enumerate(sys.argv):
+        if argument == flag and index + 1 < len(sys.argv):
+            return int(sys.argv[index + 1])
+        if argument.startswith(flag + "="):
+            return int(argument.split("=", 1)[1])
+    return default
+
+
+if __name__ == "__main__":
+    config.set_moe_tokens(_parse_int_option("--tokens", 80))
+
+
+from config import FLASH as M
+
+from config import MOE_TOKENS
 
 
 # model config
 T = MOE_TOKENS
+T_PAD = ((T + 15) // 16) * 16
 D = M.hidden_size
 MOE_INTER = M.moe_intermediate_size
 SWIGLU_LIMIT = M.swiglu_limit
+MX_GROUP = M.weight_block_size[0]
 
 # tiling
-SH_M_TILE = 16
-SH_ROW_TILE = 2
-T_PAD = ((T + SH_M_TILE - 1) // SH_M_TILE) * SH_M_TILE
-SH_VALID_M = T if T < SH_M_TILE else SH_M_TILE
-assert T < SH_M_TILE or T % SH_M_TILE == 0
-assert SH_VALID_M % SH_ROW_TILE == 0
-MX_GROUP = 32
-MX_K_TILE = 512
-MX_RIGHT_K_TILE = 256
-MX_MM_INTER_TILE = 256
-MX_K_SCALE_GROUPS = MX_K_TILE // MX_GROUP
-MX_RIGHT_K_SCALE_GROUPS = MX_RIGHT_K_TILE // MX_GROUP
-# W2 reduces over MOE_INTER, whose V4.1 value (2304) is *not* a multiple of
-# MX_K_TILE (512): 2304 = 512 * 4 + 256. The V4-Pro presets all happen to be
-# multiples of 512 (2048 / 3072 / 4096), so the shared MX_K_TILE works there.
-# Reusing MX_K_TILE here made the last `pl.pipeline` step cover
-# [2048, 2560) and read `h_tile_mx` / `shared_w2` 256 columns past their end.
-# 768 divides both 2304 (W2 K) and 5120 (W1/W3 K) and is a multiple of
-# MX_W2_RIGHT_K_TILE, so the reduction tiles exactly.
-MX_W2_K_TILE = 768
-MX_W2_RIGHT_K_TILE = 256
-MX_W2_RIGHT_K_SCALE_GROUPS = MX_W2_RIGHT_K_TILE // MX_GROUP
-assert MOE_INTER % MX_MM_INTER_TILE == 0
-assert D % MX_K_TILE == 0
-assert MOE_INTER % MX_W2_K_TILE == 0
-assert MX_W2_K_TILE % MX_W2_RIGHT_K_TILE == 0
-ACT_INTER_TILE = 256
-D_OUT_TILE = 256
-QUANT_TILE = 768
-assert MOE_INTER % QUANT_TILE == 0
-assert QUANT_TILE % ACT_INTER_TILE == 0
-assert MX_K_TILE % MX_RIGHT_K_TILE == 0
-assert MX_K_TILE % MX_W2_RIGHT_K_TILE == 0
+GATE_UP_N = 2 * MOE_INTER
+K_SCALE = D // MX_GROUP
+H_SCALE = MOE_INTER // MX_GROUP
+W13_M_TILE = 80
+W13_N_TILE = 256
+W13_GROUPS = (T_PAD + W13_M_TILE - 1) // W13_M_TILE
+W13_ROWS = W13_GROUPS * W13_M_TILE
+W13_PAD_ROWS = 16  # staging granularity when the token block is not a whole tile
+SWIGLU_WORKER_TILE = 8 if T > 80 else 20
+W13_WORKER_TILE = 4 if T > 80 else GATE_UP_N // W13_N_TILE
+W2_WORKER_TILE = 4 if T > 80 else D // 256
+W2_M_TILE = gcd(T_PAD, 256) if T > 80 else gcd(T_PAD, W13_M_TILE)
+W2_N_TILE = 256
+W2_K_TILE = 128 if T > 80 else 256
+W2_K_STAGE = 2
+W2_SYNC_START = True
+
+assert T_PAD % W13_PAD_ROWS == 0
+assert T_PAD % 16 == 0
+assert GATE_UP_N % W13_N_TILE == 0
+assert MOE_INTER % W2_K_TILE == 0
+assert D % W2_N_TILE == 0
+assert W2_M_TILE % 16 == 0
+
+
+@pl.jit.extern(
+    core_type="aic",
+    source=Path(__file__).parent / "kernels" / "expert_shared_w13.cpp",
+    include_dirs=(pto_isa_include_dir(),),
+)
+def _shared_w13_mm(
+    x_local: pl.Tensor,
+    x_local_scale: pl.Tensor,
+    shared_w1: pl.Tensor,
+    shared_w1_scale: pl.Tensor,
+    shared_w3: pl.Tensor,
+    shared_w3_scale: pl.Tensor,
+    gate_up: pl.Out[pl.Tensor],
+    rows: pl.Scalar[pl.INDEX],
+) -> pl.Tensor:
+    """Project ND MXFP8 activations with ND weights and resident MX scales."""
+    ...
+
+
+@pl.jit.extern(
+    core_type="aiv",
+    source=Path(__file__).parent / "kernels" / "expert_shared_swiglu.cpp",
+    include_dirs=(pto_isa_include_dir(),),
+)
+def _shared_swiglu_vf(
+    gate_up: pl.Tensor,
+    payload: pl.Out[pl.Tensor],
+    scales: pl.Out[pl.Tensor],
+):
+    """Fuse the SwiGLU epilogue with upward MXFP8 requantization in one VF."""
+    ...
+
+
+@pl.jit.inline
+def _w13_padded_inputs(
+    x_local: pl.Tensor,
+    x_local_scale: pl.Tensor,
+):
+    """Pad payload and packed scales to whole W13 row tiles."""
+    x_padded = pl.create_tensor([W13_ROWS, D], dtype=pl.FP8E4M3FN)
+    scale_padded = pl.create_tensor([1, W13_ROWS * K_SCALE], dtype=pl.FP8E8M0)
+    scale_col = W13_PAD_ROWS * K_SCALE
+    pad_workers = pl.min(T_PAD // W13_PAD_ROWS, 16)
+    with pl.spmd(pad_workers, name_hint="sh_w13_pad"):
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, T_PAD // W13_PAD_ROWS, pad_workers):
+            row0 = block * W13_PAD_ROWS
+            x_rows = pl.load(x_local, [row0, 0], [W13_PAD_ROWS, D])
+            x_padded = pl.store(x_rows, [row0, 0], x_padded)
+            scale_rows = pl.load(x_local_scale, [0, row0 * K_SCALE], [1, scale_col])
+            scale_padded = pl.store(scale_rows, [0, row0 * K_SCALE], scale_padded)
+    return x_padded, scale_padded
+
+
+@pl.jit.inline
+def _w13_direct_inputs(
+    x_local: pl.Tensor,
+    x_local_scale: pl.Tensor,
+):
+    """The physical token block already spans whole W13 row tiles."""
+    return x_local, x_local_scale
+
+
+# Selected at import time so the fused program traces exactly one input path.
+_W13_INPUTS = _w13_direct_inputs if W13_ROWS == T_PAD else _w13_padded_inputs
+
+
+@pl.jit.inline
+def _shared_swiglu(
+    gate_up: pl.Tensor,
+    payload: pl.Out[pl.Tensor],
+    scales: pl.Out[pl.Tensor],
+):
+    """SwiGLU epilogue plus grouped MXFP8 requantization over the token block."""
+    with pl.spmd(SWIGLU_WORKER_TILE, name_hint="sh_swiglu_vf"):
+        _shared_swiglu_vf(gate_up, payload, scales)
+    return payload, scales
+
+
+import torch.nn.functional as F
 
 
 @pl.jit.inline
@@ -68,284 +167,66 @@ def expert_shared(
     sh: pl.Tensor[[T, D], pl.BF16],
 ):
     """Shared expert with device MXFP8 activation quantization before both projections."""
-    # The activation scale uses the official logical [M, K/32] backing;
-    # matmul_mx consumes it as MX_A_ZZ without a flat-to-MX view.
-    w1_scale_mx = shared_w1_scale
-    w3_scale_mx = shared_w3_scale
-    w2_scale_mx = shared_w2_scale
-    x_local_scale_mx = pl.tensor.view(
-        x_local_scale,
-        [T_PAD, D // MX_GROUP],
-        layout=pl.MX_A_ZZ,
+    # Merged W1/W3 projection into BF16 gate/up columns.
+    gate_up = pl.create_tensor([T_PAD, GATE_UP_N], dtype=pl.BF16)
+    x_w13, x_w13_scale = _W13_INPUTS(x_local, x_local_scale)
+    w13_workers = pl.min(W13_GROUPS * (GATE_UP_N // W13_N_TILE), W13_WORKER_TILE)
+    with pl.spmd(w13_workers, name_hint="sh_w13_mx_mm"):
+        gate_up = _shared_w13_mm(
+            x_w13, x_w13_scale,
+            shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+            gate_up, T_PAD,
+        )
+
+    # FP32 SwiGLU, FP8 payload, and packed MX_A_ZZ scales.
+    h_tile_mx = pl.create_tensor([T_PAD, MOE_INTER], dtype=pl.FP8E4M3FN)
+    h_scale_mx = pl.create_tensor([T_PAD, H_SCALE], dtype=pl.FP8E8M0)
+    h_tile_mx, h_scale_mx = _shared_swiglu(gate_up, h_tile_mx, h_scale_mx)
+
+    # Complete row tiles keep MX_A_ZZ scale loads inside the packed backing.
+    h_tile_scale_zz = pl.tensor.view(
+        h_scale_mx, [T_PAD, H_SCALE], layout=pl.MX_A_ZZ,
     )
-    for mt in pl.parallel(T_PAD // SH_M_TILE):
-        ts0 = mt * SH_M_TILE
-
-        gate_fp32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.FP32)
-
-        for nb_idx in pl.spmd(MOE_INTER // MX_MM_INTER_TILE, name_hint="sh_gate_mx_mm"):
-            n0 = nb_idx * MX_MM_INTER_TILE
-            xs0 = pl.load(x_local, [ts0, 0], [SH_M_TILE, MX_RIGHT_K_TILE])
-            xs_scale0 = pl.load(
-                x_local_scale_mx,
-                [ts0, 0],
-                [SH_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
-            )
-            w1_0 = pl.load(shared_w1, [0, n0], [MX_RIGHT_K_TILE, MX_MM_INTER_TILE])
-            w1_scale0 = pl.load(
-                w1_scale_mx,
-                [0, n0],
-                [MX_RIGHT_K_SCALE_GROUPS, MX_MM_INTER_TILE],
-            )
-            gate_acc = pl.matmul_mx(xs0, xs_scale0, w1_0, w1_scale0)
-            for kb in pl.range(1, MX_K_TILE // MX_RIGHT_K_TILE):
-                k_local = kb * MX_RIGHT_K_TILE
-                xs_part = pl.load(x_local, [ts0, k_local], [SH_M_TILE, MX_RIGHT_K_TILE])
-                xs_scale_part = pl.load(
-                    x_local_scale_mx,
-                    [ts0, k_local // MX_GROUP],
-                    [SH_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
-                )
-                w1_part = pl.load(
-                    shared_w1,
-                    [k_local, n0],
-                    [MX_RIGHT_K_TILE, MX_MM_INTER_TILE],
-                )
-                w1_scale_part = pl.load(
-                    w1_scale_mx,
-                    [k_local // MX_GROUP, n0],
-                    [MX_RIGHT_K_SCALE_GROUPS, MX_MM_INTER_TILE],
-                )
-                gate_acc = pl.matmul_mx_acc(
-                    gate_acc,
-                    xs_part,
-                    xs_scale_part,
-                    w1_part,
-                    w1_scale_part,
-                )
-            for k0 in pl.pipeline(MX_K_TILE, D, MX_K_TILE, stage=2):
-                for kb in pl.range(MX_K_TILE // MX_RIGHT_K_TILE):
-                    k_local = kb * MX_RIGHT_K_TILE
-                    xs_part = pl.load(
-                        x_local,
-                        [ts0, k0 + k_local],
-                        [SH_M_TILE, MX_RIGHT_K_TILE],
+    rows = pl.tensor.dim(sh, 0)
+    with pl.spmd(W2_WORKER_TILE, name_hint="sh_w2_mm", sync_start=W2_SYNC_START):
+        worker = pl.tile.get_block_idx()
+        for lane in pl.range((D // W2_N_TILE + W2_WORKER_TILE - 1) // W2_WORKER_TILE):
+            column = worker + lane * W2_WORKER_TILE
+            if column < D // W2_N_TILE:
+                d0 = column * W2_N_TILE
+                for wm in pl.range((T_PAD + W2_M_TILE - 1) // W2_M_TILE):
+                    row0 = wm * W2_M_TILE
+                    valid_m = pl.min(W2_M_TILE, T_PAD - row0)
+                    valid_out = pl.min(W2_M_TILE, rows - row0)
+                    hs0 = pl.load(h_tile_mx, [row0, 0], [W2_M_TILE, W2_K_TILE], valid_shape=[valid_m, W2_K_TILE])
+                    hs_scale0 = pl.load(h_tile_scale_zz, [row0, 0], [W2_M_TILE, W2_K_TILE // MX_GROUP], valid_shape=[valid_m, W2_K_TILE // MX_GROUP])
+                    sw2_0 = pl.load(shared_w2, [0, d0], [W2_K_TILE, W2_N_TILE])
+                    sw2_scale0 = pl.load(
+                        shared_w2_scale, [0, d0], [W2_K_TILE // MX_GROUP, W2_N_TILE],
                     )
-                    xs_scale_part = pl.load(
-                        x_local_scale_mx,
-                        [ts0, (k0 + k_local) // MX_GROUP],
-                        [SH_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
-                    )
-                    w1_part = pl.load(
-                        shared_w1,
-                        [k0 + k_local, n0],
-                        [MX_RIGHT_K_TILE, MX_MM_INTER_TILE],
-                    )
-                    w1_scale_part = pl.load(
-                        w1_scale_mx,
-                        [(k0 + k_local) // MX_GROUP, n0],
-                        [MX_RIGHT_K_SCALE_GROUPS, MX_MM_INTER_TILE],
-                    )
-                    gate_acc = pl.matmul_mx_acc(
-                        gate_acc,
-                        xs_part,
-                        xs_scale_part,
-                        w1_part,
-                        w1_scale_part,
-                    )
-            gate_fp32 = pl.store(gate_acc, [0, n0], gate_fp32)
-
-        up_fp32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.FP32)
-
-        for nb_idx in pl.spmd(MOE_INTER // MX_MM_INTER_TILE, name_hint="sh_up_mx_mm"):
-            n0 = nb_idx * MX_MM_INTER_TILE
-            xs0 = pl.load(x_local, [ts0, 0], [SH_M_TILE, MX_RIGHT_K_TILE])
-            xs_scale0 = pl.load(
-                x_local_scale_mx,
-                [ts0, 0],
-                [SH_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
-            )
-            w3_0 = pl.load(shared_w3, [0, n0], [MX_RIGHT_K_TILE, MX_MM_INTER_TILE])
-            w3_scale0 = pl.load(
-                w3_scale_mx,
-                [0, n0],
-                [MX_RIGHT_K_SCALE_GROUPS, MX_MM_INTER_TILE],
-            )
-            up_acc = pl.matmul_mx(xs0, xs_scale0, w3_0, w3_scale0)
-            for kb in pl.range(1, MX_K_TILE // MX_RIGHT_K_TILE):
-                k_local = kb * MX_RIGHT_K_TILE
-                xs_part = pl.load(x_local, [ts0, k_local], [SH_M_TILE, MX_RIGHT_K_TILE])
-                xs_scale_part = pl.load(
-                    x_local_scale_mx,
-                    [ts0, k_local // MX_GROUP],
-                    [SH_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
-                )
-                w3_part = pl.load(
-                    shared_w3,
-                    [k_local, n0],
-                    [MX_RIGHT_K_TILE, MX_MM_INTER_TILE],
-                )
-                w3_scale_part = pl.load(
-                    w3_scale_mx,
-                    [k_local // MX_GROUP, n0],
-                    [MX_RIGHT_K_SCALE_GROUPS, MX_MM_INTER_TILE],
-                )
-                up_acc = pl.matmul_mx_acc(
-                    up_acc,
-                    xs_part,
-                    xs_scale_part,
-                    w3_part,
-                    w3_scale_part,
-                )
-            for k0 in pl.pipeline(MX_K_TILE, D, MX_K_TILE, stage=2):
-                for kb in pl.range(MX_K_TILE // MX_RIGHT_K_TILE):
-                    k_local = kb * MX_RIGHT_K_TILE
-                    xs_part = pl.load(
-                        x_local,
-                        [ts0, k0 + k_local],
-                        [SH_M_TILE, MX_RIGHT_K_TILE],
-                    )
-                    xs_scale_part = pl.load(
-                        x_local_scale_mx,
-                        [ts0, (k0 + k_local) // MX_GROUP],
-                        [SH_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
-                    )
-                    w3_part = pl.load(
-                        shared_w3,
-                        [k0 + k_local, n0],
-                        [MX_RIGHT_K_TILE, MX_MM_INTER_TILE],
-                    )
-                    w3_scale_part = pl.load(
-                        w3_scale_mx,
-                        [(k0 + k_local) // MX_GROUP, n0],
-                        [MX_RIGHT_K_SCALE_GROUPS, MX_MM_INTER_TILE],
-                    )
-                    up_acc = pl.matmul_mx_acc(
-                        up_acc,
-                        xs_part,
-                        xs_scale_part,
-                        w3_part,
-                        w3_scale_part,
-                    )
-            up_fp32 = pl.store(up_acc, [0, n0], up_fp32)
-
-        h_tile_fp32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.FP32)
-        h_tile_mx = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.FP8E4M3FN)
-        h_scale_backing = pl.create_tensor(
-            [1, SH_M_TILE * (MOE_INTER // MX_GROUP)], dtype=pl.FP8E8M0
-        )
-        for q_idx in pl.spmd(MOE_INTER // QUANT_TILE, name_hint="sh_gate_up_act"):
-            k0 = q_idx * QUANT_TILE
-            for row_block in pl.range(SH_M_TILE // SH_ROW_TILE):
-                row0 = row_block * SH_ROW_TILE
-                for n0 in pl.pipeline(k0, k0 + QUANT_TILE, ACT_INTER_TILE, stage=2):
-                    gate_rows = gate_fp32[row0 : row0 + SH_ROW_TILE, n0 : n0 + ACT_INTER_TILE]
-                    up_rows = up_fp32[row0 : row0 + SH_ROW_TILE, n0 : n0 + ACT_INTER_TILE]
-                    if SWIGLU_LIMIT > 0.0:
-                        gate_rows = pl.minimum(gate_rows, SWIGLU_LIMIT)
-                        up_max = pl.minimum(up_rows, SWIGLU_LIMIT)
-                        up_rows = pl.maximum(up_max, -SWIGLU_LIMIT)
-                    gate_neg = pl.neg(gate_rows)
-                    gate_exp = pl.exp(gate_neg)
-                    gate_exp_one = pl.add(gate_exp, 1.0)
-                    sigmoid = pl.recip(gate_exp_one)
-                    silu = pl.mul(gate_rows, sigmoid)
-                    gated = pl.mul(silu, up_rows)
-                    h_tile_fp32[row0 : row0 + SH_ROW_TILE, n0 : n0 + ACT_INTER_TILE] = gated
-            h_fp32 = pl.load(h_tile_fp32, [0, k0], [SH_M_TILE, QUANT_TILE])
-            h_mx, h_scale_mx = pl.quant_mx(h_fp32, group_axis=1)
-            h_tile_mx = pl.store(h_mx, [0, k0], h_tile_mx)
-            scale_offset = q_idx * SH_M_TILE * (QUANT_TILE // MX_GROUP)
-            h_scale_backing = pl.store(
-                pl.reshape(h_scale_mx, [1, SH_M_TILE * (QUANT_TILE // MX_GROUP)]),
-                [0, scale_offset],
-                h_scale_backing,
-            )
-
-        h_tile_scale_mx = pl.tensor.view(
-            h_scale_backing,
-            [SH_M_TILE, MOE_INTER // MX_GROUP],
-            layout=pl.MX_A_ZZ,
-        )
-        for db_idx in pl.spmd(D // D_OUT_TILE, name_hint="sh_w2_mm"):
-            d0 = db_idx * D_OUT_TILE
-            hs0 = pl.load(h_tile_mx, [0, 0], [SH_M_TILE, MX_W2_RIGHT_K_TILE])
-            hs_scale0 = pl.load(
-                h_tile_scale_mx,
-                [0, 0],
-                [SH_M_TILE, MX_W2_RIGHT_K_SCALE_GROUPS],
-            )
-            sw2_0 = pl.load(shared_w2, [0, d0], [MX_W2_RIGHT_K_TILE, D_OUT_TILE])
-            sw2_scale0 = pl.load(
-                w2_scale_mx,
-                [0, d0],
-                [MX_W2_RIGHT_K_SCALE_GROUPS, D_OUT_TILE],
-            )
-            y_acc = pl.matmul_mx(hs0, hs_scale0, sw2_0, sw2_scale0)
-            for kb in pl.range(1, MX_W2_K_TILE // MX_W2_RIGHT_K_TILE):
-                k_local = kb * MX_W2_RIGHT_K_TILE
-                hs_part = pl.load(h_tile_mx, [0, k_local], [SH_M_TILE, MX_W2_RIGHT_K_TILE])
-                hs_scale_part = pl.load(
-                    h_tile_scale_mx,
-                    [0, k_local // MX_GROUP],
-                    [SH_M_TILE, MX_W2_RIGHT_K_SCALE_GROUPS],
-                )
-                sw2_part = pl.load(
-                    shared_w2,
-                    [k_local, d0],
-                    [MX_W2_RIGHT_K_TILE, D_OUT_TILE],
-                )
-                sw2_scale_part = pl.load(
-                    w2_scale_mx,
-                    [k_local // MX_GROUP, d0],
-                    [MX_W2_RIGHT_K_SCALE_GROUPS, D_OUT_TILE],
-                )
-                y_acc = pl.matmul_mx_acc(
-                    y_acc,
-                    hs_part,
-                    hs_scale_part,
-                    sw2_part,
-                    sw2_scale_part,
-                )
-            for k0 in pl.pipeline(MX_W2_K_TILE, MOE_INTER, MX_W2_K_TILE, stage=2):
-                for kb in pl.range(MX_W2_K_TILE // MX_W2_RIGHT_K_TILE):
-                    k_local = kb * MX_W2_RIGHT_K_TILE
-                    hs_part = pl.load(
-                        h_tile_mx,
-                        [0, k0 + k_local],
-                        [SH_M_TILE, MX_W2_RIGHT_K_TILE],
-                    )
-                    hs_scale_part = pl.load(
-                        h_tile_scale_mx,
-                        [0, (k0 + k_local) // MX_GROUP],
-                        [SH_M_TILE, MX_W2_RIGHT_K_SCALE_GROUPS],
-                    )
-                    sw2_part = pl.load(
-                        shared_w2,
-                        [k0 + k_local, d0],
-                        [MX_W2_RIGHT_K_TILE, D_OUT_TILE],
-                    )
-                    sw2_scale_part = pl.load(
-                        w2_scale_mx,
-                        [(k0 + k_local) // MX_GROUP, d0],
-                        [MX_W2_RIGHT_K_SCALE_GROUPS, D_OUT_TILE],
-                    )
-                    y_acc = pl.matmul_mx_acc(
-                        y_acc,
-                        hs_part,
-                        hs_scale_part,
-                        sw2_part,
-                        sw2_scale_part,
-                    )
-            y_bf16 = pl.cast(y_acc, target_type=pl.BF16, mode="rint")
-            y_valid = pl.set_validshape(y_bf16, SH_VALID_M, D_OUT_TILE)
-            sh = pl.store(y_valid, [ts0, d0], sh)
+                    y_acc = pl.matmul_mx(hs0, hs_scale0, sw2_0, sw2_scale0)
+                    for k0 in pl.pipeline(W2_K_TILE, MOE_INTER, W2_K_TILE, stage=W2_K_STAGE):
+                        hs_part = pl.load(h_tile_mx, [row0, k0], [W2_M_TILE, W2_K_TILE], valid_shape=[valid_m, W2_K_TILE])
+                        hs_scale_part = pl.load(
+                            h_tile_scale_zz,
+                            [row0, k0 // MX_GROUP],
+                            [W2_M_TILE, W2_K_TILE // MX_GROUP], valid_shape=[valid_m, W2_K_TILE // MX_GROUP],
+                        )
+                        sw2_part = pl.load(shared_w2, [k0, d0], [W2_K_TILE, W2_N_TILE])
+                        sw2_scale_part = pl.load(
+                            shared_w2_scale, [k0 // MX_GROUP, d0], [W2_K_TILE // MX_GROUP, W2_N_TILE],
+                        )
+                        y_acc = pl.matmul_mx_acc(
+                            y_acc, hs_part, hs_scale_part, sw2_part, sw2_scale_part,
+                        )
+                    # Fixpipe rounds the accumulator directly to BF16.
+                    sh = pl.store(pl.set_validshape(y_acc, valid_out, W2_N_TILE), [row0, d0], sh)
 
     return sh
 
 
 @pl.jit
-def expert_shared_test(
+def l2_expert_shared(
     x_local: pl.Tensor[[T_PAD, D], pl.FP8E4M3FN],
     x_local_scale: pl.Tensor[[1, T_PAD * (D // MX_GROUP)], pl.FP8E8M0],
     shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
@@ -366,9 +247,9 @@ def expert_shared_test(
 def golden_expert_shared(tensors):
     """Reference for MXFP8 W1/W3, SwiGLU requantization, and MXFP8 W2."""
     import torch
-    import torch.nn.functional as F
 
-    from models.deepseek_v4_1_flash.quantization import decode_e8m0_codes_v41 as decode_e8m0_codes, host_quant_mxfp8_v41 as host_quant_mxfp8, matmul_mx_golden_v41 as matmul_mx_golden
+    from quant import unpack_mx_scale_codes as decode_e8m0_codes, quantize_mxfp8_upward_e8m0 as host_quant_mxfp8
+    from gemm import golden_gemm_mxfp8_to_fp32_dequantized as matmul_mx_golden
 
     x_fp8 = tensors["x_local"][:T]
     x_scale = decode_e8m0_codes(
@@ -381,13 +262,13 @@ def golden_expert_shared(tensors):
     w2_fp8 = tensors["shared_w2"]
     w2_scale = decode_e8m0_codes(tensors["shared_w2_scale"], side="b")
 
-    sh_gate = matmul_mx_golden(x_fp8, x_scale, w1_fp8, w1_scale)
-    sh_up = matmul_mx_golden(x_fp8, x_scale, w3_fp8, w3_scale)
+    sh_gate = matmul_mx_golden(x_fp8, x_scale, w1_fp8, w1_scale).bfloat16().float()
+    sh_up = matmul_mx_golden(x_fp8, x_scale, w3_fp8, w3_scale).bfloat16().float()
     if SWIGLU_LIMIT > 0:
         sh_gate = sh_gate.clamp(max=SWIGLU_LIMIT)
         sh_up = sh_up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
     sh_h = F.silu(sh_gate) * sh_up
-    sh_h_fp8, sh_h_scale = host_quant_mxfp8(sh_h, return_e8m0=True)
+    sh_h_fp8, sh_h_scale = host_quant_mxfp8(sh_h)
     sh = matmul_mx_golden(sh_h_fp8, sh_h_scale, w2_fp8, w2_scale)
 
     tensors["sh"][:] = sh.to(torch.bfloat16)
@@ -396,14 +277,14 @@ def golden_expert_shared(tensors):
 def build_tensor_specs():
     import torch
     from golden.spec import TensorSpec
-    from models.deepseek_v4_1_flash.quantization import gen_mxfp8_weight_kn_v41 as gen_mxfp8_weight_kn_device, host_quant_mxfp8_v41 as host_mxfp8_activation
+    from quant import generate_mxfp8_weight_kn as gen_mxfp8_weight_kn_device, quantize_mxfp8_upward_e8m0 as host_mxfp8_activation
 
     x_local_bf16 = torch.randn(T_PAD, D, dtype=torch.bfloat16)
     if T < T_PAD:
         x_local_bf16[T:, :] = 0
-    x_local_fp8, x_local_scale_codes = host_mxfp8_activation(x_local_bf16, return_e8m0=True)
+    x_local_fp8, x_local_scale_codes = host_mxfp8_activation(x_local_bf16)
     # matmul_mx expects the physical MX_A_ZZ scale order.
-    from models.deepseek_v4_1_flash.quantization import pack_mx_a_scale
+    from quant import pack_mx_a_scale
     x_local_scale_codes = pack_mx_a_scale(x_local_scale_codes)
     fp8_e8m0 = getattr(torch, "float8_e8m0fnu", torch.uint8)
     x_local_scale = x_local_scale_codes.contiguous().view(fp8_e8m0)
@@ -434,34 +315,49 @@ def build_tensor_specs():
 
 
 if __name__ == "__main__":
-    # Drop this model directory when run as a script so the local golden.py does not
-    # shadow the repository golden package.
-    import pathlib
-    import sys
-    _model_dir = pathlib.Path(__file__).resolve().parent
-    sys.path = [item for item in sys.path if pathlib.Path(item or ".").resolve() != _model_dir]
     import argparse
     from golden.validation import ratio_reldiff
     from golden.runner import run
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a5", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
+    parser.add_argument("--tokens", type=int, default=None)
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
+    if args.execution_mode:
+        parser.error("this entry requires hardware; --sim is unsupported")
+    if args.tokens is None:
+        if args.golden_data or args.runtime_dir:
+            parser.error("--golden-data and --runtime-dir require an explicit --tokens value")
+        import subprocess
+
+        for tokens in (16, 80, 96):
+            print(f"Shared expert validation: tokens={tokens}", flush=True)
+            command = [sys.executable, str(Path(__file__).resolve()), "--tokens", str(tokens), *sys.argv[1:]]
+            completed = subprocess.run(command, check=False)
+            if completed.returncode:
+                raise SystemExit(completed.returncode)
+        raise SystemExit(0)
 
     result = run(
-        fn=expert_shared_test,
+        fn=l2_expert_shared,
         specs=build_tensor_specs(),
         golden_fn=golden_expert_shared,
         golden_data=args.golden_data,
         save_data=args.save_data,
+        runtime_dir=args.runtime_dir,
+        compile_only=args.compile_only,
         config=dict(
             dump_passes=args.dump_passes,
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),

@@ -260,16 +260,13 @@ HCA_KV_CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM * BLOCK_SIZE // HCA_CMP_STORAGE_BLOCK_SI
 IDX_CACHE_BLOCK_NUM = 256
 
 # Persistent compressor state pool capacities shared by prefill and decode.
-# HCA eagerly writes one full decode step before pooling a 128-row state window,
-# so each request needs 128 historical rows plus DECODE_SEQ transaction rows.
-HCA_STATE_PHYSICAL_BLOCKS = DECODE_BATCH * (
-    (128 + DECODE_SEQ + C128_COMPRESSOR_BLOCK_SIZE - 1) // C128_COMPRESSOR_BLOCK_SIZE
-)
+# HCA state includes 128 historical rows and one decode transaction.
+HCA_STATE_BLOCKS_PER_REQUEST = (128 + DECODE_SEQ + C128_COMPRESSOR_BLOCK_SIZE - 1) // C128_COMPRESSOR_BLOCK_SIZE
+HCA_STATE_PHYSICAL_BLOCKS = DECODE_BATCH * HCA_STATE_BLOCKS_PER_REQUEST
 # Ratio-4 compressor state: eight history rows plus one decode transaction.
 CSA_STATE_BLOCKS_PER_REQUEST = (8 + DECODE_SEQ + C4A_COMPRESSOR_BLOCK_SIZE - 1) // C4A_COMPRESSOR_BLOCK_SIZE
-# Main compressor state pool across all request slots.
 CSA_STATE_PHYSICAL_BLOCKS = DECODE_BATCH * CSA_STATE_BLOCKS_PER_REQUEST
-# Inner compressor state pool with the same request-local geometry.
+# Inner compressor state uses the same request-local geometry.
 CSA_INNER_STATE_BLOCKS_PER_REQUEST = CSA_STATE_BLOCKS_PER_REQUEST
 CSA_INNER_STATE_PHYSICAL_BLOCKS = DECODE_BATCH * CSA_INNER_STATE_BLOCKS_PER_REQUEST
 
@@ -281,10 +278,10 @@ FP32_NEG_INF = -3.4028234663852886e38     # most-negative finite fp32 (softmax m
 # Parallelism constants
 TP = 4    # tensor-parallel ranks per DP group
 DP = 4    # DP groups per node
-EP = 16   # expert-parallel world size (moe overrides it from --ep)
+EP = 8    # expert-parallel world size (moe overrides it from --ep)
 
 # MoE constants
-MOE_TOKENS = DECODE_TOKENS * DP // EP
+MOE_TOKENS = DECODE_TOKENS // TP
 DECODE_RECV_MAX = DP * DECODE_TOKENS
 PREFILL_RECV_MAX = DP * PREFILL_TOKENS
 RECV_MAX = DECODE_RECV_MAX

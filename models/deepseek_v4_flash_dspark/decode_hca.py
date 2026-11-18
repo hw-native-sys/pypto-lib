@@ -70,11 +70,10 @@ from decode_o_proj import (
     ATTENTION_WINDOW_ROWS,
     GROUP_T_PAD,
     LOCAL_O_GROUPS,
-    LOCAL_O_WIDTH,
     LOCAL_T,
     LOCAL_T_PAD,
     O_WINDOW_ROWS,
-    decode_o_proj_tp1,
+    decode_o_proj_tp1_hc,
     o_group_a2a,
     o_proj_reduce_scatter,
 )
@@ -141,7 +140,8 @@ COMPRESS_STATE_BLOCKS_PER_REQUEST = COMPRESS_STATE_PHYSICAL_BLOCKS // DECODE_BAT
 # tiling
 SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
-HCA_WB_TOKEN_TILE = 8  # tokens per cache-writeback SPMD block
+HCA_WB_TOKEN_TILE = math.gcd(S, 8)  # tokens per cache-writeback SPMD block
+TP1_HCA_WB_TOKEN_TILE = math.gcd(HCA_WB_TOKEN_TILE, S)
 
 if T != LOCAL_T:
     raise ValueError(f"HCA token capacity {T} must equal TP local token capacity {LOCAL_T}")
@@ -155,8 +155,8 @@ def _decode_hca(
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
@@ -183,8 +183,8 @@ def _decode_hca(
     position_ids: pl.Tensor[[KV_T_DYN], pl.INT32],
     kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, LOCAL_O_WIDTH], pl.INT8],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[LOCAL_O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
     gather_window: pld.DistributedTensor[[DECODE_GROUP_CAP, D], pl.BF16],
@@ -265,7 +265,9 @@ def _decode_hca(
         x_normed, cmp_wkv, cmp_wgate, cmp_values_local, cmp_scores_local, rms_tid,
     )
     projection_local = pl.create_tensor([t_dim, 2560], dtype=pl.BF16)
-    with pl.spmd(16, name_hint="hca_projection_pack", deps=[cmp_projection_tid]) as projection_pack_tid:
+    with pl.spmd(
+        16, name_hint="hca_projection_pack", deps=[cmp_projection_tid], allow_early_resolve=True,
+    ) as projection_pack_tid:
         pack_worker = pl.tile.get_block_idx()
         for pack_row in pl.range(pack_worker, t_dim, 16):
             value_bits = pl.reinterpret_view(cmp_values_local[pack_row : pack_row + 1, :], pl.BF16)
@@ -463,7 +465,7 @@ def _decode_hca(
         )
 
     with pl.scope():
-        hc_post(attn_out, x_hc, post_t, comb_t, x_out)
+        hc_post(attn_out, x_hc, post_t, comb_t, x_out, T_TILE=4)
     return x_out
 
 
@@ -507,7 +509,7 @@ def l3_decode_hca(
     kv_seq_lens: pl.Tensor[[TP_SIZE, B_DYN], pl.INT32],
     attn_sink: pl.Tensor[[TP_SIZE, H], pl.FP32],
     wo_a: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[TP_SIZE, D, LOCAL_O_WIDTH], pl.INT8],
+    wo_b: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[TP_SIZE, D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, HC_MULT, D], pl.FP32]],
     local_t: pl.Scalar[pl.INT32],
@@ -575,8 +577,8 @@ def _decode_hca_tp1(
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
     # qkv_proj_rope weights
     attn_norm_w: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
@@ -607,8 +609,8 @@ def _decode_hca_tp1(
     # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
     # o_proj (fused into sparse_attn)
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
 ):
@@ -631,7 +633,7 @@ def _decode_hca_tp1(
     kv_seq_lens.bind_dynamic(0, B_DYN)
     x_out.bind_dynamic(0, T_DYN)
     t_dim = pl.tensor.dim(x_hc, 0)
-    wb_blocks = t_dim // HCA_WB_TOKEN_TILE
+    wb_blocks = t_dim // TP1_HCA_WB_TOKEN_TILE
     post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
     x_normed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
@@ -663,8 +665,8 @@ def _decode_hca_tp1(
     kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
     with pl.spmd(wb_blocks, name_hint="hca_cache_writeback") as ori_cache_write_tid:
         wb_blk = pl.tile.get_block_idx()
-        wb_t0 = wb_blk * HCA_WB_TOKEN_TILE
-        for write_dt in pl.range(HCA_WB_TOKEN_TILE):
+        wb_t0 = wb_blk * TP1_HCA_WB_TOKEN_TILE
+        for write_dt in pl.range(TP1_HCA_WB_TOKEN_TILE):
             write_t = wb_t0 + write_dt
             write_row_i64 = pl.read(ori_slot_mapping, [write_t])
             if write_row_i64 >= 0:
@@ -681,7 +683,6 @@ def _decode_hca_tp1(
         late_dep, cmp_rope_ready_tid,
     )
 
-    attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     with pl.scope():
         o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD, O_GROUP_IN], dtype=pl.BF16)
         o_packed_heads, heads_dep = sparse_attn_hca_tp1(
@@ -692,10 +693,9 @@ def _decode_hca_tp1(
             o_packed_heads, ori_cache_write_tid, cmp_cache_write_tid,
         )
         with pl.scope():
-            decode_o_proj_tp1(o_packed_heads, wo_a, wo_b, wo_b_scale, attn_out, heads_dep)
-
-    with pl.scope():
-        hc_post(attn_out, x_hc, post_t, comb_t, x_out)
+            decode_o_proj_tp1_hc(
+                o_packed_heads, wo_a, wo_b, wo_b_scale, x_hc, post_t, comb_t, x_out, heads_dep,
+            )
     return x_out
 
 
@@ -844,8 +844,10 @@ def golden_decode_hca(tensors):
     from rmsnorm import golden_rms_norm
 
     tp_size, local_t = tensors["x_hc"].shape[:2]
+    # Both weights stay NZ-packed here -- only the leading group axis is
+    # reassembled; golden_decode_o_proj_tp1 (via golden_decode_hca_tp1) unpacks them.
     full_wo_a = tensors["wo_a"].reshape(O_GROUPS, O_LORA, O_GROUP_IN)
-    full_wo_b = tensors["wo_b"].permute(1, 0, 2).reshape(D, O_GROUPS * O_LORA)
+    full_wo_b = tensors["wo_b"].reshape(O_GROUPS, D, O_LORA)
 
     # Post-norm rows the all-gather publishes, rank-major.
     normed_chunks = []
@@ -935,11 +937,12 @@ def _hca_start_positions(start_pos, *, batch):
 def _validate_hca_token_count(token_count):
     """Validate the dynamic token extent shared by TP1 and distributed HCA."""
     group_cap = TP_SIZE * LOCAL_T
-    if (token_count < VALID_TOKEN_TILE or token_count > group_cap
-            or token_count % VALID_TOKEN_TILE != 0 or token_count % S != 0):
+    token_tile = math.gcd(VALID_TOKEN_TILE, S)
+    if (token_count < token_tile or token_count > group_cap
+            or token_count % token_tile != 0 or token_count % S != 0):
         raise ValueError(
-            f"HCA token count must be a multiple of {VALID_TOKEN_TILE} and S={S} "
-            f"in [{VALID_TOKEN_TILE}, {group_cap}], got {token_count}",
+            f"HCA token count must be a multiple of {token_tile} and S={S} "
+            f"in [{token_tile}, {group_cap}], got {token_count}",
         )
 
 
@@ -1019,6 +1022,7 @@ def build_tensor_specs(start_pos=None, batch=B):
     from utils import (
         compressed_slot_mapping,
         ori_slot_mapping,
+        pack_nz,
         position_ids_from_starts,
         state_slot_mapping,
         swa_indices_and_lens,
@@ -1178,6 +1182,10 @@ def build_tensor_specs(start_pos=None, batch=B):
     wq_b_i8, wq_b_scale = quant_w_per_output_channel(wq_b_bf16)
     wo_b_bf16 = init_wo_b().to(torch.bfloat16)
     wo_b_i8, wo_b_scale = quant_w_per_row(wo_b_bf16)
+    # wo_b's group axis is the sole NZ leading/batch axis, matching wo_a's own
+    # [GROUPS, ...] convention: fold the flat [D, GROUPS*O_LORA] quant result
+    # into [GROUPS, D, O_LORA] before packing each group's fractal blocks.
+    wo_b_i8_groups = wo_b_i8.reshape(D, O_GROUPS, O_LORA).permute(1, 0, 2).contiguous()
 
     return [
         TensorSpec("x_hc", [tokens, HC_MULT, D], torch.float32, init_value=init_x_hc),
@@ -1185,8 +1193,8 @@ def build_tensor_specs(start_pos=None, batch=B):
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=init_hc_attn_scale),
         TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=init_hc_attn_base),
         TensorSpec("attn_norm_w", [D], torch.bfloat16, init_value=init_attn_norm_w),
-        TensorSpec("wq_a", [D, Q_LORA], torch.bfloat16, init_value=init_wq_a),
-        TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
+        TensorSpec("wq_a", [D, Q_LORA], torch.bfloat16, init_value=lambda: pack_nz(init_wq_a().to(torch.bfloat16))),
+        TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.int8, init_value=lambda: pack_nz(wq_b_i8)),
         TensorSpec("wq_b_scale", [H * HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
         TensorSpec("wkv", [D, HEAD_DIM], torch.bfloat16, init_value=init_wkv),
         TensorSpec("gamma_cq", [Q_LORA], torch.bfloat16, init_value=init_gamma_cq),
@@ -1212,8 +1220,8 @@ def build_tensor_specs(start_pos=None, batch=B):
         TensorSpec("position_ids", [tokens], torch.int32, init_value=init_position_ids),
         TensorSpec("kv_seq_lens", [batch], torch.int32, init_value=init_kv_seq_lens),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
-        TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
-        TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
+        TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=lambda: pack_nz(init_wo_a().to(torch.bfloat16))),
+        TensorSpec("wo_b", [O_GROUPS, D, O_LORA], torch.int8, init_value=lambda: pack_nz(wo_b_i8_groups)),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
         TensorSpec("x_out", [tokens, HC_MULT, D], torch.float32),
     ]
@@ -1293,8 +1301,9 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
             specs.append(wo_a_spec)
             continue
         if spec.name == "wo_b":
-            shards = value.reshape(D, TP_SIZE, LOCAL_O_WIDTH).permute(1, 0, 2).contiguous()
-            wo_b_spec = TensorSpec("wo_b", [TP_SIZE, D, LOCAL_O_WIDTH], spec.dtype, init_value=shards)
+            # Same leading-group-axis split as wo_a -- wo_b is now [GROUPS, D, O_LORA].
+            shards = value.reshape(TP_SIZE, LOCAL_O_GROUPS, D, O_LORA).contiguous()
+            wo_b_spec = TensorSpec("wo_b", [TP_SIZE, LOCAL_O_GROUPS, D, O_LORA], spec.dtype, init_value=shards)
             wo_b_spec.resident = "stacked"
             specs.append(wo_b_spec)
             continue
@@ -1337,7 +1346,8 @@ if __name__ == "__main__":
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES), help="tensor-parallel world size")
     parser.add_argument(
         "-d", "--device", type=str, default=None,
@@ -1398,7 +1408,8 @@ if __name__ == "__main__":
                 compile_only=args.compile_only,
                 config=dict(
                     dump_passes=args.dump_passes,
-                    platform=args.platform,
+                    backend_type=args.backend_type,
+                    execution_mode=args.execution_mode,
                     device_id=device_ids[0],
                     enable_chip_swimlane=args.enable_chip_swimlane,
                 ),
@@ -1425,8 +1436,8 @@ if __name__ == "__main__":
             )
         else:
             # The A2A3 simulator's distributed O path uses the CSA-level threshold and near-zero cap.
-            full_x_out_diff_thd = 4e-3 if args.platform == "a2a3sim" else 3e-3
-            full_x_out_max_diff = 2 if args.platform == "a2a3sim" else 1
+            full_x_out_diff_thd = 4e-3 if (args.backend_type == "a2a3" and args.execution_mode) else 3e-3
+            full_x_out_max_diff = 2 if (args.backend_type == "a2a3" and args.execution_mode) else 1
             mapping_shape = (TP_SIZE, local_t)
             full_mapping_shape = (TP_SIZE, TP_SIZE * local_t)
             result = run(
@@ -1439,7 +1450,8 @@ if __name__ == "__main__":
                 config=dict(
                     dump_passes=args.dump_passes,
                     distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
-                    platform=args.platform,
+                    backend_type=args.backend_type,
+                    execution_mode=args.execution_mode,
                     enable_chip_swimlane=args.enable_chip_swimlane,
                 ),
                 rtol=1e-3,

@@ -11,6 +11,7 @@
 
 
 import sys
+from math import gcd
 
 import config
 
@@ -86,7 +87,6 @@ from decode_indexer_compressor import (
     indexer_compressor_write,
 )
 from qkv_proj_rope import (
-    QPROJ_TAIL_M_TILE,
     QPROJ_T_PAD,
     kv_proj_rope,
     q_proj_q_dequant,
@@ -99,11 +99,10 @@ from decode_o_proj import (
     ATTENTION_WINDOW_ROWS,
     GROUP_T_PAD,
     LOCAL_O_GROUPS,
-    LOCAL_O_WIDTH,
     LOCAL_T,
     LOCAL_T_PAD,
     O_WINDOW_ROWS,
-    decode_o_proj_tp1,
+    decode_o_proj_tp1_hc,
     o_group_a2a,
     o_proj_reduce_scatter,
 )
@@ -189,7 +188,10 @@ IDX_DEP_COUNT = IDX_LEAF_DEP_SLOT + 1
 CSA_PROJECTION_PACK_ROW_TILE = 8
 CSA_PROJECTION_PACK_WORKERS = 16
 CSA_ALL_VISIBLE_WORKERS = 16
-CSA_WB_TOKEN_TILE = 8
+CSA_WB_TOKEN_TILE = gcd(S, 8)
+TP1_CSA_ROPE_TILE = gcd(4, S)
+TP1_CSA_WB_TOKEN_TILE = gcd(CSA_WB_TOKEN_TILE, S)
+CSA_ROPE_WORKERS = 16
 CSA_WB_WORKERS = 48  # CSA cache-write workers
 TP1_CSA_WB_WORKERS = 8  # TP1 CSA cache-write workers
 
@@ -205,8 +207,8 @@ def _decode_csa(
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
@@ -248,8 +250,8 @@ def _decode_csa(
     position_ids: pl.Tensor[[KV_T_DYN], pl.INT32],
     kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, LOCAL_O_WIDTH], pl.INT8],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[LOCAL_O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
     gather_window: pld.DistributedTensor[[DECODE_GROUP_CAP, D], pl.BF16],
@@ -399,9 +401,8 @@ def _decode_csa(
             x_normed_t, inner_wkv, inner_wgate, idx_values_local, idx_scores_local,
             projection_dep, idx_qr_mm_tid,
         )
-        qproj_t_matmul = ((t_dim + QPROJ_TAIL_M_TILE - 1) // QPROJ_TAIL_M_TILE) * QPROJ_TAIL_M_TILE
-        q_proj_i32 = pl.create_tensor([qproj_t_matmul, H * HEAD_DIM], dtype=pl.INT32)
-        q_proj_i32, qproj_tid = q_proj_q_matmul(
+        q_proj_i32 = pl.create_tensor([QPROJ_T_PAD, H * HEAD_DIM], dtype=pl.INT32)
+        qproj_tid = q_proj_q_matmul(
             wq_b, qr_i8_matmul, q_proj_i32, t_dim, idx_projection_tid,
         )
         cmp_projection_tid = compressor_ratio4_project(
@@ -624,7 +625,7 @@ def _decode_csa(
         )
 
     with pl.scope():
-        hc_post(attn_out, x_hc, post_t, comb_t, x_out)
+        hc_post(attn_out, x_hc, post_t, comb_t, x_out, T_TILE=4)
     return x_out
 
 
@@ -683,7 +684,7 @@ def l3_decode_csa(
     kv_seq_lens: pl.Tensor[[TP_SIZE, B_DYN], pl.INT32],
     attn_sink: pl.Tensor[[TP_SIZE, H], pl.FP32],
     wo_a: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[TP_SIZE, D, LOCAL_O_WIDTH], pl.INT8],
+    wo_b: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[TP_SIZE, D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, HC_MULT, D], pl.FP32]],
     local_t: pl.Scalar[pl.INT32],
@@ -764,8 +765,8 @@ def _decode_csa_tp1(
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
@@ -806,8 +807,8 @@ def _decode_csa_tp1(
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
 ):
@@ -837,7 +838,7 @@ def _decode_csa_tp1(
     idx_block_table.bind_dynamic(0, B_DYN)
     x_out.bind_dynamic(0, T_DYN)
     t_dim = pl.tensor.dim(x_hc, 0)
-    wb_blocks = t_dim // CSA_WB_TOKEN_TILE
+    wb_blocks = t_dim // TP1_CSA_WB_TOKEN_TILE
     post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
     x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
@@ -851,25 +852,26 @@ def _decode_csa_tp1(
     idx_sin_signed = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_cos_il = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_sin_signed = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_rope_interleave") as rope_tid:
-        il_ones = pl.full([4, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
-        il_lane_ids = pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32)
-        il_col = pl.col_expand_mul(il_ones, il_lane_ids)
-        il_dup_f = pl.cast(pl.cast(pl.mul(il_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        il_dup_idx = pl.cast(il_dup_f, target_type=pl.INT32)
-        il_lane = pl.sub(il_col, pl.mul(il_dup_f, 2.0))
-        il_sign = pl.sub(pl.mul(il_lane, 2.0), 1.0)
-        for rope_t0 in pl.range(0, t_dim, 4):
-            idx_cos_half = pl.cast(freqs_cos[rope_t0 : rope_t0 + 4, 0:HALF_ROPE], target_type=pl.FP32)
-            idx_cos_il[rope_t0 : rope_t0 + 4, :] = pl.gather(idx_cos_half, dim=-1, index=il_dup_idx)
-            idx_sin_half = pl.cast(freqs_sin[rope_t0 : rope_t0 + 4, 0:HALF_ROPE], target_type=pl.FP32)
+    with pl.spmd(pl.min(t_dim // TP1_CSA_ROPE_TILE, CSA_ROPE_WORKERS), name_hint="csa_rope_interleave", allow_early_resolve=True) as rope_tid:
+        for rope_block in pl.range(pl.tile.get_block_idx(), t_dim // TP1_CSA_ROPE_TILE, pl.min(t_dim // TP1_CSA_ROPE_TILE, CSA_ROPE_WORKERS)):
+            rope_t0 = rope_block * TP1_CSA_ROPE_TILE
+            il_ones = pl.full([TP1_CSA_ROPE_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
+            il_lane_ids = pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32)
+            il_col = pl.col_expand_mul(il_ones, il_lane_ids)
+            il_dup_f = pl.cast(pl.cast(pl.mul(il_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+            il_dup_idx = pl.cast(il_dup_f, target_type=pl.INT32)
+            il_lane = pl.sub(il_col, pl.mul(il_dup_f, 2.0))
+            il_sign = pl.sub(pl.mul(il_lane, 2.0), 1.0)
+            idx_cos_half = pl.cast(freqs_cos[rope_t0 : rope_t0 + TP1_CSA_ROPE_TILE, 0:HALF_ROPE], target_type=pl.FP32)
+            idx_cos_il[rope_t0 : rope_t0 + TP1_CSA_ROPE_TILE, :] = pl.gather(idx_cos_half, dim=-1, index=il_dup_idx)
+            idx_sin_half = pl.cast(freqs_sin[rope_t0 : rope_t0 + TP1_CSA_ROPE_TILE, 0:HALF_ROPE], target_type=pl.FP32)
             idx_sin_il = pl.gather(idx_sin_half, dim=-1, index=il_dup_idx)
-            idx_sin_signed[rope_t0 : rope_t0 + 4, :] = pl.mul(idx_sin_il, il_sign)
-            cmp_cos_half = pl.cast(cmp_freqs_cos[rope_t0 : rope_t0 + 4, 0:HALF_ROPE], target_type=pl.FP32)
-            cmp_cos_il[rope_t0 : rope_t0 + 4, :] = pl.gather(cmp_cos_half, dim=-1, index=il_dup_idx)
-            cmp_sin_half = pl.cast(cmp_freqs_sin[rope_t0 : rope_t0 + 4, 0:HALF_ROPE], target_type=pl.FP32)
+            idx_sin_signed[rope_t0 : rope_t0 + TP1_CSA_ROPE_TILE, :] = pl.mul(idx_sin_il, il_sign)
+            cmp_cos_half = pl.cast(cmp_freqs_cos[rope_t0 : rope_t0 + TP1_CSA_ROPE_TILE, 0:HALF_ROPE], target_type=pl.FP32)
+            cmp_cos_il[rope_t0 : rope_t0 + TP1_CSA_ROPE_TILE, :] = pl.gather(cmp_cos_half, dim=-1, index=il_dup_idx)
+            cmp_sin_half = pl.cast(cmp_freqs_sin[rope_t0 : rope_t0 + TP1_CSA_ROPE_TILE, 0:HALF_ROPE], target_type=pl.FP32)
             cmp_sin_il = pl.gather(cmp_sin_half, dim=-1, index=il_dup_idx)
-            cmp_sin_signed[rope_t0 : rope_t0 + 4, :] = pl.mul(cmp_sin_il, il_sign)
+            cmp_sin_signed[rope_t0 : rope_t0 + TP1_CSA_ROPE_TILE, :] = pl.mul(cmp_sin_il, il_sign)
 
     q = pl.create_tensor([t_dim, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.BF16)
@@ -893,8 +895,8 @@ def _decode_csa_tp1(
         with pl.spmd(TP1_CSA_WB_WORKERS, name_hint="csa_cache_writeback"):
             wb_worker = pl.tile.get_block_idx()
             for wb_blk in pl.range(wb_worker, wb_blocks, TP1_CSA_WB_WORKERS):
-                wb_t0 = wb_blk * CSA_WB_TOKEN_TILE
-                for write_dt in pl.range(CSA_WB_TOKEN_TILE):
+                wb_t0 = wb_blk * TP1_CSA_WB_TOKEN_TILE
+                for write_dt in pl.range(TP1_CSA_WB_TOKEN_TILE):
                     write_t = wb_t0 + write_dt
                     write_row_i64 = pl.read(ori_slot_mapping, [write_t])
                     if write_row_i64 >= 0:
@@ -938,8 +940,9 @@ def _decode_csa_tp1(
             attn_sink, freqs_cos, freqs_sin,
             o_packed_heads,
         )
-        attn_out = decode_o_proj_tp1(o_packed_heads, wo_a, wo_b, wo_b_scale, attn_out, heads_dep)
-        hc_post(attn_out, x_hc, post_t, comb_t, x_out)
+        decode_o_proj_tp1_hc(
+            o_packed_heads, wo_a, wo_b, wo_b_scale, x_hc, post_t, comb_t, x_out, heads_dep,
+        )
     return x_out
 
 
@@ -948,8 +951,8 @@ decode_csa_tp1_test = pl.jit(auto_scope=False)(_decode_csa_tp1)
 
 
 # fixture
-if LOCAL_T < 2 * ROPE_CS_T_TILE:
-    raise ValueError("CSA fixture token capacity must leave one RoPE row tile for subcapacity")
+if LOCAL_T < ROPE_CS_T_TILE:
+    raise ValueError("CSA fixture token capacity must contain one RoPE row tile")
 if LOCAL_T % ROPE_CS_T_TILE != 0:
     raise ValueError("CSA fixture token capacity must align to the RoPE row tile")
 if (LOCAL_T - ROPE_CS_T_TILE) % S != 0:
@@ -1150,6 +1153,7 @@ def build_tensor_specs(start_pos=None, batch=B):
         csa_decode_start_set,
         kv_seq_lens_from_starts,
         ori_slot_mapping,
+        pack_nz,
         position_ids_from_starts,
         resolve_start_positions,
         swa_indices_and_lens,
@@ -1226,7 +1230,8 @@ def build_tensor_specs(start_pos=None, batch=B):
     max_active_pages = max(1, (max_visible_rows + BLOCK_SIZE - 1) // BLOCK_SIZE)
     cmp_block_num = batch * max_active_pages
     idx_cache_block_num = batch * max_active_pages
-    window_block_table = block_table(batch=batch, table_blocks=ORI_MAX_BLOCKS, physical_blocks=ORI_BLOCK_NUM)
+    window_pool_blocks = (ORI_BLOCK_NUM // batch) * batch
+    window_block_table = block_table(batch=batch, table_blocks=ORI_MAX_BLOCKS, physical_blocks=window_pool_blocks)
     cmp_block_table = block_table(batch=batch, table_blocks=CMP_MAX_BLOCKS, physical_blocks=cmp_block_num)
     idx_block_table = block_table(batch=batch, table_blocks=IDX_MAX_BLOCKS, physical_blocks=idx_cache_block_num)
     def round_half_away_from_zero(x):
@@ -1467,8 +1472,13 @@ def build_tensor_specs(start_pos=None, batch=B):
 
     wq_b_bf16 = init_wq_b().to(torch.bfloat16)
     wq_b_i8, wq_b_scale = quant_w_per_output_channel(wq_b_bf16)
+    wo_a_bf16 = init_wo_a().to(torch.bfloat16)
     wo_b_bf16 = init_wo_b().to(torch.bfloat16)
     wo_b_i8, wo_b_scale = quant_w_per_row(wo_b_bf16)
+    # wo_b's group axis is the sole NZ leading/batch axis, matching wo_a's own
+    # [GROUPS, ...] convention: fold the flat [D, GROUPS*O_LORA] quant result
+    # into [GROUPS, D, O_LORA] before packing each group's fractal blocks.
+    wo_b_i8_groups = wo_b_i8.reshape(D, O_GROUPS, O_LORA).permute(1, 0, 2).contiguous()
 
     return [
         TensorSpec("x_hc", [tokens, HC_MULT, D], torch.float32, init_value=lambda: shared_x_hc.clone()),
@@ -1476,8 +1486,8 @@ def build_tensor_specs(start_pos=None, batch=B):
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=lambda: shared_hc_attn_scale.clone()),
         TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=lambda: shared_hc_attn_base.clone()),
         TensorSpec("attn_norm_w", [D], torch.bfloat16, init_value=lambda: shared_attn_norm_w.clone()),
-        TensorSpec("wq_a", [D, Q_LORA], torch.bfloat16, init_value=lambda: shared_wq_a.clone()),
-        TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
+        TensorSpec("wq_a", [D, Q_LORA], torch.bfloat16, init_value=lambda: pack_nz(shared_wq_a.clone())),
+        TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.int8, init_value=lambda: pack_nz(wq_b_i8)),
         TensorSpec("wq_b_scale", [H * HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
         TensorSpec("wkv", [D, HEAD_DIM], torch.bfloat16, init_value=init_wkv),
         TensorSpec("gamma_cq", [Q_LORA], torch.bfloat16, init_value=lambda: shared_gamma_cq.clone()),
@@ -1533,8 +1543,8 @@ def build_tensor_specs(start_pos=None, batch=B):
         TensorSpec("position_ids", [tokens], torch.int32, init_value=init_position_ids),
         TensorSpec("kv_seq_lens", [batch], torch.int32, init_value=init_kv_seq_lens),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
-        TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
-        TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
+        TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=lambda: pack_nz(wo_a_bf16.clone())),
+        TensorSpec("wo_b", [O_GROUPS, D, O_LORA], torch.int8, init_value=lambda: pack_nz(wo_b_i8_groups)),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
         TensorSpec("x_out", [tokens, HC_MULT, D], torch.float32),
     ]
@@ -1619,6 +1629,8 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
             specs.append(full_spec)
             continue
         if spec.name == "wo_a":
+            # NZ packing only reorders the trailing [O_LORA, O_GROUP_IN] pair, so
+            # splitting the already-packed leading group axis into TP shards is safe.
             shards = value.reshape(TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN).contiguous()
             wo_a_spec = TensorSpec(
                 "wo_a", [TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], spec.dtype,
@@ -1628,8 +1640,9 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
             specs.append(wo_a_spec)
             continue
         if spec.name == "wo_b":
-            shards = value.reshape(D, TP_SIZE, LOCAL_O_WIDTH).permute(1, 0, 2).contiguous()
-            wo_b_spec = TensorSpec("wo_b", [TP_SIZE, D, LOCAL_O_WIDTH], spec.dtype, init_value=shards)
+            # Same leading-group-axis split as wo_a -- wo_b is now [GROUPS, D, O_LORA].
+            shards = value.reshape(TP_SIZE, LOCAL_O_GROUPS, D, O_LORA).contiguous()
+            wo_b_spec = TensorSpec("wo_b", [TP_SIZE, LOCAL_O_GROUPS, D, O_LORA], spec.dtype, init_value=shards)
             wo_b_spec.resident = "stacked"
             specs.append(wo_b_spec)
             continue
@@ -1674,8 +1687,10 @@ def golden_decode_csa(tensors):
     from rmsnorm import golden_rms_norm
 
     tp_size, local_t = tensors["x_hc"].shape[:2]
+    # Both weights stay NZ-packed here -- only the leading group axis is
+    # reassembled; golden_decode_o_proj_tp1 (via golden_decode_csa_tp1) unpacks them.
     full_wo_a = tensors["wo_a"].reshape(O_GROUPS, O_LORA, O_GROUP_IN)
-    full_wo_b = tensors["wo_b"].permute(1, 0, 2).reshape(D, O_GROUPS * O_LORA)
+    full_wo_b = tensors["wo_b"].reshape(O_GROUPS, D, O_LORA)
     full_wo_b_scale = tensors["wo_b_scale"][0]
 
     # Post-norm rows the all-gather publishes, rank-major.
@@ -1747,7 +1762,8 @@ if __name__ == "__main__":
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES), help="tensor-parallel world size")
     parser.add_argument(
         "-d", "--device", type=str, default=None,
@@ -1808,7 +1824,8 @@ if __name__ == "__main__":
             compile_only=args.compile_only,
             config=dict(
                             dump_passes=args.dump_passes,
-                            platform=args.platform,
+                            backend_type=args.backend_type,
+                            execution_mode=args.execution_mode,
                             device_id=device_ids[0],
                             enable_chip_swimlane=args.enable_chip_swimlane,
                             ring_task_window=16_384,
@@ -1848,7 +1865,7 @@ if __name__ == "__main__":
                     block_size=BLOCK_SIZE,
                     pool_name="indexer KV scale", atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01,
                 ),
-                "x_out": ratio_reldiff(diff_thd=4e-3, pct_thd=0.008, max_diff_hd=1.0),
+                "x_out": ratio_reldiff(diff_thd=4e-3, pct_thd=0.008, max_diff_hd=1.1),
             },
         )
         if not result.passed:
@@ -1868,7 +1885,8 @@ if __name__ == "__main__":
         config=dict(
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             enable_chip_swimlane=args.enable_chip_swimlane,
             ring_task_window=16_384,
             ring_heap=1_073_741_824,

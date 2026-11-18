@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """The block reference against the model's own module, `Qwen3_5GatedDeltaNet`.
 
-`reference.block` is what every kernel of the block is scored against, so it has
+`block_reference.block` is what every kernel of the block is scored against, so it has
 to be right before anything is built on it. This runs the `transformers` module
 on the same hidden states and weights and compares the two chains at every point
 a forward hook can reach: the four projections, the delta rule's output, the
@@ -58,11 +58,13 @@ import time
 
 import torch
 
+import block_reference
 import reference
 import weights as weights_mod
-from config import GDN_QUANT, GDN_TILING, QWEN3_8_27B
+from chunk_cumsum import CHUNK_TILE
+from config import GDN_QUANT, QWEN3_8_27B
 
-CHUNK = GDN_TILING.chunk
+CHUNK = CHUNK_TILE
 
 # The W8A8 ablation: what is int8 in each variant. `weights` names the weight
 # set to quantise, or None for bf16.
@@ -163,7 +165,7 @@ def quant_table(t: int, x: torch.Tensor, w: dict[str, torch.Tensor],
     for name, names, quant_x, quant_y in QUANT_VARIANTS:
         started = time.time()
         wq = reference.quantize_weights(w, names) if names else w
-        st = reference.block(x, wq, QWEN3_8_27B, CHUNK, quant_x=quant_x, quant_y=quant_y)
+        st = block_reference.block(x, wq, QWEN3_8_27B, CHUNK, quant_x=quant_x, quant_y=quant_y)
         row = f"  {name:<42} {compare(st['o'], truth['o'])[0]:>15.3e} {compare(st['out'], truth['out'])[0]:>10.3e}"
         if bf16_out is not None:
             row += f" {compare(st['out'], bf16_out)[0]:>12.3e}"
@@ -186,7 +188,7 @@ def check(t: int, w: dict[str, torch.Tensor], dtypes: list[torch.dtype],
 
     x = reference.make_block_inputs(t, QWEN3_8_27B, seed)
     started = time.time()
-    ours = reference.block(x, w, QWEN3_8_27B, CHUNK)
+    ours = block_reference.block(x, w, QWEN3_8_27B, CHUNK)
     print(f"[ref] float64 block at T={t}: {time.time() - started:.1f}s; "
           f"g in [{float(ours['g'].min()):.3g}, {float(ours['g'].max()):.3g}], "
           f"chunk g_sum min {float(ours['g_sum'].min()):.3g}, "

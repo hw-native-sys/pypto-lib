@@ -9,6 +9,8 @@
 """DeepSeek-V4 decode Indexer: q projection, Hadamard INT8 quant, inner compressor, paged C8 score and Top-K."""
 
 
+from math import gcd
+
 import pypto.language as pl
 
 from config import (
@@ -68,12 +70,12 @@ MM_N_TILE = 512       # idx qr_proj Mat N tile
 MM_ROW_TILE = 16
 T_PAD = ((T + MM_ROW_TILE - 1) // MM_ROW_TILE) * MM_ROW_TILE
 assert T_PAD == MM_ROW_TILE, "weights_proj single-row-tile scope assumes decode T <= MM_ROW_TILE"
-D_TILE = 512
 # weights_proj: WEIGHTS_OK tasks, each a [MM_ROW_TILE, IDX_N_HEADS] matmul over one WEIGHTS_K_TILE K range,
 # summed by a separate reduce scope (a zero-seed + atomic-add assemble races on the full-extent seed).
 # The inner K loop is a pl.range: a 2-iteration pl.pipeline(stage=2) miscompiles over matmul.
 WEIGHTS_OK = 4
 WEIGHTS_K_TILE = D // WEIGHTS_OK
+D_TILE = gcd(512, WEIGHTS_K_TILE)
 assert WEIGHTS_K_TILE % D_TILE == 0
 QH_MM_TILE = 64       # q @ hadamard row tile; L0C caps QH_MM_TILE * IDX_HEAD_DIM * 4B <= 64KiB
 QH_QUANT_TILE = 64
@@ -107,9 +109,9 @@ def indexer(
     x: pl.Tensor[[B, S, D], pl.BF16],
     qr: pl.Tensor[[T, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T, 1], pl.FP32],
-    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
+    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, pl.NZ],
     # Interleave-duplicated (j>>1) cos and sign-folded sin, built once by the caller:
     #   cos[j] = cos_half[j>>1];  sin[j] = sin_half[j>>1] * sign[j], sign = [-1,+1,...]
     cos: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
@@ -137,6 +139,8 @@ def indexer(
 ):
     qr_acc_pad = pl.create_tensor([T_PAD, IDX_Q_DIM], dtype=pl.INT32)
     for ot in pl.spmd(IDX_Q_DIM // Q_OUT_TILE, name_hint="idx_qr_proj_matmul", allow_early_resolve=True):
+        # Weight reads bypass L2.
+        pl.set_cache_policy(wq_b, pl.CachePolicy.BYPASS)
         o_base = ot * Q_OUT_TILE
         for ns in pl.range(0, Q_OUT_TILE, MM_N_TILE):
             qr_acc = pl.create_tensor([MM_ROW_TILE, MM_N_TILE], dtype=pl.INT32)
@@ -217,6 +221,7 @@ def indexer(
     x_flat = pl.reshape(x, [T, D])
     weights_partial = pl.create_tensor([WEIGHTS_OK * MM_ROW_TILE, IDX_N_HEADS], dtype=pl.FP32)
     with pl.spmd(WEIGHTS_OK, name_hint="weights_proj", deps=[late_dep]) as _weights_tid:
+        pl.set_cache_policy(weights_proj, pl.CachePolicy.BYPASS)
         kb = pl.tile.get_block_idx()
         k_base = kb * WEIGHTS_K_TILE
         weights_acc = pl.create_tensor([MM_ROW_TILE, IDX_N_HEADS], dtype=pl.FP32)
@@ -552,9 +557,9 @@ def indexer_test(
     x: pl.Tensor[[B, S, D], pl.BF16],
     qr: pl.Tensor[[T, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T, 1], pl.FP32],
-    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
+    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, pl.NZ],
     cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
@@ -631,14 +636,14 @@ def golden_indexer(tensors):
     """Torch reference for Indexer.forward decode branch; prefill `start_pos == 0` path is omitted."""
     import torch
     from decode_indexer_compressor import golden_compressor
-    from utils import int8_quant_per_row
+    from utils import int8_quant_per_row, unpack_nz
 
     x = tensors["x"].float()
     qr = tensors["qr"]
     qr_scale = tensors["qr_scale"].float()
-    wq_b = tensors["wq_b"]
+    wq_b = unpack_nz(tensors["wq_b"])
     wq_b_scale = tensors["wq_b_scale"].float()
-    weights_proj = tensors["weights_proj"].float()
+    weights_proj = unpack_nz(tensors["weights_proj"]).float()
     cos = tensors["cos"]
     sin = tensors["sin"]
     hadamard = tensors["hadamard"].float()
@@ -732,6 +737,7 @@ def golden_indexer(tensors):
 def build_tensor_specs(start_pos=None):
     import torch
     from utils import (
+        pack_nz,
         block_table,
         compressed_slot_mapping,
         csa_decode_start_set,
@@ -828,9 +834,9 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),
         TensorSpec("qr", [T, Q_LORA], torch.int8, init_value=lambda: qr_i8),
         TensorSpec("qr_scale", [T, 1], torch.float32, init_value=lambda: qr_scale),
-        TensorSpec("wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
+        TensorSpec("wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.int8, init_value=lambda: pack_nz(wq_b_i8)),
         TensorSpec("wq_b_scale", [IDX_N_HEADS * IDX_HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
-        TensorSpec("weights_proj", [D, IDX_N_HEADS], torch.bfloat16, init_value=init_weights_proj),
+        TensorSpec("weights_proj", [D, IDX_N_HEADS], torch.bfloat16, init_value=lambda: pack_nz(init_weights_proj().to(torch.bfloat16))),
         TensorSpec("cos", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
         TensorSpec("sin", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
         TensorSpec("hadamard", [IDX_HEAD_DIM, IDX_HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
@@ -865,7 +871,8 @@ if __name__ == "__main__":
     from utils import parse_start_pos_arg
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--runtime-dir", type=str, default=None)
@@ -906,7 +913,8 @@ if __name__ == "__main__":
         runtime_dir=args.runtime_dir,
         config=dict(
             dump_passes=args.dump_passes,
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),

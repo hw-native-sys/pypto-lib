@@ -43,17 +43,20 @@ assert D % ROW_PAD == 0
 GATE_D_TILE = 2048
 assert D % GATE_D_TILE == 0, "gate K-loop must cover D"
 QUANT_TILE = 256
-SCORE_PAD = 256         # padded expert row for sort32 + mrgsort
+SCORE_PAD = max(256, 1 << (N_EXPERTS - 1).bit_length())
 TOPK_PAD = 8            # TOPK padded to 32B-aligned width
 SORT_PAD = TOPK_PAD * 2 # (val, idx) interleaved slice width
 assert TOPK <= TOPK_PAD
 
-def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE):
+def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE, norm_rows_per_block=1):
     """Build a router body with fixed projection tiles for its workload."""
     if token_tile_rows <= 0 or token_tile_rows % 16:
         raise ValueError("gate token tile rows must be a positive multiple of 16")
     if hidden_tile_cols <= 0 or D % hidden_tile_cols:
         raise ValueError("gate hidden tile columns must divide the hidden dimension")
+    if norm_rows_per_block <= 0:
+        raise ValueError("norm rows per block must be positive")
+    NORM_ROWS_PER_BLOCK = norm_rows_per_block
     TOKEN_TILE_ROWS = token_tile_rows
     HIDDEN_TILE_COLS = hidden_tile_cols
 
@@ -79,13 +82,7 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE):
         weights.bind_dynamic(0, GATE_T_DYN)
         token_rows = pl.tensor.dim(x_mixed, 0)
         padded_rows = ((token_rows + TOKEN_TILE_ROWS - 1) // TOKEN_TILE_ROWS) * TOKEN_TILE_ROWS
-        # Deferred RMSNorm (qwen3-style): store xg = x*gamma (NOT *inv_rms), because
-        # the per-token positive scalar inv_rms factors out of everything downstream:
-        #   - gate logits: inv_rms * (xg @ gate_w.T)  -> applied as a [16,1] row-scale
-        #   - int8 quant : symmetric per-token quant of xg CANCELS inv_rms exactly;
-        #                  inv_rms rides only x_norm_scale (= inv_rms * amax(xg)/127).
-        # This lets sq_sum (needs raw x) and xg share ONE pass over x_mixed instead of
-        # a sqsum pass followed by a separate normalize pass.
+        # Preserve the canonical deferred RMSNorm contract while batching rows.
         xg_buf = pl.create_tensor([padded_rows, D], dtype=pl.FP32)
         inv_rms_buf = pl.create_tensor([padded_rows, 1], dtype=pl.FP32)
         # per-token int8 quant scale (= INT8_SCALE_MAX / amax(xg)), computed in ffn_norm
@@ -103,46 +100,49 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE):
         if active_gate_tokens > token_rows:
             active_gate_tokens = pl.cast(token_rows, pl.INDEX)
 
-        # One token per core with two-level full-row reductions.
+        # Group independent rows to amortize block scheduling and reuse gamma.
         norm_w_2d = pl.reshape(norm_w, [1, D])
-        for tok in pl.spmd(active_gate_tokens, name_hint="ffn_norm", allow_early_resolve=True):
-            rms_x = pl.cast(pl.tile.load(x_mixed, [tok, 0], [1, D]), pl.FP32)
+        for norm_block in pl.spmd((active_gate_tokens + NORM_ROWS_PER_BLOCK - 1) // NORM_ROWS_PER_BLOCK, name_hint="ffn_norm", allow_early_resolve=True):
             rms_w = pl.cast(pl.tile.load(norm_w_2d, [0, 0], [1, D]), pl.FP32)
-            xg = pl.mul(rms_x, rms_w)
-            pl.tile.store(xg, [tok, 0], xg_buf, shapes=[1, D])
+            row_begin = norm_block * NORM_ROWS_PER_BLOCK
+            row_end = pl.min(row_begin + NORM_ROWS_PER_BLOCK, active_gate_tokens)
+            for tok in pl.range(row_begin, row_end):
+                rms_x = pl.cast(pl.tile.load(x_mixed, [tok, 0], [1, D]), pl.FP32)
+                xg = pl.mul(rms_x, rms_w)
+                pl.tile.store(xg, [tok, 0], xg_buf, shapes=[1, D])
 
-            sq_rows = pl.reshape(pl.mul(rms_x, rms_x), [ROW_PAD, FFN_REDUCE_TILE])
-            sq_partial_tmp = pl.create_tile([ROW_PAD, FFN_REDUCE_TILE], dtype=pl.FP32)
-            sq_partial = pl.row_sum(sq_rows, sq_partial_tmp)
-            sq_reduce = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
-            sq_reduce[0:1, :] = pl.reshape(sq_partial, [1, ROW_PAD])
-            sq_reduce = pl.set_validshape(sq_reduce, 1, ROW_PAD)
-            sq_sum_tmp = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
-            sq_sum = pl.row_sum(sq_reduce, sq_sum_tmp)
-            sq_sum = pl.set_validshape(pl.reshape(sq_sum, [1, ROW_PAD]), 1, 1)
-            inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS)))
-            pl.tile.store(inv_rms, [tok, 0], inv_rms_buf, shapes=[1, 1])
+                sq_rows = pl.reshape(pl.mul(rms_x, rms_x), [ROW_PAD, FFN_REDUCE_TILE])
+                sq_partial_tmp = pl.create_tile([ROW_PAD, FFN_REDUCE_TILE], dtype=pl.FP32)
+                sq_partial = pl.row_sum(sq_rows, sq_partial_tmp)
+                sq_reduce = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
+                sq_reduce[0:1, :] = pl.reshape(sq_partial, [1, ROW_PAD])
+                sq_reduce = pl.set_validshape(sq_reduce, 1, ROW_PAD)
+                sq_sum_tmp = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
+                sq_sum = pl.row_sum(sq_reduce, sq_sum_tmp)
+                sq_sum = pl.set_validshape(pl.reshape(sq_sum, [1, ROW_PAD]), 1, 1)
+                inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS)))
+                pl.tile.store(inv_rms, [tok, 0], inv_rms_buf, shapes=[1, 1])
 
-            xg_abs_rows = pl.reshape(pl.abs(xg), [ROW_PAD, FFN_REDUCE_TILE])
-            amax_partial_tmp = pl.create_tile([ROW_PAD, FFN_REDUCE_TILE], dtype=pl.FP32)
-            amax_partial = pl.row_max(xg_abs_rows, amax_partial_tmp)
-            amax_reduce = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
-            amax_reduce[0:1, :] = pl.reshape(amax_partial, [1, ROW_PAD])
-            amax_reduce = pl.set_validshape(amax_reduce, 1, ROW_PAD)
-            amax_tmp = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
-            xg_amax = pl.row_max(amax_reduce, amax_tmp)
-            xg_amax = pl.set_validshape(pl.reshape(xg_amax, [1, ROW_PAD]), 1, 1)
-            amax_eps = pl.tile.full([1, ROW_PAD], dtype=pl.FP32, value=INT8_AMAX_EPS)
-            amax_eps = pl.set_validshape(amax_eps, 1, 1)
-            xg_amax = pl.maximum(xg_amax, amax_eps)
-            # quant scale = INT8_SCALE_MAX / amax(xg); dequant scale rides inv_rms.
-            scale_max = pl.tile.full([1, ROW_PAD], dtype=pl.FP32, value=INT8_SCALE_MAX)
-            scale_max = pl.set_validshape(scale_max, 1, 1)
-            xg_sq = pl.div(scale_max, xg_amax)
-            xg_dequant_scale = pl.mul(xg_amax, 1.0 / INT8_SCALE_MAX)
-            x_norm_dequant_scale = pl.mul(xg_dequant_scale, inv_rms)
-            pl.tile.store(x_norm_dequant_scale, [tok, 0], x_norm_scale, shapes=[1, 1])
-            pl.tile.store(xg_sq, [tok, 0], xn_scale_buf, shapes=[1, 1])
+                xg_abs_rows = pl.reshape(pl.abs(xg), [ROW_PAD, FFN_REDUCE_TILE])
+                amax_partial_tmp = pl.create_tile([ROW_PAD, FFN_REDUCE_TILE], dtype=pl.FP32)
+                amax_partial = pl.row_max(xg_abs_rows, amax_partial_tmp)
+                amax_reduce = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
+                amax_reduce[0:1, :] = pl.reshape(amax_partial, [1, ROW_PAD])
+                amax_reduce = pl.set_validshape(amax_reduce, 1, ROW_PAD)
+                amax_tmp = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
+                xg_amax = pl.row_max(amax_reduce, amax_tmp)
+                xg_amax = pl.set_validshape(pl.reshape(xg_amax, [1, ROW_PAD]), 1, 1)
+                amax_eps = pl.tile.full([1, ROW_PAD], dtype=pl.FP32, value=INT8_AMAX_EPS)
+                amax_eps = pl.set_validshape(amax_eps, 1, 1)
+                xg_amax = pl.maximum(xg_amax, amax_eps)
+                # quant scale = INT8_SCALE_MAX / amax(xg); dequant scale rides inv_rms.
+                scale_max = pl.tile.full([1, ROW_PAD], dtype=pl.FP32, value=INT8_SCALE_MAX)
+                scale_max = pl.set_validshape(scale_max, 1, 1)
+                xg_sq = pl.div(scale_max, xg_amax)
+                xg_dequant_scale = pl.mul(xg_amax, 1.0 / INT8_SCALE_MAX)
+                x_norm_dequant_scale = pl.mul(xg_dequant_scale, inv_rms)
+                pl.tile.store(x_norm_dequant_scale, [tok, 0], x_norm_scale, shapes=[1, 1])
+                pl.tile.store(xg_sq, [tok, 0], xn_scale_buf, shapes=[1, 1])
 
         seed_dummy = pl.system.task_dummy(deps=[])
 
@@ -195,6 +195,8 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE):
         # stays outermost and // % divide by the compile-time GATE_N_BLOCKS.
         GATE_N_BLOCKS = N_EXPERTS // GATE_N_TILE
         for gb_idx in pl.spmd(active_gate_tiles * GATE_N_BLOCKS, name_hint="gate", allow_early_resolve=True):
+            # Weight reads bypass L2.
+            pl.set_cache_policy(gate_w, pl.CachePolicy.BYPASS)
             tg = gb_idx // GATE_N_BLOCKS
             nb = gb_idx % GATE_N_BLOCKS
             t1 = tg * TOKEN_TILE_ROWS
@@ -262,16 +264,18 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE):
                 # the batched pl.gather below accepts it — Tile-against-Tensor src
                 # is rejected.
                 topk_idx_tile = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
-                # ptoas pto.tmrgsort requires src rows == 1; sort path iterates
-                # row-by-row. sort32: [1,256]→[1,512] (8 runs of 64). mrgsort
-                # format1 4-way: 8→2 runs of 256. format2 2-way: 2→1 run of 512.
+                # Merge sorted 32-score runs; mrgsort requires a single source row.
                 for sr_tt in pl.range(GATE_T_TILE):
                     sr_row = biased_scores_buf[t1 + sr_tt : t1 + sr_tt + 1, :]
                     sr_idx_init = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
                     sr_sorted = pl.sort32(sr_row, sr_idx_init)
                     sr_sorted = pl.mrgsort(sr_sorted, block_len=64)
-                    sr_sorted = pl.mrgsort(sr_sorted[:, 0:256], sr_sorted[:, 256:512])
-                    sr_pairs = sr_sorted[:, 0:SORT_PAD]
+                    if SCORE_PAD == 512:
+                        sr_wide_sorted = pl.mrgsort(sr_sorted, block_len=256)
+                        sr_pairs = sr_wide_sorted[:, 0:SORT_PAD]
+                    else:
+                        sr_narrow_sorted = pl.mrgsort(sr_sorted[:, 0:256], sr_sorted[:, 256:512])
+                        sr_pairs = sr_narrow_sorted[:, 0:SORT_PAD]
                     sr_i = pl.gather(sr_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
                     topk_idx_tile[sr_tt : sr_tt + 1, :] = sr_i
                 # Batched gather; set_validshape+fillpad zeros the [TOPK, TOPK_PAD)
@@ -420,7 +424,8 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run, topk_pair_compare
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--layer-id", type=int, default=10)
     parser.add_argument("--num-tokens", type=int, default=T)
@@ -434,7 +439,8 @@ if __name__ == "__main__":
         golden_fn=golden_gate_core,
         config=dict(
             dump_passes=args.dump_passes,
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),

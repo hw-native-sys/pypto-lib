@@ -108,6 +108,8 @@ def _hc_head(
             linear_full_rows // LINEAR_T_TILE,
             name_hint="hc_head_linear",
         ) as _linear_tid:
+            # Weight reads bypass L2.
+            pl.set_cache_policy(hc_head_fn, pl.CachePolicy.BYPASS)
             task = pl.tile.get_block_idx()
             t0 = task * LINEAR_T_TILE
             acc_full = pl.create_tensor([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32)
@@ -130,6 +132,7 @@ def _hc_head(
             level=pl.Level.CORE_GROUP,
             name_hint="hc_head_linear_tail",
         ):
+            pl.set_cache_policy(hc_head_fn, pl.CachePolicy.BYPASS)
             tail_rows = t_dim - linear_full_rows
             acc_tail = pl.create_tensor([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32)
             for kb in pl.pipeline(0, HC_DIM // LINEAR_K_TILE, stage=2):
@@ -318,9 +321,8 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"]
-    )
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--token-count", type=int, default=T, help="Physical token rows, up to 8192.")
@@ -338,7 +340,8 @@ if __name__ == "__main__":
         golden_fn=golden_hc_head,
         config=dict(
             dump_passes=args.dump_passes,
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),

@@ -88,6 +88,7 @@ assert INDEXER_SCORE_CAP == INDEXER_SCORE_MAX_BLOCKS * BLOCK_SIZE
 # Named, not inlined: a python max() call is not traceable inside a loop bound.
 INDEXER_SCORE_BLOCKS = max(1, (INDEXER_SCORE_CAP + CACHE_TILE - 1) // CACHE_TILE)
 SCORE_TOKEN_TILE = 8
+CP_SCORE_TOKEN_TILE = 16
 TOPK_TILE = 4
 Q_TILE = 128
 Q_OUT_TILE = 256
@@ -95,11 +96,15 @@ QR_PROJ_ROW_TILE = 16
 HEAD_DIM_TILE = 32
 D_TILE = 32
 WEIGHTS_ROW_TILE = 32
+CP_WEIGHTS_ROW_TILE = 128
+CP_WEIGHTS_K_TILE = 256
 QH_QUANT_TILE = 256
 QH_QUANT_ROW_TILE = 64
 ROPE_ROW_TILE = IDX_N_HEADS           # one token owns IDX_N_HEADS contiguous q rows + one cos/sin
 ROPE_PREP_TOKEN_TILE = 16
 QH_MM_TILE = 64
+TOPK_TOKEN_TILE = 4     # queries per prefill_cp_idx_topk block
+TOPK_SMALL_TOKEN_TILE = 16
 # topk_pairs (= 2*PREFILL_TOPK_CAP) must be a power of two aligned to the final mrgsort run: a
 # misaligned prefix (e.g. 2*192) faults like a narrow sort. The real score cap is 256, so two
 # merge stages are sufficient: the only finite values are sorted within the first 512-value run.
@@ -118,9 +123,9 @@ def prefill_indexer(
     x: pl.Tensor[[T, D], pl.BF16],
     qr: pl.Tensor[[T, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T, 1], pl.FP32],
-    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
+    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, pl.NZ],
     cos: pl.Tensor[[T, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[T, ROPE_HEAD_DIM // 2], pl.FP32],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
@@ -367,57 +372,73 @@ def _cp_topk512_query(
     cmp_topk_indices: pl.Tensor[[T, IDX_TOPK], pl.INT32],
 ) -> None:
     """Select one exact TopK=512 row over every visible candidate, one sort leaf at a time."""
-    query = pl.tile.get_block_idx()
-    empty_indices = pl.tile.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
-    pl.store(empty_indices, [query, 0], cmp_topk_indices)
+    # Each worker owns an equal query interval.
+    query_blk = pl.tile.get_block_idx()
+    query_workers = pl.tile.get_block_num()
+    query_tile = T // query_workers
+    for tk_i in pl.range(query_tile):
+        query = query_blk * query_tile + tk_i
+        empty_indices = pl.tile.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
+        pl.store(empty_indices, [query, 0], cmp_topk_indices)
 
-    if query < num_tokens:
-        position = pl.read(position_ids, [query])
-        visible_count = pl.max(pl.min((position + 1) // COMPRESS_RATIO, candidate_rows), 0)
-        if visible_count > 0:
-            leaf_count = (visible_count + CP_INDEXER_LEAF_LEN - 1) // CP_INDEXER_LEAF_LEN
-            for leaf in pl.range(leaf_count):
-                leaf0 = leaf * CP_INDEXER_LEAF_LEN
-                leaf_valid = pl.min(CP_INDEXER_LEAF_LEN, visible_count - leaf0)
-                score_row_raw = pl.load(
-                    score_wide,
-                    [query, leaf0],
-                    [1, CP_INDEXER_LEAF_LEN],
-                    valid_shape=[1, leaf_valid],
+        if query < num_tokens:
+            position = pl.read(position_ids, [query])
+            visible_count = pl.max(pl.min((position + 1) // COMPRESS_RATIO, candidate_rows), 0)
+            if visible_count > 0 and visible_count <= IDX_TOPK:
+                # Single-leaf TopK over at most 512 visible candidates.
+                small_raw = pl.load(score_wide, [query, 0], [1, IDX_TOPK], valid_shape=[1, visible_count])
+                small_scores = pl.tile.fillpad(small_raw, pad_value=pl.PadValue.min)
+                small_floor = pl.tile.full([1, IDX_TOPK], dtype=pl.FP32, value=FP32_NEG_INF)
+                small_scores = pl.maximum(small_scores, small_floor)
+                small_indices = pl.tile.arange(0, [1, IDX_TOPK], dtype=pl.UINT32)
+                small_pairs = pl.tile.sort32(small_scores, small_indices)
+                small_pairs = pl.tile.mrgsort(small_pairs, block_len=64)
+                small_pairs = pl.tile.mrgsort(small_pairs, block_len=256)
+                small_idxs = pl.tile.gather_mask(small_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+                small_valid = pl.tile.set_validshape(small_idxs, 1, visible_count)
+                pl.store(small_valid, [query, 0], cmp_topk_indices)
+            elif visible_count > IDX_TOPK:
+                leaf_count = (visible_count + CP_INDEXER_LEAF_LEN - 1) // CP_INDEXER_LEAF_LEN
+                for leaf in pl.range(leaf_count):
+                    leaf0 = leaf * CP_INDEXER_LEAF_LEN
+                    leaf_valid = pl.min(CP_INDEXER_LEAF_LEN, visible_count - leaf0)
+                    score_row_raw = pl.load(
+                        score_wide,
+                        [query, leaf0],
+                        [1, CP_INDEXER_LEAF_LEN],
+                        valid_shape=[1, leaf_valid],
+                    )
+                    score_row = pl.tile.fillpad(score_row_raw, pad_value=pl.PadValue.min)
+                    score_floor = pl.tile.full([1, CP_INDEXER_LEAF_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
+                    score_row = pl.maximum(score_row, score_floor)
+                    index_ramp = pl.tile.arange(0, [1, CP_INDEXER_LEAF_LEN], dtype=pl.INT32)
+                    leaf_indices = pl.add(index_ramp, pl.cast(leaf0, pl.INT32))
+                    pairs = pl.tile.sort32(score_row, pl.reinterpret_view(leaf_indices, pl.UINT32))
+                    pairs = pl.tile.mrgsort(pairs, block_len=64)
+                    pairs = pl.tile.mrgsort(pairs, block_len=256)
+                    pairs = pl.tile.mrgsort(pairs, block_len=1024)
+                    # sort32 produces 32-score runs (64 interleaved pair lanes).
+                    # The 64/256/1024 stages therefore fully sort 2048 scores.  A
+                    # 4096 stage is only valid for the 8192-score #1080 donor leaf;
+                    # on this 2048-score row it lowers to an illegal AIV config.
+                    leaf_pairs = pl.tile.slice(pairs, [1, CP_INDEXER_PAIR_WIDTH], [0, 0])
+                    if leaf == 0:
+                        pl.store(leaf_pairs, [query, 0], topk_pairs)
+                    else:
+                        running_pairs = pl.load(topk_pairs, [query, 0], [1, CP_INDEXER_PAIR_WIDTH])
+                        merge_tmp = pl.tile.create([1, 2 * CP_INDEXER_PAIR_WIDTH], dtype=pl.FP32)
+                        merged_all = pl.tile.mrgsort(running_pairs, leaf_pairs, tmp=merge_tmp)
+                        merged_pairs = pl.tile.slice(merged_all, [1, CP_INDEXER_PAIR_WIDTH], [0, 0])
+                        pl.store(merged_pairs, [query, 0], topk_pairs)
+                top_pairs = pl.load(topk_pairs, [query, 0], [1, CP_INDEXER_PAIR_WIDTH])
+                selected_indices = pl.tile.gather_mask(
+                    top_pairs,
+                    mask_pattern=pl.tile.MaskPattern.P1010,
+                    output_dtype=pl.INT32,
                 )
-                score_row = pl.tile.fillpad(score_row_raw, pad_value=pl.PadValue.min)
-                score_floor = pl.tile.full([1, CP_INDEXER_LEAF_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
-                score_row = pl.maximum(score_row, score_floor)
-                index_ramp = pl.tile.arange(0, [1, CP_INDEXER_LEAF_LEN], dtype=pl.INT32)
-                leaf_indices = pl.add(index_ramp, pl.cast(leaf0, pl.INT32))
-                pairs = pl.tile.sort32(score_row, pl.reinterpret_view(leaf_indices, pl.UINT32))
-                pairs = pl.tile.mrgsort(pairs, block_len=64)
-                pairs = pl.tile.mrgsort(pairs, block_len=256)
-                pairs = pl.tile.mrgsort(pairs, block_len=1024)
-                # sort32 produces 32-score runs (64 interleaved pair lanes).
-                # The 64/256/1024 stages therefore fully sort 2048 scores.  A
-                # 4096 stage is only valid for the 8192-score #1080 donor leaf;
-                # on this 2048-score row it lowers to an illegal AIV config.
-                leaf_pairs = pl.tile.slice(pairs, [1, CP_INDEXER_PAIR_WIDTH], [0, 0])
-                if leaf == 0:
-                    pl.store(leaf_pairs, [query, 0], topk_pairs)
-                else:
-                    running_pairs = pl.load(topk_pairs, [query, 0], [1, CP_INDEXER_PAIR_WIDTH])
-                    merge_tmp = pl.tile.create([1, 2 * CP_INDEXER_PAIR_WIDTH], dtype=pl.FP32)
-                    merged_all = pl.tile.mrgsort(running_pairs, leaf_pairs, tmp=merge_tmp)
-                    merged_pairs = pl.tile.slice(merged_all, [1, CP_INDEXER_PAIR_WIDTH], [0, 0])
-                    pl.store(merged_pairs, [query, 0], topk_pairs)
-            top_pairs = pl.load(topk_pairs, [query, 0], [1, CP_INDEXER_PAIR_WIDTH])
-            selected_indices = pl.tile.gather_mask(
-                top_pairs,
-                mask_pattern=pl.tile.MaskPattern.P1010,
-                output_dtype=pl.INT32,
-            )
-            output_indices = pl.tile.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
-            valid_topk = pl.min(visible_count, IDX_TOPK)
-            for lane in pl.range(valid_topk):
-                pl.tile.write(output_indices, [0, lane], pl.tile.read(selected_indices, [0, lane]))
-            pl.store(output_indices, [query, 0], cmp_topk_indices)
+                valid_topk = pl.min(visible_count, IDX_TOPK)
+                valid_indices = pl.tile.set_validshape(selected_indices, 1, valid_topk)
+                pl.store(valid_indices, [query, 0], cmp_topk_indices)
 
 
 @pl.jit.inline
@@ -425,15 +446,14 @@ def _prefill_indexer_cp_score_topk(
     x: pl.Tensor[[T, D], pl.BF16],
     qr: pl.Tensor[[T, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T, 1], pl.FP32],
-    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
+    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
-    cos: pl.Tensor[[T, ROPE_HEAD_DIM // 2], pl.FP32],
-    sin: pl.Tensor[[T, ROPE_HEAD_DIM // 2], pl.FP32],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, pl.NZ],
+    cos: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16],
+    sin: pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     idx_kv_cache: pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8],
     idx_kv_scale: pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP16],
-    idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     prior_dep: pl.Scalar[pl.TASK_ID],
@@ -442,200 +462,221 @@ def _prefill_indexer_cp_score_topk(
     pl.Tensor[[T, IDX_TOPK], pl.INT32],
     pl.Scalar[pl.TASK_ID],
 ]:
-    """Compute CP indexer query scores and top-k selections."""
-    # Project quantized query rows.
-    qr_proj = pl.create_tensor([T, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
-    for idx in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="prefill_cp_idx_qr_proj"):
-        o0 = idx * Q_OUT_TILE
-        qr_acc = pl.create_tensor([T, Q_OUT_TILE], dtype=pl.INT32)
-        for kb in pl.pipeline(0, Q_LORA // Q_TILE, stage=2):
-            q0 = kb * Q_TILE
-            qr_tile = qr[:, q0 : q0 + Q_TILE]
-            wq_tile = wq_b[q0 : q0 + Q_TILE, o0 : o0 + Q_OUT_TILE]
-            qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile, init_cond=(q0 == 0))
-        wq_scale = pl.reshape(wq_b_scale[o0 : o0 + Q_OUT_TILE], [1, Q_OUT_TILE])
-        for r0 in pl.range(0, T, QR_PROJ_ROW_TILE):
-            qr_acc_tile = qr_acc[r0 : r0 + QR_PROJ_ROW_TILE, :]
-            acc_fp32 = pl.cast(qr_acc_tile, target_type=pl.FP32, mode="none")
-            scale_dq = qr_scale[r0 : r0 + QR_PROJ_ROW_TILE, :]
-            qr_scaled = pl.row_expand_mul(acc_fp32, scale_dq)
-            qr_dequant = pl.col_expand_mul(qr_scaled, wq_scale)
-            qr_proj[r0 : r0 + QR_PROJ_ROW_TILE, o0 : o0 + Q_OUT_TILE] = qr_dequant
-
-    # Materialize interleaved RoPE rows.
-    rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
-    rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
-    for prep_idx in pl.spmd(T // ROPE_PREP_TOKEN_TILE, name_hint="prefill_cp_idx_rope_prepare", allow_early_resolve=True):
-        t0 = prep_idx * ROPE_PREP_TOKEN_TILE
-        rope_ones = pl.full([ROPE_PREP_TOKEN_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
-        rope_col_i32 = pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32)
-        rope_col_fp32 = pl.cast(rope_col_i32, target_type=pl.FP32)
-        rope_col = pl.col_expand_mul(rope_ones, rope_col_fp32)
-        rope_dup_i32 = pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc")
-        rope_dup_f = pl.cast(rope_dup_i32, target_type=pl.FP32)
-        rope_dup_idx = pl.cast(rope_dup_f, target_type=pl.INT32)
-        rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))
-        rope_sign = pl.sub(pl.mul(rope_lane, 2.0), 1.0)
-        cos_tile = cos[t0 : t0 + ROPE_PREP_TOKEN_TILE, 0 : ROPE_HEAD_DIM // 2]
-        sin_tile = sin[t0 : t0 + ROPE_PREP_TOKEN_TILE, 0 : ROPE_HEAD_DIM // 2]
-        cos_il = pl.gather(cos_tile, dim=-1, index=rope_dup_idx)
-        sin_il = pl.gather(sin_tile, dim=-1, index=rope_dup_idx)
-        rope_cos_il[t0 : t0 + ROPE_PREP_TOKEN_TILE, :] = cos_il
-        rope_sin_signed[t0 : t0 + ROPE_PREP_TOKEN_TILE, :] = pl.mul(sin_il, rope_sign)
-
-    rope_swap_idx = pl.create_tensor([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_cp_idx_rope_swap_idx", allow_early_resolve=True):
-        swap_ones = pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
-        swap_col_i32 = pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32)
-        swap_col_fp32 = pl.cast(swap_col_i32, target_type=pl.FP32)
-        swap_col = pl.col_expand_mul(swap_ones, swap_col_fp32)
-        swap_dup_i32 = pl.cast(pl.mul(swap_col, 0.5), target_type=pl.INT32, mode="trunc")
-        swap_dup_f = pl.cast(swap_dup_i32, target_type=pl.FP32)
-        swap_lane = pl.sub(swap_col, pl.mul(swap_dup_f, 2.0))
-        swap_index = pl.cast(pl.sub(pl.add(swap_col, 1.0), pl.mul(swap_lane, 2.0)), target_type=pl.INT32)
-        rope_swap_idx[0:ROPE_ROW_TILE, 0:ROPE_HEAD_DIM] = swap_index
-
-    qr_proj_flat = pl.reshape(qr_proj, [T * IDX_N_HEADS, IDX_HEAD_DIM])
-    qr_bf16 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.BF16)
-    for token_idx in pl.spmd(T, name_hint="prefill_cp_idx_qr_rope", allow_early_resolve=True):
-        r0 = token_idx * ROPE_ROW_TILE
-        qr_nope_fp32 = qr_proj_flat[r0 : r0 + ROPE_ROW_TILE, 0 : IDX_NOPE_HEAD_DIM]
-        qr_nope = pl.cast(qr_nope_fp32, target_type=pl.BF16, mode="rint")
-        qr_rope = qr_proj_flat[r0 : r0 + ROPE_ROW_TILE, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM]
-        rope_swap_tile = rope_swap_idx[0:ROPE_ROW_TILE, 0:ROPE_HEAD_DIM]
-        qr_swapped = pl.gather(qr_rope, dim=-1, index=rope_swap_tile)
-        rope_cos_tile = rope_cos_il[token_idx : token_idx + 1, :]
-        rope_sin_tile = rope_sin_signed[token_idx : token_idx + 1, :]
-        rope_main = pl.col_expand_mul(qr_rope, rope_cos_tile)
-        rope_swapped = pl.col_expand_mul(qr_swapped, rope_sin_tile)
-        rope_rot = pl.add(rope_main, rope_swapped)
-        rope_bf16 = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
-        qr_bf16[r0 : r0 + ROPE_ROW_TILE, :] = pl.concat(qr_nope, rope_bf16)
-
-    qh_acc_gm = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.FP32)
-    for mm_idx in pl.spmd(T * IDX_N_HEADS // QH_MM_TILE, name_hint="prefill_cp_idx_qr_hadamard", allow_early_resolve=True):
-        r0 = mm_idx * QH_MM_TILE
-        qr_bf16_tile = qr_bf16[r0 : r0 + QH_MM_TILE, :]
-        qh_acc = pl.matmul(qr_bf16_tile, hadamard, out_dtype=pl.FP32)
-        qh_acc_gm[r0 : r0 + QH_MM_TILE, :] = qh_acc
-
-    qr_hadamard_i8 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
-    # QuantLightningIndexer consumes per-token-head query scales as FP16.
-    qr_hadamard_scale_dq = pl.create_tensor([T * IDX_N_HEADS, 1], dtype=pl.FP16)
-    for quant_idx in pl.spmd(T * IDX_N_HEADS // QH_QUANT_ROW_TILE, name_hint="prefill_cp_idx_qr_quant", allow_early_resolve=True):
-        r0 = quant_idx * QH_QUANT_ROW_TILE
-        qh_amax = pl.full([1, QH_QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-        for h0 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
-            qh_tile = qh_acc_gm[r0 : r0 + QH_QUANT_ROW_TILE, h0 : h0 + HEAD_DIM_TILE]
-            qh_abs = pl.maximum(qh_tile, pl.neg(qh_tile))
-            qh_row_max = pl.reshape(pl.row_max(qh_abs), [1, QH_QUANT_ROW_TILE])
-            qh_amax = pl.maximum(qh_amax, qh_row_max)
-        scale_max = pl.full([1, QH_QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
-        scale_quant_row = pl.div(scale_max, qh_amax)
-        qr_scale_tile = pl.reshape(pl.recip(scale_quant_row), [QH_QUANT_ROW_TILE, 1])
-        qr_hadamard_scale_dq[
-            r0 : r0 + QH_QUANT_ROW_TILE, :
-        ] = pl.cast(qr_scale_tile, target_type=pl.FP16, mode="rint")
-        scale_quant = pl.reshape(scale_quant_row, [QH_QUANT_ROW_TILE, 1])
-        for h1 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
-            qh_quant_tile = qh_acc_gm[r0 : r0 + QH_QUANT_ROW_TILE, h1 : h1 + HEAD_DIM_TILE]
-            qh_scaled = pl.row_expand_mul(qh_quant_tile, scale_quant)
-            qh_i32 = pl.cast(qh_scaled, target_type=pl.INT32, mode="rint")
-            qh_half = pl.cast(qh_i32, target_type=pl.FP16, mode="round")
-            qh_i8 = pl.cast(qh_half, target_type=pl.INT8, mode="trunc")
-            qr_hadamard_i8[r0 : r0 + QH_QUANT_ROW_TILE, h1 : h1 + HEAD_DIM_TILE] = qh_i8
-
-    # Project per-head weights. Recipes rounds this LI input to FP16.
-    weights = pl.create_tensor([T, IDX_N_HEADS], dtype=pl.FP16)
-    for idx in pl.spmd(T // WEIGHTS_ROW_TILE, name_hint="prefill_cp_idx_weights_proj"):
-        wrow0 = idx * WEIGHTS_ROW_TILE
-        weights_acc = pl.create_tensor([WEIGHTS_ROW_TILE, IDX_N_HEADS], dtype=pl.FP32)
-        for db in pl.pipeline(0, D // D_TILE, stage=2):
-            d0 = db * D_TILE
-            x_tile = x[wrow0 : wrow0 + WEIGHTS_ROW_TILE, d0 : d0 + D_TILE]
-            wp_tile = weights_proj[d0 : d0 + D_TILE, :]
-            weights_acc = pl.matmul_acc(weights_acc, x_tile, wp_tile, init_cond=(d0 == 0))
-        weights[wrow0 : wrow0 + WEIGHTS_ROW_TILE, :] = pl.cast(
-            pl.mul(weights_acc, WEIGHTS_SCALE),
-            target_type=pl.FP16,
-            mode="rint",
-        )
-
-    # Score paged INT8 cache rows.
+    """Score CP temporary roots with logical page p stored at physical page p + 1."""
     idx_block_num = pl.tensor.dim(idx_kv_cache, 0)
-    kv_cache_i8_flat = pl.reshape(idx_kv_cache, [idx_block_num * BLOCK_SIZE, IDX_HEAD_DIM])
-    kv_scale_flat = pl.reshape(idx_kv_scale, [idx_block_num * BLOCK_SIZE, 1])
-    # Page 0 of the scored root is the zero sentinel; the rest are candidate rows.
     candidate_rows = pl.min((idx_block_num - 1) * BLOCK_SIZE, CP_INDEXER_SCORE_CAP)
-    score_cols = ((candidate_rows + CP_INDEXER_LEAF_LEN - 1) // CP_INDEXER_LEAF_LEN) * CP_INDEXER_LEAF_LEN
-    score_wide = pl.create_tensor([T, score_cols], dtype=pl.FP32)
-    for si in pl.spmd(T // SCORE_INIT_TILE, name_hint="prefill_cp_idx_score_init"):
-        init_row0 = si * SCORE_INIT_TILE
-        for init_col0 in pl.range(0, score_cols, CP_INDEXER_LEAF_LEN):
-            score_init_tile = pl.full([SCORE_INIT_TILE, CP_INDEXER_LEAF_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
-            score_wide[init_row0 : init_row0 + SCORE_INIT_TILE, init_col0 : init_col0 + CP_INDEXER_LEAF_LEN] = score_init_tile
+    completion = pl.array.create(1, pl.TASK_ID)
+    if candidate_rows <= IDX_TOPK:
+        with pl.spmd(T // TOPK_SMALL_TOKEN_TILE, name_hint="prefill_cp_idx_all_visible", deps=[prior_dep]) as all_visible_tid:
+            worker = pl.tile.get_block_idx()
+            for row in pl.range(TOPK_SMALL_TOKEN_TILE):
+                query = worker * TOPK_SMALL_TOKEN_TILE + row
+                empty_indices = pl.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
+                cmp_topk_indices[query:query + 1, :] = empty_indices
+                if query < num_tokens:
+                    position = pl.read(position_ids, [query])
+                    visible_count = pl.max(pl.min((position + 1) // COMPRESS_RATIO, candidate_rows), 0)
+                    if visible_count > 0:
+                        visible_indices = pl.arange(0, [1, IDX_TOPK], dtype=pl.INT32)
+                        valid_indices = pl.set_validshape(visible_indices, 1, visible_count)
+                        cmp_topk_indices[query:query + 1, :] = valid_indices
+        completion[0] = all_visible_tid
+    else:
+        # Project quantized query rows.
+        qr_proj = pl.create_tensor([T, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
+        # Four original output-column tiles per worker.
+        for idx in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE // 4, name_hint="prefill_cp_idx_qr_proj"):
+            for tile_in_block in pl.range(4):
+                o0 = (idx * 4 + tile_in_block) * Q_OUT_TILE
+                qr_acc = pl.create_tensor([T, Q_OUT_TILE], dtype=pl.INT32)
+                for kb in pl.pipeline(0, Q_LORA // Q_TILE, stage=2):
+                    q0 = kb * Q_TILE
+                    qr_tile = qr[:, q0 : q0 + Q_TILE]
+                    wq_tile = wq_b[q0 : q0 + Q_TILE, o0 : o0 + Q_OUT_TILE]
+                    qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile, init_cond=(q0 == 0))
+                wq_scale = pl.reshape(wq_b_scale[o0 : o0 + Q_OUT_TILE], [1, Q_OUT_TILE])
+                for r0 in pl.range(0, T, QR_PROJ_ROW_TILE):
+                    qr_acc_tile = qr_acc[r0 : r0 + QR_PROJ_ROW_TILE, :]
+                    acc_fp32 = pl.cast(qr_acc_tile, target_type=pl.FP32, mode="none")
+                    scale_dq = qr_scale[r0 : r0 + QR_PROJ_ROW_TILE, :]
+                    qr_scaled = pl.row_expand_mul(acc_fp32, scale_dq)
+                    qr_dequant = pl.col_expand_mul(qr_scaled, wq_scale)
+                    qr_proj[r0 : r0 + QR_PROJ_ROW_TILE, o0 : o0 + Q_OUT_TILE] = qr_dequant
 
-    with pl.spmd(T // SCORE_TOKEN_TILE, name_hint="prefill_cp_idx_score", deps=[prior_dep]) as score_tid:
-        score_idx = pl.tile.get_block_idx()
-        token0 = score_idx * SCORE_TOKEN_TILE
-        last_pos = pl.read(position_ids, [num_tokens - 1])
-        visible_limit = pl.min((last_pos + 1) // COMPRESS_RATIO, candidate_rows)
-        for cb in pl.range((visible_limit + CP_SCORE_CACHE_TILE - 1) // CP_SCORE_CACHE_TILE):
-            cache0 = cb * CP_SCORE_CACHE_TILE
-            logical_block = cache0 // BLOCK_SIZE
-            page_offset = cache0 % BLOCK_SIZE
-            if visible_limit > cache0 and logical_block < IDX_CACHE_MAX_BLOCKS:
-                physical_block_raw = pl.read(idx_block_table, [logical_block])
-                # Recipes page 0 is a zero sentinel, never a data page.
-                if physical_block_raw > 0 and physical_block_raw < idx_block_num:
-                    kv_row0 = (pl.cast(physical_block_raw, pl.INDEX) * BLOCK_SIZE + page_offset)
-                    kv_q_i8_full = kv_cache_i8_flat[kv_row0 : kv_row0 + CP_SCORE_CACHE_TILE, 0:IDX_HEAD_DIM]
-                    kv_cache_scale_dq = pl.cast(
-                        kv_scale_flat[kv_row0 : kv_row0 + CP_SCORE_CACHE_TILE, :],
-                        target_type=pl.FP32,
-                        mode="none",
-                    )
-                    for token_offset in pl.range(SCORE_TOKEN_TILE):
-                        t = token0 + token_offset
-                        if t < num_tokens:
-                            q_s0 = t * IDX_N_HEADS
-                            qr_hadamard_i8_tile = qr_hadamard_i8[q_s0 : q_s0 + IDX_N_HEADS, 0:IDX_HEAD_DIM]
-                            score_acc_s = pl.matmul(kv_q_i8_full, qr_hadamard_i8_tile, out_dtype=pl.INT32, b_trans=True)
-                            qh_scale_source = pl.cast(
-                                qr_hadamard_scale_dq[q_s0 : q_s0 + IDX_N_HEADS, :],
-                                target_type=pl.FP32,
-                                mode="none",
-                            )
-                            qh_scale_s = pl.reshape(qh_scale_source, [1, IDX_N_HEADS])
-                            score_acc_fp32 = pl.cast(score_acc_s, target_type=pl.FP32, mode="none")
-                            score_row_scaled = pl.row_expand_mul(score_acc_fp32, kv_cache_scale_dq)
-                            score_scaled = pl.col_expand_mul(score_row_scaled, qh_scale_s)
-                            score_zero = pl.mul(score_scaled, 0.0)
-                            relu_score_s = pl.maximum(score_scaled, score_zero)
-                            weight_row = pl.cast(weights[t : t + 1, :], target_type=pl.FP32, mode="none")
-                            weighted_heads = pl.col_expand_mul(relu_score_s, weight_row)
-                            weighted_sum = pl.row_sum(weighted_heads)
-                            weighted_score_s = pl.reshape(weighted_sum, [1, CP_SCORE_CACHE_TILE])
-                            pos = pl.read(position_ids, [t])
-                            visible_t = pl.min((pos + 1) // COMPRESS_RATIO, candidate_rows)
-                            if visible_t > cache0:
-                                valid_len_t = pl.min(CP_SCORE_CACHE_TILE, visible_t - cache0)
-                            else:
-                                valid_len_t = 0
-                            weighted_visible = pl.set_validshape(weighted_score_s, 1, valid_len_t)
-                            weighted_valid_t = pl.fillpad(weighted_visible, pad_value=pl.PadValue.min)
-                            neg_inf_tile = pl.full([1, CP_SCORE_CACHE_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
-                            weighted_valid_t = pl.maximum(weighted_valid_t, neg_inf_tile)
-                            score_wide[t : t + 1, cache0 : cache0 + CP_SCORE_CACHE_TILE] = weighted_valid_t
+        qr_proj_flat = pl.reshape(qr_proj, [T * IDX_N_HEADS, IDX_HEAD_DIM])
+        qr_bf16 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.BF16)
+        idx_rope_items = T // 4
+        idx_rope_workers = pl.min(idx_rope_items, 8)
+        for idx_rope_worker in pl.spmd(idx_rope_workers, name_hint="prefill_cp_idx_qr_rope", allow_early_resolve=True):
+            swap_ones = pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
+            swap_col_i32 = pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32)
+            swap_col_fp32 = pl.cast(swap_col_i32, target_type=pl.FP32)
+            swap_col = pl.col_expand_mul(swap_ones, swap_col_fp32)
+            swap_dup_i32 = pl.cast(pl.mul(swap_col, 0.5), target_type=pl.INT32, mode="trunc")
+            swap_dup_f = pl.cast(swap_dup_i32, target_type=pl.FP32)
+            swap_lane = pl.sub(swap_col, pl.mul(swap_dup_f, 2.0))
+            swap_index = pl.cast(pl.sub(pl.add(swap_col, 1.0), pl.mul(swap_lane, 2.0)), target_type=pl.INT32)
+            rope_dup_idx = pl.cast(pl.mul(swap_col_fp32, 0.5), target_type=pl.INT32, mode="trunc")
+            rope_dup_fp32 = pl.cast(rope_dup_idx, target_type=pl.FP32)
+            rope_pair_lane = pl.sub(swap_col_fp32, pl.mul(rope_dup_fp32, 2.0))
+            rope_sign_row = pl.sub(pl.mul(rope_pair_lane, 2.0), 1.0)
+            swap_head_index = pl.arange(0, [1, ROPE_ROW_TILE], dtype=pl.INT32)
+            swap_head_offsets = pl.reshape(pl.mul(swap_head_index, ROPE_HEAD_DIM), [ROPE_ROW_TILE, 1])
+            swap_index_global = pl.row_expand_add(swap_index, swap_head_offsets)
+            swap_flat_index = pl.reshape(swap_index_global, [1, ROPE_ROW_TILE * ROPE_HEAD_DIM])
+            # Four-token groups.
+            for token_idx_blk in pl.range(idx_rope_worker, idx_rope_items, idx_rope_workers):
+                for token_idx_g in pl.range(4):
+                    token_idx = token_idx_blk * 4 + token_idx_g
+                    r0 = token_idx * ROPE_ROW_TILE
+                    qr_nope_fp32 = qr_proj_flat[r0 : r0 + ROPE_ROW_TILE, 0 : IDX_NOPE_HEAD_DIM]
+                    qr_nope = pl.cast(qr_nope_fp32, target_type=pl.BF16, mode="rint")
+                    qr_rope = qr_proj_flat[r0 : r0 + ROPE_ROW_TILE, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM]
+                    qr_rope_flat = pl.reshape(qr_rope, [1, ROPE_ROW_TILE * ROPE_HEAD_DIM])
+                    qr_swapped_flat = pl.gather(qr_rope_flat, dim=-1, index=swap_flat_index)
+                    qr_swapped = pl.reshape(qr_swapped_flat, [ROPE_ROW_TILE, ROPE_HEAD_DIM])
+                    rope_cos_full = pl.cast(cos[token_idx : token_idx + 1, :], target_type=pl.FP32)
+                    rope_sin_full = pl.cast(sin[token_idx : token_idx + 1, :], target_type=pl.FP32)
+                    rope_cos_half = rope_cos_full[:, 0 : ROPE_HEAD_DIM // 2]
+                    rope_sin_half = rope_sin_full[:, 0 : ROPE_HEAD_DIM // 2]
+                    rope_cos_tile = pl.gather(rope_cos_half, dim=-1, index=rope_dup_idx)
+                    rope_sin_interleaved = pl.gather(rope_sin_half, dim=-1, index=rope_dup_idx)
+                    rope_sin_tile = pl.mul(rope_sin_interleaved, rope_sign_row)
+                    rope_main = pl.col_expand_mul(qr_rope, rope_cos_tile)
+                    rope_swapped = pl.col_expand_mul(qr_swapped, rope_sin_tile)
+                    rope_rot = pl.add(rope_main, rope_swapped)
+                    rope_bf16 = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
+                    qr_bf16[r0 : r0 + ROPE_ROW_TILE, :] = pl.concat(qr_nope, rope_bf16)
 
-    # Select the model-configured TopK=512 with the incore tile path used by
-    # #1080.  The old orchestration-level 4096 merge lowers to an illegal
-    # vector configuration on A2/A3.
-    topk_pairs = pl.create_tensor([T, CP_INDEXER_PAIR_WIDTH], dtype=pl.FP32)
-    with pl.spmd(T, name_hint="prefill_cp_idx_topk", deps=[score_tid, prior_dep]) as _topk_tid:
-        _cp_topk512_query(score_wide, position_ids, num_tokens, candidate_rows, topk_pairs, cmp_topk_indices)
+        qh_acc_gm = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.FP32)
+        hadamard_items = (T * IDX_N_HEADS // QH_MM_TILE) // 16
+        hadamard_workers = pl.min(hadamard_items, 2)
+        for hadamard_worker in pl.spmd(hadamard_workers, name_hint="prefill_cp_idx_qr_hadamard", allow_early_resolve=True):
+            hadamard_tile = pl.load(hadamard, [0, 0], [IDX_HEAD_DIM, IDX_HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+            for mm_idx_blk in pl.range(hadamard_worker, hadamard_items, hadamard_workers):
+                # Keep the original 16-tile body and each GEMM's accumulation.
+                for mm_idx_g in pl.range(16):
+                    mm_idx = mm_idx_blk * 16 + mm_idx_g
+                    r0 = mm_idx * QH_MM_TILE
+                    qr_bf16_tile = pl.load(qr_bf16, [r0, 0], [QH_MM_TILE, IDX_HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+                    qh_acc = pl.matmul(qr_bf16_tile, hadamard_tile, out_dtype=pl.FP32)
+                    pl.store(qh_acc, [r0, 0], qh_acc_gm)
 
-    return cmp_topk_indices, _topk_tid
+        qr_hadamard_i8 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
+        # QuantLightningIndexer consumes per-token-head query scales as FP16.
+        qr_hadamard_scale_dq = pl.create_tensor([T * IDX_N_HEADS, 1], dtype=pl.FP16)
+        for quant_idx_blk in pl.spmd((T * IDX_N_HEADS // QH_QUANT_ROW_TILE) // 16, name_hint="prefill_cp_idx_qr_quant", allow_early_resolve=True):
+            # Sixteen quantization tiles per block.
+            for quant_idx_g in pl.range(16):
+                quant_idx = quant_idx_blk * 16 + quant_idx_g
+                r0 = quant_idx * QH_QUANT_ROW_TILE
+                qh_amax = pl.full([1, QH_QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+                qh_tile = qh_acc_gm[r0 : r0 + QH_QUANT_ROW_TILE, :]
+                qh_neg = pl.neg(qh_tile)
+                qh_abs = pl.maximum(qh_tile, qh_neg)
+                qh_row_max_column = pl.row_max(qh_abs)
+                qh_row_max = pl.reshape(qh_row_max_column, [1, QH_QUANT_ROW_TILE])
+                qh_amax = pl.maximum(qh_amax, qh_row_max)
+                scale_max = pl.full([1, QH_QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
+                scale_quant_row = pl.div(scale_max, qh_amax)
+                qr_scale_row = pl.recip(scale_quant_row)
+                qr_scale_tile = pl.reshape(qr_scale_row, [QH_QUANT_ROW_TILE, 1])
+                qr_scale_fp16 = pl.cast(qr_scale_tile, target_type=pl.FP16, mode="rint")
+                qr_hadamard_scale_dq[r0 : r0 + QH_QUANT_ROW_TILE, :] = qr_scale_fp16
+                scale_quant = pl.reshape(scale_quant_row, [QH_QUANT_ROW_TILE, 1])
+                qh_scaled = pl.row_expand_mul(qh_tile, scale_quant)
+                qh_i32 = pl.cast(qh_scaled, target_type=pl.INT32, mode="rint")
+                qh_half = pl.cast(qh_i32, target_type=pl.FP16, mode="round")
+                qh_i8 = pl.cast(qh_half, target_type=pl.INT8, mode="trunc")
+                qr_hadamard_i8[r0 : r0 + QH_QUANT_ROW_TILE, :] = qh_i8
+
+        # Project per-head weights. Recipes rounds this LI input to FP16.
+        weights = pl.create_tensor([T, IDX_N_HEADS], dtype=pl.FP16)
+        for idx in pl.spmd(T // CP_WEIGHTS_ROW_TILE, name_hint="prefill_cp_idx_weights_proj"):
+            wrow0 = idx * CP_WEIGHTS_ROW_TILE
+            weights_acc = pl.create_tensor([CP_WEIGHTS_ROW_TILE, IDX_N_HEADS], dtype=pl.FP32)
+            for db in pl.pipeline(0, D // CP_WEIGHTS_K_TILE, stage=2):
+                d0 = db * CP_WEIGHTS_K_TILE
+                x_tile = x[wrow0 : wrow0 + CP_WEIGHTS_ROW_TILE, d0 : d0 + CP_WEIGHTS_K_TILE]
+                wp_tile = weights_proj[d0 : d0 + CP_WEIGHTS_K_TILE, :]
+                weights_acc = pl.matmul_acc(weights_acc, x_tile, wp_tile, init_cond=(d0 == 0))
+            weights[wrow0 : wrow0 + CP_WEIGHTS_ROW_TILE, :] = pl.cast(
+                pl.mul(weights_acc, WEIGHTS_SCALE),
+                target_type=pl.FP16,
+                mode="rint",
+            )
+
+        # Score paged INT8 cache rows.
+        kv_cache_i8_flat = pl.reshape(idx_kv_cache, [idx_block_num * BLOCK_SIZE, IDX_HEAD_DIM])
+        kv_scale_flat = pl.reshape(idx_kv_scale, [idx_block_num * BLOCK_SIZE, 1])
+        # Page 0 is reserved and never scored; the rest are candidate rows.
+        score_cols = ((candidate_rows + CP_INDEXER_LEAF_LEN - 1) // CP_INDEXER_LEAF_LEN) * CP_INDEXER_LEAF_LEN
+        score_wide = pl.create_tensor([T, score_cols], dtype=pl.FP32)
+        # Score writes cover the valid region loaded by TopK.
+        with pl.spmd(T // CP_SCORE_TOKEN_TILE, name_hint="prefill_cp_idx_score", deps=[prior_dep]) as score_tid:
+            score_idx = pl.tile.get_block_idx()
+            token0 = score_idx * CP_SCORE_TOKEN_TILE
+            last_pos = pl.read(position_ids, [num_tokens - 1])
+            visible_limit = pl.min((last_pos + 1) // COMPRESS_RATIO, candidate_rows)
+            for cb in pl.range((visible_limit + CP_SCORE_CACHE_TILE - 1) // CP_SCORE_CACHE_TILE):
+                cache0 = cb * CP_SCORE_CACHE_TILE
+                logical_block = cache0 // BLOCK_SIZE
+                page_offset = cache0 % BLOCK_SIZE
+                if visible_limit > cache0 and logical_block < IDX_CACHE_MAX_BLOCKS:
+                    physical_block_raw = pl.cast(logical_block + 1, pl.INT32)
+                    # The CP temporary root never stores candidate data in page 0.
+                    if physical_block_raw > 0 and physical_block_raw < idx_block_num:
+                        kv_row0 = (pl.cast(physical_block_raw, pl.INDEX) * BLOCK_SIZE + page_offset)
+                        kv_q_i8_full = kv_cache_i8_flat[kv_row0 : kv_row0 + CP_SCORE_CACHE_TILE, 0:IDX_HEAD_DIM]
+                        kv_cache_scale_dq = pl.cast(
+                            kv_scale_flat[kv_row0 : kv_row0 + CP_SCORE_CACHE_TILE, :],
+                            target_type=pl.FP32,
+                            mode="none",
+                        )
+                        for token_offset in pl.range(CP_SCORE_TOKEN_TILE):
+                            t = token0 + token_offset
+                            if t < num_tokens:
+                                q_s0 = t * IDX_N_HEADS
+                                qr_hadamard_i8_tile = qr_hadamard_i8[q_s0 : q_s0 + IDX_N_HEADS, 0:IDX_HEAD_DIM]
+                                score_acc_s = pl.matmul(kv_q_i8_full, qr_hadamard_i8_tile, out_dtype=pl.INT32, b_trans=True)
+                                qh_scale_source = pl.cast(
+                                    qr_hadamard_scale_dq[q_s0 : q_s0 + IDX_N_HEADS, :],
+                                    target_type=pl.FP32,
+                                    mode="none",
+                                )
+                                qh_scale_s = pl.reshape(qh_scale_source, [1, IDX_N_HEADS])
+                                score_acc_fp32 = pl.cast(score_acc_s, target_type=pl.FP32, mode="none")
+                                score_row_scaled = pl.row_expand_mul(score_acc_fp32, kv_cache_scale_dq)
+                                score_scaled = pl.col_expand_mul(score_row_scaled, qh_scale_s)
+                                score_zero = pl.mul(score_scaled, 0.0)
+                                relu_score_s = pl.maximum(score_scaled, score_zero)
+                                weight_row = pl.cast(weights[t : t + 1, :], target_type=pl.FP32, mode="none")
+                                weighted_heads = pl.col_expand_mul(relu_score_s, weight_row)
+                                weighted_sum = pl.row_sum(weighted_heads)
+                                weighted_score_s = pl.reshape(weighted_sum, [1, CP_SCORE_CACHE_TILE])
+                                pos = pl.read(position_ids, [t])
+                                visible_t = pl.min((pos + 1) // COMPRESS_RATIO, candidate_rows)
+                                if visible_t > cache0:
+                                    valid_len_t = pl.min(CP_SCORE_CACHE_TILE, visible_t - cache0)
+                                else:
+                                    valid_len_t = 0
+                                weighted_visible = pl.set_validshape(weighted_score_s, 1, valid_len_t)
+                                weighted_valid_t = pl.fillpad(weighted_visible, pad_value=pl.PadValue.min)
+                                neg_inf_tile = pl.full([1, CP_SCORE_CACHE_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
+                                weighted_valid_t = pl.maximum(weighted_valid_t, neg_inf_tile)
+                                score_wide[t : t + 1, cache0 : cache0 + CP_SCORE_CACHE_TILE] = weighted_valid_t
+
+        # Select the model-configured TopK=512 with the incore tile path used by
+        # #1080.  The old orchestration-level 4096 merge lowers to an illegal
+        # vector configuration on A2/A3.
+        topk_pairs = pl.create_tensor([T, CP_INDEXER_PAIR_WIDTH], dtype=pl.FP32)
+        topk_workers = T // TOPK_TOKEN_TILE
+        with pl.spmd(topk_workers, name_hint="prefill_cp_idx_topk", deps=[score_tid, prior_dep]) as _topk_tid:
+            _cp_topk512_query(score_wide, position_ids, num_tokens, candidate_rows, topk_pairs, cmp_topk_indices)
+
+        completion[0] = _topk_tid
+
+    return cmp_topk_indices, completion[0]
 
 
 def topk_prefix_contract_error(topk_indices, position_ids, num_tokens):
@@ -671,7 +712,7 @@ def topk_prefix_contract_error(topk_indices, position_ids, num_tokens):
 
 
 def golden_prefill_indexer_core(tensors):
-    from utils import int8_quant_per_row
+    from utils import int8_quant_per_row, unpack_nz
     import torch
 
     compressor_tensors = {
@@ -717,7 +758,7 @@ def golden_prefill_indexer_core(tensors):
     # Q: int8 qr x int8 wq_b -> dequant -> per-token interleaved RoPE -> Hadamard rotation.
     qr = tensors["qr"]
     qr_scale = tensors["qr_scale"].float()
-    wq_b = tensors["wq_b"]
+    wq_b = unpack_nz(tensors["wq_b"])
     wq_b_scale = tensors["wq_b_scale"].float()
     hadamard = tensors["hadamard"].float()
     cos = tensors["cos"].float().view(T, 1, -1)
@@ -731,7 +772,7 @@ def golden_prefill_indexer_core(tensors):
     q = torch.cat([q[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
     q = q.to(torch.bfloat16).float() @ hadamard
 
-    weights = (tensors["x"].float() @ tensors["weights_proj"].float()) * WEIGHTS_SCALE  # [T, heads]
+    weights = (tensors["x"].float() @ unpack_nz(tensors["weights_proj"]).float()) * WEIGHTS_SCALE  # [T, heads]
 
     # C8: the compressor already stored INT8 KV + a per-position dequant scale. Gather both in
     # compressed-position order through the paged block table (no score-time re-quant).
@@ -782,9 +823,9 @@ def prefill_indexer_test(
     x: pl.Tensor[[T, D], pl.BF16],
     qr: pl.Tensor[[T, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T, 1], pl.FP32],
-    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
+    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, pl.NZ],
     cos: pl.Tensor[[T, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[T, ROPE_HEAD_DIM // 2], pl.FP32],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
@@ -855,7 +896,7 @@ def gen_shared_weight(shape, dequant_std, chan_cv):
 
 
 def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
-    from utils import int8_quant_per_row
+    from utils import int8_quant_per_row, pack_nz
     import torch
     from golden import ScalarSpec, TensorSpec
     from utils import build_rope_tables, materialize_half_rope_tables
@@ -989,7 +1030,7 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
     # idx wq_b uses the real MXFP8 grid (not a benign randn int8); qr is per-row int8 like the
     # runtime W8A8C16 activation path.
     wq_b_i8_T, wq_b_scale = gen_shared_weight((IDX_N_HEADS * IDX_HEAD_DIM, Q_LORA), dequant_std=0.108, chan_cv=0.56)
-    wq_b_i8 = wq_b_i8_T.t().contiguous()
+    wq_b_i8 = pack_nz(wq_b_i8_T.t().contiguous())
     qr_i8, qr_scale = int8_quant_per_row(torch.rand(T, Q_LORA))
 
     return [
@@ -998,7 +1039,7 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
         TensorSpec("qr_scale", [T, 1], torch.float32, init_value=lambda: qr_scale),
         TensorSpec("wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
         TensorSpec("wq_b_scale", [IDX_N_HEADS * IDX_HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
-        TensorSpec("weights_proj", [D, IDX_N_HEADS], torch.bfloat16, init_value=init_weights_proj),
+        TensorSpec("weights_proj", [D, IDX_N_HEADS], torch.bfloat16, init_value=lambda: pack_nz(init_weights_proj().to(torch.bfloat16))),
         TensorSpec("cos", [T, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
         TensorSpec("sin", [T, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
@@ -1028,8 +1069,8 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run, topk_pair_compare
 
     parser = argparse.ArgumentParser(description="Standalone token-major DeepSeek V4 prefill indexer validation.")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument(
         "--compile-only",
@@ -1072,7 +1113,8 @@ if __name__ == "__main__":
         golden_fn=golden_prefill_indexer,
         config=dict(
             dump_passes=args.dump_passes,
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),

@@ -22,7 +22,6 @@ from paged_attention_cce import (
     KV_HIDDEN,
     NUM_HEADS,
     NUM_KV_HEADS,
-    SUPPORTED_PLATFORMS,
     qwen_decode_attention_cache_offset_test,
     qwen_decode_attention_cce,
 )
@@ -106,12 +105,8 @@ def golden_attention(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-p",
-        "--platform",
-        default="a2a3",
-        choices=SUPPORTED_PLATFORMS,
-    )
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--batch", type=int, default=1, choices=[1, BATCH_PAD])
     parser.add_argument("--context-len", type=int, default=3338)
@@ -164,11 +159,12 @@ def main() -> None:
         specs=specs,
         golden_fn=golden_fn,
         config=dict(
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),
-        compile_only=args.compile_only or args.platform.endswith("sim"),
+        compile_only=args.compile_only or args.execution_mode,
         rtol=5e-3,
         atol=2e-2,
         save_data=False,

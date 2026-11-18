@@ -23,7 +23,8 @@ below the presets.
 | Decode context length | up to 1,048,576 positions, paged in **32-token** pages (`max_position_embeddings`, `BLOCK_SIZE`) |
 | Prefill shape | one packed request stream per CP group, `PREFILL_SEQ = 512` tokens per dispatch; longer prompts arrive as chunks against a resident prefix |
 | Platform | Ascend A2/A3, single node |
-| Tensor parallelism | `--tp 1/2/4`; the deployment point is TP 4 — the grouped output projection and the LM head are vocab/group-sharded over it |
+| Attention tensor parallelism | `--tp 1/2/4`; the deployment point is TP 4, including the grouped output projection and DSA-CP token split |
+| LM-head tensor parallelism | `--lm-head-tp 1/2/4/8/16`, defaulting to `--tp`; independent vocabulary shards for both target and Markov sampling |
 | Context parallelism | DSA-CP reuses that same physical TP group: each rank owns a slice of the step's token rows, and the attention KV stream is replicated rank-major across the group |
 | Expert parallelism | `--ep 2/4/8/16`; the deployment point is EP 16, and each rank holds `256 / ep` routed experts |
 | Data parallelism | `DP = 4` groups per node, so the deployment point is 16 cards (`TP * DP`) |
@@ -71,6 +72,15 @@ decode_fwd
 
 `decode_fwd` is the plain forward: it takes its token ids, positions, and
 sequence lengths from the host and carries no persistent-state coupling.
+Both the prefill and decode forwards require a rank-sharded `grammar_mask`
+input for LM-head sampling. Its `int16` shape per rank is
+`[MAX_LOGIT_ROWS, VOCAB // 808, 64]`: each 808-token segment stores allowed
+tokens in consecutive words, with token offset `i` in bit `i % 16` of word
+`i // 16` (including signed bit 15). The last word of segment zero is a
+header: `-1` selects unconstrained argmax, while `0` selects masked argmax.
+An unconstrained row can fill the entire mask with `-1`; a constrained row
+must have at least one allowed vocabulary token and set its header to `0`.
+
 Speculative decoding brackets it with two device-state stages that
 [decode_prepare.py](../../../models/deepseek_v4_flash_dspark/decode_prepare.py)
 exports, and the fused DSpark L2 in
@@ -82,6 +92,11 @@ prepare_target_group_from_device_state   late-bind the step from request slots
 decode_fwd_inline                        the forward above, unchanged
 accept_target_into_device_state          accept the longest matching prefix
 ```
+
+The fused decode also requires rank-sharded `valid_draft_counts` with shape
+`[DECODE_BATCH]` per rank. For each request, preparation and acceptance cap
+the stored draft count by `max(valid_draft_counts[request], 0)`, so invalid
+proposals cannot enter the target or accepted prefix.
 
 Every `decode_{swa,csa,hca}` entry has a `_tp1` twin: the single-rank form runs
 the layer without the CP gather and the TP publish, and is what the golden
@@ -97,6 +112,46 @@ per-stage scopes, `prefill_{swa,hca,csa}` in place of the decode
 orchestrations, and the same `hc_head → rms_norm → lm_head` tail. Prompt
 sequence lengths that do not divide the CP group are padded rather than
 rejected, so one program serves an arbitrary chunk against a resident prefix.
+
+Prefill also takes `state_checkpoint_ends`, an INT32
+`[requests, checkpoint_tiles, 6]` tensor (rank-stacked in L3).
+Checkpoint tiles follow each request's own 512-token projection tiles. Each
+ordered row names at most four periodic boundaries on the common 128-token
+alignment plus two replay/shared boundaries; unused entries are zero. The
+caller chooses the retention interval independently of the Prefill chunk.
+A boundary is placed in the tile where it ends. Any earlier fragment of its
+history is covered by the preceding tile's normal tail, whose extent is at
+least the required checkpoint history. Empty rows skip extra publication.
+HCA and both CSA compressors publish the union of the selected history windows
+from existing tile projections, in addition to their normal terminal tails.
+Intermediate state positions are not all materialized and must not be indexed
+as immutable Prefix Cache solely because their tokens have been computed.
+
+Prefill state read tables and write slot mappings may name different physical
+pages. The read tables preserve the entry history before the request's first
+position; earlier tiles in the same forward are read through the existing
+write slot mappings, and the current tile uses projection scratch. Callers
+must retain entry pages until the forward settles and keep both views stable
+during execution. This permits compact state rings without copying history or
+changing the Prefill tensor-argument list. The three compressors' references
+accept both shared and distinct read/write views.
+
+Checkpoint publication and the normal tile tail must not assign different
+logical positions to the same physical row. Published checkpoint pages remain
+immutable until the caller drops their references; later tiles and forwards
+must use other pages or the caller's existing copy-on-write mechanism.
+Increasing the read view alone does not protect checkpoint destination pages.
+
+The compressor fixture builders accept `checkpoint_end=0` by default. A
+nonzero boundary, or a tuple of boundaries with at most six ending per tile, allocates non-aliasing
+entry and publication rows covering that bounded fixture. A partial entry page retains its history rows and accepts
+new rows in place, keeping the checkpoint representable by one page table.
+The Host references reject missing or aliased state.
+The three standalone compressor validations run the original zero-boundary
+case plus checkpoints inside a tile and across a tile boundary, including a
+non-aligned start. HCA/CSA CP builders forward `checkpoint_end`; their ragged
+builders accept per-request `checkpoint_ends`. These checks and extra fixture
+pages are validation-only and add no scan or synchronization to model execution.
 
 ### Attention under DSA-CP
 
@@ -194,12 +249,31 @@ its shapes do not move with `--tp`; only the DSA-CP group width does.
 [decode_fwd_dspark.py](../../../models/deepseek_v4_flash_dspark/decode_fwd_dspark.py)
 composes the whole recurrent step — prepare, target forward, accept, drafter,
 Markov sampler, state commit — into one L2, and runs it end to end without a
-golden.
+golden. The fused step and three-layer drafter accept `--tp 1/2/4`. At TP1,
+each EP rank owns an independent attention/cache group; EP MoE communication
+still spans the selected world. The per-rank 128-token MoE slab and maximum
+16-request drafter batch do not grow when TP decreases.
+
+The fused target takes zero-copy views of the padded metadata: compressor
+tables and group RoPE cover `TP * 16` requests and `TP * 128` tokens, while
+attention cache tables and sequence lengths cover 16 rank-local requests.
+Each request therefore retains the K7 width of eight tokens for TP1/2/4;
+the outer metadata ABI and resident cache allocations do not change.
+
+For attention TP1 / EP16, `--lm-head-tp 4` keeps the head's BF16 NZ weight
+vocabulary-sharded without changing the attention/cache layout. As in MTP,
+rank `r` joins head group `r // head_tp`, owns shard `r % head_tp`, and receives
+its own full-vocabulary logits. Idle attention owners still participate in
+the head collective. Target, drafter/Markov and bootstrap share this grouping;
+the draft attention and request-state publication retain the attention TP.
+The head TP must divide the model world. A full-vocabulary TP1 head remains
+subject to the toolchain's NZ GM burst-gap limit; the independent TP4 head
+avoids that layout without changing the SDK or using ND weights.
 
 ## Status
 
-Under development, and not wired into `pypto-serving`. Every executable file
-carries its own Golden Harness fixture; the
+These entries validate library kernels, not a serving deployment. Every executable
+file carries its own Golden Harness fixture; the
 `decode_fwd` / `prefill_fwd` / `decode_layer` / `prefill_layer` compositions and
 the distributed communication oracles are device-only and do not run on a
 simulator. Most kernels are a plain function exposed twice — as the
@@ -212,9 +286,11 @@ python models/deepseek_v4_flash_dspark/decode_layer.py -p a2a3 --tp 2 --ep 2 -d 
 python models/deepseek_v4_flash_dspark/decode_fwd.py -p a2a3 --tp 2 --ep 2 -d 0,1
 python models/deepseek_v4_flash_dspark/dspark_drafter.py -p a2a3 --tp 2 --ep 2 -d 0,1
 python models/deepseek_v4_flash_dspark/decode_fwd_dspark.py -p a2a3 --tp 2 --ep 2 -d 0,1
+# Independent attention TP1 and LM-head TP4, with EP16.
+python models/deepseek_v4_flash_dspark/decode_fwd_dspark.py -p a2a3 --tp 1 --lm-head-tp 4 --ep 16 -d 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 ```
 
-`--tp` and `--ep` are read at import time, because the shapes they derive
+`--tp`, `--lm-head-tp` and `--ep` are read at import time, because the shapes they derive
 freeze before the kernels are traced; passing a value the module did not import
 with is rejected rather than silently ignored.
 

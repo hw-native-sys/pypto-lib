@@ -28,8 +28,8 @@ one above it.
 | Advanced | [Top-k](../../examples/advanced/topk.py) | Specialized instructions — `sort32` and chained `mrgsort`, mask gather, tie-aware validation |
 | Advanced | [All-reduce](../../examples/advanced/allreduce.py) | L3 distributed execution: window buffers, remote tile loads, notify/wait |
 
-All 11 declare `a2a3`, `a2a3sim`, `a5`, and `a5sim` in their `--platform`
-choices. An accepted `-p a5` is not by itself evidence that the example has been
+All 11 declare `a2a3` and `a5` in their `--platform`
+choices; add `--sim` for simulator execution. An accepted `-p a5` is not by itself evidence that the example has been
 validated on an A5 device.
 
 ## Running an example
@@ -37,7 +37,7 @@ validated on an A5 device.
 Use a simulator for the quickest functional check, or a real device by ID:
 
 ```bash
-python examples/beginner/hello_world.py -p a2a3sim
+python examples/beginner/hello_world.py -p a2a3 --sim
 python examples/intermediate/softmax.py -p a2a3 -d 0
 ```
 

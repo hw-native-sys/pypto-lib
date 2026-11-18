@@ -11,7 +11,7 @@ activations for both decode and prefill attention paths."""
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, TP, PREFILL_BATCH, PREFILL_SEQ
+from config import FLASH as M, PREFILL_BATCH, PREFILL_SEQ
 
 
 # Dynamic shape variables.
@@ -27,7 +27,6 @@ EPS = M.rms_norm_eps
 D_TILE = 128
 T_TILE = 8
 assert D % D_TILE == 0, "D must be divisible by D_TILE"
-assert (DECODE_BATCH // TP * DECODE_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
 
 
@@ -138,6 +137,23 @@ def _rms_norm_tail_tile(
         pl.store(x_normed_valid, [tg, apply_d0], x_normed)
 
 
+@pl.jit.incore
+def rms_norm_spmd(
+    x_normed: pl.Tensor[[T_DYN, D], pl.BF16],
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    norm_w: pl.Tensor[[D], pl.BF16],
+):
+    """Normalize one token tile into the caller-owned output."""
+    t_dim = pl.tensor.dim(x, 0)
+    tg_idx = pl.tile.get_block_idx()
+    tg = tg_idx * T_TILE
+    valid_rows = pl.min(T_TILE, t_dim - tg)
+    if valid_rows == T_TILE:
+        _rms_norm_full_tile(x, norm_w, x_normed)
+    else:
+        _rms_norm_tail_tile(x, norm_w, x_normed)
+
+
 @pl.jit.inline
 def rms_norm(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -145,32 +161,11 @@ def rms_norm(
     x_normed: pl.Tensor[[T_DYN, D], pl.BF16],
 ):
     t_dim = pl.tensor.dim(x, 0)
-    # Capture form (not `for ... in pl.spmd`): callers need the producer TaskId to
-    # hang a `pl.system.task_dummy` barrier off it and defer non-critical consumers.
     token_tiles = (t_dim + T_TILE - 1) // T_TILE
     with pl.spmd(token_tiles, name_hint="rms_norm", allow_early_resolve=True) as rms_tid:
-        tg_idx = pl.tile.get_block_idx()
-        tg = tg_idx * T_TILE
-        valid_rows = pl.min(T_TILE, t_dim - tg)
-        if valid_rows == T_TILE:
-            _rms_norm_full_tile(x, norm_w, x_normed)
-        else:
-            _rms_norm_tail_tile(x, norm_w, x_normed)
+        rms_norm_spmd(x_normed, x, norm_w)
 
     return rms_tid
-
-
-@pl.jit
-def rms_norm_test(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    norm_w: pl.Tensor[[D], pl.BF16],
-    x_normed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
-):
-    x.bind_dynamic(0, T_DYN)
-    x_normed.bind_dynamic(0, T_DYN)
-
-    rms_norm(x, norm_w, x_normed)
-    return x_normed
 
 
 def golden_rms_norm(x, norm_w):
@@ -180,77 +175,3 @@ def golden_rms_norm(x, norm_w):
     norm_w = norm_w.float()
     inv = torch.rsqrt(x.square().mean(-1, keepdim=True) + EPS)
     return (x * inv * norm_w).to(torch.bfloat16)
-
-
-def golden_rms_norm_test(tensors):
-    tensors["x_normed"][:] = golden_rms_norm(tensors["x"], tensors["norm_w"])
-
-
-def build_tensor_specs(B, S):
-    import torch
-    from golden import TensorSpec
-
-    T = B * S
-
-    def init_x():
-        return torch.randn(T, D) - 0.5
-
-    def init_norm_w():
-        return torch.randn(D) * 0.1 + 1.0
-
-    return [
-        TensorSpec("x", [T, D], torch.bfloat16, init_value=init_x),
-        TensorSpec("norm_w", [D], torch.bfloat16, init_value=init_norm_w),
-        TensorSpec("x_normed", [T, D], torch.bfloat16),
-    ]
-
-
-if __name__ == "__main__":
-    import argparse
-    from golden import ratio_allclose, run
-
-    MODES = {
-        "decode":  (DECODE_BATCH // TP, DECODE_SEQ),
-        "prefill": (PREFILL_BATCH, PREFILL_SEQ),
-    }
-
-    parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 attention RMSNorm validation.")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--mode", choices=["decode", "prefill", "all"], default="all",
-                        help="Use decode or prefill batch sizes, or 'all' to test both.")
-    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
-    parser.add_argument("--runtime-dir", type=str, default=None)
-    parser.add_argument("--golden-data", type=str, default=None)
-    parser.add_argument("--compile-only", action="store_true", default=False)
-    parser.add_argument("--dump-passes", action="store_true", default=False)
-    args = parser.parse_args()
-
-    modes_to_run = list(MODES.keys()) if args.mode == "all" else [args.mode]
-
-    for mode_name in modes_to_run:
-        B, S = MODES[mode_name]
-        print(f"--- rms_norm_test {mode_name}: B={B}, S={S} ---")
-        result = run(
-            fn=rms_norm_test,
-            specs=build_tensor_specs(B, S),
-            golden_fn=golden_rms_norm_test,
-            runtime_dir=args.runtime_dir,
-            golden_data=args.golden_data,
-            config=dict(
-                dump_passes=args.dump_passes,
-                platform=args.platform,
-                device_id=args.device,
-                enable_chip_swimlane=args.enable_chip_swimlane,
-            ),
-            rtol=5e-3,
-            atol=5e-3,
-            compare_fn={
-                "x_normed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-            },
-            compile_only=args.compile_only,
-        )
-        if not result.passed:
-            if result.error:
-                print(result.error)
-            raise SystemExit(1)

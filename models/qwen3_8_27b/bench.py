@@ -9,9 +9,10 @@
 # ci: no-sim
 """Latency benchmark for the six GDN stages, and the block's other kernels on request.
 
-Times each stage on device over a sweep of sequence lengths and head counts, in
-one process: one compile and one timed loop per (stage, shape), no re-runs for
-extra samples. The reported number is the mean of the per-round Effective window
+Times each stage on device over a sweep of sequence lengths, in one process: one
+compile and one timed loop per (stage, T), no re-runs for extra samples. The
+head counts are the model's own -- the kernels read them from `config.py` and
+take only the token count as a shape. The reported number is the mean of the per-round Effective window
 -- the same field as the harness's `[RUN] effective_us ... mean=` line.
 
 Shapes follow the reference benchmark (`megagdn-pto/benchmarks/kernel/
@@ -45,20 +46,20 @@ import time
 STAGES = ("chunk_cumsum", "scaled_dot_kkt", "solve_tril", "wy_fast",
           "chunk_h", "chunk_o")
 # The block's other kernels (Q4), off by default: `--stages gated_rmsnorm`. Their
-# shape is (t, h) only, and their output names come from the module's OUTPUTS.
-# In the order the block runs them.
+# shape is (t, h) only. In the order the block runs them.
 BLOCK_KERNELS = ("quant_x", "in_proj_qkv", "in_proj_z", "in_proj_ab", "short_conv",
                  "qk_norm_gate", "gated_rmsnorm", "out_proj")
 # The whole block as one program, for the composed number against the sum of the
 # parts above: `--stages gdn_block`. It carries its own run config.
 COMPOSED = ("gdn_block",)
 
-from config import GDN_TILING, QWEN3_8_27B
+from chunk_cumsum import CHUNK_TILE
+from config import QWEN3_8_27B
 
 D = QWEN3_8_27B.linear_value_head_dim
-CHUNK = GDN_TILING.chunk
-HEADS = (QWEN3_8_27B.linear_num_value_heads,)
-QK_HEADS = QWEN3_8_27B.linear_num_key_heads
+CHUNK = CHUNK_TILE
+H = QWEN3_8_27B.linear_num_value_heads
+HG = QWEN3_8_27B.linear_num_key_heads
 # One shape by default so a bare run stays a few minutes; the reference
 # benchmark's own --l-seg list is 4096, 8192, 16384 and --seq-len takes it.
 SEQ_LENS = (8192,)
@@ -68,21 +69,17 @@ def _random_specs(stage, specs):
     """Same shapes and dtypes, values drawn at random instead of from the chain.
 
     Outputs are left alone. TensorSpec.direction is stamped from the compiled
-    kernel, so it cannot be read before the run; the names come from the stage
-    test's map instead.
+    kernel, so it cannot be read before the run; an output is the spec its
+    builder gave no `init_value`, which is how every entry here writes one.
     """
     import torch
 
-    from test_gdn_stages import OUTPUTS
-
-    outputs = OUTPUTS[stage] if stage in OUTPUTS else importlib.import_module(stage).OUTPUTS
     # Constants, not data: randomising these would have solve_tril contract against a
     # random matrix instead of -I, and leave the strict causal mask non-triangular.
-    leave_alone = set(outputs) | {"mask", "mask_strict", "tril", "eye",
-                                  "m_diag", "m_low"}
+    leave_alone = {"mask", "mask_strict", "tril", "eye", "m_diag", "m_low"}
     out = []
     for spec in specs:
-        if spec.name in leave_alone:
+        if spec.name in leave_alone or spec.init_value is None:
             out.append(spec)
             continue
         dtype = spec.dtype
@@ -95,31 +92,23 @@ def _random_specs(stage, specs):
     return out
 
 
-def bench_stage(stage: str, t: int, h: int, hg: int, platform: str, device: int,
+def bench_stage(stage: str, t: int, platform: str, device: int,
                 rounds: int, warmup: int, data: str) -> dict:
     """One compile and one timed loop. Returns the record for this (stage, shape)."""
     from golden import run
-
-    from test_gdn_stages import GQA_STAGES
 
     mod = importlib.import_module(stage)
     if stage in COMPOSED:
         fn = mod.build_kernel(t=t)
         specs = mod.build_tensor_specs(t=t)
     elif stage in BLOCK_KERNELS:
-        # the block's kernels do not share one signature -- the conv has no head
-        # axis at all -- so pass h only where it is accepted
-        import inspect
-
-        kw = dict(h=h) if "h" in inspect.signature(mod.build_kernel).parameters else {}
-        fn = mod.build_kernel(t=t, **kw)
-        spec_kw = {k: v for k, v in kw.items()
-                   if k in inspect.signature(mod.build_tensor_specs).parameters}
-        specs = mod.build_tensor_specs(t=t, **spec_kw)
+        fn = mod.build_kernel(t=t)
+        specs = mod.build_tensor_specs(t=t)
     else:
-        kernel_kw = dict(hg=hg) if stage in GQA_STAGES else {}
-        fn = mod.build_kernel(t=t, h=h, d=D, chunk=CHUNK, **kernel_kw)
-        specs = mod.build_tensor_specs(t=t, h=h, d=D, chunk=CHUNK, hg=hg)
+        # The six delta-rule kernels take their shape from the model config and the
+        # token count from a dynamic dimension, so the only thing to vary is T.
+        fn = getattr(mod, f"gdn_{stage}_test")
+        specs = mod.build_tensor_specs(t=t)
     if data == "random":
         specs = _random_specs(stage, specs)
 
@@ -127,11 +116,11 @@ def bench_stage(stage: str, t: int, h: int, hg: int, platform: str, device: int,
     result = run(
         fn=fn,
         specs=specs,
-        golden_fn=None,                       # timing only; correctness is test_gdn_stages
+        golden_fn=None,                       # timing only; correctness is each entry's own run
         config=(mod.run_config(platform, device) if stage in COMPOSED
                 else dict(platform=platform, device_id=device)),
     )
-    rec = dict(stage=stage, t=t, h=h, hg=hg, d=D, chunk=CHUNK, rounds=rounds,
+    rec = dict(stage=stage, t=t, h=H, hg=HG, d=D, chunk=CHUNK, rounds=rounds,
                warmup=warmup, data=data, ok=bool(result.passed),
                compile_and_run_s=round(time.time() - started, 2))
     samples = []
@@ -155,12 +144,6 @@ def main() -> int:
     parser.add_argument("--seq-len", type=str,
                         default=",".join(str(x) for x in SEQ_LENS),
                         help="comma-separated single-sequence token counts")
-    parser.add_argument("--heads", type=str,
-                        default=",".join(str(x) for x in HEADS),
-                        help="comma-separated value-head counts H")
-    parser.add_argument("--qk-heads", type=int, default=QK_HEADS,
-                        help="QK heads Hg; pass the same value as --heads for no "
-                             "grouping")
     parser.add_argument("--stages", type=str, default=",".join(STAGES))
     parser.add_argument("--rounds", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=5)
@@ -174,24 +157,18 @@ def main() -> int:
     os.environ["PYPTO_BENCH_WARMUP"] = str(args.warmup)
 
     seq_lens = [int(x) for x in args.seq_len.split(",") if x]
-    heads = [int(x) for x in args.heads.split(",") if x]
     stages = [s for s in args.stages.split(",") if s]
-    for h in heads:
-        if h % args.qk_heads:
-            parser.error(f"H={h} must be divisible by Hg={args.qk_heads}")
 
     records = []
     for t in seq_lens:
-        for h in heads:
-            hg = args.qk_heads
-            for stage in stages:
-                rec = bench_stage(stage, t, h, hg, args.platform, args.device,
-                                  args.rounds, args.warmup, args.data)
-                records.append(rec)
-                print(f"[bench] {stage:<16} T={t:<7} H={h:<3} Hg={hg:<3} "
-                      f"mean={rec.get('mean_us', float('nan'))} us "
-                      f"(median={rec.get('median_us')}, min={rec.get('min_us')}, "
-                      f"max={rec.get('max_us')})", flush=True)
+        for stage in stages:
+            rec = bench_stage(stage, t, args.platform, args.device,
+                              args.rounds, args.warmup, args.data)
+            records.append(rec)
+            print(f"[bench] {stage:<16} T={t:<7} H={H:<3} Hg={HG:<3} "
+                  f"mean={rec.get('mean_us', float('nan'))} us "
+                  f"(median={rec.get('median_us')}, min={rec.get('min_us')}, "
+                  f"max={rec.get('max_us')})", flush=True)
 
     print()
     print(format_table(records))

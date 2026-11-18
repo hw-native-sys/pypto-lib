@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Host-side torch helpers for the decode/prefill test fixtures.
 
-Paged-KV metadata lowering and RoPE/YaRN table generation.
+Paged-KV metadata lowering, RoPE/YaRN table generation and FRACTAL_NZ weight packing.
 """
 
 from __future__ import annotations
@@ -29,6 +29,32 @@ from config import (
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,
 )
+
+
+# --- FRACTAL_NZ weight packing. ---
+# A ``pl.NZ`` parameter asserts the GM bytes are already in pto-isa fractal order:
+# c0 contiguous elements form one 32-byte C0 line, 16 rows form one fractal, and
+# column blocks walk outermost. The fixture packs, the golden reads back logically.
+NZ_FRACTAL_ROWS = 16
+NZ_C0_BYTES = 32
+
+
+def pack_nz(logical: torch.Tensor) -> torch.Tensor:
+    """Reorder the trailing ``[R, C]`` of a row-major tensor into NZ fractal order."""
+    rows, cols = logical.shape[-2:]
+    c0 = NZ_C0_BYTES // logical.element_size()
+    assert rows % NZ_FRACTAL_ROWS == 0, f"NZ needs {NZ_FRACTAL_ROWS}-row fractals, got {rows} rows"
+    assert cols % c0 == 0, f"NZ needs whole C0 lines of {c0} elements, got {cols} cols"
+    blocked = logical.reshape(-1, rows // NZ_FRACTAL_ROWS, NZ_FRACTAL_ROWS, cols // c0, c0)
+    return blocked.permute(0, 3, 1, 2, 4).contiguous().reshape(logical.shape)
+
+
+def unpack_nz(packed: torch.Tensor) -> torch.Tensor:
+    """Restore NZ-ordered bytes to the logical row-major ``[..., R, C]`` tensor."""
+    rows, cols = packed.shape[-2:]
+    c0 = NZ_C0_BYTES // packed.element_size()
+    blocked = packed.reshape(-1, cols // c0, rows // NZ_FRACTAL_ROWS, NZ_FRACTAL_ROWS, c0)
+    return blocked.permute(0, 2, 3, 1, 4).contiguous().reshape(packed.shape)
 
 
 # --- Paged-KV metadata lowering. ---

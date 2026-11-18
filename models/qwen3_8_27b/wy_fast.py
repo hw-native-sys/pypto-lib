@@ -10,119 +10,151 @@
 
     A2[i, j] = A[i, j] * beta_j                 U = A2 @ V
     A1[i, j] = A[i, j] * beta_j * exp(g_j)      W = A1 @ K
-
-Scaling A's columns rather than V's and K's rows gives the same result and lets
-the cube read V and K straight from BSND. exp(g) underflows for late columns of a
-chunk, and those columns are negligible in the sum, so the scaled A columns go to
-zero as they do in the reference.
 """
 import pypto.language as pl
+import torch
 
-from config import GDN_TILING, QWEN3_8_27B
+from chunk_cumsum import cumsum_ref
+from config import QWEN3_8_27B
+from reference import REF_DTYPE, frob_ok, make_inputs, to_hT
+from scaled_dot_kkt import kkt_ref
+from solve_tril import CHUNK_TILE, solve_tril_ref
 
-# model shape
+# Dynamic shape variables.
+T_DYN = pl.dynamic("T_DYN")                 # tokens
+
+# model config
 H = QWEN3_8_27B.linear_num_value_heads      # value heads
 HG = QWEN3_8_27B.linear_num_key_heads       # QK heads; H // HG value heads share one
 D = QWEN3_8_27B.linear_value_head_dim       # head dimension
-CHUNK = GDN_TILING.chunk                    # chunk size in tokens, our tiling choice
+GRP = H // HG                               # value heads sharing one key head
+KEY_WIDTH = HG * D
+VAL_WIDTH = H * D
 
-# case shape
-T = 8192                # tokens (single sequence, B = 1)
+# tiling
+A_WIDTH = H * CHUNK_TILE
+
+# validation
+# One chunk, the cross-chunk recurrence, then eight chunks. The token count must be a
+# multiple of CHUNK_TILE.
+DEFAULT_CASES = (128, 256, 1024)
+BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 
-def build_kernel(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
-                 hg: int = HG, inline: bool = False):
-    """The stage kernel at one shape.
+def _gdn_wy_fast(
+    k: pl.Tensor[[T_DYN, HG, D], pl.FP16],
+    v: pl.Tensor[[T_DYN, H, D], pl.FP16],
+    a_in: pl.Tensor[[T_DYN, H, CHUNK_TILE], pl.FP16],
+    beta: pl.Tensor[[H, T_DYN], pl.FP32],
+    g_sum: pl.Tensor[[H, T_DYN], pl.FP32],
+    w_out: pl.Out[pl.Tensor[[T_DYN, H, D], pl.FP16]],
+    u_out: pl.Out[pl.Tensor[[T_DYN, H, D], pl.FP16]],
+):
+    """The token count must be a multiple of CHUNK_TILE; a block walks one whole chunk."""
+    k.bind_dynamic(0, T_DYN)
+    v.bind_dynamic(0, T_DYN)
+    a_in.bind_dynamic(0, T_DYN)
+    beta.bind_dynamic(1, T_DYN)
+    g_sum.bind_dynamic(1, T_DYN)
+    w_out.bind_dynamic(0, T_DYN)
+    u_out.bind_dynamic(0, T_DYN)
+    t_dim = pl.tensor.dim(k, 0)
+    k_flat = pl.reshape(k, [t_dim, KEY_WIDTH])
+    v_flat = pl.reshape(v, [t_dim, VAL_WIDTH])
+    a_flat = pl.reshape(a_in, [t_dim, A_WIDTH])
+    w_flat = pl.reshape(w_out, [t_dim, VAL_WIDTH])
+    u_flat = pl.reshape(u_out, [t_dim, VAL_WIDTH])
+    for c0 in pl.spmd(t_dim // CHUNK_TILE, name_hint="wy_fast"):
+        t0 = c0 * CHUNK_TILE
+        for hh in pl.range(H):
+            col = hh * CHUNK_TILE
+            a_chunk = a_flat[t0 : t0 + CHUNK_TILE, col : col + CHUNK_TILE]
+            beta_row = beta[hh : hh + 1, t0 : t0 + CHUNK_TILE]
+            g_row = g_sum[hh : hh + 1, t0 : t0 + CHUNK_TILE]
+            beta16 = pl.cast(beta_row, target_type=pl.FP16, mode="rint")
+            gate = pl.mul(pl.exp(g_row), beta_row)
+            gate16 = pl.cast(gate, target_type=pl.FP16, mode="rint")
+            a2 = pl.col_expand_mul(a_chunk, beta16)
+            a1 = pl.col_expand_mul(a_chunk, gate16)
+            d0 = hh * D
+            # GQA: W reads key head hh // GRP, U reads value head hh.
+            dg0 = (hh // GRP) * D
+            v_blk = v_flat[t0 : t0 + CHUNK_TILE, d0 : d0 + D]
+            k_blk = k_flat[t0 : t0 + CHUNK_TILE, dg0 : dg0 + D]
+            # FP16 operands promote to an FP16 result, accumulated FP32 in the cube
+            u_flat[t0 : t0 + CHUNK_TILE, d0 : d0 + D] = pl.matmul(a2, v_blk)
+            w_flat[t0 : t0 + CHUNK_TILE, d0 : d0 + D] = pl.matmul(a1, k_blk)
+    return w_out, u_out
 
-    `hg` is the number of QK heads, `h` the number of value heads; they differ
-    under GQA. Pass `hg=h` for an ungrouped shape. `inline` makes the kernel a
-    callee for `gdn_layer` rather than a program of its own.
-    """
+
+gdn_wy_fast = pl.jit.inline(_gdn_wy_fast)
+gdn_wy_fast_test = pl.jit(_gdn_wy_fast)
+
+
+def wy_fast_ref(
+    k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor,
+    a_inv: torch.Tensor, g_sum: torch.Tensor,
+    chunk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """S5: the WY representation. -> (W, U), both [T, H, D]."""
+    t, hg, d = k.shape
+    h = v.shape[1]
     grp = h // hg
-
-    @(pl.jit.inline if inline else pl.jit)
-    def gdn_wy_fast(
-        k: pl.Tensor[[t, hg, d], pl.FP16],
-        v: pl.Tensor[[t, h, d], pl.FP16],
-        a_in: pl.Tensor[[t, h, chunk], pl.FP16],
-        beta: pl.Tensor[[h, t], pl.FP32],
-        g_sum: pl.Tensor[[h, t], pl.FP32],
-        w_out: pl.Out[pl.Tensor[[t, h, d], pl.FP16]],
-        u_out: pl.Out[pl.Tensor[[t, h, d], pl.FP16]],
-    ):
-        k_flat = pl.reshape(k, [t, hg * d])
-        v_flat = pl.reshape(v, [t, h * d])
-        a_flat = pl.reshape(a_in, [t, h * chunk])
-        w_flat = pl.reshape(w_out, [t, h * d])
-        u_flat = pl.reshape(u_out, [t, h * d])
-        for c0 in pl.spmd(t // chunk, name_hint="wy_fast"):
-            t0 = c0 * chunk
-            for hh in pl.range(h):
-                col = hh * chunk
-                a_chunk = a_flat[t0 : t0 + chunk, col : col + chunk]
-                beta_row = beta[hh : hh + 1, t0 : t0 + chunk]
-                g_row = g_sum[hh : hh + 1, t0 : t0 + chunk]
-                beta16 = pl.cast(beta_row, target_type=pl.FP16, mode="rint")
-                gate = pl.mul(pl.exp(g_row), beta_row)
-                gate16 = pl.cast(gate, target_type=pl.FP16, mode="rint")
-                a2 = pl.col_expand_mul(a_chunk, beta16)
-                a1 = pl.col_expand_mul(a_chunk, gate16)
-                d0 = hh * d
-                # GQA: W reads key head hh // grp, U reads value head hh.
-                dg0 = (hh // grp) * d
-                v_blk = v_flat[t0 : t0 + chunk, d0 : d0 + d]
-                k_blk = k_flat[t0 : t0 + chunk, dg0 : dg0 + d]
-                # FP16 operands promote to an FP16 result, accumulated FP32 in the cube
-                u_flat[t0 : t0 + chunk, d0 : d0 + d] = pl.matmul(a2, v_blk)
-                w_flat[t0 : t0 + chunk, d0 : d0 + d] = pl.matmul(a1, k_blk)
-        return w_out, u_out
-
-    return gdn_wy_fast
+    kf, vf, bf, af, gf = (x.to(REF_DTYPE) for x in (k, v, beta, a_inv, g_sum))
+    w = torch.zeros(t, h, d, dtype=REF_DTYPE)
+    u = torch.zeros(t, h, d, dtype=REF_DTYPE)
+    for t0 in range(0, t, chunk):
+        for hh in range(h):
+            ab = af[t0 : t0 + chunk, hh, :]
+            bc = bf[t0 : t0 + chunk, hh, None]
+            gc = gf[t0 : t0 + chunk, hh, None]
+            kg = kf[t0 : t0 + chunk, hh // grp, :] * bc * torch.exp(gc)
+            u[t0 : t0 + chunk, hh, :] = ab @ (vf[t0 : t0 + chunk, hh, :] * bc)
+            w[t0 : t0 + chunk, hh, :] = ab @ kg
+    return w, u
 
 
-gdn_wy_fast = build_kernel()
+_INPUTS: dict = {}
 
 
-def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
-                       hg: int = HG):
-    import torch
+def _inputs(t: int) -> dict:
+    """The chain this stage consumes, memoised so the several specs pay for it once."""
+    key = t
+    if key not in _INPUTS:
+        st = make_inputs(t, H, D, HG)
+        st["g_sum"] = cumsum_ref(st["g"], CHUNK_TILE)
+        a16 = kkt_ref(st["k"], st["beta"], st["g_sum"], CHUNK_TILE).to(torch.float16)
+        st["a_inv16"] = solve_tril_ref(a16, CHUNK_TILE).to(torch.float16)
+        _INPUTS[key] = st
+    return _INPUTS[key]
+
+
+def build_tensor_specs(t: int = BENCH_SEQ):
     from golden import TensorSpec
 
-    import reference
+    def draw(key, transform=None):
+        def make():
+            value = _inputs(t)[key]
+            return transform(value) if transform is not None else value
 
+        return make
 
     return [
-        TensorSpec("k", [t, hg, d], torch.float16,
-                   init_value=reference.lazy("wy_fast", "k", t, h, d, chunk, hg=hg)),
-        TensorSpec("v", [t, h, d], torch.float16, init_value=reference.lazy("wy_fast", "v", t, h, d, chunk, hg=hg)),
-        TensorSpec("a_in", [t, h, chunk], torch.float16,
-                   init_value=reference.lazy("wy_fast", "a_inv16", t, h, d, chunk, hg=hg)),
-        TensorSpec("beta", [h, t], torch.float32,
-                   init_value=reference.lazy("wy_fast", "beta", t, h, d, chunk, reference.to_hT, hg=hg)),
-        TensorSpec("g_sum", [h, t], torch.float32,
-                   init_value=reference.lazy("wy_fast", "g_sum", t, h, d, chunk, reference.to_hT, hg=hg)),
-        TensorSpec("w_out", [t, h, d], torch.float16),
-        TensorSpec("u_out", [t, h, d], torch.float16),
+        TensorSpec("k", [t, HG, D], torch.float16, init_value=draw("k")),
+        TensorSpec("v", [t, H, D], torch.float16, init_value=draw("v")),
+        TensorSpec("a_in", [t, H, CHUNK_TILE], torch.float16, init_value=draw("a_inv16")),
+        TensorSpec("beta", [H, t], torch.float32, init_value=draw("beta", to_hT)),
+        TensorSpec("g_sum", [H, t], torch.float32, init_value=draw("g_sum", to_hT)),
+        TensorSpec("w_out", [t, H, D], torch.float16),
+        TensorSpec("u_out", [t, H, D], torch.float16),
     ]
 
 
 def golden_gdn_wy_fast(tensors):
-    import reference
-
     chunk = tensors["a_in"].shape[-1]
-    w, u = reference.wy_fast(tensors["k"], tensors["v"], tensors["beta"].t(),
-                             tensors["a_in"], tensors["g_sum"].t(), chunk)
+    w, u = wy_fast_ref(tensors["k"], tensors["v"], tensors["beta"].t(), tensors["a_in"], tensors["g_sum"].t(), chunk)
     tensors["w_out"].copy_(w)
     tensors["u_out"].copy_(u)
-
-
-def _stats_ok(actual, expected, **_kwargs):
-    """megagdn-pto's criterion for this stage (tests/utils.py: NumericalAccuracy)."""
-    import reference
-
-    ok, detail = reference.stats_ok(actual, expected, chunk=CHUNK)
-    print(f"[stats] {detail}", flush=True)
-    return ok, detail
 
 
 if __name__ == "__main__":
@@ -130,30 +162,35 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--seq-len", type=int, default=None, help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
+    cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
+    if args.seq_len and args.seq_len % CHUNK_TILE:
+        parser.error(f"--seq-len must be a multiple of CHUNK_TILE={CHUNK_TILE}")
+    if len(cases) > 1 and (args.golden_data or args.runtime_dir):
+        parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
 
-    result = run(
-        fn=gdn_wy_fast,
-        specs=build_tensor_specs(),
-        golden_fn=golden_gdn_wy_fast,
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        save_data=args.save_data,
-        config=dict(
-            platform=args.platform,
-            device_id=args.device,
-        ),
-        rtol=1e-2,
-        atol=1e-5,
-        compare_fn={"w_out": _stats_ok, "u_out": _stats_ok},
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    for t in cases:
+        print(f"[case] wy_fast T={t}", flush=True)
+        result = run(
+            fn=gdn_wy_fast_test,
+            specs=build_tensor_specs(t=t),
+            golden_fn=golden_gdn_wy_fast,
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            save_data=args.save_data,
+            config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
+            compare_fn={"w_out": frob_ok(), "u_out": frob_ok()},
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            # Stop at the first failure: one device failure poisons the chip run lane, so
+            # every later case in this process reports a failure it did not cause.
+            raise SystemExit(f"FAILED at T={t}")

@@ -8,8 +8,8 @@ description: >-
   a per-job venv + activate.sh, and a from-source build/install of
   pypto + simpler. Simpler's own installer resolves the pinned pto-isa checkout
   (pypto's runtime/pto_isa.pin is the single source of truth), so this action
-  never clones it. The device jobs differ only in that they additionally check the
-  NPU and source CANN's set_env.sh — see the needs-device input.
+  never clones it. The device jobs differ only in that they additionally source
+  CANN's set_env.sh — see the needs-device input.
 
   Unlike pypto (which builds itself), pypto-lib builds against a separate pypto
   clone kept in a per-job ci-cache/pypto-src-<build-namespace> dir (concurrent
@@ -44,7 +44,7 @@ description: >-
   elsewhere symlinks /opt/pypto at them.
 
   Beyond those, the host is expected to provide (by name, not by path):
-  task-submit / npu-smi / ccache / git / curl on PATH, and — on the conda path
+  task-submit / ccache / git / curl on PATH, and — on the conda path
   only — a conda env `py310-lib` under CONDA_ROOT. The `.env` makes the
   *locations* portable; these names are the provisioning contract a runner has to
   satisfy to be usable at all.
@@ -99,13 +99,18 @@ inputs:
       Workspace-relative dir to check the repo out into (also the venv /
       activate.sh home). Isolates each job's tree on the shared self-hosted host.
     required: true
+  runtime-platform:
+    description: >-
+      Simpler runtime to build: a2a3, a5, a2a3sim, or a5sim. Select the
+      job's NPU target explicitly; the CPU architecture does not identify it.
+    required: true
   needs-device:
     description: >-
-      When 'true' the job talks to an NPU: verify a card is visible (npu-smi) and
-      have activate.sh source CANN's set_env.sh, which wires up the Ascend/HCCL
-      host environment. When 'false' (the simulator jobs) both are skipped and
-      CANN_ROOT is not required in the runner config — the simulator needs no
-      driver, no card and no Ascend env.
+      When 'true' the job talks to an NPU: have activate.sh source CANN's
+      set_env.sh, which wires up the Ascend/HCCL host environment. When 'false'
+      (the simulator jobs) CANN setup is skipped and CANN_ROOT is not required in
+      the runner config — the simulator needs no driver, no card and no Ascend
+      env.
     required: false
     default: 'false'
   toolchain:
@@ -129,11 +134,11 @@ inputs:
     default: 'bundle'
   install-torch-npu:
     description: >-
-      When 'true', install torch_npu into the venv. It is what puts `torch.npu`
-      on the torch module, and only the serving jobs need it — they run
-      pypto-serving's NPU runners, which call torch.npu.mem_get_info to size the
-      KV cache. Nothing in pypto-lib itself touches torch.npu, and the wheel is
-      large, so the other jobs leave it out.
+      When 'true', install torch_npu into the venv for a job whose runtime
+      explicitly needs `torch.npu` (for example, to call
+      `torch.npu.mem_get_info` while sizing a KV cache). Jobs that use CPU Torch
+      or do not call that API must leave this false. Nothing in pypto-lib itself
+      touches torch.npu, and the wheel is large.
 
       It hard-pins torch to an exact version, so this and the torch pin in the
       build step move together.
@@ -145,9 +150,9 @@ inputs:
       py310-lib resolved torch>=2.0.0 to, which is the version every job built
       against before the bundle migration.
 
-      Override it only for a job whose kernels need a newer torch, and only with
-      install-torch-npu false: torch_npu hard-requires its own exact torch, so
-      the two cannot both choose one.
+      Override it for a job whose kernels or model loaders need a newer torch.
+      Keep install-torch-npu false when selecting a version other than the
+      torch_npu-compatible pin: torch_npu hard-requires its own exact torch.
     required: false
     default: 'torch==2.6.0'
   build-namespace:
@@ -184,12 +189,18 @@ runs:
       shell: bash
       env:
         NEEDS_DEVICE: ${{ inputs.needs-device }}
+        RUNTIME_PLATFORM: ${{ inputs.runtime-platform }}
         CCACHE_NAME: ${{ inputs.ccache-name }}
         PIP_CACHE_NAME: ${{ inputs.pip-cache-name }}
         BUILD_NAMESPACE: ${{ inputs.build-namespace }}
         TOOLCHAIN_IN: ${{ inputs.toolchain }}
       run: |
         set -uo pipefail
+        case "$NEEDS_DEVICE:$RUNTIME_PLATFORM" in
+          true:a2a3|true:a5|false:a2a3sim|false:a5sim) ;;
+          *) echo "::error::runtime-platform must match needs-device (a2a3/a5 for device, a2a3sim/a5sim for sim)"
+             exit 1 ;;
+        esac
         # Prerequisites CI does not create, so they must already be there. The
         # simulator needs no Ascend env, so CANN_ROOT is device-jobs-only. Model
         # dirs are only needed by the serving job, which checks its own.
@@ -415,52 +426,6 @@ runs:
           echo "PTO_ISA_COMMIT=$(tr -d '[:space:]' < "$PYPTO_SRC/runtime/pto_isa.pin")"
         } >> "$GITHUB_ENV"
 
-    - name: Check NPU
-      if: ${{ inputs.needs-device == 'true' }}
-      shell: bash
-      # Since the A5 host's driver upgrade its device nodes are
-      # `crw-rw---- HwHiAiUser:HwHiAiUser`, and the CI user is not in that
-      # group. dcmi_init then cannot open the character device, and npu-smi
-      # exits 187 with "dcmi module initialize failed. ret is -8005" — which
-      # reads like a missing DCMI component but is plain permission denial
-      # (npu-smi lists "Failed to open the character device" among its own
-      # candidate causes). task-submit drops privileges into the HwHiAiUser
-      # group, which is how every model run reaches a card in the first place.
-      #
-      # Direct first: on hosts whose nodes are still world-readable it works,
-      # and the check then costs no device lease and no queue wait.
-      run: |
-        rc=0
-        npu-smi info || rc=$?
-        if [ "$rc" -eq 0 ]; then
-          exit 0
-        fi
-        echo "npu-smi failed directly (exit $rc); the device nodes are likely"
-        echo "group-restricted. Retrying through task-submit ..."
-        # The payload ends on `rc=$?; exit $rc` rather than on `npu-smi info`:
-        # with the probe as the bare last command task-submit reports 215 even
-        # though npu-smi returned 0 (reproduced 3/3 on an A5 host). Setting the
-        # status explicitly makes the outer code npu-smi's own — verified to
-        # pass 0, 9 and 127 through unchanged.
-        #
-        # NPUSMI_RC is a sentinel that separates the two ways this can fail.
-        # task-submit leases a real card, so a busy queue makes it give up on
-        # the wait and exit 1 having never run anything — that says nothing
-        # about the NPU and must not fail a diagnostic step. If the sentinel is
-        # present the probe really ran, and its status is authoritative.
-        rc=0
-        out=$(task-submit --device "${DEVICE_ID:-auto}" --timeout 240 --max-time 60 \
-          --run 'npu-smi info; rc=$?; echo "NPUSMI_RC=$rc"; exit $rc' 2>&1) || rc=$?
-        printf '%s\n' "$out"
-        if ! printf '%s' "$out" | grep -q 'NPUSMI_RC='; then
-          echo "::warning::Could not obtain a card from the device queue within"
-          echo "the wait, so the NPU was never probed. Continuing — every model"
-          echo "run goes through task-submit and will fail loudly if no device"
-          echo "is actually available."
-          exit 0
-        fi
-        exit "$rc"
-
     # Namespace the cache by pto-isa commit so a pto-isa bump can never serve
     # stale objects compiled against the old ISA headers (see issue #1139):
     # a different commit hashes to a different key, forcing a real recompile.
@@ -479,8 +444,8 @@ runs:
       working-directory: ${{ inputs.checkout-path }}
       env:
         NEEDS_DEVICE: ${{ inputs.needs-device }}
-        # Part of the runner's provisioning contract, like having task-submit and
-        # npu-smi on PATH: the host is expected to provide a conda env under this
+        # Part of the runner's provisioning contract, like having task-submit on
+        # PATH: the host is expected to provide a conda env under this
         # name. CONDA_ROOT says where conda lives; this says which env to use, and
         # `python -m venv --system-site-packages` below layers the per-job venv on
         # it, so its site-packages are an implicit dependency of every build here.
@@ -717,6 +682,7 @@ runs:
       working-directory: ${{ inputs.checkout-path }}
       env:
         INSTALL_TORCH_NPU: ${{ inputs.install-torch-npu }}
+        RUNTIME_PLATFORM: ${{ inputs.runtime-platform }}
         TORCH_VERSION: ${{ inputs.torch-version }}
       run: |
         source activate.sh
@@ -736,10 +702,14 @@ runs:
         }
         # Same split, for producing a wheel instead of installing one.
         py_build_wheel() {  # <out-dir> <source-dir>
+          local settings=()
+          if [ "$2" = "$PYPTO_SRC/runtime" ]; then
+            settings+=("--config-settings=build.targets=build_package_${RUNTIME_PLATFORM}")
+          fi
           if [ "${PYPTO_USE_UV:-false}" = "true" ]; then
-            uv build --wheel --no-build-isolation --out-dir "$1" "$2"
+            uv build --wheel --no-build-isolation --out-dir "$1" "$2" "${settings[@]}"
           else
-            pip wheel --no-build-isolation --no-deps --wheel-dir "$1" "$2"
+            pip wheel --no-build-isolation --no-deps --wheel-dir "$1" "$2" "${settings[@]}"
           fi
         }
         if [ "${PYPTO_USE_UV:-false}" != "true" ]; then
@@ -767,26 +737,24 @@ runs:
         #
         # The default is pinned to what py310-lib actually resolved torch>=2.0.0
         # to, so this migration changes the toolchain and nothing else. Unpinned,
-        # pip takes the newest (2.13.0 today). It is also forced from below when
-        # install-torch-npu is on: the torch_npu 2.6.0 line requires torch==2.6.0
-        # exactly, and one torch is installed here for every job. The
-        # torch-version input overrides it per job; see that input's description.
+        # pip takes the newest (2.13.0 today). Jobs that install torch_npu must
+        # use its compatible pin, while CPU Torch jobs can override it per job;
+        # see the input description.
         TORCH_PIN="$TORCH_VERSION"
         if ! py_install "$TORCH_PIN" --index-url https://download.pytorch.org/whl/cpu; then
           echo "note: download.pytorch.org unreachable — falling back to PyPI"
           py_install "$TORCH_PIN"
         fi
-        # torch_npu is what puts `torch.npu` on the torch module. Nothing imports
-        # it explicitly — PyTorch autoloads it through its `torch.backends` entry
-        # point — which is how it stayed an undeclared dependency: under
-        # --system-site-packages the conda env just had it. Only the serving jobs
-        # need it (pypto-serving's NPU runners call torch.npu.mem_get_info to
-        # size the KV cache); nothing in pypto-lib itself touches torch.npu.
+        # When requested, torch_npu puts `torch.npu` on the torch module. Nothing
+        # imports it explicitly — PyTorch autoloads it through its `torch.backends`
+        # entry point — which is how it stayed an undeclared dependency under
+        # --system-site-packages. Only jobs that call torch.npu need it;
+        # CPU Torch jobs leave it out.
         #
-        # Not on PyPI, which stops at 2.3.1, so the index is named explicitly.
-        # The version must track TORCH_PIN: the wheel's metadata is
-        # `Requires-Dist: torch==2.6.0`, satisfied by the 2.6.0+cpu installed
-        # above because a specifier carrying no local label ignores one.
+        # When enabled, torch_npu is not on PyPI, which stops at 2.3.1, so the
+        # index is named explicitly. Its wheel metadata requires torch==2.6.0,
+        # satisfied by the 2.6.0+cpu install above because a specifier carrying
+        # no local label ignores one.
         if [ "$INSTALL_TORCH_NPU" = "true" ]; then
           py_install 'torch_npu==2.6.0.post5' \
             --index-url https://mirrors.huaweicloud.com/repository/pypi/simple
@@ -799,6 +767,8 @@ runs:
           # dependency step, one step after this one. That ordering is what kept
           # it invisible; it is a real gap in the environment either way.
           py_install pyyaml
+        else
+          echo 'torch_npu disabled; using the requested CPU Torch installation'
         fi
         # The from-source pypto / simpler builds compile native code (libbacktrace
         # et al.) with conda's compiler_compat toolchain, which intermittently
@@ -823,7 +793,13 @@ runs:
             sleep $((attempt * 10))
           done
         }
-        retry_build() { retry_native "$1" py_install --no-build-isolation "$1"; }
+        retry_build() {
+          local settings=()
+          if [ "$1" = "$PYPTO_SRC/runtime" ]; then
+            settings+=("--config-settings=build.targets=build_package_${RUNTIME_PLATFORM}")
+          fi
+          retry_native "$1" py_install --no-build-isolation "$1" "${settings[@]}"
+        }
 
         # ----------------------------------------------------------------------
         # Wheel cache — a second layer above ccache, aimed at a different axis.
@@ -916,31 +892,26 @@ runs:
         # this checkout, is what gets built here.
         pypto_tree="$(git -C "$PYPTO_SRC" rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
         simpler_tree="$(git -C "$PYPTO_SRC/runtime" rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
-        # ...and the set of runtimes the build host could actually produce.
-        # Installing simpler runs simpler_setup/build_runtimes.py, which asks what
-        # the toolchain supports: gcc alone yields the a2a3sim / a5sim runtimes,
-        # and the onboard a2a3 / a5 pair is added only when ccec and CANN's
-        # cross-compiler are both there. That is exactly the difference between a
-        # sim job and a device job ON THIS HOST — cpu-N and npu-N are runner
-        # instances of the same machine and share one CI_CACHE_ROOT — so without
-        # this dimension a device job could install a simulator-only simpler and
-        # fail at run time rather than at install time.
-        #
-        # Probed with the same predicate build_runtimes.detect_buildable_platforms()
-        # uses, rather than keyed on the needs-device input: the input says what
-        # the job wants, this says what the build produced. CANN identifies itself
-        # in there too, because the onboard runtimes are compiled against that
-        # toolkit and an upgrade must not be served the old ones. CANN_ROOT is a
-        # symlink on at least one runner, so resolve it before taking a basename.
-        simpler_rt="sim"
-        if command -v ccec >/dev/null 2>&1 &&
-           [ -f "${ASCEND_HOME_PATH:-}/tools/hcc/bin/aarch64-target-linux-gnu-g++" ]; then
+        # The explicit runtime target is part of the wheel identity. CPU and
+        # NPU jobs can share CI_CACHE_ROOT, but must not reuse another platform's
+        # wheel. Device wheels also depend on the active CANN SDK; simulator
+        # builds do not, even if CANN happens to be installed on the host.
+        simpler_rt="$RUNTIME_PLATFORM"
+        if [ "$RUNTIME_PLATFORM" = a2a3 ] || [ "$RUNTIME_PLATFORM" = a5 ]; then
           cann_id="$(basename "$(readlink -f "${CANN_ROOT:-}")" 2>/dev/null || echo unknown)"
-          cann_info="$(ls "${CANN_ROOT:-}"/*-linux/ascend_toolkit_install.info 2>/dev/null | head -1)"
+          # This metadata is optional; an unmatched glob must not abort the
+          # setup shell under -e and pipefail before either wheel is built.
+          cann_info=""
+          for candidate in "${CANN_ROOT:-}"/*-linux/ascend_toolkit_install.info; do
+            if [ -f "$candidate" ]; then
+              cann_info="$candidate"
+              break
+            fi
+          done
           if [ -n "$cann_info" ]; then
             cann_id="$cann_id-$(sha256sum "$cann_info" | cut -c1-12)"
           fi
-          simpler_rt="sim-onboard-$cann_id"
+          simpler_rt="$RUNTIME_PLATFORM-$cann_id"
         fi
         if [ -z "$pypto_tree" ] || [ -z "$simpler_tree" ] ||
            [ -z "$toolchain_prefix" ] || [ -z "$build_inputs" ]; then
@@ -1312,7 +1283,29 @@ runs:
           python -m venv "$PTOAS_ROOT" --system-site-packages
           "$PTOAS_ROOT/bin/python" -m pip install "$CACHE_WHEEL"
         fi
-        "$PTOAS_ROOT/bin/ptoas" --version
+        # CANN's set_env.sh (sourced by activate.sh on device jobs) prepends its
+        # own site-packages to PYTHONPATH, which outranks ptoas-bin's, so `ptoas`
+        # imports CANN's online-build ptoas and dies on the missing pybind11.
+        # Re-assert ptoas-bin's site right after the job venv's — as the bootstrap
+        # guard already does for the job venv — and rebuild on every source so a
+        # re-prepended CANN entry cannot get back in front.
+        _PYPTO_PTOAS_SITE="$("$PTOAS_ROOT/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+        echo "_PYPTO_PTOAS_SITE=$_PYPTO_PTOAS_SITE" >> activate.sh
+        cat >> activate.sh <<'EOF'
+        _PYPTO_PP=""
+        _PYPTO_IFS="$IFS"; IFS=":"
+        for _p in ${PYTHONPATH:-}; do
+          case "$_p" in ""|"$_PYPTO_SITE"|"$_PYPTO_PTOAS_SITE") continue ;; esac
+          _PYPTO_PP="${_PYPTO_PP:+$_PYPTO_PP:}$_p"
+        done
+        IFS="$_PYPTO_IFS"
+        export PYTHONPATH="$_PYPTO_SITE:$_PYPTO_PTOAS_SITE${_PYPTO_PP:+:$_PYPTO_PP}"
+        EOF
+        ( source activate.sh
+          source activate.sh
+          "$PTOAS_ROOT/bin/ptoas" --version
+          "$PTOAS_ROOT/bin/python" -c 'import os, sys, sysconfig, ptoas; s=os.path.realpath(sysconfig.get_paths()["purelib"]); p=os.path.realpath(ptoas.__file__); sys.exit(0 if p.startswith(s+os.sep) else f"::error::ptoas -> {p} (outside ptoas-bin {s})")'
+        )
 
     - name: Report toolchain versions
       # One grep-able block naming every component a failure has to be

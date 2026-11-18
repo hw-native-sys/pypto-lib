@@ -6,30 +6,15 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4.1-Flash model, deployment, and kernel-shape configuration."""
+"""DeepSeek-V4.1-Flash model, deployment, parallel, and shared shape configuration."""
 
 import sys
 from dataclasses import dataclass
-from enum import Enum
 from typing import Literal, Optional, Tuple
 
 import pypto.language as pl
 
-
-class AttentionKind(str, Enum):
-    """Attention families required by the text backbone."""
-
-    SLIDING_WINDOW = "sliding_window"
-    COMPRESSED_SPARSE = "compressed_sparse"
-
-
-class AttentionMode(str, Enum):
-    """Static attention implementation selected for one backbone layer."""
-
-    SWA = "swa"
-    FULL = "full"
-    REINDEX = "reindex"
-    REUSE = "reuse"
+CACHE_ROWS_DYN = pl.dynamic("CACHE_ROWS_DYN")
 
 
 @dataclass(frozen=True)
@@ -37,14 +22,11 @@ class DeepSeekV41LayerConfig:
     """Resolved ownership and attention mode for one text-backbone layer."""
 
     layer_id: int
-    attention_kind: AttentionKind
     compression_ratio: int
     kv_source_layer_id: Optional[int]
     index_source_layer_id: Optional[int]
     is_kv_source: bool
-    is_index_source: bool
-    is_candidate_source: bool
-    mode: AttentionMode
+    mode: str
 
 
 @dataclass(frozen=True)
@@ -128,35 +110,24 @@ class DeepSeekV41Config:
             raise ValueError(f"layer_id must be in [0, {self.num_hidden_layers - 1}], got {layer_id}")
 
         ratio = self.compress_ratios[layer_id]
-        if ratio == 0:
-            attention_kind = AttentionKind.SLIDING_WINDOW
-        else:
-            attention_kind = AttentionKind.COMPRESSED_SPARSE
-
         kv_source = self._active_source(layer_id, ratio, self.kv_source_layer_ids)
         index_source = self._active_source(layer_id, ratio, self.index_source_layer_ids)
         if ratio == 0:
-            mode = AttentionMode.SWA
+            mode = "swa"
         elif layer_id in self.kv_source_layer_ids:
-            mode = AttentionMode.FULL
+            mode = "full"
         elif layer_id in self.index_source_layer_ids:
-            mode = AttentionMode.REINDEX
+            mode = "reindex"
         else:
-            mode = AttentionMode.REUSE
+            mode = "reuse"
         return DeepSeekV41LayerConfig(
             layer_id=layer_id,
-            attention_kind=attention_kind,
             compression_ratio=ratio,
             kv_source_layer_id=kv_source,
             index_source_layer_id=index_source,
             is_kv_source=layer_id in self.kv_source_layer_ids,
-            is_index_source=layer_id in self.index_source_layer_ids,
-            is_candidate_source=layer_id == self.candidate_source_layer_id,
             mode=mode,
         )
-
-    def backbone_layers(self) -> Tuple[DeepSeekV41LayerConfig, ...]:
-        return tuple(self.layer_config(layer_id) for layer_id in range(self.num_hidden_layers))
 
     def _active_source(self, layer_id: int, ratio: int, sources: Tuple[int, ...]) -> Optional[int]:
         if ratio == 0:
@@ -222,7 +193,7 @@ FLASH = DeepSeekV41Config(
     o_lora_rank=1024,
     o_groups=8,
     sliding_window=128,
-    rms_norm_eps=1e-20,
+    rms_norm_eps=1e-6,
     max_position_embeddings=1048576,
     rope_theta=10000.0,
     compress_rope_theta=160000.0,
@@ -267,91 +238,89 @@ FLASH = DeepSeekV41Config(
 )
 
 
-T_DYN = pl.dynamic("V41_T_DYN")
-ROUTE_T_DYN = pl.dynamic("V41_ROUTE_T_DYN")
-B_DYN = pl.dynamic("V41_B_DYN")
-STATE_BLOCKS_DYN = pl.dynamic("V41_STATE_BLOCKS_DYN")
-Q_START_DYN = pl.dynamic("V41_Q_START_DYN")
-TABLE_DYN = pl.dynamic("V41_TABLE_DYN")
-ORI_BLOCKS_DYN = pl.dynamic("V41_ORI_BLOCKS_DYN")
-CMP_BLOCKS_DYN = pl.dynamic("V41_CMP_BLOCKS_DYN")
-INDEX_BLOCKS_DYN = pl.dynamic("V41_INDEX_BLOCKS_DYN")
-CMP_POSITIONS_DYN = pl.dynamic("V41_CMP_POSITIONS_DYN")
-RECV_DYN = pl.dynamic("V41_RECV_DYN")
-LOGIT_ROWS_DYN = pl.dynamic("V41_LOGIT_ROWS_DYN")
-
-D = FLASH.hidden_size
-H = FLASH.num_attention_heads
-HEAD_DIM = FLASH.head_dim
-ROPE_DIM = FLASH.qk_rope_head_dim
-NOPE_DIM = FLASH.nope_head_dim
-Q_LORA = FLASH.q_lora_rank
-O_LORA = FLASH.o_lora_rank
-O_GROUPS = FLASH.o_groups
-O_GROUP_IN = H * HEAD_DIM // O_GROUPS
-HC_MULT = FLASH.hc_mult
-HC_DIM = FLASH.hc_dim
-MIX_HC = FLASH.mix_hc
-INDEX_H = FLASH.index_n_heads
-INDEX_DIM = FLASH.index_head_dim
-INDEX_TOPK = FLASH.index_topk
-N_EXPERTS = FLASH.n_routed_experts
-TOPK = FLASH.num_experts_per_tok
-MOE_INTER = FLASH.moe_intermediate_size
-VOCAB = FLASH.vocab_size
-MX_GROUP = FLASH.weight_block_size[0]
-
-SUPPORTED_TP_SIZES = (1, 2, 4, 8)
-SUPPORTED_EP_SIZES = (2, 4, 8)
-
-
-def _parse_parallel_size(name: str, default: int) -> int:
-    flag = f"--{name}"
-    for index, argument in enumerate(sys.argv):
-        if argument == flag and index + 1 < len(sys.argv):
-            return int(sys.argv[index + 1])
-        if argument.startswith(f"{flag}="):
-            return int(argument.split("=", 1)[1])
-    return default
-
-
-TP_SIZE = _parse_parallel_size("tp", 4)
-EP_SIZE = _parse_parallel_size("ep", 8)
-if TP_SIZE not in SUPPORTED_TP_SIZES:
-    raise ValueError(f"--tp must be one of {SUPPORTED_TP_SIZES}, got {TP_SIZE}")
-if EP_SIZE not in SUPPORTED_EP_SIZES:
-    raise ValueError(f"--ep must be one of {SUPPORTED_EP_SIZES}, got {EP_SIZE}")
-if EP_SIZE % TP_SIZE:
-    raise ValueError(f"EP{EP_SIZE} must be divisible by TP{TP_SIZE}")
-if H % TP_SIZE:
-    raise ValueError(f"{H} attention heads cannot be evenly sharded across TP{TP_SIZE}")
-if O_GROUPS % TP_SIZE:
-    raise ValueError(f"{O_GROUPS} output groups cannot be evenly sharded across TP{TP_SIZE}")
-if N_EXPERTS % EP_SIZE:
-    raise ValueError(f"{N_EXPERTS} routed experts cannot be evenly sharded across EP{EP_SIZE}")
-
-DP_SIZE = EP_SIZE // TP_SIZE
-LOCAL_H = H // TP_SIZE
-LOCAL_O_GROUPS = O_GROUPS // TP_SIZE
-LOCAL_O_WIDTH = LOCAL_O_GROUPS * O_LORA
-N_LOCAL_EXPERTS = N_EXPERTS // EP_SIZE
-
-BLOCK_SIZE = 128
-RATIO2_STORAGE_BLOCK_SIZE = BLOCK_SIZE
-RATIO1_STORAGE_BLOCK_SIZE = BLOCK_SIZE
-STATE_CAPACITY = 4
-STATE_WIDTH = 2 * HEAD_DIM
-MAX_BATCH_PER_DP = 32
+DECODE_BATCH = 12
 DSPARK_SPEC_TOKENS = 5
-DECODE_ROWS_PER_REQUEST = DSPARK_SPEC_TOKENS + 1
-DECODE_MAX_TOKENS = MAX_BATCH_PER_DP * DECODE_ROWS_PER_REQUEST
-PREFILL_MAX_TOKENS = 4096
-DECODE_RECV_MAX = DP_SIZE * DECODE_MAX_TOKENS
-PREFILL_RECV_MAX = DP_SIZE * PREFILL_MAX_TOKENS
-RECV_MAX = PREFILL_RECV_MAX
-MOE_TOKENS = 16
-AUX_WIDTH = 8
-ROUTE_WIDTH = 8
+DECODE_SEQ = DSPARK_SPEC_TOKENS + 1
+BLOCK_SIZE = 128
+C2A_STORAGE_ROWS = 64
+C1A_STORAGE_ROWS = 128
+COMPRESSED_POOL_UNIT_ROWS = 64
+DSPARK_DRAFT_LAYERS = 3
+DSPARK_N_ROUTED_EXPERTS = 128
+DSPARK_NUM_EXPERTS_PER_TOK = 3
+DSPARK_TARGET_LAYER_IDS = (37, 38, 39)
+DSPARK_LAST_TARGET_LAYER = DSPARK_TARGET_LAYER_IDS[-1]
+DSPARK_QUERY_WIDTH = DSPARK_SPEC_TOKENS
+DSPARK_SWA_INDEX_WIDTH = (FLASH.sliding_window + DSPARK_QUERY_WIDTH + 63) // 64 * 64
+DSPARK_MARKOV_RANK = 256
+DSPARK_NOISE_TOKEN_ID = 128799
+# Retain every verified row until acceptance selects the next decode position.
+STATE_CAPACITY = (DECODE_SEQ + 7) // 8 * 8
+DECODE_MAX_TOKENS = DECODE_BATCH * DECODE_SEQ
+PREFILL_MAX_TOKENS = 8192
 WINDOW_CACHE_GROUP = 32
 COMPRESSED_CACHE_GROUP = 16
 INDEX_CACHE_GROUP = 32
+WINDOW_CACHE_BYTES = FLASH.head_dim + 2 * (FLASH.head_dim // WINDOW_CACHE_GROUP)
+COMPRESSED_CACHE_BYTES = FLASH.head_dim // 2 + 2 * (FLASH.head_dim // COMPRESSED_CACHE_GROUP)
+
+
+# Shared symbolic dimensions
+RANKS_DYN = pl.dynamic("RANKS_DYN")
+T_DYN = pl.dynamic("T_DYN")
+LOCAL_T_DYN = pl.dynamic("LOCAL_T_DYN")
+ROUTE_T_DYN = pl.dynamic("ROUTE_T_DYN")
+B_DYN = pl.dynamic("B_DYN")
+STATE_BLOCKS_DYN = pl.dynamic("STATE_BLOCKS_DYN")
+Q_START_DYN = pl.dynamic("Q_START_DYN")
+TABLE_DYN = pl.dynamic("TABLE_DYN")
+ORI_BLOCKS_DYN = pl.dynamic("ORI_BLOCKS_DYN")
+CMP_BLOCKS_DYN = pl.dynamic("CMP_BLOCKS_DYN")
+INDEX_BLOCKS_DYN = pl.dynamic("INDEX_BLOCKS_DYN")
+CMP_POSITIONS_DYN = pl.dynamic("CMP_POSITIONS_DYN")
+INDEX_POOL_BLOCKS_DYN = pl.dynamic("INDEX_POOL_BLOCKS_DYN")
+INDEX_POOL_POSITIONS_DYN = pl.dynamic("INDEX_POOL_POSITIONS_DYN")
+
+
+# Parallel configuration
+SUPPORTED_LM_HEAD_TP_SIZES = (1, 2, 4, 8)
+SUPPORTED_CP_SIZES = (1, 2, 4, 8)
+SUPPORTED_EP_SIZES = (2, 4, 8)
+
+
+def _parse_parallel_size(name: str, default: int, choices: Tuple[int, ...]) -> int:
+    flag = f"--{name}"
+    size = default
+    for index, argument in enumerate(sys.argv):
+        if argument == flag:
+            if index + 1 == len(sys.argv):
+                raise ValueError(f"{flag} requires an integer")
+            size = int(sys.argv[index + 1])
+        elif argument.startswith(f"{flag}="):
+            size = int(argument.split("=", 1)[1])
+    if size not in choices:
+        raise ValueError(f"{flag} must be one of {choices}, got {size}")
+    return size
+
+
+LM_HEAD_TP_SIZE = _parse_parallel_size("lm-head-tp", 1, SUPPORTED_LM_HEAD_TP_SIZES)
+CP_SIZE = _parse_parallel_size("cp", 1, SUPPORTED_CP_SIZES)
+EP_SIZE = _parse_parallel_size("ep", 2, SUPPORTED_EP_SIZES)
+DP_SIZE = EP_SIZE // CP_SIZE
+
+
+def set_moe_tokens(tokens: int) -> None:
+    """Set the composed entry token extent before importing MoE kernels."""
+    if tokens <= 0 or tokens % 16:
+        raise ValueError(f"MoE tokens must be positive and divisible by 16, got {tokens}")
+    global MOE_TOKENS, MOE_RECV_MAX
+    MOE_TOKENS = tokens
+    MOE_RECV_MAX = EP_SIZE * tokens
+
+
+# Shared MoE deployment dimensions
+N_LOCAL_EXPERTS = FLASH.n_routed_experts // EP_SIZE
+MOE_TOKENS = (DECODE_MAX_TOKENS + 15) // 16 * 16
+MOE_RECV_MAX = EP_SIZE * MOE_TOKENS
+# Input gather publishes each rank's complete padded physical slab.
+DECODE_INPUT_MAX_TOKENS = max(DECODE_MAX_TOKENS, MOE_TOKENS)

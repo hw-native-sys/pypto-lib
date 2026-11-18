@@ -24,7 +24,6 @@ HEAD_DIM = M.head_dim
 # CP layout
 CP_CHOICES = (1, 2, 4, 8, 16)
 CP_DEFAULT = 2
-MAX_SEGMENT_TILES = 4
 EPOCHS = 1
 
 # tiling
@@ -43,6 +42,18 @@ def _parse_static_int(name: str, default: int) -> int:
 
 CP_SIZE = _parse_static_int("cp", _parse_static_int("ep", CP_DEFAULT))
 NUM_SEGMENTS = 2 * CP_SIZE
+# Segment capacity in TAIL_ROWS tiles. The fixed 4 sized the program for 2048
+# tokens at CP2, so a 1024-token request left 6 of the 10 compressor leaves empty
+# -- each still paid its four serialised task launches on the critical path
+# (~30 us per leaf for ~4.6 us of work). Deriving it from --num-tokens matches the
+# arena to the request the program is built for; without the flag the old
+# full-capacity default stands.
+_REQUEST_TOKENS = _parse_static_int("num-tokens", 0)
+# Capped at four: the staged CP-SWA wave sequence in prefill_sparse_attn is four
+# unrolled 128-row waves, so a larger arena would leave later rows unprocessed.
+MAX_SEGMENT_TILES = (
+    min(4, max(1, -(-_REQUEST_TOKENS // (NUM_SEGMENTS * TAIL_ROWS)))) if _REQUEST_TOKENS > 0 else 4
+)
 CP_PREFILL_CMP_BLOCK_NUM = NUM_SEGMENTS * MAX_SEGMENT_TILES
 
 # Rank-major tail-window rows.
@@ -322,7 +333,8 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser(description="Standalone context-parallel zigzag exchange test.")
-    parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(CP_SIZE)))
     parser.add_argument("--cp", type=int, default=CP_SIZE, choices=CP_CHOICES)
     parser.add_argument("--compile-only", action="store_true")
@@ -341,7 +353,8 @@ if __name__ == "__main__":
         compile_only=args.compile_only,
         config=dict(
             distributed_config=DistributedConfig(device_ids=device_ids[:args.cp], num_sub_workers=0),
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
         ),
         rtol=0.0,
         atol=0.0,

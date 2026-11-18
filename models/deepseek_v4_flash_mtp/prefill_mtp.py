@@ -40,7 +40,6 @@ from prefill_moe import (
     PrefillMoELayout,
     make_prefill_moe,
     clear_prefill_moe_signals,
-    PREFILL_MOE_EXPERT_SCALE_PAD,
     PREFILL_MOE_SCALE_PAD,
     D,
     HC_DIM,
@@ -122,20 +121,20 @@ def mtp_prefill_fwd(
     prev_hidden_states: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     enorm_w: pl.Tensor[[D], pl.FP32],
     hnorm_w: pl.Tensor[[D], pl.FP32],
-    e_proj_w: pl.Tensor[[D, D], pl.INT8],
+    e_proj_w: pl.Tensor[[D, D], pl.INT8, pl.NZ],
     e_proj_w_scale: pl.Tensor[[D], pl.FP32],
     e_proj_smooth: pl.Tensor[[D], pl.FP32],
-    h_proj_w: pl.Tensor[[D, D], pl.INT8],
+    h_proj_w: pl.Tensor[[D, D], pl.INT8, pl.NZ],
     h_proj_w_scale: pl.Tensor[[D], pl.FP32],
     h_proj_smooth: pl.Tensor[[D], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
@@ -145,8 +144,8 @@ def mtp_prefill_fwd(
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     position_ids: pl.Tensor[[T], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
@@ -156,17 +155,17 @@ def mtp_prefill_fwd(
     gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
     input_ids: pl.Tensor[[T], pl.INT64],
-    routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
     routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
     routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
+    routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ],
     routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
-    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     mtp_hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
     mtp_hc_head_scale: pl.Tensor[[1], pl.FP32],
@@ -225,9 +224,6 @@ def mtp_prefill_fwd(
     moe_post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     moe_comb_ffn = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
     moe_ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    moe_dense_x = pl.create_tensor([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
-    moe_dense_scale = pl.create_tensor([PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], dtype=pl.FP32)
-    moe_returned_y = pl.create_tensor([PREFILL_MOE_ROUTES_PER_SRC, D], dtype=pl.BF16)
     completion = pl.create_tensor([1, 1, 8], dtype=pl.FP32)
     with pl.scope():
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_prefill_attention_ready", allow_early_resolve=False) as attention_ready:
@@ -240,8 +236,6 @@ def mtp_prefill_fwd(
             shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
             shared_w2, shared_w2_scale, pre_hc_hidden_out,
             moe_x_mixed, moe_post_ffn, moe_comb_ffn, moe_ffn_out,
-            moe_dense_x, moe_dense_scale,
-            moe_returned_y,
             count_target, count_signal, x_target, x_signal,
             scale_target, reverse_target, reverse_signal,
             attention_ready, pl.cast(MTP_LAYER_ID, pl.INT32),
@@ -289,7 +283,7 @@ def l3_mtp_prefill_fwd(
     position_ids: pl.Tensor[[N_RANKS, T], pl.INT32],
     attn_sink: pl.Tensor[[N_RANKS, H], pl.FP32],
     wo_a: pl.Tensor[[N_RANKS, O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[N_RANKS, D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b: pl.Tensor[[N_RANKS, O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
     hc_ffn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
@@ -386,6 +380,7 @@ def l3_mtp_prefill_fwd(
 def _projection_specs():
     import torch
     from golden import TensorSpec
+    from utils import pack_nz
 
     e_proj_cache = None
     h_proj_cache = None
@@ -403,7 +398,7 @@ def _projection_specs():
     def init_e_proj_w():
         nonlocal e_proj_cache
         e_proj_cache = init_proj_pair()
-        return e_proj_cache[0]
+        return pack_nz(e_proj_cache[0])
 
     def init_e_proj_w_scale():
         nonlocal e_proj_cache
@@ -414,7 +409,7 @@ def _projection_specs():
     def init_h_proj_w():
         nonlocal h_proj_cache
         h_proj_cache = init_proj_pair()
-        return h_proj_cache[0]
+        return pack_nz(h_proj_cache[0])
 
     def init_h_proj_w_scale():
         nonlocal h_proj_cache
@@ -479,6 +474,7 @@ def build_tensor_specs(
 ):
     import torch
     from golden import ScalarSpec, TensorSpec
+    from utils import pack_nz
 
     if output_mode not in ("validate", "device-resident"):
         raise ValueError(f"unsupported output_mode {output_mode!r}; expected 'validate' or 'device-resident'")
@@ -511,7 +507,7 @@ def build_tensor_specs(
 
     def init_lm_head_weight():
         shards = (torch.randn(LM_HEAD_TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
-        return torch.stack([shards[r % LM_HEAD_TP_SIZE] for r in range(N_RANKS)], dim=0)
+        return pack_nz(torch.stack([shards[r % LM_HEAD_TP_SIZE] for r in range(N_RANKS)], dim=0))
 
     def init_logit_row_indices():
         indices = torch.full((N_RANKS, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
@@ -747,7 +743,8 @@ def golden_mtp_prefill_fwd(tensors):
 
 def main():
     parser = argparse.ArgumentParser(description="DeepSeek-V4 MTP packed-prefill forward driver.")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument(
         "--ep", type=int, default=N_RANKS, choices=[2, 4, 8],
         help="EP world size / rank count (parsed at import by prefill_moe).",
@@ -774,6 +771,8 @@ def main():
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
+    if args.execution_mode:
+        parser.error("this entry requires hardware; --sim is unsupported")
 
     print(f"[RUN] output_mode={args.output_mode}", flush=True)
 
@@ -795,7 +794,8 @@ def main():
         config=dict(
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=device_ids[:N_RANKS], num_sub_workers=0),
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             enable_chip_swimlane=args.enable_chip_swimlane,
             enable_scope_stats=args.enable_scope_stats,
         ),

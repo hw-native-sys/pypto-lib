@@ -71,6 +71,15 @@ Mixed cube/vector kernels use a small dispatcher that launches the appropriate
 AIC and AIV entry points. The standalone case is intentionally single-core; it
 does not reproduce the full persistent or multi-core runtime schedule.
 
+For a kernel with `pl.split_aiv`, the two vector cores may take different
+branches. The normal runtime supplies a separate subblock ID to each AIV, but
+the standalone launch passes the same host scalar arguments to both. When the
+PTO IR identifies `__pypto_spmd_subblock_idx`, the profiling workflow rewrites
+only the generated standalone kernel to read each core's physical subblock ID.
+This is specific to the direct CCE simulator launch; it does not change the
+source kernel or the normal runtime wrapper. The manifest records
+`subblock_lane=get_subblockid()` when the rewrite was applied.
+
 ## Output layout
 
 A collection is stored below the selected build directory:
@@ -138,6 +147,8 @@ Treat any of these as a degenerate trace:
 - total execution is implausibly short;
 - `CUBE=0` for a kernel that should perform matmul;
 - a mixed kernel has no vector work;
+- a split-AIV kernel shows both vector cores taking the same branch when the
+  source assigns different work to subblock IDs 0 and 1;
 - the instruction CSV contains only scalar and synchronization operations; or
 - the collection summary warns about data-dependent control.
 
@@ -154,6 +165,13 @@ Before trusting such a trace:
    exceeding the generated bound.
 6. Rebuild and recollect from the testcase's working directory.
 7. Record the exact wired workload with the trace.
+
+For split-AIV branches, inspect the instruction CSV or trace for each vector
+core and confirm that the intended branch actually ran. Nonzero VECTOR cycles
+alone do not establish this: both cores can spend time in the same wrong
+branch. If the hardware subblock ID does not distinguish them in a particular
+camodel, report that limitation and do not interpret the trace as covering the
+missing branch.
 
 Static `.pto` shapes size the full GM allocations. For a direct `%argN`
 dynamic extent or stride, the bundled generator uses `--dynamic-dim`

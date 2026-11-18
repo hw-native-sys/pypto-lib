@@ -24,8 +24,14 @@ against it without a translation table.
 | Linear-attention head dim | 128 for both key and value |
 | Short convolution | depthwise, kernel 4, over all 10240 q/k/v channels |
 | Chunk length | 128 — our tiling choice, not a model constant |
-| Platform | Ascend A2/A3 (`-p a2a3`); A5 through the daily job |
+| Platform | Ascend A2/A3 (`-p a2a3`) |
 | Quantization | W8A8 around the delta rule, which has none itself (no weights): int8 weights per output channel, int8 activations per token. `in_proj_qkv`, `in_proj_z` and `out_proj` are int8 both sides; `in_proj_a`, `in_proj_b` and the convolution taps stay bf16, where int8 would move the block output by 3e-5 and save nothing. Measured cost on the real layer at T = 8192: 3.0e-2 against the float64 truth, ten times the model's own bf16 rounding |
+
+A2/A3 is the only platform this directory claims in
+[`.github/ci_platforms.json`](../../../.github/ci_platforms.json), so it is the only
+one the daily job runs for these entries, and the only one they have been validated
+on device. Every entry also accepts `-p a5`, but the A5 evidence so far is a manual
+simulator run: no A5 device validation and no daily A5 coverage.
 
 Grouped-query attention is the shape that matters here: value head `h` reads key
 head `h // 3`. q and k carry 16 heads; v, beta, the gate, the state and the
@@ -62,8 +68,60 @@ one implementation, [a8w8_linear.py](../../../models/qwen3_8_27b/a8w8_linear.py)
 each instance file supplies its shape, its tiles and where its weight and
 references come from.
 
+### How `solve_tril` inverts a chunk
+
 `solve_tril` is the delta-rule triangular inversion of
-[arXiv:2605.21325](https://arxiv.org/abs/2605.21325).
+[arXiv:2605.21325](https://arxiv.org/abs/2605.21325). `A` is strictly lower
+triangular, so `I + A` is unit triangular and its inverse is a finite Neumann
+series. The kernel reaches it by block doubling rather than by a sequential
+substitution, which keeps the work in the cube.
+
+Split `A = D + N`, with `D` block-diagonal in blocks of `BLOCK_TILE` and `N`
+strictly block-lower. Then
+
+```text
+I + A      = (I + D)(I + Xd N),   Xd = (I + D)^-1
+(I + A)^-1 = (I + M)^-1 Xd,       M  = Xd N
+```
+
+Both factors come from the same doubling step:
+
+```text
+X = I - D;  Y = D @ D
+repeat:  X += X @ Y;  Y = Y @ Y
+```
+
+`X` starts at two terms of the series and each update doubles the term count, so
+the inner factor is exact after `log2(BLOCK_TILE) - 1` updates (`ND_IN` in the
+file, since `D` is nilpotent at `D^BLOCK_TILE`) and the outer factor after
+`log2(CHUNK_TILE / BLOCK_TILE) - 1` (`ND_OUT`, since `M^(CHUNK_TILE /
+BLOCK_TILE) = 0`). Off a power of two the product stops short and the kernel
+returns a truncated inverse with no other symptom, so `solve_tril.py` refuses
+such a `CHUNK_TILE` or `BLOCK_TILE` at import.
+
+**Why the split, rather than doubling on the whole chunk.** The doubling holds
+`A^(2^j)` as FP16 matmul operands, which is safe only while those powers shrink.
+On synthetic keys they do -- `F.normalize(randn)` makes `k_i . k_j` concentrate
+near zero, and the row sums of `A` reach only ~0.10. A real layer's keys are
+correlated: the row sums reach **37**, the powers stay around 1 instead of
+shrinking, the intermediates pass **7e+05** against FP16's 65504, and the kernel
+returned NaN -- silently, because the composed block's int8 hand-off turned it
+into finite garbage. Splitting bounds each block's powers independently while
+keeping every matmul full-tile, so the fix costs 15 matmuls against 13 rather
+than the 52 that shrinking the tiles would take. `BLOCK_TILE` is 16 rather than
+32 because the split makes the block size free -- 15 matmuls either way -- so it
+takes the one with the most margin.
+
+The masks that select `D` and `N` are negated, so the accumulator forms `I - D`
+and `I - M` directly; the squaring steps are unaffected because `(-M)^2 = M^2`.
+Forming each identity in one `matmul_acc(acc, I, I)` that way measured **1440.2
+us against 1497.2** for the same split with each identity built by a
+negate-then-add pair, paired in one grant at T = 8192, H = 48, and at a slightly
+better error (2.198e-04 against 2.286e-04 on the real layer, where the gate is
+1e-3). The split as a whole costs about a quarter over the unsplit doubling --
+1622.1 against 1269.6, paired in an earlier grant, with the unsplit form
+non-finite on the real layer -- and none of that reaches the composed block,
+whose latency is unchanged inside its 150 us between-grant spread.
 
 ## The layer
 
@@ -73,11 +131,13 @@ allocated inside it and never leave; only q, k, v, the gate and beta come in, an
 only the output goes out. It is scored end to end against the float64 reference
 rather than stage by stage.
 
-The operators are shared, not duplicated: each `build_kernel` takes `inline`, so
-the same source is either a program of its own or a callee here. The one
-difference from running the stages back to back is that `solve_tril` writes
-`A_inv` as FP16 directly instead of FP32 for a host-side narrowing, since FP16 is
-what its consumer reads.
+The operators are shared, not duplicated. Each of the six delta-rule files
+decorates one body twice -- `pl.jit.inline` for the callee this layer calls,
+`pl.jit` for the standalone program its own entry point runs -- and each block
+operator's `build_kernel` takes `inline` for the same reason. Both names wrap
+the same source, so the layer and the stages run back to back compute the same
+thing: `solve_tril` writes `A_inv` as FP16 on either path, which is what
+`wy_fast` reads.
 
 `gdn_layer.py` is the delta rule alone. The surrounding block is
 [gdn_block.py](../../../models/qwen3_8_27b/gdn_block.py), below.
@@ -242,12 +302,20 @@ the whole of the rest.
 
 ## Validating and benchmarking
 
-[reference.py](../../../models/qwen3_8_27b/reference.py) is a float64 torch chain
-of all six stages, and around them of the whole block: the four projections, the
-depthwise convolution, the qk-norm and gate, the gated RMSNorm and `out_proj`,
-read line by line from `Qwen3_5GatedDeltaNet` in `transformers`. That block
-chain is what every operator and the composed block are scored against, so it
-is itself checked against the model's own module:
+Each of the six delta-rule files is its own test. It owns the float64 torch
+reference for its own stage, builds its inputs by calling the references of the
+stages before it, computes a golden, and scores the device result with the
+harness's `ratio_reldiff` per point plus a relative Frobenius norm over the whole
+output. [reference.py](../../../models/qwen3_8_27b/reference.py) holds what they
+share -- the drawn inputs, the two layout conversions and the acceptance
+criterion -- and, for the block, the float64 form of each piece around the delta
+rule: the four projections, the depthwise convolution, the qk-norm and gate, the
+gated RMSNorm and `out_proj`, read line by line from `Qwen3_5GatedDeltaNet` in
+`transformers`.
+[block_reference.py](../../../models/qwen3_8_27b/block_reference.py) strings
+those and `gdn_layer.delta_rule_ref` into one chain, hidden states to hidden
+states. That block chain is what every block operator and the composed block are
+scored against, so it is itself checked against the model's own module:
 [test_block_reference.py](../../../models/qwen3_8_27b/test_block_reference.py)
 runs `Qwen3_5GatedDeltaNet` on the same hidden states and weights and compares
 the two at every projection, after the delta rule, after the norm and at the
@@ -257,7 +325,7 @@ statistics in fp32 by its own code, which is the floor. In the model's own bf16
 the block output sits 3e-3 to 7e-3 from the float64 chain, which is the
 yardstick for what a device-side block can be held to.
 
-The reference is two references in one. On bf16 weights it is the float64
+The block chain is two references in one. On bf16 weights it is the float64
 truth above. On int8 weights (`reference.quantize_weights`, the same
 per-output-channel chain `models/qwen3_14b` and `models/deepseek_v4_pro` use)
 with per-token quantisation of the hidden states and of the normed output, it
@@ -279,23 +347,23 @@ needed. A trained layer's `A_log` and `dt_bias` reach a decay range the random
 init does not, and that is the range where a wrong scale, a wrong eps or a
 saturating gate would show.
 
-[test_gdn_stages.py](../../../models/qwen3_8_27b/test_gdn_stages.py)
-feeds each operator the reference outputs of the ones before it and scores it on
-relative Frobenius norm; `--chain` instead feeds each operator the previous
-*kernel's* device output, which is what the deployed pipeline does.
+A default invocation of a delta-rule entry runs its `DEFAULT_CASES`: one chunk,
+the cross-chunk recurrence and eight chunks (128, 256, 1024 tokens) for the five
+that accept a single chunk; `chunk_cumsum` and `gdn_layer` dispatch
+`CHUNK_TILE * GROUP_TILE = 512` tokens at a time, so they run 512 and 1024
+instead. `--seq-len` runs one shape instead, and `BENCH_SEQ = 8192` is the
+prefill shape a performance run names. `PYPTO_BENCH=1` turns any of them into a
+benchmark, and the harness prints the median `effective_us`.
 
 ```bash
 python models/qwen3_8_27b/gdn_block.py -p a2a3 -d 0
 python models/qwen3_8_27b/gdn_block.py -p a2a3sim --seq-len 2048
 python models/qwen3_8_27b/gdn_layer.py -p a2a3 -d 0
-python models/qwen3_8_27b/test_gdn_stages.py -p a2a3 -d 0
-python models/qwen3_8_27b/test_gdn_stages.py -p a2a3 -d 0 --chain
-python models/qwen3_8_27b/test_gdn_stages.py -p a2a3sim --seq-len 1024
+python models/qwen3_8_27b/chunk_h.py -p a2a3 --sim
+PYPTO_BENCH=1 python models/qwen3_8_27b/gdn_layer.py -p a2a3 -d 0 --seq-len 8192
 python models/qwen3_8_27b/bench.py -p a2a3 -d 0 --seq-len 8192
 ```
 
-`test_gdn_stages.py` and `bench.py` take `--heads` and `--qk-heads`, defaulting
-to the model's 48 and 16; pass the same value to both for an ungrouped shape.
 The block is marked device-only for CI: on a simulator it takes about eight
 minutes at T = 8192, more than the shared simulator job can spend on one file,
 so CI exercises it on hardware and the operators individually on the simulator.
