@@ -85,6 +85,33 @@ COMBINE_T_TILE = 2
 
 
 @pl.jit.inline(auto_scope=False)
+def initialize_balanced_routes(
+    routes: pl.Out[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+    rank: pl.Scalar[pl.INT32],
+    local_experts: pl.constexpr,
+    topk: pl.constexpr,
+):
+    """Write the equal-token balanced-routing fixture used by the MoE entry."""
+    capacity = pl.tensor.dim(routes, 0)
+    with pl.spmd(32, name_hint="initialize_balanced_routes"):
+        core = pl.tile.get_block_idx()
+        expanded = num_tokens * topk
+        rank_offset = rank * expanded + rank
+        for row in pl.range(core, capacity, 32):
+            values = pl.tile.full([1, 8], dtype=pl.INT32, value=0)
+            for lane in pl.unroll(topk):
+                offset = row * topk + lane + rank_offset
+                peer = offset % N_RANKS
+                expert = offset // N_RANKS % local_experts
+                expert_id = pl.cast(peer * local_experts + expert, pl.INT32)
+                pl.tile.write(values, [0, lane], expert_id)
+            valid_values = pl.set_validshape(values, 1, topk)
+            routes = pl.store(valid_values, [row, 0], routes)
+    return routes
+
+
+@pl.jit.inline(auto_scope=False)
 def clear_moe_signals(
     completion_anchor: pl.Tensor,
     data_arrived: pld.DistributedTensor,

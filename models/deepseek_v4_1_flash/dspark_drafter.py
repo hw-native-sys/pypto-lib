@@ -12,6 +12,9 @@
 
 import argparse
 import inspect
+from pathlib import Path
+
+from pypto.runtime import pto_isa_include_dir
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -28,7 +31,7 @@ from expert_routed import (
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS,
 )
 from input_pack import pack_x_hc
-from decode_moe import DISPATCH_PACKET_WIDTH, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD, moe
+from decode_moe import BALANCED_ROUTING, initialize_balanced_routes, DISPATCH_PACKET_WIDTH, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD, moe
 
 from dspark_attn import dspark_attn, dspark_context_kv
 from qkv_proj_rope import quantize_projection_input
@@ -41,8 +44,8 @@ DSPARK_QUERY_T_DYN = pl.dynamic("DSPARK_QUERY_T_DYN")
 _shape_parser = argparse.ArgumentParser(add_help=False)
 _shape_parser.add_argument("--draft-experts-per-rank", type=int, default=DSPARK_N_ROUTED_EXPERTS // EP_SIZE)
 _shape_options = _shape_parser.parse_known_args()[0]
-if _shape_options.draft_experts_per_rank <= 0 or EP_SIZE * _shape_options.draft_experts_per_rank % 16:
-    _shape_parser.error("--draft-experts-per-rank must be positive and give a total expert count aligned to 16")
+if _shape_options.draft_experts_per_rank <= 0 or EP_SIZE * _shape_options.draft_experts_per_rank < DSPARK_NUM_EXPERTS_PER_TOK:
+    _shape_parser.error("--draft-experts-per-rank must give at least draft TopK routed experts")
 
 
 # model config
@@ -68,32 +71,112 @@ TOPK = DSPARK_NUM_EXPERTS_PER_TOK
 MAIN_IN = DSPARK_DRAFT_LAYERS * D
 DSPARK_WINDOW = FLASH.sliding_window
 
-# tiling
-PROJ_M_TILE = 16
+
+# Projection tiles.
+PROJ_M_TILE = 80
 PROJ_N_TILE = 160
-PROJ_K_TILE = 128
+PROJ_K_TILE = 384
+QUANT_M_TILE = 16
+QUANT_K_TILE = 1280
+
+
+@pl.jit.extern(
+    core_type="mixed", dual_aiv_dispatch=True,
+    aic_source=Path(__file__).parent / "kernels/dspark_projection.cpp",
+    aiv_source=Path(__file__).parent / "kernels/dspark_projection.cpp",
+    include_dirs=(str(Path(__file__).parent / "kernels"), pto_isa_include_dir()),
+)
+def _dspark_projection_mix(
+    hidden: pl.Tensor,
+    payload: pl.Out[pl.Tensor],
+    scales: pl.Out[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+    padded_rows: pl.Scalar[pl.INDEX],
+    weight: pl.Tensor,
+    weight_scale: pl.Tensor,
+    output: pl.Out[pl.Tensor],
+) -> tuple[pl.Tensor, pl.Tensor, pl.Tensor]:
+    return payload, scales, output
 
 
 @pl.jit.inline(auto_scope=False)
 def dspark_proj(
     target_hidden: pl.Tensor[[T_DYN, MAIN_IN], pl.BF16],
-    main_proj_weight: pl.Tensor[[MAIN_IN, D], pl.BF16],
+    main_proj_weight: pl.Tensor[[MAIN_IN, D], pl.FP8E4M3FN],
+    main_proj_scale: pl.Tensor[[MAIN_IN // MX_GROUP, D], pl.FP8E8M0],
     projected: pl.Tensor[[T_DYN, D], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    """Project active target-tap rows to BF16 with FP32 accumulation."""
-    row_tiles = (num_tokens + PROJ_M_TILE - 1) // PROJ_M_TILE
-    for block in pl.spmd(row_tiles * (D // PROJ_N_TILE), name_hint="dspark_proj"):
-        row = block // (D // PROJ_N_TILE) * PROJ_M_TILE
-        column = block % (D // PROJ_N_TILE) * PROJ_N_TILE
-        valid_rows = pl.min(PROJ_M_TILE, num_tokens - row)
-        acc = pl.tile.create([PROJ_M_TILE, PROJ_N_TILE], pl.FP32, target_memory=pl.Mem.Acc, compact=True)
-        acc = pl.set_validshape(acc, valid_rows, PROJ_N_TILE)
-        for k in pl.pipeline(0, MAIN_IN, PROJ_K_TILE, stage=3):
-            hidden = pl.load(target_hidden, [row, k], [PROJ_M_TILE, PROJ_K_TILE], [valid_rows, PROJ_K_TILE])
-            weight = pl.load(main_proj_weight, [k, column], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
-            acc = pl.matmul_acc(acc, hidden, weight, init_cond=(k == 0))
-        pl.store(pl.set_validshape(acc, valid_rows, PROJ_N_TILE), [row, column], projected)
+    """Project target taps with NZ MXFP8 weights and MX_B_NN E8M0 scales in a MIX launch."""
+    target_hidden.bind_dynamic(0, T_DYN)
+    projected.bind_dynamic(0, T_DYN)
+    padded_rows = (num_tokens + 79) // 80 * 80
+    payload = pl.create_tensor([padded_rows, MAIN_IN], dtype=pl.FP8E4M3FN)
+    scales = pl.create_tensor([1, padded_rows * (MAIN_IN // MX_GROUP)], dtype=pl.FP8E8M0)
+    workers = pl.min(D // PROJ_N_TILE, pl.system.available_cluster_count())
+    with pl.spmd(workers, name_hint="dspark_quant_gemm_mix", sync_start=True):
+        payload, scales, projected = _dspark_projection_mix(
+            target_hidden, payload, scales, num_tokens, padded_rows,
+            main_proj_weight, main_proj_scale, projected,
+        )
+    return projected
+
+
+@pl.jit.inline(auto_scope=False)
+def dspark_proj_pypto(
+    target_hidden: pl.Tensor[[T_DYN, MAIN_IN], pl.BF16],
+    main_proj_weight: pl.Tensor[[MAIN_IN, D], pl.FP8E4M3FN, pl.NZ],
+    main_proj_scale: pl.Tensor[[MAIN_IN // MX_GROUP, D], pl.FP8E8M0],
+    projected: pl.Tensor[[T_DYN, D], pl.BF16],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Quantize target taps once and project them with NZ MXFP8 weights."""
+    target_hidden.bind_dynamic(0, T_DYN)
+    projected.bind_dynamic(0, T_DYN)
+    padded_rows = (num_tokens + PROJ_M_TILE - 1) // PROJ_M_TILE * PROJ_M_TILE
+    payload = pl.create_tensor([padded_rows, MAIN_IN], dtype=pl.FP8E4M3FN)
+    scales = pl.create_tensor([1, padded_rows * (MAIN_IN // MX_GROUP)], dtype=pl.FP8E8M0)
+    quant_tasks = padded_rows // QUANT_M_TILE * (MAIN_IN // QUANT_K_TILE)
+    quant_workers = pl.min(quant_tasks, 2 * pl.system.available_cluster_count())
+    with pl.spmd(quant_workers, name_hint="dspark_projection_quant") as quantized:
+        worker = pl.tile.get_block_idx()
+        workers = pl.tile.get_block_num()
+        for task in pl.range(worker, quant_tasks, workers):
+            row = task // (MAIN_IN // QUANT_K_TILE) * QUANT_M_TILE
+            k = task % (MAIN_IN // QUANT_K_TILE) * QUANT_K_TILE
+            source_row = pl.min(row, num_tokens - 1)
+            rows = pl.min(QUANT_M_TILE, num_tokens - source_row)
+            source = pl.load(target_hidden, [source_row, k], [QUANT_M_TILE, QUANT_K_TILE], valid_shape=[rows, QUANT_K_TILE])
+            padded = pl.fillpad(source, pad_value=pl.PadValue.zero)
+            full = pl.set_validshape(padded, QUANT_M_TILE, QUANT_K_TILE)
+            data, scale = pl.quant_mx(full, group_axis=1, quant_scale_alg="ocp")
+            payload = pl.store(data, [row, k], payload)
+            packed = pl.reshape(scale, [1, QUANT_M_TILE * (QUANT_K_TILE // MX_GROUP)])
+            offset = row * (MAIN_IN // MX_GROUP) + k // MX_GROUP * QUANT_M_TILE
+            scales = pl.store(packed, [0, offset], scales)
+
+    weight_scale = pl.tensor.view(main_proj_scale, [MAIN_IN // MX_GROUP, D], layout=pl.MX_B_NN)
+    for row_tile in pl.parallel((num_tokens + PROJ_M_TILE - 1) // PROJ_M_TILE):
+        row = row_tile * PROJ_M_TILE
+        scale_begin = row * (MAIN_IN // MX_GROUP)
+        scale_end = scale_begin + PROJ_M_TILE * (MAIN_IN // MX_GROUP)
+        scale_slice = scales[0:1, scale_begin:scale_end]
+        activation_scale = pl.tensor.view(scale_slice, [PROJ_M_TILE, MAIN_IN // MX_GROUP], layout=pl.MX_A_ZZ)
+        with pl.spmd(D // PROJ_N_TILE, name_hint="dspark_projection_gemm", deps=[quantized]):
+            col = pl.tile.get_block_idx() * PROJ_N_TILE
+            a = pl.load(payload, [row, 0], [PROJ_M_TILE, PROJ_K_TILE], target_memory=pl.Mem.Mat)
+            sa = pl.load(activation_scale, [0, 0], [PROJ_M_TILE, PROJ_K_TILE // MX_GROUP])
+            b = pl.load(main_proj_weight, [0, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+            sb = pl.load(weight_scale, [0, col], [PROJ_K_TILE // MX_GROUP, PROJ_N_TILE])
+            acc = pl.matmul_mx(a, sa, b, sb)
+            for k in pl.pipeline(PROJ_K_TILE, MAIN_IN, PROJ_K_TILE, stage=2):
+                a_next = pl.load(payload, [row, k], [PROJ_M_TILE, PROJ_K_TILE], target_memory=pl.Mem.Mat)
+                sa_next = pl.load(activation_scale, [0, k // MX_GROUP], [PROJ_M_TILE, PROJ_K_TILE // MX_GROUP])
+                b_next = pl.load(main_proj_weight, [k, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+                sb_next = pl.load(weight_scale, [k // MX_GROUP, col], [PROJ_K_TILE // MX_GROUP, PROJ_N_TILE])
+                acc = pl.matmul_mx_acc(acc, a_next, sa_next, b_next, sb_next)
+            valid = pl.set_validshape(acc, pl.min(PROJ_M_TILE, num_tokens - row), PROJ_N_TILE)
+            projected = pl.store(valid, [row, col], projected)
     return projected
 
 
@@ -111,66 +194,92 @@ def dspark_metadata(
     rope_sin: pl.Out[pl.Tensor[[MOE_TOKENS, ROPE_DIM // 2], pl.FP32]],
     pre_mix: pl.Out[pl.Tensor[[MOE_TOKENS, HC_MULT], pl.FP32]],
 ):
-    """Build padded query IDs, paged visibility, RoPE rows, and initial HC coefficients."""
+    """Build query metadata with 64 row/layer workers and local-page VF gathers."""
     batch = pl.tensor.dim(anchor_ids, 0)
     table_blocks = pl.tensor.dim(block_tables, 2)
-    for _ in pl.spmd(1, name_hint="dspark_metadata"):
-        for row in pl.range(MOE_TOKENS):
-            pl.write(padded_ids, [row], pl.cast(0, pl.INT64))
-            rope_cos[row : row + 1, :] = pl.full([1, ROPE_DIM // 2], dtype=pl.FP32, value=0.0)
-            rope_sin[row : row + 1, :] = pl.full([1, ROPE_DIM // 2], dtype=pl.FP32, value=0.0)
-            if row < batch * DSPARK_QUERY_WIDTH:
-                rope_cos[row : row + 1, :] = query_rope_cos[row : row + 1, :]
-                rope_sin[row : row + 1, :] = query_rope_sin[row : row + 1, :]
-            for lane in pl.range(HC_MULT):
-                coefficient = pl.cast(0.0, pl.FP32)
-                if lane == 0:
-                    coefficient = pl.cast(1.0, pl.FP32)
-                pl.write(pre_mix, [row, lane], coefficient)
-            for layer in pl.range(DSPARK_DRAFT_LAYERS):
-                pl.write(padded_slots, [layer, row], pl.cast(-1, pl.INT64))
-                empty_indices = pl.full([1, 1, DSPARK_SWA_INDEX_WIDTH], dtype=pl.INT32, value=-1)
-                padded_indices[layer : layer + 1, row : row + 1, :] = empty_indices
-        for request in pl.range(batch):
-            first = pl.read(first_query_positions, [request])
+    flat_padded_ids = pl.reshape(padded_ids, [1, MOE_TOKENS])
+    flat_indices = pl.reshape(padded_indices, [DSPARK_DRAFT_LAYERS * MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH])
+    for core in pl.spmd(64, name_hint="dspark_metadata"):
+        for work in pl.range(core, MOE_TOKENS * DSPARK_DRAFT_LAYERS, 64):
+            layer = work % DSPARK_DRAFT_LAYERS
+            row = work // DSPARK_DRAFT_LAYERS
+            request = row // DSPARK_QUERY_WIDTH
+            first = pl.cast(0, pl.INT32)
+            if request < batch:
+                first = pl.read(first_query_positions, [request])
+            buffer = pl.tile.full([1, DSPARK_SWA_INDEX_WIDTH], dtype=pl.INT32, value=-1)
+            buffer = pl.tile.move(buffer, target_memory=pl.Mem.Vec)
+            indices = pl.reshape(buffer, [DSPARK_SWA_INDEX_WIDTH])
             if first > 0 and table_blocks > 0:
                 prefix = pl.max(first - DSPARK_WINDOW, 0)
                 visible = first - prefix + DSPARK_QUERY_WIDTH
-                for offset in pl.range(DSPARK_QUERY_WIDTH):
-                    row = request * DSPARK_QUERY_WIDTH + offset
+                first_page = prefix // BLOCK_SIZE
+                page_count = (first + DSPARK_QUERY_WIDTH - 1) // BLOCK_SIZE - first_page + 1
+                pages = pl.create_tile([1, 8], dtype=pl.INT32, target_memory=pl.Mem.Vec)
+                for offset in pl.range(page_count):
+                    page = (first_page + offset) % table_blocks
+                    physical = pl.read(block_tables, [layer, request, page])
+                    pl.tile.write(pages, [0, offset], physical)
+                page_table = pl.reshape(pages, [8])
+                prefix_u = pl.cast(prefix, pl.UINT32)
+                visible_u = pl.cast(visible, pl.UINT32)
+                first_page_u = pl.cast(first_page, pl.UINT32)
+                with pl.reg_scope():
+                    r_full = pl.reg.full_mask(lanes=64)
+                    r_lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
+                    r_low = pl.reg.broadcast(BLOCK_SIZE - 1, lanes=64, dtype=pl.UINT32)
+                    r_first_page = pl.reg.broadcast(first_page_u, lanes=64, dtype=pl.UINT32)
+                    r_empty = pl.reg.broadcast(-1, lanes=64, dtype=pl.INT32)
+                    for segment in pl.hardware_loop(DSPARK_SWA_INDEX_WIDTH // 64):
+                        r_column = pl.reg.adds(r_lane, pl.cast(segment * 64, pl.UINT32), r_full)
+                        r_position = pl.reg.adds(r_column, prefix_u, r_full)
+                        r_page = pl.reg.shift_rights(r_position, 7, r_full)
+                        r_page = pl.reg.sub(r_page, r_first_page, r_full)
+                        r_valid = pl.reg.compares(r_column, visible_u, r_full, predicate="lt")
+                        r_physical = pl.reg.gather(page_table, r_page, r_valid)
+                        r_base = pl.reg.muls(r_physical, BLOCK_SIZE, r_full)
+                        r_offset_u = pl.reg.bitwise_and(r_position, r_low, r_full)
+                        r_offset_i = pl.reg.interpret_cast(r_offset_u, dtype=pl.INT32)
+                        r_slot = pl.reg.add(r_base, r_offset_i, r_full)
+                        r_result = pl.reg.select(r_valid, r_slot, r_empty)
+                        _written = pl.reg.store(indices, segment * 64, r_result)
+            slot = pl.cast(-1, pl.INT64)
+            if first > 0 and table_blocks > 0:
+                position = first + row % DSPARK_QUERY_WIDTH
+                page = position // BLOCK_SIZE % table_blocks
+                physical = pl.read(block_tables, [layer, request, page])
+                slot = pl.cast(physical * BLOCK_SIZE + position % BLOCK_SIZE, pl.INT64)
+            slot_tile = pl.tile.create([1, 4], pl.INT64)
+            pl.tile.write(slot_tile, [0, 0], slot)
+            pl.store(pl.set_validshape(slot_tile, 1, 1), [layer, row], padded_slots)
+            index_row = pl.reshape(indices, [1, DSPARK_SWA_INDEX_WIDTH])
+            pl.store(index_row, [layer * MOE_TOKENS + row, 0], flat_indices)
+            if layer == 0:
+                token = pl.cast(0, pl.INT64)
+                if first > 0 and table_blocks > 0:
                     token = pl.cast(DSPARK_NOISE_TOKEN_ID, pl.INT64)
-                    if offset == 0:
+                    if row % DSPARK_QUERY_WIDTH == 0:
                         token = pl.read(anchor_ids, [request])
-                    pl.write(padded_ids, [row], token)
-                for layer in pl.range(DSPARK_DRAFT_LAYERS):
-                    columns = pl.arange(0, [1, DSPARK_SWA_INDEX_WIDTH], dtype=pl.INT32)
-                    positions = pl.add(columns, pl.cast(prefix, pl.INT32))
-                    indices = pl.full([1, DSPARK_SWA_INDEX_WIDTH], dtype=pl.INT32, value=-1)
-                    for page in pl.range(prefix // BLOCK_SIZE, (first + DSPARK_QUERY_WIDTH - 1) // BLOCK_SIZE + 1):
-                        block = pl.read(block_tables, [layer, request, page % table_blocks])
-                        lower = pl.cmp(positions, pl.cast(page * BLOCK_SIZE, pl.INT32), cmp_type=5)
-                        upper = pl.cmp(positions, pl.cast((page + 1) * BLOCK_SIZE, pl.INT32), cmp_type=2)
-                        in_page = pl.mul(lower, upper)
-                        visible_mask = pl.cmp(columns, pl.cast(visible, pl.INT32), cmp_type=2)
-                        valid = pl.mul(in_page, visible_mask)
-                        slots = pl.add(positions, pl.cast((block - page) * BLOCK_SIZE, pl.INT32))
-                        delta = pl.sub(slots, indices)
-                        update = pl.mul(valid, delta)
-                        indices = pl.add(indices, update)
-                    index_row = pl.reshape(indices, [1, 1, DSPARK_SWA_INDEX_WIDTH])
-                    for offset in pl.range(DSPARK_QUERY_WIDTH):
-                        row = request * DSPARK_QUERY_WIDTH + offset
-                        position = first + offset
-                        page = position // BLOCK_SIZE % table_blocks
-                        block = pl.read(block_tables, [layer, request, page])
-                        slot = pl.cast(block * BLOCK_SIZE + position % BLOCK_SIZE, pl.INT64)
-                        pl.write(padded_slots, [layer, row], slot)
-                        padded_indices[layer : layer + 1, row : row + 1, :] = index_row
+                token_tile = pl.tile.create([1, 4], pl.INT64)
+                pl.tile.write(token_tile, [0, 0], token)
+                pl.store(pl.set_validshape(token_tile, 1, 1), [0, row], flat_padded_ids)
+                cos = pl.full([1, ROPE_DIM // 2], dtype=pl.FP32, value=0.0)
+                sin = pl.full([1, ROPE_DIM // 2], dtype=pl.FP32, value=0.0)
+                if row < batch * DSPARK_QUERY_WIDTH:
+                    cos = query_rope_cos[row : row + 1, :]
+                    sin = query_rope_sin[row : row + 1, :]
+                rope_cos[row : row + 1, :] = cos
+                rope_sin[row : row + 1, :] = sin
+                mix = pl.tile.full([1, 8], dtype=pl.FP32, value=0.0)
+                pl.tile.write(mix, [0, 0], pl.cast(1.0, pl.FP32))
+                pl.store(pl.set_validshape(mix, 1, HC_MULT), [row, 0], pre_mix)
+    return padded_ids, padded_slots, padded_indices, rope_cos, rope_sin, pre_mix
 
 
 def _dspark_drafter(
     target_hidden: pl.Tensor[[T_DYN, MAIN_IN], pl.BF16],
-    main_proj_weight: pl.Tensor[[MAIN_IN, D], pl.BF16],
+    main_proj_weight: pl.Tensor[[MAIN_IN, D], pl.FP8E4M3FN],
+    main_proj_scale: pl.Tensor[[MAIN_IN // MX_GROUP, D], pl.FP8E8M0],
     main_norm_weight: pl.Tensor[[D], pl.BF16],
     num_sampled: pl.Tensor[[B_DYN], pl.INT32],
     last_sampled: pl.Tensor[[B_DYN], pl.INT64],
@@ -249,7 +358,7 @@ def _dspark_drafter(
     context_tokens = pl.tensor.dim(target_hidden, 0)
     main_x = pl.create_tensor([context_tokens, D], dtype=pl.BF16)
     projected = pl.create_tensor([context_tokens, D], dtype=pl.BF16)
-    dspark_proj(target_hidden, main_proj_weight, projected, context_tokens)
+    dspark_proj(target_hidden, main_proj_weight, main_proj_scale, projected, context_tokens)
     rms_norm(projected, main_norm_weight, main_x, context_tokens, width=D, zero_tail=False)
 
     context_payload, context_scales, context_padded_rows = quantize_projection_input(main_x, context_tokens, row_tile=80)
@@ -279,6 +388,9 @@ def _dspark_drafter(
 
     batch = pl.tensor.dim(num_sampled, 0)
     query_tokens = batch * DSPARK_QUERY_WIDTH
+    force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
+    if BALANCED_ROUTING:
+        initialize_balanced_routes(force_topk, query_tokens, rank, N_LOCAL_EXPERTS, TOPK)
     for layer in pl.range(DSPARK_DRAFT_LAYERS):
         layer_wq_a_scale: pl.Tensor[[D // MX_GROUP, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[layer]
         layer_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wq_b_scale[layer]
@@ -304,7 +416,6 @@ def _dspark_drafter(
             query_tokens,
         )
 
-        force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
         moe(
             attention_hidden, attention_pre_mix,
             hc_ffn_fn[layer], hc_ffn_scale[layer], hc_ffn_base[layer],
@@ -333,7 +444,8 @@ l2_dspark_drafter = pl.jit(auto_scope=False)(_dspark_drafter)
 @pl.jit.host
 def l3_dspark_drafter(
     target_hidden: pl.Tensor[[C.EP_SIZE, T_DYN, MAIN_IN], pl.BF16],
-    main_proj_weight: pl.Tensor[[C.EP_SIZE, MAIN_IN, D], pl.BF16],
+    main_proj_weight: pl.Tensor[[C.EP_SIZE, MAIN_IN, D], pl.FP8E4M3FN],
+    main_proj_scale: pl.Tensor[[C.EP_SIZE, MAIN_IN // MX_GROUP, D], pl.FP8E8M0],
     main_norm_weight: pl.Tensor[[C.EP_SIZE, D], pl.BF16],
     num_sampled: pl.Tensor[[C.EP_SIZE, B_DYN], pl.INT32],
     last_sampled: pl.Tensor[[C.EP_SIZE, B_DYN], pl.INT64],
@@ -416,7 +528,7 @@ def l3_dspark_drafter(
         routed_output = pld.window(routed_output_buf, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buf, [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
         l2_dspark_drafter(
-            target_hidden[rank], main_proj_weight[rank], main_norm_weight[rank],
+            target_hidden[rank], main_proj_weight[rank], main_proj_scale[rank], main_norm_weight[rank],
             num_sampled[rank], last_sampled[rank], next_prefill_tokens[rank],
             anchor_ids[rank], first_query_positions[rank],
             block_tables[rank], context_slots[rank],
