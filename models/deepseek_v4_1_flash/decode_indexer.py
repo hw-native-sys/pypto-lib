@@ -791,9 +791,9 @@ def _score_select_pool(
     runs = pl.create_tensor([4, tokens + 1], dtype=pl.INT32)
     table_width = pl.tensor.dim(block_table, 1)
     request_count = pl.tensor.dim(block_table, 0)
-    with pl.spmd(32, name_hint="idx_gather_pool", deps=[cache_ready, pool_ready]) as gather_tid:
+    with pl.spmd(64, name_hint="idx_gather_pool", deps=[cache_ready, pool_ready]) as gather_tid:
         worker = pl.tile.get_block_idx()
-        for work in pl.range(worker, num_tokens * panels, 32):
+        for work in pl.range(worker, num_tokens * panels, 64):
             token = work // panels
             panel = work % panels
             slot_begin = panel * 32
@@ -804,32 +804,64 @@ def _score_select_pool(
             raw_scale = pl.tile.full([1, 256 * _SCALE_COUNT], dtype=pl.INT8, value=127)
             valid_lanes = pl.tile.full([1, 256], dtype=pl.INT32, value=0)
             physical_lanes = pl.tile.full([1, 256], dtype=pl.INT32, value=-1)
-            for block in pl.range(32):
-                slot = slot_begin + block
-                if slot < count:
-                    logical_block = pl.read(pool_block_ids, [token, slot])
-                    if logical_block >= 0 and logical_block < (visible + 7) // 8:
-                        logical_page = logical_block // 16
-                        if request >= 0 and request < request_count and logical_page < table_width:
-                            page = pl.read(block_table, [pl.cast(request, pl.INDEX), logical_page])
-                            if page >= 0 and page < cache_pages:
-                                physical_row = pl.cast(page, pl.INDEX) * 128 + (logical_block % 16) * 8
-                                payload_raw = pl.load(cache_flat, [physical_row, 0], [8, INDEX_DIM // 2], target_memory=pl.MemorySpace.Vec)
-                                payload = pl.reinterpret_view(payload_raw, pl.INT8)
-                                packed[block * 8:block * 8 + 8, :] = payload
-                                scales_raw = pl.load(scale_flat, [physical_row // 8, 0], [1, 32], target_memory=pl.MemorySpace.Vec)
-                                block_scale_bytes = pl.reinterpret_view(scales_raw, pl.UINT8)
-                                block_scales = pl.reinterpret_view(block_scale_bytes, pl.INT8)
-                                raw_scale[:, block * 32:block * 32 + 32] = block_scales
-                                lanes = pl.tile.arange(0, [1, 8], dtype=pl.INT32)
-                                remaining = pl.cast(pl.min(8, visible - logical_block * 8), pl.INT32)
-                                lane_valid = pl.tile.cmps(lanes, remaining, cmp_type=2)
-                                ones = pl.tile.full([1, 8], dtype=pl.INT32, value=1)
-                                block_valid = pl.tile.select(lane_valid, ones, 0)
-                                block_physical = pl.add(lanes, pl.cast(physical_row, pl.INT32))
-                                block_physical = pl.tile.select(lane_valid, block_physical, -1)
-                                valid_lanes[:, block * 8:block * 8 + 8] = block_valid
-                                physical_lanes[:, block * 8:block * 8 + 8] = block_physical
+            for piece in pl.range(2):
+                page_slot = slot_begin + piece * 16
+                copied_page = pl.cast(0, pl.INT32)
+                if page_slot + 16 <= count and request >= 0 and request < request_count:
+                    first = pl.cast(pl.read(pool_block_ids, [token, page_slot]), pl.INDEX)
+                    if first >= 0 and first % 16 == 0 and (first + 16) * 8 <= visible:
+                        logical_page = first // 16
+                        if logical_page < table_width:
+                            contiguous = pl.cast(1, pl.INT32)
+                            for offset in pl.range(1, 16):
+                                block_id = pl.read(pool_block_ids, [token, page_slot + offset])
+                                if block_id != first + offset:
+                                    contiguous = pl.cast(0, pl.INT32)
+                            if contiguous != 0:
+                                page = pl.read(block_table, [pl.cast(request, pl.INDEX), logical_page])
+                                if page >= 0 and page < cache_pages:
+                                    row = pl.cast(page, pl.INDEX) * 128
+                                    page_payload = pl.load(cache_flat, [row, 0], [128, INDEX_DIM // 2],
+                                                      target_memory=pl.MemorySpace.Vec)
+                                    packed = pl.tile.assemble(packed, pl.reinterpret_view(page_payload, pl.INT8), [piece * 128, 0])
+                                    page_scales_raw = pl.load(scale_flat, [row // 8, 0], [16, 32],
+                                                         target_memory=pl.MemorySpace.Vec)
+                                    page_scale_bytes = pl.reinterpret_view(pl.reinterpret_view(page_scales_raw, pl.UINT8), pl.INT8)
+                                    raw_scale = pl.tile.assemble(raw_scale, pl.reshape(page_scale_bytes, [1, 512]), [0, piece * 512])
+                                    page_ones = pl.tile.full([1, 128], dtype=pl.INT32, value=1)
+                                    valid_lanes = pl.tile.assemble(valid_lanes, page_ones, [0, piece * 128])
+                                    page_rows = pl.tile.arange(0, [1, 128], dtype=pl.INT32)
+                                    page_rows = pl.add(page_rows, pl.cast(row, pl.INT32))
+                                    physical_lanes = pl.tile.assemble(physical_lanes, page_rows, [0, piece * 128])
+                                    copied_page = pl.cast(1, pl.INT32)
+                if copied_page == 0:
+                    for page_block in pl.range(16):
+                        block = piece * 16 + page_block
+                        slot = slot_begin + block
+                        if slot < count:
+                            logical_block = pl.read(pool_block_ids, [token, slot])
+                            if logical_block >= 0 and logical_block < (visible + 7) // 8:
+                                logical_page = logical_block // 16
+                                if request >= 0 and request < request_count and logical_page < table_width:
+                                    page = pl.read(block_table, [pl.cast(request, pl.INDEX), logical_page])
+                                    if page >= 0 and page < cache_pages:
+                                        physical_row = pl.cast(page, pl.INDEX) * 128 + (logical_block % 16) * 8
+                                        payload_raw = pl.load(cache_flat, [physical_row, 0], [8, INDEX_DIM // 2], target_memory=pl.MemorySpace.Vec)
+                                        payload = pl.reinterpret_view(payload_raw, pl.INT8)
+                                        packed[block * 8:block * 8 + 8, :] = payload
+                                        scales_raw = pl.load(scale_flat, [physical_row // 8, 0], [1, 32], target_memory=pl.MemorySpace.Vec)
+                                        block_scale_bytes = pl.reinterpret_view(scales_raw, pl.UINT8)
+                                        block_scales = pl.reinterpret_view(block_scale_bytes, pl.INT8)
+                                        raw_scale[:, block * 32:block * 32 + 32] = block_scales
+                                        lanes = pl.tile.arange(0, [1, 8], dtype=pl.INT32)
+                                        remaining = pl.cast(pl.min(8, visible - logical_block * 8), pl.INT32)
+                                        lane_valid = pl.tile.cmps(lanes, remaining, cmp_type=2)
+                                        ones = pl.tile.full([1, 8], dtype=pl.INT32, value=1)
+                                        block_valid = pl.tile.select(lane_valid, ones, 0)
+                                        block_physical = pl.add(lanes, pl.cast(physical_row, pl.INT32))
+                                        block_physical = pl.tile.select(lane_valid, block_physical, -1)
+                                        valid_lanes[:, block * 8:block * 8 + 8] = block_valid
+                                        physical_lanes[:, block * 8:block * 8 + 8] = block_physical
             row_offset = token * gathered_rows + panel * 256
             packed_bytes = pl.reinterpret_view(packed, pl.UINT8)
             pl.store(packed_bytes, [row_offset, 0], payloads)
