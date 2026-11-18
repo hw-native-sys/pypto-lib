@@ -35,13 +35,13 @@ from moe import (
     VOCAB,
     build_tensor_specs as build_moe_tensor_specs,
     clear_prefill_moe_signals,
-    prefill_moe,
+    prefill_moe_local,
 )
 from config import FLASH as MODEL_CONFIG
 from prefill_swa import (
     build_cp_tensor_specs as build_swa_attention_tensor_specs,
     build_ragged2_cp_tensor_specs as build_swa_ragged2_tensor_specs,
-    prefill_attention_swa_cp,
+    prefill_attention_swa_cp_local,
 )
 from prefill_hca import (
     COMPRESS_RATIO as HCA_COMPRESS_RATIO,
@@ -54,7 +54,7 @@ from prefill_hca import (
     SPARSE_CMP_MAX_BLOCKS as HCA_CMP_MAX_BLOCKS,
     build_cp_tensor_specs as build_hca_attention_tensor_specs,
     build_ragged2_cp_tensor_specs as build_hca_ragged2_tensor_specs,
-    prefill_attention_hca_cp,
+    prefill_attention_hca_cp_local,
 )
 from prefill_csa import (
     BLOCK_SIZE,
@@ -85,11 +85,14 @@ from prefill_csa import (
     START_POS,
     build_cp_tensor_specs as build_csa_attention_tensor_specs,
     build_ragged2_cp_tensor_specs as build_csa_ragged2_tensor_specs,
-    prefill_attention_csa_cp,
+    prefill_attention_csa_cp_local,
 )
 from prefill_cp_token_allgather import (
     PREFILL_GROUP_CAP,
     TP_SIZE,
+    prefill_cp_materialize_hc_full,
+    prefill_cp_materialize_coeff_full,
+    prefill_cp_token_allgather_into,
 )
 from prefill_metadata import (
     CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE,
@@ -415,6 +418,8 @@ def prefill_fwd(
     group_base = my_rank // TP_SIZE * TP_SIZE
     tp_rank = my_rank % TP_SIZE
     local_tokens = pl.tensor.dim(position_ids_local, 0)
+    group_rows = pl.tensor.dim(x_hc, 0)
+    local_start = pl.cast(tp_rank, pl.INDEX) * pl.cast(local_tokens, pl.INDEX)
     request_count = pl.tensor.dim(query_start_loc, 0) - 1
     # Query boundaries must agree across the TP/CP group.
     group_tokens = pl.read(query_start_loc, [request_count])
@@ -433,6 +438,27 @@ def prefill_fwd(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_fwd_order_state_init"):
         pl.write(stage_token, [0], pl.cast(0, pl.INT32))
         pl.write(layer_completion, [0], pl.cast(0, pl.INT32))
+
+    # Local HC state and FFN coefficient views.
+    hc_elements_local = local_tokens * HC_MULT * D
+    hidden_elements_local = local_tokens * D
+    post_elements_local = local_tokens * HC_MULT
+    comb_elements_local = local_tokens * HC_MULT * HC_MULT
+    x_hc_rows_local = pl.slice(x_hc, [local_tokens, HC_MULT, D], [local_start, 0, 0])
+    x_hc_flat_local = pl.reshape(x_hc_rows_local, [hc_elements_local])
+    x_hc_local = pl.reshape(x_hc_flat_local, [local_tokens, HC_MULT, D])
+    attn_stage_rows_local = pl.slice(attn_stage, [local_tokens, HC_MULT, D], [local_start, 0, 0])
+    attn_stage_flat_local = pl.reshape(attn_stage_rows_local, [hc_elements_local])
+    attn_stage_local = pl.reshape(attn_stage_flat_local, [local_tokens, HC_MULT, D])
+    x_mixed_rows_local = pl.slice(x_mixed, [local_tokens, D], [local_start, 0])
+    x_mixed_flat_local = pl.reshape(x_mixed_rows_local, [hidden_elements_local])
+    x_mixed_local = pl.reshape(x_mixed_flat_local, [local_tokens, D])
+    post_ffn_rows_local = pl.slice(post_ffn, [local_tokens, HC_MULT], [local_start, 0])
+    post_ffn_flat_local = pl.reshape(post_ffn_rows_local, [post_elements_local])
+    post_ffn_local = pl.reshape(post_ffn_flat_local, [local_tokens, HC_MULT])
+    comb_ffn_rows_local = pl.slice(comb_ffn, [local_tokens, HC_MULT * HC_MULT], [local_start, 0])
+    comb_ffn_flat_local = pl.reshape(comb_ffn_rows_local, [comb_elements_local])
+    comb_ffn_local = pl.reshape(comb_ffn_flat_local, [local_tokens, HC_MULT * HC_MULT])
 
     # Layer 0: SWA.
     with pl.scope():
@@ -487,12 +513,12 @@ def prefill_fwd(
         shared_w2_scale_l0 = pl.slice(shared_w2_scale, [D], [d_start_l0])
 
         with pl.scope():
-            attn_stage_step = attn_stage
+            attn_stage_step = attn_stage_local
             gather_signal_step = gather_signal
             o_proj_wo_b_full_step = o_proj_wo_b_full
             if group_tokens > 0:
-                prefill_attention_swa_cp(
-                    x_hc,
+                prefill_attention_swa_cp_local(
+                    x_hc_local,
                     hc_attn_fn_l0, hc_attn_scale_l0, hc_attn_base_l0,
                     attn_norm_w_l0, wq_a_l0, wq_b_l0, wq_b_scale_l0,
                     wkv_l0, gamma_cq_l0, gamma_ckv_l0,
@@ -510,20 +536,19 @@ def prefill_fwd(
                 )
 
         with pl.scope():
-            prefill_moe(
-                attn_stage,
+            prefill_moe_local(
+                attn_stage_local,
                 hc_ffn_fn_l0, hc_ffn_scale_l0, hc_ffn_base_l0,
                 norm_w_l0, gate_w_l0, gate_bias_l0, tid2eid_l0, input_ids,
                 routed_w1_l0, routed_w1_scale_l0, routed_w3_l0, routed_w3_scale_l0,
                 routed_w2_l0, routed_w2_scale_l0,
                 shared_w1_l0, shared_w1_scale_l0, shared_w3_l0, shared_w3_scale_l0,
                 shared_w2_l0, shared_w2_scale_l0,
-                x_hc, x_mixed, post_ffn, comb_ffn, ffn_out,
+                x_hc_local, x_mixed_local, post_ffn_local, comb_ffn_local, ffn_out,
                 recv_meta, recv_x, recv_aux,
                 arrived, data_arrived, routed_y_buf, combine_arrived,
                 stage_done, stage_token, layer_completion,
-                gather_window, gather_signal,
-                group_base, tp_rank, layer_l0, my_rank, group_tokens,
+                layer_l0, my_rank, group_tokens,
             )
 
     # Layer 1: SWA.
@@ -579,12 +604,12 @@ def prefill_fwd(
         shared_w2_scale_l1 = pl.slice(shared_w2_scale, [D], [d_start_l1])
 
         with pl.scope():
-            attn_stage_step = attn_stage
+            attn_stage_step = attn_stage_local
             gather_signal_step = gather_signal
             o_proj_wo_b_full_step = o_proj_wo_b_full
             if group_tokens > 0:
-                prefill_attention_swa_cp(
-                    x_hc,
+                prefill_attention_swa_cp_local(
+                    x_hc_local,
                     hc_attn_fn_l1, hc_attn_scale_l1, hc_attn_base_l1,
                     attn_norm_w_l1, wq_a_l1, wq_b_l1, wq_b_scale_l1,
                     wkv_l1, gamma_cq_l1, gamma_ckv_l1,
@@ -602,25 +627,21 @@ def prefill_fwd(
                 )
 
         with pl.scope():
-            prefill_moe(
-                attn_stage,
+            prefill_moe_local(
+                attn_stage_local,
                 hc_ffn_fn_l1, hc_ffn_scale_l1, hc_ffn_base_l1,
                 norm_w_l1, gate_w_l1, gate_bias_l1, tid2eid_l1, input_ids,
                 routed_w1_l1, routed_w1_scale_l1, routed_w3_l1, routed_w3_scale_l1,
                 routed_w2_l1, routed_w2_scale_l1,
                 shared_w1_l1, shared_w1_scale_l1, shared_w3_l1, shared_w3_scale_l1,
                 shared_w2_l1, shared_w2_scale_l1,
-                x_hc, x_mixed, post_ffn, comb_ffn, ffn_out,
+                x_hc_local, x_mixed_local, post_ffn_local, comb_ffn_local, ffn_out,
                 recv_meta, recv_x, recv_aux,
                 arrived, data_arrived, routed_y_buf, combine_arrived,
                 stage_done, stage_token, layer_completion,
-                gather_window, gather_signal,
-                group_base, tp_rank, layer_l1, my_rank, group_tokens,
+                layer_l1, my_rank, group_tokens,
             )
 
-    group_rows = pl.tensor.dim(x_hc, 0)
-    local_tokens = pl.tensor.dim(input_ids, 0)
-    local_start = pl.cast(tp_rank, pl.INDEX) * pl.cast(local_tokens, pl.INDEX)
     target_l41_start = pl.cast(local_tokens, pl.INDEX)
     target_hc_rows = 2 * local_tokens
     target_hc_stack = pl.create_tensor([target_hc_rows, HC_MULT, D], dtype=pl.FP32)
@@ -731,12 +752,12 @@ def prefill_fwd(
             )
 
             with pl.scope():
-                attn_stage_step = attn_stage
+                attn_stage_step = attn_stage_local
                 gather_signal_step = gather_signal
                 o_proj_wo_b_full_step = o_proj_wo_b_full
                 if group_tokens > 0:
-                    prefill_attention_csa_cp(
-                        x_hc,
+                    prefill_attention_csa_cp_local(
+                        x_hc_local,
                         query_start_loc, state_checkpoint_ends,
                         hc_attn_fn_csa, hc_attn_scale_csa, hc_attn_base_csa,
                         attn_norm_w_csa, wq_a_csa, wq_b_csa, wq_b_scale_csa,
@@ -766,35 +787,33 @@ def prefill_fwd(
                     )
 
             with pl.scope():
-                prefill_moe(
-                    attn_stage,
+                prefill_moe_local(
+                    attn_stage_local,
                     hc_ffn_fn_csa, hc_ffn_scale_csa, hc_ffn_base_csa,
                     norm_w_csa, gate_w_csa, gate_bias_csa, tid2eid_csa, input_ids,
                     routed_w1_csa, routed_w1_scale_csa, routed_w3_csa, routed_w3_scale_csa,
                     routed_w2_csa, routed_w2_scale_csa,
                     shared_w1_csa, shared_w1_scale_csa, shared_w3_csa, shared_w3_scale_csa,
                     shared_w2_csa, shared_w2_scale_csa,
-                    x_hc, x_mixed, post_ffn, comb_ffn, ffn_out,
+                    x_hc_local, x_mixed_local, post_ffn_local, comb_ffn_local, ffn_out,
                     recv_meta, recv_x, recv_aux,
                     arrived, data_arrived, routed_y_buf, combine_arrived,
                     stage_done, stage_token, layer_completion,
-                    gather_window, gather_signal,
-                    group_base, tp_rank, csa_layer, my_rank, group_tokens,
+                    csa_layer, my_rank, group_tokens,
                 )
                 if group_tokens > 0:
                     if pair_order == HCA_NUM_LAYERS - 1:
-                        target_x_hc_l40 = pl.slice(
-                            x_hc,
-                            [local_tokens, HC_MULT, D],
-                            [local_start, 0, 0],
-                        )
+                        target_x_hc_l40 = x_hc_local
                         target_hc_l40 = pl.slice(
                             target_hc_stack,
                             [local_tokens, HC_MULT, D],
                             [0, 0, 0],
                         )
-                        with pl.spmd(local_tokens, name_hint="prefill_fwd_capture_target_hc_l40"):
+                        with pl.spmd(local_tokens, name_hint="prefill_fwd_capture_target_hc_l40") as capture_l40_tid:
                             target_hc_l40 = _copy_target_hc_row(target_x_hc_l40, target_hc_l40)
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_fwd_capture_l40_publish", deps=[capture_l40_tid]):
+                            capture_l40_epoch = pl.read(stage_token, [0])
+                            pl.write(stage_token, [0], capture_l40_epoch)
 
         with pl.scope():
             hca_layer = attention_order * 2 + pl.const(3, pl.INT32)
@@ -868,12 +887,12 @@ def prefill_fwd(
             )
 
             with pl.scope():
-                attn_stage_step = attn_stage
+                attn_stage_step = attn_stage_local
                 gather_signal_step = gather_signal
                 o_proj_wo_b_full_step = o_proj_wo_b_full
                 if group_tokens > 0:
-                    prefill_attention_hca_cp(
-                        x_hc,
+                    prefill_attention_hca_cp_local(
+                        x_hc_local,
                         query_start_loc, state_checkpoint_ends, local_request_ids,
                         hc_attn_fn_hca, hc_attn_scale_hca, hc_attn_base_hca,
                         attn_norm_w_hca, wq_a_hca, wq_b_hca, wq_b_scale_hca,
@@ -897,35 +916,33 @@ def prefill_fwd(
                     )
 
             with pl.scope():
-                prefill_moe(
-                    attn_stage,
+                prefill_moe_local(
+                    attn_stage_local,
                     hc_ffn_fn_hca, hc_ffn_scale_hca, hc_ffn_base_hca,
                     norm_w_hca, gate_w_hca, gate_bias_hca, tid2eid_hca, input_ids,
                     routed_w1_hca, routed_w1_scale_hca, routed_w3_hca, routed_w3_scale_hca,
                     routed_w2_hca, routed_w2_scale_hca,
                     shared_w1_hca, shared_w1_scale_hca, shared_w3_hca, shared_w3_scale_hca,
                     shared_w2_hca, shared_w2_scale_hca,
-                    x_hc, x_mixed, post_ffn, comb_ffn, ffn_out,
+                    x_hc_local, x_mixed_local, post_ffn_local, comb_ffn_local, ffn_out,
                     recv_meta, recv_x, recv_aux,
                     arrived, data_arrived, routed_y_buf, combine_arrived,
                     stage_done, stage_token, layer_completion,
-                    gather_window, gather_signal,
-                    group_base, tp_rank, hca_layer, my_rank, group_tokens,
+                    hca_layer, my_rank, group_tokens,
                 )
                 if group_tokens > 0:
                     if pair_order == HCA_NUM_LAYERS - 1:
-                        target_x_hc_l41 = pl.slice(
-                            x_hc,
-                            [local_tokens, HC_MULT, D],
-                            [local_start, 0, 0],
-                        )
+                        target_x_hc_l41 = x_hc_local
                         target_hc_l41 = pl.slice(
                             target_hc_stack,
                             [local_tokens, HC_MULT, D],
                             [target_l41_start, 0, 0],
                         )
-                        with pl.spmd(local_tokens, name_hint="prefill_fwd_capture_target_hc_l41"):
+                        with pl.spmd(local_tokens, name_hint="prefill_fwd_capture_target_hc_l41") as capture_l41_tid:
                             target_hc_l41 = _copy_target_hc_row(target_x_hc_l41, target_hc_l41)
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_fwd_capture_l41_publish", deps=[capture_l41_tid]):
+                            capture_l41_epoch = pl.read(stage_token, [0])
+                            pl.write(stage_token, [0], capture_l41_epoch)
 
     # Layer 42: CSA order 20.
     with pl.scope():
@@ -1031,12 +1048,12 @@ def prefill_fwd(
         )
 
         with pl.scope():
-            attn_stage_step = attn_stage
+            attn_stage_step = attn_stage_local
             gather_signal_step = gather_signal
             o_proj_wo_b_full_step = o_proj_wo_b_full
             if group_tokens > 0:
-                prefill_attention_csa_cp(
-                    x_hc,
+                prefill_attention_csa_cp_local(
+                    x_hc_local,
                     query_start_loc, state_checkpoint_ends,
                     hc_attn_fn_last, hc_attn_scale_last, hc_attn_base_last,
                     attn_norm_w_last, wq_a_last, wq_b_last, wq_b_scale_last,
@@ -1066,20 +1083,19 @@ def prefill_fwd(
                 )
 
         with pl.scope():
-            prefill_moe(
-                attn_stage,
+            prefill_moe_local(
+                attn_stage_local,
                 hc_ffn_fn_last, hc_ffn_scale_last, hc_ffn_base_last,
                 norm_w_last, gate_w_last, gate_bias_last, tid2eid_last, input_ids,
                 routed_w1_last, routed_w1_scale_last, routed_w3_last, routed_w3_scale_last,
                 routed_w2_last, routed_w2_scale_last,
                 shared_w1_last, shared_w1_scale_last, shared_w3_last, shared_w3_scale_last,
                 shared_w2_last, shared_w2_scale_last,
-                x_hc, x_mixed, post_ffn, comb_ffn, ffn_out,
+                x_hc_local, x_mixed_local, post_ffn_local, comb_ffn_local, ffn_out,
                 recv_meta, recv_x, recv_aux,
                 arrived, data_arrived, routed_y_buf, combine_arrived,
                 stage_done, stage_token, layer_completion,
-                gather_window, gather_signal,
-                group_base, tp_rank, layer_last, my_rank, group_tokens,
+                layer_last, my_rank, group_tokens,
             )
 
     moe_retired_tid = clear_prefill_moe_signals(stage_token, arrived, data_arrived, combine_arrived, stage_done)
@@ -1096,7 +1112,6 @@ def prefill_fwd(
         if group_tokens > 0:
             for token in pl.spmd(local_tokens, name_hint="prefill_fwd_store_target_hidden"):
                 target_l41_row = target_l41_start + token
-                target_l42_row = local_start + token
                 target_hc_l40_row = target_hc_stack[token : token + 1, 0 : HC_MULT, 0:D]
                 target_hidden_l40 = pl.mul(pl.col_sum(pl.reshape(target_hc_l40_row, [HC_MULT, D])), 1.0 / HC_MULT)
                 dspark_target_hidden[token : token + 1, 0:D] = pl.cast(target_hidden_l40, pl.BF16, mode="rint")
@@ -1107,7 +1122,7 @@ def prefill_fwd(
                 dspark_target_hidden[token : token + 1, D : 2 * D] = pl.cast(
                     target_hidden_l41, pl.BF16, mode="rint",
                 )
-                target_hc_l42_row = x_hc[target_l42_row : target_l42_row + 1, 0 : HC_MULT, 0:D]
+                target_hc_l42_row = x_hc_local[token : token + 1, 0 : HC_MULT, 0:D]
                 target_hidden_l42 = pl.mul(pl.col_sum(pl.reshape(target_hc_l42_row, [HC_MULT, D])), 1.0 / HC_MULT)
                 dspark_target_hidden[token : token + 1, 2 * D : 3 * D] = pl.cast(
                     target_hidden_l42, pl.BF16, mode="rint",
@@ -1120,11 +1135,31 @@ def prefill_fwd(
             for token in pl.spmd(group_rows, name_hint="prefill_fwd_inactive_hidden"):
                 x_hc[token : token + 1, :, :] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
 
-    # All head-group members participate, including idle attention owners.
+    # Materialize the full public stage tensors.
+    with pl.scope():
+        if group_tokens > 0:
+            materialize_ready_tid = pl.system.task_dummy(deps=[])
+            hc_full_tid = prefill_cp_materialize_hc_full(
+                x_hc_local, x_hc, gather_window, gather_signal, group_base, tp_rank, materialize_ready_tid,
+            )
+            attn_full_tid = prefill_cp_materialize_hc_full(
+                attn_stage_local, attn_stage, gather_window, gather_signal, group_base, tp_rank, hc_full_tid,
+            )
+            mixed_full_tid = prefill_cp_token_allgather_into(
+                x_mixed_local, x_mixed, gather_window, gather_signal, group_base, tp_rank, attn_full_tid,
+            )
+            post_full_tid = prefill_cp_materialize_coeff_full(
+                post_ffn_local, post_ffn, gather_window, gather_signal, group_base, tp_rank, mixed_full_tid,
+            )
+            prefill_cp_materialize_coeff_full(
+                comb_ffn_local, comb_ffn, gather_window, gather_signal, group_base, tp_rank, post_full_tid,
+            )
+
+    # All head-group ranks participate, including ranks with no attention tokens.
     layer42_hidden = pl.create_tensor([group_rows, D], dtype=pl.BF16)
     layer42_hidden = hc_head(x_hc, hc_head_fn, hc_head_scale, hc_head_base, layer42_hidden)
     final_norm_tid = rms_norm(layer42_hidden, final_norm_w, x_out)
-    # Retire final MoE epochs before every owner's head collectives.
+    # Retire final MoE epochs before each rank's head collectives.
     head_ready_tid = pl.system.task_dummy(deps=[final_norm_tid, moe_retired_tid])
     lm_head(
         x_out, lm_head_weight, logit_row_indices, logits,
