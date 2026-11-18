@@ -35,7 +35,6 @@ from .decode_swa import (
     HEAD_DIM,
     MAX_SEQ_LEN,
     MIX_HC,
-    O_GROUPS,
     O_GROUP_IN,
     O_LORA,
     ORI_TABLE_MAX_BLOCKS,
@@ -164,11 +163,9 @@ def decode_fwd(
     gamma_ckv: pl.Tensor[[FWD_NUM_LAYERS * HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[FWD_ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     attn_sink: pl.Tensor[[FWD_NUM_LAYERS * H], pl.FP32],
-    wo_a: pl.Tensor[[FWD_NUM_LAYERS * O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[FWD_NUM_LAYERS * D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
     # The CSA layers shard the projection one group per card; SWA and HCA keep
-    # reading the replicated wo_a / wo_b above.
+    # reading replicated full projection banks.
     wo_a_shard: pl.Tensor[[FWD_NUM_LAYERS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b_shard: pl.Tensor[[FWD_NUM_LAYERS * D, O_LORA], pl.INT8],
     hca_cmp_wkv: pl.Tensor[[HCA_NUM_LAYERS * HCA_MAIN_OUT_DIM, D], pl.BF16],
@@ -408,9 +405,6 @@ def decode_fwd(
     idx_block_num = pl.tensor.dim(idx_kv_cache, 0) // CSA_NUM_LAYERS
     kv_cache_l0 = pl.slice(kv_cache, [ori_block_num, BLOCK_SIZE, 1, HEAD_DIM], [0 * ori_block_num, 0, 0, 0])
     attn_sink_l0: pl.Tensor[[H], pl.FP32] = pl.slice(attn_sink, [H], [0 * H])
-    wo_a_l0: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
-        wo_a, [O_GROUPS, O_LORA, O_GROUP_IN], [0 * O_GROUPS, 0, 0]
-    )
     wo_a_shard_l0: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
         wo_a_shard, [1, O_LORA, O_GROUP_IN], [0, 0, 0]
     )
@@ -420,7 +414,6 @@ def decode_fwd(
     wo_b_shard_l0: pl.Tensor[[1, D, O_LORA], pl.INT8] = pl.reshape(
         wo_b_shard_l0_flat, [1, D, O_LORA]
     )
-    wo_b_l0: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(wo_b, [D, O_GROUPS * O_LORA], [0 * D, 0])
     wo_b_scale_l0: pl.Tensor[[D], pl.FP32] = pl.slice(wo_b_scale, [D], [0 * D])
     hc_ffn_fn_l0: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
         hc_ffn_fn, [MIX_HC, HC_DIM], [0 * MIX_HC, 0]
@@ -467,9 +460,6 @@ def decode_fwd(
     gamma_ckv_l1: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(gamma_ckv, [HEAD_DIM], [1 * HEAD_DIM])
     kv_cache_l1 = pl.slice(kv_cache, [ori_block_num, BLOCK_SIZE, 1, HEAD_DIM], [1 * ori_block_num, 0, 0, 0])
     attn_sink_l1: pl.Tensor[[H], pl.FP32] = pl.slice(attn_sink, [H], [1 * H])
-    wo_a_l1: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
-        wo_a, [O_GROUPS, O_LORA, O_GROUP_IN], [1 * O_GROUPS, 0, 0]
-    )
     wo_a_shard_l1: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
         wo_a_shard, [1, O_LORA, O_GROUP_IN], [1, 0, 0]
     )
@@ -479,7 +469,6 @@ def decode_fwd(
     wo_b_shard_l1: pl.Tensor[[1, D, O_LORA], pl.INT8] = pl.reshape(
         wo_b_shard_l1_flat, [1, D, O_LORA]
     )
-    wo_b_l1: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(wo_b, [D, O_GROUPS * O_LORA], [1 * D, 0])
     wo_b_scale_l1: pl.Tensor[[D], pl.FP32] = pl.slice(wo_b_scale, [D], [1 * D])
     hc_ffn_fn_l1: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
         hc_ffn_fn, [MIX_HC, HC_DIM], [1 * MIX_HC, 0]
@@ -682,12 +671,6 @@ def decode_fwd(
             kv_cache, [ori_block_num, BLOCK_SIZE, 1, HEAD_DIM], [csa_layer * ori_block_num, 0, 0, 0]
         )
         attn_sink_csa: pl.Tensor[[H], pl.FP32] = pl.slice(attn_sink, [H], [csa_layer * H])
-        wo_a_csa: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
-            wo_a, [O_GROUPS, O_LORA, O_GROUP_IN], [csa_layer * O_GROUPS, 0, 0]
-        )
-        wo_b_csa: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(
-            wo_b, [D, O_GROUPS * O_LORA], [csa_layer * D, 0]
-        )
         wo_b_scale_csa: pl.Tensor[[D], pl.FP32] = pl.slice(wo_b_scale, [D], [csa_layer * D])
         wo_a_shard_csa: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
             wo_a_shard, [1, O_LORA, O_GROUP_IN], [csa_layer, 0, 0]
@@ -926,9 +909,6 @@ def decode_fwd(
             kv_cache, [ori_block_num, BLOCK_SIZE, 1, HEAD_DIM], [hca_layer * ori_block_num, 0, 0, 0]
         )
         attn_sink_hca: pl.Tensor[[H], pl.FP32] = pl.slice(attn_sink, [H], [hca_layer * H])
-        wo_a_hca: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
-            wo_a, [O_GROUPS, O_LORA, O_GROUP_IN], [hca_layer * O_GROUPS, 0, 0]
-        )
         wo_a_shard_hca: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
             wo_a_shard, [1, O_LORA, O_GROUP_IN], [hca_layer, 0, 0]
         )
@@ -937,9 +917,6 @@ def decode_fwd(
         )
         wo_b_shard_hca: pl.Tensor[[1, D, O_LORA], pl.INT8] = pl.reshape(
             wo_b_shard_hca_flat, [1, D, O_LORA]
-        )
-        wo_b_hca: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(
-            wo_b, [D, O_GROUPS * O_LORA], [hca_layer * D, 0]
         )
         wo_b_scale_hca: pl.Tensor[[D], pl.FP32] = pl.slice(wo_b_scale, [D], [hca_layer * D])
         hca_cmp_wkv_hca: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(
@@ -1114,12 +1091,6 @@ def decode_fwd(
         kv_cache, [ori_block_num, BLOCK_SIZE, 1, HEAD_DIM], [csa_layer_last * ori_block_num, 0, 0, 0]
     )
     attn_sink_last: pl.Tensor[[H], pl.FP32] = pl.slice(attn_sink, [H], [csa_layer_last * H])
-    wo_a_last: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
-        wo_a, [O_GROUPS, O_LORA, O_GROUP_IN], [csa_layer_last * O_GROUPS, 0, 0]
-    )
-    wo_b_last: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(
-        wo_b, [D, O_GROUPS * O_LORA], [csa_layer_last * D, 0]
-    )
     wo_b_scale_last: pl.Tensor[[D], pl.FP32] = pl.slice(wo_b_scale, [D], [csa_layer_last * D])
     wo_a_shard_last: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
         wo_a_shard, [1, O_LORA, O_GROUP_IN], [csa_layer_last, 0, 0]
@@ -1385,8 +1356,6 @@ def s6_prepared(
     gamma_ckv: pl.Tensor[[FWD_NUM_LAYERS * HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[FWD_ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     attn_sink: pl.Tensor[[FWD_NUM_LAYERS * H], pl.FP32],
-    wo_a: pl.Tensor[[FWD_NUM_LAYERS * O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[FWD_NUM_LAYERS * D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
     wo_a_shard: pl.Tensor[[FWD_NUM_LAYERS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b_shard: pl.Tensor[[FWD_NUM_LAYERS * D, O_LORA], pl.INT8],
@@ -1570,8 +1539,6 @@ def s6_prepared(
         gamma_ckv,
         kv_cache,
         attn_sink,
-        wo_a,
-        wo_b,
         wo_b_scale,
         wo_a_shard,
         wo_b_shard,

@@ -5,6 +5,161 @@ ranks by default. The verification width remains eight tokens, and the eight
 attention projection groups are assigned four per rank. It is an experimental
 decode implementation, not a `pypto-serving` deployment contract.
 
+## Context capacity
+
+The model and the program builder default to 1,048,576 positions. Prompt
+length, outer prefill chunk size, and compiled context capacity are separate:
+a 16K smoke input still requires room for all following decode and speculative
+positions. Native single-query and streaming entries derive RoPE, KV page-table
+and compressor-state page-table extents from the same configured capacity.
+The builder checks these generated extents before accepting an artifact.
+
+An explicit smaller `--max-seq-len` produces a bounded validation artifact;
+it does not change the model's default context limit. Physical cache allocations
+remain request-owned and use dynamic pool dimensions. Configured capacity and
+successful code generation do not establish long-context device correctness or
+performance; each reported run must state its actual prompt and output lengths.
+
+The indexer uses one score/selection arena by default. The internal build option
+`--prefill-indexer-arenas 2` enables an experimental pair of independent arenas;
+it is recorded in the generated prefill plan. The two bounded KV gather slots
+are independent of this choice. Two-arena experiments have no confirmed
+end-to-end speedup in the representative 16K scope; each generated artifact
+requires its own correctness and performance qualification. Histogram selection
+and EMA recall are not enabled by that option alone.
+
+The separate opt-in `--prefill-echo-prefetch` requires two indexer arenas. It
+accumulates 256 ordered score bins in the existing score wave, then prefetches
+only complete high bins while the original exact top-512 selection proceeds.
+A direct logical-index map supplies prefetched rows and fills every miss from
+the original paged cache in exact selected order. Two transport slots retire
+with their actual attention consumers. This is device-HBM staging, not a host
+KV offload service; score, selection, quantization and attention arithmetic stay
+unchanged. NaN score queries use the original gather fallback.
+
+The request-zero stream uses the preceding outer chunk's global final exact
+kth score for a per-layer EMA with alpha 0.5. Other packed requests retain
+exact scoring and gather without inheriting that prediction. The first chunk
+keeps the estimate invalid and performs exact selection and gather. Its global
+final exact kth score initializes the estimate; early prefetch begins only in a
+later chunk with a valid estimate. A valid numerical zero is an initialized EMA.
+An epoch replay retains the same input estimate instead of advancing EMA twice.
+Generated metadata includes required `echo_epoch`, `echo_first_chunk`, and an
+owned FP32 `echo_diagnostics` buffer with two snapshots per CSA layer. Epochs
+must be positive, below 2^24, and advance per prepared program after successful
+whole-chunk completion. Set the first-chunk flag for every new request; no
+per-query host state update is required.
+
+`--prefill-echo-diagnostics` adds recall/miss counters for separate diagnostic
+runs. It must not be silently substituted for an ordinary timing plan. The
+feature remains off by default. CPU source/protocol checks and native artifacts
+do not establish device numerical correctness, actual prefetch overlap or an
+end-to-end gain; these qualifications remain pending for this new option.
+
+
+The opt-in prefill option `--prefill-causal-ready` publishes completed cache
+prefixes in 512-token producer tiles. Each 128-query CSA block waits for its
+logical causal range rather than the complete current chunk. Publication covers
+raw-KV normalization and RoPE, compressed-KV pooling and cache writes, and both
+the indexer's INT8 keys and FP32 dequantization scales. Cache readers use explicit
+readiness dependencies; logical positions and request origins determine those
+dependencies independently of rank-local physical page numbers. SWA uses the raw
+prefix, while HCA uses raw and compressed prefixes with its existing ordered
+query waves and 512-query output projection.
+
+This option currently requires projection degree eight. Its three INT32 prefix
+counters reserve one physical full-stream row extent per layer, including unused
+channels for layers without that cache family. The per-query requirement table
+has 16 INT32 columns per row; only the first three are semantic. Metadata stores
+own complete 64-byte rows. Raw projection staging has two bounded slots retired
+by actual cache scatter, and the existing attention workspaces retain their
+consumer retirement. Layer completion joins all cache publishers and attention
+outputs before the next ordered stage.
+
+Callers bind `causal_epoch_bases` using `prepare_causal_bindings` and advance the
+base with `advance_causal_epoch` only after successful whole-chunk completion.
+Retained domains keep separate bases for independently compiled plans. Before
+submission, callers must admit the complete reservation against INT32 overflow;
+a failed domain must be discarded. `--prefill-causal-full-wait` is a diagnostic
+variant that retains the same producer/control path and waits for full current
+prefixes. Compile each plan in a fresh setup process. Both options default off.
+Native preparation does not establish device correctness or performance; the
+causal option requires its own full output/cache and ordinary timing gates.
+
+Prefill MoE execution has an independent slab geometry. The build option
+`--prefill-moe-wave-tokens` selects 8, 32, 64, 128, 1024, 2048 or 8192 rows,
+with 2048 as the default in this branch. Routed and shared experts use bounded
+sixteen-row physical tiles; routing metadata initialization also uses bounded
+64-row tiles to avoid a slab-sized on-chip temporary. Full expert tiles
+continue in another tile without
+discarding routes, including repeated expert IDs. Weight banks and TP8
+intermediate shards are unchanged. HC and per-token routing, quantization,
+expert arithmetic and ordered combine retain their original numerical rules.
+This larger-slab path still requires its own device bitwise and ordinary
+performance qualification; native preparation alone is not an accepted speedup.
+
+The prefill build option `--prefill-moe-stage-view` lets a complete MoE wave
+consume a read-only slice of the attention output in place. The HC RMS and
+linear projections wait for the original wave credit. A final partial wave
+retains its bounded stage buffer and zero fills inactive rows. The option
+defaults off and applies only to prefill.
+
+The opt-in build option `--prefill-moe-ready` permits two bounded prefill MoE
+slabs to advance ahead of ordered TP publication and uses core-releasing peer
+waits. The original wait policy uses the same prefill slab. Copies use bounded
+4-by-2048 FP32 staging tiles; rank reduction uses 8-by-512 tiles, adds ranks
+in ascending order and rounds once to BF16. Load every compile plan in a fresh
+setup process. Both options are recorded in the prefill plan; readiness is enabled by default for prefill. The build option
+`--no-prefill-moe-ready` retains the serial publication control. Decode S1/S6 geometry, source and ABI are unaffected.
+
+A fixed 16K batch-one replay on four dual-chip 910C boards measured prefill
+public submit-to-result medians of 20.290 s with the original d8 plan and
+15.516 s with d8 MoE readiness. Both modes used one retained Worker and the
+same TP8 weights, with one warmup and three ordinary requests. All complete
+output/cache byte hashes matched the frozen serial-native reference. Input
+preparation/upload and output hashing are outside that timing; it is not a
+serving or decode-TPOT measurement. Shared-projection d1 with readiness took
+15.881 s in the same comparison, so projection selection remains d8.
+
+The prefill plan supports projection replication degrees 1, 2, 4, and 8 for
+SWA, CSA, and HCA. Degree 8 remains the default for 8192-token chunks. Shared
+degrees distribute pure 512-token KV and compressor projections using two
+bounded FP32 transport slots; normalization, RoPE, pooling, ordered state
+updates, and local cache-page mappings remain rank-local. These settings do
+not change the attention CP8, MoE TP8, or vocabulary TP8 layouts.
+
+Generated prefill metadata includes `projection_peers` and
+`projection_epoch_bases`. Callers use `prepare_projection_bindings` and bind
+these inputs with the other chunk metadata. Shared degrees require the actual
+rank topology. With retained communication windows, advance epochs only after
+successful chunk completion using `advance_projection_epochs`; keep topology
+and degrees fixed, and discard a failed communication domain. No per-tile
+host wait is required. Current 16K measurements do not establish a whole
+prefill speedup for shared degrees.
+
+Drafter metadata banks may cover a bounded interval of absolute anchor
+positions. The device derives its base from the first owner-zero query position;
+old banks starting at anchor zero retain the same indexing. The interval must
+cover every submitted parent, including drained lookahead work. Reusing a
+program at a larger anchor does not require banks for all earlier positions.
+
+The combined experimental mechanism entry exposes 100 prefill parameters,
+including real causal epoch metadata, ECHO diagnostics and request/chunk tags.
+The earlier entry has 96 parameters. Bind the generated metadata and allocate
+its required resources; an old positional argument table cannot be reused.
+This prefill interface change does not change the native decode interfaces.
+
+Native single-query programs expose 81 parameters, and native streaming programs
+expose 153. They consume the group-sharded O-proj weights directly; the unused
+replicated `wo_a` and `wo_b` inputs have been removed. Callers bind the actual
+generated metadata and regenerate older native artifacts. The standalone
+forward's golden-facing entry retains its full-weight reference inputs.
+
+The experimental prefill option `--prefill-oproj-b-batched` groups independent
+O-projection B output slabs in one grid while retaining the existing GEMM
+fragments and ordered epilogue. It defaults off and changes no decode path.
+See [the dispatch batching notes](prefill_oproj_batch.md) for its scope.
+
 ## Precision contract
 
 The native HC stream uses FP32 at `hc_pre` input and `hc_post` residual/output,
@@ -377,6 +532,120 @@ RoPE inputs.
 
 ## Batch-one DSpark request serving
 
+### Prefill
+
+`prefill_fwd.load_prefill_programs()` loads one 43-layer chunk program with
+CP8 attention, TP8 MoE intermediate shards, and a TP8 vocabulary head. Each
+rank holds the complete chunk's HC input and owns a consecutive eighth of its
+attention queries. Bind the decode Worker's existing TP8 weight banks, original
+quantization scales, and cache allocations. The chunk entry reshapes contiguous
+layer banks through borrowed device views and never uploads another weight set.
+Query LoRA, query expansion, indexer-gate and vocabulary projections keep the
+decode banks' ND storage. The isolated import loads lowlat's private copies in
+`prefill_ops/`; callers must not repack these resident banks into NZ. The DSpark
+model's operators and configuration remain unchanged.
+`load_prefill_programs(mode="serial")` loads the six component entries for the
+same TP8 numerical baseline.
+
+`prefill_cache.prefill_cache_views` borrows each owning decode cache buffer
+through that Worker's `view_tensor` API. The cache bytes remain in place:
+prefill uses 32-row raw-KV pages and 2-row ratio-4 state pages, while decode
+views the same rows as 128-row and 4-row pages. `prefill_block_tables` splits
+and pads the scheduler's decode tables, and `prefill_slot_mappings` derives
+physical rows for each active position. The caller retains both the owning
+buffers and the prefill views until all dependent dispatches complete; only
+the original owning allocations may be freed. `initialize_cache_pages`
+initializes newly owned pages, including the compressor score sentinel,
+without clearing other requests' or shared-prefix pages.
+
+`prefill_metadata` packs each prompt chunk and its RoPE rows for the CP8 group.
+Physical page IDs may differ between ranks; each rank's table is converted
+against its own cache allocation. Pass the existing `block_counts` when the
+compressor tables use the decode ring layout.
+The caller must provide enough non-aliased cache pages for the whole chunk and
+the preceding sliding window, and preserve the page mappings and stored values
+of live history across chunks. The metadata helper rejects missing pages,
+out-of-bounds writes, and aliased HCA history. The HCA state must also
+provide distinct rows for the kernel's 128-row history plus one DSpark decode
+transaction when a prefill tile publishes that many rows. Prefix checkpoints
+are not requested by this helper. Host tensors passed directly to a prepared
+Worker submission must use shared storage allocated before the Worker starts.
+For cache initialization, the distributed Worker's `copy_to` stages
+non-inherited CPU buffers.
+
+For single-machine prefill and decode, the caller uses the same rank-local
+cache allocations and waits for each prefill dispatch before dependent decode
+work. The scheduler and request lifetime remain the serving caller's job.
+Prepare both programs on one Worker using `extra_compiled`, retain the owning
+decode cache tensors, and pass their borrowed views to prefill. After terminal
+prefill completes, use its sampled token as the next decode input at the prompt
+length, with `kv_seq_lens` including that input. Decode uses the original block
+tables and counts, including compressor state; it does not use the expanded
+prefill page tables or reinitialize the retained cache pages. The decode RoPE
+capacity must cover the prompt and all subsequent generated positions. Allocate
+decode metadata, scratch and any retained ABI buffers during Worker setup,
+before prefill. Borrowed views require no physical layout conversion; first-use
+program/domain preparation and normal dispatch synchronization remain separate
+latency costs.
+Registering a decode program with `extra_compiled` does not eagerly create its
+communication domains. A caller that needs a warm first decode can run a startup
+invocation on separately initialized scratch caches before prefill, retaining the
+same prepared Worker. That invocation must not bind the real request caches.
+The first real decode then reuses the domain; normal per-dispatch buffer resets,
+input staging and completion fences still contribute to latency.
+
+`prefill_fwd.prepare_prefill_bindings` combines the caller's resident decode-format
+weights, input metadata and scratch with the cache views. `submit_prefill`
+orders the bindings using the actual generated parameter metadata. The chunk
+program submits all layers once and waits once before returning. Its final HC
+output aliases the supplied `x_hc`; `x_hc_next` is scratch for the serial
+baseline only. The `terminal` scalar runs the learned head and sampling only
+on the final chunk. The caller supplies the original sampling, grammar,
+allocation and request-lifetime inputs, and consumes its outputs. Submit chunks
+in order, retaining the owning allocations through the final completion.
+
+CSA coordinates 128-query indexer blocks with two bounded gather slots.
+Gather waits for that block's exact top-512 selection and the previous consumer
+of its slot. QK/PV waits for its gather and the preceding attention block.
+The existing 512-row output-projection tile and all attention arithmetic remain
+in their owning operators. The indexer score/pair arenas and the two KV slots
+are reused across blocks; their lifetime ends with the layer's device scope.
+This permits subsequent index scoring and gather to become ready before the
+preceding attention finishes. Generated dependencies establish eligibility;
+actual overlap and wall-time benefit still require device measurements.
+
+Generate the chunk artifact without a Worker using:
+
+```bash
+python -m models.deepseek_v4_flash_lowlat.build \
+  --profile prefill --cache build_output/prefill-cache \
+  --report ../experiments/lowlat-prefill/pr1747/builds/prefill-generated.json
+```
+
+Keep experiment scripts, case manifests, datasets and timing reports under the
+workspace's `experiments/` directory. `build_output/` owns generated compiler
+artifacts and JIT caches. Experimental callers select explicit AgentX trace and
+request identities; input length, padding and chunk boundaries must come from
+the actual reconstructed input, with no fixed short-prompt fallback.
+
+The report records chunk/tile sizes, the exact-prefetch mode, two slots, and
+the retained eight projection replicas. Code generation, native compilation,
+and host binding checks alone do not establish device equivalence. The relocated
+private operators passed a rebuilt four-board TP8 device replay. A reconstructed
+AgentX request of 16,384 tokens passed full-output and cache byte-digest checks
+against the frozen TP8 component baseline. On the same Worker, 64 subsequent
+single-query decode steps retained the original weight/cache allocations and
+matched a copied-cache control for all sampled IDs and final logits, hidden
+states and cache contents. The timing loop omits per-step diagnostic readbacks;
+its host-stepped latency is not the original speculative serving TPOT.
+This qualifies the tested allocation handoff; longer contexts
+and complete serving sessions remain unvalidated. Histogram/EMA early prefetch remains device-unqualified. Tile-specific cache
+publication dependencies are not implemented by this option.
+Their configuration must not be advertised as available or selected from
+unmeasured cost estimates.
+
+
+### Deployment
 
 This deployment retains five draft tokens and six target verification rows.
 It complements the [wide-batch DSpark model](../deepseek_v4_flash_dspark/index.md).
@@ -524,3 +793,121 @@ measurement is not a measurement of the current commit.
 
 The validated reference-arithmetic source is preserved on
 [the reference branch](https://github.com/zzjc1234/pypto-lib/tree/feat/dsv4-dspark-bs1-reference).
+
+## Host input uploads
+
+`prefill_host_inputs.SharedInput` provides a real mutable shared CPU buffer for
+HC input. Allocate it before preparing the Worker and pass its contiguous
+`storage` tensor in `inherited_host_tensors`, without `ReadOnlyHostTensor`. Fill
+it from actual BF16 prompt embeddings inside request timing. The returned
+rank-broadcast view has identical FP32 bytes per rank; upload each contiguous
+rank slice into a real device tensor. It cannot be passed directly where a
+contiguous rank-stacked shared CPU dispatch argument is required.
+
+All copies must complete before refilling the storage. Registering a private
+or post-fork allocation is not a substitute for shared backing. Reusable
+metadata buffers follow the same lifetime and must retain actual per-rank
+values, shapes and dtypes. These host changes do not alter native compute,
+weights, quantization or cache semantics.
+
+`prefill_input_plan.PreparedInputPlan` retains metadata derived from an explicit
+cache owner, page maps, positions, shapes, RoPE tables, grammar policy and revision.
+Construct and register its shared typed arenas before preparing the Worker.
+Only geometry is prepared in advance: fill real token IDs and gather actual
+prompt embeddings within request timing. A changed owner or geometry requires
+a new registered plan; it must not silently reuse the previous metadata.
+
+`DeviceMetadataArena` allocates a real device root for each dtype and borrows
+aligned same-dtype field views through the owning Worker's public API. Register
+host roots as mutable inherited tensors, retain their storage for the Worker's
+lifetime, and finish every copy before host refill. Retire the native metadata
+consumer before uploading the next chunk into those device roots. Account for
+each root and its alignment padding once; field views do not own additional
+device allocations.
+
+The input-only `prefill_embedding_lookup` program reads actual token IDs from
+resident BF16 embedding weights and expands each selected row to four FP32 HC
+channels with exact BF16 bit widening. Its caller must admit the complete
+resident vocabulary matrix, upload it during Worker setup, bind it as read-only
+input, and validate token bounds before submission. Request token upload and
+device lookup remain inside prepared-request timing. This optional input path
+does not change the prefill compute program or establish a performance gain
+without full output/cache and ordinary request checks.
+
+The opt-in `--prefill-moe-combine-rows 4` or `8` batches independent token rows
+inside each prefill ordered-combine task. Each row still starts from its shared
+expert output, then adds route outputs in the original order. The row accumulator
+and BF16-to-FP32 conversion retain their original shapes and operations; no
+expert GEMM, quantization, routing, TP reduction, or decode geometry changes.
+The default is one row per task. CPU and native checks alone do not qualify a
+latency benefit; full bytewise and ordinary request measurements are required.
+
+A prepared TP8 AgentX 16K comparison with two 8K chunks, one warm request and
+six ordinary requests per arm measured request-to-first-token medians of
+4.410906s, 4.328511s and 4.326021s for one, four and eight rows per combine task.
+All twenty-one requests matched the frozen full output/cache hashes. Both
+batched settings improved every pair against one row. The 2.490ms difference
+between four and eight rows has mixed pair directions and does not establish
+stable superiority. These figures include request input and cache initialization;
+they do not qualify serving TPOT or long-context performance.
+
+The experimental `--prefill-moe-fused-norm-quant` keeps each token's existing
+FP32 normalization, maximum reduction, and scale arithmetic, then applies the
+original round-to-INT32, FP16, saturated-INT8 cast chain before leaving the norm
+task. It retains the FP32 activation write required by the gate GEMM, avoids
+the quantization consumer's duplicate FP32 activation read and scale writes,
+and removes the separate quantization tasks. Routing, expert GEMMs, activation
+quantization rules, TP sums and decode are unchanged. The option defaults off;
+native preparation alone does not establish bytewise correctness or latency.
+
+A prepared TP8 AgentX 16K, two8K-chunk comparison with compact request
+journaling, A/B projection batching and combine8 matched all fourteen complete
+output/cache hashes. One warm request plus six ordinary requests per arm gave
+USER medians of 4.286619s versus 4.278417s, with only four of six paired samples
+improving. This small difference is inconclusive; keep fusion disabled in the
+selected plan until a phase-level comparison isolates its additional norm tail.
+
+The experimental `--prefill-moe-local-route-state` keeps expert-slot and work
+row/slot counters in bounded INT32 UB tiles during the original serial routing
+loop. The task writes the completed work vectors to their original GM outputs.
+Expert allocation order, route addresses, per-route scales and weights, shared
+tiles and expert arithmetic remain unchanged. The default is off; native and
+CPU checks alone do not qualify a latency benefit.
+
+The local-state option matched all fourteen complete output/cache hashes in a
+prepared TP8 AgentX 16K, two8K-chunk comparison. With one warm request and six
+ordinary requests per arm, USER request-to-first-token median decreased from
+4.290598s to4.265064s. All six request and submit-to-result pairs improved.
+The option remains explicit; this does not establish serving TPOT or1M-input
+performance.
+
+The experimental prefill-only `--prefill-moe-share-gate` plan assigns32 of the
+256 router columns to each TP8 rank and exchanges the exact FP32 logits before
+hash or sorted routing. It retains the original M16/N16/K2048 GEMM fragments,
+quantization and expert arithmetic. Two exchange lanes use existing MoE compute
+credits and monotonic call epochs; the public prefill ABI remains unchanged.
+This requires identical full HC inputs and replicated router parameters on the
+TP ranks. It is off by default. Source and native checks do not grant device
+bitwise or ordinary performance qualification; promotion requires the complete
+fixed-input request controls and matched same-worker A/B.
+
+`--prefill-moe-gate-copy-rows {16,64,128}` selects the shared-gate transport grain.
+The default16 preserves the qualified initial exchange. Larger values require
+shared gate and change only publish/copy task geometry, with no GEMM or MoE-wave
+change. The physical copy tile is capped at the padded wave size to keep small
+and ragged cases within their allocated lane. The128-row collect uses128KiB of
+vector tile storage and must pass actual native allocation checks. A larger
+copy tile may reduce task overhead while exposing less transfer parallelism;
+select it only from complete bitwise and ordinary device controls.
+
+The experimental prefill-only `--prefill-moe-quant-grid` groups the original
+M8/N256 quantization body into one SPMD grid. `--prefill-moe-owner-prepare`
+requires this grid, original separate quantization, column-gate sharing disabled,
+and a wave size divisible by128. Each TP8 rank computes one contiguous eighth
+of the original per-token HC/norm/gate/exact-selection work and exchanges real
+INT8 activations, FP32 scales/post/comb/route weights and INT32 route IDs.
+Original full-wave route allocation, expert fragments, rank sum and HC post are
+retained. The windows use two compute credits and monotonic call reservations.
+Padded rows execute real preparation on staged zeros; original active routing
+masks remain authoritative. Both options are off by default and require full
+bitwise and ordinary device qualification before performance promotion.

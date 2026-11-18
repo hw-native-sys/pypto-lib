@@ -285,8 +285,6 @@ def decode_fwd(
     gamma_ckv: pl.Tensor[[FWD_NUM_LAYERS * HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[FWD_ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     attn_sink: pl.Tensor[[FWD_NUM_LAYERS * H], pl.FP32],
-    wo_a: pl.Tensor[[FWD_NUM_LAYERS * O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[FWD_NUM_LAYERS * D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
     # Each rank owns consecutive groups in all three attention kinds.
     wo_a_shard: pl.Tensor[[FWD_NUM_LAYERS * GROUPS_PER_RANK, O_LORA, O_GROUP_IN], pl.BF16],
@@ -523,14 +521,10 @@ def decode_fwd(
     idx_block_num = pl.tensor.dim(idx_kv_cache, 0) // CSA_NUM_LAYERS
     kv_cache_l0 = pl.slice(kv_cache, [ori_block_num, BLOCK_SIZE, 1, HEAD_DIM], [0 * ori_block_num, 0, 0, 0])
     attn_sink_l0: pl.Tensor[[H], pl.FP32] = pl.slice(attn_sink, [H], [0 * H])
-    wo_a_l0: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
-        wo_a, [O_GROUPS, O_LORA, O_GROUP_IN], [0 * O_GROUPS, 0, 0]
-    )
     wo_a_shard_l0: pl.Tensor[[GROUPS_PER_RANK, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
         wo_a_shard, [GROUPS_PER_RANK, O_LORA, O_GROUP_IN], [0 * GROUPS_PER_RANK, 0, 0]
     )
     wo_b_shard_l0: pl.Tensor[[GROUPS_PER_RANK, D, O_LORA], pl.INT8] = pl.slice(wo_b_shard, [GROUPS_PER_RANK, D, O_LORA], [0 * GROUPS_PER_RANK, 0, 0])
-    wo_b_l0: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(wo_b, [D, O_GROUPS * O_LORA], [0 * D, 0])
     wo_b_scale_l0: pl.Tensor[[D], pl.FP32] = pl.slice(wo_b_scale, [D], [0 * D])
     hc_ffn_fn_l0: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
         hc_ffn_fn, [MIX_HC, HC_DIM], [0 * MIX_HC, 0]
@@ -577,14 +571,10 @@ def decode_fwd(
     gamma_ckv_l1: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(gamma_ckv, [HEAD_DIM], [1 * HEAD_DIM])
     kv_cache_l1 = pl.slice(kv_cache, [ori_block_num, BLOCK_SIZE, 1, HEAD_DIM], [1 * ori_block_num, 0, 0, 0])
     attn_sink_l1: pl.Tensor[[H], pl.FP32] = pl.slice(attn_sink, [H], [1 * H])
-    wo_a_l1: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
-        wo_a, [O_GROUPS, O_LORA, O_GROUP_IN], [1 * O_GROUPS, 0, 0]
-    )
     wo_a_shard_l1: pl.Tensor[[GROUPS_PER_RANK, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
         wo_a_shard, [GROUPS_PER_RANK, O_LORA, O_GROUP_IN], [1 * GROUPS_PER_RANK, 0, 0]
     )
     wo_b_shard_l1: pl.Tensor[[GROUPS_PER_RANK, D, O_LORA], pl.INT8] = pl.slice(wo_b_shard, [GROUPS_PER_RANK, D, O_LORA], [1 * GROUPS_PER_RANK, 0, 0])
-    wo_b_l1: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(wo_b, [D, O_GROUPS * O_LORA], [1 * D, 0])
     wo_b_scale_l1: pl.Tensor[[D], pl.FP32] = pl.slice(wo_b_scale, [D], [1 * D])
     hc_ffn_fn_l1: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
         hc_ffn_fn, [MIX_HC, HC_DIM], [1 * MIX_HC, 0]
@@ -777,12 +767,6 @@ def decode_fwd(
             kv_cache, [ori_block_num, BLOCK_SIZE, 1, HEAD_DIM], [csa_layer * ori_block_num, 0, 0, 0]
         )
         attn_sink_csa: pl.Tensor[[H], pl.FP32] = pl.slice(attn_sink, [H], [csa_layer * H])
-        wo_a_csa: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
-            wo_a, [O_GROUPS, O_LORA, O_GROUP_IN], [csa_layer * O_GROUPS, 0, 0]
-        )
-        wo_b_csa: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(
-            wo_b, [D, O_GROUPS * O_LORA], [csa_layer * D, 0]
-        )
         wo_b_scale_csa: pl.Tensor[[D], pl.FP32] = pl.slice(wo_b_scale, [D], [csa_layer * D])
         wo_a_shard_csa: pl.Tensor[[GROUPS_PER_RANK, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
             wo_a_shard, [GROUPS_PER_RANK, O_LORA, O_GROUP_IN], [csa_layer * GROUPS_PER_RANK, 0, 0]
@@ -1007,17 +991,11 @@ def decode_fwd(
             kv_cache, [ori_block_num, BLOCK_SIZE, 1, HEAD_DIM], [hca_layer * ori_block_num, 0, 0, 0]
         )
         attn_sink_hca: pl.Tensor[[H], pl.FP32] = pl.slice(attn_sink, [H], [hca_layer * H])
-        wo_a_hca: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
-            wo_a, [O_GROUPS, O_LORA, O_GROUP_IN], [hca_layer * O_GROUPS, 0, 0]
-        )
         wo_a_shard_hca: pl.Tensor[[GROUPS_PER_RANK, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
             wo_a_shard, [GROUPS_PER_RANK, O_LORA, O_GROUP_IN], [hca_layer * GROUPS_PER_RANK, 0, 0]
         )
         wo_b_shard_hca: pl.Tensor[[GROUPS_PER_RANK, D, O_LORA], pl.INT8] = pl.slice(
             wo_b_shard, [GROUPS_PER_RANK, D, O_LORA], [hca_layer * GROUPS_PER_RANK, 0, 0]
-        )
-        wo_b_hca: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(
-            wo_b, [D, O_GROUPS * O_LORA], [hca_layer * D, 0]
         )
         wo_b_scale_hca: pl.Tensor[[D], pl.FP32] = pl.slice(wo_b_scale, [D], [hca_layer * D])
         hca_cmp_wkv_hca: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(
@@ -1179,12 +1157,6 @@ def decode_fwd(
         kv_cache, [ori_block_num, BLOCK_SIZE, 1, HEAD_DIM], [csa_layer_last * ori_block_num, 0, 0, 0]
     )
     attn_sink_last: pl.Tensor[[H], pl.FP32] = pl.slice(attn_sink, [H], [csa_layer_last * H])
-    wo_a_last: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
-        wo_a, [O_GROUPS, O_LORA, O_GROUP_IN], [csa_layer_last * O_GROUPS, 0, 0]
-    )
-    wo_b_last: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(
-        wo_b, [D, O_GROUPS * O_LORA], [csa_layer_last * D, 0]
-    )
     wo_b_scale_last: pl.Tensor[[D], pl.FP32] = pl.slice(wo_b_scale, [D], [csa_layer_last * D])
     wo_a_shard_last: pl.Tensor[[GROUPS_PER_RANK, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
         wo_a_shard, [GROUPS_PER_RANK, O_LORA, O_GROUP_IN], [csa_layer_last * GROUPS_PER_RANK, 0, 0]
@@ -1436,7 +1408,7 @@ def l2_decode_fwd(embed_weight: pl.Tensor[[EMBED_VOCAB_PER_TP, D], pl.BF16], hc_
     tp_lookup_embedding(input_ids, embed_weight, embed_hidden, embed_window, embed_signal, my_rank, pl.const(1, pl.INT32), defer_clear=False)
     x_hc = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     pack_x_hc_rows(embed_hidden, x_hc)
-    return decode_fwd(hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv, kv_cache, attn_sink, wo_a, wo_b, wo_b_scale, wo_a_shard, wo_b_shard, hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w, hca_compress_state, csa_cmp_wkv, csa_cmp_wgate, csa_cmp_ape, csa_cmp_norm_w, csa_compress_state, csa_idx_wq_b, csa_idx_wq_b_scale, csa_weights_proj, csa_hadamard_idx, csa_inner_wkv, csa_inner_wgate, csa_inner_ape, csa_inner_norm_w, csa_inner_compress_state, hca_cmp_kv, csa_cmp_kv, idx_kv_cache, idx_kv_scale, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_w, gate_w, gate_bias, tid2eid, routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale, freqs_cos, freqs_sin, x_hc, position_ids, kv_seq_lens, hca_compress_state_block_table, csa_compress_state_block_table, csa_inner_compress_state_block_table, hca_cmp_block_table, csa_cmp_block_table, idx_block_table, ori_slot_mapping, swa_slot_mapping, swa_indices, swa_lens, hca_cmp_slot_mapping, hca_state_slot_mapping, csa_cmp_slot_mapping, csa_idx_slot_mapping, csa_state_slot_mapping, csa_inner_state_slot_mapping, input_ids, hc_head_fn, hc_head_scale, hc_head_base, final_norm_w, lm_head_weight, logit_row_indices, sampling_temperatures, sampling_top_ks, sampling_seeds, sampling_positions, pre_hc_hidden_out, x_out, logits, sampled_ids, reduce_window, reduce_signal, oproj_reduce_window, oproj_reduce_signal, oproj_sync_signal, tok_q_window, tok_q_signal, tok_o_window, tok_o_signal, lm_head_hidden_window, lm_head_hidden_done, lm_head_logits_window, lm_head_logits_done, num_tokens_per_owner, my_rank)
+    return decode_fwd(hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv, kv_cache, attn_sink, wo_b_scale, wo_a_shard, wo_b_shard, hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w, hca_compress_state, csa_cmp_wkv, csa_cmp_wgate, csa_cmp_ape, csa_cmp_norm_w, csa_compress_state, csa_idx_wq_b, csa_idx_wq_b_scale, csa_weights_proj, csa_hadamard_idx, csa_inner_wkv, csa_inner_wgate, csa_inner_ape, csa_inner_norm_w, csa_inner_compress_state, hca_cmp_kv, csa_cmp_kv, idx_kv_cache, idx_kv_scale, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_w, gate_w, gate_bias, tid2eid, routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale, freqs_cos, freqs_sin, x_hc, position_ids, kv_seq_lens, hca_compress_state_block_table, csa_compress_state_block_table, csa_inner_compress_state_block_table, hca_cmp_block_table, csa_cmp_block_table, idx_block_table, ori_slot_mapping, swa_slot_mapping, swa_indices, swa_lens, hca_cmp_slot_mapping, hca_state_slot_mapping, csa_cmp_slot_mapping, csa_idx_slot_mapping, csa_state_slot_mapping, csa_inner_state_slot_mapping, input_ids, hc_head_fn, hc_head_scale, hc_head_base, final_norm_w, lm_head_weight, logit_row_indices, sampling_temperatures, sampling_top_ks, sampling_seeds, sampling_positions, pre_hc_hidden_out, x_out, logits, sampled_ids, reduce_window, reduce_signal, oproj_reduce_window, oproj_reduce_signal, oproj_sync_signal, tok_q_window, tok_q_signal, tok_o_window, tok_o_signal, lm_head_hidden_window, lm_head_hidden_done, lm_head_logits_window, lm_head_logits_done, num_tokens_per_owner, my_rank)
 
 
 @pl.jit.host
