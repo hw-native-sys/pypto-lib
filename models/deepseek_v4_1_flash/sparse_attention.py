@@ -4192,31 +4192,6 @@ def l2_gather_sparse_attention(
     return output
 
 
-@pl.jit(auto_scope=False)
-def l2_gather_sparse_attention_pypto(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    window_indices: pl.Tensor[[T_DYN, WINDOW_KEYS], pl.INT32],
-    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
-    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
-    sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.InOut[pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16]],
-    num_tokens: pl.Scalar[pl.INT32],
-    start: pl.Scalar[pl.INT32],
-    compressed_keys: pl.Scalar[pl.INT32],
-):
-    if num_tokens > 0:
-        q = query[start:start + num_tokens, :]
-        wi = window_indices[start:start + num_tokens, :]
-        ci = compressed_indices[start:start + num_tokens, :]
-        ready = pl.system.task_dummy(deps=[])
-        if compressed_keys == 0:
-            gather_sparse_attention_pypto(q, wi, window, wi, window, sink, output, num_tokens, ready, 0)
-        else:
-            gather_sparse_attention_pypto(q, wi, window, ci, compressed, sink, output, num_tokens, ready, INDEX_TOPK)
-    return output
-
-
 def golden_gather_sparse_attention(
     query: torch.Tensor,
     window_indices: torch.Tensor,
@@ -4380,7 +4355,6 @@ if __name__ == "__main__":
     parser.add_argument("--rows", type=int, help="active row count; defaults to boundary cases")
     parser.add_argument("--compressed-keys", type=int, choices=[0, INDEX_TOPK], help="defaults to both key counts")
     parser.add_argument("--case", choices=["normal", "codes", "all"], default="all")
-    parser.add_argument("--impl", choices=["production", "pypto"], default="production")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--save-data", action="store_true")
     parser.add_argument("--runtime-dir", type=str)
@@ -4407,7 +4381,7 @@ if __name__ == "__main__":
             exact = case == "codes" or active <= 1
             compare = ratio_allclose(atol=0.0 if exact else 0.003, rtol=0.0 if exact else 0.03, max_error_ratio=0.0)
             result = run(
-                l2_gather_sparse_attention_pypto if args.impl == "pypto" else l2_gather_sparse_attention,
+                l2_gather_sparse_attention,
                 specs,
                 golden_fn=lambda tensors: tensors["output"][:active].copy_(golden_gather_sparse_attention(
                     tensors["query"][query_rows], tensors["window_indices"][query_rows], tensors["window"],
