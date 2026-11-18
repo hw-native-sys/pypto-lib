@@ -55,8 +55,8 @@ KV_TILE = 64  # kv rms-norm / rope / NOPE N granularity
 QUANT_TILE = 256
 T_TILE = 8
 MATMUL_T_TILE = 16
-QR_M_TILE = MATMUL_T_TILE  # qr_proj token (M) tile; cube rows must be a 16-row boxed tile
-QR_DENSE_M_TILE = 64
+QR_M_TILE = 64  # qr_proj tail token tile
+QR_DENSE_M_TILE = 128
 QR_N_TILE = 128  # qr_proj Q_LORA (N) per matmul
 QR_K_TILE = 256  # qr_proj D (K) reduction tile   | divides QR_SPLIT_K_TILE
 QR_OK = 2  # qr_proj split-K factor         | D//QR_OK cores share each N-group
@@ -84,9 +84,11 @@ QR_NORM_WORKERS = 16
 Q_ROPE_H_TILE = 4  # heads per fused qproj dequant/rms/rope task
 Q_DEQUANT_WORKERS = 32
 Q_STREAM_WORKERS = 20
+Q_STREAM_N_TILE = 128
 Q_STREAM_SLOTS = 2
 Q_STREAM_READY_EVENT = 0
 Q_STREAM_RELEASE_EVENT = 1
+Q_STREAM_DONE_EVENT = 2
 assert QPROJ_MM_N_TILE * QPROJ_M_TILE * 4 <= 128 * 1024  # L0C Acc cap
 assert QPROJ_M_TILE % QPROJ_TAIL_M_TILE == 0
 
@@ -338,11 +340,16 @@ def q_proj_qr(
                         dense_acc = pl.matmul_acc(dense_acc, dense_x, dense_w, init_cond=(dense_k == 0))
                     qr_fp32 = pl.assemble(qr_fp32, dense_acc, [dense_t0, q_a_col0], atomic=pl.AtomicType.Add)
                 for t0 in pl.range(qr_full_rows, qr_t_matmul, QR_M_TILE):
-                    q_acc = pl.create_tensor([QR_M_TILE, QR_N_TILE], dtype=pl.FP32)
-                    for db in pl.pipeline(QR_SPLIT_K_TILE // QR_K_TILE, stage=2):
+                    qr_rows = pl.min(QR_M_TILE, tile_rows - t0)
+                    x_t0 = tile_base + t0
+                    first_x = pl.slice(
+                        x_view, [QR_M_TILE, QR_K_TILE], [x_t0, qr_k_base],
+                        valid_shape=[qr_rows, QR_K_TILE],
+                    )
+                    first_w = wq_a[qr_k_base:qr_k_base + QR_K_TILE, q_a_col0:q_a_col0 + QR_N_TILE]
+                    q_acc = pl.matmul(first_x, first_w, out_dtype=pl.FP32)
+                    for db in pl.pipeline(1, QR_SPLIT_K_TILE // QR_K_TILE, stage=2):
                         qr_d0 = qr_k_base + db * QR_K_TILE
-                        qr_rows = pl.min(QR_M_TILE, tile_rows - t0)
-                        x_t0 = tile_base + t0
                         q_x_chunk_bf16 = pl.slice(
                             x_view,
                             [QR_M_TILE, QR_K_TILE],
@@ -350,7 +357,7 @@ def q_proj_qr(
                             valid_shape=[qr_rows, QR_K_TILE],
                         )
                         w_chunk = wq_a[qr_d0 : qr_d0 + QR_K_TILE, q_a_col0 : q_a_col0 + QR_N_TILE]
-                        q_acc = pl.matmul_acc(q_acc, q_x_chunk_bf16, w_chunk, init_cond=(db == 0))
+                        q_acc = pl.matmul_acc(q_acc, q_x_chunk_bf16, w_chunk)
                     qr_fp32 = pl.assemble(qr_fp32, q_acc, [t0, q_a_col0], atomic=pl.AtomicType.Add)
 
             qr_view = pl.reshape(qr, [t_dim, Q_LORA])
@@ -494,7 +501,7 @@ def _q_head_norm_rope(
     """Dequantize, normalize and rotate one Q head tile."""
     reduce_tmp = pl.create_tile([Q_ROPE_T_TILE, HEAD_DIM], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
     rsqrt_tmp = pl.create_tile([1, Q_ROPE_T_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-    gather_tmp = pl.create_tile([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.INT32, target_memory=pl.MemorySpace.Vec)
+    gather_tmp = pl.create_tile([1, Q_ROPE_T_TILE * ROPE_DIM], dtype=pl.INT32, target_memory=pl.MemorySpace.Vec)
     acc_float = pl.cast(accumulator, target_type=pl.FP32, mode="none")
     row_scaled = pl.row_expand_mul(acc_float, input_scale)
     dequantized = pl.col_expand_mul(row_scaled, weight_scale)
@@ -510,7 +517,11 @@ def _q_head_norm_rope(
     nope = pl.row_expand_mul(dequantized[:, 0:NOPE_DIM], inverse_column)
     nope_bf16 = pl.cast(nope, target_type=pl.BF16, mode="rint")
     rope = pl.row_expand_mul(dequantized[:, NOPE_DIM:HEAD_DIM], inverse_column)
-    swapped = pl.tile.gather(rope, swap_index, gather_tmp)
+    # The indices already contain row offsets, so one flat gather covers the full tile.
+    rope_flat = pl.reshape(rope, [1, Q_ROPE_T_TILE * ROPE_DIM])
+    swap_flat = pl.reshape(swap_index, [1, Q_ROPE_T_TILE * ROPE_DIM])
+    swapped_flat = pl.tile.gather(rope_flat, swap_flat, gather_tmp)
+    swapped = pl.reshape(swapped_flat, [Q_ROPE_T_TILE, ROPE_DIM])
     rope_cosine = pl.mul(rope, cosine)
     rope_sine = pl.mul(swapped, sine)
     rotated = pl.add(rope_cosine, rope_sine)
@@ -702,25 +713,46 @@ def _q_proj_q_stream(
             t0 = work // H * QPROJ_M_TILE
             head = work % H
             slot0 = (worker * Q_STREAM_SLOTS + item % Q_STREAM_SLOTS) * QPROJ_M_TILE
-            for half in pl.range(HEAD_DIM // QPROJ_MM_N_TILE):
-                n0 = head * HEAD_DIM + half * QPROJ_MM_N_TILE
-                acc = pl.create_tile([QPROJ_M_TILE, QPROJ_MM_N_TILE], dtype=pl.INT32, target_memory=pl.MemorySpace.Acc)
-                for kb in pl.pipeline(Q_LORA // QPROJ_K_TILE, stage=2):
-                    k0 = kb * QPROJ_K_TILE
-                    qa = pl.load(qr_i8_matmul, [t0, k0], [QPROJ_M_TILE, QPROJ_K_TILE], target_memory=pl.MemorySpace.Mat)
-                    qb = pl.load(wq_b, [k0, n0], [QPROJ_K_TILE, QPROJ_MM_N_TILE], target_memory=pl.MemorySpace.Mat)
-                    acc = pl.tile.matmul_acc(acc, qa, qb, init_cond=(kb == 0))
-                ring_col = half * QPROJ_MM_N_TILE
-                pl.store(acc, [slot0, ring_col], q_ring)
+            qa0 = pl.load(qr_i8_matmul, [t0, 0], [QPROJ_M_TILE, QPROJ_K_TILE], target_memory=pl.MemorySpace.Mat)
+            qa1 = pl.load(qr_i8_matmul, [t0, QPROJ_K_TILE], [QPROJ_M_TILE, QPROJ_K_TILE], target_memory=pl.MemorySpace.Mat)
+            # Keep both QR K panels resident across all four N fragments.
+            # Distinct L0C allocations let FIXPIPE drain one while Cube fills the other.
+            for pair in pl.range(HEAD_DIM // (2 * Q_STREAM_N_TILE)):
+                n0 = head * HEAD_DIM + pair * 2 * Q_STREAM_N_TILE
+                qb0 = pl.load(wq_b, [0, n0], [QPROJ_K_TILE, Q_STREAM_N_TILE], target_memory=pl.MemorySpace.Mat)
+                qb1 = pl.load(wq_b, [QPROJ_K_TILE, n0], [QPROJ_K_TILE, Q_STREAM_N_TILE], target_memory=pl.MemorySpace.Mat)
+                acc0: pl.Tile[[QPROJ_M_TILE, Q_STREAM_N_TILE], pl.INT32, pl.MemRef("q_acc0"), pl.Mem.Acc] = pl.create_tile(
+                    [QPROJ_M_TILE, Q_STREAM_N_TILE], dtype=pl.INT32, target_memory=pl.MemorySpace.Acc,
+                )
+                acc0 = pl.tile.matmul_acc(acc0, qa0, qb0, init_cond=True)
+                acc0 = pl.tile.matmul_acc(acc0, qa1, qb1)
+                ring_col = pair * 2 * Q_STREAM_N_TILE
+                pl.store(acc0, [slot0, ring_col], q_ring)
+                n1 = n0 + Q_STREAM_N_TILE
+                qb2 = pl.load(wq_b, [0, n1], [QPROJ_K_TILE, Q_STREAM_N_TILE], target_memory=pl.MemorySpace.Mat)
+                qb3 = pl.load(wq_b, [QPROJ_K_TILE, n1], [QPROJ_K_TILE, Q_STREAM_N_TILE], target_memory=pl.MemorySpace.Mat)
+                acc1: pl.Tile[[QPROJ_M_TILE, Q_STREAM_N_TILE], pl.INT32, pl.MemRef("q_acc1"), pl.Mem.Acc] = pl.create_tile(
+                    [QPROJ_M_TILE, Q_STREAM_N_TILE], dtype=pl.INT32, target_memory=pl.MemorySpace.Acc,
+                )
+                acc1 = pl.tile.matmul_acc(acc1, qa0, qb2, init_cond=True)
+                acc1 = pl.tile.matmul_acc(acc1, qa1, qb3)
+                pl.store(acc1, [slot0, ring_col + Q_STREAM_N_TILE], q_ring)
             pl.system.sync_set(Q_STREAM_READY_EVENT, pipe=pl.PipeType.FIX, ffts_mode=2, core_type=pl.KernelType.AIC)
         for drain in pl.range(pl.min(work_count, Q_STREAM_SLOTS)):
             pl.system.sync_wait(Q_STREAM_RELEASE_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
+
+        # Ring release covers input consumption; output completion needs a separate join.
+        pl.system.sync_wait(Q_STREAM_DONE_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
 
         for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
             pl.system.set_ffts(q_ffts)
             row_seed = pl.tile.arange(0, [1, Q_ROPE_T_TILE], dtype=pl.INT32)
             row_float = pl.cast(row_seed, target_type=pl.FP32)
             row_offsets = pl.reshape(pl.mul(row_float, ROPE_DIM), [Q_ROPE_T_TILE, 1])
+            # rope_prepare produces the same adjacent-pair permutation for every row.
+            swap_cols = pl.load(rope_swap_idx, [tile_base, 0], [Q_ROPE_T_TILE, ROPE_DIM], target_memory=pl.MemorySpace.Vec)
+            swap_float = pl.cast(swap_cols, target_type=pl.FP32)
+            swap = pl.cast(pl.row_expand_add(swap_float, row_offsets), target_type=pl.INT32)
             for vec_item in pl.range(work_count):
                 pl.system.sync_wait(Q_STREAM_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
                 vec_work = worker + vec_item * Q_STREAM_WORKERS
@@ -736,18 +768,18 @@ def _q_proj_q_stream(
                     out_t = tile_base + qr_t
                     ring_t = vec_slot0 + local_t
                     projected = pl.load(q_ring, [ring_t, 0], [Q_ROPE_T_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Vec)
+                    # Reuse is safe once both AIVs have read the last ring fragment into UB.
+                    if row_block == QPROJ_M_TILE // (2 * Q_ROPE_T_TILE) - 1:
+                        pl.system.sync_set(Q_STREAM_RELEASE_EVENT, pipe=pl.PipeType.MTE2, ffts_mode=2, core_type=pl.KernelType.AIV)
                     input_scale = pl.load(qr_scale_pad_store, [qr_t, 0], [Q_ROPE_T_TILE, 1], target_memory=pl.MemorySpace.Vec)
                     cosine = pl.load(rope_cos_il, [out_t, 0], [Q_ROPE_T_TILE, ROPE_DIM], target_memory=pl.MemorySpace.Vec)
                     sine = pl.load(rope_sin_signed, [out_t, 0], [Q_ROPE_T_TILE, ROPE_DIM], target_memory=pl.MemorySpace.Vec)
-                    swap_cols = pl.load(rope_swap_idx, [out_t, 0], [Q_ROPE_T_TILE, ROPE_DIM], target_memory=pl.MemorySpace.Vec)
-                    swap_float = pl.cast(swap_cols, target_type=pl.FP32)
-                    swap = pl.cast(pl.row_expand_add(swap_float, row_offsets), target_type=pl.INT32)
                     nope, rope = _q_head_norm_rope(
                         projected, scale, input_scale, cosine, sine, swap, False,
                     )
                     pl.store(nope, [out_t, h0], q_flat)
                     pl.store(rope, [out_t, h0 + NOPE_DIM], q_flat)
-                pl.system.sync_set(Q_STREAM_RELEASE_EVENT, pipe=pl.PipeType.MTE3, ffts_mode=2, core_type=pl.KernelType.AIV)
+            pl.system.sync_set(Q_STREAM_DONE_EVENT, pipe=pl.PipeType.MTE3, ffts_mode=2, core_type=pl.KernelType.AIV)
     return q
 
 

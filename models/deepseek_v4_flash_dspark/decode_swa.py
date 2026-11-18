@@ -368,7 +368,7 @@ def _decode_swa(
         )
 
     with pl.scope():
-        hc_post(attn_out, x_hc, post_t, comb_t, x_out, T_TILE=4)
+        hc_post(attn_out, x_hc, post_t, comb_t, x_out, pl.const(-1, pl.INT32), T_TILE=8)
 
 
 decode_swa = pl.jit.inline(auto_scope=False)(_decode_swa)

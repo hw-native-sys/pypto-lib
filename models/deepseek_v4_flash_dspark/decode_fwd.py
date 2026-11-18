@@ -401,7 +401,6 @@ def _decode_fwd(
     x_ping: pl.InOut[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
     x_pong: pl.InOut[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
     x_attn_active: pl.InOut[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
-    x_moe_next: pl.InOut[pl.Tensor[[MOE_TOKENS, HC_MULT, D], pl.FP32]],
     pre_hc_hidden_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
     dspark_target_hidden: pl.Out[pl.Tensor[[T_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
     x_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
@@ -596,19 +595,11 @@ def _decode_fwd(
                 shared_w1_layer_swa0, shared_w1_scale_layer_swa0,
                 shared_w3_layer_swa0, shared_w3_scale_layer_swa0,
                 shared_w2_layer_swa0, shared_w2_scale_layer_swa0,
-                x_moe_next,
+                x_pong,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
-                pl.const(0, pl.INT32), owner_tokens, my_rank, pl.const(1, pl.INT32),
+                pl.const(0, pl.INT32), owner_tokens, my_rank, pl.const(1, pl.INT32), owner_tokens,
             )
-            for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_swa0_active_trim"):
-                if token < local_t:
-                    if token < owner_tokens:
-                        next_row_swa0 = x_moe_next[token : token + 1, 0 : HC_MULT, 0 : D]
-                        x_pong[token : token + 1, 0 : HC_MULT, 0 : D] = next_row_swa0
-                    else:
-                        zero_next_row_swa0 = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
-                        x_pong[token : token + 1, 0 : HC_MULT, 0 : D] = zero_next_row_swa0
 
     with pl.scope():
         weight_layer_swa1 = pl.const(1, pl.INT32) % FWD_WEIGHT_BANK_SIZE
@@ -698,19 +689,11 @@ def _decode_fwd(
                 shared_w1_layer_swa1, shared_w1_scale_layer_swa1,
                 shared_w3_layer_swa1, shared_w3_scale_layer_swa1,
                 shared_w2_layer_swa1, shared_w2_scale_layer_swa1,
-                x_moe_next,
+                x_ping,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
-                pl.const(1, pl.INT32), owner_tokens, my_rank, pl.const(2, pl.INT32),
+                pl.const(1, pl.INT32), owner_tokens, my_rank, pl.const(2, pl.INT32), owner_tokens,
             )
-            for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_swa1_active_trim"):
-                if token < local_t:
-                    if token < owner_tokens:
-                        next_row_swa1 = x_moe_next[token : token + 1, 0 : HC_MULT, 0 : D]
-                        x_ping[token : token + 1, 0 : HC_MULT, 0 : D] = next_row_swa1
-                    else:
-                        zero_next_row_swa1 = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
-                        x_ping[token : token + 1, 0 : HC_MULT, 0 : D] = zero_next_row_swa1
 
     for ordinal in pl.range(HCA_LAYER_COUNT):
         csa_model_layer = pl.cast(ordinal * 2 + 2, pl.INT32)
@@ -852,19 +835,11 @@ def _decode_fwd(
                     shared_w1_layer_csa, shared_w1_scale_layer_csa,
                     shared_w3_layer_csa, shared_w3_scale_layer_csa,
                     shared_w2_layer_csa, shared_w2_scale_layer_csa,
-                    x_moe_next,
+                    x_pong,
                     recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                     routed_y_buf, combine_arrived,
-                    csa_model_layer, owner_tokens, my_rank, csa_model_layer + 1,
+                    csa_model_layer, owner_tokens, my_rank, csa_model_layer + 1, owner_tokens,
                 )
-                for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_csa_active_trim"):
-                    if token < local_t:
-                        if token < owner_tokens:
-                            next_row_csa = x_moe_next[token : token + 1, 0 : HC_MULT, 0 : D]
-                            x_pong[token : token + 1, 0 : HC_MULT, 0 : D] = next_row_csa
-                        else:
-                            zero_next_row_csa = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
-                            x_pong[token : token + 1, 0 : HC_MULT, 0 : D] = zero_next_row_csa
 
         with pl.scope():
             hc_attn_fn_layer_hca = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [hca_weight_layer * HC_FN_STORAGE_ROWS, 0])
@@ -973,19 +948,11 @@ def _decode_fwd(
                     shared_w1_layer_hca, shared_w1_scale_layer_hca,
                     shared_w3_layer_hca, shared_w3_scale_layer_hca,
                     shared_w2_layer_hca, shared_w2_scale_layer_hca,
-                    x_moe_next,
+                    x_ping,
                     recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                     routed_y_buf, combine_arrived,
-                    hca_model_layer, owner_tokens, my_rank, hca_model_layer + 1,
+                    hca_model_layer, owner_tokens, my_rank, hca_model_layer + 1, owner_tokens,
                 )
-                for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_hca_active_trim"):
-                    if token < local_t:
-                        if token < owner_tokens:
-                            next_row_hca = x_moe_next[token : token + 1, 0 : HC_MULT, 0 : D]
-                            x_ping[token : token + 1, 0 : HC_MULT, 0 : D] = next_row_hca
-                        else:
-                            zero_next_row_hca = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
-                            x_ping[token : token + 1, 0 : HC_MULT, 0 : D] = zero_next_row_hca
 
     with pl.scope():
         csa_ordinal_last = pl.const(20, pl.INT32)
@@ -1123,20 +1090,13 @@ def _decode_fwd(
                 shared_w1_layer_last, shared_w1_scale_layer_last,
                 shared_w3_layer_last, shared_w3_scale_layer_last,
                 shared_w2_layer_last, shared_w2_scale_layer_last,
-                x_moe_next,
+                pre_hc_hidden_out,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
-                model_layer_last, owner_tokens, my_rank, pl.const(43, pl.INT32),
+                model_layer_last, owner_tokens, my_rank, pl.const(43, pl.INT32), owner_tokens,
             )
-            for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_last_active_trim"):
-                if token < local_t:
-                    if token < owner_tokens:
-                        next_row_last = x_moe_next[token : token + 1, 0 : HC_MULT, 0 : D]
-                        pre_hc_hidden_out[token : token + 1, 0 : HC_MULT, 0 : D] = next_row_last
-                    else:
-                        zero_next_row_last = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
-                        pre_hc_hidden_out[token : token + 1, 0 : HC_MULT, 0 : D] = zero_next_row_last
-    clear_moe_signals(x_moe_next, arrived, data_arrived, combine_arrived)
+
+    clear_moe_signals(pre_hc_hidden_out, arrived, data_arrived, combine_arrived)
 
     # No pl.scope() here: the branches write pl.Out params, and a scope would
     # confine their phi to it, out of reach of a caller that inlines this body.
@@ -1289,6 +1249,7 @@ def l3_decode_fwd(
     x_ping: pl.InOut[pl.Tensor[[N_RANKS, T_DYN, HC_MULT, D], pl.FP32]],
     x_pong: pl.InOut[pl.Tensor[[N_RANKS, T_DYN, HC_MULT, D], pl.FP32]],
     x_attn_active: pl.InOut[pl.Tensor[[N_RANKS, T_DYN, HC_MULT, D], pl.FP32]],
+    # Reserved for serving's positional ABI; MoE writes directly to the next layer.
     x_moe_next: pl.InOut[pl.Tensor[[N_RANKS, MOE_TOKENS, HC_MULT, D], pl.FP32]],
     pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T_DYN, HC_MULT, D], pl.FP32]],
     dspark_target_hidden: pl.Out[pl.Tensor[[N_RANKS, T_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
@@ -1438,7 +1399,7 @@ def l3_decode_fwd(
             shared_w2[rank], shared_w2_scale[rank],
             hidden_workspace[rank],
             x_ping[rank], x_pong[rank],
-            x_attn_active[rank], x_moe_next[rank],
+            x_attn_active[rank],
             pre_hc_hidden_out[rank], dspark_target_hidden[rank],
             x_out[rank], logits[rank],
             grammar_mask[rank], sampled_ids[rank],
@@ -1859,7 +1820,7 @@ def build_tensor_specs(
         ),
         "x_moe_next": TensorSpec(
             "x_moe_next", [N_RANKS, MOE_TOKENS, HC_MULT, D], torch.float32,
-            init_value=lambda: torch.zeros(N_RANKS, MOE_TOKENS, HC_MULT, D, dtype=torch.float32), 
+            init_value=0,
         ),
         "pre_hc_hidden_out": TensorSpec(
             "pre_hc_hidden_out", [N_RANKS, local_t, HC_MULT, D], torch.float32, 

@@ -498,6 +498,7 @@ def draft_layer(
         recv_meta, recv_x, recv_aux, recv_route,
         arrived, data_arrived, routed_y_buf, combine_arrived,
         layer_id, active_tokens, my_rank, moe_epoch,
+        pl.const(-1, pl.INT32),
     )
     return output_hc, hidden_gather_signal
 

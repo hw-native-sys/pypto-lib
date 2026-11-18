@@ -556,6 +556,7 @@ def decode_layer_swa(
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
             layer_id, owner_tokens, my_rank, moe_epoch,
+            pl.const(-1, pl.INT32),
         )
 
         for token in pl.spmd(MOE_TOKENS, name_hint="decode_layer_active_trim"):
@@ -951,6 +952,7 @@ def decode_layer_hca(
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
             layer_id, owner_tokens, my_rank, moe_epoch,
+            pl.const(-1, pl.INT32),
         )
 
         for token in pl.spmd(MOE_TOKENS, name_hint="decode_layer_active_trim"):
@@ -1432,6 +1434,7 @@ def decode_layer_csa(
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
             layer_id, owner_tokens, my_rank, moe_epoch,
+            pl.const(-1, pl.INT32),
         )
 
         for token in pl.spmd(MOE_TOKENS, name_hint="decode_layer_active_trim"):

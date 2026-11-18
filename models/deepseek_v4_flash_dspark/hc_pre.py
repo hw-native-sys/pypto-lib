@@ -37,7 +37,7 @@ NORM_EPS = M.rms_norm_eps
 MIX_PAD = 32  # mix_hc (24) padded to a 32-wide cube N / vector row
 HC_PAD = 8  # hc (4) padded for 32B-aligned vector ops
 T_TILE = 8  # other values miscompare
-LINEAR_T_TILE = 16  # cube matmul rows must be a 16-row boxed tile
+LINEAR_T_TILE = 64  # cube matmul rows must align to 16 rows
 COMB_T_TILE = 8
 PRE_POST_WORKERS = 16
 RMS_K_TILE = 512
@@ -461,7 +461,7 @@ def hc_pre_gates(
     """Compute gates with the shared decode geometry."""
     return _hc_pre_gates(
         x, hc_fn, hc_scale, hc_base, pre_val_store, post, comb, row_recip,
-        LINEAR_T_TILE=16, COMB_T_TILE=8,
+        LINEAR_T_TILE=LINEAR_T_TILE, COMB_T_TILE=COMB_T_TILE,
     )
 
 
@@ -475,7 +475,10 @@ def _hc_pre(
     comb: pl.Out[pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32]],
 ):
     """Compute mixed activations with the shared decode geometry."""
-    return _hc_pre_impl(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb, LINEAR_T_TILE=16, COMB_T_TILE=8)
+    return _hc_pre_impl(
+        x, hc_fn, hc_scale, hc_base, x_mixed, post, comb,
+        LINEAR_T_TILE=LINEAR_T_TILE, COMB_T_TILE=COMB_T_TILE,
+    )
 
 
 hc_pre = pl.jit.inline(_hc_pre)
