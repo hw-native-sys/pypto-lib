@@ -72,7 +72,9 @@ from prefill_cp_token_allgather import (
     CP_Q_T_DYN as PREFILL_LOCAL_T_DYN,
     PREFILL_GROUP_CAP,
     TP_SIZE,
-    prefill_cp_token_allgather_step,
+    prefill_cp_token_allgather_into,
+    prefill_cp_materialize_hc_full,
+    prefill_cp_materialize_coeff_full,
 )
 
 
@@ -1532,8 +1534,8 @@ def prefill_moe_tile(
 
 
 @pl.jit.inline(auto_scope=False)
-def prefill_moe(
-    attn_out: pl.Tensor[[PREFILL_GROUP_T_DYN, HC_MULT, D], pl.FP32],
+def prefill_moe_local(
+    attn_out_local: pl.Tensor[[PREFILL_LOCAL_T_DYN, HC_MULT, D], pl.FP32],
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -1541,7 +1543,7 @@ def prefill_moe(
     gate_w: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32],
     gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
-    input_ids: pl.Tensor[[PREFILL_LOCAL_T_DYN], pl.INT64],
+    input_ids_local: pl.Tensor[[PREFILL_LOCAL_T_DYN], pl.INT64],
     routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
     routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
     routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
@@ -1554,11 +1556,11 @@ def prefill_moe(
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    x_hc: pl.Tensor[[PREFILL_GROUP_T_DYN, HC_MULT, D], pl.FP32],
-    x_mixed: pl.Tensor[[PREFILL_GROUP_T_DYN, D], pl.BF16],
-    post_ffn: pl.Tensor[[PREFILL_GROUP_T_DYN, HC_MULT], pl.FP32],
-    comb_ffn: pl.Tensor[[PREFILL_GROUP_T_DYN, HC_MULT * HC_MULT], pl.FP32],
-    ffn_out: pl.Tensor[[PREFILL_LOCAL_T_DYN, D], pl.BF16],
+    x_hc_local: pl.Tensor[[PREFILL_LOCAL_T_DYN, HC_MULT, D], pl.FP32],
+    x_mixed_local: pl.Tensor[[PREFILL_LOCAL_T_DYN, D], pl.BF16],
+    post_ffn_local: pl.Tensor[[PREFILL_LOCAL_T_DYN, HC_MULT], pl.FP32],
+    comb_ffn_local: pl.Tensor[[PREFILL_LOCAL_T_DYN, HC_MULT * HC_MULT], pl.FP32],
+    ffn_out_local: pl.Tensor[[PREFILL_LOCAL_T_DYN, D], pl.BF16],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
@@ -1569,23 +1571,19 @@ def prefill_moe(
     stage_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     stage_token: pl.Tensor[[1], pl.INT32],
     layer_completion: pl.Tensor[[1], pl.INT32],
-    gather_window: pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16],
-    gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     group_tokens: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[PREFILL_GROUP_T_DYN, HC_MULT, D], pl.FP32]:
-    """Run one CP-aware prefill MoE layer over a rank-local token shard."""
+) -> pl.Tensor[[PREFILL_LOCAL_T_DYN, HC_MULT, D], pl.FP32]:
+    """Run one local prefill MoE layer."""
     with pl.scope():
-        x_mixed_step = x_mixed
-        post_ffn_step = post_ffn
-        comb_ffn_step = comb_ffn
+        x_mixed_step = x_mixed_local
+        post_ffn_step = post_ffn_local
+        comb_ffn_step = comb_ffn_local
         if group_tokens > 0:
-            _hc_pre_prefill(attn_out, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, x_mixed_step, post_ffn_step, comb_ffn_step)
+            _hc_pre_prefill(attn_out_local, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, x_mixed_step, post_ffn_step, comb_ffn_step)
 
-    local_rows = pl.tensor.dim(ffn_out, 0)
+    local_rows = pl.tensor.dim(ffn_out_local, 0)
     # Every EP rank participates in every physical wave, including empty groups.
     num_waves = (local_rows + PREFILL_MOE_T_TILE - 1) // PREFILL_MOE_T_TILE
     num_waves_i32 = pl.cast(num_waves, pl.INT32)
@@ -1593,14 +1591,13 @@ def prefill_moe(
         wave_i32 = pl.cast(wave, pl.INT32)
         moe_epoch = layer_id * num_waves_i32 + wave_i32 + pl.const(1, pl.INT32)
         with pl.scope():
-            ffn_out_step = ffn_out
+            ffn_out_step = ffn_out_local
             local_wave_base = wave_i32 * PREFILL_MOE_T_TILE
             # Physical rows in the fixed-capacity wave.
             wave_rows = pl.min(PREFILL_MOE_T_TILE, local_rows - local_wave_base)
             if group_tokens <= 0:
                 wave_rows = pl.cast(0, pl.INDEX)
             wave_rows_i32 = pl.cast(wave_rows, pl.INT32)
-            full_wave_base = tp_rank * local_rows + local_wave_base
 
             x_mixed_wave = pl.create_tensor([PREFILL_MOE_T_TILE, D], dtype=pl.BF16)
             with pl.spmd(PREFILL_MOE_T_TILE, name_hint="prefill_moe_hidden_stage") as wave_ready_tid:
@@ -1608,15 +1605,15 @@ def prefill_moe(
                 completed_epoch = pl.read(stage_token, [0])
                 if completed_epoch >= 0:
                     if token < wave_rows:
-                        full_token = full_wave_base + token
-                        x_mixed_row = x_mixed[full_token : full_token + 1, :]
+                        hidden_token = local_wave_base + token
+                        x_mixed_row = x_mixed_local[hidden_token : hidden_token + 1, :]
                         x_mixed_wave[token : token + 1, :] = x_mixed_row
                     else:
                         x_mixed_zero = pl.full([1, D], dtype=pl.BF16, value=0.0)
                         x_mixed_wave[token : token + 1, :] = x_mixed_zero
 
-            input_id_count = pl.tensor.dim(input_ids, 0)
-            input_ids_rows = pl.reshape(input_ids, [input_id_count, 1])
+            input_id_count = pl.tensor.dim(input_ids_local, 0)
+            input_ids_rows = pl.reshape(input_ids_local, [input_id_count, 1])
             input_ids_wave_rows = pl.create_tensor([PREFILL_MOE_T_TILE, 1], dtype=pl.INT64)
             if wave_rows == PREFILL_MOE_T_TILE and PREFILL_MOE_T_TILE % INT64_PER_CACHE_LINE == 0:
                 for token_block in pl.spmd(PREFILL_MOE_T_TILE // PREFILL_INPUT_ID_TILE, name_hint="prefill_moe_ids_stage"):
@@ -1698,14 +1695,98 @@ def prefill_moe(
 
     with pl.scope():
         if group_tokens > 0:
-            group_rows = pl.tensor.dim(attn_out, 0)
-            ffn_out_full = pl.create_tensor([group_rows, D], dtype=pl.BF16)
-            ffn_out_full, _gather_signal = prefill_cp_token_allgather_step(
-                ffn_out, ffn_out_full,
-                gather_window, gather_signal,
-                group_base, tp_rank,
+            hc_post(ffn_out_local, attn_out_local, post_ffn_local, comb_ffn_local, x_hc_local, T_TILE=16)
+    return x_hc_local
+
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_moe(
+    attn_out: pl.Tensor[[PREFILL_GROUP_T_DYN, HC_MULT, D], pl.FP32],
+    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    gate_w: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
+    tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
+    input_ids: pl.Tensor[[PREFILL_LOCAL_T_DYN], pl.INT64],
+    routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
+    routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
+    routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ],
+    routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
+    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
+    shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
+    shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
+    shared_w2_scale: pl.Tensor[[D], pl.FP32],
+    x_hc: pl.Tensor[[PREFILL_GROUP_T_DYN, HC_MULT, D], pl.FP32],
+    x_mixed: pl.Tensor[[PREFILL_GROUP_T_DYN, D], pl.BF16],
+    post_ffn: pl.Tensor[[PREFILL_GROUP_T_DYN, HC_MULT], pl.FP32],
+    comb_ffn: pl.Tensor[[PREFILL_GROUP_T_DYN, HC_MULT * HC_MULT], pl.FP32],
+    ffn_out: pl.Tensor[[PREFILL_LOCAL_T_DYN, D], pl.BF16],
+    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_x: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
+    recv_aux: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
+    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    routed_y_buf: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    stage_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    stage_token: pl.Tensor[[1], pl.INT32],
+    layer_completion: pl.Tensor[[1], pl.INT32],
+    gather_window: pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16],
+    gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    layer_id: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    group_tokens: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[PREFILL_GROUP_T_DYN, HC_MULT, D], pl.FP32]:
+    """Materialize one CP-replicated prefill MoE layer."""
+    local_rows = pl.tensor.dim(ffn_out, 0)
+    local_base = tp_rank * local_rows
+    local_end = local_base + local_rows
+    attn_out_local = attn_out[local_base : local_end, :, :]
+    x_hc_local = x_hc[local_base : local_end, :, :]
+    x_mixed_local = x_mixed[local_base : local_end, :]
+    post_ffn_local = post_ffn[local_base : local_end, :]
+    comb_ffn_local = comb_ffn[local_base : local_end, :]
+    prefill_moe_local(
+        attn_out_local,
+        hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        norm_w, gate_w, gate_bias, tid2eid, input_ids,
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+        routed_w2, routed_w2_scale,
+        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+        shared_w2, shared_w2_scale,
+        x_hc_local, x_mixed_local, post_ffn_local, comb_ffn_local, ffn_out,
+        recv_meta, recv_x, recv_aux, arrived, data_arrived,
+        routed_y_buf, combine_arrived, stage_done, stage_token, layer_completion,
+        layer_id, my_rank, group_tokens,
+    )
+    with pl.scope():
+        if group_tokens > 0:
+            materialize_ready_tid = pl.system.task_dummy(deps=[])
+            hc_full_tid = prefill_cp_materialize_hc_full(
+                x_hc_local, x_hc,
+                gather_window, gather_signal, group_base, tp_rank, materialize_ready_tid,
             )
-            hc_post(ffn_out_full, attn_out, post_ffn, comb_ffn, x_hc, T_TILE=16)
+            mixed_full_tid = prefill_cp_token_allgather_into(
+                x_mixed_local, x_mixed,
+                gather_window, gather_signal, group_base, tp_rank, hc_full_tid,
+            )
+            post_full_tid = prefill_cp_materialize_coeff_full(
+                post_ffn_local, post_ffn,
+                gather_window, gather_signal, group_base, tp_rank, mixed_full_tid,
+            )
+            prefill_cp_materialize_coeff_full(
+                comb_ffn_local, comb_ffn,
+                gather_window, gather_signal, group_base, tp_rank, post_full_tid,
+            )
     return x_hc
 
 
