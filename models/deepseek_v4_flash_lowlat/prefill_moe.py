@@ -16,6 +16,7 @@ from .prefill_moe_geometry import (
     REDUCE_WINDOW_ROWS, REDUCE_LANE_ROWS, REDUCE_D_TILE, T_PAD, T, TOPK, VOCAB,
     COPY_T_TILE, COPY_D_TILE, REDUCE_T_TILE,
     PREFILL_MOE_BATCHED_GATHER as PREFILL_MOE_BATCHED_GATHER, PREFILL_MOE_DIRECT_POST,
+    PREFILL_MOE_STAGE_VIEW,
     PREFILL_MOE_OWNER_REDUCE, PREFILL_MOE_EXPERT_AFFINITY as PREFILL_MOE_EXPERT_AFFINITY, OWNER_ROWS, OWNER_REDUCE_T_TILE, OWNER_COPY_T_TILE, RESULT_WINDOW_ROWS,
 )
 
@@ -298,17 +299,34 @@ def prefill_moe_tp(
             base = wave * T
             active = pl.min(T, pl.cast(group_tokens, pl.INDEX) - base)
             epoch = epoch_base + pl.cast(wave, pl.INT32) + pl.const(1, pl.INT32)
-            wave_hc = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
             wave_ids = pl.create_tensor([T], dtype=pl.INT64)
             compute_ready = consumed[lane]
             if PREFILL_MOE_READY == 0:
                 compute_ready = stored[0]
-            with pl.spmd(T, name_hint="prefill_moe_ready_stage", deps=[compute_ready]) as staged:
-                token = pl.tile.get_block_idx()
-                if token < active:
-                    wave_hc[token:token + 1, :, :] = attn_out[base + token:base + token + 1, :, :]
+            if PREFILL_MOE_STAGE_VIEW != 0:
+                stage_tasks = pl.array.create(1, pl.TASK_ID)
+                stage_tasks[0] = compute_ready
+                if active == T:
+                    wave_hc = pl.slice(attn_out, [T, HC_MULT, D], [base, 0, 0])
                 else:
-                    wave_hc[token:token + 1, :, :] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
+                    wave_hc = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+                    with pl.spmd(T, name_hint="prefill_moe_ready_stage_tail", deps=[compute_ready]) as tail_staged:
+                        token = pl.tile.get_block_idx()
+                        if token < active:
+                            wave_hc[token:token + 1, :, :] = attn_out[base + token:base + token + 1, :, :]
+                        else:
+                            wave_hc[token:token + 1, :, :] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
+                    stage_tasks[0] = tail_staged
+                staged = stage_tasks[0]
+            else:
+                wave_hc = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+                with pl.spmd(T, name_hint="prefill_moe_ready_stage", deps=[compute_ready]) as copied:
+                    token = pl.tile.get_block_idx()
+                    if token < active:
+                        wave_hc[token:token + 1, :, :] = attn_out[base + token:base + token + 1, :, :]
+                    else:
+                        wave_hc[token:token + 1, :, :] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
+                staged = copied
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_ready_ids", deps=[compute_ready]) as ids_ready:
                 for token in pl.range(T):
                     value = pl.const(0, pl.INT64)
@@ -322,6 +340,7 @@ def prefill_moe_tp(
                 tid2eid, wave_ids, layer_id, pl.cast(active, pl.INT32),
                 gate_window, gate_signal, my_rank, gate_epoch_base + epoch, previous_gate_scalar,
                 owner_norm_window, owner_scale_window, owner_post_window, owner_comb_window, owner_indices_window, owner_weights_window,
+                staged,
             )
             gate_previous[0] = gate_finished
             ffn_partial = moe_local(

@@ -14,7 +14,7 @@ from .prefill_moe_geometry import GATE_WINDOW_ROWS, N_RANKS, PREFILL_MOE_OWNER_P
 from .prefill_owner_prepare import exchange_preparation
 from .prefill_parallel_route import parallel_route_metadata
 from .prefill_moe_geometry import PREFILL_MOE_PARALLEL_ROUTE
-from .hc_pre import hc_pre
+from .prefill_hc_pre import hc_pre_with_input_ready as hc_pre
 from .prefill_moe_gate import gate, ROUTE_ROW_PAD
 from .prefill_moe_expert import expert_routed_persistent_planned
 from .prefill_moe_geometry import (
@@ -258,6 +258,7 @@ def prepare_moe(
     owner_comb_window: pld.DistributedTensor[[OWNER_WINDOW_ROWS, HC_MULT * HC_MULT], pl.FP32],
     owner_indices_window: pld.DistributedTensor[[OWNER_WINDOW_ROWS, 16], pl.INT32],
     owner_weights_window: pld.DistributedTensor[[OWNER_WINDOW_ROWS, 16], pl.FP32],
+    residual_ready: pl.Scalar[pl.TASK_ID] = None,
 ):
     post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32, manual_dep=True)
     comb_ffn = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
@@ -278,7 +279,7 @@ def prepare_moe(
         owner_scale = pl.create_tensor([PREP_OWNER_ROWS, 1], dtype=pl.FP32)
         owner_indices = pl.create_tensor([PREP_OWNER_ROWS, ROUTE_ROW_PAD], dtype=pl.INT32)
         owner_weights = pl.create_tensor([PREP_OWNER_ROWS, ROUTE_ROW_PAD], dtype=pl.FP32)
-        hc_pre(owner_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, owner_mixed, owner_post, owner_comb)
+        hc_pre(owner_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, owner_mixed, owner_post, owner_comb, residual_ready)
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_owner_route_padding_init"):
             owner_indices[:, :] = pl.full([PREP_OWNER_ROWS, ROUTE_ROW_PAD], dtype=pl.INT32, value=0)
             owner_weights[:, :] = pl.full([PREP_OWNER_ROWS, ROUTE_ROW_PAD], dtype=pl.FP32, value=0.0)
@@ -293,7 +294,7 @@ def prepare_moe(
         x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
         hc_pre(
             x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-            x_mixed, post_ffn, comb_ffn,
+            x_mixed, post_ffn, comb_ffn, residual_ready,
         )
 
         gate_weights, legacy_gate_finished = gate(

@@ -98,6 +98,12 @@ expert arithmetic and ordered combine retain their original numerical rules.
 This larger-slab path still requires its own device bitwise and ordinary
 performance qualification; native preparation alone is not an accepted speedup.
 
+The prefill build option `--prefill-moe-stage-view` lets a complete MoE wave
+consume a read-only slice of the attention output in place. The HC RMS and
+linear projections wait for the original wave credit. A final partial wave
+retains its bounded stage buffer and zero fills inactive rows. The option
+defaults off and applies only to prefill.
+
 The opt-in build option `--prefill-moe-ready` permits two bounded prefill MoE
 slabs to advance ahead of ordered TP publication and uses core-releasing peer
 waits. The original wait policy uses the same prefill slab. Copies use bounded

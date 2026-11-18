@@ -43,6 +43,9 @@ if PREFILL_MOE_EXPERT_AFFINITY not in (0, 1):
 PREFILL_MOE_BATCHED_GATHER = _parse_int_argv("--prefill-moe-batched-gather", 0)
 if PREFILL_MOE_BATCHED_GATHER not in (0, 1):
     raise ValueError("Prefill batched gather must be zero or one")
+PREFILL_MOE_STAGE_VIEW = _parse_int_argv("--prefill-moe-stage-view", 0)
+if PREFILL_MOE_STAGE_VIEW not in (0, 1):
+    raise ValueError("Prefill MoE stage view must be zero or one")
 PREFILL_MOE_DIRECT_POST = _parse_int_argv("--prefill-moe-direct-post", 0)
 if PREFILL_MOE_DIRECT_POST not in (0, 1):
     raise ValueError("Prefill direct post must be zero or one")
