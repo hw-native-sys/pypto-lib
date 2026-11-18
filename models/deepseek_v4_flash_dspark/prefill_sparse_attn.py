@@ -231,6 +231,7 @@ def _hca_streaming_wave(
     cmp_partial_o: pl.Tensor[[HCA_QUERY_STATS_ROWS, HEAD_DIM], pl.FP32],
     rope_cos_il: pl.Tensor[[T_PAD, ROPE_DIM], pl.FP32],
     rope_sin_signed: pl.Tensor[[T_PAD, ROPE_DIM], pl.FP32],
+    rope_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
     wave_completion: pl.Array[1, pl.TASK_ID],
     request_offset: pl.Scalar[pl.INDEX],
     tile_base: pl.Scalar[pl.INDEX],
@@ -514,11 +515,8 @@ def _hca_streaming_wave(
 
             merge_dense_t = dense_query_base + merge_local_t
             merge_rope = merge_full[:, NOPE_DIM:HEAD_DIM]
-            merge_even = pl.gather(merge_rope, mask_pattern=pl.tile.MaskPattern.P0101)
-            merge_odd = pl.gather(merge_rope, mask_pattern=pl.tile.MaskPattern.P1010)
-            merge_swapped = pl.full([HEAD_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
-            merge_swapped = pl.tensor.scatter(merge_odd, mask_pattern=pl.tile.MaskPattern.P0101, dst=merge_swapped)
-            merge_swapped = pl.tensor.scatter(merge_even, mask_pattern=pl.tile.MaskPattern.P1010, dst=merge_swapped)
+            merge_swap_idx = rope_swap_idx[:, :]
+            merge_swapped = pl.gather(merge_rope, dim=-1, index=merge_swap_idx)
             merge_cos = rope_cos_il[merge_dense_t : merge_dense_t + 1, 0:ROPE_DIM]
             merge_sin = rope_sin_signed[merge_dense_t : merge_dense_t + 1, 0:ROPE_DIM]
             merge_main = pl.col_expand_mul(merge_rope, merge_cos)
@@ -641,7 +639,7 @@ def _hca_streaming_attn_tile(
                 raw_kv, raw_valid,
                 stream_state_m, stream_state_l, stream_heads,
                 cmp_partial_m, cmp_partial_l, cmp_partial_o,
-                rope_cos_il, rope_sin_signed,
+                rope_cos_il, rope_sin_signed, rope_swap_idx,
                 wave_completion, request_offset, tile_base, dense_query_base,
             )
 
@@ -697,6 +695,8 @@ def _sparse_attn_wave(
     gather_cmp_blocks = gather_cmp_token_blocks * (PREFILL_ATTN_BLOCKS - 1)
 
     # Stage original-window rows in reverse token-tile order.
+    sparse_ori_rows = PREFILL_QUERY_TILE * PREFILL_ATTN_TILE
+    sparse_ori_kv = sparse_kv[0:sparse_ori_rows, 0:HEAD_DIM]
     with pl.spmd(
         gather_blocks,
         name_hint="gather_ori_kv",
@@ -728,7 +728,7 @@ def _sparse_attn_wave(
             if gather_t < t_dim:
                 if gather_t < active_rows:
                     request_id = pl.read(local_request_ids, [gather_t])
-                    block_base = gather_local_t * PREFILL_SPARSE_PAD
+                    block_base = gather_local_t * PREFILL_ATTN_TILE
                     if pl.read(valid_block_mask, [gather_t, 0]) > 0:
                         stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
                         if request_id >= 0:
@@ -750,8 +750,9 @@ def _sparse_attn_wave(
                                         if gather_raw >= 0:
                                             src = pl.cast(gather_raw, pl.INDEX)
                                             stage[gather_ki : gather_ki + 1, :] = ori_kv_flat[src : src + 1, :]
-                        sparse_kv[block_base : block_base + PREFILL_ATTN_TILE, :] = stage
+                        sparse_ori_kv[block_base : block_base + PREFILL_ATTN_TILE, :] = stage
 
+    sparse_cmp_kv = sparse_kv[sparse_ori_rows:PREFILL_QUERY_TILE * PREFILL_SPARSE_PAD, 0:HEAD_DIM]
     with pl.spmd(
         gather_cmp_blocks,
         name_hint="gather_cmp_kv",
@@ -770,7 +771,7 @@ def _sparse_attn_wave(
                 if gather_t < active_rows:
                     request_id = pl.read(local_request_ids, [gather_t])
                     gather_block_valid = pl.read(valid_block_mask, [gather_t, gather_sb])
-                    block_base = gather_local_t * PREFILL_SPARSE_PAD + gather_k0
+                    block_base = ((gather_sb - 1) * PREFILL_QUERY_TILE + gather_local_t) * PREFILL_ATTN_TILE
                     if gather_block_valid > 0:
                         stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
                         if request_id >= 0:
@@ -806,7 +807,7 @@ def _sparse_attn_wave(
                                                     blk = pl.cast(blk_raw, pl.INDEX)
                                                     src = blk * BLOCK_SIZE + (gather_raw - blk_slot * BLOCK_SIZE)
                                                     stage[gather_ki : gather_ki + 1, :] = cmp_kv_flat[src : src + 1, :]
-                        sparse_kv[block_base : block_base + PREFILL_ATTN_TILE, :] = stage
+                        sparse_cmp_kv[block_base : block_base + PREFILL_ATTN_TILE, :] = stage
 
     # Pipeline K blocks and keep the online-softmax state local to each query.
     transfer_slots = NUM_QK_CORES * QK_TRANSFER_SLOTS
@@ -831,7 +832,7 @@ def _sparse_attn_wave(
                     qk_sb = qk_tick
                     if pl.read(valid_block_mask, [qk_t, qk_sb]) > 0:
                         qk_slot = qk_core * QK_TRANSFER_SLOTS + qk_sb % QK_TRANSFER_SLOTS
-                        qk_kv_row = qk_local_t * PREFILL_SPARSE_PAD + qk_sb * PREFILL_ATTN_TILE
+                        qk_kv_row = (qk_sb * PREFILL_QUERY_TILE + qk_local_t) * PREFILL_ATTN_TILE
                         qk_transfer_row = qk_slot * H
                         qk_kv = pl.load(
                             sparse_kv, [qk_kv_row, 0], [PREFILL_ATTN_TILE, HEAD_DIM],
@@ -847,7 +848,7 @@ def _sparse_attn_wave(
                     pv_sb = qk_tick - QK_PRE_LAUNCH
                     if pl.read(valid_block_mask, [qk_t, pv_sb]) > 0:
                         pv_slot = qk_core * QK_TRANSFER_SLOTS + pv_sb % QK_TRANSFER_SLOTS
-                        pv_kv_row = qk_local_t * PREFILL_SPARSE_PAD + pv_sb * PREFILL_ATTN_TILE
+                        pv_kv_row = (pv_sb * PREFILL_QUERY_TILE + qk_local_t) * PREFILL_ATTN_TILE
                         pv_transfer_row = pv_slot * H
                         pl.system.sync_wait(QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
                         pv_probability = pl.load(
