@@ -625,7 +625,7 @@ def _decode_csa(
         )
 
     with pl.scope():
-        hc_post(attn_out, x_hc, post_t, comb_t, x_out)
+        hc_post(attn_out, x_hc, post_t, comb_t, x_out, T_TILE=4)
     return x_out
 
 

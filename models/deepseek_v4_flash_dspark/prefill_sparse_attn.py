@@ -70,7 +70,7 @@ CMP_BLOCK_NUM = CMP_MAX_BLOCKS
 
 # tiling
 HEAD_TILE = 16  # storage / merge head-tile
-QK_M_TILE = 32  # head rows cube-batched per QK/PV matmul
+QK_M_TILE = 64  # head rows cube-batched per QK/PV matmul
 NUM_QK_CORES = 24
 QK_PRE_LAUNCH = 2
 QK_TRANSFER_SLOTS = QK_PRE_LAUNCH + 1
@@ -257,13 +257,29 @@ def _hca_streaming_wave(
             raw_stage = pl.full([WIN, HEAD_DIM], dtype=pl.BF16, value=0.0)
             valid_stage = pl.full([1, WIN], dtype=pl.FP32, value=0.0)
             if gather_t < request_end:
-                for gather_k in pl.range(WIN):
-                    gather_row_i32 = pl.read(swa_indices, [gather_t, gather_k])
-                    if gather_row_i32 >= 0:
-                        gather_row = pl.cast(gather_row_i32, pl.INDEX)
-                        gather_kv = ori_kv_flat[gather_row : gather_row + 1, 0:HEAD_DIM]
-                        raw_stage[gather_k : gather_k + 1, 0:HEAD_DIM] = gather_kv
-                        pl.write(valid_stage, [0, gather_k], 1.0)
+                gather_indices = pl.load(swa_indices, [gather_t, 0], [1, WIN], target_memory=pl.MemorySpace.Vec)
+                for gather_g0 in pl.range(0, WIN, SPARSE_OPT_GATHER_ROW_TILE):
+                    gather_first = pl.tile.read(gather_indices, [0, gather_g0])
+                    gather_contiguous = gather_first >= 0
+                    for gather_ci, (contiguous_iter,) in pl.range(1, SPARSE_OPT_GATHER_ROW_TILE, init_values=(gather_contiguous,)):
+                        gather_next = pl.tile.read(gather_indices, [0, gather_g0 + gather_ci])
+                        gather_matches = contiguous_iter and gather_next == gather_first + gather_ci
+                        gather_contiguous = pl.yield_(gather_matches)
+                    if gather_contiguous:
+                        gather_row = pl.cast(gather_first, pl.INDEX)
+                        gather_bulk = pl.slice(ori_kv_flat, [SPARSE_OPT_GATHER_ROW_TILE, HEAD_DIM], [gather_row, 0])
+                        raw_stage[gather_g0:gather_g0 + SPARSE_OPT_GATHER_ROW_TILE, :] = gather_bulk
+                        gather_valid = pl.full([1, SPARSE_OPT_GATHER_ROW_TILE], dtype=pl.FP32, value=1.0)
+                        valid_stage[:, gather_g0:gather_g0 + SPARSE_OPT_GATHER_ROW_TILE] = gather_valid
+                    else:
+                        for gather_ci in pl.range(SPARSE_OPT_GATHER_ROW_TILE):
+                            gather_k = gather_g0 + gather_ci
+                            gather_row_i32 = pl.tile.read(gather_indices, [0, gather_k])
+                            if gather_row_i32 >= 0:
+                                gather_row = pl.cast(gather_row_i32, pl.INDEX)
+                                gather_kv = ori_kv_flat[gather_row:gather_row + 1, 0:HEAD_DIM]
+                                raw_stage[gather_k:gather_k + 1, 0:HEAD_DIM] = gather_kv
+                                pl.write(valid_stage, [0, gather_k], 1.0)
             raw_kv[gather_dst : gather_dst + WIN, 0:HEAD_DIM] = raw_stage
             raw_valid[gather_local_t : gather_local_t + 1, 0:WIN] = valid_stage
 

@@ -25,7 +25,7 @@ from config import (
 )
 
 from hc_post import golden_hc_post, hc_post
-from hc_pre import golden_hc_pre, hc_pre
+from hc_pre import golden_hc_pre, _hc_pre_prefill as hc_pre
 from prefill_compressor_ratio128 import (
     HCA_STATE_BLOCK_NUM,
     HCA_STATE_BLOCK_SIZE,
@@ -318,7 +318,7 @@ def _prefill_attention_hca(
             # straight into a slot is not expanded.
             request_deps[0] = request_tid
 
-    hc_post(attn_out, x_hc, post, comb, x_out)
+    hc_post(attn_out, x_hc, post, comb, x_out, T_TILE=16)
     return x_out
 
 
@@ -1111,7 +1111,7 @@ def prefill_attention_hca_cp(
         group_base, tp_rank,
     )
 
-    hc_post(attn_out_full, x_hc_full, post_full, comb_full, x_out_full)
+    hc_post(attn_out_full, x_hc_full, post_full, comb_full, x_out_full, T_TILE=16)
     return x_out_full, gather_signal
 
 

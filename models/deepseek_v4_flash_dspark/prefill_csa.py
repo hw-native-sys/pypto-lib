@@ -33,7 +33,7 @@ from prefill_compressor_ratio4 import (
     golden_prefill_compressor_ratio4,
 )
 from hc_post import golden_hc_post, hc_post
-from hc_pre import golden_hc_pre, hc_pre
+from hc_pre import golden_hc_pre, _hc_pre_prefill as hc_pre
 from prefill_indexer import (
     COMPRESS_RATIO as INDEXER_COMPRESS_RATIO,
     IDX_CACHE_BLOCK_NUM,
@@ -394,7 +394,7 @@ def _prefill_attention_csa(
         o_proj_weight_dep,
     )
 
-    hc_post(attn_out, x_hc, post, comb, x_out)
+    hc_post(attn_out, x_hc, post, comb, x_out, T_TILE=16)
     return (
         kv_cache,
         cmp_kv,
@@ -1410,7 +1410,7 @@ def prefill_attention_csa_cp(
         group_base, tp_rank,
     )
 
-    hc_post(attn_out_full, x_hc_full, post_full, comb_full, x_out_full)
+    hc_post(attn_out_full, x_hc_full, post_full, comb_full, x_out_full, T_TILE=16)
     return x_out_full, gather_signal
 
 

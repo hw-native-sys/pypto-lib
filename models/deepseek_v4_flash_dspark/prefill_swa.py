@@ -23,7 +23,7 @@ from config import (
 )
 
 from hc_post import golden_hc_post, hc_post
-from hc_pre import golden_hc_pre, hc_pre
+from hc_pre import golden_hc_pre, _hc_pre_prefill as hc_pre
 from prefill_cp_token_allgather import (
     PREFILL_GROUP_CAP,
     TP_SIZE,
@@ -208,7 +208,7 @@ def _prefill_attention_swa(
         wo_a, wo_b, wo_b_scale, attn_out, o_proj_weight_dep,
     )
 
-    hc_post(attn_out, x_hc, post, comb, x_out)
+    hc_post(attn_out, x_hc, post, comb, x_out, T_TILE=16)
     return kv_cache, x_out
 
 
@@ -419,7 +419,7 @@ def prefill_attention_swa_cp(
         group_base, tp_rank,
     )
 
-    hc_post(attn_out_full, x_hc_full, post_full, comb_full, x_out_full)
+    hc_post(attn_out_full, x_hc_full, post_full, comb_full, x_out_full, T_TILE=16)
     return kv_cache, x_out_full, gather_signal
 
 
