@@ -13,6 +13,7 @@
 import pypto.language as pl
 import pypto.language.distributed as pld
 
+from config import CACHE_ROWS_DYN
 from config import (
     FLASH as M, RANKS_DYN, LOCAL_T_DYN, T_DYN, ORI_BLOCKS_DYN,
     CP_SIZE, PREFILL_MAX_TOKENS, WINDOW_CACHE_BYTES, CMP_BLOCKS_DYN, COMPRESSED_CACHE_BYTES,
@@ -81,7 +82,7 @@ def prefill_c1a_reuse(
     kv_token_count: pl.Scalar[pl.INT32],
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     # Compressed and index caches.
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, CACHE_ROWS_DYN, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     # Outputs.
     kv_hidden: pl.Tensor[[T_DYN, D], pl.BF16],
     hc_output: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
@@ -204,7 +205,7 @@ def l2_prefill_c1a_reuse(
     kv_token_count: pl.Tensor[[1], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
     # Compressed and index caches.
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, CACHE_ROWS_DYN, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     # Outputs.
     kv_hidden: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
     hc_output: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
@@ -213,6 +214,7 @@ def l2_prefill_c1a_reuse(
     hc_input.bind_dynamic(0, T_DYN)
     window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
+    compressed_cache.bind_dynamic(1, CACHE_ROWS_DYN)
     kv_tokenactive = pl.read(kv_token_count, [0])
     prefill_c1a_reuse(
         hc_input, hc_pre_mix,
@@ -265,7 +267,7 @@ def l3_prefill_c1a_reuse(
     kv_token_count: pl.Tensor[[RANKS_DYN, 1], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[RANKS_DYN, ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
     # Compressed and index caches.
-    compressed_cache: pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    compressed_cache: pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, CACHE_ROWS_DYN, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     # Outputs.
     kv_hidden: pl.Out[pl.Tensor[[RANKS_DYN, T_DYN, D], pl.BF16]],
     hc_output: pl.Out[pl.Tensor[[RANKS_DYN, T_DYN, HC_MULT, D], pl.FP32]],
@@ -275,6 +277,7 @@ def l3_prefill_c1a_reuse(
     hc_input.bind_dynamic(1, T_DYN)
     window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
+    compressed_cache.bind_dynamic(2, CACHE_ROWS_DYN)
     for rank in pl.range(pld.world_size()):
         rank_wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[rank]
         rank_wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wq_b_scale[rank]
@@ -334,7 +337,7 @@ def prefill_c1a_reuse_cp(
     kv_token_count: pl.Scalar[pl.INT32],
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     # Compressed and index caches.
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, CACHE_ROWS_DYN, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     # CP communication and row restoration.
     cp_hidden_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     cp_hidden_arrived: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
@@ -484,7 +487,7 @@ def l2_prefill_c1a_reuse_cp(
     kv_token_count: pl.Tensor[[1], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
     # Compressed and index caches.
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, CACHE_ROWS_DYN, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     # CP communication and row restoration.
     cp_hidden_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     cp_hidden_arrived: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
@@ -500,6 +503,7 @@ def l2_prefill_c1a_reuse_cp(
     kv_rope_cos.bind_dynamic(0, T_DYN)
     window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
+    compressed_cache.bind_dynamic(1, CACHE_ROWS_DYN)
     q_tokenactive = pl.read(q_token_count, [0])
     kv_tokenactive = pl.read(kv_token_count, [0])
     prefill_c1a_reuse_cp(
@@ -560,7 +564,7 @@ def l3_prefill_c1a_reuse_cp(
     kv_token_count: pl.Tensor[[RANKS_DYN, 1], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[RANKS_DYN, ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
     # Compressed and index caches.
-    compressed_cache: pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    compressed_cache: pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, CACHE_ROWS_DYN, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     kv_restore_indices: pl.Tensor[[RANKS_DYN, T_DYN], pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
     # Outputs.
@@ -573,6 +577,7 @@ def l3_prefill_c1a_reuse_cp(
     kv_rope_cos.bind_dynamic(1, T_DYN)
     window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
+    compressed_cache.bind_dynamic(2, CACHE_ROWS_DYN)
     cp_hidden_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     cp_arrived_buffer = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):

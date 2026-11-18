@@ -32,6 +32,7 @@ LOCAL_CAPACITY = max(
 )
 C.set_moe_tokens(min((LOCAL_CAPACITY + 15) // 16 * 16, _shape_options.moe_tokens))
 
+from config import CACHE_ROWS_DYN
 from config import (
     FLASH as M, CP_SIZE, EP_SIZE, RANKS_DYN, LOCAL_T_DYN, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN,
     ROUTE_T_DYN, PREFILL_MAX_TOKENS, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES, MOE_TOKENS,
@@ -165,7 +166,7 @@ def l3_prefill_layer(
     kv_token_count: pl.Tensor[[RANKS_DYN, 1], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[RANKS_DYN, ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
     # Compressed and index caches.
-    compressed_cache: pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    compressed_cache: pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, CACHE_ROWS_DYN, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     # Outputs.
     kv_hidden: pl.Out[pl.Tensor[[RANKS_DYN, T_DYN, D], pl.BF16]],
     hc_output: pl.Out[pl.Tensor[[RANKS_DYN, T_DYN, HC_MULT, D], pl.FP32]],
@@ -196,6 +197,7 @@ def l3_prefill_layer(
     hc_input.bind_dynamic(1, T_DYN)
     window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
+    compressed_cache.bind_dynamic(2, CACHE_ROWS_DYN)
     recv_meta_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
     recv_scale_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
@@ -301,7 +303,7 @@ def l3_prefill_layer_cp(
     kv_token_count: pl.Tensor[[RANKS_DYN, 1], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[RANKS_DYN, ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
     # Compressed and index caches.
-    compressed_cache: pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    compressed_cache: pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, CACHE_ROWS_DYN, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     kv_restore_indices: pl.Tensor[[RANKS_DYN, T_DYN], pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
     # Outputs.
@@ -335,6 +337,7 @@ def l3_prefill_layer_cp(
     kv_rope_cos.bind_dynamic(1, T_DYN)
     window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
+    compressed_cache.bind_dynamic(2, CACHE_ROWS_DYN)
     cp_hidden_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     cp_arrived_buffer = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
     recv_meta_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)

@@ -11,7 +11,8 @@
 import pypto.language as pl
 import torch
 
-from config import BLOCK_SIZE, DECODE_BATCH, DECODE_SEQ, DSPARK_QUERY_WIDTH, DSPARK_DRAFT_LAYERS, FLASH, TABLE_DYN
+from config import BLOCK_SIZE, C2A_STORAGE_ROWS, DECODE_BATCH, DECODE_SEQ
+from config import DSPARK_QUERY_WIDTH, DSPARK_DRAFT_LAYERS, FLASH, TABLE_DYN
 from lm_head import SAMPLED_IDS_PAD
 from input_pack import VOCAB_DYN, pack_x_hc
 
@@ -118,8 +119,8 @@ def decode_prepare(
             c1a_slot = pl.cast(-1, pl.INT64)
             if mapped_request >= 0 and position >= 0:
                 page = position // BLOCK_SIZE
-                if page < table_pages:
-                    physical = pl.read(window_table, [request, page])
+                if table_pages > 0:
+                    physical = pl.read(window_table, [request, page % table_pages])
                     if physical >= 0:
                         window_slot = pl.cast(physical * BLOCK_SIZE + position % BLOCK_SIZE, pl.INT64)
                 if page < c1a_pages:
@@ -127,10 +128,10 @@ def decode_prepare(
                     if physical >= 0:
                         c1a_slot = pl.cast(physical * BLOCK_SIZE + position % BLOCK_SIZE, pl.INT64)
                 compressed = position // 2
-                if (position + 1) % 2 == 0 and compressed // BLOCK_SIZE < c2a_pages:
-                    physical = pl.read(c2a_table, [request, compressed // BLOCK_SIZE])
+                if (position + 1) % 2 == 0 and compressed // C2A_STORAGE_ROWS < c2a_pages:
+                    physical = pl.read(c2a_table, [request, compressed // C2A_STORAGE_ROWS])
                     if physical >= 0:
-                        c2a_slot = pl.cast(physical * BLOCK_SIZE + compressed % BLOCK_SIZE, pl.INT64)
+                        c2a_slot = pl.cast(physical * C2A_STORAGE_ROWS + compressed % C2A_STORAGE_ROWS, pl.INT64)
             pl.write(window_slots, [row], window_slot)
             pl.write(c2a_slots, [row], c2a_slot)
             pl.write(c1a_slots, [row], c1a_slot)
@@ -140,8 +141,8 @@ def decode_prepare(
                 past = position - visible_length + 1 + column
                 if mapped_request >= 0 and column < visible_length:
                     past_page = past // BLOCK_SIZE
-                    if past_page < table_pages:
-                        physical = pl.read(window_table, [request, past_page])
+                    if table_pages > 0:
+                        physical = pl.read(window_table, [request, past_page % table_pages])
                         if physical >= 0:
                             visible = pl.cast(physical * BLOCK_SIZE + past % BLOCK_SIZE, pl.INT32)
                 pl.write(window_indices, [row, column], visible)
@@ -254,8 +255,9 @@ def decode_accept(
                     pl.write(context_rope_sin, [row, col], sin)
                 for layer in pl.range(DSPARK_DRAFT_LAYERS):
                     context_slot = pl.cast(-1, pl.INT64)
-                    if active and position // BLOCK_SIZE < table_blocks:
-                        physical = pl.read(block_tables, [layer, request, position // BLOCK_SIZE])
+                    if active and table_blocks > 0:
+                        page = position // BLOCK_SIZE % table_blocks
+                        physical = pl.read(block_tables, [layer, request, page])
                         if physical >= 0:
                             context_slot = pl.cast(physical * BLOCK_SIZE + position % BLOCK_SIZE, pl.INT64)
                     pl.write(context_slots, [layer, row], context_slot)

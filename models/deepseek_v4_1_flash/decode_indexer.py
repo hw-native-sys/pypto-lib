@@ -14,6 +14,7 @@ from pypto.runtime import pto_isa_include_dir
 
 from gemm import gemm_bf16_to_bf16, gemm_mxfp8_to_bf16
 import pypto.language as pl
+from config import CACHE_ROWS_DYN
 from config import (
     B_DYN, FLASH, INDEX_BLOCKS_DYN, INDEX_CACHE_GROUP, INDEX_POOL_BLOCKS_DYN,
     INDEX_POOL_POSITIONS_DYN, TABLE_DYN, T_DYN,
@@ -583,8 +584,8 @@ def publish_index_rows(
     cosine: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     sine: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     slots: pl.Tensor[[T_DYN], pl.INT64],
-    cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
-    scales: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, _SCALE_COUNT], pl.FP8E8M0],
+    cache: pl.Tensor[[INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, INDEX_DIM // 2], pl.UINT8],
+    scales: pl.Tensor[[INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, _SCALE_COUNT], pl.FP8E8M0],
     num_tokens: pl.Scalar[pl.INT32],
     cache_ready: pl.Scalar[pl.TASK_ID],
     kv_ready: pl.Scalar[pl.TASK_ID],
@@ -594,7 +595,7 @@ def publish_index_rows(
     slots_matrix = pl.reshape(slots, [1, slot_capacity])
     row_groups = (num_tokens + 95) // 96
     workers = pl.max(1, pl.min(pl.min(num_tokens, row_groups * 4), pl.system.available_cluster_count()))
-    cache_rows = pl.tensor.dim(cache, 0) * 128
+    cache_rows = pl.tensor.dim(cache, 0) * pl.tensor.dim(cache, 1)
     cache_flat = pl.reshape(cache, [cache_rows, INDEX_DIM // 2])
     scale_flat = pl.reshape(scales, [cache_rows, _SCALE_COUNT])
     with pl.spmd(workers, name_hint="idx_k_norm_rope_publish", deps=[cache_ready, kv_ready]) as published:
@@ -2377,8 +2378,8 @@ def decode_c2a_indexer(
     compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
-    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, (INDEX_DIM // 2)], pl.UINT8],
-    index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, (INDEX_DIM // INDEX_CACHE_GROUP)], pl.FP8E8M0],
+    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, (INDEX_DIM // 2)], pl.UINT8],
+    index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, (INDEX_DIM // INDEX_CACHE_GROUP)], pl.FP8E8M0],
     index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
@@ -2396,7 +2397,7 @@ def decode_c2a_indexer(
         index_cache, index_cache_scale, num_tokens, cache_ready, projected_tid,
     )
     # The dense arena follows logical page-table capacity, never allocated cache pages.
-    score_width = pl.tensor.dim(index_block_table, 1) * 128
+    score_width = pl.tensor.dim(index_block_table, 1) * pl.tensor.dim(index_cache, 1)
     query, query_scale, raw_weights, scores, query_tid, weights_tid = c1a_index(
         x,
         index_wq_b, index_wq_b_scale, index_weights_proj,
@@ -2544,10 +2545,10 @@ def golden_index_weighted_sum(dots, weights):
     return values.float()
 
 
-def _golden_paged_index_scores(query, weights, keys, table, request_ids, lengths, *, skip_short=False):
+def _golden_paged_index_scores(query, weights, keys, table, request_ids, lengths, *, skip_short=False, page_rows=128):
     """Score request-local history in token batches with sequential BF16 head accumulation."""
     tokens, heads, dim = query.shape
-    width = table.shape[-1] * 128
+    width = table.shape[-1] * page_rows
     scores = torch.full((tokens, width), -torch.inf)
     physical = torch.full((tokens, width), -1, dtype=torch.int64)
     for request in request_ids.unique().tolist():
@@ -2556,8 +2557,8 @@ def _golden_paged_index_scores(query, weights, keys, table, request_ids, lengths
         token_ids = (request_ids == request).nonzero().flatten()
         count = max(0, min(int(lengths[token_ids].max()), width))
         logical = torch.arange(count)
-        pages = table[request, logical // 128].long()
-        rows = pages * 128 + logical.remainder(128)
+        pages = table[request, logical // page_rows].long()
+        rows = pages * page_rows + logical.remainder(page_rows)
         valid = (pages >= 0) & (rows >= 0) & (rows < keys.shape[0])
         logical, rows = logical[valid], rows[valid]
         if not rows.numel():
@@ -2602,7 +2603,7 @@ def golden_c1a_index_scores(a, qr, index_payload, index_scale):
     # The device scales the projected head weight in FP32 and rounds it once to BF16.
     weight = ((x).float() @ unpack_bf16_nz(a["index_weights_proj"]).float()).to(torch.bfloat16).float() * (dim * heads) ** -0.5
     weight = weight.to(torch.bfloat16).float()
-    return _golden_paged_index_scores(iq, weight, keys, a["index_block_table"], a["request_ids"], lengths)
+    return _golden_paged_index_scores(iq, weight, keys, a["index_block_table"], a["request_ids"], lengths, page_rows=index_payload.shape[1])
 
 
 def golden_pool_index_scores(scores, physical, pool_block_ids, pool_block_counts):
@@ -2679,7 +2680,7 @@ def golden_c2a_index(t, qr, index_cache, index_cache_scale):
     lens = t["compressed_lens"].long()
     keys = index_values.to(torch.bfloat16)
     scores, physical_rows = _golden_paged_index_scores(
-        index_q, head_weights, keys, t["index_block_table"], t["token_to_req_indices"], lens, skip_short=True,
+        index_q, head_weights, keys, t["index_block_table"], t["token_to_req_indices"], lens, skip_short=True, page_rows=index_cache.shape[1],
     )
     return _select_shared_c2a_topk(scores, physical_rows, lens)
 

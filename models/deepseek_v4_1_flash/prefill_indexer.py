@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 import pypto.language as pl
 
+from config import CACHE_ROWS_DYN
 from config import INDEX_CACHE_GROUP, FLASH as M, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, T_DYN
 from rmsnorm import EPS, rms_norm, golden_rms_norm
 from quant import quantize_bf16_to_mxfp8, dequantize_mxfp4_cache, golden_index_query_fp4, fp4_e4m3_lut
@@ -148,15 +149,15 @@ def prefill_index_query(
 def publish_index_cache(
     value: pl.Tensor[[T_DYN, INDEX_DIM], pl.BF16],
     slots: pl.Tensor[[T_DYN], pl.INT64],
-    cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
+    cache: pl.Tensor[[INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, INDEX_DIM // 2], pl.UINT8],
     scales: pl.Tensor[
-        [INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP],
+        [INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, INDEX_DIM // INDEX_CACHE_GROUP],
         pl.FP8E8M0,
     ],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Publish index-key rows as group-32 MXFP4 with E8M0 scales."""
-    cache_rows = pl.tensor.dim(cache, 0) * 128
+    cache_rows = pl.tensor.dim(cache, 0) * pl.tensor.dim(cache, 1)
     cache_flat = pl.reshape(cache, [cache_rows, INDEX_DIM // 2])
     scale_flat = pl.reshape(scales, [cache_rows, INDEX_DIM // INDEX_CACHE_GROUP])
     with pl.spmd(32, name_hint="c1a_index_publish") as publish_tid:
@@ -684,7 +685,8 @@ def _prefill_index_scores(
             pl.store(pl.set_validshape(clear_value, 1, pl.min(128, width - begin)), [token, begin], output)
 
     cache_pages = pl.tensor.dim(cache, 0)
-    cache_rows = cache_pages * 128
+    page_rows = pl.tensor.dim(cache, 1)
+    cache_rows = cache_pages * page_rows
     packed_flat = pl.reshape(cache, [cache_rows, INDEX_DIM // 2])
     scale_rows = cache_rows // 8
     scale_flat = pl.reshape(cache_scale, [scale_rows, 32])
@@ -697,8 +699,8 @@ def _prefill_index_scores(
     with pl.spmd(8, name_hint="prefill_index_cache_decode", deps=[ready]) as decoded_tid:
         decode_worker = pl.tile.get_block_idx()
         decode_lut = fp4_e4m3_lut()
-        for decode_row in pl.range(decode_worker * 128, cache_rows, 8 * 128):
-            decode_packed = pl.load(packed_flat, [decode_row, 0], [128, INDEX_DIM // 2])
+        for decode_row in pl.range(decode_worker * 64, cache_rows, 8 * 64):
+            decode_packed = pl.load(packed_flat, [decode_row, 0], [64, INDEX_DIM // 2])
             decode_signed = pl.reinterpret_view(decode_packed, pl.INT8)
             decode_bytes = pl.ands(pl.cast(decode_signed, pl.INT16), 255)
             decode_low = pl.ands(decode_bytes, 15)
@@ -707,7 +709,7 @@ def _prefill_index_scores(
             decode_low_bytes = pl.tile.gather(decode_lut, decode_low, decode_tmp)
             decode_high_bytes = pl.tile.gather(decode_lut, decode_high, decode_tmp)
             decode_words = pl.or_(decode_low_bytes, pl.shls(decode_high_bytes, 8))
-            decode_raw = pl.reinterpret_view(decode_words, pl.INT8, shape=[128, INDEX_DIM])
+            decode_raw = pl.reinterpret_view(decode_words, pl.INT8, shape=[64, INDEX_DIM])
             if pool:
                 decode_carrier = pl.reinterpret_view(decode_raw, pl.FP8E4M3FN)
                 pl.store(decode_carrier, [decode_row, 0], decoded_keys)
@@ -783,13 +785,13 @@ def _prefill_index_scores(
                         if candidate >= 0 and candidate < (maximum_visible + 7) // 8:
                             logical = pl.cast(candidate, pl.INDEX) * 8
                 else:
-                    logical = begin + part * 128
+                    logical = begin + part * part_rows
                 if logical >= 0 and logical < maximum_visible:
-                    logical_page = logical // 128
+                    logical_page = logical // page_rows
                     if request >= 0 and request < requests and logical_page < table_width:
                         page = pl.read(block_table, [pl.cast(request, pl.INDEX), logical_page])
                         if page >= 0 and page < cache_pages:
-                            physical_row = pl.cast(page, pl.INDEX) * 128 + logical % 128
+                            physical_row = pl.cast(page, pl.INDEX) * page_rows + logical % page_rows
                             valid_rows = pl.min(part_rows, maximum_visible - logical)
                             if pool:
                                 payload_raw = pl.load(decoded_keys, [physical_row, 0], [part_rows, INDEX_DIM])
@@ -1015,28 +1017,28 @@ def _select_c2a_topk(
             pl.store(empty, [token, 0], output)
             if length <= INDEX_TOPK:
                 written = pl.cast(0, pl.INDEX)
-                for part in pl.range(INDEX_TOPK // 128):
-                    begin = part * 128
+                for part in pl.range(INDEX_TOPK // 64):
+                    begin = part * 64
                     if begin < length and request >= 0 and request < pl.tensor.dim(table, 0):
                         page = pl.read(table, [request, part])
                         if page >= 0 and page < cache_pages:
-                            count = pl.min(128, length - begin)
-                            short_rows = pl.add(pl.tile.arange(0, [1, 128], dtype=pl.INT32), pl.cast(page * 128, pl.INT32))
+                            count = pl.min(64, length - begin)
+                            short_rows = pl.add(pl.tile.arange(0, [1, 64], dtype=pl.INT32), pl.cast(page * 64, pl.INT32))
                             pl.store(pl.set_validshape(short_rows, 1, count), [token, written], output)
                             written = written + count
             else:
                 running = pl.tile.full([1, TOPK_PAIR_WIDTH], dtype=pl.FP32, value=SORT_FLOOR)
                 for leaf, (previous,) in pl.range((length + LEAF - 1) // LEAF, init_values=(running,)):
                     begin = leaf * LEAF
-                    for part in pl.range(LEAF // 128):
-                        logical = begin + part * 128
-                        physical_rows = pl.tile.full([1, 128], dtype=pl.INT32, value=-1)
+                    for part in pl.range(LEAF // 64):
+                        logical = begin + part * 64
+                        physical_rows = pl.tile.full([1, 64], dtype=pl.INT32, value=-1)
                         if logical < length and request >= 0 and request < pl.tensor.dim(table, 0):
-                            page = pl.read(table, [request, logical // 128])
+                            page = pl.read(table, [request, logical // 64])
                             if page >= 0 and page < cache_pages:
-                                row_offsets = pl.tile.arange(0, [1, 128], dtype=pl.INT32)
-                                physical_rows = pl.add(row_offsets, pl.cast(page * 128, pl.INT32))
-                        pl.store(physical_rows, [token, part * 128], leaf_rows)
+                                row_offsets = pl.tile.arange(0, [1, 64], dtype=pl.INT32)
+                                physical_rows = pl.add(row_offsets, pl.cast(page * 64, pl.INT32))
+                        pl.store(physical_rows, [token, part * 64], leaf_rows)
                     raw = pl.load(scores, [token, begin], [1, LEAF], valid_shape=[1, pl.min(LEAF, length - begin)])
                     padded = pl.tile.fillpad(raw, pad_value=pl.PadValue.min)
                     values = pl.maximum(padded, SORT_FLOOR)
@@ -1065,8 +1067,8 @@ def _select_c2a_topk(
 def publish_index_key(
     keys: pl.Tensor[[T_DYN, INDEX_DIM], pl.BF16],
     slots: pl.Tensor[[T_DYN], pl.INT64],
-    cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, IDX_PACKED], pl.UINT8],
-    scales: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, IDX_SCALES], pl.FP8E8M0],
+    cache: pl.Tensor[[INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, IDX_PACKED], pl.UINT8],
+    scales: pl.Tensor[[INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, IDX_SCALES], pl.FP8E8M0],
     num_tokens: pl.Scalar[pl.INT32],
     cache_ready: pl.Scalar[pl.TASK_ID],
 ):
@@ -1077,7 +1079,7 @@ def publish_index_key(
     Both payloads use the same group-32 MXFP4 scoring reader.
     """
     blocks = pl.tensor.dim(cache, 0)
-    cache_rows = blocks * 128
+    cache_rows = blocks * pl.tensor.dim(cache, 1)
     flat = pl.reshape(cache, [cache_rows, IDX_PACKED])
     scale_flat = pl.reshape(scales, [cache_rows, IDX_SCALES])
     with pl.spmd(32, name_hint="c2a_index_publish", deps=[cache_ready]) as publish_tid:
@@ -1163,8 +1165,8 @@ def publish_c1a_index_key(
     compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
-    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
-    index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0],
+    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, INDEX_DIM // 2], pl.UINT8],
+    index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     tokens = pl.tensor.dim(compressed_latent, 0)
@@ -1196,8 +1198,8 @@ def publish_c2a_index_key(
     compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
-    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, IDX_PACKED], pl.UINT8],
-    index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, IDX_SCALES], pl.FP8E8M0],
+    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, IDX_PACKED], pl.UINT8],
+    index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, IDX_SCALES], pl.FP8E8M0],
     num_tokens: pl.Scalar[pl.INT32],
     pool_tid: pl.Scalar[pl.TASK_ID],
     cache_ready: pl.Scalar[pl.TASK_ID],
@@ -1329,7 +1331,7 @@ def prefill_indexer(
     c2a: pl.constexpr,
 ):
     """Prepare queries, score bounded chunks, and select sparse cache rows."""
-    width = pl.tensor.dim(table, 1) * 128
+    width = pl.tensor.dim(table, 1) * pl.tensor.dim(cache, 1)
     if pool:
         width = pl.tensor.dim(pool_ids, 1) * 8
     width = (width + 127) // 128 * 128
@@ -1397,7 +1399,7 @@ def prefill_indexer(
                             query, query_scale, weights, cache, cache_scale, table,
                             chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
                             count, prepared, tile_n=128, query_tile=4, pool=False, skip_short=c2a,
-                            head_rows=4 * INDEX_H, part_rows=128,
+                            head_rows=4 * INDEX_H, part_rows=64 if c2a else 128,
                         )
                         scoring[0] = paired_tid
                     elif dense != 0:
@@ -1405,7 +1407,7 @@ def prefill_indexer(
                             query, query_scale, weights, cache, cache_scale, table,
                             chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
                             count, prepared, tile_n=128, query_tile=1, pool=False, skip_short=c2a,
-                            head_rows=INDEX_H, part_rows=128,
+                            head_rows=INDEX_H, part_rows=64 if c2a else 128,
                         )
                         scoring[0] = paged_tid
                     elif pool and pool_paired != 0:
@@ -1421,7 +1423,7 @@ def prefill_indexer(
                             query, query_scale, weights, cache, cache_scale, table,
                             chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
                             count, prepared, tile_n=128, query_tile=1, pool=pool, skip_short=c2a,
-                            head_rows=INDEX_H, part_rows=8 if pool else 128,
+                            head_rows=INDEX_H, part_rows=8 if pool else (64 if c2a else 128),
                         )
                         scoring[0] = general_tid
                 score_ready = scoring[0]
@@ -1531,6 +1533,7 @@ def golden_prefill_indexer(
     weights = (x.float() @ unpack_bf16_nz(weights_proj).float()).bfloat16()
     weights = (weights.float() * INDEX_SCORE_SCALE).bfloat16()
     keys = index_cache.flatten(0, 1).squeeze(-2)
+    page_rows = index_cache.shape[1]
     torch_threads = torch.get_num_threads()
     torch.set_num_threads(1)
     try:
@@ -1543,10 +1546,10 @@ def golden_prefill_indexer(
                 positions = positions[(positions >= 0) & (positions < length)]
             if not positions.numel():
                 continue
-            pages = block_table[int(request_ids[token]), positions // 128]
+            pages = block_table[int(request_ids[token]), positions // page_rows]
             present = (pages >= 0) & (pages < index_cache.shape[0])
             positions, pages = positions[present], pages[present]
-            physical = pages.long() * 128 + positions % 128
+            physical = pages.long() * page_rows + positions % page_rows
             if c2a and length <= topk:
                 selected[token, :physical.numel()] = physical.int()
                 continue
@@ -1601,7 +1604,8 @@ def compare_compressed_topk(
             length = int(inputs["q_compressed_lens"][rank, row])
             request = int(inputs["q_request_ids"][rank, row])
             logical = torch.arange(length)
-            physical = inputs["index_block_table"][rank, request, logical // 128].long() * 128 + logical % 128
+            page_rows = inputs["index_cache"].shape[2]
+            physical = inputs["index_block_table"][rank, request, logical // page_rows].long() * page_rows + logical % page_rows
             inverse = {int(p): int(l) for p, l in zip(physical, logical)}
             if any(int(p) not in inverse for p in av):
                 return False, f"rank {rank} row {row}: noncausal Top-K member"

@@ -155,6 +155,18 @@ namespace {
             vsts(h0, hist, 0, NORM_B16, full);
             vsts(h1, hist, 128, NORM_B16, full);
         }
+        __tf__ __aicore__ void compact_validity(__ubuf__ uint32_t* out,
+                                                int p0, int p1, int p2, int p3) {
+            __VEC_SCOPE__ {
+                vector_u32 value;
+                auto full = pset_b32(PAT_ALL);
+                for (uint16_t piece = 0; piece < 4; ++piece) {
+                    int page = piece == 0 ? p0 : piece == 1 ? p1 : piece == 2 ? p2 : p3;
+                    vbr(value, uint32_t(page >= 0));
+                    vsts(value, out, piece * 64, NORM_B32, full);
+                }
+            }
+        }
         template <int HistogramTile>
         __tf__ __aicore__ void score_cache(__ubuf__ bfloat16_t* src, __ubuf__ bfloat16_t* weights,
         __ubuf__ uint16_t* cache, __ubuf__ uint16_t* hist, int column, int span0, int span1,
@@ -354,7 +366,7 @@ namespace {
         }
         __tf__ __aicore__ void packed_select(__ubuf__ uint16_t* outk, __ubuf__ uint32_t* outi,
         __ubuf__ uint16_t* src, __ubuf__ uint32_t* ids, __ubuf__ uint32_t* table,
-        int width, uint32_t cutoff, int boundary, bool gathered, bool map_output) {
+        int width, uint32_t cutoff, int boundary, bool gathered, bool map_output, int page_shift = 7) {
             auto result = outi;
             __VEC_SCOPE__ {
                 vector_u32 key, lane, logical, tmp, page, squeezed, invalid, shift;
@@ -398,10 +410,10 @@ namespace {
                             vgather2(page, table, logical, valid);
                             logical = page;
                         } else {
-                            vshrs(tmp, logical, 7, full, MODE_ZEROING);
+                            vshrs(tmp, logical, page_shift, full, MODE_ZEROING);
                             vgather2(page, table, tmp, valid);
-                            vshls(page, page, 7, full, MODE_ZEROING);
-                            vbr(tmp, 127u);
+                            vshls(page, page, page_shift, full, MODE_ZEROING);
+                            vbr(tmp, uint32_t((1 << page_shift) - 1));
                             vand(tmp, logical, tmp, full, MODE_ZEROING);
                             vadd(logical, page, tmp, full, MODE_ZEROING);
                         }
@@ -413,7 +425,7 @@ namespace {
         }
         __tf__ __aicore__ void merge_select(__ubuf__ uint16_t* outk, __ubuf__ uint32_t* outi,
         __ubuf__ uint16_t* src, __ubuf__ uint32_t* ids, __ubuf__ uint32_t* table,
-        int width, bool gathered, bool map_output, __ubuf__ uint16_t* scratch) {
+        int width, bool gathered, bool map_output, __ubuf__ uint16_t* scratch, int page_shift = 7) {
             auto result = outi;
             __VEC_SCOPE__ {
                 vector_u16 cutoff16, boundary16;
@@ -469,10 +481,10 @@ namespace {
                             vgather2(page, table, logical, valid);
                             logical = page;
                         } else {
-                            vshrs(tmp, logical, 7, full, MODE_ZEROING);
+                            vshrs(tmp, logical, page_shift, full, MODE_ZEROING);
                             vgather2(page, table, tmp, valid);
-                            vshls(page, page, 7, full, MODE_ZEROING);
-                            vbr(tmp, 127u);
+                            vshls(page, page, page_shift, full, MODE_ZEROING);
+                            vbr(tmp, uint32_t((1 << page_shift) - 1));
                             vand(tmp, logical, tmp, full, MODE_ZEROING);
                             vadd(logical, page, tmp, full, MODE_ZEROING);
                         }
@@ -713,13 +725,13 @@ namespace {
                 }
             }
         }
-        __tf__ __aicore__ void short_page(__ubuf__ uint32_t* output, int base, int count) {
+        __tf__ __aicore__ void short_page(__ubuf__ uint32_t* output, int base, int count, int page_rows) {
             __VEC_SCOPE__ {
                 vector_u32 lane, physical, invalid, result;
                 vector_bool valid;
                 auto full = pset_b32(PAT_ALL);
                 vbr(invalid, 0xffffffffu);
-                for (uint16_t chunk = 0; chunk < 2; ++chunk) {
+                for (uint16_t chunk = 0; chunk < page_rows / 64; ++chunk) {
                     vci((vector_s32&)lane, int32_t(chunk * 64), INC_ORDER);
                     vadds(physical, lane, uint32_t(base), full, MODE_ZEROING);
                     vcmps_lt(valid, (vector_s32&)lane, count, full);
@@ -733,9 +745,10 @@ namespace {
                                                int length, CandidateIndices& indices) {
             int table_width = args[17];
             int cache_pages = reinterpret_cast<__gm__ Tensor*>(args[3])->shapes[0];
+            int page_rows = reinterpret_cast<__gm__ Tensor*>(args[3])->shapes[1];
             int request = read(data<int32_t>(args, 6) + token);
-            for (int block = 0; block < 4; ++block) {
-                int count = minimum(128, length - block * 128);
+            for (int block = 0; block < 512 / page_rows; ++block) {
+                int count = minimum(page_rows, length - block * page_rows);
                 int page = -1;
                 if (count > 0 && block < table_width) {
                     page = read(data<int32_t>(args, 5) + request * table_width + block);
@@ -744,7 +757,7 @@ namespace {
                     page = 0;
                     count = 0;
                 }
-                short_page(indices.data() + block * 128, page * 128, count);
+                short_page(indices.data() + block * page_rows, page * page_rows, count, page_rows);
             }
             GM<uint32_t, 1, 512, 1, 512> out(data<uint32_t>(args, 8) + token * 512);
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -810,7 +823,8 @@ namespace {
                         TLOAD(rows, pg);
                         mapping = rows.data();
                     } else if (final) {
-                        int request = read(data<int32_t>(args, 6) + token), page_count = (width + 127) / 128;
+                        int page_rows = reinterpret_cast<__gm__ Tensor*>(args[3])->shapes[1];
+                        int request = read(data<int32_t>(args, 6) + token), page_count = (width + page_rows - 1) / page_rows;
                         Tile<TileType::Vec, uint32_t, 1, 16384, BLayout::RowMajor, 1, DYNAMIC> pages(page_count);
                         TASSIGN(pages, 134656);
                         GM<uint32_t, 1, DYNAMIC, 1, DYNAMIC> pg(data<uint32_t>(args, 5) + request * table_width,
@@ -823,11 +837,13 @@ namespace {
                     int boundary;
                     if (final) {
                         merge_select(selected_keys.data(), selected_indices.data(), ub<uint16_t>(0),
-                            ub<uint32_t>(65536), mapping, candidates, gathered_rows != 0, final, ub<uint16_t>(32768));
+                            ub<uint32_t>(65536), mapping, candidates, gathered_rows != 0, final, ub<uint16_t>(32768),
+                            reinterpret_cast<__gm__ Tensor*>(args[3])->shapes[1] == 64 ? 6 : 7);
                     } else {
                         packed_threshold(ub<uint16_t>(0), candidates, 32768, 131072, cutoff, boundary);
                         packed_select(selected_keys.data(), selected_indices.data(), ub<uint16_t>(0),
-                            ub<uint32_t>(65536), mapping, candidates, cutoff, boundary, gathered_rows != 0, final);
+                            ub<uint32_t>(65536), mapping, candidates, cutoff, boundary, gathered_rows != 0, final,
+                            reinterpret_cast<__gm__ Tensor*>(args[3])->shapes[1] == 64 ? 6 : 7);
                     }
                     if (final) {
                         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -1416,38 +1432,45 @@ namespace {
 #endif
 
 #if defined(__DAV_CUBE__)
+        template <int PageRows>
         __aicore__ inline bool prefetch_key(__gm__ int64_t* args, int request, int maximum,
                                             int first_panel, int panel, int cache_pages) {
             int logical = (first_panel + panel) * 256;
             int table_width = args[17];
-            int page0 = logical < maximum ? read(data<int32_t>(args, 5) + request * table_width + logical / 128) : -1;
-            int page1 = logical + 128 < maximum ? read(data<int32_t>(args, 5) + request * table_width + logical / 128 + 1) : -1;
-            if (page0 >= cache_pages) page0 = -1;
-            if (page1 >= cache_pages) page1 = -1;
+            int pages[256 / PageRows];
+            int fallback = -1;
+            for (int piece = 0; piece < 256 / PageRows; ++piece) {
+                int position = logical + piece * PageRows;
+                int page = position < maximum && position / PageRows < table_width
+                    ? read(data<int32_t>(args, 5) + request * table_width + position / PageRows) : -1;
+                pages[piece] = page >= 0 && page < cache_pages ? page : -1;
+                if (pages[piece] >= 0) fallback = pages[piece];
+            }
             int slot = panel % 4;
             int event = slot + 2;
             if (panel >= 4) wait_flag(PIPE_MTE1, PIPE_MTE2, event);
-            if (page0 >= 0 || page1 >= 0) {
-                using KeyPart = Tile<TileType::Mat, F4, 128, 256, BLayout::RowMajor, 128, 128, SLayout::ColMajor>;
-                for (int piece = 0; piece < 2; ++piece) {
-                    int page = piece == 0 ? page0 : page1;
-                    if (page < 0) page = page0 >= 0 ? page0 : page1;
+            if (fallback >= 0) {
+                using KeyPart = Tile<TileType::Mat, F4, 128, 256, BLayout::RowMajor, 128, PageRows, SLayout::ColMajor>;
+                using ScalePart = Tile<TileType::Mat, S, 4, PageRows, BLayout::ColMajor, 4, PageRows, SLayout::ColMajor, 32>;
+                for (int piece = 0; piece < 256 / PageRows; ++piece) {
+                    int page = pages[piece] >= 0 ? pages[piece] : fallback;
                     KeyPart key;
-                    KeyScale scale;
-                    TASSIGN(key, 65536 + slot * 65536 + piece * 4096);
-                    TASSIGN(scale, 81920 + slot * 65536 + piece * 512);
-                    GM<F4, 128, 128, 128, 128, Layout::DN> kg(data<F4>(args, 3) + static_cast<int64_t>(page) * 8192);
-                    GM<S, 4, 128, 4, 128, Layout::MX_B_DN> sg(data<S>(args, 4) + page * 512);
+                    ScalePart scale;
+                    TASSIGN(key, 65536 + slot * 65536 + piece * PageRows * 32);
+                    TASSIGN(scale, 81920 + slot * 65536 + piece * PageRows * 4);
+                    GM<F4, 128, PageRows, 128, PageRows, Layout::DN> kg(data<F4>(args, 3) + static_cast<int64_t>(page) * PageRows * 64);
+                    GM<S, 4, PageRows, 4, PageRows, Layout::MX_B_DN> sg(data<S>(args, 4) + page * PageRows * 4);
                     TLOAD(key, kg);
                     TLOAD(scale, sg);
                 }
             }
             set_flag(PIPE_MTE2, PIPE_MTE1, event);
-            return page0 >= 0 || page1 >= 0;
+            return fallback >= 0;
         }
+
 #endif
 
-        template <int KeySlots>
+        template <int KeySlots, int PageRows = 128>
         __aicore__ inline void run(__gm__ int64_t* args) {
             int width = args[15], stride = args[16], table_width = args[17];
             int gathered_rows = args[19];
@@ -1506,7 +1529,7 @@ namespace {
                         set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
                         wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
                         for (int panel = 0; panel < minimum(3, panel_count); ++panel) {
-                            bool valid = prefetch_key(args, request, maximum, first_panel, panel, cache_pages);
+                            bool valid = prefetch_key<PageRows>(args, request, maximum, first_panel, panel, cache_pages);
                             if (valid) valid_panels |= 1 << panel;
                         }
                     }
@@ -1522,7 +1545,7 @@ namespace {
                         if constexpr (KeySlots == 4) {
                             int future = panel + 3;
                             if (future < panel_count) {
-                                bool valid = prefetch_key(args, request, maximum, first_panel, future, cache_pages);
+                                bool valid = prefetch_key<PageRows>(args, request, maximum, first_panel, future, cache_pages);
                                 int bit = 1 << (future % 4);
                                 valid_panels = (valid_panels & ~bit) | (valid ? bit : 0);
                             }
@@ -1530,6 +1553,7 @@ namespace {
 #endif
                         int logical = (first_panel + panel) * 256;
                         int page0 = -1, page1 = -1;
+                        int compact_pages[4] = {-1, -1, -1, -1};
 #if defined(__DAV_CUBE__)
                         if constexpr (KeySlots == 2) {
 #endif
@@ -1547,6 +1571,19 @@ namespace {
                         }
 #endif
                         bool have_dot = page0 >= 0 || page1 >= 0;
+#if defined(__DAV_VEC__)
+                        if constexpr (PageRows == 64) {
+                            have_dot = false;
+                            for (int piece = 0; piece < 4; ++piece) {
+                                int position = logical + piece * 64;
+                                int page = position < maximum && position / 64 < table_width
+                                    ? read(data<int32_t>(args, 5) + request * table_width + position / 64) : -1;
+                                compact_pages[piece] = page >= 0 && page < cache_pages ? page : -1;
+                                have_dot = have_dot || compact_pages[piece] >= 0;
+                            }
+                            page0 = page1 = have_dot ? 0 : -1;
+                        }
+#endif
 #if defined(__DAV_CUBE__)
                         if constexpr (KeySlots == 4) {
                             have_dot = (valid_panels & (1 << (panel % 4))) != 0;
@@ -1644,6 +1681,16 @@ namespace {
                             wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
                             TCVT(pool_valid, raw_valid, RoundMode::CAST_NONE);
                         }
+                        if constexpr (PageRows == 64) {
+                            Vec<int32_t, 1, 256> raw_valid;
+                            Vec<uint16_t, 1, 256> page_valid;
+                            TASSIGN(raw_valid, 253440);
+                            TASSIGN(page_valid, 254464);
+                            compact_validity((__ubuf__ uint32_t*)raw_valid.data(),
+                                             compact_pages[0], compact_pages[1], compact_pages[2], compact_pages[3]);
+                            pipe_barrier(PIPE_ALL);
+                            TCVT(page_valid, raw_valid, RoundMode::CAST_NONE);
+                        }
                         int n0 = visible0 - logical;
                         int n1 = visible1 - logical;
                         int n2 = visible2 - logical;
@@ -1657,7 +1704,7 @@ namespace {
                         if (span0<0)span0 = 0;
                         if (span1<0)span1 = 0;
                         score_cache<KeySlots == 4 ? 256 : 128>(ub<bfloat16_t>((transferred%2)*49152), ub<bfloat16_t>(257280+offset*64),
-                        ub<uint16_t>(98304), ub<uint16_t>(251904), panel*256, span0, span1, v00, v01, v10, v11, v20, v21, have_dot, ub<uint16_t>(254464), gathered_rows != 0);
+                        ub<uint16_t>(98304), ub<uint16_t>(251904), panel*256, span0, span1, v00, v01, v10, v11, v20, v21, have_dot, ub<uint16_t>(254464), (gathered_rows != 0 || PageRows == 64));
                         if (have_dot) {
                             set_intra_block(PIPE_V, (transferred%2)*2+1);
                             ++transferred;
@@ -1716,7 +1763,10 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 #endif
         return;
     }
-    if (args[19] == 0) fused::run<4>(args);
+    if (args[19] == 0) {
+        if (reinterpret_cast<__gm__ Tensor*>(args[3])->shapes[1] == 64) fused::run<4, 64>(args);
+        else fused::run<4, 128>(args);
+    }
     else fused::run<2>(args);
     SYNCALL<SyncCoreType::AIVOnly>();
 #if defined(__DAV_VEC__)

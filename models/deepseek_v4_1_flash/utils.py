@@ -132,6 +132,7 @@ def paged_slots(
     storage_block_size: int = BLOCK_SIZE,
     logical_divisor: int = 1,
     publish_only_complete: bool = False,
+    *, rolling: bool = False,
 ) -> torch.Tensor:
     """Map logical token positions to flattened physical cache rows."""
     if positions.ndim != 1 or request_ids.shape != positions.shape or block_table.ndim != 2:
@@ -146,6 +147,8 @@ def paged_slots(
     slots = torch.full_like(positions, -1, dtype=torch.int64)
     logical = torch.div(positions[publish], logical_divisor, rounding_mode="floor")
     logical_block = torch.div(logical, storage_block_size, rounding_mode="floor")
+    if rolling:
+        logical_block = logical_block.remainder(block_table.shape[1])
     offset = logical.remainder(storage_block_size)
     active_requests = request_ids[publish]
     if bool(((active_requests < 0) | (active_requests >= block_table.shape[0])).any()):
@@ -164,9 +167,10 @@ def window_metadata(
     request_ids: torch.Tensor,
     block_table: torch.Tensor,
     window: int = M.sliding_window,
+    *, rolling: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build paged write slots plus causal indices for the visible sliding window."""
-    slots = paged_slots(positions, request_ids, block_table)
+    slots = paged_slots(positions, request_ids, block_table, rolling=rolling)
     lens = torch.minimum(positions + 1, torch.full_like(positions, window)).to(torch.int32)
     offsets = torch.arange(window, device=positions.device)
     starts = positions - lens.to(positions.dtype) + 1
@@ -174,7 +178,7 @@ def window_metadata(
     valid = offsets.unsqueeze(0) < lens.unsqueeze(-1)
     indices = torch.full_like(visible, -1, dtype=torch.int64)
     visible_requests = request_ids.unsqueeze(-1).expand_as(visible)
-    indices[valid] = paged_slots(visible[valid], visible_requests[valid], block_table)
+    indices[valid] = paged_slots(visible[valid], visible_requests[valid], block_table, rolling=rolling)
     return slots, indices.to(torch.int32), lens
 
 

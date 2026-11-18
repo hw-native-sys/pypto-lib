@@ -14,6 +14,8 @@ from typing import Literal, Optional, Tuple
 
 import pypto.language as pl
 
+CACHE_ROWS_DYN = pl.dynamic("CACHE_ROWS_DYN")
+
 
 @dataclass(frozen=True)
 class DeepSeekV41LayerConfig:
@@ -240,6 +242,9 @@ DECODE_BATCH = 12
 DSPARK_SPEC_TOKENS = 5
 DECODE_SEQ = DSPARK_SPEC_TOKENS + 1
 BLOCK_SIZE = 128
+C2A_STORAGE_ROWS = 64
+C1A_STORAGE_ROWS = 128
+COMPRESSED_POOL_UNIT_ROWS = 64
 DSPARK_DRAFT_LAYERS = 3
 DSPARK_N_ROUTED_EXPERTS = 128
 DSPARK_NUM_EXPERTS_PER_TOK = 3
