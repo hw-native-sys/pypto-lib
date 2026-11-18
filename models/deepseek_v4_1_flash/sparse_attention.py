@@ -156,6 +156,8 @@ SPARSE_VF_FUSED_GATHER_TILE = 16
 
 
 SPARSE_VF_FUSED_SCALE_TILE = 8
+# Decode two 16-row panels per packed FP4 chunk.
+SPARSE_VF_FUSED_FP4_SCALE_TILE = 16
 
 
 SPARSE_VF_WINDOW_GROUP = 32
@@ -1198,14 +1200,16 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                 future_seed0_contiguous = pl.cast(0, pl.INT32)
                 future_seed0_all_valid = pl.cast(0, pl.INT32)
                 if future_seed0_first >= 0:
-                    future_seed0_all_valid = pl.cast(1, pl.INT32)
-                    future_seed0_contiguous = pl.cast(1, pl.INT32)
+                    # The OR of XOR differences is zero for a contiguous run and negative for an invalid index.
+                    future_seed0_first_wide = pl.cast(future_seed0_first, pl.INT64)
+                    future_seed0_mismatch = pl.cast(0, pl.INT64)
                     for future_seed0_check in pl.range(1, 32):
                         future_seed0_index = pl.tile.read(ids_future_seed0, [0, future_seed0_check])
-                        if future_seed0_index != future_seed0_first + future_seed0_check:
-                            future_seed0_contiguous = pl.cast(0, pl.INT32)
-                        if future_seed0_index < 0:
-                            future_seed0_all_valid = pl.cast(0, pl.INT32)
+                        future_seed0_expected = future_seed0_first_wide + pl.cast(future_seed0_check, pl.INT64)
+                        future_seed0_delta = pl.cast(future_seed0_index, pl.INT64) ^ future_seed0_expected
+                        future_seed0_mismatch = future_seed0_mismatch | future_seed0_delta
+                    future_seed0_contiguous = pl.cast(future_seed0_mismatch == 0, pl.INT32)
+                    future_seed0_all_valid = pl.cast(future_seed0_mismatch >= 0, pl.INT32)
                 if future_seed0_contiguous != 0:
                     future_seed0_physical = pl.cast(future_seed0_first, pl.INDEX)
                     raw_future_seed0 = pl.tile.gather_row(raw_future_seed0, compressed_flat, [0, 0], [future_seed0_physical, 0], [32, COMPRESSED_CACHE_BYTES])
@@ -1363,14 +1367,15 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                 future_seed1_contiguous = pl.cast(0, pl.INT32)
                 future_seed1_all_valid = pl.cast(0, pl.INT32)
                 if future_seed1_first >= 0:
-                    future_seed1_all_valid = pl.cast(1, pl.INT32)
-                    future_seed1_contiguous = pl.cast(1, pl.INT32)
+                    future_seed1_first_wide = pl.cast(future_seed1_first, pl.INT64)
+                    future_seed1_mismatch = pl.cast(0, pl.INT64)
                     for future_seed1_check in pl.range(1, 32):
                         future_seed1_index = pl.tile.read(ids_future_seed1, [0, future_seed1_check])
-                        if future_seed1_index != future_seed1_first + future_seed1_check:
-                            future_seed1_contiguous = pl.cast(0, pl.INT32)
-                        if future_seed1_index < 0:
-                            future_seed1_all_valid = pl.cast(0, pl.INT32)
+                        future_seed1_expected = future_seed1_first_wide + pl.cast(future_seed1_check, pl.INT64)
+                        future_seed1_delta = pl.cast(future_seed1_index, pl.INT64) ^ future_seed1_expected
+                        future_seed1_mismatch = future_seed1_mismatch | future_seed1_delta
+                    future_seed1_contiguous = pl.cast(future_seed1_mismatch == 0, pl.INT32)
+                    future_seed1_all_valid = pl.cast(future_seed1_mismatch >= 0, pl.INT32)
                 if future_seed1_contiguous != 0:
                     future_seed1_physical = pl.cast(future_seed1_first, pl.INDEX)
                     raw_future_seed1 = pl.tile.gather_row(raw_future_seed1, compressed_flat, [0, 0], [future_seed1_physical, 0], [32, COMPRESSED_CACHE_BYTES])
@@ -1528,14 +1533,15 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                 future_seed2_contiguous = pl.cast(0, pl.INT32)
                 future_seed2_all_valid = pl.cast(0, pl.INT32)
                 if future_seed2_first >= 0:
-                    future_seed2_all_valid = pl.cast(1, pl.INT32)
-                    future_seed2_contiguous = pl.cast(1, pl.INT32)
+                    future_seed2_first_wide = pl.cast(future_seed2_first, pl.INT64)
+                    future_seed2_mismatch = pl.cast(0, pl.INT64)
                     for future_seed2_check in pl.range(1, 32):
                         future_seed2_index = pl.tile.read(ids_future_seed2, [0, future_seed2_check])
-                        if future_seed2_index != future_seed2_first + future_seed2_check:
-                            future_seed2_contiguous = pl.cast(0, pl.INT32)
-                        if future_seed2_index < 0:
-                            future_seed2_all_valid = pl.cast(0, pl.INT32)
+                        future_seed2_expected = future_seed2_first_wide + pl.cast(future_seed2_check, pl.INT64)
+                        future_seed2_delta = pl.cast(future_seed2_index, pl.INT64) ^ future_seed2_expected
+                        future_seed2_mismatch = future_seed2_mismatch | future_seed2_delta
+                    future_seed2_contiguous = pl.cast(future_seed2_mismatch == 0, pl.INT32)
+                    future_seed2_all_valid = pl.cast(future_seed2_mismatch >= 0, pl.INT32)
                 if future_seed2_contiguous != 0:
                     future_seed2_physical = pl.cast(future_seed2_first, pl.INDEX)
                     raw_future_seed2 = pl.tile.gather_row(raw_future_seed2, compressed_flat, [0, 0], [future_seed2_physical, 0], [32, COMPRESSED_CACHE_BYTES])
@@ -1584,17 +1590,17 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
             raw_current_compressed2_flat_seed2: pl.Tile[[1, 17408], pl.UINT8, pl.MemRef('sparse_raw3', slots=3)[2], pl.Mem.Vec] = pl.tile.create([1, 17408], dtype=pl.UINT8, target_memory=pl.Mem.Vec)
             raw_current_compressed2_prefix_seed2 = pl.tile.slice(raw_current_compressed2_flat_seed2, [1, 10240], [0, 0])
             raw_current_compressed2_seed2 = pl.tile.reshape(raw_current_compressed2_prefix_seed2, [32, COMPRESSED_CACHE_BYTES])
-            fca_raw_chunk_slot2_seed2 = pl.tile.slice(raw_current_compressed2_seed2, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [0, 0])
+            fca_raw_chunk_slot2_seed2 = pl.tile.slice(raw_current_compressed2_seed2, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [0, 0])
             fca_packed_slot2_seed2 = pl.reinterpret_view(fca_raw_chunk_slot2_seed2, pl.FP4E2M1X2)
             fca_codes_slot2_seed2 = fca_packed_slot2_seed2[:, :SPARSE_VF_HALF_DIM]
             fca_values_slot2_seed2 = pl.cast(fca_codes_slot2_seed2, pl.BF16)
-            fca_scale_words_slot2_seed2 = pl.reinterpret_view(fca_raw_chunk_slot2_seed2, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-            fca_scale_flat_slot2_seed2 = pl.tile.reshape(fca_scale_words_slot2_seed2, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-            fca_value_flat_slot2_seed2 = pl.tile.reshape(fca_values_slot2_seed2, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+            fca_scale_words_slot2_seed2 = pl.reinterpret_view(fca_raw_chunk_slot2_seed2, pl.UINT16, shape=[SPARSE_VF_FUSED_FP4_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+            fca_scale_flat_slot2_seed2 = pl.tile.reshape(fca_scale_words_slot2_seed2, [SPARSE_VF_FUSED_FP4_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+            fca_value_flat_slot2_seed2 = pl.tile.reshape(fca_values_slot2_seed2, [SPARSE_VF_FUSED_FP4_SCALE_TILE * HEAD_DIM])
             fca_kv_flat_slot2_seed2 = pl.tile.reshape(kv_chunk_seed2, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
             with pl.reg_scope():
                 raw_stream_8_fca_all_r4_slot2_seed2 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                for raw_stream_8_fca_row_r4_slot2_seed2 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                for raw_stream_8_fca_row_r4_slot2_seed2 in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                     for raw_stream_8_fca_chunk_r4_slot2_seed2 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                         raw_stream_8_fca_scale_offset_r4_slot2_seed2 = raw_stream_8_fca_row_r4_slot2_seed2 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
                         raw_stream_8_fca_scale_offset_r4_slot2_seed2 = raw_stream_8_fca_scale_offset_r4_slot2_seed2 + raw_stream_8_fca_chunk_r4_slot2_seed2 * SPARSE_VF_COMPRESSED_STEP
@@ -1607,40 +1613,17 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                         raw_stream_8_fca_target_row_r4_slot2_seed2 = 0 + 0 + raw_stream_8_fca_row_r4_slot2_seed2
                         raw_stream_8_fca_target_offset_r4_slot2_seed2 = raw_stream_8_fca_target_row_r4_slot2_seed2 * 16 + raw_stream_8_fca_chunk_r4_slot2_seed2 * (32 * SPARSE_VF_REG_TILE)
                         raw_stream_8_fca_write_r4_slot2_seed2 = pl.reg.store(fca_kv_flat_slot2_seed2, raw_stream_8_fca_target_offset_r4_slot2_seed2, raw_stream_8_fca_scaled_r4_slot2_seed2, raw_stream_8_fca_all_r4_slot2_seed2, block_stride=32)
-            fca_raw_chunk_slot2_seed2 = pl.tile.slice(raw_current_compressed2_seed2, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [8, 0])
+            fca_raw_chunk_slot2_seed2 = pl.tile.slice(raw_current_compressed2_seed2, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
             fca_packed_slot2_seed2 = pl.reinterpret_view(fca_raw_chunk_slot2_seed2, pl.FP4E2M1X2)
             fca_codes_slot2_seed2 = fca_packed_slot2_seed2[:, :SPARSE_VF_HALF_DIM]
             fca_values_slot2_seed2 = pl.cast(fca_codes_slot2_seed2, pl.BF16)
-            fca_scale_words_slot2_seed2 = pl.reinterpret_view(fca_raw_chunk_slot2_seed2, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-            fca_scale_flat_slot2_seed2 = pl.tile.reshape(fca_scale_words_slot2_seed2, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-            fca_value_flat_slot2_seed2 = pl.tile.reshape(fca_values_slot2_seed2, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-            fca_kv_flat_slot2_seed2 = pl.tile.reshape(kv_chunk_seed2, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
-            with pl.reg_scope():
-                raw_stream_9_fca_all_r4_slot2_seed2 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                for raw_stream_9_fca_row_r4_slot2_seed2 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
-                    for raw_stream_9_fca_chunk_r4_slot2_seed2 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
-                        raw_stream_9_fca_scale_offset_r4_slot2_seed2 = raw_stream_9_fca_row_r4_slot2_seed2 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                        raw_stream_9_fca_scale_offset_r4_slot2_seed2 = raw_stream_9_fca_scale_offset_r4_slot2_seed2 + raw_stream_9_fca_chunk_r4_slot2_seed2 * SPARSE_VF_COMPRESSED_STEP
-                        raw_stream_9_fca_groups_r4_slot2_seed2 = pl.reg.load(fca_scale_flat_slot2_seed2, raw_stream_9_fca_scale_offset_r4_slot2_seed2, lanes=SPARSE_VF_COMPRESSED_STEP)
-                        raw_stream_9_fca_factor_bits_r4_slot2_seed2 = pl.reg.group_broadcast(raw_stream_9_fca_groups_r4_slot2_seed2, lanes=SPARSE_VF_REG_TILE)
-                        raw_stream_9_fca_factor_r4_slot2_seed2 = pl.reg.interpret_cast(raw_stream_9_fca_factor_bits_r4_slot2_seed2, dtype=pl.BF16)
-                        raw_stream_9_fca_value_offset_r4_slot2_seed2 = raw_stream_9_fca_row_r4_slot2_seed2 * HEAD_DIM + raw_stream_9_fca_chunk_r4_slot2_seed2 * SPARSE_VF_REG_TILE
-                        raw_stream_9_fca_value_r4_slot2_seed2 = pl.reg.load(fca_value_flat_slot2_seed2, raw_stream_9_fca_value_offset_r4_slot2_seed2, lanes=SPARSE_VF_REG_TILE)
-                        raw_stream_9_fca_scaled_r4_slot2_seed2 = pl.reg.mul(raw_stream_9_fca_value_r4_slot2_seed2, raw_stream_9_fca_factor_r4_slot2_seed2, raw_stream_9_fca_all_r4_slot2_seed2)
-                        raw_stream_9_fca_target_row_r4_slot2_seed2 = 0 + 8 + raw_stream_9_fca_row_r4_slot2_seed2
-                        raw_stream_9_fca_target_offset_r4_slot2_seed2 = raw_stream_9_fca_target_row_r4_slot2_seed2 * 16 + raw_stream_9_fca_chunk_r4_slot2_seed2 * (32 * SPARSE_VF_REG_TILE)
-                        raw_stream_9_fca_write_r4_slot2_seed2 = pl.reg.store(fca_kv_flat_slot2_seed2, raw_stream_9_fca_target_offset_r4_slot2_seed2, raw_stream_9_fca_scaled_r4_slot2_seed2, raw_stream_9_fca_all_r4_slot2_seed2, block_stride=32)
-            fca_raw_chunk_slot2_seed2 = pl.tile.slice(raw_current_compressed2_seed2, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
-            fca_packed_slot2_seed2 = pl.reinterpret_view(fca_raw_chunk_slot2_seed2, pl.FP4E2M1X2)
-            fca_codes_slot2_seed2 = fca_packed_slot2_seed2[:, :SPARSE_VF_HALF_DIM]
-            fca_values_slot2_seed2 = pl.cast(fca_codes_slot2_seed2, pl.BF16)
-            fca_scale_words_slot2_seed2 = pl.reinterpret_view(fca_raw_chunk_slot2_seed2, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-            fca_scale_flat_slot2_seed2 = pl.tile.reshape(fca_scale_words_slot2_seed2, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-            fca_value_flat_slot2_seed2 = pl.tile.reshape(fca_values_slot2_seed2, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+            fca_scale_words_slot2_seed2 = pl.reinterpret_view(fca_raw_chunk_slot2_seed2, pl.UINT16, shape=[SPARSE_VF_FUSED_FP4_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+            fca_scale_flat_slot2_seed2 = pl.tile.reshape(fca_scale_words_slot2_seed2, [SPARSE_VF_FUSED_FP4_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+            fca_value_flat_slot2_seed2 = pl.tile.reshape(fca_values_slot2_seed2, [SPARSE_VF_FUSED_FP4_SCALE_TILE * HEAD_DIM])
             fca_kv_flat_slot2_seed2 = pl.tile.reshape(kv_chunk_seed2, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
             with pl.reg_scope():
                 raw_stream_10_fca_all_r4_slot2_seed2 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                for raw_stream_10_fca_row_r4_slot2_seed2 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                for raw_stream_10_fca_row_r4_slot2_seed2 in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                     for raw_stream_10_fca_chunk_r4_slot2_seed2 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                         raw_stream_10_fca_scale_offset_r4_slot2_seed2 = raw_stream_10_fca_row_r4_slot2_seed2 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
                         raw_stream_10_fca_scale_offset_r4_slot2_seed2 = raw_stream_10_fca_scale_offset_r4_slot2_seed2 + raw_stream_10_fca_chunk_r4_slot2_seed2 * SPARSE_VF_COMPRESSED_STEP
@@ -1653,29 +1636,6 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                         raw_stream_10_fca_target_row_r4_slot2_seed2 = 0 + 16 + raw_stream_10_fca_row_r4_slot2_seed2
                         raw_stream_10_fca_target_offset_r4_slot2_seed2 = raw_stream_10_fca_target_row_r4_slot2_seed2 * 16 + raw_stream_10_fca_chunk_r4_slot2_seed2 * (32 * SPARSE_VF_REG_TILE)
                         raw_stream_10_fca_write_r4_slot2_seed2 = pl.reg.store(fca_kv_flat_slot2_seed2, raw_stream_10_fca_target_offset_r4_slot2_seed2, raw_stream_10_fca_scaled_r4_slot2_seed2, raw_stream_10_fca_all_r4_slot2_seed2, block_stride=32)
-            fca_raw_chunk_slot2_seed2 = pl.tile.slice(raw_current_compressed2_seed2, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [24, 0])
-            fca_packed_slot2_seed2 = pl.reinterpret_view(fca_raw_chunk_slot2_seed2, pl.FP4E2M1X2)
-            fca_codes_slot2_seed2 = fca_packed_slot2_seed2[:, :SPARSE_VF_HALF_DIM]
-            fca_values_slot2_seed2 = pl.cast(fca_codes_slot2_seed2, pl.BF16)
-            fca_scale_words_slot2_seed2 = pl.reinterpret_view(fca_raw_chunk_slot2_seed2, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-            fca_scale_flat_slot2_seed2 = pl.tile.reshape(fca_scale_words_slot2_seed2, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-            fca_value_flat_slot2_seed2 = pl.tile.reshape(fca_values_slot2_seed2, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-            fca_kv_flat_slot2_seed2 = pl.tile.reshape(kv_chunk_seed2, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
-            with pl.reg_scope():
-                raw_stream_11_fca_all_r4_slot2_seed2 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                for raw_stream_11_fca_row_r4_slot2_seed2 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
-                    for raw_stream_11_fca_chunk_r4_slot2_seed2 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
-                        raw_stream_11_fca_scale_offset_r4_slot2_seed2 = raw_stream_11_fca_row_r4_slot2_seed2 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                        raw_stream_11_fca_scale_offset_r4_slot2_seed2 = raw_stream_11_fca_scale_offset_r4_slot2_seed2 + raw_stream_11_fca_chunk_r4_slot2_seed2 * SPARSE_VF_COMPRESSED_STEP
-                        raw_stream_11_fca_groups_r4_slot2_seed2 = pl.reg.load(fca_scale_flat_slot2_seed2, raw_stream_11_fca_scale_offset_r4_slot2_seed2, lanes=SPARSE_VF_COMPRESSED_STEP)
-                        raw_stream_11_fca_factor_bits_r4_slot2_seed2 = pl.reg.group_broadcast(raw_stream_11_fca_groups_r4_slot2_seed2, lanes=SPARSE_VF_REG_TILE)
-                        raw_stream_11_fca_factor_r4_slot2_seed2 = pl.reg.interpret_cast(raw_stream_11_fca_factor_bits_r4_slot2_seed2, dtype=pl.BF16)
-                        raw_stream_11_fca_value_offset_r4_slot2_seed2 = raw_stream_11_fca_row_r4_slot2_seed2 * HEAD_DIM + raw_stream_11_fca_chunk_r4_slot2_seed2 * SPARSE_VF_REG_TILE
-                        raw_stream_11_fca_value_r4_slot2_seed2 = pl.reg.load(fca_value_flat_slot2_seed2, raw_stream_11_fca_value_offset_r4_slot2_seed2, lanes=SPARSE_VF_REG_TILE)
-                        raw_stream_11_fca_scaled_r4_slot2_seed2 = pl.reg.mul(raw_stream_11_fca_value_r4_slot2_seed2, raw_stream_11_fca_factor_r4_slot2_seed2, raw_stream_11_fca_all_r4_slot2_seed2)
-                        raw_stream_11_fca_target_row_r4_slot2_seed2 = 0 + 24 + raw_stream_11_fca_row_r4_slot2_seed2
-                        raw_stream_11_fca_target_offset_r4_slot2_seed2 = raw_stream_11_fca_target_row_r4_slot2_seed2 * 16 + raw_stream_11_fca_chunk_r4_slot2_seed2 * (32 * SPARSE_VF_REG_TILE)
-                        raw_stream_11_fca_write_r4_slot2_seed2 = pl.reg.store(fca_kv_flat_slot2_seed2, raw_stream_11_fca_target_offset_r4_slot2_seed2, raw_stream_11_fca_scaled_r4_slot2_seed2, raw_stream_11_fca_all_r4_slot2_seed2, block_stride=32)
             kv_nz_seed2: pl.Tile[[32, HEAD_DIM], pl.BF16, pl.MemRef('sparse_raw_kv_nz'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.tile.create([32, HEAD_DIM], dtype=pl.BF16, target_memory=pl.Mem.Vec)
             pl.system.tpush_to_aic(kv_nz_seed2, split=1, id=1)
             if 3 + 2 < parts * 2:
@@ -1687,14 +1647,15 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                 future_seed3_contiguous = pl.cast(0, pl.INT32)
                 future_seed3_all_valid = pl.cast(0, pl.INT32)
                 if future_seed3_first >= 0:
-                    future_seed3_all_valid = pl.cast(1, pl.INT32)
-                    future_seed3_contiguous = pl.cast(1, pl.INT32)
+                    future_seed3_first_wide = pl.cast(future_seed3_first, pl.INT64)
+                    future_seed3_mismatch = pl.cast(0, pl.INT64)
                     for future_seed3_check in pl.range(1, 32):
                         future_seed3_index = pl.tile.read(ids_future_seed3, [0, future_seed3_check])
-                        if future_seed3_index != future_seed3_first + future_seed3_check:
-                            future_seed3_contiguous = pl.cast(0, pl.INT32)
-                        if future_seed3_index < 0:
-                            future_seed3_all_valid = pl.cast(0, pl.INT32)
+                        future_seed3_expected = future_seed3_first_wide + pl.cast(future_seed3_check, pl.INT64)
+                        future_seed3_delta = pl.cast(future_seed3_index, pl.INT64) ^ future_seed3_expected
+                        future_seed3_mismatch = future_seed3_mismatch | future_seed3_delta
+                    future_seed3_contiguous = pl.cast(future_seed3_mismatch == 0, pl.INT32)
+                    future_seed3_all_valid = pl.cast(future_seed3_mismatch >= 0, pl.INT32)
                 if future_seed3_contiguous != 0:
                     future_seed3_physical = pl.cast(future_seed3_first, pl.INDEX)
                     raw_future_seed3 = pl.tile.gather_row(raw_future_seed3, compressed_flat, [0, 0], [future_seed3_physical, 0], [32, COMPRESSED_CACHE_BYTES])
@@ -1743,17 +1704,17 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
             raw_current_compressed0_flat_seed3: pl.Tile[[1, 17408], pl.UINT8, pl.MemRef('sparse_raw3', slots=3)[0], pl.Mem.Vec] = pl.tile.create([1, 17408], dtype=pl.UINT8, target_memory=pl.Mem.Vec)
             raw_current_compressed0_prefix_seed3 = pl.tile.slice(raw_current_compressed0_flat_seed3, [1, 10240], [0, 0])
             raw_current_compressed0_seed3 = pl.tile.reshape(raw_current_compressed0_prefix_seed3, [32, COMPRESSED_CACHE_BYTES])
-            fca_raw_chunk_slot0_seed3 = pl.tile.slice(raw_current_compressed0_seed3, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [0, 0])
+            fca_raw_chunk_slot0_seed3 = pl.tile.slice(raw_current_compressed0_seed3, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [0, 0])
             fca_packed_slot0_seed3 = pl.reinterpret_view(fca_raw_chunk_slot0_seed3, pl.FP4E2M1X2)
             fca_codes_slot0_seed3 = fca_packed_slot0_seed3[:, :SPARSE_VF_HALF_DIM]
             fca_values_slot0_seed3 = pl.cast(fca_codes_slot0_seed3, pl.BF16)
-            fca_scale_words_slot0_seed3 = pl.reinterpret_view(fca_raw_chunk_slot0_seed3, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-            fca_scale_flat_slot0_seed3 = pl.tile.reshape(fca_scale_words_slot0_seed3, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-            fca_value_flat_slot0_seed3 = pl.tile.reshape(fca_values_slot0_seed3, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+            fca_scale_words_slot0_seed3 = pl.reinterpret_view(fca_raw_chunk_slot0_seed3, pl.UINT16, shape=[SPARSE_VF_FUSED_FP4_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+            fca_scale_flat_slot0_seed3 = pl.tile.reshape(fca_scale_words_slot0_seed3, [SPARSE_VF_FUSED_FP4_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+            fca_value_flat_slot0_seed3 = pl.tile.reshape(fca_values_slot0_seed3, [SPARSE_VF_FUSED_FP4_SCALE_TILE * HEAD_DIM])
             fca_kv_flat_slot0_seed3 = pl.tile.reshape(kv_chunk_seed3, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
             with pl.reg_scope():
                 raw_stream_12_fca_all_r4_slot0_seed3 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                for raw_stream_12_fca_row_r4_slot0_seed3 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                for raw_stream_12_fca_row_r4_slot0_seed3 in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                     for raw_stream_12_fca_chunk_r4_slot0_seed3 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                         raw_stream_12_fca_scale_offset_r4_slot0_seed3 = raw_stream_12_fca_row_r4_slot0_seed3 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
                         raw_stream_12_fca_scale_offset_r4_slot0_seed3 = raw_stream_12_fca_scale_offset_r4_slot0_seed3 + raw_stream_12_fca_chunk_r4_slot0_seed3 * SPARSE_VF_COMPRESSED_STEP
@@ -1766,40 +1727,17 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                         raw_stream_12_fca_target_row_r4_slot0_seed3 = 0 + 0 + raw_stream_12_fca_row_r4_slot0_seed3
                         raw_stream_12_fca_target_offset_r4_slot0_seed3 = raw_stream_12_fca_target_row_r4_slot0_seed3 * 16 + raw_stream_12_fca_chunk_r4_slot0_seed3 * (32 * SPARSE_VF_REG_TILE)
                         raw_stream_12_fca_write_r4_slot0_seed3 = pl.reg.store(fca_kv_flat_slot0_seed3, raw_stream_12_fca_target_offset_r4_slot0_seed3, raw_stream_12_fca_scaled_r4_slot0_seed3, raw_stream_12_fca_all_r4_slot0_seed3, block_stride=32)
-            fca_raw_chunk_slot0_seed3 = pl.tile.slice(raw_current_compressed0_seed3, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [8, 0])
+            fca_raw_chunk_slot0_seed3 = pl.tile.slice(raw_current_compressed0_seed3, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
             fca_packed_slot0_seed3 = pl.reinterpret_view(fca_raw_chunk_slot0_seed3, pl.FP4E2M1X2)
             fca_codes_slot0_seed3 = fca_packed_slot0_seed3[:, :SPARSE_VF_HALF_DIM]
             fca_values_slot0_seed3 = pl.cast(fca_codes_slot0_seed3, pl.BF16)
-            fca_scale_words_slot0_seed3 = pl.reinterpret_view(fca_raw_chunk_slot0_seed3, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-            fca_scale_flat_slot0_seed3 = pl.tile.reshape(fca_scale_words_slot0_seed3, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-            fca_value_flat_slot0_seed3 = pl.tile.reshape(fca_values_slot0_seed3, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-            fca_kv_flat_slot0_seed3 = pl.tile.reshape(kv_chunk_seed3, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
-            with pl.reg_scope():
-                raw_stream_13_fca_all_r4_slot0_seed3 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                for raw_stream_13_fca_row_r4_slot0_seed3 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
-                    for raw_stream_13_fca_chunk_r4_slot0_seed3 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
-                        raw_stream_13_fca_scale_offset_r4_slot0_seed3 = raw_stream_13_fca_row_r4_slot0_seed3 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                        raw_stream_13_fca_scale_offset_r4_slot0_seed3 = raw_stream_13_fca_scale_offset_r4_slot0_seed3 + raw_stream_13_fca_chunk_r4_slot0_seed3 * SPARSE_VF_COMPRESSED_STEP
-                        raw_stream_13_fca_groups_r4_slot0_seed3 = pl.reg.load(fca_scale_flat_slot0_seed3, raw_stream_13_fca_scale_offset_r4_slot0_seed3, lanes=SPARSE_VF_COMPRESSED_STEP)
-                        raw_stream_13_fca_factor_bits_r4_slot0_seed3 = pl.reg.group_broadcast(raw_stream_13_fca_groups_r4_slot0_seed3, lanes=SPARSE_VF_REG_TILE)
-                        raw_stream_13_fca_factor_r4_slot0_seed3 = pl.reg.interpret_cast(raw_stream_13_fca_factor_bits_r4_slot0_seed3, dtype=pl.BF16)
-                        raw_stream_13_fca_value_offset_r4_slot0_seed3 = raw_stream_13_fca_row_r4_slot0_seed3 * HEAD_DIM + raw_stream_13_fca_chunk_r4_slot0_seed3 * SPARSE_VF_REG_TILE
-                        raw_stream_13_fca_value_r4_slot0_seed3 = pl.reg.load(fca_value_flat_slot0_seed3, raw_stream_13_fca_value_offset_r4_slot0_seed3, lanes=SPARSE_VF_REG_TILE)
-                        raw_stream_13_fca_scaled_r4_slot0_seed3 = pl.reg.mul(raw_stream_13_fca_value_r4_slot0_seed3, raw_stream_13_fca_factor_r4_slot0_seed3, raw_stream_13_fca_all_r4_slot0_seed3)
-                        raw_stream_13_fca_target_row_r4_slot0_seed3 = 0 + 8 + raw_stream_13_fca_row_r4_slot0_seed3
-                        raw_stream_13_fca_target_offset_r4_slot0_seed3 = raw_stream_13_fca_target_row_r4_slot0_seed3 * 16 + raw_stream_13_fca_chunk_r4_slot0_seed3 * (32 * SPARSE_VF_REG_TILE)
-                        raw_stream_13_fca_write_r4_slot0_seed3 = pl.reg.store(fca_kv_flat_slot0_seed3, raw_stream_13_fca_target_offset_r4_slot0_seed3, raw_stream_13_fca_scaled_r4_slot0_seed3, raw_stream_13_fca_all_r4_slot0_seed3, block_stride=32)
-            fca_raw_chunk_slot0_seed3 = pl.tile.slice(raw_current_compressed0_seed3, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
-            fca_packed_slot0_seed3 = pl.reinterpret_view(fca_raw_chunk_slot0_seed3, pl.FP4E2M1X2)
-            fca_codes_slot0_seed3 = fca_packed_slot0_seed3[:, :SPARSE_VF_HALF_DIM]
-            fca_values_slot0_seed3 = pl.cast(fca_codes_slot0_seed3, pl.BF16)
-            fca_scale_words_slot0_seed3 = pl.reinterpret_view(fca_raw_chunk_slot0_seed3, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-            fca_scale_flat_slot0_seed3 = pl.tile.reshape(fca_scale_words_slot0_seed3, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-            fca_value_flat_slot0_seed3 = pl.tile.reshape(fca_values_slot0_seed3, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+            fca_scale_words_slot0_seed3 = pl.reinterpret_view(fca_raw_chunk_slot0_seed3, pl.UINT16, shape=[SPARSE_VF_FUSED_FP4_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+            fca_scale_flat_slot0_seed3 = pl.tile.reshape(fca_scale_words_slot0_seed3, [SPARSE_VF_FUSED_FP4_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+            fca_value_flat_slot0_seed3 = pl.tile.reshape(fca_values_slot0_seed3, [SPARSE_VF_FUSED_FP4_SCALE_TILE * HEAD_DIM])
             fca_kv_flat_slot0_seed3 = pl.tile.reshape(kv_chunk_seed3, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
             with pl.reg_scope():
                 raw_stream_14_fca_all_r4_slot0_seed3 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                for raw_stream_14_fca_row_r4_slot0_seed3 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                for raw_stream_14_fca_row_r4_slot0_seed3 in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                     for raw_stream_14_fca_chunk_r4_slot0_seed3 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                         raw_stream_14_fca_scale_offset_r4_slot0_seed3 = raw_stream_14_fca_row_r4_slot0_seed3 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
                         raw_stream_14_fca_scale_offset_r4_slot0_seed3 = raw_stream_14_fca_scale_offset_r4_slot0_seed3 + raw_stream_14_fca_chunk_r4_slot0_seed3 * SPARSE_VF_COMPRESSED_STEP
@@ -1812,29 +1750,6 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                         raw_stream_14_fca_target_row_r4_slot0_seed3 = 0 + 16 + raw_stream_14_fca_row_r4_slot0_seed3
                         raw_stream_14_fca_target_offset_r4_slot0_seed3 = raw_stream_14_fca_target_row_r4_slot0_seed3 * 16 + raw_stream_14_fca_chunk_r4_slot0_seed3 * (32 * SPARSE_VF_REG_TILE)
                         raw_stream_14_fca_write_r4_slot0_seed3 = pl.reg.store(fca_kv_flat_slot0_seed3, raw_stream_14_fca_target_offset_r4_slot0_seed3, raw_stream_14_fca_scaled_r4_slot0_seed3, raw_stream_14_fca_all_r4_slot0_seed3, block_stride=32)
-            fca_raw_chunk_slot0_seed3 = pl.tile.slice(raw_current_compressed0_seed3, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [24, 0])
-            fca_packed_slot0_seed3 = pl.reinterpret_view(fca_raw_chunk_slot0_seed3, pl.FP4E2M1X2)
-            fca_codes_slot0_seed3 = fca_packed_slot0_seed3[:, :SPARSE_VF_HALF_DIM]
-            fca_values_slot0_seed3 = pl.cast(fca_codes_slot0_seed3, pl.BF16)
-            fca_scale_words_slot0_seed3 = pl.reinterpret_view(fca_raw_chunk_slot0_seed3, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-            fca_scale_flat_slot0_seed3 = pl.tile.reshape(fca_scale_words_slot0_seed3, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-            fca_value_flat_slot0_seed3 = pl.tile.reshape(fca_values_slot0_seed3, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-            fca_kv_flat_slot0_seed3 = pl.tile.reshape(kv_chunk_seed3, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
-            with pl.reg_scope():
-                raw_stream_15_fca_all_r4_slot0_seed3 = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                for raw_stream_15_fca_row_r4_slot0_seed3 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
-                    for raw_stream_15_fca_chunk_r4_slot0_seed3 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
-                        raw_stream_15_fca_scale_offset_r4_slot0_seed3 = raw_stream_15_fca_row_r4_slot0_seed3 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                        raw_stream_15_fca_scale_offset_r4_slot0_seed3 = raw_stream_15_fca_scale_offset_r4_slot0_seed3 + raw_stream_15_fca_chunk_r4_slot0_seed3 * SPARSE_VF_COMPRESSED_STEP
-                        raw_stream_15_fca_groups_r4_slot0_seed3 = pl.reg.load(fca_scale_flat_slot0_seed3, raw_stream_15_fca_scale_offset_r4_slot0_seed3, lanes=SPARSE_VF_COMPRESSED_STEP)
-                        raw_stream_15_fca_factor_bits_r4_slot0_seed3 = pl.reg.group_broadcast(raw_stream_15_fca_groups_r4_slot0_seed3, lanes=SPARSE_VF_REG_TILE)
-                        raw_stream_15_fca_factor_r4_slot0_seed3 = pl.reg.interpret_cast(raw_stream_15_fca_factor_bits_r4_slot0_seed3, dtype=pl.BF16)
-                        raw_stream_15_fca_value_offset_r4_slot0_seed3 = raw_stream_15_fca_row_r4_slot0_seed3 * HEAD_DIM + raw_stream_15_fca_chunk_r4_slot0_seed3 * SPARSE_VF_REG_TILE
-                        raw_stream_15_fca_value_r4_slot0_seed3 = pl.reg.load(fca_value_flat_slot0_seed3, raw_stream_15_fca_value_offset_r4_slot0_seed3, lanes=SPARSE_VF_REG_TILE)
-                        raw_stream_15_fca_scaled_r4_slot0_seed3 = pl.reg.mul(raw_stream_15_fca_value_r4_slot0_seed3, raw_stream_15_fca_factor_r4_slot0_seed3, raw_stream_15_fca_all_r4_slot0_seed3)
-                        raw_stream_15_fca_target_row_r4_slot0_seed3 = 0 + 24 + raw_stream_15_fca_row_r4_slot0_seed3
-                        raw_stream_15_fca_target_offset_r4_slot0_seed3 = raw_stream_15_fca_target_row_r4_slot0_seed3 * 16 + raw_stream_15_fca_chunk_r4_slot0_seed3 * (32 * SPARSE_VF_REG_TILE)
-                        raw_stream_15_fca_write_r4_slot0_seed3 = pl.reg.store(fca_kv_flat_slot0_seed3, raw_stream_15_fca_target_offset_r4_slot0_seed3, raw_stream_15_fca_scaled_r4_slot0_seed3, raw_stream_15_fca_all_r4_slot0_seed3, block_stride=32)
             kv_nz_seed3: pl.Tile[[32, HEAD_DIM], pl.BF16, pl.MemRef('sparse_raw_kv_nz'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.tile.create([32, HEAD_DIM], dtype=pl.BF16, target_memory=pl.Mem.Vec)
             pl.system.tpush_to_aic(kv_nz_seed3, split=1, id=1)
             for part in pl.range(parts):
@@ -1848,6 +1763,12 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                 else:
                     qk_half = pl.system.tpop_from_aic(shape=[SPARSE_VF_FUSED_AIV_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.FP32, split=1, id=0)
                 scores = pl.mul(qk_half, SCALE)
+                # The assembled scores own their data, so Cube can reuse the FIFO during softmax.
+                if compressed_keys > 0:
+                    pl.system.tfree_to_aic(qk_half_a, id=0)
+                    pl.system.tfree_to_aic(qk_half_b, id=0)
+                else:
+                    pl.system.tfree_to_aic(qk_half, id=0)
                 column = part * SPARSE_VF_KEY_TILE
                 if column < WINDOW_KEYS:
                     ids = pl.tile.load(window_indices, [token, column], [1, SPARSE_VF_KEY_TILE])
@@ -1906,11 +1827,6 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                         raw_stream_16_sm_store_c = pl.reg.store(sm_correction_flat, raw_stream_16_sm_row, raw_stream_16_sm_alpha)
                 maximum = next_max
                 denominator = next_denominator
-                if compressed_keys > 0:
-                    pl.system.tfree_to_aic(qk_half_a, id=0)
-                    pl.system.tfree_to_aic(qk_half_b, id=0)
-                else:
-                    pl.system.tfree_to_aic(qk_half, id=0)
                 pl.system.tpush_to_aic(weights, split=1, id=2)
                 if part + 2 < parts:
                     if 2 * (part + 2) + 2 < parts * 2:
@@ -1923,14 +1839,15 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                             future_part_a_s0_contiguous = pl.cast(0, pl.INT32)
                             future_part_a_s0_all_valid = pl.cast(0, pl.INT32)
                             if future_part_a_s0_first >= 0:
-                                future_part_a_s0_all_valid = pl.cast(1, pl.INT32)
-                                future_part_a_s0_contiguous = pl.cast(1, pl.INT32)
+                                future_part_a_s0_first_wide = pl.cast(future_part_a_s0_first, pl.INT64)
+                                future_part_a_s0_mismatch = pl.cast(0, pl.INT64)
                                 for future_part_a_s0_check in pl.range(1, 32):
                                     future_part_a_s0_index = pl.tile.read(ids_future_part_a_s0, [0, future_part_a_s0_check])
-                                    if future_part_a_s0_index != future_part_a_s0_first + future_part_a_s0_check:
-                                        future_part_a_s0_contiguous = pl.cast(0, pl.INT32)
-                                    if future_part_a_s0_index < 0:
-                                        future_part_a_s0_all_valid = pl.cast(0, pl.INT32)
+                                    future_part_a_s0_expected = future_part_a_s0_first_wide + pl.cast(future_part_a_s0_check, pl.INT64)
+                                    future_part_a_s0_delta = pl.cast(future_part_a_s0_index, pl.INT64) ^ future_part_a_s0_expected
+                                    future_part_a_s0_mismatch = future_part_a_s0_mismatch | future_part_a_s0_delta
+                                future_part_a_s0_contiguous = pl.cast(future_part_a_s0_mismatch == 0, pl.INT32)
+                                future_part_a_s0_all_valid = pl.cast(future_part_a_s0_mismatch >= 0, pl.INT32)
                             if future_part_a_s0_contiguous != 0:
                                 future_part_a_s0_physical = pl.cast(future_part_a_s0_first, pl.INDEX)
                                 raw_future_part_a_s0 = pl.tile.gather_row(raw_future_part_a_s0, compressed_flat, [0, 0], [future_part_a_s0_physical, 0], [32, COMPRESSED_CACHE_BYTES])
@@ -1984,14 +1901,15 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                             future_part_a_s1_contiguous = pl.cast(0, pl.INT32)
                             future_part_a_s1_all_valid = pl.cast(0, pl.INT32)
                             if future_part_a_s1_first >= 0:
-                                future_part_a_s1_all_valid = pl.cast(1, pl.INT32)
-                                future_part_a_s1_contiguous = pl.cast(1, pl.INT32)
+                                future_part_a_s1_first_wide = pl.cast(future_part_a_s1_first, pl.INT64)
+                                future_part_a_s1_mismatch = pl.cast(0, pl.INT64)
                                 for future_part_a_s1_check in pl.range(1, 32):
                                     future_part_a_s1_index = pl.tile.read(ids_future_part_a_s1, [0, future_part_a_s1_check])
-                                    if future_part_a_s1_index != future_part_a_s1_first + future_part_a_s1_check:
-                                        future_part_a_s1_contiguous = pl.cast(0, pl.INT32)
-                                    if future_part_a_s1_index < 0:
-                                        future_part_a_s1_all_valid = pl.cast(0, pl.INT32)
+                                    future_part_a_s1_expected = future_part_a_s1_first_wide + pl.cast(future_part_a_s1_check, pl.INT64)
+                                    future_part_a_s1_delta = pl.cast(future_part_a_s1_index, pl.INT64) ^ future_part_a_s1_expected
+                                    future_part_a_s1_mismatch = future_part_a_s1_mismatch | future_part_a_s1_delta
+                                future_part_a_s1_contiguous = pl.cast(future_part_a_s1_mismatch == 0, pl.INT32)
+                                future_part_a_s1_all_valid = pl.cast(future_part_a_s1_mismatch >= 0, pl.INT32)
                             if future_part_a_s1_contiguous != 0:
                                 future_part_a_s1_physical = pl.cast(future_part_a_s1_first, pl.INDEX)
                                 raw_future_part_a_s1 = pl.tile.gather_row(raw_future_part_a_s1, compressed_flat, [0, 0], [future_part_a_s1_physical, 0], [32, COMPRESSED_CACHE_BYTES])
@@ -2045,14 +1963,15 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                             future_part_a_s2_contiguous = pl.cast(0, pl.INT32)
                             future_part_a_s2_all_valid = pl.cast(0, pl.INT32)
                             if future_part_a_s2_first >= 0:
-                                future_part_a_s2_all_valid = pl.cast(1, pl.INT32)
-                                future_part_a_s2_contiguous = pl.cast(1, pl.INT32)
+                                future_part_a_s2_first_wide = pl.cast(future_part_a_s2_first, pl.INT64)
+                                future_part_a_s2_mismatch = pl.cast(0, pl.INT64)
                                 for future_part_a_s2_check in pl.range(1, 32):
                                     future_part_a_s2_index = pl.tile.read(ids_future_part_a_s2, [0, future_part_a_s2_check])
-                                    if future_part_a_s2_index != future_part_a_s2_first + future_part_a_s2_check:
-                                        future_part_a_s2_contiguous = pl.cast(0, pl.INT32)
-                                    if future_part_a_s2_index < 0:
-                                        future_part_a_s2_all_valid = pl.cast(0, pl.INT32)
+                                    future_part_a_s2_expected = future_part_a_s2_first_wide + pl.cast(future_part_a_s2_check, pl.INT64)
+                                    future_part_a_s2_delta = pl.cast(future_part_a_s2_index, pl.INT64) ^ future_part_a_s2_expected
+                                    future_part_a_s2_mismatch = future_part_a_s2_mismatch | future_part_a_s2_delta
+                                future_part_a_s2_contiguous = pl.cast(future_part_a_s2_mismatch == 0, pl.INT32)
+                                future_part_a_s2_all_valid = pl.cast(future_part_a_s2_mismatch >= 0, pl.INT32)
                             if future_part_a_s2_contiguous != 0:
                                 future_part_a_s2_physical = pl.cast(future_part_a_s2_first, pl.INDEX)
                                 raw_future_part_a_s2 = pl.tile.gather_row(raw_future_part_a_s2, compressed_flat, [0, 0], [future_part_a_s2_physical, 0], [32, COMPRESSED_CACHE_BYTES])
@@ -2102,17 +2021,17 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                         raw_current_compressed0_flat_part_a: pl.Tile[[1, 17408], pl.UINT8, pl.MemRef('sparse_raw3', slots=3)[0], pl.Mem.Vec] = pl.tile.create([1, 17408], dtype=pl.UINT8, target_memory=pl.Mem.Vec)
                         raw_current_compressed0_prefix_part_a = pl.tile.slice(raw_current_compressed0_flat_part_a, [1, 10240], [0, 0])
                         raw_current_compressed0_part_a = pl.tile.reshape(raw_current_compressed0_prefix_part_a, [32, COMPRESSED_CACHE_BYTES])
-                        fca_raw_chunk_slot0_part_a = pl.tile.slice(raw_current_compressed0_part_a, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [0, 0])
+                        fca_raw_chunk_slot0_part_a = pl.tile.slice(raw_current_compressed0_part_a, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [0, 0])
                         fca_packed_slot0_part_a = pl.reinterpret_view(fca_raw_chunk_slot0_part_a, pl.FP4E2M1X2)
                         fca_codes_slot0_part_a = fca_packed_slot0_part_a[:, :SPARSE_VF_HALF_DIM]
                         fca_values_slot0_part_a = pl.cast(fca_codes_slot0_part_a, pl.BF16)
-                        fca_scale_words_slot0_part_a = pl.reinterpret_view(fca_raw_chunk_slot0_part_a, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot0_part_a = pl.tile.reshape(fca_scale_words_slot0_part_a, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot0_part_a = pl.tile.reshape(fca_values_slot0_part_a, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fca_scale_words_slot0_part_a = pl.reinterpret_view(fca_raw_chunk_slot0_part_a, pl.UINT16, shape=[SPARSE_VF_FUSED_FP4_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_scale_flat_slot0_part_a = pl.tile.reshape(fca_scale_words_slot0_part_a, [SPARSE_VF_FUSED_FP4_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_value_flat_slot0_part_a = pl.tile.reshape(fca_values_slot0_part_a, [SPARSE_VF_FUSED_FP4_SCALE_TILE * HEAD_DIM])
                         fca_kv_flat_slot0_part_a = pl.tile.reshape(kv_chunk_part_a, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
                         with pl.reg_scope():
                             raw_stream_17_fca_all_r4_slot0_part_a = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_17_fca_row_r4_slot0_part_a in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                            for raw_stream_17_fca_row_r4_slot0_part_a in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_17_fca_chunk_r4_slot0_part_a in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_17_fca_scale_offset_r4_slot0_part_a = raw_stream_17_fca_row_r4_slot0_part_a * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
                                     raw_stream_17_fca_scale_offset_r4_slot0_part_a = raw_stream_17_fca_scale_offset_r4_slot0_part_a + raw_stream_17_fca_chunk_r4_slot0_part_a * SPARSE_VF_COMPRESSED_STEP
@@ -2125,40 +2044,17 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_17_fca_target_row_r4_slot0_part_a = 0 + 0 + raw_stream_17_fca_row_r4_slot0_part_a
                                     raw_stream_17_fca_target_offset_r4_slot0_part_a = raw_stream_17_fca_target_row_r4_slot0_part_a * 16 + raw_stream_17_fca_chunk_r4_slot0_part_a * (32 * SPARSE_VF_REG_TILE)
                                     raw_stream_17_fca_write_r4_slot0_part_a = pl.reg.store(fca_kv_flat_slot0_part_a, raw_stream_17_fca_target_offset_r4_slot0_part_a, raw_stream_17_fca_scaled_r4_slot0_part_a, raw_stream_17_fca_all_r4_slot0_part_a, block_stride=32)
-                        fca_raw_chunk_slot0_part_a = pl.tile.slice(raw_current_compressed0_part_a, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [8, 0])
+                        fca_raw_chunk_slot0_part_a = pl.tile.slice(raw_current_compressed0_part_a, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
                         fca_packed_slot0_part_a = pl.reinterpret_view(fca_raw_chunk_slot0_part_a, pl.FP4E2M1X2)
                         fca_codes_slot0_part_a = fca_packed_slot0_part_a[:, :SPARSE_VF_HALF_DIM]
                         fca_values_slot0_part_a = pl.cast(fca_codes_slot0_part_a, pl.BF16)
-                        fca_scale_words_slot0_part_a = pl.reinterpret_view(fca_raw_chunk_slot0_part_a, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot0_part_a = pl.tile.reshape(fca_scale_words_slot0_part_a, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot0_part_a = pl.tile.reshape(fca_values_slot0_part_a, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fca_kv_flat_slot0_part_a = pl.tile.reshape(kv_chunk_part_a, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
-                        with pl.reg_scope():
-                            raw_stream_18_fca_all_r4_slot0_part_a = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_18_fca_row_r4_slot0_part_a in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
-                                for raw_stream_18_fca_chunk_r4_slot0_part_a in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
-                                    raw_stream_18_fca_scale_offset_r4_slot0_part_a = raw_stream_18_fca_row_r4_slot0_part_a * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_18_fca_scale_offset_r4_slot0_part_a = raw_stream_18_fca_scale_offset_r4_slot0_part_a + raw_stream_18_fca_chunk_r4_slot0_part_a * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_18_fca_groups_r4_slot0_part_a = pl.reg.load(fca_scale_flat_slot0_part_a, raw_stream_18_fca_scale_offset_r4_slot0_part_a, lanes=SPARSE_VF_COMPRESSED_STEP)
-                                    raw_stream_18_fca_factor_bits_r4_slot0_part_a = pl.reg.group_broadcast(raw_stream_18_fca_groups_r4_slot0_part_a, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_18_fca_factor_r4_slot0_part_a = pl.reg.interpret_cast(raw_stream_18_fca_factor_bits_r4_slot0_part_a, dtype=pl.BF16)
-                                    raw_stream_18_fca_value_offset_r4_slot0_part_a = raw_stream_18_fca_row_r4_slot0_part_a * HEAD_DIM + raw_stream_18_fca_chunk_r4_slot0_part_a * SPARSE_VF_REG_TILE
-                                    raw_stream_18_fca_value_r4_slot0_part_a = pl.reg.load(fca_value_flat_slot0_part_a, raw_stream_18_fca_value_offset_r4_slot0_part_a, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_18_fca_scaled_r4_slot0_part_a = pl.reg.mul(raw_stream_18_fca_value_r4_slot0_part_a, raw_stream_18_fca_factor_r4_slot0_part_a, raw_stream_18_fca_all_r4_slot0_part_a)
-                                    raw_stream_18_fca_target_row_r4_slot0_part_a = 0 + 8 + raw_stream_18_fca_row_r4_slot0_part_a
-                                    raw_stream_18_fca_target_offset_r4_slot0_part_a = raw_stream_18_fca_target_row_r4_slot0_part_a * 16 + raw_stream_18_fca_chunk_r4_slot0_part_a * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_18_fca_write_r4_slot0_part_a = pl.reg.store(fca_kv_flat_slot0_part_a, raw_stream_18_fca_target_offset_r4_slot0_part_a, raw_stream_18_fca_scaled_r4_slot0_part_a, raw_stream_18_fca_all_r4_slot0_part_a, block_stride=32)
-                        fca_raw_chunk_slot0_part_a = pl.tile.slice(raw_current_compressed0_part_a, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
-                        fca_packed_slot0_part_a = pl.reinterpret_view(fca_raw_chunk_slot0_part_a, pl.FP4E2M1X2)
-                        fca_codes_slot0_part_a = fca_packed_slot0_part_a[:, :SPARSE_VF_HALF_DIM]
-                        fca_values_slot0_part_a = pl.cast(fca_codes_slot0_part_a, pl.BF16)
-                        fca_scale_words_slot0_part_a = pl.reinterpret_view(fca_raw_chunk_slot0_part_a, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot0_part_a = pl.tile.reshape(fca_scale_words_slot0_part_a, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot0_part_a = pl.tile.reshape(fca_values_slot0_part_a, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fca_scale_words_slot0_part_a = pl.reinterpret_view(fca_raw_chunk_slot0_part_a, pl.UINT16, shape=[SPARSE_VF_FUSED_FP4_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_scale_flat_slot0_part_a = pl.tile.reshape(fca_scale_words_slot0_part_a, [SPARSE_VF_FUSED_FP4_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_value_flat_slot0_part_a = pl.tile.reshape(fca_values_slot0_part_a, [SPARSE_VF_FUSED_FP4_SCALE_TILE * HEAD_DIM])
                         fca_kv_flat_slot0_part_a = pl.tile.reshape(kv_chunk_part_a, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
                         with pl.reg_scope():
                             raw_stream_19_fca_all_r4_slot0_part_a = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_19_fca_row_r4_slot0_part_a in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                            for raw_stream_19_fca_row_r4_slot0_part_a in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_19_fca_chunk_r4_slot0_part_a in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_19_fca_scale_offset_r4_slot0_part_a = raw_stream_19_fca_row_r4_slot0_part_a * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
                                     raw_stream_19_fca_scale_offset_r4_slot0_part_a = raw_stream_19_fca_scale_offset_r4_slot0_part_a + raw_stream_19_fca_chunk_r4_slot0_part_a * SPARSE_VF_COMPRESSED_STEP
@@ -2171,44 +2067,21 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_19_fca_target_row_r4_slot0_part_a = 0 + 16 + raw_stream_19_fca_row_r4_slot0_part_a
                                     raw_stream_19_fca_target_offset_r4_slot0_part_a = raw_stream_19_fca_target_row_r4_slot0_part_a * 16 + raw_stream_19_fca_chunk_r4_slot0_part_a * (32 * SPARSE_VF_REG_TILE)
                                     raw_stream_19_fca_write_r4_slot0_part_a = pl.reg.store(fca_kv_flat_slot0_part_a, raw_stream_19_fca_target_offset_r4_slot0_part_a, raw_stream_19_fca_scaled_r4_slot0_part_a, raw_stream_19_fca_all_r4_slot0_part_a, block_stride=32)
-                        fca_raw_chunk_slot0_part_a = pl.tile.slice(raw_current_compressed0_part_a, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [24, 0])
-                        fca_packed_slot0_part_a = pl.reinterpret_view(fca_raw_chunk_slot0_part_a, pl.FP4E2M1X2)
-                        fca_codes_slot0_part_a = fca_packed_slot0_part_a[:, :SPARSE_VF_HALF_DIM]
-                        fca_values_slot0_part_a = pl.cast(fca_codes_slot0_part_a, pl.BF16)
-                        fca_scale_words_slot0_part_a = pl.reinterpret_view(fca_raw_chunk_slot0_part_a, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot0_part_a = pl.tile.reshape(fca_scale_words_slot0_part_a, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot0_part_a = pl.tile.reshape(fca_values_slot0_part_a, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fca_kv_flat_slot0_part_a = pl.tile.reshape(kv_chunk_part_a, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
-                        with pl.reg_scope():
-                            raw_stream_20_fca_all_r4_slot0_part_a = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_20_fca_row_r4_slot0_part_a in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
-                                for raw_stream_20_fca_chunk_r4_slot0_part_a in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
-                                    raw_stream_20_fca_scale_offset_r4_slot0_part_a = raw_stream_20_fca_row_r4_slot0_part_a * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_20_fca_scale_offset_r4_slot0_part_a = raw_stream_20_fca_scale_offset_r4_slot0_part_a + raw_stream_20_fca_chunk_r4_slot0_part_a * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_20_fca_groups_r4_slot0_part_a = pl.reg.load(fca_scale_flat_slot0_part_a, raw_stream_20_fca_scale_offset_r4_slot0_part_a, lanes=SPARSE_VF_COMPRESSED_STEP)
-                                    raw_stream_20_fca_factor_bits_r4_slot0_part_a = pl.reg.group_broadcast(raw_stream_20_fca_groups_r4_slot0_part_a, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_20_fca_factor_r4_slot0_part_a = pl.reg.interpret_cast(raw_stream_20_fca_factor_bits_r4_slot0_part_a, dtype=pl.BF16)
-                                    raw_stream_20_fca_value_offset_r4_slot0_part_a = raw_stream_20_fca_row_r4_slot0_part_a * HEAD_DIM + raw_stream_20_fca_chunk_r4_slot0_part_a * SPARSE_VF_REG_TILE
-                                    raw_stream_20_fca_value_r4_slot0_part_a = pl.reg.load(fca_value_flat_slot0_part_a, raw_stream_20_fca_value_offset_r4_slot0_part_a, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_20_fca_scaled_r4_slot0_part_a = pl.reg.mul(raw_stream_20_fca_value_r4_slot0_part_a, raw_stream_20_fca_factor_r4_slot0_part_a, raw_stream_20_fca_all_r4_slot0_part_a)
-                                    raw_stream_20_fca_target_row_r4_slot0_part_a = 0 + 24 + raw_stream_20_fca_row_r4_slot0_part_a
-                                    raw_stream_20_fca_target_offset_r4_slot0_part_a = raw_stream_20_fca_target_row_r4_slot0_part_a * 16 + raw_stream_20_fca_chunk_r4_slot0_part_a * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_20_fca_write_r4_slot0_part_a = pl.reg.store(fca_kv_flat_slot0_part_a, raw_stream_20_fca_target_offset_r4_slot0_part_a, raw_stream_20_fca_scaled_r4_slot0_part_a, raw_stream_20_fca_all_r4_slot0_part_a, block_stride=32)
                     elif 2 * (part + 2) % 3 == 1:
                         raw_current_compressed1_flat_part_a: pl.Tile[[1, 17408], pl.UINT8, pl.MemRef('sparse_raw3', slots=3)[1], pl.Mem.Vec] = pl.tile.create([1, 17408], dtype=pl.UINT8, target_memory=pl.Mem.Vec)
                         raw_current_compressed1_prefix_part_a = pl.tile.slice(raw_current_compressed1_flat_part_a, [1, 10240], [0, 0])
                         raw_current_compressed1_part_a = pl.tile.reshape(raw_current_compressed1_prefix_part_a, [32, COMPRESSED_CACHE_BYTES])
-                        fca_raw_chunk_slot1_part_a = pl.tile.slice(raw_current_compressed1_part_a, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [0, 0])
+                        fca_raw_chunk_slot1_part_a = pl.tile.slice(raw_current_compressed1_part_a, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [0, 0])
                         fca_packed_slot1_part_a = pl.reinterpret_view(fca_raw_chunk_slot1_part_a, pl.FP4E2M1X2)
                         fca_codes_slot1_part_a = fca_packed_slot1_part_a[:, :SPARSE_VF_HALF_DIM]
                         fca_values_slot1_part_a = pl.cast(fca_codes_slot1_part_a, pl.BF16)
-                        fca_scale_words_slot1_part_a = pl.reinterpret_view(fca_raw_chunk_slot1_part_a, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot1_part_a = pl.tile.reshape(fca_scale_words_slot1_part_a, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot1_part_a = pl.tile.reshape(fca_values_slot1_part_a, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fca_scale_words_slot1_part_a = pl.reinterpret_view(fca_raw_chunk_slot1_part_a, pl.UINT16, shape=[SPARSE_VF_FUSED_FP4_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_scale_flat_slot1_part_a = pl.tile.reshape(fca_scale_words_slot1_part_a, [SPARSE_VF_FUSED_FP4_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_value_flat_slot1_part_a = pl.tile.reshape(fca_values_slot1_part_a, [SPARSE_VF_FUSED_FP4_SCALE_TILE * HEAD_DIM])
                         fca_kv_flat_slot1_part_a = pl.tile.reshape(kv_chunk_part_a, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
                         with pl.reg_scope():
                             raw_stream_25_fca_all_r4_slot1_part_a = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_25_fca_row_r4_slot1_part_a in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                            for raw_stream_25_fca_row_r4_slot1_part_a in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_25_fca_chunk_r4_slot1_part_a in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_25_fca_scale_offset_r4_slot1_part_a = raw_stream_25_fca_row_r4_slot1_part_a * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
                                     raw_stream_25_fca_scale_offset_r4_slot1_part_a = raw_stream_25_fca_scale_offset_r4_slot1_part_a + raw_stream_25_fca_chunk_r4_slot1_part_a * SPARSE_VF_COMPRESSED_STEP
@@ -2221,40 +2094,17 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_25_fca_target_row_r4_slot1_part_a = 0 + 0 + raw_stream_25_fca_row_r4_slot1_part_a
                                     raw_stream_25_fca_target_offset_r4_slot1_part_a = raw_stream_25_fca_target_row_r4_slot1_part_a * 16 + raw_stream_25_fca_chunk_r4_slot1_part_a * (32 * SPARSE_VF_REG_TILE)
                                     raw_stream_25_fca_write_r4_slot1_part_a = pl.reg.store(fca_kv_flat_slot1_part_a, raw_stream_25_fca_target_offset_r4_slot1_part_a, raw_stream_25_fca_scaled_r4_slot1_part_a, raw_stream_25_fca_all_r4_slot1_part_a, block_stride=32)
-                        fca_raw_chunk_slot1_part_a = pl.tile.slice(raw_current_compressed1_part_a, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [8, 0])
+                        fca_raw_chunk_slot1_part_a = pl.tile.slice(raw_current_compressed1_part_a, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
                         fca_packed_slot1_part_a = pl.reinterpret_view(fca_raw_chunk_slot1_part_a, pl.FP4E2M1X2)
                         fca_codes_slot1_part_a = fca_packed_slot1_part_a[:, :SPARSE_VF_HALF_DIM]
                         fca_values_slot1_part_a = pl.cast(fca_codes_slot1_part_a, pl.BF16)
-                        fca_scale_words_slot1_part_a = pl.reinterpret_view(fca_raw_chunk_slot1_part_a, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot1_part_a = pl.tile.reshape(fca_scale_words_slot1_part_a, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot1_part_a = pl.tile.reshape(fca_values_slot1_part_a, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fca_kv_flat_slot1_part_a = pl.tile.reshape(kv_chunk_part_a, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
-                        with pl.reg_scope():
-                            raw_stream_26_fca_all_r4_slot1_part_a = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_26_fca_row_r4_slot1_part_a in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
-                                for raw_stream_26_fca_chunk_r4_slot1_part_a in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
-                                    raw_stream_26_fca_scale_offset_r4_slot1_part_a = raw_stream_26_fca_row_r4_slot1_part_a * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_26_fca_scale_offset_r4_slot1_part_a = raw_stream_26_fca_scale_offset_r4_slot1_part_a + raw_stream_26_fca_chunk_r4_slot1_part_a * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_26_fca_groups_r4_slot1_part_a = pl.reg.load(fca_scale_flat_slot1_part_a, raw_stream_26_fca_scale_offset_r4_slot1_part_a, lanes=SPARSE_VF_COMPRESSED_STEP)
-                                    raw_stream_26_fca_factor_bits_r4_slot1_part_a = pl.reg.group_broadcast(raw_stream_26_fca_groups_r4_slot1_part_a, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_26_fca_factor_r4_slot1_part_a = pl.reg.interpret_cast(raw_stream_26_fca_factor_bits_r4_slot1_part_a, dtype=pl.BF16)
-                                    raw_stream_26_fca_value_offset_r4_slot1_part_a = raw_stream_26_fca_row_r4_slot1_part_a * HEAD_DIM + raw_stream_26_fca_chunk_r4_slot1_part_a * SPARSE_VF_REG_TILE
-                                    raw_stream_26_fca_value_r4_slot1_part_a = pl.reg.load(fca_value_flat_slot1_part_a, raw_stream_26_fca_value_offset_r4_slot1_part_a, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_26_fca_scaled_r4_slot1_part_a = pl.reg.mul(raw_stream_26_fca_value_r4_slot1_part_a, raw_stream_26_fca_factor_r4_slot1_part_a, raw_stream_26_fca_all_r4_slot1_part_a)
-                                    raw_stream_26_fca_target_row_r4_slot1_part_a = 0 + 8 + raw_stream_26_fca_row_r4_slot1_part_a
-                                    raw_stream_26_fca_target_offset_r4_slot1_part_a = raw_stream_26_fca_target_row_r4_slot1_part_a * 16 + raw_stream_26_fca_chunk_r4_slot1_part_a * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_26_fca_write_r4_slot1_part_a = pl.reg.store(fca_kv_flat_slot1_part_a, raw_stream_26_fca_target_offset_r4_slot1_part_a, raw_stream_26_fca_scaled_r4_slot1_part_a, raw_stream_26_fca_all_r4_slot1_part_a, block_stride=32)
-                        fca_raw_chunk_slot1_part_a = pl.tile.slice(raw_current_compressed1_part_a, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
-                        fca_packed_slot1_part_a = pl.reinterpret_view(fca_raw_chunk_slot1_part_a, pl.FP4E2M1X2)
-                        fca_codes_slot1_part_a = fca_packed_slot1_part_a[:, :SPARSE_VF_HALF_DIM]
-                        fca_values_slot1_part_a = pl.cast(fca_codes_slot1_part_a, pl.BF16)
-                        fca_scale_words_slot1_part_a = pl.reinterpret_view(fca_raw_chunk_slot1_part_a, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot1_part_a = pl.tile.reshape(fca_scale_words_slot1_part_a, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot1_part_a = pl.tile.reshape(fca_values_slot1_part_a, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fca_scale_words_slot1_part_a = pl.reinterpret_view(fca_raw_chunk_slot1_part_a, pl.UINT16, shape=[SPARSE_VF_FUSED_FP4_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_scale_flat_slot1_part_a = pl.tile.reshape(fca_scale_words_slot1_part_a, [SPARSE_VF_FUSED_FP4_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_value_flat_slot1_part_a = pl.tile.reshape(fca_values_slot1_part_a, [SPARSE_VF_FUSED_FP4_SCALE_TILE * HEAD_DIM])
                         fca_kv_flat_slot1_part_a = pl.tile.reshape(kv_chunk_part_a, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
                         with pl.reg_scope():
                             raw_stream_27_fca_all_r4_slot1_part_a = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_27_fca_row_r4_slot1_part_a in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                            for raw_stream_27_fca_row_r4_slot1_part_a in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_27_fca_chunk_r4_slot1_part_a in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_27_fca_scale_offset_r4_slot1_part_a = raw_stream_27_fca_row_r4_slot1_part_a * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
                                     raw_stream_27_fca_scale_offset_r4_slot1_part_a = raw_stream_27_fca_scale_offset_r4_slot1_part_a + raw_stream_27_fca_chunk_r4_slot1_part_a * SPARSE_VF_COMPRESSED_STEP
@@ -2267,44 +2117,21 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_27_fca_target_row_r4_slot1_part_a = 0 + 16 + raw_stream_27_fca_row_r4_slot1_part_a
                                     raw_stream_27_fca_target_offset_r4_slot1_part_a = raw_stream_27_fca_target_row_r4_slot1_part_a * 16 + raw_stream_27_fca_chunk_r4_slot1_part_a * (32 * SPARSE_VF_REG_TILE)
                                     raw_stream_27_fca_write_r4_slot1_part_a = pl.reg.store(fca_kv_flat_slot1_part_a, raw_stream_27_fca_target_offset_r4_slot1_part_a, raw_stream_27_fca_scaled_r4_slot1_part_a, raw_stream_27_fca_all_r4_slot1_part_a, block_stride=32)
-                        fca_raw_chunk_slot1_part_a = pl.tile.slice(raw_current_compressed1_part_a, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [24, 0])
-                        fca_packed_slot1_part_a = pl.reinterpret_view(fca_raw_chunk_slot1_part_a, pl.FP4E2M1X2)
-                        fca_codes_slot1_part_a = fca_packed_slot1_part_a[:, :SPARSE_VF_HALF_DIM]
-                        fca_values_slot1_part_a = pl.cast(fca_codes_slot1_part_a, pl.BF16)
-                        fca_scale_words_slot1_part_a = pl.reinterpret_view(fca_raw_chunk_slot1_part_a, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot1_part_a = pl.tile.reshape(fca_scale_words_slot1_part_a, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot1_part_a = pl.tile.reshape(fca_values_slot1_part_a, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fca_kv_flat_slot1_part_a = pl.tile.reshape(kv_chunk_part_a, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
-                        with pl.reg_scope():
-                            raw_stream_28_fca_all_r4_slot1_part_a = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_28_fca_row_r4_slot1_part_a in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
-                                for raw_stream_28_fca_chunk_r4_slot1_part_a in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
-                                    raw_stream_28_fca_scale_offset_r4_slot1_part_a = raw_stream_28_fca_row_r4_slot1_part_a * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_28_fca_scale_offset_r4_slot1_part_a = raw_stream_28_fca_scale_offset_r4_slot1_part_a + raw_stream_28_fca_chunk_r4_slot1_part_a * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_28_fca_groups_r4_slot1_part_a = pl.reg.load(fca_scale_flat_slot1_part_a, raw_stream_28_fca_scale_offset_r4_slot1_part_a, lanes=SPARSE_VF_COMPRESSED_STEP)
-                                    raw_stream_28_fca_factor_bits_r4_slot1_part_a = pl.reg.group_broadcast(raw_stream_28_fca_groups_r4_slot1_part_a, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_28_fca_factor_r4_slot1_part_a = pl.reg.interpret_cast(raw_stream_28_fca_factor_bits_r4_slot1_part_a, dtype=pl.BF16)
-                                    raw_stream_28_fca_value_offset_r4_slot1_part_a = raw_stream_28_fca_row_r4_slot1_part_a * HEAD_DIM + raw_stream_28_fca_chunk_r4_slot1_part_a * SPARSE_VF_REG_TILE
-                                    raw_stream_28_fca_value_r4_slot1_part_a = pl.reg.load(fca_value_flat_slot1_part_a, raw_stream_28_fca_value_offset_r4_slot1_part_a, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_28_fca_scaled_r4_slot1_part_a = pl.reg.mul(raw_stream_28_fca_value_r4_slot1_part_a, raw_stream_28_fca_factor_r4_slot1_part_a, raw_stream_28_fca_all_r4_slot1_part_a)
-                                    raw_stream_28_fca_target_row_r4_slot1_part_a = 0 + 24 + raw_stream_28_fca_row_r4_slot1_part_a
-                                    raw_stream_28_fca_target_offset_r4_slot1_part_a = raw_stream_28_fca_target_row_r4_slot1_part_a * 16 + raw_stream_28_fca_chunk_r4_slot1_part_a * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_28_fca_write_r4_slot1_part_a = pl.reg.store(fca_kv_flat_slot1_part_a, raw_stream_28_fca_target_offset_r4_slot1_part_a, raw_stream_28_fca_scaled_r4_slot1_part_a, raw_stream_28_fca_all_r4_slot1_part_a, block_stride=32)
                     else:
                         raw_current_compressed2_flat_part_a: pl.Tile[[1, 17408], pl.UINT8, pl.MemRef('sparse_raw3', slots=3)[2], pl.Mem.Vec] = pl.tile.create([1, 17408], dtype=pl.UINT8, target_memory=pl.Mem.Vec)
                         raw_current_compressed2_prefix_part_a = pl.tile.slice(raw_current_compressed2_flat_part_a, [1, 10240], [0, 0])
                         raw_current_compressed2_part_a = pl.tile.reshape(raw_current_compressed2_prefix_part_a, [32, COMPRESSED_CACHE_BYTES])
-                        fca_raw_chunk_slot2_part_a = pl.tile.slice(raw_current_compressed2_part_a, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [0, 0])
+                        fca_raw_chunk_slot2_part_a = pl.tile.slice(raw_current_compressed2_part_a, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [0, 0])
                         fca_packed_slot2_part_a = pl.reinterpret_view(fca_raw_chunk_slot2_part_a, pl.FP4E2M1X2)
                         fca_codes_slot2_part_a = fca_packed_slot2_part_a[:, :SPARSE_VF_HALF_DIM]
                         fca_values_slot2_part_a = pl.cast(fca_codes_slot2_part_a, pl.BF16)
-                        fca_scale_words_slot2_part_a = pl.reinterpret_view(fca_raw_chunk_slot2_part_a, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot2_part_a = pl.tile.reshape(fca_scale_words_slot2_part_a, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot2_part_a = pl.tile.reshape(fca_values_slot2_part_a, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fca_scale_words_slot2_part_a = pl.reinterpret_view(fca_raw_chunk_slot2_part_a, pl.UINT16, shape=[SPARSE_VF_FUSED_FP4_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_scale_flat_slot2_part_a = pl.tile.reshape(fca_scale_words_slot2_part_a, [SPARSE_VF_FUSED_FP4_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_value_flat_slot2_part_a = pl.tile.reshape(fca_values_slot2_part_a, [SPARSE_VF_FUSED_FP4_SCALE_TILE * HEAD_DIM])
                         fca_kv_flat_slot2_part_a = pl.tile.reshape(kv_chunk_part_a, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
                         with pl.reg_scope():
                             raw_stream_29_fca_all_r4_slot2_part_a = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_29_fca_row_r4_slot2_part_a in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                            for raw_stream_29_fca_row_r4_slot2_part_a in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_29_fca_chunk_r4_slot2_part_a in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_29_fca_scale_offset_r4_slot2_part_a = raw_stream_29_fca_row_r4_slot2_part_a * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
                                     raw_stream_29_fca_scale_offset_r4_slot2_part_a = raw_stream_29_fca_scale_offset_r4_slot2_part_a + raw_stream_29_fca_chunk_r4_slot2_part_a * SPARSE_VF_COMPRESSED_STEP
@@ -2317,40 +2144,17 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_29_fca_target_row_r4_slot2_part_a = 0 + 0 + raw_stream_29_fca_row_r4_slot2_part_a
                                     raw_stream_29_fca_target_offset_r4_slot2_part_a = raw_stream_29_fca_target_row_r4_slot2_part_a * 16 + raw_stream_29_fca_chunk_r4_slot2_part_a * (32 * SPARSE_VF_REG_TILE)
                                     raw_stream_29_fca_write_r4_slot2_part_a = pl.reg.store(fca_kv_flat_slot2_part_a, raw_stream_29_fca_target_offset_r4_slot2_part_a, raw_stream_29_fca_scaled_r4_slot2_part_a, raw_stream_29_fca_all_r4_slot2_part_a, block_stride=32)
-                        fca_raw_chunk_slot2_part_a = pl.tile.slice(raw_current_compressed2_part_a, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [8, 0])
+                        fca_raw_chunk_slot2_part_a = pl.tile.slice(raw_current_compressed2_part_a, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
                         fca_packed_slot2_part_a = pl.reinterpret_view(fca_raw_chunk_slot2_part_a, pl.FP4E2M1X2)
                         fca_codes_slot2_part_a = fca_packed_slot2_part_a[:, :SPARSE_VF_HALF_DIM]
                         fca_values_slot2_part_a = pl.cast(fca_codes_slot2_part_a, pl.BF16)
-                        fca_scale_words_slot2_part_a = pl.reinterpret_view(fca_raw_chunk_slot2_part_a, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot2_part_a = pl.tile.reshape(fca_scale_words_slot2_part_a, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot2_part_a = pl.tile.reshape(fca_values_slot2_part_a, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fca_kv_flat_slot2_part_a = pl.tile.reshape(kv_chunk_part_a, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
-                        with pl.reg_scope():
-                            raw_stream_30_fca_all_r4_slot2_part_a = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_30_fca_row_r4_slot2_part_a in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
-                                for raw_stream_30_fca_chunk_r4_slot2_part_a in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
-                                    raw_stream_30_fca_scale_offset_r4_slot2_part_a = raw_stream_30_fca_row_r4_slot2_part_a * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_30_fca_scale_offset_r4_slot2_part_a = raw_stream_30_fca_scale_offset_r4_slot2_part_a + raw_stream_30_fca_chunk_r4_slot2_part_a * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_30_fca_groups_r4_slot2_part_a = pl.reg.load(fca_scale_flat_slot2_part_a, raw_stream_30_fca_scale_offset_r4_slot2_part_a, lanes=SPARSE_VF_COMPRESSED_STEP)
-                                    raw_stream_30_fca_factor_bits_r4_slot2_part_a = pl.reg.group_broadcast(raw_stream_30_fca_groups_r4_slot2_part_a, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_30_fca_factor_r4_slot2_part_a = pl.reg.interpret_cast(raw_stream_30_fca_factor_bits_r4_slot2_part_a, dtype=pl.BF16)
-                                    raw_stream_30_fca_value_offset_r4_slot2_part_a = raw_stream_30_fca_row_r4_slot2_part_a * HEAD_DIM + raw_stream_30_fca_chunk_r4_slot2_part_a * SPARSE_VF_REG_TILE
-                                    raw_stream_30_fca_value_r4_slot2_part_a = pl.reg.load(fca_value_flat_slot2_part_a, raw_stream_30_fca_value_offset_r4_slot2_part_a, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_30_fca_scaled_r4_slot2_part_a = pl.reg.mul(raw_stream_30_fca_value_r4_slot2_part_a, raw_stream_30_fca_factor_r4_slot2_part_a, raw_stream_30_fca_all_r4_slot2_part_a)
-                                    raw_stream_30_fca_target_row_r4_slot2_part_a = 0 + 8 + raw_stream_30_fca_row_r4_slot2_part_a
-                                    raw_stream_30_fca_target_offset_r4_slot2_part_a = raw_stream_30_fca_target_row_r4_slot2_part_a * 16 + raw_stream_30_fca_chunk_r4_slot2_part_a * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_30_fca_write_r4_slot2_part_a = pl.reg.store(fca_kv_flat_slot2_part_a, raw_stream_30_fca_target_offset_r4_slot2_part_a, raw_stream_30_fca_scaled_r4_slot2_part_a, raw_stream_30_fca_all_r4_slot2_part_a, block_stride=32)
-                        fca_raw_chunk_slot2_part_a = pl.tile.slice(raw_current_compressed2_part_a, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
-                        fca_packed_slot2_part_a = pl.reinterpret_view(fca_raw_chunk_slot2_part_a, pl.FP4E2M1X2)
-                        fca_codes_slot2_part_a = fca_packed_slot2_part_a[:, :SPARSE_VF_HALF_DIM]
-                        fca_values_slot2_part_a = pl.cast(fca_codes_slot2_part_a, pl.BF16)
-                        fca_scale_words_slot2_part_a = pl.reinterpret_view(fca_raw_chunk_slot2_part_a, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot2_part_a = pl.tile.reshape(fca_scale_words_slot2_part_a, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot2_part_a = pl.tile.reshape(fca_values_slot2_part_a, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fca_scale_words_slot2_part_a = pl.reinterpret_view(fca_raw_chunk_slot2_part_a, pl.UINT16, shape=[SPARSE_VF_FUSED_FP4_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_scale_flat_slot2_part_a = pl.tile.reshape(fca_scale_words_slot2_part_a, [SPARSE_VF_FUSED_FP4_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_value_flat_slot2_part_a = pl.tile.reshape(fca_values_slot2_part_a, [SPARSE_VF_FUSED_FP4_SCALE_TILE * HEAD_DIM])
                         fca_kv_flat_slot2_part_a = pl.tile.reshape(kv_chunk_part_a, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
                         with pl.reg_scope():
                             raw_stream_31_fca_all_r4_slot2_part_a = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_31_fca_row_r4_slot2_part_a in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                            for raw_stream_31_fca_row_r4_slot2_part_a in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_31_fca_chunk_r4_slot2_part_a in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_31_fca_scale_offset_r4_slot2_part_a = raw_stream_31_fca_row_r4_slot2_part_a * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
                                     raw_stream_31_fca_scale_offset_r4_slot2_part_a = raw_stream_31_fca_scale_offset_r4_slot2_part_a + raw_stream_31_fca_chunk_r4_slot2_part_a * SPARSE_VF_COMPRESSED_STEP
@@ -2363,29 +2167,6 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_31_fca_target_row_r4_slot2_part_a = 0 + 16 + raw_stream_31_fca_row_r4_slot2_part_a
                                     raw_stream_31_fca_target_offset_r4_slot2_part_a = raw_stream_31_fca_target_row_r4_slot2_part_a * 16 + raw_stream_31_fca_chunk_r4_slot2_part_a * (32 * SPARSE_VF_REG_TILE)
                                     raw_stream_31_fca_write_r4_slot2_part_a = pl.reg.store(fca_kv_flat_slot2_part_a, raw_stream_31_fca_target_offset_r4_slot2_part_a, raw_stream_31_fca_scaled_r4_slot2_part_a, raw_stream_31_fca_all_r4_slot2_part_a, block_stride=32)
-                        fca_raw_chunk_slot2_part_a = pl.tile.slice(raw_current_compressed2_part_a, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [24, 0])
-                        fca_packed_slot2_part_a = pl.reinterpret_view(fca_raw_chunk_slot2_part_a, pl.FP4E2M1X2)
-                        fca_codes_slot2_part_a = fca_packed_slot2_part_a[:, :SPARSE_VF_HALF_DIM]
-                        fca_values_slot2_part_a = pl.cast(fca_codes_slot2_part_a, pl.BF16)
-                        fca_scale_words_slot2_part_a = pl.reinterpret_view(fca_raw_chunk_slot2_part_a, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot2_part_a = pl.tile.reshape(fca_scale_words_slot2_part_a, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot2_part_a = pl.tile.reshape(fca_values_slot2_part_a, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fca_kv_flat_slot2_part_a = pl.tile.reshape(kv_chunk_part_a, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
-                        with pl.reg_scope():
-                            raw_stream_32_fca_all_r4_slot2_part_a = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_32_fca_row_r4_slot2_part_a in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
-                                for raw_stream_32_fca_chunk_r4_slot2_part_a in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
-                                    raw_stream_32_fca_scale_offset_r4_slot2_part_a = raw_stream_32_fca_row_r4_slot2_part_a * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_32_fca_scale_offset_r4_slot2_part_a = raw_stream_32_fca_scale_offset_r4_slot2_part_a + raw_stream_32_fca_chunk_r4_slot2_part_a * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_32_fca_groups_r4_slot2_part_a = pl.reg.load(fca_scale_flat_slot2_part_a, raw_stream_32_fca_scale_offset_r4_slot2_part_a, lanes=SPARSE_VF_COMPRESSED_STEP)
-                                    raw_stream_32_fca_factor_bits_r4_slot2_part_a = pl.reg.group_broadcast(raw_stream_32_fca_groups_r4_slot2_part_a, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_32_fca_factor_r4_slot2_part_a = pl.reg.interpret_cast(raw_stream_32_fca_factor_bits_r4_slot2_part_a, dtype=pl.BF16)
-                                    raw_stream_32_fca_value_offset_r4_slot2_part_a = raw_stream_32_fca_row_r4_slot2_part_a * HEAD_DIM + raw_stream_32_fca_chunk_r4_slot2_part_a * SPARSE_VF_REG_TILE
-                                    raw_stream_32_fca_value_r4_slot2_part_a = pl.reg.load(fca_value_flat_slot2_part_a, raw_stream_32_fca_value_offset_r4_slot2_part_a, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_32_fca_scaled_r4_slot2_part_a = pl.reg.mul(raw_stream_32_fca_value_r4_slot2_part_a, raw_stream_32_fca_factor_r4_slot2_part_a, raw_stream_32_fca_all_r4_slot2_part_a)
-                                    raw_stream_32_fca_target_row_r4_slot2_part_a = 0 + 24 + raw_stream_32_fca_row_r4_slot2_part_a
-                                    raw_stream_32_fca_target_offset_r4_slot2_part_a = raw_stream_32_fca_target_row_r4_slot2_part_a * 16 + raw_stream_32_fca_chunk_r4_slot2_part_a * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_32_fca_write_r4_slot2_part_a = pl.reg.store(fca_kv_flat_slot2_part_a, raw_stream_32_fca_target_offset_r4_slot2_part_a, raw_stream_32_fca_scaled_r4_slot2_part_a, raw_stream_32_fca_all_r4_slot2_part_a, block_stride=32)
                     kv_nz_part_a: pl.Tile[[32, HEAD_DIM], pl.BF16, pl.MemRef('sparse_raw_kv_nz'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.tile.create([32, HEAD_DIM], dtype=pl.BF16, target_memory=pl.Mem.Vec)
                     pl.system.tpush_to_aic(kv_nz_part_a, split=1, id=1)
                     if 2 * (part + 2) + 1 + 2 < parts * 2:
@@ -2398,14 +2179,15 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                             future_part_b_s0_contiguous = pl.cast(0, pl.INT32)
                             future_part_b_s0_all_valid = pl.cast(0, pl.INT32)
                             if future_part_b_s0_first >= 0:
-                                future_part_b_s0_all_valid = pl.cast(1, pl.INT32)
-                                future_part_b_s0_contiguous = pl.cast(1, pl.INT32)
+                                future_part_b_s0_first_wide = pl.cast(future_part_b_s0_first, pl.INT64)
+                                future_part_b_s0_mismatch = pl.cast(0, pl.INT64)
                                 for future_part_b_s0_check in pl.range(1, 32):
                                     future_part_b_s0_index = pl.tile.read(ids_future_part_b_s0, [0, future_part_b_s0_check])
-                                    if future_part_b_s0_index != future_part_b_s0_first + future_part_b_s0_check:
-                                        future_part_b_s0_contiguous = pl.cast(0, pl.INT32)
-                                    if future_part_b_s0_index < 0:
-                                        future_part_b_s0_all_valid = pl.cast(0, pl.INT32)
+                                    future_part_b_s0_expected = future_part_b_s0_first_wide + pl.cast(future_part_b_s0_check, pl.INT64)
+                                    future_part_b_s0_delta = pl.cast(future_part_b_s0_index, pl.INT64) ^ future_part_b_s0_expected
+                                    future_part_b_s0_mismatch = future_part_b_s0_mismatch | future_part_b_s0_delta
+                                future_part_b_s0_contiguous = pl.cast(future_part_b_s0_mismatch == 0, pl.INT32)
+                                future_part_b_s0_all_valid = pl.cast(future_part_b_s0_mismatch >= 0, pl.INT32)
                             if future_part_b_s0_contiguous != 0:
                                 future_part_b_s0_physical = pl.cast(future_part_b_s0_first, pl.INDEX)
                                 raw_future_part_b_s0 = pl.tile.gather_row(raw_future_part_b_s0, compressed_flat, [0, 0], [future_part_b_s0_physical, 0], [32, COMPRESSED_CACHE_BYTES])
@@ -2459,14 +2241,15 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                             future_part_b_s1_contiguous = pl.cast(0, pl.INT32)
                             future_part_b_s1_all_valid = pl.cast(0, pl.INT32)
                             if future_part_b_s1_first >= 0:
-                                future_part_b_s1_all_valid = pl.cast(1, pl.INT32)
-                                future_part_b_s1_contiguous = pl.cast(1, pl.INT32)
+                                future_part_b_s1_first_wide = pl.cast(future_part_b_s1_first, pl.INT64)
+                                future_part_b_s1_mismatch = pl.cast(0, pl.INT64)
                                 for future_part_b_s1_check in pl.range(1, 32):
                                     future_part_b_s1_index = pl.tile.read(ids_future_part_b_s1, [0, future_part_b_s1_check])
-                                    if future_part_b_s1_index != future_part_b_s1_first + future_part_b_s1_check:
-                                        future_part_b_s1_contiguous = pl.cast(0, pl.INT32)
-                                    if future_part_b_s1_index < 0:
-                                        future_part_b_s1_all_valid = pl.cast(0, pl.INT32)
+                                    future_part_b_s1_expected = future_part_b_s1_first_wide + pl.cast(future_part_b_s1_check, pl.INT64)
+                                    future_part_b_s1_delta = pl.cast(future_part_b_s1_index, pl.INT64) ^ future_part_b_s1_expected
+                                    future_part_b_s1_mismatch = future_part_b_s1_mismatch | future_part_b_s1_delta
+                                future_part_b_s1_contiguous = pl.cast(future_part_b_s1_mismatch == 0, pl.INT32)
+                                future_part_b_s1_all_valid = pl.cast(future_part_b_s1_mismatch >= 0, pl.INT32)
                             if future_part_b_s1_contiguous != 0:
                                 future_part_b_s1_physical = pl.cast(future_part_b_s1_first, pl.INDEX)
                                 raw_future_part_b_s1 = pl.tile.gather_row(raw_future_part_b_s1, compressed_flat, [0, 0], [future_part_b_s1_physical, 0], [32, COMPRESSED_CACHE_BYTES])
@@ -2520,14 +2303,15 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                             future_part_b_s2_contiguous = pl.cast(0, pl.INT32)
                             future_part_b_s2_all_valid = pl.cast(0, pl.INT32)
                             if future_part_b_s2_first >= 0:
-                                future_part_b_s2_all_valid = pl.cast(1, pl.INT32)
-                                future_part_b_s2_contiguous = pl.cast(1, pl.INT32)
+                                future_part_b_s2_first_wide = pl.cast(future_part_b_s2_first, pl.INT64)
+                                future_part_b_s2_mismatch = pl.cast(0, pl.INT64)
                                 for future_part_b_s2_check in pl.range(1, 32):
                                     future_part_b_s2_index = pl.tile.read(ids_future_part_b_s2, [0, future_part_b_s2_check])
-                                    if future_part_b_s2_index != future_part_b_s2_first + future_part_b_s2_check:
-                                        future_part_b_s2_contiguous = pl.cast(0, pl.INT32)
-                                    if future_part_b_s2_index < 0:
-                                        future_part_b_s2_all_valid = pl.cast(0, pl.INT32)
+                                    future_part_b_s2_expected = future_part_b_s2_first_wide + pl.cast(future_part_b_s2_check, pl.INT64)
+                                    future_part_b_s2_delta = pl.cast(future_part_b_s2_index, pl.INT64) ^ future_part_b_s2_expected
+                                    future_part_b_s2_mismatch = future_part_b_s2_mismatch | future_part_b_s2_delta
+                                future_part_b_s2_contiguous = pl.cast(future_part_b_s2_mismatch == 0, pl.INT32)
+                                future_part_b_s2_all_valid = pl.cast(future_part_b_s2_mismatch >= 0, pl.INT32)
                             if future_part_b_s2_contiguous != 0:
                                 future_part_b_s2_physical = pl.cast(future_part_b_s2_first, pl.INDEX)
                                 raw_future_part_b_s2 = pl.tile.gather_row(raw_future_part_b_s2, compressed_flat, [0, 0], [future_part_b_s2_physical, 0], [32, COMPRESSED_CACHE_BYTES])
@@ -2577,17 +2361,17 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                         raw_current_compressed0_flat_part_b: pl.Tile[[1, 17408], pl.UINT8, pl.MemRef('sparse_raw3', slots=3)[0], pl.Mem.Vec] = pl.tile.create([1, 17408], dtype=pl.UINT8, target_memory=pl.Mem.Vec)
                         raw_current_compressed0_prefix_part_b = pl.tile.slice(raw_current_compressed0_flat_part_b, [1, 10240], [0, 0])
                         raw_current_compressed0_part_b = pl.tile.reshape(raw_current_compressed0_prefix_part_b, [32, COMPRESSED_CACHE_BYTES])
-                        fca_raw_chunk_slot0_part_b = pl.tile.slice(raw_current_compressed0_part_b, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [0, 0])
+                        fca_raw_chunk_slot0_part_b = pl.tile.slice(raw_current_compressed0_part_b, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [0, 0])
                         fca_packed_slot0_part_b = pl.reinterpret_view(fca_raw_chunk_slot0_part_b, pl.FP4E2M1X2)
                         fca_codes_slot0_part_b = fca_packed_slot0_part_b[:, :SPARSE_VF_HALF_DIM]
                         fca_values_slot0_part_b = pl.cast(fca_codes_slot0_part_b, pl.BF16)
-                        fca_scale_words_slot0_part_b = pl.reinterpret_view(fca_raw_chunk_slot0_part_b, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot0_part_b = pl.tile.reshape(fca_scale_words_slot0_part_b, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot0_part_b = pl.tile.reshape(fca_values_slot0_part_b, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fca_scale_words_slot0_part_b = pl.reinterpret_view(fca_raw_chunk_slot0_part_b, pl.UINT16, shape=[SPARSE_VF_FUSED_FP4_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_scale_flat_slot0_part_b = pl.tile.reshape(fca_scale_words_slot0_part_b, [SPARSE_VF_FUSED_FP4_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_value_flat_slot0_part_b = pl.tile.reshape(fca_values_slot0_part_b, [SPARSE_VF_FUSED_FP4_SCALE_TILE * HEAD_DIM])
                         fca_kv_flat_slot0_part_b = pl.tile.reshape(kv_chunk_part_b, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
                         with pl.reg_scope():
                             raw_stream_21_fca_all_r4_slot0_part_b = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_21_fca_row_r4_slot0_part_b in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                            for raw_stream_21_fca_row_r4_slot0_part_b in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_21_fca_chunk_r4_slot0_part_b in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_21_fca_scale_offset_r4_slot0_part_b = raw_stream_21_fca_row_r4_slot0_part_b * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
                                     raw_stream_21_fca_scale_offset_r4_slot0_part_b = raw_stream_21_fca_scale_offset_r4_slot0_part_b + raw_stream_21_fca_chunk_r4_slot0_part_b * SPARSE_VF_COMPRESSED_STEP
@@ -2600,40 +2384,17 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_21_fca_target_row_r4_slot0_part_b = 0 + 0 + raw_stream_21_fca_row_r4_slot0_part_b
                                     raw_stream_21_fca_target_offset_r4_slot0_part_b = raw_stream_21_fca_target_row_r4_slot0_part_b * 16 + raw_stream_21_fca_chunk_r4_slot0_part_b * (32 * SPARSE_VF_REG_TILE)
                                     raw_stream_21_fca_write_r4_slot0_part_b = pl.reg.store(fca_kv_flat_slot0_part_b, raw_stream_21_fca_target_offset_r4_slot0_part_b, raw_stream_21_fca_scaled_r4_slot0_part_b, raw_stream_21_fca_all_r4_slot0_part_b, block_stride=32)
-                        fca_raw_chunk_slot0_part_b = pl.tile.slice(raw_current_compressed0_part_b, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [8, 0])
+                        fca_raw_chunk_slot0_part_b = pl.tile.slice(raw_current_compressed0_part_b, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
                         fca_packed_slot0_part_b = pl.reinterpret_view(fca_raw_chunk_slot0_part_b, pl.FP4E2M1X2)
                         fca_codes_slot0_part_b = fca_packed_slot0_part_b[:, :SPARSE_VF_HALF_DIM]
                         fca_values_slot0_part_b = pl.cast(fca_codes_slot0_part_b, pl.BF16)
-                        fca_scale_words_slot0_part_b = pl.reinterpret_view(fca_raw_chunk_slot0_part_b, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot0_part_b = pl.tile.reshape(fca_scale_words_slot0_part_b, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot0_part_b = pl.tile.reshape(fca_values_slot0_part_b, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fca_kv_flat_slot0_part_b = pl.tile.reshape(kv_chunk_part_b, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
-                        with pl.reg_scope():
-                            raw_stream_22_fca_all_r4_slot0_part_b = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_22_fca_row_r4_slot0_part_b in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
-                                for raw_stream_22_fca_chunk_r4_slot0_part_b in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
-                                    raw_stream_22_fca_scale_offset_r4_slot0_part_b = raw_stream_22_fca_row_r4_slot0_part_b * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_22_fca_scale_offset_r4_slot0_part_b = raw_stream_22_fca_scale_offset_r4_slot0_part_b + raw_stream_22_fca_chunk_r4_slot0_part_b * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_22_fca_groups_r4_slot0_part_b = pl.reg.load(fca_scale_flat_slot0_part_b, raw_stream_22_fca_scale_offset_r4_slot0_part_b, lanes=SPARSE_VF_COMPRESSED_STEP)
-                                    raw_stream_22_fca_factor_bits_r4_slot0_part_b = pl.reg.group_broadcast(raw_stream_22_fca_groups_r4_slot0_part_b, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_22_fca_factor_r4_slot0_part_b = pl.reg.interpret_cast(raw_stream_22_fca_factor_bits_r4_slot0_part_b, dtype=pl.BF16)
-                                    raw_stream_22_fca_value_offset_r4_slot0_part_b = raw_stream_22_fca_row_r4_slot0_part_b * HEAD_DIM + raw_stream_22_fca_chunk_r4_slot0_part_b * SPARSE_VF_REG_TILE
-                                    raw_stream_22_fca_value_r4_slot0_part_b = pl.reg.load(fca_value_flat_slot0_part_b, raw_stream_22_fca_value_offset_r4_slot0_part_b, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_22_fca_scaled_r4_slot0_part_b = pl.reg.mul(raw_stream_22_fca_value_r4_slot0_part_b, raw_stream_22_fca_factor_r4_slot0_part_b, raw_stream_22_fca_all_r4_slot0_part_b)
-                                    raw_stream_22_fca_target_row_r4_slot0_part_b = 0 + 8 + raw_stream_22_fca_row_r4_slot0_part_b
-                                    raw_stream_22_fca_target_offset_r4_slot0_part_b = raw_stream_22_fca_target_row_r4_slot0_part_b * 16 + raw_stream_22_fca_chunk_r4_slot0_part_b * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_22_fca_write_r4_slot0_part_b = pl.reg.store(fca_kv_flat_slot0_part_b, raw_stream_22_fca_target_offset_r4_slot0_part_b, raw_stream_22_fca_scaled_r4_slot0_part_b, raw_stream_22_fca_all_r4_slot0_part_b, block_stride=32)
-                        fca_raw_chunk_slot0_part_b = pl.tile.slice(raw_current_compressed0_part_b, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
-                        fca_packed_slot0_part_b = pl.reinterpret_view(fca_raw_chunk_slot0_part_b, pl.FP4E2M1X2)
-                        fca_codes_slot0_part_b = fca_packed_slot0_part_b[:, :SPARSE_VF_HALF_DIM]
-                        fca_values_slot0_part_b = pl.cast(fca_codes_slot0_part_b, pl.BF16)
-                        fca_scale_words_slot0_part_b = pl.reinterpret_view(fca_raw_chunk_slot0_part_b, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot0_part_b = pl.tile.reshape(fca_scale_words_slot0_part_b, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot0_part_b = pl.tile.reshape(fca_values_slot0_part_b, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fca_scale_words_slot0_part_b = pl.reinterpret_view(fca_raw_chunk_slot0_part_b, pl.UINT16, shape=[SPARSE_VF_FUSED_FP4_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_scale_flat_slot0_part_b = pl.tile.reshape(fca_scale_words_slot0_part_b, [SPARSE_VF_FUSED_FP4_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_value_flat_slot0_part_b = pl.tile.reshape(fca_values_slot0_part_b, [SPARSE_VF_FUSED_FP4_SCALE_TILE * HEAD_DIM])
                         fca_kv_flat_slot0_part_b = pl.tile.reshape(kv_chunk_part_b, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
                         with pl.reg_scope():
                             raw_stream_23_fca_all_r4_slot0_part_b = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_23_fca_row_r4_slot0_part_b in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                            for raw_stream_23_fca_row_r4_slot0_part_b in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_23_fca_chunk_r4_slot0_part_b in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_23_fca_scale_offset_r4_slot0_part_b = raw_stream_23_fca_row_r4_slot0_part_b * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
                                     raw_stream_23_fca_scale_offset_r4_slot0_part_b = raw_stream_23_fca_scale_offset_r4_slot0_part_b + raw_stream_23_fca_chunk_r4_slot0_part_b * SPARSE_VF_COMPRESSED_STEP
@@ -2646,44 +2407,21 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_23_fca_target_row_r4_slot0_part_b = 0 + 16 + raw_stream_23_fca_row_r4_slot0_part_b
                                     raw_stream_23_fca_target_offset_r4_slot0_part_b = raw_stream_23_fca_target_row_r4_slot0_part_b * 16 + raw_stream_23_fca_chunk_r4_slot0_part_b * (32 * SPARSE_VF_REG_TILE)
                                     raw_stream_23_fca_write_r4_slot0_part_b = pl.reg.store(fca_kv_flat_slot0_part_b, raw_stream_23_fca_target_offset_r4_slot0_part_b, raw_stream_23_fca_scaled_r4_slot0_part_b, raw_stream_23_fca_all_r4_slot0_part_b, block_stride=32)
-                        fca_raw_chunk_slot0_part_b = pl.tile.slice(raw_current_compressed0_part_b, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [24, 0])
-                        fca_packed_slot0_part_b = pl.reinterpret_view(fca_raw_chunk_slot0_part_b, pl.FP4E2M1X2)
-                        fca_codes_slot0_part_b = fca_packed_slot0_part_b[:, :SPARSE_VF_HALF_DIM]
-                        fca_values_slot0_part_b = pl.cast(fca_codes_slot0_part_b, pl.BF16)
-                        fca_scale_words_slot0_part_b = pl.reinterpret_view(fca_raw_chunk_slot0_part_b, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot0_part_b = pl.tile.reshape(fca_scale_words_slot0_part_b, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot0_part_b = pl.tile.reshape(fca_values_slot0_part_b, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fca_kv_flat_slot0_part_b = pl.tile.reshape(kv_chunk_part_b, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
-                        with pl.reg_scope():
-                            raw_stream_24_fca_all_r4_slot0_part_b = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_24_fca_row_r4_slot0_part_b in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
-                                for raw_stream_24_fca_chunk_r4_slot0_part_b in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
-                                    raw_stream_24_fca_scale_offset_r4_slot0_part_b = raw_stream_24_fca_row_r4_slot0_part_b * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_24_fca_scale_offset_r4_slot0_part_b = raw_stream_24_fca_scale_offset_r4_slot0_part_b + raw_stream_24_fca_chunk_r4_slot0_part_b * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_24_fca_groups_r4_slot0_part_b = pl.reg.load(fca_scale_flat_slot0_part_b, raw_stream_24_fca_scale_offset_r4_slot0_part_b, lanes=SPARSE_VF_COMPRESSED_STEP)
-                                    raw_stream_24_fca_factor_bits_r4_slot0_part_b = pl.reg.group_broadcast(raw_stream_24_fca_groups_r4_slot0_part_b, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_24_fca_factor_r4_slot0_part_b = pl.reg.interpret_cast(raw_stream_24_fca_factor_bits_r4_slot0_part_b, dtype=pl.BF16)
-                                    raw_stream_24_fca_value_offset_r4_slot0_part_b = raw_stream_24_fca_row_r4_slot0_part_b * HEAD_DIM + raw_stream_24_fca_chunk_r4_slot0_part_b * SPARSE_VF_REG_TILE
-                                    raw_stream_24_fca_value_r4_slot0_part_b = pl.reg.load(fca_value_flat_slot0_part_b, raw_stream_24_fca_value_offset_r4_slot0_part_b, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_24_fca_scaled_r4_slot0_part_b = pl.reg.mul(raw_stream_24_fca_value_r4_slot0_part_b, raw_stream_24_fca_factor_r4_slot0_part_b, raw_stream_24_fca_all_r4_slot0_part_b)
-                                    raw_stream_24_fca_target_row_r4_slot0_part_b = 0 + 24 + raw_stream_24_fca_row_r4_slot0_part_b
-                                    raw_stream_24_fca_target_offset_r4_slot0_part_b = raw_stream_24_fca_target_row_r4_slot0_part_b * 16 + raw_stream_24_fca_chunk_r4_slot0_part_b * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_24_fca_write_r4_slot0_part_b = pl.reg.store(fca_kv_flat_slot0_part_b, raw_stream_24_fca_target_offset_r4_slot0_part_b, raw_stream_24_fca_scaled_r4_slot0_part_b, raw_stream_24_fca_all_r4_slot0_part_b, block_stride=32)
                     elif (2 * (part + 2) + 1) % 3 == 1:
                         raw_current_compressed1_flat_part_b: pl.Tile[[1, 17408], pl.UINT8, pl.MemRef('sparse_raw3', slots=3)[1], pl.Mem.Vec] = pl.tile.create([1, 17408], dtype=pl.UINT8, target_memory=pl.Mem.Vec)
                         raw_current_compressed1_prefix_part_b = pl.tile.slice(raw_current_compressed1_flat_part_b, [1, 10240], [0, 0])
                         raw_current_compressed1_part_b = pl.tile.reshape(raw_current_compressed1_prefix_part_b, [32, COMPRESSED_CACHE_BYTES])
-                        fca_raw_chunk_slot1_part_b = pl.tile.slice(raw_current_compressed1_part_b, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [0, 0])
+                        fca_raw_chunk_slot1_part_b = pl.tile.slice(raw_current_compressed1_part_b, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [0, 0])
                         fca_packed_slot1_part_b = pl.reinterpret_view(fca_raw_chunk_slot1_part_b, pl.FP4E2M1X2)
                         fca_codes_slot1_part_b = fca_packed_slot1_part_b[:, :SPARSE_VF_HALF_DIM]
                         fca_values_slot1_part_b = pl.cast(fca_codes_slot1_part_b, pl.BF16)
-                        fca_scale_words_slot1_part_b = pl.reinterpret_view(fca_raw_chunk_slot1_part_b, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot1_part_b = pl.tile.reshape(fca_scale_words_slot1_part_b, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot1_part_b = pl.tile.reshape(fca_values_slot1_part_b, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fca_scale_words_slot1_part_b = pl.reinterpret_view(fca_raw_chunk_slot1_part_b, pl.UINT16, shape=[SPARSE_VF_FUSED_FP4_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_scale_flat_slot1_part_b = pl.tile.reshape(fca_scale_words_slot1_part_b, [SPARSE_VF_FUSED_FP4_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_value_flat_slot1_part_b = pl.tile.reshape(fca_values_slot1_part_b, [SPARSE_VF_FUSED_FP4_SCALE_TILE * HEAD_DIM])
                         fca_kv_flat_slot1_part_b = pl.tile.reshape(kv_chunk_part_b, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
                         with pl.reg_scope():
                             raw_stream_33_fca_all_r4_slot1_part_b = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_33_fca_row_r4_slot1_part_b in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                            for raw_stream_33_fca_row_r4_slot1_part_b in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_33_fca_chunk_r4_slot1_part_b in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_33_fca_scale_offset_r4_slot1_part_b = raw_stream_33_fca_row_r4_slot1_part_b * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
                                     raw_stream_33_fca_scale_offset_r4_slot1_part_b = raw_stream_33_fca_scale_offset_r4_slot1_part_b + raw_stream_33_fca_chunk_r4_slot1_part_b * SPARSE_VF_COMPRESSED_STEP
@@ -2696,40 +2434,17 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_33_fca_target_row_r4_slot1_part_b = 0 + 0 + raw_stream_33_fca_row_r4_slot1_part_b
                                     raw_stream_33_fca_target_offset_r4_slot1_part_b = raw_stream_33_fca_target_row_r4_slot1_part_b * 16 + raw_stream_33_fca_chunk_r4_slot1_part_b * (32 * SPARSE_VF_REG_TILE)
                                     raw_stream_33_fca_write_r4_slot1_part_b = pl.reg.store(fca_kv_flat_slot1_part_b, raw_stream_33_fca_target_offset_r4_slot1_part_b, raw_stream_33_fca_scaled_r4_slot1_part_b, raw_stream_33_fca_all_r4_slot1_part_b, block_stride=32)
-                        fca_raw_chunk_slot1_part_b = pl.tile.slice(raw_current_compressed1_part_b, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [8, 0])
+                        fca_raw_chunk_slot1_part_b = pl.tile.slice(raw_current_compressed1_part_b, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
                         fca_packed_slot1_part_b = pl.reinterpret_view(fca_raw_chunk_slot1_part_b, pl.FP4E2M1X2)
                         fca_codes_slot1_part_b = fca_packed_slot1_part_b[:, :SPARSE_VF_HALF_DIM]
                         fca_values_slot1_part_b = pl.cast(fca_codes_slot1_part_b, pl.BF16)
-                        fca_scale_words_slot1_part_b = pl.reinterpret_view(fca_raw_chunk_slot1_part_b, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot1_part_b = pl.tile.reshape(fca_scale_words_slot1_part_b, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot1_part_b = pl.tile.reshape(fca_values_slot1_part_b, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fca_kv_flat_slot1_part_b = pl.tile.reshape(kv_chunk_part_b, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
-                        with pl.reg_scope():
-                            raw_stream_34_fca_all_r4_slot1_part_b = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_34_fca_row_r4_slot1_part_b in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
-                                for raw_stream_34_fca_chunk_r4_slot1_part_b in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
-                                    raw_stream_34_fca_scale_offset_r4_slot1_part_b = raw_stream_34_fca_row_r4_slot1_part_b * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_34_fca_scale_offset_r4_slot1_part_b = raw_stream_34_fca_scale_offset_r4_slot1_part_b + raw_stream_34_fca_chunk_r4_slot1_part_b * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_34_fca_groups_r4_slot1_part_b = pl.reg.load(fca_scale_flat_slot1_part_b, raw_stream_34_fca_scale_offset_r4_slot1_part_b, lanes=SPARSE_VF_COMPRESSED_STEP)
-                                    raw_stream_34_fca_factor_bits_r4_slot1_part_b = pl.reg.group_broadcast(raw_stream_34_fca_groups_r4_slot1_part_b, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_34_fca_factor_r4_slot1_part_b = pl.reg.interpret_cast(raw_stream_34_fca_factor_bits_r4_slot1_part_b, dtype=pl.BF16)
-                                    raw_stream_34_fca_value_offset_r4_slot1_part_b = raw_stream_34_fca_row_r4_slot1_part_b * HEAD_DIM + raw_stream_34_fca_chunk_r4_slot1_part_b * SPARSE_VF_REG_TILE
-                                    raw_stream_34_fca_value_r4_slot1_part_b = pl.reg.load(fca_value_flat_slot1_part_b, raw_stream_34_fca_value_offset_r4_slot1_part_b, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_34_fca_scaled_r4_slot1_part_b = pl.reg.mul(raw_stream_34_fca_value_r4_slot1_part_b, raw_stream_34_fca_factor_r4_slot1_part_b, raw_stream_34_fca_all_r4_slot1_part_b)
-                                    raw_stream_34_fca_target_row_r4_slot1_part_b = 0 + 8 + raw_stream_34_fca_row_r4_slot1_part_b
-                                    raw_stream_34_fca_target_offset_r4_slot1_part_b = raw_stream_34_fca_target_row_r4_slot1_part_b * 16 + raw_stream_34_fca_chunk_r4_slot1_part_b * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_34_fca_write_r4_slot1_part_b = pl.reg.store(fca_kv_flat_slot1_part_b, raw_stream_34_fca_target_offset_r4_slot1_part_b, raw_stream_34_fca_scaled_r4_slot1_part_b, raw_stream_34_fca_all_r4_slot1_part_b, block_stride=32)
-                        fca_raw_chunk_slot1_part_b = pl.tile.slice(raw_current_compressed1_part_b, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
-                        fca_packed_slot1_part_b = pl.reinterpret_view(fca_raw_chunk_slot1_part_b, pl.FP4E2M1X2)
-                        fca_codes_slot1_part_b = fca_packed_slot1_part_b[:, :SPARSE_VF_HALF_DIM]
-                        fca_values_slot1_part_b = pl.cast(fca_codes_slot1_part_b, pl.BF16)
-                        fca_scale_words_slot1_part_b = pl.reinterpret_view(fca_raw_chunk_slot1_part_b, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot1_part_b = pl.tile.reshape(fca_scale_words_slot1_part_b, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot1_part_b = pl.tile.reshape(fca_values_slot1_part_b, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fca_scale_words_slot1_part_b = pl.reinterpret_view(fca_raw_chunk_slot1_part_b, pl.UINT16, shape=[SPARSE_VF_FUSED_FP4_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_scale_flat_slot1_part_b = pl.tile.reshape(fca_scale_words_slot1_part_b, [SPARSE_VF_FUSED_FP4_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_value_flat_slot1_part_b = pl.tile.reshape(fca_values_slot1_part_b, [SPARSE_VF_FUSED_FP4_SCALE_TILE * HEAD_DIM])
                         fca_kv_flat_slot1_part_b = pl.tile.reshape(kv_chunk_part_b, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
                         with pl.reg_scope():
                             raw_stream_35_fca_all_r4_slot1_part_b = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_35_fca_row_r4_slot1_part_b in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                            for raw_stream_35_fca_row_r4_slot1_part_b in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_35_fca_chunk_r4_slot1_part_b in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_35_fca_scale_offset_r4_slot1_part_b = raw_stream_35_fca_row_r4_slot1_part_b * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
                                     raw_stream_35_fca_scale_offset_r4_slot1_part_b = raw_stream_35_fca_scale_offset_r4_slot1_part_b + raw_stream_35_fca_chunk_r4_slot1_part_b * SPARSE_VF_COMPRESSED_STEP
@@ -2742,44 +2457,21 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_35_fca_target_row_r4_slot1_part_b = 0 + 16 + raw_stream_35_fca_row_r4_slot1_part_b
                                     raw_stream_35_fca_target_offset_r4_slot1_part_b = raw_stream_35_fca_target_row_r4_slot1_part_b * 16 + raw_stream_35_fca_chunk_r4_slot1_part_b * (32 * SPARSE_VF_REG_TILE)
                                     raw_stream_35_fca_write_r4_slot1_part_b = pl.reg.store(fca_kv_flat_slot1_part_b, raw_stream_35_fca_target_offset_r4_slot1_part_b, raw_stream_35_fca_scaled_r4_slot1_part_b, raw_stream_35_fca_all_r4_slot1_part_b, block_stride=32)
-                        fca_raw_chunk_slot1_part_b = pl.tile.slice(raw_current_compressed1_part_b, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [24, 0])
-                        fca_packed_slot1_part_b = pl.reinterpret_view(fca_raw_chunk_slot1_part_b, pl.FP4E2M1X2)
-                        fca_codes_slot1_part_b = fca_packed_slot1_part_b[:, :SPARSE_VF_HALF_DIM]
-                        fca_values_slot1_part_b = pl.cast(fca_codes_slot1_part_b, pl.BF16)
-                        fca_scale_words_slot1_part_b = pl.reinterpret_view(fca_raw_chunk_slot1_part_b, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot1_part_b = pl.tile.reshape(fca_scale_words_slot1_part_b, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot1_part_b = pl.tile.reshape(fca_values_slot1_part_b, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fca_kv_flat_slot1_part_b = pl.tile.reshape(kv_chunk_part_b, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
-                        with pl.reg_scope():
-                            raw_stream_36_fca_all_r4_slot1_part_b = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_36_fca_row_r4_slot1_part_b in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
-                                for raw_stream_36_fca_chunk_r4_slot1_part_b in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
-                                    raw_stream_36_fca_scale_offset_r4_slot1_part_b = raw_stream_36_fca_row_r4_slot1_part_b * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_36_fca_scale_offset_r4_slot1_part_b = raw_stream_36_fca_scale_offset_r4_slot1_part_b + raw_stream_36_fca_chunk_r4_slot1_part_b * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_36_fca_groups_r4_slot1_part_b = pl.reg.load(fca_scale_flat_slot1_part_b, raw_stream_36_fca_scale_offset_r4_slot1_part_b, lanes=SPARSE_VF_COMPRESSED_STEP)
-                                    raw_stream_36_fca_factor_bits_r4_slot1_part_b = pl.reg.group_broadcast(raw_stream_36_fca_groups_r4_slot1_part_b, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_36_fca_factor_r4_slot1_part_b = pl.reg.interpret_cast(raw_stream_36_fca_factor_bits_r4_slot1_part_b, dtype=pl.BF16)
-                                    raw_stream_36_fca_value_offset_r4_slot1_part_b = raw_stream_36_fca_row_r4_slot1_part_b * HEAD_DIM + raw_stream_36_fca_chunk_r4_slot1_part_b * SPARSE_VF_REG_TILE
-                                    raw_stream_36_fca_value_r4_slot1_part_b = pl.reg.load(fca_value_flat_slot1_part_b, raw_stream_36_fca_value_offset_r4_slot1_part_b, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_36_fca_scaled_r4_slot1_part_b = pl.reg.mul(raw_stream_36_fca_value_r4_slot1_part_b, raw_stream_36_fca_factor_r4_slot1_part_b, raw_stream_36_fca_all_r4_slot1_part_b)
-                                    raw_stream_36_fca_target_row_r4_slot1_part_b = 0 + 24 + raw_stream_36_fca_row_r4_slot1_part_b
-                                    raw_stream_36_fca_target_offset_r4_slot1_part_b = raw_stream_36_fca_target_row_r4_slot1_part_b * 16 + raw_stream_36_fca_chunk_r4_slot1_part_b * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_36_fca_write_r4_slot1_part_b = pl.reg.store(fca_kv_flat_slot1_part_b, raw_stream_36_fca_target_offset_r4_slot1_part_b, raw_stream_36_fca_scaled_r4_slot1_part_b, raw_stream_36_fca_all_r4_slot1_part_b, block_stride=32)
                     else:
                         raw_current_compressed2_flat_part_b: pl.Tile[[1, 17408], pl.UINT8, pl.MemRef('sparse_raw3', slots=3)[2], pl.Mem.Vec] = pl.tile.create([1, 17408], dtype=pl.UINT8, target_memory=pl.Mem.Vec)
                         raw_current_compressed2_prefix_part_b = pl.tile.slice(raw_current_compressed2_flat_part_b, [1, 10240], [0, 0])
                         raw_current_compressed2_part_b = pl.tile.reshape(raw_current_compressed2_prefix_part_b, [32, COMPRESSED_CACHE_BYTES])
-                        fca_raw_chunk_slot2_part_b = pl.tile.slice(raw_current_compressed2_part_b, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [0, 0])
+                        fca_raw_chunk_slot2_part_b = pl.tile.slice(raw_current_compressed2_part_b, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [0, 0])
                         fca_packed_slot2_part_b = pl.reinterpret_view(fca_raw_chunk_slot2_part_b, pl.FP4E2M1X2)
                         fca_codes_slot2_part_b = fca_packed_slot2_part_b[:, :SPARSE_VF_HALF_DIM]
                         fca_values_slot2_part_b = pl.cast(fca_codes_slot2_part_b, pl.BF16)
-                        fca_scale_words_slot2_part_b = pl.reinterpret_view(fca_raw_chunk_slot2_part_b, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot2_part_b = pl.tile.reshape(fca_scale_words_slot2_part_b, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot2_part_b = pl.tile.reshape(fca_values_slot2_part_b, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fca_scale_words_slot2_part_b = pl.reinterpret_view(fca_raw_chunk_slot2_part_b, pl.UINT16, shape=[SPARSE_VF_FUSED_FP4_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_scale_flat_slot2_part_b = pl.tile.reshape(fca_scale_words_slot2_part_b, [SPARSE_VF_FUSED_FP4_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_value_flat_slot2_part_b = pl.tile.reshape(fca_values_slot2_part_b, [SPARSE_VF_FUSED_FP4_SCALE_TILE * HEAD_DIM])
                         fca_kv_flat_slot2_part_b = pl.tile.reshape(kv_chunk_part_b, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
                         with pl.reg_scope():
                             raw_stream_37_fca_all_r4_slot2_part_b = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_37_fca_row_r4_slot2_part_b in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                            for raw_stream_37_fca_row_r4_slot2_part_b in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_37_fca_chunk_r4_slot2_part_b in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_37_fca_scale_offset_r4_slot2_part_b = raw_stream_37_fca_row_r4_slot2_part_b * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
                                     raw_stream_37_fca_scale_offset_r4_slot2_part_b = raw_stream_37_fca_scale_offset_r4_slot2_part_b + raw_stream_37_fca_chunk_r4_slot2_part_b * SPARSE_VF_COMPRESSED_STEP
@@ -2792,40 +2484,17 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_37_fca_target_row_r4_slot2_part_b = 0 + 0 + raw_stream_37_fca_row_r4_slot2_part_b
                                     raw_stream_37_fca_target_offset_r4_slot2_part_b = raw_stream_37_fca_target_row_r4_slot2_part_b * 16 + raw_stream_37_fca_chunk_r4_slot2_part_b * (32 * SPARSE_VF_REG_TILE)
                                     raw_stream_37_fca_write_r4_slot2_part_b = pl.reg.store(fca_kv_flat_slot2_part_b, raw_stream_37_fca_target_offset_r4_slot2_part_b, raw_stream_37_fca_scaled_r4_slot2_part_b, raw_stream_37_fca_all_r4_slot2_part_b, block_stride=32)
-                        fca_raw_chunk_slot2_part_b = pl.tile.slice(raw_current_compressed2_part_b, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [8, 0])
+                        fca_raw_chunk_slot2_part_b = pl.tile.slice(raw_current_compressed2_part_b, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
                         fca_packed_slot2_part_b = pl.reinterpret_view(fca_raw_chunk_slot2_part_b, pl.FP4E2M1X2)
                         fca_codes_slot2_part_b = fca_packed_slot2_part_b[:, :SPARSE_VF_HALF_DIM]
                         fca_values_slot2_part_b = pl.cast(fca_codes_slot2_part_b, pl.BF16)
-                        fca_scale_words_slot2_part_b = pl.reinterpret_view(fca_raw_chunk_slot2_part_b, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot2_part_b = pl.tile.reshape(fca_scale_words_slot2_part_b, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot2_part_b = pl.tile.reshape(fca_values_slot2_part_b, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fca_kv_flat_slot2_part_b = pl.tile.reshape(kv_chunk_part_b, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
-                        with pl.reg_scope():
-                            raw_stream_38_fca_all_r4_slot2_part_b = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_38_fca_row_r4_slot2_part_b in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
-                                for raw_stream_38_fca_chunk_r4_slot2_part_b in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
-                                    raw_stream_38_fca_scale_offset_r4_slot2_part_b = raw_stream_38_fca_row_r4_slot2_part_b * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_38_fca_scale_offset_r4_slot2_part_b = raw_stream_38_fca_scale_offset_r4_slot2_part_b + raw_stream_38_fca_chunk_r4_slot2_part_b * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_38_fca_groups_r4_slot2_part_b = pl.reg.load(fca_scale_flat_slot2_part_b, raw_stream_38_fca_scale_offset_r4_slot2_part_b, lanes=SPARSE_VF_COMPRESSED_STEP)
-                                    raw_stream_38_fca_factor_bits_r4_slot2_part_b = pl.reg.group_broadcast(raw_stream_38_fca_groups_r4_slot2_part_b, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_38_fca_factor_r4_slot2_part_b = pl.reg.interpret_cast(raw_stream_38_fca_factor_bits_r4_slot2_part_b, dtype=pl.BF16)
-                                    raw_stream_38_fca_value_offset_r4_slot2_part_b = raw_stream_38_fca_row_r4_slot2_part_b * HEAD_DIM + raw_stream_38_fca_chunk_r4_slot2_part_b * SPARSE_VF_REG_TILE
-                                    raw_stream_38_fca_value_r4_slot2_part_b = pl.reg.load(fca_value_flat_slot2_part_b, raw_stream_38_fca_value_offset_r4_slot2_part_b, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_38_fca_scaled_r4_slot2_part_b = pl.reg.mul(raw_stream_38_fca_value_r4_slot2_part_b, raw_stream_38_fca_factor_r4_slot2_part_b, raw_stream_38_fca_all_r4_slot2_part_b)
-                                    raw_stream_38_fca_target_row_r4_slot2_part_b = 0 + 8 + raw_stream_38_fca_row_r4_slot2_part_b
-                                    raw_stream_38_fca_target_offset_r4_slot2_part_b = raw_stream_38_fca_target_row_r4_slot2_part_b * 16 + raw_stream_38_fca_chunk_r4_slot2_part_b * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_38_fca_write_r4_slot2_part_b = pl.reg.store(fca_kv_flat_slot2_part_b, raw_stream_38_fca_target_offset_r4_slot2_part_b, raw_stream_38_fca_scaled_r4_slot2_part_b, raw_stream_38_fca_all_r4_slot2_part_b, block_stride=32)
-                        fca_raw_chunk_slot2_part_b = pl.tile.slice(raw_current_compressed2_part_b, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
-                        fca_packed_slot2_part_b = pl.reinterpret_view(fca_raw_chunk_slot2_part_b, pl.FP4E2M1X2)
-                        fca_codes_slot2_part_b = fca_packed_slot2_part_b[:, :SPARSE_VF_HALF_DIM]
-                        fca_values_slot2_part_b = pl.cast(fca_codes_slot2_part_b, pl.BF16)
-                        fca_scale_words_slot2_part_b = pl.reinterpret_view(fca_raw_chunk_slot2_part_b, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot2_part_b = pl.tile.reshape(fca_scale_words_slot2_part_b, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot2_part_b = pl.tile.reshape(fca_values_slot2_part_b, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fca_scale_words_slot2_part_b = pl.reinterpret_view(fca_raw_chunk_slot2_part_b, pl.UINT16, shape=[SPARSE_VF_FUSED_FP4_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_scale_flat_slot2_part_b = pl.tile.reshape(fca_scale_words_slot2_part_b, [SPARSE_VF_FUSED_FP4_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_value_flat_slot2_part_b = pl.tile.reshape(fca_values_slot2_part_b, [SPARSE_VF_FUSED_FP4_SCALE_TILE * HEAD_DIM])
                         fca_kv_flat_slot2_part_b = pl.tile.reshape(kv_chunk_part_b, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
                         with pl.reg_scope():
                             raw_stream_39_fca_all_r4_slot2_part_b = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_39_fca_row_r4_slot2_part_b in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
+                            for raw_stream_39_fca_row_r4_slot2_part_b in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_39_fca_chunk_r4_slot2_part_b in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_39_fca_scale_offset_r4_slot2_part_b = raw_stream_39_fca_row_r4_slot2_part_b * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
                                     raw_stream_39_fca_scale_offset_r4_slot2_part_b = raw_stream_39_fca_scale_offset_r4_slot2_part_b + raw_stream_39_fca_chunk_r4_slot2_part_b * SPARSE_VF_COMPRESSED_STEP
@@ -2838,29 +2507,6 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_39_fca_target_row_r4_slot2_part_b = 0 + 16 + raw_stream_39_fca_row_r4_slot2_part_b
                                     raw_stream_39_fca_target_offset_r4_slot2_part_b = raw_stream_39_fca_target_row_r4_slot2_part_b * 16 + raw_stream_39_fca_chunk_r4_slot2_part_b * (32 * SPARSE_VF_REG_TILE)
                                     raw_stream_39_fca_write_r4_slot2_part_b = pl.reg.store(fca_kv_flat_slot2_part_b, raw_stream_39_fca_target_offset_r4_slot2_part_b, raw_stream_39_fca_scaled_r4_slot2_part_b, raw_stream_39_fca_all_r4_slot2_part_b, block_stride=32)
-                        fca_raw_chunk_slot2_part_b = pl.tile.slice(raw_current_compressed2_part_b, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [24, 0])
-                        fca_packed_slot2_part_b = pl.reinterpret_view(fca_raw_chunk_slot2_part_b, pl.FP4E2M1X2)
-                        fca_codes_slot2_part_b = fca_packed_slot2_part_b[:, :SPARSE_VF_HALF_DIM]
-                        fca_values_slot2_part_b = pl.cast(fca_codes_slot2_part_b, pl.BF16)
-                        fca_scale_words_slot2_part_b = pl.reinterpret_view(fca_raw_chunk_slot2_part_b, pl.UINT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_scale_flat_slot2_part_b = pl.tile.reshape(fca_scale_words_slot2_part_b, [SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_HALFWORDS])
-                        fca_value_flat_slot2_part_b = pl.tile.reshape(fca_values_slot2_part_b, [SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fca_kv_flat_slot2_part_b = pl.tile.reshape(kv_chunk_part_b, [SPARSE_VF_KEY_TILE // 4 * HEAD_DIM])
-                        with pl.reg_scope():
-                            raw_stream_40_fca_all_r4_slot2_part_b = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
-                            for raw_stream_40_fca_row_r4_slot2_part_b in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
-                                for raw_stream_40_fca_chunk_r4_slot2_part_b in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
-                                    raw_stream_40_fca_scale_offset_r4_slot2_part_b = raw_stream_40_fca_row_r4_slot2_part_b * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_40_fca_scale_offset_r4_slot2_part_b = raw_stream_40_fca_scale_offset_r4_slot2_part_b + raw_stream_40_fca_chunk_r4_slot2_part_b * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_40_fca_groups_r4_slot2_part_b = pl.reg.load(fca_scale_flat_slot2_part_b, raw_stream_40_fca_scale_offset_r4_slot2_part_b, lanes=SPARSE_VF_COMPRESSED_STEP)
-                                    raw_stream_40_fca_factor_bits_r4_slot2_part_b = pl.reg.group_broadcast(raw_stream_40_fca_groups_r4_slot2_part_b, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_40_fca_factor_r4_slot2_part_b = pl.reg.interpret_cast(raw_stream_40_fca_factor_bits_r4_slot2_part_b, dtype=pl.BF16)
-                                    raw_stream_40_fca_value_offset_r4_slot2_part_b = raw_stream_40_fca_row_r4_slot2_part_b * HEAD_DIM + raw_stream_40_fca_chunk_r4_slot2_part_b * SPARSE_VF_REG_TILE
-                                    raw_stream_40_fca_value_r4_slot2_part_b = pl.reg.load(fca_value_flat_slot2_part_b, raw_stream_40_fca_value_offset_r4_slot2_part_b, lanes=SPARSE_VF_REG_TILE)
-                                    raw_stream_40_fca_scaled_r4_slot2_part_b = pl.reg.mul(raw_stream_40_fca_value_r4_slot2_part_b, raw_stream_40_fca_factor_r4_slot2_part_b, raw_stream_40_fca_all_r4_slot2_part_b)
-                                    raw_stream_40_fca_target_row_r4_slot2_part_b = 0 + 24 + raw_stream_40_fca_row_r4_slot2_part_b
-                                    raw_stream_40_fca_target_offset_r4_slot2_part_b = raw_stream_40_fca_target_row_r4_slot2_part_b * 16 + raw_stream_40_fca_chunk_r4_slot2_part_b * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_40_fca_write_r4_slot2_part_b = pl.reg.store(fca_kv_flat_slot2_part_b, raw_stream_40_fca_target_offset_r4_slot2_part_b, raw_stream_40_fca_scaled_r4_slot2_part_b, raw_stream_40_fca_all_r4_slot2_part_b, block_stride=32)
                     kv_nz_part_b: pl.Tile[[32, HEAD_DIM], pl.BF16, pl.MemRef('sparse_raw_kv_nz'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.tile.create([32, HEAD_DIM], dtype=pl.BF16, target_memory=pl.Mem.Vec)
                     pl.system.tpush_to_aic(kv_nz_part_b, split=1, id=1)
                 if part + 3 == parts and block + workers < num_tokens * (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE):
@@ -4473,6 +4119,10 @@ def gather_sparse_attention_pypto(
     compressed_keys: pl.constexpr,
 ):
     """Fuse packed-cache decoding and attention; keep single-part SWA scheduling."""
+    query = query[:num_tokens, :]
+    output = output[:num_tokens, :]
+    window_indices = window_indices[:num_tokens, :]
+    compressed_indices = compressed_indices[:num_tokens, :]
     attended = pl.system.task_invalid()
     if compressed_keys > 0 and LOCAL_H >= 32:
         window_rows = pl.tensor.dim(window, 0) * 128
