@@ -24,8 +24,8 @@ _default_experts = C.FLASH.n_routed_experts // C.EP_SIZE if C.EP_SIZE in (4, 8) 
 _shape_parser.add_argument("--experts-per-rank", type=int, default=_default_experts)
 _shape_parser.add_argument("--weight-bank-size", type=int, default=C.FLASH.num_hidden_layers)
 _shape_options = _shape_parser.parse_known_args()[0]
-if _shape_options.experts_per_rank <= 0 or C.EP_SIZE * _shape_options.experts_per_rank % 16:
-    _shape_parser.error("--experts-per-rank must be positive and give a total expert count aligned to 16")
+if _shape_options.experts_per_rank <= 0 or C.EP_SIZE * _shape_options.experts_per_rank < C.FLASH.num_experts_per_tok:
+    _shape_parser.error("--experts-per-rank must give at least TopK routed experts")
 C.N_LOCAL_EXPERTS = _shape_options.experts_per_rank
 WEIGHT_BANK_SIZE = _shape_options.weight_bank_size
 if WEIGHT_BANK_SIZE not in (1, C.FLASH.num_hidden_layers):
@@ -50,7 +50,7 @@ from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
 from engram import ENGRAM_K, KV_OUT, engram_from_rows
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
 from decode_moe import (
-    moe, SIGNAL_PAD, clear_moe_signals, DISPATCH_PACKET_WIDTH, EP_SIZE, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH,
+    BALANCED_ROUTING, initialize_balanced_routes, moe, SIGNAL_PAD, clear_moe_signals, DISPATCH_PACKET_WIDTH, EP_SIZE, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH,
 )
 
 
@@ -237,6 +237,9 @@ def decode_encoder(
     topk_indices = pl.create_tensor([tokens, INDEX_TOPK], dtype=pl.INT32)
     x_mixed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     local_moe_tokens = pl.read(moe_num_tokens, [rank])
+    force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
+    if BALANCED_ROUTING:
+        initialize_balanced_routes(force_topk, local_moe_tokens, rank, N_LOCAL_EXPERTS, TOPK)
     for layer in pl.range(0, 20):
         if layer == 1 or layer == 14:
             with pl.scope():
@@ -368,7 +371,6 @@ def decode_encoder(
             ffn_shared_w2_scale: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w2_scale, [MOE_INTER // MX_GROUP, D], [weight_layer * (MOE_INTER // MX_GROUP), 0])
             ffn_shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN] = shared_w3[weight_layer]
             ffn_shared_w3_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w3_scale, [D // MX_GROUP, MOE_INTER], [weight_layer * (D // MX_GROUP), 0])
-            force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
             moe(
                 attention_hidden, attention_pre_mix,
                 ffn_hc_fn, ffn_hc_scale, ffn_hc_base,
@@ -500,6 +502,9 @@ def decode_decoder(
     pool_block_counts = pl.create_tensor([tokens], dtype=pl.INT32)
     x_mixed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     local_moe_tokens = pl.read(moe_num_tokens, [rank])
+    force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
+    if BALANCED_ROUTING:
+        initialize_balanced_routes(force_topk, local_moe_tokens, rank, N_LOCAL_EXPERTS, TOPK)
     for layer in pl.range(20, 40):
         with pl.scope():
             weight_layer = layer % WEIGHT_BANK_SIZE
@@ -635,7 +640,6 @@ def decode_decoder(
             ffn_shared_w2_scale: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w2_scale, [MOE_INTER // MX_GROUP, D], [weight_layer * (MOE_INTER // MX_GROUP), 0])
             ffn_shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN] = shared_w3[weight_layer]
             ffn_shared_w3_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w3_scale, [D // MX_GROUP, MOE_INTER], [weight_layer * (D // MX_GROUP), 0])
-            force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
             moe(
                 attention_hidden, attention_pre_mix,
                 ffn_hc_fn, ffn_hc_scale, ffn_hc_base,
@@ -1170,6 +1174,7 @@ if __name__ == "__main__":
     parser.add_argument("--experts-per-rank", type=int, default=N_LOCAL_EXPERTS, help="routed experts on each EP rank")
     parser.add_argument("--weight-bank-size", type=int, default=WEIGHT_BANK_SIZE, choices=[1, N_LAYERS])
     parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(EP_SIZE)))
+    parser.add_argument("--balanced-routing", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--dump-passes", action="store_true")
     parser.add_argument("--enable-scope-stats", action="store_true")

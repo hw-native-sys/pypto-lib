@@ -18,7 +18,9 @@ if __name__ == "__main__":
     import sys
 
     # Select the bounded smoke shapes before decode_fwd reads its import-time options.
-    sys.argv[1:1] = ["--weight-bank-size", "1", "--experts-per-rank", "16"]
+    sys.argv[1:1] = ["--weight-bank-size", "1"]
+    if not any(arg == "--experts-per-rank" or arg.startswith("--experts-per-rank=") for arg in sys.argv[1:]):
+        sys.argv[1:1] = ["--experts-per-rank", "16"]
 
 from config import (
     BLOCK_SIZE,
@@ -250,7 +252,8 @@ def l2_decode_fwd_dspark(
     context_rope_sin: pl.Out[pl.Tensor[[DECODE_BATCH * STATE_OPS_ROWS, STATE_OPS_ROPE_HALF], pl.FP32]],
     query_rope_cos: pl.Out[pl.Tensor[[DECODE_BATCH * STATE_OPS_DSPARK_QUERY_WIDTH, STATE_OPS_ROPE_HALF], pl.FP32]],
     query_rope_sin: pl.Out[pl.Tensor[[DECODE_BATCH * STATE_OPS_DSPARK_QUERY_WIDTH, STATE_OPS_ROPE_HALF], pl.FP32]],
-    draft_main_proj_weight: pl.Tensor[[DRAFT_MAIN_IN, D], pl.BF16],
+    draft_main_proj_weight: pl.Tensor[[DRAFT_MAIN_IN, D], pl.FP8E4M3FN],
+    draft_main_proj_scale: pl.Tensor[[DRAFT_MAIN_IN // DRAFT_MX_GROUP, D], pl.FP8E8M0],
     draft_main_norm_weight: pl.Tensor[[D], pl.BF16],
     zero_prefill_tokens: pl.Tensor[[DRAFT_B_DYN], pl.INT64],
     draft_embedding_weight: pl.Tensor[[DRAFT_VOCAB, D], pl.BF16],
@@ -423,7 +426,7 @@ def l2_decode_fwd_dspark(
     draft_x_hc = pl.create_tensor([DRAFT_MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
     draft_pre_mix = pl.create_tensor([DRAFT_MOE_TOKENS, HC_MULT], dtype=pl.FP32)
     dspark_drafter(
-        target_hidden, draft_main_proj_weight, draft_main_norm_weight, num_sampled,
+        target_hidden, draft_main_proj_weight, draft_main_proj_scale, draft_main_norm_weight, num_sampled,
         last_sampled, zero_prefill_tokens, anchor_ids, first_query_positions,
         draft_table, context_slots, context_rope_cos, context_rope_sin,
         query_rope_cos, query_rope_sin, draft_embedding_weight, draft_hc_attn_fn,
@@ -564,7 +567,8 @@ def l3_decode_fwd_dspark(
     context_rope_sin: pl.Out[pl.Tensor[[EP_SIZE, DECODE_BATCH * STATE_OPS_ROWS, STATE_OPS_ROPE_HALF], pl.FP32]],
     query_rope_cos: pl.Out[pl.Tensor[[EP_SIZE, DECODE_BATCH * STATE_OPS_DSPARK_QUERY_WIDTH, STATE_OPS_ROPE_HALF], pl.FP32]],
     query_rope_sin: pl.Out[pl.Tensor[[EP_SIZE, DECODE_BATCH * STATE_OPS_DSPARK_QUERY_WIDTH, STATE_OPS_ROPE_HALF], pl.FP32]],
-    draft_main_proj_weight: pl.Tensor[[DRAFT_EP_SIZE, DRAFT_MAIN_IN, D], pl.BF16],
+    draft_main_proj_weight: pl.Tensor[[DRAFT_EP_SIZE, DRAFT_MAIN_IN, D], pl.FP8E4M3FN],
+    draft_main_proj_scale: pl.Tensor[[DRAFT_EP_SIZE, DRAFT_MAIN_IN // DRAFT_MX_GROUP, D], pl.FP8E8M0],
     draft_main_norm_weight: pl.Tensor[[DRAFT_EP_SIZE, D], pl.BF16],
     zero_prefill_tokens: pl.Tensor[[DRAFT_EP_SIZE, DRAFT_B_DYN], pl.INT64],
     draft_embedding_weight: pl.Tensor[[DRAFT_EP_SIZE, DRAFT_VOCAB, D], pl.BF16],
@@ -711,7 +715,7 @@ def l3_decode_fwd_dspark(
             last_sampled[rank], anchor_ids[rank], first_query_positions[rank],
             draft_table[rank], draft_cos[rank], draft_sin[rank], context_slots[rank],
             context_rope_cos[rank], context_rope_sin[rank], query_rope_cos[rank], query_rope_sin[rank],
-            draft_main_proj_weight[rank], draft_main_norm_weight[rank], zero_prefill_tokens[rank], draft_embedding_weight[rank],
+            draft_main_proj_weight[rank], draft_main_proj_scale[rank], draft_main_norm_weight[rank], zero_prefill_tokens[rank], draft_embedding_weight[rank],
             draft_hc_attn_fn[rank], draft_hc_attn_scale[rank], draft_hc_attn_base[rank], draft_attn_norm_weight[rank],
             draft_wq_a[rank], draft_wq_a_scale[rank], draft_q_norm_weight[rank], draft_wq_b[rank],
             draft_wq_b_scale[rank], draft_wkv[rank], draft_wkv_scale[rank], draft_kv_norm_weight[rank],
@@ -827,9 +831,10 @@ if __name__ == "__main__":
     parser.add_argument("--ep", type=int, default=EP_SIZE)
     parser.add_argument("--dp", type=int, default=EP_SIZE)
     parser.add_argument("--weight-bank-size", type=int, choices=[1], default=1)
-    parser.add_argument("--experts-per-rank", type=int, choices=[16], default=16)
+    parser.add_argument("--experts-per-rank", type=int, default=target_fwd.N_LOCAL_EXPERTS)
     parser.add_argument("--draft-experts-per-rank", type=int, default=DRAFT_N_LOCAL_EXPERTS)
     parser.add_argument("-d", "--device", default=",".join(map(str, range(EP_SIZE))))
+    parser.add_argument("--balanced-routing", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=range(5))

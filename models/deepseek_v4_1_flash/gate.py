@@ -89,6 +89,7 @@ def _gate_scores_vf(
             one = pl.reg.broadcast(1.0, lanes=64, dtype=pl.FP32)
             for segment in pl.hardware_loop(GATE_M_TILE * GATE_N_TILE // 64):
                 logits = pl.reg.load(raw, segment * 64, lanes=64)
+                logits = pl.reg.select(valid_columns, logits, zero)
                 relu = pl.reg.maximum(logits, zero, full)
                 absolute = pl.reg.abs(logits, full)
                 tail = pl.reg.muls(absolute, -1.0, full)
