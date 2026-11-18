@@ -352,7 +352,7 @@ def q_proj_rope(
 
 
 @pl.jit.inline(auto_scope=False)
-def kv_proj(
+def kv_proj_cpp(
     payload: pl.Tensor,
     scales: pl.Tensor,
     wkv: pl.Tensor,
@@ -774,42 +774,57 @@ def proj_q_b_pypto(
 
 
 @pl.jit.inline(auto_scope=False)
-def proj_kv_pypto(
+def _proj_kv_tile_pypto(
     payload: pl.Tensor,
     weight: pl.Tensor,
     activation_scale: pl.Tensor,
     weight_scale: pl.Tensor,
     output: pl.Tensor,
     rows: pl.Scalar[pl.INDEX],
-    row_start: pl.Scalar[pl.INDEX],
-    worker_limit: pl.constexpr = 32,
+    worker_limit: pl.constexpr,
+    m_tile: pl.constexpr,
+    n_tile: pl.constexpr,
+    k_tile: pl.constexpr,
 ):
-    scale_width = weight.shape[0] // 32
-    for mt in pl.parallel((rows + 79) // 80):
-        scale_begin = mt * 80 * scale_width
-        scale_end = scale_begin + 80 * scale_width
+    """Project each row group using logical MX scale tiles."""
+    nz_weight: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN, pl.NZ] = weight[:, :]
+    scale_backing = pl.tensor.view(weight_scale, [D // 32, HEAD_DIM], layout=pl.ND)
+    b_scales = pl.tensor.view(scale_backing, [D // 32, HEAD_DIM], layout=pl.MX_B_NN)
+    scale_width = D // 32
+    lanes = pl.max(1, worker_limit)
+    for mt in pl.parallel((rows + m_tile - 1) // m_tile):
+        row = mt * m_tile
+        valid_rows = pl.min(m_tile, rows - row)
+        row_output = output[row:row + valid_rows, :HEAD_DIM]
+        scale_begin = mt * m_tile * scale_width
+        scale_end = scale_begin + m_tile * scale_width
         sa = activation_scale[0, scale_begin:scale_end]
-        sa = pl.reshape(sa, [80, scale_width])
-        sa = pl.tensor.view(sa, [80, scale_width], layout=pl.MX_A_ZZ)
-        for worker in pl.spmd(pl.min(worker_limit, 8)):
-            for base in pl.range(0, 8, worker_limit):
-                if base + worker < 8:
-                    row = mt * 80
-                    col = (base + worker) * 64
-                    full_a = pl.load(payload, [row, 0], [80, 5120], target_memory=pl.Mem.Mat)
-                    a0 = pl.tile.slice(full_a, [80, 256], [0, 0])
-                    sa0 = pl.load(sa, [0, 0], [80, 8])
-                    b0 = pl.load(weight, [0, col], [256, 64], target_memory=pl.Mem.Mat)
-                    sb0 = pl.load(weight_scale, [0, col], [8, 64])
+        sa = pl.reshape(sa, [m_tile, scale_width])
+        sa = pl.tensor.view(sa, [m_tile, scale_width], layout=pl.MX_A_ZZ)
+        for worker in pl.spmd(pl.min(lanes, HEAD_DIM // n_tile), name_hint="proj_kv"):
+            for base in pl.range(0, HEAD_DIM // n_tile, lanes):
+                if base + worker < HEAD_DIM // n_tile:
+                    col = (base + worker) * n_tile
+                    if m_tile == 80:
+                        full_a = pl.load(payload, [row, 0], [80, D], target_memory=pl.Mem.Mat)
+                        a0 = pl.tile.slice(full_a, [80, k_tile], [0, 0])
+                    else:
+                        a0 = pl.load(payload, [row, 0], [m_tile, k_tile], target_memory=pl.Mem.Mat)
+                    sa0 = pl.load(sa, [0, 0], [m_tile, k_tile // 32])
+                    b0 = pl.load(nz_weight, [0, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
+                    sb0 = pl.load(b_scales, [0, col], [k_tile // 32, n_tile])
                     acc = pl.matmul_mx(a0, sa0, b0, sb0)
-                    for k in pl.pipeline(256, 5120, 256, stage=2):
-                        av = pl.tile.slice(full_a, [80, 256], [0, k])
-                        sav = pl.load(sa, [0, k // 32], [80, 8])
-                        bv = pl.load(weight, [k, col], [256, 64], target_memory=pl.Mem.Mat)
-                        sbv = pl.load(weight_scale, [k // 32, col], [8, 64])
+                    for k in pl.pipeline(k_tile, D, k_tile, stage=2):
+                        if m_tile == 80:
+                            av = pl.tile.slice(full_a, [80, k_tile], [0, k])
+                        else:
+                            av = pl.load(payload, [row, k], [m_tile, k_tile], target_memory=pl.Mem.Mat)
+                        sav = pl.load(sa, [0, k // 32], [m_tile, k_tile // 32])
+                        bv = pl.load(nz_weight, [k, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
+                        sbv = pl.load(b_scales, [k // 32, col], [k_tile // 32, n_tile])
                         acc = pl.matmul_mx_acc(acc, av, sav, bv, sbv)
-                    valid = pl.set_validshape(acc, pl.min(80, rows - row), 64)
-                    output = pl.store(valid, [row_start + row, col], output)
+                    valid = pl.set_validshape(acc, valid_rows, n_tile)
+                    row_output = pl.store(valid, [0, col], row_output)
     return output
 
 
@@ -860,10 +875,26 @@ def kv_proj_pypto(
     kv_projection: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     worker_limit: pl.constexpr = 32,
+    row_tile: pl.constexpr = 80,
 ):
-    """Project NZ KV weights to BF16 rows in M80 groups."""
-    kv_projection = proj_kv_pypto(payload, wkv, scales, wkv_scale, kv_projection, num_tokens, 0, worker_limit)
+    """Project packed KV weights to BF16 using the M80 or M256 preset.
+
+    Stock PTOAS 0.74 misaddresses logical MX scale slices (hw-native-sys/PTOAS#1763).
+    The model CI pin uses PTOAS 0.72.
+    """
+    if row_tile == 256:
+        kv_projection = _proj_kv_tile_pypto(
+            payload, wkv, scales, wkv_scale, kv_projection, num_tokens, worker_limit, 256, 128, 128,
+        )
+    else:
+        kv_projection = _proj_kv_tile_pypto(
+            payload, wkv, scales, wkv_scale, kv_projection, num_tokens, worker_limit, 80, 64, 256,
+        )
     return kv_projection
+
+
+# Shared model entry. Set to kv_proj_pypto to select the native backend.
+kv_proj = kv_proj_cpp
 
 
 @pl.jit
@@ -891,7 +922,7 @@ def qkv_native(
         qa_worker_limit=NATIVE_VALIDATION_WORKERS, qb_worker_limit=NATIVE_VALIDATION_WORKERS,
     )
     kv_projection = kv_proj_pypto(
-        payload, scales, wkv, wkv_scale, kv_projection, num_tokens, worker_limit=NATIVE_VALIDATION_WORKERS,
+        payload, scales, wkv, wkv_scale, kv_projection, num_tokens, worker_limit=NATIVE_VALIDATION_WORKERS, row_tile=80,
     )
     return query_latent, query, kv_projection
 
@@ -1082,3 +1113,60 @@ def compare_qkv_output(actual, expected, *, inputs, **kwargs):
     passed, detail = compare(actual, expected, inputs=inputs, **kwargs)
     tail_ok = torch.equal(actual[active:], expected[active:])
     return passed and tail_ok, f"{detail}; inactive canary preserved={tail_ok}"
+
+
+def validate_native_kv(active, row_tile, worker_limit, config):
+    """Check a native KV preset against a Torch projection with nonuniform packed scales."""
+    from gemm import golden_gemm_mxfp8_to_fp32_dequantized
+    from golden import ScalarSpec, TensorSpec, run
+    from quant import generate_mxfp8_weight_kn, pack_fp8_nz, pack_mx_a_scale, unpack_mx_b_scale
+
+    @pl.jit
+    def project(
+        payload: pl.Tensor, scales: pl.Tensor,
+        wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN, pl.NZ],
+        wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+        kv_projection: pl.InOut[pl.Tensor], num_tokens: pl.Scalar[pl.INT32],
+    ):
+        return kv_proj_pypto(payload, scales, wkv, wkv_scale, kv_projection, num_tokens, worker_limit, row_tile)
+
+    padded = (active + row_tile - 1) // row_tile * row_tile
+    generator = torch.Generator().manual_seed(17)
+    payload = torch.randn(padded, D, generator=generator).to(torch.float8_e4m3fn)
+    codes = torch.randint(124, 131, (padded, D // 32), generator=generator, dtype=torch.uint8)
+    scales = pack_mx_a_scale(codes).view(torch.float8_e8m0fnu).reshape(1, -1)
+    weight, weight_scale = generate_mxfp8_weight_kn(HEAD_DIM, D, D**-0.5, seed=29)
+    specs = [
+        TensorSpec("payload", list(payload.shape), payload.dtype, init_value=payload),
+        TensorSpec("scales", list(scales.shape), scales.dtype, init_value=scales),
+        TensorSpec("wkv", [D, HEAD_DIM], weight.dtype, init_value=pack_fp8_nz(weight)),
+        TensorSpec("wkv_scale", list(weight_scale.shape), weight_scale.dtype, init_value=weight_scale),
+        TensorSpec("kv_projection", [padded, HEAD_DIM], torch.bfloat16, init_value=13.0),
+        ScalarSpec("num_tokens", torch.int32, active),
+    ]
+
+    def golden_kv(tensors):
+        weight_codes = unpack_mx_b_scale(weight_scale.view(torch.uint8))
+        expected = golden_gemm_mxfp8_to_fp32_dequantized(payload[:active], codes[:active], weight, weight_codes)
+        tensors["kv_projection"][:active].copy_(expected)
+
+    return run(
+        fn=project, specs=specs, golden_fn=golden_kv,
+        compare_fn={"kv_projection": compare_qkv_output}, config=config,
+    )
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Validate the native V4.1 KV projection")
+    parser.add_argument("-p", "--platform", choices=["a5"], default="a5")
+    parser.add_argument("--sim", action="store_true")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    args = parser.parse_args()
+    config = dict(backend_type=args.platform, execution_mode=args.sim, device_id=args.device)
+    for active, row_tile, worker_limit in ((72, 80, 32), (257, 256, 8)):
+        print(f"[KV] active={active}, row_tile={row_tile}, worker_limit={worker_limit}", flush=True)
+        result = validate_native_kv(active, row_tile, worker_limit, config)
+        if not result.passed:
+            raise SystemExit(result.error or 1)
