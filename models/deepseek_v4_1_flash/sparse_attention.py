@@ -16,6 +16,7 @@ import pypto.language as pl
 import torch
 from pypto.runtime import pto_isa_include_dir
 
+from config import CACHE_ROWS_DYN
 from config import (
     FLASH as M, CMP_BLOCKS_DYN, ORI_BLOCKS_DYN, T_DYN, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
@@ -116,13 +117,14 @@ def l2_gather_sparse_attention(
     window_indices: pl.Tensor[[T_DYN, WINDOW_KEYS], pl.INT32],
     window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, CACHE_ROWS_DYN, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
     output: pl.InOut[pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
     start: pl.Scalar[pl.INT32],
     compressed_keys: pl.Scalar[pl.INT32],
 ):
+    compressed.bind_dynamic(1, CACHE_ROWS_DYN)
     if num_tokens > 0:
         q = query[start:start + num_tokens, :]
         wi = window_indices[start:start + num_tokens, :]

@@ -113,6 +113,7 @@ def dspark_metadata(
 ):
     """Build padded query IDs, paged visibility, RoPE rows, and initial HC coefficients."""
     batch = pl.tensor.dim(anchor_ids, 0)
+    table_blocks = pl.tensor.dim(block_tables, 2)
     for _ in pl.spmd(1, name_hint="dspark_metadata"):
         for row in pl.range(MOE_TOKENS):
             pl.write(padded_ids, [row], pl.cast(0, pl.INT64))
@@ -132,7 +133,7 @@ def dspark_metadata(
                 padded_indices[layer : layer + 1, row : row + 1, :] = empty_indices
         for request in pl.range(batch):
             first = pl.read(first_query_positions, [request])
-            if first > 0:
+            if first > 0 and table_blocks > 0:
                 prefix = pl.max(first - DSPARK_WINDOW, 0)
                 visible = first - prefix + DSPARK_QUERY_WIDTH
                 for offset in pl.range(DSPARK_QUERY_WIDTH):
@@ -146,7 +147,7 @@ def dspark_metadata(
                     positions = pl.add(columns, pl.cast(prefix, pl.INT32))
                     indices = pl.full([1, DSPARK_SWA_INDEX_WIDTH], dtype=pl.INT32, value=-1)
                     for page in pl.range(prefix // BLOCK_SIZE, (first + DSPARK_QUERY_WIDTH - 1) // BLOCK_SIZE + 1):
-                        block = pl.read(block_tables, [layer, request, page])
+                        block = pl.read(block_tables, [layer, request, page % table_blocks])
                         lower = pl.cmp(positions, pl.cast(page * BLOCK_SIZE, pl.INT32), cmp_type=5)
                         upper = pl.cmp(positions, pl.cast((page + 1) * BLOCK_SIZE, pl.INT32), cmp_type=2)
                         in_page = pl.mul(lower, upper)
@@ -160,7 +161,8 @@ def dspark_metadata(
                     for offset in pl.range(DSPARK_QUERY_WIDTH):
                         row = request * DSPARK_QUERY_WIDTH + offset
                         position = first + offset
-                        block = pl.read(block_tables, [layer, request, position // BLOCK_SIZE])
+                        page = position // BLOCK_SIZE % table_blocks
+                        block = pl.read(block_tables, [layer, request, page])
                         slot = pl.cast(block * BLOCK_SIZE + position % BLOCK_SIZE, pl.INT64)
                         pl.write(padded_slots, [layer, row], slot)
                         padded_indices[layer : layer + 1, row : row + 1, :] = index_row

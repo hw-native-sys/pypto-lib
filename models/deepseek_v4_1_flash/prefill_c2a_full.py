@@ -16,6 +16,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
 
+from config import CACHE_ROWS_DYN
 from config import (
     FLASH as M, RANKS_DYN, LOCAL_T_DYN, T_DYN, ORI_BLOCKS_DYN, B_DYN, TABLE_DYN, INDEX_BLOCKS_DYN,
     INDEX_CACHE_GROUP, STATE_BLOCKS_DYN, STATE_CAPACITY, Q_START_DYN, CP_SIZE, PREFILL_MAX_TOKENS,
@@ -123,9 +124,9 @@ def prefill_c2a_full(
     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
     state_cache: pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32],
     # Compressed and index caches.
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
-    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
-    index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, CACHE_ROWS_DYN, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, INDEX_DIM // 2], pl.UINT8],
+    index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0],
     index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
     # Outputs.
     kv_hidden: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -307,9 +308,9 @@ def l2_prefill_c2a_full(
     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
     state_cache: pl.InOut[pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     # Compressed and index caches.
-    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
-    index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
-    index_cache_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
+    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, CACHE_ROWS_DYN, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
+    index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, INDEX_DIM // 2], pl.UINT8]],
+    index_cache_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
     index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
     # Outputs.
     kv_hidden: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
@@ -323,7 +324,10 @@ def l2_prefill_c2a_full(
     state_block_table.bind_dynamic(0, B_DYN)
     state_cache.bind_dynamic(0, STATE_BLOCKS_DYN)
     compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
+    compressed_cache.bind_dynamic(1, CACHE_ROWS_DYN)
     index_cache.bind_dynamic(0, INDEX_BLOCKS_DYN)
+    index_cache.bind_dynamic(1, CACHE_ROWS_DYN)
+    index_cache_scale.bind_dynamic(1, CACHE_ROWS_DYN)
     index_block_table.bind_dynamic(1, TABLE_DYN)
     kv_tokenactive = pl.read(kv_token_count, [0])
     prefill_c2a_full(
@@ -407,9 +411,9 @@ def l3_prefill_c2a_full(
     state_block_table: pl.Tensor[[RANKS_DYN, B_DYN, 1], pl.INT32],
     state_cache: pl.InOut[pl.Tensor[[RANKS_DYN, STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     # Compressed and index caches.
-    compressed_cache: pl.InOut[pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
-    index_cache: pl.InOut[pl.Tensor[[RANKS_DYN, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
-    index_cache_scale: pl.InOut[pl.Tensor[[RANKS_DYN, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
+    compressed_cache: pl.InOut[pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, CACHE_ROWS_DYN, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
+    index_cache: pl.InOut[pl.Tensor[[RANKS_DYN, INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, INDEX_DIM // 2], pl.UINT8]],
+    index_cache_scale: pl.InOut[pl.Tensor[[RANKS_DYN, INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
     index_block_table: pl.Tensor[[RANKS_DYN, B_DYN, TABLE_DYN], pl.INT32],
     # Outputs.
     kv_hidden: pl.Out[pl.Tensor[[RANKS_DYN, T_DYN, D], pl.BF16]],
@@ -424,7 +428,10 @@ def l3_prefill_c2a_full(
     state_block_table.bind_dynamic(1, B_DYN)
     state_cache.bind_dynamic(1, STATE_BLOCKS_DYN)
     compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
+    compressed_cache.bind_dynamic(2, CACHE_ROWS_DYN)
     index_cache.bind_dynamic(1, INDEX_BLOCKS_DYN)
+    index_cache.bind_dynamic(2, CACHE_ROWS_DYN)
+    index_cache_scale.bind_dynamic(2, CACHE_ROWS_DYN)
     index_block_table.bind_dynamic(2, TABLE_DYN)
     for rank in pl.range(pld.world_size()):
         rank_wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[rank]
@@ -521,9 +528,9 @@ def prefill_c2a_full_cp(
     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
     state_cache: pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32],
     # Compressed and index caches.
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
-    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
-    index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, CACHE_ROWS_DYN, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, INDEX_DIM // 2], pl.UINT8],
+    index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0],
     index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
     # CP communication and row restoration.
     cp_hidden_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
@@ -729,9 +736,9 @@ def l2_prefill_c2a_full_cp(
     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
     state_cache: pl.InOut[pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     # Compressed and index caches.
-    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
-    index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
-    index_cache_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
+    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, CACHE_ROWS_DYN, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
+    index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, INDEX_DIM // 2], pl.UINT8]],
+    index_cache_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
     index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
     # CP communication and row restoration.
     cp_hidden_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
@@ -752,7 +759,10 @@ def l2_prefill_c2a_full_cp(
     state_block_table.bind_dynamic(0, B_DYN)
     state_cache.bind_dynamic(0, STATE_BLOCKS_DYN)
     compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
+    compressed_cache.bind_dynamic(1, CACHE_ROWS_DYN)
     index_cache.bind_dynamic(0, INDEX_BLOCKS_DYN)
+    index_cache.bind_dynamic(1, CACHE_ROWS_DYN)
+    index_cache_scale.bind_dynamic(1, CACHE_ROWS_DYN)
     index_block_table.bind_dynamic(1, TABLE_DYN)
     q_tokenactive = pl.read(q_token_count, [0])
     kv_tokenactive = pl.read(kv_token_count, [0])
@@ -844,9 +854,9 @@ def l3_prefill_c2a_full_cp(
     state_block_table: pl.Tensor[[RANKS_DYN, B_DYN, 1], pl.INT32],
     state_cache: pl.InOut[pl.Tensor[[RANKS_DYN, STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     # Compressed and index caches.
-    compressed_cache: pl.InOut[pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
-    index_cache: pl.InOut[pl.Tensor[[RANKS_DYN, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
-    index_cache_scale: pl.InOut[pl.Tensor[[RANKS_DYN, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
+    compressed_cache: pl.InOut[pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, CACHE_ROWS_DYN, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
+    index_cache: pl.InOut[pl.Tensor[[RANKS_DYN, INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, INDEX_DIM // 2], pl.UINT8]],
+    index_cache_scale: pl.InOut[pl.Tensor[[RANKS_DYN, INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
     index_block_table: pl.Tensor[[RANKS_DYN, B_DYN, TABLE_DYN], pl.INT32],
     kv_restore_indices: pl.Tensor[[RANKS_DYN, T_DYN], pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
@@ -864,7 +874,10 @@ def l3_prefill_c2a_full_cp(
     state_block_table.bind_dynamic(1, B_DYN)
     state_cache.bind_dynamic(1, STATE_BLOCKS_DYN)
     compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
+    compressed_cache.bind_dynamic(2, CACHE_ROWS_DYN)
     index_cache.bind_dynamic(1, INDEX_BLOCKS_DYN)
+    index_cache.bind_dynamic(2, CACHE_ROWS_DYN)
+    index_cache_scale.bind_dynamic(2, CACHE_ROWS_DYN)
     index_block_table.bind_dynamic(2, TABLE_DYN)
     cp_hidden_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     cp_arrived_buffer = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
@@ -1042,7 +1055,7 @@ def build_c2a_specs(args, entry, *, mode="full"):
     fixture_lengths = [prefill_fixture_lengths(group, tokens) for group in query_lengths]
     window_pages = max(prefill_window_pages(ns, ps) for ns, ps in zip(fixture_lengths, starts))
     max_end = max(p + n for ps, ns in zip(starts, fixture_lengths) for p, n in zip(ps, ns))
-    table_pages = max(1, (max_end // 2 + 127) // 128)
+    table_pages = max(1, (max_end // 2 + 63) // 64)
     requests = max(map(len, query_lengths))
     batch = requests
     compressed_pages = requests * table_pages + 1
@@ -1124,7 +1137,7 @@ def build_c2a_specs(args, entry, *, mode="full"):
                 request_ids = torch.arange(input_requests, dtype=torch.int32)
                 request_ids = torch.repeat_interleave(request_ids, torch.tensor(query_lens))
                 compressed_lengths = (positions + 1) // 2
-                input_table_pages = max(1, (max(p + n for p, n in zip(start_pos, query_lens)) // 2 + 127) // 128)
+                input_table_pages = max(1, (max(p + n for p, n in zip(start_pos, query_lens)) // 2 + 63) // 64)
                 pages = input_requests * input_table_pages + 1
                 table = torch.randperm(pages, generator=generator)[:input_requests * input_table_pages].int()
                 table = table.reshape(input_requests, input_table_pages)
@@ -1134,15 +1147,15 @@ def build_c2a_specs(args, entry, *, mode="full"):
                 compressed_positions = (positions + 1 - 2).clamp_min(0).long()
                 inputs["compressed_rope_cos"] = cos[compressed_positions].masked_fill(~complete[:, None], 1)
                 inputs["compressed_rope_sin"] = sin[compressed_positions].masked_fill(~complete[:, None], 0)
-                inputs["compressed_write_slots"] = paged_slots(positions, request_ids, table, 128, 2, True)
+                inputs["compressed_write_slots"] = paged_slots(positions, request_ids, table, 64, 2, True)
                 inputs["q_request_ids"], inputs["q_compressed_lens"] = request_ids, compressed_lengths
                 inputs["kv_request_ids"], inputs["kv_position_ids"] = request_ids, positions
                 inputs["kv_query_start"] = torch.tensor([0, *torch.tensor(query_lens).cumsum(0).tolist()], dtype=torch.int32)
                 inputs["index_block_table"] = table
-                compressed = torch.randn(pages, 128, 1, M.head_dim, generator=generator).bfloat16()
+                compressed = torch.randn(pages, 64, 1, M.head_dim, generator=generator).bfloat16()
                 payload, scales = quantize_mxfp4_cache(compressed, 16, "bf16")
                 inputs["compressed_cache"] = pack_quantized_cache(payload, scales)
-                index = torch.randn(pages, 128, 1, M.index_head_dim, generator=generator).bfloat16()
+                index = torch.randn(pages, 64, 1, M.index_head_dim, generator=generator).bfloat16()
                 inputs["index_cache"], scales = quantize_mxfp4_cache(index, 32, "e8m0")
                 inputs["index_cache_scale"] = scales.view(torch.float8_e8m0fnu)
                 for weight_name, inn, out in (
@@ -1172,8 +1185,8 @@ def build_c2a_specs(args, entry, *, mode="full"):
                 selected = torch.full((tokens, M.index_topk), -1, dtype=torch.int32)
                 for row, length in enumerate(compressed_lengths.tolist()):
                     logical = torch.arange(length, dtype=torch.int64)[:M.index_topk]
-                    physical_pages = table[int(request_ids[row]), logical // 128]
-                    selected[row, :logical.numel()] = physical_pages * 128 + (logical % 128).int()
+                    physical_pages = table[int(request_ids[row]), logical // 64]
+                    selected[row, :logical.numel()] = physical_pages * 64 + (logical % 64).int()
                 inputs["q_compressed_indices"] = selected
 
                 shapes = {
@@ -1279,9 +1292,9 @@ def build_c2a_specs(args, entry, *, mode="full"):
         TensorSpec("kv_query_start", [ranks, requests + 1], torch.int32),
         TensorSpec("state_block_table", [ranks, requests, 1], torch.int32),
         TensorSpec("state_cache", [ranks, requests + 1, STATE_CAPACITY, STATE_WIDTH], torch.float32),
-        TensorSpec("compressed_cache", [ranks, compressed_pages, 128, 1, COMPRESSED_CACHE_BYTES], torch.uint8),
-        TensorSpec("index_cache", [ranks, compressed_pages, 128, 1, INDEX_DIM // 2], torch.uint8),
-        TensorSpec("index_cache_scale", [ranks, compressed_pages, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], mx),
+        TensorSpec("compressed_cache", [ranks, compressed_pages, 64, 1, COMPRESSED_CACHE_BYTES], torch.uint8),
+        TensorSpec("index_cache", [ranks, compressed_pages, 64, 1, INDEX_DIM // 2], torch.uint8),
+        TensorSpec("index_cache_scale", [ranks, compressed_pages, 64, 1, INDEX_DIM // INDEX_CACHE_GROUP], mx),
         TensorSpec("index_block_table", [ranks, requests, table_pages], torch.int32),
         TensorSpec("kv_restore_indices", [ranks, tokens], torch.int32),
         TensorSpec("kv_hidden", [ranks, tokens, D], bf),
@@ -1373,24 +1386,24 @@ if __name__ == "__main__":
             "compressed_cache": packed_cache_compare(
                 mapped_pool_ratio_allclose(
                     "compressed_write_slots", pool_name="compressed_cache",
-                    mapping_shape=(len(devices), args.tokens), block_size=128, leading_rank_axis=True,
+                    mapping_shape=(len(devices), args.tokens), block_size=64, leading_rank_axis=True,
                     atol=0.0, rtol=0.0, max_error_ratio=0.01,
                 ),
                 mapped_pool_ratio_allclose(
                     "compressed_write_slots", pool_name="compressed_cache scale",
-                    mapping_shape=(len(devices), args.tokens), block_size=128, leading_rank_axis=True,
+                    mapping_shape=(len(devices), args.tokens), block_size=64, leading_rank_axis=True,
                     atol=0.0, rtol=0.0, max_error_ratio=0.01,
                 ),
                 fp4=True,
             ),
             "index_cache": mapped_pool_ratio_allclose(
                 "compressed_write_slots", pool_name="index_cache",
-                mapping_shape=(len(devices), args.tokens), block_size=128, leading_rank_axis=True,
+                mapping_shape=(len(devices), args.tokens), block_size=64, leading_rank_axis=True,
                 atol=0.0, rtol=0.0, max_error_ratio=0.01,
             ),
             "index_cache_scale": mapped_pool_ratio_allclose(
                 "compressed_write_slots", pool_name="index_cache_scale",
-                mapping_shape=(len(devices), args.tokens), block_size=128, leading_rank_axis=True,
+                mapping_shape=(len(devices), args.tokens), block_size=64, leading_rank_axis=True,
                 atol=0.0, rtol=0.0, max_error_ratio=0.0,
             ),
             "state_cache": ratio_allclose(atol=1e-3, rtol=1e-3),

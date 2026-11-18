@@ -18,7 +18,7 @@ import torch
 
 from config import (
     FLASH as M, STATE_CAPACITY, B_DYN, Q_START_DYN, STATE_BLOCKS_DYN, T_DYN, CMP_BLOCKS_DYN,
-    COMPRESSED_CACHE_BYTES,
+    COMPRESSED_CACHE_BYTES, C2A_STORAGE_ROWS,
 )
 from quant import unpack_bf16_nz
 from rmsnorm import golden_rms_norm
@@ -749,7 +749,7 @@ def c2a_compressor_publish(
     cosine: pl.Tensor,
     sine: pl.Tensor,
     slots: pl.Tensor[[T_DYN], pl.INT64],
-    cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    cache: pl.Tensor[[CMP_BLOCKS_DYN, C2A_STORAGE_ROWS, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     partition: pl.constexpr,
 ):
     """Pool spans by request or token partition and publish the latest state slots."""
@@ -800,7 +800,7 @@ def c2a_compressor_publish(
     native_rows = native_blocks * 4
     native_flat = pl.reshape(native_state, [native_rows, STATE_WIDTH])
     cache_blocks = pl.tensor.dim(cache, 0)
-    cache_rows = cache_blocks * 128
+    cache_rows = cache_blocks * C2A_STORAGE_ROWS
     cache_flat = pl.reshape(cache, [cache_rows, COMPRESSED_CACHE_BYTES])
     completed = state_ready
     if partition == "token":
@@ -862,9 +862,9 @@ def c2a_state_feedback_test(
     sine: pl.Tensor[[8, ROPE_DIM // 2], pl.FP32],
     state_cache: pl.InOut[pl.Tensor[[3, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     latent: pl.InOut[pl.Tensor[[8, HEAD_DIM], pl.BF16]],
+    cache: pl.InOut[pl.Tensor[[4, C2A_STORAGE_ROWS, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
 ):
-    """Validate the ring retained after a six-row speculative verification window."""
-    cache = pl.create_tensor([1, 128, 1, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8)
+    """Validate compact page publication and the retained speculative state ring."""
     state_ready = pl.system.task_dummy(deps=[])
     state_table = pl.reshape(state_blocks, [8, 1])
     c2a_compressor_publish(
@@ -872,7 +872,7 @@ def c2a_state_feedback_test(
         state_cache, norm_weight, latent, pl.cast(6, pl.INT32), state_ready,
         cosine, sine, slots, cache, partition="request",
     )
-    return state_cache, latent
+    return state_cache, latent, cache
 
 
 def golden_c1a_compressor(
@@ -950,7 +950,7 @@ if __name__ == "__main__":
     import functools
 
     from golden import TensorSpec, ratio_allclose, run
-    from quant import pack_bf16_nz
+    from quant import pack_bf16_nz, pack_quantized_cache, quantize_mxfp4_cache
 
     parser = argparse.ArgumentParser(description="C2A state feedback after speculative prefix acceptance")
     parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5")
@@ -976,6 +976,14 @@ if __name__ == "__main__":
     state[1, (args.start_position - 1) % STATE_CAPACITY, :HEAD_DIM] = 1.0
     weight = pack_bf16_nz(torch.eye(HEAD_DIM, dtype=torch.bfloat16))
     gate = torch.zeros_like(weight)
+    slots = torch.full((8,), -1, dtype=torch.int64)
+    pages = (3, 1, 0, 2)
+    for token in range(6):
+        position = args.start_position + token
+        if position % 2:
+            logical = position // 2
+            page = pages[logical // C2A_STORAGE_ROWS % len(pages)]
+            slots[token] = page * C2A_STORAGE_ROWS + logical % C2A_STORAGE_ROWS
 
     def golden(values):
         values["latent"].copy_(golden_c2a_compressor(
@@ -983,6 +991,11 @@ if __name__ == "__main__":
             values["request_ids"], values["state_blocks"].unsqueeze(1), values["state_cache"],
             weight, gate, values["norm_weight"],
         )[0])
+        published = values["slots"] >= 0
+        payload, factors = quantize_mxfp4_cache(values["latent"][published], 16, "bf16")
+        packed = pack_quantized_cache(payload, factors)
+        flat = values["cache"].view(-1, COMPRESSED_CACHE_BYTES)
+        flat[values["slots"][published]] = packed
 
     def compare_feedback(actual, expected, *, compare, **kwargs):
         ok, detail = compare(actual, expected, **kwargs)
@@ -1009,12 +1022,13 @@ if __name__ == "__main__":
         TensorSpec("request_ids", [8], torch.int32, init_value=request_ids),
         TensorSpec("query_starts", [16], torch.int32, init_value=query_starts),
         TensorSpec("state_blocks", [8], torch.int32, init_value=state_blocks),
-        TensorSpec("slots", [8], torch.int64, init_value=-1),
+        TensorSpec("slots", [8], torch.int64, init_value=slots),
         TensorSpec("norm_weight", [HEAD_DIM], torch.bfloat16, init_value=1.0),
         TensorSpec("cosine", [8, ROPE_DIM // 2], torch.float32, init_value=1.0),
         TensorSpec("sine", [8, ROPE_DIM // 2], torch.float32, init_value=0.0),
         TensorSpec("state_cache", [3, STATE_CAPACITY, STATE_WIDTH], torch.float32, init_value=state),
         TensorSpec("latent", [8, HEAD_DIM], torch.bfloat16, init_value=0.0),
+        TensorSpec("cache", [4, C2A_STORAGE_ROWS, 1, COMPRESSED_CACHE_BYTES], torch.uint8, init_value=173),
     ]
     result = run(
         fn=c2a_state_feedback_test, specs=specs, golden_fn=golden,
@@ -1023,6 +1037,7 @@ if __name__ == "__main__":
                 compare_feedback, compare=ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
             ),
             "latent": ratio_allclose(atol=1e-3, rtol=1e-3, valid_rows=6, zero_tail=True),
+            "cache": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
         },
         config={"backend_type": "a5", "device_id": args.device,
                 "execution_mode": args.execution_mode or args.platform == "a5sim"},

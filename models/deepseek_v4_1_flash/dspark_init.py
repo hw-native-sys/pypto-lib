@@ -220,8 +220,9 @@ def prepare_prefill_drafter_geometry_rank(
                 pl.write(context_rope_sin, [row, col], sin)
             for layer in pl.range(DSPARK_DRAFT_LAYERS):
                 slot = pl.cast(-1, pl.INT64)
-                if active and position // BLOCK_SIZE < table_blocks:
-                    physical = pl.read(block_tables, [layer, request, position // BLOCK_SIZE])
+                if active and table_blocks > 0:
+                    page = position // BLOCK_SIZE % table_blocks
+                    physical = pl.read(block_tables, [layer, request, page])
                     if physical >= 0:
                         slot = pl.cast(physical * BLOCK_SIZE + position % BLOCK_SIZE, pl.INT64)
                 pl.write(context_slots, [layer, row], slot)

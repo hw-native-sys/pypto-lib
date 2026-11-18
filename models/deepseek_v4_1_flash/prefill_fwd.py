@@ -68,6 +68,7 @@ if not 16 <= CAPACITY <= _MAX_CHUNK_TOKENS or CAPACITY % 16:
 # Keep MoE scratch bounded independently of the current-row capacity.
 C.set_moe_tokens(min((LOCAL_CAPACITY + 15) // 16 * 16, _shape_options.moe_tokens))
 
+from config import CACHE_ROWS_DYN
 from config import (
     FLASH as M, INDEX_CACHE_GROUP, CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, ORI_BLOCKS_DYN, LM_HEAD_TP_SIZE, B_DYN,
     INDEX_POOL_BLOCKS_DYN, PREFILL_MAX_TOKENS, Q_START_DYN, STATE_BLOCKS_DYN, STATE_CAPACITY, MOE_TOKENS,
@@ -100,6 +101,7 @@ DSPARK_MAIN_IN = DSPARK_DRAFT_LAYERS * D
 HC_MULT = M.hc_mult
 VOCAB = M.vocab_size
 PAGES = pl.dynamic("PREFILL_HISTORY_PAGES")
+WINDOW_PAGES = pl.dynamic("PREFILL_WINDOW_PAGES")
 C2A_TABLE_DYN = pl.dynamic("PREFILL_C2A_TABLE")
 C1A_TABLE_DYN = pl.dynamic("PREFILL_C1A_TABLE")
 LOCAL_EXPERTS = C.N_LOCAL_EXPERTS
@@ -129,6 +131,31 @@ Q_LORA = M.q_lora_rank
 TOPK = M.num_experts_per_tok
 
 ROPE_DIM = M.qk_rope_head_dim
+
+
+@pl.jit.inline(auto_scope=False)
+def restore_window_tail(
+    cache: pl.Tensor,
+    source_slots: pl.Tensor,
+    destination_slots: pl.Tensor,
+    ready: pl.Scalar[pl.TASK_ID],
+):
+    """Copy final prefill rows from transient scratch into private window rings."""
+    pages = pl.tensor.dim(cache, 1)
+    rows = pages * 128
+    flat = pl.reshape(cache, [40 * rows, WINDOW_CACHE_BYTES])
+    tokens = pl.tensor.dim(destination_slots, 0)
+    with pl.spmd(32, name_hint="prefill_window_tail", deps=[ready]) as restored:
+        worker = pl.tile.get_block_idx()
+        for work in pl.range(worker, 40 * tokens, 32):
+            layer = work // tokens
+            token = work % tokens
+            destination = pl.read(destination_slots, [token])
+            if destination >= 0:
+                source = pl.read(source_slots, [token])
+                payload = pl.load(flat, [layer * rows + source, 0], [1, WINDOW_CACHE_BYTES])
+                pl.store(payload, [layer * rows + destination, 0], flat)
+    return restored
 
 
 @pl.jit.inline(auto_scope=False)
@@ -162,11 +189,11 @@ def prefill_attention(
     q_compressed_lens: pl.Tensor[[LOCAL_CAPACITY], pl.INT32],
     kv_restore_indices: pl.Tensor[[CAPACITY], pl.INT32],
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, CACHE_ROWS_DYN, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     token_to_req_indices: pl.Tensor[[CAPACITY], pl.INT32],
-    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
+    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, INDEX_DIM // 2], pl.UINT8],
     index_cache_scale: pl.Tensor[
-        [INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0
+        [INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0
     ],
     c2a_index_block_table: pl.Tensor[[B_DYN, C2A_TABLE_DYN], pl.INT32],
     c1a_index_block_table: pl.Tensor[[B_DYN, C1A_TABLE_DYN], pl.INT32],
@@ -303,11 +330,11 @@ def prefill_attention_cp(
     q_compressed_lens: pl.Tensor[[LOCAL_CAPACITY], pl.INT32],
     kv_restore_indices: pl.Tensor[[CAPACITY], pl.INT32],
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, CACHE_ROWS_DYN, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     token_to_req_indices: pl.Tensor[[CAPACITY], pl.INT32],
-    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
+    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, INDEX_DIM // 2], pl.UINT8],
     index_cache_scale: pl.Tensor[
-        [INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0
+        [INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0
     ],
     c2a_index_block_table: pl.Tensor[[B_DYN, C2A_TABLE_DYN], pl.INT32],
     c1a_index_block_table: pl.Tensor[[B_DYN, C1A_TABLE_DYN], pl.INT32],
@@ -485,6 +512,7 @@ def l2_prefill_fwd(
     freqs_cos: pl.Tensor[[2, ROPE_ROWS_DYN, 32], pl.FP32],
     freqs_sin: pl.Tensor[[2, ROPE_ROWS_DYN, 32], pl.FP32],
     window_slots: pl.Tensor[[2, CAPACITY], pl.INT64],
+    window_restore_slots: pl.Tensor[[CAPACITY], pl.INT64],
     window_indices: pl.Tensor[[2, CAPACITY, 128], pl.INT32],
     c2a_compressed_slots: pl.Tensor[[CAPACITY], pl.INT64],
     c1a_compressed_slots: pl.Tensor[[CAPACITY], pl.INT64],
@@ -493,10 +521,10 @@ def l2_prefill_fwd(
     c2a_index_block_table: pl.Tensor[[B_DYN, C2A_TABLE_DYN], pl.INT32],
     c1a_index_block_table: pl.Tensor[[B_DYN, C1A_TABLE_DYN], pl.INT32],
     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[40, PAGES, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
-    compressed_cache: pl.InOut[pl.Tensor[[4, PAGES, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
-    index_cache: pl.InOut[pl.Tensor[[4, PAGES, 128, 1, 64], pl.UINT8]],
-    index_scales: pl.InOut[pl.Tensor[[4, PAGES, 128, 1, 4], pl.FP8E8M0]],
+    window_cache: pl.InOut[pl.Tensor[[40, WINDOW_PAGES, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    compressed_cache: pl.InOut[pl.Tensor[[5, PAGES, 64, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
+    index_cache: pl.InOut[pl.Tensor[[5, PAGES, 64, 1, 64], pl.UINT8]],
+    index_scales: pl.InOut[pl.Tensor[[5, PAGES, 64, 1, 4], pl.FP8E8M0]],
     state_cache: pl.InOut[pl.Tensor[[3, STATE_BLOCKS_DYN, C.STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     final_norm_weight: pl.Tensor[[D], pl.BF16],
     lm_head_weight: pl.Tensor[[D, VOCAB // LM_HEAD_TP_SIZE], pl.BF16, pl.NZ],
@@ -644,6 +672,13 @@ def l2_prefill_fwd(
     local_next_hidden = pl.create_tensor([LOCAL_CAPACITY, HC_MULT, D], dtype=pl.FP32)
     local_next_pre = pl.create_tensor([LOCAL_CAPACITY, HC_MULT], dtype=pl.FP32)
     moe_ready = pl.system.task_dummy(deps=[])
+    history_pages = pl.tensor.dim(compressed_cache, 1)
+    c1a_cache_units = pl.slice(compressed_cache, [2, history_pages, 64, 1, COMPRESSED_CACHE_BYTES], [3, 0, 0, 0, 0])
+    c1a_cache = pl.reshape(c1a_cache_units, [history_pages, 128, 1, COMPRESSED_CACHE_BYTES])
+    c1a_index_units = pl.slice(index_cache, [2, history_pages, 64, 1, 64], [3, 0, 0, 0, 0])
+    c1a_index = pl.reshape(c1a_index_units, [history_pages, 128, 1, 64])
+    c1a_scale_units = pl.slice(index_scales, [2, history_pages, 64, 1, 4], [3, 0, 0, 0, 0])
+    c1a_scale = pl.reshape(c1a_scale_units, [history_pages, 128, 1, 4])
     for layer in pl.range(N_LAYERS):
         stage = layer // 20
         active = pl.read(counts, [stage])
@@ -716,7 +751,7 @@ def l2_prefill_fwd(
                 publisher_ready = prefill_publish_decoder(
                     encoder_normalized, c1a_compressor_wkv, layer_compressor_norm, layer_index_wk, layer_index_norm,
                     rope_cos[1], rope_sin[1], c1a_compressed_slots,
-                    compressed_cache[3], index_cache[3], index_scales[3],
+                    c1a_cache, c1a_index, c1a_scale,
                     pl.read(counts, [0]),
                 )
                 gathered_hidden = pl.reshape(hidden, [CAPACITY, HC_DIM])
@@ -756,22 +791,40 @@ def l2_prefill_fwd(
                 if (layer - 2) % 6 == 0:
                     mode = 1
             state_slot = pl.min(cache_slot, 2)
-            prefill_attention_entry(
-                local_hidden, local_pre, layer_attn_fn, layer_attn_scale, layer_attn_base, layer_attn_norm,
-                layer_wq_a, layer_wq_a_scale, layer_q_norm, layer_wq_b, layer_wq_b_scale,
-                layer_wkv, layer_wkv_scale, layer_kv_norm, layer_attn_sink,
-                layer_wo_a, layer_wo_a_scale, layer_wo_b, layer_wo_b_scale,
-                rope_cos[rope_slot], rope_sin[rope_slot], window_slots[stage], q_window_indices[stage],
-                q_rope_cos[rope_slot], q_rope_sin[rope_slot], q_request_ids[stage], q_compressed_lens[stage],
-                restore_indices[stage], window_cache[layer], compressed_cache[cache_slot], token_to_req_indices[stage],
-                index_cache[cache_slot], index_scales[cache_slot], c2a_index_block_table, c1a_index_block_table,
-                position_ids[stage], compressed_cos, compressed_sin, layer_compressor_wkv, layer_compressor_wgate,
-                query_start_loc[stage], state_block_table, state_cache[state_slot], layer_compressor_norm,
-                c2a_compressed_slots, layer_index_wk, layer_index_norm, layer_index_wq_b, layer_index_wq_b_scale,
-                layer_index_weights, pool_block_ids, pool_block_counts, topk_indices, attention_window, attention_arrived,
-                normalized, attn_hidden, attn_pre, local_active,
-                rank // CP_SIZE * CP_SIZE, rank % CP_SIZE, active, layer + 1, mode,
-            )
+            if layer >= 20:
+                prefill_attention_entry(
+                    local_hidden, local_pre, layer_attn_fn, layer_attn_scale, layer_attn_base, layer_attn_norm,
+                    layer_wq_a, layer_wq_a_scale, layer_q_norm, layer_wq_b, layer_wq_b_scale,
+                    layer_wkv, layer_wkv_scale, layer_kv_norm, layer_attn_sink,
+                    layer_wo_a, layer_wo_a_scale, layer_wo_b, layer_wo_b_scale,
+                    rope_cos[rope_slot], rope_sin[rope_slot], window_slots[stage], q_window_indices[stage],
+                    q_rope_cos[rope_slot], q_rope_sin[rope_slot], q_request_ids[stage], q_compressed_lens[stage],
+                    restore_indices[stage], window_cache[layer], c1a_cache, token_to_req_indices[stage],
+                    c1a_index, c1a_scale, c2a_index_block_table, c1a_index_block_table,
+                    position_ids[stage], compressed_cos, compressed_sin, layer_compressor_wkv, layer_compressor_wgate,
+                    query_start_loc[stage], state_block_table, state_cache[state_slot], layer_compressor_norm,
+                    c2a_compressed_slots, layer_index_wk, layer_index_norm, layer_index_wq_b, layer_index_wq_b_scale,
+                    layer_index_weights, pool_block_ids, pool_block_counts, topk_indices, attention_window, attention_arrived,
+                    normalized, attn_hidden, attn_pre, local_active,
+                    rank // CP_SIZE * CP_SIZE, rank % CP_SIZE, active, layer + 1, mode,
+                )
+            else:
+                prefill_attention_entry(
+                    local_hidden, local_pre, layer_attn_fn, layer_attn_scale, layer_attn_base, layer_attn_norm,
+                    layer_wq_a, layer_wq_a_scale, layer_q_norm, layer_wq_b, layer_wq_b_scale,
+                    layer_wkv, layer_wkv_scale, layer_kv_norm, layer_attn_sink,
+                    layer_wo_a, layer_wo_a_scale, layer_wo_b, layer_wo_b_scale,
+                    rope_cos[rope_slot], rope_sin[rope_slot], window_slots[stage], q_window_indices[stage],
+                    q_rope_cos[rope_slot], q_rope_sin[rope_slot], q_request_ids[stage], q_compressed_lens[stage],
+                    restore_indices[stage], window_cache[layer], compressed_cache[cache_slot], token_to_req_indices[stage],
+                    index_cache[cache_slot], index_scales[cache_slot], c2a_index_block_table, c1a_index_block_table,
+                    position_ids[stage], compressed_cos, compressed_sin, layer_compressor_wkv, layer_compressor_wgate,
+                    query_start_loc[stage], state_block_table, state_cache[state_slot], layer_compressor_norm,
+                    c2a_compressed_slots, layer_index_wk, layer_index_norm, layer_index_wq_b, layer_index_wq_b_scale,
+                    layer_index_weights, pool_block_ids, pool_block_counts, topk_indices, attention_window, attention_arrived,
+                    normalized, attn_hidden, attn_pre, local_active,
+                    rank // CP_SIZE * CP_SIZE, rank % CP_SIZE, active, layer + 1, mode,
+                )
         moe_ready = prefill_moe_slabs(
             attn_hidden, attn_pre, layer_ffn_fn, layer_ffn_scale, layer_ffn_base, layer_ffn_norm, layer_gate_weight, layer_gate_bias,
             layer_routed_w1, layer_routed_w1_scale, layer_routed_w2, layer_routed_w2_scale, layer_routed_w3, layer_routed_w3_scale,
@@ -812,6 +865,7 @@ def l2_prefill_fwd(
                     else:
                         target_bf16 = pl.full([1, D], dtype=pl.BF16, value=0.0)
                     dspark_target_hidden[token : token + 1, target_column : target_column + D] = target_bf16
+    window_ready = restore_window_tail(window_cache, window_slots[0], window_restore_slots, moe_ready)
     final_hidden = pl.slice(hidden_pair, [CAPACITY, HC_MULT, D], [FINAL_SLOT, 0, 0])
     final_pre = pl.slice(pre_pair, [CAPACITY, HC_MULT], [FINAL_SLOT, 0])
     source_hidden = pl.reshape(final_hidden, [CAPACITY, HC_DIM])
@@ -905,6 +959,7 @@ def l3_prefill_fwd(
     freqs_cos: pl.Tensor[[RANKS, 2, ROPE_ROWS_DYN, 32], pl.FP32],
     freqs_sin: pl.Tensor[[RANKS, 2, ROPE_ROWS_DYN, 32], pl.FP32],
     window_slots: pl.Tensor[[RANKS, 2, CAPACITY], pl.INT64],
+    window_restore_slots: pl.Tensor[[RANKS, CAPACITY], pl.INT64],
     window_indices: pl.Tensor[[RANKS, 2, CAPACITY, 128], pl.INT32],
     c2a_compressed_slots: pl.Tensor[[RANKS, CAPACITY], pl.INT64],
     c1a_compressed_slots: pl.Tensor[[RANKS, CAPACITY], pl.INT64],
@@ -913,10 +968,10 @@ def l3_prefill_fwd(
     c2a_index_block_table: pl.Tensor[[RANKS, B_DYN, C2A_TABLE_DYN], pl.INT32],
     c1a_index_block_table: pl.Tensor[[RANKS, B_DYN, C1A_TABLE_DYN], pl.INT32],
     state_block_table: pl.Tensor[[RANKS, B_DYN, 1], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[RANKS, 40, PAGES, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
-    compressed_cache: pl.InOut[pl.Tensor[[RANKS, 4, PAGES, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
-    index_cache: pl.InOut[pl.Tensor[[RANKS, 4, PAGES, 128, 1, 64], pl.UINT8]],
-    index_scales: pl.InOut[pl.Tensor[[RANKS, 4, PAGES, 128, 1, 4], pl.FP8E8M0]],
+    window_cache: pl.InOut[pl.Tensor[[RANKS, 40, WINDOW_PAGES, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    compressed_cache: pl.InOut[pl.Tensor[[RANKS, 5, PAGES, 64, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
+    index_cache: pl.InOut[pl.Tensor[[RANKS, 5, PAGES, 64, 1, 64], pl.UINT8]],
+    index_scales: pl.InOut[pl.Tensor[[RANKS, 5, PAGES, 64, 1, 4], pl.FP8E8M0]],
     state_cache: pl.InOut[pl.Tensor[[RANKS, 3, STATE_BLOCKS_DYN, C.STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     final_norm_weight: pl.Tensor[[RANKS, D], pl.BF16],
     lm_head_weight: pl.Tensor[[RANKS, D, VOCAB // LM_HEAD_TP_SIZE], pl.BF16],
@@ -944,8 +999,9 @@ def l3_prefill_fwd(
     encoder, decoder. Each stage has packed query_start_loc and absolute
     position_ids; token_to_req_indices indexes request-table rows.
     C2A/C1A index_block_table arguments have independent widths and source-local
-    physical page IDs. KV and index keys share their family's mapping. Pages
-    contain 128 stored rows: 256 original tokens for C2A, 128 for C1A/SWA.
+    physical page IDs. KV and index keys share their family's mapping. C2A pages
+    contain 64 stored rows covering 128 original tokens; C1A and SWA pages
+    contain 128 stored rows covering 128 original tokens.
     Visible lengths are derived once as floor((position+1)/ratio), including
     completed current groups: C2A follows encoder rows and C1A decoder replay rows.
     freqs_cos/sin are resident full FP32 half-width tables with profile order
@@ -1050,6 +1106,7 @@ def l3_prefill_fwd(
             position_ids[rank],
             freqs_cos[rank], freqs_sin[rank],
             window_slots[rank],
+            window_restore_slots[rank],
             window_indices[rank],
             c2a_compressed_slots[rank],
             c1a_compressed_slots[rank],
@@ -1112,6 +1169,7 @@ PREFILL_TENSORS = (
     "position_ids",
     "freqs_cos", "freqs_sin",
     "window_slots",
+    "window_restore_slots",
     "window_indices",
     "c2a_compressed_slots",
     "c1a_compressed_slots",
@@ -1532,7 +1590,7 @@ def prepare_prefill_inputs(
     pages = request_capacity * data_pages + 1
     table = torch.arange(request_capacity * data_pages, dtype=torch.int32).reshape(request_capacity, data_pages)
     table[batch:] = -1
-    c2a_pages = max(1, (max_seq_len // 2 + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE)
+    c2a_pages = data_pages
     c2a_table = torch.arange(request_capacity * c2a_pages, dtype=torch.int32).reshape(request_capacity, c2a_pages)
     c2a_table[batch:] = -1
     compressed_tables = {
@@ -1552,7 +1610,7 @@ def prepare_prefill_inputs(
     request_ids = torch.repeat_interleave(torch.arange(batch, dtype=torch.int32), torch.tensor(lengths))
     positions = torch.cat([torch.arange(p, p + n, dtype=torch.int32) for p, n in zip(starts, lengths)])
     window_slots, window_indices, _ = window_metadata(positions, request_ids, table)
-    c2a_slots = paged_slots(positions, request_ids, c2a_table, C.BLOCK_SIZE, 2, True)
+    c2a_slots = paged_slots(positions, request_ids, c2a_table, 64, 2, True)
     c1a_slots = paged_slots(positions, request_ids, table)
     freqs_cos, freqs_sin = prepare_forward_rope_tables(max_seq_len, rope_tables)
 
@@ -1568,7 +1626,7 @@ def prepare_prefill_inputs(
         if length:
             logit_rows[request] = query_starts[request + 1] - 1
     window_shape = (M.num_hidden_layers, pages, C.BLOCK_SIZE, 1)
-    source_shape = (len(M.kv_source_layer_ids), pages, C.BLOCK_SIZE, 1)
+    source_shape = (5, pages, 64, 1)
 
     def native_cache(name, shape, dtype, fill=0):
         if cache_state is not None:
@@ -1600,6 +1658,7 @@ def prepare_prefill_inputs(
         "freqs_cos": freqs_cos,
         "freqs_sin": freqs_sin,
         "window_slots": pad(window_slots, -1).repeat(2, 1),
+        "window_restore_slots": torch.full((capacity,), -1, dtype=torch.int64),
         "window_indices": pad(window_indices, -1).repeat(2, 1, 1),
         "c2a_compressed_slots": pad(c2a_slots, -1),
         "c1a_compressed_slots": pad(c1a_slots, -1),
@@ -2083,8 +2142,9 @@ def validate_prefill_caches(
         value = cache_state[name]
         if value.ndim not in (5, 6) or not value.is_contiguous():
             raise ValueError(f"{name} must preserve the contiguous native source/page layout")
-        sources = M.num_hidden_layers if name.startswith("window") else len(M.kv_source_layer_ids)
-        if value.shape[-5] != sources or value.shape[-4] < 1 or tuple(value.shape[-3:-1]) != (C.BLOCK_SIZE, 1):
+        sources = M.num_hidden_layers if name.startswith("window") else 5
+        rows = C.BLOCK_SIZE if name.startswith("window") else 64
+        if value.shape[-5] != sources or value.shape[-4] < 1 or tuple(value.shape[-3:-1]) != (rows, 1):
             raise ValueError(f"{name} has an incompatible source or page geometry")
         expected_dtype = {
             "window_cache": torch.uint8,
@@ -2101,10 +2161,14 @@ def validate_prefill_caches(
         if value.shape[-1] != expected_width:
             raise ValueError(f"{name} has an incompatible native row width")
         reference = cache_state["window_cache"]
-        if value.shape[:-5] != reference.shape[:-5] or value.shape[-4] != reference.shape[-4]:
-            raise ValueError("all prefill cache pools must preserve the same rank and page extents")
+        if value.shape[:-5] != reference.shape[:-5]:
+            raise ValueError("all prefill cache pools must preserve the same rank extents")
         if value.device != reference.device:
             raise ValueError("all cache payloads and scales must reside on the same device")
+    history_pages = cache_state["compressed_cache"].shape[-4]
+    for name in ("index_cache", "index_scales"):
+        if cache_state[name].shape[-4] != history_pages:
+            raise ValueError(f"{name} must share the compressed-cache page extent")
     state = cache_state["state_cache"]
     if state.ndim not in (4, 5) or not state.is_contiguous():
         raise ValueError("state_cache must preserve its contiguous source/request layout")
@@ -2124,7 +2188,7 @@ def validate_prefill_caches(
     requests = window_block_table.shape[0]
     if requests < 1 or (CP_SIZE > 1 and requests != 1):
         raise ValueError("prefill requires positive request capacity and one request per DP when CP > 1")
-    pages = cache_state["window_cache"].shape[1]
+    pages = cache_state["compressed_cache"].shape[1]
     state_blocks = cache_state["state_cache"].shape[1]
 
     def validate_table(name, table, capacity, state=False):
@@ -2139,7 +2203,7 @@ def validate_prefill_caches(
             if allocated.unique().numel() != allocated.numel():
                 raise ValueError("live requests must own distinct state blocks")
 
-    validate_table("window block table", window_block_table, pages)
+    validate_table("window block table", window_block_table, cache_state["window_cache"].shape[-4])
     family_tables = {}
     shared_state = None
     for source in M.kv_source_layer_ids:

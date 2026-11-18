@@ -32,6 +32,7 @@ if WEIGHT_BANK_SIZE not in (1, C.FLASH.num_hidden_layers):
     _shape_parser.error("--weight-bank-size must be 1 or the full layer count")
 
 
+from config import COMPRESSED_POOL_UNIT_ROWS, C2A_STORAGE_ROWS, C1A_STORAGE_ROWS
 from config import (
     FLASH as M, LM_HEAD_TP_SIZE, B_DYN, Q_START_DYN, ROUTE_T_DYN, T_DYN, BLOCK_SIZE, DECODE_MAX_TOKENS,
     DECODE_INPUT_MAX_TOKENS, INDEX_CACHE_GROUP, STATE_CAPACITY, MOE_TOKENS, DSPARK_DRAFT_LAYERS,
@@ -81,6 +82,7 @@ MX_GROUP = M.weight_block_size[0]
 N_LAYERS = M.num_hidden_layers
 C2A_SOURCE_COUNT = 3
 KV_SOURCE_COUNT = 4
+COMPRESSED_SOURCE_UNITS = 5
 INDEX_SOURCE_COUNT = 8
 
 BLOCK_SIZE = BLOCK_SIZE
@@ -128,12 +130,12 @@ def decode_encoder(
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, BLOCK_SIZE], pl.INT32],
     window_cache_pool: pl.InOut[pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
-    compressed_cache_pool: pl.InOut[pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
+    compressed_cache_pool: pl.InOut[pl.Tensor[[FWD_CMP_BLOCKS_DYN, COMPRESSED_POOL_UNIT_ROWS, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    index_cache_pool: pl.InOut[pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // 2], pl.UINT8]],
+    index_cache_pool: pl.InOut[pl.Tensor[[FWD_INDEX_BLOCKS_DYN, COMPRESSED_POOL_UNIT_ROWS, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale_pool: pl.InOut[
-        pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
+        pl.Tensor[[FWD_INDEX_BLOCKS_DYN, COMPRESSED_POOL_UNIT_ROWS, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
     ],
     c2a_index_block_table: pl.Tensor[[B_DYN, FWD_C2A_TABLE_DYN], pl.INT32],
     c2a_compressor_wkv: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.BF16, pl.NZ],
@@ -227,8 +229,8 @@ def decode_encoder(
     c2a_compressed_lens = pl.create_tensor([tokens], dtype=pl.INT32)
     prepare_compressed_lens(position_ids, c2a_compressed_lens, 1)
     window_blocks_per_layer = pl.tensor.dim(window_cache_pool, 0) // N_LAYERS
-    compressed_blocks_per_source = pl.tensor.dim(compressed_cache_pool, 0) // KV_SOURCE_COUNT
-    index_blocks_per_source = pl.tensor.dim(index_cache_pool, 0) // KV_SOURCE_COUNT
+    compressed_blocks_per_source = pl.tensor.dim(compressed_cache_pool, 0) // COMPRESSED_SOURCE_UNITS
+    index_blocks_per_source = pl.tensor.dim(index_cache_pool, 0) // COMPRESSED_SOURCE_UNITS
     state_blocks_per_source = pl.tensor.dim(state_cache_pool, 0) // C2A_SOURCE_COUNT
     attention_hidden = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
     attention_pre_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
@@ -284,9 +286,9 @@ def decode_encoder(
                 )
             elif (layer - 2) % 6 == 0:
                 full_source_id = (layer - 2) // 6
-                full_compressed_cache = pl.slice(compressed_cache_pool, [compressed_blocks_per_source, BLOCK_SIZE, 1, COMPRESSED_CACHE_BYTES], [full_source_id * compressed_blocks_per_source, 0, 0, 0])
-                full_index_cache = pl.slice(index_cache_pool, [index_blocks_per_source, BLOCK_SIZE, 1, INDEX_DIM // 2], [full_source_id * index_blocks_per_source, 0, 0, 0])
-                full_index_cache_scale = pl.slice(index_cache_scale_pool, [index_blocks_per_source, BLOCK_SIZE, 1, INDEX_DIM // INDEX_CACHE_GROUP], [full_source_id * index_blocks_per_source, 0, 0, 0])
+                full_compressed_cache = pl.slice(compressed_cache_pool, [compressed_blocks_per_source, C2A_STORAGE_ROWS, 1, COMPRESSED_CACHE_BYTES], [full_source_id * compressed_blocks_per_source, 0, 0, 0])
+                full_index_cache = pl.slice(index_cache_pool, [index_blocks_per_source, C2A_STORAGE_ROWS, 1, INDEX_DIM // 2], [full_source_id * index_blocks_per_source, 0, 0, 0])
+                full_index_cache_scale = pl.slice(index_cache_scale_pool, [index_blocks_per_source, C2A_STORAGE_ROWS, 1, INDEX_DIM // INDEX_CACHE_GROUP], [full_source_id * index_blocks_per_source, 0, 0, 0])
                 full_state_cache = pl.slice(state_cache_pool, [state_blocks_per_source, STATE_CAPACITY, STATE_WIDTH], [full_source_id * state_blocks_per_source, 0, 0])
                 full_index_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(index_wq_b_scale, [Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], [(layer - 2) // 6 * (Q_LORA // MX_GROUP), 0])
                 full_c2a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ] = c2a_compressor_wkv[full_source_id]
@@ -327,7 +329,7 @@ def decode_encoder(
                 )
             else:
                 reuse_source_id = (layer - 2) // 6
-                reuse_compressed_cache = pl.slice(compressed_cache_pool, [compressed_blocks_per_source, BLOCK_SIZE, 1, COMPRESSED_CACHE_BYTES], [reuse_source_id * compressed_blocks_per_source, 0, 0, 0])
+                reuse_compressed_cache = pl.slice(compressed_cache_pool, [compressed_blocks_per_source, C2A_STORAGE_ROWS, 1, COMPRESSED_CACHE_BYTES], [reuse_source_id * compressed_blocks_per_source, 0, 0, 0])
                 decode_c2a_reuse(
                     x_hc, pre_mix,
                     layer_hc_fn, layer_hc_scale, layer_hc_base,
@@ -411,12 +413,12 @@ def decode_decoder(
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, BLOCK_SIZE], pl.INT32],
     window_cache_pool: pl.InOut[pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
-    compressed_cache_pool: pl.InOut[pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
+    compressed_cache_pool: pl.InOut[pl.Tensor[[FWD_CMP_BLOCKS_DYN, COMPRESSED_POOL_UNIT_ROWS, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    index_cache_pool: pl.InOut[pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // 2], pl.UINT8]],
+    index_cache_pool: pl.InOut[pl.Tensor[[FWD_INDEX_BLOCKS_DYN, COMPRESSED_POOL_UNIT_ROWS, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale_pool: pl.InOut[
-        pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
+        pl.Tensor[[FWD_INDEX_BLOCKS_DYN, COMPRESSED_POOL_UNIT_ROWS, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
     ],
     c1a_index_block_table: pl.Tensor[[B_DYN, FWD_C1A_TABLE_DYN], pl.INT32],
     c2a_compressor_wkv: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.BF16, pl.NZ],
@@ -487,8 +489,8 @@ def decode_decoder(
     c1a_compressed_lens = pl.create_tensor([tokens], dtype=pl.INT32)
     prepare_compressed_lens(position_ids, c1a_compressed_lens, 0)
     window_blocks_per_layer = pl.tensor.dim(window_cache_pool, 0) // N_LAYERS
-    compressed_blocks_per_source = pl.tensor.dim(compressed_cache_pool, 0) // KV_SOURCE_COUNT
-    index_blocks_per_source = pl.tensor.dim(index_cache_pool, 0) // KV_SOURCE_COUNT
+    compressed_blocks_per_source = pl.tensor.dim(compressed_cache_pool, 0) // COMPRESSED_SOURCE_UNITS
+    index_blocks_per_source = pl.tensor.dim(index_cache_pool, 0) // COMPRESSED_SOURCE_UNITS
     attention_hidden = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
     attention_pre_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     topk_indices = pl.create_tensor([tokens, INDEX_TOPK], dtype=pl.INT32)
@@ -503,7 +505,8 @@ def decode_decoder(
             weight_layer = layer % WEIGHT_BANK_SIZE
             layer_window_cache = pl.slice(window_cache_pool, [window_blocks_per_layer, BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], [layer * window_blocks_per_layer, 0, 0, 0])
             layer_source_id = 3
-            layer_compressed_cache = pl.slice(compressed_cache_pool, [compressed_blocks_per_source, BLOCK_SIZE, 1, COMPRESSED_CACHE_BYTES], [layer_source_id * compressed_blocks_per_source, 0, 0, 0])
+            layer_compressed_cache_units = pl.slice(compressed_cache_pool, [2 * compressed_blocks_per_source, COMPRESSED_POOL_UNIT_ROWS, 1, COMPRESSED_CACHE_BYTES], [layer_source_id * compressed_blocks_per_source, 0, 0, 0])
+            layer_compressed_cache = pl.reshape(layer_compressed_cache_units, [compressed_blocks_per_source, C1A_STORAGE_ROWS, 1, COMPRESSED_CACHE_BYTES])
             layer_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [weight_layer * MIX_HC, 0])
             layer_hc_scale: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [weight_layer * 3])
             layer_hc_base: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_attn_base, [MIX_HC], [weight_layer * MIX_HC])
@@ -523,8 +526,10 @@ def decode_decoder(
             layer_wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(wo_b_scale, [LOCAL_O_WIDTH // MX_GROUP, D], [weight_layer * (LOCAL_O_WIDTH // MX_GROUP), 0])
             if layer == 20:
                 full_index_source_id = 3
-                full_index_cache = pl.slice(index_cache_pool, [index_blocks_per_source, BLOCK_SIZE, 1, INDEX_DIM // 2], [full_index_source_id * index_blocks_per_source, 0, 0, 0])
-                full_index_cache_scale = pl.slice(index_cache_scale_pool, [index_blocks_per_source, BLOCK_SIZE, 1, INDEX_DIM // INDEX_CACHE_GROUP], [full_index_source_id * index_blocks_per_source, 0, 0, 0])
+                full_index_cache_units = pl.slice(index_cache_pool, [2 * index_blocks_per_source, COMPRESSED_POOL_UNIT_ROWS, 1, INDEX_DIM // 2], [full_index_source_id * index_blocks_per_source, 0, 0, 0])
+                full_index_cache = pl.reshape(full_index_cache_units, [index_blocks_per_source, C1A_STORAGE_ROWS, 1, INDEX_DIM // 2])
+                full_index_cache_scale_units = pl.slice(index_cache_scale_pool, [2 * index_blocks_per_source, COMPRESSED_POOL_UNIT_ROWS, 1, INDEX_DIM // INDEX_CACHE_GROUP], [full_index_source_id * index_blocks_per_source, 0, 0, 0])
+                full_index_cache_scale = pl.reshape(full_index_cache_scale_units, [index_blocks_per_source, C1A_STORAGE_ROWS, 1, INDEX_DIM // INDEX_CACHE_GROUP])
                 full_index_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(index_wq_b_scale, [Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], [3 * (Q_LORA // MX_GROUP), 0])
                 full_compressor_norm: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(compressor_norm_weight, [HEAD_DIM], [layer_source_id * HEAD_DIM])
                 full_index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16, pl.NZ] = index_wk[full_index_source_id]
@@ -560,8 +565,10 @@ def decode_decoder(
                 )
             elif (layer - 20) % 4 == 0:
                 reindex_index_source_id = (layer - 24) // 4 + 4
-                reindex_index_cache = pl.slice(index_cache_pool, [index_blocks_per_source, BLOCK_SIZE, 1, INDEX_DIM // 2], [layer_source_id * index_blocks_per_source, 0, 0, 0])
-                reindex_index_cache_scale = pl.slice(index_cache_scale_pool, [index_blocks_per_source, BLOCK_SIZE, 1, INDEX_DIM // INDEX_CACHE_GROUP], [layer_source_id * index_blocks_per_source, 0, 0, 0])
+                reindex_index_cache_units = pl.slice(index_cache_pool, [2 * index_blocks_per_source, COMPRESSED_POOL_UNIT_ROWS, 1, INDEX_DIM // 2], [layer_source_id * index_blocks_per_source, 0, 0, 0])
+                reindex_index_cache = pl.reshape(reindex_index_cache_units, [index_blocks_per_source, C1A_STORAGE_ROWS, 1, INDEX_DIM // 2])
+                reindex_index_cache_scale_units = pl.slice(index_cache_scale_pool, [2 * index_blocks_per_source, COMPRESSED_POOL_UNIT_ROWS, 1, INDEX_DIM // INDEX_CACHE_GROUP], [layer_source_id * index_blocks_per_source, 0, 0, 0])
+                reindex_index_cache_scale = pl.reshape(reindex_index_cache_scale_units, [index_blocks_per_source, C1A_STORAGE_ROWS, 1, INDEX_DIM // INDEX_CACHE_GROUP])
                 reindex_index_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(index_wq_b_scale, [Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], [((layer - 24) // 4 + 4) * (Q_LORA // MX_GROUP), 0])
                 reindex_index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN] = index_wq_b[reindex_index_source_id]
                 reindex_index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ] = index_weights_proj[reindex_index_source_id]
@@ -687,12 +694,12 @@ def _l2_decode_fwd(
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, BLOCK_SIZE], pl.INT32],
     window_cache_pool: pl.InOut[pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
-    compressed_cache_pool: pl.InOut[pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
+    compressed_cache_pool: pl.InOut[pl.Tensor[[FWD_CMP_BLOCKS_DYN, COMPRESSED_POOL_UNIT_ROWS, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    index_cache_pool: pl.InOut[pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // 2], pl.UINT8]],
+    index_cache_pool: pl.InOut[pl.Tensor[[FWD_INDEX_BLOCKS_DYN, COMPRESSED_POOL_UNIT_ROWS, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale_pool: pl.InOut[
-        pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
+        pl.Tensor[[FWD_INDEX_BLOCKS_DYN, COMPRESSED_POOL_UNIT_ROWS, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
     ],
     c2a_index_block_table: pl.Tensor[[B_DYN, FWD_C2A_TABLE_DYN], pl.INT32],
     c1a_index_block_table: pl.Tensor[[B_DYN, FWD_C1A_TABLE_DYN], pl.INT32],
@@ -854,14 +861,14 @@ def l3_decode_fwd(
     window_slots: pl.Tensor[[EP_SIZE, T_DYN], pl.INT64],
     window_indices: pl.Tensor[[EP_SIZE, T_DYN, BLOCK_SIZE], pl.INT32],
     window_cache_pool: pl.InOut[pl.Tensor[[EP_SIZE, FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
-    compressed_cache_pool: pl.InOut[pl.Tensor[[EP_SIZE, FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
+    compressed_cache_pool: pl.InOut[pl.Tensor[[EP_SIZE, FWD_CMP_BLOCKS_DYN, COMPRESSED_POOL_UNIT_ROWS, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
     token_to_req_indices: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
     position_ids: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
     index_cache_pool: pl.InOut[
-        pl.Tensor[[EP_SIZE, FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // 2], pl.UINT8]
+        pl.Tensor[[EP_SIZE, FWD_INDEX_BLOCKS_DYN, COMPRESSED_POOL_UNIT_ROWS, 1, INDEX_DIM // 2], pl.UINT8]
     ],
     index_cache_scale_pool: pl.InOut[
-        pl.Tensor[[EP_SIZE, FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
+        pl.Tensor[[EP_SIZE, FWD_INDEX_BLOCKS_DYN, COMPRESSED_POOL_UNIT_ROWS, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
     ],
     c2a_index_block_table: pl.Tensor[[EP_SIZE, B_DYN, FWD_C2A_TABLE_DYN], pl.INT32],
     c1a_index_block_table: pl.Tensor[[EP_SIZE, B_DYN, FWD_C1A_TABLE_DYN], pl.INT32],
@@ -929,7 +936,9 @@ def l3_decode_fwd(
     position p, their visible lengths include the current publication and
     equal (p+1)//2 and p+1. Incomplete C2A pairs use write slot -1.
     Page ids and slots are relative to each source's slice of the packed
-    cache pools, with BLOCK_SIZE compressed rows per page. Sources within
+    cache pools. C2A pages hold C2A_STORAGE_ROWS (64) compressed rows
+    covering 128 original tokens, while C1A and SWA pages hold 128
+    stored rows covering 128 original tokens. Sources within
     one family share a page mapping; the two families may use different
     page ids and table widths. Index and main KV caches share that mapping.
     Visible lengths are derived once on device from position_ids and reused
@@ -1075,8 +1084,8 @@ def _fixture_extent(dim):
         "Q_START_DYN": FIXTURE_BATCH + 1,
         "T_DYN": MOE_TOKENS,
         "FWD_ORI_BLOCKS_DYN": N_LAYERS * FIXTURE_BATCH,
-        "FWD_CMP_BLOCKS_DYN": KV_SOURCE_COUNT * FIXTURE_BATCH,
-        "FWD_INDEX_BLOCKS_DYN": KV_SOURCE_COUNT * FIXTURE_BATCH,
+        "FWD_CMP_BLOCKS_DYN": COMPRESSED_SOURCE_UNITS * FIXTURE_BATCH,
+        "FWD_INDEX_BLOCKS_DYN": COMPRESSED_SOURCE_UNITS * FIXTURE_BATCH,
         "FWD_STATE_BLOCKS_DYN": C2A_SOURCE_COUNT * FIXTURE_BATCH,
         "FWD_C2A_TABLE_DYN": 1,
         "FWD_C1A_TABLE_DYN": 2,
@@ -1106,7 +1115,7 @@ def build_tensor_specs():
     window_slots, window_indices, _ = window_metadata(position_ids, request_ids, window_table)
     metadata_rows = {"window_slots": window_slots, "window_indices": window_indices}
     for family, ratio, table in (("c2a", 2, c2a_table), ("c1a", 1, c1a_table)):
-        slots = paged_slots(position_ids, request_ids, table, BLOCK_SIZE, ratio, True)
+        slots = paged_slots(position_ids, request_ids, table, BLOCK_SIZE // ratio, ratio, True)
         metadata_rows[family + "_compressed_slots"] = slots
         metadata_rows[family + "_index_block_table"] = table
     for name in ("window_slots", "window_indices", "c2a_compressed_slots", "c1a_compressed_slots"):
