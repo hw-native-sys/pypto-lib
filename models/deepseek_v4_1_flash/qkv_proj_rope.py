@@ -292,6 +292,9 @@ def q_norm_quant(
                     lowest = pl.reg.active_mask(1, lanes=64)
                     partial_mask = pl.reg.active_mask(Q_NORM_FOLD // 64, lanes=64)
                     lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
+                    # The inverse-root scope loads the full scratch vector.
+                    rms_zero = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+                    _rms_initialized = pl.reg.store(rms, value=rms_zero)
                     for row in pl.hardware_loop(active):
                         row_offset = row * Q_LORA
                         partials = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
