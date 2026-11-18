@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from pypto.runtime import pto_isa_include_dir
 
 from config import FLASH as M, T_DYN
-from rmsnorm import golden_rms_norm
+from rmsnorm import _rms_norm_rows, golden_rms_norm
 
 
 # model config
@@ -377,20 +377,70 @@ def hc_project(x_hc: pl.Tensor, function: pl.Tensor, rms_worker_limit: pl.conste
     return inv_rms, mixes_partials
 
 
-@pl.jit.extern(core_type="aiv", source=_KERNELS / "hc_collapse.cpp",
-               include_dirs=(pto_isa_include_dir(), str(_KERNELS)))
-def _hc_collapse(
-    x: pl.Tensor,
+@pl.jit.inline
+def _hc_collapse_rows(
+    x_hc: pl.Tensor,
     pre_mix: pl.Tensor,
+    output: pl.Tensor,
     norm_weight: pl.Tensor,
-    output: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
-    collapsed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
-    rows: pl.Scalar[pl.INDEX],
+    raw_output: pl.Tensor,
     active_rows: pl.Scalar[pl.INDEX],
-    mode: pl.Scalar[pl.INDEX],
+    worker_limit: pl.constexpr,
+    row_tile: pl.constexpr,
+    store_collapsed: pl.constexpr,
 ):
-    """Collapse streams; mode 1 normalizes, and mode 2 also stores raw BF16 rows."""
-    ...
+    """Collapse HC streams with ordered FP32 products, sums, and BF16 rounding."""
+    tokens = pl.tensor.dim(x_hc, 0)
+    x_flat = pl.reshape(x_hc, [tokens, HC_DIM])
+    mix_flat = pl.reshape(pre_mix, [1, tokens * HC_MULT])
+    with pl.spmd(
+        pl.max(pl.min((tokens + row_tile - 1) // row_tile, worker_limit), 1),
+        name_hint="hc_collapse_norm",
+        allow_early_resolve=True,
+    ) as ready:
+        block = pl.tile.get_block_idx()
+        gamma = pl.load(norm_weight, [0], [D], target_memory=pl.Mem.Vec)
+        for start in pl.range(block * row_tile, tokens, pl.tile.get_block_num() * row_tile):
+            rows = pl.min(row_tile, tokens - start)
+            mix = pl.load(
+                mix_flat, [0, start * HC_MULT], [1, MIX_PAD],
+                valid_shape=[1, rows * HC_MULT], target_memory=pl.MemorySpace.Vec,
+            )
+            for local in pl.pipeline(rows, stage=2):
+                row = start + local
+                source = pl.load(x_flat, [row, 0], [1, HC_DIM], target_memory=pl.MemorySpace.Vec)
+                source = pl.reshape(source, [HC_DIM])
+                collapsed = pl.create_tile([D], dtype=pl.BF16, target_memory=pl.MemorySpace.Vec)
+                with pl.reg_scope():
+                    full = pl.reg.full_mask(lanes=64)
+                    mix0 = pl.reg.load(mix, offset=local * HC_MULT, lanes=1)
+                    mix1 = pl.reg.load(mix, offset=local * HC_MULT + 1, lanes=1)
+                    mix2 = pl.reg.load(mix, offset=local * HC_MULT + 2, lanes=1)
+                    mix3 = pl.reg.load(mix, offset=local * HC_MULT + 3, lanes=1)
+                    p0 = pl.reg.broadcast(mix0, lanes=64, dtype=pl.FP32)
+                    p1 = pl.reg.broadcast(mix1, lanes=64, dtype=pl.FP32)
+                    p2 = pl.reg.broadcast(mix2, lanes=64, dtype=pl.FP32)
+                    p3 = pl.reg.broadcast(mix3, lanes=64, dtype=pl.FP32)
+                    for chunk in pl.hardware_loop(D // 64):
+                        offset = chunk * 64
+                        x0 = pl.reg.mul(pl.reg.load(source, offset=offset, lanes=64), p0, full)
+                        x1 = pl.reg.mul(pl.reg.load(source, offset=D + offset, lanes=64), p1, full)
+                        x2 = pl.reg.mul(pl.reg.load(source, offset=2 * D + offset, lanes=64), p2, full)
+                        x3 = pl.reg.mul(pl.reg.load(source, offset=3 * D + offset, lanes=64), p3, full)
+                        value = pl.reg.add(pl.reg.add(pl.reg.add(x0, x1, full), x2, full), x3, full)
+                        rounded = pl.reg.convert(value, dtype=pl.BF16, rounding="R", saturate=False)
+                        _stored = pl.reg.store(collapsed, offset=offset, value=rounded, mask=full)
+                collapsed = pl.reshape(collapsed, [1, D])
+                if store_collapsed:
+                    pl.store(collapsed, [row, 0], raw_output)
+                if row < active_rows:
+                    normalized = _rms_norm_rows(collapsed, gamma, D, 1, D * 4 // 5)
+                    normalized = pl.reshape(normalized, [1, D])
+                    pl.store(normalized, [row, 0], output)
+                else:
+                    zero = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
+                    pl.store(zero, [row, 0], output)
+    return ready
 
 
 @pl.jit.inline
@@ -453,16 +503,11 @@ def hc_head_norm(
     output: pl.Tensor,
     worker_limit: pl.constexpr,
 ):
-    """Collapse eight HC rows and normalize their rounded BF16 values."""
+    """Collapse HC streams and normalize their rounded BF16 values."""
     tokens = pl.tensor.dim(x_hc, 0)
-    workers = pl.min((tokens + PRE_NORM_T_TILE - 1) // PRE_NORM_T_TILE, worker_limit)
-    input_view = pl.reshape(x_hc, [tokens, HC_MULT, D])
-    mix_view = pl.reshape(pre_mix, [tokens, HC_MULT])
-    output_view = pl.reshape(output, [tokens, D])
-    collapsed_view = pl.reshape(output, [tokens, D])
-    with pl.spmd(workers, name_hint="hc_collapse_norm") as ready:
-        _hc_collapse(input_view, mix_view, norm_weight, output_view, collapsed_view, tokens, tokens, 1)
-    return ready
+    return _hc_collapse_rows(
+        x_hc, pre_mix, output, norm_weight, output, tokens, worker_limit, PRE_NORM_T_TILE, False,
+    )
 
 
 @pl.jit.inline(auto_scope=False)
@@ -478,14 +523,9 @@ def hc_head_norm_store(
     """Collapse all rows, normalize active rows, and zero normalized padding."""
     tokens = pl.tensor.dim(x_hc, 0)
     active_rows = pl.max(pl.min(pl.cast(num_tokens, pl.INDEX), tokens), 0)
-    workers = pl.min((tokens + PRE_NORM_STORE_T_TILE - 1) // PRE_NORM_STORE_T_TILE, worker_limit)
-    input_view = pl.reshape(x_hc, [tokens, HC_MULT, D])
-    mix_view = pl.reshape(pre_mix, [tokens, HC_MULT])
-    output_view = pl.reshape(output, [tokens, D])
-    collapsed_view = pl.reshape(collapsed, [tokens, D])
-    with pl.spmd(workers, name_hint="hc_collapse_norm_store") as ready:
-        _hc_collapse(input_view, mix_view, norm_weight, output_view, collapsed_view, tokens, active_rows, 2)
-    return ready
+    return _hc_collapse_rows(
+        x_hc, pre_mix, output, norm_weight, collapsed, active_rows, worker_limit, PRE_NORM_STORE_T_TILE, True,
+    )
 
 
 @pl.jit.inline
