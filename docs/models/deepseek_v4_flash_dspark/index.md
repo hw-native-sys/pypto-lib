@@ -195,6 +195,16 @@ decode_csa   … → decode_compressor_ratio4 (main, inner)
   [prefill_cp_token_allgather.py](../../../models/deepseek_v4_flash_dspark/prefill_cp_token_allgather.py)
   and [prefill_o_proj.py](../../../models/deepseek_v4_flash_dspark/prefill_o_proj.py).
 
+The shared KV projection uses two FP32 split-K partial sums. Four atomic
+partials can accumulate in different orders and change the BF16 cache result
+even when every run passes the operator's golden tolerance. Device replay of
+fixed 32-row and 257-row inputs, 16 times each, was bitwise stable with two
+partials; the four-part control produced 2 and 12 distinct outputs respectively.
+All 64 control/candidate dispatches passed the original golden gates. This
+checks those fixed inputs and execution shapes, not equality across different
+batch geometries or correctness of a complete serving deployment. Prefill,
+Decode and the drafter all use this shared projection.
+
 ### MoE and output stages
 
 [moe.py](../../../models/deepseek_v4_flash_dspark/moe.py) is unchanged in shape
