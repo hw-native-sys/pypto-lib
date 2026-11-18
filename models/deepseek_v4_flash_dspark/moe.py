@@ -66,7 +66,7 @@ from expert_routed import (
 from expert_shared import expert_shared
 from gate import gate
 from hc_post import hc_post
-from hc_pre import hc_pre
+from hc_pre import hc_pre, _hc_pre_prefill
 from prefill_cp_token_allgather import (
     CP_KV_T_DYN as PREFILL_GROUP_T_DYN,
     CP_Q_T_DYN as PREFILL_LOCAL_T_DYN,
@@ -138,7 +138,7 @@ PREFILL_SOURCE_PACK_BLOCKS = N_RANKS
 PREFILL_RESORT_BLOCKS_PER_EXPERT = 1
 PREFILL_COUNT_TOKEN_TILE = min(PREFILL_MOE_T_TILE, 128)
 PREFILL_COUNT_SHARDS = (PREFILL_MOE_T_TILE + PREFILL_COUNT_TOKEN_TILE - 1) // PREFILL_COUNT_TOKEN_TILE
-PREFILL_DISPATCH_ROW_TILE = 1
+PREFILL_DISPATCH_ROW_TILE = 16
 PREFILL_REVERSE_ROW_TILE = 1
 
 # Scalar stores into recv_* land a whole 64-byte line at a time, so an expert
@@ -700,7 +700,7 @@ def moe(
             arrived, data_arrived, routed_y_buf, combine_arrived,
             layer_id, num_tokens, my_rank, moe_epoch,
         )
-        hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
+        hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next, T_TILE=4)
     return x_next
 
 
@@ -865,7 +865,7 @@ def make_prefill_expert_grouped(grouped_capacity: int):
     """Specialize count-driven expert compute for an aligned scratch capacity."""
     if grouped_capacity <= 0 or grouped_capacity % PREFILL_RECV_TILE:
         raise ValueError("grouped expert capacity must be a positive multiple of RECV_TILE")
-    grouped_tile_capacity = grouped_capacity // PREFILL_RECV_TILE
+    grouped_tile_capacity = grouped_capacity // 128 + 3
     gate_up_quant_m192 = _make_expert_gate_up_quant_tile(grouped_capacity, 192)
     gate_up_quant_m128 = _make_expert_gate_up_quant_tile(grouped_capacity, 128)
     gate_up_quant_m96 = _make_expert_gate_up_quant_tile(grouped_capacity, 96)
@@ -1583,7 +1583,7 @@ def prefill_moe(
         post_ffn_step = post_ffn
         comb_ffn_step = comb_ffn
         if group_tokens > 0:
-            hc_pre(attn_out, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, x_mixed_step, post_ffn_step, comb_ffn_step)
+            _hc_pre_prefill(attn_out, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, x_mixed_step, post_ffn_step, comb_ffn_step)
 
     local_rows = pl.tensor.dim(ffn_out, 0)
     # Every EP rank participates in every physical wave, including empty groups.
@@ -1705,7 +1705,7 @@ def prefill_moe(
                 gather_window, gather_signal,
                 group_base, tp_rank,
             )
-            hc_post(ffn_out_full, attn_out, post_ffn, comb_ffn, x_hc)
+            hc_post(ffn_out_full, attn_out, post_ffn, comb_ffn, x_hc, T_TILE=16)
     return x_hc
 
 
