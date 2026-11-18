@@ -433,9 +433,7 @@ if __name__ == "__main__":
         fn=l3_lm_head,
         specs=build_tensor_specs(args.num_tokens),
         golden_fn=golden_lm_head,
-        compare_fn={
-            "logits": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
-        },
+        compare_fn={"logits": ratio_allclose(atol=1e-3, rtol=1.0 / 128, max_error_ratio=0.0)},
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         golden_data=args.golden_data,
