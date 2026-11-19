@@ -14,7 +14,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 
-from config import DECODE_SEQ, MOE_TOKENS, FLASH as M
+from config import DECODE_SEQ, FP32_NEG_INF, MOE_TOKENS, FLASH as M
 from lm_head import (
     DONE_VALUE,
     GROUP_LOGIT_ROWS,
@@ -62,7 +62,6 @@ GREEDY_VOCAB_TILE = 808
 GREEDY_SHARD_TILE = GREEDY_ARGMAX_ROWS * GREEDY_VOCAB_TILE
 GREEDY_PARTIAL_TILE = 16
 GREEDY_REDUCE_TILE = 32
-NEG_INF = -3.402823e38
 
 assert D % HIDDEN_TILE == 0
 assert D % LM_K_TILE == 0
@@ -388,7 +387,7 @@ def greedy_markov_step(
         bias_tile = bias_grid[bias_begin:bias_begin + GREEDY_ARGMAX_ROWS, :]
         scores = pl.add(base_tile, bias_tile)
         row_winners = pl.row_argmax(scores)
-        row_scores = pl.full([GREEDY_ARGMAX_ROWS, GREEDY_ARGMAX_ROWS], dtype=pl.FP32, value=NEG_INF)
+        row_scores = pl.full([GREEDY_ARGMAX_ROWS, GREEDY_ARGMAX_ROWS], dtype=pl.FP32, value=FP32_NEG_INF)
         for row in pl.range(GREEDY_ARGMAX_ROWS):
             column = pl.cast(pl.read(row_winners, [row, 0]), pl.INDEX)
             pl.write(row_scores, [0, row], pl.read(scores, [row, column]))
@@ -405,7 +404,7 @@ def greedy_markov_step(
 
     with pl.spmd(batch, name_hint="dspark_markov_greedy", deps=[partials_tid]) as greedy_tid:
         request = pl.tile.get_block_idx()
-        shard_scores = pl.full([GREEDY_ARGMAX_ROWS, GREEDY_REDUCE_TILE], dtype=pl.FP32, value=NEG_INF)
+        shard_scores = pl.full([GREEDY_ARGMAX_ROWS, GREEDY_REDUCE_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
         for shard in pl.range(VOCAB // GREEDY_SHARD_TILE):
             partial = request * (VOCAB // GREEDY_SHARD_TILE) + shard
             pl.write(shard_scores, [0, shard], pl.read(partials, [partial, 0]))
@@ -547,7 +546,6 @@ def _distributed_markov_sample(
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     ROW_CAPACITY: pl.constexpr = MAX_LOGIT_ROWS,
-    MASKED_OWNERS: pl.constexpr = False,
 ):
     head_hidden.bind_dynamic(0, B_DYN)
     num_sampled.bind_dynamic(0, B_DYN)
@@ -562,10 +560,11 @@ def _distributed_markov_sample(
         normalized,
     )
     base_logits = pl.create_tensor([MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
+    selected_indices = logit_row_indices[:ROW_CAPACITY]
     base_logits, base_logits_tid = lm_head(
         normalized,
         lm_head_weight,
-        logit_row_indices,
+        selected_indices,
         base_logits,
         hidden_window,
         hidden_done,
@@ -575,7 +574,6 @@ def _distributed_markov_sample(
         tp_rank,
         DONE_VALUE,
         final_norm_tid,
-        ROW_CAPACITY, MASKED_OWNERS,
     )
     draft_token_ids, confidence_probs = sample_from_base_logits(
         head_hidden,
@@ -667,7 +665,7 @@ def l3_distributed_markov_sample(
             logits_done,
             rank // TP_SIZE * TP_SIZE,
             rank % TP_SIZE,
-            MAX_LOGIT_ROWS, False,
+            MAX_LOGIT_ROWS,
             device=rank,
         )
 

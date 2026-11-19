@@ -651,7 +651,7 @@ def l2_decode_fwd_dspark(
             draft_markov_hidden_window, draft_markov_hidden_done,
             draft_markov_logits_window, draft_markov_logits_done,
             my_rank // DRAFT_LM_HEAD_TP_SIZE * DRAFT_LM_HEAD_TP_SIZE, my_rank % DRAFT_LM_HEAD_TP_SIZE,
-            DRAFT_MAX_LOGIT_ROWS, False,
+            DRAFT_MAX_LOGIT_ROWS,
         )
     with pl.scope():
         state_tokens, state_meta = commit_drafts_to_device_state(

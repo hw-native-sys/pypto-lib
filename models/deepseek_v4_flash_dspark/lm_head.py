@@ -82,7 +82,6 @@ FUSED_LM_HEAD_CORES = 24
 # AIV lanes per AICore: the fused kernel splits each row block's accumulator
 # across the two lanes, and each lane pushes a contiguous half of one owner's rows.
 AIV_LANES = 2
-LANE_ROWS = (MM_ROW_TILE + AIV_LANES - 1) // AIV_LANES
 VOCAB_TAIL = VOCAB_PER_TP % FUSED_VOCAB_TILE
 VOCAB_FULL_TILES = VOCAB_PER_TP // FUSED_VOCAB_TILE
 LOGITS_COMM_TAIL = VOCAB_PER_TP % LOGITS_COMM_TILE
@@ -112,7 +111,7 @@ assert VOCAB < GREEDY_INDEX_SENTINEL, "sentinel must lose every row_min against 
 def lm_head(
     hidden_states: pl.Tensor,
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, pl.NZ],
-    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    logit_row_indices: pl.Tensor,
     logits: pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
     hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -122,20 +121,20 @@ def lm_head(
     tp_rank: pl.Scalar[pl.INT32],
     done_epoch: pl.Scalar[pl.INT32],
     hidden_ready_tid: pl.Scalar[pl.TASK_ID],
-    ROW_CAPACITY: pl.constexpr = MAX_LOGIT_ROWS,
-    MASKED_OWNERS: pl.constexpr = False,
 ) -> tuple[
     pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
     pl.Scalar[pl.TASK_ID],
 ]:
     # Scratch is allocated just outside the scope that first writes it: a
     # create_tensor inside a pl.at yields a tile, not a GM tensor view.
-    selected_hidden = pl.create_tensor([ROW_CAPACITY, D], dtype=pl.BF16)
+    # A compact index view bounds bootstrap work within full-size owner windows.
+    row_capacity = logit_row_indices.shape[0]
+    selected_hidden = pl.create_tensor([row_capacity, D], dtype=pl.BF16)
     owner_header = pl.create_tensor([1, 16], dtype=pl.BF16)
-    gather_tiles = (ROW_CAPACITY + HIDDEN_GATHER_ROW_TILE - 1) // HIDDEN_GATHER_ROW_TILE
-    gather_rows = ROW_CAPACITY // gather_tiles
-    matmul_tiles = (ROW_CAPACITY + MM_ROW_TILE - 1) // MM_ROW_TILE
-    matmul_rows = ROW_CAPACITY // matmul_tiles
+    gather_tiles = (row_capacity + HIDDEN_GATHER_ROW_TILE - 1) // HIDDEN_GATHER_ROW_TILE
+    gather_rows = row_capacity // gather_tiles
+    matmul_tiles = (row_capacity + MM_ROW_TILE - 1) // MM_ROW_TILE
+    matmul_rows = row_capacity // matmul_tiles
 
     # Publish this card's logit rows into every group member's window slot: the
     # window holds one slot per group member and each card writes only its own,
@@ -146,7 +145,7 @@ def lm_head(
     # per-row form stalled lm_head_dispatch_gather on persistent re-dispatch
     # (SCHEDULER_TIMEOUT S1 with the gather task's core never exiting).
     with pl.spmd(
-        ROW_CAPACITY // PUSH_ROW_TILE,
+        row_capacity // PUSH_ROW_TILE,
         name_hint="lm_head_dispatch_push",
         deps=[hidden_ready_tid],
     ) as _dispatch_push_tid:
@@ -165,10 +164,10 @@ def lm_head(
                 source_row = pl.cast(safe_raw, target_type=pl.INDEX)
                 selected_hidden[row : row + 1, :] = hidden_states[source_row : source_row + 1, :]
 
-        if MASKED_OWNERS and ROW_CAPACITY < MAX_LOGIT_ROWS:
-            if blk == ROW_CAPACITY // PUSH_ROW_TILE - 1:
+        if row_capacity < MAX_LOGIT_ROWS:
+            if blk == row_capacity // PUSH_ROW_TILE - 1:
                 owner_active = pl.cast(0, pl.INT32)
-                for header_row in pl.range(ROW_CAPACITY):
+                for header_row in pl.range(row_capacity):
                     if pl.read(logit_row_indices, [header_row]) >= 0:
                         owner_active = pl.cast(1, pl.INT32)
                 header_fp32 = pl.full([1, 16], dtype=pl.FP32, value=0.0)
@@ -177,8 +176,8 @@ def lm_head(
 
         # Self-target rides the same put; put drains before the notify issues.
         for peer_tp in pl.range(TP_SIZE):
-            if MASKED_OWNERS and ROW_CAPACITY < MAX_LOGIT_ROWS:
-                if blk == ROW_CAPACITY // PUSH_ROW_TILE - 1:
+            if row_capacity < MAX_LOGIT_ROWS:
+                if blk == row_capacity // PUSH_ROW_TILE - 1:
                     header_row = tp_rank * MAX_LOGIT_ROWS + MAX_LOGIT_ROWS - 1
                     pld.tensor.put(
                         dst=hidden_window, peer=group_base + peer_tp, src=owner_header,
@@ -215,14 +214,14 @@ def lm_head(
                 pld.system.wait(
                     signal=hidden_done,
                     offsets=[owner_tp, 0],
-                    expected=pl.cast(done_epoch * (ROW_CAPACITY // PUSH_ROW_TILE), pl.INT32),
+                    expected=pl.cast(done_epoch * (row_capacity // PUSH_ROW_TILE), pl.INT32),
                     cmp=pld.WaitCmp.Ge,
                 )
 
     # Window -> matmul operand: a local copy split over k-tiles. Keeps the matmul's
     # auto-dep on owner_hiddens.
     owner_header_words = pl.create_tensor([TP_SIZE, 8], dtype=pl.INT32)
-    owner_hiddens = pl.create_tensor([TP_SIZE * ROW_CAPACITY, D], dtype=pl.BF16)
+    owner_hiddens = pl.create_tensor([TP_SIZE * row_capacity, D], dtype=pl.BF16)
     with pl.spmd(
         TP_SIZE * gather_tiles * (D // HIDDEN_GATHER_TILE),
         name_hint="lm_head_dispatch_gather",
@@ -233,12 +232,12 @@ def lm_head(
         row_block = gblock // (D // HIDDEN_GATHER_TILE)
         gather_owner = row_block // gather_tiles
         owner_row = row_block % gather_tiles * gather_rows
-        compact_row = gather_owner * ROW_CAPACITY + owner_row
+        compact_row = gather_owner * row_capacity + owner_row
         window_row = gather_owner * MAX_LOGIT_ROWS + owner_row
         owner_hiddens[compact_row:compact_row + gather_rows, gk0:gk0 + HIDDEN_GATHER_TILE] = hidden_window[
             window_row:window_row + gather_rows, gk0:gk0 + HIDDEN_GATHER_TILE
         ]
-        if MASKED_OWNERS and ROW_CAPACITY < MAX_LOGIT_ROWS:
+        if row_capacity < MAX_LOGIT_ROWS:
             if gk0 == 0 and owner_row == 0:
                 header_row = gather_owner * MAX_LOGIT_ROWS + MAX_LOGIT_ROWS - 1
                 header_bits = pl.load(hidden_window, [header_row, 0], [1, 16])
@@ -266,7 +265,7 @@ def lm_head(
                 mm_r0 = mm_rb * matmul_rows
                 project_owner = mm_rb // matmul_tiles
                 project_active = pl.cast(1, pl.INT32)
-                if MASKED_OWNERS and ROW_CAPACITY < MAX_LOGIT_ROWS:
+                if row_capacity < MAX_LOGIT_ROWS:
                     project_active = pl.read(owner_header_words, [project_owner, 0])
                 if project_active != 0:
                     mm_acc = pl.create_tensor([matmul_rows, FUSED_VOCAB_TILE], dtype=pl.FP32)
@@ -306,7 +305,7 @@ def lm_head(
                     tail_r0 = tail_rb * matmul_rows
                     tail_owner = tail_rb // matmul_tiles
                     tail_active = pl.cast(1, pl.INT32)
-                    if MASKED_OWNERS and ROW_CAPACITY < MAX_LOGIT_ROWS:
+                    if row_capacity < MAX_LOGIT_ROWS:
                         tail_active = pl.read(owner_header_words, [tail_owner, 0])
                     if tail_active != 0:
                         tail_acc = pl.create_tensor([matmul_rows, VOCAB_TAIL], dtype=pl.FP32)
@@ -380,7 +379,7 @@ def lm_head(
             for ob in pl.range(gblk, N_LOGITS_COMM_TILES, LOGITS_COMM_BLOCKS):
                 o0 = ob * LOGITS_COMM_TILE
                 lo = src_vocab_base + o0
-                for gr in pl.range(0, ROW_CAPACITY, LOGITS_GATHER_ROW_TILE):
+                for gr in pl.range(0, row_capacity, LOGITS_GATHER_ROW_TILE):
                     logits[gr : gr + LOGITS_GATHER_ROW_TILE, lo : lo + LOGITS_COMM_TILE] = logits_window[
                         gr : gr + LOGITS_GATHER_ROW_TILE, lo : lo + LOGITS_COMM_TILE
                     ]
@@ -389,7 +388,7 @@ def lm_head(
                 if gblk == LOGITS_TAIL_BLOCK:
                     tail_o0 = N_LOGITS_COMM_TILES * LOGITS_COMM_TILE
                     tl = src_vocab_base + tail_o0
-                    for tr in pl.range(0, ROW_CAPACITY, LOGITS_GATHER_ROW_TILE):
+                    for tr in pl.range(0, row_capacity, LOGITS_GATHER_ROW_TILE):
                         logits[tr : tr + LOGITS_GATHER_ROW_TILE, tl : tl + LOGITS_COMM_TAIL] = logits_window[
                             tr : tr + LOGITS_GATHER_ROW_TILE, tl : tl + LOGITS_COMM_TAIL
                         ]
@@ -431,7 +430,7 @@ def l2_lm_head(
     lm_head(
         hidden_states, lm_head_weight, logit_row_indices, logits,
         hidden_window, hidden_done, logits_window, logits_done,
-        group_base, tp_rank, done_epoch, hidden_ready_tid, MAX_LOGIT_ROWS, False,
+        group_base, tp_rank, done_epoch, hidden_ready_tid,
     )
     return logits
 
@@ -602,7 +601,7 @@ def l2_lm_head_sample(
     lm_head(
         hidden_states, lm_head_weight, logit_row_indices, logits,
         hidden_window, hidden_done, logits_window, logits_done,
-        group_base, tp_rank, done_epoch, hidden_ready_tid, MAX_LOGIT_ROWS, False,
+        group_base, tp_rank, done_epoch, hidden_ready_tid,
     )
     greedy_sample(logits, logit_row_indices, grammar_mask, sampled_ids)
     return logits, sampled_ids

@@ -69,7 +69,7 @@ COMM_ROW_TILE = 8
 ATTENTION_PUBLISH_WORKERS = 48
 O_RS_REDUCE_WORKERS = 48   # 128 row blocks; 8 left 40 of 48 AIV idle
 O_RS_PUBLISH_WORKERS = 32
-O_RS_DEQUANT_WORKERS = 12    # per owner; 4 owners -> one AIV wave
+O_RS_DEQUANT_WORKERS = 12 * TP_SIZE  # 48 workers across the compact group at TP4
 O_RS_PUT_T_TILE = 8
 O_RS_D_TILE = gcd(4096, D)
 LOCAL_T_PAD = (LOCAL_T + TOKEN_TILE - 1) // TOKEN_TILE * TOKEN_TILE
@@ -111,7 +111,7 @@ O_A_K_TILE = 256
 O_A_N_TILE = 128
 QUANT_T_TILE = 8
 O_A_QUANT_TASK_T_TILE = 16
-O_A_QUANT_WORKERS = 6   # per owner-group; 4 x 2 x 6 -> one AIV wave
+O_A_QUANT_WORKERS = 6 * TP_SIZE  # 24 workers per local O group at TP4
 O_B_T_TILE = _token_tile(LOCAL_T_PAD, 128)
 O_B_K_TILE = 256
 O_B_N_TILE = 256
@@ -761,9 +761,9 @@ def o_proj_reduce_scatter(
             group_a_fp32[pa_t0 : pa_t0 + O_A_T_TILE, pa_wrow : pa_wrow + O_A_N_TILE] = pa_valid
 
         # Quantization workers own disjoint 16-row scale regions.
-        with pl.spmd(O_A_QUANT_WORKERS * TP_SIZE, name_hint="tp_o_a_quant", deps=[pa_tid]) as q_tid:
+        with pl.spmd(O_A_QUANT_WORKERS, name_hint="tp_o_a_quant", deps=[pa_tid]) as q_tid:
             qz_worker = pl.tile.get_block_idx()
-            for qz_blk in pl.range(qz_worker, group_quant_blocks, O_A_QUANT_WORKERS * TP_SIZE):
+            for qz_blk in pl.range(qz_worker, group_quant_blocks, O_A_QUANT_WORKERS):
                 qz_scale_line = pl.full([1, O_A_QUANT_TASK_T_TILE], dtype=pl.FP32, value=0.0)
                 for qz_offset in pl.range(0, O_A_QUANT_TASK_T_TILE, QUANT_T_TILE):
                     qz_t = qz_blk * O_A_QUANT_TASK_T_TILE + qz_offset
@@ -790,7 +790,7 @@ def o_proj_reduce_scatter(
                         )
                 qz_line_start = qz_blk * O_A_QUANT_TASK_T_TILE
                 group_scale[local_group : local_group + 1, qz_line_start : qz_line_start + O_A_QUANT_TASK_T_TILE] = qz_scale_line
-            for qz_pad in pl.range(group_quant_tiles + qz_worker, group_pad_tiles, O_A_QUANT_WORKERS * TP_SIZE):
+            for qz_pad in pl.range(group_quant_tiles + qz_worker, group_pad_tiles, O_A_QUANT_WORKERS):
                 qz_pt = qz_pad * QUANT_T_TILE
                 qz_prows = pl.min(QUANT_T_TILE, o_b_group_t - qz_pt)
                 qz_zero = pl.full([QUANT_T_TILE, O_LORA], dtype=pl.FP16, value=0.0)
@@ -821,12 +821,12 @@ def o_proj_reduce_scatter(
                 group_b_i32[pb_t0 : pb_t0 + O_B_T_TILE, pb_col : pb_col + O_B_N_TILE] = pb_acc_2d
 
     with pl.spmd(
-        O_RS_DEQUANT_WORKERS * TP_SIZE,
+        O_RS_DEQUANT_WORKERS,
         name_hint="tp_o_b_dequant",
         optimizations=[pl.cross_core_slot(slot_num=2)],
     ):
         dq_worker = pl.tile.get_block_idx()
-        for dq_blk in pl.range(dq_worker, group_act_rows * (D // ACT_N_TILE), O_RS_DEQUANT_WORKERS * TP_SIZE):
+        for dq_blk in pl.range(dq_worker, group_act_rows * (D // ACT_N_TILE), O_RS_DEQUANT_WORKERS):
             dq_rb = dq_blk // (D // ACT_N_TILE)
             dq_nb = dq_blk - dq_rb * (D // ACT_N_TILE)
             dq_row = dq_rb * ACT_T_TILE
