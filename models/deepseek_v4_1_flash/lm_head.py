@@ -53,7 +53,6 @@ LM_HEAD_M_TILE = 80
 LM_HEAD_N_TILE = 256
 LM_HEAD_K_TILE = 128
 LM_HEAD_PUSH_M_TILE = 192
-LM_HEAD_PUSH_L1_K_TILE = 256
 LM_HEAD_PUSH_L0_K_TILE = 64
 LM_HEAD_GATHER_M_TILE = 72
 LM_HEAD_TAIL_TILE = VOCAB_PER_TP % LM_HEAD_N_TILE or LM_HEAD_N_TILE
@@ -85,6 +84,11 @@ def _lm_head_push_row_tile(num_rows: int) -> int:
     return max(tile for tile in range(lane_aligned, LM_HEAD_PUSH_M_TILE + 1, lane_aligned) if group_rows % tile == 0)
 
 
+def _lm_head_push_l1_tiling(num_rows: int) -> tuple[int, int]:
+    # Small row tiles can overlap an extra L1 load. Larger tiles use shorter K slices.
+    return (256, 3) if _lm_head_push_row_tile(num_rows) <= 32 else (128, 2)
+
+
 @pl.jit.inline(auto_scope=False)
 def _lm_head_project_push(
     hidden: pl.Tensor,
@@ -96,6 +100,8 @@ def _lm_head_project_push(
     dispatch_notified: pl.Scalar[pl.TASK_ID],
     num_rows: pl.constexpr,
     row_tile: pl.constexpr,
+    l1_k_tile: pl.constexpr,
+    l1_stages: pl.constexpr,
 ) -> pl.Scalar[pl.TASK_ID]:
     with pl.spmd(
         32, name_hint="lm_head_matmul_push", deps=[dispatch_ready, dispatch_notified],
@@ -110,13 +116,13 @@ def _lm_head_project_push(
                 # The final projection tile ends at the shard boundary.
                 weight_column = pl.min(column, VOCAB_PER_TP - LM_HEAD_N_TILE)
                 acc = pl.tile.create([row_tile, LM_HEAD_N_TILE], dtype=pl.FP32)
-                for k in pl.pipeline(0, D, LM_HEAD_PUSH_L1_K_TILE, stage=2):
-                    a = pl.load(hidden, [row, k], [row_tile, LM_HEAD_PUSH_L1_K_TILE], target_memory=pl.Mem.Mat)
+                for k in pl.pipeline(0, D, l1_k_tile, stage=l1_stages):
+                    a = pl.load(hidden, [row, k], [row_tile, l1_k_tile], target_memory=pl.Mem.Mat)
                     b = pl.load(
-                        weight, [k, weight_column], [LM_HEAD_PUSH_L1_K_TILE, LM_HEAD_N_TILE],
+                        weight, [k, weight_column], [l1_k_tile, LM_HEAD_N_TILE],
                         target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP,
                     )
-                    for inner in pl.range(0, LM_HEAD_PUSH_L1_K_TILE, LM_HEAD_PUSH_L0_K_TILE):
+                    for inner in pl.pipeline(0, l1_k_tile, LM_HEAD_PUSH_L0_K_TILE, stage=2):
                         left = pl.tile.extract(
                             a, 0, inner, [row_tile, LM_HEAD_PUSH_L0_K_TILE], target_memory=pl.Mem.Left,
                         )
@@ -165,7 +171,7 @@ def _lm_head_panel_gather_tile(
     rows = pl.min(LM_HEAD_GATHER_M_TILE, num_rows - row)
     panel_view = pl.tensor.view(received, [num_rows * (VOCAB // column_tile), column_tile])
     tile = pl.load(panel_view, [input_row, 0], [LM_HEAD_GATHER_M_TILE, column_tile], valid_shape=[rows, column_tile])
-    value = pl.cast(tile, pl.FP32)
+    value = pl.cast(tile, pl.FP32, mode="none")
     pl.store(value, [row, output_column], logits)
 
 
@@ -331,6 +337,8 @@ def lm_head(
         logits_pushed = _lm_head_project_push(
             hidden_window, lm_head_weight, logits_window, project_tp_rank, project_group_base,
             dispatch_ready, dispatch_notified, num_rows, _lm_head_push_row_tile(num_rows),
+            l1_k_tile=_lm_head_push_l1_tiling(num_rows)[0],
+            l1_stages=_lm_head_push_l1_tiling(num_rows)[1],
         )
 
         # Publish one completion update after all vector workers finish their puts.
@@ -350,7 +358,9 @@ def lm_head(
                         cmp=pld.WaitCmp.Ge,
                     )
 
-        with pl.spmd(64, name_hint="lm_head_combine_gather", deps=[combine_ready, combine_notified]) as gathered:
+        with pl.spmd(
+            64, name_hint="lm_head_combine_gather", sync_start=True, deps=[combine_ready, combine_notified],
+        ) as gathered:
             gather_worker = pl.tile.get_block_idx()
             row_tiles = (num_rows + LM_HEAD_GATHER_M_TILE - 1) // LM_HEAD_GATHER_M_TILE
             full_panels = (VOCAB_PER_TP - LM_HEAD_TAIL_TILE) // LM_HEAD_N_TILE
