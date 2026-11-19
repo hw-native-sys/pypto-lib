@@ -86,9 +86,10 @@ QR_PROJ_ROW_TILE = 16
 HEAD_DIM_TILE = 32
 D_TILE = 256
 WEIGHTS_ROW_TILE = 32
-QH_QUANT_ROW_TILE = 64
 ROPE_ROW_TILE = IDX_N_HEADS  # one token owns IDX_N_HEADS contiguous q rows + one cos/sin
 QH_MM_TILE = 64
+QH_QUANT_WORKERS = 24
+QH_QUANT_LANE_ROW_TILE = QH_MM_TILE // 2
 WEIGHTS_TAIL_ROW_TILE = 16
 TOPK_LEAF_TILE = 8192
 TOPK_SHORT_LEAF_TILE = 2048
@@ -590,58 +591,42 @@ def _prefill_indexer_dense_tile(
         rope_bf16 = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
         qr_bf16[r0 : r0 + ROPE_ROW_TILE, :] = pl.concat(qr_nope, rope_bf16)
 
-    qh_acc_gm = pl.create_tensor([PREFILL_DENSE_TILE * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.FP32)
-    for mm_idx in pl.spmd(tile_rows, name_hint="prefill_idx_qr_hadamard", allow_early_resolve=True):
-        r0 = mm_idx * QH_MM_TILE
-        qh_acc = pl.matmul(
-            qr_bf16[r0 : r0 + QH_MM_TILE, :],
-            hadamard,
-            out_dtype=pl.FP32,
-        )
-        qh_acc_gm[r0 : r0 + QH_MM_TILE, :] = qh_acc
-
-    qr_hadamard_i8 = pl.create_tensor(
-        [PREFILL_DENSE_TILE * IDX_N_HEADS, IDX_HEAD_DIM],
-        dtype=pl.INT8,
-    )
-    qr_hadamard_scale_dq = pl.create_tensor(
-        [PREFILL_DENSE_TILE * IDX_N_HEADS, 1],
-        dtype=pl.FP32,
-    )
-    for quant_idx in pl.spmd(tile_rows, name_hint="prefill_idx_qr_quant", allow_early_resolve=True):
-        r0 = quant_idx * QH_QUANT_ROW_TILE
-        qh_amax = pl.full([1, QH_QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-        for h0 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
-            qh_tile = qh_acc_gm[
-                r0 : r0 + QH_QUANT_ROW_TILE,
-                h0 : h0 + HEAD_DIM_TILE,
-            ]
-            qh_abs = pl.maximum(qh_tile, pl.neg(qh_tile))
-            qh_amax = pl.maximum(
-                qh_amax,
-                pl.reshape(pl.row_max(qh_abs), [1, QH_QUANT_ROW_TILE]),
-            )
-        scale_quant_row = pl.div(
-            pl.full([1, QH_QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX),
-            qh_amax,
-        )
-        qr_hadamard_scale_dq[r0 : r0 + QH_QUANT_ROW_TILE, :] = pl.reshape(
-            pl.recip(scale_quant_row),
-            [QH_QUANT_ROW_TILE, 1],
-        )
-        scale_quant = pl.reshape(scale_quant_row, [QH_QUANT_ROW_TILE, 1])
-        for h1 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
-            qh_quant_tile = qh_acc_gm[
-                r0 : r0 + QH_QUANT_ROW_TILE,
-                h1 : h1 + HEAD_DIM_TILE,
-            ]
-            qh_scaled = pl.row_expand_mul(qh_quant_tile, scale_quant)
-            qh_i32 = pl.cast(qh_scaled, target_type=pl.INT32, mode="rint")
-            qh_half = pl.cast(qh_i32, target_type=pl.FP16, mode="round")
-            qr_hadamard_i8[
-                r0 : r0 + QH_QUANT_ROW_TILE,
-                h1 : h1 + HEAD_DIM_TILE,
-            ] = pl.cast(qh_half, target_type=pl.INT8, mode="trunc")
+    qr_hadamard_i8 = pl.create_tensor([PREFILL_DENSE_TILE * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
+    qr_hadamard_scale_dq = pl.create_tensor([PREFILL_DENSE_TILE * IDX_N_HEADS, 1], dtype=pl.FP32)
+    with pl.spmd(QH_QUANT_WORKERS, name_hint="prefill_idx_qr_hadamard_quant", allow_early_resolve=True, optimizations=[pl.cross_core_slot(slot_num=2, local_slot_num=1)]):
+        qh_worker = pl.tile.get_block_idx()
+        if qh_worker < tile_rows:
+            qh_weight = pl.load(hadamard, [0, 0], [IDX_HEAD_DIM, IDX_HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+            for qh_group in pl.pipeline(qh_worker, tile_rows, QH_QUANT_WORKERS, stage=1):
+                qh_r0 = qh_group * QH_MM_TILE
+                qh_input = pl.load(qr_bf16, [qh_r0, 0], [QH_MM_TILE, IDX_HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+                qh_acc = pl.matmul(qh_input, qh_weight, out_dtype=pl.FP32)
+                for qh_shard in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    qh_values = pl.aiv_shard(qh_acc)
+                for qh_lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                    qh_lane_r0 = qh_r0 + qh_lane * QH_QUANT_LANE_ROW_TILE
+                    qh_amax = pl.tile.full([1, QH_QUANT_LANE_ROW_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+                    qh_reduce_tmp = pl.tile.create([QH_QUANT_LANE_ROW_TILE, HEAD_DIM_TILE], pl.FP32)
+                    for h0 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
+                        qh_tile = pl.tile.slice(qh_values, [QH_QUANT_LANE_ROW_TILE, HEAD_DIM_TILE], [0, h0])
+                        qh_neg = pl.neg(qh_tile)
+                        qh_abs = pl.maximum(qh_tile, qh_neg)
+                        qh_max_rows = pl.row_max(qh_abs, tmp_tile=qh_reduce_tmp)
+                        qh_row_max = pl.reshape(qh_max_rows, [1, QH_QUANT_LANE_ROW_TILE])
+                        qh_amax = pl.maximum(qh_amax, qh_row_max)
+                    scale_quant_num = pl.tile.full([1, QH_QUANT_LANE_ROW_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
+                    scale_quant_row = pl.div(scale_quant_num, qh_amax)
+                    scale_dequant_row = pl.recip(scale_quant_row)
+                    scale_dequant = pl.reshape(scale_dequant_row, [QH_QUANT_LANE_ROW_TILE, 1])
+                    pl.store(scale_dequant, [qh_lane_r0, 0], qr_hadamard_scale_dq)
+                    scale_quant = pl.reshape(scale_quant_row, [QH_QUANT_LANE_ROW_TILE, 1])
+                    for h1 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
+                        qh_quant_tile = pl.tile.slice(qh_values, [QH_QUANT_LANE_ROW_TILE, HEAD_DIM_TILE], [0, h1])
+                        qh_scaled = pl.row_expand_mul(qh_quant_tile, scale_quant)
+                        qh_i32 = pl.cast(qh_scaled, target_type=pl.INT32, mode="rint")
+                        qh_half = pl.cast(qh_i32, target_type=pl.FP16, mode="round")
+                        qh_i8 = pl.cast(qh_half, target_type=pl.INT8, mode="trunc")
+                        pl.store(qh_i8, [qh_lane_r0, h1], qr_hadamard_i8)
 
     # Per-head weight projection with an M16 tail.
     weights = pl.create_tensor([PREFILL_DENSE_TILE, IDX_N_HEADS], dtype=pl.FP32)
