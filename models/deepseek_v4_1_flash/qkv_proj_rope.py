@@ -45,6 +45,9 @@ Q_LORA = M.q_lora_rank
 Q_A_N_TILE = 64
 Q_B_N_TILE = 256
 KV_N_TILE = 64
+KV_DECODE_N_TILE = 32
+KV_DECODE_K_TILE = 384
+KV_DECODE_LAST_K_TILE = (D - 1) % KV_DECODE_K_TILE + 1
 QKV_SCALE_TILE = MX_M_TILE * MX_K_TILE // 32
 PROJ_M_TILE = 80
 PROJ_WIDE_M_TILE = 128
@@ -806,15 +809,17 @@ def _proj_kv_tile_pypto(
                 if base + worker < HEAD_DIM // n_tile:
                     col = (base + worker) * n_tile
                     if m_tile == 80:
+                        k_end = D - KV_DECODE_LAST_K_TILE
                         full_a = pl.load(payload, [row, 0], [80, D], target_memory=pl.Mem.Mat)
                         a0 = pl.tile.slice(full_a, [80, k_tile], [0, 0])
                     else:
+                        k_end = D
                         a0 = pl.load(payload, [row, 0], [m_tile, k_tile], target_memory=pl.Mem.Mat)
                     sa0 = pl.load(sa, [0, 0], [m_tile, k_tile // 32])
                     b0 = pl.load(nz_weight, [0, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
                     sb0 = pl.load(b_scales, [0, col], [k_tile // 32, n_tile])
                     acc = pl.matmul_mx(a0, sa0, b0, sb0)
-                    for k in pl.pipeline(k_tile, D, k_tile, stage=2):
+                    for k in pl.pipeline(k_tile, k_end, k_tile, stage=2):
                         if m_tile == 80:
                             av = pl.tile.slice(full_a, [80, k_tile], [0, k])
                         else:
@@ -823,6 +828,12 @@ def _proj_kv_tile_pypto(
                         bv = pl.load(nz_weight, [k, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
                         sbv = pl.load(b_scales, [k // 32, col], [k_tile // 32, n_tile])
                         acc = pl.matmul_mx_acc(acc, av, sav, bv, sbv)
+                    if m_tile == 80:
+                        a_tail = pl.tile.slice(full_a, [80, KV_DECODE_LAST_K_TILE], [0, k_end])
+                        sa_tail = pl.load(sa, [0, k_end // 32], [80, KV_DECODE_LAST_K_TILE // 32])
+                        b_tail = pl.load(nz_weight, [k_end, col], [KV_DECODE_LAST_K_TILE, n_tile], target_memory=pl.Mem.Mat)
+                        sb_tail = pl.load(b_scales, [k_end // 32, col], [KV_DECODE_LAST_K_TILE // 32, n_tile])
+                        acc = pl.matmul_mx_acc(acc, a_tail, sa_tail, b_tail, sb_tail)
                     valid = pl.set_validshape(acc, valid_rows, n_tile)
                     row_output = pl.store(valid, [0, col], row_output)
     return output
@@ -888,7 +899,8 @@ def kv_proj_pypto(
         )
     else:
         kv_projection = _proj_kv_tile_pypto(
-            payload, wkv, scales, wkv_scale, kv_projection, num_tokens, worker_limit, 80, 64, 320,
+            payload, wkv, scales, wkv_scale, kv_projection, num_tokens, worker_limit, 80,
+            KV_DECODE_N_TILE if worker_limit >= HEAD_DIM // KV_DECODE_N_TILE else KV_N_TILE, KV_DECODE_K_TILE,
         )
     return kv_projection
 
