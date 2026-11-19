@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""One real Gated DeltaNet layer of Qwen3.8-27B, fetched without the checkpoint.
+"""Load and prepare Gated DeltaNet weights for Qwen3.8-27B.
 
 The nine `linear_attn` tensors of a layer sit next to each other in their
 safetensors shard, so a single HTTP range request of 221 MiB brings a whole
@@ -25,7 +25,7 @@ The file is a `torch.save` dict keyed by the tensor names under `linear_attn.`
 and gitignored with it. `--quantize` writes the int8 form beside it
 (`..._int8.pt`): the projections the kernels run as W8A8 replaced by int8 plus a
 per-output-channel `weight_scale`, everything else as it was (see
-`reference.quantize_weights`; the scheme is `config.GDN_QUANT`). The
+`quantize_weights`; the scheme is `config.GDN_QUANT`). The
 checkpoint ships no int8, so this is the quantisation the kernels are scored
 against until a converted checkpoint supplies its own scales.
 
@@ -40,9 +40,14 @@ import argparse
 import json
 import struct
 import urllib.request
+from collections.abc import Callable
+from functools import cache
 from pathlib import Path
 
 import torch
+
+import reference
+from config import GDN_QUANT, Qwen38Config
 
 REPO = "Qwen/Qwen3.8-27B"
 # The commit `main` resolved to when the config was pinned (Q0). Byte offsets
@@ -106,15 +111,44 @@ def load_layer(path: str | Path) -> dict[str, torch.Tensor]:
     return torch.load(path, weights_only=True)
 
 
+def load_weights(cfg: Qwen38Config, path: str | Path | None) -> dict[str, torch.Tensor]:
+    """Load a layer checkpoint or generate deterministic weights."""
+    if path is None:
+        return reference.make_block_weights(cfg)
+    return load_layer(path)
+
+
+def quantized_weight(
+    cfg: Qwen38Config, module: str, path: str | Path | None,
+) -> tuple[Callable[[], torch.Tensor], Callable[[], torch.Tensor]]:
+    """Return lazy initializers for a projection's INT8 weight and FP32 scales."""
+    @cache
+    def load():
+        w = load_weights(cfg, path)[module + ".weight"]
+        return reference.quantize_rows(w)
+
+    return (lambda: load()[0]), (lambda: load()[1])
+
+
+def stacked_ab_weight(w: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Stack the A and B projection weights in the fused BF16 layout."""
+    return torch.cat([w["in_proj_a.weight"], w["in_proj_b.weight"]]).to(torch.bfloat16)
+
+
+def quantize_weights(w: dict[str, torch.Tensor],
+                     names: tuple[str, ...] = GDN_QUANT.weights) -> dict[str, torch.Tensor]:
+    """Replace selected weights with INT8 tensors and add their FP32 scales."""
+    out = dict(w)
+    for name in names:
+        if not name.endswith(".weight"):
+            raise ValueError(f"expected a projection weight name, got {name}")
+        scale_name = name.removesuffix(".weight") + ".weight_scale"
+        out[name], out[scale_name] = reference.quantize_rows(w[name])
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    # Accepted and ignored: this is a host-side tool, but CI invokes every runnable
-    # file in a model directory as `python <file> -p <platform> -d <card>`.
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"],
-                        help="accepted for CI's uniform invocation; nothing here runs on device")
-    parser.add_argument("-d", "--device", type=int, default=0,
-                        help="accepted for CI's uniform invocation; unused")
     parser.add_argument("--fetch", action="store_true",
                         help="download the layer from the checkpoint if it is not already "
                              "on disk; without it a missing file is reported, not fetched")
@@ -135,13 +169,11 @@ def main() -> int:
         return 0
 
     if args.quantize:
-        import reference
-
         if not source.is_file():
             weights = fetch_layer(args.layer, revision=args.revision)
             source.parent.mkdir(parents=True, exist_ok=True)
             torch.save(weights, source)
-        weights = reference.quantize_weights(load_layer(source))
+        weights = quantize_weights(load_layer(source))
         out = Path(args.out) if args.out else default_path(args.layer, quantized=True)
     elif source.is_file():
         print(f"[weights] layer {args.layer} already on disk ({source})")

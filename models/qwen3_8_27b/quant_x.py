@@ -32,8 +32,8 @@ CHUNK = CHUNK_TILE                          # only picks the reference chain to 
 SCALE_MAX = GDN_QUANT.scale_max
 AMAX_EPS = GDN_QUANT.amax_eps
 
-# case shape
-T = 8192                # tokens (single sequence, B = 1)
+# validation
+DEFAULT_TEST_SEQ_LEN = 512
 
 # gate
 MIN_EXACT_VS_REFERENCE = 0.999  # of x_q elements identical to the fake-quant reference
@@ -46,7 +46,7 @@ GROUP = 4               # pipelined steps per block
 OUTPUTS = ("x_q", "x_scale")        # bench.py reads it
 
 
-def build_kernel(t: int = T, c: int = C, inline: bool = False,
+def build_kernel(t: int = DEFAULT_TEST_SEQ_LEN, c: int = C, inline: bool = False,
                  tok_tile: int = TOK_TILE, ch_tile: int = CH_TILE, group: int = GROUP):
     """The operator at one shape. `inline` makes it a callee for `gdn_block`.
 
@@ -132,7 +132,7 @@ def golden_gdn_quant_x(tensors):
     tensors["x_scale"].copy_(scale.reshape(1, -1))
 
 
-def build_tensor_specs(t: int = T, c: int = C, chunk: int = CHUNK,
+def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, c: int = C, chunk: int = CHUNK,
                        weights: str | None = None):
     import torch
     from golden import TensorSpec
@@ -194,10 +194,10 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=DEFAULT_TEST_SEQ_LEN)
     parser.add_argument("--tok-tile", type=int, default=TOK_TILE)
     parser.add_argument("--ch-tile", type=int, default=CH_TILE)
     parser.add_argument("--group", type=int, default=GROUP)
@@ -222,7 +222,7 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
-        config=dict(platform=args.platform, device_id=args.device),
+        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
         rtol=1e-3,
         atol=1e-5,
         compare_fn={"x_q": compare_x_q(args.seq_len, CHUNK, None),

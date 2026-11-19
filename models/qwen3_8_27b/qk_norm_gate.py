@@ -26,8 +26,8 @@ HG = QWEN3_8_27B.linear_num_key_heads       # QK heads: q and k
 D = QWEN3_8_27B.linear_value_head_dim       # head dimension, the norm's axis
 EPS = 1e-6                                  # inside the sqrt
 
-# case shape
-T = 8192                # tokens (single sequence, B = 1)
+# validation
+DEFAULT_TEST_SEQ_LEN = 512
 
 # tiling
 ROW_TILE = 64           # (token, head) rows per pipelined step of the norm
@@ -39,7 +39,7 @@ TOK_TILE = 256          # tokens per block of the gate
 SOFTPLUS_LINEAR = 20.0
 
 
-def build_kernel(t: int = T, h: int = H, hg: int = HG, d: int = D, eps: float = EPS,
+def build_kernel(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, hg: int = HG, d: int = D, eps: float = EPS,
                  inline: bool = False, row_tile: int = ROW_TILE, group: int = GROUP,
                  tok_tile: int = TOK_TILE):
     """The operator at one shape. `inline` makes it a callee for `gdn_block`."""
@@ -135,56 +135,56 @@ def golden_gdn_qk_norm_gate(tensors):
     tensors["g"].copy_(g)
 
 
-def _split(which: int, t: int, hg: int, d: int, chunk: int, weights: str | None):
-    """q (0) or k (1) out of the conv output: the chain keeps only their normed forms."""
+def qk_norm_gate_ref(q, k, a, b, a_log, dt_bias):
+    """Float64 Q/K normalization, beta and decay."""
     import torch
+    from torch.nn.functional import softplus
 
-    import block_reference
+    from reference import REF_DTYPE
 
-    src = block_reference.block_inputs("qkv_conv", t, QWEN3_8_27B, chunk, weights=weights)
-    width = hg * d
+    def normalize(x):
+        xf = x.to(REF_DTYPE)
+        return xf * torch.rsqrt((xf * xf).sum(dim=-1, keepdim=True) + EPS)
 
-    def load():
-        col = which * width
-        return src()[:, col : col + width].reshape(t, hg, d).to(torch.bfloat16)
-
-    return load
-
-
-def _proj(key: str, t: int, chunk: int, weights: str | None):
-    import torch
-
-    import block_reference
-
-    src = block_reference.block_inputs(key, t, QWEN3_8_27B, chunk, weights=weights)
-    return lambda: src().to(torch.bfloat16)
+    q_out = normalize(q) * q.shape[-1] ** -0.5
+    k_out = normalize(k)
+    beta = torch.sigmoid(b.to(REF_DTYPE))
+    g = -torch.exp(a_log.to(REF_DTYPE)) * softplus(a.to(REF_DTYPE) + dt_bias.to(REF_DTYPE))
+    return q_out, k_out, beta, g
 
 
-def _param(name: str, weights: str | None):
-    import torch
+def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, hg: int = HG, d: int = D,
+                       weights: str | None = None):
+    from functools import cache
 
-    import reference
-
-    def load():
-        w = (reference.make_block_weights(QWEN3_8_27B) if weights is None
-             else torch.load(weights, weights_only=True))
-        return w[name].to(torch.bfloat16)
-
-    return load
-
-
-def build_tensor_specs(t: int = T, h: int = H, hg: int = HG, d: int = D,
-                       chunk: int = 128, weights: str | None = None):
     import torch
     from golden import TensorSpec
 
+    from weights import load_layer
+
+    def draw(shape, seed):
+        def load():
+            generator = torch.Generator().manual_seed(seed)
+            return (torch.randn(shape, generator=generator) * 0.5).to(torch.bfloat16)
+
+        return load
+
+    @cache
+    def params():
+        if weights is None:
+            generator = torch.Generator().manual_seed(48)
+            a_log = torch.log(0.01 + (16 - 0.01) * torch.rand(h, generator=generator))
+            return {"A_log": a_log, "dt_bias": torch.ones(h)}
+        layer = load_layer(weights)
+        return {name: layer[name] for name in ("A_log", "dt_bias")}
+
     return [
-        TensorSpec("q", [t, hg, d], torch.bfloat16, init_value=_split(0, t, hg, d, chunk, weights)),
-        TensorSpec("k", [t, hg, d], torch.bfloat16, init_value=_split(1, t, hg, d, chunk, weights)),
-        TensorSpec("a_proj", [t, h], torch.bfloat16, init_value=_proj("a_proj", t, chunk, weights)),
-        TensorSpec("b_proj", [t, h], torch.bfloat16, init_value=_proj("b_proj", t, chunk, weights)),
-        TensorSpec("a_log", [h], torch.bfloat16, init_value=_param("A_log", weights)),
-        TensorSpec("dt_bias", [h], torch.bfloat16, init_value=_param("dt_bias", weights)),
+        TensorSpec("q", [t, hg, d], torch.bfloat16, init_value=draw((t, hg, d), 42)),
+        TensorSpec("k", [t, hg, d], torch.bfloat16, init_value=draw((t, hg, d), 43)),
+        TensorSpec("a_proj", [t, h], torch.bfloat16, init_value=draw((t, h), 44)),
+        TensorSpec("b_proj", [t, h], torch.bfloat16, init_value=draw((t, h), 45)),
+        TensorSpec("a_log", [h], torch.bfloat16, init_value=lambda: params()["A_log"]),
+        TensorSpec("dt_bias", [h], torch.bfloat16, init_value=lambda: params()["dt_bias"]),
         TensorSpec("q_out", [t, hg, d], torch.float16),
         TensorSpec("k_out", [t, hg, d], torch.float16),
         TensorSpec("beta", [h, t], torch.float32),
@@ -192,42 +192,18 @@ def build_tensor_specs(t: int = T, h: int = H, hg: int = HG, d: int = D,
     ]
 
 
-def compare_against_reference(t: int, chunk: int, weights: str | None):
-    """Report each output's distance from the float64 reference beside the golden gate."""
-    import block_reference
-
-    def make(key, transform=None):
-        def compare(actual, expected, **kw):
-            from golden import ratio_allclose
-
-            gate = ratio_allclose(atol=3e-3, rtol=3e-3, max_error_ratio=0.02)
-            ok, detail = gate(actual, expected, **kw)
-            ref = block_reference.block_inputs(key, t, QWEN3_8_27B, chunk, weights=weights)()
-            if transform is not None:
-                ref = transform(ref)
-            dev = actual.double().reshape(ref.shape)
-            print(f"[stats] {key}: max abs {float((dev - ref).abs().max()):.3e}, "
-                  f"rel frob {float((dev - ref).norm() / ref.norm()):.3e} vs float64", flush=True)
-            return ok, detail
-
-        return compare
-
-    return {"q_out": make("q"), "k_out": make("k"),
-            "beta": make("beta", lambda x: x.t().contiguous()), "g": make("g")}
-
-
 if __name__ == "__main__":
     import argparse
     import os
     import statistics
 
-    from golden import run
+    from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=DEFAULT_TEST_SEQ_LEN)
     parser.add_argument("--weights", type=str, default=None,
                         help="a real layer from weights.py; default: random weights")
     parser.add_argument("--row-tile", type=int, default=ROW_TILE)
@@ -246,6 +222,7 @@ if __name__ == "__main__":
         os.environ["PYPTO_BENCH_ROUNDS"] = str(args.rounds)
         os.environ["PYPTO_BENCH_WARMUP"] = "5"
 
+    gate = ratio_allclose(atol=3e-3, rtol=3e-3, max_error_ratio=0.02)
     result = run(
         fn=build_kernel(t=args.seq_len, row_tile=args.row_tile, group=args.group,
                         tok_tile=args.tok_tile),
@@ -254,10 +231,10 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
-        config=dict(platform=args.platform, device_id=args.device),
+        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
         rtol=1e-3,
         atol=1e-5,
-        compare_fn=compare_against_reference(args.seq_len, 128, args.weights),
+        compare_fn=dict.fromkeys(("q_out", "k_out", "beta", "g"), gate),
         compile_only=args.compile_only,
     )
     if args.rounds and result.bench is not None:

@@ -27,10 +27,8 @@ from config import QWEN3_8_27B
 K = QWEN3_8_27B.hidden_size                 # contraction: the block's input width
 H = QWEN3_8_27B.linear_num_value_heads      # one scalar per value head, twice over
 
-MODULES = ("in_proj_a", "in_proj_b")
-
-# case shape
-T = 8192                # tokens (single sequence, B = 1)
+# validation
+DEFAULT_TEST_SEQ_LEN = 512
 
 # tiling
 M_TILE = 128            # token rows per block
@@ -39,7 +37,7 @@ K_TILE = 256            # contraction step; bf16 halves the useful K tile
 OUTPUTS = ("a_proj", "b_proj")      # bench.py reads it
 
 
-def build_kernel(t: int = T, k: int = K, h: int = H, inline: bool = False,
+def build_kernel(t: int = DEFAULT_TEST_SEQ_LEN, k: int = K, h: int = H, inline: bool = False,
                  m_tile: int = M_TILE, k_tile: int = K_TILE):
     """The operator at one shape. `inline` makes it a callee for `gdn_block`."""
     if t % m_tile or k % k_tile:
@@ -79,39 +77,29 @@ gdn_in_proj_ab = build_kernel()
 def golden_fn(tensors):
     import torch
 
-    import a8w8_linear
+    from reference import host_torch_setup
 
-    a8w8_linear.host_torch_setup()
+    host_torch_setup()
     h = tensors["a_proj"].shape[1]
     acc = tensors["x"].float() @ tensors["w_ab"].float().t()
     tensors["a_proj"].copy_(acc[:, :h].to(torch.bfloat16))
     tensors["b_proj"].copy_(acc[:, h:].to(torch.bfloat16))
 
 
-def _stacked_weight(weights: str | None):
-    """`in_proj_a.weight` on top of `in_proj_b.weight`: the [2H, K] the kernel reads."""
-    import torch
-
-    import a8w8_linear
-
-    def load():
-        w = a8w8_linear.load_weights(QWEN3_8_27B, weights)
-        return torch.cat([w[m + ".weight"] for m in MODULES])
-
-    return load
-
-
-def build_tensor_specs(t: int = T, k: int = K, h: int = H, weights: str | None = None,
+def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, k: int = K, h: int = H, weights: str | None = None,
                        **_):
     import torch
     from golden import TensorSpec
 
-    import reference
+    from reference import make_block_inputs
+    from weights import load_weights, stacked_ab_weight
+
+    def weights_ab():
+        return stacked_ab_weight(load_weights(QWEN3_8_27B, weights))
 
     return [
-        TensorSpec("x", [t, k], torch.bfloat16,
-                   init_value=lambda: reference.make_block_inputs(t, QWEN3_8_27B)),
-        TensorSpec("w_ab", [2 * h, k], torch.bfloat16, init_value=_stacked_weight(weights)),
+        TensorSpec("x", [t, k], torch.bfloat16, init_value=lambda: make_block_inputs(t, QWEN3_8_27B)),
+        TensorSpec("w_ab", [2 * h, k], torch.bfloat16, init_value=weights_ab),
         TensorSpec("a_proj", [t, h], torch.bfloat16),
         TensorSpec("b_proj", [t, h], torch.bfloat16),
     ]
@@ -125,16 +113,16 @@ def compare(name: str, t: int, weights: str | None):
     """
     from golden import ratio_allclose
 
-    import a8w8_linear
     import reference
+    from weights import load_weights
 
     module = "in_proj_a" if name == "a_proj" else "in_proj_b"
     gate = ratio_allclose(atol=3e-3, rtol=3e-3, max_error_ratio=0.02)
 
     def compare_fn(actual, expected, **kw):
         ok, detail = gate(actual, expected, **kw)
-        a8w8_linear.host_torch_setup()
-        w = a8w8_linear.load_weights(QWEN3_8_27B, weights)[module + ".weight"]
+        reference.host_torch_setup()
+        w = load_weights(QWEN3_8_27B, weights)[module + ".weight"]
         ref = reference.linear(reference.make_block_inputs(t, QWEN3_8_27B), w)
         dev = actual.double()
         print(f"[stats] {name}: rel frob {float((dev - ref).norm() / ref.norm()):.3e} "
@@ -152,10 +140,10 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=DEFAULT_TEST_SEQ_LEN)
     parser.add_argument("--weights", type=str, default=None,
                         help="a real layer from weights.py; default: random weights")
     parser.add_argument("--m-tile", type=int, default=M_TILE)
@@ -180,7 +168,7 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
-        config=dict(platform=args.platform, device_id=args.device),
+        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
         rtol=1e-3,
         atol=1e-5,
         compare_fn={"a_proj": compare("a_proj", args.seq_len, args.weights),

@@ -6,7 +6,6 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: no-sim
 """Qwen3.8-27B's whole Gated DeltaNet block: hidden states in, hidden states out.
 
     x_q, x_scale = quant_x(x)                     per-token int8 of the hidden states
@@ -49,8 +48,8 @@ import qk_norm_gate
 import quant_x
 import short_conv
 import solve_tril
-from chunk_cumsum import CHUNK_TILE
-from config import QWEN3_8_27B
+from chunk_cumsum import CHUNK_TILE, DISPATCH_TOKENS
+from config import GDN_QUANT, QWEN3_8_27B
 
 # model shape
 C = QWEN3_8_27B.hidden_size                 # the residual stream
@@ -62,15 +61,10 @@ D = QWEN3_8_27B.linear_value_head_dim
 KCONV = QWEN3_8_27B.linear_conv_kernel_dim  # convolution taps
 CHUNK = CHUNK_TILE
 
-# case shape
-T = 8192                # tokens (single sequence, B = 1)
+# validation
+DEFAULT_TEST_SEQ_LEN = 512
 
-# At T = 8192 the block holds about 1.3 GB of intermediates at once: 0.6 GB
-# inside the delta rule, and the projections, the convolution's three outputs
-# and the quantised hand-offs on top. `gdn_layer` needs 1 GiB for its 0.6 GB,
-# so this follows the same ratio, rounded up: the runtime takes powers of two
-# only. Under the default 256 MiB per ring the layer alone fails with
-# orch_error_code=2 HEAP_RING_DEADLOCK.
+# Per-ring heap override for sequences longer than one dispatch group.
 BLOCK_RING_HEAP = 4 * 1024 * 1024 * 1024
 
 # tiling
@@ -79,19 +73,29 @@ HALO_TILE = 1024        # channels per block of the zero fill above the projecti
 OUTPUTS = ("out",)      # bench.py reads it
 
 
-def run_config(platform: str = "a2a3", device: int = 0) -> dict:
-    """The config `golden.run` needs for this block. The ring heap is not optional."""
-    return dict(platform=platform, device_id=device, ring_heap=BLOCK_RING_HEAP)
+def run_config(backend_type: str = "a2a3", device: int = 0, sim: bool = False, *, t: int = DEFAULT_TEST_SEQ_LEN) -> dict:
+    """Configure the block's backend and ring heap for the token count."""
+    config = dict(backend_type=backend_type, execution_mode=sim, device_id=device)
+    if t > DISPATCH_TOKENS:
+        config["ring_heap"] = BLOCK_RING_HEAP
+    return config
 
 
-def build_kernel(t: int = T, h: int = H, hg: int = HG, d: int = D, chunk: int = CHUNK,
+def build_kernel(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, hg: int = HG, d: int = D, chunk: int = CHUNK,
                  inline: bool = False):
     """The block at one shape, composing fourteen operators as inlined callees."""
+    if t <= 0 or t % DISPATCH_TOKENS:
+        raise ValueError(f"t={t} must be a positive multiple of {DISPATCH_TOKENS}")
+
     c, cqkv, cv, k = C, CQKV, CV, KCONV
     key_width = hg * d
 
     op_quant = quant_x.build_kernel(t=t, inline=True)
-    op_qkv = in_proj_qkv.build_kernel(t=t, inline=True, row_off=k - 1)
+    op_qkv = a8w8_linear.build_kernel(
+        t, c, cqkv, name=in_proj_qkv.MODULE, inline=True, row_off=k - 1,
+        m_tile=in_proj_qkv.M_TILE, n_tile=in_proj_qkv.N_TILE, k_tile=in_proj_qkv.K_TILE,
+        m_group=in_proj_qkv.M_GROUP, n_group=in_proj_qkv.N_GROUP,
+    )
     op_z = in_proj_z.build_kernel(t=t, inline=True)
     op_ab = in_proj_ab.build_kernel(t=t, inline=True)
     conv = dict(t=t, c=cqkv, k=k, inline=True)
@@ -176,30 +180,24 @@ def build_kernel(t: int = T, h: int = H, hg: int = HG, d: int = D, chunk: int = 
     return gdn_block
 
 
-def build_tensor_specs(t: int = T, h: int = H, hg: int = HG, d: int = D,
+def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, hg: int = HG, d: int = D,
                        chunk: int = CHUNK, weights: str | None = None):
     """Every weight the block reads, plus the delta rule's three constants."""
     import torch
     from golden import TensorSpec
 
     import reference
+    from weights import load_weights, quantized_weight, stacked_ab_weight
 
     def block_weights():
-        if weights is None:
-            return reference.make_block_weights(QWEN3_8_27B)
-        return torch.load(weights, weights_only=True)
+        return load_weights(QWEN3_8_27B, weights)
 
-    def quantized(module):
-        q, scale = a8w8_linear.quantized_weight(QWEN3_8_27B, module, weights)
-        return q, scale
-
-    w_qkv, w_qkv_scale = quantized("in_proj_qkv")
-    w_z, w_z_scale = quantized("in_proj_z")
-    w_out, w_out_scale = quantized("out_proj")
+    w_qkv, w_qkv_scale = quantized_weight(QWEN3_8_27B, in_proj_qkv.MODULE, weights)
+    w_z, w_z_scale = quantized_weight(QWEN3_8_27B, in_proj_z.MODULE, weights)
+    w_out, w_out_scale = quantized_weight(QWEN3_8_27B, out_proj.MODULE, weights)
 
     def stacked_ab():
-        w = block_weights()
-        return torch.cat([w["in_proj_a.weight"], w["in_proj_b.weight"]]).to(torch.bfloat16)
+        return stacked_ab_weight(block_weights())
 
     def taps():
         return block_weights()["conv1d.weight"].reshape(CQKV, KCONV).t().contiguous().float()
@@ -241,44 +239,38 @@ def build_tensor_specs(t: int = T, h: int = H, hg: int = HG, d: int = D,
     ]
 
 
-def golden_gdn_block(weights: str | None = None):
-    """The fake-quant chain: the block in float64 with the two activation quantisations.
+def _reference_weights(inputs):
+    """Translate the block's weight tensors to the Torch reference layout."""
+    w_a, w_b = inputs["w_ab"].chunk(2, dim=0)
+    return {
+        "in_proj_qkv.weight": inputs["w_qkv"],
+        "in_proj_qkv.weight_scale": inputs["w_qkv_scale"],
+        "in_proj_z.weight": inputs["w_z"],
+        "in_proj_z.weight_scale": inputs["w_z_scale"],
+        "in_proj_a.weight": w_a,
+        "in_proj_b.weight": w_b,
+        "conv1d.weight": inputs["conv_w"].t().unsqueeze(1),
+        "A_log": inputs["a_log"],
+        "dt_bias": inputs["dt_bias"],
+        "norm.weight": inputs["norm_w"],
+        "out_proj.weight": inputs["w_out"],
+        "out_proj.weight_scale": inputs["w_out_scale"],
+    }
 
-    A factory, like `compare_out`, because the weight set has to reach it: the
-    specs draw the device inputs from *weights*, so a golden computed from the
-    random set would be a different problem's answer. `compare_out` scores
-    against its own chain and would not notice, but `--save-data` persists this
-    tensor for a later `--golden-data` replay.
-    """
-    def golden(tensors):
-        tensors["out"].copy_(_chain(tensors["x"].shape[0], weights, quant=True)["out"])
 
-    return golden
-
-
-_CHAIN_CACHE: dict[tuple, dict] = {}
-
-
-def _chain(t: int, weights: str | None, quant: bool, chunk: int = CHUNK):
-    """The float64 block, cached. *quant* picks the fake-quant chain or the truth."""
-    import torch
-
+def _reference_out(inputs, weights, *, quant: bool):
     import block_reference
-    import reference
 
-    a8w8_linear.host_torch_setup()
-    key = (t, weights, quant, chunk)
-    if key not in _CHAIN_CACHE:
-        if weights is None:
-            w = reference.make_block_weights(QWEN3_8_27B)
-        else:
-            w = torch.load(weights, weights_only=True)
-        if quant:
-            w = reference.quantize_weights(w)
-        _CHAIN_CACHE[key] = block_reference.block(
-            reference.make_block_inputs(t, QWEN3_8_27B), w, QWEN3_8_27B, chunk,
-            quant_x=quant, quant_y=quant)
-    return _CHAIN_CACHE[key]
+    chunk = inputs["tril"].shape[0]
+    return block_reference.block(inputs["x"], weights, QWEN3_8_27B, chunk, quant_x=quant, quant_y=quant)["out"]
+
+
+def golden_gdn_block(tensors):
+    """Fill the fake-quant golden from the block's input tensors."""
+    from reference import host_torch_setup
+
+    host_torch_setup()
+    tensors["out"].copy_(_reference_out(tensors, _reference_weights(tensors), quant=True))
 
 
 # Acceptance, both against the quantization floor rather than a fixed number.
@@ -296,35 +288,37 @@ MAX_VS_GOLDEN = 1.00
 MAX_ROW_VS_GOLDEN = 1.50
 
 
-def compare_out(t: int, weights: str | None):
-    """Score the block against the float64 truth, beside what quantization alone costs.
+def compare_out(weights: str | None):
+    """Compare the harness golden and FP64 truth using the run's quantization floor."""
+    import math
 
-    **Not** an element-wise gate against the fake-quant chain, which is the
-    obvious choice and the wrong one. `out_proj` reads int8, so a difference
-    far below the int8 step still flips values that sit near a rounding
-    boundary: the kernels' own dtypes move `y` by 2.6e-03, that flips 1.0% of
-    `y_q` by one step, and those flips alone move `out` by 1.4e-02. An
-    element-wise comparison after a quantization step measures which side of a
-    boundary a value landed on, not whether the kernel is right.
+    import torch
 
-    What is meaningful is how much the block adds to what W8A8 already costs,
-    so both gates are ratios against the quantization floor and neither
-    carries a tolerance of its own. The second one is per token row: a
-    corrupted row barely moves the whole-tensor norm -- one dead row in 2048
-    is 1.12x the floor -- while moving the worst row by more than 10x.
+    import reference
+    from weights import load_weights
 
-    Those two ratios are not sufficient on their own. Each compares a distance
-    to the *truth* against another distance to the truth, so neither bounds how
-    far the kernel is from the fake-quant chain it implements: an output
-    mirrored across the truth, `2 * truth - fq`, is exactly the floor distance
-    from the truth and passes both at 1.000x while being twice the floor from
-    the answer it should have produced. Two further gates bound the distance to
-    `fq` directly, whole-tensor and worst row, in the same floor-relative units.
-    """
-    def compare(actual, expected, **_kwargs):
+    def compare(actual, expected, *, inputs, **_kwargs):
+        if actual.shape != expected.shape:
+            return False, f"output shape {tuple(actual.shape)} != golden shape {tuple(expected.shape)}"
+
+        reference.host_torch_setup()
+        quantized_weights = _reference_weights(inputs)
+        original_weights = load_weights(QWEN3_8_27B, weights)
+        truth_weights = quantized_weights.copy()
+        for name in GDN_QUANT.weights:
+            weight = original_weights.get(name)
+            if weight is None or not weight.is_floating_point():
+                return False, f"quantization baseline requires the original floating-point weight {name}"
+            q, scale = reference.quantize_rows(weight)
+            scale_name = name.removesuffix(".weight") + ".weight_scale"
+            if not torch.equal(q, quantized_weights[name]) or not torch.equal(scale, quantized_weights[scale_name]):
+                return False, f"{name} does not match the run's quantized weight and scale; use the original --weights"
+            truth_weights[name] = weight
+
         dev = actual.double()
-        fq = _chain(t, weights, quant=True)["out"]
-        truth = _chain(t, weights, quant=False)["out"]
+        golden = expected.double()
+        fq = _reference_out(inputs, quantized_weights, quant=True)
+        truth = _reference_out(inputs, truth_weights, quant=False)
 
         def rel(a, b):
             return float((a - b).norm() / b.norm())
@@ -334,19 +328,21 @@ def compare_out(t: int, weights: str | None):
 
         floor, dev_truth = rel(fq, truth), rel(dev, truth)
         row_floor, dev_row = worst_row(fq, truth), worst_row(dev, truth)
+        if not (math.isfinite(floor) and floor > 0 and math.isfinite(row_floor) and row_floor > 0):
+            return False, "quantization baseline requires finite, positive tensor and worst-row errors"
         over, row_over = dev_truth / floor, dev_row / row_floor
-        dev_fq, dev_row_fq = rel(dev, fq), worst_row(dev, fq)
-        near, row_near = dev_fq / floor, dev_row_fq / row_floor
+        dev_golden, dev_row_golden = rel(dev, golden), worst_row(dev, golden)
+        near, row_near = dev_golden / floor, dev_row_golden / row_floor
         print(f"[stats] out: rel frob {dev_truth:.3e} vs the float64 truth against a "
               f"quantization floor of {floor:.3e} ({over:.3f}x); worst token row "
               f"{dev_row:.3e} against {row_floor:.3e} ({row_over:.3f}x); "
-              f"{dev_fq:.3e} vs the fake-quant chain ({near:.3f} of the floor, "
+              f"{dev_golden:.3e} vs the fake-quant golden ({near:.3f} of the floor, "
               f"worst row {row_near:.3f})", flush=True)
         ok = (over <= MAX_OVER_FLOOR and row_over <= MAX_ROW_OVER_FLOOR
               and near <= MAX_VS_GOLDEN and row_near <= MAX_ROW_VS_GOLDEN)
         detail = (f"{over:.3f}x the quantization floor (<={MAX_OVER_FLOOR}), "
                   f"worst row {row_over:.3f}x (<={MAX_ROW_OVER_FLOOR}); "
-                  f"vs the fake-quant chain {near:.3f} (<={MAX_VS_GOLDEN}), "
+                  f"vs the fake-quant golden {near:.3f} (<={MAX_VS_GOLDEN}), "
                   f"worst row {row_near:.3f} (<={MAX_ROW_VS_GOLDEN})")
         return ok, detail
 
@@ -361,12 +357,12 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=DEFAULT_TEST_SEQ_LEN)
     parser.add_argument("--weights", type=str, default=None,
-                        help="a real layer from weights.py; default: random weights")
+                        help="the original floating-point layer from weights.py; default: random weights")
     parser.add_argument("--rounds", type=int, default=0,
                         help="also time the block over this many rounds (device only)")
     parser.add_argument("--save-data", action="store_true", default=False)
@@ -383,14 +379,14 @@ if __name__ == "__main__":
     result = run(
         fn=build_kernel(t=args.seq_len),
         specs=build_tensor_specs(t=args.seq_len, weights=args.weights),
-        golden_fn=golden_gdn_block(args.weights),
+        golden_fn=golden_gdn_block,
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
-        config=run_config(args.platform, args.device),
+        config=run_config(args.backend_type, args.device, args.execution_mode, t=args.seq_len),
         rtol=1e-2,
         atol=1e-5,
-        compare_fn={"out": compare_out(args.seq_len, args.weights)},
+        compare_fn={"out": compare_out(args.weights)},
         compile_only=args.compile_only,
     )
     if args.rounds and result.bench is not None:

@@ -19,18 +19,16 @@ That is why there is no `quant_y` kernel beside `quant_x`.
 """
 import a8w8_linear
 
-from chunk_cumsum import CHUNK_TILE
 from config import QWEN3_8_27B
 
 # model shape
 K = QWEN3_8_27B.value_width                 # contraction: H value heads of D
 N = QWEN3_8_27B.hidden_size                 # back to the residual stream
-CHUNK = CHUNK_TILE                          # only picks the reference chain to draw from
 
 MODULE = "out_proj"
 
-# case shape
-T = 8192                # tokens (single sequence, B = 1)
+# validation
+DEFAULT_TEST_SEQ_LEN = 512
 
 # tiling
 M_TILE = 128
@@ -42,64 +40,43 @@ N_GROUP = 2
 OUTPUTS = ("y",)                    # bench.py reads it
 
 
-def build_kernel(t: int = T, k: int = K, n: int = N, inline: bool = False,
+def build_kernel(t: int = DEFAULT_TEST_SEQ_LEN, k: int = K, n: int = N, inline: bool = False,
                  m_tile: int = M_TILE, n_tile: int = N_TILE, k_tile: int = K_TILE,
-                 m_group: int = M_GROUP, n_group: int = N_GROUP):
+                 m_group: int | None = None, n_group: int = N_GROUP):
+    if m_group is None:
+        m_group = a8w8_linear.default_m_group(t, m_tile, M_GROUP)
     return a8w8_linear.build_kernel(t, k, n, name=MODULE, inline=inline, m_tile=m_tile,
                                     n_tile=n_tile, k_tile=k_tile, m_group=m_group,
                                     n_group=n_group)
 
 
-_ACT_CACHE: dict[tuple, dict] = {}
+def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, k: int = K, n: int = N, weights: str | None = None, **_):
+    from functools import cache
+
+    import torch
+
+    from reference import quantize_rows
+    from weights import quantized_weight
+
+    @cache
+    def activation():
+        generator = torch.Generator().manual_seed(42)
+        x = torch.randn(t, k, generator=generator)
+        q, scale = quantize_rows(x)
+        return q, scale.reshape(1, t)
+
+    w_q, w_scale = quantized_weight(QWEN3_8_27B, MODULE, weights)
+    return a8w8_linear.build_specs(t, k, n, lambda: activation()[0], lambda: activation()[1], w_q, w_scale)
 
 
-def _activation(t: int, chunk: int, weights: str | None):
-    """`gated_rmsnorm`'s epilogue output, from the block chain that produces it.
-
-    The whole float64 block runs to get here -- the normed output is the last
-    thing before this projection -- so the three tensors share one chain and
-    one cache.
-    """
-    import block_reference
-
-    def load():
-        key = (t, chunk, weights)
-        cache = _ACT_CACHE.get(key)
-        if cache is None:
-            def draw(name):
-                return block_reference.block_inputs(name, t, QWEN3_8_27B, chunk,
-                                              weights=weights, quant_y=True)()
-            cache = _ACT_CACHE[key] = dict(
-                x=draw("y").reshape(t, -1), q=draw("y_q"),
-                scale=draw("y_scale").float().reshape(1, -1))
-        return cache
-
-    return load
-
-
-def build_tensor_specs(t: int = T, k: int = K, n: int = N, chunk: int = CHUNK,
-                       weights: str | None = None, **_):
-    act = _activation(t, chunk, weights)
-    w_q, w_scale = a8w8_linear.quantized_weight(QWEN3_8_27B, MODULE, weights)
-    return a8w8_linear.build_specs(t, k, n, lambda: act()["q"], lambda: act()["scale"],
-                                   w_q, w_scale)
-
-
-def compare_y(t: int, chunk: int, weights: str | None):
-    act = _activation(t, chunk, weights)
-    truth, fakequant = a8w8_linear.references(QWEN3_8_27B, MODULE, act, weights)
-    return a8w8_linear.compare_y(truth, fakequant, "out")
-
-
-if __name__ == "__main__":
+def validate() -> None:
     import argparse
     import os
 
-    from golden import run
+    from golden import ratio_allclose, run
 
-    args = a8w8_linear.add_args(
-        argparse.ArgumentParser(description=__doc__.splitlines()[0]),
-        M_TILE, N_TILE, K_TILE, T, M_GROUP, N_GROUP).parse_args()
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    args = a8w8_linear.parse_args(parser, M_TILE, N_TILE, K_TILE, DEFAULT_TEST_SEQ_LEN, M_GROUP, N_GROUP)
     if args.rounds:
         os.environ["PYPTO_BENCH"] = "1"
         os.environ["PYPTO_BENCH_ROUNDS"] = str(args.rounds)
@@ -113,10 +90,10 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
-        config=dict(platform=args.platform, device_id=args.device),
+        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
         rtol=1e-3,
         atol=1e-5,
-        compare_fn={"y": compare_y(args.seq_len, CHUNK, args.weights)},
+        compare_fn={"y": ratio_allclose(atol=3e-3, rtol=3e-3, max_error_ratio=0.02)},
         compile_only=args.compile_only,
     )
     a8w8_linear.report("out_proj", args, result, K, N)
@@ -124,3 +101,7 @@ if __name__ == "__main__":
         if result.error:
             print(result.error)
         raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    validate()
