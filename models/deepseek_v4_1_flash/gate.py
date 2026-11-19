@@ -267,7 +267,7 @@ def golden_gate_reference(
 
 
 @pl.jit.inline
-def gate_from_bf16(
+def gate(
     xg_buf: pl.Tensor[[T_PAD, D], pl.BF16],
     gate_w: pl.Tensor,
     gate_bias: pl.Tensor,
@@ -338,7 +338,7 @@ def l2_gate(
     indices: pl.Out[pl.Tensor[[T, TOPK], pl.INT32]],
     weights: pl.Out[pl.Tensor[[T, TOPK], pl.FP32]],
 ):
-    gate_from_bf16(
+    gate(
         x_normed, gate_w, gate_bias,
         num_tokens,
         x_norm_mx, x_norm_scale, indices, weights, n_experts=N_EXPERTS, topk=TOPK,
@@ -408,9 +408,9 @@ def build_tensor_specs(num_tokens=T):
     from golden import ScalarSpec, TensorSpec
 
     def init_x_normed():
-        from rmsnorm import golden_rms_norm_tiled
+        from rmsnorm import golden_rms_norm
 
-        value = golden_rms_norm_tiled(torch.randn(T_PAD, D).to(torch.bfloat16), torch.ones(D))
+        value = golden_rms_norm(torch.randn(T_PAD, D).to(torch.bfloat16), torch.ones(D))
         value[max(0, min(T, num_tokens)):] = 0
         return value
 

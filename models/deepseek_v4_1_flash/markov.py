@@ -48,8 +48,8 @@ if EP_SIZE % LM_HEAD_TP_SIZE:
 
 @pl.jit.extern(
     core_type="mixed", dual_aiv_dispatch=True,
-    aic_source=Path(__file__).parent / "kernels" / "markov_recurrence.cpp",
-    aiv_source=Path(__file__).parent / "kernels" / "markov_recurrence.cpp",
+    aic_source=Path(__file__).parent / "kernels" / "markov_sample.cpp",
+    aiv_source=Path(__file__).parent / "kernels" / "markov_sample.cpp",
     include_dirs=(pto_isa_include_dir(),),
 )
 def _markov_sample(
@@ -99,7 +99,7 @@ def markov_sample(
     conf_view = confidences[:batch, :DSPARK_QUERY_WIDTH]
     anchors_view = anchor_ids[:batch]
     workers = pl.min(32, pl.system.available_cluster_count())
-    with pl.spmd(workers, name_hint="dspark_markov_recurrence", sync_start=True):
+    with pl.spmd(workers, name_hint="markov_sample", sync_start=True):
         embedding, partial_scores, partial_ids, draft_state, confidence_state, ids_out, conf_out = _markov_sample(
             logits_view, embedding, markov_w2, partial_scores, partial_ids, hidden_view,
             markov_w1, confidence_weight, draft_state, confidence_state, ids_view, conf_view, anchors_view,

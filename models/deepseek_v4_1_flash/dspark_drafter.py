@@ -34,7 +34,7 @@ from input_pack import pack_x_hc
 from decode_moe import BALANCED_ROUTING, initialize_balanced_routes, DISPATCH_PACKET_WIDTH, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD, moe
 
 from dspark_attn import dspark_attn, dspark_context_kv
-from qkv_proj_rope import quantize_projection_input
+from qkv_proj_rope import qkv_quant
 
 
 # Dynamic shape variables.
@@ -361,7 +361,7 @@ def _dspark_drafter(
     dspark_proj(target_hidden, main_proj_weight, main_proj_scale, projected, context_tokens)
     rms_norm(projected, main_norm_weight, main_x, context_tokens, width=D, zero_tail=False)
 
-    context_payload, context_scales, context_padded_rows = quantize_projection_input(main_x, context_tokens, row_tile=80)
+    context_payload, context_scales, context_padded_rows = qkv_quant(main_x, context_tokens, row_tile=80)
     for layer in pl.range(DSPARK_DRAFT_LAYERS):
         layer_wkv_scale: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[layer]
         dspark_context_kv(

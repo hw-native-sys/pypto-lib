@@ -434,7 +434,6 @@ def select_candidate_block_pool(
     pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
     pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
-    scores_ready: pl.Scalar[pl.TASK_ID],
 ):
     """Publish sorted logical candidate block IDs and per-query counts."""
     tokens = pl.tensor.dim(index_scores, 0)
@@ -456,8 +455,7 @@ def select_candidate_block_pool(
     with pl.spmd(
         32,
         name_hint="c1a_pool_block_scores",
-        deps=[scores_ready],
-    ) as score_tid:
+    ):
         worker = pl.tile.get_block_idx()
         for work in pl.range(worker, score_task_tokens * score_task_tiles, 32):
             token = work // score_task_tiles
@@ -486,7 +484,7 @@ def select_candidate_block_pool(
                 pl.store(maxima, [token, block_begin], block_scores)
 
     arena = pl.create_tensor([tokens * CANDIDATE_MAX_LEAVES, CANDIDATE_PAIR_WIDTH], dtype=pl.FP32)
-    with pl.spmd(32, name_hint="c1a_pool_block_select", deps=[score_tid]) as pool_tid:
+    with pl.spmd(32, name_hint="c1a_pool_block_select") as pool_tid:
         worker = pl.tile.get_block_idx()
         for token in pl.range(worker, tokens, 32):
             sorted_ids = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32, value=-1)
@@ -588,9 +586,8 @@ def project_index_weights(
     """Project BF16 per-head weights with BF16 rounding before and after scaling."""
     tokens = pl.tensor.dim(x, 0)
     projected_weights = pl.create_tensor([tokens, INDEX_H], dtype=pl.BF16)
-    ready = pl.system.task_dummy(deps=[])
-    projected_result, projected_tid = gemm_bf16_to_bf16(
-        x, weight, projected_weights, num_tokens, ready,
+    gemm_bf16_to_bf16(
+        x, weight, projected_weights, num_tokens,
         width=D, output_width=INDEX_H, n_tile=INDEX_H, k_tile=INDEX_PROJ_K_TILE,
         workers=4, name_hint="prefill_index_weights",
     )
@@ -1134,9 +1131,8 @@ def prefill_index_key_project(
     """Project C2A keys, then normalize after the compressor pool_ready dependency."""
     tokens = pl.tensor.dim(latent, 0)
     projected = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-    projection_ready = pl.system.task_dummy(deps=[])
-    projected_result, projected_tid = gemm_bf16_to_bf16(
-        latent, weight, projected, num_tokens, projection_ready,
+    gemm_bf16_to_bf16(
+        latent, weight, projected, num_tokens,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
         workers=4, name_hint="prefill_index_key",
     )
@@ -1170,9 +1166,8 @@ def publish_c1a_index_key(
 ):
     tokens = pl.tensor.dim(compressed_latent, 0)
     index_projection = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-    projection_ready = pl.system.task_dummy(deps=[])
-    projected_result, projected_tid = gemm_bf16_to_bf16(
-        compressed_latent, index_wk, index_projection, num_tokens, projection_ready,
+    gemm_bf16_to_bf16(
+        compressed_latent, index_wk, index_projection, num_tokens,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
         workers=4, name_hint="prefill_index_key",
     )
@@ -1442,7 +1437,7 @@ def prefill_indexer(
                 completion[0] = topk_ready
                 if not pool and not c2a:
                     pool_ready = select_candidate_block_pool(chunk_scores, chunk_lengths, chunk_pool,
-                                                            chunk_counts, count, score_ready)
+                                                            chunk_counts, count)
                     completion[0] = pl.system.task_dummy(deps=[topk_ready, pool_ready])
     return completion[0]
 

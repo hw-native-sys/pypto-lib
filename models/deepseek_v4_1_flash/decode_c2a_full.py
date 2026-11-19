@@ -26,7 +26,7 @@ from config import (
 from compressor import STATE_WIDTH, c2a_compressor_project
 from compressor import c2a_compressor_publish
 from hc import hc_head_norm, hc_project, hc_sinkhorn
-from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
+from qkv_proj_rope import qkv_quant, q_proj_rope, kv_proj, window_publish
 from o_proj import o_proj_hc_post
 from sparse_attention import gather_sparse_attention
 from decode_indexer import decode_c2a_indexer, prepare_score_metadata
@@ -106,17 +106,19 @@ def decode_c2a_full(
     next_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    metadata, metadata_ready = prepare_score_metadata(token_to_req_indices, compressed_lens, num_tokens)
+    metadata = prepare_score_metadata(token_to_req_indices, compressed_lens, num_tokens)
     tokens = pl.tensor.dim(x_hc, 0)
+    x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    hc_head_norm(x_hc, pre_mix, attn_norm_weight, x_norm, worker_limit=64)
+    inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    cache_ready = hc_head_norm(x_hc, pre_mix, attn_norm_weight, x_norm, worker_limit=64)
+    hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    proj_payload, proj_scales, proj_payload_padded_rows = quantize_projection_input(x_norm, num_tokens, row_tile=80)
-    qr, query, qb_payload, qb_scales = q_proj_rope(
+    proj_payload, proj_scales, proj_payload_padded_rows = qkv_quant(x_norm, num_tokens, row_tile=80)
+    qb_payload, qb_scales = q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
@@ -126,7 +128,7 @@ def decode_c2a_full(
         padded_rows=proj_payload_padded_rows,
         qa_row_tile=80, qb_row_tile=80,
     )
-    kv_projection = kv_proj(
+    kv_proj(
         proj_payload, proj_scales,
         wkv, wkv_scale,
         kv_projection, num_tokens, worker_limit=32, row_tile=80,
@@ -134,37 +136,33 @@ def decode_c2a_full(
     window_publish(
         kv_projection, kv_norm_weight, rope_cos, rope_sin,
         window_slots, window_cache,
-        num_tokens, cache_ready,
+        num_tokens,
     )
 
     compressor_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
     compressor_score = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
     c2a_compressor_project(x_norm, compressor_wkv, compressor_wgate, compressor_kv, compressor_score, num_tokens, n_tile=64)
     latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    compressed_publish_tid = c2a_compressor_publish(
+    c2a_compressor_publish(
         compressor_kv, compressor_score, query_start_loc, position_ids, token_to_req_indices,
-        state_block_table, state_cache, compressor_norm_weight, latent, num_tokens, cache_ready,
+        state_block_table, state_cache, compressor_norm_weight, latent, num_tokens,
         compressed_rope_cos, compressed_rope_sin, compressed_slots, compressed_cache, partition="request",
     )
 
-    select_tid = decode_c2a_indexer(
+    decode_c2a_indexer(
         x_norm, qb_payload, qb_scales, latent, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
         index_weights_proj, rope_cos, rope_sin, compressed_rope_cos, compressed_rope_sin,
         compressed_slots, index_cache, index_cache_scale, index_block_table, token_to_req_indices,
-        compressed_lens, metadata, topk_indices, num_tokens, cache_ready, compressed_publish_tid, metadata_ready,
+        compressed_lens, metadata, topk_indices, num_tokens,
     )
 
-    chunk_done = pl.system.task_dummy(deps=[select_tid, compressed_publish_tid])
-
-    attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    attn_out = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     gather_sparse_attention(
         query, window_indices, window_cache, topk_indices, compressed_cache,
-        attn_sink, attended, num_tokens, chunk_done, compressed_keys=INDEX_TOPK,
+        attn_sink, attn_out, num_tokens, compressed_keys=INDEX_TOPK,
     )
-    inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
-    hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
     o_proj_hc_post(
-        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+        attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
         x_hc, post_mix, residual_mix, output, num_tokens,
         oa_row_tile=80, ob_row_tile=128,
     )
@@ -445,14 +443,14 @@ def golden_c2a(tensors, mode="full"):
     # Sparse attention over window and compressed rows.
     packed_window = pack_quantized_cache(window_cache, window_cache_scale)
     packed_compressed = pack_quantized_cache(compressed_cache, compressed_cache_scale)
-    attended = golden_gather_sparse_attention(
+    attn_out = golden_gather_sparse_attention(
         q, t["window_indices"], packed_window, topk_indices, packed_compressed, t["attn_sink"],
         compressed_keys=INDEX_TOPK,
     )
 
     # Inverse RoPE and output projection.
     output = golden_o_proj(
-        attended, t["rope_cos"], t["rope_sin"], t["wo_a"], t["wo_b"], t["wo_b_scale"],
+        attn_out, t["rope_cos"], t["rope_sin"], t["wo_a"], t["wo_b"], t["wo_b_scale"],
         wo_a_scale=t["wo_a_scale"], sequential_projection=True,
     )
 

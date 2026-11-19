@@ -45,14 +45,13 @@ def c1a_compressor_project(
     weight: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
-    ready: pl.Scalar[pl.TASK_ID],
     m_tile: pl.constexpr,
     n_tile: pl.constexpr,
 ):
     """Project NZ weights with full-height Cube tiles and store active rows."""
     row_groups = (num_tokens + 2 * m_tile - 1) // (2 * m_tile)
     workers = pl.max(pl.min(row_groups * (HEAD_DIM // n_tile), pl.system.available_cluster_count()), 1)
-    with pl.spmd(workers, name_hint="proj_cmp", deps=[ready]) as completed:
+    with pl.spmd(workers, name_hint="proj_cmp"):
         with pl.at(level=pl.Level.CORE_GROUP):
             worker = pl.tile.get_block_idx()
             task_stride = pl.max(workers, 1)
@@ -62,22 +61,30 @@ def c1a_compressor_project(
                 col = task % (HEAD_DIM // n_tile) * n_tile
                 row = row_block * m_tile
                 rows = pl.max(pl.min(m_tile, num_tokens - row), 0)
-                a = pl.load(source, [row, 0], [m_tile, C1A_PROJ_K_TILE], valid_shape=[rows, C1A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
+                a = pl.load(
+                    source, [row, 0], [m_tile, C1A_PROJ_K_TILE],
+                    valid_shape=[rows, C1A_PROJ_K_TILE], target_memory=pl.Mem.Mat,
+                )
                 b = pl.load(weight, [0, col], [C1A_PROJ_K_TILE, n_tile], target_memory=pl.Mem.Mat)
                 full_a = pl.set_validshape(a, m_tile, C1A_PROJ_K_TILE)
                 acc = pl.matmul(full_a, b)
                 for k in pl.pipeline(C1A_PROJ_K_TILE, D, C1A_PROJ_K_TILE, stage=2):
-                    a = pl.load(source, [row, k], [m_tile, C1A_PROJ_K_TILE], valid_shape=[rows, C1A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
+                    a = pl.load(
+                        source, [row, k], [m_tile, C1A_PROJ_K_TILE],
+                        valid_shape=[rows, C1A_PROJ_K_TILE], target_memory=pl.Mem.Mat,
+                    )
                     b = pl.load(weight, [k, col], [C1A_PROJ_K_TILE, n_tile], target_memory=pl.Mem.Mat)
                     full_a = pl.set_validshape(a, m_tile, C1A_PROJ_K_TILE)
                     acc = pl.matmul_acc(acc, full_a, b)
                 value = pl.set_validshape(acc, rows, n_tile)
                 output = pl.store(value, [row, col], output)
-    return output, completed
+    return output
 
 
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "compressor_publish.cpp",
-               include_dirs=(pto_isa_include_dir(), str(Path(__file__).parent / "kernels")))
+@pl.jit.extern(
+    core_type="aiv", source=Path(__file__).parent / "kernels" / "compressor_publish.cpp",
+    include_dirs=(pto_isa_include_dir(), str(Path(__file__).parent / "kernels")),
+)
 def _c1a_compress(
     source: pl.Tensor,
     slots: pl.Tensor,
@@ -102,16 +109,14 @@ def c1a_compressor_publish(
     slots: pl.Tensor[[T_DYN], pl.INT64],
     cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     num_tokens: pl.Scalar[pl.INT32],
-    cache_ready: pl.Scalar[pl.TASK_ID],
-    source_ready: pl.Scalar[pl.TASK_ID],
 ):
     """Normalize and publish MXFP4 rows while retaining the unrotated latent."""
     active_tokens = pl.cast(num_tokens, pl.INT32)
     row_groups = (active_tokens + 2 * C1A_PROJ_M_TILE - 1) // (2 * C1A_PROJ_M_TILE)
     workers = pl.max(pl.min(pl.min(active_tokens, row_groups * 8), pl.system.available_cluster_count()), 1)
-    with pl.spmd(workers, name_hint="c1a_compress", deps=[cache_ready, source_ready]) as published:
-        cache = _c1a_compress(source, slots, cache, cosine, sine, norm_weight, latent, active_tokens)
-    return published
+    with pl.spmd(workers, name_hint="c1a_compress"):
+        _c1a_compress(source, slots, cache, cosine, sine, norm_weight, latent, active_tokens)
+    return cache
 
 
 @pl.jit.inline(auto_scope=False)
@@ -124,7 +129,7 @@ def _c1a_publish_normalize(
         full = pl.reg.full_mask(lanes=64)
         for row in pl.hardware_loop(rows):
             summed = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
-            # Accumulate squared values in a counted loop.
+            # Sum squared values by segment.
             for segment in pl.hardware_loop(8):
                 value = pl.reg.convert(pl.reg.load(source, row * 512 + segment * 64, lanes=64), dtype=pl.FP32)
                 summed = pl.reg.add(summed, pl.reg.mul(value, value, full), full)
@@ -365,9 +370,8 @@ def c1a_compressor_publish_python(
     active_tokens = pl.cast(num_tokens, pl.INT32)
     workers = pl.max(pl.min(active_tokens, 8), 1)
     flat_cache = pl.reshape(cache, [pl.tensor.dim(cache, 0) * 128, COMPRESSED_CACHE_BYTES])
-    # Keep the physical 320-byte row for both aliases. Shortening either
-    # view before the JIT boundary would incorrectly make it contiguous.
-    # Payload writes [0, 256), scales write [256, 320) of each row.
+    # Both aliases use the physical 320-byte row pitch.
+    # Payload writes [0, 256), scales write [256, 320).
     scale_cache = flat_cache
     with pl.spmd(workers, name_hint="c1a_compress_python", deps=[cache_ready, source_ready]) as published:
         _published = _c1a_compress_python(
@@ -387,12 +391,18 @@ def _c2a_compressor_project_tile(
     rows: pl.Scalar[pl.INDEX],
     n_tile: pl.constexpr,
 ):
-    a = pl.load(x, [row, 0], [C2A_PROJ_M_TILE, C2A_PROJ_K_TILE], valid_shape=[rows, C2A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
+    a = pl.load(
+        x, [row, 0], [C2A_PROJ_M_TILE, C2A_PROJ_K_TILE],
+        valid_shape=[rows, C2A_PROJ_K_TILE], target_memory=pl.Mem.Mat,
+    )
     b = pl.load(weight, [0, col], [C2A_PROJ_K_TILE, n_tile], target_memory=pl.Mem.Mat)
     a_full = pl.set_validshape(a, C2A_PROJ_M_TILE, C2A_PROJ_K_TILE)
     acc = pl.matmul(a_full, b)
     for k in pl.pipeline(C2A_PROJ_K_TILE, D, C2A_PROJ_K_TILE, stage=2):
-        a = pl.load(x, [row, k], [C2A_PROJ_M_TILE, C2A_PROJ_K_TILE], valid_shape=[rows, C2A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
+        a = pl.load(
+            x, [row, k], [C2A_PROJ_M_TILE, C2A_PROJ_K_TILE],
+            valid_shape=[rows, C2A_PROJ_K_TILE], target_memory=pl.Mem.Mat,
+        )
         b = pl.load(weight, [k, col], [C2A_PROJ_K_TILE, n_tile], target_memory=pl.Mem.Mat)
         a_full = pl.set_validshape(a, C2A_PROJ_M_TILE, C2A_PROJ_K_TILE)
         acc = pl.matmul_acc(acc, a_full, b)
@@ -462,7 +472,7 @@ def _pool_normalize(
             bf = pl.reg.convert(pooled, dtype=pl.BF16, rounding="R", saturate=False)
             value = pl.reg.convert(bf, dtype=pl.FP32)
             _rounded_written = pl.reg.store(rounded, chunk * 64, value)
-        # Match the shared CANN RMSNorm: fold 512 columns to 256, then
+        # Fold 512 columns to 256, then
         # reduce each 64-lane block and the four block sums.
         lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
         partials = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
@@ -510,7 +520,7 @@ def _pool_normalize(
             norm = pl.reg.mul(scaled_value, gamma, full)
             bf = pl.reg.convert(norm, dtype=pl.BF16, rounding="R", saturate=False)
             _output_written = pl.reg.store(output, chunk * 64, bf)
-            # Keep the unrotated latent live until its GM store completes.
+            # Store the unrotated latent before rotating.
             _rotated_written = pl.reg.store(rotated, chunk * 64, bf)
     return (output, rotated)
 
@@ -675,13 +685,19 @@ def _c2a_compress(
                             if token > start:
                                 previous_kv_row = pl.load(kv_proj, [token - 1, 0], [1, 512], target_memory=pl.Mem.Vec)
                                 pk = pl.reshape(previous_kv_row, [512])
-                                previous_score_row = pl.load(score_proj, [token - 1, 0], [1, 512], target_memory=pl.Mem.Vec)
+                                previous_score_row = pl.load(
+                                    score_proj, [token - 1, 0], [1, 512],
+                                    target_memory=pl.Mem.Vec,
+                                )
                                 ps = pl.reshape(previous_score_row, [512])
                             else:
                                 history = block * 4 + (position - 1) % 4
                                 history_kv_row = pl.load(state_flat, [history, 0], [1, 512], target_memory=pl.Mem.Vec)
                                 pk = pl.reshape(history_kv_row, [512])
-                                history_score_row = pl.load(state_flat, [history, 512], [1, 512], target_memory=pl.Mem.Vec)
+                                history_score_row = pl.load(
+                                    state_flat, [history, 512], [1, 512],
+                                    target_memory=pl.Mem.Vec,
+                                )
                                 ps = pl.reshape(history_score_row, [512])
                             pooled, rotated = _pool_normalize(ck, cs, pk, ps, gamma)
                             latent_row = pl.reshape(pooled, [1, 512])
@@ -745,7 +761,6 @@ def c2a_compressor_publish(
     norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     latent: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
-    state_ready: pl.Scalar[pl.TASK_ID],
     cosine: pl.Tensor,
     sine: pl.Tensor,
     slots: pl.Tensor[[T_DYN], pl.INT64],
@@ -764,7 +779,7 @@ def c2a_compressor_publish(
     mapped_blocks = pl.create_tensor([groups, 1], dtype=pl.INT32)
     native_blocks = pl.tensor.dim(state_cache, 0) * (STATE_CAPACITY // 4)
     native_state = pl.reshape(state_cache, [native_blocks, 4, STATE_WIDTH])
-    with pl.spmd(1, name_hint="c2a_four_slot_requests", deps=[state_ready]) as mapped:
+    with pl.spmd(1, name_hint="c2a_four_slot_requests"):
         worker = pl.tile.get_block_idx()
         for row in pl.range(worker, tokens):
             pl.write(mapped_requests, [row], pl.cast(-1, pl.INT32))
@@ -787,7 +802,8 @@ def c2a_compressor_publish(
                     position = first_position + begin - start
                     native_block = pl.cast(-1, pl.INT32)
                     if block >= 0 and block < blocks:
-                        native_block = pl.cast(block * (STATE_CAPACITY // 4) + position // 4 % (STATE_CAPACITY // 4), pl.INT32)
+                        ring_group = position // 4 % (STATE_CAPACITY // 4)
+                        native_block = pl.cast(block * (STATE_CAPACITY // 4) + ring_group, pl.INT32)
                     pl.write(mapped_starts, [count], pl.cast(begin, pl.INT32))
                     pl.write(mapped_starts, [count + 1], pl.cast(limit, pl.INT32))
                     pl.write(mapped_blocks, [count, 0], native_block)
@@ -802,10 +818,10 @@ def c2a_compressor_publish(
     cache_blocks = pl.tensor.dim(cache, 0)
     cache_rows = cache_blocks * C2A_STORAGE_ROWS
     cache_flat = pl.reshape(cache, [cache_rows, COMPRESSED_CACHE_BYTES])
-    completed = state_ready
+    completed = pl.system.task_invalid()
     if partition == "token":
         token_workers = pl.max(1, pl.min((active_tokens + 15) // 16, 64))
-        with pl.spmd(token_workers, name_hint="c2a_compress", deps=[mapped]) as pooled:
+        with pl.spmd(token_workers, name_hint="c2a_compress") as pooled:
             pooled_state, pooled_latent, pooled_cache = _c2a_compress(
                 kv_proj, score_proj, native_flat, position_ids, norm_weight, latent,
                 mapped_starts, mapped_requests, mapped_blocks,
@@ -813,6 +829,7 @@ def c2a_compressor_publish(
                 phase_begin=0, phase_end=1, partition="token",
             )
         state_workers = pl.max(1, pl.min(native_rows, 64))
+        # Pooling reads historical slots before state commit overwrites them.
         with pl.spmd(state_workers, name_hint="c2a_state_commit", deps=[pooled]) as branch_completed:
             commit_worker = pl.tile.get_block_idx()
             for state_row in pl.range(commit_worker, native_rows, state_workers):
@@ -837,7 +854,7 @@ def c2a_compressor_publish(
                                 found = pl.cast(1, pl.INT32)
         completed = branch_completed
     else:
-        with pl.spmd(workers, name_hint="c2a_compress", deps=[mapped]) as branch_completed:
+        with pl.spmd(workers, name_hint="c2a_compress") as branch_completed:
             _c2a_compress(
                 kv_proj, score_proj, native_flat, position_ids, norm_weight, latent,
                 mapped_starts, mapped_requests, mapped_blocks,
@@ -849,7 +866,27 @@ def c2a_compressor_publish(
 
 
 @pl.jit
-def c2a_state_feedback_test(
+def c1a_compressor_test(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    weight: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
+    norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    cosine: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    sine: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    slots: pl.Tensor[[T_DYN], pl.INT64],
+    latent: pl.InOut[pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16]],
+    cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Validate C1A projection, latent retention, and packed cache publication."""
+    tokens = pl.tensor.dim(x, 0)
+    projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    c1a_compressor_project(x, weight, projected, num_tokens, m_tile=C1A_PROJ_M_TILE, n_tile=C1A_PROJ_N_TILE)
+    c1a_compressor_publish(projected, norm_weight, latent, cosine, sine, slots, cache, num_tokens)
+    return latent, cache
+
+
+@pl.jit
+def c2a_compressor_test(
     kv: pl.Tensor[[8, HEAD_DIM], pl.FP32],
     score: pl.Tensor[[8, HEAD_DIM], pl.FP32],
     positions: pl.Tensor[[8], pl.INT32],
@@ -865,11 +902,10 @@ def c2a_state_feedback_test(
     cache: pl.InOut[pl.Tensor[[4, C2A_STORAGE_ROWS, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
 ):
     """Validate compact page publication and the retained speculative state ring."""
-    state_ready = pl.system.task_dummy(deps=[])
     state_table = pl.reshape(state_blocks, [8, 1])
     c2a_compressor_publish(
         kv, score, query_starts, positions, request_ids, state_table,
-        state_cache, norm_weight, latent, pl.cast(6, pl.INT32), state_ready,
+        state_cache, norm_weight, latent, pl.cast(6, pl.INT32),
         cosine, sine, slots, cache, partition="request",
     )
     return state_cache, latent, cache
@@ -945,77 +981,104 @@ def golden_c2a_compressor(
     return latent, publish
 
 
-if __name__ == "__main__":
-    import argparse
-    import functools
+def _golden_compressor_cache(values, *, round_to_even):
+    from qkv_proj_rope import golden_rope_tail
+    from quant import pack_quantized_cache, quantize_mxfp4_cache
 
-    from golden import TensorSpec, ratio_allclose, run
-    from quant import pack_bf16_nz, pack_quantized_cache, quantize_mxfp4_cache
+    published = values["slots"] >= 0
+    rotated = golden_rope_tail(values["latent"][published], values["cosine"][published], values["sine"][published])
+    payload, factors = quantize_mxfp4_cache(rotated, 16, "bf16", round_to_even=round_to_even)
+    flat = values["cache"].view(-1, COMPRESSED_CACHE_BYTES)
+    flat[values["slots"][published]] = pack_quantized_cache(payload, factors)
 
-    parser = argparse.ArgumentParser(description="C2A state feedback after speculative prefix acceptance")
-    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5")
-    parser.add_argument("--sim", dest="execution_mode", action="store_true")
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--compile-only", action="store_true")
-    parser.add_argument("--start-position", type=int, default=12)
-    parser.add_argument("--accepted", type=int, choices=range(1, 7), default=1)
-    args = parser.parse_args()
-    if args.start_position < 1:
-        parser.error("--start-position must be positive")
+
+def golden_c1a_compressor_test(values):
+    """Project, normalize, and publish the active C1A rows."""
+    active = int(values["num_tokens"])
+    latent = golden_c1a_compressor(values["x"][:active], values["weight"], values["norm_weight"])
+    values["latent"][:active].copy_(latent)
+    _golden_compressor_cache(values, round_to_even=True)
+
+
+def golden_c2a_state_feedback(values, *, start_position, accepted):
+    """Publish the C2A fixture and check the retained speculative predecessor."""
+    from quant import pack_bf16_nz
+
+    weight = pack_bf16_nz(torch.eye(HEAD_DIM, dtype=torch.bfloat16))
+    gate = torch.zeros_like(weight)
+    latent, _publish = golden_c2a_compressor(
+        values["kv"].bfloat16(), values["query_starts"], values["positions"],
+        values["request_ids"], values["state_blocks"].unsqueeze(1), values["state_cache"],
+        weight, gate, values["norm_weight"],
+    )
+    values["latent"].copy_(latent)
+    _golden_compressor_cache(values, round_to_even=False)
+
+    next_position = start_position + accepted
+    if next_position % 2:
+        block = int(values["state_blocks"][0])
+        predecessor = next_position - 1
+        retained = values["state_cache"][block, predecessor % STATE_CAPACITY]
+        accepted_row = accepted - 1
+        required = torch.cat((values["kv"][accepted_row], values["score"][accepted_row]))
+        if not torch.equal(retained, required):
+            raise ValueError(f"Golden state cache did not retain accepted predecessor position {predecessor}")
+
+
+def build_c1a_compressor_specs():
+    """Build two projection tiles, skipped slots, and padded output rows."""
+    from golden import ScalarSpec, TensorSpec
+    from quant import pack_bf16_nz
+
+    generator = torch.Generator().manual_seed(41)
+    active = C1A_PROJ_M_TILE + 1
+    capacity = active + 7
+    x = torch.randn(capacity, D, generator=generator).bfloat16()
+    weight = torch.randn(D, HEAD_DIM, generator=generator).mul_(D ** -0.5).bfloat16()
+    positions = torch.arange(capacity, dtype=torch.float32) + 127
+    frequencies = 10000 ** (-torch.arange(0, ROPE_DIM, 2, dtype=torch.float32) / ROPE_DIM)
+    angles = positions[:, None] * frequencies
+    slots = torch.full((capacity,), -1, dtype=torch.int64)
+    slots[:active] = torch.arange(127, 127 + active)
+    slots[::7] = -1
+    return [
+        TensorSpec("x", [capacity, D], torch.bfloat16, init_value=x),
+        TensorSpec("weight", [D, HEAD_DIM], torch.bfloat16, init_value=pack_bf16_nz(weight)),
+        TensorSpec("norm_weight", [HEAD_DIM], torch.bfloat16, init_value=1.0),
+        TensorSpec("cosine", [capacity, ROPE_DIM // 2], torch.float32, init_value=angles.cos()),
+        TensorSpec("sine", [capacity, ROPE_DIM // 2], torch.float32, init_value=angles.sin()),
+        TensorSpec("slots", [capacity], torch.int64, init_value=slots),
+        TensorSpec("latent", [capacity, HEAD_DIM], torch.bfloat16, init_value=0.0),
+        TensorSpec("cache", [2, 128, 1, COMPRESSED_CACHE_BYTES], torch.uint8, init_value=173),
+        ScalarSpec("num_tokens", torch.int32, active),
+    ]
+
+
+def build_c2a_state_feedback_specs(start_position):
+    """Build the C2A speculative prefix and packed-cache fixtures."""
+    from golden import TensorSpec
 
     generator = torch.Generator().manual_seed(42)
     kv = (torch.randint(0, 2, (8, HEAD_DIM), generator=generator) * 2 - 1).float()
     positions = torch.full((8,), -1, dtype=torch.int32)
-    positions[:6] = torch.arange(args.start_position, args.start_position + 6)
+    positions[:6] = torch.arange(start_position, start_position + 6)
     request_ids = torch.tensor([0] * 6 + [-1] * 2, dtype=torch.int32)
     query_starts = torch.tensor([0] + [6] * 15, dtype=torch.int32)
     state_blocks = torch.tensor([1] + [-1] * 7, dtype=torch.int32)
     state = torch.full((3, STATE_CAPACITY, STATE_WIDTH), 0.25)
     state[1].zero_()
     state[2].fill_(0.75)
-    state[1, (args.start_position - 1) % STATE_CAPACITY, :HEAD_DIM] = 1.0
-    weight = pack_bf16_nz(torch.eye(HEAD_DIM, dtype=torch.bfloat16))
-    gate = torch.zeros_like(weight)
+    state[1, (start_position - 1) % STATE_CAPACITY, :HEAD_DIM] = 1.0
     slots = torch.full((8,), -1, dtype=torch.int64)
     pages = (3, 1, 0, 2)
     for token in range(6):
-        position = args.start_position + token
+        position = start_position + token
         if position % 2:
             logical = position // 2
             page = pages[logical // C2A_STORAGE_ROWS % len(pages)]
             slots[token] = page * C2A_STORAGE_ROWS + logical % C2A_STORAGE_ROWS
 
-    def golden(values):
-        values["latent"].copy_(golden_c2a_compressor(
-            values["kv"].bfloat16(), values["query_starts"], values["positions"],
-            values["request_ids"], values["state_blocks"].unsqueeze(1), values["state_cache"],
-            weight, gate, values["norm_weight"],
-        )[0])
-        published = values["slots"] >= 0
-        payload, factors = quantize_mxfp4_cache(values["latent"][published], 16, "bf16")
-        packed = pack_quantized_cache(payload, factors)
-        flat = values["cache"].view(-1, COMPRESSED_CACHE_BYTES)
-        flat[values["slots"][published]] = packed
-
-    def compare_feedback(actual, expected, *, compare, **kwargs):
-        ok, detail = compare(actual, expected, **kwargs)
-        next_position = args.start_position + args.accepted
-        if not ok or next_position % 2 == 0:
-            return ok, detail
-        # An odd first row in the next window reads its accepted predecessor from the ring.
-        inputs = kwargs["inputs"]
-        block = int(inputs["state_blocks"][0])
-        predecessor = next_position - 1
-        retained = actual[block, predecessor % actual.shape[1]]
-        required = torch.cat((inputs["kv"][args.accepted - 1], inputs["score"][args.accepted - 1]))
-        if torch.equal(retained, required):
-            return True, ""
-        return False, (
-            f"    accepted predecessor position {predecessor} was overwritten before the next window; "
-            f"{int((retained != required).sum())}/{required.numel()} ring values differ"
-        )
-
-    specs = [
+    return [
         TensorSpec("kv", [8, HEAD_DIM], torch.float32, init_value=kv),
         TensorSpec("score", [8, HEAD_DIM], torch.float32, init_value=0.0),
         TensorSpec("positions", [8], torch.int32, init_value=positions),
@@ -1030,19 +1093,61 @@ if __name__ == "__main__":
         TensorSpec("latent", [8, HEAD_DIM], torch.bfloat16, init_value=0.0),
         TensorSpec("cache", [4, C2A_STORAGE_ROWS, 1, COMPRESSED_CACHE_BYTES], torch.uint8, init_value=173),
     ]
-    result = run(
-        fn=c2a_state_feedback_test, specs=specs, golden_fn=golden,
-        compare_fn={
-            "state_cache": functools.partial(
-                compare_feedback, compare=ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
-            ),
-            "latent": ratio_allclose(atol=1e-3, rtol=1e-3, valid_rows=6, zero_tail=True),
-            "cache": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
-        },
-        config={"backend_type": "a5", "device_id": args.device,
-                "execution_mode": args.execution_mode or args.platform == "a5sim"},
-        compile_only=args.compile_only,
-    )
-    print(result)
-    if not result.passed:
+
+
+if __name__ == "__main__":
+    import argparse
+    from functools import partial
+
+    from golden import ratio_allclose, run
+
+    parser = argparse.ArgumentParser(description="Validate C1A and C2A compression")
+    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--case", choices=("c1a", "c2a", "all"), default="all")
+    parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--start-position", type=int, default=12)
+    parser.add_argument("--accepted", type=int, choices=range(1, 7), default=1)
+    args = parser.parse_args()
+    if args.start_position < 1:
+        parser.error("--start-position must be positive")
+    config = {
+        "backend_type": "a5",
+        "device_id": args.device,
+        "execution_mode": args.execution_mode or args.platform == "a5sim",
+    }
+    passed = True
+    if args.case in ("c1a", "all"):
+        print("[compressor] c1a", flush=True)
+        specs = build_c1a_compressor_specs()
+        valid_rows = next(int(spec.value) for spec in specs if spec.name == "num_tokens")
+        result = run(
+            fn=c1a_compressor_test,
+            specs=specs,
+            golden_fn=golden_c1a_compressor_test,
+            compare_fn={
+                "latent": ratio_allclose(atol=1e-3, rtol=1e-3, valid_rows=valid_rows, zero_tail=True),
+                "cache": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+            },
+            config=config,
+            compile_only=args.compile_only,
+        )
+        passed = result.passed
+    if args.case in ("c2a", "all"):
+        print("[compressor] c2a", flush=True)
+        result = run(
+            fn=c2a_compressor_test,
+            specs=build_c2a_state_feedback_specs(args.start_position),
+            golden_fn=partial(golden_c2a_state_feedback, start_position=args.start_position, accepted=args.accepted),
+            compare_fn={
+                "state_cache": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+                "latent": ratio_allclose(atol=1e-3, rtol=1e-3, valid_rows=6, zero_tail=True),
+                "cache": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+            },
+            config=config,
+            compile_only=args.compile_only,
+        )
+        passed = result.passed and passed
+    if not passed:
         raise SystemExit(1)

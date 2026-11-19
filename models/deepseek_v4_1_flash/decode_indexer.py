@@ -88,7 +88,7 @@ def _idx_q(
 
 
 @pl.jit.inline(auto_scope=False)
-def project_index_query_pypto(
+def idx_q_pypto(
     payload: pl.Tensor,
     weight: pl.Tensor,
     activation_scale: pl.Tensor,
@@ -349,8 +349,6 @@ def publish_index_rows(
     cache: pl.Tensor[[INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, INDEX_DIM // 2], pl.UINT8],
     scales: pl.Tensor[[INDEX_BLOCKS_DYN, CACHE_ROWS_DYN, 1, _SCALE_COUNT], pl.FP8E8M0],
     num_tokens: pl.Scalar[pl.INT32],
-    cache_ready: pl.Scalar[pl.TASK_ID],
-    kv_ready: pl.Scalar[pl.TASK_ID],
 ):
     """Publish normalized and rotated MXFP4 index keys with one writer per page."""
     slot_capacity = pl.tensor.dim(slots, 0)
@@ -360,7 +358,7 @@ def publish_index_rows(
     cache_rows = pl.tensor.dim(cache, 0) * pl.tensor.dim(cache, 1)
     cache_flat = pl.reshape(cache, [cache_rows, INDEX_DIM // 2])
     scale_flat = pl.reshape(scales, [cache_rows, _SCALE_COUNT])
-    with pl.spmd(workers, name_hint="idx_k_norm_rope_publish", deps=[cache_ready, kv_ready]) as published:
+    with pl.spmd(workers, name_hint="idx_k_norm_rope_publish"):
         worker = pl.tile.get_block_idx()
         gamma_tile = pl.load(weight, [0], [INDEX_DIM], target_memory=pl.MemorySpace.Vec)
         source_batch = pl.tile.create(
@@ -605,7 +603,7 @@ def publish_index_rows(
                 pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.MTE2, 0)
             next_batch_cursor = pl.yield_(final_scan)
         pl.system.barrier(pipe=pl.PipeType.ALL)
-    return published
+    return cache, scales
 
 
 @pl.jit.inline(auto_scope=False)
@@ -665,10 +663,6 @@ def score_select_reindex(
     scores: pl.Tensor[[T_DYN, INDEX_POOL_POSITIONS_DYN], pl.FP32],
     output: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
-    cache_ready: pl.Scalar[pl.TASK_ID],
-    query_ready: pl.Scalar[pl.TASK_ID],
-    weights_ready: pl.Scalar[pl.TASK_ID],
-    pool_ready: pl.Scalar[pl.TASK_ID],
 ):
     """Route identity pools to paged scoring and sparse pools to pipelined gathering."""
     capacity = pl.tensor.dim(pool_block_ids, 1)
@@ -677,7 +671,7 @@ def score_select_reindex(
     request_count = pl.tensor.dim(block_table, 0)
     cache_pages = pl.tensor.dim(index_cache, 0)
     flags = pl.create_tensor([32, 32], dtype=pl.INT32)
-    with pl.spmd(32, name_hint="idx_plan_pool", deps=[cache_ready, pool_ready]) as plan_tid:
+    with pl.spmd(32, name_hint="idx_plan_pool"):
         worker = pl.tile.get_block_idx()
         dense = pl.cast(1, pl.INT32)
         mismatch = pl.tile.full([1, 64], dtype=pl.FP32, value=0.0)
@@ -720,20 +714,19 @@ def score_select_reindex(
         tokens = pl.tensor.dim(output, 0)
         dense_width = pl.min(width, table_width * 128)
         paged_scores = pl.create_tensor([tokens, dense_width], dtype=pl.FP32)
-        selected, scores_tid = score_select_paged(
+        score_select_paged(
             query, query_scale, weights, index_cache, index_cache_scale,
             block_table, request_ids, lengths, paged_scores, output,
-            num_tokens, plan_tid, query_ready, weights_ready, capacity,
+            num_tokens, capacity,
             shard_k_tile=SCORE_SHARD_CACHE, short_history_policy="score", score_layout="dense",
         )
-        result = selected
     else:
-        result = _score_select_pool(
+        _score_select_pool(
             query, query_scale, weights, index_cache, index_cache_scale,
             block_table, request_ids, lengths, pool_block_ids, pool_block_counts, scores, output,
-            num_tokens, cache_ready, query_ready, weights_ready, plan_tid,
+            num_tokens,
         )
-    return result
+    return output
 
 
 @pl.jit.inline(auto_scope=False)
@@ -751,10 +744,6 @@ def _score_select_pool(
     scores: pl.Tensor[[T_DYN, INDEX_POOL_POSITIONS_DYN], pl.FP32],
     output: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
-    cache_ready: pl.Scalar[pl.TASK_ID],
-    query_ready: pl.Scalar[pl.TASK_ID],
-    weights_ready: pl.Scalar[pl.TASK_ID],
-    pool_ready: pl.Scalar[pl.TASK_ID],
 ):
     """Pipeline candidate gathering, scoring, and TopK through a bounded per-worker ring."""
     capacity = pl.tensor.dim(pool_block_ids, 1)
@@ -765,14 +754,14 @@ def _score_select_pool(
     candidate_keys = pl.create_tensor([tokens, workers * INDEX_TOPK], dtype=pl.UINT16)
     candidate_indices = pl.create_tensor([tokens, workers * INDEX_TOPK], dtype=pl.INT32)
     table_width = pl.tensor.dim(block_table, 1)
-    with pl.spmd(workers, name_hint="idx_pool_score_topk", sync_start=True, deps=[cache_ready, query_ready, weights_ready, pool_ready]) as mix_tid:
+    with pl.spmd(workers, name_hint="idx_pool_score_topk", sync_start=True):
         _idx_pool_score_topk(
             query, query_scale, weights, index_cache, index_cache_scale,
             block_table, request_ids, lengths, output, pool_block_counts, candidate_keys, candidate_indices,
             pool_block_ids, pool_block_counts, ring, width, 0, table_width, num_tokens, -1,
             pl.cast(0, pl.INT32), workers, pl.cast(0, pl.INT32),
         )
-    return mix_tid
+    return output
 
 
 @pl.jit.inline(auto_scope=False)
@@ -788,9 +777,6 @@ def score_select_paged(
     scores: pl.Tensor,
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
-    cache_ready: pl.Scalar[pl.TASK_ID],
-    query_ready: pl.Scalar[pl.TASK_ID],
-    weights_ready: pl.Scalar[pl.TASK_ID],
     pool_capacity: pl.Scalar[pl.INDEX],
     shard_k_tile: pl.constexpr = SCORE_SHARD_CACHE,
     short_history_policy: pl.constexpr = "score",
@@ -838,14 +824,14 @@ def score_select_paged(
     score_rows = pl.slice(scores, [capacity, width], [0, 0])
     candidate_keys = pl.create_tensor([capacity, shards * INDEX_TOPK], dtype=pl.UINT16)
     candidate_indices = pl.create_tensor([capacity, shards * INDEX_TOPK], dtype=pl.INT32)
-    with pl.spmd(workers, name_hint="idx_score_topk", sync_start=True, deps=[cache_ready, query_ready, weights_ready]) as mix_tid:
-        mixed_output = _idx_score_topk(
+    with pl.spmd(workers, name_hint="idx_score_topk", sync_start=True):
+        _idx_score_topk(
             query_rows, scale_rows, weight_rows, index_cache, index_cache_scale,
             block_table, request_rows, length_rows, mixed_output, runs, candidate_keys, candidate_indices,
             block_table, block_table, score_rows, width, run_stride, table_width, active_tokens, 0,
             emit_scores, shards, direct_limit_i32,
         )
-    return mix_tid, mix_tid
+    return output
 
 
 @pl.jit.inline(auto_scope=False)
@@ -2036,12 +2022,11 @@ def project_index_weights(
     weight: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ],
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
-    ready: pl.Scalar[pl.TASK_ID],
 ):
     tokens = pl.tensor.dim(source, 0)
     partials = pl.create_tensor([INDEX_WEIGHT_K_SPLIT_TILE * tokens, INDEX_H], dtype=pl.FP32)
     blocks = (num_tokens + 79) // 80
-    with pl.spmd(INDEX_WEIGHT_K_SPLIT_TILE, name_hint="proj_idx_w", deps=[ready]) as cube_tid:
+    with pl.spmd(INDEX_WEIGHT_K_SPLIT_TILE, name_hint="proj_idx_w"):
         split = pl.tile.get_block_idx()
         begin = split * (D // INDEX_WEIGHT_K_SPLIT_TILE)
         for block in pl.range(blocks):
@@ -2060,7 +2045,7 @@ def project_index_weights(
                 acc = pl.matmul_acc(acc, full_a, w)
             value = pl.set_validshape(acc, rows, INDEX_H)
             partials = pl.store(value, [split * tokens + row, 0], partials)
-    with pl.spmd(pl.max(pl.min((num_tokens + 15) // 16, 8), 1), name_hint="reduce_idx_w", deps=[cube_tid]) as completed:
+    with pl.spmd(pl.max(pl.min((num_tokens + 15) // 16, 8), 1), name_hint="reduce_idx_w"):
         worker = pl.tile.get_block_idx()
         workers = pl.tile.get_block_num()
         for row in pl.range(worker * 16, num_tokens, workers * 16):
@@ -2071,7 +2056,7 @@ def project_index_weights(
                 reduced = pl.add(reduced, partial_value)
             rounded = pl.cast(reduced, pl.BF16, mode="rint")
             output = pl.store(rounded, [row, 0], output)
-    return completed
+    return output
 
 
 @pl.jit.inline(auto_scope=False)
@@ -2085,29 +2070,24 @@ def c1a_index(
     cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
-    entry_ready: pl.Scalar[pl.TASK_ID],
     projection_payload: pl.Tensor,
     projection_scale_backing: pl.Tensor,
 ) -> tuple[
     pl.Tensor[[T_DYN, INDEX_H * INDEX_DIM // 2], pl.UINT8],
     pl.Tensor[[T_DYN, INDEX_H * (INDEX_DIM // INDEX_CACHE_GROUP)], pl.FP8E8M0],
     pl.Tensor[[T_DYN, INDEX_H], pl.BF16],
-    pl.Scalar[pl.TASK_ID],
-    pl.Scalar[pl.TASK_ID],
 ]:
     tokens = pl.tensor.dim(x, 0)
     query = pl.create_tensor([tokens, INDEX_H * INDEX_DIM // 2], dtype=pl.UINT8)
     query_scale = pl.create_tensor([tokens, INDEX_H * (INDEX_DIM // INDEX_CACHE_GROUP)], dtype=pl.FP8E8M0)
-    with pl.spmd(16, name_hint="idx_q", deps=[entry_ready]) as query_tid:
-        query = _idx_q(
+    with pl.spmd(16, name_hint="idx_q"):
+        _idx_q(
             projection_payload, index_wq_b, projection_scale_backing, index_wq_b_scale,
             cos, sin, query, query_scale, num_tokens,
         )
     weights = pl.create_tensor([tokens, INDEX_H], dtype=pl.BF16)
-    weights_tid = project_index_weights(
-        x, index_weights_proj, weights, num_tokens, entry_ready
-    )
-    return query, query_scale, weights, query_tid, weights_tid
+    project_index_weights(x, index_weights_proj, weights, num_tokens)
+    return query, query_scale, weights
 
 
 @pl.jit.inline(auto_scope=False)
@@ -2116,15 +2096,13 @@ def project_index_key(
     weight: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16, pl.NZ],
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
-    ready: pl.Scalar[pl.TASK_ID],
     max_workers: pl.constexpr,
 ):
-    result, completed = gemm_bf16_to_bf16(
-        source, weight, output, num_tokens, ready,
+    return gemm_bf16_to_bf16(
+        source, weight, output, num_tokens,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
         workers=max_workers, name_hint='proj_idx_k',
     )
-    return completed
 
 
 @pl.jit.extern(core_type="aiv", aiv_source=LI_SOURCE, include_dirs=LI_INCLUDES)
@@ -2185,9 +2163,9 @@ def prepare_score_metadata(
 ):
     active_rows = pl.cast(num_tokens, pl.INT64)
     metadata = pl.create_tensor([33, 2], dtype=pl.INT32)
-    with pl.spmd(1, name_hint="qli_score_metadata") as prepared:
+    with pl.spmd(1, name_hint="qli_score_metadata"):
         _score_prepare(request_ids, lengths, metadata, METADATA, active_rows)
-    return metadata, prepared
+    return metadata
 
 
 @pl.jit.inline(auto_scope=False)
@@ -2203,19 +2181,15 @@ def score_paged(
     metadata: pl.Tensor,
     scores: pl.Tensor,
     active: pl.Scalar[pl.INT32],
-    query_ready: pl.Scalar[pl.TASK_ID],
-    key_ready: pl.Scalar[pl.TASK_ID],
-    metadata_ready: pl.Scalar[pl.TASK_ID],
     block_scores: pl.Tensor,
     candidates: pl.constexpr = False,
-) -> pl.Scalar[pl.TASK_ID]:
+):
     active_rows = pl.cast(active, pl.INT64)
-    with pl.spmd(WORKERS, name_hint="qli_score", deps=[metadata_ready, query_ready, key_ready]) as completed:
+    with pl.spmd(WORKERS, name_hint="qli_score"):
         if candidates:
             _score_candidates(query, query_scale, weights, key, key_scale, table, request_ids, lengths, metadata, scores, block_scores, SCORE_CANDIDATES, active_rows)
         else:
             _score(query, query_scale, weights, key, key_scale, table, request_ids, lengths, metadata, scores, active_rows, SCORE)
-    return completed
 
 
 @pl.jit.extern(core_type="aiv", source=LI_SOURCE, include_dirs=LI_INCLUDES)
@@ -2258,18 +2232,16 @@ def deepseek_select_attention(
     request_ids: pl.Tensor,
     physical: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
-    ready: pl.Scalar[pl.TASK_ID],
     page_rows: pl.Scalar[pl.INT64],
     sorted_index: pl.constexpr = False,
 ):
     active = pl.cast(num_tokens, pl.INT64)
     native_sorted = pl.cast(sorted_index, pl.INT64)
-    with pl.spmd(64, name_hint="qli_deepseek_attention_select", deps=[ready]) as selected_ready:
+    with pl.spmd(64, name_hint="qli_deepseek_attention_select"):
         _deepseek_select(
             scores, lengths, physical, table, request_ids, lengths,
             ATTENTION, active, native_sorted, page_rows,
         )
-    return physical, selected_ready
 
 
 @pl.jit.inline(auto_scope=False)
@@ -2279,15 +2251,13 @@ def deepseek_select_pool(
     pool_ids: pl.Tensor,
     pool_counts: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
-    ready: pl.Scalar[pl.TASK_ID],
 ):
     active = pl.cast(num_tokens, pl.INT64)
-    with pl.spmd(64, name_hint="qli_deepseek_pool_select", deps=[ready]) as selected_ready:
+    with pl.spmd(64, name_hint="qli_deepseek_pool_select"):
         _deepseek_select_pool(
             block_scores, token_lengths, pool_ids, block_scores, token_lengths, pool_counts,
             POOL, active, 1, 128,
         )
-    return pool_ids, selected_ready
 
 
 @pl.jit.inline(auto_scope=False)
@@ -2305,16 +2275,11 @@ def select_qli(
     pool_ids: pl.Tensor,
     pool_counts: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
-    key_ready: pl.Scalar[pl.TASK_ID],
-    query_ready: pl.Scalar[pl.TASK_ID],
-    weights_ready: pl.Scalar[pl.TASK_ID],
-    metadata_ready: pl.Scalar[pl.TASK_ID],
     candidates: pl.constexpr = False,
     sorted_index: pl.constexpr = False,
 ):
     tokens = pl.tensor.dim(query, 0)
     active = pl.cast(num_tokens, pl.INT32)
-    inputs_ready = pl.system.task_dummy(deps=[query_ready, weights_ready])
     page_rows = pl.tensor.dim(key, 1)
     capacity = pl.tensor.dim(table, 1) * page_rows
     width = (capacity + 255) // 256 * 256
@@ -2322,25 +2287,24 @@ def select_qli(
     if candidates:
         block_width = pl.max(2048, ((capacity + 7) // 8 + 511) // 512 * 512)
         block_scores = pl.create_tensor([tokens, block_width], dtype=pl.BF16)
-        score_ready = score_paged(
+        score_paged(
             query, query_scale, raw_weights, key, key_scale, table,
-            request_ids, lengths, metadata, scores, active, inputs_ready, key_ready, metadata_ready, block_scores, True,
+            request_ids, lengths, metadata, scores, active, block_scores, True,
         )
-        selected_output, selected_ready = deepseek_select_attention(
-            scores, lengths, table, request_ids, output, active, score_ready, page_rows, sorted_index,
+        deepseek_select_attention(
+            scores, lengths, table, request_ids, output, active, page_rows, sorted_index,
         )
-        selected_pool, pool_ready = deepseek_select_pool(
-            block_scores, lengths, pool_ids, pool_counts, active, score_ready,
+        deepseek_select_pool(
+            block_scores, lengths, pool_ids, pool_counts, active,
         )
     else:
-        score_ready = score_paged(
+        score_paged(
             query, query_scale, raw_weights, key, key_scale, table,
-            request_ids, lengths, metadata, scores, active, inputs_ready, key_ready, metadata_ready, scores, False,
+            request_ids, lengths, metadata, scores, active, scores, False,
         )
-        selected_output, selected_ready = deepseek_select_attention(
-            scores, lengths, table, request_ids, output, active, score_ready, page_rows, sorted_index,
+        deepseek_select_attention(
+            scores, lengths, table, request_ids, output, active, page_rows, sorted_index,
         )
-    return selected_ready
 
 
 @pl.jit.inline(auto_scope=False)
@@ -2367,32 +2331,29 @@ def decode_c2a_indexer(
     metadata: pl.Tensor,
     topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
-    cache_ready: pl.Scalar[pl.TASK_ID],
-    latent_ready: pl.Scalar[pl.TASK_ID],
-    metadata_ready: pl.Scalar[pl.TASK_ID],
 ):
     """Publish C2A keys and select long histories through the shared MX scorer."""
     tokens = pl.tensor.dim(latent, 0)
     projected_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-    projected_tid = project_index_key(latent, index_wk, projected_key, num_tokens, latent_ready, max_workers=32)
-    index_publish_tid = publish_index_rows(
+    project_index_key(latent, index_wk, projected_key, num_tokens, max_workers=32)
+    publish_index_rows(
         projected_key, index_norm_weight, compressed_rope_cos, compressed_rope_sin, compressed_slots,
-        index_cache, index_cache_scale, num_tokens, cache_ready, projected_tid,
+        index_cache, index_cache_scale, num_tokens,
     )
-    query, query_scale, raw_weights, query_tid, weights_tid = c1a_index(
+    query, query_scale, raw_weights = c1a_index(
         x,
         index_wq_b, index_wq_b_scale, index_weights_proj,
         rope_cos, rope_sin,
-        num_tokens, cache_ready,
+        num_tokens,
         projection_payload, projection_scales,
     )
-    selected_tid = select_qli(
+    select_qli(
         query, query_scale, raw_weights, index_cache, index_cache_scale,
         index_block_table, token_to_req_indices, compressed_lens, metadata,
         topk_indices, compressed_lens, compressed_lens,
-        num_tokens, index_publish_tid, query_tid, weights_tid, metadata_ready, False, False,
+        num_tokens, False, False,
     )
-    return selected_tid
+    return topk_indices
 
 
 @pl.jit
@@ -2418,11 +2379,10 @@ def qli_validation(
     table.bind_dynamic(0, B_DYN)
     table.bind_dynamic(1, TABLE_DYN)
     pool_ids.bind_dynamic(1, INDEX_POOL_BLOCKS_DYN)
-    metadata, metadata_ready = prepare_score_metadata(request_ids, lengths, num_tokens)
-    ready = pl.system.task_dummy(deps=[])
-    complete = select_qli(
+    metadata = prepare_score_metadata(request_ids, lengths, num_tokens)
+    select_qli(
         query, query_scale, raw_weights, key, key_scale, table, request_ids, lengths, metadata,
-        physical, pool_ids, pool_counts, num_tokens, ready, ready, ready, metadata_ready, candidates, sorted_index,
+        physical, pool_ids, pool_counts, num_tokens, candidates, sorted_index,
     )
     return physical
 

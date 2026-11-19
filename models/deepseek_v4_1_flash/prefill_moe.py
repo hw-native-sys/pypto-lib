@@ -44,7 +44,7 @@ from config import FLASH as M
 from config import EP_SIZE, SUPPORTED_EP_SIZES
 from config import MOE_TOKENS, MOE_RECV_MAX, N_LOCAL_EXPERTS, LOCAL_T_DYN, ROUTE_T_DYN
 from config import T_DYN
-from gate import gate_from_bf16
+from gate import gate
 from expert_shared import expert_shared
 from expert_routed import (
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS,
@@ -265,7 +265,7 @@ def dispatch(
 
     # Gather compact expert rows and pack their MX scales.
     recv_x_out_flat = pl.reshape(recv_x_out, [N_LOCAL * RECV_MAX, D])
-    with pl.spmd(32, name_hint="dispatch_gather_pack", deps=[_wait_tid, _push_tid, _meta_tid]) as gathered:
+    with pl.spmd(32, name_hint="dispatch_gather_pack", deps=[_wait_tid, _push_tid, _meta_tid]):
         worker = pl.tile.get_block_idx()
         for e in pl.range(worker, N_LOCAL, 32):
             expert_rows = pl.cast(pl.read(recv_count_out, [e, 0]), pl.INDEX)
@@ -303,7 +303,7 @@ def dispatch(
                 gather_packed_flat = pl.reshape(gather_packed_mx, [1, RECV_GATHER_TILE * K_SCALE])
                 packed_offset = (e_base_row + tile_row) * K_SCALE
                 recv_scale_out = pl.store(gather_packed_flat, [0, packed_offset], recv_scale_out)
-    return gathered
+    return recv_x_out
 
 
 @pl.jit.inline
@@ -409,7 +409,7 @@ def prefill_moe(
         x_norm_scale = pl.create_tensor([1, t * (D // MX_GROUP)], dtype=pl.FP8E8M0)
         indices = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
         weights = pl.create_tensor([t, TOPK], dtype=pl.FP32)
-        gate_from_bf16(
+        gate(
             ffn_input, gate_weight, correction_bias, num_tokens,
             x_norm_mx, x_norm_scale, indices, weights, n_experts=N_EXPERTS, topk=TOPK,
         )
@@ -431,7 +431,7 @@ def prefill_moe(
         recv_route_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.INT32)
         recv_count_local = pl.create_tensor([N_LOCAL_EXPERTS, 1], dtype=pl.INT32)
         recv_meta_local = pl.create_tensor([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-        input_ready = dispatch(
+        dispatch(
             dispatch_indices, x_norm_mx, x_norm_scale, weights,
             recv_x_local, recv_scale_local_backing,
             recv_weight_local, recv_route_local, recv_count_local, recv_meta_local,
@@ -445,7 +445,7 @@ def prefill_moe(
             routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
             routed_w2, routed_w2_scale,
             recv_route_local, recv_meta_local,
-            routed_output, input_ready, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
+            routed_output, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
         )
         output_ready = combine_scattered(
             shared_result, sublayer,
@@ -471,7 +471,7 @@ def prefill_moe(
         hc_post_deps = pl.array.create(2, pl.TASK_ID)
         hc_post_deps[0] = round_ready
         hc_post_deps[1] = mixes_ready
-        hc_post(sublayer, x_hc, post_mix, residual_mix, x_next, deps=hc_post_deps)
+        hc_post(sublayer, x_hc, post_mix, residual_mix, x_next, deps=hc_post_deps, dep_count=2)
     return x_next
 
 

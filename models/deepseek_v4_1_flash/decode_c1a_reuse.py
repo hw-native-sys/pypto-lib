@@ -20,7 +20,7 @@ from config import (
     COMPRESSED_CACHE_BYTES,
 )
 from hc import hc_head_norm, hc_project, hc_sinkhorn
-from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
+from qkv_proj_rope import qkv_quant, q_proj_rope, kv_proj, window_publish
 from o_proj import o_proj_hc_post
 from sparse_attention import gather_sparse_attention
 
@@ -75,15 +75,17 @@ def decode_c1a_reuse(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     tokens = pl.tensor.dim(x_hc, 0)
+    x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    hc_head_norm(x_hc, pre_mix, attn_norm_weight, x_norm, worker_limit=64)
+    inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    x_ready = hc_head_norm(x_hc, pre_mix, attn_norm_weight, x_norm, worker_limit=64)
+    hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
 
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    proj_payload, proj_scales, proj_payload_padded_rows = quantize_projection_input(x_norm, num_tokens, row_tile=80)
+    proj_payload, proj_scales, proj_payload_padded_rows = qkv_quant(x_norm, num_tokens, row_tile=80)
     q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
@@ -94,7 +96,7 @@ def decode_c1a_reuse(
         padded_rows=proj_payload_padded_rows,
         qa_row_tile=80, qb_row_tile=80,
     )
-    kv_projection = kv_proj(
+    kv_proj(
         proj_payload, proj_scales,
         wkv, wkv_scale,
         kv_projection, num_tokens, worker_limit=32, row_tile=80,
@@ -102,17 +104,15 @@ def decode_c1a_reuse(
     window_publish(
         kv_projection, kv_norm_weight, rope_cos, rope_sin,
         window_slots, window_cache,
-        num_tokens, x_ready,
+        num_tokens,
     )
-    attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    attn_out = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     gather_sparse_attention(
         query, window_indices, window_cache, compressed_indices, compressed_cache,
-        attn_sink, attended, num_tokens, x_ready, compressed_keys=INDEX_TOPK,
+        attn_sink, attn_out, num_tokens, compressed_keys=INDEX_TOPK,
     )
-    inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
-    hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
     o_proj_hc_post(
-        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+        attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
         x_hc, post_mix, residual_mix, output, num_tokens,
         oa_row_tile=80, ob_row_tile=128,
     )

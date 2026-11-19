@@ -121,7 +121,7 @@ def gather_routed_inputs(
     """Gather source lanes with expert-partitioned workers and pack MX scales."""
     x_flat = pl.reshape(x_out, [local_experts * RECV_MAX, D])
     count_routes = pl.tensor.view(recv_routes, [local_experts * EP_WORLD_SIZE, max_per_source * 8])
-    with pl.spmd(GATHER_WORKER_TILE, name_hint="dispatch_gather", deps=[wait_ready, publish_ready]) as ready:
+    with pl.spmd(GATHER_WORKER_TILE, name_hint="dispatch_gather", deps=[wait_ready, publish_ready]):
         core = pl.tile.get_block_idx()
         expert_groups = pl.min(local_experts, GATHER_WORKER_TILE)
         expert_lane = core // expert_groups
@@ -196,7 +196,7 @@ def gather_routed_inputs(
                 packed_mx = pl.reinterpret_view(packed, pl.FP8E8M0)
                 packed_flat = pl.reshape(packed_mx, [1, RECV_ROW_TILE * K_SCALE])
                 scale_out = pl.store(packed_flat, [0, scale_row * K_SCALE], scale_out)
-    return ready
+    return x_out
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1113,7 +1113,6 @@ def _expert_routed_output(
     w3_scale: pl.Tensor,
     w2: pl.Tensor,
     w2_scale: pl.Tensor,
-    input_ready: pl.Scalar[pl.TASK_ID],
     experts: pl.constexpr,
     stride: pl.constexpr,
     width: pl.constexpr,
@@ -1122,14 +1121,14 @@ def _expert_routed_output(
 ):
     """Run BF16 W13, FP32 weighted MXFP8 activation, and full-K BF16 W2.
 
-    Counts are immutable after input_ready, lie in [0, stride], and sum to
+    Counts lie in [0, stride] and sum to
     at most row_capacity. Stride is divisible by 16; width and hidden are
     divisible by 256.
     """
     activation_rows = ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE
     pair = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, 2 * hidden], dtype=pl.BF16)
     compact_weights = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, 1], dtype=pl.FP32)
-    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w13", deps=[input_ready]) as w13_ready:
+    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w13"):
         pair, compact_weights = _routed_w13(
             x, x_scale, counts, w1, w1_scale, w3, w3_scale, pair,
             weights, compact_weights, experts, stride, width, hidden, activation_rows, row_capacity,
@@ -1137,19 +1136,19 @@ def _expert_routed_output(
 
     payload = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, hidden], dtype=pl.FP8E4M3FN)
     scales = pl.create_tensor([1, ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE * (hidden // MX_GROUP)], dtype=pl.FP8E8M0)
-    with pl.spmd(ROUTED_VECTOR_WORKER_TILE, name_hint="routed_swiglu_quant", deps=[w13_ready]) as activation_ready:
+    with pl.spmd(ROUTED_VECTOR_WORKER_TILE, name_hint="routed_swiglu_quant"):
         payload, scales = _routed_swiglu_quant(
             pair, compact_weights, counts, payload, scales, experts, stride, hidden, row_capacity,
         )
 
     output_rows = ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE
     output = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, width], dtype=pl.BF16)
-    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w2", deps=[activation_ready]) as ready:
+    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w2"):
         output = _routed_w2(
             payload, scales, counts, w2, w2_scale, output,
             experts, stride, width, hidden, output_rows, activation_rows, row_capacity,
         )
-    return output, ready
+    return output
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1167,23 +1166,22 @@ def expert_routed_scatter(
     recv_route: pl.Tensor,
     recv_meta: pl.Tensor,
     routed_output: pld.DistributedTensor,
-    input_ready: pl.Scalar[pl.TASK_ID],
     local_experts: pl.constexpr = N_LOCAL_EXPERTS,
     topk: pl.constexpr = M.num_experts_per_tok,
 ):
     """Compute active expert rows and scatter each source interval to its route destinations."""
     recv_x_flat = pl.reshape(recv_x, [local_experts * RECV_MAX, D])
     route_weights = pl.reshape(recv_weights, [local_experts * RECV_MAX, 1])
-    output, down_ready = _expert_routed_output(
+    output = _expert_routed_output(
         recv_x_flat, recv_mx_scale, route_weights, recv_expert_count,
         routed_w1_packed, routed_w1_scale, routed_w3_packed, routed_w3_scale,
-        routed_w2_packed, routed_w2_scale, input_ready,
+        routed_w2_packed, routed_w2_scale,
         local_experts, RECV_MAX, D, MOE_INTER,
         (local_experts if local_experts < topk else topk) * RECV_MAX,
     )
     flat_counts = pl.reshape(recv_expert_count, [1, local_experts])
     metadata_cols = ((local_experts + 7) // 8) * 8
-    with pl.spmd(64, name_hint="ffn_scatter", deps=[down_ready]) as scatter_done:
+    with pl.spmd(64, name_hint="ffn_scatter") as scatter_done:
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="ffn_scatter", no_dep_args=[routed_output]):
             core = pl.tile.get_block_idx()
             count_values = pl.load(flat_counts, [0, 0], [1, metadata_cols], valid_shape=[1, local_experts])
@@ -1246,16 +1244,15 @@ def local_compute_test(
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * H_SCALE, D], pl.FP8E8M0, pl.MX_B_NN],
     routed_y: pl.InOut[pl.Tensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.BF16]],
 ):
-    input_ready = pl.system.task_dummy(deps=[])
     recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
     route_weights = pl.reshape(recv_weights, [N_LOCAL_EXPERTS * RECV_MAX, 1])
-    output, down_ready = _expert_routed_output(
+    output = _expert_routed_output(
         recv_x_flat, recv_mx_scale, route_weights, recv_expert_count,
         routed_w1_packed, routed_w1_scale, routed_w3_packed, routed_w3_scale,
-        routed_w2_packed, routed_w2_scale, input_ready,
+        routed_w2_packed, routed_w2_scale,
         N_LOCAL_EXPERTS, RECV_MAX, D, MOE_INTER, N_LOCAL_EXPERTS * RECV_MAX,
     )
-    with pl.spmd(64, name_hint="ffn_copy", deps=[down_ready]):
+    with pl.spmd(64, name_hint="ffn_copy"):
         core = pl.tile.get_block_idx()
         work_base = 0
         compact_base = 0

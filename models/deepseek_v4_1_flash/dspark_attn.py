@@ -21,9 +21,9 @@ from config import (
     DSPARK_QUERY_WIDTH, DSPARK_SWA_INDEX_WIDTH, FLASH, MOE_TOKENS, ORI_BLOCKS_DYN,
     WINDOW_CACHE_BYTES,
 )
-from hc import hc_head_norm, hc_project, hc_sinkhorn, zero_bf16_padding
+from hc import hc_head_norm, hc_project, hc_sinkhorn
 from o_proj import o_proj_hc_post
-from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
+from qkv_proj_rope import qkv_quant, q_proj_rope, kv_proj, window_publish
 from qkv_proj_rope import golden_rope_interleave
 from quant import quantize_mxfp8_cache
 from rmsnorm import golden_rms_norm
@@ -54,10 +54,10 @@ SOFTMAX_SCALE = HEAD_DIM**-0.5
 QUERY_HEAD_TILE = max(32, LOCAL_H)
 
 
-@pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "dspark_attention_core.cpp",
-               aiv_source=Path(__file__).parent / "kernels" / "dspark_attention_core.cpp",
+@pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "dspark_attention.cpp",
+               aiv_source=Path(__file__).parent / "kernels" / "dspark_attention.cpp",
                include_dirs=(pto_isa_include_dir(),), dual_aiv_dispatch=True)
-def _attend_dspark_native(
+def _dspark_attention(
     query: pl.Tensor,
     cache: pl.Tensor,
     indices: pl.Tensor,
@@ -71,7 +71,7 @@ def _attend_dspark_native(
 
 
 @pl.jit.inline(auto_scope=False)
-def attend_dspark_window(
+def dspark_attention(
     query: pl.Tensor[[MOE_TOKENS, LOCAL_H * HEAD_DIM], pl.BF16],
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     indices: pl.Tensor[[MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
@@ -87,12 +87,11 @@ def attend_dspark_window(
             active_query = query[row : row + 1, :]
             padded[:, :LOCAL_H * HEAD_DIM] = active_query
             padded_query[row : row + 1, :] = padded
-        with pl.spmd(workers, name_hint="dspark_online_attention"):
-            output = _attend_dspark_native(padded_query, cache, indices, sink, output, num_tokens, LOCAL_H)
+        with pl.spmd(workers, name_hint="dspark_attention"):
+            _dspark_attention(padded_query, cache, indices, sink, output, num_tokens, LOCAL_H)
     else:
-        with pl.spmd(workers, name_hint="dspark_online_attention"):
-            output = _attend_dspark_native(query, cache, indices, sink, output, num_tokens, LOCAL_H)
-    return output
+        with pl.spmd(workers, name_hint="dspark_attention"):
+            _dspark_attention(query, cache, indices, sink, output, num_tokens, LOCAL_H)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -111,8 +110,7 @@ def dspark_context_kv(
     """Project shared quantized context inputs through one layer's own weights."""
     tokens = pl.tensor.dim(context_slots, 0)
     projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    window_input_ready = pl.system.task_dummy(deps=[])
-    projected = kv_proj(
+    kv_proj(
         kv_input_payload, kv_input_scales,
         wkv, wkv_scale,
         projected, num_tokens, worker_limit=32, row_tile=80,
@@ -120,7 +118,7 @@ def dspark_context_kv(
     window_publish(
         projected, kv_norm_weight, rope_cos, rope_sin,
         context_slots, window_cache,
-        num_tokens, window_input_ready,
+        num_tokens,
     )
     return window_cache
 
@@ -191,11 +189,10 @@ def dspark_attn(
     post_mix = pl.create_tensor([MOE_TOKENS, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([MOE_TOKENS, HC_MULT, HC_MULT], dtype=pl.FP32)
     hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, attention_pre_mix, post_mix, residual_mix)
-    zero_bf16_padding(normalized_attention, num_tokens)
-    proj_payload, proj_scales, proj_rows = quantize_projection_input(normalized_attention, num_tokens, row_tile=80)
+    proj_payload, proj_scales, proj_rows = qkv_quant(normalized_attention, num_tokens, row_tile=80)
     qr = pl.create_tensor([MOE_TOKENS, Q_LORA], dtype=pl.BF16)
     q = pl.create_tensor([MOE_TOKENS, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    q_proj_result = q_proj_rope(
+    q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
@@ -206,8 +203,7 @@ def dspark_attn(
         qa_row_tile=80, qb_row_tile=80,
     )
     kv_projection = pl.create_tensor([MOE_TOKENS, HEAD_DIM], dtype=pl.BF16)
-    window_input_ready = pl.system.task_dummy(deps=[])
-    kv_projection = kv_proj(
+    kv_proj(
         proj_payload, proj_scales,
         wkv, wkv_scale,
         kv_projection, num_tokens, worker_limit=32, row_tile=80,
@@ -215,13 +211,13 @@ def dspark_attn(
     window_publish(
         kv_projection, kv_norm_weight, rope_cos, rope_sin,
         window_slots, window_cache,
-        num_tokens, window_input_ready,
+        num_tokens,
     )
-    attended = pl.create_tensor([MOE_TOKENS, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    attended = attend_dspark_window(q, window_cache, window_indices, attn_sink, attended, num_tokens)
+    attention_output = pl.create_tensor([MOE_TOKENS, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    dspark_attention(q, window_cache, window_indices, attn_sink, attention_output, num_tokens)
 
     o_proj_hc_post(
-        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+        attention_output, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
         x_hc, post_mix, residual_mix, attention_hidden, num_tokens,
         oa_row_tile=80, ob_row_tile=128,
     )
@@ -352,12 +348,12 @@ def golden_dspark_attn(tensors):
         )
         packed_cache = pack_quantized_cache(cache, scale)
         indices = inputs["window_indices"]
-        attended = golden_gather_sparse_attention(
+        attention_output = golden_gather_sparse_attention(
             query, indices, packed_cache, indices, packed_cache, inputs["attn_sink"],
             compressed_keys=0, key_tile=64,
         )
         projected = golden_o_proj(
-            attended, inputs["rope_cos"], inputs["rope_sin"], inputs["wo_a"], inputs["wo_b"], inputs["wo_b_scale"],
+            attention_output, inputs["rope_cos"], inputs["rope_sin"], inputs["wo_a"], inputs["wo_b"], inputs["wo_b_scale"],
             wo_a_scale=inputs["wo_a_scale"], sequential_projection=True,
         )
         projection[:active].copy_(projected)
