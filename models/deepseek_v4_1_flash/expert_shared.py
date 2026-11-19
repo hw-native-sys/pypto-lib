@@ -333,7 +333,11 @@ def _shared_swiglu_vf(
             pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.V, slot)
             if iteration >= 2:
                 pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, slot)
-            ub_payload, ub_scales = _shared_swiglu_compute(gate, up, ub_payload, ub_scales, slot)
+            # Use static UB offsets for each register scope.
+            if slot == 0:
+                _shared_swiglu_compute(gate, up, ub_payload, ub_scales, 0)
+            else:
+                _shared_swiglu_compute(gate, up, ub_payload, ub_scales, 1)
             pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE2, slot)
             pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE3, slot)
             if work + 2 < last:
