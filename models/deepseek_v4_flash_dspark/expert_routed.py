@@ -51,7 +51,7 @@ assert RECV_MAX % RECV_TILE == 0, "RECV_MAX must be a whole number of RECV_TILE 
 
 @pl.jit.incore
 def _gate_up_python(
-    x: pl.Tensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
+    x: pl.Tensor,
     gate: pl.Out[pl.Tensor],
     up: pl.Out[pl.Tensor],
     w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8, pl.NZ],
@@ -188,6 +188,9 @@ def expert_routed_tile(
 ) -> pl.Scalar[pl.TASK_ID]:
     recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
     flat_tile_row = local_e * RECV_MAX + tile_row
+    recv_x_tile = recv_x_flat[flat_tile_row : flat_tile_row + ROW_TILE, :]
+    recv_scale_tile = recv_scale_dq[local_e : local_e + 1, tile_row : tile_row + ROW_TILE]
+    recv_weight_tile = recv_weights[local_e : local_e + 1, tile_row : tile_row + ROW_TILE]
     h_tile_i8 = pl.create_tensor([ROW_TILE, MOE_INTER], dtype=pl.INT8)
     h_tile_row_scale = pl.create_tensor([1, ROW_TILE], dtype=pl.FP32, manual_dep=True)
     quant_tids = pl.array.create(1, pl.TASK_ID)
@@ -198,16 +201,15 @@ def expert_routed_tile(
 
         with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_up_mm", deps=[inputs_ready]):
             gate_tile_i32, up_tile_i32 = _gate_up_python(
-                recv_x_flat, gate_tile_i32, up_tile_i32,
-                routed_w1, routed_w3, flat_tile_row, local_e, ROW_TILE,
+                recv_x_tile, gate_tile_i32, up_tile_i32,
+                routed_w1, routed_w3, 0, local_e, ROW_TILE,
             )
 
         with pl.spmd(ROW_TILE // QUANT_ROW_TILE, name_hint="exp_gate_up_act_q") as quant_tid:
             quant_block = pl.tile.get_block_idx()
             quant_row = quant_block * QUANT_ROW_TILE
-            recv_row = tile_row + quant_row
             valid_quant_rows = pl.min(QUANT_ROW_TILE, pl.max(0, valid_rows - quant_row))
-            x_scale = recv_scale_dq[local_e : local_e + 1, recv_row : recv_row + QUANT_ROW_TILE]
+            x_scale = recv_scale_tile[:, quant_row : quant_row + QUANT_ROW_TILE]
             x_scale = pl.reshape(x_scale, [QUANT_ROW_TILE, 1])
             row_amax = pl.full([1, QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
             gate0_i32 = gate_tile_i32[quant_row : quant_row + QUANT_ROW_TILE, :ACT_INTER_TILE]
@@ -256,7 +258,7 @@ def expert_routed_tile(
 
             quant_scale = pl.div(pl.full([1, QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), row_amax)
             dequant_scale = pl.recip(quant_scale)
-            route_weight = recv_weights[local_e : local_e + 1, recv_row : recv_row + QUANT_ROW_TILE]
+            route_weight = recv_weight_tile[:, quant_row : quant_row + QUANT_ROW_TILE]
             h_tile_row_scale[:, quant_row : quant_row + QUANT_ROW_TILE] = pl.mul(dequant_scale, route_weight)
             quant_scale_col = pl.reshape(quant_scale, [QUANT_ROW_TILE, 1])
             scaled0 = pl.row_expand_mul(activated0, quant_scale_col)

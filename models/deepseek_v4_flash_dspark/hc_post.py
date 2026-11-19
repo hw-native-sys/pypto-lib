@@ -10,7 +10,7 @@
 output with its hc-residual into the next hc-stack via post and comb weights.
 Supports both decode and prefill batch/sequence sizes via dynamic-shape tensors."""
 
-# ``hc_post`` processes a dynamic tensor whose rows are all valid (decode/MoE).
+# ``hc_post`` writes an output prefix and zero-fills its inactive rows.
 # ``hc_post_prefill`` processes only the active prefix of a static prefill tensor
 # and deterministically zero-fills its inactive tail.
 
@@ -22,6 +22,7 @@ from config import FLASH as M, PREFILL_BATCH, PREFILL_SEQ
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")  # T = B * S
+OUT_T_DYN = pl.dynamic("OUT_T_DYN")
 
 # model config
 D = M.hidden_size
@@ -30,6 +31,7 @@ HC_DIM = M.hc_dim
 
 # tiling
 T_TILE = 4
+HC_TOKEN_TILE = 8
 HC_RESIDENT_F32_ELEMENTS = 8192
 HC_MAX_D_TILE = 4096
 INACTIVE_FILL_T_TILE = 16
@@ -59,15 +61,20 @@ def _hc_post(
     residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
-    y: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
-    T_TILE: pl.constexpr = 4,
+    y: pl.Out[pl.Tensor[[OUT_T_DYN, HC_MULT, D], pl.FP32]],
+    num_tokens: pl.Scalar[pl.INT32],
+    T_TILE: pl.constexpr = HC_TOKEN_TILE,
 ):
+    """Write at most the input row count; a negative count keeps all output rows active."""
     x.bind_dynamic(0, T_DYN)
     residual.bind_dynamic(0, T_DYN)
     post.bind_dynamic(0, T_DYN)
     comb.bind_dynamic(0, T_DYN)
-    y.bind_dynamic(0, T_DYN)
-    t_dim = pl.tensor.dim(x, 0)
+    y.bind_dynamic(0, OUT_T_DYN)
+    t_dim = pl.tensor.dim(y, 0)
+    active_tokens = t_dim
+    if num_tokens >= 0:
+        active_tokens = pl.min(t_dim, pl.cast(num_tokens, pl.INDEX))
 
     y_flat = pl.reshape(y, [t_dim, HC_DIM])
 
@@ -77,7 +84,7 @@ def _hc_post(
         d0 = (block % HC_D_BLOCKS) * HC_D_TILE
         t0 = token_block * T_TILE
         for t in pl.pipeline(t0, t0 + T_TILE, stage=2):
-            if t < t_dim:
+            if t < active_tokens:
                 x_tile = pl.load(
                     x, [t, d0], [1, HC_D_TILE], target_memory=pl.MemorySpace.Vec,
                 )
@@ -97,6 +104,11 @@ def _hc_post(
                         y_row = pl.add(y_row, pl.mul(res_row, comb_w))
                     out_d0 = out_h * D + d0
                     y_flat = pl.store(y_row, [t, out_d0], y_flat)
+            elif t < t_dim:
+                zero_row = pl.full([1, HC_D_TILE], dtype=pl.FP32, value=0.0)
+                for zero_h in pl.unroll(HC_MULT):
+                    zero_d0 = zero_h * D + d0
+                    y_flat[t : t + 1, zero_d0 : zero_d0 + HC_D_TILE] = zero_row
     return y
 
 
@@ -176,7 +188,11 @@ def golden_hc_post(tensors):
         y_fp32[:, out_h, :] = y_row
     y = y_fp32  # hc residual stream is FP32 end-to-end: no BF16 rounding
 
-    tensors["y"][:] = y
+    output_rows = tensors["y"].shape[0]
+    num_tokens = int(tensors.get("num_tokens", -1))
+    active_rows = output_rows if num_tokens < 0 else min(output_rows, num_tokens)
+    tensors["y"][:active_rows] = y[:active_rows]
+    tensors["y"][active_rows:] = 0
 
 
 def golden_hc_post_prefill(tensors):

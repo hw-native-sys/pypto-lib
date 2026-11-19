@@ -395,7 +395,7 @@ def _prefill_attention_csa(
         o_proj_weight_dep,
     )
 
-    hc_post(attn_out, x_hc, post, comb, x_out, T_TILE=16)
+    hc_post(attn_out, x_hc, post, comb, x_out, pl.const(-1, pl.INT32), T_TILE=16)
     return (
         kv_cache,
         cmp_kv,
@@ -1412,7 +1412,7 @@ def prefill_attention_csa_cp_local(
 
     hc_output_flat_local = pl.reshape(x_out_local, [hc_local_elements])
     hc_output_local = pl.reshape(hc_output_flat_local, [q_dim, HC_MULT, D])
-    hc_post(attn_out_local, hc_residual_local, post_local, comb_local, hc_output_local, T_TILE=16)
+    hc_post(attn_out_local, hc_residual_local, post_local, comb_local, hc_output_local, pl.const(-1, pl.INT32), T_TILE=16)
     return x_out_local, gather_signal
 
 
