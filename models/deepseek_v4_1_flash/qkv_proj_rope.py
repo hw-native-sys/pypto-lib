@@ -255,6 +255,148 @@ def qkv_quant(
 
 
 @pl.jit.inline(auto_scope=False)
+def _q_norm_quant_rows(
+    source: pl.Tile[[MX_M_TILE, Q_LORA], pl.BF16, pl.Mem.Vec, pl.TileView(stride=[Q_LORA, 1])],
+    gamma: pl.Tile[[Q_LORA], pl.BF16, pl.Mem.Vec],
+    normalized: pl.Tile[[MX_M_TILE * Q_LORA], pl.BF16, pl.Mem.Vec],
+    quant_words: pl.Tile[[MX_M_TILE * Q_LORA // 4], pl.UINT32, pl.Mem.Vec],
+    row_scales: pl.Tile[[MX_M_TILE * 32], pl.UINT32, pl.Mem.Vec],
+    active: pl.Scalar[pl.INDEX],
+):
+    """Normalize and quantize the active rows of a UB tile."""
+    with pl.reg_scope():
+        full = pl.reg.full_mask(lanes=64)
+        partial_mask = pl.reg.active_mask(Q_NORM_FOLD // 64, lanes=64)
+        lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
+        variances = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+        for row in pl.hardware_loop(active):
+            row_offset = row * Q_LORA
+            partials = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+            # Fold the trailing 256 squares onto the first four vectors.
+            for block in pl.hardware_loop((Q_LORA - Q_NORM_FOLD) // 64):
+                column = block * 64
+                raw = pl.reg.load(source, row_offset + column, lanes=64)
+                value = pl.reg.convert(raw, dtype=pl.FP32)
+                square = pl.reg.mul(value, value, full)
+                raw_folded = pl.reg.load(source, row_offset + Q_NORM_FOLD + column, lanes=64)
+                folded = pl.reg.convert(raw_folded, dtype=pl.FP32)
+                folded_square = pl.reg.mul(folded, folded, full)
+                square = pl.reg.add(square, folded_square, full)
+                partial = pl.reg.reduce_sum(square, full, reassoc=True)
+                partial_all = pl.reg.broadcast(partial, lanes=64, dtype=pl.FP32)
+                slot = pl.reg.compares(lane, pl.cast(block, pl.UINT32), full, predicate="eq")
+                partials = pl.reg.select(slot, partial_all, partials)
+            for block_tail in pl.hardware_loop((2 * Q_NORM_FOLD - Q_LORA) // 64):
+                block = block_tail + (Q_LORA - Q_NORM_FOLD) // 64
+                column = block * 64
+                raw = pl.reg.load(source, row_offset + column, lanes=64)
+                value = pl.reg.convert(raw, dtype=pl.FP32)
+                square = pl.reg.mul(value, value, full)
+                partial = pl.reg.reduce_sum(square, full, reassoc=True)
+                partial_all = pl.reg.broadcast(partial, lanes=64, dtype=pl.FP32)
+                slot = pl.reg.compares(lane, pl.cast(block, pl.UINT32), full, predicate="eq")
+                partials = pl.reg.select(slot, partial_all, partials)
+            total = pl.reg.reduce_sum(partials, partial_mask, reassoc=True)
+            total_all = pl.reg.broadcast(total, lanes=64, dtype=pl.FP32)
+            variance = pl.reg.muls(total_all, 1.0 / Q_LORA, full)
+            row_slot = pl.reg.compares(lane, pl.cast(row, pl.UINT32), full, predicate="eq")
+            variances = pl.reg.select(row_slot, variance, variances)
+
+        # Correct the reciprocal square root for all active rows together.
+        active_mask = pl.reg.active_mask(active, lanes=64)
+        one = pl.reg.broadcast(1.0, lanes=64, dtype=pl.FP32)
+        half = pl.reg.broadcast(0.5, lanes=64, dtype=pl.FP32)
+        three_halves = pl.reg.broadcast(1.5, lanes=64, dtype=pl.FP32)
+        adjusted = pl.reg.adds(variances, EPS, active_mask)
+        reciprocal = pl.reg.div(one, adjusted, active_mask)
+        root = pl.reg.sqrt(reciprocal, active_mask)
+        negative_half = pl.reg.muls(adjusted, -0.5, active_mask)
+        product = pl.reg.mul(negative_half, root, active_mask)
+        factor = pl.reg.mula(three_halves, product, root, active_mask)
+        inverses = pl.reg.mul(root, factor, active_mask)
+        negative_variance = pl.reg.muls(adjusted, -1.0, active_mask)
+        correction = pl.reg.mula(one, negative_variance, reciprocal, active_mask)
+        negative_inverse = pl.reg.muls(inverses, -1.0, active_mask)
+        error = pl.reg.mula(reciprocal, negative_inverse, inverses, active_mask)
+        correction = pl.reg.mula(correction, adjusted, error, active_mask)
+        correction = pl.reg.mul(correction, inverses, active_mask)
+        inverses = pl.reg.mula(inverses, correction, half, active_mask)
+        variance_bits = pl.reg.interpret_cast(adjusted, dtype=pl.UINT32)
+        is_infinite = pl.reg.compares(variance_bits, 0x7F800000, active_mask, predicate="eq")
+        is_zero = pl.reg.compares(variance_bits, 0, active_mask, predicate="eq")
+        zero = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+        infinity_bits = pl.reg.broadcast(0x7F800000, lanes=64, dtype=pl.UINT32)
+        infinity = pl.reg.interpret_cast(infinity_bits, dtype=pl.FP32)
+        inverses = pl.reg.select(is_infinite, zero, inverses)
+        inverses = pl.reg.select(is_zero, infinity, inverses)
+
+        wide_mask = pl.reg.full_mask(lanes=256)
+        first_only = pl.reg.active_mask(1, lanes=64)
+        pair_mask = pl.reg.full_mask(lanes=8)
+        code_zero = pl.reg.broadcast(0, lanes=8, dtype=pl.INT32)
+        code_one = pl.reg.broadcast(1, lanes=8, dtype=pl.INT32)
+        # Each 256-element chunk contributes four adjacent scale pairs.
+        pair_bits = pl.reg.broadcast(3, lanes=64, dtype=pl.UINT32)
+        pair_lane = pl.reg.bitwise_and(lane, pair_bits)
+        first_lane = pl.reg.shift_lefts(pair_lane, 4, full)
+        last_lane = pl.reg.adds(first_lane, 8, full)
+        chunk_lane = pl.reg.shift_rights(lane, 2, full)
+        empty_codes = pl.reg.broadcast(0, lanes=64, dtype=pl.UINT32)
+        # Keep one packed scale pair in the low half of each word.
+        code_prefix = pl.reg.active_mask(32, lanes=64)
+        for norm_row in pl.hardware_loop(active):
+            inverse_index = pl.reg.broadcast(pl.cast(norm_row, pl.UINT32), lanes=64, dtype=pl.UINT32)
+            selected_inverse = pl.reg.gather_lanes(inverses, inverse_index)
+            scalar_inverse = pl.reg.reduce_max(selected_inverse, first_only)
+            row_inverse = pl.reg.broadcast(scalar_inverse, lanes=256, dtype=pl.FP32)
+            row_codes = empty_codes
+            for chunk in pl.hardware_loop(Q_LORA // 256):
+                norm_column = chunk * 256
+                offset = norm_row * Q_LORA + norm_column
+                input_raw = pl.reg.load(source, offset, lanes=256)
+                normalized_value = pl.reg.convert(input_raw, dtype=pl.FP32)
+                gamma_raw = pl.reg.load(gamma, norm_column, lanes=256)
+                gain = pl.reg.convert(gamma_raw, dtype=pl.FP32)
+                normalized_value = pl.reg.mul(normalized_value, row_inverse, wide_mask)
+                normalized_value = pl.reg.mul(normalized_value, gain, wide_mask)
+                rounded = pl.reg.convert(normalized_value, dtype=pl.BF16, rounding="R", saturate=False)
+                normalized_value = pl.reg.convert(rounded, dtype=pl.FP32)
+
+                # Quantize eight groups of 32 with independent shared exponents.
+                magnitude = pl.reg.abs(normalized_value, wide_mask)
+                maximum = pl.reg.reduce_max(magnitude, wide_mask, group_size=32)
+                maximum_bits = pl.reg.interpret_cast(maximum, dtype=pl.INT32)
+                exponent = pl.reg.shift_rights(maximum_bits, 23, pair_mask)
+                exponent = pl.reg.adds(exponent, -8, pair_mask)
+                exponent = pl.reg.maximum(exponent, code_zero, pair_mask)
+                nonzero = pl.reg.minimum(exponent, code_one, pair_mask)
+                reciprocal_code = pl.reg.muls(exponent, -1, pair_mask)
+                reciprocal_code = pl.reg.adds(reciprocal_code, 254, pair_mask)
+                reciprocal_code = pl.reg.mul(reciprocal_code, nonzero, pair_mask)
+                reciprocal_bits = pl.reg.shift_lefts(reciprocal_code, 23, pair_mask)
+                group_inverse = pl.reg.interpret_cast(reciprocal_bits, dtype=pl.FP32)
+                scale_inverse = pl.reg.group_broadcast(group_inverse, lanes=256)
+                normalized_value = pl.reg.mul(normalized_value, scale_inverse, wide_mask)
+                normalized_value = pl.reg.maximums(normalized_value, -448.0, wide_mask)
+                normalized_value = pl.reg.minimums(normalized_value, 448.0, wide_mask)
+                fp8 = pl.reg.convert(normalized_value, dtype=pl.FP8E4M3FN, rounding="R", saturate=False)
+                packed = pl.reg.interpret_cast(fp8, dtype=pl.UINT32)
+                group_codes = pl.reg.interpret_cast(exponent, dtype=pl.UINT32)
+                codes = pl.reg.group_broadcast(group_codes, lanes=64)
+                first_code = pl.reg.gather_lanes(codes, first_lane)
+                second_code = pl.reg.gather_lanes(codes, last_lane)
+                second_code = pl.reg.shift_lefts(second_code, 8, full)
+                pair = pl.reg.bitwise_or(first_code, second_code)
+                code_slot = pl.reg.compares(chunk_lane, pl.cast(chunk, pl.UINT32), full, predicate="eq")
+                row_codes = pl.reg.select(code_slot, pair, row_codes)
+                _latent_written = pl.reg.store(normalized, offset, rounded)
+                # Keep the word offset affine for an aligned UB store.
+                payload_offset = norm_row * (Q_LORA // 4) + chunk * 64
+                _payload_written = pl.reg.store(quant_words, payload_offset, packed)
+            _row_scales_written = pl.reg.store(row_scales, norm_row * 32, row_codes, code_prefix)
+
+
+@pl.jit.inline(auto_scope=False)
 def q_norm_quant(
     projected: pl.Tensor,
     weight: pl.Tensor,
@@ -292,134 +434,14 @@ def q_norm_quant(
                 gamma = pl.load(weight, [0], [Q_LORA], target_memory=pl.Mem.Vec)
                 normalized = pl.create_tile([MX_M_TILE * Q_LORA], dtype=pl.BF16, target_memory=pl.Mem.Vec)
 
-                with pl.reg_scope():
-                    full = pl.reg.full_mask(lanes=64)
-                    partial_mask = pl.reg.active_mask(Q_NORM_FOLD // 64, lanes=64)
-                    lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
-                    variances = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
-                    for row in pl.hardware_loop(active):
-                        row_offset = row * Q_LORA
-                        partials = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
-                        # Fold the trailing 256 squares onto the first four vectors.
-                        for block in pl.hardware_loop((Q_LORA - Q_NORM_FOLD) // 64):
-                            column = block * 64
-                            raw = pl.reg.load(source, row_offset + column, lanes=64)
-                            value = pl.reg.convert(raw, dtype=pl.FP32)
-                            square = pl.reg.mul(value, value, full)
-                            raw_folded = pl.reg.load(source, row_offset + Q_NORM_FOLD + column, lanes=64)
-                            folded = pl.reg.convert(raw_folded, dtype=pl.FP32)
-                            folded_square = pl.reg.mul(folded, folded, full)
-                            square = pl.reg.add(square, folded_square, full)
-                            partial = pl.reg.reduce_sum(square, full, reassoc=True)
-                            partial_all = pl.reg.broadcast(partial, lanes=64, dtype=pl.FP32)
-                            slot = pl.reg.compares(lane, pl.cast(block, pl.UINT32), full, predicate="eq")
-                            partials = pl.reg.select(slot, partial_all, partials)
-                        for block_tail in pl.hardware_loop((2 * Q_NORM_FOLD - Q_LORA) // 64):
-                            block = block_tail + (Q_LORA - Q_NORM_FOLD) // 64
-                            column = block * 64
-                            raw = pl.reg.load(source, row_offset + column, lanes=64)
-                            value = pl.reg.convert(raw, dtype=pl.FP32)
-                            square = pl.reg.mul(value, value, full)
-                            partial = pl.reg.reduce_sum(square, full, reassoc=True)
-                            partial_all = pl.reg.broadcast(partial, lanes=64, dtype=pl.FP32)
-                            slot = pl.reg.compares(lane, pl.cast(block, pl.UINT32), full, predicate="eq")
-                            partials = pl.reg.select(slot, partial_all, partials)
-                        total = pl.reg.reduce_sum(partials, partial_mask, reassoc=True)
-                        total_all = pl.reg.broadcast(total, lanes=64, dtype=pl.FP32)
-                        variance = pl.reg.muls(total_all, 1.0 / Q_LORA, full)
-                        row_slot = pl.reg.compares(lane, pl.cast(row, pl.UINT32), full, predicate="eq")
-                        variances = pl.reg.select(row_slot, variance, variances)
-
-                    # Correct the reciprocal square root for all active rows together.
-                    active_mask = pl.reg.active_mask(active, lanes=64)
-                    one = pl.reg.broadcast(1.0, lanes=64, dtype=pl.FP32)
-                    half = pl.reg.broadcast(0.5, lanes=64, dtype=pl.FP32)
-                    three_halves = pl.reg.broadcast(1.5, lanes=64, dtype=pl.FP32)
-                    adjusted = pl.reg.adds(variances, EPS, active_mask)
-                    reciprocal = pl.reg.div(one, adjusted, active_mask)
-                    root = pl.reg.sqrt(reciprocal, active_mask)
-                    negative_half = pl.reg.muls(adjusted, -0.5, active_mask)
-                    product = pl.reg.mul(negative_half, root, active_mask)
-                    factor = pl.reg.mula(three_halves, product, root, active_mask)
-                    inverses = pl.reg.mul(root, factor, active_mask)
-                    negative_variance = pl.reg.muls(adjusted, -1.0, active_mask)
-                    correction = pl.reg.mula(one, negative_variance, reciprocal, active_mask)
-                    negative_inverse = pl.reg.muls(inverses, -1.0, active_mask)
-                    error = pl.reg.mula(reciprocal, negative_inverse, inverses, active_mask)
-                    correction = pl.reg.mula(correction, adjusted, error, active_mask)
-                    correction = pl.reg.mul(correction, inverses, active_mask)
-                    inverses = pl.reg.mula(inverses, correction, half, active_mask)
-                    variance_bits = pl.reg.interpret_cast(adjusted, dtype=pl.UINT32)
-                    is_infinite = pl.reg.compares(variance_bits, 0x7F800000, active_mask, predicate="eq")
-                    is_zero = pl.reg.compares(variance_bits, 0, active_mask, predicate="eq")
-                    zero = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
-                    infinity_bits = pl.reg.broadcast(0x7F800000, lanes=64, dtype=pl.UINT32)
-                    infinity = pl.reg.interpret_cast(infinity_bits, dtype=pl.FP32)
-                    inverses = pl.reg.select(is_infinite, zero, inverses)
-                    inverses = pl.reg.select(is_zero, infinity, inverses)
-
-                    wide_mask = pl.reg.full_mask(lanes=256)
-                    first_only = pl.reg.active_mask(1, lanes=64)
-                    pair_mask = pl.reg.full_mask(lanes=8)
-                    code_zero = pl.reg.broadcast(0, lanes=8, dtype=pl.INT32)
-                    code_one = pl.reg.broadcast(1, lanes=8, dtype=pl.INT32)
-                    # Each 256-element chunk contributes four adjacent scale pairs.
-                    pair_bits = pl.reg.broadcast(3, lanes=64, dtype=pl.UINT32)
-                    pair_lane = pl.reg.bitwise_and(lane, pair_bits)
-                    first_lane = pl.reg.shift_lefts(pair_lane, 4, full)
-                    last_lane = pl.reg.adds(first_lane, 8, full)
-                    chunk_lane = pl.reg.shift_rights(lane, 2, full)
-                    empty_codes = pl.reg.broadcast(0, lanes=64, dtype=pl.UINT32)
-                    # Keep one packed scale pair in the low half of each word.
-                    code_prefix = pl.reg.active_mask(32, lanes=64)
-                    for norm_row in pl.hardware_loop(active):
-                        inverse_index = pl.reg.broadcast(pl.cast(norm_row, pl.UINT32), lanes=64, dtype=pl.UINT32)
-                        selected_inverse = pl.reg.gather_lanes(inverses, inverse_index)
-                        scalar_inverse = pl.reg.reduce_max(selected_inverse, first_only)
-                        row_inverse = pl.reg.broadcast(scalar_inverse, lanes=256, dtype=pl.FP32)
-                        row_codes = empty_codes
-                        for chunk in pl.hardware_loop(Q_LORA // 256):
-                            norm_column = chunk * 256
-                            offset = norm_row * Q_LORA + norm_column
-                            input_raw = pl.reg.load(source, offset, lanes=256)
-                            normalized_value = pl.reg.convert(input_raw, dtype=pl.FP32)
-                            gamma_raw = pl.reg.load(gamma, norm_column, lanes=256)
-                            gain = pl.reg.convert(gamma_raw, dtype=pl.FP32)
-                            normalized_value = pl.reg.mul(normalized_value, row_inverse, wide_mask)
-                            normalized_value = pl.reg.mul(normalized_value, gain, wide_mask)
-                            rounded = pl.reg.convert(normalized_value, dtype=pl.BF16, rounding="R", saturate=False)
-                            _latent_written = pl.reg.store(normalized, offset, rounded)
-                            normalized_value = pl.reg.convert(rounded, dtype=pl.FP32)
-
-                            # Quantize eight groups of 32 with independent shared exponents.
-                            magnitude = pl.reg.abs(normalized_value, wide_mask)
-                            maximum = pl.reg.reduce_max(magnitude, wide_mask, group_size=32)
-                            maximum_bits = pl.reg.interpret_cast(maximum, dtype=pl.INT32)
-                            exponent = pl.reg.shift_rights(maximum_bits, 23, pair_mask)
-                            exponent = pl.reg.adds(exponent, -8, pair_mask)
-                            exponent = pl.reg.maximum(exponent, code_zero, pair_mask)
-                            nonzero = pl.reg.minimum(exponent, code_one, pair_mask)
-                            reciprocal_code = pl.reg.muls(exponent, -1, pair_mask)
-                            reciprocal_code = pl.reg.adds(reciprocal_code, 254, pair_mask)
-                            reciprocal_code = pl.reg.mul(reciprocal_code, nonzero, pair_mask)
-                            reciprocal_bits = pl.reg.shift_lefts(reciprocal_code, 23, pair_mask)
-                            group_inverse = pl.reg.interpret_cast(reciprocal_bits, dtype=pl.FP32)
-                            scale_inverse = pl.reg.group_broadcast(group_inverse, lanes=256)
-                            normalized_value = pl.reg.mul(normalized_value, scale_inverse, wide_mask)
-                            normalized_value = pl.reg.maximums(normalized_value, -448.0, wide_mask)
-                            normalized_value = pl.reg.minimums(normalized_value, 448.0, wide_mask)
-                            fp8 = pl.reg.convert(normalized_value, dtype=pl.FP8E4M3FN, rounding="R", saturate=False)
-                            packed = pl.reg.interpret_cast(fp8, dtype=pl.UINT32)
-                            _payload_written = pl.reg.store(quant_words, offset // 4, packed)
-                            group_codes = pl.reg.interpret_cast(exponent, dtype=pl.UINT32)
-                            codes = pl.reg.group_broadcast(group_codes, lanes=64)
-                            first_code = pl.reg.gather_lanes(codes, first_lane)
-                            second_code = pl.reg.gather_lanes(codes, last_lane)
-                            second_code = pl.reg.shift_lefts(second_code, 8, full)
-                            pair = pl.reg.bitwise_or(first_code, second_code)
-                            code_slot = pl.reg.compares(chunk_lane, pl.cast(chunk, pl.UINT32), full, predicate="eq")
-                            row_codes = pl.reg.select(code_slot, pair, row_codes)
-                        _row_scales_written = pl.reg.store(row_scales, norm_row * 32, row_codes, code_prefix)
+                # Constant row counts let PTOAS prove disjoint UB accesses.
+                # Keep the dynamic path for other tail lengths.
+                if active == MX_M_TILE // 2:
+                    _q_norm_quant_rows(source, gamma, normalized, quant_words, row_scales, MX_M_TILE // 2)
+                elif active == MX_M_TILE:
+                    _q_norm_quant_rows(source, gamma, normalized, quant_words, row_scales, MX_M_TILE)
+                else:
+                    _q_norm_quant_rows(source, gamma, normalized, quant_words, row_scales, active)
                 latent_tile = pl.reshape(normalized, [MX_M_TILE, Q_LORA])
                 valid_latent = pl.tile.slice(latent_tile, [MX_M_TILE, Q_LORA], [0, 0], valid_shape=[active, Q_LORA])
                 pl.store(valid_latent, [first, 0], latent)
