@@ -101,12 +101,19 @@ def gather_sparse_attention(
         ready_offset = 2 * workers * 64 * (HEAD_DIM + 2)
         for ready_index in pl.range(2 * workers):
             pl.write(partials, [ready_offset + ready_index], pl.cast(0, pl.FP32))
-    with pl.spmd(workers, name_hint="sparse_gather_vf", sync_start=True, deps=[source_ready]) as attended:
-        computed_output, computed_partials = _gather_sparse_vf_rows(
-            active_output, query, sink, window, compressed,
-            window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
-            balanced, cache_mode=compressed_keys,
-        )
+        with pl.spmd(workers, name_hint="sparse_gather_vf", sync_start=True, deps=[source_ready]) as attended:
+            computed_output, computed_partials = _gather_sparse_vf_rows(
+                active_output, query, sink, window, compressed,
+                window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
+                balanced, cache_mode=compressed_keys,
+            )
+    else:
+        with pl.spmd(workers, name_hint="sparse_gather_vf", deps=[source_ready]) as attended:
+            computed_output, computed_partials = _gather_sparse_vf_rows(
+                active_output, query, sink, window, compressed,
+                window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
+                balanced, cache_mode=compressed_keys,
+            )
     return attended
 
 

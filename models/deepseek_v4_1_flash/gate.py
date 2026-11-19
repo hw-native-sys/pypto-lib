@@ -307,12 +307,10 @@ def gate_from_bf16(
         )
 
     route_scores_buf = pl.create_tensor([T_PAD, score_pad], dtype=pl.FP32)
-    # Reserve both engines before any local Cube-to-Vector transfer.
-    # Bound synchronous cohorts to the target A5 core count.
     gate_tasks = task_gate_tiles * ((n_experts + GATE_N_TILE - 1) // GATE_N_TILE)
     gate_worker_limit = pl.min(16, pl.system.available_cluster_count())
     gate_workers = pl.max(1, pl.min(gate_tasks, gate_worker_limit))
-    with pl.spmd(gate_workers, name_hint="gate", sync_start=True):
+    with pl.spmd(gate_workers, name_hint="gate"):
         route_scores_buf, biased_scores_buf = _gate_scores_vf(
             xg_buf, gate_w, gate_bias, route_scores_buf, biased_scores_buf, gate_tasks,
         )

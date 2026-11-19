@@ -58,7 +58,7 @@ def gemm_mxfp8_to_bf16(
     scale_group = pl.tensor.view(scale_group_backing, [width // 32, output_width], layout=pl.MX_B_NN)
     available_clusters = pl.system.available_cluster_count()
     workers = pl.min(pl.min(output_width // n_tile, max_workers), available_clusters)
-    with pl.spmd(workers, name_hint=name_hint, sync_start=True, deps=[ready]) as completed:
+    with pl.spmd(workers, name_hint=name_hint, deps=[ready]) as completed:
         worker = pl.tile.get_block_idx()
         full_a = pl.load(payload, [payload_row, 0], [m_tile, width], target_memory=pl.MemorySpace.Mat)
         block_num = pl.tile.get_block_num()
@@ -160,7 +160,7 @@ def gemm_bf16_via_mxfp8_to_bf16_fused(
     """Compute native M32 MXFP8 products with in-task activation quantization."""
     workers = pl.min(output_width // n_tile, pl.system.available_cluster_count())
     for mt in pl.parallel((num_tokens + 31) // 32):
-        for worker in pl.spmd(workers, name_hint=name_hint, sync_start=True):
+        for worker in pl.spmd(workers, name_hint=name_hint):
             block_num = pl.tile.get_block_num()
             for wave in pl.range((output_width // n_tile + block_num - 1) // block_num):
                 block = wave * block_num + worker
