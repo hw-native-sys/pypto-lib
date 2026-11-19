@@ -65,6 +65,7 @@ O_QUANT_SCALE_COLS = 256                # scale bytes per block row and head
 # integer in P0", so every derived extent below stays at module level.
 O_QUANT_HEADS = LOCAL_O_GROUPS * O_QUANT_HEADS_PER_GROUP
 O_QUANT_ROPE_PAIRS = ROPE_DIM // 2
+O_QUANT_ROPE_UNROLL = 8
 O_QUANT_ROPE_START = HEAD_DIM - ROPE_DIM
 O_QUANT_TRIG_TILE = O_QUANT_ROW_TILE * O_QUANT_ROPE_PAIRS
 O_QUANT_VALUE_TILE = O_QUANT_ROW_TILE * HEAD_DIM
@@ -148,7 +149,142 @@ def quant_o_vf_pypto(
                 ix1 = pl.reg.sub(ix1, tmp)
                 pair_index = pl.reg.shift_rights(lane, 1, full)
                 even = pl.reg.compare(ix1, lane, full, predicate="gt")
-                for row in pl.hardware_loop(rows):
+                # Read the eight input rows before writing their rounded RoPE tails.
+                # This shares the load-to-store synchronization across the group.
+                for row_group in pl.hardware_loop(rows // O_QUANT_ROPE_UNROLL):
+                    row0 = row_group * O_QUANT_ROPE_UNROLL
+                    value_offset0 = row0 * HEAD_DIM + O_QUANT_ROPE_START
+                    trig_base0 = row0 * O_QUANT_ROPE_PAIRS
+                    cosine0 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base0)
+                    sine0 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base0)
+                    raw0 = pl.reg.load(value, offset=value_offset0, lanes=O_QUANT_LANES)
+                    row1 = row_group * O_QUANT_ROPE_UNROLL + 1
+                    value_offset1 = row1 * HEAD_DIM + O_QUANT_ROPE_START
+                    trig_base1 = row1 * O_QUANT_ROPE_PAIRS
+                    cosine1 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base1)
+                    sine1 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base1)
+                    raw1 = pl.reg.load(value, offset=value_offset1, lanes=O_QUANT_LANES)
+                    row2 = row_group * O_QUANT_ROPE_UNROLL + 2
+                    value_offset2 = row2 * HEAD_DIM + O_QUANT_ROPE_START
+                    trig_base2 = row2 * O_QUANT_ROPE_PAIRS
+                    cosine2 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base2)
+                    sine2 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base2)
+                    raw2 = pl.reg.load(value, offset=value_offset2, lanes=O_QUANT_LANES)
+                    row3 = row_group * O_QUANT_ROPE_UNROLL + 3
+                    value_offset3 = row3 * HEAD_DIM + O_QUANT_ROPE_START
+                    trig_base3 = row3 * O_QUANT_ROPE_PAIRS
+                    cosine3 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base3)
+                    sine3 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base3)
+                    raw3 = pl.reg.load(value, offset=value_offset3, lanes=O_QUANT_LANES)
+                    row4 = row_group * O_QUANT_ROPE_UNROLL + 4
+                    value_offset4 = row4 * HEAD_DIM + O_QUANT_ROPE_START
+                    trig_base4 = row4 * O_QUANT_ROPE_PAIRS
+                    cosine4 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base4)
+                    sine4 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base4)
+                    raw4 = pl.reg.load(value, offset=value_offset4, lanes=O_QUANT_LANES)
+                    row5 = row_group * O_QUANT_ROPE_UNROLL + 5
+                    value_offset5 = row5 * HEAD_DIM + O_QUANT_ROPE_START
+                    trig_base5 = row5 * O_QUANT_ROPE_PAIRS
+                    cosine5 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base5)
+                    sine5 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base5)
+                    raw5 = pl.reg.load(value, offset=value_offset5, lanes=O_QUANT_LANES)
+                    row6 = row_group * O_QUANT_ROPE_UNROLL + 6
+                    value_offset6 = row6 * HEAD_DIM + O_QUANT_ROPE_START
+                    trig_base6 = row6 * O_QUANT_ROPE_PAIRS
+                    cosine6 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base6)
+                    sine6 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base6)
+                    raw6 = pl.reg.load(value, offset=value_offset6, lanes=O_QUANT_LANES)
+                    row7 = row_group * O_QUANT_ROPE_UNROLL + 7
+                    value_offset7 = row7 * HEAD_DIM + O_QUANT_ROPE_START
+                    trig_base7 = row7 * O_QUANT_ROPE_PAIRS
+                    cosine7 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base7)
+                    sine7 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base7)
+                    raw7 = pl.reg.load(value, offset=value_offset7, lanes=O_QUANT_LANES)
+
+                    sine_negative0 = pl.reg.muls(sine0, -1.0, full)
+                    rotated0 = pl.reg.convert(raw0, dtype=pl.FP32)
+                    swapped0 = pl.reg.gather_lanes(rotated0, ix1)
+                    scaled_real0 = pl.reg.mul(rotated0, cosine0)
+                    scaled_imag0 = pl.reg.mul(swapped0, sine_negative0)
+                    real0 = pl.reg.sub(scaled_real0, scaled_imag0)
+                    imag0 = pl.reg.add(scaled_imag0, scaled_real0)
+                    result0 = pl.reg.select(even, real0, imag0)
+                    tail0 = pl.reg.convert(result0, dtype=pl.BF16, rounding="R", saturate=False)
+                    sine_negative1 = pl.reg.muls(sine1, -1.0, full)
+                    rotated1 = pl.reg.convert(raw1, dtype=pl.FP32)
+                    swapped1 = pl.reg.gather_lanes(rotated1, ix1)
+                    scaled_real1 = pl.reg.mul(rotated1, cosine1)
+                    scaled_imag1 = pl.reg.mul(swapped1, sine_negative1)
+                    real1 = pl.reg.sub(scaled_real1, scaled_imag1)
+                    imag1 = pl.reg.add(scaled_imag1, scaled_real1)
+                    result1 = pl.reg.select(even, real1, imag1)
+                    tail1 = pl.reg.convert(result1, dtype=pl.BF16, rounding="R", saturate=False)
+                    sine_negative2 = pl.reg.muls(sine2, -1.0, full)
+                    rotated2 = pl.reg.convert(raw2, dtype=pl.FP32)
+                    swapped2 = pl.reg.gather_lanes(rotated2, ix1)
+                    scaled_real2 = pl.reg.mul(rotated2, cosine2)
+                    scaled_imag2 = pl.reg.mul(swapped2, sine_negative2)
+                    real2 = pl.reg.sub(scaled_real2, scaled_imag2)
+                    imag2 = pl.reg.add(scaled_imag2, scaled_real2)
+                    result2 = pl.reg.select(even, real2, imag2)
+                    tail2 = pl.reg.convert(result2, dtype=pl.BF16, rounding="R", saturate=False)
+                    sine_negative3 = pl.reg.muls(sine3, -1.0, full)
+                    rotated3 = pl.reg.convert(raw3, dtype=pl.FP32)
+                    swapped3 = pl.reg.gather_lanes(rotated3, ix1)
+                    scaled_real3 = pl.reg.mul(rotated3, cosine3)
+                    scaled_imag3 = pl.reg.mul(swapped3, sine_negative3)
+                    real3 = pl.reg.sub(scaled_real3, scaled_imag3)
+                    imag3 = pl.reg.add(scaled_imag3, scaled_real3)
+                    result3 = pl.reg.select(even, real3, imag3)
+                    tail3 = pl.reg.convert(result3, dtype=pl.BF16, rounding="R", saturate=False)
+                    sine_negative4 = pl.reg.muls(sine4, -1.0, full)
+                    rotated4 = pl.reg.convert(raw4, dtype=pl.FP32)
+                    swapped4 = pl.reg.gather_lanes(rotated4, ix1)
+                    scaled_real4 = pl.reg.mul(rotated4, cosine4)
+                    scaled_imag4 = pl.reg.mul(swapped4, sine_negative4)
+                    real4 = pl.reg.sub(scaled_real4, scaled_imag4)
+                    imag4 = pl.reg.add(scaled_imag4, scaled_real4)
+                    result4 = pl.reg.select(even, real4, imag4)
+                    tail4 = pl.reg.convert(result4, dtype=pl.BF16, rounding="R", saturate=False)
+                    sine_negative5 = pl.reg.muls(sine5, -1.0, full)
+                    rotated5 = pl.reg.convert(raw5, dtype=pl.FP32)
+                    swapped5 = pl.reg.gather_lanes(rotated5, ix1)
+                    scaled_real5 = pl.reg.mul(rotated5, cosine5)
+                    scaled_imag5 = pl.reg.mul(swapped5, sine_negative5)
+                    real5 = pl.reg.sub(scaled_real5, scaled_imag5)
+                    imag5 = pl.reg.add(scaled_imag5, scaled_real5)
+                    result5 = pl.reg.select(even, real5, imag5)
+                    tail5 = pl.reg.convert(result5, dtype=pl.BF16, rounding="R", saturate=False)
+                    sine_negative6 = pl.reg.muls(sine6, -1.0, full)
+                    rotated6 = pl.reg.convert(raw6, dtype=pl.FP32)
+                    swapped6 = pl.reg.gather_lanes(rotated6, ix1)
+                    scaled_real6 = pl.reg.mul(rotated6, cosine6)
+                    scaled_imag6 = pl.reg.mul(swapped6, sine_negative6)
+                    real6 = pl.reg.sub(scaled_real6, scaled_imag6)
+                    imag6 = pl.reg.add(scaled_imag6, scaled_real6)
+                    result6 = pl.reg.select(even, real6, imag6)
+                    tail6 = pl.reg.convert(result6, dtype=pl.BF16, rounding="R", saturate=False)
+                    sine_negative7 = pl.reg.muls(sine7, -1.0, full)
+                    rotated7 = pl.reg.convert(raw7, dtype=pl.FP32)
+                    swapped7 = pl.reg.gather_lanes(rotated7, ix1)
+                    scaled_real7 = pl.reg.mul(rotated7, cosine7)
+                    scaled_imag7 = pl.reg.mul(swapped7, sine_negative7)
+                    real7 = pl.reg.sub(scaled_real7, scaled_imag7)
+                    imag7 = pl.reg.add(scaled_imag7, scaled_real7)
+                    result7 = pl.reg.select(even, real7, imag7)
+                    tail7 = pl.reg.convert(result7, dtype=pl.BF16, rounding="R", saturate=False)
+
+                    _rotated0 = pl.reg.store(value, offset=value_offset0, value=tail0)
+                    _rotated1 = pl.reg.store(value, offset=value_offset1, value=tail1)
+                    _rotated2 = pl.reg.store(value, offset=value_offset2, value=tail2)
+                    _rotated3 = pl.reg.store(value, offset=value_offset3, value=tail3)
+                    _rotated4 = pl.reg.store(value, offset=value_offset4, value=tail4)
+                    _rotated5 = pl.reg.store(value, offset=value_offset5, value=tail5)
+                    _rotated6 = pl.reg.store(value, offset=value_offset6, value=tail6)
+                    _rotated7 = pl.reg.store(value, offset=value_offset7, value=tail7)
+
+                for remainder_row in pl.hardware_loop(rows % O_QUANT_ROPE_UNROLL):
+                    row = rows // O_QUANT_ROPE_UNROLL * O_QUANT_ROPE_UNROLL + remainder_row
                     # Match vgather2(cos/sin + row * 32, pair_index, all).
                     trig_base = row * O_QUANT_ROPE_PAIRS
                     cosine_v = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base)
@@ -169,6 +305,26 @@ def quant_o_vf_pypto(
             max_workspace = pl.create_tile([1, O_QUANT_SCALE_COUNT], dtype=pl.BF16)
             scale_workspace = pl.create_tile([1, O_QUANT_SCALE_COUNT], dtype=pl.BF16)
             payload_bytes, exponents = pl.tile.quant_mx_raw(full_rows, max_workspace, scale_workspace, group_axis=1)
+            # Pack scales while the payload tile is live so scale packing
+            # can start before the payload writeback.
+            zz_tmp = pl.create_tile([1, O_QUANT_SCALE_PACK_TMP], dtype=pl.UINT8)
+            packed_scale = pl.tmov_x2zz(
+                exponents, zz_tmp, group_axis=1, dst_rows=O_QUANT_ROW_TILE, dst_cols=O_QUANT_SCALE_GROUPS,
+            )
+            scale_tile = pl.tile.reinterpret_view(packed_scale, pl.FP8E8M0)
+            scale_tile = pl.reshape(scale_tile, [O_QUANT_ROW_TILE // O_QUANT_SCALE_BLOCK, O_QUANT_SCALE_COLS])
+            scale_tile = pl.tile.set_validshape(
+                scale_tile, capacity // O_QUANT_SCALE_BLOCK, O_QUANT_SCALE_COLS
+            )
+            pl.store(
+                scale_tile,
+                [
+                    group * scale_block_rows + t0 // O_QUANT_SCALE_BLOCK,
+                    local_head * O_QUANT_SCALE_COLS,
+                ],
+                scale_view,
+            )
+
             # TQUANT uses a finite reciprocal for scale code zero. Preserve the
             # projection contract by clearing magnitude bits in those groups.
             if rows > 0:
@@ -217,23 +373,6 @@ def quant_o_vf_pypto(
             payload_tile = pl.tile.reinterpret_view(payload_bytes, pl.FP8E4M3FN)
             payload_tile = pl.tile.set_validshape(payload_tile, capacity, HEAD_DIM)
             pl.store(payload_tile, [group * padded_rows + t0, local_head * HEAD_DIM], payload)
-            zz_tmp = pl.create_tile([1, O_QUANT_SCALE_PACK_TMP], dtype=pl.UINT8)
-            packed_scale = pl.tmov_x2zz(
-                exponents, zz_tmp, group_axis=1, dst_rows=O_QUANT_ROW_TILE, dst_cols=O_QUANT_SCALE_GROUPS,
-            )
-            scale_tile = pl.tile.reinterpret_view(packed_scale, pl.FP8E8M0)
-            scale_tile = pl.reshape(scale_tile, [O_QUANT_ROW_TILE // O_QUANT_SCALE_BLOCK, O_QUANT_SCALE_COLS])
-            scale_tile = pl.tile.set_validshape(
-                scale_tile, capacity // O_QUANT_SCALE_BLOCK, O_QUANT_SCALE_COLS
-            )
-            pl.store(
-                scale_tile,
-                [
-                    group * scale_block_rows + t0 // O_QUANT_SCALE_BLOCK,
-                    local_head * O_QUANT_SCALE_COLS,
-                ],
-                scale_view,
-            )
     return published
 
 
