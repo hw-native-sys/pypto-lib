@@ -39,6 +39,7 @@ import json
 import os
 import statistics
 import time
+from math import gcd
 
 STAGES = ("chunk_cumsum", "scaled_dot_kkt", "solve_tril", "wy_fast",
           "chunk_h", "chunk_o")
@@ -62,7 +63,7 @@ HG = QWEN3_8_27B.linear_num_key_heads
 SEQ_LENS = (8192,)
 
 
-def _random_specs(stage, specs):
+def _random_specs(specs):
     """Same shapes and dtypes, values drawn at random instead of from the chain.
 
     Outputs are left alone. TensorSpec.direction is stamped from the compiled
@@ -70,13 +71,14 @@ def _random_specs(stage, specs):
     builder gave no `init_value`, which is how every entry here writes one.
     """
     import torch
+    from golden import TensorSpec
 
     # Constants, not data: randomising these would have solve_tril contract against a
     # random matrix instead of -I, and leave the strict causal mask non-triangular.
-    leave_alone = {"mask", "mask_strict", "tril", "eye", "m_diag", "m_low"}
+    leave_alone = {"mask", "mask_strict", "tril", "eye", "m_diag", "m_low", "row_base"}
     out = []
     for spec in specs:
-        if spec.name in leave_alone or spec.init_value is None:
+        if not isinstance(spec, TensorSpec) or spec.name in leave_alone or spec.init_value is None:
             out.append(spec)
             continue
         dtype = spec.dtype
@@ -94,28 +96,35 @@ def bench_stage(stage: str, t: int, backend_type: str, device: int,
     """One compile and one timed loop. Returns the record for this (stage, shape)."""
     from golden import run
 
-    mod = importlib.import_module(stage)
+    mod = importlib.import_module("chunk_o_pipe" if stage == "chunk_o" else stage)
     config = dict(backend_type=backend_type, execution_mode=sim, device_id=device)
     if stage in COMPOSED:
         fn = mod.build_kernel(t=t)
-        config = mod.run_config(backend_type, device, sim, t=t)
-    elif stage == "in_proj_qkv":
-        from a8w8_linear import build_kernel
-
-        fn = build_kernel(
-            t, mod.K, mod.N, name=mod.MODULE,
-            m_tile=mod.M_TILE, n_tile=mod.N_TILE, k_tile=mod.K_TILE,
-            m_group=mod.M_GROUP, n_group=mod.N_GROUP,
-        )
+        config = mod.run_config(backend_type=backend_type, sim=sim, device=device, t=t)
+        specs = mod.build_tensor_specs(t=t)
+    elif stage == "gated_rmsnorm":
+        fn = mod.gdn_gated_rmsnorm_bf16_test
+        specs = mod.build_tensor_specs(t=t, quant=False)
+    elif stage == "chunk_o":
+        fn = mod.gdn_chunk_o_pipe_test
+        specs = mod.build_tensor_specs(t=t)
+        config["ring_heap"] = mod.PIPE_RING_HEAP
+    elif stage in ("in_proj_ab", "quant_x", "qk_norm_gate"):
+        fn = getattr(mod, f"gdn_{stage}_test")
+        specs = mod.build_tensor_specs(t=t)
+    elif stage == "in_proj_z":
+        fn = mod.build_kernel(t=t, m_group=gcd(t // mod.M_TILE, mod.M_GROUP))
+        specs = mod.build_tensor_specs(t=t)
     elif stage in BLOCK_KERNELS:
         fn = mod.build_kernel(t=t)
+        specs = mod.build_tensor_specs(t=t)
     else:
         # The six delta-rule kernels take their shape from the model config and the
         # token count from a dynamic dimension, so the only thing to vary is T.
         fn = getattr(mod, f"gdn_{stage}_test")
-    specs = mod.build_tensor_specs(t=t)
+        specs = mod.build_tensor_specs(t=t)
     if data == "random":
-        specs = _random_specs(stage, specs)
+        specs = _random_specs(specs)
 
     started = time.time()
     result = run(

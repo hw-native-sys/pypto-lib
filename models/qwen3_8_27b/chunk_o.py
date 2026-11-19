@@ -20,7 +20,8 @@ import torch
 from chunk_cumsum import cumsum_ref
 from chunk_h import CHUNK_TILE, chunk_h_ref
 from config import QWEN3_8_27B
-from reference import REF_DTYPE, flat_state, frob_ok, make_inputs, to_hT
+from delta_rule_reference import chunk_o_ref
+from reference import flat_state, frob_ok, make_inputs, to_hT
 from scaled_dot_kkt import kkt_ref
 from solve_tril import solve_tril_ref
 from wy_fast import wy_fast_ref
@@ -121,37 +122,6 @@ def _gdn_chunk_o(
 
 gdn_chunk_o = pl.jit.inline(_gdn_chunk_o)
 gdn_chunk_o_test = pl.jit(_gdn_chunk_o)
-
-
-def chunk_o_ref(
-    q: torch.Tensor, k: torch.Tensor, v_new: torch.Tensor,
-    state: torch.Tensor, g_sum: torch.Tensor,
-    chunk: int,
-) -> torch.Tensor:
-    """S7: the chunk output, inter-chunk plus intra-chunk. -> [T, H, D].
-
-    The causal mask includes the diagonal here, unlike :func:`scaled_dot_kkt.kkt_ref`'s.
-    """
-    t, hg, d = q.shape
-    h = v_new.shape[1]
-    grp = h // hg
-    qf, kf, vf, sf, gf = (x.to(REF_DTYPE) for x in (q, k, v_new, state, g_sum))
-    out = torch.zeros(t, h, d, dtype=REF_DTYPE)
-    rows = torch.arange(chunk)[:, None]
-    cols = torch.arange(chunk)[None, :]
-    causal = (rows >= cols).to(REF_DTYPE)
-    zero = torch.zeros(chunk, chunk, dtype=REF_DTYPE)
-    for ci in range(t // chunk):
-        t0 = ci * chunk
-        for hh in range(h):
-            qc = qf[t0 : t0 + chunk, hh // grp, :]
-            kc = kf[t0 : t0 + chunk, hh // grp, :]
-            gc = gf[t0 : t0 + chunk, hh]
-            inter = (qc @ sf[ci, hh]) * torch.exp(gc)[:, None]
-            gate = torch.exp(torch.minimum(gc[:, None] - gc[None, :], zero))
-            intra = ((qc @ kc.T) * gate * causal) @ vf[t0 : t0 + chunk, hh, :]
-            out[t0 : t0 + chunk, hh, :] = inter + intra
-    return out
 
 
 _INPUTS: dict = {}

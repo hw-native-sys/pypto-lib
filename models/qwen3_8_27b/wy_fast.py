@@ -16,7 +16,8 @@ import torch
 
 from chunk_cumsum import cumsum_ref
 from config import QWEN3_8_27B
-from reference import REF_DTYPE, frob_ok, make_inputs, to_hT
+from delta_rule_reference import wy_fast_ref
+from reference import frob_ok, make_inputs, to_hT
 from scaled_dot_kkt import kkt_ref
 from solve_tril import CHUNK_TILE, solve_tril_ref
 
@@ -89,29 +90,6 @@ def _gdn_wy_fast(
 
 gdn_wy_fast = pl.jit.inline(_gdn_wy_fast)
 gdn_wy_fast_test = pl.jit(_gdn_wy_fast)
-
-
-def wy_fast_ref(
-    k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor,
-    a_inv: torch.Tensor, g_sum: torch.Tensor,
-    chunk: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """S5: the WY representation. -> (W, U), both [T, H, D]."""
-    t, hg, d = k.shape
-    h = v.shape[1]
-    grp = h // hg
-    kf, vf, bf, af, gf = (x.to(REF_DTYPE) for x in (k, v, beta, a_inv, g_sum))
-    w = torch.zeros(t, h, d, dtype=REF_DTYPE)
-    u = torch.zeros(t, h, d, dtype=REF_DTYPE)
-    for t0 in range(0, t, chunk):
-        for hh in range(h):
-            ab = af[t0 : t0 + chunk, hh, :]
-            bc = bf[t0 : t0 + chunk, hh, None]
-            gc = gf[t0 : t0 + chunk, hh, None]
-            kg = kf[t0 : t0 + chunk, hh // grp, :] * bc * torch.exp(gc)
-            u[t0 : t0 + chunk, hh, :] = ab @ (vf[t0 : t0 + chunk, hh, :] * bc)
-            w[t0 : t0 + chunk, hh, :] = ab @ kg
-    return w, u
 
 
 _INPUTS: dict = {}
