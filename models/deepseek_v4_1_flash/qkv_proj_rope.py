@@ -284,7 +284,8 @@ def q_norm_quant_pypto(
     if capacity <= 128:
         row_tile = MX_M_TILE // 2
     chunks = capacity // row_tile
-    available_vectors = 2 * pl.system.available_cluster_count()
+    # Limit launch fanout so fewer AIV completions reach the scheduler together.
+    available_vectors = pl.min(32, 2 * pl.system.available_cluster_count())
     norm_workers = pl.max(pl.min(chunks, available_vectors), 1)
     with pl.spmd(norm_workers, name_hint="q_norm_quant_pypto"):
         worker = pl.tile.get_block_idx()
