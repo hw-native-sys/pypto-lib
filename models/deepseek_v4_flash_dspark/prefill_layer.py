@@ -31,6 +31,7 @@ from moe import (
     N_RANKS,
     PREFILL_MOE_SCALE_PAD,
     PREFILL_MOE_TOTAL_CAP,
+    PREFILL_MOE_T_TILE,
     T,
     TOPK,
     VOCAB,
@@ -70,6 +71,7 @@ from prefill_csa import (
     prefill_attention_csa_cp,
 )
 from prefill_fwd import (
+    DEFAULT_GROUP_TOKENS,
     FWD_GROUP_TOKENS_DYN,
     FWD_TOKENS_DYN,
     HOST_TENSOR_ORDER,
@@ -107,7 +109,7 @@ from prefill_swa import golden_prefill_attention_swa, prefill_attention_swa_cp
 
 
 # model config
-GROUP_TOKENS = TP_SIZE * T
+GROUP_TOKENS = DEFAULT_GROUP_TOKENS
 
 # runtime
 # Per-ring output heap, 1 GiB on each of the 4 rings. The 256 MiB compile-time
@@ -382,7 +384,7 @@ def prefill_layer_moe(
     layer_completion = pl.create_tensor([1], dtype=pl.INT32)
     layer_i32 = pl.cast(layer_id, pl.INT32)
     local_rows = pl.tensor.dim(ffn_out, 0)
-    num_waves = (local_rows + T - 1) // T
+    num_waves = (local_rows + PREFILL_MOE_T_TILE - 1) // PREFILL_MOE_T_TILE
     epoch_base = layer_i32 * pl.cast(num_waves, pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_layer_moe_epoch_seed") as seed_tid:
         for src in pl.range(N_RANKS):

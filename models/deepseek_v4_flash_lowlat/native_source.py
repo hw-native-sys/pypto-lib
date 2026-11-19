@@ -17,10 +17,13 @@ import re
 
 NATIVE_SOURCE = Path(__file__).resolve().parent / "native/experts_w2_prefetch.inc"
 # The reviewed PTO input and shared ABI are the same for these PTOAS 0.65 and
-# 0.72 outputs; their generated Cube expression scheduling differs.
+# 0.72 outputs; their generated Cube expression scheduling differs. The
+# shared-kernel form also uses signed floor division for the nonnegative
+# routed-row count. Its external ABI and shared declarations are unchanged.
 GENERATED_CUBE_DIGESTS = frozenset({
     "bcefd5b7f4a590885e9e9c0753f3ffb76afe7db16410913964e5826178b0ad7f",
     "c6d08d3890d1fc83c7c9276608dba45d708e52a3e68b1e69235db60dbceee581",
+    "8d5f99c852b736cadddef1a0025c53ce5ec760a965c9e249dfb0f0abc9fbac60",
 })
 CUBE_REGION = re.compile(r"^  #if defined\(__DAV_CUBE__\).*?^  #endif // __DAV_CUBE__", re.M | re.S)
 VECTOR_REGION = re.compile(r"^  #if defined\(__DAV_VEC__\).*?^  #endif // __DAV_VEC__", re.M | re.S)
@@ -95,8 +98,10 @@ def select_sources(files, expected_fingerprint):
                 selected_source_sha256=hashlib.sha256(selected_source.encode()).hexdigest(),
             )
         )
-    if len(selected) != 10:
-        raise ValueError(f"Expected five W2 sites in each of two roles, found {len(selected)}")
+    sites = {role: sum(role in Path(item["source"]).parts for item in selected)
+             for role in ("l2_full_cycles", "l2_s6_cycles_only")}
+    if tuple(sites.values()) not in ((5, 5), (1, 1)) or sum(sites.values()) != len(selected):
+        raise ValueError(f"Expected five W2 sites or one shared site in each of two roles: {sites}")
     result["report/native-w2-source-selection.json"] = (
         json.dumps(
             dict(
@@ -104,6 +109,7 @@ def select_sources(files, expected_fingerprint):
                 source_sha256=expected_fingerprint,
                 fragment_sha256=hashlib.sha256(NATIVE_SOURCE.read_bytes()).hexdigest(),
                 selected=selected,
+                sites_by_role=sites,
                 old_binaries_loaded=False,
                 native_build="REQUIRED",
             ),

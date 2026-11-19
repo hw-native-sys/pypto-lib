@@ -23,9 +23,9 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 # Dynamic shape variables.
-ROWS = pl.dynamic("V41_VISION_ROWS")
-INPUT = pl.dynamic("V41_VISION_INPUT")
-OUTPUT = pl.dynamic("V41_VISION_OUTPUT")
+ROWS = pl.dynamic("VISION_ROWS")
+INPUT = pl.dynamic("VISION_INPUT")
+OUTPUT = pl.dynamic("VISION_OUTPUT")
 
 # tiling
 M_TILE = 16
@@ -393,7 +393,7 @@ def _make_vit(cfg):
 
 def _make_aligner(cfg):
     d, r, ld = cfg.dim, cfg.downsample, cfg.language_dim
-    aligned_rows = pl.dynamic("V41_VISION_ALIGNED_ROWS")
+    aligned_rows = pl.dynamic("VISION_ALIGNED_ROWS")
 
     @pl.jit.inline(auto_scope=False)
     def aligner(
@@ -486,7 +486,7 @@ def make_vision_program(cfg=VisionConfig()):
     aligner = _make_aligner(cfg)
     d, l, i, ld = cfg.dim, cfg.layers, cfg.intermediate, cfg.language_dim
     patch = 3 * cfg.patch_size ** 2
-    aligned = pl.dynamic("V41_VISION_ALIGNED_ROWS")
+    aligned = pl.dynamic("VISION_ALIGNED_ROWS")
     half = d // cfg.heads // 2
 
     @pl.jit

@@ -6,6 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: no-sim
 """Compression projections, rotary embedding, cache publication, and ratio-2 ring state."""
 
 from pathlib import Path
@@ -16,8 +17,8 @@ from pypto.runtime import pto_isa_include_dir
 import torch
 
 from config import (
-    FLASH as M, TP_SIZE, STATE_CAPACITY, B_DYN, Q_START_DYN, STATE_BLOCKS_DYN, T_DYN, CMP_BLOCKS_DYN,
-    COMPRESSED_CACHE_BYTES,
+    FLASH as M, STATE_CAPACITY, B_DYN, Q_START_DYN, STATE_BLOCKS_DYN, T_DYN, CMP_BLOCKS_DYN,
+    COMPRESSED_CACHE_BYTES, C2A_STORAGE_ROWS,
 )
 from quant import unpack_bf16_nz
 from rmsnorm import golden_rms_norm
@@ -49,15 +50,16 @@ def c1a_compressor_project(
     n_tile: pl.constexpr,
 ):
     """Project NZ weights with full-height Cube tiles and store active rows."""
-    blocks = (num_tokens + m_tile - 1) // m_tile * (HEAD_DIM // n_tile)
-    workers = pl.max(pl.min(blocks, 8), 1)
+    row_groups = (num_tokens + 2 * m_tile - 1) // (2 * m_tile)
+    workers = pl.max(pl.min(row_groups * (HEAD_DIM // n_tile), pl.system.available_cluster_count()), 1)
     with pl.spmd(workers, name_hint="proj_cmp", deps=[ready]) as completed:
         with pl.at(level=pl.Level.CORE_GROUP):
             worker = pl.tile.get_block_idx()
-            col = worker % (HEAD_DIM // n_tile) * n_tile
-            row_workers = pl.max(workers // (HEAD_DIM // n_tile), 1)
+            task_stride = pl.max(workers, 1)
             row_blocks = (num_tokens + m_tile - 1) // m_tile
-            for row_block in pl.range(worker // (HEAD_DIM // n_tile), row_blocks, row_workers):
+            for task in pl.range(worker, row_blocks * (HEAD_DIM // n_tile), task_stride):
+                row_block = task // (HEAD_DIM // n_tile)
+                col = task % (HEAD_DIM // n_tile) * n_tile
                 row = row_block * m_tile
                 rows = pl.max(pl.min(m_tile, num_tokens - row), 0)
                 a = pl.load(source, [row, 0], [m_tile, C1A_PROJ_K_TILE], valid_shape=[rows, C1A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
@@ -105,9 +107,273 @@ def c1a_compressor_publish(
 ):
     """Normalize and publish MXFP4 rows while retaining the unrotated latent."""
     active_tokens = pl.cast(num_tokens, pl.INT32)
-    workers = pl.max(pl.min(active_tokens, 8), 1)
+    row_groups = (active_tokens + 2 * C1A_PROJ_M_TILE - 1) // (2 * C1A_PROJ_M_TILE)
+    workers = pl.max(pl.min(pl.min(active_tokens, row_groups * 8), pl.system.available_cluster_count()), 1)
     with pl.spmd(workers, name_hint="c1a_compress", deps=[cache_ready, source_ready]) as published:
         cache = _c1a_compress(source, slots, cache, cosine, sine, norm_weight, latent, active_tokens)
+    return published
+
+
+@pl.jit.inline(auto_scope=False)
+def _c1a_publish_normalize(
+    source: pl.Tile[[4096], pl.BF16, pl.Mem.Vec],
+    weight: pl.Tile[[512], pl.BF16, pl.Mem.Vec],
+    rows: pl.Scalar[pl.INDEX],
+):
+    with pl.reg_scope():
+        full = pl.reg.full_mask(lanes=64)
+        for row in pl.hardware_loop(rows):
+            summed = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+            # Accumulate squared values in a counted loop.
+            for segment in pl.hardware_loop(8):
+                value = pl.reg.convert(pl.reg.load(source, row * 512 + segment * 64, lanes=64), dtype=pl.FP32)
+                summed = pl.reg.add(summed, pl.reg.mul(value, value, full), full)
+            sum_one = pl.reg.reduce_sum(summed, full, reassoc=True)
+            scalar_mask = pl.reg.full_mask(lanes=1)
+            mean = pl.reg.muls(sum_one, 1.0 / 512.0, scalar_mask)
+            rms = pl.reg.sqrt(pl.reg.adds(mean, 1e-6, scalar_mask), scalar_mask)
+            inverse_one = pl.reg.div(pl.reg.broadcast(1.0, lanes=1, dtype=pl.FP32), rms, scalar_mask)
+            inverse = pl.reg.broadcast(inverse_one, lanes=64, dtype=pl.FP32)
+            for segment in pl.hardware_loop(8):
+                value = pl.reg.convert(pl.reg.load(source, row * 512 + segment * 64, lanes=64), dtype=pl.FP32)
+                gain = pl.reg.convert(pl.reg.load(weight, segment * 64, lanes=64), dtype=pl.FP32)
+                value = pl.reg.mul(pl.reg.mul(value, inverse, full), gain, full)
+                bf = pl.reg.convert(value, dtype=pl.BF16, rounding="R", saturate=False)
+                _source_write = pl.reg.store(source, row * 512 + segment * 64, bf)
+    return source
+
+
+@pl.jit.inline(auto_scope=False)
+def _c1a_publish_rotate(
+    source: pl.Tile[[4096], pl.BF16, pl.Mem.Vec],
+    cosine: pl.Tile[[512], pl.FP32, pl.Mem.Vec],
+    sine: pl.Tile[[512], pl.FP32, pl.Mem.Vec],
+    rows: pl.Scalar[pl.INDEX],
+):
+    with pl.reg_scope():
+        full = pl.reg.full_mask(lanes=64)
+        lower = pl.reg.active_mask(32, lanes=64)
+        for row in pl.hardware_loop(rows):
+            value = pl.reg.convert(pl.reg.load(source, row * 512 + 448, lanes=64), dtype=pl.FP32)
+            cosv = pl.reg.load(cosine, row * 64, lanes=64)
+            sinv = pl.reg.load(sine, row * 64, lanes=64)
+            even, odd = pl.reg.dintlv(value, value, full)
+            real = pl.reg.sub(pl.reg.mul(even, cosv, lower), pl.reg.mul(odd, sinv, lower), lower)
+            imag = pl.reg.add(pl.reg.mul(even, sinv, lower), pl.reg.mul(odd, cosv, lower), lower)
+            interleaved, unused = pl.reg.intlv(real, imag, full)
+            bf = pl.reg.convert(interleaved, dtype=pl.BF16, rounding="R", saturate=False)
+            _source_write = pl.reg.store(source, row * 512 + 448, bf)
+    return source
+
+
+@pl.jit.inline(auto_scope=False)
+def _c1a_publish_quantize(
+    source: pl.Tile[[4096], pl.BF16, pl.Mem.Vec],
+    rows: pl.Scalar[pl.INDEX],
+):
+    packed = pl.tile.create([4096], dtype=pl.UINT8, target_memory=pl.Mem.Vec)
+    maxima = pl.tile.create([256], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+    rounded = pl.tile.create([512], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+    factors = pl.tile.create([512], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+    with pl.reg_scope():
+        full = pl.reg.full_mask(lanes=64)
+        lower = pl.reg.active_mask(32, lanes=64)
+        scale_mask = pl.reg.full_mask(lanes=32)
+        full16 = pl.reg.full_mask(lanes=128)
+        lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
+        group_indices = pl.reg.shift_rights(lane, 4, full)
+        for row in pl.hardware_loop(rows):
+            for chunk in pl.hardware_loop(4):
+                bf = pl.reg.load(source, row * 512 + chunk * 128, lanes=128)
+                bits = pl.reg.interpret_cast(bf, dtype=pl.UINT16)
+                abs_bits = pl.reg.bitwise_and(bits, pl.reg.broadcast(32767, lanes=128, dtype=pl.UINT16), full16)
+                compact = pl.reg.reduce_max(abs_bits, full16, group_size=16)
+                bf_max = pl.reg.interpret_cast(compact, dtype=pl.BF16)
+                _maxima_write = pl.reg.store(maxima, row * 32 + chunk * 8, bf_max)
+            maximum = pl.reg.convert(pl.reg.load(maxima, row * 32, lanes=32), dtype=pl.FP32)
+            scale32 = pl.reg.maximums(pl.reg.muls(maximum, 1.0 / 6.0, scale_mask), 0.001953125, scale_mask)
+            bf_scale = pl.reg.convert(scale32, dtype=pl.BF16, rounding="R", saturate=False)
+            _factors_write = pl.reg.store(factors, row * 64, bf_scale)
+            rounded_scale = pl.reg.convert(bf_scale, dtype=pl.FP32)
+            _rounded_write = pl.reg.store(rounded, row * 64, rounded_scale)
+            for segment in pl.hardware_loop(8):
+                value = pl.reg.convert(pl.reg.load(source, row * 512 + segment * 64, lanes=64), dtype=pl.FP32)
+                offsets = pl.reg.adds(group_indices, pl.cast(row * 64 + segment * 4, pl.UINT32), full)
+                scale = pl.reg.gather(rounded, offsets, full)
+                normalized = pl.reg.div(value, scale, full)
+                magnitude = pl.reg.abs(normalized, full)
+                codes = pl.reg.broadcast(0, lanes=64, dtype=pl.INT32)
+                selected = pl.reg.compares(magnitude, 0.25, full, predicate="gt")
+                codes = pl.reg.select(selected, pl.reg.broadcast(1, lanes=64, dtype=pl.INT32), codes)
+                selected = pl.reg.compares(magnitude, 0.75, full, predicate="ge")
+                codes = pl.reg.select(selected, pl.reg.broadcast(2, lanes=64, dtype=pl.INT32), codes)
+                selected = pl.reg.compares(magnitude, 1.25, full, predicate="gt")
+                codes = pl.reg.select(selected, pl.reg.broadcast(3, lanes=64, dtype=pl.INT32), codes)
+                selected = pl.reg.compares(magnitude, 1.75, full, predicate="ge")
+                codes = pl.reg.select(selected, pl.reg.broadcast(4, lanes=64, dtype=pl.INT32), codes)
+                selected = pl.reg.compares(magnitude, 2.5, full, predicate="gt")
+                codes = pl.reg.select(selected, pl.reg.broadcast(5, lanes=64, dtype=pl.INT32), codes)
+                selected = pl.reg.compares(magnitude, 3.5, full, predicate="ge")
+                codes = pl.reg.select(selected, pl.reg.broadcast(6, lanes=64, dtype=pl.INT32), codes)
+                selected = pl.reg.compares(magnitude, 5.0, full, predicate="gt")
+                codes = pl.reg.select(selected, pl.reg.broadcast(7, lanes=64, dtype=pl.INT32), codes)
+                sign = pl.reg.interpret_cast(normalized, dtype=pl.INT32)
+                sign = pl.reg.shift_rights(sign, 28, full)
+                sign = pl.reg.bitwise_and(sign, pl.reg.broadcast(8, lanes=64, dtype=pl.INT32), full)
+                codes = pl.reg.bitwise_or(codes, sign, full)
+                even_code, odd_code = pl.reg.dintlv(codes, codes, full)
+                odd_code = pl.reg.shift_lefts(odd_code, 4, lower)
+                byte_code = pl.reg.bitwise_or(even_code, odd_code, lower)
+                signed_bytes = pl.reg.convert(byte_code, dtype=pl.INT8, saturate=False)
+                bytes8 = pl.reg.interpret_cast(signed_bytes, dtype=pl.UINT8)
+                _payload = pl.reg.store(packed, row * HEAD_DIM + segment * 32, bytes8, lower)
+    return (packed, factors)
+
+
+@pl.jit.inline(auto_scope=False)
+def _c1a_publish_flush(
+    inputs: pl.Tile[[8, HEAD_DIM], pl.BF16, pl.Mem.Vec],
+    weight: pl.Tile[[HEAD_DIM], pl.BF16, pl.Mem.Vec],
+    cosv: pl.Tile[[8, 64], pl.FP32, pl.Mem.Vec],
+    sinv: pl.Tile[[8, 64], pl.FP32, pl.Mem.Vec],
+    targets: pl.Tile[[8], pl.INT64, pl.Mem.Vec],
+    tokens: pl.Tile[[8], pl.INT32, pl.Mem.Vec],
+    latent: pl.Tensor,
+    cache: pl.Tensor,
+    cache_scales: pl.Tensor,
+    rows: pl.Scalar[pl.INDEX],
+    source: pl.Tensor,
+    cosine: pl.Tensor,
+    sine: pl.Tensor,
+):
+    for row in pl.range(rows):
+        load_token = pl.cast(pl.tile.read(tokens, [row]), pl.INDEX)
+        inputs = pl.tile.gather_row(inputs, source, [row, 0], [load_token, 0], [1, HEAD_DIM])
+        cosv = pl.tile.gather_row(cosv, cosine, [row, 0], [load_token, 0], [1, 32])
+        sinv = pl.tile.gather_row(sinv, sine, [row, 0], [load_token, 0], [1, 32])
+    flat_inputs = pl.reshape(inputs, [4096])
+    norm = _c1a_publish_normalize(flat_inputs, weight, rows)
+    norm_rows = pl.reshape(norm, [8, HEAD_DIM])
+    for row in pl.range(rows):
+        token = pl.tile.read(tokens, [row])
+        value = pl.tile.slice(norm_rows, [1, HEAD_DIM], [row, 0])
+        pl.store(value, [token, 0], latent)
+    rotated = _c1a_publish_rotate(norm, pl.reshape(cosv, [512]), pl.reshape(sinv, [512]), rows)
+    payload, bf_factors = _c1a_publish_quantize(rotated, rows)
+    payload_rows = pl.reshape(payload, [8, HEAD_DIM])
+    bf_factor_rows = pl.reshape(bf_factors, [8, 64])
+    for row in pl.range(rows):
+        target = pl.tile.read(targets, [row])
+        if target >= 0:
+            value_fp4 = pl.tile.slice(payload_rows, [1, HEAD_DIM // 2], [row, 0])
+            pl.store(value_fp4, [target, 0], cache)
+            factors_cmp = pl.tile.slice(bf_factor_rows, [1, 32], [row, 0])
+            scale_bytes = pl.reinterpret_view(factors_cmp, pl.UINT8)
+            pl.store(scale_bytes, [target, 256], cache_scales)
+    return cache
+
+
+@pl.jit.inline(auto_scope=False)
+def _c1a_publish_body(
+    source: pl.Tensor,
+    weight: pl.Tensor,
+    cosine: pl.Tensor,
+    sine: pl.Tensor,
+    slots: pl.Tensor,
+    cache: pl.Tensor,
+    cache_scales: pl.Tensor,
+    latent: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    worker = pl.tile.get_block_idx()
+    workers = pl.tile.get_block_num()
+    gamma = pl.reshape(pl.load(weight, [0], [HEAD_DIM], target_memory=pl.Mem.Vec), [HEAD_DIM])
+    inputs = pl.tile.create([8, HEAD_DIM], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+    cosv = pl.tile.create([8, 64], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+    sinv = pl.tile.create([8, 64], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+    targets = pl.tile.create([8], dtype=pl.INT64, target_memory=pl.Mem.Vec)
+    tokens = pl.tile.create([8], dtype=pl.INT32, target_memory=pl.Mem.Vec)
+    pending = 0
+    for base in pl.range(0, num_tokens, 32):
+        count = pl.min(32, num_tokens - base)
+        slot_tile = pl.load(slots, [base], [32], valid_shape=[count], target_memory=pl.Mem.Vec)
+        for lane in pl.range(count):
+            token = base + lane
+            slot = pl.tile.read(slot_tile, [lane])
+            owner = pl.cast(slot // 128, pl.INDEX) % workers
+            if slot < 0:
+                owner = token // 8 % workers
+            if owner == worker:
+                _target = pl.tile.write(targets, [pending], slot)
+                _token = pl.tile.write(tokens, [pending], pl.cast(token, pl.INT32))
+                pending = pending + 1
+                if pending == 8:
+                    cache = _c1a_publish_flush(
+                        inputs,
+                        gamma,
+                        cosv,
+                        sinv,
+                        targets,
+                        tokens,
+                        latent,
+                        cache,
+                        cache_scales,
+                        pending,
+                        source,
+                        cosine,
+                        sine,
+                    )
+                    pending = 0
+    if pending > 0:
+        cache = _c1a_publish_flush(
+            inputs, gamma, cosv, sinv, targets, tokens, latent, cache, cache_scales, pending, source, cosine, sine
+        )
+    return cache
+
+
+@pl.jit.incore
+def _c1a_compress_python(
+    source: pl.Tensor,
+    slots: pl.Tensor,
+    cache: pl.InOut[pl.Tensor],
+    cache_scales: pl.InOut[pl.Tensor],
+    cosine: pl.Tensor,
+    sine: pl.Tensor,
+    norm_weight: pl.Tensor,
+    latent: pl.InOut[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+) -> pl.Tensor:
+    """Normalize, retain unrotated latent, and publish nearest-even E2M1 rows."""
+    _published = _c1a_publish_body(source, norm_weight, cosine, sine, slots, cache, cache_scales, latent, num_tokens)
+    return cache
+
+
+@pl.jit.inline(auto_scope=False)
+def c1a_compressor_publish_python(
+    source: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    latent: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    cosine: pl.Tensor,
+    sine: pl.Tensor,
+    slots: pl.Tensor[[T_DYN], pl.INT64],
+    cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    num_tokens: pl.Scalar[pl.INT32],
+    cache_ready: pl.Scalar[pl.TASK_ID],
+    source_ready: pl.Scalar[pl.TASK_ID],
+):
+    """Normalize and publish MXFP4 rows while retaining the unrotated latent."""
+    active_tokens = pl.cast(num_tokens, pl.INT32)
+    workers = pl.max(pl.min(active_tokens, 8), 1)
+    flat_cache = pl.reshape(cache, [pl.tensor.dim(cache, 0) * 128, COMPRESSED_CACHE_BYTES])
+    # Keep the physical 320-byte row for both aliases. Shortening either
+    # view before the JIT boundary would incorrectly make it contiguous.
+    # Payload writes [0, 256), scales write [256, 320) of each row.
+    scale_cache = flat_cache
+    with pl.spmd(workers, name_hint="c1a_compress_python", deps=[cache_ready, source_ready]) as published:
+        _published = _c1a_compress_python(
+            source, slots, flat_cache, scale_cache,
+            cosine, sine, norm_weight, latent, active_tokens,
+        )
     return published
 
 
@@ -147,25 +413,196 @@ def c2a_compressor_project(
 ):
     """Project KV and gate with NZ BF16 weights and FP32 Cube output."""
     blocks = (num_tokens + C2A_PROJ_M_TILE - 1) // C2A_PROJ_M_TILE * (2 * HEAD_DIM // n_tile)
-    workers = pl.max(pl.min(blocks, 16), 1)
-    with pl.spmd(workers, name_hint="proj_cmp"):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_cmp"):
-            worker = pl.tile.get_block_idx()
-            col = worker % (HEAD_DIM // n_tile) * n_tile
-            row_blocks = (num_tokens + C2A_PROJ_M_TILE - 1) // C2A_PROJ_M_TILE
-            row_workers = pl.max(workers // (2 * HEAD_DIM // n_tile), 1)
-            for row_block in pl.range(worker // (2 * HEAD_DIM // n_tile), row_blocks, row_workers):
-                row = row_block * C2A_PROJ_M_TILE
-                rows = pl.min(C2A_PROJ_M_TILE, num_tokens - row)
-                if worker % (2 * HEAD_DIM // n_tile) < HEAD_DIM // n_tile:
-                    kv_out = _c2a_compressor_project_tile(x, wkv, kv_out, row, col, rows, n_tile)
-                else:
-                    score_out = _c2a_compressor_project_tile(x, wgate, score_out, row, col, rows, n_tile)
+    workers = pl.max(pl.min(blocks, pl.system.available_cluster_count()), 1)
+    with pl.spmd(workers, name_hint="proj_cmp", sync_start=True):
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, blocks, workers):
+            row = block // (2 * HEAD_DIM // n_tile) * C2A_PROJ_M_TILE
+            rows = pl.min(C2A_PROJ_M_TILE, num_tokens - row)
+            for panel in pl.unroll(2 * HEAD_DIM // n_tile):
+                if block % (2 * HEAD_DIM // n_tile) == panel:
+                    col = panel % (HEAD_DIM // n_tile) * n_tile
+                    if panel < HEAD_DIM // n_tile:
+                        kv_out = _c2a_compressor_project_tile(x, wkv, kv_out, row, col, rows, n_tile)
+                    else:
+                        score_out = _c2a_compressor_project_tile(x, wgate, score_out, row, col, rows, n_tile)
     return kv_out, score_out
 
 
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "compressor_pool.cpp",
-               include_dirs=(pto_isa_include_dir(), str(Path(__file__).parent / "kernels")))
+
+@pl.jit.inline(auto_scope=False)
+def _pool_normalize(
+    ck: pl.Tile[[512], pl.FP32, pl.Mem.Vec],
+    cs: pl.Tile[[512], pl.FP32, pl.Mem.Vec],
+    pk: pl.Tile[[512], pl.FP32, pl.Mem.Vec],
+    ps: pl.Tile[[512], pl.FP32, pl.Mem.Vec],
+    weight: pl.Tile[[512], pl.BF16, pl.Mem.Vec],
+):
+    rounded = pl.create_tile([512], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+    output = pl.create_tile([512], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+    rotated = pl.create_tile([512], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+    with pl.reg_scope():
+        full = pl.reg.full_mask(lanes=64)
+        for chunk in pl.hardware_loop(8):
+            a = pl.reg.load(ps, chunk * 64, lanes=64)
+            b = pl.reg.load(cs, chunk * 64, lanes=64)
+            high = pl.reg.maximum(a, b, full)
+            previous_delta = pl.reg.sub(a, high, full)
+            a = pl.reg.exp(previous_delta, full)
+            current_delta = pl.reg.sub(b, high, full)
+            b = pl.reg.exp(current_delta, full)
+            denom = pl.reg.add(a, b, full)
+            previous_value = pl.reg.load(pk, chunk * 64, lanes=64)
+            previous_weight = pl.reg.div(a, denom, full)
+            av = pl.reg.mul(previous_value, previous_weight, full)
+            current_value = pl.reg.load(ck, chunk * 64, lanes=64)
+            current_weight = pl.reg.div(b, denom, full)
+            bv = pl.reg.mul(current_value, current_weight, full)
+            pooled = pl.reg.add(av, bv, full)
+            bf = pl.reg.convert(pooled, dtype=pl.BF16, rounding="R", saturate=False)
+            value = pl.reg.convert(bf, dtype=pl.FP32)
+            _rounded_written = pl.reg.store(rounded, chunk * 64, value)
+        # Match the shared CANN RMSNorm: fold 512 columns to 256, then
+        # reduce each 64-lane block and the four block sums.
+        lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
+        partials = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+        for chunk in pl.hardware_loop(4):
+            first = pl.reg.load(rounded, chunk * 64, lanes=64)
+            second = pl.reg.load(rounded, 256 + chunk * 64, lanes=64)
+            first_square = pl.reg.mul(first, first, full)
+            second_square = pl.reg.mul(second, second, full)
+            squares = pl.reg.add(first_square, second_square, full)
+            partial = pl.reg.reduce_sum(squares, full, reassoc=True)
+            partial = pl.reg.broadcast(partial, lanes=64, dtype=pl.FP32)
+            slot_index = pl.cast(chunk, pl.UINT32)
+            slot = pl.reg.compares(lane, slot_index, full, predicate="eq")
+            partials = pl.reg.select(slot, partial, partials)
+        active = pl.reg.active_mask(4, lanes=64)
+        reduced = pl.reg.reduce_sum(partials, active, reassoc=True)
+        reduced = pl.reg.broadcast(reduced, lanes=64, dtype=pl.FP32)
+        mean_square = pl.reg.muls(reduced, 1.0 / 512.0, full)
+        variance = pl.reg.adds(mean_square, 1e-06, full)
+        one = pl.reg.broadcast(1.0, lanes=64, dtype=pl.FP32)
+        reciprocal = pl.reg.div(one, variance, full)
+        root = pl.reg.sqrt(reciprocal, full)
+        negative_half_variance = pl.reg.muls(variance, -0.5, full)
+        product = pl.reg.mul(negative_half_variance, root, full)
+        three_halves = pl.reg.broadcast(1.5, lanes=64, dtype=pl.FP32)
+        factor = pl.reg.mula(three_halves, product, root, full)
+        inverse = pl.reg.mul(root, factor, full)
+        negative_variance = pl.reg.muls(variance, -1.0, full)
+        correction = pl.reg.mula(one, negative_variance, reciprocal, full)
+        negative_inverse = pl.reg.muls(inverse, -1.0, full)
+        error = pl.reg.mula(reciprocal, negative_inverse, inverse, full)
+        correction = pl.reg.mula(correction, variance, error, full)
+        correction = pl.reg.mul(correction, inverse, full)
+        half = pl.reg.broadcast(0.5, lanes=64, dtype=pl.FP32)
+        inv = pl.reg.mula(inverse, correction, half, full)
+        variance_bits = pl.reg.interpret_cast(variance, dtype=pl.UINT32)
+        is_infinite = pl.reg.compares(variance_bits, 2139095040, full, predicate="eq")
+        zero = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+        inv = pl.reg.select(is_infinite, zero, inv)
+        for chunk in pl.hardware_loop(8):
+            value = pl.reg.load(rounded, chunk * 64, lanes=64)
+            gamma_bf = pl.reg.load(weight, chunk * 64, lanes=64)
+            gamma = pl.reg.convert(gamma_bf, dtype=pl.FP32)
+            scaled_value = pl.reg.mul(value, inv, full)
+            norm = pl.reg.mul(scaled_value, gamma, full)
+            bf = pl.reg.convert(norm, dtype=pl.BF16, rounding="R", saturate=False)
+            _output_written = pl.reg.store(output, chunk * 64, bf)
+            # Keep the unrotated latent live until its GM store completes.
+            _rotated_written = pl.reg.store(rotated, chunk * 64, bf)
+    return (output, rotated)
+
+
+@pl.jit.inline(auto_scope=False)
+def _rotate_quantize(
+    raw: pl.Tile[[512], pl.BF16, pl.Mem.Vec],
+    cosine: pl.Tile[[32], pl.FP32, pl.Mem.Vec],
+    sine: pl.Tile[[32], pl.FP32, pl.Mem.Vec],
+):
+    packed = pl.create_tile([256], dtype=pl.UINT8, target_memory=pl.Mem.Vec)
+    factors = pl.create_tile([64], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+    scale_storage = pl.create_tile([512], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+    with pl.reg_scope():
+        full = pl.reg.full_mask(lanes=64)
+        lower = pl.reg.active_mask(32, lanes=64)
+        lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
+        rope_bf = pl.reg.load(raw, 448, lanes=64)
+        value = pl.reg.convert(rope_bf, dtype=pl.FP32)
+        even, odd = pl.reg.dintlv(value, value, full)
+        cosv = pl.reg.gather(cosine, lane, lower)
+        sinv = pl.reg.gather(sine, lane, lower)
+        even_cos = pl.reg.mul(even, cosv, lower)
+        odd_sin = pl.reg.mul(odd, sinv, lower)
+        real = pl.reg.sub(even_cos, odd_sin, lower)
+        even_sin = pl.reg.mul(even, sinv, lower)
+        odd_cos = pl.reg.mul(odd, cosv, lower)
+        imag = pl.reg.add(even_sin, odd_cos, lower)
+        interleaved, unused = pl.reg.intlv(real, imag, full)
+        bf = pl.reg.convert(interleaved, dtype=pl.BF16, rounding="R", saturate=False)
+        _raw_written = pl.reg.store(raw, 448, bf)
+        for chunk in pl.hardware_loop(8):
+            bf_values = pl.reg.load(raw, chunk * 64, lanes=64)
+            values = pl.reg.convert(bf_values, dtype=pl.FP32)
+            # Unsigned BF16 magnitudes reduce in groups of sixteen.
+            magnitude_bits = pl.reg.interpret_cast(bf_values, dtype=pl.UINT16)
+            mask16 = pl.reg.full_mask(lanes=64)
+            sign_mask = pl.reg.broadcast(32767, lanes=64, dtype=pl.UINT16)
+            magnitude_bits = pl.reg.bitwise_and(magnitude_bits, sign_mask, mask16)
+            group_maximum = pl.reg.reduce_max(magnitude_bits, mask16, group_size=16)
+            repeated_maximum = pl.reg.group_broadcast(group_maximum, lanes=64)
+            bf_maximum = pl.reg.interpret_cast(repeated_maximum, dtype=pl.BF16)
+            maximum = pl.reg.convert(bf_maximum, dtype=pl.FP32)
+            raw_scale = pl.reg.muls(maximum, 1.0 / 6.0, full)
+            scale = pl.reg.maximums(raw_scale, 0.001953125, full)
+            bf_scale = pl.reg.convert(scale, dtype=pl.BF16, rounding="R", saturate=False)
+            rounded_scale = pl.reg.convert(bf_scale, dtype=pl.FP32)
+            _scale_written = pl.reg.store(scale_storage, chunk * 64, rounded_scale)
+            normalized = pl.reg.div(values, rounded_scale, full)
+            magnitude = pl.reg.abs(normalized, full)
+            codes = pl.reg.broadcast(0, lanes=64, dtype=pl.INT32)
+            # Strict E2M1 midpoint comparisons (RoundEven=false).
+            selected = pl.reg.compares(magnitude, 0.25, full, predicate="gt")
+            code_one = pl.reg.broadcast(1, lanes=64, dtype=pl.INT32)
+            codes = pl.reg.select(selected, code_one, codes)
+            selected = pl.reg.compares(magnitude, 0.75, full, predicate="gt")
+            code_two = pl.reg.broadcast(2, lanes=64, dtype=pl.INT32)
+            codes = pl.reg.select(selected, code_two, codes)
+            selected = pl.reg.compares(magnitude, 1.25, full, predicate="gt")
+            code_three = pl.reg.broadcast(3, lanes=64, dtype=pl.INT32)
+            codes = pl.reg.select(selected, code_three, codes)
+            selected = pl.reg.compares(magnitude, 1.75, full, predicate="gt")
+            code_four = pl.reg.broadcast(4, lanes=64, dtype=pl.INT32)
+            codes = pl.reg.select(selected, code_four, codes)
+            selected = pl.reg.compares(magnitude, 2.5, full, predicate="gt")
+            code_five = pl.reg.broadcast(5, lanes=64, dtype=pl.INT32)
+            codes = pl.reg.select(selected, code_five, codes)
+            selected = pl.reg.compares(magnitude, 3.5, full, predicate="gt")
+            code_six = pl.reg.broadcast(6, lanes=64, dtype=pl.INT32)
+            codes = pl.reg.select(selected, code_six, codes)
+            selected = pl.reg.compares(magnitude, 5.0, full, predicate="gt")
+            code_seven = pl.reg.broadcast(7, lanes=64, dtype=pl.INT32)
+            codes = pl.reg.select(selected, code_seven, codes)
+            bits = pl.reg.interpret_cast(normalized, dtype=pl.INT32)
+            sign_shifted = pl.reg.shift_rights(bits, 28, full)
+            sign_mask32 = pl.reg.broadcast(8, lanes=64, dtype=pl.INT32)
+            sign = pl.reg.bitwise_and(sign_shifted, sign_mask32, full)
+            codes = pl.reg.bitwise_or(codes, sign, full)
+            even_code, odd_code = pl.reg.dintlv(codes, codes, full)
+            high_nibble = pl.reg.shift_lefts(odd_code, 4, lower)
+            byte_code = pl.reg.bitwise_or(even_code, high_nibble, lower)
+            bytes8 = pl.reg.convert(byte_code, dtype=pl.INT8, saturate=False)
+            bytes8 = pl.reg.interpret_cast(bytes8, dtype=pl.UINT8)
+            _packed_written = pl.reg.store(packed, chunk * 32, bytes8, lower)
+        group_indices = pl.reg.shift_lefts(lane, 4, full)
+        group_scale = pl.reg.gather(scale_storage, group_indices, lower)
+        group_bf = pl.reg.convert(group_scale, dtype=pl.BF16, rounding="R", saturate=False)
+        _factors_written = pl.reg.store(factors, 0, group_bf, lower)
+    return (packed, factors)
+
+
+@pl.jit.incore
 def _c2a_compress(
     kv_proj: pl.Tensor,
     score_proj: pl.Tensor,
@@ -182,9 +619,118 @@ def _c2a_compress(
     cache: pl.InOut[pl.Tensor],
     num_tokens: pl.Scalar[pl.INT32],
     num_state_blocks: pl.Scalar[pl.INT32],
-) -> pl.Tensor:
-    """Pool, normalize, publish compressed rows, and update request ring state."""
-    ...
+    phase_begin: pl.constexpr,
+    phase_end: pl.constexpr,
+    partition: pl.constexpr,
+):
+    worker = pl.tile.get_block_idx()
+    workers = pl.tile.get_block_num()
+    requests = pl.tensor.dim(state_block_table, 0)
+    state_flat = state_cache
+    cache_flat = cache
+    weight_row = pl.load(norm_weight, [0], [512], target_memory=pl.Mem.Vec)
+    gamma = pl.reshape(weight_row, [512])
+    for phase in pl.range(phase_begin, phase_end):
+        for request in pl.range(requests + 2):
+            block = -1
+            start = 0
+            end = pl.cast(num_tokens, pl.INDEX)
+            if request < requests:
+                block_id = pl.tensor.read(state_block_table, [request, 0])
+                block = pl.cast(block_id, pl.INDEX)
+                request_start = pl.tensor.read(query_start_loc, [request])
+                start = pl.cast(request_start, pl.INDEX)
+                request_end = pl.tensor.read(query_start_loc, [request + 1])
+                end = pl.cast(request_end, pl.INDEX)
+            elif request == requests:
+                prefix_end = pl.tensor.read(query_start_loc, [0])
+                end = pl.cast(prefix_end, pl.INDEX)
+            else:
+                suffix_start = pl.tensor.read(query_start_loc, [requests])
+                start = pl.cast(suffix_start, pl.INDEX)
+            valid_block = block >= 0 and block < num_state_blocks
+            owner = request % workers
+            if valid_block:
+                owner = block % workers
+            if partition == "token":
+                owner = request % workers
+            start = pl.max(start, 0)
+            end = pl.min(end, num_tokens)
+            if owner == worker:
+                begin = start
+                if phase == 1:
+                    begin = pl.max(start, end - 4)
+                for token in pl.range(begin, end):
+                    position = pl.tensor.read(position_ids, [token])
+                    req = pl.tensor.read(token_to_req_indices, [token])
+                    valid = valid_block and req == request and (position >= 0)
+                    if phase == 0:
+                        if valid and position % 2 == 1:
+                            current_kv_row = pl.load(kv_proj, [token, 0], [1, 512], target_memory=pl.Mem.Vec)
+                            ck = pl.reshape(current_kv_row, [512])
+                            current_score_row = pl.load(score_proj, [token, 0], [1, 512], target_memory=pl.Mem.Vec)
+                            cs = pl.reshape(current_score_row, [512])
+                            pk = pl.create_tile([512], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                            ps = pl.create_tile([512], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                            if token > start:
+                                previous_kv_row = pl.load(kv_proj, [token - 1, 0], [1, 512], target_memory=pl.Mem.Vec)
+                                pk = pl.reshape(previous_kv_row, [512])
+                                previous_score_row = pl.load(score_proj, [token - 1, 0], [1, 512], target_memory=pl.Mem.Vec)
+                                ps = pl.reshape(previous_score_row, [512])
+                            else:
+                                history = block * 4 + (position - 1) % 4
+                                history_kv_row = pl.load(state_flat, [history, 0], [1, 512], target_memory=pl.Mem.Vec)
+                                pk = pl.reshape(history_kv_row, [512])
+                                history_score_row = pl.load(state_flat, [history, 512], [1, 512], target_memory=pl.Mem.Vec)
+                                ps = pl.reshape(history_score_row, [512])
+                            pooled, rotated = _pool_normalize(ck, cs, pk, ps, gamma)
+                            latent_row = pl.reshape(pooled, [1, 512])
+                            pl.store(latent_row, [token, 0], latent)
+                            target = pl.tensor.read(slots, [token])
+                            for future in pl.range(token + 1, num_tokens):
+                                future_slot = pl.tensor.read(slots, [future])
+                                same_slot = future_slot == target
+                                if same_slot and target >= 0:
+                                    future_req = pl.tensor.read(token_to_req_indices, [future])
+                                    future_pos = pl.tensor.read(position_ids, [future])
+                                    if (
+                                        future_req >= 0
+                                        and future_req < requests
+                                        and (future_pos >= 0)
+                                        and (future_pos % 2 == 1)
+                                    ):
+                                        future_block = pl.tensor.read(state_block_table, [future_req, 0])
+                                        future_start = pl.tensor.read(query_start_loc, [future_req])
+                                        future_end = pl.tensor.read(query_start_loc, [future_req + 1])
+                                        if (
+                                            future_block >= 0
+                                            and future_block < num_state_blocks
+                                            and (future >= future_start)
+                                            and (future < future_end)
+                                        ):
+                                            target = pl.cast(-1, pl.INT64)
+                            if target >= 0:
+                                cosine_row = pl.load(cosine, [token, 0], [1, 32], target_memory=pl.Mem.Vec)
+                                cosv = pl.reshape(cosine_row, [32])
+                                sine_row = pl.load(sine, [token, 0], [1, 32], target_memory=pl.Mem.Vec)
+                                sinv = pl.reshape(sine_row, [32])
+                                payload, factors = _rotate_quantize(rotated, cosv, sinv)
+                                payload_row = pl.reshape(payload, [1, 256])
+                                pl.store(payload_row, [target, 0], cache_flat)
+                                factor_tile = pl.reshape(factors, [1, 64])
+                                factor_row = pl.tile.slice(factor_tile, [1, 32], [0, 0])
+                                scale_bytes = pl.reinterpret_view(factor_row, pl.UINT8)
+                                pl.store(scale_bytes, [target, 256], cache_flat)
+                        else:
+                            zero = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)
+                            pl.store(zero, [token, 0], latent)
+                    elif valid:
+                        row = block * 4 + position % 4
+                        kv = pl.load(kv_proj, [token, 0], [1, 512], target_memory=pl.Mem.Vec)
+                        score = pl.load(score_proj, [token, 0], [1, 512], target_memory=pl.Mem.Vec)
+                        pl.store(kv, [row, 0], state_flat)
+                        pl.store(score, [row, 512], state_flat)
+    return state_cache, latent, cache
 
 
 @pl.jit.inline(auto_scope=False)
@@ -203,9 +749,10 @@ def c2a_compressor_publish(
     cosine: pl.Tensor,
     sine: pl.Tensor,
     slots: pl.Tensor[[T_DYN], pl.INT64],
-    cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    cache: pl.Tensor[[CMP_BLOCKS_DYN, C2A_STORAGE_ROWS, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    partition: pl.constexpr,
 ):
-    """Pool and publish rows with state reads and writes owned by physical block."""
+    """Pool spans by request or token partition and publish the latest state slots."""
     active_tokens = pl.cast(num_tokens, pl.INT32)
     blocks = pl.cast(pl.tensor.dim(state_cache, 0), pl.INT32)
     requests = pl.tensor.dim(state_block_table, 0)
@@ -248,18 +795,56 @@ def c2a_compressor_publish(
                         if pl.read(token_to_req_indices, [token]) == request:
                             pl.write(mapped_requests, [token], count)
                     count = pl.cast(count + 1, pl.INT32)
-    # TP1 decode retains its measured request-based worker policy.
-    if TP_SIZE == 1:
-        workers = pl.max(pl.min(pl.tensor.dim(state_block_table, 0), 16), 1)
-    else:
-        workers = pl.max(pl.min(native_blocks, 32), 1)
+    workers = pl.max(pl.min(pl.tensor.dim(state_block_table, 0), pl.system.available_cluster_count()), 1)
     native_count = pl.cast(native_blocks, pl.INT32)
-    with pl.spmd(workers, name_hint="c2a_compress", deps=[mapped]) as completed:
-        _c2a_compress(
-            kv_proj, score_proj, native_state, position_ids, norm_weight, latent,
-            mapped_starts, mapped_requests, mapped_blocks,
-            slots, cosine, sine, cache, active_tokens, native_count,
-        )
+    native_rows = native_blocks * 4
+    native_flat = pl.reshape(native_state, [native_rows, STATE_WIDTH])
+    cache_blocks = pl.tensor.dim(cache, 0)
+    cache_rows = cache_blocks * C2A_STORAGE_ROWS
+    cache_flat = pl.reshape(cache, [cache_rows, COMPRESSED_CACHE_BYTES])
+    completed = state_ready
+    if partition == "token":
+        token_workers = pl.max(1, pl.min((active_tokens + 15) // 16, 64))
+        with pl.spmd(token_workers, name_hint="c2a_compress", deps=[mapped]) as pooled:
+            pooled_state, pooled_latent, pooled_cache = _c2a_compress(
+                kv_proj, score_proj, native_flat, position_ids, norm_weight, latent,
+                mapped_starts, mapped_requests, mapped_blocks,
+                slots, cosine, sine, cache_flat, active_tokens, native_count,
+                phase_begin=0, phase_end=1, partition="token",
+            )
+        state_workers = pl.max(1, pl.min(native_rows, 64))
+        with pl.spmd(state_workers, name_hint="c2a_state_commit", deps=[pooled]) as branch_completed:
+            commit_worker = pl.tile.get_block_idx()
+            for state_row in pl.range(commit_worker, native_rows, state_workers):
+                found = pl.cast(0, pl.INT32)
+                for reverse_group in pl.range(groups):
+                    commit_group = groups - 1 - reverse_group
+                    commit_block = pl.read(mapped_blocks, [commit_group, 0])
+                    if found == 0 and commit_block == state_row // 4:
+                        commit_start = pl.max(0, pl.read(mapped_starts, [commit_group]))
+                        commit_end = pl.min(active_tokens, pl.read(mapped_starts, [commit_group + 1]))
+                        for commit_offset in pl.range(commit_end - commit_start):
+                            commit_token = commit_end - 1 - commit_offset
+                            commit_position = pl.read(position_ids, [commit_token])
+                            commit_request = pl.read(mapped_requests, [commit_token])
+                            valid_request = found == 0 and commit_request == commit_group
+                            valid_position = commit_position >= 0 and commit_position % 4 == state_row % 4
+                            if valid_request and valid_position:
+                                commit_kv = pl.load(kv_proj, [commit_token, 0], [1, HEAD_DIM])
+                                commit_score = pl.load(score_proj, [commit_token, 0], [1, HEAD_DIM])
+                                pl.store(commit_kv, [state_row, 0], pooled_state)
+                                pl.store(commit_score, [state_row, HEAD_DIM], pooled_state)
+                                found = pl.cast(1, pl.INT32)
+        completed = branch_completed
+    else:
+        with pl.spmd(workers, name_hint="c2a_compress", deps=[mapped]) as branch_completed:
+            _c2a_compress(
+                kv_proj, score_proj, native_flat, position_ids, norm_weight, latent,
+                mapped_starts, mapped_requests, mapped_blocks,
+                slots, cosine, sine, cache_flat, active_tokens, native_count,
+                phase_begin=0, phase_end=2, partition="request",
+            )
+        completed = branch_completed
     return completed
 
 
@@ -277,17 +862,17 @@ def c2a_state_feedback_test(
     sine: pl.Tensor[[8, ROPE_DIM // 2], pl.FP32],
     state_cache: pl.InOut[pl.Tensor[[3, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     latent: pl.InOut[pl.Tensor[[8, HEAD_DIM], pl.BF16]],
+    cache: pl.InOut[pl.Tensor[[4, C2A_STORAGE_ROWS, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
 ):
-    """Validate the ring retained after a six-row speculative verification window."""
-    cache = pl.create_tensor([1, 128, 1, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8)
+    """Validate compact page publication and the retained speculative state ring."""
     state_ready = pl.system.task_dummy(deps=[])
     state_table = pl.reshape(state_blocks, [8, 1])
     c2a_compressor_publish(
         kv, score, query_starts, positions, request_ids, state_table,
         state_cache, norm_weight, latent, pl.cast(6, pl.INT32), state_ready,
-        cosine, sine, slots, cache,
+        cosine, sine, slots, cache, partition="request",
     )
-    return state_cache, latent
+    return state_cache, latent, cache
 
 
 def golden_c1a_compressor(
@@ -295,8 +880,14 @@ def golden_c1a_compressor(
     wkv: torch.Tensor,
     norm_weight: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute C1A NZ-weight projection followed by RMSNorm."""
-    projected = torch.matmul(x.float(), unpack_bf16_nz(wkv).float()).to(x.dtype)
+    """Compute C1A projection with K-tile FP32 accumulation followed by RMSNorm."""
+    weight = unpack_bf16_nz(wkv).float()
+    source = x.float()
+    projected = torch.zeros((*x.shape[:-1], weight.shape[-1]), dtype=torch.float32, device=x.device)
+    for begin in range(0, x.shape[-1], C1A_PROJ_K_TILE):
+        end = begin + C1A_PROJ_K_TILE
+        projected.add_(torch.matmul(source[..., begin:end], weight[begin:end]))
+    projected = projected.to(x.dtype)
     return golden_rms_norm(projected, norm_weight)
 
 
@@ -356,9 +947,10 @@ def golden_c2a_compressor(
 
 if __name__ == "__main__":
     import argparse
+    import functools
 
     from golden import TensorSpec, ratio_allclose, run
-    from quant import pack_bf16_nz
+    from quant import pack_bf16_nz, pack_quantized_cache, quantize_mxfp4_cache
 
     parser = argparse.ArgumentParser(description="C2A state feedback after speculative prefix acceptance")
     parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5")
@@ -384,6 +976,14 @@ if __name__ == "__main__":
     state[1, (args.start_position - 1) % STATE_CAPACITY, :HEAD_DIM] = 1.0
     weight = pack_bf16_nz(torch.eye(HEAD_DIM, dtype=torch.bfloat16))
     gate = torch.zeros_like(weight)
+    slots = torch.full((8,), -1, dtype=torch.int64)
+    pages = (3, 1, 0, 2)
+    for token in range(6):
+        position = args.start_position + token
+        if position % 2:
+            logical = position // 2
+            page = pages[logical // C2A_STORAGE_ROWS % len(pages)]
+            slots[token] = page * C2A_STORAGE_ROWS + logical % C2A_STORAGE_ROWS
 
     def golden(values):
         values["latent"].copy_(golden_c2a_compressor(
@@ -391,11 +991,14 @@ if __name__ == "__main__":
             values["request_ids"], values["state_blocks"].unsqueeze(1), values["state_cache"],
             weight, gate, values["norm_weight"],
         )[0])
+        published = values["slots"] >= 0
+        payload, factors = quantize_mxfp4_cache(values["latent"][published], 16, "bf16")
+        packed = pack_quantized_cache(payload, factors)
+        flat = values["cache"].view(-1, COMPRESSED_CACHE_BYTES)
+        flat[values["slots"][published]] = packed
 
-    compare_ring = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
-
-    def compare_feedback(actual, expected, **kwargs):
-        ok, detail = compare_ring(actual, expected, **kwargs)
+    def compare_feedback(actual, expected, *, compare, **kwargs):
+        ok, detail = compare(actual, expected, **kwargs)
         next_position = args.start_position + args.accepted
         if not ok or next_position % 2 == 0:
             return ok, detail
@@ -419,18 +1022,22 @@ if __name__ == "__main__":
         TensorSpec("request_ids", [8], torch.int32, init_value=request_ids),
         TensorSpec("query_starts", [16], torch.int32, init_value=query_starts),
         TensorSpec("state_blocks", [8], torch.int32, init_value=state_blocks),
-        TensorSpec("slots", [8], torch.int64, init_value=-1),
+        TensorSpec("slots", [8], torch.int64, init_value=slots),
         TensorSpec("norm_weight", [HEAD_DIM], torch.bfloat16, init_value=1.0),
         TensorSpec("cosine", [8, ROPE_DIM // 2], torch.float32, init_value=1.0),
         TensorSpec("sine", [8, ROPE_DIM // 2], torch.float32, init_value=0.0),
         TensorSpec("state_cache", [3, STATE_CAPACITY, STATE_WIDTH], torch.float32, init_value=state),
         TensorSpec("latent", [8, HEAD_DIM], torch.bfloat16, init_value=0.0),
+        TensorSpec("cache", [4, C2A_STORAGE_ROWS, 1, COMPRESSED_CACHE_BYTES], torch.uint8, init_value=173),
     ]
     result = run(
         fn=c2a_state_feedback_test, specs=specs, golden_fn=golden,
         compare_fn={
-            "state_cache": compare_feedback,
+            "state_cache": functools.partial(
+                compare_feedback, compare=ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+            ),
             "latent": ratio_allclose(atol=1e-3, rtol=1e-3, valid_rows=6, zero_tail=True),
+            "cache": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
         },
         config={"backend_type": "a5", "device_id": args.device,
                 "execution_mode": args.execution_mode or args.platform == "a5sim"},

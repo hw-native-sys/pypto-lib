@@ -17,17 +17,27 @@ import pypto.language.distributed as pld
 import config
 
 
-def _parse_experts_per_rank():
+def parse_expert_token():
+    flags = ("--experts-per-rank", "--num-tokens", "--num-tokens-per-rank")
+    values = {}
     for index, argument in enumerate(sys.argv):
-        if argument == "--experts-per-rank" and index + 1 < len(sys.argv):
-            return int(sys.argv[index + 1])
-        if argument.startswith("--experts-per-rank="):
-            return int(argument.split("=", 1)[1])
-    return config.N_LOCAL_EXPERTS
+        flag, separator, value = argument.partition("=")
+        if flag not in flags or flag in values:
+            continue
+        if not separator:
+            if index + 1 == len(sys.argv):
+                raise ValueError(f"{flag} requires a value")
+            value = sys.argv[index + 1]
+        values[flag] = value
+    experts = int(values.get("--experts-per-rank", config.N_LOCAL_EXPERTS))
+    tokens = values.get("--num-tokens-per-rank", values.get("--num-tokens", str(config.MOE_TOKENS)))
+    counts = [int(value) for value in tokens.split(",")]
+    return experts, max(config.MOE_TOKENS, max(counts))
 
 
-# Resolve test expert dimensions before importing kernels.
-_experts_per_rank = _parse_experts_per_rank()
+# Resolve entry dimensions before importing kernels.
+_experts_per_rank, _token_capacity = parse_expert_token()
+config.set_moe_tokens((_token_capacity + 15) // 16 * 16)
 _test_experts = config.EP_SIZE * _experts_per_rank
 if _experts_per_rank <= 0 or not config.FLASH.num_experts_per_tok <= _test_experts <= 384:
     raise ValueError("--experts-per-rank must give between TopK and 384 total routed experts")
@@ -35,12 +45,13 @@ config.FLASH = replace(config.FLASH, n_routed_experts=_test_experts)
 config.N_LOCAL_EXPERTS = _experts_per_rank
 
 
-from config import FLASH as M, EP_SIZE, MOE_TOKENS, MOE_RECV_MAX, N_LOCAL_EXPERTS, LOCAL_T_DYN, ROUTE_T_DYN
+from config import FLASH as M, EP_SIZE, MOE_TOKENS, MOE_RECV_MAX, N_LOCAL_EXPERTS, T_DYN, ROUTE_T_DYN
 from gate import gate_from_bf16
 from expert_shared import expert_shared
 from expert_routed import (
     dispatch,
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS, expert_routed_scatter,
+    DISPATCH_PACKET_WIDTH,
 )
 from hc import hc_head_norm_store, hc_project, hc_sinkhorn, hc_post
 
@@ -60,20 +71,44 @@ BALANCED_ROUTING = "--balanced-routing" in sys.argv
 
 # EP transport layout
 RECV_MAX = MOE_RECV_MAX
-AUX_WIDTH = 8
 ROUTE_WIDTH = 8
 T = MOE_TOKENS
 N_RANKS = EP_SIZE
 N_LOCAL = N_LOCAL_EXPERTS
 K_SCALE = D // MX_GROUP
 MAX_PER_SRC = T
-AUX_W = 0
-AUX_PAD = AUX_WIDTH
 IDX_PAD = ROUTE_WIDTH
 SIGNAL_PAD = 128  # 512-byte padded monotonic counter lane
 
 # tiling
 COMBINE_T_TILE = 2
+
+
+@pl.jit.inline(auto_scope=False)
+def initialize_balanced_routes(
+    routes: pl.Out[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+    rank: pl.Scalar[pl.INT32],
+    local_experts: pl.constexpr,
+    topk: pl.constexpr,
+):
+    """Write the equal-token balanced-routing fixture used by the MoE entry."""
+    capacity = pl.tensor.dim(routes, 0)
+    with pl.spmd(32, name_hint="initialize_balanced_routes"):
+        core = pl.tile.get_block_idx()
+        expanded = num_tokens * topk
+        rank_offset = rank * expanded + rank
+        for row in pl.range(core, capacity, 32):
+            values = pl.tile.full([1, 8], dtype=pl.INT32, value=0)
+            for lane in pl.unroll(topk):
+                offset = row * topk + lane + rank_offset
+                peer = offset % N_RANKS
+                expert = offset // N_RANKS % local_experts
+                expert_id = pl.cast(peer * local_experts + expert, pl.INT32)
+                pl.tile.write(values, [0, lane], expert_id)
+            valid_values = pl.set_validshape(values, 1, topk)
+            routes = pl.store(valid_values, [row, 0], routes)
+    return routes
 
 
 @pl.jit.inline(auto_scope=False)
@@ -106,42 +141,45 @@ def combine_scattered(
     moe_epoch: pl.Scalar[pl.INT32],
     topk: pl.constexpr = TOPK,
 ):
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_notify", deps=[scatter_done], allow_early_resolve=False) as notify_tid:
-        for peer in pl.range(N_RANKS):
-            if peer != my_rank:
-                pld.system.notify(target=combine_arrived, peer=peer, offsets=[my_rank, 0, 0], value=moe_epoch, op=pld.NotifyOp.Set)
+    with pl.spmd(N_RANKS, name_hint="combine_notify", deps=[scatter_done], allow_early_resolve=False) as notify_tid:
+        peer = pl.tile.get_block_idx()
+        if peer != my_rank:
+            pld.system.notify(target=combine_arrived, peer=peer, offsets=[my_rank, 0, 0], value=moe_epoch, op=pld.NotifyOp.Set)
 
-    with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="combine_wait",
-        deps=[scatter_done], no_dep_args=[combine_arrived],
-    ) as _cwait_tid:
-        for src in pl.range(N_RANKS):
+    peer_waits = pl.array.create(N_RANKS, pl.TASK_ID)
+    for src in pl.range(N_RANKS):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_wait", deps=[scatter_done], no_dep_args=[combine_arrived]) as peer_wait:
             if src != my_rank:
                 pld.system.defer_wait(signal=combine_arrived, offsets=[src, 0, 0], expected=moe_epoch, cmp=pld.WaitCmp.Ge)
+        peer_waits[src] = peer_wait
+    _cwait_tid = pl.system.task_dummy(deps=[peer_waits])
 
     # Wait for local and peer routed-output stores.
-    with pl.spmd((T + COMBINE_T_TILE - 1) // COMBINE_T_TILE, name_hint="combine_reduce", deps=[_cwait_tid, notify_tid]) as _reduce_tid:
-        t_begin = pl.tile.get_block_idx() * COMBINE_T_TILE
-        for t in pl.range(t_begin, pl.min(t_begin + COMBINE_T_TILE, T)):
-            if t < num_tokens:
-                shared_row = pl.load(shared_output, [t, 0], [1, D])
+    routed_rows = pl.tensor.view(routed_output, [T, topk * D])
+    with pl.spmd(pl.min((T + COMBINE_T_TILE - 1) // COMBINE_T_TILE, 64), name_hint="combine_reduce", deps=[_cwait_tid, notify_tid]) as _reduce_tid:
+        core = pl.tile.get_block_idx()
+        for t in pl.range(core * COMBINE_T_TILE, T, 64 * COMBINE_T_TILE):
+            rows = pl.min(COMBINE_T_TILE, T - t)
+            active_rows = pl.min(rows, pl.max(num_tokens - t, 0))
+            result = pl.tile.full([COMBINE_T_TILE, D], dtype=pl.BF16, value=0.0)
+            if active_rows > 0:
+                shared_row = pl.load(shared_output, [t, 0], [COMBINE_T_TILE, D], valid_shape=[active_rows, D])
                 acc = pl.cast(shared_row, target_type=pl.FP32)
                 for k in pl.pipeline(topk, stage=2):
-                    routed_row = pl.load(routed_output, [t * topk + k, 0], [1, D])
+                    routed_row = pl.load(routed_rows, [t, k * D], [COMBINE_T_TILE, D], valid_shape=[active_rows, D])
                     routed_fp32 = pl.cast(routed_row, target_type=pl.FP32)
                     acc = pl.add(acc, routed_fp32)
                 ffn_row = pl.cast(acc, target_type=pl.BF16, mode="rint")
-                ffn_out = pl.store(ffn_row, [t, 0], ffn_out)
-            else:
-                zero_row = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
-                ffn_out = pl.store(zero_row, [t, 0], ffn_out)
+                result = pl.tile.assemble(result, ffn_row, [0, 0])
+            result_valid = pl.set_validshape(result, rows, D)
+            ffn_out = pl.store(result_valid, [t, 0], ffn_out)
     return _reduce_tid
 
 
 @pl.jit.inline(auto_scope=False)
 def moe(
-    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -160,16 +198,14 @@ def moe(
     shared_w2_scale: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN],
     shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
     shared_w3_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    next_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
-    x_mixed: pl.Out[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
-    x_next: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
+    next_pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
+    x_mixed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    x_next: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
     recv_meta: pld.DistributedTensor,
     recv_x: pld.DistributedTensor,
-    recv_scale: pld.DistributedTensor,
-    recv_weights: pld.DistributedTensor,
     recv_routes: pld.DistributedTensor,
     data_arrived: pld.DistributedTensor,
-    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
+    routed_output: pld.DistributedTensor,
     combine_arrived: pld.DistributedTensor,
     num_tokens: pl.Scalar[pl.INT32],
     ep_rank: pl.Scalar[pl.INT32],
@@ -178,7 +214,7 @@ def moe(
     local_experts: pl.constexpr = N_LOCAL_EXPERTS,
     topk: pl.constexpr = TOPK,
     dispatch_worker_limit: pl.constexpr = 0,
-) -> pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]:
+) -> pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]:
     """Run delayed HC pre-mix, MoE, and residual expansion."""
     t = MOE_TOKENS
     post_mix = pl.create_tensor([t, HC_MULT], dtype=pl.FP32)
@@ -199,9 +235,9 @@ def moe(
             x_norm_mx, x_norm_scale, indices, weights, n_experts=EP_SIZE * local_experts, topk=topk,
         )
         if BALANCED_ROUTING:
-            for token in pl.spmd(num_tokens, name_hint="moe_forced_routes"):
-                forced = pl.load(force_topk, [token, 0], [1, 8], valid_shape=[1, topk])
-                indices = pl.store(forced, [token, 0], indices)
+            dispatch_indices = force_topk
+        else:
+            dispatch_indices = indices
 
         shared_output = pl.create_tensor([t, D], dtype=pl.BF16)
         shared_result = expert_shared(
@@ -220,10 +256,10 @@ def moe(
         recv_count_local = pl.create_tensor([local_experts, 1], dtype=pl.INT32)
         recv_meta_local = pl.create_tensor([EP_SIZE, local_experts], dtype=pl.INT32)
         input_ready = dispatch(
-            indices, x_norm_mx, x_norm_scale, weights,
+            dispatch_indices, x_norm_mx, x_norm_scale, weights,
             recv_x_local, recv_scale_local_backing,
             recv_weight_local, recv_route_local, recv_count_local, recv_meta_local,
-            recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
+            recv_meta, recv_x, recv_routes,
             data_arrived, num_tokens, ep_rank, moe_epoch,
             local_experts=local_experts, topk=topk, dispatch_worker_limit=dispatch_worker_limit,
         )
@@ -252,8 +288,8 @@ def moe(
 
 @pl.jit
 def l2_moe(
-    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -272,13 +308,11 @@ def l2_moe(
     shared_w2_scale: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN],
     shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
     shared_w3_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    next_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
-    x_mixed: pl.Out[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
-    x_next: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
+    next_pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
+    x_mixed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    x_next: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
     recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
-    recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
-    recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
+    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], pl.INT8],
     recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
     data_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
     routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
@@ -287,12 +321,12 @@ def l2_moe(
     ep_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
     force_topk: pl.Tensor[[MOE_TOKENS, TOPK], pl.INT32],
-) -> pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]:
-    x_hc.bind_dynamic(0, LOCAL_T_DYN)
-    pre_mix.bind_dynamic(0, LOCAL_T_DYN)
-    next_pre_mix.bind_dynamic(0, LOCAL_T_DYN)
-    x_mixed.bind_dynamic(0, LOCAL_T_DYN)
-    x_next.bind_dynamic(0, LOCAL_T_DYN)
+) -> pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]:
+    x_hc.bind_dynamic(0, T_DYN)
+    pre_mix.bind_dynamic(0, T_DYN)
+    next_pre_mix.bind_dynamic(0, T_DYN)
+    x_mixed.bind_dynamic(0, T_DYN)
+    x_next.bind_dynamic(0, T_DYN)
     local_num_tokens = pl.read(num_tokens, [ep_rank])
     moe(
         x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
@@ -301,7 +335,7 @@ def l2_moe(
         routed_w3, routed_w3_scale, shared_w1, shared_w1_scale,
         shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
         next_pre_mix, x_mixed, x_next,
-        recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
+        recv_meta, recv_x, recv_routes,
         data_arrived, routed_output, combine_arrived,
         local_num_tokens, ep_rank, moe_epoch, force_topk,
         local_experts=N_LOCAL_EXPERTS, topk=TOPK, dispatch_worker_limit=0,
@@ -341,9 +375,7 @@ def l3_moe(
 ):
     """EP host driver for the HC-wrapped Flash MoE block."""
     recv_meta_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-    recv_x_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
-    recv_scale_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
-    recv_weights_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
+    recv_x_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], dtype=pl.INT8)
     recv_routes_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
     data_arrived_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
     routed_output_buf = pld.alloc_window_buffer([MOE_TOKENS * TOPK, D], dtype=pl.BF16)
@@ -352,9 +384,7 @@ def l3_moe(
     rank_count = pld.world_size()
     for r in pl.range(rank_count):
         recv_meta = pld.window(recv_meta_buf, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-        recv_x = pld.window(recv_x_buf, [N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
-        recv_scale = pld.window(recv_scale_buf, [N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
-        recv_weights = pld.window(recv_weights_buf, [N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
+        recv_x = pld.window(recv_x_buf, [N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], dtype=pl.INT8)
         recv_routes = pld.window(recv_routes_buf, [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
         data_arrived = pld.window(data_arrived_buf, [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
         routed_output = pld.window(routed_output_buf, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
@@ -373,7 +403,7 @@ def l3_moe(
             routed_w3[r], routed_w3_scale_r, shared_w1[r], shared_w1_scale_r,
             shared_w2[r], shared_w2_scale_r, shared_w3[r], shared_w3_scale_r,
             next_pre_mix[r], x_mixed[r], x_next[r],
-            recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
+            recv_meta, recv_x, recv_routes,
             data_arrived, routed_output, combine_arrived,
             num_tokens, r, moe_epoch, force_topk[r], device=r,
         )
@@ -519,8 +549,7 @@ def build_moe_specs(num_tokens=MOE_TOKENS, *, initialize=True):
 def golden_moe(tensors):
     """Compose the validated HC references around the MoE reference."""
     import torch
-    from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_post
-    from rmsnorm import golden_rms_norm_tiled
+    from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_norm, golden_hc_post
     from gate import golden_gate_normalized_core
     from expert_shared import golden_expert_shared
     from expert_routed import golden_expert_routed
@@ -563,7 +592,7 @@ def golden_moe(tensors):
         indices = torch.zeros(MOE_TOKENS, TOPK, dtype=torch.int32)
         weights = torch.zeros(MOE_TOKENS, TOPK, dtype=torch.float32)
         golden_gate_normalized_core({
-            "x_normed": golden_rms_norm_tiled(x_mixed[src], tensors['norm_weight'][src]),
+            "x_normed": golden_hc_norm(x_mixed[src], tensors['norm_weight'][src]),
             "gate_w": tensors["gate_weight"][src],
             "gate_bias": tensors["correction_bias"][src],
             "num_tokens": active,

@@ -2,7 +2,7 @@ name: Daily CI
 
 on:
   schedule:
-    - cron: '51 18 * * *'  # UTC 18:51 = Shanghai 02:51
+    - cron: '51 11 * * *'  # UTC 11:51 = Shanghai 19:51
   workflow_dispatch:
     inputs:
       performance_only:
@@ -69,6 +69,9 @@ jobs:
           build-namespace: ${{ matrix.platform }}
           pip-cache-name: pip-sim
           toolchain: bundle
+          # The V4.1-Flash tree (a5sim leg) builds against this pypto revision;
+          # a2a3sim keeps following origin HEAD.
+          pypto-ref: ${{ matrix.platform == 'a5sim' && '3db18db1286bdbb44266179e3aedae659174b711' || '' }}
           # a5sim is the MXFP8 leg: the V4.1-Flash tree holds every MX scale in
           # a torch.float8_e8m0fnu tensor, which 2.6 does not have. 20 of the 24
           # a5sim failures in the 2026-09-19 nightly were that one
@@ -174,6 +177,9 @@ jobs:
           toolchain: bundle
           # A5 MXFP8 entries require float8_e8m0fnu from newer Torch.
           torch-version: 'torch==2.10.0'
+          # The V4.1-Flash model tree (a5 leg) builds against this pypto
+          # revision; a2a3 keeps following origin HEAD.
+          pypto-ref: ${{ matrix.platform == 'a5' && '3db18db1286bdbb44266179e3aedae659174b711' || '' }}
 
       - name: Select all device models
         id: selection
@@ -262,6 +268,9 @@ jobs:
           pip-cache-name: pip-operator-performance-${{ matrix.platform }}
           toolchain: bundle
           torch-version: 'torch==2.10.0'
+          # The V4.1-Flash operator cases (a5 leg) build against this pypto
+          # revision; a2a3 keeps following origin HEAD.
+          pypto-ref: ${{ matrix.platform == 'a5' && '3db18db1286bdbb44266179e3aedae659174b711' || '' }}
 
       - name: Run operator performance cases
         id: perf

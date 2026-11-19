@@ -15,7 +15,7 @@ import pypto.language as pl
 from pypto.runtime import pto_isa_include_dir
 import torch
 
-from config import FLASH as M, TP_SIZE
+from config import FLASH as M
 from gemm import (
     MX_M_TILE, MX_K_TILE,
     golden_gemm_bf16_via_mxfp8_to_bf16_sequential, golden_mxfp8_linear_grouped_sum,
@@ -35,7 +35,7 @@ QB_SCALE_COLS = pl.dynamic("QB_SCALE_COLS")
 QB_OUTPUT_ROWS = pl.dynamic("QB_OUTPUT_ROWS")
 
 # model config
-LOCAL_H = M.num_attention_heads // TP_SIZE
+LOCAL_H = M.num_attention_heads
 D = M.hidden_size
 HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
@@ -45,8 +45,17 @@ Q_LORA = M.q_lora_rank
 Q_A_N_TILE = 64
 Q_B_N_TILE = 256
 KV_N_TILE = 64
+QKV_SCALE_TILE = MX_M_TILE * MX_K_TILE // 32
 PROJ_M_TILE = 80
+PROJ_WIDE_M_TILE = 128
 WINDOW_PUBLISH_WORKER_TILE = 12
+NATIVE_VALIDATION_WORKERS = 32
+WINDOW_HEAD_DIM = 512
+WINDOW_PAGE_SIZE = 128
+
+# Window tiling.
+WINDOW_ROW_TILE = 8
+WINDOW_SLOT_TILE = 128
 
 
 @pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "proj_q_a.cpp",
@@ -99,17 +108,148 @@ def _proj_kv(
     return output
 
 
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "qkv_quant.cpp",
-               include_dirs=(pto_isa_include_dir(),))
+@pl.jit.inline(auto_scope=False)
+def _load_qkv_work(
+    x: pl.Tensor,
+    inputs: pl.Tile[[2 * MX_M_TILE, MX_K_TILE], pl.BF16, pl.Mem.Vec],
+    work: pl.Scalar[pl.INDEX],
+    slot: pl.Scalar[pl.INDEX],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    t0 = work // (D // MX_K_TILE) * MX_M_TILE
+    k0 = work % (D // MX_K_TILE) * MX_K_TILE
+    rows = pl.max(0, pl.min(MX_M_TILE, num_tokens - t0))
+    if rows > 0:
+        input_row = slot * MX_M_TILE
+        inputs = pl.tile.gather_row(inputs, x, [input_row, 0], [t0, k0], [MX_M_TILE, MX_K_TILE],
+                                    valid_shape=[rows, MX_K_TILE])
+    return inputs
+
+
+@pl.jit.incore
 def qkv_quant(
     x: pl.Tensor,
     payload: pl.Out[pl.Tensor],
     scales: pl.Out[pl.Tensor],
     num_tokens: pl.Scalar[pl.INT32],
     padded_rows: pl.Scalar[pl.INDEX],
-):
-    """Quantize BF16 projection inputs with M16-packed E8M0 scales."""
-    ...
+) -> tuple[pl.Tensor, pl.Tensor]:
+    """Quantize row-major BF16 projection inputs with M16-packed E8M0 scales."""
+    first = pl.tile.get_block_idx()
+    workers = pl.tile.get_block_num()
+    column_tiles = D // MX_K_TILE
+    total = padded_rows // MX_M_TILE * column_tiles
+    if first < total:
+        inputs = pl.create_tile([2 * MX_M_TILE, MX_K_TILE], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+        output = pl.create_tile([2 * MX_M_TILE * MX_K_TILE], dtype=pl.INT8, target_memory=pl.Mem.Vec)
+        # Reserve a full 256-byte register store per scale slot.
+        codes = pl.create_tile([QKV_SCALE_TILE], dtype=pl.UINT32, target_memory=pl.Mem.Vec)
+        inputs = _load_qkv_work(x, inputs, first, 0, num_tokens)
+        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, 0)
+        pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, 0)
+        pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, 1)
+        rounds = (total - first + workers - 1) // workers
+        for iteration in pl.range(rounds):
+            work = first + iteration * workers
+            slot = iteration % 2
+            next_slot = 1 - slot
+            next_work = work + workers
+            # Prefetch the next tile while the vector pipe consumes the current slot.
+            if next_work < total:
+                if iteration > 0:
+                    pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, next_slot)
+                inputs = _load_qkv_work(x, inputs, next_work, next_slot, num_tokens)
+                pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, next_slot)
+            t0 = work // column_tiles * MX_M_TILE
+            k0 = work % column_tiles * MX_K_TILE
+            rows = pl.max(0, pl.min(MX_M_TILE, num_tokens - t0))
+            source = pl.reshape(inputs, [2 * MX_M_TILE * MX_K_TILE])
+            pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.V, slot)
+            pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, slot)
+            output_words = pl.reinterpret_view(output, pl.UINT32, shape=[2 * MX_M_TILE * MX_K_TILE // 4])
+            with pl.reg_scope():
+                # Keep aligned row and slot offsets visible to register lowering.
+                slot_row = slot * MX_M_TILE
+                code_offset = slot * (QKV_SCALE_TILE // 2)
+                full = pl.reg.full_mask(lanes=MX_K_TILE)
+                groups = pl.reg.full_mask(lanes=MX_K_TILE // 32)
+                packed_mask = pl.reg.full_mask(lanes=64)
+                # Eight words per group pair hold two rows of scale bytes each.
+                lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
+                pair_mask = pl.reg.broadcast(3, lanes=64, dtype=pl.UINT32)
+                pair_index = pl.reg.shift_rights(lane, 3, packed_mask)
+                pair_index = pl.reg.bitwise_and(pair_index, pair_mask, packed_mask)
+                low_index = pl.reg.shift_lefts(pair_index, 4, packed_mask)
+                high_index = pl.reg.adds(low_index, 8, packed_mask)
+                row_mask = pl.reg.broadcast(7, lanes=64, dtype=pl.UINT32)
+                row_indices = pl.reg.bitwise_and(lane, row_mask, packed_mask)
+                zero = pl.reg.broadcast(0, lanes=64, dtype=pl.UINT32)
+                for row, (packed_scales,) in pl.hardware_loop(rows, init_values=(zero,)):
+                    tile_row = slot_row + row
+                    offset = tile_row * MX_K_TILE
+                    raw = pl.reg.load(source, offset, lanes=MX_K_TILE)
+                    value = pl.reg.convert(raw, dtype=pl.FP32)
+                    magnitude = pl.reg.abs(value, full)
+                    maximum = pl.reg.reduce_max(magnitude, full, group_size=32)
+                    maximum_bits = pl.reg.interpret_cast(maximum, dtype=pl.INT32)
+                    exponent = pl.reg.shift_rights(maximum_bits, 23, groups)
+                    exponent = pl.reg.adds(exponent, -8, groups)
+                    exponent = pl.reg.maximums(exponent, 0, groups)
+                    nonzero = pl.reg.minimums(exponent, 1, groups)
+                    reciprocal_code = pl.reg.muls(exponent, -1, groups)
+                    reciprocal_code = pl.reg.adds(reciprocal_code, 254, groups)
+                    reciprocal_code = pl.reg.mul(reciprocal_code, nonzero, groups)
+                    reciprocal_bits = pl.reg.shift_lefts(reciprocal_code, 23, groups)
+                    reciprocal = pl.reg.interpret_cast(reciprocal_bits, dtype=pl.FP32)
+                    reciprocal = pl.reg.group_broadcast(reciprocal, lanes=MX_K_TILE)
+                    value = pl.reg.mul(value, reciprocal, full)
+                    value = pl.reg.maximums(value, -448.0, full)
+                    value = pl.reg.minimums(value, 448.0, full)
+                    fp8 = pl.reg.convert(value, dtype=pl.FP8E4M3FN, rounding="R", saturate=False)
+                    words = pl.reg.interpret_cast(fp8, dtype=pl.UINT32)
+                    word_offset = tile_row * (MX_K_TILE // 4)
+                    _payload = pl.reg.store(output_words, word_offset, words)
+
+                    scale_words = pl.reg.interpret_cast(exponent, dtype=pl.UINT32)
+                    scale_words = pl.reg.group_broadcast(scale_words, lanes=64)
+                    low = pl.reg.gather_lanes(scale_words, low_index)
+                    high = pl.reg.gather_lanes(scale_words, high_index)
+                    high = pl.reg.shift_lefts(high, 8, packed_mask)
+                    pair = pl.reg.bitwise_or(low, high, packed_mask)
+                    bit = pl.cast((row % 2) * 16, pl.INT16)
+                    pair = pl.reg.shift_lefts(pair, bit, packed_mask)
+                    word = pl.cast(row // 2, pl.UINT32)
+                    row_selected = pl.reg.compares(row_indices, word, packed_mask, predicate="eq")
+                    pair = pl.reg.select(row_selected, pair, zero)
+                    updated_scales = pl.reg.bitwise_or(packed_scales, pair, packed_mask)
+                    packed_scales = pl.yield_(updated_scales)
+                _scales = pl.reg.store(codes, code_offset, packed_scales)
+                padding = pl.reg.broadcast(0, lanes=MX_K_TILE // 4, dtype=pl.UINT32)
+                for inactive in pl.hardware_loop(MX_M_TILE - rows):
+                    row = rows + inactive
+                    tile_row = slot_row + row
+                    word_offset = tile_row * (MX_K_TILE // 4)
+                    _payload_pad = pl.reg.store(output_words, word_offset, padding)
+            pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE2, slot)
+            pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE3, slot)
+            pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE3, slot)
+            output_rows = pl.reshape(output, [2 * MX_M_TILE, MX_K_TILE])
+            output_tile = pl.tile.slice(output_rows, [MX_M_TILE, MX_K_TILE], [slot * MX_M_TILE, 0])
+            quantized = pl.reinterpret_view(output_tile, pl.FP8E4M3FN)
+            scale_bytes = pl.reinterpret_view(codes, pl.UINT8, shape=[2, 2 * QKV_SCALE_TILE])
+            scale_tile = pl.tile.slice(scale_bytes, [1, QKV_SCALE_TILE], [slot, 0])
+            scale_codes = pl.reinterpret_view(scale_tile, pl.FP8E8M0)
+            scale_offset = t0 * (D // 32) + k0 // MX_K_TILE * QKV_SCALE_TILE
+            pl.store(quantized, [t0, k0], payload)
+            pl.store(scale_codes, [0, scale_offset], scales)
+            pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, slot)
+        pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, 0)
+        if rounds > 1:
+            pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, 1)
+        pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 0)
+        pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 1)
+        pl.system.barrier(pipe=pl.PipeType.ALL)
+    return payload, scales
 
 
 @pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "q_norm_quant.cpp",
@@ -135,15 +275,15 @@ def quantize_projection_input(
     """Quantize shared Q/KV inputs with padded rows and M16-packed scales."""
     capacity = pl.tensor.dim(x, 0)
     projection_rows = ((capacity + row_tile - 1) // row_tile) * row_tile
-    # Index-Q reads M80-padded input rows.
+    # Shared input covers both native projection row tiles.
     index_rows = ((capacity + PROJ_M_TILE - 1) // PROJ_M_TILE) * PROJ_M_TILE
     padded_rows = pl.max(projection_rows, index_rows)
     payload = pl.create_tensor([padded_rows, D], dtype=pl.FP8E4M3FN)
     scales = pl.create_tensor([1, padded_rows * (D // 32)], dtype=pl.FP8E8M0)
     quant_blocks = (padded_rows // MX_M_TILE) * (D // MX_K_TILE)
-    workers = pl.min(pl.min(quant_blocks, 32), 2 * pl.system.available_cluster_count())
+    workers = pl.min(quant_blocks, 2 * pl.system.available_cluster_count())
     with pl.spmd(workers, name_hint="qkv_quant"):
-        qkv_quant(x, payload, scales, num_tokens, padded_rows)
+        payload, scales = qkv_quant(x, payload, scales, num_tokens, padded_rows)
     return payload, scales, padded_rows
 
 
@@ -168,49 +308,47 @@ def q_proj_rope(
     qb_row_tile: pl.constexpr = 80,
 ):
     """Project NZ QA/QB weights, rotate Q, and retain normalized rows for Index-Q."""
-    # Native QA tiles: M80/N64 or M256/N128; QB tiles: M80/N256 or M128/N256.
-    if qa_row_tile == 256:
-        qa_n_tile = 128
-    else:
+    # Native QA tiles: M80/N64, M128/N128, or M256/N128; QB tiles: M80/N256 or M128/N256.
+    qa_tile = qa_row_tile
+    # Minimize padded row work; equal padding selects the wider tile.
+    narrow_rows = ((num_tokens + PROJ_M_TILE - 1) // PROJ_M_TILE) * PROJ_M_TILE
+    wide_rows = ((num_tokens + PROJ_WIDE_M_TILE - 1) // PROJ_WIDE_M_TILE) * PROJ_WIDE_M_TILE
+    if qa_row_tile == PROJ_M_TILE:
+        if wide_rows <= narrow_rows:
+            if padded_rows >= wide_rows:
+                qa_tile = PROJ_WIDE_M_TILE
+    if qa_tile == 80:
         qa_n_tile = Q_A_N_TILE
-    payload_rows = padded_rows
+    else:
+        qa_n_tile = 128
+    qb_tile = qb_row_tile
+    if qb_row_tile == PROJ_M_TILE:
+        if wide_rows <= narrow_rows:
+            qb_tile = PROJ_WIDE_M_TILE
+    qb_padded_rows = ((num_tokens + qb_tile - 1) // qb_tile) * qb_tile
+    payload_rows = pl.max(padded_rows, qb_padded_rows)
     qb_payload = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.FP8E4M3FN)
     qb_scales = pl.create_tensor([1, payload_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
     projected = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.BF16)
-    qa_tasks = ((num_tokens + qa_row_tile - 1) // qa_row_tile) * (Q_LORA // qa_n_tile)
+    qa_tasks = ((num_tokens + qa_tile - 1) // qa_tile) * (Q_LORA // qa_n_tile)
     qa_workers = pl.max(pl.min(qa_tasks, qa_worker_limit), 1)
     with pl.spmd(qa_workers, name_hint="proj_q_a"):
-        projected = _proj_q_a(payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_row_tile)
-    norm_workers = pl.max(pl.min(payload_rows // MX_M_TILE, 32), 1)
+        projected = _proj_q_a(payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_tile)
+    norm_workers = pl.max(pl.min(payload_rows // (MX_M_TILE // 2), 32), 1)
     latent_rows = pl.tensor.dim(query_latent, 0)
     norm_latent = pl.tensor.slice(query_latent, [latent_rows, Q_LORA], [0, 0])
     norm_payload = pl.tensor.slice(qb_payload, [payload_rows, Q_LORA], [0, 0])
     norm_scales = pl.tensor.slice(qb_scales, [1, payload_rows * (Q_LORA // 32)], [0, 0])
     with pl.spmd(norm_workers, name_hint="q_norm_quant"):
         q_norm_quant(projected, q_norm_weight, norm_latent, norm_payload, norm_scales, num_tokens)
-    qb_tasks = ((num_tokens + qb_row_tile - 1) // qb_row_tile) * (LOCAL_H * HEAD_DIM // Q_B_N_TILE)
-    qb_workers = pl.max(pl.min(qb_tasks, qb_worker_limit), 1)
+    qb_tasks = ((num_tokens + qb_tile - 1) // qb_tile) * (LOCAL_H * HEAD_DIM // Q_B_N_TILE)
+    qb_workers = pl.max(pl.min(qb_tasks, pl.min(qb_worker_limit, pl.system.available_cluster_count())), 1)
     with pl.spmd(qb_workers, name_hint="proj_q_b"):
         query = _proj_q_b(
             qb_payload, wq_b, qb_scales, wq_b_scale,
-            query, rope_cos, rope_sin, num_tokens, LOCAL_H * HEAD_DIM, 0, qb_row_tile,
+            query, rope_cos, rope_sin, num_tokens, LOCAL_H * HEAD_DIM, 0, qb_tile,
         )
     return query_latent, query, qb_payload, qb_scales
-
-
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "norm_rope_publish.cpp",
-               include_dirs=(pto_isa_include_dir(),))
-def norm_rope_publish(
-    source: pl.Tensor,
-    weight: pl.Tensor,
-    cosine: pl.Tensor,
-    sine: pl.Tensor,
-    slots: pl.Tensor,
-    cache: pl.InOut[pl.Tensor],
-    num_tokens: pl.Scalar[pl.INT32],
-) -> pl.Tensor:
-    """Normalize and rotate BF16 rows, then quantize and publish group-32 FP8 cache pages."""
-    ...
 
 
 @pl.jit.inline(auto_scope=False)
@@ -231,10 +369,273 @@ def kv_proj(
     else:
         n_tile = KV_N_TILE
     tasks = ((num_tokens + row_tile - 1) // row_tile) * (HEAD_DIM // n_tile)
-    workers = pl.max(pl.min(tasks, worker_limit), 1)
+    workers = pl.max(pl.min(tasks, pl.min(worker_limit, pl.system.available_cluster_count())), 1)
     with pl.spmd(workers, name_hint="proj_kv", sync_start=True):
         kv_projection = _proj_kv(payload, wkv, scales, wkv_scale, kv_projection, num_tokens, 0, row_tile)
     return kv_projection
+
+
+@pl.jit.inline(auto_scope=False)
+def _window_postprocess(
+    raw: pl.Tile[[WINDOW_ROW_TILE * WINDOW_HEAD_DIM], pl.BF16, pl.Mem.Vec],
+    weight: pl.Tile[[WINDOW_HEAD_DIM], pl.BF16, pl.Mem.Vec],
+    cosine: pl.Tile[[WINDOW_ROW_TILE * 32], pl.FP32, pl.Mem.Vec],
+    sine: pl.Tile[[WINDOW_ROW_TILE * 32], pl.FP32, pl.Mem.Vec],
+    rows: pl.Scalar[pl.INDEX],
+):
+    packed = pl.tile.create([WINDOW_ROW_TILE * WINDOW_HEAD_DIM], dtype=pl.UINT8, target_memory=pl.Mem.Vec)
+    factors = pl.tile.create([WINDOW_ROW_TILE * 8], dtype=pl.UINT32, target_memory=pl.Mem.Vec)
+    with pl.reg_scope():
+        full = pl.reg.full_mask(lanes=64)
+        lower = pl.reg.active_mask(32, lanes=64)
+        upper = pl.reg.mask_not(lower)
+        first_index = pl.reg.broadcast(0, lanes=64, dtype=pl.UINT32)
+        last_lane = pl.reg.broadcast(63, lanes=64, dtype=pl.UINT32)
+        one = pl.reg.broadcast(1.0, lanes=64, dtype=pl.FP32)
+        scale_words = pl.reg.broadcast(0, lanes=64, dtype=pl.UINT32)
+        for row in pl.hardware_loop(rows):
+            partials = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+            lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
+            for chunk in pl.hardware_loop(4):
+                left_bf = pl.reg.load(raw, row * WINDOW_HEAD_DIM + chunk * 64, lanes=64)
+                right_bf = pl.reg.load(raw, row * WINDOW_HEAD_DIM + 256 + chunk * 64, lanes=64)
+                left = pl.reg.convert(left_bf, dtype=pl.FP32)
+                right = pl.reg.convert(right_bf, dtype=pl.FP32)
+                square = pl.reg.add(pl.reg.mul(left, left, full), pl.reg.mul(right, right, full), full)
+                partial = pl.reg.reduce_sum(square, full, reassoc=True)
+                partial = pl.reg.broadcast(partial, lanes=64, dtype=pl.FP32)
+                slot_index = pl.cast(chunk, pl.UINT32)
+                slot = pl.reg.compares(lane, slot_index, full, predicate="eq")
+                partials = pl.reg.select(slot, partial, partials)
+            partial_mask = pl.reg.active_mask(4, lanes=64)
+            total = pl.reg.reduce_sum(partials, partial_mask, reassoc=True)
+            total = pl.reg.broadcast(total, lanes=64, dtype=pl.FP32)
+            variance = pl.reg.adds(pl.reg.muls(total, 1.0 / WINDOW_HEAD_DIM, full), 1.0e-6, full)
+            reciprocal = pl.reg.div(one, variance, full)
+            root = pl.reg.sqrt(reciprocal, full)
+            product = pl.reg.mul(pl.reg.muls(variance, -0.5, full), root, full)
+            three_halves = pl.reg.broadcast(1.5, lanes=64, dtype=pl.FP32)
+            factor = pl.reg.mula(three_halves, product, root, full)
+            inverse = pl.reg.mul(root, factor, full)
+            negative_variance = pl.reg.muls(variance, -1.0, full)
+            correction = pl.reg.mula(one, negative_variance, reciprocal, full)
+            negative_inverse = pl.reg.muls(inverse, -1.0, full)
+            error = pl.reg.mula(reciprocal, negative_inverse, inverse, full)
+            correction = pl.reg.mula(correction, variance, error, full)
+            correction = pl.reg.mul(correction, inverse, full)
+            half = pl.reg.broadcast(0.5, lanes=64, dtype=pl.FP32)
+            inverse = pl.reg.mula(inverse, correction, half, full)
+            variance_bits = pl.reg.interpret_cast(variance, dtype=pl.UINT32)
+            is_infinite = pl.reg.compares(variance_bits, 2139095040, full, predicate="eq")
+            is_zero = pl.reg.compares(variance_bits, 0, full, predicate="eq")
+            zero = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+            infinity_bits = pl.reg.broadcast(2139095040, lanes=64, dtype=pl.UINT32)
+            infinity = pl.reg.interpret_cast(infinity_bits, dtype=pl.FP32)
+            inverse = pl.reg.select(is_infinite, zero, inverse)
+            inverse = pl.reg.select(is_zero, infinity, inverse)
+            cos = pl.reg.load(cosine, row * 32, lanes=64)
+            sin = pl.reg.load(sine, row * 32, lanes=64)
+            for segment in pl.hardware_loop(WINDOW_HEAD_DIM // 64 - 1):
+                offset = row * WINDOW_HEAD_DIM + segment * 64
+                value = pl.reg.convert(pl.reg.load(raw, offset, lanes=64), dtype=pl.FP32)
+                gain = pl.reg.convert(pl.reg.load(weight, segment * 64, lanes=64), dtype=pl.FP32)
+                normalized = pl.reg.mul(pl.reg.mul(value, inverse, full), gain, full)
+                bf = pl.reg.convert(normalized, dtype=pl.BF16, rounding="R", saturate=False)
+                value = pl.reg.convert(bf, dtype=pl.FP32)
+                magnitude = pl.reg.abs(value, full)
+                lo = pl.reg.broadcast(pl.reg.reduce_max(magnitude, lower), lanes=64, dtype=pl.FP32)
+                hi = pl.reg.broadcast(pl.reg.reduce_max(magnitude, upper), lanes=64, dtype=pl.FP32)
+                maximum = pl.reg.select(lower, lo, hi)
+                scale = pl.reg.muls(pl.reg.maximums(maximum, 1.0e-4, full), 1.0 / 448.0, full)
+                scale_exponent_bits = pl.reg.interpret_cast(scale, dtype=pl.INT32)
+                rounded_bits = pl.reg.adds(scale_exponent_bits, 8388607, full)
+                exponent = pl.reg.shift_rights(rounded_bits, 23, full)
+                power_bits = pl.reg.shift_lefts(exponent, 23, full)
+                scale = pl.reg.interpret_cast(power_bits, dtype=pl.FP32)
+                quantized = pl.reg.div(value, scale, full)
+                fp8 = pl.reg.convert(quantized, dtype=pl.FP8E4M3FN, rounding="R", saturate=False)
+                bytes8 = pl.reg.interpret_cast(fp8, dtype=pl.UINT8)
+                _packed = pl.reg.store(packed, offset, bytes8)
+                # Pack two BF16 scale codes per segment.
+                scale_bits = pl.reg.interpret_cast(scale, dtype=pl.UINT32)
+                high_bits = pl.reg.gather_lanes(scale_bits, last_lane)
+                low_bits = pl.reg.shift_rights(scale_bits, 16, full)
+                codes = pl.reg.bitwise_or(low_bits, high_bits, full)
+                code_index = row * 8 + segment
+                before = pl.reg.active_mask(code_index, lanes=64)
+                through = pl.reg.active_mask(code_index + 1, lanes=64)
+                code_lane = pl.reg.mask_xor(before, through)
+                code_word = pl.reg.gather_lanes(codes, first_index)
+                scale_words = pl.reg.select(code_lane, code_word, scale_words)
+            offset = row * WINDOW_HEAD_DIM + (WINDOW_HEAD_DIM // 64 - 1) * 64
+            value = pl.reg.convert(pl.reg.load(raw, offset, lanes=64), dtype=pl.FP32)
+            gain = pl.reg.convert(pl.reg.load(weight, (WINDOW_HEAD_DIM // 64 - 1) * 64, lanes=64), dtype=pl.FP32)
+            normalized = pl.reg.mul(pl.reg.mul(value, inverse, full), gain, full)
+            bf = pl.reg.convert(normalized, dtype=pl.BF16, rounding="R", saturate=False)
+            value = pl.reg.convert(bf, dtype=pl.FP32)
+            even, odd = pl.reg.dintlv(value, value, full)
+            real = pl.reg.sub(pl.reg.mul(even, cos, lower), pl.reg.mul(odd, sin, lower), lower)
+            imag = pl.reg.add(pl.reg.mul(even, sin, lower), pl.reg.mul(odd, cos, lower), lower)
+            rotated, _unused = pl.reg.intlv(real, imag, full)
+            bf = pl.reg.convert(rotated, dtype=pl.BF16, rounding="R", saturate=False)
+            value = pl.reg.convert(bf, dtype=pl.FP32)
+            magnitude = pl.reg.abs(value, full)
+            lo = pl.reg.broadcast(pl.reg.reduce_max(magnitude, lower), lanes=64, dtype=pl.FP32)
+            hi = pl.reg.broadcast(pl.reg.reduce_max(magnitude, upper), lanes=64, dtype=pl.FP32)
+            maximum = pl.reg.select(lower, lo, hi)
+            scale = pl.reg.muls(pl.reg.maximums(maximum, 1.0e-4, full), 1.0 / 448.0, full)
+            scale_exponent_bits = pl.reg.interpret_cast(scale, dtype=pl.INT32)
+            rounded_bits = pl.reg.adds(scale_exponent_bits, 8388607, full)
+            exponent = pl.reg.shift_rights(rounded_bits, 23, full)
+            power_bits = pl.reg.shift_lefts(exponent, 23, full)
+            scale = pl.reg.interpret_cast(power_bits, dtype=pl.FP32)
+            quantized = pl.reg.div(value, scale, full)
+            fp8 = pl.reg.convert(quantized, dtype=pl.FP8E4M3FN, rounding="R", saturate=False)
+            bytes8 = pl.reg.interpret_cast(fp8, dtype=pl.UINT8)
+            _packed = pl.reg.store(packed, offset, bytes8)
+            # Pack two BF16 scale codes per segment.
+            scale_bits = pl.reg.interpret_cast(scale, dtype=pl.UINT32)
+            high_bits = pl.reg.gather_lanes(scale_bits, last_lane)
+            low_bits = pl.reg.shift_rights(scale_bits, 16, full)
+            codes = pl.reg.bitwise_or(low_bits, high_bits, full)
+            code_index = row * 8 + (WINDOW_HEAD_DIM // 64 - 1)
+            before = pl.reg.active_mask(code_index, lanes=64)
+            through = pl.reg.active_mask(code_index + 1, lanes=64)
+            code_lane = pl.reg.mask_xor(before, through)
+            code_word = pl.reg.gather_lanes(codes, first_index)
+            scale_words = pl.reg.select(code_lane, code_word, scale_words)
+        _factors = pl.reg.store(factors, 0, scale_words)
+    return packed, factors
+
+
+@pl.jit.inline(auto_scope=False)
+def _flush_window(
+    inputs: pl.Tile[[WINDOW_ROW_TILE, WINDOW_HEAD_DIM], pl.BF16, pl.Mem.Vec],
+    weight: pl.Tile[[WINDOW_HEAD_DIM], pl.BF16, pl.Mem.Vec],
+    cosine: pl.Tile[[WINDOW_ROW_TILE, 32], pl.FP32, pl.Mem.Vec],
+    sine: pl.Tile[[WINDOW_ROW_TILE, 32], pl.FP32, pl.Mem.Vec],
+    targets: pl.Tile[[WINDOW_ROW_TILE], pl.INT64, pl.Mem.Vec],
+    rows: pl.Scalar[pl.INDEX],
+    cache: pl.Tensor,
+):
+    raw = pl.reshape(inputs, [WINDOW_ROW_TILE * WINDOW_HEAD_DIM])
+    cos = pl.reshape(cosine, [WINDOW_ROW_TILE * 32])
+    sin = pl.reshape(sine, [WINDOW_ROW_TILE * 32])
+    # Expose the populated prefix as valid columns for the specialized VF calls.
+    raw = pl.reshape(raw, [1, WINDOW_ROW_TILE * WINDOW_HEAD_DIM])
+    raw = pl.tile.slice(raw, [1, WINDOW_ROW_TILE * WINDOW_HEAD_DIM], [0, 0], valid_shape=[1, rows * WINDOW_HEAD_DIM])
+    raw = pl.reshape(raw, [WINDOW_ROW_TILE * WINDOW_HEAD_DIM])
+    cos = pl.reshape(cos, [1, WINDOW_ROW_TILE * 32])
+    cos = pl.tile.slice(cos, [1, WINDOW_ROW_TILE * 32], [0, 0], valid_shape=[1, rows * 32])
+    cos = pl.reshape(cos, [WINDOW_ROW_TILE * 32])
+    sin = pl.reshape(sin, [1, WINDOW_ROW_TILE * 32])
+    sin = pl.tile.slice(sin, [1, WINDOW_ROW_TILE * 32], [0, 0], valid_shape=[1, rows * 32])
+    sin = pl.reshape(sin, [WINDOW_ROW_TILE * 32])
+    # A constant row count lets PTOAS prove the VF buffers do not overlap.
+    if rows == 2:
+        payload, factors = _window_postprocess(raw, weight, cos, sin, 2)
+    elif rows == 3:
+        payload, factors = _window_postprocess(raw, weight, cos, sin, 3)
+    elif rows == 4:
+        payload, factors = _window_postprocess(raw, weight, cos, sin, 4)
+    elif rows == 5:
+        payload, factors = _window_postprocess(raw, weight, cos, sin, 5)
+    elif rows == 6:
+        payload, factors = _window_postprocess(raw, weight, cos, sin, 6)
+    elif rows == 7:
+        payload, factors = _window_postprocess(raw, weight, cos, sin, 7)
+    else:
+        # Keep the dynamic one-row tail: PTOAS 0.72 exhausts its layout search
+        # when specializing it. A full batch reaches here with constant WINDOW_ROW_TILE.
+        payload, factors = _window_postprocess(raw, weight, cos, sin, rows)
+    payload_rows = pl.reshape(payload, [WINDOW_ROW_TILE, WINDOW_HEAD_DIM])
+    factor_bytes = pl.reinterpret_view(factors, pl.UINT8)
+    factor_rows = pl.reshape(factor_bytes, [WINDOW_ROW_TILE, WINDOW_HEAD_DIM // 16])
+    for (row,) in pl.while_(init_values=(pl.cast(0, pl.INDEX),)):
+        pl.cond(row < rows)
+        slot = pl.tile.read(targets, [row])
+        count = 1
+        scanning = True
+        while row + count < rows and scanning:
+            next_slot = pl.tile.read(targets, [row + count])
+            if next_slot == slot + count:
+                count = count + 1
+            else:
+                scanning = False
+        value = pl.tile.slice(payload_rows, [WINDOW_ROW_TILE, WINDOW_HEAD_DIM], [row, 0], valid_shape=[count, WINDOW_HEAD_DIM])
+        factor = pl.tile.slice(factor_rows, [WINDOW_ROW_TILE, WINDOW_HEAD_DIM // 16], [row, 0], valid_shape=[count, WINDOW_HEAD_DIM // 16])
+        _payload = pl.store(value, [slot, 0], cache)
+        _scales = pl.store(factor, [slot, WINDOW_HEAD_DIM], cache)
+        next_row = row + count
+        final_row = pl.yield_(next_row)
+    return cache
+
+
+@pl.jit.incore
+def norm_rope_publish(
+    source: pl.Tensor,
+    weight: pl.Tensor,
+    cosine: pl.Tensor,
+    sine: pl.Tensor,
+    slots: pl.Tensor,
+    cache: pl.InOut[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+) -> pl.Tensor:
+    """Normalize, rotate, quantize, and publish rows owned by this cache page worker."""
+    worker = pl.tile.get_block_idx()
+    workers = pl.tile.get_block_num()
+    gamma = pl.load(weight, [0], [WINDOW_HEAD_DIM], target_memory=pl.Mem.Vec)
+    inputs = pl.tile.create([WINDOW_ROW_TILE, WINDOW_HEAD_DIM], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+    cosv = pl.tile.create([WINDOW_ROW_TILE, 32], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+    sinv = pl.tile.create([WINDOW_ROW_TILE, 32], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+    targets = pl.tile.create([WINDOW_ROW_TILE], dtype=pl.INT64, target_memory=pl.Mem.Vec)
+    pending = 0
+    for base in pl.range(0, num_tokens, WINDOW_SLOT_TILE):
+        count = pl.min(WINDOW_SLOT_TILE, num_tokens - base)
+        slot_tile = pl.load(slots, [base], [WINDOW_SLOT_TILE], valid_shape=[count], target_memory=pl.Mem.Vec)
+        lane = 0
+        while lane < count:
+            slot = pl.tile.read(slot_tile, [lane])
+            accepted = False
+            if slot >= 0:
+                unsigned_slot = pl.cast(slot, pl.UINT64)
+                owner = (unsigned_slot // WINDOW_PAGE_SIZE) % pl.cast(workers, pl.UINT64)
+                accepted = owner == pl.cast(worker, pl.UINT64)
+            if accepted:
+                run = 0
+                scanning = True
+                while lane + run < count and pending + run < WINDOW_ROW_TILE and scanning:
+                    target = pl.tile.read(slot_tile, [lane + run])
+                    owned = False
+                    if target >= 0:
+                        unsigned_target = pl.cast(target, pl.UINT64)
+                        target_owner = (unsigned_target // WINDOW_PAGE_SIZE) % pl.cast(workers, pl.UINT64)
+                        owned = target_owner == pl.cast(worker, pl.UINT64)
+                    if owned:
+                        _target = pl.tile.write(targets, [pending + run], target)
+                        run = run + 1
+                    else:
+                        scanning = False
+                token = base + lane
+                inputs = pl.tile.gather_row(
+                    inputs, source, [pending, 0], [token, 0], [WINDOW_ROW_TILE, WINDOW_HEAD_DIM], valid_shape=[run, WINDOW_HEAD_DIM]
+                )
+                cosv = pl.tile.gather_row(
+                    cosv, cosine, [pending, 0], [token, 0], [WINDOW_ROW_TILE, 32], valid_shape=[run, 32]
+                )
+                sinv = pl.tile.gather_row(
+                    sinv, sine, [pending, 0], [token, 0], [WINDOW_ROW_TILE, 32], valid_shape=[run, 32]
+                )
+                lane = lane + run
+                pending = pending + run
+                if pending == WINDOW_ROW_TILE:
+                    cache = _flush_window(inputs, gamma, cosv, sinv, targets, WINDOW_ROW_TILE, cache)
+                    pending = 0
+            else:
+                lane = lane + 1
+    if pending > 0:
+        cache = _flush_window(inputs, gamma, cosv, sinv, targets, pending, cache)
+    return cache
 
 
 @pl.jit.inline(auto_scope=False)
@@ -250,9 +651,280 @@ def window_publish(
 ):
     """Fuse RMSNorm, RoPE, group-32 FP8 quantization, and window cache publication."""
     workers = pl.max(1, pl.min(num_tokens, WINDOW_PUBLISH_WORKER_TILE))
+    cache_rows = pl.tensor.dim(cache, 0) * 128
+    flat_cache = pl.reshape(cache, [cache_rows, 544])
     with pl.spmd(workers, name_hint="norm_rope_pub_win", deps=[cache_ready]) as published:
-        cache = norm_rope_publish(kv_projection, kv_norm_weight, rope_cos, rope_sin, slots, cache, num_tokens)
+        _published = norm_rope_publish(kv_projection, kv_norm_weight, rope_cos, rope_sin, slots, flat_cache, num_tokens)
     return published
+
+
+
+@pl.jit.inline(auto_scope=False)
+def proj_q_a_pypto(
+    payload: pl.Tensor,
+    weight: pl.Tensor,
+    activation_scale: pl.Tensor,
+    weight_scale: pl.Tensor,
+    output: pl.Tensor,
+    rows: pl.Scalar[pl.INDEX],
+    worker_limit: pl.constexpr = 32,
+):
+    scale_width = weight.shape[0] // 32
+    for mt in pl.parallel((rows + 79) // 80):
+        scale_begin = mt * 80 * scale_width
+        scale_end = scale_begin + 80 * scale_width
+        sa = activation_scale[0, scale_begin:scale_end]
+        sa = pl.reshape(sa, [80, scale_width])
+        sa = pl.tensor.view(sa, [80, scale_width], layout=pl.MX_A_ZZ)
+        for worker in pl.spmd(pl.min(worker_limit, 20)):
+            for base in pl.range(0, 20, worker_limit):
+                if base + worker < 20:
+                    row = mt * 80
+                    col = (base + worker) * 64
+                    full_a = pl.load(payload, [row, 0], [80, 5120], target_memory=pl.Mem.Mat)
+                    a0 = pl.tile.slice(full_a, [80, 256], [0, 0])
+                    sa0 = pl.load(sa, [0, 0], [80, 8])
+                    b0 = pl.load(weight, [0, col], [256, 64], target_memory=pl.Mem.Mat)
+                    sb0 = pl.load(weight_scale, [0, col], [8, 64])
+                    acc = pl.matmul_mx(a0, sa0, b0, sb0)
+                    for k in pl.pipeline(256, 5120, 256, stage=2):
+                        av = pl.tile.slice(full_a, [80, 256], [0, k])
+                        sav = pl.load(sa, [0, k // 32], [80, 8])
+                        bv = pl.load(weight, [k, col], [256, 64], target_memory=pl.Mem.Mat)
+                        sbv = pl.load(weight_scale, [k // 32, col], [8, 64])
+                        acc = pl.matmul_mx_acc(acc, av, sav, bv, sbv)
+                    valid = pl.set_validshape(acc, pl.min(80, rows - row), 64)
+                    output = pl.store(valid, [row, col], output)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
+def proj_q_b_pypto(
+    payload: pl.Tensor,
+    weight: pl.Tensor,
+    activation_scale: pl.Tensor,
+    weight_scale: pl.Tensor,
+    output: pl.Tensor,
+    cosine: pl.Tensor,
+    sine: pl.Tensor,
+    rows: pl.Scalar[pl.INDEX],
+    width: pl.Scalar[pl.INDEX],
+    row_start: pl.Scalar[pl.INDEX],
+    worker_limit: pl.constexpr = 32,
+):
+    projected = pl.create_tensor([rows, width], dtype=pl.BF16)
+    for mt in pl.parallel((rows + 79) // 80):
+        scale_begin = mt * 80 * 40
+        scale_end = scale_begin + 80 * 40
+        sa = activation_scale[0, scale_begin:scale_end]
+        sa = pl.reshape(sa, [80, 40])
+        sa = pl.tensor.view(sa, [80, 40], layout=pl.MX_A_ZZ)
+        for worker in pl.spmd(pl.min(worker_limit, width // 256)):
+            row = mt * 80
+            full_a = pl.load(payload, [row, 0], [80, 1280], target_memory=pl.Mem.Mat)
+            for base in pl.range(0, width // 256, worker_limit):
+                if base + worker < width // 256:
+                    col = (base + worker) * 256
+                    a0 = pl.tile.slice(full_a, [80, 256], [0, 0])
+                    sa0 = pl.load(sa, [0, 0], [80, 8])
+                    b0 = pl.load(weight, [0, col], [256, 256], target_memory=pl.Mem.Mat)
+                    sb0 = pl.load(weight_scale, [0, col], [8, 256])
+                    acc = pl.matmul_mx(a0, sa0, b0, sb0)
+                    for k in pl.pipeline(256, 1280, 256, stage=4):
+                        av = pl.tile.slice(full_a, [80, 256], [0, k])
+                        sav = pl.load(sa, [0, k // 32], [80, 8])
+                        bv = pl.load(weight, [k, col], [256, 256], target_memory=pl.Mem.Mat)
+                        sbv = pl.load(weight_scale, [k // 32, col], [8, 256])
+                        acc = pl.matmul_mx_acc(acc, av, sav, bv, sbv)
+                    valid = pl.set_validshape(acc, pl.min(80, rows - row), 256)
+                    projected = pl.store(valid, [row, col], projected)
+    for task in pl.spmd(((rows + 79) // 80) * (width // 512)):
+        row = task // (width // 512) * 80
+        col = task % (width // 512) * 512
+        valid_rows = pl.min(80, rows - row)
+        source = pl.load(projected, [row, col], [80, 512], valid_shape=[valid_rows, 512], target_memory=pl.Mem.Vec)
+        cv = pl.load(cosine, [row_start + row, 0], [80, 32], valid_shape=[valid_rows, 32], target_memory=pl.Mem.Vec)
+        sv = pl.load(sine, [row_start + row, 0], [80, 32], valid_shape=[valid_rows, 32], target_memory=pl.Mem.Vec)
+        with pl.reg_scope():
+            full = pl.reg.full_mask(lanes=64)
+            lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
+            one = pl.reg.broadcast(1, lanes=64, dtype=pl.UINT32)
+            pair = pl.reg.shift_rights(lane, 1, full)
+            swap = pl.reg.bitwise_xor(lane, one)
+            odd_bit = pl.reg.bitwise_and(lane, one)
+            is_even = pl.reg.compares(odd_bit, 0, full, predicate="eq")
+            for r in pl.hardware_loop(valid_rows):
+                trig_offset = pl.cast(r * 32, pl.UINT32)
+                trig_index = pl.reg.adds(pair, trig_offset, full)
+                c = pl.reg.gather(cv, trig_index, full)
+                s = pl.reg.gather(sv, trig_index, full)
+                raw = pl.reg.load(source, offset=r * 512 + 448, lanes=64)
+                x = pl.reg.convert(raw, dtype=pl.FP32)
+                swapped = pl.reg.gather_lanes(x, swap)
+                a = pl.reg.mul(x, c)
+                b = pl.reg.mul(swapped, s)
+                real = pl.reg.sub(a, b)
+                imag = pl.reg.add(b, a)
+                rotated = pl.reg.select(is_even, real, imag)
+                bf = pl.reg.convert(rotated, dtype=pl.BF16, rounding="R", saturate=False)
+                _rotated = pl.reg.store(source, offset=r * 512 + 448, value=bf)
+        valid_source = pl.set_validshape(source, valid_rows, 512)
+        output = pl.store(valid_source, [row_start + row, col], output)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
+def proj_kv_pypto(
+    payload: pl.Tensor,
+    weight: pl.Tensor,
+    activation_scale: pl.Tensor,
+    weight_scale: pl.Tensor,
+    output: pl.Tensor,
+    rows: pl.Scalar[pl.INDEX],
+    row_start: pl.Scalar[pl.INDEX],
+    worker_limit: pl.constexpr = 32,
+):
+    scale_width = weight.shape[0] // 32
+    for mt in pl.parallel((rows + 79) // 80):
+        scale_begin = mt * 80 * scale_width
+        scale_end = scale_begin + 80 * scale_width
+        sa = activation_scale[0, scale_begin:scale_end]
+        sa = pl.reshape(sa, [80, scale_width])
+        sa = pl.tensor.view(sa, [80, scale_width], layout=pl.MX_A_ZZ)
+        for worker in pl.spmd(pl.min(worker_limit, 8), sync_start=True):
+            for base in pl.range(0, 8, worker_limit):
+                if base + worker < 8:
+                    row = mt * 80
+                    col = (base + worker) * 64
+                    full_a = pl.load(payload, [row, 0], [80, 5120], target_memory=pl.Mem.Mat)
+                    a0 = pl.tile.slice(full_a, [80, 256], [0, 0])
+                    sa0 = pl.load(sa, [0, 0], [80, 8])
+                    b0 = pl.load(weight, [0, col], [256, 64], target_memory=pl.Mem.Mat)
+                    sb0 = pl.load(weight_scale, [0, col], [8, 64])
+                    acc = pl.matmul_mx(a0, sa0, b0, sb0)
+                    for k in pl.pipeline(256, 5120, 256, stage=2):
+                        av = pl.tile.slice(full_a, [80, 256], [0, k])
+                        sav = pl.load(sa, [0, k // 32], [80, 8])
+                        bv = pl.load(weight, [k, col], [256, 64], target_memory=pl.Mem.Mat)
+                        sbv = pl.load(weight_scale, [k // 32, col], [8, 64])
+                        acc = pl.matmul_mx_acc(acc, av, sav, bv, sbv)
+                    valid = pl.set_validshape(acc, pl.min(80, rows - row), 64)
+                    output = pl.store(valid, [row_start + row, col], output)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
+def q_proj_rope_pypto(
+    payload: pl.Tensor,
+    scales: pl.Tensor,
+    wq_a: pl.Tensor,
+    wq_a_scale: pl.Tensor,
+    q_norm_weight: pl.Tensor,
+    wq_b: pl.Tensor,
+    wq_b_scale: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    query_latent: pl.Tensor,
+    query: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    padded_rows: pl.Scalar[pl.INDEX],
+    qa_worker_limit: pl.constexpr = 32,
+    qb_worker_limit: pl.constexpr = 32,
+):
+    """Project NZ QA/QB weights, rotate Q, and retain normalized rows for Index-Q."""
+    payload_rows = padded_rows
+    projected = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.BF16)
+    projected = proj_q_a_pypto(payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_worker_limit)
+    qb_payload = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.FP8E4M3FN)
+    qb_scales = pl.create_tensor([1, payload_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
+    norm_workers = pl.max(pl.min(payload_rows // (MX_M_TILE // 2), 32), 1)
+    latent_rows = pl.tensor.dim(query_latent, 0)
+    norm_latent = query_latent[:latent_rows, :Q_LORA]
+    norm_payload = qb_payload[:payload_rows, :Q_LORA]
+    norm_scales = qb_scales[:, :payload_rows * (Q_LORA // 32)]
+    with pl.spmd(norm_workers, name_hint="q_norm_quant"):
+        q_norm_quant(projected, q_norm_weight, norm_latent, norm_payload, norm_scales, num_tokens)
+    query = proj_q_b_pypto(
+        qb_payload, wq_b, qb_scales, wq_b_scale,
+        query, rope_cos, rope_sin, num_tokens, LOCAL_H * HEAD_DIM, 0, qb_worker_limit,
+    )
+    return (query_latent, query, qb_payload, qb_scales)
+
+
+@pl.jit.inline(auto_scope=False)
+def kv_proj_pypto(
+    payload: pl.Tensor,
+    scales: pl.Tensor,
+    wkv: pl.Tensor,
+    wkv_scale: pl.Tensor,
+    kv_projection: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    worker_limit: pl.constexpr = 32,
+):
+    """Project NZ KV weights to BF16 rows in M80 groups."""
+    kv_projection = proj_kv_pypto(payload, wkv, scales, wkv_scale, kv_projection, num_tokens, 0, worker_limit)
+    return kv_projection
+
+
+@pl.jit
+def qkv_native(
+    payload: pl.Tensor,
+    scales: pl.Tensor,
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN, pl.NZ],
+    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+    q_norm_weight: pl.Tensor,
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN, pl.NZ],
+    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    wkv: pl.Tensor[[D, 512], pl.FP8E4M3FN, pl.NZ],
+    wkv_scale: pl.Tensor[[D // 32, 512], pl.FP8E8M0, pl.MX_B_NN],
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    query_latent: pl.InOut[pl.Tensor],
+    query: pl.InOut[pl.Tensor],
+    kv_projection: pl.InOut[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+    padded_rows: pl.Scalar[pl.INDEX],
+):
+    query_latent, query, q_payload, q_scales = q_proj_rope_pypto(
+        payload, scales, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
+        rope_cos, rope_sin, query_latent, query, num_tokens, padded_rows,
+        qa_worker_limit=NATIVE_VALIDATION_WORKERS, qb_worker_limit=NATIVE_VALIDATION_WORKERS,
+    )
+    kv_projection = kv_proj_pypto(
+        payload, scales, wkv, wkv_scale, kv_projection, num_tokens, worker_limit=NATIVE_VALIDATION_WORKERS,
+    )
+    return query_latent, query, kv_projection
+
+
+@pl.jit
+def qkv_cpp(
+    payload: pl.Tensor,
+    scales: pl.Tensor,
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+    q_norm_weight: pl.Tensor,
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    wkv: pl.Tensor[[D, 512], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // 32, 512], pl.FP8E8M0, pl.MX_B_NN],
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    query_latent: pl.InOut[pl.Tensor],
+    query: pl.InOut[pl.Tensor],
+    kv_projection: pl.InOut[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+    padded_rows: pl.Scalar[pl.INDEX],
+):
+    query_latent, query, q_payload, q_scales = q_proj_rope(
+        payload, scales, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
+        rope_cos, rope_sin, query_latent, query, num_tokens, padded_rows,
+        qa_worker_limit=NATIVE_VALIDATION_WORKERS, qb_worker_limit=NATIVE_VALIDATION_WORKERS,
+        qa_row_tile=80, qb_row_tile=80,
+    )
+    kv_projection = kv_proj(
+        payload, scales, wkv, wkv_scale, kv_projection, num_tokens, worker_limit=NATIVE_VALIDATION_WORKERS, row_tile=80,
+    )
+    return query_latent, query, kv_projection
 
 
 
@@ -328,3 +1000,85 @@ def golden_qkv_proj_rope(
     q = golden_rope_tail(q, cos, sin)
     kv = golden_rope_tail(kv, cos, sin)
     return q, kv, qr
+
+
+def build_qkv_validation_specs(active, capacity):
+    """Build model-sized NZ weights, packed MX scales, and canary output buffers."""
+    from golden import ScalarSpec, TensorSpec
+    from quant import generate_mxfp8_weight_kn, pack_fp8_nz, pack_mx_a_scale
+    from quant import _quantize_mxfp8_activation, encode_e8m0
+
+    padded = (capacity + 79) // 80 * 80
+    values = {}
+
+    def inputs():
+        if values:
+            return values
+        generator = torch.Generator().manual_seed(17)
+        source = torch.randn(padded, D, generator=generator).bfloat16()
+        source[active:] = 0
+        payload, scale = _quantize_mxfp8_activation(source, scale_alg=0)
+        values["payload"] = payload.flatten(-2)
+        codes = pack_mx_a_scale(encode_e8m0(scale)).reshape(1, -1)
+        values["scales"] = codes.view(torch.float8_e8m0fnu)
+        for name, width, reduction, seed in (("wq_a", Q_LORA, D, 19),
+                                             ("wq_b", LOCAL_H * HEAD_DIM, Q_LORA, 23),
+                                             ("wkv", HEAD_DIM, D, 29)):
+            weight, scales = generate_mxfp8_weight_kn(width, reduction, reduction**-0.5, seed=seed)
+            values[name] = pack_fp8_nz(weight)
+            values[name + "_scale"] = scales
+        values["q_norm_weight"] = torch.ones(Q_LORA, dtype=torch.bfloat16)
+        frequencies = 10000.0 ** (-torch.arange(0, M.qk_rope_head_dim, 2).float() / M.qk_rope_head_dim)
+        angles = (8192 + torch.arange(capacity)).float()[:, None] * frequencies
+        values.update(rope_cos=angles.cos(), rope_sin=angles.sin())
+        return values
+
+    fp8, scale_dtype = torch.float8_e4m3fn, torch.float8_e8m0fnu
+    shapes = (
+        ("payload", [padded, D], fp8), ("scales", [1, padded * (D // 32)], scale_dtype),
+        ("wq_a", [D, Q_LORA], fp8), ("wq_a_scale", [D // 32, Q_LORA], scale_dtype),
+        ("q_norm_weight", [Q_LORA], torch.bfloat16),
+        ("wq_b", [Q_LORA, LOCAL_H * HEAD_DIM], fp8),
+        ("wq_b_scale", [Q_LORA // 32, LOCAL_H * HEAD_DIM], scale_dtype),
+        ("wkv", [D, HEAD_DIM], fp8), ("wkv_scale", [D // 32, HEAD_DIM], scale_dtype),
+        ("rope_cos", [capacity, M.qk_rope_head_dim // 2], torch.float32),
+        ("rope_sin", [capacity, M.qk_rope_head_dim // 2], torch.float32),
+    )
+    specs = [TensorSpec(name, shape, dtype, init_value=lambda name=name: inputs()[name])
+             for name, shape, dtype in shapes]
+    for name, width in (("query_latent", Q_LORA), ("query", LOCAL_H * HEAD_DIM), ("kv_projection", HEAD_DIM)):
+        specs.append(TensorSpec(name, [capacity, width], torch.bfloat16, init_value=13.0))
+    return specs + [ScalarSpec("num_tokens", torch.int32, active), ScalarSpec("padded_rows", torch.int64, padded)]
+
+
+def golden_qkv_validation(values):
+    """Compute Q normalization, Q RoPE, and raw KV projection with K32 accumulation."""
+    from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential as project
+    from quant import decode_e8m0, unpack_mx_a_scale, unpack_fp8_nz
+
+    active = int(values["num_tokens"])
+    if active == 0:
+        return
+    padded = values["payload"].shape[0]
+    codes = values["scales"].view(torch.uint8).reshape(padded, D // 32)
+    scales = decode_e8m0(unpack_mx_a_scale(codes))[:active].repeat_interleave(32, dim=-1)
+    source = (values["payload"][:active].float() * scales).bfloat16()
+    projected = project(source, unpack_fp8_nz(values["wq_a"]), values["wq_a_scale"])
+    latent = golden_rms_norm(projected, values["q_norm_weight"])
+    query = project(latent, unpack_fp8_nz(values["wq_b"]), values["wq_b_scale"])
+    query = query.reshape(active, LOCAL_H, HEAD_DIM)
+    query = golden_rope_tail(query, values["rope_cos"][:active], values["rope_sin"][:active])
+    values["query_latent"][:active].copy_(latent)
+    values["query"][:active].copy_(query.flatten(1).bfloat16())
+    values["kv_projection"][:active].copy_(project(source, unpack_fp8_nz(values["wkv"]), values["wkv_scale"]))
+
+
+def compare_qkv_output(actual, expected, *, inputs, **kwargs):
+    """Check the active prefix and require exact preservation of inactive output rows."""
+    from golden import ratio_allclose
+
+    active = int(inputs["num_tokens"])
+    compare = ratio_allclose(atol=1e-2, rtol=1.0 / 128, valid_rows=active)
+    passed, detail = compare(actual, expected, inputs=inputs, **kwargs)
+    tail_ok = torch.equal(actual[active:], expected[active:])
+    return passed and tail_ok, f"{detail}; inactive canary preserved={tail_ok}"

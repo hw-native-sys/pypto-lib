@@ -8,6 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """V4.1 device and host quantization, checkpoint layouts, and weight fixtures."""
 
+from collections.abc import Callable
+
 import torch
 import pypto.language as pl
 
@@ -164,9 +166,18 @@ def _nearest_fp4_indices(values: torch.Tensor, *, round_to_even: bool = False) -
     table = FP4_VALUES[:8].to(values.device)
     magnitude = values.abs().unsqueeze(-1)
     if round_to_even:
-        order = torch.tensor([0, 2, 4, 6, 1, 3, 5, 7], device=values.device)
-        selected = (magnitude - table[order]).abs().argmin(dim=-1)
-        index = order[selected].to(torch.uint8)
+        if torch.any(magnitude > table[-1]):
+            order = torch.tensor([0, 2, 4, 6, 1, 3, 5, 7], device=values.device)
+            selected = (magnitude - table[order]).abs().argmin(dim=-1)
+            index = order[selected].to(torch.uint8)
+        else:
+            boundaries = (table[:-1] + table[1:]) * 0.5
+            absolute = magnitude.squeeze(-1)
+            index = torch.bucketize(absolute, boundaries, out_int32=True).clamp_max(7)
+            midpoint = boundaries[index.clamp_max(6)]
+            ties = (absolute == midpoint) & ((index & 1) != 0)
+            index = (index + ties).to(torch.uint8)
+            index.masked_fill_(~torch.isfinite(absolute), 0)
     else:
         boundaries = (table[:-1] + table[1:]) * 0.5
         absolute = magnitude.squeeze(-1)
@@ -189,6 +200,20 @@ def _unpack_fp4(payload: torch.Tensor) -> torch.Tensor:
     packed = payload.contiguous().view(torch.uint8)
     indices = torch.stack((packed & 0x0F, (packed >> 4) & 0x0F), dim=-1).flatten(-2)
     return FP4_VALUES.to(payload.device)[indices.to(torch.long)]
+
+
+def golden_index_query_fp4(value: torch.Tensor) -> torch.Tensor:
+    """Round FP32 query groups to E2M1, with midpoint ties away from zero."""
+    grouped = value.float().unflatten(-1, (-1, 32))
+    maximum = grouped.abs().amax(dim=-1, keepdim=True)
+    raw_scale = (maximum / 6.0).clamp_min(2.0**-126)
+    scale = torch.exp2(torch.ceil(torch.log2(raw_scale)))
+    normalized = grouped / scale
+    levels = FP4_VALUES[:8].to(value.device)
+    boundaries = (levels[:-1] + levels[1:]) * 0.5
+    indices = torch.bucketize(normalized.abs().contiguous(), boundaries, right=True)
+    rounded = torch.copysign(levels[indices], normalized) * scale
+    return rounded.flatten(-2)
 
 
 def quantize_mxfp4_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -249,6 +274,27 @@ def quantize_mxfp4_cache(
     normalized = (grouped / scale_value.unsqueeze(-1)).clamp(-6.0, 6.0)
     payload = _pack_fp4(_nearest_fp4_indices(normalized, round_to_even=round_to_even).flatten(-2))
     return payload, stored_scale
+
+
+def generate_quantized_cache(shape, quantize, *, generator=None, input_dtype=None, page_gain=None):
+    """Generate and quantize random cache pages in bounded host batches."""
+    payload = scales = None
+    for begin in range(0, shape[0], 32):
+        end = min(begin + 32, shape[0])
+        values = torch.randn(end - begin, *shape[1:], generator=generator)
+        if page_gain is not None:
+            values *= page_gain[begin:end].reshape(-1, *([1] * (len(shape) - 1)))
+        if input_dtype is not None:
+            values = values.to(input_dtype)
+        chunk_payload, chunk_scales = quantize(values)
+        if payload is None:
+            payload = torch.empty((shape[0], *chunk_payload.shape[1:]), dtype=chunk_payload.dtype)
+            scales = torch.empty((shape[0], *chunk_scales.shape[1:]), dtype=chunk_scales.dtype)
+        payload[begin:end] = chunk_payload
+        scales[begin:end] = chunk_scales
+    if payload is None:
+        raise ValueError("cache must contain at least one page")
+    return payload, scales
 
 
 def dequantize_mxfp4_cache(
@@ -386,25 +432,6 @@ def unpack_mx_scale_codes(scale: torch.Tensor, *, side: str = "a") -> torch.Tens
     raise ValueError(f"side must be 'a' or 'b', got {side!r}")
 
 
-def _pack_mxfp4_nibbles_kn_tiles(
-    nibbles_kn: torch.Tensor, k_tile: int, n_tile: int
-) -> torch.Tensor:
-    """Pack a logical [K, N] nibble matrix into Cube lane rows."""
-    k, n = nibbles_kn.shape
-    if k % k_tile or n % n_tile or k_tile % 2 or n_tile % 2:
-        raise ValueError("MXFP4 tile dimensions must divide K/N and be even")
-    k_blocks = k // k_tile
-    n_blocks = n // n_tile
-    blocked = nibbles_kn.reshape(k_blocks, k_tile, n_blocks, n_tile)
-    blocked = blocked.permute(2, 0, 1, 3)
-    lanes = blocked.reshape(n_blocks, k_blocks, 2, k_tile // 2, n_tile)
-    low = lanes[..., 0::2] & 0x0F
-    high = lanes[..., 1::2] & 0x0F
-    packed = low | (high << 4)
-    lane_bytes = k_tile * n_tile // 4
-    return packed.contiguous().reshape(n_blocks * k_blocks * 2, lane_bytes)
-
-
 def pack_mxfp4_weight_tiles(
     packed_weight_fp4: torch.Tensor, k_tile: int, n_tile: int
 ) -> torch.Tensor:
@@ -419,12 +446,15 @@ def pack_mxfp4_weight_tiles(
         [matrices.shape[0], packed_rows, packed_cols], dtype=torch.uint8
     )
     for index, matrix in enumerate(matrices):
-        nibbles = torch.empty([n, k], dtype=torch.uint8)
-        nibbles[:, 0::2] = matrix & 0x0F
-        nibbles[:, 1::2] = matrix >> 4
-        result[index] = _pack_mxfp4_nibbles_kn_tiles(
-            nibbles.t(), k_tile, n_tile
-        ).reshape(packed_rows, packed_cols)
+        if k % k_tile or n % n_tile or k_tile % 2 or n_tile % 2:
+            raise ValueError("MXFP4 tile dimensions must divide K/N and be even")
+        blocked = matrix.reshape(n // n_tile, n_tile, k // k_tile, k_tile // 2)
+        blocked = blocked.permute(0, 2, 3, 1)
+        even, odd = blocked[..., 0::2], blocked[..., 1::2]
+        low = (even & 0x0F) | ((odd & 0x0F) << 4)
+        high = (even >> 4) | (odd & 0xF0)
+        packed = torch.stack((low, high), dim=-2)
+        result[index] = packed.reshape(packed_rows, packed_cols)
     return result.reshape(*lead, packed_rows, packed_cols)
 
 
@@ -488,3 +518,40 @@ def unpack_quantized_cache(
     if not fp4:
         payload = payload.view(torch.float8_e4m3fn)
     return payload, cache[..., width:].view(torch.bfloat16)
+
+
+def _copy_cache_rows(destination: torch.Tensor, source: torch.Tensor, rows: torch.Tensor) -> None:
+    destination_rows = destination.flatten(0, 1).view(torch.uint8)
+    source_rows = source.contiguous().view(torch.uint8).reshape_as(destination_rows[rows])
+    destination_rows[rows] = source_rows
+
+
+def _publish_quantized_cache(
+    payload: torch.Tensor,
+    scale: torch.Tensor,
+    values: torch.Tensor,
+    slots: torch.Tensor,
+    quantize: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize and replace only mapped rows in a packed cache pair."""
+    updated_payload = payload.clone()
+    updated_scale = scale.clone()
+    valid = slots >= 0
+    rows = slots[valid].to(torch.int64)
+    if rows.numel():
+        row_payload, row_scale = quantize(values[valid])
+        _copy_cache_rows(updated_payload, row_payload, rows)
+        _copy_cache_rows(updated_scale, row_scale, rows)
+    return updated_payload, updated_scale
+
+
+def packed_cache_compare(payload_compare, scale_compare, *, fp4: bool):
+    """Compare explicit packed fields with independent numerical and mapped-row gates."""
+
+    def compare(actual, expected, **kwargs):
+        actual_payload, actual_scale = unpack_quantized_cache(actual, fp4)
+        expected_payload, expected_scale = unpack_quantized_cache(expected, fp4)
+        payload_ok, payload_detail = payload_compare(actual_payload, expected_payload, **kwargs)
+        scale_ok, scale_detail = scale_compare(actual_scale, expected_scale, **kwargs)
+        return payload_ok and scale_ok, "\n".join(filter(None, (payload_detail, scale_detail)))
+    return compare

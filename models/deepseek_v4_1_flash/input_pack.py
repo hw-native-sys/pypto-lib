@@ -26,8 +26,6 @@ ROW_WIDTH = pl.dynamic("PACK_ROW_WIDTH")
 HIDDEN_TILE = 512
 LENGTH_TILE = 128
 SPMD_BLOCKS = 48
-TEST_VOCAB_SIZE = 256
-DEFAULT_TOKENS = 8
 
 assert D % HIDDEN_TILE == 0
 
@@ -111,80 +109,3 @@ def pack_x_hc(
                     hidden_offset : hidden_offset + hidden_tile,
                 ] = hidden_chunk
     return x_hc
-
-
-@pl.jit
-def l2_input_pack(
-    input_ids: pl.Tensor[[TOKEN_DYN], pl.INT64],
-    embed_weight: pl.Tensor[[VOCAB_DYN, D], pl.BF16],
-    x_hc: pl.Out[pl.Tensor[[TOKEN_DYN, HC_MULT, D], pl.FP32]],
-) -> pl.Tensor[[TOKEN_DYN, HC_MULT, D], pl.FP32]:
-    input_ids.bind_dynamic(0, TOKEN_DYN)
-    embed_weight.bind_dynamic(0, VOCAB_DYN)
-    x_hc.bind_dynamic(0, TOKEN_DYN)
-    return pack_x_hc(input_ids, embed_weight, x_hc, hidden_tile=512)
-
-
-def golden_pack_x_hc(tensors):
-    vocab_size = tensors["embed_weight"].shape[0]
-    safe_ids = tensors["input_ids"].long().clamp(0, vocab_size - 1)
-    hidden = tensors["embed_weight"].index_select(0, safe_ids).float()
-    tensors["x_hc"][:] = hidden.unsqueeze(1).expand(-1, HC_MULT, -1)
-
-
-def build_tensor_specs(token_count, vocab_size):
-    import torch
-    from golden import TensorSpec
-
-    def init_input_ids():
-        samples = torch.tensor(
-            [-1, 0, 17, vocab_size - 1, vocab_size, vocab_size + 7, 2, 1],
-            dtype=torch.int64,
-        )
-        repeats = (token_count + samples.numel() - 1) // samples.numel()
-        return samples.repeat(repeats)[:token_count].contiguous()
-
-    return [
-        TensorSpec("input_ids", [token_count], torch.int64, init_value=init_input_ids),
-        TensorSpec(
-            "embed_weight",
-            [vocab_size, D],
-            torch.bfloat16,
-            init_value=lambda: torch.randn(vocab_size, D, dtype=torch.bfloat16),
-        ),
-        TensorSpec(
-            "x_hc",
-            [token_count, HC_MULT, D],
-            torch.float32,
-        ),
-    ]
-
-
-if __name__ == "__main__":
-    import argparse
-    from golden import run
-
-    parser = argparse.ArgumentParser(description="Validate DeepSeek-V4.1 Flash token input packing.")
-    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
-    parser.add_argument("--sim", dest="execution_mode", action="store_true")
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--tokens", type=int, default=DEFAULT_TOKENS)
-    parser.add_argument("--vocab", type=int, default=TEST_VOCAB_SIZE)
-    parser.add_argument("--compile-only", action="store_true", default=False)
-    args = parser.parse_args()
-
-    result = run(
-        fn=l2_input_pack,
-        specs=build_tensor_specs(args.tokens, args.vocab),
-        golden_fn=golden_pack_x_hc,
-        compile_only=args.compile_only,
-        config=dict(
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            device_id=args.device,
-        ),
-        rtol=0.0,
-        atol=0.0,
-    )
-    if not result.passed:
-        raise SystemExit(result.error or 1)

@@ -60,6 +60,7 @@ def _hc_post(
     post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
     y: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+    T_TILE: pl.constexpr = 4,
 ):
     x.bind_dynamic(0, T_DYN)
     residual.bind_dynamic(0, T_DYN)

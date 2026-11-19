@@ -70,10 +70,10 @@ K_TILE = 512
 OUT_TILE = 64
 PROJ_OUT_TILE = 32
 assert PROJ_OUT_TILE % 16 == 0, "cube tile cols must be a multiple of 16"
-MM_B_TILE = 32
+MM_B_TILE = 64
 KV_SCORE_WORKERS = 24  # KV-score projection workers
 POOL_WORKERS = 16  # Pool workers
-RMS_WORKERS = 2  # RMSNorm + RoPE workers
+RMS_WORKERS = 16  # RMSNorm + RoPE workers
 COMMIT_WORKERS = 16
 GROUP_BS = DECODE_BATCH * DECODE_SEQ
 BS_PAD = ((GROUP_BS + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE
@@ -274,7 +274,9 @@ def indexer_compressor_pool_projected(
                     )
 
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-    rms_workers = pl.min(rms_blocks, RMS_WORKERS)
+    compact_rows = b_dim * COMPACT_PER_REQUEST
+    compact_blocks = (compact_rows + RMS_PAD_TILE - 1) // RMS_PAD_TILE
+    rms_workers = pl.min(compact_blocks, RMS_WORKERS)
     with pl.spmd(rms_workers, name_hint="rmsnorm_rope", deps=[pool_tid]) as rms_tid:
         rms_worker = pl.tile.get_block_idx()
         rope_ones = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
@@ -284,45 +286,46 @@ def indexer_compressor_pool_projected(
         rope_dup_f = pl.cast(pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
         rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))                                          # j%2
         rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)  # j^1
-        for rms_blk in pl.range(rms_worker, rms_blocks, rms_workers):
-            # Padded token block and interleaved inverse-RoPE rows.
-            b0 = rms_blk * RMS_PAD_TILE
-            rms_blk_rows = pl.min(RMS_PAD_TILE, bs - b0)
-            cos_b = pl.slice(cos, [RMS_PAD_TILE, ROPE_HEAD_DIM], [b0, 0], valid_shape=[rms_blk_rows, ROPE_HEAD_DIM])
-            sin_b = pl.slice(sin, [RMS_PAD_TILE, ROPE_HEAD_DIM], [b0, 0], valid_shape=[rms_blk_rows, ROPE_HEAD_DIM])
+        for rms_blk in pl.range(rms_worker, compact_blocks, rms_workers):
+            compact_begin = rms_blk * RMS_PAD_TILE
+            rms_blk_rows = pl.min(RMS_PAD_TILE, compact_rows - compact_begin)
+            pooled_block = pl.full([RMS_PAD_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
+            cos_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+            sin_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+            for packed_row in pl.range(rms_blk_rows):
+                compact_token = compact_begin + packed_row
+                request = compact_token // COMPACT_PER_REQUEST
+                boundary = compact_token % COMPACT_PER_REQUEST
+                first_pos = pl.read(position_ids, [request * s_dim])
+                local = COMPRESS_RATIO - 1 - first_pos % COMPRESS_RATIO + boundary * COMPRESS_RATIO
+                if local < s_dim:
+                    token = request * s_dim + local
+                    pooled_block[packed_row : packed_row + 1, :] = pooled_kv[token : token + 1, :]
+                    cos_b[packed_row : packed_row + 1, :] = cos[token : token + 1, :]
+                    sin_b[packed_row : packed_row + 1, :] = sin[token : token + 1, :]
             partial_sq = pl.full([1, RMS_PAD_TILE], dtype=pl.FP32, value=0.0)
             for k0 in pl.pipeline(0, HEAD_DIM, HEAD_TILE, stage=2):
-                kv_rms_chunk = pooled_kv[b0 : b0 + RMS_PAD_TILE, k0 : k0 + HEAD_TILE]
+                kv_rms_chunk = pooled_block[:, k0 : k0 + HEAD_TILE]
                 kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
                 kv_rms_rowsum = pl.reshape(pl.row_sum(kv_rms_sq), [1, RMS_PAD_TILE])
                 partial_sq = pl.add(partial_sq, kv_rms_rowsum)
 
             variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [RMS_PAD_TILE, 1])
             inv_rms = pl.recip(pl.sqrt(variance))
-            kv_norm_chunk = pooled_kv[b0 : b0 + RMS_PAD_TILE, 0:NOPE_HEAD_DIM]
+            kv_norm_chunk = pooled_block[:, 0:NOPE_HEAD_DIM]
             gamma = pl.cast(norm_w_2d[:, 0:NOPE_HEAD_DIM], pl.FP32)
             normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
             normed_nope = pl.cast(normed_chunk, target_type=pl.BF16, mode="rint")
 
-            kv_rope_norm = pooled_kv[b0 : b0 + RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM]
+            kv_rope_norm = pooled_block[:, NOPE_HEAD_DIM:HEAD_DIM]
             gamma_rope = pl.cast(norm_w_2d[:, NOPE_HEAD_DIM : HEAD_DIM], pl.FP32)
             # Interleaved RMSNorm and inverse-RoPE rotation.
             rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope_norm, inv_rms), gamma_rope)
             swapped = pl.gather(rope_normed, dim=-1, index=rope_swap_idx)
             rope_rot = pl.add(pl.mul(rope_normed, cos_b), pl.mul(swapped, sin_b))
             normed_rope = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
-            for inner in pl.range(rms_blk_rows):
-                token = b0 + inner
-                token_pos = pl.read(position_ids, [token])
-                if (token_pos + 1) % COMPRESS_RATIO == 0:
-                    # Compact slot: request base plus the boundary's rank inside
-                    # the request, counted from the request's first boundary.
-                    request = token // S
-                    local = token - request * S
-                    first_offset = COMPRESS_RATIO - 1 - (token_pos - local) % COMPRESS_RATIO
-                    compact_token = request * COMPACT_PER_REQUEST + (local - first_offset) // COMPRESS_RATIO
-                    normed_kv[compact_token : compact_token + 1, 0:NOPE_HEAD_DIM] = normed_nope[inner : inner + 1, :]
-                    normed_kv[compact_token : compact_token + 1, NOPE_HEAD_DIM:HEAD_DIM] = normed_rope[inner : inner + 1, :]
+            normed_kv[compact_begin : compact_begin + RMS_PAD_TILE, 0:NOPE_HEAD_DIM] = normed_nope
+            normed_kv[compact_begin : compact_begin + RMS_PAD_TILE, NOPE_HEAD_DIM:HEAD_DIM] = normed_rope
 
     return _kv_score_tid, rms_tid
 
@@ -434,6 +437,9 @@ def indexer_compressor_write(
                     kv_flat[token : token + 1, :] = kv_final[compact_token : compact_token + 1, 0 : HEAD_DIM]
                     idx_kv_cache_flat[cache_row : cache_row + 1, :] = kv_i8_blk[inner : inner + 1, :]
 
+    position_row = pl.reshape(position_ids, [1, bs])
+    slot_row = pl.reshape(idx_slot_mapping, [1, bs])
+    scale_row = pl.reshape(idx_kv_scale_values, [1, BS_PAD])
     # Serialized indexer-cache scale commit.
     with pl.at(
         level=pl.Level.CORE_GROUP,
@@ -441,20 +447,23 @@ def indexer_compressor_write(
         deps=[_write_tid],
         allow_early_resolve=True,
     ) as scale_commit_tid:
+        positions_ub = pl.load(position_row, [0, 0], [1, BS_PAD], valid_shape=[1, bs])
+        slots_ub = pl.load(slot_row, [0, 0], [1, BS_PAD], valid_shape=[1, bs])
+        scales_ub = pl.load(scale_row, [0, 0], [1, BS_PAD])
         for compact_token in pl.range(compact_rows):
             request = compact_token // COMPACT_PER_REQUEST
-            first_pos = pl.read(position_ids, [request * S])
+            first_pos = pl.tile.read(positions_ub, [0, request * S])
             local = (COMPRESS_RATIO - 1 - first_pos % COMPRESS_RATIO
                      + (compact_token - request * COMPACT_PER_REQUEST) * COMPRESS_RATIO)
             if local < S:
                 token = request * S + local
-                cache_row_i64 = pl.read(idx_slot_mapping, [token])
+                cache_row_i64 = pl.tile.read(slots_ub, [0, token])
                 if cache_row_i64 >= 0:
                     cache_row = pl.cast(cache_row_i64, pl.INDEX)
                     pl.write(
                         idx_kv_scale_flat,
                         [cache_row, 0],
-                        pl.read(idx_kv_scale_values, [compact_token, 0]),
+                        pl.tile.read(scales_ub, [0, compact_token]),
                     )
 
     return hadamard_tid, scale_commit_tid
