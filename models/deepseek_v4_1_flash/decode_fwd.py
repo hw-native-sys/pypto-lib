@@ -240,6 +240,8 @@ def decode_encoder(
     force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
     if BALANCED_ROUTING:
         initialize_balanced_routes(force_topk, local_moe_tokens, rank, N_LOCAL_EXPERTS, TOPK)
+    recv_x_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.FP8E4M3FN)
+    recv_x_last_use = pl.array.create(1, pl.TASK_ID)
     for layer in pl.range(0, 20):
         if layer == 1 or layer == 14:
             with pl.scope():
@@ -387,7 +389,8 @@ def decode_encoder(
                 data_arrived,
                 routed_output, combine_arrived,
                 local_moe_tokens, rank, layer + 1,
-                force_topk, local_experts=N_LOCAL_EXPERTS, topk=TOPK, dispatch_worker_limit=0,
+                force_topk, recv_x_local, recv_x_last_use,
+                local_experts=N_LOCAL_EXPERTS, topk=TOPK, dispatch_worker_limit=0,
             )
     return x_hc, pre_mix, token_rope_cos, token_rope_sin
 
@@ -505,6 +508,8 @@ def decode_decoder(
     force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
     if BALANCED_ROUTING:
         initialize_balanced_routes(force_topk, local_moe_tokens, rank, N_LOCAL_EXPERTS, TOPK)
+    recv_x_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.FP8E4M3FN)
+    recv_x_last_use = pl.array.create(1, pl.TASK_ID)
     for layer in pl.range(20, 40):
         with pl.scope():
             weight_layer = layer % WEIGHT_BANK_SIZE
@@ -656,7 +661,8 @@ def decode_decoder(
                 data_arrived,
                 routed_output, combine_arrived,
                 local_moe_tokens, rank, layer + 1,
-                force_topk, local_experts=N_LOCAL_EXPERTS, topk=TOPK, dispatch_worker_limit=0,
+                force_topk, recv_x_local, recv_x_last_use,
+                local_experts=N_LOCAL_EXPERTS, topk=TOPK, dispatch_worker_limit=0,
             )
         # This residual enters the next layer's attention.
         target_layer = layer + 1

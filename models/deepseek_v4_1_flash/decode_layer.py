@@ -290,6 +290,8 @@ def l2_decode_layer(
 
     local_moe_tokens = pl.read(moe_num_tokens, [rank])
     force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
+    recv_x_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.FP8E4M3FN)
+    recv_x_last_use = pl.array.create(1, pl.TASK_ID)
     moe(
         attention_hidden, attention_pre_mix,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
@@ -306,7 +308,8 @@ def l2_decode_layer(
         recv_meta, recv_x, recv_routes,
         data_arrived, routed_output, combine_arrived,
         local_moe_tokens, rank, moe_epoch,
-        force_topk, local_experts=N_LOCAL_EXPERTS, topk=TOPK, dispatch_worker_limit=0,
+        force_topk, recv_x_local, recv_x_last_use,
+        local_experts=N_LOCAL_EXPERTS, topk=TOPK, dispatch_worker_limit=0,
     )
     clear_moe_signals(x_next, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
 

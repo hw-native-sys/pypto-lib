@@ -9,7 +9,6 @@
 # ci: no-sim
 """C1A full decode attention with HC."""
 
-
 from quant import packed_cache_compare
 
 import pypto.language as pl
@@ -18,8 +17,8 @@ from quant import pack_quantized_cache, unpack_quantized_cache
 
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from decode_indexer import (
-    select_candidate_block_pool, c1a_index, score_select_paged,
-    publish_index_rows, project_index_key, SCORE_SHARD_CACHE,
+    c1a_index, golden_select_qli, prepare_score_metadata, select_qli,
+    publish_index_rows, project_index_key,
 )
 from o_proj import o_proj_hc_post
 from sparse_attention import gather_sparse_attention
@@ -98,6 +97,7 @@ def decode_c1a_full(
     next_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
+    metadata, metadata_ready = prepare_score_metadata(request_ids, compressed_lens, num_tokens)
     tokens = pl.tensor.dim(x_hc, 0)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
@@ -146,23 +146,17 @@ def decode_c1a_full(
         projected_key, index_norm_weight, compressed_rope_cos, compressed_rope_sin, compressed_slots,
         index_cache, index_cache_scale, num_tokens, x_ready, pk_tid,
     )
-    # Logical index score capacity.
-    score_width = pl.tensor.dim(index_block_table, 1) * 128
-    (index_query, index_query_scale, index_weights, scores, query_tid, weights_tid) = c1a_index(
+    # Index query projection and selection.
+    index_query, index_query_scale, index_weights, query_tid, weights_tid = c1a_index(
         x_norm, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
-        num_tokens, score_width, x_ready,
+        num_tokens, x_ready,
         qb_payload, qb_scales,
     )
-    topk_tid, scores_tid = score_select_paged(
+    topk_tid = select_qli(
         index_query, index_query_scale, index_weights,
-        index_cache, index_cache_scale, index_block_table, request_ids, compressed_lens,
-        scores, topk_indices,
-        num_tokens, index_ready, query_tid, weights_tid,
-        pl.tensor.dim(pool_block_ids, 1),
-        shard_k_tile=SCORE_SHARD_CACHE, short_history_policy="score", score_layout="block_maxima",
-    )
-    pool_tid = select_candidate_block_pool(
-        scores, compressed_lens, pool_block_ids, pool_block_counts, num_tokens, scores_tid, score_layout="block_maxima",
+        index_cache, index_cache_scale, index_block_table, request_ids, compressed_lens, metadata,
+        topk_indices, pool_block_ids, pool_block_counts,
+        num_tokens, index_ready, query_tid, weights_tid, metadata_ready, True, False,
     )
     selection_ready = pl.system.task_dummy(deps=[topk_tid, compressed_ready])
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
@@ -360,7 +354,7 @@ def golden_c1a(tensors, mode="full"):
     from qkv_proj_rope import golden_qkv_proj_rope, golden_rope_tail
     from o_proj import golden_o_proj
     from decode_indexer import (
-        golden_index_key, golden_select_candidate_block_pool, golden_c1a_index_scores,
+        golden_index_key, golden_c1a_index_scores,
         golden_pool_index_scores, golden_c1a_index_topk,
     )
     from sparse_attention import golden_gather_sparse_attention
@@ -417,9 +411,12 @@ def golden_c1a(tensors, mode="full"):
             if pool_block_ids is None or pool_block_counts is None:
                 raise ValueError("C1A Reindex requires compact block-pool metadata")
             scores, physical = golden_pool_index_scores(scores, physical, pool_block_ids, pool_block_counts)
-        topk = golden_c1a_index_topk(scores, physical, lengths, pool_block_counts)
         if mode == "full":
-            pool_block_ids, pool_block_counts = golden_select_candidate_block_pool(scores, lengths)
+            topk, pool_block_ids, pool_block_counts = golden_select_qli(
+                scores, physical, lengths, pool_capacity=a["pool_block_ids"].shape[1], num_tokens=a.get("num_tokens"),
+            )
+        else:
+            topk = golden_c1a_index_topk(scores, physical, lengths, pool_block_counts)
     packed_window = pack_quantized_cache(window, window_scale)
     packed_compressed = pack_quantized_cache(compressed, compressed_scale)
     attended = golden_gather_sparse_attention(
