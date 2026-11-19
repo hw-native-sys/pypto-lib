@@ -888,7 +888,7 @@ def kv_proj_pypto(
         )
     else:
         kv_projection = _proj_kv_tile_pypto(
-            payload, wkv, scales, wkv_scale, kv_projection, num_tokens, worker_limit, 80, 64, 256,
+            payload, wkv, scales, wkv_scale, kv_projection, num_tokens, worker_limit, 80, 64, 320,
         )
     return kv_projection
 
