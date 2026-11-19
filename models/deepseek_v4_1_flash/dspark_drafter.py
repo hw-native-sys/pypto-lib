@@ -391,6 +391,8 @@ def _dspark_drafter(
     force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
     if BALANCED_ROUTING:
         initialize_balanced_routes(force_topk, query_tokens, rank, N_LOCAL_EXPERTS, TOPK)
+    recv_x_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.FP8E4M3FN)
+    recv_x_last_use = pl.array.create(1, pl.TASK_ID)
     for layer in pl.range(DSPARK_DRAFT_LAYERS):
         layer_wq_a_scale: pl.Tensor[[D // MX_GROUP, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[layer]
         layer_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wq_b_scale[layer]
@@ -431,7 +433,7 @@ def _dspark_drafter(
             recv_meta, recv_x, recv_routes,
             data_arrived, routed_output, combine_arrived,
             query_tokens, rank, moe_epoch + layer,
-            force_topk,
+            force_topk, recv_x_local, recv_x_last_use,
             local_experts=N_LOCAL_EXPERTS, topk=TOPK, dispatch_worker_limit=64,
         )
 

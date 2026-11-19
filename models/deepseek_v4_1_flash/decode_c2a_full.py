@@ -17,6 +17,7 @@ import pypto.language as pl
 from quant import pack_quantized_cache, unpack_quantized_cache
 
 from config import CACHE_ROWS_DYN
+
 from config import (
     FLASH as M, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, B_DYN, TABLE_DYN,
     Q_START_DYN, STATE_BLOCKS_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, STATE_CAPACITY,
@@ -28,7 +29,7 @@ from hc import hc_head_norm, hc_project, hc_sinkhorn
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from o_proj import o_proj_hc_post
 from sparse_attention import gather_sparse_attention
-from decode_indexer import decode_c2a_indexer
+from decode_indexer import decode_c2a_indexer, prepare_score_metadata
 
 # model config
 LOCAL_H = M.num_attention_heads
@@ -105,6 +106,7 @@ def decode_c2a_full(
     next_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
+    metadata, metadata_ready = prepare_score_metadata(token_to_req_indices, compressed_lens, num_tokens)
     tokens = pl.tensor.dim(x_hc, 0)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
@@ -149,7 +151,7 @@ def decode_c2a_full(
         x_norm, qb_payload, qb_scales, latent, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
         index_weights_proj, rope_cos, rope_sin, compressed_rope_cos, compressed_rope_sin,
         compressed_slots, index_cache, index_cache_scale, index_block_table, token_to_req_indices,
-        compressed_lens, topk_indices, num_tokens, cache_ready, compressed_publish_tid,
+        compressed_lens, metadata, topk_indices, num_tokens, cache_ready, compressed_publish_tid, metadata_ready,
     )
 
     chunk_done = pl.system.task_dummy(deps=[select_tid, compressed_publish_tid])

@@ -116,11 +116,12 @@ def decode_c1a_reindex(
         num_tokens, x_ready,
     )
     score_width = pl.tensor.dim(pool_block_ids, 1) * 8
-    index_query, index_query_scale, index_weights, scores, query_tid, weights_tid = c1a_index(
+    index_query, index_query_scale, index_weights, query_tid, weights_tid = c1a_index(
         x_norm, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
-        num_tokens, score_width, x_ready,
+        num_tokens, x_ready,
         qb_payload, qb_scales,
     )
+    scores = pl.create_tensor([tokens, score_width], dtype=pl.FP32)
     selection_ready = score_select_reindex(
         index_query, index_query_scale, index_weights, index_cache, index_cache_scale,
         index_block_table, request_ids, compressed_lens, pool_block_ids, pool_block_counts,

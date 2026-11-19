@@ -48,6 +48,52 @@ The source-layer tables in `config.py` determine ownership; these are different
 roles in one forward, rather than interchangeable execution options. C2A reuse
 uses the shared C1A reuse kernels with ratio-2 metadata.
 
+## Decode lightning indexer
+
+C1A and C2A full decode paths compose C++ AIC/AIV kernels derived from
+[DeepGEMM-Ascend](https://github.com/deepseek-ai/DeepGEMM-Ascend/tree/3a35326271b069b8b5bf1a754435acd6cc91575b) and [DeepSelect](https://github.com/deepseek-ai/DeepSelect/tree/bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18).
+Score computation and token selection follow
+the pinned official implementations on identical quantized inputs, including
+BF16 rounding, threshold filtering, seeded traversal, cutoff tie choices, and
+unsorted output order. Attention selects 512 tokens with
+`sorted_index=False` by default. The optional sorted mode orders the selected
+logical token indices before converting them to physical cache row indices.
+The kernels read the existing query, scale, and split cache layouts directly.
+Head-weight scaling runs inside the scorer, and physical index mapping runs
+inside the selector's writeback; neither requires a separate adapter task.
+A single AIV worker computes scheduling metadata from valid request IDs and
+visible lengths. Full-layer entries submit it before HC and projection work;
+it waits only for its tensor inputs. The scorer joins metadata, query, and KV
+readiness. There is no AICPU scalar planning loop or sanitized-length workspace.
+
+C1A also produces up to 2,048 candidate block IDs for Reindex. Each block covers
+eight tokens; the newest valid block is retained for finite inputs, following
+[DeepInfer](https://github.com/deepseek-ai/DeepInfer/blob/a679bb86ce36e883a98a97733492b686e5b9a08e/deepinfer/model_executor/layers/tilelang_ops/candidate_blocks.py).
+The scorer computes block maxima from its final BF16 logits in UB, sharing the logits pipeline
+buffers and synchronization. Token and candidate selection run as independent
+consumers; current attention waits only for token selection. Candidate IDs are
+always sorted by logical block number, independently of the attention sorting
+option. Invalid slots are `-1` and inactive rows have zero candidates.
+C2A does not allocate or clear candidate buffers.
+
+Visible lengths must fit the page table and the native limit of 2,097,152
+tokens per row. Both selectors reject a visible NaN before writing that row;
+block scoring preserves NaNs even in the newest block. Scores beyond the
+visible length do not participate.
+
+The [standalone entry](../../../models/deepseek_v4_1_flash/decode_indexer.py)
+checks both page sizes, attention ordering modes and candidate modes on
+bounded inputs:
+
+```bash
+python models/deepseek_v4_1_flash/decode_indexer.py --device "${TASK_DEVICE}"
+```
+
+Select the allocated device in the local execution environment. Larger shapes
+are explicit options, for example `--batch 12 --sequence 6 --kv-length 65536`.
+The latter is the LI history length; C2A's ratio-2 compression halves the
+original sequence history.
+
 ## Execution structure
 
 Prefill composes embedding and metadata preparation, the configured attention/MoE

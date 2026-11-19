@@ -211,6 +211,8 @@ def moe(
     ep_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
     force_topk: pl.Tensor,
+    recv_x_local: pl.Tensor,
+    recv_x_last_use: pl.Array[1, pl.TASK_ID],
     local_experts: pl.constexpr = N_LOCAL_EXPERTS,
     topk: pl.constexpr = TOPK,
     dispatch_worker_limit: pl.constexpr = 0,
@@ -248,7 +250,6 @@ def moe(
             shared_output,
         )
 
-        recv_x_local = pl.create_tensor([local_experts, RECV_MAX, D], dtype=pl.FP8E4M3FN)
         # Contiguous ND backing for the routed-expert MX_A_ZZ view.
         recv_scale_local_backing = pl.create_tensor([1, local_experts * RECV_MAX * (D // MX_GROUP)], dtype=pl.FP8E8M0)
         recv_weight_local = pl.create_tensor([local_experts, RECV_MAX], dtype=pl.FP32)
@@ -260,7 +261,7 @@ def moe(
             recv_x_local, recv_scale_local_backing,
             recv_weight_local, recv_route_local, recv_count_local, recv_meta_local,
             recv_meta, recv_x, recv_routes,
-            data_arrived, num_tokens, ep_rank, moe_epoch,
+            data_arrived, num_tokens, ep_rank, moe_epoch, recv_x_last_use[0],
             local_experts=local_experts, topk=topk, dispatch_worker_limit=dispatch_worker_limit,
         )
 
@@ -283,6 +284,7 @@ def moe(
         hc_post_deps[0] = output_ready
         hc_post_deps[1] = mixes_ready
         hc_post(sublayer, x_hc, post_mix, residual_mix, x_next, deps=hc_post_deps)
+        recv_x_last_use[0] = scatter_done
     return x_next
 
 
@@ -328,6 +330,8 @@ def l2_moe(
     x_mixed.bind_dynamic(0, T_DYN)
     x_next.bind_dynamic(0, T_DYN)
     local_num_tokens = pl.read(num_tokens, [ep_rank])
+    recv_x_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.FP8E4M3FN)
+    recv_x_last_use = pl.array.create(1, pl.TASK_ID)
     moe(
         x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_weight, gate_weight, correction_bias,
@@ -337,7 +341,7 @@ def l2_moe(
         next_pre_mix, x_mixed, x_next,
         recv_meta, recv_x, recv_routes,
         data_arrived, routed_output, combine_arrived,
-        local_num_tokens, ep_rank, moe_epoch, force_topk,
+        local_num_tokens, ep_rank, moe_epoch, force_topk, recv_x_local, recv_x_last_use,
         local_experts=N_LOCAL_EXPERTS, topk=TOPK, dispatch_worker_limit=0,
     )
     clear_moe_signals(x_next, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
