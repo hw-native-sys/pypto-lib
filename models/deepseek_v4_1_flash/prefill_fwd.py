@@ -13,9 +13,10 @@
 Each DP group owns independent requests and replicated cache state. Attention uses full
 weights and head-tail query shards. MoE processes local rows, and HC is restored
 to scheduler order between layers for CED replay and caller-owned state.
-Engram consumes host-gathered rows at layers 1 and 14.
+Engram consumes Device lookup rows at layers 1 and 14.
 """
 
+from contextlib import ExitStack, nullcontext
 import struct
 import math
 from numbers import Integral
@@ -26,6 +27,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import sys
 import time
 
 
@@ -53,7 +55,7 @@ _default_experts = C.FLASH.n_routed_experts // C.EP_SIZE if C.EP_SIZE in (4, 8) 
 C.N_LOCAL_EXPERTS = _default_experts if _shape_options.experts_per_rank is None else _shape_options.experts_per_rank
 if C.N_LOCAL_EXPERTS <= 0 or C.EP_SIZE * C.N_LOCAL_EXPERTS % 16:
     _shape_parser.error("--experts-per-rank must be positive and give a total expert count aligned to 16")
-_MAX_CHUNK_TOKENS = 4096
+_MAX_CHUNK_TOKENS = C.PREFILL_MAX_TOKENS
 CAPACITY = _shape_options.capacity
 CP_SIZE = C.CP_SIZE
 LOCAL_CAPACITY = 2 * ((CAPACITY + 2 * CP_SIZE - 1) // (2 * CP_SIZE))
@@ -64,7 +66,7 @@ if C.EP_SIZE % CP_SIZE or _shape_options.dp not in (None, DP_SIZE):
 if C.EP_SIZE % C.LM_HEAD_TP_SIZE:
     _shape_parser.error("EP must be divisible by LM head TP")
 if not 16 <= CAPACITY <= _MAX_CHUNK_TOKENS or CAPACITY % 16:
-    _shape_parser.error("--capacity must be between 16 and 4096 and a multiple of 16")
+    _shape_parser.error(f"--capacity must be between 16 and {_MAX_CHUNK_TOKENS} and a multiple of 16")
 # Keep MoE scratch bounded independently of the current-row capacity.
 C.set_moe_tokens(min((LOCAL_CAPACITY + 15) // 16 * 16, _shape_options.moe_tokens))
 
@@ -81,8 +83,12 @@ from hc import hc_head
 from input_pack import gather_rows, pack_x_hc
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, prepare_forward_rope_tables
 from utils import paged_slots, window_metadata
-from engram import ENGRAM_K, KV_OUT, HostEngram, engram_from_rows
-from lm_head import MAX_LOGIT_ROWS, lm_head, greedy_sample
+from engram import ENGRAM_K, FETCH_TILE, KV_OUT, N_HASH_COLS, HostEngram, engram_from_rows, engram_host_lookup
+from engram_host_offload import (
+    ENGRAM_ROWS, ENGRAM_SHARD_ROWS, ENGRAM_FULL_VOCAB, EngramHostTables, EngramPayloadSource,
+    validate_forward_engram_layout, write_forward_engram_layout,
+)
+from lm_head import MAX_LOGIT_ROWS, greedy_sample, lm_head
 from prefill_moe import AUX_WIDTH, ROUTE_WIDTH, clear_moe_signals
 from prefill_moe import prefill_moe_slabs
 from compressor import STATE_WIDTH
@@ -452,8 +458,8 @@ def prefill_attention_cp(
 prefill_attention_entry = prefill_attention_cp if CP_SIZE > 1 else prefill_attention
 
 
-@pl.jit(auto_scope=False)
-def l2_prefill_fwd(
+@pl.jit.inline(auto_scope=False)
+def prefill_fwd(
     embedding: pl.Tensor[[CAPACITY, D], pl.BF16],
     engram_lookup: pl.Tensor[[2, CAPACITY, ENGRAM_K], pl.BF16],
     engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
@@ -899,10 +905,151 @@ def l2_prefill_fwd(
     return logits, sampled_ids
 
 
+@pl.jit(auto_scope=False)
+def l2_prefill_fwd(
+    embedding: pl.Tensor[[CAPACITY, D], pl.BF16],
+    engram_ids: pl.Tensor[[2 * CAPACITY * N_HASH_COLS, 1], pl.INT32],
+    engram_scales: pl.Tensor[[2 * ENGRAM_ROWS, 8], pl.UINT8],
+    engram_payload: pld.DistributedTensor[[2 * ENGRAM_SHARD_ROWS, 256], pl.UINT8],
+    engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
+    engram_wkv_scale: pl.Tensor[[2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
+    engram_weight: pl.Tensor[[2, HC_MULT, D], pl.FP32],
+    embedding_ids: pl.Tensor[[CAPACITY], pl.INT64],
+    initial_pre: pl.Tensor[[CAPACITY, HC_MULT], pl.FP32],
+    identity_rows: pl.Tensor[[CAPACITY], pl.INT32],
+    hc_attn_fn: pl.Tensor[[N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
+    hc_attn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[N_LAYERS * D], pl.BF16],
+    wq_a: pl.Tensor[[N_LAYERS, D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), Q_LORA], pl.FP8E8M0],
+    q_norm_weight: pl.Tensor[[N_LAYERS * Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[N_LAYERS, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[N_LAYERS * (Q_LORA // MX_GROUP), LOCAL_H * HEAD_DIM], pl.FP8E8M0],
+    wkv: pl.Tensor[[N_LAYERS, D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), HEAD_DIM], pl.FP8E8M0],
+    kv_norm_weight: pl.Tensor[[N_LAYERS * HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[N_LAYERS * LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[N_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[N_LAYERS * (LOCAL_O_WIDTH // MX_GROUP), D], pl.FP8E8M0],
+    c2a_compressor_wkv: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.BF16, pl.NZ],
+    c2a_compressor_wgate: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.BF16, pl.NZ],
+    c1a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
+    compressor_norm_weight: pl.Tensor[[KV_SOURCE_COUNT * HEAD_DIM], pl.BF16],
+    index_wk: pl.Tensor[[INDEX_SOURCE_COUNT, HEAD_DIM, INDEX_DIM], pl.BF16, pl.NZ],
+    index_norm_weight: pl.Tensor[[INDEX_SOURCE_COUNT * INDEX_DIM], pl.BF16],
+    index_wq_b: pl.Tensor[[INDEX_SOURCE_COUNT, Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN, pl.NZ],
+    index_wq_b_scale: pl.Tensor[[INDEX_SOURCE_COUNT * (Q_LORA // MX_GROUP), INDEX_H * INDEX_DIM], pl.FP8E8M0],
+    index_weights_proj: pl.Tensor[[INDEX_SOURCE_COUNT, D, INDEX_H], pl.BF16, pl.NZ],
+    hc_ffn_fn: pl.Tensor[[N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
+    ffn_norm_weight: pl.Tensor[[N_LAYERS * D], pl.BF16],
+    gate_weight: pl.Tensor[[N_LAYERS * N_EXPERTS, D], pl.BF16],
+    correction_bias: pl.Tensor[[N_LAYERS * N_EXPERTS], pl.FP32],
+    routed_w1: pl.Tensor[[N_LAYERS * LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w1_scale: pl.Tensor[[N_LAYERS * (LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
+    routed_w2: pl.Tensor[[N_LAYERS * LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w2_scale: pl.Tensor[[N_LAYERS * (LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), D], pl.FP8E8M0],
+    routed_w3: pl.Tensor[[N_LAYERS * LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w3_scale: pl.Tensor[[N_LAYERS * (LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
+    shared_w1: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w1_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
+    shared_w2: pl.Tensor[[N_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
+    shared_w2_scale: pl.Tensor[[N_LAYERS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
+    shared_w3: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w3_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
+    counts: pl.Tensor[[2], pl.INT32],
+    replay_rows: pl.Tensor[[CAPACITY], pl.INT32],
+    position_ids: pl.Tensor[[2, CAPACITY], pl.INT32],
+    freqs_cos: pl.Tensor[[2, ROPE_ROWS_DYN, 32], pl.FP32],
+    freqs_sin: pl.Tensor[[2, ROPE_ROWS_DYN, 32], pl.FP32],
+    window_slots: pl.Tensor[[2, CAPACITY], pl.INT64],
+    window_indices: pl.Tensor[[2, CAPACITY, 128], pl.INT32],
+    c2a_compressed_slots: pl.Tensor[[CAPACITY], pl.INT64],
+    c1a_compressed_slots: pl.Tensor[[CAPACITY], pl.INT64],
+    token_to_req_indices: pl.Tensor[[2, CAPACITY], pl.INT32],
+    query_start_loc: pl.Tensor[[2, Q_START_DYN], pl.INT32],
+    c2a_index_block_table: pl.Tensor[[B_DYN, C2A_TABLE_DYN], pl.INT32],
+    c1a_index_block_table: pl.Tensor[[B_DYN, C1A_TABLE_DYN], pl.INT32],
+    state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
+    window_cache: pl.InOut[pl.Tensor[[40, PAGES, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    compressed_cache: pl.InOut[pl.Tensor[[4, PAGES, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
+    index_cache: pl.InOut[pl.Tensor[[4, PAGES, 128, 1, 64], pl.UINT8]],
+    index_scales: pl.InOut[pl.Tensor[[4, PAGES, 128, 1, 4], pl.FP8E8M0]],
+    state_cache: pl.InOut[pl.Tensor[[3, STATE_BLOCKS_DYN, C.STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
+    final_norm_weight: pl.Tensor[[D], pl.BF16],
+    lm_head_weight: pl.Tensor[[D, VOCAB // LM_HEAD_TP_SIZE], pl.BF16, pl.NZ],
+    logit_rows: pl.Tensor[[16], pl.INT32],
+    x_hc_out: pl.Out[pl.Tensor[[CAPACITY, HC_MULT, D], pl.FP32]],
+    pre_mix_out: pl.Out[pl.Tensor[[CAPACITY, HC_MULT], pl.FP32]],
+    dspark_target_hidden: pl.Out[pl.Tensor[[CAPACITY, DSPARK_MAIN_IN], pl.BF16]],
+    logits: pl.Out[pl.Tensor[[16, VOCAB], pl.FP32]],
+    sampled_ids: pl.Out[pl.Tensor[[16, 8], pl.INT32]],
+    recv_meta: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS], pl.INT32],
+    recv_x: pld.DistributedTensor[[LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
+    recv_scale: pld.DistributedTensor[[LOCAL_EXPERTS * RECV_MAX, D // 32], pl.UINT8],
+    recv_weights: pld.DistributedTensor[[LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
+    recv_routes: pld.DistributedTensor[[LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
+    arrived: pld.DistributedTensor[[RANKS, 128], pl.INT32],
+    data_arrived: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS, 128], pl.INT32],
+    routed_output: pld.DistributedTensor[[MOE_TOKENS * TOPK, D], pl.BF16],
+    combine_arrived: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS, 128], pl.INT32],
+    attention_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, D], pl.BF16],
+    attention_arrived: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    hc_window: pld.DistributedTensor[[LOCAL_CAPACITY, HC_DIM + 16], pl.FP32],
+    hc_arrived: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    head_hidden: pld.DistributedTensor[[LM_HEAD_TP_SIZE * 16, D], pl.BF16],
+    head_hidden_done: pld.DistributedTensor[[C.LM_HEAD_TP_SIZE, 1], pl.INT32],
+    head_logits: pld.DistributedTensor[[16, VOCAB], pl.FP32],
+    head_logits_done: pld.DistributedTensor[[C.LM_HEAD_TP_SIZE, 1], pl.INT32],
+    rank: pl.Scalar[pl.INT32],
+):
+    lookup_count = 2 * CAPACITY * N_HASH_COLS
+    lookup_flat = pl.create_tensor([lookup_count, 256], dtype=pl.BF16)
+    engram_first = pl.create_tensor([FETCH_TILE, 256], dtype=pl.UINT8)
+    engram_second = pl.create_tensor([FETCH_TILE, 256], dtype=pl.UINT8)
+    lookup_flat = engram_host_lookup(
+        engram_ids, engram_payload, engram_first, engram_second, engram_scales, lookup_flat,
+        ENGRAM_FULL_VOCAB, ENGRAM_SHARD_ROWS,
+    )
+    engram_lookup = pl.reshape(lookup_flat, [2, CAPACITY, ENGRAM_K])
+    return prefill_fwd(
+        embedding,
+        engram_lookup, engram_wkv, engram_wkv_scale, engram_weight,
+        embedding_ids, initial_pre, identity_rows,
+        hc_attn_fn, hc_attn_scale, hc_attn_base,
+        attn_norm_weight,
+        wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
+        wkv, wkv_scale, kv_norm_weight, attn_sink,
+        wo_a, wo_a_scale, wo_b, wo_b_scale,
+        c2a_compressor_wkv, c2a_compressor_wgate, c1a_compressor_wkv, compressor_norm_weight,
+        index_wk, index_norm_weight, index_wq_b, index_wq_b_scale, index_weights_proj,
+        hc_ffn_fn, hc_ffn_scale, hc_ffn_base, ffn_norm_weight,
+        gate_weight, correction_bias,
+        routed_w1, routed_w1_scale, routed_w2, routed_w2_scale, routed_w3, routed_w3_scale,
+        shared_w1, shared_w1_scale, shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
+        counts, replay_rows, position_ids, freqs_cos, freqs_sin,
+        window_slots, window_indices, c2a_compressed_slots, c1a_compressed_slots,
+        token_to_req_indices, query_start_loc, c2a_index_block_table, c1a_index_block_table, state_block_table,
+        window_cache, compressed_cache, index_cache, index_scales, state_cache,
+        final_norm_weight, lm_head_weight, logit_rows,
+        x_hc_out, pre_mix_out, dspark_target_hidden, logits, sampled_ids,
+        recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
+        arrived, data_arrived, routed_output, combine_arrived,
+        attention_window, attention_arrived, hc_window, hc_arrived,
+        head_hidden, head_hidden_done, head_logits, head_logits_done,
+        rank,
+    )
+
+
 @pl.jit.host
 def l3_prefill_fwd(
     embedding: pl.Tensor[[RANKS, CAPACITY, D], pl.BF16],
-    engram_lookup: pl.Tensor[[RANKS, 2, CAPACITY, ENGRAM_K], pl.BF16],
+    engram_ids: pl.Tensor[[RANKS, 2 * CAPACITY * N_HASH_COLS, 1], pl.INT32],
+    engram_scales: pl.Tensor[[RANKS, 2 * ENGRAM_ROWS, 8], pl.UINT8],
     engram_wkv: pl.Tensor[[RANKS, 2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
     engram_wkv_scale: pl.Tensor[[RANKS, 2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
     engram_weight: pl.Tensor[[RANKS, 2, HC_MULT, D], pl.FP32],
@@ -1030,7 +1177,7 @@ def l3_prefill_fwd(
     reset_persistent_windows=False; signals are retired at forward completion.
     After request completion, release pages and reset the request slot in all C2A sources before
     assigning them to another request; failed calls require cache restoration
-    or reset before retry. Engram consumes host lookup rows; vision and DSpark have no inputs here.
+    or reset before retry. Engram fetches FP8 Host payloads using Device-resident scales; vision and DSpark have no inputs here.
     """
     freqs_cos.bind_dynamic(2, ROPE_ROWS_DYN)
     freqs_sin.bind_dynamic(2, ROPE_ROWS_DYN)
@@ -1042,6 +1189,7 @@ def l3_prefill_fwd(
     c1a_index_block_table.bind_dynamic(1, B_DYN)
     c1a_index_block_table.bind_dynamic(2, C1A_TABLE_DYN)
     query_start_loc.bind_dynamic(2, Q_START_DYN)
+    engram_payload_buffer = pld.alloc_window_buffer([2 * ENGRAM_SHARD_ROWS, 256], dtype=pl.UINT8, memory_source="host", init="engram_payload")
     recv_meta_buffer = pld.alloc_window_buffer([RANKS, LOCAL_EXPERTS], dtype=pl.INT32)
     recv_x_buffer = pld.alloc_window_buffer([LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
     recv_scale_buffer = pld.alloc_window_buffer([LOCAL_EXPERTS * RECV_MAX, D // 32], dtype=pl.UINT8)
@@ -1060,6 +1208,7 @@ def l3_prefill_fwd(
     head_logits_buffer = pld.alloc_window_buffer([16, VOCAB], dtype=pl.BF16)
     head_logits_done_buffer = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
+        engram_payload = pld.window(engram_payload_buffer, [2 * ENGRAM_SHARD_ROWS, 256], dtype=pl.UINT8)
         recv_meta = pld.window(recv_meta_buffer, [RANKS, LOCAL_EXPERTS], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buffer, [LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
         recv_scale = pld.window(recv_scale_buffer, [LOCAL_EXPERTS * RECV_MAX, D // 32], dtype=pl.UINT8)
@@ -1079,7 +1228,8 @@ def l3_prefill_fwd(
         head_logits_done = pld.window(head_logits_done_buffer, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         l2_prefill_fwd(
             embedding[rank],
-            engram_lookup[rank], engram_wkv[rank], engram_wkv_scale[rank], engram_weight[rank],
+            engram_ids[rank], engram_scales[rank], engram_payload,
+            engram_wkv[rank], engram_wkv_scale[rank], engram_weight[rank],
             embedding_ids[rank],
             initial_pre[rank],
             identity_rows[rank],
@@ -1146,7 +1296,7 @@ def l3_prefill_fwd(
 
 PREFILL_TENSORS = (
     "embedding",
-    "engram_lookup", "engram_wkv", "engram_wkv_scale", "engram_weight",
+    "engram_ids", "engram_scales", "engram_wkv", "engram_wkv_scale", "engram_weight",
     "embedding_ids",
     "initial_pre",
     "identity_rows",
@@ -1234,26 +1384,35 @@ class PrefillCheckpoint:
         self.weight_map = index["weight_map"]
         self._headers = {}
 
-    def tensor(self, name: str) -> torch.Tensor:
-        """Return an owned CPU tensor without loading the rest of its shard."""
+    def tensor_span(self, name: str):
+        """Return validated shard path, byte offset, shape and dtype without reading payload."""
         shard = self.weight_map[name]
         path = (self.root / shard).resolve()
         if not path.is_relative_to(self.root):
             raise ValueError(f"checkpoint shard leaves its root: {shard}")
         with path.open("rb") as file:
-            header_size = struct.unpack("<Q", file.read(8))[0]
+            prefix = file.read(8)
+            if len(prefix) != 8:
+                raise ValueError(f"truncated safetensors header: {shard}")
+            header_size = struct.unpack("<Q", prefix)[0]
             if header_size > 64 * 1024 * 1024:
                 raise ValueError(f"safetensors header is too large: {shard}")
             if shard not in self._headers:
                 self._headers[shard] = json.loads(file.read(header_size))
-            entry = self._headers[shard][name]
-            dtype = _DTYPES[entry["dtype"]]
-            shape = entry["shape"]
-            start, end = entry["data_offsets"]
-            expected_bytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
-            if start < 0 or end - start != expected_bytes or 8 + header_size + end > path.stat().st_size:
-                raise ValueError(f"invalid safetensors range for {name}")
-            file.seek(8 + header_size + start)
+        entry = self._headers[shard][name]
+        dtype, shape = _DTYPES[entry["dtype"]], entry["shape"]
+        start, end = entry["data_offsets"]
+        expected_bytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+        if start < 0 or end - start != expected_bytes or 8 + header_size + end > path.stat().st_size:
+            raise ValueError(f"invalid safetensors range for {name}")
+        return path, 8 + header_size + start, tuple(shape), dtype
+
+    def tensor(self, name: str) -> torch.Tensor:
+        """Return an owned CPU tensor without loading the rest of its shard."""
+        path, offset, shape, dtype = self.tensor_span(name)
+        expected_bytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+        with path.open("rb") as file:
+            file.seek(offset)
             payload = bytearray(file.read(expected_bytes))
         if len(payload) != expected_bytes:
             raise ValueError(f"truncated safetensors payload for {name}")
@@ -1264,47 +1423,24 @@ class PrefillCheckpoint:
         if rows.dtype not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
             raise ValueError("table row ids must have an integer dtype")
         ids = rows.to(dtype=torch.int64, device="cpu").flatten()
-        shard = self.weight_map[name]
-        path = (self.root / shard).resolve()
-        if not path.is_relative_to(self.root):
-            raise ValueError(f"checkpoint shard leaves its root: {shard}")
+        path, offset, shape, dtype = self.tensor_span(name)
+        if len(shape) != 2 or bool(((ids < 0) | (ids >= shape[0])).any()):
+            raise ValueError(f"invalid table rows for {name}")
+        row_bytes = shape[1] * torch.empty((), dtype=dtype).element_size()
+        unique, inverse = torch.unique(ids, sorted=True, return_inverse=True)
+        payload = bytearray(unique.numel() * row_bytes)
         with path.open("rb") as file:
-            header_size = struct.unpack("<Q", file.read(8))[0]
-            if header_size > 64 * 1024 * 1024:
-                raise ValueError(f"safetensors header is too large: {shard}")
-            if shard not in self._headers:
-                self._headers[shard] = json.loads(file.read(header_size))
-            entry = self._headers[shard][name]
-            dtype, shape = _DTYPES[entry["dtype"]], entry["shape"]
-            if len(shape) != 2 or bool(((ids < 0) | (ids >= shape[0])).any()):
-                raise ValueError(f"invalid table rows for {name}")
-            row_bytes = shape[1] * torch.empty((), dtype=dtype).element_size()
-            start, end = entry["data_offsets"]
-            if (
-                start < 0
-                or end - start != shape[0] * row_bytes
-                or 8 + header_size + end > path.stat().st_size
-            ):
-                raise ValueError(f"invalid safetensors range for {name}")
-            unique, inverse = torch.unique(ids, sorted=True, return_inverse=True)
-            payload = bytearray(unique.numel() * row_bytes)
             for index, row in enumerate(unique.tolist()):
-                file.seek(8 + header_size + start + row * row_bytes)
+                file.seek(offset + row * row_bytes)
                 data = file.read(row_bytes)
                 if len(data) != row_bytes:
                     raise ValueError(f"truncated safetensors row for {name}")
-                payload[index * row_bytes : (index + 1) * row_bytes] = data
+                payload[index * row_bytes:(index + 1) * row_bytes] = data
         if not ids.numel():
             return torch.empty(*rows.shape, shape[1], dtype=dtype)
         table = torch.frombuffer(payload, dtype=dtype).reshape(-1, shape[1])
-        # CPU indexing is unavailable for FP8; index its byte representation.
-        return (
-            table.view(torch.uint8)
-            .reshape(unique.numel(), row_bytes)[inverse]
-            .contiguous()
-            .view(dtype)
-            .reshape(*rows.shape, shape[1])
-        )
+        selected = table.view(torch.uint8).reshape(unique.numel(), row_bytes)[inverse]
+        return selected.contiguous().view(dtype).reshape(*rows.shape, shape[1])
 
 
 def forward_weight_layouts(local_experts: int):
@@ -1648,7 +1784,7 @@ def prepare_prefill_inputs(
 
     values = {
         "embedding": pad(embedding),
-        "engram_lookup": torch.zeros((2, capacity, ENGRAM_K), dtype=torch.bfloat16),
+        "engram_ids": torch.full((2 * capacity * N_HASH_COLS, 1), -1, dtype=torch.int32),
         "embedding_ids": torch.arange(capacity, dtype=torch.int64),
         "initial_pre": initial_pre,
         "identity_rows": pad(torch.arange(count, dtype=torch.int32), -1),
@@ -1721,13 +1857,16 @@ def prepare_resident_inputs(
     )
     lengths = [count] if query_lens is None else list(query_lens)
     starts = [start_pos] * len(lengths) if isinstance(start_pos, Integral) else list(start_pos)
+    hashes = torch.full((2, capacity, N_HASH_COLS), -1, dtype=torch.int32)
     offset = 0
     for request, (length, prefix) in enumerate(zip(lengths, starts)):
         if length:
             history_key = request_id if query_lens is None else (request_id, request)
-            rows = engram.lookup(ids[offset:offset + length], length, prefix, request_id=history_key)
-            values["engram_lookup"][:, offset:offset + length] = rows
+            current = engram.hash_ids(ids[offset:offset + length], prefix, request_id=history_key)
+            hashes[:, offset:offset + length] = current.to(torch.int32)
         offset += length
+    values["engram_hash_ids"] = hashes
+    values["engram_ids"] = hashes.reshape(-1, 1).contiguous()
     return values
 
 
@@ -1801,8 +1940,11 @@ def prepare_decode_inputs(values):
     embedding = values["embedding"].float()
     result = {
         "x_hc": embedding[:, None, :].expand(-1, M.hc_mult, -1).contiguous(),
-        "pre_mix": values["initial_pre"], "engram_lookup": values["engram_lookup"],
+        "pre_mix": values["initial_pre"], "engram_ids": values["engram_ids"],
+        "logit_row_indices": values["logit_rows"],
     }
+    if "engram_hash_ids" in values:
+        result["engram_hash_ids"] = values["engram_hash_ids"]
     # Prefill metadata has encoder/decoder stages; decode starts from encoder rows.
     for name in ("window_slots", "window_indices", "token_to_req_indices", "position_ids", "query_start_loc"):
         result[name] = values[name][0].contiguous()
@@ -1812,7 +1954,11 @@ def prepare_decode_inputs(values):
     return result
 
 
-def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk_size=None, decode_compiled=None):
+def generate(
+    checkpoint, compiled, device_ids, prompts, max_new_tokens, *,
+    engram_strategy="sliced_enp", chunk_size=None, decode_compiled=None,
+    ring_heap_bytes=RING_HEAP_BYTES,
+):
     """Generate one independent continuation per rank using resident checkpoint weights.
 
     Prefill and subsequent one-token calls retain native device caches. Only
@@ -1823,25 +1969,30 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
     """
     if CP_SIZE != 1:
         raise ValueError("checkpoint generation currently requires CP=1")
+    validate_forward_engram_layout(compiled.output_dir, RANKS, ENGRAM_ROWS, engram_strategy)
+    if decode_compiled is not None:
+        validate_forward_engram_layout(decode_compiled.output_dir, RANKS, ENGRAM_ROWS, engram_strategy)
 
     from tokenizers import Tokenizer
     from pypto.runtime import DeviceTensor
 
-    # Validate the host-row Engram ABI and compilation shapes.
+    # Validate the integrated Engram ABI and compilation shapes.
     parameters = compiled._get_metadata()[0]
-    if (len(parameters) != len(PREFILL_TENSORS)
-            or parameters[0].shape != [RANKS, CAPACITY, D]):
-        raise ValueError("--runtime-dir must contain prefill compiled for the same EP and capacity with host Engram rows")
+    names = [parameter.name.removesuffix("__ssa_v0") for parameter in parameters]
+    if (names != list(PREFILL_TENSORS) or tuple(parameters[0].shape) != (RANKS, CAPACITY, D)
+            or tuple(parameters[1].shape) != (RANKS, 2 * CAPACITY * N_HASH_COLS, 1)
+            or tuple(parameters[2].shape) != (RANKS, 2 * ENGRAM_ROWS, 8)):
+        raise ValueError("--runtime-dir must contain prefill compiled for the same EP and capacity with integrated Engram lookup")
     decode_names = []
     if decode_compiled is not None:
         decode_parameters = decode_compiled._get_metadata()[0]
         decode_names = [parameter.name.removesuffix("__ssa_v0") for parameter in decode_parameters]
-        if decode_names[:4] != ["engram_lookup", "engram_wkv", "engram_wkv_scale", "engram_weight"]:
-            raise ValueError("decode artifact must use the host-row Engram ABI")
+        if decode_names[:5] != ["engram_ids", "engram_scales", "engram_wkv", "engram_wkv_scale", "engram_weight"]:
+            raise ValueError("decode artifact must use the integrated Engram ABI")
         decode_shape = decode_parameters[0].shape
-        decode_rows = DECODE_INPUT_MAX_TOKENS
-        if (decode_shape[:2] != [RANKS, 2] or decode_shape[2] not in (-1, decode_rows)
-                or decode_shape[3] != ENGRAM_K):
+        decode_rows = C.DECODE_INPUT_MAX_TOKENS
+        if (decode_shape[0] != RANKS or decode_shape[-1] != 1
+                or tuple(decode_parameters[1].shape) != (RANKS, 2 * ENGRAM_ROWS, 8)):
             raise ValueError("decode artifact must match EP and the configured decode capacity")
     if len(device_ids) != RANKS or len(set(device_ids)) != RANKS or len(prompts) != RANKS:
         raise ValueError(f"prefill requires {RANKS} distinct devices and one prompt per rank")
@@ -1863,7 +2014,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
     ]
     chunk_size = CAPACITY if chunk_size is None else chunk_size
     if not 1 <= chunk_size <= CAPACITY:
-        raise ValueError("chunk_size must fit CAPACITY and be at most 4096")
+        raise ValueError(f"chunk_size must fit CAPACITY and be at most {_MAX_CHUNK_TOKENS}")
     max_seq_len = max(map(len, sequences)) + max_new_tokens
     if max_seq_len > M.max_position_embeddings:
         raise ValueError("prompt plus generation exceeds the model position bound")
@@ -1875,9 +2026,12 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
     weights = ResidentPrefillWeights(checkpoint, ep_size=RANKS)
     engram = HostEngram(checkpoint, tokenizer)
     config = RunConfig(
-        backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD, ring_heap=RING_HEAP_BYTES,
+        backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD, ring_heap=ring_heap_bytes,
         distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
     )
+    tables = EngramHostTables(checkpoint, RANKS, engram_strategy, program_count=1 + (decode_compiled is not None))
+    if tables.rows_per_layer != ENGRAM_ROWS or engram_strategy != ("full_vocab_local" if ENGRAM_FULL_VOCAB else "sliced_enp"):
+        raise ValueError("Engram table shape and strategy must match the forward compilation")
     outputs = {
         "x_hc_out": ((CAPACITY, HC_MULT, D), torch.float32),
         "pre_mix_out": ((CAPACITY, HC_MULT), torch.float32),
@@ -1901,13 +2055,18 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
     }
     print("CED_RESIDENT_BYTES_PER_RANK", weights.bytes_per_rank, flush=True)
     start = time.monotonic()
+    timing_samples = []
     # Completed forwards retire signals; native cache allocations persist.
+    extra = [] if decode_compiled is None else [decode_compiled]
     generation_head = None if decode_compiled is None else l3_generation_head.compile(config=config)
-    extra = [] if decode_compiled is None else [decode_compiled, generation_head]
-    with compiled.prepare(
+    if generation_head is not None:
+        extra.append(generation_head)
+    inherited = [*decode_counts.values(), tables.upload_buffer]
+    with tables, compiled.prepare(
         config, extra_compiled=extra, persistent=True, reset_persistent_windows=False,
-        inherited_host_tensors=list(decode_counts.values()),
+        inherited_host_tensors=inherited, window_sources={"engram_payload": tables.sources},
     ) as runtime:
+        device_scales = tables.upload_scales(runtime)
         per_rank = [{} for _ in device_ids]
         host_cache = []
         rope_tables = None
@@ -1923,6 +2082,8 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
                 if name in weights.tensor_layouts:
                     shape, dtype = weights.tensor_layouts[name]
                     tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
+                elif name == "engram_scales":
+                    tensors[name] = device_scales.shards[rank]
                 elif name in outputs:
                     shape, dtype = outputs[name]
                     tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
@@ -1973,6 +2134,10 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
                         )
                     elif name in constants:
                         tensors[name] = per_rank[rank][name]
+                    elif name == "engram_scales":
+                        tensors[name] = device_scales.shards[rank]
+                    elif name == "dspark_target_hidden":
+                        tensors[name] = runtime.alloc_tensor((decode_rows, DSPARK_MAIN_IN), torch.bfloat16, worker_id=rank)
                     else:
                         value = values[name]
                         tensors[name] = runtime.alloc_tensor(value.shape, value.dtype, init=value, worker_id=rank)
@@ -1988,7 +2153,8 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
                 for name in head_names
             }
 
-        def run_rows(rows, *, decode=False):
+        def run_rows(rows, *, decode=False, phase="prefill"):
+            step_start = time.perf_counter_ns()
             rank_tensors = decode_rank if decode else per_rank
             capacity = decode_rows if decode else CAPACITY
             for rank, (tensors, token_ids) in enumerate(zip(rank_tensors, rows)):
@@ -2007,7 +2173,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
                     for counts in decode_counts.values():
                         counts[rank] = len(token_ids)
                 for name, value in inputs.items():
-                    if name not in constants:
+                    if name not in constants and name not in ("engram_scales", "engram_hash_ids"):
                         runtime.copy_to(
                             tensors[name].data_ptr, value.data_ptr(), value.numel() * value.element_size(),
                             worker_id=rank,
@@ -2015,11 +2181,13 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
             program = decode_compiled if decode else compiled
             arguments = decode_stacked if decode else stacked
             names = decode_names if decode else PREFILL_TENSORS
+            metadata_end = time.perf_counter_ns()
             runtime.run(program, *[arguments[name] for name in names], config=config)
             if decode:
                 runtime.run(generation_head, *[head_stacked[name] for name in head_names], config=config)
-            runtime.copy_stacked_from(stacked["logits"], logits)
-            runtime.copy_stacked_from(stacked["sampled_ids"], sampled_ids)
+            forward_end = time.perf_counter_ns()
+            runtime.copy_stacked_from(arguments["logits"], logits)
+            runtime.copy_stacked_from(arguments["sampled_ids"], sampled_ids)
             for rank, token_ids in enumerate(rows):
                 if not token_ids:
                     continue
@@ -2031,6 +2199,15 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
                 last_logits[rank].copy_(logits[rank, 0])
                 last_ids[rank] = token
                 committed[rank] += len(token_ids)
+            step_end = time.perf_counter_ns()
+            timing_samples.append({
+                "phase": phase, "tokens_per_rank": [len(token_ids) for token_ids in rows],
+                "metadata_upload_us": (metadata_end - step_start) / 1000,
+                "engram_lookup_separate_dispatch": False,
+                "forward_wall_us": (forward_end - metadata_end) / 1000,
+                "copyback_and_sampling_us": (step_end - forward_end) / 1000,
+                "end_to_end_us": (step_end - step_start) / 1000,
+            })
 
         while any(committed[rank] < len(sequence) for rank, sequence in enumerate(sequences)):
             rows = [sequence[committed[rank]:committed[rank] + chunk_size]
@@ -2041,7 +2218,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
             tick = time.monotonic()
             if step:
                 run_rows([[tokens[-1]] if not finished[rank] else []
-                          for rank, tokens in enumerate(generated)], decode=decode_compiled is not None)
+                          for rank, tokens in enumerate(generated)], decode=decode_compiled is not None, phase="decode")
             for rank, token in enumerate(last_ids):
                 if not finished[rank]:
                     generated[rank].append(token)
@@ -2057,11 +2234,28 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
         "platform": "a5", "devices": device_ids, "lm_head_tp": LM_HEAD_TP_SIZE, "ep": RANKS, "dp": DP_SIZE,
         "precision": "official_bf16_mxfp8_mxfp4", "checkpoint": str(checkpoint.root),
         "capacity": CAPACITY, "chunk_size": chunk_size, "history_capacity": max_seq_len,
-        "full_prefix_recomputation": False, "engram_enabled": True, "engram_lookup_device": "host",
+        "ring_heap_bytes_per_ring": ring_heap_bytes,
+        "full_prefix_recomputation": False, "engram_enabled": True, "engram_lookup_device": "device",
+        "engram_offload_strategy": engram_strategy,
+        "engram_host_physical_storage": (
+            "one rank-local shard per rank per program" if engram_strategy == "sliced_enp"
+            else "independent full-table window per rank per program"
+        ),
+        "engram_host_payload_bytes": tables.host_payload_bytes,
+        "engram_host_payload_bytes_per_program": tables.host_payload_bytes_per_program,
+        "engram_host_window_program_count": tables.program_count,
+        "engram_device_scale_bytes_per_rank": tables.device_scale_bytes_per_rank,
+        "timing_samples": timing_samples,
+        "timing_boundary": (
+            "Per-sample Host wall time: metadata/upload, integrated lookup and forward, copy-back and greedy checks; "
+            "first dispatch per program includes lazy Host-window initialization; weight/scale upload excluded"
+        ),
+        "engram_model_overlap": "lookup and forward share one L2 graph; hardware overlap requires profiling",
         "continuation_forward": "decode_fwd" if decode_compiled is not None else "prefill_fwd",
         "shared_resident_weights": decode_compiled is not None,
         "layers_per_forward": 40, "l2_invocations_per_rank_per_forward": 1,
         "seconds": time.monotonic() - start,
+        "seconds_includes_weight_upload_and_shutdown": True,
         "cases": [
             {"prompt": prompt, "token_ids": tokens, "text": tokenizer.decode(tokens, skip_special_tokens=False),
              "eos_reached": done}
@@ -2118,6 +2312,9 @@ def build_tensor_specs(args=None):
             value = 1.0 if dtype == torch.float8_e8m0fnu or name == "final_norm_weight" else 0.0
             if name == "correction_bias":
                 value = _route_bias().repeat(RANKS, N_LAYERS)
+        elif name == "engram_scales":
+            shape, dtype = [RANKS, 2 * ENGRAM_ROWS, 8], torch.uint8
+            value = 127
         elif name in outputs:
             shape, dtype = outputs[name]
             value = None
@@ -2232,8 +2429,10 @@ if __name__ == "__main__":
 
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("--checkpoint", type=Path, required=True)
-        parser.add_argument("--runtime-dir", type=Path, required=True, help="compiled host-row Engram prefill")
-        parser.add_argument("--decode-runtime-dir", type=Path, help="compiled host-row Engram decode for continuation")
+        parser.add_argument("--runtime-dir", type=Path, required=True, help="compiled integrated Engram prefill")
+        parser.add_argument("--decode-runtime-dir", type=Path, help="compiled integrated Engram decode for continuation")
+        parser.add_argument("--engram-table-rows", type=int, default=ENGRAM_ROWS)
+        parser.add_argument("--engram-strategy", choices=("sliced_enp", "full_vocab_local"), default="sliced_enp")
         parser.add_argument("--devices", default=os.environ.get("TASK_DEVICE"))
         parser.add_argument("--lm-head-tp", type=int, default=C.LM_HEAD_TP_SIZE, choices=C.SUPPORTED_LM_HEAD_TP_SIZES)
         parser.add_argument("--ep", type=int, default=RANKS, choices=[4, 8])
@@ -2244,6 +2443,7 @@ if __name__ == "__main__":
         parser.add_argument("--prompt", action="append", help="one prompt per rank; provide exactly --ep prompts")
         parser.add_argument("--max-new-tokens", type=int, default=16)
         parser.add_argument("--chunk-size", type=int, default=CAPACITY)
+        parser.add_argument("--ring-heap-mib", type=int, default=RING_HEAP_BYTES // 1024**2, help="output heap MiB per ring; power of two")
         parser.add_argument("--report", type=Path)
         options = parser.parse_args()
         if options.experts_per_rank * options.ep != M.n_routed_experts or N_EXPERTS != M.n_routed_experts:
@@ -2278,15 +2478,17 @@ if __name__ == "__main__":
             )
         report = generate(
             checkpoint, compiled, device_ids, prompts, options.max_new_tokens,
+            engram_strategy=options.engram_strategy,
             chunk_size=options.chunk_size, decode_compiled=decode_compiled,
+            ring_heap_bytes=options.ring_heap_mib * 1024**2,
         )
         if options.report:
             options.report.parent.mkdir(parents=True, exist_ok=True)
             options.report.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
         print("CED_GENERATION_COMPLETE", json.dumps(report, ensure_ascii=False), flush=True)
     else:
-        from golden import run
-        from utils import parse_prefill_groups
+        from golden import normalize_config, run
+        from utils import parse_prefill_groups, upload_forward_inputs
 
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
@@ -2302,6 +2504,8 @@ if __name__ == "__main__":
         parser.add_argument("--capacity", type=int, default=CAPACITY)
         parser.add_argument("--moe-tokens", type=int, default=MOE_TOKENS)
         parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(RANKS)))
+        parser.add_argument("--engram-table-rows", type=int, default=ENGRAM_ROWS)
+        parser.add_argument("--engram-strategy", choices=("sliced_enp", "full_vocab_local"), default="sliced_enp")
         parser.add_argument("--compile-only", action="store_true")
         parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
         parser.add_argument("--dump-passes", action="store_true")
@@ -2334,5 +2538,77 @@ if __name__ == "__main__":
             config=config,
             compile_only=args.compile_only,
         )
+        if result.passed:
+            write_forward_engram_layout(result.work_dir)
+        if result.passed and not args.compile_only:
+            cfg = normalize_config(config)
+            compiled = DistributedCompiledProgram.from_dir(
+                result.work_dir, backend_type=cfg.backend_type, execution_mode=cfg.execution_mode,
+                distributed_config=cfg.distributed_config,
+            )
+            host_inputs = {}
+            upload_buffer = torch.empty(64 * 1024**2, dtype=torch.uint8).share_memory_()
+            inherited = [*host_inputs.values(), upload_buffer]
+            from golden.runner import _bench_enabled, _bench_loop_sizes, _report_bench
+            from pypto.runtime.bench import _capture_fd_stderr, _parse_stats_from_strace
+            from pypto.runtime.log_config import configure_log, current_level
+            benchmark = _bench_enabled()
+            rounds, warmup = _bench_loop_sizes() if benchmark else (1, 0)
+            trace_path = Path(result.work_dir) / "prefill_benchmark.strace"
+            prior_level = current_level()
+            if benchmark:
+                configure_log("timing")
+            try:
+                capture = _capture_fd_stderr(trace_path) if benchmark else nullcontext()
+                with capture:
+                    with ExitStack() as sources, compiled.prepare(
+                        cfg, persistent=True, reset_persistent_windows=False, inherited_host_tensors=inherited,
+                        window_sources={"engram_payload": [
+                            sources.enter_context(EngramPayloadSource([(None, 0, 2 * ENGRAM_SHARD_ROWS * 256)]))
+                            for _ in devices
+                        ]},
+                    ) as runtime:
+                        parameters = compiled._get_metadata()[0]
+                        arguments = upload_forward_inputs(runtime, specs, parameters, len(devices), host_inputs, upload_buffer)
+                        for iteration in range(warmup + rounds):
+                            if iteration:
+                                for spec, parameter, argument in zip(specs, parameters, arguments, strict=True):
+                                    if parameter.direction.name != "InOut":
+                                        continue
+                                    for rank, handle in enumerate(argument.shards):
+                                        value = spec.init_value[rank].contiguous().view(torch.uint8).reshape(-1)
+                                        for offset in range(0, handle.nbytes, upload_buffer.numel()):
+                                            size = min(upload_buffer.numel(), handle.nbytes - offset)
+                                            upload_buffer[:size].copy_(value[offset:offset + size])
+                                            runtime.copy_to(handle.data_ptr, upload_buffer.data_ptr(), size, dst_offset=offset, worker_id=rank)
+                            runtime(*arguments, config=cfg)
+                        target_hidden = torch.empty((RANKS, CAPACITY, DSPARK_MAIN_IN), dtype=torch.bfloat16)
+                        runtime.copy_stacked_from(arguments[PREFILL_TENSORS.index("dspark_target_hidden")], target_hidden)
+                        for name in ("x_hc_out", "pre_mix_out", "logits"):
+                            index = PREFILL_TENSORS.index(name)
+                            value = torch.empty(specs[index].shape, dtype=specs[index].dtype)
+                            runtime.copy_stacked_from(arguments[index], value)
+                            if not torch.isfinite(value).all():
+                                raise AssertionError(f"prefill {name} contains non-finite values")
+            except Exception:
+                if benchmark and trace_path.exists():
+                    print(trace_path.read_text(), file=sys.stderr)
+                raise
+            finally:
+                configure_log(prior_level)
+            if benchmark:
+                stats = _parse_stats_from_strace(trace_path.read_text(), rounds=rounds, warmup=warmup, distributed=True)
+                _report_bench(stats, compiled, l3=True, resident=True)
+            if not torch.isfinite(target_hidden.float()).all():
+                raise AssertionError("DSpark prefill target hidden contains non-finite values")
+            expected_tap = torch.zeros((RANKS, CAPACITY, D), dtype=torch.bfloat16)
+            active_rows = specs[PREFILL_TENSORS.index("counts")].init_value[:, 1].tolist()
+            for rank, count in enumerate(active_rows):
+                expected_tap[rank, :count] = specs[PREFILL_TENSORS.index("embedding")].init_value[rank, :count]
+            for tap, layer in enumerate(DSPARK_TARGET_LAYER_IDS):
+                tap_rows = target_hidden[:, :, tap * D : (tap + 1) * D]
+                if not torch.equal(tap_rows, expected_tap):
+                    raise AssertionError(f"DSpark prefill layer {layer} tap differs from the zero-weight reference")
+            print("[FWD] Execution and all DSpark taps passed the zero-weight reference; full numerical accuracy was not validated.", flush=True)
         if not result.passed:
             raise SystemExit(result.error or 1)

@@ -21,7 +21,7 @@ operator define its executable storage and layout contracts.
 | MoE | 384 routed experts, top-6 routing, one shared expert; intermediate width 2,304 |
 | Hyper-connections | 4 streams; persistent hidden state is FP32 |
 | Context ceiling | 1,048,576 positions, with 128-token cache pages |
-| Engram | Layers 1 and 14; forward consumes host-gathered embedding rows |
+| Engram | Layers 1 and 14; forward consumes BF16 lookup rows produced on Device |
 | DSpark | 5 speculative tokens plus one verification row per request; default decode batch 12, or 72 rows |
 
 Quantized projection paths use MXFP8 weights and activations; routed expert
@@ -174,6 +174,126 @@ Forward smoke fixtures exercise composition and execution; they do not establish
 checkpoint-level generation accuracy or a complete numerical forward golden.
 The configured context ceiling and supported parallel-size choices are not a
 claim that every size/sequence-length combination has been device validated.
+
+## Engram Host offload development
+
+This experimental integration targets PyPTO `integration/urma-ccu-test` at
+`864c8b86b2bae5c53b951d880b6794c5887cb0d2` and its pinned runtime and toolchain.
+Host URMA window support in other PyPTO versions has not been verified here.
+
+The shared lookup in `engram.py` implements sliced ENP and Full-Vocab local
+fetch with FP8 E4M3 payloads transported as UINT8 bytes. Eight E8M0 group-32
+scales per row remain on the Device; the lookup dequantizes into the BF16
+`engram_lookup` contract consumed by both forwards. `EngramHistory` owns the
+common compressed-token hash and request-history calculation.
+
+[`engram_host_offload.py`](../../../models/deepseek_v4_1_flash/engram_host_offload.py)
+provides a standalone validation entry. Prepare frozen inputs, Torch reference
+outputs and A5 artifacts outside the device allocation, then execute with the
+queue-assigned devices:
+
+```bash
+python models/deepseek_v4_1_flash/engram_host_offload.py --compile-only --ranks 4 --tokens 3 --artifact build_output/engram-enp4
+python models/deepseek_v4_1_flash/engram_host_offload.py --artifact build_output/engram-enp4 --devices "$TASK_DEVICE"
+```
+
+Preparation accepts `--strategy sliced_enp` or `--strategy full_vocab_local`.
+The default bounded cases cover independent request histories, continuation,
+rollback, inactive rows, duplicate lookups, shard boundaries, and staging reuse.
+Use `--tokens 72` or `--tokens 8192` for the requested Decode/Prefill lookup
+volumes; these still use synthetic tables and do not establish model accuracy
+or representative bandwidth. Four- and eight-rank artifact preparation is
+supported; eight-device execution is deferred.
+
+The remote path GETs directly into rank-local Device staging and consumes
+those FP8 bytes on the Device. Two independent 32-row slots use 16 KiB per rank, and each fetch
+task issues at most 32 remote GETs. Each slot's next writer explicitly waits
+for its previous consumer. Separate slots permit fetch/consume overlap across
+batches; a speedup requires device measurements. A local row bypasses remote
+staging. Negative IDs are explicit zero padding; nonnegative IDs must be within
+the prepared table's padded row extent.
+
+The selected PyPTO Host-window API initializes separate physical windows per
+rank. Full-Vocab local therefore currently replicates its Host payload storage;
+passing the same source tensor to every rank does not share the destination.
+A separate native-mapper capability experiment validated one shared backing up
+to 1 GiB on four devices. Binding that storage through the public L3 API and
+validating full-table capacity remain required before claiming shared-backing
+Full-Vocab integration.
+
+The two released payload tables contain 768,022,850 rows in total: approximately
+183.1 GiB of FP8 payload and 5.72 GiB of scales. Each Device keeps the complete
+scale data in this implementation. Ignoring alignment and staging, sliced ENP
+needs 183.1 GiB of aggregate Host payload storage; duplicated Full-Vocab needs
+approximately 732.4 GiB on four ranks or 1,464.9 GiB on eight ranks. A shared
+physical Full-Vocab backing would need approximately 183.1 GiB. These are
+storage calculations, not verified registration or virtual-address limits.
+
+The checkpoint generation path prepares hash IDs on the CPU and passes them
+with Device-resident scales into each forward. The L3 entry initializes one
+Host payload shard per rank. Its L2 entry runs the shared lookup inline,
+fetches remote FP8 bytes directly into two bounded Device staging buffers,
+dequantizes on Device, and feeds the existing forward computation. Prefill and
+Decode retain one computation body each; lookup is part of the same L2 graph.
+A task consuming the lookup result waits for its asynchronous GET completion.
+
+Compile both forwards with the same `--engram-strategy sliced_enp` and actual
+rank count. Checkpoint runs default to the released `--engram-table-rows`
+extent; synthetic forward fixtures default to 4096 rows per layer. Set the
+released extent explicitly when compiling a checkpoint artifact without loading
+the checkpoint. The checkpoint
+entry rejects a table extent that does not match its checkpoint. The generation
+entry accepts the integrated Prefill artifact via `--runtime-dir` and Decode
+artifact via `--decode-runtime-dir`; no separate Engram runtime artifact is
+needed. Each forward entry writes `engram_layout.json` beside its compiled
+artifact. The controller rejects missing layouts or a mismatch in rank count,
+table extent, strategy, or ABI version before creating runtime windows. When
+compiling through the Python API, call `write_forward_engram_layout(output_dir)`
+in the same configuration after compilation. Old BF16-row forward artifacts
+must be recompiled.
+
+Payloads initialize from seekable checkpoint slices with streamed padding;
+scales upload once per rank. ENP4 uses four shards and ENP8 eight shards, with
+one aggregate table in Host memory per compiled program. PyPTO retains domains
+independently for Prefill and Decode: preparing and dispatching both currently
+retains two complete sets of shards. There is no public cross-program window
+binding or per-program release API. The default single-Prefill-program controller
+also handles continuation and retains one set. `full_vocab_local` uses independent
+full-table windows per rank per program. The controller budgets the configured
+program count, checks available Host memory before initialization, and reports
+both per-program and total payload bytes. It does not silently change strategy.
+
+The checkpoint entry supports capacities up to the configured 8192-row bound.
+Its report includes metadata/upload, integrated lookup plus forward time, and
+output copy-back. Numerical acceptance with real checkpoint weights and large
+Host registrations remains pending for the requested large workloads. The unmodified pinned runtime rejects
+Host windows at its new UDMA capability precheck. A local opt-in diagnostic
+patch permits both strategies to pass four exact synthetic lookup cases at
+72 and 8192 tokens/rank on four cards. With the patch, real-checkpoint ENP4
+also completes short-prompt generation through all 40 layers, capacity-16
+chunked Prefill and one-token continuation using the Prefill program, with the
+complete payload registered. That run uses `--ring-heap-mib 1024`; the default
+four 4-GiB heaps exhaust EP4 HBM while allocating checkpoint weights and full
+Device scales. This is separate from the deferred intermittent scheduler
+timeout and does not establish reference-level model accuracy or the requested
+large-workload end-to-end acceptance.
+A second four-card run switches to independent Decode with shared resident
+weights, caches and scales, and matches all four prompts' two generated token
+IDs. Host windows remain separate per program; both full payload sets register
+and release successfully. Decode has one active token per rank in a 192-row
+physical allocation, so this does not validate the requested 72-active-token
+model workload.
+See the linked interface-limit report below.
+Eight-card hardware execution is deferred.
+The DSpark target-body consumer still supplies prepared BF16 rows to the shared
+decode computation; adapting its speculative hash/history inputs is separate
+from the text Prefill/Decode generation entry.
+
+The explicit `--benchmark` entry measures a prepared lookup with retained
+windows, Device scales and Device output buffers. It saves raw per-rank samples,
+P50/P99, effective useful-byte bandwidth and matched local/remote/mixed cases.
+See [Host offload measurements and interface limits](host-offload.md) for
+commands, timing boundaries, memory accounting and outstanding dependencies.
 
 ## Vision
 

@@ -6,13 +6,14 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""V4.1 Engram projection and residual gating from host rows or local lookup tables."""
+"""V4.1 Engram Host FP8 lookup, dequantization, projection and residual gating."""
 
 import math
 from pathlib import Path
 
 import pypto.language as pl
 from pypto.runtime import pto_isa_include_dir
+import pypto.language.distributed as pld
 import torch
 
 from config import FLASH as M, T_DYN
@@ -38,6 +39,153 @@ GATE_T_TILE = 8
 GATE_D_TILE = 1280
 PROJECTION_N_TILE = 256
 PROJECTION_K_TILE = 256
+T_TILE = 16
+K_TILE = 128
+N_TILE = 256
+D_TILE = 512
+FETCH_TILE = 32
+SCALE_TILE = 32
+
+
+@pl.jit.inline
+def engram_dequantize(
+    payload: pl.Tile[[1, HEAD_DIM], pl.UINT8, pl.Mem.Vec],
+    scale_codes: pl.Tile[[1, SCALE_TILE], pl.UINT8, pl.Mem.Vec],
+):
+    """Decode an FP8 row with eight Device-resident group-32 E8M0 codes."""
+    padded = pl.fillpad(scale_codes, pad_value=pl.PadValue.zero)
+    all_codes = pl.set_validshape(padded, 1, SCALE_TILE)
+    code_fp16 = pl.cast(all_codes, pl.FP16)
+    codes = pl.cast(code_fp16, pl.INT32, mode="trunc")
+    bits = pl.shls(codes, 23)
+    is_subnormal = pl.tile.cmps(codes, 0, cmp_type=0)
+    bits = pl.tile.select(is_subnormal, 0x00400000, bits)
+    is_nan = pl.tile.cmps(codes, 255, cmp_type=0)
+    bits = pl.tile.select(is_nan, 0x7FC00000, bits)
+    scales = pl.reinterpret_view(bits, pl.FP32)
+    columns = pl.tile.arange(0, [1, HEAD_DIM], dtype=pl.INT32)
+    groups = pl.shrs(columns, 5)
+    temporary = pl.create_tile([1, HEAD_DIM], dtype=pl.FP32)
+    expanded = pl.tile.gather(scales, groups, temporary)
+    signed = pl.reinterpret_view(payload, pl.INT8)
+    fp8 = pl.reinterpret_view(signed, pl.FP8E4M3FN)
+    bf16 = pl.cast(fp8, pl.BF16)
+    values = pl.cast(bf16, pl.FP32)
+    dequantized = pl.mul(values, expanded)
+    return pl.cast(dequantized, pl.BF16, mode="rint")
+
+
+@pl.jit.incore
+def engram_host_fetch(
+    ids: pl.Tensor,
+    begin: pl.Scalar[pl.INDEX],
+    table: pld.DistributedTensor,
+    staging: pl.InOut[pl.Tensor],
+    shard_rows: pl.constexpr,
+):
+    """GET at most 32 remote FP8 rows into reusable rank-local Device staging."""
+    rank = pld.rank(pld.get_comm_ctx(table))
+    lookups = pl.tensor.dim(ids, 0)
+    for offset in pl.range(FETCH_TILE):
+        index = begin + offset
+        if index < lookups:
+            row = pl.read(ids, [index, 0])
+            if row >= 0:
+                owner = row // shard_rows
+                if owner != rank:
+                    layer = index // (lookups // 2)
+                    source = layer * shard_rows + row % shard_rows
+                    staging = pld.tensor.get_async(
+                        staging, peer=owner, src=table, dst_offsets=[offset, 0],
+                        src_offsets=[source, 0], shape=[1, HEAD_DIM], engine=pld.CommEngine.URMA,
+                    )
+    return staging
+
+
+@pl.jit.incore
+def engram_host_consume(
+    ids: pl.Tensor,
+    begin: pl.Scalar[pl.INDEX],
+    table: pld.DistributedTensor,
+    staging: pl.Tensor,
+    scales: pl.Tensor,
+    output: pl.InOut[pl.Tensor],
+    full_vocab: pl.constexpr,
+    table_rows: pl.constexpr,
+):
+    """Read local or staged FP8 rows and write dequantized BF16 Device rows."""
+    rows_per_layer = pl.tensor.dim(scales, 0) // 2
+    lookups = pl.tensor.dim(ids, 0)
+    for offset in pl.range(FETCH_TILE):
+        index = begin + offset
+        if index < lookups:
+            row = pl.read(ids, [index, 0])
+            if row >= 0:
+                layer = index // (lookups // 2)
+                if full_vocab:
+                    payload = pl.load(table, [layer * table_rows + row, 0], [1, HEAD_DIM])
+                else:
+                    rank = pld.rank(pld.get_comm_ctx(table))
+                    owner = row // table_rows
+                    if owner == rank:
+                        source = layer * table_rows + row % table_rows
+                        payload = pl.load(table, [source, 0], [1, HEAD_DIM])
+                    else:
+                        payload = pl.load(staging, [offset, 0], [1, HEAD_DIM])
+                scale_row = layer * rows_per_layer + row
+                codes = pl.load(scales, [scale_row, 0], [1, SCALE_TILE], valid_shape=[1, HEAD_DIM // 32])
+                values = engram_dequantize(payload, codes)
+                output = pl.store(values, [index, 0], output)
+            else:
+                zero = pl.tile.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                output = pl.store(zero, [index, 0], output)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
+def engram_host_lookup(
+    ids: pl.Tensor,
+    table: pld.DistributedTensor,
+    staging_first: pl.Tensor,
+    staging_second: pl.Tensor,
+    scales: pl.Tensor,
+    output: pl.Tensor,
+    full_vocab: pl.constexpr,
+    table_rows: pl.constexpr,
+):
+    """Fetch two layers' flattened hash rows with bounded reusable Device staging.
+
+    IDs are layer-major, negative IDs produce zero padding, and scales contain
+    the complete layer-major scale table on each Device. Host windows contain
+    either both complete payload tables or one contiguous shard of each table.
+    """
+    lookups = pl.tensor.dim(ids, 0)
+    previous_first = pl.system.task_invalid()
+    previous_second = pl.system.task_invalid()
+    for chunk in pl.range(0, lookups, 2048):
+        with pl.scope():
+            end = pl.min(chunk + 2048, lookups)
+            if full_vocab:
+                for begin in pl.range(chunk, end, FETCH_TILE):
+                    with pl.spmd(1, name_hint="engram_consume"):
+                        output = engram_host_consume(ids, begin, table, staging_first, scales, output, full_vocab, table_rows)
+            else:
+                for begin in pl.range(chunk, end, 2 * FETCH_TILE):
+                    second = begin + FETCH_TILE
+                    # Each Device slot is reused after its preceding consumer finishes.
+                    with pl.spmd(1, name_hint="engram_fetch_first", deps=[previous_first]):
+                        staging_first = engram_host_fetch(ids, begin, table, staging_first, table_rows)
+                    if second < end:
+                        with pl.spmd(1, name_hint="engram_fetch_second", deps=[previous_second]):
+                            staging_second = engram_host_fetch(ids, second, table, staging_second, table_rows)
+                    with pl.spmd(1, name_hint="engram_consume_first") as consumed_first:
+                        output = engram_host_consume(ids, begin, table, staging_first, scales, output, full_vocab, table_rows)
+                    previous_first = consumed_first
+                    if second < end:
+                        with pl.spmd(1, name_hint="engram_consume_second") as consumed_second:
+                            output = engram_host_consume(ids, second, table, staging_second, scales, output, full_vocab, table_rows)
+                        previous_second = consumed_second
+    return output
 
 
 @pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels/engram.cpp",
@@ -94,7 +242,7 @@ def engram_from_rows(
     x: pl.Tensor,
     out: pl.Tensor,
 ):
-    """Project host-gathered ND rows and gate the FP32 residual in place or out of place."""
+    """Project dequantized BF16 lookup rows and gate the FP32 residual stream."""
     tokens = pl.tensor.dim(x, 0)
     if tokens > 0:
         if tokens <= 80:
@@ -189,59 +337,25 @@ def engram_from_rows_pypto(
     return out
 
 
-class HostEngram:
-    """Hash text history and read selected FP8 checkpoint table rows on the CPU.
+class EngramHistory:
+    """Maintain request-local compressed-token history and native Engram hashes."""
 
-    Reuse one instance across prefill chunks and decode calls. Each request_id
-    owns its compressed-token history; start_pos=0 resets that request, and
-    continuation requires the preceding history. Image-token masking is unsupported.
-    """
-
-    def __init__(self, checkpoint, tokenizer):
-        import numpy as np
-        from tokenizers import Regex, normalizers
-
-        self.checkpoint = checkpoint
-        sentinel = "\ue000"
-        normalizer = normalizers.Sequence([
-            normalizers.NFKC(), normalizers.NFD(), normalizers.StripAccents(), normalizers.Lowercase(),
-            normalizers.Replace(Regex(r"[ \t\r\n]+"), " "), normalizers.Replace(Regex(r"^ $"), sentinel),
-            normalizers.Strip(), normalizers.Replace(sentinel, " "),
-        ])
-        keys = {}
-        token_map = []
-        for token in range(tokenizer.get_vocab_size(with_added_tokens=True)):
-            text = tokenizer.decode([token], skip_special_tokens=False)
-            key = tokenizer.id_to_token(token) if "\ufffd" in text else normalizer.normalize_str(text) or text
-            token_map.append(keys.setdefault(key, len(keys)))
-        if len(keys) != M.engram_compressed_vocab_size:
-            raise ValueError(f"Engram compressed vocabulary has {len(keys)} entries")
-        self.token_map = torch.tensor(token_map, dtype=torch.int64)
-        self.pad_id = token_map[M.engram_pad_token_id]
-        self.history = {}
-        primes, seen = [], set()
-        for layer in M.engram_layer_ids:
-            buckets = []
-            for _ in range(M.engram_max_ngram_size - 1):
-                candidate = M.engram_vocab_size - 1
-                for _ in range(M.engram_n_heads):
-                    candidate += 1
-                    while candidate in seen or any(candidate % d == 0 for d in range(2, math.isqrt(candidate) + 1)):
-                        candidate += 1
-                    seen.add(candidate)
-                    buckets.append(candidate)
-            primes.append(buckets)
-        if tuple(map(sum, primes)) != M.engram_num_embeddings:
-            raise ValueError("Engram prime buckets do not match checkpoint table sizes")
-        self.primes = torch.tensor(primes, dtype=torch.int64)
+    def __init__(self, token_map, pad_id, primes, multipliers):
+        self.token_map = torch.as_tensor(token_map, dtype=torch.int64, device="cpu")
+        self.primes = torch.as_tensor(primes, dtype=torch.int64, device="cpu")
+        self.multipliers = torch.as_tensor(multipliers, dtype=torch.int64, device="cpu")
+        layers = len(M.engram_layer_ids)
+        if self.token_map.ndim != 1 or self.token_map.numel() == 0 or bool((self.token_map < 0).any()):
+            raise ValueError("Engram token_map must be a nonempty vector of compressed token IDs")
+        if self.primes.shape != (layers, N_HASH_COLS) or bool((self.primes <= 0).any()):
+            raise ValueError("Engram hash buckets must contain positive sizes for every layer and hash head")
+        if self.multipliers.shape != (layers, M.engram_max_ngram_size):
+            raise ValueError("Engram hash multipliers must contain one value per layer and n-gram position")
+        if not isinstance(pad_id, int) or isinstance(pad_id, bool) or pad_id < 0:
+            raise ValueError("Engram pad_id must be a nonnegative compressed token ID")
+        self.pad_id = pad_id
         self.offsets = self.primes.cumsum(-1) - self.primes
-        bound = max(1, (np.iinfo(np.int64).max // len(keys)) // 2)
-        self.multipliers = torch.stack([
-            torch.from_numpy(np.random.default_rng(10007 * layer).integers(
-                0, bound, size=M.engram_max_ngram_size, dtype=np.int64,
-            ) * 2 + 1)
-            for layer in M.engram_layer_ids
-        ])
+        self.history = {}
 
     def hash_ids(self, token_ids, start_pos=0, *, request_id=0):
         """Return [layer, token, hash column] IDs and commit the current text history."""
@@ -272,7 +386,61 @@ class HostEngram:
         self.history[request_id] = compressed
         return torch.cat(hashes, dim=-1) + self.offsets.unsqueeze(1)
 
-    def lookup(self, token_ids, capacity, start_pos=0, *, request_id=0):
+
+class HostEngram(EngramHistory):
+    """Normalize checkpoint token text and hash request histories.
+
+    lookup_reference reads checkpoint rows on the CPU for validation.
+
+    Reuse one instance across prefill chunks and decode calls. Each request_id
+    owns its compressed-token history; start_pos=0 resets that request, and
+    continuation requires the preceding history. Image-token masking is unsupported.
+    """
+
+    def __init__(self, checkpoint, tokenizer):
+        import numpy as np
+        from tokenizers import Regex, normalizers
+
+        self.checkpoint = checkpoint
+        sentinel = "\ue000"
+        normalizer = normalizers.Sequence([
+            normalizers.NFKC(), normalizers.NFD(), normalizers.StripAccents(), normalizers.Lowercase(),
+            normalizers.Replace(Regex(r"[ \t\r\n]+"), " "), normalizers.Replace(Regex(r"^ $"), sentinel),
+            normalizers.Strip(), normalizers.Replace(sentinel, " "),
+        ])
+        keys = {}
+        token_map = []
+        for token in range(tokenizer.get_vocab_size(with_added_tokens=True)):
+            text = tokenizer.decode([token], skip_special_tokens=False)
+            key = tokenizer.id_to_token(token) if "\ufffd" in text else normalizer.normalize_str(text) or text
+            token_map.append(keys.setdefault(key, len(keys)))
+        if len(keys) != M.engram_compressed_vocab_size:
+            raise ValueError(f"Engram compressed vocabulary has {len(keys)} entries")
+        primes, seen = [], set()
+        for layer in M.engram_layer_ids:
+            buckets = []
+            for _ in range(M.engram_max_ngram_size - 1):
+                candidate = M.engram_vocab_size - 1
+                for _ in range(M.engram_n_heads):
+                    candidate += 1
+                    while candidate in seen or any(candidate % d == 0 for d in range(2, math.isqrt(candidate) + 1)):
+                        candidate += 1
+                    seen.add(candidate)
+                    buckets.append(candidate)
+            primes.append(buckets)
+        if tuple(map(sum, primes)) != M.engram_num_embeddings:
+            raise ValueError("Engram prime buckets do not match checkpoint table sizes")
+        primes = torch.tensor(primes, dtype=torch.int64)
+        bound = max(1, (np.iinfo(np.int64).max // len(keys)) // 2)
+        multipliers = torch.stack([
+            torch.from_numpy(np.random.default_rng(10007 * layer).integers(
+                0, bound, size=M.engram_max_ngram_size, dtype=np.int64,
+            ) * 2 + 1)
+            for layer in M.engram_layer_ids
+        ])
+        super().__init__(token_map, token_map[M.engram_pad_token_id], primes, multipliers)
+
+    def lookup_reference(self, token_ids, capacity, start_pos=0, *, request_id=0):
         """Read current rows and group-32 E8M0 scales into [2, capacity, 6144] BF16.
 
         Tables stay in host checkpoint files; only selected rows are read.
