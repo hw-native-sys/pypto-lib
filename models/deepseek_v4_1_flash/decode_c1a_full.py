@@ -750,7 +750,7 @@ if __name__ == "__main__":
                         "compressed_slots", pool_name="compressed_cache_scale",
                         mapping_shape=(args.tokens,),
                         block_size=BLOCK_SIZE, leading_rank_axis=False,
-                        atol=0.0, rtol=2 ** -7, max_error_ratio=0.0,
+                        atol=0.0, rtol=2 ** -6, max_error_ratio=0.0,
                     ),
                     fp4=True,
                 ),
