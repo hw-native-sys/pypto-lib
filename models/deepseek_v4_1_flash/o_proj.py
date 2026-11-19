@@ -264,14 +264,14 @@ def o_proj_hc_post(
     activation_scale = pl.create_tensor([1, padded_rows * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)
     oa_tasks = (padded_rows // oa_tile) * (LOCAL_O_WIDTH // O_A_N_TILE)
     oa_workers = pl.max(1, pl.min(oa_tasks, pl.system.available_cluster_count()))
-    with pl.spmd(oa_workers, name_hint="proj_o_a_quant", sync_start=True):
+    with pl.spmd(oa_workers, name_hint="proj_o_a_quant"):
         payload, activation_scale = _o_proj_a(
             payload_all, wo_a, scales_all, wo_a_scale, payload, activation_scale,
             LOCAL_O_WIDTH, num_tokens, padded_rows, oa_tile,
         )
     ob_tasks = ((total_rows + ob_row_tile - 1) // ob_row_tile) * ((D + O_B_N_TILE - 1) // O_B_N_TILE)
     ob_workers = pl.max(1, pl.min(ob_tasks, pl.system.available_cluster_count()))
-    with pl.spmd(ob_workers, name_hint="proj_o_b_hc_post", sync_start=True) as ready:
+    with pl.spmd(ob_workers, name_hint="proj_o_b_hc_post") as ready:
         output = _o_proj_b_hc_post(
             payload, wo_b, activation_scale, wo_b_scale,
             residual, post_mix, residual_mix, output, total_rows, ob_row_tile,
@@ -423,7 +423,7 @@ def o_proj_hc_post_native_validation(
     ob_tasks = ((total_rows + 127) // 128) * ((D + O_B_N_TILE - 1) // O_B_N_TILE)
     # Process at least two output tiles per worker.
     ob_workers = pl.max(1, pl.min(ob_tasks // 2, pl.system.available_cluster_count()))
-    with pl.spmd(ob_workers, name_hint="proj_o_b_hc_post", sync_start=True):
+    with pl.spmd(ob_workers, name_hint="proj_o_b_hc_post"):
         output = _o_proj_b_hc_post(
             payload, wo_b, activation_scale, wo_b_scale,
             residual, post_mix, residual_mix, output, total_rows, 128,
