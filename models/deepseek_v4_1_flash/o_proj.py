@@ -127,7 +127,7 @@ def _quant_o_tile(
     codes = pl.tile.create([row_tile // O_SCALE_ROW_TILE * (O_SCALE_COL_TILE // 2)], pl.UINT16, target_memory=pl.MemorySpace.Vec)
 
     # Fused inverse RoPE and output quantization.
-    with pl.reg_scope():
+    with pl.reg_scope(auto_sync=False):
         rope_mask = pl.reg.full_mask(lanes=32)
         upper_bits = pl.reg.broadcast(0xFFFF0000, lanes=32, dtype=pl.UINT32)
         for row in pl.hardware_loop(rows):
@@ -157,6 +157,8 @@ def _quant_o_tile(
             packed_bits = pl.reg.bitwise_or(rope_low_bits, rounded_imag_bits, rope_mask)
             packed_rope = pl.reg.interpret_cast(packed_bits, dtype=pl.BF16)
             rotated_back = pl.reg.store(value, offset=row * HEAD_DIM + O_ROPE_START, value=packed_rope)
+
+        pl.reg.mem_bar("VST_VLD")
 
         # BF16 exponent reduction and inverse-power scaling.
         full16 = pl.reg.full_mask(lanes=256)
@@ -209,6 +211,7 @@ def _quant_o_tile(
             word_offset_u32 = block_u32 * 64
             word_offset = pl.cast(word_offset_u32, pl.INDEX)
             stored = pl.reg.store(payload_words, offset=word_offset, value=packed_words)
+        pl.reg.mem_bar("VST_VST")
         for tail in pl.hardware_loop(row_tile - rows):
             row_u32 = pl.cast(rows + tail, pl.UINT32)
             for chunk in pl.hardware_loop(2):
