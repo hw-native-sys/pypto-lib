@@ -496,6 +496,317 @@ def golden_engram_rows_case(tensors):
     tensors["x"][:] = (h + gate.unsqueeze(-1) * value.unsqueeze(-2)).bfloat16().float()
 
 
+_ENGRAM_AUTO_SYNC = True
+
+
+@pl.jit.inline(auto_scope=False)
+def _engram_gate_row_reg(
+    hidden: pl.Tile[[D], pl.FP32, pl.Mem.Vec],
+    key: pl.Tile[[D], pl.BF16, pl.Mem.Vec],
+    value: pl.Tile[[D], pl.BF16, pl.Mem.Vec],
+    weight: pl.Tile[[D], pl.FP32, pl.Mem.Vec],
+    output: pl.Tile[[D], pl.FP32, pl.Mem.Vec],
+    auto_sync: pl.constexpr,
+):
+    """Apply the C++ lane accumulation, inverse-root correction and BF16 residual rounding."""
+    with pl.reg_scope(auto_sync=auto_sync):
+        full = pl.reg.full_mask(lanes=64)
+        sx = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+        sk = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+        dot = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+        for chunk in pl.hardware_loop(D // 64):
+            xv = pl.reg.load(hidden, chunk * 64, lanes=64)
+            kb = pl.reg.load(key, chunk * 64, lanes=64)
+            kv = pl.reg.convert(kb, dtype=pl.FP32)
+            wv = pl.reg.load(weight, chunk * 64, lanes=64)
+            square_x = pl.reg.mul(xv, xv, full)
+            sx = pl.reg.add(sx, square_x, full)
+            square_k = pl.reg.mul(kv, kv, full)
+            sk = pl.reg.add(sk, square_k, full)
+            product = pl.reg.mul(xv, wv, full)
+            product = pl.reg.mul(product, kv, full)
+            dot = pl.reg.add(dot, product, full)
+        sx = pl.reg.reduce_sum(sx, full, reassoc=True)
+        sk = pl.reg.reduce_sum(sk, full, reassoc=True)
+        dot = pl.reg.reduce_sum(dot, full, reassoc=True)
+        sx = pl.reg.broadcast(sx, lanes=64, dtype=pl.FP32)
+        sk = pl.reg.broadcast(sk, lanes=64, dtype=pl.FP32)
+        dot = pl.reg.broadcast(dot, lanes=64, dtype=pl.FP32)
+        sx = pl.reg.muls(sx, D_INV, full)
+        sk = pl.reg.muls(sk, D_INV, full)
+        x_variance = pl.reg.adds(sx, NORM_EPS, full)
+        x_one = pl.reg.broadcast(1.0, lanes=64, dtype=pl.FP32)
+        x_r = pl.reg.div(x_one, x_variance, full)
+        x_root = pl.reg.sqrt(x_r, full)
+        x_t = pl.reg.muls(x_variance, -0.5, full)
+        x_t = pl.reg.mul(x_t, x_root, full)
+        x_three_halves = pl.reg.broadcast(1.5, lanes=64, dtype=pl.FP32)
+        x_factor = pl.reg.mula(x_three_halves, x_t, x_root, full)
+        x_inverse = pl.reg.mul(x_root, x_factor, full)
+        x_negative_variance = pl.reg.muls(x_variance, -1.0, full)
+        x_correction = pl.reg.mula(x_one, x_negative_variance, x_r, full)
+        x_negative_inverse = pl.reg.muls(x_inverse, -1.0, full)
+        x_error = pl.reg.mula(x_r, x_negative_inverse, x_inverse, full)
+        x_correction = pl.reg.mula(x_correction, x_variance, x_error, full)
+        x_correction = pl.reg.mul(x_correction, x_inverse, full)
+        x_half = pl.reg.broadcast(0.5, lanes=64, dtype=pl.FP32)
+        x_inverse = pl.reg.mula(x_inverse, x_correction, x_half, full)
+        x_bits = pl.reg.interpret_cast(x_variance, dtype=pl.UINT32)
+        x_infinite = pl.reg.compares(x_bits, 2139095040, full, predicate="eq")
+        x_zero = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+        x_inverse = pl.reg.select(x_infinite, x_zero, x_inverse)
+        k_variance = pl.reg.adds(sk, NORM_EPS, full)
+        k_one = pl.reg.broadcast(1.0, lanes=64, dtype=pl.FP32)
+        k_r = pl.reg.div(k_one, k_variance, full)
+        k_root = pl.reg.sqrt(k_r, full)
+        k_t = pl.reg.muls(k_variance, -0.5, full)
+        k_t = pl.reg.mul(k_t, k_root, full)
+        k_three_halves = pl.reg.broadcast(1.5, lanes=64, dtype=pl.FP32)
+        k_factor = pl.reg.mula(k_three_halves, k_t, k_root, full)
+        k_inverse = pl.reg.mul(k_root, k_factor, full)
+        k_negative_variance = pl.reg.muls(k_variance, -1.0, full)
+        k_correction = pl.reg.mula(k_one, k_negative_variance, k_r, full)
+        k_negative_inverse = pl.reg.muls(k_inverse, -1.0, full)
+        k_error = pl.reg.mula(k_r, k_negative_inverse, k_inverse, full)
+        k_correction = pl.reg.mula(k_correction, k_variance, k_error, full)
+        k_correction = pl.reg.mul(k_correction, k_inverse, full)
+        k_half = pl.reg.broadcast(0.5, lanes=64, dtype=pl.FP32)
+        k_inverse = pl.reg.mula(k_inverse, k_correction, k_half, full)
+        k_bits = pl.reg.interpret_cast(k_variance, dtype=pl.UINT32)
+        k_infinite = pl.reg.compares(k_bits, 2139095040, full, predicate="eq")
+        k_zero = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+        k_inverse = pl.reg.select(k_infinite, k_zero, k_inverse)
+        dot = pl.reg.mul(dot, x_inverse, full)
+        dot = pl.reg.mul(dot, k_inverse, full)
+        dot = pl.reg.muls(dot, DOT_SCALE, full)
+        root = pl.reg.abs(dot, full)
+        root = pl.reg.maximums(root, CLAMP, full)
+        root = pl.reg.sqrt(root, full)
+        nonnegative = pl.reg.compares(dot, 0.0, full, predicate="ge")
+        negative = pl.reg.muls(root, -1.0, full)
+        root = pl.reg.select(nonnegative, root, negative)
+        root = pl.reg.muls(root, -1.0, full)
+        root = pl.reg.exp(root, full)
+        root = pl.reg.adds(root, 1.0, full)
+        gate = pl.reg.div(x_one, root, full)
+        for chunk in pl.hardware_loop(D // 64):
+            xv = pl.reg.load(hidden, chunk * 64, lanes=64)
+            vb = pl.reg.load(value, chunk * 64, lanes=64)
+            vv = pl.reg.convert(vb, dtype=pl.FP32)
+            y = pl.reg.mul(vv, gate, full)
+            y = pl.reg.add(xv, y, full)
+            rounded = pl.reg.convert(y, dtype=pl.BF16, rounding="R", saturate=False)
+            y = pl.reg.convert(rounded, dtype=pl.FP32)
+            if not auto_sync:
+                pl.reg.mem_bar("VLD_VST")
+            _written = pl.reg.store(output, chunk * 64, y, full)
+            if not auto_sync:
+                pl.reg.mem_bar("VST_VLD")
+    return output
+
+
+
+@pl.jit.incore
+def _engram_gate_reg(
+    kv: pl.Tensor, weight: pl.Tensor, x: pl.Tensor, out: pl.Tensor,
+    tokens: pl.Scalar[pl.INDEX], auto_sync: pl.constexpr = True,
+):
+    """Run the per-copy gate with cached weights and the C++ worker traversal."""
+    first = pl.tile.get_block_idx()
+    workers = pl.tile.get_block_num()
+    if first < tokens * HC_MULT:
+        weight_raw = pl.tile.load(weight, [first % HC_MULT, 0], [1, D], target_memory=pl.Mem.Vec)
+        for work in pl.range(first, tokens * HC_MULT, workers):
+            if work != first and workers % HC_MULT != 0:
+                weight_raw = pl.tile.load(weight, [work % HC_MULT, 0], [1, D], target_memory=pl.Mem.Vec)
+            gain = pl.reshape(weight_raw, [D])
+            hidden_raw = pl.tile.load(x, [work, 0], [1, D], target_memory=pl.Mem.Vec)
+            key_raw = pl.tile.load(kv, [work // HC_MULT, work % HC_MULT * D], [1, D], target_memory=pl.Mem.Vec)
+            value_raw = pl.tile.load(kv, [work // HC_MULT, HC_MULT * D], [1, D], target_memory=pl.Mem.Vec)
+            hidden = pl.reshape(hidden_raw, [D])
+            key = pl.reshape(key_raw, [D])
+            value = pl.reshape(value_raw, [D])
+            output = pl.create_tile([D], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+            output = _engram_gate_row_reg(hidden, key, value, gain, output, auto_sync)
+            pl.store(pl.reshape(output, [1, D]), [work, 0], out)
+    return out
+
+
+
+@pl.jit.inline(auto_scope=False)
+def _load_engram_gate_pair(
+    kv: pl.Tensor, x: pl.Tensor,
+    hidden: pl.Tile[[2, 2 * D], pl.FP32, pl.Mem.Vec],
+    key: pl.Tile[[2, 2 * D], pl.BF16, pl.Mem.Vec],
+    value: pl.Tile[[2, D], pl.BF16, pl.Mem.Vec],
+    work: pl.Scalar[pl.INDEX], slot: pl.Scalar[pl.INDEX],
+):
+    hidden = pl.tile.gather_row(hidden, x, [slot, 0], [work, 0], [1, 2 * D])
+    key = pl.tile.gather_row(key, kv, [slot, 0], [work // 2, work % 2 * 2 * D], [1, 2 * D])
+    value = pl.tile.gather_row(value, kv, [slot, 0], [work // 2, HC_MULT * D], [1, D])
+    return hidden, key, value
+
+
+
+@pl.jit.incore
+def _engram_gate_pairs_reg(
+    kv: pl.Tensor, weight: pl.Tensor, x: pl.Tensor, out: pl.Tensor,
+    tokens: pl.Scalar[pl.INDEX], auto_sync: pl.constexpr = True,
+):
+    """Prefetch the next pair into a separate UB slot while consuming the current pair."""
+    first = pl.tile.get_block_idx()
+    workers = pl.tile.get_block_num()
+    total = tokens * 2
+    if first < total:
+        hidden = pl.create_tile([2, 2 * D], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+        key = pl.create_tile([2, 2 * D], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+        value = pl.create_tile([2, D], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+        gain = pl.tile.load(weight, [first % 2, 0], [1, 2 * D], target_memory=pl.Mem.Vec)
+        output = pl.create_tile([2, D], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+        hidden, key, value = _load_engram_gate_pair(kv, x, hidden, key, value, first, 0)
+        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, 0)
+        pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, 2)
+        pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, 3)
+        rounds = (total - first + workers - 1) // workers
+        for group in pl.range((rounds + 1) // 2):
+            for slot in pl.unroll(2):
+                iteration = group * 2 + slot
+                if iteration < rounds:
+                    work = first + iteration * workers
+                    next_slot = 1 - slot
+                    if iteration > 0 and workers % 2 != 0:
+                        pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE2, 4)
+                        pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, 4)
+                        gain = pl.tile.gather_row(gain, weight, [0, 0], [work % 2, 0], [1, 2 * D])
+                        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, 4)
+                        pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.V, 4)
+                    if iteration + 1 < rounds:
+                        if iteration > 0:
+                            pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, next_slot)
+                        hidden, key, value = _load_engram_gate_pair(kv, x, hidden, key, value, work + workers, next_slot)
+                        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, next_slot)
+                    pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.V, slot)
+                    for copy in pl.unroll(2):
+                        output_event = copy + 2
+                        copy_offset = copy * D
+                        pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, output_event)
+                        hidden_row = pl.reshape(pl.tile.slice(hidden, [1, D], [slot, copy_offset]), [D])
+                        key_row = pl.reshape(pl.tile.slice(key, [1, D], [slot, copy_offset]), [D])
+                        value_row = pl.reshape(pl.tile.slice(value, [1, D], [slot, 0]), [D])
+                        gain_row = pl.reshape(pl.tile.slice(gain, [1, D], [0, copy_offset]), [D])
+                        output_row = pl.reshape(pl.tile.slice(output, [1, D], [copy, 0]), [D])
+                        output_row = _engram_gate_row_reg(hidden_row, key_row, value_row, gain_row, output_row, auto_sync)
+                        pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE3, output_event)
+                        pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE3, output_event)
+                        pl.store(pl.reshape(output_row, [1, D]), [work * 2 + copy, 0], out)
+                        pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, output_event)
+                    if iteration + 2 < rounds:
+                        pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE2, slot)
+        pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 2)
+        pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 3)
+        pl.system.barrier(pipe=pl.PipeType.ALL)
+    return out
+
+
+
+@pl.jit
+def l2_engram_gate_vectors(
+    kv: pl.Tensor, weight: pl.Tensor,
+    x: pl.InOut[pl.Tensor], active: pl.Scalar[pl.INDEX],
+):
+    with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_gate"):
+        x = _engram_gate_native(kv, weight, x, x, active, 3)
+    return x
+
+
+
+@pl.jit
+def l2_engram_gate_vectors_pypto(
+    kv: pl.Tensor, weight: pl.Tensor,
+    x: pl.InOut[pl.Tensor], active: pl.Scalar[pl.INDEX],
+):
+    with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_gate"):
+        x = _engram_gate_reg(kv, weight, x, x, active, _ENGRAM_AUTO_SYNC)
+    return x
+
+
+
+@pl.jit
+def l2_engram_gate_vectors_pypto_pairs(
+    kv: pl.Tensor, weight: pl.Tensor,
+    x: pl.InOut[pl.Tensor], active: pl.Scalar[pl.INDEX],
+):
+    hidden_pairs = pl.reshape(x, [pl.tensor.dim(x, 0) // 2, 2 * D])
+    weight_pairs = pl.reshape(weight, [HC_MULT // 2, 2 * D])
+    with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_gate_pairs"):
+        x = _engram_gate_pairs_reg(kv, weight_pairs, hidden_pairs, x, active, _ENGRAM_AUTO_SYNC)
+    return x
+
+
+
+def golden_engram_gate_vectors(tensors, active):
+    """Validate every active residual value and preserve the inactive tail."""
+    key = tensors["kv"][:active, :HC_MULT * D].float().reshape(active, HC_MULT, D)
+    value = tensors["kv"][:active, HC_MULT * D:].float()
+    hidden = tensors["x"][:active * HC_MULT].float().reshape(active, HC_MULT, D)
+    inv_x = torch.rsqrt(hidden.square().mean(-1) + NORM_EPS)
+    inv_k = torch.rsqrt(key.square().mean(-1) + NORM_EPS)
+    dot = (hidden * tensors["weight"] * key).sum(-1)
+    dot = dot * inv_x * inv_k * DOT_SCALE
+    root = dot.abs().clamp_min(CLAMP).sqrt()
+    gate = torch.sigmoid(torch.where(dot >= 0, root, -root))
+    tensors["x"][:active * HC_MULT] = (hidden + gate.unsqueeze(-1) * value.unsqueeze(-2)).bfloat16().float().reshape(active * HC_MULT, D)
+
+
+
+def run_engram_gate_case(args):
+    """Run one component with the normal golden harness and explicit capture settings."""
+    from functools import partial
+    from golden import ScalarSpec, TensorSpec, ratio_allclose, run
+
+    tokens = args.tokens if args.tokens is not None else 17
+    active = tokens if args.active is None else args.active
+    if not 0 <= active <= tokens:
+        raise ValueError("active rows must be between zero and the tensor row count")
+    generator = torch.Generator().manual_seed(17)
+    def key_values():
+        values = torch.randn(tokens, KV_OUT, generator=generator).bfloat16()
+        if args.pattern == "zero":
+            values.zero_()
+        return values
+    def hidden_values():
+        values = torch.randn(tokens, HC_MULT, D, generator=generator)
+        if args.pattern == "zero":
+            values.zero_()
+        elif args.pattern == "mixed":
+            values[::3] = 0
+            values[1::3] *= 32
+            values[2::3] *= 0.00001
+        return values
+    specs = [
+        TensorSpec("kv", [tokens, KV_OUT], torch.bfloat16, init_value=key_values),
+        TensorSpec("weight", [HC_MULT, D], torch.float32,
+                   init_value=lambda: torch.rand(HC_MULT, D, generator=generator) + 0.5),
+        TensorSpec("x", [tokens * HC_MULT, D], torch.float32, init_value=lambda: hidden_values().reshape(tokens * HC_MULT, D)),
+        ScalarSpec("active", torch.int64, active),
+    ]
+    if args.implementation == "cpp":
+        entry = l2_engram_gate_vectors
+    else:
+        # Match the C++ dispatch threshold for paired work.
+        entry = l2_engram_gate_vectors_pypto_pairs if active >= 256 else l2_engram_gate_vectors_pypto
+    reference = partial(golden_engram_gate_vectors, active=active)
+    compare = {"x": ratio_allclose(atol=1e-3, rtol=1e-2, max_error_ratio=0.005)}
+    return run(
+        fn=entry, specs=specs, golden_fn=reference, compare_fn=compare,
+        compile_only=args.compile_only, runtime_dir=args.runtime_dir, golden_data=args.golden_data,
+        save_data=args.save_data,
+        config={"backend_type": "a5", "execution_mode": args.execution_mode,
+                "device_id": int(args.device), "enable_chip_swimlane": args.enable_chip_swimlane,
+                "enable_dep_gen": bool(args.enable_chip_swimlane), "dump_passes": True},
+    )
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -520,7 +831,17 @@ if __name__ == "__main__":
     parser.add_argument("--save-data", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.add_argument("--component", choices=["rows", "gate"], default="rows")
+    parser.add_argument("--active", type=int)
+    parser.add_argument("--pattern", choices=["random", "zero", "mixed"], default="random")
+    parser.add_argument("--manual-sync", action="store_true")
     args = parser.parse_args()
+    _ENGRAM_AUTO_SYNC = not args.manual_sync
+    if args.component == "gate":
+        result = run_engram_gate_case(args)
+        if not result.passed:
+            raise SystemExit(result.error or 1)
+        raise SystemExit(0)
 
     device_ids = [int(d) for d in args.device.split(",")]
     if len(device_ids) != 1:
