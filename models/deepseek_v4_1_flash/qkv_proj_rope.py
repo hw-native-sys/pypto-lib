@@ -370,7 +370,7 @@ def kv_proj(
         n_tile = KV_N_TILE
     tasks = ((num_tokens + row_tile - 1) // row_tile) * (HEAD_DIM // n_tile)
     workers = pl.max(pl.min(tasks, pl.min(worker_limit, pl.system.available_cluster_count())), 1)
-    with pl.spmd(workers, name_hint="proj_kv", sync_start=True):
+    with pl.spmd(workers, name_hint="proj_kv"):
         kv_projection = _proj_kv(payload, wkv, scales, wkv_scale, kv_projection, num_tokens, 0, row_tile)
     return kv_projection
 
@@ -791,7 +791,7 @@ def proj_kv_pypto(
         sa = activation_scale[0, scale_begin:scale_end]
         sa = pl.reshape(sa, [80, scale_width])
         sa = pl.tensor.view(sa, [80, scale_width], layout=pl.MX_A_ZZ)
-        for worker in pl.spmd(pl.min(worker_limit, 8), sync_start=True):
+        for worker in pl.spmd(pl.min(worker_limit, 8)):
             for base in pl.range(0, 8, worker_limit):
                 if base + worker < 8:
                     row = mt * 80
