@@ -23,6 +23,8 @@ from quant import pack_bf16_nz, unpack_bf16_nz
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("LM_HEAD_T_DYN")
+PANEL_ROWS_DYN = pl.dynamic("LM_HEAD_PANEL_ROWS")
+PANEL_COLUMNS_DYN = pl.dynamic("LM_HEAD_PANEL_COLUMNS")
 
 # model config
 D = M.hidden_size
@@ -53,6 +55,7 @@ LM_HEAD_M_TILE = 80
 LM_HEAD_N_TILE = 256
 LM_HEAD_K_TILE = 128
 LM_HEAD_PUSH_M_TILE = 192
+LM_HEAD_PUSH_L1_K_TILE = 256
 LM_HEAD_PUSH_L0_K_TILE = 64
 LM_HEAD_GATHER_M_TILE = 72
 LM_HEAD_TAIL_TILE = VOCAB_PER_TP % LM_HEAD_N_TILE or LM_HEAD_N_TILE
@@ -76,17 +79,64 @@ if __name__ == "__main__" and DP_SIZE < 1:
 
 
 def _lm_head_push_row_tile(num_rows: int) -> int:
-    if LM_HEAD_TP_SIZE == 1:
-        return LM_HEAD_M_TILE
     group_rows = LM_HEAD_TP_SIZE * num_rows
-    # Cube alignment and complete owner stripes on both AIV lanes.
-    lane_aligned = lcm(16, 2 * HIDDEN_OWNER_ROW_TILE)
-    return max(tile for tile in range(lane_aligned, LM_HEAD_PUSH_M_TILE + 1, lane_aligned) if group_rows % tile == 0)
+    # Cube row alignment and complete owner stripes on each AIV lane.
+    row_alignment = lcm(16, 2 * HIDDEN_OWNER_ROW_TILE)
+    if LM_HEAD_TP_SIZE > 1 and group_rows % row_alignment != 0:
+        raise ValueError(f"LM head projection row count {group_rows} must be a multiple of {row_alignment}")
+    return min(LM_HEAD_PUSH_M_TILE, group_rows)
 
 
-def _lm_head_push_l1_tiling(num_rows: int) -> tuple[int, int]:
-    # Small row tiles can overlap an extra L1 load. Larger tiles use shorter K slices.
-    return (256, 3) if _lm_head_push_row_tile(num_rows) <= 32 else (128, 2)
+@pl.jit.inline(auto_scope=False)
+def _lm_head_project_tile(
+    hidden: pl.Tensor,
+    weight: pl.Tensor,
+    row: pl.Scalar[pl.INDEX],
+    column: pl.Scalar[pl.INDEX],
+    row_tile: pl.constexpr,
+    column_tile: pl.constexpr,
+) -> pl.Tile:
+    acc = pl.tile.create([row_tile, column_tile], dtype=pl.FP32)
+    for k in pl.pipeline(0, D, LM_HEAD_PUSH_L1_K_TILE, stage=2):
+        a = pl.load(hidden, [row, k], [row_tile, LM_HEAD_PUSH_L1_K_TILE], target_memory=pl.Mem.Mat)
+        b = pl.load(
+            weight, [k, column], [LM_HEAD_PUSH_L1_K_TILE, column_tile],
+            target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP,
+        )
+        for inner in pl.pipeline(0, LM_HEAD_PUSH_L1_K_TILE, LM_HEAD_PUSH_L0_K_TILE, stage=2):
+            left = pl.tile.extract(
+                a, 0, inner, [row_tile, LM_HEAD_PUSH_L0_K_TILE], target_memory=pl.Mem.Left,
+            )
+            right = pl.tile.extract(
+                b, inner, 0, [LM_HEAD_PUSH_L0_K_TILE, column_tile], target_memory=pl.Mem.Right,
+            )
+            acc = pl.matmul_acc(acc, left, right, init_cond=(k + inner == 0))
+    return acc
+
+
+@pl.jit.inline(auto_scope=False)
+def _lm_head_publish_panel(
+    shard: pl.Tile[[PANEL_ROWS_DYN, PANEL_COLUMNS_DYN], pl.FP32],
+    received: pld.DistributedTensor,
+    tp_rank: pl.Scalar[pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    row: pl.Scalar[pl.INDEX],
+    column: pl.Scalar[pl.INDEX],
+    lane: pl.Scalar[pl.INDEX],
+    num_rows: pl.constexpr,
+    row_tile: pl.constexpr,
+    column_tile: pl.constexpr,
+):
+    # Panel storage is ordered by source shard, then by vocabulary panel.
+    panel_view = pl.tensor.view(received, [num_rows * (VOCAB // column_tile), column_tile])
+    panel_row = (tp_rank * VOCAB_PER_TP + column) * num_rows // column_tile
+    for offset in pl.range(0, row_tile // 2, HIDDEN_OWNER_ROW_TILE):
+        stripe = row + lane * (row_tile // 2) + offset
+        owner = stripe // HIDDEN_OWNER_ROW_TILE % LM_HEAD_TP_SIZE
+        owner_row = stripe // (HIDDEN_OWNER_ROW_TILE * LM_HEAD_TP_SIZE) * HIDDEN_OWNER_ROW_TILE
+        block = pl.tile.slice(shard, [HIDDEN_OWNER_ROW_TILE, column_tile], [offset, 0])
+        panel_bf16 = pl.cast(block, pl.BF16, mode="rint")
+        pld.tile.remote_store(panel_bf16, panel_view, group_base + owner, [panel_row + owner_row, 0])
 
 
 @pl.jit.inline(auto_scope=False)
@@ -100,59 +150,57 @@ def _lm_head_project_push(
     dispatch_notified: pl.Scalar[pl.TASK_ID],
     num_rows: pl.constexpr,
     row_tile: pl.constexpr,
-    l1_k_tile: pl.constexpr,
-    l1_stages: pl.constexpr,
+    last_row_tile: pl.constexpr,
 ) -> pl.Scalar[pl.TASK_ID]:
     with pl.spmd(
         32, name_hint="lm_head_matmul_push", deps=[dispatch_ready, dispatch_notified],
         optimizations=[pl.cross_core_slot(slot_num=1)],
     ) as logits_pushed:
+        full_panels = VOCAB_PER_TP // LM_HEAD_N_TILE
         worker = pl.tile.get_block_idx()
-        panels = pl.tensor.view(received, [num_rows * (VOCAB // LM_HEAD_N_TILE), LM_HEAD_N_TILE])
-        tails = pl.tensor.view(received, [num_rows * (VOCAB // LM_HEAD_TAIL_TILE), LM_HEAD_TAIL_TILE])
-        for row in pl.range(0, LM_HEAD_TP_SIZE * num_rows, row_tile):
-            for panel in pl.range(worker, (VOCAB_PER_TP + LM_HEAD_N_TILE - 1) // LM_HEAD_N_TILE, 32):
+        group_rows = LM_HEAD_TP_SIZE * num_rows
+        last_row = group_rows // row_tile * row_tile
+        for row in pl.range(0, last_row, row_tile):
+            for panel in pl.range(worker, full_panels, 32):
                 column = panel * LM_HEAD_N_TILE
-                # The final projection tile ends at the shard boundary.
-                weight_column = pl.min(column, VOCAB_PER_TP - LM_HEAD_N_TILE)
-                acc = pl.tile.create([row_tile, LM_HEAD_N_TILE], dtype=pl.FP32)
-                for k in pl.pipeline(0, D, l1_k_tile, stage=l1_stages):
-                    a = pl.load(hidden, [row, k], [row_tile, l1_k_tile], target_memory=pl.Mem.Mat)
-                    b = pl.load(
-                        weight, [k, weight_column], [l1_k_tile, LM_HEAD_N_TILE],
-                        target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP,
-                    )
-                    for inner in pl.pipeline(0, l1_k_tile, LM_HEAD_PUSH_L0_K_TILE, stage=2):
-                        left = pl.tile.extract(
-                            a, 0, inner, [row_tile, LM_HEAD_PUSH_L0_K_TILE], target_memory=pl.Mem.Left,
-                        )
-                        right = pl.tile.extract(
-                            b, inner, 0, [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_N_TILE], target_memory=pl.Mem.Right,
-                        )
-                        acc = pl.matmul_acc(acc, left, right, init_cond=(k + inner == 0))
-
-                # Panel storage is ordered by source shard, then by vocabulary panel.
-                shard_column = tp_rank * VOCAB_PER_TP + column
+                acc = _lm_head_project_tile(hidden, weight, row, column, row_tile, LM_HEAD_N_TILE)
                 for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
-                    half = pl.aiv_shard(acc)
-                    for offset in pl.range(0, row_tile // 2, HIDDEN_OWNER_ROW_TILE):
-                        stripe = row + lane * (row_tile // 2) + offset
-                        owner = stripe // HIDDEN_OWNER_ROW_TILE % LM_HEAD_TP_SIZE
-                        owner_row = stripe // (HIDDEN_OWNER_ROW_TILE * LM_HEAD_TP_SIZE) * HIDDEN_OWNER_ROW_TILE
-                        if column == VOCAB_PER_TP - LM_HEAD_TAIL_TILE:
-                            tail_column = LM_HEAD_N_TILE - LM_HEAD_TAIL_TILE
-                            piece = pl.tile.extract(
-                                half, offset, tail_column, [HIDDEN_OWNER_ROW_TILE, LM_HEAD_TAIL_TILE],
-                                target_memory=pl.Mem.Vec,
-                            )
-                            tail_bf16 = pl.cast(piece, pl.BF16, mode="rint")
-                            panel_row = shard_column * num_rows // LM_HEAD_TAIL_TILE
-                            pld.tile.remote_store(tail_bf16, tails, group_base + owner, [panel_row + owner_row, 0])
-                        else:
-                            block = pl.tile.slice(half, [HIDDEN_OWNER_ROW_TILE, LM_HEAD_N_TILE], [offset, 0])
-                            panel_bf16 = pl.cast(block, pl.BF16, mode="rint")
-                            panel_row = shard_column * num_rows // LM_HEAD_N_TILE
-                            pld.tile.remote_store(panel_bf16, panels, group_base + owner, [panel_row + owner_row, 0])
+                    shard = pl.aiv_shard(acc)
+                    _lm_head_publish_panel(
+                        shard, received, tp_rank, group_base, row, column, lane, num_rows, row_tile, LM_HEAD_N_TILE,
+                    )
+            if VOCAB_PER_TP % LM_HEAD_N_TILE != 0 and worker == full_panels % 32:
+                column = full_panels * LM_HEAD_N_TILE
+                acc_tail = _lm_head_project_tile(hidden, weight, row, column, row_tile, LM_HEAD_TAIL_TILE)
+                for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    shard_tail = pl.aiv_shard(acc_tail)
+                    _lm_head_publish_panel(
+                        shard_tail, received, tp_rank, group_base, row, column, lane,
+                        num_rows, row_tile, LM_HEAD_TAIL_TILE,
+                    )
+        if group_rows != last_row:
+            for panel in pl.range(worker, full_panels, 32):
+                column = panel * LM_HEAD_N_TILE
+                acc_last = _lm_head_project_tile(
+                    hidden, weight, last_row, column, last_row_tile, LM_HEAD_N_TILE,
+                )
+                for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    shard_last = pl.aiv_shard(acc_last)
+                    _lm_head_publish_panel(
+                        shard_last, received, tp_rank, group_base, last_row, column, lane,
+                        num_rows, last_row_tile, LM_HEAD_N_TILE,
+                    )
+            if VOCAB_PER_TP % LM_HEAD_N_TILE != 0 and worker == full_panels % 32:
+                column = full_panels * LM_HEAD_N_TILE
+                acc_last_tail = _lm_head_project_tile(
+                    hidden, weight, last_row, column, last_row_tile, LM_HEAD_TAIL_TILE,
+                )
+                for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    shard_last_tail = pl.aiv_shard(acc_last_tail)
+                    _lm_head_publish_panel(
+                        shard_last_tail, received, tp_rank, group_base, last_row, column, lane,
+                        num_rows, last_row_tile, LM_HEAD_TAIL_TILE,
+                    )
     return logits_pushed
 
 
@@ -337,8 +385,7 @@ def lm_head(
         logits_pushed = _lm_head_project_push(
             hidden_window, lm_head_weight, logits_window, project_tp_rank, project_group_base,
             dispatch_ready, dispatch_notified, num_rows, _lm_head_push_row_tile(num_rows),
-            l1_k_tile=_lm_head_push_l1_tiling(num_rows)[0],
-            l1_stages=_lm_head_push_l1_tiling(num_rows)[1],
+            (LM_HEAD_TP_SIZE * num_rows - 1) % _lm_head_push_row_tile(num_rows) + 1,
         )
 
         # Publish one completion update after all vector workers finish their puts.
@@ -358,9 +405,7 @@ def lm_head(
                         cmp=pld.WaitCmp.Ge,
                     )
 
-        with pl.spmd(
-            64, name_hint="lm_head_combine_gather", sync_start=True, deps=[combine_ready, combine_notified],
-        ) as gathered:
+        with pl.spmd(64, name_hint="lm_head_combine_gather", deps=[combine_ready, combine_notified]) as gathered:
             gather_worker = pl.tile.get_block_idx()
             row_tiles = (num_rows + LM_HEAD_GATHER_M_TILE - 1) // LM_HEAD_GATHER_M_TILE
             full_panels = (VOCAB_PER_TP - LM_HEAD_TAIL_TILE) // LM_HEAD_N_TILE
