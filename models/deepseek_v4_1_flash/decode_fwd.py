@@ -46,8 +46,13 @@ from decode_c2a_full import decode_c2a_full
 from decode_c2a_reuse import decode_c2a_reuse
 from decode_swa import decode_swa
 from input_pack import prepare_compressed_lens
+from lm_head import GROUP_LOGIT_ROWS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD, VOCAB, VOCAB_PER_TP
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
-from engram import ENGRAM_K, KV_OUT, engram_from_rows
+from engram import ENGRAM_K, FETCH_TILE, KV_OUT, N_HASH_COLS, engram_from_rows, engram_host_lookup
+from engram_host_offload import (
+    ENGRAM_ROWS, ENGRAM_SHARD_ROWS, ENGRAM_FULL_VOCAB, ENGRAM_LOOKUPS_DYN, EngramPayloadSource,
+    write_forward_engram_layout,
+)
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
 from decode_moe import (
     BALANCED_ROUTING, initialize_balanced_routes, moe, SIGNAL_PAD, clear_moe_signals, DISPATCH_PACKET_WIDTH, EP_SIZE, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH,
@@ -831,12 +836,140 @@ def _l2_decode_fwd(
     return result, encoder_pre_mix
 
 decode_fwd = pl.jit.inline(auto_scope=False)(_l2_decode_fwd)
-l2_decode_fwd = pl.jit(auto_scope=False)(_l2_decode_fwd)
+
+
+@pl.jit(auto_scope=False)
+def l2_decode_fwd(
+    engram_ids: pl.Tensor[[2 * T_DYN * N_HASH_COLS, 1], pl.INT32],
+    engram_scales: pl.Tensor[[2 * ENGRAM_ROWS, 8], pl.UINT8],
+    engram_payload: pld.DistributedTensor[[2 * ENGRAM_SHARD_ROWS, 256], pl.UINT8],
+    engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
+    engram_wkv_scale: pl.Tensor[[2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
+    engram_weight: pl.Tensor[[2, HC_MULT, D], pl.FP32],
+    x_hc: pl.InOut[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+    pre_mix: pl.InOut[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
+    dspark_target_hidden: pl.Out[pl.Tensor[[T_DYN, DSPARK_MAIN_IN], pl.BF16]],
+    hc_attn_fn: pl.Tensor[[WEIGHT_BANK_SIZE * MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[WEIGHT_BANK_SIZE * 3], pl.FP32],
+    hc_attn_base: pl.Tensor[[WEIGHT_BANK_SIZE * MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[WEIGHT_BANK_SIZE * D], pl.BF16],
+    wq_a: pl.Tensor[[WEIGHT_BANK_SIZE, D, Q_LORA], pl.FP8E4M3FN],
+    q_norm_weight: pl.Tensor[[WEIGHT_BANK_SIZE * Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[WEIGHT_BANK_SIZE, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wkv: pl.Tensor[[WEIGHT_BANK_SIZE, D, HEAD_DIM], pl.FP8E4M3FN],
+    kv_norm_weight: pl.Tensor[[WEIGHT_BANK_SIZE * HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[WEIGHT_BANK_SIZE * LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[WEIGHT_BANK_SIZE * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[WEIGHT_BANK_SIZE * LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[WEIGHT_BANK_SIZE, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    freqs_cos: pl.Tensor[[2, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
+    freqs_sin: pl.Tensor[[2, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[T_DYN], pl.INT64],
+    window_indices: pl.Tensor[[T_DYN, BLOCK_SIZE], pl.INT32],
+    window_cache_pool: pl.InOut[pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    compressed_cache_pool: pl.InOut[pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
+    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    index_cache_pool: pl.InOut[pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // 2], pl.UINT8]],
+    index_cache_scale_pool: pl.InOut[pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
+    c2a_index_block_table: pl.Tensor[[B_DYN, FWD_C2A_TABLE_DYN], pl.INT32],
+    c1a_index_block_table: pl.Tensor[[B_DYN, FWD_C1A_TABLE_DYN], pl.INT32],
+    c2a_compressor_wkv: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.BF16, pl.NZ],
+    c2a_compressor_wgate: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.BF16, pl.NZ],
+    c1a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
+    query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
+    state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
+    state_cache_pool: pl.InOut[pl.Tensor[[FWD_STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
+    compressor_norm_weight: pl.Tensor[[KV_SOURCE_COUNT * HEAD_DIM], pl.BF16],
+    c2a_compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
+    c1a_compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
+    index_wk: pl.Tensor[[INDEX_SOURCE_COUNT, HEAD_DIM, INDEX_DIM], pl.BF16, pl.NZ],
+    index_norm_weight: pl.Tensor[[INDEX_SOURCE_COUNT * INDEX_DIM], pl.BF16],
+    index_wq_b: pl.Tensor[[INDEX_SOURCE_COUNT, Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
+    index_weights_proj: pl.Tensor[[INDEX_SOURCE_COUNT, D, INDEX_H], pl.BF16, pl.NZ],
+    hc_ffn_fn: pl.Tensor[[WEIGHT_BANK_SIZE * MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[WEIGHT_BANK_SIZE * 3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[WEIGHT_BANK_SIZE * MIX_HC], pl.FP32],
+    ffn_norm_weight: pl.Tensor[[WEIGHT_BANK_SIZE * D], pl.BF16],
+    gate_weight: pl.Tensor[[WEIGHT_BANK_SIZE * N_EXPERTS, D], pl.BF16],
+    correction_bias: pl.Tensor[[WEIGHT_BANK_SIZE * N_EXPERTS], pl.FP32],
+    routed_w1: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w2: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w3: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    shared_w1: pl.Tensor[[WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w2: pl.Tensor[[WEIGHT_BANK_SIZE, MOE_INTER, D], pl.FP8E4M3FN],
+    shared_w3: pl.Tensor[[WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
+    recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
+    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], pl.INT8],
+    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
+    data_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
+    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
+    combine_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
+    moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
+    attention_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
+    rank: pl.Scalar[pl.INT32],
+    wq_a_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (D // MX_GROUP), Q_LORA], pl.FP8E8M0],
+    wq_b_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (Q_LORA // MX_GROUP), LOCAL_H * HEAD_DIM], pl.FP8E8M0],
+    wkv_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (D // MX_GROUP), HEAD_DIM], pl.FP8E8M0],
+    wo_b_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (LOCAL_O_WIDTH // MX_GROUP), D], pl.FP8E8M0],
+    index_wq_b_scale: pl.Tensor[[INDEX_SOURCE_COUNT * (Q_LORA // MX_GROUP), INDEX_H * INDEX_DIM], pl.FP8E8M0],
+    routed_w1_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (N_LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
+    routed_w2_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), D], pl.FP8E8M0],
+    routed_w3_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (N_LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
+    shared_w1_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
+    shared_w2_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
+    shared_w3_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
+    final_norm_weight: pl.Tensor[[D], pl.BF16],
+    lm_head_weight: pl.Tensor[[D, VOCAB_PER_TP], pl.BF16, pl.NZ],
+    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
+    sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
+    hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
+    hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
+    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
+):
+    engram_ids.bind_dynamic(0, ENGRAM_LOOKUPS_DYN)
+    lookup_count = pl.tensor.dim(engram_ids, 0)
+    lookup_flat = pl.create_tensor([lookup_count, 256], dtype=pl.BF16)
+    engram_first = pl.create_tensor([FETCH_TILE, 256], dtype=pl.UINT8)
+    engram_second = pl.create_tensor([FETCH_TILE, 256], dtype=pl.UINT8)
+    lookup_flat = engram_host_lookup(
+        engram_ids, engram_payload, engram_first, engram_second, engram_scales, lookup_flat,
+        ENGRAM_FULL_VOCAB, ENGRAM_SHARD_ROWS,
+    )
+    engram_lookup = pl.reshape(lookup_flat, [2, pl.tensor.dim(x_hc, 0), ENGRAM_K])
+    return decode_fwd(
+        engram_lookup, engram_wkv, engram_wkv_scale, engram_weight,
+        x_hc, pre_mix, dspark_target_hidden,
+        hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,
+        wq_a, q_norm_weight, wq_b, wkv, kv_norm_weight, attn_sink,
+        wo_a, wo_a_scale, wo_b,
+        freqs_cos, freqs_sin, window_slots, window_indices,
+        window_cache_pool, compressed_cache_pool, token_to_req_indices, position_ids,
+        index_cache_pool, index_cache_scale_pool, c2a_index_block_table, c1a_index_block_table,
+        c2a_compressor_wkv, c2a_compressor_wgate, c1a_compressor_wkv,
+        query_start_loc, state_block_table, state_cache_pool, compressor_norm_weight,
+        c2a_compressed_slots, c1a_compressed_slots,
+        index_wk, index_norm_weight, index_wq_b, index_weights_proj,
+        hc_ffn_fn, hc_ffn_scale, hc_ffn_base, ffn_norm_weight,
+        gate_weight, correction_bias,
+        routed_w1, routed_w2, routed_w3, shared_w1, shared_w2, shared_w3,
+        recv_meta, recv_x, recv_routes, data_arrived, routed_output, combine_arrived,
+        moe_num_tokens, attention_num_tokens, rank,
+        wq_a_scale, wq_b_scale, wkv_scale, wo_b_scale, index_wq_b_scale,
+        routed_w1_scale, routed_w2_scale, routed_w3_scale,
+        shared_w1_scale, shared_w2_scale, shared_w3_scale,
+        final_norm_weight, lm_head_weight, logit_row_indices,
+        logits, sampled_ids,
+        hidden_window, hidden_done, logits_window, logits_done,
+    )
 
 
 @pl.jit.host
 def l3_decode_fwd(
-    engram_lookup: pl.Tensor[[EP_SIZE, 2, T_DYN, ENGRAM_K], pl.BF16],
+    engram_ids: pl.Tensor[[EP_SIZE, 2 * T_DYN * N_HASH_COLS, 1], pl.INT32],
+    engram_scales: pl.Tensor[[EP_SIZE, 2 * ENGRAM_ROWS, 8], pl.UINT8],
     engram_wkv: pl.Tensor[[EP_SIZE, 2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
     engram_wkv_scale: pl.Tensor[[EP_SIZE, 2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
     engram_weight: pl.Tensor[[EP_SIZE, 2, HC_MULT, D], pl.FP32],
@@ -974,7 +1107,7 @@ def l3_decode_fwd(
     commit lengths before the next call. Completed forwards clear MoE signals;
     use persistent=True with reset_persistent_windows=False for serialized calls.
     Reset a reused request slot in all C2A sources after its users complete. Restore or reset mutated state before retrying failed
-    calls. Engram consumes host lookup rows; vision and DSpark require no inputs here.
+    calls. Engram fetches FP8 Host payloads using Device-resident scales; vision and DSpark require no inputs here.
     """
     x_hc.bind_dynamic(1, T_DYN)
     pre_mix.bind_dynamic(1, T_DYN)
@@ -993,6 +1126,8 @@ def l3_decode_fwd(
     position_ids.bind_dynamic(1, T_DYN)
     freqs_cos.bind_dynamic(2, ROPE_ROWS_DYN)
     freqs_sin.bind_dynamic(2, ROPE_ROWS_DYN)
+    engram_ids.bind_dynamic(1, ENGRAM_LOOKUPS_DYN)
+    engram_payload_buffer = pld.alloc_window_buffer([2 * ENGRAM_SHARD_ROWS, 256], dtype=pl.UINT8, memory_source="host", init="engram_payload")
     recv_meta_buffer = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
     recv_x_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], dtype=pl.INT8)
     recv_routes_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
@@ -1004,6 +1139,7 @@ def l3_decode_fwd(
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
     )
     for rank in pl.range(pld.world_size()):
+        engram_payload = pld.window(engram_payload_buffer, [2 * ENGRAM_SHARD_ROWS, 256], dtype=pl.UINT8)
         recv_meta = pld.window(recv_meta_buffer, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buffer, [N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], dtype=pl.INT8)
         recv_routes = pld.window(
@@ -1021,7 +1157,8 @@ def l3_decode_fwd(
             dtype=pl.INT32,
         )
         l2_decode_fwd(
-            engram_lookup[rank], engram_wkv[rank], engram_wkv_scale[rank], engram_weight[rank],
+            engram_ids[rank], engram_scales[rank], engram_payload,
+            engram_wkv[rank], engram_wkv_scale[rank], engram_weight[rank],
             x_hc[rank], pre_mix[rank], dspark_target_hidden[rank],
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_weight[rank],
@@ -1133,8 +1270,14 @@ def build_tensor_specs():
         annotation = signature.parameters[name].annotation
         shape = [_fixture_extent(dim) for dim in annotation.shape]
         dtype = _torch_dtype(annotation.dtype)
+        if name == "engram_ids":
+            shape = [EP_SIZE, 2 * MOE_TOKENS * N_HASH_COLS, 1]
         init_value = None
-        if name == "token_to_req_indices":
+        if name == "engram_ids":
+            init_value = -1
+        elif name == "engram_scales":
+            init_value = 127
+        elif name == "token_to_req_indices":
             init_value = request_ids.repeat(EP_SIZE, 1)
         elif name == "position_ids":
             init_value = position_ids.repeat(EP_SIZE, 1)
@@ -1162,7 +1305,11 @@ def build_tensor_specs():
 
 
 if __name__ == "__main__":
-    from golden import run
+    from contextlib import ExitStack
+
+    from utils import upload_forward_inputs
+    from golden import normalize_config, run
+    from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser()
@@ -1175,6 +1322,8 @@ if __name__ == "__main__":
     parser.add_argument("--weight-bank-size", type=int, default=WEIGHT_BANK_SIZE, choices=[1, N_LAYERS])
     parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(EP_SIZE)))
     parser.add_argument("--balanced-routing", action="store_true")
+    parser.add_argument("--engram-table-rows", type=int, default=ENGRAM_ROWS)
+    parser.add_argument("--engram-strategy", choices=("sliced_enp", "full_vocab_local"), default="sliced_enp")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--dump-passes", action="store_true")
     parser.add_argument("--enable-scope-stats", action="store_true")
@@ -1210,5 +1359,41 @@ if __name__ == "__main__":
         golden_fn=None,
         compile_only=args.compile_only,
     )
+    if result.passed:
+        write_forward_engram_layout(result.work_dir)
+    if result.passed and not args.compile_only:
+        cfg = normalize_config(config)
+        compiled = DistributedCompiledProgram.from_dir(
+            result.work_dir, backend_type=cfg.backend_type, execution_mode=cfg.execution_mode,
+            distributed_config=cfg.distributed_config,
+        )
+        replicated = ('moe_num_tokens', 'attention_num_tokens')
+        host_inputs = {spec.name: spec.create_tensor().share_memory_() for spec in specs if spec.name in replicated}
+        output_names = ("logits", "sampled_ids")
+        host_outputs = {spec.name: spec.create_tensor().share_memory_() for spec in specs if spec.name in output_names}
+        upload_buffer = torch.empty(64 * 1024**2, dtype=torch.uint8).share_memory_()
+        inherited = [*host_inputs.values(), *host_outputs.values(), upload_buffer]
+        with ExitStack() as sources, compiled.prepare(
+            cfg, persistent=True, reset_persistent_windows=False, inherited_host_tensors=inherited,
+            window_sources={"engram_payload": [
+                sources.enter_context(EngramPayloadSource([(None, 0, 2 * ENGRAM_SHARD_ROWS * 256)]))
+                for _ in devices
+            ]},
+        ) as runtime:
+            parameters = compiled._get_metadata()[0]
+            arguments = upload_forward_inputs(runtime, specs, parameters, len(devices), host_inputs, upload_buffer)
+            runtime(*arguments, config=cfg)
+            stacked = dict(zip((spec.name for spec in specs), arguments, strict=True))
+            for name, tensor in host_outputs.items():
+                runtime.copy_stacked_from(stacked[name], tensor)
+        row_spec = next(spec for spec in specs if spec.name == "logit_row_indices")
+        inactive_rows = row_spec.create_tensor() < 0
+        if torch.count_nonzero(host_outputs["logits"][inactive_rows]).item():
+            raise RuntimeError("inactive decode logit rows must be zero")
+        if torch.count_nonzero(host_outputs["sampled_ids"][inactive_rows]).item():
+            raise RuntimeError("inactive decode sampled-id rows must be zero")
+        if torch.count_nonzero(host_outputs["sampled_ids"][:, :, 1:]).item():
+            raise RuntimeError("decode sampled-id padding must be zero")
+        print("[FWD] Execution and head output checks passed; numerical accuracy was not validated.", flush=True)
     if not result.passed:
         raise SystemExit(result.error or 1)
