@@ -54,10 +54,9 @@ O_B_N_TILE = 160
 
 # Output-quantization tiles and scheduling.
 O_QUANT_ROW_TILE = 80
-O_QUANT_WORKERS = 40
 O_QUANT_HEADS_PER_GROUP = 8
 O_QUANT_LANES = 64                      # FP32 lanes in one 256-byte vector register
-O_QUANT_GROUP = 32                      # MX quantization group
+O_QUANT_SCALE_GROUPS = HEAD_DIM // 32
 O_QUANT_SCALE_BLOCK = 16                # rows sharing one packed scale row
 O_QUANT_SCALE_COLS = 256                # scale bytes per block row and head
 # Shapes that index a Tile must reach the op as Python integers. A name bound
@@ -69,7 +68,8 @@ O_QUANT_ROPE_PAIRS = ROPE_DIM // 2
 O_QUANT_ROPE_START = HEAD_DIM - ROPE_DIM
 O_QUANT_TRIG_TILE = O_QUANT_ROW_TILE * O_QUANT_ROPE_PAIRS
 O_QUANT_VALUE_TILE = O_QUANT_ROW_TILE * HEAD_DIM
-O_QUANT_CODE_TILE = (O_QUANT_ROW_TILE // O_QUANT_SCALE_BLOCK) * (O_QUANT_SCALE_COLS // 2)
+O_QUANT_SCALE_COUNT = O_QUANT_ROW_TILE * O_QUANT_SCALE_GROUPS
+O_QUANT_SCALE_PACK_TMP = ((64 + O_QUANT_SCALE_COUNT // O_QUANT_SCALE_BLOCK + 31) // 32) * 32
 
 
 @pl.jit.inline(auto_scope=False)
@@ -90,7 +90,7 @@ def quant_o_vf_pypto(
     scale_view = pl.tensor.view(
         scales, [LOCAL_O_GROUPS * scale_block_rows, O_QUANT_HEADS_PER_GROUP * O_QUANT_SCALE_COLS]
     )
-    workers = pl.max(1, pl.min(O_QUANT_WORKERS, 2 * pl.system.available_cluster_count()))
+    workers = pl.max(1, pl.min(O_QUANT_HEADS, 2 * pl.system.available_cluster_count()))
     with pl.spmd(workers, name_hint="quant_o_vf_pypto") as published:
         worker = pl.tile.get_block_idx()
         worker_count = pl.tile.get_block_num()
@@ -106,8 +106,7 @@ def quant_o_vf_pypto(
             )
             group = head // O_QUANT_HEADS_PER_GROUP
             local_head = head % O_QUANT_HEADS_PER_GROUP
-            # Input(rows) / Trig(rows): static 80-row Vec tiles with a dynamic
-            # valid extent, so rows past the active count are never transferred.
+            # Load active rows and zero-fill the quantization tile.
             window = pl.load(
                 attended, [t0, head * HEAD_DIM], [O_QUANT_ROW_TILE, HEAD_DIM],
                 valid_shape=[rows, HEAD_DIM], target_memory=pl.MemorySpace.Vec,
@@ -120,12 +119,10 @@ def quant_o_vf_pypto(
                 sine, [t0, 0], [O_QUANT_ROW_TILE, O_QUANT_ROPE_PAIRS],
                 valid_shape=[rows, O_QUANT_ROPE_PAIRS], target_memory=pl.MemorySpace.Vec,
             )
-            # reg.load / reg.store address a flat Vec tile, and a tile whose real
-            # data ends at a runtime row cannot be flattened. Widen the declared
-            # valid extent back to the allocation first: the rows past `rows` hold
-            # undefined UB, and no loop below ever reads them.
+            padded = pl.fillpad(window, pad_value=pl.PadValue.zero)
+            # Register addressing uses flat tile shapes. Only active rows use the trig data.
             value = pl.tile.reshape(
-                pl.tile.set_validshape(window, O_QUANT_ROW_TILE, HEAD_DIM),
+                pl.tile.set_validshape(padded, O_QUANT_ROW_TILE, HEAD_DIM),
                 [O_QUANT_VALUE_TILE],
             )
             cos_flat = pl.tile.reshape(
@@ -136,11 +133,7 @@ def quant_o_vf_pypto(
                 pl.tile.set_validshape(sin_tile, O_QUANT_ROW_TILE, O_QUANT_ROPE_PAIRS),
                 [O_QUANT_TRIG_TILE],
             )
-            quantized = pl.tile.create([O_QUANT_VALUE_TILE], pl.INT8, target_memory=pl.MemorySpace.Vec)
-            payload_words = pl.reinterpret_view(quantized, pl.UINT32, shape=[O_QUANT_VALUE_TILE // 4])
-            codes = pl.tile.create([O_QUANT_CODE_TILE], pl.UINT16, target_memory=pl.MemorySpace.Vec)
-
-            # Fused inverse RoPE and output quantization.
+            # Rotate the trailing BF16 pairs and round back to BF16.
             with pl.reg_scope():
                 full = pl.reg.full_mask(lanes=O_QUANT_LANES)
                 lane = pl.reg.index_gen(0, lanes=O_QUANT_LANES, dtype=pl.UINT32)
@@ -170,82 +163,66 @@ def quant_o_vf_pypto(
                     imag = pl.reg.add(scaled_imag, scaled_real)
                     rotated = pl.reg.select(even, real, imag)
                     raw = pl.reg.convert(rotated, dtype=pl.BF16, rounding="R", saturate=False)
-                    rotated_back = pl.reg.store(value, offset=row * HEAD_DIM + O_QUANT_ROPE_START, value=raw)
+                    _rotated = pl.reg.store(value, offset=row * HEAD_DIM + O_QUANT_ROPE_START, value=raw)
 
-                # BF16 exponent reduction and inverse-power scaling.
-                full16 = pl.reg.full_mask(lanes=256)
-                compact_mask = pl.reg.full_mask(lanes=8)
-                four = pl.reg.active_mask(4, lanes=8)
-                scale_lane = pl.reg.index_gen(0, lanes=8, dtype=pl.UINT16)
-                scatter_offset = pl.reg.shift_lefts(scale_lane, 4, compact_mask)
-                exponent_mask = pl.reg.broadcast(0x7F80, lanes=256, dtype=pl.UINT16)
-                exponent_floor = pl.reg.broadcast(8 << 7, lanes=8, dtype=pl.UINT16)
-                inverse_bias = pl.reg.broadcast(254 << 7, lanes=8, dtype=pl.UINT16)
-                zero16 = pl.reg.broadcast(0, lanes=8, dtype=pl.UINT16)
-                # BF16 encodings of -448 and +448.
-                low_bits = pl.reg.broadcast(0xC3E0, lanes=256, dtype=pl.UINT16)
-                high_bits = pl.reg.broadcast(0x43E0, lanes=256, dtype=pl.UINT16)
-                low = pl.reg.interpret_cast(low_bits, dtype=pl.BF16)
-                high = pl.reg.interpret_cast(high_bits, dtype=pl.BF16)
-                zero_payload = pl.reg.broadcast(0, lanes=256, dtype=pl.INT8)
-                for block in pl.hardware_loop(rows * 2):
-                    block_u32 = pl.cast(block, pl.UINT32)
-                    row_u32 = pl.cast(block_u32 // 2, pl.UINT32)
-                    chunk_u32 = pl.cast(block_u32 % 2, pl.UINT32)
-                    offset_u32 = block_u32 * 256
-                    offset = pl.cast(offset_u32, pl.INDEX)
-                    chunk_bits = pl.reg.load(value, offset=offset, lanes=256)
-                    exponent_bits = pl.reg.interpret_cast(chunk_bits, dtype=pl.UINT16)
-                    exponent_bits = pl.reg.bitwise_and(exponent_bits, exponent_mask, full16)
-                    maximum = pl.reg.reduce_max(exponent_bits, full16, group_size=O_QUANT_GROUP)
-                    maximum = pl.reg.maximum(maximum, exponent_floor, compact_mask)
-                    shared = pl.reg.sub(maximum, exponent_floor, compact_mask)
-                    codes8 = pl.reg.shift_rights(shared, 7, compact_mask)
-                    even_codes, odd_codes = pl.reg.dintlv(codes8, codes8)
-                    odd_codes = pl.reg.shift_lefts(odd_codes, 8, compact_mask)
-                    pairs = pl.reg.bitwise_or(even_codes, odd_codes, compact_mask)
-                    scale_base_u32 = row_u32 // 16 * 128 + row_u32 % 16 + chunk_u32 * 64
-                    scale_base = pl.cast(scale_base_u32, pl.INDEX)
-                    scattered = pl.reg.scatter(codes, scatter_offset, pairs, four, base_offset=scale_base)
-                    inverse = pl.reg.sub(inverse_bias, shared, compact_mask)
-                    nonzero = pl.reg.minimums(shared, 128, compact_mask)
-                    nonzero = pl.reg.shift_rights(nonzero, 7, compact_mask)
-                    keep = pl.reg.sub(zero16, nonzero, compact_mask)
-                    inverse = pl.reg.bitwise_and(inverse, keep, compact_mask)
-                    expanded_inverse = pl.reg.group_broadcast(inverse, lanes=256)
-                    reciprocal = pl.reg.interpret_cast(expanded_inverse, dtype=pl.BF16)
-                    scaled_bf16 = pl.reg.mul(chunk_bits, reciprocal, full16)
-                    scaled_bf16 = pl.reg.maximum(scaled_bf16, low, full16)
-                    scaled_bf16 = pl.reg.minimum(scaled_bf16, high, full16)
-                    scaled = pl.reg.convert(scaled_bf16, dtype=pl.FP32)
-                    quant = pl.reg.convert(scaled, dtype=pl.FP8E4M3FN, rounding="R", saturate=False)
-                    packed_words = pl.reg.interpret_cast(quant, dtype=pl.UINT32)
-                    word_offset_u32 = block_u32 * 64
-                    word_offset = pl.cast(word_offset_u32, pl.INDEX)
-                    stored = pl.reg.store(payload_words, offset=word_offset, value=packed_words)
-                for tail in pl.hardware_loop(O_QUANT_ROW_TILE - rows):
-                    row_u32 = pl.cast(rows + tail, pl.UINT32)
-                    for chunk in pl.hardware_loop(2):
-                        chunk_u32 = pl.cast(chunk, pl.UINT32)
-                        offset_u32 = row_u32 * HEAD_DIM + chunk_u32 * 256
-                        offset = pl.cast(offset_u32, pl.INDEX)
-                        stored_zero = pl.reg.store(quantized, offset=offset, value=zero_payload)
-                        scale_base_u32 = row_u32 // 16 * 128 + row_u32 % 16 + chunk_u32 * 64
-                        scale_base = pl.cast(scale_base_u32, pl.INDEX)
-                        zeroed_scale = pl.reg.scatter(codes, scatter_offset, zero16, four, base_offset=scale_base)
-
-            payload_tile = pl.tile.reinterpret_view(
-                pl.tile.reshape(quantized, [O_QUANT_ROW_TILE, HEAD_DIM]), pl.FP8E4M3FN
-            )
+            full_rows = pl.tile.reshape(value, [O_QUANT_ROW_TILE, HEAD_DIM])
+            max_workspace = pl.create_tile([1, O_QUANT_SCALE_COUNT], dtype=pl.BF16)
+            scale_workspace = pl.create_tile([1, O_QUANT_SCALE_COUNT], dtype=pl.BF16)
+            payload_bytes, exponents = pl.tile.quant_mx_raw(full_rows, max_workspace, scale_workspace, group_axis=1)
+            # TQUANT uses a finite reciprocal for scale code zero. Preserve the
+            # projection contract by clearing magnitude bits in those groups.
+            if rows > 0:
+                exponent_words = pl.reinterpret_view(exponents, pl.UINT32, shape=[O_QUANT_SCALE_COUNT // 4])
+                flag = pl.create_tile([1, 64], dtype=pl.UINT32, target_memory=pl.MemorySpace.Vec)
+                flat_flag = pl.reshape(flag, [64])
+                with pl.reg_scope():
+                    word_count = rows * (O_QUANT_SCALE_GROUPS // 4)
+                    all_code_words = pl.reg.full_mask(lanes=64)
+                    one_per_byte = pl.reg.broadcast(0x01010101, lanes=64, dtype=pl.UINT32)
+                    top_bits = pl.reg.broadcast(0x80808080, lanes=64, dtype=pl.UINT32)
+                    zero_flags = pl.reg.broadcast(0, lanes=64, dtype=pl.UINT32)
+                    scan_blocks = (word_count + 63) // 64
+                    for scan, (found,) in pl.hardware_loop(scan_blocks, init_values=(zero_flags,)):
+                        start_word = scan * 64
+                        valid_words = pl.reg.active_mask(pl.min(word_count - start_word, 64), lanes=64)
+                        codes = pl.reg.load(exponent_words, start_word, lanes=64)
+                        # This expression detects zero bytes in the active words.
+                        decremented = pl.reg.sub(codes, one_per_byte, valid_words)
+                        inverse_codes = pl.reg.bitwise_not(codes, valid_words)
+                        byte_flags = pl.reg.bitwise_and(decremented, inverse_codes, valid_words)
+                        byte_flags = pl.reg.bitwise_and(byte_flags, top_bits, valid_words)
+                        found = pl.yield_(pl.reg.bitwise_or(found, byte_flags, all_code_words))
+                    any_zero = pl.reg.reduce_max(found, all_code_words)
+                    flag_words = pl.reg.group_broadcast(any_zero, lanes=64)
+                    _scan = pl.reg.store(flat_flag, 0, flag_words)
+                if pl.tile.read(flag, [0, 0]) != 0:
+                    words = pl.reinterpret_view(payload_bytes, pl.UINT32, shape=[O_QUANT_VALUE_TILE // 4])
+                    with pl.reg_scope():
+                        groups = pl.reg.full_mask(lanes=8)
+                        scale_index = pl.reg.index_gen(0, lanes=8, dtype=pl.UINT16)
+                        keep = pl.reg.broadcast(0xFFFFFFFF, lanes=8, dtype=pl.UINT32)
+                        sign = pl.reg.broadcast(0x80808080, lanes=8, dtype=pl.UINT32)
+                        full_words = pl.reg.full_mask(lanes=64)
+                        for block in pl.hardware_loop(rows * 2):
+                            index = pl.cast(block * 8, pl.INDEX)
+                            scale = pl.reg.gather(exponents, scale_index, groups, base_offset=index)
+                            scale_u32 = pl.reg.convert(scale, dtype=pl.UINT32)
+                            nonzero = pl.reg.compares(scale_u32, 0, groups, predicate="ne")
+                            byte_mask = pl.reg.select(nonzero, keep, sign)
+                            word_mask = pl.reg.group_broadcast(byte_mask, lanes=64)
+                            offset = block * 64
+                            value_words = pl.reg.load(words, offset, lanes=64)
+                            zeroed_words = pl.reg.bitwise_and(value_words, word_mask, full_words)
+                            _payload_words = pl.reg.store(words, offset, zeroed_words)
+            payload_tile = pl.tile.reinterpret_view(payload_bytes, pl.FP8E4M3FN)
             payload_tile = pl.tile.set_validshape(payload_tile, capacity, HEAD_DIM)
             pl.store(payload_tile, [group * padded_rows + t0, local_head * HEAD_DIM], payload)
-            code_bytes = pl.tile.reinterpret_view(
-                pl.tile.reshape(
-                    codes, [O_QUANT_ROW_TILE // O_QUANT_SCALE_BLOCK, O_QUANT_SCALE_COLS // 2]
-                ),
-                pl.UINT8,
+            zz_tmp = pl.create_tile([1, O_QUANT_SCALE_PACK_TMP], dtype=pl.UINT8)
+            packed_scale = pl.tmov_x2zz(
+                exponents, zz_tmp, group_axis=1, dst_rows=O_QUANT_ROW_TILE, dst_cols=O_QUANT_SCALE_GROUPS,
             )
-            scale_tile = pl.tile.reinterpret_view(code_bytes, pl.FP8E8M0)
+            scale_tile = pl.tile.reinterpret_view(packed_scale, pl.FP8E8M0)
+            scale_tile = pl.reshape(scale_tile, [O_QUANT_ROW_TILE // O_QUANT_SCALE_BLOCK, O_QUANT_SCALE_COLS])
             scale_tile = pl.tile.set_validshape(
                 scale_tile, capacity // O_QUANT_SCALE_BLOCK, O_QUANT_SCALE_COLS
             )
@@ -258,7 +235,6 @@ def quant_o_vf_pypto(
                 scale_view,
             )
     return published
-
 
 
 @pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "o_proj_a.cpp",
