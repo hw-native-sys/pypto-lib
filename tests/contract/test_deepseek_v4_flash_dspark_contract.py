@@ -24,7 +24,7 @@ sys.path.insert(0, str(MODEL_DIR))
 from utils import block_table, pack_nz, state_slot_mapping
 
 
-def _fused_target_arguments(tp):
+def _fused_target_arguments(tp, sequence=8):
     source = ast.parse((MODEL_DIR / "decode_fwd_dspark.py").read_text())
     forward = next(node for node in source.body
                    if isinstance(node, ast.FunctionDef) and node.name == "l2_decode_fwd_dspark")
@@ -40,9 +40,9 @@ def _fused_target_arguments(tp):
     namespace = {node.id: 8 for node in ast.walk(ast.Module(body=assignments, type_ignores=[]))
                  if isinstance(node, ast.Name) and node.id.isupper()}
     namespace.update({
-        "TP_SIZE": tp, "DECODE_BATCH": 64, "GROUP_DECODE_TOKENS": 512,
-        "LOCAL_DECODE_BATCH": 16, "LOCAL_DECODE_TOKENS": 128,
-        "DSPARK_STATE_LOCAL_BATCH": 16, "MAX_LOGIT_ROWS": 128,
+        "TP_SIZE": tp, "DECODE_BATCH": 64, "GROUP_DECODE_TOKENS": 64 * sequence,
+        "LOCAL_DECODE_BATCH": 16, "LOCAL_DECODE_TOKENS": 16 * sequence,
+        "DSPARK_STATE_LOCAL_BATCH": 16, "MAX_LOGIT_ROWS": 16 * sequence,
         "draft_batch": 16,
         "pl": SimpleNamespace(create_tensor=lambda shape, dtype: torch.empty(shape, dtype=dtype),
                               INT32=torch.int32, INT64=torch.int64, BF16=torch.bfloat16,
@@ -63,10 +63,11 @@ def _fused_target_arguments(tp):
 
 
 @pytest.mark.parametrize("tp", [1, 2, 4])
-def test_fused_target_metadata_preserves_eight_tokens_per_request(tp) -> None:
-    arguments, namespace = _fused_target_arguments(tp)
+@pytest.mark.parametrize("sequence", [6, 8])
+def test_fused_target_metadata_preserves_speculative_window(tp, sequence) -> None:
+    arguments, namespace = _fused_target_arguments(tp, sequence)
     group_batch = tp * 16
-    group_tokens = group_batch * 8
+    group_tokens = group_batch * sequence
     group_token_names = (
         "position_ids", "swa_slot_mapping", "csa_cmp_freqs_cos", "csa_cmp_freqs_sin",
         "csa_ori_slot_mapping", "csa_cmp_slot_mapping", "csa_idx_slot_mapping",
@@ -82,21 +83,22 @@ def test_fused_target_metadata_preserves_eight_tokens_per_request(tp) -> None:
         assert actual.shape[0] == (group_tokens if name in group_token_names else group_batch), name
         original = namespace[f"prepared_{name}"]
         assert actual.untyped_storage().data_ptr() == original.untyped_storage().data_ptr(), name
-        assert original.shape[0] == (512 if name in group_token_names else 64), name
+        assert original.shape[0] == (64 * sequence if name in group_token_names else 64), name
     for name in ("csa_cmp_block_table", "csa_idx_block_table", "hca_cmp_block_table",
                  "csa_kv_seq_lens", "hca_kv_seq_lens"):
         assert arguments[name].shape[0] == 16, name
     for name in ("input_ids", "position_ids_local", "freqs_cos", "freqs_sin",
                  "compressed_freqs_cos", "compressed_freqs_sin", "swa_indices", "swa_lens"):
-        assert arguments[name].shape[0] == 128, name
-    assert arguments["position_ids"].shape[0] // arguments["hca_compress_state_block_table"].shape[0] == 8
-    assert arguments["position_ids"].shape[0] // arguments["csa_compress_state_block_table"].shape[0] == 8
+        assert arguments[name].shape[0] == 16 * sequence, name
+    assert arguments["position_ids"].shape[0] // arguments["hca_compress_state_block_table"].shape[0] == sequence
+    assert arguments["position_ids"].shape[0] // arguments["csa_compress_state_block_table"].shape[0] == sequence
 
 
 @pytest.mark.parametrize("tp", [1, 2, 4])
 @pytest.mark.parametrize("start", [122, 250])
-def test_fused_hca_boundary_keeps_request_state_isolated(tp, start) -> None:
-    arguments, _ = _fused_target_arguments(tp)
+@pytest.mark.parametrize("sequence", [6, 8])
+def test_fused_hca_boundary_keeps_request_state_isolated(tp, start, sequence) -> None:
+    arguments, _ = _fused_target_arguments(tp, sequence)
     tokens = arguments["position_ids"].shape[0]
     batch = arguments["hca_compress_state_block_table"].shape[0]
     sequence = tokens // batch

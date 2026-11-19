@@ -76,6 +76,7 @@ MARKOV_VOCAB = dspark_markov.VOCAB
 MARKOV_VOCAB_PER_TP = dspark_markov.VOCAB_PER_TP
 MARKOV_WORLD_SIZE = dspark_markov.WORLD_SIZE
 METADATA_BATCH = prefill_bootstrap_metadata.BATCH
+METADATA_MAX_LOGIT_ROWS = prefill_bootstrap_metadata.MAX_LOGIT_ROWS
 METADATA_CONTEXT = prefill_bootstrap_metadata.CONTEXT
 METADATA_EP = prefill_bootstrap_metadata.EP
 METADATA_GROUP_QUERY = prefill_bootstrap_metadata.GROUP_QUERY
@@ -92,6 +93,7 @@ PUBLISH_MAX_REQUESTS = prefill_bootstrap.MAX_REQUESTS
 PUBLISH_PAYLOAD_WIDTH = prefill_bootstrap.PAYLOAD_WIDTH
 PUBLISH_REQUESTS_DYN = prefill_bootstrap.REQUESTS_DYN
 PUBLISH_TP = prefill_bootstrap.TP
+PUBLISH_TOKEN_WIDTH = prefill_bootstrap.DECODE_SEQ
 TOKENS_DESCRIPTOR_WIDTH = prefill_bootstrap.DESCRIPTOR_WIDTH
 TOKENS_EP = prefill_bootstrap.EP
 TOKENS_MAX_REQUESTS = prefill_bootstrap.MAX_REQUESTS
@@ -131,7 +133,7 @@ def l2_bootstrap_one_l2(
     query_freqs_sin: pl.InOut[pl.Tensor[[METADATA_QUERY, METADATA_ROPE_DIM], pl.BF16]],
     query_group_freqs_cos: pl.InOut[pl.Tensor[[METADATA_GROUP_QUERY, METADATA_ROPE_DIM], pl.BF16]],
     query_group_freqs_sin: pl.InOut[pl.Tensor[[METADATA_GROUP_QUERY, METADATA_ROPE_DIM], pl.BF16]],
-    logit_row_indices: pl.InOut[pl.Tensor[[128], pl.INT32]],
+    logit_row_indices: pl.InOut[pl.Tensor[[METADATA_MAX_LOGIT_ROWS], pl.INT32]],
     tail: pl.Tensor[[EXTRACT_LEASES_DYN, EXTRACT_TAIL_ROWS, EXTRACT_MAIN_DIM], pl.BF16],
     positions: pl.Tensor[[EXTRACT_LEASES_DYN, EXTRACT_TAIL_ROWS], pl.INT32],
     context_hidden: pl.InOut[pl.Tensor[[EXTRACT_LOCAL_ROWS_DYN, EXTRACT_MAIN_DIM], pl.BF16]],
@@ -185,7 +187,7 @@ def l2_bootstrap_one_l2(
     confidence_head_weight: pl.Tensor[[1, MARKOV_D + MARKOV_DSPARK_MARKOV_RANK], pl.FP32],
     draft_token_ids: pl.InOut[pl.Tensor[[MARKOV_B_DYN, MARKOV_DSPARK_QUERY_WIDTH], pl.INT32]],
     confidence_probs: pl.Out[pl.Tensor[[MARKOV_B_DYN, MARKOV_DSPARK_QUERY_WIDTH], pl.FP32]],
-    state_tokens: pl.InOut[pl.Tensor[[PUBLISH_LEASES_DYN, 8], pl.INT64]],
+    state_tokens: pl.InOut[pl.Tensor[[PUBLISH_LEASES_DYN, PUBLISH_TOKEN_WIDTH], pl.INT64]],
     hidden_gather_window: pld.DistributedTensor[[DRAFTER_PREFILL_GROUP_CAP, DRAFTER_D], pl.BF16],
     hidden_gather_signal: pld.DistributedTensor[[DRAFTER_DSPARK_CP_SIZE, 1], pl.INT32],
     attention_window: pld.DistributedTensor[[DRAFTER_ATTENTION_WINDOW_ROWS, DRAFTER_O_GROUP_IN], pl.BF16],
@@ -246,7 +248,7 @@ def l3_bootstrap_one_l2(
     query_freqs_sin: pl.InOut[pl.Tensor[[METADATA_EP, METADATA_QUERY, METADATA_ROPE_DIM], pl.BF16]],
     query_group_freqs_cos: pl.InOut[pl.Tensor[[METADATA_EP, METADATA_GROUP_QUERY, METADATA_ROPE_DIM], pl.BF16]],
     query_group_freqs_sin: pl.InOut[pl.Tensor[[METADATA_EP, METADATA_GROUP_QUERY, METADATA_ROPE_DIM], pl.BF16]],
-    logit_row_indices: pl.InOut[pl.Tensor[[METADATA_EP, 128], pl.INT32]],
+    logit_row_indices: pl.InOut[pl.Tensor[[METADATA_EP, METADATA_MAX_LOGIT_ROWS], pl.INT32]],
     tail: pl.Tensor[[EXTRACT_EP, EXTRACT_LEASES_DYN, EXTRACT_TAIL_ROWS, EXTRACT_MAIN_DIM], pl.BF16],
     positions: pl.Tensor[[EXTRACT_EP, EXTRACT_LEASES_DYN, EXTRACT_TAIL_ROWS], pl.INT32],
     context_hidden: pl.InOut[pl.Tensor[[EXTRACT_EP, EXTRACT_LOCAL_ROWS_DYN, EXTRACT_MAIN_DIM], pl.BF16]],
@@ -300,7 +302,7 @@ def l3_bootstrap_one_l2(
     confidence_head_weight: pl.Tensor[[MARKOV_WORLD_SIZE, 1, MARKOV_D + MARKOV_DSPARK_MARKOV_RANK], pl.FP32],
     draft_token_ids: pl.InOut[pl.Tensor[[MARKOV_WORLD_SIZE, MARKOV_B_DYN, MARKOV_DSPARK_QUERY_WIDTH], pl.INT32]],
     confidence_probs: pl.Out[pl.Tensor[[MARKOV_WORLD_SIZE, MARKOV_B_DYN, MARKOV_DSPARK_QUERY_WIDTH], pl.FP32]],
-    state_tokens: pl.InOut[pl.Tensor[[PUBLISH_EP, PUBLISH_LEASES_DYN, 8], pl.INT64]],
+    state_tokens: pl.InOut[pl.Tensor[[PUBLISH_EP, PUBLISH_LEASES_DYN, PUBLISH_TOKEN_WIDTH], pl.INT64]],
 ):
     descriptors.bind_dynamic(1, TOKENS_REQUESTS_DYN)
     next_prefill_tokens.bind_dynamic(1, TOKENS_REQUESTS_DYN)

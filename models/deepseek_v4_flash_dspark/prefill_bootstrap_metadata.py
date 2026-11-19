@@ -11,14 +11,16 @@
 import pypto.language as pl
 import pypto.language.distributed as pld
 
-from config import EP, TP
+from config import DECODE_SEQ, EP, MOE_TOKENS, TP
 
 LEASES_DYN = pl.dynamic("DSPARK_BOOT_META_LEASES_DYN")
 POSITIONS_DYN = pl.dynamic("DSPARK_BOOT_META_POSITIONS_DYN")
 BATCH = 4
 TAIL_CONTEXT = 128
 CONTEXT = BATCH * TAIL_CONTEXT
-QUERY = 16 * 7
+MAX_LOGIT_ROWS = MOE_TOKENS
+QUERY_WIDTH = DECODE_SEQ - 1
+QUERY = 16 * QUERY_WIDTH
 GROUP_QUERY = TP * QUERY
 ROPE_DIM = 64
 TABLE_DEPTH = 32768
@@ -64,7 +66,7 @@ def prepare_bootstrap_metadata_rank(
     query_freqs_sin: pl.Out[pl.Tensor[[QUERY, ROPE_DIM], pl.BF16]],
     query_group_freqs_cos: pl.Out[pl.Tensor[[GROUP_QUERY, ROPE_DIM], pl.BF16]],
     query_group_freqs_sin: pl.Out[pl.Tensor[[GROUP_QUERY, ROPE_DIM], pl.BF16]],
-    logit_row_indices: pl.Out[pl.Tensor[[128], pl.INT32]],
+    logit_row_indices: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32]],
     tp_rank: pl.Scalar[pl.INT32],
 ):
     meta.bind_dynamic(0, LEASES_DYN)
@@ -91,7 +93,7 @@ def prepare_bootstrap_metadata_rank(
                 if generation == resident_generation and valid == 0 and start + length >= prompt:
                     if (
                         flags % 2 == 1 and flags // 2 % 2 == 1
-                        and prompt + 6 < limit and prompt + 6 < rope_positions
+                        and prompt + QUERY_WIDTH - 1 < limit and prompt + QUERY_WIDTH - 1 < rope_positions
                     ):
                         eligible = pl.cast(1, pl.INT32)
             tail_length = pl.cast(pl.min(prompt, TAIL_CONTEXT), pl.INT32)
@@ -110,9 +112,9 @@ def prepare_bootstrap_metadata_rank(
             pl.write(anchor_positions, [request], pl.cast(0, pl.INT32))
             if eligible == 1 and tp_rank == 0:
                 pl.write(anchor_positions, [request], pl.cast(prompt - 1, pl.INT32))
-        for row in pl.range(128):
+        for row in pl.range(MAX_LOGIT_ROWS):
             logit = pl.cast(-1, pl.INT32)
-            request = row // 7
+            request = row // QUERY_WIDTH
             if request < BATCH and tp_rank == 0 and pl.read(info, [request, 0]) == 1:
                 logit = pl.cast(row, pl.INT32)
             pl.write(logit_row_indices, [row], logit)
@@ -137,12 +139,12 @@ def prepare_bootstrap_metadata_rank(
                     cache_slot = pl.cast(page * 32 + position % 32, pl.INT64)
                 pl.write(context_group_slot_mapping, [layer, row], cache_slot)
         for row in pl.range(GROUP_QUERY):
-            request = row // 7
+            request = row // QUERY_WIDTH
             position = pl.cast(0, pl.INT32)
             live = pl.cast(0, pl.INT32)
             if request < BATCH and pl.read(info, [request, 0]) == 1:
                 prompt = pl.read(descriptors, [request, 5])
-                position = pl.cast(prompt + row % 7, pl.INT32)
+                position = pl.cast(prompt + row % QUERY_WIDTH, pl.INT32)
                 live = pl.cast(1, pl.INT32)
             pl.write(query_group_position_ids, [row], position)
             for layer in pl.range(3):
@@ -226,7 +228,7 @@ def l3_prepare_bootstrap_metadata(
     query_freqs_sin: pl.Out[pl.Tensor[[EP, QUERY, ROPE_DIM], pl.BF16]],
     query_group_freqs_cos: pl.Out[pl.Tensor[[EP, GROUP_QUERY, ROPE_DIM], pl.BF16]],
     query_group_freqs_sin: pl.Out[pl.Tensor[[EP, GROUP_QUERY, ROPE_DIM], pl.BF16]],
-    logit_row_indices: pl.Out[pl.Tensor[[EP, 128], pl.INT32]],
+    logit_row_indices: pl.Out[pl.Tensor[[EP, MAX_LOGIT_ROWS], pl.INT32]],
 ):
     meta.bind_dynamic(1, LEASES_DYN)
     full_cos.bind_dynamic(1, POSITIONS_DYN)
