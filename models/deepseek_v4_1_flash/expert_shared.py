@@ -62,7 +62,6 @@ W2_M_TILE = gcd(T_PAD, 256) if T > 80 else gcd(T_PAD, W13_M_TILE)
 W2_N_TILE = 256
 W2_K_TILE = 128 if T > 80 else 256
 W2_K_STAGE = 2
-W2_SYNC_START = True
 
 assert T_PAD % W13_PAD_ROWS == 0
 assert T_PAD % 16 == 0
@@ -188,7 +187,7 @@ def expert_shared(
         h_scale_mx, [T_PAD, H_SCALE], layout=pl.MX_A_ZZ,
     )
     rows = pl.tensor.dim(sh, 0)
-    with pl.spmd(W2_WORKER_TILE, name_hint="sh_w2_mm", sync_start=W2_SYNC_START):
+    with pl.spmd(W2_WORKER_TILE, name_hint="sh_w2_mm"):
         worker = pl.tile.get_block_idx()
         for lane in pl.range((D // W2_N_TILE + W2_WORKER_TILE - 1) // W2_WORKER_TILE):
             column = worker + lane * W2_WORKER_TILE
