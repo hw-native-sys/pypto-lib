@@ -51,6 +51,7 @@ PROJ_WIDE_M_TILE = 128
 WINDOW_PUBLISH_WORKER_TILE = 12
 NATIVE_VALIDATION_WORKERS = 32
 Q_NORM_FOLD = 1024
+Q_NORM_SCALE_GROUP_TILE = ((Q_LORA // 64 + 7) // 8) * 8
 WINDOW_HEAD_DIM = 512
 WINDOW_PAGE_SIZE = 128
 
@@ -280,7 +281,9 @@ def q_norm_quant(
             active = pl.max(0, pl.min(row_tile, rows - first))
             quant_bytes = pl.create_tile([MX_M_TILE * Q_LORA], dtype=pl.INT8, target_memory=pl.Mem.Vec)
             quant_words = pl.reinterpret_view(quant_bytes, pl.UINT32, shape=[MX_M_TILE * Q_LORA // 4])
-            scale_pairs = pl.create_tile([Q_LORA // 64 * MX_M_TILE], dtype=pl.UINT16, target_memory=pl.Mem.Vec)
+            scale_pairs = pl.create_tile([Q_NORM_SCALE_GROUP_TILE * MX_M_TILE], dtype=pl.UINT16, target_memory=pl.Mem.Vec)
+            row_scales = pl.create_tile([MX_M_TILE * 32], dtype=pl.UINT32, target_memory=pl.Mem.Vec)
+            row_scale_halves = pl.reinterpret_view(row_scales, pl.UINT16, shape=[MX_M_TILE * 64])
             if active > 0:
                 source = pl.load(
                     projected, [first, 0], [MX_M_TILE, Q_LORA],
@@ -366,14 +369,9 @@ def q_norm_quant(
                     first_lane = pl.reg.shift_lefts(pair_lane, 4, full)
                     last_lane = pl.reg.adds(first_lane, 8, full)
                     chunk_lane = pl.reg.shift_rights(lane, 2, full)
-                    scale_full = pl.reg.full_mask(lanes=128)
-                    scale_lanes = pl.reg.index_gen(0, lanes=128, dtype=pl.UINT16)
-                    even = pl.reg.create_group_mask(1, num_groups=64, group_size=2)
-                    scale_prefix = pl.reg.active_mask(Q_LORA // 32, lanes=128)
-                    scale_mask = pl.reg.mask_and(even, scale_prefix)
-                    scale_groups = pl.reg.shift_rights(scale_lanes, 1, scale_full)
-                    scale_offsets = pl.reg.muls(scale_groups, MX_M_TILE, scale_full)
                     empty_codes = pl.reg.broadcast(0, lanes=64, dtype=pl.UINT32)
+                    # Keep one packed scale pair in the low half of each word.
+                    code_prefix = pl.reg.active_mask(32, lanes=64)
                     for norm_row in pl.hardware_loop(active):
                         inverse_index = pl.reg.broadcast(pl.cast(norm_row, pl.UINT32), lanes=64, dtype=pl.UINT32)
                         selected_inverse = pl.reg.gather_lanes(inverses, inverse_index)
@@ -421,32 +419,43 @@ def q_norm_quant(
                             pair = pl.reg.bitwise_or(first_code, second_code)
                             code_slot = pl.reg.compares(chunk_lane, pl.cast(chunk, pl.UINT32), full, predicate="eq")
                             row_codes = pl.reg.select(code_slot, pair, row_codes)
-                        # The lower halfword of each word holds one scale pair.
-                        packed_codes = pl.reg.interpret_cast(row_codes, dtype=pl.UINT16)
-                        scale_index = pl.reg.adds(scale_offsets, pl.cast(norm_row, pl.UINT16), scale_full)
-                        _scales_written = pl.reg.scatter(scale_pairs, scale_index, packed_codes, scale_mask)
+                        _row_scales_written = pl.reg.store(row_scales, norm_row * 32, row_codes, code_prefix)
                 latent_tile = pl.reshape(normalized, [MX_M_TILE, Q_LORA])
                 valid_latent = pl.tile.slice(latent_tile, [MX_M_TILE, Q_LORA], [0, 0], valid_shape=[active, Q_LORA])
                 pl.store(valid_latent, [first, 0], latent)
 
+            with pl.reg_scope():
+                empty_scale_row = pl.reg.broadcast(0, lanes=32, dtype=pl.UINT32)
+                for scale_pad in pl.hardware_loop(row_tile - active):
+                    scale_row_index = active + scale_pad
+                    _row_scale_zeroed = pl.reg.store(row_scales, scale_row_index * 32, empty_scale_row)
+                # Gather eight groups at a time into M16 order. An 8-row
+                # chunk wraps the upper half to initialized rows in its half-tile.
+                transpose_full = pl.reg.full_mask(lanes=128)
+                transpose_lane = pl.reg.index_gen(0, lanes=128, dtype=pl.UINT16)
+                row_bits = pl.reg.broadcast(pl.cast(row_tile - 1, pl.UINT16), lanes=128, dtype=pl.UINT16)
+                transpose_row = pl.reg.bitwise_and(transpose_lane, row_bits)
+                transpose_row_offset = pl.reg.shift_lefts(transpose_row, 6, transpose_full)
+                transpose_group = pl.reg.shift_rights(transpose_lane, 4, transpose_full)
+                group_offset = pl.reg.shift_lefts(transpose_group, 1, transpose_full)
+                transpose_index = pl.reg.add(transpose_row_offset, group_offset, transpose_full)
+                for scale_vec in pl.hardware_loop(Q_NORM_SCALE_GROUP_TILE // 8):
+                    scale_offset = scale_vec * 16
+                    pair_data = pl.reg.gather(row_scale_halves, transpose_index, transpose_full, base_offset=scale_offset)
+                    _scales_written = pl.reg.store(scale_pairs, scale_vec * 128, pair_data)
+
             if active < row_tile:
                 with pl.reg_scope():
                     padding = pl.reg.broadcast(0, lanes=256, dtype=pl.INT8)
-                    scale_padding = pl.reg.interpret_cast(padding, dtype=pl.UINT16)
-                    padding_lane = pl.reg.active_mask(1, lanes=128)
                     for inactive in pl.hardware_loop(row_tile - active):
                         pad_row = active + inactive
                         for pad_chunk in pl.hardware_loop(Q_LORA // 256):
                             _payload_zeroed = pl.reg.store(quant_bytes, pad_row * Q_LORA + pad_chunk * 256, padding)
-                        for scale_chunk in pl.hardware_loop(Q_LORA // 64):
-                            pad_scale_offset = pl.cast(scale_chunk * MX_M_TILE + pad_row, pl.UINT16)
-                            pad_scale_index = pl.reg.broadcast(pad_scale_offset, lanes=128, dtype=pl.UINT16)
-                            _scales_zeroed = pl.reg.scatter(scale_pairs, pad_scale_index, scale_padding, padding_lane)
 
             quantized = pl.reinterpret_view(quant_bytes, pl.FP8E4M3FN, shape=[MX_M_TILE, Q_LORA])
             valid_payload = pl.tile.slice(quantized, [MX_M_TILE, Q_LORA], [0, 0], valid_shape=[row_tile, Q_LORA])
             pl.store(valid_payload, [first, 0], payload)
-            scale_bytes = pl.reinterpret_view(scale_pairs, pl.UINT8, shape=[Q_LORA // 64, MX_M_TILE * 2])
+            scale_bytes = pl.reinterpret_view(scale_pairs, pl.UINT8, shape=[Q_NORM_SCALE_GROUP_TILE, MX_M_TILE * 2])
             scale_codes = pl.reinterpret_view(scale_bytes, pl.FP8E8M0)
             valid_scales = pl.tile.slice(
                 scale_codes, [Q_LORA // 64, MX_M_TILE * 2], [0, 0], valid_shape=[Q_LORA // 64, row_tile * 2],
