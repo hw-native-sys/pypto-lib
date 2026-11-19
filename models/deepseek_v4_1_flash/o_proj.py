@@ -839,6 +839,8 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--tokens", type=int, help="active rows for a single padded case")
     parser.add_argument("--native-oa", action="store_true", help="validate native M80 O-A with fused C++ O-B/HC post")
+    parser.add_argument("--check-native-oquant", action="store_true",
+                        help="also check standalone Native O-Quant (requires PyPTO explicit VF barriers)")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--save-data", action="store_true")
     args = parser.parse_args()
@@ -848,7 +850,7 @@ if __name__ == "__main__":
     cases = ((0, True), (1, True), (17, True), (72, False), (129, True))
     if args.tokens is not None:
         cases = ((args.tokens, True),)
-    if not args.execution_mode and args.tokens is None and not args.native_oa:
+    if args.check_native_oquant:
         for active, capacity in ((0, 80), (17, 80), (129, 160)):
             print(f"[O_QUANT] Native active={active}, padded={capacity}", flush=True)
             result = run(
