@@ -280,11 +280,13 @@ def q_norm_quant_pypto(
     capacity = pl.tensor.dim(payload, 0)
     scale_rows = capacity // MX_M_TILE * (Q_LORA // 64)
     scale_blocks = pl.reshape(scales, [scale_rows, MX_M_TILE * 2])
-    norm_workers = pl.max(pl.min(capacity // (MX_M_TILE // 2), 32), 1)
+    row_tile = MX_M_TILE
+    if capacity <= 128:
+        row_tile = MX_M_TILE // 2
+    chunks = capacity // row_tile
+    available_vectors = 2 * pl.system.available_cluster_count()
+    norm_workers = pl.max(pl.min(chunks, available_vectors), 1)
     with pl.spmd(norm_workers, name_hint="q_norm_quant_pypto"):
-        row_tile = MX_M_TILE
-        if capacity <= 128:
-            row_tile = MX_M_TILE // 2
         worker = pl.tile.get_block_idx()
         workers = pl.tile.get_block_num()
         for first in pl.range(worker * row_tile, capacity, workers * row_tile):
@@ -299,16 +301,12 @@ def q_norm_quant_pypto(
                 )
                 gamma = pl.load(weight, [0], [Q_LORA], target_memory=pl.Mem.Vec)
                 normalized = pl.create_tile([MX_M_TILE * Q_LORA], dtype=pl.BF16, target_memory=pl.Mem.Vec)
-                rms = pl.create_tile([64], dtype=pl.FP32, target_memory=pl.Mem.Vec)
 
                 with pl.reg_scope():
                     full = pl.reg.full_mask(lanes=64)
-                    lowest = pl.reg.active_mask(1, lanes=64)
                     partial_mask = pl.reg.active_mask(Q_NORM_FOLD // 64, lanes=64)
                     lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
-                    # The inverse-root scope loads the full scratch vector.
-                    rms_zero = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
-                    _rms_initialized = pl.reg.store(rms, value=rms_zero)
+                    variances = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
                     for row in pl.hardware_loop(active):
                         row_offset = row * Q_LORA
                         partials = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
@@ -339,13 +337,11 @@ def q_norm_quant_pypto(
                         total = pl.reg.reduce_sum(partials, partial_mask, reassoc=True)
                         total_all = pl.reg.broadcast(total, lanes=64, dtype=pl.FP32)
                         variance = pl.reg.muls(total_all, 1.0 / Q_LORA, full)
-                        location = pl.reg.broadcast(pl.cast(row, pl.UINT32), lanes=64, dtype=pl.UINT32)
-                        _variance_written = pl.reg.scatter(rms, location, variance, lowest)
+                        row_slot = pl.reg.compares(lane, pl.cast(row, pl.UINT32), full, predicate="eq")
+                        variances = pl.reg.select(row_slot, variance, variances)
 
-                with pl.reg_scope():
                     # Correct the reciprocal square root for all active rows together.
                     active_mask = pl.reg.active_mask(active, lanes=64)
-                    variances = pl.reg.load(rms, lanes=64)
                     one = pl.reg.broadcast(1.0, lanes=64, dtype=pl.FP32)
                     half = pl.reg.broadcast(0.5, lanes=64, dtype=pl.FP32)
                     three_halves = pl.reg.broadcast(1.5, lanes=64, dtype=pl.FP32)
@@ -371,20 +367,25 @@ def q_norm_quant_pypto(
                     infinity = pl.reg.interpret_cast(infinity_bits, dtype=pl.FP32)
                     inverses = pl.reg.select(is_infinite, zero, inverses)
                     inverses = pl.reg.select(is_zero, infinity, inverses)
-                    _inverses_written = pl.reg.store(rms, value=inverses, mask=active_mask)
 
-                with pl.reg_scope():
-                    quant_full = pl.reg.full_mask(lanes=64)
                     lower = pl.reg.active_mask(32, lanes=64)
                     upper = pl.reg.mask_not(lower)
                     code_zero = pl.reg.broadcast(0, lanes=64, dtype=pl.INT32)
                     code_one = pl.reg.broadcast(1, lanes=64, dtype=pl.INT32)
                     first_lane = pl.reg.broadcast(0, lanes=64, dtype=pl.UINT32)
                     last_lane = pl.reg.broadcast(63, lanes=64, dtype=pl.UINT32)
-                    scale_lane = pl.reg.active_mask(1, lanes=128)
+                    scale_full = pl.reg.full_mask(lanes=128)
+                    scale_lanes = pl.reg.index_gen(0, lanes=128, dtype=pl.UINT16)
+                    even = pl.reg.create_group_mask(1, num_groups=64, group_size=2)
+                    scale_prefix = pl.reg.active_mask(Q_LORA // 32, lanes=128)
+                    scale_mask = pl.reg.mask_and(even, scale_prefix)
+                    scale_groups = pl.reg.shift_rights(scale_lanes, 1, scale_full)
+                    scale_offsets = pl.reg.muls(scale_groups, MX_M_TILE, scale_full)
+                    empty_codes = pl.reg.broadcast(0, lanes=64, dtype=pl.UINT32)
                     for norm_row in pl.hardware_loop(active):
-                        inverse_scalar = pl.reg.load(rms, norm_row, lanes=1)
-                        row_inverse = pl.reg.broadcast(inverse_scalar, lanes=64, dtype=pl.FP32)
+                        inverse_index = pl.reg.broadcast(pl.cast(norm_row, pl.UINT32), lanes=64, dtype=pl.UINT32)
+                        row_inverse = pl.reg.gather_lanes(inverses, inverse_index)
+                        row_codes = empty_codes
                         for chunk in pl.hardware_loop(Q_LORA // 64):
                             norm_column = chunk * 64
                             offset = norm_row * Q_LORA + norm_column
@@ -392,60 +393,63 @@ def q_norm_quant_pypto(
                             normalized_value = pl.reg.convert(input_raw, dtype=pl.FP32)
                             gamma_raw = pl.reg.load(gamma, norm_column, lanes=64)
                             gain = pl.reg.convert(gamma_raw, dtype=pl.FP32)
-                            normalized_value = pl.reg.mul(normalized_value, row_inverse, quant_full)
-                            normalized_value = pl.reg.mul(normalized_value, gain, quant_full)
+                            normalized_value = pl.reg.mul(normalized_value, row_inverse, full)
+                            normalized_value = pl.reg.mul(normalized_value, gain, full)
                             rounded = pl.reg.convert(normalized_value, dtype=pl.BF16, rounding="R", saturate=False)
                             _latent_written = pl.reg.store(normalized, offset, rounded)
                             normalized_value = pl.reg.convert(rounded, dtype=pl.FP32)
 
                             # Quantize the two groups of 32 from their own shared exponent.
-                            magnitude = pl.reg.abs(normalized_value, quant_full)
+                            magnitude = pl.reg.abs(normalized_value, full)
                             low_max = pl.reg.reduce_max(magnitude, lower)
                             high_max = pl.reg.reduce_max(magnitude, upper)
                             low = pl.reg.broadcast(low_max, lanes=64, dtype=pl.FP32)
                             high = pl.reg.broadcast(high_max, lanes=64, dtype=pl.FP32)
                             maximum = pl.reg.select(lower, low, high)
                             maximum_bits = pl.reg.interpret_cast(maximum, dtype=pl.INT32)
-                            exponent = pl.reg.shift_rights(maximum_bits, 23, quant_full)
-                            exponent = pl.reg.adds(exponent, -8, quant_full)
-                            exponent = pl.reg.maximum(exponent, code_zero, quant_full)
-                            nonzero = pl.reg.minimum(exponent, code_one, quant_full)
-                            reciprocal_code = pl.reg.muls(exponent, -1, quant_full)
-                            reciprocal_code = pl.reg.adds(reciprocal_code, 254, quant_full)
-                            reciprocal_code = pl.reg.mul(reciprocal_code, nonzero, quant_full)
-                            reciprocal_bits = pl.reg.shift_lefts(reciprocal_code, 23, quant_full)
+                            exponent = pl.reg.shift_rights(maximum_bits, 23, full)
+                            exponent = pl.reg.adds(exponent, -8, full)
+                            exponent = pl.reg.maximum(exponent, code_zero, full)
+                            nonzero = pl.reg.minimum(exponent, code_one, full)
+                            reciprocal_code = pl.reg.muls(exponent, -1, full)
+                            reciprocal_code = pl.reg.adds(reciprocal_code, 254, full)
+                            reciprocal_code = pl.reg.mul(reciprocal_code, nonzero, full)
+                            reciprocal_bits = pl.reg.shift_lefts(reciprocal_code, 23, full)
                             scale_inverse = pl.reg.interpret_cast(reciprocal_bits, dtype=pl.FP32)
-                            normalized_value = pl.reg.mul(normalized_value, scale_inverse, quant_full)
-                            normalized_value = pl.reg.maximums(normalized_value, -448.0, quant_full)
-                            normalized_value = pl.reg.minimums(normalized_value, 448.0, quant_full)
+                            normalized_value = pl.reg.mul(normalized_value, scale_inverse, full)
+                            normalized_value = pl.reg.maximums(normalized_value, -448.0, full)
+                            normalized_value = pl.reg.minimums(normalized_value, 448.0, full)
                             fp8 = pl.reg.convert(normalized_value, dtype=pl.FP8E4M3FN, rounding="R", saturate=False)
                             packed = pl.reg.interpret_cast(fp8, dtype=pl.UINT32)
                             _payload_written = pl.reg.store(quant_words, offset // 4, packed)
                             codes = pl.reg.interpret_cast(exponent, dtype=pl.UINT32)
                             first_code = pl.reg.gather_lanes(codes, first_lane)
                             second_code = pl.reg.gather_lanes(codes, last_lane)
-                            second_code = pl.reg.shift_lefts(second_code, 8, quant_full)
+                            second_code = pl.reg.shift_lefts(second_code, 8, full)
                             pair = pl.reg.bitwise_or(first_code, second_code)
-                            pair = pl.reg.interpret_cast(pair, dtype=pl.UINT16)
-                            scale_offset = pl.cast(chunk * MX_M_TILE + norm_row, pl.UINT16)
-                            scale_index = pl.reg.broadcast(scale_offset, lanes=128, dtype=pl.UINT16)
-                            _scales_written = pl.reg.scatter(scale_pairs, scale_index, pair, scale_lane)
+                            code_slot = pl.reg.compares(lane, pl.cast(chunk, pl.UINT32), full, predicate="eq")
+                            row_codes = pl.reg.select(code_slot, pair, row_codes)
+                        # The lower halfword of each word holds one scale pair.
+                        packed_codes = pl.reg.interpret_cast(row_codes, dtype=pl.UINT16)
+                        scale_index = pl.reg.adds(scale_offsets, pl.cast(norm_row, pl.UINT16), scale_full)
+                        _scales_written = pl.reg.scatter(scale_pairs, scale_index, packed_codes, scale_mask)
                 latent_tile = pl.reshape(normalized, [MX_M_TILE, Q_LORA])
                 valid_latent = pl.tile.slice(latent_tile, [MX_M_TILE, Q_LORA], [0, 0], valid_shape=[active, Q_LORA])
                 pl.store(valid_latent, [first, 0], latent)
 
-            with pl.reg_scope():
-                padding = pl.reg.broadcast(0, lanes=256, dtype=pl.INT8)
-                scale_padding = pl.reg.interpret_cast(padding, dtype=pl.UINT16)
-                padding_lane = pl.reg.active_mask(1, lanes=128)
-                for inactive in pl.hardware_loop(row_tile - active):
-                    pad_row = active + inactive
-                    for pad_chunk in pl.hardware_loop(Q_LORA // 256):
-                        _payload_zeroed = pl.reg.store(quant_bytes, pad_row * Q_LORA + pad_chunk * 256, padding)
-                    for scale_chunk in pl.hardware_loop(Q_LORA // 64):
-                        pad_scale_offset = pl.cast(scale_chunk * MX_M_TILE + pad_row, pl.UINT16)
-                        pad_scale_index = pl.reg.broadcast(pad_scale_offset, lanes=128, dtype=pl.UINT16)
-                        _scales_zeroed = pl.reg.scatter(scale_pairs, pad_scale_index, scale_padding, padding_lane)
+            if active < row_tile:
+                with pl.reg_scope():
+                    padding = pl.reg.broadcast(0, lanes=256, dtype=pl.INT8)
+                    scale_padding = pl.reg.interpret_cast(padding, dtype=pl.UINT16)
+                    padding_lane = pl.reg.active_mask(1, lanes=128)
+                    for inactive in pl.hardware_loop(row_tile - active):
+                        pad_row = active + inactive
+                        for pad_chunk in pl.hardware_loop(Q_LORA // 256):
+                            _payload_zeroed = pl.reg.store(quant_bytes, pad_row * Q_LORA + pad_chunk * 256, padding)
+                        for scale_chunk in pl.hardware_loop(Q_LORA // 64):
+                            pad_scale_offset = pl.cast(scale_chunk * MX_M_TILE + pad_row, pl.UINT16)
+                            pad_scale_index = pl.reg.broadcast(pad_scale_offset, lanes=128, dtype=pl.UINT16)
+                            _scales_zeroed = pl.reg.scatter(scale_pairs, pad_scale_index, scale_padding, padding_lane)
 
             quantized = pl.reinterpret_view(quant_bytes, pl.FP8E4M3FN, shape=[MX_M_TILE, Q_LORA])
             valid_payload = pl.tile.slice(quantized, [MX_M_TILE, Q_LORA], [0, 0], valid_shape=[row_tile, Q_LORA])
