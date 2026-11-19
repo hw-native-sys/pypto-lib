@@ -253,8 +253,7 @@ def qkv_quant(
     return payload, scales
 
 
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "q_norm_quant.cpp",
-               include_dirs=(pto_isa_include_dir(),))
+@pl.jit.inline(auto_scope=False)
 def q_norm_quant(
     projected: pl.Tensor,
     weight: pl.Tensor,
@@ -264,19 +263,6 @@ def q_norm_quant(
     rows: pl.Scalar[pl.INT32],
 ):
     """Normalize latent rows and write M16-packed MXFP8 outputs."""
-    ...
-
-
-@pl.jit.inline(auto_scope=False)
-def q_norm_quant_pypto(
-    projected: pl.Tensor,
-    weight: pl.Tensor,
-    latent: pl.Out[pl.Tensor],
-    payload: pl.Out[pl.Tensor],
-    scales: pl.Out[pl.Tensor],
-    rows: pl.Scalar[pl.INT32],
-):
-    """Run the PyPTO variant of Q normalization and M16-packed MXFP8 quantization."""
     capacity = pl.tensor.dim(payload, 0)
     scale_rows = capacity // MX_M_TILE * (Q_LORA // 64)
     scale_blocks = pl.reshape(scales, [scale_rows, MX_M_TILE * 2])
@@ -287,7 +273,7 @@ def q_norm_quant_pypto(
     # Limit launch fanout so fewer AIV completions reach the scheduler together.
     available_vectors = pl.min(32, 2 * pl.system.available_cluster_count())
     norm_workers = pl.max(pl.min(chunks, available_vectors), 1)
-    with pl.spmd(norm_workers, name_hint="q_norm_quant_pypto"):
+    with pl.spmd(norm_workers, name_hint="q_norm_quant"):
         worker = pl.tile.get_block_idx()
         workers = pl.tile.get_block_num()
         for first in pl.range(worker * row_tile, capacity, workers * row_tile):
@@ -540,13 +526,11 @@ def q_proj_rope(
     qa_workers = pl.max(pl.min(qa_tasks, qa_worker_limit), 1)
     with pl.spmd(qa_workers, name_hint="proj_q_a"):
         projected = _proj_q_a(payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_tile)
-    norm_workers = pl.max(pl.min(payload_rows // (MX_M_TILE // 2), 32), 1)
     latent_rows = pl.tensor.dim(query_latent, 0)
     norm_latent = pl.tensor.slice(query_latent, [latent_rows, Q_LORA], [0, 0])
     norm_payload = pl.tensor.slice(qb_payload, [payload_rows, Q_LORA], [0, 0])
     norm_scales = pl.tensor.slice(qb_scales, [1, payload_rows * (Q_LORA // 32)], [0, 0])
-    with pl.spmd(norm_workers, name_hint="q_norm_quant"):
-        q_norm_quant(projected, q_norm_weight, norm_latent, norm_payload, norm_scales, num_tokens)
+    q_norm_quant(projected, q_norm_weight, norm_latent, norm_payload, norm_scales, num_tokens)
     qb_tasks = ((num_tokens + qb_tile - 1) // qb_tile) * (LOCAL_H * HEAD_DIM // Q_B_N_TILE)
     qb_workers = pl.max(pl.min(qb_tasks, pl.min(qb_worker_limit, pl.system.available_cluster_count())), 1)
     with pl.spmd(qb_workers, name_hint="proj_q_b"):
@@ -1043,13 +1027,11 @@ def q_proj_rope_pypto(
     projected = proj_q_a_pypto(payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_worker_limit)
     qb_payload = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.FP8E4M3FN)
     qb_scales = pl.create_tensor([1, payload_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
-    norm_workers = pl.max(pl.min(payload_rows // (MX_M_TILE // 2), 32), 1)
     latent_rows = pl.tensor.dim(query_latent, 0)
     norm_latent = query_latent[:latent_rows, :Q_LORA]
     norm_payload = qb_payload[:payload_rows, :Q_LORA]
     norm_scales = qb_scales[:, :payload_rows * (Q_LORA // 32)]
-    with pl.spmd(norm_workers, name_hint="q_norm_quant"):
-        q_norm_quant(projected, q_norm_weight, norm_latent, norm_payload, norm_scales, num_tokens)
+    q_norm_quant(projected, q_norm_weight, norm_latent, norm_payload, norm_scales, num_tokens)
     query = proj_q_b_pypto(
         qb_payload, wq_b, qb_scales, wq_b_scale,
         query, rope_cos, rope_sin, num_tokens, LOCAL_H * HEAD_DIM, 0, qb_worker_limit,
