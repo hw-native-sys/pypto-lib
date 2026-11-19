@@ -97,24 +97,32 @@ def dspark_attention(
     o_packed_heads: pl.Tensor[
         [O_GROUPS * LOCAL_T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16
     ],
+    num_query_tokens: pl.Scalar[pl.INT32],
+    QUERY_REQUESTS: pl.constexpr = B,
 ):
+    query_capacity = QUERY_REQUESTS * S
+    query_tokens = pl.min(query_capacity, pl.max(pl.cast(num_query_tokens, pl.INDEX), 0))
+    query_requests = (query_tokens + S - 1) // S
+    query_x = x[0:query_capacity, :]
+    query_cos = freqs_cos_local[0:query_capacity, :]
+    query_sin = freqs_sin_local[0:query_capacity, :]
     kv_tokens = pl.tensor.dim(kv_position_ids, 0)
-    rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    rope_swap_idx = pl.create_tensor([T, ROPE_DIM], dtype=pl.INT32)
+    rope_cos_il = pl.create_tensor([query_capacity, ROPE_DIM], dtype=pl.FP32)
+    rope_sin_signed = pl.create_tensor([query_capacity, ROPE_DIM], dtype=pl.FP32)
+    rope_swap_idx = pl.create_tensor([query_capacity, ROPE_DIM], dtype=pl.INT32)
     rope_prepare(
-        freqs_cos_local,
-        freqs_sin_local,
+        query_cos,
+        query_sin,
         rope_cos_il,
         rope_sin_signed,
         rope_swap_idx,
     )
 
-    q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
-    qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
-    qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
+    q = pl.create_tensor([query_capacity, H, HEAD_DIM], dtype=pl.BF16)
+    qr = pl.create_tensor([query_capacity, Q_LORA], dtype=pl.INT8)
+    qr_scale = pl.create_tensor([query_capacity, 1], dtype=pl.FP32)
     q_proj_rope(
-        x, wq_a, wq_b, wq_b_scale, gamma_cq,
+        query_x, wq_a, wq_b, wq_b_scale, gamma_cq,
         rope_cos_il, rope_sin_signed, rope_swap_idx,
         q, qr, qr_scale,
     )
@@ -149,7 +157,7 @@ def dspark_attention(
     # gather below reads those rows back through swa_indices.
     ori_block_num = pl.tensor.dim(kv_cache, 0)
     kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-    sparse_bias = pl.create_tensor([B, INDEX_WIDTH], dtype=pl.FP32)
+    sparse_bias = pl.create_tensor([QUERY_REQUESTS, INDEX_WIDTH], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_kv_commit_valid_bias"):
         for write_t in pl.range(kv_tokens):
             write_row_i64 = pl.read(kv_slot_mapping, [write_t])
@@ -157,17 +165,20 @@ def dspark_attention(
                 write_row = pl.cast(write_row_i64, pl.INDEX)
                 kv_cache_flat[write_row : write_row + 1, 0:HEAD_DIM] = kv[write_t : write_t + 1, 0:HEAD_DIM]
         v_col = pl.cast(pl.arange(0, [1, INDEX_WIDTH], dtype=pl.INT32), target_type=pl.FP32)
-        for v_blk in pl.range(B // BIAS_B_TILE):
+        for v_blk in pl.range((query_requests + BIAS_B_TILE - 1) // BIAS_B_TILE):
             v_b0 = v_blk * BIAS_B_TILE
             v_col_m = pl.col_expand(pl.full([BIAS_B_TILE, INDEX_WIDTH], dtype=pl.FP32, value=0.0), v_col)
-            v_lens = pl.cast(pl.reshape(swa_lens[v_b0 : v_b0 + BIAS_B_TILE], [BIAS_B_TILE, 1]), target_type=pl.FP32)
+            v_rows = pl.min(BIAS_B_TILE, query_requests - v_b0)
+            v_lens_tile = pl.slice(swa_lens, [BIAS_B_TILE], [v_b0], valid_shape=[v_rows])
+            v_lens = pl.cast(pl.reshape(v_lens_tile, [BIAS_B_TILE, 1]), target_type=pl.FP32)
             v_valid = pl.minimum(pl.maximum(pl.neg(pl.row_expand_sub(v_col_m, v_lens)), 0.0), 1.0)
-            sparse_bias[v_b0 : v_b0 + BIAS_B_TILE, 0:INDEX_WIDTH] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
+            v_bias = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
+            sparse_bias[v_b0 : v_b0 + BIAS_B_TILE, 0:INDEX_WIDTH] = pl.set_validshape(v_bias, v_rows, INDEX_WIDTH)
 
     # One index row per request: build_dspark_swa_indices repeats it across the
-    # block's query rows, so the gather runs B times, not T.
-    visible_kv = pl.create_tensor([B * INDEX_WIDTH, HEAD_DIM], dtype=pl.BF16)
-    for g_task in pl.spmd(B * SPARSE_BLOCKS, name_hint="dspark_gather_kv"):
+    # block's query rows, so the gather runs B times, not query_tokens.
+    visible_kv = pl.create_tensor([QUERY_REQUESTS * INDEX_WIDTH, HEAD_DIM], dtype=pl.BF16)
+    for g_task in pl.spmd(query_requests * SPARSE_BLOCKS, name_hint="dspark_gather_kv"):
         g_b = g_task // SPARSE_BLOCKS
         g_c0 = (g_task % SPARSE_BLOCKS) * ATTN_K_TILE
         g_base = g_b * INDEX_WIDTH
@@ -181,11 +192,11 @@ def dspark_attention(
                 else:
                     visible_kv[g_dst : g_dst + 1, 0:HEAD_DIM] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
 
-    q_flat = pl.reshape(q, [T * H, HEAD_DIM])
+    q_flat = pl.reshape(q, [query_capacity * H, HEAD_DIM])
     # Save online-softmax state for the fused publish phase after QK/PV.
-    sparse_mi = pl.create_tensor([T * H, 1], dtype=pl.FP32)
-    sparse_li = pl.create_tensor([T * H, 1], dtype=pl.FP32)
-    sparse_oi = pl.create_tensor([T * H, HEAD_DIM], dtype=pl.FP32)
+    sparse_mi = pl.create_tensor([query_capacity * H, 1], dtype=pl.FP32)
+    sparse_li = pl.create_tensor([query_capacity * H, 1], dtype=pl.FP32)
+    sparse_oi = pl.create_tensor([query_capacity * H, HEAD_DIM], dtype=pl.FP32)
     attn_sink_col = pl.reshape(attn_sink, [H, 1])
     o_packed_flat = pl.reshape(
         o_packed_heads,
@@ -202,7 +213,7 @@ def dspark_attention(
     with pl.spmd(NUM_QK_CORES, name_hint="dspark_qk_pv") as qk_tid:
         qk_core = pl.tile.get_block_idx()
         pl.system.set_ffts(ffts_workspace)
-        for qk_t in pl.range(qk_core, T, NUM_QK_CORES):
+        for qk_t in pl.range(qk_core, query_tokens, NUM_QK_CORES):
             qk_b = qk_t // S
             qk_q = pl.load(
                 q_flat, [qk_t * H, 0], [H, HEAD_DIM], target_memory=pl.MemorySpace.Mat,
@@ -337,7 +348,7 @@ def dspark_attention(
             merge_swap_flat = pl.row_expand_add(merge_swap_grid, merge_row_offsets)
             merge_swap_indices = pl.cast(merge_swap_flat, target_type=pl.INT32)
             merge_gather_tmp = pl.create_tile([H_TILE, ROPE_DIM], dtype=pl.INT32)
-            for merge_t in pl.range(qk_core, T, NUM_QK_CORES):
+            for merge_t in pl.range(qk_core, query_tokens, NUM_QK_CORES):
                 merge_cos = pl.load(rope_cos_il, [merge_t, 0], [1, ROPE_DIM])
                 merge_sin = pl.load(rope_sin_signed, [merge_t, 0], [1, ROPE_DIM])
                 for merge_tile in pl.unroll((H // 2) // H_TILE):
@@ -421,7 +432,7 @@ def dspark_attention_test(
         freqs_cos_local, freqs_sin_local, freqs_cos, freqs_sin,
         position_ids, position_ids,
         kv_cache, slot_mapping, swa_indices, swa_lens,
-        attn_sink, o_packed_flat,
+        attn_sink, o_packed_flat, pl.const(T, pl.INT32), B,
     )
     return kv_cache, o_packed_heads
 

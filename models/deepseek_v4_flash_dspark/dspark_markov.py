@@ -14,7 +14,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 
-from config import DECODE_SEQ, MOE_TOKENS, FLASH as M
+from config import DECODE_SEQ, FP32_NEG_INF, MOE_TOKENS, FLASH as M
 from lm_head import (
     DONE_VALUE,
     GROUP_LOGIT_ROWS,
@@ -57,17 +57,15 @@ MARKOV_M_TILE = max(8, DSPARK_MAX_BATCH)
 # from concurrent request blocks otherwise overwrite the neighbouring row.
 MARKOV_ID_PAD = (DSPARK_QUERY_WIDTH + 15) // 16 * 16
 CONFIDENCE_PAD = 8
-GREEDY_VOCAB_CHUNK = 256
-GREEDY_NUM_CHUNKS = VOCAB // GREEDY_VOCAB_CHUNK
-GREEDY_CHUNK_PAD = 512
 GREEDY_ARGMAX_ROWS = 8
-NEG_INF = -3.402823e38
+GREEDY_VOCAB_TILE = 808
+GREEDY_SHARD_TILE = GREEDY_ARGMAX_ROWS * GREEDY_VOCAB_TILE
+GREEDY_PARTIAL_TILE = 16
+GREEDY_REDUCE_TILE = 32
 
 assert D % HIDDEN_TILE == 0
 assert D % LM_K_TILE == 0
 assert VOCAB % LM_N_TILE == 0
-assert VOCAB % GREEDY_VOCAB_CHUNK == 0
-assert GREEDY_NUM_CHUNKS <= GREEDY_CHUNK_PAD
 assert CONFIDENCE_PAD * 4 == 32
 # Base-logit row tiling must exactly cover every supported padded batch.
 for _batch in DSPARK_SUPPORTED_BATCHES:
@@ -87,7 +85,7 @@ def normalize_head_hidden(
     padded_hidden = pl.create_tensor([DSPARK_NORM_TOKENS, D], dtype=pl.BF16)
     hidden_blocks = D // HIDDEN_TILE
     with pl.spmd(
-        (DSPARK_NORM_TOKENS // RMS_M_TILE) * hidden_blocks,
+        (padded_tokens // RMS_M_TILE) * hidden_blocks,
         name_hint="dspark_hidden_zero",
     ) as hidden_zero_tid:
         zero_task = pl.tile.get_block_idx()
@@ -371,69 +369,53 @@ def greedy_markov_step(
             request_base : request_base + CONFIDENCE_PAD,
         ] = confidence_prob
 
+    partials = pl.create_tensor([batch * (VOCAB // GREEDY_SHARD_TILE), GREEDY_PARTIAL_TILE], dtype=pl.FP32)
+    base_rows = pl.tensor.dim(base_logits, 0)
+    base_grid = pl.reshape(base_logits, [base_rows * (VOCAB // GREEDY_VOCAB_TILE), GREEDY_VOCAB_TILE])
+    bias_grid = pl.reshape(markov_bias, [batch * (VOCAB // GREEDY_VOCAB_TILE), GREEDY_VOCAB_TILE])
     with pl.spmd(
-        MARKOV_M_TILE,
-        name_hint="dspark_markov_greedy",
+        batch * (VOCAB // GREEDY_SHARD_TILE), name_hint="dspark_markov_greedy_partials",
         deps=[base_logits_ready_tid, confidence_tid, markov_logits_tid],
-    ) as greedy_tid:
-        request = pl.tile.get_block_idx()
-        if request < batch:
-            source_row = request * DSPARK_QUERY_WIDTH + step
-            chunk_maxima = pl.full(
-                [GREEDY_ARGMAX_ROWS, GREEDY_CHUNK_PAD],
-                dtype=pl.FP32,
-                value=NEG_INF,
-            )
-            chunk_token_ids = pl.full(
-                [1, GREEDY_CHUNK_PAD],
-                dtype=pl.INT32,
-                value=0,
-            )
-            for chunk in pl.range(GREEDY_NUM_CHUNKS):
-                vocab_offset = chunk * GREEDY_VOCAB_CHUNK
-                scores = pl.full(
-                    [GREEDY_ARGMAX_ROWS, GREEDY_VOCAB_CHUNK],
-                    dtype=pl.FP32,
-                    value=NEG_INF,
-                )
-                scores[0:1, 0:GREEDY_VOCAB_CHUNK] = pl.add(
-                    pl.slice(
-                        base_logits,
-                        [1, GREEDY_VOCAB_CHUNK],
-                        [pl.cast(source_row, pl.INDEX), vocab_offset],
-                    ),
-                    markov_bias[
-                        request : request + 1,
-                        vocab_offset : vocab_offset + GREEDY_VOCAB_CHUNK,
-                    ],
-                )
-                local_winner = pl.row_argmax(scores)
-                local_token = pl.read(local_winner, [0, 0])
-                pl.write(
-                    chunk_maxima,
-                    [0, chunk],
-                    pl.read(scores, [0, pl.cast(local_token, pl.INDEX)]),
-                )
-                pl.write(
-                    chunk_token_ids,
-                    [0, chunk],
-                    pl.cast(vocab_offset, pl.INT32) + local_token,
-                )
+    ) as partials_tid:
+        partial = pl.tile.get_block_idx()
+        request = partial // (VOCAB // GREEDY_SHARD_TILE)
+        shard = partial % (VOCAB // GREEDY_SHARD_TILE)
+        source_row = request * DSPARK_QUERY_WIDTH + step
+        base_begin = source_row * (VOCAB // GREEDY_VOCAB_TILE) + shard * GREEDY_ARGMAX_ROWS
+        bias_begin = request * (VOCAB // GREEDY_VOCAB_TILE) + shard * GREEDY_ARGMAX_ROWS
+        base_tile = base_grid[base_begin:base_begin + GREEDY_ARGMAX_ROWS, :]
+        bias_tile = bias_grid[bias_begin:bias_begin + GREEDY_ARGMAX_ROWS, :]
+        scores = pl.add(base_tile, bias_tile)
+        row_winners = pl.row_argmax(scores)
+        row_scores = pl.full([GREEDY_ARGMAX_ROWS, GREEDY_ARGMAX_ROWS], dtype=pl.FP32, value=FP32_NEG_INF)
+        for row in pl.range(GREEDY_ARGMAX_ROWS):
+            column = pl.cast(pl.read(row_winners, [row, 0]), pl.INDEX)
+            pl.write(row_scores, [0, row], pl.read(scores, [row, column]))
+        winning_row = pl.cast(pl.read(pl.row_argmax(row_scores), [0, 0]), pl.INDEX)
+        winning_column = pl.read(row_winners, [winning_row, 0])
+        winning_score = pl.read(row_scores, [0, winning_row])
+        winning_token = shard * GREEDY_SHARD_TILE + winning_row * GREEDY_VOCAB_TILE + winning_column
+        winning_token_i32 = pl.cast(winning_token, pl.INT32)
+        # Each shard stores one cache line; vocabulary token IDs are exact FP32 integers.
+        partial_row = pl.full([1, GREEDY_PARTIAL_TILE], dtype=pl.FP32, value=0.0)
+        pl.write(partial_row, [0, 0], winning_score)
+        pl.write(partial_row, [0, 1], pl.cast(winning_token_i32, pl.FP32))
+        partials[partial:partial + 1, :] = partial_row
 
-            winning_chunk = pl.read(pl.row_argmax(chunk_maxima), [0, 0])
-            winning_token = pl.read(
-                chunk_token_ids,
-                [0, pl.cast(winning_chunk, pl.INDEX)],
-            )
-            token_row = draft_token_scratch[
-                request : request + 1,
-                0:MARKOV_ID_PAD,
-            ]
-            pl.write(token_row, [0, pl.cast(step, pl.INDEX)], winning_token)
-            draft_token_scratch[
-                request : request + 1,
-                0:MARKOV_ID_PAD,
-            ] = token_row
+    with pl.spmd(batch, name_hint="dspark_markov_greedy", deps=[partials_tid]) as greedy_tid:
+        request = pl.tile.get_block_idx()
+        shard_scores = pl.full([GREEDY_ARGMAX_ROWS, GREEDY_REDUCE_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
+        for shard in pl.range(VOCAB // GREEDY_SHARD_TILE):
+            partial = request * (VOCAB // GREEDY_SHARD_TILE) + shard
+            pl.write(shard_scores, [0, shard], pl.read(partials, [partial, 0]))
+        winning_shard = pl.read(pl.row_argmax(shard_scores), [0, 0])
+        winning_token = pl.cast(0, pl.INT32)
+        if winning_shard < VOCAB // GREEDY_SHARD_TILE:
+            winning_partial = request * (VOCAB // GREEDY_SHARD_TILE) + winning_shard
+            winning_token = pl.cast(pl.read(partials, [pl.cast(winning_partial, pl.INDEX), 1]), pl.INT32)
+        token_row = draft_token_scratch[request:request + 1, 0:MARKOV_ID_PAD]
+        pl.write(token_row, [0, pl.cast(step, pl.INDEX)], winning_token)
+        draft_token_scratch[request:request + 1, 0:MARKOV_ID_PAD] = token_row
 
     return greedy_tid
 
@@ -563,6 +545,7 @@ def _distributed_markov_sample(
     logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
+    ROW_CAPACITY: pl.constexpr = MAX_LOGIT_ROWS,
 ):
     head_hidden.bind_dynamic(0, B_DYN)
     num_sampled.bind_dynamic(0, B_DYN)
@@ -577,10 +560,11 @@ def _distributed_markov_sample(
         normalized,
     )
     base_logits = pl.create_tensor([MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
+    selected_indices = logit_row_indices[:ROW_CAPACITY]
     base_logits, base_logits_tid = lm_head(
         normalized,
         lm_head_weight,
-        logit_row_indices,
+        selected_indices,
         base_logits,
         hidden_window,
         hidden_done,
@@ -681,6 +665,7 @@ def l3_distributed_markov_sample(
             logits_done,
             rank // TP_SIZE * TP_SIZE,
             rank % TP_SIZE,
+            MAX_LOGIT_ROWS,
             device=rank,
         )
 
