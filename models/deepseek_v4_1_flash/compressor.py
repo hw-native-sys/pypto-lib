@@ -414,7 +414,7 @@ def c2a_compressor_project(
     """Project KV and gate with NZ BF16 weights and FP32 Cube output."""
     blocks = (num_tokens + C2A_PROJ_M_TILE - 1) // C2A_PROJ_M_TILE * (2 * HEAD_DIM // n_tile)
     workers = pl.max(pl.min(blocks, pl.system.available_cluster_count()), 1)
-    with pl.spmd(workers, name_hint="proj_cmp", sync_start=True):
+    with pl.spmd(workers, name_hint="proj_cmp"):
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, blocks, workers):
             row = block // (2 * HEAD_DIM // n_tile) * C2A_PROJ_M_TILE

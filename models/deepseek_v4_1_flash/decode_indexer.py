@@ -2332,7 +2332,7 @@ def c1a_index(
     tokens = pl.tensor.dim(x, 0)
     query = pl.create_tensor([tokens, INDEX_H * INDEX_DIM // 2], dtype=pl.UINT8)
     query_scale = pl.create_tensor([tokens, INDEX_H * (INDEX_DIM // INDEX_CACHE_GROUP)], dtype=pl.FP8E8M0)
-    with pl.spmd(16, name_hint="idx_q", sync_start=True, deps=[entry_ready]) as query_tid:
+    with pl.spmd(16, name_hint="idx_q", deps=[entry_ready]) as query_tid:
         query = _idx_q(
             projection_payload, index_wq_b, projection_scale_backing, index_wq_b_scale,
             cos, sin, query, query_scale, num_tokens,
