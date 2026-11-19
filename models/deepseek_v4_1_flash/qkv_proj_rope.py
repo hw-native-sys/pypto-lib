@@ -45,6 +45,7 @@ Q_LORA = M.q_lora_rank
 Q_A_N_TILE = 64
 Q_B_N_TILE = 256
 KV_N_TILE = 64
+QKV_SCALE_TILE = MX_M_TILE * MX_K_TILE // 32
 PROJ_M_TILE = 80
 PROJ_WIDE_M_TILE = 128
 WINDOW_PUBLISH_WORKER_TILE = 12
@@ -107,17 +108,148 @@ def _proj_kv(
     return output
 
 
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "qkv_quant.cpp",
-               include_dirs=(pto_isa_include_dir(),))
+@pl.jit.inline(auto_scope=False)
+def _load_qkv_work(
+    x: pl.Tensor,
+    inputs: pl.Tile[[2 * MX_M_TILE, MX_K_TILE], pl.BF16, pl.Mem.Vec],
+    work: pl.Scalar[pl.INDEX],
+    slot: pl.Scalar[pl.INDEX],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    t0 = work // (D // MX_K_TILE) * MX_M_TILE
+    k0 = work % (D // MX_K_TILE) * MX_K_TILE
+    rows = pl.max(0, pl.min(MX_M_TILE, num_tokens - t0))
+    if rows > 0:
+        input_row = slot * MX_M_TILE
+        inputs = pl.tile.gather_row(inputs, x, [input_row, 0], [t0, k0], [MX_M_TILE, MX_K_TILE],
+                                    valid_shape=[rows, MX_K_TILE])
+    return inputs
+
+
+@pl.jit.incore
 def qkv_quant(
     x: pl.Tensor,
     payload: pl.Out[pl.Tensor],
     scales: pl.Out[pl.Tensor],
     num_tokens: pl.Scalar[pl.INT32],
     padded_rows: pl.Scalar[pl.INDEX],
-):
-    """Quantize BF16 projection inputs with M16-packed E8M0 scales."""
-    ...
+) -> tuple[pl.Tensor, pl.Tensor]:
+    """Quantize row-major BF16 projection inputs with M16-packed E8M0 scales."""
+    first = pl.tile.get_block_idx()
+    workers = pl.tile.get_block_num()
+    column_tiles = D // MX_K_TILE
+    total = padded_rows // MX_M_TILE * column_tiles
+    if first < total:
+        inputs = pl.create_tile([2 * MX_M_TILE, MX_K_TILE], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+        output = pl.create_tile([2 * MX_M_TILE * MX_K_TILE], dtype=pl.INT8, target_memory=pl.Mem.Vec)
+        # Reserve a full 256-byte register store per scale slot.
+        codes = pl.create_tile([QKV_SCALE_TILE], dtype=pl.UINT32, target_memory=pl.Mem.Vec)
+        inputs = _load_qkv_work(x, inputs, first, 0, num_tokens)
+        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, 0)
+        pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, 0)
+        pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, 1)
+        rounds = (total - first + workers - 1) // workers
+        for iteration in pl.range(rounds):
+            work = first + iteration * workers
+            slot = iteration % 2
+            next_slot = 1 - slot
+            next_work = work + workers
+            # Prefetch the next tile while the vector pipe consumes the current slot.
+            if next_work < total:
+                if iteration > 0:
+                    pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, next_slot)
+                inputs = _load_qkv_work(x, inputs, next_work, next_slot, num_tokens)
+                pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, next_slot)
+            t0 = work // column_tiles * MX_M_TILE
+            k0 = work % column_tiles * MX_K_TILE
+            rows = pl.max(0, pl.min(MX_M_TILE, num_tokens - t0))
+            source = pl.reshape(inputs, [2 * MX_M_TILE * MX_K_TILE])
+            pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.V, slot)
+            pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, slot)
+            output_words = pl.reinterpret_view(output, pl.UINT32, shape=[2 * MX_M_TILE * MX_K_TILE // 4])
+            with pl.reg_scope():
+                # Keep aligned row and slot offsets visible to register lowering.
+                slot_row = slot * MX_M_TILE
+                code_offset = slot * (QKV_SCALE_TILE // 2)
+                full = pl.reg.full_mask(lanes=MX_K_TILE)
+                groups = pl.reg.full_mask(lanes=MX_K_TILE // 32)
+                packed_mask = pl.reg.full_mask(lanes=64)
+                # Eight words per group pair hold two rows of scale bytes each.
+                lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
+                pair_mask = pl.reg.broadcast(3, lanes=64, dtype=pl.UINT32)
+                pair_index = pl.reg.shift_rights(lane, 3, packed_mask)
+                pair_index = pl.reg.bitwise_and(pair_index, pair_mask, packed_mask)
+                low_index = pl.reg.shift_lefts(pair_index, 4, packed_mask)
+                high_index = pl.reg.adds(low_index, 8, packed_mask)
+                row_mask = pl.reg.broadcast(7, lanes=64, dtype=pl.UINT32)
+                row_indices = pl.reg.bitwise_and(lane, row_mask, packed_mask)
+                zero = pl.reg.broadcast(0, lanes=64, dtype=pl.UINT32)
+                for row, (packed_scales,) in pl.hardware_loop(rows, init_values=(zero,)):
+                    tile_row = slot_row + row
+                    offset = tile_row * MX_K_TILE
+                    raw = pl.reg.load(source, offset, lanes=MX_K_TILE)
+                    value = pl.reg.convert(raw, dtype=pl.FP32)
+                    magnitude = pl.reg.abs(value, full)
+                    maximum = pl.reg.reduce_max(magnitude, full, group_size=32)
+                    maximum_bits = pl.reg.interpret_cast(maximum, dtype=pl.INT32)
+                    exponent = pl.reg.shift_rights(maximum_bits, 23, groups)
+                    exponent = pl.reg.adds(exponent, -8, groups)
+                    exponent = pl.reg.maximums(exponent, 0, groups)
+                    nonzero = pl.reg.minimums(exponent, 1, groups)
+                    reciprocal_code = pl.reg.muls(exponent, -1, groups)
+                    reciprocal_code = pl.reg.adds(reciprocal_code, 254, groups)
+                    reciprocal_code = pl.reg.mul(reciprocal_code, nonzero, groups)
+                    reciprocal_bits = pl.reg.shift_lefts(reciprocal_code, 23, groups)
+                    reciprocal = pl.reg.interpret_cast(reciprocal_bits, dtype=pl.FP32)
+                    reciprocal = pl.reg.group_broadcast(reciprocal, lanes=MX_K_TILE)
+                    value = pl.reg.mul(value, reciprocal, full)
+                    value = pl.reg.maximums(value, -448.0, full)
+                    value = pl.reg.minimums(value, 448.0, full)
+                    fp8 = pl.reg.convert(value, dtype=pl.FP8E4M3FN, rounding="R", saturate=False)
+                    words = pl.reg.interpret_cast(fp8, dtype=pl.UINT32)
+                    word_offset = tile_row * (MX_K_TILE // 4)
+                    _payload = pl.reg.store(output_words, word_offset, words)
+
+                    scale_words = pl.reg.interpret_cast(exponent, dtype=pl.UINT32)
+                    scale_words = pl.reg.group_broadcast(scale_words, lanes=64)
+                    low = pl.reg.gather_lanes(scale_words, low_index)
+                    high = pl.reg.gather_lanes(scale_words, high_index)
+                    high = pl.reg.shift_lefts(high, 8, packed_mask)
+                    pair = pl.reg.bitwise_or(low, high, packed_mask)
+                    bit = pl.cast((row % 2) * 16, pl.INT16)
+                    pair = pl.reg.shift_lefts(pair, bit, packed_mask)
+                    word = pl.cast(row // 2, pl.UINT32)
+                    row_selected = pl.reg.compares(row_indices, word, packed_mask, predicate="eq")
+                    pair = pl.reg.select(row_selected, pair, zero)
+                    updated_scales = pl.reg.bitwise_or(packed_scales, pair, packed_mask)
+                    packed_scales = pl.yield_(updated_scales)
+                _scales = pl.reg.store(codes, code_offset, packed_scales)
+                padding = pl.reg.broadcast(0, lanes=MX_K_TILE // 4, dtype=pl.UINT32)
+                for inactive in pl.hardware_loop(MX_M_TILE - rows):
+                    row = rows + inactive
+                    tile_row = slot_row + row
+                    word_offset = tile_row * (MX_K_TILE // 4)
+                    _payload_pad = pl.reg.store(output_words, word_offset, padding)
+            pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE2, slot)
+            pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE3, slot)
+            pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE3, slot)
+            output_rows = pl.reshape(output, [2 * MX_M_TILE, MX_K_TILE])
+            output_tile = pl.tile.slice(output_rows, [MX_M_TILE, MX_K_TILE], [slot * MX_M_TILE, 0])
+            quantized = pl.reinterpret_view(output_tile, pl.FP8E4M3FN)
+            scale_bytes = pl.reinterpret_view(codes, pl.UINT8, shape=[2, 2 * QKV_SCALE_TILE])
+            scale_tile = pl.tile.slice(scale_bytes, [1, QKV_SCALE_TILE], [slot, 0])
+            scale_codes = pl.reinterpret_view(scale_tile, pl.FP8E8M0)
+            scale_offset = t0 * (D // 32) + k0 // MX_K_TILE * QKV_SCALE_TILE
+            pl.store(quantized, [t0, k0], payload)
+            pl.store(scale_codes, [0, scale_offset], scales)
+            pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, slot)
+        pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, 0)
+        if rounds > 1:
+            pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, 1)
+        pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 0)
+        pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 1)
+        pl.system.barrier(pipe=pl.PipeType.ALL)
+    return payload, scales
 
 
 @pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "q_norm_quant.cpp",
@@ -151,7 +283,7 @@ def quantize_projection_input(
     quant_blocks = (padded_rows // MX_M_TILE) * (D // MX_K_TILE)
     workers = pl.min(quant_blocks, 2 * pl.system.available_cluster_count())
     with pl.spmd(workers, name_hint="qkv_quant"):
-        qkv_quant(x, payload, scales, num_tokens, padded_rows)
+        payload, scales = qkv_quant(x, payload, scales, num_tokens, padded_rows)
     return payload, scales, padded_rows
 
 
