@@ -343,7 +343,7 @@ def q_proj_rope(
         q_norm_quant(projected, q_norm_weight, norm_latent, norm_payload, norm_scales, num_tokens)
     qb_tasks = ((num_tokens + qb_tile - 1) // qb_tile) * (LOCAL_H * HEAD_DIM // Q_B_N_TILE)
     qb_workers = pl.max(pl.min(qb_tasks, pl.min(qb_worker_limit, pl.system.available_cluster_count())), 1)
-    with pl.spmd(qb_workers, name_hint="proj_q_b", sync_start=True):
+    with pl.spmd(qb_workers, name_hint="proj_q_b"):
         query = _proj_q_b(
             qb_payload, wq_b, qb_scales, wq_b_scale,
             query, rope_cos, rope_sin, num_tokens, LOCAL_H * HEAD_DIM, 0, qb_tile,

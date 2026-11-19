@@ -721,9 +721,8 @@ def _prefill_index_scores(
     query_flat = pl.reshape(query, [query_rows, INDEX_DIM])
     table_width = pl.tensor.dim(block_table, 1)
     requests = pl.tensor.dim(block_table, 0)
-    # Initial V2C FIFO writes require the paired Cube's L1 to be available.
     workers = pl.max(1, pl.min(32, pl.system.available_cluster_count()))
-    with pl.spmd(workers, name_hint="prefill_index_mx_scores", sync_start=True, deps=[plan_tid, clear_tid, decoded_tid],
+    with pl.spmd(workers, name_hint="prefill_index_mx_scores", deps=[plan_tid, clear_tid, decoded_tid],
                  optimizations=[pl.cross_core_slot(slot_num=2)]) as score_tid:
         worker = pl.tile.get_block_idx()
         work_items = pl.cast(pl.read(prefix, [groups]), pl.INDEX)
@@ -1587,6 +1586,8 @@ def compare_compressed_topk(
 
     if actual.shape != expected.shape or actual.dtype != expected.dtype:
         return False, "Top-K shape or dtype mismatch"
+    cache = actual_outputs if mode == "full" else inputs
+    page_rows = cache["index_cache"].shape[2]
     for rank in range(actual.shape[0]):
         active = int(inputs["q_token_count"][rank, 0]) if CP_SIZE > 1 else int(inputs["kv_token_count"][rank, 0])
         if not bool((actual[rank, active:] == -1).all()):
@@ -1604,7 +1605,6 @@ def compare_compressed_topk(
             length = int(inputs["q_compressed_lens"][rank, row])
             request = int(inputs["q_request_ids"][rank, row])
             logical = torch.arange(length)
-            page_rows = inputs["index_cache"].shape[2]
             physical = inputs["index_block_table"][rank, request, logical // page_rows].long() * page_rows + logical % page_rows
             inverse = {int(p): int(l) for p, l in zip(physical, logical)}
             if any(int(p) not in inverse for p in av):
@@ -1632,7 +1632,6 @@ def compare_compressed_topk(
                     inputs["wq_b"][rank], inputs["wq_b_scale"][rank], inputs["wkv"][rank], inputs["wkv_scale"][rank],
                     inputs["wkv_norm"][rank], cos, sin, sequential_query=True,
                 )
-                cache = actual_outputs if mode == "full" else inputs
                 keys = dequantize_mxfp4_cache(cache["index_cache"][rank], cache["index_cache_scale"][rank], 32, "e8m0").bfloat16()
                 pool_args = {}
                 if mode == "reindex":
