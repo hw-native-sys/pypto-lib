@@ -7,7 +7,6 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: no-sim
-"""PyPTO sparse MLA with packed-cache dequantization and sink-aware Cube attention."""
 """Gather sparse attention over packed FP8/FP4 caches with an attention sink."""
 
 from pathlib import Path
@@ -16,9 +15,8 @@ import pypto.language as pl
 import torch
 from pypto.runtime import pto_isa_include_dir
 
-from config import CACHE_ROWS_DYN
 from config import (
-    FLASH as M, CMP_BLOCKS_DYN, ORI_BLOCKS_DYN, T_DYN, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
+    FLASH as M, CACHE_ROWS_DYN, CMP_BLOCKS_DYN, ORI_BLOCKS_DYN, T_DYN, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
 from quant import (
     dequantize_mxfp4_cache, dequantize_mxfp8_cache, quantize_mxfp4_cache, quantize_mxfp8_cache,
@@ -30,9 +28,41 @@ HEAD_DIM = M.head_dim
 LOCAL_H = M.num_attention_heads
 WINDOW_KEYS = M.sliding_window
 INDEX_TOPK = M.index_topk
+SCALE = HEAD_DIM ** -0.5
 
 # tiling
-WORKERS = 32
+SPARSE_VF_WORKER_TILE = 32
+SPARSE_VF_KEY_TILE = 128
+SPARSE_VF_GATHER_TILE = 32
+SPARSE_VF_HEAD_TILE = min(32, LOCAL_H)
+SPARSE_VF_CUBE_HEAD_TILE = max(16, SPARSE_VF_HEAD_TILE)
+SPARSE_VF_PIPE_HEAD_TILE = min(64, LOCAL_H)
+SPARSE_VF_PIPE_CUBE_HEAD_TILE = max(16, SPARSE_VF_PIPE_HEAD_TILE)
+SPARSE_VF_PIPE_SPLIT = 1 if LOCAL_H >= 32 else 0
+SPARSE_VF_PIPE_SLOT_BYTES = SPARSE_VF_PIPE_CUBE_HEAD_TILE * 256 * 4 // (2 if SPARSE_VF_PIPE_SPLIT else 1)
+SPARSE_VF_PIPE_BUFFER_BYTES = SPARSE_VF_PIPE_SLOT_BYTES * 2
+SPARSE_VF_REG_TILE = 128
+SPARSE_VF_FUSED_HEAD_TILE = min(64, LOCAL_H)
+SPARSE_VF_FUSED_CUBE_HEAD_TILE = max(16, SPARSE_VF_FUSED_HEAD_TILE)
+SPARSE_VF_FUSED_AIV_HEAD_TILE = SPARSE_VF_FUSED_CUBE_HEAD_TILE // 2
+SPARSE_VF_FUSED_GATHER_TILE = 16
+SPARSE_VF_FUSED_SCALE_TILE = 8
+SPARSE_VF_FUSED_FP4_SCALE_TILE = 16
+
+# Packed cache layout.
+SPARSE_VF_WINDOW_GROUP = 32
+SPARSE_VF_COMPRESSED_GROUP = 16
+SPARSE_VF_WINDOW_GROUPS = HEAD_DIM // SPARSE_VF_WINDOW_GROUP
+SPARSE_VF_HALF_DIM = HEAD_DIM // 2
+SPARSE_VF_WINDOW_HALFWORDS = WINDOW_CACHE_BYTES // 2
+SPARSE_VF_COMPRESSED_HALFWORDS = COMPRESSED_CACHE_BYTES // 2
+SPARSE_VF_WINDOW_SCALE_OFFSET = HEAD_DIM // 2
+SPARSE_VF_COMPRESSED_SCALE_OFFSET = HEAD_DIM // 4
+SPARSE_VF_WINDOW_SCALE_END = SPARSE_VF_WINDOW_SCALE_OFFSET + SPARSE_VF_WINDOW_GROUPS
+SPARSE_VF_WINDOW_SHIFT = 5
+SPARSE_VF_WINDOW_SCALE_TILE = SPARSE_VF_REG_TILE // SPARSE_VF_WINDOW_GROUP
+SPARSE_VF_COMPRESSED_SCALE_TILE = SPARSE_VF_REG_TILE // SPARSE_VF_COMPRESSED_GROUP
+SPARSE_VF_WINDOW_SCALE_ROW_TILE = SPARSE_VF_REG_TILE // SPARSE_VF_WINDOW_GROUPS
 
 
 @pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "sparse_gather_vf.cpp",
@@ -53,14 +83,13 @@ def _gather_sparse_vf_rows(
     compressed_keys: pl.Scalar[pl.INT32],
     balanced: pl.Scalar[pl.INT32],
     cache_mode: pl.constexpr,
-) -> tuple[pl.Tensor, pl.Tensor]:
+):
     """Stream cache rows through L1 with sink-aware sparse attention.
 
     Scalar gather indices use refreshed GM cache lines; vector masks use
     the asynchronous index copy in UB.
     """
-    return output, partials
-
+    ...
 
 
 @pl.jit.inline(auto_scope=False)
@@ -73,7 +102,6 @@ def gather_sparse_attention(
     sink: pl.Tensor,
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
-    source_ready: pl.Scalar[pl.TASK_ID],
     compressed_keys: pl.constexpr,
 ):
     """Attend H=32/64, D=512 packed caches with K=128 or 640 and both Vector lanes."""
@@ -82,11 +110,10 @@ def gather_sparse_attention(
     window_indices = window_indices[:num_tokens, :]
     compressed_indices = compressed_indices[:num_tokens, :]
     if compressed_keys == 0:
-        # Use fewer workers without increasing the maximum queries per worker.
-        query_waves = pl.max(1, (num_tokens + WORKERS - 1) // WORKERS)
-        workers = pl.max(1, pl.min(WORKERS, (num_tokens + query_waves - 1) // query_waves))
+        query_waves = pl.max(1, (num_tokens + SPARSE_VF_WORKER_TILE - 1) // SPARSE_VF_WORKER_TILE)
+        workers = pl.max(1, pl.min(SPARSE_VF_WORKER_TILE, (num_tokens + query_waves - 1) // query_waves))
     else:
-        workers = pl.max(1, pl.min(num_tokens, WORKERS))
+        workers = pl.max(1, pl.min(num_tokens, SPARSE_VF_WORKER_TILE))
     workers = pl.min(workers, pl.system.available_cluster_count())
     parts = (WINDOW_KEYS + compressed_keys) // 128
     whole_tiles = ((num_tokens + workers - 1) // workers) * parts
@@ -101,110 +128,20 @@ def gather_sparse_attention(
         ready_offset = 2 * workers * 64 * (HEAD_DIM + 2)
         for ready_index in pl.range(2 * workers):
             pl.write(partials, [ready_offset + ready_index], pl.cast(0, pl.FP32))
-        with pl.spmd(workers, name_hint="sparse_gather_vf", sync_start=True, deps=[source_ready]) as attended:
-            computed_output, computed_partials = _gather_sparse_vf_rows(
+        with pl.spmd(workers, name_hint="sparse_gather_vf", sync_start=True) as attended:
+            _gather_sparse_vf_rows(
                 active_output, query, sink, window, compressed,
                 window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
                 balanced, cache_mode=compressed_keys,
             )
     else:
-        with pl.spmd(workers, name_hint="sparse_gather_vf", deps=[source_ready]) as attended:
-            computed_output, computed_partials = _gather_sparse_vf_rows(
+        with pl.spmd(workers, name_hint="sparse_gather_vf") as attended:
+            _gather_sparse_vf_rows(
                 active_output, query, sink, window, compressed,
                 window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
                 balanced, cache_mode=compressed_keys,
             )
     return attended
-
-
-
-SCALE = HEAD_DIM**-0.5
-
-
-SPARSE_VF_KEY_TILE = 128
-
-
-SPARSE_VF_GATHER_TILE = 32
-
-
-SPARSE_VF_HEAD_TILE = min(32, LOCAL_H)
-
-
-SPARSE_VF_CUBE_HEAD_TILE = max(16, SPARSE_VF_HEAD_TILE)
-
-
-SPARSE_VF_PIPE_HEAD_TILE = min(64, LOCAL_H)
-
-
-SPARSE_VF_PIPE_CUBE_HEAD_TILE = max(16, SPARSE_VF_PIPE_HEAD_TILE)
-
-
-SPARSE_VF_PIPE_SPLIT = 1 if LOCAL_H >= 32 else 0
-
-
-SPARSE_VF_PIPE_SLOT_BYTES = SPARSE_VF_PIPE_CUBE_HEAD_TILE * 256 * 4 // (2 if SPARSE_VF_PIPE_SPLIT else 1)
-
-
-SPARSE_VF_PIPE_BUFFER_BYTES = SPARSE_VF_PIPE_SLOT_BYTES * 2
-
-
-SPARSE_VF_REG_TILE = 128
-
-
-SPARSE_VF_FUSED_HEAD_TILE = min(64, LOCAL_H)
-
-
-SPARSE_VF_FUSED_CUBE_HEAD_TILE = max(16, SPARSE_VF_FUSED_HEAD_TILE)
-
-
-SPARSE_VF_FUSED_AIV_HEAD_TILE = SPARSE_VF_FUSED_CUBE_HEAD_TILE // 2
-
-
-SPARSE_VF_FUSED_GATHER_TILE = 16
-
-
-SPARSE_VF_FUSED_SCALE_TILE = 8
-# Decode two 16-row panels per packed FP4 chunk.
-SPARSE_VF_FUSED_FP4_SCALE_TILE = 16
-
-
-SPARSE_VF_WINDOW_GROUP = 32
-
-
-SPARSE_VF_COMPRESSED_GROUP = 16
-
-
-SPARSE_VF_WINDOW_GROUPS = HEAD_DIM // SPARSE_VF_WINDOW_GROUP
-
-
-SPARSE_VF_HALF_DIM = HEAD_DIM // 2
-
-
-SPARSE_VF_WINDOW_HALFWORDS = WINDOW_CACHE_BYTES // 2
-
-
-SPARSE_VF_COMPRESSED_HALFWORDS = COMPRESSED_CACHE_BYTES // 2
-
-
-SPARSE_VF_WINDOW_SCALE_OFFSET = HEAD_DIM // 2
-
-
-SPARSE_VF_COMPRESSED_SCALE_OFFSET = HEAD_DIM // 4
-
-
-SPARSE_VF_WINDOW_SCALE_END = SPARSE_VF_WINDOW_SCALE_OFFSET + SPARSE_VF_WINDOW_GROUPS
-
-
-SPARSE_VF_WINDOW_SHIFT = 5
-
-
-SPARSE_VF_WINDOW_STEP = SPARSE_VF_REG_TILE // SPARSE_VF_WINDOW_GROUP
-
-
-SPARSE_VF_COMPRESSED_STEP = SPARSE_VF_REG_TILE // SPARSE_VF_COMPRESSED_GROUP
-
-
-SPARSE_VF_WINDOW_SCALE_ROW_TILE = SPARSE_VF_REG_TILE // SPARSE_VF_WINDOW_GROUPS
 
 
 @pl.jit.inline(auto_scope=False)
@@ -224,12 +161,11 @@ def sparse_vf_decode_pypto(
     window_rows = pl.tensor.dim(window, 0) * 128
     window_flat = pl.reshape(window, [window_rows, WINDOW_CACHE_BYTES])
     if compressed_keys > 0:
-        # Window-only callers have no compressed-cache view.
         compressed_rows = pl.tensor.dim(compressed, 0) * 128
         compressed_flat = pl.reshape(compressed, [compressed_rows, COMPRESSED_CACHE_BYTES])
-    worker_limit = WORKERS
+    worker_limit = SPARSE_VF_WORKER_TILE
     if compressed_keys > 0:
-        worker_limit = 2 * WORKERS
+        worker_limit = 2 * SPARSE_VF_WORKER_TILE
     workers = pl.min(num_tokens * (keys // SPARSE_VF_GATHER_TILE), worker_limit)
     workers = pl.max(1, workers)
     # A register scope cannot share a kernel with matmul operations.
@@ -283,7 +219,7 @@ def sparse_vf_decode_pypto(
                 factor_flat = pl.reshape(
                     factors, [SPARSE_VF_GATHER_TILE * SPARSE_VF_WINDOW_GROUPS],
                 )
-                # Expand each scale table in registers before the BF16 multiply.
+                # Expand the scale table in registers.
                 with pl.reg_scope():
                     w_full = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
                     w_group = pl.reg.index_gen(0, lanes=SPARSE_VF_REG_TILE, dtype=pl.UINT16)
@@ -292,16 +228,16 @@ def sparse_vf_decode_pypto(
                         w_table_offset = w_table * SPARSE_VF_REG_TILE
                         w_table_values = pl.reg.load(factor_flat, w_table_offset, lanes=SPARSE_VF_REG_TILE)
                         w_table_bits = pl.reg.interpret_cast(w_table_values, dtype=pl.UINT16)
-                        for w_chunk in pl.hardware_loop(SPARSE_VF_REG_TILE // SPARSE_VF_WINDOW_STEP):
-                            w_base = pl.cast(w_chunk * SPARSE_VF_WINDOW_STEP, pl.UINT16)
+                        for w_chunk in pl.hardware_loop(SPARSE_VF_REG_TILE // SPARSE_VF_WINDOW_SCALE_TILE):
+                            w_base = pl.cast(w_chunk * SPARSE_VF_WINDOW_SCALE_TILE, pl.UINT16)
                             w_indices = pl.reg.adds(w_group, w_base, w_full)
                             w_lane_bits = pl.reg.gather_lanes(w_table_bits, w_indices)
                             w_factor = pl.reg.interpret_cast(w_lane_bits, dtype=pl.BF16)
-                            w_table_base = w_table * (SPARSE_VF_REG_TILE // SPARSE_VF_WINDOW_STEP)
+                            w_table_base = w_table * (SPARSE_VF_REG_TILE // SPARSE_VF_WINDOW_SCALE_TILE)
                             w_offset = (w_table_base + w_chunk) * SPARSE_VF_REG_TILE
                             w_value = pl.reg.load(value_flat, w_offset, lanes=SPARSE_VF_REG_TILE)
                             w_scaled = pl.reg.mul(w_value, w_factor, w_full)
-                            w_write = pl.reg.store(value_flat, w_offset, w_scaled)
+                            _w_write = pl.reg.store(value_flat, w_offset, w_scaled)
                 scaled_values = pl.reshape(value_flat, [SPARSE_VF_GATHER_TILE, HEAD_DIM])
                 pl.tile.store(scaled_values, [destination, 0], decoded)
             if compressed_keys > 0:
@@ -353,14 +289,14 @@ def sparse_vf_decode_pypto(
                             c_row_scale_offset = c_scale_row * SPARSE_VF_COMPRESSED_HALFWORDS
                             c_row_scale_offset = c_row_scale_offset + SPARSE_VF_COMPRESSED_SCALE_OFFSET
                             for c_scale_chunk in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
-                                c_scale_offset = c_row_scale_offset + c_scale_chunk * SPARSE_VF_COMPRESSED_STEP
-                                c_groups = pl.reg.load(c_factor_flat, c_scale_offset, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                c_scale_offset = c_row_scale_offset + c_scale_chunk * SPARSE_VF_COMPRESSED_SCALE_TILE
+                                c_groups = pl.reg.load(c_factor_flat, c_scale_offset, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                                 c_group_bits = pl.reg.group_broadcast(c_groups, lanes=SPARSE_VF_REG_TILE)
                                 c_factor = pl.reg.interpret_cast(c_group_bits, dtype=pl.BF16)
                                 c_offset = c_scale_row * HEAD_DIM + c_scale_chunk * SPARSE_VF_REG_TILE
                                 c_value = pl.reg.load(c_value_flat, c_offset, lanes=SPARSE_VF_REG_TILE)
                                 c_scaled = pl.reg.mul(c_value, c_factor, c_full)
-                                c_write = pl.reg.store(c_value_flat, c_offset, c_scaled)
+                                _c_write = pl.reg.store(c_value_flat, c_offset, c_scaled)
                     c_scaled_values = pl.reshape(c_value_flat, [SPARSE_VF_GATHER_TILE, HEAD_DIM])
                     pl.tile.store(c_scaled_values, [destination, 0], decoded)
     return gathered
@@ -370,7 +306,7 @@ def sparse_vf_decode_pypto(
 def sparse_vf_pipeline_worker_count(num_tokens: pl.Scalar[pl.INT32]):
     """Use the fewest clusters that preserve the existing maximum task count per cluster."""
     tasks = num_tokens * (LOCAL_H // SPARSE_VF_PIPE_HEAD_TILE)
-    waves = pl.max(1, (tasks + WORKERS - 1) // WORKERS)
+    waves = pl.max(1, (tasks + SPARSE_VF_WORKER_TILE - 1) // SPARSE_VF_WORKER_TILE)
     workers = pl.max(1, (tasks + waves - 1) // waves)
     return workers
 
@@ -487,7 +423,7 @@ def sparse_vf_pipeline_vector(
     c2v_buffer = pl.reserve_buffer(name="sparse_vf_pipeline_scores", size=SPARSE_VF_PIPE_BUFFER_BYTES)
     v2c_peer = pl.import_peer_buffer(name="sparse_vf_pipeline_weights", peer_func="sparse_vf_pipeline_cube")
     pl.aiv_initialize_pipe(c2v_consumer_buf=c2v_buffer, v2c_consumer_buf=v2c_peer, dir_mask=3, slot_size=SPARSE_VF_PIPE_SLOT_BYTES, slot_num=2)
-    keys = WINDOW_KEYS + compressed_keys
+    _keys = WINDOW_KEYS + compressed_keys
     workers = sparse_vf_pipeline_worker_count(num_tokens)
     worker = pl.tile.get_block_idx()
     for block in pl.range(worker, num_tokens * (LOCAL_H // SPARSE_VF_PIPE_HEAD_TILE), workers):
@@ -741,7 +677,7 @@ def sparse_vf_attend_pypto(
         sink_column = pl.reshape(sink, [1, LOCAL_H])
         workers = sparse_vf_pipeline_worker_count(num_tokens)
         with pl.spmd(workers, name_hint="sparse_vf_attend", deps=[decoded_ready]) as packed_attended:
-            pipeline_output = sparse_vf_pipeline_group(qflat, decoded, selected_ids, sink_column, oflat, num_tokens, compressed_keys=compressed_keys)
+            _pipeline_output = sparse_vf_pipeline_group(qflat, decoded, selected_ids, sink_column, oflat, num_tokens, compressed_keys=compressed_keys)
         attended = packed_attended
     else:
         keys = WINDOW_KEYS + compressed_keys
@@ -750,7 +686,7 @@ def sparse_vf_attend_pypto(
         qflat = pl.reshape(query, [tokens * LOCAL_H, HEAD_DIM])
         oflat = pl.reshape(output, [tokens * LOCAL_H, HEAD_DIM])
         sink_row = pl.reshape(sink, [1, LOCAL_H])
-        workers = pl.min(num_tokens * (LOCAL_H // SPARSE_VF_HEAD_TILE), WORKERS)
+        workers = pl.min(num_tokens * (LOCAL_H // SPARSE_VF_HEAD_TILE), SPARSE_VF_WORKER_TILE)
         workers = pl.max(1, workers)
         with pl.spmd(
             workers, name_hint="sparse_vf_attend", deps=[decoded_ready],
@@ -761,7 +697,7 @@ def sparse_vf_attend_pypto(
                 token = block // (LOCAL_H // SPARSE_VF_HEAD_TILE)
                 head = block % (LOCAL_H // SPARSE_VF_HEAD_TILE) * SPARSE_VF_HEAD_TILE
                 q0 = token * LOCAL_H + head
-                # Pad Cube rows without reading heads from the next token.
+                # Pad Cube rows within the current token.
                 q = pl.slice(qflat, [SPARSE_VF_CUBE_HEAD_TILE, HEAD_DIM], [q0, 0],
                              valid_shape=[SPARSE_VF_HEAD_TILE, HEAD_DIM])
                 maximum = pl.full([1, SPARSE_VF_CUBE_HEAD_TILE], dtype=pl.FP32, value=-1e30)
@@ -825,8 +761,8 @@ def sparse_vf_attend_pypto(
 def sparse_vf_fused_cube(qflat: pl.Tensor, window_indices: pl.Tensor, compressed_indices: pl.Tensor, window_flat: pl.Tensor, compressed_flat: pl.Tensor, sink_row: pl.Tensor, oflat: pl.Out[pl.Tensor], num_tokens: pl.Scalar[pl.INT32], compressed_keys: pl.constexpr):
     pl.func_attr({'split_aiv': True})
     keys = WINDOW_KEYS + compressed_keys
-    parts = keys // SPARSE_VF_KEY_TILE
-    workers = pl.min(num_tokens * (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE), WORKERS)
+    _parts = keys // SPARSE_VF_KEY_TILE
+    workers = pl.min(num_tokens * (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE), SPARSE_VF_WORKER_TILE)
     workers = pl.max(1, workers)
     if compressed_keys > 0:
         kv_ring = pl.system.reserve_buffer(name='sparse_kv_ring', size=262144)
@@ -1045,7 +981,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
     pl.func_attr({'split_aiv': True, 'dual_aiv_dispatch': True})
     keys = WINDOW_KEYS + compressed_keys
     parts = keys // SPARSE_VF_KEY_TILE
-    workers = pl.min(num_tokens * (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE), WORKERS)
+    workers = pl.min(num_tokens * (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE), SPARSE_VF_WORKER_TILE)
     workers = pl.max(1, workers)
     aiv_id = pl.tile.get_subblock_idx()
     pv_ring = pl.system.reserve_buffer(name='sparse_qk_ring', size=16384)
@@ -1279,8 +1215,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                 for raw_stream_0_fwa_row_r0_slot0_seed0 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                     for raw_stream_0_fwa_chunk_r0_slot0_seed0 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                         raw_stream_0_fwa_scale_offset_r0_slot0_seed0 = raw_stream_0_fwa_row_r0_slot0_seed0 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                        raw_stream_0_fwa_scale_offset_r0_slot0_seed0 = raw_stream_0_fwa_scale_offset_r0_slot0_seed0 + raw_stream_0_fwa_chunk_r0_slot0_seed0 * SPARSE_VF_WINDOW_STEP
-                        raw_stream_0_fwa_groups_r0_slot0_seed0 = pl.reg.load(fwa_scale_flat_slot0_seed0, raw_stream_0_fwa_scale_offset_r0_slot0_seed0, lanes=SPARSE_VF_WINDOW_STEP)
+                        raw_stream_0_fwa_scale_offset_r0_slot0_seed0 = raw_stream_0_fwa_scale_offset_r0_slot0_seed0 + raw_stream_0_fwa_chunk_r0_slot0_seed0 * SPARSE_VF_WINDOW_SCALE_TILE
+                        raw_stream_0_fwa_groups_r0_slot0_seed0 = pl.reg.load(fwa_scale_flat_slot0_seed0, raw_stream_0_fwa_scale_offset_r0_slot0_seed0, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                         raw_stream_0_fwa_factor_bits_r0_slot0_seed0 = pl.reg.group_broadcast(raw_stream_0_fwa_groups_r0_slot0_seed0, lanes=SPARSE_VF_REG_TILE)
                         raw_stream_0_fwa_factor_r0_slot0_seed0 = pl.reg.interpret_cast(raw_stream_0_fwa_factor_bits_r0_slot0_seed0, dtype=pl.BF16)
                         raw_stream_0_fwa_value_offset_r0_slot0_seed0 = raw_stream_0_fwa_row_r0_slot0_seed0 * HEAD_DIM + raw_stream_0_fwa_chunk_r0_slot0_seed0 * SPARSE_VF_REG_TILE
@@ -1288,7 +1224,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                         raw_stream_0_fwa_scaled_r0_slot0_seed0 = pl.reg.mul(raw_stream_0_fwa_value_r0_slot0_seed0, raw_stream_0_fwa_factor_r0_slot0_seed0, raw_stream_0_fwa_all_r0_slot0_seed0)
                         raw_stream_0_fwa_target_row_r0_slot0_seed0 = 0 + 0 + raw_stream_0_fwa_row_r0_slot0_seed0
                         raw_stream_0_fwa_target_offset_r0_slot0_seed0 = raw_stream_0_fwa_target_row_r0_slot0_seed0 * 16 + raw_stream_0_fwa_chunk_r0_slot0_seed0 * (32 * SPARSE_VF_REG_TILE)
-                        raw_stream_0_fwa_write_r0_slot0_seed0 = pl.reg.store(fwa_kv_flat_slot0_seed0, raw_stream_0_fwa_target_offset_r0_slot0_seed0, raw_stream_0_fwa_scaled_r0_slot0_seed0, raw_stream_0_fwa_all_r0_slot0_seed0, block_stride=32)
+                        _raw_stream_0_fwa_write_r0_slot0_seed0 = pl.reg.store(fwa_kv_flat_slot0_seed0, raw_stream_0_fwa_target_offset_r0_slot0_seed0, raw_stream_0_fwa_scaled_r0_slot0_seed0, raw_stream_0_fwa_all_r0_slot0_seed0, block_stride=32)
             fwa_raw_chunk_slot0_seed0 = pl.tile.slice(raw_current_window0_seed0, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [8, 0])
             fwa_signed_slot0_seed0 = pl.reinterpret_view(fwa_raw_chunk_slot0_seed0, pl.INT8)
             fwa_packed_slot0_seed0 = pl.reinterpret_view(fwa_signed_slot0_seed0, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
@@ -1304,8 +1240,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                 for raw_stream_1_fwa_row_r0_slot0_seed0 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                     for raw_stream_1_fwa_chunk_r0_slot0_seed0 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                         raw_stream_1_fwa_scale_offset_r0_slot0_seed0 = raw_stream_1_fwa_row_r0_slot0_seed0 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                        raw_stream_1_fwa_scale_offset_r0_slot0_seed0 = raw_stream_1_fwa_scale_offset_r0_slot0_seed0 + raw_stream_1_fwa_chunk_r0_slot0_seed0 * SPARSE_VF_WINDOW_STEP
-                        raw_stream_1_fwa_groups_r0_slot0_seed0 = pl.reg.load(fwa_scale_flat_slot0_seed0, raw_stream_1_fwa_scale_offset_r0_slot0_seed0, lanes=SPARSE_VF_WINDOW_STEP)
+                        raw_stream_1_fwa_scale_offset_r0_slot0_seed0 = raw_stream_1_fwa_scale_offset_r0_slot0_seed0 + raw_stream_1_fwa_chunk_r0_slot0_seed0 * SPARSE_VF_WINDOW_SCALE_TILE
+                        raw_stream_1_fwa_groups_r0_slot0_seed0 = pl.reg.load(fwa_scale_flat_slot0_seed0, raw_stream_1_fwa_scale_offset_r0_slot0_seed0, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                         raw_stream_1_fwa_factor_bits_r0_slot0_seed0 = pl.reg.group_broadcast(raw_stream_1_fwa_groups_r0_slot0_seed0, lanes=SPARSE_VF_REG_TILE)
                         raw_stream_1_fwa_factor_r0_slot0_seed0 = pl.reg.interpret_cast(raw_stream_1_fwa_factor_bits_r0_slot0_seed0, dtype=pl.BF16)
                         raw_stream_1_fwa_value_offset_r0_slot0_seed0 = raw_stream_1_fwa_row_r0_slot0_seed0 * HEAD_DIM + raw_stream_1_fwa_chunk_r0_slot0_seed0 * SPARSE_VF_REG_TILE
@@ -1313,7 +1249,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                         raw_stream_1_fwa_scaled_r0_slot0_seed0 = pl.reg.mul(raw_stream_1_fwa_value_r0_slot0_seed0, raw_stream_1_fwa_factor_r0_slot0_seed0, raw_stream_1_fwa_all_r0_slot0_seed0)
                         raw_stream_1_fwa_target_row_r0_slot0_seed0 = 0 + 8 + raw_stream_1_fwa_row_r0_slot0_seed0
                         raw_stream_1_fwa_target_offset_r0_slot0_seed0 = raw_stream_1_fwa_target_row_r0_slot0_seed0 * 16 + raw_stream_1_fwa_chunk_r0_slot0_seed0 * (32 * SPARSE_VF_REG_TILE)
-                        raw_stream_1_fwa_write_r0_slot0_seed0 = pl.reg.store(fwa_kv_flat_slot0_seed0, raw_stream_1_fwa_target_offset_r0_slot0_seed0, raw_stream_1_fwa_scaled_r0_slot0_seed0, raw_stream_1_fwa_all_r0_slot0_seed0, block_stride=32)
+                        _raw_stream_1_fwa_write_r0_slot0_seed0 = pl.reg.store(fwa_kv_flat_slot0_seed0, raw_stream_1_fwa_target_offset_r0_slot0_seed0, raw_stream_1_fwa_scaled_r0_slot0_seed0, raw_stream_1_fwa_all_r0_slot0_seed0, block_stride=32)
             fwa_raw_chunk_slot0_seed0 = pl.tile.slice(raw_current_window0_seed0, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [16, 0])
             fwa_signed_slot0_seed0 = pl.reinterpret_view(fwa_raw_chunk_slot0_seed0, pl.INT8)
             fwa_packed_slot0_seed0 = pl.reinterpret_view(fwa_signed_slot0_seed0, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
@@ -1329,8 +1265,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                 for raw_stream_2_fwa_row_r0_slot0_seed0 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                     for raw_stream_2_fwa_chunk_r0_slot0_seed0 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                         raw_stream_2_fwa_scale_offset_r0_slot0_seed0 = raw_stream_2_fwa_row_r0_slot0_seed0 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                        raw_stream_2_fwa_scale_offset_r0_slot0_seed0 = raw_stream_2_fwa_scale_offset_r0_slot0_seed0 + raw_stream_2_fwa_chunk_r0_slot0_seed0 * SPARSE_VF_WINDOW_STEP
-                        raw_stream_2_fwa_groups_r0_slot0_seed0 = pl.reg.load(fwa_scale_flat_slot0_seed0, raw_stream_2_fwa_scale_offset_r0_slot0_seed0, lanes=SPARSE_VF_WINDOW_STEP)
+                        raw_stream_2_fwa_scale_offset_r0_slot0_seed0 = raw_stream_2_fwa_scale_offset_r0_slot0_seed0 + raw_stream_2_fwa_chunk_r0_slot0_seed0 * SPARSE_VF_WINDOW_SCALE_TILE
+                        raw_stream_2_fwa_groups_r0_slot0_seed0 = pl.reg.load(fwa_scale_flat_slot0_seed0, raw_stream_2_fwa_scale_offset_r0_slot0_seed0, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                         raw_stream_2_fwa_factor_bits_r0_slot0_seed0 = pl.reg.group_broadcast(raw_stream_2_fwa_groups_r0_slot0_seed0, lanes=SPARSE_VF_REG_TILE)
                         raw_stream_2_fwa_factor_r0_slot0_seed0 = pl.reg.interpret_cast(raw_stream_2_fwa_factor_bits_r0_slot0_seed0, dtype=pl.BF16)
                         raw_stream_2_fwa_value_offset_r0_slot0_seed0 = raw_stream_2_fwa_row_r0_slot0_seed0 * HEAD_DIM + raw_stream_2_fwa_chunk_r0_slot0_seed0 * SPARSE_VF_REG_TILE
@@ -1338,7 +1274,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                         raw_stream_2_fwa_scaled_r0_slot0_seed0 = pl.reg.mul(raw_stream_2_fwa_value_r0_slot0_seed0, raw_stream_2_fwa_factor_r0_slot0_seed0, raw_stream_2_fwa_all_r0_slot0_seed0)
                         raw_stream_2_fwa_target_row_r0_slot0_seed0 = 0 + 16 + raw_stream_2_fwa_row_r0_slot0_seed0
                         raw_stream_2_fwa_target_offset_r0_slot0_seed0 = raw_stream_2_fwa_target_row_r0_slot0_seed0 * 16 + raw_stream_2_fwa_chunk_r0_slot0_seed0 * (32 * SPARSE_VF_REG_TILE)
-                        raw_stream_2_fwa_write_r0_slot0_seed0 = pl.reg.store(fwa_kv_flat_slot0_seed0, raw_stream_2_fwa_target_offset_r0_slot0_seed0, raw_stream_2_fwa_scaled_r0_slot0_seed0, raw_stream_2_fwa_all_r0_slot0_seed0, block_stride=32)
+                        _raw_stream_2_fwa_write_r0_slot0_seed0 = pl.reg.store(fwa_kv_flat_slot0_seed0, raw_stream_2_fwa_target_offset_r0_slot0_seed0, raw_stream_2_fwa_scaled_r0_slot0_seed0, raw_stream_2_fwa_all_r0_slot0_seed0, block_stride=32)
             fwa_raw_chunk_slot0_seed0 = pl.tile.slice(raw_current_window0_seed0, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [24, 0])
             fwa_signed_slot0_seed0 = pl.reinterpret_view(fwa_raw_chunk_slot0_seed0, pl.INT8)
             fwa_packed_slot0_seed0 = pl.reinterpret_view(fwa_signed_slot0_seed0, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
@@ -1354,8 +1290,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                 for raw_stream_3_fwa_row_r0_slot0_seed0 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                     for raw_stream_3_fwa_chunk_r0_slot0_seed0 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                         raw_stream_3_fwa_scale_offset_r0_slot0_seed0 = raw_stream_3_fwa_row_r0_slot0_seed0 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                        raw_stream_3_fwa_scale_offset_r0_slot0_seed0 = raw_stream_3_fwa_scale_offset_r0_slot0_seed0 + raw_stream_3_fwa_chunk_r0_slot0_seed0 * SPARSE_VF_WINDOW_STEP
-                        raw_stream_3_fwa_groups_r0_slot0_seed0 = pl.reg.load(fwa_scale_flat_slot0_seed0, raw_stream_3_fwa_scale_offset_r0_slot0_seed0, lanes=SPARSE_VF_WINDOW_STEP)
+                        raw_stream_3_fwa_scale_offset_r0_slot0_seed0 = raw_stream_3_fwa_scale_offset_r0_slot0_seed0 + raw_stream_3_fwa_chunk_r0_slot0_seed0 * SPARSE_VF_WINDOW_SCALE_TILE
+                        raw_stream_3_fwa_groups_r0_slot0_seed0 = pl.reg.load(fwa_scale_flat_slot0_seed0, raw_stream_3_fwa_scale_offset_r0_slot0_seed0, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                         raw_stream_3_fwa_factor_bits_r0_slot0_seed0 = pl.reg.group_broadcast(raw_stream_3_fwa_groups_r0_slot0_seed0, lanes=SPARSE_VF_REG_TILE)
                         raw_stream_3_fwa_factor_r0_slot0_seed0 = pl.reg.interpret_cast(raw_stream_3_fwa_factor_bits_r0_slot0_seed0, dtype=pl.BF16)
                         raw_stream_3_fwa_value_offset_r0_slot0_seed0 = raw_stream_3_fwa_row_r0_slot0_seed0 * HEAD_DIM + raw_stream_3_fwa_chunk_r0_slot0_seed0 * SPARSE_VF_REG_TILE
@@ -1363,7 +1299,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                         raw_stream_3_fwa_scaled_r0_slot0_seed0 = pl.reg.mul(raw_stream_3_fwa_value_r0_slot0_seed0, raw_stream_3_fwa_factor_r0_slot0_seed0, raw_stream_3_fwa_all_r0_slot0_seed0)
                         raw_stream_3_fwa_target_row_r0_slot0_seed0 = 0 + 24 + raw_stream_3_fwa_row_r0_slot0_seed0
                         raw_stream_3_fwa_target_offset_r0_slot0_seed0 = raw_stream_3_fwa_target_row_r0_slot0_seed0 * 16 + raw_stream_3_fwa_chunk_r0_slot0_seed0 * (32 * SPARSE_VF_REG_TILE)
-                        raw_stream_3_fwa_write_r0_slot0_seed0 = pl.reg.store(fwa_kv_flat_slot0_seed0, raw_stream_3_fwa_target_offset_r0_slot0_seed0, raw_stream_3_fwa_scaled_r0_slot0_seed0, raw_stream_3_fwa_all_r0_slot0_seed0, block_stride=32)
+                        _raw_stream_3_fwa_write_r0_slot0_seed0 = pl.reg.store(fwa_kv_flat_slot0_seed0, raw_stream_3_fwa_target_offset_r0_slot0_seed0, raw_stream_3_fwa_scaled_r0_slot0_seed0, raw_stream_3_fwa_all_r0_slot0_seed0, block_stride=32)
             kv_nz_seed0: pl.Tile[[32, HEAD_DIM], pl.BF16, pl.MemRef('sparse_raw_kv_nz'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.tile.create([32, HEAD_DIM], dtype=pl.BF16, target_memory=pl.Mem.Vec)
             pl.system.tpush_to_aic(kv_nz_seed0, split=1, id=1)
             if 1 + 2 < parts * 2:
@@ -1445,8 +1381,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                 for raw_stream_4_fwa_row_r0_slot1_seed1 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                     for raw_stream_4_fwa_chunk_r0_slot1_seed1 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                         raw_stream_4_fwa_scale_offset_r0_slot1_seed1 = raw_stream_4_fwa_row_r0_slot1_seed1 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                        raw_stream_4_fwa_scale_offset_r0_slot1_seed1 = raw_stream_4_fwa_scale_offset_r0_slot1_seed1 + raw_stream_4_fwa_chunk_r0_slot1_seed1 * SPARSE_VF_WINDOW_STEP
-                        raw_stream_4_fwa_groups_r0_slot1_seed1 = pl.reg.load(fwa_scale_flat_slot1_seed1, raw_stream_4_fwa_scale_offset_r0_slot1_seed1, lanes=SPARSE_VF_WINDOW_STEP)
+                        raw_stream_4_fwa_scale_offset_r0_slot1_seed1 = raw_stream_4_fwa_scale_offset_r0_slot1_seed1 + raw_stream_4_fwa_chunk_r0_slot1_seed1 * SPARSE_VF_WINDOW_SCALE_TILE
+                        raw_stream_4_fwa_groups_r0_slot1_seed1 = pl.reg.load(fwa_scale_flat_slot1_seed1, raw_stream_4_fwa_scale_offset_r0_slot1_seed1, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                         raw_stream_4_fwa_factor_bits_r0_slot1_seed1 = pl.reg.group_broadcast(raw_stream_4_fwa_groups_r0_slot1_seed1, lanes=SPARSE_VF_REG_TILE)
                         raw_stream_4_fwa_factor_r0_slot1_seed1 = pl.reg.interpret_cast(raw_stream_4_fwa_factor_bits_r0_slot1_seed1, dtype=pl.BF16)
                         raw_stream_4_fwa_value_offset_r0_slot1_seed1 = raw_stream_4_fwa_row_r0_slot1_seed1 * HEAD_DIM + raw_stream_4_fwa_chunk_r0_slot1_seed1 * SPARSE_VF_REG_TILE
@@ -1454,7 +1390,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                         raw_stream_4_fwa_scaled_r0_slot1_seed1 = pl.reg.mul(raw_stream_4_fwa_value_r0_slot1_seed1, raw_stream_4_fwa_factor_r0_slot1_seed1, raw_stream_4_fwa_all_r0_slot1_seed1)
                         raw_stream_4_fwa_target_row_r0_slot1_seed1 = 0 + 0 + raw_stream_4_fwa_row_r0_slot1_seed1
                         raw_stream_4_fwa_target_offset_r0_slot1_seed1 = raw_stream_4_fwa_target_row_r0_slot1_seed1 * 16 + raw_stream_4_fwa_chunk_r0_slot1_seed1 * (32 * SPARSE_VF_REG_TILE)
-                        raw_stream_4_fwa_write_r0_slot1_seed1 = pl.reg.store(fwa_kv_flat_slot1_seed1, raw_stream_4_fwa_target_offset_r0_slot1_seed1, raw_stream_4_fwa_scaled_r0_slot1_seed1, raw_stream_4_fwa_all_r0_slot1_seed1, block_stride=32)
+                        _raw_stream_4_fwa_write_r0_slot1_seed1 = pl.reg.store(fwa_kv_flat_slot1_seed1, raw_stream_4_fwa_target_offset_r0_slot1_seed1, raw_stream_4_fwa_scaled_r0_slot1_seed1, raw_stream_4_fwa_all_r0_slot1_seed1, block_stride=32)
             fwa_raw_chunk_slot1_seed1 = pl.tile.slice(raw_current_window1_seed1, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [8, 0])
             fwa_signed_slot1_seed1 = pl.reinterpret_view(fwa_raw_chunk_slot1_seed1, pl.INT8)
             fwa_packed_slot1_seed1 = pl.reinterpret_view(fwa_signed_slot1_seed1, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
@@ -1470,8 +1406,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                 for raw_stream_5_fwa_row_r0_slot1_seed1 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                     for raw_stream_5_fwa_chunk_r0_slot1_seed1 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                         raw_stream_5_fwa_scale_offset_r0_slot1_seed1 = raw_stream_5_fwa_row_r0_slot1_seed1 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                        raw_stream_5_fwa_scale_offset_r0_slot1_seed1 = raw_stream_5_fwa_scale_offset_r0_slot1_seed1 + raw_stream_5_fwa_chunk_r0_slot1_seed1 * SPARSE_VF_WINDOW_STEP
-                        raw_stream_5_fwa_groups_r0_slot1_seed1 = pl.reg.load(fwa_scale_flat_slot1_seed1, raw_stream_5_fwa_scale_offset_r0_slot1_seed1, lanes=SPARSE_VF_WINDOW_STEP)
+                        raw_stream_5_fwa_scale_offset_r0_slot1_seed1 = raw_stream_5_fwa_scale_offset_r0_slot1_seed1 + raw_stream_5_fwa_chunk_r0_slot1_seed1 * SPARSE_VF_WINDOW_SCALE_TILE
+                        raw_stream_5_fwa_groups_r0_slot1_seed1 = pl.reg.load(fwa_scale_flat_slot1_seed1, raw_stream_5_fwa_scale_offset_r0_slot1_seed1, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                         raw_stream_5_fwa_factor_bits_r0_slot1_seed1 = pl.reg.group_broadcast(raw_stream_5_fwa_groups_r0_slot1_seed1, lanes=SPARSE_VF_REG_TILE)
                         raw_stream_5_fwa_factor_r0_slot1_seed1 = pl.reg.interpret_cast(raw_stream_5_fwa_factor_bits_r0_slot1_seed1, dtype=pl.BF16)
                         raw_stream_5_fwa_value_offset_r0_slot1_seed1 = raw_stream_5_fwa_row_r0_slot1_seed1 * HEAD_DIM + raw_stream_5_fwa_chunk_r0_slot1_seed1 * SPARSE_VF_REG_TILE
@@ -1479,7 +1415,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                         raw_stream_5_fwa_scaled_r0_slot1_seed1 = pl.reg.mul(raw_stream_5_fwa_value_r0_slot1_seed1, raw_stream_5_fwa_factor_r0_slot1_seed1, raw_stream_5_fwa_all_r0_slot1_seed1)
                         raw_stream_5_fwa_target_row_r0_slot1_seed1 = 0 + 8 + raw_stream_5_fwa_row_r0_slot1_seed1
                         raw_stream_5_fwa_target_offset_r0_slot1_seed1 = raw_stream_5_fwa_target_row_r0_slot1_seed1 * 16 + raw_stream_5_fwa_chunk_r0_slot1_seed1 * (32 * SPARSE_VF_REG_TILE)
-                        raw_stream_5_fwa_write_r0_slot1_seed1 = pl.reg.store(fwa_kv_flat_slot1_seed1, raw_stream_5_fwa_target_offset_r0_slot1_seed1, raw_stream_5_fwa_scaled_r0_slot1_seed1, raw_stream_5_fwa_all_r0_slot1_seed1, block_stride=32)
+                        _raw_stream_5_fwa_write_r0_slot1_seed1 = pl.reg.store(fwa_kv_flat_slot1_seed1, raw_stream_5_fwa_target_offset_r0_slot1_seed1, raw_stream_5_fwa_scaled_r0_slot1_seed1, raw_stream_5_fwa_all_r0_slot1_seed1, block_stride=32)
             fwa_raw_chunk_slot1_seed1 = pl.tile.slice(raw_current_window1_seed1, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [16, 0])
             fwa_signed_slot1_seed1 = pl.reinterpret_view(fwa_raw_chunk_slot1_seed1, pl.INT8)
             fwa_packed_slot1_seed1 = pl.reinterpret_view(fwa_signed_slot1_seed1, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
@@ -1495,8 +1431,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                 for raw_stream_6_fwa_row_r0_slot1_seed1 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                     for raw_stream_6_fwa_chunk_r0_slot1_seed1 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                         raw_stream_6_fwa_scale_offset_r0_slot1_seed1 = raw_stream_6_fwa_row_r0_slot1_seed1 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                        raw_stream_6_fwa_scale_offset_r0_slot1_seed1 = raw_stream_6_fwa_scale_offset_r0_slot1_seed1 + raw_stream_6_fwa_chunk_r0_slot1_seed1 * SPARSE_VF_WINDOW_STEP
-                        raw_stream_6_fwa_groups_r0_slot1_seed1 = pl.reg.load(fwa_scale_flat_slot1_seed1, raw_stream_6_fwa_scale_offset_r0_slot1_seed1, lanes=SPARSE_VF_WINDOW_STEP)
+                        raw_stream_6_fwa_scale_offset_r0_slot1_seed1 = raw_stream_6_fwa_scale_offset_r0_slot1_seed1 + raw_stream_6_fwa_chunk_r0_slot1_seed1 * SPARSE_VF_WINDOW_SCALE_TILE
+                        raw_stream_6_fwa_groups_r0_slot1_seed1 = pl.reg.load(fwa_scale_flat_slot1_seed1, raw_stream_6_fwa_scale_offset_r0_slot1_seed1, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                         raw_stream_6_fwa_factor_bits_r0_slot1_seed1 = pl.reg.group_broadcast(raw_stream_6_fwa_groups_r0_slot1_seed1, lanes=SPARSE_VF_REG_TILE)
                         raw_stream_6_fwa_factor_r0_slot1_seed1 = pl.reg.interpret_cast(raw_stream_6_fwa_factor_bits_r0_slot1_seed1, dtype=pl.BF16)
                         raw_stream_6_fwa_value_offset_r0_slot1_seed1 = raw_stream_6_fwa_row_r0_slot1_seed1 * HEAD_DIM + raw_stream_6_fwa_chunk_r0_slot1_seed1 * SPARSE_VF_REG_TILE
@@ -1504,7 +1440,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                         raw_stream_6_fwa_scaled_r0_slot1_seed1 = pl.reg.mul(raw_stream_6_fwa_value_r0_slot1_seed1, raw_stream_6_fwa_factor_r0_slot1_seed1, raw_stream_6_fwa_all_r0_slot1_seed1)
                         raw_stream_6_fwa_target_row_r0_slot1_seed1 = 0 + 16 + raw_stream_6_fwa_row_r0_slot1_seed1
                         raw_stream_6_fwa_target_offset_r0_slot1_seed1 = raw_stream_6_fwa_target_row_r0_slot1_seed1 * 16 + raw_stream_6_fwa_chunk_r0_slot1_seed1 * (32 * SPARSE_VF_REG_TILE)
-                        raw_stream_6_fwa_write_r0_slot1_seed1 = pl.reg.store(fwa_kv_flat_slot1_seed1, raw_stream_6_fwa_target_offset_r0_slot1_seed1, raw_stream_6_fwa_scaled_r0_slot1_seed1, raw_stream_6_fwa_all_r0_slot1_seed1, block_stride=32)
+                        _raw_stream_6_fwa_write_r0_slot1_seed1 = pl.reg.store(fwa_kv_flat_slot1_seed1, raw_stream_6_fwa_target_offset_r0_slot1_seed1, raw_stream_6_fwa_scaled_r0_slot1_seed1, raw_stream_6_fwa_all_r0_slot1_seed1, block_stride=32)
             fwa_raw_chunk_slot1_seed1 = pl.tile.slice(raw_current_window1_seed1, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [24, 0])
             fwa_signed_slot1_seed1 = pl.reinterpret_view(fwa_raw_chunk_slot1_seed1, pl.INT8)
             fwa_packed_slot1_seed1 = pl.reinterpret_view(fwa_signed_slot1_seed1, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
@@ -1520,8 +1456,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                 for raw_stream_7_fwa_row_r0_slot1_seed1 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                     for raw_stream_7_fwa_chunk_r0_slot1_seed1 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                         raw_stream_7_fwa_scale_offset_r0_slot1_seed1 = raw_stream_7_fwa_row_r0_slot1_seed1 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                        raw_stream_7_fwa_scale_offset_r0_slot1_seed1 = raw_stream_7_fwa_scale_offset_r0_slot1_seed1 + raw_stream_7_fwa_chunk_r0_slot1_seed1 * SPARSE_VF_WINDOW_STEP
-                        raw_stream_7_fwa_groups_r0_slot1_seed1 = pl.reg.load(fwa_scale_flat_slot1_seed1, raw_stream_7_fwa_scale_offset_r0_slot1_seed1, lanes=SPARSE_VF_WINDOW_STEP)
+                        raw_stream_7_fwa_scale_offset_r0_slot1_seed1 = raw_stream_7_fwa_scale_offset_r0_slot1_seed1 + raw_stream_7_fwa_chunk_r0_slot1_seed1 * SPARSE_VF_WINDOW_SCALE_TILE
+                        raw_stream_7_fwa_groups_r0_slot1_seed1 = pl.reg.load(fwa_scale_flat_slot1_seed1, raw_stream_7_fwa_scale_offset_r0_slot1_seed1, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                         raw_stream_7_fwa_factor_bits_r0_slot1_seed1 = pl.reg.group_broadcast(raw_stream_7_fwa_groups_r0_slot1_seed1, lanes=SPARSE_VF_REG_TILE)
                         raw_stream_7_fwa_factor_r0_slot1_seed1 = pl.reg.interpret_cast(raw_stream_7_fwa_factor_bits_r0_slot1_seed1, dtype=pl.BF16)
                         raw_stream_7_fwa_value_offset_r0_slot1_seed1 = raw_stream_7_fwa_row_r0_slot1_seed1 * HEAD_DIM + raw_stream_7_fwa_chunk_r0_slot1_seed1 * SPARSE_VF_REG_TILE
@@ -1529,7 +1465,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                         raw_stream_7_fwa_scaled_r0_slot1_seed1 = pl.reg.mul(raw_stream_7_fwa_value_r0_slot1_seed1, raw_stream_7_fwa_factor_r0_slot1_seed1, raw_stream_7_fwa_all_r0_slot1_seed1)
                         raw_stream_7_fwa_target_row_r0_slot1_seed1 = 0 + 24 + raw_stream_7_fwa_row_r0_slot1_seed1
                         raw_stream_7_fwa_target_offset_r0_slot1_seed1 = raw_stream_7_fwa_target_row_r0_slot1_seed1 * 16 + raw_stream_7_fwa_chunk_r0_slot1_seed1 * (32 * SPARSE_VF_REG_TILE)
-                        raw_stream_7_fwa_write_r0_slot1_seed1 = pl.reg.store(fwa_kv_flat_slot1_seed1, raw_stream_7_fwa_target_offset_r0_slot1_seed1, raw_stream_7_fwa_scaled_r0_slot1_seed1, raw_stream_7_fwa_all_r0_slot1_seed1, block_stride=32)
+                        _raw_stream_7_fwa_write_r0_slot1_seed1 = pl.reg.store(fwa_kv_flat_slot1_seed1, raw_stream_7_fwa_target_offset_r0_slot1_seed1, raw_stream_7_fwa_scaled_r0_slot1_seed1, raw_stream_7_fwa_all_r0_slot1_seed1, block_stride=32)
             kv_nz_seed1: pl.Tile[[32, HEAD_DIM], pl.BF16, pl.MemRef('sparse_raw_kv_nz'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.tile.create([32, HEAD_DIM], dtype=pl.BF16, target_memory=pl.Mem.Vec)
             pl.system.tpush_to_aic(kv_nz_seed1, split=1, id=1)
             if 2 + 2 < parts * 2:
@@ -1611,8 +1547,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                 for raw_stream_8_fca_row_r4_slot2_seed2 in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                     for raw_stream_8_fca_chunk_r4_slot2_seed2 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                         raw_stream_8_fca_scale_offset_r4_slot2_seed2 = raw_stream_8_fca_row_r4_slot2_seed2 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                        raw_stream_8_fca_scale_offset_r4_slot2_seed2 = raw_stream_8_fca_scale_offset_r4_slot2_seed2 + raw_stream_8_fca_chunk_r4_slot2_seed2 * SPARSE_VF_COMPRESSED_STEP
-                        raw_stream_8_fca_groups_r4_slot2_seed2 = pl.reg.load(fca_scale_flat_slot2_seed2, raw_stream_8_fca_scale_offset_r4_slot2_seed2, lanes=SPARSE_VF_COMPRESSED_STEP)
+                        raw_stream_8_fca_scale_offset_r4_slot2_seed2 = raw_stream_8_fca_scale_offset_r4_slot2_seed2 + raw_stream_8_fca_chunk_r4_slot2_seed2 * SPARSE_VF_COMPRESSED_SCALE_TILE
+                        raw_stream_8_fca_groups_r4_slot2_seed2 = pl.reg.load(fca_scale_flat_slot2_seed2, raw_stream_8_fca_scale_offset_r4_slot2_seed2, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                         raw_stream_8_fca_factor_bits_r4_slot2_seed2 = pl.reg.group_broadcast(raw_stream_8_fca_groups_r4_slot2_seed2, lanes=SPARSE_VF_REG_TILE)
                         raw_stream_8_fca_factor_r4_slot2_seed2 = pl.reg.interpret_cast(raw_stream_8_fca_factor_bits_r4_slot2_seed2, dtype=pl.BF16)
                         raw_stream_8_fca_value_offset_r4_slot2_seed2 = raw_stream_8_fca_row_r4_slot2_seed2 * HEAD_DIM + raw_stream_8_fca_chunk_r4_slot2_seed2 * SPARSE_VF_REG_TILE
@@ -1620,7 +1556,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                         raw_stream_8_fca_scaled_r4_slot2_seed2 = pl.reg.mul(raw_stream_8_fca_value_r4_slot2_seed2, raw_stream_8_fca_factor_r4_slot2_seed2, raw_stream_8_fca_all_r4_slot2_seed2)
                         raw_stream_8_fca_target_row_r4_slot2_seed2 = 0 + 0 + raw_stream_8_fca_row_r4_slot2_seed2
                         raw_stream_8_fca_target_offset_r4_slot2_seed2 = raw_stream_8_fca_target_row_r4_slot2_seed2 * 16 + raw_stream_8_fca_chunk_r4_slot2_seed2 * (32 * SPARSE_VF_REG_TILE)
-                        raw_stream_8_fca_write_r4_slot2_seed2 = pl.reg.store(fca_kv_flat_slot2_seed2, raw_stream_8_fca_target_offset_r4_slot2_seed2, raw_stream_8_fca_scaled_r4_slot2_seed2, raw_stream_8_fca_all_r4_slot2_seed2, block_stride=32)
+                        _raw_stream_8_fca_write_r4_slot2_seed2 = pl.reg.store(fca_kv_flat_slot2_seed2, raw_stream_8_fca_target_offset_r4_slot2_seed2, raw_stream_8_fca_scaled_r4_slot2_seed2, raw_stream_8_fca_all_r4_slot2_seed2, block_stride=32)
             fca_raw_chunk_slot2_seed2 = pl.tile.slice(raw_current_compressed2_seed2, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
             fca_packed_slot2_seed2 = pl.reinterpret_view(fca_raw_chunk_slot2_seed2, pl.FP4E2M1X2)
             fca_codes_slot2_seed2 = fca_packed_slot2_seed2[:, :SPARSE_VF_HALF_DIM]
@@ -1634,8 +1570,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                 for raw_stream_10_fca_row_r4_slot2_seed2 in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                     for raw_stream_10_fca_chunk_r4_slot2_seed2 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                         raw_stream_10_fca_scale_offset_r4_slot2_seed2 = raw_stream_10_fca_row_r4_slot2_seed2 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                        raw_stream_10_fca_scale_offset_r4_slot2_seed2 = raw_stream_10_fca_scale_offset_r4_slot2_seed2 + raw_stream_10_fca_chunk_r4_slot2_seed2 * SPARSE_VF_COMPRESSED_STEP
-                        raw_stream_10_fca_groups_r4_slot2_seed2 = pl.reg.load(fca_scale_flat_slot2_seed2, raw_stream_10_fca_scale_offset_r4_slot2_seed2, lanes=SPARSE_VF_COMPRESSED_STEP)
+                        raw_stream_10_fca_scale_offset_r4_slot2_seed2 = raw_stream_10_fca_scale_offset_r4_slot2_seed2 + raw_stream_10_fca_chunk_r4_slot2_seed2 * SPARSE_VF_COMPRESSED_SCALE_TILE
+                        raw_stream_10_fca_groups_r4_slot2_seed2 = pl.reg.load(fca_scale_flat_slot2_seed2, raw_stream_10_fca_scale_offset_r4_slot2_seed2, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                         raw_stream_10_fca_factor_bits_r4_slot2_seed2 = pl.reg.group_broadcast(raw_stream_10_fca_groups_r4_slot2_seed2, lanes=SPARSE_VF_REG_TILE)
                         raw_stream_10_fca_factor_r4_slot2_seed2 = pl.reg.interpret_cast(raw_stream_10_fca_factor_bits_r4_slot2_seed2, dtype=pl.BF16)
                         raw_stream_10_fca_value_offset_r4_slot2_seed2 = raw_stream_10_fca_row_r4_slot2_seed2 * HEAD_DIM + raw_stream_10_fca_chunk_r4_slot2_seed2 * SPARSE_VF_REG_TILE
@@ -1643,7 +1579,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                         raw_stream_10_fca_scaled_r4_slot2_seed2 = pl.reg.mul(raw_stream_10_fca_value_r4_slot2_seed2, raw_stream_10_fca_factor_r4_slot2_seed2, raw_stream_10_fca_all_r4_slot2_seed2)
                         raw_stream_10_fca_target_row_r4_slot2_seed2 = 0 + 16 + raw_stream_10_fca_row_r4_slot2_seed2
                         raw_stream_10_fca_target_offset_r4_slot2_seed2 = raw_stream_10_fca_target_row_r4_slot2_seed2 * 16 + raw_stream_10_fca_chunk_r4_slot2_seed2 * (32 * SPARSE_VF_REG_TILE)
-                        raw_stream_10_fca_write_r4_slot2_seed2 = pl.reg.store(fca_kv_flat_slot2_seed2, raw_stream_10_fca_target_offset_r4_slot2_seed2, raw_stream_10_fca_scaled_r4_slot2_seed2, raw_stream_10_fca_all_r4_slot2_seed2, block_stride=32)
+                        _raw_stream_10_fca_write_r4_slot2_seed2 = pl.reg.store(fca_kv_flat_slot2_seed2, raw_stream_10_fca_target_offset_r4_slot2_seed2, raw_stream_10_fca_scaled_r4_slot2_seed2, raw_stream_10_fca_all_r4_slot2_seed2, block_stride=32)
             kv_nz_seed2: pl.Tile[[32, HEAD_DIM], pl.BF16, pl.MemRef('sparse_raw_kv_nz'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.tile.create([32, HEAD_DIM], dtype=pl.BF16, target_memory=pl.Mem.Vec)
             pl.system.tpush_to_aic(kv_nz_seed2, split=1, id=1)
             if 3 + 2 < parts * 2:
@@ -1725,8 +1661,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                 for raw_stream_12_fca_row_r4_slot0_seed3 in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                     for raw_stream_12_fca_chunk_r4_slot0_seed3 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                         raw_stream_12_fca_scale_offset_r4_slot0_seed3 = raw_stream_12_fca_row_r4_slot0_seed3 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                        raw_stream_12_fca_scale_offset_r4_slot0_seed3 = raw_stream_12_fca_scale_offset_r4_slot0_seed3 + raw_stream_12_fca_chunk_r4_slot0_seed3 * SPARSE_VF_COMPRESSED_STEP
-                        raw_stream_12_fca_groups_r4_slot0_seed3 = pl.reg.load(fca_scale_flat_slot0_seed3, raw_stream_12_fca_scale_offset_r4_slot0_seed3, lanes=SPARSE_VF_COMPRESSED_STEP)
+                        raw_stream_12_fca_scale_offset_r4_slot0_seed3 = raw_stream_12_fca_scale_offset_r4_slot0_seed3 + raw_stream_12_fca_chunk_r4_slot0_seed3 * SPARSE_VF_COMPRESSED_SCALE_TILE
+                        raw_stream_12_fca_groups_r4_slot0_seed3 = pl.reg.load(fca_scale_flat_slot0_seed3, raw_stream_12_fca_scale_offset_r4_slot0_seed3, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                         raw_stream_12_fca_factor_bits_r4_slot0_seed3 = pl.reg.group_broadcast(raw_stream_12_fca_groups_r4_slot0_seed3, lanes=SPARSE_VF_REG_TILE)
                         raw_stream_12_fca_factor_r4_slot0_seed3 = pl.reg.interpret_cast(raw_stream_12_fca_factor_bits_r4_slot0_seed3, dtype=pl.BF16)
                         raw_stream_12_fca_value_offset_r4_slot0_seed3 = raw_stream_12_fca_row_r4_slot0_seed3 * HEAD_DIM + raw_stream_12_fca_chunk_r4_slot0_seed3 * SPARSE_VF_REG_TILE
@@ -1734,7 +1670,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                         raw_stream_12_fca_scaled_r4_slot0_seed3 = pl.reg.mul(raw_stream_12_fca_value_r4_slot0_seed3, raw_stream_12_fca_factor_r4_slot0_seed3, raw_stream_12_fca_all_r4_slot0_seed3)
                         raw_stream_12_fca_target_row_r4_slot0_seed3 = 0 + 0 + raw_stream_12_fca_row_r4_slot0_seed3
                         raw_stream_12_fca_target_offset_r4_slot0_seed3 = raw_stream_12_fca_target_row_r4_slot0_seed3 * 16 + raw_stream_12_fca_chunk_r4_slot0_seed3 * (32 * SPARSE_VF_REG_TILE)
-                        raw_stream_12_fca_write_r4_slot0_seed3 = pl.reg.store(fca_kv_flat_slot0_seed3, raw_stream_12_fca_target_offset_r4_slot0_seed3, raw_stream_12_fca_scaled_r4_slot0_seed3, raw_stream_12_fca_all_r4_slot0_seed3, block_stride=32)
+                        _raw_stream_12_fca_write_r4_slot0_seed3 = pl.reg.store(fca_kv_flat_slot0_seed3, raw_stream_12_fca_target_offset_r4_slot0_seed3, raw_stream_12_fca_scaled_r4_slot0_seed3, raw_stream_12_fca_all_r4_slot0_seed3, block_stride=32)
             fca_raw_chunk_slot0_seed3 = pl.tile.slice(raw_current_compressed0_seed3, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
             fca_packed_slot0_seed3 = pl.reinterpret_view(fca_raw_chunk_slot0_seed3, pl.FP4E2M1X2)
             fca_codes_slot0_seed3 = fca_packed_slot0_seed3[:, :SPARSE_VF_HALF_DIM]
@@ -1748,8 +1684,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                 for raw_stream_14_fca_row_r4_slot0_seed3 in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                     for raw_stream_14_fca_chunk_r4_slot0_seed3 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                         raw_stream_14_fca_scale_offset_r4_slot0_seed3 = raw_stream_14_fca_row_r4_slot0_seed3 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                        raw_stream_14_fca_scale_offset_r4_slot0_seed3 = raw_stream_14_fca_scale_offset_r4_slot0_seed3 + raw_stream_14_fca_chunk_r4_slot0_seed3 * SPARSE_VF_COMPRESSED_STEP
-                        raw_stream_14_fca_groups_r4_slot0_seed3 = pl.reg.load(fca_scale_flat_slot0_seed3, raw_stream_14_fca_scale_offset_r4_slot0_seed3, lanes=SPARSE_VF_COMPRESSED_STEP)
+                        raw_stream_14_fca_scale_offset_r4_slot0_seed3 = raw_stream_14_fca_scale_offset_r4_slot0_seed3 + raw_stream_14_fca_chunk_r4_slot0_seed3 * SPARSE_VF_COMPRESSED_SCALE_TILE
+                        raw_stream_14_fca_groups_r4_slot0_seed3 = pl.reg.load(fca_scale_flat_slot0_seed3, raw_stream_14_fca_scale_offset_r4_slot0_seed3, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                         raw_stream_14_fca_factor_bits_r4_slot0_seed3 = pl.reg.group_broadcast(raw_stream_14_fca_groups_r4_slot0_seed3, lanes=SPARSE_VF_REG_TILE)
                         raw_stream_14_fca_factor_r4_slot0_seed3 = pl.reg.interpret_cast(raw_stream_14_fca_factor_bits_r4_slot0_seed3, dtype=pl.BF16)
                         raw_stream_14_fca_value_offset_r4_slot0_seed3 = raw_stream_14_fca_row_r4_slot0_seed3 * HEAD_DIM + raw_stream_14_fca_chunk_r4_slot0_seed3 * SPARSE_VF_REG_TILE
@@ -1757,7 +1693,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                         raw_stream_14_fca_scaled_r4_slot0_seed3 = pl.reg.mul(raw_stream_14_fca_value_r4_slot0_seed3, raw_stream_14_fca_factor_r4_slot0_seed3, raw_stream_14_fca_all_r4_slot0_seed3)
                         raw_stream_14_fca_target_row_r4_slot0_seed3 = 0 + 16 + raw_stream_14_fca_row_r4_slot0_seed3
                         raw_stream_14_fca_target_offset_r4_slot0_seed3 = raw_stream_14_fca_target_row_r4_slot0_seed3 * 16 + raw_stream_14_fca_chunk_r4_slot0_seed3 * (32 * SPARSE_VF_REG_TILE)
-                        raw_stream_14_fca_write_r4_slot0_seed3 = pl.reg.store(fca_kv_flat_slot0_seed3, raw_stream_14_fca_target_offset_r4_slot0_seed3, raw_stream_14_fca_scaled_r4_slot0_seed3, raw_stream_14_fca_all_r4_slot0_seed3, block_stride=32)
+                        _raw_stream_14_fca_write_r4_slot0_seed3 = pl.reg.store(fca_kv_flat_slot0_seed3, raw_stream_14_fca_target_offset_r4_slot0_seed3, raw_stream_14_fca_scaled_r4_slot0_seed3, raw_stream_14_fca_all_r4_slot0_seed3, block_stride=32)
             kv_nz_seed3: pl.Tile[[32, HEAD_DIM], pl.BF16, pl.MemRef('sparse_raw_kv_nz'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.tile.create([32, HEAD_DIM], dtype=pl.BF16, target_memory=pl.Mem.Vec)
             pl.system.tpush_to_aic(kv_nz_seed3, split=1, id=1)
             for part in pl.range(parts):
@@ -1771,7 +1707,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                 else:
                     qk_half = pl.system.tpop_from_aic(shape=[SPARSE_VF_FUSED_AIV_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.FP32, split=1, id=0)
                 scores = pl.mul(qk_half, SCALE)
-                # The assembled scores own their data, so Cube can reuse the FIFO during softmax.
+                # Copy scores before releasing the Cube FIFO.
                 if compressed_keys > 0:
                     pl.system.tfree_to_aic(qk_half_a, id=0)
                     pl.system.tfree_to_aic(qk_half_b, id=0)
@@ -1828,11 +1764,11 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                         raw_stream_16_sm_new_den = pl.reg.add(raw_stream_16_sm_corrected_den, raw_stream_16_sm_tile_sum, raw_stream_16_sm_one)
                         raw_stream_16_sm_bf16_0 = pl.reg.convert(raw_stream_16_sm_probability0, dtype=pl.BF16, rounding='R', saturate=False)
                         raw_stream_16_sm_bf16_1 = pl.reg.convert(raw_stream_16_sm_probability1, dtype=pl.BF16, rounding='R', saturate=False)
-                        raw_stream_16_sm_store_p0 = pl.reg.store(sm_weights_flat, raw_stream_16_sm_offset, raw_stream_16_sm_bf16_0)
-                        raw_stream_16_sm_store_p1 = pl.reg.store(sm_weights_flat, raw_stream_16_sm_offset + 64, raw_stream_16_sm_bf16_1)
-                        raw_stream_16_sm_store_m = pl.reg.store(sm_next_max_flat, raw_stream_16_sm_row, raw_stream_16_sm_new_max)
-                        raw_stream_16_sm_store_l = pl.reg.store(sm_next_den_flat, raw_stream_16_sm_row, raw_stream_16_sm_new_den)
-                        raw_stream_16_sm_store_c = pl.reg.store(sm_correction_flat, raw_stream_16_sm_row, raw_stream_16_sm_alpha)
+                        _raw_stream_16_sm_store_p0 = pl.reg.store(sm_weights_flat, raw_stream_16_sm_offset, raw_stream_16_sm_bf16_0)
+                        _raw_stream_16_sm_store_p1 = pl.reg.store(sm_weights_flat, raw_stream_16_sm_offset + 64, raw_stream_16_sm_bf16_1)
+                        _raw_stream_16_sm_store_m = pl.reg.store(sm_next_max_flat, raw_stream_16_sm_row, raw_stream_16_sm_new_max)
+                        _raw_stream_16_sm_store_l = pl.reg.store(sm_next_den_flat, raw_stream_16_sm_row, raw_stream_16_sm_new_den)
+                        _raw_stream_16_sm_store_c = pl.reg.store(sm_correction_flat, raw_stream_16_sm_row, raw_stream_16_sm_alpha)
                 maximum = next_max
                 denominator = next_denominator
                 pl.system.tpush_to_aic(weights, split=1, id=2)
@@ -2042,8 +1978,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                             for raw_stream_17_fca_row_r4_slot0_part_a in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_17_fca_chunk_r4_slot0_part_a in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_17_fca_scale_offset_r4_slot0_part_a = raw_stream_17_fca_row_r4_slot0_part_a * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_17_fca_scale_offset_r4_slot0_part_a = raw_stream_17_fca_scale_offset_r4_slot0_part_a + raw_stream_17_fca_chunk_r4_slot0_part_a * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_17_fca_groups_r4_slot0_part_a = pl.reg.load(fca_scale_flat_slot0_part_a, raw_stream_17_fca_scale_offset_r4_slot0_part_a, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                    raw_stream_17_fca_scale_offset_r4_slot0_part_a = raw_stream_17_fca_scale_offset_r4_slot0_part_a + raw_stream_17_fca_chunk_r4_slot0_part_a * SPARSE_VF_COMPRESSED_SCALE_TILE
+                                    raw_stream_17_fca_groups_r4_slot0_part_a = pl.reg.load(fca_scale_flat_slot0_part_a, raw_stream_17_fca_scale_offset_r4_slot0_part_a, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                                     raw_stream_17_fca_factor_bits_r4_slot0_part_a = pl.reg.group_broadcast(raw_stream_17_fca_groups_r4_slot0_part_a, lanes=SPARSE_VF_REG_TILE)
                                     raw_stream_17_fca_factor_r4_slot0_part_a = pl.reg.interpret_cast(raw_stream_17_fca_factor_bits_r4_slot0_part_a, dtype=pl.BF16)
                                     raw_stream_17_fca_value_offset_r4_slot0_part_a = raw_stream_17_fca_row_r4_slot0_part_a * HEAD_DIM + raw_stream_17_fca_chunk_r4_slot0_part_a * SPARSE_VF_REG_TILE
@@ -2051,7 +1987,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_17_fca_scaled_r4_slot0_part_a = pl.reg.mul(raw_stream_17_fca_value_r4_slot0_part_a, raw_stream_17_fca_factor_r4_slot0_part_a, raw_stream_17_fca_all_r4_slot0_part_a)
                                     raw_stream_17_fca_target_row_r4_slot0_part_a = 0 + 0 + raw_stream_17_fca_row_r4_slot0_part_a
                                     raw_stream_17_fca_target_offset_r4_slot0_part_a = raw_stream_17_fca_target_row_r4_slot0_part_a * 16 + raw_stream_17_fca_chunk_r4_slot0_part_a * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_17_fca_write_r4_slot0_part_a = pl.reg.store(fca_kv_flat_slot0_part_a, raw_stream_17_fca_target_offset_r4_slot0_part_a, raw_stream_17_fca_scaled_r4_slot0_part_a, raw_stream_17_fca_all_r4_slot0_part_a, block_stride=32)
+                                    _raw_stream_17_fca_write_r4_slot0_part_a = pl.reg.store(fca_kv_flat_slot0_part_a, raw_stream_17_fca_target_offset_r4_slot0_part_a, raw_stream_17_fca_scaled_r4_slot0_part_a, raw_stream_17_fca_all_r4_slot0_part_a, block_stride=32)
                         fca_raw_chunk_slot0_part_a = pl.tile.slice(raw_current_compressed0_part_a, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
                         fca_packed_slot0_part_a = pl.reinterpret_view(fca_raw_chunk_slot0_part_a, pl.FP4E2M1X2)
                         fca_codes_slot0_part_a = fca_packed_slot0_part_a[:, :SPARSE_VF_HALF_DIM]
@@ -2065,8 +2001,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                             for raw_stream_19_fca_row_r4_slot0_part_a in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_19_fca_chunk_r4_slot0_part_a in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_19_fca_scale_offset_r4_slot0_part_a = raw_stream_19_fca_row_r4_slot0_part_a * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_19_fca_scale_offset_r4_slot0_part_a = raw_stream_19_fca_scale_offset_r4_slot0_part_a + raw_stream_19_fca_chunk_r4_slot0_part_a * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_19_fca_groups_r4_slot0_part_a = pl.reg.load(fca_scale_flat_slot0_part_a, raw_stream_19_fca_scale_offset_r4_slot0_part_a, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                    raw_stream_19_fca_scale_offset_r4_slot0_part_a = raw_stream_19_fca_scale_offset_r4_slot0_part_a + raw_stream_19_fca_chunk_r4_slot0_part_a * SPARSE_VF_COMPRESSED_SCALE_TILE
+                                    raw_stream_19_fca_groups_r4_slot0_part_a = pl.reg.load(fca_scale_flat_slot0_part_a, raw_stream_19_fca_scale_offset_r4_slot0_part_a, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                                     raw_stream_19_fca_factor_bits_r4_slot0_part_a = pl.reg.group_broadcast(raw_stream_19_fca_groups_r4_slot0_part_a, lanes=SPARSE_VF_REG_TILE)
                                     raw_stream_19_fca_factor_r4_slot0_part_a = pl.reg.interpret_cast(raw_stream_19_fca_factor_bits_r4_slot0_part_a, dtype=pl.BF16)
                                     raw_stream_19_fca_value_offset_r4_slot0_part_a = raw_stream_19_fca_row_r4_slot0_part_a * HEAD_DIM + raw_stream_19_fca_chunk_r4_slot0_part_a * SPARSE_VF_REG_TILE
@@ -2074,7 +2010,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_19_fca_scaled_r4_slot0_part_a = pl.reg.mul(raw_stream_19_fca_value_r4_slot0_part_a, raw_stream_19_fca_factor_r4_slot0_part_a, raw_stream_19_fca_all_r4_slot0_part_a)
                                     raw_stream_19_fca_target_row_r4_slot0_part_a = 0 + 16 + raw_stream_19_fca_row_r4_slot0_part_a
                                     raw_stream_19_fca_target_offset_r4_slot0_part_a = raw_stream_19_fca_target_row_r4_slot0_part_a * 16 + raw_stream_19_fca_chunk_r4_slot0_part_a * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_19_fca_write_r4_slot0_part_a = pl.reg.store(fca_kv_flat_slot0_part_a, raw_stream_19_fca_target_offset_r4_slot0_part_a, raw_stream_19_fca_scaled_r4_slot0_part_a, raw_stream_19_fca_all_r4_slot0_part_a, block_stride=32)
+                                    _raw_stream_19_fca_write_r4_slot0_part_a = pl.reg.store(fca_kv_flat_slot0_part_a, raw_stream_19_fca_target_offset_r4_slot0_part_a, raw_stream_19_fca_scaled_r4_slot0_part_a, raw_stream_19_fca_all_r4_slot0_part_a, block_stride=32)
                     elif 2 * (part + 2) % 3 == 1:
                         raw_current_compressed1_flat_part_a: pl.Tile[[1, 17408], pl.UINT8, pl.MemRef('sparse_raw3', slots=3)[1], pl.Mem.Vec] = pl.tile.create([1, 17408], dtype=pl.UINT8, target_memory=pl.Mem.Vec)
                         raw_current_compressed1_prefix_part_a = pl.tile.slice(raw_current_compressed1_flat_part_a, [1, 10240], [0, 0])
@@ -2092,8 +2028,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                             for raw_stream_25_fca_row_r4_slot1_part_a in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_25_fca_chunk_r4_slot1_part_a in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_25_fca_scale_offset_r4_slot1_part_a = raw_stream_25_fca_row_r4_slot1_part_a * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_25_fca_scale_offset_r4_slot1_part_a = raw_stream_25_fca_scale_offset_r4_slot1_part_a + raw_stream_25_fca_chunk_r4_slot1_part_a * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_25_fca_groups_r4_slot1_part_a = pl.reg.load(fca_scale_flat_slot1_part_a, raw_stream_25_fca_scale_offset_r4_slot1_part_a, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                    raw_stream_25_fca_scale_offset_r4_slot1_part_a = raw_stream_25_fca_scale_offset_r4_slot1_part_a + raw_stream_25_fca_chunk_r4_slot1_part_a * SPARSE_VF_COMPRESSED_SCALE_TILE
+                                    raw_stream_25_fca_groups_r4_slot1_part_a = pl.reg.load(fca_scale_flat_slot1_part_a, raw_stream_25_fca_scale_offset_r4_slot1_part_a, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                                     raw_stream_25_fca_factor_bits_r4_slot1_part_a = pl.reg.group_broadcast(raw_stream_25_fca_groups_r4_slot1_part_a, lanes=SPARSE_VF_REG_TILE)
                                     raw_stream_25_fca_factor_r4_slot1_part_a = pl.reg.interpret_cast(raw_stream_25_fca_factor_bits_r4_slot1_part_a, dtype=pl.BF16)
                                     raw_stream_25_fca_value_offset_r4_slot1_part_a = raw_stream_25_fca_row_r4_slot1_part_a * HEAD_DIM + raw_stream_25_fca_chunk_r4_slot1_part_a * SPARSE_VF_REG_TILE
@@ -2101,7 +2037,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_25_fca_scaled_r4_slot1_part_a = pl.reg.mul(raw_stream_25_fca_value_r4_slot1_part_a, raw_stream_25_fca_factor_r4_slot1_part_a, raw_stream_25_fca_all_r4_slot1_part_a)
                                     raw_stream_25_fca_target_row_r4_slot1_part_a = 0 + 0 + raw_stream_25_fca_row_r4_slot1_part_a
                                     raw_stream_25_fca_target_offset_r4_slot1_part_a = raw_stream_25_fca_target_row_r4_slot1_part_a * 16 + raw_stream_25_fca_chunk_r4_slot1_part_a * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_25_fca_write_r4_slot1_part_a = pl.reg.store(fca_kv_flat_slot1_part_a, raw_stream_25_fca_target_offset_r4_slot1_part_a, raw_stream_25_fca_scaled_r4_slot1_part_a, raw_stream_25_fca_all_r4_slot1_part_a, block_stride=32)
+                                    _raw_stream_25_fca_write_r4_slot1_part_a = pl.reg.store(fca_kv_flat_slot1_part_a, raw_stream_25_fca_target_offset_r4_slot1_part_a, raw_stream_25_fca_scaled_r4_slot1_part_a, raw_stream_25_fca_all_r4_slot1_part_a, block_stride=32)
                         fca_raw_chunk_slot1_part_a = pl.tile.slice(raw_current_compressed1_part_a, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
                         fca_packed_slot1_part_a = pl.reinterpret_view(fca_raw_chunk_slot1_part_a, pl.FP4E2M1X2)
                         fca_codes_slot1_part_a = fca_packed_slot1_part_a[:, :SPARSE_VF_HALF_DIM]
@@ -2115,8 +2051,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                             for raw_stream_27_fca_row_r4_slot1_part_a in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_27_fca_chunk_r4_slot1_part_a in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_27_fca_scale_offset_r4_slot1_part_a = raw_stream_27_fca_row_r4_slot1_part_a * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_27_fca_scale_offset_r4_slot1_part_a = raw_stream_27_fca_scale_offset_r4_slot1_part_a + raw_stream_27_fca_chunk_r4_slot1_part_a * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_27_fca_groups_r4_slot1_part_a = pl.reg.load(fca_scale_flat_slot1_part_a, raw_stream_27_fca_scale_offset_r4_slot1_part_a, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                    raw_stream_27_fca_scale_offset_r4_slot1_part_a = raw_stream_27_fca_scale_offset_r4_slot1_part_a + raw_stream_27_fca_chunk_r4_slot1_part_a * SPARSE_VF_COMPRESSED_SCALE_TILE
+                                    raw_stream_27_fca_groups_r4_slot1_part_a = pl.reg.load(fca_scale_flat_slot1_part_a, raw_stream_27_fca_scale_offset_r4_slot1_part_a, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                                     raw_stream_27_fca_factor_bits_r4_slot1_part_a = pl.reg.group_broadcast(raw_stream_27_fca_groups_r4_slot1_part_a, lanes=SPARSE_VF_REG_TILE)
                                     raw_stream_27_fca_factor_r4_slot1_part_a = pl.reg.interpret_cast(raw_stream_27_fca_factor_bits_r4_slot1_part_a, dtype=pl.BF16)
                                     raw_stream_27_fca_value_offset_r4_slot1_part_a = raw_stream_27_fca_row_r4_slot1_part_a * HEAD_DIM + raw_stream_27_fca_chunk_r4_slot1_part_a * SPARSE_VF_REG_TILE
@@ -2124,7 +2060,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_27_fca_scaled_r4_slot1_part_a = pl.reg.mul(raw_stream_27_fca_value_r4_slot1_part_a, raw_stream_27_fca_factor_r4_slot1_part_a, raw_stream_27_fca_all_r4_slot1_part_a)
                                     raw_stream_27_fca_target_row_r4_slot1_part_a = 0 + 16 + raw_stream_27_fca_row_r4_slot1_part_a
                                     raw_stream_27_fca_target_offset_r4_slot1_part_a = raw_stream_27_fca_target_row_r4_slot1_part_a * 16 + raw_stream_27_fca_chunk_r4_slot1_part_a * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_27_fca_write_r4_slot1_part_a = pl.reg.store(fca_kv_flat_slot1_part_a, raw_stream_27_fca_target_offset_r4_slot1_part_a, raw_stream_27_fca_scaled_r4_slot1_part_a, raw_stream_27_fca_all_r4_slot1_part_a, block_stride=32)
+                                    _raw_stream_27_fca_write_r4_slot1_part_a = pl.reg.store(fca_kv_flat_slot1_part_a, raw_stream_27_fca_target_offset_r4_slot1_part_a, raw_stream_27_fca_scaled_r4_slot1_part_a, raw_stream_27_fca_all_r4_slot1_part_a, block_stride=32)
                     else:
                         raw_current_compressed2_flat_part_a: pl.Tile[[1, 17408], pl.UINT8, pl.MemRef('sparse_raw3', slots=3)[2], pl.Mem.Vec] = pl.tile.create([1, 17408], dtype=pl.UINT8, target_memory=pl.Mem.Vec)
                         raw_current_compressed2_prefix_part_a = pl.tile.slice(raw_current_compressed2_flat_part_a, [1, 10240], [0, 0])
@@ -2142,8 +2078,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                             for raw_stream_29_fca_row_r4_slot2_part_a in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_29_fca_chunk_r4_slot2_part_a in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_29_fca_scale_offset_r4_slot2_part_a = raw_stream_29_fca_row_r4_slot2_part_a * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_29_fca_scale_offset_r4_slot2_part_a = raw_stream_29_fca_scale_offset_r4_slot2_part_a + raw_stream_29_fca_chunk_r4_slot2_part_a * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_29_fca_groups_r4_slot2_part_a = pl.reg.load(fca_scale_flat_slot2_part_a, raw_stream_29_fca_scale_offset_r4_slot2_part_a, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                    raw_stream_29_fca_scale_offset_r4_slot2_part_a = raw_stream_29_fca_scale_offset_r4_slot2_part_a + raw_stream_29_fca_chunk_r4_slot2_part_a * SPARSE_VF_COMPRESSED_SCALE_TILE
+                                    raw_stream_29_fca_groups_r4_slot2_part_a = pl.reg.load(fca_scale_flat_slot2_part_a, raw_stream_29_fca_scale_offset_r4_slot2_part_a, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                                     raw_stream_29_fca_factor_bits_r4_slot2_part_a = pl.reg.group_broadcast(raw_stream_29_fca_groups_r4_slot2_part_a, lanes=SPARSE_VF_REG_TILE)
                                     raw_stream_29_fca_factor_r4_slot2_part_a = pl.reg.interpret_cast(raw_stream_29_fca_factor_bits_r4_slot2_part_a, dtype=pl.BF16)
                                     raw_stream_29_fca_value_offset_r4_slot2_part_a = raw_stream_29_fca_row_r4_slot2_part_a * HEAD_DIM + raw_stream_29_fca_chunk_r4_slot2_part_a * SPARSE_VF_REG_TILE
@@ -2151,7 +2087,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_29_fca_scaled_r4_slot2_part_a = pl.reg.mul(raw_stream_29_fca_value_r4_slot2_part_a, raw_stream_29_fca_factor_r4_slot2_part_a, raw_stream_29_fca_all_r4_slot2_part_a)
                                     raw_stream_29_fca_target_row_r4_slot2_part_a = 0 + 0 + raw_stream_29_fca_row_r4_slot2_part_a
                                     raw_stream_29_fca_target_offset_r4_slot2_part_a = raw_stream_29_fca_target_row_r4_slot2_part_a * 16 + raw_stream_29_fca_chunk_r4_slot2_part_a * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_29_fca_write_r4_slot2_part_a = pl.reg.store(fca_kv_flat_slot2_part_a, raw_stream_29_fca_target_offset_r4_slot2_part_a, raw_stream_29_fca_scaled_r4_slot2_part_a, raw_stream_29_fca_all_r4_slot2_part_a, block_stride=32)
+                                    _raw_stream_29_fca_write_r4_slot2_part_a = pl.reg.store(fca_kv_flat_slot2_part_a, raw_stream_29_fca_target_offset_r4_slot2_part_a, raw_stream_29_fca_scaled_r4_slot2_part_a, raw_stream_29_fca_all_r4_slot2_part_a, block_stride=32)
                         fca_raw_chunk_slot2_part_a = pl.tile.slice(raw_current_compressed2_part_a, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
                         fca_packed_slot2_part_a = pl.reinterpret_view(fca_raw_chunk_slot2_part_a, pl.FP4E2M1X2)
                         fca_codes_slot2_part_a = fca_packed_slot2_part_a[:, :SPARSE_VF_HALF_DIM]
@@ -2165,8 +2101,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                             for raw_stream_31_fca_row_r4_slot2_part_a in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_31_fca_chunk_r4_slot2_part_a in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_31_fca_scale_offset_r4_slot2_part_a = raw_stream_31_fca_row_r4_slot2_part_a * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_31_fca_scale_offset_r4_slot2_part_a = raw_stream_31_fca_scale_offset_r4_slot2_part_a + raw_stream_31_fca_chunk_r4_slot2_part_a * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_31_fca_groups_r4_slot2_part_a = pl.reg.load(fca_scale_flat_slot2_part_a, raw_stream_31_fca_scale_offset_r4_slot2_part_a, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                    raw_stream_31_fca_scale_offset_r4_slot2_part_a = raw_stream_31_fca_scale_offset_r4_slot2_part_a + raw_stream_31_fca_chunk_r4_slot2_part_a * SPARSE_VF_COMPRESSED_SCALE_TILE
+                                    raw_stream_31_fca_groups_r4_slot2_part_a = pl.reg.load(fca_scale_flat_slot2_part_a, raw_stream_31_fca_scale_offset_r4_slot2_part_a, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                                     raw_stream_31_fca_factor_bits_r4_slot2_part_a = pl.reg.group_broadcast(raw_stream_31_fca_groups_r4_slot2_part_a, lanes=SPARSE_VF_REG_TILE)
                                     raw_stream_31_fca_factor_r4_slot2_part_a = pl.reg.interpret_cast(raw_stream_31_fca_factor_bits_r4_slot2_part_a, dtype=pl.BF16)
                                     raw_stream_31_fca_value_offset_r4_slot2_part_a = raw_stream_31_fca_row_r4_slot2_part_a * HEAD_DIM + raw_stream_31_fca_chunk_r4_slot2_part_a * SPARSE_VF_REG_TILE
@@ -2174,7 +2110,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_31_fca_scaled_r4_slot2_part_a = pl.reg.mul(raw_stream_31_fca_value_r4_slot2_part_a, raw_stream_31_fca_factor_r4_slot2_part_a, raw_stream_31_fca_all_r4_slot2_part_a)
                                     raw_stream_31_fca_target_row_r4_slot2_part_a = 0 + 16 + raw_stream_31_fca_row_r4_slot2_part_a
                                     raw_stream_31_fca_target_offset_r4_slot2_part_a = raw_stream_31_fca_target_row_r4_slot2_part_a * 16 + raw_stream_31_fca_chunk_r4_slot2_part_a * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_31_fca_write_r4_slot2_part_a = pl.reg.store(fca_kv_flat_slot2_part_a, raw_stream_31_fca_target_offset_r4_slot2_part_a, raw_stream_31_fca_scaled_r4_slot2_part_a, raw_stream_31_fca_all_r4_slot2_part_a, block_stride=32)
+                                    _raw_stream_31_fca_write_r4_slot2_part_a = pl.reg.store(fca_kv_flat_slot2_part_a, raw_stream_31_fca_target_offset_r4_slot2_part_a, raw_stream_31_fca_scaled_r4_slot2_part_a, raw_stream_31_fca_all_r4_slot2_part_a, block_stride=32)
                     kv_nz_part_a: pl.Tile[[32, HEAD_DIM], pl.BF16, pl.MemRef('sparse_raw_kv_nz'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.tile.create([32, HEAD_DIM], dtype=pl.BF16, target_memory=pl.Mem.Vec)
                     pl.system.tpush_to_aic(kv_nz_part_a, split=1, id=1)
                     if 2 * (part + 2) + 1 + 2 < parts * 2:
@@ -2382,8 +2318,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                             for raw_stream_21_fca_row_r4_slot0_part_b in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_21_fca_chunk_r4_slot0_part_b in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_21_fca_scale_offset_r4_slot0_part_b = raw_stream_21_fca_row_r4_slot0_part_b * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_21_fca_scale_offset_r4_slot0_part_b = raw_stream_21_fca_scale_offset_r4_slot0_part_b + raw_stream_21_fca_chunk_r4_slot0_part_b * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_21_fca_groups_r4_slot0_part_b = pl.reg.load(fca_scale_flat_slot0_part_b, raw_stream_21_fca_scale_offset_r4_slot0_part_b, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                    raw_stream_21_fca_scale_offset_r4_slot0_part_b = raw_stream_21_fca_scale_offset_r4_slot0_part_b + raw_stream_21_fca_chunk_r4_slot0_part_b * SPARSE_VF_COMPRESSED_SCALE_TILE
+                                    raw_stream_21_fca_groups_r4_slot0_part_b = pl.reg.load(fca_scale_flat_slot0_part_b, raw_stream_21_fca_scale_offset_r4_slot0_part_b, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                                     raw_stream_21_fca_factor_bits_r4_slot0_part_b = pl.reg.group_broadcast(raw_stream_21_fca_groups_r4_slot0_part_b, lanes=SPARSE_VF_REG_TILE)
                                     raw_stream_21_fca_factor_r4_slot0_part_b = pl.reg.interpret_cast(raw_stream_21_fca_factor_bits_r4_slot0_part_b, dtype=pl.BF16)
                                     raw_stream_21_fca_value_offset_r4_slot0_part_b = raw_stream_21_fca_row_r4_slot0_part_b * HEAD_DIM + raw_stream_21_fca_chunk_r4_slot0_part_b * SPARSE_VF_REG_TILE
@@ -2391,7 +2327,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_21_fca_scaled_r4_slot0_part_b = pl.reg.mul(raw_stream_21_fca_value_r4_slot0_part_b, raw_stream_21_fca_factor_r4_slot0_part_b, raw_stream_21_fca_all_r4_slot0_part_b)
                                     raw_stream_21_fca_target_row_r4_slot0_part_b = 0 + 0 + raw_stream_21_fca_row_r4_slot0_part_b
                                     raw_stream_21_fca_target_offset_r4_slot0_part_b = raw_stream_21_fca_target_row_r4_slot0_part_b * 16 + raw_stream_21_fca_chunk_r4_slot0_part_b * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_21_fca_write_r4_slot0_part_b = pl.reg.store(fca_kv_flat_slot0_part_b, raw_stream_21_fca_target_offset_r4_slot0_part_b, raw_stream_21_fca_scaled_r4_slot0_part_b, raw_stream_21_fca_all_r4_slot0_part_b, block_stride=32)
+                                    _raw_stream_21_fca_write_r4_slot0_part_b = pl.reg.store(fca_kv_flat_slot0_part_b, raw_stream_21_fca_target_offset_r4_slot0_part_b, raw_stream_21_fca_scaled_r4_slot0_part_b, raw_stream_21_fca_all_r4_slot0_part_b, block_stride=32)
                         fca_raw_chunk_slot0_part_b = pl.tile.slice(raw_current_compressed0_part_b, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
                         fca_packed_slot0_part_b = pl.reinterpret_view(fca_raw_chunk_slot0_part_b, pl.FP4E2M1X2)
                         fca_codes_slot0_part_b = fca_packed_slot0_part_b[:, :SPARSE_VF_HALF_DIM]
@@ -2405,8 +2341,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                             for raw_stream_23_fca_row_r4_slot0_part_b in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_23_fca_chunk_r4_slot0_part_b in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_23_fca_scale_offset_r4_slot0_part_b = raw_stream_23_fca_row_r4_slot0_part_b * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_23_fca_scale_offset_r4_slot0_part_b = raw_stream_23_fca_scale_offset_r4_slot0_part_b + raw_stream_23_fca_chunk_r4_slot0_part_b * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_23_fca_groups_r4_slot0_part_b = pl.reg.load(fca_scale_flat_slot0_part_b, raw_stream_23_fca_scale_offset_r4_slot0_part_b, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                    raw_stream_23_fca_scale_offset_r4_slot0_part_b = raw_stream_23_fca_scale_offset_r4_slot0_part_b + raw_stream_23_fca_chunk_r4_slot0_part_b * SPARSE_VF_COMPRESSED_SCALE_TILE
+                                    raw_stream_23_fca_groups_r4_slot0_part_b = pl.reg.load(fca_scale_flat_slot0_part_b, raw_stream_23_fca_scale_offset_r4_slot0_part_b, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                                     raw_stream_23_fca_factor_bits_r4_slot0_part_b = pl.reg.group_broadcast(raw_stream_23_fca_groups_r4_slot0_part_b, lanes=SPARSE_VF_REG_TILE)
                                     raw_stream_23_fca_factor_r4_slot0_part_b = pl.reg.interpret_cast(raw_stream_23_fca_factor_bits_r4_slot0_part_b, dtype=pl.BF16)
                                     raw_stream_23_fca_value_offset_r4_slot0_part_b = raw_stream_23_fca_row_r4_slot0_part_b * HEAD_DIM + raw_stream_23_fca_chunk_r4_slot0_part_b * SPARSE_VF_REG_TILE
@@ -2414,7 +2350,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_23_fca_scaled_r4_slot0_part_b = pl.reg.mul(raw_stream_23_fca_value_r4_slot0_part_b, raw_stream_23_fca_factor_r4_slot0_part_b, raw_stream_23_fca_all_r4_slot0_part_b)
                                     raw_stream_23_fca_target_row_r4_slot0_part_b = 0 + 16 + raw_stream_23_fca_row_r4_slot0_part_b
                                     raw_stream_23_fca_target_offset_r4_slot0_part_b = raw_stream_23_fca_target_row_r4_slot0_part_b * 16 + raw_stream_23_fca_chunk_r4_slot0_part_b * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_23_fca_write_r4_slot0_part_b = pl.reg.store(fca_kv_flat_slot0_part_b, raw_stream_23_fca_target_offset_r4_slot0_part_b, raw_stream_23_fca_scaled_r4_slot0_part_b, raw_stream_23_fca_all_r4_slot0_part_b, block_stride=32)
+                                    _raw_stream_23_fca_write_r4_slot0_part_b = pl.reg.store(fca_kv_flat_slot0_part_b, raw_stream_23_fca_target_offset_r4_slot0_part_b, raw_stream_23_fca_scaled_r4_slot0_part_b, raw_stream_23_fca_all_r4_slot0_part_b, block_stride=32)
                     elif (2 * (part + 2) + 1) % 3 == 1:
                         raw_current_compressed1_flat_part_b: pl.Tile[[1, 17408], pl.UINT8, pl.MemRef('sparse_raw3', slots=3)[1], pl.Mem.Vec] = pl.tile.create([1, 17408], dtype=pl.UINT8, target_memory=pl.Mem.Vec)
                         raw_current_compressed1_prefix_part_b = pl.tile.slice(raw_current_compressed1_flat_part_b, [1, 10240], [0, 0])
@@ -2432,8 +2368,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                             for raw_stream_33_fca_row_r4_slot1_part_b in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_33_fca_chunk_r4_slot1_part_b in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_33_fca_scale_offset_r4_slot1_part_b = raw_stream_33_fca_row_r4_slot1_part_b * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_33_fca_scale_offset_r4_slot1_part_b = raw_stream_33_fca_scale_offset_r4_slot1_part_b + raw_stream_33_fca_chunk_r4_slot1_part_b * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_33_fca_groups_r4_slot1_part_b = pl.reg.load(fca_scale_flat_slot1_part_b, raw_stream_33_fca_scale_offset_r4_slot1_part_b, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                    raw_stream_33_fca_scale_offset_r4_slot1_part_b = raw_stream_33_fca_scale_offset_r4_slot1_part_b + raw_stream_33_fca_chunk_r4_slot1_part_b * SPARSE_VF_COMPRESSED_SCALE_TILE
+                                    raw_stream_33_fca_groups_r4_slot1_part_b = pl.reg.load(fca_scale_flat_slot1_part_b, raw_stream_33_fca_scale_offset_r4_slot1_part_b, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                                     raw_stream_33_fca_factor_bits_r4_slot1_part_b = pl.reg.group_broadcast(raw_stream_33_fca_groups_r4_slot1_part_b, lanes=SPARSE_VF_REG_TILE)
                                     raw_stream_33_fca_factor_r4_slot1_part_b = pl.reg.interpret_cast(raw_stream_33_fca_factor_bits_r4_slot1_part_b, dtype=pl.BF16)
                                     raw_stream_33_fca_value_offset_r4_slot1_part_b = raw_stream_33_fca_row_r4_slot1_part_b * HEAD_DIM + raw_stream_33_fca_chunk_r4_slot1_part_b * SPARSE_VF_REG_TILE
@@ -2441,7 +2377,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_33_fca_scaled_r4_slot1_part_b = pl.reg.mul(raw_stream_33_fca_value_r4_slot1_part_b, raw_stream_33_fca_factor_r4_slot1_part_b, raw_stream_33_fca_all_r4_slot1_part_b)
                                     raw_stream_33_fca_target_row_r4_slot1_part_b = 0 + 0 + raw_stream_33_fca_row_r4_slot1_part_b
                                     raw_stream_33_fca_target_offset_r4_slot1_part_b = raw_stream_33_fca_target_row_r4_slot1_part_b * 16 + raw_stream_33_fca_chunk_r4_slot1_part_b * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_33_fca_write_r4_slot1_part_b = pl.reg.store(fca_kv_flat_slot1_part_b, raw_stream_33_fca_target_offset_r4_slot1_part_b, raw_stream_33_fca_scaled_r4_slot1_part_b, raw_stream_33_fca_all_r4_slot1_part_b, block_stride=32)
+                                    _raw_stream_33_fca_write_r4_slot1_part_b = pl.reg.store(fca_kv_flat_slot1_part_b, raw_stream_33_fca_target_offset_r4_slot1_part_b, raw_stream_33_fca_scaled_r4_slot1_part_b, raw_stream_33_fca_all_r4_slot1_part_b, block_stride=32)
                         fca_raw_chunk_slot1_part_b = pl.tile.slice(raw_current_compressed1_part_b, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
                         fca_packed_slot1_part_b = pl.reinterpret_view(fca_raw_chunk_slot1_part_b, pl.FP4E2M1X2)
                         fca_codes_slot1_part_b = fca_packed_slot1_part_b[:, :SPARSE_VF_HALF_DIM]
@@ -2455,8 +2391,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                             for raw_stream_35_fca_row_r4_slot1_part_b in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_35_fca_chunk_r4_slot1_part_b in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_35_fca_scale_offset_r4_slot1_part_b = raw_stream_35_fca_row_r4_slot1_part_b * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_35_fca_scale_offset_r4_slot1_part_b = raw_stream_35_fca_scale_offset_r4_slot1_part_b + raw_stream_35_fca_chunk_r4_slot1_part_b * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_35_fca_groups_r4_slot1_part_b = pl.reg.load(fca_scale_flat_slot1_part_b, raw_stream_35_fca_scale_offset_r4_slot1_part_b, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                    raw_stream_35_fca_scale_offset_r4_slot1_part_b = raw_stream_35_fca_scale_offset_r4_slot1_part_b + raw_stream_35_fca_chunk_r4_slot1_part_b * SPARSE_VF_COMPRESSED_SCALE_TILE
+                                    raw_stream_35_fca_groups_r4_slot1_part_b = pl.reg.load(fca_scale_flat_slot1_part_b, raw_stream_35_fca_scale_offset_r4_slot1_part_b, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                                     raw_stream_35_fca_factor_bits_r4_slot1_part_b = pl.reg.group_broadcast(raw_stream_35_fca_groups_r4_slot1_part_b, lanes=SPARSE_VF_REG_TILE)
                                     raw_stream_35_fca_factor_r4_slot1_part_b = pl.reg.interpret_cast(raw_stream_35_fca_factor_bits_r4_slot1_part_b, dtype=pl.BF16)
                                     raw_stream_35_fca_value_offset_r4_slot1_part_b = raw_stream_35_fca_row_r4_slot1_part_b * HEAD_DIM + raw_stream_35_fca_chunk_r4_slot1_part_b * SPARSE_VF_REG_TILE
@@ -2464,7 +2400,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_35_fca_scaled_r4_slot1_part_b = pl.reg.mul(raw_stream_35_fca_value_r4_slot1_part_b, raw_stream_35_fca_factor_r4_slot1_part_b, raw_stream_35_fca_all_r4_slot1_part_b)
                                     raw_stream_35_fca_target_row_r4_slot1_part_b = 0 + 16 + raw_stream_35_fca_row_r4_slot1_part_b
                                     raw_stream_35_fca_target_offset_r4_slot1_part_b = raw_stream_35_fca_target_row_r4_slot1_part_b * 16 + raw_stream_35_fca_chunk_r4_slot1_part_b * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_35_fca_write_r4_slot1_part_b = pl.reg.store(fca_kv_flat_slot1_part_b, raw_stream_35_fca_target_offset_r4_slot1_part_b, raw_stream_35_fca_scaled_r4_slot1_part_b, raw_stream_35_fca_all_r4_slot1_part_b, block_stride=32)
+                                    _raw_stream_35_fca_write_r4_slot1_part_b = pl.reg.store(fca_kv_flat_slot1_part_b, raw_stream_35_fca_target_offset_r4_slot1_part_b, raw_stream_35_fca_scaled_r4_slot1_part_b, raw_stream_35_fca_all_r4_slot1_part_b, block_stride=32)
                     else:
                         raw_current_compressed2_flat_part_b: pl.Tile[[1, 17408], pl.UINT8, pl.MemRef('sparse_raw3', slots=3)[2], pl.Mem.Vec] = pl.tile.create([1, 17408], dtype=pl.UINT8, target_memory=pl.Mem.Vec)
                         raw_current_compressed2_prefix_part_b = pl.tile.slice(raw_current_compressed2_flat_part_b, [1, 10240], [0, 0])
@@ -2482,8 +2418,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                             for raw_stream_37_fca_row_r4_slot2_part_b in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_37_fca_chunk_r4_slot2_part_b in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_37_fca_scale_offset_r4_slot2_part_b = raw_stream_37_fca_row_r4_slot2_part_b * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_37_fca_scale_offset_r4_slot2_part_b = raw_stream_37_fca_scale_offset_r4_slot2_part_b + raw_stream_37_fca_chunk_r4_slot2_part_b * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_37_fca_groups_r4_slot2_part_b = pl.reg.load(fca_scale_flat_slot2_part_b, raw_stream_37_fca_scale_offset_r4_slot2_part_b, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                    raw_stream_37_fca_scale_offset_r4_slot2_part_b = raw_stream_37_fca_scale_offset_r4_slot2_part_b + raw_stream_37_fca_chunk_r4_slot2_part_b * SPARSE_VF_COMPRESSED_SCALE_TILE
+                                    raw_stream_37_fca_groups_r4_slot2_part_b = pl.reg.load(fca_scale_flat_slot2_part_b, raw_stream_37_fca_scale_offset_r4_slot2_part_b, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                                     raw_stream_37_fca_factor_bits_r4_slot2_part_b = pl.reg.group_broadcast(raw_stream_37_fca_groups_r4_slot2_part_b, lanes=SPARSE_VF_REG_TILE)
                                     raw_stream_37_fca_factor_r4_slot2_part_b = pl.reg.interpret_cast(raw_stream_37_fca_factor_bits_r4_slot2_part_b, dtype=pl.BF16)
                                     raw_stream_37_fca_value_offset_r4_slot2_part_b = raw_stream_37_fca_row_r4_slot2_part_b * HEAD_DIM + raw_stream_37_fca_chunk_r4_slot2_part_b * SPARSE_VF_REG_TILE
@@ -2491,7 +2427,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_37_fca_scaled_r4_slot2_part_b = pl.reg.mul(raw_stream_37_fca_value_r4_slot2_part_b, raw_stream_37_fca_factor_r4_slot2_part_b, raw_stream_37_fca_all_r4_slot2_part_b)
                                     raw_stream_37_fca_target_row_r4_slot2_part_b = 0 + 0 + raw_stream_37_fca_row_r4_slot2_part_b
                                     raw_stream_37_fca_target_offset_r4_slot2_part_b = raw_stream_37_fca_target_row_r4_slot2_part_b * 16 + raw_stream_37_fca_chunk_r4_slot2_part_b * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_37_fca_write_r4_slot2_part_b = pl.reg.store(fca_kv_flat_slot2_part_b, raw_stream_37_fca_target_offset_r4_slot2_part_b, raw_stream_37_fca_scaled_r4_slot2_part_b, raw_stream_37_fca_all_r4_slot2_part_b, block_stride=32)
+                                    _raw_stream_37_fca_write_r4_slot2_part_b = pl.reg.store(fca_kv_flat_slot2_part_b, raw_stream_37_fca_target_offset_r4_slot2_part_b, raw_stream_37_fca_scaled_r4_slot2_part_b, raw_stream_37_fca_all_r4_slot2_part_b, block_stride=32)
                         fca_raw_chunk_slot2_part_b = pl.tile.slice(raw_current_compressed2_part_b, [SPARSE_VF_FUSED_FP4_SCALE_TILE, COMPRESSED_CACHE_BYTES], [16, 0])
                         fca_packed_slot2_part_b = pl.reinterpret_view(fca_raw_chunk_slot2_part_b, pl.FP4E2M1X2)
                         fca_codes_slot2_part_b = fca_packed_slot2_part_b[:, :SPARSE_VF_HALF_DIM]
@@ -2505,8 +2441,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                             for raw_stream_39_fca_row_r4_slot2_part_b in pl.hardware_loop(SPARSE_VF_FUSED_FP4_SCALE_TILE):
                                 for raw_stream_39_fca_chunk_r4_slot2_part_b in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     raw_stream_39_fca_scale_offset_r4_slot2_part_b = raw_stream_39_fca_row_r4_slot2_part_b * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                    raw_stream_39_fca_scale_offset_r4_slot2_part_b = raw_stream_39_fca_scale_offset_r4_slot2_part_b + raw_stream_39_fca_chunk_r4_slot2_part_b * SPARSE_VF_COMPRESSED_STEP
-                                    raw_stream_39_fca_groups_r4_slot2_part_b = pl.reg.load(fca_scale_flat_slot2_part_b, raw_stream_39_fca_scale_offset_r4_slot2_part_b, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                    raw_stream_39_fca_scale_offset_r4_slot2_part_b = raw_stream_39_fca_scale_offset_r4_slot2_part_b + raw_stream_39_fca_chunk_r4_slot2_part_b * SPARSE_VF_COMPRESSED_SCALE_TILE
+                                    raw_stream_39_fca_groups_r4_slot2_part_b = pl.reg.load(fca_scale_flat_slot2_part_b, raw_stream_39_fca_scale_offset_r4_slot2_part_b, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                                     raw_stream_39_fca_factor_bits_r4_slot2_part_b = pl.reg.group_broadcast(raw_stream_39_fca_groups_r4_slot2_part_b, lanes=SPARSE_VF_REG_TILE)
                                     raw_stream_39_fca_factor_r4_slot2_part_b = pl.reg.interpret_cast(raw_stream_39_fca_factor_bits_r4_slot2_part_b, dtype=pl.BF16)
                                     raw_stream_39_fca_value_offset_r4_slot2_part_b = raw_stream_39_fca_row_r4_slot2_part_b * HEAD_DIM + raw_stream_39_fca_chunk_r4_slot2_part_b * SPARSE_VF_REG_TILE
@@ -2514,7 +2450,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     raw_stream_39_fca_scaled_r4_slot2_part_b = pl.reg.mul(raw_stream_39_fca_value_r4_slot2_part_b, raw_stream_39_fca_factor_r4_slot2_part_b, raw_stream_39_fca_all_r4_slot2_part_b)
                                     raw_stream_39_fca_target_row_r4_slot2_part_b = 0 + 16 + raw_stream_39_fca_row_r4_slot2_part_b
                                     raw_stream_39_fca_target_offset_r4_slot2_part_b = raw_stream_39_fca_target_row_r4_slot2_part_b * 16 + raw_stream_39_fca_chunk_r4_slot2_part_b * (32 * SPARSE_VF_REG_TILE)
-                                    raw_stream_39_fca_write_r4_slot2_part_b = pl.reg.store(fca_kv_flat_slot2_part_b, raw_stream_39_fca_target_offset_r4_slot2_part_b, raw_stream_39_fca_scaled_r4_slot2_part_b, raw_stream_39_fca_all_r4_slot2_part_b, block_stride=32)
+                                    _raw_stream_39_fca_write_r4_slot2_part_b = pl.reg.store(fca_kv_flat_slot2_part_b, raw_stream_39_fca_target_offset_r4_slot2_part_b, raw_stream_39_fca_scaled_r4_slot2_part_b, raw_stream_39_fca_all_r4_slot2_part_b, block_stride=32)
                     kv_nz_part_b: pl.Tile[[32, HEAD_DIM], pl.BF16, pl.MemRef('sparse_raw_kv_nz'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.tile.create([32, HEAD_DIM], dtype=pl.BF16, target_memory=pl.Mem.Vec)
                     pl.system.tpush_to_aic(kv_nz_part_b, split=1, id=1)
                 if part + 3 == parts and block + workers < num_tokens * (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE):
@@ -2685,8 +2621,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                 for fwa_row_r0 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                     for fwa_chunk_r0 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                         fwa_scale_offset_r0 = fwa_row_r0 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                                        fwa_scale_offset_r0 = fwa_scale_offset_r0 + fwa_chunk_r0 * SPARSE_VF_WINDOW_STEP
-                                        fwa_groups_r0 = pl.reg.load(fwa_scale_flat, fwa_scale_offset_r0, lanes=SPARSE_VF_WINDOW_STEP)
+                                        fwa_scale_offset_r0 = fwa_scale_offset_r0 + fwa_chunk_r0 * SPARSE_VF_WINDOW_SCALE_TILE
+                                        fwa_groups_r0 = pl.reg.load(fwa_scale_flat, fwa_scale_offset_r0, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                                         fwa_factor_bits_r0 = pl.reg.group_broadcast(fwa_groups_r0, lanes=SPARSE_VF_REG_TILE)
                                         fwa_factor_r0 = pl.reg.interpret_cast(fwa_factor_bits_r0, dtype=pl.BF16)
                                         fwa_value_offset_r0 = fwa_row_r0 * HEAD_DIM + fwa_chunk_r0 * SPARSE_VF_REG_TILE
@@ -2694,7 +2630,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                         fwa_scaled_r0 = pl.reg.mul(fwa_value_r0, fwa_factor_r0, fwa_all_r0)
                                         fwa_target_row_r0 = 0 + fwa_cast_row0 + fwa_row_r0
                                         fwa_target_offset_r0 = fwa_target_row_r0 * HEAD_DIM + fwa_chunk_r0 * SPARSE_VF_REG_TILE
-                                        fwa_write_r0 = pl.reg.store(fwa_kv_flat, fwa_target_offset_r0, fwa_scaled_r0, fwa_all_r0)
+                                        _fwa_write_r0 = pl.reg.store(fwa_kv_flat, fwa_target_offset_r0, fwa_scaled_r0, fwa_all_r0)
                         ids_fwc = pl.tile.load(window_indices, [token, first_key_base + 64], [1, SPARSE_VF_FUSED_GATHER_TILE])
                         fwc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
                         fwc_first = pl.tile.read(ids_fwc, [0, 0])
@@ -2745,8 +2681,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                 for fwb_row_r1 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                     for fwb_chunk_r1 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                         fwb_scale_offset_r1 = fwb_row_r1 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                                        fwb_scale_offset_r1 = fwb_scale_offset_r1 + fwb_chunk_r1 * SPARSE_VF_WINDOW_STEP
-                                        fwb_groups_r1 = pl.reg.load(fwb_scale_flat, fwb_scale_offset_r1, lanes=SPARSE_VF_WINDOW_STEP)
+                                        fwb_scale_offset_r1 = fwb_scale_offset_r1 + fwb_chunk_r1 * SPARSE_VF_WINDOW_SCALE_TILE
+                                        fwb_groups_r1 = pl.reg.load(fwb_scale_flat, fwb_scale_offset_r1, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                                         fwb_factor_bits_r1 = pl.reg.group_broadcast(fwb_groups_r1, lanes=SPARSE_VF_REG_TILE)
                                         fwb_factor_r1 = pl.reg.interpret_cast(fwb_factor_bits_r1, dtype=pl.BF16)
                                         fwb_value_offset_r1 = fwb_row_r1 * HEAD_DIM + fwb_chunk_r1 * SPARSE_VF_REG_TILE
@@ -2754,7 +2690,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                         fwb_scaled_r1 = pl.reg.mul(fwb_value_r1, fwb_factor_r1, fwb_all_r1)
                                         fwb_target_row_r1 = 16 + fwb_cast_row0 + fwb_row_r1
                                         fwb_target_offset_r1 = fwb_target_row_r1 * HEAD_DIM + fwb_chunk_r1 * SPARSE_VF_REG_TILE
-                                        fwb_write_r1 = pl.reg.store(fwb_kv_flat, fwb_target_offset_r1, fwb_scaled_r1, fwb_all_r1)
+                                        _fwb_write_r1 = pl.reg.store(fwb_kv_flat, fwb_target_offset_r1, fwb_scaled_r1, fwb_all_r1)
                         pl.system.tpush_to_aic(kv_chunk, split=1, id=1)
                         kv_chunk = pl.tile.create([SPARSE_VF_KEY_TILE // 4, HEAD_DIM], dtype=pl.BF16, target_memory=pl.MemorySpace.Vec)
                         ids_fwd = pl.tile.load(window_indices, [token, first_key_base + 80], [1, SPARSE_VF_FUSED_GATHER_TILE])
@@ -2807,8 +2743,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                 for fwc_row_r2 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                     for fwc_chunk_r2 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                         fwc_scale_offset_r2 = fwc_row_r2 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                                        fwc_scale_offset_r2 = fwc_scale_offset_r2 + fwc_chunk_r2 * SPARSE_VF_WINDOW_STEP
-                                        fwc_groups_r2 = pl.reg.load(fwc_scale_flat, fwc_scale_offset_r2, lanes=SPARSE_VF_WINDOW_STEP)
+                                        fwc_scale_offset_r2 = fwc_scale_offset_r2 + fwc_chunk_r2 * SPARSE_VF_WINDOW_SCALE_TILE
+                                        fwc_groups_r2 = pl.reg.load(fwc_scale_flat, fwc_scale_offset_r2, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                                         fwc_factor_bits_r2 = pl.reg.group_broadcast(fwc_groups_r2, lanes=SPARSE_VF_REG_TILE)
                                         fwc_factor_r2 = pl.reg.interpret_cast(fwc_factor_bits_r2, dtype=pl.BF16)
                                         fwc_value_offset_r2 = fwc_row_r2 * HEAD_DIM + fwc_chunk_r2 * SPARSE_VF_REG_TILE
@@ -2816,7 +2752,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                         fwc_scaled_r2 = pl.reg.mul(fwc_value_r2, fwc_factor_r2, fwc_all_r2)
                                         fwc_target_row_r2 = 0 + fwc_cast_row0 + fwc_row_r2
                                         fwc_target_offset_r2 = fwc_target_row_r2 * HEAD_DIM + fwc_chunk_r2 * SPARSE_VF_REG_TILE
-                                        fwc_write_r2 = pl.reg.store(fwc_kv_flat, fwc_target_offset_r2, fwc_scaled_r2, fwc_all_r2)
+                                        _fwc_write_r2 = pl.reg.store(fwc_kv_flat, fwc_target_offset_r2, fwc_scaled_r2, fwc_all_r2)
                         for fwd_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
                             fwd_cast_row0 = fwd_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
                             fwd_raw_chunk = pl.tile.slice(fwd_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwd_cast_row0, 0])
@@ -2834,8 +2770,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                 for fwd_row_r3 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                     for fwd_chunk_r3 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                         fwd_scale_offset_r3 = fwd_row_r3 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                                        fwd_scale_offset_r3 = fwd_scale_offset_r3 + fwd_chunk_r3 * SPARSE_VF_WINDOW_STEP
-                                        fwd_groups_r3 = pl.reg.load(fwd_scale_flat, fwd_scale_offset_r3, lanes=SPARSE_VF_WINDOW_STEP)
+                                        fwd_scale_offset_r3 = fwd_scale_offset_r3 + fwd_chunk_r3 * SPARSE_VF_WINDOW_SCALE_TILE
+                                        fwd_groups_r3 = pl.reg.load(fwd_scale_flat, fwd_scale_offset_r3, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                                         fwd_factor_bits_r3 = pl.reg.group_broadcast(fwd_groups_r3, lanes=SPARSE_VF_REG_TILE)
                                         fwd_factor_r3 = pl.reg.interpret_cast(fwd_factor_bits_r3, dtype=pl.BF16)
                                         fwd_value_offset_r3 = fwd_row_r3 * HEAD_DIM + fwd_chunk_r3 * SPARSE_VF_REG_TILE
@@ -2843,7 +2779,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                         fwd_scaled_r3 = pl.reg.mul(fwd_value_r3, fwd_factor_r3, fwd_all_r3)
                                         fwd_target_row_r3 = 16 + fwd_cast_row0 + fwd_row_r3
                                         fwd_target_offset_r3 = fwd_target_row_r3 * HEAD_DIM + fwd_chunk_r3 * SPARSE_VF_REG_TILE
-                                        fwd_write_r3 = pl.reg.store(fwd_kv_flat, fwd_target_offset_r3, fwd_scaled_r3, fwd_all_r3)
+                                        _fwd_write_r3 = pl.reg.store(fwd_kv_flat, fwd_target_offset_r3, fwd_scaled_r3, fwd_all_r3)
                         pl.system.tpush_to_aic(kv_chunk, split=1, id=1)
                     else:
                         ids_fca = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 0], [1, SPARSE_VF_FUSED_GATHER_TILE])
@@ -2903,8 +2839,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                 for fca_row_r4 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                     for fca_chunk_r4 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                         fca_scale_offset_r4 = fca_row_r4 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                        fca_scale_offset_r4 = fca_scale_offset_r4 + fca_chunk_r4 * SPARSE_VF_COMPRESSED_STEP
-                                        fca_groups_r4 = pl.reg.load(fca_scale_flat, fca_scale_offset_r4, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                        fca_scale_offset_r4 = fca_scale_offset_r4 + fca_chunk_r4 * SPARSE_VF_COMPRESSED_SCALE_TILE
+                                        fca_groups_r4 = pl.reg.load(fca_scale_flat, fca_scale_offset_r4, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                                         fca_factor_bits_r4 = pl.reg.group_broadcast(fca_groups_r4, lanes=SPARSE_VF_REG_TILE)
                                         fca_factor_r4 = pl.reg.interpret_cast(fca_factor_bits_r4, dtype=pl.BF16)
                                         fca_value_offset_r4 = fca_row_r4 * HEAD_DIM + fca_chunk_r4 * SPARSE_VF_REG_TILE
@@ -2912,7 +2848,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                         fca_scaled_r4 = pl.reg.mul(fca_value_r4, fca_factor_r4, fca_all_r4)
                                         fca_target_row_r4 = 0 + fca_cast_row0 + fca_row_r4
                                         fca_target_offset_r4 = fca_target_row_r4 * HEAD_DIM + fca_chunk_r4 * SPARSE_VF_REG_TILE
-                                        fca_write_r4 = pl.reg.store(fca_kv_flat, fca_target_offset_r4, fca_scaled_r4, fca_all_r4)
+                                        _fca_write_r4 = pl.reg.store(fca_kv_flat, fca_target_offset_r4, fca_scaled_r4, fca_all_r4)
                         ids_fcc = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 64], [1, SPARSE_VF_FUSED_GATHER_TILE])
                         fcc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
                         for fcc_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
@@ -2949,8 +2885,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                 for fcb_row_r5 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                     for fcb_chunk_r5 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                         fcb_scale_offset_r5 = fcb_row_r5 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                        fcb_scale_offset_r5 = fcb_scale_offset_r5 + fcb_chunk_r5 * SPARSE_VF_COMPRESSED_STEP
-                                        fcb_groups_r5 = pl.reg.load(fcb_scale_flat, fcb_scale_offset_r5, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                        fcb_scale_offset_r5 = fcb_scale_offset_r5 + fcb_chunk_r5 * SPARSE_VF_COMPRESSED_SCALE_TILE
+                                        fcb_groups_r5 = pl.reg.load(fcb_scale_flat, fcb_scale_offset_r5, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                                         fcb_factor_bits_r5 = pl.reg.group_broadcast(fcb_groups_r5, lanes=SPARSE_VF_REG_TILE)
                                         fcb_factor_r5 = pl.reg.interpret_cast(fcb_factor_bits_r5, dtype=pl.BF16)
                                         fcb_value_offset_r5 = fcb_row_r5 * HEAD_DIM + fcb_chunk_r5 * SPARSE_VF_REG_TILE
@@ -2958,7 +2894,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                         fcb_scaled_r5 = pl.reg.mul(fcb_value_r5, fcb_factor_r5, fcb_all_r5)
                                         fcb_target_row_r5 = 16 + fcb_cast_row0 + fcb_row_r5
                                         fcb_target_offset_r5 = fcb_target_row_r5 * HEAD_DIM + fcb_chunk_r5 * SPARSE_VF_REG_TILE
-                                        fcb_write_r5 = pl.reg.store(fcb_kv_flat, fcb_target_offset_r5, fcb_scaled_r5, fcb_all_r5)
+                                        _fcb_write_r5 = pl.reg.store(fcb_kv_flat, fcb_target_offset_r5, fcb_scaled_r5, fcb_all_r5)
                         pl.system.tpush_to_aic(kv_chunk, split=1, id=1)
                         kv_chunk = pl.tile.create([SPARSE_VF_KEY_TILE // 4, HEAD_DIM], dtype=pl.BF16, target_memory=pl.MemorySpace.Vec)
                         ids_fcd = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 80], [1, SPARSE_VF_FUSED_GATHER_TILE])
@@ -2997,8 +2933,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                 for fcc_row_r6 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                     for fcc_chunk_r6 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                         fcc_scale_offset_r6 = fcc_row_r6 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                        fcc_scale_offset_r6 = fcc_scale_offset_r6 + fcc_chunk_r6 * SPARSE_VF_COMPRESSED_STEP
-                                        fcc_groups_r6 = pl.reg.load(fcc_scale_flat, fcc_scale_offset_r6, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                        fcc_scale_offset_r6 = fcc_scale_offset_r6 + fcc_chunk_r6 * SPARSE_VF_COMPRESSED_SCALE_TILE
+                                        fcc_groups_r6 = pl.reg.load(fcc_scale_flat, fcc_scale_offset_r6, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                                         fcc_factor_bits_r6 = pl.reg.group_broadcast(fcc_groups_r6, lanes=SPARSE_VF_REG_TILE)
                                         fcc_factor_r6 = pl.reg.interpret_cast(fcc_factor_bits_r6, dtype=pl.BF16)
                                         fcc_value_offset_r6 = fcc_row_r6 * HEAD_DIM + fcc_chunk_r6 * SPARSE_VF_REG_TILE
@@ -3006,7 +2942,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                         fcc_scaled_r6 = pl.reg.mul(fcc_value_r6, fcc_factor_r6, fcc_all_r6)
                                         fcc_target_row_r6 = 0 + fcc_cast_row0 + fcc_row_r6
                                         fcc_target_offset_r6 = fcc_target_row_r6 * HEAD_DIM + fcc_chunk_r6 * SPARSE_VF_REG_TILE
-                                        fcc_write_r6 = pl.reg.store(fcc_kv_flat, fcc_target_offset_r6, fcc_scaled_r6, fcc_all_r6)
+                                        _fcc_write_r6 = pl.reg.store(fcc_kv_flat, fcc_target_offset_r6, fcc_scaled_r6, fcc_all_r6)
                         for fcd_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
                             fcd_cast_row0 = fcd_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
                             fcd_raw_chunk = pl.tile.slice(fcd_raw, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [fcd_cast_row0, 0])
@@ -3022,8 +2958,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                 for fcd_row_r7 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                     for fcd_chunk_r7 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                         fcd_scale_offset_r7 = fcd_row_r7 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                        fcd_scale_offset_r7 = fcd_scale_offset_r7 + fcd_chunk_r7 * SPARSE_VF_COMPRESSED_STEP
-                                        fcd_groups_r7 = pl.reg.load(fcd_scale_flat, fcd_scale_offset_r7, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                        fcd_scale_offset_r7 = fcd_scale_offset_r7 + fcd_chunk_r7 * SPARSE_VF_COMPRESSED_SCALE_TILE
+                                        fcd_groups_r7 = pl.reg.load(fcd_scale_flat, fcd_scale_offset_r7, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                                         fcd_factor_bits_r7 = pl.reg.group_broadcast(fcd_groups_r7, lanes=SPARSE_VF_REG_TILE)
                                         fcd_factor_r7 = pl.reg.interpret_cast(fcd_factor_bits_r7, dtype=pl.BF16)
                                         fcd_value_offset_r7 = fcd_row_r7 * HEAD_DIM + fcd_chunk_r7 * SPARSE_VF_REG_TILE
@@ -3031,7 +2967,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                         fcd_scaled_r7 = pl.reg.mul(fcd_value_r7, fcd_factor_r7, fcd_all_r7)
                                         fcd_target_row_r7 = 16 + fcd_cast_row0 + fcd_row_r7
                                         fcd_target_offset_r7 = fcd_target_row_r7 * HEAD_DIM + fcd_chunk_r7 * SPARSE_VF_REG_TILE
-                                        fcd_write_r7 = pl.reg.store(fcd_kv_flat, fcd_target_offset_r7, fcd_scaled_r7, fcd_all_r7)
+                                        _fcd_write_r7 = pl.reg.store(fcd_kv_flat, fcd_target_offset_r7, fcd_scaled_r7, fcd_all_r7)
                         pl.system.tpush_to_aic(kv_chunk, split=1, id=1)
                 else:
                     kv_half = pl.tile.create([SPARSE_VF_KEY_TILE // 2, HEAD_DIM], dtype=pl.BF16, target_memory=pl.MemorySpace.Vec)
@@ -3119,8 +3055,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                             for fwa_row_r8 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                 for fwa_chunk_r8 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     fwa_scale_offset_r8 = fwa_row_r8 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                                    fwa_scale_offset_r8 = fwa_scale_offset_r8 + fwa_chunk_r8 * SPARSE_VF_WINDOW_STEP
-                                    fwa_groups_r8 = pl.reg.load(fwa_scale_flat, fwa_scale_offset_r8, lanes=SPARSE_VF_WINDOW_STEP)
+                                    fwa_scale_offset_r8 = fwa_scale_offset_r8 + fwa_chunk_r8 * SPARSE_VF_WINDOW_SCALE_TILE
+                                    fwa_groups_r8 = pl.reg.load(fwa_scale_flat, fwa_scale_offset_r8, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                                     fwa_factor_bits_r8 = pl.reg.group_broadcast(fwa_groups_r8, lanes=SPARSE_VF_REG_TILE)
                                     fwa_factor_r8 = pl.reg.interpret_cast(fwa_factor_bits_r8, dtype=pl.BF16)
                                     fwa_value_offset_r8 = fwa_row_r8 * HEAD_DIM + fwa_chunk_r8 * SPARSE_VF_REG_TILE
@@ -3128,7 +3064,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     fwa_scaled_r8 = pl.reg.mul(fwa_value_r8, fwa_factor_r8, fwa_all_r8)
                                     fwa_target_row_r8 = 0 + fwa_cast_row0 + fwa_row_r8
                                     fwa_target_offset_r8 = fwa_target_row_r8 * HEAD_DIM + fwa_chunk_r8 * SPARSE_VF_REG_TILE
-                                    fwa_write_r8 = pl.reg.store(fwa_kv_flat, fwa_target_offset_r8, fwa_scaled_r8, fwa_all_r8)
+                                    _fwa_write_r8 = pl.reg.store(fwa_kv_flat, fwa_target_offset_r8, fwa_scaled_r8, fwa_all_r8)
                     ids_fwc = pl.tile.load(window_indices, [token, first_key_base + 32], [1, SPARSE_VF_FUSED_GATHER_TILE])
                     fwc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
                     fwc_first = pl.tile.read(ids_fwc, [0, 0])
@@ -3179,8 +3115,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                             for fwb_row_r9 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                 for fwb_chunk_r9 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     fwb_scale_offset_r9 = fwb_row_r9 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                                    fwb_scale_offset_r9 = fwb_scale_offset_r9 + fwb_chunk_r9 * SPARSE_VF_WINDOW_STEP
-                                    fwb_groups_r9 = pl.reg.load(fwb_scale_flat, fwb_scale_offset_r9, lanes=SPARSE_VF_WINDOW_STEP)
+                                    fwb_scale_offset_r9 = fwb_scale_offset_r9 + fwb_chunk_r9 * SPARSE_VF_WINDOW_SCALE_TILE
+                                    fwb_groups_r9 = pl.reg.load(fwb_scale_flat, fwb_scale_offset_r9, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                                     fwb_factor_bits_r9 = pl.reg.group_broadcast(fwb_groups_r9, lanes=SPARSE_VF_REG_TILE)
                                     fwb_factor_r9 = pl.reg.interpret_cast(fwb_factor_bits_r9, dtype=pl.BF16)
                                     fwb_value_offset_r9 = fwb_row_r9 * HEAD_DIM + fwb_chunk_r9 * SPARSE_VF_REG_TILE
@@ -3188,7 +3124,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     fwb_scaled_r9 = pl.reg.mul(fwb_value_r9, fwb_factor_r9, fwb_all_r9)
                                     fwb_target_row_r9 = 16 + fwb_cast_row0 + fwb_row_r9
                                     fwb_target_offset_r9 = fwb_target_row_r9 * HEAD_DIM + fwb_chunk_r9 * SPARSE_VF_REG_TILE
-                                    fwb_write_r9 = pl.reg.store(fwb_kv_flat, fwb_target_offset_r9, fwb_scaled_r9, fwb_all_r9)
+                                    _fwb_write_r9 = pl.reg.store(fwb_kv_flat, fwb_target_offset_r9, fwb_scaled_r9, fwb_all_r9)
                     ids_fwd = pl.tile.load(window_indices, [token, first_key_base + 48], [1, SPARSE_VF_FUSED_GATHER_TILE])
                     fwd_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
                     fwd_first = pl.tile.read(ids_fwd, [0, 0])
@@ -3239,8 +3175,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                             for fwc_row_r10 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                 for fwc_chunk_r10 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     fwc_scale_offset_r10 = fwc_row_r10 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                                    fwc_scale_offset_r10 = fwc_scale_offset_r10 + fwc_chunk_r10 * SPARSE_VF_WINDOW_STEP
-                                    fwc_groups_r10 = pl.reg.load(fwc_scale_flat, fwc_scale_offset_r10, lanes=SPARSE_VF_WINDOW_STEP)
+                                    fwc_scale_offset_r10 = fwc_scale_offset_r10 + fwc_chunk_r10 * SPARSE_VF_WINDOW_SCALE_TILE
+                                    fwc_groups_r10 = pl.reg.load(fwc_scale_flat, fwc_scale_offset_r10, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                                     fwc_factor_bits_r10 = pl.reg.group_broadcast(fwc_groups_r10, lanes=SPARSE_VF_REG_TILE)
                                     fwc_factor_r10 = pl.reg.interpret_cast(fwc_factor_bits_r10, dtype=pl.BF16)
                                     fwc_value_offset_r10 = fwc_row_r10 * HEAD_DIM + fwc_chunk_r10 * SPARSE_VF_REG_TILE
@@ -3248,7 +3184,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     fwc_scaled_r10 = pl.reg.mul(fwc_value_r10, fwc_factor_r10, fwc_all_r10)
                                     fwc_target_row_r10 = 32 + fwc_cast_row0 + fwc_row_r10
                                     fwc_target_offset_r10 = fwc_target_row_r10 * HEAD_DIM + fwc_chunk_r10 * SPARSE_VF_REG_TILE
-                                    fwc_write_r10 = pl.reg.store(fwc_kv_flat, fwc_target_offset_r10, fwc_scaled_r10, fwc_all_r10)
+                                    _fwc_write_r10 = pl.reg.store(fwc_kv_flat, fwc_target_offset_r10, fwc_scaled_r10, fwc_all_r10)
                     for fwd_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
                         fwd_cast_row0 = fwd_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
                         fwd_raw_chunk = pl.tile.slice(fwd_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwd_cast_row0, 0])
@@ -3266,8 +3202,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                             for fwd_row_r11 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                 for fwd_chunk_r11 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                     fwd_scale_offset_r11 = fwd_row_r11 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                                    fwd_scale_offset_r11 = fwd_scale_offset_r11 + fwd_chunk_r11 * SPARSE_VF_WINDOW_STEP
-                                    fwd_groups_r11 = pl.reg.load(fwd_scale_flat, fwd_scale_offset_r11, lanes=SPARSE_VF_WINDOW_STEP)
+                                    fwd_scale_offset_r11 = fwd_scale_offset_r11 + fwd_chunk_r11 * SPARSE_VF_WINDOW_SCALE_TILE
+                                    fwd_groups_r11 = pl.reg.load(fwd_scale_flat, fwd_scale_offset_r11, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                                     fwd_factor_bits_r11 = pl.reg.group_broadcast(fwd_groups_r11, lanes=SPARSE_VF_REG_TILE)
                                     fwd_factor_r11 = pl.reg.interpret_cast(fwd_factor_bits_r11, dtype=pl.BF16)
                                     fwd_value_offset_r11 = fwd_row_r11 * HEAD_DIM + fwd_chunk_r11 * SPARSE_VF_REG_TILE
@@ -3275,7 +3211,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     fwd_scaled_r11 = pl.reg.mul(fwd_value_r11, fwd_factor_r11, fwd_all_r11)
                                     fwd_target_row_r11 = 48 + fwd_cast_row0 + fwd_row_r11
                                     fwd_target_offset_r11 = fwd_target_row_r11 * HEAD_DIM + fwd_chunk_r11 * SPARSE_VF_REG_TILE
-                                    fwd_write_r11 = pl.reg.store(fwd_kv_flat, fwd_target_offset_r11, fwd_scaled_r11, fwd_all_r11)
+                                    _fwd_write_r11 = pl.reg.store(fwd_kv_flat, fwd_target_offset_r11, fwd_scaled_r11, fwd_all_r11)
                     pl.system.tpush_to_aic(kv_half, split=1, id=1)
             for part in pl.range(parts):
                 column = part * SPARSE_VF_KEY_TILE
@@ -3339,11 +3275,11 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                         sm_new_den = pl.reg.add(sm_corrected_den, sm_tile_sum, sm_one)
                         sm_bf16_0 = pl.reg.convert(sm_probability0, dtype=pl.BF16, rounding='R', saturate=False)
                         sm_bf16_1 = pl.reg.convert(sm_probability1, dtype=pl.BF16, rounding='R', saturate=False)
-                        sm_store_p0 = pl.reg.store(sm_weights_flat, sm_offset, sm_bf16_0)
-                        sm_store_p1 = pl.reg.store(sm_weights_flat, sm_offset + 64, sm_bf16_1)
-                        sm_store_m = pl.reg.store(sm_next_max_flat, sm_row, sm_new_max)
-                        sm_store_l = pl.reg.store(sm_next_den_flat, sm_row, sm_new_den)
-                        sm_store_c = pl.reg.store(sm_correction_flat, sm_row, sm_alpha)
+                        _sm_store_p0 = pl.reg.store(sm_weights_flat, sm_offset, sm_bf16_0)
+                        _sm_store_p1 = pl.reg.store(sm_weights_flat, sm_offset + 64, sm_bf16_1)
+                        _sm_store_m = pl.reg.store(sm_next_max_flat, sm_row, sm_new_max)
+                        _sm_store_l = pl.reg.store(sm_next_den_flat, sm_row, sm_new_den)
+                        _sm_store_c = pl.reg.store(sm_correction_flat, sm_row, sm_alpha)
                 maximum = next_max
                 denominator = next_denominator
                 if compressed_keys > 0:
@@ -3441,8 +3377,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     for fwa_row_r12 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                         for fwa_chunk_r12 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                             fwa_scale_offset_r12 = fwa_row_r12 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                                            fwa_scale_offset_r12 = fwa_scale_offset_r12 + fwa_chunk_r12 * SPARSE_VF_WINDOW_STEP
-                                            fwa_groups_r12 = pl.reg.load(fwa_scale_flat, fwa_scale_offset_r12, lanes=SPARSE_VF_WINDOW_STEP)
+                                            fwa_scale_offset_r12 = fwa_scale_offset_r12 + fwa_chunk_r12 * SPARSE_VF_WINDOW_SCALE_TILE
+                                            fwa_groups_r12 = pl.reg.load(fwa_scale_flat, fwa_scale_offset_r12, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                                             fwa_factor_bits_r12 = pl.reg.group_broadcast(fwa_groups_r12, lanes=SPARSE_VF_REG_TILE)
                                             fwa_factor_r12 = pl.reg.interpret_cast(fwa_factor_bits_r12, dtype=pl.BF16)
                                             fwa_value_offset_r12 = fwa_row_r12 * HEAD_DIM + fwa_chunk_r12 * SPARSE_VF_REG_TILE
@@ -3450,7 +3386,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                             fwa_scaled_r12 = pl.reg.mul(fwa_value_r12, fwa_factor_r12, fwa_all_r12)
                                             fwa_target_row_r12 = 0 + fwa_cast_row0 + fwa_row_r12
                                             fwa_target_offset_r12 = fwa_target_row_r12 * HEAD_DIM + fwa_chunk_r12 * SPARSE_VF_REG_TILE
-                                            fwa_write_r12 = pl.reg.store(fwa_kv_flat, fwa_target_offset_r12, fwa_scaled_r12, fwa_all_r12)
+                                            _fwa_write_r12 = pl.reg.store(fwa_kv_flat, fwa_target_offset_r12, fwa_scaled_r12, fwa_all_r12)
                             ids_fwc = pl.tile.load(window_indices, [token, first_key_base + 64], [1, SPARSE_VF_FUSED_GATHER_TILE])
                             fwc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
                             fwc_first = pl.tile.read(ids_fwc, [0, 0])
@@ -3501,8 +3437,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     for fwb_row_r13 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                         for fwb_chunk_r13 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                             fwb_scale_offset_r13 = fwb_row_r13 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                                            fwb_scale_offset_r13 = fwb_scale_offset_r13 + fwb_chunk_r13 * SPARSE_VF_WINDOW_STEP
-                                            fwb_groups_r13 = pl.reg.load(fwb_scale_flat, fwb_scale_offset_r13, lanes=SPARSE_VF_WINDOW_STEP)
+                                            fwb_scale_offset_r13 = fwb_scale_offset_r13 + fwb_chunk_r13 * SPARSE_VF_WINDOW_SCALE_TILE
+                                            fwb_groups_r13 = pl.reg.load(fwb_scale_flat, fwb_scale_offset_r13, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                                             fwb_factor_bits_r13 = pl.reg.group_broadcast(fwb_groups_r13, lanes=SPARSE_VF_REG_TILE)
                                             fwb_factor_r13 = pl.reg.interpret_cast(fwb_factor_bits_r13, dtype=pl.BF16)
                                             fwb_value_offset_r13 = fwb_row_r13 * HEAD_DIM + fwb_chunk_r13 * SPARSE_VF_REG_TILE
@@ -3510,7 +3446,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                             fwb_scaled_r13 = pl.reg.mul(fwb_value_r13, fwb_factor_r13, fwb_all_r13)
                                             fwb_target_row_r13 = 16 + fwb_cast_row0 + fwb_row_r13
                                             fwb_target_offset_r13 = fwb_target_row_r13 * HEAD_DIM + fwb_chunk_r13 * SPARSE_VF_REG_TILE
-                                            fwb_write_r13 = pl.reg.store(fwb_kv_flat, fwb_target_offset_r13, fwb_scaled_r13, fwb_all_r13)
+                                            _fwb_write_r13 = pl.reg.store(fwb_kv_flat, fwb_target_offset_r13, fwb_scaled_r13, fwb_all_r13)
                             pl.system.tpush_to_aic(kv_chunk, split=1, id=1)
                             kv_chunk = pl.tile.create([SPARSE_VF_KEY_TILE // 4, HEAD_DIM], dtype=pl.BF16, target_memory=pl.MemorySpace.Vec)
                             ids_fwd = pl.tile.load(window_indices, [token, first_key_base + 80], [1, SPARSE_VF_FUSED_GATHER_TILE])
@@ -3563,8 +3499,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     for fwc_row_r14 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                         for fwc_chunk_r14 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                             fwc_scale_offset_r14 = fwc_row_r14 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                                            fwc_scale_offset_r14 = fwc_scale_offset_r14 + fwc_chunk_r14 * SPARSE_VF_WINDOW_STEP
-                                            fwc_groups_r14 = pl.reg.load(fwc_scale_flat, fwc_scale_offset_r14, lanes=SPARSE_VF_WINDOW_STEP)
+                                            fwc_scale_offset_r14 = fwc_scale_offset_r14 + fwc_chunk_r14 * SPARSE_VF_WINDOW_SCALE_TILE
+                                            fwc_groups_r14 = pl.reg.load(fwc_scale_flat, fwc_scale_offset_r14, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                                             fwc_factor_bits_r14 = pl.reg.group_broadcast(fwc_groups_r14, lanes=SPARSE_VF_REG_TILE)
                                             fwc_factor_r14 = pl.reg.interpret_cast(fwc_factor_bits_r14, dtype=pl.BF16)
                                             fwc_value_offset_r14 = fwc_row_r14 * HEAD_DIM + fwc_chunk_r14 * SPARSE_VF_REG_TILE
@@ -3572,7 +3508,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                             fwc_scaled_r14 = pl.reg.mul(fwc_value_r14, fwc_factor_r14, fwc_all_r14)
                                             fwc_target_row_r14 = 0 + fwc_cast_row0 + fwc_row_r14
                                             fwc_target_offset_r14 = fwc_target_row_r14 * HEAD_DIM + fwc_chunk_r14 * SPARSE_VF_REG_TILE
-                                            fwc_write_r14 = pl.reg.store(fwc_kv_flat, fwc_target_offset_r14, fwc_scaled_r14, fwc_all_r14)
+                                            _fwc_write_r14 = pl.reg.store(fwc_kv_flat, fwc_target_offset_r14, fwc_scaled_r14, fwc_all_r14)
                             for fwd_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
                                 fwd_cast_row0 = fwd_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
                                 fwd_raw_chunk = pl.tile.slice(fwd_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwd_cast_row0, 0])
@@ -3590,8 +3526,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     for fwd_row_r15 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                         for fwd_chunk_r15 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                             fwd_scale_offset_r15 = fwd_row_r15 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                                            fwd_scale_offset_r15 = fwd_scale_offset_r15 + fwd_chunk_r15 * SPARSE_VF_WINDOW_STEP
-                                            fwd_groups_r15 = pl.reg.load(fwd_scale_flat, fwd_scale_offset_r15, lanes=SPARSE_VF_WINDOW_STEP)
+                                            fwd_scale_offset_r15 = fwd_scale_offset_r15 + fwd_chunk_r15 * SPARSE_VF_WINDOW_SCALE_TILE
+                                            fwd_groups_r15 = pl.reg.load(fwd_scale_flat, fwd_scale_offset_r15, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                                             fwd_factor_bits_r15 = pl.reg.group_broadcast(fwd_groups_r15, lanes=SPARSE_VF_REG_TILE)
                                             fwd_factor_r15 = pl.reg.interpret_cast(fwd_factor_bits_r15, dtype=pl.BF16)
                                             fwd_value_offset_r15 = fwd_row_r15 * HEAD_DIM + fwd_chunk_r15 * SPARSE_VF_REG_TILE
@@ -3599,7 +3535,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                             fwd_scaled_r15 = pl.reg.mul(fwd_value_r15, fwd_factor_r15, fwd_all_r15)
                                             fwd_target_row_r15 = 16 + fwd_cast_row0 + fwd_row_r15
                                             fwd_target_offset_r15 = fwd_target_row_r15 * HEAD_DIM + fwd_chunk_r15 * SPARSE_VF_REG_TILE
-                                            fwd_write_r15 = pl.reg.store(fwd_kv_flat, fwd_target_offset_r15, fwd_scaled_r15, fwd_all_r15)
+                                            _fwd_write_r15 = pl.reg.store(fwd_kv_flat, fwd_target_offset_r15, fwd_scaled_r15, fwd_all_r15)
                             pl.system.tpush_to_aic(kv_chunk, split=1, id=1)
                         else:
                             ids_fca = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 0], [1, SPARSE_VF_FUSED_GATHER_TILE])
@@ -3659,8 +3595,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     for fca_row_r16 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                         for fca_chunk_r16 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                             fca_scale_offset_r16 = fca_row_r16 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                            fca_scale_offset_r16 = fca_scale_offset_r16 + fca_chunk_r16 * SPARSE_VF_COMPRESSED_STEP
-                                            fca_groups_r16 = pl.reg.load(fca_scale_flat, fca_scale_offset_r16, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                            fca_scale_offset_r16 = fca_scale_offset_r16 + fca_chunk_r16 * SPARSE_VF_COMPRESSED_SCALE_TILE
+                                            fca_groups_r16 = pl.reg.load(fca_scale_flat, fca_scale_offset_r16, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                                             fca_factor_bits_r16 = pl.reg.group_broadcast(fca_groups_r16, lanes=SPARSE_VF_REG_TILE)
                                             fca_factor_r16 = pl.reg.interpret_cast(fca_factor_bits_r16, dtype=pl.BF16)
                                             fca_value_offset_r16 = fca_row_r16 * HEAD_DIM + fca_chunk_r16 * SPARSE_VF_REG_TILE
@@ -3668,7 +3604,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                             fca_scaled_r16 = pl.reg.mul(fca_value_r16, fca_factor_r16, fca_all_r16)
                                             fca_target_row_r16 = 0 + fca_cast_row0 + fca_row_r16
                                             fca_target_offset_r16 = fca_target_row_r16 * HEAD_DIM + fca_chunk_r16 * SPARSE_VF_REG_TILE
-                                            fca_write_r16 = pl.reg.store(fca_kv_flat, fca_target_offset_r16, fca_scaled_r16, fca_all_r16)
+                                            _fca_write_r16 = pl.reg.store(fca_kv_flat, fca_target_offset_r16, fca_scaled_r16, fca_all_r16)
                             ids_fcc = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 64], [1, SPARSE_VF_FUSED_GATHER_TILE])
                             fcc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
                             for fcc_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
@@ -3705,8 +3641,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     for fcb_row_r17 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                         for fcb_chunk_r17 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                             fcb_scale_offset_r17 = fcb_row_r17 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                            fcb_scale_offset_r17 = fcb_scale_offset_r17 + fcb_chunk_r17 * SPARSE_VF_COMPRESSED_STEP
-                                            fcb_groups_r17 = pl.reg.load(fcb_scale_flat, fcb_scale_offset_r17, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                            fcb_scale_offset_r17 = fcb_scale_offset_r17 + fcb_chunk_r17 * SPARSE_VF_COMPRESSED_SCALE_TILE
+                                            fcb_groups_r17 = pl.reg.load(fcb_scale_flat, fcb_scale_offset_r17, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                                             fcb_factor_bits_r17 = pl.reg.group_broadcast(fcb_groups_r17, lanes=SPARSE_VF_REG_TILE)
                                             fcb_factor_r17 = pl.reg.interpret_cast(fcb_factor_bits_r17, dtype=pl.BF16)
                                             fcb_value_offset_r17 = fcb_row_r17 * HEAD_DIM + fcb_chunk_r17 * SPARSE_VF_REG_TILE
@@ -3714,7 +3650,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                             fcb_scaled_r17 = pl.reg.mul(fcb_value_r17, fcb_factor_r17, fcb_all_r17)
                                             fcb_target_row_r17 = 16 + fcb_cast_row0 + fcb_row_r17
                                             fcb_target_offset_r17 = fcb_target_row_r17 * HEAD_DIM + fcb_chunk_r17 * SPARSE_VF_REG_TILE
-                                            fcb_write_r17 = pl.reg.store(fcb_kv_flat, fcb_target_offset_r17, fcb_scaled_r17, fcb_all_r17)
+                                            _fcb_write_r17 = pl.reg.store(fcb_kv_flat, fcb_target_offset_r17, fcb_scaled_r17, fcb_all_r17)
                             pl.system.tpush_to_aic(kv_chunk, split=1, id=1)
                             kv_chunk = pl.tile.create([SPARSE_VF_KEY_TILE // 4, HEAD_DIM], dtype=pl.BF16, target_memory=pl.MemorySpace.Vec)
                             ids_fcd = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 80], [1, SPARSE_VF_FUSED_GATHER_TILE])
@@ -3753,8 +3689,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     for fcc_row_r18 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                         for fcc_chunk_r18 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                             fcc_scale_offset_r18 = fcc_row_r18 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                            fcc_scale_offset_r18 = fcc_scale_offset_r18 + fcc_chunk_r18 * SPARSE_VF_COMPRESSED_STEP
-                                            fcc_groups_r18 = pl.reg.load(fcc_scale_flat, fcc_scale_offset_r18, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                            fcc_scale_offset_r18 = fcc_scale_offset_r18 + fcc_chunk_r18 * SPARSE_VF_COMPRESSED_SCALE_TILE
+                                            fcc_groups_r18 = pl.reg.load(fcc_scale_flat, fcc_scale_offset_r18, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                                             fcc_factor_bits_r18 = pl.reg.group_broadcast(fcc_groups_r18, lanes=SPARSE_VF_REG_TILE)
                                             fcc_factor_r18 = pl.reg.interpret_cast(fcc_factor_bits_r18, dtype=pl.BF16)
                                             fcc_value_offset_r18 = fcc_row_r18 * HEAD_DIM + fcc_chunk_r18 * SPARSE_VF_REG_TILE
@@ -3762,7 +3698,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                             fcc_scaled_r18 = pl.reg.mul(fcc_value_r18, fcc_factor_r18, fcc_all_r18)
                                             fcc_target_row_r18 = 0 + fcc_cast_row0 + fcc_row_r18
                                             fcc_target_offset_r18 = fcc_target_row_r18 * HEAD_DIM + fcc_chunk_r18 * SPARSE_VF_REG_TILE
-                                            fcc_write_r18 = pl.reg.store(fcc_kv_flat, fcc_target_offset_r18, fcc_scaled_r18, fcc_all_r18)
+                                            _fcc_write_r18 = pl.reg.store(fcc_kv_flat, fcc_target_offset_r18, fcc_scaled_r18, fcc_all_r18)
                             for fcd_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
                                 fcd_cast_row0 = fcd_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
                                 fcd_raw_chunk = pl.tile.slice(fcd_raw, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [fcd_cast_row0, 0])
@@ -3778,8 +3714,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                     for fcd_row_r19 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                         for fcd_chunk_r19 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                             fcd_scale_offset_r19 = fcd_row_r19 * SPARSE_VF_COMPRESSED_HALFWORDS + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                                            fcd_scale_offset_r19 = fcd_scale_offset_r19 + fcd_chunk_r19 * SPARSE_VF_COMPRESSED_STEP
-                                            fcd_groups_r19 = pl.reg.load(fcd_scale_flat, fcd_scale_offset_r19, lanes=SPARSE_VF_COMPRESSED_STEP)
+                                            fcd_scale_offset_r19 = fcd_scale_offset_r19 + fcd_chunk_r19 * SPARSE_VF_COMPRESSED_SCALE_TILE
+                                            fcd_groups_r19 = pl.reg.load(fcd_scale_flat, fcd_scale_offset_r19, lanes=SPARSE_VF_COMPRESSED_SCALE_TILE)
                                             fcd_factor_bits_r19 = pl.reg.group_broadcast(fcd_groups_r19, lanes=SPARSE_VF_REG_TILE)
                                             fcd_factor_r19 = pl.reg.interpret_cast(fcd_factor_bits_r19, dtype=pl.BF16)
                                             fcd_value_offset_r19 = fcd_row_r19 * HEAD_DIM + fcd_chunk_r19 * SPARSE_VF_REG_TILE
@@ -3787,7 +3723,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                             fcd_scaled_r19 = pl.reg.mul(fcd_value_r19, fcd_factor_r19, fcd_all_r19)
                                             fcd_target_row_r19 = 16 + fcd_cast_row0 + fcd_row_r19
                                             fcd_target_offset_r19 = fcd_target_row_r19 * HEAD_DIM + fcd_chunk_r19 * SPARSE_VF_REG_TILE
-                                            fcd_write_r19 = pl.reg.store(fcd_kv_flat, fcd_target_offset_r19, fcd_scaled_r19, fcd_all_r19)
+                                            _fcd_write_r19 = pl.reg.store(fcd_kv_flat, fcd_target_offset_r19, fcd_scaled_r19, fcd_all_r19)
                             pl.system.tpush_to_aic(kv_chunk, split=1, id=1)
                     else:
                         kv_half = pl.tile.create([SPARSE_VF_KEY_TILE // 2, HEAD_DIM], dtype=pl.BF16, target_memory=pl.MemorySpace.Vec)
@@ -3875,8 +3811,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                 for fwa_row_r20 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                     for fwa_chunk_r20 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                         fwa_scale_offset_r20 = fwa_row_r20 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                                        fwa_scale_offset_r20 = fwa_scale_offset_r20 + fwa_chunk_r20 * SPARSE_VF_WINDOW_STEP
-                                        fwa_groups_r20 = pl.reg.load(fwa_scale_flat, fwa_scale_offset_r20, lanes=SPARSE_VF_WINDOW_STEP)
+                                        fwa_scale_offset_r20 = fwa_scale_offset_r20 + fwa_chunk_r20 * SPARSE_VF_WINDOW_SCALE_TILE
+                                        fwa_groups_r20 = pl.reg.load(fwa_scale_flat, fwa_scale_offset_r20, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                                         fwa_factor_bits_r20 = pl.reg.group_broadcast(fwa_groups_r20, lanes=SPARSE_VF_REG_TILE)
                                         fwa_factor_r20 = pl.reg.interpret_cast(fwa_factor_bits_r20, dtype=pl.BF16)
                                         fwa_value_offset_r20 = fwa_row_r20 * HEAD_DIM + fwa_chunk_r20 * SPARSE_VF_REG_TILE
@@ -3884,7 +3820,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                         fwa_scaled_r20 = pl.reg.mul(fwa_value_r20, fwa_factor_r20, fwa_all_r20)
                                         fwa_target_row_r20 = 0 + fwa_cast_row0 + fwa_row_r20
                                         fwa_target_offset_r20 = fwa_target_row_r20 * HEAD_DIM + fwa_chunk_r20 * SPARSE_VF_REG_TILE
-                                        fwa_write_r20 = pl.reg.store(fwa_kv_flat, fwa_target_offset_r20, fwa_scaled_r20, fwa_all_r20)
+                                        _fwa_write_r20 = pl.reg.store(fwa_kv_flat, fwa_target_offset_r20, fwa_scaled_r20, fwa_all_r20)
                         ids_fwc = pl.tile.load(window_indices, [token, first_key_base + 32], [1, SPARSE_VF_FUSED_GATHER_TILE])
                         fwc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
                         fwc_first = pl.tile.read(ids_fwc, [0, 0])
@@ -3935,8 +3871,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                 for fwb_row_r21 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                     for fwb_chunk_r21 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                         fwb_scale_offset_r21 = fwb_row_r21 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                                        fwb_scale_offset_r21 = fwb_scale_offset_r21 + fwb_chunk_r21 * SPARSE_VF_WINDOW_STEP
-                                        fwb_groups_r21 = pl.reg.load(fwb_scale_flat, fwb_scale_offset_r21, lanes=SPARSE_VF_WINDOW_STEP)
+                                        fwb_scale_offset_r21 = fwb_scale_offset_r21 + fwb_chunk_r21 * SPARSE_VF_WINDOW_SCALE_TILE
+                                        fwb_groups_r21 = pl.reg.load(fwb_scale_flat, fwb_scale_offset_r21, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                                         fwb_factor_bits_r21 = pl.reg.group_broadcast(fwb_groups_r21, lanes=SPARSE_VF_REG_TILE)
                                         fwb_factor_r21 = pl.reg.interpret_cast(fwb_factor_bits_r21, dtype=pl.BF16)
                                         fwb_value_offset_r21 = fwb_row_r21 * HEAD_DIM + fwb_chunk_r21 * SPARSE_VF_REG_TILE
@@ -3944,7 +3880,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                         fwb_scaled_r21 = pl.reg.mul(fwb_value_r21, fwb_factor_r21, fwb_all_r21)
                                         fwb_target_row_r21 = 16 + fwb_cast_row0 + fwb_row_r21
                                         fwb_target_offset_r21 = fwb_target_row_r21 * HEAD_DIM + fwb_chunk_r21 * SPARSE_VF_REG_TILE
-                                        fwb_write_r21 = pl.reg.store(fwb_kv_flat, fwb_target_offset_r21, fwb_scaled_r21, fwb_all_r21)
+                                        _fwb_write_r21 = pl.reg.store(fwb_kv_flat, fwb_target_offset_r21, fwb_scaled_r21, fwb_all_r21)
                         ids_fwd = pl.tile.load(window_indices, [token, first_key_base + 48], [1, SPARSE_VF_FUSED_GATHER_TILE])
                         fwd_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
                         fwd_first = pl.tile.read(ids_fwd, [0, 0])
@@ -3995,8 +3931,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                 for fwc_row_r22 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                     for fwc_chunk_r22 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                         fwc_scale_offset_r22 = fwc_row_r22 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                                        fwc_scale_offset_r22 = fwc_scale_offset_r22 + fwc_chunk_r22 * SPARSE_VF_WINDOW_STEP
-                                        fwc_groups_r22 = pl.reg.load(fwc_scale_flat, fwc_scale_offset_r22, lanes=SPARSE_VF_WINDOW_STEP)
+                                        fwc_scale_offset_r22 = fwc_scale_offset_r22 + fwc_chunk_r22 * SPARSE_VF_WINDOW_SCALE_TILE
+                                        fwc_groups_r22 = pl.reg.load(fwc_scale_flat, fwc_scale_offset_r22, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                                         fwc_factor_bits_r22 = pl.reg.group_broadcast(fwc_groups_r22, lanes=SPARSE_VF_REG_TILE)
                                         fwc_factor_r22 = pl.reg.interpret_cast(fwc_factor_bits_r22, dtype=pl.BF16)
                                         fwc_value_offset_r22 = fwc_row_r22 * HEAD_DIM + fwc_chunk_r22 * SPARSE_VF_REG_TILE
@@ -4004,7 +3940,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                         fwc_scaled_r22 = pl.reg.mul(fwc_value_r22, fwc_factor_r22, fwc_all_r22)
                                         fwc_target_row_r22 = 32 + fwc_cast_row0 + fwc_row_r22
                                         fwc_target_offset_r22 = fwc_target_row_r22 * HEAD_DIM + fwc_chunk_r22 * SPARSE_VF_REG_TILE
-                                        fwc_write_r22 = pl.reg.store(fwc_kv_flat, fwc_target_offset_r22, fwc_scaled_r22, fwc_all_r22)
+                                        _fwc_write_r22 = pl.reg.store(fwc_kv_flat, fwc_target_offset_r22, fwc_scaled_r22, fwc_all_r22)
                         for fwd_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
                             fwd_cast_row0 = fwd_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
                             fwd_raw_chunk = pl.tile.slice(fwd_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwd_cast_row0, 0])
@@ -4022,8 +3958,8 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                 for fwd_row_r23 in pl.hardware_loop(SPARSE_VF_FUSED_SCALE_TILE):
                                     for fwd_chunk_r23 in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
                                         fwd_scale_offset_r23 = fwd_row_r23 * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                                        fwd_scale_offset_r23 = fwd_scale_offset_r23 + fwd_chunk_r23 * SPARSE_VF_WINDOW_STEP
-                                        fwd_groups_r23 = pl.reg.load(fwd_scale_flat, fwd_scale_offset_r23, lanes=SPARSE_VF_WINDOW_STEP)
+                                        fwd_scale_offset_r23 = fwd_scale_offset_r23 + fwd_chunk_r23 * SPARSE_VF_WINDOW_SCALE_TILE
+                                        fwd_groups_r23 = pl.reg.load(fwd_scale_flat, fwd_scale_offset_r23, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
                                         fwd_factor_bits_r23 = pl.reg.group_broadcast(fwd_groups_r23, lanes=SPARSE_VF_REG_TILE)
                                         fwd_factor_r23 = pl.reg.interpret_cast(fwd_factor_bits_r23, dtype=pl.BF16)
                                         fwd_value_offset_r23 = fwd_row_r23 * HEAD_DIM + fwd_chunk_r23 * SPARSE_VF_REG_TILE
@@ -4031,7 +3967,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
                                         fwd_scaled_r23 = pl.reg.mul(fwd_value_r23, fwd_factor_r23, fwd_all_r23)
                                         fwd_target_row_r23 = 48 + fwd_cast_row0 + fwd_row_r23
                                         fwd_target_offset_r23 = fwd_target_row_r23 * HEAD_DIM + fwd_chunk_r23 * SPARSE_VF_REG_TILE
-                                        fwd_write_r23 = pl.reg.store(fwd_kv_flat, fwd_target_offset_r23, fwd_scaled_r23, fwd_all_r23)
+                                        _fwd_write_r23 = pl.reg.store(fwd_kv_flat, fwd_target_offset_r23, fwd_scaled_r23, fwd_all_r23)
                         pl.system.tpush_to_aic(kv_half, split=1, id=1)
                 correction_col = pl.reshape(correction, [SPARSE_VF_FUSED_AIV_HEAD_TILE, 1])
                 weighted_0 = pl.system.tpop_from_aic(shape=[SPARSE_VF_FUSED_AIV_HEAD_TILE, 128], dtype=pl.FP32, split=1, id=3)
@@ -4141,7 +4077,7 @@ def gather_sparse_attention_pypto(
         qflat = pl.reshape(query, [tokens * LOCAL_H, HEAD_DIM])
         oflat = pl.reshape(output, [tokens * LOCAL_H, HEAD_DIM])
         sink_row = pl.reshape(sink, [1, LOCAL_H])
-        workers = pl.min(num_tokens * (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE), WORKERS)
+        workers = pl.min(num_tokens * (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE), SPARSE_VF_WORKER_TILE)
         workers = pl.max(1, workers)
         with pl.spmd(workers, name_hint='sparse_vf_fused', deps=[source_ready]) as fused:
             sparse_vf_fused_group(
@@ -4193,11 +4129,10 @@ def l2_gather_sparse_attention(
         q = query[start:start + num_tokens, :]
         wi = window_indices[start:start + num_tokens, :]
         ci = compressed_indices[start:start + num_tokens, :]
-        ready = pl.system.task_dummy(deps=[])
         if compressed_keys == 0:
-            gather_sparse_attention(q, wi, window, wi, window, sink, output, num_tokens, ready, 0)
+            gather_sparse_attention(q, wi, window, wi, window, sink, output, num_tokens, 0)
         else:
-            gather_sparse_attention(q, wi, window, ci, compressed, sink, output, num_tokens, ready, INDEX_TOPK)
+            gather_sparse_attention(q, wi, window, ci, compressed, sink, output, num_tokens, INDEX_TOPK)
     return output
 
 
@@ -4257,7 +4192,6 @@ def golden_gather_sparse_attention(
         denominator = denominator * correction + torch.exp(sink.float() - final_maximum)
         output[token_begin:token_end] = (numerator * (correction / denominator).unsqueeze(-1)).bfloat16()
     return output.reshape(query[:tokens].shape)
-
 
 
 def build_sparse_attention_specs(rows, active, *, compressed_keys, start=0, case="normal"):

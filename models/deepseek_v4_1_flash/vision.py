@@ -360,14 +360,14 @@ def _make_vit(cfg):
             bqkv_slice = qkv_b[layer:layer + 1, :]
             bqkv = pl.reshape(bqkv_slice, [3 * d])
             linear_inline(normalized, wqkv, bqkv, qkv, 1)
-            attended = pl.create_tensor([rows, d], dtype=pl.BF16)
-            attention(qkv, cos, sin, attended)
+            attn_out = pl.create_tensor([rows, d], dtype=pl.BF16)
+            attention(qkv, cos, sin, attn_out)
             projected = pl.create_tensor([rows, d], dtype=pl.BF16)
             wo_slice = out_w[layer:layer + 1, :, :]
             wo = pl.reshape(wo_slice, [d, d])
             bo_slice = out_b[layer:layer + 1, :]
             bo = pl.reshape(bo_slice, [d])
-            linear_inline(attended, wo, bo, projected, 1)
+            linear_inline(attn_out, wo, bo, projected, 1)
             residual = pl.create_tensor([rows, d], dtype=pl.BF16)
             add_inline(projected, x, residual)
             mlp_input = pl.create_tensor([rows, d], dtype=pl.BF16)
@@ -659,9 +659,9 @@ def golden_vision(patches, weights, n_h, n_w, cfg=VisionConfig()):
         keys = rotate(k).transpose(0, 1)
         values = v.transpose(0, 1)
         with sdpa_kernel(SDPBackend.MATH):
-            attended = F.scaled_dot_product_attention(query, keys, values)
-        attended = attended.transpose(0, 1).reshape(-1, d)
-        x = x + F.linear(attended, weights["out_w"][layer].t(), weights["out_b"][layer])
+            attn_out = F.scaled_dot_product_attention(query, keys, values)
+        attn_out = attn_out.transpose(0, 1).reshape(-1, d)
+        x = x + F.linear(attn_out, weights["out_w"][layer].t(), weights["out_b"][layer])
         normalized = _golden_norm(x, weights["norm2_w"][layer])
         gate, up = F.linear(normalized, weights["mlp1_w"][layer].t()).chunk(2, dim=-1)
         x = x + F.linear(F.silu(gate) * up, weights["mlp2_w"][layer].t())

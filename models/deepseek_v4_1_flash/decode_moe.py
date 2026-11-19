@@ -46,7 +46,7 @@ config.N_LOCAL_EXPERTS = _experts_per_rank
 
 
 from config import FLASH as M, EP_SIZE, MOE_TOKENS, MOE_RECV_MAX, N_LOCAL_EXPERTS, T_DYN, ROUTE_T_DYN
-from gate import gate_from_bf16
+from gate import gate
 from expert_shared import expert_shared
 from expert_routed import (
     dispatch,
@@ -156,7 +156,7 @@ def combine_scattered(
 
     # Wait for local and peer routed-output stores.
     routed_rows = pl.tensor.view(routed_output, [T, topk * D])
-    with pl.spmd(pl.min((T + COMBINE_T_TILE - 1) // COMBINE_T_TILE, 64), name_hint="combine_reduce", deps=[_cwait_tid, notify_tid]) as _reduce_tid:
+    with pl.spmd(pl.min((T + COMBINE_T_TILE - 1) // COMBINE_T_TILE, 64), name_hint="combine_reduce", deps=[_cwait_tid, notify_tid]):
         core = pl.tile.get_block_idx()
         for t in pl.range(core * COMBINE_T_TILE, T, 64 * COMBINE_T_TILE):
             rows = pl.min(COMBINE_T_TILE, T - t)
@@ -173,7 +173,7 @@ def combine_scattered(
                 result = pl.tile.assemble(result, ffn_row, [0, 0])
             result_valid = pl.set_validshape(result, rows, D)
             ffn_out = pl.store(result_valid, [t, 0], ffn_out)
-    return _reduce_tid
+    return ffn_out
 
 
 @pl.jit.inline(auto_scope=False)
@@ -224,7 +224,7 @@ def moe(
     x_norm = pl.create_tensor([t, D], dtype=pl.BF16)
     hc_head_norm_store(x_hc, pre_mix, norm_weight, x_norm, x_mixed, num_tokens, worker_limit=64)
     inv_rms, partials = hc_project(x_hc, hc_ffn_fn, rms_worker_limit=64)
-    mixes_ready = hc_sinkhorn(inv_rms, partials, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
+    hc_sinkhorn(inv_rms, partials, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
 
     # MoE transport and routed-result scope.
     with pl.scope():
@@ -232,7 +232,7 @@ def moe(
         x_norm_scale = pl.create_tensor([1, t * (D // MX_GROUP)], dtype=pl.FP8E8M0)
         indices = pl.create_tensor([MOE_TOKENS, topk], dtype=pl.INT32)
         weights = pl.create_tensor([t, topk], dtype=pl.FP32)
-        gate_from_bf16(
+        gate(
             x_norm, gate_weight, correction_bias, num_tokens,
             x_norm_mx, x_norm_scale, indices, weights, n_experts=EP_SIZE * local_experts, topk=topk,
         )
@@ -256,7 +256,7 @@ def moe(
         recv_route_local = pl.create_tensor([local_experts, RECV_MAX], dtype=pl.INT32)
         recv_count_local = pl.create_tensor([local_experts, 1], dtype=pl.INT32)
         recv_meta_local = pl.create_tensor([EP_SIZE, local_experts], dtype=pl.INT32)
-        input_ready = dispatch(
+        dispatch(
             dispatch_indices, x_norm_mx, x_norm_scale, weights,
             recv_x_local, recv_scale_local_backing,
             recv_weight_local, recv_route_local, recv_count_local, recv_meta_local,
@@ -271,19 +271,16 @@ def moe(
             routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
             routed_w2, routed_w2_scale,
             recv_route_local, recv_meta_local,
-            routed_output, input_ready, local_experts=local_experts, topk=topk,
+            routed_output, local_experts=local_experts, topk=topk,
         )
         sublayer = pl.create_tensor([t, D], dtype=pl.BF16)
-        output_ready = combine_scattered(
+        combine_scattered(
             shared_result, sublayer,
             routed_output, combine_arrived,
             scatter_done,
             num_tokens, ep_rank, moe_epoch, topk=topk,
         )
-        hc_post_deps = pl.array.create(2, pl.TASK_ID)
-        hc_post_deps[0] = output_ready
-        hc_post_deps[1] = mixes_ready
-        hc_post(sublayer, x_hc, post_mix, residual_mix, x_next, deps=hc_post_deps)
+        hc_post(sublayer, x_hc, post_mix, residual_mix, x_next, deps=None, dep_count=0)
         recv_x_last_use[0] = scatter_done
     return x_next
 

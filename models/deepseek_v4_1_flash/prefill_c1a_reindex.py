@@ -21,7 +21,7 @@ from config import (
 )
 from prefill_indexer import prefill_indexer
 from sparse_attention import gather_sparse_attention
-from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
+from qkv_proj_rope import qkv_quant, q_proj_rope, kv_proj, window_publish
 from o_proj import o_proj_hc_post, retire_prefill_signals
 from hc import hc_head_norm, hc_project, hc_sinkhorn, zero_bf16_padding
 from prefill_cp_allgather import prefill_cp_input_allgather
@@ -107,25 +107,25 @@ def prefill_c1a_reindex(
     q_capacity = pl.tensor.dim(hc_input, 0)
     post_mix = pl.create_tensor([q_capacity, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([q_capacity, HC_MULT, HC_MULT], dtype=pl.FP32)
-    normalized_ready = hc_head_norm(hc_input, hc_pre_mix, w_attn_norm, kv_hidden, worker_limit=64)
+    hc_head_norm(hc_input, hc_pre_mix, w_attn_norm, kv_hidden, worker_limit=64)
     inv_rms, partials = hc_project(hc_input, hc_attn_fn, rms_worker_limit=64)
     hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, hc_next_pre_mix, post_mix, residual_mix)
     zero_bf16_padding(kv_hidden, kv_token_count)
     if kv_token_count > 0:
         kv_capacity = pl.tensor.dim(kv_hidden, 0)
         kv_projection = pl.create_tensor([kv_capacity, HEAD_DIM], dtype=pl.BF16)
-        kv_input_payload, kv_input_scales, kv_input_payload_padded_rows = quantize_projection_input(
+        kv_input_payload, kv_input_scales, kv_input_payload_padded_rows = qkv_quant(
             kv_hidden, kv_token_count, row_tile=256,
         )
-        kv_projection = kv_proj(
+        kv_proj(
             kv_input_payload, kv_input_scales,
             wkv, wkv_scale,
             kv_projection, kv_token_count, worker_limit=8, row_tile=256,
         )
-        kv_ready = window_publish(
+        window_publish(
             kv_projection, wkv_norm, kv_rope_cos, kv_rope_sin,
             kv_write_slots, window_cache,
-            kv_token_count, normalized_ready,
+            kv_token_count,
         )
         chunk_hidden = pl.create_tensor([Q_TILE, D], dtype=pl.BF16)
         chunk_rope_cos = pl.create_tensor([Q_TILE, ROPE_DIM // 2], dtype=pl.FP32)
@@ -140,11 +140,12 @@ def prefill_c1a_reindex(
         q_latent = pl.create_tensor([Q_TILE, Q_LORA], dtype=pl.BF16)
         q = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
 
-        chunk_done = normalized_ready
+        no_dependency = pl.system.task_invalid()
+        chunk_done = no_dependency
         for start in pl.range(0, kv_token_count, Q_TILE):
             active = pl.min(Q_TILE, kv_token_count - start)
             # The prior chunk must finish reading every reusable scratch buffer.
-            with pl.spmd(WORKER_TILE, name_hint="prefill_c1a_reindex_stage", deps=[chunk_done]) as stage_tid:
+            with pl.spmd(WORKER_TILE, name_hint="prefill_c1a_reindex_stage", deps=[chunk_done]):
                 worker = pl.tile.get_block_idx()
                 for row in pl.range(worker, active, WORKER_TILE):
                     source_row = start + row
@@ -162,7 +163,7 @@ def prefill_c1a_reindex(
                     pl.write(chunk_compressed_lens, [row], compressed_lens_value)
                     pool_block_counts_value = pl.read(q_pool_block_counts, [start + row])
                     pl.write(chunk_pool_block_counts, [row], pool_block_counts_value)
-            q_input_payload, q_input_scales, q_input_payload_padded_rows = quantize_projection_input(
+            q_input_payload, q_input_scales, q_input_payload_padded_rows = qkv_quant(
                 chunk_hidden, active, row_tile=256,
             )
             q_proj_rope(
@@ -175,22 +176,20 @@ def prefill_c1a_reindex(
                 padded_rows=q_input_payload_padded_rows,
                 qa_row_tile=256, qb_row_tile=128,
             )
-            attended = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-            index_inputs_ready = pl.system.task_dummy(deps=[stage_tid, kv_ready])
-            index_ready = prefill_indexer(
+            attn_out = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+            _index_ready = prefill_indexer(
                 chunk_hidden, q_latent, chunk_request_ids, chunk_compressed_lens,
                 index_cache, index_cache_scale, index_block_table,
                 chunk_rope_cos, chunk_rope_sin, w_index_q, w_index_q_scale, w_index_score,
-                chunk_pool_block_ids, chunk_pool_block_counts, chunk_topk_indices, active, index_inputs_ready,
+                chunk_pool_block_ids, chunk_pool_block_counts, chunk_topk_indices, active, no_dependency,
                 pool=True, c2a=False,
             )
-            attention_ready = pl.system.task_dummy(deps=[stage_tid, kv_ready, index_ready])
             gather_sparse_attention(
                 q, chunk_window_indices, window_cache, chunk_topk_indices, compressed_cache,
-                attn_sink, attended, active, attention_ready, compressed_keys=INDEX_TOPK,
+                attn_sink, attn_out, active, compressed_keys=INDEX_TOPK,
             )
             _chunk_output, projection_done = o_proj_hc_post(
-                attended, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_rope_cos, chunk_rope_sin,
+                attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_rope_cos, chunk_rope_sin,
                 hc_input[start:start + active, :, :], post_mix[start:start + active, :],
                 residual_mix[start:start + active, :, :], hc_output[start:start + active, :, :], active,
                 oa_row_tile=128, ob_row_tile=128,
@@ -462,8 +461,6 @@ def prefill_c1a_reindex_cp(
         q_hidden, cp_hidden_window, cp_hidden_arrived, kv_restore_indices, kv_hidden,
         cp_group_base, cp_rank, attention_epoch, group_size=CP_SIZE,
     )
-    publication = pl.array.create(1, pl.TASK_ID)
-    publication[0] = gathered
     if kv_token_count > 0:
         kv_capacity = pl.tensor.dim(kv_hidden, 0)
         kv_projection = pl.create_tensor([kv_capacity, HEAD_DIM], dtype=pl.BF16)
@@ -472,20 +469,19 @@ def prefill_c1a_reindex_cp(
             worker = pl.tile.get_block_idx()
             for row in pl.range(worker, kv_token_count, WORKER_TILE):
                 kv_projection[row : row + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-        kv_input_payload, kv_input_scales, kv_input_payload_padded_rows = quantize_projection_input(
+        kv_input_payload, kv_input_scales, kv_input_payload_padded_rows = qkv_quant(
             kv_hidden, kv_token_count, row_tile=256,
         )
-        kv_projection = kv_proj(
+        kv_proj(
             kv_input_payload, kv_input_scales,
             wkv, wkv_scale,
             kv_projection, kv_token_count, worker_limit=8, row_tile=256,
         )
-        kv_ready = window_publish(
+        window_publish(
             kv_projection, wkv_norm, kv_rope_cos, kv_rope_sin,
             kv_write_slots, window_cache,
-            kv_token_count, gathered,
+            kv_token_count,
         )
-        publication[0] = kv_ready
         chunk_hidden = pl.create_tensor([Q_TILE, D], dtype=pl.BF16)
         chunk_rope_cos = pl.create_tensor([Q_TILE, ROPE_DIM // 2], dtype=pl.FP32)
         chunk_rope_sin = pl.create_tensor([Q_TILE, ROPE_DIM // 2], dtype=pl.FP32)
@@ -521,7 +517,7 @@ def prefill_c1a_reindex_cp(
                     pl.write(chunk_compressed_lens, [row], compressed_lens_value)
                     pool_block_counts_value = pl.read(q_pool_block_counts, [start + row])
                     pl.write(chunk_pool_block_counts, [row], pool_block_counts_value)
-            q_input_payload, q_input_scales, q_input_payload_padded_rows = quantize_projection_input(
+            q_input_payload, q_input_scales, q_input_payload_padded_rows = qkv_quant(
                 chunk_hidden, active, row_tile=256,
             )
             q_proj_rope(
@@ -534,22 +530,20 @@ def prefill_c1a_reindex_cp(
                 padded_rows=q_input_payload_padded_rows,
                 qa_row_tile=256, qb_row_tile=128,
             )
-            attended = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-            index_inputs_ready = pl.system.task_dummy(deps=[stage_tid, kv_ready])
-            index_ready = prefill_indexer(
+            attn_out = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+            _index_ready = prefill_indexer(
                 chunk_hidden, q_latent, chunk_request_ids, chunk_compressed_lens,
                 index_cache, index_cache_scale, index_block_table,
                 chunk_rope_cos, chunk_rope_sin, w_index_q, w_index_q_scale, w_index_score,
-                chunk_pool_block_ids, chunk_pool_block_counts, chunk_topk_indices, active, index_inputs_ready,
+                chunk_pool_block_ids, chunk_pool_block_counts, chunk_topk_indices, active, stage_tid,
                 pool=True, c2a=False,
             )
-            attention_ready = pl.system.task_dummy(deps=[stage_tid, kv_ready, index_ready])
             gather_sparse_attention(
                 q, chunk_window_indices, window_cache, chunk_topk_indices, compressed_cache,
-                attn_sink, attended, active, attention_ready, compressed_keys=INDEX_TOPK,
+                attn_sink, attn_out, active, compressed_keys=INDEX_TOPK,
             )
             _chunk_output, projection_done = o_proj_hc_post(
-                attended, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_rope_cos, chunk_rope_sin,
+                attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_rope_cos, chunk_rope_sin,
                 hc_input[start:start + active, :, :], post_mix[start:start + active, :],
                 residual_mix[start:start + active, :, :], hc_output[start:start + active, :, :], active,
                 oa_row_tile=128, ob_row_tile=128,
@@ -561,7 +555,7 @@ def prefill_c1a_reindex_cp(
                     q_topk_indices[start + row:start + row + 1, :] = chunk_topk_indices[row:row + 1, :]
             chunk_done = collect_tid
     if q_token_count < q_capacity:
-        with pl.spmd(32, name_hint="prefill_c1a_reindex_cp_zero_padding", deps=[publication[0]]):
+        with pl.spmd(32, name_hint="prefill_c1a_reindex_cp_zero_padding", deps=[gathered]):
             worker = pl.tile.get_block_idx()
             for row in pl.range(q_token_count + worker, q_capacity, 32):
                 zero_output = pl.full([1, HC_MULT * D], dtype=pl.FP32, value=0.0)

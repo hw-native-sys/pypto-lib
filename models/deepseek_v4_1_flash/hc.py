@@ -397,7 +397,7 @@ def _hc_collapse_rows(
         pl.max(pl.min((tokens + row_tile - 1) // row_tile, worker_limit), 1),
         name_hint="hc_collapse_norm",
         allow_early_resolve=True,
-    ) as ready:
+    ):
         block = pl.tile.get_block_idx()
         gamma = pl.load(norm_weight, [0], [D], target_memory=pl.Mem.Vec)
         for start in pl.range(block * row_tile, tokens, pl.tile.get_block_num() * row_tile):
@@ -440,7 +440,7 @@ def _hc_collapse_rows(
                 else:
                     zero = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
                     pl.store(zero, [row, 0], output)
-    return ready
+    return output
 
 
 @pl.jit.inline
@@ -638,8 +638,9 @@ def hc_post(
     residual_mix: pl.Tensor,
     output: pl.Tensor,
     deps: pl.Array[2, pl.TASK_ID],
+    dep_count: pl.constexpr,
 ):
-    """Mix all four residual streams after the supplied producer dependencies."""
+    """Mix all four residual streams with optional producer dependencies."""
     tokens = pl.tensor.dim(sublayer, 0)
     sublayer_view = pl.reshape(sublayer, [tokens, D])
     residual_view = pl.reshape(residual, [tokens, HC_MULT, D])
@@ -647,7 +648,7 @@ def hc_post(
     mix_view = pl.reshape(residual_mix, [tokens, HC_MULT, HC_MULT])
     output_view = pl.reshape(output, [tokens, HC_MULT, D])
     workers = pl.min(tokens * (D // D_TILE) * HC_MULT, POST_WORKER_TILE)
-    with pl.spmd(workers, name_hint="hc_post", deps=[deps]):
+    with pl.spmd(workers, name_hint="hc_post", deps=[deps[i] for i in range(dep_count)]):
         _hc_post(sublayer_view, residual_view, post_view, mix_view, output_view, tokens)
     return output
 
@@ -844,8 +845,7 @@ def l2_hc_post(
     post_mix.bind_dynamic(0, T_DYN)
     residual_mix.bind_dynamic(0, T_DYN)
     output.bind_dynamic(0, T_DYN)
-    hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(sublayer, residual, post_mix, residual_mix, output, deps=hc_post_deps)
+    hc_post(sublayer, residual, post_mix, residual_mix, output, deps=None, dep_count=0)
     return output
 
 

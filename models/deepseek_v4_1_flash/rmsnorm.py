@@ -6,15 +6,16 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek V4.1 Flash RMSNorm kernels and shared Torch references."""
-
-from __future__ import annotations
+"""DeepSeek V4.1 Flash RMSNorm with folded FP32 square reduction."""
 
 import pypto.language as pl
-import torch
 
 from config import FLASH as M
 
+
+# Tile dimensions
+rows = pl.dynamic("rows")
+width = pl.dynamic("width")
 
 # model config
 EPS = M.rms_norm_eps
@@ -23,11 +24,10 @@ EPS = M.rms_norm_eps
 NORM_T_TILE = 8
 
 
-# Tile dimensions bind to the constexpr width during specialization.
 @pl.jit.inline(auto_scope=False)
 def _rms_norm_rows(
-    source: pl.Tile[[rows, width], pl.BF16, pl.Mem.Vec],  # noqa: F821
-    gamma: pl.Tile[[width], pl.BF16, pl.Mem.Vec],  # noqa: F821
+    source: pl.Tile[[rows, width], pl.BF16, pl.Mem.Vec],
+    gamma: pl.Tile[[width], pl.BF16, pl.Mem.Vec],
     width: pl.constexpr,
     rows: pl.constexpr,
     fold: pl.constexpr,
@@ -36,11 +36,11 @@ def _rms_norm_rows(
     source_fp32 = pl.cast(source, pl.FP32)
     if width > 512:
         squares = pl.mul(source_fp32, source_fp32)
-        folded = pl.tile.slice(squares, [rows, fold], [0, 0])
-        leading = pl.tile.slice(squares, [rows, width - fold], [0, 0])
-        trailing = pl.tile.slice(squares, [rows, width - fold], [0, fold])
+        folded = squares[:rows, :fold]
+        leading = squares[:rows, :width - fold]
+        trailing = squares[:rows, fold:width]
         combined = pl.add(leading, trailing)
-        folded = pl.tile.assemble(folded, combined, [0, 0])
+        folded[:rows, :width - fold] = combined
         folded = pl.reshape(folded, [rows * fold])
     source_fp32 = pl.reshape(source_fp32, [rows * width])
     normalized = pl.create_tile([rows * width], dtype=pl.BF16, target_memory=pl.Mem.Vec)
@@ -133,10 +133,12 @@ def rms_norm(
                     source = pl.set_validshape(source, NORM_T_TILE, width)
                     normalized = _rms_norm_rows(source, gamma, width, NORM_T_TILE, width // 2)
                     output_rows = pl.reshape(normalized, [NORM_T_TILE, width])
-                    pl.store(pl.set_validshape(output_rows, rows, width), [start, 0], output)
+                    output_rows = pl.set_validshape(output_rows, rows, width)
+                    pl.store(output_rows, [start, 0], output)
                 else:
                     zero_rows = pl.tile.full([NORM_T_TILE, width], dtype=pl.BF16, value=0.0)
-                    pl.store(pl.set_validshape(zero_rows, rows, width), [start, 0], output)
+                    zero_rows = pl.set_validshape(zero_rows, rows, width)
+                    pl.store(zero_rows, [start, 0], output)
         else:
             for row in pl.range(worker, count, workers):
                 if row < active:
@@ -150,13 +152,10 @@ def rms_norm(
     return ready
 
 
-def golden_rms_norm_tiled(x: torch.Tensor, norm_w: torch.Tensor) -> torch.Tensor:
-    """Apply the shared RMSNorm reference to hidden-width rows."""
-    return golden_rms_norm(x, norm_w)
-
-
-def golden_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = EPS) -> torch.Tensor:
+def golden_rms_norm(x, weight, eps=EPS):
     """Model folded FP32 square reduction and fused Newton correction."""
+    import torch
+
     value = x.float()
     width = value.shape[-1]
     square = value.square()

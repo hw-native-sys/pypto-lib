@@ -34,7 +34,7 @@ from prefill_indexer import (
     compare_compressed_topk,
     prefill_indexer, publish_c1a_index_key,
 )
-from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
+from qkv_proj_rope import qkv_quant, q_proj_rope, kv_proj, window_publish
 from quant import (
     pack_bf16_nz, pack_fp8_nz, pack_mx_b_scale, pack_quantized_cache, unpack_quantized_cache,
     quantize_mxfp4_cache, dequantize_mxfp4_cache, packed_cache_compare,
@@ -88,22 +88,20 @@ def prefill_publish_decoder(
 ):
     tokens = pl.tensor.dim(x, 0)
     compressed_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    projection_ready = pl.system.task_dummy(deps=[])
-    compressed_projection, projection_done = c1a_compressor_project(
-        x, w_compressor_kv, compressed_projection, num_tokens, projection_ready, m_tile=80, n_tile=128,
+    c1a_compressor_project(
+        x, w_compressor_kv, compressed_projection, num_tokens, m_tile=80, n_tile=128,
     )
     compressed_latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    compressed_ready = c1a_compressor_publish(
+    c1a_compressor_publish(
         compressed_projection, w_compressor_norm, compressed_latent, compressed_rope_cos, compressed_rope_sin,
         compressed_write_slots, compressed_cache,
-        num_tokens, projection_ready, projection_done,
+        num_tokens,
     )
     index_ready = publish_c1a_index_key(
         compressed_latent, w_index_k, w_index_norm, compressed_rope_cos, compressed_rope_sin,
         compressed_write_slots, index_cache, index_cache_scale, num_tokens,
     )
-    ready = pl.system.task_dummy(deps=[compressed_ready, index_ready])
-    return ready
+    return index_ready
 
 
 @pl.jit.inline(auto_scope=False)
@@ -171,29 +169,28 @@ def prefill_c1a_full(
     q_capacity = pl.tensor.dim(hc_input, 0)
     post_mix = pl.create_tensor([q_capacity, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([q_capacity, HC_MULT, HC_MULT], dtype=pl.FP32)
-    normalized_ready = hc_head_norm(hc_input, hc_pre_mix, w_attn_norm, kv_hidden, worker_limit=64)
+    hc_head_norm(hc_input, hc_pre_mix, w_attn_norm, kv_hidden, worker_limit=64)
     inv_rms, partials = hc_project(hc_input, hc_attn_fn, rms_worker_limit=64)
     hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, hc_next_pre_mix, post_mix, residual_mix)
     zero_bf16_padding(kv_hidden, kv_token_count)
     if kv_token_count > 0:
         kv_capacity = pl.tensor.dim(kv_hidden, 0)
         kv_projection = pl.create_tensor([kv_capacity, HEAD_DIM], dtype=pl.BF16)
-        kv_input_payload, kv_input_scales, kv_input_payload_padded_rows = quantize_projection_input(
+        kv_input_payload, kv_input_scales, kv_input_payload_padded_rows = qkv_quant(
             kv_hidden, kv_token_count, row_tile=256,
         )
-        kv_projection = kv_proj(
+        kv_proj(
             kv_input_payload, kv_input_scales,
             wkv, wkv_scale,
             kv_projection, kv_token_count, worker_limit=8, row_tile=256,
         )
-        kv_ready = window_publish(
+        window_publish(
             kv_projection, wkv_norm, kv_rope_cos, kv_rope_sin,
             kv_write_slots, window_cache,
-            kv_token_count, normalized_ready,
+            kv_token_count,
         )
-        compressed_ready = normalized_ready
         if publish_compressed:
-            compressed_ready = prefill_publish_decoder(
+            prefill_publish_decoder(
                 kv_hidden, w_compressor_kv, w_compressor_norm, w_index_k, w_index_norm,
                 compressed_rope_cos, compressed_rope_sin, compressed_write_slots,
                 compressed_cache, index_cache, index_cache_scale, kv_token_count,
@@ -211,11 +208,11 @@ def prefill_c1a_full(
         q_latent = pl.create_tensor([Q_TILE, Q_LORA], dtype=pl.BF16)
         q = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
 
-        chunk_done = normalized_ready
+        chunk_done = pl.system.task_invalid()
         for start in pl.range(0, kv_token_count, Q_TILE):
             active = pl.min(Q_TILE, kv_token_count - start)
             # The prior chunk must finish reading every reusable scratch buffer.
-            with pl.spmd(WORKER_TILE, name_hint="prefill_c1a_full_stage", deps=[chunk_done]) as stage_tid:
+            with pl.spmd(WORKER_TILE, name_hint="prefill_c1a_full_stage", deps=[chunk_done]):
                 worker = pl.tile.get_block_idx()
                 for row in pl.range(worker, active, WORKER_TILE):
                     source_row = start + row
@@ -229,7 +226,7 @@ def prefill_c1a_full(
                     pl.write(chunk_request_ids, [row], request_ids_value)
                     compressed_lens_value = pl.read(q_compressed_lens, [start + row])
                     pl.write(chunk_compressed_lens, [row], compressed_lens_value)
-            q_input_payload, q_input_scales, q_input_payload_padded_rows = quantize_projection_input(
+            q_input_payload, q_input_scales, q_input_payload_padded_rows = qkv_quant(
                 chunk_hidden, active, row_tile=256,
             )
             q_proj_rope(
@@ -242,22 +239,20 @@ def prefill_c1a_full(
                 padded_rows=q_input_payload_padded_rows,
                 qa_row_tile=256, qb_row_tile=128,
             )
-            attended = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-            index_inputs_ready = pl.system.task_dummy(deps=[stage_tid, compressed_ready])
-            index_ready = prefill_indexer(
+            attn_out = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+            _index_ready = prefill_indexer(
                 chunk_hidden, q_latent, chunk_request_ids, chunk_compressed_lens,
                 index_cache, index_cache_scale, index_block_table,
                 chunk_rope_cos, chunk_rope_sin, w_index_q, w_index_q_scale, w_index_score,
-                chunk_pool_block_ids, chunk_pool_block_counts, chunk_topk_indices, active, index_inputs_ready,
+                chunk_pool_block_ids, chunk_pool_block_counts, chunk_topk_indices, active, chunk_done,
                 pool=False, c2a=False,
             )
-            attention_ready = pl.system.task_dummy(deps=[stage_tid, kv_ready, index_ready])
             gather_sparse_attention(
                 q, chunk_window_indices, window_cache, chunk_topk_indices, compressed_cache,
-                attn_sink, attended, active, attention_ready, compressed_keys=INDEX_TOPK,
+                attn_sink, attn_out, active, compressed_keys=INDEX_TOPK,
             )
             _chunk_output, projection_done = o_proj_hc_post(
-                attended, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_rope_cos, chunk_rope_sin,
+                attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_rope_cos, chunk_rope_sin,
                 hc_input[start:start + active, :, :], post_mix[start:start + active, :],
                 residual_mix[start:start + active, :, :], hc_output[start:start + active, :, :], active,
                 oa_row_tile=128, ob_row_tile=128,
@@ -581,8 +576,8 @@ def prefill_c1a_full_cp(
         q_hidden, cp_hidden_window, cp_hidden_arrived, kv_restore_indices, kv_hidden,
         cp_group_base, cp_rank, attention_epoch, group_size=CP_SIZE,
     )
-    publication = pl.array.create(1, pl.TASK_ID)
-    publication[0] = gathered
+    compressed_publication = pl.array.create(1, pl.TASK_ID)
+    compressed_publication[0] = pl.system.task_invalid()
     if kv_token_count > 0:
         kv_capacity = pl.tensor.dim(kv_hidden, 0)
         kv_projection = pl.create_tensor([kv_capacity, HEAD_DIM], dtype=pl.BF16)
@@ -591,18 +586,18 @@ def prefill_c1a_full_cp(
             worker = pl.tile.get_block_idx()
             for row in pl.range(worker, kv_token_count, WORKER_TILE):
                 kv_projection[row : row + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-        kv_input_payload, kv_input_scales, kv_input_payload_padded_rows = quantize_projection_input(
+        kv_input_payload, kv_input_scales, kv_input_payload_padded_rows = qkv_quant(
             kv_hidden, kv_token_count, row_tile=256,
         )
-        kv_projection = kv_proj(
+        kv_proj(
             kv_input_payload, kv_input_scales,
             wkv, wkv_scale,
             kv_projection, kv_token_count, worker_limit=8, row_tile=256,
         )
-        kv_ready = window_publish(
+        window_publish(
             kv_projection, wkv_norm, kv_rope_cos, kv_rope_sin,
             kv_write_slots, window_cache,
-            kv_token_count, gathered,
+            kv_token_count,
         )
         compressed_ready = gathered
         if publish_compressed:
@@ -611,7 +606,7 @@ def prefill_c1a_full_cp(
                 compressed_rope_cos, compressed_rope_sin, compressed_write_slots,
                 compressed_cache, index_cache, index_cache_scale, kv_token_count,
             )
-        publication[0] = pl.system.task_dummy(deps=[kv_ready, compressed_ready])
+        compressed_publication[0] = compressed_ready
         chunk_hidden = pl.create_tensor([Q_TILE, D], dtype=pl.BF16)
         chunk_rope_cos = pl.create_tensor([Q_TILE, ROPE_DIM // 2], dtype=pl.FP32)
         chunk_rope_sin = pl.create_tensor([Q_TILE, ROPE_DIM // 2], dtype=pl.FP32)
@@ -643,7 +638,7 @@ def prefill_c1a_full_cp(
                     pl.write(chunk_request_ids, [row], request_ids_value)
                     compressed_lens_value = pl.read(q_compressed_lens, [start + row])
                     pl.write(chunk_compressed_lens, [row], compressed_lens_value)
-            q_input_payload, q_input_scales, q_input_payload_padded_rows = quantize_projection_input(
+            q_input_payload, q_input_scales, q_input_payload_padded_rows = qkv_quant(
                 chunk_hidden, active, row_tile=256,
             )
             q_proj_rope(
@@ -656,22 +651,21 @@ def prefill_c1a_full_cp(
                 padded_rows=q_input_payload_padded_rows,
                 qa_row_tile=256, qb_row_tile=128,
             )
-            attended = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+            attn_out = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
             index_inputs_ready = pl.system.task_dummy(deps=[stage_tid, compressed_ready])
-            index_ready = prefill_indexer(
+            _index_ready = prefill_indexer(
                 chunk_hidden, q_latent, chunk_request_ids, chunk_compressed_lens,
                 index_cache, index_cache_scale, index_block_table,
                 chunk_rope_cos, chunk_rope_sin, w_index_q, w_index_q_scale, w_index_score,
                 chunk_pool_block_ids, chunk_pool_block_counts, chunk_topk_indices, active, index_inputs_ready,
                 pool=False, c2a=False,
             )
-            attention_ready = pl.system.task_dummy(deps=[stage_tid, kv_ready, index_ready])
             gather_sparse_attention(
                 q, chunk_window_indices, window_cache, chunk_topk_indices, compressed_cache,
-                attn_sink, attended, active, attention_ready, compressed_keys=INDEX_TOPK,
+                attn_sink, attn_out, active, compressed_keys=INDEX_TOPK,
             )
             _chunk_output, projection_done = o_proj_hc_post(
-                attended, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_rope_cos, chunk_rope_sin,
+                attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_rope_cos, chunk_rope_sin,
                 hc_input[start:start + active, :, :], post_mix[start:start + active, :],
                 residual_mix[start:start + active, :, :], hc_output[start:start + active, :, :], active,
                 oa_row_tile=128, ob_row_tile=128,
@@ -689,7 +683,7 @@ def prefill_c1a_full_cp(
                     pl.write(q_pool_block_counts, [start + row], count)
             chunk_done = pl.system.task_dummy(deps=[collect_tid, counts_tid])
     if q_token_count < q_capacity:
-        with pl.spmd(32, name_hint="prefill_c1a_full_cp_zero_padding", deps=[publication[0]]):
+        with pl.spmd(32, name_hint="prefill_c1a_full_cp_zero_padding", deps=[gathered, compressed_publication[0]]):
             worker = pl.tile.get_block_idx()
             for row in pl.range(q_token_count + worker, q_capacity, 32):
                 zero_output = pl.full([1, HC_MULT * D], dtype=pl.FP32, value=0.0)
@@ -1029,12 +1023,12 @@ def golden_c1a_prefill(tensors, *, mode="full"):
                         scores, local_fields["q_compressed_lens"][:active],
                     )
                     result.update(pool_block_ids=pool_ids, pool_block_counts=pool_counts)
-            attended = golden_gather_sparse_attention(
+            attn_out = golden_gather_sparse_attention(
                 query, local_fields["q_window_indices"][:active], pack_quantized_cache(window, window_scale),
                 topk, pack_quantized_cache(compressed, compressed_scale), a["attn_sink"], compressed_keys=INDEX_TOPK,
             )
             projected = golden_o_proj(
-                attended, cos, sin, a["wo_a"], a["wo_b"], a["wo_b_scale"],
+                attn_out, cos, sin, a["wo_a"], a["wo_b"], a["wo_b_scale"],
                 wo_a_scale=a["wo_a_scale"], output_dtype=torch.float32, sequential_projection=True,
             )
             output[:active] = projected.bfloat16()

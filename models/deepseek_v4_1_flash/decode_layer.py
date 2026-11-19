@@ -1177,11 +1177,7 @@ if __name__ == "__main__":
                 ),
                 fp4=False,
             ),
-            "compressed_cache": packed_cache_compare(
-                exact,
-                exact,
-                fp4=True,
-            ),
+            "compressed_cache": exact,
             "index_cache": exact,
             "index_cache_scale": exact,
             "state_cache": exact,

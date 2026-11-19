@@ -146,50 +146,11 @@ def gemm_bf16_via_mxfp8_to_bf16_staged(
 
 
 @pl.jit.inline(auto_scope=False)
-def gemm_bf16_via_mxfp8_to_bf16_fused(
-    x: pl.Tensor,
-    weight: pl.Tensor,
-    scale: pl.Tensor,
-    output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-    width: pl.constexpr,
-    output_width: pl.constexpr,
-    n_tile: pl.constexpr,
-    name_hint: pl.constexpr,
-):
-    """Compute native M32 MXFP8 products with in-task activation quantization."""
-    workers = pl.min(output_width // n_tile, pl.system.available_cluster_count())
-    for mt in pl.parallel((num_tokens + 31) // 32):
-        for worker in pl.spmd(workers, name_hint=name_hint):
-            block_num = pl.tile.get_block_num()
-            for wave in pl.range((output_width // n_tile + block_num - 1) // block_num):
-                block = wave * block_num + worker
-                if block < output_width // n_tile:
-                    t0 = mt * 32
-                    n0 = block * n_tile
-                    rows = pl.min(32, num_tokens - t0)
-                    a0, sa0 = quantize_bf16_to_mxfp8(x, t0, 0, rows, 32)
-                    b0 = pl.load(weight, [0, n0], [MX_K_TILE, n_tile], target_memory=pl.MemorySpace.Mat)
-                    sb0 = pl.load(scale, [0, n0], [MX_K_TILE // 32, n_tile])
-                    acc = pl.matmul_mx(a0, sa0, b0, sb0)
-                    for kb in pl.range(1, width // MX_K_TILE):
-                        k0 = kb * MX_K_TILE
-                        a, sa = quantize_bf16_to_mxfp8(x, t0, k0, rows, 32)
-                        b = pl.load(weight, [k0, n0], [MX_K_TILE, n_tile], target_memory=pl.MemorySpace.Mat)
-                        sb = pl.load(scale, [k0 // 32, n0], [MX_K_TILE // 32, n_tile])
-                        acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
-                    value = pl.cast(acc, target_type=pl.BF16, mode="rint")
-                    output = pl.store(pl.set_validshape(value, rows, n_tile), [t0, n0], output)
-    return output
-
-
-@pl.jit.inline(auto_scope=False)
 def gemm_bf16_to_bf16(
     source: pl.Tensor,
     weight: pl.Tensor,
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
-    ready: pl.Scalar[pl.TASK_ID],
     width: pl.constexpr,
     output_width: pl.constexpr,
     n_tile: pl.constexpr,
@@ -200,9 +161,7 @@ def gemm_bf16_to_bf16(
     """Project ND activations with NZ weights and store BF16 through Fixpipe."""
     blocks = (num_tokens + 16 - 1) // 16 * (output_width // n_tile)
     task_workers = pl.max(pl.min(blocks, workers), 1)
-    entry_deps = pl.array.create(1, pl.TASK_ID)
-    entry_deps[0] = ready
-    with pl.spmd(task_workers, name_hint=name_hint, deps=[entry_deps[0]]) as cube_tid:
+    with pl.spmd(task_workers, name_hint=name_hint):
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, blocks, task_workers):
             row = block // (output_width // n_tile) * 16
@@ -215,7 +174,7 @@ def gemm_bf16_to_bf16(
                 acc = pl.matmul_acc(acc, a, w, init_cond=(k == 0))
             value = pl.set_validshape(acc, rows, n_tile)
             output = pl.store(value, [row, col], output)
-    return output, cube_tid
+    return output
 
 
 def golden_mxfp8_linear_grouped_sum(

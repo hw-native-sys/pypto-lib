@@ -55,7 +55,7 @@ O_B_N_TILE = 160
 @pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "o_quant_vf.cpp",
                include_dirs=(pto_isa_include_dir(),))
 def _quant_o_vf(
-    attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    attn_out: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     cosine: pl.Tensor,
     sine: pl.Tensor,
     payload: pl.Out[pl.Tensor[[O_GROUP_ROWS, O_GROUP_IN], pl.FP8E4M3FN]],
@@ -231,7 +231,7 @@ def o_proj_a_pypto(
 
 @pl.jit.inline(auto_scope=False)
 def o_proj_hc_post(
-    attended: pl.Tensor,
+    attn_out: pl.Tensor,
     wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
@@ -257,7 +257,7 @@ def o_proj_hc_post(
     vector_workers = 2 * pl.system.available_cluster_count()
     with pl.spmd(vector_workers, name_hint="quant_o_vf"):
         payload_all, scales_all = _quant_o_vf(
-            attended, rope_cos, rope_sin, payload_all, scales_all,
+            attn_out, rope_cos, rope_sin, payload_all, scales_all,
             num_tokens, LOCAL_O_GROUPS, padded_rows,
         )
     payload = pl.create_tensor([padded_rows, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
@@ -305,7 +305,7 @@ def golden_grouped_output(
 
 
 def golden_o_proj(
-    attended: torch.Tensor,
+    attn_out: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
     wo_a: torch.Tensor,
@@ -320,10 +320,10 @@ def golden_o_proj(
 
     wo_b = unpack_fp8_nz(wo_b)
     rope_dim = cos.shape[-1] * 2
-    tail = rope_interleave(attended[..., -rope_dim:], cos, sin, inverse=True)
-    attended = torch.cat((attended[..., :-rope_dim], tail), dim=-1)
+    tail = rope_interleave(attn_out[..., -rope_dim:], cos, sin, inverse=True)
+    attn_out = torch.cat((attn_out[..., :-rope_dim], tail), dim=-1)
     groups = wo_a.shape[0]
-    grouped = attended.flatten(-2).unflatten(-1, (groups, -1))
+    grouped = attn_out.flatten(-2).unflatten(-1, (groups, -1))
     latent = golden_grouped_output(grouped, wo_a, wo_a_scale)
     if sequential_projection and wo_b_scale is not None:
         projected = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(latent.flatten(-2), wo_b, wo_b_scale)
@@ -354,7 +354,7 @@ def retire_prefill_signals(
 
 @pl.jit
 def o_proj_hc_post_validation(
-    attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    attn_out: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
@@ -367,7 +367,7 @@ def o_proj_hc_post_validation(
     output: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    attended.bind_dynamic(0, T_DYN)
+    attn_out.bind_dynamic(0, T_DYN)
     rope_cos.bind_dynamic(0, T_DYN)
     rope_sin.bind_dynamic(0, T_DYN)
     residual.bind_dynamic(0, T_DYN)
@@ -375,7 +375,7 @@ def o_proj_hc_post_validation(
     residual_mix.bind_dynamic(0, T_DYN)
     output.bind_dynamic(0, T_DYN)
     o_proj_hc_post(
-        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+        attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
         residual, post_mix, residual_mix, output, num_tokens,
         oa_row_tile=80, ob_row_tile=128,
     )
@@ -384,7 +384,7 @@ def o_proj_hc_post_validation(
 
 @pl.jit
 def o_proj_hc_post_native_validation(
-    attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    attn_out: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
@@ -398,7 +398,7 @@ def o_proj_hc_post_native_validation(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Validate native M80 O-A between C++ quantization and fused O-B/HC post."""
-    attended.bind_dynamic(0, T_DYN)
+    attn_out.bind_dynamic(0, T_DYN)
     rope_cos.bind_dynamic(0, T_DYN)
     rope_sin.bind_dynamic(0, T_DYN)
     residual.bind_dynamic(0, T_DYN)
@@ -412,7 +412,7 @@ def o_proj_hc_post_native_validation(
     vector_workers = 2 * pl.system.available_cluster_count()
     with pl.spmd(vector_workers, name_hint="quant_o_vf"):
         payload_all, scales_all = _quant_o_vf(
-            attended, rope_cos, rope_sin, payload_all, scales_all, num_tokens, LOCAL_O_GROUPS, padded_rows,
+            attn_out, rope_cos, rope_sin, payload_all, scales_all, num_tokens, LOCAL_O_GROUPS, padded_rows,
         )
     payload = pl.create_tensor([padded_rows, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
     activation_scale = pl.create_tensor([1, padded_rows * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)
@@ -442,8 +442,8 @@ def build_o_proj_specs(active_tokens: int, *, pad_to_tile: bool = True):
     def inputs():
         if not values:
             generator = torch.Generator().manual_seed(17)
-            attended = torch.randn(tokens, LOCAL_H * HEAD_DIM, generator=generator).bfloat16()
-            attended[active_tokens:] = float("nan")
+            attn_out = torch.randn(tokens, LOCAL_H * HEAD_DIM, generator=generator).bfloat16()
+            attn_out[active_tokens:] = float("nan")
             wo_a = torch.randn(LOCAL_O_GROUPS, O_LORA, O_GROUP_IN, generator=generator) / O_GROUP_IN**0.5
             wo_a, wo_a_scale = quantize_grouped_mxfp8_weight(wo_a.bfloat16())
             wo_b = torch.randn(D, LOCAL_O_WIDTH, generator=generator) / LOCAL_O_WIDTH**0.5
@@ -451,7 +451,7 @@ def build_o_proj_specs(active_tokens: int, *, pad_to_tile: bool = True):
             frequencies = 10000.0 ** (-torch.arange(0, ROPE_DIM, 2).float() / ROPE_DIM)
             angles = torch.arange(tokens).float()[:, None] * frequencies
             values.update(
-                attended=attended, wo_a=wo_a, wo_a_scale=wo_a_scale,
+                attn_out=attn_out, wo_a=wo_a, wo_a_scale=wo_a_scale,
                 wo_b=pack_fp8_nz(wo_b.T.contiguous()),
                 wo_b_scale=pack_mx_b_scale(wo_b_scale.T.contiguous()).view(torch.float8_e8m0fnu),
                 rope_cos=angles.cos(), rope_sin=angles.sin(),
@@ -459,7 +459,7 @@ def build_o_proj_specs(active_tokens: int, *, pad_to_tile: bool = True):
         return values
 
     shapes = (
-        ("attended", [tokens, LOCAL_H * HEAD_DIM], torch.bfloat16),
+        ("attn_out", [tokens, LOCAL_H * HEAD_DIM], torch.bfloat16),
         ("wo_a", [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], torch.float8_e4m3fn),
         ("wo_a_scale", [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], torch.float8_e8m0fnu),
         ("wo_b", [LOCAL_O_WIDTH, D], torch.float8_e4m3fn),
@@ -481,9 +481,9 @@ def golden_o_proj_validation(tensors):
     tensors["output"].zero_()
     if active == 0:
         return
-    attended = tensors["attended"][:active].unflatten(-1, (LOCAL_H, HEAD_DIM))
+    attn_out = tensors["attn_out"][:active].unflatten(-1, (LOCAL_H, HEAD_DIM))
     result = golden_o_proj(
-        attended, tensors["rope_cos"][:active], tensors["rope_sin"][:active],
+        attn_out, tensors["rope_cos"][:active], tensors["rope_sin"][:active],
         tensors["wo_a"], tensors["wo_b"], tensors["wo_b_scale"],
         wo_a_scale=tensors["wo_a_scale"], output_dtype=torch.bfloat16, sequential_projection=True,
     )
