@@ -1179,6 +1179,7 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true")
     parser.add_argument("--enable-scope-stats", action="store_true")
     parser.add_argument("--log-level", default=None)
+    parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=range(5))
     args = parser.parse_args()
     if args.execution_mode:
         parser.error("this forward entry requires hardware; --sim is unsupported")
@@ -1195,6 +1196,7 @@ if __name__ == "__main__":
         execution_mode=args.execution_mode,
         dump_passes=args.dump_passes,
         enable_scope_stats=args.enable_scope_stats,
+        enable_chip_swimlane=args.enable_chip_swimlane,
         log_level=args.log_level,
         ring_heap=(2 * 1024**3, 2 * 1024**3, 1024**3, 512 * 1024**2),
         ring_dep_pool=131072,

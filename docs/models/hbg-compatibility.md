@@ -76,6 +76,33 @@ keeps paired, paged, and pooled scoring, and checks the selected route
 inside the device kernels. The Lib `prefill_fwd.py` entry also compiled
 in both runtimes at TP1/EP2/DP2 with synthetic weights.
 
+## Integration audit on 2026-11-16
+
+This audit checks publication and existing evidence; it does not qualify the
+latest four upstream heads as a tested combination.
+
+- PyPTO #3277, #3321, #3322, and #3326 are merged. Do not reapply these
+  historical patches on a main revision that already contains them.
+- PyPTO #3323 remains open. Its reshape parameter-direction fix must be
+  evaluated against an affected Graph boundary before calling it a requirement
+  for a particular model entry.
+- Simpler #2930 is merged. #2931 and #2932 are closed without merge; they
+  are not established requirements for the supported model fixtures.
+- Simpler #2934 remains a draft with merge conflicts. Its communication-domain
+  lifetime changes concern asynchronous consumers; synchronous execution does
+  not establish whether the fix is required for an overlapping workload.
+- The A5 standalone goldens and forward execution checks above remain scoped
+  to their recorded versions. Full-forward padding checks are not a numerical
+  golden, and older AICPU compatibility results do not qualify resident AICore
+  scheduling or current explicit Graph support.
+- Whole-model Host preparation overlap still needs a same-invocation device
+  timing check. Overlap with a Host runner envelope alone is insufficient,
+  because that envelope can include diagnostic setup and retirement.
+
+Keep functional model adaptations, profiling entry options, and experimental
+scheduling changes in separate commits. A failed experimental Graph variant
+must not replace the validated model entry.
+
 ## PyPTO and Simpler dependencies
 
 As checked on 2026-11-11, PyPTO main
