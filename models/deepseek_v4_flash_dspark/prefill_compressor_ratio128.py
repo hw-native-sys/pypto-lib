@@ -33,6 +33,7 @@ PREFILL_STATE_TILE = 512
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("PREFILL_HCA_C128_T_DYN")
+PROJ_T_DYN = pl.dynamic("PREFILL_HCA_C128_PROJ_T_DYN")
 STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_HCA_STATE_BLOCK_NUM_DYN")
 CMP_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CMP_BLOCK_NUM_DYN")
 
@@ -80,41 +81,16 @@ assert HCA_STATE_BLOCK_NUM == DECODE_BATCH * HCA_STATE_BLOCKS_PER_REQUEST
 
 
 @pl.jit.inline(auto_scope=False)
-def _prefill_compressor_ratio128_tile(
+def _prefill_compressor_ratio128_project_tile(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    compress_state: pl.InOut[
-        pl.Tensor[[STATE_BLOCK_NUM_DYN, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
-    ],
-    compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
-    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
-    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
-    state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
-    rope_dup_idx_template: pl.Tensor[[HCA_C128_RMS_TILE, ROPE_HEAD_DIM], pl.INT32],
-    rope_swap_idx_template: pl.Tensor[[HCA_C128_RMS_TILE, ROPE_HEAD_DIM], pl.INT32],
-    rope_sign_template: pl.Tensor[[HCA_C128_RMS_TILE, ROPE_HEAD_DIM], pl.FP32],
-    state_order_fence: pl.InOut[pl.Tensor[[1], pl.INT32]],
-    request_start: pl.Scalar[pl.INDEX],
+    kv_proj_scratch: pl.Tensor[[PREFILL_STATE_TILE, OUT_DIM], pl.FP32],
+    score_proj_scratch: pl.Tensor[[PREFILL_STATE_TILE, OUT_DIM], pl.FP32],
     tile_base: pl.Scalar[pl.INDEX],
     tile_rows: pl.Scalar[pl.INDEX],
-    checkpoint_ends: pl.Tensor[[CHECKPOINTS_PER_TILE], pl.INT32],
 ):
-    state_block_num = pl.tensor.dim(compress_state, 0)
-    cmp_block_num = pl.tensor.dim(cmp_kv, 0)
-    kv_proj_scratch = pl.create_tensor([PREFILL_STATE_TILE, OUT_DIM], dtype=pl.FP32)
-    score_proj_scratch = pl.create_tensor([PREFILL_STATE_TILE, OUT_DIM], dtype=pl.FP32)
-    compress_state_flat = pl.reshape(
-        compress_state,
-        [state_block_num * HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
-    )
-    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * CMP_STORAGE_BLOCK_SIZE, HEAD_DIM])
-
+    """Project one bounded token tile without updating compressor state."""
     t_dim = pl.tensor.dim(x, 0)
     x_flat = pl.reshape(x, [t_dim, D])
     proj_full_rows = (tile_rows // PROJ_ROW_TILE) * PROJ_ROW_TILE
@@ -197,6 +173,38 @@ def _prefill_compressor_ratio128_tile(
                     tail_o0 : tail_o0 + OUT_TILE,
                 ] = score_tail_acc
 
+    return kv_proj_scratch, score_proj_scratch
+
+
+@pl.jit.inline(auto_scope=False)
+def _prefill_compressor_ratio128_apply_tile(
+    kv_proj_scratch: pl.Tensor[[PREFILL_STATE_TILE, OUT_DIM], pl.FP32],
+    score_proj_scratch: pl.Tensor[[PREFILL_STATE_TILE, OUT_DIM], pl.FP32],
+    compress_state: pl.InOut[pl.Tensor[[STATE_BLOCK_NUM_DYN, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]],
+    compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
+    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
+    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
+    cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    rope_dup_idx_template: pl.Tensor[[HCA_C128_RMS_TILE, ROPE_HEAD_DIM], pl.INT32],
+    rope_swap_idx_template: pl.Tensor[[HCA_C128_RMS_TILE, ROPE_HEAD_DIM], pl.INT32],
+    rope_sign_template: pl.Tensor[[HCA_C128_RMS_TILE, ROPE_HEAD_DIM], pl.FP32],
+    state_order_fence: pl.InOut[pl.Tensor[[1], pl.INT32]],
+    request_start: pl.Scalar[pl.INDEX],
+    tile_base: pl.Scalar[pl.INDEX],
+    tile_rows: pl.Scalar[pl.INDEX],
+    checkpoint_ends: pl.Tensor[[CHECKPOINTS_PER_TILE], pl.INT32],
+):
+    """Pool and publish one state tile from unchanged FP32 projections."""
+    state_block_num = pl.tensor.dim(compress_state, 0)
+    cmp_block_num = pl.tensor.dim(cmp_kv, 0)
+    compress_state_flat = pl.reshape(compress_state, [state_block_num * HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM])
+    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * CMP_STORAGE_BLOCK_SIZE, HEAD_DIM])
+
     # write_i -> (position, dst cache row) map, consumed by pool / rmsnorm_rope / kv_finalize.
     # Sized to HCA_C128_RMS_PAD_ROWS: rmsnorm_rope indexes padded rows past MAX_CMP_WRITES, which stay -1.
     write_pos_map = pl.create_tensor([1, HCA_C128_RMS_PAD_ROWS], dtype=pl.INT32)
@@ -236,57 +244,66 @@ def _prefill_compressor_ratio128_tile(
             write_pos = pl.read(write_pos_map, [0, write_i])
             write_src = pl.cast(pl.read(write_src_map, [0, write_i]), pl.INDEX)
             pool_start = write_pos + 1 - COMPRESS_RATIO
-            for pool_state_i in pl.range(STATE_LEN):
-                pool_kv_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = pl.full(
-                    [1, HEAD_TILE],
-                    dtype=pl.FP32,
-                    value=0.0,
-                )
-                pool_score_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = pl.full(
-                    [1, HEAD_TILE],
-                    dtype=pl.FP32,
-                    value=0.0,
-                )
-                pool_abs = pool_start + pool_state_i
-                pool_source = write_src - pl.cast(write_pos - pool_abs, pl.INDEX)
-                if pool_source < tile_base:
-                    pool_state_row_raw = pl.cast(-1, pl.INT64)
-                    if pool_source >= request_start:
-                        pool_state_row_raw = pl.read(state_slot_mapping, [pool_source])
+            pool_first_local = write_src - tile_base - (STATE_LEN - 1)
+            pool_end_local = pool_first_local + STATE_LEN
+            pool_ape_phase = pool_start % COMPRESS_RATIO
+            if pool_first_local >= 0 and pool_end_local <= tile_rows and pool_end_local <= PREFILL_STATE_TILE and pool_ape_phase == 0:
+                pool_kv_tile[0:STATE_LEN, 0:HEAD_TILE] = pl.slice(kv_proj_scratch, [STATE_LEN, HEAD_TILE], [pool_first_local, h0])
+                pool_score_current = pl.slice(score_proj_scratch, [STATE_LEN, HEAD_TILE], [pool_first_local, h0])
+                pool_ape_current = ape[0:STATE_LEN, h0:h0 + HEAD_TILE]
+                pool_score_tile[0:STATE_LEN, 0:HEAD_TILE] = pl.add(pool_score_current, pool_ape_current)
+            else:
+                for pool_state_i in pl.range(STATE_LEN):
+                    pool_kv_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = pl.full(
+                        [1, HEAD_TILE],
+                        dtype=pl.FP32,
+                        value=0.0,
+                    )
+                    pool_score_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = pl.full(
+                        [1, HEAD_TILE],
+                        dtype=pl.FP32,
+                        value=0.0,
+                    )
+                    pool_abs = pool_start + pool_state_i
+                    pool_source = write_src - pl.cast(write_pos - pool_abs, pl.INDEX)
+                    if pool_source < tile_base:
+                        pool_state_row_raw = pl.cast(-1, pl.INT64)
+                        if pool_source >= request_start:
+                            pool_state_row_raw = pl.read(state_slot_mapping, [pool_source])
+                        else:
+                            pool_state_block = pl.cast(pool_abs // HCA_STATE_BLOCK_SIZE, pl.INDEX)
+                            pool_state_intra = pl.cast(pool_abs % HCA_STATE_BLOCK_SIZE, pl.INDEX)
+                            pool_phys_block_raw = pl.read(compress_state_block_table, [pool_state_block])
+                            if pool_phys_block_raw >= 0:
+                                pool_state_row_raw = pl.cast(pool_phys_block_raw * HCA_STATE_BLOCK_SIZE, pl.INT64)
+                                pool_state_row_raw = pool_state_row_raw + pool_state_intra
+                        if pool_state_row_raw >= 0:
+                            pool_state_row = pl.cast(pool_state_row_raw, pl.INDEX)
+                            pool_kv_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = compress_state_flat[
+                                pool_state_row : pool_state_row + 1,
+                                h0 : h0 + HEAD_TILE,
+                            ]
+                            pool_score_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = compress_state_flat[
+                                pool_state_row : pool_state_row + 1,
+                                OUT_DIM + h0 : OUT_DIM + h0 + HEAD_TILE,
+                            ]
                     else:
-                        pool_state_block = pl.cast(pool_abs // HCA_STATE_BLOCK_SIZE, pl.INDEX)
-                        pool_state_intra = pl.cast(pool_abs % HCA_STATE_BLOCK_SIZE, pl.INDEX)
-                        pool_phys_block_raw = pl.read(compress_state_block_table, [pool_state_block])
-                        if pool_phys_block_raw >= 0:
-                            pool_state_row_raw = pl.cast(pool_phys_block_raw * HCA_STATE_BLOCK_SIZE, pl.INT64)
-                            pool_state_row_raw = pool_state_row_raw + pool_state_intra
-                    if pool_state_row_raw >= 0:
-                        pool_state_row = pl.cast(pool_state_row_raw, pl.INDEX)
-                        pool_kv_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = compress_state_flat[
-                            pool_state_row : pool_state_row + 1,
-                            h0 : h0 + HEAD_TILE,
-                        ]
-                        pool_score_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = compress_state_flat[
-                            pool_state_row : pool_state_row + 1,
-                            OUT_DIM + h0 : OUT_DIM + h0 + HEAD_TILE,
-                        ]
-                else:
-                    pool_local = pool_source - tile_base
-                    pool_ape_slot = pl.cast(pool_abs % COMPRESS_RATIO, pl.INDEX)
-                    pool_kv_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = kv_proj_scratch[
-                        pool_local : pool_local + 1,
-                        h0 : h0 + HEAD_TILE,
-                    ]
-                    pool_score_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = pl.add(
-                        score_proj_scratch[
+                        pool_local = pool_source - tile_base
+                        pool_ape_slot = pl.cast(pool_abs % COMPRESS_RATIO, pl.INDEX)
+                        pool_kv_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = kv_proj_scratch[
                             pool_local : pool_local + 1,
                             h0 : h0 + HEAD_TILE,
-                        ],
-                        ape[
-                            pool_ape_slot : pool_ape_slot + 1,
-                            h0 : h0 + HEAD_TILE,
-                        ],
-                    )
+                        ]
+                        pool_score_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = pl.add(
+                            score_proj_scratch[
+                                pool_local : pool_local + 1,
+                                h0 : h0 + HEAD_TILE,
+                            ],
+                            ape[
+                                pool_ape_slot : pool_ape_slot + 1,
+                                h0 : h0 + HEAD_TILE,
+                            ],
+                        )
             # Vectorized softmax over all STATE_LEN slots: transpose the assembled
             # [STATE_LEN, HEAD_TILE] tile, then row_max/exp/sum/div and the weighted sum.
             pool_score_t = pl.transpose(pool_score_tile, axis1=0, axis2=1)
@@ -437,6 +454,29 @@ def _prefill_compressor_ratio128_tile(
     return cmp_kv, compress_state
 
 
+@pl.jit.inline(auto_scope=False)
+def _prefill_compressor_ratio128_prepare():
+    """Construct RoPE indices and the ordered state-publication fence."""
+    rope_dup_idx_template = pl.create_tensor([HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
+    rope_swap_idx_template = pl.create_tensor([HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
+    rope_sign_template = pl.create_tensor([HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_rope_index_prepare"):
+        # Scalar construction avoids TCI's implicit temporary, which is not
+        # available when this inline program is itself nested under HCA.
+        for rope_r in pl.range(HCA_C128_RMS_TILE):
+            for rope_c in pl.range(ROPE_HEAD_DIM):
+                rope_lane = rope_c % 2
+                pl.write(rope_dup_idx_template, [rope_r, rope_c], pl.cast(rope_c // 2, pl.INT32))
+                pl.write(rope_swap_idx_template, [rope_r, rope_c], pl.cast(rope_c + 1 - rope_lane * 2, pl.INT32))
+                pl.write(rope_sign_template, [rope_r, rope_c], pl.cast(pl.cast(rope_lane * 2 - 1, pl.INT32), pl.FP32))
+
+    # One GM-resident token orders each tile's pool and bounded state-tail commit.
+    state_order_fence = pl.create_tensor([1], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_state_order_init"):
+        pl.write(state_order_fence, [0], pl.cast(0, pl.INT32))
+    return rope_dup_idx_template, rope_swap_idx_template, rope_sign_template, state_order_fence
+
+
 def _prefill_compressor_ratio128(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
@@ -473,35 +513,7 @@ def _prefill_compressor_ratio128(
     cmp_slot_mapping.bind_dynamic(0, T_DYN)
     state_slot_mapping.bind_dynamic(0, T_DYN)
     request_count = pl.tensor.dim(query_start_loc, 0) - 1
-    rope_dup_idx_template = pl.create_tensor([HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
-    rope_swap_idx_template = pl.create_tensor([HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
-    rope_sign_template = pl.create_tensor([HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_rope_index_prepare"):
-        # Scalar construction avoids TCI's implicit temporary, which is not
-        # available when this inline program is itself nested under HCA.
-        for rope_r in pl.range(HCA_C128_RMS_TILE):
-            for rope_c in pl.range(ROPE_HEAD_DIM):
-                rope_lane = rope_c % 2
-                pl.write(
-                    rope_dup_idx_template,
-                    [rope_r, rope_c],
-                    pl.cast(rope_c // 2, pl.INT32),
-                )
-                pl.write(
-                    rope_swap_idx_template,
-                    [rope_r, rope_c],
-                    pl.cast(rope_c + 1 - rope_lane * 2, pl.INT32),
-                )
-                pl.write(
-                    rope_sign_template,
-                    [rope_r, rope_c],
-                    pl.cast(pl.cast(rope_lane * 2 - 1, pl.INT32), pl.FP32),
-                )
-
-    # One GM-resident token orders each tile's pool and bounded state-tail commit.
-    state_order_fence = pl.create_tensor([1], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_state_order_init"):
-        pl.write(state_order_fence, [0], pl.cast(0, pl.INT32))
+    rope_dup_idx_template, rope_swap_idx_template, rope_sign_template, state_order_fence = _prefill_compressor_ratio128_prepare()
     for request in pl.range(request_count):
         request_start = pl.cast(pl.read(query_start_loc, [request]), pl.INDEX)
         request_end = pl.cast(pl.read(query_start_loc, [request + 1]), pl.INDEX)
@@ -510,30 +522,99 @@ def _prefill_compressor_ratio128(
             tile_base = request_start + request_offset
             tile_rows = pl.min(PREFILL_STATE_TILE, request_end - tile_base)
             with pl.scope():
-                _prefill_compressor_ratio128_tile(
-                    x,
-                    compress_state,
-                    request_table,
-                    wkv,
-                    wgate,
-                    ape,
-                    norm_w,
-                    cmp_freqs_cos,
-                    cmp_freqs_sin,
-                    cmp_kv,
-                    position_ids,
-                    cmp_slot_mapping,
-                    state_slot_mapping,
-                    rope_dup_idx_template,
-                    rope_swap_idx_template,
-                    rope_sign_template,
-                    state_order_fence,
-                    request_start,
-                    tile_base,
-                    tile_rows,
+                tile_checkpoint_ends = state_checkpoint_ends[request, request_offset // PREFILL_STATE_TILE]
+                kv_proj_scratch = pl.create_tensor([PREFILL_STATE_TILE, OUT_DIM], dtype=pl.FP32)
+                score_proj_scratch = pl.create_tensor([PREFILL_STATE_TILE, OUT_DIM], dtype=pl.FP32)
+                _prefill_compressor_ratio128_project_tile(
+                    x, wkv, wgate, kv_proj_scratch, score_proj_scratch,
+                    tile_base, tile_rows,
+                )
+                _prefill_compressor_ratio128_apply_tile(
+                    kv_proj_scratch, score_proj_scratch,
+                    compress_state, request_table, ape, norm_w,
+                    cmp_freqs_cos, cmp_freqs_sin, cmp_kv, position_ids, cmp_slot_mapping, state_slot_mapping,
+                    rope_dup_idx_template, rope_swap_idx_template, rope_sign_template, state_order_fence,
+                    request_start, tile_base, tile_rows, tile_checkpoint_ends,
+                )
+    return cmp_kv, compress_state
+
+
+def _prefill_compressor_ratio128_projected(
+    values_full: pl.Tensor[[PROJ_T_DYN, OUT_DIM], pl.FP32],
+    scores_full: pl.Tensor[[PROJ_T_DYN, OUT_DIM], pl.FP32],
+    query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
+    compress_state: pl.InOut[pl.Tensor[[STATE_BLOCK_NUM_DYN, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]],
+    compress_state_block_table: pl.Tensor[[REQUESTS_DYN, HCA_STATE_MAX_BLOCKS], pl.INT32],
+    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
+    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
+    cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+):
+    """Compress packed requests independently through ordered 512-row state tiles.
+
+    Each request slice delimited by ``query_start_loc`` must use consecutive positions.
+    """
+    values_full.bind_dynamic(0, PROJ_T_DYN)
+    scores_full.bind_dynamic(0, PROJ_T_DYN)
+    query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
+    state_checkpoint_ends.bind_dynamic(0, REQUESTS_DYN)
+    state_checkpoint_ends.bind_dynamic(1, CHECKPOINT_TILES_DYN)
+    compress_state.bind_dynamic(0, STATE_BLOCK_NUM_DYN)
+    compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
+    cmp_kv.bind_dynamic(0, CMP_BLOCK_NUM_DYN)
+    cmp_freqs_cos.bind_dynamic(0, T_DYN)
+    cmp_freqs_sin.bind_dynamic(0, T_DYN)
+    position_ids.bind_dynamic(0, T_DYN)
+    cmp_slot_mapping.bind_dynamic(0, T_DYN)
+    state_slot_mapping.bind_dynamic(0, T_DYN)
+    request_count = pl.tensor.dim(query_start_loc, 0) - 1
+    rope_dup_idx_template, rope_swap_idx_template, rope_sign_template, state_order_fence = _prefill_compressor_ratio128_prepare()
+    for request in pl.range(request_count):
+        request_start = pl.cast(pl.read(query_start_loc, [request]), pl.INDEX)
+        request_end = pl.cast(pl.read(query_start_loc, [request + 1]), pl.INDEX)
+        request_table = compress_state_block_table[request]
+        for request_offset in pl.range(0, request_end - request_start, PREFILL_STATE_TILE):
+            tile_base = request_start + request_offset
+            tile_rows = pl.min(PREFILL_STATE_TILE, request_end - tile_base)
+            with pl.scope():
+                values_tile = pl.slice(values_full, [PREFILL_STATE_TILE, OUT_DIM], [tile_base, 0], valid_shape=[tile_rows, OUT_DIM])
+                scores_tile = pl.slice(scores_full, [PREFILL_STATE_TILE, OUT_DIM], [tile_base, 0], valid_shape=[tile_rows, OUT_DIM])
+                _prefill_compressor_ratio128_apply_tile(
+                    values_tile, scores_tile,
+                    compress_state, request_table, ape, norm_w,
+                    cmp_freqs_cos, cmp_freqs_sin, cmp_kv,
+                    position_ids, cmp_slot_mapping, state_slot_mapping,
+                    rope_dup_idx_template, rope_swap_idx_template, rope_sign_template, state_order_fence,
+                    request_start, tile_base, tile_rows,
                     state_checkpoint_ends[request, request_offset // PREFILL_STATE_TILE],
                 )
     return cmp_kv, compress_state
+
+
+prefill_compressor_ratio128_projected = pl.jit.inline(auto_scope=False)(_prefill_compressor_ratio128_projected)
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_compressor_ratio128_project_local(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    values_local: pl.Tensor,
+    scores_local: pl.Tensor,
+):
+    """Project rank-local rows through the same bounded cube tiles."""
+    local_rows = pl.tensor.dim(x, 0)
+    for projection_base in pl.range(0, local_rows, PREFILL_STATE_TILE):
+        projection_rows = pl.min(PREFILL_STATE_TILE, local_rows - projection_base)
+        values_tile = pl.slice(values_local, [PREFILL_STATE_TILE, OUT_DIM], [projection_base, 0])
+        scores_tile = pl.slice(scores_local, [PREFILL_STATE_TILE, OUT_DIM], [projection_base, 0])
+        _prefill_compressor_ratio128_project_tile( x, wkv, wgate, values_tile, scores_tile, projection_base, projection_rows)
+    return values_local, scores_local
 
 
 prefill_compressor_ratio128 = pl.jit.inline(auto_scope=False)(_prefill_compressor_ratio128)
