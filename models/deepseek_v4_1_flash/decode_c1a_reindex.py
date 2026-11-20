@@ -312,13 +312,15 @@ def l3_decode_c1a_reindex(
     )
 
 
-def prepare_reindex_metadata(pool_ids, pool_counts, request_ids, lengths, page_table, cache_pages, active):
+def prepare_reindex_metadata(pool_ids, pool_counts, request_ids, lengths, page_table, cache_pages, active, *, capacity=None):
     """Evaluate the original pool identity condition and group paged runs on CPU."""
-    rows, capacity = pool_ids.shape
+    rows = request_ids.shape[0]
+    if pool_ids is not None:
+        capacity = pool_ids.shape[1]
     if not 0 <= active <= rows:
         raise ValueError(f"num_tokens must lie between 0 and {rows}, got {active}")
     width = min(capacity * M.candidate_block_size, page_table.shape[1] * 128)
-    expected_ids = torch.arange(capacity, dtype=pool_ids.dtype)
+    expected_ids = torch.arange(capacity, dtype=pool_ids.dtype) if pool_ids is not None else None
     runs = torch.zeros((4, rows + 1), dtype=torch.int32)
     dense = True
     run_count = 0
@@ -328,13 +330,15 @@ def prepare_reindex_metadata(pool_ids, pool_counts, request_ids, lengths, page_t
     for token in range(active):
         request = int(request_ids[token])
         visible = max(0, int(lengths[token]))
-        count = max(0, min(int(pool_counts[token]), capacity))
+        blocks = (visible + 7) // 8
+        # The full layer emits ascending IDs when all visible blocks fit in TopK.
+        count = min(blocks, capacity, 2048) if pool_ids is None else max(0, min(int(pool_counts[token]), capacity))
         if dense:
             dense = (
-                count == (visible + 7) // 8
+                count == blocks
                 and visible <= width
                 and 0 <= request < page_table.shape[0]
-                and torch.equal(pool_ids[token, :count], expected_ids[:count])
+                and (pool_ids is None or torch.equal(pool_ids[token, :count], expected_ids[:count]))
                 and not bool((page_table[request, :(visible + 127) // 128] >= cache_pages).any())
             )
         if token and (request != previous or token - start == 6):
