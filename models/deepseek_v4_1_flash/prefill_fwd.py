@@ -82,8 +82,9 @@ from input_pack import gather_rows, pack_x_hc
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, prepare_forward_rope_tables
 from utils import paged_slots, window_metadata
 from engram import ENGRAM_K, KV_OUT, HostEngram, engram_from_rows
-from lm_head import MAX_LOGIT_ROWS, lm_head, greedy_sample
+from lm_head import MAX_LOGIT_ROWS, lm_head
 from gate import gather_routing_bias
+from sample import sample
 
 BIAS_DYN = pl.dynamic("PREFILL_FORWARD_BIAS_DYN")
 from prefill_moe import AUX_WIDTH, ROUTE_WIDTH, clear_moe_signals
@@ -532,6 +533,11 @@ def l2_prefill_fwd(
     final_norm_weight: pl.Tensor[[D], pl.BF16],
     lm_head_weight: pl.Tensor[[D, VOCAB // LM_HEAD_TP_SIZE], pl.BF16, pl.NZ],
     logit_rows: pl.Tensor[[16], pl.INT32],
+    sampling_temperatures: pl.Tensor[[16], pl.FP32],
+    sampling_top_ks: pl.Tensor[[16], pl.INT32],
+    sampling_top_ps: pl.Tensor[[16], pl.FP32],
+    sampling_seeds: pl.Tensor[[16], pl.INT32],
+    sampling_positions: pl.Tensor[[16], pl.INT32],
     x_hc_out: pl.Out[pl.Tensor[[CAPACITY, HC_MULT, D], pl.FP32]],
     pre_mix_out: pl.Out[pl.Tensor[[CAPACITY, HC_MULT], pl.FP32]],
     dspark_target_hidden: pl.Out[pl.Tensor[[CAPACITY, DSPARK_MAIN_IN], pl.BF16]],
@@ -910,7 +916,10 @@ def l2_prefill_fwd(
         head_hidden, head_hidden_done, head_logits, head_logits_done,
         rank, MAX_LOGIT_ROWS,
     )
-    greedy_sample(logits, sampled_ids)
+    sample(
+        logits, sampling_temperatures, sampling_top_ks, sampling_top_ps,
+        sampling_seeds, sampling_positions, sampled_ids,
+    )
     return logits, sampled_ids
 
 
@@ -991,6 +1000,11 @@ def l3_prefill_fwd(
     final_norm_weight: pl.Tensor[[RANKS, D], pl.BF16],
     lm_head_weight: pl.Tensor[[RANKS, D, VOCAB // LM_HEAD_TP_SIZE], pl.BF16],
     logit_rows: pl.Tensor[[RANKS, 16], pl.INT32],
+    sampling_temperatures: pl.Tensor[[RANKS, 16], pl.FP32],
+    sampling_top_ks: pl.Tensor[[RANKS, 16], pl.INT32],
+    sampling_top_ps: pl.Tensor[[RANKS, 16], pl.FP32],
+    sampling_seeds: pl.Tensor[[RANKS, 16], pl.INT32],
+    sampling_positions: pl.Tensor[[RANKS, 16], pl.INT32],
     x_hc_out: pl.Out[pl.Tensor[[RANKS, CAPACITY, HC_MULT, D], pl.FP32]],
     pre_mix_out: pl.Out[pl.Tensor[[RANKS, CAPACITY, HC_MULT], pl.FP32]],
     dspark_target_hidden: pl.Out[pl.Tensor[[RANKS, CAPACITY, DSPARK_MAIN_IN], pl.BF16]],
@@ -1142,6 +1156,8 @@ def l3_prefill_fwd(
             final_norm_weight[rank],
             lm_head_weight[rank],
             logit_rows[rank],
+            sampling_temperatures[rank], sampling_top_ks[rank], sampling_top_ps[rank],
+            sampling_seeds[rank], sampling_positions[rank],
             x_hc_out[rank], pre_mix_out[rank], dspark_target_hidden[rank],
             logits[rank],
             sampled_ids[rank],
@@ -1205,6 +1221,7 @@ PREFILL_TENSORS = (
     "final_norm_weight",
     "lm_head_weight",
     "logit_rows",
+    "sampling_temperatures", "sampling_top_ks", "sampling_top_ps", "sampling_seeds", "sampling_positions",
     "x_hc_out", "pre_mix_out", "dspark_target_hidden",
     "logits",
     "sampled_ids",
@@ -1698,6 +1715,11 @@ def prepare_prefill_inputs(
             "state_cache", (len(state_tables), request_capacity + 1, C.STATE_CAPACITY, 2 * M.head_dim), torch.float32,
         ),
         "logit_rows": logit_rows,
+        "sampling_temperatures": torch.zeros(16, dtype=torch.float32),
+        "sampling_top_ks": torch.zeros(16, dtype=torch.int32),
+        "sampling_top_ps": torch.zeros(16, dtype=torch.float32),
+        "sampling_seeds": torch.zeros(16, dtype=torch.int32),
+        "sampling_positions": torch.zeros(16, dtype=torch.int32),
     }
     validate_prefill_caches(values, table, compressed_tables, state_tables)
     return values
@@ -1795,6 +1817,11 @@ def l2_generation_head(
     final_norm_weight: pl.Tensor[[D], pl.BF16],
     lm_head_weight: pl.Tensor[[D, VOCAB // LM_HEAD_TP_SIZE], pl.BF16, pl.NZ],
     logit_rows: pl.Tensor[[16], pl.INT32],
+    sampling_temperatures: pl.Tensor[[16], pl.FP32],
+    sampling_top_ks: pl.Tensor[[16], pl.INT32],
+    sampling_top_ps: pl.Tensor[[16], pl.FP32],
+    sampling_seeds: pl.Tensor[[16], pl.INT32],
+    sampling_positions: pl.Tensor[[16], pl.INT32],
     logits: pl.Out[pl.Tensor[[16, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[16, 8], pl.INT32]],
     head_hidden: pld.DistributedTensor[[LM_HEAD_TP_SIZE * 16, D], pl.BF16],
@@ -1811,7 +1838,10 @@ def l2_generation_head(
         normalized, lm_head_weight, logit_rows, logits,
         head_hidden, head_hidden_done, head_logits, head_logits_done, rank, MAX_LOGIT_ROWS,
     )
-    greedy_sample(logits, sampled_ids)
+    sample(
+        logits, sampling_temperatures, sampling_top_ks, sampling_top_ps,
+        sampling_seeds, sampling_positions, sampled_ids,
+    )
 
 
 @pl.jit.host
@@ -1821,6 +1851,11 @@ def l3_generation_head(
     final_norm_weight: pl.Tensor[[RANKS, D], pl.BF16],
     lm_head_weight: pl.Tensor[[RANKS, D, VOCAB // LM_HEAD_TP_SIZE], pl.BF16],
     logit_rows: pl.Tensor[[RANKS, 16], pl.INT32],
+    sampling_temperatures: pl.Tensor[[RANKS, 16], pl.FP32],
+    sampling_top_ks: pl.Tensor[[RANKS, 16], pl.INT32],
+    sampling_top_ps: pl.Tensor[[RANKS, 16], pl.FP32],
+    sampling_seeds: pl.Tensor[[RANKS, 16], pl.INT32],
+    sampling_positions: pl.Tensor[[RANKS, 16], pl.INT32],
     logits: pl.Out[pl.Tensor[[RANKS, 16, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[RANKS, 16, 8], pl.INT32]],
 ):
@@ -1835,6 +1870,8 @@ def l3_generation_head(
         head_logits_done = pld.window(logits_done_buffer, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         l2_generation_head(
             x_hc[rank], pre_mix[rank], final_norm_weight[rank], lm_head_weight[rank], logit_rows[rank],
+            sampling_temperatures[rank], sampling_top_ks[rank], sampling_top_ps[rank],
+            sampling_seeds[rank], sampling_positions[rank],
             logits[rank], sampled_ids[rank], head_hidden, head_hidden_done, head_logits, head_logits_done,
             rank, device=rank,
         )
@@ -1960,7 +1997,16 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
     print("CED_RESIDENT_BYTES_PER_RANK", weights.bytes_per_rank, flush=True)
     start = time.monotonic()
     # Completed forwards retire signals; native cache allocations persist.
+    head_names = (
+        "x_hc", "pre_mix", "final_norm_weight", "lm_head_weight", "logit_rows",
+        "sampling_temperatures", "sampling_top_ks", "sampling_top_ps", "sampling_seeds", "sampling_positions",
+        "logits", "sampled_ids",
+    )
     generation_head = None if decode_compiled is None else l3_generation_head.compile(config=config)
+    if generation_head is not None:
+        head_parameter_names = [parameter.name.removesuffix("__ssa_v0") for parameter in generation_head._get_metadata()[0]]
+        if head_parameter_names != list(head_names):
+            raise ValueError("generation head parameters must match the staged head tensor names in order")
     extra = [] if decode_compiled is None else [decode_compiled, generation_head]
     with compiled.prepare(
         config, extra_compiled=extra, persistent=True, reset_persistent_windows=False,
@@ -2011,7 +2057,6 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
 
         decode_rank = [{} for _ in device_ids]
         decode_stacked = {}
-        head_names = ("x_hc", "pre_mix", "final_norm_weight", "lm_head_weight", "logit_rows", "logits", "sampled_ids")
         head_stacked = {}
         if decode_compiled is not None:
             for rank, tensors in enumerate(decode_rank):
@@ -2055,6 +2100,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
         def run_rows(rows, *, decode=False):
             rank_tensors = decode_rank if decode else per_rank
             capacity = decode_rows if decode else CAPACITY
+            greedy_live = []
             for rank, (tensors, token_ids) in enumerate(zip(rank_tensors, rows)):
                 inputs = prepare_resident_inputs(
                     weights, token_ids, capacity,
@@ -2062,6 +2108,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
                     cache_state=host_cache[rank], rope_tables=rope_tables,
                     engram=engram, request_id=rank, image_spans=() if decode else image_spans[rank],
                 )
+                greedy_live.append(float(inputs["sampling_temperatures"][0]) == 0.0)
                 if multimodal and not decode:
                     from gate import prepare_routing_bias
 
@@ -2104,7 +2151,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
                 if not bool(torch.isfinite(logits[rank, 0]).all()):
                     raise FloatingPointError(f"nonfinite logits on rank {rank}")
                 token = int(sampled_ids[rank, 0, 0])
-                if token != int(logits[rank, 0].argmax()):
+                if greedy_live[rank] and token != int(logits[rank, 0].argmax()):
                     raise AssertionError("device greedy sampling disagrees with copied logits")
                 last_logits[rank].copy_(logits[rank, 0])
                 last_ids[rank] = token
@@ -2188,6 +2235,8 @@ def build_tensor_specs(args=None):
             embedding, CAPACITY, query_lens=group, start_pos=prefixes,
             request_capacity=request_capacity, max_seq_len=max_seq_len, cache_state=previous,
         )
+        values["sampling_temperatures"][0] = 0.7 if dp_rank % 2 == 0 else 0.0
+        values["sampling_seeds"] = torch.arange(16, dtype=torch.int32)
         rank_values.extend([values] * CP_SIZE)
     specs = []
     for name in PREFILL_TENSORS:
