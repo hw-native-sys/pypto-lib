@@ -122,6 +122,58 @@ with the entry points it names — registers the prefill, decode, and
 greedy-sample stages, their compile-time argument builders, and the ABI
 constants an external runtime needs.
 
+### vLLM Kernel smoke
+
+The Lib CI adapter lives under
+[`.github/scripts/qwen-vllm-kernel/`](../../../.github/scripts/qwen-vllm-kernel/).
+It owns the Qwen model, Worker/Runner subclasses, weight packing, KV allocation,
+metadata staging and eager/capture integration. Its model code imports no
+Simpler Qwen examples. Simpler supplies the pinned runtime and generic native
+submission bridge; the compiler retains its own matching runtime environment.
+
+All four cases guard **native vLLM prefill followed by Lib decode**. The shared
+`qwen_kernel_worker.py` provides `KernelWorker` for eager and `CaptureWorker`
+for capture; both preserve the native Qwen prefill forward using the adapter's
+shared packed weights and KV views.
+
+| Lib decode runtime | Eager case | Capture case |
+| --- | --- | --- |
+| TMR | Native vLLM prefill, then Lib TMR decode | Native vLLM prefill, then graph-replayed Lib TMR decode |
+| HBG | Native vLLM prefill, then Lib HBG decode | Native vLLM prefill, then graph-replayed Lib HBG decode |
+
+`compile_decode.py` builds TMR and HBG Kernel artifacts from the Lib checkout
+under test. `run_smoke.sh` runs eager and capture against each artifact, producing
+four logs and result JSON files. Each case runs 16 requests with five input
+tokens and eight expected output tokens: native prefill produces the first
+token and seven Lib decode steps produce the rest. Every decode step checks
+private KV pages and address ranges across all 40 layers. Capture additionally requires
+one cold recording, seven actual graph replays, graph reset and subsequent
+Torch device use. The worker uses the physical device assigned by TaskQueue.
+`prepare_runtime.py` populates the native callable caches before card allocation.
+
+Capture uses `FULL_DECODE_ONLY`; prefill runs outside the recorded decode graph.
+The pinned native prefill environment retains `triton-ascend==3.2.1`, including
+its download checksum and cache. The smoke checks that package version. A
+Triton-free native fallback is not qualified by these cases. Lib's
+`prefill_fwd` is covered through the separate Serving integration, rather than
+being substituted into this vLLM path. The existing `qwen-vllm-eager` CI check
+and cache identities are retained for compatibility; its script directory and
+result artifacts use the Kernel name.
+
+The adapter allocates separate contiguous K/V roots shaped
+`[40, pages, 128, 8, 128]`. Native prefill receives per-layer views while Lib
+decode receives flattened views of the same storage. No per-step KV repacking
+is needed. Token IDs and page/length/slot metadata are staged into stable
+buffers. FP32 normalization weights are loaded from the checkpoint separately
+from the BF16 native model weights.
+
+This is a pinned single-device BF16, synchronous B16 smoke. It excludes prefix
+caching, chunked prefill, quantization, speculative decoding and distributed
+execution. The current execution path calls Simpler directly; migration to
+PyPTO's public eager and capture entries follows their respective mainline
+availability. This smoke does not establish long-request or Clean performance
+qualification.
+
 ## How it was optimized
 
 [Qwen3-14B optimization](optimization.md) follows the
