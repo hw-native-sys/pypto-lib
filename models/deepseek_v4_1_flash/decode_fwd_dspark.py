@@ -41,7 +41,8 @@ import decode_metadata as state_ops
 from decode_fwd import decode_fwd
 from hc import hc_head
 from rmsnorm import rms_norm
-from lm_head import VOCAB, lm_head, greedy_sample
+from lm_head import VOCAB, lm_head
+from sample import sample
 import lm_head as head
 from dspark_drafter import dspark_drafter
 from markov import markov_sample
@@ -237,6 +238,11 @@ def l2_decode_fwd_dspark(
     attention_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     final_norm_weight: pl.Tensor[[D], pl.BF16],
     lm_head_weight: pl.Tensor[[D, TARGET_FWD_VOCAB_PER_TP], pl.BF16, pl.NZ],
+    sampling_temperatures: pl.Tensor[[TARGET_ROWS], pl.FP32],
+    sampling_top_ks: pl.Tensor[[TARGET_ROWS], pl.INT32],
+    sampling_top_ps: pl.Tensor[[TARGET_ROWS], pl.FP32],
+    sampling_seeds: pl.Tensor[[TARGET_ROWS], pl.INT32],
+    sampling_positions: pl.Tensor[[TARGET_ROWS], pl.INT32],
     target_sampled_ids: pl.Out[pl.Tensor[[TARGET_ROWS, TARGET_FWD_SAMPLED_IDS_PAD], pl.INT32]],
     accepted_ids: pl.Out[pl.Tensor[[DECODE_BATCH, STATE_OPS_ROWS], pl.INT32]],
     accepted_counts: pl.Out[pl.Tensor[[DECODE_BATCH], pl.INT32]],
@@ -417,7 +423,10 @@ def l2_decode_fwd_dspark(
         sampling_hidden_window, sampling_hidden_done, sampling_logits_window, sampling_logits_done,
         rank, PADDED_ROWS,
     )
-    greedy_sample(sample_logits[:TARGET_ROWS, :], target_sampled_ids)
+    sample(
+        sample_logits[:TARGET_ROWS, :], sampling_temperatures, sampling_top_ks, sampling_top_ps,
+        sampling_seeds, sampling_positions, target_sampled_ids,
+    )
     markov_row_indices = pl.create_tensor([MARKOV_MAX_LOGIT_ROWS], dtype=pl.INT32)
     target_hidden = decode_accept(
         slot_ids, generations, active_widths, target_sampled_ids,
@@ -470,6 +479,22 @@ def l2_decode_fwd_dspark(
         slot_ids, generations, draft_ids, state_tokens,
         state_meta, committed,
     )
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="all_signal_clear", allow_early_resolve=False):
+        anchor = pl.read(committed, [0])
+        zero = pl.cast(0, pl.INT32)
+        for peer in pl.range(EP_SIZE):
+            pl.write(target_fwd_data_arrived, [peer, 0, 0], zero)
+            pl.write(target_fwd_combine_arrived, [peer, 0, 0], zero)
+            pl.write(draft_data_arrived, [peer, 0, 0], zero)
+            pl.write(draft_combine_arrived, [peer, 0, 0], zero)
+        if LM_HEAD_TP_SIZE > 1:
+            for peer in pl.range(LM_HEAD_TP_SIZE):
+                pl.write(sampling_hidden_done, [peer, 0], zero)
+                pl.write(sampling_logits_done, [peer, 0], zero)
+                pl.write(markov_hidden_done, [peer, 0], zero)
+                pl.write(markov_logits_done, [peer, 0], zero)
+        pl.write(committed, [0], anchor)
 
 
 
@@ -556,6 +581,11 @@ def l3_decode_fwd_dspark(
     attention_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     final_norm_weight: pl.Tensor[[EP_SIZE, D], pl.BF16],
     lm_head_weight: pl.Tensor[[EP_SIZE, D, TARGET_FWD_VOCAB_PER_TP], pl.BF16],
+    sampling_temperatures: pl.Tensor[[EP_SIZE, TARGET_ROWS], pl.FP32],
+    sampling_top_ks: pl.Tensor[[EP_SIZE, TARGET_ROWS], pl.INT32],
+    sampling_top_ps: pl.Tensor[[EP_SIZE, TARGET_ROWS], pl.FP32],
+    sampling_seeds: pl.Tensor[[EP_SIZE, TARGET_ROWS], pl.INT32],
+    sampling_positions: pl.Tensor[[EP_SIZE, TARGET_ROWS], pl.INT32],
     target_sampled_ids: pl.Out[pl.Tensor[[EP_SIZE, TARGET_ROWS, TARGET_FWD_SAMPLED_IDS_PAD], pl.INT32]],
     accepted_ids: pl.Out[pl.Tensor[[EP_SIZE, DECODE_BATCH, STATE_OPS_ROWS], pl.INT32]],
     accepted_counts: pl.Out[pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32]],
@@ -714,6 +744,8 @@ def l3_decode_fwd_dspark(
             routed_w3_scale[rank], shared_w1[rank], shared_w1_scale[rank], shared_w2[rank],
             shared_w2_scale[rank], shared_w3[rank], shared_w3_scale[rank], moe_num_tokens,
             attention_num_tokens, final_norm_weight[rank], lm_head_weight[rank],
+            sampling_temperatures[rank], sampling_top_ks[rank], sampling_top_ps[rank],
+            sampling_seeds[rank], sampling_positions[rank],
             target_sampled_ids[rank], accepted_ids[rank],
             accepted_counts[rank], num_sampled[rank],
             last_sampled[rank], anchor_ids[rank], first_query_positions[rank],
@@ -826,6 +858,11 @@ def l3_decode_fwd_dspark_prepared(
     attention_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     final_norm_weight: pl.Tensor[[EP_SIZE, D], pl.BF16],
     lm_head_weight: pl.Tensor[[EP_SIZE, D, TARGET_FWD_VOCAB_PER_TP], pl.BF16],
+    sampling_temperatures: pl.Tensor[[EP_SIZE, TARGET_ROWS], pl.FP32],
+    sampling_top_ks: pl.Tensor[[EP_SIZE, TARGET_ROWS], pl.INT32],
+    sampling_top_ps: pl.Tensor[[EP_SIZE, TARGET_ROWS], pl.FP32],
+    sampling_seeds: pl.Tensor[[EP_SIZE, TARGET_ROWS], pl.INT32],
+    sampling_positions: pl.Tensor[[EP_SIZE, TARGET_ROWS], pl.INT32],
     target_sampled_ids: pl.Out[pl.Tensor[[EP_SIZE, TARGET_ROWS, TARGET_FWD_SAMPLED_IDS_PAD], pl.INT32]],
     accepted_ids: pl.Out[pl.Tensor[[EP_SIZE, DECODE_BATCH, STATE_OPS_ROWS], pl.INT32]],
     accepted_counts: pl.Out[pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32]],
@@ -986,6 +1023,8 @@ def l3_decode_fwd_dspark_prepared(
             routed_w3_scale[rank], shared_w1[rank], shared_w1_scale[rank], shared_w2[rank],
             shared_w2_scale[rank], shared_w3[rank], shared_w3_scale[rank], moe_num_tokens,
             attention_num_tokens, final_norm_weight[rank], lm_head_weight[rank],
+            sampling_temperatures[rank], sampling_top_ks[rank], sampling_top_ps[rank],
+            sampling_seeds[rank], sampling_positions[rank],
             target_sampled_ids[rank], accepted_ids[rank],
             accepted_counts[rank], num_sampled[rank],
             last_sampled[rank], anchor_ids[rank], first_query_positions[rank],
@@ -1047,6 +1086,9 @@ def build_tensor_specs():
         "draft_main_norm_weight": 1.0,
         "markov_final_norm_weight": 1.0,
         "final_norm_weight": 1.0,
+        "sampling_temperatures": torch.tensor([0.7, 0.0] * (DECODE_BATCH // 2)).repeat_interleave(DECODE_SEQ).repeat(EP_SIZE, 1),
+        "sampling_seeds": torch.arange(DECODE_BATCH, dtype=torch.int32).repeat_interleave(DECODE_SEQ).repeat(EP_SIZE, 1),
+        "sampling_positions": torch.arange(DECODE_SEQ, dtype=torch.int32).repeat(DECODE_BATCH).repeat(EP_SIZE, 1),
         "attention_num_tokens": ROWS,
         "moe_num_tokens": ROWS,
     }

@@ -114,24 +114,30 @@ gdn_layer_test = pl.jit(_gdn_layer)
 def delta_rule_ref(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     beta: torch.Tensor, g: torch.Tensor,
-    chunk: int,
+    chunk: int, narrow: bool = True,
 ) -> dict[str, torch.Tensor]:
     """All six stages on the given inputs; every intermediate, `o` the output.
 
     Values crossing a stage boundary are narrowed to the dtype the kernels
     exchange -- FP16 for A, A_inv, W, U, V_new and the state snapshots -- so a
-    stage reads what the preceding kernel would have handed it.
+    stage reads what the preceding kernel would have handed it. *narrow* off
+    keeps the whole chain in REF_DTYPE, which is the float64 truth the block
+    reference measures the model against; the `16` in the key names marks the
+    boundary either way.
     """
+    def across(x):
+        return x.to(torch.float16) if narrow else x
+
     st = dict(q=q, k=k, v=v, beta=beta, g=g)
     st["g_sum"] = cumsum_ref(g, chunk)
-    st["a16"] = kkt_ref(k, beta, st["g_sum"], chunk).to(torch.float16)
-    st["a_inv16"] = solve_tril_ref(st["a16"], chunk).to(torch.float16)
+    st["a16"] = across(kkt_ref(k, beta, st["g_sum"], chunk))
+    st["a_inv16"] = across(solve_tril_ref(st["a16"], chunk))
     w, u = wy_fast_ref(k, v, beta, st["a_inv16"], st["g_sum"], chunk)
-    st["w16"] = w.to(torch.float16)
-    st["u16"] = u.to(torch.float16)
+    st["w16"] = across(w)
+    st["u16"] = across(u)
     state, v_new, st["final_state"] = chunk_h_ref(k, st["w16"], st["u16"], st["g_sum"], chunk)
-    st["state16"] = state.to(torch.float16)
-    st["v_new16"] = v_new.to(torch.float16)
+    st["state16"] = across(state)
+    st["v_new16"] = across(v_new)
     st["o"] = chunk_o_ref(q, k, st["v_new16"], st["state16"], st["g_sum"], chunk)
     return st
 

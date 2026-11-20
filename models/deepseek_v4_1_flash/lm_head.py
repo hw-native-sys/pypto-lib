@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
 # ci: no-sim
-"""DeepSeek-V4.1 Flash vocabulary projection, distributed logits assembly and greedy sampling."""
+"""DeepSeek-V4.1 Flash vocabulary projection and distributed logits assembly."""
 
 import sys
 from math import gcd
@@ -61,13 +61,7 @@ HIDDEN_PUSH_WORKER_TILE = (MAX_LOGIT_ROWS + 64 // LM_HEAD_TP_SIZE - 1) // (64 //
 HIDDEN_PUSH_ROW_TILE = gcd(HIDDEN_OWNER_ROW_TILE, HIDDEN_PUSH_WORKER_TILE)
 HIDDEN_PUSH_CHUNK_TILE = min(12, HIDDEN_PUSH_ROW_TILE)
 
-# Greedy reduction tiles and first-index selection.
-GREEDY_VOCAB_TILE = 8192
-GREEDY_ROW_TILE = 8
-GREEDY_SEGMENT_TILE = GREEDY_VOCAB_TILE // GREEDY_ROW_TILE
-GREEDY_INDEX_TILE = GREEDY_SEGMENT_TILE // GREEDY_ROW_TILE
-GREEDY_NEGATIVE_INF_BITS = -8388608
-GREEDY_INDEX_SENTINEL = 1073741824
+# Padded sampled-ids row width shared with the decode sampling operators.
 SAMPLED_IDS_PAD = 8
 
 
@@ -123,73 +117,6 @@ def lm_head_project(
             result = pl.cast(rounded, pl.FP32)
             value = pl.set_validshape(result, output_rows, LM_HEAD_N_TILE)
             pl.store(value, [row, column], logits)
-
-
-@pl.jit.inline(auto_scope=False)
-def greedy_sample(
-    logits: pl.Tensor,
-    sampled_ids: pl.Tensor,
-):
-    """Select the first maximum token ID for each requested logits row."""
-    rows = pl.tensor.dim(sampled_ids, 0)
-    workers = pl.min(64, rows)
-    with pl.spmd(workers, name_hint="lm_head_greedy_sample"):
-        worker = pl.tile.get_block_idx()
-        ramp = pl.arange(0, [1, GREEDY_ROW_TILE * GREEDY_ROW_TILE], dtype=pl.INT32)
-        lane_grid = pl.reshape(ramp, [GREEDY_ROW_TILE, GREEDY_ROW_TILE])
-        lane_indices = pl.shr(lane_grid, 3)
-        lane_bases = pl.mul(lane_indices, GREEDY_SEGMENT_TILE)
-        for row in pl.range(worker, rows, workers):
-            inf_bits = pl.full([GREEDY_ROW_TILE, GREEDY_ROW_TILE], dtype=pl.INT32, value=GREEDY_NEGATIVE_INF_BITS)
-            best_values = pl.reinterpret_view(inf_bits, pl.FP32)
-            best_bases = lane_bases
-            for offset in pl.pipeline(0, VOCAB, GREEDY_VOCAB_TILE, stage=2):
-                valid = pl.min(GREEDY_VOCAB_TILE, VOCAB - offset)
-                scores = pl.slice(logits, [1, GREEDY_VOCAB_TILE], [row, offset], valid_shape=[1, valid])
-                scores = pl.fillpad(scores, pad_value=pl.PadValue.min)
-                scores = pl.set_validshape(scores, 1, GREEDY_VOCAB_TILE)
-                scores = pl.reshape(scores, [GREEDY_ROW_TILE, GREEDY_SEGMENT_TILE])
-                maxima = pl.row_max(scores)
-                current_zeros = pl.full([GREEDY_ROW_TILE, GREEDY_ROW_TILE], dtype=pl.FP32, value=0.0)
-                current = pl.row_expand(current_zeros, maxima)
-                update_mask = pl.cmp(current, best_values, cmp_type=4)
-                update = pl.cast(update_mask, pl.INT32)
-                offset_i32 = pl.cast(offset, pl.INT32)
-                current_bases = pl.add(lane_bases, offset_i32)
-                base_delta = pl.sub(current_bases, best_bases)
-                updated_delta = pl.mul(update, base_delta)
-                best_bases = pl.add(best_bases, updated_delta)
-                best_values = pl.maximum(best_values, current)
-            maximum = pl.col_max(best_values)
-            best_value = pl.read(maximum, [0, 0])
-            winning_mask = pl.cmp(best_values, best_value, cmp_type=0)
-            winning_lanes = pl.cast(winning_mask, pl.INT32)
-            base_offsets = pl.add(best_bases, -GREEDY_INDEX_SENTINEL)
-            matched_bases = pl.mul(winning_lanes, base_offsets)
-            base_candidates = pl.add(matched_bases, GREEDY_INDEX_SENTINEL)
-            first_base = pl.col_min(base_candidates)
-            best_base = pl.read(first_base, [0, 0])
-            base = pl.cast(best_base, pl.INDEX)
-            tail_cols = pl.min(GREEDY_SEGMENT_TILE, VOCAB - base)
-            segment = pl.slice(logits, [1, GREEDY_SEGMENT_TILE], [row, base], valid_shape=[1, tail_cols])
-            segment = pl.fillpad(segment, pad_value=pl.PadValue.min)
-            segment = pl.set_validshape(segment, 1, GREEDY_SEGMENT_TILE)
-            segment = pl.reshape(segment, [GREEDY_ROW_TILE, GREEDY_INDEX_TILE])
-            indices = pl.arange(0, [1, GREEDY_SEGMENT_TILE], dtype=pl.INT32)
-            indices = pl.reshape(indices, [GREEDY_ROW_TILE, GREEDY_INDEX_TILE])
-            match_mask = pl.cmp(segment, best_value, cmp_type=0)
-            matches = pl.cast(match_mask, pl.INT32)
-            index_offsets = pl.add(indices, -GREEDY_INDEX_SENTINEL)
-            matched_indices = pl.mul(matches, index_offsets)
-            candidates = pl.add(matched_indices, GREEDY_INDEX_SENTINEL)
-            minima = pl.row_min(candidates)
-            min_zeros = pl.full([GREEDY_ROW_TILE, GREEDY_ROW_TILE], dtype=pl.INT32, value=0)
-            min_grid = pl.row_expand(min_zeros, minima)
-            first_index = pl.col_min(min_grid)
-            index = pl.read(first_index, [0, 0])
-            result = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=0)
-            pl.write(result, [0, 0], best_base + index)
-            sampled_ids[row : row + 1, :] = result
 
 
 @pl.jit.inline(auto_scope=False)
@@ -278,7 +205,7 @@ def lm_head(
                         cmp=pld.WaitCmp.Ge,
                     )
 
-        with pl.spmd(64, name_hint="lm_head_combine_gather", deps=[combine_ready, combine_notified]) as gathered:
+        with pl.spmd(64, name_hint="lm_head_combine_gather", deps=[combine_ready, combine_notified]):
             gather_worker = pl.tile.get_block_idx()
             row_tiles = (num_rows + LM_HEAD_GATHER_M_TILE - 1) // LM_HEAD_GATHER_M_TILE
             full_panels = VOCAB_PER_TP // LM_HEAD_N_TILE
@@ -353,8 +280,11 @@ def lm_head(
             pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, 0)
             pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 0)
 
-        # Clear this rank's counters after its final logits-window read.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_signal_clear", deps=[gathered], allow_early_resolve=False):
+
+@pl.jit.inline(auto_scope=False)
+def clear_lm_head_signals(logits: pl.Tensor, hidden_done: pld.DistributedTensor, logits_done: pld.DistributedTensor):
+    if LM_HEAD_TP_SIZE > 1:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_signal_clear", allow_early_resolve=False):
             anchor = pl.read(logits, [0, 0])
             zero = pl.cast(0, pl.INT32)
             for peer in pl.range(LM_HEAD_TP_SIZE):
@@ -382,6 +312,7 @@ def l2_lm_head(
         hidden_window, hidden_done, logits_window, logits_done,
         rank, MAX_LOGIT_ROWS,
     )
+    clear_lm_head_signals(logits, hidden_done, logits_done)
     return logits
 
 
