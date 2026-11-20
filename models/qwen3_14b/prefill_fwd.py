@@ -1353,7 +1353,9 @@ def prefill_layer(
                         [0, h0],
                     )
 
-            down_chain = pl.array.create(MLP_PROJ_BANDS, pl.TASK_ID)
+            # Only the writes to the shared FP32 accumulator need K-band ordering.
+            down_chain = pl.array.create(MLP_PROJ_BANDS + 1, pl.TASK_ID)
+            pl.array.update_element(down_chain, 0, seed_tid)
 
             for mlp_band in pl.range(MLP_PROJ_BANDS):
                 with pl.scope():
@@ -1424,7 +1426,7 @@ def prefill_layer(
                         with pl.spmd(
                             DOWN_PROJ_SPMD_BLOCKS,
                             name_hint="down_proj_spmd",
-                            deps=[seed_tid, silu_tid],
+                            deps=[down_chain[mlp_band], silu_tid],
                         ) as down_tid:
                             down_core = pl.tile.get_block_idx()
                             for hb in pl.range(down_core, down_n_blocks, DOWN_PROJ_SPMD_BLOCKS):
@@ -1445,16 +1447,16 @@ def prefill_layer(
                                     [0, h0],
                                     atomic=pl.AtomicType.Add,
                                 )
-                        down_chain[mlp_band] = down_tid
+                        pl.array.update_element(down_chain, mlp_band + 1, down_tid)
 
             valid_tt = pl.min(MLP_M_TILE, prefill_tokens - m0)
             with pl.spmd(
                 DOWN_RESID_SPMD_BLOCKS,
                 name_hint="mlp_out_cast_spmd",
-                deps=[down_chain[i] for i in range(MLP_PROJ_BANDS)],
+                deps=[down_chain[MLP_PROJ_BANDS]],
             ) as cast_tid:
                 cast_core = pl.tile.get_block_idx()
-                # FP32 input and BF16 output need disjoint UB storage (96 KiB at 128 columns).
+                # FP32 input and BF16 output use disjoint UB storage.
                 for hb in pl.range(cast_core, HIDDEN // MLP_CAST_TILE, DOWN_RESID_SPMD_BLOCKS):
                     h0 = hb * MLP_CAST_TILE
                     acc_chunk = pl.slice(mlp_out_acc_tile, [MLP_M_TILE, MLP_CAST_TILE], [0, h0])
