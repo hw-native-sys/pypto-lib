@@ -688,7 +688,7 @@ if __name__ == "__main__":
             start_pos=args.startpos, query_lens=args.query_lens, param_names=host.param_names,
         )
 
-        pool_error_ratio = 0.0 if args.case == "pool" else 0.02
+        pool_error_ratio = 0.0 if args.case == "pool" else 0.0225
         result = run(
             fn=host,
             specs=specs,

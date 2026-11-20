@@ -2514,13 +2514,15 @@ def mapped_fp4_cache_compare(
     pool_name: str,
     leading_rank_axis: bool = False,
     max_error_ratio: float = 0.005,
+    allow_signed_zero: bool = False,
 ):
     """Bound sparse E2M1 changes after floating-point model computation.
 
     The existing mapped comparator keeps every unwritten byte exact and bounds
     differing written bytes by the declared ratio. A second, unconditional gate
-    rejects sign changes (including signed zero) or a jump over more than one
-    magnitude level in either nibble. This is an end-to-end numerical policy,
+    rejects sign changes or a jump over more than one magnitude level in either
+    nibble. Callers can opt into treating both encodings of zero as equal for
+    the sign check. This is an end-to-end numerical policy,
     not an exact quantizer test or a proof of a floating-point error bound.
     """
     from golden import mapped_pool_ratio_allclose
@@ -2539,9 +2541,18 @@ def mapped_fp4_cache_compare(
             return False, detail
         a = actual.detach().cpu().to(torch.int16)
         e = expected.detach().cpu().to(torch.int16)
-        sign_changed = torch.bitwise_and(torch.bitwise_xor(a, e), 0x88) != 0
+        sign_bits = torch.bitwise_and(torch.bitwise_xor(a, e), 0x88)
+        sign_changed = sign_bits != 0
         if bool(sign_changed.any()):
-            return False, f"{pool_name}: E2M1 sign changed in {int(sign_changed.sum())} byte(s)"
+            changes = sign_bits[sign_changed]
+            if allow_signed_zero:
+                magnitude = a[sign_changed] | e[sign_changed]
+                low_changed = ((changes & 0x08) != 0) & ((magnitude & 0x07) != 0)
+                high_changed = ((changes & 0x80) != 0) & ((magnitude & 0x70) != 0)
+                changes = low_changed | high_changed
+            count = int(torch.count_nonzero(changes))
+            if count:
+                return False, f"{pool_name}: E2M1 sign changed in {count} byte(s)"
         low_distance = ((a & 7) - (e & 7)).abs()
         high_distance = (((a >> 4) & 7) - ((e >> 4) & 7)).abs()
         invalid = (low_distance > 1) | (high_distance > 1)
