@@ -1302,9 +1302,7 @@ def build_c2a_specs(args, entry, *, mode="full"):
     ]
     outputs = {"kv_hidden", "hc_output", "hc_next_pre_mix", "q_topk_indices"}
     for spec in specs:
-        # L2 reads these counts on the host before launching its kernels.
-        if spec.name not in {"q_token_count", "kv_token_count"}:
-            spec.resident = "stacked"
+        spec.resident = "stacked"
         if spec.name not in outputs:
             spec.init_value = lambda name=spec.name: initialize(name)
     specs.append(ScalarSpec("attention_epoch", torch.int32, 1, compile_runtime=True, benchmark_step=None))
