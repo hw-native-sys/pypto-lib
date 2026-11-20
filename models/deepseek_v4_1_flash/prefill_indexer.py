@@ -641,6 +641,9 @@ def _prefill_index_scores(
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
+    route: pl.Tensor,
+    route_ready: pl.Scalar[pl.TASK_ID],
+    route_index: pl.constexpr,
     tile_n: pl.constexpr,
     query_tile: pl.constexpr,
     pool: pl.constexpr,
@@ -654,10 +657,13 @@ def _prefill_index_scores(
     capacity = pl.tensor.dim(pool_ids, 1)
     prefix_rows = groups + 1
     prefix = pl.create_tensor([prefix_rows], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_index_plan", deps=[ready]) as plan_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_index_plan", deps=[ready, route_ready]) as plan_tid:
         total = pl.cast(0, pl.INDEX)
         pl.write(prefix, [0], pl.cast(total, pl.INT32))
-        for group in pl.range(groups):
+        active_groups = pl.cast(0, pl.INDEX)
+        if pl.read(route, [route_index]) != 0:
+            active_groups = groups
+        for group in pl.range(active_groups):
             visible = pl.cast(0, pl.INDEX)
             for row in pl.unroll(query_tile):
                 token = group * query_tile + row
@@ -673,9 +679,12 @@ def _prefill_index_scores(
             pl.write(prefix, [group + 1], pl.cast(total, pl.INT32))
 
     output_panels = (width + 127) // 128
-    with pl.spmd(32, name_hint="prefill_index_score_clear", deps=[ready]) as clear_tid:
+    with pl.spmd(32, name_hint="prefill_index_score_clear", deps=[ready, route_ready]) as clear_tid:
         worker = pl.tile.get_block_idx()
-        for work in pl.range(worker, num_tokens * output_panels, 32):
+        clear_tokens = pl.cast(0, pl.INT32)
+        if pl.read(route, [route_index]) != 0:
+            clear_tokens = num_tokens
+        for work in pl.range(worker, clear_tokens * output_panels, 32):
             token = work // output_panels
             begin = (work % output_panels) * 128
             clear_value = pl.reinterpret_view(pl.tile.full([1, 128], dtype=pl.INT32, value=-8388608), pl.FP32)
@@ -693,10 +702,13 @@ def _prefill_index_scores(
         decoded_rows = cache_rows
         decoded_cols = INDEX_DIM
     decoded_keys = pl.create_tensor([decoded_rows, decoded_cols], dtype=pl.FP8E4M3FN)
-    with pl.spmd(8, name_hint="prefill_index_cache_decode", deps=[ready]) as decoded_tid:
+    with pl.spmd(8, name_hint="prefill_index_cache_decode", deps=[ready, route_ready]) as decoded_tid:
         decode_worker = pl.tile.get_block_idx()
         decode_lut = fp4_e4m3_lut()
-        for decode_row in pl.range(decode_worker * 64, cache_rows, 8 * 64):
+        decode_limit = pl.cast(0, pl.INDEX)
+        if pl.read(route, [route_index]) != 0:
+            decode_limit = cache_rows
+        for decode_row in pl.range(decode_worker * 64, decode_limit, 8 * 64):
             decode_packed = pl.load(packed_flat, [decode_row, 0], [64, INDEX_DIM // 2])
             decode_signed = pl.reinterpret_view(decode_packed, pl.INT8)
             decode_bytes = pl.ands(pl.cast(decode_signed, pl.INT16), 255)
@@ -719,10 +731,12 @@ def _prefill_index_scores(
     table_width = pl.tensor.dim(block_table, 1)
     requests = pl.tensor.dim(block_table, 0)
     workers = pl.max(1, pl.min(32, pl.system.available_cluster_count()))
-    with pl.spmd(workers, name_hint="prefill_index_mx_scores", deps=[plan_tid, clear_tid, decoded_tid],
+    with pl.spmd(workers, name_hint="prefill_index_mx_scores", deps=[plan_tid, clear_tid, decoded_tid, route_ready],
                  optimizations=[pl.cross_core_slot(slot_num=2)]) as score_tid:
         worker = pl.tile.get_block_idx()
-        work_items = pl.cast(pl.read(prefix, [groups]), pl.INDEX)
+        work_items = pl.cast(0, pl.INDEX)
+        if pl.read(route, [route_index]) != 0:
+            work_items = pl.cast(pl.read(prefix, [groups]), pl.INDEX)
         for work in pl.range(worker, work_items, workers):
             lower = pl.cast(0, pl.INDEX)
             upper = groups
@@ -1357,70 +1371,72 @@ def prefill_indexer(
                 query = pl.create_tensor([rows, INDEX_H * INDEX_DIM], dtype=pl.FP8E4M3FN)
                 query_scale = pl.create_tensor([rows, INDEX_H * 4], dtype=pl.FP8E8M0)
                 weights = pl.create_tensor([rows, INDEX_H], dtype=pl.BF16)
-                maximum_visible = pl.cast(0, pl.INDEX)
-                paired = pl.cast(0, pl.INT32)
-                dense = pl.cast(1, pl.INT32)
-                pool_paired = pl.cast(1, pl.INT32)
+                route = pl.create_tensor([4], dtype=pl.INT32)
                 chunk_ready = completion[0]
                 if pool:
                     flags, pool_plan = _prefill_pool_is_dense(
-                        chunk_pool, chunk_counts, chunk_lengths, chunk_requests,
-                        count, width, pl.tensor.dim(table, 1), chunk_ready,
+                        chunk_pool, chunk_counts, chunk_lengths, chunk_requests, count, width, pl.tensor.dim(table, 1), chunk_ready,
                     )
-                    for worker in pl.range(32):
-                        dense = dense * pl.read(flags, [worker, 0])
-                        pool_paired = pool_paired * pl.read(flags, [worker, 1])
                     chunk_ready = pool_plan
-                if dense != 0:
-                    if width >= 256:
-                        paired = pl.cast(rows % 4 == 0, pl.INT32)
-                    for token in pl.range(rows):
-                        if c2a:
-                            maximum_visible = pl.max(maximum_visible, pl.read(chunk_lengths, [token]))
-                        if token % 4 != 0:
-                            if pl.read(chunk_requests, [token]) != pl.read(chunk_requests, [token - token % 4]):
-                                paired = pl.cast(0, pl.INT32)
-                scoring = pl.array.create(1, pl.TASK_ID)
-                scoring[0] = chunk_ready
-                if not c2a or maximum_visible > INDEX_TOPK:
-                    query_tid, weights_tid = prepare_prefill_index_query(
-                        chunk_x, chunk_latent, query_weight, query_weight_scale, weight_projection,
-                        chunk_cos, chunk_sin, query, query_scale, weights, count, chunk_ready,
+                else:
+                    flags = pl.create_tensor([32, 16], dtype=pl.INT32)
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_index_route", deps=[chunk_ready]) as route_ready:
+                    dense = pl.cast(1, pl.INT32)
+                    pool_paired = pl.cast(1, pl.INT32)
+                    if pool:
+                        for worker in pl.range(32):
+                            dense = dense * pl.read(flags, [worker, 0])
+                            pool_paired = pool_paired * pl.read(flags, [worker, 1])
+                    paired = pl.cast(0, pl.INT32)
+                    maximum_visible = pl.cast(0, pl.INDEX)
+                    if dense != 0:
+                        if width >= 256:
+                            paired = pl.cast(rows % 4 == 0, pl.INT32)
+                        for token in pl.range(rows):
+                            if c2a:
+                                maximum_visible = pl.max(maximum_visible, pl.read(chunk_lengths, [token]))
+                            if token % 4 != 0:
+                                if pl.read(chunk_requests, [token]) != pl.read(chunk_requests, [token - token % 4]):
+                                    paired = pl.cast(0, pl.INT32)
+                    score = pl.cast(1, pl.INT32)
+                    if c2a:
+                        score = pl.cast(maximum_visible > INDEX_TOPK, pl.INT32)
+                    pl.write(route, [0], pl.cast(score * paired, pl.INT32))
+                    pl.write(route, [1], pl.cast(score * dense * (1 - paired), pl.INT32))
+                    pl.write(route, [2], pl.cast(score * (1 - dense) * (1 - pool_paired), pl.INT32))
+                    pl.write(route, [3], pl.cast(score * (1 - dense) * pool_paired, pl.INT32))
+                query_tid, weights_tid = prepare_prefill_index_query(
+                    chunk_x, chunk_latent, query_weight, query_weight_scale, weight_projection,
+                    chunk_cos, chunk_sin, query, query_scale, weights, count, chunk_ready,
+                )
+                prepared = pl.system.task_dummy(deps=[query_tid, weights_tid])
+                paired_tid = _prefill_index_scores(
+                    query, query_scale, weights, cache, cache_scale, table,
+                    chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
+                    count, prepared, route, route_ready, 0, tile_n=128, query_tile=4, pool=False, skip_short=c2a,
+                    head_rows=4 * INDEX_H, part_rows=64 if c2a else 128,
+                )
+                paged_tid = _prefill_index_scores(
+                    query, query_scale, weights, cache, cache_scale, table,
+                    chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
+                    count, prepared, route, route_ready, 1, tile_n=128, query_tile=1, pool=False, skip_short=c2a,
+                    head_rows=INDEX_H, part_rows=64 if c2a else 128,
+                )
+                score_ready = pl.system.task_dummy(deps=[paired_tid, paged_tid])
+                if pool:
+                    pooled_tid = _prefill_index_scores(
+                        query, query_scale, weights, cache, cache_scale, table,
+                        chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
+                        count, prepared, route, route_ready, 2, tile_n=128, query_tile=1, pool=True, skip_short=c2a,
+                        head_rows=INDEX_H, part_rows=8,
                     )
-                    prepared = pl.system.task_dummy(deps=[query_tid, weights_tid])
-                    if paired != 0:
-                        paired_tid = _prefill_index_scores(
-                            query, query_scale, weights, cache, cache_scale, table,
-                            chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
-                            count, prepared, tile_n=128, query_tile=4, pool=False, skip_short=c2a,
-                            head_rows=4 * INDEX_H, part_rows=64 if c2a else 128,
-                        )
-                        scoring[0] = paired_tid
-                    elif dense != 0:
-                        paged_tid = _prefill_index_scores(
-                            query, query_scale, weights, cache, cache_scale, table,
-                            chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
-                            count, prepared, tile_n=128, query_tile=1, pool=False, skip_short=c2a,
-                            head_rows=INDEX_H, part_rows=64 if c2a else 128,
-                        )
-                        scoring[0] = paged_tid
-                    elif pool and pool_paired != 0:
-                        pooled_tid = _prefill_index_scores(
-                            query, query_scale, weights, cache, cache_scale, table,
-                            chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
-                            count, prepared, tile_n=128, query_tile=4, pool=True, skip_short=c2a,
-                            head_rows=4 * INDEX_H, part_rows=8,
-                        )
-                        scoring[0] = pooled_tid
-                    else:
-                        general_tid = _prefill_index_scores(
-                            query, query_scale, weights, cache, cache_scale, table,
-                            chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
-                            count, prepared, tile_n=128, query_tile=1, pool=pool, skip_short=c2a,
-                            head_rows=INDEX_H, part_rows=8 if pool else (64 if c2a else 128),
-                        )
-                        scoring[0] = general_tid
-                score_ready = scoring[0]
+                    paired_pool_tid = _prefill_index_scores(
+                        query, query_scale, weights, cache, cache_scale, table,
+                        chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
+                        count, prepared, route, route_ready, 3, tile_n=128, query_tile=4, pool=True, skip_short=c2a,
+                        head_rows=4 * INDEX_H, part_rows=8,
+                    )
+                    score_ready = pl.system.task_dummy(deps=[score_ready, pooled_tid, paired_pool_tid])
                 selection = pl.array.create(1, pl.TASK_ID)
                 selection[0] = score_ready
                 if c2a:
