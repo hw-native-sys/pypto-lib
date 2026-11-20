@@ -573,7 +573,7 @@ def hc_post_regscope_block(
     residual = pl.tile.load(residual_rows, [row, d0], [HC_MULT, D_TILE], target_memory=pl.Mem.Vec)
     residual = pl.tile.reshape(residual, [HC_MULT * D_TILE])
     output = pl.tile.create([stream_tile * D_TILE], dtype=pl.FP32, target_memory=pl.Mem.Vec)
-    with pl.reg_scope():
+    with pl.reg_scope(auto_sync=False):
         mask = pl.reg.full_mask(lanes=64)
         for segment in pl.hardware_loop(D_TILE // 64):
             offset = segment * 64
