@@ -27,6 +27,7 @@ from golden.runner import (
     RunResult,
     _bench_loop_sizes,
     _format_stale_paths,
+    _fresh_compile_config,
     normalize_config,
     _ordered_args,
     _prepare_inputs,
@@ -45,6 +46,38 @@ from golden.runner import (
     _stale_cpps,
     _validate_compiled_spec_abi,
 )
+
+
+@pytest.mark.parametrize("platform", ["a5", "a5sim", "a2a3"])
+def test_fresh_compile_platform_default(platform, monkeypatch):
+    from pypto.pypto_core import passes
+
+    monkeypatch.delenv("PYPTO_LIB_A5_RUNTIME", raising=False)
+    cfg = normalize_config(dict(platform=platform))
+    with _fresh_compile_config(cfg):
+        ctx = passes.PassContext.current()
+        if platform == "a2a3":
+            assert ctx is None
+        else:
+            assert ctx.get_runtime() == passes.RuntimeKind.HOST_BUILD_GRAPH
+    assert passes.PassContext.current() is None
+
+
+def test_fresh_compile_a5_overrides(monkeypatch):
+    from pypto.pypto_core import passes
+
+    cfg = normalize_config(dict(platform="a5", memory_planner=passes.MemoryPlanner.PTOAS))
+    monkeypatch.setenv("PYPTO_LIB_A5_RUNTIME", "tensormap_and_ringbuffer")
+    with _fresh_compile_config(cfg) as compile_cfg:
+        ctx = passes.PassContext.current()
+        assert ctx.get_runtime() == passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER
+        assert ctx.get_memory_planner() == passes.MemoryPlanner.PTOAS
+        assert compile_cfg.memory_planner is None
+    assert cfg.memory_planner == passes.MemoryPlanner.PTOAS
+    with passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH):
+        with _fresh_compile_config(cfg) as compile_cfg:
+            assert compile_cfg is cfg
+            assert passes.PassContext.current().get_runtime() == passes.RuntimeKind.HOST_BUILD_GRAPH
 
 
 class _FakeCompiled:

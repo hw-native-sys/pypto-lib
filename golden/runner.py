@@ -18,7 +18,7 @@ import statistics
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -1476,6 +1476,36 @@ def _validate(
         )
 
 
+@contextmanager
+def _fresh_compile_config(cfg: Any) -> Iterator[Any]:
+    """Select the A5 host graph for new builds. Explicit contexts own their pass settings."""
+    if cfg.platform not in ("a5", "a5sim"):
+        yield cfg
+        return
+
+    from pypto.pypto_core import passes
+
+    if passes.PassContext.current() is not None:
+        yield cfg
+        return
+
+    runtime = passes.runtime_kind_from_name(os.environ.get("PYPTO_LIB_A5_RUNTIME", "host_build_graph"))
+    # PyPTO rejects these options when passed both to ir.compile and to a
+    # PassContext. Move the caller's values into the context for this compile.
+    options = {}
+    for field in ("diagnostic_phase", "memory_planner", "enable_software_pipeline"):
+        value = getattr(cfg, field)
+        if value is not None:
+            options[field] = value
+    if cfg.enable_software_pipeline:
+        options["enable_buffer_ir"] = False
+    options.setdefault("diagnostic_phase", passes.get_default_diagnostic_phase())
+    with passes.PassContext(
+        [], runtime=runtime, verification_level=passes.get_default_verification_level(), **options,
+    ):
+        yield replace(cfg, diagnostic_phase=None, memory_planner=None, enable_software_pipeline=None)
+
+
 def _run_pipeline(
     specs: list[TensorSpec | ScalarSpec],
     *,
@@ -1548,8 +1578,8 @@ def _run_pipeline(
         # dispatch below calls, so this is not an L3-only concern.
         compiled = _reload_from_dir(work_dir, cfg)
     else:
-        with _Stage("compile"):
-            compiled = compile_step(cfg, compile_state)
+        with _Stage("compile"), _fresh_compile_config(cfg) as compile_cfg:
+            compiled = compile_step(compile_cfg, compile_state)
             work_dir = Path(compiled.output_dir)
 
     # Neither a signature-driven compile (which trusts annotations over tensor
