@@ -1147,6 +1147,55 @@ __simd_vf__ inline void vf_mqa_logits_reduce(
     constexpr uint32_t kNumVecRegs = kNumElems / kNumElemsPerVecReg;
     static_assert(kNumElems % kNumElemsPerVecReg == 0 && kNumVecRegs >= 1 && kNumVecRegs <= 4);
     static_assert((kNumQueries == 1 || kNumQueries == 2) && kSplitKV == 512);
+#if defined(PREFILL_FP32_HEAD_SUM)
+    if constexpr (kPageSize == 128) {
+        // Match the prefill expression: each product rounds to BF16, while
+        // the head reduction accumulates in FP32 and rounds once at the end.
+        constexpr uint32_t lanes = asc_get_vf_len() / sizeof(float);
+        constexpr uint32_t pieces = kNumElems / lanes;
+        const auto full = pset_b32(PAT_ALL);
+        const auto full16 = pset_b16(PAT_ALL);
+        vector_float sums[kNumQueries][pieces];
+        #pragma unroll
+        for (uint32_t q = 0; q < kNumQueries; ++q) {
+            #pragma unroll
+            for (uint32_t p = 0; p < pieces; ++p) {
+                vdup(sums[q][p], 0.0f, full, MODE_ZEROING);
+            }
+        }
+        #pragma unroll 1
+        for (uint16_t h = 0; h < kNumHeads; ++h) {
+            #pragma unroll
+            for (uint32_t q = 0; q < kNumQueries; ++q) {
+                vector_bfloat16_t weight;
+                vlds(weight, weights, (q_idx + q) * kNumHeads + h, BRC_B16);
+                const uint32_t base = ((q_local + q) * kNumHeads + h) * kNumElems;
+                #pragma unroll
+                for (uint32_t p = 0; p < pieces; ++p) {
+                    vector_bfloat16_t value, product;
+                    vector_float wide;
+                    vlds(value, score, base + p * lanes, UNPK_B16);
+                    vmul(product, value, weight, full16, MODE_ZEROING);
+                    vcvt(wide, product, full, PART_EVEN);
+                    vadd(sums[q][p], sums[q][p], wide, full, MODE_ZEROING);
+                }
+            }
+        }
+        #pragma unroll
+        for (uint32_t q = 0; q < kNumQueries; ++q) {
+            #pragma unroll
+            for (uint32_t p = 0; p < pieces; ++p) {
+                const uint32_t page = p / 2;
+                const uint32_t reverse = (reversed_pairs >> (page / 2)) & 1u;
+                const uint32_t offset = (page ^ reverse) * kNumElemsPerVecReg + (p % 2) * lanes;
+                vector_bfloat16_t rounded;
+                vcvt(rounded, sums[q][p], full, ROUND_R, RS_DISABLE, PART_EVEN);
+                vsts(rounded, line, q * kSplitKV + offset, PK_B32, full);
+            }
+        }
+        return;
+    }
+#endif
     vector_bool mask = asc_create_mask_b16(PAT_ALL);
     vector_bfloat16_t sum[kNumVecRegs][kNumQueries];
     #pragma unroll
