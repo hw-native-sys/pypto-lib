@@ -32,6 +32,9 @@ SOFTWARE.
 #undef __cpp_concepts
 #endif
 #include <utils/debug/asc_assert.h>
+#if defined(__DAV_VEC__)
+#include <adv_api/sort/sort.h>
+#endif
 #include "tensor.h"
 #include "intrinsic.h"
 
@@ -1804,7 +1807,6 @@ static __aicore__ __attribute__((noinline)) void score(__gm__ int64_t* args) {
     asc_sync();
 }
 #if defined(__DAV_VEC__)
-#include <adv_api/sort/sort.h>
 #include <c_api/asc_simd.h>
 #include <kernel_operator.h>
 
