@@ -82,7 +82,7 @@ from input_pack import gather_rows, pack_x_hc
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, prepare_forward_rope_tables
 from utils import paged_slots, window_metadata
 from engram import ENGRAM_K, KV_OUT, HostEngram, engram_from_rows
-from lm_head import MAX_LOGIT_ROWS, lm_head
+from lm_head import MAX_LOGIT_ROWS, clear_lm_head_signals, lm_head
 from gate import gather_routing_bias
 from sample import sample
 
@@ -916,6 +916,7 @@ def l2_prefill_fwd(
         head_hidden, head_hidden_done, head_logits, head_logits_done,
         rank, MAX_LOGIT_ROWS,
     )
+    clear_lm_head_signals(logits, head_hidden_done, head_logits_done)
     sample(
         logits, sampling_temperatures, sampling_top_ks, sampling_top_ps,
         sampling_seeds, sampling_positions, sampled_ids,
@@ -1838,6 +1839,7 @@ def l2_generation_head(
         normalized, lm_head_weight, logit_rows, logits,
         head_hidden, head_hidden_done, head_logits, head_logits_done, rank, MAX_LOGIT_ROWS,
     )
+    clear_lm_head_signals(logits, head_hidden_done, head_logits_done)
     sample(
         logits, sampling_temperatures, sampling_top_ks, sampling_top_ps,
         sampling_seeds, sampling_positions, sampled_ids,
