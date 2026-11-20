@@ -579,6 +579,10 @@ def _dspark_prefill_context_kv_rank(
     window_cache: pl.InOut[pl.Tensor[[DSPARK_DRAFT_LAYERS, C.ORI_BLOCKS_DYN,
                                        BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
 ):
+    target_hidden.bind_dynamic(0, T_DYN)
+    context_slots.bind_dynamic(1, T_DYN)
+    context_rope_cos.bind_dynamic(0, T_DYN)
+    context_rope_sin.bind_dynamic(0, T_DYN)
     if pl.read(num_tokens, [0]) > 0:
         context_tokens = pl.tensor.dim(target_hidden, 0)
         projected = pl.create_tensor([context_tokens, D], dtype=pl.BF16)
