@@ -564,6 +564,43 @@ def l3_dspark_drafter(
         )
 
 
+def _dspark_prefill_context_kv_rank(
+    target_hidden: pl.Tensor[[T_DYN, MAIN_IN], pl.BF16],
+    main_proj_weight: pl.Tensor[[MAIN_IN, D], pl.FP8E4M3FN],
+    main_proj_scale: pl.Tensor[[MAIN_IN // MX_GROUP, D], pl.FP8E8M0],
+    main_norm_weight: pl.Tensor[[D], pl.BF16],
+    num_tokens: pl.Tensor[[1], pl.INT32],
+    context_slots: pl.Tensor[[DSPARK_DRAFT_LAYERS, T_DYN], pl.INT64],
+    context_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    context_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    wkv: pl.Tensor[[DSPARK_DRAFT_LAYERS, D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, D // MX_GROUP, HEAD_DIM], pl.FP8E8M0],
+    kv_norm_weight: pl.Tensor[[DSPARK_DRAFT_LAYERS, HEAD_DIM], pl.BF16],
+    window_cache: pl.InOut[pl.Tensor[[DSPARK_DRAFT_LAYERS, C.ORI_BLOCKS_DYN,
+                                       BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+):
+    context_tokens = pl.tensor.dim(target_hidden, 0)
+    projected = pl.create_tensor([context_tokens, D], dtype=pl.BF16)
+    main_x = pl.create_tensor([context_tokens, D], dtype=pl.BF16)
+    dspark_proj(target_hidden, main_proj_weight, main_proj_scale, projected, context_tokens)
+    rms_norm(projected, main_norm_weight, main_x, context_tokens, width=D, zero_tail=False)
+    payload, scales, _ = qkv_quant(main_x, context_tokens, row_tile=80)
+    for layer in pl.range(DSPARK_DRAFT_LAYERS):
+        layer_wkv_scale: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[layer]
+        dspark_context_kv(
+            payload, scales, wkv[layer], layer_wkv_scale, kv_norm_weight[layer],
+            context_rope_cos, context_rope_sin, context_slots[layer],
+            window_cache[layer], context_tokens,
+        )
+
+
+dspark_prefill_context_kv_rank = pl.jit.inline(auto_scope=False)(
+    _dspark_prefill_context_kv_rank
+)
+l2_dspark_prefill_context_kv_rank = pl.jit(auto_scope=False)(
+    _dspark_prefill_context_kv_rank
+)
+
 
 @pl.jit.host
 def l3_dspark_prefill_context_kv(
@@ -593,20 +630,12 @@ def l3_dspark_prefill_context_kv(
     context_rope_sin.bind_dynamic(1, T_DYN)
     window_cache.bind_dynamic(2, C.ORI_BLOCKS_DYN)
     for rank in pl.range(EP_SIZE):
-        active = pl.read(num_tokens, [rank, 0])
-        context_tokens = pl.tensor.dim(target_hidden[rank], 0)
-        projected = pl.create_tensor([context_tokens, D], dtype=pl.BF16)
-        main_x = pl.create_tensor([context_tokens, D], dtype=pl.BF16)
-        dspark_proj(target_hidden[rank], main_proj_weight[rank], main_proj_scale[rank], projected, active)
-        rms_norm(projected, main_norm_weight[rank], main_x, active, width=D, zero_tail=False)
-        payload, scales, _ = qkv_quant(main_x, active, row_tile=80)
-        for layer in pl.range(DSPARK_DRAFT_LAYERS):
-            layer_wkv_scale: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[rank, layer]
-            dspark_context_kv(
-                payload, scales, wkv[rank, layer], layer_wkv_scale, kv_norm_weight[rank, layer],
-                context_rope_cos[rank], context_rope_sin[rank], context_slots[rank, layer],
-                window_cache[rank, layer], active,
-            )
+        l2_dspark_prefill_context_kv_rank(
+            target_hidden[rank], main_proj_weight[rank], main_proj_scale[rank],
+            main_norm_weight[rank], num_tokens[rank], context_slots[rank],
+            context_rope_cos[rank], context_rope_sin[rank], wkv[rank],
+            wkv_scale[rank], kv_norm_weight[rank], window_cache[rank], device=rank,
+        )
 
 
 def build_drafter_specs():
