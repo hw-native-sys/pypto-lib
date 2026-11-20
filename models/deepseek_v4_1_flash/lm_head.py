@@ -278,7 +278,7 @@ def lm_head(
                         cmp=pld.WaitCmp.Ge,
                     )
 
-        with pl.spmd(64, name_hint="lm_head_combine_gather", deps=[combine_ready, combine_notified]) as gathered:
+        with pl.spmd(64, name_hint="lm_head_combine_gather", deps=[combine_ready, combine_notified]):
             gather_worker = pl.tile.get_block_idx()
             row_tiles = (num_rows + LM_HEAD_GATHER_M_TILE - 1) // LM_HEAD_GATHER_M_TILE
             full_panels = VOCAB_PER_TP // LM_HEAD_N_TILE
@@ -353,8 +353,11 @@ def lm_head(
             pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, 0)
             pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 0)
 
-        # Clear this rank's counters after its final logits-window read.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_signal_clear", deps=[gathered], allow_early_resolve=False):
+
+@pl.jit.inline(auto_scope=False)
+def clear_lm_head_signals(logits: pl.Tensor, hidden_done: pld.DistributedTensor, logits_done: pld.DistributedTensor):
+    if LM_HEAD_TP_SIZE > 1:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_signal_clear", allow_early_resolve=False):
             anchor = pl.read(logits, [0, 0])
             zero = pl.cast(0, pl.INT32)
             for peer in pl.range(LM_HEAD_TP_SIZE):
@@ -382,6 +385,7 @@ def l2_lm_head(
         hidden_window, hidden_done, logits_window, logits_done,
         rank, MAX_LOGIT_ROWS,
     )
+    clear_lm_head_signals(logits, hidden_done, logits_done)
     return logits
 
 

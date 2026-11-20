@@ -476,6 +476,22 @@ def l2_decode_fwd_dspark(
         state_meta, committed,
     )
 
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="all_signal_clear", allow_early_resolve=False):
+        anchor = pl.read(committed, [0])
+        zero = pl.cast(0, pl.INT32)
+        for peer in pl.range(EP_SIZE):
+            pl.write(target_fwd_data_arrived, [peer, 0, 0], zero)
+            pl.write(target_fwd_combine_arrived, [peer, 0, 0], zero)
+            pl.write(draft_data_arrived, [peer, 0, 0], zero)
+            pl.write(draft_combine_arrived, [peer, 0, 0], zero)
+        if LM_HEAD_TP_SIZE > 1:
+            for peer in pl.range(LM_HEAD_TP_SIZE):
+                pl.write(sampling_hidden_done, [peer, 0], zero)
+                pl.write(sampling_logits_done, [peer, 0], zero)
+                pl.write(markov_hidden_done, [peer, 0], zero)
+                pl.write(markov_logits_done, [peer, 0], zero)
+        pl.write(committed, [0], anchor)
+
 
 
 @pl.jit.host

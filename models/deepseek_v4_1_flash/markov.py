@@ -19,7 +19,7 @@ from config import (
     EP_SIZE, FLASH, DECODE_BATCH,
     SUPPORTED_EP_SIZES, SUPPORTED_LM_HEAD_TP_SIZES, LM_HEAD_TP_SIZE,
 )
-from lm_head import VOCAB_PER_TP, lm_head
+from lm_head import VOCAB_PER_TP, clear_lm_head_signals, lm_head
 from rmsnorm import rms_norm
 from hc import hc_head
 
@@ -446,6 +446,7 @@ def l2_markov_output(
         hidden_window, hidden_done, logits_window, logits_done,
         rank, LOGIT_ROWS,
     )
+    clear_lm_head_signals(logits, hidden_done, logits_done)
     base_logits = pl.reshape(logits[:rows, :], [batch, DSPARK_QUERY_WIDTH, VOCAB])
     markov_sample(
         base_logits, head_hidden, anchor_ids, markov_w1, markov_w2,
