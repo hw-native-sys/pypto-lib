@@ -200,14 +200,14 @@ runs:
         # deployment axes at half the 16-card cost.
         run_cmd="$run_cmd PYPTO_DSPARK_EP_SIZE=8"
         # EP8 doubles each rank's routed experts (256/8 vs 256/16), which
-        # leaves the KV budget ~3.4 GiB negative at npu_memory_utilization
-        # 0.90 with the 16-card ring heaps. Halve the prefill profile (the
-        # test's documented PYPTO_DSPARK_RING_HEAP knob) and shrink the
-        # drafter pooled arena (16 GiB bring-up default -> 4 GiB); the KV
-        # pool then fits with 12 slots and the K=7 wave dispatches. Both are
-        # generous defaults, not kernel-validated minimums; the 16-card
-        # deployment keeps them unchanged.
-        run_cmd="$run_cmd PYPTO_DSPARK_RING_HEAP=1073741824,1073741824,2147483648,4294967296"
+        # leaves less room for KV cache beside resident weights. Reserve
+        # 7 GiB for prefill (1/1/1/4 GiB by scope depth) and 4 GiB for the
+        # drafter. The previous 8 GiB prefill profile exhausted the 0.90
+        # budget after the additional resident prefill weight layouts.
+        # Keep the deepest prefill ring at 4 GiB and size KV cache from
+        # the remaining measured budget; capacity is not a fixed slot count.
+        # These overrides apply only to this 8-card CI guard.
+        run_cmd="$run_cmd PYPTO_DSPARK_RING_HEAP=1073741824,1073741824,1073741824,4294967296"
         run_cmd="$run_cmd PYPTO_DSPARK_DRAFTER_RING_HEAP=1073741824,1073741824,1073741824,1073741824"
         run_cmd="$run_cmd PYPTO_RUNTIME_LOG=$PYPTO_RUNTIME_LOG"
         run_cmd="$run_cmd python -m pytest $pytest_target -q -s"
