@@ -52,6 +52,7 @@ K_SCALE = D // MX_GROUP
 H_SCALE = MOE_INTER // MX_GROUP
 W13_M_TILE = 80
 W13_N_TILE = 256
+W13_K_TILE = 128
 W13_GROUPS = (T_PAD + W13_M_TILE - 1) // W13_M_TILE
 W13_ROWS = W13_GROUPS * W13_M_TILE
 W13_PAD_ROWS = 16  # staging granularity when the token block is not a whole tile
@@ -332,6 +333,64 @@ def _w13_direct_inputs(
 _W13_INPUTS = _w13_direct_inputs if W13_ROWS == T_PAD else _w13_padded_inputs
 
 
+@pl.jit.inline
+def _project_w13_pypto(
+    x: pl.Tensor,
+    x_scale: pl.Tensor,
+    weight: pl.Tensor,
+    weight_scale: pl.Tensor,
+    gate_up: pl.Out[pl.Tensor],
+    row: pl.Scalar[pl.INDEX],
+    col: pl.Scalar[pl.INDEX],
+    projection: pl.constexpr,
+) -> pl.Tensor:
+    """Accumulate one W1 or W3 panel in FP32 and store its active rows in BF16."""
+    x_scale_zz = pl.tensor.view(x_scale, [W13_ROWS, K_SCALE], layout=pl.MX_A_ZZ)
+    acc = pl.create_tile([W13_M_TILE, W13_N_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+    for k in pl.range(0, D, W13_K_TILE):
+        scale_k = k // MX_GROUP
+        a = pl.tile.load(x, [row, k], [W13_M_TILE, W13_K_TILE], target_memory=pl.Mem.Mat)
+        b = pl.tile.load(weight, [k, col], [W13_K_TILE, W13_N_TILE], target_memory=pl.Mem.Mat)
+        # Stream each K128 E8M0 fragment into Mat for the MX matmul.
+        sa = pl.tile.load(x_scale_zz, [row, scale_k], [W13_M_TILE, W13_K_TILE // MX_GROUP])
+        sb = pl.tile.load(weight_scale, [scale_k, col], [W13_K_TILE // MX_GROUP, W13_N_TILE])
+        if k == 0:
+            acc = pl.tile.matmul_mx(a, sa, b, sb)
+        else:
+            acc = pl.tile.matmul_mx_acc(acc, a, sa, b, sb)
+    active = pl.min(T_PAD - row, W13_M_TILE)
+    out = pl.tile.set_validshape(acc, active, W13_N_TILE)
+    out_col = projection * MOE_INTER + col
+    return pl.tile.store(out, [row, out_col], gate_up)
+
+
+@pl.jit.inline
+def shared_w13_pypto(
+    x_local: pl.Tensor[[T_PAD, D], pl.FP8E4M3FN],
+    x_local_scale: pl.Tensor[[1, T_PAD * K_SCALE], pl.FP8E8M0],
+    shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w1_scale: pl.Tensor[[K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w3_scale: pl.Tensor[[K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    gate_up: pl.Out[pl.Tensor[[T_PAD, GATE_UP_N], pl.BF16]],
+) -> pl.Tensor:
+    """Project MXFP8 activations into concatenated BF16 W1 and W3 panels."""
+    x, x_scale = _W13_INPUTS(x_local, x_local_scale)
+    n_tiles = MOE_INTER // W13_N_TILE
+    workers = pl.min(n_tiles, W13_WORKER_TILE)
+    with pl.spmd(workers, name_hint="sh_w13_pypto"):
+        block = pl.tile.get_block_idx()
+        blocks = pl.tile.get_block_num()
+        for band in pl.range((n_tiles + blocks - 1) // blocks):
+            panel = block + band * blocks
+            if panel < n_tiles:
+                col = panel * W13_N_TILE
+                for row in pl.range(0, T_PAD, W13_M_TILE):
+                    gate_up = _project_w13_pypto(x, x_scale, shared_w1, shared_w1_scale, gate_up, row, col, 0)
+                    gate_up = _project_w13_pypto(x, x_scale, shared_w3, shared_w3_scale, gate_up, row, col, 1)
+    return gate_up
+
+
 import torch.nn.functional as F
 
 
@@ -483,6 +542,42 @@ def l2_expert_shared(
     return sh
 
 
+@pl.jit
+def l2_shared_w13_pypto(
+    x_local: pl.Tensor[[T_PAD, D], pl.FP8E4M3FN],
+    x_local_scale: pl.Tensor[[1, T_PAD * K_SCALE], pl.FP8E8M0],
+    shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w1_scale: pl.Tensor[[K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w3_scale: pl.Tensor[[K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    gate_up: pl.Out[pl.Tensor[[T_PAD, GATE_UP_N], pl.BF16]],
+):
+    shared_w13_pypto(x_local, x_local_scale, shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, gate_up)
+    return gate_up
+
+
+def _golden_w13(tensors, rows):
+    from quant import unpack_mx_scale_codes as decode_e8m0_codes
+    from gemm import golden_gemm_mxfp8_to_fp32_dequantized as matmul_mx_golden
+
+    x_fp8 = tensors["x_local"][:rows]
+    x_scale = decode_e8m0_codes(tensors["x_local_scale"].reshape(T_PAD, K_SCALE), side="a")[:rows]
+    w1_fp8 = tensors["shared_w1"]
+    w1_scale = decode_e8m0_codes(tensors["shared_w1_scale"], side="b")
+    w3_fp8 = tensors["shared_w3"]
+    w3_scale = decode_e8m0_codes(tensors["shared_w3_scale"], side="b")
+    gate = matmul_mx_golden(x_fp8, x_scale, w1_fp8, w1_scale).bfloat16()
+    up = matmul_mx_golden(x_fp8, x_scale, w3_fp8, w3_scale).bfloat16()
+    return gate, up
+
+
+def golden_shared_w13(tensors):
+    """Reference for the concatenated BF16 output of W1 and W3."""
+    gate, up = _golden_w13(tensors, T_PAD)
+    tensors["gate_up"][:, :MOE_INTER] = gate
+    tensors["gate_up"][:, MOE_INTER:] = up
+
+
 def golden_expert_shared(tensors):
     """Reference for MXFP8 W1/W3, SwiGLU requantization, and MXFP8 W2."""
     import torch
@@ -490,30 +585,22 @@ def golden_expert_shared(tensors):
     from quant import unpack_mx_scale_codes as decode_e8m0_codes, quantize_mxfp8_upward_e8m0 as host_quant_mxfp8
     from gemm import golden_gemm_mxfp8_to_fp32_dequantized as matmul_mx_golden
 
-    x_fp8 = tensors["x_local"][:T]
-    x_scale = decode_e8m0_codes(
-        tensors["x_local_scale"].reshape(T_PAD, D // MX_GROUP), side="a",
-    )[:T]
-    w1_fp8 = tensors["shared_w1"]
-    w1_scale = decode_e8m0_codes(tensors["shared_w1_scale"], side="b")
-    w3_fp8 = tensors["shared_w3"]
-    w3_scale = decode_e8m0_codes(tensors["shared_w3_scale"], side="b")
-    w2_fp8 = tensors["shared_w2"]
-    w2_scale = decode_e8m0_codes(tensors["shared_w2_scale"], side="b")
-
-    sh_gate = matmul_mx_golden(x_fp8, x_scale, w1_fp8, w1_scale).bfloat16().float()
-    sh_up = matmul_mx_golden(x_fp8, x_scale, w3_fp8, w3_scale).bfloat16().float()
+    gate, up = _golden_w13(tensors, T)
+    sh_gate = gate.float()
+    sh_up = up.float()
     if SWIGLU_LIMIT > 0:
         sh_gate = sh_gate.clamp(max=SWIGLU_LIMIT)
         sh_up = sh_up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
     sh_h = F.silu(sh_gate) * sh_up
     sh_h_fp8, sh_h_scale = host_quant_mxfp8(sh_h)
+    w2_fp8 = tensors["shared_w2"]
+    w2_scale = decode_e8m0_codes(tensors["shared_w2_scale"], side="b")
     sh = matmul_mx_golden(sh_h_fp8, sh_h_scale, w2_fp8, w2_scale)
 
     tensors["sh"][:] = sh.to(torch.bfloat16)
 
 
-def build_tensor_specs():
+def build_tensor_specs(*, w13_only=False):
     import torch
     from golden.spec import TensorSpec
     from quant import generate_mxfp8_weight_kn as gen_mxfp8_weight_kn_device, quantize_mxfp8_upward_e8m0 as host_mxfp8_activation
@@ -531,22 +618,26 @@ def build_tensor_specs():
     SHARED_DEQUANT_STD = {"w1": 1.71e-2, "w2": 1.68e-2, "w3": 1.70e-2}
     sw1_fp8, sw1_scale = gen_mxfp8_weight_kn_device(MOE_INTER, D, SHARED_DEQUANT_STD["w1"], chan_cv=0.50, seed=1)
     sw3_fp8, sw3_scale = gen_mxfp8_weight_kn_device(MOE_INTER, D, SHARED_DEQUANT_STD["w3"], chan_cv=0.50, seed=2)
-    sw2_fp8, sw2_scale = gen_mxfp8_weight_kn_device(
-        D, MOE_INTER, SHARED_DEQUANT_STD["w2"], chan_cv=0.33, seed=3
-    )
     sw1_scale = sw1_scale.contiguous().view(fp8_e8m0)
     sw3_scale = sw3_scale.contiguous().view(fp8_e8m0)
-    sw2_scale = sw2_scale.contiguous().view(fp8_e8m0)
 
     fp8 = torch.float8_e4m3fn
 
-    return [
+    specs = [
         TensorSpec("x_local", [T_PAD, D], fp8, init_value=lambda: x_local_fp8),
         TensorSpec("x_local_scale", [1, T_PAD * (D // MX_GROUP)], fp8_e8m0, init_value=lambda: x_local_scale.reshape(1, -1)),
         TensorSpec("shared_w1", [D, MOE_INTER], fp8, init_value=lambda: sw1_fp8),
         TensorSpec("shared_w1_scale", [D // MX_GROUP, MOE_INTER], fp8_e8m0, init_value=lambda: sw1_scale),
         TensorSpec("shared_w3", [D, MOE_INTER], fp8, init_value=lambda: sw3_fp8),
         TensorSpec("shared_w3_scale", [D // MX_GROUP, MOE_INTER], fp8_e8m0, init_value=lambda: sw3_scale),
+    ]
+    if w13_only:
+        return [*specs, TensorSpec("gate_up", [T_PAD, GATE_UP_N], torch.bfloat16)]
+
+    sw2_fp8, sw2_scale = gen_mxfp8_weight_kn_device(D, MOE_INTER, SHARED_DEQUANT_STD["w2"], chan_cv=0.33, seed=3)
+    sw2_scale = sw2_scale.contiguous().view(fp8_e8m0)
+    return [
+        *specs,
         TensorSpec("shared_w2", [MOE_INTER, D], fp8, init_value=lambda: sw2_fp8),
         TensorSpec("shared_w2_scale", [MOE_INTER // MX_GROUP, D], fp8_e8m0, init_value=lambda: sw2_scale),
         TensorSpec("sh", [T, D], torch.bfloat16),
@@ -562,6 +653,7 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--tokens", type=int, default=None)
+    parser.add_argument("--pypto-w13", action="store_true", help="validate the standalone PyPTO W1/W3 projection")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
@@ -577,18 +669,21 @@ if __name__ == "__main__":
             parser.error("--golden-data and --runtime-dir require an explicit --tokens value")
         import subprocess
 
+        modes = ((),) if args.pypto_w13 else ((), ("--pypto-w13",))
         for tokens in (16, 80, 96):
-            print(f"Shared expert validation: tokens={tokens}", flush=True)
-            command = [sys.executable, str(Path(__file__).resolve()), "--tokens", str(tokens), *sys.argv[1:]]
-            completed = subprocess.run(command, check=False)
-            if completed.returncode:
-                raise SystemExit(completed.returncode)
+            for mode in modes:
+                case = "PyPTO W13" if mode or args.pypto_w13 else "shared expert"
+                print(f"Validating {case} with {tokens} tokens", flush=True)
+                command = [sys.executable, str(Path(__file__).resolve()), "--tokens", str(tokens), *mode, *sys.argv[1:]]
+                completed = subprocess.run(command, check=False)
+                if completed.returncode:
+                    raise SystemExit(completed.returncode)
         raise SystemExit(0)
 
     result = run(
-        fn=l2_expert_shared,
-        specs=build_tensor_specs(),
-        golden_fn=golden_expert_shared,
+        fn=l2_shared_w13_pypto if args.pypto_w13 else l2_expert_shared,
+        specs=build_tensor_specs(w13_only=args.pypto_w13),
+        golden_fn=golden_shared_w13 if args.pypto_w13 else golden_expert_shared,
         golden_data=args.golden_data,
         save_data=args.save_data,
         runtime_dir=args.runtime_dir,
@@ -603,7 +698,7 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "sh": ratio_reldiff(diff_thd=2e-3, pct_thd=0.01),
+            ("gate_up" if args.pypto_w13 else "sh"): ratio_reldiff(diff_thd=2e-3, pct_thd=0.01),
         },
     )
     if not result.passed:
