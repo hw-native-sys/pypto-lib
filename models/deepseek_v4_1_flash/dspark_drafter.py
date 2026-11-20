@@ -564,6 +564,51 @@ def l3_dspark_drafter(
         )
 
 
+
+@pl.jit.host
+def l3_dspark_prefill_context_kv(
+    target_hidden: pl.Tensor[[C.EP_SIZE, T_DYN, MAIN_IN], pl.BF16],
+    main_proj_weight: pl.Tensor[[C.EP_SIZE, MAIN_IN, D], pl.FP8E4M3FN],
+    main_proj_scale: pl.Tensor[[C.EP_SIZE, MAIN_IN // MX_GROUP, D], pl.FP8E8M0],
+    main_norm_weight: pl.Tensor[[C.EP_SIZE, D], pl.BF16],
+    num_tokens: pl.Tensor[[C.EP_SIZE, 1], pl.INT32],
+    context_slots: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, T_DYN], pl.INT64],
+    context_rope_cos: pl.Tensor[[C.EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
+    context_rope_sin: pl.Tensor[[C.EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
+    wkv: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, D // MX_GROUP, HEAD_DIM], pl.FP8E8M0],
+    kv_norm_weight: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, HEAD_DIM], pl.BF16],
+    window_cache: pl.InOut[pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, C.ORI_BLOCKS_DYN,
+                                       BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+):
+    """Write draft context KV from target hidden taps without running the drafter.
+
+    This is the Lib-owned composite used by the prefill migration.  It keeps
+    projection, normalization and all three context writes in one L3 boundary,
+    leaving Serving responsible only for slots, RoPE tables and buffers.
+    """
+    target_hidden.bind_dynamic(1, T_DYN)
+    context_slots.bind_dynamic(2, T_DYN)
+    context_rope_cos.bind_dynamic(1, T_DYN)
+    context_rope_sin.bind_dynamic(1, T_DYN)
+    window_cache.bind_dynamic(2, C.ORI_BLOCKS_DYN)
+    for rank in pl.range(EP_SIZE):
+        active = pl.read(num_tokens, [rank, 0])
+        context_tokens = pl.tensor.dim(target_hidden[rank], 0)
+        projected = pl.create_tensor([context_tokens, D], dtype=pl.BF16)
+        main_x = pl.create_tensor([context_tokens, D], dtype=pl.BF16)
+        dspark_proj(target_hidden[rank], main_proj_weight[rank], main_proj_scale[rank], projected, active)
+        rms_norm(projected, main_norm_weight[rank], main_x, active, width=D, zero_tail=False)
+        payload, scales, _ = qkv_quant(main_x, active, row_tile=80)
+        for layer in pl.range(DSPARK_DRAFT_LAYERS):
+            layer_wkv_scale: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[rank, layer]
+            dspark_context_kv(
+                payload, scales, wkv[rank, layer], layer_wkv_scale, kv_norm_weight[rank, layer],
+                context_rope_cos[rank], context_rope_sin[rank], context_slots[rank, layer],
+                window_cache[rank, layer], active,
+            )
+
+
 def build_drafter_specs():
     """One request on every DP rank, with nonzero embeddings and two context writes."""
     from golden import ScalarSpec, TensorSpec
