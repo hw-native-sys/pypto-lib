@@ -79,7 +79,7 @@ from config import (
 
 from prefill_cp_allgather import prefill_cp_gather_hc
 from hc import hc_head
-from dspark_drafter import dspark_prefill_context_kv_rank
+from dspark_drafter import dspark_prefill_context_kv_rank, T_DYN as DSPARK_CONTEXT_T_DYN
 from dspark_drafter import D as DSPARK_D, MAIN_IN as DSPARK_MAIN_IN, MX_GROUP as DSPARK_MX_GROUP
 from input_pack import gather_rows, pack_x_hc
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, prepare_forward_rope_tables
@@ -1009,9 +1009,9 @@ def l3_prefill_fwd_dspark(
     draft_main_proj_scale: pl.Tensor[[RANKS, DSPARK_MAIN_IN // DSPARK_MX_GROUP, DSPARK_D], pl.FP8E8M0],
     draft_main_norm_weight: pl.Tensor[[RANKS, DSPARK_D], pl.BF16],
     draft_num_tokens: pl.Tensor[[RANKS, 1], pl.INT32],
-    draft_context_slots: pl.Tensor[[RANKS, DSPARK_DRAFT_LAYERS, CAPACITY], pl.INT64],
-    draft_context_rope_cos: pl.Tensor[[RANKS, CAPACITY, ROPE_DIM // 2], pl.FP32],
-    draft_context_rope_sin: pl.Tensor[[RANKS, CAPACITY, ROPE_DIM // 2], pl.FP32],
+    draft_context_slots: pl.Tensor[[RANKS, DSPARK_DRAFT_LAYERS, DSPARK_CONTEXT_T_DYN], pl.INT64],
+    draft_context_rope_cos: pl.Tensor[[RANKS, DSPARK_CONTEXT_T_DYN, ROPE_DIM // 2], pl.FP32],
+    draft_context_rope_sin: pl.Tensor[[RANKS, DSPARK_CONTEXT_T_DYN, ROPE_DIM // 2], pl.FP32],
     draft_wkv: pl.Tensor[[RANKS, DSPARK_DRAFT_LAYERS, DSPARK_D, HEAD_DIM], pl.FP8E4M3FN],
     draft_wkv_scale: pl.Tensor[[RANKS, DSPARK_DRAFT_LAYERS, DSPARK_D // DSPARK_MX_GROUP, HEAD_DIM], pl.FP8E8M0],
     draft_kv_norm_weight: pl.Tensor[[RANKS, DSPARK_DRAFT_LAYERS, HEAD_DIM], pl.BF16],
@@ -1185,11 +1185,9 @@ def l3_prefill_fwd_dspark(
         # Fuse draft context KV materialization into the terminal prefill
         # composite. The dependency is carried by dspark_target_hidden, so
         # the context write starts after the target layers publish their taps.
-        context_slots = pl.slice(
-            draft_context_slots[rank], [DSPARK_DRAFT_LAYERS, CAPACITY], [0, 0]
-        )
-        context_rope_cos = pl.slice(draft_context_rope_cos[rank], [CAPACITY, ROPE_DIM // 2], [0, 0])
-        context_rope_sin = pl.slice(draft_context_rope_sin[rank], [CAPACITY, ROPE_DIM // 2], [0, 0])
+        context_slots = draft_context_slots[rank]
+        context_rope_cos = draft_context_rope_cos[rank]
+        context_rope_sin = draft_context_rope_sin[rank]
         dspark_prefill_context_kv_rank(
             dspark_target_hidden[rank], draft_main_proj_weight[rank], draft_main_proj_scale[rank],
             draft_main_norm_weight[rank], draft_num_tokens[rank], context_slots,
