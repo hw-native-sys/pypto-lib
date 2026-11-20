@@ -455,6 +455,18 @@ def prefill_attention_cp(
 prefill_attention_entry = prefill_attention_cp if CP_SIZE > 1 else prefill_attention
 
 
+@pl.jit.inline
+def _prefill_query_partition(count: pl.Scalar[pl.INT32], rank: pl.Scalar[pl.INT32]):
+    """Compute the local CP partition from the host-visible stage count."""
+    chunk = (count + 2 * CP_SIZE - 1) // (2 * CP_SIZE)
+    cp_rank = rank % CP_SIZE
+    head_start = cp_rank * chunk
+    tail_start = (2 * CP_SIZE - 1 - cp_rank) * chunk
+    head_count = pl.max(0, pl.min(chunk, count - head_start))
+    tail_count = pl.max(0, pl.min(chunk, count - tail_start))
+    return chunk, head_start, tail_start, head_count, tail_count
+
+
 @pl.jit(auto_scope=False)
 def l2_prefill_fwd(
     embedding: pl.Tensor[[CAPACITY, D], pl.BF16],
@@ -592,7 +604,6 @@ def l2_prefill_fwd(
     )
     q_rows = pl.create_tensor([2, LOCAL_CAPACITY], dtype=pl.INT32)
     restore_indices = pl.create_tensor([2, CAPACITY], dtype=pl.INT32)
-    q_counts = pl.create_tensor([2], dtype=pl.INT32)
     q_rope_cos = pl.create_tensor([3, LOCAL_CAPACITY, 32], dtype=pl.FP32)
     q_rope_sin = pl.create_tensor([3, LOCAL_CAPACITY, 32], dtype=pl.FP32)
     q_window_indices = pl.create_tensor([2, LOCAL_CAPACITY, 128], dtype=pl.INT32)
@@ -600,15 +611,9 @@ def l2_prefill_fwd(
     q_compressed_lens = pl.create_tensor([2, LOCAL_CAPACITY], dtype=pl.INT32)
     for stage_index in pl.range(2):
         count = pl.read(counts, [stage_index])
-        chunk = (count + 2 * CP_SIZE - 1) // (2 * CP_SIZE)
-        cp_rank = rank % CP_SIZE
-        head_start = cp_rank * chunk
-        tail_start = (2 * CP_SIZE - 1 - cp_rank) * chunk
-        head_count = pl.max(0, pl.min(chunk, count - head_start))
-        tail_count = pl.max(0, pl.min(chunk, count - tail_start))
+        chunk, head_start, tail_start, head_count, tail_count = _prefill_query_partition(count, rank)
         with pl.spmd(1, name_hint="prefill_cp_rows") as rows_ready:
             writer = pl.tile.get_block_idx()
-            pl.write(q_counts, [stage_index], pl.cast(head_count + tail_count, pl.INT32))
             for row in pl.range(writer, LOCAL_CAPACITY):
                 source = pl.cast(-1, pl.INT32)
                 if row < head_count:
@@ -686,6 +691,8 @@ def l2_prefill_fwd(
     for layer in pl.range(N_LAYERS):
         stage = layer // 20
         active = pl.read(counts, [stage])
+        _chunk, _head_start, _tail_start, head_count, tail_count = _prefill_query_partition(active, rank)
+        local_active = pl.cast(head_count + tail_count, pl.INT32)
         current_slot = (2 * stage + layer % 2) * CAPACITY
         next_slot = (2 * stage + (layer + 1) % 2) * CAPACITY
         hidden = pl.slice(hidden_pair, [CAPACITY, HC_MULT, D], [current_slot, 0, 0])
@@ -766,7 +773,7 @@ def l2_prefill_fwd(
                     encoder_normalized, c1a_compressor_wkv, layer_compressor_norm, layer_index_wk, layer_index_norm,
                     rope_cos[1], rope_sin[1], c1a_compressed_slots,
                     c1a_cache, c1a_index, c1a_scale,
-                    pl.read(counts, [0]),
+                    encoder_count,
                 )
                 gathered_hidden = pl.reshape(hidden, [CAPACITY, HC_DIM])
                 source_hidden = pl.reshape(encoder_hidden, [CAPACITY, HC_DIM])
@@ -787,7 +794,6 @@ def l2_prefill_fwd(
             local_hc = pl.reshape(local_hidden, [LOCAL_CAPACITY, HC_DIM])
             gather_rows(global_hc, q_rows[stage], local_hc, moe_ready, column_tile=D)
             gather_rows(delayed_pre, q_rows[stage], local_pre, moe_ready, column_tile=16)
-            local_active = pl.read(q_counts, [stage])
             mode = 0
             cache_slot = 0
             rope_slot = 0
@@ -847,7 +853,7 @@ def l2_prefill_fwd(
             layer_shared_w3, layer_shared_w3_scale, local_next_pre, ffn_mixed, local_next_hidden,
             recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
             routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, slab_rows,
-            moe_ready, pl.read(q_counts, [stage]), rank, layer + 1, capacity=LOCAL_CAPACITY,
+            moe_ready, local_active, rank, layer + 1, capacity=LOCAL_CAPACITY,
         )
         if CP_SIZE > 1:
             moe_ready = prefill_cp_gather_hc(
