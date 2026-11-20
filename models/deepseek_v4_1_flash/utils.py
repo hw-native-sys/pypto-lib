@@ -72,6 +72,26 @@ def parse_prefill_groups(value):
         raise argparse.ArgumentTypeError("use comma-separated integers and semicolons between DP groups") from error
 
 
+def prefill_index_validation_cases(args, ratio):
+    """Exercise score-dependent TopK in the default C1A/C2A full validation."""
+    import copy
+    import os
+    import sys
+
+    # CI supplies only the platform and device. A requested workload, capture,
+    # saved fixture, or benchmark must run exactly the selected invocation.
+    explicit = any(arg.startswith("--") and arg.partition("=")[0] not in ("--platform", "--device")
+                   for arg in sys.argv[1:])
+    benchmark = os.environ.get("PYPTO_BENCH", "").strip() not in ("", "0", "false", "False")
+    if explicit or benchmark:
+        return [args]
+
+    scored = copy.copy(args)
+    scored.query_lens = [[8]]
+    scored.start_pos = [[ratio * (M.index_topk + 32)]]
+    return [args, scored]
+
+
 def prefill_batch_layout(args):
     """Resolve independent per-DP request lengths and absolute starting positions."""
     lengths = getattr(args, "query_lens", None)

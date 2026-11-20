@@ -166,7 +166,7 @@ def prefill_c1a_reindex(
             q_input_payload, q_input_scales, q_input_payload_padded_rows = qkv_quant(
                 chunk_hidden, active, row_tile=256,
             )
-            q_proj_rope(
+            qb_payload, qb_scales = q_proj_rope(
                 q_input_payload, q_input_scales,
                 wq_a, wq_a_scale, wq_norm,
                 wq_b, wq_b_scale,
@@ -178,6 +178,7 @@ def prefill_c1a_reindex(
             )
             attn_out = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
             _index_ready = prefill_indexer(
+                qb_payload, qb_scales,
                 chunk_hidden, q_latent, chunk_request_ids, chunk_compressed_lens,
                 index_cache, index_cache_scale, index_block_table,
                 chunk_rope_cos, chunk_rope_sin, w_index_q, w_index_q_scale, w_index_score,
@@ -520,7 +521,7 @@ def prefill_c1a_reindex_cp(
             q_input_payload, q_input_scales, q_input_payload_padded_rows = qkv_quant(
                 chunk_hidden, active, row_tile=256,
             )
-            q_proj_rope(
+            qb_payload, qb_scales = q_proj_rope(
                 q_input_payload, q_input_scales,
                 wq_a, wq_a_scale, wq_norm,
                 wq_b, wq_b_scale,
@@ -532,6 +533,7 @@ def prefill_c1a_reindex_cp(
             )
             attn_out = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
             _index_ready = prefill_indexer(
+                qb_payload, qb_scales,
                 chunk_hidden, q_latent, chunk_request_ids, chunk_compressed_lens,
                 index_cache, index_cache_scale, index_block_table,
                 chunk_rope_cos, chunk_rope_sin, w_index_q, w_index_q_scale, w_index_score,

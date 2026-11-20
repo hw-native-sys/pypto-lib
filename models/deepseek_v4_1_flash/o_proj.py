@@ -839,10 +839,17 @@ def _o_proj_a(
 ) -> tuple[pl.Tensor, pl.Tensor]:
     """Select the mixed worker grid for the runtime row tile and output width."""
     if row_tile == 128:
-        output, output_scale = _o_proj_a_mixed(
-            payload, weight, activation_scale, weight_scale, output, output_scale,
-            output_width, active_rows, padded_rows, row_tile=128, group_tile=1,
-        )
+        # At eight or more M128 tiles, issue all eight groups on one 32-worker grid per tile.
+        if padded_rows >= 1024 and output_width == 8 * O_LORA and pl.system.available_cluster_count() >= 32:
+            output, output_scale = _o_proj_a_mixed(
+                payload, weight, activation_scale, weight_scale, output, output_scale,
+                output_width, active_rows, padded_rows, row_tile=128, group_tile=8,
+            )
+        else:
+            output, output_scale = _o_proj_a_mixed(
+                payload, weight, activation_scale, weight_scale, output, output_scale,
+                output_width, active_rows, padded_rows, row_tile=128, group_tile=1,
+            )
     elif output_width == 8 * O_LORA and pl.system.available_cluster_count() >= 32:
         output, output_scale = _o_proj_a_mixed(
             payload, weight, activation_scale, weight_scale, output, output_scale,
