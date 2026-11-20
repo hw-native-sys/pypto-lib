@@ -81,6 +81,31 @@ def test_fresh_compile_a5_overrides(monkeypatch):
             assert passes.PassContext.current().get_runtime() == passes.RuntimeKind.HOST_BUILD_GRAPH
 
 
+
+def test_a5_artifact_runtime_reads_selected_chip_metadata_without_execution(tmp_path, capsys):
+    from golden.runner import _report_a5_artifact_runtime
+
+    for name, value in (("one", "'percounter'"), ("two", "get_dynamic_runtime()")):
+        chip_dir = tmp_path / "next_levels" / name
+        chip_dir.mkdir(parents=True)
+        (chip_dir / "kernel_config.py").write_text(
+            f"RUNTIME_CONFIG = {{'runtime': {value}}}\nraise AssertionError('must only read metadata')\n"
+        )
+    cfg = types.SimpleNamespace(distributed_config=types.SimpleNamespace(device_ids=[4, 6]))
+    _report_a5_artifact_runtime(None, tmp_path, cfg)
+    report = capsys.readouterr().out
+    assert "devices=[4, 6]" in report and "'one': 'percounter'" in report and "'two': 'unknown'" in report
+
+
+def test_a5_artifact_runtime_prefers_loaded_single_chip_runtime(tmp_path, capsys):
+    from golden.runner import _report_a5_artifact_runtime
+
+    cfg = types.SimpleNamespace(distributed_config=None, device_id=3)
+    compiled = types.SimpleNamespace(_runtime_name="tensormap_and_ringbuffer")
+    _report_a5_artifact_runtime(compiled, tmp_path, cfg)
+    assert "tensormap_and_ringbuffer" in capsys.readouterr().out
+
+
 class _FakeCompiled:
     """Stand-in for CompiledProgram returned by ir.compile()."""
 

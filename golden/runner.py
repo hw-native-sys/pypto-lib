@@ -12,6 +12,7 @@
 Public entry point: :func:`run`.
 """
 
+import ast
 import os
 import re
 import statistics
@@ -213,6 +214,38 @@ def _validate_stepped_swimlane(
         "one handle call may launch multiple physical passes with the same "
         "scalar values",
     )
+
+
+def _artifact_runtime(config_path: Path) -> str:
+    """Read the baked ABI literal without executing generated Python."""
+    try:
+        for stmt in ast.parse(config_path.read_bytes(), filename=str(config_path)).body:
+            if isinstance(stmt, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "RUNTIME_CONFIG" for target in stmt.targets
+            ):
+                config = ast.literal_eval(stmt.value)
+                runtime = config.get("runtime") if isinstance(config, dict) else None
+                return runtime if isinstance(runtime, str) and runtime else "unknown"
+    except (OSError, SyntaxError, ValueError, TypeError):
+        pass
+    return "unknown"
+
+
+def _report_a5_artifact_runtime(compiled: Any, work_dir: Path, cfg: Any) -> None:
+    dc = cfg.distributed_config
+    devices = list(dc.device_ids) if dc is not None else [cfg.device_id]
+    next_levels = work_dir / "next_levels"
+    if next_levels.is_dir():
+        # These are chip callables. Multiple ranks can use the same callable.
+        callables = {
+            path.parent.name: _artifact_runtime(path)
+            for path in sorted(next_levels.glob("*/kernel_config.py"))
+        }
+    else:
+        cached = getattr(compiled, "_runtime_name", None)
+        runtime = cached if isinstance(cached, str) and cached else _artifact_runtime(work_dir / "kernel_config.py")
+        callables = {work_dir.name: runtime}
+    print(f"[RUN] artifact runtime: devices={devices} callables={callables or 'unknown'}", flush=True)
 
 
 def _stale_cpps(work_dir: Path, *, platform: str) -> list[Path]:
@@ -1581,6 +1614,9 @@ def _run_pipeline(
         with _Stage("compile"), _fresh_compile_config(cfg) as compile_cfg:
             compiled = compile_step(compile_cfg, compile_state)
             work_dir = Path(compiled.output_dir)
+
+    if cfg.platform == "a5":
+        _report_a5_artifact_runtime(compiled, work_dir, cfg)
 
     # Neither a signature-driven compile (which trusts annotations over tensor
     # samples) nor a runtime-dir replay (which trusts a persisted artifact) can
