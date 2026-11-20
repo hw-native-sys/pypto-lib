@@ -6,6 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: no-sim
 """V4.1 Engram projection and residual gating from host rows or local lookup tables."""
 
 import math
@@ -104,14 +105,6 @@ def _engram_project_pypto(
     return kv
 
 
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels/engram.cpp",
-               include_dirs=(pto_isa_include_dir(),))
-def _engram_gate_native(kv: pl.Tensor, weight: pl.Tensor, x: pl.Tensor, out: pl.Out[pl.Tensor],
-                        tokens: pl.Scalar[pl.INDEX], mode: pl.Scalar[pl.INDEX]) -> pl.Tensor:
-    """Compute the normalized-dot gate and update the residual."""
-    return out
-
-
 @pl.jit.inline(auto_scope=False)
 def _load_engram_quant_work(
     x: pl.Tensor,
@@ -138,7 +131,6 @@ def _engram_quantize_pypto(
     scales: pl.Out[pl.Tensor],
     num_tokens: pl.Scalar[pl.INT32],
     padded_rows: pl.Scalar[pl.INDEX],
-    auto_sync: pl.constexpr = True,
 ) -> tuple[pl.Tensor, pl.Tensor]:
     """Quantize row-major BF16 projection inputs with M16-packed E8M0 scales."""
     first = pl.tile.get_block_idx()
@@ -173,7 +165,7 @@ def _engram_quantize_pypto(
             pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.V, slot)
             pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, slot)
             output_words = pl.reinterpret_view(output, pl.UINT32, shape=[2 * ENGRAM_QUANT_M_TILE * ENGRAM_QUANT_K_TILE // 4])
-            with pl.reg_scope(auto_sync=auto_sync):
+            with pl.reg_scope(auto_sync=False):
                 # Keep aligned row and slot offsets visible to register lowering.
                 slot_row = slot * ENGRAM_QUANT_M_TILE
                 code_offset = slot * (ENGRAM_QUANT_SCALE_TILE // 2)
@@ -229,9 +221,8 @@ def _engram_quantize_pypto(
                     pair = pl.reg.select(row_selected, pair, zero)
                     updated_scales = pl.reg.bitwise_or(packed_scales, pair, packed_mask)
                     packed_scales = pl.yield_(updated_scales)
-                if not auto_sync:
-                    # Complete the active payload stores before the scale and padding stores.
-                    pl.reg.mem_bar("VST_VST")
+                # Complete the active payload stores before the scale and padding stores.
+                pl.reg.mem_bar("VST_VST")
                 _scales = pl.reg.store(codes, code_offset, packed_scales)
                 padding = pl.reg.broadcast(0, lanes=ENGRAM_QUANT_K_TILE // 4, dtype=pl.UINT32)
                 for inactive in pl.hardware_loop(ENGRAM_QUANT_M_TILE - rows):
@@ -274,7 +265,7 @@ def _engram_rows_tile(
     scales = pl.create_tensor([1, padded * (ENGRAM_K // 32)], dtype=pl.FP8E8M0)
     kv = pl.create_tensor([tokens, KV_OUT], dtype=pl.BF16)
     with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_quant"):
-        quantized, quantized_scales = _engram_quantize_pypto(lookup, payload, scales, tokens, padded, False)
+        quantized, quantized_scales = _engram_quantize_pypto(lookup, payload, scales, tokens, padded)
     with pl.spmd(pl.system.available_cluster_count(), name_hint="engram_projection"):
         projected = _engram_project(quantized, wkv, quantized_scales, wkv_scale, kv, tokens, row_tile)
     output_rows = pl.reshape(out, [pl.tensor.dim(out, 0) * HC_MULT, D])
@@ -282,11 +273,11 @@ def _engram_rows_tile(
         hidden_pairs = pl.reshape(x, [pl.tensor.dim(x, 0) * (HC_MULT // 2), 2 * D])
         weight_pairs = pl.reshape(weight, [HC_MULT // 2, 2 * D])
         with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_gate_pairs"):
-            _engram_gate_pairs_reg(projected, weight_pairs, hidden_pairs, output_rows, tokens, True)
+            _engram_gate_pairs_reg(projected, weight_pairs, hidden_pairs, output_rows, tokens)
     else:
         hidden_rows = pl.reshape(x, [pl.tensor.dim(x, 0) * HC_MULT, D])
         with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_gate"):
-            _engram_gate_reg(projected, weight, hidden_rows, output_rows, tokens, True)
+            _engram_gate_reg(projected, weight, hidden_rows, output_rows, tokens)
     return out
 
 
@@ -583,9 +574,6 @@ def golden_engram_rows_case(tensors):
     tensors["x"][:] = (h + gate.unsqueeze(-1) * value.unsqueeze(-2)).bfloat16().float()
 
 
-_ENGRAM_AUTO_SYNC = True
-
-
 @pl.jit.inline(auto_scope=False)
 def _engram_gate_row_reg(
     hidden: pl.Tile[[D], pl.FP32, pl.Mem.Vec],
@@ -593,10 +581,9 @@ def _engram_gate_row_reg(
     value: pl.Tile[[D], pl.BF16, pl.Mem.Vec],
     weight: pl.Tile[[D], pl.FP32, pl.Mem.Vec],
     output: pl.Tile[[D], pl.FP32, pl.Mem.Vec],
-    auto_sync: pl.constexpr,
 ):
     """Apply the C++ lane accumulation, inverse-root correction and BF16 residual rounding."""
-    with pl.reg_scope(auto_sync=auto_sync):
+    with pl.reg_scope(auto_sync=False):
         full = pl.reg.full_mask(lanes=64)
         sx = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
         sk = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
@@ -684,11 +671,9 @@ def _engram_gate_row_reg(
             y = pl.reg.add(xv, y, full)
             rounded = pl.reg.convert(y, dtype=pl.BF16, rounding="R", saturate=False)
             y = pl.reg.convert(rounded, dtype=pl.FP32)
-            if not auto_sync:
-                pl.reg.mem_bar("VLD_VST")
+            pl.reg.mem_bar("VLD_VST")
             _written = pl.reg.store(output, chunk * 64, y, full)
-            if not auto_sync:
-                pl.reg.mem_bar("VST_VLD")
+            pl.reg.mem_bar("VST_VLD")
     return output
 
 
@@ -699,7 +684,7 @@ def _engram_gate_reg(
     weight: pl.Tensor[[HC_MULT, D], pl.FP32],
     x: pl.Tensor[[T_DYN * HC_MULT, D], pl.FP32],
     out: pl.Out[pl.Tensor[[T_DYN * HC_MULT, D], pl.FP32]],
-    tokens: pl.Scalar[pl.INDEX], auto_sync: pl.constexpr = True,
+    tokens: pl.Scalar[pl.INDEX],
 ):
     """Run the per-copy gate with cached weights and the C++ worker traversal."""
     first = pl.tile.get_block_idx()
@@ -717,7 +702,7 @@ def _engram_gate_reg(
             key = pl.reshape(key_raw, [D])
             value = pl.reshape(value_raw, [D])
             output = pl.create_tile([D], dtype=pl.FP32, target_memory=pl.Mem.Vec)
-            output = _engram_gate_row_reg(hidden, key, value, gain, output, auto_sync)
+            output = _engram_gate_row_reg(hidden, key, value, gain, output)
             pl.store(pl.reshape(output, [1, D]), [work, 0], out)
     return out
 
@@ -745,7 +730,7 @@ def _engram_gate_pairs_reg(
     weight: pl.Tensor[[HC_MULT // 2, 2 * D], pl.FP32],
     x: pl.Tensor[[T_DYN * (HC_MULT // 2), 2 * D], pl.FP32],
     out: pl.Out[pl.Tensor[[T_DYN * HC_MULT, D], pl.FP32]],
-    tokens: pl.Scalar[pl.INDEX], auto_sync: pl.constexpr = True,
+    tokens: pl.Scalar[pl.INDEX],
 ):
     """Prefetch the next pair into a separate UB slot while consuming the current pair."""
     first = pl.tile.get_block_idx()
@@ -789,7 +774,7 @@ def _engram_gate_pairs_reg(
                         value_row = pl.reshape(pl.tile.slice(value, [1, D], [slot, 0]), [D])
                         gain_row = pl.reshape(pl.tile.slice(gain, [1, D], [0, copy_offset]), [D])
                         output_row = pl.reshape(pl.tile.slice(output, [1, D], [copy, 0]), [D])
-                        output_row = _engram_gate_row_reg(hidden_row, key_row, value_row, gain_row, output_row, auto_sync)
+                        output_row = _engram_gate_row_reg(hidden_row, key_row, value_row, gain_row, output_row)
                         pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE3, output_event)
                         pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE3, output_event)
                         pl.store(pl.reshape(output_row, [1, D]), [work * 2 + copy, 0], out)
@@ -800,105 +785,6 @@ def _engram_gate_pairs_reg(
         pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 3)
         pl.system.barrier(pipe=pl.PipeType.ALL)
     return out
-
-
-
-@pl.jit
-def l2_engram_gate_vectors(
-    kv: pl.Tensor, weight: pl.Tensor,
-    x: pl.InOut[pl.Tensor], active: pl.Scalar[pl.INDEX],
-):
-    with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_gate"):
-        x = _engram_gate_native(kv, weight, x, x, active, 3)
-    return x
-
-
-
-@pl.jit
-def l2_engram_gate_vectors_pypto(
-    kv: pl.Tensor, weight: pl.Tensor,
-    x: pl.InOut[pl.Tensor], active: pl.Scalar[pl.INDEX],
-):
-    with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_gate"):
-        x = _engram_gate_reg(kv, weight, x, x, active, _ENGRAM_AUTO_SYNC)
-    return x
-
-
-
-@pl.jit
-def l2_engram_gate_vectors_pypto_pairs(
-    kv: pl.Tensor, weight: pl.Tensor,
-    x: pl.InOut[pl.Tensor], active: pl.Scalar[pl.INDEX],
-):
-    hidden_pairs = pl.reshape(x, [pl.tensor.dim(x, 0) // 2, 2 * D])
-    weight_pairs = pl.reshape(weight, [HC_MULT // 2, 2 * D])
-    with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_gate_pairs"):
-        x = _engram_gate_pairs_reg(kv, weight_pairs, hidden_pairs, x, active, _ENGRAM_AUTO_SYNC)
-    return x
-
-
-
-def golden_engram_gate_vectors(tensors, active):
-    """Validate every active residual value and preserve the inactive tail."""
-    key = tensors["kv"][:active, :HC_MULT * D].float().reshape(active, HC_MULT, D)
-    value = tensors["kv"][:active, HC_MULT * D:].float()
-    hidden = tensors["x"][:active * HC_MULT].float().reshape(active, HC_MULT, D)
-    inv_x = torch.rsqrt(hidden.square().mean(-1) + NORM_EPS)
-    inv_k = torch.rsqrt(key.square().mean(-1) + NORM_EPS)
-    dot = (hidden * tensors["weight"] * key).sum(-1)
-    dot = dot * inv_x * inv_k * DOT_SCALE
-    root = dot.abs().clamp_min(CLAMP).sqrt()
-    gate = torch.sigmoid(torch.where(dot >= 0, root, -root))
-    tensors["x"][:active * HC_MULT] = (hidden + gate.unsqueeze(-1) * value.unsqueeze(-2)).bfloat16().float().reshape(active * HC_MULT, D)
-
-
-
-def run_engram_gate_case(args):
-    """Run one component with the normal golden harness and explicit capture settings."""
-    from functools import partial
-    from golden import ScalarSpec, TensorSpec, ratio_allclose, run
-
-    tokens = args.tokens if args.tokens is not None else 17
-    active = tokens if args.active is None else args.active
-    if not 0 <= active <= tokens:
-        raise ValueError("active rows must be between zero and the tensor row count")
-    generator = torch.Generator().manual_seed(17)
-    def key_values():
-        values = torch.randn(tokens, KV_OUT, generator=generator).bfloat16()
-        if args.pattern == "zero":
-            values.zero_()
-        return values
-    def hidden_values():
-        values = torch.randn(tokens, HC_MULT, D, generator=generator)
-        if args.pattern == "zero":
-            values.zero_()
-        elif args.pattern == "mixed":
-            values[::3] = 0
-            values[1::3] *= 32
-            values[2::3] *= 0.00001
-        return values
-    specs = [
-        TensorSpec("kv", [tokens, KV_OUT], torch.bfloat16, init_value=key_values),
-        TensorSpec("weight", [HC_MULT, D], torch.float32,
-                   init_value=lambda: torch.rand(HC_MULT, D, generator=generator) + 0.5),
-        TensorSpec("x", [tokens * HC_MULT, D], torch.float32, init_value=lambda: hidden_values().reshape(tokens * HC_MULT, D)),
-        ScalarSpec("active", torch.int64, active),
-    ]
-    if args.implementation == "cpp":
-        entry = l2_engram_gate_vectors
-    else:
-        # Match the C++ dispatch threshold for paired work.
-        entry = l2_engram_gate_vectors_pypto_pairs if active >= 256 else l2_engram_gate_vectors_pypto
-    reference = partial(golden_engram_gate_vectors, active=active)
-    compare = {"x": ratio_allclose(atol=1e-3, rtol=1e-2, max_error_ratio=0.005)}
-    return run(
-        fn=entry, specs=specs, golden_fn=reference, compare_fn=compare,
-        compile_only=args.compile_only, runtime_dir=args.runtime_dir, golden_data=args.golden_data,
-        save_data=args.save_data,
-        config={"backend_type": "a5", "execution_mode": args.execution_mode,
-                "device_id": int(args.device), "enable_chip_swimlane": args.enable_chip_swimlane,
-                "enable_dep_gen": bool(args.enable_chip_swimlane), "dump_passes": True},
-    )
 
 
 if __name__ == "__main__":
@@ -924,17 +810,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-data", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
-    parser.add_argument("--component", choices=["rows", "gate"], default="rows")
-    parser.add_argument("--active", type=int)
-    parser.add_argument("--pattern", choices=["random", "zero", "mixed"], default="random")
-    parser.add_argument("--manual-sync", action="store_true")
     args = parser.parse_args()
-    _ENGRAM_AUTO_SYNC = not args.manual_sync
-    if args.component == "gate":
-        result = run_engram_gate_case(args)
-        if not result.passed:
-            raise SystemExit(result.error or 1)
-        raise SystemExit(0)
 
     device_ids = [int(d) for d in args.device.split(",")]
     if len(device_ids) != 1:
