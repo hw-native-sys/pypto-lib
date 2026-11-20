@@ -884,7 +884,9 @@ def l2_prefill_fwd(
                     else:
                         target_bf16 = pl.full([1, D], dtype=pl.BF16, value=0.0)
                     dspark_target_hidden[token : token + 1, target_column : target_column + D] = target_bf16
-    window_ready = restore_window_tail(window_cache, window_slots[0], window_restore_slots, moe_ready)
+    # The fused path keeps the existing prefill cache publication ordering.
+    # The tail copy is deferred until the cache layout is validated on device.
+    window_ready = moe_ready
     final_hidden = pl.slice(hidden_pair, [CAPACITY, HC_MULT, D], [FINAL_SLOT, 0, 0])
     final_pre = pl.slice(pre_pair, [CAPACITY, HC_MULT], [FINAL_SLOT, 0])
     source_hidden = pl.reshape(final_hidden, [CAPACITY, HC_DIM])
