@@ -298,74 +298,6 @@ def _shared_swiglu_compute(
     return payload, scales
 
 
-@pl.jit.incore
-def _shared_swiglu_vf(
-    gate_up: pl.Tensor,
-    payload: pl.Out[pl.Tensor],
-    scales: pl.Out[pl.Tensor],
-) -> tuple[pl.Tensor, pl.Tensor]:
-    """Run the double-buffered SwiGLU and MXFP8 epilogue."""
-    block = pl.tile.get_block_idx()
-    blocks = pl.tile.get_block_num()
-    rows = pl.tensor.dim(gate_up, 0)
-    pairs = MOE_INTER // SWIGLU_COL_TILE
-    tasks = rows // SWIGLU_ROW_TILE * pairs
-
-    # Contiguous work ranges with Q16 rounding.
-    base16 = tasks * 65536 // blocks
-    first = pl.min(tasks, (block * base16 + 32768) // 65536)
-    last = tasks
-    if block + 1 < blocks:
-        last = pl.min(tasks, ((block + 1) * base16 + 32768) // 65536)
-
-    if first < last:
-        gate = pl.create_tile([2 * SWIGLU_ROW_TILE, SWIGLU_COL_TILE], dtype=pl.BF16, target_memory=pl.Mem.Vec)
-        up = pl.create_tile([2 * SWIGLU_ROW_TILE, SWIGLU_COL_TILE], dtype=pl.BF16, target_memory=pl.Mem.Vec)
-        ub_payload = pl.create_tile([2 * SWIGLU_ROW_TILE * SWIGLU_COL_TILE], dtype=pl.INT8, target_memory=pl.Mem.Vec)
-        ub_scales = pl.create_tile([2 * SWIGLU_SCALE_REGISTER_TILE], dtype=pl.UINT32, target_memory=pl.Mem.Vec)
-        gate, up = _shared_swiglu_prefetch(gate_up, gate, up, first, 0)
-        if first + 1 < last:
-            gate, up = _shared_swiglu_prefetch(gate_up, gate, up, first + 1, 1)
-
-        for work in pl.range(first, last):
-            iteration = work - first
-            slot = iteration % 2
-            pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.V, slot)
-            if iteration >= 2:
-                pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, slot)
-            # Use static UB offsets for each register scope.
-            if slot == 0:
-                _shared_swiglu_compute(gate, up, ub_payload, ub_scales, 0)
-            else:
-                _shared_swiglu_compute(gate, up, ub_payload, ub_scales, 1)
-            pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE2, slot)
-            pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE3, slot)
-            if work + 2 < last:
-                pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, slot)
-                gate, up = _shared_swiglu_prefetch(gate_up, gate, up, work + 2, slot)
-            pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE3, slot)
-
-            row = work // pairs * SWIGLU_ROW_TILE
-            col = work % pairs * SWIGLU_COL_TILE
-            payload_rows = pl.reshape(ub_payload, [2 * SWIGLU_ROW_TILE, SWIGLU_COL_TILE])
-            payload_slot = pl.tile.slice(payload_rows, [SWIGLU_ROW_TILE, SWIGLU_COL_TILE], [slot * SWIGLU_ROW_TILE, 0])
-            payload_fp8 = pl.reinterpret_view(payload_slot, pl.FP8E4M3FN)
-            scale_bytes = pl.reinterpret_view(ub_scales, pl.UINT8, shape=[2, 4 * SWIGLU_SCALE_REGISTER_TILE])
-            scale_slot = pl.tile.slice(scale_bytes, [1, SWIGLU_SCALE_TILE], [slot, 0])
-            scale_fp8 = pl.reinterpret_view(scale_slot, pl.FP8E8M0)
-            pl.store(payload_fp8, [row, col], payload)
-            pl.store(scale_fp8, [0, work * SWIGLU_SCALE_TILE], scales)
-            pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, slot)
-
-        pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, 0)
-        pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 0)
-        if first + 1 < last:
-            pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, 1)
-            pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 1)
-    pl.system.barrier(pipe=pl.PipeType.ALL)
-    return payload, scales
-
-
 @pl.jit.inline
 def _w13_padded_inputs(
     x_local: pl.Tensor,
@@ -400,18 +332,6 @@ def _w13_direct_inputs(
 _W13_INPUTS = _w13_direct_inputs if W13_ROWS == T_PAD else _w13_padded_inputs
 
 
-@pl.jit.inline
-def _shared_swiglu(
-    gate_up: pl.Tensor,
-    payload: pl.Out[pl.Tensor],
-    scales: pl.Out[pl.Tensor],
-):
-    """SwiGLU epilogue plus grouped MXFP8 requantization over the token block."""
-    with pl.spmd(SWIGLU_WORKER_TILE, name_hint="sh_swiglu_vf"):
-        _shared_swiglu_vf(gate_up, payload, scales)
-    return payload, scales
-
-
 import torch.nn.functional as F
 
 
@@ -442,7 +362,65 @@ def expert_shared(
     # FP32 SwiGLU, FP8 payload, and packed MX_A_ZZ scales.
     h_tile_mx = pl.create_tensor([T_PAD, MOE_INTER], dtype=pl.FP8E4M3FN)
     h_scale_mx = pl.create_tensor([1, T_PAD * H_SCALE], dtype=pl.FP8E8M0)
-    h_tile_mx, h_scale_mx = _shared_swiglu(gate_up, h_tile_mx, h_scale_mx)
+    for block in pl.spmd(SWIGLU_WORKER_TILE, name_hint="sh_swiglu_vf"):
+        blocks = pl.tile.get_block_num()
+        swiglu_rows = pl.tensor.dim(gate_up, 0)
+        pairs = MOE_INTER // SWIGLU_COL_TILE
+        tasks = swiglu_rows // SWIGLU_ROW_TILE * pairs
+
+        # Contiguous work ranges with Q16 rounding.
+        base16 = tasks * 65536 // blocks
+        first = pl.min(tasks, (block * base16 + 32768) // 65536)
+        last = tasks
+        if block + 1 < blocks:
+            last = pl.min(tasks, ((block + 1) * base16 + 32768) // 65536)
+
+        if first < last:
+            gate = pl.create_tile([2 * SWIGLU_ROW_TILE, SWIGLU_COL_TILE], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+            up = pl.create_tile([2 * SWIGLU_ROW_TILE, SWIGLU_COL_TILE], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+            ub_payload = pl.create_tile([2 * SWIGLU_ROW_TILE * SWIGLU_COL_TILE], dtype=pl.INT8, target_memory=pl.Mem.Vec)
+            ub_scales = pl.create_tile([2 * SWIGLU_SCALE_REGISTER_TILE], dtype=pl.UINT32, target_memory=pl.Mem.Vec)
+            gate, up = _shared_swiglu_prefetch(gate_up, gate, up, first, 0)
+            if first + 1 < last:
+                gate, up = _shared_swiglu_prefetch(gate_up, gate, up, first + 1, 1)
+
+            for work in pl.range(first, last):
+                iteration = work - first
+                slot = iteration % 2
+                pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.V, slot)
+                if iteration >= 2:
+                    pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, slot)
+                # Use static UB offsets for each register scope.
+                if slot == 0:
+                    _shared_swiglu_compute(gate, up, ub_payload, ub_scales, 0)
+                else:
+                    _shared_swiglu_compute(gate, up, ub_payload, ub_scales, 1)
+                pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE2, slot)
+                pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE3, slot)
+                if work + 2 < last:
+                    pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, slot)
+                    gate, up = _shared_swiglu_prefetch(gate_up, gate, up, work + 2, slot)
+                pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE3, slot)
+
+                row = work // pairs * SWIGLU_ROW_TILE
+                col = work % pairs * SWIGLU_COL_TILE
+                payload_rows = pl.reshape(ub_payload, [2 * SWIGLU_ROW_TILE, SWIGLU_COL_TILE])
+                slot_row = slot * SWIGLU_ROW_TILE
+                payload_slot = pl.tile.slice(payload_rows, [SWIGLU_ROW_TILE, SWIGLU_COL_TILE], [slot_row, 0])
+                payload_fp8 = pl.reinterpret_view(payload_slot, pl.FP8E4M3FN)
+                scale_bytes = pl.reinterpret_view(ub_scales, pl.UINT8, shape=[2, 4 * SWIGLU_SCALE_REGISTER_TILE])
+                scale_slot = pl.tile.slice(scale_bytes, [1, SWIGLU_SCALE_TILE], [slot, 0])
+                scale_fp8 = pl.reinterpret_view(scale_slot, pl.FP8E8M0)
+                pl.store(payload_fp8, [row, col], h_tile_mx)
+                pl.store(scale_fp8, [0, work * SWIGLU_SCALE_TILE], h_scale_mx)
+                pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, slot)
+
+            pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, 0)
+            pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 0)
+            if first + 1 < last:
+                pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, 1)
+                pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 1)
+        pl.system.barrier(pipe=pl.PipeType.ALL)
 
     # Complete row tiles keep MX_A_ZZ scale loads inside the packed backing.
     h_tile_scale_zz = pl.tensor.view(
