@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Daily operator performance: run each fixed workload and report its device timing.
+"""Daily operator performance: run each fixed workload and report its effective time.
 
 Commands: ci submits every case through task-submit and writes report.md;
 prepare freezes a GLM case on CPU; case captures its allocated device replay.
@@ -19,7 +19,6 @@ import copy
 from contextlib import contextmanager
 import importlib
 import json
-import math
 import os
 from pathlib import Path
 import runpy
@@ -223,20 +222,19 @@ def replay_prepared(case, selected, output, prepared):
 
 
 def benchmark_payload(stats):
-    """Keep both clock windows on the original round/rank/dispatch grid."""
+    """Serialize RunResult.bench as rounds of {rank: [dispatch effective_us]}."""
     if stats is None:
         raise ValueError("benchmark unavailable or skipped")
-    grid = stats.rounds_dispatches or [{item.pid: [item]} for item in stats.invocations]
-
-    def samples(metric):
-        return [{str(pid): [getattr(item, metric) for item in items] for pid, items in row.items()}
-                for row in grid]
-
+    grid = stats.rounds_dispatches
+    if grid:
+        rounds = [{str(pid): [item.effective_us for item in items] for pid, items in row.items()}
+                  for row in grid]
+    else:
+        rounds = [{str(item.pid): [item.effective_us]} for item in stats.invocations]
     return {"rounds": stats.rounds, "warmup": stats.warmup,
             "fallback_flattened": stats.fallback_flattened,
             "unstable_dispatch_slots": getattr(stats, "unstable_dispatch_slots", False),
-            "all_zero_device": stats.all_zero_device, "samples": samples("effective_us"),
-            "device_wall_samples": samples("device_wall_us")}
+            "all_zero_device": stats.all_zero_device, "samples": rounds}
 
 
 def make_capture(original_run, output, selected, case):
@@ -288,7 +286,7 @@ def run_case(args):
 # ci: submits every case and renders the report.
 
 
-def timing_median_us(payload, case, sampling, platform):
+def effective_us(payload, case, sampling):
     """Per rank and round, sum all dispatches.
 
     Single card reports the median; multi-card reports the lowest per-rank median.
@@ -300,7 +298,7 @@ def timing_median_us(payload, case, sampling, platform):
         raise ValueError("benchmark rounds/warmup differ from the manifest")
     if bench["fallback_flattened"] or bench["unstable_dispatch_slots"] or bench["all_zero_device"]:
         raise ValueError("benchmark timing is flattened, unstable or all zero")
-    rows = bench["device_wall_samples"] if platform == "a5" else bench["samples"]
+    rows = bench["samples"]
     if len(rows) != sampling["rounds"] or len(rows[0]) != case["device_count"]:
         raise ValueError("benchmark rounds or ranks are incomplete")
     totals = {}
@@ -308,10 +306,6 @@ def timing_median_us(payload, case, sampling, platform):
         if set(row) != set(rows[0]):
             raise ValueError("a rank is missing from a measured round")
         for pid, dispatches in row.items():
-            if platform == "a5" and (not dispatches or any(
-                not math.isfinite(value) or value <= 0 for value in dispatches
-            )):
-                raise ValueError(f"device wall timing is missing or invalid for rank {pid}")
             totals.setdefault(pid, []).append(sum(dispatches))
     if case["device_count"] == 1:
         return statistics.median(next(iter(totals.values())))
@@ -341,10 +335,9 @@ def submit_command(case, case_dir, sampling):
     return command + ["--timeout", str(QUEUE_TIMEOUT), "--max-time", str(CASE_TIMEOUT), "--run", payload]
 
 
-def render_report(manifest, results, platform):
-    metric = "Device wall" if platform == "a5" else "Effective"
+def render_report(manifest, results):
     lines = ["Single-card median or lowest per-rank median, after summing dispatches per round.",
-             "", f"| Case | {metric} median (us) |", "| --- | --- |"]
+             "", "| Case | Effective median (us) |", "| --- | --- |"]
     for case in manifest["cases"]:
         value = results.get(case["case_id"], "-")
         lines.append(f"| {case['case_id']} | {value:.2f} |" if isinstance(value, float)
@@ -360,7 +353,7 @@ def run_ci(output, platform="a2a3"):
     published.mkdir(parents=True)
     env = {key: value for key, value in os.environ.items() if key not in ("GH_TOKEN", "GITHUB_TOKEN")}
     results = {}
-    (published / "report.md").write_text(render_report(manifest, results, platform))
+    (published / "report.md").write_text(render_report(manifest, results))
     for case in manifest["cases"]:
         case_id = case["case_id"]
         case_dir = work / case_id
@@ -389,7 +382,7 @@ def run_ci(output, platform="a2a3"):
             rc = proc.returncode
             if rc != 0:
                 raise ValueError(f"task-submit exited {rc}")
-            results[case_id] = timing_median_us(read_json(case_dir / "raw-result.json"), case, sampling, platform)
+            results[case_id] = effective_us(read_json(case_dir / "raw-result.json"), case, sampling)
             print(f"[perf] {case_id}: {results[case_id]:.2f} us", flush=True)
         except (OSError, UnicodeError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
             results[case_id] = "FAIL"
@@ -401,7 +394,7 @@ def run_ci(output, platform="a2a3"):
         for name in ("prepare.log", "prepared.json", "run.log", "raw-result.json"):
             if (case_dir / name).is_file():
                 shutil.copyfile(case_dir / name, published / case_id / name)
-        (published / "report.md").write_text(render_report(manifest, results, platform))
+        (published / "report.md").write_text(render_report(manifest, results))
     return 0 if all(isinstance(value, float) for value in results.values()) else 1
 
 
