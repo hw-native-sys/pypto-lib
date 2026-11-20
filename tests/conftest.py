@@ -23,6 +23,7 @@ two competing stubs cannot coexist: whichever conftest ran first would win
 ``sys.modules`` and starve the other of the attributes it added.
 """
 
+from dataclasses import dataclass
 import importlib.machinery
 import importlib.util
 import sys
@@ -74,6 +75,7 @@ def _install_pypto_stubs() -> None:
         "enable_dump_args": 0,
         "enable_pmu": 0,
         "enable_dep_gen": False,
+        "enable_software_pipeline": None,
         "enable_scope_stats": False,
         "compile_profiling": False,
         "diagnostic_phase": None,
@@ -100,7 +102,11 @@ def _install_pypto_stubs() -> None:
             ):
                 setattr(self, name, kwargs.get(name, 0))
 
+    @dataclass(init=False)
     class RunConfig:
+        # The real RunConfig preserves every field across dataclasses.replace().
+        __annotations__ = dict.fromkeys(("platform", *_RUN_CONFIG_FIELDS), object)
+
         def __init__(
             self, platform=None, *, backend_type=BackendType.Ascend910B,
             execution_mode=ExecutionMode.SIM, **kwargs,
@@ -194,6 +200,45 @@ def _install_pypto_stubs() -> None:
     replay = types.ModuleType("pypto.runtime.debug.replay")
     pto_rebuild = types.ModuleType("pypto.runtime.debug.pto_rebuild")
     backend = types.ModuleType("pypto.backend")
+    core = types.ModuleType("pypto.pypto_core")
+
+    class RuntimeKind(enum.Enum):
+        HOST_BUILD_GRAPH = "host_build_graph"
+        TENSORMAP_AND_RINGBUFFER = "tensormap_and_ringbuffer"
+
+    class MemoryPlanner(enum.Enum):
+        PTOAS = "ptoas"
+
+    class PassContext:
+        """Expose the pass stack used while the mock compiler handles a fresh build."""
+        _stack = []
+
+        def __init__(self, _passes, *, runtime, memory_planner=None, **_options):
+            self.runtime = runtime
+            self.memory_planner = memory_planner
+
+        @classmethod
+        def current(cls):
+            return cls._stack[-1] if cls._stack else None
+
+        def __enter__(self):
+            self._stack.append(self)
+            return self
+
+        def __exit__(self, *_exc):
+            self._stack.pop()
+
+        def get_runtime(self):
+            return self.runtime
+
+        def get_memory_planner(self):
+            return self.memory_planner
+
+    core.passes = types.SimpleNamespace(
+        RuntimeKind=RuntimeKind, MemoryPlanner=MemoryPlanner, PassContext=PassContext,
+        runtime_kind_from_name=RuntimeKind, get_default_verification_level=lambda: None,
+        get_default_diagnostic_phase=lambda: None,
+    )
 
     for name in ("Tensor", "Scalar", "Array", "InOut", "Out"):
         setattr(language, name, _TypeSpec)
@@ -241,6 +286,7 @@ def _install_pypto_stubs() -> None:
     pto_rebuild.rebuild_kernel_cpp_from_pto = lambda *_a, **_k: []
     backend.BackendType = BackendType
 
+    pypto.pypto_core = core
     pypto.ir = ir
     pypto.language = language
     pypto.runtime = runtime
@@ -252,6 +298,7 @@ def _install_pypto_stubs() -> None:
 
     sys.modules["pypto"] = pypto
     sys.modules["pypto.language"] = language
+    sys.modules["pypto.pypto_core"] = core
     sys.modules["pypto.ir"] = ir
     sys.modules["pypto.runtime"] = runtime
     sys.modules["pypto.runtime.log_config"] = log_config
