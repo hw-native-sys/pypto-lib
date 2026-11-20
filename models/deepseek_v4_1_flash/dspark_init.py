@@ -334,3 +334,59 @@ def dspark_init(
         sampled_rows=workspace["sampled_rows"], sampled_ids=workspace["prefill_sampled_ids"],
         draft_ids=workspace["draft_ids"], state_tokens=state.tokens, state_meta=state.meta,
     ))
+
+
+def dspark_propose(
+    runner: StageRunner,
+    workspace: Mapping[str, Any],
+    draft_model: Mapping[str, Any],
+    markov_model: Mapping[str, Any],
+    cache_tables: Mapping[str, Any],
+    rope_tables: Mapping[str, Any],
+    *,
+    moe_epoch: int,
+    logits_epoch: int,
+) -> None:
+    """Generate one proposal block before the target verification pass.
+
+    Serving supplies ``target_hidden`` from prefill or the preceding verify
+    pass.  The function deliberately stops before state publication so CPU
+    Engram can inspect the proposal and populate the verification inputs.
+    ``dspark_verify_and_accept`` owns the subsequent state transition.
+    """
+    from dspark_drafter import l3_dspark_drafter
+    from markov import l3_markov_output
+
+    draft_args = dict(draft_model)
+    draft_args.update(
+        target_hidden=workspace["target_hidden"],
+        num_sampled=workspace["num_sampled"],
+        last_sampled=workspace["last_sampled"],
+        next_prefill_tokens=workspace["next_prefill_tokens"],
+        anchor_ids=workspace["anchor_ids"],
+        first_query_positions=workspace["first_query_positions"],
+        block_tables=cache_tables["draft"],
+        context_slots=workspace["context_slots"],
+        context_rope_cos=workspace["context_rope_cos"],
+        context_rope_sin=workspace["context_rope_sin"],
+        query_rope_cos=workspace["query_rope_cos"],
+        query_rope_sin=workspace["query_rope_sin"],
+        draft_x_hc=workspace["draft_x_hc"],
+        draft_pre_mix=workspace["draft_pre_mix"],
+        moe_epoch=moe_epoch,
+    )
+    _run_stage(runner, l3_dspark_drafter, draft_args)
+    markov_args = dict(markov_model)
+    markov_args.update(
+        draft_x_hc=workspace["draft_x_hc"],
+        draft_pre_mix=workspace["draft_pre_mix"],
+        head_hidden=workspace["draft_head_hidden"],
+        num_sampled=workspace["num_sampled"],
+        last_sampled=workspace["last_sampled"],
+        next_prefill_tokens=workspace["next_prefill_tokens"],
+        anchor_ids=workspace["anchor_ids"],
+        draft_ids=workspace["draft_ids"],
+        confidences=workspace["confidences"],
+        logits_epoch=logits_epoch,
+    )
+    _run_stage(runner, l3_markov_output, markov_args)
