@@ -73,6 +73,7 @@ from config import (
     FLASH as M, INDEX_CACHE_GROUP, CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, ORI_BLOCKS_DYN, LM_HEAD_TP_SIZE, B_DYN,
     INDEX_POOL_BLOCKS_DYN, PREFILL_MAX_TOKENS, Q_START_DYN, STATE_BLOCKS_DYN, STATE_CAPACITY, MOE_TOKENS,
     DSPARK_DRAFT_LAYERS, DSPARK_LAST_TARGET_LAYER, DSPARK_TARGET_LAYER_IDS, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
+    BLOCK_SIZE,
     DECODE_INPUT_MAX_TOKENS,
 )
 
@@ -102,6 +103,8 @@ from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_R
 
 RANKS = C.EP_SIZE
 D = M.hidden_size
+HEAD_DIM = M.head_dim
+ROPE_DIM = M.qk_rope_head_dim
 DSPARK_MAIN_IN = DSPARK_DRAFT_LAYERS * D
 HC_MULT = M.hc_mult
 VOCAB = M.vocab_size
@@ -1007,12 +1010,12 @@ def l3_prefill_fwd_dspark(
     draft_main_norm_weight: pl.Tensor[[RANKS, DSPARK_D], pl.BF16],
     draft_num_tokens: pl.Tensor[[RANKS, 1], pl.INT32],
     draft_context_slots: pl.Tensor[[RANKS, DSPARK_DRAFT_LAYERS, PREFILL_MAX_TOKENS], pl.INT64],
-    draft_context_rope_cos: pl.Tensor[[RANKS, PREFILL_MAX_TOKENS, 64], pl.FP32],
-    draft_context_rope_sin: pl.Tensor[[RANKS, PREFILL_MAX_TOKENS, 64], pl.FP32],
-    draft_wkv: pl.Tensor[[RANKS, DSPARK_DRAFT_LAYERS, DSPARK_D, 128], pl.FP8E4M3FN],
-    draft_wkv_scale: pl.Tensor[[RANKS, DSPARK_DRAFT_LAYERS, DSPARK_D // DSPARK_MX_GROUP, 128], pl.FP8E8M0],
-    draft_kv_norm_weight: pl.Tensor[[RANKS, DSPARK_DRAFT_LAYERS, 128], pl.BF16],
-    draft_window_cache: pl.InOut[pl.Tensor[[RANKS, DSPARK_DRAFT_LAYERS, ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    draft_context_rope_cos: pl.Tensor[[RANKS, PREFILL_MAX_TOKENS, ROPE_DIM // 2], pl.FP32],
+    draft_context_rope_sin: pl.Tensor[[RANKS, PREFILL_MAX_TOKENS, ROPE_DIM // 2], pl.FP32],
+    draft_wkv: pl.Tensor[[RANKS, DSPARK_DRAFT_LAYERS, DSPARK_D, HEAD_DIM], pl.FP8E4M3FN],
+    draft_wkv_scale: pl.Tensor[[RANKS, DSPARK_DRAFT_LAYERS, DSPARK_D // DSPARK_MX_GROUP, HEAD_DIM], pl.FP8E8M0],
+    draft_kv_norm_weight: pl.Tensor[[RANKS, DSPARK_DRAFT_LAYERS, HEAD_DIM], pl.BF16],
+    draft_window_cache: pl.InOut[pl.Tensor[[RANKS, DSPARK_DRAFT_LAYERS, ORI_BLOCKS_DYN, BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
 ):
     """Append one chunk with EP = DP * CP and return global state/logits.
 
