@@ -55,7 +55,7 @@ LM_HEAD_M_TILE = 80
 LM_HEAD_N_TILE = 256
 LM_HEAD_K_TILE = 128
 LM_HEAD_PUSH_M_TILE = 192
-LM_HEAD_PUSH_PANEL_BYTES = LM_HEAD_PUSH_M_TILE * LM_HEAD_N_TILE * 2
+LM_HEAD_PUSH_PANEL_BYTES = (LM_HEAD_PUSH_M_TILE // 2) * LM_HEAD_N_TILE * 4
 LM_HEAD_PUSH_FIFO_BYTES = LM_HEAD_PUSH_PANEL_BYTES * 2
 LM_HEAD_PUSH_L1_K_TILE = 256
 LM_HEAD_PUSH_L0_K_TILE = 64
@@ -110,7 +110,7 @@ def _lm_head_prefetch_panel(
 
 @pl.jit.inline(auto_scope=False)
 def _lm_head_publish_panel(
-    panel: pl.Tile[[PANEL_ROWS_DYN, PANEL_COLUMNS_DYN], pl.BF16],
+    panel: pl.Tile[[PANEL_ROWS_DYN, PANEL_COLUMNS_DYN], pl.FP32],
     received: pld.DistributedTensor,
     tp_rank: pl.Scalar[pl.INT32],
     group_base: pl.Scalar[pl.INT32],
@@ -118,22 +118,20 @@ def _lm_head_publish_panel(
     column: pl.Scalar[pl.INDEX],
     lane: pl.Scalar[pl.INDEX],
     num_rows: pl.constexpr,
-    row_tile: pl.constexpr,
+    lane_rows: pl.Scalar[pl.INDEX],
     column_tile: pl.constexpr,
-    lane_rows: pl.constexpr,
 ):
-    # Keep the lane band from the full M tile when the last tile is short.
+    # Each lane starts at its own half of the valid rows, including a short M tile.
     # Panel storage is ordered by source shard, then by vocabulary panel.
     panel_view = pl.tensor.view(received, [num_rows * (VOCAB // column_tile), column_tile])
     panel_row = (tp_rank * VOCAB_PER_TP + column) * num_rows // column_tile
-    for offset in pl.range(
-        lane * lane_rows, pl.min((lane + 1) * lane_rows, row_tile), HIDDEN_OWNER_ROW_TILE,
-    ):
-        stripe = row + offset
+    for offset in pl.range(0, lane_rows, HIDDEN_OWNER_ROW_TILE):
+        stripe = row + lane * lane_rows + offset
         owner = stripe // HIDDEN_OWNER_ROW_TILE % LM_HEAD_TP_SIZE
         owner_row = stripe // (HIDDEN_OWNER_ROW_TILE * LM_HEAD_TP_SIZE) * HIDDEN_OWNER_ROW_TILE
         block = pl.tile.slice(panel, [HIDDEN_OWNER_ROW_TILE, column_tile], [offset, 0])
-        pld.tile.remote_store(block, panel_view, group_base + owner, [panel_row + owner_row, 0])
+        value = pl.cast(block, pl.BF16, mode="rint")
+        pld.tile.remote_store(value, panel_view, group_base + owner, [panel_row + owner_row, 0])
 
 
 @pl.jit.inline(auto_scope=False)
@@ -202,23 +200,11 @@ def _lm_head_receive_panel(
     rows: pl.Scalar[pl.INDEX],
     row_tile: pl.constexpr,
     column_tile: pl.constexpr,
-    lane_rows: pl.constexpr,
 ):
-    panel = pl.tpop_from_aic(shape=[row_tile, column_tile], dtype=pl.BF16, split=1)
-    # Keep the lane band from the full M tile when the last tile is short.
-    # Panel storage is ordered by source shard, then by vocabulary panel.
-    panel_view = pl.tensor.view(received, [num_rows * (VOCAB // column_tile), column_tile])
-    panel_row = (tp_rank * VOCAB_PER_TP + column) * num_rows // column_tile
-    for offset in pl.range(
-        lane * lane_rows,
-        pl.min((lane + 1) * lane_rows, rows),
-        HIDDEN_OWNER_ROW_TILE,
-    ):
-        stripe = row + offset
-        owner = stripe // HIDDEN_OWNER_ROW_TILE % LM_HEAD_TP_SIZE
-        owner_row = stripe // (HIDDEN_OWNER_ROW_TILE * LM_HEAD_TP_SIZE) * HIDDEN_OWNER_ROW_TILE
-        block = pl.tile.slice(panel, [HIDDEN_OWNER_ROW_TILE, column_tile], [offset, 0])
-        pld.tile.remote_store(block, panel_view, group_base + owner, [panel_row + owner_row, 0])
+    panel = pl.tpop_from_aic(shape=[row_tile // 2, column_tile], dtype=pl.FP32, split=1)
+    _lm_head_publish_panel(
+        panel, received, tp_rank, group_base, row, column, lane, num_rows, rows // 2, column_tile,
+    )
     pl.tfree_to_aic(panel)
 
 
@@ -238,14 +224,24 @@ def _lm_head_project_push(
     with pl.spmd(
         32, name_hint="lm_head_matmul_push", deps=[dispatch_ready, dispatch_notified],
     ) as logits_pushed:
-        # Both lanes receive full BF16 panels and release a slot after publishing their rows.
+        # Each AIV receives half the FP32 rows and publishes its BF16 stripes.
         peer = pl.import_peer_buffer(name="projection_panels")
-        pl.aic_initialize_pipe(c2v_consumer_buf=peer, dir_mask=1, slot_size=LM_HEAD_PUSH_PANEL_BYTES, slot_num=2, c2v_dtype=pl.BF16, broadcast=True,
+        pl.aic_initialize_pipe(
+            c2v_consumer_buf=peer,
+            dir_mask=1,
+            slot_size=LM_HEAD_PUSH_PANEL_BYTES,
+            slot_num=2,
             ptoas_plan_memory=multi_row_tiles,
+            ptoas_buffer_id_sync=True,
         )
         buffer = pl.reserve_buffer(name="projection_panels", size=LM_HEAD_PUSH_FIFO_BYTES)
-        pl.aiv_initialize_pipe(c2v_consumer_buf=buffer, dir_mask=1, slot_size=LM_HEAD_PUSH_PANEL_BYTES, slot_num=2, c2v_dtype=pl.BF16, broadcast=True,
+        pl.aiv_initialize_pipe(
+            c2v_consumer_buf=buffer,
+            dir_mask=1,
+            slot_size=LM_HEAD_PUSH_PANEL_BYTES,
+            slot_num=2,
             ptoas_plan_memory=multi_row_tiles,
+            ptoas_buffer_id_sync=True,
         )
         full_panels = VOCAB_PER_TP // LM_HEAD_N_TILE
         worker = pl.tile.get_block_idx()
@@ -278,11 +274,11 @@ def _lm_head_project_push(
                         n = (
                             worker + pl.cast(ordinal // (D // LM_HEAD_PUSH_L1_K_TILE), pl.INDEX) * 32
                         ) * LM_HEAD_N_TILE
-                        pl.tpush_to_aiv(acc_pipe, split=1)
+                        pl.tpush_to_aiv(acc_pipe, split=1, split_valid_rows=True)
                         for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
                             _lm_head_receive_panel(
                                 received, tp_rank, group_base, row, n, lane,
-                                num_rows, rows, row_tile, LM_HEAD_N_TILE, row_tile // 2,
+                                num_rows, rows, row_tile, LM_HEAD_N_TILE,
                             )
                 for inner in pl.pipeline(0, LM_HEAD_PUSH_L1_K_TILE, LM_HEAD_PUSH_L0_K_TILE, stage=2):
                     left = pl.tile.extract(a_even, 0, inner, [row_tile, LM_HEAD_PUSH_L0_K_TILE], target_memory=pl.Mem.Left)
@@ -293,20 +289,20 @@ def _lm_head_project_push(
                     right = pl.tile.extract(b_odd, inner, 0, [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_N_TILE], target_memory=pl.Mem.Right)
                     acc_pipe = pl.matmul_acc(acc_pipe, left, right, init_cond=False)
                 n_last = (worker + (panel_count - 1) * 32) * LM_HEAD_N_TILE
-                pl.tpush_to_aiv(acc_pipe, split=1)
+                pl.tpush_to_aiv(acc_pipe, split=1, split_valid_rows=True)
                 for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
                     _lm_head_receive_panel(
                         received, tp_rank, group_base, row, n_last, lane,
-                        num_rows, rows, row_tile, LM_HEAD_N_TILE, row_tile // 2,
+                        num_rows, rows, row_tile, LM_HEAD_N_TILE,
                     )
                 if VOCAB_PER_TP % LM_HEAD_N_TILE != 0 and worker == full_panels % 32:
                     column = full_panels * LM_HEAD_N_TILE
                     acc_tail = _lm_head_project_compact_tail(hidden, weight, row, column, rows, row_tile, LM_HEAD_TAIL_TILE)
-                    pl.tpush_to_aiv(acc_tail, split=1)
+                    pl.tpush_to_aiv(acc_tail, split=1, split_valid_rows=True)
                     for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
                         _lm_head_receive_panel(
                             received, tp_rank, group_base, row, column, lane,
-                            num_rows, rows, row_tile, LM_HEAD_TAIL_TILE, row_tile // 2,
+                            num_rows, rows, row_tile, LM_HEAD_TAIL_TILE,
                         )
         else:
             # Share two L0A/L0B slots across the full and tail panels.
@@ -364,9 +360,9 @@ def _lm_head_project_push(
                         n = (worker + pl.cast(ordinal // (D // LM_HEAD_PUSH_L1_K_TILE), pl.INDEX) * 32) * LM_HEAD_N_TILE
                         pl.tpush_to_aiv(acc_pipe, split=1)
                         for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
-                            panel_pipe = pl.tpop_from_aic(shape=[row_tile, LM_HEAD_N_TILE], dtype=pl.BF16, split=1)
+                            panel_pipe = pl.tpop_from_aic(shape=[row_tile // 2, LM_HEAD_N_TILE], dtype=pl.FP32, split=1)
                             _lm_head_publish_panel(
-                                panel_pipe, received, tp_rank, group_base, row, n, lane, num_rows, row_tile, LM_HEAD_N_TILE, row_tile // 2,
+                                panel_pipe, received, tp_rank, group_base, row, n, lane, num_rows, row_tile // 2, LM_HEAD_N_TILE,
                             )
                             pl.tfree_to_aic(panel_pipe)
                 for inner in pl.range(0, LM_HEAD_PUSH_L1_K_TILE, 2 * LM_HEAD_PUSH_L0_K_TILE):
@@ -410,9 +406,9 @@ def _lm_head_project_push(
                 n_last = (worker + (panel_count - 1) * 32) * LM_HEAD_N_TILE
                 pl.tpush_to_aiv(acc_pipe, split=1)
                 for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
-                    panel_pipe_last = pl.tpop_from_aic(shape=[row_tile, LM_HEAD_N_TILE], dtype=pl.BF16, split=1)
+                    panel_pipe_last = pl.tpop_from_aic(shape=[row_tile // 2, LM_HEAD_N_TILE], dtype=pl.FP32, split=1)
                     _lm_head_publish_panel(
-                        panel_pipe_last, received, tp_rank, group_base, row, n_last, lane, num_rows, row_tile, LM_HEAD_N_TILE, row_tile // 2,
+                        panel_pipe_last, received, tp_rank, group_base, row, n_last, lane, num_rows, row_tile // 2, LM_HEAD_N_TILE,
                     )
                     pl.tfree_to_aic(panel_pipe_last)
                 if VOCAB_PER_TP % LM_HEAD_N_TILE != 0 and worker == full_panels % 32:
@@ -442,10 +438,10 @@ def _lm_head_project_push(
                             acc_tail = pl.matmul_acc(acc_tail, left_1, right_tail_1)
                     pl.tpush_to_aiv(acc_tail, split=1)
                     for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
-                        panel_tail = pl.tpop_from_aic(shape=[row_tile, LM_HEAD_TAIL_TILE], dtype=pl.BF16, split=1)
+                        panel_tail = pl.tpop_from_aic(shape=[row_tile // 2, LM_HEAD_TAIL_TILE], dtype=pl.FP32, split=1)
                         _lm_head_publish_panel(
                             panel_tail, received, tp_rank, group_base, row, column, lane,
-                            num_rows, row_tile, LM_HEAD_TAIL_TILE, row_tile // 2,
+                            num_rows, row_tile // 2, LM_HEAD_TAIL_TILE,
                         )
                         pl.tfree_to_aic(panel_tail)
     return logits_pushed
