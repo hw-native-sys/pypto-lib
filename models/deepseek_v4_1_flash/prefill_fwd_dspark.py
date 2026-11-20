@@ -1185,9 +1185,15 @@ def l3_prefill_fwd_dspark(
         # Fuse draft context KV materialization into the terminal prefill
         # composite. The dependency is carried by dspark_target_hidden, so
         # the context write starts after the target layers publish their taps.
-        context_slots = draft_context_slots[rank]
-        context_rope_cos = draft_context_rope_cos[rank]
-        context_rope_sin = draft_context_rope_sin[rank]
+        context_slots = pl.reshape(
+            draft_context_slots[rank], [DSPARK_DRAFT_LAYERS, CAPACITY]
+        )
+        context_rope_cos = pl.reshape(
+            draft_context_rope_cos[rank], [CAPACITY, ROPE_DIM // 2]
+        )
+        context_rope_sin = pl.reshape(
+            draft_context_rope_sin[rank], [CAPACITY, ROPE_DIM // 2]
+        )
         dspark_prefill_context_kv_rank(
             dspark_target_hidden[rank], draft_main_proj_weight[rank], draft_main_proj_scale[rank],
             draft_main_norm_weight[rank], draft_num_tokens[rank], context_slots,
