@@ -52,7 +52,8 @@ K_SCALE = D // MX_GROUP
 H_SCALE = MOE_INTER // MX_GROUP
 W13_M_TILE = 80
 W13_N_TILE = 256
-W13_K_TILE = 128
+W13_K_TILE = 256
+W13_K_STAGE = 2
 W13_GROUPS = (T_PAD + W13_M_TILE - 1) // W13_M_TILE
 W13_ROWS = W13_GROUPS * W13_M_TILE
 W13_PAD_ROWS = 16  # staging granularity when the token block is not a whole tile
@@ -346,22 +347,47 @@ def _project_w13_pypto(
 ) -> pl.Tensor:
     """Accumulate one W1 or W3 panel in FP32 and store its active rows in BF16."""
     x_scale_zz = pl.tensor.view(x_scale, [W13_ROWS, K_SCALE], layout=pl.MX_A_ZZ)
-    acc = pl.create_tile([W13_M_TILE, W13_N_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc)
-    for k in pl.range(0, D, W13_K_TILE):
+    a0 = pl.tile.load(x, [row, 0], [W13_M_TILE, W13_K_TILE], target_memory=pl.Mem.Mat)
+    b0 = pl.tile.load(weight, [0, col], [W13_K_TILE, W13_N_TILE], target_memory=pl.Mem.Mat)
+    sa0 = pl.tile.load(x_scale_zz, [row, 0], [W13_M_TILE, W13_K_TILE // MX_GROUP])
+    sb0 = pl.tile.load(weight_scale, [0, col], [W13_K_TILE // MX_GROUP, W13_N_TILE])
+    acc = pl.tile.matmul_mx(a0, sa0, b0, sb0)
+    for k in pl.pipeline(W13_K_TILE, D, W13_K_TILE, stage=W13_K_STAGE):
         scale_k = k // MX_GROUP
         a = pl.tile.load(x, [row, k], [W13_M_TILE, W13_K_TILE], target_memory=pl.Mem.Mat)
         b = pl.tile.load(weight, [k, col], [W13_K_TILE, W13_N_TILE], target_memory=pl.Mem.Mat)
-        # Stream each K128 E8M0 fragment into Mat for the MX matmul.
         sa = pl.tile.load(x_scale_zz, [row, scale_k], [W13_M_TILE, W13_K_TILE // MX_GROUP])
         sb = pl.tile.load(weight_scale, [scale_k, col], [W13_K_TILE // MX_GROUP, W13_N_TILE])
-        if k == 0:
-            acc = pl.tile.matmul_mx(a, sa, b, sb)
-        else:
-            acc = pl.tile.matmul_mx_acc(acc, a, sa, b, sb)
+        acc = pl.tile.matmul_mx_acc(acc, a, sa, b, sb)
     active = pl.min(T_PAD - row, W13_M_TILE)
     out = pl.tile.set_validshape(acc, active, W13_N_TILE)
     out_col = projection * MOE_INTER + col
     return pl.tile.store(out, [row, out_col], gate_up)
+
+
+@pl.jit.incore
+def _shared_w13_mm_pypto(
+    x: pl.Tensor,
+    x_scale: pl.Tensor,
+    shared_w1: pl.Tensor,
+    shared_w1_scale: pl.Tensor,
+    shared_w3: pl.Tensor,
+    shared_w3_scale: pl.Tensor,
+    gate_up: pl.Out[pl.Tensor],
+) -> pl.Tensor:
+    """Distribute row and projection panels over the Cube workers."""
+    n_tiles = MOE_INTER // W13_N_TILE
+    block = pl.tile.get_block_idx()
+    blocks = pl.tile.get_block_num()
+    for row in pl.range(0, T_PAD, W13_M_TILE):
+        first = row // W13_M_TILE * 2 * n_tiles
+        for col in pl.range(0, MOE_INTER, W13_N_TILE):
+            task = first + col // W13_N_TILE
+            if task % blocks == block:
+                gate_up = _project_w13_pypto(x, x_scale, shared_w1, shared_w1_scale, gate_up, row, col, 0)
+            if (task + n_tiles) % blocks == block:
+                gate_up = _project_w13_pypto(x, x_scale, shared_w3, shared_w3_scale, gate_up, row, col, 1)
+    return gate_up
 
 
 @pl.jit.inline
@@ -376,18 +402,9 @@ def shared_w13_pypto(
 ) -> pl.Tensor:
     """Project MXFP8 activations into concatenated BF16 W1 and W3 panels."""
     x, x_scale = _W13_INPUTS(x_local, x_local_scale)
-    n_tiles = MOE_INTER // W13_N_TILE
-    workers = pl.min(n_tiles, W13_WORKER_TILE)
+    workers = pl.min(W13_GROUPS * (GATE_UP_N // W13_N_TILE), W13_WORKER_TILE)
     with pl.spmd(workers, name_hint="sh_w13_pypto"):
-        block = pl.tile.get_block_idx()
-        blocks = pl.tile.get_block_num()
-        for band in pl.range((n_tiles + blocks - 1) // blocks):
-            panel = block + band * blocks
-            if panel < n_tiles:
-                col = panel * W13_N_TILE
-                for row in pl.range(0, T_PAD, W13_M_TILE):
-                    gate_up = _project_w13_pypto(x, x_scale, shared_w1, shared_w1_scale, gate_up, row, col, 0)
-                    gate_up = _project_w13_pypto(x, x_scale, shared_w3, shared_w3_scale, gate_up, row, col, 1)
+        gate_up = _shared_w13_mm_pypto(x, x_scale, shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, gate_up)
     return gate_up
 
 
