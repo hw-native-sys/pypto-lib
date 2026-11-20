@@ -19,7 +19,7 @@ import pypto.language as pl
 from config import CACHE_ROWS_DYN
 from config import (
     B_DYN, FLASH, INDEX_BLOCKS_DYN, INDEX_CACHE_GROUP, INDEX_POOL_BLOCKS_DYN,
-    INDEX_POOL_POSITIONS_DYN, TABLE_DYN, T_DYN,
+    TABLE_DYN, T_DYN,
 )
 
 
@@ -660,32 +660,6 @@ def score_select_reindex(
     lengths: pl.Tensor,
     pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
     pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
-    scores: pl.Tensor[[T_DYN, INDEX_POOL_POSITIONS_DYN], pl.FP32],
-    output: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Score candidates from the device-visible pool."""
-    _score_select_pool(
-        query, query_scale, weights, index_cache, index_cache_scale,
-        block_table, request_ids, lengths, pool_block_ids, pool_block_counts, scores, output,
-        num_tokens,
-    )
-    return output
-
-
-@pl.jit.inline(auto_scope=False)
-def _score_select_pool(
-    query: pl.Tensor[[T_DYN, INDEX_H * INDEX_DIM // 2], pl.UINT8],
-    query_scale: pl.Tensor[[T_DYN, INDEX_H * _SCALE_COUNT], pl.FP8E8M0],
-    weights: pl.Tensor[[T_DYN, INDEX_H], pl.BF16],
-    index_cache: pl.Tensor,
-    index_cache_scale: pl.Tensor,
-    block_table: pl.Tensor,
-    request_ids: pl.Tensor,
-    lengths: pl.Tensor,
-    pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
-    pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
-    scores: pl.Tensor[[T_DYN, INDEX_POOL_POSITIONS_DYN], pl.FP32],
     output: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ):

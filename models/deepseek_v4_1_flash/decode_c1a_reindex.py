@@ -117,17 +117,15 @@ def decode_c1a_reindex(
         window_slots, window_cache,
         num_tokens,
     )
-    score_width = pl.tensor.dim(pool_block_ids, 1) * 8
     index_query, index_query_scale, index_weights = c1a_index(
         x_norm, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
         num_tokens,
         qb_payload, qb_scales,
     )
-    scores = pl.create_tensor([tokens, score_width], dtype=pl.FP32)
     score_select_reindex(
         index_query, index_query_scale, index_weights, index_cache, index_cache_scale,
         index_block_table, request_ids, compressed_lens, pool_block_ids, pool_block_counts,
-        scores, topk_indices, num_tokens,
+        topk_indices, num_tokens,
     )
     attn_out = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     gather_sparse_attention(
