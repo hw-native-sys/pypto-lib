@@ -397,8 +397,7 @@ def markov_sample_test(
     )
 
 
-@pl.jit(auto_scope=False)
-def l2_markov_output(
+def _markov_output(
     draft_x_hc: pl.Tensor[[MOE_TOKENS, HC_MULT, D], pl.FP32],
     draft_pre_mix: pl.Tensor[[MOE_TOKENS, HC_MULT], pl.FP32],
     head_hidden: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16]],
@@ -453,6 +452,10 @@ def l2_markov_output(
         confidence_weight, draft_ids, confidences,
     )
     return draft_ids, confidences
+
+
+markov_output = pl.jit.inline(auto_scope=False)(_markov_output)
+l2_markov_output = pl.jit(auto_scope=False)(_markov_output)
 
 
 @pl.jit.host

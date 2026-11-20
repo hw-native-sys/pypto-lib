@@ -157,6 +157,7 @@ and [golden harness](../../run-and-validate/golden-harness.md) for artifact and
 comparison behavior. Standalone operators compare against Torch references.
 The prefill, decode, DSpark decode, and drafter smoke entries use `golden.run`
 without a numerical golden. Multi-stage initialization is owned by `dspark_init.py`.
+The [terminal-prefill bootstrap composite](dspark-bootstrap.md) provides a single-L2 handoff.
 Forward smoke fixtures exercise composition and execution; they do not establish
 checkpoint-level generation accuracy or a complete numerical forward golden.
 The configured context ceiling and supported parallel-size choices are not a

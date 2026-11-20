@@ -65,8 +65,7 @@ ROPE_ROWS_DYN = pl.dynamic("DSPARK_ROPE_ROWS_DYN")
 
 
 
-@pl.jit
-def bootstrap_inputs_rank(
+def _bootstrap_inputs(
     slot_ids: pl.Tensor[[DECODE_BATCH], pl.INT32],
     generations: pl.Tensor[[DECODE_BATCH], pl.INT32],
     prompt_lengths: pl.Tensor[[DECODE_BATCH], pl.INT32],
@@ -97,6 +96,10 @@ def bootstrap_inputs_rank(
     return next_prefill_tokens, first_query_positions
 
 
+bootstrap_inputs = pl.jit.inline(auto_scope=False)(_bootstrap_inputs)
+bootstrap_inputs_rank = pl.jit(_bootstrap_inputs)
+
+
 @pl.jit.host
 def l3_bootstrap_inputs(
     slot_ids: pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32],
@@ -117,8 +120,7 @@ def l3_bootstrap_inputs(
         )
 
 
-@pl.jit
-def publish_bootstrap_rank(
+def _publish_bootstrap(
     slot_ids: pl.Tensor[[DECODE_BATCH], pl.INT32],
     generations: pl.Tensor[[DECODE_BATCH], pl.INT32],
     prompt_lengths: pl.Tensor[[DECODE_BATCH], pl.INT32],
@@ -157,6 +159,10 @@ def publish_bootstrap_rank(
     return state_tokens, state_meta
 
 
+publish_bootstrap = pl.jit.inline(auto_scope=False)(_publish_bootstrap)
+publish_bootstrap_rank = pl.jit(_publish_bootstrap)
+
+
 @pl.jit.host
 def l3_publish_bootstrap(
     slot_ids: pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32],
@@ -177,8 +183,7 @@ def l3_publish_bootstrap(
         )
 
 
-@pl.jit
-def prepare_prefill_drafter_geometry_rank(
+def _prepare_prefill_drafter_geometry(
     positions: pl.Tensor[[T_DYN], pl.INT32],
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
     num_tokens: pl.Tensor[[1], pl.INT32],
@@ -241,6 +246,10 @@ def prepare_prefill_drafter_geometry_rank(
                     pl.write(query_rope_cos, [row, col], cos)
                     pl.write(query_rope_sin, [row, col], sin)
     return context_slots, context_rope_cos, context_rope_sin, query_rope_cos, query_rope_sin
+
+
+prepare_prefill_drafter_geometry = pl.jit.inline(auto_scope=False)(_prepare_prefill_drafter_geometry)
+prepare_prefill_drafter_geometry_rank = pl.jit(_prepare_prefill_drafter_geometry)
 
 
 @pl.jit.host
