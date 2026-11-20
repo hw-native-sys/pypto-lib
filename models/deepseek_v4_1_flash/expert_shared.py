@@ -15,8 +15,6 @@ from pathlib import Path
 
 import pypto.language as pl
 
-from pypto.runtime import pto_isa_include_dir
-
 import config
 
 
@@ -82,25 +80,6 @@ assert GATE_UP_N % W13_N_TILE == 0
 assert MOE_INTER % W2_K_TILE == 0
 assert D % W2_N_TILE == 0
 assert W2_M_TILE % 16 == 0
-
-
-@pl.jit.extern(
-    core_type="aic",
-    source=Path(__file__).parent / "kernels" / "expert_shared_w13.cpp",
-    include_dirs=(pto_isa_include_dir(),),
-)
-def _shared_w13_mm(
-    x_local: pl.Tensor,
-    x_local_scale: pl.Tensor,
-    shared_w1: pl.Tensor,
-    shared_w1_scale: pl.Tensor,
-    shared_w3: pl.Tensor,
-    shared_w3_scale: pl.Tensor,
-    gate_up: pl.Out[pl.Tensor],
-    rows: pl.Scalar[pl.INDEX],
-) -> pl.Tensor:
-    """Project ND MXFP8 activations with ND weights and resident MX scales."""
-    ...
 
 
 @pl.jit.inline(auto_scope=False)
@@ -572,7 +551,7 @@ def shared_w13_pypto(
     """Project MXFP8 activations into concatenated BF16 W1 and W3 panels."""
     x, x_scale = _W13_INPUTS(x_local, x_local_scale)
     workers = pl.min(W13_GROUPS * (GATE_UP_N // W13_N_TILE), W13_WORKER_TILE)
-    with pl.spmd(workers, name_hint="sh_w13_pypto"):
+    with pl.spmd(workers, name_hint="sh_w13_mx_mm"):
         gate_up = _shared_w13_mm_pypto(x, x_scale, shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, gate_up)
     return gate_up
 
@@ -595,14 +574,9 @@ def expert_shared(
     """Shared expert with device MXFP8 activation quantization before both projections."""
     # Merged W1/W3 projection into BF16 gate/up columns.
     gate_up = pl.create_tensor([T_PAD, GATE_UP_N], dtype=pl.BF16)
-    x_w13, x_w13_scale = _W13_INPUTS(x_local, x_local_scale)
-    w13_workers = pl.min(W13_GROUPS * (GATE_UP_N // W13_N_TILE), W13_WORKER_TILE)
-    with pl.spmd(w13_workers, name_hint="sh_w13_mx_mm"):
-        gate_up = _shared_w13_mm(
-            x_w13, x_w13_scale,
-            shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-            gate_up, T_PAD,
-        )
+    gate_up = shared_w13_pypto(
+        x_local, x_local_scale, shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, gate_up,
+    )
 
     # FP32 SwiGLU, FP8 payload, and packed MX_A_ZZ scales.
     h_tile_mx = pl.create_tensor([T_PAD, MOE_INTER], dtype=pl.FP8E4M3FN)
