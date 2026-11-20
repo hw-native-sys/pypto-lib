@@ -10,6 +10,8 @@
 # VPTO register helpers require real A5 device execution.
 """V4.1 inverse RoPE, grouped W8A8 MXFP8 output projection, and HC post."""
 
+from __future__ import annotations
+
 from pathlib import Path
 
 import torch
@@ -42,6 +44,7 @@ HC_MULT = M.hc_mult
 HC_DIM = M.hc_dim
 
 
+O_QUANT_SCALE_VIEW_ROWS = pl.dynamic("O_QUANT_SCALE_VIEW_ROWS")
 O_GROUP_ROWS = pl.dynamic("O_GROUP_ROWS")
 O_PAD_ROWS = pl.dynamic("O_PAD_ROWS")
 O_IN_SCALE_COLS = pl.dynamic("O_IN_SCALE_COLS")
@@ -54,23 +57,492 @@ O_B_N_TILE = 160
 
 # Output-quantization tiles and scheduling.
 O_QUANT_ROW_TILE = 80
+O_QUANT_PREFETCH_ROW_TILE = 64
 O_QUANT_HEADS_PER_GROUP = 8
 O_QUANT_LANES = 64                      # FP32 lanes in one 256-byte vector register
 O_QUANT_SCALE_GROUPS = HEAD_DIM // 32
 O_QUANT_SCALE_BLOCK = 16                # rows sharing one packed scale row
 O_QUANT_SCALE_COLS = 256                # scale bytes per block row and head
-# Shapes that index a Tile must reach the op as Python integers. A name bound
-# inside a traced body is an IR expression even when its value is constant, and
-# reg.load / reg.gather then reject it with "Tile dimension must be a static
-# integer in P0", so every derived extent below stays at module level.
 O_QUANT_HEADS = LOCAL_O_GROUPS * O_QUANT_HEADS_PER_GROUP
 O_QUANT_ROPE_PAIRS = ROPE_DIM // 2
 O_QUANT_ROPE_UNROLL = 8
 O_QUANT_ROPE_START = HEAD_DIM - ROPE_DIM
-O_QUANT_TRIG_TILE = O_QUANT_ROW_TILE * O_QUANT_ROPE_PAIRS
-O_QUANT_VALUE_TILE = O_QUANT_ROW_TILE * HEAD_DIM
-O_QUANT_SCALE_COUNT = O_QUANT_ROW_TILE * O_QUANT_SCALE_GROUPS
-O_QUANT_SCALE_PACK_TMP = ((64 + O_QUANT_SCALE_COUNT // O_QUANT_SCALE_BLOCK + 31) // 32) * 32
+
+
+@pl.jit.inline(auto_scope=False)
+def _load_o_quant_inputs(
+    tile_rows: pl.constexpr,
+    attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    cosine: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    sine: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    t0: pl.Scalar[pl.INDEX],
+    head: pl.Scalar[pl.INDEX],
+    rows: pl.Scalar[pl.INDEX],
+):
+    # Load the activation and trigonometric values for the active rows.
+    window = pl.load(
+        attended, [t0, head * HEAD_DIM], [tile_rows, HEAD_DIM],
+        valid_shape=[rows, HEAD_DIM], target_memory=pl.MemorySpace.Vec,
+    )
+    cos_tile = pl.load(
+        cosine, [t0, 0], [tile_rows, O_QUANT_ROPE_PAIRS],
+        valid_shape=[rows, O_QUANT_ROPE_PAIRS], target_memory=pl.MemorySpace.Vec,
+    )
+    sin_tile = pl.load(
+        sine, [t0, 0], [tile_rows, O_QUANT_ROPE_PAIRS],
+        valid_shape=[rows, O_QUANT_ROPE_PAIRS], target_memory=pl.MemorySpace.Vec,
+    )
+    return window, cos_tile, sin_tile
+
+
+# Tile dimensions bind to the constexpr row count during specialization.
+@pl.jit.inline(auto_scope=False)
+def _quantize_o_tile(
+    tile_rows: pl.constexpr,
+    full_tile: pl.constexpr,
+    window: pl.Tile[[tile_rows, HEAD_DIM], pl.BF16, pl.Mem.Vec],  # noqa: F821
+    cos_tile: pl.Tile[[tile_rows, O_QUANT_ROPE_PAIRS], pl.FP32, pl.Mem.Vec],  # noqa: F821
+    sin_tile: pl.Tile[[tile_rows, O_QUANT_ROPE_PAIRS], pl.FP32, pl.Mem.Vec],  # noqa: F821
+    rows: pl.Scalar[pl.INDEX],
+    capacity: pl.Scalar[pl.INDEX],
+    t0: pl.Scalar[pl.INDEX],
+    group: pl.Scalar[pl.INDEX],
+    local_head: pl.Scalar[pl.INDEX],
+    padded_rows: pl.Scalar[pl.INDEX],
+    scale_block_rows: pl.Scalar[pl.INDEX],
+    payload: pl.Tensor[[O_GROUP_ROWS, O_GROUP_IN], pl.FP8E4M3FN],
+    scale_view: pl.Tensor[[O_QUANT_SCALE_VIEW_ROWS, O_QUANT_HEADS_PER_GROUP * O_QUANT_SCALE_COLS], pl.FP8E8M0],
+):
+    # A full load initializes the whole tile.
+    if full_tile:
+        padded = window
+    else:
+        padded = pl.fillpad(window, pad_value=pl.PadValue.zero)
+    # Register addressing uses flat tile shapes. Only active rows use the trig data.
+    value = pl.tile.reshape(
+        pl.tile.set_validshape(padded, tile_rows, HEAD_DIM),
+        [(tile_rows * HEAD_DIM)],
+    )
+    cos_flat = pl.tile.reshape(
+        pl.tile.set_validshape(cos_tile, tile_rows, O_QUANT_ROPE_PAIRS),
+        [(tile_rows * O_QUANT_ROPE_PAIRS)],
+    )
+    sin_flat = pl.tile.reshape(
+        pl.tile.set_validshape(sin_tile, tile_rows, O_QUANT_ROPE_PAIRS),
+        [(tile_rows * O_QUANT_ROPE_PAIRS)],
+    )
+    # Rotate the trailing BF16 pairs and round back to BF16.
+    with pl.reg_scope():
+        full = pl.reg.full_mask(lanes=O_QUANT_LANES)
+        lane = pl.reg.index_gen(0, lanes=O_QUANT_LANES, dtype=pl.UINT32)
+        one = pl.reg.broadcast(1, lanes=O_QUANT_LANES, dtype=pl.UINT32)
+        # ix1 is the partner lane of each (real, imaginary) pair, and
+        # pair_index the trig element both lanes of a pair share.
+        tmp = pl.reg.shift_rights(lane, 1, full)
+        tmp = pl.reg.shift_lefts(tmp, 1, full)
+        tmp = pl.reg.sub(lane, tmp)
+        tmp = pl.reg.shift_lefts(tmp, 1, full)
+        ix1 = pl.reg.add(lane, one)
+        ix1 = pl.reg.sub(ix1, tmp)
+        pair_index = pl.reg.shift_rights(lane, 1, full)
+        even = pl.reg.compare(ix1, lane, full, predicate="gt")
+        # Read the eight input rows before writing their rounded RoPE tails.
+        # This shares the load-to-store synchronization across the group.
+        for row_group in pl.hardware_loop(rows // O_QUANT_ROPE_UNROLL):
+            row0 = row_group * O_QUANT_ROPE_UNROLL
+            value_offset0 = row0 * HEAD_DIM + O_QUANT_ROPE_START
+            trig_base0 = row0 * O_QUANT_ROPE_PAIRS
+            cosine0 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base0)
+            sine0 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base0)
+            raw0 = pl.reg.load(value, offset=value_offset0, lanes=O_QUANT_LANES)
+            row1 = row_group * O_QUANT_ROPE_UNROLL + 1
+            value_offset1 = row1 * HEAD_DIM + O_QUANT_ROPE_START
+            trig_base1 = row1 * O_QUANT_ROPE_PAIRS
+            cosine1 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base1)
+            sine1 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base1)
+            raw1 = pl.reg.load(value, offset=value_offset1, lanes=O_QUANT_LANES)
+            row2 = row_group * O_QUANT_ROPE_UNROLL + 2
+            value_offset2 = row2 * HEAD_DIM + O_QUANT_ROPE_START
+            trig_base2 = row2 * O_QUANT_ROPE_PAIRS
+            cosine2 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base2)
+            sine2 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base2)
+            raw2 = pl.reg.load(value, offset=value_offset2, lanes=O_QUANT_LANES)
+            row3 = row_group * O_QUANT_ROPE_UNROLL + 3
+            value_offset3 = row3 * HEAD_DIM + O_QUANT_ROPE_START
+            trig_base3 = row3 * O_QUANT_ROPE_PAIRS
+            cosine3 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base3)
+            sine3 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base3)
+            raw3 = pl.reg.load(value, offset=value_offset3, lanes=O_QUANT_LANES)
+            row4 = row_group * O_QUANT_ROPE_UNROLL + 4
+            value_offset4 = row4 * HEAD_DIM + O_QUANT_ROPE_START
+            trig_base4 = row4 * O_QUANT_ROPE_PAIRS
+            cosine4 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base4)
+            sine4 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base4)
+            raw4 = pl.reg.load(value, offset=value_offset4, lanes=O_QUANT_LANES)
+            row5 = row_group * O_QUANT_ROPE_UNROLL + 5
+            value_offset5 = row5 * HEAD_DIM + O_QUANT_ROPE_START
+            trig_base5 = row5 * O_QUANT_ROPE_PAIRS
+            cosine5 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base5)
+            sine5 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base5)
+            raw5 = pl.reg.load(value, offset=value_offset5, lanes=O_QUANT_LANES)
+            row6 = row_group * O_QUANT_ROPE_UNROLL + 6
+            value_offset6 = row6 * HEAD_DIM + O_QUANT_ROPE_START
+            trig_base6 = row6 * O_QUANT_ROPE_PAIRS
+            cosine6 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base6)
+            sine6 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base6)
+            raw6 = pl.reg.load(value, offset=value_offset6, lanes=O_QUANT_LANES)
+            row7 = row_group * O_QUANT_ROPE_UNROLL + 7
+            value_offset7 = row7 * HEAD_DIM + O_QUANT_ROPE_START
+            trig_base7 = row7 * O_QUANT_ROPE_PAIRS
+            cosine7 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base7)
+            sine7 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base7)
+            raw7 = pl.reg.load(value, offset=value_offset7, lanes=O_QUANT_LANES)
+
+            sine_negative0 = pl.reg.muls(sine0, -1.0, full)
+            rotated0 = pl.reg.convert(raw0, dtype=pl.FP32)
+            swapped0 = pl.reg.gather_lanes(rotated0, ix1)
+            scaled_real0 = pl.reg.mul(rotated0, cosine0)
+            scaled_imag0 = pl.reg.mul(swapped0, sine_negative0)
+            real0 = pl.reg.sub(scaled_real0, scaled_imag0)
+            imag0 = pl.reg.add(scaled_imag0, scaled_real0)
+            result0 = pl.reg.select(even, real0, imag0)
+            tail0 = pl.reg.convert(result0, dtype=pl.BF16, rounding="R", saturate=False)
+            sine_negative1 = pl.reg.muls(sine1, -1.0, full)
+            rotated1 = pl.reg.convert(raw1, dtype=pl.FP32)
+            swapped1 = pl.reg.gather_lanes(rotated1, ix1)
+            scaled_real1 = pl.reg.mul(rotated1, cosine1)
+            scaled_imag1 = pl.reg.mul(swapped1, sine_negative1)
+            real1 = pl.reg.sub(scaled_real1, scaled_imag1)
+            imag1 = pl.reg.add(scaled_imag1, scaled_real1)
+            result1 = pl.reg.select(even, real1, imag1)
+            tail1 = pl.reg.convert(result1, dtype=pl.BF16, rounding="R", saturate=False)
+            sine_negative2 = pl.reg.muls(sine2, -1.0, full)
+            rotated2 = pl.reg.convert(raw2, dtype=pl.FP32)
+            swapped2 = pl.reg.gather_lanes(rotated2, ix1)
+            scaled_real2 = pl.reg.mul(rotated2, cosine2)
+            scaled_imag2 = pl.reg.mul(swapped2, sine_negative2)
+            real2 = pl.reg.sub(scaled_real2, scaled_imag2)
+            imag2 = pl.reg.add(scaled_imag2, scaled_real2)
+            result2 = pl.reg.select(even, real2, imag2)
+            tail2 = pl.reg.convert(result2, dtype=pl.BF16, rounding="R", saturate=False)
+            sine_negative3 = pl.reg.muls(sine3, -1.0, full)
+            rotated3 = pl.reg.convert(raw3, dtype=pl.FP32)
+            swapped3 = pl.reg.gather_lanes(rotated3, ix1)
+            scaled_real3 = pl.reg.mul(rotated3, cosine3)
+            scaled_imag3 = pl.reg.mul(swapped3, sine_negative3)
+            real3 = pl.reg.sub(scaled_real3, scaled_imag3)
+            imag3 = pl.reg.add(scaled_imag3, scaled_real3)
+            result3 = pl.reg.select(even, real3, imag3)
+            tail3 = pl.reg.convert(result3, dtype=pl.BF16, rounding="R", saturate=False)
+            sine_negative4 = pl.reg.muls(sine4, -1.0, full)
+            rotated4 = pl.reg.convert(raw4, dtype=pl.FP32)
+            swapped4 = pl.reg.gather_lanes(rotated4, ix1)
+            scaled_real4 = pl.reg.mul(rotated4, cosine4)
+            scaled_imag4 = pl.reg.mul(swapped4, sine_negative4)
+            real4 = pl.reg.sub(scaled_real4, scaled_imag4)
+            imag4 = pl.reg.add(scaled_imag4, scaled_real4)
+            result4 = pl.reg.select(even, real4, imag4)
+            tail4 = pl.reg.convert(result4, dtype=pl.BF16, rounding="R", saturate=False)
+            sine_negative5 = pl.reg.muls(sine5, -1.0, full)
+            rotated5 = pl.reg.convert(raw5, dtype=pl.FP32)
+            swapped5 = pl.reg.gather_lanes(rotated5, ix1)
+            scaled_real5 = pl.reg.mul(rotated5, cosine5)
+            scaled_imag5 = pl.reg.mul(swapped5, sine_negative5)
+            real5 = pl.reg.sub(scaled_real5, scaled_imag5)
+            imag5 = pl.reg.add(scaled_imag5, scaled_real5)
+            result5 = pl.reg.select(even, real5, imag5)
+            tail5 = pl.reg.convert(result5, dtype=pl.BF16, rounding="R", saturate=False)
+            sine_negative6 = pl.reg.muls(sine6, -1.0, full)
+            rotated6 = pl.reg.convert(raw6, dtype=pl.FP32)
+            swapped6 = pl.reg.gather_lanes(rotated6, ix1)
+            scaled_real6 = pl.reg.mul(rotated6, cosine6)
+            scaled_imag6 = pl.reg.mul(swapped6, sine_negative6)
+            real6 = pl.reg.sub(scaled_real6, scaled_imag6)
+            imag6 = pl.reg.add(scaled_imag6, scaled_real6)
+            result6 = pl.reg.select(even, real6, imag6)
+            tail6 = pl.reg.convert(result6, dtype=pl.BF16, rounding="R", saturate=False)
+            sine_negative7 = pl.reg.muls(sine7, -1.0, full)
+            rotated7 = pl.reg.convert(raw7, dtype=pl.FP32)
+            swapped7 = pl.reg.gather_lanes(rotated7, ix1)
+            scaled_real7 = pl.reg.mul(rotated7, cosine7)
+            scaled_imag7 = pl.reg.mul(swapped7, sine_negative7)
+            real7 = pl.reg.sub(scaled_real7, scaled_imag7)
+            imag7 = pl.reg.add(scaled_imag7, scaled_real7)
+            result7 = pl.reg.select(even, real7, imag7)
+            tail7 = pl.reg.convert(result7, dtype=pl.BF16, rounding="R", saturate=False)
+
+            _rotated0 = pl.reg.store(value, offset=value_offset0, value=tail0)
+            _rotated1 = pl.reg.store(value, offset=value_offset1, value=tail1)
+            _rotated2 = pl.reg.store(value, offset=value_offset2, value=tail2)
+            _rotated3 = pl.reg.store(value, offset=value_offset3, value=tail3)
+            _rotated4 = pl.reg.store(value, offset=value_offset4, value=tail4)
+            _rotated5 = pl.reg.store(value, offset=value_offset5, value=tail5)
+            _rotated6 = pl.reg.store(value, offset=value_offset6, value=tail6)
+            _rotated7 = pl.reg.store(value, offset=value_offset7, value=tail7)
+
+        for remainder_row in pl.hardware_loop(rows % O_QUANT_ROPE_UNROLL):
+            row = rows // O_QUANT_ROPE_UNROLL * O_QUANT_ROPE_UNROLL + remainder_row
+            # Match vgather2(cos/sin + row * 32, pair_index, all).
+            trig_base = row * O_QUANT_ROPE_PAIRS
+            cosine_v = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base)
+            sine_v = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base)
+            sine_v = pl.reg.muls(sine_v, -1.0, full)
+            raw = pl.reg.load(value, offset=row * HEAD_DIM + O_QUANT_ROPE_START, lanes=O_QUANT_LANES)
+            rotated = pl.reg.convert(raw, dtype=pl.FP32)
+            swapped = pl.reg.gather_lanes(rotated, ix1)
+            scaled_real = pl.reg.mul(rotated, cosine_v)
+            scaled_imag = pl.reg.mul(swapped, sine_v)
+            real = pl.reg.sub(scaled_real, scaled_imag)
+            imag = pl.reg.add(scaled_imag, scaled_real)
+            rotated = pl.reg.select(even, real, imag)
+            raw = pl.reg.convert(rotated, dtype=pl.BF16, rounding="R", saturate=False)
+            _rotated = pl.reg.store(value, offset=row * HEAD_DIM + O_QUANT_ROPE_START, value=raw)
+
+    full_rows = pl.tile.reshape(value, [tile_rows, HEAD_DIM])
+    max_workspace = pl.create_tile([1, (tile_rows * O_QUANT_SCALE_GROUPS)], dtype=pl.BF16)
+    scale_workspace = pl.create_tile([1, (tile_rows * O_QUANT_SCALE_GROUPS)], dtype=pl.BF16)
+    payload_bytes, exponents = pl.tile.quant_mx_raw(full_rows, max_workspace, scale_workspace, group_axis=1)
+    # Pack scales while the payload tile is live so scale packing
+    # can start before the payload writeback.
+    zz_tmp = pl.create_tile([1, (((64 + tile_rows * O_QUANT_SCALE_GROUPS // O_QUANT_SCALE_BLOCK + 31) // 32) * 32)], dtype=pl.UINT8)
+    packed_scale = pl.tmov_x2zz(
+        exponents, zz_tmp, group_axis=1, dst_rows=tile_rows, dst_cols=O_QUANT_SCALE_GROUPS,
+    )
+    scale_tile = pl.tile.reinterpret_view(packed_scale, pl.FP8E8M0)
+    scale_tile = pl.reshape(scale_tile, [tile_rows // O_QUANT_SCALE_BLOCK, O_QUANT_SCALE_COLS])
+    scale_tile = pl.tile.set_validshape(
+        scale_tile, capacity // O_QUANT_SCALE_BLOCK, O_QUANT_SCALE_COLS
+    )
+    pl.store(
+        scale_tile,
+        [
+            group * scale_block_rows + t0 // O_QUANT_SCALE_BLOCK,
+            local_head * O_QUANT_SCALE_COLS,
+        ],
+        scale_view,
+    )
+
+    # TQUANT uses a finite reciprocal for scale code zero. Preserve the
+    # projection contract by clearing magnitude bits in those groups.
+    if rows > 0:
+        exponent_words = pl.reinterpret_view(exponents, pl.UINT32, shape=[(tile_rows * O_QUANT_SCALE_GROUPS) // 4])
+        flag = pl.create_tile([1, 64], dtype=pl.UINT32, target_memory=pl.MemorySpace.Vec)
+        flat_flag = pl.reshape(flag, [64])
+        with pl.reg_scope():
+            word_count = rows * (O_QUANT_SCALE_GROUPS // 4)
+            all_code_words = pl.reg.full_mask(lanes=64)
+            one_per_byte = pl.reg.broadcast(0x01010101, lanes=64, dtype=pl.UINT32)
+            top_bits = pl.reg.broadcast(0x80808080, lanes=64, dtype=pl.UINT32)
+            zero_flags = pl.reg.broadcast(0, lanes=64, dtype=pl.UINT32)
+            scan_blocks = (word_count + 63) // 64
+            for scan, (found,) in pl.hardware_loop(scan_blocks, init_values=(zero_flags,)):
+                start_word = scan * 64
+                valid_words = pl.reg.active_mask(pl.min(word_count - start_word, 64), lanes=64)
+                codes = pl.reg.load(exponent_words, start_word, lanes=64)
+                # This expression detects zero bytes in the active words.
+                decremented = pl.reg.sub(codes, one_per_byte, valid_words)
+                inverse_codes = pl.reg.bitwise_not(codes, valid_words)
+                byte_flags = pl.reg.bitwise_and(decremented, inverse_codes, valid_words)
+                byte_flags = pl.reg.bitwise_and(byte_flags, top_bits, valid_words)
+                found = pl.yield_(pl.reg.bitwise_or(found, byte_flags, all_code_words))
+            any_zero = pl.reg.reduce_max(found, all_code_words)
+            flag_words = pl.reg.group_broadcast(any_zero, lanes=64)
+            _scan = pl.reg.store(flat_flag, 0, flag_words)
+        if pl.tile.read(flag, [0, 0]) != 0:
+            words = pl.reinterpret_view(payload_bytes, pl.UINT32, shape=[(tile_rows * HEAD_DIM) // 4])
+            with pl.reg_scope():
+                groups = pl.reg.full_mask(lanes=8)
+                scale_index = pl.reg.index_gen(0, lanes=8, dtype=pl.UINT16)
+                keep = pl.reg.broadcast(0xFFFFFFFF, lanes=8, dtype=pl.UINT32)
+                sign = pl.reg.broadcast(0x80808080, lanes=8, dtype=pl.UINT32)
+                full_words = pl.reg.full_mask(lanes=64)
+                for block in pl.hardware_loop(rows * 2):
+                    index = pl.cast(block * 8, pl.INDEX)
+                    scale = pl.reg.gather(exponents, scale_index, groups, base_offset=index)
+                    scale_u32 = pl.reg.convert(scale, dtype=pl.UINT32)
+                    nonzero = pl.reg.compares(scale_u32, 0, groups, predicate="ne")
+                    byte_mask = pl.reg.select(nonzero, keep, sign)
+                    word_mask = pl.reg.group_broadcast(byte_mask, lanes=64)
+                    offset = block * 64
+                    value_words = pl.reg.load(words, offset, lanes=64)
+                    zeroed_words = pl.reg.bitwise_and(value_words, word_mask, full_words)
+                    _payload_words = pl.reg.store(words, offset, zeroed_words)
+    payload_tile = pl.tile.reinterpret_view(payload_bytes, pl.FP8E4M3FN)
+    payload_tile = pl.tile.set_validshape(payload_tile, capacity, HEAD_DIM)
+    pl.store(payload_tile, [group * padded_rows + t0, local_head * HEAD_DIM], payload)
+    return payload
+
+
+@pl.jit.inline(auto_scope=False)
+def _quant_o_vf_schedule(
+    tile_rows: pl.constexpr,
+    prefetch_tiles: pl.constexpr,
+    attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    cosine: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    sine: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    payload: pl.Out[pl.Tensor[[O_GROUP_ROWS, O_GROUP_IN], pl.FP8E4M3FN]],
+    scales: pl.Out[pl.Tensor[[LOCAL_O_GROUPS, O_IN_SCALE_COLS], pl.FP8E8M0]],
+    active_rows: pl.Scalar[pl.INT32],
+    padded_rows: pl.Scalar[pl.INDEX],
+):
+    """Inverse-rotate BF16 tails and produce grouped MXFP8 payload and scales."""
+    scale_block_rows = padded_rows // O_QUANT_SCALE_BLOCK
+    # scale_gm walks 2048-byte block rows inside one group. Expose that stride as
+    # a tensor view so the tile store can write an ordinary 2D slice.
+    # Form the view before pl.spmd.
+    scale_stride = O_QUANT_HEADS_PER_GROUP * O_QUANT_SCALE_COLS
+    scale_view = pl.reshape(scales, [LOCAL_O_GROUPS * pl.tensor.dim(scales, 1) // scale_stride, scale_stride])
+    workers = pl.max(1, pl.min(O_QUANT_HEADS, 2 * pl.system.available_cluster_count()))
+    with pl.spmd(workers, name_hint="quant_o_vf_pypto") as published:
+        worker = pl.tile.get_block_idx()
+        worker_count = pl.tile.get_block_num()
+        row_blocks = (padded_rows + tile_rows - 1) // tile_rows
+        if prefetch_tiles > 0:
+            # Start with two loads, then load one additional tile after each quantization.
+            for head in pl.range(worker, O_QUANT_HEADS, worker_count):
+                group = head // O_QUANT_HEADS_PER_GROUP
+                local_head = head % O_QUANT_HEADS_PER_GROUP
+                full_rows = pl.max(0, pl.min(pl.cast(active_rows, pl.INDEX), padded_rows))
+                prefetch_groups = full_rows // (tile_rows * prefetch_tiles)
+                for prefetch_group in pl.range(prefetch_groups):
+                    t_full0 = prefetch_group * prefetch_tiles * tile_rows
+                    window_full0, cosine_full0, sine_full0 = _load_o_quant_inputs(
+                        tile_rows, attended, cosine, sine, t_full0, head, tile_rows,
+                    )
+                    t_full1 = t_full0 + tile_rows
+                    window_full1, cosine_full1, sine_full1 = _load_o_quant_inputs(
+                        tile_rows, attended, cosine, sine, t_full1, head, tile_rows,
+                    )
+                    _quantize_o_tile(
+                        tile_rows, True, window_full0, cosine_full0, sine_full0, tile_rows, tile_rows, t_full0,
+                        group, local_head, padded_rows, scale_block_rows, payload, scale_view,
+                    )
+                    t_full2 = t_full0 + 2 * tile_rows
+                    window_full2, cosine_full2, sine_full2 = _load_o_quant_inputs(
+                        tile_rows, attended, cosine, sine, t_full2, head, tile_rows,
+                    )
+                    _quantize_o_tile(
+                        tile_rows, True, window_full1, cosine_full1, sine_full1, tile_rows, tile_rows, t_full1,
+                        group, local_head, padded_rows, scale_block_rows, payload, scale_view,
+                    )
+                    t_full3 = t_full0 + 3 * tile_rows
+                    window_full3, cosine_full3, sine_full3 = _load_o_quant_inputs(
+                        tile_rows, attended, cosine, sine, t_full3, head, tile_rows,
+                    )
+                    _quantize_o_tile(
+                        tile_rows, True, window_full2, cosine_full2, sine_full2, tile_rows, tile_rows, t_full2,
+                        group, local_head, padded_rows, scale_block_rows, payload, scale_view,
+                    )
+                    if prefetch_tiles >= 5:
+                        t_full4 = t_full0 + 4 * tile_rows
+                        window_full4, cosine_full4, sine_full4 = _load_o_quant_inputs(
+                            tile_rows, attended, cosine, sine, t_full4, head, tile_rows,
+                        )
+                        _quantize_o_tile(
+                            tile_rows, True, window_full3, cosine_full3, sine_full3, tile_rows, tile_rows, t_full3,
+                            group, local_head, padded_rows, scale_block_rows, payload, scale_view,
+                        )
+                    if prefetch_tiles >= 6:
+                        t_full5 = t_full0 + 5 * tile_rows
+                        window_full5, cosine_full5, sine_full5 = _load_o_quant_inputs(
+                            tile_rows, attended, cosine, sine, t_full5, head, tile_rows,
+                        )
+                        _quantize_o_tile(
+                            tile_rows, True, window_full4, cosine_full4, sine_full4, tile_rows, tile_rows, t_full4,
+                            group, local_head, padded_rows, scale_block_rows, payload, scale_view,
+                        )
+                        if prefetch_tiles == 8:
+                            t_full6 = t_full0 + 6 * tile_rows
+                            window_full6, cosine_full6, sine_full6 = _load_o_quant_inputs(
+                                tile_rows, attended, cosine, sine, t_full6, head, tile_rows,
+                            )
+                            _quantize_o_tile(
+                                tile_rows, True, window_full5, cosine_full5, sine_full5, tile_rows, tile_rows, t_full5,
+                                group, local_head, padded_rows, scale_block_rows, payload, scale_view,
+                            )
+                            t_full7 = t_full0 + 7 * tile_rows
+                            window_full7, cosine_full7, sine_full7 = _load_o_quant_inputs(
+                                tile_rows, attended, cosine, sine, t_full7, head, tile_rows,
+                            )
+                            _quantize_o_tile(
+                                tile_rows, True, window_full6, cosine_full6, sine_full6, tile_rows, tile_rows, t_full6,
+                                group, local_head, padded_rows, scale_block_rows, payload, scale_view,
+                            )
+                            _quantize_o_tile(
+                                tile_rows, True, window_full7, cosine_full7, sine_full7, tile_rows, tile_rows, t_full7,
+                                group, local_head, padded_rows, scale_block_rows, payload, scale_view,
+                            )
+                        else:
+                            _quantize_o_tile(
+                                tile_rows, True, window_full5, cosine_full5, sine_full5, tile_rows, tile_rows, t_full5,
+                                group, local_head, padded_rows, scale_block_rows, payload, scale_view,
+                            )
+                    elif prefetch_tiles == 5:
+                        _quantize_o_tile(
+                            tile_rows, True, window_full4, cosine_full4, sine_full4, tile_rows, tile_rows, t_full4,
+                            group, local_head, padded_rows, scale_block_rows, payload, scale_view,
+                        )
+                    else:
+                        _quantize_o_tile(
+                            tile_rows, True, window_full3, cosine_full3, sine_full3, tile_rows, tile_rows, t_full3,
+                            group, local_head, padded_rows, scale_block_rows, payload, scale_view,
+                        )
+                # Short groups and partially filled tiles use the two-tile path.
+                full_blocks = prefetch_groups * prefetch_tiles
+                remaining_blocks = row_blocks - full_blocks
+                for tile_pair in pl.range(remaining_blocks // 2):
+                    t0 = (full_blocks + tile_pair * 2) * tile_rows
+                    capacity0 = pl.min(padded_rows - t0, tile_rows)
+                    rows0 = pl.cast(
+                        pl.max(0, pl.min(active_rows - pl.cast(t0, pl.INT32), pl.cast(capacity0, pl.INT32))), pl.INDEX,
+                    )
+                    window0, cosine0, sine0 = _load_o_quant_inputs(tile_rows, attended, cosine, sine, t0, head, rows0)
+                    t1 = t0 + tile_rows
+                    capacity1 = pl.min(padded_rows - t1, tile_rows)
+                    rows1 = pl.cast(
+                        pl.max(0, pl.min(active_rows - pl.cast(t1, pl.INT32), pl.cast(capacity1, pl.INT32))), pl.INDEX,
+                    )
+                    window1, cosine1, sine1 = _load_o_quant_inputs(tile_rows, attended, cosine, sine, t1, head, rows1)
+                    _quantize_o_tile(
+                        tile_rows, False,
+                        window0, cosine0, sine0, rows0, capacity0, t0, group, local_head,
+                        padded_rows, scale_block_rows, payload, scale_view,
+                    )
+                    _quantize_o_tile(
+                        tile_rows, False,
+                        window1, cosine1, sine1, rows1, capacity1, t1, group, local_head,
+                        padded_rows, scale_block_rows, payload, scale_view,
+                    )
+                if remaining_blocks % 2 != 0:
+                    t2 = (row_blocks - 1) * tile_rows
+                    capacity2 = pl.min(padded_rows - t2, tile_rows)
+                    rows2 = pl.cast(
+                        pl.max(0, pl.min(active_rows - pl.cast(t2, pl.INT32), pl.cast(capacity2, pl.INT32))), pl.INDEX,
+                    )
+                    window2, cosine2, sine2 = _load_o_quant_inputs(tile_rows, attended, cosine, sine, t2, head, rows2)
+                    _quantize_o_tile(
+                        tile_rows, False,
+                        window2, cosine2, sine2, rows2, capacity2, t2, group, local_head,
+                        padded_rows, scale_block_rows, payload, scale_view,
+                    )
+        else:
+            # PTOAS derives pipe synchronization from Tile and VF memory effects.
+            for work in pl.range(worker, row_blocks * O_QUANT_HEADS, worker_count):
+                head = work % O_QUANT_HEADS
+                t0 = (work // O_QUANT_HEADS) * tile_rows
+                capacity = pl.min(padded_rows - t0, tile_rows)
+                rows = pl.cast(
+                    pl.max(0, pl.min(active_rows - pl.cast(t0, pl.INT32), pl.cast(capacity, pl.INT32))),
+                    pl.INDEX,
+                )
+                group = head // O_QUANT_HEADS_PER_GROUP
+                local_head = head % O_QUANT_HEADS_PER_GROUP
+                window, cos_tile, sin_tile = _load_o_quant_inputs(tile_rows, attended, cosine, sine, t0, head, rows)
+                _quantize_o_tile(
+                    tile_rows, False, window, cos_tile, sin_tile, rows, capacity, t0, group, local_head,
+                    padded_rows, scale_block_rows, payload, scale_view,
+                )
+    return published
 
 
 @pl.jit.inline(auto_scope=False)
@@ -84,295 +556,28 @@ def quant_o_vf_pypto(
     padded_rows: pl.Scalar[pl.INDEX],
 ):
     """Inverse-rotate BF16 tails and produce grouped MXFP8 payload and scales."""
-    scale_block_rows = padded_rows // O_QUANT_SCALE_BLOCK
-    # scale_gm walks 2048-byte block rows inside one group. Expose that stride as
-    # a tensor view so the tile store stays an ordinary 2D slice; tensor-level
-    # views must be built before pl.spmd, where reshape would lower as a Tile op.
-    scale_view = pl.tensor.view(
-        scales, [LOCAL_O_GROUPS * scale_block_rows, O_QUANT_HEADS_PER_GROUP * O_QUANT_SCALE_COLS]
-    )
-    workers = pl.max(1, pl.min(O_QUANT_HEADS, 2 * pl.system.available_cluster_count()))
-    with pl.spmd(workers, name_hint="quant_o_vf_pypto") as published:
-        worker = pl.tile.get_block_idx()
-        worker_count = pl.tile.get_block_num()
-        row_blocks = (padded_rows + O_QUANT_ROW_TILE - 1) // O_QUANT_ROW_TILE
-        # PTOAS derives pipe synchronization from Tile and VF memory effects.
-        for work in pl.range(worker, row_blocks * O_QUANT_HEADS, worker_count):
-            head = work % O_QUANT_HEADS
-            t0 = (work // O_QUANT_HEADS) * O_QUANT_ROW_TILE
-            capacity = pl.min(padded_rows - t0, O_QUANT_ROW_TILE)
-            rows = pl.cast(
-                pl.max(0, pl.min(active_rows - pl.cast(t0, pl.INT32), pl.cast(capacity, pl.INT32))),
-                pl.INDEX,
-            )
-            group = head // O_QUANT_HEADS_PER_GROUP
-            local_head = head % O_QUANT_HEADS_PER_GROUP
-            # Load active rows and zero-fill the quantization tile.
-            window = pl.load(
-                attended, [t0, head * HEAD_DIM], [O_QUANT_ROW_TILE, HEAD_DIM],
-                valid_shape=[rows, HEAD_DIM], target_memory=pl.MemorySpace.Vec,
-            )
-            cos_tile = pl.load(
-                cosine, [t0, 0], [O_QUANT_ROW_TILE, O_QUANT_ROPE_PAIRS],
-                valid_shape=[rows, O_QUANT_ROPE_PAIRS], target_memory=pl.MemorySpace.Vec,
-            )
-            sin_tile = pl.load(
-                sine, [t0, 0], [O_QUANT_ROW_TILE, O_QUANT_ROPE_PAIRS],
-                valid_shape=[rows, O_QUANT_ROPE_PAIRS], target_memory=pl.MemorySpace.Vec,
-            )
-            padded = pl.fillpad(window, pad_value=pl.PadValue.zero)
-            # Register addressing uses flat tile shapes. Only active rows use the trig data.
-            value = pl.tile.reshape(
-                pl.tile.set_validshape(padded, O_QUANT_ROW_TILE, HEAD_DIM),
-                [O_QUANT_VALUE_TILE],
-            )
-            cos_flat = pl.tile.reshape(
-                pl.tile.set_validshape(cos_tile, O_QUANT_ROW_TILE, O_QUANT_ROPE_PAIRS),
-                [O_QUANT_TRIG_TILE],
-            )
-            sin_flat = pl.tile.reshape(
-                pl.tile.set_validshape(sin_tile, O_QUANT_ROW_TILE, O_QUANT_ROPE_PAIRS),
-                [O_QUANT_TRIG_TILE],
-            )
-            # Rotate the trailing BF16 pairs and round back to BF16.
-            with pl.reg_scope():
-                full = pl.reg.full_mask(lanes=O_QUANT_LANES)
-                lane = pl.reg.index_gen(0, lanes=O_QUANT_LANES, dtype=pl.UINT32)
-                one = pl.reg.broadcast(1, lanes=O_QUANT_LANES, dtype=pl.UINT32)
-                # ix1 is the partner lane of each (real, imaginary) pair, and
-                # pair_index the trig element both lanes of a pair share.
-                tmp = pl.reg.shift_rights(lane, 1, full)
-                tmp = pl.reg.shift_lefts(tmp, 1, full)
-                tmp = pl.reg.sub(lane, tmp)
-                tmp = pl.reg.shift_lefts(tmp, 1, full)
-                ix1 = pl.reg.add(lane, one)
-                ix1 = pl.reg.sub(ix1, tmp)
-                pair_index = pl.reg.shift_rights(lane, 1, full)
-                even = pl.reg.compare(ix1, lane, full, predicate="gt")
-                # Read the eight input rows before writing their rounded RoPE tails.
-                # This shares the load-to-store synchronization across the group.
-                for row_group in pl.hardware_loop(rows // O_QUANT_ROPE_UNROLL):
-                    row0 = row_group * O_QUANT_ROPE_UNROLL
-                    value_offset0 = row0 * HEAD_DIM + O_QUANT_ROPE_START
-                    trig_base0 = row0 * O_QUANT_ROPE_PAIRS
-                    cosine0 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base0)
-                    sine0 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base0)
-                    raw0 = pl.reg.load(value, offset=value_offset0, lanes=O_QUANT_LANES)
-                    row1 = row_group * O_QUANT_ROPE_UNROLL + 1
-                    value_offset1 = row1 * HEAD_DIM + O_QUANT_ROPE_START
-                    trig_base1 = row1 * O_QUANT_ROPE_PAIRS
-                    cosine1 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base1)
-                    sine1 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base1)
-                    raw1 = pl.reg.load(value, offset=value_offset1, lanes=O_QUANT_LANES)
-                    row2 = row_group * O_QUANT_ROPE_UNROLL + 2
-                    value_offset2 = row2 * HEAD_DIM + O_QUANT_ROPE_START
-                    trig_base2 = row2 * O_QUANT_ROPE_PAIRS
-                    cosine2 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base2)
-                    sine2 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base2)
-                    raw2 = pl.reg.load(value, offset=value_offset2, lanes=O_QUANT_LANES)
-                    row3 = row_group * O_QUANT_ROPE_UNROLL + 3
-                    value_offset3 = row3 * HEAD_DIM + O_QUANT_ROPE_START
-                    trig_base3 = row3 * O_QUANT_ROPE_PAIRS
-                    cosine3 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base3)
-                    sine3 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base3)
-                    raw3 = pl.reg.load(value, offset=value_offset3, lanes=O_QUANT_LANES)
-                    row4 = row_group * O_QUANT_ROPE_UNROLL + 4
-                    value_offset4 = row4 * HEAD_DIM + O_QUANT_ROPE_START
-                    trig_base4 = row4 * O_QUANT_ROPE_PAIRS
-                    cosine4 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base4)
-                    sine4 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base4)
-                    raw4 = pl.reg.load(value, offset=value_offset4, lanes=O_QUANT_LANES)
-                    row5 = row_group * O_QUANT_ROPE_UNROLL + 5
-                    value_offset5 = row5 * HEAD_DIM + O_QUANT_ROPE_START
-                    trig_base5 = row5 * O_QUANT_ROPE_PAIRS
-                    cosine5 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base5)
-                    sine5 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base5)
-                    raw5 = pl.reg.load(value, offset=value_offset5, lanes=O_QUANT_LANES)
-                    row6 = row_group * O_QUANT_ROPE_UNROLL + 6
-                    value_offset6 = row6 * HEAD_DIM + O_QUANT_ROPE_START
-                    trig_base6 = row6 * O_QUANT_ROPE_PAIRS
-                    cosine6 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base6)
-                    sine6 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base6)
-                    raw6 = pl.reg.load(value, offset=value_offset6, lanes=O_QUANT_LANES)
-                    row7 = row_group * O_QUANT_ROPE_UNROLL + 7
-                    value_offset7 = row7 * HEAD_DIM + O_QUANT_ROPE_START
-                    trig_base7 = row7 * O_QUANT_ROPE_PAIRS
-                    cosine7 = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base7)
-                    sine7 = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base7)
-                    raw7 = pl.reg.load(value, offset=value_offset7, lanes=O_QUANT_LANES)
-
-                    sine_negative0 = pl.reg.muls(sine0, -1.0, full)
-                    rotated0 = pl.reg.convert(raw0, dtype=pl.FP32)
-                    swapped0 = pl.reg.gather_lanes(rotated0, ix1)
-                    scaled_real0 = pl.reg.mul(rotated0, cosine0)
-                    scaled_imag0 = pl.reg.mul(swapped0, sine_negative0)
-                    real0 = pl.reg.sub(scaled_real0, scaled_imag0)
-                    imag0 = pl.reg.add(scaled_imag0, scaled_real0)
-                    result0 = pl.reg.select(even, real0, imag0)
-                    tail0 = pl.reg.convert(result0, dtype=pl.BF16, rounding="R", saturate=False)
-                    sine_negative1 = pl.reg.muls(sine1, -1.0, full)
-                    rotated1 = pl.reg.convert(raw1, dtype=pl.FP32)
-                    swapped1 = pl.reg.gather_lanes(rotated1, ix1)
-                    scaled_real1 = pl.reg.mul(rotated1, cosine1)
-                    scaled_imag1 = pl.reg.mul(swapped1, sine_negative1)
-                    real1 = pl.reg.sub(scaled_real1, scaled_imag1)
-                    imag1 = pl.reg.add(scaled_imag1, scaled_real1)
-                    result1 = pl.reg.select(even, real1, imag1)
-                    tail1 = pl.reg.convert(result1, dtype=pl.BF16, rounding="R", saturate=False)
-                    sine_negative2 = pl.reg.muls(sine2, -1.0, full)
-                    rotated2 = pl.reg.convert(raw2, dtype=pl.FP32)
-                    swapped2 = pl.reg.gather_lanes(rotated2, ix1)
-                    scaled_real2 = pl.reg.mul(rotated2, cosine2)
-                    scaled_imag2 = pl.reg.mul(swapped2, sine_negative2)
-                    real2 = pl.reg.sub(scaled_real2, scaled_imag2)
-                    imag2 = pl.reg.add(scaled_imag2, scaled_real2)
-                    result2 = pl.reg.select(even, real2, imag2)
-                    tail2 = pl.reg.convert(result2, dtype=pl.BF16, rounding="R", saturate=False)
-                    sine_negative3 = pl.reg.muls(sine3, -1.0, full)
-                    rotated3 = pl.reg.convert(raw3, dtype=pl.FP32)
-                    swapped3 = pl.reg.gather_lanes(rotated3, ix1)
-                    scaled_real3 = pl.reg.mul(rotated3, cosine3)
-                    scaled_imag3 = pl.reg.mul(swapped3, sine_negative3)
-                    real3 = pl.reg.sub(scaled_real3, scaled_imag3)
-                    imag3 = pl.reg.add(scaled_imag3, scaled_real3)
-                    result3 = pl.reg.select(even, real3, imag3)
-                    tail3 = pl.reg.convert(result3, dtype=pl.BF16, rounding="R", saturate=False)
-                    sine_negative4 = pl.reg.muls(sine4, -1.0, full)
-                    rotated4 = pl.reg.convert(raw4, dtype=pl.FP32)
-                    swapped4 = pl.reg.gather_lanes(rotated4, ix1)
-                    scaled_real4 = pl.reg.mul(rotated4, cosine4)
-                    scaled_imag4 = pl.reg.mul(swapped4, sine_negative4)
-                    real4 = pl.reg.sub(scaled_real4, scaled_imag4)
-                    imag4 = pl.reg.add(scaled_imag4, scaled_real4)
-                    result4 = pl.reg.select(even, real4, imag4)
-                    tail4 = pl.reg.convert(result4, dtype=pl.BF16, rounding="R", saturate=False)
-                    sine_negative5 = pl.reg.muls(sine5, -1.0, full)
-                    rotated5 = pl.reg.convert(raw5, dtype=pl.FP32)
-                    swapped5 = pl.reg.gather_lanes(rotated5, ix1)
-                    scaled_real5 = pl.reg.mul(rotated5, cosine5)
-                    scaled_imag5 = pl.reg.mul(swapped5, sine_negative5)
-                    real5 = pl.reg.sub(scaled_real5, scaled_imag5)
-                    imag5 = pl.reg.add(scaled_imag5, scaled_real5)
-                    result5 = pl.reg.select(even, real5, imag5)
-                    tail5 = pl.reg.convert(result5, dtype=pl.BF16, rounding="R", saturate=False)
-                    sine_negative6 = pl.reg.muls(sine6, -1.0, full)
-                    rotated6 = pl.reg.convert(raw6, dtype=pl.FP32)
-                    swapped6 = pl.reg.gather_lanes(rotated6, ix1)
-                    scaled_real6 = pl.reg.mul(rotated6, cosine6)
-                    scaled_imag6 = pl.reg.mul(swapped6, sine_negative6)
-                    real6 = pl.reg.sub(scaled_real6, scaled_imag6)
-                    imag6 = pl.reg.add(scaled_imag6, scaled_real6)
-                    result6 = pl.reg.select(even, real6, imag6)
-                    tail6 = pl.reg.convert(result6, dtype=pl.BF16, rounding="R", saturate=False)
-                    sine_negative7 = pl.reg.muls(sine7, -1.0, full)
-                    rotated7 = pl.reg.convert(raw7, dtype=pl.FP32)
-                    swapped7 = pl.reg.gather_lanes(rotated7, ix1)
-                    scaled_real7 = pl.reg.mul(rotated7, cosine7)
-                    scaled_imag7 = pl.reg.mul(swapped7, sine_negative7)
-                    real7 = pl.reg.sub(scaled_real7, scaled_imag7)
-                    imag7 = pl.reg.add(scaled_imag7, scaled_real7)
-                    result7 = pl.reg.select(even, real7, imag7)
-                    tail7 = pl.reg.convert(result7, dtype=pl.BF16, rounding="R", saturate=False)
-
-                    _rotated0 = pl.reg.store(value, offset=value_offset0, value=tail0)
-                    _rotated1 = pl.reg.store(value, offset=value_offset1, value=tail1)
-                    _rotated2 = pl.reg.store(value, offset=value_offset2, value=tail2)
-                    _rotated3 = pl.reg.store(value, offset=value_offset3, value=tail3)
-                    _rotated4 = pl.reg.store(value, offset=value_offset4, value=tail4)
-                    _rotated5 = pl.reg.store(value, offset=value_offset5, value=tail5)
-                    _rotated6 = pl.reg.store(value, offset=value_offset6, value=tail6)
-                    _rotated7 = pl.reg.store(value, offset=value_offset7, value=tail7)
-
-                for remainder_row in pl.hardware_loop(rows % O_QUANT_ROPE_UNROLL):
-                    row = rows // O_QUANT_ROPE_UNROLL * O_QUANT_ROPE_UNROLL + remainder_row
-                    # Match vgather2(cos/sin + row * 32, pair_index, all).
-                    trig_base = row * O_QUANT_ROPE_PAIRS
-                    cosine_v = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base)
-                    sine_v = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base)
-                    sine_v = pl.reg.muls(sine_v, -1.0, full)
-                    raw = pl.reg.load(value, offset=row * HEAD_DIM + O_QUANT_ROPE_START, lanes=O_QUANT_LANES)
-                    rotated = pl.reg.convert(raw, dtype=pl.FP32)
-                    swapped = pl.reg.gather_lanes(rotated, ix1)
-                    scaled_real = pl.reg.mul(rotated, cosine_v)
-                    scaled_imag = pl.reg.mul(swapped, sine_v)
-                    real = pl.reg.sub(scaled_real, scaled_imag)
-                    imag = pl.reg.add(scaled_imag, scaled_real)
-                    rotated = pl.reg.select(even, real, imag)
-                    raw = pl.reg.convert(rotated, dtype=pl.BF16, rounding="R", saturate=False)
-                    _rotated = pl.reg.store(value, offset=row * HEAD_DIM + O_QUANT_ROPE_START, value=raw)
-
-            full_rows = pl.tile.reshape(value, [O_QUANT_ROW_TILE, HEAD_DIM])
-            max_workspace = pl.create_tile([1, O_QUANT_SCALE_COUNT], dtype=pl.BF16)
-            scale_workspace = pl.create_tile([1, O_QUANT_SCALE_COUNT], dtype=pl.BF16)
-            payload_bytes, exponents = pl.tile.quant_mx_raw(full_rows, max_workspace, scale_workspace, group_axis=1)
-            # Pack scales while the payload tile is live so scale packing
-            # can start before the payload writeback.
-            zz_tmp = pl.create_tile([1, O_QUANT_SCALE_PACK_TMP], dtype=pl.UINT8)
-            packed_scale = pl.tmov_x2zz(
-                exponents, zz_tmp, group_axis=1, dst_rows=O_QUANT_ROW_TILE, dst_cols=O_QUANT_SCALE_GROUPS,
-            )
-            scale_tile = pl.tile.reinterpret_view(packed_scale, pl.FP8E8M0)
-            scale_tile = pl.reshape(scale_tile, [O_QUANT_ROW_TILE // O_QUANT_SCALE_BLOCK, O_QUANT_SCALE_COLS])
-            scale_tile = pl.tile.set_validshape(
-                scale_tile, capacity // O_QUANT_SCALE_BLOCK, O_QUANT_SCALE_COLS
-            )
-            pl.store(
-                scale_tile,
-                [
-                    group * scale_block_rows + t0 // O_QUANT_SCALE_BLOCK,
-                    local_head * O_QUANT_SCALE_COLS,
-                ],
-                scale_view,
-            )
-
-            # TQUANT uses a finite reciprocal for scale code zero. Preserve the
-            # projection contract by clearing magnitude bits in those groups.
-            if rows > 0:
-                exponent_words = pl.reinterpret_view(exponents, pl.UINT32, shape=[O_QUANT_SCALE_COUNT // 4])
-                flag = pl.create_tile([1, 64], dtype=pl.UINT32, target_memory=pl.MemorySpace.Vec)
-                flat_flag = pl.reshape(flag, [64])
-                with pl.reg_scope():
-                    word_count = rows * (O_QUANT_SCALE_GROUPS // 4)
-                    all_code_words = pl.reg.full_mask(lanes=64)
-                    one_per_byte = pl.reg.broadcast(0x01010101, lanes=64, dtype=pl.UINT32)
-                    top_bits = pl.reg.broadcast(0x80808080, lanes=64, dtype=pl.UINT32)
-                    zero_flags = pl.reg.broadcast(0, lanes=64, dtype=pl.UINT32)
-                    scan_blocks = (word_count + 63) // 64
-                    for scan, (found,) in pl.hardware_loop(scan_blocks, init_values=(zero_flags,)):
-                        start_word = scan * 64
-                        valid_words = pl.reg.active_mask(pl.min(word_count - start_word, 64), lanes=64)
-                        codes = pl.reg.load(exponent_words, start_word, lanes=64)
-                        # This expression detects zero bytes in the active words.
-                        decremented = pl.reg.sub(codes, one_per_byte, valid_words)
-                        inverse_codes = pl.reg.bitwise_not(codes, valid_words)
-                        byte_flags = pl.reg.bitwise_and(decremented, inverse_codes, valid_words)
-                        byte_flags = pl.reg.bitwise_and(byte_flags, top_bits, valid_words)
-                        found = pl.yield_(pl.reg.bitwise_or(found, byte_flags, all_code_words))
-                    any_zero = pl.reg.reduce_max(found, all_code_words)
-                    flag_words = pl.reg.group_broadcast(any_zero, lanes=64)
-                    _scan = pl.reg.store(flat_flag, 0, flag_words)
-                if pl.tile.read(flag, [0, 0]) != 0:
-                    words = pl.reinterpret_view(payload_bytes, pl.UINT32, shape=[O_QUANT_VALUE_TILE // 4])
-                    with pl.reg_scope():
-                        groups = pl.reg.full_mask(lanes=8)
-                        scale_index = pl.reg.index_gen(0, lanes=8, dtype=pl.UINT16)
-                        keep = pl.reg.broadcast(0xFFFFFFFF, lanes=8, dtype=pl.UINT32)
-                        sign = pl.reg.broadcast(0x80808080, lanes=8, dtype=pl.UINT32)
-                        full_words = pl.reg.full_mask(lanes=64)
-                        for block in pl.hardware_loop(rows * 2):
-                            index = pl.cast(block * 8, pl.INDEX)
-                            scale = pl.reg.gather(exponents, scale_index, groups, base_offset=index)
-                            scale_u32 = pl.reg.convert(scale, dtype=pl.UINT32)
-                            nonzero = pl.reg.compares(scale_u32, 0, groups, predicate="ne")
-                            byte_mask = pl.reg.select(nonzero, keep, sign)
-                            word_mask = pl.reg.group_broadcast(byte_mask, lanes=64)
-                            offset = block * 64
-                            value_words = pl.reg.load(words, offset, lanes=64)
-                            zeroed_words = pl.reg.bitwise_and(value_words, word_mask, full_words)
-                            _payload_words = pl.reg.store(words, offset, zeroed_words)
-            payload_tile = pl.tile.reinterpret_view(payload_bytes, pl.FP8E4M3FN)
-            payload_tile = pl.tile.set_validshape(payload_tile, capacity, HEAD_DIM)
-            pl.store(payload_tile, [group * padded_rows + t0, local_head * HEAD_DIM], payload)
+    full_rows = pl.min(pl.cast(active_rows, pl.INDEX), padded_rows)
+    # Choose a group size that covers the available full tiles.
+    if padded_rows <= O_QUANT_ROW_TILE:
+        published = _quant_o_vf_schedule(
+            O_QUANT_ROW_TILE, 0, attended, cosine, sine, payload, scales, active_rows, padded_rows,
+        )
+    elif full_rows >= 8 * O_QUANT_PREFETCH_ROW_TILE:
+        published = _quant_o_vf_schedule(
+            O_QUANT_PREFETCH_ROW_TILE, 8, attended, cosine, sine, payload, scales, active_rows, padded_rows,
+        )
+    elif full_rows >= 6 * O_QUANT_PREFETCH_ROW_TILE:
+        published = _quant_o_vf_schedule(
+            O_QUANT_PREFETCH_ROW_TILE, 6, attended, cosine, sine, payload, scales, active_rows, padded_rows,
+        )
+    elif full_rows >= 5 * O_QUANT_PREFETCH_ROW_TILE:
+        published = _quant_o_vf_schedule(
+            O_QUANT_PREFETCH_ROW_TILE, 5, attended, cosine, sine, payload, scales, active_rows, padded_rows,
+        )
+    else:
+        published = _quant_o_vf_schedule(
+            O_QUANT_PREFETCH_ROW_TILE, 4, attended, cosine, sine, payload, scales, active_rows, padded_rows,
+        )
     return published
 
 
