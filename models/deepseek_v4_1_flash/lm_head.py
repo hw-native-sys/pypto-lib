@@ -54,6 +54,8 @@ GROUP_LOGIT_ROWS = LM_HEAD_TP_SIZE * MAX_LOGIT_ROWS
 LM_HEAD_M_TILE = 80
 LM_HEAD_N_TILE = 256
 LM_HEAD_K_TILE = 128
+LM_HEAD_GATHER_M_TILE = 72
+LM_HEAD_TAIL_TILE = VOCAB_PER_TP % LM_HEAD_N_TILE or LM_HEAD_N_TILE
 HIDDEN_OWNER_ROW_TILE = gcd(MAX_LOGIT_ROWS, 48)
 HIDDEN_PUSH_WORKER_TILE = (MAX_LOGIT_ROWS + 64 // LM_HEAD_TP_SIZE - 1) // (64 // LM_HEAD_TP_SIZE)
 HIDDEN_PUSH_ROW_TILE = gcd(HIDDEN_OWNER_ROW_TILE, HIDDEN_PUSH_WORKER_TILE)
@@ -91,20 +93,6 @@ def _lm_head_project_push(
     owner_row_tile: pl.Scalar[pl.INDEX],
 ) -> pld.DistributedTensor:
     return received
-
-
-@pl.jit.extern(
-    core_type="aiv", source=Path(__file__).parent / "kernels" / "lm_head_panel_gather.cpp",
-    include_dirs=(pto_isa_include_dir(),),
-)
-def _lm_head_panel_gather(
-    received: pl.Tensor,
-    logits: pl.Out[pl.Tensor],
-    tp_size: pl.Scalar[pl.INDEX],
-    owner_rows: pl.Scalar[pl.INDEX],
-    vocabulary: pl.Scalar[pl.INDEX],
-) -> pl.Tensor:
-    ...
 
 
 @pl.jit.inline(auto_scope=False)
@@ -291,7 +279,79 @@ def lm_head(
                     )
 
         with pl.spmd(64, name_hint="lm_head_combine_gather", deps=[combine_ready, combine_notified]) as gathered:
-            logits = _lm_head_panel_gather(logits_window, logits, LM_HEAD_TP_SIZE, num_rows, VOCAB_PER_TP)
+            gather_worker = pl.tile.get_block_idx()
+            row_tiles = (num_rows + LM_HEAD_GATHER_M_TILE - 1) // LM_HEAD_GATHER_M_TILE
+            full_panels = VOCAB_PER_TP // LM_HEAD_N_TILE
+            panel_tasks = LM_HEAD_TP_SIZE * row_tiles * full_panels
+            panels_u32 = pl.cast(full_panels, pl.UINT32)
+            rows_u32 = pl.cast(row_tiles, pl.UINT32)
+            panels = pl.tensor.view(logits_window, [num_rows * (VOCAB // LM_HEAD_N_TILE), LM_HEAD_N_TILE])
+            # Each slot owns one input buffer, one output buffer and its own pipeline credits.
+            pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE2, 0)
+            pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE2, 1)
+            pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, 0)
+            pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, 1)
+            for work in pl.range(gather_worker, panel_tasks, 64):
+                ordinal = pl.cast(work, pl.UINT32)
+                packed_row = ordinal // panels_u32
+                shard = pl.cast(packed_row // rows_u32, pl.INDEX)
+                row = pl.cast(packed_row % rows_u32, pl.INDEX) * LM_HEAD_GATHER_M_TILE
+                panel = pl.cast(ordinal - packed_row * panels_u32, pl.INDEX)
+                input_row = shard * (VOCAB_PER_TP * num_rows // LM_HEAD_N_TILE) + panel * num_rows + row
+                output_column = shard * VOCAB_PER_TP + panel * LM_HEAD_N_TILE
+                rows = pl.min(LM_HEAD_GATHER_M_TILE, num_rows - row)
+                slot = pl.cast((ordinal // pl.cast(64, pl.UINT32)) % pl.cast(2, pl.UINT32), pl.INDEX)
+                pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, slot)
+                panel_input: pl.Tile[
+                    [LM_HEAD_GATHER_M_TILE, LM_HEAD_N_TILE], pl.BF16, pl.MemRef("input", slots=2)[slot], pl.Mem.Vec
+                ] = pl.load(
+                    panels, [input_row, 0], [LM_HEAD_GATHER_M_TILE, LM_HEAD_N_TILE], valid_shape=[rows, LM_HEAD_N_TILE],
+                )
+                pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, slot)
+                pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.V, slot)
+                pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, slot)
+                value: pl.Tile[
+                    [LM_HEAD_GATHER_M_TILE, LM_HEAD_N_TILE], pl.FP32, pl.MemRef("output", slots=2)[slot], pl.Mem.Vec
+                ] = pl.cast(
+                    panel_input, pl.FP32, mode="none",
+                )
+                pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE2, slot)
+                pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE3, slot)
+                pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE3, slot)
+                pl.store(value, [row, output_column], logits)
+                pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, slot)
+            # The narrow tail reuses slot 0 after its full-panel transfers finish.
+            pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, 1)
+            pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 1)
+            tail_panels = pl.tensor.view(logits_window, [num_rows * (VOCAB // LM_HEAD_TAIL_TILE), LM_HEAD_TAIL_TILE])
+            for tail in pl.range(gather_worker, LM_HEAD_TP_SIZE * row_tiles, 64):
+                shard = tail // row_tiles
+                row = tail % row_tiles * LM_HEAD_GATHER_M_TILE
+                column = VOCAB_PER_TP - LM_HEAD_TAIL_TILE
+                output_column = shard * VOCAB_PER_TP + column
+                input_row = output_column * num_rows // LM_HEAD_TAIL_TILE + row
+                rows = pl.min(LM_HEAD_GATHER_M_TILE, num_rows - row)
+                pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, 0)
+                tail_tile: pl.Tile[
+                    [LM_HEAD_GATHER_M_TILE, LM_HEAD_TAIL_TILE], pl.BF16, pl.MemRef("input", slots=2)[0], pl.Mem.Vec
+                ] = pl.load(
+                    tail_panels, [input_row, 0], [LM_HEAD_GATHER_M_TILE, LM_HEAD_TAIL_TILE], valid_shape=[rows, LM_HEAD_TAIL_TILE],
+                )
+                pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, 0)
+                pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.V, 0)
+                pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 0)
+                tail_value: pl.Tile[
+                    [LM_HEAD_GATHER_M_TILE, LM_HEAD_TAIL_TILE], pl.FP32, pl.MemRef("output", slots=2)[0], pl.Mem.Vec
+                ] = pl.cast(
+                    tail_tile, pl.FP32, mode="none",
+                )
+                pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE2, 0)
+                pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE3, 0)
+                pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE3, 0)
+                pl.store(tail_value, [row, output_column], logits)
+                pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, 0)
+            pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, 0)
+            pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 0)
 
         # Clear this rank's counters after its final logits-window read.
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_signal_clear", deps=[gathered], allow_early_resolve=False):
