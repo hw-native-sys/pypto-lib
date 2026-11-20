@@ -15,8 +15,6 @@ from pathlib import Path
 
 import pypto.language as pl
 
-from pypto.runtime import pto_isa_include_dir
-
 import config
 
 
@@ -51,7 +49,14 @@ GATE_UP_N = 2 * MOE_INTER
 K_SCALE = D // MX_GROUP
 H_SCALE = MOE_INTER // MX_GROUP
 W13_M_TILE = 80
+# Reuse each weight panel across more rows when the wider tile covers T_PAD.
+W13_PYPTO_M_TILE = 192 if T_PAD % 192 == 0 else W13_M_TILE
 W13_N_TILE = 256
+W13_K_TILE = 256
+W13_L1_SLOTS = 4 if T_PAD <= W13_M_TILE else 3
+W13_SCALE_SLOTS = 2 * W13_L1_SLOTS
+W13_L0_K_TILE = 128
+W13_L0_SCALE_TILE = W13_L0_K_TILE // MX_GROUP
 W13_GROUPS = (T_PAD + W13_M_TILE - 1) // W13_M_TILE
 W13_ROWS = W13_GROUPS * W13_M_TILE
 W13_PAD_ROWS = 16  # staging granularity when the token block is not a whole tile
@@ -75,25 +80,6 @@ assert GATE_UP_N % W13_N_TILE == 0
 assert MOE_INTER % W2_K_TILE == 0
 assert D % W2_N_TILE == 0
 assert W2_M_TILE % 16 == 0
-
-
-@pl.jit.extern(
-    core_type="aic",
-    source=Path(__file__).parent / "kernels" / "expert_shared_w13.cpp",
-    include_dirs=(pto_isa_include_dir(),),
-)
-def _shared_w13_mm(
-    x_local: pl.Tensor,
-    x_local_scale: pl.Tensor,
-    shared_w1: pl.Tensor,
-    shared_w1_scale: pl.Tensor,
-    shared_w3: pl.Tensor,
-    shared_w3_scale: pl.Tensor,
-    gate_up: pl.Out[pl.Tensor],
-    rows: pl.Scalar[pl.INDEX],
-) -> pl.Tensor:
-    """Project ND MXFP8 activations with ND weights and resident MX scales."""
-    ...
 
 
 @pl.jit.inline(auto_scope=False)
@@ -332,6 +318,226 @@ def _w13_direct_inputs(
 _W13_INPUTS = _w13_direct_inputs if W13_ROWS == T_PAD else _w13_padded_inputs
 
 
+@pl.jit.inline
+def _prefetch_w13_pypto(
+    x: pl.Tensor,
+    x_scale: pl.Tensor,
+    weight: pl.Tensor,
+    weight_scale: pl.Tensor,
+    row: pl.Scalar[pl.INDEX],
+    col: pl.Scalar[pl.INDEX],
+    k: pl.Scalar[pl.INDEX],
+    slot: pl.Scalar[pl.INDEX],
+):
+    x_scale_zz = pl.tensor.view(x_scale, [W13_ROWS, K_SCALE], layout=pl.MX_A_ZZ)
+    scale_k = k // MX_GROUP
+    a: pl.Tile[
+        [W13_PYPTO_M_TILE, W13_K_TILE], pl.FP8E4M3FN, pl.MemRef("w13_a", slots=W13_L1_SLOTS)[slot], pl.Mem.Mat
+    ] = pl.tile.load(x, [row, k], [W13_PYPTO_M_TILE, W13_K_TILE], target_memory=pl.Mem.Mat)
+    b: pl.Tile[
+        [W13_K_TILE, W13_N_TILE], pl.FP8E4M3FN, pl.MemRef("w13_b", slots=W13_L1_SLOTS)[slot], pl.Mem.Mat
+    ] = pl.tile.load(weight, [k, col], [W13_K_TILE, W13_N_TILE], target_memory=pl.Mem.Mat)
+    sa0: pl.Tile[
+        [W13_PYPTO_M_TILE, W13_L0_SCALE_TILE], pl.FP8E8M0,
+        pl.MemRef("w13_sa", slots=W13_SCALE_SLOTS)[2 * slot], pl.Mem.Mat,
+    ] = pl.tile.load(x_scale_zz, [row, scale_k], [W13_PYPTO_M_TILE, W13_L0_SCALE_TILE])
+    sb0: pl.Tile[
+        [W13_L0_SCALE_TILE, W13_N_TILE], pl.FP8E8M0,
+        pl.MemRef("w13_sb", slots=W13_SCALE_SLOTS)[2 * slot], pl.Mem.Mat,
+    ] = pl.tile.load(weight_scale, [scale_k, col], [W13_L0_SCALE_TILE, W13_N_TILE])
+    sa1: pl.Tile[
+        [W13_PYPTO_M_TILE, W13_L0_SCALE_TILE], pl.FP8E8M0,
+        pl.MemRef("w13_sa", slots=W13_SCALE_SLOTS)[2 * slot + 1], pl.Mem.Mat,
+    ] = pl.tile.load(x_scale_zz, [row, scale_k + W13_L0_SCALE_TILE], [W13_PYPTO_M_TILE, W13_L0_SCALE_TILE])
+    sb1: pl.Tile[
+        [W13_L0_SCALE_TILE, W13_N_TILE], pl.FP8E8M0,
+        pl.MemRef("w13_sb", slots=W13_SCALE_SLOTS)[2 * slot + 1], pl.Mem.Mat,
+    ] = pl.tile.load(weight_scale, [scale_k + W13_L0_SCALE_TILE, col], [W13_L0_SCALE_TILE, W13_N_TILE])
+    pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, slot)
+    return a, b, sa0, sb0, sa1, sb1
+
+
+@pl.jit.inline
+def _accumulate_w13_pypto(
+    acc: pl.Tile[[W13_PYPTO_M_TILE, W13_N_TILE], pl.FP32, pl.Mem.Acc],
+    a_mat: pl.Tile[[W13_PYPTO_M_TILE, W13_K_TILE], pl.FP8E4M3FN, pl.Mem.Mat],
+    b_mat: pl.Tile[[W13_K_TILE, W13_N_TILE], pl.FP8E4M3FN, pl.Mem.Mat],
+    sa_lo: pl.Tile[
+        [W13_PYPTO_M_TILE, W13_L0_SCALE_TILE], pl.FP8E8M0, pl.Mem.Mat,
+        pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32),
+    ],
+    sb_lo: pl.Tile[
+        [W13_L0_SCALE_TILE, W13_N_TILE], pl.FP8E8M0, pl.Mem.Mat,
+        pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32),
+    ],
+    sa_hi: pl.Tile[
+        [W13_PYPTO_M_TILE, W13_L0_SCALE_TILE], pl.FP8E8M0, pl.Mem.Mat,
+        pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32),
+    ],
+    sb_hi: pl.Tile[
+        [W13_L0_SCALE_TILE, W13_N_TILE], pl.FP8E8M0, pl.Mem.Mat,
+        pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32),
+    ],
+    slot: pl.Scalar[pl.INDEX],
+    group: pl.Scalar[pl.INDEX],
+) -> pl.Tile:
+    pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, slot)
+    # Stage the low K128 half in the first L0 slot.
+    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
+    a: pl.Tile[
+        [W13_PYPTO_M_TILE, W13_L0_K_TILE], pl.FP8E4M3FN,
+        pl.MemRef("w13_a_left", slots=2)[0], pl.Mem.Left,
+    ] = pl.tile.extract(a_mat, 0, 0, [W13_PYPTO_M_TILE, W13_L0_K_TILE], target_memory=pl.Mem.Left)
+    b: pl.Tile[
+        [W13_L0_K_TILE, W13_N_TILE], pl.FP8E4M3FN,
+        pl.MemRef("w13_b_right", slots=2)[0], pl.Mem.Right,
+    ] = pl.tile.extract(b_mat, 0, 0, [W13_L0_K_TILE, W13_N_TILE], target_memory=pl.Mem.Right)
+    sa: pl.Tile[
+        [W13_PYPTO_M_TILE, W13_L0_SCALE_TILE], pl.FP8E8M0,
+        pl.MemRef("w13_sa_left", slots=2)[0], pl.Mem.LeftScale,
+    ] = pl.tile.move(sa_lo, target_memory=pl.Mem.LeftScale)
+    sb: pl.Tile[
+        [W13_L0_SCALE_TILE, W13_N_TILE], pl.FP8E8M0,
+        pl.MemRef("w13_sb_right", slots=2)[0], pl.Mem.RightScale,
+    ] = pl.tile.move(sb_lo, target_memory=pl.Mem.RightScale)
+    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
+    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
+    if group == 0:
+        acc = pl.tile.matmul_mx(a, sa, b, sb)
+    else:
+        acc = pl.tile.matmul_mx_acc(acc, a, sa, b, sb)
+    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
+
+    # Stage the high K128 half in the second L0 slot.
+    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
+    a: pl.Tile[
+        [W13_PYPTO_M_TILE, W13_L0_K_TILE], pl.FP8E4M3FN,
+        pl.MemRef("w13_a_left", slots=2)[1], pl.Mem.Left,
+    ] = pl.tile.extract(a_mat, 0, W13_L0_K_TILE, [W13_PYPTO_M_TILE, W13_L0_K_TILE], target_memory=pl.Mem.Left)
+    b: pl.Tile[
+        [W13_L0_K_TILE, W13_N_TILE], pl.FP8E4M3FN,
+        pl.MemRef("w13_b_right", slots=2)[1], pl.Mem.Right,
+    ] = pl.tile.extract(b_mat, W13_L0_K_TILE, 0, [W13_L0_K_TILE, W13_N_TILE], target_memory=pl.Mem.Right)
+    sa: pl.Tile[
+        [W13_PYPTO_M_TILE, W13_L0_SCALE_TILE], pl.FP8E8M0,
+        pl.MemRef("w13_sa_left", slots=2)[1], pl.Mem.LeftScale,
+    ] = pl.tile.move(sa_hi, target_memory=pl.Mem.LeftScale)
+    sb: pl.Tile[
+        [W13_L0_SCALE_TILE, W13_N_TILE], pl.FP8E8M0,
+        pl.MemRef("w13_sb_right", slots=2)[1], pl.Mem.RightScale,
+    ] = pl.tile.move(sb_hi, target_memory=pl.Mem.RightScale)
+    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
+    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
+    acc = pl.tile.matmul_mx_acc(acc, a, sa, b, sb)
+    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
+
+    return acc
+
+
+@pl.jit.inline
+def _project_w13_pypto(
+    x: pl.Tensor,
+    x_scale: pl.Tensor,
+    weight: pl.Tensor,
+    weight_scale: pl.Tensor,
+    gate_up: pl.Out[pl.Tensor],
+    row: pl.Scalar[pl.INDEX],
+    col: pl.Scalar[pl.INDEX],
+    projection: pl.constexpr,
+) -> pl.Tensor:
+    """Prefetch K256 payloads into L1 and alternate K128 operands in L0."""
+    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
+    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
+    a_mat0, b_mat0, sa_lo0, sb_lo0, sa_hi0, sb_hi0 = _prefetch_w13_pypto(x, x_scale, weight, weight_scale, row, col, 0, 0)
+    a_mat1, b_mat1, sa_lo1, sb_lo1, sa_hi1, sb_hi1 = _prefetch_w13_pypto(
+        x, x_scale, weight, weight_scale, row, col, W13_K_TILE, 1,
+    )
+    a_mat2, b_mat2, sa_lo2, sb_lo2, sa_hi2, sb_hi2 = _prefetch_w13_pypto(
+        x, x_scale, weight, weight_scale, row, col, 2 * W13_K_TILE, 2,
+    )
+    if W13_L1_SLOTS == 4:
+        a_mat3, b_mat3, sa_lo3, sb_lo3, sa_hi3, sb_hi3 = _prefetch_w13_pypto(
+            x, x_scale, weight, weight_scale, row, col, 3 * W13_K_TILE, 3,
+        )
+
+    acc = pl.create_tile([W13_PYPTO_M_TILE, W13_N_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+    for group in pl.unroll(D // W13_K_TILE):
+        slot = group % W13_L1_SLOTS
+        acc = _accumulate_w13_pypto(acc, a_mat0, b_mat0, sa_lo0, sb_lo0, sa_hi0, sb_hi0, slot, group)
+
+        # Rotate handles to the prefetched tiles in L1.
+        a_mat0 = a_mat1
+        b_mat0 = b_mat1
+        sa_lo0 = sa_lo1
+        sb_lo0 = sb_lo1
+        sa_hi0 = sa_hi1
+        sb_hi0 = sb_hi1
+        a_mat1 = a_mat2
+        b_mat1 = b_mat2
+        sa_lo1 = sa_lo2
+        sb_lo1 = sb_lo2
+        sa_hi1 = sa_hi2
+        sb_hi1 = sb_hi2
+        if W13_L1_SLOTS == 4:
+            a_mat2 = a_mat3
+            b_mat2 = b_mat3
+            sa_lo2 = sa_lo3
+            sb_lo2 = sb_lo3
+            sa_hi2 = sa_hi3
+            sb_hi2 = sb_hi3
+        next_group = group + W13_L1_SLOTS
+        if next_group < D // W13_K_TILE:
+            pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, slot)
+            pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, slot)
+            k = next_group * W13_K_TILE
+            if W13_L1_SLOTS == 4:
+                a_mat3, b_mat3, sa_lo3, sb_lo3, sa_hi3, sb_hi3 = _prefetch_w13_pypto(
+                    x, x_scale, weight, weight_scale, row, col, k, slot,
+                )
+            else:
+                a_mat2, b_mat2, sa_lo2, sb_lo2, sa_hi2, sb_hi2 = _prefetch_w13_pypto(
+                    x, x_scale, weight, weight_scale, row, col, k, slot,
+                )
+
+    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
+    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
+    pl.system.set_flag(pl.PipeType.M, pl.PipeType.FIX, 0)
+    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.FIX, 0)
+    active = pl.min(T_PAD - row, W13_PYPTO_M_TILE)
+    out = pl.tile.set_validshape(acc, active, W13_N_TILE)
+    out_col = projection * MOE_INTER + col
+    gate_up = pl.tile.store(out, [row, out_col], gate_up)
+    pl.system.barrier(pipe=pl.PipeType.ALL)
+    return gate_up
+
+
+@pl.jit.incore
+def _shared_w13_mm_pypto(
+    x: pl.Tensor,
+    x_scale: pl.Tensor,
+    shared_w1: pl.Tensor,
+    shared_w1_scale: pl.Tensor,
+    shared_w3: pl.Tensor,
+    shared_w3_scale: pl.Tensor,
+    gate_up: pl.Out[pl.Tensor],
+) -> pl.Tensor:
+    """Distribute row and projection panels over the Cube workers."""
+    n_tiles = MOE_INTER // W13_N_TILE
+    block = pl.tile.get_block_idx()
+    blocks = pl.tile.get_block_num()
+    for row in pl.range(0, T_PAD, W13_PYPTO_M_TILE):
+        first = row // W13_PYPTO_M_TILE * 2 * n_tiles
+        for projection in pl.range(2):
+            for col in pl.range(0, MOE_INTER, W13_N_TILE):
+                task = first + projection * n_tiles + col // W13_N_TILE
+                if task % blocks == block:
+                    if projection == 0:
+                        gate_up = _project_w13_pypto(x, x_scale, shared_w1, shared_w1_scale, gate_up, row, col, 0)
+                    else:
+                        gate_up = _project_w13_pypto(x, x_scale, shared_w3, shared_w3_scale, gate_up, row, col, 1)
+    return gate_up
+
+
 import torch.nn.functional as F
 
 
@@ -353,10 +559,8 @@ def expert_shared(
     x_w13, x_w13_scale = _W13_INPUTS(x_local, x_local_scale)
     w13_workers = pl.min(W13_GROUPS * (GATE_UP_N // W13_N_TILE), W13_WORKER_TILE)
     with pl.spmd(w13_workers, name_hint="sh_w13_mx_mm"):
-        gate_up = _shared_w13_mm(
-            x_w13, x_w13_scale,
-            shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-            gate_up, T_PAD,
+        gate_up = _shared_w13_mm_pypto(
+            x_w13, x_w13_scale, shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, gate_up,
         )
 
     # FP32 SwiGLU, FP8 payload, and packed MX_A_ZZ scales.
