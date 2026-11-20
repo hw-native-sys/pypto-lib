@@ -79,7 +79,7 @@ from config import (
 
 from prefill_cp_allgather import prefill_cp_gather_hc
 from hc import hc_head
-from dspark_drafter import l2_dspark_prefill_context_kv_rank
+from dspark_drafter import dspark_prefill_context_kv_rank
 from dspark_drafter import D as DSPARK_D, MAIN_IN as DSPARK_MAIN_IN, MX_GROUP as DSPARK_MX_GROUP
 from input_pack import gather_rows, pack_x_hc
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, prepare_forward_rope_tables
@@ -1190,12 +1190,11 @@ def l3_prefill_fwd_dspark(
         )
         context_rope_cos = pl.slice(draft_context_rope_cos[rank], [CAPACITY, ROPE_DIM // 2], [0, 0])
         context_rope_sin = pl.slice(draft_context_rope_sin[rank], [CAPACITY, ROPE_DIM // 2], [0, 0])
-        l2_dspark_prefill_context_kv_rank(
+        dspark_prefill_context_kv_rank(
             dspark_target_hidden[rank], draft_main_proj_weight[rank], draft_main_proj_scale[rank],
             draft_main_norm_weight[rank], draft_num_tokens[rank], context_slots,
             context_rope_cos, context_rope_sin, draft_wkv[rank],
             draft_wkv_scale[rank], draft_kv_norm_weight[rank], draft_window_cache[rank],
-            device=rank,
         )
 
 
