@@ -606,6 +606,7 @@ def decode_decoder(
                     reindex_index_wq_b, reindex_index_wq_b_scale, reindex_index_weights_proj,
                     topk_indices,
                     attention_hidden, attention_pre_mix, attention_count,
+                    pool_block_counts, pool_block_ids, False,
                 )
             else:
                 decode_c1a_reuse(

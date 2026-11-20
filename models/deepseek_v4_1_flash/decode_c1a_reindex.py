@@ -9,6 +9,13 @@
 # ci: no-sim
 """C1A reindex decode attention with HC."""
 
+from contextlib import contextmanager
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+import torch
+
 from quant import packed_cache_compare
 
 import pypto.language as pl
@@ -85,6 +92,9 @@ def decode_c1a_reindex(
     output: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     next_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
+    host_control: pl.Tensor = None,
+    prepared_runs: pl.Tensor = None,
+    use_host_plan: pl.constexpr = False,
 ):
     tokens = pl.tensor.dim(x_hc, 0)
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
@@ -127,7 +137,7 @@ def decode_c1a_reindex(
     score_select_reindex(
         index_query, index_query_scale, index_weights, index_cache, index_cache_scale,
         index_block_table, request_ids, compressed_lens, pool_block_ids, pool_block_counts,
-        scores, topk_indices, num_tokens,
+        scores, topk_indices, num_tokens, host_control, prepared_runs, use_host_plan,
     )
     attn_out = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     gather_sparse_attention(
@@ -183,6 +193,8 @@ def l2_decode_c1a_reindex(
     output: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
     next_pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
+    host_control: pl.Tensor[[2], pl.INT32],
+    prepared_runs: pl.Tensor[[4, T_DYN + 1], pl.INT32],
 ):
     x_hc.bind_dynamic(0, T_DYN)
     window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
@@ -212,7 +224,7 @@ def l2_decode_c1a_reindex(
         index_wq_b, index_wq_b_scale, index_weights_proj,
         topk_indices,
         output, next_pre_mix,
-        num_tokens,
+        num_tokens, host_control, prepared_runs, True,
     )
 
 
@@ -257,6 +269,8 @@ def l3_decode_c1a_reindex(
     output: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
     next_pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
+    host_control: pl.Tensor[[2], pl.INT32],
+    prepared_runs: pl.Tensor[[4, T_DYN + 1], pl.INT32],
 ):
     x_hc.bind_dynamic(0, T_DYN)
     rope_cos.bind_dynamic(0, T_DYN)
@@ -293,9 +307,103 @@ def l3_decode_c1a_reindex(
         index_wq_b, index_wq_b_scale_r, index_weights_proj,
         topk_indices,
         output, next_pre_mix,
-        num_tokens,
+        num_tokens, host_control, prepared_runs,
         device=0,
     )
+
+
+def prepare_reindex_metadata(pool_ids, pool_counts, request_ids, lengths, page_table, cache_pages, active):
+    """Evaluate the original pool identity condition and group paged runs on CPU."""
+    rows, capacity = pool_ids.shape
+    if not 0 <= active <= rows:
+        raise ValueError(f"num_tokens must lie between 0 and {rows}, got {active}")
+    width = min(capacity * M.candidate_block_size, page_table.shape[1] * 128)
+    expected_ids = torch.arange(capacity, dtype=pool_ids.dtype)
+    runs = torch.zeros((4, rows + 1), dtype=torch.int32)
+    dense = True
+    run_count = 0
+    start = 0
+    previous = -1
+    max_visible = 0
+    for token in range(active):
+        request = int(request_ids[token])
+        visible = max(0, int(lengths[token]))
+        count = max(0, min(int(pool_counts[token]), capacity))
+        if dense:
+            dense = (
+                count == (visible + 7) // 8
+                and visible <= width
+                and 0 <= request < page_table.shape[0]
+                and torch.equal(pool_ids[token, :count], expected_ids[:count])
+                and not bool((page_table[request, :(visible + 127) // 128] >= cache_pages).any())
+            )
+        if token and (request != previous or token - start == 6):
+            runs[:3, run_count] = torch.tensor([start, token, max_visible])
+            run_count += 1
+            start, max_visible = token, 0
+        max_visible = max(max_visible, min(visible, width))
+        runs[3, token + 1] = run_count
+        previous = request
+    if active:
+        runs[:3, run_count] = torch.tensor([start, active, max_visible])
+        run_count += 1
+    runs[3, 0] = run_count
+    return torch.tensor([dense, run_count], dtype=torch.int32), runs
+
+
+@contextmanager
+def reindex_case_inputs(specs, golden_data, runtime_dir):
+    """Match the selected artifact ABI and derive metadata from the inputs being replayed."""
+    from golden import TensorSpec
+
+    if runtime_dir:
+        metadata = json.loads((Path(runtime_dir) / "distributed_meta.json").read_text())
+        params = {item["name"].partition("__ssa_v")[0] for item in metadata["params"]}
+        if "host_control" not in params:
+            yield specs, golden_data
+            return
+
+    by_name = {spec.name: spec for spec in specs}
+    saved = Path(golden_data).resolve() if golden_data else None
+
+    def value(name):
+        if saved:
+            return torch.load(saved / "in" / f"{name}.pt", map_location="cpu", weights_only=True)
+        return by_name[name].create_tensor()
+
+    if saved:
+        active = int(value("num_tokens").item())
+        cache_pages = torch.load(
+            saved / "in" / "index_cache.pt", map_location="meta", weights_only=True, mmap=True,
+        ).shape[0]
+    else:
+        active = int(by_name["num_tokens"].value)
+        cache_pages = by_name["index_cache"].shape[0]
+
+    control, runs = prepare_reindex_metadata(
+        value("pool_block_ids"), value("pool_block_counts"), value("request_ids"),
+        value("compressed_lens"), value("index_block_table"), cache_pages, active,
+    )
+    added = {"host_control": control, "prepared_runs": runs}
+    prepared = specs + [
+        TensorSpec(name, list(tensor.shape), tensor.dtype, init_value=tensor) for name, tensor in added.items()
+    ]
+    if not saved:
+        yield prepared, None
+        return
+    # Replay the original input/output files while supplying this ABI's derived metadata.
+    with TemporaryDirectory(prefix="c1a-reindex-golden-") as directory:
+        overlay = Path(directory)
+        inputs = overlay / "in"
+        inputs.mkdir()
+        for source in (saved / "in").iterdir():
+            if source.stem not in added:
+                (inputs / source.name).symlink_to(source)
+        for name, tensor in added.items():
+            torch.save(tensor, inputs / f"{name}.pt")
+        if (saved / "out").is_dir():
+            (overlay / "out").symlink_to(saved / "out", target_is_directory=True)
+        yield prepared, str(overlay)
 
 
 if __name__ == "__main__":
@@ -335,56 +443,57 @@ if __name__ == "__main__":
     host = l3_decode_c1a_reindex
     specs = build_c1a_specs(
         "reindex", args.tokens, args.pages, args.requests, args.seed, args.case,
-        start_pos=args.startpos, query_lens=args.query_lens, param_names=host.param_names,
+        start_pos=args.startpos, query_lens=args.query_lens, param_names=[n for n in host.param_names if n not in {"host_control", "prepared_runs"}],
     )
 
-    result = run(
-        a5_default_runtime="host_build_graph",
-        fn=host,
-        specs=specs,
-        golden_fn=partial(golden_c1a, mode="reindex"),
-        compile_only=args.compile_only,
-        save_data=args.save_data,
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        config=dict(
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            dump_passes=args.dump_passes,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-            distributed_config=DistributedConfig(device_ids=[args.device], num_sub_workers=0),
-        ),
-        rtol=1e-3,
-        atol=1e-3,
-        compare_fn={
-            "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
-            "pool_block_ids": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
-            "pool_block_counts": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
-            "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
-            "output": ratio_allclose(atol=1e-2, rtol=1e-2, max_error_ratio=0.01),
-            "window_cache": packed_cache_compare(
-                mapped_pool_ratio_allclose(
-                    "window_slots", pool_name="window_cache",
-                    mapping_shape=(args.tokens,),
-                    block_size=BLOCK_SIZE, leading_rank_axis=False,
-                    atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.0,
-                ),
-                mapped_pool_ratio_allclose(
-                    "window_slots", pool_name="window_cache_scale",
-                    mapping_shape=(args.tokens,),
-                    block_size=BLOCK_SIZE, leading_rank_axis=False,
-                    atol=0.0, rtol=2 ** -7, max_error_ratio=0.0,
-                ),
-                fp4=False,
+    with reindex_case_inputs(specs, args.golden_data, args.runtime_dir) as (specs, replay_dir):
+        result = run(
+            a5_default_runtime="host_build_graph",
+            fn=host,
+            specs=specs,
+            golden_fn=partial(golden_c1a, mode="reindex"),
+            compile_only=args.compile_only,
+            save_data=args.save_data,
+            golden_data=replay_dir,
+            runtime_dir=args.runtime_dir,
+            config=dict(
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                dump_passes=args.dump_passes,
+                enable_chip_swimlane=args.enable_chip_swimlane,
+                distributed_config=DistributedConfig(device_ids=[args.device], num_sub_workers=0),
             ),
-            "compressed_cache": packed_cache_compare(
-                ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
-                ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
-                fp4=True,
-            ),
-            "index_cache": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
-            "index_cache_scale": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
-        },
-    )
+            rtol=1e-3,
+            atol=1e-3,
+            compare_fn={
+                "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
+                "pool_block_ids": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+                "pool_block_counts": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+                "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
+                "output": ratio_allclose(atol=1e-2, rtol=1e-2, max_error_ratio=0.01),
+                "window_cache": packed_cache_compare(
+                    mapped_pool_ratio_allclose(
+                        "window_slots", pool_name="window_cache",
+                        mapping_shape=(args.tokens,),
+                        block_size=BLOCK_SIZE, leading_rank_axis=False,
+                        atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.0,
+                    ),
+                    mapped_pool_ratio_allclose(
+                        "window_slots", pool_name="window_cache_scale",
+                        mapping_shape=(args.tokens,),
+                        block_size=BLOCK_SIZE, leading_rank_axis=False,
+                        atol=0.0, rtol=2 ** -7, max_error_ratio=0.0,
+                    ),
+                    fp4=False,
+                ),
+                "compressed_cache": packed_cache_compare(
+                    ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+                    ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+                    fp4=True,
+                ),
+                "index_cache": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+                "index_cache_scale": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+            },
+        )
     if not result.passed:
         raise SystemExit(result.error or 1)
