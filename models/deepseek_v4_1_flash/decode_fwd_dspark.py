@@ -850,6 +850,7 @@ if __name__ == "__main__":
     from pypto.ir import DistributedConfig
 
     result = run(
+        a5_default_runtime="host_build_graph",
         fn=l3_decode_fwd_dspark,
         specs=build_tensor_specs(),
         golden_fn=None,

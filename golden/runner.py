@@ -1510,9 +1510,10 @@ def _validate(
 
 
 @contextmanager
-def _fresh_compile_config(cfg: Any) -> Iterator[Any]:
-    """Select the A5 host graph for new builds. Explicit contexts own their pass settings."""
-    if cfg.platform not in ("a5", "a5sim"):
+def _fresh_compile_config(cfg: Any, a5_default_runtime: str | None = None) -> Iterator[Any]:
+    """Select an opted-in A5 runtime for new builds while preserving explicit pass settings."""
+    requested = os.environ.get("PYPTO_LIB_A5_RUNTIME", a5_default_runtime)
+    if cfg.platform not in ("a5", "a5sim") or requested is None:
         yield cfg
         return
 
@@ -1522,7 +1523,7 @@ def _fresh_compile_config(cfg: Any) -> Iterator[Any]:
         yield cfg
         return
 
-    runtime = passes.runtime_kind_from_name(os.environ.get("PYPTO_LIB_A5_RUNTIME", "host_build_graph"))
+    runtime = passes.runtime_kind_from_name(requested)
     # PyPTO rejects these options when passed both to ir.compile and to a
     # PassContext. Move the caller's values into the context for this compile.
     options = {}
@@ -1554,6 +1555,7 @@ def _run_pipeline(
     compile_only: bool,
     runtime_dir: str | None,
     save_data: bool,
+    a5_default_runtime: str | None,
 ) -> RunResult:
     """Compile / run / validate body behind :func:`run`.
 
@@ -1611,7 +1613,7 @@ def _run_pipeline(
         # dispatch below calls, so this is not an L3-only concern.
         compiled = _reload_from_dir(work_dir, cfg)
     else:
-        with _Stage("compile"), _fresh_compile_config(cfg) as compile_cfg:
+        with _Stage("compile"), _fresh_compile_config(cfg, a5_default_runtime) as compile_cfg:
             compiled = compile_step(compile_cfg, compile_state)
             work_dir = Path(compiled.output_dir)
 
@@ -1808,6 +1810,7 @@ def run(
     compile_only: bool = False,
     runtime_dir: str | None = None,
     save_data: bool = False,
+    a5_default_runtime: str | None = None,
 ) -> RunResult:
     """Compile *fn*, run it on device, and validate against golden.
 
@@ -1818,6 +1821,9 @@ def run(
 
     Args:
         fn: ``@pl.jit`` callable, ``@pl.program`` class, or ``ir.Program``.
+        a5_default_runtime: Runtime used for fresh A5/A5sim compiles of this entry.
+            An explicit PassContext or PYPTO_LIB_A5_RUNTIME overrides this default.
+            When omitted, PyPTO selects its usual runtime.
         specs: :class:`TensorSpec` / :class:`ScalarSpec` list in *fn*'s
             parameter order. A mismatched order is rejected, never reordered.
         golden_fn: ``golden_fn(values)`` that fills outputs in-place; *values*
@@ -1880,4 +1886,5 @@ def run(
             compile_only=compile_only,
             runtime_dir=runtime_dir,
             save_data=save_data,
+            a5_default_runtime=a5_default_runtime,
         )

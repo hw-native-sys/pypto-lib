@@ -55,7 +55,10 @@ def test_fresh_compile_platform_default(platform, monkeypatch):
 
     monkeypatch.delenv("PYPTO_LIB_A5_RUNTIME", raising=False)
     cfg = normalize_config(dict(platform=platform))
-    with _fresh_compile_config(cfg):
+    with _fresh_compile_config(cfg) as compile_cfg:
+        assert compile_cfg is cfg
+        assert passes.PassContext.current() is None
+    with _fresh_compile_config(cfg, "host_build_graph"):
         ctx = passes.PassContext.current()
         if platform == "a2a3":
             assert ctx is None
@@ -69,14 +72,14 @@ def test_fresh_compile_a5_overrides(monkeypatch):
 
     cfg = normalize_config(dict(platform="a5", memory_planner=passes.MemoryPlanner.PTOAS))
     monkeypatch.setenv("PYPTO_LIB_A5_RUNTIME", "tensormap_and_ringbuffer")
-    with _fresh_compile_config(cfg) as compile_cfg:
+    with _fresh_compile_config(cfg, "host_build_graph") as compile_cfg:
         ctx = passes.PassContext.current()
         assert ctx.get_runtime() == passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER
         assert ctx.get_memory_planner() == passes.MemoryPlanner.PTOAS
         assert compile_cfg.memory_planner is None
     assert cfg.memory_planner == passes.MemoryPlanner.PTOAS
     with passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH):
-        with _fresh_compile_config(cfg) as compile_cfg:
+        with _fresh_compile_config(cfg, "host_build_graph") as compile_cfg:
             assert compile_cfg is cfg
             assert passes.PassContext.current().get_runtime() == passes.RuntimeKind.HOST_BUILD_GRAPH
 

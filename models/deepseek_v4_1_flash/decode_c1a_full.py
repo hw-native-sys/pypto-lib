@@ -690,6 +690,7 @@ if __name__ == "__main__":
 
         pool_error_ratio = 0.0 if args.case == "pool" else 0.02
         result = run(
+            a5_default_runtime="host_build_graph",
             fn=host,
             specs=specs,
             golden_fn=golden_c1a,
