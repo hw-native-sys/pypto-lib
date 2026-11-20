@@ -11,13 +11,11 @@
 """DeepSeek-V4.1 Flash vocabulary projection, distributed logits assembly and greedy sampling."""
 
 import sys
-from math import gcd
-from pathlib import Path
+from math import gcd, lcm
 
 import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
-from pypto.runtime import pto_isa_include_dir
 
 from config import EP_SIZE, FLASH as M, LM_HEAD_TP_SIZE as MODEL_LM_HEAD_TP_SIZE, SUPPORTED_LM_HEAD_TP_SIZES
 from quant import pack_bf16_nz, unpack_bf16_nz
@@ -25,6 +23,8 @@ from quant import pack_bf16_nz, unpack_bf16_nz
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("LM_HEAD_T_DYN")
+PANEL_ROWS_DYN = pl.dynamic("LM_HEAD_PANEL_ROWS")
+PANEL_COLUMNS_DYN = pl.dynamic("LM_HEAD_PANEL_COLUMNS")
 
 # model config
 D = M.hidden_size
@@ -54,6 +54,13 @@ GROUP_LOGIT_ROWS = LM_HEAD_TP_SIZE * MAX_LOGIT_ROWS
 LM_HEAD_M_TILE = 80
 LM_HEAD_N_TILE = 256
 LM_HEAD_K_TILE = 128
+LM_HEAD_PUSH_M_TILE = 192
+LM_HEAD_PUSH_PANEL_BYTES = (LM_HEAD_PUSH_M_TILE // 2) * LM_HEAD_N_TILE * 4
+LM_HEAD_PUSH_FIFO_BYTES = LM_HEAD_PUSH_PANEL_BYTES * 2
+LM_HEAD_PUSH_L1_K_TILE = 256
+LM_HEAD_PUSH_L0_K_TILE = 64
+LM_HEAD_GATHER_M_TILE = 72
+LM_HEAD_TAIL_TILE = VOCAB_PER_TP % LM_HEAD_N_TILE or LM_HEAD_N_TILE
 HIDDEN_OWNER_ROW_TILE = gcd(MAX_LOGIT_ROWS, 48)
 HIDDEN_PUSH_WORKER_TILE = (MAX_LOGIT_ROWS + 64 // LM_HEAD_TP_SIZE - 1) // (64 // LM_HEAD_TP_SIZE)
 HIDDEN_PUSH_ROW_TILE = gcd(HIDDEN_OWNER_ROW_TILE, HIDDEN_PUSH_WORKER_TILE)
@@ -73,38 +80,390 @@ if __name__ == "__main__" and DP_SIZE < 1:
     raise ValueError(f"--dp must be positive, got {DP_SIZE}")
 
 
-@pl.jit.extern(
-    core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "lm_head_project_push.cpp",
-    aiv_source=Path(__file__).parent / "kernels" / "lm_head_project_push.cpp", dual_aiv_dispatch=True,
-    include_dirs=(pto_isa_include_dir(),),
-)
-def _lm_head_project_push(
-    hidden_states: pl.Tensor,
-    lm_head_weight: pl.Tensor,
-    received: pl.Out[pld.DistributedTensor],
+def _lm_head_push_row_tile(num_rows: int) -> int:
+    group_rows = LM_HEAD_TP_SIZE * num_rows
+    # Cube row alignment and complete owner stripes on each AIV lane.
+    row_alignment = lcm(16, 2 * HIDDEN_OWNER_ROW_TILE)
+    if LM_HEAD_TP_SIZE > 1 and group_rows % row_alignment != 0:
+        raise ValueError(f"LM head projection row count {group_rows} must be a multiple of {row_alignment}")
+    return min(LM_HEAD_PUSH_M_TILE, group_rows)
+
+
+@pl.jit.inline(auto_scope=False)
+def _lm_head_prefetch_panel(
+    hidden: pl.Tensor,
+    weight: pl.Tensor,
+    row: pl.Scalar[pl.INDEX],
+    worker: pl.Scalar[pl.INDEX],
+    step: pl.Scalar[pl.INDEX],
+    row_tile: pl.constexpr,
+) -> pl.Tuple[pl.Tile, pl.Tile]:
+    k = step % (D // LM_HEAD_PUSH_L1_K_TILE) * LM_HEAD_PUSH_L1_K_TILE
+    column = (worker + step // (D // LM_HEAD_PUSH_L1_K_TILE) * 32) * LM_HEAD_N_TILE
+    a = pl.load(hidden, [row, k], [row_tile, LM_HEAD_PUSH_L1_K_TILE], target_memory=pl.Mem.Mat)
+    b = pl.load(
+        weight, [k, column], [LM_HEAD_PUSH_L1_K_TILE, LM_HEAD_N_TILE],
+        target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP,
+    )
+    return a, b
+
+
+@pl.jit.inline(auto_scope=False)
+def _lm_head_publish_panel(
+    panel: pl.Tile[[PANEL_ROWS_DYN, PANEL_COLUMNS_DYN], pl.FP32],
+    received: pld.DistributedTensor,
     tp_rank: pl.Scalar[pl.INT32],
     group_base: pl.Scalar[pl.INT32],
-    tp_size: pl.Scalar[pl.INDEX],
-    owner_rows: pl.Scalar[pl.INDEX],
-    vocabulary: pl.Scalar[pl.INDEX],
-    row_tile: pl.Scalar[pl.INDEX],
-    owner_row_tile: pl.Scalar[pl.INDEX],
-) -> pld.DistributedTensor:
-    return received
+    row: pl.Scalar[pl.INDEX],
+    column: pl.Scalar[pl.INDEX],
+    lane: pl.Scalar[pl.INDEX],
+    num_rows: pl.constexpr,
+    lane_rows: pl.Scalar[pl.INDEX],
+    column_tile: pl.constexpr,
+):
+    # Each lane starts at its own half of the valid rows, including a short M tile.
+    # Panel storage is ordered by source shard, then by vocabulary panel.
+    panel_view = pl.tensor.view(received, [num_rows * (VOCAB // column_tile), column_tile])
+    panel_row = (tp_rank * VOCAB_PER_TP + column) * num_rows // column_tile
+    for offset in pl.range(0, lane_rows, HIDDEN_OWNER_ROW_TILE):
+        stripe = row + lane * lane_rows + offset
+        owner = stripe // HIDDEN_OWNER_ROW_TILE % LM_HEAD_TP_SIZE
+        owner_row = stripe // (HIDDEN_OWNER_ROW_TILE * LM_HEAD_TP_SIZE) * HIDDEN_OWNER_ROW_TILE
+        block = pl.tile.slice(panel, [HIDDEN_OWNER_ROW_TILE, column_tile], [offset, 0])
+        value = pl.cast(block, pl.BF16, mode="rint")
+        pld.tile.remote_store(value, panel_view, group_base + owner, [panel_row + owner_row, 0])
 
 
-@pl.jit.extern(
-    core_type="aiv", source=Path(__file__).parent / "kernels" / "lm_head_panel_gather.cpp",
-    include_dirs=(pto_isa_include_dir(),),
-)
-def _lm_head_panel_gather(
-    received: pl.Tensor,
-    logits: pl.Out[pl.Tensor],
-    tp_size: pl.Scalar[pl.INDEX],
-    owner_rows: pl.Scalar[pl.INDEX],
-    vocabulary: pl.Scalar[pl.INDEX],
-) -> pl.Tensor:
-    ...
+@pl.jit.inline(auto_scope=False)
+def _lm_head_project_compact_tail(
+    hidden: pl.Tensor,
+    weight: pl.Tensor,
+    row: pl.Scalar[pl.INDEX],
+    column: pl.Scalar[pl.INDEX],
+    rows: pl.Scalar[pl.INDEX],
+    row_tile: pl.constexpr,
+    column_tile: pl.constexpr,
+) -> pl.Tile:
+    seed = pl.tile.create([row_tile, column_tile], dtype=pl.FP32, target_memory=pl.Mem.Acc, compact=True)
+    acc = pl.set_validshape(seed, rows, column_tile)
+    for k in pl.pipeline(0, D, LM_HEAD_PUSH_L1_K_TILE, stage=2):
+        a = pl.load(hidden, [row, k], [row_tile, LM_HEAD_PUSH_L1_K_TILE],
+                    valid_shape=[rows, LM_HEAD_PUSH_L1_K_TILE], target_memory=pl.Mem.Mat)
+        b = pl.load(
+            weight, [k, column], [LM_HEAD_PUSH_L1_K_TILE, column_tile],
+            target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP,
+        )
+        for inner in pl.pipeline(0, LM_HEAD_PUSH_L1_K_TILE, LM_HEAD_PUSH_L0_K_TILE, stage=2):
+            left = pl.tile.extract(
+                a, 0, inner, [row_tile, LM_HEAD_PUSH_L0_K_TILE], target_memory=pl.Mem.Left,
+            )
+            right = pl.tile.extract(
+                b, inner, 0, [LM_HEAD_PUSH_L0_K_TILE, column_tile], target_memory=pl.Mem.Right,
+            )
+            acc = pl.matmul_acc(acc, left, right, init_cond=(k + inner == 0))
+    return acc
+
+
+@pl.jit.inline(auto_scope=False)
+def _lm_head_prefetch_compact_panel(
+    hidden: pl.Tensor,
+    weight: pl.Tensor,
+    row: pl.Scalar[pl.INDEX],
+    worker: pl.Scalar[pl.INDEX],
+    step: pl.Scalar[pl.INDEX],
+    rows: pl.Scalar[pl.INDEX],
+    row_tile: pl.constexpr,
+) -> pl.Tuple[pl.Tile, pl.Tile]:
+    k = step % (D // LM_HEAD_PUSH_L1_K_TILE) * LM_HEAD_PUSH_L1_K_TILE
+    column = (worker + step // (D // LM_HEAD_PUSH_L1_K_TILE) * 32) * LM_HEAD_N_TILE
+    a = pl.load(hidden, [row, k], [row_tile, LM_HEAD_PUSH_L1_K_TILE],
+                valid_shape=[rows, LM_HEAD_PUSH_L1_K_TILE], target_memory=pl.Mem.Mat)
+    b = pl.load(
+        weight,
+        [k, column],
+        [LM_HEAD_PUSH_L1_K_TILE, LM_HEAD_N_TILE],
+        target_memory=pl.Mem.Mat,
+        cache=pl.CachePolicy.NOT_ALLOC_KEEP,
+    )
+    return a, b
+
+
+@pl.jit.inline(auto_scope=False)
+def _lm_head_receive_panel(
+    received: pld.DistributedTensor,
+    tp_rank: pl.Scalar[pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    row: pl.Scalar[pl.INDEX],
+    column: pl.Scalar[pl.INDEX],
+    lane: pl.Scalar[pl.INDEX],
+    num_rows: pl.constexpr,
+    rows: pl.Scalar[pl.INDEX],
+    row_tile: pl.constexpr,
+    column_tile: pl.constexpr,
+):
+    panel = pl.tpop_from_aic(shape=[row_tile // 2, column_tile], dtype=pl.FP32, split=1)
+    _lm_head_publish_panel(
+        panel, received, tp_rank, group_base, row, column, lane, num_rows, rows // 2, column_tile,
+    )
+    pl.tfree_to_aic(panel)
+
+
+@pl.jit.inline(auto_scope=False)
+def _lm_head_project_push(
+    hidden: pl.Tensor,
+    weight: pl.Tensor,
+    received: pld.DistributedTensor,
+    tp_rank: pl.Scalar[pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    dispatch_ready: pl.Scalar[pl.TASK_ID],
+    dispatch_notified: pl.Scalar[pl.TASK_ID],
+    num_rows: pl.constexpr,
+    row_tile: pl.constexpr,
+    multi_row_tiles: pl.constexpr,
+) -> pl.Scalar[pl.TASK_ID]:
+    with pl.spmd(
+        32, name_hint="lm_head_matmul_push", deps=[dispatch_ready, dispatch_notified],
+    ) as logits_pushed:
+        # Each AIV receives half the FP32 rows and publishes its BF16 stripes.
+        peer = pl.import_peer_buffer(name="projection_panels")
+        pl.aic_initialize_pipe(
+            c2v_consumer_buf=peer,
+            dir_mask=1,
+            slot_size=LM_HEAD_PUSH_PANEL_BYTES,
+            slot_num=2,
+            ptoas_plan_memory=multi_row_tiles,
+            ptoas_buffer_id_sync=True,
+        )
+        buffer = pl.reserve_buffer(name="projection_panels", size=LM_HEAD_PUSH_FIFO_BYTES)
+        pl.aiv_initialize_pipe(
+            c2v_consumer_buf=buffer,
+            dir_mask=1,
+            slot_size=LM_HEAD_PUSH_PANEL_BYTES,
+            slot_num=2,
+            ptoas_plan_memory=multi_row_tiles,
+            ptoas_buffer_id_sync=True,
+        )
+        full_panels = VOCAB_PER_TP // LM_HEAD_N_TILE
+        worker = pl.tile.get_block_idx()
+        group_rows = LM_HEAD_TP_SIZE * num_rows
+        if multi_row_tiles:
+            panel_count = (full_panels + 31 - worker) // 32
+            steps = panel_count * (D // LM_HEAD_PUSH_L1_K_TILE)
+            # The final M tile keeps the same allocation geometry and carries its valid row count.
+            for row in pl.range(0, group_rows, row_tile):
+                rows = pl.min(row_tile, group_rows - row)
+                seed = pl.tile.create([row_tile, LM_HEAD_N_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc, compact=True)
+                acc_pipe = pl.set_validshape(seed, rows, LM_HEAD_N_TILE)
+                # Carry both L1 slots across full vocabulary panels.
+                a_even, b_even = _lm_head_prefetch_compact_panel(hidden, weight, row, worker, 0, rows, row_tile)
+                a_odd, b_odd = _lm_head_prefetch_compact_panel(hidden, weight, row, worker, 1, rows, row_tile)
+                for step in pl.range(0, steps - 2, 2):
+                    ordinal = pl.cast(step, pl.UINT32)
+                    k_even = pl.cast(ordinal % (D // LM_HEAD_PUSH_L1_K_TILE), pl.INDEX) * LM_HEAD_PUSH_L1_K_TILE
+                    for inner in pl.pipeline(0, LM_HEAD_PUSH_L1_K_TILE, LM_HEAD_PUSH_L0_K_TILE, stage=2):
+                        left = pl.tile.extract(a_even, 0, inner, [row_tile, LM_HEAD_PUSH_L0_K_TILE], target_memory=pl.Mem.Left)
+                        right = pl.tile.extract(b_even, inner, 0, [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_N_TILE], target_memory=pl.Mem.Right)
+                        acc_pipe = pl.matmul_acc(acc_pipe, left, right, init_cond=(k_even == 0 and inner == 0))
+                    a_even, b_even = _lm_head_prefetch_compact_panel(hidden, weight, row, worker, step + 2, rows, row_tile)
+                    for inner in pl.pipeline(0, LM_HEAD_PUSH_L1_K_TILE, LM_HEAD_PUSH_L0_K_TILE, stage=2):
+                        left = pl.tile.extract(a_odd, 0, inner, [row_tile, LM_HEAD_PUSH_L0_K_TILE], target_memory=pl.Mem.Left)
+                        right = pl.tile.extract(b_odd, inner, 0, [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_N_TILE], target_memory=pl.Mem.Right)
+                        acc_pipe = pl.matmul_acc(acc_pipe, left, right, init_cond=False)
+                    a_odd, b_odd = _lm_head_prefetch_compact_panel(hidden, weight, row, worker, step + 3, rows, row_tile)
+                    if k_even == D - 2 * LM_HEAD_PUSH_L1_K_TILE:
+                        n = (
+                            worker + pl.cast(ordinal // (D // LM_HEAD_PUSH_L1_K_TILE), pl.INDEX) * 32
+                        ) * LM_HEAD_N_TILE
+                        pl.tpush_to_aiv(acc_pipe, split=1, split_valid_rows=True)
+                        for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                            _lm_head_receive_panel(
+                                received, tp_rank, group_base, row, n, lane,
+                                num_rows, rows, row_tile, LM_HEAD_N_TILE,
+                            )
+                for inner in pl.pipeline(0, LM_HEAD_PUSH_L1_K_TILE, LM_HEAD_PUSH_L0_K_TILE, stage=2):
+                    left = pl.tile.extract(a_even, 0, inner, [row_tile, LM_HEAD_PUSH_L0_K_TILE], target_memory=pl.Mem.Left)
+                    right = pl.tile.extract(b_even, inner, 0, [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_N_TILE], target_memory=pl.Mem.Right)
+                    acc_pipe = pl.matmul_acc(acc_pipe, left, right, init_cond=False)
+                for inner in pl.pipeline(0, LM_HEAD_PUSH_L1_K_TILE, LM_HEAD_PUSH_L0_K_TILE, stage=2):
+                    left = pl.tile.extract(a_odd, 0, inner, [row_tile, LM_HEAD_PUSH_L0_K_TILE], target_memory=pl.Mem.Left)
+                    right = pl.tile.extract(b_odd, inner, 0, [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_N_TILE], target_memory=pl.Mem.Right)
+                    acc_pipe = pl.matmul_acc(acc_pipe, left, right, init_cond=False)
+                n_last = (worker + (panel_count - 1) * 32) * LM_HEAD_N_TILE
+                pl.tpush_to_aiv(acc_pipe, split=1, split_valid_rows=True)
+                for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                    _lm_head_receive_panel(
+                        received, tp_rank, group_base, row, n_last, lane,
+                        num_rows, rows, row_tile, LM_HEAD_N_TILE,
+                    )
+                if VOCAB_PER_TP % LM_HEAD_N_TILE != 0 and worker == full_panels % 32:
+                    column = full_panels * LM_HEAD_N_TILE
+                    acc_tail = _lm_head_project_compact_tail(hidden, weight, row, column, rows, row_tile, LM_HEAD_TAIL_TILE)
+                    pl.tpush_to_aiv(acc_tail, split=1, split_valid_rows=True)
+                    for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                        _lm_head_receive_panel(
+                            received, tp_rank, group_base, row, column, lane,
+                            num_rows, rows, row_tile, LM_HEAD_TAIL_TILE,
+                        )
+        else:
+            # Share two L0A/L0B slots across the full and tail panels.
+            for row in pl.range(0, group_rows, row_tile):
+                panel_count = (full_panels + 31 - worker) // 32
+                steps = panel_count * (D // LM_HEAD_PUSH_L1_K_TILE)
+                acc_pipe = pl.tile.create([row_tile, LM_HEAD_N_TILE], dtype=pl.FP32)
+                # Carry both L1 slots across full vocabulary panels.
+                a_even, b_even = _lm_head_prefetch_panel(hidden, weight, row, worker, 0, row_tile)
+                a_odd, b_odd = _lm_head_prefetch_panel(hidden, weight, row, worker, 1, row_tile)
+                for step in pl.range(0, steps - 2, 2):
+                    ordinal = pl.cast(step, pl.UINT32)
+                    k_even = pl.cast(ordinal % (D // LM_HEAD_PUSH_L1_K_TILE), pl.INDEX) * LM_HEAD_PUSH_L1_K_TILE
+                    for inner in pl.range(0, LM_HEAD_PUSH_L1_K_TILE, 2 * LM_HEAD_PUSH_L0_K_TILE):
+                        left_0: pl.Tile[
+                            [row_tile, LM_HEAD_PUSH_L0_K_TILE], pl.BF16, pl.MemRef("project_left", slots=2)[0], pl.Mem.Left
+                        ] = pl.tile.extract(a_even, 0, inner, [row_tile, LM_HEAD_PUSH_L0_K_TILE],
+                                            target_memory=pl.Mem.Left)
+                        right_0: pl.Tile[
+                            [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_N_TILE], pl.BF16, pl.MemRef("project_right", slots=2)[0], pl.Mem.Right
+                        ] = pl.tile.extract(b_even, inner, 0, [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_N_TILE],
+                                            target_memory=pl.Mem.Right)
+                        left_1: pl.Tile[
+                            [row_tile, LM_HEAD_PUSH_L0_K_TILE], pl.BF16, pl.MemRef("project_left", slots=2)[1], pl.Mem.Left
+                        ] = pl.tile.extract(a_even, 0, inner + LM_HEAD_PUSH_L0_K_TILE, [row_tile, LM_HEAD_PUSH_L0_K_TILE],
+                                            target_memory=pl.Mem.Left)
+                        right_1: pl.Tile[
+                            [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_N_TILE], pl.BF16, pl.MemRef("project_right", slots=2)[1], pl.Mem.Right
+                        ] = pl.tile.extract(b_even, inner + LM_HEAD_PUSH_L0_K_TILE, 0, [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_N_TILE],
+                                            target_memory=pl.Mem.Right)
+                        acc_pipe = pl.matmul_acc(acc_pipe, left_0, right_0, init_cond=(k_even == 0 and inner == 0))
+                        acc_pipe = pl.matmul_acc(acc_pipe, left_1, right_1)
+                    a_even, b_even = _lm_head_prefetch_panel(hidden, weight, row, worker, step + 2, row_tile)
+                    for inner in pl.range(0, LM_HEAD_PUSH_L1_K_TILE, 2 * LM_HEAD_PUSH_L0_K_TILE):
+                        left_0: pl.Tile[
+                            [row_tile, LM_HEAD_PUSH_L0_K_TILE], pl.BF16, pl.MemRef("project_left", slots=2)[0], pl.Mem.Left
+                        ] = pl.tile.extract(a_odd, 0, inner, [row_tile, LM_HEAD_PUSH_L0_K_TILE],
+                                            target_memory=pl.Mem.Left)
+                        right_0: pl.Tile[
+                            [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_N_TILE], pl.BF16, pl.MemRef("project_right", slots=2)[0], pl.Mem.Right
+                        ] = pl.tile.extract(b_odd, inner, 0, [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_N_TILE],
+                                            target_memory=pl.Mem.Right)
+                        left_1: pl.Tile[
+                            [row_tile, LM_HEAD_PUSH_L0_K_TILE], pl.BF16, pl.MemRef("project_left", slots=2)[1], pl.Mem.Left
+                        ] = pl.tile.extract(a_odd, 0, inner + LM_HEAD_PUSH_L0_K_TILE, [row_tile, LM_HEAD_PUSH_L0_K_TILE],
+                                            target_memory=pl.Mem.Left)
+                        right_1: pl.Tile[
+                            [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_N_TILE], pl.BF16, pl.MemRef("project_right", slots=2)[1], pl.Mem.Right
+                        ] = pl.tile.extract(b_odd, inner + LM_HEAD_PUSH_L0_K_TILE, 0, [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_N_TILE],
+                                            target_memory=pl.Mem.Right)
+                        acc_pipe = pl.matmul_acc(acc_pipe, left_0, right_0, init_cond=False)
+                        acc_pipe = pl.matmul_acc(acc_pipe, left_1, right_1)
+                    a_odd, b_odd = _lm_head_prefetch_panel(hidden, weight, row, worker, step + 3, row_tile)
+                    if k_even == D - 2 * LM_HEAD_PUSH_L1_K_TILE:
+                        n = (worker + pl.cast(ordinal // (D // LM_HEAD_PUSH_L1_K_TILE), pl.INDEX) * 32) * LM_HEAD_N_TILE
+                        pl.tpush_to_aiv(acc_pipe, split=1)
+                        for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                            panel_pipe = pl.tpop_from_aic(shape=[row_tile // 2, LM_HEAD_N_TILE], dtype=pl.FP32, split=1)
+                            _lm_head_publish_panel(
+                                panel_pipe, received, tp_rank, group_base, row, n, lane, num_rows, row_tile // 2, LM_HEAD_N_TILE,
+                            )
+                            pl.tfree_to_aic(panel_pipe)
+                for inner in pl.range(0, LM_HEAD_PUSH_L1_K_TILE, 2 * LM_HEAD_PUSH_L0_K_TILE):
+                    left_0: pl.Tile[
+                        [row_tile, LM_HEAD_PUSH_L0_K_TILE], pl.BF16, pl.MemRef("project_left", slots=2)[0], pl.Mem.Left
+                    ] = pl.tile.extract(a_even, 0, inner, [row_tile, LM_HEAD_PUSH_L0_K_TILE],
+                                        target_memory=pl.Mem.Left)
+                    right_0: pl.Tile[
+                        [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_N_TILE], pl.BF16, pl.MemRef("project_right", slots=2)[0], pl.Mem.Right
+                    ] = pl.tile.extract(b_even, inner, 0, [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_N_TILE],
+                                        target_memory=pl.Mem.Right)
+                    left_1: pl.Tile[
+                        [row_tile, LM_HEAD_PUSH_L0_K_TILE], pl.BF16, pl.MemRef("project_left", slots=2)[1], pl.Mem.Left
+                    ] = pl.tile.extract(a_even, 0, inner + LM_HEAD_PUSH_L0_K_TILE, [row_tile, LM_HEAD_PUSH_L0_K_TILE],
+                                        target_memory=pl.Mem.Left)
+                    right_1: pl.Tile[
+                        [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_N_TILE], pl.BF16, pl.MemRef("project_right", slots=2)[1], pl.Mem.Right
+                    ] = pl.tile.extract(b_even, inner + LM_HEAD_PUSH_L0_K_TILE, 0, [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_N_TILE],
+                                        target_memory=pl.Mem.Right)
+                    acc_pipe = pl.matmul_acc(acc_pipe, left_0, right_0, init_cond=False)
+                    acc_pipe = pl.matmul_acc(acc_pipe, left_1, right_1)
+                for inner in pl.range(0, LM_HEAD_PUSH_L1_K_TILE, 2 * LM_HEAD_PUSH_L0_K_TILE):
+                    left_0: pl.Tile[
+                        [row_tile, LM_HEAD_PUSH_L0_K_TILE], pl.BF16, pl.MemRef("project_left", slots=2)[0], pl.Mem.Left
+                    ] = pl.tile.extract(a_odd, 0, inner, [row_tile, LM_HEAD_PUSH_L0_K_TILE],
+                                        target_memory=pl.Mem.Left)
+                    right_0: pl.Tile[
+                        [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_N_TILE], pl.BF16, pl.MemRef("project_right", slots=2)[0], pl.Mem.Right
+                    ] = pl.tile.extract(b_odd, inner, 0, [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_N_TILE],
+                                        target_memory=pl.Mem.Right)
+                    left_1: pl.Tile[
+                        [row_tile, LM_HEAD_PUSH_L0_K_TILE], pl.BF16, pl.MemRef("project_left", slots=2)[1], pl.Mem.Left
+                    ] = pl.tile.extract(a_odd, 0, inner + LM_HEAD_PUSH_L0_K_TILE, [row_tile, LM_HEAD_PUSH_L0_K_TILE],
+                                        target_memory=pl.Mem.Left)
+                    right_1: pl.Tile[
+                        [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_N_TILE], pl.BF16, pl.MemRef("project_right", slots=2)[1], pl.Mem.Right
+                    ] = pl.tile.extract(b_odd, inner + LM_HEAD_PUSH_L0_K_TILE, 0, [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_N_TILE],
+                                        target_memory=pl.Mem.Right)
+                    acc_pipe = pl.matmul_acc(acc_pipe, left_0, right_0, init_cond=False)
+                    acc_pipe = pl.matmul_acc(acc_pipe, left_1, right_1)
+                n_last = (worker + (panel_count - 1) * 32) * LM_HEAD_N_TILE
+                pl.tpush_to_aiv(acc_pipe, split=1)
+                for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                    panel_pipe_last = pl.tpop_from_aic(shape=[row_tile // 2, LM_HEAD_N_TILE], dtype=pl.FP32, split=1)
+                    _lm_head_publish_panel(
+                        panel_pipe_last, received, tp_rank, group_base, row, n_last, lane, num_rows, row_tile // 2, LM_HEAD_N_TILE,
+                    )
+                    pl.tfree_to_aic(panel_pipe_last)
+                if VOCAB_PER_TP % LM_HEAD_N_TILE != 0 and worker == full_panels % 32:
+                    column = full_panels * LM_HEAD_N_TILE
+                    acc_tail = pl.tile.create([row_tile, LM_HEAD_TAIL_TILE], dtype=pl.FP32)
+                    for k in pl.pipeline(0, D, LM_HEAD_PUSH_L1_K_TILE, stage=2):
+                        a_tail = pl.load(hidden, [row, k], [row_tile, LM_HEAD_PUSH_L1_K_TILE], target_memory=pl.Mem.Mat)
+                        b_tail = pl.load(weight, [k, column], [LM_HEAD_PUSH_L1_K_TILE, LM_HEAD_TAIL_TILE], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
+                        for inner in pl.range(0, LM_HEAD_PUSH_L1_K_TILE, 2 * LM_HEAD_PUSH_L0_K_TILE):
+                            left_0: pl.Tile[
+                                [row_tile, LM_HEAD_PUSH_L0_K_TILE], pl.BF16, pl.MemRef("project_left", slots=2)[0], pl.Mem.Left
+                            ] = pl.tile.extract(a_tail, 0, inner, [row_tile, LM_HEAD_PUSH_L0_K_TILE],
+                                                target_memory=pl.Mem.Left)
+                            right_tail_0: pl.Tile[
+                                [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_TAIL_TILE], pl.BF16, pl.MemRef("project_right", slots=2)[0], pl.Mem.Right
+                            ] = pl.tile.extract(b_tail, inner, 0, [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_TAIL_TILE],
+                                                target_memory=pl.Mem.Right)
+                            left_1: pl.Tile[
+                                [row_tile, LM_HEAD_PUSH_L0_K_TILE], pl.BF16, pl.MemRef("project_left", slots=2)[1], pl.Mem.Left
+                            ] = pl.tile.extract(a_tail, 0, inner + LM_HEAD_PUSH_L0_K_TILE, [row_tile, LM_HEAD_PUSH_L0_K_TILE],
+                                                target_memory=pl.Mem.Left)
+                            right_tail_1: pl.Tile[
+                                [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_TAIL_TILE], pl.BF16, pl.MemRef("project_right", slots=2)[1], pl.Mem.Right
+                            ] = pl.tile.extract(b_tail, inner + LM_HEAD_PUSH_L0_K_TILE, 0, [LM_HEAD_PUSH_L0_K_TILE, LM_HEAD_TAIL_TILE],
+                                                target_memory=pl.Mem.Right)
+                            acc_tail = pl.matmul_acc(acc_tail, left_0, right_tail_0, init_cond=(k == 0 and inner == 0))
+                            acc_tail = pl.matmul_acc(acc_tail, left_1, right_tail_1)
+                    pl.tpush_to_aiv(acc_tail, split=1)
+                    for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                        panel_tail = pl.tpop_from_aic(shape=[row_tile // 2, LM_HEAD_TAIL_TILE], dtype=pl.FP32, split=1)
+                        _lm_head_publish_panel(
+                            panel_tail, received, tp_rank, group_base, row, column, lane,
+                            num_rows, row_tile // 2, LM_HEAD_TAIL_TILE,
+                        )
+                        pl.tfree_to_aic(panel_tail)
+    return logits_pushed
+
+
+@pl.jit.inline(auto_scope=False)
+def _lm_head_panel_gather_tile(
+    received: pld.DistributedTensor,
+    logits: pl.Tensor,
+    shard: pl.Scalar[pl.INDEX],
+    row: pl.Scalar[pl.INDEX],
+    column: pl.Scalar[pl.INDEX],
+    num_rows: pl.constexpr,
+    column_tile: pl.constexpr,
+):
+    output_column = shard * VOCAB_PER_TP + column
+    input_row = output_column * num_rows // column_tile + row
+    rows = pl.min(LM_HEAD_GATHER_M_TILE, num_rows - row)
+    panel_view = pl.tensor.view(received, [num_rows * (VOCAB // column_tile), column_tile])
+    tile = pl.load(panel_view, [input_row, 0], [LM_HEAD_GATHER_M_TILE, column_tile], valid_shape=[rows, column_tile])
+    value = pl.cast(tile, pl.FP32, mode="none")
+    pl.store(value, [row, output_column], logits)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -264,14 +623,13 @@ def lm_head(
                         cmp=pld.WaitCmp.Ge,
                     )
 
-        group_m_tile = pl.min(192, LM_HEAD_TP_SIZE * num_rows)
         project_tp_rank = pl.cast(tp_rank, pl.INT32)
         project_group_base = pl.cast(group_base, pl.INT32)
-        with pl.spmd(32, name_hint="lm_head_matmul_push", deps=[dispatch_ready, dispatch_notified]) as logits_pushed:
-            logits_window = _lm_head_project_push(
-                hidden_window, lm_head_weight, logits_window, project_tp_rank, project_group_base, LM_HEAD_TP_SIZE,
-                num_rows, VOCAB_PER_TP, group_m_tile, HIDDEN_OWNER_ROW_TILE,
-            )
+        logits_pushed = _lm_head_project_push(
+            hidden_window, lm_head_weight, logits_window, project_tp_rank, project_group_base,
+            dispatch_ready, dispatch_notified, num_rows, _lm_head_push_row_tile(num_rows),
+            LM_HEAD_TP_SIZE * num_rows > _lm_head_push_row_tile(num_rows),
+        )
 
         # Publish one completion update after all vector workers finish their puts.
         with pl.spmd(LM_HEAD_TP_SIZE, name_hint="lm_head_combine_notify", deps=[logits_pushed]) as combine_notified:
@@ -291,7 +649,19 @@ def lm_head(
                     )
 
         with pl.spmd(64, name_hint="lm_head_combine_gather", deps=[combine_ready, combine_notified]) as gathered:
-            logits = _lm_head_panel_gather(logits_window, logits, LM_HEAD_TP_SIZE, num_rows, VOCAB_PER_TP)
+            gather_worker = pl.tile.get_block_idx()
+            row_tiles = (num_rows + LM_HEAD_GATHER_M_TILE - 1) // LM_HEAD_GATHER_M_TILE
+            full_panels = (VOCAB_PER_TP - LM_HEAD_TAIL_TILE) // LM_HEAD_N_TILE
+            for work in pl.pipeline(gather_worker, LM_HEAD_TP_SIZE * row_tiles * full_panels, 64, stage=2):
+                shard = work // (row_tiles * full_panels)
+                row = work // full_panels % row_tiles * LM_HEAD_GATHER_M_TILE
+                column = work % full_panels * LM_HEAD_N_TILE
+                _lm_head_panel_gather_tile(logits_window, logits, shard, row, column, num_rows, LM_HEAD_N_TILE)
+            for tail in pl.range(gather_worker, LM_HEAD_TP_SIZE * row_tiles, 64):
+                shard = tail // row_tiles
+                row = tail % row_tiles * LM_HEAD_GATHER_M_TILE
+                column = VOCAB_PER_TP - LM_HEAD_TAIL_TILE
+                _lm_head_panel_gather_tile(logits_window, logits, shard, row, column, num_rows, LM_HEAD_TAIL_TILE)
 
         # Clear this rank's counters after its final logits-window read.
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_signal_clear", deps=[gathered], allow_early_resolve=False):
