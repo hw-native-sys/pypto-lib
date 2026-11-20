@@ -1002,9 +1002,9 @@ def l3_prefill_fwd_dspark(
     draft_main_proj_scale: pl.Tensor[[RANKS, DSPARK_MAIN_IN // DSPARK_MX_GROUP, DSPARK_D], pl.FP8E8M0],
     draft_main_norm_weight: pl.Tensor[[RANKS, DSPARK_D], pl.BF16],
     draft_num_tokens: pl.Tensor[[RANKS, 1], pl.INT32],
-    draft_context_slots: pl.Tensor[[RANKS, DSPARK_DRAFT_LAYERS, CAPACITY], pl.INT64],
-    draft_context_rope_cos: pl.Tensor[[RANKS, CAPACITY, 64], pl.FP32],
-    draft_context_rope_sin: pl.Tensor[[RANKS, CAPACITY, 64], pl.FP32],
+    draft_context_slots: pl.Tensor[[RANKS, DSPARK_DRAFT_LAYERS, PREFILL_MAX_TOKENS], pl.INT64],
+    draft_context_rope_cos: pl.Tensor[[RANKS, PREFILL_MAX_TOKENS, 64], pl.FP32],
+    draft_context_rope_sin: pl.Tensor[[RANKS, PREFILL_MAX_TOKENS, 64], pl.FP32],
     draft_wkv: pl.Tensor[[RANKS, DSPARK_DRAFT_LAYERS, DSPARK_D, 128], pl.FP8E4M3FN],
     draft_wkv_scale: pl.Tensor[[RANKS, DSPARK_DRAFT_LAYERS, DSPARK_D // DSPARK_MX_GROUP, 128], pl.FP8E8M0],
     draft_kv_norm_weight: pl.Tensor[[RANKS, DSPARK_DRAFT_LAYERS, 128], pl.BF16],
@@ -1178,10 +1178,15 @@ def l3_prefill_fwd_dspark(
         # Fuse draft context KV materialization into the terminal prefill
         # composite. The dependency is carried by dspark_target_hidden, so
         # the context write starts after the target layers publish their taps.
+        context_slots = pl.slice(
+            draft_context_slots[rank], [DSPARK_DRAFT_LAYERS, CAPACITY], [0, 0]
+        )
+        context_rope_cos = pl.slice(draft_context_rope_cos[rank], [CAPACITY, 64], [0, 0])
+        context_rope_sin = pl.slice(draft_context_rope_sin[rank], [CAPACITY, 64], [0, 0])
         l2_dspark_prefill_context_kv_rank(
             dspark_target_hidden[rank], draft_main_proj_weight[rank], draft_main_proj_scale[rank],
-            draft_main_norm_weight[rank], draft_num_tokens[rank], draft_context_slots[rank],
-            draft_context_rope_cos[rank], draft_context_rope_sin[rank], draft_wkv[rank],
+            draft_main_norm_weight[rank], draft_num_tokens[rank], context_slots,
+            context_rope_cos, context_rope_sin, draft_wkv[rank],
             draft_wkv_scale[rank], draft_kv_norm_weight[rank], draft_window_cache[rank],
             device=rank,
         )
