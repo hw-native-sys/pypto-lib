@@ -14,6 +14,7 @@ so they run without a device.
 """
 
 import ctypes
+import struct
 import sys
 import types
 from contextlib import contextmanager
@@ -1920,10 +1921,22 @@ class TestGeneratedCppCache:
         # This cannot invoke a native compiler or initialize a device.
         from pypto.runtime.device_runner import _compile_single_kernel
 
+        # ELF64 with a section-name table and a linked device entry at the
+        # beginning of .text. Exercise the production image checks and extraction.
+        names = b"\0.shstrtab\0.text\0"
+        text = b"\0" * 4
+        section_table = 96
+        image = bytearray(section_table + 3 * 64)
+        image[:7] = b"\x7fELF\x02\x01\x01"
+        struct.pack_into("<HHIQQQIHHHHHH", image, 16, 2, 0x1029, 1, 0x1000, 0, section_table,
+                         0, 64, 0, 0, 64, 3, 1)
+        image[64:64 + len(names)] = names
+        image[88:88 + len(text)] = text
+        struct.pack_into("<IIQQQQIIQQ", image, section_table + 64, 1, 3, 0, 0, 64, len(names), 0, 0, 1, 0)
+        struct.pack_into("<IIQQQQIIQQ", image, section_table + 128, 11, 1, 6, 0x1000, 88, len(text), 0, 0, 4, 0)
         compiler = MagicMock()
-        compiler.compile_incore.return_value = b"cached kernel"
-        with patch("pypto.runtime.device_runner.extract_text_section", side_effect=lambda raw: raw):
-            _compile_single_kernel(kernel, compiler, platform, "", "hbg")
+        compiler.compile_incore.return_value = bytes(image)
+        _compile_single_kernel(kernel, compiler, platform, "", "hbg")
         compiler.compile_incore.assert_called_once()
 
     @pytest.mark.parametrize("platform", ["a5", "a5sim"])
