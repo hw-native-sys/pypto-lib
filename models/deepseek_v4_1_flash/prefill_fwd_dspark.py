@@ -158,7 +158,9 @@ def restore_window_tail(
             destination = pl.read(destination_slots, [token])
             if destination >= 0:
                 source = pl.read(source_slots, [token])
-                payload = pl.load(flat, [layer * rows + source, 0], [1, WINDOW_CACHE_BYTES])
+                payload = pl.load(
+                    flat, [layer * rows + source, 0], [1, WINDOW_CACHE_BYTES], clamp=True
+                )
                 pl.store(payload, [layer * rows + destination, 0], flat)
     return restored
 
