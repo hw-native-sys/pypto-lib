@@ -579,19 +579,20 @@ def _dspark_prefill_context_kv_rank(
     window_cache: pl.InOut[pl.Tensor[[DSPARK_DRAFT_LAYERS, C.ORI_BLOCKS_DYN,
                                        BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
 ):
-    context_tokens = pl.tensor.dim(target_hidden, 0)
-    projected = pl.create_tensor([context_tokens, D], dtype=pl.BF16)
-    main_x = pl.create_tensor([context_tokens, D], dtype=pl.BF16)
-    dspark_proj(target_hidden, main_proj_weight, main_proj_scale, projected, context_tokens)
-    rms_norm(projected, main_norm_weight, main_x, context_tokens, width=D, zero_tail=False)
-    payload, scales, _ = qkv_quant(main_x, context_tokens, row_tile=80)
-    for layer in pl.range(DSPARK_DRAFT_LAYERS):
-        layer_wkv_scale: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[layer]
-        dspark_context_kv(
-            payload, scales, wkv[layer], layer_wkv_scale, kv_norm_weight[layer],
-            context_rope_cos, context_rope_sin, context_slots[layer],
-            window_cache[layer], context_tokens,
-        )
+    if pl.read(num_tokens, [0]) > 0:
+        context_tokens = pl.tensor.dim(target_hidden, 0)
+        projected = pl.create_tensor([context_tokens, D], dtype=pl.BF16)
+        main_x = pl.create_tensor([context_tokens, D], dtype=pl.BF16)
+        dspark_proj(target_hidden, main_proj_weight, main_proj_scale, projected, context_tokens)
+        rms_norm(projected, main_norm_weight, main_x, context_tokens, width=D, zero_tail=False)
+        payload, scales, _ = qkv_quant(main_x, context_tokens, row_tile=80)
+        for layer in pl.range(DSPARK_DRAFT_LAYERS):
+            layer_wkv_scale: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[layer]
+            dspark_context_kv(
+                payload, scales, wkv[layer], layer_wkv_scale, kv_norm_weight[layer],
+                context_rope_cos, context_rope_sin, context_slots[layer],
+                window_cache[layer], context_tokens,
+            )
 
 
 dspark_prefill_context_kv_rank = pl.jit.inline(auto_scope=False)(
