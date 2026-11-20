@@ -60,6 +60,50 @@ def _engram_project(payload: pl.Tensor, weight: pl.Tensor, scales: pl.Tensor, we
     return kv
 
 
+@pl.jit.inline(auto_scope=False)
+def _engram_project_pypto(
+    payload: pl.Tensor, weight: pl.Tensor, scales: pl.Tensor, weight_scale: pl.Tensor,
+    kv: pl.Tensor, tokens: pl.Scalar[pl.INDEX], row_tile: pl.constexpr,
+    n_tile: pl.constexpr, inner_k: pl.constexpr,
+):
+    """Hold the K256 payload projection for validation after packed MX scale lowering is fixed."""
+    scale_groups = ENGRAM_K // 32
+    scale_tile = inner_k // 32
+    row_tiles = (tokens + row_tile - 1) // row_tile
+    col_tiles = KV_OUT // n_tile
+    padded = row_tiles * row_tile
+    activation_scale = pl.tensor.view(scales, [padded, scale_groups], layout=pl.MX_A_ZZ)
+    packed_weight_scale = pl.tensor.view(weight_scale, [scale_groups, KV_OUT], layout=pl.MX_B_NN)
+    with pl.spmd(pl.system.available_cluster_count(), name_hint="engram_projection_pypto"):
+        worker = pl.tile.get_block_idx()
+        workers = pl.tile.get_block_num()
+        for row in pl.range(row_tiles):
+            for col in pl.range(col_tiles):
+                if (row * col_tiles + col) % workers == worker:
+                    m0 = row * row_tile
+                    n0 = col * n_tile
+                    sa = pl.load(activation_scale, [m0, 0], [row_tile, scale_tile], target_memory=pl.Mem.Mat)
+                    sb = pl.load(packed_weight_scale, [0, n0], [scale_tile, n_tile], target_memory=pl.Mem.Mat)
+                    a_l1 = pl.load(payload, [m0, 0], [row_tile, PROJECTION_K_TILE], target_memory=pl.Mem.Mat)
+                    b_l1 = pl.load(weight, [0, n0], [PROJECTION_K_TILE, n_tile], target_memory=pl.Mem.Mat)
+                    a = pl.tile.extract(a_l1, 0, 0, [row_tile, inner_k], target_memory=pl.Mem.Left)
+                    b = pl.tile.extract(b_l1, 0, 0, [inner_k, n_tile], target_memory=pl.Mem.Right)
+                    acc = pl.matmul_mx(a, sa, b, sb)
+                    for k0 in pl.range(inner_k, ENGRAM_K, inner_k):
+                        local_k = k0 % PROJECTION_K_TILE
+                        if local_k == 0:
+                            a_l1 = pl.load(payload, [m0, k0], [row_tile, PROJECTION_K_TILE], target_memory=pl.Mem.Mat)
+                            b_l1 = pl.load(weight, [k0, n0], [PROJECTION_K_TILE, n_tile], target_memory=pl.Mem.Mat)
+                        a = pl.tile.extract(a_l1, 0, local_k, [row_tile, inner_k], target_memory=pl.Mem.Left)
+                        b = pl.tile.extract(b_l1, local_k, 0, [inner_k, n_tile], target_memory=pl.Mem.Right)
+                        sa = pl.load(activation_scale, [m0, k0 // 32], [row_tile, scale_tile], target_memory=pl.Mem.Mat)
+                        sb = pl.load(packed_weight_scale, [k0 // 32, n0], [scale_tile, n_tile], target_memory=pl.Mem.Mat)
+                        acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
+                    valid_acc = pl.set_validshape(acc, pl.min(row_tile, tokens - m0), n_tile)
+                    kv = pl.store(valid_acc, [m0, n0], kv)
+    return kv
+
+
 @pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels/engram.cpp",
                include_dirs=(pto_isa_include_dir(),))
 def _engram_gate_native(kv: pl.Tensor, weight: pl.Tensor, x: pl.Tensor, out: pl.Out[pl.Tensor],
