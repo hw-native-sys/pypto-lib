@@ -18,6 +18,12 @@ entries, must follow the project [coding style](../skills/fmt-coding-style/SKILL
   (`Performance target`, `Deferred performance work`, and
   `Compatibility requirements`) to guide implementation tradeoffs. Do not
   infer deferred work or reduced compatibility when these fields are absent.
+- **Keep the model index stable.** Approve changes to
+  `docs/models/<model>/index.md` only when readers need a new or corrected
+  description of the model's architecture, development priorities, public
+  interface, or supported configurations. Request removal of additions about
+  internal refactors, tile choices, fixtures, or individual benchmark results
+  before approval. Record per-change tuning details and measurements in the PR.
 - Apply optimizations to the existing shared implementation and adapt all
   affected callers. Do not add configuration branches, specialized entry
   points, or parallel implementations, or retain an old path, solely to
@@ -96,7 +102,15 @@ entries, must follow the project [coding style](../skills/fmt-coding-style/SKILL
 
 ## Contracts and validation
 
-- Model development should normally leave `tests/` unchanged.
+- **At most one contract test file per model.** The only file a model PR may
+  add or update under `tests/` is that model's serving contract test in
+  `tests/contract/`. Use the existing file if present. Limit its assertions to
+  the interface observable by serving callers. Request removal of any other
+  `tests/` additions or edits before approval. Operator correctness
+  and boundary cases belong in the model's executable validation entry.
+- Extend the existing model entry when it can exercise the changed behavior.
+- Update CI configuration when the change affects platform selection, case
+  discovery, or execution.
 - Preserve operator contracts: dtypes, scale encoding, layouts, quantization
   boundaries, sharding, and state ownership. Do not silently change interfaces,
   relax acceptance criteria, or claim support beyond the implemented and
@@ -104,7 +118,10 @@ entries, must follow the project [coding style](../skills/fmt-coding-style/SKILL
 - Executable operator files use the existing
   [golden harness](../../docs/run-and-validate/golden-harness.md). Their default
   invocation provides bounded correctness coverage of relevant shapes,
-  branches, and boundaries. Any failing subcase must make the entry fail.
+  branches, and boundaries. Choose inputs that drive the model caller's path
+  through the changed computation or state transition. Check the affected
+  output or state so that skipping the computation or writing the wrong value
+  would fail the case. Any failing subcase must make the entry fail.
 - Performance configurations require explicit options; large benchmark shapes
   and timing sweeps must not replace default correctness coverage. Case
   selection and validation defaults belong to the executable entry, not model
