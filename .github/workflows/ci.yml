@@ -200,7 +200,7 @@ jobs:
           torch-version: ${{ matrix.platform == 'a5sim' && 'torch==2.10.0' || 'torch==2.6.0' }}
           # The V4.1-Flash tree (a5sim leg) builds against this pypto revision;
           # a2a3sim keeps following origin HEAD.
-          pypto-ref: ${{ matrix.platform == 'a5sim' && '3db18db1286bdbb44266179e3aedae659174b711' || '' }}
+          pypto-ref: ${{ matrix.platform == 'a5sim' && 'd5ec0534ab23bf6c6226b32bc3c2e3c81b494c9e' || '' }}
 
       - name: Run simulator tests
         uses: ./.github/actions/run-sim-tests
@@ -261,7 +261,7 @@ jobs:
           torch-version: 'torch==2.10.0'
           # The V4.1-Flash model tree (a5 leg) builds against this pypto
           # revision; a2a3 keeps following origin HEAD.
-          pypto-ref: ${{ matrix.platform == 'a5' && '3db18db1286bdbb44266179e3aedae659174b711' || '' }}
+          pypto-ref: ${{ matrix.platform == 'a5' && 'd5ec0534ab23bf6c6226b32bc3c2e3c81b494c9e' || '' }}
 
       - name: Run device tests
         uses: ./.github/actions/run-device-tests
