@@ -788,6 +788,7 @@ if __name__ == "__main__":
                 mapping_shape=(args.tokens,),
                 block_size=BLOCK_SIZE // RATIO, leading_rank_axis=False,
                 max_error_ratio=0.005,
+                allow_signed_zero=True,
             ),
             "index_cache_scale": mapped_pool_ratio_allclose(
                 "compressed_slots", pool_name="index_cache_scale",
