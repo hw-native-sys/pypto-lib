@@ -452,7 +452,7 @@ def _pool_normalize(
     rms_inverse = pl.create_tile([64], dtype=pl.FP32, target_memory=pl.Mem.Vec)
     output = pl.create_tile([512], dtype=pl.BF16, target_memory=pl.Mem.Vec)
     rotated = pl.create_tile([512], dtype=pl.BF16, target_memory=pl.Mem.Vec)
-    with pl.reg_scope():
+    with pl.reg_scope(auto_sync=False):
         full = pl.reg.full_mask(lanes=64)
         for chunk in pl.hardware_loop(8):
             a = pl.reg.load(ps, chunk * 64, lanes=64)
@@ -473,8 +473,9 @@ def _pool_normalize(
             pooled_bf = pl.reg.convert(pooled, dtype=pl.BF16, rounding="R", saturate=False)
             pooled_fp = pl.reg.convert(pooled_bf, dtype=pl.FP32)
             _rounded_written = pl.reg.store(rounded, chunk * 64, pooled_fp)
+        pl.reg.mem_bar("VST_VLD")
 
-    with pl.reg_scope():
+    with pl.reg_scope(auto_sync=False):
         full = pl.reg.full_mask(lanes=64)
         # Fold 512 columns to 256, then reduce the four 64-lane block sums.
         lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
@@ -516,6 +517,7 @@ def _pool_normalize(
         zero = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
         inv = pl.reg.select(is_infinite, zero, inv)
         _inverse_written = pl.reg.store(rms_inverse, 0, inv, full)
+        pl.reg.mem_bar("VST_VLD")
 
     with pl.reg_scope():
         norm_full = pl.reg.full_mask(lanes=64)
@@ -542,7 +544,7 @@ def _rotate_quantize(
     packed = pl.create_tile([256], dtype=pl.UINT8, target_memory=pl.Mem.Vec)
     factors = pl.create_tile([64], dtype=pl.BF16, target_memory=pl.Mem.Vec)
     scale_storage = pl.create_tile([512], dtype=pl.FP32, target_memory=pl.Mem.Vec)
-    with pl.reg_scope():
+    with pl.reg_scope(auto_sync=False):
         full = pl.reg.full_mask(lanes=64)
         lower = pl.reg.active_mask(32, lanes=64)
         lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
@@ -560,6 +562,7 @@ def _rotate_quantize(
         interleaved, unused = pl.reg.intlv(real, imag, full)
         bf = pl.reg.convert(interleaved, dtype=pl.BF16, rounding="R", saturate=False)
         _raw_written = pl.reg.store(raw, 448, bf)
+        pl.reg.mem_bar("VST_VLD")
         for chunk in pl.hardware_loop(8):
             bf_values = pl.reg.load(raw, chunk * 64, lanes=64)
             values = pl.reg.convert(bf_values, dtype=pl.FP32)
@@ -613,6 +616,7 @@ def _rotate_quantize(
             bytes8 = pl.reg.convert(byte_code, dtype=pl.INT8, saturate=False)
             bytes8 = pl.reg.interpret_cast(bytes8, dtype=pl.UINT8)
             _packed_written = pl.reg.store(packed, chunk * 32, bytes8, lower)
+        pl.reg.mem_bar("VST_VLD")
         group_indices = pl.reg.shift_lefts(lane, 4, full)
         group_scale = pl.reg.gather(scale_storage, group_indices, lower)
         group_bf = pl.reg.convert(group_scale, dtype=pl.BF16, rounding="R", saturate=False)
