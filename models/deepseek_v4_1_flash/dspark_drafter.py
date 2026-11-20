@@ -108,6 +108,8 @@ def dspark_proj(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Project target taps with NZ MXFP8 weights and MX_B_NN E8M0 scales in a MIX launch."""
+    target_hidden.bind_dynamic(0, T_DYN)
+    projected.bind_dynamic(0, T_DYN)
     padded_rows = (num_tokens + 79) // 80 * 80
     payload = pl.create_tensor([padded_rows, MAIN_IN], dtype=pl.FP8E4M3FN)
     scales = pl.create_tensor([1, padded_rows * (MAIN_IN // MX_GROUP)], dtype=pl.FP8E8M0)
@@ -129,6 +131,8 @@ def dspark_proj_pypto(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Quantize target taps once and project them with NZ MXFP8 weights."""
+    target_hidden.bind_dynamic(0, T_DYN)
+    projected.bind_dynamic(0, T_DYN)
     padded_rows = (num_tokens + PROJ_M_TILE - 1) // PROJ_M_TILE * PROJ_M_TILE
     payload = pl.create_tensor([padded_rows, MAIN_IN], dtype=pl.FP8E4M3FN)
     scales = pl.create_tensor([1, padded_rows * (MAIN_IN // MX_GROUP)], dtype=pl.FP8E8M0)
