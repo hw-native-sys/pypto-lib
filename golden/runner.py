@@ -221,7 +221,7 @@ def _stale_cpps(work_dir: Path, *, platform: str) -> list[Path]:
     Generated kernels may have several registrations sharing one content-keyed
     binary. Require a fresh sidecar for every distinct code contract and the
     replay platform, using PyPTO's own identity function. Plain kernels and
-    orchestration retain their legacy sibling naming. External/builtin caches
+    orchestration retain their legacy sibling naming. External, builtin and VPTO helper caches
     belong to the runtime.
     """
     stale: list[Path] = []
@@ -243,9 +243,9 @@ def _stale_cpps(work_dir: Path, *, platform: str) -> list[Path]:
             for kernel in read_kernel_config(config_path).KERNELS:
                 source = Path(kernel["source"])
                 expected = sidecars.setdefault(source.resolve(), set())
-                if kernel.get("external", False) or kernel.get("builtin", False):
+                if kernel.get("external") or kernel.get("builtin") or kernel.get("vpto_sources"):
                     # These never have source-adjacent binaries; their content
-                    # and include closure are checked by the runtime cache.
+                    # and toolchain identity are checked by the runtime cache.
                     continue
                 stem = source.stem
                 if _generated_code_key(kernel) is not None:

@@ -2068,9 +2068,9 @@ class TestGeneratedCppCache:
             _setup_runtime_dir(str(tmp_path), compile_label="test", platform="a5sim")
         assert invalidate.call_count == int(not fresh)
 
-    @pytest.mark.parametrize("kind", ["external", "builtin"])
-    def test_external_and_builtin_sidecars_are_runtime_owned(self, tmp_path, kind):
-        kernel = self._kernel(tmp_path, **{kind: True})
+    @pytest.mark.parametrize("options", [{"external": True}, {"builtin": True}, {"vpto_sources": ["helper.pto"]}])
+    def test_runtime_owned_caches_do_not_require_a_sidecar(self, tmp_path, options):
+        kernel = self._kernel(tmp_path, **options)
         self._config(tmp_path, [kernel])
         assert _stale_cpps(tmp_path, platform="a5sim") == []
 
