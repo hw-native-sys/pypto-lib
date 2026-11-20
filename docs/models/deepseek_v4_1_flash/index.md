@@ -7,6 +7,14 @@ decoding, and a separately callable vision encoder. Operator entries provide
 Torch references and standalone validation; forward entries compose those same
 operators.
 
+## Development priorities
+
+| Field | Current priority |
+| --- | --- |
+| Performance target | 72-token decode and 1,024-token standalone prefill attention (DP1/CP1), using full attention weights. Apply optimizations to the shared implementation across all attention layers and adapt all affected callers. |
+| Deferred performance work | Performance tuning for other token counts and prefill parallel configurations remains secondary to these targets; correctness and the shared fused output projection / HC-post implementation remain required. |
+| Compatibility requirements | Preserve correctness and interface contracts for already supported paths, including other token counts and DP/CP configurations. Update affected callers to use revised shared implementations. The optimized C++ routed FFN requires A5 device execution; simulation requests fail explicitly rather than selecting a different numerical implementation. |
+
 ## Model configuration
 
 [`config.py`](../../../models/deepseek_v4_1_flash/config.py) owns the model
@@ -22,7 +30,7 @@ operator define its executable storage and layout contracts.
 | Hyper-connections | 4 streams; persistent hidden state is FP32 |
 | Context ceiling | 1,048,576 positions, with 128-token cache pages |
 | Engram | Layers 1 and 14; forward consumes host-gathered embedding rows |
-| DSpark | 5 speculative tokens plus one verification row per request; default decode batch 12, or 72 rows |
+| DSpark | 5 speculative tokens plus one verification row per request; default per-rank decode batch 12, or 72 local rows |
 
 Quantized projection paths use MXFP8 weights and activations; routed expert
 weights use packed MXFP4. Scale tensors use the owning operator's MX layout.
@@ -47,52 +55,6 @@ computes a new selection. **Reuse** consumes existing KV and selection state.
 The source-layer tables in `config.py` determine ownership; these are different
 roles in one forward, rather than interchangeable execution options. C2A reuse
 uses the shared C1A reuse kernels with ratio-2 metadata.
-
-## Decode lightning indexer
-
-C1A and C2A full decode paths compose C++ AIC/AIV kernels derived from
-[DeepGEMM-Ascend](https://github.com/deepseek-ai/DeepGEMM-Ascend/tree/3a35326271b069b8b5bf1a754435acd6cc91575b) and [DeepSelect](https://github.com/deepseek-ai/DeepSelect/tree/bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18).
-Score computation and token selection follow
-the pinned official implementations on identical quantized inputs, including
-BF16 rounding, threshold filtering, seeded traversal, cutoff tie choices, and
-unsorted output order. Attention selects 512 tokens with
-`sorted_index=False` by default. The optional sorted mode orders the selected
-logical token indices before converting them to physical cache row indices.
-The kernels read the existing query, scale, and split cache layouts directly.
-Head-weight scaling runs inside the scorer, and physical index mapping runs
-inside the selector's writeback; neither requires a separate adapter task.
-A single AIV worker computes scheduling metadata from valid request IDs and
-visible lengths. Full-layer entries submit it before HC and projection work;
-it waits only for its tensor inputs. The scorer joins metadata, query, and KV
-readiness. There is no AICPU scalar planning loop or sanitized-length workspace.
-
-C1A also produces up to 2,048 candidate block IDs for Reindex. Each block covers
-eight tokens; the newest valid block is retained for finite inputs, following
-[DeepInfer](https://github.com/deepseek-ai/DeepInfer/blob/a679bb86ce36e883a98a97733492b686e5b9a08e/deepinfer/model_executor/layers/tilelang_ops/candidate_blocks.py).
-The scorer computes block maxima from its final BF16 logits in UB, sharing the logits pipeline
-buffers and synchronization. Token and candidate selection run as independent
-consumers; current attention waits only for token selection. Candidate IDs are
-always sorted by logical block number, independently of the attention sorting
-option. Invalid slots are `-1` and inactive rows have zero candidates.
-C2A does not allocate or clear candidate buffers.
-
-Visible lengths must fit the page table and the native limit of 2,097,152
-tokens per row. Both selectors reject a visible NaN before writing that row;
-block scoring preserves NaNs even in the newest block. Scores beyond the
-visible length do not participate.
-
-The [standalone entry](../../../models/deepseek_v4_1_flash/decode_indexer.py)
-checks both page sizes, attention ordering modes and candidate modes on
-bounded inputs:
-
-```bash
-python models/deepseek_v4_1_flash/decode_indexer.py --device "${TASK_DEVICE}"
-```
-
-Select the allocated device in the local execution environment. Larger shapes
-are explicit options, for example `--batch 12 --sequence 6 --kv-length 65536`.
-The latter is the LI history length; C2A's ratio-2 compression halves the
-original sequence history.
 
 ## Execution structure
 
@@ -129,9 +91,9 @@ the results back into the local HC state.
 | Prefill CP | `--cp 1/2/4/8`; CP1 uses local attention, CP>1 uses head-tail query placement and KV publication across peers |
 | MoE EP | `--ep 2/4/8`; EP1 is unsupported |
 | Prefill DP | `DP_SIZE = EP_SIZE // CP_SIZE`; CP must divide EP |
-| Decode attention | Independent requests and local KV/cache state per rank; no decode CP partitioning |
-| Decode MoE | EP dispatch/combine across ranks, while attention retains local request ownership |
-| LM-head TP | Independent `--lm-head-tp 1/2/4/8`, subject to the rank-group constraints checked by the entry |
+| Decode attention | CP1. Each rank owns its requests, KV caches, and compressor state |
+| Decode MoE | Dispatch across the EP group and return results to the originating rank |
+| LM-head TP | `--lm-head-tp 1/2/4/8` partitions the vocabulary projection independently of attention. The forward requires `EP_SIZE % LM_HEAD_TP_SIZE == 0` |
 
 For prefill, at CP1, each DP group may pack multiple independent requests. At CP>1, each DP
 group supports one request. Different DP groups own independent requests and
@@ -148,22 +110,8 @@ This requires the caller to preserve matching cache and compressor state;
 a prefix length does not populate that state or provide a prefix-cache manager.
 The checkpoint `generate` entry currently requires CP1.
 
-Decode runs attention independently on each rank, with full attention weights
-and rank-local request metadata, KV caches, and compressor state. The prefill
-formula `DP_SIZE = EP_SIZE // CP_SIZE` describes prefill grouping; decode does
-not use its head-tail CP layout. Use CP1 for the current decode deployment.
-The default per-rank batch is `DECODE_BATCH = 12`; DSpark verifies
-`DECODE_SEQ = 6` rows per request, giving 72 local rows in the default workload.
-MoE routes these local rows across the EP group and returns results to their
-originating rank.
-
-LM-head TP partitions the vocabulary projection independently of attention.
-The forward requires `EP_SIZE % LM_HEAD_TP_SIZE == 0`. Contiguous groups of
-`LM_HEAD_TP_SIZE` ranks exchange selected hidden rows, compute vocabulary
-shards, and return output to the row owners; requests remain independently
-owned by their original ranks. For example, EP8 with LM-head TP2 has eight
-local attention batches and four two-rank output-projection groups. With
-LM-head TP1, each rank computes its own complete vocabulary projection.
+Contiguous LM-head TP groups exchange selected hidden rows, compute vocabulary
+shards, and return results to the row owners.
 
 ## Entry points and validation
 
@@ -184,17 +132,6 @@ for these standalone entries. For example, batch 64 with four query tokens per
 request uses 64 starting positions and 64 query lengths of `4` (256 tokens).
 Query blocks must remain within the model position range. This does not change
 the forward or DSpark serving capacities.
-
-Compressed-attention decode fixtures retain only the sliding-window pages visible
-to the current query block, plus an unmapped control page. Compressed and index caches retain
-their history. Random cache generation uses bounded page batches; index goldens
-batch tokens sharing one request while retaining sequential BF16 head rounding.
-C2A reuse fixture preparation computes its source compressed cache and selected
-indices without computing the source attention output.
-
-C2A reuse validates its composed HC output with `atol=0.01`, `rtol=1/128`,
-and a maximum outlier ratio of 1%. Its cache and HC-mix checks retain their
-separate tolerances.
 
 For prefill attention, `--tokens` is capacity per DP group, before CP partitioning.
 `--query-lens '65,31;96'` describes two requests in DP0 and one in DP1;
@@ -238,11 +175,3 @@ multimodal serving pipeline.
 The standalone entry defaults to a reduced two-layer Torch comparison;
 `--checkpoint` selects the released profile and weights, while `--patches` and
 `--grid` supply preprocessed input.
-
-## Development priorities
-
-| Field | Current priority |
-| --- | --- |
-| Performance target | 72-token decode and 1,024-token prefill with DP1/CP1, using full attention weights. Apply optimizations to the shared implementation across all attention layers and adapt all affected callers. |
-| Deferred performance work | Performance tuning for other token counts and prefill parallel configurations remains secondary to these targets; correctness and the shared fused output projection / HC-post implementation remain required. |
-| Compatibility requirements | Preserve correctness and interface contracts for already supported paths, including other token counts and DP/CP configurations. Update affected callers to use revised shared implementations. The optimized C++ routed FFN requires A5 device execution; simulation requests fail explicitly rather than selecting a different numerical implementation. |

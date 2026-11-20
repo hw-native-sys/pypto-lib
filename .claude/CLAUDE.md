@@ -4,14 +4,21 @@ PyPTO-Lib provides PyPTO kernels and end-to-end LLM models for Ascend NPUs,
 plus the `golden/` harness for compilation, execution, and Torch validation.
 This file is the shared project entry point; `AGENTS.md` adapts it for Codex.
 
+**Read [the model implementation rules (models.md)](rules/models.md) before
+developing, optimizing, or reviewing a model.** Then read the target model's
+`docs/models/<model>/index.md` for its performance targets and compatibility
+requirements. Use both to guide implementation choices and PR review.
+
 ## Working agreements
 
 - Keep changes scoped to the requested kernel, model, test, or documentation
   area. Prefer existing project patterns when they agree with current rules.
-- `tests/` primarily tests the `golden` harness. `tests/contract/` tests model
-  integration with serving, not model computation or implementation structure.
-  Model development should leave these tests unchanged unless the task
-  specifically requires harness or serving-contract test changes.
+- `tests/` primarily covers the `golden` harness. Under `tests/contract/`,
+  **each model may have at most one serving contract test file**. A model PR
+  may add or update only that file under `tests/` and must reuse it if present.
+  Validate model computation in the model's executable entry as described in
+  the [model rules](rules/models.md#contracts-and-validation).
+- **Never create `tests/ci/` or add files under it, including in CI-only PRs.**
 - Keep public documentation and examples aligned when behavior changes.
 - Keep agent constraints in `.claude/rules/`, task execution workflows in
   `.claude/skills/`, and public technical guidance in `docs/`. Link to the
