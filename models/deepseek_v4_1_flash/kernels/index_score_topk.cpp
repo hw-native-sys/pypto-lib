@@ -766,10 +766,10 @@ namespace {
             pipe_barrier(PIPE_ALL);
         }
 
-        __aicore__ inline void merge(__gm__ int64_t* args) {
+        __aicore__ inline void merge(__gm__ int64_t* args, int gathered_rows) {
             int width = args[15], stride = args[16], table_width = args[17], tokens = args[18];
             int workers = get_block_num(args), worker = get_block_idx(args) * 2 + get_subblockid();
-            int gathered_rows = args[19], shards = args[21];
+            int shards = args[21];
             int panels = (width + 255) / 256, total = read(data<int32_t>(args, 9) + 3 * stride) * panels;
             CandidateKeys selected_keys;
             CandidateIndices selected_indices;
@@ -1471,9 +1471,8 @@ namespace {
 #endif
 
         template <int KeySlots, int PageRows = 128>
-        __aicore__ inline void run(__gm__ int64_t* args) {
+        __aicore__ inline void run(__gm__ int64_t* args, int gathered_rows) {
             int width = args[15], stride = args[16], table_width = args[17];
-            int gathered_rows = args[19];
             int cache_pages = reinterpret_cast<__gm__ Tensor*>(args[3])->shapes[0];
             int groups = read(data<int32_t>(args, 9) + 3 * stride);
             int panels = (width + 255) / 256;
@@ -1755,7 +1754,9 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 #else
     set_ctrl(sbitset0(get_ctrl(), pto::MAD_MODE_BIT));
 #endif
-    if (args[19] < 0) {
+    int gathered_rows = args[19];
+    // Reindex publishes the batch-wide mode after the four dense run rows.
+    if (gathered_rows < 0 && read(data<int32_t>(args, 9) + 4 * args[16]) == 0) {
         fused::run_pool(args);
         SYNCALL<SyncCoreType::AIVOnly>();
 #if defined(__DAV_VEC__)
@@ -1763,13 +1764,14 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 #endif
         return;
     }
-    if (args[19] == 0) {
-        if (reinterpret_cast<__gm__ Tensor*>(args[3])->shapes[1] == 64) fused::run<4, 64>(args);
-        else fused::run<4, 128>(args);
+    if (gathered_rows <= 0) {
+        gathered_rows = 0;
+        if (reinterpret_cast<__gm__ Tensor*>(args[3])->shapes[1] == 64) fused::run<4, 64>(args, 0);
+        else fused::run<4, 128>(args, 0);
     }
-    else fused::run<2>(args);
+    else fused::run<2>(args, gathered_rows);
     SYNCALL<SyncCoreType::AIVOnly>();
 #if defined(__DAV_VEC__)
-    fused::merge(args);
+    fused::merge(args, gathered_rows);
 #endif
 }
