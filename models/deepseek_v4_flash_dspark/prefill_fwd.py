@@ -91,7 +91,7 @@ from prefill_cp_token_allgather import (
     PREFILL_GROUP_CAP,
     TP_SIZE,
     prefill_cp_materialize_hc_full,
-    prefill_cp_materialize_coeff_full,
+    prefill_cp_materialize_ffn_coeffs,
     prefill_cp_token_allgather_into,
 )
 from prefill_metadata import (
@@ -111,6 +111,7 @@ from prefill_o_proj import (
     retire_o_proj_weight_signals,
 )
 from hc_head import hc_head
+from hc_post import golden_hc_post, hc_post
 from lm_head import (
     GRAMMAR_SEGMENT_WORDS,
     GREEDY_GRID_ROWS,
@@ -1139,21 +1140,28 @@ def prefill_fwd(
     with pl.scope():
         if group_tokens > 0:
             materialize_ready_tid = pl.system.task_dummy(deps=[])
-            hc_full_tid = prefill_cp_materialize_hc_full(
-                x_hc_local, x_hc, gather_window, gather_signal, group_base, tp_rank, materialize_ready_tid,
-            )
+            rebuild_hc = group_rows == PREFILL_GROUP_CAP and TP_SIZE > 1
+            if not rebuild_hc:
+                materialize_ready_tid = prefill_cp_materialize_hc_full(
+                    x_hc_local, x_hc, gather_window, gather_signal, group_base, tp_rank, materialize_ready_tid,
+                )
             attn_full_tid = prefill_cp_materialize_hc_full(
-                attn_stage_local, attn_stage, gather_window, gather_signal, group_base, tp_rank, hc_full_tid,
+                attn_stage_local, attn_stage, gather_window, gather_signal, group_base, tp_rank, materialize_ready_tid,
             )
             mixed_full_tid = prefill_cp_token_allgather_into(
                 x_mixed_local, x_mixed, gather_window, gather_signal, group_base, tp_rank, attn_full_tid,
             )
-            post_full_tid = prefill_cp_materialize_coeff_full(
-                post_ffn_local, post_ffn, gather_window, gather_signal, group_base, tp_rank, mixed_full_tid,
+            coeffs_full_tid = prefill_cp_materialize_ffn_coeffs(
+                post_ffn_local, comb_ffn_local, post_ffn, comb_ffn,
+                gather_window, gather_signal, group_base, tp_rank, mixed_full_tid,
             )
-            prefill_cp_materialize_coeff_full(
-                comb_ffn_local, comb_ffn, gather_window, gather_signal, group_base, tp_rank, post_full_tid,
-            )
+            if rebuild_hc:
+                # Rebuild the final HC rows from the replicated residual and the narrow FFN output.
+                ffn_full = pl.create_tensor([group_rows, D], dtype=pl.BF16)
+                _ffn_full_tid = prefill_cp_token_allgather_into(
+                    ffn_out, ffn_full, gather_window, gather_signal, group_base, tp_rank, coeffs_full_tid,
+                )
+                hc_post(ffn_full, attn_stage, post_ffn, comb_ffn, x_hc, pl.const(-1, pl.INT32), T_TILE=16)
 
     # All head-group ranks participate, including ranks with no attention tokens.
     layer42_hidden = pl.create_tensor([group_rows, D], dtype=pl.BF16)
@@ -2092,6 +2100,40 @@ def finite_tensor_compare(actual, expected, *, preserve_inactive=False, zero_ina
     return True, ""
 
 
+def x_hc_compare(actual, expected, **kwargs):
+    """Validate full-group HC against each owner's residual, coefficients, and FFN result."""
+    import torch
+    from golden import ratio_allclose
+
+    valid, detail = finite_tensor_compare(actual, expected, zero_inactive=True, **kwargs)
+    if not valid or TP_SIZE == 1 or actual.shape[1] != PREFILL_GROUP_CAP:
+        return valid, detail
+
+    outputs = kwargs["actual_outputs"]
+    starts = kwargs["inputs"]["query_start_loc"]
+    owner_ffn = outputs["ffn_out"]
+    local_rows = owner_ffn.shape[1]
+    compare = ratio_allclose(atol=1e-6, rtol=1e-6, max_error_ratio=0)
+    for owner in range(actual.shape[0]):
+        if int(starts[owner, -1]) == 0:
+            continue
+        group_base = owner // TP_SIZE * TP_SIZE
+        start = (owner - group_base) * local_rows
+        rows = slice(start, start + local_rows)
+        owner_hc = torch.empty_like(actual[owner, rows], device="cpu")
+        golden_hc_post({
+            "x": owner_ffn[owner].cpu(),
+            "residual": outputs["attn_stage"][owner, rows].cpu(),
+            "post": outputs["post_ffn"][owner, rows].cpu(),
+            "comb": outputs["comb_ffn"][owner, rows].cpu(),
+            "y": owner_hc,
+        })
+        for rank in range(group_base, group_base + TP_SIZE):
+            matches, mismatch = compare(actual[rank, rows].cpu(), owner_hc, **kwargs)
+            if not matches:
+                return False, f"    rank {rank} HC rows owned by rank {owner}:\n{mismatch}"
+    return True, ""
+
 def x_out_compare(actual, _expected, **kwargs):
     """Recompute hc_head plus the final norm from the device x_hc and compare."""
     import torch
@@ -2251,7 +2293,7 @@ def compare_functions():
     compare["dspark_target_hidden"] = dspark_target_hidden_compare
     for name in CACHE_NAMES | {"attn_stage"}:
         compare[name] = partial(finite_tensor_compare, preserve_inactive=True)
-    compare["x_hc"] = partial(finite_tensor_compare, zero_inactive=True)
+    compare["x_hc"] = x_hc_compare
     compare["x_out"] = x_out_compare
     compare["logits"] = logits_compare
     compare["sampled_ids"] = sampled_ids_compare
@@ -2286,8 +2328,8 @@ def main():
         help=f"B1 prompt tokens per TP/CP group; defaults to {DEFAULT_GROUP_TOKENS}. ragged2 is fixed at 7.",
     )
     parser.add_argument(
-        "--case", choices=["b1", "ragged2"], default="b1",
-        help="Fixture case; ragged2 is the fixed two-request TP2 boundary case.",
+        "--case", choices=["b1", "ragged2", "full-group"], default="b1",
+        help="Fixture case; ragged2 is the two-request TP2 case and full-group checks HC at full CP capacity.",
     )
     parser.add_argument(
         "--inactive-dp-groups", type=int, nargs="*", default=[],
@@ -2331,6 +2373,10 @@ def main():
         parser.error("--case ragged2 requires --tp 2")
     if args.case == "ragged2" and args.start_pos != 0:
         parser.error("--case ragged2 has fixed request starts and requires --start-pos 0")
+    if args.case == "full-group":
+        if TP_SIZE == 1 or args.num_tokens not in (None, PREFILL_GROUP_CAP):
+            parser.error(f"--case full-group requires TP > 1 and {PREFILL_GROUP_CAP} tokens")
+        args.num_tokens = PREFILL_GROUP_CAP
     if args.num_tokens is None:
         args.num_tokens = 7 if args.case == "ragged2" else DEFAULT_GROUP_TOKENS
     if args.case == "ragged2" and args.num_tokens != 7:
@@ -2348,7 +2394,8 @@ def main():
         idx_block_num=args.idx_block_num,
         hca_state_block_num=args.hca_state_block_num, csa_state_block_num=args.csa_state_block_num,
         inner_state_block_num=args.inner_state_block_num,
-        fixture_case=args.case, inactive_dp_groups=args.inactive_dp_groups,
+        fixture_case="ragged2" if args.case == "ragged2" else "b1",
+        inactive_dp_groups=args.inactive_dp_groups,
     )
 
     result = run(

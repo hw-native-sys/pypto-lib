@@ -74,7 +74,7 @@ from prefill_cp_token_allgather import (
     TP_SIZE,
     prefill_cp_token_allgather_into,
     prefill_cp_materialize_hc_full,
-    prefill_cp_materialize_coeff_full,
+    prefill_cp_materialize_ffn_coeffs,
 )
 
 
@@ -1800,13 +1800,9 @@ def prefill_moe(
                 x_mixed_local, x_mixed,
                 gather_window, gather_signal, group_base, tp_rank, hc_full_tid,
             )
-            post_full_tid = prefill_cp_materialize_coeff_full(
-                post_ffn_local, post_ffn,
+            prefill_cp_materialize_ffn_coeffs(
+                post_ffn_local, comb_ffn_local, post_ffn, comb_ffn,
                 gather_window, gather_signal, group_base, tp_rank, mixed_full_tid,
-            )
-            prefill_cp_materialize_coeff_full(
-                comb_ffn_local, comb_ffn,
-                gather_window, gather_signal, group_base, tp_rank, post_full_tid,
             )
     return x_hc
 
