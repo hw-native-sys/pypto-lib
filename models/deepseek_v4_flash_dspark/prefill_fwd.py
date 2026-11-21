@@ -86,6 +86,7 @@ from prefill_csa import (
     build_cp_tensor_specs as build_csa_attention_tensor_specs,
     build_ragged2_cp_tensor_specs as build_csa_ragged2_tensor_specs,
     prefill_attention_csa_cp_local,
+    prepare_csa_compact_plan,
 )
 from prefill_cp_token_allgather import (
     PREFILL_GROUP_CAP,
@@ -440,6 +441,15 @@ def prefill_fwd(
         pl.write(stage_token, [0], pl.cast(0, pl.INT32))
         pl.write(layer_completion, [0], pl.cast(0, pl.INT32))
 
+    # The forward ABI supplies one immutable set of CSA slot maps for all layers.
+    csa_plan = pl.create_tensor([1], dtype=pl.INT32)
+    with pl.scope():
+        prepare_csa_compact_plan(
+            local_tokens, query_start_loc, state_checkpoint_ends, position_ids_full, ori_slot_mapping_full,
+            csa_cmp_slot_mapping_full, csa_idx_slot_mapping_full, csa_state_slot_mapping_full,
+            csa_inner_state_slot_mapping_full, csa_plan,
+        )
+
     # Local HC state and FFN coefficient views.
     hc_elements_local = local_tokens * HC_MULT * D
     hidden_elements_local = local_tokens * D
@@ -647,6 +657,8 @@ def prefill_fwd(
     target_hc_rows = 2 * local_tokens
     target_hc_stack = pl.create_tensor([target_hc_rows, HC_MULT, D], dtype=pl.FP32)
 
+    csa_compact = pl.read(csa_plan, [0])
+
     # Layers 2-41: CSA/HCA pairs.
     for pair_order in pl.range(HCA_NUM_LAYERS):
         attention_order = pl.cast(pair_order, pl.INT32)
@@ -784,7 +796,7 @@ def prefill_fwd(
                         o_proj_wo_a_window, o_proj_wo_b_window,
                         o_proj_weight_ready, o_proj_weight_consumed,
                         layer_completion,
-                        group_base, tp_rank, csa_layer + pl.const(1, pl.INT32),
+                        group_base, tp_rank, csa_layer + pl.const(1, pl.INT32), csa_compact,
                     )
 
             with pl.scope():
@@ -1080,7 +1092,7 @@ def prefill_fwd(
                     o_proj_wo_a_window, o_proj_wo_b_window,
                     o_proj_weight_ready, o_proj_weight_consumed,
                     layer_completion,
-                    group_base, tp_rank, layer_last + pl.const(1, pl.INT32),
+                    group_base, tp_rank, layer_last + pl.const(1, pl.INT32), csa_compact,
                 )
 
         with pl.scope():
