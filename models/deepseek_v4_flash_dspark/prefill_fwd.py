@@ -48,6 +48,7 @@ from prefill_swa import (
 from prefill_hca import (
     COMPRESS_RATIO as HCA_COMPRESS_RATIO,
     HCA_CMP_BLOCK_NUM,
+    HCA_REQUEST_RANGE_WORDS,
     CMP_STORAGE_BLOCK_SIZE as HCA_CMP_STORAGE_BLOCK_SIZE,
     HCA_STATE_BLOCK_NUM,
     HCA_STATE_BLOCK_SIZE,
@@ -57,6 +58,7 @@ from prefill_hca import (
     build_cp_tensor_specs as build_hca_attention_tensor_specs,
     build_ragged2_cp_tensor_specs as build_hca_ragged2_tensor_specs,
     prefill_attention_hca_cp_local,
+    prepare_hca_query_ranges,
 )
 from prefill_csa import (
     BLOCK_SIZE,
@@ -429,6 +431,8 @@ def prefill_fwd(
     group_tokens = pl.read(query_start_loc, [request_count])
     local_request_ids = pl.create_tensor([local_tokens], dtype=pl.INT32)
     lower_local_request_ids(query_start_loc, local_request_ids, tp_rank * local_tokens)
+    hca_request_ranges = pl.create_tensor([request_count, HCA_REQUEST_RANGE_WORDS], dtype=pl.INT32)
+    hca_request_ranges = prepare_hca_query_ranges(local_request_ids, hca_request_ranges)
     ori_block_num = pl.tensor.dim(kv_cache, 0) // FWD_NUM_LAYERS
     hca_cmp_block_num = pl.tensor.dim(hca_cmp_kv, 0) // HCA_NUM_LAYERS
     csa_cmp_block_num = pl.tensor.dim(csa_cmp_kv, 0) // CSA_NUM_LAYERS
@@ -919,7 +923,7 @@ def prefill_fwd(
                 if group_tokens > 0:
                     prefill_attention_hca_cp_local(
                         x_hc_local,
-                        query_start_loc, state_checkpoint_ends, local_request_ids,
+                        query_start_loc, state_checkpoint_ends, local_request_ids, hca_request_ranges,
                         hc_attn_fn_hca, hc_attn_scale_hca, hc_attn_base_hca,
                         attn_norm_w_hca, wq_a_hca, wq_b_hca, wq_b_scale_hca,
                         wkv_hca, gamma_cq_hca, gamma_ckv_hca,

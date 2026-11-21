@@ -106,6 +106,8 @@ COMPRESS_RATIO = 128
 HCA_SWA_ROW_TILE = 8
 HCA_CACHE_READY_TILE = 64
 HCA_CACHE_WRITE_TILE = 64
+HCA_PAD_ROWS_TILE = 16
+HCA_REQUEST_RANGE_WORDS = 16
 MAIN_OUT_DIM = HEAD_DIM
 MAIN_COMPRESS_STATE_DIM = 2 * MAIN_OUT_DIM
 START_POS = 0
@@ -812,9 +814,31 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
 
 
 @pl.jit.inline
+def prepare_hca_query_ranges(
+    local_request_ids: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
+    request_ranges: pl.Tensor[[REQUESTS_DYN, HCA_REQUEST_RANGE_WORDS], pl.INT32],
+):
+    """Record each local request's first query and query count."""
+    local_rows = pl.tensor.dim(local_request_ids, 0)
+    request_count = pl.tensor.dim(request_ranges, 0)
+    for request in pl.spmd(request_count, name_hint="prefill_hca_query_ranges"):
+        request_id = pl.cast(request, pl.INT32)
+        first = pl.const(0, pl.INT32)
+        count = pl.const(0, pl.INT32)
+        for row in pl.range(local_rows):
+            if pl.read(local_request_ids, [row]) == request_id:
+                if count == 0:
+                    first = pl.cast(row, pl.INT32)
+                count = count + pl.const(1, pl.INT32)
+        pl.write(request_ranges, [request, 0], first)
+        pl.write(request_ranges, [request, 1], count)
+    return request_ranges
+
+
+@pl.jit.inline
 def prefill_attention_hca_cp_core(
     q: pl.Tensor[[CP_Q_T_DYN, H, HEAD_DIM], pl.BF16],
-    query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
+    request_ranges: pl.Tensor[[REQUESTS_DYN, HCA_REQUEST_RANGE_WORDS], pl.INT32],
     local_request_ids: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
     compress_state: pl.Tensor[[STATE_BLOCK_NUM_DYN, HCA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM], pl.FP32],
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
@@ -902,24 +926,23 @@ def prefill_attention_hca_cp_core(
         pl.write(cache_ready_fence, [ready_block], ready_bit)
 
     # Per-request HCA streaming over rank-local packed query intervals.
-    with pl.spmd(q_dim, name_hint="prefill_hca_cp_pad_output_init") as pad_output_tid:
-        pad_t = pl.tile.get_block_idx()
-        if pl.read(local_request_ids, [pad_t]) < 0:
-            pad_row = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
-            pl.store(pad_row, [pad_t, 0], attn_out_local)
+    request_id_row = pl.reshape(local_request_ids, [1, q_dim])
+    pad_blocks = (q_dim + HCA_PAD_ROWS_TILE - 1) // HCA_PAD_ROWS_TILE
+    with pl.spmd(pad_blocks, name_hint="prefill_hca_cp_pad_output_init") as pad_output_tid:
+        pad_start = pl.tile.get_block_idx() * HCA_PAD_ROWS_TILE
+        pad_rows = pl.min(HCA_PAD_ROWS_TILE, q_dim - pad_start)
+        ids = pl.tile.load(request_id_row, [0, pad_start], [1, HCA_PAD_ROWS_TILE], valid_shape=[1, pad_rows])
+        for row in pl.range(pad_rows):
+            if pl.tile.read(ids, [0, row]) < 0:
+                pad_row = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
+                pl.store(pad_row, [pad_start + row, 0], attn_out_local)
     # Serial chain over requests, array carry as in the non-CP path above.
     request_deps = pl.array.create(1, pl.TASK_ID)
     request_deps[0] = pl.system.task_dummy(deps=[cache_ready_dep, pad_output_tid])
-    request_count = pl.tensor.dim(query_start_loc, 0) - 1
+    request_count = pl.tensor.dim(request_ranges, 0)
     for request in pl.range(request_count):
-        local_start = pl.cast(0, pl.INDEX)
-        request_rows = pl.cast(0, pl.INDEX)
-        for local_t in pl.range(q_dim):
-            request_id = pl.read(local_request_ids, [local_t])
-            if request_id == request:
-                if request_rows == 0:
-                    local_start = local_t
-                request_rows = request_rows + 1
+        local_start = pl.cast(pl.read(request_ranges, [request, 0]), pl.INDEX)
+        request_rows = pl.cast(pl.read(request_ranges, [request, 1]), pl.INDEX)
         if request_rows > 0:
             request_tid = hca_streaming_attn_physical(
                 q,
@@ -946,6 +969,7 @@ def prefill_attention_hca_cp_local(
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
     state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
     local_request_ids: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
+    request_ranges: pl.Tensor[[REQUESTS_DYN, HCA_REQUEST_RANGE_WORDS], pl.INT32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -1101,7 +1125,7 @@ def prefill_attention_hca_cp_local(
     attn_out_local = pl.create_tensor([q_dim, D], dtype=pl.BF16)
     cache_update_tid = update[0]
     attn_out_local = prefill_attention_hca_cp_core(
-        q, query_start_loc, local_request_ids,
+        q, request_ranges, local_request_ids,
         compress_state, kv_cache, ori_block_table, cmp_kv, cmp_block_table,
         position_ids_local, position_ids_full, cmp_slot_mapping_full, state_slot_mapping_full,
         attn_sink, wo_a_full, wo_b_full, wo_b_scale, attn_out_local, cache_update_tid, o_proj_weight_dep,
@@ -1175,9 +1199,12 @@ def prefill_attention_hca_cp(
     )
     x_hc_local = pl.slice(x_hc_full, [q_dim, HC_MULT, D], [local_base, 0, 0])
     x_out_local = pl.slice(x_out_full, [q_dim, HC_MULT, D], [local_base, 0, 0])
+    request_count = pl.tensor.dim(query_start_loc, 0) - 1
+    request_ranges = pl.create_tensor([request_count, HCA_REQUEST_RANGE_WORDS], dtype=pl.INT32)
+    request_ranges = prepare_hca_query_ranges(local_request_ids, request_ranges)
     x_out_local, gather_signal = prefill_attention_hca_cp_local(
         x_hc_local,
-        query_start_loc, state_checkpoint_ends, local_request_ids,
+        query_start_loc, state_checkpoint_ends, local_request_ids, request_ranges,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale,
         wkv, gamma_cq, gamma_ckv,
