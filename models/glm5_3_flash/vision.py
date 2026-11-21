@@ -30,9 +30,6 @@ from models.glm5_3_flash.config import (
     VISION_PATCH, VISION_PATCH_IN, VISION_PROJ_INTER, VISION_RMS_NORM_EPS, VISION_SWIGLU_LIMIT,
     VISION_TEMPORAL_PATCH, D,
 )
-from models.glm5_3_flash.elementwise import (
-    accurate_divide, accurate_exp, accurate_reciprocal, accurate_row_sum_parts, accurate_rsqrt,
-)
 from models.glm5_3_flash.linear import bf16_linear, bf16_projection, golden_bf16_linear
 from models.glm5_3_flash.rmsnorm import rms_norm, rmsnorm
 from models.glm5_3_flash.utils import Checkpoint, component_hidden, component_options, vision_weight_layouts
@@ -57,20 +54,6 @@ RESIDUAL_N_TILE = 128
 MERGE_N_TILE = 128
 MERGE_M_TILE = 8
 LAYER_NORM_EPS = 1e-5
-
-
-@pl.jit.inline
-def vision_softmax_exp(
-    x: pl.Tensor[[ATTENTION_M_TILE, ATTENTION_N_TILE], pl.FP32],
-):
-    """Use compensated exp in its supported range and retain underflow behavior."""
-    bounded = pl.create_tensor([ATTENTION_M_TILE, ATTENTION_N_TILE], dtype=pl.FP32)
-    bounded[:, :] = pl.maximum(x, -80.0)
-    precise = accurate_exp(bounded)
-    small = pl.exp(x)
-    use_precise = pl.cast(pl.cast(pl.cmp(x, -80.0, cmp_type=5), pl.INT32), pl.FP32)
-    use_small = pl.add(pl.neg(use_precise), 1.0)
-    return pl.add(pl.mul(precise, use_precise), pl.mul(small, use_small))
 
 
 @pl.jit.inline
@@ -198,7 +181,6 @@ def vision_attention(
                     maximum = updated_maximum
                 maximum_column = pl.reshape(maximum, [ATTENTION_M_TILE, 1])
                 mass = pl.full([1, ATTENTION_M_TILE], dtype=pl.FP32, value=0.0)
-                mass_error = pl.full([1, ATTENTION_M_TILE], dtype=pl.FP32, value=0.0)
                 for mass_key0 in pl.range(begin, end, ATTENTION_N_TILE):
                     mass_valid_keys = pl.min(ATTENTION_N_TILE, end - mass_key0)
                     mass_key_row0 = attention_head * rows + mass_key0
@@ -215,22 +197,15 @@ def vision_attention(
                     mass_zero = pl.full([ATTENTION_M_TILE, ATTENTION_N_TILE], dtype=pl.FP32, value=0.0)
                     mass_argument[:, :] = pl.add(mass_zero, mass_shifted)
                     mass_exponentials = pl.create_tensor([ATTENTION_M_TILE, ATTENTION_N_TILE], dtype=pl.FP32)
-                    mass_exponentials[:, :] = vision_softmax_exp(mass_argument)
-                    mass_high, mass_low = accurate_row_sum_parts(mass_exponentials, 128)
-                    block_mass = pl.reshape(mass_high, [1, ATTENTION_M_TILE])
-                    block_error = pl.reshape(mass_low, [1, ATTENTION_M_TILE])
-                    updated_mass = pl.add(mass, block_mass)
-                    recovered_mass = pl.sub(updated_mass, mass)
-                    mass_left = pl.sub(mass, pl.sub(updated_mass, recovered_mass))
-                    mass_right = pl.sub(block_mass, recovered_mass)
-                    mass_error = pl.add(mass_error, pl.add(pl.add(mass_left, mass_right), block_error))
-                    mass = updated_mass
+                    mass_exponentials[:, :] = pl.exp(mass_argument)
+                    mass_sum = pl.row_sum(mass_exponentials)
+                    block_mass = pl.reshape(mass_sum, [1, ATTENTION_M_TILE])
+                    mass = pl.add(mass, block_mass)
                 mass_buffer = pl.create_tensor([1, ATTENTION_M_TILE], dtype=pl.FP32)
-                mass_buffer[:, :] = pl.add(mass, mass_error)
-                inverse_mass_row = accurate_reciprocal(mass_buffer)
+                mass_buffer[:, :] = mass
+                inverse_mass_row = pl.recip(mass_buffer)
                 inverse_mass = pl.reshape(inverse_mass_row, [ATTENTION_M_TILE, 1])
                 context = pl.full([ATTENTION_M_TILE, VISION_HEAD_DIM], dtype=pl.FP32, value=0.0)
-                context_error = pl.full([ATTENTION_M_TILE, VISION_HEAD_DIM], dtype=pl.FP32, value=0.0)
                 for key0 in pl.range(begin, end, ATTENTION_N_TILE):
                     valid_keys = pl.min(ATTENTION_N_TILE, end - key0)
                     key_head_row0 = attention_head * rows + key0
@@ -246,7 +221,7 @@ def vision_attention(
                     probability_shift = pl.row_expand_sub(scores_full, maximum_column)
                     probability_zero = pl.full([ATTENTION_M_TILE, ATTENTION_N_TILE], dtype=pl.FP32, value=0.0)
                     probability_argument[:, :] = pl.add(probability_zero, probability_shift)
-                    exponential = vision_softmax_exp(probability_argument)
+                    exponential = pl.exp(probability_argument)
                     probabilities = pl.row_expand_mul(exponential, inverse_mass)
                     probabilities = pl.add(probability_zero, probabilities)
                     probabilities_bf16 = pl.cast(probabilities, pl.BF16, mode="rint")
@@ -261,13 +236,7 @@ def vision_attention(
                         product_zero = pl.full([ATTENTION_M_TILE, VISION_HEAD_DIM], dtype=pl.FP32, value=0.0)
                         probability_rows = pl.row_expand(product_zero, probability_column)
                         partial_context = pl.col_expand_mul(probability_rows, context_value_row)
-                        updated_context = pl.add(context, partial_context)
-                        recovered_context = pl.sub(updated_context, context)
-                        context_left = pl.sub(context, pl.sub(updated_context, recovered_context))
-                        context_right = pl.sub(partial_context, recovered_context)
-                        context_error = pl.add(context_error, pl.add(context_left, context_right))
-                        context = updated_context
-                context = pl.add(context, context_error)
+                        context = pl.add(context, partial_context)
                 result = pl.cast(context, pl.BF16, mode="rint")
                 attended[row0:row0 + ATTENTION_M_TILE, attention_head * VISION_HEAD_DIM:(attention_head + 1) * VISION_HEAD_DIM] = pl.set_validshape(result, valid_rows, VISION_HEAD_DIM)
     bf16_projection(attended, proj_weight, proj_bias, output, VISION_HIDDEN, VISION_HIDDEN, True)
@@ -327,9 +296,9 @@ def vision_swiglu(
         denominator = pl.create_tensor([ACT_M_TILE, ACT_N_TILE], dtype=pl.FP32)
         gate_buffer[:, :] = gate_fp32
         exponent[:, :] = pl.neg(gate_fp32)
-        exponential = accurate_exp(exponent)
+        exponential = pl.exp(exponent)
         denominator[:, :] = pl.add(exponential, 1.0)
-        silu = accurate_divide(gate_buffer, denominator)
+        silu = pl.div(gate_buffer, denominator)
         silu_bf16 = pl.cast(silu, pl.BF16, mode="rint")
         product = pl.mul(pl.cast(silu_bf16, pl.FP32), up_fp32)
         result = pl.cast(product, pl.BF16, mode="rint")
@@ -652,7 +621,7 @@ def vision_merger_activation(
         variance = pl.add(pl.mul(squared_total, 1.0 / D), LAYER_NORM_EPS)
         variance_buffer = pl.create_tensor([1, MERGE_M_TILE], dtype=pl.FP32)
         variance_buffer[:, :] = variance
-        inverse_row = accurate_rsqrt(variance_buffer)
+        inverse_row = pl.rsqrt(variance_buffer, high_precision=False)
         inverse = pl.reshape(inverse_row, [MERGE_M_TILE, 1])
         for col0 in pl.range(0, D, MERGE_N_TILE):
             source = pl.slice(x, [MERGE_M_TILE, MERGE_N_TILE], [row0, col0], valid_shape=[valid_rows, MERGE_N_TILE])
@@ -666,7 +635,7 @@ def vision_merger_activation(
             z = pl.mul(normalized_fp32, 0.7071067811865476)
             gelu_denominator = pl.create_tensor([MERGE_M_TILE, MERGE_N_TILE], dtype=pl.FP32)
             gelu_denominator[:, :] = pl.add(pl.mul(pl.abs(z), 0.3275911), 1.0)
-            t = accurate_reciprocal(gelu_denominator)
+            t = pl.recip(gelu_denominator)
             polynomial = pl.add(pl.mul(t, 1.061405429), -1.453152027)
             polynomial = pl.add(pl.mul(t, polynomial), 1.421413741)
             polynomial = pl.add(pl.mul(t, polynomial), -0.284496736)

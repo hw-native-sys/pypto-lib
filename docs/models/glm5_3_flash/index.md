@@ -981,6 +981,175 @@ Use `--case tp_reduce` for the collective alone, or a local case such as
 python models/glm5_3_flash/lm_head.py -p a2a3 -d 0,1 --compile-only
 ```
 
+### Precision-compensation audit
+
+Native FP32 arithmetic replaces custom exp, reciprocal, sqrt and division
+corrections, compensated row sums and accumulations across KDA, mHC stream
+mixing, TP reduction, routing, MoE combine and vision attention. Three
+custom correction groups remain in the shared linear and RMSNorm kernels:
+
+- `bf16_linear` retains TwoSum residual accumulation of FP32 dot products.
+- `rmsnorm` retains `accurate_row_sum_parts` and the squared-sum residual
+  carried between chunks. It rounds the high/low sum and uses native `div`;
+  `accurate_divide_parts` is not retained.
+- `rmsnorm` uses `accurate_rsqrt`: a native high-precision initial value
+  followed by a Newton correction with both multiplication-error terms.
+
+The 24-layer vision forward ablation freezes inputs and Torch goldens for
+seeds 5355, 5356 and 5357, with grid `[[1, 2, 2], [1, 2, 6]]` and workspace
+shape `[1, 16, 1024]`. The existing comparison is `atol=rtol=0.02`, allowing
+at most 5% of points beyond tolerance. The following percentages describe
+failing points in `workspace_a` and `workspace_b`, not relative L2 error.
+
+| Removed or simplified correction | Counterexample | Workspace error percentages |
+| --- | --- | --- |
+| Linear TwoSum accumulation, retaining the former RMSNorm corrections | Seed 5355, hardware | 33.28% / 32.04% |
+| RMSNorm squared-sum correction | Seed 5356, hardware | 17.36% / 16.46% |
+| RMSNorm squared-sum correction | Seed 5355, simulator | 25.26% / 24.27% |
+| RMSNorm Newton correction, retaining the high-precision native initial value | Seed 5355, hardware | 7.14% / 6.27% |
+| Either multiplication-error term, or both terms, in the Newton residual | Seed 5356, hardware | 14.56% / 13.72% |
+| High-precision initial value, retaining the full Newton correction | Seeds 5355 / 5356 / 5357, hardware | 33.81% / 32.54%; 35.71% / 34.64%; 36.40% / 35.41% |
+
+Keeping these three groups passes all three fixtures on hardware and in
+simulation. The first two seeds have zero workspace points beyond tolerance;
+the third has 0.85% / 0.43%. The lower-precision initial value passes the
+simulator fixtures and isolated RMSNorm/MLA checks but fails composed vision
+on hardware, so simulator success alone does not justify removing it.
+The retained candidate also passes RMSNorm and TP8 native MLA projection
+with layer-3 checkpoint weights at 32 and 192 tokens. Goldens, thresholds,
+BF16/INT8 boundaries and padding contracts are unchanged.
+
+Hardware checks use PyPTO `ff2e0a4e`, runtime `31f9e72e` and PTOAS 0.72.
+The CI-revision simulator checks use PyPTO `1dedb26c`, runtime `355ce301`,
+PTO-ISA `5487a6b0` and PTOAS 0.72. These are different toolchain revisions,
+not an assertion that the full CI machine environment was reproduced.
+
+This is the minimum among the tested correction variants and fixtures,
+under the existing internal-workspace CI contract. Without these custom
+corrections, final vision `features` still pass the three hardware fixtures:
+only 0.11%, 0.25% and 0.12% of their elements exceed tolerance. The workspace
+counterexamples therefore do not establish that each correction is
+indispensable for answer quality or every possible input.
+
+Three shared call sites retain native `rsqrt(high_precision=True)`:
+
+| Retained site | Counterexample with default precision |
+| --- | --- |
+| `mhc_mixes` inverse RMS | TP8, 192 tokens, seed 3: pre/post/residual coefficients have 13/768, 122/768 and 532/3072 points beyond `atol=1e-5, rtol=1e-3`; the allowed error ratio is 0.5%. Native high precision passes without custom correction. |
+| `rmsnorm_quant` inverse RMS | 32x4096 random fixture: 5,342 INT8 mismatches exceed the 0.1% budget; 7/32 scales fail `rtol=1e-6`. The rounding fixture has 15,360 INT8 mismatches. Native high precision passes without custom correction. |
+| `rmsnorm` inverse-root initial value | All three hardware vision fixtures fail even with the full Newton residual correction, as shown above. |
+
+KDA output normalization, KDA prefill Q/K normalization and vision merger
+normalization use `high_precision=False`; their existing operator checks
+pass in that mode. No shape-specific precision branches are added.
+`bf16_linear_row`, quantized RMSNorm, vision-local arithmetic and native
+RMSNorm mean division do not regain custom corrections. Unused compensated
+helpers and their obsolete standalone validation entry remain removed;
+independent CPU references still use FP64.
+
+The router's learned `correction_bias`, epsilon terms, softmax max
+subtraction, FP32 accumulation and model-defined BF16/INT8 rounding
+boundaries remain part of the model computation. They are not removable
+roundoff compensation. Earlier performance sections describe historical
+implementations and do not justify retaining their precision corrections.
+
+### Precision-cleanup generation and performance validation
+
+The earlier cleanup, before the minimum vision corrections above were
+restored, passed 33 operator case groups and 46 golden runs. Those checks
+covered vision components but omitted the composed 24-layer vision forward
+case. They are not a complete accuracy verdict for the final revision.
+The full-model short-answer check uses 12 unique questions and two repeats, temperature zero, the same W8A8
+checkpoint and TP8/EP8 configuration. Both versions answer all 12 questions
+correctly; all 14 final answers match. Full generated token sequences match
+in 13/14 comparisons: one extraction answer omits the baseline's reasoning
+text but preserves the final answer. Input lengths are 22-223 tokens. This
+is a bounded short-answer regression, not a standardized accuracy benchmark
+or a long-generation quality evaluation.
+
+A separate serving throughput test compares main `35211954` plus the
+Sinkhorn/convolution cleanup with the same base plus the earlier full audit,
+before restoring the minimum vision corrections. These measurements do not
+measure the final retained-correction revision; its full-model performance
+has not been remeasured.
+Both variants use the same eight a2a3 devices, published W8A8 checkpoint,
+serving PR #286 with ABI-11 adaptations, PyPTO `ff2e0a4e`, runtime
+`31f9e72e` and PTOAS 0.72. The case is TP8/EP8, concurrency one, 160 input
+and 128 output tokens, with 32-token prefill chunks and prefix caching
+disabled. Timing observes the host serving stream and excludes startup
+and profiling. One warmup precedes three measured requests; the table
+reports medians. Throughput is 128 divided by complete request time;
+TPOT excludes the first token and divides by the remaining 127 tokens.
+
+| Metric | Before full audit | After full audit | Change |
+| --- | ---: | ---: | ---: |
+| Output throughput (tokens/s) | 8.044 | 10.376 | +28.98% |
+| Time to first token (s) | 1.687 | 1.513 | -10.31% |
+| Time per subsequent token (ms) | 112.074 | 85.340 | -23.85% |
+| Complete request time (s) | 15.912 | 12.336 | -22.47% |
+
+Throughput samples are 8.003, 8.052 and 8.044 tokens/s before cleanup,
+and 10.292, 10.376 and 10.401 tokens/s after cleanup. All eight requests,
+including warmups, produce the same 128 token IDs. This fixed throughput
+prompt is separate from the short-answer quality check.
+
+A separate native rank-0 capture covers all 45 layers and the vocabulary
+head for the final 32-token prefill chunk and first decode step. The
+physical-core execution spans are 285.708 ms and 65.826 ms respectively;
+these are single profiled dispatches, not all 128 decode steps or the
+unprofiled latency statistics above. The official swimlane export retains
+scheduler and dependency events. The smaller prefill browser trace keeps
+all physical-core execution events; both browser traces render execution
+lanes. Decode dependency-arrow import warnings do not remove execution
+slices. Raw captures, source snapshots and browser-validation records are
+retained with the benchmark artifacts, outside the source repository.
+
+### Native arithmetic for Sinkhorn and convolution
+
+The mHC Sinkhorn normalization uses FP32 `row_sum` and `div` for its
+replicated 4x4 nonnegative matrix. The 20 row/column iterations, quadrant
+scaling and epsilon placement are preserved. KDA convolution uses native
+FP32 `exp` and `div` for SiLU across bulk, request-head and recurrent paths;
+the four taps retain sequential FP32 accumulation and the output rounds
+once to BF16. The former `accurate_silu` helper is replaced by `silu`.
+The audit above limits remaining custom compensation to shared linear
+accumulation and RMSNorm.
+
+The FP64-derived goldens and numerical acceptance limits are unchanged.
+TP8 and TP16 checks cover zero, cancellation and scaled inputs, odd token
+counts, prefix snapshots, speculative state restoration, the exact BF16
+convolution boundary fixture, and mHC coefficients composed with BF16
+stream collapse. Checkpoint-weight checks use attention/FFN mHC weights
+from layers 0, 23 and 44, and convolution weights from layers 0, 22 and 44,
+with seeded synthetic activations. Coefficients pass all points at
+`atol=1e-5, rtol=1e-3`; convolution and recurrent outputs pass all points at
+`atol=rtol=0.02`; convolution state copies and the boundary key are exact.
+The composed mHC BF16 output retains `atol=1e-4, rtol=1/128`.
+
+On a2a3 TP8, complete mHC mixing against mainline `79be1fd` falls from
+1073.8 to 1027.5 us at 32 rows, and from 4576.7 to 4393.1 us at 192 rows.
+The projection work in that baseline dominates the complete operator.
+
+The following separate comparison applies only these arithmetic changes
+on top of the Cube projections and bounded workers in PR #1730 at
+`e821d1f`. It does not include those earlier optimizations in the speedup.
+
+| Operator | Case | Before (us) | After (us) | Speedup |
+|---|---|---:|---:|---:|
+| Complete mHC mixing | 32 rows | 139.2 | 93.6 | 1.49x |
+| Complete mHC mixing | 192 rows | 530.9 | 348.0 | 1.53x |
+| Recurrent convolution | Capacity 32, one active request | 24.5 | 21.3 | 1.15x |
+| Recurrent convolution | Capacity 32, 32 one-token requests | 105.3 | 46.1 | 2.28x |
+| Recurrent convolution | Capacity 192, lengths `[6, 0, 2, 1] * 8` | 200.0 | 66.6 | 3.00x |
+
+Each pair uses the same device, 100 timed rounds after five warmups,
+frozen input/golden replay and the device effective-time median.
+Convolution shapes are `[capacity, 3072]`, weights `[4, 3072]`, state
+`[320, 3, 3072]`, request offsets `[33]` and metadata `[32, 14]`.
+These are single-operator measurements; whole-model generation has not
+been remeasured with these arithmetic changes. Passing the component
+gates does not establish bitwise equality for all model outputs.
+
 ## Validation
 
 `decode_fwd.py` exports the complete production decode L3 entry. Component validation stays with the operators in `kda.py`,
@@ -1229,8 +1398,8 @@ frame-segmented attention/MLP blocks, downsampling and the merger on an
 allocated NPU.
 Position-only FP32 RoPE constants are prepared with the input metadata and
 gathered on device. The attention reference rounds independent FP64
-exponentials, sums and reciprocals at the FP32 boundaries; compensated
-reductions retain those boundaries in the device implementation.
+exponentials, sums and reciprocals at the FP32 boundaries. The device uses
+native FP32 arithmetic and retains the model-defined BF16 boundaries.
 The validation driver with image/video inputs
 expands image/video markers and replaces the corresponding embedding rows
 before seeding all four streams.

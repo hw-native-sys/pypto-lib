@@ -18,9 +18,7 @@ import pypto.language as pl
 import torch
 
 from models.glm5_3_flash.config import FLASH, D
-from models.glm5_3_flash.elementwise import (
-    _sum_fp32_reference, accurate_divide_parts, accurate_row_sum_parts, accurate_rsqrt,
-)
+from models.glm5_3_flash.elementwise import _sum_fp32_reference, accurate_row_sum_parts, accurate_rsqrt
 from models.glm5_3_flash.quantization import INT8_SCALE_MAX, quantize_per_token_int8
 from models.glm5_3_flash.utils import _check, _report
 
@@ -68,7 +66,8 @@ def rmsnorm(
         sum_high[:, :] = square_sum
         sum_low[:, :] = square_error
         denominator[:, :] = pl.add(pl.mul(square_sum, 0.0), pl.cast(pl.cast(width, pl.INT32), pl.FP32))
-        mean = accurate_divide_parts(sum_high, sum_low, denominator, 1, NORM_T_TILE)
+        rounded_sum = pl.add(sum_high, sum_low)
+        mean = pl.div(rounded_sum, denominator)
         norm_argument = pl.create_tensor([1, NORM_T_TILE], dtype=pl.FP32)
         norm_argument[:, :] = pl.add(mean, EPS)
         inverse = accurate_rsqrt(norm_argument)
@@ -113,23 +112,18 @@ def rmsnorm_quant(
         t0 = block * NORM_T_TILE
         valid_rows = pl.min(NORM_T_TILE, t_dim - t0)
         square_sum = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
-        square_error = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
         for norm_k in pl.pipeline(0, D, NORM_D_TILE, stage=1):
             norm_part = pl.slice(x, [NORM_T_TILE, NORM_D_TILE], [t0, norm_k], valid_shape=[valid_rows, NORM_D_TILE])
             norm_value = pl.cast(norm_part, pl.FP32)
             norm_square = pl.create_tensor([NORM_T_TILE, NORM_D_TILE], dtype=pl.FP32)
             norm_square[:, :] = pl.mul(norm_value, norm_value)
-            part_high, part_low = accurate_row_sum_parts(norm_square, 128)
-            part_sum = pl.reshape(part_high, [1, NORM_T_TILE])
-            part_error = pl.reshape(part_low, [1, NORM_T_TILE])
-            updated_sum = pl.add(square_sum, part_sum)
-            recovered = pl.sub(updated_sum, square_sum)
-            error = pl.add(pl.sub(square_sum, pl.sub(updated_sum, recovered)), pl.sub(part_sum, recovered))
-            square_error = pl.add(square_error, pl.add(error, part_error))
-            square_sum = updated_sum
+            row_sum = pl.row_sum(norm_square)
+            part_sum = pl.reshape(row_sum, [1, NORM_T_TILE])
+            square_sum = pl.add(square_sum, part_sum)
         norm_argument = pl.create_tensor([1, NORM_T_TILE], dtype=pl.FP32)
-        norm_argument[:, :] = pl.add(pl.mul(pl.add(square_sum, square_error), 1.0 / D), EPS)
-        inverse = accurate_rsqrt(norm_argument)
+        norm_argument[:, :] = pl.add(pl.mul(square_sum, 1.0 / D), EPS)
+        # The default inverse RMS fails the INT8 and dequantization-scale contracts.
+        inverse = pl.rsqrt(norm_argument, high_precision=True)
         inv_rms = pl.reshape(inverse, [NORM_T_TILE, 1])
         for kb in pl.pipeline(D // NORM_D_TILE, stage=2):
             k0 = kb * NORM_D_TILE
