@@ -243,7 +243,30 @@ def _prefill_indexer_compressor_tile(
             write_pos = pl.read(write_pos_map, [0, write_i])
             cur_start = write_pos + 1 - COMPRESS_RATIO
             prev_start = cur_start - COMPRESS_RATIO
-            for pool_s in pl.range(COMPRESS_RATIO):
+            # Consecutive tile-local windows read each half directly from its projection columns.
+            history_slots = pl.cast(COMPRESS_RATIO, pl.INDEX)
+            overlay_begin = pl.cast(0, pl.INDEX)
+            overlay_end = tile_rows
+            if pl.read(tile_positions_consecutive_flag, [0]) > 0:
+                first_pos = pl.cast(tile_first_position, pl.INDEX)
+                prev_local = pl.cast(prev_start, pl.INDEX) - first_pos
+                end_local = pl.cast(write_pos, pl.INDEX) + 1 - first_pos
+                overlay_begin = pl.max(0, prev_local)
+                overlay_end = pl.min(tile_rows, end_local)
+                whole_window = prev_local >= 0 and end_local <= tile_rows and write_pos >= STATE_LEN - 1
+                if whole_window and prev_start % COMPRESS_RATIO == 0:
+                    cur_local = prev_local + COMPRESS_RATIO
+                    pool_kv_tile[0:COMPRESS_RATIO, :] = pl.slice(kv_proj_scratch, [COMPRESS_RATIO, HEAD_D_TILE], [prev_local, h0])
+                    pool_kv_tile[COMPRESS_RATIO:STATE_LEN, :] = pl.slice(kv_proj_scratch, [COMPRESS_RATIO, HEAD_D_TILE], [cur_local, HEAD_DIM + h0])
+                    prev_scores = pl.slice(score_proj_scratch, [COMPRESS_RATIO, HEAD_D_TILE], [prev_local, h0])
+                    cur_scores = pl.slice(score_proj_scratch, [COMPRESS_RATIO, HEAD_D_TILE], [cur_local, HEAD_DIM + h0])
+                    prev_ape = pl.slice(ape, [COMPRESS_RATIO, HEAD_D_TILE], [0, h0])
+                    cur_ape = pl.slice(ape, [COMPRESS_RATIO, HEAD_D_TILE], [0, HEAD_DIM + h0])
+                    pool_score_tile[0:COMPRESS_RATIO, :] = pl.add(prev_scores, prev_ape)
+                    pool_score_tile[COMPRESS_RATIO:STATE_LEN, :] = pl.add(cur_scores, cur_ape)
+                    history_slots = pl.cast(0, pl.INDEX)
+                    overlay_end = overlay_begin
+            for pool_s in pl.range(history_slots):
                 prev_abs = prev_start + pool_s
                 front_slot = pool_s
                 pool_kv_tile[front_slot : front_slot + 1, 0:HEAD_D_TILE] = pl.full(
@@ -315,13 +338,6 @@ def _prefill_indexer_compressor_tile(
                         OUT_DIM + HEAD_DIM + h0 : OUT_DIM + HEAD_DIM + h0 + HEAD_D_TILE,
                     ]
 
-            # Current-tile state overlay from projection scratch.
-            overlay_begin = pl.cast(0, pl.INDEX)
-            overlay_end = tile_rows
-            if pl.read(tile_positions_consecutive_flag, [0]) > 0:
-                overlay_first = pl.cast(tile_first_position, pl.INDEX)
-                overlay_begin = pl.max(0, pl.cast(prev_start, pl.INDEX) - overlay_first)
-                overlay_end = pl.min(tile_rows, pl.cast(write_pos, pl.INDEX) + 1 - overlay_first)
             for pool_local in pl.range(overlay_begin, overlay_end):
                 pool_global = tile_base + pool_local
                 pool_pos = pl.read(position_ids, [pool_global])
