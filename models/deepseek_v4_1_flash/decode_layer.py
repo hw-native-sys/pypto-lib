@@ -269,7 +269,6 @@ def l2_decode_layer(
             topk_indices,
             attention_hidden, attention_pre_mix,
             attention_num_tokens,
-            pool_block_counts, pool_block_ids, False,
         )
     else:
         decode_c1a_reuse(
