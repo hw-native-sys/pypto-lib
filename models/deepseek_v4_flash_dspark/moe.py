@@ -122,9 +122,6 @@ PREFILL_MM_INTER_TILE = 256
 PREFILL_ACT_INTER_TILE = 128
 PREFILL_D_OUT_TILE = 256
 PREFILL_QUANT_TILE = 512
-PREFILL_D_OUT_ACT_TILE = 512
-PREFILL_W2_INNER = 1
-PREFILL_W2_ACT_INNER = 1
 PREFILL_MOE_SCALE_PAD = 16
 PREFILL_MOE_EXPERT_SCALE_PAD = 16
 PREFILL_MOE_ROUTE_MAP_PAD = 16
@@ -740,7 +737,7 @@ def _make_expert_gate_up_quant_tile(grouped_capacity: int, row_tile: int):
         expert_x: pl.Tensor[[grouped_capacity, D], pl.INT8],
         expert_scale: pl.Tensor[[grouped_capacity, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32],
         h_i8: pl.Tensor[[grouped_capacity, MOE_INTER], pl.INT8],
-        h_scale_dq: pl.Tensor[[grouped_capacity, 1], pl.FP32],
+        h_route_scale: pl.Tensor[[grouped_capacity, 1], pl.FP32],
         tile_row_start: pl.Scalar[pl.INDEX],
         local_expert_id: pl.Scalar[pl.INDEX],
         valid_rows: pl.Scalar[pl.INDEX],
@@ -776,7 +773,7 @@ def _make_expert_gate_up_quant_tile(grouped_capacity: int, row_tile: int):
 
             h_tile_fp32 = pl.create_tensor([ROW_TILE, MOE_INTER], dtype=pl.FP32)
             h_tile_i8 = h_i8[tile_row_start : tile_row_start + ROW_TILE]
-            h_tile_scale_dq = h_scale_dq[tile_row_start : tile_row_start + ROW_TILE]
+            h_tile_route_scale = h_route_scale[tile_row_start : tile_row_start + ROW_TILE]
             with pl.spmd((ROW_TILE // VEC_ROW_TILE), name_hint="prefill_exp_gate_up_quant", deps=[w13_tid]):
                 vector_row = pl.tile.get_block_idx() * VEC_ROW_TILE
                 vector_flat_row = tile_row_start + vector_row
@@ -807,7 +804,9 @@ def _make_expert_gate_up_quant_tile(grouped_capacity: int, row_tile: int):
                     h_abs = pl.maximum(h_padded, pl.neg(h_padded))
                     row_amax = pl.maximum(row_amax, pl.reshape(pl.row_max(h_abs), [1, VEC_ROW_TILE]))
                 quant_scale = pl.div(pl.full([1, VEC_ROW_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), row_amax)
-                h_tile_scale_dq[vector_row : vector_row + VEC_ROW_TILE, :] = pl.reshape(pl.recip(quant_scale), [VEC_ROW_TILE, 1])
+                dequant_scale = pl.reshape(pl.recip(quant_scale), [VEC_ROW_TILE, 1])
+                route_weight = pl.reshape(x_scale_transposed[1:2, :], [VEC_ROW_TILE, 1])
+                h_tile_route_scale[vector_row : vector_row + VEC_ROW_TILE, :] = pl.mul(dequant_scale, route_weight)
                 quant_scale_col = pl.reshape(quant_scale, [VEC_ROW_TILE, 1])
                 for k0 in pl.pipeline(0, MOE_INTER, H_QUANT_TILE, stage=2):
                     h_quant_chunk = h_tile_fp32[vector_row : vector_row + VEC_ROW_TILE, k0 : k0 + H_QUANT_TILE]
@@ -824,13 +823,12 @@ def _make_expert_down_proj_tile(grouped_capacity: int, row_tile: int):
     ROW_TILE = row_tile
     OUTPUT_MM_TILE = 128 if row_tile > 128 else PREFILL_D_OUT_TILE
     VEC_ROW_TILE = PREFILL_RECV_TILE
-    OUTPUT_ACT_TILE = PREFILL_D_OUT_ACT_TILE
+    LANE_ROW_TILE = ROW_TILE // 2
 
     @pl.jit.inline(auto_scope=False)
     def expert_down_proj_tile(
-        expert_scale: pl.Tensor[[grouped_capacity, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32],
         h_i8: pl.Tensor[[grouped_capacity, MOE_INTER], pl.INT8],
-        h_scale_dq: pl.Tensor[[grouped_capacity, 1], pl.FP32],
+        h_route_scale: pl.Tensor[[grouped_capacity, 1], pl.FP32],
         tile_row_start: pl.Scalar[pl.INDEX],
         local_expert_id: pl.Scalar[pl.INDEX],
         routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ],
@@ -838,48 +836,35 @@ def _make_expert_down_proj_tile(grouped_capacity: int, row_tile: int):
         expert_y: pl.Tensor[[grouped_capacity, D], pl.BF16],
     ) -> pl.Scalar[pl.TASK_ID]:
         """Write routing-weighted BF16 down-projection output and return its TaskId."""
-        weight_e = local_expert_id
         h_tile_i8 = h_i8[tile_row_start : tile_row_start + ROW_TILE]
-        h_tile_scale_dq = h_scale_dq[tile_row_start : tile_row_start + ROW_TILE]
-
-        y_i32 = pl.create_tensor([ROW_TILE, D], dtype=pl.INT32)
-        with pl.spmd(D // (PREFILL_W2_INNER * OUTPUT_MM_TILE), name_hint="prefill_exp_w2_mm", allow_early_resolve=True) as w2_tid:
-            block = pl.tile.get_block_idx()
-            d_base = block * (PREFILL_W2_INNER * OUTPUT_MM_TILE)
-            for inner in pl.range(PREFILL_W2_INNER):
-                d0 = d_base + inner * OUTPUT_MM_TILE
-                y_acc = pl.create_tensor([1, ROW_TILE, OUTPUT_MM_TILE], dtype=pl.INT32)
-                for k0 in pl.pipeline(0, MOE_INTER, PREFILL_INTER_K_TILE, stage=2):
-                    h_w2_chunk = h_tile_i8[:, k0 : k0 + PREFILL_INTER_K_TILE]
-                    w2_chunk = routed_w2[weight_e : weight_e + 1, d0 : d0 + OUTPUT_MM_TILE, k0 : k0 + PREFILL_INTER_K_TILE]
-                    y_acc = pl.matmul_acc(y_acc, h_w2_chunk, w2_chunk, b_trans=True, init_cond=k0 == 0)
-                y_i32[:, d0 : d0 + OUTPUT_MM_TILE] = pl.reshape(y_acc, [ROW_TILE, OUTPUT_MM_TILE])
-
+        h_tile_route_scale = h_route_scale[tile_row_start : tile_row_start + ROW_TILE]
         expert_y_tile = expert_y[tile_row_start : tile_row_start + ROW_TILE, :]
         with pl.spmd(
-            (ROW_TILE // VEC_ROW_TILE) * (D // (PREFILL_W2_ACT_INNER * OUTPUT_ACT_TILE)),
-            name_hint="prefill_exp_w2_act",
-            deps=[w2_tid],
-            allow_early_resolve=False,
-        ) as w2_act_tid:
-            grid_block = pl.tile.get_block_idx()
-            vector_row = (grid_block // (D // (PREFILL_W2_ACT_INNER * OUTPUT_ACT_TILE))) * VEC_ROW_TILE
-            block = grid_block % (D // (PREFILL_W2_ACT_INNER * OUTPUT_ACT_TILE))
-            vector_flat_row = tile_row_start + vector_row
-            d_base = block * (PREFILL_W2_ACT_INNER * OUTPUT_ACT_TILE)
-            scale_padded = expert_scale[vector_flat_row : vector_flat_row + VEC_ROW_TILE, 0:PREFILL_MOE_EXPERT_SCALE_PAD]
-            scale_transposed = pl.transpose(scale_padded, axis1=0, axis2=1)
-            weight_col = pl.reshape(scale_transposed[1:2, :], [VEC_ROW_TILE, 1])
-            row_scale = pl.mul(h_tile_scale_dq[vector_row : vector_row + VEC_ROW_TILE, :], weight_col)
-            for inner in pl.pipeline(PREFILL_W2_ACT_INNER, stage=2):
-                d0 = d_base + inner * OUTPUT_ACT_TILE
-                y_fp32 = pl.cast(y_i32[vector_row : vector_row + VEC_ROW_TILE, d0 : d0 + OUTPUT_ACT_TILE], target_type=pl.FP32, mode="none")
-                y_scaled = pl.row_expand_mul(y_fp32, row_scale)
-                output_weight_scale = routed_w2_scale[local_expert_id : local_expert_id + 1, d0 : d0 + OUTPUT_ACT_TILE]
-                y_fp32 = pl.col_expand_mul(y_scaled, output_weight_scale)
-                y_bf16 = pl.cast(y_fp32, pl.BF16, mode="rint")
-                expert_y_tile[vector_row : vector_row + VEC_ROW_TILE, d0 : d0 + OUTPUT_ACT_TILE] = y_bf16
-        return w2_act_tid
+            D // OUTPUT_MM_TILE, name_hint="prefill_exp_w2", allow_early_resolve=True,
+            optimizations=[pl.cross_core_slot(slot_num=1)],
+        ) as w2_tid:
+            d0 = pl.tile.get_block_idx() * OUTPUT_MM_TILE
+            y_acc = pl.create_tensor([1, ROW_TILE, OUTPUT_MM_TILE], dtype=pl.INT32)
+            for k0 in pl.pipeline(0, MOE_INTER, PREFILL_INTER_K_TILE, stage=2):
+                activation = h_tile_i8[:, k0 : k0 + PREFILL_INTER_K_TILE]
+                weight = routed_w2[local_expert_id : local_expert_id + 1, d0 : d0 + OUTPUT_MM_TILE, k0 : k0 + PREFILL_INTER_K_TILE]
+                y_acc = pl.matmul_acc(y_acc, activation, weight, b_trans=True, init_cond=k0 == 0)
+
+            y_matrix = pl.reshape(y_acc, [ROW_TILE, OUTPUT_MM_TILE])
+            for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                y_shard = pl.aiv_shard(y_matrix)
+                lane_row = lane * LANE_ROW_TILE
+                weight_scale = routed_w2_scale[local_expert_id : local_expert_id + 1, d0 : d0 + OUTPUT_MM_TILE]
+                for subrow in pl.range(0, LANE_ROW_TILE, VEC_ROW_TILE):
+                    row = lane_row + subrow
+                    row_scale = h_tile_route_scale[row : row + VEC_ROW_TILE, :]
+                    y_i32 = y_shard[subrow : subrow + VEC_ROW_TILE, :]
+                    y_fp32 = pl.cast(y_i32, pl.FP32, mode="none")
+                    y_scaled = pl.row_expand_mul(y_fp32, row_scale)
+                    y_fp32 = pl.col_expand_mul(y_scaled, weight_scale)
+                    y_bf16 = pl.cast(y_fp32, pl.BF16, mode="rint")
+                    expert_y_tile[row : row + VEC_ROW_TILE, d0 : d0 + OUTPUT_MM_TILE] = y_bf16
+        return w2_tid
 
     return expert_down_proj_tile
 
@@ -923,7 +908,7 @@ def make_prefill_expert_grouped(grouped_capacity: int):
         """Compute aligned expert slabs with count-driven row tiles and weighted BF16 outputs."""
         expert_bases = pl.create_tensor([N_LOCAL, 1], dtype=pl.INT32)
         h_i8 = pl.create_tensor([grouped_capacity, MOE_INTER], dtype=pl.INT8)
-        h_scale_dq = pl.create_tensor([grouped_capacity, 1], dtype=pl.FP32, manual_dep=True)
+        h_route_scale = pl.create_tensor([grouped_capacity, 1], dtype=pl.FP32, manual_dep=True)
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_exp_group_layout", allow_early_resolve=True) as layout_tid:
             grouped_base = pl.cast(0, pl.INDEX)
             for local_expert_id in pl.range(N_LOCAL):
@@ -944,7 +929,7 @@ def make_prefill_expert_grouped(grouped_capacity: int):
                     tile_row_start = flat_base + tile_row
                     valid_rows = pl.cast(pl.min(256, n_rows - tile_row), pl.INDEX)
                     gate_up_quant_m256(
-                        expert_x, expert_scale, h_i8, h_scale_dq,
+                        expert_x, expert_scale, h_i8, h_route_scale,
                         tile_row_start, local_expert_id, valid_rows, layout_tid,
                         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
                     )
@@ -953,7 +938,7 @@ def make_prefill_expert_grouped(grouped_capacity: int):
                     tile_row_start = flat_base + tile_row
                     valid_rows = pl.cast(pl.min(32, n_rows - tile_row), pl.INDEX)
                     gate_up_quant_m32(
-                        expert_x, expert_scale, h_i8, h_scale_dq,
+                        expert_x, expert_scale, h_i8, h_route_scale,
                         tile_row_start, local_expert_id, valid_rows, layout_tid,
                         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
                     )
@@ -962,7 +947,7 @@ def make_prefill_expert_grouped(grouped_capacity: int):
                     tile_row_start = flat_base + tile_row
                     valid_rows = pl.cast(pl.min(64, n_rows - tile_row), pl.INDEX)
                     gate_up_quant_m64(
-                        expert_x, expert_scale, h_i8, h_scale_dq,
+                        expert_x, expert_scale, h_i8, h_route_scale,
                         tile_row_start, local_expert_id, valid_rows, layout_tid,
                         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
                     )
@@ -971,7 +956,7 @@ def make_prefill_expert_grouped(grouped_capacity: int):
                     tile_row_start = flat_base + tile_row
                     valid_rows = pl.cast(pl.min(96, n_rows - tile_row), pl.INDEX)
                     gate_up_quant_m96(
-                        expert_x, expert_scale, h_i8, h_scale_dq,
+                        expert_x, expert_scale, h_i8, h_route_scale,
                         tile_row_start, local_expert_id, valid_rows, layout_tid,
                         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
                     )
@@ -980,7 +965,7 @@ def make_prefill_expert_grouped(grouped_capacity: int):
                     tile_row_start = flat_base + tile_row
                     valid_rows = pl.cast(pl.min(128, n_rows - tile_row), pl.INDEX)
                     gate_up_quant_m128(
-                        expert_x, expert_scale, h_i8, h_scale_dq,
+                        expert_x, expert_scale, h_i8, h_route_scale,
                         tile_row_start, local_expert_id, valid_rows, layout_tid,
                         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
                     )
@@ -989,7 +974,7 @@ def make_prefill_expert_grouped(grouped_capacity: int):
                     tile_row_start = flat_base + tile_row
                     valid_rows = pl.cast(pl.min(160, n_rows - tile_row), pl.INDEX)
                     gate_up_quant_m160(
-                        expert_x, expert_scale, h_i8, h_scale_dq,
+                        expert_x, expert_scale, h_i8, h_route_scale,
                         tile_row_start, local_expert_id, valid_rows, layout_tid,
                         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
                     )
@@ -998,7 +983,7 @@ def make_prefill_expert_grouped(grouped_capacity: int):
                     tile_row_start = flat_base + tile_row
                     valid_rows = pl.cast(pl.min(192, n_rows - tile_row), pl.INDEX)
                     gate_up_quant_m192(
-                        expert_x, expert_scale, h_i8, h_scale_dq,
+                        expert_x, expert_scale, h_i8, h_route_scale,
                         tile_row_start, local_expert_id, valid_rows, layout_tid,
                         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
                     )
@@ -1007,7 +992,7 @@ def make_prefill_expert_grouped(grouped_capacity: int):
                     tile_row_start = flat_base + tile_row
                     valid_rows = pl.cast(pl.min(224, n_rows - tile_row), pl.INDEX)
                     gate_up_quant_m224(
-                        expert_x, expert_scale, h_i8, h_scale_dq,
+                        expert_x, expert_scale, h_i8, h_route_scale,
                         tile_row_start, local_expert_id, valid_rows, layout_tid,
                         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
                     )
@@ -1023,7 +1008,7 @@ def make_prefill_expert_grouped(grouped_capacity: int):
                     tile_row = tile * 256
                     tile_row_start = flat_base + tile_row
                     w2_act_tid = down_proj_m256(
-                        expert_scale, h_i8, h_scale_dq, tile_row_start, local_expert_id,
+                        h_i8, h_route_scale, tile_row_start, local_expert_id,
                         routed_w2, routed_w2_scale, expert_y,
                     )
                     w2_act_tids[tile] = w2_act_tid
@@ -1031,7 +1016,7 @@ def make_prefill_expert_grouped(grouped_capacity: int):
                     tile_row = full_tiles * 256
                     tile_row_start = flat_base + tile_row
                     w2_act_tid = down_proj_m32(
-                        expert_scale, h_i8, h_scale_dq, tile_row_start, local_expert_id,
+                        h_i8, h_route_scale, tile_row_start, local_expert_id,
                         routed_w2, routed_w2_scale, expert_y,
                     )
                     w2_act_tids[full_tiles] = w2_act_tid
@@ -1039,7 +1024,7 @@ def make_prefill_expert_grouped(grouped_capacity: int):
                     tile_row = full_tiles * 256
                     tile_row_start = flat_base + tile_row
                     w2_act_tid = down_proj_m64(
-                        expert_scale, h_i8, h_scale_dq, tile_row_start, local_expert_id,
+                        h_i8, h_route_scale, tile_row_start, local_expert_id,
                         routed_w2, routed_w2_scale, expert_y,
                     )
                     w2_act_tids[full_tiles] = w2_act_tid
@@ -1047,7 +1032,7 @@ def make_prefill_expert_grouped(grouped_capacity: int):
                     tile_row = full_tiles * 256
                     tile_row_start = flat_base + tile_row
                     w2_act_tid = down_proj_m96(
-                        expert_scale, h_i8, h_scale_dq, tile_row_start, local_expert_id,
+                        h_i8, h_route_scale, tile_row_start, local_expert_id,
                         routed_w2, routed_w2_scale, expert_y,
                     )
                     w2_act_tids[full_tiles] = w2_act_tid
@@ -1055,7 +1040,7 @@ def make_prefill_expert_grouped(grouped_capacity: int):
                     tile_row = full_tiles * 256
                     tile_row_start = flat_base + tile_row
                     w2_act_tid = down_proj_m128(
-                        expert_scale, h_i8, h_scale_dq, tile_row_start, local_expert_id,
+                        h_i8, h_route_scale, tile_row_start, local_expert_id,
                         routed_w2, routed_w2_scale, expert_y,
                     )
                     w2_act_tids[full_tiles] = w2_act_tid
@@ -1063,7 +1048,7 @@ def make_prefill_expert_grouped(grouped_capacity: int):
                     tile_row = full_tiles * 256
                     tile_row_start = flat_base + tile_row
                     w2_act_tid = down_proj_m160(
-                        expert_scale, h_i8, h_scale_dq, tile_row_start, local_expert_id,
+                        h_i8, h_route_scale, tile_row_start, local_expert_id,
                         routed_w2, routed_w2_scale, expert_y,
                     )
                     w2_act_tids[full_tiles] = w2_act_tid
@@ -1071,7 +1056,7 @@ def make_prefill_expert_grouped(grouped_capacity: int):
                     tile_row = full_tiles * 256
                     tile_row_start = flat_base + tile_row
                     w2_act_tid = down_proj_m192(
-                        expert_scale, h_i8, h_scale_dq, tile_row_start, local_expert_id,
+                        h_i8, h_route_scale, tile_row_start, local_expert_id,
                         routed_w2, routed_w2_scale, expert_y,
                     )
                     w2_act_tids[full_tiles] = w2_act_tid
@@ -1079,7 +1064,7 @@ def make_prefill_expert_grouped(grouped_capacity: int):
                     tile_row = full_tiles * 256
                     tile_row_start = flat_base + tile_row
                     w2_act_tid = down_proj_m224(
-                        expert_scale, h_i8, h_scale_dq, tile_row_start, local_expert_id,
+                        h_i8, h_route_scale, tile_row_start, local_expert_id,
                         routed_w2, routed_w2_scale, expert_y,
                     )
                     w2_act_tids[full_tiles] = w2_act_tid
