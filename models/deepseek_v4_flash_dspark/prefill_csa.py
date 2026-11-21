@@ -1423,14 +1423,8 @@ def prefill_attention_csa_cp_local(
     norm_ready_tid = rms_norm(x_mixed_local, attn_norm_w, x_normed_local)
     x_normed_full = pl.create_tensor([kv_dim, D], dtype=pl.BF16)
     local_base = tp_rank * q_dim
-    freqs_cos_local = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
-    freqs_sin_local = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
-    for local_row in pl.spmd(q_dim, name_hint="prefill_csa_cp_query_slice"):
-        full_row = local_base + local_row
-        cos_row = pl.load(freqs_cos, [full_row, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
-        sin_row = pl.load(freqs_sin, [full_row, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
-        pl.store(cos_row, [local_row, 0], freqs_cos_local)
-        pl.store(sin_row, [local_row, 0], freqs_sin_local)
+    freqs_cos_local = pl.slice(freqs_cos, [q_dim, ROPE_HEAD_DIM], [local_base, 0])
+    freqs_sin_local = pl.slice(freqs_sin, [q_dim, ROPE_HEAD_DIM], [local_base, 0])
 
     attn_out_local = pl.create_tensor([q_dim, D], dtype=pl.BF16)
     attn_out_local = prefill_attention_csa_cp_core(

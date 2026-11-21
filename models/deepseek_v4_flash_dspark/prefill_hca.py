@@ -104,7 +104,6 @@ O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 
 COMPRESS_RATIO = 128
 HCA_SWA_ROW_TILE = 8
-HCA_QUERY_SLICE_TILE = 8
 HCA_CACHE_READY_TILE = 64
 HCA_CACHE_WRITE_TILE = 64
 MAIN_OUT_DIM = HEAD_DIM
@@ -1021,23 +1020,8 @@ def prefill_attention_hca_cp_local(
     x_normed_local = pl.create_tensor([q_dim, D], dtype=pl.BF16)
     norm_ready_tid = rms_norm(x_mixed_local, attn_norm_w, x_normed_local)
     local_base = tp_rank * q_dim
-    freqs_cos_local = pl.create_tensor([q_dim, ROPE_DIM], dtype=pl.BF16)
-    freqs_sin_local = pl.create_tensor([q_dim, ROPE_DIM], dtype=pl.BF16)
-    for block in pl.spmd((q_dim + HCA_QUERY_SLICE_TILE - 1) // HCA_QUERY_SLICE_TILE, name_hint="prefill_hca_cp_query_slice"):
-        row_base = block * HCA_QUERY_SLICE_TILE
-        for row_offset in pl.range(HCA_QUERY_SLICE_TILE):
-            local_row = row_base + row_offset
-            if local_row < q_dim:
-                query_cos = pl.load(
-                    freqs_cos, [local_base + local_row, 0], [1, ROPE_DIM],
-                    target_memory=pl.MemorySpace.Vec,
-                )
-                query_sin = pl.load(
-                    freqs_sin, [local_base + local_row, 0], [1, ROPE_DIM],
-                    target_memory=pl.MemorySpace.Vec,
-                )
-                pl.store(query_cos, [local_row, 0], freqs_cos_local)
-                pl.store(query_sin, [local_row, 0], freqs_sin_local)
+    freqs_cos_local = pl.slice(freqs_cos, [q_dim, ROPE_DIM], [local_base, 0])
+    freqs_sin_local = pl.slice(freqs_sin, [q_dim, ROPE_DIM], [local_base, 0])
 
     q_cos_il = pl.create_tensor([q_dim, ROPE_DIM], dtype=pl.FP32)
     q_sin_signed = pl.create_tensor([q_dim, ROPE_DIM], dtype=pl.FP32)
