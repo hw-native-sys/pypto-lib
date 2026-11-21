@@ -330,13 +330,22 @@ def prepare_routing_bias(text_bias, vision_bias, image_mask, capacity):
 
 
 @pl.jit.inline
-def gate(
+def quantize_expert_input(
+    xg_buf: pl.Tensor[[T_PAD, D], pl.BF16],
+    x_norm_mx: pl.Tensor[[T_PAD, D], pl.FP8E4M3FN],
+    x_norm_scale: pl.Tensor[[1, T_PAD * MX_SCALE_GROUPS], pl.FP8E8M0],
+):
+    with pl.spmd(pl.min((T_PAD // GATE_M_TILE) * (D // QUANT_TASK_TILE), QUANT_WORKER_TILE), name_hint="x_norm_mx_quant"):
+        x_norm_mx, x_norm_scale = _gate_quant_vf(xg_buf, x_norm_mx, x_norm_scale)
+    return x_norm_mx, x_norm_scale
+
+
+@pl.jit.inline
+def route_tokens(
     xg_buf: pl.Tensor[[T_PAD, D], pl.BF16],
     gate_w: pl.Tensor,
     gate_bias: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
-    x_norm_mx: pl.Tensor[[T_PAD, D], pl.FP8E4M3FN],
-    x_norm_scale: pl.Tensor[[1, T_PAD * MX_SCALE_GROUPS], pl.FP8E8M0],
     indices: pl.Tensor,
     weights: pl.Tensor,
     n_experts: pl.constexpr = N_EXPERTS,
@@ -356,9 +365,6 @@ def gate(
         active_tokens = pl.cast(T, pl.INDEX)
     task_tokens = pl.max(active_tokens, pl.cast(1, pl.INDEX))
     task_gate_tiles = (task_tokens + GATE_M_TILE - 1) // GATE_M_TILE
-
-    with pl.spmd(pl.min((T_PAD // GATE_M_TILE) * (D // QUANT_TASK_TILE), QUANT_WORKER_TILE), name_hint="x_norm_mx_quant"):
-        x_norm_mx, x_norm_scale = _gate_quant_vf(xg_buf, x_norm_mx, x_norm_scale)
 
     biased_scores_buf = pl.create_tensor([T_PAD, score_pad], dtype=pl.FP32)
     index_flat = pl.reshape(indices, [1, T * topk])
@@ -397,6 +403,23 @@ def gate(
     return weights
 
 
+@pl.jit.inline
+def gate(
+    xg_buf: pl.Tensor[[T_PAD, D], pl.BF16],
+    gate_w: pl.Tensor,
+    gate_bias: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    x_norm_mx: pl.Tensor[[T_PAD, D], pl.FP8E4M3FN],
+    x_norm_scale: pl.Tensor[[1, T_PAD * MX_SCALE_GROUPS], pl.FP8E8M0],
+    indices: pl.Tensor,
+    weights: pl.Tensor,
+    n_experts: pl.constexpr = N_EXPERTS,
+    topk: pl.constexpr = TOPK,
+):
+    quantize_expert_input(xg_buf, x_norm_mx, x_norm_scale)
+    return route_tokens(xg_buf, gate_w, gate_bias, num_tokens, indices, weights, n_experts=n_experts, topk=topk)
+
+
 @pl.jit
 def l2_gate(
     x_normed: pl.Tensor[[T_PAD, D], pl.BF16],
@@ -428,7 +451,7 @@ def _golden_gate_scores(tensors):
     logits = x_norm @ gate_w.T
     softplus = logits.clamp(min=0) + torch.log1p(torch.exp(-logits.abs()))
     scores = softplus.sqrt()
-    biased = scores + gate_bias.reshape(-1, N_EXPERTS)[:T]
+    biased = scores + gate_bias.reshape(-1, gate_w.shape[0])[:T]
     return x_norm, scores, biased
 
 

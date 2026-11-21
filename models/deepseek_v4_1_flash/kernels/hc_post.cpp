@@ -12,8 +12,8 @@
 #include <cmath>
 #endif
 #include <pto/pto-inst.hpp>
-#include "tensor.h"
-#include "intrinsic.h"
+#include <tensor.h>
+#include <intrinsic.h>
 using namespace pto;
 namespace {
 template <typename T, int R, int C>

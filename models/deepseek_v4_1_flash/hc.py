@@ -15,7 +15,6 @@ from pathlib import Path
 import pypto.language as pl
 import torch
 import torch.nn.functional as F
-from pypto.runtime import pto_isa_include_dir
 
 from config import FLASH as M, T_DYN
 from rmsnorm import _rms_norm_rows, golden_rms_norm
@@ -538,8 +537,7 @@ def zero_bf16_padding(x: pl.Tensor, valid_rows: pl.Scalar[pl.INT32]):
                 x[row : row + 1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)
 
 
-@pl.jit.extern(core_type="aiv", source=_KERNELS / "hc_post.cpp",
-               include_dirs=(pto_isa_include_dir(),))
+@pl.jit.extern(core_type="aiv", source=_KERNELS / "hc_post.cpp")
 def _hc_post(
     sublayer: pl.Tensor, residual: pl.Tensor, post_mix: pl.Tensor, residual_mix: pl.Tensor,
     output: pl.Out[pl.Tensor], tokens: pl.Scalar[pl.INDEX],
