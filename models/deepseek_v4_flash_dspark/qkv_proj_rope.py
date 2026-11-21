@@ -429,6 +429,59 @@ def q_proj_qr(
 
 
 @pl.jit.inline(auto_scope=False)
+def _q_proj_qr_full_tile(
+    x: pl.Tensor, wq_a: pl.Tensor, gamma_cq: pl.Tensor, qr: pl.Tensor,
+    qr_scale: pl.Tensor, qr_i8_matmul: pl.Tensor, qr_scale_pad_store: pl.Tensor,
+):
+    """Project and quantize a complete dense query tile for the Q and indexer paths."""
+    with pl.scope():
+        projected = pl.create_tensor([PREFILL_DENSE_TILE, Q_LORA], dtype=pl.FP32)
+        for worker in pl.spmd(
+            (PREFILL_DENSE_TILE // QR_DENSE_M_TILE) * (Q_LORA // QR_N_TILE),
+            name_hint="qr_proj_dense", allow_early_resolve=True,
+        ):
+            row = (worker // (Q_LORA // QR_N_TILE)) * QR_DENSE_M_TILE
+            column = (worker % (Q_LORA // QR_N_TILE)) * QR_N_TILE
+            for part in pl.range(QR_OK):
+                acc = pl.create_tensor([QR_DENSE_M_TILE, QR_N_TILE], dtype=pl.FP32)
+                for k in pl.pipeline(0, QR_SPLIT_K_TILE // QR_K_TILE, stage=2):
+                    begin = part * QR_SPLIT_K_TILE + k * QR_K_TILE
+                    activation = x[row : row + QR_DENSE_M_TILE, begin : begin + QR_K_TILE]
+                    weight = wq_a[begin : begin + QR_K_TILE, column : column + QR_N_TILE]
+                    acc = pl.matmul_acc(acc, activation, weight, init_cond=(k == 0))
+                if part == 0:
+                    projected[row : row + QR_DENSE_M_TILE, column : column + QR_N_TILE] = acc
+                else:
+                    projected = pl.assemble(projected, acc, [row, column], atomic=pl.AtomicType.Add)
+
+        for worker in pl.spmd(QR_NORM_WORKERS, name_hint="qr_dense_rms_norm_quant", allow_early_resolve=True):
+            gamma = pl.reshape(pl.cast(gamma_cq[0:Q_LORA], pl.FP32), [1, Q_LORA])
+            for start in pl.range(worker * T_TILE, PREFILL_DENSE_TILE, QR_NORM_WORKERS * T_TILE):
+                rows = projected[start : start + T_TILE, 0:Q_LORA]
+                sums = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+                for col in pl.range(0, Q_LORA, Q_LORA_TILE):
+                    chunk = projected[start : start + T_TILE, col : col + Q_LORA_TILE]
+                    squares = pl.mul(chunk, chunk)
+                    sums = pl.add(sums, pl.reshape(pl.row_sum(squares), [1, T_TILE]))
+                inv_rms = pl.rsqrt(pl.add(pl.mul(sums, 1.0 / Q_LORA), EPS), high_precision=True)
+                scaled = pl.col_expand_mul(rows, gamma)
+                peaks = pl.reshape(pl.row_max(pl.abs(scaled)), [1, T_TILE])
+                peak_floor = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+                bounded = pl.maximum(peak_floor, pl.mul(peaks, inv_rms))
+                quant_scale = pl.div(pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), bounded)
+                dequant = pl.reshape(pl.recip(quant_scale), [T_TILE, 1])
+                normalized = pl.col_expand_mul(pl.row_expand_mul(rows, pl.reshape(inv_rms, [T_TILE, 1])), gamma)
+                quantized = pl.row_expand_mul(normalized, pl.reshape(quant_scale, [T_TILE, 1]))
+                rounded = pl.cast(quantized, target_type=pl.INT32, mode="rint")
+                half = pl.cast(rounded, target_type=pl.FP16, mode="round")
+                packed = pl.cast(half, target_type=pl.INT8, mode="trunc")
+                qr_i8_matmul[start : start + T_TILE, 0:Q_LORA] = packed
+                qr[start : start + T_TILE, 0:Q_LORA] = packed
+                qr_scale_pad_store[start : start + T_TILE, 0:1] = dequant
+                qr_scale[start : start + T_TILE, 0:1] = dequant
+
+
+@pl.jit.inline(auto_scope=False)
 def q_proj_q_matmul(
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     qr_i8_matmul: pl.Tensor[[QPROJ_T_PAD, Q_LORA], pl.INT8],
@@ -848,7 +901,10 @@ def q_proj_rope(
             qr_i8_matmul = pl.create_tensor([QPROJ_T_PAD, Q_LORA], dtype=pl.INT8)
             # The quant scale rides the qr_i8 -> qproj_matmul -> dequant chain.
             qr_scale_pad_store = pl.create_tensor([QPROJ_T_PAD, 1], dtype=pl.FP32, manual_dep=True)
-            q_proj_qr(x_tile, wq_a, gamma_cq, qr_tile, qr_scale_tile, qr_i8_matmul, qr_scale_pad_store)
+            if tile_rows == PREFILL_DENSE_TILE:
+                _q_proj_qr_full_tile(x_tile, wq_a, gamma_cq, qr_tile, qr_scale_tile, qr_i8_matmul, qr_scale_pad_store)
+            else:
+                q_proj_qr(x_tile, wq_a, gamma_cq, qr_tile, qr_scale_tile, qr_i8_matmul, qr_scale_pad_store)
             q_seq_dep = pl.system.task_dummy(deps=[])
             q_proj_q(
                 x_tile, wq_b, wq_b_scale, cos_tile, sin_tile, swap_tile, q_tile,
