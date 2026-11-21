@@ -297,38 +297,6 @@ def _idx_score_topk(
     ...
 
 
-@pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "index_score_topk.cpp",
-               aiv_source=Path(__file__).parent / "kernels" / "index_score_topk.cpp", dual_aiv_dispatch=True,
-               include_dirs=(pto_isa_include_dir(),))
-def _idx_pool_score_topk(
-    query: pl.Tensor,
-    query_scale: pl.Tensor,
-    weights: pl.Tensor,
-    index_cache: pl.Tensor,
-    index_cache_scale: pl.Tensor,
-    block_table: pl.Tensor,
-    request_ids: pl.Tensor,
-    lengths: pl.Tensor,
-    output: pl.Out[pl.Tensor],
-    runs: pl.Tensor,
-    candidate_keys: pl.Out[pl.Tensor],
-    candidate_indices: pl.Out[pl.Tensor],
-    valid: pl.Tensor,
-    physical: pl.Tensor,
-    scores: pl.Out[pl.Tensor],
-    width: pl.Scalar[pl.INDEX],
-    run_stride: pl.Scalar[pl.INDEX],
-    table_width: pl.Scalar[pl.INDEX],
-    num_tokens: pl.Scalar[pl.INT32],
-    gathered_rows: pl.Scalar[pl.INDEX],
-    emit_scores: pl.Scalar[pl.INT32],
-    shards: pl.Scalar[pl.INDEX],
-    short_history_limit: pl.Scalar[pl.INT32],
-) -> pl.Tensor:
-    """Gather and score pool shards, then merge local TopK within one MIX."""
-    ...
-
-
 @pl.jit.inline(auto_scope=False)
 def publish_index_rows(
     source: pl.Tensor[[T_DYN, INDEX_DIM], pl.BF16],
@@ -606,7 +574,7 @@ def _plan_index_runs(
     short_history_policy: pl.constexpr,
     score_layout: pl.constexpr,
 ):
-    """Publish request groups synchronously before using their count to size shards."""
+    """Write groups of up to six consecutive queries from the same request."""
     run_count = pl.cast(0, pl.INT32)
     run_start = pl.cast(0, pl.INT32)
     previous_request = pl.cast(-1, pl.INT32)
@@ -639,6 +607,117 @@ def _plan_index_runs(
 
 
 @pl.jit.inline(auto_scope=False)
+def plan_reindex_pool(
+    index_cache: pl.Tensor,
+    block_table: pl.Tensor,
+    request_ids: pl.Tensor,
+    lengths: pl.Tensor,
+    pool_block_ids: pl.Tensor,
+    pool_block_counts: pl.Tensor,
+    width: pl.Scalar[pl.INDEX],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Check pool coverage and publish the paged run plan for identity pools."""
+    capacity = pl.tensor.dim(pool_block_ids, 1)
+    table_width = pl.tensor.dim(block_table, 1)
+    request_count = pl.tensor.dim(block_table, 0)
+    cache_pages = pl.tensor.dim(index_cache, 0)
+    flags = pl.create_tensor([32, 32], dtype=pl.INT32)
+    with pl.spmd(32, name_hint="idx_plan_pool"):
+        worker = pl.tile.get_block_idx()
+        dense = pl.cast(1, pl.INT32)
+        mismatch = pl.tile.full([1, 64], dtype=pl.FP32, value=0.0)
+        for token in pl.range(worker, num_tokens, 32):
+            if dense == 1:
+                count = pl.max(0, pl.min(pl.read(pool_block_counts, [token]), capacity))
+                visible = pl.max(0, pl.read(lengths, [token]))
+                request = pl.read(request_ids, [token])
+                complete = count == (visible + 7) // 8 and visible <= width and visible <= table_width * 128
+                if not complete or request < 0 or request >= request_count:
+                    dense = pl.cast(0, pl.INT32)
+                else:
+                    for start in pl.range(0, count, 1024):
+                        active = pl.min(1024, count - start)
+                        raw = pl.load(pool_block_ids, [token, start], [1, 1024], valid_shape=[1, active])
+                        ids = pl.tile.fillpad(raw, pad_value=pl.PadValue.zero)
+                        lanes = pl.tile.arange(0, [1, 1024], dtype=pl.INT32)
+                        expected = pl.add(lanes, pl.cast(start, pl.INT32))
+                        error = pl.abs(pl.cast(pl.sub(ids, expected), pl.FP32))
+                        valid = pl.tile.cmps(lanes, pl.cast(active, pl.INT32), cmp_type=2)
+                        error = pl.tile.select(valid, error, 0.0)
+                        mismatch = pl.add(mismatch, pl.col_sum(pl.reshape(error, [16, 64])))
+                    page_count = (visible + 127) // 128
+                    for start in pl.range(0, page_count, 128):
+                        active = pl.min(128, page_count - start)
+                        raw_pages = pl.load(block_table, [request, start], [1, 128], valid_shape=[1, active])
+                        pages = pl.tile.fillpad(raw_pages, pad_value=pl.PadValue.zero)
+                        bad = pl.tile.cmps(pages, pl.cast(cache_pages, pl.INT32), cmp_type=5)
+                        page_errors = pl.tile.select(bad, pl.tile.full([1, 128], dtype=pl.FP32, value=1.0), 0.0)
+                        mismatch = pl.add(mismatch, pl.col_sum(pl.reshape(page_errors, [2, 64])))
+        sums = pl.col_sum(pl.reshape(mismatch, [8, 8]))
+        for lane in pl.unroll(8):
+            if pl.tile.read(sums, [0, lane]) != 0.0:
+                dense = pl.cast(0, pl.INT32)
+        pl.write(flags, [worker, 0], dense)
+    tokens = pl.tensor.dim(pool_block_ids, 0)
+    stride = tokens + 1
+    dense_width = pl.min(width, table_width * 128)
+    # Rows 0-3 describe dense runs. Row 4 selects the path for every MIX core.
+    runs = pl.create_tensor([5, stride], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="idx_plan_reindex"):
+        dense = pl.read(flags, [0, 0])
+        if dense != 0:
+            for worker in pl.range(1, 32):
+                dense = dense * pl.read(flags, [worker, 0])
+        pl.write(runs, [4, 0], dense)
+        if dense != 0:
+            _plan_index_runs(request_ids, lengths, runs, num_tokens, dense_width, "score", "dense")
+    return runs, dense_width
+
+
+@pl.jit.inline(auto_scope=False)
+def score_reindex_pool(
+    query: pl.Tensor[[T_DYN, INDEX_H * INDEX_DIM // 2], pl.UINT8],
+    query_scale: pl.Tensor[[T_DYN, INDEX_H * _SCALE_COUNT], pl.FP8E8M0],
+    weights: pl.Tensor[[T_DYN, INDEX_H], pl.BF16],
+    index_cache: pl.Tensor,
+    index_cache_scale: pl.Tensor,
+    block_table: pl.Tensor,
+    request_ids: pl.Tensor,
+    lengths: pl.Tensor,
+    pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
+    pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
+    runs: pl.Tensor,
+    dense_width: pl.Scalar[pl.INDEX],
+    output: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Score the planned pool using a single mixed-core dispatch."""
+    tokens = pl.tensor.dim(output, 0)
+    stride = pl.tensor.dim(runs, 1)
+    table_width = pl.tensor.dim(block_table, 1)
+    workers = pl.max(1, pl.min(32, pl.system.available_cluster_count()))
+    shards = workers
+    if dense_width > SCORE_SHARD_CACHE:
+        # Bound the scratch by one request run per active query for oversized input pools.
+        panels = (dense_width + SCORE_TILE - 1) // SCORE_TILE
+        wave_panels = workers * (SCORE_SHARD_CACHE // SCORE_TILE)
+        waves = (num_tokens * panels + wave_panels - 1) // wave_panels
+        shards = workers * pl.max(1, waves)
+    ring = pl.create_tensor([workers, 20480], dtype=pl.FP32)
+    candidate_keys = pl.create_tensor([tokens, shards * INDEX_TOPK], dtype=pl.UINT16)
+    candidate_indices = pl.create_tensor([tokens, shards * INDEX_TOPK], dtype=pl.INT32)
+    with pl.spmd(workers, name_hint="idx_reindex_score_topk", sync_start=True):
+        _idx_score_topk(
+            query, query_scale, weights, index_cache, index_cache_scale,
+            block_table, request_ids, lengths, output, runs, candidate_keys, candidate_indices,
+            pool_block_ids, pool_block_counts, ring, dense_width, stride, table_width, num_tokens, -1,
+            pl.cast(0, pl.INT32), shards, pl.cast(0, pl.INT32),
+        )
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
 def score_select_reindex(
     query: pl.Tensor[[T_DYN, INDEX_H * INDEX_DIM // 2], pl.UINT8],
     query_scale: pl.Tensor[[T_DYN, INDEX_H * _SCALE_COUNT], pl.FP8E8M0],
@@ -654,104 +733,15 @@ def score_select_reindex(
     output: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    """Route identity pools to paged scoring and sparse pools to pipelined gathering."""
-    capacity = pl.tensor.dim(pool_block_ids, 1)
+    """Plan and score an externally supplied candidate pool."""
     width = pl.tensor.dim(scores, 1)
-    table_width = pl.tensor.dim(block_table, 1)
-    request_count = pl.tensor.dim(block_table, 0)
-    cache_pages = pl.tensor.dim(index_cache, 0)
-    flags = pl.create_tensor([32, 32], dtype=pl.INT32)
-    with pl.spmd(32, name_hint="idx_plan_pool"):
-        worker = pl.tile.get_block_idx()
-        dense = pl.cast(1, pl.INT32)
-        mismatch = pl.tile.full([1, 64], dtype=pl.FP32, value=0.0)
-        for token in pl.range(worker, num_tokens, 32):
-            count = pl.max(0, pl.min(pl.read(pool_block_counts, [token]), capacity))
-            visible = pl.max(0, pl.read(lengths, [token]))
-            request = pl.read(request_ids, [token])
-            if count != (visible + 7) // 8 or visible > width or visible > table_width * 128:
-                dense = pl.cast(0, pl.INT32)
-            if request < 0 or request >= request_count:
-                dense = pl.cast(0, pl.INT32)
-            if dense == 1:
-                for start in pl.range(0, count, 1024):
-                    active = pl.min(1024, count - start)
-                    raw = pl.load(pool_block_ids, [token, start], [1, 1024], valid_shape=[1, active])
-                    ids = pl.tile.fillpad(raw, pad_value=pl.PadValue.zero)
-                    lanes = pl.tile.arange(0, [1, 1024], dtype=pl.INT32)
-                    expected = pl.add(lanes, pl.cast(start, pl.INT32))
-                    error = pl.abs(pl.cast(pl.sub(ids, expected), pl.FP32))
-                    valid = pl.tile.cmps(lanes, pl.cast(active, pl.INT32), cmp_type=2)
-                    error = pl.tile.select(valid, error, 0.0)
-                    mismatch = pl.add(mismatch, pl.col_sum(pl.reshape(error, [16, 64])))
-                page_count = (visible + 127) // 128
-                for start in pl.range(0, page_count, 128):
-                    active = pl.min(128, page_count - start)
-                    raw_pages = pl.load(block_table, [request, start], [1, 128], valid_shape=[1, active])
-                    pages = pl.tile.fillpad(raw_pages, pad_value=pl.PadValue.zero)
-                    bad = pl.tile.cmps(pages, pl.cast(cache_pages, pl.INT32), cmp_type=5)
-                    page_errors = pl.tile.select(bad, pl.tile.full([1, 128], dtype=pl.FP32, value=1.0), 0.0)
-                    mismatch = pl.add(mismatch, pl.col_sum(pl.reshape(page_errors, [2, 64])))
-        sums = pl.col_sum(pl.reshape(mismatch, [8, 8]))
-        for lane in pl.unroll(8):
-            if pl.tile.read(sums, [0, lane]) != 0.0:
-                dense = pl.cast(0, pl.INT32)
-        pl.write(flags, [worker, 0], dense)
-    dense = pl.cast(1, pl.INT32)
-    for worker in pl.range(32):
-        dense = dense * pl.read(flags, [worker, 0])
-    if dense != 0:
-        tokens = pl.tensor.dim(output, 0)
-        dense_width = pl.min(width, table_width * 128)
-        paged_scores = pl.create_tensor([tokens, dense_width], dtype=pl.FP32)
-        score_select_paged(
-            query, query_scale, weights, index_cache, index_cache_scale,
-            block_table, request_ids, lengths, paged_scores, output,
-            num_tokens, capacity,
-            shard_k_tile=SCORE_SHARD_CACHE, short_history_policy="score", score_layout="dense",
-        )
-    else:
-        _score_select_pool(
-            query, query_scale, weights, index_cache, index_cache_scale,
-            block_table, request_ids, lengths, pool_block_ids, pool_block_counts, scores, output,
-            num_tokens,
-        )
-    return output
-
-
-@pl.jit.inline(auto_scope=False)
-def _score_select_pool(
-    query: pl.Tensor[[T_DYN, INDEX_H * INDEX_DIM // 2], pl.UINT8],
-    query_scale: pl.Tensor[[T_DYN, INDEX_H * _SCALE_COUNT], pl.FP8E8M0],
-    weights: pl.Tensor[[T_DYN, INDEX_H], pl.BF16],
-    index_cache: pl.Tensor,
-    index_cache_scale: pl.Tensor,
-    block_table: pl.Tensor,
-    request_ids: pl.Tensor,
-    lengths: pl.Tensor,
-    pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
-    pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
-    scores: pl.Tensor[[T_DYN, INDEX_POOL_POSITIONS_DYN], pl.FP32],
-    output: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Pipeline candidate gathering, scoring, and TopK through a bounded per-worker ring."""
-    capacity = pl.tensor.dim(pool_block_ids, 1)
-    tokens = pl.tensor.dim(output, 0)
-    width = capacity * CANDIDATE_BLOCK_SIZE
-    workers = pl.max(1, pl.min(32, pl.system.available_cluster_count()))
-    ring = pl.create_tensor([workers, 20480], dtype=pl.FP32)
-    candidate_keys = pl.create_tensor([tokens, workers * INDEX_TOPK], dtype=pl.UINT16)
-    candidate_indices = pl.create_tensor([tokens, workers * INDEX_TOPK], dtype=pl.INT32)
-    table_width = pl.tensor.dim(block_table, 1)
-    with pl.spmd(workers, name_hint="idx_pool_score_topk", sync_start=True):
-        _idx_pool_score_topk(
-            query, query_scale, weights, index_cache, index_cache_scale,
-            block_table, request_ids, lengths, output, pool_block_counts, candidate_keys, candidate_indices,
-            pool_block_ids, pool_block_counts, ring, width, 0, table_width, num_tokens, -1,
-            pl.cast(0, pl.INT32), workers, pl.cast(0, pl.INT32),
-        )
-    return output
+    runs, dense_width = plan_reindex_pool(
+        index_cache, block_table, request_ids, lengths, pool_block_ids, pool_block_counts, width, num_tokens,
+    )
+    return score_reindex_pool(
+        query, query_scale, weights, index_cache, index_cache_scale, block_table, request_ids, lengths,
+        pool_block_ids, pool_block_counts, runs, dense_width, output, num_tokens,
+    )
 
 
 @pl.jit.inline(auto_scope=False)

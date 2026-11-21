@@ -20,7 +20,7 @@ from config import (
     ORI_BLOCKS_DYN, TABLE_DYN, T_DYN, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
 from hc import hc_head_norm, hc_project, hc_sinkhorn
-from decode_indexer import c1a_index, score_select_reindex
+from decode_indexer import c1a_index, plan_reindex_pool, score_reindex_pool
 from qkv_proj_rope import qkv_quant, q_proj_rope, kv_proj, window_publish
 from o_proj import o_proj_hc_post
 from sparse_attention import gather_sparse_attention
@@ -42,6 +42,7 @@ MIX_HC = M.mix_hc
 INDEX_H = M.index_n_heads
 INDEX_DIM = M.index_head_dim
 INDEX_TOPK = M.index_topk
+CANDIDATE_BLOCK_SIZE = M.candidate_block_size
 
 
 @pl.jit.inline(auto_scope=False)
@@ -93,6 +94,11 @@ def decode_c1a_reindex(
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
+    pool_width = pl.tensor.dim(pool_block_ids, 1) * CANDIDATE_BLOCK_SIZE
+    runs, dense_width = plan_reindex_pool(
+        index_cache, index_block_table, request_ids, compressed_lens,
+        pool_block_ids, pool_block_counts, pool_width, num_tokens,
+    )
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
@@ -117,17 +123,15 @@ def decode_c1a_reindex(
         window_slots, window_cache,
         num_tokens,
     )
-    score_width = pl.tensor.dim(pool_block_ids, 1) * 8
     index_query, index_query_scale, index_weights = c1a_index(
         x_norm, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
         num_tokens,
         qb_payload, qb_scales,
     )
-    scores = pl.create_tensor([tokens, score_width], dtype=pl.FP32)
-    score_select_reindex(
+    score_reindex_pool(
         index_query, index_query_scale, index_weights, index_cache, index_cache_scale,
         index_block_table, request_ids, compressed_lens, pool_block_ids, pool_block_counts,
-        scores, topk_indices, num_tokens,
+        runs, dense_width, topk_indices, num_tokens,
     )
     attn_out = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     gather_sparse_attention(
