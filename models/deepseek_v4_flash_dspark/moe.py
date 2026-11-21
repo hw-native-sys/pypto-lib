@@ -123,6 +123,7 @@ PREFILL_ACT_INTER_TILE = 128
 PREFILL_D_OUT_TILE = 256
 PREFILL_QUANT_TILE = 512
 PREFILL_MOE_SCALE_PAD = 16
+PREFILL_MOE_FORWARD_SLOTS = 2
 PREFILL_MOE_EXPERT_SCALE_PAD = 16
 PREFILL_MOE_ROUTE_MAP_PAD = 16
 PREFILL_MOE_FINALIZE_TOKEN_TILE = gcd(PREFILL_MOE_T_TILE, 16)
@@ -169,8 +170,8 @@ def clear_moe_signals(
 @pl.jit.inline
 def clear_prefill_moe_signals(
     stage_token: pl.Tensor[[1], pl.INT32],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    arrived: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * N_RANKS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * N_RANKS, 1], pl.INT32],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     stage_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
 ) -> pl.Scalar[pl.TASK_ID]:
@@ -181,9 +182,10 @@ def clear_prefill_moe_signals(
         completed_epoch = pl.read(stage_token, [0])
         if completed_epoch >= 0:
             zero = pl.cast(0, pl.INT32)
+            for slot_rank in pl.range(PREFILL_MOE_FORWARD_SLOTS * N_RANKS):
+                pl.write(arrived, [slot_rank, 0], zero)
+                pl.write(data_arrived, [slot_rank, 0], zero)
             for src in pl.range(N_RANKS):
-                pl.write(arrived, [src, 0], zero)
-                pl.write(data_arrived, [src, 0], zero)
                 pl.write(combine_arrived, [src, 0], zero)
                 pl.write(stage_done, [src, 0], zero)
     return cleared_tid
@@ -1089,15 +1091,16 @@ def prefill_moe_dispatch(
     recv_expert_counts_out: pl.Tensor[[N_RANKS, N_LOCAL], pl.INT32],
     send_counts_out: pl.Tensor[[N_RANKS, 1], pl.INT32],
     route_to_packed_out: pl.Tensor[[PREFILL_MOE_ROUTES_PER_SRC, PREFILL_MOE_ROUTE_MAP_PAD], pl.INT32],
-    count_target: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
-    count_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    x_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
-    x_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    scale_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
+    count_target: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * N_RANKS, N_LOCAL], pl.INT32],
+    count_signal: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * N_RANKS, 1], pl.INT32],
+    x_target: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
+    x_signal: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * N_RANKS, 1], pl.INT32],
+    scale_target: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
-    prior_dep: pl.Scalar[pl.TASK_ID],
-    epoch: pl.Scalar[pl.INT32],
+    forward_slot_tid: pl.Scalar[pl.TASK_ID],
+    forward_slot: pl.Scalar[pl.INT32],
+    forward_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Scalar[pl.TASK_ID]:
     """Pack active routes, exchange counts and payloads, and form aligned expert slabs."""
 
@@ -1202,26 +1205,31 @@ def prefill_moe_dispatch(
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="prefill_moe_dispatch_count_exchange",
-        deps=[count_tid, prior_dep],
+        deps=[count_tid, forward_slot_tid],
     ) as count_publish_tid:
+        forward_rank = forward_slot * N_RANKS + my_rank
         for dest in pl.range(N_RANKS):
             pld.tensor.put(
                 dst=count_target, peer=dest, src=send_expert_counts,
-                dst_offsets=[my_rank, 0], src_offsets=[dest, 0], shape=[1, N_LOCAL],
+                dst_offsets=[forward_rank, 0], src_offsets=[dest, 0], shape=[1, N_LOCAL],
             )
             if dest != my_rank:
-                pld.system.notify(target=count_signal, peer=dest, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,)
+                pld.system.notify(
+                    target=count_signal, peer=dest, offsets=[forward_rank, 0],
+                    value=1, op=pld.NotifyOp.AtomicAdd,
+                )
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_count_wait") as count_wait_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
-                pld.system.defer_wait(signal=count_signal, offsets=[src, 0], expected=epoch, cmp=pld.WaitCmp.Ge)
+                source_slot = forward_slot * N_RANKS + src
+                pld.system.defer_wait(signal=count_signal, offsets=[source_slot, 0], expected=forward_epoch, cmp=pld.WaitCmp.Ge)
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_count_finalize", deps=[count_publish_tid, count_wait_tid]) as count_exchange_tid:
         for local_e in pl.range(N_LOCAL):
             expert_total = pl.const(0, pl.INT32)
             for src in pl.range(N_RANKS):
-                count = pl.read(count_target, [src, local_e])
+                count = pl.read(count_target, [forward_slot * N_RANKS + src, local_e])
                 pl.write(recv_expert_counts_out, [src, local_e], count)
                 expert_total = expert_total + count
             pl.write(expert_counts_out, [local_e, 0], expert_total)
@@ -1243,7 +1251,8 @@ def prefill_moe_dispatch(
         src_base = pl.cast(0, pl.INDEX)
         for prior_dst in pl.range(dest):
             src_base = src_base + pl.cast(pl.read(send_counts_out, [prior_dst, 0]), pl.INDEX)
-        dst_base = pl.cast(my_rank, pl.INDEX) * PREFILL_MOE_PEER_CAP
+        slot_start = pl.cast(forward_slot, pl.INDEX) * PREFILL_MOE_TOTAL_CAP
+        dst_base = slot_start + pl.cast(my_rank, pl.INDEX) * PREFILL_MOE_PEER_CAP
         full_rows = (n_rows // PREFILL_DISPATCH_ROW_TILE) * PREFILL_DISPATCH_ROW_TILE
         for row in pl.range(row_group * PREFILL_DISPATCH_ROW_TILE, full_rows, 4 * PREFILL_DISPATCH_ROW_TILE):
             pld.tensor.put(
@@ -1283,12 +1292,14 @@ def prefill_moe_dispatch(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_dispatch_payload_notify", deps=[payload_put_tid]) as payload_notify_tid:
         for peer in pl.range(N_RANKS):
             if peer != my_rank:
-                pld.system.notify(target=x_signal, peer=peer, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,)
+                forward_rank = forward_slot * N_RANKS + my_rank
+                pld.system.notify(target=x_signal, peer=peer, offsets=[forward_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,)
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_dispatch_payload_wait", deps=[payload_notify_tid]) as payload_exchange_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
-                pld.system.defer_wait(signal=x_signal, offsets=[src, 0], expected=epoch, cmp=pld.WaitCmp.Ge)
+                source_slot = forward_slot * N_RANKS + src
+                pld.system.defer_wait(signal=x_signal, offsets=[source_slot, 0], expected=forward_epoch, cmp=pld.WaitCmp.Ge)
 
     with pl.spmd(
         N_LOCAL * PREFILL_RESORT_BLOCKS_PER_EXPERT,
@@ -1315,7 +1326,8 @@ def prefill_moe_dispatch(
                     prior_count = pl.cast(pl.read(recv_expert_counts_out, [src, prior_e]), pl.INDEX)
                     source_expert_base = source_expert_base + prior_count
                 n_rows = pl.cast(pl.read(recv_expert_counts_out, [src, local_e]), pl.INDEX)
-                input_base = src * PREFILL_MOE_PEER_CAP + source_expert_base
+                slot_start = pl.cast(forward_slot, pl.INDEX) * PREFILL_MOE_TOTAL_CAP
+                input_base = slot_start + src * PREFILL_MOE_PEER_CAP + source_expert_base
                 output_base = expert_base + source_prefix
                 full_rows = (n_rows // 16) * 16
                 for row in pl.range(row_group * 16, full_rows, PREFILL_RESORT_BLOCKS_PER_EXPERT * 16):
@@ -1439,6 +1451,7 @@ def prefill_moe_combine(
     my_rank: pl.Scalar[pl.INT32],
     dispatch_tid: pl.Scalar[pl.TASK_ID],
     expert_tids: pl.Array[N_LOCAL, pl.TASK_ID],
+    stage_token: pl.Tensor[[1], pl.INT32],
     epoch: pl.Scalar[pl.INT32],
 ) -> pl.Scalar[pl.TASK_ID]:
     """Return weighted expert rows and combine shared output in top-k order."""
@@ -1451,11 +1464,13 @@ def prefill_moe_combine(
         deps=[dispatch_tid],
         allow_early_resolve=True,
     ) as reverse_counts_tid:
-        for src in pl.range(N_RANKS):
-            source_total = pl.const(0, pl.INT32)
-            for local_e in pl.range(N_LOCAL):
-                source_total = source_total + pl.read(recv_expert_counts, [src, local_e])
-            pl.write(reverse_send_counts, [src, 0], source_total)
+        completed_epoch = pl.read(stage_token, [0])
+        if completed_epoch >= 0:
+            for src in pl.range(N_RANKS):
+                source_total = pl.const(0, pl.INT32)
+                for local_e in pl.range(N_LOCAL):
+                    source_total = source_total + pl.read(recv_expert_counts, [src, local_e])
+                pl.write(reverse_send_counts, [src, 0], source_total)
 
     reverse_exchange_tid = _prefill_moe_reverse_exchange(
         expert_y, expert_counts, recv_expert_counts,
@@ -1512,14 +1527,17 @@ def prefill_moe_tile(
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     ffn_out: pl.Tensor[[PREFILL_MOE_T_TILE, D], pl.BF16],
-    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
-    recv_x: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
-    recv_aux: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    recv_meta: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * N_RANKS, N_LOCAL], pl.INT32],
+    recv_x: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
+    recv_aux: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
+    arrived: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * N_RANKS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    prior_dep: pl.Scalar[pl.TASK_ID],
+    forward_slot_tid: pl.Scalar[pl.TASK_ID],
+    forward_slot: pl.Scalar[pl.INT32],
+    forward_epoch: pl.Scalar[pl.INT32],
+    stage_token: pl.Tensor[[1], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
@@ -1566,7 +1584,7 @@ def prefill_moe_tile(
             indices, x_norm_i8, x_norm_scale, weights,
             grouped_x, grouped_scale, expert_counts, recv_expert_counts, send_counts, route_to_packed,
             recv_meta, arrived, recv_x, data_arrived, recv_aux,
-            num_tokens, my_rank, prior_dep, moe_epoch,
+            num_tokens, my_rank, forward_slot_tid, forward_slot, forward_epoch,
         )
         prefill_expert_grouped(
             grouped_x, grouped_scale, expert_counts,
@@ -1576,7 +1594,7 @@ def prefill_moe_tile(
     dispatch_tid = pl.system.task_dummy(deps=[dispatch_tids])
     completion_tid = prefill_moe_combine(
         grouped_y, expert_counts, recv_expert_counts, route_to_packed, shared_out, ffn_out,
-        routed_y_buf, combine_arrived, num_tokens, my_rank, dispatch_tid, expert_tids, moe_epoch,
+        routed_y_buf, combine_arrived, num_tokens, my_rank, dispatch_tid, expert_tids, stage_token, moe_epoch,
     )
     return completion_tid
 
@@ -1609,11 +1627,11 @@ def prefill_moe_local(
     post_ffn_local: pl.Tensor[[PREFILL_LOCAL_T_DYN, HC_MULT], pl.FP32],
     comb_ffn_local: pl.Tensor[[PREFILL_LOCAL_T_DYN, HC_MULT * HC_MULT], pl.FP32],
     ffn_out_local: pl.Tensor[[PREFILL_LOCAL_T_DYN, D], pl.BF16],
-    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
-    recv_x: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
-    recv_aux: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    recv_meta: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * N_RANKS, N_LOCAL], pl.INT32],
+    recv_x: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
+    recv_aux: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
+    arrived: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * N_RANKS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     stage_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
@@ -1635,9 +1653,19 @@ def prefill_moe_local(
     # Every EP rank participates in every physical wave, including empty groups.
     num_waves = (local_rows + PREFILL_MOE_T_TILE - 1) // PREFILL_MOE_T_TILE
     num_waves_i32 = pl.cast(num_waves, pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_forward_slots_ready") as slots_ready_tid:
+        completed_epoch = pl.read(stage_token, [0])
+        pl.write(stage_token, [0], completed_epoch)
+    forward_retired = pl.array.create(PREFILL_MOE_FORWARD_SLOTS, pl.TASK_ID)
+    for slot in pl.range(PREFILL_MOE_FORWARD_SLOTS):
+        forward_retired[slot] = slots_ready_tid
     for wave in pl.range(num_waves):
         wave_i32 = pl.cast(wave, pl.INT32)
-        moe_epoch = layer_id * num_waves_i32 + wave_i32 + pl.const(1, pl.INT32)
+        wave_id = layer_id * num_waves_i32 + wave_i32
+        forward_slot = pl.cast(wave_id % PREFILL_MOE_FORWARD_SLOTS, pl.INT32)
+        forward_slot_ready_tid = forward_retired[forward_slot]
+        forward_epoch = pl.cast(wave_id // PREFILL_MOE_FORWARD_SLOTS + 1, pl.INT32)
+        moe_epoch = wave_id + pl.const(1, pl.INT32)
         with pl.scope():
             ffn_out_step = ffn_out_local
             local_wave_base = wave_i32 * PREFILL_MOE_T_TILE
@@ -1647,36 +1675,20 @@ def prefill_moe_local(
                 wave_rows = pl.cast(0, pl.INDEX)
             wave_rows_i32 = pl.cast(wave_rows, pl.INT32)
 
-            ready_tids = pl.array.create(1, pl.TASK_ID)
             if wave_rows == PREFILL_MOE_T_TILE:
                 x_mixed_wave = pl.slice(x_mixed_local, [PREFILL_MOE_T_TILE, D], [local_wave_base, 0])
                 input_ids_wave = pl.slice(input_ids_local, [PREFILL_MOE_T_TILE], [local_wave_base])
                 ffn_wave = pl.slice(ffn_out_step, [PREFILL_MOE_T_TILE, D], [local_wave_base, 0])
-                # Publish the existing full-wave rows after the preceding EP exchange.
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_hidden_ready") as full_ready_tid:
-                    completed_epoch = pl.read(stage_token, [0])
-                    if completed_epoch >= 0:
-                        anchor = pl.load(x_mixed_wave, [0, 0], [1, 16])
-                        words = pl.reinterpret_view(anchor, pl.INT32)
-                        first_word = pl.tile.read(words, [0, 0])
-                        pl.tile.write(words, [0, 0], first_word)
-                        published = pl.reinterpret_view(words, pl.BF16)
-                        pl.store(published, [0, 0], x_mixed_wave)
-                ready_tids[0] = full_ready_tid
             else:
                 x_mixed_wave = pl.create_tensor([PREFILL_MOE_T_TILE, D], dtype=pl.BF16)
-                with pl.spmd(PREFILL_MOE_T_TILE, name_hint="prefill_moe_hidden_stage") as tail_ready_tid:
-                    token = pl.tile.get_block_idx()
-                    completed_epoch = pl.read(stage_token, [0])
-                    if completed_epoch >= 0:
-                        if token < wave_rows:
-                            hidden_token = local_wave_base + token
-                            x_mixed_row = x_mixed_local[hidden_token : hidden_token + 1, :]
-                            x_mixed_wave[token : token + 1, :] = x_mixed_row
-                        else:
-                            x_mixed_zero = pl.full([1, D], dtype=pl.BF16, value=0.0)
-                            x_mixed_wave[token : token + 1, :] = x_mixed_zero
-                ready_tids[0] = tail_ready_tid
+                for token in pl.spmd(PREFILL_MOE_T_TILE, name_hint="prefill_moe_hidden_stage"):
+                    if token < wave_rows:
+                        hidden_token = local_wave_base + token
+                        x_mixed_row = x_mixed_local[hidden_token : hidden_token + 1, :]
+                        x_mixed_wave[token : token + 1, :] = x_mixed_row
+                    else:
+                        x_mixed_zero = pl.full([1, D], dtype=pl.BF16, value=0.0)
+                        x_mixed_wave[token : token + 1, :] = x_mixed_zero
                 input_id_count = pl.tensor.dim(input_ids_local, 0)
                 input_ids_rows = pl.reshape(input_ids_local, [input_id_count, 1])
                 input_ids_wave_rows = pl.create_tensor([PREFILL_MOE_T_TILE, 1], dtype=pl.INT64)
@@ -1692,7 +1704,7 @@ def prefill_moe_local(
                             pl.write(input_ids_wave_rows, [token, 0], input_id)
                 input_ids_wave = pl.reshape(input_ids_wave_rows, [PREFILL_MOE_T_TILE])
                 ffn_wave = pl.create_tensor([PREFILL_MOE_T_TILE, D], dtype=pl.BF16)
-            wave_ready_tid = pl.system.task_dummy(deps=[ready_tids])
+            # Local preparation can overlap the preceding EP exchange.
             completion_tid = prefill_moe_tile(
                 x_mixed_wave,
                 norm_w, gate_w, gate_bias, tid2eid, input_ids_wave,
@@ -1703,7 +1715,8 @@ def prefill_moe_local(
                 ffn_wave,
                 recv_meta, recv_x, recv_aux,
                 arrived, data_arrived, routed_y_buf, combine_arrived,
-                wave_ready_tid, layer_id, wave_rows_i32, my_rank, moe_epoch,
+                forward_slot_ready_tid, forward_slot, forward_epoch,
+                stage_token, layer_id, wave_rows_i32, my_rank, moe_epoch,
             )
             output_tids = pl.array.create(1, pl.TASK_ID)
             output_tids[0] = completion_tid
@@ -1740,8 +1753,9 @@ def prefill_moe_local(
                 level=pl.Level.CORE_GROUP,
                 name_hint="prefill_moe_wave_publish",
                 deps=[output_store_tid, notify_tid, wait_tid],
-            ):
+            ) as wave_retired_tid:
                 pl.write(stage_token, [0], moe_epoch)
+            forward_retired[forward_slot] = wave_retired_tid
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_layer_complete"):
         completed_epoch = pl.read(stage_token, [0])
@@ -1783,11 +1797,11 @@ def prefill_moe(
     post_ffn: pl.Tensor[[PREFILL_GROUP_T_DYN, HC_MULT], pl.FP32],
     comb_ffn: pl.Tensor[[PREFILL_GROUP_T_DYN, HC_MULT * HC_MULT], pl.FP32],
     ffn_out: pl.Tensor[[PREFILL_LOCAL_T_DYN, D], pl.BF16],
-    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
-    recv_x: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
-    recv_aux: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    recv_meta: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * N_RANKS, N_LOCAL], pl.INT32],
+    recv_x: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
+    recv_aux: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
+    arrived: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * N_RANKS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     stage_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
