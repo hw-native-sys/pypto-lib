@@ -101,7 +101,7 @@ ROPE_CS_T_TILE = 8  # rope cos/sin row block
 # proj_a / proj_b cube M. Bounded by the 128 KiB L0C Acc (ROW_TILE*N_TILE*4) and by
 # T_PAD: a taller row tile reads into the next group's slab and writes past the end
 # of the row-indexed scratch.
-PROJ_A_ROW_TILE = min(128, T_PAD)
+PROJ_A_ROW_TILE = min(256, T_PAD)
 PROJ_B_ROW_TILE = min(256, T_PAD)
 O_PROJ_ROW_TILE = max(PROJ_A_ROW_TILE, PROJ_B_ROW_TILE)
 # Task-array fan-outs; named because a deps= list comprehension cannot be hoisted
@@ -1076,7 +1076,7 @@ def _sparse_attn_o_proj(
     partials = pl.create_tensor([T_PAD, O_GROUPS * D], dtype=pl.INT32)
     proj_a_tids = pl.array.create(O_GROUPS * PA_NFRAGS, pl.TASK_ID)
     quant_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
-    proj_b_tids = pl.array.create(PB_DSLABS * O_GROUPS, pl.TASK_ID)
+    proj_b_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
     # Round physical tails up to complete projection tiles; only the final store
     # writes active rows.
     o_compute_rows = ((tile_rows + O_PROJ_ROW_TILE - 1) // O_PROJ_ROW_TILE) * O_PROJ_ROW_TILE
@@ -1101,7 +1101,7 @@ def _sparse_attn_o_proj(
                     pa_r0 = pl.tile.get_block_idx() * PROJ_A_ROW_TILE
                     pa_src0 = row_base_o + pa_r0
                     acc_a = pl.create_tensor([PROJ_A_ROW_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
-                    for kb in pl.pipeline(0, O_GROUP_IN, A_K_TILE, stage=4):
+                    for kb in pl.pipeline(0, O_GROUP_IN, A_K_TILE, stage=2):
                         xa_k = pl.slice(o_packed, [PROJ_A_ROW_TILE, A_K_TILE], [pa_src0, kb])
                         wa_k = pl.slice(wo_a_2d, [PROJ_A_MM_N_TILE, A_K_TILE], [pa_col0, kb])
                         acc_a = pl.matmul_acc(acc_a, xa_k, wa_k, b_trans=True, init_cond=(kb == 0))
@@ -1151,44 +1151,41 @@ def _sparse_attn_o_proj(
                     pl.assemble(quant_output, oq_i8, [qt, k1])
             quant_tids[g] = q_tid
 
-        # proj_b_mm[dc, g]: INT8 GEMM of group g's contribution to a PROJ_B_D_TILE-wide slab
-        # of D, written as INT32 partials[:, g*D+n]. init_cond overwrites the accumulator on
-        # the first K step; accumulating from a zero carry trips TLOAD DN->NZ (pypto#1540).
-        for dc in pl.parallel(PB_DSLABS):
-            d0 = dc * PROJ_B_D_TILE
-            for g in pl.range(O_GROUPS):
-                col_g = g * O_LORA
-                pb_input: pl.Tensor[
-                    [T_PAD, O_LORA], pl.INT8, pl.TensorView(stride=[O_GROUPS * O_LORA, 1])
-                ] = pl.slice(o_r_i8, [T_PAD, O_LORA], [0, col_g])
-                pb_col0 = g * D + d0
-                pb_output: pl.Tensor[
-                    [T_PAD, PROJ_B_D_TILE], pl.INT32, pl.TensorView(stride=[O_GROUPS * D, 1])
-                ] = pl.slice(partials, [T_PAD, PROJ_B_D_TILE], [0, pb_col0])
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_b_mm", deps=[quant_tids[g]]) as pb_tid:
-                    for nf in pl.range(PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
-                        pb_out_n0 = nf * PROJ_B_MM_N_TILE
-                        pb_weight_row0 = pb_col0 + pb_out_n0
-                        for pb_rb in pl.range(proj_b_rows):
-                            pb_r0 = pb_rb * PROJ_B_ROW_TILE
-                            acc_b = pl.tile.create([PROJ_B_ROW_TILE, PROJ_B_MM_N_TILE], pl.INT32, target_memory=pl.Mem.Acc)
-                            for kb in pl.pipeline(0, O_LORA, B_L1_K_TILE, stage=2):
-                                xb_l1 = pl.tile.load(pb_input, [pb_r0, kb], [PROJ_B_ROW_TILE, B_L1_K_TILE], target_memory=pl.Mem.Mat)
-                                wb_l1 = pl.tile.load(wo_b_2d, [pb_weight_row0, kb], [PROJ_B_MM_N_TILE, B_L1_K_TILE], target_memory=pl.Mem.Mat)
-                                wb_transposed = pl.tile.transpose_view(wb_l1)
-                                for ki in pl.pipeline(0, B_L1_K_TILE, B_K_TILE, stage=2):
-                                    xb_l0 = pl.tile.extract(xb_l1, 0, ki, [PROJ_B_ROW_TILE, B_K_TILE], target_memory=pl.Mem.Left)
-                                    wb_l0 = pl.tile.extract(wb_transposed, ki, 0, [B_K_TILE, PROJ_B_MM_N_TILE], target_memory=pl.Mem.Right)
-                                    acc_b = pl.tile.matmul_acc(acc_b, xb_l0, wb_l0, init_cond=(kb == 0 and ki == 0))
-                            pl.tile.store(acc_b, [pb_r0, pb_out_n0], pb_output)
-                proj_b_tids[dc * O_GROUPS + g] = pb_tid
+        # Each group projects independent row blocks and output slabs.
+        for g in pl.parallel(O_GROUPS):
+            col_g = g * O_LORA
+            pb_input: pl.Tensor[
+                [T_PAD, O_LORA], pl.INT8, pl.TensorView(stride=[O_GROUPS * O_LORA, 1])
+            ] = pl.slice(o_r_i8, [T_PAD, O_LORA], [0, col_g])
+            group_col = g * D
+            pb_output: pl.Tensor[
+                [T_PAD, D], pl.INT32, pl.TensorView(stride=[O_GROUPS * D, 1])
+            ] = pl.slice(partials, [T_PAD, D], [0, group_col])
+            with pl.spmd(proj_b_rows * PB_DSLABS, name_hint="proj_b_mm", deps=[quant_tids[g]]) as pb_tid:
+                pb_block = pl.tile.get_block_idx()
+                pb_r0 = (pb_block // PB_DSLABS) * PROJ_B_ROW_TILE
+                pb_slab = (pb_block % PB_DSLABS) * PROJ_B_D_TILE
+                for frag in pl.range(PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
+                    pb_out_n0 = pb_slab + frag * PROJ_B_MM_N_TILE
+                    pb_weight_row0 = group_col + pb_out_n0
+                    acc_b = pl.tile.create([PROJ_B_ROW_TILE, PROJ_B_MM_N_TILE], pl.INT32, target_memory=pl.Mem.Acc)
+                    for kb in pl.pipeline(0, O_LORA, B_L1_K_TILE, stage=2):
+                        xb_l1 = pl.tile.load(pb_input, [pb_r0, kb], [PROJ_B_ROW_TILE, B_L1_K_TILE], target_memory=pl.Mem.Mat)
+                        wb_l1 = pl.tile.load(wo_b_2d, [pb_weight_row0, kb], [PROJ_B_MM_N_TILE, B_L1_K_TILE], target_memory=pl.Mem.Mat)
+                        wb_transposed = pl.tile.transpose_view(wb_l1)
+                        for ki in pl.pipeline(0, B_L1_K_TILE, B_K_TILE, stage=2):
+                            xb_l0 = pl.tile.extract(xb_l1, 0, ki, [PROJ_B_ROW_TILE, B_K_TILE], target_memory=pl.Mem.Left)
+                            wb_l0 = pl.tile.extract(wb_transposed, ki, 0, [B_K_TILE, PROJ_B_MM_N_TILE], target_memory=pl.Mem.Right)
+                            acc_b = pl.tile.matmul_acc(acc_b, xb_l0, wb_l0, init_cond=(kb == 0 and ki == 0))
+                    pl.tile.store(acc_b, [pb_r0, pb_out_n0], pb_output)
+            proj_b_tids[g] = pb_tid
 
     # Dequantize and sum per-group INT32 partials into the BF16 output.
     act_t_blks = (tile_rows + PROJ_B_ACT_TASK_T_TILE - 1) // PROJ_B_ACT_TASK_T_TILE
     act_blocks = (D // PROJ_B_ACT_N_TILE) * act_t_blks
     with pl.spmd(
         act_blocks, name_hint="proj_b_act",
-        deps=[proj_b_tids[i] for i in range(PB_DSLABS * O_GROUPS)],
+        deps=[proj_b_tids[i] for i in range(O_GROUPS)],
     ) as act_tid:
         act_idx = pl.tile.get_block_idx()
         nreg = act_idx // act_t_blks
