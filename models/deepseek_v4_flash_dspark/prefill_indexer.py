@@ -828,6 +828,82 @@ def prefill_indexer(
 
 
 @pl.jit.inline(auto_scope=False)
+def prepare_prefill_indexer_workspace(completion: pl.Array[1, pl.TASK_ID]):
+    """Prepare the rotary templates and scratch used by consecutive query tiles."""
+    # Invocation-wide RoPE templates.
+    rope_dup_idx_template = pl.create_tensor([QR_PROJ_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
+    rope_swap_idx_template = pl.create_tensor([QR_PROJ_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
+    rope_sign_template = pl.create_tensor([1, ROPE_HEAD_DIM], dtype=pl.FP32)
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="prefill_idx_rope_index_prepare",
+        deps=[completion[0]],
+    ) as rope_prepare_tid:
+        for rope_c in pl.range(ROPE_HEAD_DIM):
+            rope_lane = rope_c % 2
+            pl.write(rope_sign_template, [0, rope_c], pl.cast(pl.cast(rope_lane * 2 - 1, pl.INT32), pl.FP32))
+            for rope_r in pl.range(QR_PROJ_ROW_TILE):
+                dup_col = rope_r * (ROPE_HEAD_DIM // 2) + rope_c // 2
+                pl.write(rope_dup_idx_template, [rope_r, rope_c], pl.cast(dup_col, pl.INT32))
+                swap_col = rope_r * Q_OUT_TILE + rope_c + 1 - rope_lane * 2
+                pl.write(rope_swap_idx_template, [rope_r, rope_c], pl.cast(swap_col, pl.INT32))
+
+    # Reusable score and pair arenas.
+    score_arena = pl.create_tensor([PREFILL_DENSE_TILE, INDEXER_MAX_CANDIDATES], dtype=pl.FP32, manual_dep=True)
+    pair_arena = pl.create_tensor([TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], dtype=pl.FP32, manual_dep=True)
+    return rope_dup_idx_template, rope_swap_idx_template, rope_sign_template, score_arena, pair_arena, rope_prepare_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def score_prefill_indexer_queries(
+    x: pl.Tensor[[Q_T_DYN, D], pl.BF16],
+    qr: pl.Tensor[[Q_T_DYN, Q_LORA], pl.INT8],
+    qr_scale: pl.Tensor[[Q_T_DYN, 1], pl.FP32],
+    # NOT pl.NZ: o0/tail_o0 are formed via integer division of a flattened
+    # spmd index (qr_n = idx // qr_full_row_blocks), which NZ addressability
+    # cannot prove non-negative (only bare spmd/loop indices and their
+    # sums/products with constants are provable, not a quotient).
+    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, pl.NZ],
+    cos: pl.Tensor[[Q_T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
+    sin: pl.Tensor[[Q_T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
+    hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
+    idx_kv_cache: pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8],
+    idx_kv_scale: pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32],
+    idx_block_table: pl.Tensor[[REQUESTS_DYN, IDX_CACHE_MAX_BLOCKS], pl.INT32],
+    cmp_topk_indices: pl.Out[pl.Tensor[[Q_T_DYN, IDX_TOPK], pl.INT32]],
+    position_ids: pl.Tensor[[Q_T_DYN], pl.INT32],
+    local_request_ids: pl.Tensor[[Q_T_DYN], pl.INT32],
+    rope_dup_idx_template: pl.Tensor,
+    rope_swap_idx_template: pl.Tensor,
+    rope_sign_template: pl.Tensor,
+    score_arena: pl.Tensor,
+    pair_arena: pl.Tensor,
+    selection_completion: pl.Array[1, pl.TASK_ID],
+):
+    """Select the top compressed keys for the supplied query rows."""
+    t_dim = pl.tensor.dim(x, 0)
+    for tile_base in pl.range(0, t_dim, PREFILL_DENSE_TILE):
+        with pl.scope():
+            tile_rows = pl.min(PREFILL_DENSE_TILE, t_dim - tile_base)
+            _prefill_indexer_dense_tile(
+                x, qr, qr_scale,
+                wq_b, wq_b_scale, weights_proj,
+                cos, sin,
+                hadamard,
+                idx_kv_cache, idx_kv_scale, idx_block_table,
+                local_request_ids,
+                cmp_topk_indices, position_ids,
+                rope_dup_idx_template, rope_swap_idx_template, rope_sign_template,
+                score_arena, pair_arena, selection_completion,
+                tile_base, tile_rows,
+            )
+
+    return cmp_topk_indices
+
+
+@pl.jit.inline(auto_scope=False)
 def prefill_indexer_query(
     x: pl.Tensor[[Q_T_DYN, D], pl.BF16],
     qr: pl.Tensor[[Q_T_DYN, Q_LORA], pl.INT8],
@@ -851,49 +927,14 @@ def prefill_indexer_query(
     completion: pl.Array[1, pl.TASK_ID],
 ):
     """Score local queries against the published indexer cache."""
-    t_dim = pl.tensor.dim(x, 0)
-
-    # Invocation-wide RoPE templates.
-    rope_dup_idx_template = pl.create_tensor([QR_PROJ_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
-    rope_swap_idx_template = pl.create_tensor([QR_PROJ_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
-    rope_sign_template = pl.create_tensor([1, ROPE_HEAD_DIM], dtype=pl.FP32)
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="prefill_idx_rope_index_prepare",
-        deps=[completion[0]],
-    ) as rope_prepare_tid:
-        for rope_c in pl.range(ROPE_HEAD_DIM):
-            rope_lane = rope_c % 2
-            pl.write(rope_sign_template, [0, rope_c], pl.cast(pl.cast(rope_lane * 2 - 1, pl.INT32), pl.FP32))
-            for rope_r in pl.range(QR_PROJ_ROW_TILE):
-                dup_col = rope_r * (ROPE_HEAD_DIM // 2) + rope_c // 2
-                pl.write(rope_dup_idx_template, [rope_r, rope_c], pl.cast(dup_col, pl.INT32))
-                swap_col = rope_r * Q_OUT_TILE + rope_c + 1 - rope_lane * 2
-                pl.write(rope_swap_idx_template, [rope_r, rope_c], pl.cast(swap_col, pl.INT32))
-
-    # Reusable score and pair arenas.
-    score_arena = pl.create_tensor([PREFILL_DENSE_TILE, INDEXER_MAX_CANDIDATES], dtype=pl.FP32, manual_dep=True)
-    pair_arena = pl.create_tensor([TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], dtype=pl.FP32, manual_dep=True)
+    dup, swap, sign, scores, pairs, ready = prepare_prefill_indexer_workspace(completion)
     selection_completion = pl.array.create(1, pl.TASK_ID)
-    selection_completion[0] = rope_prepare_tid
-
-    for tile_base in pl.range(0, t_dim, PREFILL_DENSE_TILE):
-        with pl.scope():
-            tile_rows = pl.min(PREFILL_DENSE_TILE, t_dim - tile_base)
-            _prefill_indexer_dense_tile(
-                x, qr, qr_scale,
-                wq_b, wq_b_scale, weights_proj,
-                cos, sin,
-                hadamard,
-                idx_kv_cache, idx_kv_scale, idx_block_table,
-                local_request_ids,
-                cmp_topk_indices, position_ids,
-                rope_dup_idx_template, rope_swap_idx_template, rope_sign_template,
-                score_arena, pair_arena, selection_completion,
-                tile_base, tile_rows,
-            )
-
-    return cmp_topk_indices
+    selection_completion[0] = ready
+    return score_prefill_indexer_queries(
+        x, qr, qr_scale, wq_b, wq_b_scale, weights_proj, cos, sin, hadamard,
+        idx_kv_cache, idx_kv_scale, idx_block_table, cmp_topk_indices, position_ids, local_request_ids,
+        dup, swap, sign, scores, pairs, selection_completion,
+    )
 
 
 def topk_prefix_contract_error(topk_indices, position_ids, num_tokens=None):
