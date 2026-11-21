@@ -12,13 +12,14 @@
 Public entry point: :func:`run`.
 """
 
+import ast
 import os
 import re
 import statistics
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -215,13 +216,45 @@ def _validate_stepped_swimlane(
     )
 
 
+def _artifact_runtime(config_path: Path) -> str:
+    """Read the baked ABI literal without executing generated Python."""
+    try:
+        for stmt in ast.parse(config_path.read_bytes(), filename=str(config_path)).body:
+            if isinstance(stmt, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "RUNTIME_CONFIG" for target in stmt.targets
+            ):
+                config = ast.literal_eval(stmt.value)
+                runtime = config.get("runtime") if isinstance(config, dict) else None
+                return runtime if isinstance(runtime, str) and runtime else "unknown"
+    except (OSError, SyntaxError, ValueError, TypeError):
+        pass
+    return "unknown"
+
+
+def _report_a5_artifact_runtime(compiled: Any, work_dir: Path, cfg: Any) -> None:
+    dc = cfg.distributed_config
+    devices = list(dc.device_ids) if dc is not None else [cfg.device_id]
+    next_levels = work_dir / "next_levels"
+    if next_levels.is_dir():
+        # These are chip callables. Multiple ranks can use the same callable.
+        callables = {
+            path.parent.name: _artifact_runtime(path)
+            for path in sorted(next_levels.glob("*/kernel_config.py"))
+        }
+    else:
+        cached = getattr(compiled, "_runtime_name", None)
+        runtime = cached if isinstance(cached, str) and cached else _artifact_runtime(work_dir / "kernel_config.py")
+        callables = {work_dir.name: runtime}
+    print(f"[RUN] artifact runtime: devices={devices} callables={callables or 'unknown'}", flush=True)
+
+
 def _stale_cpps(work_dir: Path, *, platform: str) -> list[Path]:
     """Find missing or outdated generated binaries using registered code identities.
 
     Generated kernels may have several registrations sharing one content-keyed
     binary. Require a fresh sidecar for every distinct code contract and the
     replay platform, using PyPTO's own identity function. Plain kernels and
-    orchestration retain their legacy sibling naming. External/builtin caches
+    orchestration retain their legacy sibling naming. External, builtin and VPTO helper caches
     belong to the runtime.
     """
     stale: list[Path] = []
@@ -243,9 +276,9 @@ def _stale_cpps(work_dir: Path, *, platform: str) -> list[Path]:
             for kernel in read_kernel_config(config_path).KERNELS:
                 source = Path(kernel["source"])
                 expected = sidecars.setdefault(source.resolve(), set())
-                if kernel.get("external", False) or kernel.get("builtin", False):
+                if kernel.get("external") or kernel.get("builtin") or kernel.get("vpto_sources"):
                     # These never have source-adjacent binaries; their content
-                    # and include closure are checked by the runtime cache.
+                    # and toolchain identity are checked by the runtime cache.
                     continue
                 stem = source.stem
                 if _generated_code_key(kernel) is not None:
@@ -1476,6 +1509,37 @@ def _validate(
         )
 
 
+@contextmanager
+def _fresh_compile_config(cfg: Any, a5_default_runtime: str | None = None) -> Iterator[Any]:
+    """Select an opted-in A5 runtime for new builds while preserving explicit pass settings."""
+    requested = os.environ.get("PYPTO_LIB_A5_RUNTIME", a5_default_runtime)
+    if cfg.platform not in ("a5", "a5sim") or requested is None:
+        yield cfg
+        return
+
+    from pypto.pypto_core import passes
+
+    if passes.PassContext.current() is not None:
+        yield cfg
+        return
+
+    runtime = passes.runtime_kind_from_name(requested)
+    # PyPTO rejects these options when passed both to ir.compile and to a
+    # PassContext. Move the caller's values into the context for this compile.
+    options = {}
+    for field in ("diagnostic_phase", "memory_planner", "enable_software_pipeline"):
+        value = getattr(cfg, field)
+        if value is not None:
+            options[field] = value
+    if cfg.enable_software_pipeline:
+        options["enable_buffer_ir"] = False
+    options.setdefault("diagnostic_phase", passes.get_default_diagnostic_phase())
+    with passes.PassContext(
+        [], runtime=runtime, verification_level=passes.get_default_verification_level(), **options,
+    ):
+        yield replace(cfg, diagnostic_phase=None, memory_planner=None, enable_software_pipeline=None)
+
+
 def _run_pipeline(
     specs: list[TensorSpec | ScalarSpec],
     *,
@@ -1491,6 +1555,7 @@ def _run_pipeline(
     compile_only: bool,
     runtime_dir: str | None,
     save_data: bool,
+    a5_default_runtime: str | None,
 ) -> RunResult:
     """Compile / run / validate body behind :func:`run`.
 
@@ -1548,9 +1613,12 @@ def _run_pipeline(
         # dispatch below calls, so this is not an L3-only concern.
         compiled = _reload_from_dir(work_dir, cfg)
     else:
-        with _Stage("compile"):
-            compiled = compile_step(cfg, compile_state)
+        with _Stage("compile"), _fresh_compile_config(cfg, a5_default_runtime) as compile_cfg:
+            compiled = compile_step(compile_cfg, compile_state)
             work_dir = Path(compiled.output_dir)
+
+    if cfg.platform == "a5":
+        _report_a5_artifact_runtime(compiled, work_dir, cfg)
 
     # Neither a signature-driven compile (which trusts annotations over tensor
     # samples) nor a runtime-dir replay (which trusts a persisted artifact) can
@@ -1742,6 +1810,7 @@ def run(
     compile_only: bool = False,
     runtime_dir: str | None = None,
     save_data: bool = False,
+    a5_default_runtime: str | None = None,
 ) -> RunResult:
     """Compile *fn*, run it on device, and validate against golden.
 
@@ -1752,6 +1821,9 @@ def run(
 
     Args:
         fn: ``@pl.jit`` callable, ``@pl.program`` class, or ``ir.Program``.
+        a5_default_runtime: Runtime used for fresh A5/A5sim compiles of this entry.
+            An explicit PassContext or PYPTO_LIB_A5_RUNTIME overrides this default.
+            When omitted, PyPTO selects its usual runtime.
         specs: :class:`TensorSpec` / :class:`ScalarSpec` list in *fn*'s
             parameter order. A mismatched order is rejected, never reordered.
         golden_fn: ``golden_fn(values)`` that fills outputs in-place; *values*
@@ -1814,4 +1886,5 @@ def run(
             compile_only=compile_only,
             runtime_dir=runtime_dir,
             save_data=save_data,
+            a5_default_runtime=a5_default_runtime,
         )
