@@ -91,8 +91,12 @@ from prefill_o_proj import (
     O_PROJ_WO_A_WINDOW_ROWS,
     O_PROJ_WO_B_WINDOW_COLS,
     O_PROJ_WO_B_WINDOW_ROWS,
-    gather_o_proj_full_weights,
+    _begin_o_proj_full_weights_gather,
+    _finish_o_proj_full_weights_gather,
 )
+
+if TP_SIZE == 1:
+    from prefill_o_proj import gather_o_proj_full_weights
 from qkv_proj_rope import kv_proj_rope, q_proj_rope, rope_prepare
 
 
@@ -1399,14 +1403,22 @@ def prefill_attention_csa_cp_local(
     inverse_ready: pl.Scalar[pl.TASK_ID],
 ):
     """Run CSA with local HC state and replicated normalized input."""
-    o_proj_weight_dep = gather_o_proj_full_weights(
-        wo_a_local, wo_b_local,
-        wo_a_full, wo_b_full,
-        o_proj_wo_a_window, o_proj_wo_b_window,
-        o_proj_weight_ready, o_proj_weight_consumed,
-        o_proj_order_fence,
-        group_base, tp_rank, weight_epoch,
-    )
+    if TP_SIZE > 1:
+        weight_published, weight_waited = _begin_o_proj_full_weights_gather(
+            wo_a_local, wo_b_local,
+            o_proj_wo_a_window, o_proj_wo_b_window,
+            o_proj_weight_ready, o_proj_weight_consumed,
+            group_base, tp_rank, weight_epoch,
+        )
+    else:
+        o_proj_weight_dep = gather_o_proj_full_weights(
+            wo_a_local, wo_b_local,
+            wo_a_full, wo_b_full,
+            o_proj_wo_a_window, o_proj_wo_b_window,
+            o_proj_weight_ready, o_proj_weight_consumed,
+            o_proj_order_fence,
+            group_base, tp_rank, weight_epoch,
+        )
     q_dim = pl.tensor.dim(position_ids_local, 0)
     kv_dim = pl.tensor.dim(position_ids_full, 0)
 
@@ -1421,6 +1433,14 @@ def prefill_attention_csa_cp_local(
 
     x_normed_local = pl.create_tensor([q_dim, D], dtype=pl.BF16)
     norm_ready_tid = rms_norm(x_mixed_local, attn_norm_w, x_normed_local)
+    if TP_SIZE > 1:
+        o_proj_weight_dep = _finish_o_proj_full_weights_gather(
+            wo_a_local, wo_b_local,
+            wo_a_full, wo_b_full,
+            o_proj_wo_a_window, o_proj_wo_b_window,
+            o_proj_weight_consumed, o_proj_order_fence,
+            group_base, tp_rank, weight_published, weight_waited, norm_ready_tid,
+        )
     x_normed_full = pl.create_tensor([kv_dim, D], dtype=pl.BF16)
     local_base = tp_rank * q_dim
     freqs_cos_local = pl.slice(freqs_cos, [q_dim, ROPE_HEAD_DIM], [local_base, 0])

@@ -56,21 +56,18 @@ O_PROJ_WO_B_PUSH_ROWS = O_PROJ_WEIGHT_COPY_TILE * O_PROJ_LOCAL_GROUPS
 
 
 @pl.jit.inline(auto_scope=False)
-def gather_o_proj_full_weights(
+def _begin_o_proj_full_weights_gather(
     wo_a_local: pl.Tensor[[O_PROJ_LOCAL_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b_local: pl.Tensor[[O_PROJ_LOCAL_GROUPS, D, O_LORA], pl.INT8],
-    wo_a_full: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], pl.BF16],
-    wo_b_full: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_D, O_LORA], pl.INT8],
     wo_a_window: pld.DistributedTensor[[O_PROJ_WO_A_WINDOW_ROWS, O_PROJ_WO_A_WINDOW_COLS], pl.BF16],
     wo_b_window: pld.DistributedTensor[[O_PROJ_WO_B_WINDOW_ROWS, O_PROJ_WO_B_WINDOW_COLS], pl.INT8],
     weight_ready: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     weight_consumed: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    order_fence: pl.Tensor[[1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     weight_epoch: pl.Scalar[pl.INT32],
-) -> pl.Scalar[pl.TASK_ID]:
-    """Materialize one layer's resident TP shards in reusable full-weight scratch."""
+) -> tuple[pl.Scalar[pl.TASK_ID], pl.Scalar[pl.TASK_ID]]:
+    """Push resident TP weight shards and wait for peer publication."""
     previous_epoch = weight_epoch - pl.const(1, pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="o_proj_weight_reuse_wait") as reuse_wait_tid:
         for source_tp in pl.range(TP_SIZE):
@@ -122,10 +119,32 @@ def gather_o_proj_full_weights(
                     expected=weight_epoch, cmp=pld.WaitCmp.Ge,
                 )
 
+    return publish_tid, ready_wait_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def _finish_o_proj_full_weights_gather(
+    wo_a_local: pl.Tensor[[O_PROJ_LOCAL_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_local: pl.Tensor[[O_PROJ_LOCAL_GROUPS, D, O_LORA], pl.INT8],
+    wo_a_full: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], pl.BF16],
+    wo_b_full: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_D, O_LORA], pl.INT8],
+    wo_a_window: pld.DistributedTensor[[O_PROJ_WO_A_WINDOW_ROWS, O_PROJ_WO_A_WINDOW_COLS], pl.BF16],
+    wo_b_window: pld.DistributedTensor[[O_PROJ_WO_B_WINDOW_ROWS, O_PROJ_WO_B_WINDOW_COLS], pl.INT8],
+    weight_consumed: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    order_fence: pl.Tensor[[1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    publish_tid: pl.Scalar[pl.TASK_ID],
+    ready_wait_tid: pl.Scalar[pl.TASK_ID],
+    norm_ready_tid: pl.Scalar[pl.TASK_ID],
+) -> pl.Scalar[pl.TASK_ID]:
+    """Read the TP shards into full-weight scratch after attention input norm."""
+    wo_a_local_flat = pl.reshape(wo_a_local, [O_PROJ_LOCAL_COLS, O_GROUP_IN])
+    wo_b_local_flat = pl.reshape(wo_b_local, [O_PROJ_LOCAL_ROWS_B, O_LORA])
     wo_a_full_flat = pl.reshape(wo_a_full, [O_PROJ_FULL_ROWS, O_GROUP_IN])
     with pl.spmd(
         O_PROJ_FULL_ROWS // O_PROJ_WEIGHT_COPY_TILE, name_hint="o_proj_wo_a_readback",
-        deps=[publish_tid, ready_wait_tid],
+        deps=[publish_tid, ready_wait_tid, norm_ready_tid],
     ) as wo_a_readback_tid:
         order = pl.read(order_fence, [0])
         if order >= 0:
@@ -145,7 +164,7 @@ def gather_o_proj_full_weights(
     wo_b_full_flat = pl.reshape(wo_b_full, [O_PROJ_FULL_ROWS_B, O_LORA])
     with pl.spmd(
         O_PROJ_FULL_ROWS_B // O_PROJ_WO_B_COPY_TILE, name_hint="o_proj_wo_b_readback",
-        deps=[publish_tid, ready_wait_tid],
+        deps=[publish_tid, ready_wait_tid, norm_ready_tid],
     ) as wo_b_readback_tid:
         order = pl.read(order_fence, [0])
         if order >= 0:
