@@ -46,6 +46,9 @@ from prefill_o_proj import (
     gather_o_proj_full_weights,
 )
 from prefill_sparse_attn import (
+    HEAD_TILE as SPARSE_ROPE_HEAD_TILE,
+    SPARSE_ROPE_ROWS,
+    prepare_sparse_attn_rope,
     PREFILL_ATTN_TILE,
     PREFILL_RING_HEAP,
     SPARSE_BIAS_COLS,
@@ -133,6 +136,9 @@ def _prefill_attention_swa(
     local_request_ids.bind_dynamic(0, T_DYN)
     x_out.bind_dynamic(0, T_DYN)
     t_dim = pl.tensor.dim(x_hc, 0)
+    inverse_rope, inverse_swap_idx, inverse_ready = prepare_sparse_attn_rope(
+        freqs_cos, freqs_sin, pl.const(0, pl.INDEX), t_dim, pl.const(1, pl.INT32),
+    )
     x_mixed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     post = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
     comb = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
@@ -211,7 +217,7 @@ def _prefill_attention_swa(
         cmp_indices_dummy,
         valid_block_mask,
         attn_sink,
-        freqs_cos, freqs_sin,
+        inverse_rope, inverse_swap_idx, inverse_ready,
         wo_a, wo_b, wo_b_scale, attn_out, o_proj_weight_dep,
     )
 
@@ -227,8 +233,6 @@ prefill_attention_swa_test = pl.jit(_prefill_attention_swa)
 def prefill_attention_swa_cp_core(
     q: pl.Tensor[[CP_Q_T_DYN, H, HEAD_DIM], pl.BF16],
     kv_full: pl.Tensor[[CP_KV_T_DYN, HEAD_DIM], pl.BF16],
-    freqs_cos_local: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_local: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.Tensor[[BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     block_table: pl.Tensor[[REQUESTS_DYN, BLOCK_TABLE_BLOCKS], pl.INT32],
     ori_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
@@ -241,6 +245,9 @@ def prefill_attention_swa_cp_core(
     attn_out_local: pl.Tensor[[CP_Q_T_DYN, D], pl.BF16],
     projection_done: pl.Scalar[pl.TASK_ID],
     o_proj_weight_dep: pl.Scalar[pl.TASK_ID],
+    inverse_rope: pl.Tensor[[SPARSE_ROPE_ROWS, 2 * ROPE_HEAD_DIM], pl.FP32],
+    inverse_swap_idx: pl.Tensor[[SPARSE_ROPE_HEAD_TILE, ROPE_HEAD_DIM], pl.INT32],
+    inverse_ready: pl.Scalar[pl.TASK_ID],
 ):
     """SWA attention body: local queries/output projection and replicated full KV."""
     q_dim = pl.tensor.dim(q, 0)
@@ -301,7 +308,7 @@ def prefill_attention_swa_cp_core(
         q, kv_cache, swa_indices,
         cmp_kv_dummy, cmp_block_table_dummy, local_request_ids, cmp_indices_dummy,
         valid_block_mask, attn_sink,
-        freqs_cos_local, freqs_sin_local,
+        inverse_rope, inverse_swap_idx, inverse_ready,
         wo_a, wo_b, wo_b_scale,
         attn_out_local, o_proj_weight_dep,
     )
@@ -346,6 +353,9 @@ def prefill_attention_swa_cp_local(
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     weight_epoch: pl.Scalar[pl.INT32],
+    inverse_rope: pl.Tensor[[SPARSE_ROPE_ROWS, 2 * ROPE_HEAD_DIM], pl.FP32],
+    inverse_swap_idx: pl.Tensor[[SPARSE_ROPE_HEAD_TILE, ROPE_HEAD_DIM], pl.INT32],
+    inverse_ready: pl.Scalar[pl.TASK_ID],
 ):
     """Run SWA with local HC state and replicated projected KV."""
     o_proj_weight_dep = gather_o_proj_full_weights(
@@ -399,7 +409,6 @@ def prefill_attention_swa_cp_local(
     attn_out_local = pl.create_tensor([q_dim, D], dtype=pl.BF16)
     kv_cache, attn_out_local = prefill_attention_swa_cp_core(
         q, kv_full,
-        freqs_cos_local, freqs_sin_local,
         kv_cache, block_table,
         ori_slot_mapping_full,
         position_ids_local, local_request_ids,
@@ -407,6 +416,7 @@ def prefill_attention_swa_cp_local(
         wo_a_full, wo_b_full, wo_b_scale,
         attn_out_local,
         projection_done, o_proj_weight_dep,
+        inverse_rope, inverse_swap_idx, inverse_ready,
     )
 
     hc_output_flat_local = pl.reshape(x_out_local, [hc_local_elements])
@@ -457,6 +467,9 @@ def prefill_attention_swa_cp(
     """Materialize the full HC result at the public SWA CP boundary."""
     q_dim = pl.tensor.dim(position_ids_local, 0)
     local_base = tp_rank * q_dim
+    inverse_rope, inverse_swap_idx, inverse_ready = prepare_sparse_attn_rope(
+        freqs_cos, freqs_sin, local_base, q_dim, pl.const(1, pl.INT32),
+    )
     x_hc_local = pl.slice(x_hc_full, [q_dim, HC_MULT, D], [local_base, 0, 0])
     x_out_local = pl.slice(x_out_full, [q_dim, HC_MULT, D], [local_base, 0, 0])
     kv_cache, x_out_local, gather_signal = prefill_attention_swa_cp_local(
@@ -476,6 +489,7 @@ def prefill_attention_swa_cp(
         o_proj_weight_ready, o_proj_weight_consumed,
         o_proj_order_fence,
         group_base, tp_rank, weight_epoch,
+        inverse_rope, inverse_swap_idx, inverse_ready,
     )
     materialize_ready_tid = pl.system.task_dummy(deps=[])
     prefill_cp_materialize_hc_full(
