@@ -42,7 +42,8 @@ from prefill_indexer import (
     gen_shared_weight,
     golden_prefill_indexer_core,
     prefill_indexer,
-    prefill_indexer_query,
+    prepare_prefill_indexer_workspace,
+    score_prefill_indexer_queries,
     topk_prefix_contract_error,
 )
 from prefill_indexer_compressor import (
@@ -148,6 +149,7 @@ CSA_CMP_BLOCK_NUM = CMP_BLOCK_NUM
 
 # tiling
 CSA_TOPK_TOKEN_TILE = 2
+CSA_QUERY_TILE = 512
 CSA_CACHE_WRITE_TILE = 64
 CSA_ROPE_TILE = 8
 
@@ -1262,18 +1264,6 @@ def prefill_attention_csa_cp_core(
         idx_cos[idx_t : idx_t + CSA_ROPE_TILE, 0:HALF_ROPE] = idx_cos_fp32
         idx_sin[idx_t : idx_t + CSA_ROPE_TILE, 0:HALF_ROPE] = idx_sin_fp32
 
-    cmp_topk_indices = pl.create_tensor([q_dim, IDX_TOPK], dtype=pl.INT32)
-    cmp_topk_indices = prefill_indexer_query(
-        x_normed_local, qr, qr_scale,
-        idx_wq_b, idx_wq_b_scale, idx_weights_proj,
-        idx_cos, idx_sin,
-        hadamard_idx,
-        idx_kv_cache, idx_kv_scale, idx_block_table,
-        cmp_topk_indices,
-        position_ids_local, local_request_ids,
-        indexer_cache_ready,
-    )
-
     swa_indices = pl.create_tensor([q_dim, WIN], dtype=pl.INT32)
     valid_block_mask = pl.create_tensor([q_dim, VALID_BLOCK_MASK_COLS], dtype=pl.INT32)
     csa_topk_blocks = (q_dim + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE
@@ -1311,16 +1301,26 @@ def prefill_attention_csa_cp_core(
                 swa_indices[t_idx : t_idx + 1, 0:WIN] = swa_row
                 valid_block_mask[t_idx : t_idx + 1, 0:VALID_BLOCK_MASK_COLS] = mask_row
 
-    attn_out_local = sparse_attn_physical(
-        q,
-        kv_cache, swa_indices,
-        cmp_kv, cmp_block_table, local_request_ids, cmp_topk_indices,
-        valid_block_mask, attn_sink,
-        inverse_rope, inverse_swap_idx, inverse_ready,
-        wo_a, wo_b, wo_b_scale,
-        attn_out_local,
-        o_proj_weight_dep,
-    )
+    dup, swap, sign, scores, pairs, ready = prepare_prefill_indexer_workspace(indexer_cache_ready)
+    selection_completion = pl.array.create(1, pl.TASK_ID)
+    selection_completion[0] = ready
+    for first in pl.range(0, q_dim, CSA_QUERY_TILE):
+        rows = pl.min(CSA_QUERY_TILE, q_dim - first)
+        ids = local_request_ids[first:first + rows]
+        topk = pl.create_tensor([rows, IDX_TOPK], dtype=pl.INT32)
+        topk = score_prefill_indexer_queries(
+            x_normed_local[first:first + rows], qr[first:first + rows], qr_scale[first:first + rows],
+            idx_wq_b, idx_wq_b_scale, idx_weights_proj, idx_cos[first:first + rows], idx_sin[first:first + rows],
+            hadamard_idx, idx_kv_cache, idx_kv_scale, idx_block_table, topk, position_ids_local[first:first + rows],
+            ids, dup, swap, sign, scores, pairs, selection_completion,
+        )
+        rope_end = pl.min(first + CSA_QUERY_TILE, pl.tensor.dim(inverse_rope, 0))
+        sparse_attn_physical(
+            q[first:first + rows], kv_cache, swa_indices[first:first + rows], cmp_kv, cmp_block_table, ids, topk,
+            valid_block_mask[first:first + rows], attn_sink, inverse_rope[first:rope_end], inverse_swap_idx, inverse_ready,
+            wo_a, wo_b, wo_b_scale, attn_out_local[first:first + rows],
+            o_proj_weight_dep,
+        )
     return attn_out_local
 
 
