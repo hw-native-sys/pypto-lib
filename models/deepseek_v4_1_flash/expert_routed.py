@@ -1128,7 +1128,7 @@ def _expert_routed_output(
     activation_rows = ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE
     pair = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, 2 * hidden], dtype=pl.BF16)
     compact_weights = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, 1], dtype=pl.FP32)
-    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w13"):
+    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w13") as w13_ready:
         pair, compact_weights = _routed_w13(
             x, x_scale, counts, w1, w1_scale, w3, w3_scale, pair,
             weights, compact_weights, experts, stride, width, hidden, activation_rows, row_capacity,
@@ -1136,10 +1136,9 @@ def _expert_routed_output(
 
     payload = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, hidden], dtype=pl.FP8E4M3FN)
     scales = pl.create_tensor([1, ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE * (hidden // MX_GROUP)], dtype=pl.FP8E8M0)
-    with pl.spmd(ROUTED_VECTOR_WORKER_TILE, name_hint="routed_swiglu_quant"):
-        payload, scales = _routed_swiglu_quant(
-            pair, compact_weights, counts, payload, scales, experts, stride, hidden, row_capacity,
-        )
+    payload, scales, _ = routed_swiglu_quant_pypto(
+        pair, compact_weights, counts, payload, scales, w13_ready, experts,
+    )
 
     output_rows = ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE
     output = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, width], dtype=pl.BF16)

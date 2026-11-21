@@ -601,36 +601,6 @@ def hc_post_regscope_block(
 
 
 @pl.jit.inline
-def hc_post_regscope(
-    sublayer: pl.Tensor,
-    residual: pl.Tensor,
-    post_mix: pl.Tensor,
-    residual_mix: pl.Tensor,
-    output: pl.Tensor,
-    deps: pl.Array[2, pl.TASK_ID],
-):
-    """Mix HC streams with an opt-in A5 RegScope implementation."""
-    t_dim = pl.tensor.dim(sublayer, 0)
-    residual_rows = pl.reshape(residual, [t_dim * HC_MULT, D])
-    residual_mix_flat = pl.reshape(residual_mix, [t_dim, HC_MULT * HC_MULT])
-    output_rows = pl.reshape(output, [t_dim * HC_MULT, D])
-    total_work = t_dim * (D // D_TILE)
-    full_work = total_work // POST_WORKER_TILE * POST_WORKER_TILE
-    tail_work = (total_work - full_work) * HC_MULT
-    workers = pl.min(total_work * HC_MULT, POST_WORKER_TILE)
-    with pl.spmd(workers, name_hint="hc_post", deps=[deps]):
-        worker = pl.tile.get_block_idx()
-        for block in pl.pipeline(worker, full_work, POST_WORKER_TILE, stage=1):
-            hc_post_regscope_block(sublayer, residual_rows, post_mix, residual_mix_flat, output_rows, block, HC_MULT)
-        for tail in pl.range(worker, tail_work, POST_WORKER_TILE):
-            tail_chunk = full_work + tail // HC_MULT
-            tail_stream = (tail_chunk // (D // D_TILE)) * HC_MULT + tail % HC_MULT
-            tail_block = tail_stream * (D // D_TILE) + tail_chunk % (D // D_TILE)
-            hc_post_regscope_block(sublayer, residual_rows, post_mix, residual_mix_flat, output_rows, tail_block, 1)
-    return output
-
-
-@pl.jit.inline
 def hc_post(
     sublayer: pl.Tensor,
     residual: pl.Tensor,
@@ -640,19 +610,27 @@ def hc_post(
     deps: pl.Array[2, pl.TASK_ID],
     dep_count: pl.constexpr,
 ):
-    """Mix all four residual streams with optional producer dependencies."""
-    tokens = pl.tensor.dim(sublayer, 0)
-    sublayer_view = pl.reshape(sublayer, [tokens, D])
-    residual_view = pl.reshape(residual, [tokens, HC_MULT, D])
-    post_view = pl.reshape(post_mix, [tokens, HC_MULT])
-    mix_view = pl.reshape(residual_mix, [tokens, HC_MULT, HC_MULT])
-    output_view = pl.reshape(output, [tokens, HC_MULT, D])
-    workers = pl.min(tokens * (D // D_TILE) * HC_MULT, POST_WORKER_TILE)
+    """Mix HC streams in vector registers."""
+    t_dim = pl.tensor.dim(sublayer, 0)
+    sublayer = pl.reshape(sublayer, [t_dim, D])
+    post_rows = pl.reshape(post_mix, [t_dim, HC_MULT])
+    residual_rows = pl.reshape(residual, [t_dim * HC_MULT, D])
+    residual_mix_flat = pl.reshape(residual_mix, [t_dim, HC_MULT * HC_MULT])
+    output_rows = pl.reshape(output, [t_dim * HC_MULT, D])
+    total_work = t_dim * (D // D_TILE)
+    full_work = total_work // POST_WORKER_TILE * POST_WORKER_TILE
+    tail_work = (total_work - full_work) * HC_MULT
+    workers = pl.min(total_work * HC_MULT, POST_WORKER_TILE)
     with pl.spmd(workers, name_hint="hc_post", deps=[deps[i] for i in range(dep_count)]):
-        _hc_post(sublayer_view, residual_view, post_view, mix_view, output_view, tokens)
+        worker = pl.tile.get_block_idx()
+        for block in pl.pipeline(worker, full_work, POST_WORKER_TILE, stage=1):
+            hc_post_regscope_block(sublayer, residual_rows, post_rows, residual_mix_flat, output_rows, block, HC_MULT)
+        for tail in pl.range(worker, tail_work, POST_WORKER_TILE):
+            tail_chunk = full_work + tail // HC_MULT
+            tail_stream = (tail_chunk // (D // D_TILE)) * HC_MULT + tail % HC_MULT
+            tail_block = tail_stream * (D // D_TILE) + tail_chunk % (D // D_TILE)
+            hc_post_regscope_block(sublayer, residual_rows, post_rows, residual_mix_flat, output_rows, tail_block, 1)
     return output
-
-
 
 
 def _round_hf32(value: torch.Tensor) -> torch.Tensor:
@@ -864,7 +842,7 @@ def l2_hc_post_regscope(
     residual_mix.bind_dynamic(0, T_DYN)
     output.bind_dynamic(0, T_DYN)
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post_regscope(sublayer, residual, post_mix, residual_mix, output, deps=hc_post_deps)
+    hc_post(sublayer, residual, post_mix, residual_mix, output, deps=hc_post_deps, dep_count=2)
     return output
 
 

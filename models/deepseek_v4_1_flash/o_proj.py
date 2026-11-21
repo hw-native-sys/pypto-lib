@@ -1284,7 +1284,7 @@ def o_proj_b_hc_post_native(
 
 
 # Shared O-B backend for decode, prefill and validation.
-o_proj_b_hc_post = o_proj_b_hc_post_cpp
+o_proj_b_hc_post = o_proj_b_hc_post_native
 
 
 @pl.jit.inline(auto_scope=False)
