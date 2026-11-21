@@ -65,11 +65,13 @@ from prefill_sparse_attn import (
     PREFILL_ATTN_BLOCKS,
     PREFILL_ATTN_TILE,
     PREFILL_RING_HEAP,
+    PROJECTION_PAIR_TILE,
     PREFILL_SPARSE_PAD as SPARSE_PREFILL_SPARSE_PAD,
     SPARSE_CMP_BIAS_COLS,
     VALID_BLOCK_MASK_COLS,
     golden_prefill_sparse_attn,
     sparse_attn_physical,
+    sparse_attn_project_pair,
 )
 
 import pypto.language.distributed as pld
@@ -93,6 +95,7 @@ from prefill_o_proj import (
     O_PROJ_WO_B_WINDOW_ROWS,
     _begin_o_proj_full_weights_gather,
     _finish_o_proj_full_weights_gather,
+    pack_o_proj_a_weights,
 )
 
 if TP_SIZE == 1:
@@ -396,7 +399,9 @@ def _prefill_attention_csa(
                 swa_indices[t_idx : t_idx + 1, 0:WIN] = swa_row
                 valid_block_mask[t_idx : t_idx + 1, 0:VALID_BLOCK_MASK_COLS] = mask_row
 
-    o_proj_weight_dep = pl.system.task_dummy(deps=[])
+    unpacked_weight_dep = pl.system.task_dummy(deps=[])
+    wo_a_nz = pl.create_tensor([O_GROUPS, O_LORA, O_GROUP_IN], dtype=pl.BF16, layout=pl.NZ)
+    o_proj_weight_dep = pack_o_proj_a_weights(wo_a, wo_a_nz, unpacked_weight_dep)
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     attn_out = sparse_attn_physical(
         q,
@@ -404,7 +409,7 @@ def _prefill_attention_csa(
         cmp_kv, cmp_block_table, local_request_ids, cmp_topk_indices,
         valid_block_mask, attn_sink,
         inverse_rope, inverse_swap_idx, inverse_ready,
-        wo_a, wo_b, wo_b_scale,
+        wo_a_nz, wo_b, wo_b_scale,
         attn_out,
         o_proj_weight_dep,
     )
@@ -1164,7 +1169,7 @@ def prefill_attention_csa_cp_core(
     state_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
     inner_state_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
     wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out_local: pl.Tensor[[CP_Q_T_DYN, D], pl.BF16],
@@ -1308,22 +1313,29 @@ def prefill_attention_csa_cp_core(
     dup, swap, sign, scores, pairs, ready = prepare_prefill_indexer_workspace(indexer_cache_ready)
     selection_completion = pl.array.create(1, pl.TASK_ID)
     selection_completion[0] = ready
-    for first in pl.range(0, q_dim, CSA_QUERY_TILE):
-        rows = pl.min(CSA_QUERY_TILE, q_dim - first)
-        ids = local_request_ids[first:first + rows]
-        topk = pl.create_tensor([rows, IDX_TOPK], dtype=pl.INT32)
-        topk = score_prefill_indexer_queries(
-            x_normed_local[first:first + rows], qr[first:first + rows], qr_scale[first:first + rows],
-            idx_wq_b, idx_wq_b_scale, idx_weights_proj, idx_cos[first:first + rows], idx_sin[first:first + rows],
-            hadamard_idx, idx_kv_cache, idx_kv_scale, idx_block_table, topk, position_ids_local[first:first + rows],
-            ids, dup, swap, sign, scores, pairs, selection_completion,
-        )
-        rope_end = pl.min(first + CSA_QUERY_TILE, pl.tensor.dim(inverse_rope, 0))
-        sparse_attn_physical(
-            q[first:first + rows], kv_cache, swa_indices[first:first + rows], cmp_kv, cmp_block_table, ids, topk,
-            valid_block_mask[first:first + rows], attn_sink, inverse_rope[first:rope_end], inverse_swap_idx, inverse_ready,
-            wo_a, wo_b, wo_b_scale, attn_out_local[first:first + rows],
-            o_proj_weight_dep,
+    for first in pl.range(0, q_dim, PROJECTION_PAIR_TILE):
+        pair_rows = pl.min(PROJECTION_PAIR_TILE, q_dim - first)
+        pair_end = first + pair_rows
+        topk = pl.create_tensor([pair_rows, IDX_TOPK], dtype=pl.INT32)
+        for offset in pl.range(0, pair_rows, CSA_QUERY_TILE):
+            rows = pl.min(CSA_QUERY_TILE, pair_rows - offset)
+            start = first + offset
+            ids = local_request_ids[start:start + rows]
+            selected = pl.slice(topk, [rows, IDX_TOPK], [offset, 0])
+            score_prefill_indexer_queries(
+                x_normed_local[start:start + rows], qr[start:start + rows], qr_scale[start:start + rows],
+                idx_wq_b, idx_wq_b_scale, idx_weights_proj, idx_cos[start:start + rows], idx_sin[start:start + rows],
+                hadamard_idx, idx_kv_cache, idx_kv_scale, idx_block_table, selected, position_ids_local[start:start + rows],
+                ids, dup, swap, sign, scores, pairs, selection_completion,
+            )
+        rope_end = pl.min(pair_end, pl.tensor.dim(inverse_rope, 0))
+        # Gate the next pair's score arena work on the current projection.
+        sparse_attn_project_pair(
+            q[first:first + pair_rows], kv_cache, swa_indices[first:first + pair_rows], cmp_kv, cmp_block_table,
+            local_request_ids[first:first + pair_rows], topk, valid_block_mask[first:first + pair_rows], attn_sink,
+            pl.const(0, pl.INDEX), pair_rows, inverse_rope[first:rope_end], inverse_swap_idx, inverse_ready,
+            wo_a, wo_b, wo_b_scale, attn_out_local[first:first + pair_rows], o_proj_weight_dep,
+            selection_completion, TRACK_COMPLETION=True, PROJ_A_FENCE=False,
         )
     return attn_out_local
 
@@ -1403,6 +1415,7 @@ def prefill_attention_csa_cp_local(
     inverse_ready: pl.Scalar[pl.TASK_ID],
 ):
     """Run CSA with local HC state and replicated normalized input."""
+    wo_a_nz = pl.create_tensor([O_GROUPS, O_LORA, O_GROUP_IN], dtype=pl.BF16, layout=pl.NZ)
     if TP_SIZE > 1:
         weight_published, weight_waited = _begin_o_proj_full_weights_gather(
             wo_a_local, wo_b_local,
@@ -1413,7 +1426,7 @@ def prefill_attention_csa_cp_local(
     else:
         o_proj_weight_dep = gather_o_proj_full_weights(
             wo_a_local, wo_b_local,
-            wo_a_full, wo_b_full,
+            wo_a_full, wo_a_nz, wo_b_full,
             o_proj_wo_a_window, o_proj_wo_b_window,
             o_proj_weight_ready, o_proj_weight_consumed,
             o_proj_order_fence,
@@ -1436,7 +1449,7 @@ def prefill_attention_csa_cp_local(
     if TP_SIZE > 1:
         o_proj_weight_dep = _finish_o_proj_full_weights_gather(
             wo_a_local, wo_b_local,
-            wo_a_full, wo_b_full,
+            wo_a_full, wo_a_nz, wo_b_full,
             o_proj_wo_a_window, o_proj_wo_b_window,
             o_proj_weight_consumed, o_proj_order_fence,
             group_base, tp_rank, weight_published, weight_waited, norm_ready_tid,
@@ -1467,7 +1480,7 @@ def prefill_attention_csa_cp_local(
         cmp_slot_mapping_full, idx_slot_mapping_full,
         state_slot_mapping_full, inner_state_slot_mapping_full,
         attn_sink,
-        wo_a_full, wo_b_full, wo_b_scale,
+        wo_a_nz, wo_b_full, wo_b_scale,
         attn_out_local,
         gather_window, gather_signal, group_base, tp_rank, norm_ready_tid, o_proj_weight_dep, compact,
         inverse_rope, inverse_swap_idx, inverse_ready,

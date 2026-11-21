@@ -45,6 +45,7 @@ from prefill_o_proj import (
     O_PROJ_WO_B_WINDOW_ROWS,
     _begin_o_proj_full_weights_gather,
     _finish_o_proj_full_weights_gather,
+    pack_o_proj_a_weights,
 )
 
 if TP_SIZE == 1:
@@ -214,7 +215,9 @@ def _prefill_attention_swa(
             if dummy_t < t_dim:
                 cmp_indices_dummy[dummy_t : dummy_t + 1, :] = pl.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
-    o_proj_weight_dep = pl.system.task_dummy(deps=[])
+    unpacked_weight_dep = pl.system.task_dummy(deps=[])
+    wo_a_nz = pl.create_tensor([O_GROUPS, O_LORA, O_GROUP_IN], dtype=pl.BF16, layout=pl.NZ)
+    o_proj_weight_dep = pack_o_proj_a_weights(wo_a, wo_a_nz, unpacked_weight_dep)
     attn_out = sparse_attn_physical(
         q, kv_cache, swa_indices,
         cmp_kv_dummy, cmp_block_table_dummy, local_request_ids,
@@ -222,7 +225,7 @@ def _prefill_attention_swa(
         valid_block_mask,
         attn_sink,
         inverse_rope, inverse_swap_idx, inverse_ready,
-        wo_a, wo_b, wo_b_scale, attn_out, o_proj_weight_dep,
+        wo_a_nz, wo_b, wo_b_scale, attn_out, o_proj_weight_dep,
     )
 
     hc_post(attn_out, x_hc, post, comb, x_out, pl.const(-1, pl.INT32), T_TILE=16)
@@ -243,7 +246,7 @@ def prefill_attention_swa_cp_core(
     position_ids_local: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
     local_request_ids: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
     wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out_local: pl.Tensor[[CP_Q_T_DYN, D], pl.BF16],
@@ -362,6 +365,7 @@ def prefill_attention_swa_cp_local(
     inverse_ready: pl.Scalar[pl.TASK_ID],
 ):
     """Run SWA with local HC state and replicated projected KV."""
+    wo_a_nz = pl.create_tensor([O_GROUPS, O_LORA, O_GROUP_IN], dtype=pl.BF16, layout=pl.NZ)
     if TP_SIZE > 1:
         weight_published, weight_waited = _begin_o_proj_full_weights_gather(
             wo_a_local, wo_b_local,
@@ -372,7 +376,7 @@ def prefill_attention_swa_cp_local(
     else:
         o_proj_weight_dep = gather_o_proj_full_weights(
             wo_a_local, wo_b_local,
-            wo_a_full, wo_b_full,
+            wo_a_full, wo_a_nz, wo_b_full,
             o_proj_wo_a_window, o_proj_wo_b_window,
             o_proj_weight_ready, o_proj_weight_consumed,
             o_proj_order_fence,
@@ -395,7 +399,7 @@ def prefill_attention_swa_cp_local(
     if TP_SIZE > 1:
         o_proj_weight_dep = _finish_o_proj_full_weights_gather(
             wo_a_local, wo_b_local,
-            wo_a_full, wo_b_full,
+            wo_a_full, wo_a_nz, wo_b_full,
             o_proj_wo_a_window, o_proj_wo_b_window,
             o_proj_weight_consumed, o_proj_order_fence,
             group_base, tp_rank, weight_published, weight_waited, norm_ready_tid,
@@ -427,7 +431,7 @@ def prefill_attention_swa_cp_local(
         ori_slot_mapping_full,
         position_ids_local, local_request_ids,
         attn_sink,
-        wo_a_full, wo_b_full, wo_b_scale,
+        wo_a_nz, wo_b_full, wo_b_scale,
         attn_out_local,
         projection_done, o_proj_weight_dep,
         inverse_rope, inverse_swap_idx, inverse_ready,

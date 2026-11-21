@@ -72,6 +72,7 @@ from prefill_o_proj import (
     O_PROJ_WO_B_WINDOW_ROWS,
     _begin_o_proj_full_weights_gather,
     _finish_o_proj_full_weights_gather,
+    pack_o_proj_a_weights,
 )
 
 if TP_SIZE == 1:
@@ -301,14 +302,16 @@ def _prefill_attention_hca(
                 ready_bit = ready_bit + cmp_ready_value
         pl.write(cache_ready_fence, [0], ready_bit)
 
-    o_proj_weight_dep = pl.system.task_dummy(deps=[])
+    unpacked_weight_dep = pl.system.task_dummy(deps=[])
+    wo_a_nz = pl.create_tensor([O_GROUPS, O_LORA, O_GROUP_IN], dtype=pl.BF16, layout=pl.NZ)
+    o_proj_weight_dep = pack_o_proj_a_weights(wo_a, wo_a_nz, unpacked_weight_dep)
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     with pl.spmd(t_dim, name_hint="prefill_hca_pad_output_init") as pad_output_tid:
         pad_t = pl.tile.get_block_idx()
         if pl.read(local_request_ids, [pad_t]) < 0:
             attn_out[pad_t : pad_t + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
-    # Serial chain over requests. A pl.range body is its own scope, so the carry
-    # must be an array outliving it, not a Python name naming a dead local.
+    # Use the padded output's view for the request loop.
+    request_out = pl.slice(attn_out, [t_dim, D], [0, 0])
     request_deps = pl.array.create(1, pl.TASK_ID)
     request_deps[0] = pl.system.task_dummy(deps=[cache_ready_dep, pad_output_tid])
     request_count = pl.tensor.dim(query_start_loc, 0) - 1
@@ -323,8 +326,8 @@ def _prefill_attention_hca(
                 cmp_kv, cmp_block_table[request],
                 position_ids, attn_sink,
                 inverse_rope, inverse_swap_idx, inverse_ready,
-                wo_a, wo_b, wo_b_scale,
-                attn_out,
+                wo_a_nz, wo_b, wo_b_scale,
+                request_out,
                 request_deps[0],
                 o_proj_weight_dep,
                 request_start,
@@ -854,7 +857,7 @@ def prefill_attention_hca_cp_core(
     cmp_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
     state_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
     wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out_local: pl.Tensor[[CP_Q_T_DYN, D], pl.BF16],
@@ -940,7 +943,8 @@ def prefill_attention_hca_cp_core(
             if pl.tile.read(ids, [0, row]) < 0:
                 pad_row = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
                 pl.store(pad_row, [pad_start + row, 0], attn_out_local)
-    # Serial chain over requests, array carry as in the non-CP path above.
+    # Use the padded output's view for the request loop.
+    request_out = pl.slice(attn_out_local, [q_dim, D], [0, 0])
     request_deps = pl.array.create(1, pl.TASK_ID)
     request_deps[0] = pl.system.task_dummy(deps=[cache_ready_dep, pad_output_tid])
     request_count = pl.tensor.dim(request_ranges, 0)
@@ -955,7 +959,7 @@ def prefill_attention_hca_cp_core(
                 position_ids_local, attn_sink,
                 inverse_rope, inverse_swap_idx, inverse_ready,
                 wo_a, wo_b, wo_b_scale,
-                attn_out_local,
+                request_out,
                 request_deps[0],
                 o_proj_weight_dep,
                 local_start,
@@ -1025,6 +1029,7 @@ def prefill_attention_hca_cp_local(
     inverse_ready: pl.Scalar[pl.TASK_ID],
 ):
     """Run HCA with local HC state and gathered KV and compressor projections."""
+    wo_a_nz = pl.create_tensor([O_GROUPS, O_LORA, O_GROUP_IN], dtype=pl.BF16, layout=pl.NZ)
     if TP_SIZE > 1:
         weight_published, weight_waited = _begin_o_proj_full_weights_gather(
             wo_a_local, wo_b_local,
@@ -1035,7 +1040,7 @@ def prefill_attention_hca_cp_local(
     else:
         o_proj_weight_dep = gather_o_proj_full_weights(
             wo_a_local, wo_b_local,
-            wo_a_full, wo_b_full,
+            wo_a_full, wo_a_nz, wo_b_full,
             o_proj_wo_a_window, o_proj_wo_b_window,
             o_proj_weight_ready, o_proj_weight_consumed,
             o_proj_order_fence,
@@ -1058,7 +1063,7 @@ def prefill_attention_hca_cp_local(
     if TP_SIZE > 1:
         o_proj_weight_dep = _finish_o_proj_full_weights_gather(
             wo_a_local, wo_b_local,
-            wo_a_full, wo_b_full,
+            wo_a_full, wo_a_nz, wo_b_full,
             o_proj_wo_a_window, o_proj_wo_b_window,
             o_proj_weight_consumed, o_proj_order_fence,
             group_base, tp_rank, weight_published, weight_waited, norm_ready_tid,
@@ -1148,7 +1153,7 @@ def prefill_attention_hca_cp_local(
         q, request_ranges, local_request_ids,
         compress_state, kv_cache, ori_block_table, cmp_kv, cmp_block_table,
         position_ids_local, position_ids_full, cmp_slot_mapping_full, state_slot_mapping_full,
-        attn_sink, wo_a_full, wo_b_full, wo_b_scale, attn_out_local, cache_update_tid, o_proj_weight_dep,
+        attn_sink, wo_a_nz, wo_b_full, wo_b_scale, attn_out_local, cache_update_tid, o_proj_weight_dep,
         inverse_rope, inverse_swap_idx, inverse_ready,
     )
 
