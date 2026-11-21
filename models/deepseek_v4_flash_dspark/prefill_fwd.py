@@ -38,6 +38,7 @@ from moe import (
     prefill_moe_local,
 )
 from config import FLASH as MODEL_CONFIG
+from prefill_sparse_attn import prepare_sparse_attn_rope
 from prefill_swa import (
     build_cp_tensor_specs as build_swa_attention_tensor_specs,
     build_ragged2_cp_tensor_specs as build_swa_ragged2_tensor_specs,
@@ -450,6 +451,14 @@ def prefill_fwd(
             csa_inner_state_slot_mapping_full, csa_plan,
         )
 
+    # Query frequencies are shared by layer kind for this forward.
+    swa_inverse, swa_swap_idx, swa_rope_ready = prepare_sparse_attn_rope(
+        swa_freqs_cos, swa_freqs_sin, local_start, local_tokens, group_tokens,
+    )
+    compressed_inverse, compressed_swap_idx, compressed_rope_ready = prepare_sparse_attn_rope(
+        compressed_freqs_cos, compressed_freqs_sin, local_start, local_tokens, group_tokens,
+    )
+
     # Local HC state and FFN coefficient views.
     hc_elements_local = local_tokens * HC_MULT * D
     hidden_elements_local = local_tokens * D
@@ -544,6 +553,7 @@ def prefill_fwd(
                     o_proj_weight_ready, o_proj_weight_consumed,
                     layer_completion,
                     group_base, tp_rank, layer_l0 + pl.const(1, pl.INT32),
+                    swa_inverse, swa_swap_idx, swa_rope_ready,
                 )
 
         with pl.scope():
@@ -635,6 +645,7 @@ def prefill_fwd(
                     o_proj_weight_ready, o_proj_weight_consumed,
                     layer_completion,
                     group_base, tp_rank, layer_l1 + pl.const(1, pl.INT32),
+                    swa_inverse, swa_swap_idx, swa_rope_ready,
                 )
 
         with pl.scope():
@@ -797,6 +808,7 @@ def prefill_fwd(
                         o_proj_weight_ready, o_proj_weight_consumed,
                         layer_completion,
                         group_base, tp_rank, csa_layer + pl.const(1, pl.INT32), csa_compact,
+                        compressed_inverse, compressed_swap_idx, compressed_rope_ready,
                     )
 
             with pl.scope():
@@ -926,6 +938,7 @@ def prefill_fwd(
                         o_proj_weight_ready, o_proj_weight_consumed,
                         layer_completion,
                         group_base, tp_rank, hca_layer + pl.const(1, pl.INT32),
+                        compressed_inverse, compressed_swap_idx, compressed_rope_ready,
                     )
 
             with pl.scope():
@@ -1093,6 +1106,7 @@ def prefill_fwd(
                     o_proj_weight_ready, o_proj_weight_consumed,
                     layer_completion,
                     group_base, tp_rank, layer_last + pl.const(1, pl.INT32), csa_compact,
+                    compressed_inverse, compressed_swap_idx, compressed_rope_ready,
                 )
 
         with pl.scope():

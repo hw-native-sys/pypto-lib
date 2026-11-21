@@ -36,6 +36,7 @@ PREFILL_RING_HEAP = (1024 * 1024 * 1024,) * 4
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("PREFILL_ATTN_T_DYN")
+SPARSE_ROPE_ROWS = pl.dynamic("PREFILL_SPARSE_ROPE_ROWS")
 ORI_BLOCK_NUM_DYN = pl.dynamic("PREFILL_ORI_BLOCK_NUM_DYN")
 CMP_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CMP_BLOCK_NUM_DYN")
 
@@ -140,48 +141,51 @@ assert O_PROJ_PAD_ROWS % QUANT_TOKEN_TILE == 0
 assert O_PROJ_PAD_ROWS % PROJ_B_ACT_TASK_T_TILE == 0
 
 @pl.jit.inline(auto_scope=False)
-def _prepare_sparse_attn_rope(
+def prepare_sparse_attn_rope(
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    rope_cos_il: pl.Tensor[[T_PAD, ROPE_DIM], pl.FP32],
-    rope_sin_signed: pl.Tensor[[T_PAD, ROPE_DIM], pl.FP32],
-    rope_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
-    tile_base: pl.Scalar[pl.INDEX],
-    tile_rows: pl.Scalar[pl.INDEX],
-    input_ready_dep: pl.Scalar[pl.TASK_ID],
-) -> pl.Scalar[pl.TASK_ID]:
-    """Build one dense tile of inverse-RoPE tables."""
-    rope_cs_blocks = (tile_rows + ROPE_CS_T_TILE - 1) // ROPE_CS_T_TILE
-    with pl.spmd(ROPE_HALF // ROPE_TILE, name_hint="rope_cs", deps=[input_ready_dep]) as rope_cs_tid:
-        cp = pl.tile.get_block_idx()
-        cp_r0 = cp * ROPE_TILE
-        cp_c0 = 2 * cp_r0
+    source_base: pl.Scalar[pl.INDEX],
+    rows: pl.Scalar[pl.INDEX],
+    active: pl.Scalar[pl.INT32],
+):
+    """Prepare inverse RoPE coefficients for one local physical query interval."""
+    row_blocks = (rows + ROPE_CS_T_TILE - 1) // ROPE_CS_T_TILE
+    inverse_rope = pl.create_tensor([row_blocks * ROPE_CS_T_TILE, 2 * ROPE_DIM], dtype=pl.FP32)
+    inverse_swap_idx = pl.create_tensor([HEAD_TILE, ROPE_DIM], dtype=pl.INT32)
+    ready = pl.array.create(1, pl.TASK_ID)
+    if active > 0:
+        with pl.spmd(row_blocks * (ROPE_HALF // ROPE_TILE), name_hint="prefill_inverse_rope") as prepared:
+            block = pl.tile.get_block_idx()
+            cp = block % (ROPE_HALF // ROPE_TILE)
+            row_block = block // (ROPE_HALF // ROPE_TILE)
+            cp_r0 = cp * ROPE_TILE
+            cp_c0 = 2 * cp_r0
 
-        swap_ones = pl.full([HEAD_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
-        swap_ramp = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
-        swap_col = pl.col_expand_mul(swap_ones, swap_ramp)
-        swap_dup_i32 = pl.cast(pl.mul(swap_col, 0.5), target_type=pl.INT32, mode="trunc")
-        swap_dup_f = pl.cast(swap_dup_i32, target_type=pl.FP32)
-        swap_lane = pl.sub(swap_col, pl.mul(swap_dup_f, 2.0))  # j%2
-        swap_pair_f = pl.sub(pl.add(swap_col, 1.0), pl.mul(swap_lane, 2.0))  # j^1
-        swap_idx = pl.cast(swap_pair_f, target_type=pl.INT32)
-        rope_swap_idx[:, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = swap_idx[
-            :, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE
-        ]
+            if row_block == 0:
+                swap_ones = pl.full([HEAD_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
+                swap_ramp = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
+                swap_col = pl.col_expand_mul(swap_ones, swap_ramp)
+                swap_dup_i32 = pl.cast(pl.mul(swap_col, 0.5), target_type=pl.INT32, mode="trunc")
+                swap_dup_f = pl.cast(swap_dup_i32, target_type=pl.FP32)
+                swap_lane = pl.sub(swap_col, pl.mul(swap_dup_f, 2.0))  # j%2
+                swap_pair_f = pl.sub(pl.add(swap_col, 1.0), pl.mul(swap_lane, 2.0))  # j^1
+                swap_idx = pl.cast(swap_pair_f, target_type=pl.INT32)
+                inverse_swap_idx[:, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = swap_idx[
+                    :, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE
+                ]
 
-        cs_ones = pl.full([ROPE_CS_T_TILE, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0)
-        cs_ramp_i32 = pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32)
-        cs_ramp = pl.cast(cs_ramp_i32, target_type=pl.FP32)
-        cs_col = pl.col_expand_mul(cs_ones, cs_ramp)
-        cs_dup_i32 = pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc")
-        cs_dup_f = pl.cast(cs_dup_i32, target_type=pl.FP32)
-        cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)  # j>>1
-        cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))  # j%2
-        cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))  # [+1,-1,...]
-        for cs_rb in pl.range(rope_cs_blocks):
-            cs_local_t0 = cs_rb * ROPE_CS_T_TILE
-            cs_t0 = tile_base + cs_local_t0
-            cs_rows = pl.min(ROPE_CS_T_TILE, tile_rows - cs_local_t0)
+            cs_ones = pl.full([ROPE_CS_T_TILE, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0)
+            cs_ramp_i32 = pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32)
+            cs_ramp = pl.cast(cs_ramp_i32, target_type=pl.FP32)
+            cs_col = pl.col_expand_mul(cs_ones, cs_ramp)
+            cs_dup_i32 = pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc")
+            cs_dup_f = pl.cast(cs_dup_i32, target_type=pl.FP32)
+            cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)  # j>>1
+            cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))  # j%2
+            cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))  # [+1,-1,...]
+            cs_local_t0 = row_block * ROPE_CS_T_TILE
+            cs_t0 = source_base + cs_local_t0
+            cs_rows = pl.min(ROPE_CS_T_TILE, rows - cs_local_t0)
             cs_cos_rows = pl.slice(
                 freqs_cos,
                 [ROPE_CS_T_TILE, ROPE_TILE],
@@ -199,15 +203,18 @@ def _prepare_sparse_attn_rope(
             cs_cos_il = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
             cs_sin_il = pl.gather(cs_sin, dim=-1, index=cs_dup_idx)
             cs_sin_signed = pl.mul(cs_sin_il, cs_sign)
-            rope_cos_il[
+            inverse_rope[
                 cs_local_t0 : cs_local_t0 + ROPE_CS_T_TILE,
                 cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE,
             ] = cs_cos_il
-            rope_sin_signed[
+            inverse_rope[
                 cs_local_t0 : cs_local_t0 + ROPE_CS_T_TILE,
-                cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE,
+                ROPE_DIM + cp_c0 : ROPE_DIM + cp_c0 + ROPE_INTERLEAVE_TILE,
             ] = cs_sin_signed
-    return rope_cs_tid
+        ready[0] = prepared
+    else:
+        ready[0] = pl.system.task_dummy(deps=[])
+    return inverse_rope, inverse_swap_idx, ready[0]
 
 
 @pl.jit.inline
@@ -229,9 +236,9 @@ def _hca_panel_probabilities(
 def _hca_merge_packed_heads(
     running_m: pl.Tile[[QK_M_TILE // 2, 1], pl.FP32], running_l: pl.Tile[[QK_M_TILE // 2, 1], pl.FP32],
     running_left: pl.Tile[[QK_M_TILE // 2, HEAD_DIM // 2], pl.FP32], running_right: pl.Tile[[QK_M_TILE // 2, HEAD_DIM // 2], pl.FP32],
-    first_head: pl.Scalar[pl.INDEX], qk_local_t: pl.Scalar[pl.INDEX], dense_query_base: pl.Scalar[pl.INDEX],
+    first_head: pl.Scalar[pl.INDEX], qk_local_t: pl.Scalar[pl.INDEX], dense_query_base: pl.Scalar[pl.INDEX], query_base: pl.Scalar[pl.INDEX],
     attn_sink_col: pl.Tensor, stream_state_m: pl.Tensor, stream_state_l: pl.Tensor, stream_heads: pl.Tensor,
-    rope_cos_il: pl.Tensor, rope_sin_signed: pl.Tensor, rope_swap_idx: pl.Tensor, o_packed_heads: pl.Tensor,
+    inverse_rope: pl.Tensor, inverse_swap_idx: pl.Tensor, o_packed_heads: pl.Tensor,
 ):
     # Merge the raw window with the compressed head halves in vector memory.
     raw_row = qk_local_t * H + first_head
@@ -245,9 +252,9 @@ def _hca_merge_packed_heads(
     sink_tile = pl.add(pl.sub(merged_m, merged_m), sink_values)
     denom = pl.add(merged_l, pl.exp(pl.sub(sink_tile, merged_m)))
     dense_row = dense_query_base + qk_local_t
-    cos_il = pl.load(rope_cos_il, [dense_row, 0], [1, ROPE_DIM], target_memory=pl.MemorySpace.Vec)
-    sin_signed = pl.load(rope_sin_signed, [dense_row, 0], [1, ROPE_DIM], target_memory=pl.MemorySpace.Vec)
-    swap = pl.load(rope_swap_idx, [0, 0], [HEADS_PER_GROUP, ROPE_DIM], target_memory=pl.MemorySpace.Vec)
+    cos_il = pl.load(inverse_rope, [query_base + qk_local_t, 0], [1, ROPE_DIM], target_memory=pl.MemorySpace.Vec)
+    sin_signed = pl.load(inverse_rope, [query_base + qk_local_t, ROPE_DIM], [1, ROPE_DIM], target_memory=pl.MemorySpace.Vec)
+    swap = pl.load(inverse_swap_idx, [0, 0], [HEADS_PER_GROUP, ROPE_DIM], target_memory=pl.MemorySpace.Vec)
     head_rows = pl.tile.arange(0, [1, HEADS_PER_GROUP], dtype=pl.INT32)
     head_offsets = pl.reshape(pl.mul(head_rows, HEAD_DIM // 2), [HEADS_PER_GROUP, 1])
     rope_offsets = pl.add(head_offsets, NOPE_DIM - HEAD_DIM // 2)
@@ -287,7 +294,7 @@ def _hca_merge_packed_heads(
 def _hca_short_panel_wave(
     q_flat: pl.Tensor, cmp_work_kv: pl.Tensor, cmp_work_valid: pl.Tensor, position_ids: pl.Tensor, attn_sink_col: pl.Tensor,
     stream_state_m: pl.Tensor, stream_state_l: pl.Tensor, stream_heads: pl.Tensor,
-    rope_cos_il: pl.Tensor, rope_sin_signed: pl.Tensor, rope_swap_idx: pl.Tensor, o_packed_heads: pl.Tensor,
+    inverse_rope: pl.Tensor, inverse_swap_idx: pl.Tensor, o_packed_heads: pl.Tensor,
     query_base: pl.Scalar[pl.INDEX], request_end: pl.Scalar[pl.INDEX], dense_query_base: pl.Scalar[pl.INDEX],
     raw_done: pl.Scalar[pl.TASK_ID],
 ) -> pl.Scalar[pl.TASK_ID]:
@@ -372,8 +379,8 @@ def _hca_short_panel_wave(
                         running_right = pl.add(pl.row_expand_mul(running_right, alpha), pl.row_expand_mul(pv_right, beta))
                         running_m = next_m
                     _hca_merge_packed_heads(
-                        running_m, running_l, running_left, running_right, qk_head_base + qk_lane_head, qk_local_t, dense_query_base,
-                        attn_sink_col, stream_state_m, stream_state_l, stream_heads, rope_cos_il, rope_sin_signed, rope_swap_idx, o_packed_heads,
+                        running_m, running_l, running_left, running_right, qk_head_base + qk_lane_head, qk_local_t, dense_query_base, query_base,
+                        attn_sink_col, stream_state_m, stream_state_l, stream_heads, inverse_rope, inverse_swap_idx, o_packed_heads,
                     )
     return short_tid
 
@@ -395,9 +402,8 @@ def _hca_streaming_wave(
     stream_state_m: pl.Tensor[[HCA_QUERY_TILE * H, 1], pl.FP32],
     stream_state_l: pl.Tensor[[HCA_QUERY_TILE * H, 1], pl.FP32],
     stream_heads: pl.Tensor[[HCA_QUERY_TILE * H, HEAD_DIM], pl.FP32],
-    rope_cos_il: pl.Tensor[[T_PAD, ROPE_DIM], pl.FP32],
-    rope_sin_signed: pl.Tensor[[T_PAD, ROPE_DIM], pl.FP32],
-    rope_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
+    inverse_rope: pl.Tensor[[SPARSE_ROPE_ROWS, 2 * ROPE_DIM], pl.FP32],
+    inverse_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
     raw_consumed: pl.Array[1, pl.TASK_ID],
     wave_completion: pl.Array[1, pl.TASK_ID],
     request_offset: pl.Scalar[pl.INDEX],
@@ -550,13 +556,13 @@ def _hca_streaming_wave(
     if panel_count <= 1:
         short_done = _hca_short_panel_wave(
             q_flat, cmp_work_kv, cmp_work_valid, position_ids, attn_sink_col, stream_state_m, stream_state_l, stream_heads,
-            rope_cos_il, rope_sin_signed, rope_swap_idx, o_packed_heads, query_base, request_end, dense_query_base, raw_heads_tid,
+            inverse_rope, inverse_swap_idx, o_packed_heads, query_base, request_end, dense_query_base, raw_heads_tid,
         )
         wave_completion[0] = short_done
     else:
         general_done = _hca_multi_panel_wave(
             q_flat, cmp_work_kv, cmp_work_valid, position_ids, attn_sink_col,
-            stream_state_m, stream_state_l, stream_heads, rope_cos_il, rope_sin_signed, rope_swap_idx, o_packed_heads,
+            stream_state_m, stream_state_l, stream_heads, inverse_rope, inverse_swap_idx, o_packed_heads,
             query_base, request_end, dense_query_base, raw_heads_tid,
         )
         wave_completion[0] = general_done
@@ -566,7 +572,7 @@ def _hca_streaming_wave(
 def _hca_multi_panel_wave(
     q_flat: pl.Tensor, cmp_work_kv: pl.Tensor, cmp_work_valid: pl.Tensor, position_ids: pl.Tensor, attn_sink_col: pl.Tensor,
     stream_state_m: pl.Tensor, stream_state_l: pl.Tensor, stream_heads: pl.Tensor,
-    rope_cos_il: pl.Tensor, rope_sin_signed: pl.Tensor, rope_swap_idx: pl.Tensor, o_packed_heads: pl.Tensor,
+    inverse_rope: pl.Tensor, inverse_swap_idx: pl.Tensor, o_packed_heads: pl.Tensor,
     query_base: pl.Scalar[pl.INDEX], request_end: pl.Scalar[pl.INDEX], dense_query_base: pl.Scalar[pl.INDEX],
     raw_done: pl.Scalar[pl.TASK_ID],
 ) -> pl.Scalar[pl.TASK_ID]:
@@ -695,8 +701,8 @@ def _hca_multi_panel_wave(
                         m_after, l_after, left_after, right_after = pl.yield_(m_iter, l_iter, left_iter, right_iter)
                     running_m, running_l, running_left, running_right = pl.yield_(m_after, l_after, left_after, right_after)
                 _hca_merge_packed_heads(
-                    running_m, running_l, running_left, running_right, qk_head_base + qk_lane_head, qk_local_t, dense_query_base,
-                    attn_sink_col, stream_state_m, stream_state_l, stream_heads, rope_cos_il, rope_sin_signed, rope_swap_idx, o_packed_heads,
+                    running_m, running_l, running_left, running_right, qk_head_base + qk_lane_head, qk_local_t, dense_query_base, query_base,
+                    attn_sink_col, stream_state_m, stream_state_l, stream_heads, inverse_rope, inverse_swap_idx, o_packed_heads,
                 )
 
     return cmp_qk_tid
@@ -713,8 +719,9 @@ def _hca_streaming_attn_tile(
     attn_sink: pl.Tensor[[H], pl.FP32],
     request_offset: pl.Scalar[pl.INDEX],
     active_rows: pl.Scalar[pl.INDEX],
-    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    inverse_rope: pl.Tensor[[SPARSE_ROPE_ROWS, 2 * ROPE_DIM], pl.FP32],
+    inverse_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
+    inverse_ready: pl.Scalar[pl.TASK_ID],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
@@ -760,15 +767,6 @@ def _hca_streaming_attn_tile(
                             gather_page_kv = pl.load(cmp_kv_flat, [gather_src, 0], [HCA_CMP_STORAGE_BLOCK_SIZE, HEAD_DIM])
                             pl.store(gather_page_kv, [gather_dst, 0], cmp_work_kv)
 
-        rope_cos_il = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
-        rope_sin_signed = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
-        rope_swap_idx = pl.create_tensor([HEAD_TILE, ROPE_DIM], dtype=pl.INT32, manual_dep=True)
-        rope_cs_tid = _prepare_sparse_attn_rope(
-            freqs_cos, freqs_sin,
-            rope_cos_il, rope_sin_signed, rope_swap_idx,
-            request_offset + tile_base, tile_rows,
-            packed_init_tid,
-        )
 
         # Raw KV is reusable after raw QK/PV. The partial statistics stay live through merge.
         raw_kv = pl.create_tensor([HCA_QUERY_TILE * WIN, HEAD_DIM], dtype=pl.BF16)
@@ -778,7 +776,7 @@ def _hca_streaming_attn_tile(
         stream_state_l = pl.create_tensor([HCA_QUERY_TILE * H, 1], dtype=pl.FP32)
         stream_heads = pl.create_tensor([HCA_QUERY_TILE * H, HEAD_DIM], dtype=pl.FP32)
         wave_completion = pl.array.create(1, pl.TASK_ID)
-        wave_ready_tid = pl.system.task_dummy(deps=[cmp_gather_tid, rope_cs_tid])
+        wave_ready_tid = pl.system.task_dummy(deps=[cmp_gather_tid, inverse_ready])
         raw_consumed = pl.array.create(1, pl.TASK_ID)
         raw_consumed[0] = wave_ready_tid
         wave_completion[0] = wave_ready_tid
@@ -790,7 +788,7 @@ def _hca_streaming_attn_tile(
                 o_packed_heads,
                 raw_kv, raw_valid, raw_offsets,
                 stream_state_m, stream_state_l, stream_heads,
-                rope_cos_il, rope_sin_signed, rope_swap_idx,
+                inverse_rope, inverse_swap_idx,
                 raw_consumed, wave_completion, request_offset, tile_base, dense_query_base, panel_count,
             )
 
@@ -822,9 +820,8 @@ def _sparse_attn_wave(
     o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16],
     sparse_kv: pl.Tensor[[PREFILL_QUERY_TILE * PREFILL_SPARSE_PAD, HEAD_DIM], pl.BF16],
     sparse_bias: pl.Tensor[[PREFILL_QUERY_TILE, PREFILL_SPARSE_PAD], pl.FP32],
-    rope_cos_il: pl.Tensor[[T_PAD, ROPE_DIM], pl.FP32],
-    rope_sin_signed: pl.Tensor[[T_PAD, ROPE_DIM], pl.FP32],
-    rope_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
+    inverse_rope: pl.Tensor[[SPARSE_ROPE_ROWS, 2 * ROPE_DIM], pl.FP32],
+    inverse_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
     prior_wave_tid: pl.Scalar[pl.TASK_ID],
     query_base: pl.Scalar[pl.INDEX],
     dense_query_base: pl.Scalar[pl.INDEX],
@@ -1085,9 +1082,9 @@ def _sparse_attn_wave(
                 sink_tile = pl.add(pl.sub(running_m, running_m), sink_values)
                 denom = pl.add(running_l, pl.exp(pl.sub(sink_tile, running_m)))
                 dense_row = dense_query_base + qk_local_t
-                cos_il = pl.load(rope_cos_il, [dense_row, 0], [1, ROPE_DIM], target_memory=pl.MemorySpace.Vec)
-                sin_signed = pl.load(rope_sin_signed, [dense_row, 0], [1, ROPE_DIM], target_memory=pl.MemorySpace.Vec)
-                swap = pl.load(rope_swap_idx, [0, 0], [HEADS_PER_GROUP, ROPE_DIM], target_memory=pl.MemorySpace.Vec)
+                cos_il = pl.load(inverse_rope, [qk_t, 0], [1, ROPE_DIM], target_memory=pl.MemorySpace.Vec)
+                sin_signed = pl.load(inverse_rope, [qk_t, ROPE_DIM], [1, ROPE_DIM], target_memory=pl.MemorySpace.Vec)
+                swap = pl.load(inverse_swap_idx, [0, 0], [HEADS_PER_GROUP, ROPE_DIM], target_memory=pl.MemorySpace.Vec)
                 head_rows = pl.tile.arange(0, [1, HEADS_PER_GROUP], dtype=pl.INT32)
                 head_offsets = pl.reshape(pl.mul(head_rows, HEAD_DIM // 2), [HEADS_PER_GROUP, 1])
                 rope_offsets = pl.add(head_offsets, NOPE_DIM - HEAD_DIM // 2)
@@ -1129,8 +1126,9 @@ def _sparse_attn_heads(
     valid_block_mask: pl.Tensor[[T_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     active_rows: pl.Scalar[pl.INDEX],
-    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    inverse_rope: pl.Tensor[[SPARSE_ROPE_ROWS, 2 * ROPE_DIM], pl.FP32],
+    inverse_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
+    inverse_ready: pl.Scalar[pl.TASK_ID],
     o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16],
     packed_init_tid: pl.Scalar[pl.TASK_ID],
     tile_base: pl.Scalar[pl.INDEX],
@@ -1150,20 +1148,7 @@ def _sparse_attn_heads(
             [PREFILL_QUERY_TILE, PREFILL_SPARSE_PAD],
             dtype=pl.FP32,
         )
-        rope_cos_il = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
-        rope_sin_signed = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
-        rope_swap_idx = pl.create_tensor([HEAD_TILE, ROPE_DIM], dtype=pl.INT32, manual_dep=True)
-        rope_cs_tid = _prepare_sparse_attn_rope(
-            freqs_cos,
-            freqs_sin,
-            rope_cos_il,
-            rope_sin_signed,
-            rope_swap_idx,
-            tile_base,
-            tile_rows,
-            packed_init_tid,
-        )
-        ready_tid = pl.system.task_dummy(deps=[packed_init_tid, rope_cs_tid])
+        ready_tid = pl.system.task_dummy(deps=[packed_init_tid, inverse_ready])
         wave_tids[0] = ready_tid
         for query_block in pl.unroll(PREFILL_QUERY_BLOCKS):
             dense_query_base = query_block * PREFILL_QUERY_TILE
@@ -1185,9 +1170,7 @@ def _sparse_attn_heads(
                     o_packed_heads,
                     sparse_kv,
                     sparse_bias,
-                    rope_cos_il,
-                    rope_sin_signed,
-                    rope_swap_idx,
+                    inverse_rope, inverse_swap_idx,
                     prior_wave_tid,
                     query_base,
                     dense_query_base,
@@ -1371,8 +1354,9 @@ def hca_streaming_attn_physical(
     cmp_block_table: pl.Tensor[[HCA_CMP_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    inverse_rope: pl.Tensor[[SPARSE_ROPE_ROWS, 2 * ROPE_DIM], pl.FP32],
+    inverse_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
+    inverse_ready: pl.Scalar[pl.TASK_ID],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
@@ -1432,7 +1416,7 @@ def hca_streaming_attn_physical(
                 q, ori_kv, swa_indices,
                 cmp_kv, cmp_block_table,
                 position_ids, attn_sink, request_offset, active_rows,
-                freqs_cos, freqs_sin,
+                inverse_rope, inverse_swap_idx, inverse_ready,
                 wo_a, wo_b, wo_b_scale,
                 attn_out,
                 o_packed_heads, packed_init_tid, o_proj_weight_dep,
@@ -1460,8 +1444,9 @@ def sparse_attn_compute(
     valid_block_mask: pl.Tensor[[T_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     active_rows: pl.Scalar[pl.INDEX],
-    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    inverse_rope: pl.Tensor[[SPARSE_ROPE_ROWS, 2 * ROPE_DIM], pl.FP32],
+    inverse_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
+    inverse_ready: pl.Scalar[pl.TASK_ID],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
@@ -1503,8 +1488,7 @@ def sparse_attn_compute(
                 valid_block_mask,
                 attn_sink,
                 active_rows,
-                freqs_cos,
-                freqs_sin,
+                inverse_rope, inverse_swap_idx, inverse_ready,
                 o_packed_heads,
                 packed_init_tid,
                 tile_base,
@@ -1535,8 +1519,9 @@ def sparse_attn_physical(
     cmp_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
     valid_block_mask: pl.Tensor[[T_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    inverse_rope: pl.Tensor[[SPARSE_ROPE_ROWS, 2 * ROPE_DIM], pl.FP32],
+    inverse_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
+    inverse_ready: pl.Scalar[pl.TASK_ID],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
@@ -1556,8 +1541,7 @@ def sparse_attn_physical(
         valid_block_mask,
         attn_sink,
         active_rows,
-        freqs_cos,
-        freqs_sin,
+        inverse_rope, inverse_swap_idx, inverse_ready,
         wo_a,
         wo_b,
         wo_b_scale,
@@ -1596,6 +1580,9 @@ def prefill_sparse_attn_test(
     freqs_sin.bind_dynamic(0, T_DYN)
     attn_out.bind_dynamic(0, T_DYN)
     o_proj_weight_dep = pl.system.task_dummy(deps=[])
+    inverse_rope, inverse_swap_idx, inverse_ready = prepare_sparse_attn_rope(
+        freqs_cos, freqs_sin, pl.const(0, pl.INDEX), pl.tensor.dim(q, 0), pl.const(1, pl.INT32),
+    )
     return sparse_attn_physical(
         q,
         ori_kv,
@@ -1606,8 +1593,7 @@ def prefill_sparse_attn_test(
         cmp_indices,
         valid_block_mask,
         attn_sink,
-        freqs_cos,
-        freqs_sin,
+        inverse_rope, inverse_swap_idx, inverse_ready,
         wo_a,
         wo_b,
         wo_b_scale,
