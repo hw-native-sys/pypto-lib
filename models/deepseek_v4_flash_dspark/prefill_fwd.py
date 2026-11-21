@@ -91,7 +91,7 @@ from prefill_cp_token_allgather import (
     PREFILL_GROUP_CAP,
     TP_SIZE,
     prefill_cp_materialize_hc_full,
-    prefill_cp_materialize_coeff_full,
+    prefill_cp_materialize_ffn_coeffs,
     prefill_cp_token_allgather_into,
 )
 from prefill_metadata import (
@@ -111,6 +111,7 @@ from prefill_o_proj import (
     retire_o_proj_weight_signals,
 )
 from hc_head import hc_head
+from hc_post import hc_post
 from lm_head import (
     GRAMMAR_SEGMENT_WORDS,
     GREEDY_GRID_ROWS,
@@ -1139,21 +1140,28 @@ def prefill_fwd(
     with pl.scope():
         if group_tokens > 0:
             materialize_ready_tid = pl.system.task_dummy(deps=[])
-            hc_full_tid = prefill_cp_materialize_hc_full(
-                x_hc_local, x_hc, gather_window, gather_signal, group_base, tp_rank, materialize_ready_tid,
-            )
+            rebuild_hc = group_rows == PREFILL_GROUP_CAP and TP_SIZE > 1
+            if not rebuild_hc:
+                materialize_ready_tid = prefill_cp_materialize_hc_full(
+                    x_hc_local, x_hc, gather_window, gather_signal, group_base, tp_rank, materialize_ready_tid,
+                )
             attn_full_tid = prefill_cp_materialize_hc_full(
-                attn_stage_local, attn_stage, gather_window, gather_signal, group_base, tp_rank, hc_full_tid,
+                attn_stage_local, attn_stage, gather_window, gather_signal, group_base, tp_rank, materialize_ready_tid,
             )
             mixed_full_tid = prefill_cp_token_allgather_into(
                 x_mixed_local, x_mixed, gather_window, gather_signal, group_base, tp_rank, attn_full_tid,
             )
-            post_full_tid = prefill_cp_materialize_coeff_full(
-                post_ffn_local, post_ffn, gather_window, gather_signal, group_base, tp_rank, mixed_full_tid,
+            coeffs_full_tid = prefill_cp_materialize_ffn_coeffs(
+                post_ffn_local, comb_ffn_local, post_ffn, comb_ffn,
+                gather_window, gather_signal, group_base, tp_rank, mixed_full_tid,
             )
-            prefill_cp_materialize_coeff_full(
-                comb_ffn_local, comb_ffn, gather_window, gather_signal, group_base, tp_rank, post_full_tid,
-            )
+            if rebuild_hc:
+                # Rebuild the final HC rows from the replicated residual and the narrow FFN output.
+                ffn_full = pl.create_tensor([group_rows, D], dtype=pl.BF16)
+                _ffn_full_tid = prefill_cp_token_allgather_into(
+                    ffn_out, ffn_full, gather_window, gather_signal, group_base, tp_rank, coeffs_full_tid,
+                )
+                hc_post(ffn_full, attn_stage, post_ffn, comb_ffn, x_hc, pl.const(-1, pl.INT32), T_TILE=16)
 
     # All head-group ranks participate, including ranks with no attention tokens.
     layer42_hidden = pl.create_tensor([group_rows, D], dtype=pl.BF16)
