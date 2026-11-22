@@ -113,6 +113,8 @@ def l2_prefill_layer_ffn(
     slab_pre = pl.create_tensor([2 * MOE_TOKENS, HC_MULT], dtype=pl.FP32)
     slab_mixed = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
     slab_rows = pl.create_tensor([MOE_TOKENS], dtype=pl.INT32)
+    recv_x_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.FP8E4M3FN)
+    recv_scale_local_backing = pl.create_tensor([1, N_LOCAL_EXPERTS * RECV_MAX * (D // MX_GROUP)], dtype=pl.FP8E8M0)
     with pl.spmd(32, name_hint="slab_mixed_zero") as initialized:
         worker = pl.tile.get_block_idx()
         for row in pl.range(worker, capacity, 32):
@@ -126,6 +128,7 @@ def l2_prefill_layer_ffn(
         next_pre_mix, ffn_input, output,
         recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
         routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, slab_rows,
+        recv_x_local, recv_scale_local_backing,
         initialized, active, ep_rank, moe_epoch, capacity=LOCAL_CAPACITY,
     )
     clear_moe_signals(output, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))

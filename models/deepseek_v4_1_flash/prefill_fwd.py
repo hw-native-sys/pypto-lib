@@ -677,6 +677,8 @@ def l2_prefill_fwd(
     slab_pre = pl.create_tensor([2 * MOE_TOKENS, HC_MULT], dtype=pl.FP32)
     slab_mixed = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
     slab_rows = pl.create_tensor([MOE_TOKENS], dtype=pl.INT32)
+    recv_x_local = pl.create_tensor([LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.FP8E4M3FN)
+    recv_scale_local_backing = pl.create_tensor([1, LOCAL_EXPERTS * RECV_MAX * (D // MX_GROUP)], dtype=pl.FP8E8M0)
     local_hidden = pl.create_tensor([LOCAL_CAPACITY, HC_MULT, D], dtype=pl.FP32)
     local_pre = pl.create_tensor([LOCAL_CAPACITY, HC_MULT], dtype=pl.FP32)
     local_next_hidden = pl.create_tensor([LOCAL_CAPACITY, HC_MULT, D], dtype=pl.FP32)
@@ -853,6 +855,7 @@ def l2_prefill_fwd(
             layer_shared_w3, layer_shared_w3_scale, local_next_pre, ffn_mixed, local_next_hidden,
             recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
             routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, slab_rows,
+            recv_x_local, recv_scale_local_backing,
             moe_ready, pl.read(q_counts, [stage]), rank, layer + 1, capacity=LOCAL_CAPACITY,
         )
         if CP_SIZE > 1:

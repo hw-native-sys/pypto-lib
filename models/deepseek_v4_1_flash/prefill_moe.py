@@ -80,6 +80,7 @@ VALIDATION_TOKENS = SLAB_CAPACITY if VALIDATE_SLABS else MOE_TOKENS
 
 # EP transport layout
 RECV_MAX = MOE_RECV_MAX
+MOE_ROUNDS_PER_BATCH = 8
 AUX_WIDTH = 8
 ROUTE_WIDTH = 8
 T = MOE_TOKENS
@@ -385,6 +386,8 @@ def prefill_moe(
     data_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
     routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
+    recv_x_local: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.FP8E4M3FN],
+    recv_scale_local_backing: pl.Tensor[[1, N_LOCAL_EXPERTS * RECV_MAX * K_SCALE], pl.FP8E8M0],
     num_tokens: pl.Scalar[pl.INT32],
     ep_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
@@ -426,9 +429,6 @@ def prefill_moe(
             shared_output,
         )
 
-        recv_x_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.FP8E4M3FN)
-        # Contiguous ND backing for the routed-expert MX_A_ZZ view.
-        recv_scale_local_backing = pl.create_tensor([1, N_LOCAL_EXPERTS * RECV_MAX * (D // MX_GROUP)], dtype=pl.FP8E8M0)
         recv_weight_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.FP32)
         recv_route_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.INT32)
         recv_count_local = pl.create_tensor([N_LOCAL_EXPERTS, 1], dtype=pl.INT32)
@@ -543,6 +543,8 @@ def prefill_moe_slabs(
     slab_pre: pl.Tensor[[2 * MOE_TOKENS, HC_MULT], pl.FP32],
     slab_mixed: pl.Tensor[[MOE_TOKENS, D], pl.BF16],
     slab_rows: pl.Tensor[[MOE_TOKENS], pl.INT32],
+    recv_x_local: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.FP8E4M3FN],
+    recv_scale_local_backing: pl.Tensor[[1, N_LOCAL_EXPERTS * RECV_MAX * K_SCALE], pl.FP8E8M0],
     reuse_ready: pl.Scalar[pl.TASK_ID],
     num_tokens: pl.Scalar[pl.INT32],
     ep_rank: pl.Scalar[pl.INT32],
@@ -553,10 +555,17 @@ def prefill_moe_slabs(
     source_hidden = pl.reshape(x_hc, [capacity, HC_DIM])
     round_completion = pl.array.create(1, pl.TASK_ID)
     round_completion[0] = reuse_ready
+    batch_epoch = pl.create_tensor([1], dtype=pl.INT32)
     owner_capacity = capacity
     owner_begin = 0
     rounds = (owner_capacity + MOE_TOKENS - 1) // MOE_TOKENS
     for round_id in pl.range(rounds):
+        epoch = pl.cast((moe_epoch - 1) * rounds + round_id + 1, pl.INT32)
+        if round_id % MOE_ROUNDS_PER_BATCH == 0:
+            # Let the previous batch retire its expert scratch before submitting more rounds.
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_batch_epoch", deps=[round_completion[0]]):
+                pl.write(batch_epoch, [0], epoch)
+            epoch = pl.read(batch_epoch, [0])
         begin = owner_begin + round_id * MOE_TOKENS
         rows = pl.min(MOE_TOKENS, owner_begin + owner_capacity - begin)
         # Keep caller-owned destinations outside the slab allocation scope.
@@ -589,7 +598,7 @@ def prefill_moe_slabs(
             bias_elements = bias_tile_rows * N_EXPERTS
             round_bias = pl.create_tensor([bias_elements], dtype=pl.FP32)
             gather_routing_bias(correction_bias, row_ids, round_bias, rows_ready, n_experts=N_EXPERTS)
-            epoch = (moe_epoch - 1) * rounds + round_id + 1
+            # The route gate consumes the rows gathered after the prior scatter.
             prefill_moe(
                 round_hidden, round_pre, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_weight,
                 gate_weight, round_bias,
@@ -597,7 +606,8 @@ def prefill_moe_slabs(
                 shared_w1, shared_w1_scale, shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
                 round_next, round_mixed, round_output,
                 recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
-                routed_output, combine_arrived, active, ep_rank, epoch,
+                routed_output, combine_arrived, recv_x_local, recv_scale_local_backing,
+                active, ep_rank, epoch,
             )
             with pl.spmd(32, name_hint="prefill_moe_results") as hidden_copied:
                 worker = pl.tile.get_block_idx()
@@ -665,6 +675,8 @@ def l2_prefill_moe(
     x_mixed.bind_dynamic(0, LOCAL_T_DYN)
     x_next.bind_dynamic(0, LOCAL_T_DYN)
     local_num_tokens = pl.read(num_tokens, [ep_rank])
+    recv_x_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.FP8E4M3FN)
+    recv_scale_local_backing = pl.create_tensor([1, N_LOCAL_EXPERTS * RECV_MAX * K_SCALE], dtype=pl.FP8E8M0)
     prefill_moe(
         x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_weight, gate_weight, correction_bias,
@@ -674,6 +686,7 @@ def l2_prefill_moe(
         next_pre_mix, x_mixed, x_next,
         recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
         arrived, data_arrived, routed_output, combine_arrived,
+        recv_x_local, recv_scale_local_backing,
         local_num_tokens, ep_rank, moe_epoch,
     )
     clear_moe_signals(x_next, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
@@ -725,6 +738,8 @@ def l2_prefill_moe_slabs(
     slab_pre = pl.create_tensor([2 * MOE_TOKENS, HC_MULT], dtype=pl.FP32)
     slab_mixed = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
     slab_rows = pl.create_tensor([MOE_TOKENS], dtype=pl.INT32)
+    recv_x_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.FP8E4M3FN)
+    recv_scale_local_backing = pl.create_tensor([1, N_LOCAL_EXPERTS * RECV_MAX * K_SCALE], dtype=pl.FP8E8M0)
     with pl.spmd(32, name_hint="slab_mixed_zero") as initialized:
         worker = pl.tile.get_block_idx()
         for row in pl.range(worker, capacity, 32):
@@ -738,6 +753,7 @@ def l2_prefill_moe_slabs(
         next_pre_mix, x_mixed, x_next,
         recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
         routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, slab_rows,
+        recv_x_local, recv_scale_local_backing,
         initialized, active, ep_rank, moe_epoch, capacity=SLAB_CAPACITY,
     )
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_slabs_complete", deps=[completed]):

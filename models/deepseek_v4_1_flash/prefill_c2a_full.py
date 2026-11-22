@@ -175,8 +175,15 @@ def prefill_c2a_full(
             compressed_latent, w_index_k, w_index_norm, compressed_rope_cos, compressed_rope_sin,
             compressed_write_slots, index_cache, index_cache_scale, kv_token_count, compressed_published, no_dependency,
         )
+        tile_active = pl.create_tensor([1], dtype=pl.INT32)
+        tile_completion = pl.array.create(1, pl.TASK_ID)
+        tile_completion[0] = no_dependency
         for start in pl.range(0, kv_token_count, Q_TILE):
-            active = pl.min(Q_TILE, kv_token_count - start)
+            remaining = pl.cast(pl.min(Q_TILE, kv_token_count - start), pl.INT32)
+            # Wait for the previous tile before submitting its successor.
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="c2a_query_tile_gate", deps=[tile_completion[0]]):
+                pl.write(tile_active, [0], remaining)
+            active = pl.read(tile_active, [0])
             chunk_hidden = pl.slice(kv_hidden, [active, D], [start, 0])
             chunk_rope_cos = pl.slice(kv_rope_cos, [active, ROPE_DIM // 2], [start, 0])
             chunk_rope_sin = pl.slice(kv_rope_sin, [active, ROPE_DIM // 2], [start, 0])
@@ -214,12 +221,13 @@ def prefill_c2a_full(
                 q, chunk_window_indices, window_cache, chunk_topk_indices, compressed_cache,
                 attn_sink, attn_out, active, compressed_keys=INDEX_TOPK,
             )
-            _chunk_output, _projection_done = o_proj_hc_post(
+            _chunk_output, projection_done = o_proj_hc_post(
                 attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_rope_cos, chunk_rope_sin,
                 hc_input[start:start + active, :, :], post_mix[start:start + active, :],
                 residual_mix[start:start + active, :, :], hc_output[start:start + active, :, :], active,
                 oa_row_tile=128, ob_row_tile=128,
             )
+            tile_completion[0] = projection_done
 
     if kv_token_count < q_capacity:
         with pl.spmd(32, name_hint="prefill_c2a_full_zero_padding"):
