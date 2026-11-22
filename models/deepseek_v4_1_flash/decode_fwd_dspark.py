@@ -403,24 +403,33 @@ def l2_decode_fwd_dspark(
         x_hc, pre_mix, target_hidden_padded,
         position_ids, request_ids, window_slots, window_indices, c2a_slots, c1a_slots, query_starts,
     )
-    sample_hidden = pl.reshape(local_x_hc, [PADDED_ROWS, HC_MULT, D])
-    sample_pre_mix = pl.reshape(local_pre_mix, [PADDED_ROWS, HC_MULT])
+    # A TP group exchanges vocabulary shards at one common panel stride.
+    # Sampling still consumes only the live prefix belonging to this rank.
+    live_rows = pl.max(1, pl.min(pl.read(attention_num_tokens, [rank]), TARGET_ROWS))
+    group_rows = live_rows
+    if LM_HEAD_TP_SIZE > 1:
+        tp_base = rank // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE
+        for peer in pl.unroll(LM_HEAD_TP_SIZE):
+            group_rows = pl.max(group_rows, pl.read(attention_num_tokens, [tp_base + peer]))
+    head_rows = (pl.min(group_rows, TARGET_ROWS) + 15) // 16 * 16
+    sample_hidden = local_x_hc[:head_rows, :, :]
+    sample_pre_mix = local_pre_mix[:head_rows, :]
     sample_tokens = pl.tensor.dim(sample_hidden, 0)
-    sample_collapsed = pl.create_tensor([PADDED_ROWS, D], dtype=pl.BF16)
+    sample_collapsed = pl.create_tensor([head_rows, D], dtype=pl.BF16)
     hc_head(sample_hidden, sample_pre_mix, sample_collapsed, worker_limit=64)
-    sample_normalized = pl.create_tensor([PADDED_ROWS, D], dtype=pl.BF16)
+    sample_normalized = pl.create_tensor([head_rows, D], dtype=pl.BF16)
     rms_norm(
         sample_collapsed, final_norm_weight, sample_normalized,
         sample_tokens, width=D, zero_tail=False,
     )
-    sample_logits = pl.create_tensor([PADDED_ROWS, VOCAB], dtype=pl.FP32)
+    sample_logits = pl.create_tensor([head_rows, VOCAB], dtype=pl.FP32)
     lm_head(
         sample_normalized, lm_head_weight, sample_row_indices, sample_logits,
         sampling_hidden_window, sampling_hidden_done, sampling_logits_window, sampling_logits_done,
         rank, PADDED_ROWS,
     )
     sample(
-        sample_logits[:TARGET_ROWS, :], sampling_temperatures, sampling_top_ks, sampling_top_ps,
+        sample_logits[:live_rows, :], sampling_temperatures, sampling_top_ks, sampling_top_ps,
         sampling_seeds, sampling_positions, target_sampled_ids,
     )
     markov_row_indices = pl.create_tensor([MARKOV_MAX_LOGIT_ROWS], dtype=pl.INT32)
