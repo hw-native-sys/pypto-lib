@@ -128,6 +128,16 @@ shards, and return results to the row owners.
 | Speculative decoding | [`decode_fwd_dspark.py`](../../../models/deepseek_v4_1_flash/decode_fwd_dspark.py), `dspark_drafter.py`, `dspark_init.py`, `decode_metadata.py`, `dspark_attn.py`, and `markov.py` |
 | Shared operators | `hc.py`, `qkv_proj_rope.py`, `compressor.py`, `sparse_attention.py`, `o_proj.py`, `engram.py`, `lm_head.py`, and `sample.py` |
 
+The standalone decode MoE entry and the direct DSpark decode entry pack
+eligible routed FP4 weights once before resident upload. Target and draft
+select their layouts independently. Capacities up to 80 rows use packed
+weights. At capacities 192 and 384, packing is enabled when
+`capacity * topk <= 96 * local_experts`. Other capacities use the ordinary
+layout. Logical checkpoint weights retain their existing shape and dtype. For DSpark, `--no-packed-routed-weights` selects the
+ordinary layout when compiling a new artifact. Replaying `--runtime-dir`
+uses the compiled argument shapes to select the matching upload layout.
+The imported forward modules keep the ordinary layout by default.
+
 The six standalone decode attention entries accept explicit request starts and
 query lengths through `--start-pos` and `--query-lens`. Both lists have one
 comma-separated value per request. Their lengths and sum determine the request

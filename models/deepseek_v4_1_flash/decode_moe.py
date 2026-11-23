@@ -48,7 +48,10 @@ if N_LOCAL_EXPERTS <= 0 or not config.FLASH.num_experts_per_tok <= _test_experts
 from config import FLASH as M, EP_SIZE, MOE_TOKENS, MOE_RECV_MAX, T_DYN
 from gate import gate, route_tokens
 from expert_shared import expert_shared
-from mega_moe import specialize_mega_moe, workspace_bytes
+from mega_moe import (
+    FP4_PANEL_ROWS, _resident_down_weight, _resident_gate_up_half,
+    specialize_mega_moe, use_packed_decode_weights, workspace_bytes,
+)
 from expert_routed import (
     dispatch,
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS, expert_routed_scatter,
@@ -358,8 +361,7 @@ def make_decode_moe(local_experts, topk, packed_routed_weights=False):
 
 # The standalone entry owns the resident upload. Layer/forward callers
 # pass weights in the public FP4 layout unless they opt into the packed ABI.
-PACK_ROUTED_WEIGHTS = __name__ == "__main__" and MOE_TOKENS <= 80
-FP4_PANEL_ROWS = 256
+PACK_ROUTED_WEIGHTS = __name__ == "__main__" and use_packed_decode_weights(MOE_TOKENS, N_LOCAL_EXPERTS, TOPK)
 PANEL_ROWS = FP4_PANEL_ROWS if PACK_ROUTED_WEIGHTS else 1
 WEIGHT_PANEL_BYTES = PANEL_ROWS * MX_PACKED_LANE_COLS
 W1_DEVICE_ROWS = MX_W1_PACKED_ROWS // PANEL_ROWS
@@ -496,25 +498,6 @@ def _route_bias(experts=N_EXPERTS):
     bias = torch.full((experts,), -1.0, dtype=torch.float32)
     bias[selected] = 4.0
     return bias
-
-
-def _resident_gate_up_half(tensors, half):
-    """Zip corresponding gate/up halves in the N32-major order consumed by Cube."""
-    import torch
-
-    gate = tensors["routed_w1"]
-    result = torch.empty_like(gate, memory_format=torch.contiguous_format)
-    dst = result.reshape(-1, 8, 256, 16)
-    for lane, name in enumerate(("routed_w1", "routed_w3")):
-        source = tensors[name].reshape(-1, 256, 8, 16)
-        dst[:, 4 * lane:4 * (lane + 1)].copy_(source[:, :, 4 * half:4 * (half + 1)].transpose(1, 2))
-    return result.reshape(*gate.shape[:-2], -1, FP4_PANEL_ROWS * MX_PACKED_LANE_COLS)
-
-
-def _resident_down_weight(tensors):
-    weight = tensors["routed_w2"]
-    panels = weight.reshape(-1, 256, 8, 16).transpose(1, 2).contiguous()
-    return panels.reshape(*weight.shape[:-2], -1, FP4_PANEL_ROWS * MX_PACKED_LANE_COLS)
 
 
 def build_moe_specs(num_tokens=MOE_TOKENS, *, initialize=True):

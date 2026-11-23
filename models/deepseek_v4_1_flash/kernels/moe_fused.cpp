@@ -13,8 +13,9 @@
 #define ASCENDC_TILING_KEY_VAR_IMPL 0
 #include <utils/debug/asc_printf.h>
 #include <utils/debug/asc_assert.h>
-// Keep N256 resident for the 384-row decode entry, including short expert groups.
-#define MOE_DECODE_K256 (MOE_TOKENS == 384)
+// Packed FP4 uploads contain K256/N256 panels. The 384-row ordinary layout
+// also keeps N256 resident for short expert groups.
+#define MOE_DECODE_K256 (MOE_TOKENS == 384 || MOE_PACKED_ROUTED_WEIGHTS)
 #define MOE_STREAM_W2_SCALES (!MOE_PACKED_ROUTED_WEIGHTS && MOE_TOKENS <= 80 && \
     1ULL * MOE_TOKENS * (MOE_TOPK + 2) * MOE_HIDDEN * 2 <= 32ULL * 1024 * 1024)
 /*

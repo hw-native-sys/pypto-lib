@@ -64,6 +64,57 @@ TOPK = M.num_experts_per_tok
 MOE_INTER = M.moe_intermediate_size
 
 
+FP4_PANEL_ROWS = 256
+
+
+def _resident_gate_up_half(tensors, half, prefix=""):
+    """Zip corresponding gate/up halves in the N32-major order consumed by Cube."""
+    import torch
+
+    gate = tensors[prefix + "routed_w1"]
+    result = torch.empty_like(gate, memory_format=torch.contiguous_format)
+    dst = result.reshape(-1, 8, 256, 16)
+    for lane, name in enumerate(("routed_w1", "routed_w3")):
+        source = tensors[prefix + name].reshape(-1, 256, 8, 16)
+        dst[:, 4 * lane:4 * (lane + 1)].copy_(source[:, :, 4 * half:4 * (half + 1)].transpose(1, 2))
+    return result.reshape(*gate.shape[:-2], -1, FP4_PANEL_ROWS * MX_PACKED_LANE_COLS)
+
+
+def _resident_down_weight(tensors, prefix=""):
+    weight = tensors[prefix + "routed_w2"]
+    panels = weight.reshape(-1, 256, 8, 16).transpose(1, 2).contiguous()
+    return panels.reshape(*weight.shape[:-2], -1, FP4_PANEL_ROWS * MX_PACKED_LANE_COLS)
+
+
+def use_packed_decode_weights(capacity, local_experts, topk):
+    """Select the decode panel layout from the active shape specialization."""
+    if capacity <= 80:
+        return True
+    # Use routed assignments per local expert to distinguish the measured
+    # weight-bound decode cases from the denser 384-row groups.
+    return capacity in (192, 384) and capacity * topk <= 96 * local_experts
+
+
+def forward_routed_weight_spec(name, device_shape, dtype, init_value, packed, prefix=""):
+    """Keep checkpoint shapes on the host and pack only the compiled resident FP4 payloads."""
+    from functools import partial
+    from golden import TensorSpec
+
+    projection = name.removeprefix(prefix)
+    if not packed or not name.startswith(prefix) or projection not in ("routed_w1", "routed_w2", "routed_w3"):
+        return TensorSpec(name, device_shape, dtype, init_value=init_value)
+    rows, columns = device_shape[-2:]
+    if columns != FP4_PANEL_ROWS * MX_PACKED_LANE_COLS:
+        raise ValueError(f"{name}: invalid packed FP4 device panel width {columns}")
+    logical_shape = [*device_shape[:-2], rows * FP4_PANEL_ROWS, MX_PACKED_LANE_COLS]
+    if projection == "routed_w2":
+        pack = partial(_resident_down_weight, prefix=prefix)
+    else:
+        pack = partial(_resident_gate_up_half, half=int(projection == "routed_w3"), prefix=prefix)
+    return TensorSpec(name, logical_shape, dtype, init_value=init_value, resident="stacked",
+                      pack_for_upload=pack, upload_shape=device_shape)
+
+
 def workspace_bytes(ep, local_experts, tokens, topk, hidden, intermediate):
     """Size the symmetric workspace for the routed experts and one shared expert."""
     if ep not in (2, 4, 8) or local_experts <= 0 or tokens <= 0 or tokens % 16:
@@ -122,8 +173,8 @@ def workspace_bytes(ep, local_experts, tokens, topk, hidden, intermediate):
 
 def _fused_external_kernel(local_experts, topk, packed_routed_weights=False):
     """Prepare a content-addressed, shape-specialized native entry."""
-    if packed_routed_weights and MOE_TOKENS > 80:
-        raise ValueError("packed routed weights require a capacity of at most 80 tokens")
+    if packed_routed_weights and MOE_TOKENS > 80 and MOE_TOKENS not in (192, 384):
+        raise ValueError("unsupported token capacity for packed routed weights")
     kernels = Path(__file__).parent / "kernels"
     values = dict(MOE_EP=EP_WORLD_SIZE, MOE_EXPERTS=local_experts, MOE_TOKENS=MOE_TOKENS,
                   MOE_TOPK=topk, MOE_HIDDEN=D, MOE_INTER=MOE_INTER, MOE_PACKED_ROUTED_WEIGHTS=int(packed_routed_weights))
