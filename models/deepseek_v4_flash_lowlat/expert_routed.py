@@ -798,7 +798,10 @@ def expert_routed_persistent_planned(
                                 # full RECV_TILE operand in L1 for the down matmul.
                                 h_gathered = pl.aic_gather(h_i8)
                             else:
-                                h_full[:, inter_start : inter_start + FUSED_N_TILE] = h_raw
+                                # Empty lanes retain the initial zeros. TINSERT
+                                # requires a positive number of source rows.
+                                if lane_r0 < valid_rows:
+                                    h_full[:, inter_start : inter_start + FUSED_N_TILE] = h_raw
 
                     if MOE_INTER > FUSED_N_TILE:
                         # Reduce the whole shard before quantizing any column tile.
