@@ -342,4 +342,5 @@ if __name__ == "__main__":
         },
         single_device=('lookup',),
         automatic=('tp', 'lookup'),
+        standalone_options={"lookup": {"--mode"}, "tp": {"--tp", "--dump-passes"}},
     )

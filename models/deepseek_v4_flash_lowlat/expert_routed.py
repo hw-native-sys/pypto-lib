@@ -1120,5 +1120,6 @@ if __name__ == "__main__":
             'persistent': validate_persistent,
             'activation': benchmark_activation,
         },
+        standalone_options={"routed": {"--golden-data"}},
         automatic=('routed', 'persistent'),
     )

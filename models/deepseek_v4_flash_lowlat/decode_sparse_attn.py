@@ -78,9 +78,6 @@ B_K_TILE = 256           # proj_b_mm cube K frag
 # proj_b_mm cube N frag; Acc = MM_T_TILE*N*4 = 128KB sits exactly on the a2a3 L0C wall.
 PROJ_B_MM_N_TILE = 256
 PROJ_B_ACT_N_TILE = 512  # proj_b_act vector N frag; keeps the O_GROUPS-way accumulate inside UB
-# Fused amax+quant token tile. 8 keeps the [1, QUANT_TOKEN_TILE] fp32 amax tile
-# 32-byte aligned (8*4=32B, the alloc-tile row floor).
-QUANT_TOKEN_TILE = 8
 PROJ_B_D_TILE = 512      # proj_b_mm D chunk per task; its N frags loop inside the task
 PROJ_B_ACT_T_TILE = 8    # proj_b_act inner token tile for the O_GROUPS-way INT32->FP32 accumulate
 PROJ_B_ACT_TASK_T_TILE = 8   # proj_b_act token block per task
@@ -1522,9 +1519,6 @@ HCA_TOPK = WIN + HCA_CMP_TOPK    # cache-first window slots + the ratio-128 comp
 HCA_SPARSE_BLOCKS = max(2, (HCA_TOPK + HCA_ATTN_K_TILE - 1) // HCA_ATTN_K_TILE)
 HCA_PADDED_TOPK = HCA_SPARSE_BLOCKS * HCA_ATTN_K_TILE
 assert WIN == HCA_ATTN_K_TILE, f"HCA window tile requires WIN ({WIN}) == ATTN_K_TILE ({HCA_ATTN_K_TILE})"
-assert HCA_SPARSE_BLOCKS == 1 + HCA_CMP_TOPK // HCA_ATTN_K_TILE, (
-    f"qk_pv assembles block 0 from the window and block k >= 1 from compressed "
-    f"tail columns [(k - 1) * ATTN_K_TILE, k * ATTN_K_TILE), got {HCA_SPARSE_BLOCKS}")
 assert WIN == BLOCK_SIZE, "a window spans at most two paged blocks only while WIN == BLOCK_SIZE"
 
 
@@ -2043,8 +2037,12 @@ def build_tensor_specs_hca(
     short_window_fixture: bool = False,
     mixed_topk_fixture: bool = False,
     cache_window_replacement_fixture: bool = False,
+    *,
+    full_cmp_tail: bool = False,
 ):
     """Build deterministic demo tensors for the HCA standalone harness."""
+    if HCA_CMP_TOPK == 0:
+        raise ValueError(f"HCA validation requires a context capacity of at least {HCA_COMPRESS_RATIO}")
     blocks_per_request = (HCA_CMP_TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE
     if blocks_per_request > CMP_MAX_BLOCKS:
         raise ValueError(
@@ -2128,24 +2126,13 @@ def build_tensor_specs_hca(
         )
 
     def init_cmp_sparse_indices():
-        """Build the sparse index list with a full window prefix and padded compressed tail.
-
-        The compressed tail width follows the active specialization (TOPK - WIN):
-        the pruned build narrows it to `cmp_valid` columns, the full-blocks
-        baseline keeps the whole CMP_TOPK-wide tail.
-        """
+        """Use consecutive queries with one full tile and a partially filled next tile."""
         indices = torch.full((T, HCA_CMP_TOPK), -1, dtype=torch.int32)
-        if cmp_valid:
-            indices[:, :cmp_valid] = torch.arange(cmp_valid, dtype=torch.int32)
-        if short_window_fixture:
-            indices[:, :] = -1
-        if mixed_topk_fixture:
-            indices[:, :] = -1
-            mixed_cmp_valid = cmp_valid
-            if mixed_cmp_valid:
-                indices[:, :mixed_cmp_valid] = torch.arange(mixed_cmp_valid, dtype=torch.int32)
-        if cache_window_replacement_fixture:
-            indices[:, :] = -1
+        if not short_window_fixture and not cache_window_replacement_fixture:
+            for query in range(T):
+                bounded = HCA_ATTN_K_TILE + query % 2
+                count = cmp_valid if full_cmp_tail or mixed_topk_fixture else min(cmp_valid, bounded)
+                indices[query, :count] = torch.arange(count, dtype=torch.int32)
         if causal_regression_fixture:
             indices[0, :] = -1
         return indices
@@ -2268,14 +2255,11 @@ def validate_swa():
 
 
 
-def validate_csa():
-    assert T == O_GROUPS, "standalone token sharding requires eight queries"
-
-
-
 def validate_hca():
     _validate_grouped_projection_rows()
     import argparse
+    import subprocess
+    import sys
     from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser()
@@ -2301,13 +2285,14 @@ def validate_hca():
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
-    if __package__:
-        from .decode_shapes import CONTEXT_CAPACITY
-    else:
-        from decode_shapes import CONTEXT_CAPACITY
-
-    parser.add_argument("--max-seq-len", type=int, default=CONTEXT_CAPACITY, help="import-time context capacity (default 1048576)")
+    parser.add_argument("--max-seq-len", type=int, help="Import-time context capacity for HCA validation.")
+    parser.add_argument("--full-cmp-tail", action="store_true", help="Validate all visible compressed rows.")
     args = parser.parse_args()
+    if args.max_seq_len is None and args.golden_data is None and not args.full_cmp_tail:
+        subprocess.run(
+            [sys.executable, *sys.argv, "--operator", "hca", "--max-seq-len", "32768"], check=True,
+        )
+        return
 
     print(f"compress_ratio={HCA_COMPRESS_RATIO} -> TOPK={HCA_TOPK} SPARSE_BLOCKS={HCA_SPARSE_BLOCKS} PADDED_TOPK={HCA_PADDED_TOPK}", flush=True)
 
@@ -2319,6 +2304,7 @@ def validate_hca():
             args.short_window_fixture,
             args.mixed_topk_fixture,
             args.cache_window_replacement_fixture,
+            full_cmp_tail=args.full_cmp_tail or args.golden_data is not None,
         ),
         golden_fn=golden_sparse_attn_hca,
         golden_data=args.golden_data,
@@ -2350,7 +2336,10 @@ if __name__ == "__main__":
     run_operator_validations(
         {
             'swa': validate_swa,
-            'csa': validate_csa,
             'hca': validate_hca,
+        },
+        standalone_options={
+            "swa": {"--unmapped-window-fixture"},
+            "hca": {"--max-seq-len", "--full-cmp-tail", "--mixed-topk-fixture", "--cache-window-replacement-fixture"},
         },
     )

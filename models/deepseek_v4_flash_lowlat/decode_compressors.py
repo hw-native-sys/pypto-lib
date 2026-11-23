@@ -1186,7 +1186,7 @@ def build_tensor_specs_ratio128(start_pos=None):
             batch=B,
             compress_ratio=RATIO128_COMPRESS_RATIO,
             state_block_size=RATIO128_COMPRESS_STATE_BLOCK_SIZE,
-            long_pos=DECODE_START_POS - S // 2,
+            long_pos=DECODE_START_POS - max(1, S // 2),
         )
 
     def init_start_pos():
@@ -2036,6 +2036,8 @@ def validate_ratio128():
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("--sim", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--spec-tokens", type=int, choices=range(8), default=S - 1)
+    parser.add_argument("--max-seq-len", type=int, default=MAX_SEQ_LEN, help="Import-time context capacity.")
     parser.add_argument("--start-pos", type=int, default=None,
                         help="Uniform fixture-only start_pos override for all batches; "
                              "default (unset) uses the canonical per-batch HCA set that includes the 8k point.")

@@ -1256,6 +1256,16 @@ def build_tensor_specs_lm(num_tokens=TEST_TOKENS):
         indices[:, :active] = torch.arange(active, dtype=torch.int32)
         return indices
 
+    def init_sampling_temperatures():
+        temperatures = torch.zeros((WORLD_SIZE, MAX_LOGIT_ROWS), dtype=torch.float32)
+        temperatures[:, :active:2] = 0.7
+        return temperatures
+
+    def init_sampling_top_ks():
+        top_ks = torch.full((WORLD_SIZE, MAX_LOGIT_ROWS), VOCAB, dtype=torch.int32)
+        top_ks[:, :active:2] = 16
+        return top_ks
+
     return [
         TensorSpec(
             "hidden_states",
@@ -1277,15 +1287,13 @@ def build_tensor_specs_lm(num_tokens=TEST_TOKENS):
             "sampling_temperatures",
             [WORLD_SIZE, MAX_LOGIT_ROWS],
             torch.float32,
-            init_value=lambda: torch.zeros(WORLD_SIZE, MAX_LOGIT_ROWS),
+            init_value=init_sampling_temperatures,
         ),
         TensorSpec(
             "sampling_top_ks",
             [WORLD_SIZE, MAX_LOGIT_ROWS],
             torch.int32,
-            init_value=lambda: torch.full(
-                (WORLD_SIZE, MAX_LOGIT_ROWS), VOCAB, dtype=torch.int32
-            ),
+            init_value=init_sampling_top_ks,
         ),
         TensorSpec(
             "sampling_seeds",
@@ -1366,6 +1374,7 @@ def compare_sampled_ids(actual, _expected, *, actual_outputs, inputs=None, **_):
 
 def validate_sampling():
     import argparse
+    from math import isfinite
 
     from golden import run
 
@@ -1383,8 +1392,8 @@ def validate_sampling():
     parser.add_argument("--golden-data", type=str, default=None)
     args = parser.parse_args()
 
-    if args.temperature is not None and args.temperature < 0.0:
-        parser.error(f"--temperature must be non-negative, got {args.temperature}")
+    if args.temperature is not None and (not isfinite(args.temperature) or args.temperature < 0.0):
+        parser.error(f"--temperature must be finite and non-negative, got {args.temperature}")
     result = run(
         fn=sample_test,
         specs=build_tensor_specs_sampling(args.temperature, args.top_k),
@@ -1484,4 +1493,8 @@ if __name__ == "__main__":
         },
         single_device=('sampling',),
         automatic=('lm', 'sampling'),
+        standalone_options={
+            "lm": {"--tp", "--dp", "--num-tokens", "--runtime-dir", "--dump-passes", "--enable-chip-swimlane"},
+            "sampling": {"--temperature", "--top-k", "--enable-l2-swimlane"},
+        },
     )

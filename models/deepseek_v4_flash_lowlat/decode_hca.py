@@ -136,6 +136,8 @@ COMPRESS_STATE_BLOCK_NUM = COMPRESS_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_BLOCK_NUM_DYN = pl.dynamic('LOWLAT_TARGET_HCA_STATE_BLOCK_NUM_DYN')
 COMPRESS_STATE_DIM = 2 * MAIN_OUT_DIM
 COMPRESS_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO   # demo 32; flash 128 (= 16384/128); max compressed positions
+if COMPRESS_TOPK == 0:
+    raise ValueError(f"HCA decode requires a context capacity of at least {COMPRESS_RATIO}")
 # HCA has no indexer: the compressed tail is every slot the cache holds, so the
 # only bound is the cache capacity (`index_topk` belongs to the ratio-4 indexer).
 # Longest context served = COMPRESS_TOPK * COMPRESS_RATIO = MAX_SEQ_LEN.
