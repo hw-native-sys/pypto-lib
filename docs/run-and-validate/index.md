@@ -27,6 +27,7 @@ Use the following references:
 - [Golden Harness](golden-harness.md) introduces `TensorSpec`, `ScalarSpec`,
   `run`, validation, and `RunResult`.
 - [Save and Replay Golden Data](save-and-replay.md) freezes inputs and expected
+- [Accuracy Evaluation](accuracy-evaluation.md) defines layered numerical, state, distributed, and real-text validation.
   outputs for repeated performance-oriented runs.
 
 For a first end-to-end command, start with
