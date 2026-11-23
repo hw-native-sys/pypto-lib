@@ -47,9 +47,9 @@ config.N_LOCAL_EXPERTS = _experts_per_rank
 
 from config import FLASH as M, EP_SIZE, MOE_TOKENS, MOE_RECV_MAX, N_LOCAL_EXPERTS, T_DYN, ROUTE_T_DYN
 from gate import gate
-from expert_shared import expert_shared
+from expert_shared import SWIGLU_WORKER_TILE, W13_WORKER_TILE, W2_WORKER_TILE, expert_shared
 from expert_routed import (
-    dispatch,
+    ROUTED_CUBE_WORKER_TILE, ROUTED_VECTOR_WORKER_TILE, dispatch,
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS, expert_routed_scatter,
     DISPATCH_PACKET_WIDTH,
 )
@@ -82,6 +82,15 @@ SIGNAL_PAD = 128  # 512-byte padded monotonic counter lane
 
 # tiling
 COMBINE_T_TILE = 2
+
+# Main decode worker budgets, ordered as W13 Cube, W2 Cube, SwiGLU Vector.
+FULL_ROUTED_CUBES, FULL_ROUTED_VECTORS = 32, 64
+SHORT_SHARED_W13, SHORT_SHARED_W2, SHORT_SHARED_ACT = 18, 10, 32
+SHORT_TOKEN_LIMIT = 80
+LONG_TOKEN_MIN = 256
+SHORT_EXPERT_ROWS_MIN = 32
+LONG_EXPERT_ROWS_MIN = 64
+DENSE_EXPERT_ROWS = 128
 
 
 @pl.jit.inline(auto_scope=False)
@@ -177,6 +186,38 @@ def combine_scattered(
 
 
 @pl.jit.inline(auto_scope=False)
+def _decode_ffn_workers(num_tokens: pl.Scalar[pl.INT32], local_experts: pl.constexpr, topk: pl.constexpr):
+    """Select launch sizes from the active rows on this rank and the balanced expert workload."""
+    rw13 = pl.cast(ROUTED_CUBE_WORKER_TILE, pl.INT32)
+    rw2 = pl.cast(ROUTED_CUBE_WORKER_TILE, pl.INT32)
+    ract = pl.cast(ROUTED_VECTOR_WORKER_TILE, pl.INT32)
+    sw13 = pl.cast(W13_WORKER_TILE, pl.INT32)
+    sw2 = pl.cast(W2_WORKER_TILE, pl.INT32)
+    sact = pl.cast(SWIGLU_WORKER_TILE, pl.INT32)
+    if topk == 6:
+        routed_rows = num_tokens * topk
+        if num_tokens <= SHORT_TOKEN_LIMIT:
+            if routed_rows >= local_experts * SHORT_EXPERT_ROWS_MIN:
+                rw13 = pl.cast(FULL_ROUTED_CUBES, pl.INT32)
+                rw2 = pl.cast(FULL_ROUTED_CUBES, pl.INT32)
+                ract = pl.cast(FULL_ROUTED_VECTORS, pl.INT32)
+                sw13 = pl.cast(SHORT_SHARED_W13, pl.INT32)
+                sw2 = pl.cast(SHORT_SHARED_W2, pl.INT32)
+                sact = pl.cast(SHORT_SHARED_ACT, pl.INT32)
+        elif (num_tokens >= LONG_TOKEN_MIN) and (routed_rows >= local_experts * LONG_EXPERT_ROWS_MIN):
+            rw13 = pl.cast(FULL_ROUTED_CUBES, pl.INT32)
+            rw2 = pl.cast(FULL_ROUTED_CUBES, pl.INT32)
+            ract = pl.cast(FULL_ROUTED_VECTORS, pl.INT32)
+            sw13 = pl.cast(18, pl.INT32)
+            sw2 = pl.cast(20, pl.INT32)
+            sact = pl.cast(8, pl.INT32)
+            if routed_rows >= local_experts * DENSE_EXPERT_ROWS:
+                sw13 = pl.cast(16, pl.INT32)
+                sw2 = pl.cast(16, pl.INT32)
+    return rw13, rw2, ract, sw13, sw2, sact
+
+
+@pl.jit.inline(auto_scope=False)
 def moe(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
@@ -219,6 +260,7 @@ def moe(
 ) -> pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]:
     """Run delayed HC pre-mix, MoE, and residual expansion."""
     t = MOE_TOKENS
+    rw13, rw2, ract, sw13, sw2, sact = _decode_ffn_workers(num_tokens, local_experts, topk)
     post_mix = pl.create_tensor([t, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([t, HC_MULT, HC_MULT], dtype=pl.FP32)
     x_norm = pl.create_tensor([t, D], dtype=pl.BF16)
@@ -247,7 +289,7 @@ def moe(
             shared_w1, shared_w1_scale,
             shared_w3, shared_w3_scale,
             shared_w2, shared_w2_scale,
-            shared_output,
+            shared_output, sw13, sw2, sact,
         )
 
         # Contiguous ND backing for the routed-expert MX_A_ZZ view.
@@ -272,6 +314,7 @@ def moe(
             routed_w2, routed_w2_scale,
             recv_route_local, recv_meta_local,
             routed_output, local_experts=local_experts, topk=topk,
+            w13_workers=rw13, w2_workers=rw2, swiglu_workers=ract,
         )
         sublayer = pl.create_tensor([t, D], dtype=pl.BF16)
         combine_scattered(
