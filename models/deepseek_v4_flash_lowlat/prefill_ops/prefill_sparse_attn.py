@@ -1749,10 +1749,10 @@ if __name__ == "__main__":
     ratio_choices = list(SUPPORTED_COMPRESS_RATIOS)
     parser.add_argument("--compress-ratio", type=int, default=DEFAULT_COMPRESS_RATIO, choices=ratio_choices)
     parser.add_argument(
-        "--tokens", type=int, default=T, help=f"Physical token rows, up to {MAX_SEQ_LEN}."
+        "--tokens", type=int, help=f"Physical token rows, up to {MAX_SEQ_LEN}; defaults to {T}."
     )
-    parser.add_argument("--ori-block-num", type=int, default=ORI_BLOCK_NUM)
-    parser.add_argument("--cmp-block-num", type=int, default=CMP_BLOCK_NUM)
+    parser.add_argument("--ori-block-num", type=int)
+    parser.add_argument("--cmp-block-num", type=int)
     parser.add_argument("--missing-cmp-page", action="store_true", help="Leave the first selected compressed page unmapped.")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
@@ -1762,32 +1762,52 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run(
-        fn=prefill_sparse_attn_test,
-        specs=build_tensor_specs(
-            args.compress_ratio, args.tokens, args.ori_block_num, args.cmp_block_num,
-            missing_cmp_page=args.missing_cmp_page,
+    cases = [
+        (
+            T if args.tokens is None else args.tokens,
+            ORI_BLOCK_NUM if args.ori_block_num is None else args.ori_block_num,
+            CMP_BLOCK_NUM if args.cmp_block_num is None else args.cmp_block_num,
+            args.missing_cmp_page,
         ),
-        golden_fn=golden_prefill_sparse_attn,
-        save_data=args.save_data,
-        golden_data=args.golden_data,
-        config=dict(
-            dump_passes=args.dump_passes,
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            device_id=args.device,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-            enable_pmu=args.enable_pmu,
-            enable_scope_stats=args.enable_scope_stats,
-        ),
-        rtol=1e-3,
-        atol=1e-3,
-        compile_only=args.compile_only,
-        compare_fn={
-            "attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-        },
+    ]
+    default_fixture = (
+        args.tokens is None and args.ori_block_num is None and args.cmp_block_num is None
+        and args.compress_ratio == DEFAULT_COMPRESS_RATIO
+        and not args.missing_cmp_page and args.golden_data is None
     )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    if default_fixture:
+        # Expose the first row of page one after the unmapped page zero.
+        missing_page_tokens = DEFAULT_COMPRESS_RATIO * (BLOCK_SIZE + 1)
+        missing_page_ori_blocks = (missing_page_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
+        cases.append((missing_page_tokens, missing_page_ori_blocks, 2, True))
+
+    for tokens, ori_blocks, cmp_blocks, missing_cmp_page in cases:
+        result = run(
+            fn=prefill_sparse_attn_test,
+            specs=build_tensor_specs(
+                args.compress_ratio, tokens, ori_blocks, cmp_blocks,
+                missing_cmp_page=missing_cmp_page,
+            ),
+            golden_fn=golden_prefill_sparse_attn,
+            save_data=args.save_data,
+            golden_data=args.golden_data,
+            config=dict(
+                dump_passes=args.dump_passes,
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                device_id=args.device,
+                enable_chip_swimlane=args.enable_chip_swimlane,
+                enable_pmu=args.enable_pmu,
+                enable_scope_stats=args.enable_scope_stats,
+            ),
+            rtol=1e-3,
+            atol=1e-3,
+            compile_only=args.compile_only,
+            compare_fn={
+                "attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            },
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
