@@ -591,8 +591,10 @@ artifacts and JIT caches. Experimental callers select explicit AgentX trace and
 request identities; input length, padding and chunk boundaries must come from
 the actual reconstructed input, with no fixed short-prompt fallback.
 
-The report records the selected prefill plan and generated argument layout.
-Use the actual generated metadata to provision buffers and bind arguments.
+The report records the selected prefill plan, artifact directory, parameter
+count, and metadata hash. Read argument names and shapes from
+`distributed_meta.json` in the reported `artifact_dir` when allocating
+buffers and binding arguments.
 
 ### Deployment
 
