@@ -238,7 +238,23 @@ FLASH = DeepSeekV41Config(
 )
 
 
-DECODE_BATCH = 12
+def _parse_shape_size(name: str, default: int, choices: Tuple[int, ...]) -> int:
+    flag = f"--{name}"
+    size = default
+    for index, argument in enumerate(sys.argv):
+        if argument == flag:
+            if index + 1 == len(sys.argv):
+                raise ValueError(f"{flag} requires an integer")
+            size = int(sys.argv[index + 1])
+        elif argument.startswith(f"{flag}="):
+            size = int(argument.split("=", 1)[1])
+    if size not in choices:
+        raise ValueError(f"{flag} must be one of {choices}, got {size}")
+    return size
+
+
+SUPPORTED_DECODE_BATCHES = (12, 32, 64)
+DECODE_BATCH = _parse_shape_size("decode-batch", 12, SUPPORTED_DECODE_BATCHES)
 DSPARK_SPEC_TOKENS = 5
 DECODE_SEQ = DSPARK_SPEC_TOKENS + 1
 BLOCK_SIZE = 128
@@ -288,24 +304,9 @@ SUPPORTED_CP_SIZES = (1, 2, 4, 8)
 SUPPORTED_EP_SIZES = (2, 4, 8)
 
 
-def _parse_parallel_size(name: str, default: int, choices: Tuple[int, ...]) -> int:
-    flag = f"--{name}"
-    size = default
-    for index, argument in enumerate(sys.argv):
-        if argument == flag:
-            if index + 1 == len(sys.argv):
-                raise ValueError(f"{flag} requires an integer")
-            size = int(sys.argv[index + 1])
-        elif argument.startswith(f"{flag}="):
-            size = int(argument.split("=", 1)[1])
-    if size not in choices:
-        raise ValueError(f"{flag} must be one of {choices}, got {size}")
-    return size
-
-
-LM_HEAD_TP_SIZE = _parse_parallel_size("lm-head-tp", 1, SUPPORTED_LM_HEAD_TP_SIZES)
-CP_SIZE = _parse_parallel_size("cp", 1, SUPPORTED_CP_SIZES)
-EP_SIZE = _parse_parallel_size("ep", 2, SUPPORTED_EP_SIZES)
+LM_HEAD_TP_SIZE = _parse_shape_size("lm-head-tp", 1, SUPPORTED_LM_HEAD_TP_SIZES)
+CP_SIZE = _parse_shape_size("cp", 1, SUPPORTED_CP_SIZES)
+EP_SIZE = _parse_shape_size("ep", 2, SUPPORTED_EP_SIZES)
 DP_SIZE = EP_SIZE // CP_SIZE
 
 

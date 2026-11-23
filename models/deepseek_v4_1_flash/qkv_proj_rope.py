@@ -949,9 +949,15 @@ def q_proj_rope(
     qb_payload = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.FP8E4M3FN)
     qb_scales = pl.create_tensor([1, payload_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
     projected = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.BF16)
-    # Narrow decode buffers can hold only an M80 input tile.
-    if qa_row_tile == PROJ_M_TILE and padded_rows < PROJ_WIDE_M_TILE:
-        projected = proj_q_a_pypto(payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_worker_limit)
+    # A default decode call can select only M80 or M128. Keep the wide
+    # projection out of the IR even when the active-row decision is dynamic.
+    if qa_row_tile == PROJ_M_TILE:
+        if padded_rows < PROJ_WIDE_M_TILE:
+            projected = proj_q_a_pypto(payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_worker_limit)
+        elif qa_tile == PROJ_WIDE_M_TILE:
+            projected = _proj_q_a_decode(payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_worker_limit, 128, 128, 128)
+        else:
+            projected = proj_q_a_pypto(payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_worker_limit)
     else:
         projected = proj_q_a(payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_tile, qa_worker_limit)
     latent_rows = pl.tensor.dim(query_latent, 0)

@@ -30,7 +30,7 @@ operator define its executable storage and layout contracts.
 | Hyper-connections | 4 streams; persistent hidden state is FP32 |
 | Context ceiling | 1,048,576 positions, with 128-token cache pages |
 | Engram | Layers 1 and 14; forward consumes host-gathered embedding rows |
-| DSpark | 5 speculative tokens plus one verification row per request; default per-rank decode batch 12, or 72 local rows |
+| DSpark | 5 speculative tokens plus one verification row per request. The per-rank request capacity is 12 (default), 32, or 64. |
 
 Quantized projection paths use MXFP8 weights and activations; routed expert
 weights use packed MXFP4. Scale tensors use the owning operator's MX layout.
@@ -138,14 +138,21 @@ ordinary layout when compiling a new artifact. Replaying `--runtime-dir`
 uses the compiled argument shapes to select the matching upload layout.
 The imported forward modules keep the ordinary layout by default.
 
+The direct DSpark entry accepts `--decode-batch {12,32,64}`. It reserves
+six target rows and five draft rows per request. Set `--active-requests`
+to run between one request (the default) and the compiled capacity per
+rank. When replaying a compiled artifact, pass the same `--decode-batch`
+and expert counts used at compile time. For example,
+`--decode-batch 32 --active-requests 32` runs 192 target and 160 draft
+rows per rank.
+
 The six standalone decode attention entries accept explicit request starts and
 query lengths through `--start-pos` and `--query-lens`. Both lists have one
 comma-separated value per request. Their lengths and sum determine the request
 and token counts; the default batch of 12 and 72-token workload are not limits
 for these standalone entries. For example, batch 64 with four query tokens per
 request uses 64 starting positions and 64 query lengths of `4` (256 tokens).
-Query blocks must remain within the model position range. This does not change
-the forward or DSpark serving capacities.
+Query blocks must remain within the model position range.
 
 For prefill attention, `--tokens` is capacity per DP group, before CP partitioning.
 `--query-lens '65,31;96'` describes two requests in DP0 and one in DP1;

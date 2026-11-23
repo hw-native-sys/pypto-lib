@@ -97,7 +97,7 @@ BLOCK_SIZE = BLOCK_SIZE
 DECODE_MAX_TOKENS = DECODE_MAX_TOKENS
 STATE_CAPACITY = STATE_CAPACITY
 
-FIXTURE_BATCH = 12
+FIXTURE_BATCH = C.DECODE_BATCH
 FIXTURE_SEQUENCE = 6
 FIXTURE_TOKENS = FIXTURE_BATCH * FIXTURE_SEQUENCE
 
@@ -1155,7 +1155,7 @@ def _fixture_extent(dim):
 
 
 def build_tensor_specs():
-    """Build the twelve-request decode smoke fixture."""
+    """Build the decode smoke fixture for the configured request capacity."""
     from decode_moe import _route_bias
 
     signature = inspect.signature(l3_decode_fwd._func)

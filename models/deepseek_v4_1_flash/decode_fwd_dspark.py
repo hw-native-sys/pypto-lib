@@ -32,7 +32,7 @@ from config import (
     DSPARK_DRAFT_LAYERS,
     EP_SIZE,
     FLASH,
-    DECODE_BATCH,
+    DECODE_BATCH, SUPPORTED_DECODE_BATCHES,
     LM_HEAD_TP_SIZE, SUPPORTED_LM_HEAD_TP_SIZES, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
 from quant import unpack_quantized_cache
@@ -727,13 +727,15 @@ def l3_decode_fwd_dspark(
         )
 
 
-def build_tensor_specs():
+def build_tensor_specs(active_requests=1):
     """Build a bounded single-dispatch DSpark decode fixture."""
     import inspect
     import torch
 
     from golden import ScalarSpec, TensorSpec
 
+    if not 1 <= active_requests <= DECODE_BATCH:
+        raise ValueError(f"active requests must be between 1 and {DECODE_BATCH}")
     limit = 64
     extents = {
         VOCAB_DYN.name: 32,
@@ -762,8 +764,8 @@ def build_tensor_specs():
         "sampling_temperatures": torch.tensor([0.7, 0.0] * (DECODE_BATCH // 2)).repeat_interleave(DECODE_SEQ).repeat(EP_SIZE, 1),
         "sampling_seeds": torch.arange(DECODE_BATCH, dtype=torch.int32).repeat_interleave(DECODE_SEQ).repeat(EP_SIZE, 1),
         "sampling_positions": torch.arange(DECODE_SEQ, dtype=torch.int32).repeat(DECODE_BATCH).repeat(EP_SIZE, 1),
-        "attention_num_tokens": ROWS,
-        "moe_num_tokens": ROWS,
+        "attention_num_tokens": active_requests * ROWS,
+        "moe_num_tokens": active_requests * ROWS,
     }
     aliases = {
         "markov_lm_head_weight": "lm_head_weight",
@@ -798,16 +800,16 @@ def build_tensor_specs():
 
     for name in ("slot_ids", "generations", "state_meta", "state_tokens"):
         specs[name].init_value = specs[name].create_tensor()
-    specs["slot_ids"].init_value[:, 0] = 0
-    specs["generations"].init_value[:, 0] = 1
-    meta = specs["state_meta"].init_value[:, 0]
-    meta[:, state_ops.STATE_VALID] = 1
-    meta[:, state_ops.STATE_GENERATION] = 1
-    meta[:, state_ops.STATE_ANCHOR] = 2
-    meta[:, state_ops.STATE_COMMITTED] = 2
-    meta[:, state_ops.STATE_DRAFT_COUNT] = ROWS - 1
-    meta[:, state_ops.STATE_LIMIT] = limit
-    specs["state_tokens"].init_value[:, 0, 1] = 1
+    specs["slot_ids"].init_value[:, :active_requests] = torch.arange(active_requests, dtype=torch.int32)
+    specs["generations"].init_value[:, :active_requests] = 1
+    meta = specs["state_meta"].init_value[:, :active_requests]
+    meta[..., state_ops.STATE_VALID] = 1
+    meta[..., state_ops.STATE_GENERATION] = 1
+    meta[..., state_ops.STATE_ANCHOR] = 2
+    meta[..., state_ops.STATE_COMMITTED] = 2
+    meta[..., state_ops.STATE_DRAFT_COUNT] = ROWS - 1
+    meta[..., state_ops.STATE_LIMIT] = limit
+    specs["state_tokens"].init_value[:, :active_requests, 1] = 1
 
     arguments = dict(specs)
     for name, value in scalars.items():
@@ -822,6 +824,9 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--lm-head-tp", type=int, default=LM_HEAD_TP_SIZE, choices=SUPPORTED_LM_HEAD_TP_SIZES)
+    parser.add_argument("--decode-batch", type=int, choices=SUPPORTED_DECODE_BATCHES, default=DECODE_BATCH,
+                        help="maximum requests per rank in the compiled DSpark step")
+    parser.add_argument("--active-requests", type=int, default=1, help="number of active requests per rank in the fixture")
     parser.add_argument("--ep", type=int, default=EP_SIZE)
     parser.add_argument("--dp", type=int, default=EP_SIZE)
     parser.add_argument("--weight-bank-size", type=int, choices=[1], default=1)
@@ -834,6 +839,8 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=range(5))
     args = parser.parse_args()
+    if not 1 <= args.active_requests <= DECODE_BATCH:
+        parser.error(f"--active-requests must be between 1 and {DECODE_BATCH}")
     if (args.ep, args.dp) != (EP_SIZE, EP_SIZE):
         parser.error("--ep/--dp must match the import-time DP=EP configuration")
     devices = tuple(int(value) for value in args.device.split(","))
@@ -846,7 +853,7 @@ if __name__ == "__main__":
 
     result = run(
         fn=l3_decode_fwd_dspark,
-        specs=build_tensor_specs(),
+        specs=build_tensor_specs(args.active_requests),
         golden_fn=None,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,

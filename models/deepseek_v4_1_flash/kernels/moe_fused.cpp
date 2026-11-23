@@ -2893,7 +2893,9 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
             // The empty events protect physical slots across expert tasks.
             // Keep their pitch fixed when consecutive tasks select different MAD_M.
             constexpr l0a_ptr<float8_e4m3_t> l0a(L0ASizeBytes / (kNumL0Stages * MAD_K), MAD_K);
-            constexpr l0b_ptr<float8_e4m3_t> l0b(MAD_N, MAD_K);
+            // An outstanding L0B event owns a fixed half-buffer even when the next
+            // task uses a different MAD_N for its current weight tile.
+            constexpr l0b_ptr<float8_e4m3_t> l0b(L0BSizeBytes / (kNumL0Stages * MAD_K), MAD_K);
             constexpr l0c_ptr<float> l0c(MAD_M, MAD_N);
 
             for (uint32_t k_idx = 0; k_idx < num_k; k_idx += BLOCK_K) {
@@ -2984,7 +2986,8 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
                         const uint32_t l0b_stage_idx = (l0a_stage_idx * (BLOCK_N / MAD_N) + l0c_idx) % kNumL0Stages;
                         wait<PIPE_M, PIPE_MTE1>(kL0BEmpty, l0b_stage_idx);
                         const auto l1b_src = is_shared ? shared_l1b[l1b_stage_idx] : l1b[(l1b_stage_idx + n_mad_idx / MAD_N) % kNumL1BStages];
-                        copy_l1_to_l0b(l0b[l0b_stage_idx], l1b_src, is_shared ? n_mad_idx : 0, k_mad_idx);
+                        const auto l0b_mad = l0b[l0b_stage_idx].as_mad_aligned(MAD_N, MAD_K);
+                        copy_l1_to_l0b(l0b_mad, l1b_src, is_shared ? n_mad_idx : 0, k_mad_idx);
 #if MOE_STREAM_W2_SCALES
                         if (not is_shared and not is_linear1 and sf_pair_idx % kNumSFPairsPerChunk == 0 and k_mad_idx == 0 and n_mad_idx == 0)
                             wait_intra_block<PIPE_MTE1, 0>(kStreamSFFull, w2_sf_stage_idx);
@@ -2992,13 +2995,13 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
 #else
                         const auto b_scale = l1_sfb[sf_stage_idx];
 #endif
-                        copy_l1_to_l0b_mx(l0b[l0b_stage_idx], b_scale, n_mad_idx, sf_pair_idx_in_chunk, MAD_K);
+                        copy_l1_to_l0b_mx(l0b_mad, b_scale, n_mad_idx, sf_pair_idx_in_chunk, MAD_K);
                         notify<PIPE_MTE1, PIPE_M>(l0_full, l0b_stage_idx);
 
                         // B readiness also covers the earlier A/scales loads on the same MTE1 queue
                         const auto l0c_mad = l0c[l0c_idx].as_mad_aligned(aligned_valid_m, MAD_N);
                         wait<PIPE_MTE1, PIPE_M>(l0_full, l0b_stage_idx);
-                        mad(l0c_mad, l0a_mad, l0b[l0b_stage_idx], aligned_valid_m, MAD_N, MAD_K,
+                        mad(l0c_mad, l0a_mad, l0b_mad, aligned_valid_m, MAD_N, MAD_K,
                             is_last_k ? asc_unit_flag_mode::ENABLE_UPDATE : asc_unit_flag_mode::ENABLE_KEEP,
                             k_idx + k_mad_idx == 0);
                         if (n_mad_idx + MAD_N == BLOCK_N)
