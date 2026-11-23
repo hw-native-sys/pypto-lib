@@ -32,7 +32,7 @@ KV_INPUT_ROWS = pl.dynamic("KV_INPUT_ROWS")
 KV_SCALE_COLS = pl.dynamic("KV_SCALE_COLS")
 KV_OUTPUT_ROWS = pl.dynamic("KV_OUTPUT_ROWS")
 QB_INPUT_ROWS = pl.dynamic("QB_INPUT_ROWS")
-QB_SCALE_COLS = pl.dynamic("QB_SCALE_COLS")
+QB_SCALE_BYTES = pl.dynamic("QB_SCALE_BYTES")
 QB_OUTPUT_ROWS = pl.dynamic("QB_OUTPUT_ROWS")
 
 # model config
@@ -68,7 +68,7 @@ WINDOW_SLOT_TILE = 128
 def _proj_q_b(
     payload: pl.Tensor[[QB_INPUT_ROWS, Q_LORA], pl.FP8E4M3FN],
     weight: pl.Tensor,
-    activation_scale: pl.Tensor[[1, QB_SCALE_COLS], pl.FP8E8M0],
+    activation_scale: pl.Tensor[[QB_SCALE_BYTES], pl.FP8E8M0],
     weight_scale: pl.Tensor,
     output: pl.Out[pl.Tensor[[QB_OUTPUT_ROWS, LOCAL_H * HEAD_DIM], pl.BF16]],
     rope_cos: pl.Tensor,
@@ -959,11 +959,12 @@ def q_proj_rope(
     norm_payload = pl.tensor.slice(qb_payload, [payload_rows, Q_LORA], [0, 0])
     norm_scales = pl.tensor.slice(qb_scales, [1, payload_rows * (Q_LORA // 32)], [0, 0])
     q_norm_quant(projected, q_norm_weight, norm_latent, norm_payload, norm_scales, num_tokens)
+    qb_scale_stream = pl.reshape(qb_scales, [pl.tensor.dim(qb_scales, 1)])
     qb_tasks = ((num_tokens + qb_tile - 1) // qb_tile) * (LOCAL_H * HEAD_DIM // Q_B_N_TILE)
     qb_workers = pl.max(pl.min(qb_tasks, pl.min(qb_worker_limit, pl.system.available_cluster_count())), 1)
     with pl.spmd(qb_workers, name_hint="proj_q_b"):
         query = _proj_q_b(
-            qb_payload, wq_b, qb_scales, wq_b_scale,
+            qb_payload, wq_b, qb_scale_stream, wq_b_scale,
             query, rope_cos, rope_sin, num_tokens, LOCAL_H * HEAD_DIM, 0, qb_tile,
         )
     return qb_payload, qb_scales

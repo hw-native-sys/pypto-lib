@@ -38,9 +38,13 @@ def gemm_eltwise(
                 tile_w = wo[k0 : k0 + K_TILE, n0 : n0 + N_TILE]
                 acc = pl.matmul_acc(acc, tile_a, tile_w, init_cond=(kb == 0))
 
-            # fuse the residual add while the matmul output is still on chip
-            hidden_tile = pl.cast(hidden_states[:, n0 : n0 + N_TILE], target_type=pl.FP32)
-            resid[:, n0 : n0 + N_TILE] = pl.add(acc, hidden_tile)
+            # Fuse the residual add across both vector lanes.
+            for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                acc_rows = pl.aiv_shard(acc)
+                row = lane * (BATCH // 2)
+                hidden_rows = pl.slice(hidden_states, [BATCH // 2, N_TILE], [row, n0])
+                hidden_tile = pl.cast(hidden_rows, target_type=pl.FP32)
+                resid = pl.assemble(resid, pl.add(acc_rows, hidden_tile), [row, n0])
     return resid
 
 
