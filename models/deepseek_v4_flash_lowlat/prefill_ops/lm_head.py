@@ -18,7 +18,7 @@ from projection_weight_layout import PROJECTION_WEIGHT_LAYOUT
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 
-from config import FLASH as M, FP32_NEG_INF
+from models.deepseek_v4_flash_lowlat.model_config import FLASH as M, FP32_NEG_INF
 from prefill_shapes import MOE_TOKENS
 
 

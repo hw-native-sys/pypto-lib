@@ -10,7 +10,7 @@
 
 import pypto.language as pl
 
-from .config import FLASH as M
+from .model_config import FLASH as M
 
 KV_T_DYN = pl.dynamic("NATIVE_D_QKV_KV_T_DYN")
 PREFILL_DENSE_TILE = 512

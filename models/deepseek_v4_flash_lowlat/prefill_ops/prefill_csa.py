@@ -23,7 +23,7 @@ from qkv_proj_rope import kv_proj_rope_cp
 from projection_weight_layout import PROJECTION_WEIGHT_LAYOUT
 from utils import checkpoint_ends_tensor
 
-from config import FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
+from models.deepseek_v4_flash_lowlat.model_config import FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
 from prefill_shapes import (
     BLOCK_SIZE,
     CSA_INNER_STATE_BLOCKS_PER_REQUEST,

@@ -17,7 +17,7 @@ from projection_exchange import (
 )
 from utils import checkpoint_ends_tensor
 
-from config import FLASH as M, FP32_NEG_INF, INT8_AMAX_EPS, INT8_SCALE_MAX
+from models.deepseek_v4_flash_lowlat.model_config import FLASH as M, FP32_NEG_INF, INT8_AMAX_EPS, INT8_SCALE_MAX
 from prefill_shapes import (
     BLOCK_SIZE,
     C4A_COMPRESSOR_BLOCK_SIZE,

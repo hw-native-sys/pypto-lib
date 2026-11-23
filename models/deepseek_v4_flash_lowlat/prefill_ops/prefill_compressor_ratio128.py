@@ -17,7 +17,7 @@ from projection_exchange import (
 )
 from utils import checkpoint_ends_tensor
 
-from config import FLASH as M
+from models.deepseek_v4_flash_lowlat.model_config import FLASH as M
 from prefill_shapes import (
     HCA_CMP_STORAGE_BLOCK_SIZE as CMP_STORAGE_BLOCK_SIZE,
     C128_COMPRESSOR_BLOCK_SIZE,

@@ -11,7 +11,7 @@ activations for both decode and prefill attention paths."""
 
 import pypto.language as pl
 
-from config import FLASH as M
+from models.deepseek_v4_flash_lowlat.model_config import FLASH as M
 
 
 # Dynamic shape variables.

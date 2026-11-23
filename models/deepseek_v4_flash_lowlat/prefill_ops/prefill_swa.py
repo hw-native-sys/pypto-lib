@@ -21,7 +21,7 @@ from qkv_proj_rope import kv_proj_rope_cp
 from projection_weight_layout import PROJECTION_WEIGHT_LAYOUT
 import pypto.language.distributed as pld
 
-from config import FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
+from models.deepseek_v4_flash_lowlat.model_config import FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
 from prefill_shapes import BLOCK_SIZE, KV_CMP_BLOCK_NUM, KV_ORI_BLOCK_NUM
 
 from models.deepseek_v4_flash_lowlat.hc_post_common import golden_hc_post, hc_post

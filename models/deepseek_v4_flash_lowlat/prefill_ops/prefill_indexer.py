@@ -12,7 +12,7 @@ import pypto.language as pl
 
 from projection_weight_layout import PROJECTION_WEIGHT_LAYOUT
 
-from config import FLASH as M, FP32_NEG_INF, INT8_SCALE_MAX, INT8_AMAX_EPS
+from models.deepseek_v4_flash_lowlat.model_config import FLASH as M, FP32_NEG_INF, INT8_SCALE_MAX, INT8_AMAX_EPS
 from prefill_shapes import BLOCK_SIZE, CSA_INNER_STATE_BLOCKS_PER_REQUEST
 
 from prefill_indexer_compressor import (

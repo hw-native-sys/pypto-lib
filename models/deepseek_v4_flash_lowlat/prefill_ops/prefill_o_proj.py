@@ -11,7 +11,7 @@
 import pypto.language as pl
 import pypto.language.distributed as pld
 
-from config import FLASH as M
+from models.deepseek_v4_flash_lowlat.model_config import FLASH as M
 from prefill_cp_token_allgather import TP_SIZE
 
 
