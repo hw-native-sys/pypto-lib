@@ -753,6 +753,10 @@ def _o_proj_a_mixed(
                 scale_bytes = pl.reinterpret_view(scale_pairs, pl.UINT8, shape=[row_tile * 128 // 32])
                 quant_words = pl.reinterpret_view(quant_bytes, pl.UINT32, shape=[row_tile * 128 // 4])
                 row_codes = pl.create_tile([row_tile * 4], dtype=pl.UINT16, target_memory=pl.Mem.Vec)
+                # The rounded tile owns its storage while Cube computes the next row block.
+                if cube_mt + 1 < padded_rows // row_tile:
+                    pl.system.set_intra_block(4, pipe=pl.PipeType.V, core_type=pl.KernelType.AIV)
+                    pl.system.wait_intra_block(5, pipe=pl.PipeType.V, core_type=pl.KernelType.AIV)
                 with pl.reg_scope():
                     q_zero_row = pl.reg.broadcast(0, lanes=4, dtype=pl.UINT16)
                     # Process two rows as eight independent 32-value MX groups.
@@ -778,10 +782,7 @@ def _o_proj_a_mixed(
                         q_wide_reciprocal = pl.reg.interpret_cast(q_wide_inverse, dtype=pl.BF16)
                         q_wide_scaled = pl.reg.mul(q_values, q_wide_reciprocal)
                         q_wide_float = pl.reg.convert(q_wide_scaled, dtype=pl.FP32)
-                        q_wide_float_mask = pl.reg.full_mask(lanes=256)
-                        q_wide_clipped = pl.reg.maximums(q_wide_float, -448.0, q_wide_float_mask)
-                        q_wide_clipped = pl.reg.minimums(q_wide_clipped, 448.0, q_wide_float_mask)
-                        q_wide_fp8 = pl.reg.convert(q_wide_clipped, dtype=pl.FP8E4M3FN, rounding="R", saturate=False)
+                        q_wide_fp8 = pl.reg.convert(q_wide_float, dtype=pl.FP8E4M3FN, rounding="R", saturate=True)
                         q_wide_words = pl.reg.interpret_cast(q_wide_fp8, dtype=pl.UINT32)
                         _q_quant_written = pl.reg.store(quant_words, offset=q_pair * 64, value=q_wide_words)
                         q_codes = pl.reg.shift_rights(q_group_shared, 7, q_group_mask)
@@ -818,13 +819,16 @@ def _o_proj_a_mixed(
                 output = pl.store(quantized, [row, group * 1024 + col], output)
                 packed = pl.reshape(scale, [row_tile // 16, 64])
                 scales = pl.store(packed, [row // 16, group * 512 + nb * 128 + lane * 64], scales)
-                pl.system.set_intra_block(4, pipe=pl.PipeType.MTE3, core_type=pl.KernelType.AIV)
-                pl.system.wait_intra_block(5, pipe=pl.PipeType.V, core_type=pl.KernelType.AIV)
-            pl.system.wait_intra_block(4, pipe=pl.PipeType.FIX, core_type=pl.KernelType.AIC)
-            pl.system.wait_intra_block(20, pipe=pl.PipeType.FIX, core_type=pl.KernelType.AIC)
-            pl.system.barrier(pipe=pl.PipeType.ALL, core_type=pl.KernelType.AIC)
-            pl.system.set_intra_block(5, pipe=pl.PipeType.FIX, core_type=pl.KernelType.AIC)
-            pl.system.set_intra_block(21, pipe=pl.PipeType.FIX, core_type=pl.KernelType.AIC)
+                # Drain the last pair of vector stores.
+                if padded_rows > row_tile and cube_mt + 1 == padded_rows // row_tile:
+                    pl.system.set_intra_block(4, pipe=pl.PipeType.MTE3, core_type=pl.KernelType.AIV)
+                    pl.system.wait_intra_block(5, pipe=pl.PipeType.V, core_type=pl.KernelType.AIV)
+            if padded_rows > row_tile:
+                pl.system.wait_intra_block(4, pipe=pl.PipeType.FIX, core_type=pl.KernelType.AIC)
+                pl.system.wait_intra_block(20, pipe=pl.PipeType.FIX, core_type=pl.KernelType.AIC)
+                pl.system.barrier(pipe=pl.PipeType.ALL, core_type=pl.KernelType.AIC)
+                pl.system.set_intra_block(5, pipe=pl.PipeType.FIX, core_type=pl.KernelType.AIC)
+                pl.system.set_intra_block(21, pipe=pl.PipeType.FIX, core_type=pl.KernelType.AIC)
     return output, output_scale
 
 
@@ -852,25 +856,6 @@ def o_proj_a_pypto(
             payload, weight, activation_scale, weight_scale, output, output_scale,
             output_width, active_rows, padded_rows, row_tile=80,
         )
-    return output, output_scale
-
-
-@pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "o_proj_a.cpp",
-               aiv_source=Path(__file__).parent / "kernels" / "o_proj_a.cpp",
-               include_dirs=(pto_isa_include_dir(),), dual_aiv_dispatch=True)
-def _o_proj_a(
-    payload: pl.Tensor[[O_GROUP_ROWS, O_GROUP_IN], pl.FP8E4M3FN],
-    weight: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
-    activation_scale: pl.Tensor[[LOCAL_O_GROUPS, O_IN_SCALE_COLS], pl.FP8E8M0],
-    weight_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
-    output: pl.Out[pl.Tensor[[O_PAD_ROWS, LOCAL_O_WIDTH], pl.FP8E4M3FN]],
-    output_scale: pl.Out[pl.Tensor[[1, O_OUT_SCALE_COLS], pl.FP8E8M0]],
-    output_width: pl.Scalar[pl.INDEX],
-    active_rows: pl.Scalar[pl.INT32],
-    padded_rows: pl.Scalar[pl.INDEX],
-    row_tile: pl.Scalar[pl.INDEX],
-) -> tuple[pl.Tensor, pl.Tensor]:
-    """Round the O-A result to BF16 and quantize on the paired Vector cores."""
     return output, output_scale
 
 
@@ -1326,13 +1311,10 @@ def o_proj_hc_post(
     quant_o_vf_pypto(attn_out, rope_cos, rope_sin, payload_all, scales_all, num_tokens, padded_rows)
     payload = pl.create_tensor([padded_rows, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
     activation_scale = pl.create_tensor([1, padded_rows * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)
-    oa_tasks = (padded_rows // oa_tile) * (LOCAL_O_WIDTH // O_A_N_TILE)
-    oa_workers = pl.max(1, pl.min(oa_tasks, pl.min(32, pl.system.available_cluster_count())))
-    with pl.spmd(oa_workers, name_hint="proj_o_a_quant"):
-        payload, activation_scale = _o_proj_a(
-            payload_all, wo_a, scales_all, wo_a_scale, payload, activation_scale,
-            LOCAL_O_WIDTH, num_tokens, padded_rows, oa_tile,
-        )
+    payload, activation_scale = o_proj_a_pypto(
+        payload_all, wo_a, scales_all, wo_a_scale, payload, activation_scale,
+        LOCAL_O_WIDTH, num_tokens, padded_rows, oa_tile,
+    )
     ob_tasks = ((total_rows + ob_row_tile - 1) // ob_row_tile) * ((D + O_B_N_TILE - 1) // O_B_N_TILE)
     ob_workers = pl.max(1, pl.min(ob_tasks, pl.system.available_cluster_count()))
     output, ready = o_proj_b_hc_post(
