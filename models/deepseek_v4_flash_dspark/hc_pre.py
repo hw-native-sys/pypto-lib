@@ -99,12 +99,18 @@ def _hc_pre_statistics(
             linear_split = task % LINEAR_OK
             k_base = linear_split * LINEAR_K_PER_SPLIT
             t_rows = pl.min(LINEAR_T_TILE, t_dim - t0)  # last row-block spills past t_dim; valid_shape zero-fills the tail
-            acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
-            for kb in pl.pipeline(0, LINEAR_K_PER_SPLIT // LINEAR_K_TILE, stage=2):
+            # Peel the first K tile: pl.matmul stamps the accumulator compact, so mad
+            # may write t_rows < LINEAR_T_TILE at the narrowed pitch. A create_tensor
+            # accumulator plus init_cond stays uncompact and fails AccCompactValid now
+            # that LINEAR_T_TILE spans several 16-row fractals.
+            x_linear_first = pl.slice(x_flat, [LINEAR_T_TILE, LINEAR_K_TILE], [t0, k_base], valid_shape=[t_rows, LINEAR_K_TILE])
+            w_first = pl.slice(hc_fn, [MIX_PAD, LINEAR_K_TILE], [0, k_base], valid_shape=[MIX_HC, LINEAR_K_TILE])
+            acc = pl.matmul(x_linear_first, w_first, b_trans=True, out_dtype=pl.FP32)
+            for kb in pl.pipeline(1, LINEAR_K_PER_SPLIT // LINEAR_K_TILE, stage=2):
                 k0 = k_base + kb * LINEAR_K_TILE
                 x_linear_chunk = pl.slice(x_flat, [LINEAR_T_TILE, LINEAR_K_TILE], [t0, k0], valid_shape=[t_rows, LINEAR_K_TILE])
                 w_chunk = pl.slice(hc_fn, [MIX_PAD, LINEAR_K_TILE], [0, k0], valid_shape=[MIX_HC, LINEAR_K_TILE])
-                acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True, init_cond=(kb == 0))
+                acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True)
             partial_row0 = linear_split * t_linear + t0
             mixes_partials[partial_row0 : partial_row0 + LINEAR_T_TILE, 0:MIX_PAD] = acc
     return inv_rms, mixes_partials
