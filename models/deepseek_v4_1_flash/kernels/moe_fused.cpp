@@ -2890,7 +2890,9 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
             constexpr l1_ptr<float8_e4m3_t, Major::K> l1a(L0ASizeBytes / BLOCK_K, BLOCK_K, 0);
             constexpr l1_ptr<float8_e4m3_t, Major::MN> l1b(MAD_N, BLOCK_K, kL1BBase);
             constexpr l1_ptr<float8_e4m3_t, Major::MN> shared_l1b(BLOCK_N, BLOCK_K, l1b.addr);
-            constexpr l0a_ptr<float8_e4m3_t> l0a(MAD_M, MAD_K);
+            // The empty events protect physical slots across expert tasks.
+            // Keep their pitch fixed when consecutive tasks select different MAD_M.
+            constexpr l0a_ptr<float8_e4m3_t> l0a(L0ASizeBytes / (kNumL0Stages * MAD_K), MAD_K);
             constexpr l0b_ptr<float8_e4m3_t> l0b(MAD_N, MAD_K);
             constexpr l0c_ptr<float> l0c(MAD_M, MAD_N);
 
