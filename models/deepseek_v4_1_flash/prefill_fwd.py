@@ -230,76 +230,79 @@ def prefill_attention(
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
     mode: pl.Scalar[pl.INT32],
+    c1a_phase: pl.constexpr,
 ):
-    if mode == 0:
-        prefill_swa(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, q_window_indices,
-            rope_cos, rope_sin, window_slots, num_tokens, window_cache,
-            kv_hidden, hc_output, hc_next_pre_mix,
-        )
-    elif mode == 1:
-        prefill_c2a_full(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, compressor_wkv,
-            compressor_wgate, compressor_norm_weight, index_wk, index_norm_weight, index_wq_b,
-            index_wq_b_scale, index_weights_proj, q_window_indices, q_request_ids, q_compressed_lens,
-            rope_cos, rope_sin, window_slots, num_tokens, window_cache,
-            compressed_rope_cos, compressed_rope_sin, c2a_compressed_slots, token_to_req_indices, position_ids,
-            query_start_loc, state_block_table, state_cache, compressed_cache, index_cache,
-            index_cache_scale, c2a_index_block_table, kv_hidden, hc_output,
-            hc_next_pre_mix, topk_indices,
-        )
-    elif mode == 2:
-        prefill_c1a_reuse(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, q_window_indices,
-            topk_indices, rope_cos, rope_sin, window_slots, num_tokens,
-            window_cache, compressed_cache, kv_hidden, hc_output,
-            hc_next_pre_mix,
-        )
-    elif mode == 3:
-        prefill_c1a_full(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, compressor_wkv,
-            compressor_norm_weight, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
-            index_weights_proj, q_window_indices, q_request_ids, q_compressed_lens, rope_cos,
-            rope_sin, window_slots, num_tokens, window_cache, compressed_rope_cos,
-            compressed_rope_sin, c2a_compressed_slots, compressed_cache, index_cache, index_cache_scale,
-            c1a_index_block_table, kv_hidden, hc_output, hc_next_pre_mix,
-            topk_indices, pool_block_ids, pool_block_counts,
-            publish_compressed=False,
-        )
-    elif mode == 4:
-        prefill_c1a_reindex(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, index_wq_b,
-            index_wq_b_scale, index_weights_proj, q_window_indices, q_request_ids, q_compressed_lens,
-            pool_block_ids, pool_block_counts, rope_cos, rope_sin, window_slots,
-            num_tokens, window_cache, compressed_cache, index_cache, index_cache_scale,
-            c1a_index_block_table, kv_hidden, hc_output, hc_next_pre_mix,
-            topk_indices,
-        )
-    elif mode == 5:
-        prefill_c1a_reuse(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, q_window_indices,
-            topk_indices, rope_cos, rope_sin, window_slots, num_tokens,
-            window_cache, compressed_cache, kv_hidden, hc_output,
-            hc_next_pre_mix,
-        )
+    if not c1a_phase:
+        if mode == 0:
+            prefill_swa(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, q_window_indices,
+                rope_cos, rope_sin, window_slots, num_tokens, window_cache,
+                kv_hidden, hc_output, hc_next_pre_mix,
+            )
+        elif mode == 1:
+            prefill_c2a_full(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, compressor_wkv,
+                compressor_wgate, compressor_norm_weight, index_wk, index_norm_weight, index_wq_b,
+                index_wq_b_scale, index_weights_proj, q_window_indices, q_request_ids, q_compressed_lens,
+                rope_cos, rope_sin, window_slots, num_tokens, window_cache,
+                compressed_rope_cos, compressed_rope_sin, c2a_compressed_slots, token_to_req_indices, position_ids,
+                query_start_loc, state_block_table, state_cache, compressed_cache, index_cache,
+                index_cache_scale, c2a_index_block_table, kv_hidden, hc_output,
+                hc_next_pre_mix, topk_indices,
+            )
+        elif mode == 2:
+            prefill_c1a_reuse(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, q_window_indices,
+                topk_indices, rope_cos, rope_sin, window_slots, num_tokens,
+                window_cache, compressed_cache, kv_hidden, hc_output,
+                hc_next_pre_mix,
+            )
+    else:
+        if mode == 3:
+            prefill_c1a_full(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, compressor_wkv,
+                compressor_norm_weight, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
+                index_weights_proj, q_window_indices, q_request_ids, q_compressed_lens, rope_cos,
+                rope_sin, window_slots, num_tokens, window_cache, compressed_rope_cos,
+                compressed_rope_sin, c2a_compressed_slots, compressed_cache, index_cache, index_cache_scale,
+                c1a_index_block_table, kv_hidden, hc_output, hc_next_pre_mix,
+                topk_indices, pool_block_ids, pool_block_counts,
+                publish_compressed=False,
+            )
+        elif mode == 4:
+            prefill_c1a_reindex(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, index_wq_b,
+                index_wq_b_scale, index_weights_proj, q_window_indices, q_request_ids, q_compressed_lens,
+                pool_block_ids, pool_block_counts, rope_cos, rope_sin, window_slots,
+                num_tokens, window_cache, compressed_cache, index_cache, index_cache_scale,
+                c1a_index_block_table, kv_hidden, hc_output, hc_next_pre_mix,
+                topk_indices,
+            )
+        elif mode == 5:
+            prefill_c1a_reuse(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, q_window_indices,
+                topk_indices, rope_cos, rope_sin, window_slots, num_tokens,
+                window_cache, compressed_cache, kv_hidden, hc_output,
+                hc_next_pre_mix,
+            )
     return hc_output, hc_next_pre_mix
 
 
@@ -371,85 +374,88 @@ def prefill_attention_cp(
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
     mode: pl.Scalar[pl.INT32],
+    c1a_phase: pl.constexpr,
 ):
-    if mode == 0:
-        prefill_swa_cp(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, q_rope_cos,
-            q_rope_sin, q_window_indices, local_tokens, rope_cos, rope_sin,
-            window_slots, num_tokens, window_cache, output_window, output_arrived,
-            kv_restore_indices, cp_group_base, cp_rank, attention_epoch, kv_hidden,
-            hc_output, hc_next_pre_mix,
-        )
-    elif mode == 1:
-        prefill_c2a_full_cp(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, compressor_wkv,
-            compressor_wgate, compressor_norm_weight, index_wk, index_norm_weight, index_wq_b,
-            index_wq_b_scale, index_weights_proj, q_rope_cos, q_rope_sin, q_window_indices,
-            q_request_ids, q_compressed_lens, local_tokens, rope_cos, rope_sin,
-            window_slots, num_tokens, window_cache, compressed_rope_cos, compressed_rope_sin,
-            c2a_compressed_slots, token_to_req_indices, position_ids, query_start_loc, state_block_table,
-            state_cache, compressed_cache, index_cache, index_cache_scale, c2a_index_block_table,
-            output_window, output_arrived, kv_restore_indices, cp_group_base, cp_rank,
-            attention_epoch, kv_hidden, hc_output, hc_next_pre_mix,
-            topk_indices,
-        )
-    elif mode == 2:
-        prefill_c1a_reuse_cp(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, q_rope_cos,
-            q_rope_sin, q_window_indices, topk_indices, local_tokens, rope_cos,
-            rope_sin, window_slots, num_tokens, window_cache, compressed_cache,
-            output_window, output_arrived, kv_restore_indices, cp_group_base, cp_rank,
-            attention_epoch, kv_hidden, hc_output, hc_next_pre_mix,
-        )
-    elif mode == 3:
-        prefill_c1a_full_cp(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, compressor_wkv,
-            compressor_norm_weight, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
-            index_weights_proj, q_rope_cos, q_rope_sin, q_window_indices, q_request_ids,
-            q_compressed_lens, local_tokens, rope_cos, rope_sin, window_slots,
-            num_tokens, window_cache, compressed_rope_cos, compressed_rope_sin, c2a_compressed_slots,
-            compressed_cache, index_cache, index_cache_scale, c1a_index_block_table, output_window,
-            output_arrived, kv_restore_indices, cp_group_base, cp_rank, attention_epoch,
-            kv_hidden, hc_output, hc_next_pre_mix, topk_indices,
-            pool_block_ids, pool_block_counts,
-            publish_compressed=False,
-        )
-    elif mode == 4:
-        prefill_c1a_reindex_cp(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, index_wq_b,
-            index_wq_b_scale, index_weights_proj, q_rope_cos, q_rope_sin, q_window_indices,
-            q_request_ids, q_compressed_lens, pool_block_ids, pool_block_counts, local_tokens,
-            rope_cos, rope_sin, window_slots, num_tokens, window_cache,
-            compressed_cache, index_cache, index_cache_scale, c1a_index_block_table, output_window,
-            output_arrived, kv_restore_indices, cp_group_base, cp_rank, attention_epoch,
-            kv_hidden, hc_output, hc_next_pre_mix, topk_indices,
-        )
-    elif mode == 5:
-        prefill_c1a_reuse_cp(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, q_rope_cos,
-            q_rope_sin, q_window_indices, topk_indices, local_tokens, rope_cos,
-            rope_sin, window_slots, num_tokens, window_cache, compressed_cache,
-            output_window, output_arrived, kv_restore_indices, cp_group_base, cp_rank,
-            attention_epoch, kv_hidden, hc_output, hc_next_pre_mix,
-        )
+    if not c1a_phase:
+        if mode == 0:
+            prefill_swa_cp(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, q_rope_cos,
+                q_rope_sin, q_window_indices, local_tokens, rope_cos, rope_sin,
+                window_slots, num_tokens, window_cache, output_window, output_arrived,
+                kv_restore_indices, cp_group_base, cp_rank, attention_epoch, kv_hidden,
+                hc_output, hc_next_pre_mix,
+            )
+        elif mode == 1:
+            prefill_c2a_full_cp(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, compressor_wkv,
+                compressor_wgate, compressor_norm_weight, index_wk, index_norm_weight, index_wq_b,
+                index_wq_b_scale, index_weights_proj, q_rope_cos, q_rope_sin, q_window_indices,
+                q_request_ids, q_compressed_lens, local_tokens, rope_cos, rope_sin,
+                window_slots, num_tokens, window_cache, compressed_rope_cos, compressed_rope_sin,
+                c2a_compressed_slots, token_to_req_indices, position_ids, query_start_loc, state_block_table,
+                state_cache, compressed_cache, index_cache, index_cache_scale, c2a_index_block_table,
+                output_window, output_arrived, kv_restore_indices, cp_group_base, cp_rank,
+                attention_epoch, kv_hidden, hc_output, hc_next_pre_mix,
+                topk_indices,
+            )
+        elif mode == 2:
+            prefill_c1a_reuse_cp(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, q_rope_cos,
+                q_rope_sin, q_window_indices, topk_indices, local_tokens, rope_cos,
+                rope_sin, window_slots, num_tokens, window_cache, compressed_cache,
+                output_window, output_arrived, kv_restore_indices, cp_group_base, cp_rank,
+                attention_epoch, kv_hidden, hc_output, hc_next_pre_mix,
+            )
+    else:
+        if mode == 3:
+            prefill_c1a_full_cp(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, compressor_wkv,
+                compressor_norm_weight, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
+                index_weights_proj, q_rope_cos, q_rope_sin, q_window_indices, q_request_ids,
+                q_compressed_lens, local_tokens, rope_cos, rope_sin, window_slots,
+                num_tokens, window_cache, compressed_rope_cos, compressed_rope_sin, c2a_compressed_slots,
+                compressed_cache, index_cache, index_cache_scale, c1a_index_block_table, output_window,
+                output_arrived, kv_restore_indices, cp_group_base, cp_rank, attention_epoch,
+                kv_hidden, hc_output, hc_next_pre_mix, topk_indices,
+                pool_block_ids, pool_block_counts,
+                publish_compressed=False,
+            )
+        elif mode == 4:
+            prefill_c1a_reindex_cp(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, index_wq_b,
+                index_wq_b_scale, index_weights_proj, q_rope_cos, q_rope_sin, q_window_indices,
+                q_request_ids, q_compressed_lens, pool_block_ids, pool_block_counts, local_tokens,
+                rope_cos, rope_sin, window_slots, num_tokens, window_cache,
+                compressed_cache, index_cache, index_cache_scale, c1a_index_block_table, output_window,
+                output_arrived, kv_restore_indices, cp_group_base, cp_rank, attention_epoch,
+                kv_hidden, hc_output, hc_next_pre_mix, topk_indices,
+            )
+        elif mode == 5:
+            prefill_c1a_reuse_cp(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, q_rope_cos,
+                q_rope_sin, q_window_indices, topk_indices, local_tokens, rope_cos,
+                rope_sin, window_slots, num_tokens, window_cache, compressed_cache,
+                output_window, output_arrived, kv_restore_indices, cp_group_base, cp_rank,
+                attention_epoch, kv_hidden, hc_output, hc_next_pre_mix,
+            )
     return hc_output, hc_next_pre_mix
 
 
@@ -685,10 +691,10 @@ def l2_prefill_fwd(
     history_pages = pl.tensor.dim(compressed_cache, 1)
     c1a_cache_units = pl.slice(compressed_cache, [2, history_pages, 64, 1, COMPRESSED_CACHE_BYTES], [3, 0, 0, 0, 0])
     c1a_cache = pl.reshape(c1a_cache_units, [history_pages, 128, 1, COMPRESSED_CACHE_BYTES])
-    c1a_index_units = pl.slice(index_cache, [2, history_pages, 64, 1, 64], [3, 0, 0, 0, 0])
-    c1a_index = pl.reshape(c1a_index_units, [history_pages, 128, 1, 64])
-    c1a_scale_units = pl.slice(index_scales, [2, history_pages, 64, 1, 4], [3, 0, 0, 0, 0])
-    c1a_scale = pl.reshape(c1a_scale_units, [history_pages, 128, 1, 4])
+    c1a_index_units = index_cache[3:5]
+    c1a_index = pl.reshape(c1a_index_units, [pl.tensor.dim(index_cache, 1), 128, 1, 64])
+    c1a_scale_units = index_scales[3:5]
+    c1a_scale = pl.reshape(c1a_scale_units, [pl.tensor.dim(index_scales, 1), 128, 1, 4])
     for layer in pl.range(N_LAYERS):
         stage = layer // 20
         active = pl.read(counts, [stage])
@@ -828,6 +834,7 @@ def l2_prefill_fwd(
                     layer_index_weights, pool_block_ids, pool_block_counts, topk_indices, attention_window, attention_arrived,
                     normalized, attn_hidden, attn_pre, local_active,
                     rank // CP_SIZE * CP_SIZE, rank % CP_SIZE, active, layer + 1, mode,
+                    c1a_phase=True,
                 )
             else:
                 prefill_attention_entry(
@@ -845,6 +852,7 @@ def l2_prefill_fwd(
                     layer_index_weights, pool_block_ids, pool_block_counts, topk_indices, attention_window, attention_arrived,
                     normalized, attn_hidden, attn_pre, local_active,
                     rank // CP_SIZE * CP_SIZE, rank % CP_SIZE, active, layer + 1, mode,
+                    c1a_phase=False,
                 )
         moe_ready = prefill_moe_slabs(
             attn_hidden, attn_pre, layer_ffn_fn, layer_ffn_scale, layer_ffn_base, layer_ffn_norm, layer_gate_weight, layer_gate_bias,
