@@ -122,7 +122,7 @@ def _c1a_publish_normalize(
     weight: pl.Tile[[512], pl.BF16, pl.Mem.Vec],
     rows: pl.Scalar[pl.INDEX],
 ):
-    with pl.reg_scope():
+    with pl.reg_scope(auto_sync=False):
         full = pl.reg.full_mask(lanes=64)
         for row in pl.hardware_loop(rows):
             summed = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
@@ -152,7 +152,7 @@ def _c1a_publish_rotate(
     sine: pl.Tile[[512], pl.FP32, pl.Mem.Vec],
     rows: pl.Scalar[pl.INDEX],
 ):
-    with pl.reg_scope():
+    with pl.reg_scope(auto_sync=False):
         full = pl.reg.full_mask(lanes=64)
         lower = pl.reg.active_mask(32, lanes=64)
         for row in pl.hardware_loop(rows):
@@ -165,6 +165,7 @@ def _c1a_publish_rotate(
             interleaved, unused = pl.reg.intlv(real, imag, full)
             bf = pl.reg.convert(interleaved, dtype=pl.BF16, rounding="R", saturate=False)
             _source_write = pl.reg.store(source, row * 512 + 448, bf)
+        pl.reg.mem_bar("VST_VLD")
     return source
 
 
@@ -177,7 +178,7 @@ def _c1a_publish_quantize(
     maxima = pl.tile.create([256], dtype=pl.BF16, target_memory=pl.Mem.Vec)
     rounded = pl.tile.create([512], dtype=pl.FP32, target_memory=pl.Mem.Vec)
     factors = pl.tile.create([512], dtype=pl.BF16, target_memory=pl.Mem.Vec)
-    with pl.reg_scope():
+    with pl.reg_scope(auto_sync=False):
         full = pl.reg.full_mask(lanes=64)
         lower = pl.reg.active_mask(32, lanes=64)
         scale_mask = pl.reg.full_mask(lanes=32)
@@ -192,12 +193,14 @@ def _c1a_publish_quantize(
                 compact = pl.reg.reduce_max(abs_bits, full16, group_size=16)
                 bf_max = pl.reg.interpret_cast(compact, dtype=pl.BF16)
                 _maxima_write = pl.reg.store(maxima, row * 32 + chunk * 8, bf_max)
+            pl.reg.mem_bar("VST_VLD")
             maximum = pl.reg.convert(pl.reg.load(maxima, row * 32, lanes=32), dtype=pl.FP32)
             scale32 = pl.reg.maximums(pl.reg.muls(maximum, 1.0 / 6.0, scale_mask), 0.001953125, scale_mask)
             bf_scale = pl.reg.convert(scale32, dtype=pl.BF16, rounding="R", saturate=False)
             _factors_write = pl.reg.store(factors, row * 64, bf_scale)
             rounded_scale = pl.reg.convert(bf_scale, dtype=pl.FP32)
             _rounded_write = pl.reg.store(rounded, row * 64, rounded_scale)
+            pl.reg.mem_bar("VST_VLD")
             for segment in pl.hardware_loop(8):
                 value = pl.reg.convert(pl.reg.load(source, row * 512 + segment * 64, lanes=64), dtype=pl.FP32)
                 offsets = pl.reg.adds(group_indices, pl.cast(row * 64 + segment * 4, pl.UINT32), full)
@@ -248,20 +251,33 @@ def _c1a_publish_flush(
     cosine: pl.Tensor,
     sine: pl.Tensor,
 ):
+    # Explicit pipe events give this kernel ownership of Tile-level synchronization.
+    pl.system.set_flag(pl.PipeType.S, pl.PipeType.MTE2, 0)
+    pl.system.wait_flag(pl.PipeType.S, pl.PipeType.MTE2, 0)
     for row in pl.range(rows):
         load_token = pl.cast(pl.tile.read(tokens, [row]), pl.INDEX)
         inputs = pl.tile.gather_row(inputs, source, [row, 0], [load_token, 0], [1, HEAD_DIM])
         cosv = pl.tile.gather_row(cosv, cosine, [row, 0], [load_token, 0], [1, 32])
         sinv = pl.tile.gather_row(sinv, sine, [row, 0], [load_token, 0], [1, 32])
+    pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, 0)
+    pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.V, 0)
     flat_inputs = pl.reshape(inputs, [4096])
     norm = _c1a_publish_normalize(flat_inputs, weight, rows)
+    # Each token is visited once, so latent rows can be written as a batch.
+    pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE3, 0)
+    pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE3, 0)
     norm_rows = pl.reshape(norm, [8, HEAD_DIM])
     for row in pl.range(rows):
         token = pl.tile.read(tokens, [row])
         value = pl.tile.slice(norm_rows, [1, HEAD_DIM], [row, 0])
         pl.store(value, [token, 0], latent)
+    # RoPE overwrites norm in place. Wait until MTE3 has read the whole batch.
+    pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, 0)
+    pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 0)
     rotated = _c1a_publish_rotate(norm, pl.reshape(cosv, [512]), pl.reshape(sinv, [512]), rows)
     payload, bf_factors = _c1a_publish_quantize(rotated, rows)
+    pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE3, 0)
+    pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE3, 0)
     payload_rows = pl.reshape(payload, [8, HEAD_DIM])
     bf_factor_rows = pl.reshape(bf_factors, [8, 64])
     for row in pl.range(rows):
@@ -272,6 +288,10 @@ def _c1a_publish_flush(
             factors_cmp = pl.tile.slice(bf_factor_rows, [1, 32], [row, 0])
             scale_bytes = pl.reinterpret_view(factors_cmp, pl.UINT8)
             pl.store(scale_bytes, [target, 256], cache_scales)
+            # Cache slots may repeat. Finish both writes before publishing another slot.
+            pl.system.barrier(pipe=pl.PipeType.MTE3)
+    # A subsequent batch reuses UB for its gathers and VF outputs.
+    pl.system.barrier(pipe=pl.PipeType.ALL)
     return cache
 
 
@@ -299,6 +319,8 @@ def _c1a_publish_body(
     for base in pl.range(0, num_tokens, 32):
         count = pl.min(32, num_tokens - base)
         slot_tile = pl.load(slots, [base], [32], valid_shape=[count], target_memory=pl.Mem.Vec)
+        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.S, 0)
+        pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.S, 0)
         for lane in pl.range(count):
             token = base + lane
             slot = pl.tile.read(slot_tile, [lane])
@@ -326,6 +348,8 @@ def _c1a_publish_body(
                         sine,
                     )
                     pending = 0
+        pl.system.set_flag(pl.PipeType.S, pl.PipeType.MTE2, 0)
+        pl.system.wait_flag(pl.PipeType.S, pl.PipeType.MTE2, 0)
     if pending > 0:
         cache = _c1a_publish_flush(
             inputs, gamma, cosv, sinv, targets, tokens, latent, cache, cache_scales, pending, source, cosine, sine
@@ -365,7 +389,8 @@ def c1a_compressor_publish_python(
 ):
     """Normalize and publish MXFP4 rows while retaining the unrotated latent."""
     active_tokens = pl.cast(num_tokens, pl.INT32)
-    workers = pl.max(pl.min(active_tokens, 8), 1)
+    row_groups = (active_tokens + 2 * C1A_PROJ_M_TILE - 1) // (2 * C1A_PROJ_M_TILE)
+    workers = pl.max(pl.min(pl.min(active_tokens, row_groups * 8), pl.system.available_cluster_count()), 1)
     flat_cache = pl.reshape(cache, [pl.tensor.dim(cache, 0) * 128, COMPRESSED_CACHE_BYTES])
     # Both aliases use the physical 320-byte row pitch.
     # Payload writes [0, 256), scales write [256, 320).
