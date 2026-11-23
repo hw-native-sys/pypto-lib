@@ -224,7 +224,7 @@ def prefill_c1a_full(
                 wq_b, wq_b_scale,
                 chunk_rope_cos, chunk_rope_sin,
                 q_latent, q,
-                active, qa_worker_limit=24, qb_worker_limit=20,
+                active, previous_chunk=chunk_done, qa_worker_limit=24, qb_worker_limit=20,
                 padded_rows=q_input_payload_padded_rows,
                 qa_row_tile=256, qb_row_tile=128,
             )
@@ -629,7 +629,7 @@ def prefill_c1a_full_cp(
                 wq_b, wq_b_scale,
                 chunk_rope_cos, chunk_rope_sin,
                 q_latent, q,
-                active, qa_worker_limit=24, qb_worker_limit=24,
+                active, previous_chunk=chunk_done, qa_worker_limit=24, qb_worker_limit=24,
                 padded_rows=q_input_payload_padded_rows,
                 qa_row_tile=256, qb_row_tile=128,
             )

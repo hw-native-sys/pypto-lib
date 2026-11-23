@@ -127,52 +127,34 @@ def prefill_c1a_reindex(
             kv_write_slots, window_cache,
             kv_token_count,
         )
-        chunk_hidden = pl.create_tensor([Q_TILE, D], dtype=pl.BF16)
-        chunk_rope_cos = pl.create_tensor([Q_TILE, ROPE_DIM // 2], dtype=pl.FP32)
-        chunk_rope_sin = pl.create_tensor([Q_TILE, ROPE_DIM // 2], dtype=pl.FP32)
-        chunk_window_indices = pl.create_tensor([Q_TILE, 128], dtype=pl.INT32)
         pool_capacity = pl.tensor.dim(q_pool_block_ids, 1)
-        chunk_request_ids = pl.create_tensor([Q_TILE], dtype=pl.INT32)
-        chunk_compressed_lens = pl.create_tensor([Q_TILE], dtype=pl.INT32)
-        chunk_pool_block_ids = pl.create_tensor([Q_TILE, pool_capacity], dtype=pl.INT32)
-        chunk_pool_block_counts = pl.create_tensor([Q_TILE], dtype=pl.INT32)
-        chunk_topk_indices = pl.create_tensor([Q_TILE, INDEX_TOPK], dtype=pl.INT32)
-        q_latent = pl.create_tensor([Q_TILE, Q_LORA], dtype=pl.BF16)
-        q = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-
-        no_dependency = pl.system.task_invalid()
-        chunk_done = no_dependency
+        chunk_done = pl.system.task_invalid()
         for start in pl.range(0, kv_token_count, Q_TILE):
             active = pl.min(Q_TILE, kv_token_count - start)
-            # The prior chunk must finish reading every reusable scratch buffer.
-            with pl.spmd(WORKER_TILE, name_hint="prefill_c1a_reindex_stage", deps=[chunk_done]):
-                worker = pl.tile.get_block_idx()
-                for row in pl.range(worker, active, WORKER_TILE):
-                    source_row = start + row
-                    chunk_hidden[row:row + 1, :] = kv_hidden[source_row:source_row + 1, :]
-                    chunk_rope_cos[row:row + 1, :] = kv_rope_cos[source_row:source_row + 1, :]
-                    chunk_rope_sin[row:row + 1, :] = kv_rope_sin[source_row:source_row + 1, :]
-                    chunk_window_indices[row:row + 1, :] = q_window_indices[source_row:source_row + 1, :]
-                    pool_row = pl.slice(q_pool_block_ids, [1, POOL_TILE], [source_row, 0], valid_shape=[1, pool_capacity])
-                    chunk_pool_block_ids[row:row + 1, :] = pool_row
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="stage_query_metadata", deps=[chunk_done]):
-                for row in pl.range(active):
-                    request_ids_value = pl.read(q_request_ids, [start + row])
-                    pl.write(chunk_request_ids, [row], request_ids_value)
-                    compressed_lens_value = pl.read(q_compressed_lens, [start + row])
-                    pl.write(chunk_compressed_lens, [row], compressed_lens_value)
-                    pool_block_counts_value = pl.read(q_pool_block_counts, [start + row])
-                    pl.write(chunk_pool_block_counts, [row], pool_block_counts_value)
-            q_input_payload, q_input_scales, q_input_payload_padded_rows = qkv_quant(
-                chunk_hidden, active, row_tile=256,
-            )
+            chunk_hidden = pl.slice(kv_hidden, [active, D], [start, 0])
+            chunk_rope_cos = pl.slice(kv_rope_cos, [active, ROPE_DIM // 2], [start, 0])
+            chunk_rope_sin = pl.slice(kv_rope_sin, [active, ROPE_DIM // 2], [start, 0])
+            chunk_window_indices = pl.slice(q_window_indices, [active, 128], [start, 0])
+            q_latent = pl.create_tensor([Q_TILE, Q_LORA], dtype=pl.BF16)
+            q = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+            chunk_topk_indices = pl.slice(q_topk_indices, [active, INDEX_TOPK], [start, 0])
+            chunk_pool_block_ids = pl.slice(q_pool_block_ids, [active, pool_capacity], [start, 0])
+            chunk_pool_block_counts = pl.slice(q_pool_block_counts, [active], [start])
+            chunk_request_ids = pl.slice(q_request_ids, [active], [start])
+            chunk_compressed_lens = pl.slice(q_compressed_lens, [active], [start])
+            # The CP1 Q rows share the KV projection input. Q_TILE is a multiple
+            # of the activation M16 scale pack and the QA M256 projection tile.
+            q_input_payload_padded_rows = (active + 255) // 256 * 256
+            q_input_payload = pl.slice(kv_input_payload, [q_input_payload_padded_rows, D], [start, 0])
+            q_input_scales = pl.slice(kv_input_scales, [1, q_input_payload_padded_rows * (D // 32)],
+                                      [0, start * (D // 32)])
             qb_payload, qb_scales = q_proj_rope(
                 q_input_payload, q_input_scales,
                 wq_a, wq_a_scale, wq_norm,
                 wq_b, wq_b_scale,
                 chunk_rope_cos, chunk_rope_sin,
                 q_latent, q,
-                active, qa_worker_limit=24, qb_worker_limit=24,
+                active, previous_chunk=chunk_done, qa_worker_limit=24, qb_worker_limit=24,
                 padded_rows=q_input_payload_padded_rows,
                 qa_row_tile=256, qb_row_tile=128,
             )
@@ -182,7 +164,7 @@ def prefill_c1a_reindex(
                 chunk_hidden, q_latent, chunk_request_ids, chunk_compressed_lens,
                 index_cache, index_cache_scale, index_block_table,
                 chunk_rope_cos, chunk_rope_sin, w_index_q, w_index_q_scale, w_index_score,
-                chunk_pool_block_ids, chunk_pool_block_counts, chunk_topk_indices, active, no_dependency,
+                chunk_pool_block_ids, chunk_pool_block_counts, chunk_topk_indices, active, chunk_done,
                 pool=True, c2a=False,
             )
             gather_sparse_attention(
@@ -196,11 +178,7 @@ def prefill_c1a_reindex(
                 oa_row_tile=128, ob_row_tile=128,
             )
 
-            with pl.spmd(WORKER_TILE, name_hint="prefill_c1a_reindex_collect", deps=[projection_done]) as collect_tid:
-                worker = pl.tile.get_block_idx()
-                for row in pl.range(worker, active, WORKER_TILE):
-                    q_topk_indices[start + row:start + row + 1, :] = chunk_topk_indices[row:row + 1, :]
-            chunk_done = collect_tid
+            chunk_done = pl.system.task_dummy(deps=[projection_done, _index_ready])
     if kv_token_count < q_capacity:
         with pl.spmd(32, name_hint="prefill_c1a_reindex_zero_padding"):
             worker = pl.tile.get_block_idx()
@@ -527,7 +505,7 @@ def prefill_c1a_reindex_cp(
                 wq_b, wq_b_scale,
                 chunk_rope_cos, chunk_rope_sin,
                 q_latent, q,
-                active, qa_worker_limit=24, qb_worker_limit=24,
+                active, previous_chunk=chunk_done, qa_worker_limit=24, qb_worker_limit=24,
                 padded_rows=q_input_payload_padded_rows,
                 qa_row_tile=256, qb_row_tile=128,
             )
@@ -792,7 +770,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=lambda value: [int(part) for part in value.split(",")], help="comma-separated device IDs")
     parser.add_argument("--cp", type=int, default=CP_SIZE, choices=SUPPORTED_CP_SIZES)
     parser.add_argument("--dp", type=int, default=1, choices=[1, 2, 4, 8])
-    parser.add_argument("--tokens", type=int, default=128)
+    parser.add_argument("--tokens", type=int, default=Q_TILE + 1)
     parser.add_argument("--dp-tokens", type=lambda value: [int(part) for part in value.split(",")], help="active token counts per DP group")
     parser.add_argument("--requests", type=int, default=1, help="request count per DP when query-lens is omitted")
     parser.add_argument("--query-lens", type=parse_prefill_groups, help="request lengths, e.g. '17,15;32'")

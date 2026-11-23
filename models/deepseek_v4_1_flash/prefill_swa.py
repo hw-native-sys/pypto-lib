@@ -108,23 +108,14 @@ def prefill_swa(
             kv_write_slots, window_cache,
             kv_token_count,
         )
-        chunk_rope_cos = pl.create_tensor([Q_TILE, ROPE_DIM // 2], dtype=pl.FP32)
-        chunk_rope_sin = pl.create_tensor([Q_TILE, ROPE_DIM // 2], dtype=pl.FP32)
-        chunk_window_indices = pl.create_tensor([Q_TILE, 128], dtype=pl.INT32)
-        q_latent = pl.create_tensor([Q_TILE, Q_LORA], dtype=pl.BF16)
-        q = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-
         chunk_done = pl.system.task_invalid()
         for start in pl.range(0, kv_token_count, Q_TILE):
             active = pl.min(Q_TILE, kv_token_count - start)
-            # The prior chunk must finish reading every reusable scratch buffer.
-            with pl.spmd(WORKER_TILE, name_hint="prefill_swa_stage", deps=[chunk_done]):
-                worker = pl.tile.get_block_idx()
-                for row in pl.range(worker, active, WORKER_TILE):
-                    source_row = start + row
-                    chunk_rope_cos[row:row + 1, :] = kv_rope_cos[source_row:source_row + 1, :]
-                    chunk_rope_sin[row:row + 1, :] = kv_rope_sin[source_row:source_row + 1, :]
-                    chunk_window_indices[row:row + 1, :] = q_window_indices[source_row:source_row + 1, :]
+            chunk_rope_cos = pl.slice(kv_rope_cos, [active, ROPE_DIM // 2], [start, 0])
+            chunk_rope_sin = pl.slice(kv_rope_sin, [active, ROPE_DIM // 2], [start, 0])
+            chunk_window_indices = pl.slice(q_window_indices, [active, 128], [start, 0])
+            q_latent = pl.create_tensor([Q_TILE, Q_LORA], dtype=pl.BF16)
+            q = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
             q_input_payload_padded_rows = ((active + 255) // 256) * 256
             q_input_end = start + q_input_payload_padded_rows
             q_input_payload = kv_input_payload[start:q_input_end, :]
@@ -137,7 +128,7 @@ def prefill_swa(
                 wq_b, wq_b_scale,
                 chunk_rope_cos, chunk_rope_sin,
                 q_latent, q,
-                active, qa_worker_limit=24, qb_worker_limit=32,
+                active, previous_chunk=chunk_done, qa_worker_limit=24, qb_worker_limit=32,
                 padded_rows=q_input_payload_padded_rows,
                 qa_row_tile=256, qb_row_tile=128,
             )
@@ -146,14 +137,13 @@ def prefill_swa(
                 q, chunk_window_indices, window_cache, chunk_window_indices, window_cache,
                 attn_sink, attn_out, active, compressed_keys=0,
             )
-            _chunk_output, projection_done = o_proj_hc_post(
+            _chunk_output, chunk_done = o_proj_hc_post(
                 attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_rope_cos, chunk_rope_sin,
                 hc_input[start:start + active, :, :], post_mix[start:start + active, :],
                 residual_mix[start:start + active, :, :], hc_output[start:start + active, :, :], active,
                 oa_row_tile=128, ob_row_tile=128,
             )
 
-            chunk_done = projection_done
     if kv_token_count < q_capacity:
         with pl.spmd(32, name_hint="prefill_swa_zero_padding"):
             worker = pl.tile.get_block_idx()
@@ -396,7 +386,7 @@ def prefill_swa_cp(
                 wq_b, wq_b_scale,
                 chunk_rope_cos, chunk_rope_sin,
                 q_latent, q,
-                active, qa_worker_limit=24, qb_worker_limit=32,
+                active, previous_chunk=chunk_done, qa_worker_limit=24, qb_worker_limit=32,
                 padded_rows=q_input_payload_padded_rows,
                 qa_row_tile=256, qb_row_tile=128,
             )
@@ -830,7 +820,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=lambda value: [int(part) for part in value.split(",")], help="comma-separated device IDs")
     parser.add_argument("--cp", type=int, default=CP_SIZE, choices=SUPPORTED_CP_SIZES)
     parser.add_argument("--dp", type=int, default=1, choices=[1, 2, 4, 8])
-    parser.add_argument("--tokens", type=int, default=128)
+    parser.add_argument("--tokens", type=int, default=Q_TILE + 1)
     parser.add_argument("--dp-tokens", type=lambda value: [int(part) for part in value.split(",")], help="active token counts per DP group")
     parser.add_argument("--requests", type=int, default=1, help="request count per DP when query-lens is omitted")
     parser.add_argument("--query-lens", type=parse_prefill_groups, help="request lengths, e.g. '17,15;32'")

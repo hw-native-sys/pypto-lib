@@ -84,13 +84,14 @@ def decode_swa(
     q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales, proj_payload_padded_rows = qkv_quant(x_norm, num_tokens, row_tile=80)
+    previous_chunk = pl.system.task_invalid()
     q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
         qr, q,
-        num_tokens, qa_worker_limit=32, qb_worker_limit=32,
+        num_tokens, previous_chunk=previous_chunk, qa_worker_limit=32, qb_worker_limit=32,
         padded_rows=proj_payload_padded_rows,
         qa_row_tile=80, qb_row_tile=80,
     )

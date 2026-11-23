@@ -1341,12 +1341,18 @@ def grouped_mxfp8_linear(
     from quant import unpack_fp8_nz
 
     wo_a = unpack_fp8_nz(wo_a)
-    activation, activation_scale = _quantize_mxfp8_activation(grouped, scale_alg=0)
     weight_scale = decode_e8m0(unpack_mx_b_scale(wo_a_scale))
     weight_groups = wo_a.float().unflatten(-2, (-1, MX_GROUP))
-    partials = torch.einsum("tgmk,gmkr->tgmr", activation.float(), weight_groups)
-    partials = partials * activation_scale.unsqueeze(-1) * weight_scale.unsqueeze(0)
-    return partials.sum(dim=2).to(output_dtype or grouped.dtype)
+    result = grouped.new_empty((*grouped.shape[:-1], wo_a.shape[-1]), dtype=output_dtype or grouped.dtype)
+    # Bound the independent FP32 dot products to 128 token rows per contraction.
+    for start in range(0, grouped.shape[0], 128):
+        rows = grouped[start:start + 128]
+        activation, activation_scale = _quantize_mxfp8_activation(rows, scale_alg=0)
+        partials = torch.einsum("tgmk,gmkr->tgmr", activation.float(), weight_groups)
+        partials = partials * activation_scale.unsqueeze(-1) * weight_scale.unsqueeze(0)
+        result[start:start + 128] = partials.sum(dim=2)
+    return result
+
 
 def golden_grouped_output(
     grouped: torch.Tensor, wo_a: torch.Tensor, wo_a_scale: torch.Tensor,

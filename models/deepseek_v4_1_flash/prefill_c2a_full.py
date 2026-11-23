@@ -175,6 +175,7 @@ def prefill_c2a_full(
             compressed_latent, w_index_k, w_index_norm, compressed_rope_cos, compressed_rope_sin,
             compressed_write_slots, index_cache, index_cache_scale, kv_token_count, compressed_published, no_dependency,
         )
+        chunk_done = no_dependency
         for start in pl.range(0, kv_token_count, Q_TILE):
             active = pl.min(Q_TILE, kv_token_count - start)
             chunk_hidden = pl.slice(kv_hidden, [active, D], [start, 0])
@@ -197,7 +198,7 @@ def prefill_c2a_full(
                 wq_b, wq_b_scale,
                 chunk_rope_cos, chunk_rope_sin,
                 q_latent, q,
-                active, qa_worker_limit=24, qb_worker_limit=32,
+                active, previous_chunk=chunk_done, qa_worker_limit=24, qb_worker_limit=32,
                 padded_rows=q_input_payload_padded_rows,
                 qa_row_tile=256, qb_row_tile=128,
             )
@@ -214,7 +215,7 @@ def prefill_c2a_full(
                 q, chunk_window_indices, window_cache, chunk_topk_indices, compressed_cache,
                 attn_sink, attn_out, active, compressed_keys=INDEX_TOPK,
             )
-            _chunk_output, _projection_done = o_proj_hc_post(
+            _chunk_output, chunk_done = o_proj_hc_post(
                 attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_rope_cos, chunk_rope_sin,
                 hc_input[start:start + active, :, :], post_mix[start:start + active, :],
                 residual_mix[start:start + active, :, :], hc_output[start:start + active, :, :], active,
@@ -615,7 +616,7 @@ def prefill_c2a_full_cp(
                 wq_b, wq_b_scale,
                 chunk_rope_cos, chunk_rope_sin,
                 q_latent, q,
-                active, qa_worker_limit=24, qb_worker_limit=32,
+                active, previous_chunk=chunk_done, qa_worker_limit=24, qb_worker_limit=32,
                 padded_rows=q_input_payload_padded_rows,
                 qa_row_tile=256, qb_row_tile=128,
             )

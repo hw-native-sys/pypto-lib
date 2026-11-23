@@ -11,7 +11,7 @@
 
 
 from config import CP_SIZE, PREFILL_MAX_TOKENS
-from prefill_c1a_reuse import l3_prefill_c1a_reuse, l3_prefill_c1a_reuse_cp
+from prefill_c1a_reuse import Q_TILE, l3_prefill_c1a_reuse, l3_prefill_c1a_reuse_cp
 
 
 PREFILL_ATTN_RING_HEAP = (1024 * 1024 * 1024,) * 4
@@ -36,7 +36,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=lambda value: [int(part) for part in value.split(",")], help="comma-separated device IDs")
     parser.add_argument("--cp", type=int, default=CP_SIZE, choices=SUPPORTED_CP_SIZES)
     parser.add_argument("--dp", type=int, default=1, choices=[1, 2, 4, 8])
-    parser.add_argument("--tokens", type=int, default=128)
+    parser.add_argument("--tokens", type=int, default=Q_TILE + 1)
     parser.add_argument("--dp-tokens", type=lambda value: [int(part) for part in value.split(",")], help="active token counts per DP group")
     parser.add_argument("--requests", type=int, default=1, help="request count per DP when query-lens is omitted")
     parser.add_argument("--query-lens", type=parse_prefill_groups, help="request lengths, e.g. '17,15;32'")
