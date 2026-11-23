@@ -427,7 +427,7 @@ def validate_allgather():
 
 
 if __name__ == "__main__":
-    from models.deepseek_v4_flash_lowlat.build import run_operator_validations
+    from models.deepseek_v4_flash_lowlat.utils import run_operator_validations
 
     run_operator_validations(
         {

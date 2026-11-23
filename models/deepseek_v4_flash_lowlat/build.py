@@ -306,32 +306,6 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
     return compiled, report
 
 
-def run_operator_validations(cases, *, single_device=(), automatic=None):
-    """Preserve standalone component cases and route the CI device assignment."""
-    import subprocess
-
-    selector = argparse.ArgumentParser(add_help=False)
-    selector.add_argument("--operator", choices=tuple(cases), help="Select one standalone validation case")
-    selected, remaining = selector.parse_known_args()
-    if selected.operator is not None:
-        sys.argv[:] = [sys.argv[0], *remaining]
-        cases[selected.operator]()
-        return
-    if any(arg in ("-h", "--help") for arg in remaining):
-        selector.print_help()
-        return
-
-    device_parser = argparse.ArgumentParser(add_help=False)
-    device_parser.add_argument("-d", "--device")
-    options, forwarded = device_parser.parse_known_args(remaining)
-    for name in automatic if automatic is not None else cases:
-        args = remaining
-        if options.device is not None and name in single_device:
-            args = [*forwarded, "-d", options.device.split(",", 1)[0]]
-        print(f"Validating {name}", flush=True)
-        subprocess.run([sys.executable, sys.argv[0], "--operator", name, *args], check=True)
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", choices=["single", "one", "two", "rsag", "prefill"], required=True)
