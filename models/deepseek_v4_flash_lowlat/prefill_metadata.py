@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Prepare prefill inputs and bind metadata to caller-owned cache storage."""
 
+import logging
 from math import prod
 import torch
 from .prefill_ops.prefill_shapes import DECODE_SEQ as PREFILL_STATE_ROWS
@@ -325,6 +326,8 @@ def prefill_slot_mappings(positions, decode_tables, caches, *, block_counts=None
             physical = _physical_rows(decode_tables[table_name], boundaries, 128, page_rows, ratio,
                                       counts=counts.get(table_name))
             _check_rows(table_name, physical, caches[cache_name], cache_name)
+            if table_name == "idx_block_table":
+                _check_rows(table_name, physical, caches["idx_kv_scale"], "idx_kv_scale")
             for rank in range(RANKS):
                 if physical.shape[1] != torch.unique(physical[rank]).numel():
                     raise ValueError(f"{table_name} aliases compressed history")
@@ -407,6 +410,16 @@ MAX_PREFILL_TOKENS = 8192
 HIDDEN = 4096
 HC_MULT = 4
 VOCAB = 129280
+
+
+def advance_gate_epoch(epoch_base, physical_rows, *, layers=43):
+    """Check a chunk's reservation and return its endpoint."""
+    if any(type(value) is not int or value < 0 for value in (epoch_base, physical_rows, layers)):
+        raise ValueError("MoE gate epochs, physical extents, and layer counts must be nonnegative integers")
+    end = epoch_base + physical_rows * layers
+    if end >= 2**31 - 1:
+        raise ValueError("MoE gate counters require a fresh communication domain before INT32 overflow")
+    return end
 
 
 def _replicate(rows):
@@ -611,14 +624,19 @@ def _signature(owner, revision, token_count, start_pos, terminal, tables, caches
     extra_specs = tuple((name, _tensor_stamp(value)) for name, value in sorted(extras.items()))
     return (PLAN_VERSION, owner, revision, token_count, start_pos, terminal, max_logit_rows,
             cache_specs, table_specs, _tensor_stamp(rope_cos), _tensor_stamp(rope_sin),
-            _tensor_stamp(block_counts), extra_specs)
+            None if block_counts is None else _tensor_stamp(block_counts), extra_specs)
 
 
 class PreparedInputPlan:
     """Retain prompt-independent geometry; fill actual token IDs during each request."""
 
     def __init__(self, *, owner, revision, token_count, start_pos, terminal, tables, caches,
-                 rope_cos, rope_sin, max_logit_rows, block_counts, extras):
+                 rope_cos, rope_sin, max_logit_rows, block_counts=None, extras):
+        for name, shape in (("projection_epoch_bases", (RANKS, 6)), ("gate_epoch_bases", (RANKS, 1))):
+            value = extras.get(name)
+            if (not isinstance(value, torch.Tensor) or value.device.type != "cpu"
+                    or value.dtype != torch.int32 or tuple(value.shape) != shape):
+                raise ValueError(f"{name} must be a CPU INT32 tensor with shape {shape}")
         self.context = dict(owner=owner, revision=revision, token_count=token_count, start_pos=start_pos,
                             terminal=terminal, tables=tables, caches=caches, rope_cos=rope_cos,
                             rope_sin=rope_sin, max_logit_rows=max_logit_rows,
@@ -649,12 +667,11 @@ class PreparedInputPlan:
             raise ValueError("Actual INT64 token IDs must match the prepared token extent")
         if bool(((tokens < 0) | (tokens >= 129280)).any()):
             raise ValueError("Token ID outside the vocabulary")
-        if type(gate_epoch) is not int or not 0 <= gate_epoch < 2**31:
-            raise ValueError("MoE gate epoch must be a nonnegative INT32")
-        if len(projection_epochs) != 6 or any(type(v) is not int or not 0 <= v < 2**31 for v in projection_epochs):
-            raise ValueError("Projection epochs must be six nonnegative INT32 values")
         views = self.arena.views
         full = views["input_ids_full"]
+        advance_gate_epoch(gate_epoch, full.shape[1])
+        if len(projection_epochs) != 6 or any(type(v) is not int or not 0 <= v < 2**31 for v in projection_epochs):
+            raise ValueError("Projection epochs must be six nonnegative INT32 values")
         full[:, :tokens.numel()].copy_(tokens.unsqueeze(0))
         full[:, tokens.numel():].zero_()
         views["input_ids"].copy_(full[0].reshape(RANKS, -1))
@@ -674,14 +691,27 @@ class DeviceMetadataArena:
         self.busy = False
         self.roots = {}
         self.fields = {}
-        for dtype, n in layout.elements.items():
-            shards = [worker.alloc_tensor((n,), dtype, worker_id=rank) for rank in range(RANKS)]
-            self.roots[dtype] = StackedDeviceTensor(shards, (RANKS, n), range(RANKS))
-        for name, field in layout.fields.items():
-            root = self.roots[field.dtype]
-            shards = [worker.view_tensor(shard, field.shape, byte_offset=field.byte_offset, worker_id=rank)
-                      for rank, shard in enumerate(root.shards)]
-            self.fields[name] = StackedDeviceTensor(shards, (RANKS, *field.shape), range(RANKS))
+        allocations = []
+        try:
+            for dtype, n in layout.elements.items():
+                shards = []
+                for rank in range(RANKS):
+                    shard = worker.alloc_tensor((n,), dtype, worker_id=rank)
+                    allocations.append((rank, shard))
+                    shards.append(shard)
+                self.roots[dtype] = StackedDeviceTensor(shards, (RANKS, n), range(RANKS))
+            for name, field in layout.fields.items():
+                root = self.roots[field.dtype]
+                shards = [worker.view_tensor(shard, field.shape, byte_offset=field.byte_offset, worker_id=rank)
+                          for rank, shard in enumerate(root.shards)]
+                self.fields[name] = StackedDeviceTensor(shards, (RANKS, *field.shape), range(RANKS))
+        except BaseException:
+            for rank, shard in reversed(allocations):
+                try:
+                    worker.free_tensor(shard, worker_id=rank)
+                except Exception:
+                    logging.getLogger(__name__).exception("Could not free failed metadata arena root on rank %d", rank)
+            raise
 
     def require_idle(self, worker):
         if worker is not self.worker:

@@ -289,12 +289,15 @@ def golden_hc_head(tensors):
     tensors["y"][:] = y.to(torch.bfloat16)
 
 
+HC_VALIDATION_MAX_ROWS = 8192
+
+
 def build_tensor_specs_hc(token_count: int = T):
     import torch
     from golden import TensorSpec
 
-    if token_count <= 0 or token_count > MAX_SEQ_LEN:
-        raise ValueError(f"token_count must be in [1, {MAX_SEQ_LEN}], got {token_count}")
+    if not 1 <= token_count <= HC_VALIDATION_MAX_ROWS:
+        raise ValueError(f"token_count must be in [1, {HC_VALIDATION_MAX_ROWS}], got {token_count}")
 
     def init_x_hc():
         return torch.randn(token_count, HC_MULT, D) * 0.05
@@ -924,7 +927,7 @@ def l2_prefill_head(
     hc_head_scale: pl.Tensor[[1], pl.FP32],
     hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
     final_norm_w: pl.Tensor[[D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, PROJECTION_WEIGHT_LAYOUT],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     grammar_mask: pl.Tensor[[MAX_LOGIT_ROWS, GREEDY_GRID_ROWS, GRAMMAR_SEGMENT_WORDS], pl.INT16],
     x_out: pl.Out[pl.Tensor[[PREFILL_ROWS, D], pl.BF16]],
@@ -1094,6 +1097,102 @@ def build_tensor_specs_lm(num_tokens=TEST_TOKENS):
     ]
 
 
+def golden_prefill_tap(tensors):
+    import torch
+
+    tap_index = int(tensors["tap_index"])
+    group_tokens = int(tensors["group_tokens"])
+    target = tensors["target_hidden"]
+    local_rows = target.shape[1]
+    column = tap_index * D
+    for rank in range(TP_SIZE):
+        first_row = rank * local_rows
+        live_rows = max(0, min(local_rows, group_tokens - first_row))
+        rows = torch.zeros((local_rows, D), dtype=torch.bfloat16)
+        if live_rows:
+            source = tensors["x_hc"][rank, first_row:first_row + live_rows]
+            rows[:live_rows] = source.mean(dim=1).to(torch.bfloat16)
+        target[rank, :, column:column + D] = rows
+
+
+def golden_prefill_head(tensors):
+    import torch
+    from models.deepseek_v4_flash_lowlat.rmsnorm_common import golden_rms_norm
+
+    output = tensors["x_out"]
+    for rank in range(TP_SIZE):
+        hidden = torch.empty_like(output[rank])
+        golden_hc_head({
+            "x_hc": tensors["x_hc"][rank],
+            "hc_head_fn": tensors["hc_head_fn"][rank],
+            "hc_head_scale": tensors["hc_head_scale"][rank],
+            "hc_head_base": tensors["hc_head_base"][rank],
+            "y": hidden,
+        })
+        output[rank] = golden_rms_norm(hidden, tensors["final_norm_w"][rank])
+    golden_lm_head_sample({**tensors, "hidden_states": output})
+
+
+def validate_composed_head(config, *, compile_only):
+    import torch
+    from golden import ScalarSpec, TensorSpec, ratio_allclose, run
+
+    local_rows = 4
+    physical_rows = TP_SIZE * local_rows
+    logical_rows = physical_rows - 1
+    x_hc = torch.randn((physical_rows, HC_MULT, D), dtype=torch.float32) * 0.05
+    x_hc[logical_rows:] = 0
+    x_hc = torch.stack([x_hc] * TP_SIZE)
+    x_spec = TensorSpec("x_hc", list(x_hc.shape), torch.float32, init_value=x_hc)
+    tap_shape = (TP_SIZE, local_rows, 3 * D)
+    tap_result = run(
+        fn=l3_prefill_tap,
+        specs=[
+            x_spec,
+            TensorSpec("target_hidden", list(tap_shape), torch.bfloat16,
+                       init_value=lambda: torch.full(tap_shape, 3, dtype=torch.bfloat16)),
+            ScalarSpec("tap_index", torch.int32, 1),
+            ScalarSpec("group_tokens", torch.int32, logical_rows),
+        ],
+        golden_fn=golden_prefill_tap, config=config, compile_only=compile_only,
+        rtol=0, atol=0,
+    )
+    if not tap_result.passed:
+        raise SystemExit(tap_result.error or 1)
+
+    lm_specs = {spec.name: spec for spec in build_tensor_specs_lm(1)}
+    indices = torch.full((TP_SIZE, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
+    indices[0, 0] = logical_rows - 1
+    mask = torch.full((TP_SIZE, MAX_LOGIT_ROWS, GREEDY_GRID_ROWS, GRAMMAR_SEGMENT_WORDS), -1, dtype=torch.int16)
+    mask[0, 0] = 0
+    mask[0, 0, 0] = -32768
+    final_weight = torch.linspace(0.5, 1.5, D, dtype=torch.bfloat16).repeat(TP_SIZE, 1)
+    head_result = run(
+        fn=l3_prefill_head,
+        specs=[
+            x_spec,
+            TensorSpec("hc_head_fn", [TP_SIZE, HC_MULT, HC_DIM], torch.float32,
+                       init_value=lambda: torch.randn(TP_SIZE, HC_MULT, HC_DIM) * 0.0519),
+            TensorSpec("hc_head_scale", [TP_SIZE, 1], torch.float32,
+                       init_value=lambda: torch.full((TP_SIZE, 1), 0.076099)),
+            TensorSpec("hc_head_base", [TP_SIZE, HC_MULT], torch.float32,
+                       init_value=lambda: torch.tensor([5.9166, -3.6223, -2.9324, -3.3124]).repeat(TP_SIZE, 1)),
+            TensorSpec("final_norm_w", [TP_SIZE, D], torch.bfloat16, init_value=final_weight),
+            lm_specs["lm_head_weight"],
+            TensorSpec("logit_row_indices", list(indices.shape), torch.int32, init_value=indices),
+            TensorSpec("grammar_mask", list(mask.shape), torch.int16, init_value=mask),
+            TensorSpec("x_out", [TP_SIZE, physical_rows, D], torch.bfloat16),
+            lm_specs["logits"],
+            TensorSpec("sampled_ids", [TP_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], torch.int32),
+        ],
+        golden_fn=golden_prefill_head, config=config, compile_only=compile_only,
+        compare_fn={"x_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128)},
+        rtol=1e-3, atol=1e-3,
+    )
+    if not head_result.passed:
+        raise SystemExit(head_result.error or 1)
+
+
 def validate_hc():
     import argparse
     import torch
@@ -1104,7 +1203,9 @@ def validate_hc():
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--token-count", type=int, default=T, help="Physical token rows, up to 8192.")
+    parser.add_argument(
+        "--token-count", type=int, default=T, help=f"Physical token rows, up to {HC_VALIDATION_MAX_ROWS}.",
+    )
     parser.add_argument("--compile-only", action="store_true", default=False)
     # Int mode (0=off; 1=timing only, most accurate; 2=timing + dep graph, two runs).
     # `nargs="?"` so a bare `--enable-chip-swimlane` -> mode 1 (int, not bool True).
@@ -1147,8 +1248,8 @@ def validate_lm():
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES), help="LM-head tensor-parallel world size")
     parser.add_argument("--dp", type=int, default=DP_SIZE, choices=list(_DP_CHOICES), help="DP groups (world size = tp * dp)")
-    parser.add_argument("--num-tokens", type=int, default=TEST_TOKENS, help="Active hidden rows each owner projects")
-    parser.add_argument("--entry", type=str, default="projection", choices=("projection", "sample"))
+    parser.add_argument("--num-tokens", type=int, help="Active hidden rows each owner projects")
+    parser.add_argument("--entry", choices=("projection", "sample"))
     device_default = ",".join(str(i) for i in range(WORLD_SIZE))
     parser.add_argument("-d", "--device", type=str, default=device_default, help=f"comma-separated device ids; need at least {WORLD_SIZE}")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
@@ -1158,6 +1259,11 @@ def validate_lm():
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
+    check_composed = (
+        args.entry is None and args.num_tokens is None and args.runtime_dir is None and WORLD_SIZE == TP_SIZE
+    )
+    if args.num_tokens is None:
+        args.num_tokens = TEST_TOKENS
     device_ids = [int(d) for d in args.device.split(",")]
     required_devices = WORLD_SIZE
     assert len(device_ids) >= required_devices, f"need at least {required_devices} devices, got {device_ids}"
@@ -1196,24 +1302,22 @@ def validate_lm():
             ),
         )
 
+    config = dict(
+        dump_passes=args.dump_passes,
+        distributed_config=DistributedConfig(device_ids=device_ids[:required_devices], num_sub_workers=0),
+        backend_type=args.backend_type,
+        execution_mode=args.execution_mode,
+        enable_chip_swimlane=args.enable_chip_swimlane,
+        enable_scope_stats=args.enable_scope_stats,
+        ring_heap=LM_HEAD_RING_HEAP,
+    )
     result = run(
         fn=fn,
         specs=specs,
         golden_fn=golden_fn,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
-        config=dict(
-            dump_passes=args.dump_passes,
-            distributed_config=DistributedConfig(
-                device_ids=device_ids[:required_devices],
-                num_sub_workers=0,
-            ),
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-            enable_scope_stats=args.enable_scope_stats,
-            ring_heap=LM_HEAD_RING_HEAP,
-        ),
+        config=config,
         rtol=1e-3,
         atol=1e-3,
     )
@@ -1221,6 +1325,8 @@ def validate_lm():
         if result.error:
             print(result.error)
         raise SystemExit(1)
+    if check_composed:
+        validate_composed_head(config, compile_only=args.compile_only)
 
 
 if __name__ == "__main__":
@@ -1233,4 +1339,8 @@ if __name__ == "__main__":
         },
         single_device=('hc',),
         automatic=('lm', 'hc'),
+        standalone_options={
+            "lm": {"--entry", "--num-tokens", "--tp", "--dp", "--runtime-dir", "--enable-scope-stats"},
+            "hc": {"--token-count", "--seed"},
+        },
     )

@@ -1781,6 +1781,14 @@ if __name__ == "__main__":
         missing_page_ori_blocks = (missing_page_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
         cases.append((missing_page_tokens, missing_page_ori_blocks, 2, True))
 
+    compare_output = ratio_allclose(atol=1e-4, rtol=1.0 / 128)
+
+    def compare_missing_page(actual, expected, **kwargs):
+        passed, detail = compare_output(actual, expected, **kwargs)
+        if not passed:
+            return passed, detail
+        return compare_output(actual[-1:], expected[-1:], **kwargs)
+
     for tokens, ori_blocks, cmp_blocks, missing_cmp_page in cases:
         result = run(
             fn=prefill_sparse_attn_test,
@@ -1804,7 +1812,7 @@ if __name__ == "__main__":
             atol=1e-3,
             compile_only=args.compile_only,
             compare_fn={
-                "attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+                "attn_out": compare_missing_page if missing_cmp_page else compare_output,
             },
         )
         if not result.passed:

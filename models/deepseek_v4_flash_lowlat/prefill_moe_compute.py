@@ -259,6 +259,16 @@ def _router_scores(route_logits: pl.Tensor[[GATE_T_TILE, N_EXPERTS], pl.FP32]) -
 
 
 @pl.jit.inline(auto_scope=False)
+def _hash_route_weights(scores: pl.Tensor[[ROW_PAD, TOPK_PAD], pl.FP32]) -> pl.Tensor:
+    selected = pl.set_validshape(scores, GATE_T_TILE, TOPK)
+    denominator = pl.row_sum(selected)
+    # A positive FP32 router score is a square root, hence at least sqrt(2**-149).
+    safe_denominator = pl.maximum(denominator, 1.0e-30)
+    normalized = pl.mul(pl.row_expand_div(selected, safe_denominator), ROUTE_SCALE)
+    return pl.set_validshape(normalized, GATE_T_TILE, TOPK)
+
+
+@pl.jit.inline(auto_scope=False)
 def gate(
     x_mixed: pl.Tensor[[GATE_PREP_ROWS, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.BF16],
@@ -441,9 +451,7 @@ def gate(
                 gather_all = pl.gather(gp_score, dim=-1, index=hs_idx_tile)
                 hs_reduce = pl.create_tensor([ROW_PAD, TOPK_PAD], dtype=pl.FP32)
                 hs_reduce[0:GATE_T_TILE, :] = gather_all
-                hs_reduce = pl.set_validshape(hs_reduce, GATE_T_TILE, TOPK)
-                hs_denom = pl.row_sum(hs_reduce)
-                hs_weight_mat = pl.mul(pl.row_expand_div(hs_reduce, hs_denom), ROUTE_SCALE)
+                hs_weight_mat = _hash_route_weights(hs_reduce)
                 hs_indices_valid = pl.set_validshape(hs_idx_tile, GATE_T_TILE, TOPK)
                 indices = pl.assemble(indices, hs_indices_valid, [t1, 0])
                 weights = pl.assemble(weights, hs_weight_mat, [t1, 0])

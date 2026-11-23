@@ -87,23 +87,19 @@ def prefill_metadata_test(
     return lower_local_request_ids(query_start_loc, request_ids, local_base)
 
 
-def build_tensor_specs_metadata():
+def build_tensor_specs_metadata(offsets, local_token_count, local_base):
     import torch
     from golden import ScalarSpec, TensorSpec
 
-    query_start_loc = torch.tensor([0, 3, 7], dtype=torch.int32)
-    local_token_count = 4
-    request_ids = torch.full((local_token_count,), -1, dtype=torch.int32)
-    local_base = local_token_count
+    query_start_loc = torch.tensor(offsets, dtype=torch.int32)
     return [
         TensorSpec("query_start_loc", list(query_start_loc.shape), torch.int32, init_value=query_start_loc),
         ScalarSpec("local_base", torch.int32, local_base),
-        TensorSpec("request_ids", list(request_ids.shape), torch.int32),
+        TensorSpec("request_ids", [local_token_count], torch.int32),
     ]
 
 
 def golden_prefill_metadata(tensors):
-    import torch
 
     query_start_loc = tensors["query_start_loc"]
     local_token_count = tensors["request_ids"].shape[0]
@@ -119,9 +115,6 @@ def golden_prefill_metadata(tensors):
             if query_start_loc[request] <= packed_token < query_start_loc[request + 1]:
                 request_ids[local_token] = request
                 break
-    expected = torch.tensor([1, 1, 1, -1], dtype=torch.int32)
-    if not torch.equal(request_ids, expected):
-        raise AssertionError(f"unexpected request ids: {request_ids.tolist()}")
 
 
 # ci: devices=2
@@ -359,21 +352,23 @@ def validate_metadata():
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
 
-    result = run(
-        fn=prefill_metadata_test,
-        specs=build_tensor_specs_metadata(),
-        golden_fn=golden_prefill_metadata,
-        compile_only=args.compile_only,
-        config=dict(
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            device_id=args.device,
-        ),
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    fixtures = (([0, 3, 7], 4, 4), ([0, 512], 512, 0), ([0, 511], 512, 0))
+    for offsets, rows, local_base in fixtures:
+        result = run(
+            fn=prefill_metadata_test,
+            specs=build_tensor_specs_metadata(offsets, rows, local_base),
+            golden_fn=golden_prefill_metadata,
+            compile_only=args.compile_only,
+            config=dict(
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                device_id=args.device,
+            ),
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
 
 
 
@@ -436,4 +431,5 @@ if __name__ == "__main__":
         },
         single_device=('metadata',),
         automatic=('allgather', 'metadata'),
+        standalone_options={"allgather": {"--tp", "--local-t", "--runtime-dir", "--dump-passes"}},
     )

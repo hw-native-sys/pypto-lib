@@ -15,6 +15,8 @@ from pathlib import Path
 import sys
 import threading
 
+from .prefill_metadata import MAX_PREFILL_TOKENS, advance_gate_epoch as advance_gate_epoch
+
 
 _IMPORT_LOCK = threading.RLock()
 _RANKS = 8
@@ -262,24 +264,15 @@ def advance_projection_epochs(bases, request_lengths, *, projection_degrees, lay
             for base, end, family in zip(bases, result, families)]
 
 
-def prepare_gate_bindings(*, epoch_base=0):
+def prepare_gate_bindings(*, epoch_base=0, physical_rows=MAX_PREFILL_TOKENS):
     """Allocate the common rank-local MoE gate epoch before Worker preparation."""
     import torch
 
-    if type(epoch_base) is not int or not 0 <= epoch_base < 2**31 - 1:
-        raise ValueError("The MoE gate epoch base must be a nonnegative INT32")
+    if type(physical_rows) is not int or not 1 <= physical_rows <= MAX_PREFILL_TOKENS:
+        raise ValueError("Physical gate rows must be in [1, 8192]")
+    advance_gate_epoch(epoch_base, physical_rows)
     epochs = torch.full((_RANKS, 1), epoch_base, dtype=torch.int32)
     return {"gate_epoch_bases": epochs.share_memory_()}
-
-
-def advance_gate_epoch(epoch_base, physical_rows, *, layers=43):
-    """Advance a successfully completed chunk's reserved physical prefix extent."""
-    if any(type(value) is not int or value < 0 for value in (epoch_base, physical_rows, layers)):
-        raise ValueError("MoE gate epochs, physical extents, and layer counts must be nonnegative integers")
-    end = epoch_base + physical_rows * layers
-    if end >= 2**31 - 1:
-        raise ValueError("MoE gate counters require a fresh communication domain before INT32 overflow")
-    return end
 
 
 def prepare_prefill_bindings(worker, caches, weights, inputs, scratch):

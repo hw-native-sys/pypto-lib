@@ -565,6 +565,10 @@ or pass the gate epoch to `PreparedInputPlan.fill` when preparing metadata.
 Start at zero in a fresh domain. In a retained domain, use
 `advance_gate_epoch` after each successful chunk when the plan enables
 shared MoE gating or MoE owner preparation.
+Pass the padded chunk extent as `physical_rows` to `prepare_gate_bindings`
+for its pre-submit INT32 reservation check. Without an extent it checks
+against the maximum chunk size. If a chunk fails, discard its communication
+domain and start a fresh one at epoch zero before retrying.
 
 CSA coordinates 128-query indexer blocks with two bounded gather slots.
 Gather waits for that block's exact top-512 selection and the previous consumer
@@ -773,7 +777,9 @@ device allocations.
 
 The input-only `l3_lookup_prefill_input` program reads actual token IDs from
 resident BF16 embedding weights and expands each selected row to four FP32 HC
-channels with exact BF16 bit widening. Its caller must admit the complete
+channels with exact BF16 bit widening. Bind the chunk's `query_start_loc`;
+its terminal offset marks the logical input extent. The program writes zero HC
+rows beyond that extent. Its caller must admit the complete
 resident vocabulary matrix, upload it during Worker setup, bind it as read-only
 input, and validate token bounds before submission. Request token upload and
 device lookup remain inside prepared-request timing. This optional input path

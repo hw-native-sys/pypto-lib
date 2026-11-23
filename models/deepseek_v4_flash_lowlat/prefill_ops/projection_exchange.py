@@ -241,6 +241,8 @@ def projection_tensor_specs(tp_size):
     for index, value in enumerate(sys.argv):
         if value == "--prefill-projection-topology" and index + 1 < len(sys.argv):
             topology_path = Path(sys.argv[index + 1])
+        elif value.startswith("--prefill-projection-topology="):
+            topology_path = Path(value.partition("=")[2])
     degrees = [projection_degree(family) for family in ("swa", "csa", "hca")]
     if any(degree < 8 for degree in degrees) and (tp_size != 8 or topology_path is None):
         raise ValueError("Shared projection fixtures require TP8 and an explicit measured topology")

@@ -2323,7 +2323,12 @@ if __name__ == "__main__":
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--ring-heap-mib", type=int, default=None)
+    parser.add_argument("--prefill-projection-csa-d", type=int, choices=(1, 2, 4, 8), default=8)
+    parser.add_argument("--prefill-projection-topology", help="Measured TP8 topology for shared projection.")
+    parser.add_argument("--prefill-indexer-arenas", type=int, choices=(1, 2), default=1)
     args = parser.parse_args()
+    if PROJECTION_D < 8 and (TP_SIZE != 8 or args.prefill_projection_topology is None):
+        parser.error("Shared projection requires --tp 8 and --prefill-projection-topology")
 
     import torch
 

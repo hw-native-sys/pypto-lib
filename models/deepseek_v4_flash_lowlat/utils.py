@@ -36,7 +36,7 @@ else:
     from decode_shapes import BLOCK_SIZE, C4A_COMPRESSOR_BLOCK_SIZE, C128_COMPRESSOR_BLOCK_SIZE, DECODE_BATCH, DECODE_SEQ
 
 
-def run_operator_validations(cases, *, single_device=(), automatic=None):
+def run_operator_validations(cases, *, single_device=(), automatic=None, standalone_options=None):
     """Preserve standalone component cases and route the CI device assignment."""
     import argparse
     import subprocess
@@ -45,6 +45,13 @@ def run_operator_validations(cases, *, single_device=(), automatic=None):
     selector = argparse.ArgumentParser(add_help=False)
     selector.add_argument("--operator", choices=tuple(cases), help="Select one standalone validation case")
     selected, remaining = selector.parse_known_args()
+    if selected.operator is None and standalone_options:
+        option_names = {arg.partition("=")[0] for arg in remaining if arg.startswith("--")}
+        requested = [name for name, flags in standalone_options.items() if option_names.intersection(flags)]
+        if len(requested) > 1:
+            selector.error("Options refer to different standalone operators")
+        if requested:
+            selected.operator = requested[0]
     if selected.operator is not None:
         sys.argv[:] = [sys.argv[0], *remaining]
         cases[selected.operator]()

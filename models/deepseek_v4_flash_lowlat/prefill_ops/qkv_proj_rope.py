@@ -976,7 +976,7 @@ def qkv_proj_rope_test(
 
 
 # Split-branch coverage geometry: q on a CP-local token slice, kv on the full run.
-SPLIT_T_FULL = 512
+SPLIT_T_FULL = 520
 SPLIT_T_LOCAL = SPLIT_T_FULL // 4
 
 
