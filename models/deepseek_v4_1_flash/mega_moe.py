@@ -120,11 +120,13 @@ def workspace_bytes(ep, local_experts, tokens, topk, hidden, intermediate):
     return align(offset, 2 * 1024 * 1024)
 
 
-def _fused_external_kernel(local_experts, topk):
+def _fused_external_kernel(local_experts, topk, packed_routed_weights=False):
     """Prepare a content-addressed, shape-specialized native entry."""
+    if packed_routed_weights and MOE_TOKENS > 80:
+        raise ValueError("packed routed weights require a capacity of at most 80 tokens")
     kernels = Path(__file__).parent / "kernels"
     values = dict(MOE_EP=EP_WORLD_SIZE, MOE_EXPERTS=local_experts, MOE_TOKENS=MOE_TOKENS,
-                  MOE_TOPK=topk, MOE_HIDDEN=D, MOE_INTER=MOE_INTER)
+                  MOE_TOPK=topk, MOE_HIDDEN=D, MOE_INTER=MOE_INTER, MOE_PACKED_ROUTED_WEIGHTS=int(packed_routed_weights))
     text = "".join(f"#define {name} {value}\n" for name, value in values.items())
     text += '#include "moe_fused.cpp"\n'
     digest = hashlib.sha256(text.encode())
@@ -152,9 +154,9 @@ def _fused_external_kernel(local_experts, topk):
 
 
 @lru_cache(maxsize=None)
-def specialize_mega_moe(local_experts, topk):
+def specialize_mega_moe(local_experts, topk, packed_routed_weights=False):
     """Bind the model entry's local expert count and route width to its mixed-core kernel."""
-    @_fused_external_kernel(local_experts, topk)
+    @_fused_external_kernel(local_experts, topk, packed_routed_weights)
     def _fused_experts(
         indices: pl.Tensor, x: pl.Tensor, weights: pl.Tensor,
         w1: pl.Tensor, w1_scale: pl.Tensor, w3: pl.Tensor, w3_scale: pl.Tensor,

@@ -15,6 +15,8 @@
 #include <utils/debug/asc_assert.h>
 // Keep N256 resident for the 384-row decode entry, including short expert groups.
 #define MOE_DECODE_K256 (MOE_TOKENS == 384)
+#define MOE_STREAM_W2_SCALES (!MOE_PACKED_ROUTED_WEIGHTS && MOE_TOKENS <= 80 && \
+    1ULL * MOE_TOKENS * (MOE_TOPK + 2) * MOE_HIDDEN * 2 <= 32ULL * 1024 * 1024)
 /*
  * Operation-private DeepSeek V4.1 MoE pipeline port.
  *
@@ -1680,6 +1682,48 @@ __simd_vf__ inline void vf_fp4_to_fp8_nz(__ubuf__ uint8_t* src, __ubuf__ uint8_t
     }
 }
 
+#if MOE_PACKED_ROUTED_WEIGHTS
+// The static FP4 payload already follows Cube's NZ order. Each VF expands
+// adjacent packed nibbles into an adjacent pair of E4M3 bytes.
+__simd_vf__ inline void expand_scaled_linear(__ubuf__ int8_t* input, __ubuf__ int8_t* output) {
+    const auto mask = asc_create_mask_b8(PAT_ALL);
+    vector_int8_t left, right, keep;
+    asc_duplicate_scalar(reinterpret_cast<vector_uint16_t&>(left), uint16_t{4});
+    asc_duplicate_scalar(right, int8_t{2});
+    asc_duplicate_scalar(keep, int8_t(0x9c));
+    for (uint32_t panel = 0; panel < 8; ++panel) {
+        for (uint32_t i = 0; i < 8; ++i) {
+            #pragma unroll
+            for (uint32_t j = 0; j < 4; ++j) {
+                vector_int8_t value;
+                asc_loadalign_upsample_postupdate(value, input, 128);
+                asc_shiftleft(value, value, left, mask);
+                asc_shiftright(value, value, right, mask);
+                asc_and(value, value, keep, mask);
+                asc_storealign_postupdate(output, value, 256, mask);
+            }
+        }
+        output += 32;
+    }
+}
+
+// Quantization uses ceil(log2(amax / 448)) for finite inputs. Its largest
+// possible E8M0 code is 247, so increasing the activation exponent by six is exact.
+__simd_vf__ inline void compensate_routed_scale(__ubuf__ uint8_t* scales, uint32_t count) {
+    for (uint32_t offset = 0; offset < count; offset += sizeof(vector_uint8_t)) {
+        uint32_t remaining = count - offset;
+        auto mask = plt_b8(remaining, POST_UPDATE);
+        vector_uint8_t original, shifted;
+        asc_loadalign(original, scales + offset);
+        asc_add_scalar(shifted, original, uint8_t{6}, mask);
+        vector_bool is_nan;
+        vcmps_eq(is_nan, original, uint8_t{255}, mask);
+        vsel(shifted, original, shifted, is_nan);
+        asc_storealign(scales + offset, shifted, mask);
+    }
+}
+#endif
+
 // Linear1 epilogue: SwiGLU and FP8 quantization
 template <bool kApplyRouteWeight, uint32_t STORE_BLOCK_M>
 __simd_vf__ inline void vf_swiglu_quant(__ubuf__ bfloat16_t* input, __ubuf__ float8_e4m3_t* output,
@@ -1797,6 +1841,17 @@ __simd_vf__ inline void vf_swiglu_quant(__ubuf__ bfloat16_t* input, __ubuf__ flo
             output_ptr += MX_SF_DIVISOR;
 
             asc_shiftright_scalar(bits[0], bits[0], 23, pair_mask_b32);
+#if MOE_PACKED_ROUTED_WEIGHTS
+            if constexpr (kApplyRouteWeight) {
+                // B payloads are widened to FP8 / 64. Apply 64 to this activation
+                // scale after computing its FP8 payload, only for the routed path.
+                vector_bool is_nan;
+                vcmps_eq(is_nan, bits[0], uint32_t{255}, pair_mask_b32);
+                vector_uint32_t shifted;
+                asc_add_scalar(shifted, bits[0], uint32_t{6}, pair_mask_b32);
+                asc_select(bits[0], bits[0], shifted, is_nan);
+            }
+#endif
             asc_gather(bits[1], bits[0], high_group_idx);
             vector_uint8_t packed_sf_half, unused_sf_half;
             asc_intlv(packed_sf_half, unused_sf_half, reinterpret_cast<vector_uint8_t&>(bits[0]),
@@ -1947,6 +2002,19 @@ AICORE inline void load_routed_panel(uint32_t raw_address, __gm__ const uint8_t*
             pto::TEXPANDS(tail, uint8_t{0});
         }
     }
+#if MOE_PACKED_ROUTED_WEIGHTS
+    static_assert(BlockK == 256 && MadN == 256);
+    // Even and odd gate/up panels live in separate shards. Each 32 KiB
+    // panel holds four gate N32 fragments followed by four up fragments.
+    const uint8_t __gm__* shard = linear1 && (n_block & 1) ? up : first;
+    const uint32_t column = (linear1 ? n_block / 2 : n_block) * 256;
+    auto* source = const_cast<__gm__ uint8_t*>(shard) +
+                   fp4_offset(expert, input_k, output_n, column, k_begin);
+    asc_copy_gm2ub_align(reinterpret_cast<__ubuf__ uint8_t*>(raw_address), source,
+                         1, valid_k * PackedColumns, 0, 0, false, cache_hint,
+                         valid_k * PackedColumns, valid_k * PackedColumns);
+    return;
+#endif
     if (linear1) {
         const uint32_t column = n_block * 128;
         if constexpr (MadN == 128) {
@@ -1966,6 +2034,12 @@ AICORE inline void load_routed_panel(uint32_t raw_address, __gm__ const uint8_t*
 
 template <uint32_t BlockK, uint32_t MadN>
 AICORE inline void decode_routed_panel(uint32_t raw_address, uint32_t nz_address, bool shifted_scale = false) {
+#if MOE_PACKED_ROUTED_WEIGHTS
+    static_assert(BlockK * MadN == 65536);
+    deep_gemm::mega_moe::expand_scaled_linear(reinterpret_cast<__ubuf__ int8_t*>(raw_address),
+                                              reinterpret_cast<__ubuf__ int8_t*>(nz_address));
+    return;
+#endif
     using Packed = pto::Tile<pto::TileType::Vec, float4_e2m1x2_t, BlockK, MadN>;
     using NZ = pto::Tile<pto::TileType::Vec, float8_e4m3_t, BlockK, MadN,
                          pto::BLayout::ColMajor, BlockK, MadN, pto::SLayout::RowMajor,
@@ -2124,7 +2198,7 @@ using layout::BLOCK_N;
 
 // Double-buffer L0A/B; L1 has two or three A stages and four routed B stages.
 constexpr uint32_t kNumL0Stages = 2;
-#if MOE_TOKENS <= 80 && (1ULL * MOE_TOKENS * (MOE_TOPK + 2) * MOE_HIDDEN * 2 <= 32ULL * 1024 * 1024)
+#if MOE_STREAM_W2_SCALES
 constexpr uint32_t kNumL1AStages = 2;
 #else
 constexpr uint32_t kNumL1AStages = 3;
@@ -2435,7 +2509,7 @@ __aicore__ __forceinline__ void combine_reduce(__gm__ uint8_t* buffer, __gm__ bf
     }
 }
 
-#if MOE_TOKENS <= 80 && (1ULL * MOE_TOKENS * (MOE_TOPK + 2) * MOE_HIDDEN * 2 <= 32ULL * 1024 * 1024)
+#if MOE_STREAM_W2_SCALES
 // Shift sixteen N16 SF panels by +6 and flag any original byte >= 249.
 // Each panel has a 1024-byte physical pitch; valid bytes are a multiple of 256.
 __simd_vf__ inline void stream_shift_sf(__ubuf__ uint8_t* data, __ubuf__ uint32_t* status, uint32_t bytes_per_panel) {
@@ -2522,7 +2596,7 @@ __aicore__ inline void aiv0_weight_pipeline(__gm__ uint8_t* buffer, __gm__ bfloa
     // Initialize UB reuse credits; AIC releases the initial L1B credits
     notify<PIPE_V, PIPE_MTE2, kNumFP4Stages>(kFP4Empty);
     notify<PIPE_MTE3, PIPE_V, kNumNZStages>(kNZEmpty);
-#if MOE_TOKENS <= 80 && (1ULL * MOE_TOKENS * (MOE_TOPK + 2) * MOE_HIDDEN * 2 <= 32ULL * 1024 * 1024)
+#if MOE_STREAM_W2_SCALES
     notify<PIPE_MTE3, PIPE_MTE2>(kStreamSFUBEmpty);
 #endif
 
@@ -2575,7 +2649,7 @@ __aicore__ inline void aiv0_weight_pipeline(__gm__ uint8_t* buffer, __gm__ bfloa
                 // valid_k remains a multiple of MAD_K, including the final K block
                 const uint32_t valid_k = min(BLOCK_K, num_k - k_idx);
                 bool first_panel_prefetched = false;
-#if MOE_TOKENS <= 80 && (1ULL * MOE_TOKENS * (MOE_TOPK + 2) * MOE_HIDDEN * 2 <= 32ULL * 1024 * 1024)
+#if MOE_STREAM_W2_SCALES
                 if (not is_linear1 and k_idx % 2048 == 0) {
                     const uint32_t valid_pairs = min(32u, (num_k - k_idx) / 64);
                     const uint32_t bytes_per_panel = valid_pairs * 32;
@@ -2688,7 +2762,7 @@ __aicore__ inline void aiv0_weight_pipeline(__gm__ uint8_t* buffer, __gm__ bfloa
     if (had_routed_task) {
         wait_intra_block<PIPE_MTE3, 0, kNumL1BStages>(kL1BEmpty);
     }
-#if MOE_TOKENS <= 80 && (1ULL * MOE_TOKENS * (MOE_TOPK + 2) * MOE_HIDDEN * 2 <= 32ULL * 1024 * 1024)
+#if MOE_STREAM_W2_SCALES
     wait_intra_block<PIPE_MTE3, 0, kNumSFStages>(kStreamSFEmpty);
     wait<PIPE_MTE3, PIPE_MTE2>(kStreamSFUBEmpty);
 #endif
@@ -2722,7 +2796,7 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
     notify<PIPE_M, PIPE_MTE1, kNumL0Stages>(kL0BEmpty);
     notify<PIPE_MTE1, PIPE_MTE2, kNumL1AStages>(kL1AEmpty);
     notify<PIPE_MTE1, PIPE_MTE2, kNumSFStages>(kSFEmpty);
-#if MOE_TOKENS <= 80 && (1ULL * MOE_TOKENS * (MOE_TOPK + 2) * MOE_HIDDEN * 2 <= 32ULL * 1024 * 1024)
+#if MOE_STREAM_W2_SCALES
     notify_intra_block<PIPE_MTE1, 0, kNumSFStages>(kStreamSFEmpty);
 #endif
     if constexpr (kHasSharedExperts)
@@ -2840,7 +2914,7 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
                 if (sf_pair_idx % kNumSFPairsPerChunk == 0) {
                     wait<PIPE_MTE1, PIPE_MTE2>(kSFEmpty, sf_stage_idx);
 #ifdef __DAV_CUBE__
-#if MOE_TOKENS <= 80 && (1ULL * MOE_TOKENS * (MOE_TOPK + 2) * MOE_HIDDEN * 2 <= 32ULL * 1024 * 1024)
+#if MOE_STREAM_W2_SCALES
                     if (is_shared or is_linear1)
 #endif
                     original_weights::load_weight_scales(l1_sfb[sf_stage_idx].addr,
@@ -2908,7 +2982,7 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
                         wait<PIPE_M, PIPE_MTE1>(kL0BEmpty, l0b_stage_idx);
                         const auto l1b_src = is_shared ? shared_l1b[l1b_stage_idx] : l1b[(l1b_stage_idx + n_mad_idx / MAD_N) % kNumL1BStages];
                         copy_l1_to_l0b(l0b[l0b_stage_idx], l1b_src, is_shared ? n_mad_idx : 0, k_mad_idx);
-#if MOE_TOKENS <= 80 && (1ULL * MOE_TOKENS * (MOE_TOPK + 2) * MOE_HIDDEN * 2 <= 32ULL * 1024 * 1024)
+#if MOE_STREAM_W2_SCALES
                         if (not is_shared and not is_linear1 and sf_pair_idx % kNumSFPairsPerChunk == 0 and k_mad_idx == 0 and n_mad_idx == 0)
                             wait_intra_block<PIPE_MTE1, 0>(kStreamSFFull, w2_sf_stage_idx);
                         const auto b_scale = not is_shared and not is_linear1 ? l1_w2_sfb[w2_sf_stage_idx] : l1_sfb[sf_stage_idx];
@@ -2977,7 +3051,7 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
 
                 if ((sf_pair_idx + BLOCK_K / MX_SF_DIVISOR) % kNumSFPairsPerChunk == 0 or k_idx + valid_k == num_k) {
                     notify<PIPE_MTE1, PIPE_MTE2>(kSFEmpty, sf_stage_idx);
-#if MOE_TOKENS <= 80 && (1ULL * MOE_TOKENS * (MOE_TOPK + 2) * MOE_HIDDEN * 2 <= 32ULL * 1024 * 1024)
+#if MOE_STREAM_W2_SCALES
                     if (not is_shared and not is_linear1) {
                         notify_intra_block<PIPE_MTE1, 0>(kStreamSFEmpty, w2_sf_stage_idx);
                         w2_sf_stage_idx = (w2_sf_stage_idx + 1) % kNumSFStages;
@@ -3198,6 +3272,14 @@ __aicore__ inline void aiv1_epilogue_comm(__gm__ uint8_t* buffer, __gm__ bfloat1
                           config.num_input_sf_pairs * sizeof(int16_t), asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM);
             notify<PIPE_MTE2, PIPE_MTE3>(kPullFull, stage_idx);
 
+#if MOE_PACKED_ROUTED_WEIGHTS
+            notify<PIPE_MTE2, PIPE_V>(PipeEvent<PIPE_MTE2, PIPE_V>{2}, stage_idx);
+            wait<PIPE_MTE2, PIPE_V>(PipeEvent<PIPE_MTE2, PIPE_V>{2}, stage_idx);
+            compensate_routed_scale(reinterpret_cast<__ubuf__ uint8_t*>(ub_pull_sf[stage_idx].ptr()),
+                                    config.num_input_sf_pairs * sizeof(int16_t));
+            notify<PIPE_V, PIPE_MTE3>(PipeEvent<PIPE_V, PIPE_MTE3>{2}, stage_idx);
+            wait<PIPE_V, PIPE_MTE3>(PipeEvent<PIPE_V, PIPE_MTE3>{2}, stage_idx);
+#endif
             // Stage routed inputs
             wait<PIPE_MTE2, PIPE_MTE3>(kPullFull, stage_idx);
             copy_ub_to_gm(l1_acts + ring_m_idx * config.hidden,

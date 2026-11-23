@@ -288,9 +288,9 @@ def split_moe(
     return x_next
 
 
-def make_decode_moe(local_experts, topk):
+def make_decode_moe(local_experts, topk, packed_routed_weights=False):
     """Wire HC and routing to the fused experts specialized for this entry."""
-    fused_experts = specialize_mega_moe(local_experts, topk)
+    fused_experts = specialize_mega_moe(local_experts, topk, packed_routed_weights)
 
     @pl.jit.inline(auto_scope=False)
     def moe(
@@ -356,7 +356,16 @@ def make_decode_moe(local_experts, topk):
     return moe
 
 
-moe = make_decode_moe(N_LOCAL_EXPERTS, TOPK)
+# The standalone entry owns the resident upload. Layer/forward callers
+# pass weights in the public FP4 layout unless they opt into the packed ABI.
+PACK_ROUTED_WEIGHTS = __name__ == "__main__" and MOE_TOKENS <= 80
+FP4_PANEL_ROWS = 256
+PANEL_ROWS = FP4_PANEL_ROWS if PACK_ROUTED_WEIGHTS else 1
+WEIGHT_PANEL_BYTES = PANEL_ROWS * MX_PACKED_LANE_COLS
+W1_DEVICE_ROWS = MX_W1_PACKED_ROWS // PANEL_ROWS
+W2_DEVICE_ROWS = MX_W2_PACKED_ROWS // PANEL_ROWS
+W3_DEVICE_ROWS = MX_W3_PACKED_ROWS // PANEL_ROWS
+moe = make_decode_moe(N_LOCAL_EXPERTS, TOPK, packed_routed_weights=PACK_ROUTED_WEIGHTS)
 
 
 @pl.jit
@@ -369,11 +378,11 @@ def l2_moe(
     norm_weight: pl.Tensor[[D], pl.BF16],
     gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
-    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, W1_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, W2_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN],
-    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, W3_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
     shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
@@ -417,11 +426,11 @@ def l3_moe(
     norm_weight: pl.Tensor[[EP_SIZE, D], pl.BF16],
     gate_weight: pl.Tensor[[EP_SIZE, N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[EP_SIZE, N_EXPERTS], pl.FP32],
-    routed_w1: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w1: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, W1_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     routed_w1_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
-    routed_w2: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w2: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, W2_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     routed_w2_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
-    routed_w3: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w3: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, W3_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     routed_w3_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
     shared_w1: pl.Tensor[[EP_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[EP_SIZE, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
@@ -487,6 +496,25 @@ def _route_bias(experts=N_EXPERTS):
     bias = torch.full((experts,), -1.0, dtype=torch.float32)
     bias[selected] = 4.0
     return bias
+
+
+def _resident_gate_up_half(tensors, half):
+    """Zip corresponding gate/up halves in the N32-major order consumed by Cube."""
+    import torch
+
+    gate = tensors["routed_w1"]
+    result = torch.empty_like(gate, memory_format=torch.contiguous_format)
+    dst = result.reshape(-1, 8, 256, 16)
+    for lane, name in enumerate(("routed_w1", "routed_w3")):
+        source = tensors[name].reshape(-1, 256, 8, 16)
+        dst[:, 4 * lane:4 * (lane + 1)].copy_(source[:, :, 4 * half:4 * (half + 1)].transpose(1, 2))
+    return result.reshape(*gate.shape[:-2], -1, FP4_PANEL_ROWS * MX_PACKED_LANE_COLS)
+
+
+def _resident_down_weight(tensors):
+    weight = tensors["routed_w2"]
+    panels = weight.reshape(-1, 256, 8, 16).transpose(1, 2).contiguous()
+    return panels.reshape(*weight.shape[:-2], -1, FP4_PANEL_ROWS * MX_PACKED_LANE_COLS)
 
 
 def build_moe_specs(num_tokens=MOE_TOKENS, *, initialize=True):
@@ -594,7 +622,15 @@ def build_moe_specs(num_tokens=MOE_TOKENS, *, initialize=True):
         value = values.get(name)
         init = None if value is None else partial(torch.clone, value)
         resident = None if name in nonresident else "stacked"
-        specs.append(TensorSpec(name, shapes[name], dtype, init_value=init, resident=resident))
+        pack = None
+        if PACK_ROUTED_WEIGHTS and name in ("routed_w1", "routed_w3"):
+            pack = partial(_resident_gate_up_half, half=int(name == "routed_w3"))
+        elif PACK_ROUTED_WEIGHTS and name == "routed_w2":
+            pack = _resident_down_weight
+        shape = shapes[name]
+        upload_shape = [*shape[:-2], shape[-2] // PANEL_ROWS, WEIGHT_PANEL_BYTES] if pack else None
+        specs.append(TensorSpec(name, shape, dtype, init_value=init, resident=resident,
+                                pack_for_upload=pack, upload_shape=upload_shape))
     return specs
 
 

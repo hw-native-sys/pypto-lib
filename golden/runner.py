@@ -938,6 +938,10 @@ def _abi_error(details: list[str]) -> ValueError:
     )
 
 
+def _matches_shape(artifact: tuple[int, ...], shape: Sequence[int]) -> bool:
+    return len(artifact) == len(shape) and all(a == -1 or a == s for a, s in zip(artifact, shape, strict=True))
+
+
 def _check_param_abi(param_infos: Any, specs: list[TensorSpec | ScalarSpec]) -> None:
     """Reject any drift between the artifact's parameters and *specs*.
 
@@ -991,15 +995,13 @@ def _check_param_abi(param_infos: Any, specs: list[TensorSpec | ScalarSpec]) -> 
             expected_shape = tuple(spec.shape)
             if artifact_shape is None:
                 mismatches.append(f"{name}: expected tensor shape={expected_shape}, artifact is scalar")
-            elif len(artifact_shape) != len(expected_shape) or any(
-                artifact_dim != -1 and artifact_dim != expected_dim
-                for artifact_dim, expected_dim in zip(
-                    artifact_shape, expected_shape, strict=True
-                )
-            ):
-                mismatches.append(
-                    f"{name}: shape spec={expected_shape} artifact={artifact_shape}"
-                )
+            else:
+                canonical = _matches_shape(artifact_shape, expected_shape)
+                packed = spec.upload_shape is not None and _matches_shape(artifact_shape, spec.upload_shape)
+                if not (canonical or packed):
+                    mismatches.append(f"{name}: shape spec={expected_shape} artifact={artifact_shape}")
+                elif packed and (canonical or directions.get(info.direction) != "in"):
+                    mismatches.append(f"{name}: packed ABI requires an unambiguous input-only parameter")
 
         if artifact_dtype != spec.dtype:
             mismatches.append(
@@ -1131,6 +1133,27 @@ def _readback_resident_outputs(
             )
 
 
+def _packed_resident_inputs(
+    compiled: Any, specs: list[TensorSpec | ScalarSpec], tensors: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Select packing from the loaded artifact ABI, including on runtime-dir replay."""
+    candidates = [s for s in specs if isinstance(s, TensorSpec) and s.pack_for_upload is not None]
+    if not candidates:
+        return {}
+    infos, _, _ = compiled._get_metadata()
+    shapes = {_strip_ssa_suffix(info.name): info.shape for info in infos}
+    packed = {}
+    for spec in candidates:
+        assert spec.upload_shape is not None and spec.pack_for_upload is not None
+        if not _matches_shape(tuple(shapes[spec.name]), spec.upload_shape):
+            continue
+        value = spec.pack_for_upload(tensors)
+        if tuple(value.shape) != tuple(spec.upload_shape) or value.dtype != spec.dtype:
+            raise ValueError(f"packed tensor {spec.name!r} must have shape {spec.upload_shape} and dtype {spec.dtype}")
+        packed[spec.name] = value
+    return packed
+
+
 def _run_l3_resident(
     compiled: Any,
     specs: list[TensorSpec | ScalarSpec],
@@ -1180,7 +1203,12 @@ def _run_l3_resident(
         )
 
     # Per-call IO + resident upload sources must be shared memory before prepare().
-    _share_in_place(tensors)
+    packed = _packed_resident_inputs(compiled, specs, tensors)
+    upload = {**tensors, **packed} if packed else tensors
+    _share_in_place(upload)
+    if packed:
+        # Preserve logical inputs for comparisons and expose shared outputs to the caller.
+        tensors.update((name, value) for name, value in upload.items() if name not in packed)
 
     pure_out_names = _l3_pure_out_names(compiled)
     run_config = cfg
@@ -1231,15 +1259,16 @@ def _run_l3_resident(
                                 f"exposing DistributedWorker.alloc_stacked_tensor; this runtime lacks it."
                             )
                         else:
-                            handle = rt.alloc_stacked_tensor(tensors[s.name])
+                            handle = rt.alloc_stacked_tensor(upload[s.name])
                         resident_handles.append((s.name, handle, True, 0))
                     else:
                         # Whole-tensor resident on a single card: resident is the int
                         # worker id (0, 1, ...) the consuming kernel is dispatched to.
                         wid = int(s.resident)
-                        init = None if s.name in pure_out_names else tensors[s.name]
+                        init = None if s.name in pure_out_names else upload[s.name]
                         handle = rt.alloc_tensor(
-                            tuple(s.shape), s.dtype, init=init, worker_id=wid
+                            tuple(packed[s.name].shape if s.name in packed else s.shape),
+                            s.dtype, init=init, worker_id=wid,
                         )
                         resident_handles.append((s.name, handle, False, wid))
                 # Resident weights replace their host buffer in the arg list;
@@ -1722,7 +1751,7 @@ def _jit_entry(
         dummy_args = [
             compile_scalars[spec.name].to_python()
             if isinstance(spec, ScalarSpec)
-            else torch.empty(spec.shape, dtype=spec.dtype)
+            else torch.empty(spec.upload_shape if spec.upload_shape is not None else spec.shape, dtype=spec.dtype)
             for spec in specs
         ]
         return fn.compile(*dummy_args, config=cfg)
