@@ -9,11 +9,8 @@
 # ci: no-sim
 """Compression projections, rotary embedding, cache publication, and ratio-2 ring state."""
 
-from pathlib import Path
-
 import pypto.language as pl
 
-from pypto.runtime import pto_isa_include_dir
 import torch
 
 from config import (
@@ -79,44 +76,6 @@ def c1a_compressor_project(
                 value = pl.set_validshape(acc, rows, n_tile)
                 output = pl.store(value, [row, col], output)
     return output
-
-
-@pl.jit.extern(
-    core_type="aiv", source=Path(__file__).parent / "kernels" / "compressor_publish.cpp",
-    include_dirs=(pto_isa_include_dir(), str(Path(__file__).parent / "kernels")),
-)
-def _c1a_compress(
-    source: pl.Tensor,
-    slots: pl.Tensor,
-    cache: pl.InOut[pl.Tensor],
-    cosine: pl.Tensor,
-    sine: pl.Tensor,
-    norm_weight: pl.Tensor,
-    latent: pl.InOut[pl.Tensor],
-    num_tokens: pl.Scalar[pl.INT32],
-) -> pl.Tensor:
-    """Normalize, retain unrotated latent, and publish nearest-even E2M1 rows."""
-    ...
-
-
-@pl.jit.inline(auto_scope=False)
-def c1a_compressor_publish(
-    source: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-    latent: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    cosine: pl.Tensor,
-    sine: pl.Tensor,
-    slots: pl.Tensor[[T_DYN], pl.INT64],
-    cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Normalize and publish MXFP4 rows while retaining the unrotated latent."""
-    active_tokens = pl.cast(num_tokens, pl.INT32)
-    row_groups = (active_tokens + 2 * C1A_PROJ_M_TILE - 1) // (2 * C1A_PROJ_M_TILE)
-    workers = pl.max(pl.min(pl.min(active_tokens, row_groups * 8), pl.system.available_cluster_count()), 1)
-    with pl.spmd(workers, name_hint="c1a_compress"):
-        _c1a_compress(source, slots, cache, cosine, sine, norm_weight, latent, active_tokens)
-    return cache
 
 
 @pl.jit.inline(auto_scope=False)
@@ -378,7 +337,7 @@ def _c1a_compress_python(
 
 
 @pl.jit.inline(auto_scope=False)
-def c1a_compressor_publish_python(
+def c1a_compressor_publish(
     source: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
     norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     latent: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
@@ -387,8 +346,6 @@ def c1a_compressor_publish_python(
     slots: pl.Tensor[[T_DYN], pl.INT64],
     cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     num_tokens: pl.Scalar[pl.INT32],
-    cache_ready: pl.Scalar[pl.TASK_ID],
-    source_ready: pl.Scalar[pl.TASK_ID],
 ):
     """Normalize and publish MXFP4 rows while retaining the unrotated latent."""
     active_tokens = pl.cast(num_tokens, pl.INT32)
@@ -398,12 +355,12 @@ def c1a_compressor_publish_python(
     # Both aliases use the physical 320-byte row pitch.
     # Payload writes [0, 256), scales write [256, 320).
     scale_cache = flat_cache
-    with pl.spmd(workers, name_hint="c1a_compress_python", deps=[cache_ready, source_ready]) as published:
+    with pl.spmd(workers, name_hint="c1a_compress_python"):
         _published = _c1a_compress_python(
             source, slots, flat_cache, scale_cache,
             cosine, sine, norm_weight, latent, active_tokens,
         )
-    return published
+    return cache
 
 
 @pl.jit.inline
