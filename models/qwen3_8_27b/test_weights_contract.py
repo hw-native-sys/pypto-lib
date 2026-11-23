@@ -302,6 +302,50 @@ def check_fetch_publishes_only_verified_index() -> None:
             assert weights.checkpoint_summary(destination, contract)["shards"] == 2
 
 
+def check_loader_excludes_a_concurrent_fetch() -> None:
+    """A fetch must not replace shards under a load that already passed the stamp check.
+
+    The revision stamp is read once, before the first shard is opened, so on its own it
+    cannot see a fetch that starts while the remaining shards are still streaming. The
+    loader holds the fetch lock shared for the whole stream; this releases a would-be
+    fetcher after the first tensor is exported and checks it takes the exclusive lock
+    only once the load has returned.
+    """
+    import fcntl
+
+    contract = make_text_contract(tiny_config())
+    with tempfile.TemporaryDirectory(prefix="qwen38_race_") as directory:
+        root = Path(directory)
+        _write_fixture(root, contract)
+        weights._write_revision_stamp(root, weights.ECO_REVISION)
+
+        refused: list[bool] = []
+
+        def exporter(tensor):
+            if not refused:
+                with (root / weights._FETCH_LOCK).open("a+b") as lock:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        refused.append(False)
+                    except BlockingIOError:
+                        refused.append(True)
+            return tensor.clone()
+
+        weights.prepare_qwen38_weights(root, exporter, contract=contract)
+        assert refused == [True], "a fetch could have replaced the shards still to be read"
+
+        # The lock is an exclusion, not a requirement: a checkpoint nothing can fetch
+        # into still loads, and so does one no fetch ever stamped.
+        (root / weights._REVISION_STAMP).unlink()
+        (root / weights._FETCH_LOCK).unlink()
+        os.chmod(root, 0o555)
+        try:
+            prepared = weights.prepare_qwen38_weights(root, lambda t: t.clone(), contract=contract)
+        finally:
+            os.chmod(root, 0o755)
+        assert len(prepared.tensors) == len(contract.prepared_weight_specs)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3",
@@ -319,6 +363,7 @@ def main() -> int:
         print("SKIP: loader check requires safetensors")
     else:
         check_loader()
+        check_loader_excludes_a_concurrent_fetch()
         check_fetch_publishes_only_verified_index()
     print("PASS: Qwen3.8 weight loader and text contract")
     return 0

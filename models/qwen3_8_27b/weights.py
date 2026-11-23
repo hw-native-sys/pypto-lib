@@ -39,6 +39,7 @@ single-layer behavior. Missing data is reported rather than downloaded.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import io
@@ -101,6 +102,7 @@ ECO_METADATA_FILES = ("config.json", "quant_model_description.json", ECO_INDEX)
 # Which revision a checkpoint directory holds, written by `fetch_checkpoint` once its
 # shards and index agree. While a fetch is replacing shards the stamp reads
 # `<_STAMP_FETCHING> <revision>` instead, so an interrupted one stays marked.
+_FETCH_LOCK = ".fetch.lock"
 _REVISION_STAMP = ".checkpoint_revision"
 _STAMP_FETCHING = "fetching"
 
@@ -427,6 +429,30 @@ def _text_shards(weight_map: dict[str, str], contract: Qwen38TextContract) -> di
     return shards
 
 
+@contextlib.contextmanager
+def _shared_fetch_lock(checkpoint_dir: Path):
+    """Hold ``.fetch.lock`` shared for as long as the caller reads shards.
+
+    The revision stamp is read once, and shards are then streamed for as long as
+    the export takes. Without this a fetch starting after that read would replace
+    the shards still to come, and the load would return tensors from two
+    revisions. Taken before the stamp is read, so a fetch already running is
+    waited out and its result is what gets checked. A checkpoint directory that
+    cannot be written also cannot be fetched into, so failing to take the lock
+    there is not a race.
+    """
+    try:
+        handle = (checkpoint_dir / _FETCH_LOCK).open("a+b")
+    except OSError:
+        yield None
+        return
+    try:
+        fcntl.flock(handle, fcntl.LOCK_SH)
+        yield handle
+    finally:
+        handle.close()
+
+
 def _write_revision_stamp(checkpoint_dir: Path, value: str) -> None:
     tmp = checkpoint_dir / f"{_REVISION_STAMP}.tmp"
     tmp.write_text(f"{value}\n")
@@ -483,12 +509,14 @@ def checkpoint_summary(
     what is on disk.
     """
     checkpoint_dir = Path(checkpoint_dir)
-    _check_checkpoint_revision(checkpoint_dir, revision)
-    shards = _text_shards(_load_checkpoint_index(checkpoint_dir), contract)
-    _check_local_shards(checkpoint_dir, shards)
-    summary = _verify_text_shard_headers(
-        shards, contract, lambda shard: _local_header(checkpoint_dir / shard), lambda _message: None,
-    )
+    with _shared_fetch_lock(checkpoint_dir):
+        _check_checkpoint_revision(checkpoint_dir, revision)
+        shards = _text_shards(_load_checkpoint_index(checkpoint_dir), contract)
+        _check_local_shards(checkpoint_dir, shards)
+        summary = _verify_text_shard_headers(
+            shards, contract, lambda shard: _local_header(checkpoint_dir / shard),
+            lambda _message: None,
+        )
     return {**summary, "prepared_tensors": len(contract.prepared_weight_specs)}
 
 
@@ -610,29 +638,30 @@ def prepare_qwen38_weights(
         raise RuntimeError("prepare_qwen38_weights requires the safetensors package") from error
 
     checkpoint_dir = Path(checkpoint_dir)
-    _check_checkpoint_revision(checkpoint_dir, revision)
-    shards = _text_shards(_load_checkpoint_index(checkpoint_dir), contract)
-    _check_local_shards(checkpoint_dir, shards)
-
     prepared: dict[str, Any] = {}
-    for shard, specs in shards.items():
-        shard_path = checkpoint_dir / shard
-        with safe_open(shard_path, framework="pt", device="cpu") as handle:
-            shard_keys = set(handle.keys())
-            missing = [spec.name for spec in specs if spec.name not in shard_keys]
-            if missing:
-                raise ValueError(f"{shard}: index names absent from safetensors header: {missing[:3]}")
-            for spec in specs:
-                name = spec.name
-                tensor = handle.get_tensor(name)
-                _validate_tensor(tensor, spec)
-                if spec.is_zero_offset:
-                    if verify_zero_offsets and bool(torch.count_nonzero(tensor)):
-                        raise ValueError(f"{name}: symmetric W8A8 checkpoint offset is not zero")
-                    continue
-                if spec.role == "weight_scale":
-                    tensor = tensor.reshape(-1)
-                prepared[name] = tensor_exporter(tensor.contiguous())
+    with _shared_fetch_lock(checkpoint_dir):
+        _check_checkpoint_revision(checkpoint_dir, revision)
+        shards = _text_shards(_load_checkpoint_index(checkpoint_dir), contract)
+        _check_local_shards(checkpoint_dir, shards)
+
+        for shard, specs in shards.items():
+            shard_path = checkpoint_dir / shard
+            with safe_open(shard_path, framework="pt", device="cpu") as handle:
+                shard_keys = set(handle.keys())
+                missing = [spec.name for spec in specs if spec.name not in shard_keys]
+                if missing:
+                    raise ValueError(f"{shard}: index names absent from safetensors header: {missing[:3]}")
+                for spec in specs:
+                    name = spec.name
+                    tensor = handle.get_tensor(name)
+                    _validate_tensor(tensor, spec)
+                    if spec.is_zero_offset:
+                        if verify_zero_offsets and bool(torch.count_nonzero(tensor)):
+                            raise ValueError(f"{name}: symmetric W8A8 checkpoint offset is not zero")
+                        continue
+                    if spec.role == "weight_scale":
+                        tensor = tensor.reshape(-1)
+                    prepared[name] = tensor_exporter(tensor.contiguous())
 
     expected_prepared = [spec.name for spec in contract.prepared_weight_specs]
     prepared = {name: prepared[name] for name in expected_prepared}
@@ -787,7 +816,7 @@ def fetch_checkpoint(
     """Verify the pinned Eco-Tech checkpoint and publish the index after its shards."""
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    with (checkpoint_dir / ".fetch.lock").open("a+b") as lock:
+    with (checkpoint_dir / _FETCH_LOCK).open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         _fetch_checkpoint(checkpoint_dir, repo, revision, log)
     return checkpoint_dir
