@@ -39,7 +39,7 @@ struct StorePair {
 #ifdef __DAV_VEC__
 AICORE inline void copyRouteWeights(__gm__ float* input, __gm__ float* output, int64_t count)
 {
-    using W = Tile<TileType::Vec, float, 1, M_TILE, BLayout::RowMajor, 1, DYNAMIC>;
+    using W = Tile<TileType::Vec, float, 1, 256, BLayout::RowMajor, 1, DYNAMIC>;
     using G = GlobalTensor<float, Shape<1, 1, 1, 1, DYNAMIC>, pto::Stride<1, 1, 1, 1, 1>>;
     W tile(count);
     TASSIGN(tile, 0);
@@ -65,6 +65,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
     const int64_t block = get_block_idx(args);
     const int64_t blocks = get_block_num(args);
     const int64_t hTiles = hidden / N_TILE;
+    const int64_t rowLimit = selectRowTileLimit(counts, experts, 2 * hTiles, blocks);
 #ifdef __DAV_VEC__
     auto* w1 = tensorData<uint8_t>(args, 3);
     auto* w3 = tensorData<uint8_t>(args, 5);
@@ -78,26 +79,37 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
 #endif
     beginGemm();
     int64_t workBase = 0;
+    int64_t previousRowTile = 0;
     int64_t activationBase = 0;
     for (int64_t expert = 0; expert < experts; ++expert) {
         const int64_t count = acquireCount(counts, expert);
-        const int64_t workCount = ((count + M_TILE - 1) / M_TILE) * 2 * hTiles;
+        const int64_t countTile = selectRowTile(count);
+        const int64_t rowTile = countTile < rowLimit ? countTile : rowLimit;
+        if (count > 0) {
+            // Drain both lanes before changing the shared L1 partition.
+            if (previousRowTile != 0 && rowTile != previousRowTile) {
+                endGemm();
+                beginGemm();
+            }
+            previousRowTile = rowTile;
+        }
+        const int64_t workCount = ((count + rowTile - 1) / rowTile) * 2 * hTiles;
         const int64_t first = (block + blocks - workBase % blocks) % blocks;
         for (int64_t work = first; work < workCount; work += blocks) {
-            const int64_t row = work / (2 * hTiles) * M_TILE;
+            const int64_t row = work / (2 * hTiles) * rowTile;
             const int64_t col = work % hTiles * N_TILE;
             const bool up = (work / hTiles) % 2 != 0;
-            const int64_t valid = count - row < M_TILE ? count - row : M_TILE;
+            const int64_t valid = count - row < rowTile ? count - row : rowTile;
 #ifdef __DAV_VEC__
             if (work % (2 * hTiles) == 0 && get_subblockid() == 0) {
                 copyRouteWeights(tensorData<float>(args, 8) + expert * stride + row,
                                  tensorData<float>(args, 9) + activationBase + row, valid);
             }
-            produceWeight(up ? w3 : w1, width, hidden, expert, col);
+            dispatchWeight(rowTile, up ? w3 : w1, width, hidden, expert, col);
 #endif
 #ifdef __DAV_CUBE__
             const Chunk chunk{expert, expert * stride + row, valid};
-            computeProjection<M_TILE>(x, xScale, up ? s3 : s1, width, hidden, experts,
+            dispatchProjection(rowTile, x, xScale, up ? s3 : s1, width, hidden, experts,
                                       experts * stride, chunk, col,
                                       StorePair{out, activationRows, 2 * hidden,
                                                 activationBase + row,

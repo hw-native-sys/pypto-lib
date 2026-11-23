@@ -552,12 +552,15 @@ def expert_shared(
     shared_w2: pl.Tensor[[MOE_INTER, D], pl.FP8E4M3FN],
     shared_w2_scale: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN],
     sh: pl.Tensor[[T, D], pl.BF16],
+    w13_limit: pl.Scalar[pl.INT32],
+    w2_workers: pl.Scalar[pl.INT32],
+    swiglu_workers: pl.Scalar[pl.INT32],
 ):
     """Shared expert with device MXFP8 activation quantization before both projections."""
     # Merged W1/W3 projection into BF16 gate/up columns.
     gate_up = pl.create_tensor([T_PAD, GATE_UP_N], dtype=pl.BF16)
     x_w13, x_w13_scale = _W13_INPUTS(x_local, x_local_scale)
-    w13_workers = pl.min(W13_GROUPS * (GATE_UP_N // W13_N_TILE), W13_WORKER_TILE)
+    w13_workers = pl.min(W13_GROUPS * (GATE_UP_N // W13_N_TILE), w13_limit)
     with pl.spmd(w13_workers, name_hint="sh_w13_mx_mm"):
         gate_up = _shared_w13_mm_pypto(
             x_w13, x_w13_scale, shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, gate_up,
@@ -566,7 +569,7 @@ def expert_shared(
     # FP32 SwiGLU, FP8 payload, and packed MX_A_ZZ scales.
     h_tile_mx = pl.create_tensor([T_PAD, MOE_INTER], dtype=pl.FP8E4M3FN)
     h_scale_mx = pl.create_tensor([1, T_PAD * H_SCALE], dtype=pl.FP8E8M0)
-    for block in pl.spmd(SWIGLU_WORKER_TILE, name_hint="sh_swiglu_vf"):
+    for block in pl.spmd(swiglu_workers, name_hint="sh_swiglu_vf"):
         blocks = pl.tile.get_block_num()
         swiglu_rows = pl.tensor.dim(gate_up, 0)
         pairs = MOE_INTER // SWIGLU_COL_TILE
@@ -631,10 +634,11 @@ def expert_shared(
         h_scale_mx, [T_PAD, H_SCALE], layout=pl.MX_A_ZZ,
     )
     rows = pl.tensor.dim(sh, 0)
-    with pl.spmd(W2_WORKER_TILE, name_hint="sh_w2_mm"):
+    with pl.spmd(w2_workers, name_hint="sh_w2_mm"):
         worker = pl.tile.get_block_idx()
-        for lane in pl.range((D // W2_N_TILE + W2_WORKER_TILE - 1) // W2_WORKER_TILE):
-            column = worker + lane * W2_WORKER_TILE
+        blocks = pl.tile.get_block_num()
+        for lane in pl.range((D // W2_N_TILE + blocks - 1) // blocks):
+            column = worker + lane * blocks
             if column < D // W2_N_TILE:
                 d0 = column * W2_N_TILE
                 for wm in pl.range((T_PAD + W2_M_TILE - 1) // W2_M_TILE):
@@ -683,6 +687,7 @@ def l2_expert_shared(
     expert_shared(
         x_local, x_local_scale, shared_w1, shared_w1_scale,
         shared_w3, shared_w3_scale, shared_w2, shared_w2_scale, sh,
+        W13_WORKER_TILE, W2_WORKER_TILE, SWIGLU_WORKER_TILE,
     )
     return sh
 

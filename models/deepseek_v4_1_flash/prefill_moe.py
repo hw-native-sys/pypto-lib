@@ -45,12 +45,12 @@ from config import EP_SIZE, SUPPORTED_EP_SIZES
 from config import MOE_TOKENS, MOE_RECV_MAX, N_LOCAL_EXPERTS, LOCAL_T_DYN, ROUTE_T_DYN
 from config import T_DYN
 from gate import gate, gather_routing_bias, prepare_routing_bias
-from expert_shared import expert_shared
+from expert_shared import SWIGLU_WORKER_TILE, W13_WORKER_TILE, W2_WORKER_TILE, expert_shared
 
 BIAS_DYN = pl.dynamic("PREFILL_MOE_BIAS_DYN")
 from expert_routed import (
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS,
-    expert_routed_scatter,
+    ROUTED_CUBE_WORKER_TILE, ROUTED_VECTOR_WORKER_TILE, expert_routed_scatter,
 )
 from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_norm, golden_hc_post
 from hc import hc_head_norm_store, hc_project, hc_sinkhorn, hc_post
@@ -423,7 +423,7 @@ def prefill_moe(
             shared_w1, shared_w1_scale,
             shared_w3, shared_w3_scale,
             shared_w2, shared_w2_scale,
-            shared_output,
+            shared_output, W13_WORKER_TILE, W2_WORKER_TILE, SWIGLU_WORKER_TILE,
         )
 
         recv_x_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.FP8E4M3FN)
@@ -447,7 +447,8 @@ def prefill_moe(
             routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
             routed_w2, routed_w2_scale,
             recv_route_local, recv_meta_local,
-            routed_output, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
+            routed_output, N_LOCAL_EXPERTS, TOPK,
+            ROUTED_CUBE_WORKER_TILE, ROUTED_CUBE_WORKER_TILE, ROUTED_VECTOR_WORKER_TILE,
         )
         output_ready = combine_scattered(
             shared_result, sublayer,
