@@ -377,255 +377,6 @@ def sparse_attn_test_swa(
     return attn_out
 
 
-def golden_sparse_attn_swa(tensors):
-    import math
-
-    """Torch reference: sparse_attn decode path followed by grouped o_proj."""
-    import torch
-
-    if __package__:
-        from .utils import bf16_matmul_fp32, grouped_bf16_matmul_fp32
-    else:
-        from utils import bf16_matmul_fp32, grouped_bf16_matmul_fp32
-
-    q = tensors["q"].float()
-    ori_kv = tensors["ori_kv"].float()
-    ori_kv_flat = ori_kv.reshape(ori_kv.shape[0] * BLOCK_SIZE, HEAD_DIM)
-    swa_indices = tensors["swa_indices"]
-    swa_lens = tensors["swa_lens"]
-    attn_sink = tensors["attn_sink"].float()
-    cos = tensors["freqs_cos"].float()
-    sin = tensors["freqs_sin"].float()
-    wo_a = tensors["wo_a"].float()
-    wo_b_i8 = tensors["wo_b"]
-    wo_b_scale = tensors["wo_b_scale"].float()
-
-    o = torch.zeros(T, H, HEAD_DIM)
-
-    # Per-query-token attention. swa_indices is the authoritative physical
-    # cache-row list; invalid tail columns are -1 and swa_lens gives the valid
-    # prefix length.
-    for t in range(T):
-        valid_len = int(swa_lens[t].item())
-        valid_slots = [int(v) for v in swa_indices[t, :valid_len].tolist() if int(v) >= 0]
-        if not valid_slots:
-            continue
-
-        q_t = q[t]
-
-        block_mi = []
-        block_li = []
-        block_oi = []
-        for sb in range(SWA_SPARSE_BLOCKS):
-            start = sb * SWA_ATTN_K_TILE
-            end = min(start + SWA_ATTN_K_TILE, WIN)
-            slots = swa_indices[t, start:end].tolist()
-            valid_tile = torch.tensor(
-                [start + i < valid_len and int(slot) >= 0 for i, slot in enumerate(slots)],
-                dtype=torch.bool,
-            )
-            if end - start < SWA_ATTN_K_TILE:
-                valid_tile = torch.cat(
-                    [
-                        valid_tile,
-                        torch.zeros(SWA_ATTN_K_TILE - (end - start), dtype=torch.bool),
-                    ]
-                )
-            valid_tile = valid_tile.to(device=ori_kv.device)
-            kv_tile = torch.zeros(SWA_ATTN_K_TILE, HEAD_DIM, dtype=ori_kv.dtype, device=ori_kv.device)
-            for r, slot in enumerate(slots):
-                if r >= SWA_ATTN_K_TILE:
-                    break
-                slot_i = int(slot)
-                if slot_i >= 0:
-                    kv_tile[r] = ori_kv_flat[slot_i]
-            scores = bf16_matmul_fp32(q_t, kv_tile.T) * SOFTMAX_SCALE
-            scores = scores.masked_fill(~valid_tile.unsqueeze(0), NEG_INF)
-            mi = scores.max(dim=-1, keepdim=True).values
-            exp_values = [math.exp(value) for value in (scores - mi).reshape(-1).tolist()]
-            exp_scores = torch.tensor(exp_values, dtype=torch.float32, device=scores.device).reshape_as(
-                scores
-            )
-            exp_scores = exp_scores.masked_fill(~valid_tile.unsqueeze(0), 0.0)
-            li64 = exp_scores[..., :64] + exp_scores[..., 64:128]
-            li32 = li64[..., :32] + li64[..., 32:64]
-            li16 = li32[..., :16] + li32[..., 16:32]
-            li8 = li16[..., :8] + li16[..., 8:16]
-            li4 = li8[..., :4] + li8[..., 4:8]
-            li2 = li4[..., :2] + li4[..., 2:4]
-            li = li2[..., :1] + li2[..., 1:2]
-            oi = bf16_matmul_fp32(exp_scores.to(torch.bfloat16).float(), kv_tile.to(torch.bfloat16).float())
-            block_mi.append(mi)
-            block_li.append(li)
-            block_oi.append(oi)
-
-        score_max = block_mi[0]
-        li = block_li[0]
-        oi_num = block_oi[0]
-        for mi_cur, li_cur, oi_cur in zip(block_mi[1:], block_li[1:], block_oi[1:]):
-            score_max_new = torch.maximum(score_max, mi_cur)
-            alpha = torch.exp(score_max - score_max_new)
-            beta = torch.exp(mi_cur - score_max_new)
-            li = alpha * li + beta * li_cur
-            oi_num = alpha * oi_num + beta * oi_cur
-            score_max = score_max_new
-
-        denom = li + torch.exp(attn_sink.unsqueeze(-1) - score_max)
-        o[t] = oi_num / denom
-
-    rope_pair = o[..., NOPE_DIM:].unflatten(-1, (-1, 2))
-    rope_even = rope_pair[..., 0]
-    rope_odd = rope_pair[..., 1]
-    cos_half = cos[:, :HALF_ROPE].unsqueeze(1)
-    sin_half = sin[:, :HALF_ROPE].unsqueeze(1)
-    inv_even = (rope_even * cos_half + rope_odd * sin_half).to(torch.bfloat16).float()
-    inv_odd = (rope_odd * cos_half - rope_even * sin_half).to(torch.bfloat16).float()
-    o_rope = torch.stack([inv_even, inv_odd], dim=-1).flatten(-2)
-    o = torch.cat([o[..., :NOPE_DIM], o_rope], dim=-1).to(torch.bfloat16)
-
-    seq_per_batch = T // B
-    o_model = o.float().view(B, seq_per_batch, O_GROUPS, O_GROUP_IN)
-    o_r = grouped_bf16_matmul_fp32(o_model, wo_a)
-    # PER-GROUP INT8 activation quant (one amax per O_LORA group, not per full row):
-    # this localizes the reduction so proj_a[g]->quant[g]->proj_b[g] can pipeline
-    # back-to-back. Each group's INT32 partial is dequantized by its OWN per-row
-    # activation scale before the groups are summed (the per-group scale cannot
-    # factor out of the K-sum), then the per-channel weight scale is applied.
-    o_r_g = o_r.reshape(T, O_GROUPS, O_LORA)
-    amax_g = o_r_g.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)  # [T, G, 1]
-    scale_q_g = INT8_SCALE_MAX / amax_g
-    if tensors.get("tp_projection", False):
-        scale_q_g = torch.div(torch.full_like(amax_g, INT8_SCALE_MAX), amax_g)
-    o_r_i8_g = torch.round(o_r_g * scale_q_g).to(torch.int32).to(torch.float16).to(torch.int8)
-    scale_dq_g = 1.0 / scale_q_g  # [T, G, 1]
-    wo_b_g = wo_b_i8.reshape(D, O_GROUPS, O_LORA)
-    out = torch.zeros(T, D, dtype=torch.float32)
-    for g in range(O_GROUPS):
-        p_g = o_r_i8_g[:, g].to(torch.int32) @ wo_b_g[:, g].to(torch.int32).T  # [T, D]
-        partial = p_g.float() * scale_dq_g[:, g]
-        if tensors.get("tp_projection", False):
-            partial = partial * wo_b_scale.unsqueeze(0)
-        out = out + partial  # per-row group scale
-    if not tensors.get("tp_projection", False):
-        out = out * wo_b_scale.unsqueeze(0)  # per-channel weight scale
-
-    tensors["attn_out"][:] = out.to(torch.bfloat16)
-
-def build_tensor_specs_swa(
-    causal_regression_fixture: bool = False,
-    short_window_fixture: bool = False,
-    unmapped_window_fixture: bool = False,
-):
-    """Build deterministic demo tensors for the merged standalone harness."""
-    import torch
-    from golden import TensorSpec
-
-    if __package__:
-        from .utils import block_table, quant_w_per_channel
-    else:
-        from utils import block_table, quant_w_per_channel
-
-    def init_q():
-        """Initialize the query tensor used by the decode attention stage."""
-        q = torch.rand(T, H, HEAD_DIM) - 0.5
-        if causal_regression_fixture:
-            q[0].fill_(1.0)
-        return q
-
-    def init_ori_kv():
-        """Initialize the sliding-window KV cache pages."""
-        kv = torch.rand(ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5
-        if causal_regression_fixture:
-            kv[0, WIN - 1, 0].fill_(8.0)
-        if unmapped_window_fixture:
-            kv[0].fill_(float("nan"))
-        return kv
-
-    def init_attn_sink():
-        """Initialize the per-head sink logits to zero."""
-        return torch.zeros(H)
-
-    def init_ori_block_table():
-        """Build the demo block table for the sliding-window cache pages."""
-        return block_table(batch=B, table_blocks=ORI_MAX_BLOCKS, physical_blocks=ORI_BLOCK_NUM)
-
-    def init_swa_lens():
-        lens = torch.full((T,), WIN, dtype=torch.int32)
-        if short_window_fixture:
-            lens.fill_(17)
-        return lens
-
-    def init_swa_indices():
-        """Build physical cache-row indices for the standalone SWA fixture."""
-        tbl = init_ori_block_table()
-        indices = torch.full((T, WIN), -1, dtype=torch.int32)
-        if unmapped_window_fixture:
-            half = WIN // 2
-            for t in range(T):
-                if t % 4 == 0:
-                    indices[t, half:] = BLOCK_SIZE + torch.arange(half, dtype=torch.int32)
-                elif t % 4 == 1:
-                    indices[t, :half] = 2 * BLOCK_SIZE + half + torch.arange(half, dtype=torch.int32)
-                elif t % 4 == 3:
-                    indices[t, :half] = 3 * BLOCK_SIZE + half + torch.arange(half, dtype=torch.int32)
-                    indices[t, half:] = 4 * BLOCK_SIZE + torch.arange(half, dtype=torch.int32)
-            return indices
-        lens = init_swa_lens()
-        for t in range(T):
-            b = t // S
-            valid_len = int(lens[t].item())
-            for w in range(valid_len):
-                logical_blk = w // BLOCK_SIZE
-                intra = w % BLOCK_SIZE
-                blk = int(tbl[b, logical_blk].item())
-                if blk >= 0:
-                    indices[t, w] = blk * BLOCK_SIZE + intra
-        return indices
-
-    def init_cos():
-        """Build the split-half cosine table used by the inverse-RoPE reference."""
-        angles = torch.arange(T * HALF_ROPE).reshape(T, HALF_ROPE) * 1e-3
-        cos_half = torch.cos(angles)
-        return torch.cat([cos_half, cos_half], dim=-1)
-
-    def init_sin():
-        """Build the split-half sine table used by the inverse-RoPE reference."""
-        angles = torch.arange(T * HALF_ROPE).reshape(T, HALF_ROPE) * 1e-3
-        sin_half = torch.sin(angles)
-        return torch.cat([sin_half, sin_half], dim=-1)
-
-    def init_wo_a():
-        """Initialize the grouped first-stage output-projection weights."""
-        return (torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) / (O_GROUP_IN**0.5)
-
-    wo_b_bf16 = ((torch.rand(D, O_GROUPS * O_LORA) - 0.5) / ((O_GROUPS * O_LORA) ** 0.5)).to(torch.bfloat16)
-    wo_b_i8, wo_b_scale = quant_w_per_channel(wo_b_bf16)
-
-    def init_wo_b():
-        """Initialize the second-stage output-projection weights in per-channel INT8 form."""
-        return wo_b_i8
-
-    def init_wo_b_scale():
-        """Initialize the dequant scales paired with the INT8 second-stage weights."""
-        return wo_b_scale
-
-    return [
-        TensorSpec("q", [T, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
-        TensorSpec(
-            "ori_kv", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv
-        ),
-        TensorSpec("swa_indices", [T, WIN], torch.int32, init_value=init_swa_indices),
-        TensorSpec("swa_lens", [T], torch.int32, init_value=init_swa_lens),
-        TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
-        TensorSpec("freqs_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_cos),
-        TensorSpec("freqs_sin", [T, ROPE_DIM], torch.bfloat16, init_value=init_sin),
-        TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
-        TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=init_wo_b),
-        TensorSpec("wo_b_scale", [D], torch.float32, init_value=init_wo_b_scale),
-        TensorSpec("attn_out", [T, D], torch.bfloat16),
-    ]
-
-
 if __package__:
     from .decode_shapes import DECODE_CONFIG as M
     from .config import INT8_SCALE_MAX, INT8_AMAX_EPS
@@ -1324,144 +1075,6 @@ def csa_o_all_to_all_wait(
 # dropped in this variant: this leaf uses the layer's communication windows
 # and is qualified through the composed distributed entry.
 
-def golden_sparse_attn_csa(tensors):
-    """Torch reference: sparse_attn decode path followed by grouped o_proj."""
-    import torch
-
-    if __package__:
-        from .utils import bf16_matmul_fp32, grouped_bf16_matmul_fp32
-    else:
-        from utils import bf16_matmul_fp32, grouped_bf16_matmul_fp32
-
-    q = tensors["q"].float()
-    ori_kv = tensors["ori_kv"].float()
-    window_swa_indices = tensors["window_swa_indices"]
-    cmp_kv = tensors["cmp_kv"].float()
-    cmp_block_table = tensors["cmp_block_table"]
-    # Compressed slots: keep raw indexer topk iff 0 <= raw < floor((pos + 1) / COMPRESS_RATIO), else -1.
-    raw = tensors["idx_topk"][:, :CSA_CMP_TOPK].to(torch.int64)
-    bound = ((tensors["position_ids"][:, 0].to(torch.int64) + 1) // CSA_COMPRESS_RATIO).unsqueeze(1)
-    keep = (raw >= 0) & (raw < bound)
-    cmp_sparse_indices = torch.where(keep, raw, torch.full_like(raw, -1)).to(torch.int32)
-    attn_sink = tensors["attn_sink"].float()
-    cos = tensors["freqs_cos"].float()
-    sin = tensors["freqs_sin"].float()
-    wo_a = tensors["wo_a"].float()
-    wo_b_i8 = tensors["wo_b"]
-    wo_b_scale = tensors["wo_b_scale"].float()
-
-    o = torch.zeros(T, H, HEAD_DIM)
-
-    # Per-query-token attention. The window prefix is driven by window_swa_indices;
-    # cmp_sparse_indices contains compressed-cache slots only.
-    for t in range(T):
-        b = t // S
-        kv_rows = []
-        valid = []
-
-        for raw in window_swa_indices[t].tolist():
-            slot = int(raw)
-            if slot >= 0:
-                blk_id = slot // BLOCK_SIZE
-                intra = slot % BLOCK_SIZE
-                kv_rows.append(ori_kv[blk_id, intra, 0])
-                valid.append(True)
-            else:
-                kv_rows.append(torch.zeros(HEAD_DIM, dtype=ori_kv.dtype))
-                valid.append(False)
-
-        for raw in cmp_sparse_indices[t].tolist():
-            if raw < 0:
-                kv_rows.append(torch.zeros(HEAD_DIM, dtype=ori_kv.dtype))
-                valid.append(False)
-                continue
-            cmp_slot = int(raw)
-            block_id = int(cmp_block_table[b, cmp_slot // CSA_CMP_STORAGE_BLOCK_SIZE].item())
-            kv_rows.append(cmp_kv[block_id, cmp_slot % CSA_CMP_STORAGE_BLOCK_SIZE, 0])
-            valid.append(True)
-
-        if not any(valid):
-            continue
-
-        pad_k = CSA_PADDED_TOPK - CSA_TOPK
-        if pad_k:
-            kv_rows.extend(torch.zeros(HEAD_DIM, dtype=ori_kv.dtype) for _ in range(pad_k))
-            valid.extend(False for _ in range(pad_k))
-
-        kv_b = torch.stack(kv_rows, dim=0)
-        valid_b = torch.tensor(valid, dtype=torch.bool)
-        q_t = q[t]
-
-        block_mi = []
-        block_li = []
-        block_oi = []
-        for tile_start in range(0, CSA_PADDED_TOPK, CSA_ATTN_K_TILE):
-            kv_tile = kv_b[tile_start : tile_start + CSA_ATTN_K_TILE]
-            valid_tile = valid_b[tile_start : tile_start + CSA_ATTN_K_TILE]
-            scores = bf16_matmul_fp32(q_t, kv_tile.T) * SOFTMAX_SCALE
-            scores = scores.masked_fill(~valid_tile.unsqueeze(0), NEG_INF)
-            mi = scores.max(dim=-1, keepdim=True).values
-            # Round exp once to FP32, then use the shared fixed split-half tree.
-            exp_scores = torch.exp((scores - mi).double()).float().masked_fill(~valid_tile.unsqueeze(0), 0.0)
-            li = exp_scores
-            for half_width in (16, 8, 4, 2, 1):
-                li = li[:, :half_width] + li[:, half_width : 2 * half_width]
-            oi = bf16_matmul_fp32(exp_scores.to(torch.bfloat16).float(), kv_tile.to(torch.bfloat16).float())
-            block_mi.append(mi)
-            block_li.append(li)
-            block_oi.append(oi)
-
-        score_max = block_mi[0]
-        li = block_li[0]
-        oi_num = block_oi[0]
-        for mi_cur, li_cur, oi_cur in zip(block_mi[1:], block_li[1:], block_oi[1:]):
-            score_max_new = torch.maximum(score_max, mi_cur)
-            alpha = torch.exp((score_max - score_max_new).double()).float()
-            beta = torch.exp((mi_cur - score_max_new).double()).float()
-            li = alpha * li + beta * li_cur
-            oi_num = alpha * oi_num + beta * oi_cur
-            score_max = score_max_new
-
-        denom = li + torch.exp((attn_sink.unsqueeze(-1) - score_max).double()).float()
-        o[t] = oi_num / denom
-
-    rope_pair = o[..., NOPE_DIM:].unflatten(-1, (-1, 2))
-    rope_even = rope_pair[..., 0]
-    rope_odd = rope_pair[..., 1]
-    cos_half = cos[:, :HALF_ROPE].unsqueeze(1)
-    sin_half = sin[:, :HALF_ROPE].unsqueeze(1)
-    inv_even = (rope_even * cos_half + rope_odd * sin_half).to(torch.bfloat16).float()
-    inv_odd = (rope_odd * cos_half - rope_even * sin_half).to(torch.bfloat16).float()
-    o_rope = torch.stack([inv_even, inv_odd], dim=-1).flatten(-2)
-    o = torch.cat([o[..., :NOPE_DIM], o_rope], dim=-1).to(torch.bfloat16)
-
-    seq_per_batch = T // B
-    o_model = o.float().view(B, seq_per_batch, O_GROUPS, O_GROUP_IN)
-    o_r = grouped_bf16_matmul_fp32(o_model, wo_a)
-    # PER-GROUP INT8 activation quant: one amax per O_LORA group. Each group's INT32
-    # partial is dequantized by its OWN per-row act scale before the groups are summed
-    # (the per-group scale cannot factor out of the K-sum), then the channel scale.
-    o_r_g = o_r.reshape(T, O_GROUPS, O_LORA)
-    amax_g = o_r_g.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)  # [T, G, 1]
-    scale_q_g = INT8_SCALE_MAX / amax_g
-    if tensors.get("tp_projection", False):
-        scale_q_g = torch.div(torch.full_like(amax_g, INT8_SCALE_MAX), amax_g)
-    o_r_i8_g = torch.round(o_r_g * scale_q_g).to(torch.int32).to(torch.float16).to(torch.int8)
-    scale_dq_g = 1.0 / scale_q_g  # [T, G, 1]
-    wo_b_g = wo_b_i8.reshape(D, O_GROUPS, O_LORA)
-    out = torch.zeros(T, D, dtype=torch.float32)
-    for g in range(O_GROUPS):
-        p_g = o_r_i8_g[:, g].to(torch.int32) @ wo_b_g[:, g].to(torch.int32).T  # [T, D]
-        partial = p_g.float() * scale_dq_g[:, g]
-        if tensors.get("tp_projection", False):
-            partial = partial * wo_b_scale.unsqueeze(0)
-        out = out + partial  # per-row group scale
-    if not tensors.get("tp_projection", False):
-        out = out * wo_b_scale.unsqueeze(0)  # per-channel weight scale
-
-    tensors["attn_out"][:] = out.to(torch.bfloat16)
-
-
 
 # No `__main__` entry: this variant is exercised only through decode_layer.py,
 # which owns the comm windows the token shard is built on.
@@ -1881,6 +1494,394 @@ def sparse_attn_test_hca(
     merge_tid = pl.system.task_dummy(deps=[merge_tids])
     o_proj_grouped(o_packed, merge_tid, wo_a, wo_b, wo_b_scale, attn_out)
     return attn_out
+
+
+def golden_sparse_attn_swa(tensors):
+    import math
+
+    """Torch reference: sparse_attn decode path followed by grouped o_proj."""
+    import torch
+
+    if __package__:
+        from .utils import bf16_matmul_fp32, grouped_bf16_matmul_fp32
+    else:
+        from utils import bf16_matmul_fp32, grouped_bf16_matmul_fp32
+
+    q = tensors["q"].float()
+    ori_kv = tensors["ori_kv"].float()
+    ori_kv_flat = ori_kv.reshape(ori_kv.shape[0] * BLOCK_SIZE, HEAD_DIM)
+    swa_indices = tensors["swa_indices"]
+    swa_lens = tensors["swa_lens"]
+    attn_sink = tensors["attn_sink"].float()
+    cos = tensors["freqs_cos"].float()
+    sin = tensors["freqs_sin"].float()
+    wo_a = tensors["wo_a"].float()
+    wo_b_i8 = tensors["wo_b"]
+    wo_b_scale = tensors["wo_b_scale"].float()
+
+    o = torch.zeros(T, H, HEAD_DIM)
+
+    # Per-query-token attention. swa_indices is the authoritative physical
+    # cache-row list; invalid tail columns are -1 and swa_lens gives the valid
+    # prefix length.
+    for t in range(T):
+        valid_len = int(swa_lens[t].item())
+        valid_slots = [int(v) for v in swa_indices[t, :valid_len].tolist() if int(v) >= 0]
+        if not valid_slots:
+            continue
+
+        q_t = q[t]
+
+        block_mi = []
+        block_li = []
+        block_oi = []
+        for sb in range(SWA_SPARSE_BLOCKS):
+            start = sb * SWA_ATTN_K_TILE
+            end = min(start + SWA_ATTN_K_TILE, WIN)
+            slots = swa_indices[t, start:end].tolist()
+            valid_tile = torch.tensor(
+                [start + i < valid_len and int(slot) >= 0 for i, slot in enumerate(slots)],
+                dtype=torch.bool,
+            )
+            if end - start < SWA_ATTN_K_TILE:
+                valid_tile = torch.cat(
+                    [
+                        valid_tile,
+                        torch.zeros(SWA_ATTN_K_TILE - (end - start), dtype=torch.bool),
+                    ]
+                )
+            valid_tile = valid_tile.to(device=ori_kv.device)
+            kv_tile = torch.zeros(SWA_ATTN_K_TILE, HEAD_DIM, dtype=ori_kv.dtype, device=ori_kv.device)
+            for r, slot in enumerate(slots):
+                if r >= SWA_ATTN_K_TILE:
+                    break
+                slot_i = int(slot)
+                if slot_i >= 0:
+                    kv_tile[r] = ori_kv_flat[slot_i]
+            scores = bf16_matmul_fp32(q_t, kv_tile.T) * SOFTMAX_SCALE
+            scores = scores.masked_fill(~valid_tile.unsqueeze(0), NEG_INF)
+            mi = scores.max(dim=-1, keepdim=True).values
+            exp_values = [math.exp(value) for value in (scores - mi).reshape(-1).tolist()]
+            exp_scores = torch.tensor(exp_values, dtype=torch.float32, device=scores.device).reshape_as(
+                scores
+            )
+            exp_scores = exp_scores.masked_fill(~valid_tile.unsqueeze(0), 0.0)
+            li64 = exp_scores[..., :64] + exp_scores[..., 64:128]
+            li32 = li64[..., :32] + li64[..., 32:64]
+            li16 = li32[..., :16] + li32[..., 16:32]
+            li8 = li16[..., :8] + li16[..., 8:16]
+            li4 = li8[..., :4] + li8[..., 4:8]
+            li2 = li4[..., :2] + li4[..., 2:4]
+            li = li2[..., :1] + li2[..., 1:2]
+            oi = bf16_matmul_fp32(exp_scores.to(torch.bfloat16).float(), kv_tile.to(torch.bfloat16).float())
+            block_mi.append(mi)
+            block_li.append(li)
+            block_oi.append(oi)
+
+        score_max = block_mi[0]
+        li = block_li[0]
+        oi_num = block_oi[0]
+        for mi_cur, li_cur, oi_cur in zip(block_mi[1:], block_li[1:], block_oi[1:]):
+            score_max_new = torch.maximum(score_max, mi_cur)
+            alpha = torch.exp(score_max - score_max_new)
+            beta = torch.exp(mi_cur - score_max_new)
+            li = alpha * li + beta * li_cur
+            oi_num = alpha * oi_num + beta * oi_cur
+            score_max = score_max_new
+
+        denom = li + torch.exp(attn_sink.unsqueeze(-1) - score_max)
+        o[t] = oi_num / denom
+
+    rope_pair = o[..., NOPE_DIM:].unflatten(-1, (-1, 2))
+    rope_even = rope_pair[..., 0]
+    rope_odd = rope_pair[..., 1]
+    cos_half = cos[:, :HALF_ROPE].unsqueeze(1)
+    sin_half = sin[:, :HALF_ROPE].unsqueeze(1)
+    inv_even = (rope_even * cos_half + rope_odd * sin_half).to(torch.bfloat16).float()
+    inv_odd = (rope_odd * cos_half - rope_even * sin_half).to(torch.bfloat16).float()
+    o_rope = torch.stack([inv_even, inv_odd], dim=-1).flatten(-2)
+    o = torch.cat([o[..., :NOPE_DIM], o_rope], dim=-1).to(torch.bfloat16)
+
+    seq_per_batch = T // B
+    o_model = o.float().view(B, seq_per_batch, O_GROUPS, O_GROUP_IN)
+    o_r = grouped_bf16_matmul_fp32(o_model, wo_a)
+    # PER-GROUP INT8 activation quant (one amax per O_LORA group, not per full row):
+    # this localizes the reduction so proj_a[g]->quant[g]->proj_b[g] can pipeline
+    # back-to-back. Each group's INT32 partial is dequantized by its OWN per-row
+    # activation scale before the groups are summed (the per-group scale cannot
+    # factor out of the K-sum), then the per-channel weight scale is applied.
+    o_r_g = o_r.reshape(T, O_GROUPS, O_LORA)
+    amax_g = o_r_g.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)  # [T, G, 1]
+    scale_q_g = INT8_SCALE_MAX / amax_g
+    if tensors.get("tp_projection", False):
+        scale_q_g = torch.div(torch.full_like(amax_g, INT8_SCALE_MAX), amax_g)
+    o_r_i8_g = torch.round(o_r_g * scale_q_g).to(torch.int32).to(torch.float16).to(torch.int8)
+    scale_dq_g = 1.0 / scale_q_g  # [T, G, 1]
+    wo_b_g = wo_b_i8.reshape(D, O_GROUPS, O_LORA)
+    out = torch.zeros(T, D, dtype=torch.float32)
+    for g in range(O_GROUPS):
+        p_g = o_r_i8_g[:, g].to(torch.int32) @ wo_b_g[:, g].to(torch.int32).T  # [T, D]
+        partial = p_g.float() * scale_dq_g[:, g]
+        if tensors.get("tp_projection", False):
+            partial = partial * wo_b_scale.unsqueeze(0)
+        out = out + partial  # per-row group scale
+    if not tensors.get("tp_projection", False):
+        out = out * wo_b_scale.unsqueeze(0)  # per-channel weight scale
+
+    tensors["attn_out"][:] = out.to(torch.bfloat16)
+
+
+def build_tensor_specs_swa(
+    causal_regression_fixture: bool = False,
+    short_window_fixture: bool = False,
+    unmapped_window_fixture: bool = False,
+):
+    """Build deterministic demo tensors for the merged standalone harness."""
+    import torch
+    from golden import TensorSpec
+
+    if __package__:
+        from .utils import block_table, quant_w_per_channel
+    else:
+        from utils import block_table, quant_w_per_channel
+
+    def init_q():
+        """Initialize the query tensor used by the decode attention stage."""
+        q = torch.rand(T, H, HEAD_DIM) - 0.5
+        if causal_regression_fixture:
+            q[0].fill_(1.0)
+        return q
+
+    def init_ori_kv():
+        """Initialize the sliding-window KV cache pages."""
+        kv = torch.rand(ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5
+        if causal_regression_fixture:
+            kv[0, WIN - 1, 0].fill_(8.0)
+        if unmapped_window_fixture:
+            kv[0].fill_(float("nan"))
+        return kv
+
+    def init_attn_sink():
+        """Initialize the per-head sink logits to zero."""
+        return torch.zeros(H)
+
+    def init_ori_block_table():
+        """Build the demo block table for the sliding-window cache pages."""
+        return block_table(batch=B, table_blocks=ORI_MAX_BLOCKS, physical_blocks=ORI_BLOCK_NUM)
+
+    def init_swa_lens():
+        lens = torch.full((T,), WIN, dtype=torch.int32)
+        if short_window_fixture:
+            lens.fill_(17)
+        return lens
+
+    def init_swa_indices():
+        """Build physical cache-row indices for the standalone SWA fixture."""
+        tbl = init_ori_block_table()
+        indices = torch.full((T, WIN), -1, dtype=torch.int32)
+        if unmapped_window_fixture:
+            half = WIN // 2
+            for t in range(T):
+                if t % 4 == 0:
+                    indices[t, half:] = BLOCK_SIZE + torch.arange(half, dtype=torch.int32)
+                elif t % 4 == 1:
+                    indices[t, :half] = 2 * BLOCK_SIZE + half + torch.arange(half, dtype=torch.int32)
+                elif t % 4 == 3:
+                    indices[t, :half] = 3 * BLOCK_SIZE + half + torch.arange(half, dtype=torch.int32)
+                    indices[t, half:] = 4 * BLOCK_SIZE + torch.arange(half, dtype=torch.int32)
+            return indices
+        lens = init_swa_lens()
+        for t in range(T):
+            b = t // S
+            valid_len = int(lens[t].item())
+            for w in range(valid_len):
+                logical_blk = w // BLOCK_SIZE
+                intra = w % BLOCK_SIZE
+                blk = int(tbl[b, logical_blk].item())
+                if blk >= 0:
+                    indices[t, w] = blk * BLOCK_SIZE + intra
+        return indices
+
+    def init_cos():
+        """Build the split-half cosine table used by the inverse-RoPE reference."""
+        angles = torch.arange(T * HALF_ROPE).reshape(T, HALF_ROPE) * 1e-3
+        cos_half = torch.cos(angles)
+        return torch.cat([cos_half, cos_half], dim=-1)
+
+    def init_sin():
+        """Build the split-half sine table used by the inverse-RoPE reference."""
+        angles = torch.arange(T * HALF_ROPE).reshape(T, HALF_ROPE) * 1e-3
+        sin_half = torch.sin(angles)
+        return torch.cat([sin_half, sin_half], dim=-1)
+
+    def init_wo_a():
+        """Initialize the grouped first-stage output-projection weights."""
+        return (torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) / (O_GROUP_IN**0.5)
+
+    wo_b_bf16 = ((torch.rand(D, O_GROUPS * O_LORA) - 0.5) / ((O_GROUPS * O_LORA) ** 0.5)).to(torch.bfloat16)
+    wo_b_i8, wo_b_scale = quant_w_per_channel(wo_b_bf16)
+
+    def init_wo_b():
+        """Initialize the second-stage output-projection weights in per-channel INT8 form."""
+        return wo_b_i8
+
+    def init_wo_b_scale():
+        """Initialize the dequant scales paired with the INT8 second-stage weights."""
+        return wo_b_scale
+
+    return [
+        TensorSpec("q", [T, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
+        TensorSpec(
+            "ori_kv", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv
+        ),
+        TensorSpec("swa_indices", [T, WIN], torch.int32, init_value=init_swa_indices),
+        TensorSpec("swa_lens", [T], torch.int32, init_value=init_swa_lens),
+        TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
+        TensorSpec("freqs_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_cos),
+        TensorSpec("freqs_sin", [T, ROPE_DIM], torch.bfloat16, init_value=init_sin),
+        TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
+        TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=init_wo_b),
+        TensorSpec("wo_b_scale", [D], torch.float32, init_value=init_wo_b_scale),
+        TensorSpec("attn_out", [T, D], torch.bfloat16),
+    ]
+
+
+def golden_sparse_attn_csa(tensors):
+    """Torch reference: sparse_attn decode path followed by grouped o_proj."""
+    import torch
+
+    if __package__:
+        from .utils import bf16_matmul_fp32, grouped_bf16_matmul_fp32
+    else:
+        from utils import bf16_matmul_fp32, grouped_bf16_matmul_fp32
+
+    q = tensors["q"].float()
+    ori_kv = tensors["ori_kv"].float()
+    window_swa_indices = tensors["window_swa_indices"]
+    cmp_kv = tensors["cmp_kv"].float()
+    cmp_block_table = tensors["cmp_block_table"]
+    # Compressed slots: keep raw indexer topk iff 0 <= raw < floor((pos + 1) / COMPRESS_RATIO), else -1.
+    raw = tensors["idx_topk"][:, :CSA_CMP_TOPK].to(torch.int64)
+    bound = ((tensors["position_ids"][:, 0].to(torch.int64) + 1) // CSA_COMPRESS_RATIO).unsqueeze(1)
+    keep = (raw >= 0) & (raw < bound)
+    cmp_sparse_indices = torch.where(keep, raw, torch.full_like(raw, -1)).to(torch.int32)
+    attn_sink = tensors["attn_sink"].float()
+    cos = tensors["freqs_cos"].float()
+    sin = tensors["freqs_sin"].float()
+    wo_a = tensors["wo_a"].float()
+    wo_b_i8 = tensors["wo_b"]
+    wo_b_scale = tensors["wo_b_scale"].float()
+
+    o = torch.zeros(T, H, HEAD_DIM)
+
+    # Per-query-token attention. The window prefix is driven by window_swa_indices;
+    # cmp_sparse_indices contains compressed-cache slots only.
+    for t in range(T):
+        b = t // S
+        kv_rows = []
+        valid = []
+
+        for raw in window_swa_indices[t].tolist():
+            slot = int(raw)
+            if slot >= 0:
+                blk_id = slot // BLOCK_SIZE
+                intra = slot % BLOCK_SIZE
+                kv_rows.append(ori_kv[blk_id, intra, 0])
+                valid.append(True)
+            else:
+                kv_rows.append(torch.zeros(HEAD_DIM, dtype=ori_kv.dtype))
+                valid.append(False)
+
+        for raw in cmp_sparse_indices[t].tolist():
+            if raw < 0:
+                kv_rows.append(torch.zeros(HEAD_DIM, dtype=ori_kv.dtype))
+                valid.append(False)
+                continue
+            cmp_slot = int(raw)
+            block_id = int(cmp_block_table[b, cmp_slot // CSA_CMP_STORAGE_BLOCK_SIZE].item())
+            kv_rows.append(cmp_kv[block_id, cmp_slot % CSA_CMP_STORAGE_BLOCK_SIZE, 0])
+            valid.append(True)
+
+        if not any(valid):
+            continue
+
+        pad_k = CSA_PADDED_TOPK - CSA_TOPK
+        if pad_k:
+            kv_rows.extend(torch.zeros(HEAD_DIM, dtype=ori_kv.dtype) for _ in range(pad_k))
+            valid.extend(False for _ in range(pad_k))
+
+        kv_b = torch.stack(kv_rows, dim=0)
+        valid_b = torch.tensor(valid, dtype=torch.bool)
+        q_t = q[t]
+
+        block_mi = []
+        block_li = []
+        block_oi = []
+        for tile_start in range(0, CSA_PADDED_TOPK, CSA_ATTN_K_TILE):
+            kv_tile = kv_b[tile_start : tile_start + CSA_ATTN_K_TILE]
+            valid_tile = valid_b[tile_start : tile_start + CSA_ATTN_K_TILE]
+            scores = bf16_matmul_fp32(q_t, kv_tile.T) * SOFTMAX_SCALE
+            scores = scores.masked_fill(~valid_tile.unsqueeze(0), NEG_INF)
+            mi = scores.max(dim=-1, keepdim=True).values
+            # Round exp once to FP32, then use the shared fixed split-half tree.
+            exp_scores = torch.exp((scores - mi).double()).float().masked_fill(~valid_tile.unsqueeze(0), 0.0)
+            li = exp_scores
+            for half_width in (16, 8, 4, 2, 1):
+                li = li[:, :half_width] + li[:, half_width : 2 * half_width]
+            oi = bf16_matmul_fp32(exp_scores.to(torch.bfloat16).float(), kv_tile.to(torch.bfloat16).float())
+            block_mi.append(mi)
+            block_li.append(li)
+            block_oi.append(oi)
+
+        score_max = block_mi[0]
+        li = block_li[0]
+        oi_num = block_oi[0]
+        for mi_cur, li_cur, oi_cur in zip(block_mi[1:], block_li[1:], block_oi[1:]):
+            score_max_new = torch.maximum(score_max, mi_cur)
+            alpha = torch.exp((score_max - score_max_new).double()).float()
+            beta = torch.exp((mi_cur - score_max_new).double()).float()
+            li = alpha * li + beta * li_cur
+            oi_num = alpha * oi_num + beta * oi_cur
+            score_max = score_max_new
+
+        denom = li + torch.exp((attn_sink.unsqueeze(-1) - score_max).double()).float()
+        o[t] = oi_num / denom
+
+    rope_pair = o[..., NOPE_DIM:].unflatten(-1, (-1, 2))
+    rope_even = rope_pair[..., 0]
+    rope_odd = rope_pair[..., 1]
+    cos_half = cos[:, :HALF_ROPE].unsqueeze(1)
+    sin_half = sin[:, :HALF_ROPE].unsqueeze(1)
+    inv_even = (rope_even * cos_half + rope_odd * sin_half).to(torch.bfloat16).float()
+    inv_odd = (rope_odd * cos_half - rope_even * sin_half).to(torch.bfloat16).float()
+    o_rope = torch.stack([inv_even, inv_odd], dim=-1).flatten(-2)
+    o = torch.cat([o[..., :NOPE_DIM], o_rope], dim=-1).to(torch.bfloat16)
+
+    seq_per_batch = T // B
+    o_model = o.float().view(B, seq_per_batch, O_GROUPS, O_GROUP_IN)
+    o_r = grouped_bf16_matmul_fp32(o_model, wo_a)
+    # PER-GROUP INT8 activation quant: one amax per O_LORA group. Each group's INT32
+    # partial is dequantized by its OWN per-row act scale before the groups are summed
+    # (the per-group scale cannot factor out of the K-sum), then the channel scale.
+    o_r_g = o_r.reshape(T, O_GROUPS, O_LORA)
+    amax_g = o_r_g.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)  # [T, G, 1]
+    scale_q_g = INT8_SCALE_MAX / amax_g
+    if tensors.get("tp_projection", False):
+        scale_q_g = torch.div(torch.full_like(amax_g, INT8_SCALE_MAX), amax_g)
+    o_r_i8_g = torch.round(o_r_g * scale_q_g).to(torch.int32).to(torch.float16).to(torch.int8)
+    scale_dq_g = 1.0 / scale_q_g  # [T, G, 1]
+    wo_b_g = wo_b_i8.reshape(D, O_GROUPS, O_LORA)
+    out = torch.zeros(T, D, dtype=torch.float32)
+    for g in range(O_GROUPS):
+        p_g = o_r_i8_g[:, g].to(torch.int32) @ wo_b_g[:, g].to(torch.int32).T  # [T, D]
+        partial = p_g.float() * scale_dq_g[:, g]
+        if tensors.get("tp_projection", False):
+            partial = partial * wo_b_scale.unsqueeze(0)
+        out = out + partial  # per-row group scale
+    if not tensors.get("tp_projection", False):
+        out = out * wo_b_scale.unsqueeze(0)  # per-channel weight scale
+
+    tensors["attn_out"][:] = out.to(torch.bfloat16)
 
 
 def golden_sparse_attn_hca(tensors):

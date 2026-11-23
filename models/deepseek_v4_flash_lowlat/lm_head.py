@@ -547,100 +547,6 @@ def _gumbel_noise(seed, position):
     return -np.log(-np.log(uniform))
 
 
-def build_tensor_specs_sampling(temperature=None, top_k=None):
-    import torch
-
-    from golden import TensorSpec
-
-    def init_logits():
-        generator = torch.Generator().manual_seed(20260821)
-        logits = torch.randn(SAMPLE_ROWS, VOCAB, generator=generator, dtype=torch.float32)
-        logits[0, 7] = 20.0
-        if SAMPLE_ROWS > 2:
-            logits[2].zero_()
-        if SAMPLE_ROWS > 3:
-            logits[3].fill_(-1.0)
-            logits[3, [17, 60000, VOCAB - 1]] = 1.0
-        if SAMPLE_ROWS > 4:
-            logits[4, 42] = 20.0
-        if SAMPLE_ROWS > 5:
-            logits[5, 0:1200] = 10.0
-        if SAMPLE_ROWS > 6:
-            logits[6] = torch.linspace(-1e-10, 1e-10, VOCAB)
-            logits[6, 0] = 1.0
-        return logits
-
-    def repeat_rows(values, dtype):
-        repeats = (SAMPLE_ROWS + len(values) - 1) // len(values)
-        return torch.tensor(values, dtype=dtype).repeat(repeats)[:SAMPLE_ROWS]
-
-    return [
-        TensorSpec("logits", [SAMPLE_ROWS, VOCAB], torch.float32, init_value=init_logits),
-        TensorSpec(
-            "temperatures",
-            [SAMPLE_ROWS],
-            torch.float32,
-            init_value=(
-                (lambda: torch.full([SAMPLE_ROWS], temperature, dtype=torch.float32))
-                if temperature is not None
-                else (lambda: repeat_rows([0.0, 0.3, 0.7, 1.0, 0.0, 0.5, 1.3, 2.0], torch.float32))
-            ),
-        ),
-        TensorSpec(
-            "top_ks",
-            [SAMPLE_ROWS],
-            torch.int32,
-            init_value=(
-                (lambda: torch.full([SAMPLE_ROWS], top_k, dtype=torch.int32))
-                if top_k is not None
-                else (lambda: repeat_rows([VOCAB, 1, 8, 32, 128, 1000, 4096, VOCAB], torch.int32))
-            ),
-        ),
-        TensorSpec(
-            "seeds",
-            [SAMPLE_ROWS],
-            torch.int32,
-            init_value=lambda: repeat_rows([1, 7, 19, 1234, 42, 99, 2026, 65537], torch.int32),
-        ),
-        TensorSpec(
-            "positions",
-            [SAMPLE_ROWS],
-            torch.int32,
-            init_value=lambda: repeat_rows([0, 1, 17, 1024, 4, 55, 4096, 32767], torch.int32),
-        ),
-        TensorSpec("sampled_ids", [SAMPLE_ROWS, SAMPLED_IDS_PAD], torch.int32),
-    ]
-
-
-def golden_sample(tensors):
-    import torch
-
-    tensors["sampled_ids"].zero_()
-    for row in range(SAMPLE_ROWS):
-        logits = tensors["logits"][row].float()
-        temperature = float(tensors["temperatures"][row])
-        top_k = int(tensors["top_ks"][row])
-        if temperature < SAMPLING_EPS:
-            selected = torch.argmax(logits)
-        else:
-            seed = int(tensors["seeds"][row])
-            position = int(tensors["positions"][row])
-            noise = torch.from_numpy(_gumbel_noise(seed, position))
-            scaled_logits = logits / temperature
-            if 0 < top_k < VOCAB:
-                boundary = torch.topk(scaled_logits, top_k).values[-1]
-                greater_mask = scaled_logits > boundary
-                boundary_indices = torch.nonzero(scaled_logits == boundary).flatten()
-                boundary_keep = top_k - int(torch.sum(greater_mask))
-                keep_mask = greater_mask.clone()
-                keep_mask[boundary_indices[:boundary_keep]] = True
-                filtered_logits = torch.full_like(scaled_logits, -torch.inf)
-                filtered_logits[keep_mask] = scaled_logits[keep_mask]
-                scaled_logits = filtered_logits
-            selected = torch.argmax(scaled_logits + noise)
-        tensors["sampled_ids"][row, 0] = selected.to(torch.int32)
-
-
 # ci: devices=2
 
 
@@ -1197,6 +1103,100 @@ def l3_lm_head(
             hidden_window, hidden_done, logits_window, logits_done,
             r // TP_SIZE * TP_SIZE, r % TP_SIZE, DONE_VALUE, device=r,
         )
+
+
+def build_tensor_specs_sampling(temperature=None, top_k=None):
+    import torch
+
+    from golden import TensorSpec
+
+    def init_logits():
+        generator = torch.Generator().manual_seed(20260821)
+        logits = torch.randn(SAMPLE_ROWS, VOCAB, generator=generator, dtype=torch.float32)
+        logits[0, 7] = 20.0
+        if SAMPLE_ROWS > 2:
+            logits[2].zero_()
+        if SAMPLE_ROWS > 3:
+            logits[3].fill_(-1.0)
+            logits[3, [17, 60000, VOCAB - 1]] = 1.0
+        if SAMPLE_ROWS > 4:
+            logits[4, 42] = 20.0
+        if SAMPLE_ROWS > 5:
+            logits[5, 0:1200] = 10.0
+        if SAMPLE_ROWS > 6:
+            logits[6] = torch.linspace(-1e-10, 1e-10, VOCAB)
+            logits[6, 0] = 1.0
+        return logits
+
+    def repeat_rows(values, dtype):
+        repeats = (SAMPLE_ROWS + len(values) - 1) // len(values)
+        return torch.tensor(values, dtype=dtype).repeat(repeats)[:SAMPLE_ROWS]
+
+    return [
+        TensorSpec("logits", [SAMPLE_ROWS, VOCAB], torch.float32, init_value=init_logits),
+        TensorSpec(
+            "temperatures",
+            [SAMPLE_ROWS],
+            torch.float32,
+            init_value=(
+                (lambda: torch.full([SAMPLE_ROWS], temperature, dtype=torch.float32))
+                if temperature is not None
+                else (lambda: repeat_rows([0.0, 0.3, 0.7, 1.0, 0.0, 0.5, 1.3, 2.0], torch.float32))
+            ),
+        ),
+        TensorSpec(
+            "top_ks",
+            [SAMPLE_ROWS],
+            torch.int32,
+            init_value=(
+                (lambda: torch.full([SAMPLE_ROWS], top_k, dtype=torch.int32))
+                if top_k is not None
+                else (lambda: repeat_rows([VOCAB, 1, 8, 32, 128, 1000, 4096, VOCAB], torch.int32))
+            ),
+        ),
+        TensorSpec(
+            "seeds",
+            [SAMPLE_ROWS],
+            torch.int32,
+            init_value=lambda: repeat_rows([1, 7, 19, 1234, 42, 99, 2026, 65537], torch.int32),
+        ),
+        TensorSpec(
+            "positions",
+            [SAMPLE_ROWS],
+            torch.int32,
+            init_value=lambda: repeat_rows([0, 1, 17, 1024, 4, 55, 4096, 32767], torch.int32),
+        ),
+        TensorSpec("sampled_ids", [SAMPLE_ROWS, SAMPLED_IDS_PAD], torch.int32),
+    ]
+
+
+def golden_sample(tensors):
+    import torch
+
+    tensors["sampled_ids"].zero_()
+    for row in range(SAMPLE_ROWS):
+        logits = tensors["logits"][row].float()
+        temperature = float(tensors["temperatures"][row])
+        top_k = int(tensors["top_ks"][row])
+        if temperature < SAMPLING_EPS:
+            selected = torch.argmax(logits)
+        else:
+            seed = int(tensors["seeds"][row])
+            position = int(tensors["positions"][row])
+            noise = torch.from_numpy(_gumbel_noise(seed, position))
+            scaled_logits = logits / temperature
+            if 0 < top_k < VOCAB:
+                boundary = torch.topk(scaled_logits, top_k).values[-1]
+                greater_mask = scaled_logits > boundary
+                boundary_indices = torch.nonzero(scaled_logits == boundary).flatten()
+                boundary_keep = top_k - int(torch.sum(greater_mask))
+                keep_mask = greater_mask.clone()
+                keep_mask[boundary_indices[:boundary_keep]] = True
+                filtered_logits = torch.full_like(scaled_logits, -torch.inf)
+                filtered_logits[keep_mask] = scaled_logits[keep_mask]
+                scaled_logits = filtered_logits
+            selected = torch.argmax(scaled_logits + noise)
+        tensors["sampled_ids"][row, 0] = selected.to(torch.int32)
 
 
 def golden_lm_head(tensors):

@@ -1274,278 +1274,7 @@ compressor_ratio4 = pl.jit.inline(auto_scope=False)(_compressor_ratio4)
 prefill_compressor_ratio4_test = pl.jit(auto_scope=False)(_compressor_ratio4)
 
 
-def golden_prefill_compressor_ratio4(tensors):
-    """Physical token-major torch reference with transactional state publication."""
-    import torch
-    from utils import validate_prefill_state_checkpoint
-
-    validate_prefill_state_checkpoint(
-        tensors, history=RATIO4_STATE_LEN, block_size=CSA_STATE_BLOCK_SIZE, tail=RATIO4_STATE_LEN,
-        table_name="compress_state_block_table", slot_name="state_slot_mapping",
-    )
-
-    token_count = tensors["x"].shape[0]
-    x = tensors["x"].view(token_count, D).float()
-    compress_state_flat = tensors["compress_state"].view(-1, RATIO4_COMPRESS_STATE_DIM)
-    kv_state_flat = compress_state_flat[:, :RATIO4_OUT_DIM]
-    score_state_flat = compress_state_flat[:, RATIO4_OUT_DIM:]
-    state_block_table = tensors["compress_state_block_table"][0]
-    wkv = tensors["wkv"].float()
-    wgate = tensors["wgate"].float()
-    ape = tensors["ape"]
-    norm_w = tensors["norm_w"]
-    cmp_kv = tensors["cmp_kv"]
-    cache_rows = cmp_kv.view(cmp_kv.shape[0] * BLOCK_SIZE, 1, RATIO4_HEAD_DIM)[:, 0, :]
-    position_ids = tensors["position_ids"]
-
-    kv_proj = x @ wkv.t()  # wkv stored [OUT_DIM, D] for b_trans
-    score_proj = x @ wgate.t()
-
-    def state_row(abs_pos):
-        if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
-            return -1
-        if abs_pos >= int(position_ids[0]):
-            if abs_pos >= int(position_ids[tile_base]):
-                return -1
-            return int(tensors["state_slot_mapping"][abs_pos - int(position_ids[0])])
-        block = abs_pos // CSA_STATE_BLOCK_SIZE
-        intra = abs_pos % CSA_STATE_BLOCK_SIZE
-        phys_block = int(state_block_table[block].item())
-        if phys_block < 0:
-            return -1
-        return phys_block * CSA_STATE_BLOCK_SIZE + intra
-
-    for tile_base in range(0, token_count, PREFILL_STATE_TILE):
-        tile_end = min(tile_base + PREFILL_STATE_TILE, token_count)
-
-        for token_id in range(tile_base, tile_end):
-            dst_row = int(tensors["cmp_slot_mapping"][token_id].item())
-            if dst_row < 0:
-                continue
-            write_pos = int(position_ids[token_id].item())
-            cur_start = write_pos + 1 - RATIO4_COMPRESS_RATIO
-            prev_start = cur_start - RATIO4_COMPRESS_RATIO
-            pool_kv = torch.zeros(RATIO4_STATE_LEN, RATIO4_HEAD_DIM, dtype=torch.float32)
-            pool_score = torch.full(
-                (RATIO4_STATE_LEN, RATIO4_HEAD_DIM),
-                float("-inf"),
-                dtype=torch.float32,
-            )
-
-            for s in range(RATIO4_COMPRESS_RATIO):
-                if write_pos >= RATIO4_STATE_LEN - 1:
-                    prev_row = state_row(prev_start + s)
-                    if prev_row >= 0:
-                        pool_kv[s] = kv_state_flat[prev_row, :RATIO4_HEAD_DIM]
-                        pool_score[s] = score_state_flat[prev_row, :RATIO4_HEAD_DIM]
-
-                cur_row = state_row(cur_start + s)
-                if cur_row >= 0:
-                    pool_kv[RATIO4_COMPRESS_RATIO + s] = kv_state_flat[
-                        cur_row,
-                        RATIO4_HEAD_DIM:RATIO4_OUT_DIM,
-                    ]
-                    pool_score[RATIO4_COMPRESS_RATIO + s] = score_state_flat[
-                        cur_row,
-                        RATIO4_HEAD_DIM:RATIO4_OUT_DIM,
-                    ]
-
-            for pool_token_id in range(tile_base, tile_end):
-                if int(tensors["state_slot_mapping"][pool_token_id].item()) < 0:
-                    continue
-                pool_pos = int(position_ids[pool_token_id].item())
-                if pool_pos < prev_start or pool_pos > write_pos:
-                    continue
-                ape_slot = pool_pos % RATIO4_COMPRESS_RATIO
-                if pool_pos < cur_start:
-                    pool_slot = pool_pos - prev_start
-                    pool_kv[pool_slot] = kv_proj[pool_token_id, :RATIO4_HEAD_DIM]
-                    pool_score[pool_slot] = score_proj[pool_token_id, :RATIO4_HEAD_DIM] + ape[
-                        ape_slot,
-                        :RATIO4_HEAD_DIM,
-                    ]
-                else:
-                    pool_slot = RATIO4_COMPRESS_RATIO + pool_pos - cur_start
-                    pool_kv[pool_slot] = kv_proj[pool_token_id, RATIO4_HEAD_DIM:RATIO4_OUT_DIM]
-                    pool_score[pool_slot] = score_proj[pool_token_id, RATIO4_HEAD_DIM:RATIO4_OUT_DIM] + ape[
-                        ape_slot,
-                        RATIO4_HEAD_DIM:RATIO4_OUT_DIM,
-                    ]
-
-            init_slot = RATIO4_STATE_LEN - 1
-            mi = pool_score[init_slot : init_slot + 1].clone()
-            li = torch.exp(mi - mi)
-            oi = pool_kv[init_slot : init_slot + 1].clone()
-            for slot_i in range(RATIO4_STATE_LEN - 1):
-                if slot_i < RATIO4_COMPRESS_RATIO and write_pos < RATIO4_STATE_LEN - 1:
-                    continue
-                slot_score = pool_score[slot_i : slot_i + 1]
-                slot_kv = pool_kv[slot_i : slot_i + 1]
-                mi_next = torch.maximum(mi, slot_score)
-                alpha = torch.exp(mi - mi_next)
-                beta = torch.exp(slot_score - mi_next)
-                li = alpha * li + beta
-                oi = oi * alpha + slot_kv * beta
-                mi = mi_next
-            pooled = oi / li
-            inv_rms = torch.rsqrt(pooled.square().mean(dim=-1, keepdim=True) + EPS)
-            normed = pooled * inv_rms * norm_w.float().view(1, RATIO4_HEAD_DIM)
-            rope_pair = normed[..., RATIO4_NOPE_HEAD_DIM:RATIO4_HEAD_DIM].unflatten(-1, (-1, 2))
-            rope_even = rope_pair[..., 0]
-            rope_odd = rope_pair[..., 1]
-            cos = tensors["cmp_freqs_cos"][token_id : token_id + 1, 0 : ROPE_HEAD_DIM // 2].float()
-            sin = tensors["cmp_freqs_sin"][token_id : token_id + 1, 0 : ROPE_HEAD_DIM // 2].float()
-            rot_even = rope_even * cos - rope_odd * sin
-            rot_odd = rope_even * sin + rope_odd * cos
-            normed[:, RATIO4_NOPE_HEAD_DIM:RATIO4_HEAD_DIM] = torch.stack([rot_even, rot_odd], dim=-1).flatten(-2)
-            cache_rows[dst_row] = normed.to(torch.bfloat16)[0]
-
-        checkpoint_ends = tensors["state_checkpoint_ends"][0].reshape(-1).tolist()
-        publish_base = max(tile_base, tile_end - RATIO4_STATE_LEN)
-        for token_id in range(tile_base, tile_end):
-            position = int(position_ids[token_id])
-            if token_id < publish_base and not any(max(0, b - RATIO4_STATE_LEN) <= position < b for b in checkpoint_ends):
-                continue
-            dst_row = int(tensors["state_slot_mapping"][token_id].item())
-            if dst_row < 0:
-                continue
-            pos = int(position_ids[token_id].item())
-            kv_state_flat[dst_row] = kv_proj[token_id]
-            score_state_flat[dst_row] = score_proj[token_id] + ape[pos % RATIO4_COMPRESS_RATIO]
-
-
 VALIDATION_TOKENS = 512
-
-
-def build_tensor_specs_ratio4(start_pos: int = START_POS, token_count: int = VALIDATION_TOKENS, checkpoint_end: int = 0):
-    import torch
-    from golden import TensorSpec
-    from utils import prefill_state_fixture, token_local_rope
-
-    if token_count <= 0 or token_count > MAX_SEQ_LEN:
-        raise ValueError(f"token_count must be in [1, {MAX_SEQ_LEN}], got {token_count}")
-    if start_pos < 0:
-        raise ValueError("start_pos must be non-negative")
-    if start_pos + token_count > MAX_SEQ_LEN:
-        raise ValueError("start_pos + token_count exceeds max_position_embeddings")
-
-    logical_blocks = torch.arange(CSA_STATE_MAX_BLOCKS, dtype=torch.int64)
-    state_table = ((logical_blocks * 17 + 3) % CSA_STATE_BLOCKS_PER_REQUEST).to(torch.int32)
-    state_table, state_mapping, state_blocks = prefill_state_fixture(
-        start_pos, token_count, checkpoint_end, history=RATIO4_STATE_LEN, block_size=CSA_STATE_BLOCK_SIZE,
-        table=state_table, physical_blocks=CSA_STATE_BLOCK_NUM,
-    )
-
-    def init_compress_state_block_table():
-        return state_table.unsqueeze(0)
-
-    def state_row(abs_pos):
-        if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
-            return -1
-        block = abs_pos // CSA_STATE_BLOCK_SIZE
-        intra = abs_pos % CSA_STATE_BLOCK_SIZE
-        physical_block = int(state_table[block])
-        return physical_block * CSA_STATE_BLOCK_SIZE + intra
-
-    def init_x():
-        return ((torch.rand(token_count, D) - 0.5) * 0.1).to(torch.bfloat16)
-
-    def init_compress_state():
-        state = torch.zeros(state_blocks, CSA_STATE_BLOCK_SIZE, RATIO4_COMPRESS_STATE_DIM)
-        flat = state.view(-1, RATIO4_COMPRESS_STATE_DIM)
-        for abs_pos in range(max(0, start_pos - RATIO4_STATE_LEN), start_pos):
-            row = state_row(abs_pos)
-            if row >= 0:
-                flat[row] = (torch.rand(RATIO4_COMPRESS_STATE_DIM) - 0.5) * 0.05
-        return state
-
-    # BF16 weight std and RMSNorm gamma mean/std, averaged over DeepSeek-V4-Flash-0731
-    # layers 8/32 (the ratio-4 CSA main compressor). Mirrors decode_compressors.
-    def init_wkv():
-        return torch.randn(RATIO4_OUT_DIM, D) * 0.0240
-
-    def init_wgate():
-        return torch.randn(RATIO4_OUT_DIM, D) * 0.0381
-
-    def init_ape():
-        return torch.randn(RATIO4_COMPRESS_RATIO, RATIO4_OUT_DIM) * 0.1226
-
-    def init_norm_w():
-        return 0.9569 + 0.1916 * torch.randn(RATIO4_HEAD_DIM)
-
-    def init_cmp_kv():
-        return torch.zeros(RATIO4_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, RATIO4_HEAD_DIM, dtype=torch.bfloat16)
-
-    def init_position_ids():
-        return torch.arange(start_pos, start_pos + token_count, dtype=torch.int32)
-
-    def init_cmp_rope_positions():
-        positions = init_position_ids().to(torch.int64)
-        boundary = (positions + 1) % RATIO4_COMPRESS_RATIO == 0
-        return torch.where(boundary, positions - (RATIO4_COMPRESS_RATIO - 1), torch.zeros_like(positions))
-
-    def init_cmp_freqs_cos():
-        cos, _ = token_local_rope(
-            M, RATIO4_COMPRESS_RATIO, init_cmp_rope_positions(),
-            max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16,
-        )
-        return cos.contiguous()
-
-    def init_cmp_freqs_sin():
-        _, sin = token_local_rope(
-            M, RATIO4_COMPRESS_RATIO, init_cmp_rope_positions(),
-            max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16,
-        )
-        return sin.contiguous()
-
-    def init_cmp_slot_mapping():
-        mapping = torch.full((token_count,), -1, dtype=torch.int64)
-        for t in range(token_count):
-            pos = start_pos + t
-            if pos + 1 >= RATIO4_COMPRESS_RATIO and (pos + 1) % RATIO4_COMPRESS_RATIO == 0:
-                dst_row = (pos + 1) // RATIO4_COMPRESS_RATIO - 1
-                if dst_row >= RATIO4_CMP_MAX_BLOCKS * BLOCK_SIZE:
-                    raise ValueError("fixture compressed slot exceeds standalone cmp_kv capacity")
-                mapping[t] = dst_row
-        return mapping
-
-    def init_state_slot_mapping():
-        return state_mapping.clone()
-
-    checkpoint_tensor = checkpoint_ends_tensor([checkpoint_end], starts=[start_pos], lengths=[token_count])
-
-    return [
-        TensorSpec("x", [token_count, D], torch.bfloat16, init_value=init_x),
-        TensorSpec("query_start_loc", [2], torch.int32, init_value=torch.tensor([0, token_count], dtype=torch.int32)),
-        TensorSpec("state_checkpoint_ends", list(checkpoint_tensor.shape), torch.int32, init_value=checkpoint_tensor),
-        TensorSpec(
-            "compress_state",
-            [state_blocks, CSA_STATE_BLOCK_SIZE, RATIO4_COMPRESS_STATE_DIM],
-            torch.float32,
-            init_value=init_compress_state,
-        ),
-        TensorSpec(
-            "compress_state_block_table",
-            [1, CSA_STATE_MAX_BLOCKS],
-            torch.int32,
-            init_value=init_compress_state_block_table,
-        ),
-        TensorSpec("wkv", [RATIO4_OUT_DIM, D], torch.bfloat16, init_value=init_wkv),
-        TensorSpec("wgate", [RATIO4_OUT_DIM, D], torch.bfloat16, init_value=init_wgate),
-        TensorSpec("ape", [RATIO4_COMPRESS_RATIO, RATIO4_OUT_DIM], torch.float32, init_value=init_ape),
-        TensorSpec("norm_w", [RATIO4_HEAD_DIM], torch.bfloat16, init_value=init_norm_w),
-        TensorSpec("cmp_freqs_cos", [token_count, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_cmp_freqs_cos),
-        TensorSpec("cmp_freqs_sin", [token_count, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_cmp_freqs_sin),
-        TensorSpec(
-            "cmp_kv",
-            [RATIO4_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, RATIO4_HEAD_DIM],
-            torch.bfloat16,
-            init_value=init_cmp_kv,
-        ),
-        TensorSpec("position_ids", [token_count], torch.int32, init_value=init_position_ids),
-        TensorSpec("cmp_slot_mapping", [token_count], torch.int64, init_value=init_cmp_slot_mapping),
-        TensorSpec("state_slot_mapping", [token_count], torch.int64, init_value=init_state_slot_mapping),
-    ]
 
 
 # Bounded physical-row tile for ratio-128 projection/state updates.
@@ -2576,217 +2305,6 @@ prefill_compressor_ratio128 = pl.jit.inline(auto_scope=False)(_prefill_compresso
 prefill_compressor_ratio128_test = pl.jit(auto_scope=False)(_prefill_compressor_ratio128)
 
 
-def golden_prefill_compressor_ratio128(tensors):
-    import torch
-    from utils import validate_prefill_state_checkpoint
-
-    validate_prefill_state_checkpoint(
-        tensors, history=RATIO128_STATE_LEN, block_size=HCA_STATE_BLOCK_SIZE, tail=STATE_STORAGE_LEN,
-        table_name="compress_state_block_table", slot_name="state_slot_mapping",
-    )
-
-    token_count = tensors["x"].shape[0]
-    kv_proj = tensors["x"].float() @ tensors["wkv"].float().t()  # wkv stored [OUT_DIM, D] for b_trans
-    score_proj = tensors["x"].float() @ tensors["wgate"].float().t()
-    compress_state_flat = tensors["compress_state"].view(
-        -1, RATIO128_COMPRESS_STATE_DIM,
-    )
-    kv_state_flat = compress_state_flat[:, :RATIO128_OUT_DIM]
-    score_state_flat = compress_state_flat[:, RATIO128_OUT_DIM:]
-    state_block_table = tensors["compress_state_block_table"][0]
-    cmp_kv_flat = tensors["cmp_kv"].view(RATIO128_CMP_MAX_BLOCKS * CMP_STORAGE_BLOCK_SIZE, RATIO128_HEAD_DIM)
-
-    def state_row(abs_pos):
-        if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
-            return -1
-        # This reference overlays all current-forward projections below.
-        if abs_pos >= int(tensors["position_ids"][0]):
-            return -1
-        block = abs_pos // HCA_STATE_BLOCK_SIZE
-        intra = abs_pos % HCA_STATE_BLOCK_SIZE
-        phys_block = int(state_block_table[block].item())
-        if phys_block < 0:
-            return -1
-        return phys_block * HCA_STATE_BLOCK_SIZE + intra
-
-    for token_id in range(token_count):
-        dst_row = int(tensors["cmp_slot_mapping"][token_id].item())
-        if dst_row < 0:
-            continue
-        write_pos = int(tensors["position_ids"][token_id].item())
-        pool_kv_state = torch.zeros(RATIO128_STATE_LEN, RATIO128_OUT_DIM, dtype=torch.float32)
-        pool_score_state = torch.zeros(RATIO128_STATE_LEN, RATIO128_OUT_DIM, dtype=torch.float32)
-        for slot in range(RATIO128_STATE_LEN):
-            row = state_row(write_pos + 1 - RATIO128_COMPRESS_RATIO + slot)
-            if row >= 0:
-                pool_kv_state[slot] = kv_state_flat[row]
-                pool_score_state[slot] = score_state_flat[row]
-        for t in range(token_count):
-            pos = int(tensors["position_ids"][t].item())
-            if pos > write_pos:
-                continue
-            slot = pos % RATIO128_COMPRESS_RATIO
-            pool_kv_state[slot] = kv_proj[t]
-            pool_score_state[slot] = score_proj[t] + tensors["ape"][slot]
-        pooled = (pool_kv_state * pool_score_state.softmax(dim=0)).sum(dim=0, keepdim=True)
-        inv = torch.rsqrt(pooled.square().mean(dim=-1, keepdim=True) + EPS)
-        normed = pooled * inv * tensors["norm_w"].float().view(1, RATIO128_HEAD_DIM)
-        rope_pair = normed[..., RATIO128_NOPE_HEAD_DIM:].unflatten(-1, (-1, 2))
-        even = rope_pair[..., 0].float()
-        odd = rope_pair[..., 1].float()
-        cos = tensors["cmp_freqs_cos"][token_id : token_id + 1, 0:ROPE_HALF].float()
-        sin = tensors["cmp_freqs_sin"][token_id : token_id + 1, 0:ROPE_HALF].float()
-        rot_even = even * cos - odd * sin
-        rot_odd = even * sin + odd * cos
-        normed[:, RATIO128_NOPE_HEAD_DIM:] = torch.stack([rot_even, rot_odd], dim=-1).flatten(-2)
-        cmp_kv_flat[dst_row] = normed[0]
-
-    checkpoint_ends = tensors["state_checkpoint_ends"][0].reshape(-1).tolist()
-    for t in range(token_count):
-        tile_end = min((t // PREFILL_STATE_TILE + 1) * PREFILL_STATE_TILE, token_count)
-        pos = int(tensors["position_ids"][t].item())
-        checkpoint_row = any(max(0, b - RATIO128_STATE_LEN) <= pos < b for b in checkpoint_ends)
-        if t < tile_end - STATE_STORAGE_LEN and not checkpoint_row:
-            continue
-        dst_row = int(tensors["state_slot_mapping"][t].item())
-        if dst_row < 0:
-            continue
-        slot = pos % RATIO128_COMPRESS_RATIO
-        kv_state_flat[dst_row] = kv_proj[t]
-        score_state_flat[dst_row] = score_proj[t] + tensors["ape"][slot]
-
-
-
-
-def build_tensor_specs_ratio128(start_pos: int = START_POS, token_count: int = VALIDATION_TOKENS, checkpoint_end: int = 0):
-    import torch
-    from golden import TensorSpec
-    from utils import block_table, prefill_state_fixture, token_local_rope
-
-    if token_count <= 0 or token_count > MAX_SEQ_LEN:
-        raise ValueError(f"token_count must be in [1, {MAX_SEQ_LEN}], got {token_count}")
-    if start_pos < 0:
-        raise ValueError("start_pos must be non-negative")
-    if start_pos + token_count > MAX_SEQ_LEN:
-        raise ValueError("start_pos + token_count exceeds max_position_embeddings")
-
-    state_table = block_table(
-        batch=1,
-        table_blocks=HCA_STATE_MAX_BLOCKS,
-        physical_blocks=HCA_STATE_BLOCK_NUM,
-        request_slots=DECODE_BATCH,
-    )[0]
-    state_table, state_mapping, state_blocks = prefill_state_fixture(
-        start_pos, token_count, checkpoint_end, history=RATIO128_STATE_LEN, block_size=HCA_STATE_BLOCK_SIZE,
-        table=state_table, physical_blocks=HCA_STATE_BLOCK_NUM,
-    )
-
-    def init_compress_state_block_table():
-        return state_table.unsqueeze(0)
-
-    def state_row(abs_pos):
-        if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
-            return -1
-        block = abs_pos // HCA_STATE_BLOCK_SIZE
-        intra = abs_pos % HCA_STATE_BLOCK_SIZE
-        physical_block = int(state_table[block].item())
-        return physical_block * HCA_STATE_BLOCK_SIZE + intra
-
-    def init_x():
-        return ((torch.rand(token_count, D) - 0.5) * 0.1).to(torch.bfloat16)
-
-    def init_compress_state():
-        state = torch.zeros(state_blocks, HCA_STATE_BLOCK_SIZE, RATIO128_COMPRESS_STATE_DIM)
-        for abs_pos in range(max(0, start_pos - RATIO128_COMPRESS_RATIO), start_pos):
-            row = state_row(abs_pos)
-            if row >= 0:
-                state.view(-1, RATIO128_COMPRESS_STATE_DIM)[row] = (torch.rand(RATIO128_COMPRESS_STATE_DIM) - 0.5) * 0.05
-        return state
-
-    # BF16 weight std and RMSNorm gamma mean/std, averaged over DeepSeek-V4-Flash-0731
-    # layers 7/9 (the ratio-128 HCA main compressor).
-    def init_wkv():
-        return torch.randn(RATIO128_OUT_DIM, D) * 0.0240
-
-    def init_wgate():
-        return torch.randn(RATIO128_OUT_DIM, D) * 0.0309
-
-    def init_ape():
-        return torch.randn(RATIO128_COMPRESS_RATIO, RATIO128_OUT_DIM) * 0.0332
-
-    def init_norm_w():
-        return 0.0982 + 0.0539 * torch.randn(RATIO128_HEAD_DIM)
-
-    def init_cmp_kv():
-        return torch.zeros(RATIO128_CMP_MAX_BLOCKS, CMP_STORAGE_BLOCK_SIZE, 1, RATIO128_HEAD_DIM, dtype=torch.bfloat16)
-
-    def init_position_ids():
-        return torch.arange(start_pos, start_pos + token_count, dtype=torch.int32)
-
-    def init_cmp_rope_positions():
-        positions = init_position_ids().to(torch.int64)
-        boundary = (positions + 1) % RATIO128_COMPRESS_RATIO == 0
-        return torch.where(boundary, positions - (RATIO128_COMPRESS_RATIO - 1), torch.zeros_like(positions))
-
-    def init_cmp_freqs_cos():
-        cos, _ = token_local_rope(
-            M, RATIO128_COMPRESS_RATIO, init_cmp_rope_positions(),
-            max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16,
-        )
-        return cos.contiguous()
-
-    def init_cmp_freqs_sin():
-        _, sin = token_local_rope(
-            M, RATIO128_COMPRESS_RATIO, init_cmp_rope_positions(),
-            max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16,
-        )
-        return sin.contiguous()
-
-    def init_cmp_slot_mapping():
-        mapping = torch.full((token_count,), -1, dtype=torch.int64)
-        for token_id in range(token_count):
-            pos = start_pos + token_id
-            if pos + 1 >= RATIO128_COMPRESS_RATIO and (pos + 1) % RATIO128_COMPRESS_RATIO == 0:
-                mapping[token_id] = (pos + 1) // RATIO128_COMPRESS_RATIO - 1
-        return mapping
-
-    def init_state_slot_mapping():
-        return state_mapping.clone()
-
-    checkpoint_tensor = checkpoint_ends_tensor([checkpoint_end], starts=[start_pos], lengths=[token_count])
-
-    return [
-        TensorSpec("x", [token_count, D], torch.bfloat16, init_value=init_x),
-        TensorSpec("query_start_loc", [2], torch.int32, init_value=torch.tensor([0, token_count], dtype=torch.int32)),
-        TensorSpec("state_checkpoint_ends", list(checkpoint_tensor.shape), torch.int32, init_value=checkpoint_tensor),
-        TensorSpec(
-            "compress_state",
-            [state_blocks, HCA_STATE_BLOCK_SIZE, RATIO128_COMPRESS_STATE_DIM],
-            torch.float32,
-            init_value=init_compress_state,
-        ),
-        TensorSpec(
-            "compress_state_block_table",
-            [1, HCA_STATE_MAX_BLOCKS],
-            torch.int32,
-            init_value=init_compress_state_block_table,
-        ),
-        TensorSpec("wkv", [RATIO128_OUT_DIM, D], torch.bfloat16, init_value=init_wkv),
-        TensorSpec("wgate", [RATIO128_OUT_DIM, D], torch.bfloat16, init_value=init_wgate),
-        TensorSpec("ape", [RATIO128_COMPRESS_RATIO, RATIO128_OUT_DIM], torch.float32, init_value=init_ape),
-        TensorSpec("norm_w", [RATIO128_HEAD_DIM], torch.bfloat16, init_value=init_norm_w),
-        TensorSpec("cmp_freqs_cos", [token_count, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_cmp_freqs_cos),
-        TensorSpec("cmp_freqs_sin", [token_count, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_cmp_freqs_sin),
-        TensorSpec(
-            "cmp_kv",
-            [RATIO128_CMP_MAX_BLOCKS, CMP_STORAGE_BLOCK_SIZE, 1, RATIO128_HEAD_DIM],
-            torch.bfloat16,
-            init_value=init_cmp_kv,
-        ),
-        TensorSpec("position_ids", [token_count], torch.int32, init_value=init_position_ids),
-        TensorSpec("cmp_slot_mapping", [token_count], torch.int64, init_value=init_cmp_slot_mapping),
-        TensorSpec("state_slot_mapping", [token_count], torch.int64, init_value=init_state_slot_mapping),
-    ]
 
 
 # Bounded physical-row tile for index projection/state updates.
@@ -4164,6 +3682,488 @@ def prefill_indexer_compressor_test(
         inner_state_slot_mapping,
         completion,
     )
+
+
+def golden_prefill_compressor_ratio4(tensors):
+    """Physical token-major torch reference with transactional state publication."""
+    import torch
+    from utils import validate_prefill_state_checkpoint
+
+    validate_prefill_state_checkpoint(
+        tensors, history=RATIO4_STATE_LEN, block_size=CSA_STATE_BLOCK_SIZE, tail=RATIO4_STATE_LEN,
+        table_name="compress_state_block_table", slot_name="state_slot_mapping",
+    )
+
+    token_count = tensors["x"].shape[0]
+    x = tensors["x"].view(token_count, D).float()
+    compress_state_flat = tensors["compress_state"].view(-1, RATIO4_COMPRESS_STATE_DIM)
+    kv_state_flat = compress_state_flat[:, :RATIO4_OUT_DIM]
+    score_state_flat = compress_state_flat[:, RATIO4_OUT_DIM:]
+    state_block_table = tensors["compress_state_block_table"][0]
+    wkv = tensors["wkv"].float()
+    wgate = tensors["wgate"].float()
+    ape = tensors["ape"]
+    norm_w = tensors["norm_w"]
+    cmp_kv = tensors["cmp_kv"]
+    cache_rows = cmp_kv.view(cmp_kv.shape[0] * BLOCK_SIZE, 1, RATIO4_HEAD_DIM)[:, 0, :]
+    position_ids = tensors["position_ids"]
+
+    kv_proj = x @ wkv.t()  # wkv stored [OUT_DIM, D] for b_trans
+    score_proj = x @ wgate.t()
+
+    def state_row(abs_pos):
+        if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
+            return -1
+        if abs_pos >= int(position_ids[0]):
+            if abs_pos >= int(position_ids[tile_base]):
+                return -1
+            return int(tensors["state_slot_mapping"][abs_pos - int(position_ids[0])])
+        block = abs_pos // CSA_STATE_BLOCK_SIZE
+        intra = abs_pos % CSA_STATE_BLOCK_SIZE
+        phys_block = int(state_block_table[block].item())
+        if phys_block < 0:
+            return -1
+        return phys_block * CSA_STATE_BLOCK_SIZE + intra
+
+    for tile_base in range(0, token_count, PREFILL_STATE_TILE):
+        tile_end = min(tile_base + PREFILL_STATE_TILE, token_count)
+
+        for token_id in range(tile_base, tile_end):
+            dst_row = int(tensors["cmp_slot_mapping"][token_id].item())
+            if dst_row < 0:
+                continue
+            write_pos = int(position_ids[token_id].item())
+            cur_start = write_pos + 1 - RATIO4_COMPRESS_RATIO
+            prev_start = cur_start - RATIO4_COMPRESS_RATIO
+            pool_kv = torch.zeros(RATIO4_STATE_LEN, RATIO4_HEAD_DIM, dtype=torch.float32)
+            pool_score = torch.full(
+                (RATIO4_STATE_LEN, RATIO4_HEAD_DIM),
+                float("-inf"),
+                dtype=torch.float32,
+            )
+
+            for s in range(RATIO4_COMPRESS_RATIO):
+                if write_pos >= RATIO4_STATE_LEN - 1:
+                    prev_row = state_row(prev_start + s)
+                    if prev_row >= 0:
+                        pool_kv[s] = kv_state_flat[prev_row, :RATIO4_HEAD_DIM]
+                        pool_score[s] = score_state_flat[prev_row, :RATIO4_HEAD_DIM]
+
+                cur_row = state_row(cur_start + s)
+                if cur_row >= 0:
+                    pool_kv[RATIO4_COMPRESS_RATIO + s] = kv_state_flat[
+                        cur_row,
+                        RATIO4_HEAD_DIM:RATIO4_OUT_DIM,
+                    ]
+                    pool_score[RATIO4_COMPRESS_RATIO + s] = score_state_flat[
+                        cur_row,
+                        RATIO4_HEAD_DIM:RATIO4_OUT_DIM,
+                    ]
+
+            for pool_token_id in range(tile_base, tile_end):
+                if int(tensors["state_slot_mapping"][pool_token_id].item()) < 0:
+                    continue
+                pool_pos = int(position_ids[pool_token_id].item())
+                if pool_pos < prev_start or pool_pos > write_pos:
+                    continue
+                ape_slot = pool_pos % RATIO4_COMPRESS_RATIO
+                if pool_pos < cur_start:
+                    pool_slot = pool_pos - prev_start
+                    pool_kv[pool_slot] = kv_proj[pool_token_id, :RATIO4_HEAD_DIM]
+                    pool_score[pool_slot] = score_proj[pool_token_id, :RATIO4_HEAD_DIM] + ape[
+                        ape_slot,
+                        :RATIO4_HEAD_DIM,
+                    ]
+                else:
+                    pool_slot = RATIO4_COMPRESS_RATIO + pool_pos - cur_start
+                    pool_kv[pool_slot] = kv_proj[pool_token_id, RATIO4_HEAD_DIM:RATIO4_OUT_DIM]
+                    pool_score[pool_slot] = score_proj[pool_token_id, RATIO4_HEAD_DIM:RATIO4_OUT_DIM] + ape[
+                        ape_slot,
+                        RATIO4_HEAD_DIM:RATIO4_OUT_DIM,
+                    ]
+
+            init_slot = RATIO4_STATE_LEN - 1
+            mi = pool_score[init_slot : init_slot + 1].clone()
+            li = torch.exp(mi - mi)
+            oi = pool_kv[init_slot : init_slot + 1].clone()
+            for slot_i in range(RATIO4_STATE_LEN - 1):
+                if slot_i < RATIO4_COMPRESS_RATIO and write_pos < RATIO4_STATE_LEN - 1:
+                    continue
+                slot_score = pool_score[slot_i : slot_i + 1]
+                slot_kv = pool_kv[slot_i : slot_i + 1]
+                mi_next = torch.maximum(mi, slot_score)
+                alpha = torch.exp(mi - mi_next)
+                beta = torch.exp(slot_score - mi_next)
+                li = alpha * li + beta
+                oi = oi * alpha + slot_kv * beta
+                mi = mi_next
+            pooled = oi / li
+            inv_rms = torch.rsqrt(pooled.square().mean(dim=-1, keepdim=True) + EPS)
+            normed = pooled * inv_rms * norm_w.float().view(1, RATIO4_HEAD_DIM)
+            rope_pair = normed[..., RATIO4_NOPE_HEAD_DIM:RATIO4_HEAD_DIM].unflatten(-1, (-1, 2))
+            rope_even = rope_pair[..., 0]
+            rope_odd = rope_pair[..., 1]
+            cos = tensors["cmp_freqs_cos"][token_id : token_id + 1, 0 : ROPE_HEAD_DIM // 2].float()
+            sin = tensors["cmp_freqs_sin"][token_id : token_id + 1, 0 : ROPE_HEAD_DIM // 2].float()
+            rot_even = rope_even * cos - rope_odd * sin
+            rot_odd = rope_even * sin + rope_odd * cos
+            normed[:, RATIO4_NOPE_HEAD_DIM:RATIO4_HEAD_DIM] = torch.stack([rot_even, rot_odd], dim=-1).flatten(-2)
+            cache_rows[dst_row] = normed.to(torch.bfloat16)[0]
+
+        checkpoint_ends = tensors["state_checkpoint_ends"][0].reshape(-1).tolist()
+        publish_base = max(tile_base, tile_end - RATIO4_STATE_LEN)
+        for token_id in range(tile_base, tile_end):
+            position = int(position_ids[token_id])
+            if token_id < publish_base and not any(max(0, b - RATIO4_STATE_LEN) <= position < b for b in checkpoint_ends):
+                continue
+            dst_row = int(tensors["state_slot_mapping"][token_id].item())
+            if dst_row < 0:
+                continue
+            pos = int(position_ids[token_id].item())
+            kv_state_flat[dst_row] = kv_proj[token_id]
+            score_state_flat[dst_row] = score_proj[token_id] + ape[pos % RATIO4_COMPRESS_RATIO]
+
+
+def build_tensor_specs_ratio4(start_pos: int = START_POS, token_count: int = VALIDATION_TOKENS, checkpoint_end: int = 0):
+    import torch
+    from golden import TensorSpec
+    from utils import prefill_state_fixture, token_local_rope
+
+    if token_count <= 0 or token_count > MAX_SEQ_LEN:
+        raise ValueError(f"token_count must be in [1, {MAX_SEQ_LEN}], got {token_count}")
+    if start_pos < 0:
+        raise ValueError("start_pos must be non-negative")
+    if start_pos + token_count > MAX_SEQ_LEN:
+        raise ValueError("start_pos + token_count exceeds max_position_embeddings")
+
+    logical_blocks = torch.arange(CSA_STATE_MAX_BLOCKS, dtype=torch.int64)
+    state_table = ((logical_blocks * 17 + 3) % CSA_STATE_BLOCKS_PER_REQUEST).to(torch.int32)
+    state_table, state_mapping, state_blocks = prefill_state_fixture(
+        start_pos, token_count, checkpoint_end, history=RATIO4_STATE_LEN, block_size=CSA_STATE_BLOCK_SIZE,
+        table=state_table, physical_blocks=CSA_STATE_BLOCK_NUM,
+    )
+
+    def init_compress_state_block_table():
+        return state_table.unsqueeze(0)
+
+    def state_row(abs_pos):
+        if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
+            return -1
+        block = abs_pos // CSA_STATE_BLOCK_SIZE
+        intra = abs_pos % CSA_STATE_BLOCK_SIZE
+        physical_block = int(state_table[block])
+        return physical_block * CSA_STATE_BLOCK_SIZE + intra
+
+    def init_x():
+        return ((torch.rand(token_count, D) - 0.5) * 0.1).to(torch.bfloat16)
+
+    def init_compress_state():
+        state = torch.zeros(state_blocks, CSA_STATE_BLOCK_SIZE, RATIO4_COMPRESS_STATE_DIM)
+        flat = state.view(-1, RATIO4_COMPRESS_STATE_DIM)
+        for abs_pos in range(max(0, start_pos - RATIO4_STATE_LEN), start_pos):
+            row = state_row(abs_pos)
+            if row >= 0:
+                flat[row] = (torch.rand(RATIO4_COMPRESS_STATE_DIM) - 0.5) * 0.05
+        return state
+
+    # BF16 weight std and RMSNorm gamma mean/std, averaged over DeepSeek-V4-Flash-0731
+    # layers 8/32 (the ratio-4 CSA main compressor). Mirrors decode_compressors.
+    def init_wkv():
+        return torch.randn(RATIO4_OUT_DIM, D) * 0.0240
+
+    def init_wgate():
+        return torch.randn(RATIO4_OUT_DIM, D) * 0.0381
+
+    def init_ape():
+        return torch.randn(RATIO4_COMPRESS_RATIO, RATIO4_OUT_DIM) * 0.1226
+
+    def init_norm_w():
+        return 0.9569 + 0.1916 * torch.randn(RATIO4_HEAD_DIM)
+
+    def init_cmp_kv():
+        return torch.zeros(RATIO4_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, RATIO4_HEAD_DIM, dtype=torch.bfloat16)
+
+    def init_position_ids():
+        return torch.arange(start_pos, start_pos + token_count, dtype=torch.int32)
+
+    def init_cmp_rope_positions():
+        positions = init_position_ids().to(torch.int64)
+        boundary = (positions + 1) % RATIO4_COMPRESS_RATIO == 0
+        return torch.where(boundary, positions - (RATIO4_COMPRESS_RATIO - 1), torch.zeros_like(positions))
+
+    def init_cmp_freqs_cos():
+        cos, _ = token_local_rope(
+            M, RATIO4_COMPRESS_RATIO, init_cmp_rope_positions(),
+            max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16,
+        )
+        return cos.contiguous()
+
+    def init_cmp_freqs_sin():
+        _, sin = token_local_rope(
+            M, RATIO4_COMPRESS_RATIO, init_cmp_rope_positions(),
+            max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16,
+        )
+        return sin.contiguous()
+
+    def init_cmp_slot_mapping():
+        mapping = torch.full((token_count,), -1, dtype=torch.int64)
+        for t in range(token_count):
+            pos = start_pos + t
+            if pos + 1 >= RATIO4_COMPRESS_RATIO and (pos + 1) % RATIO4_COMPRESS_RATIO == 0:
+                dst_row = (pos + 1) // RATIO4_COMPRESS_RATIO - 1
+                if dst_row >= RATIO4_CMP_MAX_BLOCKS * BLOCK_SIZE:
+                    raise ValueError("fixture compressed slot exceeds standalone cmp_kv capacity")
+                mapping[t] = dst_row
+        return mapping
+
+    def init_state_slot_mapping():
+        return state_mapping.clone()
+
+    checkpoint_tensor = checkpoint_ends_tensor([checkpoint_end], starts=[start_pos], lengths=[token_count])
+
+    return [
+        TensorSpec("x", [token_count, D], torch.bfloat16, init_value=init_x),
+        TensorSpec("query_start_loc", [2], torch.int32, init_value=torch.tensor([0, token_count], dtype=torch.int32)),
+        TensorSpec("state_checkpoint_ends", list(checkpoint_tensor.shape), torch.int32, init_value=checkpoint_tensor),
+        TensorSpec(
+            "compress_state",
+            [state_blocks, CSA_STATE_BLOCK_SIZE, RATIO4_COMPRESS_STATE_DIM],
+            torch.float32,
+            init_value=init_compress_state,
+        ),
+        TensorSpec(
+            "compress_state_block_table",
+            [1, CSA_STATE_MAX_BLOCKS],
+            torch.int32,
+            init_value=init_compress_state_block_table,
+        ),
+        TensorSpec("wkv", [RATIO4_OUT_DIM, D], torch.bfloat16, init_value=init_wkv),
+        TensorSpec("wgate", [RATIO4_OUT_DIM, D], torch.bfloat16, init_value=init_wgate),
+        TensorSpec("ape", [RATIO4_COMPRESS_RATIO, RATIO4_OUT_DIM], torch.float32, init_value=init_ape),
+        TensorSpec("norm_w", [RATIO4_HEAD_DIM], torch.bfloat16, init_value=init_norm_w),
+        TensorSpec("cmp_freqs_cos", [token_count, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_cmp_freqs_cos),
+        TensorSpec("cmp_freqs_sin", [token_count, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_cmp_freqs_sin),
+        TensorSpec(
+            "cmp_kv",
+            [RATIO4_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, RATIO4_HEAD_DIM],
+            torch.bfloat16,
+            init_value=init_cmp_kv,
+        ),
+        TensorSpec("position_ids", [token_count], torch.int32, init_value=init_position_ids),
+        TensorSpec("cmp_slot_mapping", [token_count], torch.int64, init_value=init_cmp_slot_mapping),
+        TensorSpec("state_slot_mapping", [token_count], torch.int64, init_value=init_state_slot_mapping),
+    ]
+
+
+def golden_prefill_compressor_ratio128(tensors):
+    import torch
+    from utils import validate_prefill_state_checkpoint
+
+    validate_prefill_state_checkpoint(
+        tensors, history=RATIO128_STATE_LEN, block_size=HCA_STATE_BLOCK_SIZE, tail=STATE_STORAGE_LEN,
+        table_name="compress_state_block_table", slot_name="state_slot_mapping",
+    )
+
+    token_count = tensors["x"].shape[0]
+    kv_proj = tensors["x"].float() @ tensors["wkv"].float().t()  # wkv stored [OUT_DIM, D] for b_trans
+    score_proj = tensors["x"].float() @ tensors["wgate"].float().t()
+    compress_state_flat = tensors["compress_state"].view(
+        -1, RATIO128_COMPRESS_STATE_DIM,
+    )
+    kv_state_flat = compress_state_flat[:, :RATIO128_OUT_DIM]
+    score_state_flat = compress_state_flat[:, RATIO128_OUT_DIM:]
+    state_block_table = tensors["compress_state_block_table"][0]
+    cmp_kv_flat = tensors["cmp_kv"].view(RATIO128_CMP_MAX_BLOCKS * CMP_STORAGE_BLOCK_SIZE, RATIO128_HEAD_DIM)
+
+    def state_row(abs_pos):
+        if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
+            return -1
+        # This reference overlays all current-forward projections below.
+        if abs_pos >= int(tensors["position_ids"][0]):
+            return -1
+        block = abs_pos // HCA_STATE_BLOCK_SIZE
+        intra = abs_pos % HCA_STATE_BLOCK_SIZE
+        phys_block = int(state_block_table[block].item())
+        if phys_block < 0:
+            return -1
+        return phys_block * HCA_STATE_BLOCK_SIZE + intra
+
+    for token_id in range(token_count):
+        dst_row = int(tensors["cmp_slot_mapping"][token_id].item())
+        if dst_row < 0:
+            continue
+        write_pos = int(tensors["position_ids"][token_id].item())
+        pool_kv_state = torch.zeros(RATIO128_STATE_LEN, RATIO128_OUT_DIM, dtype=torch.float32)
+        pool_score_state = torch.zeros(RATIO128_STATE_LEN, RATIO128_OUT_DIM, dtype=torch.float32)
+        for slot in range(RATIO128_STATE_LEN):
+            row = state_row(write_pos + 1 - RATIO128_COMPRESS_RATIO + slot)
+            if row >= 0:
+                pool_kv_state[slot] = kv_state_flat[row]
+                pool_score_state[slot] = score_state_flat[row]
+        for t in range(token_count):
+            pos = int(tensors["position_ids"][t].item())
+            if pos > write_pos:
+                continue
+            slot = pos % RATIO128_COMPRESS_RATIO
+            pool_kv_state[slot] = kv_proj[t]
+            pool_score_state[slot] = score_proj[t] + tensors["ape"][slot]
+        pooled = (pool_kv_state * pool_score_state.softmax(dim=0)).sum(dim=0, keepdim=True)
+        inv = torch.rsqrt(pooled.square().mean(dim=-1, keepdim=True) + EPS)
+        normed = pooled * inv * tensors["norm_w"].float().view(1, RATIO128_HEAD_DIM)
+        rope_pair = normed[..., RATIO128_NOPE_HEAD_DIM:].unflatten(-1, (-1, 2))
+        even = rope_pair[..., 0].float()
+        odd = rope_pair[..., 1].float()
+        cos = tensors["cmp_freqs_cos"][token_id : token_id + 1, 0:ROPE_HALF].float()
+        sin = tensors["cmp_freqs_sin"][token_id : token_id + 1, 0:ROPE_HALF].float()
+        rot_even = even * cos - odd * sin
+        rot_odd = even * sin + odd * cos
+        normed[:, RATIO128_NOPE_HEAD_DIM:] = torch.stack([rot_even, rot_odd], dim=-1).flatten(-2)
+        cmp_kv_flat[dst_row] = normed[0]
+
+    checkpoint_ends = tensors["state_checkpoint_ends"][0].reshape(-1).tolist()
+    for t in range(token_count):
+        tile_end = min((t // PREFILL_STATE_TILE + 1) * PREFILL_STATE_TILE, token_count)
+        pos = int(tensors["position_ids"][t].item())
+        checkpoint_row = any(max(0, b - RATIO128_STATE_LEN) <= pos < b for b in checkpoint_ends)
+        if t < tile_end - STATE_STORAGE_LEN and not checkpoint_row:
+            continue
+        dst_row = int(tensors["state_slot_mapping"][t].item())
+        if dst_row < 0:
+            continue
+        slot = pos % RATIO128_COMPRESS_RATIO
+        kv_state_flat[dst_row] = kv_proj[t]
+        score_state_flat[dst_row] = score_proj[t] + tensors["ape"][slot]
+
+
+def build_tensor_specs_ratio128(start_pos: int = START_POS, token_count: int = VALIDATION_TOKENS, checkpoint_end: int = 0):
+    import torch
+    from golden import TensorSpec
+    from utils import block_table, prefill_state_fixture, token_local_rope
+
+    if token_count <= 0 or token_count > MAX_SEQ_LEN:
+        raise ValueError(f"token_count must be in [1, {MAX_SEQ_LEN}], got {token_count}")
+    if start_pos < 0:
+        raise ValueError("start_pos must be non-negative")
+    if start_pos + token_count > MAX_SEQ_LEN:
+        raise ValueError("start_pos + token_count exceeds max_position_embeddings")
+
+    state_table = block_table(
+        batch=1,
+        table_blocks=HCA_STATE_MAX_BLOCKS,
+        physical_blocks=HCA_STATE_BLOCK_NUM,
+        request_slots=DECODE_BATCH,
+    )[0]
+    state_table, state_mapping, state_blocks = prefill_state_fixture(
+        start_pos, token_count, checkpoint_end, history=RATIO128_STATE_LEN, block_size=HCA_STATE_BLOCK_SIZE,
+        table=state_table, physical_blocks=HCA_STATE_BLOCK_NUM,
+    )
+
+    def init_compress_state_block_table():
+        return state_table.unsqueeze(0)
+
+    def state_row(abs_pos):
+        if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
+            return -1
+        block = abs_pos // HCA_STATE_BLOCK_SIZE
+        intra = abs_pos % HCA_STATE_BLOCK_SIZE
+        physical_block = int(state_table[block].item())
+        return physical_block * HCA_STATE_BLOCK_SIZE + intra
+
+    def init_x():
+        return ((torch.rand(token_count, D) - 0.5) * 0.1).to(torch.bfloat16)
+
+    def init_compress_state():
+        state = torch.zeros(state_blocks, HCA_STATE_BLOCK_SIZE, RATIO128_COMPRESS_STATE_DIM)
+        for abs_pos in range(max(0, start_pos - RATIO128_COMPRESS_RATIO), start_pos):
+            row = state_row(abs_pos)
+            if row >= 0:
+                state.view(-1, RATIO128_COMPRESS_STATE_DIM)[row] = (torch.rand(RATIO128_COMPRESS_STATE_DIM) - 0.5) * 0.05
+        return state
+
+    # BF16 weight std and RMSNorm gamma mean/std, averaged over DeepSeek-V4-Flash-0731
+    # layers 7/9 (the ratio-128 HCA main compressor).
+    def init_wkv():
+        return torch.randn(RATIO128_OUT_DIM, D) * 0.0240
+
+    def init_wgate():
+        return torch.randn(RATIO128_OUT_DIM, D) * 0.0309
+
+    def init_ape():
+        return torch.randn(RATIO128_COMPRESS_RATIO, RATIO128_OUT_DIM) * 0.0332
+
+    def init_norm_w():
+        return 0.0982 + 0.0539 * torch.randn(RATIO128_HEAD_DIM)
+
+    def init_cmp_kv():
+        return torch.zeros(RATIO128_CMP_MAX_BLOCKS, CMP_STORAGE_BLOCK_SIZE, 1, RATIO128_HEAD_DIM, dtype=torch.bfloat16)
+
+    def init_position_ids():
+        return torch.arange(start_pos, start_pos + token_count, dtype=torch.int32)
+
+    def init_cmp_rope_positions():
+        positions = init_position_ids().to(torch.int64)
+        boundary = (positions + 1) % RATIO128_COMPRESS_RATIO == 0
+        return torch.where(boundary, positions - (RATIO128_COMPRESS_RATIO - 1), torch.zeros_like(positions))
+
+    def init_cmp_freqs_cos():
+        cos, _ = token_local_rope(
+            M, RATIO128_COMPRESS_RATIO, init_cmp_rope_positions(),
+            max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16,
+        )
+        return cos.contiguous()
+
+    def init_cmp_freqs_sin():
+        _, sin = token_local_rope(
+            M, RATIO128_COMPRESS_RATIO, init_cmp_rope_positions(),
+            max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16,
+        )
+        return sin.contiguous()
+
+    def init_cmp_slot_mapping():
+        mapping = torch.full((token_count,), -1, dtype=torch.int64)
+        for token_id in range(token_count):
+            pos = start_pos + token_id
+            if pos + 1 >= RATIO128_COMPRESS_RATIO and (pos + 1) % RATIO128_COMPRESS_RATIO == 0:
+                mapping[token_id] = (pos + 1) // RATIO128_COMPRESS_RATIO - 1
+        return mapping
+
+    def init_state_slot_mapping():
+        return state_mapping.clone()
+
+    checkpoint_tensor = checkpoint_ends_tensor([checkpoint_end], starts=[start_pos], lengths=[token_count])
+
+    return [
+        TensorSpec("x", [token_count, D], torch.bfloat16, init_value=init_x),
+        TensorSpec("query_start_loc", [2], torch.int32, init_value=torch.tensor([0, token_count], dtype=torch.int32)),
+        TensorSpec("state_checkpoint_ends", list(checkpoint_tensor.shape), torch.int32, init_value=checkpoint_tensor),
+        TensorSpec(
+            "compress_state",
+            [state_blocks, HCA_STATE_BLOCK_SIZE, RATIO128_COMPRESS_STATE_DIM],
+            torch.float32,
+            init_value=init_compress_state,
+        ),
+        TensorSpec(
+            "compress_state_block_table",
+            [1, HCA_STATE_MAX_BLOCKS],
+            torch.int32,
+            init_value=init_compress_state_block_table,
+        ),
+        TensorSpec("wkv", [RATIO128_OUT_DIM, D], torch.bfloat16, init_value=init_wkv),
+        TensorSpec("wgate", [RATIO128_OUT_DIM, D], torch.bfloat16, init_value=init_wgate),
+        TensorSpec("ape", [RATIO128_COMPRESS_RATIO, RATIO128_OUT_DIM], torch.float32, init_value=init_ape),
+        TensorSpec("norm_w", [RATIO128_HEAD_DIM], torch.bfloat16, init_value=init_norm_w),
+        TensorSpec("cmp_freqs_cos", [token_count, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_cmp_freqs_cos),
+        TensorSpec("cmp_freqs_sin", [token_count, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_cmp_freqs_sin),
+        TensorSpec(
+            "cmp_kv",
+            [RATIO128_CMP_MAX_BLOCKS, CMP_STORAGE_BLOCK_SIZE, 1, RATIO128_HEAD_DIM],
+            torch.bfloat16,
+            init_value=init_cmp_kv,
+        ),
+        TensorSpec("position_ids", [token_count], torch.int32, init_value=init_position_ids),
+        TensorSpec("cmp_slot_mapping", [token_count], torch.int64, init_value=init_cmp_slot_mapping),
+        TensorSpec("state_slot_mapping", [token_count], torch.int64, init_value=init_state_slot_mapping),
+    ]
 
 
 def golden_prefill_indexer_compressor(tensors):

@@ -823,6 +823,93 @@ def topk_prefix_contract_error(topk_indices, position_ids, num_tokens=None):
     return None
 
 
+@pl.jit
+def prefill_indexer_test(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
+    qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
+    qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
+    # NOT pl.NZ: o0/tail_o0 are formed via integer division of a flattened
+    # spmd index (qr_n = idx // qr_full_row_blocks), which NZ addressability
+    # cannot prove non-negative (only bare spmd/loop indices and their
+    # sums/products with constants are provable, not a quotient).
+    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, PROJECTION_WEIGHT_LAYOUT],
+    cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
+    sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
+    cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
+    inner_compress_state: pl.InOut[
+        pl.Tensor[[INNER_STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM], pl.FP32]
+    ],
+    inner_compress_state_block_table: pl.Tensor[[REQUESTS_DYN, INNER_STATE_MAX_BLOCKS], pl.INT32],
+    inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
+    inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
+    inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
+    inner_norm_w: pl.Tensor[[INNER_HEAD_DIM], pl.BF16],
+    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
+    idx_block_table: pl.Tensor[[REQUESTS_DYN, IDX_CACHE_MAX_BLOCKS], pl.INT32],
+    topk_idxs: pl.Out[pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32]],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    local_request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    idx_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    inner_state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+):
+    x.bind_dynamic(0, T_DYN)
+    query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
+    state_checkpoint_ends.bind_dynamic(0, REQUESTS_DYN)
+    state_checkpoint_ends.bind_dynamic(1, CHECKPOINT_TILES_DYN)
+    qr.bind_dynamic(0, T_DYN)
+    qr_scale.bind_dynamic(0, T_DYN)
+    cos.bind_dynamic(0, T_DYN)
+    sin.bind_dynamic(0, T_DYN)
+    cmp_freqs_cos.bind_dynamic(0, T_DYN)
+    cmp_freqs_sin.bind_dynamic(0, T_DYN)
+    inner_compress_state.bind_dynamic(0, INNER_STATE_BLOCK_NUM_DYN)
+    inner_compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
+    idx_kv_cache.bind_dynamic(0, IDX_BLOCK_NUM_DYN)
+    idx_kv_scale.bind_dynamic(0, IDX_BLOCK_NUM_DYN)
+    topk_idxs.bind_dynamic(0, T_DYN)
+    position_ids.bind_dynamic(0, T_DYN)
+    local_request_ids.bind_dynamic(0, T_DYN)
+    idx_slot_mapping.bind_dynamic(0, T_DYN)
+    inner_state_slot_mapping.bind_dynamic(0, T_DYN)
+
+    prefill_indexer(
+        x,
+        query_start_loc, state_checkpoint_ends,
+        qr,
+        qr_scale,
+        wq_b,
+        wq_b_scale,
+        weights_proj,
+        cos,
+        sin,
+        cmp_freqs_cos,
+        cmp_freqs_sin,
+        hadamard,
+        inner_compress_state,
+        inner_compress_state_block_table,
+        inner_wkv,
+        inner_wgate,
+        inner_ape,
+        inner_norm_w,
+        idx_kv_cache,
+        idx_kv_scale,
+        idx_block_table,
+        topk_idxs,
+        position_ids,
+        local_request_ids,
+        idx_slot_mapping,
+        inner_state_slot_mapping,
+    )
+    return idx_kv_cache, idx_kv_scale, topk_idxs
+
+
 def golden_prefill_indexer_core(tensors):
     from utils import int8_quant_per_row, unpack_nz
     import torch
@@ -944,93 +1031,6 @@ def golden_prefill_indexer(tensors):
     cmp_topk_indices = golden_prefill_indexer_core(tensors)
     topk_idxs = cmp_topk_indices[:, 0:IDX_TOPK].to(torch.int32)
     tensors["topk_idxs"][:] = topk_idxs
-
-
-@pl.jit
-def prefill_indexer_test(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
-    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
-    qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
-    qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
-    # NOT pl.NZ: o0/tail_o0 are formed via integer division of a flattened
-    # spmd index (qr_n = idx // qr_full_row_blocks), which NZ addressability
-    # cannot prove non-negative (only bare spmd/loop indices and their
-    # sums/products with constants are provable, not a quotient).
-    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, PROJECTION_WEIGHT_LAYOUT],
-    cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
-    sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
-    cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
-    inner_compress_state: pl.InOut[
-        pl.Tensor[[INNER_STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM], pl.FP32]
-    ],
-    inner_compress_state_block_table: pl.Tensor[[REQUESTS_DYN, INNER_STATE_MAX_BLOCKS], pl.INT32],
-    inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
-    inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
-    inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
-    inner_norm_w: pl.Tensor[[INNER_HEAD_DIM], pl.BF16],
-    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
-    idx_block_table: pl.Tensor[[REQUESTS_DYN, IDX_CACHE_MAX_BLOCKS], pl.INT32],
-    topk_idxs: pl.Out[pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32]],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    local_request_ids: pl.Tensor[[T_DYN], pl.INT32],
-    idx_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
-    inner_state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
-):
-    x.bind_dynamic(0, T_DYN)
-    query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
-    state_checkpoint_ends.bind_dynamic(0, REQUESTS_DYN)
-    state_checkpoint_ends.bind_dynamic(1, CHECKPOINT_TILES_DYN)
-    qr.bind_dynamic(0, T_DYN)
-    qr_scale.bind_dynamic(0, T_DYN)
-    cos.bind_dynamic(0, T_DYN)
-    sin.bind_dynamic(0, T_DYN)
-    cmp_freqs_cos.bind_dynamic(0, T_DYN)
-    cmp_freqs_sin.bind_dynamic(0, T_DYN)
-    inner_compress_state.bind_dynamic(0, INNER_STATE_BLOCK_NUM_DYN)
-    inner_compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
-    idx_kv_cache.bind_dynamic(0, IDX_BLOCK_NUM_DYN)
-    idx_kv_scale.bind_dynamic(0, IDX_BLOCK_NUM_DYN)
-    topk_idxs.bind_dynamic(0, T_DYN)
-    position_ids.bind_dynamic(0, T_DYN)
-    local_request_ids.bind_dynamic(0, T_DYN)
-    idx_slot_mapping.bind_dynamic(0, T_DYN)
-    inner_state_slot_mapping.bind_dynamic(0, T_DYN)
-
-    prefill_indexer(
-        x,
-        query_start_loc, state_checkpoint_ends,
-        qr,
-        qr_scale,
-        wq_b,
-        wq_b_scale,
-        weights_proj,
-        cos,
-        sin,
-        cmp_freqs_cos,
-        cmp_freqs_sin,
-        hadamard,
-        inner_compress_state,
-        inner_compress_state_block_table,
-        inner_wkv,
-        inner_wgate,
-        inner_ape,
-        inner_norm_w,
-        idx_kv_cache,
-        idx_kv_scale,
-        idx_block_table,
-        topk_idxs,
-        position_ids,
-        local_request_ids,
-        idx_slot_mapping,
-        inner_state_slot_mapping,
-    )
-    return idx_kv_cache, idx_kv_scale, topk_idxs
 
 
 def gen_shared_weight(shape, dequant_std, chan_cv):

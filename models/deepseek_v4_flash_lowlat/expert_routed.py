@@ -401,240 +401,6 @@ def expert_routed_test(
     return recv_y
 
 
-def golden_expert_routed(tensors):
-    """Integer-accumulate W8A8 reference for one TP intermediate partition."""
-    import torch
-
-    if __package__:
-        from .utils import int8_quant_per_row
-    else:
-        from utils import int8_quant_per_row
-
-    counts = tensors["recv_expert_count"]
-    recv_y = torch.zeros_like(tensors["recv_y"], dtype=torch.float32)
-    for slot in range(counts.shape[0]):
-        n_rows = int(counts[slot, 0])
-        if not 0 <= n_rows <= tensors["recv_x"].shape[1]:
-            raise ValueError("Expert row count exceeds the receive buffer")
-        if n_rows == 0:
-            continue
-        expert = int(tensors["slot_expert"][slot, 0])
-        x_i32 = tensors["recv_x"][slot, :n_rows].to(torch.int32)
-        row_scale = tensors["recv_scale_dq"][slot, :n_rows].float().unsqueeze(-1)
-        route_weight = tensors["recv_weights"][slot, :n_rows].float().unsqueeze(-1)
-        gate_acc = x_i32 @ tensors["routed_w1"][expert].to(torch.int32).T
-        up_acc = x_i32 @ tensors["routed_w3"][expert].to(torch.int32).T
-        gate = (gate_acc.float() * row_scale) * tensors["routed_w1_scale"][expert].float()
-        up = (up_acc.float() * row_scale) * tensors["routed_w3_scale"][expert].float()
-        if SWIGLU_LIMIT > 0:
-            gate = gate.clamp(max=SWIGLU_LIMIT)
-            up = up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
-        sigmoid_exp = torch.exp(-gate.double()).float()
-        sigmoid = torch.reciprocal(sigmoid_exp + 1.0)
-        hidden = (gate * sigmoid) * up
-        hidden_i8, hidden_scale = int8_quant_per_row(hidden, direct_div=True)
-        down_acc = hidden_i8.to(torch.int32) @ tensors["routed_w2"][expert].to(torch.int32).T
-        row_scale = hidden_scale * route_weight
-        recv_y[slot, :n_rows] = (down_acc.float() * row_scale) * tensors["routed_w2_scale"][expert].float()
-    tensors["recv_y"].copy_(recv_y.to(torch.bfloat16))
-
-
-def gen_routed_weight(shape, dequant_std):
-    """Synthesize a routed-expert per-channel-symmetric INT8 weight + FP32 scale by
-    simulating the real DeepSeek-V4-Flash MXFP4 routed-expert quant grid (e2m1, per-32-group
-    E8M0 scale), then re-quantizing per-output-channel. A plain ``randn`` INT8 is wrong:
-    routed collapses onto ~37 discrete levels with an ~11.6% zero spike (the FP4 grid) and a
-    per-channel scale CV ~0.09 (the fine group scale flattens it). Per-output-channel INT8 is
-    scale-invariant, so the level structure / zero spike emerge from the grid alone and
-    ``dequant_std`` only sets the absolute scale magnitude. (shared experts use a different
-    grid -- see utils.gen_shared_weight.)
-
-    ``shape`` last dim = reduction (in) dim; leading dims map to the per-output-channel
-    scale shape ([E, out, in] -> scale [E, out]).
-    """
-    import torch
-
-    FP4_MAG = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
-    FP4_MID = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])  # nearest-grid bounds
-    FP4_MAX, TINY = 6.0, 1e-20
-    GROUP = 32
-    CHUNK_ELEMS = 1 << 25  # elements per pass; unchunked this walks GiB-sized temporaries
-
-    *lead, out, inn = shape
-    n_lead = 1
-    for dim in lead:
-        n_lead *= dim
-
-    W = torch.randn(*shape).reshape(n_lead, out, inn)
-    w_i8 = torch.empty(n_lead, out, inn, dtype=torch.int8)
-    scale = torch.empty(n_lead, out, 1, dtype=torch.float32)
-
-    # e2m1 + per-32-group E8M0 (round-up) scale on the in dim, then per-output-channel
-    # INT8. Chunked over the leading dim: every reduction here is confined to one
-    # (out, in) row, so the chunk boundary cannot change a result.
-    step = max(1, CHUNK_ELEMS // (out * inn))
-    for i0 in range(0, n_lead, step):
-        w = W[i0 : i0 + step]
-        wg = w.reshape(-1, out, inn // GROUP, GROUP)
-        absw = wg.abs()
-        grp_scale = torch.exp2(
-            torch.ceil(torch.log2((absw.amax(-1, keepdim=True) / FP4_MAX).clamp_min(TINY)))
-        )
-        idx = torch.bucketize(absw.div_(grp_scale), FP4_MID).clamp_max_(7)
-        wq = (torch.sign(wg) * FP4_MAG[idx]).mul_(grp_scale).reshape(w.shape)
-        amax = wq.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-        chan_scale = amax / INT8_SCALE_MAX
-        w_i8[i0 : i0 + step] = (
-            torch.round(wq.div_(chan_scale)).clamp_(-INT8_SCALE_MAX, INT8_SCALE_MAX).to(torch.int8)
-        )
-        scale[i0 : i0 + step] = chan_scale
-    del W
-
-    scale = (scale * (dequant_std / (w_i8.float() * scale).std())).squeeze(-1).float()
-    return w_i8.reshape(*shape), scale.reshape(*lead, out)
-
-
-def compare_recv_y(actual, expected, *, inputs, **kwargs):
-    """Compare only the input-declared active rows of each expert slot."""
-    import torch
-    from golden import ratio_reldiff
-
-    if actual.shape != expected.shape or actual.ndim != 3:
-        return False, "Expert output must have matching [slots, rows, channels] shapes"
-    counts = inputs.get("recv_expert_count")
-    if counts is None or counts.ndim != 2 or counts.shape[0] != actual.shape[0] or counts.shape[1] < 1:
-        return False, "Missing or incompatible recv_expert_count input"
-    if counts.dtype not in (torch.int32, torch.int64):
-        return False, "Expert row counts must have an integer dtype"
-    rows = counts.cpu()[:, 0].to(torch.int64)
-    if bool(((rows < 0) | (rows > actual.shape[1])).any()):
-        return False, "Expert row count is outside the output capacity"
-    valid = torch.arange(actual.shape[1]).unsqueeze(0) < rows.unsqueeze(1)
-    if not bool(valid.any()):
-        return True, ""
-    return ratio_reldiff(diff_thd=2e-3, pct_thd=0.01)(
-        actual.cpu()[valid], expected.cpu()[valid], inputs=inputs, **kwargs,
-    )
-
-
-
-def build_tensor_specs(merged=False):
-    """Fixture for the routed expert.
-
-    ``merged=True`` builds the shared-expert-merged form: ``N_SLOTS_B`` slots
-    whose last one carries every token at weight 1.0, and an ``N_BANK`` bank
-    whose last expert is a shared-expert weight set (a different quant grid --
-    MXFP8, not MXFP4 -- so the merge does not silently change the numerics the
-    shared path is validated against).
-    """
-    if __package__:
-        from .utils import int8_quant_per_row
-    else:
-        from utils import int8_quant_per_row
-    import torch
-    from golden import TensorSpec
-
-    # Across-layer-mean dequant std (typical layer) of the real DeepSeek-V4-Flash MXFP4
-    # routed experts; gen_routed_weight simulates the FP4 grid (see its docstring).
-    ROUTED_DEQUANT_STD = {"w1": 2.47e-2, "w2": 2.44e-2, "w3": 2.46e-2}
-    SHARED_DEQUANT_STD = {"w1": 2.31e-2, "w2": 2.39e-2, "w3": 2.30e-2}
-
-    n_slots = N_SLOTS_B if merged else N_SLOTS
-    n_bank = N_BANK if merged else N_EXPERTS
-
-    # One slot per active expert: T * TOPK routed pairs spread over N_SLOTS slots,
-    # each slot holding at most T rows. Slot experts are distinct global ids.
-    total = T * TOPK
-    counts = torch.bincount(torch.randint(0, N_SLOTS, (total,)), minlength=N_SLOTS)
-    counts = counts.clamp(max=T).to(torch.int32)
-    slot_expert_1d = torch.randperm(N_EXPERTS)[:N_SLOTS].to(torch.int32)
-    if merged:
-        # The shared slot holds every token, at expert id SHARED_EID.
-        counts = torch.cat([counts, torch.tensor([T], dtype=torch.int32)])
-        slot_expert_1d = torch.cat([slot_expert_1d, torch.tensor([SHARED_EID], dtype=torch.int32)])
-    counts_2d = torch.zeros(n_slots, IDX_PAD, dtype=torch.int32)
-    counts_2d[:, 0] = counts
-    slot_expert_2d = torch.zeros(n_slots, IDX_PAD, dtype=torch.int32)
-    slot_expert_2d[:, 0] = slot_expert_1d
-
-    # Build a consistent INT8 recv_x + per-row dequant scale (dispatch is
-    # responsible for per-token quantization). Invalid tail rows go to INT8 0
-    # with scale 0 so dequant produces 0.
-    x_bf16 = torch.randn(n_slots, RECV_MAX, D, dtype=torch.bfloat16)
-    valid_mask_3d = torch.arange(RECV_MAX).reshape(1, RECV_MAX, 1) < counts.reshape(n_slots, 1, 1)
-    recv_x_i8_pre, recv_scale_dq_pre = int8_quant_per_row(x_bf16)
-    recv_x_i8_pre = torch.where(valid_mask_3d, recv_x_i8_pre, torch.zeros_like(recv_x_i8_pre))
-    valid_mask_2d = valid_mask_3d.squeeze(-1)
-    recv_scale_dq_pre = torch.where(
-        valid_mask_2d,
-        recv_scale_dq_pre.squeeze(-1),
-        torch.zeros_like(recv_scale_dq_pre.squeeze(-1)),
-    )
-
-    def init_recv_x():
-        return recv_x_i8_pre
-
-    def init_recv_scale_dq():
-        return recv_scale_dq_pre.float()
-
-    def init_recv_expert_count():
-        return counts_2d
-
-    def init_slot_expert():
-        return slot_expert_2d
-
-    # Per-row routing weight in [0, 1); tail rows (slot >= count) stay 0 so
-    # they don't perturb the BF16 round-trip in expert_routed.
-    recv_weights_pre = torch.rand(n_slots, RECV_MAX, dtype=torch.float32)
-    recv_weights_pre = torch.where(valid_mask_2d, recv_weights_pre, torch.zeros_like(recv_weights_pre))
-    if merged:
-        # The shared expert is not gated: its rows come in at weight 1.0.
-        recv_weights_pre[SH_SLOT, :] = torch.where(
-            valid_mask_2d[SH_SLOT, :], torch.ones(RECV_MAX), torch.zeros(RECV_MAX)
-        )
-
-    def init_recv_weights():
-        return recv_weights_pre
-
-    # Only the slot experts are ever read, so synthesize N_SLOTS weight sets and
-    # scatter them into the full expert bank; the rest stay zero.
-    def scatter_bank(shape_tail, dequant_std, shared_dequant_std, chan_cv):
-        if __package__:
-            from .utils import gen_shared_weight
-        else:
-            from utils import gen_shared_weight
-
-        w_i8, w_s = gen_routed_weight((N_SLOTS, *shape_tail), dequant_std)
-        bank_i8 = torch.zeros(n_bank, *shape_tail, dtype=torch.int8)
-        bank_s = torch.zeros(n_bank, shape_tail[0], dtype=torch.float32)
-        routed_eids = slot_expert_1d[:N_SLOTS].long()
-        bank_i8[routed_eids] = w_i8
-        bank_s[routed_eids] = w_s
-        if merged:
-            sh_i8, sh_s = gen_shared_weight(shape_tail, shared_dequant_std, chan_cv=chan_cv)
-            bank_i8[SHARED_EID] = sh_i8
-            bank_s[SHARED_EID] = sh_s
-        return bank_i8, bank_s
-
-    w1_i8, w1_s = scatter_bank((MOE_INTER, D), ROUTED_DEQUANT_STD["w1"], SHARED_DEQUANT_STD["w1"], 0.50)
-    w3_i8, w3_s = scatter_bank((MOE_INTER, D), ROUTED_DEQUANT_STD["w3"], SHARED_DEQUANT_STD["w3"], 0.50)
-    w2_i8, w2_s = scatter_bank((D, MOE_INTER), ROUTED_DEQUANT_STD["w2"], SHARED_DEQUANT_STD["w2"], 0.33)
-
-    return [
-        TensorSpec("recv_x", [n_slots, RECV_MAX, D], torch.int8, init_value=init_recv_x),
-        TensorSpec("recv_scale_dq", [n_slots, RECV_MAX], torch.float32, init_value=init_recv_scale_dq),
-        TensorSpec("recv_weights", [n_slots, RECV_MAX], torch.float32, init_value=init_recv_weights),
-        TensorSpec("recv_expert_count", [n_slots, IDX_PAD], torch.int32, init_value=init_recv_expert_count),
-        TensorSpec("slot_expert", [n_slots, IDX_PAD], torch.int32, init_value=init_slot_expert),
-        TensorSpec("routed_w1", [n_bank, MOE_INTER, D], torch.int8, init_value=lambda: w1_i8),
-        TensorSpec("routed_w1_scale", [n_bank, MOE_INTER], torch.float32, init_value=lambda: w1_s),
-        TensorSpec("routed_w3", [n_bank, MOE_INTER, D], torch.int8, init_value=lambda: w3_i8),
-        TensorSpec("routed_w3_scale", [n_bank, MOE_INTER], torch.float32, init_value=lambda: w3_s),
-        TensorSpec("routed_w2", [n_bank, D, MOE_INTER], torch.int8, init_value=lambda: w2_i8),
-        TensorSpec("routed_w2_scale", [n_bank, D], torch.float32, init_value=lambda: w2_s),
-        TensorSpec("recv_y", [n_slots, RECV_MAX, D], torch.bfloat16),
-    ]
-
 
 if __package__:
     from .config import INT8_SCALE_MAX, INT8_AMAX_EPS
@@ -920,6 +686,240 @@ def expert_routed_persistent_balanced_test(
         recv_y,
     )
     return recv_y
+
+
+def golden_expert_routed(tensors):
+    """Integer-accumulate W8A8 reference for one TP intermediate partition."""
+    import torch
+
+    if __package__:
+        from .utils import int8_quant_per_row
+    else:
+        from utils import int8_quant_per_row
+
+    counts = tensors["recv_expert_count"]
+    recv_y = torch.zeros_like(tensors["recv_y"], dtype=torch.float32)
+    for slot in range(counts.shape[0]):
+        n_rows = int(counts[slot, 0])
+        if not 0 <= n_rows <= tensors["recv_x"].shape[1]:
+            raise ValueError("Expert row count exceeds the receive buffer")
+        if n_rows == 0:
+            continue
+        expert = int(tensors["slot_expert"][slot, 0])
+        x_i32 = tensors["recv_x"][slot, :n_rows].to(torch.int32)
+        row_scale = tensors["recv_scale_dq"][slot, :n_rows].float().unsqueeze(-1)
+        route_weight = tensors["recv_weights"][slot, :n_rows].float().unsqueeze(-1)
+        gate_acc = x_i32 @ tensors["routed_w1"][expert].to(torch.int32).T
+        up_acc = x_i32 @ tensors["routed_w3"][expert].to(torch.int32).T
+        gate = (gate_acc.float() * row_scale) * tensors["routed_w1_scale"][expert].float()
+        up = (up_acc.float() * row_scale) * tensors["routed_w3_scale"][expert].float()
+        if SWIGLU_LIMIT > 0:
+            gate = gate.clamp(max=SWIGLU_LIMIT)
+            up = up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
+        sigmoid_exp = torch.exp(-gate.double()).float()
+        sigmoid = torch.reciprocal(sigmoid_exp + 1.0)
+        hidden = (gate * sigmoid) * up
+        hidden_i8, hidden_scale = int8_quant_per_row(hidden, direct_div=True)
+        down_acc = hidden_i8.to(torch.int32) @ tensors["routed_w2"][expert].to(torch.int32).T
+        row_scale = hidden_scale * route_weight
+        recv_y[slot, :n_rows] = (down_acc.float() * row_scale) * tensors["routed_w2_scale"][expert].float()
+    tensors["recv_y"].copy_(recv_y.to(torch.bfloat16))
+
+
+def gen_routed_weight(shape, dequant_std):
+    """Synthesize a routed-expert per-channel-symmetric INT8 weight + FP32 scale by
+    simulating the real DeepSeek-V4-Flash MXFP4 routed-expert quant grid (e2m1, per-32-group
+    E8M0 scale), then re-quantizing per-output-channel. A plain ``randn`` INT8 is wrong:
+    routed collapses onto ~37 discrete levels with an ~11.6% zero spike (the FP4 grid) and a
+    per-channel scale CV ~0.09 (the fine group scale flattens it). Per-output-channel INT8 is
+    scale-invariant, so the level structure / zero spike emerge from the grid alone and
+    ``dequant_std`` only sets the absolute scale magnitude. (shared experts use a different
+    grid -- see utils.gen_shared_weight.)
+
+    ``shape`` last dim = reduction (in) dim; leading dims map to the per-output-channel
+    scale shape ([E, out, in] -> scale [E, out]).
+    """
+    import torch
+
+    FP4_MAG = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    FP4_MID = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])  # nearest-grid bounds
+    FP4_MAX, TINY = 6.0, 1e-20
+    GROUP = 32
+    CHUNK_ELEMS = 1 << 25  # elements per pass; unchunked this walks GiB-sized temporaries
+
+    *lead, out, inn = shape
+    n_lead = 1
+    for dim in lead:
+        n_lead *= dim
+
+    W = torch.randn(*shape).reshape(n_lead, out, inn)
+    w_i8 = torch.empty(n_lead, out, inn, dtype=torch.int8)
+    scale = torch.empty(n_lead, out, 1, dtype=torch.float32)
+
+    # e2m1 + per-32-group E8M0 (round-up) scale on the in dim, then per-output-channel
+    # INT8. Chunked over the leading dim: every reduction here is confined to one
+    # (out, in) row, so the chunk boundary cannot change a result.
+    step = max(1, CHUNK_ELEMS // (out * inn))
+    for i0 in range(0, n_lead, step):
+        w = W[i0 : i0 + step]
+        wg = w.reshape(-1, out, inn // GROUP, GROUP)
+        absw = wg.abs()
+        grp_scale = torch.exp2(
+            torch.ceil(torch.log2((absw.amax(-1, keepdim=True) / FP4_MAX).clamp_min(TINY)))
+        )
+        idx = torch.bucketize(absw.div_(grp_scale), FP4_MID).clamp_max_(7)
+        wq = (torch.sign(wg) * FP4_MAG[idx]).mul_(grp_scale).reshape(w.shape)
+        amax = wq.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
+        chan_scale = amax / INT8_SCALE_MAX
+        w_i8[i0 : i0 + step] = (
+            torch.round(wq.div_(chan_scale)).clamp_(-INT8_SCALE_MAX, INT8_SCALE_MAX).to(torch.int8)
+        )
+        scale[i0 : i0 + step] = chan_scale
+    del W
+
+    scale = (scale * (dequant_std / (w_i8.float() * scale).std())).squeeze(-1).float()
+    return w_i8.reshape(*shape), scale.reshape(*lead, out)
+
+
+def compare_recv_y(actual, expected, *, inputs, **kwargs):
+    """Compare only the input-declared active rows of each expert slot."""
+    import torch
+    from golden import ratio_reldiff
+
+    if actual.shape != expected.shape or actual.ndim != 3:
+        return False, "Expert output must have matching [slots, rows, channels] shapes"
+    counts = inputs.get("recv_expert_count")
+    if counts is None or counts.ndim != 2 or counts.shape[0] != actual.shape[0] or counts.shape[1] < 1:
+        return False, "Missing or incompatible recv_expert_count input"
+    if counts.dtype not in (torch.int32, torch.int64):
+        return False, "Expert row counts must have an integer dtype"
+    rows = counts.cpu()[:, 0].to(torch.int64)
+    if bool(((rows < 0) | (rows > actual.shape[1])).any()):
+        return False, "Expert row count is outside the output capacity"
+    valid = torch.arange(actual.shape[1]).unsqueeze(0) < rows.unsqueeze(1)
+    if not bool(valid.any()):
+        return True, ""
+    return ratio_reldiff(diff_thd=2e-3, pct_thd=0.01)(
+        actual.cpu()[valid], expected.cpu()[valid], inputs=inputs, **kwargs,
+    )
+
+
+def build_tensor_specs(merged=False):
+    """Fixture for the routed expert.
+
+    ``merged=True`` builds the shared-expert-merged form: ``N_SLOTS_B`` slots
+    whose last one carries every token at weight 1.0, and an ``N_BANK`` bank
+    whose last expert is a shared-expert weight set (a different quant grid --
+    MXFP8, not MXFP4 -- so the merge does not silently change the numerics the
+    shared path is validated against).
+    """
+    if __package__:
+        from .utils import int8_quant_per_row
+    else:
+        from utils import int8_quant_per_row
+    import torch
+    from golden import TensorSpec
+
+    # Across-layer-mean dequant std (typical layer) of the real DeepSeek-V4-Flash MXFP4
+    # routed experts; gen_routed_weight simulates the FP4 grid (see its docstring).
+    ROUTED_DEQUANT_STD = {"w1": 2.47e-2, "w2": 2.44e-2, "w3": 2.46e-2}
+    SHARED_DEQUANT_STD = {"w1": 2.31e-2, "w2": 2.39e-2, "w3": 2.30e-2}
+
+    n_slots = N_SLOTS_B if merged else N_SLOTS
+    n_bank = N_BANK if merged else N_EXPERTS
+
+    # One slot per active expert: T * TOPK routed pairs spread over N_SLOTS slots,
+    # each slot holding at most T rows. Slot experts are distinct global ids.
+    total = T * TOPK
+    counts = torch.bincount(torch.randint(0, N_SLOTS, (total,)), minlength=N_SLOTS)
+    counts = counts.clamp(max=T).to(torch.int32)
+    slot_expert_1d = torch.randperm(N_EXPERTS)[:N_SLOTS].to(torch.int32)
+    if merged:
+        # The shared slot holds every token, at expert id SHARED_EID.
+        counts = torch.cat([counts, torch.tensor([T], dtype=torch.int32)])
+        slot_expert_1d = torch.cat([slot_expert_1d, torch.tensor([SHARED_EID], dtype=torch.int32)])
+    counts_2d = torch.zeros(n_slots, IDX_PAD, dtype=torch.int32)
+    counts_2d[:, 0] = counts
+    slot_expert_2d = torch.zeros(n_slots, IDX_PAD, dtype=torch.int32)
+    slot_expert_2d[:, 0] = slot_expert_1d
+
+    # Build a consistent INT8 recv_x + per-row dequant scale (dispatch is
+    # responsible for per-token quantization). Invalid tail rows go to INT8 0
+    # with scale 0 so dequant produces 0.
+    x_bf16 = torch.randn(n_slots, RECV_MAX, D, dtype=torch.bfloat16)
+    valid_mask_3d = torch.arange(RECV_MAX).reshape(1, RECV_MAX, 1) < counts.reshape(n_slots, 1, 1)
+    recv_x_i8_pre, recv_scale_dq_pre = int8_quant_per_row(x_bf16)
+    recv_x_i8_pre = torch.where(valid_mask_3d, recv_x_i8_pre, torch.zeros_like(recv_x_i8_pre))
+    valid_mask_2d = valid_mask_3d.squeeze(-1)
+    recv_scale_dq_pre = torch.where(
+        valid_mask_2d,
+        recv_scale_dq_pre.squeeze(-1),
+        torch.zeros_like(recv_scale_dq_pre.squeeze(-1)),
+    )
+
+    def init_recv_x():
+        return recv_x_i8_pre
+
+    def init_recv_scale_dq():
+        return recv_scale_dq_pre.float()
+
+    def init_recv_expert_count():
+        return counts_2d
+
+    def init_slot_expert():
+        return slot_expert_2d
+
+    # Per-row routing weight in [0, 1); tail rows (slot >= count) stay 0 so
+    # they don't perturb the BF16 round-trip in expert_routed.
+    recv_weights_pre = torch.rand(n_slots, RECV_MAX, dtype=torch.float32)
+    recv_weights_pre = torch.where(valid_mask_2d, recv_weights_pre, torch.zeros_like(recv_weights_pre))
+    if merged:
+        # The shared expert is not gated: its rows come in at weight 1.0.
+        recv_weights_pre[SH_SLOT, :] = torch.where(
+            valid_mask_2d[SH_SLOT, :], torch.ones(RECV_MAX), torch.zeros(RECV_MAX)
+        )
+
+    def init_recv_weights():
+        return recv_weights_pre
+
+    # Only the slot experts are ever read, so synthesize N_SLOTS weight sets and
+    # scatter them into the full expert bank; the rest stay zero.
+    def scatter_bank(shape_tail, dequant_std, shared_dequant_std, chan_cv):
+        if __package__:
+            from .utils import gen_shared_weight
+        else:
+            from utils import gen_shared_weight
+
+        w_i8, w_s = gen_routed_weight((N_SLOTS, *shape_tail), dequant_std)
+        bank_i8 = torch.zeros(n_bank, *shape_tail, dtype=torch.int8)
+        bank_s = torch.zeros(n_bank, shape_tail[0], dtype=torch.float32)
+        routed_eids = slot_expert_1d[:N_SLOTS].long()
+        bank_i8[routed_eids] = w_i8
+        bank_s[routed_eids] = w_s
+        if merged:
+            sh_i8, sh_s = gen_shared_weight(shape_tail, shared_dequant_std, chan_cv=chan_cv)
+            bank_i8[SHARED_EID] = sh_i8
+            bank_s[SHARED_EID] = sh_s
+        return bank_i8, bank_s
+
+    w1_i8, w1_s = scatter_bank((MOE_INTER, D), ROUTED_DEQUANT_STD["w1"], SHARED_DEQUANT_STD["w1"], 0.50)
+    w3_i8, w3_s = scatter_bank((MOE_INTER, D), ROUTED_DEQUANT_STD["w3"], SHARED_DEQUANT_STD["w3"], 0.50)
+    w2_i8, w2_s = scatter_bank((D, MOE_INTER), ROUTED_DEQUANT_STD["w2"], SHARED_DEQUANT_STD["w2"], 0.33)
+
+    return [
+        TensorSpec("recv_x", [n_slots, RECV_MAX, D], torch.int8, init_value=init_recv_x),
+        TensorSpec("recv_scale_dq", [n_slots, RECV_MAX], torch.float32, init_value=init_recv_scale_dq),
+        TensorSpec("recv_weights", [n_slots, RECV_MAX], torch.float32, init_value=init_recv_weights),
+        TensorSpec("recv_expert_count", [n_slots, IDX_PAD], torch.int32, init_value=init_recv_expert_count),
+        TensorSpec("slot_expert", [n_slots, IDX_PAD], torch.int32, init_value=init_slot_expert),
+        TensorSpec("routed_w1", [n_bank, MOE_INTER, D], torch.int8, init_value=lambda: w1_i8),
+        TensorSpec("routed_w1_scale", [n_bank, MOE_INTER], torch.float32, init_value=lambda: w1_s),
+        TensorSpec("routed_w3", [n_bank, MOE_INTER, D], torch.int8, init_value=lambda: w3_i8),
+        TensorSpec("routed_w3_scale", [n_bank, MOE_INTER], torch.float32, init_value=lambda: w3_s),
+        TensorSpec("routed_w2", [n_bank, D, MOE_INTER], torch.int8, init_value=lambda: w2_i8),
+        TensorSpec("routed_w2_scale", [n_bank, D], torch.float32, init_value=lambda: w2_s),
+        TensorSpec("recv_y", [n_slots, RECV_MAX, D], torch.bfloat16),
+    ]
 
 
 def validate_routed():

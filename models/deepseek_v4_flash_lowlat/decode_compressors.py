@@ -335,266 +335,6 @@ def compressor_test_ratio4(
     return kv, compress_state, cmp_kv_cache
 
 
-def golden_compressor_ratio4(tensors):
-    """Torch reference for Compressor.forward (decode branch, ratio=4 overlap)."""
-    import torch
-
-    if __package__:
-        from .utils import bf16_matmul_fp32
-    else:
-        from utils import bf16_matmul_fp32
-
-    # Unmapped boundaries and non-boundary rows are outside the output write set.
-    tensors["kv"].fill_(float("nan"))
-
-    x = tensors["x"].float()
-    compress_state = tensors["compress_state"]
-    compress_state_block_table = tensors["compress_state_block_table"]
-    wkv = tensors["wkv"].float()
-    wgate = tensors["wgate"].float()
-    ape = tensors["ape"]
-    norm_w = tensors["norm_w"]
-    cos = tensors["cos"]
-    sin = tensors["sin"]
-    cmp_kv_cache = tensors["cmp_kv_cache"]
-    position_ids = tensors["position_ids"].to(torch.int64)
-    cmp_slot_mapping = tensors["cmp_slot_mapping"].to(torch.int64)
-    state_slot_mapping = tensors["state_slot_mapping"].to(torch.int64)
-    bsz, _, _ = x.shape
-    ratio, rd = RATIO4_COMPRESS_RATIO, ROPE_HEAD_DIM
-
-    kv = bf16_matmul_fp32(x, wkv.t())  # [B, S, OUT_DIM]  (wkv stored [OUT_DIM, D] for b_trans)
-    score = bf16_matmul_fp32(x, wgate.t())  # [B, S, OUT_DIM]
-
-    # Each boundary stays at its input token index, as in the device output.
-    pooled = torch.zeros(bsz, S, RATIO4_HEAD_DIM, dtype=torch.float32, device=x.device)
-    visible_boundaries = []
-    score = score + ape[position_ids % ratio]
-
-    def read_pool_row(b, abs_pos, half):
-        if abs_pos < 0:
-            return (
-                torch.zeros(RATIO4_HEAD_DIM, dtype=torch.float32, device=x.device),
-                torch.full((RATIO4_HEAD_DIM,), float("-inf"), dtype=torch.float32, device=x.device),
-            )
-        first_pos = int(position_ids[b, 0].item())
-        channel = half * RATIO4_HEAD_DIM
-        if abs_pos >= first_pos:
-            token = abs_pos - first_pos
-            return kv[b, token, channel : channel + RATIO4_HEAD_DIM], score[b, token, channel : channel + RATIO4_HEAD_DIM]
-        blk_id = int(compress_state_block_table[b, abs_pos // RATIO4_COMPRESS_STATE_BLOCK_SIZE].item())
-        if blk_id < 0:
-            return (
-                torch.zeros(RATIO4_HEAD_DIM, dtype=torch.float32, device=x.device),
-                torch.full((RATIO4_HEAD_DIM,), float("-inf"), dtype=torch.float32, device=x.device),
-            )
-        intra = abs_pos % RATIO4_COMPRESS_STATE_BLOCK_SIZE
-        return (
-            compress_state[blk_id, intra, channel : channel + RATIO4_HEAD_DIM],
-            compress_state[blk_id, intra, RATIO4_OUT_DIM + channel : RATIO4_OUT_DIM + channel + RATIO4_HEAD_DIM],
-        )
-
-    # Read every prefix window before a commit can overwrite rolling physical state.
-    for b in range(bsz):
-        first_pos = int(position_ids[b, 0].item())
-        first_boundary_s = ratio - 1 - first_pos % ratio
-        for boundary_s in range(first_boundary_s, S, ratio):
-            if int(cmp_slot_mapping[b, boundary_s].item()) < 0:
-                continue
-            boundary_end = int(position_ids[b, boundary_s].item())
-            current_start = boundary_end - ratio + 1
-            rows = [read_pool_row(b, pos, 0) for pos in range(current_start - ratio, current_start)]
-            rows += [read_pool_row(b, pos, 1) for pos in range(current_start, boundary_end + 1)]
-            kvs = torch.stack([row[0] for row in rows])
-            scs = torch.stack([row[1] for row in rows])
-            pooled[b, boundary_s] = (kvs * scs.softmax(dim=0)).sum(dim=0)
-            visible_boundaries.append((b, boundary_s))
-
-    for b in range(bsz):
-        for token in range(S):
-            state_row = int(state_slot_mapping[b, token].item())
-            if state_row >= 0:
-                blk_id = state_row // RATIO4_COMPRESS_STATE_BLOCK_SIZE
-                intra = state_row % RATIO4_COMPRESS_STATE_BLOCK_SIZE
-                compress_state[blk_id, intra, :RATIO4_OUT_DIM] = kv[b, token]
-                compress_state[blk_id, intra, RATIO4_OUT_DIM:] = score[b, token]
-
-    tensors["compress_state"][:] = compress_state
-
-    def rmsnorm(x, w):
-        x = x.float()
-        var = x.square().mean(-1, keepdim=True)
-        x = x * torch.rsqrt(var + EPS)
-        return w * x
-
-    for b, boundary_s in visible_boundaries:
-        kv_b = rmsnorm(pooled[b : b + 1, boundary_s : boundary_s + 1], norm_w)
-
-        x_pair = kv_b[..., -rd:].unflatten(-1, (-1, 2))
-        x0, x1 = x_pair[..., 0], x_pair[..., 1]
-        cos_v, sin_v = cos[b * S + boundary_s].view(-1), sin[b * S + boundary_s].view(-1)
-        y0 = x0 * cos_v - x1 * sin_v
-        y1 = x0 * sin_v + x1 * cos_v
-
-        kv_b = torch.cat([kv_b[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
-
-        cmp_row = int(cmp_slot_mapping[b, boundary_s].item())
-        if cmp_row >= 0:
-            tensors["kv"][b : b + 1, boundary_s : boundary_s + 1, :] = kv_b
-            blk_id = cmp_row // RATIO4_CMP_STORAGE_BLOCK_SIZE
-            cmp_kv_cache[blk_id, cmp_row % RATIO4_CMP_STORAGE_BLOCK_SIZE, 0] = kv_b[0, 0]
-
-    tensors["cmp_kv_cache"][:] = cmp_kv_cache
-
-
-def build_tensor_specs_ratio4(start_pos=None):
-    import torch  # type: ignore[import]
-
-    if __package__:
-        from .utils import (
-            block_table,
-            compressed_slot_mapping,
-            csa_decode_start_set,
-            position_ids_from_starts,
-            resolve_start_positions,
-            state_slot_mapping,
-        )
-    else:
-        from utils import (
-            block_table,
-            compressed_slot_mapping,
-            csa_decode_start_set,
-            position_ids_from_starts,
-            resolve_start_positions,
-            state_slot_mapping,
-        )
-    from golden import TensorSpec
-
-    if __package__:
-        from .utils import build_rope_tables, materialize_half_rope_tables
-    else:
-        from utils import build_rope_tables, materialize_half_rope_tables
-
-    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, RATIO4_COMPRESS_RATIO, dtype=torch.bfloat16)
-
-    def init_x():
-        return torch.rand(B, S, D)
-
-    def init_compress_state():
-        state = torch.zeros(RATIO4_COMPRESS_STATE_BLOCK_NUM, RATIO4_COMPRESS_STATE_BLOCK_SIZE, RATIO4_COMPRESS_STATE_DIM)
-        state[:, :, RATIO4_OUT_DIM:] = FP32_NEG_INF
-        return state
-
-    def init_compress_state_block_table():
-        return block_table(
-            batch=B,
-            table_blocks=RATIO4_COMPRESS_STATE_MAX_BLOCKS,
-            physical_blocks=RATIO4_COMPRESS_STATE_PHYSICAL_BLOCKS,
-        )
-
-    # Calibrated to the real DeepSeek-V4-Flash CSA (ratio-4) main compressor (mean l8/l32 of
-    # extract_weights_flash): zero-mean Gaussian BF16 weights at the measured std; the RMSNorm
-    # gamma centers near the measured mean (not ones / not uniform).
-    def init_wkv():
-        return torch.randn(RATIO4_OUT_DIM, D) * 0.0245
-
-    def init_wgate():
-        return torch.randn(RATIO4_OUT_DIM, D) * 0.0388
-
-    def init_ape():
-        return torch.randn(RATIO4_COMPRESS_RATIO, RATIO4_OUT_DIM) * 0.1243
-
-    def init_norm_w():
-        return 0.9666 + 0.1929 * torch.randn(RATIO4_HEAD_DIM)
-
-    def init_rope_positions():
-        positions = init_position_ids().to(torch.int64)
-        boundaries = (positions + 1) % RATIO4_COMPRESS_RATIO == 0
-        return torch.where(boundaries, positions - RATIO4_COMPRESS_RATIO + 1, 0).reshape(-1)
-
-    def init_cos():
-        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_rope_positions())[0]
-
-    def init_sin():
-        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_rope_positions())[1]
-
-    def init_cmp_kv_cache():
-        return torch.zeros(CMP_BLOCK_NUM, RATIO4_CMP_STORAGE_BLOCK_SIZE, 1, RATIO4_HEAD_DIM)
-
-    def init_cmp_block_table():
-        return block_table(
-            batch=B,
-            table_blocks=CMP_MAX_BLOCKS,
-            physical_blocks=CMP_BLOCK_NUM,
-        )
-
-    def init_default_start_pos():
-        # Canonical CSA start-position set (ratio-4 compressor + indexer + sliding-window + 8k).
-        return csa_decode_start_set(
-            batch=B, seq=S, compress_ratio=RATIO4_COMPRESS_RATIO, state_block_size=RATIO4_COMPRESS_STATE_BLOCK_SIZE
-        )
-
-    def init_start_pos():
-        return resolve_start_positions(
-            start_pos,
-            batch=B,
-            seq=S,
-            max_seq_len=MAX_SEQ_LEN,
-            default_fn=init_default_start_pos,
-        )
-
-    def init_position_ids():
-        return position_ids_from_starts(init_start_pos(), seq=S)
-
-    def init_state_slot_mapping():
-        return state_slot_mapping(
-            init_position_ids(),
-            init_compress_state_block_table(),
-            state_block_size=RATIO4_COMPRESS_STATE_BLOCK_SIZE,
-        )
-
-    def init_cmp_slot_mapping():
-        positions = init_position_ids()
-        return compressed_slot_mapping(
-            positions,
-            init_cmp_block_table(),
-            compress_ratio=RATIO4_COMPRESS_RATIO,
-            block_size=RATIO4_CMP_STORAGE_BLOCK_SIZE,
-        )
-
-    return [
-        TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),
-        TensorSpec("kv", [B, S, RATIO4_HEAD_DIM], torch.float32),
-        TensorSpec(
-            "compress_state",
-            [RATIO4_COMPRESS_STATE_BLOCK_NUM, RATIO4_COMPRESS_STATE_BLOCK_SIZE, RATIO4_COMPRESS_STATE_DIM],
-            torch.float32,
-            init_value=init_compress_state,
-        ),
-        TensorSpec(
-            "compress_state_block_table",
-            [B, RATIO4_COMPRESS_STATE_MAX_BLOCKS],
-            torch.int32,
-            init_value=init_compress_state_block_table,
-        ),
-        TensorSpec("wkv", [RATIO4_OUT_DIM, D], torch.bfloat16, init_value=init_wkv),
-        TensorSpec("wgate", [RATIO4_OUT_DIM, D], torch.bfloat16, init_value=init_wgate),
-        TensorSpec("ape", [RATIO4_COMPRESS_RATIO, RATIO4_OUT_DIM], torch.float32, init_value=init_ape),
-        TensorSpec("norm_w", [RATIO4_HEAD_DIM], torch.bfloat16, init_value=init_norm_w),
-        TensorSpec("cos", [B * S, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
-        TensorSpec("sin", [B * S, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
-        TensorSpec(
-            "cmp_kv_cache",
-            [CMP_BLOCK_NUM, RATIO4_CMP_STORAGE_BLOCK_SIZE, 1, RATIO4_HEAD_DIM],
-            torch.bfloat16,
-            init_value=init_cmp_kv_cache,
-        ),
-        TensorSpec("position_ids", [B, S], torch.int32, init_value=init_position_ids),
-        TensorSpec("cmp_slot_mapping", [B, S], torch.int64, init_value=init_cmp_slot_mapping),
-        TensorSpec("state_slot_mapping", [B, S], torch.int64, init_value=init_state_slot_mapping),
-    ]
-
-
 if __package__:
     from .kv_proj_rope import rope_interleave
 else:
@@ -940,340 +680,6 @@ def compressor_test_ratio128(
     )
     return kv, compress_state, cmp_kv_cache
 
-
-def golden_compressor_ratio128(tensors):
-    """Torch reference for Compressor.forward (decode branch, ratio=128 non-overlap).
-
-    Operates on paged caches: compress_state (kv + score channels merged) and cmp_kv_cache,
-    each addressed via the corresponding block_table.
-    """
-    import torch
-
-    if __package__:
-        from .utils import bf16_matmul_fp32
-    else:
-        from utils import bf16_matmul_fp32
-
-    # Rows this golden never writes stay NaN: ignored by the kv comparator.
-    tensors["kv"].fill_(float("nan"))
-
-    x = tensors["x"].float()
-    compress_state_block_table = tensors["compress_state_block_table"]
-    position_ids = tensors["position_ids"].to(torch.int64)
-    cmp_slot_mapping = tensors["cmp_slot_mapping"].to(torch.int64)
-    state_slot_mapping = tensors["state_slot_mapping"].to(torch.int64)
-    # Historical state reads still use absolute-position block-table addressing.
-    # Persistent writes use token-major slot mappings. APE remains modulo ratio.
-    compress_state = tensors["compress_state"]
-
-    def read_state_row(b, pos):
-        first_pos = int(position_ids[b, 0].item())
-        if first_pos <= pos < first_pos + S:
-            token = pos - first_pos
-            return kv[b, token], score[b, token]
-        logical_blk = pos // RATIO128_COMPRESS_STATE_BLOCK_SIZE
-        intra = pos % RATIO128_COMPRESS_STATE_BLOCK_SIZE
-        sblk = int(compress_state_block_table[b, logical_blk].item())
-        if sblk < 0:
-            return (
-                torch.zeros(RATIO128_OUT_DIM, dtype=torch.float32, device=compress_state.device),
-                torch.full((RATIO128_OUT_DIM,), float("-inf"), dtype=torch.float32, device=compress_state.device),
-            )
-        return (
-            compress_state[sblk, intra, :RATIO128_OUT_DIM],
-            compress_state[sblk, intra, RATIO128_OUT_DIM : 2 * RATIO128_OUT_DIM],
-        )
-
-    def write_state_row(slot, kv_row, score_row):
-        if slot < 0:
-            return
-        sblk = slot // RATIO128_COMPRESS_STATE_BLOCK_SIZE
-        intra = slot % RATIO128_COMPRESS_STATE_BLOCK_SIZE
-        compress_state[sblk, intra, :RATIO128_OUT_DIM] = kv_row
-        compress_state[sblk, intra, RATIO128_OUT_DIM : 2 * RATIO128_OUT_DIM] = score_row
-
-    wkv = tensors["wkv"].float()
-    wgate = tensors["wgate"].float()
-    ape = tensors["ape"]
-    norm_w = tensors["norm_w"]
-    cos = tensors["cos"]
-    sin = tensors["sin"]
-    cmp_kv_cache = tensors["cmp_kv_cache"]
-    bsz, _, _ = x.shape
-    ratio, rd = RATIO128_COMPRESS_RATIO, ROPE_HEAD_DIM
-
-    kv = bf16_matmul_fp32(x, wkv.t())  # [B, S, OUT_DIM]  (wkv stored [OUT_DIM, D] for b_trans)
-    score = bf16_matmul_fp32(x, wgate.t())  # [B, S, OUT_DIM]
-    pooled = torch.zeros(bsz, 1, RATIO128_HEAD_DIM, dtype=torch.float32, device=x.device)
-    should_compress_rows = torch.zeros(bsz, dtype=torch.bool, device=x.device)
-
-    for b in range(bsz):
-        boundary_s = None
-        for s in range(S):
-            pos = int(position_ids[b, s].item())
-            token_ape_row = pos % ratio
-            score[b, s, :] = score[b, s, :] + ape[token_ape_row]
-            if (pos + 1) % ratio == 0:
-                boundary_s = s
-
-        if boundary_s is not None:
-            should_compress_rows[b] = True
-            compress_pos = int(position_ids[b, boundary_s].item())
-            kv_rows = []
-            score_rows = []
-            for pos in range(compress_pos - ratio + 1, compress_pos + 1):
-                kv_row, score_row = read_state_row(b, pos)
-                kv_rows.append(kv_row)
-                score_rows.append(score_row)
-            kv_state = torch.stack(kv_rows, dim=0).unsqueeze(0)
-            score_state = torch.stack(score_rows, dim=0).unsqueeze(0)
-            pooled[b : b + 1] = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
-        for token in range(S):
-            write_state_row(int(state_slot_mapping[b, token].item()), kv[b, token], score[b, token])
-
-    tensors["compress_state"][:] = compress_state
-
-    if not bool(should_compress_rows.any()):
-        return
-
-    def rmsnorm(x, w):
-        x = x.float()
-        var = x.square().mean(-1, keepdim=True)
-        x = x * torch.rsqrt(var + EPS)
-        return w * x
-
-    for b in range(bsz):
-        if not bool(should_compress_rows[b]):
-            continue
-        kv_b = rmsnorm(pooled[b : b + 1], norm_w)
-
-        x_pair = kv_b[..., -rd:].unflatten(-1, (-1, 2))
-        x0, x1 = x_pair[..., 0], x_pair[..., 1]
-        cos_v, sin_v = cos[b].view(-1), sin[b].view(-1)
-        y0 = x0 * cos_v - x1 * sin_v
-        y1 = x0 * sin_v + x1 * cos_v
-
-        kv_b = torch.cat([kv_b[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
-
-        boundary_positions = torch.nonzero((position_ids[b, :S] + 1) % ratio == 0, as_tuple=False).flatten()
-        if int(boundary_positions.numel()) == 0:
-            continue
-        boundary_s = int(boundary_positions[0].item())
-        cmp_row = int(cmp_slot_mapping[b, boundary_s].item())
-        if cmp_row >= 0:
-            # Kernel writes committed pooled result only to kv[:, 0, :]; leave
-            # speculative-boundary rows and kv[:, 1:, :] NaN (ignored).
-            tensors["kv"][b : b + 1, 0:1, :] = kv_b
-            cblk = cmp_row // RATIO128_CMP_STORAGE_BLOCK_SIZE
-            intra_offset = cmp_row % RATIO128_CMP_STORAGE_BLOCK_SIZE
-            cmp_kv_cache[cblk, intra_offset, 0] = kv_b[0, 0]
-
-    tensors["cmp_kv_cache"][:] = cmp_kv_cache
-
-
-
-def compare_compressor_kv(actual, expected, *, inputs, **kwargs):
-    """Leave pure-Out rows unconstrained only for an input-proved empty write set."""
-    import torch
-    from golden import ratio_allclose
-
-    if actual.shape != expected.shape:
-        return False, "Compressor KV output shapes differ"
-    positions = inputs.get("position_ids")
-    mapping = inputs.get("cmp_slot_mapping")
-    if positions is None or mapping is None or tuple(positions.shape) != (B, S):
-        return False, "Missing or incompatible compressor position/mapping inputs"
-    if positions.shape != mapping.shape:
-        return False, "Compressor position and slot-mapping shapes differ"
-    boundaries = (positions.cpu().to(torch.int64) + 1).remainder(RATIO128_COMPRESS_RATIO) == 0
-    writes = boundaries & (mapping.cpu() >= 0)
-    if not bool(writes.any()):
-        if not bool(torch.isnan(expected).all()):
-            return False, "Empty compressor write set must leave the pure-Out golden undefined"
-        return True, ""
-    return ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0, ignore_nan=True)(
-        actual, expected, inputs=inputs, **kwargs,
-    )
-
-def build_tensor_specs_ratio128(start_pos=None):
-    import torch  # type: ignore[import]
-
-    if __package__:
-        from .utils import (
-            block_table,
-            compressed_slot_mapping,
-            hca_decode_start_set,
-            position_ids_from_starts,
-            resolve_start_positions,
-            state_slot_mapping,
-        )
-    else:
-        from utils import (
-            block_table,
-            compressed_slot_mapping,
-            hca_decode_start_set,
-            position_ids_from_starts,
-            resolve_start_positions,
-            state_slot_mapping,
-        )
-    from golden import TensorSpec
-
-    if __package__:
-        from .utils import build_rope_tables, materialize_half_rope_tables
-    else:
-        from utils import build_rope_tables, materialize_half_rope_tables
-
-    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, RATIO128_COMPRESS_RATIO, dtype=torch.bfloat16)
-
-    def init_x():
-        return torch.rand(B, S, D)
-
-    def init_compress_state():
-        return torch.zeros(RATIO128_COMPRESS_STATE_BLOCK_NUM, RATIO128_COMPRESS_STATE_BLOCK_SIZE, RATIO128_COMPRESS_STATE_DIM)
-
-    # Calibrated to the real DeepSeek-V4-Flash 150
-    #  (ratio-128) main compressor (mean l7/l9 of
-    # extract_weights_flash): zero-mean Gaussian BF16 weights at the measured std; the RMSNorm
-    # gamma centers near the measured mean (not ones / not uniform).
-    def init_wkv():
-        return torch.randn(RATIO128_OUT_DIM, D) * 0.0246
-
-    def init_wgate():
-        return torch.randn(RATIO128_OUT_DIM, D) * 0.0316
-
-    def init_ape():
-        return torch.randn(RATIO128_COMPRESS_RATIO, RATIO128_OUT_DIM) * 0.0340
-
-    def init_norm_w():
-        return 0.1001 + 0.0549 * torch.randn(RATIO128_HEAD_DIM)
-
-    def init_rope_positions():
-        first_pos = init_position_ids().to(torch.int64)[:, 0]
-        cmp_offset = RATIO128_COMPRESS_RATIO - (first_pos % RATIO128_COMPRESS_RATIO)
-        return (first_pos + cmp_offset - RATIO128_COMPRESS_RATIO).to(torch.int64)
-
-    def init_cos():
-        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_rope_positions())[0]
-
-    def init_sin():
-        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_rope_positions())[1]
-
-    def init_cmp_kv_cache():
-        return torch.zeros(CMP_BLOCK_NUM, RATIO128_CMP_STORAGE_BLOCK_SIZE, 1, RATIO128_HEAD_DIM)
-
-    def init_compress_state_block_table():
-        return block_table(
-            batch=B,
-            table_blocks=RATIO128_COMPRESS_STATE_MAX_BLOCKS,
-            physical_blocks=RATIO128_COMPRESS_STATE_PHYSICAL_BLOCKS,
-            permuted=True,
-        )
-
-    def init_cmp_block_table():
-        return block_table(
-            batch=B,
-            table_blocks=CMP_MAX_BLOCKS,
-            physical_blocks=CMP_BLOCK_NUM,
-            permuted=True,
-        )
-
-    def init_default_start_pos():
-        # Canonical HCA start-position set (ratio-128 compressor branches + 8k long-context).
-        # At B=1 only the 8k point survives, and [8192, 8192 + S) holds no compress
-        # boundary, so the entry would write nothing it validates. Pull the 8k point
-        # back half a step so its S tokens straddle the 8192 boundary.
-        return hca_decode_start_set(
-            batch=B,
-            compress_ratio=RATIO128_COMPRESS_RATIO,
-            state_block_size=RATIO128_COMPRESS_STATE_BLOCK_SIZE,
-            long_pos=DECODE_START_POS - max(1, S // 2),
-        )
-
-    def init_start_pos():
-        return resolve_start_positions(
-            start_pos,
-            batch=B,
-            seq=S,
-            max_seq_len=MAX_SEQ_LEN,
-            default_fn=init_default_start_pos,
-        )
-
-    def init_position_ids():
-        return position_ids_from_starts(init_start_pos(), seq=S)
-
-    def init_state_slot_mapping():
-        return state_slot_mapping(
-            init_position_ids(),
-            init_compress_state_block_table(),
-            state_block_size=RATIO128_COMPRESS_STATE_BLOCK_SIZE,
-        )
-
-    def init_cmp_slot_mapping():
-        positions = init_position_ids()
-        return compressed_slot_mapping(
-            positions,
-            init_cmp_block_table(),
-            compress_ratio=RATIO128_COMPRESS_RATIO,
-            block_size=RATIO128_CMP_STORAGE_BLOCK_SIZE,
-        )
-
-    return [
-        TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),
-        TensorSpec("kv", [B, S, RATIO128_HEAD_DIM], torch.float32),
-        TensorSpec(
-            "compress_state",
-            [RATIO128_COMPRESS_STATE_BLOCK_NUM, RATIO128_COMPRESS_STATE_BLOCK_SIZE, RATIO128_COMPRESS_STATE_DIM],
-            torch.float32,
-            init_value=init_compress_state,
-        ),
-        TensorSpec(
-            "compress_state_block_table",
-            [B, RATIO128_COMPRESS_STATE_MAX_BLOCKS],
-            torch.int32,
-            init_value=init_compress_state_block_table,
-        ),
-        TensorSpec("wkv", [RATIO128_OUT_DIM, D], torch.bfloat16, init_value=init_wkv),
-        TensorSpec("wgate", [RATIO128_OUT_DIM, D], torch.bfloat16, init_value=init_wgate),
-        TensorSpec("ape", [RATIO128_COMPRESS_RATIO, RATIO128_OUT_DIM], torch.float32, init_value=init_ape),
-        TensorSpec("norm_w", [RATIO128_HEAD_DIM], torch.bfloat16, init_value=init_norm_w),
-        TensorSpec("cos", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
-        TensorSpec("sin", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
-        TensorSpec(
-            "cmp_kv_cache",
-            [CMP_BLOCK_NUM, RATIO128_CMP_STORAGE_BLOCK_SIZE, 1, RATIO128_HEAD_DIM],
-            torch.bfloat16,
-            init_value=init_cmp_kv_cache,
-        ),
-        TensorSpec("position_ids", [B, S], torch.int32, init_value=init_position_ids),
-        TensorSpec("cmp_slot_mapping", [B, S], torch.int64, init_value=init_cmp_slot_mapping),
-        TensorSpec("state_slot_mapping", [B, S], torch.int64, init_value=init_state_slot_mapping),
-    ]
-
-
-def build_boundary_missing_slot_specs(start_pos=None):
-    """Exercise a boundary token that participates in pooling but is not persisted."""
-    import torch
-
-    if start_pos is None:
-        start_pos = RATIO128_COMPRESS_RATIO - S // 2
-    specs = build_tensor_specs_ratio128(start_pos)
-    by_name = {spec.name: spec for spec in specs}
-    positions = by_name["position_ids"].init_value()
-    boundary = (positions + 1).remainder(RATIO128_COMPRESS_RATIO) == 0
-    mapping = by_name["state_slot_mapping"].init_value()
-    cmp_mapping = by_name["cmp_slot_mapping"].init_value()
-    if not bool(boundary.any()) or not bool((mapping[boundary] >= 0).all()) or not bool(
-        (cmp_mapping[boundary] >= 0).all()
-    ):
-        raise ValueError("Fixture requires a mapped compression boundary before masking its state slot")
-    mapping[boundary] = -1
-    by_name["state_slot_mapping"].init_value = mapping
-    state = torch.zeros(by_name["compress_state"].shape, dtype=torch.float32)
-    # Keep historical scores finite but negligible so the missing current row
-    # has a visible effect while the normal state comparator remains active.
-    state[..., RATIO128_OUT_DIM:] = -1e4
-    by_name["compress_state"].init_value = state
-    return specs
 
 
 if __package__:
@@ -1669,6 +1075,601 @@ def compressor_test_indexer(
         late_dep,
     )
     return kv, compress_state, idx_kv_cache, idx_kv_scale
+
+
+def golden_compressor_ratio4(tensors):
+    """Torch reference for Compressor.forward (decode branch, ratio=4 overlap)."""
+    import torch
+
+    if __package__:
+        from .utils import bf16_matmul_fp32
+    else:
+        from utils import bf16_matmul_fp32
+
+    # Unmapped boundaries and non-boundary rows are outside the output write set.
+    tensors["kv"].fill_(float("nan"))
+
+    x = tensors["x"].float()
+    compress_state = tensors["compress_state"]
+    compress_state_block_table = tensors["compress_state_block_table"]
+    wkv = tensors["wkv"].float()
+    wgate = tensors["wgate"].float()
+    ape = tensors["ape"]
+    norm_w = tensors["norm_w"]
+    cos = tensors["cos"]
+    sin = tensors["sin"]
+    cmp_kv_cache = tensors["cmp_kv_cache"]
+    position_ids = tensors["position_ids"].to(torch.int64)
+    cmp_slot_mapping = tensors["cmp_slot_mapping"].to(torch.int64)
+    state_slot_mapping = tensors["state_slot_mapping"].to(torch.int64)
+    bsz, _, _ = x.shape
+    ratio, rd = RATIO4_COMPRESS_RATIO, ROPE_HEAD_DIM
+
+    kv = bf16_matmul_fp32(x, wkv.t())  # [B, S, OUT_DIM]  (wkv stored [OUT_DIM, D] for b_trans)
+    score = bf16_matmul_fp32(x, wgate.t())  # [B, S, OUT_DIM]
+
+    # Each boundary stays at its input token index, as in the device output.
+    pooled = torch.zeros(bsz, S, RATIO4_HEAD_DIM, dtype=torch.float32, device=x.device)
+    visible_boundaries = []
+    score = score + ape[position_ids % ratio]
+
+    def read_pool_row(b, abs_pos, half):
+        if abs_pos < 0:
+            return (
+                torch.zeros(RATIO4_HEAD_DIM, dtype=torch.float32, device=x.device),
+                torch.full((RATIO4_HEAD_DIM,), float("-inf"), dtype=torch.float32, device=x.device),
+            )
+        first_pos = int(position_ids[b, 0].item())
+        channel = half * RATIO4_HEAD_DIM
+        if abs_pos >= first_pos:
+            token = abs_pos - first_pos
+            return kv[b, token, channel : channel + RATIO4_HEAD_DIM], score[b, token, channel : channel + RATIO4_HEAD_DIM]
+        blk_id = int(compress_state_block_table[b, abs_pos // RATIO4_COMPRESS_STATE_BLOCK_SIZE].item())
+        if blk_id < 0:
+            return (
+                torch.zeros(RATIO4_HEAD_DIM, dtype=torch.float32, device=x.device),
+                torch.full((RATIO4_HEAD_DIM,), float("-inf"), dtype=torch.float32, device=x.device),
+            )
+        intra = abs_pos % RATIO4_COMPRESS_STATE_BLOCK_SIZE
+        return (
+            compress_state[blk_id, intra, channel : channel + RATIO4_HEAD_DIM],
+            compress_state[blk_id, intra, RATIO4_OUT_DIM + channel : RATIO4_OUT_DIM + channel + RATIO4_HEAD_DIM],
+        )
+
+    # Read every prefix window before a commit can overwrite rolling physical state.
+    for b in range(bsz):
+        first_pos = int(position_ids[b, 0].item())
+        first_boundary_s = ratio - 1 - first_pos % ratio
+        for boundary_s in range(first_boundary_s, S, ratio):
+            if int(cmp_slot_mapping[b, boundary_s].item()) < 0:
+                continue
+            boundary_end = int(position_ids[b, boundary_s].item())
+            current_start = boundary_end - ratio + 1
+            rows = [read_pool_row(b, pos, 0) for pos in range(current_start - ratio, current_start)]
+            rows += [read_pool_row(b, pos, 1) for pos in range(current_start, boundary_end + 1)]
+            kvs = torch.stack([row[0] for row in rows])
+            scs = torch.stack([row[1] for row in rows])
+            pooled[b, boundary_s] = (kvs * scs.softmax(dim=0)).sum(dim=0)
+            visible_boundaries.append((b, boundary_s))
+
+    for b in range(bsz):
+        for token in range(S):
+            state_row = int(state_slot_mapping[b, token].item())
+            if state_row >= 0:
+                blk_id = state_row // RATIO4_COMPRESS_STATE_BLOCK_SIZE
+                intra = state_row % RATIO4_COMPRESS_STATE_BLOCK_SIZE
+                compress_state[blk_id, intra, :RATIO4_OUT_DIM] = kv[b, token]
+                compress_state[blk_id, intra, RATIO4_OUT_DIM:] = score[b, token]
+
+    tensors["compress_state"][:] = compress_state
+
+    def rmsnorm(x, w):
+        x = x.float()
+        var = x.square().mean(-1, keepdim=True)
+        x = x * torch.rsqrt(var + EPS)
+        return w * x
+
+    for b, boundary_s in visible_boundaries:
+        kv_b = rmsnorm(pooled[b : b + 1, boundary_s : boundary_s + 1], norm_w)
+
+        x_pair = kv_b[..., -rd:].unflatten(-1, (-1, 2))
+        x0, x1 = x_pair[..., 0], x_pair[..., 1]
+        cos_v, sin_v = cos[b * S + boundary_s].view(-1), sin[b * S + boundary_s].view(-1)
+        y0 = x0 * cos_v - x1 * sin_v
+        y1 = x0 * sin_v + x1 * cos_v
+
+        kv_b = torch.cat([kv_b[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
+
+        cmp_row = int(cmp_slot_mapping[b, boundary_s].item())
+        if cmp_row >= 0:
+            tensors["kv"][b : b + 1, boundary_s : boundary_s + 1, :] = kv_b
+            blk_id = cmp_row // RATIO4_CMP_STORAGE_BLOCK_SIZE
+            cmp_kv_cache[blk_id, cmp_row % RATIO4_CMP_STORAGE_BLOCK_SIZE, 0] = kv_b[0, 0]
+
+    tensors["cmp_kv_cache"][:] = cmp_kv_cache
+
+
+def build_tensor_specs_ratio4(start_pos=None):
+    import torch  # type: ignore[import]
+
+    if __package__:
+        from .utils import (
+            block_table,
+            compressed_slot_mapping,
+            csa_decode_start_set,
+            position_ids_from_starts,
+            resolve_start_positions,
+            state_slot_mapping,
+        )
+    else:
+        from utils import (
+            block_table,
+            compressed_slot_mapping,
+            csa_decode_start_set,
+            position_ids_from_starts,
+            resolve_start_positions,
+            state_slot_mapping,
+        )
+    from golden import TensorSpec
+
+    if __package__:
+        from .utils import build_rope_tables, materialize_half_rope_tables
+    else:
+        from utils import build_rope_tables, materialize_half_rope_tables
+
+    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, RATIO4_COMPRESS_RATIO, dtype=torch.bfloat16)
+
+    def init_x():
+        return torch.rand(B, S, D)
+
+    def init_compress_state():
+        state = torch.zeros(RATIO4_COMPRESS_STATE_BLOCK_NUM, RATIO4_COMPRESS_STATE_BLOCK_SIZE, RATIO4_COMPRESS_STATE_DIM)
+        state[:, :, RATIO4_OUT_DIM:] = FP32_NEG_INF
+        return state
+
+    def init_compress_state_block_table():
+        return block_table(
+            batch=B,
+            table_blocks=RATIO4_COMPRESS_STATE_MAX_BLOCKS,
+            physical_blocks=RATIO4_COMPRESS_STATE_PHYSICAL_BLOCKS,
+        )
+
+    # Calibrated to the real DeepSeek-V4-Flash CSA (ratio-4) main compressor (mean l8/l32 of
+    # extract_weights_flash): zero-mean Gaussian BF16 weights at the measured std; the RMSNorm
+    # gamma centers near the measured mean (not ones / not uniform).
+    def init_wkv():
+        return torch.randn(RATIO4_OUT_DIM, D) * 0.0245
+
+    def init_wgate():
+        return torch.randn(RATIO4_OUT_DIM, D) * 0.0388
+
+    def init_ape():
+        return torch.randn(RATIO4_COMPRESS_RATIO, RATIO4_OUT_DIM) * 0.1243
+
+    def init_norm_w():
+        return 0.9666 + 0.1929 * torch.randn(RATIO4_HEAD_DIM)
+
+    def init_rope_positions():
+        positions = init_position_ids().to(torch.int64)
+        boundaries = (positions + 1) % RATIO4_COMPRESS_RATIO == 0
+        return torch.where(boundaries, positions - RATIO4_COMPRESS_RATIO + 1, 0).reshape(-1)
+
+    def init_cos():
+        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_rope_positions())[0]
+
+    def init_sin():
+        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_rope_positions())[1]
+
+    def init_cmp_kv_cache():
+        return torch.zeros(CMP_BLOCK_NUM, RATIO4_CMP_STORAGE_BLOCK_SIZE, 1, RATIO4_HEAD_DIM)
+
+    def init_cmp_block_table():
+        return block_table(
+            batch=B,
+            table_blocks=CMP_MAX_BLOCKS,
+            physical_blocks=CMP_BLOCK_NUM,
+        )
+
+    def init_default_start_pos():
+        # Canonical CSA start-position set (ratio-4 compressor + indexer + sliding-window + 8k).
+        return csa_decode_start_set(
+            batch=B, seq=S, compress_ratio=RATIO4_COMPRESS_RATIO, state_block_size=RATIO4_COMPRESS_STATE_BLOCK_SIZE
+        )
+
+    def init_start_pos():
+        return resolve_start_positions(
+            start_pos,
+            batch=B,
+            seq=S,
+            max_seq_len=MAX_SEQ_LEN,
+            default_fn=init_default_start_pos,
+        )
+
+    def init_position_ids():
+        return position_ids_from_starts(init_start_pos(), seq=S)
+
+    def init_state_slot_mapping():
+        return state_slot_mapping(
+            init_position_ids(),
+            init_compress_state_block_table(),
+            state_block_size=RATIO4_COMPRESS_STATE_BLOCK_SIZE,
+        )
+
+    def init_cmp_slot_mapping():
+        positions = init_position_ids()
+        return compressed_slot_mapping(
+            positions,
+            init_cmp_block_table(),
+            compress_ratio=RATIO4_COMPRESS_RATIO,
+            block_size=RATIO4_CMP_STORAGE_BLOCK_SIZE,
+        )
+
+    return [
+        TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),
+        TensorSpec("kv", [B, S, RATIO4_HEAD_DIM], torch.float32),
+        TensorSpec(
+            "compress_state",
+            [RATIO4_COMPRESS_STATE_BLOCK_NUM, RATIO4_COMPRESS_STATE_BLOCK_SIZE, RATIO4_COMPRESS_STATE_DIM],
+            torch.float32,
+            init_value=init_compress_state,
+        ),
+        TensorSpec(
+            "compress_state_block_table",
+            [B, RATIO4_COMPRESS_STATE_MAX_BLOCKS],
+            torch.int32,
+            init_value=init_compress_state_block_table,
+        ),
+        TensorSpec("wkv", [RATIO4_OUT_DIM, D], torch.bfloat16, init_value=init_wkv),
+        TensorSpec("wgate", [RATIO4_OUT_DIM, D], torch.bfloat16, init_value=init_wgate),
+        TensorSpec("ape", [RATIO4_COMPRESS_RATIO, RATIO4_OUT_DIM], torch.float32, init_value=init_ape),
+        TensorSpec("norm_w", [RATIO4_HEAD_DIM], torch.bfloat16, init_value=init_norm_w),
+        TensorSpec("cos", [B * S, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
+        TensorSpec("sin", [B * S, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
+        TensorSpec(
+            "cmp_kv_cache",
+            [CMP_BLOCK_NUM, RATIO4_CMP_STORAGE_BLOCK_SIZE, 1, RATIO4_HEAD_DIM],
+            torch.bfloat16,
+            init_value=init_cmp_kv_cache,
+        ),
+        TensorSpec("position_ids", [B, S], torch.int32, init_value=init_position_ids),
+        TensorSpec("cmp_slot_mapping", [B, S], torch.int64, init_value=init_cmp_slot_mapping),
+        TensorSpec("state_slot_mapping", [B, S], torch.int64, init_value=init_state_slot_mapping),
+    ]
+
+
+def golden_compressor_ratio128(tensors):
+    """Torch reference for Compressor.forward (decode branch, ratio=128 non-overlap).
+
+    Operates on paged caches: compress_state (kv + score channels merged) and cmp_kv_cache,
+    each addressed via the corresponding block_table.
+    """
+    import torch
+
+    if __package__:
+        from .utils import bf16_matmul_fp32
+    else:
+        from utils import bf16_matmul_fp32
+
+    # Rows this golden never writes stay NaN: ignored by the kv comparator.
+    tensors["kv"].fill_(float("nan"))
+
+    x = tensors["x"].float()
+    compress_state_block_table = tensors["compress_state_block_table"]
+    position_ids = tensors["position_ids"].to(torch.int64)
+    cmp_slot_mapping = tensors["cmp_slot_mapping"].to(torch.int64)
+    state_slot_mapping = tensors["state_slot_mapping"].to(torch.int64)
+    # Historical state reads still use absolute-position block-table addressing.
+    # Persistent writes use token-major slot mappings. APE remains modulo ratio.
+    compress_state = tensors["compress_state"]
+
+    def read_state_row(b, pos):
+        first_pos = int(position_ids[b, 0].item())
+        if first_pos <= pos < first_pos + S:
+            token = pos - first_pos
+            return kv[b, token], score[b, token]
+        logical_blk = pos // RATIO128_COMPRESS_STATE_BLOCK_SIZE
+        intra = pos % RATIO128_COMPRESS_STATE_BLOCK_SIZE
+        sblk = int(compress_state_block_table[b, logical_blk].item())
+        if sblk < 0:
+            return (
+                torch.zeros(RATIO128_OUT_DIM, dtype=torch.float32, device=compress_state.device),
+                torch.full((RATIO128_OUT_DIM,), float("-inf"), dtype=torch.float32, device=compress_state.device),
+            )
+        return (
+            compress_state[sblk, intra, :RATIO128_OUT_DIM],
+            compress_state[sblk, intra, RATIO128_OUT_DIM : 2 * RATIO128_OUT_DIM],
+        )
+
+    def write_state_row(slot, kv_row, score_row):
+        if slot < 0:
+            return
+        sblk = slot // RATIO128_COMPRESS_STATE_BLOCK_SIZE
+        intra = slot % RATIO128_COMPRESS_STATE_BLOCK_SIZE
+        compress_state[sblk, intra, :RATIO128_OUT_DIM] = kv_row
+        compress_state[sblk, intra, RATIO128_OUT_DIM : 2 * RATIO128_OUT_DIM] = score_row
+
+    wkv = tensors["wkv"].float()
+    wgate = tensors["wgate"].float()
+    ape = tensors["ape"]
+    norm_w = tensors["norm_w"]
+    cos = tensors["cos"]
+    sin = tensors["sin"]
+    cmp_kv_cache = tensors["cmp_kv_cache"]
+    bsz, _, _ = x.shape
+    ratio, rd = RATIO128_COMPRESS_RATIO, ROPE_HEAD_DIM
+
+    kv = bf16_matmul_fp32(x, wkv.t())  # [B, S, OUT_DIM]  (wkv stored [OUT_DIM, D] for b_trans)
+    score = bf16_matmul_fp32(x, wgate.t())  # [B, S, OUT_DIM]
+    pooled = torch.zeros(bsz, 1, RATIO128_HEAD_DIM, dtype=torch.float32, device=x.device)
+    should_compress_rows = torch.zeros(bsz, dtype=torch.bool, device=x.device)
+
+    for b in range(bsz):
+        boundary_s = None
+        for s in range(S):
+            pos = int(position_ids[b, s].item())
+            token_ape_row = pos % ratio
+            score[b, s, :] = score[b, s, :] + ape[token_ape_row]
+            if (pos + 1) % ratio == 0:
+                boundary_s = s
+
+        if boundary_s is not None:
+            should_compress_rows[b] = True
+            compress_pos = int(position_ids[b, boundary_s].item())
+            kv_rows = []
+            score_rows = []
+            for pos in range(compress_pos - ratio + 1, compress_pos + 1):
+                kv_row, score_row = read_state_row(b, pos)
+                kv_rows.append(kv_row)
+                score_rows.append(score_row)
+            kv_state = torch.stack(kv_rows, dim=0).unsqueeze(0)
+            score_state = torch.stack(score_rows, dim=0).unsqueeze(0)
+            pooled[b : b + 1] = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
+        for token in range(S):
+            write_state_row(int(state_slot_mapping[b, token].item()), kv[b, token], score[b, token])
+
+    tensors["compress_state"][:] = compress_state
+
+    if not bool(should_compress_rows.any()):
+        return
+
+    def rmsnorm(x, w):
+        x = x.float()
+        var = x.square().mean(-1, keepdim=True)
+        x = x * torch.rsqrt(var + EPS)
+        return w * x
+
+    for b in range(bsz):
+        if not bool(should_compress_rows[b]):
+            continue
+        kv_b = rmsnorm(pooled[b : b + 1], norm_w)
+
+        x_pair = kv_b[..., -rd:].unflatten(-1, (-1, 2))
+        x0, x1 = x_pair[..., 0], x_pair[..., 1]
+        cos_v, sin_v = cos[b].view(-1), sin[b].view(-1)
+        y0 = x0 * cos_v - x1 * sin_v
+        y1 = x0 * sin_v + x1 * cos_v
+
+        kv_b = torch.cat([kv_b[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
+
+        boundary_positions = torch.nonzero((position_ids[b, :S] + 1) % ratio == 0, as_tuple=False).flatten()
+        if int(boundary_positions.numel()) == 0:
+            continue
+        boundary_s = int(boundary_positions[0].item())
+        cmp_row = int(cmp_slot_mapping[b, boundary_s].item())
+        if cmp_row >= 0:
+            # Kernel writes committed pooled result only to kv[:, 0, :]; leave
+            # speculative-boundary rows and kv[:, 1:, :] NaN (ignored).
+            tensors["kv"][b : b + 1, 0:1, :] = kv_b
+            cblk = cmp_row // RATIO128_CMP_STORAGE_BLOCK_SIZE
+            intra_offset = cmp_row % RATIO128_CMP_STORAGE_BLOCK_SIZE
+            cmp_kv_cache[cblk, intra_offset, 0] = kv_b[0, 0]
+
+    tensors["cmp_kv_cache"][:] = cmp_kv_cache
+
+
+def compare_compressor_kv(actual, expected, *, inputs, **kwargs):
+    """Leave pure-Out rows unconstrained only for an input-proved empty write set."""
+    import torch
+    from golden import ratio_allclose
+
+    if actual.shape != expected.shape:
+        return False, "Compressor KV output shapes differ"
+    positions = inputs.get("position_ids")
+    mapping = inputs.get("cmp_slot_mapping")
+    if positions is None or mapping is None or tuple(positions.shape) != (B, S):
+        return False, "Missing or incompatible compressor position/mapping inputs"
+    if positions.shape != mapping.shape:
+        return False, "Compressor position and slot-mapping shapes differ"
+    boundaries = (positions.cpu().to(torch.int64) + 1).remainder(RATIO128_COMPRESS_RATIO) == 0
+    writes = boundaries & (mapping.cpu() >= 0)
+    if not bool(writes.any()):
+        if not bool(torch.isnan(expected).all()):
+            return False, "Empty compressor write set must leave the pure-Out golden undefined"
+        return True, ""
+    return ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0, ignore_nan=True)(
+        actual, expected, inputs=inputs, **kwargs,
+    )
+
+
+def build_tensor_specs_ratio128(start_pos=None):
+    import torch  # type: ignore[import]
+
+    if __package__:
+        from .utils import (
+            block_table,
+            compressed_slot_mapping,
+            hca_decode_start_set,
+            position_ids_from_starts,
+            resolve_start_positions,
+            state_slot_mapping,
+        )
+    else:
+        from utils import (
+            block_table,
+            compressed_slot_mapping,
+            hca_decode_start_set,
+            position_ids_from_starts,
+            resolve_start_positions,
+            state_slot_mapping,
+        )
+    from golden import TensorSpec
+
+    if __package__:
+        from .utils import build_rope_tables, materialize_half_rope_tables
+    else:
+        from utils import build_rope_tables, materialize_half_rope_tables
+
+    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, RATIO128_COMPRESS_RATIO, dtype=torch.bfloat16)
+
+    def init_x():
+        return torch.rand(B, S, D)
+
+    def init_compress_state():
+        return torch.zeros(RATIO128_COMPRESS_STATE_BLOCK_NUM, RATIO128_COMPRESS_STATE_BLOCK_SIZE, RATIO128_COMPRESS_STATE_DIM)
+
+    # Calibrated to the real DeepSeek-V4-Flash 150
+    #  (ratio-128) main compressor (mean l7/l9 of
+    # extract_weights_flash): zero-mean Gaussian BF16 weights at the measured std; the RMSNorm
+    # gamma centers near the measured mean (not ones / not uniform).
+    def init_wkv():
+        return torch.randn(RATIO128_OUT_DIM, D) * 0.0246
+
+    def init_wgate():
+        return torch.randn(RATIO128_OUT_DIM, D) * 0.0316
+
+    def init_ape():
+        return torch.randn(RATIO128_COMPRESS_RATIO, RATIO128_OUT_DIM) * 0.0340
+
+    def init_norm_w():
+        return 0.1001 + 0.0549 * torch.randn(RATIO128_HEAD_DIM)
+
+    def init_rope_positions():
+        first_pos = init_position_ids().to(torch.int64)[:, 0]
+        cmp_offset = RATIO128_COMPRESS_RATIO - (first_pos % RATIO128_COMPRESS_RATIO)
+        return (first_pos + cmp_offset - RATIO128_COMPRESS_RATIO).to(torch.int64)
+
+    def init_cos():
+        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_rope_positions())[0]
+
+    def init_sin():
+        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_rope_positions())[1]
+
+    def init_cmp_kv_cache():
+        return torch.zeros(CMP_BLOCK_NUM, RATIO128_CMP_STORAGE_BLOCK_SIZE, 1, RATIO128_HEAD_DIM)
+
+    def init_compress_state_block_table():
+        return block_table(
+            batch=B,
+            table_blocks=RATIO128_COMPRESS_STATE_MAX_BLOCKS,
+            physical_blocks=RATIO128_COMPRESS_STATE_PHYSICAL_BLOCKS,
+            permuted=True,
+        )
+
+    def init_cmp_block_table():
+        return block_table(
+            batch=B,
+            table_blocks=CMP_MAX_BLOCKS,
+            physical_blocks=CMP_BLOCK_NUM,
+            permuted=True,
+        )
+
+    def init_default_start_pos():
+        # Canonical HCA start-position set (ratio-128 compressor branches + 8k long-context).
+        # At B=1 only the 8k point survives, and [8192, 8192 + S) holds no compress
+        # boundary, so the entry would write nothing it validates. Pull the 8k point
+        # back half a step so its S tokens straddle the 8192 boundary.
+        return hca_decode_start_set(
+            batch=B,
+            compress_ratio=RATIO128_COMPRESS_RATIO,
+            state_block_size=RATIO128_COMPRESS_STATE_BLOCK_SIZE,
+            long_pos=DECODE_START_POS - max(1, S // 2),
+        )
+
+    def init_start_pos():
+        return resolve_start_positions(
+            start_pos,
+            batch=B,
+            seq=S,
+            max_seq_len=MAX_SEQ_LEN,
+            default_fn=init_default_start_pos,
+        )
+
+    def init_position_ids():
+        return position_ids_from_starts(init_start_pos(), seq=S)
+
+    def init_state_slot_mapping():
+        return state_slot_mapping(
+            init_position_ids(),
+            init_compress_state_block_table(),
+            state_block_size=RATIO128_COMPRESS_STATE_BLOCK_SIZE,
+        )
+
+    def init_cmp_slot_mapping():
+        positions = init_position_ids()
+        return compressed_slot_mapping(
+            positions,
+            init_cmp_block_table(),
+            compress_ratio=RATIO128_COMPRESS_RATIO,
+            block_size=RATIO128_CMP_STORAGE_BLOCK_SIZE,
+        )
+
+    return [
+        TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),
+        TensorSpec("kv", [B, S, RATIO128_HEAD_DIM], torch.float32),
+        TensorSpec(
+            "compress_state",
+            [RATIO128_COMPRESS_STATE_BLOCK_NUM, RATIO128_COMPRESS_STATE_BLOCK_SIZE, RATIO128_COMPRESS_STATE_DIM],
+            torch.float32,
+            init_value=init_compress_state,
+        ),
+        TensorSpec(
+            "compress_state_block_table",
+            [B, RATIO128_COMPRESS_STATE_MAX_BLOCKS],
+            torch.int32,
+            init_value=init_compress_state_block_table,
+        ),
+        TensorSpec("wkv", [RATIO128_OUT_DIM, D], torch.bfloat16, init_value=init_wkv),
+        TensorSpec("wgate", [RATIO128_OUT_DIM, D], torch.bfloat16, init_value=init_wgate),
+        TensorSpec("ape", [RATIO128_COMPRESS_RATIO, RATIO128_OUT_DIM], torch.float32, init_value=init_ape),
+        TensorSpec("norm_w", [RATIO128_HEAD_DIM], torch.bfloat16, init_value=init_norm_w),
+        TensorSpec("cos", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
+        TensorSpec("sin", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
+        TensorSpec(
+            "cmp_kv_cache",
+            [CMP_BLOCK_NUM, RATIO128_CMP_STORAGE_BLOCK_SIZE, 1, RATIO128_HEAD_DIM],
+            torch.bfloat16,
+            init_value=init_cmp_kv_cache,
+        ),
+        TensorSpec("position_ids", [B, S], torch.int32, init_value=init_position_ids),
+        TensorSpec("cmp_slot_mapping", [B, S], torch.int64, init_value=init_cmp_slot_mapping),
+        TensorSpec("state_slot_mapping", [B, S], torch.int64, init_value=init_state_slot_mapping),
+    ]
+
+
+def build_boundary_missing_slot_specs(start_pos=None):
+    """Exercise a boundary token that participates in pooling but is not persisted."""
+    import torch
+
+    if start_pos is None:
+        start_pos = RATIO128_COMPRESS_RATIO - S // 2
+    specs = build_tensor_specs_ratio128(start_pos)
+    by_name = {spec.name: spec for spec in specs}
+    positions = by_name["position_ids"].init_value()
+    boundary = (positions + 1).remainder(RATIO128_COMPRESS_RATIO) == 0
+    mapping = by_name["state_slot_mapping"].init_value()
+    cmp_mapping = by_name["cmp_slot_mapping"].init_value()
+    if not bool(boundary.any()) or not bool((mapping[boundary] >= 0).all()) or not bool(
+        (cmp_mapping[boundary] >= 0).all()
+    ):
+        raise ValueError("Fixture requires a mapped compression boundary before masking its state slot")
+    mapping[boundary] = -1
+    by_name["state_slot_mapping"].init_value = mapping
+    state = torch.zeros(by_name["compress_state"].shape, dtype=torch.float32)
+    # Keep historical scores finite but negligible so the missing current row
+    # has a visible effect while the normal state comparator remains active.
+    state[..., RATIO128_OUT_DIM:] = -1e4
+    by_name["compress_state"].init_value = state
+    return specs
 
 
 def golden_compressor_indexer(tensors):

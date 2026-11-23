@@ -249,74 +249,7 @@ hc_head = pl.jit.inline(_hc_head)
 hc_head_test = pl.jit(_hc_head)
 
 
-def golden_hc_head(tensors):
-    import torch
-
-    x = tensors["x_hc"]
-    shape = x.shape
-    token_count = x.shape[0]
-    x_flat_2d = x.reshape(token_count, HC_DIM).float()
-    hc_head_fn = tensors["hc_head_fn"].float()
-
-    sq_sum = torch.zeros(token_count, 1, dtype=torch.float32)
-    for k0 in range(0, HC_DIM, RMS_K_TILE):
-        x_chunk = x_flat_2d[:, k0 : k0 + RMS_K_TILE]
-        sq_sum += (x_chunk * x_chunk).sum(dim=1, keepdim=True)
-    rsqrt = torch.rsqrt(sq_sum * HC_DIM_INV + EPS)
-
-    mix_cols = []
-    for h in range(HC_MULT):
-        mix_col = torch.zeros(token_count, 1, dtype=torch.float32)
-        for k0 in range(0, HC_DIM, LINEAR_K_TILE):
-            x_chunk = x_flat_2d[:, k0 : k0 + LINEAR_K_TILE]
-            w_chunk = hc_head_fn[h : h + 1, k0 : k0 + LINEAR_K_TILE]
-            mix_col += (x_chunk * w_chunk).sum(dim=1, keepdim=True)
-        mix_cols.append(mix_col * rsqrt)
-    mixes = torch.cat(mix_cols, dim=1).reshape(token_count, HC_MULT)
-
-    pre = torch.sigmoid(mixes * tensors["hc_head_scale"].float() + tensors["hc_head_base"].float()) + HC_EPS
-    x_view = x.float().view(shape)
-    if HC_MULT == 4:
-        y = (x_view[:, 0, :] * pre[:, 0:1] + x_view[:, 1, :] * pre[:, 1:2]) + (
-            x_view[:, 2, :] * pre[:, 2:3] + x_view[:, 3, :] * pre[:, 3:4]
-        )
-    else:
-        y = torch.zeros(token_count, D, dtype=torch.float32)
-        for h in range(HC_MULT):
-            y += x_view[:, h, :] * pre[:, h : h + 1]
-
-    # Match the kernel's mode="rint" cast (round to nearest, ties to even).
-    tensors["y"][:] = y.to(torch.bfloat16)
-
-
 HC_VALIDATION_MAX_ROWS = 8192
-
-
-def build_tensor_specs_hc(token_count: int = T):
-    import torch
-    from golden import TensorSpec
-
-    if not 1 <= token_count <= HC_VALIDATION_MAX_ROWS:
-        raise ValueError(f"token_count must be in [1, {HC_VALIDATION_MAX_ROWS}], got {token_count}")
-
-    def init_x_hc():
-        return torch.randn(token_count, HC_MULT, D) * 0.05
-
-    def init_hc_head_fn():
-        return torch.randn(HC_MULT, HC_DIM) * 0.0519
-
-    return [
-        TensorSpec("x_hc", [token_count, HC_MULT, D], torch.float32, init_value=init_x_hc),
-        TensorSpec("hc_head_fn", [HC_MULT, HC_DIM], torch.float32, init_value=init_hc_head_fn),
-        TensorSpec("hc_head_scale", [1], torch.float32, init_value=lambda: torch.tensor([0.076099])),
-        TensorSpec(
-            "hc_head_base",
-            [HC_MULT],
-            torch.float32,
-            init_value=lambda: torch.tensor([5.9166, -3.6223, -2.9324, -3.3124]),
-        ),
-        TensorSpec("y", [token_count, D], torch.bfloat16),
-    ]
 
 
 # ci: devices=2
@@ -984,6 +917,99 @@ def l3_prefill_head(
     return x_out
 
 
+@pl.jit.host
+def l3_lm_head(
+    hidden_states: pl.Tensor[[WORLD_SIZE, TEST_TOKENS, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[WORLD_SIZE, VOCAB_PER_TP, D], pl.BF16],
+    logits: pl.Out[pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
+    logit_row_indices: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS], pl.INT32],
+):
+    # Windows are group-local: hidden_window holds one row slot per group member,
+    # and every card receives only its own full-vocabulary logits.
+    hidden_window_buf = pld.alloc_window_buffer(GROUP_LOGIT_ROWS * D * 2)
+    logits_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * VOCAB * 4)
+    hidden_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
+    logits_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
+
+    for r in pl.range(pld.world_size()):
+        hidden_window = pld.window(hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
+        hidden_done = pld.window(hidden_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
+        logits_window = pld.window(logits_window_buf, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
+        logits_done = pld.window(logits_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
+        l2_lm_head(
+            hidden_states[r], lm_head_weight[r], logit_row_indices[r], logits[r],
+            hidden_window, hidden_done, logits_window, logits_done,
+            r // TP_SIZE * TP_SIZE, r % TP_SIZE, DONE_VALUE, device=r,
+        )
+
+
+def golden_hc_head(tensors):
+    import torch
+
+    x = tensors["x_hc"]
+    shape = x.shape
+    token_count = x.shape[0]
+    x_flat_2d = x.reshape(token_count, HC_DIM).float()
+    hc_head_fn = tensors["hc_head_fn"].float()
+
+    sq_sum = torch.zeros(token_count, 1, dtype=torch.float32)
+    for k0 in range(0, HC_DIM, RMS_K_TILE):
+        x_chunk = x_flat_2d[:, k0 : k0 + RMS_K_TILE]
+        sq_sum += (x_chunk * x_chunk).sum(dim=1, keepdim=True)
+    rsqrt = torch.rsqrt(sq_sum * HC_DIM_INV + EPS)
+
+    mix_cols = []
+    for h in range(HC_MULT):
+        mix_col = torch.zeros(token_count, 1, dtype=torch.float32)
+        for k0 in range(0, HC_DIM, LINEAR_K_TILE):
+            x_chunk = x_flat_2d[:, k0 : k0 + LINEAR_K_TILE]
+            w_chunk = hc_head_fn[h : h + 1, k0 : k0 + LINEAR_K_TILE]
+            mix_col += (x_chunk * w_chunk).sum(dim=1, keepdim=True)
+        mix_cols.append(mix_col * rsqrt)
+    mixes = torch.cat(mix_cols, dim=1).reshape(token_count, HC_MULT)
+
+    pre = torch.sigmoid(mixes * tensors["hc_head_scale"].float() + tensors["hc_head_base"].float()) + HC_EPS
+    x_view = x.float().view(shape)
+    if HC_MULT == 4:
+        y = (x_view[:, 0, :] * pre[:, 0:1] + x_view[:, 1, :] * pre[:, 1:2]) + (
+            x_view[:, 2, :] * pre[:, 2:3] + x_view[:, 3, :] * pre[:, 3:4]
+        )
+    else:
+        y = torch.zeros(token_count, D, dtype=torch.float32)
+        for h in range(HC_MULT):
+            y += x_view[:, h, :] * pre[:, h : h + 1]
+
+    # Match the kernel's mode="rint" cast (round to nearest, ties to even).
+    tensors["y"][:] = y.to(torch.bfloat16)
+
+
+def build_tensor_specs_hc(token_count: int = T):
+    import torch
+    from golden import TensorSpec
+
+    if not 1 <= token_count <= HC_VALIDATION_MAX_ROWS:
+        raise ValueError(f"token_count must be in [1, {HC_VALIDATION_MAX_ROWS}], got {token_count}")
+
+    def init_x_hc():
+        return torch.randn(token_count, HC_MULT, D) * 0.05
+
+    def init_hc_head_fn():
+        return torch.randn(HC_MULT, HC_DIM) * 0.0519
+
+    return [
+        TensorSpec("x_hc", [token_count, HC_MULT, D], torch.float32, init_value=init_x_hc),
+        TensorSpec("hc_head_fn", [HC_MULT, HC_DIM], torch.float32, init_value=init_hc_head_fn),
+        TensorSpec("hc_head_scale", [1], torch.float32, init_value=lambda: torch.tensor([0.076099])),
+        TensorSpec(
+            "hc_head_base",
+            [HC_MULT],
+            torch.float32,
+            init_value=lambda: torch.tensor([5.9166, -3.6223, -2.9324, -3.3124]),
+        ),
+        TensorSpec("y", [token_count, D], torch.bfloat16),
+    ]
+
+
 def golden_lm_head_sample(tensors):
     import torch
 
@@ -1014,32 +1040,6 @@ def expected_sampled_id(logits, grammar_mask):
     words = grammar_mask[segment, offset // 16].to(torch.int32)
     allowed = (words & (1 << (offset % 16))) != 0
     return int(torch.argmax(logits + (~allowed).to(logits.dtype) * -1.0e30))
-
-
-@pl.jit.host
-def l3_lm_head(
-    hidden_states: pl.Tensor[[WORLD_SIZE, TEST_TOKENS, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[WORLD_SIZE, VOCAB_PER_TP, D], pl.BF16],
-    logits: pl.Out[pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
-    logit_row_indices: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS], pl.INT32],
-):
-    # Windows are group-local: hidden_window holds one row slot per group member,
-    # and every card receives only its own full-vocabulary logits.
-    hidden_window_buf = pld.alloc_window_buffer(GROUP_LOGIT_ROWS * D * 2)
-    logits_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * VOCAB * 4)
-    hidden_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
-    logits_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
-
-    for r in pl.range(pld.world_size()):
-        hidden_window = pld.window(hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-        hidden_done = pld.window(hidden_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        logits_window = pld.window(logits_window_buf, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
-        logits_done = pld.window(logits_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        l2_lm_head(
-            hidden_states[r], lm_head_weight[r], logit_row_indices[r], logits[r],
-            hidden_window, hidden_done, logits_window, logits_done,
-            r // TP_SIZE * TP_SIZE, r % TP_SIZE, DONE_VALUE, device=r,
-        )
 
 
 def golden_lm_head(tensors):

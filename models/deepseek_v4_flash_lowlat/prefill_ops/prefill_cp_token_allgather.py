@@ -87,36 +87,6 @@ def prefill_metadata_test(
     return lower_local_request_ids(query_start_loc, request_ids, local_base)
 
 
-def build_tensor_specs_metadata(offsets, local_token_count, local_base):
-    import torch
-    from golden import ScalarSpec, TensorSpec
-
-    query_start_loc = torch.tensor(offsets, dtype=torch.int32)
-    return [
-        TensorSpec("query_start_loc", list(query_start_loc.shape), torch.int32, init_value=query_start_loc),
-        ScalarSpec("local_base", torch.int32, local_base),
-        TensorSpec("request_ids", [local_token_count], torch.int32),
-    ]
-
-
-def golden_prefill_metadata(tensors):
-
-    query_start_loc = tensors["query_start_loc"]
-    local_token_count = tensors["request_ids"].shape[0]
-    local_base = int(tensors["local_base"])
-    total_tokens = int(query_start_loc[-1])
-    request_ids = tensors["request_ids"]
-    request_ids.fill_(-1)
-    for local_token in range(local_token_count):
-        packed_token = local_base + local_token
-        if packed_token >= total_tokens:
-            continue
-        for request in range(query_start_loc.numel() - 1):
-            if query_start_loc[request] <= packed_token < query_start_loc[request + 1]:
-                request_ids[local_token] = request
-                break
-
-
 # ci: devices=2
 
 
@@ -286,6 +256,36 @@ def l3_prefill_cp_token_allgather_fixture(
                 0, rank,
                 device=rank,
             )
+
+
+def build_tensor_specs_metadata(offsets, local_token_count, local_base):
+    import torch
+    from golden import ScalarSpec, TensorSpec
+
+    query_start_loc = torch.tensor(offsets, dtype=torch.int32)
+    return [
+        TensorSpec("query_start_loc", list(query_start_loc.shape), torch.int32, init_value=query_start_loc),
+        ScalarSpec("local_base", torch.int32, local_base),
+        TensorSpec("request_ids", [local_token_count], torch.int32),
+    ]
+
+
+def golden_prefill_metadata(tensors):
+
+    query_start_loc = tensors["query_start_loc"]
+    local_token_count = tensors["request_ids"].shape[0]
+    local_base = int(tensors["local_base"])
+    total_tokens = int(query_start_loc[-1])
+    request_ids = tensors["request_ids"]
+    request_ids.fill_(-1)
+    for local_token in range(local_token_count):
+        packed_token = local_base + local_token
+        if packed_token >= total_tokens:
+            continue
+        for request in range(query_start_loc.numel() - 1):
+            if query_start_loc[request] <= packed_token < query_start_loc[request + 1]:
+                request_ids[local_token] = request
+                break
 
 
 def materialize_spec(spec):

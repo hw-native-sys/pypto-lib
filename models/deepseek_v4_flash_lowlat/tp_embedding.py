@@ -70,29 +70,6 @@ def lookup_embedding_test(
     return hidden_states
 
 
-def golden_lookup_embedding_test(tensors):
-    tensors["hidden_states"][:] = tensors["embed_weight"].index_select(0, tensors["input_ids"].long())
-
-
-def build_tensor_specs_lookup(token_count, vocab_size):
-    import torch
-    from golden import TensorSpec
-
-    def init_input_ids():
-        sample_ids = torch.tensor([0, 1, 17, vocab_size - 1, 17, 2, vocab_size // 2, 1], dtype=torch.int64)
-        repeats = (token_count + sample_ids.numel() - 1) // sample_ids.numel()
-        return sample_ids.repeat(repeats)[:token_count].contiguous()
-
-    def init_embed_weight():
-        return torch.randn(vocab_size, D, dtype=torch.bfloat16)
-
-    return [
-        TensorSpec("input_ids", [token_count], torch.int64, init_value=init_input_ids),
-        TensorSpec("embed_weight", [vocab_size, D], torch.bfloat16, init_value=init_embed_weight),
-        TensorSpec("hidden_states", [token_count, D], torch.bfloat16),
-    ]
-
-
 # ci: devices=2
 
 
@@ -216,6 +193,29 @@ def l3_tp_embedding(
             r, pl.const(1, pl.INT32),
             device=r,
         )
+
+
+def golden_lookup_embedding_test(tensors):
+    tensors["hidden_states"][:] = tensors["embed_weight"].index_select(0, tensors["input_ids"].long())
+
+
+def build_tensor_specs_lookup(token_count, vocab_size):
+    import torch
+    from golden import TensorSpec
+
+    def init_input_ids():
+        sample_ids = torch.tensor([0, 1, 17, vocab_size - 1, 17, 2, vocab_size // 2, 1], dtype=torch.int64)
+        repeats = (token_count + sample_ids.numel() - 1) // sample_ids.numel()
+        return sample_ids.repeat(repeats)[:token_count].contiguous()
+
+    def init_embed_weight():
+        return torch.randn(vocab_size, D, dtype=torch.bfloat16)
+
+    return [
+        TensorSpec("input_ids", [token_count], torch.int64, init_value=init_input_ids),
+        TensorSpec("embed_weight", [vocab_size, D], torch.bfloat16, init_value=init_embed_weight),
+        TensorSpec("hidden_states", [token_count, D], torch.bfloat16),
+    ]
 
 
 def golden_tp_embedding(tensors):
