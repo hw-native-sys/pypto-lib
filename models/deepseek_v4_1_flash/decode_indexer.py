@@ -2137,6 +2137,128 @@ def deepseek_select_attention(
         )
 
 
+@pl.jit.incore
+def _index_pool_select_radix(
+    scores: pl.Tensor, lengths: pl.Tensor, output: pl.Out[pl.Tensor], counts: pl.Out[pl.Tensor],
+    active: pl.Scalar[pl.INT32], packed: pl.constexpr,
+):
+    """Preserve ordered FP32 keys and radix rank selection before stable compaction."""
+    positions = pl.tensor.dim(scores, 1)
+    capacity = pl.tensor.dim(output, 1)
+    token = pl.tile.get_block_idx()
+    keys = pl.create_tile([32768], dtype=pl.UINT32, target_memory=pl.Mem.Vec)
+    visible = pl.cast(0, pl.INDEX)
+    if token < active:
+        visible = pl.min(pl.max(pl.read(lengths, [token]), 0), positions)
+    blocks = (visible + 7) // 8
+    selected = pl.min(pl.min(blocks, capacity), 2048)
+    result = pl.tile.full([1, 2048], dtype=pl.INT32, value=-1)
+    if blocks > selected:
+        for base in pl.range(0, blocks, 1024):
+            valid = pl.min(1024, blocks - base)
+            if packed:
+                raw = pl.load(scores, [token, base], [1, 1024], valid_shape=[1, valid])
+                maxima = pl.reshape(raw, [1024])
+            else:
+                size = pl.min(8192, positions - base * 8)
+                raw = pl.load(scores, [token, base * 8], [1, 8192], valid_shape=[1, size])
+                padded = pl.tile.fillpad(raw, pad_value=pl.PadValue.min)
+                grouped = pl.reshape(padded, [1024, 8])
+                scratch = pl.create_tile([1024, 8], dtype=pl.FP32)
+                maxima = pl.reshape(pl.row_max(grouped, tmp_tile=scratch), [1024])
+            maxima_ub = pl.tile.move(maxima, target_memory=pl.Mem.Vec)
+            with pl.reg_scope():
+                full = pl.reg.full_mask(lanes=64)
+                lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
+                sign = pl.reg.broadcast(2147483648, lanes=64, dtype=pl.UINT32)
+                lower = pl.reg.broadcast(246811957, lanes=64, dtype=pl.UINT32)
+                newest_key = pl.reg.broadcast(4048155338, lanes=64, dtype=pl.UINT32)
+                for chunk in pl.hardware_loop((valid + 63) // 64):
+                    mask = pl.reg.active_mask(pl.min(64, valid - chunk * 64), lanes=64)
+                    value = pl.reg.load(maxima_ub, chunk * 64, lanes=64)
+                    if packed:
+                        bits = pl.reg.interpret_cast(value, dtype=pl.UINT32)
+                        key = pl.reg.maximum(bits, lower, mask)
+                    else:
+                        value = pl.reg.maximums(value, -1e30, mask)
+                        value = pl.reg.adds(value, 0.0, mask)
+                        bits = pl.reg.interpret_cast(value, dtype=pl.UINT32)
+                        negative = pl.reg.compares(bits, 2147483648, mask, predicate="ge")
+                        positive_key = pl.reg.bitwise_xor(bits, sign, mask)
+                        negative_key = pl.reg.bitwise_not(bits, mask)
+                        key = pl.reg.select(negative, negative_key, positive_key)
+                    ids = pl.reg.adds(lane, pl.cast(base + chunk * 64, pl.UINT32), mask)
+                    newest = pl.reg.compares(ids, pl.cast(blocks - 1, pl.UINT32), mask, predicate="eq")
+                    key = pl.reg.select(newest, newest_key, key)
+                    _encoded = pl.reg.store(keys, (base // 64 + chunk) * 64, key, full)
+        histogram = pl.array.create(256, pl.INT32)
+        cutoff = pl.cast(0, pl.UINT32)
+        rank = blocks - selected + 1
+        for byte in pl.range(4):
+            shift = (3 - byte) * 8
+            for bin_id in pl.range(256):
+                histogram[bin_id] = pl.cast(0, pl.INT32)
+            for index in pl.range(blocks):
+                scalar_key = pl.tile.read(keys, [index])
+                if byte == 0 or (scalar_key >> (shift + 8)) == (cutoff >> (shift + 8)):
+                    bin_id = pl.cast((scalar_key >> shift) & 255, pl.INDEX)
+                    histogram[bin_id] = pl.cast(histogram[bin_id] + 1, pl.INT32)
+            prefix_count = pl.cast(0, pl.INDEX)
+            chosen = pl.cast(0, pl.INDEX)
+            previous = pl.cast(0, pl.INDEX)
+            found = pl.cast(0, pl.INDEX)
+            for bin_id in pl.range(256):
+                next_count = prefix_count + histogram[bin_id]
+                if found == 0 and next_count >= rank:
+                    chosen = bin_id
+                    previous = prefix_count
+                    found = 1
+                prefix_count = next_count
+            rank = rank - previous
+            cutoff = pl.cast(cutoff | (pl.cast(chosen, pl.UINT32) << shift), pl.UINT32)
+        strict_count = pl.cast(0, pl.INDEX)
+        for index in pl.range(blocks):
+            if pl.tile.read(keys, [index]) > cutoff:
+                strict_count = strict_count + 1
+        equal_budget = selected - strict_count
+        cursor = pl.cast(0, pl.INDEX)
+        for index in pl.range(blocks):
+            scalar_key = pl.tile.read(keys, [index])
+            if scalar_key > cutoff or (scalar_key == cutoff and equal_budget > 0):
+                pl.tile.write(result, [0, cursor], pl.cast(index, pl.INT32))
+                cursor = cursor + 1
+                if scalar_key == cutoff:
+                    equal_budget = equal_budget - 1
+    else:
+        for index in pl.range(selected):
+            pl.tile.write(result, [0, index], pl.cast(index, pl.INT32))
+    pl.store(pl.set_validshape(result, 1, capacity), [token, 0], output)
+    if token == 0:
+        for row in pl.range(pl.tensor.dim(counts, 0)):
+            count = pl.cast(0, pl.INT32)
+            if row < active:
+                row_visible = pl.min(pl.max(pl.read(lengths, [row]), 0), positions)
+                row_blocks = (row_visible + 7) // 8
+                count = pl.cast(pl.min(pl.min(row_blocks, capacity), 2048), pl.INT32)
+            pl.write(counts, [row], count)
+    return output, counts
+
+
+@pl.jit
+def l2_index_pool_select_radix(
+    scores: pl.Tensor,
+    lengths: pl.Tensor,
+    ids: pl.Out[pl.Tensor],
+    counts: pl.Out[pl.Tensor],
+    active: pl.Scalar[pl.INT32],
+    packed: pl.constexpr = False,
+):
+    """Compile the radix candidate for dense scores or packed ordered block maxima."""
+    with pl.spmd(pl.tensor.dim(ids, 0), name_hint="pool_select_radix"):
+        ids, counts = _index_pool_select_radix(scores, lengths, ids, counts, active, packed)
+    return ids, counts
+
+
 @pl.jit.inline(auto_scope=False)
 def deepseek_select_pool(
     block_scores: pl.Tensor,
