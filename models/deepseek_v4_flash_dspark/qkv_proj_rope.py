@@ -880,6 +880,7 @@ def kv_proj_rope(
             # Split-K kv_proj: KV_N_TILE N-groups expanded KV_OK-fold into cube blocks that
             # atomic-add their K partials into a zero-seeded output.
             kv_fp32 = pl.create_tensor([t_matmul, HEAD_DIM], dtype=pl.FP32)
+            kv_parts = pl.create_tensor([KV_OK * t_matmul, HEAD_DIM], dtype=pl.FP32)
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj_seed"):
                 for kts0 in pl.range(0, t_matmul, KV_M_TILE):
                     for kvseed0 in pl.range(0, HEAD_DIM, KV_N_TILE):
@@ -904,7 +905,7 @@ def kv_proj_rope(
                         dense_x = x_view[dense_x0 : dense_x0 + KV_DENSE_M_TILE, dense_d0 : dense_d0 + KV_K_TILE]
                         dense_w = wkv[dense_d0 : dense_d0 + KV_K_TILE, kv_col0 : kv_col0 + KV_N_TILE]
                         dense_acc = pl.matmul_acc(dense_acc, dense_x, dense_w, init_cond=(dense_k == 0))
-                    kv_fp32 = pl.assemble(kv_fp32, dense_acc, [dense_t0, kv_col0], atomic=pl.AtomicType.Add)
+                    kv_parts = pl.assemble(kv_parts, dense_acc, [((kbg // kv_m_groups) % KV_OK) * t_matmul + dense_t0, kv_col0])
                 for t0 in pl.range(kv_full_rows + kv_m_group * KV_M_TILE, t_matmul, kv_m_groups * KV_M_TILE):
                     kv_acc = pl.create_tensor([KV_M_TILE, KV_N_TILE], dtype=pl.FP32)
                     for db in pl.pipeline(KV_SPLIT_K_TILE // KV_K_TILE, stage=2):
@@ -919,7 +920,19 @@ def kv_proj_rope(
                         )
                         wkv_chunk = wkv[d0 : d0 + KV_K_TILE, kv_col0 : kv_col0 + KV_N_TILE]
                         kv_acc = pl.matmul_acc(kv_acc, kv_x_chunk_bf16, wkv_chunk, init_cond=(db == 0))
-                    kv_fp32 = pl.assemble(kv_fp32, kv_acc, [t0, kv_col0], atomic=pl.AtomicType.Add)
+                    kv_parts = pl.assemble(kv_parts, kv_acc, [((kbg // kv_m_groups) % KV_OK) * t_matmul + t0, kv_col0])
+
+            # Sum the Cube partials in a fixed split order.
+            with pl.spmd((t_matmul // KV_M_TILE) * (HEAD_DIM // KV_N_TILE),
+                         name_hint="kv_proj_ordered_reduce", deps=[_kv_tid]):
+                reduce_worker = pl.tile.get_block_idx()
+                reduce_t0 = (reduce_worker // (HEAD_DIM // KV_N_TILE)) * KV_M_TILE
+                reduce_n0 = (reduce_worker % (HEAD_DIM // KV_N_TILE)) * KV_N_TILE
+                ordered_sum = pl.load(kv_parts, [reduce_t0, reduce_n0], [KV_M_TILE, KV_N_TILE])
+                for reduce_split in pl.unroll(1, KV_OK):
+                    partial = pl.load(kv_parts, [reduce_split * t_matmul + reduce_t0, reduce_n0], [KV_M_TILE, KV_N_TILE])
+                    ordered_sum = pl.add(ordered_sum, partial)
+                pl.store(ordered_sum, [reduce_t0, reduce_n0], kv_fp32)
 
             kv_view = pl.reshape(kv, [t_dim, HEAD_DIM])
 

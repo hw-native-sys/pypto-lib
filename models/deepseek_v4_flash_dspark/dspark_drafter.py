@@ -398,15 +398,20 @@ def draft_layer(
     query_mixed_active: pl.Tensor[[T_QUERY, D], pl.BF16] = pl.slice(query_mixed, [T_QUERY, D], [0, 0])
     rms_norm(query_mixed_active, layer_attn_norm_w, query_normed)
     query_group = pl.create_tensor([DSPARK_CP_SIZE * T_QUERY, D], dtype=pl.BF16)
-    with pl.scope():
-        _gathered_query, hidden_gather_signal = prefill_cp_token_allgather_step(
-            query_normed,
-            query_group,
-            hidden_gather_window,
-            hidden_gather_signal,
-            group_base,
-            dsa_cp_rank,
-        )
+    if DSPARK_CP_SIZE == 1:
+        with pl.spmd(T_QUERY, name_hint="dspark_local_query_copy"):
+            row = pl.tile.get_block_idx()
+            query_group[row : row + 1, 0:D] = query_normed[row : row + 1, 0:D]
+    else:
+        with pl.scope():
+            _gathered_query, hidden_gather_signal = prefill_cp_token_allgather_step(
+                query_normed,
+                query_group,
+                hidden_gather_window,
+                hidden_gather_signal,
+                group_base,
+                dsa_cp_rank,
+            )
     o_packed_heads = pl.create_tensor([O_GROUPS * LOCAL_T_PAD * (H // O_GROUPS), HEAD_DIM], dtype=pl.BF16)
     dspark_attention(
         query_normed,
@@ -653,14 +658,19 @@ def _dspark_drafter(
     lookup_embedding(query_token_ids, embedding_weight, lookup_hidden, query_hc)
     group_context_tokens = pl.tensor.dim(context_group_position_ids, 0)
     group_main_x = pl.create_tensor([group_context_tokens, D], dtype=pl.BF16)
-    _gathered_context, hidden_gather_signal = prefill_cp_token_allgather_step(
-        main_x,
-        group_main_x,
-        hidden_gather_window,
-        hidden_gather_signal,
-        group_base,
-        dsa_cp_rank,
-    )
+    if DSPARK_CP_SIZE == 1:
+        with pl.spmd(group_context_tokens, name_hint="dspark_local_context_copy"):
+            row = pl.tile.get_block_idx()
+            group_main_x[row : row + 1, 0:D] = main_x[row : row + 1, 0:D]
+    else:
+        _gathered_context, hidden_gather_signal = prefill_cp_token_allgather_step(
+            main_x,
+            group_main_x,
+            hidden_gather_window,
+            hidden_gather_signal,
+            group_base,
+            dsa_cp_rank,
+        )
     dspark_context_kv(
         group_main_x, wkv_0, gamma_ckv_0,
         context_group_freqs_cos, context_group_freqs_sin,

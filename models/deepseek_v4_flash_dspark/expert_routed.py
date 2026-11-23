@@ -41,10 +41,16 @@ W2_ACT_INNER = 8
 ZERO_D_TILE = 512 if RECV_TILE == 128 else 1024
 ZERO_WORKERS = 40
 TILES_PER_EXPERT = RECV_MAX // RECV_TILE
-TAIL_TILE = min(64, RECV_TILE)
+EXPERT_GROUP_TILE = 4 if N_LOCAL_EXPERTS % 4 == 0 else (2 if N_LOCAL_EXPERTS % 2 == 0 else 1)
+TAIL_TILE = 32 if RECV_TILE == 64 else min(64, RECV_TILE)
 TAIL_INTER_K = 256 if W2_EXPERT_ROWS >= 2 * TAIL_TILE else 512
 TAIL_D_OUT_TILE = 512 if W2_EXPERT_ROWS >= 2 * TAIL_TILE else 256
 TAIL_D_OUT_TILE_ACT = 512 if MOE_TOKENS <= 8 else 256
+
+MID_TILE = 48 if RECV_TILE == 64 else TAIL_TILE
+MID_K_TILE = 256 if W2_EXPERT_ROWS >= 2 * MID_TILE else 512
+MID_D_TILE = 512 if W2_EXPERT_ROWS >= 2 * MID_TILE else 256
+MID_D_ACT_TILE = 512 if MOE_TOKENS <= 8 else 256
 
 assert RECV_MAX % RECV_TILE == 0, "RECV_MAX must be a whole number of RECV_TILE row-tiles"
 
@@ -59,17 +65,28 @@ def _gate_up_python(
     row: pl.Scalar[pl.INDEX],
     expert: pl.Scalar[pl.INDEX],
     ROW_TILE: pl.constexpr,
+    GROUP_TILE: pl.constexpr,
+    STREAM_WEIGHTS: pl.constexpr,
 ) -> tuple[pl.Tensor, pl.Tensor]:
+    group = pl.tile.get_block_idx() // 4
+    out_row = group * ROW_TILE
+    if GROUP_TILE > 1:
+        expert = expert + group
+        row = row + group * RECV_MAX
     if ROW_TILE <= 64:
-        block = pl.tile.get_block_idx()
+        block = pl.tile.get_block_idx() % 4
         x_full = pl.load(x, [row, 0], [ROW_TILE, D], target_memory=pl.Mem.Mat)
         gate_acc = pl.create_tile([ROW_TILE, 128], dtype=pl.INT32, target_memory=pl.Mem.Acc)
         up_acc = pl.create_tile([ROW_TILE, 128], dtype=pl.INT32, target_memory=pl.Mem.Acc)
         for panel in pl.pipeline(4 * (D // 512), stage=2):
             n0 = block * 512 + (panel // (D // 512)) * 128
             k0 = (panel % (D // 512)) * 512
-            gate_l1 = pl.load(w1, [expert, n0, k0], [1, 128, 512], target_memory=pl.Mem.Mat)
-            up_l1 = pl.load(w3, [expert, n0, k0], [1, 128, 512], target_memory=pl.Mem.Mat)
+            if STREAM_WEIGHTS:
+                gate_l1 = pl.load(w1, [expert, n0, k0], [1, 128, 512], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.BYPASS)
+                up_l1 = pl.load(w3, [expert, n0, k0], [1, 128, 512], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.BYPASS)
+            else:
+                gate_l1 = pl.load(w1, [expert, n0, k0], [1, 128, 512], target_memory=pl.Mem.Mat)
+                up_l1 = pl.load(w3, [expert, n0, k0], [1, 128, 512], target_memory=pl.Mem.Mat)
             gate_2d = pl.reshape(gate_l1, [128, 512])
             up_2d = pl.reshape(up_l1, [128, 512])
             gate_t = pl.tile.transpose_view(gate_2d)
@@ -81,10 +98,10 @@ def _gate_up_python(
                 gate_acc = pl.tile.matmul_acc(gate_acc, x_l0, gate_l0, init_cond=(k0 == 0 and kk == 0))
                 up_acc = pl.tile.matmul_acc(up_acc, x_l0, up_l0, init_cond=(k0 == 0 and kk == 0))
             if k0 + 512 == D:
-                pl.store(gate_acc, [0, n0], gate)
-                pl.store(up_acc, [0, n0], up)
+                pl.store(gate_acc, [out_row, n0], gate)
+                pl.store(up_acc, [out_row, n0], up)
     else:
-        block = pl.tile.get_block_idx()
+        block = pl.tile.get_block_idx() % 4
         gate_acc = pl.create_tile([ROW_TILE, 128], dtype=pl.INT32, target_memory=pl.Mem.Acc)
         up_acc = pl.create_tile([ROW_TILE, 128], dtype=pl.INT32, target_memory=pl.Mem.Acc)
         x0: pl.Tile[[ROW_TILE, 512], pl.INT8, pl.MemRef("x0"), pl.Mem.Mat] = pl.load(x, [row, 0], [ROW_TILE, 512], target_memory=pl.Mem.Mat)
@@ -124,8 +141,8 @@ def _gate_up_python(
             gate_acc = pl.tile.matmul_acc(gate_acc, a0_3, gb0_3, init_cond=False)
             up_acc = pl.tile.matmul_acc(up_acc, a0_3, ub0_3, init_cond=False)
             if k0 + 512 == D:
-                pl.store(gate_acc, [0, n0], gate)
-                pl.store(up_acc, [0, n0], up)
+                pl.store(gate_acc, [out_row, n0], gate)
+                pl.store(up_acc, [out_row, n0], up)
             if pair + 2 < 4 * (D // 512):
                 future_panel = pair + 2
                 future_n = block * 512 + (future_panel // (D // 512)) * 128
@@ -160,8 +177,8 @@ def _gate_up_python(
             gate_acc = pl.tile.matmul_acc(gate_acc, a1_3, gb1_3, init_cond=False)
             up_acc = pl.tile.matmul_acc(up_acc, a1_3, ub1_3, init_cond=False)
             if k0 + 512 == D:
-                pl.store(gate_acc, [0, n0], gate)
-                pl.store(up_acc, [0, n0], up)
+                pl.store(gate_acc, [out_row, n0], gate)
+                pl.store(up_acc, [out_row, n0], up)
     return gate, up
 
 
@@ -176,6 +193,7 @@ def expert_routed_tile(
     routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
     routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8, pl.NZ],
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
+    recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
     recv_y_tile: pl.Tensor,
     local_e: pl.Scalar[pl.INDEX],
     tile_row: pl.Scalar[pl.INDEX],
@@ -185,46 +203,66 @@ def expert_routed_tile(
     INTER_K: pl.constexpr,
     D_OUT_TILE: pl.constexpr,
     D_OUT_TILE_ACT: pl.constexpr,
+    GROUP_TILE: pl.constexpr,
+    Y_ROW_TILE: pl.constexpr,
 ) -> pl.Scalar[pl.TASK_ID]:
     recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
     flat_tile_row = local_e * RECV_MAX + tile_row
-    recv_x_tile = recv_x_flat[flat_tile_row : flat_tile_row + ROW_TILE, :]
-    recv_scale_tile = recv_scale_dq[local_e : local_e + 1, tile_row : tile_row + ROW_TILE]
-    recv_weight_tile = recv_weights[local_e : local_e + 1, tile_row : tile_row + ROW_TILE]
-    h_tile_i8 = pl.create_tensor([ROW_TILE, MOE_INTER], dtype=pl.INT8)
-    h_tile_row_scale = pl.create_tensor([1, ROW_TILE], dtype=pl.FP32, manual_dep=True)
+    recv_x_tile = recv_x_flat[flat_tile_row : flat_tile_row + (GROUP_TILE - 1) * RECV_MAX + ROW_TILE, :]
+    recv_scale_flat = pl.reshape(recv_scale_dq, [1, N_LOCAL_EXPERTS * RECV_MAX])
+    recv_scale_tile = recv_scale_flat[:, flat_tile_row : flat_tile_row + (GROUP_TILE - 1) * RECV_MAX + ROW_TILE]
+    recv_weight_flat = pl.reshape(recv_weights, [1, N_LOCAL_EXPERTS * RECV_MAX])
+    recv_weight_tile = recv_weight_flat[:, flat_tile_row : flat_tile_row + (GROUP_TILE - 1) * RECV_MAX + ROW_TILE]
+    h_tile_i8 = pl.create_tensor([GROUP_TILE * ROW_TILE, MOE_INTER], dtype=pl.INT8)
+    h_tile_row_scale = pl.create_tensor([1, GROUP_TILE * ROW_TILE], dtype=pl.FP32, manual_dep=True)
     quant_tids = pl.array.create(1, pl.TASK_ID)
 
     with pl.scope():
-        gate_tile_i32 = pl.create_tensor([ROW_TILE, MOE_INTER], dtype=pl.INT32)
-        up_tile_i32 = pl.create_tensor([ROW_TILE, MOE_INTER], dtype=pl.INT32)
+        gate_tile_i32 = pl.create_tensor([GROUP_TILE * ROW_TILE, MOE_INTER], dtype=pl.INT32)
+        up_tile_i32 = pl.create_tensor([GROUP_TILE * ROW_TILE, MOE_INTER], dtype=pl.INT32)
 
-        with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_up_mm", deps=[inputs_ready]):
-            gate_tile_i32, up_tile_i32 = _gate_up_python(
-                recv_x_tile, gate_tile_i32, up_tile_i32,
-                routed_w1, routed_w3, 0, local_e, ROW_TILE,
-            )
+        expert_rows = pl.cast(pl.read(recv_expert_count, [local_e, 0]), pl.INDEX)
+        if ROW_TILE <= 64 and expert_rows <= RECV_TILE:
+            with pl.spmd(GROUP_TILE * MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_up_mm", deps=[inputs_ready]):
+                gate_tile_i32, up_tile_i32 = _gate_up_python(
+                    recv_x_tile, gate_tile_i32, up_tile_i32,
+                    routed_w1, routed_w3, 0, local_e, ROW_TILE, GROUP_TILE, True,
+                )
 
-        with pl.spmd(ROW_TILE // QUANT_ROW_TILE, name_hint="exp_gate_up_act_q") as quant_tid:
+        else:
+            with pl.spmd(GROUP_TILE * MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_up_mm", deps=[inputs_ready]):
+                gate_tile_i32, up_tile_i32 = _gate_up_python(
+                    recv_x_tile, gate_tile_i32, up_tile_i32,
+                    routed_w1, routed_w3, 0, local_e, ROW_TILE, GROUP_TILE, False,
+                )
+
+        with pl.spmd(GROUP_TILE * ROW_TILE // QUANT_ROW_TILE, name_hint="exp_gate_up_act_q") as quant_tid:
             quant_block = pl.tile.get_block_idx()
-            quant_row = quant_block * QUANT_ROW_TILE
+            group = quant_block // (ROW_TILE // QUANT_ROW_TILE)
+            group_expert = local_e + group
+            quant_row = (quant_block % (ROW_TILE // QUANT_ROW_TILE)) * QUANT_ROW_TILE
+            out_quant_row = group * ROW_TILE + quant_row
+            scale_row = group * RECV_MAX + quant_row
+            if GROUP_TILE > 1:
+                count = pl.cast(pl.read(recv_expert_count, [group_expert, 0]), pl.INDEX)
+                valid_rows = pl.min(ROW_TILE, pl.max(0, count - tile_row))
             valid_quant_rows = pl.min(QUANT_ROW_TILE, pl.max(0, valid_rows - quant_row))
-            x_scale = recv_scale_tile[:, quant_row : quant_row + QUANT_ROW_TILE]
+            x_scale = recv_scale_tile[:, scale_row : scale_row + QUANT_ROW_TILE]
             x_scale = pl.reshape(x_scale, [QUANT_ROW_TILE, 1])
             row_amax = pl.full([1, QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-            gate0_i32 = gate_tile_i32[quant_row : quant_row + QUANT_ROW_TILE, :ACT_INTER_TILE]
+            gate0_i32 = gate_tile_i32[out_quant_row : out_quant_row + QUANT_ROW_TILE, :ACT_INTER_TILE]
             gate0_fp32 = pl.cast(gate0_i32, target_type=pl.FP32, mode="none")
             gate0_scaled = pl.row_expand_mul(gate0_fp32, x_scale)
-            w1_scale0 = routed_w1_scale[local_e : local_e + 1, :ACT_INTER_TILE]
+            w1_scale0 = routed_w1_scale[group_expert : group_expert + 1, :ACT_INTER_TILE]
             gate0_fp32 = pl.col_expand_mul(gate0_scaled, w1_scale0)
             if SWIGLU_LIMIT > 0.0:
                 gate0_fp32 = pl.minimum(gate0_fp32, SWIGLU_LIMIT)
             sigmoid0 = pl.recip(pl.add(pl.exp(pl.neg(gate0_fp32)), 1.0))
             silu0 = pl.mul(gate0_fp32, sigmoid0)
-            up0_i32 = up_tile_i32[quant_row : quant_row + QUANT_ROW_TILE, :ACT_INTER_TILE]
+            up0_i32 = up_tile_i32[out_quant_row : out_quant_row + QUANT_ROW_TILE, :ACT_INTER_TILE]
             up0_fp32 = pl.cast(up0_i32, target_type=pl.FP32, mode="none")
             up0_scaled = pl.row_expand_mul(up0_fp32, x_scale)
-            w3_scale0 = routed_w3_scale[local_e : local_e + 1, :ACT_INTER_TILE]
+            w3_scale0 = routed_w3_scale[group_expert : group_expert + 1, :ACT_INTER_TILE]
             up0_fp32 = pl.col_expand_mul(up0_scaled, w3_scale0)
             if SWIGLU_LIMIT > 0.0:
                 up0_fp32 = pl.maximum(pl.minimum(up0_fp32, SWIGLU_LIMIT), -SWIGLU_LIMIT)
@@ -234,19 +272,19 @@ def expert_routed_tile(
             abs0 = pl.maximum(activated0, pl.neg(activated0))
             row_amax = pl.maximum(row_amax, pl.reshape(pl.row_max(abs0), [1, QUANT_ROW_TILE]))
 
-            gate1_i32 = gate_tile_i32[quant_row : quant_row + QUANT_ROW_TILE, ACT_INTER_TILE:]
+            gate1_i32 = gate_tile_i32[out_quant_row : out_quant_row + QUANT_ROW_TILE, ACT_INTER_TILE:]
             gate1_fp32 = pl.cast(gate1_i32, target_type=pl.FP32, mode="none")
             gate1_scaled = pl.row_expand_mul(gate1_fp32, x_scale)
-            w1_scale1 = routed_w1_scale[local_e : local_e + 1, ACT_INTER_TILE:]
+            w1_scale1 = routed_w1_scale[group_expert : group_expert + 1, ACT_INTER_TILE:]
             gate1_fp32 = pl.col_expand_mul(gate1_scaled, w1_scale1)
             if SWIGLU_LIMIT > 0.0:
                 gate1_fp32 = pl.minimum(gate1_fp32, SWIGLU_LIMIT)
             sigmoid1 = pl.recip(pl.add(pl.exp(pl.neg(gate1_fp32)), 1.0))
             silu1 = pl.mul(gate1_fp32, sigmoid1)
-            up1_i32 = up_tile_i32[quant_row : quant_row + QUANT_ROW_TILE, ACT_INTER_TILE:]
+            up1_i32 = up_tile_i32[out_quant_row : out_quant_row + QUANT_ROW_TILE, ACT_INTER_TILE:]
             up1_fp32 = pl.cast(up1_i32, target_type=pl.FP32, mode="none")
             up1_scaled = pl.row_expand_mul(up1_fp32, x_scale)
-            w3_scale1 = routed_w3_scale[local_e : local_e + 1, ACT_INTER_TILE:]
+            w3_scale1 = routed_w3_scale[group_expert : group_expert + 1, ACT_INTER_TILE:]
             up1_fp32 = pl.col_expand_mul(up1_scaled, w3_scale1)
             if SWIGLU_LIMIT > 0.0:
                 up1_fp32 = pl.maximum(pl.minimum(up1_fp32, SWIGLU_LIMIT), -SWIGLU_LIMIT)
@@ -258,62 +296,69 @@ def expert_routed_tile(
 
             quant_scale = pl.div(pl.full([1, QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), row_amax)
             dequant_scale = pl.recip(quant_scale)
-            route_weight = recv_weight_tile[:, quant_row : quant_row + QUANT_ROW_TILE]
-            h_tile_row_scale[:, quant_row : quant_row + QUANT_ROW_TILE] = pl.mul(dequant_scale, route_weight)
+            route_weight = recv_weight_tile[:, scale_row : scale_row + QUANT_ROW_TILE]
+            h_tile_row_scale[:, out_quant_row : out_quant_row + QUANT_ROW_TILE] = pl.mul(dequant_scale, route_weight)
             quant_scale_col = pl.reshape(quant_scale, [QUANT_ROW_TILE, 1])
             scaled0 = pl.row_expand_mul(activated0, quant_scale_col)
             i32_0 = pl.cast(scaled0, target_type=pl.INT32, mode="rint")
             fp16_0 = pl.cast(i32_0, target_type=pl.FP16, mode="round")
-            h_tile_i8[quant_row : quant_row + QUANT_ROW_TILE, :ACT_INTER_TILE] = pl.cast(fp16_0, pl.INT8, mode="trunc")
+            h_tile_i8[out_quant_row : out_quant_row + QUANT_ROW_TILE, :ACT_INTER_TILE] = pl.cast(fp16_0, pl.INT8, mode="trunc")
             scaled1 = pl.row_expand_mul(activated1, quant_scale_col)
             i32_1 = pl.cast(scaled1, target_type=pl.INT32, mode="rint")
             fp16_1 = pl.cast(i32_1, target_type=pl.FP16, mode="round")
-            h_tile_i8[quant_row : quant_row + QUANT_ROW_TILE, ACT_INTER_TILE:] = pl.cast(fp16_1, pl.INT8, mode="trunc")
+            h_tile_i8[out_quant_row : out_quant_row + QUANT_ROW_TILE, ACT_INTER_TILE:] = pl.cast(fp16_1, pl.INT8, mode="trunc")
         quant_tids[0] = quant_tid
 
-    y_i32 = pl.create_tensor([ROW_TILE, D], dtype=pl.INT32)
+    y_i32 = pl.create_tensor([GROUP_TILE * ROW_TILE, D], dtype=pl.INT32)
     with pl.spmd(
-        D // (W2_INNER * D_OUT_TILE),
+        GROUP_TILE * D // (W2_INNER * D_OUT_TILE),
         name_hint="exp_w2_mm",
         deps=[quant_tids[0]],
         allow_early_resolve=True,
     ) as w2_tid:
-        # Weight reads bypass L2.
-        pl.set_cache_policy(routed_w2, pl.CachePolicy.BYPASS)
-        block = pl.tile.get_block_idx()
+        group_block = pl.tile.get_block_idx()
+        group = group_block // (D // (W2_INNER * D_OUT_TILE))
+        block = group_block % (D // (W2_INNER * D_OUT_TILE))
+        group_expert = local_e + group
+        out_row = group * ROW_TILE
         d_base = block * (W2_INNER * D_OUT_TILE)
         h_l1 = pl.create_l1([ROW_TILE, MOE_INTER], dtype=pl.INT8)
-        h_l1 = pl.gather_row(h_l1, h_tile_i8, [0, 0], [0, 0], [ROW_TILE, MOE_INTER])
+        h_l1 = pl.gather_row(h_l1, h_tile_i8, [0, 0], [out_row, 0], [ROW_TILE, MOE_INTER])
         for inner in pl.range(W2_INNER):
             d0 = d_base + inner * D_OUT_TILE
             y_acc = pl.create_tensor([1, ROW_TILE, D_OUT_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, MOE_INTER, INTER_K, stage=2):
                 h_w2_chunk = h_l1[:, k0 : k0 + INTER_K]
-                w2_chunk = routed_w2[local_e : local_e + 1, d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K]
+                w2_chunk = routed_w2[group_expert : group_expert + 1, d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K]
                 y_acc = pl.matmul_acc(y_acc, h_w2_chunk, w2_chunk, b_trans=True, init_cond=(k0 == 0))
-            y_i32[:, d0 : d0 + D_OUT_TILE] = pl.reshape(y_acc, [ROW_TILE, D_OUT_TILE])
+            y_i32[out_row : out_row + ROW_TILE, d0 : d0 + D_OUT_TILE] = pl.reshape(y_acc, [ROW_TILE, D_OUT_TILE])
 
     with pl.spmd(
-        D // (W2_ACT_INNER * D_OUT_TILE_ACT),
+        GROUP_TILE * D // (W2_ACT_INNER * D_OUT_TILE_ACT),
         name_hint="exp_w2_act",
         deps=[w2_tid],
         allow_early_resolve=True,
     ) as w2_act_tid:
-        block = pl.tile.get_block_idx()
+        group_block = pl.tile.get_block_idx()
+        group = group_block // (D // (W2_ACT_INNER * D_OUT_TILE_ACT))
+        block = group_block % (D // (W2_ACT_INNER * D_OUT_TILE_ACT))
+        group_expert = local_e + group
+        out_row = group * ROW_TILE
         d_base = block * (W2_ACT_INNER * D_OUT_TILE_ACT)
-        row_scale = h_tile_row_scale[:, :]
+        y_out_row = group * Y_ROW_TILE
+        row_scale = h_tile_row_scale[:, out_row : out_row + ROW_TILE]
         row_scale = pl.reshape(row_scale, [ROW_TILE, 1])
         for inner in pl.pipeline(W2_ACT_INNER, stage=2):
             d0 = d_base + inner * D_OUT_TILE_ACT
-            y_fp32 = pl.cast(y_i32[:, d0 : d0 + D_OUT_TILE_ACT], target_type=pl.FP32, mode="none")
+            y_fp32 = pl.cast(y_i32[out_row : out_row + ROW_TILE, d0 : d0 + D_OUT_TILE_ACT], target_type=pl.FP32, mode="none")
             y_fp32 = pl.col_expand_mul(
                 pl.row_expand_mul(y_fp32, row_scale),
                 routed_w2_scale[
-                    local_e : local_e + 1,
+                    group_expert : group_expert + 1,
                     d0 : d0 + D_OUT_TILE_ACT,
                 ],
             )
-            recv_y_tile[:, d0 : d0 + D_OUT_TILE_ACT] = pl.cast(y_fp32, target_type=pl.BF16, mode="rint")
+            recv_y_tile[y_out_row : y_out_row + ROW_TILE, d0 : d0 + D_OUT_TILE_ACT] = pl.cast(y_fp32, target_type=pl.BF16, mode="rint")
     return w2_act_tid
 
 
@@ -342,35 +387,87 @@ def expert_routed_test(
             zero_row = (block // d_tiles) * RECV_TILE
             zero_col = (block % d_tiles) * ZERO_D_TILE
             recv_y_flat[zero_row : zero_row + RECV_TILE, zero_col : zero_col + ZERO_D_TILE] = zero_tile
-    for local_e in pl.parallel(N_LOCAL_EXPERTS):
-        n_rows = pl.cast(pl.read(recv_expert_count, [local_e, 0]), pl.INDEX)
-        n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
-        for tile in pl.parallel(n_tiles):
-            tile_row = tile * RECV_TILE
-            valid_rows = pl.min(RECV_TILE, n_rows - tile_row)
-            flat_tile_row = local_e * RECV_MAX + tile_row
-            if valid_rows > 64 or RECV_TILE <= 64:
-                with pl.scope():
-                    recv_y_tile = pl.create_tensor([RECV_TILE, D], dtype=pl.BF16)
-                    expert_routed_tile(
-                        recv_x, recv_scale_dq, recv_weights,
-                        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
-                        recv_y_tile,
-                        local_e, tile_row, valid_rows, inputs_ready,
-                        RECV_TILE, INTER_K, D_OUT_TILE, D_OUT_TILE_ACT,
-                    )
-                    recv_y_flat[flat_tile_row : flat_tile_row + RECV_TILE, :] = recv_y_tile
-            else:
-                with pl.scope():
-                    recv_y_tail = pl.create_tensor([TAIL_TILE, D], dtype=pl.BF16)
-                    expert_routed_tile(
-                        recv_x, recv_scale_dq, recv_weights,
-                        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
-                        recv_y_tail,
-                        local_e, tile_row, valid_rows, inputs_ready,
-                        TAIL_TILE, TAIL_INTER_K, TAIL_D_OUT_TILE, TAIL_D_OUT_TILE_ACT,
-                    )
-                    recv_y_flat[flat_tile_row : flat_tile_row + TAIL_TILE, :] = recv_y_tail
+    for group_start in pl.parallel(0, N_LOCAL_EXPERTS, EXPERT_GROUP_TILE):
+        group_min = pl.cast(RECV_MAX, pl.INDEX)
+        group_max = pl.cast(0, pl.INDEX)
+        for member in pl.range(EXPERT_GROUP_TILE):
+            count = pl.cast(pl.read(recv_expert_count, [group_start + member, 0]), pl.INDEX)
+            group_min = pl.min(group_min, count)
+            group_max = pl.max(group_max, count)
+        if RECV_TILE == 64 and group_min > TAIL_TILE and group_max <= MID_TILE:
+            with pl.scope():
+                dst_start = group_start * RECV_MAX
+                grouped_y_mid = recv_y_flat[dst_start : dst_start + (EXPERT_GROUP_TILE - 1) * RECV_MAX + MID_TILE, :]
+                expert_routed_tile(
+                    recv_x, recv_scale_dq, recv_weights,
+                    routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+                    recv_expert_count, grouped_y_mid,
+                    group_start, 0, group_max, inputs_ready,
+                    MID_TILE, MID_K_TILE, MID_D_TILE, MID_D_ACT_TILE, EXPERT_GROUP_TILE, RECV_MAX,
+                )
+        elif group_min > MID_TILE and group_max <= RECV_TILE:
+            with pl.scope():
+                dst_start = group_start * RECV_MAX
+                grouped_y = recv_y_flat[dst_start : dst_start + (EXPERT_GROUP_TILE - 1) * RECV_MAX + RECV_TILE, :]
+                expert_routed_tile(
+                    recv_x, recv_scale_dq, recv_weights,
+                    routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+                    recv_expert_count, grouped_y,
+                    group_start, 0, group_max, inputs_ready,
+                    RECV_TILE, INTER_K, D_OUT_TILE, D_OUT_TILE_ACT, EXPERT_GROUP_TILE, RECV_MAX,
+                )
+        elif group_min > 0 and group_max <= TAIL_TILE:
+            with pl.scope():
+                dst_start = group_start * RECV_MAX
+                grouped_y_tail = recv_y_flat[dst_start : dst_start + (EXPERT_GROUP_TILE - 1) * RECV_MAX + TAIL_TILE, :]
+                expert_routed_tile(
+                    recv_x, recv_scale_dq, recv_weights,
+                    routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+                    recv_expert_count, grouped_y_tail,
+                    group_start, 0, group_max, inputs_ready,
+                    TAIL_TILE, TAIL_INTER_K, TAIL_D_OUT_TILE, TAIL_D_OUT_TILE_ACT, EXPERT_GROUP_TILE, RECV_MAX,
+                )
+        else:
+            for local_e in pl.parallel(group_start, group_start + EXPERT_GROUP_TILE):
+                n_rows = pl.cast(pl.read(recv_expert_count, [local_e, 0]), pl.INDEX)
+                n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
+                for tile in pl.parallel(n_tiles):
+                    tile_row = tile * RECV_TILE
+                    valid_rows = pl.min(RECV_TILE, n_rows - tile_row)
+                    flat_tile_row = local_e * RECV_MAX + tile_row
+                    if RECV_TILE == 64 and valid_rows > TAIL_TILE and valid_rows <= MID_TILE:
+                        with pl.scope():
+                            recv_y_mid = pl.create_tensor([MID_TILE, D], dtype=pl.BF16)
+                            expert_routed_tile(
+                                recv_x, recv_scale_dq, recv_weights,
+                                routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+                                recv_expert_count, recv_y_mid,
+                                local_e, tile_row, valid_rows, inputs_ready,
+                                MID_TILE, MID_K_TILE, MID_D_TILE, MID_D_ACT_TILE, 1, MID_TILE,
+                            )
+                            recv_y_flat[flat_tile_row : flat_tile_row + MID_TILE, :] = recv_y_mid
+                    elif valid_rows > TAIL_TILE or RECV_TILE <= TAIL_TILE:
+                        with pl.scope():
+                            recv_y_tile = pl.create_tensor([RECV_TILE, D], dtype=pl.BF16)
+                            expert_routed_tile(
+                                recv_x, recv_scale_dq, recv_weights,
+                                routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+                                recv_expert_count, recv_y_tile,
+                                local_e, tile_row, valid_rows, inputs_ready,
+                                RECV_TILE, INTER_K, D_OUT_TILE, D_OUT_TILE_ACT, 1, RECV_TILE,
+                            )
+                            recv_y_flat[flat_tile_row : flat_tile_row + RECV_TILE, :] = recv_y_tile
+                    else:
+                        with pl.scope():
+                            recv_y_tail = pl.create_tensor([TAIL_TILE, D], dtype=pl.BF16)
+                            expert_routed_tile(
+                                recv_x, recv_scale_dq, recv_weights,
+                                routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+                                recv_expert_count, recv_y_tail,
+                                local_e, tile_row, valid_rows, inputs_ready,
+                                TAIL_TILE, TAIL_INTER_K, TAIL_D_OUT_TILE, TAIL_D_OUT_TILE_ACT, 1, TAIL_TILE,
+                            )
+                            recv_y_flat[flat_tile_row : flat_tile_row + TAIL_TILE, :] = recv_y_tail
     return recv_y
 
 
@@ -575,6 +672,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     boundary_counts = [0, 1, 15, 16, 17, 63, 64, 65, 127, 128, 129, 191, 192, 193, 255, 256]
+    if RECV_TILE == 64:
+        boundary_counts = [0, 1, 31, 32, 33, 47, 48, 49, 63, 64, 65, 95, 96, 97, RECV_MAX - 1, RECV_MAX]
     boundary_counts = [count for count in boundary_counts if count <= RECV_MAX]
     counts = [boundary_counts[expert % len(boundary_counts)] for expert in range(N_LOCAL_EXPERTS)]
     cases = {"random": None, "boundaries": counts}

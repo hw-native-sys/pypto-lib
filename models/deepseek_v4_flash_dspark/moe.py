@@ -60,7 +60,8 @@ from pypto.ir import DistributedConfig
 
 from config import FLASH as M, MOE_TOKENS, RECV_MAX, INT8_AMAX_EPS, INT8_SCALE_MAX
 from expert_routed import (
-    RECV_TILE, INTER_K, D_OUT_TILE, D_OUT_TILE_ACT, TILES_PER_EXPERT,
+    MID_TILE, MID_K_TILE, MID_D_TILE, MID_D_ACT_TILE,
+    EXPERT_GROUP_TILE, RECV_TILE, INTER_K, D_OUT_TILE, D_OUT_TILE_ACT, TILES_PER_EXPERT,
     TAIL_TILE, TAIL_INTER_K, TAIL_D_OUT_TILE, TAIL_D_OUT_TILE_ACT, expert_routed_tile,
 )
 from expert_shared import expert_shared
@@ -566,88 +567,234 @@ def _moe_tile(
     )
 
     expert_completion_tids = pl.array.create(N_LOCAL, pl.TASK_ID)
-    for local_e in pl.parallel(N_LOCAL):
-        tile_completion_tids = pl.array.create(TILES_PER_EXPERT, pl.TASK_ID)
-        expert_rows = pl.cast(pl.read(recv_count_out, [local_e, 0]), pl.INDEX)
-        expert_tiles = (expert_rows + RECV_TILE - 1) // RECV_TILE
-        for tile in pl.parallel(expert_tiles):
-            tile_row = tile * RECV_TILE
-            valid_rows = pl.min(RECV_TILE, expert_rows - tile_row)
-            tile_inputs_ready = gather_ready[local_e * TILES_PER_EXPERT + tile]
-            if valid_rows > 64 or RECV_TILE <= 64:
-                recv_y_tile = pl.create_tensor([RECV_TILE, D], dtype=pl.BF16)
-                tile_ready = expert_routed_tile(
-                    recv_x_out, recv_scale_out, recv_w_out,
-                    routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
-                    recv_y_tile,
-                    local_e, tile_row, valid_rows, tile_inputs_ready,
-                    RECV_TILE, INTER_K, D_OUT_TILE, D_OUT_TILE_ACT,
-                )
+    for group_start in pl.parallel(0, N_LOCAL, EXPERT_GROUP_TILE):
+        group_min = pl.cast(RECV_MAX, pl.INDEX)
+        group_max = pl.cast(0, pl.INDEX)
+        for member in pl.range(EXPERT_GROUP_TILE):
+            count = pl.cast(pl.read(recv_count_out, [group_start + member, 0]), pl.INDEX)
+            group_min = pl.min(group_min, count)
+            group_max = pl.max(group_max, count)
+        if RECV_TILE == 64 and group_min > TAIL_TILE and group_max <= MID_TILE:
+            group_inputs_ready = pl.system.task_dummy(
+                deps=[gather_ready[(group_start + g) * TILES_PER_EXPERT] for g in range(EXPERT_GROUP_TILE)],
+            )
+            grouped_y_mid = pl.create_tensor([EXPERT_GROUP_TILE * MID_TILE, D], dtype=pl.BF16)
+            group_ready = expert_routed_tile(
+                recv_x_out, recv_scale_out, recv_w_out,
+                routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+                recv_count_out, grouped_y_mid,
+                group_start, 0, group_max, group_inputs_ready,
+                MID_TILE, MID_K_TILE, MID_D_TILE, MID_D_ACT_TILE, EXPERT_GROUP_TILE, MID_TILE,
+            )
+            for member in pl.parallel(EXPERT_GROUP_TILE):
+                group_expert = group_start + member
+                out_row = member * MID_TILE
+                recv_y_member_mid = grouped_y_mid[out_row : out_row + MID_TILE, :]
                 with pl.at(
                     level=pl.Level.CORE_GROUP,
                     name_hint="expert_tile_scatter",
-                    deps=[tile_ready],
-                    # Route rows are unique within an epoch, and the completion
-                    # fan-in below already orders combine after every scatter.
+                    deps=[group_ready],
                     no_dep_args=[routed_y_buf],
-                ) as scatter_tid:
-                    tile_end = tile_row + valid_rows
+                ) as scatter_group_tid:
                     source_begin = pl.cast(0, pl.INDEX)
                     for src in pl.range(N_RANKS):
-                        source_rows = pl.cast(pl.read(recv_meta_local, [src, local_e]), pl.INDEX)
+                        source_rows = pl.cast(pl.read(recv_meta_local, [src, group_expert]), pl.INDEX)
                         source_end = source_begin + source_rows
-                        scatter_begin = pl.max(tile_row, source_begin)
-                        scatter_end = pl.min(tile_end, source_end)
-                        for compact_row in pl.range(scatter_begin, scatter_end):
-                            route = pl.cast(pl.read(recv_r_route_out, [local_e, compact_row]), pl.INDEX)
+                        for compact_row in pl.range(source_begin, source_end):
+                            route = pl.cast(pl.read(recv_r_route_out, [group_expert, compact_row]), pl.INDEX)
                             pld.tensor.put(
-                                dst=routed_y_buf,
-                                peer=src,
-                                src=recv_y_tile,
-                                dst_offsets=[route, 0],
-                                src_offsets=[compact_row - tile_row, 0],
-                                shape=[1, D],
+                                dst=routed_y_buf, peer=src, src=recv_y_member_mid,
+                                dst_offsets=[route, 0], src_offsets=[compact_row, 0], shape=[1, D],
                             )
                         source_begin = source_end
-                tile_completion_tids[tile] = scatter_tid
-            else:
-                recv_y_tail = pl.create_tensor([TAIL_TILE, D], dtype=pl.BF16)
-                tail_ready = expert_routed_tile(
-                    recv_x_out, recv_scale_out, recv_w_out,
-                    routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
-                    recv_y_tail,
-                    local_e, tile_row, valid_rows, tile_inputs_ready,
-                    TAIL_TILE, TAIL_INTER_K, TAIL_D_OUT_TILE, TAIL_D_OUT_TILE_ACT,
-                )
+                expert_completion_tids[group_expert] = scatter_group_tid
+        elif group_min > MID_TILE and group_max <= RECV_TILE:
+            group_inputs_ready = pl.system.task_dummy(
+                deps=[gather_ready[(group_start + g) * TILES_PER_EXPERT] for g in range(EXPERT_GROUP_TILE)],
+            )
+            grouped_y = pl.create_tensor([EXPERT_GROUP_TILE * RECV_TILE, D], dtype=pl.BF16)
+            group_ready = expert_routed_tile(
+                recv_x_out, recv_scale_out, recv_w_out,
+                routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+                recv_count_out, grouped_y,
+                group_start, 0, group_max, group_inputs_ready,
+                RECV_TILE, INTER_K, D_OUT_TILE, D_OUT_TILE_ACT, EXPERT_GROUP_TILE, RECV_TILE,
+            )
+            for member in pl.parallel(EXPERT_GROUP_TILE):
+                group_expert = group_start + member
+                out_row = member * RECV_TILE
+                recv_y_member = grouped_y[out_row : out_row + RECV_TILE, :]
                 with pl.at(
                     level=pl.Level.CORE_GROUP,
                     name_hint="expert_tile_scatter",
-                    deps=[tail_ready],
-                    # Route rows are unique within an epoch, and the completion
-                    # fan-in below already orders combine after every scatter.
+                    deps=[group_ready],
                     no_dep_args=[routed_y_buf],
-                ) as scatter_tail_tid:
-                    tile_end = tile_row + valid_rows
+                ) as scatter_group_tid:
                     source_begin = pl.cast(0, pl.INDEX)
                     for src in pl.range(N_RANKS):
-                        source_rows = pl.cast(pl.read(recv_meta_local, [src, local_e]), pl.INDEX)
+                        source_rows = pl.cast(pl.read(recv_meta_local, [src, group_expert]), pl.INDEX)
                         source_end = source_begin + source_rows
-                        scatter_begin = pl.max(tile_row, source_begin)
-                        scatter_end = pl.min(tile_end, source_end)
-                        for compact_row in pl.range(scatter_begin, scatter_end):
-                            route = pl.cast(pl.read(recv_r_route_out, [local_e, compact_row]), pl.INDEX)
+                        for compact_row in pl.range(source_begin, source_end):
+                            route = pl.cast(pl.read(recv_r_route_out, [group_expert, compact_row]), pl.INDEX)
                             pld.tensor.put(
-                                dst=routed_y_buf,
-                                peer=src,
-                                src=recv_y_tail,
-                                dst_offsets=[route, 0],
-                                src_offsets=[compact_row - tile_row, 0],
-                                shape=[1, D],
+                                dst=routed_y_buf, peer=src, src=recv_y_member,
+                                dst_offsets=[route, 0], src_offsets=[compact_row, 0], shape=[1, D],
                             )
                         source_begin = source_end
-                tile_completion_tids[tile] = scatter_tail_tid
-        expert_tiles_done = pl.system.task_dummy(deps=[tile_completion_tids])
-        expert_completion_tids[local_e] = expert_tiles_done
+                expert_completion_tids[group_expert] = scatter_group_tid
+        elif group_min > 0 and group_max <= TAIL_TILE:
+            group_inputs_ready = pl.system.task_dummy(
+                deps=[gather_ready[(group_start + g) * TILES_PER_EXPERT] for g in range(EXPERT_GROUP_TILE)],
+            )
+            grouped_y_tail = pl.create_tensor([EXPERT_GROUP_TILE * TAIL_TILE, D], dtype=pl.BF16)
+            group_ready = expert_routed_tile(
+                recv_x_out, recv_scale_out, recv_w_out,
+                routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+                recv_count_out, grouped_y_tail,
+                group_start, 0, group_max, group_inputs_ready,
+                TAIL_TILE, TAIL_INTER_K, TAIL_D_OUT_TILE, TAIL_D_OUT_TILE_ACT, EXPERT_GROUP_TILE, TAIL_TILE,
+            )
+            for member in pl.parallel(EXPERT_GROUP_TILE):
+                group_expert = group_start + member
+                out_row = member * TAIL_TILE
+                recv_y_member_tail = grouped_y_tail[out_row : out_row + TAIL_TILE, :]
+                with pl.at(
+                    level=pl.Level.CORE_GROUP,
+                    name_hint="expert_tile_scatter",
+                    deps=[group_ready],
+                    no_dep_args=[routed_y_buf],
+                ) as scatter_group_tid:
+                    source_begin = pl.cast(0, pl.INDEX)
+                    for src in pl.range(N_RANKS):
+                        source_rows = pl.cast(pl.read(recv_meta_local, [src, group_expert]), pl.INDEX)
+                        source_end = source_begin + source_rows
+                        for compact_row in pl.range(source_begin, source_end):
+                            route = pl.cast(pl.read(recv_r_route_out, [group_expert, compact_row]), pl.INDEX)
+                            pld.tensor.put(
+                                dst=routed_y_buf, peer=src, src=recv_y_member_tail,
+                                dst_offsets=[route, 0], src_offsets=[compact_row, 0], shape=[1, D],
+                            )
+                        source_begin = source_end
+                expert_completion_tids[group_expert] = scatter_group_tid
+        else:
+            for local_e in pl.parallel(group_start, group_start + EXPERT_GROUP_TILE):
+                tile_completion_tids = pl.array.create(TILES_PER_EXPERT, pl.TASK_ID)
+                expert_rows = pl.cast(pl.read(recv_count_out, [local_e, 0]), pl.INDEX)
+                expert_tiles = (expert_rows + RECV_TILE - 1) // RECV_TILE
+                for tile in pl.parallel(expert_tiles):
+                    tile_row = tile * RECV_TILE
+                    valid_rows = pl.min(RECV_TILE, expert_rows - tile_row)
+                    tile_inputs_ready = gather_ready[local_e * TILES_PER_EXPERT + tile]
+                    if RECV_TILE == 64 and valid_rows > TAIL_TILE and valid_rows <= MID_TILE:
+                        recv_y_mid = pl.create_tensor([MID_TILE, D], dtype=pl.BF16)
+                        mid_ready = expert_routed_tile(
+                            recv_x_out, recv_scale_out, recv_w_out,
+                            routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+                            recv_count_out, recv_y_mid,
+                            local_e, tile_row, valid_rows, tile_inputs_ready,
+                            MID_TILE, MID_K_TILE, MID_D_TILE, MID_D_ACT_TILE, 1, MID_TILE,
+                        )
+                        with pl.at(
+                            level=pl.Level.CORE_GROUP,
+                            name_hint="expert_tile_scatter",
+                            deps=[mid_ready],
+                            # Route rows are unique within an epoch, and the completion
+                            # fan-in below already orders combine after every scatter.
+                            no_dep_args=[routed_y_buf],
+                        ) as scatter_mid_tid:
+                            tile_end = tile_row + valid_rows
+                            source_begin = pl.cast(0, pl.INDEX)
+                            for src in pl.range(N_RANKS):
+                                source_rows = pl.cast(pl.read(recv_meta_local, [src, local_e]), pl.INDEX)
+                                source_end = source_begin + source_rows
+                                scatter_begin = pl.max(tile_row, source_begin)
+                                scatter_end = pl.min(tile_end, source_end)
+                                for compact_row in pl.range(scatter_begin, scatter_end):
+                                    route = pl.cast(pl.read(recv_r_route_out, [local_e, compact_row]), pl.INDEX)
+                                    pld.tensor.put(
+                                        dst=routed_y_buf,
+                                        peer=src,
+                                        src=recv_y_mid,
+                                        dst_offsets=[route, 0],
+                                        src_offsets=[compact_row - tile_row, 0],
+                                        shape=[1, D],
+                                    )
+                                source_begin = source_end
+                        tile_completion_tids[tile] = scatter_mid_tid
+                    elif valid_rows > TAIL_TILE or RECV_TILE <= TAIL_TILE:
+                        recv_y_tile = pl.create_tensor([RECV_TILE, D], dtype=pl.BF16)
+                        tile_ready = expert_routed_tile(
+                            recv_x_out, recv_scale_out, recv_w_out,
+                            routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+                            recv_count_out, recv_y_tile,
+                            local_e, tile_row, valid_rows, tile_inputs_ready,
+                            RECV_TILE, INTER_K, D_OUT_TILE, D_OUT_TILE_ACT, 1, RECV_TILE,
+                        )
+                        with pl.at(
+                            level=pl.Level.CORE_GROUP,
+                            name_hint="expert_tile_scatter",
+                            deps=[tile_ready],
+                            # Route rows are unique within an epoch, and the completion
+                            # fan-in below already orders combine after every scatter.
+                            no_dep_args=[routed_y_buf],
+                        ) as scatter_tid:
+                            tile_end = tile_row + valid_rows
+                            source_begin = pl.cast(0, pl.INDEX)
+                            for src in pl.range(N_RANKS):
+                                source_rows = pl.cast(pl.read(recv_meta_local, [src, local_e]), pl.INDEX)
+                                source_end = source_begin + source_rows
+                                scatter_begin = pl.max(tile_row, source_begin)
+                                scatter_end = pl.min(tile_end, source_end)
+                                for compact_row in pl.range(scatter_begin, scatter_end):
+                                    route = pl.cast(pl.read(recv_r_route_out, [local_e, compact_row]), pl.INDEX)
+                                    pld.tensor.put(
+                                        dst=routed_y_buf,
+                                        peer=src,
+                                        src=recv_y_tile,
+                                        dst_offsets=[route, 0],
+                                        src_offsets=[compact_row - tile_row, 0],
+                                        shape=[1, D],
+                                    )
+                                source_begin = source_end
+                        tile_completion_tids[tile] = scatter_tid
+                    else:
+                        recv_y_tail = pl.create_tensor([TAIL_TILE, D], dtype=pl.BF16)
+                        tail_ready = expert_routed_tile(
+                            recv_x_out, recv_scale_out, recv_w_out,
+                            routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+                            recv_count_out, recv_y_tail,
+                            local_e, tile_row, valid_rows, tile_inputs_ready,
+                            TAIL_TILE, TAIL_INTER_K, TAIL_D_OUT_TILE, TAIL_D_OUT_TILE_ACT, 1, TAIL_TILE,
+                        )
+                        with pl.at(
+                            level=pl.Level.CORE_GROUP,
+                            name_hint="expert_tile_scatter",
+                            deps=[tail_ready],
+                            # Route rows are unique within an epoch, and the completion
+                            # fan-in below already orders combine after every scatter.
+                            no_dep_args=[routed_y_buf],
+                        ) as scatter_tail_tid:
+                            tile_end = tile_row + valid_rows
+                            source_begin = pl.cast(0, pl.INDEX)
+                            for src in pl.range(N_RANKS):
+                                source_rows = pl.cast(pl.read(recv_meta_local, [src, local_e]), pl.INDEX)
+                                source_end = source_begin + source_rows
+                                scatter_begin = pl.max(tile_row, source_begin)
+                                scatter_end = pl.min(tile_end, source_end)
+                                for compact_row in pl.range(scatter_begin, scatter_end):
+                                    route = pl.cast(pl.read(recv_r_route_out, [local_e, compact_row]), pl.INDEX)
+                                    pld.tensor.put(
+                                        dst=routed_y_buf,
+                                        peer=src,
+                                        src=recv_y_tail,
+                                        dst_offsets=[route, 0],
+                                        src_offsets=[compact_row - tile_row, 0],
+                                        shape=[1, D],
+                                    )
+                                source_begin = source_end
+                        tile_completion_tids[tile] = scatter_tail_tid
+                expert_tiles_done = pl.system.task_dummy(deps=[tile_completion_tids])
+                expert_completion_tids[local_e] = expert_tiles_done
 
     scatters_done = pl.system.task_dummy(deps=[expert_completion_tids[local_e] for local_e in range(N_LOCAL)])
     scatter_done = pl.system.task_dummy(deps=[scatters_done, dispatch_done])

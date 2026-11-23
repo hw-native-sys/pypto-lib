@@ -57,17 +57,15 @@ MARKOV_M_TILE = max(8, DSPARK_MAX_BATCH)
 # from concurrent request blocks otherwise overwrite the neighbouring row.
 MARKOV_ID_PAD = (DSPARK_QUERY_WIDTH + 15) // 16 * 16
 CONFIDENCE_PAD = 8
-GREEDY_VOCAB_CHUNK = 256
-GREEDY_NUM_CHUNKS = VOCAB // GREEDY_VOCAB_CHUNK
-GREEDY_CHUNK_PAD = 512
 GREEDY_ARGMAX_ROWS = 8
-NEG_INF = -3.402823e38
+GREEDY_SEGMENT_WIDTH = gcd(VOCAB // GREEDY_ARGMAX_ROWS, 808)
+GREEDY_SEGMENTS = VOCAB // GREEDY_SEGMENT_WIDTH
+GREEDY_TILE = GREEDY_ARGMAX_ROWS * GREEDY_SEGMENT_WIDTH
 
 assert D % HIDDEN_TILE == 0
 assert D % LM_K_TILE == 0
 assert VOCAB % LM_N_TILE == 0
-assert VOCAB % GREEDY_VOCAB_CHUNK == 0
-assert GREEDY_NUM_CHUNKS <= GREEDY_CHUNK_PAD
+assert VOCAB % GREEDY_TILE == 0
 assert CONFIDENCE_PAD * 4 == 32
 # Base-logit row tiling must exactly cover every supported padded batch.
 for _batch in DSPARK_SUPPORTED_BATCHES:
@@ -379,52 +377,26 @@ def greedy_markov_step(
         request = pl.tile.get_block_idx()
         if request < batch:
             source_row = request * DSPARK_QUERY_WIDTH + step
-            chunk_maxima = pl.full(
-                [GREEDY_ARGMAX_ROWS, GREEDY_CHUNK_PAD],
-                dtype=pl.FP32,
-                value=NEG_INF,
-            )
-            chunk_token_ids = pl.full(
-                [1, GREEDY_CHUNK_PAD],
-                dtype=pl.INT32,
-                value=0,
-            )
-            for chunk in pl.range(GREEDY_NUM_CHUNKS):
-                vocab_offset = chunk * GREEDY_VOCAB_CHUNK
-                scores = pl.full(
-                    [GREEDY_ARGMAX_ROWS, GREEDY_VOCAB_CHUNK],
-                    dtype=pl.FP32,
-                    value=NEG_INF,
+            # All eight reduction rows hold neighbouring vocabulary segments.
+            segment_maxima = pl.full([GREEDY_ARGMAX_ROWS, GREEDY_SEGMENTS], dtype=pl.FP32, value=0.0)
+            segment_ids = pl.full([1, GREEDY_SEGMENTS], dtype=pl.INT32, value=0)
+            for tile in pl.range(VOCAB // GREEDY_TILE):
+                vocab_offset = tile * GREEDY_TILE
+                base = pl.slice(base_logits, [1, GREEDY_TILE], [pl.cast(source_row, pl.INDEX), vocab_offset])
+                bias = markov_bias[request : request + 1, vocab_offset : vocab_offset + GREEDY_TILE]
+                scores = pl.reshape(pl.add(base, bias), [GREEDY_ARGMAX_ROWS, GREEDY_SEGMENT_WIDTH])
+                segment = tile * GREEDY_ARGMAX_ROWS
+                segment_maxima[0:1, segment : segment + GREEDY_ARGMAX_ROWS] = pl.reshape(
+                    pl.row_max(scores), [1, GREEDY_ARGMAX_ROWS]
                 )
-                scores[0:1, 0:GREEDY_VOCAB_CHUNK] = pl.add(
-                    pl.slice(
-                        base_logits,
-                        [1, GREEDY_VOCAB_CHUNK],
-                        [pl.cast(source_row, pl.INDEX), vocab_offset],
-                    ),
-                    markov_bias[
-                        request : request + 1,
-                        vocab_offset : vocab_offset + GREEDY_VOCAB_CHUNK,
-                    ],
-                )
-                local_winner = pl.row_argmax(scores)
-                local_token = pl.read(local_winner, [0, 0])
-                pl.write(
-                    chunk_maxima,
-                    [0, chunk],
-                    pl.read(scores, [0, pl.cast(local_token, pl.INDEX)]),
-                )
-                pl.write(
-                    chunk_token_ids,
-                    [0, chunk],
-                    pl.cast(vocab_offset, pl.INT32) + local_token,
+                segment_ids[0:1, segment : segment + GREEDY_ARGMAX_ROWS] = pl.reshape(
+                    pl.row_argmax(scores), [1, GREEDY_ARGMAX_ROWS]
                 )
 
-            winning_chunk = pl.read(pl.row_argmax(chunk_maxima), [0, 0])
-            winning_token = pl.read(
-                chunk_token_ids,
-                [0, pl.cast(winning_chunk, pl.INDEX)],
-            )
+            # The first winning segment followed by its first maximum gives the global tie-break.
+            winning_segment = pl.read(pl.row_argmax(segment_maxima), [0, 0])
+            local_token = pl.read(segment_ids, [0, pl.cast(winning_segment, pl.INDEX)])
+            winning_token = pl.cast(winning_segment * GREEDY_SEGMENT_WIDTH, pl.INT32) + local_token
             token_row = draft_token_scratch[
                 request : request + 1,
                 0:MARKOV_ID_PAD,

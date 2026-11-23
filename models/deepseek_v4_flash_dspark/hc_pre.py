@@ -398,42 +398,67 @@ def _hc_pre_impl(
     t_dim = pl.tensor.dim(x, 0)
     token_tiles = (t_dim + T_TILE - 1) // T_TILE
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
-    pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
-    _hc_pre_gates(
-        x, hc_fn, hc_scale, hc_base, pre_val_store, post, comb,
-        row_recip=False, LINEAR_T_TILE=LINEAR_T_TILE, COMB_T_TILE=COMB_T_TILE,
-    )
+    inv_rms, mixes_partials = _hc_pre_statistics(x, hc_fn, LINEAR_T_TILE=LINEAR_T_TILE)
+    mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
+    post_tail_store = pl.create_tensor([token_tiles * T_TILE, HC_PAD], dtype=pl.FP32)
+    scale0 = pl.read(hc_scale, [0])
+    scale1 = pl.read(hc_scale, [1])
+    scale2 = pl.read(hc_scale, [2])
     x_flat = pl.reshape(x, [t_dim, HC_DIM])
 
-    # mix_x: x_mixed = sum_h pre[:,h]*x[:,h,:], fanned over D/D_SPMD blocks per token tile.
-    x_mixed_tail_store = pl.create_tensor([T_TILE, D], dtype=pl.BF16)
-    for blk in pl.spmd(token_tiles * (D // D_SPMD), name_hint="mix_x", allow_early_resolve=True):
-        t0 = (blk // (D // D_SPMD)) * T_TILE
-        d_base = (blk % (D // D_SPMD)) * D_SPMD
+    # Each worker owns the gates and all mixed channels of one token tile.
+    for blk in pl.spmd(token_tiles, name_hint="mix_x", allow_early_resolve=True):
+        t0 = blk * T_TILE
         valid_rows = pl.min(T_TILE, t_dim - t0)
-        pre_tile_t = pl.transpose(pre_val_store[t0:t0 + T_TILE, 0:HC_PAD], axis1=0, axis2=1)
+        pre_val, post_pad, mixes_total = _hc_pre_gate_values(
+            mixes_partials, inv_rms, hc_base, t0, t_linear, scale0, scale1,
+        )
+        pl.store(mixes_total, [t0, 0], mixes_raw)
+        if pl.tensor.dim(post, 0) < T_TILE:
+            pl.store(post_pad, [t0, 0], post_tail_store)
+            for post_row in pl.range(valid_rows):
+                post_value = pl.load(
+                    post_tail_store, [t0 + post_row, 0], [1, HC_PAD],
+                    valid_shape=[1, HC_MULT],
+                )
+                pl.store(post_value, [t0 + post_row, 0], post)
+        else:
+            post_valid = pl.set_validshape(post_pad, valid_rows, HC_MULT)
+            pl.store(post_valid, [t0, 0], post)
+        pre_tile_t = pl.tile.transpose(pre_val, 0, 1)
         pre0 = pl.reshape(pre_tile_t[0:1, 0:T_TILE], [T_TILE, 1])
         pre1 = pl.reshape(pre_tile_t[1:2, 0:T_TILE], [T_TILE, 1])
         pre2 = pl.reshape(pre_tile_t[2:3, 0:T_TILE], [T_TILE, 1])
         pre3 = pl.reshape(pre_tile_t[3:4, 0:T_TILE], [T_TILE, 1])
-        for db in pl.pipeline(D_SPMD // D_TILE, stage=2):
-            d0 = d_base + db * D_TILE
-            x0 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, 0 * D + d0], valid_shape=[valid_rows, D_TILE])
-            x1 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, 1 * D + d0], valid_shape=[valid_rows, D_TILE])
-            x2 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, 2 * D + d0], valid_shape=[valid_rows, D_TILE])
-            x3 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, 3 * D + d0], valid_shape=[valid_rows, D_TILE])
+        for db in pl.pipeline(D // D_TILE, stage=2):
+            d0 = db * D_TILE
+            x0 = pl.load(
+                x_flat, [t0, 0 * D + d0], [T_TILE, D_TILE],
+                valid_shape=[valid_rows, D_TILE], target_memory=pl.MemorySpace.Vec,
+            )
+            x1 = pl.load(
+                x_flat, [t0, 1 * D + d0], [T_TILE, D_TILE],
+                valid_shape=[valid_rows, D_TILE], target_memory=pl.MemorySpace.Vec,
+            )
+            x2 = pl.load(
+                x_flat, [t0, 2 * D + d0], [T_TILE, D_TILE],
+                valid_shape=[valid_rows, D_TILE], target_memory=pl.MemorySpace.Vec,
+            )
+            x3 = pl.load(
+                x_flat, [t0, 3 * D + d0], [T_TILE, D_TILE],
+                valid_shape=[valid_rows, D_TILE], target_memory=pl.MemorySpace.Vec,
+            )
             y0 = pl.row_expand_mul(x0, pre0)
             y1 = pl.row_expand_mul(x1, pre1)
             y2 = pl.row_expand_mul(x2, pre2)
             y3 = pl.row_expand_mul(x3, pre3)
             y_tile = pl.add(pl.add(y0, y1), pl.add(y2, y3))
             y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
-            if valid_rows == T_TILE:
-                x_mixed[t0:t0 + T_TILE, d0:d0 + D_TILE] = y_bf16
-            else:
-                x_mixed_tail_store[0:T_TILE, d0:d0 + D_TILE] = y_bf16
-                y_out = pl.load(x_mixed_tail_store, [0, d0], [T_TILE, D_TILE], valid_shape=[valid_rows, D_TILE], target_memory=pl.MemorySpace.Vec)
-                pl.store(y_out, [t0, d0], x_mixed)
+            y_valid = pl.set_validshape(y_bf16, valid_rows, D_TILE)
+            pl.store(y_valid, [t0, d0], x_mixed)
+    _hc_pre_combinations(
+        mixes_raw, inv_rms, hc_base, comb, t_dim, scale2, False, COMB_T_TILE=COMB_T_TILE,
+    )
     return x_mixed
 
 

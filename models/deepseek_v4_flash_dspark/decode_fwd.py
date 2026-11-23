@@ -216,6 +216,7 @@ PACKED_POOL_LAYER_COUNTS = {
 }
 
 MOE_INPUT_IDS_PER_CACHE_LINE = 8  # One 64-byte cache line of INT64 values.
+MOE_PAD_TOKEN_TILE = 8
 
 
 def build_num_tokens_per_owner_host(values, physical_tokens):
@@ -295,6 +296,38 @@ def decode_embedding_preamble(
             zero_hc_row = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
             x_hc[token : token + 1, 0 : HC_MULT, 0 : D] = zero_hc_row
     return x_hc
+
+
+@pl.jit.incore
+def decode_fwd_attn_pad(
+    x_hc: pl.InOut[pl.Tensor[[MOE_TOKENS, HC_MULT, D], pl.FP32]],
+    owner_tokens: pl.Scalar[pl.INT32],
+):
+    """Preserve active rows and clear the tail after the Attention producer."""
+    block = pl.tile.get_block_idx()
+    token_begin = owner_tokens + block * MOE_PAD_TOKEN_TILE
+    zero_row = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
+    for token in pl.range(token_begin, pl.min(token_begin + MOE_PAD_TOKEN_TILE, MOE_TOKENS)):
+        x_hc[token : token + 1, 0 : HC_MULT, 0 : D] = zero_row
+    return x_hc
+
+
+@pl.jit.inline
+def pad_moe_input(
+    x_hc: pl.Tensor[[MOE_TOKENS, HC_MULT, D], pl.FP32],
+    owner_tokens: pl.Scalar[pl.INT32],
+):
+    """Skip padding for a full buffer; otherwise retain the producer dependency."""
+    if owner_tokens < MOE_TOKENS:
+        inactive_tiles = (MOE_TOKENS - owner_tokens + MOE_PAD_TOKEN_TILE - 1) // MOE_PAD_TOKEN_TILE
+        # Materialize the explicit InOut callee before submitting its SPMD task.
+        if False:
+            pad_specialize = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
+            pad_specialize = decode_fwd_attn_pad(pad_specialize, owner_tokens)
+        x_hc, _pad_tid = pl.spmd_submit(
+            self.decode_fwd_attn_pad,  # noqa: F821 - materialized by @pl.jit
+            x_hc, owner_tokens, core_num=inactive_tiles,
+        )
 
 
 def _decode_fwd(
@@ -543,6 +576,8 @@ def _decode_fwd(
         routed_w3_layer_swa0: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ] = pl.slice(routed_w3, [N_LOCAL, MOE_INTER, D], [weight_layer_swa0 * N_LOCAL, 0, 0])
         routed_w2_layer_swa0: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ] = pl.slice(routed_w2, [N_LOCAL, D, MOE_INTER], [weight_layer_swa0 * N_LOCAL, 0, 0])
         raw_kv_layer_swa0 = pl.slice(raw_kv_pool, [raw_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM], [0, 0, 0, 0])
+        x_attn_moe_swa0 = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
+        x_attn_view_swa0 = pl.slice(x_attn_moe_swa0, [local_t, HC_MULT, D], [0, 0, 0])
         with pl.scope():
             if group_tokens > 0:
                 if TP_SIZE == 1:
@@ -554,7 +589,7 @@ def _decode_fwd(
                         freqs_cos, freqs_sin,
                         raw_kv_layer_swa0, swa_slot_mapping, swa_indices, swa_lens, position_ids_local,
                         attn_sink_layer_swa0, wo_a_layer_swa0, wo_b_layer_swa0, wo_b_scale_layer_swa0,
-                        x_attn_active,
+                        x_attn_view_swa0,
                     )
                 else:
                     gather_signal_step_swa0 = gather_signal
@@ -568,7 +603,7 @@ def _decode_fwd(
                         freqs_cos, freqs_sin,
                         raw_kv_layer_swa0, swa_slot_mapping, swa_indices, swa_lens, position_ids_local,
                         attn_sink_layer_swa0, wo_a_layer_swa0, wo_b_layer_swa0, wo_b_scale_layer_swa0,
-                        x_attn_active,
+                        x_attn_view_swa0,
                         gather_window, gather_signal_step_swa0,
                         attention_window, attention_signal_step_swa0,
                         o_window, o_signal_step_swa0,
@@ -576,14 +611,7 @@ def _decode_fwd(
                     )
 
         with pl.scope():
-            x_attn_moe_swa0 = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
-            for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_swa0_attn_pack"):
-                if token < owner_tokens:
-                    attn_row_swa0 = x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
-                    x_attn_moe_swa0[token : token + 1, 0 : HC_MULT, 0 : D] = attn_row_swa0
-                else:
-                    zero_moe_row_swa0 = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
-                    x_attn_moe_swa0[token : token + 1, 0 : HC_MULT, 0 : D] = zero_moe_row_swa0
+            pad_moe_input(x_attn_moe_swa0, owner_tokens)
             moe(
                 x_attn_moe_swa0,
                 hc_ffn_fn_layer_swa0, hc_ffn_scale_layer_swa0, hc_ffn_base_layer_swa0,
@@ -637,6 +665,8 @@ def _decode_fwd(
         routed_w3_layer_swa1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ] = pl.slice(routed_w3, [N_LOCAL, MOE_INTER, D], [weight_layer_swa1 * N_LOCAL, 0, 0])
         routed_w2_layer_swa1: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ] = pl.slice(routed_w2, [N_LOCAL, D, MOE_INTER], [weight_layer_swa1 * N_LOCAL, 0, 0])
         raw_kv_layer_swa1 = pl.slice(raw_kv_pool, [raw_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM], [raw_blocks_per_layer, 0, 0, 0])
+        x_attn_moe_swa1 = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
+        x_attn_view_swa1 = pl.slice(x_attn_moe_swa1, [local_t, HC_MULT, D], [0, 0, 0])
         with pl.scope():
             if group_tokens > 0:
                 if TP_SIZE == 1:
@@ -648,7 +678,7 @@ def _decode_fwd(
                         freqs_cos, freqs_sin,
                         raw_kv_layer_swa1, swa_slot_mapping, swa_indices, swa_lens, position_ids_local,
                         attn_sink_layer_swa1, wo_a_layer_swa1, wo_b_layer_swa1, wo_b_scale_layer_swa1,
-                        x_attn_active,
+                        x_attn_view_swa1,
                     )
                 else:
                     gather_signal_step_swa1 = gather_signal
@@ -662,7 +692,7 @@ def _decode_fwd(
                         freqs_cos, freqs_sin,
                         raw_kv_layer_swa1, swa_slot_mapping, swa_indices, swa_lens, position_ids_local,
                         attn_sink_layer_swa1, wo_a_layer_swa1, wo_b_layer_swa1, wo_b_scale_layer_swa1,
-                        x_attn_active,
+                        x_attn_view_swa1,
                         gather_window, gather_signal_step_swa1,
                         attention_window, attention_signal_step_swa1,
                         o_window, o_signal_step_swa1,
@@ -670,14 +700,7 @@ def _decode_fwd(
                     )
 
         with pl.scope():
-            x_attn_moe_swa1 = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
-            for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_swa1_attn_pack"):
-                if token < owner_tokens:
-                    attn_row_swa1 = x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
-                    x_attn_moe_swa1[token : token + 1, 0 : HC_MULT, 0 : D] = attn_row_swa1
-                else:
-                    zero_moe_row_swa1 = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
-                    x_attn_moe_swa1[token : token + 1, 0 : HC_MULT, 0 : D] = zero_moe_row_swa1
+            pad_moe_input(x_attn_moe_swa1, owner_tokens)
             moe(
                 x_attn_moe_swa1,
                 hc_ffn_fn_layer_swa1, hc_ffn_scale_layer_swa1, hc_ffn_base_layer_swa1,
@@ -755,6 +778,8 @@ def _decode_fwd(
             shared_w3_scale_layer_csa = pl.slice(shared_w3_scale, [MOE_INTER], [csa_weight_layer * MOE_INTER])
             shared_w2_layer_csa = shared_w2[csa_weight_layer]
             shared_w2_scale_layer_csa = pl.slice(shared_w2_scale, [D], [csa_weight_layer * D])
+            x_attn_moe_csa = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
+            x_attn_view_csa = pl.slice(x_attn_moe_csa, [local_t, HC_MULT, D], [0, 0, 0])
             with pl.scope():
                 if group_tokens > 0:
                     if TP_SIZE == 1:
@@ -780,7 +805,7 @@ def _decode_fwd(
                             csa_state_slot_mapping, csa_inner_state_slot_mapping,
                             position_ids_local, csa_kv_seq_lens,
                             attn_sink_layer_csa, wo_a_layer_csa, wo_b_layer_csa, wo_b_scale_layer_csa,
-                            x_attn_active,
+                            x_attn_view_csa,
                         )
                     else:
                         gather_signal_step_csa = gather_signal
@@ -808,7 +833,7 @@ def _decode_fwd(
                             csa_state_slot_mapping, csa_inner_state_slot_mapping,
                             position_ids_local, position_ids, csa_kv_seq_lens,
                             attn_sink_layer_csa, wo_a_layer_csa, wo_b_layer_csa, wo_b_scale_layer_csa,
-                            x_attn_active,
+                            x_attn_view_csa,
                             gather_window, gather_signal_step_csa,
                             attention_window, attention_signal_step_csa,
                             o_window, o_signal_step_csa,
@@ -816,14 +841,7 @@ def _decode_fwd(
                         )
 
             with pl.scope():
-                x_attn_moe_csa = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
-                for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_csa_attn_pack"):
-                    if token < owner_tokens:
-                        attn_row_csa = x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
-                        x_attn_moe_csa[token : token + 1, 0 : HC_MULT, 0 : D] = attn_row_csa
-                    else:
-                        zero_moe_row_csa = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
-                        x_attn_moe_csa[token : token + 1, 0 : HC_MULT, 0 : D] = zero_moe_row_csa
+                pad_moe_input(x_attn_moe_csa, owner_tokens)
                 moe(
                     x_attn_moe_csa,
                     hc_ffn_fn_layer_csa, hc_ffn_scale_layer_csa, hc_ffn_base_layer_csa,
@@ -882,6 +900,8 @@ def _decode_fwd(
             shared_w3_scale_layer_hca = pl.slice(shared_w3_scale, [MOE_INTER], [hca_weight_layer * MOE_INTER])
             shared_w2_layer_hca = shared_w2[hca_weight_layer]
             shared_w2_scale_layer_hca = pl.slice(shared_w2_scale, [D], [hca_weight_layer * D])
+            x_attn_moe_hca = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
+            x_attn_view_hca = pl.slice(x_attn_moe_hca, [local_t, HC_MULT, D], [0, 0, 0])
             with pl.scope():
                 if group_tokens > 0:
                     if TP_SIZE == 1:
@@ -900,7 +920,7 @@ def _decode_fwd(
                             hca_cmp_slot_mapping, hca_state_slot_mapping,
                             position_ids_local, hca_kv_seq_lens,
                             attn_sink_layer_hca, wo_a_layer_hca, wo_b_layer_hca, wo_b_scale_layer_hca,
-                            x_attn_active,
+                            x_attn_view_hca,
                         )
                     else:
                         gather_signal_step_hca = gather_signal
@@ -921,7 +941,7 @@ def _decode_fwd(
                             hca_cmp_slot_mapping, hca_state_slot_mapping,
                             position_ids_local, position_ids, hca_kv_seq_lens,
                             attn_sink_layer_hca, wo_a_layer_hca, wo_b_layer_hca, wo_b_scale_layer_hca,
-                            x_attn_active,
+                            x_attn_view_hca,
                             gather_window, gather_signal_step_hca,
                             attention_window, attention_signal_step_hca,
                             o_window, o_signal_step_hca,
@@ -929,14 +949,7 @@ def _decode_fwd(
                         )
 
             with pl.scope():
-                x_attn_moe_hca = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
-                for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_hca_attn_pack"):
-                    if token < owner_tokens:
-                        attn_row_hca = x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
-                        x_attn_moe_hca[token : token + 1, 0 : HC_MULT, 0 : D] = attn_row_hca
-                    else:
-                        zero_moe_row_hca = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
-                        x_attn_moe_hca[token : token + 1, 0 : HC_MULT, 0 : D] = zero_moe_row_hca
+                pad_moe_input(x_attn_moe_hca, owner_tokens)
                 moe(
                     x_attn_moe_hca,
                     hc_ffn_fn_layer_hca, hc_ffn_scale_layer_hca, hc_ffn_base_layer_hca,

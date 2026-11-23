@@ -696,6 +696,7 @@ GROUP_METADATA_ROWS = DSPARK_CP_SIZE * LOCAL_METADATA_ROWS
 METADATA_WIDTH = 1 + DSPARK_DRAFT_LAYERS
 META_COMM_ROWS = gcd(GROUP_METADATA_ROWS, 16)
 ROPE_COMM_ROWS = gcd(GROUP_METADATA_ROWS, 8)
+LOCAL_ROPE_TILE = gcd(LOCAL_METADATA_ROWS, 8)
 BRIDGE_B_DYN = pl.dynamic("DSPARK_BRIDGE_B_DYN")
 BRIDGE_GROUP_CONTEXT_T_DYN = pl.dynamic("DSPARK_BRIDGE_GROUP_CONTEXT_T_DYN")
 
@@ -961,8 +962,13 @@ def prepare_drafter_after_target(
             pl.write(local_metadata, [row, 0], pl.cast(0, pl.INT64))
             for layer in pl.range(DSPARK_DRAFT_LAYERS):
                 pl.write(local_metadata, [row, 1 + layer], pl.cast(-1, pl.INT64))
-            local_rope_cos[row : row + 1, 0:ROPE_DIM] = pl.full([1, ROPE_DIM], dtype=pl.BF16, value=0.0)
-            local_rope_sin[row : row + 1, 0:ROPE_DIM] = pl.full([1, ROPE_DIM], dtype=pl.BF16, value=0.0)
+        for tile in pl.range(0, LOCAL_METADATA_ROWS, LOCAL_ROPE_TILE):
+            local_rope_cos[tile : tile + LOCAL_ROPE_TILE, 0:ROPE_DIM] = pl.full(
+                [LOCAL_ROPE_TILE, ROPE_DIM], dtype=pl.BF16, value=0.0
+            )
+            local_rope_sin[tile : tile + LOCAL_ROPE_TILE, 0:ROPE_DIM] = pl.full(
+                [LOCAL_ROPE_TILE, ROPE_DIM], dtype=pl.BF16, value=0.0
+            )
         for request in pl.range(batch):
             pl.write(num_sampled, [request], pl.cast(0, pl.INT32))
             pl.write(compact_last_sampled, [request], pl.cast(0, pl.INT64))
@@ -1020,21 +1026,27 @@ def prepare_drafter_after_target(
                     local_rope_sin[metadata_row : metadata_row + 1, 0:ROPE_DIM] = query_sin_flat
                     pl.write(logit_row_indices, [query_row], pl.cast(query_row, pl.INT32))
 
-    group_metadata, metadata_signal = _allgather_metadata(
-        local_metadata, group_metadata,
-        metadata_window, metadata_signal,
-        group_base, cp_rank,
-    )
-    group_rope_cos, rope_cos_signal = _allgather_rope(
-        local_rope_cos, group_rope_cos,
-        rope_cos_window, rope_cos_signal,
-        group_base, cp_rank,
-    )
-    group_rope_sin, rope_sin_signal = _allgather_rope(
-        local_rope_sin, group_rope_sin,
-        rope_sin_window, rope_sin_signal,
-        group_base, cp_rank,
-    )
+    if DSPARK_CP_SIZE == 1:
+        # The sole CP member already owns the complete rank-major input.
+        group_metadata = local_metadata
+        group_rope_cos = local_rope_cos
+        group_rope_sin = local_rope_sin
+    else:
+        group_metadata, metadata_signal = _allgather_metadata(
+            local_metadata, group_metadata,
+            metadata_window, metadata_signal,
+            group_base, cp_rank,
+        )
+        group_rope_cos, rope_cos_signal = _allgather_rope(
+            local_rope_cos, group_rope_cos,
+            rope_cos_window, rope_cos_signal,
+            group_base, cp_rank,
+        )
+        group_rope_sin, rope_sin_signal = _allgather_rope(
+            local_rope_sin, group_rope_sin,
+            rope_sin_window, rope_sin_signal,
+            group_base, cp_rank,
+        )
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dspark_bridge_unpack"):
         for row in pl.range(group_context_tokens):
@@ -1044,10 +1056,6 @@ def prepare_drafter_after_target(
             pl.write(context_group_position_ids, [row], pl.cast(pl.read(group_metadata, [metadata_row, 0]), pl.INT32))
             for layer in pl.range(DSPARK_DRAFT_LAYERS):
                 pl.write(context_group_slot_mapping, [layer, row], pl.read(group_metadata, [metadata_row, 1 + layer]))
-            group_cos_src = pl.load(group_rope_cos, [metadata_row, 0], [1, ROPE_DIM])
-            pl.store(group_cos_src, [row, 0], context_group_freqs_cos)
-            group_sin_src = pl.load(group_rope_sin, [metadata_row, 0], [1, ROPE_DIM])
-            pl.store(group_sin_src, [row, 0], context_group_freqs_sin)
         for row in pl.range(DSPARK_CP_SIZE * T_QUERY):
             source_rank = row // T_QUERY
             source_row = row % T_QUERY
@@ -1055,13 +1063,26 @@ def prepare_drafter_after_target(
             pl.write(query_group_position_ids, [row], pl.cast(pl.read(group_metadata, [metadata_row, 0]), pl.INT32))
             for layer in pl.range(DSPARK_DRAFT_LAYERS):
                 pl.write(query_group_slot_mapping, [layer, row], pl.read(group_metadata, [metadata_row, 1 + layer]))
-            query_group_cos_src = group_rope_cos[metadata_row : metadata_row + 1, 0:ROPE_DIM]
-            query_group_freqs_cos[row : row + 1, 0:ROPE_DIM] = query_group_cos_src
-            query_group_sin_src = group_rope_sin[metadata_row : metadata_row + 1, 0:ROPE_DIM]
-            query_group_freqs_sin[row : row + 1, 0:ROPE_DIM] = query_group_sin_src
-        for row in pl.range(T_QUERY):
-            metadata_row = CONTEXT_T + row
-            local_cos_src = local_rope_cos[metadata_row : metadata_row + 1, 0:ROPE_DIM]
-            query_freqs_cos[row : row + 1, 0:ROPE_DIM] = local_cos_src
-            local_sin_src = local_rope_sin[metadata_row : metadata_row + 1, 0:ROPE_DIM]
-            query_freqs_sin[row : row + 1, 0:ROPE_DIM] = local_sin_src
+        for rank in pl.range(DSPARK_CP_SIZE):
+            for row in pl.range(0, local_context_tokens, LOCAL_ROPE_TILE):
+                valid_rows = pl.min(LOCAL_ROPE_TILE, local_context_tokens - row)
+                source = rank * LOCAL_METADATA_ROWS + row
+                destination = rank * local_context_tokens + row
+                context_cos = pl.load(group_rope_cos, [source, 0], [LOCAL_ROPE_TILE, ROPE_DIM], valid_shape=[valid_rows, ROPE_DIM])
+                context_sin = pl.load(group_rope_sin, [source, 0], [LOCAL_ROPE_TILE, ROPE_DIM], valid_shape=[valid_rows, ROPE_DIM])
+                pl.store(context_cos, [destination, 0], context_group_freqs_cos)
+                pl.store(context_sin, [destination, 0], context_group_freqs_sin)
+            for row in pl.range(0, T_QUERY, LOCAL_ROPE_TILE):
+                valid_rows = pl.min(LOCAL_ROPE_TILE, T_QUERY - row)
+                source = rank * LOCAL_METADATA_ROWS + CONTEXT_T + row
+                destination = rank * T_QUERY + row
+                group_cos = pl.load(group_rope_cos, [source, 0], [LOCAL_ROPE_TILE, ROPE_DIM], valid_shape=[valid_rows, ROPE_DIM])
+                group_sin = pl.load(group_rope_sin, [source, 0], [LOCAL_ROPE_TILE, ROPE_DIM], valid_shape=[valid_rows, ROPE_DIM])
+                pl.store(group_cos, [destination, 0], query_group_freqs_cos)
+                pl.store(group_sin, [destination, 0], query_group_freqs_sin)
+        for row in pl.range(0, T_QUERY, LOCAL_ROPE_TILE):
+            valid_rows = pl.min(LOCAL_ROPE_TILE, T_QUERY - row)
+            local_cos = pl.load(local_rope_cos, [CONTEXT_T + row, 0], [LOCAL_ROPE_TILE, ROPE_DIM], valid_shape=[valid_rows, ROPE_DIM])
+            local_sin = pl.load(local_rope_sin, [CONTEXT_T + row, 0], [LOCAL_ROPE_TILE, ROPE_DIM], valid_shape=[valid_rows, ROPE_DIM])
+            pl.store(local_cos, [row, 0], query_freqs_cos)
+            pl.store(local_sin, [row, 0], query_freqs_sin)

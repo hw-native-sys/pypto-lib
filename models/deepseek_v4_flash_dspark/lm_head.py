@@ -61,13 +61,20 @@ GROUP_LOGIT_ROWS = TP_SIZE * MAX_LOGIT_ROWS
 TEST_TOKENS = 2 * MAX_LOGIT_ROWS  # standalone fixture: hidden rows per card
 
 # tiling
-# MM_ROW_TILE x FUSED_VOCAB_TILE fp32 keeps the accumulator inside the 128KiB
-# Acc space and divides MAX_LOGIT_ROWS: every row block is one owner's rows.
-# One whole owner per block is the widest M the Acc space admits, and it halves
-# the weight tile re-reads a narrower row tile forces.
 FUSED_K_TILE = 256
 FUSED_VOCAB_TILE = 128
+AIV_LANES = 2
+C2V_SLOTS = 2
+# Pair two owners so both AIV lanes can reuse the same Cube weight panel.
+# Each C->V slot reserves the full FP32 output tile in the 192 KiB vector UB.
+PAIRED_ROWS = AIV_LANES * MAX_LOGIT_ROWS
 MM_ROW_TILE = gcd(MAX_LOGIT_ROWS, 128)
+if (
+    TP_SIZE % AIV_LANES == 0
+    and MAX_LOGIT_ROWS % 32 == 0
+    and C2V_SLOTS * PAIRED_ROWS * FUSED_VOCAB_TILE * 4 <= 192 * 1024
+):
+    MM_ROW_TILE = PAIRED_ROWS
 HIDDEN_GATHER_TILE = 1024
 HIDDEN_GATHER_ROW_TILE = gcd(GROUP_LOGIT_ROWS, min(GROUP_LOGIT_ROWS, 64))
 PUSH_ROW_TILE = gcd(MAX_LOGIT_ROWS, 16)  # rows pushed per dispatch_push block (fewer, larger ring puts)
@@ -79,15 +86,12 @@ GREEDY_ROW_WIDTH = 808
 GREEDY_BLOCK_ROWS = 8
 SAMPLED_IDS_PAD = 8
 FUSED_LM_HEAD_CORES = 24
-# AIV lanes per AICore: the fused kernel splits each row block's accumulator
-# across the two lanes, and each lane pushes a contiguous half of one owner's rows.
-AIV_LANES = 2
 LANE_ROWS = (MM_ROW_TILE + AIV_LANES - 1) // AIV_LANES
 VOCAB_TAIL = VOCAB_PER_TP % FUSED_VOCAB_TILE
 VOCAB_FULL_TILES = VOCAB_PER_TP // FUSED_VOCAB_TILE
 LOGITS_COMM_TAIL = VOCAB_PER_TP % LOGITS_COMM_TILE
 N_LOGITS_COMM_TILES = VOCAB_PER_TP // LOGITS_COMM_TILE
-LOGITS_COMM_BLOCKS = min(FUSED_LM_HEAD_CORES, N_LOGITS_COMM_TILES + (1 if LOGITS_COMM_TAIL != 0 else 0))
+LOGITS_COMM_BLOCKS = min(FUSED_LM_HEAD_CORES * AIV_LANES, N_LOGITS_COMM_TILES + (1 if LOGITS_COMM_TAIL != 0 else 0))
 LOGITS_TAIL_BLOCK = N_LOGITS_COMM_TILES % LOGITS_COMM_BLOCKS
 GREEDY_GRID_ROWS = VOCAB // GREEDY_ROW_WIDTH
 GREEDY_BLOCK_SPAN = GREEDY_BLOCK_ROWS * GREEDY_ROW_WIDTH
@@ -98,7 +102,7 @@ GREEDY_INDEX_SENTINEL = 1073741824
 DONE_VALUE = 1
 LM_HEAD_RING_HEAP = 1 << 30
 
-assert MAX_LOGIT_ROWS % MM_ROW_TILE == 0, "each row block must be one owner's rows"
+assert GROUP_LOGIT_ROWS % MM_ROW_TILE == 0, "row blocks must cover the group exactly"
 assert MAX_LOGIT_ROWS % PUSH_ROW_TILE == 0, "row block must cover whole rows"
 assert MAX_LOGIT_ROWS % LOGITS_GATHER_ROW_TILE == 0, "logits row blocks must cover whole rows"
 # TP1 notifies nobody, so its empty peer loop needs no lane pairing.
@@ -213,13 +217,12 @@ def lm_head(
     # Fused cube+comm kernel: matmul one [MM_ROW_TILE, FUSED_VOCAB_TILE] tile,
     # carry the accumulator across the C->V edge with pl.aiv_shard, and
     # remote_store each lane's row half to its owner's window while the cube
-    # projects the next tile. No GM staging: every row block is one owner's rows,
-    # so each lane's shard is already the exact rows it pushes.
+    # projects the next tile. Each lane owns a contiguous range of one owner's rows.
     with pl.spmd(
         FUSED_LM_HEAD_CORES,
         name_hint="lm_head_matmul_push",
         deps=[_dgather_tid],
-        optimizations=[pl.cross_core_slot(slot_num=2)],
+        optimizations=[pl.cross_core_slot(slot_num=C2V_SLOTS)],
     ) as _push_tid:
         # Weight reads bypass L2.
         pl.set_cache_policy(lm_head_weight, pl.CachePolicy.BYPASS)
@@ -236,12 +239,12 @@ def lm_head(
                     mm_weight_tile = lm_head_weight[mm_o0 : mm_o0 + FUSED_VOCAB_TILE, mm_k0 : mm_k0 + FUSED_K_TILE]
                     mm_acc = pl.matmul_acc(mm_acc, mm_hidden_tile, mm_weight_tile, b_trans=True, init_cond=(mm_kb == 0))
 
-                # The block is one owner's rows; the two lanes push its two
-                # contiguous halves straight to that owner's window.
+                # Map the lane's first row to its owner and local row offset.
                 for aiv_id in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
                     mm_shard = pl.aiv_shard(mm_acc)
-                    owner_tp = mm_rb // (MAX_LOGIT_ROWS // MM_ROW_TILE)
-                    owner_r0 = (mm_rb % (MAX_LOGIT_ROWS // MM_ROW_TILE)) * MM_ROW_TILE + aiv_id * LANE_ROWS
+                    group_row = mm_r0 + aiv_id * LANE_ROWS
+                    owner_tp = group_row // MAX_LOGIT_ROWS
+                    owner_r0 = group_row % MAX_LOGIT_ROWS
                     if aiv_id * LANE_ROWS < MM_ROW_TILE:
                         pld.tensor.remote_store(
                             mm_shard, logits_window, group_base + owner_tp,
@@ -270,8 +273,9 @@ def lm_head(
 
                     for aiv_id in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
                         tail_shard = pl.aiv_shard(tail_acc)
-                        owner_tp = tail_rb // (MAX_LOGIT_ROWS // MM_ROW_TILE)
-                        owner_r0 = (tail_rb % (MAX_LOGIT_ROWS // MM_ROW_TILE)) * MM_ROW_TILE + aiv_id * LANE_ROWS
+                        group_row = tail_r0 + aiv_id * LANE_ROWS
+                        owner_tp = group_row // MAX_LOGIT_ROWS
+                        owner_r0 = group_row % MAX_LOGIT_ROWS
                         if aiv_id * LANE_ROWS < MM_ROW_TILE:
                             pld.tensor.remote_store(
                                 tail_shard, logits_window, group_base + owner_tp,
@@ -388,8 +392,7 @@ def greedy_sample(
     constrained row; it never overlaps vocabulary bits. An all--1 mask takes
     the native argmax fast path without expanding the bitset.
     """
-    # One pass per row into a [BLOCK_ROWS, ROW_WIDTH] accumulator carrying the
-    # running maximum and the block that set it; a lane's column is its position.
+    # Unconstrained rows reduce contiguous vocabulary segments independently.
     # The inactive-row mask rides the same block: a dead row skips the scan
     # instead of being overwritten by a second pass over sampled_ids.
     logits_grid = pl.reshape(logits, [MAX_LOGIT_ROWS * GREEDY_GRID_ROWS, GREEDY_ROW_WIDTH])
@@ -401,43 +404,21 @@ def greedy_sample(
             # -1 selects the native argmax without reading or expanding mask bits.
             if pl.read(grammar_mask, [row, 0, GRAMMAR_SEGMENT_WORDS - 1]) == -1:
                 row_base = row * GREEDY_GRID_ROWS
-                running_max = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.FP32, value=FP32_NEG_INF)
-                running_base = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.INT32, value=0)
+                segment_maxima = pl.full([GREEDY_BLOCK_ROWS, GREEDY_GRID_ROWS], dtype=pl.FP32, value=0.0)
+                segment_indices = pl.full([1, GREEDY_GRID_ROWS], dtype=pl.INT32, value=0)
                 for block in pl.range(GREEDY_GRID_ROWS // GREEDY_BLOCK_ROWS):
-                    block_row = row_base + block * GREEDY_BLOCK_ROWS
+                    segment = block * GREEDY_BLOCK_ROWS
+                    block_row = row_base + segment
                     scores = logits_grid[block_row : block_row + GREEDY_BLOCK_ROWS, 0:GREEDY_ROW_WIDTH]
-                    # Strict greater-than, so a lane keeps the earliest block it peaked at.
-                    is_newer = pl.cmp(scores, running_max, cmp_type=4)
-                    newer = pl.cast(is_newer, target_type=pl.INT32)
-                    running_max = pl.maximum(running_max, scores)
-                    block_base = pl.cast(block * GREEDY_BLOCK_SPAN, pl.INT32)
-                    to_new = pl.neg(pl.sub(running_base, block_base))
-                    running_base = pl.add(running_base, pl.mul(newer, to_new))
-
-                # Broadcast the lane maxima back and column-reduce: every entry is then the
-                # row maximum. A scalar pl.max over the lanes miscompiles on fp32
-                # (ptoas_bitcast has no float overload).
-                lane_maxima = pl.row_max(running_max)
-                lane_zeros = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.FP32, value=0.0)
-                lane_broadcast = pl.row_expand_add(lane_zeros, lane_maxima)
-                best_value = pl.read(pl.col_max(lane_broadcast), [0, 0])
-
-                # Flat index of every lane still at the row maximum, sentinel for the rest.
-                # The lane * width term folds into the scalar combine below, keeping the
-                # ramp a broadcast row rather than an (illegal) 2D arange.
-                ramp_zeros = pl.full([GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH], dtype=pl.INT32, value=0)
-                column_ramp = pl.col_expand(ramp_zeros, pl.arange(0, [1, GREEDY_ROW_WIDTH], dtype=pl.INT32))
-                flat_index = pl.add(running_base, column_ramp)
-                is_max = pl.cmp(running_max, best_value, cmp_type=0)
-                hit = pl.cast(is_max, target_type=pl.INT32)
-                offset_index = pl.sub(flat_index, GREEDY_INDEX_SENTINEL)
-                candidates = pl.add(pl.mul(hit, offset_index), GREEDY_INDEX_SENTINEL)
-                lane_indices = pl.row_min(candidates)
-                best_index = pl.read(lane_indices, [0, 0])
-                for lane in pl.range(1, GREEDY_BLOCK_ROWS):
-                    lane_term = pl.cast(lane * GREEDY_ROW_WIDTH, pl.INT32)
-                    lane_best = pl.read(lane_indices, [lane, 0]) + lane_term
-                    best_index = pl.min(best_index, lane_best)
+                    segment_maxima[0:1, segment : segment + GREEDY_BLOCK_ROWS] = pl.reshape(
+                        pl.row_max(scores), [1, GREEDY_BLOCK_ROWS]
+                    )
+                    segment_indices[0:1, segment : segment + GREEDY_BLOCK_ROWS] = pl.reshape(
+                        pl.row_argmax(scores), [1, GREEDY_BLOCK_ROWS]
+                    )
+                best_segment = pl.read(pl.row_argmax(segment_maxima), [0, 0])
+                index = pl.read(segment_indices, [0, pl.cast(best_segment, pl.INDEX)])
+                best_index = pl.cast(best_segment * GREEDY_ROW_WIDTH, pl.INT32) + index
 
             else:
                 row_base = row * GREEDY_GRID_ROWS
