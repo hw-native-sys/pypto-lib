@@ -32,6 +32,9 @@ SOFTWARE.
 #undef __cpp_concepts
 #endif
 #include <utils/debug/asc_assert.h>
+#if defined(__DAV_VEC__)
+#include <adv_api/sort/sort.h>
+#endif
 #include "tensor.h"
 #include "intrinsic.h"
 
@@ -1144,6 +1147,55 @@ __simd_vf__ inline void vf_mqa_logits_reduce(
     constexpr uint32_t kNumVecRegs = kNumElems / kNumElemsPerVecReg;
     static_assert(kNumElems % kNumElemsPerVecReg == 0 && kNumVecRegs >= 1 && kNumVecRegs <= 4);
     static_assert((kNumQueries == 1 || kNumQueries == 2) && kSplitKV == 512);
+#if defined(PREFILL_FP32_HEAD_SUM)
+    if constexpr (kPageSize == 128) {
+        // Match the prefill expression: each product rounds to BF16, while
+        // the head reduction accumulates in FP32 and rounds once at the end.
+        constexpr uint32_t lanes = asc_get_vf_len() / sizeof(float);
+        constexpr uint32_t pieces = kNumElems / lanes;
+        const auto full = pset_b32(PAT_ALL);
+        const auto full16 = pset_b16(PAT_ALL);
+        vector_float sums[kNumQueries][pieces];
+        #pragma unroll
+        for (uint32_t q = 0; q < kNumQueries; ++q) {
+            #pragma unroll
+            for (uint32_t p = 0; p < pieces; ++p) {
+                vdup(sums[q][p], 0.0f, full, MODE_ZEROING);
+            }
+        }
+        #pragma unroll 1
+        for (uint16_t h = 0; h < kNumHeads; ++h) {
+            #pragma unroll
+            for (uint32_t q = 0; q < kNumQueries; ++q) {
+                vector_bfloat16_t weight;
+                vlds(weight, weights, (q_idx + q) * kNumHeads + h, BRC_B16);
+                const uint32_t base = ((q_local + q) * kNumHeads + h) * kNumElems;
+                #pragma unroll
+                for (uint32_t p = 0; p < pieces; ++p) {
+                    vector_bfloat16_t value, product;
+                    vector_float wide;
+                    vlds(value, score, base + p * lanes, UNPK_B16);
+                    vmul(product, value, weight, full16, MODE_ZEROING);
+                    vcvt(wide, product, full, PART_EVEN);
+                    vadd(sums[q][p], sums[q][p], wide, full, MODE_ZEROING);
+                }
+            }
+        }
+        #pragma unroll
+        for (uint32_t q = 0; q < kNumQueries; ++q) {
+            #pragma unroll
+            for (uint32_t p = 0; p < pieces; ++p) {
+                const uint32_t page = p / 2;
+                const uint32_t reverse = (reversed_pairs >> (page / 2)) & 1u;
+                const uint32_t offset = (page ^ reverse) * kNumElemsPerVecReg + (p % 2) * lanes;
+                vector_bfloat16_t rounded;
+                vcvt(rounded, sums[q][p], full, ROUND_R, RS_DISABLE, PART_EVEN);
+                vsts(rounded, line, q * kSplitKV + offset, PK_B32, full);
+            }
+        }
+        return;
+    }
+#endif
     vector_bool mask = asc_create_mask_b16(PAT_ALL);
     vector_bfloat16_t sum[kNumVecRegs][kNumQueries];
     #pragma unroll
@@ -1804,7 +1856,6 @@ static __aicore__ __attribute__((noinline)) void score(__gm__ int64_t* args) {
     asc_sync();
 }
 #if defined(__DAV_VEC__)
-#include <adv_api/sort/sort.h>
 #include <c_api/asc_simd.h>
 #include <kernel_operator.h>
 
@@ -3224,10 +3275,15 @@ __simt_callee__ __aicore__ inline uint32_t simt_ceil_div(uint32_t n, uint32_t d)
     return (n + d - 1) / d;
 }
 
+// Read the current producer values when the persistent AIV reuses a GM address.
+__simt_callee__ __aicore__ inline uint32_t load_metadata_input(__gm__ uint32_t* address) {
+    return __ldg<LD_L2CacheType::L2_CACHE_HINT_NORMAL_FV, L1CacheType::NON_CACHEABLE>(address);
+}
+
 __simt_callee__ __aicore__ inline uint32_t simt_context_len(uint32_t q, uint32_t count, __gm__ uint32_t* lengths) {
     uint32_t context_len = 0;
     for (uint32_t row = q; row < q + count; ++row)
-        context_len = context_len > lengths[row] ? context_len : lengths[row];
+        context_len = max(context_len, load_metadata_input(lengths + row));
     return context_len;
 }
 
@@ -3321,7 +3377,8 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumPagedMQAMetadataThreads) inline voi
     const uint32_t q_token_end_idx = min(q_token_begin_idx + num_q_tokens_per_thread, num_q_tokens);
     uint32_t num_request_starts = 0;
     for (uint32_t q_token_idx = q_token_begin_idx; q_token_idx < q_token_end_idx; ++q_token_idx) {
-        const bool is_request_start = q_token_idx == 0 || indices[q_token_idx] != indices[q_token_idx - 1];
+        const bool is_request_start = q_token_idx == 0 ||
+            load_metadata_input(indices + q_token_idx) != load_metadata_input(indices + q_token_idx - 1);
         prefix[q_token_idx] = is_request_start;
         num_request_starts += is_request_start;
     }
@@ -3383,7 +3440,8 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumPagedMQAMetadataThreads) inline voi
         uint32_t q_token_start = 0;
         while (q_token_start < num_q_tokens) {
             uint32_t q_token_end = q_token_start + 1;
-            while (q_token_end < num_q_tokens && indices[q_token_end] == indices[q_token_start])
+            while (q_token_end < num_q_tokens &&
+                   load_metadata_input(indices + q_token_end) == load_metadata_input(indices + q_token_start))
                 ++q_token_end;
             total_cost += paged_mqa_request_cost<kSplitKV, kNumQTokensPerTile>(
                 q_token_start, q_token_end - q_token_start, context_lens);
@@ -3404,7 +3462,8 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumPagedMQAMetadataThreads) inline voi
             uint32_t q_token_start = 0;
             while (q_token_start < num_q_tokens) {
                 uint32_t q_token_end = q_token_start + 1;
-                while (q_token_end < num_q_tokens && indices[q_token_end] == indices[q_token_start])
+                while (q_token_end < num_q_tokens &&
+                       load_metadata_input(indices + q_token_end) == load_metadata_input(indices + q_token_start))
                     ++q_token_end;
                 const uint32_t num_q_tokens_in_request = q_token_end - q_token_start;
                 const uint32_t request_cost = paged_mqa_request_cost<kSplitKV, kNumQTokensPerTile>(

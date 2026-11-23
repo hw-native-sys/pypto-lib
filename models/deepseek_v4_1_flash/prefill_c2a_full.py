@@ -175,49 +175,35 @@ def prefill_c2a_full(
             compressed_latent, w_index_k, w_index_norm, compressed_rope_cos, compressed_rope_sin,
             compressed_write_slots, index_cache, index_cache_scale, kv_token_count, compressed_published, no_dependency,
         )
-        chunk_hidden = pl.create_tensor([Q_TILE, D], dtype=pl.BF16)
-        chunk_rope_cos = pl.create_tensor([Q_TILE, ROPE_DIM // 2], dtype=pl.FP32)
-        chunk_rope_sin = pl.create_tensor([Q_TILE, ROPE_DIM // 2], dtype=pl.FP32)
-        chunk_window_indices = pl.create_tensor([Q_TILE, 128], dtype=pl.INT32)
-        chunk_request_ids = pl.create_tensor([Q_TILE], dtype=pl.INT32)
-        chunk_compressed_lens = pl.create_tensor([Q_TILE], dtype=pl.INT32)
-        chunk_topk_indices = pl.create_tensor([Q_TILE, INDEX_TOPK], dtype=pl.INT32)
-        q_latent = pl.create_tensor([Q_TILE, Q_LORA], dtype=pl.BF16)
-        q = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-
-        chunk_done = pl.system.task_invalid()
         for start in pl.range(0, kv_token_count, Q_TILE):
             active = pl.min(Q_TILE, kv_token_count - start)
-            # The prior chunk must finish reading every reusable scratch buffer.
-            with pl.spmd(WORKER_TILE, name_hint="prefill_c2a_full_stage", deps=[chunk_done]):
-                worker = pl.tile.get_block_idx()
-                for row in pl.range(worker, active, WORKER_TILE):
-                    source_row = start + row
-                    chunk_hidden[row:row + 1, :] = kv_hidden[source_row:source_row + 1, :]
-                    chunk_rope_cos[row:row + 1, :] = kv_rope_cos[source_row:source_row + 1, :]
-                    chunk_rope_sin[row:row + 1, :] = kv_rope_sin[source_row:source_row + 1, :]
-                    chunk_window_indices[row:row + 1, :] = q_window_indices[source_row:source_row + 1, :]
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="stage_query_metadata", deps=[chunk_done]):
-                for row in pl.range(active):
-                    request_ids_value = pl.read(q_request_ids, [start + row])
-                    pl.write(chunk_request_ids, [row], request_ids_value)
-                    compressed_lens_value = pl.read(q_compressed_lens, [start + row])
-                    pl.write(chunk_compressed_lens, [row], compressed_lens_value)
-            q_input_payload, q_input_scales, q_input_payload_padded_rows = qkv_quant(
-                chunk_hidden, active, row_tile=256,
-            )
-            q_proj_rope(
+            chunk_hidden = pl.slice(kv_hidden, [active, D], [start, 0])
+            chunk_rope_cos = pl.slice(kv_rope_cos, [active, ROPE_DIM // 2], [start, 0])
+            chunk_rope_sin = pl.slice(kv_rope_sin, [active, ROPE_DIM // 2], [start, 0])
+            chunk_window_indices = pl.slice(q_window_indices, [active, 128], [start, 0])
+            chunk_request_ids = pl.slice(q_request_ids, [active], [start])
+            chunk_compressed_lens = pl.slice(q_compressed_lens, [active], [start])
+            chunk_topk_indices = pl.slice(q_topk_indices, [active, INDEX_TOPK], [start, 0])
+            q_latent = pl.create_tensor([Q_TILE, Q_LORA], dtype=pl.BF16)
+            q = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+            # Q and KV consume the same M16-packed activations on the unsharded path.
+            q_input_payload_padded_rows = ((active + 255) // 256) * 256
+            q_input_payload = pl.slice(kv_input_payload, [q_input_payload_padded_rows, D], [start, 0])
+            scale_columns = q_input_payload_padded_rows * (D // 32)
+            q_input_scales = pl.slice(kv_input_scales, [1, scale_columns], [0, start * (D // 32)])
+            qb_payload, qb_scales = q_proj_rope(
                 q_input_payload, q_input_scales,
                 wq_a, wq_a_scale, wq_norm,
                 wq_b, wq_b_scale,
                 chunk_rope_cos, chunk_rope_sin,
                 q_latent, q,
-                active, qa_worker_limit=24, qb_worker_limit=24,
+                active, qa_worker_limit=24, qb_worker_limit=32,
                 padded_rows=q_input_payload_padded_rows,
                 qa_row_tile=256, qb_row_tile=128,
             )
             attn_out = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
             _index_ready = prefill_indexer(
+                qb_payload, qb_scales,
                 chunk_hidden, q_latent, chunk_request_ids, chunk_compressed_lens,
                 index_cache, index_cache_scale, index_block_table,
                 chunk_rope_cos, chunk_rope_sin, w_index_q, w_index_q_scale, w_index_score,
@@ -228,18 +214,13 @@ def prefill_c2a_full(
                 q, chunk_window_indices, window_cache, chunk_topk_indices, compressed_cache,
                 attn_sink, attn_out, active, compressed_keys=INDEX_TOPK,
             )
-            _chunk_output, projection_done = o_proj_hc_post(
+            _chunk_output, _projection_done = o_proj_hc_post(
                 attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_rope_cos, chunk_rope_sin,
                 hc_input[start:start + active, :, :], post_mix[start:start + active, :],
                 residual_mix[start:start + active, :, :], hc_output[start:start + active, :, :], active,
                 oa_row_tile=128, ob_row_tile=128,
             )
 
-            with pl.spmd(WORKER_TILE, name_hint="prefill_c2a_full_collect", deps=[projection_done]) as collect_tid:
-                worker = pl.tile.get_block_idx()
-                for row in pl.range(worker, active, WORKER_TILE):
-                    q_topk_indices[start + row:start + row + 1, :] = chunk_topk_indices[row:row + 1, :]
-            chunk_done = collect_tid
     if kv_token_count < q_capacity:
         with pl.spmd(32, name_hint="prefill_c2a_full_zero_padding"):
             worker = pl.tile.get_block_idx()
@@ -628,19 +609,20 @@ def prefill_c2a_full_cp(
             q_input_payload, q_input_scales, q_input_payload_padded_rows = qkv_quant(
                 chunk_hidden, active, row_tile=256,
             )
-            q_proj_rope(
+            qb_payload, qb_scales = q_proj_rope(
                 q_input_payload, q_input_scales,
                 wq_a, wq_a_scale, wq_norm,
                 wq_b, wq_b_scale,
                 chunk_rope_cos, chunk_rope_sin,
                 q_latent, q,
-                active, qa_worker_limit=24, qb_worker_limit=24,
+                active, qa_worker_limit=24, qb_worker_limit=32,
                 padded_rows=q_input_payload_padded_rows,
                 qa_row_tile=256, qb_row_tile=128,
             )
             attn_out = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
             index_inputs_ready = pl.system.task_dummy(deps=[stage_tid, compressed_ready])
             _index_ready = prefill_indexer(
+                qb_payload, qb_scales,
                 chunk_hidden, q_latent, chunk_request_ids, chunk_compressed_lens,
                 index_cache, index_cache_scale, index_block_table,
                 chunk_rope_cos, chunk_rope_sin, w_index_q, w_index_q_scale, w_index_score,
@@ -1318,7 +1300,7 @@ if __name__ == "__main__":
     from quant import packed_cache_compare
     from pypto.ir import DistributedConfig
 
-    from utils import parse_prefill_groups
+    from utils import parse_prefill_groups, prefill_index_validation_cases
 
     parser = argparse.ArgumentParser(description="DeepSeek V4.1 prefill C2A full")
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
@@ -1349,9 +1331,8 @@ if __name__ == "__main__":
             parser.error("dp-tokens must contain one count per DP group, each in [0, tokens]")
     torch.set_num_threads(8)
     entry = l3_prefill_c2a_full if CP_SIZE == 1 else l3_prefill_c2a_full_cp
-    result = run(
+    run_kwargs = dict(
         fn=entry,
-        specs=build_c2a_specs(args, entry, mode="full"),
         golden_fn=functools.partial(golden_c2a_prefill, mode="full"),
         compile_only=args.compile_only,
         save_data=args.save_data,
@@ -1410,5 +1391,7 @@ if __name__ == "__main__":
             ),
         },
     )
-    if not result.passed:
-        raise SystemExit(result.error or 1)
+    for case in prefill_index_validation_cases(args, ratio=2):
+        result = run(specs=build_c2a_specs(case, entry, mode="full"), **run_kwargs)
+        if not result.passed:
+            raise SystemExit(result.error or 1)

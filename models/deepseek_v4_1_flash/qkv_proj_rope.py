@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Shared V4.1 Q/KV projection, normalization, RoPE, and window cache publication."""
 
+from __future__ import annotations
 
 from pathlib import Path
 
@@ -42,9 +43,11 @@ ROPE_DIM = M.qk_rope_head_dim
 Q_LORA = M.q_lora_rank
 
 # tiling
-Q_A_N_TILE = 64
 Q_B_N_TILE = 256
 KV_N_TILE = 64
+KV_DECODE_N_TILE = 32
+KV_DECODE_K_TILE = 384
+KV_DECODE_LAST_K_TILE = (D - 1) % KV_DECODE_K_TILE + 1
 QKV_SCALE_TILE = MX_M_TILE * MX_K_TILE // 32
 PROJ_M_TILE = 80
 PROJ_WIDE_M_TILE = 128
@@ -58,21 +61,6 @@ WINDOW_PAGE_SIZE = 128
 # Window tiling.
 WINDOW_ROW_TILE = 8
 WINDOW_SLOT_TILE = 128
-
-
-@pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "proj_q_a.cpp",
-               include_dirs=(pto_isa_include_dir(),))
-def _proj_q_a(
-    payload: pl.Tensor[[QA_INPUT_ROWS, D], pl.FP8E4M3FN],
-    weight: pl.Tensor,
-    activation_scale: pl.Tensor[[1, QA_SCALE_COLS], pl.FP8E8M0],
-    weight_scale: pl.Tensor,
-    output: pl.Out[pl.Tensor[[QA_OUTPUT_ROWS, Q_LORA], pl.BF16]],
-    rows: pl.Scalar[pl.INDEX],
-    row_tile: pl.Scalar[pl.INDEX],
-) -> pl.Tensor:
-    """Project ND activations and NZ weights with packed MX scales."""
-    return output
 
 
 @pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "proj_q_b.cpp",
@@ -527,6 +515,402 @@ def qkv_quant(
 
 
 @pl.jit.inline(auto_scope=False)
+def _proj_q_a_decode(
+    payload: pl.Tensor,
+    weight: pl.Tensor,
+    activation_scale: pl.Tensor,
+    weight_scale: pl.Tensor,
+    output: pl.Tensor,
+    rows: pl.Scalar[pl.INDEX],
+    worker_limit: pl.constexpr,
+    m_tile: pl.constexpr,
+    n_tile: pl.constexpr,
+    k_tile: pl.constexpr,
+):
+    """Project decode tiles with two L1 panels of five MX fragments each."""
+    panel_k = 5 * k_tile
+    panel_pairs = D // (2 * panel_k)
+    # Each scale band packs 16 rows and one exponent per 32 K values.
+    scale_width = 16 * (k_tile // 32)
+    panel_scale_width = 5 * scale_width
+    output_tiles = Q_LORA // n_tile
+    nz_weight: pl.Tensor[[5120, 1280], pl.FP8E4M3FN, pl.NZ] = weight[:, :]
+    raw_b = pl.tensor.view(weight_scale, [80, 2560], layout=pl.ND)
+    tasks = ((rows + m_tile - 1) // m_tile) * output_tiles
+    stride = pl.max(1, worker_limit)
+    workers = pl.max(1, pl.min(tasks, stride))
+    for worker in pl.spmd(workers, sync_start=False, name_hint="proj_q_a"):
+        scale_bands = pl.tensor.dim(activation_scale, 1) // 2560
+        raw_a = pl.tensor.view(activation_scale, [scale_bands, 2560], layout=pl.ND)
+        for base in pl.range(0, tasks, stride):
+            task = base + worker
+            if task < tasks:
+                row = task // output_tiles * m_tile
+                col = task % output_tiles * n_tile
+                pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
+                pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
+                # Fill both L1 banks before starting the first five-fragment panel.
+                a_pre0: pl.Tile[[m_tile, 5 * k_tile], pl.FP8E4M3FN, pl.MemRef("mat_a0"), pl.Mem.Mat] = pl.load(payload, [row, 0], [m_tile, 5 * k_tile], target_memory=pl.Mem.Mat)
+                b_pre0: pl.Tile[[5 * k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("mat_b0"), pl.Mem.Mat] = pl.load(nz_weight, [0, col], [5 * k_tile, n_tile], target_memory=pl.Mem.Mat)
+                a0_0_pre_buf: pl.Tile[[m_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_a0_0"), pl.Mem.Mat] = pl.tile.create([m_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                a0_0_pre_dst = pl.tile.reshape(a0_0_pre_buf, [m_tile // 16, k_tile // 2])
+                a0_0_pre_loaded = pl.tile.gather_row(a0_0_pre_dst, raw_a, [0, 0], [row // 16, 0], [m_tile // 16, k_tile // 2])
+                b0_0_pre_buf: pl.Tile[[n_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_b0_0"), pl.Mem.Mat] = pl.tile.create([n_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                b0_0_pre_dst = pl.tile.reshape(b0_0_pre_buf, [n_tile // 16, k_tile // 2])
+                b0_0_pre_loaded = pl.tile.gather_row(b0_0_pre_dst, raw_b, [0, 0], [col // 16, 0], [n_tile // 16, k_tile // 2])
+                a0_1_pre_buf: pl.Tile[[m_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_a0_1"), pl.Mem.Mat] = pl.tile.create([m_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                a0_1_pre_dst = pl.tile.reshape(a0_1_pre_buf, [m_tile // 16, k_tile // 2])
+                a0_1_pre_loaded = pl.tile.gather_row(a0_1_pre_dst, raw_a, [0, 0], [row // 16, scale_width], [m_tile // 16, k_tile // 2])
+                b0_1_pre_buf: pl.Tile[[n_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_b0_1"), pl.Mem.Mat] = pl.tile.create([n_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                b0_1_pre_dst = pl.tile.reshape(b0_1_pre_buf, [n_tile // 16, k_tile // 2])
+                b0_1_pre_loaded = pl.tile.gather_row(b0_1_pre_dst, raw_b, [0, 0], [col // 16, scale_width], [n_tile // 16, k_tile // 2])
+                a0_2_pre_buf: pl.Tile[[m_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_a0_2"), pl.Mem.Mat] = pl.tile.create([m_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                a0_2_pre_dst = pl.tile.reshape(a0_2_pre_buf, [m_tile // 16, k_tile // 2])
+                a0_2_pre_loaded = pl.tile.gather_row(a0_2_pre_dst, raw_a, [0, 0], [row // 16, 2 * scale_width], [m_tile // 16, k_tile // 2])
+                b0_2_pre_buf: pl.Tile[[n_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_b0_2"), pl.Mem.Mat] = pl.tile.create([n_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                b0_2_pre_dst = pl.tile.reshape(b0_2_pre_buf, [n_tile // 16, k_tile // 2])
+                b0_2_pre_loaded = pl.tile.gather_row(b0_2_pre_dst, raw_b, [0, 0], [col // 16, 2 * scale_width], [n_tile // 16, k_tile // 2])
+                a0_3_pre_buf: pl.Tile[[m_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_a0_3"), pl.Mem.Mat] = pl.tile.create([m_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                a0_3_pre_dst = pl.tile.reshape(a0_3_pre_buf, [m_tile // 16, k_tile // 2])
+                a0_3_pre_loaded = pl.tile.gather_row(a0_3_pre_dst, raw_a, [0, 0], [row // 16, 3 * scale_width], [m_tile // 16, k_tile // 2])
+                b0_3_pre_buf: pl.Tile[[n_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_b0_3"), pl.Mem.Mat] = pl.tile.create([n_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                b0_3_pre_dst = pl.tile.reshape(b0_3_pre_buf, [n_tile // 16, k_tile // 2])
+                b0_3_pre_loaded = pl.tile.gather_row(b0_3_pre_dst, raw_b, [0, 0], [col // 16, 3 * scale_width], [n_tile // 16, k_tile // 2])
+                a0_4_pre_buf: pl.Tile[[m_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_a0_4"), pl.Mem.Mat] = pl.tile.create([m_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                a0_4_pre_dst = pl.tile.reshape(a0_4_pre_buf, [m_tile // 16, k_tile // 2])
+                a0_4_pre_loaded = pl.tile.gather_row(a0_4_pre_dst, raw_a, [0, 0], [row // 16, 4 * scale_width], [m_tile // 16, k_tile // 2])
+                b0_4_pre_buf: pl.Tile[[n_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_b0_4"), pl.Mem.Mat] = pl.tile.create([n_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                b0_4_pre_dst = pl.tile.reshape(b0_4_pre_buf, [n_tile // 16, k_tile // 2])
+                b0_4_pre_loaded = pl.tile.gather_row(b0_4_pre_dst, raw_b, [0, 0], [col // 16, 4 * scale_width], [n_tile // 16, k_tile // 2])
+                pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 0)
+                a_pre1: pl.Tile[[m_tile, 5 * k_tile], pl.FP8E4M3FN, pl.MemRef("mat_a1"), pl.Mem.Mat] = pl.load(payload, [row, panel_k], [m_tile, 5 * k_tile], target_memory=pl.Mem.Mat)
+                b_pre1: pl.Tile[[5 * k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("mat_b1"), pl.Mem.Mat] = pl.load(nz_weight, [panel_k, col], [5 * k_tile, n_tile], target_memory=pl.Mem.Mat)
+                a1_0_pre_buf: pl.Tile[[m_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_a1_0"), pl.Mem.Mat] = pl.tile.create([m_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                a1_0_pre_dst = pl.tile.reshape(a1_0_pre_buf, [m_tile // 16, k_tile // 2])
+                a1_0_pre_loaded = pl.tile.gather_row(a1_0_pre_dst, raw_a, [0, 0], [row // 16, panel_scale_width], [m_tile // 16, k_tile // 2])
+                b1_0_pre_buf: pl.Tile[[n_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_b1_0"), pl.Mem.Mat] = pl.tile.create([n_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                b1_0_pre_dst = pl.tile.reshape(b1_0_pre_buf, [n_tile // 16, k_tile // 2])
+                b1_0_pre_loaded = pl.tile.gather_row(b1_0_pre_dst, raw_b, [0, 0], [col // 16, panel_scale_width], [n_tile // 16, k_tile // 2])
+                a1_1_pre_buf: pl.Tile[[m_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_a1_1"), pl.Mem.Mat] = pl.tile.create([m_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                a1_1_pre_dst = pl.tile.reshape(a1_1_pre_buf, [m_tile // 16, k_tile // 2])
+                a1_1_pre_loaded = pl.tile.gather_row(a1_1_pre_dst, raw_a, [0, 0], [row // 16, 6 * scale_width], [m_tile // 16, k_tile // 2])
+                b1_1_pre_buf: pl.Tile[[n_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_b1_1"), pl.Mem.Mat] = pl.tile.create([n_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                b1_1_pre_dst = pl.tile.reshape(b1_1_pre_buf, [n_tile // 16, k_tile // 2])
+                b1_1_pre_loaded = pl.tile.gather_row(b1_1_pre_dst, raw_b, [0, 0], [col // 16, 6 * scale_width], [n_tile // 16, k_tile // 2])
+                a1_2_pre_buf: pl.Tile[[m_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_a1_2"), pl.Mem.Mat] = pl.tile.create([m_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                a1_2_pre_dst = pl.tile.reshape(a1_2_pre_buf, [m_tile // 16, k_tile // 2])
+                a1_2_pre_loaded = pl.tile.gather_row(a1_2_pre_dst, raw_a, [0, 0], [row // 16, 7 * scale_width], [m_tile // 16, k_tile // 2])
+                b1_2_pre_buf: pl.Tile[[n_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_b1_2"), pl.Mem.Mat] = pl.tile.create([n_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                b1_2_pre_dst = pl.tile.reshape(b1_2_pre_buf, [n_tile // 16, k_tile // 2])
+                b1_2_pre_loaded = pl.tile.gather_row(b1_2_pre_dst, raw_b, [0, 0], [col // 16, 7 * scale_width], [n_tile // 16, k_tile // 2])
+                a1_3_pre_buf: pl.Tile[[m_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_a1_3"), pl.Mem.Mat] = pl.tile.create([m_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                a1_3_pre_dst = pl.tile.reshape(a1_3_pre_buf, [m_tile // 16, k_tile // 2])
+                a1_3_pre_loaded = pl.tile.gather_row(a1_3_pre_dst, raw_a, [0, 0], [row // 16, 8 * scale_width], [m_tile // 16, k_tile // 2])
+                b1_3_pre_buf: pl.Tile[[n_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_b1_3"), pl.Mem.Mat] = pl.tile.create([n_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                b1_3_pre_dst = pl.tile.reshape(b1_3_pre_buf, [n_tile // 16, k_tile // 2])
+                b1_3_pre_loaded = pl.tile.gather_row(b1_3_pre_dst, raw_b, [0, 0], [col // 16, 8 * scale_width], [n_tile // 16, k_tile // 2])
+                a1_4_pre_buf: pl.Tile[[m_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_a1_4"), pl.Mem.Mat] = pl.tile.create([m_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                a1_4_pre_dst = pl.tile.reshape(a1_4_pre_buf, [m_tile // 16, k_tile // 2])
+                a1_4_pre_loaded = pl.tile.gather_row(a1_4_pre_dst, raw_a, [0, 0], [row // 16, 9 * scale_width], [m_tile // 16, k_tile // 2])
+                b1_4_pre_buf: pl.Tile[[n_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_b1_4"), pl.Mem.Mat] = pl.tile.create([n_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                b1_4_pre_dst = pl.tile.reshape(b1_4_pre_buf, [n_tile // 16, k_tile // 2])
+                b1_4_pre_loaded = pl.tile.gather_row(b1_4_pre_dst, raw_b, [0, 0], [col // 16, 9 * scale_width], [n_tile // 16, k_tile // 2])
+                pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 1)
+                acc = pl.tile.create([m_tile, n_tile], pl.FP32, target_memory=pl.Mem.Acc)
+                # Consume alternating panels and refill each bank after its final MTE1 read.
+                for cycle in pl.range(panel_pairs):
+                    pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 0)
+                    mat_a0: pl.Tile[[m_tile, 5 * k_tile], pl.FP8E4M3FN, pl.MemRef("mat_a0"), pl.Mem.Mat] = pl.tile.create([m_tile, 5 * k_tile], pl.FP8E4M3FN, target_memory=pl.Mem.Mat)
+                    mat_b0: pl.Tile[[5 * k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("mat_b0"), pl.Mem.Mat] = pl.tile.create([5 * k_tile, n_tile], pl.FP8E4M3FN, target_memory=pl.Mem.Mat)
+                    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
+                    a_reg0: pl.Tile[[m_tile, k_tile], pl.FP8E4M3FN, pl.MemRef("a_l0_0"), pl.Mem.Left] = pl.tile.extract(mat_a0, 0, 0, [m_tile, k_tile], target_memory=pl.Mem.Left)
+                    a_box0: pl.Tile[[m_tile, k_tile // 32], pl.FP8E8M0, pl.MemRef("mx_a0_0"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([m_tile, k_tile // 32], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                    a_scale0 = pl.tile.move(a_box0, target_memory=pl.Mem.LeftScale)
+                    b_reg0: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("b_l0_0"), pl.Mem.Right] = pl.tile.extract(mat_b0, 0, 0, [k_tile, n_tile], target_memory=pl.Mem.Right)
+                    b_box0: pl.Tile[[k_tile // 32, n_tile], pl.FP8E8M0, pl.MemRef("mx_b0_0"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([k_tile // 32, n_tile], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                    b_scale0 = pl.tile.move(b_box0, target_memory=pl.Mem.RightScale)
+                    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
+                    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
+                    if cycle == 0:
+                        acc = pl.matmul_mx(a_reg0, a_scale0, b_reg0, b_scale0)
+                    else:
+                        acc = pl.matmul_mx_acc(acc, a_reg0, a_scale0, b_reg0, b_scale0)
+                    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
+                    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
+                    a_reg1: pl.Tile[[m_tile, k_tile], pl.FP8E4M3FN, pl.MemRef("a_l0_1"), pl.Mem.Left] = pl.tile.extract(mat_a0, 0, k_tile, [m_tile, k_tile], target_memory=pl.Mem.Left)
+                    a_box1: pl.Tile[[m_tile, k_tile // 32], pl.FP8E8M0, pl.MemRef("mx_a0_1"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([m_tile, k_tile // 32], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                    a_scale1 = pl.tile.move(a_box1, target_memory=pl.Mem.LeftScale)
+                    b_reg1: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("b_l0_1"), pl.Mem.Right] = pl.tile.extract(mat_b0, k_tile, 0, [k_tile, n_tile], target_memory=pl.Mem.Right)
+                    b_box1: pl.Tile[[k_tile // 32, n_tile], pl.FP8E8M0, pl.MemRef("mx_b0_1"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([k_tile // 32, n_tile], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                    b_scale1 = pl.tile.move(b_box1, target_memory=pl.Mem.RightScale)
+                    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
+                    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
+                    acc = pl.matmul_mx_acc(acc, a_reg1, a_scale1, b_reg1, b_scale1)
+                    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
+                    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
+                    a_reg2: pl.Tile[[m_tile, k_tile], pl.FP8E4M3FN, pl.MemRef("a_l0_0"), pl.Mem.Left] = pl.tile.extract(mat_a0, 0, 2 * k_tile, [m_tile, k_tile], target_memory=pl.Mem.Left)
+                    a_box2: pl.Tile[[m_tile, k_tile // 32], pl.FP8E8M0, pl.MemRef("mx_a0_2"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([m_tile, k_tile // 32], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                    a_scale2 = pl.tile.move(a_box2, target_memory=pl.Mem.LeftScale)
+                    b_reg2: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("b_l0_0"), pl.Mem.Right] = pl.tile.extract(mat_b0, 2 * k_tile, 0, [k_tile, n_tile], target_memory=pl.Mem.Right)
+                    b_box2: pl.Tile[[k_tile // 32, n_tile], pl.FP8E8M0, pl.MemRef("mx_b0_2"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([k_tile // 32, n_tile], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                    b_scale2 = pl.tile.move(b_box2, target_memory=pl.Mem.RightScale)
+                    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
+                    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
+                    acc = pl.matmul_mx_acc(acc, a_reg2, a_scale2, b_reg2, b_scale2)
+                    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
+                    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
+                    a_reg3: pl.Tile[[m_tile, k_tile], pl.FP8E4M3FN, pl.MemRef("a_l0_1"), pl.Mem.Left] = pl.tile.extract(mat_a0, 0, 3 * k_tile, [m_tile, k_tile], target_memory=pl.Mem.Left)
+                    a_box3: pl.Tile[[m_tile, k_tile // 32], pl.FP8E8M0, pl.MemRef("mx_a0_3"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([m_tile, k_tile // 32], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                    a_scale3 = pl.tile.move(a_box3, target_memory=pl.Mem.LeftScale)
+                    b_reg3: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("b_l0_1"), pl.Mem.Right] = pl.tile.extract(mat_b0, 3 * k_tile, 0, [k_tile, n_tile], target_memory=pl.Mem.Right)
+                    b_box3: pl.Tile[[k_tile // 32, n_tile], pl.FP8E8M0, pl.MemRef("mx_b0_3"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([k_tile // 32, n_tile], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                    b_scale3 = pl.tile.move(b_box3, target_memory=pl.Mem.RightScale)
+                    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
+                    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
+                    acc = pl.matmul_mx_acc(acc, a_reg3, a_scale3, b_reg3, b_scale3)
+                    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
+                    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
+                    a_reg4: pl.Tile[[m_tile, k_tile], pl.FP8E4M3FN, pl.MemRef("a_l0_0"), pl.Mem.Left] = pl.tile.extract(mat_a0, 0, 4 * k_tile, [m_tile, k_tile], target_memory=pl.Mem.Left)
+                    a_box4: pl.Tile[[m_tile, k_tile // 32], pl.FP8E8M0, pl.MemRef("mx_a0_4"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([m_tile, k_tile // 32], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                    a_scale4 = pl.tile.move(a_box4, target_memory=pl.Mem.LeftScale)
+                    b_reg4: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("b_l0_0"), pl.Mem.Right] = pl.tile.extract(mat_b0, 4 * k_tile, 0, [k_tile, n_tile], target_memory=pl.Mem.Right)
+                    b_box4: pl.Tile[[k_tile // 32, n_tile], pl.FP8E8M0, pl.MemRef("mx_b0_4"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([k_tile // 32, n_tile], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                    b_scale4 = pl.tile.move(b_box4, target_memory=pl.Mem.RightScale)
+                    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
+                    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
+                    acc = pl.matmul_mx_acc(acc, a_reg4, a_scale4, b_reg4, b_scale4)
+                    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
+                    if cycle + 1 < panel_pairs:
+                        pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 0)
+                        pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 0)
+                        a_next0: pl.Tile[[m_tile, 5 * k_tile], pl.FP8E4M3FN, pl.MemRef("mat_a0"), pl.Mem.Mat] = pl.load(payload, [row, (cycle * 2 + 2) * panel_k], [m_tile, 5 * k_tile], target_memory=pl.Mem.Mat)
+                        b_next0: pl.Tile[[5 * k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("mat_b0"), pl.Mem.Mat] = pl.load(nz_weight, [(cycle * 2 + 2) * panel_k, col], [5 * k_tile, n_tile], target_memory=pl.Mem.Mat)
+                        a0_0_next_buf: pl.Tile[[m_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_a0_0"), pl.Mem.Mat] = pl.tile.create([m_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                        a0_0_next_dst = pl.tile.reshape(a0_0_next_buf, [m_tile // 16, k_tile // 2])
+                        a0_0_next_loaded = pl.tile.gather_row(a0_0_next_dst, raw_a, [0, 0], [row // 16, (cycle * 2 + 2) * panel_scale_width], [m_tile // 16, k_tile // 2])
+                        b0_0_next_buf: pl.Tile[[n_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_b0_0"), pl.Mem.Mat] = pl.tile.create([n_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                        b0_0_next_dst = pl.tile.reshape(b0_0_next_buf, [n_tile // 16, k_tile // 2])
+                        b0_0_next_loaded = pl.tile.gather_row(b0_0_next_dst, raw_b, [0, 0], [col // 16, (cycle * 2 + 2) * panel_scale_width], [n_tile // 16, k_tile // 2])
+                        a0_1_next_buf: pl.Tile[[m_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_a0_1"), pl.Mem.Mat] = pl.tile.create([m_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                        a0_1_next_dst = pl.tile.reshape(a0_1_next_buf, [m_tile // 16, k_tile // 2])
+                        a0_1_next_loaded = pl.tile.gather_row(a0_1_next_dst, raw_a, [0, 0], [row // 16, (cycle * 2 + 2) * panel_scale_width + scale_width], [m_tile // 16, k_tile // 2])
+                        b0_1_next_buf: pl.Tile[[n_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_b0_1"), pl.Mem.Mat] = pl.tile.create([n_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                        b0_1_next_dst = pl.tile.reshape(b0_1_next_buf, [n_tile // 16, k_tile // 2])
+                        b0_1_next_loaded = pl.tile.gather_row(b0_1_next_dst, raw_b, [0, 0], [col // 16, (cycle * 2 + 2) * panel_scale_width + scale_width], [n_tile // 16, k_tile // 2])
+                        a0_2_next_buf: pl.Tile[[m_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_a0_2"), pl.Mem.Mat] = pl.tile.create([m_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                        a0_2_next_dst = pl.tile.reshape(a0_2_next_buf, [m_tile // 16, k_tile // 2])
+                        a0_2_next_loaded = pl.tile.gather_row(a0_2_next_dst, raw_a, [0, 0], [row // 16, (cycle * 2 + 2) * panel_scale_width + 2 * scale_width], [m_tile // 16, k_tile // 2])
+                        b0_2_next_buf: pl.Tile[[n_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_b0_2"), pl.Mem.Mat] = pl.tile.create([n_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                        b0_2_next_dst = pl.tile.reshape(b0_2_next_buf, [n_tile // 16, k_tile // 2])
+                        b0_2_next_loaded = pl.tile.gather_row(b0_2_next_dst, raw_b, [0, 0], [col // 16, (cycle * 2 + 2) * panel_scale_width + 2 * scale_width], [n_tile // 16, k_tile // 2])
+                        a0_3_next_buf: pl.Tile[[m_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_a0_3"), pl.Mem.Mat] = pl.tile.create([m_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                        a0_3_next_dst = pl.tile.reshape(a0_3_next_buf, [m_tile // 16, k_tile // 2])
+                        a0_3_next_loaded = pl.tile.gather_row(a0_3_next_dst, raw_a, [0, 0], [row // 16, (cycle * 2 + 2) * panel_scale_width + 3 * scale_width], [m_tile // 16, k_tile // 2])
+                        b0_3_next_buf: pl.Tile[[n_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_b0_3"), pl.Mem.Mat] = pl.tile.create([n_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                        b0_3_next_dst = pl.tile.reshape(b0_3_next_buf, [n_tile // 16, k_tile // 2])
+                        b0_3_next_loaded = pl.tile.gather_row(b0_3_next_dst, raw_b, [0, 0], [col // 16, (cycle * 2 + 2) * panel_scale_width + 3 * scale_width], [n_tile // 16, k_tile // 2])
+                        a0_4_next_buf: pl.Tile[[m_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_a0_4"), pl.Mem.Mat] = pl.tile.create([m_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                        a0_4_next_dst = pl.tile.reshape(a0_4_next_buf, [m_tile // 16, k_tile // 2])
+                        a0_4_next_loaded = pl.tile.gather_row(a0_4_next_dst, raw_a, [0, 0], [row // 16, (cycle * 2 + 2) * panel_scale_width + 4 * scale_width], [m_tile // 16, k_tile // 2])
+                        b0_4_next_buf: pl.Tile[[n_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_b0_4"), pl.Mem.Mat] = pl.tile.create([n_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                        b0_4_next_dst = pl.tile.reshape(b0_4_next_buf, [n_tile // 16, k_tile // 2])
+                        b0_4_next_loaded = pl.tile.gather_row(b0_4_next_dst, raw_b, [0, 0], [col // 16, (cycle * 2 + 2) * panel_scale_width + 4 * scale_width], [n_tile // 16, k_tile // 2])
+                        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 0)
+                    pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 1)
+                    mat_a1: pl.Tile[[m_tile, 5 * k_tile], pl.FP8E4M3FN, pl.MemRef("mat_a1"), pl.Mem.Mat] = pl.tile.create([m_tile, 5 * k_tile], pl.FP8E4M3FN, target_memory=pl.Mem.Mat)
+                    mat_b1: pl.Tile[[5 * k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("mat_b1"), pl.Mem.Mat] = pl.tile.create([5 * k_tile, n_tile], pl.FP8E4M3FN, target_memory=pl.Mem.Mat)
+                    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
+                    a_reg5: pl.Tile[[m_tile, k_tile], pl.FP8E4M3FN, pl.MemRef("a_l0_1"), pl.Mem.Left] = pl.tile.extract(mat_a1, 0, 0, [m_tile, k_tile], target_memory=pl.Mem.Left)
+                    a_box5: pl.Tile[[m_tile, k_tile // 32], pl.FP8E8M0, pl.MemRef("mx_a1_0"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([m_tile, k_tile // 32], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                    a_scale5 = pl.tile.move(a_box5, target_memory=pl.Mem.LeftScale)
+                    b_reg5: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("b_l0_1"), pl.Mem.Right] = pl.tile.extract(mat_b1, 0, 0, [k_tile, n_tile], target_memory=pl.Mem.Right)
+                    b_box5: pl.Tile[[k_tile // 32, n_tile], pl.FP8E8M0, pl.MemRef("mx_b1_0"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([k_tile // 32, n_tile], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                    b_scale5 = pl.tile.move(b_box5, target_memory=pl.Mem.RightScale)
+                    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
+                    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
+                    acc = pl.matmul_mx_acc(acc, a_reg5, a_scale5, b_reg5, b_scale5)
+                    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
+                    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
+                    a_reg6: pl.Tile[[m_tile, k_tile], pl.FP8E4M3FN, pl.MemRef("a_l0_0"), pl.Mem.Left] = pl.tile.extract(mat_a1, 0, k_tile, [m_tile, k_tile], target_memory=pl.Mem.Left)
+                    a_box6: pl.Tile[[m_tile, k_tile // 32], pl.FP8E8M0, pl.MemRef("mx_a1_1"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([m_tile, k_tile // 32], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                    a_scale6 = pl.tile.move(a_box6, target_memory=pl.Mem.LeftScale)
+                    b_reg6: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("b_l0_0"), pl.Mem.Right] = pl.tile.extract(mat_b1, k_tile, 0, [k_tile, n_tile], target_memory=pl.Mem.Right)
+                    b_box6: pl.Tile[[k_tile // 32, n_tile], pl.FP8E8M0, pl.MemRef("mx_b1_1"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([k_tile // 32, n_tile], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                    b_scale6 = pl.tile.move(b_box6, target_memory=pl.Mem.RightScale)
+                    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
+                    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
+                    acc = pl.matmul_mx_acc(acc, a_reg6, a_scale6, b_reg6, b_scale6)
+                    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
+                    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
+                    a_reg7: pl.Tile[[m_tile, k_tile], pl.FP8E4M3FN, pl.MemRef("a_l0_1"), pl.Mem.Left] = pl.tile.extract(mat_a1, 0, 2 * k_tile, [m_tile, k_tile], target_memory=pl.Mem.Left)
+                    a_box7: pl.Tile[[m_tile, k_tile // 32], pl.FP8E8M0, pl.MemRef("mx_a1_2"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([m_tile, k_tile // 32], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                    a_scale7 = pl.tile.move(a_box7, target_memory=pl.Mem.LeftScale)
+                    b_reg7: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("b_l0_1"), pl.Mem.Right] = pl.tile.extract(mat_b1, 2 * k_tile, 0, [k_tile, n_tile], target_memory=pl.Mem.Right)
+                    b_box7: pl.Tile[[k_tile // 32, n_tile], pl.FP8E8M0, pl.MemRef("mx_b1_2"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([k_tile // 32, n_tile], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                    b_scale7 = pl.tile.move(b_box7, target_memory=pl.Mem.RightScale)
+                    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
+                    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
+                    acc = pl.matmul_mx_acc(acc, a_reg7, a_scale7, b_reg7, b_scale7)
+                    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
+                    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
+                    a_reg8: pl.Tile[[m_tile, k_tile], pl.FP8E4M3FN, pl.MemRef("a_l0_0"), pl.Mem.Left] = pl.tile.extract(mat_a1, 0, 3 * k_tile, [m_tile, k_tile], target_memory=pl.Mem.Left)
+                    a_box8: pl.Tile[[m_tile, k_tile // 32], pl.FP8E8M0, pl.MemRef("mx_a1_3"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([m_tile, k_tile // 32], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                    a_scale8 = pl.tile.move(a_box8, target_memory=pl.Mem.LeftScale)
+                    b_reg8: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("b_l0_0"), pl.Mem.Right] = pl.tile.extract(mat_b1, 3 * k_tile, 0, [k_tile, n_tile], target_memory=pl.Mem.Right)
+                    b_box8: pl.Tile[[k_tile // 32, n_tile], pl.FP8E8M0, pl.MemRef("mx_b1_3"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([k_tile // 32, n_tile], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                    b_scale8 = pl.tile.move(b_box8, target_memory=pl.Mem.RightScale)
+                    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
+                    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
+                    acc = pl.matmul_mx_acc(acc, a_reg8, a_scale8, b_reg8, b_scale8)
+                    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
+                    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
+                    a_reg9: pl.Tile[[m_tile, k_tile], pl.FP8E4M3FN, pl.MemRef("a_l0_1"), pl.Mem.Left] = pl.tile.extract(mat_a1, 0, 4 * k_tile, [m_tile, k_tile], target_memory=pl.Mem.Left)
+                    a_box9: pl.Tile[[m_tile, k_tile // 32], pl.FP8E8M0, pl.MemRef("mx_a1_4"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([m_tile, k_tile // 32], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                    a_scale9 = pl.tile.move(a_box9, target_memory=pl.Mem.LeftScale)
+                    b_reg9: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("b_l0_1"), pl.Mem.Right] = pl.tile.extract(mat_b1, 4 * k_tile, 0, [k_tile, n_tile], target_memory=pl.Mem.Right)
+                    b_box9: pl.Tile[[k_tile // 32, n_tile], pl.FP8E8M0, pl.MemRef("mx_b1_4"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([k_tile // 32, n_tile], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                    b_scale9 = pl.tile.move(b_box9, target_memory=pl.Mem.RightScale)
+                    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
+                    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
+                    acc = pl.matmul_mx_acc(acc, a_reg9, a_scale9, b_reg9, b_scale9)
+                    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
+                    if cycle + 1 < panel_pairs:
+                        pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 1)
+                        pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 1)
+                        a_next1: pl.Tile[[m_tile, 5 * k_tile], pl.FP8E4M3FN, pl.MemRef("mat_a1"), pl.Mem.Mat] = pl.load(payload, [row, (cycle * 2 + 3) * panel_k], [m_tile, 5 * k_tile], target_memory=pl.Mem.Mat)
+                        b_next1: pl.Tile[[5 * k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("mat_b1"), pl.Mem.Mat] = pl.load(nz_weight, [(cycle * 2 + 3) * panel_k, col], [5 * k_tile, n_tile], target_memory=pl.Mem.Mat)
+                        a1_0_next_buf: pl.Tile[[m_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_a1_0"), pl.Mem.Mat] = pl.tile.create([m_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                        a1_0_next_dst = pl.tile.reshape(a1_0_next_buf, [m_tile // 16, k_tile // 2])
+                        a1_0_next_loaded = pl.tile.gather_row(a1_0_next_dst, raw_a, [0, 0], [row // 16, (cycle * 2 + 3) * panel_scale_width], [m_tile // 16, k_tile // 2])
+                        b1_0_next_buf: pl.Tile[[n_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_b1_0"), pl.Mem.Mat] = pl.tile.create([n_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                        b1_0_next_dst = pl.tile.reshape(b1_0_next_buf, [n_tile // 16, k_tile // 2])
+                        b1_0_next_loaded = pl.tile.gather_row(b1_0_next_dst, raw_b, [0, 0], [col // 16, (cycle * 2 + 3) * panel_scale_width], [n_tile // 16, k_tile // 2])
+                        a1_1_next_buf: pl.Tile[[m_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_a1_1"), pl.Mem.Mat] = pl.tile.create([m_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                        a1_1_next_dst = pl.tile.reshape(a1_1_next_buf, [m_tile // 16, k_tile // 2])
+                        a1_1_next_loaded = pl.tile.gather_row(a1_1_next_dst, raw_a, [0, 0], [row // 16, (cycle * 2 + 3) * panel_scale_width + scale_width], [m_tile // 16, k_tile // 2])
+                        b1_1_next_buf: pl.Tile[[n_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_b1_1"), pl.Mem.Mat] = pl.tile.create([n_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                        b1_1_next_dst = pl.tile.reshape(b1_1_next_buf, [n_tile // 16, k_tile // 2])
+                        b1_1_next_loaded = pl.tile.gather_row(b1_1_next_dst, raw_b, [0, 0], [col // 16, (cycle * 2 + 3) * panel_scale_width + scale_width], [n_tile // 16, k_tile // 2])
+                        a1_2_next_buf: pl.Tile[[m_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_a1_2"), pl.Mem.Mat] = pl.tile.create([m_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                        a1_2_next_dst = pl.tile.reshape(a1_2_next_buf, [m_tile // 16, k_tile // 2])
+                        a1_2_next_loaded = pl.tile.gather_row(a1_2_next_dst, raw_a, [0, 0], [row // 16, (cycle * 2 + 3) * panel_scale_width + 2 * scale_width], [m_tile // 16, k_tile // 2])
+                        b1_2_next_buf: pl.Tile[[n_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_b1_2"), pl.Mem.Mat] = pl.tile.create([n_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                        b1_2_next_dst = pl.tile.reshape(b1_2_next_buf, [n_tile // 16, k_tile // 2])
+                        b1_2_next_loaded = pl.tile.gather_row(b1_2_next_dst, raw_b, [0, 0], [col // 16, (cycle * 2 + 3) * panel_scale_width + 2 * scale_width], [n_tile // 16, k_tile // 2])
+                        a1_3_next_buf: pl.Tile[[m_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_a1_3"), pl.Mem.Mat] = pl.tile.create([m_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                        a1_3_next_dst = pl.tile.reshape(a1_3_next_buf, [m_tile // 16, k_tile // 2])
+                        a1_3_next_loaded = pl.tile.gather_row(a1_3_next_dst, raw_a, [0, 0], [row // 16, (cycle * 2 + 3) * panel_scale_width + 3 * scale_width], [m_tile // 16, k_tile // 2])
+                        b1_3_next_buf: pl.Tile[[n_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_b1_3"), pl.Mem.Mat] = pl.tile.create([n_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                        b1_3_next_dst = pl.tile.reshape(b1_3_next_buf, [n_tile // 16, k_tile // 2])
+                        b1_3_next_loaded = pl.tile.gather_row(b1_3_next_dst, raw_b, [0, 0], [col // 16, (cycle * 2 + 3) * panel_scale_width + 3 * scale_width], [n_tile // 16, k_tile // 2])
+                        a1_4_next_buf: pl.Tile[[m_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_a1_4"), pl.Mem.Mat] = pl.tile.create([m_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                        a1_4_next_dst = pl.tile.reshape(a1_4_next_buf, [m_tile // 16, k_tile // 2])
+                        a1_4_next_loaded = pl.tile.gather_row(a1_4_next_dst, raw_a, [0, 0], [row // 16, (cycle * 2 + 3) * panel_scale_width + 4 * scale_width], [m_tile // 16, k_tile // 2])
+                        b1_4_next_buf: pl.Tile[[n_tile // 16, k_tile // 2], pl.FP8E8M0, pl.MemRef("mx_b1_4"), pl.Mem.Mat] = pl.tile.create([n_tile // 16, k_tile // 2], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                        b1_4_next_dst = pl.tile.reshape(b1_4_next_buf, [n_tile // 16, k_tile // 2])
+                        b1_4_next_loaded = pl.tile.gather_row(b1_4_next_dst, raw_b, [0, 0], [col // 16, (cycle * 2 + 3) * panel_scale_width + 4 * scale_width], [n_tile // 16, k_tile // 2])
+                        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 1)
+                # Drain both L0 banks before publishing the valid BF16 rows.
+                pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
+                pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
+                pl.system.set_flag(pl.PipeType.M, pl.PipeType.FIX, 0)
+                pl.system.wait_flag(pl.PipeType.M, pl.PipeType.FIX, 0)
+                valid = pl.set_validshape(acc, pl.min(m_tile, rows - row), n_tile)
+                output = pl.store(valid, [row, col], output)
+                pl.system.barrier(pipe=pl.PipeType.ALL)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
+def proj_q_a_pypto(
+    payload: pl.Tensor,
+    weight: pl.Tensor,
+    activation_scale: pl.Tensor,
+    weight_scale: pl.Tensor,
+    output: pl.Tensor,
+    rows: pl.Scalar[pl.INDEX],
+    worker_limit: pl.constexpr = 32,
+):
+    """Project a narrow decode tile."""
+    return _proj_q_a_decode(payload, weight, activation_scale, weight_scale, output, rows, worker_limit, 80, 64, 256)
+
+
+@pl.jit.inline(auto_scope=False)
+def proj_q_a_wide(
+    payload: pl.Tensor,
+    weight: pl.Tensor,
+    activation_scale: pl.Tensor,
+    weight_scale: pl.Tensor,
+    output: pl.Tensor,
+    rows: pl.Scalar[pl.INDEX],
+    worker_limit: pl.constexpr,
+    row_tile: pl.constexpr,
+):
+    """Project M128 and M256 tiles with K256 MX fragments."""
+    nz_weight: pl.Tensor[[5120, 1280], pl.FP8E4M3FN, pl.NZ] = weight[:, :]
+    raw_b = pl.tensor.view(weight_scale, [80, 2560], layout=pl.ND)
+    tasks = ((rows + row_tile - 1) // row_tile) * 10
+    stride = pl.max(1, worker_limit)
+    workers = pl.max(1, pl.min(tasks, stride))
+    for worker in pl.spmd(workers, sync_start=False, name_hint="proj_q_a"):
+        scale_bands = pl.tensor.dim(activation_scale, 1) // 2560
+        raw_a = pl.tensor.view(activation_scale, [scale_bands, 2560], layout=pl.ND)
+        for base in pl.range(0, tasks, stride):
+            task = base + worker
+            if task < tasks:
+                row = task // 10 * row_tile
+                col = task % 10 * 128
+                a0 = pl.load(payload, [row, 0], [row_tile, 256], target_memory=pl.Mem.Mat)
+                sa0_flat: pl.Tile[[row_tile // 16, 128], pl.FP8E8M0, pl.MemRef("sa_pack"), pl.Mem.Mat] = pl.tile.create([row_tile // 16, 128], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                sa0_dest = pl.tile.reshape(sa0_flat, [row_tile // 16, 128])
+                sa0_bytes = pl.tile.gather_row(sa0_dest, raw_a, [0, 0], [row // 16, 0], [row_tile // 16, 128])
+                sa0: pl.Tile[[row_tile, 8], pl.FP8E8M0, pl.MemRef("sa_pack"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([row_tile, 8], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                b0 = pl.load(nz_weight, [0, col], [256, 128], target_memory=pl.Mem.Mat)
+                sb0_flat: pl.Tile[[8, 128], pl.FP8E8M0, pl.MemRef("sb_pack"), pl.Mem.Mat] = pl.tile.create([8, 128], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                sb0_dest = pl.tile.reshape(sb0_flat, [8, 128])
+                sb0_bytes = pl.tile.gather_row(sb0_dest, raw_b, [0, 0], [col // 16, 0], [8, 128])
+                sb0: pl.Tile[[8, 128], pl.FP8E8M0, pl.MemRef("sb_pack"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([8, 128], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                acc = pl.matmul_mx(a0, sa0, b0, sb0)
+                for k in pl.range(256, 5120, 256):
+                    av = pl.load(payload, [row, k], [row_tile, 256], target_memory=pl.Mem.Mat)
+                    sav_flat: pl.Tile[[row_tile // 16, 128], pl.FP8E8M0, pl.MemRef("sa_pack"), pl.Mem.Mat] = pl.tile.create([row_tile // 16, 128], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                    sav_dest = pl.tile.reshape(sav_flat, [row_tile // 16, 128])
+                    sav_bytes = pl.tile.gather_row(sav_dest, raw_a, [0, 0], [row // 16, k // 32 * 16], [row_tile // 16, 128])
+                    sav: pl.Tile[[row_tile, 8], pl.FP8E8M0, pl.MemRef("sa_pack"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([row_tile, 8], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                    bv = pl.load(nz_weight, [k, col], [256, 128], target_memory=pl.Mem.Mat)
+                    sbv_flat: pl.Tile[[8, 128], pl.FP8E8M0, pl.MemRef("sb_pack"), pl.Mem.Mat] = pl.tile.create([8, 128], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
+                    sbv_dest = pl.tile.reshape(sbv_flat, [8, 128])
+                    sbv_bytes = pl.tile.gather_row(sbv_dest, raw_b, [0, 0], [col // 16, k // 32 * 16], [8, 128])
+                    sbv: pl.Tile[[8, 128], pl.FP8E8M0, pl.MemRef("sb_pack"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([8, 128], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+                    acc = pl.matmul_mx_acc(acc, av, sav, bv, sbv)
+                valid = pl.set_validshape(acc, pl.min(row_tile, rows - row), 128)
+                output = pl.store(valid, [row, col], output)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
+def proj_q_a(
+    payload: pl.Tensor,
+    weight: pl.Tensor,
+    activation_scale: pl.Tensor,
+    weight_scale: pl.Tensor,
+    output: pl.Tensor,
+    rows: pl.Scalar[pl.INDEX],
+    row_tile: pl.Scalar[pl.INDEX],
+    worker_limit: pl.constexpr = 32,
+):
+    """Project Q-A using the caller's row tile and worker limit."""
+    payload_rows = pl.tensor.dim(payload, 0)
+    if payload_rows < 128 or row_tile == 80:
+        output = proj_q_a_pypto(payload, weight, activation_scale, weight_scale, output, rows, worker_limit)
+    elif payload_rows < 256 or row_tile == 128:
+        output = _proj_q_a_decode(payload, weight, activation_scale, weight_scale, output, rows, worker_limit, 128, 128, 128)
+    else:
+        output = proj_q_a_wide(payload, weight, activation_scale, weight_scale, output, rows, worker_limit, 256)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
 def q_proj_rope(
     payload: pl.Tensor,
     scales: pl.Tensor,
@@ -556,10 +940,6 @@ def q_proj_rope(
         if wide_rows <= narrow_rows:
             if padded_rows >= wide_rows:
                 qa_tile = PROJ_WIDE_M_TILE
-    if qa_tile == 80:
-        qa_n_tile = Q_A_N_TILE
-    else:
-        qa_n_tile = 128
     qb_tile = qb_row_tile
     if qb_row_tile == PROJ_M_TILE:
         if wide_rows <= narrow_rows:
@@ -569,10 +949,11 @@ def q_proj_rope(
     qb_payload = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.FP8E4M3FN)
     qb_scales = pl.create_tensor([1, payload_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
     projected = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.BF16)
-    qa_tasks = ((num_tokens + qa_tile - 1) // qa_tile) * (Q_LORA // qa_n_tile)
-    qa_workers = pl.max(pl.min(qa_tasks, qa_worker_limit), 1)
-    with pl.spmd(qa_workers, name_hint="proj_q_a"):
-        projected = _proj_q_a(payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_tile)
+    # Narrow decode buffers can hold only an M80 input tile.
+    if qa_row_tile == PROJ_M_TILE and padded_rows < PROJ_WIDE_M_TILE:
+        projected = proj_q_a_pypto(payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_worker_limit)
+    else:
+        projected = proj_q_a(payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_tile, qa_worker_limit)
     latent_rows = pl.tensor.dim(query_latent, 0)
     norm_latent = pl.tensor.slice(query_latent, [latent_rows, Q_LORA], [0, 0])
     norm_payload = pl.tensor.slice(qb_payload, [payload_rows, Q_LORA], [0, 0])
@@ -589,7 +970,7 @@ def q_proj_rope(
 
 
 @pl.jit.inline(auto_scope=False)
-def kv_proj(
+def kv_proj_cpp(
     payload: pl.Tensor,
     scales: pl.Tensor,
     wkv: pl.Tensor,
@@ -900,41 +1281,624 @@ def window_publish(
 
 
 @pl.jit.inline(auto_scope=False)
-def proj_q_a_pypto(
+def _q_b_rope_chunk(
+    source: pl.Tile[[SOURCE_TILE * 64], pl.BF16, pl.Mem.Vec],  # noqa: F821 - bound by the inline constexpr parameters
+    cosine: pl.Tile[[SOURCE_TILE, 32], pl.FP32, pl.Mem.Vec, pl.TileView(stride=[32, 1])],  # noqa: F821 - bound by the inline constexpr parameters
+    sine: pl.Tile[[SOURCE_TILE, 32], pl.FP32, pl.Mem.Vec, pl.TileView(stride=[32, 1])],  # noqa: F821 - bound by the inline constexpr parameters
+    output: pl.Tile[[ROW_TILE * 64], pl.BF16, pl.Mem.Vec],  # noqa: F821 - bound by the inline constexpr parameters
+    row_start: pl.constexpr,
+    ROW_TILE: pl.constexpr,
+    SOURCE_TILE: pl.constexpr,
+):
+    """Rotate adjacent BF16 lane pairs from a local UB row chunk."""
+    with pl.reg_scope():
+        full = pl.reg.full_mask(lanes=64)
+        for row in pl.hardware_loop(ROW_TILE // 2):
+            c = pl.reg.load(cosine, offset=row_start * 32 + row * 64, lanes=64)
+            s = pl.reg.load(sine, offset=row_start * 32 + row * 64, lanes=64)
+            raw0 = pl.reg.load(source, offset=row_start * 64 + row * 128, lanes=64)
+            raw1 = pl.reg.load(source, offset=row_start * 64 + row * 128 + 64, lanes=64)
+            x0 = pl.reg.convert(raw0, dtype=pl.FP32)
+            x1 = pl.reg.convert(raw1, dtype=pl.FP32)
+            even, odd = pl.reg.dintlv(x0, x1, full)
+            ec = pl.reg.mul(even, c, full)
+            os = pl.reg.mul(odd, s, full)
+            es = pl.reg.mul(even, s, full)
+            oc = pl.reg.mul(odd, c, full)
+            real = pl.reg.sub(ec, os, full)
+            imag = pl.reg.add(es, oc, full)
+            low, high = pl.reg.intlv(real, imag, full)
+            bf0 = pl.reg.convert(low, dtype=pl.BF16, rounding="R", saturate=False)
+            bf1 = pl.reg.convert(high, dtype=pl.BF16, rounding="R", saturate=False)
+            _low = pl.reg.store(output, offset=row * 128, value=bf0)
+            _high = pl.reg.store(output, offset=row * 128 + 64, value=bf1)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
+def _store_q_b_decode_tile(
+    acc: pl.Tile[[PROJ_M_TILE, Q_B_N_TILE], pl.FP32, pl.Mem.Acc],
+    cosine: pl.Tile[[PROJ_M_TILE, 32], pl.FP32, pl.Mem.Vec, pl.TileView(stride=[32, 1])],
+    sine: pl.Tile[[PROJ_M_TILE, 32], pl.FP32, pl.Mem.Vec, pl.TileView(stride=[32, 1])],
+    output: pl.Tensor,
+    row: pl.Scalar[pl.INDEX],
+    col: pl.Scalar[pl.INDEX],
+    valid_rows: pl.Scalar[pl.INDEX],
+):
+    """Store an M80 projection tile and rotate the BF16 tail of each head."""
+    if col % HEAD_DIM == Q_B_N_TILE:
+        prefix_cols = Q_B_N_TILE - ROPE_DIM
+        tail = pl.tile.slice(acc, [PROJ_M_TILE, ROPE_DIM], [0, prefix_cols])
+        prefix = pl.set_validshape(acc, valid_rows, prefix_cols)
+        output = pl.store(prefix, [row, col], output)
+        rounded = pl.cast(tail, pl.BF16, mode="rint")
+        flat = pl.reshape(rounded, [PROJ_M_TILE * ROPE_DIM])
+        flat_out = pl.tile.create([PROJ_M_TILE * ROPE_DIM], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+        flat_out = _q_b_rope_chunk(flat, cosine, sine, flat_out, 0, PROJ_M_TILE, PROJ_M_TILE)
+        rotated = pl.reshape(flat_out, [PROJ_M_TILE, ROPE_DIM])
+        valid_tail = pl.set_validshape(rotated, valid_rows, ROPE_DIM)
+        output = pl.store(valid_tail, [row, col + prefix_cols], output)
+    else:
+        valid_acc = pl.set_validshape(acc, valid_rows, Q_B_N_TILE)
+        output = pl.store(valid_acc, [row, col], output)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
+def _proj_q_b_tile_pypto(
     payload: pl.Tensor,
     weight: pl.Tensor,
     activation_scale: pl.Tensor,
     weight_scale: pl.Tensor,
     output: pl.Tensor,
+    cosine: pl.Tensor,
+    sine: pl.Tensor,
     rows: pl.Scalar[pl.INDEX],
+    width: pl.Scalar[pl.INDEX],
+    row_start: pl.Scalar[pl.INDEX],
     worker_limit: pl.constexpr = 32,
+    M_TILE: pl.constexpr = 80,
 ):
-    scale_width = weight.shape[0] // 32
-    for mt in pl.parallel((rows + 79) // 80):
-        scale_begin = mt * 80 * scale_width
-        scale_end = scale_begin + 80 * scale_width
-        sa = activation_scale[0, scale_begin:scale_end]
-        sa = pl.reshape(sa, [80, scale_width])
-        sa = pl.tensor.view(sa, [80, scale_width], layout=pl.MX_A_ZZ)
-        for worker in pl.spmd(pl.min(worker_limit, 20)):
-            for base in pl.range(0, 20, worker_limit):
-                if base + worker < 20:
-                    row = mt * 80
-                    col = (base + worker) * 64
-                    full_a = pl.load(payload, [row, 0], [80, 5120], target_memory=pl.Mem.Mat)
-                    a0 = pl.tile.slice(full_a, [80, 256], [0, 0])
-                    sa0 = pl.load(sa, [0, 0], [80, 8])
-                    b0 = pl.load(weight, [0, col], [256, 64], target_memory=pl.Mem.Mat)
-                    sb0 = pl.load(weight_scale, [0, col], [8, 64])
-                    acc = pl.matmul_mx(a0, sa0, b0, sb0)
-                    for k in pl.pipeline(256, 5120, 256, stage=2):
-                        av = pl.tile.slice(full_a, [80, 256], [0, k])
-                        sav = pl.load(sa, [0, k // 32], [80, 8])
-                        bv = pl.load(weight, [k, col], [256, 64], target_memory=pl.Mem.Mat)
-                        sbv = pl.load(weight_scale, [k // 32, col], [8, 64])
-                        acc = pl.matmul_mx_acc(acc, av, sav, bv, sbv)
-                    valid = pl.set_validshape(acc, pl.min(80, rows - row), 64)
-                    output = pl.store(valid, [row, col], output)
+    """Project MXFP8 Q tiles and rotate BF16-rounded tails in a mixed group."""
+    scale_rows = activation_scale.shape[1] // 40
+    sa = pl.reshape(activation_scale, [scale_rows, 40])
+    sa = pl.tensor.view(sa, [scale_rows, 40], layout=pl.MX_A_ZZ)
+    row_tiles = (rows + M_TILE - 1) // M_TILE
+    tasks = row_tiles * (width // 256)
+    worker_cap = pl.min(worker_limit, pl.system.available_cluster_count())
+    workers = pl.max(pl.min(tasks, worker_cap), 1)
+    lanes = workers
+    if row_tiles > 1:
+        lanes = pl.max(workers // row_tiles // 2 * 2, 2)
+    for worker in pl.spmd(workers, optimizations=[pl.cross_core_slot(slot_num=2)]):
+        for mt in pl.range(row_tiles):
+            for n_lane in pl.range(lanes):
+                if (mt * lanes + n_lane) % workers == worker:
+                    row = mt * M_TILE
+                    load_rows = pl.min(M_TILE, payload.shape[0] - row)
+                    full_a = pl.load(payload, [row, 0], [M_TILE, 1280], valid_shape=[load_rows, 1280], target_memory=pl.Mem.Mat)
+                    # Preserve the physical M pitch through masked accumulator stores.
+                    full_a = pl.set_validshape(full_a, M_TILE, 1280)
+                    sa_cache_0 = pl.load(sa, [row, 0], [M_TILE, 4], valid_shape=[load_rows, 4], target_memory=pl.Mem.Mat)
+                    sa_cache_0 = pl.set_validshape(sa_cache_0, M_TILE, 4)
+                    sa_cache_1 = pl.load(sa, [row, 4], [M_TILE, 4], valid_shape=[load_rows, 4], target_memory=pl.Mem.Mat)
+                    sa_cache_1 = pl.set_validshape(sa_cache_1, M_TILE, 4)
+                    sa_cache_2 = pl.load(sa, [row, 8], [M_TILE, 4], valid_shape=[load_rows, 4], target_memory=pl.Mem.Mat)
+                    sa_cache_2 = pl.set_validshape(sa_cache_2, M_TILE, 4)
+                    sa_cache_3 = pl.load(sa, [row, 12], [M_TILE, 4], valid_shape=[load_rows, 4], target_memory=pl.Mem.Mat)
+                    sa_cache_3 = pl.set_validshape(sa_cache_3, M_TILE, 4)
+                    sa_cache_4 = pl.load(sa, [row, 16], [M_TILE, 4], valid_shape=[load_rows, 4], target_memory=pl.Mem.Mat)
+                    sa_cache_4 = pl.set_validshape(sa_cache_4, M_TILE, 4)
+                    sa_cache_5 = pl.load(sa, [row, 20], [M_TILE, 4], valid_shape=[load_rows, 4], target_memory=pl.Mem.Mat)
+                    sa_cache_5 = pl.set_validshape(sa_cache_5, M_TILE, 4)
+                    sa_cache_6 = pl.load(sa, [row, 24], [M_TILE, 4], valid_shape=[load_rows, 4], target_memory=pl.Mem.Mat)
+                    sa_cache_6 = pl.set_validshape(sa_cache_6, M_TILE, 4)
+                    sa_cache_7 = pl.load(sa, [row, 28], [M_TILE, 4], valid_shape=[load_rows, 4], target_memory=pl.Mem.Mat)
+                    sa_cache_7 = pl.set_validshape(sa_cache_7, M_TILE, 4)
+                    sa_cache_8 = pl.load(sa, [row, 32], [M_TILE, 4], valid_shape=[load_rows, 4], target_memory=pl.Mem.Mat)
+                    sa_cache_8 = pl.set_validshape(sa_cache_8, M_TILE, 4)
+                    sa_cache_9 = pl.load(sa, [row, 36], [M_TILE, 4], valid_shape=[load_rows, 4], target_memory=pl.Mem.Mat)
+                    sa_cache_9 = pl.set_validshape(sa_cache_9, M_TILE, 4)
+                    # M80 A slots 2/5 map to scale offsets 1280/3200.
+                    # Two M80 accumulator slots; M256 occupies all L0C.
+                    if M_TILE < 256:
+                        # Select a positive stride for NZ offset range analysis.
+                        angle_rows = pl.min(M_TILE, rows - row)
+                        cos_resident = pl.load(cosine, [row_start + row, 0], [M_TILE, 32], valid_shape=[angle_rows, 32], target_memory=pl.Mem.Vec)
+                        sin_resident = pl.load(sine, [row_start + row, 0], [M_TILE, 32], valid_shape=[angle_rows, 32], target_memory=pl.Mem.Vec)
+                        for n_stride in pl.range(1, lanes + 1):
+                            if n_stride == lanes:
+                                waves = (width // 256 - n_lane + n_stride - 1) // n_stride
+                                for wave in pl.range((waves + 3) // 4):
+                                    if wave * 4 + 3 < waves:
+                                        col_g0 = (n_lane + (wave * 4 + 0) * n_stride) * 256
+                                        col_g1 = (n_lane + (wave * 4 + 1) * n_stride) * 256
+                                        col_g2 = (n_lane + (wave * 4 + 2) * n_stride) * 256
+                                        col_g3 = (n_lane + (wave * 4 + 3) * n_stride) * 256
+                                        sb_cache_0_g0 = pl.load(weight_scale, [0, col_g0], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_1_g0 = pl.load(weight_scale, [4, col_g0], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_2_g0 = pl.load(weight_scale, [8, col_g0], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_3_g0 = pl.load(weight_scale, [12, col_g0], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_4_g0 = pl.load(weight_scale, [16, col_g0], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_5_g0 = pl.load(weight_scale, [20, col_g0], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_6_g0 = pl.load(weight_scale, [24, col_g0], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_7_g0 = pl.load(weight_scale, [28, col_g0], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_8_g0 = pl.load(weight_scale, [32, col_g0], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_9_g0 = pl.load(weight_scale, [36, col_g0], [4, 256], target_memory=pl.Mem.Mat)
+                                        b_pre_0_g0: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[0], pl.Mem.Mat] = pl.load(weight, [0, col_g0], [256, 256], target_memory=pl.Mem.Mat)
+                                        b_pre_1_g0: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[1], pl.Mem.Mat] = pl.load(weight, [256, col_g0], [256, 256], target_memory=pl.Mem.Mat)
+                                        b_next_0_g0: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[2], pl.Mem.Mat] = pl.load(weight, [512, col_g0], [256, 256], target_memory=pl.Mem.Mat)
+                                        b_next_1_g0: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[3], pl.Mem.Mat] = pl.load(weight, [768, col_g0], [256, 256], target_memory=pl.Mem.Mat)
+                                        a_l0_0_g0: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left] = pl.tile.extract(full_a, 0, 0, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_0_g0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_pre_0_g0, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_0_g0: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_0, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_0_g0: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_0_g0, target_memory=pl.Mem.RightScale)
+                                        acc_g0: pl.Tile[[M_TILE, 256], pl.FP32, pl.MemRef("qb_acc", slots=2)[0], pl.Mem.Acc] = pl.matmul_mx(a_l0_0_g0, sa_l0_0_g0, b_l0_0_g0, sb_l0_0_g0)
+                                        a_l0_1_g0: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left] = pl.tile.extract(full_a, 0, 128, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_1_g0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_pre_0_g0, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_1_g0: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_1, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_1_g0: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_1_g0, target_memory=pl.Mem.RightScale)
+                                        acc_g0 = pl.matmul_mx_acc(acc_g0, a_l0_1_g0, sa_l0_1_g0, b_l0_1_g0, sb_l0_1_g0)
+                                        b_next_2_g0: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[0], pl.Mem.Mat] = pl.load(weight, [1024, col_g0], [256, 256], target_memory=pl.Mem.Mat)
+                                        a_l0_2_g0: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left] = pl.tile.extract(full_a, 0, 256, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_2_g0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_pre_1_g0, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_2_g0: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_2, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_2_g0: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_2_g0, target_memory=pl.Mem.RightScale)
+                                        acc_g0 = pl.matmul_mx_acc(acc_g0, a_l0_2_g0, sa_l0_2_g0, b_l0_2_g0, sb_l0_2_g0)
+                                        a_l0_3_g0: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left] = pl.tile.extract(full_a, 0, 384, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_3_g0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_pre_1_g0, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_3_g0: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_3, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_3_g0: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_3_g0, target_memory=pl.Mem.RightScale)
+                                        acc_g0 = pl.matmul_mx_acc(acc_g0, a_l0_3_g0, sa_l0_3_g0, b_l0_3_g0, sb_l0_3_g0)
+                                        b_pre_0_g1: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[1], pl.Mem.Mat] = pl.load(weight, [0, col_g1], [256, 256], target_memory=pl.Mem.Mat)
+                                        a_l0_4_g0: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left] = pl.tile.extract(full_a, 0, 512, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_4_g0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_next_0_g0, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_4_g0: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_4, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_4_g0: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_4_g0, target_memory=pl.Mem.RightScale)
+                                        acc_g0 = pl.matmul_mx_acc(acc_g0, a_l0_4_g0, sa_l0_4_g0, b_l0_4_g0, sb_l0_4_g0)
+                                        a_l0_5_g0: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left] = pl.tile.extract(full_a, 0, 640, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_5_g0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_next_0_g0, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_5_g0: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_5, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_5_g0: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_5_g0, target_memory=pl.Mem.RightScale)
+                                        acc_g0 = pl.matmul_mx_acc(acc_g0, a_l0_5_g0, sa_l0_5_g0, b_l0_5_g0, sb_l0_5_g0)
+                                        b_pre_1_g1: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[2], pl.Mem.Mat] = pl.load(weight, [256, col_g1], [256, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_0_g1 = pl.load(weight_scale, [0, col_g1], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_1_g1 = pl.load(weight_scale, [4, col_g1], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_2_g1 = pl.load(weight_scale, [8, col_g1], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_3_g1 = pl.load(weight_scale, [12, col_g1], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_4_g1 = pl.load(weight_scale, [16, col_g1], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_5_g1 = pl.load(weight_scale, [20, col_g1], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_6_g1 = pl.load(weight_scale, [24, col_g1], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_7_g1 = pl.load(weight_scale, [28, col_g1], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_8_g1 = pl.load(weight_scale, [32, col_g1], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_9_g1 = pl.load(weight_scale, [36, col_g1], [4, 256], target_memory=pl.Mem.Mat)
+                                        a_l0_6_g0: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left] = pl.tile.extract(full_a, 0, 768, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_6_g0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_next_1_g0, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_6_g0: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_6, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_6_g0: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_6_g0, target_memory=pl.Mem.RightScale)
+                                        acc_g0 = pl.matmul_mx_acc(acc_g0, a_l0_6_g0, sa_l0_6_g0, b_l0_6_g0, sb_l0_6_g0)
+                                        a_l0_7_g0: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left] = pl.tile.extract(full_a, 0, 896, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_7_g0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_next_1_g0, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_7_g0: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_7, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_7_g0: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_7_g0, target_memory=pl.Mem.RightScale)
+                                        acc_g0 = pl.matmul_mx_acc(acc_g0, a_l0_7_g0, sa_l0_7_g0, b_l0_7_g0, sb_l0_7_g0)
+                                        b_next_0_g1: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[3], pl.Mem.Mat] = pl.load(weight, [512, col_g1], [256, 256], target_memory=pl.Mem.Mat)
+                                        a_l0_8_g0: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left] = pl.tile.extract(full_a, 0, 1024, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_8_g0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_next_2_g0, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_8_g0: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_8, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_8_g0: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_8_g0, target_memory=pl.Mem.RightScale)
+                                        acc_g0 = pl.matmul_mx_acc(acc_g0, a_l0_8_g0, sa_l0_8_g0, b_l0_8_g0, sb_l0_8_g0)
+                                        a_l0_9_g0: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left] = pl.tile.extract(full_a, 0, 1152, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_9_g0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_next_2_g0, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_9_g0: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_9, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_9_g0: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_9_g0, target_memory=pl.Mem.RightScale)
+                                        acc_g0 = pl.matmul_mx_acc(acc_g0, a_l0_9_g0, sa_l0_9_g0, b_l0_9_g0, sb_l0_9_g0)
+                                        b_next_1_g1: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[0], pl.Mem.Mat] = pl.load(weight, [768, col_g1], [256, 256], target_memory=pl.Mem.Mat)
+                                        output = _store_q_b_decode_tile(
+                                            acc_g0, cos_resident, sin_resident, output,
+                                            row_start + row, col_g0, angle_rows,
+                                        )
+                                        a_l0_0_g1: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left] = pl.tile.extract(full_a, 0, 0, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_0_g1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_pre_0_g1, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_0_g1: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_0, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_0_g1: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_0_g1, target_memory=pl.Mem.RightScale)
+                                        acc_g1: pl.Tile[[M_TILE, 256], pl.FP32, pl.MemRef("qb_acc", slots=2)[1], pl.Mem.Acc] = pl.matmul_mx(a_l0_0_g1, sa_l0_0_g1, b_l0_0_g1, sb_l0_0_g1)
+                                        a_l0_1_g1: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left] = pl.tile.extract(full_a, 0, 128, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_1_g1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_pre_0_g1, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_1_g1: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_1, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_1_g1: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_1_g1, target_memory=pl.Mem.RightScale)
+                                        acc_g1 = pl.matmul_mx_acc(acc_g1, a_l0_1_g1, sa_l0_1_g1, b_l0_1_g1, sb_l0_1_g1)
+                                        b_next_2_g1: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[1], pl.Mem.Mat] = pl.load(weight, [1024, col_g1], [256, 256], target_memory=pl.Mem.Mat)
+                                        a_l0_2_g1: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left] = pl.tile.extract(full_a, 0, 256, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_2_g1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_pre_1_g1, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_2_g1: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_2, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_2_g1: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_2_g1, target_memory=pl.Mem.RightScale)
+                                        acc_g1 = pl.matmul_mx_acc(acc_g1, a_l0_2_g1, sa_l0_2_g1, b_l0_2_g1, sb_l0_2_g1)
+                                        a_l0_3_g1: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left] = pl.tile.extract(full_a, 0, 384, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_3_g1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_pre_1_g1, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_3_g1: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_3, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_3_g1: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_3_g1, target_memory=pl.Mem.RightScale)
+                                        acc_g1 = pl.matmul_mx_acc(acc_g1, a_l0_3_g1, sa_l0_3_g1, b_l0_3_g1, sb_l0_3_g1)
+                                        b_pre_0_g2: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[2], pl.Mem.Mat] = pl.load(weight, [0, col_g2], [256, 256], target_memory=pl.Mem.Mat)
+                                        a_l0_4_g1: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left] = pl.tile.extract(full_a, 0, 512, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_4_g1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_next_0_g1, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_4_g1: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_4, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_4_g1: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_4_g1, target_memory=pl.Mem.RightScale)
+                                        acc_g1 = pl.matmul_mx_acc(acc_g1, a_l0_4_g1, sa_l0_4_g1, b_l0_4_g1, sb_l0_4_g1)
+                                        a_l0_5_g1: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left] = pl.tile.extract(full_a, 0, 640, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_5_g1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_next_0_g1, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_5_g1: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_5, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_5_g1: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_5_g1, target_memory=pl.Mem.RightScale)
+                                        acc_g1 = pl.matmul_mx_acc(acc_g1, a_l0_5_g1, sa_l0_5_g1, b_l0_5_g1, sb_l0_5_g1)
+                                        b_pre_1_g2: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[3], pl.Mem.Mat] = pl.load(weight, [256, col_g2], [256, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_0_g2 = pl.load(weight_scale, [0, col_g2], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_1_g2 = pl.load(weight_scale, [4, col_g2], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_2_g2 = pl.load(weight_scale, [8, col_g2], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_3_g2 = pl.load(weight_scale, [12, col_g2], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_4_g2 = pl.load(weight_scale, [16, col_g2], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_5_g2 = pl.load(weight_scale, [20, col_g2], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_6_g2 = pl.load(weight_scale, [24, col_g2], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_7_g2 = pl.load(weight_scale, [28, col_g2], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_8_g2 = pl.load(weight_scale, [32, col_g2], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_9_g2 = pl.load(weight_scale, [36, col_g2], [4, 256], target_memory=pl.Mem.Mat)
+                                        a_l0_6_g1: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left] = pl.tile.extract(full_a, 0, 768, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_6_g1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_next_1_g1, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_6_g1: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_6, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_6_g1: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_6_g1, target_memory=pl.Mem.RightScale)
+                                        acc_g1 = pl.matmul_mx_acc(acc_g1, a_l0_6_g1, sa_l0_6_g1, b_l0_6_g1, sb_l0_6_g1)
+                                        a_l0_7_g1: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left] = pl.tile.extract(full_a, 0, 896, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_7_g1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_next_1_g1, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_7_g1: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_7, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_7_g1: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_7_g1, target_memory=pl.Mem.RightScale)
+                                        acc_g1 = pl.matmul_mx_acc(acc_g1, a_l0_7_g1, sa_l0_7_g1, b_l0_7_g1, sb_l0_7_g1)
+                                        b_next_0_g2: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[0], pl.Mem.Mat] = pl.load(weight, [512, col_g2], [256, 256], target_memory=pl.Mem.Mat)
+                                        a_l0_8_g1: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left] = pl.tile.extract(full_a, 0, 1024, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_8_g1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_next_2_g1, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_8_g1: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_8, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_8_g1: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_8_g1, target_memory=pl.Mem.RightScale)
+                                        acc_g1 = pl.matmul_mx_acc(acc_g1, a_l0_8_g1, sa_l0_8_g1, b_l0_8_g1, sb_l0_8_g1)
+                                        a_l0_9_g1: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left] = pl.tile.extract(full_a, 0, 1152, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_9_g1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_next_2_g1, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_9_g1: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_9, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_9_g1: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_9_g1, target_memory=pl.Mem.RightScale)
+                                        acc_g1 = pl.matmul_mx_acc(acc_g1, a_l0_9_g1, sa_l0_9_g1, b_l0_9_g1, sb_l0_9_g1)
+                                        b_next_1_g2: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[1], pl.Mem.Mat] = pl.load(weight, [768, col_g2], [256, 256], target_memory=pl.Mem.Mat)
+                                        output = _store_q_b_decode_tile(
+                                            acc_g1, cos_resident, sin_resident, output,
+                                            row_start + row, col_g1, angle_rows,
+                                        )
+                                        a_l0_0_g2: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left] = pl.tile.extract(full_a, 0, 0, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_0_g2: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_pre_0_g2, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_0_g2: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_0, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_0_g2: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_0_g2, target_memory=pl.Mem.RightScale)
+                                        acc_g2: pl.Tile[[M_TILE, 256], pl.FP32, pl.MemRef("qb_acc", slots=2)[0], pl.Mem.Acc] = pl.matmul_mx(a_l0_0_g2, sa_l0_0_g2, b_l0_0_g2, sb_l0_0_g2)
+                                        a_l0_1_g2: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left] = pl.tile.extract(full_a, 0, 128, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_1_g2: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_pre_0_g2, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_1_g2: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_1, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_1_g2: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_1_g2, target_memory=pl.Mem.RightScale)
+                                        acc_g2 = pl.matmul_mx_acc(acc_g2, a_l0_1_g2, sa_l0_1_g2, b_l0_1_g2, sb_l0_1_g2)
+                                        b_next_2_g2: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[2], pl.Mem.Mat] = pl.load(weight, [1024, col_g2], [256, 256], target_memory=pl.Mem.Mat)
+                                        a_l0_2_g2: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left] = pl.tile.extract(full_a, 0, 256, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_2_g2: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_pre_1_g2, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_2_g2: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_2, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_2_g2: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_2_g2, target_memory=pl.Mem.RightScale)
+                                        acc_g2 = pl.matmul_mx_acc(acc_g2, a_l0_2_g2, sa_l0_2_g2, b_l0_2_g2, sb_l0_2_g2)
+                                        a_l0_3_g2: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left] = pl.tile.extract(full_a, 0, 384, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_3_g2: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_pre_1_g2, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_3_g2: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_3, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_3_g2: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_3_g2, target_memory=pl.Mem.RightScale)
+                                        acc_g2 = pl.matmul_mx_acc(acc_g2, a_l0_3_g2, sa_l0_3_g2, b_l0_3_g2, sb_l0_3_g2)
+                                        b_pre_0_g3: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[3], pl.Mem.Mat] = pl.load(weight, [0, col_g3], [256, 256], target_memory=pl.Mem.Mat)
+                                        a_l0_4_g2: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left] = pl.tile.extract(full_a, 0, 512, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_4_g2: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_next_0_g2, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_4_g2: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_4, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_4_g2: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_4_g2, target_memory=pl.Mem.RightScale)
+                                        acc_g2 = pl.matmul_mx_acc(acc_g2, a_l0_4_g2, sa_l0_4_g2, b_l0_4_g2, sb_l0_4_g2)
+                                        a_l0_5_g2: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left] = pl.tile.extract(full_a, 0, 640, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_5_g2: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_next_0_g2, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_5_g2: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_5, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_5_g2: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_5_g2, target_memory=pl.Mem.RightScale)
+                                        acc_g2 = pl.matmul_mx_acc(acc_g2, a_l0_5_g2, sa_l0_5_g2, b_l0_5_g2, sb_l0_5_g2)
+                                        b_pre_1_g3: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[0], pl.Mem.Mat] = pl.load(weight, [256, col_g3], [256, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_0_g3 = pl.load(weight_scale, [0, col_g3], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_1_g3 = pl.load(weight_scale, [4, col_g3], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_2_g3 = pl.load(weight_scale, [8, col_g3], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_3_g3 = pl.load(weight_scale, [12, col_g3], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_4_g3 = pl.load(weight_scale, [16, col_g3], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_5_g3 = pl.load(weight_scale, [20, col_g3], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_6_g3 = pl.load(weight_scale, [24, col_g3], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_7_g3 = pl.load(weight_scale, [28, col_g3], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_8_g3 = pl.load(weight_scale, [32, col_g3], [4, 256], target_memory=pl.Mem.Mat)
+                                        sb_cache_9_g3 = pl.load(weight_scale, [36, col_g3], [4, 256], target_memory=pl.Mem.Mat)
+                                        a_l0_6_g2: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left] = pl.tile.extract(full_a, 0, 768, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_6_g2: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_next_1_g2, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_6_g2: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_6, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_6_g2: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_6_g2, target_memory=pl.Mem.RightScale)
+                                        acc_g2 = pl.matmul_mx_acc(acc_g2, a_l0_6_g2, sa_l0_6_g2, b_l0_6_g2, sb_l0_6_g2)
+                                        a_l0_7_g2: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left] = pl.tile.extract(full_a, 0, 896, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_7_g2: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_next_1_g2, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_7_g2: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_7, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_7_g2: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_7_g2, target_memory=pl.Mem.RightScale)
+                                        acc_g2 = pl.matmul_mx_acc(acc_g2, a_l0_7_g2, sa_l0_7_g2, b_l0_7_g2, sb_l0_7_g2)
+                                        b_next_0_g3: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[1], pl.Mem.Mat] = pl.load(weight, [512, col_g3], [256, 256], target_memory=pl.Mem.Mat)
+                                        a_l0_8_g2: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left] = pl.tile.extract(full_a, 0, 1024, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_8_g2: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_next_2_g2, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_8_g2: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_8, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_8_g2: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_8_g2, target_memory=pl.Mem.RightScale)
+                                        acc_g2 = pl.matmul_mx_acc(acc_g2, a_l0_8_g2, sa_l0_8_g2, b_l0_8_g2, sb_l0_8_g2)
+                                        a_l0_9_g2: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left] = pl.tile.extract(full_a, 0, 1152, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_9_g2: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_next_2_g2, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_9_g2: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_9, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_9_g2: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_9_g2, target_memory=pl.Mem.RightScale)
+                                        acc_g2 = pl.matmul_mx_acc(acc_g2, a_l0_9_g2, sa_l0_9_g2, b_l0_9_g2, sb_l0_9_g2)
+                                        b_next_1_g3: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[2], pl.Mem.Mat] = pl.load(weight, [768, col_g3], [256, 256], target_memory=pl.Mem.Mat)
+                                        output = _store_q_b_decode_tile(
+                                            acc_g2, cos_resident, sin_resident, output,
+                                            row_start + row, col_g2, angle_rows,
+                                        )
+                                        a_l0_0_g3: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left] = pl.tile.extract(full_a, 0, 0, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_0_g3: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_pre_0_g3, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_0_g3: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_0, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_0_g3: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_0_g3, target_memory=pl.Mem.RightScale)
+                                        acc_g3: pl.Tile[[M_TILE, 256], pl.FP32, pl.MemRef("qb_acc", slots=2)[1], pl.Mem.Acc] = pl.matmul_mx(a_l0_0_g3, sa_l0_0_g3, b_l0_0_g3, sb_l0_0_g3)
+                                        a_l0_1_g3: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left] = pl.tile.extract(full_a, 0, 128, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_1_g3: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_pre_0_g3, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_1_g3: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_1, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_1_g3: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_1_g3, target_memory=pl.Mem.RightScale)
+                                        acc_g3 = pl.matmul_mx_acc(acc_g3, a_l0_1_g3, sa_l0_1_g3, b_l0_1_g3, sb_l0_1_g3)
+                                        b_next_2_g3: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[3], pl.Mem.Mat] = pl.load(weight, [1024, col_g3], [256, 256], target_memory=pl.Mem.Mat)
+                                        a_l0_2_g3: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left] = pl.tile.extract(full_a, 0, 256, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_2_g3: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_pre_1_g3, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_2_g3: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_2, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_2_g3: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_2_g3, target_memory=pl.Mem.RightScale)
+                                        acc_g3 = pl.matmul_mx_acc(acc_g3, a_l0_2_g3, sa_l0_2_g3, b_l0_2_g3, sb_l0_2_g3)
+                                        a_l0_3_g3: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left] = pl.tile.extract(full_a, 0, 384, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_3_g3: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_pre_1_g3, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_3_g3: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_3, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_3_g3: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_3_g3, target_memory=pl.Mem.RightScale)
+                                        acc_g3 = pl.matmul_mx_acc(acc_g3, a_l0_3_g3, sa_l0_3_g3, b_l0_3_g3, sb_l0_3_g3)
+                                        a_l0_4_g3: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left] = pl.tile.extract(full_a, 0, 512, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_4_g3: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_next_0_g3, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_4_g3: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_4, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_4_g3: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_4_g3, target_memory=pl.Mem.RightScale)
+                                        acc_g3 = pl.matmul_mx_acc(acc_g3, a_l0_4_g3, sa_l0_4_g3, b_l0_4_g3, sb_l0_4_g3)
+                                        a_l0_5_g3: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left] = pl.tile.extract(full_a, 0, 640, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_5_g3: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_next_0_g3, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_5_g3: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_5, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_5_g3: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_5_g3, target_memory=pl.Mem.RightScale)
+                                        acc_g3 = pl.matmul_mx_acc(acc_g3, a_l0_5_g3, sa_l0_5_g3, b_l0_5_g3, sb_l0_5_g3)
+                                        a_l0_6_g3: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left] = pl.tile.extract(full_a, 0, 768, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_6_g3: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_next_1_g3, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_6_g3: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_6, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_6_g3: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_6_g3, target_memory=pl.Mem.RightScale)
+                                        acc_g3 = pl.matmul_mx_acc(acc_g3, a_l0_6_g3, sa_l0_6_g3, b_l0_6_g3, sb_l0_6_g3)
+                                        a_l0_7_g3: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left] = pl.tile.extract(full_a, 0, 896, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_7_g3: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_next_1_g3, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_7_g3: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_7, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_7_g3: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_7_g3, target_memory=pl.Mem.RightScale)
+                                        acc_g3 = pl.matmul_mx_acc(acc_g3, a_l0_7_g3, sa_l0_7_g3, b_l0_7_g3, sb_l0_7_g3)
+                                        a_l0_8_g3: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left] = pl.tile.extract(full_a, 0, 1024, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_8_g3: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_next_2_g3, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_8_g3: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_8, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_8_g3: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_8_g3, target_memory=pl.Mem.RightScale)
+                                        acc_g3 = pl.matmul_mx_acc(acc_g3, a_l0_8_g3, sa_l0_8_g3, b_l0_8_g3, sb_l0_8_g3)
+                                        a_l0_9_g3: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left] = pl.tile.extract(full_a, 0, 1152, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                        b_l0_9_g3: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_next_2_g3, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                        sa_l0_9_g3: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_9, target_memory=pl.Mem.LeftScale)
+                                        sb_l0_9_g3: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_9_g3, target_memory=pl.Mem.RightScale)
+                                        acc_g3 = pl.matmul_mx_acc(acc_g3, a_l0_9_g3, sa_l0_9_g3, b_l0_9_g3, sb_l0_9_g3)
+                                        output = _store_q_b_decode_tile(
+                                            acc_g3, cos_resident, sin_resident, output,
+                                            row_start + row, col_g3, angle_rows,
+                                        )
+                                    else:
+                                        for remainder in pl.range(4):
+                                            if wave * 4 + remainder < waves:
+                                                col_tail4 = (n_lane + (wave * 4 + remainder) * n_stride) * 256
+                                                sb_cache_0_tail4 = pl.load(weight_scale, [0, col_tail4], [4, 256], target_memory=pl.Mem.Mat)
+                                                sb_cache_1_tail4 = pl.load(weight_scale, [4, col_tail4], [4, 256], target_memory=pl.Mem.Mat)
+                                                sb_cache_2_tail4 = pl.load(weight_scale, [8, col_tail4], [4, 256], target_memory=pl.Mem.Mat)
+                                                sb_cache_3_tail4 = pl.load(weight_scale, [12, col_tail4], [4, 256], target_memory=pl.Mem.Mat)
+                                                sb_cache_4_tail4 = pl.load(weight_scale, [16, col_tail4], [4, 256], target_memory=pl.Mem.Mat)
+                                                sb_cache_5_tail4 = pl.load(weight_scale, [20, col_tail4], [4, 256], target_memory=pl.Mem.Mat)
+                                                sb_cache_6_tail4 = pl.load(weight_scale, [24, col_tail4], [4, 256], target_memory=pl.Mem.Mat)
+                                                sb_cache_7_tail4 = pl.load(weight_scale, [28, col_tail4], [4, 256], target_memory=pl.Mem.Mat)
+                                                sb_cache_8_tail4 = pl.load(weight_scale, [32, col_tail4], [4, 256], target_memory=pl.Mem.Mat)
+                                                sb_cache_9_tail4 = pl.load(weight_scale, [36, col_tail4], [4, 256], target_memory=pl.Mem.Mat)
+                                                b_pre_0_tail4: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[0], pl.Mem.Mat] = pl.load(weight, [0, col_tail4], [256, 256], target_memory=pl.Mem.Mat)
+                                                b_pre_1_tail4: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[1], pl.Mem.Mat] = pl.load(weight, [256, col_tail4], [256, 256], target_memory=pl.Mem.Mat)
+                                                a_l0_0_tail4: pl.Tile[
+                                                    [M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left,
+                                                ] = pl.tile.extract(full_a, 0, 0, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                                b_l0_0_tail4: pl.Tile[
+                                                    [128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right,
+                                                ] = pl.tile.extract(b_pre_0_tail4, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                                sa_l0_0_tail4: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_0, target_memory=pl.Mem.LeftScale)
+                                                sb_l0_0_tail4: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_0_tail4, target_memory=pl.Mem.RightScale)
+                                                acc_tail4 = pl.matmul_mx(a_l0_0_tail4, sa_l0_0_tail4, b_l0_0_tail4, sb_l0_0_tail4)
+                                                a_l0_1_tail4: pl.Tile[
+                                                    [M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left,
+                                                ] = pl.tile.extract(full_a, 0, 128, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                                b_l0_1_tail4: pl.Tile[
+                                                    [128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right,
+                                                ] = pl.tile.extract(b_pre_0_tail4, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                                sa_l0_1_tail4: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_1, target_memory=pl.Mem.LeftScale)
+                                                sb_l0_1_tail4: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_1_tail4, target_memory=pl.Mem.RightScale)
+                                                acc_tail4 = pl.matmul_mx_acc(acc_tail4, a_l0_1_tail4, sa_l0_1_tail4, b_l0_1_tail4, sb_l0_1_tail4)
+                                                b_next_0_tail4: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[0], pl.Mem.Mat] = pl.load(weight, [512, col_tail4], [256, 256], target_memory=pl.Mem.Mat)
+                                                a_l0_2_tail4: pl.Tile[
+                                                    [M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left,
+                                                ] = pl.tile.extract(full_a, 0, 256, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                                b_l0_2_tail4: pl.Tile[
+                                                    [128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right,
+                                                ] = pl.tile.extract(b_pre_1_tail4, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                                sa_l0_2_tail4: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_2, target_memory=pl.Mem.LeftScale)
+                                                sb_l0_2_tail4: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_2_tail4, target_memory=pl.Mem.RightScale)
+                                                acc_tail4 = pl.matmul_mx_acc(acc_tail4, a_l0_2_tail4, sa_l0_2_tail4, b_l0_2_tail4, sb_l0_2_tail4)
+                                                a_l0_3_tail4: pl.Tile[
+                                                    [M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left,
+                                                ] = pl.tile.extract(full_a, 0, 384, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                                b_l0_3_tail4: pl.Tile[
+                                                    [128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right,
+                                                ] = pl.tile.extract(b_pre_1_tail4, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                                sa_l0_3_tail4: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_3, target_memory=pl.Mem.LeftScale)
+                                                sb_l0_3_tail4: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_3_tail4, target_memory=pl.Mem.RightScale)
+                                                acc_tail4 = pl.matmul_mx_acc(acc_tail4, a_l0_3_tail4, sa_l0_3_tail4, b_l0_3_tail4, sb_l0_3_tail4)
+                                                b_next_1_tail4: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[1], pl.Mem.Mat] = pl.load(weight, [768, col_tail4], [256, 256], target_memory=pl.Mem.Mat)
+                                                a_l0_4_tail4: pl.Tile[
+                                                    [M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left,
+                                                ] = pl.tile.extract(full_a, 0, 512, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                                b_l0_4_tail4: pl.Tile[
+                                                    [128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right,
+                                                ] = pl.tile.extract(b_next_0_tail4, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                                sa_l0_4_tail4: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_4, target_memory=pl.Mem.LeftScale)
+                                                sb_l0_4_tail4: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_4_tail4, target_memory=pl.Mem.RightScale)
+                                                acc_tail4 = pl.matmul_mx_acc(acc_tail4, a_l0_4_tail4, sa_l0_4_tail4, b_l0_4_tail4, sb_l0_4_tail4)
+                                                a_l0_5_tail4: pl.Tile[
+                                                    [M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left,
+                                                ] = pl.tile.extract(full_a, 0, 640, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                                b_l0_5_tail4: pl.Tile[
+                                                    [128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right,
+                                                ] = pl.tile.extract(b_next_0_tail4, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                                sa_l0_5_tail4: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_5, target_memory=pl.Mem.LeftScale)
+                                                sb_l0_5_tail4: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_5_tail4, target_memory=pl.Mem.RightScale)
+                                                acc_tail4 = pl.matmul_mx_acc(acc_tail4, a_l0_5_tail4, sa_l0_5_tail4, b_l0_5_tail4, sb_l0_5_tail4)
+                                                b_next_2_tail4: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=4)[0], pl.Mem.Mat] = pl.load(weight, [1024, col_tail4], [256, 256], target_memory=pl.Mem.Mat)
+                                                a_l0_6_tail4: pl.Tile[
+                                                    [M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left,
+                                                ] = pl.tile.extract(full_a, 0, 768, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                                b_l0_6_tail4: pl.Tile[
+                                                    [128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right,
+                                                ] = pl.tile.extract(b_next_1_tail4, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                                sa_l0_6_tail4: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_6, target_memory=pl.Mem.LeftScale)
+                                                sb_l0_6_tail4: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_6_tail4, target_memory=pl.Mem.RightScale)
+                                                acc_tail4 = pl.matmul_mx_acc(acc_tail4, a_l0_6_tail4, sa_l0_6_tail4, b_l0_6_tail4, sb_l0_6_tail4)
+                                                a_l0_7_tail4: pl.Tile[
+                                                    [M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left,
+                                                ] = pl.tile.extract(full_a, 0, 896, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                                b_l0_7_tail4: pl.Tile[
+                                                    [128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right,
+                                                ] = pl.tile.extract(b_next_1_tail4, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                                sa_l0_7_tail4: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_7, target_memory=pl.Mem.LeftScale)
+                                                sb_l0_7_tail4: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_7_tail4, target_memory=pl.Mem.RightScale)
+                                                acc_tail4 = pl.matmul_mx_acc(acc_tail4, a_l0_7_tail4, sa_l0_7_tail4, b_l0_7_tail4, sb_l0_7_tail4)
+                                                a_l0_8_tail4: pl.Tile[
+                                                    [M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[2], pl.Mem.Left,
+                                                ] = pl.tile.extract(full_a, 0, 1024, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                                b_l0_8_tail4: pl.Tile[
+                                                    [128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right,
+                                                ] = pl.tile.extract(b_next_2_tail4, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                                sa_l0_8_tail4: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[4], pl.Mem.LeftScale] = pl.tile.move(sa_cache_8, target_memory=pl.Mem.LeftScale)
+                                                sb_l0_8_tail4: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_8_tail4, target_memory=pl.Mem.RightScale)
+                                                acc_tail4 = pl.matmul_mx_acc(acc_tail4, a_l0_8_tail4, sa_l0_8_tail4, b_l0_8_tail4, sb_l0_8_tail4)
+                                                a_l0_9_tail4: pl.Tile[
+                                                    [M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=6)[5], pl.Mem.Left,
+                                                ] = pl.tile.extract(full_a, 0, 1152, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                                b_l0_9_tail4: pl.Tile[
+                                                    [128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right,
+                                                ] = pl.tile.extract(b_next_2_tail4, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                                sa_l0_9_tail4: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=12)[10], pl.Mem.LeftScale] = pl.tile.move(sa_cache_9, target_memory=pl.Mem.LeftScale)
+                                                sb_l0_9_tail4: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_9_tail4, target_memory=pl.Mem.RightScale)
+                                                acc_tail4 = pl.matmul_mx_acc(acc_tail4, a_l0_9_tail4, sa_l0_9_tail4, b_l0_9_tail4, sb_l0_9_tail4)
+                                                output = _store_q_b_decode_tile(
+                                                    acc_tail4, cos_resident, sin_resident, output,
+                                                    row_start + row, col_tail4, angle_rows,
+                                                )
+                    else:
+                        for nt in pl.range(width // 256):
+                            if nt % lanes == n_lane:
+                                col = nt * 256
+                                sb_cache_0 = pl.load(weight_scale, [0, col], [4, 256], target_memory=pl.Mem.Mat)
+                                sb_cache_1 = pl.load(weight_scale, [4, col], [4, 256], target_memory=pl.Mem.Mat)
+                                sb_cache_2 = pl.load(weight_scale, [8, col], [4, 256], target_memory=pl.Mem.Mat)
+                                sb_cache_3 = pl.load(weight_scale, [12, col], [4, 256], target_memory=pl.Mem.Mat)
+                                sb_cache_4 = pl.load(weight_scale, [16, col], [4, 256], target_memory=pl.Mem.Mat)
+                                sb_cache_5 = pl.load(weight_scale, [20, col], [4, 256], target_memory=pl.Mem.Mat)
+                                sb_cache_6 = pl.load(weight_scale, [24, col], [4, 256], target_memory=pl.Mem.Mat)
+                                sb_cache_7 = pl.load(weight_scale, [28, col], [4, 256], target_memory=pl.Mem.Mat)
+                                sb_cache_8 = pl.load(weight_scale, [32, col], [4, 256], target_memory=pl.Mem.Mat)
+                                sb_cache_9 = pl.load(weight_scale, [36, col], [4, 256], target_memory=pl.Mem.Mat)
+                                b_pre_0: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=2)[0], pl.Mem.Mat] = pl.load(weight, [0, col], [256, 256], target_memory=pl.Mem.Mat)
+                                b_pre_1: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=2)[1], pl.Mem.Mat] = pl.load(weight, [256, col], [256, 256], target_memory=pl.Mem.Mat)
+                                a_l0_0: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=2)[0], pl.Mem.Left] = pl.tile.extract(full_a, 0, 0, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                b_l0_0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_pre_0, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                sa_l0_0: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=4)[0], pl.Mem.LeftScale] = pl.tile.move(sa_cache_0, target_memory=pl.Mem.LeftScale)
+                                sb_l0_0: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_0, target_memory=pl.Mem.RightScale)
+                                acc = pl.matmul_mx(a_l0_0, sa_l0_0, b_l0_0, sb_l0_0)
+                                a_l0_1: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=2)[1], pl.Mem.Left] = pl.tile.extract(full_a, 0, 128, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                b_l0_1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_pre_0, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                sa_l0_1: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=4)[2], pl.Mem.LeftScale] = pl.tile.move(sa_cache_1, target_memory=pl.Mem.LeftScale)
+                                sb_l0_1: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_1, target_memory=pl.Mem.RightScale)
+                                acc = pl.matmul_mx_acc(acc, a_l0_1, sa_l0_1, b_l0_1, sb_l0_1)
+                                b_next_0: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=2)[0], pl.Mem.Mat] = pl.load(weight, [512, col], [256, 256], target_memory=pl.Mem.Mat)
+                                a_l0_2: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=2)[0], pl.Mem.Left] = pl.tile.extract(full_a, 0, 256, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                b_l0_2: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_pre_1, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                sa_l0_2: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=4)[0], pl.Mem.LeftScale] = pl.tile.move(sa_cache_2, target_memory=pl.Mem.LeftScale)
+                                sb_l0_2: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_2, target_memory=pl.Mem.RightScale)
+                                acc = pl.matmul_mx_acc(acc, a_l0_2, sa_l0_2, b_l0_2, sb_l0_2)
+                                a_l0_3: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=2)[1], pl.Mem.Left] = pl.tile.extract(full_a, 0, 384, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                b_l0_3: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_pre_1, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                sa_l0_3: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=4)[2], pl.Mem.LeftScale] = pl.tile.move(sa_cache_3, target_memory=pl.Mem.LeftScale)
+                                sb_l0_3: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_3, target_memory=pl.Mem.RightScale)
+                                acc = pl.matmul_mx_acc(acc, a_l0_3, sa_l0_3, b_l0_3, sb_l0_3)
+                                b_next_1: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=2)[1], pl.Mem.Mat] = pl.load(weight, [768, col], [256, 256], target_memory=pl.Mem.Mat)
+                                a_l0_4: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=2)[0], pl.Mem.Left] = pl.tile.extract(full_a, 0, 512, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                b_l0_4: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_next_0, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                sa_l0_4: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=4)[0], pl.Mem.LeftScale] = pl.tile.move(sa_cache_4, target_memory=pl.Mem.LeftScale)
+                                sb_l0_4: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_4, target_memory=pl.Mem.RightScale)
+                                acc = pl.matmul_mx_acc(acc, a_l0_4, sa_l0_4, b_l0_4, sb_l0_4)
+                                a_l0_5: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=2)[1], pl.Mem.Left] = pl.tile.extract(full_a, 0, 640, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                b_l0_5: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_next_0, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                sa_l0_5: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=4)[2], pl.Mem.LeftScale] = pl.tile.move(sa_cache_5, target_memory=pl.Mem.LeftScale)
+                                sb_l0_5: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_5, target_memory=pl.Mem.RightScale)
+                                acc = pl.matmul_mx_acc(acc, a_l0_5, sa_l0_5, b_l0_5, sb_l0_5)
+                                b_next_2: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef("b_l1", slots=2)[0], pl.Mem.Mat] = pl.load(weight, [1024, col], [256, 256], target_memory=pl.Mem.Mat)
+                                a_l0_6: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=2)[0], pl.Mem.Left] = pl.tile.extract(full_a, 0, 768, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                b_l0_6: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_next_1, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                sa_l0_6: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=4)[0], pl.Mem.LeftScale] = pl.tile.move(sa_cache_6, target_memory=pl.Mem.LeftScale)
+                                sb_l0_6: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_6, target_memory=pl.Mem.RightScale)
+                                acc = pl.matmul_mx_acc(acc, a_l0_6, sa_l0_6, b_l0_6, sb_l0_6)
+                                a_l0_7: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=2)[1], pl.Mem.Left] = pl.tile.extract(full_a, 0, 896, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                b_l0_7: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_next_1, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                sa_l0_7: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=4)[2], pl.Mem.LeftScale] = pl.tile.move(sa_cache_7, target_memory=pl.Mem.LeftScale)
+                                sb_l0_7: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_7, target_memory=pl.Mem.RightScale)
+                                acc = pl.matmul_mx_acc(acc, a_l0_7, sa_l0_7, b_l0_7, sb_l0_7)
+                                a_l0_8: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=2)[0], pl.Mem.Left] = pl.tile.extract(full_a, 0, 1024, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                b_l0_8: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_next_2, 0, 0, [128, 256], target_memory=pl.Mem.Right)
+                                sa_l0_8: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=4)[0], pl.Mem.LeftScale] = pl.tile.move(sa_cache_8, target_memory=pl.Mem.LeftScale)
+                                sb_l0_8: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[0], pl.Mem.RightScale] = pl.tile.move(sb_cache_8, target_memory=pl.Mem.RightScale)
+                                acc = pl.matmul_mx_acc(acc, a_l0_8, sa_l0_8, b_l0_8, sb_l0_8)
+                                a_l0_9: pl.Tile[[M_TILE, 128], pl.FP8E4M3FN, pl.MemRef("a_l0", slots=2)[1], pl.Mem.Left] = pl.tile.extract(full_a, 0, 1152, [M_TILE, 128], target_memory=pl.Mem.Left)
+                                b_l0_9: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef("b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_next_2, 128, 0, [128, 256], target_memory=pl.Mem.Right)
+                                sa_l0_9: pl.Tile[[M_TILE, 4], pl.FP8E8M0, pl.MemRef("sa_l0", slots=4)[2], pl.Mem.LeftScale] = pl.tile.move(sa_cache_9, target_memory=pl.Mem.LeftScale)
+                                sb_l0_9: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef("sb_l0", slots=4)[2], pl.Mem.RightScale] = pl.tile.move(sb_cache_9, target_memory=pl.Mem.RightScale)
+                                acc = pl.matmul_mx_acc(acc, a_l0_9, sa_l0_9, b_l0_9, sb_l0_9)
+                                valid_rows = pl.min(M_TILE, rows - row)
+                                if col % 512 == 256:
+                                    tail = pl.tile.slice(acc, [M_TILE, 64], [0, 192])
+                                    prefix = pl.set_validshape(acc, valid_rows, 192)
+                                    output = pl.store(prefix, [row_start + row, col], output)
+                                    rounded = pl.cast(tail, pl.BF16, mode="rint")
+                                    source = pl.tile.move(rounded, target_memory=pl.Mem.Vec, blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.none_box)
+                                    flat = pl.reshape(source, [M_TILE * 64])
+                                    cv = pl.load(cosine, [row_start + row, 0], [M_TILE, 32], valid_shape=[valid_rows, 32], target_memory=pl.Mem.Vec)
+                                    sv = pl.load(sine, [row_start + row, 0], [M_TILE, 32], valid_shape=[valid_rows, 32], target_memory=pl.Mem.Vec)
+                                    cv = pl.tile.fillpad_inplace(cv)
+                                    sv = pl.tile.fillpad_inplace(sv)
+                                    flat_out = pl.tile.create([8192], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+                                    flat_out = _q_b_rope_chunk(flat, cv, sv, flat_out, 0, 128, M_TILE)
+                                    rotated_tile_h0 = pl.reshape(flat_out, [128, 64])
+                                    part_rows_h0 = pl.min(128, pl.max(valid_rows, 0))
+                                    valid_part_h0 = pl.set_validshape(rotated_tile_h0, part_rows_h0, 64)
+                                    output = pl.store(valid_part_h0, [row_start + row, col + 192], output)
+                                    flat_out = _q_b_rope_chunk(flat, cv, sv, flat_out, 128, 128, M_TILE)
+                                    rotated_tile_h1 = pl.reshape(flat_out, [128, 64])
+                                    part_rows_h1 = pl.min(128, pl.max(valid_rows - 128, 0))
+                                    valid_part_h1 = pl.set_validshape(rotated_tile_h1, part_rows_h1, 64)
+                                    output = pl.store(valid_part_h1, [row_start + row + 128, col + 192], output)
+                                else:
+                                    valid_acc = pl.set_validshape(acc, valid_rows, 256)
+                                    output = pl.store(valid_acc, [row_start + row, col], output)
     return output
 
 
@@ -952,104 +1916,86 @@ def proj_q_b_pypto(
     row_start: pl.Scalar[pl.INDEX],
     worker_limit: pl.constexpr = 32,
 ):
-    projected = pl.create_tensor([rows, width], dtype=pl.BF16)
-    for mt in pl.parallel((rows + 79) // 80):
-        scale_begin = mt * 80 * 40
-        scale_end = scale_begin + 80 * 40
-        sa = activation_scale[0, scale_begin:scale_end]
-        sa = pl.reshape(sa, [80, 40])
-        sa = pl.tensor.view(sa, [80, 40], layout=pl.MX_A_ZZ)
-        for worker in pl.spmd(pl.min(worker_limit, width // 256)):
-            row = mt * 80
-            full_a = pl.load(payload, [row, 0], [80, 1280], target_memory=pl.Mem.Mat)
-            for base in pl.range(0, width // 256, worker_limit):
-                if base + worker < width // 256:
-                    col = (base + worker) * 256
-                    a0 = pl.tile.slice(full_a, [80, 256], [0, 0])
-                    sa0 = pl.load(sa, [0, 0], [80, 8])
-                    b0 = pl.load(weight, [0, col], [256, 256], target_memory=pl.Mem.Mat)
-                    sb0 = pl.load(weight_scale, [0, col], [8, 256])
-                    acc = pl.matmul_mx(a0, sa0, b0, sb0)
-                    for k in pl.pipeline(256, 1280, 256, stage=4):
-                        av = pl.tile.slice(full_a, [80, 256], [0, k])
-                        sav = pl.load(sa, [0, k // 32], [80, 8])
-                        bv = pl.load(weight, [k, col], [256, 256], target_memory=pl.Mem.Mat)
-                        sbv = pl.load(weight_scale, [k // 32, col], [8, 256])
-                        acc = pl.matmul_mx_acc(acc, av, sav, bv, sbv)
-                    valid = pl.set_validshape(acc, pl.min(80, rows - row), 256)
-                    projected = pl.store(valid, [row, col], projected)
-    for task in pl.spmd(((rows + 79) // 80) * (width // 512)):
-        row = task // (width // 512) * 80
-        col = task % (width // 512) * 512
-        valid_rows = pl.min(80, rows - row)
-        source = pl.load(projected, [row, col], [80, 512], valid_shape=[valid_rows, 512], target_memory=pl.Mem.Vec)
-        cv = pl.load(cosine, [row_start + row, 0], [80, 32], valid_shape=[valid_rows, 32], target_memory=pl.Mem.Vec)
-        sv = pl.load(sine, [row_start + row, 0], [80, 32], valid_shape=[valid_rows, 32], target_memory=pl.Mem.Vec)
-        with pl.reg_scope():
-            full = pl.reg.full_mask(lanes=64)
-            lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
-            one = pl.reg.broadcast(1, lanes=64, dtype=pl.UINT32)
-            pair = pl.reg.shift_rights(lane, 1, full)
-            swap = pl.reg.bitwise_xor(lane, one)
-            odd_bit = pl.reg.bitwise_and(lane, one)
-            is_even = pl.reg.compares(odd_bit, 0, full, predicate="eq")
-            for r in pl.hardware_loop(valid_rows):
-                trig_offset = pl.cast(r * 32, pl.UINT32)
-                trig_index = pl.reg.adds(pair, trig_offset, full)
-                c = pl.reg.gather(cv, trig_index, full)
-                s = pl.reg.gather(sv, trig_index, full)
-                raw = pl.reg.load(source, offset=r * 512 + 448, lanes=64)
-                x = pl.reg.convert(raw, dtype=pl.FP32)
-                swapped = pl.reg.gather_lanes(x, swap)
-                a = pl.reg.mul(x, c)
-                b = pl.reg.mul(swapped, s)
-                real = pl.reg.sub(a, b)
-                imag = pl.reg.add(b, a)
-                rotated = pl.reg.select(is_even, real, imag)
-                bf = pl.reg.convert(rotated, dtype=pl.BF16, rounding="R", saturate=False)
-                _rotated = pl.reg.store(source, offset=r * 512 + 448, value=bf)
-        valid_source = pl.set_validshape(source, valid_rows, 512)
-        output = pl.store(valid_source, [row_start + row, col], output)
+    """Select M256 or M80 Q projection from capacity and active rows."""
+    if payload.shape[0] >= 256:
+        if rows > 80 and ((rows + 255) // 256) * 256 <= ((rows + 79) // 80) * 80:
+            output = _proj_q_b_tile_pypto(
+                payload, weight, activation_scale, weight_scale, output, cosine, sine,
+                rows, width, row_start, worker_limit, 256,
+            )
+        else:
+            output = _proj_q_b_tile_pypto(
+                payload, weight, activation_scale, weight_scale, output, cosine, sine,
+                rows, width, row_start, worker_limit, 80,
+            )
+    else:
+        output = _proj_q_b_tile_pypto(
+            payload, weight, activation_scale, weight_scale, output, cosine, sine,
+            rows, width, row_start, worker_limit, 80,
+        )
     return output
 
 
 @pl.jit.inline(auto_scope=False)
-def proj_kv_pypto(
+def _proj_kv_tile_pypto(
     payload: pl.Tensor,
     weight: pl.Tensor,
     activation_scale: pl.Tensor,
     weight_scale: pl.Tensor,
     output: pl.Tensor,
     rows: pl.Scalar[pl.INDEX],
-    row_start: pl.Scalar[pl.INDEX],
-    worker_limit: pl.constexpr = 32,
+    worker_limit: pl.constexpr,
+    m_tile: pl.constexpr,
+    n_tile: pl.constexpr,
+    k_tile: pl.constexpr,
 ):
-    scale_width = weight.shape[0] // 32
-    for mt in pl.parallel((rows + 79) // 80):
-        scale_begin = mt * 80 * scale_width
-        scale_end = scale_begin + 80 * scale_width
+    """Project each row group using logical MX scale tiles."""
+    nz_weight: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN, pl.NZ] = weight[:, :]
+    scale_backing = pl.tensor.view(weight_scale, [D // 32, HEAD_DIM], layout=pl.ND)
+    b_scales = pl.tensor.view(scale_backing, [D // 32, HEAD_DIM], layout=pl.MX_B_NN)
+    scale_width = D // 32
+    lanes = pl.max(1, worker_limit)
+    for mt in pl.parallel((rows + m_tile - 1) // m_tile):
+        row = mt * m_tile
+        valid_rows = pl.min(m_tile, rows - row)
+        row_output = output[row:row + valid_rows, :HEAD_DIM]
+        scale_begin = mt * m_tile * scale_width
+        scale_end = scale_begin + m_tile * scale_width
         sa = activation_scale[0, scale_begin:scale_end]
-        sa = pl.reshape(sa, [80, scale_width])
-        sa = pl.tensor.view(sa, [80, scale_width], layout=pl.MX_A_ZZ)
-        for worker in pl.spmd(pl.min(worker_limit, 8)):
-            for base in pl.range(0, 8, worker_limit):
-                if base + worker < 8:
-                    row = mt * 80
-                    col = (base + worker) * 64
-                    full_a = pl.load(payload, [row, 0], [80, 5120], target_memory=pl.Mem.Mat)
-                    a0 = pl.tile.slice(full_a, [80, 256], [0, 0])
-                    sa0 = pl.load(sa, [0, 0], [80, 8])
-                    b0 = pl.load(weight, [0, col], [256, 64], target_memory=pl.Mem.Mat)
-                    sb0 = pl.load(weight_scale, [0, col], [8, 64])
+        sa = pl.reshape(sa, [m_tile, scale_width])
+        sa = pl.tensor.view(sa, [m_tile, scale_width], layout=pl.MX_A_ZZ)
+        for worker in pl.spmd(pl.min(lanes, HEAD_DIM // n_tile), name_hint="proj_kv"):
+            for base in pl.range(0, HEAD_DIM // n_tile, lanes):
+                if base + worker < HEAD_DIM // n_tile:
+                    col = (base + worker) * n_tile
+                    if m_tile == 80:
+                        k_end = D - KV_DECODE_LAST_K_TILE
+                        full_a = pl.load(payload, [row, 0], [80, D], target_memory=pl.Mem.Mat)
+                        a0 = pl.tile.slice(full_a, [80, k_tile], [0, 0])
+                    else:
+                        k_end = D
+                        a0 = pl.load(payload, [row, 0], [m_tile, k_tile], target_memory=pl.Mem.Mat)
+                    sa0 = pl.load(sa, [0, 0], [m_tile, k_tile // 32])
+                    b0 = pl.load(nz_weight, [0, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
+                    sb0 = pl.load(b_scales, [0, col], [k_tile // 32, n_tile])
                     acc = pl.matmul_mx(a0, sa0, b0, sb0)
-                    for k in pl.pipeline(256, 5120, 256, stage=2):
-                        av = pl.tile.slice(full_a, [80, 256], [0, k])
-                        sav = pl.load(sa, [0, k // 32], [80, 8])
-                        bv = pl.load(weight, [k, col], [256, 64], target_memory=pl.Mem.Mat)
-                        sbv = pl.load(weight_scale, [k // 32, col], [8, 64])
+                    for k in pl.pipeline(k_tile, k_end, k_tile, stage=2):
+                        if m_tile == 80:
+                            av = pl.tile.slice(full_a, [80, k_tile], [0, k])
+                        else:
+                            av = pl.load(payload, [row, k], [m_tile, k_tile], target_memory=pl.Mem.Mat)
+                        sav = pl.load(sa, [0, k // 32], [m_tile, k_tile // 32])
+                        bv = pl.load(nz_weight, [k, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
+                        sbv = pl.load(b_scales, [k // 32, col], [k_tile // 32, n_tile])
                         acc = pl.matmul_mx_acc(acc, av, sav, bv, sbv)
-                    valid = pl.set_validshape(acc, pl.min(80, rows - row), 64)
-                    output = pl.store(valid, [row_start + row, col], output)
+                    if m_tile == 80:
+                        a_tail = pl.tile.slice(full_a, [80, KV_DECODE_LAST_K_TILE], [0, k_end])
+                        sa_tail = pl.load(sa, [0, k_end // 32], [80, KV_DECODE_LAST_K_TILE // 32])
+                        b_tail = pl.load(nz_weight, [k_end, col], [KV_DECODE_LAST_K_TILE, n_tile], target_memory=pl.Mem.Mat)
+                        sb_tail = pl.load(b_scales, [k_end // 32, col], [KV_DECODE_LAST_K_TILE // 32, n_tile])
+                        acc = pl.matmul_mx_acc(acc, a_tail, sa_tail, b_tail, sb_tail)
+                    valid = pl.set_validshape(acc, valid_rows, n_tile)
+                    row_output = pl.store(valid, [0, col], row_output)
     return output
 
 
@@ -1070,11 +2016,12 @@ def q_proj_rope_pypto(
     padded_rows: pl.Scalar[pl.INDEX],
     qa_worker_limit: pl.constexpr = 32,
     qb_worker_limit: pl.constexpr = 32,
+    qa_row_tile: pl.constexpr = 80,
 ):
     """Project NZ QA/QB weights, rotate Q, and retain normalized rows for Index-Q."""
-    payload_rows = padded_rows
+    payload_rows = payload.shape[0]
     projected = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.BF16)
-    projected = proj_q_a_pypto(payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_worker_limit)
+    projected = proj_q_a(payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_row_tile, qa_worker_limit)
     qb_payload = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.FP8E4M3FN)
     qb_scales = pl.create_tensor([1, payload_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
     latent_rows = pl.tensor.dim(query_latent, 0)
@@ -1098,10 +2045,45 @@ def kv_proj_pypto(
     kv_projection: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     worker_limit: pl.constexpr = 32,
+    row_tile: pl.constexpr = 80,
 ):
-    """Project NZ KV weights to BF16 rows in M80 groups."""
-    kv_projection = proj_kv_pypto(payload, wkv, scales, wkv_scale, kv_projection, num_tokens, 0, worker_limit)
+    """Project packed KV weights to BF16 using the M80 or M256 preset.
+
+    Stock PTOAS 0.74 misaddresses logical MX scale slices (hw-native-sys/PTOAS#1763).
+    The model CI pin uses PTOAS 0.72.
+    """
+    if row_tile == 256:
+        kv_projection = _proj_kv_tile_pypto(
+            payload, wkv, scales, wkv_scale, kv_projection, num_tokens, worker_limit, 256, 128, 128,
+        )
+    else:
+        kv_projection = _proj_kv_tile_pypto(
+            payload, wkv, scales, wkv_scale, kv_projection, num_tokens, worker_limit, 80,
+            KV_DECODE_N_TILE if worker_limit >= HEAD_DIM // KV_DECODE_N_TILE else KV_N_TILE, KV_DECODE_K_TILE,
+        )
     return kv_projection
+
+
+# Shared model entry. Set to kv_proj_pypto to select the native backend.
+kv_proj = kv_proj_cpp
+
+
+@pl.jit
+def proj_q_a_validation(
+    payload: pl.Tensor[[QA_INPUT_ROWS, D], pl.FP8E4M3FN],
+    scales: pl.Tensor[[1, QA_SCALE_COLS], pl.FP8E8M0],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN, pl.NZ],
+    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+    projected: pl.InOut[pl.Tensor[[QA_OUTPUT_ROWS, Q_LORA], pl.BF16]],
+    num_tokens: pl.Scalar[pl.INT32],
+    row_tile: pl.Scalar[pl.INDEX],
+):
+    payload.bind_dynamic(0, QA_INPUT_ROWS)
+    scales.bind_dynamic(1, QA_SCALE_COLS)
+    projected.bind_dynamic(0, QA_OUTPUT_ROWS)
+    tile_rows = ((num_tokens + row_tile - 1) // row_tile) * row_tile
+    scale_view = scales[:, :tile_rows * (D // 32)]
+    return proj_q_a(payload, wq_a, scale_view, wq_a_scale, projected, num_tokens, row_tile, NATIVE_VALIDATION_WORKERS)
 
 
 @pl.jit
@@ -1122,14 +2104,16 @@ def qkv_native(
     kv_projection: pl.InOut[pl.Tensor],
     num_tokens: pl.Scalar[pl.INT32],
     padded_rows: pl.Scalar[pl.INDEX],
+    qa_row_tile: pl.constexpr = 80,
 ):
     query_latent, query, q_payload, q_scales = q_proj_rope_pypto(
         payload, scales, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
         rope_cos, rope_sin, query_latent, query, num_tokens, padded_rows,
         qa_worker_limit=NATIVE_VALIDATION_WORKERS, qb_worker_limit=NATIVE_VALIDATION_WORKERS,
+        qa_row_tile=qa_row_tile,
     )
     kv_projection = kv_proj_pypto(
-        payload, scales, wkv, wkv_scale, kv_projection, num_tokens, worker_limit=NATIVE_VALIDATION_WORKERS,
+        payload, scales, wkv, wkv_scale, kv_projection, num_tokens, worker_limit=NATIVE_VALIDATION_WORKERS, row_tile=80,
     )
     return query_latent, query, kv_projection
 
@@ -1289,19 +2273,34 @@ def build_qkv_validation_specs(active, capacity):
     return specs + [ScalarSpec("num_tokens", torch.int32, active), ScalarSpec("padded_rows", torch.int64, padded)]
 
 
-def golden_qkv_validation(values):
-    """Compute Q normalization, Q RoPE, and raw KV projection with K32 accumulation."""
-    from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential as project
+def _golden_q_a(values, active):
     from quant import decode_e8m0, unpack_mx_a_scale, unpack_fp8_nz
 
-    active = int(values["num_tokens"])
-    if active == 0:
-        return
     padded = values["payload"].shape[0]
     codes = values["scales"].view(torch.uint8).reshape(padded, D // 32)
     scales = decode_e8m0(unpack_mx_a_scale(codes))[:active].repeat_interleave(32, dim=-1)
     source = (values["payload"][:active].float() * scales).bfloat16()
-    projected = project(source, unpack_fp8_nz(values["wq_a"]), values["wq_a_scale"])
+    weight = unpack_fp8_nz(values["wq_a"])
+    projected = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(source, weight, values["wq_a_scale"])
+    return source, projected
+
+
+def golden_proj_q_a_validation(values):
+    active = int(values["num_tokens"])
+    if active:
+        _, projected = _golden_q_a(values, active)
+        values["projected"][:active].copy_(projected)
+
+
+def golden_qkv_validation(values):
+    """Compute Q normalization, Q RoPE, and raw KV projection with K32 accumulation."""
+    from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential as project
+    from quant import unpack_fp8_nz
+
+    active = int(values["num_tokens"])
+    if active == 0:
+        return
+    source, projected = _golden_q_a(values, active)
     latent = golden_rms_norm(projected, values["q_norm_weight"])
     query = project(latent, unpack_fp8_nz(values["wq_b"]), values["wq_b_scale"])
     query = query.reshape(active, LOCAL_H, HEAD_DIM)
@@ -1309,3 +2308,48 @@ def golden_qkv_validation(values):
     values["query_latent"][:active].copy_(latent)
     values["query"][:active].copy_(query.flatten(1).bfloat16())
     values["kv_projection"][:active].copy_(project(source, unpack_fp8_nz(values["wkv"]), values["wkv_scale"]))
+
+
+def compare_qkv_output(actual, expected, *, inputs, **kwargs):
+    """Check the active prefix and require exact preservation of inactive output rows."""
+    from golden import ratio_allclose
+
+    active = int(inputs["num_tokens"])
+    compare = ratio_allclose(atol=1e-2, rtol=1.0 / 128, valid_rows=active)
+    passed, detail = compare(actual, expected, inputs=inputs, **kwargs)
+    tail_ok = torch.equal(actual[active:], expected[active:])
+    return passed and tail_ok, f"{detail}; inactive canary preserved={tail_ok}"
+
+
+def build_proj_q_a_validation_specs(active, capacity, row_tile):
+    from golden import ScalarSpec, TensorSpec
+
+    qkv = {spec.name: spec for spec in build_qkv_validation_specs(active, capacity)}
+    return [
+        qkv["payload"], qkv["scales"], qkv["wq_a"], qkv["wq_a_scale"],
+        TensorSpec("projected", [capacity, Q_LORA], torch.bfloat16, init_value=13.0),
+        qkv["num_tokens"], ScalarSpec("row_tile", torch.int64, row_tile),
+    ]
+
+
+if __name__ == "__main__":
+    import argparse
+    from golden import run
+
+    parser = argparse.ArgumentParser(description="Validate Native Q-A projections against the model golden")
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--compile-only", action="store_true")
+    args = parser.parse_args()
+    for active, capacity, row_tile in ((72, 80, 80), (127, 160, 128), (129, 320, 256)):
+        result = run(
+            fn=proj_q_a_validation,
+            specs=build_proj_q_a_validation_specs(active, capacity, row_tile),
+            golden_fn=golden_proj_q_a_validation,
+            compare_fn={"projected": compare_qkv_output},
+            config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
+            compile_only=args.compile_only,
+        )
+        if not result.passed:
+            raise SystemExit(result.error or 1)

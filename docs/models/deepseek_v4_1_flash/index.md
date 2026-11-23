@@ -59,12 +59,16 @@ uses the shared C1A reuse kernels with ratio-2 metadata.
 ## Execution structure
 
 Prefill composes embedding and metadata preparation, the configured attention/MoE
-layer schedule, HC collapse, RMSNorm, vocabulary projection, and greedy sampling
-for the last query row per request. The reusable `decode_fwd` and its L3 entry
+layer schedule, HC collapse, RMSNorm, and vocabulary projection, and samples the
+last query row per request. The reusable `decode_fwd` and its L3 entry
 run only the backbone, retaining final HC state and DSpark target taps. DSpark
 composes the output head and sampling after that backbone. `lm_head` writes
-FP32 logits in place; `greedy_sample` and `markov_sample` are separate operations.
-Engram contributes at its configured layers. A layer follows this structure:
+FP32 logits in place; the prefill rows (both the forward tail and the resident
+generation head) and the DSpark target rows sample through `sample`
+(`sample.py`), which takes per-row temperature, top-k, and top-p filters with
+Gumbel-max randomness — zero temperature reproduces greedy decoding — while
+the DSpark draft rows use `markov_sample`. Engram contributes at its configured
+layers. A layer follows this structure:
 
 ```text
 HC state → HC pre-mix / attention norm → Q/KV projection and RoPE
@@ -122,7 +126,7 @@ shards, and return results to the row owners.
 | Layer composition | [`prefill_layer.py`](../../../models/deepseek_v4_1_flash/prefill_layer.py), [`decode_layer.py`](../../../models/deepseek_v4_1_flash/decode_layer.py) |
 | Text forward | [`prefill_fwd.py`](../../../models/deepseek_v4_1_flash/prefill_fwd.py), [`decode_fwd.py`](../../../models/deepseek_v4_1_flash/decode_fwd.py) |
 | Speculative decoding | [`decode_fwd_dspark.py`](../../../models/deepseek_v4_1_flash/decode_fwd_dspark.py), `dspark_drafter.py`, `dspark_init.py`, `decode_metadata.py`, `dspark_attn.py`, and `markov.py` |
-| Shared operators | `hc.py`, `qkv_proj_rope.py`, `compressor.py`, `sparse_attention.py`, `o_proj.py`, `engram.py`, and `lm_head.py` |
+| Shared operators | `hc.py`, `qkv_proj_rope.py`, `compressor.py`, `sparse_attention.py`, `o_proj.py`, `engram.py`, `lm_head.py`, and `sample.py` |
 
 The six standalone decode attention entries accept explicit request starts and
 query lengths through `--start-pos` and `--query-lens`. Both lists have one

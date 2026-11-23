@@ -31,7 +31,10 @@ from expert_routed import (
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS,
 )
 from input_pack import pack_x_hc
-from decode_moe import BALANCED_ROUTING, initialize_balanced_routes, DISPATCH_PACKET_WIDTH, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD, moe
+from decode_moe import (
+    BALANCED_ROUTING, DISPATCH_PACKET_WIDTH, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD,
+    clear_moe_signals, initialize_balanced_routes, moe,
+)
 
 from dspark_attn import dspark_attn, dspark_context_kv
 from qkv_proj_rope import qkv_quant
@@ -276,7 +279,8 @@ def dspark_metadata(
     return padded_ids, padded_slots, padded_indices, rope_cos, rope_sin, pre_mix
 
 
-def _dspark_drafter(
+@pl.jit.inline(auto_scope=False)
+def dspark_drafter(
     target_hidden: pl.Tensor[[T_DYN, MAIN_IN], pl.BF16],
     main_proj_weight: pl.Tensor[[MAIN_IN, D], pl.FP8E4M3FN],
     main_proj_scale: pl.Tensor[[MAIN_IN // MX_GROUP, D], pl.FP8E8M0],
@@ -438,9 +442,104 @@ def _dspark_drafter(
         )
 
 
-
-dspark_drafter = pl.jit.inline(auto_scope=False)(_dspark_drafter)
-l2_dspark_drafter = pl.jit(auto_scope=False)(_dspark_drafter)
+@pl.jit(auto_scope=False)
+def l2_dspark_drafter(
+    target_hidden: pl.Tensor[[T_DYN, MAIN_IN], pl.BF16],
+    main_proj_weight: pl.Tensor[[MAIN_IN, D], pl.FP8E4M3FN],
+    main_proj_scale: pl.Tensor[[MAIN_IN // MX_GROUP, D], pl.FP8E8M0],
+    main_norm_weight: pl.Tensor[[D], pl.BF16],
+    num_sampled: pl.Tensor[[B_DYN], pl.INT32],
+    last_sampled: pl.Tensor[[B_DYN], pl.INT64],
+    next_prefill_tokens: pl.Tensor[[B_DYN], pl.INT64],
+    anchor_ids: pl.Tensor[[B_DYN], pl.INT64],
+    first_query_positions: pl.Tensor[[B_DYN], pl.INT32],
+    block_tables: pl.Tensor[[DSPARK_DRAFT_LAYERS, B_DYN, TABLE_DYN], pl.INT32],
+    context_slots: pl.Tensor[[DSPARK_DRAFT_LAYERS, T_DYN], pl.INT64],
+    context_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    context_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    query_rope_cos: pl.Tensor[[DSPARK_QUERY_T_DYN, ROPE_DIM // 2], pl.FP32],
+    query_rope_sin: pl.Tensor[[DSPARK_QUERY_T_DYN, ROPE_DIM // 2], pl.FP32],
+    embedding_weight: pl.Tensor[[VOCAB, D], pl.BF16],
+    hc_attn_fn: pl.Tensor[[DSPARK_DRAFT_LAYERS, MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, 3], pl.FP32],
+    hc_attn_base: pl.Tensor[[DSPARK_DRAFT_LAYERS, MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[DSPARK_DRAFT_LAYERS, D], pl.BF16],
+    wq_a: pl.Tensor[[DSPARK_DRAFT_LAYERS, D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, D // MX_GROUP, Q_LORA], pl.FP8E8M0],
+    q_norm_weight: pl.Tensor[[DSPARK_DRAFT_LAYERS, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[DSPARK_DRAFT_LAYERS, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], pl.FP8E8M0],
+    wkv: pl.Tensor[[DSPARK_DRAFT_LAYERS, D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, D // MX_GROUP, HEAD_DIM], pl.FP8E8M0],
+    kv_norm_weight: pl.Tensor[[DSPARK_DRAFT_LAYERS, HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[DSPARK_DRAFT_LAYERS, LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[DSPARK_DRAFT_LAYERS, LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, LOCAL_O_GROUPS, O_GROUP_IN // MX_GROUP, O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[DSPARK_DRAFT_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0],
+    window_cache: pl.InOut[pl.Tensor[[DSPARK_DRAFT_LAYERS, C.ORI_BLOCKS_DYN, BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    hc_ffn_fn: pl.Tensor[[DSPARK_DRAFT_LAYERS, MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, 3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[DSPARK_DRAFT_LAYERS, MIX_HC], pl.FP32],
+    ffn_norm_weight: pl.Tensor[[DSPARK_DRAFT_LAYERS, D], pl.BF16],
+    gate_weight: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_EXPERTS, D], pl.BF16],
+    correction_bias: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_EXPERTS], pl.FP32],
+    routed_w1: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w1_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
+    routed_w2: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w2_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
+    routed_w3: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w3_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
+    shared_w1: pl.Tensor[[DSPARK_DRAFT_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w1_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
+    shared_w2: pl.Tensor[[DSPARK_DRAFT_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
+    shared_w2_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, MOE_INTER // MX_GROUP, D], pl.FP8E8M0],
+    shared_w3: pl.Tensor[[DSPARK_DRAFT_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w3_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
+    draft_x_hc: pl.Out[pl.Tensor[[MOE_TOKENS, HC_MULT, D], pl.FP32]],
+    draft_pre_mix: pl.Out[pl.Tensor[[MOE_TOKENS, HC_MULT], pl.FP32]],
+    recv_meta: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
+    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], pl.INT8],
+    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
+    data_arrived: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
+    routed_output: pld.DistributedTensor,
+    combine_arrived: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
+    rank: pl.Scalar[pl.INT32],
+    moe_epoch: pl.Scalar[pl.INT32],
+):
+    dspark_drafter(
+        target_hidden, main_proj_weight, main_proj_scale, main_norm_weight,
+        num_sampled, last_sampled, next_prefill_tokens,
+        anchor_ids, first_query_positions,
+        block_tables, context_slots,
+        context_rope_cos, context_rope_sin,
+        query_rope_cos, query_rope_sin,
+        embedding_weight,
+        hc_attn_fn, hc_attn_scale, hc_attn_base,
+        attn_norm_weight,
+        wq_a, wq_a_scale,
+        q_norm_weight,
+        wq_b, wq_b_scale,
+        wkv, wkv_scale, kv_norm_weight,
+        attn_sink,
+        wo_a, wo_a_scale,
+        wo_b, wo_b_scale,
+        window_cache,
+        hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        ffn_norm_weight,
+        gate_weight, correction_bias,
+        routed_w1, routed_w1_scale,
+        routed_w2, routed_w2_scale,
+        routed_w3, routed_w3_scale,
+        shared_w1, shared_w1_scale,
+        shared_w2, shared_w2_scale,
+        shared_w3, shared_w3_scale,
+        draft_x_hc, draft_pre_mix,
+        recv_meta, recv_x, recv_routes,
+        data_arrived, routed_output, combine_arrived,
+        rank, moe_epoch,
+    )
+    clear_moe_signals(draft_x_hc, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
 
 
 @pl.jit.host
