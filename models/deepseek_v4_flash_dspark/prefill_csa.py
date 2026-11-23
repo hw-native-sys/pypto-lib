@@ -1329,13 +1329,13 @@ def prefill_attention_csa_cp_core(
                 ids, dup, swap, sign, scores, pairs, selection_completion,
             )
         rope_end = pl.min(pair_end, pl.tensor.dim(inverse_rope, 0))
-        # Gate the next pair's score arena work on the current projection.
+        # Reuse the score arena once the preceding TopK readers finish.
         sparse_attn_project_pair(
             q[first:first + pair_rows], kv_cache, swa_indices[first:first + pair_rows], cmp_kv, cmp_block_table,
             local_request_ids[first:first + pair_rows], topk, valid_block_mask[first:first + pair_rows], attn_sink,
             pl.const(0, pl.INDEX), pair_rows, inverse_rope[first:rope_end], inverse_swap_idx, inverse_ready,
             wo_a, wo_b, wo_b_scale, attn_out_local[first:first + pair_rows], o_proj_weight_dep,
-            selection_completion, TRACK_COMPLETION=True, PROJ_A_FENCE=False,
+            selection_completion, TRACK_COMPLETION=False, PROJ_A_FENCE=False,
         )
     return attn_out_local
 
