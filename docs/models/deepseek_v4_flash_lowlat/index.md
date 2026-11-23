@@ -83,11 +83,9 @@ old banks starting at anchor zero retain the same indexing. The interval must
 cover every submitted parent, including drained lookahead work. Reusing a
 program at a larger anchor does not require banks for all earlier positions.
 
-The combined experimental mechanism entry exposes 100 prefill parameters,
-including real causal epoch metadata, ECHO diagnostics and request/chunk tags.
-The earlier entry has 96 parameters. Bind the generated metadata and allocate
-its required resources; an old positional argument table cannot be reused.
-This prefill interface change does not change the native decode interfaces.
+The optimized chunk entry exposes 97 parameters, including
+`gate_epoch_bases` for the MoE gate. Use the generated metadata to bind
+the arguments and allocate their buffers.
 
 Native single-query programs expose 81 parameters, and native streaming programs
 expose 153. They consume the group-sharded O-proj weights directly; the unused
