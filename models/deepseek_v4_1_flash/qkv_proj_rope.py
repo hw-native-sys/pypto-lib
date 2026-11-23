@@ -2033,8 +2033,8 @@ def kv_proj_pypto(
     return kv_projection
 
 
-# Shared model entry. Set to kv_proj_pypto to select the native backend.
-kv_proj = kv_proj_cpp
+# Shared KV projection for decode and prefill.
+kv_proj = kv_proj_pypto
 
 
 @pl.jit

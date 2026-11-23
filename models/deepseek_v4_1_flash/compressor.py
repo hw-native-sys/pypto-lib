@@ -111,11 +111,8 @@ def c1a_compressor_publish(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Normalize and publish MXFP4 rows while retaining the unrotated latent."""
-    active_tokens = pl.cast(num_tokens, pl.INT32)
-    row_groups = (active_tokens + 2 * C1A_PROJ_M_TILE - 1) // (2 * C1A_PROJ_M_TILE)
-    workers = pl.max(pl.min(pl.min(active_tokens, row_groups * 8), pl.system.available_cluster_count()), 1)
-    with pl.spmd(workers, name_hint="c1a_compress"):
-        _c1a_compress(source, slots, cache, cosine, sine, norm_weight, latent, active_tokens)
+    ready = pl.system.task_invalid()
+    c1a_compressor_publish_python(source, norm_weight, latent, cosine, sine, slots, cache, num_tokens, ready, ready)
     return cache
 
 
