@@ -24,7 +24,7 @@ from models.deepseek_v4_flash_lowlat.prefill_moe import (
 N_LOCAL = N_BANK
 N_EXPERTS_GLOBAL = N_EXPERTS
 
-from config import FLASH as MODEL_CONFIG
+from .model_config import FLASH as MODEL_CONFIG
 from prefill_swa import (
     prefill_attention_swa_cp,
 )
