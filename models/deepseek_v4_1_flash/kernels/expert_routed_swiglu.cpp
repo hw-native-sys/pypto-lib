@@ -23,10 +23,11 @@ using namespace pto;
 
 namespace {
 
-constexpr int ROW_TILE = 16;
-constexpr int COL_TILE = 768;
+constexpr int ROW_TILE = 8;
+constexpr int COL_TILE = 2304;
 constexpr int SCALE_COLS = COL_TILE / 32;
-constexpr int SCALE_STRIDE = 32;
+constexpr int SCALE_STRIDE = (SCALE_COLS + 31) / 32 * 32;
+constexpr uint32_t UB_STAGE_BYTES = 92 * 1024;
 constexpr int INPUT_BYTES = ROW_TILE * COL_TILE * sizeof(bfloat16_t);
 
 template <typename T>
@@ -45,7 +46,7 @@ AICORE inline void activateQuantize(__ubuf__ bfloat16_t* gate, __ubuf__ bfloat16
     using Input = Tile<TileType::Vec, bfloat16_t, ROW_TILE, COL_TILE>;
     using Weight = Tile<TileType::Vec, float, 1, ROW_TILE>;
     using Output = Tile<TileType::Vec, uint8_t, ROW_TILE, COL_TILE>;
-    using Codes = Tile<TileType::Vec, uint8_t, 1, ROW_TILE * SCALE_COLS>;
+    using Codes = Tile<TileType::Vec, uint8_t, 1, ROW_TILE * SCALE_STRIDE>;
     Input gateTile, upTile;
     Weight weightTile;
     Output outputTile;
@@ -200,6 +201,33 @@ AICORE inline void reduceCounts(__ubuf__ int32_t* input, uint16_t count)
     }
 #endif
 }
+template <typename Input, typename Weight>
+AICORE inline void loadActivationTile(Input& gateTile, Input& upTile, Weight& weightTile,
+                                      __gm__ bfloat16_t* pair, __gm__ float* weights,
+                                      int64_t row, int64_t col, int64_t rows, int64_t width,
+                                      event_t event)
+{
+    const uint16_t validRows = rows - row < ROW_TILE ? rows - row : ROW_TILE;
+    const uint16_t validCols = width - col < COL_TILE ? width - col : COL_TILE;
+    gateTile.SetValidRow(validRows);
+    gateTile.SetValidCol(validCols);
+    upTile.SetValidRow(validRows);
+    upTile.SetValidCol(validCols);
+    weightTile.SetValidCol(validRows);
+    using GI = GlobalTensor<bfloat16_t, Shape<1, 1, 1, DYNAMIC, DYNAMIC>,
+                            pto::Stride<DYNAMIC, DYNAMIC, DYNAMIC, DYNAMIC, 1>>;
+    using GW = GlobalTensor<float, Shape<1, 1, 1, 1, DYNAMIC>, pto::Stride<1, 1, 1, 1, 1>>;
+    GI gg(pair + row * width * 2 + col, GI::Shape(1, 1, 1, validRows, validCols),
+          GI::Stride(1, 1, 1, width * 2, 1));
+    GI gu(pair + row * width * 2 + width + col, GI::Shape(1, 1, 1, validRows, validCols),
+          GI::Stride(1, 1, 1, width * 2, 1));
+    GW gw(weights + row, GW::Shape(1, 1, 1, 1, validRows));
+    TLOAD(gateTile, gg);
+    TLOAD(upTile, gu);
+    TLOAD(weightTile, gw);
+    set_flag(PIPE_MTE2, PIPE_V, event);
+}
+
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
 {
     auto* pair = tensorData<bfloat16_t>(args, 0);
@@ -214,7 +242,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
     using Counts = Tile<TileType::Vec, int32_t, 1, 256, BLayout::RowMajor, 1, DYNAMIC>;
     using GlobalCounts = GlobalTensor<int32_t, Shape<1, 1, 1, 1, DYNAMIC>, pto::Stride<1, 1, 1, 1, 1>>;
     Counts localCounts;
-    TASSIGN(localCounts, 65536);
+    TASSIGN(localCounts, 2 * UB_STAGE_BYTES);
     int64_t rows = 0;
     for (int64_t first = 0; first < experts; first += 256) {
         const int64_t entries = experts - first < 256 ? experts - first : 256;
@@ -232,49 +260,73 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
     using Weight = Tile<TileType::Vec, float, 1, ROW_TILE, BLayout::RowMajor, 1, DYNAMIC>;
     using Output = Tile<TileType::Vec, uint8_t, ROW_TILE, COL_TILE, BLayout::RowMajor, DYNAMIC, DYNAMIC>;
     using Codes = Tile<TileType::Vec, uint8_t, ROW_TILE, SCALE_STRIDE, BLayout::RowMajor, DYNAMIC, DYNAMIC>;
-    Input gateTile, upTile;
-    Weight weightTile;
-    Output outputTile;
-    Codes codeTile;
-    TASSIGN(gateTile, 0);
-    TASSIGN(upTile, INPUT_BYTES);
-    TASSIGN(weightTile, 2 * INPUT_BYTES);
-    TASSIGN(outputTile, 2 * INPUT_BYTES + 64);
-    TASSIGN(codeTile, 2 * INPUT_BYTES + 64 + ROW_TILE * COL_TILE);
-    using GI = GlobalTensor<bfloat16_t, Shape<1, 1, 1, DYNAMIC, DYNAMIC>, pto::Stride<DYNAMIC, DYNAMIC, DYNAMIC, DYNAMIC, 1>>;
-    using GW = GlobalTensor<float, Shape<1, 1, 1, 1, DYNAMIC>, pto::Stride<1, 1, 1, 1, 1>>;
-    using GO = GlobalTensor<uint8_t, Shape<1, 1, 1, DYNAMIC, DYNAMIC>, pto::Stride<DYNAMIC, DYNAMIC, DYNAMIC, DYNAMIC, 1>>;
-    const int64_t colTiles = (width + COL_TILE - 1) / COL_TILE;
-    const int64_t workCount = ((rows + ROW_TILE - 1) / ROW_TILE) * colTiles;
-    for (int64_t work = block; work < workCount; work += blocks) {
-        const int64_t row = work / colTiles * ROW_TILE;
-        const int64_t col = work % colTiles * COL_TILE;
-        const uint16_t validRows = rows - row < ROW_TILE ? rows - row : ROW_TILE;
-        const uint16_t validCols = width - col < COL_TILE ? width - col : COL_TILE;
-        gateTile.SetValidRow(validRows);
-        gateTile.SetValidCol(validCols);
-        upTile.SetValidRow(validRows);
-        upTile.SetValidCol(validCols);
-        weightTile.SetValidCol(validRows);
-        outputTile.SetValidRow(validRows);
-        outputTile.SetValidCol(validCols);
-        codeTile.SetValidRow(validRows);
-        codeTile.SetValidCol(validCols / 32);
-        GI gg(pair + row * width * 2 + col, GI::Shape(1, 1, 1, validRows, validCols), GI::Stride(1, 1, 1, width * 2, 1));
-        GI gu(pair + row * width * 2 + width + col, GI::Shape(1, 1, 1, validRows, validCols), GI::Stride(1, 1, 1, width * 2, 1));
-        GW gw(weights + row, GW::Shape(1, 1, 1, 1, validRows));
-        TLOAD(gateTile, gg);
-        TLOAD(upTile, gu);
-        TLOAD(weightTile, gw);
-        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-        activateQuantize(gateTile.data(), upTile.data(), weightTile.data(), outputTile.data(), codeTile.data(), validRows, validCols);
-        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-        GO gy(out + row * width + col, GO::Shape(1, 1, 1, validRows, validCols), GO::Stride(1, 1, 1, width, 1));
-        GO gs(scales + row * (width / 32) + col / 32, GO::Shape(1, 1, 1, validRows, validCols / 32), GO::Stride(1, 1, 1, width / 32, 1));
-        TSTORE(gy, outputTile);
-        TSTORE(gs, codeTile);
-        pipe_barrier(PIPE_ALL);
+    static_assert(2 * INPUT_BYTES + 64 + ROW_TILE * (COL_TILE + SCALE_STRIDE) <= UB_STAGE_BYTES);
+    static_assert(2 * UB_STAGE_BYTES + 256 * sizeof(int32_t) <= 192 * 1024);
+    Input gateTile[2], upTile[2];
+    Weight weightTile[2];
+    Output outputTile[2];
+    Codes codeTile[2];
+    for (uint32_t slot = 0; slot < 2; ++slot) {
+        const uint32_t base = slot * UB_STAGE_BYTES;
+        TASSIGN(gateTile[slot], base);
+        TASSIGN(upTile[slot], base + INPUT_BYTES);
+        TASSIGN(weightTile[slot], base + 2 * INPUT_BYTES);
+        TASSIGN(outputTile[slot], base + 2 * INPUT_BYTES + 64);
+        TASSIGN(codeTile[slot], base + 2 * INPUT_BYTES + 64 + ROW_TILE * COL_TILE);
+        set_flag(PIPE_MTE3, PIPE_V, static_cast<event_t>(slot));
     }
+    using GO = GlobalTensor<uint8_t, Shape<1, 1, 1, DYNAMIC, DYNAMIC>,
+                            pto::Stride<DYNAMIC, DYNAMIC, DYNAMIC, DYNAMIC, 1>>;
+    const int64_t colTiles = (width + COL_TILE - 1) / COL_TILE;
+    // Give each vector core a contiguous, balanced row range, including the final wave.
+    const int64_t firstRow = rows * block / blocks;
+    const int64_t endRow = rows * (block + 1) / blocks;
+    const int64_t workCount = ((endRow - firstRow + ROW_TILE - 1) / ROW_TILE) * colTiles;
+    if (workCount > 0) {
+        loadActivationTile(gateTile[0], upTile[0], weightTile[0], pair, weights,
+                           firstRow, 0, endRow, width, EVENT_ID0);
+    }
+    int64_t iteration = 0;
+    for (; iteration < workCount; ++iteration) {
+        const uint32_t slot = iteration % 2;
+        const auto event = static_cast<event_t>(slot);
+        if (iteration + 1 < workCount) {
+            const auto nextEvent = static_cast<event_t>(1 - slot);
+            if (iteration > 0) {
+                wait_flag(PIPE_V, PIPE_MTE2, nextEvent);
+            }
+            loadActivationTile(gateTile[1 - slot], upTile[1 - slot], weightTile[1 - slot],
+                               pair, weights, firstRow + (iteration + 1) / colTiles * ROW_TILE,
+                               (iteration + 1) % colTiles * COL_TILE, endRow, width, nextEvent);
+        }
+        const int64_t row = firstRow + iteration / colTiles * ROW_TILE;
+        const int64_t col = iteration % colTiles * COL_TILE;
+        const uint16_t validRows = endRow - row < ROW_TILE ? endRow - row : ROW_TILE;
+        const uint16_t validCols = width - col < COL_TILE ? width - col : COL_TILE;
+        outputTile[slot].SetValidRow(validRows);
+        outputTile[slot].SetValidCol(validCols);
+        codeTile[slot].SetValidRow(validRows);
+        codeTile[slot].SetValidCol(validCols / 32);
+        wait_flag(PIPE_MTE2, PIPE_V, event);
+        wait_flag(PIPE_MTE3, PIPE_V, event);
+        activateQuantize(gateTile[slot].data(), upTile[slot].data(), weightTile[slot].data(),
+                        outputTile[slot].data(), codeTile[slot].data(), validRows, validCols);
+        set_flag(PIPE_V, PIPE_MTE2, event);
+        set_flag(PIPE_V, PIPE_MTE3, event);
+        wait_flag(PIPE_V, PIPE_MTE3, event);
+        GO gy(out + row * width + col, GO::Shape(1, 1, 1, validRows, validCols),
+              GO::Stride(1, 1, 1, width, 1));
+        GO gs(scales + row * (width / 32) + col / 32, GO::Shape(1, 1, 1, validRows, validCols / 32),
+              GO::Stride(1, 1, 1, width / 32, 1));
+        TSTORE(gy, outputTile[slot]);
+        TSTORE(gs, codeTile[slot]);
+        set_flag(PIPE_MTE3, PIPE_V, event);
+    }
+    for (uint32_t slot = 0; slot < 2; ++slot) {
+        if (iteration > slot) {
+            wait_flag(PIPE_V, PIPE_MTE2, static_cast<event_t>(slot));
+        }
+        wait_flag(PIPE_MTE3, PIPE_V, static_cast<event_t>(slot));
+    }
+    pipe_barrier(PIPE_ALL);
 }

@@ -65,7 +65,7 @@ SWIGLU_COL_TILE = 2 * MX_GROUP
 SWIGLU_SCALE_TILE = 2 * SWIGLU_ROW_TILE
 # Each scale slot reserves one full register of 32-bit words.
 SWIGLU_SCALE_REGISTER_TILE = 64
-SWIGLU_CHAIN_TILE = 4
+SWIGLU_CHAIN_TILE = 2
 SWIGLU_WORKER_TILE = 8 if T > 80 else 20
 W13_WORKER_TILE = 4 if T > 80 else GATE_UP_N // W13_N_TILE
 W2_WORKER_TILE = 4 if T > 80 else D // 256
@@ -121,163 +121,89 @@ def _shared_swiglu_compute(
             base = slot * SWIGLU_ROW_TILE + group * SWIGLU_CHAIN_TILE
             off0 = base * SWIGLU_COL_TILE
             off1 = off0 + SWIGLU_COL_TILE
-            off2 = off1 + SWIGLU_COL_TILE
-            off3 = off2 + SWIGLU_COL_TILE
 
             # Clamp gate and up and evaluate SiLU(gate) * up in FP32.
             g0_bf = pl.reg.load(gate_flat, off0, lanes=SWIGLU_COL_TILE)
             g1_bf = pl.reg.load(gate_flat, off1, lanes=SWIGLU_COL_TILE)
-            g2_bf = pl.reg.load(gate_flat, off2, lanes=SWIGLU_COL_TILE)
-            g3_bf = pl.reg.load(gate_flat, off3, lanes=SWIGLU_COL_TILE)
             g0 = pl.reg.convert(g0_bf, dtype=pl.FP32)
             g1 = pl.reg.convert(g1_bf, dtype=pl.FP32)
-            g2 = pl.reg.convert(g2_bf, dtype=pl.FP32)
-            g3 = pl.reg.convert(g3_bf, dtype=pl.FP32)
             u0_bf = pl.reg.load(up_flat, off0, lanes=SWIGLU_COL_TILE)
             u1_bf = pl.reg.load(up_flat, off1, lanes=SWIGLU_COL_TILE)
-            u2_bf = pl.reg.load(up_flat, off2, lanes=SWIGLU_COL_TILE)
-            u3_bf = pl.reg.load(up_flat, off3, lanes=SWIGLU_COL_TILE)
             u0 = pl.reg.convert(u0_bf, dtype=pl.FP32)
             u1 = pl.reg.convert(u1_bf, dtype=pl.FP32)
-            u2 = pl.reg.convert(u2_bf, dtype=pl.FP32)
-            u3 = pl.reg.convert(u3_bf, dtype=pl.FP32)
             g0 = pl.reg.minimums(g0, SWIGLU_LIMIT, full)
             g1 = pl.reg.minimums(g1, SWIGLU_LIMIT, full)
-            g2 = pl.reg.minimums(g2, SWIGLU_LIMIT, full)
-            g3 = pl.reg.minimums(g3, SWIGLU_LIMIT, full)
             u0 = pl.reg.minimums(u0, SWIGLU_LIMIT, full)
             u1 = pl.reg.minimums(u1, SWIGLU_LIMIT, full)
-            u2 = pl.reg.minimums(u2, SWIGLU_LIMIT, full)
-            u3 = pl.reg.minimums(u3, SWIGLU_LIMIT, full)
             u0 = pl.reg.maximums(u0, -SWIGLU_LIMIT, full)
             u1 = pl.reg.maximums(u1, -SWIGLU_LIMIT, full)
-            u2 = pl.reg.maximums(u2, -SWIGLU_LIMIT, full)
-            u3 = pl.reg.maximums(u3, -SWIGLU_LIMIT, full)
             s0 = pl.reg.muls(g0, -1.0, full)
             s1 = pl.reg.muls(g1, -1.0, full)
-            s2 = pl.reg.muls(g2, -1.0, full)
-            s3 = pl.reg.muls(g3, -1.0, full)
             s0 = pl.reg.exp(s0, full)
             s1 = pl.reg.exp(s1, full)
-            s2 = pl.reg.exp(s2, full)
-            s3 = pl.reg.exp(s3, full)
             s0 = pl.reg.adds(s0, 1.0, full)
             s1 = pl.reg.adds(s1, 1.0, full)
-            s2 = pl.reg.adds(s2, 1.0, full)
-            s3 = pl.reg.adds(s3, 1.0, full)
             h0 = pl.reg.div(g0, s0, full)
             h1 = pl.reg.div(g1, s1, full)
-            h2 = pl.reg.div(g2, s2, full)
-            h3 = pl.reg.div(g3, s3, full)
             h0 = pl.reg.mul(h0, u0, full)
             h1 = pl.reg.mul(h1, u1, full)
-            h2 = pl.reg.mul(h2, u2, full)
-            h3 = pl.reg.mul(h3, u3, full)
 
             # Round each group maximum upward to an E8M0 exponent.
             m0 = pl.reg.abs(h0, full)
             m1 = pl.reg.abs(h1, full)
-            m2 = pl.reg.abs(h2, full)
-            m3 = pl.reg.abs(h3, full)
             peak0 = pl.reg.reduce_max(m0, full, group_size=MX_GROUP)
             peak1 = pl.reg.reduce_max(m1, full, group_size=MX_GROUP)
-            peak2 = pl.reg.reduce_max(m2, full, group_size=MX_GROUP)
-            peak3 = pl.reg.reduce_max(m3, full, group_size=MX_GROUP)
             m0 = pl.reg.group_broadcast(peak0, lanes=SWIGLU_COL_TILE)
             m1 = pl.reg.group_broadcast(peak1, lanes=SWIGLU_COL_TILE)
-            m2 = pl.reg.group_broadcast(peak2, lanes=SWIGLU_COL_TILE)
-            m3 = pl.reg.group_broadcast(peak3, lanes=SWIGLU_COL_TILE)
             m0 = pl.reg.maximums(m0, 1e-4, full)
             m1 = pl.reg.maximums(m1, 1e-4, full)
-            m2 = pl.reg.maximums(m2, 1e-4, full)
-            m3 = pl.reg.maximums(m3, 1e-4, full)
             m0 = pl.reg.muls(m0, 1.0 / 448.0, full)
             m1 = pl.reg.muls(m1, 1.0 / 448.0, full)
-            m2 = pl.reg.muls(m2, 1.0 / 448.0, full)
-            m3 = pl.reg.muls(m3, 1.0 / 448.0, full)
             e0 = pl.reg.interpret_cast(m0, dtype=pl.INT32)
             e1 = pl.reg.interpret_cast(m1, dtype=pl.INT32)
-            e2 = pl.reg.interpret_cast(m2, dtype=pl.INT32)
-            e3 = pl.reg.interpret_cast(m3, dtype=pl.INT32)
             e0 = pl.reg.adds(e0, 8388607, full)
             e1 = pl.reg.adds(e1, 8388607, full)
-            e2 = pl.reg.adds(e2, 8388607, full)
-            e3 = pl.reg.adds(e3, 8388607, full)
             e0 = pl.reg.shift_rights(e0, 23, full)
             e1 = pl.reg.shift_rights(e1, 23, full)
-            e2 = pl.reg.shift_rights(e2, 23, full)
-            e3 = pl.reg.shift_rights(e3, 23, full)
 
             # Pack the two exponent bytes per row in MX_A_ZZ order.
             lo_code0 = pl.reg.gather_lanes(e0, lo)
             lo_code1 = pl.reg.gather_lanes(e1, lo)
-            lo_code2 = pl.reg.gather_lanes(e2, lo)
-            lo_code3 = pl.reg.gather_lanes(e3, lo)
             hi_code0 = pl.reg.gather_lanes(e0, hi)
             hi_code1 = pl.reg.gather_lanes(e1, hi)
-            hi_code2 = pl.reg.gather_lanes(e2, hi)
-            hi_code3 = pl.reg.gather_lanes(e3, hi)
             hi_code0 = pl.reg.shift_lefts(hi_code0, 8, full)
             hi_code1 = pl.reg.shift_lefts(hi_code1, 8, full)
-            hi_code2 = pl.reg.shift_lefts(hi_code2, 8, full)
-            hi_code3 = pl.reg.shift_lefts(hi_code3, 8, full)
             codes0 = pl.reg.bitwise_or(lo_code0, hi_code0, full)
             codes1 = pl.reg.bitwise_or(lo_code1, hi_code1, full)
-            codes2 = pl.reg.bitwise_or(lo_code2, hi_code2, full)
-            codes3 = pl.reg.bitwise_or(lo_code3, hi_code3, full)
-            # Each aligned 32-bit word carries the exponents of two adjacent rows.
+            # Combine the two rows' exponent bytes into one aligned 32-bit word.
             codes1 = pl.reg.shift_lefts(codes1, 16, full)
-            codes3 = pl.reg.shift_lefts(codes3, 16, full)
-            pair0 = pl.reg.bitwise_or(codes0, codes1, full)
-            pair1 = pl.reg.bitwise_or(codes2, codes3, full)
-            pair0 = pl.reg.interpret_cast(pair0, dtype=pl.UINT32)
-            pair1 = pl.reg.interpret_cast(pair1, dtype=pl.UINT32)
-            word0 = pl.cast(group * 2, pl.UINT32)
-            word1 = pl.cast(group * 2 + 1, pl.UINT32)
-            select0 = pl.reg.compares(scale_lane, word0, full, predicate="eq")
-            select1 = pl.reg.compares(scale_lane, word1, full, predicate="eq")
-            packed_scales = pl.reg.select(select0, pair0, packed_scales)
-            packed_scales = pl.reg.select(select1, pair1, packed_scales)
+            pair = pl.reg.bitwise_or(codes0, codes1, full)
+            pair = pl.reg.interpret_cast(pair, dtype=pl.UINT32)
+            word = pl.cast(group, pl.UINT32)
+            selected = pl.reg.compares(scale_lane, word, full, predicate="eq")
+            packed_scales = pl.reg.select(selected, pair, packed_scales)
 
             # Apply the reciprocal scale in FP32.
             r0 = pl.reg.sub(bias, e0, full)
             r1 = pl.reg.sub(bias, e1, full)
-            r2 = pl.reg.sub(bias, e2, full)
-            r3 = pl.reg.sub(bias, e3, full)
             r0 = pl.reg.shift_lefts(r0, 23, full)
             r1 = pl.reg.shift_lefts(r1, 23, full)
-            r2 = pl.reg.shift_lefts(r2, 23, full)
-            r3 = pl.reg.shift_lefts(r3, 23, full)
             recip0 = pl.reg.interpret_cast(r0, dtype=pl.FP32)
             recip1 = pl.reg.interpret_cast(r1, dtype=pl.FP32)
-            recip2 = pl.reg.interpret_cast(r2, dtype=pl.FP32)
-            recip3 = pl.reg.interpret_cast(r3, dtype=pl.FP32)
             h0 = pl.reg.mul(h0, recip0, full)
             h1 = pl.reg.mul(h1, recip1, full)
-            h2 = pl.reg.mul(h2, recip2, full)
-            h3 = pl.reg.mul(h3, recip3, full)
 
             # Clamp to the E4M3 range and store the packed payload.
             h0 = pl.reg.maximums(h0, -448.0, full)
             h1 = pl.reg.maximums(h1, -448.0, full)
-            h2 = pl.reg.maximums(h2, -448.0, full)
-            h3 = pl.reg.maximums(h3, -448.0, full)
             h0 = pl.reg.minimums(h0, 448.0, full)
             h1 = pl.reg.minimums(h1, 448.0, full)
-            h2 = pl.reg.minimums(h2, 448.0, full)
-            h3 = pl.reg.minimums(h3, 448.0, full)
             q0 = pl.reg.convert(h0, dtype=pl.FP8E4M3FN, rounding="R", saturate=True)
             q1 = pl.reg.convert(h1, dtype=pl.FP8E4M3FN, rounding="R", saturate=True)
-            q2 = pl.reg.convert(h2, dtype=pl.FP8E4M3FN, rounding="R", saturate=True)
-            q3 = pl.reg.convert(h3, dtype=pl.FP8E4M3FN, rounding="R", saturate=True)
             bytes0 = pl.reg.interpret_cast(q0, dtype=pl.INT8)
             bytes1 = pl.reg.interpret_cast(q1, dtype=pl.INT8)
-            bytes2 = pl.reg.interpret_cast(q2, dtype=pl.INT8)
-            bytes3 = pl.reg.interpret_cast(q3, dtype=pl.INT8)
             _payload0 = pl.reg.store(payload, off0, bytes0)
             _payload1 = pl.reg.store(payload, off1, bytes1)
-            _payload2 = pl.reg.store(payload, off2, bytes2)
-            _payload3 = pl.reg.store(payload, off3, bytes3)
             packed_scales = pl.yield_(packed_scales)
         scale_offset = slot * SWIGLU_SCALE_REGISTER_TILE
         _scale_write = pl.reg.store(scales, scale_offset, packed_scales)
@@ -552,12 +478,15 @@ def expert_shared(
     shared_w2: pl.Tensor[[MOE_INTER, D], pl.FP8E4M3FN],
     shared_w2_scale: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN],
     sh: pl.Tensor[[T, D], pl.BF16],
+    w13_limit: pl.Scalar[pl.INT32],
+    w2_workers: pl.Scalar[pl.INT32],
+    swiglu_workers: pl.Scalar[pl.INT32],
 ):
     """Shared expert with device MXFP8 activation quantization before both projections."""
     # Merged W1/W3 projection into BF16 gate/up columns.
     gate_up = pl.create_tensor([T_PAD, GATE_UP_N], dtype=pl.BF16)
     x_w13, x_w13_scale = _W13_INPUTS(x_local, x_local_scale)
-    w13_workers = pl.min(W13_GROUPS * (GATE_UP_N // W13_N_TILE), W13_WORKER_TILE)
+    w13_workers = pl.min(W13_GROUPS * (GATE_UP_N // W13_N_TILE), w13_limit)
     with pl.spmd(w13_workers, name_hint="sh_w13_mx_mm"):
         gate_up = _shared_w13_mm_pypto(
             x_w13, x_w13_scale, shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, gate_up,
@@ -566,7 +495,7 @@ def expert_shared(
     # FP32 SwiGLU, FP8 payload, and packed MX_A_ZZ scales.
     h_tile_mx = pl.create_tensor([T_PAD, MOE_INTER], dtype=pl.FP8E4M3FN)
     h_scale_mx = pl.create_tensor([1, T_PAD * H_SCALE], dtype=pl.FP8E8M0)
-    for block in pl.spmd(SWIGLU_WORKER_TILE, name_hint="sh_swiglu_vf"):
+    for block in pl.spmd(swiglu_workers, name_hint="sh_swiglu_vf"):
         blocks = pl.tile.get_block_num()
         swiglu_rows = pl.tensor.dim(gate_up, 0)
         pairs = MOE_INTER // SWIGLU_COL_TILE
@@ -631,10 +560,11 @@ def expert_shared(
         h_scale_mx, [T_PAD, H_SCALE], layout=pl.MX_A_ZZ,
     )
     rows = pl.tensor.dim(sh, 0)
-    with pl.spmd(W2_WORKER_TILE, name_hint="sh_w2_mm"):
+    with pl.spmd(w2_workers, name_hint="sh_w2_mm"):
         worker = pl.tile.get_block_idx()
-        for lane in pl.range((D // W2_N_TILE + W2_WORKER_TILE - 1) // W2_WORKER_TILE):
-            column = worker + lane * W2_WORKER_TILE
+        blocks = pl.tile.get_block_num()
+        for lane in pl.range((D // W2_N_TILE + blocks - 1) // blocks):
+            column = worker + lane * blocks
             if column < D // W2_N_TILE:
                 d0 = column * W2_N_TILE
                 for wm in pl.range((T_PAD + W2_M_TILE - 1) // W2_M_TILE):
@@ -683,6 +613,7 @@ def l2_expert_shared(
     expert_shared(
         x_local, x_local_scale, shared_w1, shared_w1_scale,
         shared_w3, shared_w3_scale, shared_w2, shared_w2_scale, sh,
+        W13_WORKER_TILE, W2_WORKER_TILE, SWIGLU_WORKER_TILE,
     )
     return sh
 
