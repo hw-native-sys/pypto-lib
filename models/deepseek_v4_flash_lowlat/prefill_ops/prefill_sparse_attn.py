@@ -674,6 +674,7 @@ def _sparse_attn_wave(
     ori_kv_flat = pl.reshape(ori_kv, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
     cmp_block_num = pl.tensor.dim(cmp_kv, 0)
     cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * BLOCK_SIZE, HEAD_DIM])
+    request_count = pl.tensor.dim(cmp_block_table, 0)
     o_packed = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
     q_flat = pl.reshape(q, [t_dim * H, HEAD_DIM])
     attn_sink_col = pl.reshape(attn_sink, [H, 1])
@@ -698,15 +699,6 @@ def _sparse_attn_wave(
             gather_bias_win_flag = pl.minimum(pl.maximum(pl.add(gather_bias_win_idx, 1.0), 0.0), 1.0)
             gather_bias_win = pl.mul(pl.sub(gather_bias_win_flag, 1.0), -FP32_NEG_INF)
             sparse_bias[gather_local_t0 : gather_local_t0 + GATHER_TOKEN_TILE, 0:WIN] = gather_bias_win
-            if SPARSE_CMP_BIAS_COLS > 0:
-                gather_bias_cmp_rows = pl.slice(cmp_indices, [GATHER_TOKEN_TILE, SPARSE_CMP_BIAS_COLS], [gather_bias_t0, 0], valid_shape=[gather_bias_rows, SPARSE_CMP_BIAS_COLS])
-                gather_bias_cmp_idx = pl.cast(gather_bias_cmp_rows, target_type=pl.FP32)
-                gather_bias_cmp_flag = pl.minimum(pl.maximum(pl.add(gather_bias_cmp_idx, 1.0), 0.0), 1.0)
-                gather_bias_cmp = pl.mul(pl.sub(gather_bias_cmp_flag, 1.0), -FP32_NEG_INF)
-                sparse_bias[gather_local_t0 : gather_local_t0 + GATHER_TOKEN_TILE, WIN:SPARSE_BIAS_COLS] = gather_bias_cmp
-            if PREFILL_SPARSE_PAD > SPARSE_BIAS_COLS:
-                gather_bias_pad = pl.full([GATHER_TOKEN_TILE, PREFILL_SPARSE_PAD - SPARSE_BIAS_COLS], dtype=pl.FP32, value=FP32_NEG_INF)
-                sparse_bias[gather_local_t0 : gather_local_t0 + GATHER_TOKEN_TILE, SPARSE_BIAS_COLS:PREFILL_SPARSE_PAD] = gather_bias_pad
         for gather_dt in pl.range(GATHER_TOKEN_TILE):
             gather_local_t = gather_local_t0 + gather_dt
             gather_t = query_base + gather_local_t
@@ -758,7 +750,8 @@ def _sparse_attn_wave(
                     block_base = gather_local_t * PREFILL_SPARSE_PAD + gather_k0
                     if gather_block_valid > 0:
                         stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                        if request_id >= 0:
+                        cmp_bias = pl.full([1, PREFILL_ATTN_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
+                        if request_id >= 0 and request_id < request_count:
                             gather_cmp_offset = gather_k0 - WIN
                             gather_cmp_cols = pl.min(PREFILL_ATTN_TILE, IDX_TOPK - gather_cmp_offset)
                             gather_indices = pl.load(cmp_indices, [gather_t, gather_cmp_offset], [1, PREFILL_ATTN_TILE], valid_shape=[1, gather_cmp_cols], target_memory=pl.MemorySpace.Vec)
@@ -772,26 +765,31 @@ def _sparse_attn_wave(
                                     gather_next = pl.tile.read(gather_indices, [0, gather_g0 + gather_ci])
                                     gather_matches = contiguous_iter and gather_next == gather_first + gather_ci
                                     gather_contiguous = pl.yield_(gather_matches)
-                                if gather_contiguous:
+                                if gather_contiguous and gather_page < CMP_MAX_BLOCKS:
                                     blk_raw = pl.read(cmp_block_table, [request_id, gather_page])
                                     if blk_raw >= 0 and blk_raw < cmp_block_num:
                                         blk = pl.cast(blk_raw, pl.INDEX)
                                         src = blk * BLOCK_SIZE + gather_intra
                                         stage[gather_g0 : gather_g0 + SPARSE_OPT_CMP_GATHER_ROW_TILE, :] = cmp_kv_flat[src : src + SPARSE_OPT_CMP_GATHER_ROW_TILE, :]
+                                        cmp_bias[:, gather_g0 : gather_g0 + SPARSE_OPT_CMP_GATHER_ROW_TILE] = pl.full(
+                                            [1, SPARSE_OPT_CMP_GATHER_ROW_TILE], dtype=pl.FP32, value=0.0,
+                                        )
                                 else:
                                     for gather_ci in pl.range(SPARSE_OPT_CMP_GATHER_ROW_TILE):
                                         gather_ki = gather_g0 + gather_ci
                                         gather_cmp_k = gather_cmp_offset + gather_ki
                                         if gather_cmp_k < IDX_TOPK:
                                             gather_raw = pl.tile.read(gather_indices, [0, gather_ki])
-                                            if gather_raw >= 0:
+                                            if gather_raw >= 0 and gather_raw < CMP_MAX_BLOCKS * BLOCK_SIZE:
                                                 blk_slot = gather_raw // BLOCK_SIZE
                                                 blk_raw = pl.read(cmp_block_table, [request_id, blk_slot])
                                                 if blk_raw >= 0 and blk_raw < cmp_block_num:
                                                     blk = pl.cast(blk_raw, pl.INDEX)
                                                     src = blk * BLOCK_SIZE + (gather_raw - blk_slot * BLOCK_SIZE)
                                                     stage[gather_ki : gather_ki + 1, :] = cmp_kv_flat[src : src + 1, :]
+                                                    pl.write(cmp_bias, [0, gather_ki], 0.0)
                         sparse_kv[block_base : block_base + PREFILL_ATTN_TILE, :] = stage
+                        sparse_bias[gather_local_t : gather_local_t + 1, gather_k0 : gather_k0 + PREFILL_ATTN_TILE] = cmp_bias
 
     # Pipeline K blocks and keep the online-softmax state local to each query.
     transfer_slots = NUM_QK_CORES * QK_TRANSFER_SLOTS
@@ -878,7 +876,8 @@ def _sparse_attn_wave(
                             )
                             qk_scaled = pl.mul(qk_scores_half, SOFTMAX_SCALE)
                             qk_masked = pl.col_expand_add(qk_scaled, qk_bias)
-                            qk_mi = pl.row_max(qk_masked, qk_reduce_tmp)
+                            # A block with no resolved pages must contribute zero probability.
+                            qk_mi = pl.maximum(pl.row_max(qk_masked, qk_reduce_tmp), FP32_NEG_INF * 0.5)
                             qk_exp = pl.exp(pl.row_expand_sub(qk_masked, qk_mi))
                             qk_li = pl.row_sum(qk_exp, qk_reduce_tmp)
                             qk_probability = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
@@ -1023,6 +1022,7 @@ def _sparse_attn_heads(
         sparse_bias = pl.create_tensor(
             [PREFILL_QUERY_TILE, PREFILL_SPARSE_PAD],
             dtype=pl.FP32,
+            manual_dep=True,
         )
         sparse_blk_mi = pl.create_tensor([PREFILL_QUERY_STATS_ROWS, 1], dtype=pl.FP32)
         sparse_blk_li = pl.create_tensor([PREFILL_QUERY_STATS_ROWS, 1], dtype=pl.FP32)
@@ -1610,6 +1610,8 @@ def build_tensor_specs(
     token_count: int = T,
     ori_block_num: int = ORI_BLOCK_NUM,
     cmp_block_num: int = CMP_BLOCK_NUM,
+    *,
+    missing_cmp_page: bool = False,
 ):
     import torch
     from golden import TensorSpec
@@ -1620,6 +1622,8 @@ def build_tensor_specs(
     if ori_block_num <= 0 or cmp_block_num <= 0:
         raise ValueError("dynamic cache block counts must be positive")
     cmp_valid = get_prefill_cmp_valid(compress_ratio, token_count)
+    if missing_cmp_page and not cmp_valid:
+        raise ValueError("The missing-page fixture requires visible compressed indices")
     rope_positions = torch.arange(token_count, dtype=torch.int32)
     shared_rope_cos, shared_rope_sin = token_local_rope(
         M, compress_ratio, rope_positions,
@@ -1639,6 +1643,8 @@ def build_tensor_specs(
         table = torch.zeros(1, CMP_MAX_BLOCKS, dtype=torch.int32)
         for blk in range(CMP_MAX_BLOCKS):
             table[0, blk] = blk % cmp_block_num
+        if missing_cmp_page:
+            table[0, 0] = -1
         return table
 
     def init_local_request_ids():
@@ -1747,6 +1753,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--ori-block-num", type=int, default=ORI_BLOCK_NUM)
     parser.add_argument("--cmp-block-num", type=int, default=CMP_BLOCK_NUM)
+    parser.add_argument("--missing-cmp-page", action="store_true", help="Leave the first selected compressed page unmapped.")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
@@ -1757,7 +1764,10 @@ if __name__ == "__main__":
 
     result = run(
         fn=prefill_sparse_attn_test,
-        specs=build_tensor_specs(args.compress_ratio, args.tokens, args.ori_block_num, args.cmp_block_num),
+        specs=build_tensor_specs(
+            args.compress_ratio, args.tokens, args.ori_block_num, args.cmp_block_num,
+            missing_cmp_page=args.missing_cmp_page,
+        ),
         golden_fn=golden_prefill_sparse_attn,
         save_data=args.save_data,
         golden_data=args.golden_data,
