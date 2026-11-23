@@ -560,15 +560,19 @@ and parallel route scheduling preserve route identities and combine order.
 These options default off.
 
 Bind the per-rank `gate_epoch_bases` for each optimized chunk submission,
-including plans with shared MoE gating disabled. Use `prepare_gate_bindings`
-or pass the gate epoch to `PreparedInputPlan.fill` when preparing metadata.
+including plans with shared MoE gating disabled. Allocate and register the
+shared tensor with `prepare_gate_bindings` before starting the Worker. After
+each previous submission completes, update that same storage for the next
+chunk. `PreparedInputPlan.fill` updates the registered metadata arena.
 Start at zero in a fresh domain. In a retained domain, use
 `advance_gate_epoch` after each successful chunk when the plan enables
 shared MoE gating or MoE owner preparation.
 Pass the padded chunk extent as `physical_rows` to `prepare_gate_bindings`
 for its pre-submit INT32 reservation check. Without an extent it checks
-against the maximum chunk size. If a chunk fails, discard its communication
-domain and start a fresh one at epoch zero before retrying.
+against the maximum chunk size. Check the reservation before writing a new
+epoch into registered storage. After a failed chunk, restore its pre-chunk
+cache state or restart prefill from a valid prefix. In both cases, start a
+fresh communication domain at epoch zero.
 
 CSA coordinates 128-query indexer blocks with two bounded gather slots.
 Gather waits for that block's exact top-512 selection and the previous consumer
@@ -837,7 +841,9 @@ The experimental prefill-only `--prefill-moe-share-gate` plan assigns32 of the
 256 router columns to each TP8 rank and exchanges the exact FP32 logits before
 hash or sorted routing. It retains the original M16/N16/K2048 GEMM fragments,
 quantization and expert arithmetic. Two exchange lanes use existing MoE compute
-credits and monotonic call epochs; the public prefill ABI remains unchanged.
+credits and monotonic call epochs. The current gate-on and gate-off plans
+share the 97-parameter ABI. Rebuild bindings from the selected artifact's
+metadata when moving from an earlier ABI.
 This requires identical full HC inputs and replicated router parameters on the
 TP ranks. It is off by default. Source and native checks do not grant device
 bitwise or ordinary performance qualification; promotion requires the complete

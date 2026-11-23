@@ -1061,7 +1061,7 @@ def gen_shared_weight(shape, dequant_std, chan_cv):
     return w_i8, scale
 
 
-def build_tensor_specs(start_pos: int = START_POS, token_count: int = S):
+def build_tensor_specs(start_pos: int = START_POS, token_count: int = S, *, second_leaf: bool = False):
     from utils import checkpoint_ends_tensor, int8_quant_per_row, pack_nz
     import torch
     from golden import TensorSpec
@@ -1098,7 +1098,11 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = S):
         return physical_block * INNER_STATE_BLOCK_SIZE + intra
 
     def init_x():
-        return ((torch.rand(token_count, D) - 0.5) * 0.1).to(torch.bfloat16)
+        values = ((torch.rand(token_count, D) - 0.5) * 0.1).to(torch.bfloat16)
+        if second_leaf:
+            values.zero_()
+            values[:, 0] = 1
+        return values
 
     def init_hadamard():
         h = torch.ones((1, 1))
@@ -1157,6 +1161,13 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = S):
                 valid_rows = rows[valid]
                 c_flat.index_copy_(0, valid_rows, hi8[valid])
                 s_flat.index_copy_(0, valid_rows, hsc[valid])
+        if second_leaf:
+            slot = TOPK_LEAF_TILE
+            if completed <= slot:
+                raise ValueError("The second-leaf winner must already be in the compressed cache")
+            physical = int(table[slot // BLOCK_SIZE]) * BLOCK_SIZE + slot % BLOCK_SIZE
+            c_flat[physical].fill_(127)
+            s_flat[physical].fill_(1.0 / 127)
         _idx_hist["cache"] = cache_i8
         _idx_hist["scale"] = scale
 
@@ -1220,7 +1231,11 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = S):
 
     def init_weights_proj():
         # weights_proj std, averaged over DeepSeek-V4-Flash-0731 layers 8/32.
-        return torch.randn(D, IDX_N_HEADS) * 0.2218
+        weights = torch.randn(D, IDX_N_HEADS) * 0.2218
+        if second_leaf:
+            weights.zero_()
+            weights[0, 0] = 1
+        return weights
 
     def init_cos():
         cos_query, _ = token_local_rope(
@@ -1243,6 +1258,13 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = S):
     )
     wq_b_i8 = wq_b_i8_T.t().contiguous()
     qr_i8, qr_scale = int8_quant_per_row(torch.rand(token_count, Q_LORA))
+    if second_leaf:
+        wq_b_i8.zero_()
+        wq_b_i8[0, 0] = 1
+        wq_b_scale.fill_(1)
+        qr_i8.zero_()
+        qr_i8[:, 0] = 1
+        qr_scale.fill_(1)
     checkpoint_tensor = checkpoint_ends_tensor([0], starts=[start_pos], lengths=[token_count])
 
     return [
@@ -1449,19 +1471,31 @@ if __name__ == "__main__":
         compare.__name__ = f"mapped_active_rows({mapping_name})"
         return compare
 
+    def second_leaf_topk_compare(actual, expected, **kwargs):
+        if not bool((expected == TOPK_LEAF_TILE).any(dim=1).all()):
+            return False, "The golden must select the seeded winner from the second score leaf."
+        if not bool((actual == TOPK_LEAF_TILE).any(dim=1).all()):
+            return False, "Top-K omitted the seeded winner from the second score leaf."
+        return topk_idxs_compare(actual, expected, **kwargs)
+
     if args.start_pos is None and args.token_count is None:
         # The final query sees 513 candidates, making the Top-K cutoff observable.
-        cases = ((START_POS, S), (IDX_TOPK * COMPRESS_RATIO - COMPRESS_RATIO, 2 * COMPRESS_RATIO))
+        cases = (
+            (START_POS, S, False),
+            (IDX_TOPK * COMPRESS_RATIO - COMPRESS_RATIO, 2 * COMPRESS_RATIO, False),
+            ((TOPK_LEAF_TILE + 1) * COMPRESS_RATIO, COMPRESS_RATIO - 1, True),
+        )
     else:
         cases = ((
             START_POS if args.start_pos is None else args.start_pos,
             S if args.token_count is None else args.token_count,
+            False,
         ),)
-    for start_pos, token_count in cases:
+    for start_pos, token_count, second_leaf in cases:
         torch.manual_seed(args.seed)
         result = run(
             fn=prefill_indexer_test,
-            specs=build_tensor_specs(start_pos, token_count),
+            specs=build_tensor_specs(start_pos, token_count, second_leaf=second_leaf),
             golden_fn=golden_prefill_indexer,
             config=dict(
                 dump_passes=args.dump_passes,
@@ -1474,7 +1508,7 @@ if __name__ == "__main__":
             atol=1e-3,
             compile_only=args.compile_only,
             compare_fn={
-                "topk_idxs": topk_idxs_compare,
+                "topk_idxs": second_leaf_topk_compare if second_leaf else topk_idxs_compare,
                 # C8 cache: INT8 rows exact bar boundary +/-1 LSB; scale rides alongside.
                 "idx_kv_cache": mapped_active_rows(
                     "idx_slot_mapping",

@@ -1257,6 +1257,13 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
+    compare_kv = ratio_allclose(atol=1e-4, rtol=1.0 / 128)
+
+    def compare_split_kv(actual, expected, **kwargs):
+        passed, detail = compare_kv(actual, expected, **kwargs)
+        if not passed:
+            return passed, detail
+        return compare_kv(actual[PREFILL_DENSE_TILE:], expected[PREFILL_DENSE_TILE:], **kwargs)
 
     modes_to_run = list(MODES.keys()) + ["split"] if args.mode == "all" else [args.mode]
 
@@ -1279,7 +1286,7 @@ if __name__ == "__main__":
             # cann-recipes-infer/ops/pypto_python/example/test_mla_prolog_pypto.py
             compare_fn={
                 "q": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-                "kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+                "kv": compare_split_kv if mode_name == "split" else compare_kv,
                 "qr": ratio_allclose(atol=1, rtol=0, max_error_ratio=0),
                 "qr_scale": ratio_allclose(atol=2.5e-5, rtol=5e-3),
             },

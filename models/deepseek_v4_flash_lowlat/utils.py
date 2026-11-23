@@ -47,7 +47,15 @@ def run_operator_validations(cases, *, single_device=(), automatic=None, standal
     selected, remaining = selector.parse_known_args()
     if selected.operator is None and standalone_options:
         option_names = {arg.partition("=")[0] for arg in remaining if arg.startswith("--")}
-        requested = [name for name, flags in standalone_options.items() if option_names.intersection(flags)]
+        known = set().union(*standalone_options.values())
+        recognized = set()
+        for name in option_names:
+            matches = [flag for flag in known if flag.startswith(name)]
+            if name in known:
+                recognized.add(name)
+            elif len(matches) == 1:
+                recognized.add(matches[0])
+        requested = [name for name, flags in standalone_options.items() if recognized.intersection(flags)]
         if len(requested) > 1:
             selector.error("Options refer to different standalone operators")
         if requested:
@@ -68,7 +76,16 @@ def run_operator_validations(cases, *, single_device=(), automatic=None, standal
         if options.device is not None and name in single_device:
             args = [*forwarded, "-d", options.device.split(",", 1)[0]]
         print(f"Validating {name}", flush=True)
-        subprocess.run([sys.executable, sys.argv[0], "--operator", name, *args], check=True)
+        subprocess.run(validation_subprocess_command("--operator", name, *args), check=True)
+
+
+def validation_subprocess_command(*args):
+    """Preserve module execution when rerunning a standalone validation."""
+    import sys
+
+    main_spec = getattr(sys.modules["__main__"], "__spec__", None)
+    entry = [sys.argv[0]] if main_spec is None else ["-m", main_spec.name]
+    return [sys.executable, *entry, *args]
 
 
 # Validation default; runtime operators receive actual request positions.

@@ -1189,6 +1189,30 @@ def golden_compressor_ratio4(tensors):
     tensors["cmp_kv_cache"][:] = cmp_kv_cache
 
 
+def seed_compressor_fixture_history(state, table, positions, *, ratio, overlap):
+    """Initialize mapped historical rows read by the first compression boundary."""
+    import torch
+
+    page_rows = state.shape[1]
+    channels = state.shape[2] // 2
+    cols = torch.arange(channels, dtype=torch.float32)
+    state[:, :, channels:] = FP32_NEG_INF
+    for batch in range(positions.shape[0]):
+        start = int(positions[batch, 0])
+        stop = int(positions[batch, -1]) + 1
+        block_start = start // ratio * ratio
+        if stop < block_start + ratio:
+            continue
+        history_start = max(0, block_start - ratio * int(overlap))
+        for absolute in range(history_start, start):
+            page = int(table[batch, absolute // page_rows])
+            if 0 <= page < state.shape[0]:
+                row = state[page, absolute % page_rows]
+                row[:channels] = torch.sin(cols * 0.017 + absolute * 0.31) * 0.125
+                row[channels:] = torch.cos(cols * 0.023 + absolute * 0.19) * 0.5
+    return state
+
+
 def build_tensor_specs_ratio4(start_pos=None):
     import torch  # type: ignore[import]
 
@@ -1224,8 +1248,9 @@ def build_tensor_specs_ratio4(start_pos=None):
 
     def init_compress_state():
         state = torch.zeros(RATIO4_COMPRESS_STATE_BLOCK_NUM, RATIO4_COMPRESS_STATE_BLOCK_SIZE, RATIO4_COMPRESS_STATE_DIM)
-        state[:, :, RATIO4_OUT_DIM:] = FP32_NEG_INF
-        return state
+        return seed_compressor_fixture_history(
+            state, init_compress_state_block_table(), init_position_ids(), ratio=RATIO4_COMPRESS_RATIO, overlap=True,
+        )
 
     def init_compress_state_block_table():
         return block_table(
@@ -1525,7 +1550,10 @@ def build_tensor_specs_ratio128(start_pos=None):
         return torch.rand(B, S, D)
 
     def init_compress_state():
-        return torch.zeros(RATIO128_COMPRESS_STATE_BLOCK_NUM, RATIO128_COMPRESS_STATE_BLOCK_SIZE, RATIO128_COMPRESS_STATE_DIM)
+        state = torch.zeros(RATIO128_COMPRESS_STATE_BLOCK_NUM, RATIO128_COMPRESS_STATE_BLOCK_SIZE, RATIO128_COMPRESS_STATE_DIM)
+        return seed_compressor_fixture_history(
+            state, init_compress_state_block_table(), init_position_ids(), ratio=RATIO128_COMPRESS_RATIO, overlap=False,
+        )
 
     # Calibrated to the real DeepSeek-V4-Flash 150
     #  (ratio-128) main compressor (mean l7/l9 of
@@ -1651,7 +1679,7 @@ def build_boundary_missing_slot_specs(start_pos=None):
     import torch
 
     if start_pos is None:
-        start_pos = RATIO128_COMPRESS_RATIO - S // 2
+        start_pos = RATIO128_COMPRESS_RATIO - max(1, S // 2)
     specs = build_tensor_specs_ratio128(start_pos)
     by_name = {spec.name: spec for spec in specs}
     positions = by_name["position_ids"].init_value()
@@ -1832,8 +1860,9 @@ def build_tensor_specs_indexer(start_pos=None):
 
     def init_compress_state():
         state = torch.zeros(INDEXER_COMPRESS_STATE_BLOCK_NUM, INDEXER_COMPRESS_STATE_BLOCK_SIZE, INDEXER_COMPRESS_STATE_DIM)
-        state[:, :, INDEXER_OUT_DIM:] = FP32_NEG_INF
-        return state
+        return seed_compressor_fixture_history(
+            state, init_compress_state_block_table(), init_position_ids(), ratio=INDEXER_COMPRESS_RATIO, overlap=True,
+        )
 
     def init_compress_state_block_table():
         return block_table(
@@ -2138,4 +2167,5 @@ if __name__ == "__main__":
             'ratio128': validate_ratio128,
             'indexer': validate_indexer,
         },
+        standalone_options={"ratio128": {"--boundary-missing-slot-fixture", "--spec-tokens", "--max-seq-len"}},
     )

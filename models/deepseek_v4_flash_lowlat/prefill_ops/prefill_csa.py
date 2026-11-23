@@ -2290,6 +2290,7 @@ if __name__ == "__main__":
     from golden import mapped_pool_ratio_allclose, ratio_allclose, ratio_reldiff, run
 
     parser = argparse.ArgumentParser(
+        allow_abbrev=False,
         description="Standalone DeepSeek V4 packed prefill CSA correctness test."
     )
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")

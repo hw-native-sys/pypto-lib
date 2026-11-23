@@ -1761,6 +1761,14 @@ if __name__ == "__main__":
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
+    if args.golden_data is not None and args.missing_cmp_page:
+        from pathlib import Path
+        import torch
+
+        table_path = Path(args.golden_data) / "in" / "cmp_block_table.pt"
+        table = torch.load(table_path, map_location="cpu", weights_only=True)
+        if table.ndim != 2 or table.numel() == 0 or int(table[0, 0]) >= 0:
+            parser.error("The replay must contain an unmapped first compressed page.")
 
     cases = [
         (

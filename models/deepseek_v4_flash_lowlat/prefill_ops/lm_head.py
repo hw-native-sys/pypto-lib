@@ -1144,11 +1144,13 @@ def validate_composed_head(config, *, compile_only):
     x_hc[logical_rows:] = 0
     x_hc = torch.stack([x_hc] * TP_SIZE)
     x_spec = TensorSpec("x_hc", list(x_hc.shape), torch.float32, init_value=x_hc)
+    tap_input = x_hc.clone()
+    tap_input[:, logical_rows:] = 0.125
     tap_shape = (TP_SIZE, local_rows, 3 * D)
     tap_result = run(
         fn=l3_prefill_tap,
         specs=[
-            x_spec,
+            TensorSpec("x_hc", list(tap_input.shape), torch.float32, init_value=tap_input),
             TensorSpec("target_hidden", list(tap_shape), torch.bfloat16,
                        init_value=lambda: torch.full(tap_shape, 3, dtype=torch.bfloat16)),
             ScalarSpec("tap_index", torch.int32, 1),

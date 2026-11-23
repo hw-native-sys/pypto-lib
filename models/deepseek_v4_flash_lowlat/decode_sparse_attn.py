@@ -1256,6 +1256,8 @@ def sparse_attn_hca_packed(
                 if qk_sb < qk_live_blocks:
                     qk_token_base = qk_t * QK_M_BOX * HCA_SPARSE_BLOCKS
                     qk_kv = pl.create_l1([HCA_ATTN_K_TILE, HEAD_DIM], pl.BF16)
+                    qk_columns = pl.create_tensor([1, HCA_ATTN_K_TILE], dtype=pl.FP32)
+                    qk_has_holes = pl.cast(0, pl.INT32)
                     if qk_sb == 0:
                         qk_slot0 = pl.max(pl.read(window_swa_indices, [qk_t, 0]), 0)
                         qk_r = qk_slot0 % BLOCK_SIZE
@@ -1326,16 +1328,24 @@ def sparse_attn_hca_packed(
                                         valid_shape=[qk_pad_rows - qk_pad_head, HEAD_DIM],
                                     )
                         else:
-                            qk_first_src = pl.cast(pl.read(cmp_block_table, [qk_b, qk_col0]), pl.INDEX)
+                            qk_columns[:, :] = pl.full([1, HCA_ATTN_K_TILE], dtype=pl.FP32, value=1.0)
+                            qk_first_src = pl.read(cmp_block_table, [qk_b, qk_col0])
                             for qk_cr in pl.range(HCA_ATTN_K_TILE):
                                 qk_cs = qk_first_src
                                 if qk_cr < qk_valid:
-                                    qk_cs = pl.cast(
-                                        pl.read(cmp_block_table, [qk_b, qk_col0 + qk_cr]), pl.INDEX
+                                    qk_cs = pl.read(cmp_block_table, [qk_b, qk_col0 + qk_cr])
+                                if qk_cs >= 0 and qk_cs < cmp_block_num * HCA_CMP_STORAGE_BLOCK_SIZE:
+                                    qk_src = pl.cast(qk_cs, pl.INDEX)
+                                    qk_kv = pl.gather_row(
+                                        qk_kv, cmp_kv_flat, [qk_cr, 0], [qk_src, 0], [1, HEAD_DIM]
                                     )
-                                qk_kv = pl.gather_row(
-                                    qk_kv, cmp_kv_flat, [qk_cr, 0], [qk_cs, 0], [1, HEAD_DIM]
-                                )
+                                else:
+                                    qk_kv = pl.gather_row(
+                                        qk_kv, ori_kv_flat, [qk_cr, 0], [0, 0], [1, HEAD_DIM]
+                                    )
+                                    if qk_cr < qk_valid:
+                                        pl.write(qk_columns, [0, qk_cr], 0.0)
+                                        qk_has_holes = pl.cast(1, pl.INT32)
                     for qk_hb in pl.pipeline(HCA_H_LOCAL // HCA_QK_M_TILE, stage=2):
                         qk_h0 = qk_hb * HCA_QK_M_TILE
                         qk_head_row = qk_t * H + head_base + qk_h0
@@ -1347,15 +1357,28 @@ def sparse_attn_hca_packed(
                         qk_scores_valid = pl.set_validshape(qk_scaled, HCA_QK_M_TILE, qk_valid)
                         qk_scores_padded = pl.fillpad(qk_scores_valid, pad_value=pl.PadValue.min)
                         qk_scores = pl.set_validshape(qk_scores_padded, HCA_QK_M_TILE, HCA_ATTN_K_TILE)
-                        qk_mi = pl.row_max(qk_scores)
-                        qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
-                        qk_li = pl.row_sum(qk_exp)
-                        qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
-                        qk_oi = pl.matmul(qk_exp_bf16, qk_kv, out_dtype=pl.FP32)
                         qk_row = qk_token_base + qk_sb * QK_M_BOX
-                        sparse_blk_mi[qk_row : qk_row + QK_M_BOX, 0:1] = qk_mi
-                        sparse_blk_li[qk_row : qk_row + QK_M_BOX, 0:1] = qk_li
-                        sparse_blk_oi[qk_row : qk_row + QK_M_BOX, 0:HEAD_DIM] = qk_oi
+                        if qk_has_holes != 0:
+                            qk_bias = pl.mul(pl.sub(qk_columns, 1.0), -NEG_INF)
+                            masked_scores = pl.col_expand_add(qk_scores, qk_bias)
+                            masked_mi = pl.row_max(masked_scores)
+                            masked_exp = pl.exp(pl.row_expand_sub(masked_scores, masked_mi))
+                            masked_exp = pl.col_expand_mul(masked_exp, qk_columns)
+                            masked_li = pl.row_sum(masked_exp)
+                            masked_prob = pl.cast(masked_exp, target_type=pl.BF16, mode="rint")
+                            masked_oi = pl.matmul(masked_prob, qk_kv, out_dtype=pl.FP32)
+                            sparse_blk_mi[qk_row : qk_row + QK_M_BOX, 0:1] = masked_mi
+                            sparse_blk_li[qk_row : qk_row + QK_M_BOX, 0:1] = masked_li
+                            sparse_blk_oi[qk_row : qk_row + QK_M_BOX, 0:HEAD_DIM] = masked_oi
+                        else:
+                            qk_mi = pl.row_max(qk_scores)
+                            qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
+                            qk_li = pl.row_sum(qk_exp)
+                            qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
+                            qk_oi = pl.matmul(qk_exp_bf16, qk_kv, out_dtype=pl.FP32)
+                            sparse_blk_mi[qk_row : qk_row + QK_M_BOX, 0:1] = qk_mi
+                            sparse_blk_li[qk_row : qk_row + QK_M_BOX, 0:1] = qk_li
+                            sparse_blk_oi[qk_row : qk_row + QK_M_BOX, 0:HEAD_DIM] = qk_oi
 
     # Online-softmax merge across sparse-K tiles, sink-norm, then fused inverse RoPE.
     # One spmd block per (token, head-tile) -- T*(H//H_TILE) blocks -- so the merge
@@ -1898,6 +1921,7 @@ def golden_sparse_attn_hca(tensors):
     ori_kv = tensors["ori_kv"].float()
     window_swa_indices = tensors["window_swa_indices"]
     cmp_kv = tensors["cmp_kv"].float()
+    cmp_rows = cmp_kv.reshape(-1, HEAD_DIM)
     cmp_block_table = tensors["cmp_block_table"]
     cmp_sparse_indices = tensors["cmp_sparse_indices"]
     attn_sink = tensors["attn_sink"].float()
@@ -1928,14 +1952,13 @@ def golden_sparse_attn_hca(tensors):
                 valid.append(False)
 
         for raw in cmp_sparse_indices[t].tolist():
-            if raw < 0:
+            row = int(cmp_block_table[b, raw].item()) if 0 <= raw < cmp_block_table.shape[1] else -1
+            if 0 <= row < cmp_rows.shape[0]:
+                kv_rows.append(cmp_rows[row])
+                valid.append(True)
+            else:
                 kv_rows.append(torch.zeros(HEAD_DIM, dtype=ori_kv.dtype))
                 valid.append(False)
-                continue
-            cmp_slot = int(raw)
-            row = int(cmp_block_table[b, cmp_slot].item())
-            kv_rows.append(cmp_kv.reshape(-1, HEAD_DIM)[row])
-            valid.append(True)
 
         if not any(valid):
             continue
@@ -2040,11 +2063,22 @@ def build_tensor_specs_hca(
     cache_window_replacement_fixture: bool = False,
     *,
     full_cmp_tail: bool = False,
+    unmapped_compressed_fixture: bool = False,
 ):
     """Build deterministic demo tensors for the HCA standalone harness."""
     if HCA_CMP_TOPK == 0:
         raise ValueError(f"HCA validation requires a context capacity of at least {HCA_COMPRESS_RATIO}")
-    blocks_per_request = (HCA_CMP_TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE
+    cmp_valid = min(CMP_CAPACITY, HCA_TOPK - WIN)
+    live_counts = [
+        cmp_valid if full_cmp_tail or mixed_topk_fixture else min(cmp_valid, HCA_ATTN_K_TILE + query % 2)
+        for query in range(T)
+    ]
+    if short_window_fixture or cache_window_replacement_fixture:
+        live_counts = [0] * T
+    if causal_regression_fixture:
+        live_counts[0] = 0
+    max_live = max(live_counts)
+    blocks_per_request = (max_live + HCA_CMP_STORAGE_BLOCK_SIZE - 1) // HCA_CMP_STORAGE_BLOCK_SIZE
     if blocks_per_request > CMP_MAX_BLOCKS:
         raise ValueError(
             f"HCA fixture requires {blocks_per_request} compressed table blocks per request, "
@@ -2063,8 +2097,6 @@ def build_tensor_specs_hca(
         from .utils import block_table, quant_w_per_channel
     else:
         from utils import block_table, quant_w_per_channel
-
-    cmp_valid = min(CMP_CAPACITY, HCA_TOPK - WIN)
 
     def init_q():
         """Initialize the query tensor used by the decode attention stage."""
@@ -2120,22 +2152,23 @@ def build_tensor_specs_hca(
 
     def init_cmp_block_table():
         """Build the demo block table for the compressed-cache pages."""
-        return block_table(
+        table = block_table(
             batch=B,
             table_blocks=CMP_MAX_BLOCKS,
             physical_blocks=CMP_BLOCK_NUM,
         )
+        if unmapped_compressed_fixture:
+            if max_live <= HCA_ATTN_K_TILE:
+                raise ValueError("The unmapped fixture requires a partially filled second compressed tile")
+            table[:, 0] = -1
+            table[:, HCA_ATTN_K_TILE] = -1
+        return table
 
     def init_cmp_sparse_indices():
         """Use consecutive queries with one full tile and a partially filled next tile."""
         indices = torch.full((T, HCA_CMP_TOPK), -1, dtype=torch.int32)
-        if not short_window_fixture and not cache_window_replacement_fixture:
-            for query in range(T):
-                bounded = HCA_ATTN_K_TILE + query % 2
-                count = cmp_valid if full_cmp_tail or mixed_topk_fixture else min(cmp_valid, bounded)
-                indices[query, :count] = torch.arange(count, dtype=torch.int32)
-        if causal_regression_fixture:
-            indices[0, :] = -1
+        for query, count in enumerate(live_counts):
+            indices[query, :count] = torch.arange(count, dtype=torch.int32)
         return indices
 
     def init_cos():
@@ -2261,6 +2294,8 @@ def validate_hca():
     import argparse
     import subprocess
     import sys
+    from pathlib import Path
+    from models.deepseek_v4_flash_lowlat.utils import validation_subprocess_command
     from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser()
@@ -2288,25 +2323,51 @@ def validate_hca():
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--max-seq-len", type=int, help="Import-time context capacity for HCA validation.")
     parser.add_argument("--full-cmp-tail", action="store_true", help="Validate all visible compressed rows.")
+    parser.add_argument("--unmapped-compressed-fixture", action="store_true")
     args = parser.parse_args()
     if args.max_seq_len is None and args.golden_data is None and not args.full_cmp_tail:
-        subprocess.run(
-            [sys.executable, *sys.argv, "--operator", "hca", "--max-seq-len", "32768"], check=True,
+        bounded = validation_subprocess_command(*sys.argv[1:], "--operator", "hca", "--max-seq-len", "32768")
+        subprocess.run(bounded, check=True)
+        explicit_fixture = (
+            args.save_data or args.causal_regression_fixture or args.short_window_fixture or args.mixed_topk_fixture
+            or args.cache_window_replacement_fixture or args.unmapped_compressed_fixture
         )
+        if not explicit_fixture:
+            subprocess.run([*bounded, "--unmapped-compressed-fixture"], check=True)
         return
+
+    if args.golden_data is not None:
+        import torch
+
+        capacity_inputs = {
+            "cmp_block_table": ((B, CMP_MAX_BLOCKS), torch.int32),
+            "cmp_kv": ((CMP_BLOCK_NUM, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM), torch.bfloat16),
+            "cmp_sparse_indices": ((T, HCA_CMP_TOPK), torch.int32),
+        }
+        for name, (shape, dtype) in capacity_inputs.items():
+            path = Path(args.golden_data) / "in" / (name + ".pt")
+            saved = torch.load(path, map_location="cpu", weights_only=True)
+            if tuple(saved.shape) != shape or saved.dtype != dtype:
+                parser.error(f"Replay layout for {name} differs. Pass the save-time --max-seq-len.")
+            if args.unmapped_compressed_fixture and name == "cmp_block_table":
+                if saved.shape[1] <= HCA_ATTN_K_TILE or bool((saved[:, [0, HCA_ATTN_K_TILE]] >= 0).any()):
+                    parser.error("The replay must contain both unmapped compressed pages.")
+
+    specs = build_tensor_specs_hca(
+        args.causal_regression_fixture,
+        args.short_window_fixture,
+        args.mixed_topk_fixture,
+        args.cache_window_replacement_fixture,
+        full_cmp_tail=args.full_cmp_tail or args.golden_data is not None,
+        unmapped_compressed_fixture=args.unmapped_compressed_fixture,
+    )
 
     print(f"compress_ratio={HCA_COMPRESS_RATIO} -> TOPK={HCA_TOPK} SPARSE_BLOCKS={HCA_SPARSE_BLOCKS} PADDED_TOPK={HCA_PADDED_TOPK}", flush=True)
 
     result = run(
         compile_only=args.compile_only,
         fn=sparse_attn_test_hca,
-        specs=build_tensor_specs_hca(
-            args.causal_regression_fixture,
-            args.short_window_fixture,
-            args.mixed_topk_fixture,
-            args.cache_window_replacement_fixture,
-            full_cmp_tail=args.full_cmp_tail or args.golden_data is not None,
-        ),
+        specs=specs,
         golden_fn=golden_sparse_attn_hca,
         golden_data=args.golden_data,
         save_data=args.save_data,
@@ -2341,6 +2402,7 @@ if __name__ == "__main__":
         },
         standalone_options={
             "swa": {"--unmapped-window-fixture"},
-            "hca": {"--max-seq-len", "--full-cmp-tail", "--mixed-topk-fixture", "--cache-window-replacement-fixture"},
+            "hca": {"--max-seq-len", "--full-cmp-tail", "--mixed-topk-fixture", "--cache-window-replacement-fixture",
+                    "--unmapped-compressed-fixture"},
         },
     )
