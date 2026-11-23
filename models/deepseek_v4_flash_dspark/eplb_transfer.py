@@ -83,7 +83,11 @@ def make_eplb_transfer(*, ranks: int, local_slots: int, hidden_size: int, interm
                 if peer != my_rank:
                     pld.system.notify(sources_done, peer, [my_rank, 0], 1, op=pld.NotifyOp.AtomicAdd)
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="eplb_wait_sources") as read_wait_tid:
+        # Anchor the deferred wait after every local push/notify.  Without this
+        # dependency the scheduler may submit the wait before the matching
+        # epoch signal is published, which can leave the transfer lane in an
+        # all-idle state on a first real migration.
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="eplb_wait_sources", deps=[push_tid]) as read_wait_tid:
             for peer in pl.range(R):
                 if peer != my_rank:
                     pld.system.defer_wait(sources_done, [peer, 0], epoch, cmp=pld.WaitCmp.Ge)
@@ -110,10 +114,11 @@ def make_eplb_transfer(*, ranks: int, local_slots: int, hidden_size: int, interm
                 if peer != my_rank:
                     pld.system.notify(installed, peer, [my_rank, 0], 1, op=pld.NotifyOp.AtomicAdd)
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="eplb_wait_install", deps=[install_tid]):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="eplb_wait_install", deps=[install_tid]) as wait_install_tid:
             for peer in pl.range(R):
                 if peer != my_rank:
                     pld.system.defer_wait(installed, [peer, 0], epoch, cmp=pld.WaitCmp.Ge)
+
         return w1, w1_scale, w3, w3_scale, w2, w2_scale
 
     @pl.jit.host

@@ -15,7 +15,7 @@ import pypto.language as pl
 
 
 def make_eplb_routing(*, logical_experts: int, ranks: int, tokens: int, top_k: int,
-                      bank_layers: int = 1, boolean_mask: bool = True):
+                      bank_layers: int = 1, boolean_mask: bool = True, single_replica: bool = False):
     """Specialize replica selection independently from the gate's score/hash policy."""
     if min(logical_experts, ranks, tokens, top_k, bank_layers) <= 0 or top_k > 8:
         raise ValueError("EPLB routing requires positive dimensions and cache-line aligned route rows")
@@ -57,9 +57,16 @@ def make_eplb_routing(*, logical_experts: int, ranks: int, tokens: int, top_k: i
                     for route in pl.range(K):
                         expert = pl.tile.read(logical_tile, [row, route])
                         bank_expert = (layer_id % bank_layers) * E + expert
-                        count = pl.read(replica_count, [bank_expert])
-                        seed = token + my_rank * T + route + route_epoch
-                        replica = seed % count
+                        # With no redundant slots, coverage of every logical
+                        # expert guarantees exactly one replica even after a
+                        # rebalance. Avoid a dynamic count read and remainder
+                        # for every route; the placement lookup still applies.
+                        if single_replica:
+                            replica = 0
+                        else:
+                            count = pl.read(replica_count, [bank_expert])
+                            seed = token + my_rank * T + route + route_epoch
+                            replica = seed % count
                         physical = pl.read(logical_to_physical, [bank_expert, replica])
                         pl.tile.write(physical_tile, [row, route], physical)
             physical_valid = pl.set_validshape(physical_tile, TOKEN_TILE, K)
@@ -78,7 +85,7 @@ def make_moe_eplb(*, enabled: bool, logical_experts: int, ranks: int, tokens: in
     BANK_ROWS = bank_layers * E
     route_experts = make_eplb_routing(
         logical_experts=E, ranks=R, tokens=T, top_k=K,
-        bank_layers=bank_layers, boolean_mask=False,
+        bank_layers=bank_layers, boolean_mask=False, single_replica=C * R == E,
     ) if enabled else None
 
     @pl.jit.inline
@@ -145,10 +152,12 @@ def make_moe_eplb(*, enabled: bool, logical_experts: int, ranks: int, tokens: in
     return (mapped_routes, publish_counts) if enabled else (identity_routes, discard_counts)
 
 
-def make_routing_test(*, logical_experts: int, ranks: int, tokens: int = 8, top_k: int = 6):
+def make_routing_test(*, logical_experts: int, ranks: int, tokens: int = 8, top_k: int = 6,
+                      single_replica: bool = False):
     """Build a distributed golden entry for replica IDs and non-contiguous invalid rows."""
     E, R, T, K = logical_experts, ranks, tokens, top_k
-    route_experts = make_eplb_routing(logical_experts=E, ranks=R, tokens=T, top_k=K)
+    route_experts = make_eplb_routing(logical_experts=E, ranks=R, tokens=T, top_k=K,
+                                     single_replica=single_replica)
 
     @pl.jit
     def routing_test(
@@ -211,7 +220,9 @@ def build_tensor_specs(*, logical_experts: int, ranks: int, redundant_experts: i
     physical = logical_experts + redundant_experts
     if logical_experts < 8 or physical % ranks or physical // ranks > logical_experts:
         raise ValueError("Invalid routing fixture capacity")
-    mapping = torch.arange(physical) % logical_experts
+    # Exercise a changed placement as well as replica selection. In particular,
+    # the single-replica specialization must still honor nonidentity mappings.
+    mapping = torch.roll(torch.arange(physical) % logical_experts, shifts=1)
     inverse = torch.full((logical_experts, ranks), -1, dtype=torch.int32)
     counts = torch.bincount(mapping, minlength=logical_experts).to(torch.int32)
     for expert in range(logical_experts):
@@ -244,6 +255,10 @@ if __name__ == "__main__":
     parser.add_argument("--ep", type=int, choices=(2, 4, 8, 16), default=2)
     parser.add_argument("--logical-experts", type=int, default=256)
     parser.add_argument("--redundant-experts", type=int, default=16)
+    parser.add_argument("--num-tokens", type=int, default=8,
+                        help="active token rows per rank; must be a multiple of the route tile")
+    parser.add_argument("--top-k", type=int, default=6,
+                        help="routes per token (at most 8)")
     parser.add_argument("-d", "--devices", default=None)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
@@ -257,11 +272,14 @@ if __name__ == "__main__":
         parser.error("Device count must match EP")
     if any(device < 0 for device in devices) or len(set(devices)) != len(devices):
         parser.error("Device IDs must be distinct and non-negative")
-    fn = make_routing_test(logical_experts=args.logical_experts, ranks=args.ep)
+    fn = make_routing_test(logical_experts=args.logical_experts, ranks=args.ep,
+                           tokens=args.num_tokens, top_k=args.top_k,
+                           single_replica=args.redundant_experts == 0)
     result = run(
         fn=fn,
         specs=build_tensor_specs(logical_experts=args.logical_experts, ranks=args.ep,
-                                 redundant_experts=args.redundant_experts),
+                                 redundant_experts=args.redundant_experts,
+                                 tokens=args.num_tokens, top_k=args.top_k),
         golden_fn=golden_routing,
         compile_only=args.compile_only,
         config=dict(backend_type=args.platform, execution_mode=args.sim,
