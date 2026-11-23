@@ -561,11 +561,11 @@ Direct HC post requires owner reduction. Expert affinity, batched gather,
 and parallel route scheduling preserve route identities and combine order.
 These options default off.
 
-For shared MoE gating, bind the per-rank `gate_epoch_bases` with
-`prepare_gate_bindings`. Use `advance_gate_epoch` after each successful
-whole-chunk dispatch when retaining the communication domain. Start at zero
-in a fresh domain. Pass the matching gate epoch to `PreparedInputPlan.fill`
-when using prepared metadata.
+Bind the per-rank `gate_epoch_bases` for each optimized chunk submission,
+including plans with shared MoE gating disabled. Use `prepare_gate_bindings`
+or pass the gate epoch to `PreparedInputPlan.fill` when preparing metadata.
+Start at zero in a fresh domain. When shared MoE gating is enabled, use
+`advance_gate_epoch` after each successful chunk in a retained domain.
 
 CSA coordinates 128-query indexer blocks with two bounded gather slots.
 Gather waits for that block's exact top-512 selection and the previous consumer
