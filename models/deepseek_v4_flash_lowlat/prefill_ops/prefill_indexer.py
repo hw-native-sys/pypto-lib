@@ -1327,7 +1327,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--start-pos",
         type=int,
-        default=START_POS,
+        default=None,
         help="Fixture-only absolute position for token 0; lowered into position_ids and dense idx_slot_mapping.",
     )
     parser.add_argument(
@@ -1335,11 +1335,12 @@ if __name__ == "__main__":
         "--num-tokens",
         dest="token_count",
         type=int,
-        default=S,
+        default=None,
         help=f"Physical token length in [1, {PREFILL_MAX_TOKENS}].",
     )
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--seed", type=int, default=20261023)
     args = parser.parse_args()
 
     def score_selected_indices(token_id, indices, expected_outputs, inputs):
@@ -1448,42 +1449,52 @@ if __name__ == "__main__":
         compare.__name__ = f"mapped_active_rows({mapping_name})"
         return compare
 
-    result = run(
-        fn=prefill_indexer_test,
-        specs=build_tensor_specs(args.start_pos, args.token_count),
-        golden_fn=golden_prefill_indexer,
-        config=dict(
-            dump_passes=args.dump_passes,
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            device_id=args.device,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-        ),
-        rtol=1e-3,
-        atol=1e-3,
-        compile_only=args.compile_only,
-        compare_fn={
-            "topk_idxs": topk_idxs_compare,
-            # C8 cache: INT8 rows exact bar boundary +/-1 LSB; scale rides alongside.
-            "idx_kv_cache": mapped_active_rows(
-                "idx_slot_mapping",
-                ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
+    if args.start_pos is None and args.token_count is None:
+        # The final query sees 513 candidates, making the Top-K cutoff observable.
+        cases = ((START_POS, S), (IDX_TOPK * COMPRESS_RATIO - COMPRESS_RATIO, 2 * COMPRESS_RATIO))
+    else:
+        cases = ((
+            START_POS if args.start_pos is None else args.start_pos,
+            S if args.token_count is None else args.token_count,
+        ),)
+    for start_pos, token_count in cases:
+        torch.manual_seed(args.seed)
+        result = run(
+            fn=prefill_indexer_test,
+            specs=build_tensor_specs(start_pos, token_count),
+            golden_fn=golden_prefill_indexer,
+            config=dict(
+                dump_passes=args.dump_passes,
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                device_id=args.device,
+                enable_chip_swimlane=args.enable_chip_swimlane,
             ),
-            "idx_kv_scale": mapped_active_rows(
-                "idx_slot_mapping",
-                ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
-            ),
-            "inner_compress_state": mapped_active_rows(
-                "inner_state_slot_mapping",
-                ratio_allclose(
-                    atol=1e-4,
-                    rtol=1.0 / 128,
-                    max_error_ratio=0.01,
+            rtol=1e-3,
+            atol=1e-3,
+            compile_only=args.compile_only,
+            compare_fn={
+                "topk_idxs": topk_idxs_compare,
+                # C8 cache: INT8 rows exact bar boundary +/-1 LSB; scale rides alongside.
+                "idx_kv_cache": mapped_active_rows(
+                    "idx_slot_mapping",
+                    ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
                 ),
-            ),
-        },
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+                "idx_kv_scale": mapped_active_rows(
+                    "idx_slot_mapping",
+                    ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
+                ),
+                "inner_compress_state": mapped_active_rows(
+                    "inner_state_slot_mapping",
+                    ratio_allclose(
+                        atol=1e-4,
+                        rtol=1.0 / 128,
+                        max_error_ratio=0.01,
+                    ),
+                ),
+            },
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
