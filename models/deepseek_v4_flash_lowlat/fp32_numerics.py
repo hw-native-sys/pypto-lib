@@ -600,7 +600,7 @@ def rne_exp_signed(
         one = zero
     else:
         one = pl.add(zero, 1.0)
-    (reduced, low, power, one) = exp_reduced(
+    (reduced, low, power, result_unit) = exp_reduced(
         argument, zero, one, rows, cols,
         round_first=True, positive=True, late_unit=negate,
     )
@@ -610,7 +610,7 @@ def rne_exp_signed(
     else:
         fallback = pl.exp(argument)
     inside = pl.minimum(pl.maximum(pl.mul(pl.neg(pl.sub(pl.abs(x), 80.00000762939453)), 131072.0), 0.0), 1.0)
-    outside = pl.sub(one, inside)
+    outside = pl.sub(result_unit, inside)
     result = pl.add(pl.mul(value, inside), pl.mul(fallback, outside))
     return result
 
