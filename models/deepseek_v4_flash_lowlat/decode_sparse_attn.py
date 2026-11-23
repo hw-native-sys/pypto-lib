@@ -1516,21 +1516,11 @@ HCA_ATTN_K_TILE = 128
 CMP_CAPACITY = MAX_SEQ_LEN // HCA_COMPRESS_RATIO
 # Rounded up to a whole sparse block so TOPK needs no padding (PADDED_TOPK == TOPK).
 HCA_CMP_TOPK = ((CMP_CAPACITY + HCA_ATTN_K_TILE - 1) // HCA_ATTN_K_TILE) * HCA_ATTN_K_TILE
-# Longest context this build serves; past it the tail drops its NEWEST slots and
-# leaves a hole between the compressed history and the window.
-MAX_SUPPORTED_SEQ = HCA_CMP_TOPK * HCA_COMPRESS_RATIO
-CMP_BLOCKS_PER_REQ = (HCA_CMP_TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE
 HCA_TOPK = WIN + HCA_CMP_TOPK    # cache-first window slots + the ratio-128 compressed tail
 # Floor to 2: a single sparse-K block miscompiles in pypto (S-stride cross-token
 # output mixup); a 2-block build with an all-invalid 2nd block is bit-exact.
 HCA_SPARSE_BLOCKS = max(2, (HCA_TOPK + HCA_ATTN_K_TILE - 1) // HCA_ATTN_K_TILE)
 HCA_PADDED_TOPK = HCA_SPARSE_BLOCKS * HCA_ATTN_K_TILE
-assert CMP_BLOCKS_PER_REQ <= CMP_MAX_BLOCKS, (
-    f"compressed block table ({CMP_MAX_BLOCKS} blocks) must index the whole "
-    f"{HCA_CMP_TOPK}-slot tail; MAX_SUPPORTED_SEQ={MAX_SUPPORTED_SEQ}")
-assert B * CMP_BLOCKS_PER_REQ <= CMP_BLOCK_NUM, (
-    f"compressed KV pool ({CMP_BLOCK_NUM} blocks) must hold B={B} requests x "
-    f"{CMP_BLOCKS_PER_REQ} blocks; MAX_SUPPORTED_SEQ={MAX_SUPPORTED_SEQ}")
 assert WIN == HCA_ATTN_K_TILE, f"HCA window tile requires WIN ({WIN}) == ATTN_K_TILE ({HCA_ATTN_K_TILE})"
 assert HCA_SPARSE_BLOCKS == 1 + HCA_CMP_TOPK // HCA_ATTN_K_TILE, (
     f"qk_pv assembles block 0 from the window and block k >= 1 from compressed "
@@ -2055,6 +2045,18 @@ def build_tensor_specs_hca(
     cache_window_replacement_fixture: bool = False,
 ):
     """Build deterministic demo tensors for the HCA standalone harness."""
+    blocks_per_request = (HCA_CMP_TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE
+    if blocks_per_request > CMP_MAX_BLOCKS:
+        raise ValueError(
+            f"HCA fixture requires {blocks_per_request} compressed table blocks per request, "
+            f"but the table has {CMP_MAX_BLOCKS}"
+        )
+    if B * blocks_per_request > CMP_BLOCK_NUM:
+        raise ValueError(
+            f"HCA fixture requires {B * blocks_per_request} compressed KV pool blocks, "
+            f"but the pool has {CMP_BLOCK_NUM}"
+        )
+
     import torch
     from golden import TensorSpec
 

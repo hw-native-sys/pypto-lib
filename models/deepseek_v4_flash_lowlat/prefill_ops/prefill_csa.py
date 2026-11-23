@@ -2287,7 +2287,7 @@ if __name__ == "__main__":
     import subprocess
     import sys
 
-    from golden import ratio_allclose, ratio_reldiff, run
+    from golden import mapped_pool_ratio_allclose, ratio_allclose, ratio_reldiff, run
 
     parser = argparse.ArgumentParser(
         description="Standalone DeepSeek V4 packed prefill CSA correctness test."
@@ -2336,10 +2336,20 @@ if __name__ == "__main__":
         "cmp_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3),
         "inner_compress_state": ratio_allclose(atol=1e-3, rtol=1e-3),
-        # INT8 quant-on-write: one LSB of rounding drift on a bounded row fraction.
-        "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
-        "idx_kv_scale": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
     }
+
+    def index_cache_compare(specs, mapping_name, *, leading_rank_axis=False):
+        mapping_shape = tuple(next(spec.shape for spec in specs if spec.name == mapping_name))
+        pool_layout = dict(mapping_shape=mapping_shape, block_size=BLOCK_SIZE, leading_rank_axis=leading_rank_axis)
+        return {
+            "idx_kv_cache": mapped_pool_ratio_allclose(
+                mapping_name, **pool_layout, pool_name="index cache", atol=1, rtol=0, max_error_ratio=0.01,
+            ),
+            "idx_kv_scale": mapped_pool_ratio_allclose(
+                mapping_name, **pool_layout, pool_name="index scales", atol=1e-4, rtol=1.0 / 128,
+                max_error_ratio=0.01,
+            ),
+        }
 
     if args.tp != TP_SIZE:
         raise SystemExit(f"--tp={args.tp} does not match import-time TP_SIZE={TP_SIZE}")
@@ -2365,9 +2375,10 @@ if __name__ == "__main__":
         parser.error(f"--token-count must be a multiple of --tp={TP_SIZE}, got {args.token_count}")
 
     if TP_SIZE == 1:
+        specs = build_tensor_specs(args.start_pos, args.token_count)
         result = run(
             fn=prefill_attention_csa_test,
-            specs=build_tensor_specs(args.start_pos, args.token_count),
+            specs=specs,
             golden_fn=golden_prefill_attention_csa,
             config=dict(
                 dump_passes=args.dump_passes,
@@ -2385,13 +2396,8 @@ if __name__ == "__main__":
             atol=1e-2,
             compare_fn={
                 "x_out": ratio_reldiff(diff_thd=x_out_diff_thd, pct_thd=0.005, max_diff_hd=x_out_max_diff),
-                "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-                "cmp_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-                "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3),
-                "inner_compress_state": ratio_allclose(atol=1e-3, rtol=1e-3),
-                # INT8 quant-on-write: one LSB of rounding drift on a bounded row fraction.
-                "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
-                "idx_kv_scale": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
+                **cache_compare,
+                **index_cache_compare(specs, "idx_slot_mapping"),
             },
         )
     else:
@@ -2422,6 +2428,7 @@ if __name__ == "__main__":
             compare_fn={
                 "x_out_full": ratio_reldiff(diff_thd=x_out_diff_thd, pct_thd=0.005, max_diff_hd=x_out_max_diff),
                 **cache_compare,
+                **index_cache_compare(specs, "idx_slot_mapping_full", leading_rank_axis=True),
             },
         )
     if not result.passed:

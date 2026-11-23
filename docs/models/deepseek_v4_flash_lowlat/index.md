@@ -562,8 +562,9 @@ These options default off.
 Bind the per-rank `gate_epoch_bases` for each optimized chunk submission,
 including plans with shared MoE gating disabled. Use `prepare_gate_bindings`
 or pass the gate epoch to `PreparedInputPlan.fill` when preparing metadata.
-Start at zero in a fresh domain. When shared MoE gating is enabled, use
-`advance_gate_epoch` after each successful chunk in a retained domain.
+Start at zero in a fresh domain. In a retained domain, use
+`advance_gate_epoch` after each successful chunk when the plan enables
+shared MoE gating or MoE owner preparation.
 
 CSA coordinates 128-query indexer blocks with two bounded gather slots.
 Gather waits for that block's exact top-512 selection and the previous consumer

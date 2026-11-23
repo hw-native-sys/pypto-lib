@@ -4604,7 +4604,7 @@ def validate_ratio128():
 
 def validate_indexer():
     import argparse
-    from golden import ratio_allclose, run
+    from golden import mapped_pool_ratio_allclose, ratio_allclose, run
 
     parser = argparse.ArgumentParser(
         description="Standalone token-major DeepSeek V4 prefill indexer compressor validation."
@@ -4640,6 +4640,7 @@ def validate_indexer():
     if args.start_pos == START_POS and args.token_count == VALIDATION_TOKENS:
         cases.extend(((0, 8192, (512, 4096, 8064)), (33, 1024, 640), (127, 513, 128)))
     for start_pos, token_count, checkpoint_end in cases:
+        index_pool = dict(mapping_shape=(token_count,), block_size=BLOCK_SIZE, max_error_ratio=0.01)
         result = run(
             fn=prefill_indexer_compressor_test,
             specs=build_tensor_specs_indexer(start_pos, token_count, checkpoint_end),
@@ -4654,9 +4655,12 @@ def validate_indexer():
             compile_only=args.compile_only,
             compare_fn={
                 "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
-                # C8 cache: INT8 rows exact bar the <=B boundary rows the compressor rewrote (+/-1 LSB).
-                "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
-                "idx_kv_scale": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
+                "idx_kv_cache": mapped_pool_ratio_allclose(
+                    "idx_slot_mapping", **index_pool, pool_name="index cache", atol=1, rtol=0,
+                ),
+                "idx_kv_scale": mapped_pool_ratio_allclose(
+                    "idx_slot_mapping", **index_pool, pool_name="index scales", atol=1e-4, rtol=1.0 / 128,
+                ),
             },
         )
         if not result.passed:
