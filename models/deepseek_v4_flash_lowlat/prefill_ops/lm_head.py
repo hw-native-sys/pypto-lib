@@ -89,7 +89,7 @@ def _hc_head(
         k_base = ok * (HC_DIM // RMS_OK)
         valid_rows = pl.min(RMS_T_TILE, t_dim - t0)
         sq_sum = pl.full([1, RMS_T_TILE], dtype=pl.FP32, value=0.0)
-        for kb in pl.pipeline(HC_DIM // RMS_OK // RMS_K_TILE, stage=4):
+        for kb in pl.pipeline(HC_DIM // RMS_OK // RMS_K_TILE, stage=1):
             k0 = k_base + kb * RMS_K_TILE
             if valid_rows == RMS_T_TILE:
                 x_rms_full = x_flat[t0 : t0 + RMS_T_TILE, k0 : k0 + RMS_K_TILE]
