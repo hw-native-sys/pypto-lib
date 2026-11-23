@@ -171,6 +171,9 @@ def main() -> int:
 
     seq_lens = [int(x) for x in args.seq_len.split(",") if x]
     stages = [s for s in args.stages.split(",") if s]
+    if args.backend_type == "a5" and "chunk_o" in stages:
+        parser.error("the chunk_o stage times chunk_o_pipe, whose authored cross-core "
+                     "events have no a5 path; drop it from --stages")
 
     records = []
     for t in seq_lens:

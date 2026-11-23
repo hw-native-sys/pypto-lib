@@ -98,6 +98,11 @@ ECO_REPO = "Eco-Tech/Qwen3.8-27B-w8a8"
 ECO_REVISION = "ca2937f18b7e399c0ee91c728a4cde9b837aebff"
 ECO_INDEX = "quant_model_weights.safetensors.index.json"
 ECO_METADATA_FILES = ("config.json", "quant_model_description.json", ECO_INDEX)
+# Which revision a checkpoint directory holds, written by `fetch_checkpoint` once its
+# shards and index agree. While a fetch is replacing shards the stamp reads
+# `<_STAMP_FETCHING> <revision>` instead, so an interrupted one stays marked.
+_REVISION_STAMP = ".checkpoint_revision"
+_STAMP_FETCHING = "fetching"
 
 _SAFETENSOR_DTYPES = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32}
 _CONTRACT_DTYPES = {BF16: torch.bfloat16, FP32: torch.float32, INT8: torch.int8}
@@ -221,44 +226,48 @@ def fetch_layer(
     names = [name for name in index if name.startswith(prefix) and wanted(name[len(prefix) :])]
     if not names:
         raise RuntimeError(f"layer {layer}: no {mixer} tensors in the index")
-    shards = {index[name] for name in names}
-    if len(shards) != 1:
-        raise RuntimeError(f"layer {layer}: expected one shard, found {sorted(shards)}")
-    shard = shards.pop()
+    # A shard boundary falls inside a layer every eight layers or so, which puts that
+    # layer's mixer and its two norms in two files. Offsets are shard-local, so the range
+    # plan below is per shard.
+    shards = sorted({index[name] for name in names})
 
-    header_len = struct.unpack("<Q", _get(base + shard, (0, 7)))[0]
-    header = json.loads(_get(base + shard, (8, 8 + header_len - 1)))
-    header.pop("__metadata__", None)
-    entries = {name[len(prefix) :]: info for name, info in header.items()
-               if name.startswith(prefix) and wanted(name[len(prefix) :])}
-    # One range request per contiguous run of tensors, not one spanning all of them. A
-    # module's tensors are adjacent in the shard and coalesce into a single read, but the
-    # two layer norms sit at opposite ends of the layer, and the span between them is the
-    # whole layer -- 731 MiB to fetch 20 KiB.
-    ordered = sorted(entries.items(), key=lambda kv: kv[1]["data_offsets"][0])
-    runs: list[list[int]] = []
-    for _, info in ordered:
-        start, end = info["data_offsets"]
-        if runs and start - runs[-1][1] <= _FETCH_GAP:
-            runs[-1][1] = max(runs[-1][1], end)
-        else:
-            runs.append([start, end])
-    fetched = sum(hi - lo for lo, hi in runs)
-    log(
-        f"[weights] layer {layer}: {len(entries)} tensors, {fetched / 2**20:.1f} MiB in "
-        f"{len(runs)} range request(s) from {shard} at revision {revision[:8]}"
-    )
-
-    data_start = 8 + header_len
-    blobs = [_get(base + shard, (data_start + lo, data_start + hi - 1)) for lo, hi in runs]
     out = {}
-    for name, info in entries.items():
-        start, end = info["data_offsets"]
-        run = next(i for i, (lo, hi) in enumerate(runs) if lo <= start and end <= hi)
-        raw = bytearray(blobs[run][start - runs[run][0] : end - runs[run][0]])
-        out[name] = (
-            torch.frombuffer(raw, dtype=_SAFETENSOR_DTYPES[info["dtype"]]).reshape(info["shape"]).clone()
+    for shard in shards:
+        header_len = struct.unpack("<Q", _get(base + shard, (0, 7)))[0]
+        header = json.loads(_get(base + shard, (8, 8 + header_len - 1)))
+        header.pop("__metadata__", None)
+        entries = {name[len(prefix) :]: info for name, info in header.items()
+                   if name.startswith(prefix) and wanted(name[len(prefix) :])}
+        # One range request per contiguous run of tensors, not one spanning all of them. A
+        # module's tensors are adjacent in the shard and coalesce into a single read, but the
+        # two layer norms sit at opposite ends of the layer, and the span between them is the
+        # whole layer -- 731 MiB to fetch 20 KiB.
+        ordered = sorted(entries.items(), key=lambda kv: kv[1]["data_offsets"][0])
+        runs: list[list[int]] = []
+        for _, info in ordered:
+            start, end = info["data_offsets"]
+            if runs and start - runs[-1][1] <= _FETCH_GAP:
+                runs[-1][1] = max(runs[-1][1], end)
+            else:
+                runs.append([start, end])
+        fetched = sum(hi - lo for lo, hi in runs)
+        log(
+            f"[weights] layer {layer}: {len(entries)} tensors, {fetched / 2**20:.1f} MiB in "
+            f"{len(runs)} range request(s) from {shard} at revision {revision[:8]}"
         )
+
+        data_start = 8 + header_len
+        blobs = [_get(base + shard, (data_start + lo, data_start + hi - 1)) for lo, hi in runs]
+        for name, info in entries.items():
+            start, end = info["data_offsets"]
+            run = next(i for i, (lo, hi) in enumerate(runs) if lo <= start and end <= hi)
+            raw = bytearray(blobs[run][start - runs[run][0] : end - runs[run][0]])
+            out[name] = (
+                torch.frombuffer(raw, dtype=_SAFETENSOR_DTYPES[info["dtype"]]).reshape(info["shape"]).clone()
+            )
+    missing = [name[len(prefix) :] for name in names if name[len(prefix) :] not in out]
+    if missing:
+        raise RuntimeError(f"layer {layer}: the index names tensors no shard header carries: {missing[:3]}")
     return out
 
 
@@ -418,6 +427,39 @@ def _text_shards(weight_map: dict[str, str], contract: Qwen38TextContract) -> di
     return shards
 
 
+def _write_revision_stamp(checkpoint_dir: Path, value: str) -> None:
+    tmp = checkpoint_dir / f"{_REVISION_STAMP}.tmp"
+    tmp.write_text(f"{value}\n")
+    os.replace(tmp, checkpoint_dir / _REVISION_STAMP)
+
+
+def _check_checkpoint_revision(checkpoint_dir: Path, revision: str) -> None:
+    """Refuse a directory an interrupted or differently-pinned fetch left behind.
+
+    ``_fetch_checkpoint`` replaces shards in place and publishes the index last, so a
+    fetch that dies in between leaves bytes from two revisions under an index that
+    still describes the old one. Names, shapes and dtypes survive a requant, so the
+    rest of the loader's checks pass and the mix would load silently. A directory with
+    no stamp was not written by ``fetch_checkpoint`` and is taken as the caller's own.
+    """
+    try:
+        stamp = (checkpoint_dir / _REVISION_STAMP).read_text().strip()
+    except FileNotFoundError:
+        return
+    if stamp == revision:
+        return
+    if stamp.startswith(_STAMP_FETCHING):
+        fetching = stamp.split()[-1]
+        detail = (f"a fetch of {fetching[:8]} that did not finish" if fetching == revision
+                  else f"an unfinished fetch of {fetching[:8]}, over the pinned {revision[:8]}")
+    else:
+        detail = f"revision {stamp[:8]}, not the pinned {revision[:8]}"
+    raise RuntimeError(
+        f"{checkpoint_dir} holds {detail}; its shards may mix revisions. Rerun "
+        f"`python models/qwen3_8_27b/weights.py --fetch-checkpoint` to complete it"
+    )
+
+
 def _check_local_shards(checkpoint_dir: Path, shards: dict[str, list[WeightSpec]]) -> None:
     absent_shards = sorted(name for name in shards if not (checkpoint_dir / name).is_file())
     if absent_shards:
@@ -429,6 +471,8 @@ def _check_local_shards(checkpoint_dir: Path, shards: dict[str, list[WeightSpec]
 def checkpoint_summary(
     checkpoint_dir: str | Path,
     contract: Qwen38TextContract = QWEN3_8_27B_TEXT_CONTRACT,
+    *,
+    revision: str = ECO_REVISION,
 ) -> dict[str, int]:
     """Validate the index, the required shards and their headers, reading no tensor data.
 
@@ -439,6 +483,7 @@ def checkpoint_summary(
     what is on disk.
     """
     checkpoint_dir = Path(checkpoint_dir)
+    _check_checkpoint_revision(checkpoint_dir, revision)
     shards = _text_shards(_load_checkpoint_index(checkpoint_dir), contract)
     _check_local_shards(checkpoint_dir, shards)
     summary = _verify_text_shard_headers(
@@ -549,6 +594,7 @@ def prepare_qwen38_weights(
     *,
     contract: Qwen38TextContract = QWEN3_8_27B_TEXT_CONTRACT,
     verify_zero_offsets: bool = True,
+    revision: str = ECO_REVISION,
 ) -> PreparedQwen38Weights:
     """Stream the complete text checkpoint into the runtime's tensor exporter.
 
@@ -564,6 +610,7 @@ def prepare_qwen38_weights(
         raise RuntimeError("prepare_qwen38_weights requires the safetensors package") from error
 
     checkpoint_dir = Path(checkpoint_dir)
+    _check_checkpoint_revision(checkpoint_dir, revision)
     shards = _text_shards(_load_checkpoint_index(checkpoint_dir), contract)
     _check_local_shards(checkpoint_dir, shards)
 
@@ -779,6 +826,11 @@ def _fetch_checkpoint(checkpoint_dir: Path, repo: str, revision: str, log: Calla
     if remaining > free:
         raise OSError(f"checkpoint needs {remaining / 2**30:.2f} GiB but only {free / 2**30:.2f} GiB is free")
 
+    # Shards are replaced in place, so from here until the index is published the
+    # directory can hold bytes from two revisions. The stamp says so; a fetch that
+    # dies in between leaves it saying so, and the loader refuses the directory.
+    _write_revision_stamp(checkpoint_dir, f"{_STAMP_FETCHING} {revision}")
+
     for position, name in enumerate(required, 1):
         info = manifest[name]
         destination = checkpoint_dir / name
@@ -800,6 +852,7 @@ def _fetch_checkpoint(checkpoint_dir: Path, repo: str, revision: str, log: Calla
         )
     if not cached_index:
         _write_verified_file(io.BytesIO(index_data), index_path, index_size, index_digest)
+    _write_revision_stamp(checkpoint_dir, revision)
 
 
 def _print_checkpoint_summary(checkpoint_dir: Path) -> None:
