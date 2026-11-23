@@ -449,6 +449,7 @@ def _pool_normalize(
     weight: pl.Tile[[512], pl.BF16, pl.Mem.Vec],
 ):
     rounded = pl.create_tile([512], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+    rms_inverse = pl.create_tile([64], dtype=pl.FP32, target_memory=pl.Mem.Vec)
     output = pl.create_tile([512], dtype=pl.BF16, target_memory=pl.Mem.Vec)
     rotated = pl.create_tile([512], dtype=pl.BF16, target_memory=pl.Mem.Vec)
     with pl.reg_scope():
@@ -469,11 +470,13 @@ def _pool_normalize(
             current_weight = pl.reg.div(b, denom, full)
             bv = pl.reg.mul(current_value, current_weight, full)
             pooled = pl.reg.add(av, bv, full)
-            bf = pl.reg.convert(pooled, dtype=pl.BF16, rounding="R", saturate=False)
-            value = pl.reg.convert(bf, dtype=pl.FP32)
-            _rounded_written = pl.reg.store(rounded, chunk * 64, value)
-        # Fold 512 columns to 256, then
-        # reduce each 64-lane block and the four block sums.
+            pooled_bf = pl.reg.convert(pooled, dtype=pl.BF16, rounding="R", saturate=False)
+            pooled_fp = pl.reg.convert(pooled_bf, dtype=pl.FP32)
+            _rounded_written = pl.reg.store(rounded, chunk * 64, pooled_fp)
+
+    with pl.reg_scope():
+        full = pl.reg.full_mask(lanes=64)
+        # Fold 512 columns to 256, then reduce the four 64-lane block sums.
         lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
         partials = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
         for chunk in pl.hardware_loop(4):
@@ -512,12 +515,17 @@ def _pool_normalize(
         is_infinite = pl.reg.compares(variance_bits, 2139095040, full, predicate="eq")
         zero = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
         inv = pl.reg.select(is_infinite, zero, inv)
+        _inverse_written = pl.reg.store(rms_inverse, 0, inv, full)
+
+    with pl.reg_scope():
+        norm_full = pl.reg.full_mask(lanes=64)
+        row_inverse = pl.reg.load(rms_inverse, 0, lanes=64)
         for chunk in pl.hardware_loop(8):
             value = pl.reg.load(rounded, chunk * 64, lanes=64)
             gamma_bf = pl.reg.load(weight, chunk * 64, lanes=64)
             gamma = pl.reg.convert(gamma_bf, dtype=pl.FP32)
-            scaled_value = pl.reg.mul(value, inv, full)
-            norm = pl.reg.mul(scaled_value, gamma, full)
+            scaled_value = pl.reg.mul(value, row_inverse, norm_full)
+            norm = pl.reg.mul(scaled_value, gamma, norm_full)
             bf = pl.reg.convert(norm, dtype=pl.BF16, rounding="R", saturate=False)
             _output_written = pl.reg.store(output, chunk * 64, bf)
             # Store the unrotated latent before rotating.

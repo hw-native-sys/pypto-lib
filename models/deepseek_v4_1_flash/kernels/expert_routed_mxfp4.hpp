@@ -21,14 +21,10 @@ namespace grouped_mxfp4 {
 
 using namespace pto;
 
-constexpr uint32_t M_TILE = 64;
 constexpr uint32_t N_TILE = 256;
 constexpr uint32_t K_TILE = 256;
 constexpr uint32_t SCALE_K_TILE = K_TILE / 32;
 constexpr uint32_t L0_K_TILE = 128;
-constexpr uint32_t A_STAGE_K = 1024;
-constexpr uint32_t SCALE_STAGE_K = 4096;
-constexpr uint32_t SCALE_STAGE_Q = SCALE_STAGE_K / 32;
 constexpr uint32_t L0_SCALE_K_TILE = L0_K_TILE / 32;
 constexpr uint32_t VEC_K_TILE = K_TILE / 2;
 constexpr uint32_t PACKED_COLS = N_TILE / 2;
@@ -36,16 +32,30 @@ constexpr uint32_t UB_SOURCE_BYTES = VEC_K_TILE * PACKED_COLS;
 constexpr uint32_t UB_NZ_BYTES = ((VEC_K_TILE + 15) / 16 * 16 + 1) * N_TILE;
 constexpr uint32_t PREFETCH_SLOTS = 4;
 constexpr uint32_t L0_PINGPONG_BYTES = 32 * 1024;
-constexpr uint32_t L1_BASE = 2 * M_TILE * A_STAGE_K + 2 * (M_TILE + N_TILE) * SCALE_STAGE_Q;
-constexpr uint32_t L1_SLOT_BYTES = K_TILE * N_TILE;
 constexpr uint32_t L1_SLOT_COUNT = 2;
 constexpr uint8_t VEC_CORE_ID_OFFSET = 16;
 
 static_assert(UB_SOURCE_BYTES + UB_NZ_BYTES <= 64 * 1024);
-static_assert(M_TILE * K_TILE <= L0_PINGPONG_BYTES);
 static_assert(L0_K_TILE * N_TILE <= L0_PINGPONG_BYTES);
 
-static_assert(L1_BASE + L1_SLOT_COUNT * L1_SLOT_BYTES <= 512 * 1024);
+template <uint32_t M>
+struct GemmTile {
+    // Larger B stages amortize producer/consumer synchronization for larger row tiles.
+    static constexpr uint32_t A_STAGE_K = M > 128 ? 256 : (M > 64 ? 512 : 1024);
+    static constexpr uint32_t B_STAGE_K = M > 64 ? 512 : 256;
+    static constexpr uint32_t SCALE_STAGE_K = M > 128 ? 2048 : 4096;
+    static constexpr uint32_t SCALE_STAGE_Q = SCALE_STAGE_K / 32;
+    static constexpr uint32_t L1_SLOT_BYTES = B_STAGE_K * N_TILE;
+    static constexpr uint32_t L1_BASE = 2 * M * A_STAGE_K + 2 * (M + N_TILE) * SCALE_STAGE_Q;
+    static_assert(M * L0_K_TILE <= L0_PINGPONG_BYTES);
+    static_assert(M * N_TILE * sizeof(float) <= 256 * 1024);
+    static_assert(L1_BASE + L1_SLOT_COUNT * L1_SLOT_BYTES <= 512 * 1024);
+};
+
+AICORE inline int64_t selectRowTile(int64_t count)
+{
+    return count <= 64 ? 64 : (count <= 128 ? 128 : 256);
+}
 
 #ifdef __DAV_CUBE__
 AICORE inline void releaseSlot(uint32_t slot)
@@ -80,14 +90,47 @@ struct Chunk {
 AICORE inline int64_t acquireCount(__gm__ int32_t* counts, int64_t expert)
 {
     auto* count = counts + expert;
-    dcci(count, SINGLE_CACHE_LINE);
+    if (expert == 0 || (reinterpret_cast<uint64_t>(count) & 63) == 0) {
+        dcci(count, SINGLE_CACHE_LINE);
+    }
     return *count;
 }
 
+// Estimate the longest wave for each row partition using actual expert counts.
+// Keep full-width weight conversion and split rows only for a clear occupancy gain.
+AICORE inline int64_t selectRowTileLimit(__gm__ int32_t* counts, int64_t experts,
+                                        int64_t columnTiles, int64_t blocks)
+{
+    int64_t wideTasks = 0;
+    int64_t narrowTasks = 0;
+    int64_t wideRows = 0;
+    int64_t narrowRows = 0;
+    for (int64_t expert = 0; expert < experts; ++expert) {
+        const int64_t count = acquireCount(counts, expert);
+        const int64_t wideShift = count <= 64 ? 6 : (count <= 128 ? 7 : 8);
+        const int64_t narrowShift = wideShift < 7 ? wideShift : 7;
+        const int64_t wide = int64_t{1} << wideShift;
+        const int64_t narrow = int64_t{1} << narrowShift;
+        wideTasks += ((count + wide - 1) >> wideShift) * columnTiles;
+        narrowTasks += ((count + narrow - 1) >> narrowShift) * columnTiles;
+        const int64_t wideValid = ((count < wide ? count : wide) + 15) / 16 * 16;
+        const int64_t narrowValid = ((count < narrow ? count : narrow) + 15) / 16 * 16;
+        wideRows = wideRows < wideValid ? wideValid : wideRows;
+        narrowRows = narrowRows < narrowValid ? narrowValid : narrowRows;
+    }
+    const int64_t wideWork = ((wideTasks + blocks - 1) / blocks) * wideRows;
+    const int64_t narrowWork = ((narrowTasks + blocks - 1) / blocks) * narrowRows;
+    return wideWork > 0 && narrowWork * 10 <= wideWork * 9 ? 128 : 256;
+}
+
 #ifdef __DAV_VEC__
+template <uint32_t M>
 AICORE inline void produceWeight(__gm__ uint8_t* weight, int64_t k, int64_t n,
                                 int64_t expert, int64_t n0, int64_t kBegin = 0, int64_t kEnd = 0)
 {
+    constexpr uint32_t B_STAGE_K = GemmTile<M>::B_STAGE_K;
+    constexpr uint32_t B_PARTS = B_STAGE_K / K_TILE;
+    constexpr uint32_t L1_SLOT_BYTES = GemmTile<M>::L1_SLOT_BYTES;
     constexpr uint32_t PACKED_ROW_BYTES = 256 / 2;
     constexpr uint32_t PACKED_TILE_BYTES = 256 * 256 / 2;
     static_assert(PREFETCH_SLOTS * UB_SOURCE_BYTES + 2 * UB_NZ_BYTES <= 192 * 1024);
@@ -98,8 +141,8 @@ AICORE inline void produceWeight(__gm__ uint8_t* weight, int64_t k, int64_t n,
     static_assert(NZ::StorageBytes == UB_NZ_BYTES);
     using GlobalPacked = GlobalTensor<uint8_t, Shape<1, 1, 1, VEC_K_TILE, PACKED_COLS>,
                                       pto::Stride<1, 1, 1, PACKED_ROW_BYTES, 1>>;
-    using MatSlot = Tile<TileType::Mat, float8_e4m3_t, K_TILE, N_TILE, BLayout::ColMajor,
-                         K_TILE, N_TILE, SLayout::RowMajor, 512>;
+    using MatSlot = Tile<TileType::Mat, float8_e4m3_t, B_STAGE_K, N_TILE, BLayout::ColMajor,
+                         B_STAGE_K, N_TILE, SLayout::RowMajor, 512>;
     MatSlot matSlot;
     Packed packed[PREFETCH_SLOTS];
     Raw raw[PREFETCH_SLOTS];
@@ -141,17 +184,35 @@ AICORE inline void produceWeight(__gm__ uint8_t* weight, int64_t k, int64_t n,
             set_flag(PIPE_MTE2, PIPE_V, inputEvent);
         }
         wait_flag(PIPE_V, PIPE_MTE3, event);
-        wait_intra_block(PIPE_MTE3, static_cast<uint8_t>(1 + 2 * slot));
-        TASSIGN(matSlot, L1_BASE + slot * L1_SLOT_BYTES);
-        TINSERT(matSlot, nz[slot], static_cast<uint16_t>(lane * VEC_K_TILE), static_cast<uint16_t>(0));
-        set_intra_block(PIPE_MTE3, static_cast<uint8_t>(2 * slot));
+        const uint32_t bSlot = (iteration / B_PARTS) % 2;
+        const uint32_t bPart = iteration % B_PARTS;
+        if (bPart == 0) {
+            wait_intra_block(PIPE_MTE3, static_cast<uint8_t>(1 + 2 * bSlot));
+        }
+        TASSIGN(matSlot, GemmTile<M>::L1_BASE + bSlot * L1_SLOT_BYTES);
+        TINSERT(matSlot, nz[slot], static_cast<uint16_t>(bPart * K_TILE + lane * VEC_K_TILE), 0);
+        if (bPart + 1 == B_PARTS || iteration + 1 == iterations) {
+            set_intra_block(PIPE_MTE3, static_cast<uint8_t>(2 * bSlot));
+        }
         set_flag(PIPE_MTE3, PIPE_V, event);
+    }
+}
+
+AICORE inline void dispatchWeight(int64_t rowTile, __gm__ uint8_t* weight, int64_t k, int64_t n,
+                                 int64_t expert, int64_t n0)
+{
+    if (rowTile == 64) {
+        produceWeight<64>(weight, k, n, expert, n0);
+    } else if (rowTile == 128) {
+        produceWeight<128>(weight, k, n, expert, n0);
+    } else {
+        produceWeight<256>(weight, k, n, expert, n0);
     }
 }
 #endif
 
 #ifdef __DAV_CUBE__
-template <typename AStage, typename GlobalA>
+template <uint32_t A_STAGE_K, typename AStage, typename GlobalA>
 AICORE inline void loadAStage(AStage& target, __gm__ float8_e4m3_t* x,
                              int64_t k, int64_t rows, Chunk chunk, int64_t start, uint32_t slot, int64_t limit)
 {
@@ -166,13 +227,14 @@ AICORE inline void loadAStage(AStage& target, __gm__ float8_e4m3_t* x,
     set_flag(PIPE_MTE2, PIPE_MTE1, event);
 }
 
-template <typename AScale, typename BScale, typename GlobalAScale, typename GlobalBScale>
+template <uint32_t M, typename AScale, typename BScale, typename GlobalAScale, typename GlobalBScale>
 AICORE inline void loadScaleStage(AScale& aScale, BScale& bScale,
                                  __gm__ float8_e8m0_t* xScale, __gm__ float8_e8m0_t* weightScale,
                                  int64_t k, int64_t n, int64_t experts, int64_t rows,
                                  Chunk chunk, int64_t n0, int64_t start, uint32_t slot, int64_t limit)
 {
     const auto event = static_cast<event_t>(4 + slot);
+    constexpr uint32_t SCALE_STAGE_K = GemmTile<M>::SCALE_STAGE_K;
     const int64_t q = k / 32;
     const int64_t globalQ = experts * q;
     const int64_t validQ = (limit - start < SCALE_STAGE_K ? limit - start : SCALE_STAGE_K) / 32;
@@ -210,11 +272,17 @@ AICORE inline void computeProjection(__gm__ float8_e4m3_t* x, __gm__ float8_e8m0
                                      int64_t kBegin = 0, int64_t kEnd = 0)
 {
     const int64_t limit = kEnd == 0 ? k : kEnd;
+    constexpr uint32_t A_STAGE_K = GemmTile<M>::A_STAGE_K;
+    constexpr uint32_t B_STAGE_K = GemmTile<M>::B_STAGE_K;
+    constexpr uint32_t SCALE_STAGE_K = GemmTile<M>::SCALE_STAGE_K;
+    constexpr uint32_t SCALE_STAGE_Q = GemmTile<M>::SCALE_STAGE_Q;
+    constexpr uint32_t L1_SLOT_BYTES = GemmTile<M>::L1_SLOT_BYTES;
+    constexpr uint32_t L1_BASE = GemmTile<M>::L1_BASE;
     constexpr int VALID_M = DYNAMIC;
     using MatA = Tile<TileType::Mat, float8_e4m3_t, M, A_STAGE_K, BLayout::ColMajor,
                       VALID_M, DYNAMIC, SLayout::RowMajor, 512>;
-    using MatB = Tile<TileType::Mat, float8_e4m3_t, K_TILE, N_TILE, BLayout::ColMajor,
-                      K_TILE, N_TILE, SLayout::RowMajor, 512>;
+    using MatB = Tile<TileType::Mat, float8_e4m3_t, B_STAGE_K, N_TILE, BLayout::ColMajor,
+                      B_STAGE_K, N_TILE, SLayout::RowMajor, 512>;
     using MatAScale = Tile<TileType::Mat, float8_e8m0_t, M, SCALE_STAGE_Q, BLayout::RowMajor,
                            DYNAMIC, DYNAMIC, SLayout::RowMajor, 32>;
     using MatBScale = Tile<TileType::Mat, float8_e8m0_t, SCALE_STAGE_Q, N_TILE, BLayout::ColMajor,
@@ -254,20 +322,21 @@ AICORE inline void computeProjection(__gm__ float8_e4m3_t* x, __gm__ float8_e8m0
         aScale[1].SetValidRow(chunk.validRows);
     }
     for (uint32_t slot = 0; slot < 2; ++slot) {
-        TASSIGN(aMat[slot], slot * M_TILE * A_STAGE_K);
-        TASSIGN(aScaleMat[slot], 2 * M_TILE * A_STAGE_K + slot * M_TILE * SCALE_STAGE_Q);
-        TASSIGN(bScaleMat[slot], 2 * M_TILE * (A_STAGE_K + SCALE_STAGE_Q) + slot * N_TILE * SCALE_STAGE_Q);
+        TASSIGN(aMat[slot], slot * M * A_STAGE_K);
+        TASSIGN(aScaleMat[slot], 2 * M * A_STAGE_K + slot * M * SCALE_STAGE_Q);
+        TASSIGN(bScaleMat[slot], 2 * M * (A_STAGE_K + SCALE_STAGE_Q) + slot * N_TILE * SCALE_STAGE_Q);
         TASSIGN(a[slot], slot * L0_PINGPONG_BYTES);
         TASSIGN(b[slot], slot * L0_PINGPONG_BYTES);
         TASSIGN(aScale[slot], GetScaleAddr(a[slot].data()));
         TASSIGN(bScale[slot], GetScaleAddr(b[slot].data()));
     }
     TASSIGN(acc, 0);
-    loadAStage<MatA, GlobalA>(aMat[0], x, k, rows, chunk, kBegin, 0, limit);
-    loadScaleStage<MatAScale, MatBScale, GlobalAScale, GlobalBScale>(
+    loadAStage<A_STAGE_K, MatA, GlobalA>(aMat[0], x, k, rows, chunk, kBegin, 0, limit);
+    loadScaleStage<M, MatAScale, MatBScale, GlobalAScale, GlobalBScale>(
         aScaleMat[0], bScaleMat[0], xScale, weightScale, k, n, experts, rows, chunk, n0, kBegin, 0, limit);
     for (int64_t k0 = kBegin; k0 < limit; k0 += K_TILE) {
-        const uint32_t slot = ((k0 - kBegin) / K_TILE) % 2;
+        const uint32_t slot = ((k0 - kBegin) / B_STAGE_K) % 2;
+        const uint16_t bOffset = (k0 - kBegin) % B_STAGE_K;
         const uint32_t aSlot = ((k0 - kBegin) / A_STAGE_K) % 2;
         const uint32_t scaleSlot = ((k0 - kBegin) / SCALE_STAGE_K) % 2;
         const uint16_t aOffset = (k0 - kBegin) % A_STAGE_K;
@@ -278,7 +347,9 @@ AICORE inline void computeProjection(__gm__ float8_e4m3_t* x, __gm__ float8_e8m0
         if (scaleOffset == 0) {
             wait_flag(PIPE_MTE2, PIPE_MTE1, static_cast<event_t>(4 + scaleSlot));
         }
-        waitSlot(slot);
+        if (bOffset == 0) {
+            waitSlot(slot);
+        }
         TASSIGN(bMat, L1_BASE + slot * L1_SLOT_BYTES);
         for (uint32_t half = 0; half < 2; ++half) {
             const auto event = static_cast<event_t>(half);
@@ -286,11 +357,13 @@ AICORE inline void computeProjection(__gm__ float8_e4m3_t* x, __gm__ float8_e8m0
             const uint16_t qOffset = half * L0_SCALE_K_TILE;
             wait_flag(PIPE_M, PIPE_MTE1, event);
             TEXTRACT(a[half], aMat[aSlot], 0, static_cast<uint16_t>(aOffset + offset));
-            TEXTRACT(b[half], bMat, offset, 0);
+            TEXTRACT(b[half], bMat, static_cast<uint16_t>(bOffset + offset), 0);
             TEXTRACT(aScale[half], aScaleMat[scaleSlot], 0, static_cast<uint16_t>(scaleOffset + qOffset));
             TEXTRACT(bScale[half], bScaleMat[scaleSlot], static_cast<uint16_t>(scaleOffset + qOffset), 0);
             if (half == 1) {
-                releaseSlot(slot);
+                if (bOffset + K_TILE == B_STAGE_K || k0 + K_TILE == limit) {
+                    releaseSlot(slot);
+                }
                 if (aOffset + K_TILE == A_STAGE_K || k0 + K_TILE == limit) {
                     set_flag(PIPE_MTE1, PIPE_MTE2, static_cast<event_t>(2 + aSlot));
                 }
@@ -310,15 +383,30 @@ AICORE inline void computeProjection(__gm__ float8_e4m3_t* x, __gm__ float8_e8m0
             set_flag(PIPE_M, PIPE_MTE1, event);
         }
         if (aOffset == 0 && k0 + A_STAGE_K < limit) {
-            loadAStage<MatA, GlobalA>(aMat[1-aSlot], x, k, rows, chunk, k0 + A_STAGE_K, 1-aSlot, limit);
+            loadAStage<A_STAGE_K, MatA, GlobalA>(aMat[1-aSlot], x, k, rows, chunk, k0 + A_STAGE_K, 1-aSlot, limit);
         }
         if (scaleOffset == 0 && k0 + SCALE_STAGE_K < limit) {
-            loadScaleStage<MatAScale, MatBScale, GlobalAScale, GlobalBScale>(
+            loadScaleStage<M, MatAScale, MatBScale, GlobalAScale, GlobalBScale>(
                 aScaleMat[1-scaleSlot], bScaleMat[1-scaleSlot], xScale, weightScale,
                 k, n, experts, rows, chunk, n0, k0 + SCALE_STAGE_K, 1-scaleSlot, limit);
         }
     }
     sink(acc);
+}
+
+template <typename OutputSink>
+AICORE inline void dispatchProjection(int64_t rowTile, __gm__ float8_e4m3_t* x,
+                                      __gm__ float8_e8m0_t* xScale, __gm__ float8_e8m0_t* weightScale,
+                                      int64_t k, int64_t n, int64_t experts, int64_t rows,
+                                      Chunk chunk, int64_t n0, OutputSink sink)
+{
+    if (rowTile == 64) {
+        computeProjection<64>(x, xScale, weightScale, k, n, experts, rows, chunk, n0, sink);
+    } else if (rowTile == 128) {
+        computeProjection<128>(x, xScale, weightScale, k, n, experts, rows, chunk, n0, sink);
+    } else {
+        computeProjection<256>(x, xScale, weightScale, k, n, experts, rows, chunk, n0, sink);
+    }
 }
 
 #endif
