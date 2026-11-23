@@ -784,45 +784,6 @@ def prefill_indexer_query(
     return cmp_topk_indices
 
 
-def topk_prefix_contract_error(topk_indices, position_ids, num_tokens=None):
-    """Return an error string if the top-k prefix contract is broken."""
-    import torch
-
-    physical_tokens = int(topk_indices.shape[0])
-    if num_tokens is None:
-        num_tokens = physical_tokens
-    elif hasattr(num_tokens, "item"):
-        num_tokens = num_tokens.item()
-    num_tokens = int(num_tokens)
-    for t in range(physical_tokens):
-        row = topk_indices[t]
-        if t >= num_tokens:
-            non_padding = int((row != -1).count_nonzero().item())
-            if non_padding:
-                return f"inactive top-k row {t} contains {non_padding} non--1 entries"
-            continue
-        visible_candidates = min(
-            int((int(position_ids[t].item()) + 1) // COMPRESS_RATIO),
-            INDEXER_MAX_CANDIDATES,
-        )
-        selected = min(IDX_TOPK, visible_candidates)
-        prefix = row[:selected]
-        if selected:
-            out_of_range = int(((prefix < 0) | (prefix >= visible_candidates)).count_nonzero().item())
-            if out_of_range:
-                return (
-                    f"top-k row {t} has {out_of_range} entries outside "
-                    f"[0, {visible_candidates}) in its selected prefix"
-                )
-            unique_count = int(torch.unique(prefix).numel())
-            if unique_count != selected:
-                return f"top-k row {t} selected prefix has {unique_count}/{selected} unique entries"
-        tail_non_padding = int((row[selected:] != -1).count_nonzero().item())
-        if tail_non_padding:
-            return f"top-k row {t} tail contains {tail_non_padding} non--1 entries"
-    return None
-
-
 @pl.jit
 def prefill_indexer_test(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -908,6 +869,45 @@ def prefill_indexer_test(
         inner_state_slot_mapping,
     )
     return idx_kv_cache, idx_kv_scale, topk_idxs
+
+
+def topk_prefix_contract_error(topk_indices, position_ids, num_tokens=None):
+    """Return an error string if the top-k prefix contract is broken."""
+    import torch
+
+    physical_tokens = int(topk_indices.shape[0])
+    if num_tokens is None:
+        num_tokens = physical_tokens
+    elif hasattr(num_tokens, "item"):
+        num_tokens = num_tokens.item()
+    num_tokens = int(num_tokens)
+    for t in range(physical_tokens):
+        row = topk_indices[t]
+        if t >= num_tokens:
+            non_padding = int((row != -1).count_nonzero().item())
+            if non_padding:
+                return f"inactive top-k row {t} contains {non_padding} non--1 entries"
+            continue
+        visible_candidates = min(
+            int((int(position_ids[t].item()) + 1) // COMPRESS_RATIO),
+            INDEXER_MAX_CANDIDATES,
+        )
+        selected = min(IDX_TOPK, visible_candidates)
+        prefix = row[:selected]
+        if selected:
+            out_of_range = int(((prefix < 0) | (prefix >= visible_candidates)).count_nonzero().item())
+            if out_of_range:
+                return (
+                    f"top-k row {t} has {out_of_range} entries outside "
+                    f"[0, {visible_candidates}) in its selected prefix"
+                )
+            unique_count = int(torch.unique(prefix).numel())
+            if unique_count != selected:
+                return f"top-k row {t} selected prefix has {unique_count}/{selected} unique entries"
+        tail_non_padding = int((row[selected:] != -1).count_nonzero().item())
+        if tail_non_padding:
+            return f"top-k row {t} tail contains {tail_non_padding} non--1 entries"
+    return None
 
 
 def golden_prefill_indexer_core(tensors):

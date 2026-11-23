@@ -528,25 +528,6 @@ def sample_test(
     return sample(logits, temperatures, top_ks, seeds, positions, sampled_ids)
 
 
-def _gumbel_noise(seed, position):
-    import numpy as np
-
-    counters = np.arange(VOCAB, dtype=np.uint32)
-    random_key = np.uint32((seed + position * POSITION_MULTIPLIER) % RANDOM_KEY_MODULUS)
-    random_bits = counters ^ random_key
-    random_bits ^= random_bits >> np.uint32(16)
-    random_bits *= np.uint32(HASH_MULTIPLIER)
-    random_bits &= np.uint32(0x7FFFFFFF)
-    random_bits ^= random_bits >> np.uint32(16)
-    random_bits *= np.uint32(HASH_MULTIPLIER)
-    random_bits &= np.uint32(0x7FFFFFFF)
-    random_bits ^= random_bits >> np.uint32(16)
-    uniform_bits = (random_bits >> np.uint32(8)).astype(np.float32)
-    uniform_centered = uniform_bits + np.float32(0.5)
-    uniform = uniform_centered * np.float32(UINT23_SCALE)
-    return -np.log(-np.log(uniform))
-
-
 # ci: devices=2
 
 
@@ -1103,6 +1084,25 @@ def l3_lm_head(
             hidden_window, hidden_done, logits_window, logits_done,
             r // TP_SIZE * TP_SIZE, r % TP_SIZE, DONE_VALUE, device=r,
         )
+
+
+def _gumbel_noise(seed, position):
+    import numpy as np
+
+    counters = np.arange(VOCAB, dtype=np.uint32)
+    random_key = np.uint32((seed + position * POSITION_MULTIPLIER) % RANDOM_KEY_MODULUS)
+    random_bits = counters ^ random_key
+    random_bits ^= random_bits >> np.uint32(16)
+    random_bits *= np.uint32(HASH_MULTIPLIER)
+    random_bits &= np.uint32(0x7FFFFFFF)
+    random_bits ^= random_bits >> np.uint32(16)
+    random_bits *= np.uint32(HASH_MULTIPLIER)
+    random_bits &= np.uint32(0x7FFFFFFF)
+    random_bits ^= random_bits >> np.uint32(16)
+    uniform_bits = (random_bits >> np.uint32(8)).astype(np.float32)
+    uniform_centered = uniform_bits + np.float32(0.5)
+    uniform = uniform_centered * np.float32(UINT23_SCALE)
+    return -np.log(-np.log(uniform))
 
 
 def build_tensor_specs_sampling(temperature=None, top_k=None):

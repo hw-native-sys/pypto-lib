@@ -155,129 +155,6 @@ def projection_release(
     return released
 
 
-def projection_groups(topology, replicas):
-    """Partition measured rank links into equal groups with minimum cross-group broadcast cost.
-
-    Each topology row supplies rank, board, chip, and a complete peer_cost mapping.
-    Rank identifiers are communication ranks, independent of device and page identifiers.
-    """
-    import itertools
-
-    if replicas not in (1, 2, 4, 8):
-        raise ValueError("Projection replicas must be 1, 2, 4, or 8")
-    records = {int(row["rank"]): row for row in topology}
-    if set(records) != set(range(PROJECTION_RANKS)):
-        raise ValueError("A measured topology record for each communication rank is required")
-    for row in records.values():
-        if "board" not in row or "chip" not in row or set(map(int, row["peer_cost"])) != set(records):
-            raise ValueError("Complete board/chip identity and peer costs are required")
-    size = PROJECTION_RANKS // replicas
-
-    def cost(group):
-        return sum(float(records[a]["peer_cost"].get(b, records[a]["peer_cost"].get(str(b)))) for a in group for b in group if a != b)
-
-    def partitions(remaining):
-        if not remaining:
-            yield ()
-        else:
-            first, *rest = remaining
-            for tail in itertools.combinations(rest, size - 1):
-                group = (first, *tail)
-                rest_set = set(group)
-                for others in partitions(tuple(r for r in remaining if r not in rest_set)):
-                    yield (group, *others)
-
-    groups = min(partitions(tuple(sorted(records))), key=lambda p: (sum(map(cost, p)), p))
-    return [list(next(g for g in groups if r in g)) + [-1] * (PROJECTION_RANKS - size) for r in range(PROJECTION_RANKS)]
-
-
-def select_projection_degree(measurements, *, attention, chunk_size):
-    """Select a qualified paired wall-time winner for one attention and chunk size."""
-    import math
-
-    identity = ("metric", "baseline_id", "topology_id", "input_id", "rounds", "warmup")
-    rows = [r for r in measurements if r.get("attention") == attention and r.get("chunk_size") == chunk_size]
-    rows = [r for r in rows if r.get("qualified") is True and all(key in r for key in identity)]
-    rows = [r for r in rows if r["metric"] in ("public_submit_to_result_median_us", "fastest_rank_device_median_us")]
-    rows = [r for r in rows if math.isfinite(float(r.get("wall_median_us", math.nan))) and r["wall_median_us"] > 0]
-    baselines = [r for r in rows if r.get("d") == 8]
-    winners = []
-    for baseline in baselines:
-        for candidate in rows:
-            paired = all(candidate[key] == baseline[key] for key in identity)
-            verified = candidate.get("mechanism_verified") is True
-            if candidate.get("d") in (1, 2, 4) and paired and verified:
-                if candidate["wall_median_us"] < baseline["wall_median_us"]:
-                    winners.append(candidate)
-    return int(min(winners, key=lambda row: row["wall_median_us"])["d"]) if winners else 8
-
-
-def projection_degree(attention):
-    """Read the offline-selected degree for one attention family; retain eight replicas by default."""
-    import sys
-
-    flag = "--prefill-projection-" + attention + "-d"
-    result = 8
-    for index, value in enumerate(sys.argv):
-        if value == flag and index + 1 < len(sys.argv):
-            result = int(sys.argv[index + 1])
-        elif value.startswith(flag + "="):
-            result = int(value.split("=", 1)[1])
-    if result not in (1, 2, 4, 8):
-        raise ValueError("Projection replicas must be 1, 2, 4, or 8")
-    return result
-
-
-def projection_tensor_specs(tp_size):
-    """Build fixture peer metadata from an explicitly supplied measured topology."""
-    import json
-    import sys
-    from pathlib import Path
-
-    import torch
-    from golden import TensorSpec
-
-    topology_path = None
-    for index, value in enumerate(sys.argv):
-        if value == "--prefill-projection-topology" and index + 1 < len(sys.argv):
-            topology_path = Path(sys.argv[index + 1])
-        elif value.startswith("--prefill-projection-topology="):
-            topology_path = Path(value.partition("=")[2])
-    degrees = [projection_degree(family) for family in ("swa", "csa", "hca")]
-    if any(degree < 8 for degree in degrees) and (tp_size != 8 or topology_path is None):
-        raise ValueError("Shared projection fixtures require TP8 and an explicit measured topology")
-    peers = torch.full((tp_size, 3, PROJECTION_RANKS), -1, dtype=torch.int32)
-    for family, degree in enumerate(degrees):
-        if degree == 8:
-            peers[:, family, 0] = torch.arange(tp_size, dtype=torch.int32)
-        else:
-            topology = json.loads(topology_path.read_text())
-            peers[:, family] = torch.tensor(projection_groups(topology, degree), dtype=torch.int32)
-    epochs = torch.zeros((tp_size, PROJECTION_KINDS), dtype=torch.int32)
-    return [
-        TensorSpec("projection_peers", list(peers.shape), torch.int32, init_value=peers),
-        TensorSpec("projection_epoch_bases", list(epochs.shape), torch.int32, init_value=epochs),
-    ]
-
-
-def projection_epoch_advance(bases, request_lengths, *, layers=43):
-    """Advance exact tile counts from physical packed request lengths without a device result."""
-    if type(layers) is not int or not 1 <= layers <= 43:
-        raise ValueError("Projection epoch accounting supports one through 43 model layers")
-    if len(bases) != PROJECTION_KINDS or any(type(base) is not int or base < 0 for base in bases):
-        raise ValueError("Six nonnegative integer epoch bases are required")
-    if any(type(length) is not int or length < 0 for length in request_lengths):
-        raise ValueError("Six nonnegative epoch bases and nonnegative request lengths are required")
-    raw_tiles = (sum(request_lengths) + PROJECTION_TILE - 1) // PROJECTION_TILE
-    state_tiles = sum((length + PROJECTION_TILE - 1) // PROJECTION_TILE for length in request_lengths)
-    counts = [min(layers, 2), sum(i >= 2 and i % 2 == 0 for i in range(layers)), sum(i >= 3 and i % 2 == 1 for i in range(layers))]
-    increments = [raw_tiles * n for n in counts] + [state_tiles * counts[1], state_tiles * counts[2], state_tiles * counts[1]]
-    result = [int(base) + count for base, count in zip(bases, increments)]
-    if any(base < 0 for base in result) or sum(result) >= 2**31 - 1:
-        raise ValueError("Projection epochs require a new communication domain before INT32 overflow")
-    return result
-
-
 # model config
 D = M.hidden_size
 H = M.num_attention_heads
@@ -480,3 +357,126 @@ def retire_o_proj_weight_signals(
                         offsets=[source_tp, 0], value=reset_value, op=pld.NotifyOp.AtomicAdd,
                     )
     return retire_tid
+
+
+def projection_groups(topology, replicas):
+    """Partition measured rank links into equal groups with minimum cross-group broadcast cost.
+
+    Each topology row supplies rank, board, chip, and a complete peer_cost mapping.
+    Rank identifiers are communication ranks, independent of device and page identifiers.
+    """
+    import itertools
+
+    if replicas not in (1, 2, 4, 8):
+        raise ValueError("Projection replicas must be 1, 2, 4, or 8")
+    records = {int(row["rank"]): row for row in topology}
+    if set(records) != set(range(PROJECTION_RANKS)):
+        raise ValueError("A measured topology record for each communication rank is required")
+    for row in records.values():
+        if "board" not in row or "chip" not in row or set(map(int, row["peer_cost"])) != set(records):
+            raise ValueError("Complete board/chip identity and peer costs are required")
+    size = PROJECTION_RANKS // replicas
+
+    def cost(group):
+        return sum(float(records[a]["peer_cost"].get(b, records[a]["peer_cost"].get(str(b)))) for a in group for b in group if a != b)
+
+    def partitions(remaining):
+        if not remaining:
+            yield ()
+        else:
+            first, *rest = remaining
+            for tail in itertools.combinations(rest, size - 1):
+                group = (first, *tail)
+                rest_set = set(group)
+                for others in partitions(tuple(r for r in remaining if r not in rest_set)):
+                    yield (group, *others)
+
+    groups = min(partitions(tuple(sorted(records))), key=lambda p: (sum(map(cost, p)), p))
+    return [list(next(g for g in groups if r in g)) + [-1] * (PROJECTION_RANKS - size) for r in range(PROJECTION_RANKS)]
+
+
+def select_projection_degree(measurements, *, attention, chunk_size):
+    """Select a qualified paired wall-time winner for one attention and chunk size."""
+    import math
+
+    identity = ("metric", "baseline_id", "topology_id", "input_id", "rounds", "warmup")
+    rows = [r for r in measurements if r.get("attention") == attention and r.get("chunk_size") == chunk_size]
+    rows = [r for r in rows if r.get("qualified") is True and all(key in r for key in identity)]
+    rows = [r for r in rows if r["metric"] in ("public_submit_to_result_median_us", "fastest_rank_device_median_us")]
+    rows = [r for r in rows if math.isfinite(float(r.get("wall_median_us", math.nan))) and r["wall_median_us"] > 0]
+    baselines = [r for r in rows if r.get("d") == 8]
+    winners = []
+    for baseline in baselines:
+        for candidate in rows:
+            paired = all(candidate[key] == baseline[key] for key in identity)
+            verified = candidate.get("mechanism_verified") is True
+            if candidate.get("d") in (1, 2, 4) and paired and verified:
+                if candidate["wall_median_us"] < baseline["wall_median_us"]:
+                    winners.append(candidate)
+    return int(min(winners, key=lambda row: row["wall_median_us"])["d"]) if winners else 8
+
+
+def projection_degree(attention):
+    """Read the offline-selected degree for one attention family; retain eight replicas by default."""
+    import sys
+
+    flag = "--prefill-projection-" + attention + "-d"
+    result = 8
+    for index, value in enumerate(sys.argv):
+        if value == flag and index + 1 < len(sys.argv):
+            result = int(sys.argv[index + 1])
+        elif value.startswith(flag + "="):
+            result = int(value.split("=", 1)[1])
+    if result not in (1, 2, 4, 8):
+        raise ValueError("Projection replicas must be 1, 2, 4, or 8")
+    return result
+
+
+def projection_tensor_specs(tp_size):
+    """Build fixture peer metadata from an explicitly supplied measured topology."""
+    import json
+    import sys
+    from pathlib import Path
+
+    import torch
+    from golden import TensorSpec
+
+    topology_path = None
+    for index, value in enumerate(sys.argv):
+        if value == "--prefill-projection-topology" and index + 1 < len(sys.argv):
+            topology_path = Path(sys.argv[index + 1])
+        elif value.startswith("--prefill-projection-topology="):
+            topology_path = Path(value.partition("=")[2])
+    degrees = [projection_degree(family) for family in ("swa", "csa", "hca")]
+    if any(degree < 8 for degree in degrees) and (tp_size != 8 or topology_path is None):
+        raise ValueError("Shared projection fixtures require TP8 and an explicit measured topology")
+    peers = torch.full((tp_size, 3, PROJECTION_RANKS), -1, dtype=torch.int32)
+    for family, degree in enumerate(degrees):
+        if degree == 8:
+            peers[:, family, 0] = torch.arange(tp_size, dtype=torch.int32)
+        else:
+            topology = json.loads(topology_path.read_text())
+            peers[:, family] = torch.tensor(projection_groups(topology, degree), dtype=torch.int32)
+    epochs = torch.zeros((tp_size, PROJECTION_KINDS), dtype=torch.int32)
+    return [
+        TensorSpec("projection_peers", list(peers.shape), torch.int32, init_value=peers),
+        TensorSpec("projection_epoch_bases", list(epochs.shape), torch.int32, init_value=epochs),
+    ]
+
+
+def projection_epoch_advance(bases, request_lengths, *, layers=43):
+    """Advance exact tile counts from physical packed request lengths without a device result."""
+    if type(layers) is not int or not 1 <= layers <= 43:
+        raise ValueError("Projection epoch accounting supports one through 43 model layers")
+    if len(bases) != PROJECTION_KINDS or any(type(base) is not int or base < 0 for base in bases):
+        raise ValueError("Six nonnegative integer epoch bases are required")
+    if any(type(length) is not int or length < 0 for length in request_lengths):
+        raise ValueError("Six nonnegative epoch bases and nonnegative request lengths are required")
+    raw_tiles = (sum(request_lengths) + PROJECTION_TILE - 1) // PROJECTION_TILE
+    state_tiles = sum((length + PROJECTION_TILE - 1) // PROJECTION_TILE for length in request_lengths)
+    counts = [min(layers, 2), sum(i >= 2 and i % 2 == 0 for i in range(layers)), sum(i >= 3 and i % 2 == 1 for i in range(layers))]
+    increments = [raw_tiles * n for n in counts] + [state_tiles * counts[1], state_tiles * counts[2], state_tiles * counts[1]]
+    result = [int(base) + count for base, count in zip(bases, increments)]
+    if any(base < 0 for base in result) or sum(result) >= 2**31 - 1:
+        raise ValueError("Projection epochs require a new communication domain before INT32 overflow")
+    return result

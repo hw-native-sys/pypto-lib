@@ -334,18 +334,6 @@ prefill_attention_hca = pl.jit.inline(_prefill_attention_hca)
 prefill_attention_hca_test = pl.jit(_prefill_attention_hca)
 
 
-def _quant_w_per_output_channel(w):
-    import torch
-
-    amax = w.float().abs().amax(dim=0).clamp_min(INT8_AMAX_EPS)
-    scale_quant = INT8_SCALE_MAX / amax
-    scaled = w.float() * scale_quant.view(1, -1)
-    w_i32 = torch.round(scaled).to(torch.int32)
-    w_i32 = torch.clamp(w_i32, -int(INT8_SCALE_MAX), int(INT8_SCALE_MAX))
-    w_i8 = w_i32.to(torch.float16).to(torch.int8)
-    return w_i8, (1.0 / scale_quant).float()
-
-
 VALIDATION_TOKENS = 512
 
 
@@ -930,6 +918,18 @@ def l3_prefill_attention_hca_cp(
             projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers[rank], projection_epoch_bases[rank],
             device=rank,
         )
+
+
+def _quant_w_per_output_channel(w):
+    import torch
+
+    amax = w.float().abs().amax(dim=0).clamp_min(INT8_AMAX_EPS)
+    scale_quant = INT8_SCALE_MAX / amax
+    scaled = w.float() * scale_quant.view(1, -1)
+    w_i32 = torch.round(scaled).to(torch.int32)
+    w_i32 = torch.clamp(w_i32, -int(INT8_SCALE_MAX), int(INT8_SCALE_MAX))
+    w_i8 = w_i32.to(torch.float16).to(torch.int8)
+    return w_i8, (1.0 / scale_quant).float()
 
 
 def golden_prefill_attention_hca(tensors):
