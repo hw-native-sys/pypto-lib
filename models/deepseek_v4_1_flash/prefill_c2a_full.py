@@ -30,7 +30,7 @@ from hc import (
 from o_proj import o_proj_hc_post, retire_prefill_signals
 from prefill_cp_allgather import prefill_cp_input_allgather
 from prefill_indexer import (
-    golden_prefill_indexer, golden_index_key, compare_compressed_topk, prefill_indexer,
+    golden_prefill_indexer, golden_index_key, compare_compressed_topk, prefill_indexer, prepare_c2a_score_keys,
     publish_c2a_index_key,
 )
 from qkv_proj_rope import qkv_quant, q_proj_rope, kv_proj, window_publish
@@ -171,9 +171,12 @@ def prefill_c2a_full(
             compressed_rope_cos, compressed_rope_sin, compressed_write_slots, compressed_cache,
             partition="token",
         )
-        publish_c2a_index_key(
+        published = publish_c2a_index_key(
             compressed_latent, w_index_k, w_index_norm, compressed_rope_cos, compressed_rope_sin,
             compressed_write_slots, index_cache, index_cache_scale, kv_token_count, compressed_published, no_dependency,
+        )
+        score_keys, keys_ready = prepare_c2a_score_keys(
+            index_cache, index_block_table, q_compressed_lens, kv_token_count, published,
         )
         for start in pl.range(0, kv_token_count, Q_TILE):
             active = pl.min(Q_TILE, kv_token_count - start)
@@ -205,9 +208,9 @@ def prefill_c2a_full(
             _index_ready = prefill_indexer(
                 qb_payload, qb_scales,
                 chunk_hidden, q_latent, chunk_request_ids, chunk_compressed_lens,
-                index_cache, index_cache_scale, index_block_table,
+                score_keys, index_cache_scale, index_block_table,
                 chunk_rope_cos, chunk_rope_sin, w_index_q, w_index_q_scale, w_index_score,
-                chunk_topk_indices, chunk_compressed_lens, chunk_topk_indices, active, no_dependency,
+                chunk_topk_indices, chunk_compressed_lens, chunk_topk_indices, active, keys_ready,
                 pool=False, c2a=True,
             )
             gather_sparse_attention(
@@ -588,6 +591,9 @@ def prefill_c2a_full_cp(
         q_latent = pl.create_tensor([Q_TILE, Q_LORA], dtype=pl.BF16)
         q = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
 
+        score_keys, keys_ready = prepare_c2a_score_keys(
+            index_cache, index_block_table, q_compressed_lens, q_token_count, compressed_ready,
+        )
         chunk_done = gathered
         for start in pl.range(0, q_token_count, Q_TILE):
             active = pl.min(Q_TILE, q_token_count - start)
@@ -620,11 +626,11 @@ def prefill_c2a_full_cp(
                 qa_row_tile=256, qb_row_tile=128,
             )
             attn_out = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-            index_inputs_ready = pl.system.task_dummy(deps=[stage_tid, compressed_ready])
+            index_inputs_ready = pl.system.task_dummy(deps=[stage_tid, keys_ready])
             _index_ready = prefill_indexer(
                 qb_payload, qb_scales,
                 chunk_hidden, q_latent, chunk_request_ids, chunk_compressed_lens,
-                index_cache, index_cache_scale, index_block_table,
+                score_keys, index_cache_scale, index_block_table,
                 chunk_rope_cos, chunk_rope_sin, w_index_q, w_index_q_scale, w_index_score,
                 chunk_topk_indices, chunk_compressed_lens, chunk_topk_indices, active, index_inputs_ready,
                 pool=False, c2a=True,
