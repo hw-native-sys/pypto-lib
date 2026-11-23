@@ -54,7 +54,7 @@ from .expert_shared import expert_shared
 
 from .gate import gate
 
-from .hc_post import hc_post
+from ..hc_post_common import hc_post
 
 from .hc_pre import hc_pre
 

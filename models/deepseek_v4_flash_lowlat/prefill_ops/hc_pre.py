@@ -13,7 +13,8 @@ from math import gcd
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, TP, PREFILL_BATCH, PREFILL_SEQ
+from config import FLASH as M
+from prefill_shapes import DECODE_BATCH, DECODE_SEQ, TP
 from rmsnorm import rms_norm_apply, rms_norm_inverse
 
 
@@ -613,7 +614,7 @@ if __name__ == "__main__":
     MODES = {
         "decode":     (DECODE_BATCH // TP, DECODE_SEQ),
         "decode_dp":  (DECODE_BATCH, DECODE_SEQ),
-        "prefill":    (PREFILL_BATCH, PREFILL_SEQ),
+        "prefill":    (1, 512),
     }
     ALL_MODES = ["decode", "prefill"]
 

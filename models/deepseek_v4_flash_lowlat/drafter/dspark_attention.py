@@ -13,7 +13,8 @@ from .config import BLOCK_SIZE, DECODE_SEQ, FLASH as M, MOE_TOKENS
 
 from .decode_o_proj import LOCAL_T_PAD
 
-from .qkv_proj_rope import kv_proj_rope, q_proj_rope, rope_prepare
+from ..kv_proj_rope import kv_proj_rope
+from .qkv_proj_rope import q_proj_rope, rope_prepare
 
 ORI_BLOCK_NUM_DYN = pl.dynamic("NATIVE_D_DSPARK_ATTENTION_ORI_BLOCK_NUM_DYN")
 

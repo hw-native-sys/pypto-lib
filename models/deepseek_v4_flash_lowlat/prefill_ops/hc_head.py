@@ -11,14 +11,8 @@
 
 import pypto.language as pl
 
-from config import (
-    FLASH as M,
-    DECODE_BATCH,
-    DECODE_SEQ,
-    PREFILL_BATCH,
-    PREFILL_SEQ,
-    TP,
-)
+from config import FLASH as M
+from prefill_shapes import DECODE_BATCH, DECODE_SEQ, TP
 
 
 # Longest sequence the model config admits; the host-side bound on token_count.
@@ -99,7 +93,7 @@ def _hc_head(
                 )
                 sq_col_tail = pl.row_sum(pl.mul(x_rms_tail, x_rms_tail))
                 sq_sum = pl.add(sq_sum, pl.reshape(sq_col_tail, [1, RMS_T_TILE]))
-        sq_part = pl.assemble(sq_part, sq_sum, [ok, t0])
+        sq_part[ok : ok + 1, t0 : t0 + RMS_T_TILE] = sq_sum
 
     # One writer per row block computes the complete head projection.
     mixes_raw = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
@@ -123,7 +117,7 @@ def _hc_head(
                     valid_shape=[HC_MULT, LINEAR_K_TILE],
                 )
                 acc_full = pl.matmul_acc(acc_full, x_lin_full, w_full, b_trans=True, init_cond=(kb == 0))
-            mixes_raw = pl.assemble(mixes_raw, acc_full, [t0, 0])
+            mixes_raw[t0 : t0 + LINEAR_T_TILE, 0:HC_PAD] = acc_full
 
     # At most one incomplete M=16 block exists. Keep it in a separate conditional
     # task so every aligned block above retains the original static-M Cube path.
@@ -150,11 +144,7 @@ def _hc_head(
                     valid_shape=[HC_MULT, LINEAR_K_TILE],
                 )
                 acc_tail = pl.matmul_acc(acc_tail, x_lin_tail, w_tail, b_trans=True, init_cond=(kb == 0))
-            mixes_raw = pl.assemble(
-                mixes_raw,
-                acc_tail,
-                [linear_full_rows, 0],
-            )
+            mixes_raw[linear_full_rows : linear_full_rows + LINEAR_T_TILE, 0:HC_PAD] = acc_tail
 
     # reduce: gate + hc mix, fanned over (token-tile x D-slice). The rsqrt/sigmoid gate is
     # recomputed per task instead of being published by its own scope.

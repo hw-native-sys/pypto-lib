@@ -519,9 +519,9 @@ def golden_moe(tensors):
     else:
         from hc_pre import golden_hc_pre
     if __package__:
-        from .hc_post import golden_hc_post
+        from .hc_post_common import golden_hc_post
     else:
-        from hc_post import golden_hc_post
+        from models.deepseek_v4_flash_lowlat.hc_post_common import golden_hc_post
     if __package__:
         from .gate import golden_gate_core
     else:

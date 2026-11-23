@@ -151,7 +151,7 @@ class PreparedInputPlan:
         if _signature(**context) != self.signature:
             raise ValueError("Prepared input owner/page/position/shape/RoPE/grammar/revision changed")
 
-    def fill(self, tokens, *, projection_epochs, causal_epoch, **changes):
+    def fill(self, tokens, *, projection_epochs, gate_epoch, **changes):
         if self.arena.copying:
             raise RuntimeError("Metadata upload must retire before filling token IDs")
         self.validate(**changes)
@@ -161,8 +161,8 @@ class PreparedInputPlan:
             raise ValueError("Actual INT64 token IDs must match the prepared token extent")
         if bool(((tokens < 0) | (tokens >= 129280)).any()):
             raise ValueError("Token ID outside the vocabulary")
-        if type(causal_epoch) is not int or not 0 <= causal_epoch < 2**31:
-            raise ValueError("Causal epoch must be a nonnegative INT32")
+        if type(gate_epoch) is not int or not 0 <= gate_epoch < 2**31:
+            raise ValueError("MoE gate epoch must be a nonnegative INT32")
         if len(projection_epochs) != 6 or any(type(v) is not int or not 0 <= v < 2**31 for v in projection_epochs):
             raise ValueError("Projection epochs must be six nonnegative INT32 values")
         views = self.arena.views
@@ -171,7 +171,7 @@ class PreparedInputPlan:
         full[:, tokens.numel():].zero_()
         views["input_ids"].copy_(full[0].reshape(RANKS, -1))
         views["projection_epoch_bases"].copy_(torch.tensor(projection_epochs, dtype=torch.int32).unsqueeze(0))
-        views["causal_epoch_bases"].fill_(causal_epoch)
+        views["gate_epoch_bases"].fill_(gate_epoch)
         self.generation += 1
         return views
 

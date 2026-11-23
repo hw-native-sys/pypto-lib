@@ -10,35 +10,29 @@
 """DeepSeek-V4 packed prefill HCA (ratio-128) attention over one contiguous run of <=T tokens."""
 
 import pypto.language as pl
-from causal_cache_ready import (
-    CAUSAL_READY, CAUSAL_FAMILIES, CAUSAL_REQUIRED_COLS, CAUSAL_QUERY_TILE,
-    causal_tensor_specs, causal_required_prefixes, causal_publish_prefix, causal_layer_ready,
-)
 from projection_exchange import (
     PROJECTION_KINDS, PROJECTION_RANKS, PROJECTION_SIGNAL_ROWS,
     PROJECTION_WINDOW_COLS, PROJECTION_WINDOW_ROWS,
     projection_degree, projection_tensor_specs,
 )
-from qkv_proj_rope import kv_proj_cache_causal, kv_proj_rope_cp
+from models.deepseek_v4_flash_lowlat.kv_proj_rope import kv_proj_rope
+from qkv_proj_rope import kv_proj_rope_cp
 
 from projection_weight_layout import PROJECTION_WEIGHT_LAYOUT
 from utils import checkpoint_ends_tensor
 
-from config import (
+from config import FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
+from prefill_shapes import (
     BLOCK_SIZE,
     HCA_CMP_STORAGE_BLOCK_SIZE as CMP_STORAGE_BLOCK_SIZE,
     DECODE_BATCH,
-    FLASH as M,
     HCA_STATE_PHYSICAL_BLOCKS,
-    INT8_AMAX_EPS,
-    INT8_SCALE_MAX,
     KV_ORI_BLOCK_NUM,
-    PREFILL_SEQ,
 )
 
-from hc_post import golden_hc_post, hc_post
+from models.deepseek_v4_flash_lowlat.hc_post_common import golden_hc_post, hc_post
 from hc_pre import golden_hc_pre, hc_pre
-from prefill_compressor_ratio128 import prefill_compressor_ratio128_causal, prefill_compressor_ratio128_cp
+from prefill_compressor_ratio128 import prefill_compressor_ratio128_cp
 from prefill_compressor_ratio128 import (
     HCA_STATE_BLOCK_NUM,
     HCA_STATE_BLOCK_SIZE,
@@ -53,7 +47,6 @@ from prefill_metadata import (
 from qkv_proj_rope import golden_qkv_proj_rope, qkv_proj_rope
 from rmsnorm import golden_rms_norm, rms_norm
 from prefill_sparse_attn import (
-    hca_streaming_attn_physical_causal,
     PREFILL_RING_HEAP,
     golden_prefill_sparse_attn,
     hca_streaming_attn_physical,
@@ -78,7 +71,7 @@ from prefill_o_proj import (
     O_PROJ_WO_B_WINDOW_ROWS,
     gather_o_proj_full_weights,
 )
-from qkv_proj_rope import kv_proj_rope, q_proj_rope, rope_prepare
+from qkv_proj_rope import q_proj_rope, rope_prepare
 
 
 PROJECTION_D = projection_degree("hca")
@@ -495,7 +488,10 @@ def golden_prefill_attention_hca(tensors):
     tensors["x_out"][:] = y
 
 
-def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SEQ, checkpoint_end: int = 0):
+VALIDATION_TOKENS = 512
+
+
+def build_tensor_specs(start_pos: int = START_POS, token_count: int = VALIDATION_TOKENS, checkpoint_end: int = 0):
     import torch
     from golden import TensorSpec
     from utils import (block_table, cache_row_from_table, pack_nz, prefill_state_fixture,
@@ -866,8 +862,6 @@ def prefill_attention_hca_cp_core(
     projection_peers: pl.Tensor[[PROJECTION_RANKS], pl.INT32],
     projection_epochs: pl.Array[PROJECTION_KINDS, pl.INT32],
     projection_rank: pl.Scalar[pl.INT32],
-    causal_ready_signal: pld.DistributedTensor[[CAUSAL_FAMILIES, 1], pl.INT32],
-    causal_epoch_base: pl.Scalar[pl.INT32],
 ):
     """HCA attention body: local Q/o_proj and replicated full KV/compressor."""
     q_dim = pl.tensor.dim(x_normed_local, 0)
@@ -888,64 +882,30 @@ def prefill_attention_hca_cp_core(
     kv_swap_idx = pl.create_tensor([kv_dim, ROPE_DIM], dtype=pl.INT32)
     rope_prepare(freqs_cos_full, freqs_sin_full, kv_cos_il, kv_sin_signed, kv_swap_idx)
 
-    hca_original_raw_ready = pl.array.create(1, pl.TASK_ID)
-    hca_original_raw_ready[0] = late_dep
-    hca_consumer_seed = pl.array.create(1, pl.TASK_ID)
-    hca_consumer_seed[0] = late_dep
-    causal_completions = pl.array.create(4, pl.TASK_ID)
-    for causal_stage in pl.unroll(4):
-        causal_completions[causal_stage] = late_dep
-    causal_required = pl.create_tensor([(q_dim + CAUSAL_QUERY_TILE - 1) // CAUSAL_QUERY_TILE, CAUSAL_REQUIRED_COLS], dtype=pl.INT32)
-    if CAUSAL_READY:
-        causal_metadata_ready = causal_required_prefixes(
-            query_start_loc, position_ids_full, position_ids_local, local_request_ids,
-            causal_required, late_dep, COMPRESS_RATIO, False,
+    kv_full = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.BF16)
+    if PROJECTION_D < 8:
+        kv_proj_rope_cp(
+            x_normed_full, wkv, gamma_ckv, kv_cos_il, kv_sin_signed, kv_swap_idx, kv_full, late_dep,
+            projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers,
+            projection_epochs, projection_rank, 2, PROJECTION_D,
         )
-        causal_completions[0] = causal_metadata_ready
-        causal_raw_complete = kv_proj_cache_causal(
-            x_normed_full, wkv, gamma_ckv, kv_cos_il, kv_sin_signed, kv_swap_idx,
-            kv_cache, ori_slot_mapping_full, causal_ready_signal, projection_rank, late_dep,
-        )
-        causal_completions[1] = causal_raw_complete
-        causal_indexer_unused = causal_publish_prefix(causal_ready_signal, projection_rank, kv_dim, late_dep, late_dep, 2)
-        causal_completions[3] = causal_indexer_unused
     else:
-        kv_full = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.BF16)
-        if PROJECTION_D < 8:
-            kv_proj_rope_cp(
-                x_normed_full, wkv, gamma_ckv, kv_cos_il, kv_sin_signed, kv_swap_idx, kv_full, late_dep,
-                projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers,
-                projection_epochs, projection_rank, 2, PROJECTION_D,
-            )
-        else:
-            kv_proj_rope(x_normed_full, wkv, gamma_ckv, kv_cos_il, kv_sin_signed, kv_swap_idx, kv_full, late_dep)
+        kv_proj_rope(x_normed_full, wkv, gamma_ckv, kv_cos_il, kv_sin_signed, kv_swap_idx, kv_full, late_dep)
 
-        ori_block_num = pl.tensor.dim(kv_cache, 0)
-        ori_cache_rows = ori_block_num * BLOCK_SIZE
-        kv_cache_flat = pl.reshape(kv_cache, [ori_cache_rows, HEAD_DIM])
-        with pl.spmd((kv_dim + HCA_CACHE_WRITE_TILE - 1) // HCA_CACHE_WRITE_TILE, name_hint="prefill_hca_cp_cache_write") as ori_cache_write_tid:
-            write_base = pl.tile.get_block_idx() * HCA_CACHE_WRITE_TILE
-            for write_offset in pl.range(HCA_CACHE_WRITE_TILE):
-                write_t = write_base + write_offset
-                if write_t < kv_dim:
-                    write_row_raw = pl.read(ori_slot_mapping_full, [write_t])
-                    if write_row_raw >= 0:
-                        write_row = pl.cast(write_row_raw, pl.INDEX)
-                        kv_cache_flat[write_row : write_row + 1, :] = kv_full[write_t : write_t + 1, :]
+    ori_block_num = pl.tensor.dim(kv_cache, 0)
+    ori_cache_rows = ori_block_num * BLOCK_SIZE
+    kv_cache_flat = pl.reshape(kv_cache, [ori_cache_rows, HEAD_DIM])
+    with pl.spmd((kv_dim + HCA_CACHE_WRITE_TILE - 1) // HCA_CACHE_WRITE_TILE, name_hint="prefill_hca_cp_cache_write") as ori_cache_write_tid:
+        write_base = pl.tile.get_block_idx() * HCA_CACHE_WRITE_TILE
+        for write_offset in pl.range(HCA_CACHE_WRITE_TILE):
+            write_t = write_base + write_offset
+            if write_t < kv_dim:
+                write_row_raw = pl.read(ori_slot_mapping_full, [write_t])
+                if write_row_raw >= 0:
+                    write_row = pl.cast(write_row_raw, pl.INDEX)
+                    kv_cache_flat[write_row : write_row + 1, :] = kv_full[write_t : write_t + 1, :]
 
-        hca_original_raw_ready[0] = ori_cache_write_tid
-
-    if CAUSAL_READY:
-        causal_compressed_complete = prefill_compressor_ratio128_causal(
-            x_normed_full, query_start_loc, state_checkpoint_ends,
-            compress_state, compress_state_block_table,
-            cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-            cmp_freqs_cos_full, cmp_freqs_sin_full,
-            cmp_kv, position_ids_full, cmp_slot_mapping_full, state_slot_mapping_full,
-            causal_ready_signal, projection_rank, late_dep,
-        )
-        causal_completions[2] = causal_compressed_complete
-    elif PROJECTION_D < 8:
+    if PROJECTION_D < 8:
         prefill_compressor_ratio128_cp(
             x_normed_full,
             query_start_loc, state_checkpoint_ends,
@@ -990,48 +950,43 @@ def prefill_attention_hca_cp_core(
                                 pl.write(swa_row, [0, win_col], row)
                 swa_indices[idx_t : idx_t + 1, 0:WIN] = swa_row
 
-    if CAUSAL_READY:
-        hca_consumer_seed[0] = causal_completions[0]
-    else:
-        # Streaming-attention input publication fence.
-        cmp_cache_rows = pl.tensor.dim(cmp_kv, 0) * CMP_STORAGE_BLOCK_SIZE
-        state_rows = pl.tensor.dim(compress_state, 0) * HCA_STATE_BLOCK_SIZE
-        cmp_cache_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
-        compress_state_flat = pl.reshape(compress_state, [state_rows, MAIN_COMPRESS_STATE_DIM])
-        q_ready_flat = pl.reshape(q, [q_dim * H, HEAD_DIM])
-        cache_ready_blocks = (kv_dim + HCA_CACHE_READY_TILE - 1) // HCA_CACHE_READY_TILE
-        cache_ready_fence = pl.create_tensor([cache_ready_blocks], dtype=pl.INT32)
-        with pl.spmd(
-            cache_ready_blocks, name_hint="prefill_hca_cp_cache_ready",
-            deps=[hca_original_raw_ready[0], swa_indices_tid],
-        ) as cache_ready_dep:
-            ready_block = pl.tile.get_block_idx()
-            ready_bit = pl.cast(1, pl.INT32)
-            for ready_offset in pl.range(HCA_CACHE_READY_TILE):
-                ready_t = ready_block * HCA_CACHE_READY_TILE + ready_offset
-                if ready_t < kv_dim:
-                    if ready_t < q_dim:
-                        q_ready_tile = pl.load(q_ready_flat, [ready_t * H, 0], [1, 16])
-                        q_ready_bits = pl.reinterpret_view(q_ready_tile, pl.INT16)
-                        q_ready_sample = pl.tile.read(q_ready_bits, [0, 0])
-                        ready_bit = ready_bit + pl.cast(q_ready_sample, pl.INT32)
-                    state_ready_row_raw = pl.read(state_slot_mapping_full, [ready_t])
-                    if state_ready_row_raw >= 0:
-                        state_ready_row = pl.cast(state_ready_row_raw, pl.INDEX)
-                        state_ready_sample = pl.read(compress_state_flat, [state_ready_row, 0])
-                        state_ready_bit = pl.cast(state_ready_sample == state_ready_sample, pl.INT32)
-                        ready_bit = ready_bit * state_ready_bit
-                    cmp_ready_row_raw = pl.read(cmp_slot_mapping_full, [ready_t])
-                    if cmp_ready_row_raw >= 0:
-                        cmp_ready_row = pl.cast(cmp_ready_row_raw, pl.INDEX)
-                        cmp_ready_tile = pl.load(cmp_cache_flat, [cmp_ready_row, 0], [1, 16])
-                        cmp_ready_bits = pl.reinterpret_view(cmp_ready_tile, pl.INT16)
-                        cmp_ready_sample = pl.tile.read(cmp_ready_bits, [0, 0])
-                        cmp_ready_value = pl.cast(cmp_ready_sample, pl.INT32)
-                        ready_bit = ready_bit + cmp_ready_value
-            pl.write(cache_ready_fence, [ready_block], ready_bit)
-
-        hca_consumer_seed[0] = cache_ready_dep
+    # Streaming-attention input publication fence.
+    cmp_cache_rows = pl.tensor.dim(cmp_kv, 0) * CMP_STORAGE_BLOCK_SIZE
+    state_rows = pl.tensor.dim(compress_state, 0) * HCA_STATE_BLOCK_SIZE
+    cmp_cache_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
+    compress_state_flat = pl.reshape(compress_state, [state_rows, MAIN_COMPRESS_STATE_DIM])
+    q_ready_flat = pl.reshape(q, [q_dim * H, HEAD_DIM])
+    cache_ready_blocks = (kv_dim + HCA_CACHE_READY_TILE - 1) // HCA_CACHE_READY_TILE
+    cache_ready_fence = pl.create_tensor([cache_ready_blocks], dtype=pl.INT32)
+    with pl.spmd(
+        cache_ready_blocks, name_hint="prefill_hca_cp_cache_ready",
+        deps=[ori_cache_write_tid, swa_indices_tid],
+    ) as cache_ready_dep:
+        ready_block = pl.tile.get_block_idx()
+        ready_bit = pl.cast(1, pl.INT32)
+        for ready_offset in pl.range(HCA_CACHE_READY_TILE):
+            ready_t = ready_block * HCA_CACHE_READY_TILE + ready_offset
+            if ready_t < kv_dim:
+                if ready_t < q_dim:
+                    q_ready_tile = pl.load(q_ready_flat, [ready_t * H, 0], [1, 16])
+                    q_ready_bits = pl.reinterpret_view(q_ready_tile, pl.INT16)
+                    q_ready_sample = pl.tile.read(q_ready_bits, [0, 0])
+                    ready_bit = ready_bit + pl.cast(q_ready_sample, pl.INT32)
+                state_ready_row_raw = pl.read(state_slot_mapping_full, [ready_t])
+                if state_ready_row_raw >= 0:
+                    state_ready_row = pl.cast(state_ready_row_raw, pl.INDEX)
+                    state_ready_sample = pl.read(compress_state_flat, [state_ready_row, 0])
+                    state_ready_bit = pl.cast(state_ready_sample == state_ready_sample, pl.INT32)
+                    ready_bit = ready_bit * state_ready_bit
+                cmp_ready_row_raw = pl.read(cmp_slot_mapping_full, [ready_t])
+                if cmp_ready_row_raw >= 0:
+                    cmp_ready_row = pl.cast(cmp_ready_row_raw, pl.INDEX)
+                    cmp_ready_tile = pl.load(cmp_cache_flat, [cmp_ready_row, 0], [1, 16])
+                    cmp_ready_bits = pl.reinterpret_view(cmp_ready_tile, pl.INT16)
+                    cmp_ready_sample = pl.tile.read(cmp_ready_bits, [0, 0])
+                    cmp_ready_value = pl.cast(cmp_ready_sample, pl.INT32)
+                    ready_bit = ready_bit + cmp_ready_value
+        pl.write(cache_ready_fence, [ready_block], ready_bit)
 
     # Per-request HCA streaming over rank-local packed query intervals.
     with pl.spmd(q_dim, name_hint="prefill_hca_cp_pad_output_init") as pad_output_tid:
@@ -1041,7 +996,7 @@ def prefill_attention_hca_cp_core(
             pl.store(pad_row, [pad_t, 0], attn_out_local)
     # Serial chain over requests, array carry as in the non-CP path above.
     request_deps = pl.array.create(1, pl.TASK_ID)
-    request_deps[0] = pl.system.task_dummy(deps=[hca_consumer_seed[0], pad_output_tid])
+    request_deps[0] = pl.system.task_dummy(deps=[cache_ready_dep, pad_output_tid])
     request_count = pl.tensor.dim(query_start_loc, 0) - 1
     for request in pl.range(request_count):
         local_start = pl.cast(0, pl.INDEX)
@@ -1053,47 +1008,22 @@ def prefill_attention_hca_cp_core(
                     local_start = local_t
                 request_rows = request_rows + 1
         if request_rows > 0:
-            if CAUSAL_READY:
-                causal_request_begin = pl.read(query_start_loc, [request])
-                causal_request_origin = pl.read(position_ids_full, [causal_request_begin])
-                request_tid = hca_streaming_attn_physical_causal(
-                    q,
-                    kv_cache, swa_indices,
-                    cmp_kv, cmp_block_table[request],
-                    position_ids_local, attn_sink,
-                    freqs_cos_local, freqs_sin_local,
-                    wo_a, wo_b, wo_b_scale,
-                    attn_out_local,
-                    request_deps[0],
-                    o_proj_weight_dep,
-                    local_start,
-                    request_rows,
-                    causal_ready_signal, causal_required, causal_epoch_base,
-                    causal_request_begin, causal_request_origin,
-                )
-            else:
-                request_tid = hca_streaming_attn_physical(
-                    q,
-                    kv_cache, swa_indices,
-                    cmp_kv, cmp_block_table[request],
-                    position_ids_local, attn_sink,
-                    freqs_cos_local, freqs_sin_local,
-                    wo_a, wo_b, wo_b_scale,
-                    attn_out_local,
-                    request_deps[0],
-                    o_proj_weight_dep,
-                    local_start,
-                    request_rows,
-                )
+            request_tid = hca_streaming_attn_physical(
+                q,
+                kv_cache, swa_indices,
+                cmp_kv, cmp_block_table[request],
+                position_ids_local, attn_sink,
+                freqs_cos_local, freqs_sin_local,
+                wo_a, wo_b, wo_b_scale,
+                attn_out_local,
+                request_deps[0],
+                o_proj_weight_dep,
+                local_start,
+                request_rows,
+            )
             # Store the returned id, not the call: an inline callee assigned
             # straight into a slot is not expanded.
             request_deps[0] = request_tid
-    if CAUSAL_READY:
-        causal_producers_complete = pl.system.task_dummy(deps=[causal_completions[1], causal_completions[2], causal_completions[3]])
-        causal_complete = causal_layer_ready(causal_ready_signal, causal_epoch_base, kv_dim, causal_producers_complete)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="causal_hca_layer_publish", deps=[causal_complete]):
-            causal_output_anchor = pl.read(attn_out_local, [0, 0])
-            pl.write(attn_out_local, [0, 0], causal_output_anchor)
     return attn_out_local
 
 
@@ -1155,8 +1085,6 @@ def prefill_attention_hca_cp(
     projection_consumed: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
     projection_peers: pl.Tensor[[3, PROJECTION_RANKS], pl.INT32],
     projection_epochs: pl.Array[PROJECTION_KINDS, pl.INT32],
-    causal_ready_signal: pld.DistributedTensor[[CAUSAL_FAMILIES, 1], pl.INT32],
-    causal_epoch_base: pl.Scalar[pl.INT32],
 ):
     """DSA-CP HCA with replicated HC state at both layer boundaries."""
     o_proj_weight_dep = gather_o_proj_full_weights(
@@ -1220,7 +1148,6 @@ def prefill_attention_hca_cp(
         attn_out_local,
         late_dep, o_proj_weight_dep,
         projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers[2], projection_epochs, group_base + tp_rank,
-        causal_ready_signal, causal_epoch_base + (weight_epoch - 1) * pl.cast(kv_dim, pl.INT32),
     )
 
     attn_out_full = pl.create_tensor([kv_dim, D], dtype=pl.BF16)
@@ -1290,8 +1217,6 @@ def prefill_attention_hca_cp_test(
     projection_consumed: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
     projection_peers: pl.Tensor[[3, PROJECTION_RANKS], pl.INT32],
     projection_epoch_bases: pl.Tensor[[PROJECTION_KINDS], pl.INT32],
-    causal_ready_signal: pld.DistributedTensor[[CAUSAL_FAMILIES, 1], pl.INT32],
-    causal_epoch_bases: pl.Tensor[[1], pl.INT32],
 ):
     projection_epochs = pl.array.create(PROJECTION_KINDS, pl.INT32)
     for projection_kind in pl.unroll(PROJECTION_KINDS):
@@ -1346,7 +1271,6 @@ def prefill_attention_hca_cp_test(
         o_proj_order_fence,
         group_base, tp_rank, pl.const(1, pl.INT32),
         projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers, projection_epochs,
-        causal_ready_signal, pl.read(causal_epoch_bases, [0]),
     )
     return x_out_full
 
@@ -1395,7 +1319,6 @@ def l3_prefill_attention_hca_cp(
     x_out_full: pl.Out[pl.Tensor[[TP_SIZE, CP_KV_T_DYN, HC_MULT, D], pl.FP32]],
     projection_peers: pl.Tensor[[TP_SIZE, 3, PROJECTION_RANKS], pl.INT32],
     projection_epoch_bases: pl.Tensor[[TP_SIZE, PROJECTION_KINDS], pl.INT32],
-    causal_epoch_bases: pl.Tensor[[TP_SIZE, 1], pl.INT32],
 ):
     """Launch one DSA-CP HCA block per rank."""
     x_hc_full.bind_dynamic(1, CP_KV_T_DYN)
@@ -1431,14 +1354,12 @@ def l3_prefill_attention_hca_cp(
     projection_prepared_buf = pld.alloc_window_buffer([PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
     projection_ready_buf = pld.alloc_window_buffer([PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
     projection_consumed_buf = pld.alloc_window_buffer([PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
-    causal_ready_buf = pld.alloc_window_buffer([CAUSAL_FAMILIES, 1], dtype=pl.INT32)
 
     for rank in pl.range(pld.world_size()):
         projection_window = pld.window(projection_window_buf, [PROJECTION_WINDOW_ROWS, PROJECTION_WINDOW_COLS], dtype=pl.FP32)
         projection_prepared = pld.window(projection_prepared_buf, [PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
         projection_ready = pld.window(projection_ready_buf, [PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
         projection_consumed = pld.window(projection_consumed_buf, [PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
-        causal_ready_signal = pld.window(causal_ready_buf, [CAUSAL_FAMILIES, 1], dtype=pl.INT32)
 
         gather_window = pld.window(gather_window_buf, [PREFILL_GROUP_CAP, D], dtype=pl.BF16)
         gather_signal = pld.window(gather_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
@@ -1471,14 +1392,13 @@ def l3_prefill_attention_hca_cp(
             o_proj_weight_ready, o_proj_weight_consumed,
             0, rank,
             projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers[rank], projection_epoch_bases[rank],
-            causal_ready_signal, causal_epoch_bases[rank],
             device=rank,
         )
 
 
 def build_cp_tensor_specs(
     start_pos: int = START_POS,
-    token_count: int = PREFILL_SEQ,
+    token_count: int = VALIDATION_TOKENS,
     tp_size: int = TP_SIZE,
     checkpoint_end: int = 0,
 ):
@@ -1553,7 +1473,7 @@ def build_cp_tensor_specs(
                 spec.name, [tp_size, *spec.shape], spec.dtype,
                 init_value=cp_stack(value, tp_size),
             ))
-    return (specs) + projection_tensor_specs(tp_size) + causal_tensor_specs(tp_size)
+    return (specs) + projection_tensor_specs(tp_size)
 
 
 def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE, checkpoint_ends: tuple[int, int] = (0, 0)):
@@ -1748,7 +1668,7 @@ if __name__ == "__main__":
     parser.add_argument("--start-pos", type=int, default=START_POS)
     parser.add_argument(
         "--token-count", "--num-tokens", dest="token_count", type=int, default=None,
-        help=f"B1 physical query-token extent across the group; defaults to {PREFILL_SEQ}. ragged2 is fixed at 8.",
+        help=f"B1 physical query-token extent across the group; defaults to {VALIDATION_TOKENS}. ragged2 is fixed at 8.",
     )
     parser.add_argument(
         "--case", choices=["b1", "ragged2"], default="b1",
@@ -1778,7 +1698,7 @@ if __name__ == "__main__":
     if args.case == "ragged2" and args.start_pos != 0:
         parser.error("--case ragged2 has fixed request starts and requires --start-pos 0")
     if args.token_count is None:
-        args.token_count = 8 if args.case == "ragged2" else PREFILL_SEQ
+        args.token_count = 8 if args.case == "ragged2" else VALIDATION_TOKENS
     if args.case == "ragged2" and args.token_count != 8:
         parser.error("--case ragged2 has a fixed physical extent and requires --token-count 8")
     if args.case == "b1" and args.token_count % TP_SIZE != 0:

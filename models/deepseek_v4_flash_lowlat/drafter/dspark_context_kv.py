@@ -11,7 +11,8 @@ import pypto.language as pl
 
 from .config import BLOCK_SIZE, FLASH as M
 
-from .qkv_proj_rope import kv_proj_rope, rope_prepare
+from ..kv_proj_rope import kv_proj_rope
+from .qkv_proj_rope import rope_prepare
 
 T_DYN = pl.dynamic("NATIVE_D_DSPARK_CONTEXT_KV_T_DYN")
 

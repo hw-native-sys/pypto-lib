@@ -10,8 +10,6 @@
 
 from .prefill_gate_exchange import retire_gate_reservation
 import pypto.language as pl
-from causal_cache_ready import CAUSAL_READY, CAUSAL_FULL_WAIT, CAUSAL_FAMILIES
-from echo_prefetch import ECHO_PREFETCH, ECHO_DIAGNOSTICS, ECHO_STATE_ROWS, ECHO_LAYERS, ECHO_SIGNAL_COLS
 from projection_exchange import (
     PROJECTION_KINDS, PROJECTION_RANKS, PROJECTION_SIGNAL_ROWS,
     PROJECTION_WINDOW_COLS, PROJECTION_WINDOW_ROWS,
@@ -40,7 +38,6 @@ from prefill_hca import (
     prefill_attention_hca_cp,
 )
 from prefill_csa import (
-    INDEXER_ARENAS,
     BLOCK_SIZE,
     COMPRESS_RATIO as CSA_COMPRESS_RATIO,
     CSA_STATE_BLOCK_SIZE,
@@ -102,7 +99,6 @@ from prefill_sparse_attn import PREFILL_OPROJ_B_BATCHED, PREFILL_OPROJ_A_BATCHED
 PREFILL_OPROJ_PLAN = (bool(PREFILL_OPROJ_A_BATCHED), bool(PREFILL_OPROJ_B_BATCHED))
 PREFILL_MOE_STAGE_VIEW_PLAN = bool(PREFILL_MOE_STAGE_VIEW)
 PREFILL_MOE_OWNER_PLAN = (bool(PREFILL_MOE_OWNER_REDUCE), bool(PREFILL_MOE_EXPERT_AFFINITY), bool(PREFILL_MOE_BATCHED_GATHER), bool(PREFILL_MOE_DIRECT_POST))
-PREFILL_MECHANISM_PLAN = (bool(CAUSAL_READY), bool(CAUSAL_FULL_WAIT), bool(ECHO_PREFETCH), bool(ECHO_DIAGNOSTICS), INDEXER_ARENAS)
 
 
 # Dynamic shape variables.
@@ -286,17 +282,11 @@ def prefill_tp8_fwd(
     projection_consumed: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
     projection_peers: pl.Tensor[[3, PROJECTION_RANKS], pl.INT32],
     projection_epoch_bases: pl.Tensor[[PROJECTION_KINDS], pl.INT32],
-    causal_ready_signal: pld.DistributedTensor[[CAUSAL_FAMILIES, 1], pl.INT32],
-    causal_epoch_bases: pl.Tensor[[1], pl.INT32],
-    echo_state: pld.DistributedTensor[[ECHO_STATE_ROWS, 16], pl.FP32],
-    echo_signal: pld.DistributedTensor[[ECHO_LAYERS, ECHO_SIGNAL_COLS], pl.INT32],
-    echo_diagnostics: pl.InOut[pl.Tensor[[2 * ECHO_LAYERS, 16], pl.FP32]],
-    echo_epoch: pl.Scalar[pl.INT32],
-    echo_first_chunk: pl.Scalar[pl.INT32],
+    gate_epoch_bases: pl.Tensor[[1], pl.INT32],
 ):
+    gate_epoch_base = pl.read(gate_epoch_bases, [0])
     gate_previous = pl.array.create(1, pl.TASK_ID)
     gate_previous[0] = pl.system.task_dummy(deps=[])
-    causal_epoch_base = pl.read(causal_epoch_bases, [0])
     projection_epochs = pl.array.create(PROJECTION_KINDS, pl.INT32)
     for projection_kind in pl.unroll(PROJECTION_KINDS):
         projection_epochs[projection_kind] = pl.read(projection_epoch_bases, [projection_kind])
@@ -330,13 +320,6 @@ def prefill_tp8_fwd(
     request_count = pl.tensor.dim(query_start_loc, 0) - 1
     # Query boundaries must agree across the TP/CP group.
     group_tokens = pl.read(query_start_loc, [request_count])
-    if CAUSAL_READY:
-        if group_tokens == 0:
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="causal_empty_chunk_retire", no_dep_args=[causal_ready_signal]):
-                causal_empty_rows = pl.cast(pl.tensor.dim(position_ids_full, 0) * FWD_NUM_LAYERS, pl.INT32)
-                pld.system.notify(causal_ready_signal, my_rank, [0, 0], value=causal_empty_rows, op=pld.NotifyOp.AtomicAdd)
-                pld.system.notify(causal_ready_signal, my_rank, [1, 0], value=causal_empty_rows, op=pld.NotifyOp.AtomicAdd)
-                pld.system.notify(causal_ready_signal, my_rank, [2, 0], value=causal_empty_rows, op=pld.NotifyOp.AtomicAdd)
     local_request_ids = pl.create_tensor([local_tokens], dtype=pl.INT32)
     lower_local_request_ids(query_start_loc, local_request_ids, tp_rank * local_tokens)
     ori_block_num = pl.tensor.dim(kv_cache, 0) // FWD_NUM_LAYERS
@@ -420,7 +403,6 @@ def prefill_tp8_fwd(
                     layer_completion,
                     group_base, tp_rank, layer_l0 + pl.const(1, pl.INT32),
                     projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers, projection_epochs,
-                    causal_ready_signal, causal_epoch_base, query_start_loc,
                 )
 
         with pl.scope():
@@ -432,7 +414,7 @@ def prefill_tp8_fwd(
                 routed_w2_l0, routed_w2_scale_l0, x_hc, stage_token, layer_completion,
                 tp_reduce_window, tp_reduce_signal, tp_result_window, tp_result_signal, layer_l0, group_tokens, my_rank,
                 layer_l0 * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
-                gate_window, gate_signal, causal_epoch_base, previous_gate_1,
+                gate_window, gate_signal, gate_epoch_base, previous_gate_1,
                 owner_norm_window, owner_scale_window, owner_post_window, owner_comb_window, owner_indices_window, owner_weights_window,
             )
             gate_previous[0] = moe_gate_finished_1
@@ -504,7 +486,6 @@ def prefill_tp8_fwd(
                     layer_completion,
                     group_base, tp_rank, layer_l1 + pl.const(1, pl.INT32),
                     projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers, projection_epochs,
-                    causal_ready_signal, causal_epoch_base, query_start_loc,
                 )
 
         with pl.scope():
@@ -516,7 +497,7 @@ def prefill_tp8_fwd(
                 routed_w2_l1, routed_w2_scale_l1, x_hc, stage_token, layer_completion,
                 tp_reduce_window, tp_reduce_signal, tp_result_window, tp_result_signal, layer_l1, group_tokens, my_rank,
                 layer_l1 * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
-                gate_window, gate_signal, causal_epoch_base, previous_gate_2,
+                gate_window, gate_signal, gate_epoch_base, previous_gate_2,
                 owner_norm_window, owner_scale_window, owner_post_window, owner_comb_window, owner_indices_window, owner_weights_window,
             )
             gate_previous[0] = moe_gate_finished_2
@@ -660,8 +641,6 @@ def prefill_tp8_fwd(
                         layer_completion,
                         group_base, tp_rank, csa_layer + pl.const(1, pl.INT32),
                         projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers, projection_epochs,
-                        causal_ready_signal, causal_epoch_base,
-                        echo_state, echo_signal, echo_diagnostics, echo_epoch, echo_first_chunk,
                     )
 
             with pl.scope():
@@ -673,7 +652,7 @@ def prefill_tp8_fwd(
                     routed_w2_csa, routed_w2_scale_csa, x_hc, stage_token, layer_completion,
                     tp_reduce_window, tp_reduce_signal, tp_result_window, tp_result_signal, csa_layer, group_tokens, my_rank,
                     csa_layer * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
-                    gate_window, gate_signal, causal_epoch_base, previous_gate_3,
+                    gate_window, gate_signal, gate_epoch_base, previous_gate_3,
                 owner_norm_window, owner_scale_window, owner_post_window, owner_comb_window, owner_indices_window, owner_weights_window,
                 )
                 gate_previous[0] = moe_gate_finished_3
@@ -784,7 +763,6 @@ def prefill_tp8_fwd(
                         layer_completion,
                         group_base, tp_rank, hca_layer + pl.const(1, pl.INT32),
                         projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers, projection_epochs,
-                        causal_ready_signal, causal_epoch_base,
                     )
 
             with pl.scope():
@@ -796,7 +774,7 @@ def prefill_tp8_fwd(
                     routed_w2_hca, routed_w2_scale_hca, x_hc, stage_token, layer_completion,
                     tp_reduce_window, tp_reduce_signal, tp_result_window, tp_result_signal, hca_layer, group_tokens, my_rank,
                     hca_layer * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
-                    gate_window, gate_signal, causal_epoch_base, previous_gate_4,
+                    gate_window, gate_signal, gate_epoch_base, previous_gate_4,
                 owner_norm_window, owner_scale_window, owner_post_window, owner_comb_window, owner_indices_window, owner_weights_window,
                 )
                 gate_previous[0] = moe_gate_finished_4
@@ -945,8 +923,6 @@ def prefill_tp8_fwd(
                     layer_completion,
                     group_base, tp_rank, layer_last + pl.const(1, pl.INT32),
                     projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers, projection_epochs,
-                    causal_ready_signal, causal_epoch_base,
-                    echo_state, echo_signal, echo_diagnostics, echo_epoch, echo_first_chunk,
                 )
 
         with pl.scope():
@@ -958,7 +934,7 @@ def prefill_tp8_fwd(
                 routed_w2_last, routed_w2_scale_last, x_hc, stage_token, layer_completion,
                 tp_reduce_window, tp_reduce_signal, tp_result_window, tp_result_signal, layer_last, group_tokens, my_rank,
                 layer_last * pl.cast((group_tokens + MOE_WAVE_TOKENS - 1) // MOE_WAVE_TOKENS, pl.INT32),
-                gate_window, gate_signal, causal_epoch_base, previous_gate_5,
+                gate_window, gate_signal, gate_epoch_base, previous_gate_5,
                 owner_norm_window, owner_scale_window, owner_post_window, owner_comb_window, owner_indices_window, owner_weights_window,
             )
             gate_previous[0] = moe_gate_finished_5
@@ -1123,10 +1099,7 @@ def l3_prefill_tp8_fwd(
     terminal: pl.Scalar[pl.INT32],
     projection_peers: pl.Tensor[[N_RANKS, 3, PROJECTION_RANKS], pl.INT32],
     projection_epoch_bases: pl.Tensor[[N_RANKS, PROJECTION_KINDS], pl.INT32],
-    causal_epoch_bases: pl.Tensor[[N_RANKS, 1], pl.INT32],
-    echo_diagnostics: pl.InOut[pl.Tensor[[TP_SIZE, 2 * ECHO_LAYERS, 16], pl.FP32]],
-    echo_epoch: pl.Scalar[pl.INT32],
-    echo_first_chunk: pl.Scalar[pl.INT32],
+    gate_epoch_bases: pl.Tensor[[N_RANKS, 1], pl.INT32],
 ):
     """Run layer-major DSA-CP over a caller-padded physical token extent.
 
@@ -1200,18 +1173,12 @@ def l3_prefill_tp8_fwd(
     projection_prepared_buf = pld.alloc_window_buffer([PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
     projection_ready_buf = pld.alloc_window_buffer([PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
     projection_consumed_buf = pld.alloc_window_buffer([PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
-    causal_ready_buf = pld.alloc_window_buffer([CAUSAL_FAMILIES, 1], dtype=pl.INT32)
 
-    echo_state_buf = pld.alloc_window_buffer([ECHO_STATE_ROWS, 16], dtype=pl.FP32)
-    echo_signal_buf = pld.alloc_window_buffer([ECHO_LAYERS, ECHO_SIGNAL_COLS], dtype=pl.INT32)
     for r in pl.range(pld.world_size()):
-        echo_state = pld.window(echo_state_buf, [ECHO_STATE_ROWS, 16], dtype=pl.FP32)
-        echo_signal = pld.window(echo_signal_buf, [ECHO_LAYERS, ECHO_SIGNAL_COLS], dtype=pl.INT32)
         projection_window = pld.window(projection_window_buf, [PROJECTION_WINDOW_ROWS, PROJECTION_WINDOW_COLS], dtype=pl.FP32)
         projection_prepared = pld.window(projection_prepared_buf, [PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
         projection_ready = pld.window(projection_ready_buf, [PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
         projection_consumed = pld.window(projection_consumed_buf, [PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
-        causal_ready_signal = pld.window(causal_ready_buf, [CAUSAL_FAMILIES, 1], dtype=pl.INT32)
 
         owner_norm_window = pld.window(owner_norm_window_buf, [OWNER_WINDOW_ROWS, D], dtype=pl.INT8)
         owner_scale_window = pld.window(owner_scale_window_buf, [1, OWNER_WINDOW_ROWS], dtype=pl.FP32)
@@ -1290,9 +1257,7 @@ def l3_prefill_tp8_fwd(
             lm_head_hidden_window, lm_head_hidden_done,
             lm_head_logits_window, lm_head_logits_done,
             r,
-            projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers[r], projection_epoch_bases[r],
-            causal_ready_signal, causal_epoch_bases[r],
-            echo_state, echo_signal, echo_diagnostics[r], echo_epoch, echo_first_chunk,
+            projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers[r], projection_epoch_bases[r], gate_epoch_bases[r],
             device=r,
         )
     return x_out, logits, sampled_ids, dspark_target_hidden

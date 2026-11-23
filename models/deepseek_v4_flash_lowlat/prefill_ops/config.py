@@ -238,50 +238,7 @@ PRO = DeepSeekV4Config(
 PRESETS = {p.name: p for p in (DEMO, FLASH, PRO)}
 
 
-# Deployment constants
-DECODE_BATCH = 64                 # B: requests per decode step, per DP rank
-DSPARK_SPEC_TOKENS = 7            # drafts the DSpark drafter proposes per request
-DECODE_SEQ = 1 + DSPARK_SPEC_TOKENS  # S: tokens the target model verifies per step
-DECODE_TOKENS = DECODE_BATCH * DECODE_SEQ
-DECODE_START_POS = 8192
-PREFILL_BATCH = 1                 # B: prefill batch for the current kernel programs
-PREFILL_SEQ = 512                 # S: prefill sequence for the current kernel programs
-PREFILL_TOKENS = PREFILL_BATCH * PREFILL_SEQ
-
-# Paging constants
-BLOCK_SIZE = 32                           # paged-KV page size / weight-quant block size
-COMPRESSED_BLOCK_TOKENS = 128            # source tokens per compressed cache page (same as MTP)
-HCA_CMP_STORAGE_BLOCK_SIZE = COMPRESSED_BLOCK_TOKENS // 128
-C4A_COMPRESSOR_BLOCK_SIZE = 2             # ratio-4 compressor state page size
-C128_COMPRESSOR_BLOCK_SIZE = 8            # ratio-128 compressor state page size
-KV_ORI_BLOCK_NUM = 512
-KV_CMP_BLOCK_NUM = 256
-HCA_KV_CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM * BLOCK_SIZE // HCA_CMP_STORAGE_BLOCK_SIZE
-IDX_CACHE_BLOCK_NUM = 256
-
-# Persistent compressor state pool capacities shared by prefill and decode.
-# HCA state includes 128 historical rows and one decode transaction.
-HCA_STATE_BLOCKS_PER_REQUEST = (128 + DECODE_SEQ + C128_COMPRESSOR_BLOCK_SIZE - 1) // C128_COMPRESSOR_BLOCK_SIZE
-HCA_STATE_PHYSICAL_BLOCKS = DECODE_BATCH * HCA_STATE_BLOCKS_PER_REQUEST
-# Ratio-4 compressor state: eight history rows plus one decode transaction.
-CSA_STATE_BLOCKS_PER_REQUEST = (8 + DECODE_SEQ + C4A_COMPRESSOR_BLOCK_SIZE - 1) // C4A_COMPRESSOR_BLOCK_SIZE
-CSA_STATE_PHYSICAL_BLOCKS = DECODE_BATCH * CSA_STATE_BLOCKS_PER_REQUEST
-# Inner compressor state uses the same request-local geometry.
-CSA_INNER_STATE_BLOCKS_PER_REQUEST = CSA_STATE_BLOCKS_PER_REQUEST
-CSA_INNER_STATE_PHYSICAL_BLOCKS = DECODE_BATCH * CSA_INNER_STATE_BLOCKS_PER_REQUEST
-
 # Int8 quantization constants
 INT8_SCALE_MAX = 127.0                    # per-row INT8 quant: clamp scale so |q| <= 127
 INT8_AMAX_EPS = 1e-4                      # amax floor: avoids 127/0 on all-zero rows
 FP32_NEG_INF = -3.4028234663852886e38     # most-negative finite fp32 (softmax masking)
-
-# Parallelism constants
-TP = 4    # tensor-parallel ranks per DP group
-DP = 4    # DP groups per node
-EP = 8    # expert-parallel world size (moe overrides it from --ep)
-
-# MoE constants
-MOE_TOKENS = DECODE_TOKENS // TP
-DECODE_RECV_MAX = DP * DECODE_TOKENS
-PREFILL_RECV_MAX = DP * PREFILL_TOKENS
-RECV_MAX = DECODE_RECV_MAX

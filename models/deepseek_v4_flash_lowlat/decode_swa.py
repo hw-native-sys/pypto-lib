@@ -476,9 +476,9 @@ def golden_attention_swa(tensors):
     else:
         from decode_sparse_attn_swa import golden_sparse_attn
     if __package__:
-        from .hc_post import golden_hc_post
+        from .hc_post_common import golden_hc_post
     else:
-        from hc_post import golden_hc_post
+        from models.deepseek_v4_flash_lowlat.hc_post_common import golden_hc_post
 
     # ---- Block.hc_pre (model.py:691) ----
     x_mixed = torch.zeros(T, D, dtype=torch.bfloat16)

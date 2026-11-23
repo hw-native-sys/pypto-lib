@@ -13,8 +13,10 @@ import pypto.language as pl
 
 if __package__:
     from .config import FLASH as M
+    from .hc_post_common import golden_hc_post
 else:
     from config import FLASH as M
+    from models.deepseek_v4_flash_lowlat.hc_post_common import golden_hc_post
 if __package__:
     from .decode_shapes import DECODE_BATCH, DECODE_SEQ
 else:
@@ -86,27 +88,6 @@ def hc_post_test(
 
     hc_post(x, residual, post, comb, y)
     return y
-
-
-def golden_hc_post(tensors):
-    """Torch reference, direct port of model.py Block.hc_post 684-687."""
-    import torch
-
-    x        = tensors["x"].float()
-    residual = tensors["residual"].float()
-    post     = tensors["post"].float()
-    comb     = tensors["comb"].float().reshape(-1, HC_MULT, HC_MULT)  # [B, S, HC, HC]
-
-    T = x.shape[0]
-    y_fp32 = torch.zeros(T, HC_MULT, D, dtype=torch.float32)
-    for out_h in range(HC_MULT):
-        y_row = x * post[:, out_h:out_h + 1]
-        for in_h in range(HC_MULT):
-            y_row = y_row + residual[:, in_h, :] * comb[:, in_h, out_h:out_h + 1]
-        y_fp32[:, out_h, :] = y_row
-    y = y_fp32  # hc residual stream is FP32 end-to-end: no BF16 rounding
-
-    tensors["y"][:] = y
 
 
 def build_tensor_specs(B, S):

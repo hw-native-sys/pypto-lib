@@ -18,7 +18,8 @@ from projection_weight_layout import PROJECTION_WEIGHT_LAYOUT
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 
-from config import FLASH as M, FP32_NEG_INF, MOE_TOKENS
+from config import FLASH as M, FP32_NEG_INF
+from prefill_shapes import MOE_TOKENS
 
 
 T_DYN = pl.dynamic("LM_HEAD_T_DYN")

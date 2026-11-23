@@ -9,7 +9,6 @@
 """DeepSeek-V4 prefill indexer compressor for ratio-4 overlapping KV cache."""
 
 import pypto.language as pl
-from causal_cache_ready import CAUSAL_READY, CAUSAL_FAMILIES, causal_publish_prefix
 import pypto.language.distributed as pld
 from projection_exchange import (
     PROJECTION_KINDS, PROJECTION_RANKS, PROJECTION_SIGNAL_ROWS,
@@ -18,16 +17,12 @@ from projection_exchange import (
 )
 from utils import checkpoint_ends_tensor
 
-from config import (
+from config import FLASH as M, FP32_NEG_INF, INT8_AMAX_EPS, INT8_SCALE_MAX
+from prefill_shapes import (
     BLOCK_SIZE,
     C4A_COMPRESSOR_BLOCK_SIZE,
     CSA_INNER_STATE_BLOCKS_PER_REQUEST,
     CSA_INNER_STATE_PHYSICAL_BLOCKS,
-    FLASH as M,
-    FP32_NEG_INF,
-    INT8_AMAX_EPS,
-    INT8_SCALE_MAX,
-    PREFILL_SEQ,
 )
 from prefill_metadata import (
     CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE,
@@ -1062,7 +1057,7 @@ def _prefill_indexer_compressor_tile(
     with pl.spmd(
         MAX_CMP_WRITES // PACKED_RMS_TILE,
         name_hint="prefill_idx_c4_cache_write",
-    ) as causal_cache_write:
+    ):
         final_block = pl.tile.get_block_idx()
         final_base = final_block * PACKED_RMS_TILE
         # C8 quant-on-write: per-row INT8 quant of the bf16-rounded block + per-position dequant scale
@@ -1092,7 +1087,7 @@ def _prefill_indexer_compressor_tile(
                 dst_row = pl.cast(dst_row_raw, pl.INDEX)
                 idx_kv_cache_flat[dst_row : dst_row + 1, 0:HEAD_DIM] = kv_i8_blk[final_dt : final_dt + 1, :]
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_c4_scale_scatter") as causal_scale_scatter:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_c4_scale_scatter"):
         scale_tile = scale_scratch[0:MAX_CMP_WRITES, 0:1]
         for scale_i in pl.range(MAX_CMP_WRITES):
             dst_row_raw = pl.read(write_dst_map, [0, scale_i])
@@ -1117,13 +1112,7 @@ def _prefill_indexer_compressor_tile(
                 fence_value = fence_value + cache_bit * scale_bit
         pl.write(state_order_fence, [0], fence_value)
 
-    causal_cache_completion = pl.array.create(1, pl.TASK_ID)
-    causal_cache_completion[0] = causal_cache_write
-    if CAUSAL_READY:
-        causal_cache_scale_join = pl.system.task_dummy(deps=[causal_cache_write, causal_scale_scatter])
-        causal_cache_completion[0] = causal_cache_scale_join
-    causal_cache_complete = causal_cache_completion[0]
-    return causal_cache_complete
+    return idx_kv_cache, idx_kv_scale, compress_state
 
 
 
@@ -1580,7 +1569,10 @@ def golden_prefill_indexer_compressor(tensors):
     tensors["idx_kv_scale"][:] = idx_kv_scale
 
 
-def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SEQ, checkpoint_end: int = 0):
+VALIDATION_TOKENS = 512
+
+
+def build_tensor_specs(start_pos: int = START_POS, token_count: int = VALIDATION_TOKENS, checkpoint_end: int = 0):
     import torch
     from golden import TensorSpec
     from utils import prefill_state_fixture, token_local_rope
@@ -1765,7 +1757,7 @@ if __name__ == "__main__":
         "--num-tokens",
         dest="token_count",
         type=int,
-        default=PREFILL_SEQ,
+        default=VALIDATION_TOKENS,
         help="Physical token rows, up to 8192.",
     )
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
@@ -1773,7 +1765,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     cases = [(args.start_pos, args.token_count, 0)]
-    if args.start_pos == START_POS and args.token_count == PREFILL_SEQ:
+    if args.start_pos == START_POS and args.token_count == VALIDATION_TOKENS:
         cases.extend(((0, 8192, (512, 4096, 8064)), (33, 1024, 640), (127, 513, 128)))
     for start_pos, token_count, checkpoint_end in cases:
         result = run(
@@ -1799,109 +1791,3 @@ if __name__ == "__main__":
             if result.error:
                 print(result.error)
             raise SystemExit(1)
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_indexer_compressor_causal(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
-    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
-    compress_state: pl.InOut[
-        pl.Tensor[[STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
-    ],
-    inner_compress_state_block_table: pl.Tensor[[REQUESTS_DYN, INNER_STATE_MAX_BLOCKS], pl.INT32],
-    wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
-    wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
-    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
-    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
-    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    idx_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
-    inner_state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
-    causal_ready: pld.DistributedTensor[[CAUSAL_FAMILIES, 1], pl.INT32],
-    causal_rank: pl.Scalar[pl.INT32],
-    causal_seed: pl.Scalar[pl.TASK_ID],
-):
-    """Compress packed requests independently through ordered 512-row state tiles."""
-    request_count = pl.tensor.dim(query_start_loc, 0) - 1
-    rope_dup_idx_template = pl.create_tensor([PACKED_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
-    rope_swap_idx_template = pl.create_tensor([PACKED_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
-    rope_sign_template = pl.create_tensor([PACKED_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_c4_rope_index_prepare"):
-        for rope_r in pl.range(PACKED_RMS_TILE):
-            for rope_c in pl.range(ROPE_HEAD_DIM):
-                rope_lane = rope_c % 2
-                pl.write(
-                    rope_dup_idx_template,
-                    [rope_r, rope_c],
-                    pl.cast(rope_c // 2, pl.INT32),
-                )
-                pl.write(
-                    rope_swap_idx_template,
-                    [rope_r, rope_c],
-                    pl.cast(rope_c + 1 - rope_lane * 2, pl.INT32),
-                )
-                pl.write(
-                    rope_sign_template,
-                    [rope_r, rope_c],
-                    pl.cast(pl.cast(rope_lane * 2 - 1, pl.INT32), pl.FP32),
-                )
-
-    # Physical-state ring ordering token.
-    state_order_fence = pl.create_tensor([1], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_c4_state_order_init"):
-        pl.write(state_order_fence, [0], pl.cast(0, pl.INT32))
-    causal_published = pl.array.create(1, pl.TASK_ID)
-    causal_published[0] = causal_seed
-    for request in pl.range(request_count):
-        request_start = pl.cast(pl.read(query_start_loc, [request]), pl.INDEX)
-        request_end = pl.cast(pl.read(query_start_loc, [request + 1]), pl.INDEX)
-        request_table = inner_compress_state_block_table[request]
-        for request_offset in pl.range(0, request_end - request_start, PREFILL_STATE_TILE):
-            tile_base = request_start + request_offset
-            tile_rows = pl.min(PREFILL_STATE_TILE, request_end - tile_base)
-            with pl.scope():
-                causal_tile_complete = _prefill_indexer_compressor_tile(
-                    x,
-                    compress_state,
-                    request_table,
-                    wkv,
-                    wgate,
-                    ape,
-                    norm_w,
-                    cmp_freqs_cos,
-                    cmp_freqs_sin,
-                    hadamard,
-                    idx_kv_cache,
-                    idx_kv_scale,
-                    position_ids,
-                    idx_slot_mapping,
-                    inner_state_slot_mapping,
-                    rope_dup_idx_template,
-                    rope_swap_idx_template,
-                    rope_sign_template,
-                    state_order_fence,
-                    request_start,
-                    tile_base,
-                    tile_rows,
-                    state_checkpoint_ends[request, request_offset // PREFILL_STATE_TILE],
-                )
-                causal_previous_publication = causal_published[0]
-                causal_tile_published = causal_publish_prefix(
-                    causal_ready, causal_rank, tile_rows, causal_tile_complete, causal_previous_publication, 2,
-                )
-                causal_published[0] = causal_tile_published
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="causal_compressor_state_complete", deps=[causal_published[0]]) as causal_state_complete:
-        causal_state_anchor = pl.read(state_order_fence, [0])
-        pl.write(state_order_fence, [0], causal_state_anchor)
-    causal_padding = pl.tensor.dim(x, 0) - pl.cast(pl.read(query_start_loc, [request_count]), pl.INDEX)
-    causal_previous_final = causal_published[0]
-    causal_final = causal_publish_prefix(
-        causal_ready, causal_rank, causal_padding, causal_state_complete, causal_previous_final, 2,
-    )
-    return causal_final

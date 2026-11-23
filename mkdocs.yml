@@ -97,9 +97,6 @@ nav:
       - DeepSeek V4-Flash (DSpark): models/deepseek_v4_flash_dspark/index.md
       - DeepSeek V4-Flash (low latency):
           - Model overview: models/deepseek_v4_flash_lowlat/index.md
-          - Compact prefill input: models/deepseek_v4_flash_lowlat/compact_prefill_input.md
-          - Prefill output projection batching: models/deepseek_v4_flash_lowlat/prefill_oproj_batch.md
-          - Prefill owner reduction: models/deepseek_v4_flash_lowlat/prefill_owner_reduce.md
       - DeepSeek V4.1-Flash: models/deepseek_v4_1_flash/index.md
       - GLM-5.3-Flash: models/glm5_3_flash/index.md
       - Qwen3.8-27B (GDN): models/qwen3_8_27b/index.md

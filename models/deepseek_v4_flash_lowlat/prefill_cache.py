@@ -12,7 +12,7 @@ from math import prod
 
 import torch
 
-from .prefill_ops.config import DECODE_SEQ as PREFILL_STATE_ROWS
+from .prefill_ops.prefill_shapes import DECODE_SEQ as PREFILL_STATE_ROWS
 
 
 RANKS = 8

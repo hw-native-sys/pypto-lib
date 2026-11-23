@@ -11,7 +11,7 @@ activations for both decode and prefill attention paths."""
 
 import pypto.language as pl
 
-from config import FLASH as M, PREFILL_BATCH, PREFILL_SEQ
+from config import FLASH as M
 
 
 # Dynamic shape variables.
@@ -27,7 +27,6 @@ EPS = M.rms_norm_eps
 D_TILE = 128
 T_TILE = 8
 assert D % D_TILE == 0, "D must be divisible by D_TILE"
-assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
 
 
 @pl.jit.inline

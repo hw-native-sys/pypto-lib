@@ -25,67 +25,7 @@ The indexer uses one score/selection arena by default. The internal build option
 it is recorded in the generated prefill plan. The two bounded KV gather slots
 are independent of this choice. Two-arena experiments have no confirmed
 end-to-end speedup in the representative 16K scope; each generated artifact
-requires its own correctness and performance qualification. Histogram selection
-and EMA recall are not enabled by that option alone.
-
-The separate opt-in `--prefill-echo-prefetch` requires two indexer arenas. It
-accumulates 256 ordered score bins in the existing score wave, then prefetches
-only complete high bins while the original exact top-512 selection proceeds.
-A direct logical-index map supplies prefetched rows and fills every miss from
-the original paged cache in exact selected order. Two transport slots retire
-with their actual attention consumers. This is device-HBM staging, not a host
-KV offload service; score, selection, quantization and attention arithmetic stay
-unchanged. NaN score queries use the original gather fallback.
-
-The request-zero stream uses the preceding outer chunk's global final exact
-kth score for a per-layer EMA with alpha 0.5. Other packed requests retain
-exact scoring and gather without inheriting that prediction. The first chunk
-keeps the estimate invalid and performs exact selection and gather. Its global
-final exact kth score initializes the estimate; early prefetch begins only in a
-later chunk with a valid estimate. A valid numerical zero is an initialized EMA.
-An epoch replay retains the same input estimate instead of advancing EMA twice.
-Generated metadata includes required `echo_epoch`, `echo_first_chunk`, and an
-owned FP32 `echo_diagnostics` buffer with two snapshots per CSA layer. Epochs
-must be positive, below 2^24, and advance per prepared program after successful
-whole-chunk completion. Set the first-chunk flag for every new request; no
-per-query host state update is required.
-
-`--prefill-echo-diagnostics` adds recall/miss counters for separate diagnostic
-runs. It must not be silently substituted for an ordinary timing plan. The
-feature remains off by default. CPU source/protocol checks and native artifacts
-do not establish device numerical correctness, actual prefetch overlap or an
-end-to-end gain; these qualifications remain pending for this new option.
-
-
-The opt-in prefill option `--prefill-causal-ready` publishes completed cache
-prefixes in 512-token producer tiles. Each 128-query CSA block waits for its
-logical causal range rather than the complete current chunk. Publication covers
-raw-KV normalization and RoPE, compressed-KV pooling and cache writes, and both
-the indexer's INT8 keys and FP32 dequantization scales. Cache readers use explicit
-readiness dependencies; logical positions and request origins determine those
-dependencies independently of rank-local physical page numbers. SWA uses the raw
-prefix, while HCA uses raw and compressed prefixes with its existing ordered
-query waves and 512-query output projection.
-
-This option currently requires projection degree eight. Its three INT32 prefix
-counters reserve one physical full-stream row extent per layer, including unused
-channels for layers without that cache family. The per-query requirement table
-has 16 INT32 columns per row; only the first three are semantic. Metadata stores
-own complete 64-byte rows. Raw projection staging has two bounded slots retired
-by actual cache scatter, and the existing attention workspaces retain their
-consumer retirement. Layer completion joins all cache publishers and attention
-outputs before the next ordered stage.
-
-Callers bind `causal_epoch_bases` using `prepare_causal_bindings` and advance the
-base with `advance_causal_epoch` only after successful whole-chunk completion.
-Retained domains keep separate bases for independently compiled plans. Before
-submission, callers must admit the complete reservation against INT32 overflow;
-a failed domain must be discarded. `--prefill-causal-full-wait` is a diagnostic
-variant that retains the same producer/control path and waits for full current
-prefixes. Compile each plan in a fresh setup process. Both options default off.
-Native preparation does not establish device correctness or performance; the
-causal option requires its own full output/cache and ordinary timing gates.
-
+requires its own correctness and performance qualification.
 Prefill MoE execution has an independent slab geometry. The build option
 `--prefill-moe-wave-tokens` selects 8, 32, 64, 128, 1024, 2048 or 8192 rows,
 with 2048 as the default in this branch. Routed and shared experts use bounded
@@ -154,11 +94,6 @@ expose 153. They consume the group-sharded O-proj weights directly; the unused
 replicated `wo_a` and `wo_b` inputs have been removed. Callers bind the actual
 generated metadata and regenerate older native artifacts. The standalone
 forward's golden-facing entry retains its full-weight reference inputs.
-
-The experimental prefill option `--prefill-oproj-b-batched` groups independent
-O-projection B output slabs in one grid while retaining the existing GEMM
-fragments and ordered epilogue. It defaults off and changes no decode path.
-See [the dispatch batching notes](prefill_oproj_batch.md) for its scope.
 
 ## Precision contract
 
@@ -604,6 +539,36 @@ on the final chunk. The caller supplies the original sampling, grammar,
 allocation and request-lifetime inputs, and consumes its outputs. Submit chunks
 in order, retaining the owning allocations through the final completion.
 
+`CompactInput` registers reusable shared CPU BF16 embedding rows before
+Worker preparation. Fill it for each request and retire its copies before
+reuse. `l3_expand_compact_input` writes FP32 HC rows into the existing
+device allocation. The caller may instead use `l3_lookup_prefill_input`
+with resident embedding weights. `PreparedInputPlan.fill` updates token IDs
+and runtime epochs for a fixed geometry, and `DeviceMetadataArena` exposes
+typed views for uploading the resulting metadata.
+
+`l3_initialize_prefill_caches` initializes caller-owned buffers once for a
+fresh request, before the first chunk. It writes zero bytes in the
+non-state buffers and a zero/value plus finite FP32 score-sentinel pattern
+in the compressor-state rows. Retain the original decode allocations and
+complete initialization before any prefill consumer reads their views.
+
+The prefill-only `--prefill-oproj-a-batched` and `--prefill-oproj-b-batched`
+flags group their respective projection tasks while preserving weight layout,
+quantization, ordered partial reduction and output dtypes. The
+`--prefill-moe-owner-reduce` option sends FP32 partials to contiguous token
+owners. Owners sum in
+ascending rank order, round once to BF16, and publish the resulting rows.
+Direct HC post requires owner reduction. Expert affinity, batched gather,
+and parallel route scheduling preserve route identities and combine order.
+These options default off.
+
+For shared MoE gating, bind the per-rank `gate_epoch_bases` with
+`prepare_gate_bindings`. Use `advance_gate_epoch` after each successful
+whole-chunk dispatch when retaining the communication domain. Start at zero
+in a fresh domain. Pass the matching gate epoch to `PreparedInputPlan.fill`
+when using prepared metadata.
+
 CSA coordinates 128-query indexer blocks with two bounded gather slots.
 Gather waits for that block's exact top-512 selection and the previous consumer
 of its slot. QK/PV waits for its gather and the preceding attention block.
@@ -628,22 +593,8 @@ artifacts and JIT caches. Experimental callers select explicit AgentX trace and
 request identities; input length, padding and chunk boundaries must come from
 the actual reconstructed input, with no fixed short-prompt fallback.
 
-The report records chunk/tile sizes, the exact-prefetch mode, two slots, and
-the retained eight projection replicas. Code generation, native compilation,
-and host binding checks alone do not establish device equivalence. The relocated
-private operators passed a rebuilt four-board TP8 device replay. A reconstructed
-AgentX request of 16,384 tokens passed full-output and cache byte-digest checks
-against the frozen TP8 component baseline. On the same Worker, 64 subsequent
-single-query decode steps retained the original weight/cache allocations and
-matched a copied-cache control for all sampled IDs and final logits, hidden
-states and cache contents. The timing loop omits per-step diagnostic readbacks;
-its host-stepped latency is not the original speculative serving TPOT.
-This qualifies the tested allocation handoff; longer contexts
-and complete serving sessions remain unvalidated. Histogram/EMA early prefetch remains device-unqualified. Tile-specific cache
-publication dependencies are not implemented by this option.
-Their configuration must not be advertised as available or selected from
-unmeasured cost estimates.
-
+The report records the selected prefill plan and generated argument layout.
+Use the actual generated metadata to provision buffers and bind arguments.
 
 ### Deployment
 
