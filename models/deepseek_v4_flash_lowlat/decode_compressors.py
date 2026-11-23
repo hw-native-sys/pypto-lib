@@ -2061,7 +2061,7 @@ def validate_ratio128():
     import argparse
     from golden import ratio_allclose, run
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("--sim", action="store_true")

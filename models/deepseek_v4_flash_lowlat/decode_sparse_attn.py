@@ -1340,8 +1340,9 @@ def sparse_attn_hca_packed(
                                         qk_kv, cmp_kv_flat, [qk_cr, 0], [qk_src, 0], [1, HEAD_DIM]
                                     )
                                 else:
+                                    qk_safe_row = qk_t * H + head_base
                                     qk_kv = pl.gather_row(
-                                        qk_kv, ori_kv_flat, [qk_cr, 0], [0, 0], [1, HEAD_DIM]
+                                        qk_kv, q_flat, [qk_cr, 0], [qk_safe_row, 0], [1, HEAD_DIM]
                                     )
                                     if qk_cr < qk_valid:
                                         pl.write(qk_columns, [0, qk_cr], 0.0)
@@ -2064,6 +2065,7 @@ def build_tensor_specs_hca(
     *,
     full_cmp_tail: bool = False,
     unmapped_compressed_fixture: bool = False,
+    replay: bool = False,
 ):
     """Build deterministic demo tensors for the HCA standalone harness."""
     if HCA_CMP_TOPK == 0:
@@ -2079,12 +2081,12 @@ def build_tensor_specs_hca(
         live_counts[0] = 0
     max_live = max(live_counts)
     blocks_per_request = (max_live + HCA_CMP_STORAGE_BLOCK_SIZE - 1) // HCA_CMP_STORAGE_BLOCK_SIZE
-    if blocks_per_request > CMP_MAX_BLOCKS:
+    if not replay and blocks_per_request > CMP_MAX_BLOCKS:
         raise ValueError(
             f"HCA fixture requires {blocks_per_request} compressed table blocks per request, "
             f"but the table has {CMP_MAX_BLOCKS}"
         )
-    if B * blocks_per_request > CMP_BLOCK_NUM:
+    if not replay and B * blocks_per_request > CMP_BLOCK_NUM:
         raise ValueError(
             f"HCA fixture requires {B * blocks_per_request} compressed KV pool blocks, "
             f"but the pool has {CMP_BLOCK_NUM}"
@@ -2108,6 +2110,8 @@ def build_tensor_specs_hca(
     def init_ori_kv():
         """Initialize the sliding-window KV cache pages."""
         kv = torch.rand(ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5
+        if unmapped_compressed_fixture:
+            kv[0, 0].fill_(float("nan"))
         if causal_regression_fixture:
             kv[0, WIN - 1, 0].fill_(8.0)
         if cache_window_replacement_fixture:
@@ -2148,7 +2152,10 @@ def build_tensor_specs_hca(
 
     def init_window_block_table():
         """Build the demo block table for the sliding-window cache pages."""
-        return block_table(batch=B, table_blocks=ORI_MAX_BLOCKS, physical_blocks=ORI_BLOCK_NUM)
+        table = block_table(batch=B, table_blocks=ORI_MAX_BLOCKS, physical_blocks=ORI_BLOCK_NUM)
+        if unmapped_compressed_fixture:
+            table[:, 0] += 1
+        return table
 
     def init_cmp_block_table():
         """Build the demo block table for the compressed-cache pages."""
@@ -2298,7 +2305,7 @@ def validate_hca():
     from models.deepseek_v4_flash_lowlat.utils import validation_subprocess_command
     from golden import ratio_allclose, run
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("--sim", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
@@ -2358,8 +2365,9 @@ def validate_hca():
         args.short_window_fixture,
         args.mixed_topk_fixture,
         args.cache_window_replacement_fixture,
-        full_cmp_tail=args.full_cmp_tail or args.golden_data is not None,
+        full_cmp_tail=args.full_cmp_tail,
         unmapped_compressed_fixture=args.unmapped_compressed_fixture,
+        replay=args.golden_data is not None,
     )
 
     print(f"compress_ratio={HCA_COMPRESS_RATIO} -> TOPK={HCA_TOPK} SPARSE_BLOCKS={HCA_SPARSE_BLOCKS} PADDED_TOPK={HCA_PADDED_TOPK}", flush=True)
