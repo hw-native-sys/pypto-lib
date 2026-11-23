@@ -10,9 +10,8 @@
 
     output = matmul(attn_out, wo) + hidden_states
 
-The SPMD blocks split the N tiles across workers. Within each tile, a tiled
-K-reduction matmul feeds the residual add on chip. Inputs are BF16 and the
-output is FP32.
+Each N tile runs a tiled K-reduction matmul then adds the residual inside a
+single pl.at block, keeping the matmul output on chip. Inputs BF16; output FP32.
 """
 import pypto.language as pl
 
@@ -20,7 +19,6 @@ BATCH = 16
 HIDDEN = 8192
 K_TILE = 128         # K dimension tile size for matmul
 N_TILE = 64          # N dimension tile size for matmul output
-N_WORKERS = 32
 
 
 @pl.jit
@@ -30,9 +28,8 @@ def gemm_eltwise(
     wo: pl.Tensor[[HIDDEN, HIDDEN], pl.BF16],
     resid: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.FP32]],
 ):
-    for block in pl.spmd(N_WORKERS, name_hint="gemm_eltwise_tile"):
-        for tile in pl.range(block, HIDDEN // N_TILE, N_WORKERS):
-            n0 = tile * N_TILE
+    for n0 in pl.parallel(0, HIDDEN, N_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="gemm_eltwise_tile"):
             # tiled K-reduction matmul: attn_out @ wo[:, n-tile]
             acc = pl.create_tensor([BATCH, N_TILE], dtype=pl.FP32)
             for kb in pl.range(HIDDEN // K_TILE):
@@ -41,13 +38,9 @@ def gemm_eltwise(
                 tile_w = wo[k0 : k0 + K_TILE, n0 : n0 + N_TILE]
                 acc = pl.matmul_acc(acc, tile_a, tile_w, init_cond=(kb == 0))
 
-            # Fuse the residual add across both vector lanes.
-            for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
-                acc_rows = pl.aiv_shard(acc)
-                row = lane * (BATCH // 2)
-                hidden_rows = pl.slice(hidden_states, [BATCH // 2, N_TILE], [row, n0])
-                hidden_tile = pl.cast(hidden_rows, target_type=pl.FP32)
-                resid = pl.assemble(resid, pl.add(acc_rows, hidden_tile), [row, n0])
+            # fuse the residual add while the matmul output is still on chip
+            hidden_tile = pl.cast(hidden_states[:, n0 : n0 + N_TILE], target_type=pl.FP32)
+            resid[:, n0 : n0 + N_TILE] = pl.add(acc, hidden_tile)
     return resid
 
 
