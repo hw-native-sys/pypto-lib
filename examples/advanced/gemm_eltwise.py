@@ -10,8 +10,9 @@
 
     output = matmul(attn_out, wo) + hidden_states
 
-Each N tile runs a tiled K-reduction matmul then adds the residual inside a
-single pl.at block, keeping the matmul output on chip. Inputs BF16; output FP32.
+The SPMD blocks split the N tiles across workers. Within each tile, a tiled
+K-reduction matmul feeds the residual add on chip. Inputs are BF16 and the
+output is FP32.
 """
 import pypto.language as pl
 
@@ -19,6 +20,7 @@ BATCH = 16
 HIDDEN = 8192
 K_TILE = 128         # K dimension tile size for matmul
 N_TILE = 64          # N dimension tile size for matmul output
+N_WORKERS = 32
 
 
 @pl.jit
@@ -28,8 +30,9 @@ def gemm_eltwise(
     wo: pl.Tensor[[HIDDEN, HIDDEN], pl.BF16],
     resid: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.FP32]],
 ):
-    for n0 in pl.parallel(0, HIDDEN, N_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="gemm_eltwise_tile"):
+    for block in pl.spmd(N_WORKERS, name_hint="gemm_eltwise_tile"):
+        for tile in pl.range(block, HIDDEN // N_TILE, N_WORKERS):
+            n0 = tile * N_TILE
             # tiled K-reduction matmul: attn_out @ wo[:, n-tile]
             acc = pl.create_tensor([BATCH, N_TILE], dtype=pl.FP32)
             for kb in pl.range(HIDDEN // K_TILE):
