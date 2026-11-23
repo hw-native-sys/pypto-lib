@@ -18,10 +18,10 @@ from projection_exchange import (
 from models.deepseek_v4_flash_lowlat.kv_proj_rope import kv_proj_rope
 from qkv_proj_rope import kv_proj_rope_cp
 
-from projection_weight_layout import PROJECTION_WEIGHT_LAYOUT
+from projection_exchange import PROJECTION_WEIGHT_LAYOUT
 import pypto.language.distributed as pld
 
-from models.deepseek_v4_flash_lowlat.model_config import FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
+from models.deepseek_v4_flash_lowlat.config import FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
 from prefill_shapes import BLOCK_SIZE, KV_CMP_BLOCK_NUM, KV_ORI_BLOCK_NUM
 
 from models.deepseek_v4_flash_lowlat.hc_post_common import golden_hc_post, hc_post
@@ -33,8 +33,8 @@ from prefill_cp_token_allgather import (
     materialize_spec,
     prefill_cp_token_allgather_step,
 )
-from prefill_metadata import REQUESTS_DYN
-from prefill_o_proj import (
+from prefill_cp_token_allgather import REQUESTS_DYN
+from projection_exchange import (
     O_PROJ_LOCAL_GROUPS,
     O_PROJ_SCRATCH_D,
     O_PROJ_SCRATCH_GROUPS,
@@ -60,7 +60,7 @@ from qkv_proj_rope import (
     qkv_proj_rope,
     rope_prepare,
 )
-from rmsnorm import golden_rms_norm, rms_norm
+from models.deepseek_v4_flash_lowlat.rmsnorm_common import golden_rms_norm, rms_norm
 
 
 PROJECTION_D = projection_degree("swa")

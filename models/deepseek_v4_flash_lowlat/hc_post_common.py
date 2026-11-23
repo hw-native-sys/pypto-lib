@@ -12,7 +12,7 @@ from math import gcd
 
 import pypto.language as pl
 
-from .model_config import FLASH as M
+from .config import FLASH as M
 
 T_DYN = pl.dynamic("HC_POST_T_DYN")
 

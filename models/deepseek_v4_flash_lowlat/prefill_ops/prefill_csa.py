@@ -20,10 +20,10 @@ from projection_exchange import (
 from models.deepseek_v4_flash_lowlat.kv_proj_rope import kv_proj_rope
 from qkv_proj_rope import kv_proj_rope_cp
 
-from projection_weight_layout import PROJECTION_WEIGHT_LAYOUT
+from projection_exchange import PROJECTION_WEIGHT_LAYOUT
 from utils import checkpoint_ends_tensor
 
-from models.deepseek_v4_flash_lowlat.model_config import FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
+from models.deepseek_v4_flash_lowlat.config import FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
 from prefill_shapes import (
     BLOCK_SIZE,
     CSA_INNER_STATE_BLOCKS_PER_REQUEST,
@@ -31,9 +31,9 @@ from prefill_shapes import (
     KV_ORI_BLOCK_NUM,
 )
 
-from prefill_compressor_ratio4 import compressor_ratio4_cp
-from prefill_indexer_compressor import prefill_indexer_compressor_cp
-from prefill_compressor_ratio4 import (
+from prefill_compressors import compressor_ratio4_cp
+from prefill_compressors import prefill_indexer_compressor_cp
+from prefill_compressors import (
     CSA_STATE_BLOCK_NUM,
     CSA_STATE_BLOCK_SIZE,
     CSA_STATE_MAX_BLOCKS,
@@ -59,18 +59,20 @@ from prefill_indexer import (
     prepare_indexer_query_rope,
     topk_prefix_contract_error,
 )
-from prefill_indexer_compressor import (
+from prefill_compressors import (
     INNER_STATE_BLOCK_NUM,
     INNER_STATE_BLOCK_SIZE,
     INNER_STATE_MAX_BLOCKS,
     prefill_indexer_compressor,
 )
-from prefill_metadata import (
-    CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE,
-    QUERY_START_LOC_DYN, REQUESTS_DYN,
+from prefill_cp_token_allgather import (
+    CHECKPOINT_TILES_DYN,
+    CHECKPOINTS_PER_TILE,
+    QUERY_START_LOC_DYN,
+    REQUESTS_DYN,
 )
 from qkv_proj_rope import golden_qkv_proj_rope, qkv_proj_rope
-from rmsnorm import golden_rms_norm, rms_norm
+from models.deepseek_v4_flash_lowlat.rmsnorm_common import golden_rms_norm, rms_norm
 from prefill_sparse_attn import (
     PREFILL_ATTN_BLOCKS,
     PREFILL_ATTN_TILE,
@@ -100,7 +102,7 @@ from prefill_cp_token_allgather import (
     _parse_int_argv,
     prefill_cp_token_allgather_step,
 )
-from prefill_o_proj import (
+from projection_exchange import (
     O_PROJ_LOCAL_GROUPS,
     O_PROJ_SCRATCH_D,
     O_PROJ_SCRATCH_GROUPS,
@@ -1692,7 +1694,7 @@ def build_tensor_specs(
 
     # Quant-faithful CSA (ratio-4) main compressor fixtures (mean l8/l32 of extract_weights_flash):
     # zero-mean Gaussian BF16 weights at the measured std; RMSNorm gamma near the measured mean.
-    # Mirrors decode_csa / decode_compressor_ratio4.
+    # Mirrors decode_csa / decode_compressors.
     def init_cmp_wkv():
         return torch.randn(MAIN_OUT_DIM, D) * 0.0240
 

@@ -11,9 +11,9 @@
 import pypto.language as pl
 
 if __package__:
-    from .config import FLASH as M
+    from .decode_shapes import DECODE_CONFIG as M
 else:
-    from config import FLASH as M
+    from decode_shapes import DECODE_CONFIG as M
 if __package__:
     from .decode_shapes import (
         BLOCK_SIZE,

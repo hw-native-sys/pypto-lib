@@ -11,9 +11,9 @@
 
 import pypto.language as pl
 
-from models.deepseek_v4_flash_lowlat.model_config import FLASH as M, FP32_NEG_INF, INT8_AMAX_EPS, INT8_SCALE_MAX
+from models.deepseek_v4_flash_lowlat.config import FLASH as M, FP32_NEG_INF, INT8_AMAX_EPS, INT8_SCALE_MAX
 from prefill_shapes import BLOCK_SIZE, HCA_CMP_STORAGE_BLOCK_SIZE, KV_ORI_BLOCK_NUM
-from prefill_metadata import REQUESTS_DYN
+from prefill_cp_token_allgather import REQUESTS_DYN
 from models.deepseek_v4_flash_lowlat.config import _parse_int_argv
 
 # Longest sequence the model config admits; the host-side bound on token_count.

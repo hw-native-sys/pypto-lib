@@ -17,9 +17,9 @@ import math
 from typing import Any, Callable
 
 import torch
-from prefill_metadata import CHECKPOINTS_PER_TILE, METADATA_TOKEN_TILE
+from prefill_cp_token_allgather import CHECKPOINTS_PER_TILE, METADATA_TOKEN_TILE
 
-from models.deepseek_v4_flash_lowlat.model_config import FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
+from models.deepseek_v4_flash_lowlat.config import FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
 from prefill_shapes import BLOCK_SIZE, DECODE_BATCH, DECODE_SEQ
 
 

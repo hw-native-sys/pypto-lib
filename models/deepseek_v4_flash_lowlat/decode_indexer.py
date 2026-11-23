@@ -13,9 +13,11 @@ The inner Compressor is invoked via golden_compressor (placeholder)."""
 import pypto.language as pl
 
 if __package__:
-    from .config import FLASH as M, FP32_NEG_INF, INT8_SCALE_MAX, INT8_AMAX_EPS
+    from .decode_shapes import DECODE_CONFIG as M
+    from .config import FP32_NEG_INF, INT8_SCALE_MAX, INT8_AMAX_EPS
 else:
-    from config import FLASH as M, FP32_NEG_INF, INT8_SCALE_MAX, INT8_AMAX_EPS
+    from decode_shapes import DECODE_CONFIG as M
+    from config import FP32_NEG_INF, INT8_SCALE_MAX, INT8_AMAX_EPS
 if __package__:
     from .decode_shapes import (
         DECODE_BATCH,
@@ -28,13 +30,13 @@ if __package__:
 else:
     from decode_shapes import DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, C4A_COMPRESSOR_BLOCK_SIZE, DECODE_IDX_BLOCK_NUM, IDX_CACHE_MAX_BLOCKS
 if __package__:
-    from .decode_indexer_compressor import indexer_compressor, indexer_cache_compare_fn
+    from .decode_compressors import indexer_compressor, indexer_cache_compare_fn
 else:
-    from decode_indexer_compressor import indexer_compressor, indexer_cache_compare_fn
+    from decode_compressors import indexer_compressor, indexer_cache_compare_fn
 if __package__:
-    from .rope_interleave import rope_interleave
+    from .kv_proj_rope import rope_interleave
 else:
-    from rope_interleave import rope_interleave
+    from kv_proj_rope import rope_interleave
 
 # model config
 if __package__:
@@ -849,9 +851,9 @@ def golden_indexer(tensors):
     import torch
 
     if __package__:
-        from .decode_indexer_compressor import golden_compressor
+        from .decode_compressors import golden_compressor_indexer as golden_compressor
     else:
-        from decode_indexer_compressor import golden_compressor
+        from decode_compressors import golden_compressor_indexer as golden_compressor
     if __package__:
         from .utils import bf16_matmul_fp32, int8_quant_per_row
     else:
@@ -1402,9 +1404,9 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     if __package__:
-        from .config import CONTEXT_CAPACITY
+        from .decode_shapes import CONTEXT_CAPACITY
     else:
-        from config import CONTEXT_CAPACITY
+        from decode_shapes import CONTEXT_CAPACITY
 
     parser.add_argument("--max-seq-len", type=int, default=CONTEXT_CAPACITY, help="import-time context capacity (default 1048576)")
     args = parser.parse_args()

@@ -20,9 +20,9 @@ from projection_exchange import (
 )
 
 from models.deepseek_v4_flash_lowlat.kv_proj_rope import kv_proj_rope
-from projection_weight_layout import PROJECTION_WEIGHT_LAYOUT
+from projection_exchange import PROJECTION_WEIGHT_LAYOUT
 
-from models.deepseek_v4_flash_lowlat.model_config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+from models.deepseek_v4_flash_lowlat.config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
 from prefill_shapes import DECODE_BATCH, DECODE_SEQ, TP
 
 

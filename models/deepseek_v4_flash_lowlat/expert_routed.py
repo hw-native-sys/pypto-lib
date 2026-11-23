@@ -6,15 +6,11 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 MoE routed expert compute over a TP slice of the intermediate dim.
-
-Every rank holds every expert and a 1/TP slice of the intermediate dim, so
-``recv_y`` is a partial sum that ``moe`` all-reduces across the TP group. Rows
-arrive already grouped: slot ``i`` holds the rows routed to expert
-``slot_expert[i]``, and inactive slots carry a zero count.
-"""
+"""Routed and persistent expert execution and validation."""
 
 import pypto.language as pl
+
+
 if __package__:
     from .fp32_numerics import rne_exp_signed
 else:
@@ -640,7 +636,290 @@ def build_tensor_specs(merged=False):
     ]
 
 
-if __name__ == "__main__":
+if __package__:
+    from .config import INT8_SCALE_MAX, INT8_AMAX_EPS
+else:
+    from config import INT8_SCALE_MAX, INT8_AMAX_EPS
+
+
+NUM_CORES = 24
+WORK_SLOTS_PAD = (N_SLOTS_B + IDX_PAD - 1) // IDX_PAD * IDX_PAD
+
+# One cluster = 1 cube core + 2 buddy vector cores.
+AIV_LANES = 2
+ROW_HALF = RECV_TILE // AIV_LANES
+
+# Whole-shard tiles preserve the guarded native TP8 Cube contract. Wider
+# shards retain all columns and quantize only after a full-shard maximum.
+FUSED_N_TILE = min(256, MOE_INTER)
+# Two double-buffered INT32 accumulators share the 128 KiB L0C.
+assert 4 * RECV_TILE * FUSED_N_TILE * 4 <= 131072, "gate/up accumulator tiles exceed L0C"
+FUSED_K_TILE = max(64, min(512, 131072 // FUSED_N_TILE))
+FUSED_Y_TILE = max(64, min(512, 131072 // MOE_INTER))
+
+
+@pl.jit.inline(auto_scope=False)
+def expert_routed_persistent_planned(
+    recv_x: pl.Tensor[[N_SLOTS_B, RECV_MAX, D], pl.INT8],
+    recv_scale_dq: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
+    recv_weights: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
+    work_slot: pl.Tensor[[WORK_SLOTS_PAD], pl.INT32],
+    work_rows: pl.Tensor[[WORK_SLOTS_PAD], pl.INT32],
+    slot_expert: pl.Tensor[[N_SLOTS_B, IDX_PAD], pl.INT32],
+    routed_w1: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_BANK, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_BANK, D], pl.FP32],
+    recv_y: pl.Tensor[[N_SLOTS_B, RECV_MAX, D], pl.BF16],
+):
+    recv_x_flat = pl.reshape(recv_x, [N_SLOTS_B * RECV_MAX, D])
+    recv_y_flat = pl.reshape(recv_y, [N_SLOTS_B * RECV_MAX, D])
+
+    # Fold the expert axis into the row axis so every matmul operand is 2-D and
+    # the accumulator comes back 2-D (no [1, RECV_TILE, TILE] reshape unwrap).
+    w1_2d = pl.reshape(routed_w1, [N_BANK * MOE_INTER, D])
+    w3_2d = pl.reshape(routed_w3, [N_BANK * MOE_INTER, D])
+    w2_2d = pl.reshape(routed_w2, [N_BANK * D, MOE_INTER])
+
+    with pl.scope():
+        # Keep the native whole-shard cohort; wide tiles use available clusters.
+        grid_count = NUM_CORES
+        if MOE_INTER > FUSED_N_TILE:
+            grid_count = pl.cast(pl.system.available_cluster_count(), pl.INDEX)
+        with pl.spmd(
+            grid_count, name_hint="exp_routed_balanced", sync_start=True,
+            allow_early_resolve=True,
+        ):
+            core = pl.tile.get_block_idx()
+            num_cores = NUM_CORES
+            if MOE_INTER > FUSED_N_TILE:
+                num_cores = pl.cast(pl.tile.get_block_num(), pl.INDEX)
+
+            for w in pl.range(core, N_SLOTS_B, num_cores):
+                s = pl.cast(pl.read(work_slot, [w]), pl.INDEX)
+                eid = pl.cast(pl.read(slot_expert, [s, 0]), pl.INDEX)
+                n_rows = pl.read(work_rows, [w])
+                e_w1 = eid * MOE_INTER
+                e_w2 = eid * D
+                slot_base = s * RECV_MAX
+
+                # 0-or-1 trip: the zero case IS the empty-slot skip.
+                for t in pl.range((n_rows + RECV_TILE - 1) // RECV_TILE):
+                    t0 = t * RECV_TILE
+                    flat_t0 = slot_base + t0
+                    valid_rows = pl.min(RECV_TILE, n_rows - t0)
+
+                    h_full = pl.create_tensor([ROW_HALF, MOE_INTER], dtype=pl.FP32)
+                    h_gathered = pl.create_tensor([RECV_TILE, FUSED_N_TILE], dtype=pl.INT8)
+                    h_gathered_full = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT8)
+                    row_scale = pl.create_tensor([ROW_HALF, 1], dtype=pl.FP32)
+
+                    for inter_start in pl.unroll(0, MOE_INTER, FUSED_N_TILE):
+                        inter_base = e_w1 + inter_start
+                        gate_acc = pl.create_tensor([RECV_TILE, FUSED_N_TILE], dtype=pl.INT32)
+                        for kb in pl.pipeline(0, D // FUSED_K_TILE, stage=2):
+                            k0 = kb * FUSED_K_TILE
+                            x_k = pl.slice(recv_x_flat, [RECV_TILE, FUSED_K_TILE], [flat_t0, k0],
+                                           valid_shape=[valid_rows, FUSED_K_TILE])
+                            w1_k = w1_2d[inter_base : inter_base + FUSED_N_TILE, k0 : k0 + FUSED_K_TILE]
+                            gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True, init_cond=(kb == 0))
+
+                        up_acc = pl.create_tensor([RECV_TILE, FUSED_N_TILE], dtype=pl.INT32)
+                        for ukb in pl.pipeline(0, D // FUSED_K_TILE, stage=2):
+                            uk0 = ukb * FUSED_K_TILE
+                            x_u = pl.slice(recv_x_flat, [RECV_TILE, FUSED_K_TILE], [flat_t0, uk0],
+                                           valid_shape=[valid_rows, FUSED_K_TILE])
+                            w3_k = w3_2d[inter_base : inter_base + FUSED_N_TILE, uk0 : uk0 + FUSED_K_TILE]
+                            up_acc = pl.matmul_acc(up_acc, x_u, w3_k, b_trans=True, init_cond=(ukb == 0))
+
+                        w1_sc = routed_w1_scale[eid : eid + 1, inter_start : inter_start + FUSED_N_TILE]
+                        w3_sc = routed_w3_scale[eid : eid + 1, inter_start : inter_start + FUSED_N_TILE]
+
+                        # ---- vector phase 1: dequant + SwiGLU + per-row A8 requant ----
+                        # UP_DOWN halves the shard on rows, so each lane holds ROW_HALF
+                        # COMPLETE rows and pl.row_max is a within-lane reduction.
+                        for aiv_id in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
+                            # A lane-derived read address is what marks the load
+                            # per-lane for the region's half-width scan. Column-sliced
+                            # in place rather than through a 1-D view of the whole
+                            # table: a 2-D -> 1-D reshape of an inline parameter loses
+                            # its inferred metadata once moe.py nests this call.
+                            lane_r0 = pl.cast(aiv_id * ROW_HALF, pl.INDEX)
+                            if MOE_INTER > FUSED_N_TILE:
+                                if inter_start == 0:
+                                    h_full = pl.full([ROW_HALF, MOE_INTER], dtype=pl.FP32, value=0.0)
+
+                            x_sc = pl.reshape(
+                                recv_scale_dq[s : s + 1, lane_r0 : lane_r0 + ROW_HALF],
+                                [ROW_HALF, 1])
+                            w_col = pl.reshape(
+                                recv_weights[s : s + 1, lane_r0 : lane_r0 + ROW_HALF],
+                                [ROW_HALF, 1])
+                            gate_sh = pl.aiv_shard(gate_acc)
+                            up_sh = pl.aiv_shard(up_acc)
+                            gate_f = pl.cast(gate_sh, target_type=pl.FP32, mode="none")
+                            up_f = pl.cast(up_sh, target_type=pl.FP32, mode="none")
+                            gate_f = pl.col_expand_mul(pl.row_expand_mul(gate_f, x_sc), w1_sc)
+                            up_f = pl.col_expand_mul(pl.row_expand_mul(up_f, x_sc), w3_sc)
+                            if SWIGLU_LIMIT > 0.0:
+                                gate_f = pl.minimum(gate_f, SWIGLU_LIMIT)
+                                up_f = pl.maximum(pl.minimum(up_f, SWIGLU_LIMIT), -SWIGLU_LIMIT)
+                            sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_f)), 1.0))
+                            h_raw = pl.mul(pl.mul(gate_f, sigmoid), up_f)
+                            if MOE_INTER == FUSED_N_TILE:
+                                # valid_shape rides the matmul's A operand through the c2v push
+                                # and the per-lane pop, so h_raw already carries this lane's
+                                # row extent; re-marking it is rejected ("cannot re-narrow a
+                                # popped tile"). Mask the tail, then re-widen so the narrowed
+                                # extent does not leave the pad rows of y undefined.
+                                h_pad = pl.fillpad(h_raw, pad_value=pl.PadValue.zero)
+                                h_f32 = pl.set_validshape(h_pad, ROW_HALF, FUSED_N_TILE)
+
+                                h_abs = pl.maximum(h_f32, pl.neg(h_f32))
+                                h_amax = pl.maximum(
+                                    pl.full([1, ROW_HALF], dtype=pl.FP32, value=INT8_AMAX_EPS),
+                                    pl.reshape(pl.row_max(h_abs), [1, ROW_HALF]),
+                                )
+                                sq_row = pl.div(
+                                    pl.full([1, ROW_HALF], dtype=pl.FP32, value=INT8_SCALE_MAX), h_amax
+                                )
+                                h_scale_dq = pl.reshape(pl.recip(sq_row), [ROW_HALF, 1])
+                                sq_col = pl.reshape(sq_row, [ROW_HALF, 1])
+                                q_scaled = pl.row_expand_mul(h_f32, sq_col)
+                                q_i32 = pl.cast(q_scaled, target_type=pl.INT32, mode="rint")
+                                q_f16 = pl.cast(q_i32, target_type=pl.FP16, mode="round")
+                                h_i8 = pl.cast(q_f16, target_type=pl.INT8, mode="trunc")
+
+                                row_scale = pl.mul(h_scale_dq, w_col)
+
+                                # V->C: the two lanes' row bands are stitched back into one
+                                # full RECV_TILE operand in L1 for the down matmul.
+                                h_gathered = pl.aic_gather(h_i8)
+                            else:
+                                h_full[:, inter_start : inter_start + FUSED_N_TILE] = h_raw
+
+                    if MOE_INTER > FUSED_N_TILE:
+                        # Reduce the whole shard before quantizing any column tile.
+                        for aiv_quant in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
+                            lane_r0 = pl.cast(aiv_quant * ROW_HALF, pl.INDEX)
+                            w_col = pl.reshape(recv_weights[s : s + 1, lane_r0 : lane_r0 + ROW_HALF], [ROW_HALF, 1])
+                            h_amax = pl.full([1, ROW_HALF], dtype=pl.FP32, value=INT8_AMAX_EPS)
+                            for amax_start in pl.range(0, MOE_INTER, FUSED_N_TILE):
+                                h_amax_chunk = h_full[:, amax_start : amax_start + FUSED_N_TILE]
+                                h_abs = pl.maximum(h_amax_chunk, pl.neg(h_amax_chunk))
+                                h_chunk_max = pl.reshape(pl.row_max(h_abs), [1, ROW_HALF])
+                                h_amax = pl.maximum(h_amax, h_chunk_max)
+                            sq_row = pl.div(
+                                pl.full([1, ROW_HALF], dtype=pl.FP32, value=INT8_SCALE_MAX), h_amax
+                            )
+                            h_scale_dq = pl.reshape(pl.recip(sq_row), [ROW_HALF, 1])
+                            sq_col = pl.reshape(sq_row, [ROW_HALF, 1])
+                            h_f16 = pl.create_tensor([ROW_HALF, MOE_INTER], dtype=pl.FP16)
+                            for q_start in pl.range(0, MOE_INTER, FUSED_N_TILE):
+                                h_chunk = h_full[:, q_start : q_start + FUSED_N_TILE]
+                                q_scaled = pl.row_expand_mul(h_chunk, sq_col)
+                                q_i32 = pl.cast(q_scaled, target_type=pl.INT32, mode="rint")
+                                q_f16 = pl.cast(q_i32, target_type=pl.FP16, mode="round")
+                                h_f16[:, q_start : q_start + FUSED_N_TILE] = q_f16
+
+                            h_i8_full = pl.cast(h_f16, target_type=pl.INT8, mode="trunc")
+                            row_scale = pl.mul(h_scale_dq, w_col)
+
+                            # V->C: the two lanes' row bands are stitched back into one
+                            # full RECV_TILE operand in L1 for the down matmul.
+                            h_gathered_full = pl.aic_gather(h_i8_full)
+
+                    for db in pl.pipeline(D // FUSED_Y_TILE, stage=2):
+                        d0 = db * FUSED_Y_TILE
+                        if MOE_INTER == FUSED_N_TILE:
+                            w2_k = w2_2d[e_w2 + d0 : e_w2 + d0 + FUSED_Y_TILE, 0:FUSED_N_TILE]
+                            y_acc = pl.matmul(h_gathered, w2_k, b_trans=True, out_dtype=pl.INT32)
+                        else:
+                            w2_full = w2_2d[e_w2 + d0 : e_w2 + d0 + FUSED_Y_TILE, 0:MOE_INTER]
+                            y_acc = pl.matmul(h_gathered_full, w2_full, b_trans=True, out_dtype=pl.INT32)
+                        w2_sc = routed_w2_scale[eid : eid + 1, d0 : d0 + FUSED_Y_TILE]
+
+                        # ---- vector phase 2: dequant + store ----
+                        # Same row split, so this lane's row_scale from phase 1 lines
+                        # up with this lane's half of the accumulator.
+                        for aiv_id2 in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
+                            y_off = flat_t0 + pl.cast(aiv_id2 * ROW_HALF, pl.INDEX)
+                            y_sh = pl.aiv_shard(y_acc)
+                            y_f = pl.cast(y_sh, target_type=pl.FP32, mode="none")
+                            y_f = pl.col_expand_mul(pl.row_expand_mul(y_f, row_scale), w2_sc)
+                            recv_y_flat[y_off : y_off + ROW_HALF, d0 : d0 + FUSED_Y_TILE] = \
+                                pl.cast(y_f, target_type=pl.BF16, mode="rint")
+
+    return recv_y
+
+
+@pl.jit.inline(auto_scope=False)
+def expert_routed_persistent_balanced(
+    recv_x: pl.Tensor[[N_SLOTS_B, RECV_MAX, D], pl.INT8],
+    recv_scale_dq: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
+    recv_weights: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
+    recv_expert_count: pl.Tensor[[N_SLOTS_B, IDX_PAD], pl.INT32],
+    slot_expert: pl.Tensor[[N_SLOTS_B, IDX_PAD], pl.INT32],
+    routed_w1: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_BANK, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_BANK, D], pl.FP32],
+    recv_y: pl.Tensor[[N_SLOTS_B, RECV_MAX, D], pl.BF16],
+):
+    work_slot = pl.create_tensor([WORK_SLOTS_PAD], dtype=pl.INT32)
+    work_rows = pl.create_tensor([WORK_SLOTS_PAD], dtype=pl.INT32)
+
+    with pl.spmd(1, name_hint="exp_balance_plan", allow_early_resolve=True) as plan_tid:
+        plan_core = pl.tile.get_block_idx()
+        zero_i32 = pl.cast(0, pl.INT32)
+        for pad in pl.range(plan_core, N_SLOTS_B):
+            pl.write(work_slot, [pad], zero_i32)
+            pl.write(work_rows, [pad], zero_i32)
+        n_live = pl.cast(0, pl.INDEX)
+        for scan in pl.range(plan_core, N_SLOTS_B):
+            scan_rows = pl.read(recv_expert_count, [scan, 0])
+            if scan_rows > 0:
+                pl.write(work_slot, [n_live], pl.cast(scan, pl.INT32))
+                pl.write(work_rows, [n_live], scan_rows)
+                n_live = n_live + 1
+
+    expert_routed_persistent_planned(
+        recv_x, recv_scale_dq, recv_weights, work_slot, work_rows, slot_expert,
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+        routed_w2, routed_w2_scale, recv_y,
+    )
+    return recv_y
+
+
+@pl.jit
+def expert_routed_persistent_balanced_test(
+    recv_x: pl.Tensor[[N_SLOTS_B, RECV_MAX, D], pl.INT8],
+    recv_scale_dq: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
+    recv_weights: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
+    recv_expert_count: pl.Tensor[[N_SLOTS_B, IDX_PAD], pl.INT32],
+    slot_expert: pl.Tensor[[N_SLOTS_B, IDX_PAD], pl.INT32],
+    routed_w1: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_BANK, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_BANK, D], pl.FP32],
+    recv_y: pl.Out[pl.Tensor[[N_SLOTS_B, RECV_MAX, D], pl.BF16]],
+):
+    expert_routed_persistent_balanced(
+        recv_x, recv_scale_dq, recv_weights, recv_expert_count, slot_expert,
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+        routed_w2, routed_w2_scale,
+        recv_y,
+    )
+    return recv_y
+
+
+def validate_routed():
     import argparse
     from golden import run
 
@@ -695,3 +974,148 @@ if __name__ == "__main__":
         if result.error:
             print(result.error)
         raise SystemExit(1)
+
+
+
+def validate_persistent():
+    import argparse
+
+    if __package__:
+        from .decode_shapes import TP
+    else:
+        from decode_shapes import TP
+    from golden import run
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--platform", type=str, default="a2a3",
+                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("--sim", action="store_true", default=False)
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--tp", type=int, default=TP, choices=[1, 2, 4, 8], help="tensor-parallel degree; config freezes it at import")
+    parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--save-data", action="store_true", default=False)
+    parser.add_argument("--golden-data", type=str, default=None,
+                        help="dir with cached in/{name}.pt + out/{name}.pt; reuses them "
+                             "instead of regenerating inputs + recomputing golden.")
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=4, default=0, choices=range(5))
+    parser.add_argument("--dump-passes", action="store_true", default=False)
+    args = parser.parse_args()
+
+    result = run(
+        compile_only=args.compile_only,
+        fn=expert_routed_persistent_balanced_test,
+        specs=build_tensor_specs(merged=True),
+        golden_fn=golden_expert_routed,
+        golden_data=args.golden_data,
+        save_data=args.save_data,
+        config=dict(
+            dump_passes=args.dump_passes,
+            backend_type=args.platform.removesuffix("sim"),
+            execution_mode=args.sim or args.platform.endswith("sim"),
+            device_id=args.device,
+            enable_chip_swimlane=args.enable_chip_swimlane,
+        ),
+        rtol=1e-3,
+        atol=1e-3,
+        compare_fn={
+            "recv_y": compare_recv_y,
+        },
+    )
+    if not result.passed:
+        if result.error:
+            print(result.error)
+        raise SystemExit(1)
+
+
+
+def benchmark_activation():
+    """Measure routed expert scheduling across different active-slot counts."""
+    import argparse
+
+    import torch
+    from golden import TensorSpec, run
+
+    if __package__:
+        from .utils import int8_quant_per_row
+    else:
+        from utils import int8_quant_per_row
+
+    p = argparse.ArgumentParser()
+    p.add_argument("--variant", required=True, choices=["expert_routed", "expert_routed_persistent_balanced"])
+    p.add_argument("--n-active", type=int, required=True)
+    p.add_argument("-d", "--device", type=int, default=0)
+    p.add_argument("--dense", action="store_true", help="active slots are 0..n-1, as moe.route_group emits them")
+    a = p.parse_args()
+    if not 0 <= a.n_active <= N_SLOTS:
+        p.error(f"--n-active must be between 0 and {N_SLOTS}")
+
+    # Only the balanced wrapper includes the shared-expert slot and bank entry.
+    merged = a.variant == "expert_routed_persistent_balanced"
+    n_slots = N_SLOTS_B if merged else N_SLOTS
+    n_bank = N_BANK if merged else N_EXPERTS
+
+    torch.manual_seed(1234)
+    counts = torch.zeros(n_slots, dtype=torch.int32)
+    live = (torch.arange(a.n_active) if a.dense else torch.randperm(N_SLOTS)[:a.n_active])
+    counts[live] = torch.randint(1, 9, (a.n_active,), dtype=torch.int32)
+    se = torch.randperm(N_EXPERTS)[:N_SLOTS].to(torch.int32)
+    if merged:
+        counts[SH_SLOT] = 8
+        se = torch.cat([se, torch.tensor([SHARED_EID], dtype=torch.int32)])
+    counts_2d = torch.zeros(n_slots, IDX_PAD, dtype=torch.int32); counts_2d[:, 0] = counts
+    se_2d = torch.zeros(n_slots, IDX_PAD, dtype=torch.int32); se_2d[:, 0] = se
+
+    x = torch.randn(n_slots, RECV_MAX, D, dtype=torch.bfloat16)
+    v3 = torch.arange(RECV_MAX).reshape(1, RECV_MAX, 1) < counts.reshape(n_slots, 1, 1)
+    xi, xs = int8_quant_per_row(x)
+    xi = torch.where(v3, xi, torch.zeros_like(xi)); v2 = v3.squeeze(-1)
+    xs = torch.where(v2, xs.squeeze(-1), torch.zeros_like(xs.squeeze(-1)))
+    wt = torch.where(v2, torch.rand(n_slots, RECV_MAX), torch.zeros(n_slots, RECV_MAX))
+
+    def bank(tail, std):
+        wi, ws = gen_routed_weight((n_slots, *tail), std)
+        bi = torch.zeros(n_bank, *tail, dtype=torch.int8)
+        bs = torch.zeros(n_bank, tail[0], dtype=torch.float32)
+        bi[se.long()] = wi; bs[se.long()] = ws
+        return bi, bs
+
+    w1, w1s = bank((MOE_INTER, D), 2.47e-2)
+    w3, w3s = bank((MOE_INTER, D), 2.46e-2)
+    w2, w2s = bank((D, MOE_INTER), 2.44e-2)
+
+    fn = expert_routed_persistent_balanced_test if merged else expert_routed_test
+    r = run(
+        fn=fn,
+        specs=[
+            TensorSpec("recv_x", [n_slots, RECV_MAX, D], torch.int8, init_value=lambda: xi),
+            TensorSpec("recv_scale_dq", [n_slots, RECV_MAX], torch.float32, init_value=lambda: xs.float()),
+            TensorSpec("recv_weights", [n_slots, RECV_MAX], torch.float32, init_value=lambda: wt),
+            TensorSpec("recv_expert_count", [n_slots, IDX_PAD], torch.int32, init_value=lambda: counts_2d),
+            TensorSpec("slot_expert", [n_slots, IDX_PAD], torch.int32, init_value=lambda: se_2d),
+            TensorSpec("routed_w1", [n_bank, MOE_INTER, D], torch.int8, init_value=lambda: w1),
+            TensorSpec("routed_w1_scale", [n_bank, MOE_INTER], torch.float32, init_value=lambda: w1s),
+            TensorSpec("routed_w3", [n_bank, MOE_INTER, D], torch.int8, init_value=lambda: w3),
+            TensorSpec("routed_w3_scale", [n_bank, MOE_INTER], torch.float32, init_value=lambda: w3s),
+            TensorSpec("routed_w2", [n_bank, D, MOE_INTER], torch.int8, init_value=lambda: w2),
+            TensorSpec("routed_w2_scale", [n_bank, D], torch.float32, init_value=lambda: w2s),
+            TensorSpec("recv_y", [n_slots, RECV_MAX, D], torch.bfloat16),
+        ],
+        golden_fn=golden_expert_routed,
+        config=dict(backend_type='a2a3', execution_mode=False, device_id=a.device),
+        rtol=1e-3, atol=1e-3,
+        compare_fn={"recv_y": compare_recv_y},
+    )
+    raise SystemExit(0 if r.passed else 1)
+
+
+if __name__ == "__main__":
+    from models.deepseek_v4_flash_lowlat.build import run_operator_validations
+
+    run_operator_validations(
+        {
+            'routed': validate_routed,
+            'persistent': validate_persistent,
+            'activation': benchmark_activation,
+        },
+        automatic=('routed', 'persistent'),
+    )

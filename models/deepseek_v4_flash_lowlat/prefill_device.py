@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """DSpark batch-one TP8/DP1 prefill device forward."""
 
-from .prefill_gate_exchange import retire_gate_reservation
+from .prefill_moe_geometry import retire_gate_reservation
 import pypto.language as pl
 from projection_exchange import (
     PROJECTION_KINDS, PROJECTION_RANKS, PROJECTION_SIGNAL_ROWS,
@@ -24,7 +24,7 @@ from models.deepseek_v4_flash_lowlat.prefill_moe import (
 N_LOCAL = N_BANK
 N_EXPERTS_GLOBAL = N_EXPERTS
 
-from .model_config import FLASH as MODEL_CONFIG
+from .config import FLASH as MODEL_CONFIG
 from prefill_swa import (
     prefill_attention_swa_cp,
 )
@@ -63,11 +63,11 @@ from prefill_cp_token_allgather import (
     PREFILL_GROUP_CAP,
     TP_SIZE,
 )
-from prefill_metadata import (
+from prefill_cp_token_allgather import (
     CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE,
     QUERY_START_LOC_DYN, REQUESTS_DYN, lower_local_request_ids,
 )
-from prefill_o_proj import (
+from projection_exchange import (
     O_PROJ_LOCAL_GROUPS,
     O_PROJ_SCRATCH_D,
     O_PROJ_SCRATCH_GROUPS,
@@ -79,7 +79,6 @@ from prefill_o_proj import (
     O_PROJ_WO_B_WINDOW_ROWS,
     retire_o_proj_weight_signals,
 )
-from hc_head import hc_head
 from lm_head import (
     GRAMMAR_SEGMENT_WORDS,
     GREEDY_GRID_ROWS,
@@ -90,9 +89,10 @@ from lm_head import (
     VOCAB as LM_HEAD_VOCAB,
     VOCAB_PER_TP,
     greedy_sample,
+    hc_head,
     lm_head,
 )
-from rmsnorm import rms_norm
+from .rmsnorm_common import rms_norm
 from prefill_sparse_attn import PREFILL_OPROJ_B_BATCHED, PREFILL_OPROJ_A_BATCHED
 
 

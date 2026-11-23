@@ -1157,9 +1157,9 @@ if __name__ == "__main__":
                         help="persist inputs and golden outputs for replay")
     parser.add_argument("--dump-passes", action="store_true", default=False)
     if __package__:
-        from .config import CONTEXT_CAPACITY
+        from .decode_shapes import CONTEXT_CAPACITY
     else:
-        from config import CONTEXT_CAPACITY
+        from decode_shapes import CONTEXT_CAPACITY
 
     parser.add_argument("--max-seq-len", type=int, default=CONTEXT_CAPACITY, help="import-time context capacity (default 1048576)")
     args = parser.parse_args()

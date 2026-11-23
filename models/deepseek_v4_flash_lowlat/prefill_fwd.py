@@ -131,7 +131,7 @@ def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=
         sparse = importlib.import_module("prefill_sparse_attn")
         if bool(sparse.PREFILL_OPROJ_B_BATCHED) != oproj_b_batched or bool(sparse.PREFILL_OPROJ_A_BATCHED) != oproj_a_batched:
             raise RuntimeError("Prefill O-projection plan is frozen; use a fresh setup process")
-        head = importlib.import_module("models.deepseek_v4_flash_lowlat.prefill_head")
+        head = importlib.import_module("lm_head")
         moe = importlib.import_module("models.deepseek_v4_flash_lowlat.prefill_moe")
         geometry = importlib.import_module("models.deepseek_v4_flash_lowlat.prefill_moe_geometry")
         compute = importlib.import_module("models.deepseek_v4_flash_lowlat.prefill_moe_compute")
@@ -143,8 +143,8 @@ def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=
             raise RuntimeError("Prefill route state is frozen; use a fresh setup process")
         if geometry.PREFILL_MOE_COMBINE_ROWS != moe_combine_rows:
             raise RuntimeError("Prefill combine geometry is frozen; use a fresh setup process")
-        gate = importlib.import_module("models.deepseek_v4_flash_lowlat.prefill_moe_gate")
-        exchange = importlib.import_module("models.deepseek_v4_flash_lowlat.prefill_gate_exchange")
+        gate = importlib.import_module("models.deepseek_v4_flash_lowlat.prefill_moe_compute")
+        exchange = importlib.import_module("models.deepseek_v4_flash_lowlat.prefill_moe_geometry")
         if exchange.PREFILL_MOE_GATE_COPY_ROWS != moe_gate_copy_rows:
             raise RuntimeError("Prefill gate transfer geometry is frozen; use a fresh setup process")
         if bool(gate.PREFILL_MOE_QUANT_GRID) != moe_quant_grid:
@@ -284,7 +284,7 @@ def advance_gate_epoch(epoch_base, physical_rows, *, layers=43):
 
 def prepare_prefill_bindings(worker, caches, weights, inputs, scratch):
     """Bind caller-owned TP8 weights, shared caches, input metadata and scratch."""
-    from .prefill_cache import prefill_cache_views
+    from .prefill_metadata import prefill_cache_views
 
     bindings = {}
     for group in (prefill_cache_views(caches, worker=worker), weights, inputs, scratch):

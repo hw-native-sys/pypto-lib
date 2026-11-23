@@ -20,8 +20,8 @@ from .native_decode import (
     CSA_MAIN_STATE_MAX_BLOCKS, HCA_CMP_MAX_BLOCKS, HCA_COMPRESS_STATE_MAX_BLOCKS,
     MAX_SEQ_LEN, ORI_TABLE_MAX_BLOCKS, s6_prepared,
 )
-from .device_control import prepare_device_inputs_after
-from .phase_reuse import eight_rank_reuse_gate
+from .target_state import prepare_device_inputs_after
+from .target_state import eight_rank_reuse_gate
 
 NATIVE_S_FWD_ORI_BLOCK_NUM_DYN = pl.dynamic("NATIVE_S_FWD_ORI_BLOCK_NUM_DYN")
 NATIVE_S_FWD_HCA_STATE_BLOCK_NUM_DYN = pl.dynamic("NATIVE_S_FWD_HCA_STATE_BLOCK_NUM_DYN")

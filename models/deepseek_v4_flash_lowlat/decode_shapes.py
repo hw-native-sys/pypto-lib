@@ -9,12 +9,18 @@
 """Shared decode execution shapes and allocator pool geometry."""
 
 import os
+from dataclasses import replace
 
 if __package__:
     from .config import FLASH, _parse_int_argv
 else:
     from config import FLASH, _parse_int_argv
 
+
+CONTEXT_CAPACITY = _parse_int_argv("--max-seq-len", FLASH.max_position_embeddings)
+if CONTEXT_CAPACITY <= 0:
+    raise ValueError(f"--max-seq-len must be a positive integer, got {CONTEXT_CAPACITY}")
+DECODE_CONFIG = replace(FLASH, max_position_embeddings=CONTEXT_CAPACITY)
 
 # Deployment constants
 DECODE_BATCH = 1                     # B: requests per decode step
@@ -42,7 +48,7 @@ C128_COMPRESSOR_BLOCK_SIZE = 8            # ratio-128 compressor state page size
 # Static paged-cache pools. ``*_BLOCK_NUM`` is the global physical-pool capacity
 # and is deliberately independent from the compute batch. Per-request ownership
 # is expressed only by block tables.
-KV_ORI_TABLE_MAX_BLOCKS = (FLASH.max_position_embeddings + BLOCK_SIZE - 1) // BLOCK_SIZE
+KV_ORI_TABLE_MAX_BLOCKS = (CONTEXT_CAPACITY + BLOCK_SIZE - 1) // BLOCK_SIZE
 KV_ORI_MAX_BLOCKS = KV_ORI_TABLE_MAX_BLOCKS
 # Scheduler-visible tables use the same 128-source-token block granularity as
 # the uncompressed KV cache. Compressed pools store fewer rows per table entry.

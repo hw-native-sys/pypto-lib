@@ -19,9 +19,11 @@ from typing import Any, Callable
 import torch
 
 if __package__:
-    from .config import FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
+    from .decode_shapes import DECODE_CONFIG as M
+    from .config import INT8_AMAX_EPS, INT8_SCALE_MAX
 else:
-    from config import FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
+    from decode_shapes import DECODE_CONFIG as M
+    from config import INT8_AMAX_EPS, INT8_SCALE_MAX
 if __package__:
     from .decode_shapes import (
         BLOCK_SIZE,

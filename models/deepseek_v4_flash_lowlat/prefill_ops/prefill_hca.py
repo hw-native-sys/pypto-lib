@@ -18,10 +18,10 @@ from projection_exchange import (
 from models.deepseek_v4_flash_lowlat.kv_proj_rope import kv_proj_rope
 from qkv_proj_rope import kv_proj_rope_cp
 
-from projection_weight_layout import PROJECTION_WEIGHT_LAYOUT
+from projection_exchange import PROJECTION_WEIGHT_LAYOUT
 from utils import checkpoint_ends_tensor
 
-from models.deepseek_v4_flash_lowlat.model_config import FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
+from models.deepseek_v4_flash_lowlat.config import FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
 from prefill_shapes import (
     BLOCK_SIZE,
     HCA_CMP_STORAGE_BLOCK_SIZE as CMP_STORAGE_BLOCK_SIZE,
@@ -32,20 +32,22 @@ from prefill_shapes import (
 
 from models.deepseek_v4_flash_lowlat.hc_post_common import golden_hc_post, hc_post
 from hc_pre import golden_hc_pre, hc_pre
-from prefill_compressor_ratio128 import prefill_compressor_ratio128_cp
-from prefill_compressor_ratio128 import (
+from prefill_compressors import prefill_compressor_ratio128_cp
+from prefill_compressors import (
     HCA_STATE_BLOCK_NUM,
     HCA_STATE_BLOCK_SIZE,
     HCA_STATE_MAX_BLOCKS,
     golden_prefill_compressor_ratio128,
     prefill_compressor_ratio128,
 )
-from prefill_metadata import (
-    CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE,
-    QUERY_START_LOC_DYN, REQUESTS_DYN,
+from prefill_cp_token_allgather import (
+    CHECKPOINT_TILES_DYN,
+    CHECKPOINTS_PER_TILE,
+    QUERY_START_LOC_DYN,
+    REQUESTS_DYN,
 )
 from qkv_proj_rope import golden_qkv_proj_rope, qkv_proj_rope
-from rmsnorm import golden_rms_norm, rms_norm
+from models.deepseek_v4_flash_lowlat.rmsnorm_common import golden_rms_norm, rms_norm
 from prefill_sparse_attn import (
     PREFILL_RING_HEAP,
     golden_prefill_sparse_attn,
@@ -54,12 +56,8 @@ from prefill_sparse_attn import (
 
 import pypto.language.distributed as pld
 
-from prefill_cp_token_allgather import (
-    PREFILL_GROUP_CAP,
-    TP_SIZE,
-    prefill_cp_token_allgather_step,
-)
-from prefill_o_proj import (
+from prefill_cp_token_allgather import PREFILL_GROUP_CAP, TP_SIZE, prefill_cp_token_allgather_step
+from projection_exchange import (
     O_PROJ_LOCAL_GROUPS,
     O_PROJ_SCRATCH_D,
     O_PROJ_SCRATCH_GROUPS,

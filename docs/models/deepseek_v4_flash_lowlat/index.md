@@ -270,11 +270,9 @@ changes.
 context length, parallel rank count and pool scale must be positive.
 validation start-position defaults live with the host utilities.
 
-The attention-component part supplies `rope_interleave.py` and
-`o_proj_grouped.py` together with their first Indexer/compressor and standalone
-attention consumers. The former prepares query-token or compression-boundary RoPE tables;
-QKV metadata preparation separately handles dynamic token tiles and its swap
-indices.
+The shared `kv_proj_rope.py` operator prepares interleaved RoPE rows for query
+tokens and compressor boundaries. QKV metadata preparation handles dynamic token
+tiles and swap indices. `o_proj_tp.py` owns grouped and TP output projection.
 
 Each composed attention entry calls QKV once for its rank's contiguous head
 span. Q-LoRA projection, normalization and quantization, and KV projection and
@@ -299,9 +297,9 @@ per-entry execution budget. Entry device counts remain declared by
 The composed `decode_swa.py`, `decode_hca.py`, and `decode_csa.py` entries use
 two physical TP ranks by default and declare `# ci: devices=2`. Each rank
 processes its consecutive head groups. CSA assigns four logical tokens per
-rank and exchanges their query and output rows before projection. Their standalone
-`decode_sparse_attn_swa.py` and `decode_sparse_attn_hca.py` entries use one
-device and retain their original numerical references.
+rank and exchanges their query and output rows before projection. The standalone SWA and HCA entries in `decode_sparse_attn.py` use one
+device and retain their original numerical references. Grouped standalone entries
+expose their cases through `--help` and `--operator CASE`.
 
 Projection weights are resident group-major banks: `wo_a_shard` has shape
 `[N_RANKS, GROUPS_PER_RANK, O_LORA, O_GROUP_IN]` and `wo_b_shard` has shape
@@ -482,7 +480,7 @@ model's operators and configuration remain unchanged.
 `load_prefill_programs(mode="serial")` loads the six component entries for the
 same TP8 numerical baseline.
 
-`prefill_cache.prefill_cache_views` borrows each owning decode cache buffer
+`prefill_metadata.prefill_cache_views` borrows each owning decode cache buffer
 through that Worker's `view_tensor` API. The cache bytes remain in place:
 prefill uses 32-row raw-KV pages and 2-row ratio-4 state pages, while decode
 views the same rows as 128-row and 4-row pages. `prefill_block_tables` splits
@@ -623,15 +621,11 @@ validation; failures remain visible in either stage.
   proposal/confidence path with four vocabulary shards.
 - `drafter/device_metadata.py` selects the actual absolute-position metadata bank from
   committed state. A communication epoch is not a metadata-bank index.
-- `target_bridge.py` broadcasts the seed token and five proposals with an epoch
-  tag before the target can consume them.
-- `target_commit.py` accepts the longest greedy-matching draft prefix and emits
-  the target bonus. The original control fields distinguish logical advance
-  from the number of tokens still permitted by the output budget.
-- `device_control.py` materializes target metadata after the prior-cycle gate;
-  `target_state.py` publishes the next state after the real history commit
-  acknowledgement. `phase_reuse.py` supplies the peer-only eight-rank boundary
-  for reuse of communication slots within a two-cycle parent.
+- `target_state.py` owns the native target transaction. It broadcasts the seed
+  and proposals, materializes metadata after the prior-cycle gate, accepts the
+  longest greedy-matching prefix, and publishes the next state after the
+  history commit acknowledgement. Two-cycle parents use its peer barrier to
+  retire communication slots.
 
 The first three request-state fields are the monotonic epoch, committed anchor,
 and remaining output budget. Field three stores the last delivered token.
@@ -645,7 +639,7 @@ reduce-scatter/allgather composition. Its target package shares unchanged kernel
 with the baseline package. The `cycle_count` constexpr selects a one- or two-cycle
 parent in source; it does not require editing generated host code.
 
-The compact single-query entry is `native_single.py`; request cycles use
+The compact single-query entry is `native_decode.l3_decode_fwd`; request cycles use
 `native_pipeline.py` and `native_rsag_pipeline.py`, which call the corresponding
 target verification modules. They share this model directory's operator files
 and 43 layer-specific weight banks. Each build freezes its query width in a fresh
@@ -747,7 +741,7 @@ The validated reference-arithmetic source is preserved on
 
 ## Host input uploads
 
-`prefill_host_inputs.SharedInput` provides a real mutable shared CPU buffer for
+`prefill_metadata.SharedInput` provides a real mutable shared CPU buffer for
 HC input. Allocate it before preparing the Worker and pass its contiguous
 `storage` tensor in `inherited_host_tensors`, without `ReadOnlyHostTensor`. Fill
 it from actual BF16 prompt embeddings inside request timing. The returned
@@ -761,7 +755,7 @@ metadata buffers follow the same lifetime and must retain actual per-rank
 values, shapes and dtypes. These host changes do not alter native compute,
 weights, quantization or cache semantics.
 
-`prefill_input_plan.PreparedInputPlan` retains metadata derived from an explicit
+`prefill_metadata.PreparedInputPlan` retains metadata derived from an explicit
 cache owner, page maps, positions, shapes, RoPE tables, grammar policy and revision.
 Construct and register its shared typed arenas before preparing the Worker.
 Only geometry is prepared in advance: fill real token IDs and gather actual
@@ -776,7 +770,7 @@ consumer before uploading the next chunk into those device roots. Account for
 each root and its alignment padding once; field views do not own additional
 device allocations.
 
-The input-only `prefill_embedding_lookup` program reads actual token IDs from
+The input-only `l3_lookup_prefill_input` program reads actual token IDs from
 resident BF16 embedding weights and expands each selected row to four FP32 HC
 channels with exact BF16 bit widening. Its caller must admit the complete
 resident vocabulary matrix, upload it during Worker setup, bind it as read-only

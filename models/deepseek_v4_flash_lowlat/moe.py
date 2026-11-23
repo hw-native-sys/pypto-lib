@@ -37,9 +37,9 @@ if __package__:
 else:
     from expert_routed import IDX_PAD, N_BANK, N_SLOTS_B, RECV_MAX, SHARED_EID, SH_SLOT
 if __package__:
-    from .expert_routed_persistent_balanced import WORK_SLOTS_PAD, expert_routed_persistent_planned
+    from .expert_routed import WORK_SLOTS_PAD, expert_routed_persistent_planned
 else:
-    from expert_routed_persistent_balanced import WORK_SLOTS_PAD, expert_routed_persistent_planned
+    from expert_routed import WORK_SLOTS_PAD, expert_routed_persistent_planned
 if __package__:
     from .gate import gate, ROUTE_ROW_PAD
 else:

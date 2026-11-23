@@ -20,9 +20,9 @@ if __package__:
 else:
     from qkv_proj_rope import prepare_qkv_rope_metadata
 if __package__:
-    from .decode_sparse_attn_hca import prepare_hca_output_rope, H_TILE as HCA_ROPE_ROWS
+    from .decode_sparse_attn import prepare_hca_output_rope, H_TILE as HCA_ROPE_ROWS
 else:
-    from decode_sparse_attn_hca import prepare_hca_output_rope, H_TILE as HCA_ROPE_ROWS
+    from decode_sparse_attn import prepare_hca_output_rope, H_TILE as HCA_ROPE_ROWS
 import pypto.language as pl
 import pypto.language.distributed as pld
 
@@ -36,9 +36,11 @@ else:
     from o_proj_tp import o_proj_tp_core
 
 if __package__:
-    from .config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+    from .decode_shapes import DECODE_CONFIG as M
+    from .config import INT8_SCALE_MAX, INT8_AMAX_EPS
 else:
-    from config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+    from decode_shapes import DECODE_CONFIG as M
+    from config import INT8_SCALE_MAX, INT8_AMAX_EPS
 if __package__:
     from .decode_shapes import (
         DECODE_BATCH,
@@ -70,17 +72,17 @@ if __package__:
 else:
     from rmsnorm import rms_norm
 if __package__:
-    from .rope_interleave import rope_interleave
+    from .kv_proj_rope import rope_interleave
 else:
-    from rope_interleave import rope_interleave
+    from kv_proj_rope import rope_interleave
 if __package__:
-    from .decode_compressor_ratio128 import compressor_ratio128
+    from .decode_compressors import compressor_ratio128
 else:
-    from decode_compressor_ratio128 import compressor_ratio128
+    from decode_compressors import compressor_ratio128
 if __package__:
-    from .decode_sparse_attn_hca import sparse_attn_hca_packed, CMP_TOPK as HCA_SPARSE_CMP_TOPK
+    from .decode_sparse_attn import sparse_attn_hca_packed, HCA_CMP_TOPK as HCA_SPARSE_CMP_TOPK
 else:
-    from decode_sparse_attn_hca import sparse_attn_hca_packed, CMP_TOPK as HCA_SPARSE_CMP_TOPK
+    from decode_sparse_attn import sparse_attn_hca_packed, HCA_CMP_TOPK as HCA_SPARSE_CMP_TOPK
 
 
 # model config
@@ -582,13 +584,13 @@ def golden_attention_hca(tensors):
     else:
         from rmsnorm import golden_rms_norm
     if __package__:
-        from .decode_compressor_ratio128 import golden_compressor
+        from .decode_compressors import golden_compressor_ratio128 as golden_compressor
     else:
-        from decode_compressor_ratio128 import golden_compressor
+        from decode_compressors import golden_compressor_ratio128 as golden_compressor
     if __package__:
-        from .decode_sparse_attn_hca import golden_sparse_attn
+        from .decode_sparse_attn import golden_sparse_attn_hca as golden_sparse_attn
     else:
-        from decode_sparse_attn_hca import golden_sparse_attn
+        from decode_sparse_attn import golden_sparse_attn_hca as golden_sparse_attn
     if __package__:
         from .hc_post_common import golden_hc_post
     else:
@@ -1129,9 +1131,9 @@ if __name__ == "__main__":
     parser.add_argument("--sim", action="store_true")
     parser.add_argument("--compile-only", action="store_true", default=False)
     if __package__:
-        from .config import CONTEXT_CAPACITY
+        from .decode_shapes import CONTEXT_CAPACITY
     else:
-        from config import CONTEXT_CAPACITY
+        from decode_shapes import CONTEXT_CAPACITY
 
     parser.add_argument("--max-seq-len", type=int, default=CONTEXT_CAPACITY, help="import-time context capacity (default 1048576)")
     parser.add_argument("--tp", type=int, default=OPROJ_N_RANKS, choices=[1, 2, 4, 8])

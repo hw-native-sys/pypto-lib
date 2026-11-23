@@ -21,9 +21,9 @@ if __package__:
 else:
     from qkv_proj_rope import prepare_qkv_rope_metadata
 if __package__:
-    from .decode_sparse_attn_swa import prepare_swa_output_rope, H_TILE as SWA_ROPE_ROWS
+    from .decode_sparse_attn import prepare_swa_output_rope, H_TILE as SWA_ROPE_ROWS
 else:
-    from decode_sparse_attn_swa import prepare_swa_output_rope, H_TILE as SWA_ROPE_ROWS
+    from decode_sparse_attn import prepare_swa_output_rope, H_TILE as SWA_ROPE_ROWS
 import pypto.language as pl
 import pypto.language.distributed as pld
 
@@ -37,9 +37,11 @@ else:
     from o_proj_tp import o_proj_tp_core
 
 if __package__:
-    from .config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+    from .decode_shapes import DECODE_CONFIG as M
+    from .config import INT8_SCALE_MAX, INT8_AMAX_EPS
 else:
-    from config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+    from decode_shapes import DECODE_CONFIG as M
+    from config import INT8_SCALE_MAX, INT8_AMAX_EPS
 if __package__:
     from .decode_shapes import (
         DECODE_BATCH,
@@ -69,9 +71,9 @@ if __package__:
 else:
     from rmsnorm import rms_norm
 if __package__:
-    from .decode_sparse_attn_swa import sparse_attn_swa_packed
+    from .decode_sparse_attn import sparse_attn_swa_packed
 else:
-    from decode_sparse_attn_swa import sparse_attn_swa_packed
+    from decode_sparse_attn import sparse_attn_swa_packed
 
 
 # model config
@@ -472,9 +474,9 @@ def golden_attention_swa(tensors):
     else:
         from rmsnorm import golden_rms_norm
     if __package__:
-        from .decode_sparse_attn_swa import golden_sparse_attn
+        from .decode_sparse_attn import golden_sparse_attn_swa as golden_sparse_attn
     else:
-        from decode_sparse_attn_swa import golden_sparse_attn
+        from decode_sparse_attn import golden_sparse_attn_swa as golden_sparse_attn
     if __package__:
         from .hc_post_common import golden_hc_post
     else:

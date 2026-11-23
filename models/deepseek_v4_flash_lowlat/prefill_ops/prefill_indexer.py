@@ -10,22 +10,24 @@
 
 import pypto.language as pl
 
-from projection_weight_layout import PROJECTION_WEIGHT_LAYOUT
+from projection_exchange import PROJECTION_WEIGHT_LAYOUT
 
-from models.deepseek_v4_flash_lowlat.model_config import FLASH as M, FP32_NEG_INF, INT8_SCALE_MAX, INT8_AMAX_EPS
+from models.deepseek_v4_flash_lowlat.config import FLASH as M, FP32_NEG_INF, INT8_SCALE_MAX, INT8_AMAX_EPS
 from prefill_shapes import BLOCK_SIZE, CSA_INNER_STATE_BLOCKS_PER_REQUEST
 
-from prefill_indexer_compressor import (
+from prefill_compressors import (
     INNER_STATE_BLOCK_NUM,
     INNER_STATE_BLOCK_SIZE,
     INNER_STATE_MAX_BLOCKS,
-    STATE_LEN as INNER_STATE_LEN,
+    INDEXER_STATE_LEN as INNER_STATE_LEN,
     golden_prefill_indexer_compressor,
     prefill_indexer_compressor,
 )
-from prefill_metadata import (
-    CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE,
-    QUERY_START_LOC_DYN, REQUESTS_DYN,
+from prefill_cp_token_allgather import (
+    CHECKPOINT_TILES_DYN,
+    CHECKPOINTS_PER_TILE,
+    QUERY_START_LOC_DYN,
+    REQUESTS_DYN,
 )
 
 

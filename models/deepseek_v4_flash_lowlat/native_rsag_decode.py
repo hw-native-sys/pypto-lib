@@ -89,9 +89,9 @@ from .decode_prepare import N_CACHE_GROUPS, build_decode_metadata, pack_x_hc_row
 
 from .tp_embedding import VOCAB_PER_TP as EMBED_VOCAB_PER_TP, clear_embedding_signals, tp_lookup_embedding
 
-from .target_bridge import device_input_bridge
+from .target_state import device_input_bridge
 
-from .target_commit import device_commit_inline
+from .target_state import device_commit_inline
 
 from .target_state import publish_next_request_state
 

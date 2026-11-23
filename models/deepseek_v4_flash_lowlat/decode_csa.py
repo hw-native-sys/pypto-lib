@@ -15,13 +15,17 @@ if __package__:
 else:
     from qkv_proj_rope import prepare_qkv_rope_metadata
 if __package__:
-    from .decode_sparse_attn_csa import (
+    from .decode_sparse_attn import (
         prepare_csa_output_rope,
         H_TILE as CSA_ROPE_ROWS,
         sparse_attn_csa_head_packed,
     )
 else:
-    from decode_sparse_attn_csa import prepare_csa_output_rope, H_TILE as CSA_ROPE_ROWS, sparse_attn_csa_head_packed
+    from decode_sparse_attn import (
+        prepare_csa_output_rope,
+        H_TILE as CSA_ROPE_ROWS,
+        sparse_attn_csa_head_packed,
+    )
 if __package__:
     from .decode_indexer import prepare_indexer_rope_indices, ROPE_ROW_TILE as IDX_ROPE_ROWS
 else:
@@ -30,9 +34,11 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 
 if __package__:
-    from .config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+    from .decode_shapes import DECODE_CONFIG as M
+    from .config import INT8_SCALE_MAX, INT8_AMAX_EPS
 else:
-    from config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+    from decode_shapes import DECODE_CONFIG as M
+    from config import INT8_SCALE_MAX, INT8_AMAX_EPS
 if __package__:
     from .decode_shapes import (
         DECODE_BATCH,
@@ -50,9 +56,9 @@ if __package__:
 else:
     from decode_shapes import DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, C4A_COMPRESSOR_BLOCK_SIZE, DECODE_CMP_BLOCK_NUM, DECODE_IDX_BLOCK_NUM, DECODE_ORI_BLOCK_NUM, IDX_CACHE_MAX_BLOCKS, KV_CMP_MAX_BLOCKS, KV_ORI_MAX_BLOCKS, KV_ORI_TABLE_MAX_BLOCKS
 if __package__:
-    from .decode_compressor_ratio4 import compressor_ratio4
+    from .decode_compressors import compressor_ratio4
 else:
-    from decode_compressor_ratio4 import compressor_ratio4
+    from decode_compressors import compressor_ratio4
 if __package__:
     from .hc_post import hc_post
 else:
@@ -74,17 +80,17 @@ if __package__:
 else:
     from rmsnorm import rms_norm
 if __package__:
-    from .rope_interleave import rope_interleave
+    from .kv_proj_rope import rope_interleave
 else:
-    from rope_interleave import rope_interleave
+    from kv_proj_rope import rope_interleave
 if __package__:
-    from .decode_sparse_attn_csa import csa_q_all_to_all, csa_o_all_to_all_wait, sparse_attn_csa_packed
+    from .decode_sparse_attn import csa_q_all_to_all, csa_o_all_to_all_wait, sparse_attn_csa_packed
 else:
-    from decode_sparse_attn_csa import csa_q_all_to_all, csa_o_all_to_all_wait, sparse_attn_csa_packed
+    from decode_sparse_attn import csa_q_all_to_all, csa_o_all_to_all_wait, sparse_attn_csa_packed
 if __package__:
-    from . import decode_sparse_attn_csa as CSA
+    from . import decode_sparse_attn as CSA
 else:
-    import decode_sparse_attn_csa as CSA
+    import decode_sparse_attn as CSA
 # Imported by name, not via the module: the DSL parser needs a bare callee,
 # and an "import ... as" alias on a @pl.jit.inline callee fails specialization.
 if __package__:
@@ -912,9 +918,9 @@ def golden_attention_csa(tensors):
     import torch
 
     if __package__:
-        from .decode_compressor_ratio4 import golden_compressor
+        from .decode_compressors import golden_compressor_ratio4 as golden_compressor
     else:
-        from decode_compressor_ratio4 import golden_compressor
+        from decode_compressors import golden_compressor_ratio4 as golden_compressor
     if __package__:
         from .hc_pre import golden_hc_pre
     else:
@@ -932,9 +938,9 @@ def golden_attention_csa(tensors):
     else:
         from rmsnorm import golden_rms_norm
     if __package__:
-        from .decode_sparse_attn_csa import golden_sparse_attn
+        from .decode_sparse_attn import golden_sparse_attn_csa as golden_sparse_attn
     else:
-        from decode_sparse_attn_csa import golden_sparse_attn
+        from decode_sparse_attn import golden_sparse_attn_csa as golden_sparse_attn
     if __package__:
         from .hc_post_common import golden_hc_post
     else:
@@ -1701,9 +1707,9 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=0, help="Seed for the generated correctness fixture.")
     if __package__:
-        from .config import CONTEXT_CAPACITY
+        from .decode_shapes import CONTEXT_CAPACITY
     else:
-        from config import CONTEXT_CAPACITY
+        from decode_shapes import CONTEXT_CAPACITY
 
     parser.add_argument("--max-seq-len", type=int, default=CONTEXT_CAPACITY, help="import-time context capacity (default 1048576)")
     parser.add_argument("--tp", type=int, default=OPROJ_N_RANKS, choices=[1, 2, 4, 8])

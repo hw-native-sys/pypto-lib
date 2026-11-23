@@ -153,10 +153,6 @@ DEMO = DeepSeekV4Config(
     max_batch_size=4,
 )
 
-CONTEXT_CAPACITY = _parse_int_argv("--max-seq-len", 1048576)
-if CONTEXT_CAPACITY <= 0:
-    raise ValueError(f"--max-seq-len must be a positive integer, got {CONTEXT_CAPACITY}")
-
 FLASH = DeepSeekV4Config(
     name="flash",
     hidden_size=4096,
@@ -189,7 +185,7 @@ FLASH = DeepSeekV4Config(
     hc_mult=4,
     hc_sinkhorn_iters=20,
     hc_eps=1e-6,
-    max_position_embeddings=CONTEXT_CAPACITY,
+    max_position_embeddings=1_048_576,
     rope_theta=10000.0,
     compress_rope_theta=160000.0,
     rope_factor=16.0,

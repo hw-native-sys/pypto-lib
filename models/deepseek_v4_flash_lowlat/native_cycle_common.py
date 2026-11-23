@@ -13,7 +13,7 @@ import pypto.language.distributed as pld
 from .drafter.device_metadata import BANK_COUNT
 from .drafter.entry import drafter_inline
 from .markov.entry import markov_inline
-from .phase_reuse import eight_rank_reuse_gate
+from .target_state import eight_rank_reuse_gate
 
 
 @pl.jit.inline(auto_scope=False)
