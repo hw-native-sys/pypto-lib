@@ -2284,6 +2284,8 @@ def golden_prefill_attention_csa_cp(tensors):
 
 if __name__ == "__main__":
     import argparse
+    import subprocess
+    import sys
 
     from golden import ratio_allclose, ratio_reldiff, run
 
@@ -2308,6 +2310,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--case", choices=["b1", "ragged2"], default="b1",
         help="Fixture case; ragged2 is the fixed two-request TP2/TP4 boundary case.",
+    )
+    parser.add_argument(
+        "--prefill-query-pipeline", type=int, choices=(0, 1),
+        help="Select the direct or pipelined CP path. The default CP validation runs both.",
     )
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--enable-dep-gen", action="store_true", default=False)
@@ -2344,6 +2350,13 @@ if __name__ == "__main__":
         parser.error("--case ragged2 requires --tp 2 or 4")
     if args.case == "ragged2" and args.start_pos != 0:
         parser.error("--case ragged2 has fixed request starts and requires --start-pos 0")
+    if args.prefill_query_pipeline and TP_SIZE == 1:
+        parser.error("--prefill-query-pipeline 1 requires a context-parallel group")
+    check_pipeline = (
+        TP_SIZE > 1 and args.prefill_query_pipeline is None and args.case == "b1"
+        and args.token_count is None and args.start_pos == 0
+        and args.golden_data is None and args.runtime_dir is None
+    )
     if args.token_count is None:
         args.token_count = 8 if args.case == "ragged2" else VALIDATION_TOKENS
     if args.case == "ragged2" and args.token_count != 8:
@@ -2415,3 +2428,11 @@ if __name__ == "__main__":
         if result.error:
             print(result.error)
         raise SystemExit(1)
+    if check_pipeline:
+        # The third wave reuses lane zero and covers a four-row tail.
+        pipeline_tokens = TP_SIZE * (2 * PREFILL_QUERY_TILE + 4)
+        subprocess.run(
+            [sys.executable, __file__, *sys.argv[1:], "--prefill-query-pipeline", "1",
+             "--token-count", str(pipeline_tokens)],
+            check=True,
+        )
