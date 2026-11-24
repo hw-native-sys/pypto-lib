@@ -205,19 +205,22 @@ def _prefill_indexer_compressor_tile(
     write_pos_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
     write_dst_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
     write_src_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
-    tile_positions_consecutive_flag = pl.create_tensor([1], dtype=pl.INT32)
+    tile_pool_flags = pl.create_tensor([2], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_c4_write_map"):
         write_pos_tile = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=0)
         write_dst_tile = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=-1)
         write_src_tile = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=-1)
         map_seen = pl.cast(0, pl.INDEX)
         tile_positions_are_consecutive = pl.cast(1, pl.INT32)
+        tile_rows_mapped = pl.cast(1, pl.INT32)
         for map_local in pl.range(tile_rows):
             map_global = tile_base + map_local
             map_position = pl.read(position_ids, [map_global])
             expected_position = pl.cast(tile_first_position, pl.INDEX) + map_local
             if pl.cast(map_position, pl.INDEX) != expected_position:
                 tile_positions_are_consecutive = pl.cast(0, pl.INT32)
+            if pl.read(inner_state_slot_mapping, [map_global]) < 0:
+                tile_rows_mapped = pl.cast(0, pl.INT32)
             map_slot_raw = pl.read(idx_slot_mapping, [map_global])
             if map_slot_raw >= 0:
                 pl.write(write_pos_tile, [0, map_seen], map_position)
@@ -225,7 +228,8 @@ def _prefill_indexer_compressor_tile(
                 map_global_i32 = pl.cast(map_global, pl.INT32)
                 pl.write(write_src_tile, [0, map_seen], map_global_i32)
                 map_seen = map_seen + 1
-        pl.write(tile_positions_consecutive_flag, [0], tile_positions_are_consecutive)
+        pl.write(tile_pool_flags, [0], tile_positions_are_consecutive)
+        pl.write(tile_pool_flags, [1], tile_rows_mapped)
         write_pos_map[0:1, 0:MAX_CMP_WRITES] = write_pos_tile
         write_dst_map[0:1, 0:MAX_CMP_WRITES] = write_dst_tile
         write_src_map[0:1, 0:MAX_CMP_WRITES] = write_src_tile
@@ -243,7 +247,38 @@ def _prefill_indexer_compressor_tile(
             write_pos = pl.read(write_pos_map, [0, write_i])
             cur_start = write_pos + 1 - COMPRESS_RATIO
             prev_start = cur_start - COMPRESS_RATIO
-            for pool_s in pl.range(COMPRESS_RATIO):
+            # Consecutive tile-local windows read each half directly from its projection columns.
+            history_slots = pl.cast(COMPRESS_RATIO, pl.INDEX)
+            overlay_begin = pl.cast(0, pl.INDEX)
+            overlay_end = tile_rows
+            if pl.read(tile_pool_flags, [0]) > 0:
+                first_pos = pl.cast(tile_first_position, pl.INDEX)
+                prev_local = pl.cast(prev_start, pl.INDEX) - first_pos
+                end_local = pl.cast(write_pos, pl.INDEX) + 1 - first_pos
+                overlay_begin = pl.max(0, prev_local)
+                overlay_end = pl.min(tile_rows, end_local)
+                whole_window = prev_local >= 0 and end_local <= tile_rows and write_pos >= STATE_LEN - 1
+                if whole_window and prev_start % COMPRESS_RATIO == 0:
+                    window_mapped = pl.read(tile_pool_flags, [1])
+                    if window_mapped == 0:
+                        window_mapped = pl.cast(1, pl.INT32)
+                        for mapped_row in pl.range(STATE_LEN):
+                            mapped_source = tile_base + prev_local + mapped_row
+                            if pl.read(inner_state_slot_mapping, [mapped_source]) < 0:
+                                window_mapped = pl.cast(0, pl.INT32)
+                    if window_mapped > 0:
+                        cur_local = prev_local + COMPRESS_RATIO
+                        pool_kv_tile[0:COMPRESS_RATIO, :] = pl.slice(kv_proj_scratch, [COMPRESS_RATIO, HEAD_D_TILE], [prev_local, h0])
+                        pool_kv_tile[COMPRESS_RATIO:STATE_LEN, :] = pl.slice(kv_proj_scratch, [COMPRESS_RATIO, HEAD_D_TILE], [cur_local, HEAD_DIM + h0])
+                        prev_scores = pl.slice(score_proj_scratch, [COMPRESS_RATIO, HEAD_D_TILE], [prev_local, h0])
+                        cur_scores = pl.slice(score_proj_scratch, [COMPRESS_RATIO, HEAD_D_TILE], [cur_local, HEAD_DIM + h0])
+                        prev_ape = pl.slice(ape, [COMPRESS_RATIO, HEAD_D_TILE], [0, h0])
+                        cur_ape = pl.slice(ape, [COMPRESS_RATIO, HEAD_D_TILE], [0, HEAD_DIM + h0])
+                        pool_score_tile[0:COMPRESS_RATIO, :] = pl.add(prev_scores, prev_ape)
+                        pool_score_tile[COMPRESS_RATIO:STATE_LEN, :] = pl.add(cur_scores, cur_ape)
+                        history_slots = pl.cast(0, pl.INDEX)
+                        overlay_end = overlay_begin
+            for pool_s in pl.range(history_slots):
                 prev_abs = prev_start + pool_s
                 front_slot = pool_s
                 pool_kv_tile[front_slot : front_slot + 1, 0:HEAD_D_TILE] = pl.full(
@@ -315,18 +350,11 @@ def _prefill_indexer_compressor_tile(
                         OUT_DIM + HEAD_DIM + h0 : OUT_DIM + HEAD_DIM + h0 + HEAD_D_TILE,
                     ]
 
-            # Current-tile state overlay from projection scratch.
-            overlay_begin = pl.cast(0, pl.INDEX)
-            overlay_end = tile_rows
-            if pl.read(tile_positions_consecutive_flag, [0]) > 0:
-                overlay_first = pl.cast(tile_first_position, pl.INDEX)
-                overlay_begin = pl.max(0, pl.cast(prev_start, pl.INDEX) - overlay_first)
-                overlay_end = pl.min(tile_rows, pl.cast(write_pos, pl.INDEX) + 1 - overlay_first)
             for pool_local in pl.range(overlay_begin, overlay_end):
                 pool_global = tile_base + pool_local
                 pool_pos = pl.read(position_ids, [pool_global])
                 if pool_pos <= write_pos:
-                    if pool_pos >= prev_start:
+                    if pool_pos >= prev_start and pl.read(inner_state_slot_mapping, [pool_global]) >= 0:
                         pool_ape_slot = pl.cast(pool_pos % COMPRESS_RATIO, pl.INDEX)
                         if pool_pos < cur_start:
                             pool_slot = pl.cast(pool_pos - prev_start, pl.INDEX)
@@ -902,7 +930,10 @@ def golden_prefill_indexer_compressor(tensors):
     tensors["idx_kv_scale"][:] = idx_kv_scale
 
 
-def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SEQ, checkpoint_end: int = 0):
+def build_tensor_specs(
+    start_pos: int = START_POS, token_count: int = PREFILL_SEQ, checkpoint_end: int = 0,
+    *, unmapped_first_row: bool = False,
+):
     import torch
     from golden import TensorSpec
     from utils import prefill_state_fixture, token_local_rope
@@ -933,7 +964,10 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         return physical_block * INNER_STATE_BLOCK_SIZE + intra
 
     def init_x():
-        return ((torch.rand(token_count, D) - 0.5) * 0.1).to(torch.bfloat16)
+        rows = ((torch.rand(token_count, D) - 0.5) * 0.1).to(torch.bfloat16)
+        if unmapped_first_row:
+            rows[0].fill_(1)
+        return rows
 
     def init_compress_state():
         state = torch.zeros(state_blocks, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM)
@@ -1010,7 +1044,10 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         return mapping
 
     def init_inner_state_slot_mapping():
-        return state_mapping.clone()
+        mapping = state_mapping.clone()
+        if unmapped_first_row:
+            mapping[0] = -1
+        return mapping
 
     checkpoint_tensor = checkpoint_ends_tensor([checkpoint_end], starts=[start_pos], lengths=[token_count])
 
@@ -1094,13 +1131,15 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
-    cases = [(args.start_pos, args.token_count, 0)]
+    cases = [(args.start_pos, args.token_count, 0, False)]
     if args.start_pos == START_POS and args.token_count == PREFILL_SEQ:
-        cases.extend(((0, 8192, (512, 4096, 8064)), (33, 1024, 640), (127, 513, 128)))
-    for start_pos, token_count, checkpoint_end in cases:
+        cases.extend(((0, 8192, (512, 4096, 8064), False), (33, 1024, 640, False), (127, 513, 128, False)))
+        cases.append((0, 16, 0, True))
+    for start_pos, token_count, checkpoint_end, unmapped_first_row in cases:
+        cache_error_ratio = 0.0 if unmapped_first_row else 0.01
         result = run(
             fn=prefill_indexer_compressor_test,
-            specs=build_tensor_specs(start_pos, token_count, checkpoint_end),
+            specs=build_tensor_specs(start_pos, token_count, checkpoint_end, unmapped_first_row=unmapped_first_row),
             golden_fn=golden_prefill_indexer_compressor,
             config=dict(
                 dump_passes=args.dump_passes,
@@ -1113,8 +1152,8 @@ if __name__ == "__main__":
             compare_fn={
                 "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
                 # C8 cache: INT8 rows exact bar the <=B boundary rows the compressor rewrote (+/-1 LSB).
-                "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
-                "idx_kv_scale": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
+                "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=cache_error_ratio),
+                "idx_kv_scale": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=cache_error_ratio),
             },
         )
         if not result.passed:
