@@ -877,6 +877,7 @@ if __name__ == "__main__":
     }
 
     result = run(
+        a5_default_runtime="host_build_graph",
         fn=entry,
         specs=specs,
         golden_fn=golden_fn,

@@ -1146,6 +1146,7 @@ if __name__ == "__main__":
     counts = _fixture_moe_counts()
     exact = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
     result = run(
+        a5_default_runtime="host_build_graph",
         fn=l3_decode_layer,
         specs=specs,
         golden_fn=golden_l3_decode_layer,

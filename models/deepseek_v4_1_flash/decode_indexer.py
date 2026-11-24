@@ -2773,6 +2773,7 @@ if __name__ == "__main__":
                 workload = "saved inputs" if args.golden_data else f"shape={batch}x{sequence} kv={kv_length}"
                 print(f"QLI page_rows={page_rows} candidates={candidates} sorted_index={sorted_index} {workload}", flush=True)
                 result = run(
+                    a5_default_runtime="host_build_graph",
                     fn=qli_validation.specialize(num_tokens=pl.RUNTIME, candidates=candidates, sorted_index=sorted_index),
                     specs=build_validation_specs(batch, sequence, kv_length, args.seed, page_rows),
                     golden_fn=partial(golden_qli, candidates=candidates, sorted_index=sorted_index),

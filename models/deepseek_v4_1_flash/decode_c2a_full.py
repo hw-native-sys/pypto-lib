@@ -747,6 +747,7 @@ if __name__ == "__main__":
         start_pos=args.startpos, query_lens=args.query_lens, param_names=host.param_names,
     )
     result = run(
+        a5_default_runtime="host_build_graph",
         fn=host,
         specs=specs,
         golden_fn=golden_c2a,

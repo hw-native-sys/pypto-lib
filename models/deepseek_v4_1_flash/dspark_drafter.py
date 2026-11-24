@@ -735,6 +735,7 @@ if __name__ == "__main__":
         parser.error(f"drafter needs {EP_SIZE} devices")
 
     result = run(
+        a5_default_runtime="host_build_graph",
         fn=l3_dspark_drafter,
         specs=build_drafter_specs(),
         golden_fn=None,
