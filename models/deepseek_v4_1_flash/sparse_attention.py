@@ -4293,13 +4293,15 @@ def _sparse_swa_vector(
 
         scores_in = pl.system.tpop_from_aic(shape=[SPARSE_VF_FUSED_AIV_HEAD_TILE, WINDOW_KEYS], dtype=pl.FP32, split=1, id=2)
         scores = pl.mul(scores_in, SCALE)
-        weights = pl.tile.create([SPARSE_VF_FUSED_AIV_HEAD_TILE, WINDOW_KEYS], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+        weight_storage: pl.Tile[
+            [SPARSE_VF_FUSED_AIV_HEAD_TILE, WINDOW_KEYS], pl.BF16, pl.MemRef("swa_weights_nz"), pl.Mem.Vec
+        ] = pl.tile.create([SPARSE_VF_FUSED_AIV_HEAD_TILE, WINDOW_KEYS], dtype=pl.BF16, target_memory=pl.Mem.Vec)
         maximum = pl.tile.create([1, SPARSE_VF_FUSED_AIV_HEAD_TILE], dtype=pl.FP32, target_memory=pl.Mem.Vec)
         denominator = pl.tile.create([1, SPARSE_VF_FUSED_AIV_HEAD_TILE], dtype=pl.FP32, target_memory=pl.Mem.Vec)
         all_ids = pl.tile.load(indices, [token, 0], [1, WINDOW_KEYS], target_memory=pl.Mem.Vec)
         ids_flat = pl.tile.reshape(all_ids, [WINDOW_KEYS])
         scores_flat = pl.tile.reshape(scores, [SPARSE_VF_FUSED_AIV_HEAD_TILE * WINDOW_KEYS])
-        weights_flat = pl.tile.reshape(weights, [SPARSE_VF_FUSED_AIV_HEAD_TILE * WINDOW_KEYS])
+        weights_flat = pl.tile.reshape(weight_storage, [SPARSE_VF_FUSED_AIV_HEAD_TILE * WINDOW_KEYS])
         max_flat = pl.tile.reshape(maximum, [SPARSE_VF_FUSED_AIV_HEAD_TILE])
         denominator_flat = pl.tile.reshape(denominator, [SPARSE_VF_FUSED_AIV_HEAD_TILE])
         with pl.reg_scope():
@@ -4324,12 +4326,25 @@ def _sparse_swa_vector(
                 summed = pl.reg.reduce_sum(weight_pairs, full64, reassoc=True)
                 bf16_lo = pl.reg.convert(weights_lo, dtype=pl.BF16, rounding="R", saturate=False)
                 bf16_hi = pl.reg.convert(weights_hi, dtype=pl.BF16, rounding="R", saturate=False)
-                _write_lo = pl.reg.store(weights_flat, offset, bf16_lo)
-                _write_hi = pl.reg.store(weights_flat, offset + 64, bf16_hi)
+                nz_offset = row * 16
+                nz_hi = nz_offset + 64 * SPARSE_VF_FUSED_AIV_HEAD_TILE
+                _write_lo = pl.reg.store(
+                    weights_flat, nz_offset, bf16_lo, full64, block_stride=SPARSE_VF_FUSED_AIV_HEAD_TILE
+                )
+                _write_hi = pl.reg.store(
+                    weights_flat, nz_hi, bf16_hi, full64, block_stride=SPARSE_VF_FUSED_AIV_HEAD_TILE
+                )
                 _write_max = pl.reg.store(max_flat, row, max_row)
                 _write_sum = pl.reg.store(denominator_flat, row, summed)
         pl.system.tfree_to_aic(scores_in, id=2)
-        pl.system.tpush_to_aic(weights, split=1, id=1)
+        weights_nz: pl.Tile[
+            [SPARSE_VF_FUSED_AIV_HEAD_TILE, WINDOW_KEYS],
+            pl.BF16,
+            pl.MemRef("swa_weights_nz"),
+            pl.Mem.Vec,
+            pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512),
+        ] = pl.tile.create([SPARSE_VF_FUSED_AIV_HEAD_TILE, WINDOW_KEYS], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+        pl.system.tpush_to_aic(weights_nz, split=1, id=1)
 
         final_max = pl.maximum(maximum, sink_tile)
         correction = pl.col_expand_expdif(maximum, final_max)
