@@ -54,6 +54,7 @@ SPARSE_VF_FUSED_SCALE_TILE = 8
 SPARSE_VF_FUSED_FP4_SCALE_TILE = 16
 
 SPARSE_VF_SWA_VALUE_TILE = 256
+SPARSE_VF_SWA_KV_LANE_ROWS = WINDOW_KEYS // 2
 SPARSE_VF_SWA_KV_SLOT_BYTES = WINDOW_KEYS * HEAD_DIM * 2
 SPARSE_VF_SWA_WEIGHT_SLOT_BYTES = SPARSE_VF_FUSED_CUBE_HEAD_TILE * WINDOW_KEYS * 2
 SPARSE_VF_SWA_SCORE_SLOT_BYTES = SPARSE_VF_FUSED_AIV_HEAD_TILE * WINDOW_KEYS * 4
@@ -4164,11 +4165,13 @@ def _sparse_swa_vector(
     last_token = (worker + 1) * num_tokens // workers
     norm = pl.tile.full([1, SPARSE_VF_FUSED_AIV_HEAD_TILE], dtype=pl.FP32, value=0.0)
     for token in pl.range(first_token, last_token):
-        kv = pl.tile.create([WINDOW_KEYS // 2, HEAD_DIM], dtype=pl.BF16, target_memory=pl.Mem.Vec)
-        kv_flat = pl.tile.reshape(kv, [WINDOW_KEYS // 2 * HEAD_DIM])
+        kv_storage: pl.Tile[
+            [SPARSE_VF_SWA_KV_LANE_ROWS, HEAD_DIM], pl.BF16, pl.MemRef("swa_kv_nz"), pl.Mem.Vec
+        ] = pl.tile.create([SPARSE_VF_SWA_KV_LANE_ROWS, HEAD_DIM], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+        kv_flat = pl.tile.reshape(kv_storage, [SPARSE_VF_SWA_KV_LANE_ROWS * HEAD_DIM])
         for chunk_id in pl.unroll(WINDOW_KEYS // (2 * SPARSE_VF_GATHER_TILE)):
             start = chunk_id * SPARSE_VF_GATHER_TILE
-            key_start = lane * (WINDOW_KEYS // 2) + start
+            key_start = lane * SPARSE_VF_SWA_KV_LANE_ROWS + start
             gather_ids = pl.tile.load(indices, [token, key_start], [1, SPARSE_VF_GATHER_TILE], target_memory=pl.Mem.Vec)
             gather_ids_flat = pl.tile.reshape(gather_ids, [SPARSE_VF_GATHER_TILE])
             first = pl.tile.read(gather_ids, [0, 0])
@@ -4190,12 +4193,13 @@ def _sparse_swa_vector(
                 _write_count = pl.reg.store(count_flat, 0, count)
             classification = pl.tile.read(mismatch_count, [0, 0])
             if classification == 2 * SPARSE_VF_GATHER_TILE:
-                zero_offset = start * HEAD_DIM
                 with pl.reg_scope():
                     zero_kv = pl.reg.broadcast(0.0, lanes=SPARSE_VF_REG_TILE, dtype=pl.BF16)
-                    for zero_chunk in pl.hardware_loop(SPARSE_VF_GATHER_TILE * HEAD_DIM // SPARSE_VF_REG_TILE):
-                        zero_destination = zero_offset + zero_chunk * SPARSE_VF_REG_TILE
-                        _write_zero = pl.reg.store(kv_flat, zero_destination, zero_kv)
+                    for fractal in pl.hardware_loop(HEAD_DIM // 16):
+                        panel_offset = (fractal * SPARSE_VF_SWA_KV_LANE_ROWS + start) * 16
+                        for zero_chunk in pl.hardware_loop(SPARSE_VF_GATHER_TILE * 16 // SPARSE_VF_REG_TILE):
+                            zero_destination = panel_offset + zero_chunk * SPARSE_VF_REG_TILE
+                            _write_zero = pl.reg.store(kv_flat, zero_destination, zero_kv)
             else:
                 # Zero the panel before issuing the row DMAs.
                 raw = pl.tile.full([SPARSE_VF_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
@@ -4267,9 +4271,20 @@ def _sparse_swa_vector(
                             scale_bits = pl.reg.group_broadcast(scale_groups, lanes=SPARSE_VF_REG_TILE)
                             factors = pl.reg.interpret_cast(scale_bits, dtype=pl.BF16)
                             decoded = pl.reg.mul(values, factors, full)
-                            destination = (start + row) * HEAD_DIM + column
-                            _write_kv = pl.reg.store(kv_flat, destination, decoded)
-        pl.system.tpush_to_aic(kv, split=1, id=0)
+                            # NZ interleaves rows within each 16-element column block.
+                            destination = (start + row) * 16 + column * SPARSE_VF_SWA_KV_LANE_ROWS
+                            _write_kv = pl.reg.store(
+                                kv_flat, destination, decoded, full, block_stride=SPARSE_VF_SWA_KV_LANE_ROWS
+                            )
+        # The FIFO consumes the NZ view of the register store buffer.
+        kv_nz: pl.Tile[
+            [SPARSE_VF_SWA_KV_LANE_ROWS, HEAD_DIM],
+            pl.BF16,
+            pl.MemRef("swa_kv_nz"),
+            pl.Mem.Vec,
+            pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512),
+        ] = pl.tile.create([SPARSE_VF_SWA_KV_LANE_ROWS, HEAD_DIM], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+        pl.system.tpush_to_aic(kv_nz, split=1, id=0)
         # The result FIFO holds both panels of the previous token.
         if token > first_token:
             previous_norm = pl.reshape(norm, [SPARSE_VF_FUSED_AIV_HEAD_TILE, 1])
