@@ -967,6 +967,24 @@ def _sort_topk_leaf(
     pl.store(top_pairs, [output_slot, 0], arena)
 
 
+@pl.jit.inline
+def _store_short_c1a_pages(
+    logical: pl.Tile[[1, INDEX_TOPK], pl.INT32],
+    table: pl.Tensor,
+    request: pl.Scalar[pl.INT32],
+    output: pl.Tensor,
+    row: pl.Scalar[pl.INDEX],
+):
+    pages = pl.load(table, [request, 0], [1, 8], valid_shape=[1, pl.min(8, pl.tensor.dim(table, 1))])
+    pages = pl.tile.fillpad(pages, pad_value=pl.PadValue.zero)
+    safe = pl.maximum(logical, 0)
+    tmp = pl.tile.create([1, 256], dtype=pl.UINT8)
+    physical_pages = pl.tile.gather(pages, pl.shrs(safe, 7), tmp)
+    physical = pl.add(pl.shls(physical_pages, 7), pl.ands(safe, 127))
+    mapped = pl.tile.select(pl.tile.cmps(logical, -1, cmp_type=4), physical, -1)
+    pl.store(mapped, [row, 0], output)
+
+
 @pl.jit.inline(auto_scope=False)
 def _select_short_c1a_topk(
     scores: pl.Tensor,
@@ -1002,41 +1020,58 @@ def _select_short_c1a_topk(
                 values = pl.tile.fillpad(raw, pad_value=pl.PadValue.min)
                 if bf16_scores:
                     values = pl.cast(values, pl.FP32)
-                # The producer rounds to BF16 before storing FP32. Embed its sortable
-                # bit rank and reverse lane in the bits of a positive normal FP32.
-                # This also preserves subnormal-score ties on flush-to-zero hardware.
-                bits = pl.shrs(pl.reinterpret_view(values, pl.INT32), 16)
-                low = pl.sub(pl.tile.full([1, 1024], dtype=pl.INT32, value=-1), bits)
-                rank = pl.tile.select(pl.tile.cmps(bits, 0, cmp_type=2), low, pl.add(bits, 32768))
-                rank = pl.tile.select(pl.tile.cmps(bits, -32768, cmp_type=0),
-                                      pl.tile.full([1, 1024], dtype=pl.INT32, value=32768), rank)
-                keys = pl.reinterpret_view(pl.add(pl.add(pl.shls(rank, 10), tie), 1065353216), pl.FP32)
-                keys = pl.tile.select(pl.tile.cmps(values, -1e29, cmp_type=4), keys, 0.0)
-                pairs = pl.tile.sort32(keys, pl.reinterpret_view(lanes, pl.UINT32))
-                pairs = pl.tile.mrgsort(pairs, block_len=64)
-                pairs = pl.tile.mrgsort(pairs, block_len=256)
-                left = pl.tile.slice(pairs, [1, 1024], [0, 0])
-                right = pl.tile.slice(pairs, [1, 1024], [0, 1024])
-                merge_tmp = pl.tile.create([1, 2048], dtype=pl.FP32)
-                pairs = pl.tile.mrgsort(left, right, tmp=merge_tmp)
-                top = pl.tile.slice(pairs, [1, 2 * INDEX_TOPK], [0, 0])
-                key = pl.tile.gather_mask(top, mask_pattern=pl.tile.MaskPattern.P0101)
-                ids = pl.tile.gather_mask(top, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-                valid = pl.tile.cmps(key, 0.0, cmp_type=4)
-                order = pl.tile.select(valid, pl.mul(pl.cast(ids, pl.FP32), -1.0), -2048.0)
-                ids = pl.tile.select(valid, ids, -1)
-                ordered = pl.tile.sort32(order, pl.reinterpret_view(ids, pl.UINT32))
-                ordered = pl.tile.mrgsort(ordered, block_len=64)
-                ordered = pl.tile.mrgsort(ordered, block_len=256)
-                logical = pl.tile.gather_mask(ordered, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-                pages = pl.load(table, [request, 0], [1, 8], valid_shape=[1, pl.min(8, pl.tensor.dim(table, 1))])
-                pages = pl.tile.fillpad(pages, pad_value=pl.PadValue.zero)
-                safe = pl.maximum(logical, 0)
-                tmp = pl.tile.create([1, 256], dtype=pl.UINT8)
-                physical_pages = pl.tile.gather(pages, pl.shrs(safe, 7), tmp)
-                physical = pl.add(pl.shls(physical_pages, 7), pl.ands(safe, 127))
-                mapped = pl.tile.select(pl.tile.cmps(logical, -1, cmp_type=4), physical, -1)
-                pl.store(mapped, [row, 0], output)
+                # Count eligible scores before emitting the whole visible prefix.
+                all_visible = pl.cast(0, pl.INT32)
+                if length <= INDEX_TOPK:
+                    observed = pl.tile.slice(values, [1, INDEX_TOPK], [0, 0])
+                    status = pl.create_tile([1, 64], dtype=pl.INT32, target_memory=pl.Mem.Vec)
+                    flat_status = pl.reshape(status, [64])
+                    flat_values = pl.reshape(observed, [INDEX_TOPK])
+                    with pl.reg_scope():
+                        full = pl.reg.full_mask(lanes=64)
+                        one = pl.reg.broadcast(1, lanes=64, dtype=pl.INT32)
+                        zero = pl.reg.broadcast(0, lanes=64, dtype=pl.INT32)
+                        sums = pl.reg.broadcast(0, lanes=64, dtype=pl.INT32)
+                        for segment in pl.hardware_loop(INDEX_TOPK // 64):
+                            item = pl.reg.load(flat_values, segment * 64, lanes=64)
+                            keep = pl.reg.compares(item, -1e29, full, predicate="gt")
+                            sums = pl.reg.add(sums, pl.reg.select(keep, one, zero), full)
+                        total = pl.reg.reduce_sum(sums, full)
+                        _saved = pl.reg.store(flat_status, 0, total, pl.reg.active_mask(1, lanes=1))
+                    all_visible = pl.cast(pl.tile.read(status, [0, 0]) == pl.cast(length, pl.INT32), pl.INT32)
+                if all_visible != 0:
+                    short_lanes = pl.tile.slice(lanes, [1, INDEX_TOPK], [0, 0])
+                    short_logical = pl.tile.select(pl.tile.cmps(short_lanes, pl.cast(length, pl.INT32), cmp_type=2), short_lanes, -1)
+                    _store_short_c1a_pages(short_logical, table, request, output, row)
+                else:
+                    # The producer rounds to BF16 before storing FP32. Embed its sortable
+                    # bit rank and reverse lane in the bits of a positive normal FP32.
+                    # This also preserves subnormal-score ties on flush-to-zero hardware.
+                    bits = pl.shrs(pl.reinterpret_view(values, pl.INT32), 16)
+                    low = pl.sub(pl.tile.full([1, 1024], dtype=pl.INT32, value=-1), bits)
+                    rank = pl.tile.select(pl.tile.cmps(bits, 0, cmp_type=2), low, pl.add(bits, 32768))
+                    rank = pl.tile.select(pl.tile.cmps(bits, -32768, cmp_type=0),
+                                          pl.tile.full([1, 1024], dtype=pl.INT32, value=32768), rank)
+                    keys = pl.reinterpret_view(pl.add(pl.add(pl.shls(rank, 10), tie), 1065353216), pl.FP32)
+                    keys = pl.tile.select(pl.tile.cmps(values, -1e29, cmp_type=4), keys, 0.0)
+                    pairs = pl.tile.sort32(keys, pl.reinterpret_view(lanes, pl.UINT32))
+                    pairs = pl.tile.mrgsort(pairs, block_len=64)
+                    pairs = pl.tile.mrgsort(pairs, block_len=256)
+                    left = pl.tile.slice(pairs, [1, 1024], [0, 0])
+                    right = pl.tile.slice(pairs, [1, 1024], [0, 1024])
+                    merge_tmp = pl.tile.create([1, 2048], dtype=pl.FP32)
+                    pairs = pl.tile.mrgsort(left, right, tmp=merge_tmp)
+                    top = pl.tile.slice(pairs, [1, 2 * INDEX_TOPK], [0, 0])
+                    key = pl.tile.gather_mask(top, mask_pattern=pl.tile.MaskPattern.P0101)
+                    ids = pl.tile.gather_mask(top, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+                    valid = pl.tile.cmps(key, 0.0, cmp_type=4)
+                    order = pl.tile.select(valid, pl.mul(pl.cast(ids, pl.FP32), -1.0), -2048.0)
+                    ids = pl.tile.select(valid, ids, -1)
+                    ordered = pl.tile.sort32(order, pl.reinterpret_view(ids, pl.UINT32))
+                    ordered = pl.tile.mrgsort(ordered, block_len=64)
+                    ordered = pl.tile.mrgsort(ordered, block_len=256)
+                    logical = pl.tile.gather_mask(ordered, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+                    _store_short_c1a_pages(logical, table, request, output, row)
             else:
                 pl.store(empty, [row, 0], output)
     return selected
