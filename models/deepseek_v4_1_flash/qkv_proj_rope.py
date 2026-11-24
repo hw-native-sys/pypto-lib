@@ -50,10 +50,13 @@ NATIVE_VALIDATION_WORKERS = 32
 Q_NORM_FOLD = 1024
 Q_NORM_SCALE_GROUP_TILE = ((Q_LORA // 64 + 7) // 8) * 8
 WINDOW_HEAD_DIM = 512
-WINDOW_PAGE_SIZE = 128
 
 # Window tiling.
 WINDOW_ROW_TILE = 8
+# Sixteen 544-byte rows span whole 512-byte cache lines. Assign every
+# write to the same slot to one worker, even when the slot list repeats.
+WINDOW_OWNER_ROWS = 16
+WINDOW_PAGE_SIZE = 128
 WINDOW_SLOT_TILE = 128
 
 
@@ -276,12 +279,12 @@ def q_norm_quant(
     capacity = pl.tensor.dim(payload, 0)
     scale_rows = capacity // MX_M_TILE * (Q_LORA // 64)
     scale_blocks = pl.reshape(scales, [scale_rows, MX_M_TILE * 2])
+    # Use half-tiles when all packed groups fit across the available Vector cores.
+    available_vectors = 2 * pl.system.available_cluster_count()
     row_tile = MX_M_TILE
-    if capacity <= 128:
+    if capacity <= (MX_M_TILE // 2) * available_vectors:
         row_tile = MX_M_TILE // 2
     chunks = capacity // row_tile
-    # Limit launch fanout so fewer AIV completions reach the scheduler together.
-    available_vectors = pl.min(32, 2 * pl.system.available_cluster_count())
     norm_workers = pl.max(pl.min(chunks, available_vectors), 1)
     with pl.spmd(norm_workers, name_hint="q_norm_quant"):
         worker = pl.tile.get_block_idx()
@@ -302,13 +305,17 @@ def q_norm_quant(
                 normalized = pl.create_tile([MX_M_TILE * Q_LORA], dtype=pl.BF16, target_memory=pl.Mem.Vec)
 
                 # Constant row counts let PTOAS prove disjoint UB accesses.
-                # Keep the dynamic path for other tail lengths.
+                # Pad partial groups in UB before using a fixed trip count.
                 if active == MX_M_TILE // 2:
                     _q_norm_quant_rows(source, gamma, normalized, quant_words, row_scales, MX_M_TILE // 2)
                 elif active == MX_M_TILE:
                     _q_norm_quant_rows(source, gamma, normalized, quant_words, row_scales, MX_M_TILE)
                 else:
-                    _q_norm_quant_rows(source, gamma, normalized, quant_words, row_scales, active)
+                    padded = pl.tile.fillpad(source, pad_value=pl.PadValue.zero)
+                    if active < MX_M_TILE // 2:
+                        _q_norm_quant_rows(padded, gamma, normalized, quant_words, row_scales, MX_M_TILE // 2)
+                    else:
+                        _q_norm_quant_rows(padded, gamma, normalized, quant_words, row_scales, MX_M_TILE)
                 latent_tile = pl.reshape(normalized, [MX_M_TILE, Q_LORA])
                 valid_latent = pl.tile.slice(latent_tile, [MX_M_TILE, Q_LORA], [0, 0], valid_shape=[active, Q_LORA])
                 pl.store(valid_latent, [first, 0], latent)
@@ -505,7 +512,7 @@ def _proj_q_a_decode(
     n_tile: pl.constexpr,
     k_tile: pl.constexpr,
 ):
-    """Project decode tiles with two L1 panels of five MX fragments each."""
+    """Project tiles with two L1 panels of five MX fragments each."""
     panel_k = 5 * k_tile
     panel_pairs = D // (2 * panel_k)
     # Each scale band packs 16 rows and one exponent per 32 K values.
@@ -515,12 +522,12 @@ def _proj_q_a_decode(
     nz_weight: pl.Tensor[[5120, 1280], pl.FP8E4M3FN, pl.NZ] = weight[:, :]
     raw_b = pl.tensor.view(weight_scale, [80, 2560], layout=pl.ND)
     tasks = ((rows + m_tile - 1) // m_tile) * output_tiles
-    stride = pl.max(1, worker_limit)
-    workers = pl.max(1, pl.min(tasks, stride))
+    budget = pl.min(worker_limit, pl.system.available_cluster_count())
+    workers = pl.max(1, pl.min(tasks, budget))
     for worker in pl.spmd(workers, sync_start=False, name_hint="proj_q_a"):
         scale_bands = pl.tensor.dim(activation_scale, 1) // 2560
         raw_a = pl.tensor.view(activation_scale, [scale_bands, 2560], layout=pl.ND)
-        for base in pl.range(0, tasks, stride):
+        for base in pl.range(0, tasks, pl.tile.get_block_num()):
             task = base + worker
             if task < tasks:
                 row = task // output_tiles * m_tile
@@ -824,45 +831,15 @@ def proj_q_a_wide(
     worker_limit: pl.constexpr,
     row_tile: pl.constexpr,
 ):
-    """Project M128 and M256 tiles with K256 MX fragments."""
-    nz_weight: pl.Tensor[[5120, 1280], pl.FP8E4M3FN, pl.NZ] = weight[:, :]
-    raw_b = pl.tensor.view(weight_scale, [80, 2560], layout=pl.ND)
-    tasks = ((rows + row_tile - 1) // row_tile) * 10
-    stride = pl.max(1, worker_limit)
-    workers = pl.max(1, pl.min(tasks, stride))
-    for worker in pl.spmd(workers, sync_start=False, name_hint="proj_q_a"):
-        scale_bands = pl.tensor.dim(activation_scale, 1) // 2560
-        raw_a = pl.tensor.view(activation_scale, [scale_bands, 2560], layout=pl.ND)
-        for base in pl.range(0, tasks, stride):
-            task = base + worker
-            if task < tasks:
-                row = task // 10 * row_tile
-                col = task % 10 * 128
-                a0 = pl.load(payload, [row, 0], [row_tile, 256], target_memory=pl.Mem.Mat)
-                sa0_flat: pl.Tile[[row_tile // 16, 128], pl.FP8E8M0, pl.MemRef("sa_pack"), pl.Mem.Mat] = pl.tile.create([row_tile // 16, 128], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
-                sa0_dest = pl.tile.reshape(sa0_flat, [row_tile // 16, 128])
-                sa0_bytes = pl.tile.gather_row(sa0_dest, raw_a, [0, 0], [row // 16, 0], [row_tile // 16, 128])
-                sa0: pl.Tile[[row_tile, 8], pl.FP8E8M0, pl.MemRef("sa_pack"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([row_tile, 8], pl.FP8E8M0, target_memory=pl.Mem.Mat)
-                b0 = pl.load(nz_weight, [0, col], [256, 128], target_memory=pl.Mem.Mat)
-                sb0_flat: pl.Tile[[8, 128], pl.FP8E8M0, pl.MemRef("sb_pack"), pl.Mem.Mat] = pl.tile.create([8, 128], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
-                sb0_dest = pl.tile.reshape(sb0_flat, [8, 128])
-                sb0_bytes = pl.tile.gather_row(sb0_dest, raw_b, [0, 0], [col // 16, 0], [8, 128])
-                sb0: pl.Tile[[8, 128], pl.FP8E8M0, pl.MemRef("sb_pack"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([8, 128], pl.FP8E8M0, target_memory=pl.Mem.Mat)
-                acc = pl.matmul_mx(a0, sa0, b0, sb0)
-                for k in pl.range(256, 5120, 256):
-                    av = pl.load(payload, [row, k], [row_tile, 256], target_memory=pl.Mem.Mat)
-                    sav_flat: pl.Tile[[row_tile // 16, 128], pl.FP8E8M0, pl.MemRef("sa_pack"), pl.Mem.Mat] = pl.tile.create([row_tile // 16, 128], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
-                    sav_dest = pl.tile.reshape(sav_flat, [row_tile // 16, 128])
-                    sav_bytes = pl.tile.gather_row(sav_dest, raw_a, [0, 0], [row // 16, k // 32 * 16], [row_tile // 16, 128])
-                    sav: pl.Tile[[row_tile, 8], pl.FP8E8M0, pl.MemRef("sa_pack"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([row_tile, 8], pl.FP8E8M0, target_memory=pl.Mem.Mat)
-                    bv = pl.load(nz_weight, [k, col], [256, 128], target_memory=pl.Mem.Mat)
-                    sbv_flat: pl.Tile[[8, 128], pl.FP8E8M0, pl.MemRef("sb_pack"), pl.Mem.Mat] = pl.tile.create([8, 128], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True)
-                    sbv_dest = pl.tile.reshape(sbv_flat, [8, 128])
-                    sbv_bytes = pl.tile.gather_row(sbv_dest, raw_b, [0, 0], [col // 16, k // 32 * 16], [8, 128])
-                    sbv: pl.Tile[[8, 128], pl.FP8E8M0, pl.MemRef("sb_pack"), pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([8, 128], pl.FP8E8M0, target_memory=pl.Mem.Mat)
-                    acc = pl.matmul_mx_acc(acc, av, sav, bv, sbv)
-                valid = pl.set_validshape(acc, pl.min(row_tile, rows - row), 128)
-                output = pl.store(valid, [row, col], output)
+    """Use wider column tiles once the M grid fills the worker budget."""
+    row_tiles = (rows + row_tile - 1) // row_tile
+    budget = pl.max(1, pl.min(worker_limit, pl.system.available_cluster_count()))
+    if row_tiles * (Q_LORA // 128) <= budget:
+        output = _proj_q_a_decode(payload, weight, activation_scale, weight_scale, output,
+                                  rows, worker_limit, row_tile, 128, 128)
+    else:
+        output = _proj_q_a_decode(payload, weight, activation_scale, weight_scale, output,
+                                  rows, worker_limit, row_tile, 256, 64)
     return output
 
 
@@ -879,10 +856,19 @@ def proj_q_a(
 ):
     """Project Q-A using the caller's row tile and worker limit."""
     payload_rows = pl.tensor.dim(payload, 0)
-    if payload_rows < 128 or row_tile == 80:
+    narrow_tiles = (rows + 127) // 128
+    wide_tiles = (rows + 255) // 256
+    budget = pl.max(1, pl.min(worker_limit, pl.system.available_cluster_count()))
+    # The native loads read whole MX tiles. Compact decode/validation
+    # buffers are padded to M80; prefill quantization also covers M256.
+    if row_tile == 80 or narrow_tiles * 128 > payload_rows:
         output = proj_q_a_pypto(payload, weight, activation_scale, weight_scale, output, rows, worker_limit)
-    elif payload_rows < 256 or row_tile == 128:
-        output = _proj_q_a_decode(payload, weight, activation_scale, weight_scale, output, rows, worker_limit, 128, 128, 128)
+    elif row_tile == 256 and narrow_tiles * (Q_LORA // 64) <= budget:
+        output = _proj_q_a_decode(payload, weight, activation_scale, weight_scale, output,
+                                  rows, worker_limit, 128, 64, 256)
+    elif row_tile == 128 or narrow_tiles * (Q_LORA // 128) <= budget or wide_tiles * 256 > payload_rows:
+        output = _proj_q_a_decode(payload, weight, activation_scale, weight_scale, output,
+                                  rows, worker_limit, 128, 128, 128)
     else:
         output = proj_q_a_wide(payload, weight, activation_scale, weight_scale, output, rows, worker_limit, 256)
     return output
@@ -909,7 +895,7 @@ def q_proj_rope(
     qb_row_tile: pl.constexpr = 80,
 ):
     """Project NZ QA/QB weights, rotate Q, and retain normalized rows for Index-Q."""
-    # Native QA tiles: M80/N64, M128/N128, or M256/N128; QB tiles: M80/N256 or M128/N256.
+    # Prefill Q-A selects the grid from its active rows and worker budget.
     qa_tile = qa_row_tile
     # Minimize padded row work; equal padding selects the wider tile.
     narrow_rows = ((num_tokens + PROJ_M_TILE - 1) // PROJ_M_TILE) * PROJ_M_TILE
@@ -944,13 +930,28 @@ def q_proj_rope(
     norm_scales = pl.tensor.slice(qb_scales, [1, payload_rows * (Q_LORA // 32)], [0, 0])
     q_norm_quant(projected, q_norm_weight, norm_latent, norm_payload, norm_scales, num_tokens)
     qb_scale_stream = pl.reshape(qb_scales, [pl.tensor.dim(qb_scales, 1)])
-    qb_tasks = ((num_tokens + qb_tile - 1) // qb_tile) * (LOCAL_H * HEAD_DIM // Q_B_N_TILE)
+    qb_row_tiles = (num_tokens + qb_tile - 1) // qb_tile
+    qb_tasks = qb_row_tiles * (LOCAL_H * HEAD_DIM // Q_B_N_TILE)
     qb_workers = pl.max(pl.min(qb_tasks, pl.min(qb_worker_limit, pl.system.available_cluster_count())), 1)
-    with pl.spmd(qb_workers, name_hint="proj_q_b"):
-        query = _proj_q_b(
-            qb_payload, wq_b, qb_scale_stream, wq_b_scale,
-            query, rope_cos, rope_sin, num_tokens, LOCAL_H * HEAD_DIM, 0, qb_tile,
-        )
+    active_workers = qb_workers
+    if qb_row_tile == PROJ_WIDE_M_TILE:
+        if qb_row_tiles > 1:
+            # The prefill kernel assigns an even number of column lanes to each row tile.
+            lanes = pl.max(2, qb_workers // qb_row_tiles // 2 * 2)
+            active_workers = pl.min(qb_workers, qb_row_tiles * lanes)
+    if active_workers < qb_workers:
+        # Admit the partial mixed group together while the independent KV projection can run.
+        with pl.spmd(active_workers, name_hint="proj_q_b", sync_start=True):
+            query = _proj_q_b(
+                qb_payload, wq_b, qb_scale_stream, wq_b_scale,
+                query, rope_cos, rope_sin, num_tokens, LOCAL_H * HEAD_DIM, 0, qb_tile,
+            )
+    else:
+        with pl.spmd(qb_workers, name_hint="proj_q_b"):
+            query = _proj_q_b(
+                qb_payload, wq_b, qb_scale_stream, wq_b_scale,
+                query, rope_cos, rope_sin, num_tokens, LOCAL_H * HEAD_DIM, 0, qb_tile,
+            )
     return qb_payload, qb_scales
 
 
@@ -1154,6 +1155,16 @@ def _flush_window(
     return cache
 
 
+@pl.jit.inline(auto_scope=False)
+def _window_slot_owner(slot: pl.Scalar[pl.INT64], workers: pl.Scalar[pl.UINT64]):
+    # Space a page's stripes across the workers and rotate equal offsets by page.
+    unsigned_slot = pl.cast(slot, pl.UINT64)
+    page = unsigned_slot // WINDOW_PAGE_SIZE
+    stripe = (unsigned_slot % WINDOW_PAGE_SIZE) // WINDOW_OWNER_ROWS
+    stripes_per_page = WINDOW_PAGE_SIZE // WINDOW_OWNER_ROWS
+    return (page + stripe * workers // stripes_per_page) % workers
+
+
 @pl.jit.incore
 def norm_rope_publish(
     source: pl.Tensor,
@@ -1164,9 +1175,9 @@ def norm_rope_publish(
     cache: pl.InOut[pl.Tensor],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor:
-    """Normalize, rotate, quantize, and publish rows owned by this cache page worker."""
-    worker = pl.tile.get_block_idx()
-    workers = pl.tile.get_block_num()
+    """Normalize, rotate, quantize, and publish rows owned by this worker."""
+    worker = pl.cast(pl.tile.get_block_idx(), pl.UINT64)
+    workers = pl.cast(pl.tile.get_block_num(), pl.UINT64)
     gamma = pl.load(weight, [0], [WINDOW_HEAD_DIM], target_memory=pl.Mem.Vec)
     inputs = pl.tile.create([WINDOW_ROW_TILE, WINDOW_HEAD_DIM], dtype=pl.BF16, target_memory=pl.Mem.Vec)
     cosv = pl.tile.create([WINDOW_ROW_TILE, 32], dtype=pl.FP32, target_memory=pl.Mem.Vec)
@@ -1181,9 +1192,7 @@ def norm_rope_publish(
             slot = pl.tile.read(slot_tile, [lane])
             accepted = False
             if slot >= 0:
-                unsigned_slot = pl.cast(slot, pl.UINT64)
-                owner = (unsigned_slot // WINDOW_PAGE_SIZE) % pl.cast(workers, pl.UINT64)
-                accepted = owner == pl.cast(worker, pl.UINT64)
+                accepted = _window_slot_owner(slot, workers) == worker
             if accepted:
                 run = 0
                 scanning = True
@@ -1191,9 +1200,7 @@ def norm_rope_publish(
                     target = pl.tile.read(slot_tile, [lane + run])
                     owned = False
                     if target >= 0:
-                        unsigned_target = pl.cast(target, pl.UINT64)
-                        target_owner = (unsigned_target // WINDOW_PAGE_SIZE) % pl.cast(workers, pl.UINT64)
-                        owned = target_owner == pl.cast(worker, pl.UINT64)
+                        owned = _window_slot_owner(target, workers) == worker
                     if owned:
                         _target = pl.tile.write(targets, [pending + run], target)
                         run = run + 1
@@ -1233,12 +1240,11 @@ def window_publish(
 ):
     """Fuse RMSNorm, RoPE, group-32 FP8 quantization, and window cache publication."""
     workers = pl.max(1, pl.min(num_tokens, WINDOW_PUBLISH_WORKER_TILE))
-    cache_rows = pl.tensor.dim(cache, 0) * 128
+    cache_rows = pl.tensor.dim(cache, 0) * WINDOW_PAGE_SIZE
     flat_cache = pl.reshape(cache, [cache_rows, 544])
     with pl.spmd(workers, name_hint="norm_rope_pub_win"):
         _published = norm_rope_publish(kv_projection, kv_norm_weight, rope_cos, rope_sin, slots, flat_cache, num_tokens)
     return cache
-
 
 
 @pl.jit.inline(auto_scope=False)
@@ -2052,9 +2058,25 @@ def kv_proj_pypto(
 ):
     """Project packed KV weights using the model's decode or prefill output tiles."""
     if row_tile == 256:
-        kv_projection = _proj_kv_tile_pypto(
-            payload, wkv, scales, wkv_scale, kv_projection, num_tokens, worker_limit, 256, 256, 128,
-        )
+        # Use the widest column tile that supplies enough work for this prefill.
+        row_tiles = (num_tokens + 255) // 256
+        workers = pl.max(1, pl.min(worker_limit, pl.system.available_cluster_count()))
+        if num_tokens <= 128:
+            kv_projection = _proj_kv_tile_pypto(
+                payload, wkv, scales, wkv_scale, kv_projection, num_tokens, worker_limit, 128, KV_N_TILE, 128,
+            )
+        elif row_tiles * (HEAD_DIM // 256) >= workers:
+            kv_projection = _proj_kv_tile_pypto(
+                payload, wkv, scales, wkv_scale, kv_projection, num_tokens, worker_limit, 256, 256, 128,
+            )
+        elif row_tiles * (HEAD_DIM // 128) >= workers:
+            kv_projection = _proj_kv_tile_pypto(
+                payload, wkv, scales, wkv_scale, kv_projection, num_tokens, worker_limit, 256, 128, 128,
+            )
+        else:
+            kv_projection = _proj_kv_tile_pypto(
+                payload, wkv, scales, wkv_scale, kv_projection, num_tokens, worker_limit, 256, KV_N_TILE, 128,
+            )
     else:
         kv_projection = _proj_kv_tile_pypto(
             payload, wkv, scales, wkv_scale, kv_projection, num_tokens, worker_limit, 80, KV_N_TILE, 256,
@@ -2361,7 +2383,11 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
     config = {"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device}
-    for active, capacity, row_tile in ((72, 80, 80), (127, 160, 128), (129, 320, 256)):
+    cases = (
+        (72, 80, 80), (127, 160, 128), (129, 320, 256),
+        (127, 160, 256), (511, 560, 256), (1023, 1040, 256),
+    )
+    for active, capacity, row_tile in cases:
         result = run(
             a5_default_runtime="host_build_graph",
             fn=proj_q_a_validation,

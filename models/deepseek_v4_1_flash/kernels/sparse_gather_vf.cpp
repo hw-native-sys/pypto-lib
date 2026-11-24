@@ -248,9 +248,11 @@ struct WorkPlan {
     int first_token;
     int tiles;
     int queries;
+    int planned_tiles;
+    int planned_queries;
 };
 
-template <int Parts, bool Balanced>
+template <int Parts, bool Balanced, bool Compact = false>
 __aicore__ inline WorkPlan work_plan(__gm__ int64_t* args) {
     const int workers = get_block_num(args);
     const int block = get_block_idx(args);
@@ -259,6 +261,29 @@ __aicore__ inline WorkPlan work_plan(__gm__ int64_t* args) {
     WorkPlan plan;
     plan.workers = workers;
     plan.block = block;
+    if constexpr (Compact) {
+        const int capacity = (tokens + workers - 1) / workers * Parts;
+        const int stride = 128 + (capacity + 127) / 128 * 128;
+        plan.begin = block * stride;
+        auto sequence = data<int32_t>(args, ARG_PARTIALS) + plan.begin;
+#if !defined(__CPU_SIM)
+        dcci(reinterpret_cast<__gm__ void*>(sequence), cache_line_t::SINGLE_CACHE_LINE);
+        dsb(DSB_DDR);
+#endif
+        plan.queries = block < tokens ? (tokens - block + workers - 1) / workers : 0;
+        plan.first_token = block;
+        plan.planned_tiles = sequence[0];
+        plan.planned_queries = sequence[1];
+#if !defined(__CPU_SIM)
+        for (int i = 0; i < plan.planned_tiles; i += 16) {
+            dcci(reinterpret_cast<__gm__ void*>(sequence + 128 + i), cache_line_t::SINGLE_CACHE_LINE);
+        }
+        dsb(DSB_DDR);
+#endif
+        plan.tiles = plan.planned_tiles + (plan.queries - plan.planned_queries) * Parts;
+        plan.end = plan.tiles;
+        return plan;
+    }
     if constexpr (Balanced) {
         plan.begin = (int64_t)tokens * parts * block / workers;
         plan.end = (int64_t)tokens * parts * (block + 1) / workers;
@@ -275,9 +300,32 @@ __aicore__ inline WorkPlan work_plan(__gm__ int64_t* args) {
     return plan;
 }
 
-template <int Parts, bool Balanced>
+template <int Parts, bool Balanced, bool Compact = false>
 __aicore__ inline TileTask make_task(__gm__ int64_t* args, const WorkPlan& plan, int ordinal) {
     const int parts = Parts > 0 ? Parts : (args[ARG_WINDOW_KEYS] + args[ARG_COMPRESSED_KEYS]) / TILE_KEYS;
+    if constexpr (Compact) {
+        int code;
+        if (ordinal < plan.planned_tiles) {
+            code = data<int32_t>(args, ARG_PARTIALS)[plan.begin + 128 + ordinal];
+        } else {
+            // The suffix uses the complete original sequence, even if a later
+            // row happens to contain empty parts after the pilot's dense row.
+            const int tile = ordinal - plan.planned_tiles;
+            const int part = tile % Parts;
+            code = (plan.planned_queries + tile / Parts) * 16 + part + (part + 1 == Parts ? 8 : 0);
+        }
+        TileTask task;
+        task.ordinal = ordinal;
+        task.part = code & 7;
+        task.query = code >> 4;
+        task.token = plan.block + task.query * plan.workers;
+        task.query_slot = task.query & 1;
+        task.first = task.part == 0;
+        task.last = (code & 8) != 0;
+        task.compressed = !task.first;
+        task.partial_slot = -1;
+        return task;
+    }
     const int position = Balanced ? plan.begin + ordinal : ordinal;
     const int query = parts == 1 ? position : (parts == 5 ? position / 5 : position / parts);
     TileTask task;
@@ -296,6 +344,18 @@ __aicore__ inline TileTask make_task(__gm__ int64_t* args, const WorkPlan& plan,
     }
     return task;
 }
+
+#if !defined(__CPU_SIM)
+__aicore__ inline bool may_have_empty_tiles(__gm__ int64_t* args) {
+    auto last_id = data<int32_t>(args, ARG_COMPRESSED_INDICES) +
+        (int64_t)get_block_idx(args) * row_stride(args, ARG_COMPRESSED_INDICES) + args[ARG_COMPRESSED_KEYS] - 1;
+    // This one-index pilot selects which correct algorithm to run. Only a full
+    // tile reduction below can remove an actual key tile from the workload.
+    dcci(reinterpret_cast<__gm__ void*>(last_id), cache_line_t::SINGLE_CACHE_LINE);
+    dsb(DSB_DDR);
+    return *last_id < 0;
+}
+#endif
 
 #if defined(__DAV_CUBE__) && !defined(__CPU_SIM)
 template <pipe_t Pipe>
@@ -490,9 +550,9 @@ __aicore__ inline void compute_pv(__gm__ int64_t* args, const TileTask& task) {
     set_flag(PIPE_M, PIPE_MTE1, static_cast<event_t>(p_stage));
 }
 
-template <int Parts, bool Balanced>
+template <int Parts, bool Balanced, bool Compact = false>
 __aicore__ inline void attend_cube(__gm__ int64_t* args) {
-    const WorkPlan plan = work_plan<Parts, Balanced>(args);
+    const WorkPlan plan = work_plan<Parts, Balanced, Compact>(args);
     const int queries = plan.queries;
     const int tiles = plan.tiles;
     if (tiles == 0) return;
@@ -511,15 +571,15 @@ __aicore__ inline void attend_cube(__gm__ int64_t* args) {
     // Prologue QK(0), then QK(next) before PV(current), including query boundaries.
     load_q_wide(args, plan.first_token, 0);
     load_q_tail(args, plan.first_token);
-    compute_qk(args, make_task<Parts, Balanced>(args, plan, 0));
+    compute_qk(args, make_task<Parts, Balanced, Compact>(args, plan, 0));
     for (int ordinal = 0; ordinal < tiles; ++ordinal) {
-        const TileTask task = make_task<Parts, Balanced>(args, plan, ordinal);
+        const TileTask task = make_task<Parts, Balanced, Compact>(args, plan, ordinal);
         if (task.first && task.query + 1 < queries) load_q_wide(args, task.token + (Balanced ? 1 : plan.workers), (task.query + 1) & 1);
         if (!task.last) {
-            compute_qk(args, make_task<Parts, Balanced>(args, plan, ordinal + 1));
+            compute_qk(args, make_task<Parts, Balanced, Compact>(args, plan, ordinal + 1));
         } else if (task.query + 1 < queries) {
             load_q_tail(args, task.token + (Balanced ? 1 : plan.workers));
-            compute_qk(args, make_task<Parts, Balanced>(args, plan, ordinal + 1));
+            compute_qk(args, make_task<Parts, Balanced, Compact>(args, plan, ordinal + 1));
         }
         compute_pv(args, task);
     }
@@ -543,6 +603,103 @@ __aicore__ inline void attend_cube(__gm__ int64_t* args) {
 #endif
 
 #if defined(__DAV_VEC__) && !defined(__CPU_SIM)
+constexpr int PLAN_QUERY_TILE = 8;
+using PlanIds = Tile<TileType::Vec, int32_t, PLAN_QUERY_TILE, 512, BLayout::RowMajor, DYNAMIC, 512>;
+using PlanMax = Vec<int32_t, 1, PLAN_QUERY_TILE * 4>;
+using PlanPacket = Vec<int32_t, 1, 128>;
+
+__tf__ __aicore__ inline void compressed_part_maxima(PlanMax::TileDType __out__ result, PlanIds::TileDType __in__ input, uint16_t queries) {
+    auto dst = (__ubuf__ int32_t*)__cce_get_tile_ptr(result);
+    auto src = (__ubuf__ int32_t*)__cce_get_tile_ptr(input);
+    __VEC_SCOPE__ {
+        MaskReg all = pset_b32(PAT_ALL);
+        uint32_t count = 1;
+        MaskReg one = CreatePredicate<int32_t>(count);
+        for (uint16_t query = 0; query < queries; ++query) {
+            for (uint16_t part = 0; part < 4; ++part) {
+                RegTensor<int32_t> lower, upper, maximum;
+                vlds(lower, src, query * 512 + part * 128, NORM);
+                vlds(upper, src, query * 512 + part * 128 + 64, NORM);
+                vmax(maximum, lower, upper, all, MODE_ZEROING);
+                vcmax(maximum, maximum, all, MODE_ZEROING);
+                vsts(maximum, dst, query * 4 + part, ONEPT_B32, one);
+            }
+        }
+    }
+}
+
+__aicore__ inline void store_plan_packet(PlanPacket& packet, __gm__ int32_t* target) {
+    GM<int32_t, 1, 128> dest(target);
+    set_flag(PIPE_S, PIPE_MTE3, static_cast<event_t>(0));
+    wait_flag(PIPE_S, PIPE_MTE3, static_cast<event_t>(0));
+    TSTORE(dest, packet);
+    set_flag(PIPE_MTE3, PIPE_S, static_cast<event_t>(0));
+    wait_flag(PIPE_MTE3, PIPE_S, static_cast<event_t>(0));
+}
+
+__aicore__ inline void make_compact_plan(__gm__ int64_t* args) {
+    const int workers = get_block_num(args);
+    const int block = get_block_idx(args);
+    const int tokens = args[ARG_TOKENS];
+    const int max_tiles = (tokens + workers - 1) / workers * 5;
+    const int stride = 128 + (max_tiles + 127) / 128 * 128;
+    auto list = data<int32_t>(args, ARG_PARTIALS) + block * stride;
+    auto input = data<int32_t>(args, ARG_COMPRESSED_INDICES);
+    const int64_t pitch = row_stride(args, ARG_COMPRESSED_INDICES);
+    PlanMax maxima;
+    PlanPacket packet;
+    TASSIGN(maxima, PLAN_QUERY_TILE * 512 * sizeof(int32_t));
+    TASSIGN(packet, PLAN_QUERY_TILE * 512 * sizeof(int32_t) + 512);
+    TEXPANDS(packet, 0);
+    set_flag(PIPE_V, PIPE_S, static_cast<event_t>(0));
+    wait_flag(PIPE_V, PIPE_S, static_cast<event_t>(0));
+    int used = 0;
+    int planned_queries = 0;
+    const int queries = block < tokens ? (tokens - block + workers - 1) / workers : 0;
+    bool complete_suffix = false;
+    for (int first = 0; first < queries && !complete_suffix; first += PLAN_QUERY_TILE) {
+        const int count = queries - first < PLAN_QUERY_TILE ? queries - first : PLAN_QUERY_TILE;
+        const int token = block + first * workers;
+        PlanIds ids(count);
+        TASSIGN(ids, 0);
+        using IndexShape = Shape<1, 1, 1, DYNAMIC, 512>;
+        using IndexStride = pto::Stride<1, 1, 1, DYNAMIC, 1>;
+        GlobalTensor<int32_t, IndexShape, IndexStride> tile(
+            input + token * pitch, IndexShape(1, 1, 1, count, 512), IndexStride(1, 1, 1, workers * pitch, 1));
+        TLOAD(ids, tile);
+        set_flag(PIPE_MTE2, PIPE_V, static_cast<event_t>(0));
+        wait_flag(PIPE_MTE2, PIPE_V, static_cast<event_t>(0));
+        compressed_part_maxima(maxima.data(), ids.data(), count);
+        set_flag(PIPE_V, PIPE_S, static_cast<event_t>(0));
+        wait_flag(PIPE_V, PIPE_S, static_cast<event_t>(0));
+        for (int local = 0; local < count; ++local) {
+            const int query = first + local;
+            unsigned selected = 1;
+            for (int group = 0; group < 4; ++group) {
+                if (maxima.GetValue(local * 4 + group) >= 0) selected |= 2u << group;
+            }
+            // Once all parts contribute, the regular suffix avoids scanning and
+            // storing a worklist with no useful changes. Arbitrary later rows
+            // remain correct because their full masks are still honored on-chip.
+            if (selected == 31) { complete_suffix = true; break; }
+            ++planned_queries;
+            for (int part = 0; selected != 0; ++part) {
+                if ((selected & (1u << part)) != 0) {
+                    selected &= ~(1u << part);
+                    packet.SetValue(used & 127, query * 16 + part + (selected == 0 ? 8 : 0));
+                    ++used;
+                    if ((used & 127) == 0) store_plan_packet(packet, list + used);
+                }
+            }
+        }
+    }
+    if ((used & 127) != 0) store_plan_packet(packet, list + 128 + (used & ~127));
+    // Count is in a different cache line from the list, including its padding.
+    st_dev((uint32_t)used, reinterpret_cast<__gm__ uint32_t*>(list), 0);
+    st_dev((uint32_t)planned_queries, reinterpret_cast<__gm__ uint32_t*>(list + 1), 0);
+    dsb(DSB_DDR);
+}
+
 template <bool FP4>
 __aicore__ inline void gather_rows(__gm__ uint8_t* cache, __gm__ const int32_t* indices, int raw_base) {
     constexpr int row_bytes = FP4 ? 320 : 544;
@@ -825,9 +982,9 @@ __aicore__ inline void load_sink(__gm__ int64_t* args) {
     }
 }
 
-template <int Parts, bool Balanced>
+template <int Parts, bool Balanced, bool Compact = false>
 __aicore__ inline void attend_vector(__gm__ int64_t* args) {
-    const WorkPlan plan = work_plan<Parts, Balanced>(args);
+    const WorkPlan plan = work_plan<Parts, Balanced, Compact>(args);
     const int queries = plan.queries;
     const int tiles = plan.tiles;
     if (tiles == 0) return;
@@ -850,13 +1007,13 @@ __aicore__ inline void attend_vector(__gm__ int64_t* args) {
         // One KV ring slot is filled by both halves of both AIVs per tile, so the slot
         // free/ready handshake is hoisted out of the two dequant_half calls.
         if (has_previous) wait_intra_block(PIPE_MTE3, FLAG_KV_FREE + (tick - 1) % KV_SLOTS);
-        if (has_current) gather_half(args, make_task<Parts, Balanced>(args, plan, tick), 0);
-        if (has_previous) dequant_half(args, make_task<Parts, Balanced>(args, plan, tick - 1), 0);
-        if (has_softmax) softmax_publish(args, make_task<Parts, Balanced>(args, plan, tick - 3), tick);
-        if (has_current) gather_half(args, make_task<Parts, Balanced>(args, plan, tick), 1);
-        if (has_previous) dequant_half(args, make_task<Parts, Balanced>(args, plan, tick - 1), 1);
+        if (has_current) gather_half(args, make_task<Parts, Balanced, Compact>(args, plan, tick), 0);
+        if (has_previous) dequant_half(args, make_task<Parts, Balanced, Compact>(args, plan, tick - 1), 0);
+        if (has_softmax) softmax_publish(args, make_task<Parts, Balanced, Compact>(args, plan, tick - 3), tick);
+        if (has_current) gather_half(args, make_task<Parts, Balanced, Compact>(args, plan, tick), 1);
+        if (has_previous) dequant_half(args, make_task<Parts, Balanced, Compact>(args, plan, tick - 1), 1);
         if (has_previous) set_intra_block(PIPE_MTE3, FLAG_KV_READY + (tick - 1) % KV_SLOTS);
-        if (has_update) update_pv(args, make_task<Parts, Balanced>(args, plan, tick - 4), tick);
+        if (has_update) update_pv(args, make_task<Parts, Balanced, Compact>(args, plan, tick - 4), tick);
     }
     // Retirement: consume exactly one credit per still-outstanding flag, no more.
     //   MTE3->V P staging : 1 seed  - 1 per softmax consume + 1 per softmax publish = 1
@@ -983,6 +1140,15 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 #if defined(__DAV_CUBE__) && !defined(__CPU_SIM)
     const uint64_t saved_ctrl = get_ctrl();
     const int parts = (args[ARG_WINDOW_KEYS] + args[ARG_COMPRESSED_KEYS]) / TILE_KEYS;
+#if defined(SPARSE_COMPACT_PLAN)
+    if (args[ARG_BALANCED] == 2 && may_have_empty_tiles(args)) {
+        wait_intra_block(PIPE_S, FINISH_ACK);
+        signal_both<PIPE_S>(FINISH_READY);
+        attend_cube<5, false, true>(args);
+    } else {
+        attend_cube<5, false>(args);
+    }
+#else
     if (args[ARG_BALANCED]) {
         if (parts == 5) attend_cube<5, true>(args);
         else attend_cube<0, true>(args);
@@ -991,11 +1157,24 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
         else if (parts == 1) attend_cube<1, false>(args);
         else attend_cube<0, false>(args);
     }
+#endif
     set_ctrl(saved_ctrl);
 #elif defined(__DAV_VEC__) && !defined(__CPU_SIM)
     set_mask_norm();
     set_vector_mask(-1, -1);
     const int parts = (args[ARG_WINDOW_KEYS] + args[ARG_COMPRESSED_KEYS]) / TILE_KEYS;
+#if defined(SPARSE_COMPACT_PLAN)
+    if (args[ARG_BALANCED] == 2 && may_have_empty_tiles(args)) {
+        if (get_sub_block_id(args) == 0) {
+            make_compact_plan(args);
+            set_intra_block(PIPE_S, FINISH_ACK);
+        }
+        wait_intra_block(PIPE_S, FINISH_READY);
+        attend_vector<5, false, true>(args);
+    } else {
+        attend_vector<5, false>(args);
+    }
+#else
     if (args[ARG_BALANCED]) {
         if (parts == 5) attend_vector<5, true>(args);
         else attend_vector<0, true>(args);
@@ -1018,5 +1197,6 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
         else if (parts == 1) attend_vector<1, false>(args);
         else attend_vector<0, false>(args);
     }
+#endif
 #endif
 }

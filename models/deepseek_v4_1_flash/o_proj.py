@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 
 from quant import MX_GROUP, _quantize_mxfp8_activation, decode_e8m0, unpack_mx_b_scale
@@ -22,6 +24,7 @@ from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential, golden_mxfp8_lin
 
 import pypto.language as pl
 import pypto.language.distributed as pld
+from pypto.runtime import pto_isa_include_dir
 
 from config import (
     FLASH as M, T_DYN,
@@ -818,6 +821,18 @@ def _o_proj_a_mixed(
     return output, output_scale
 
 
+@pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "o_proj_a_stream.cpp",
+               aiv_source=Path(__file__).parent / "kernels" / "o_proj_a_stream.cpp",
+               include_dirs=(pto_isa_include_dir(),), dual_aiv_dispatch=True)
+def _o_proj_a_stream(
+    payload: pl.Tensor, weight: pl.Tensor, activation_scale: pl.Tensor, weight_scale: pl.Tensor,
+    output: pl.Out[pl.Tensor], output_scale: pl.Out[pl.Tensor],
+    active_rows: pl.Scalar[pl.INT32], padded_rows: pl.Scalar[pl.INDEX],
+) -> tuple[pl.Tensor, pl.Tensor]:
+    """Project each column panel across full M256 tiles and a bounded final row tile."""
+    return output, output_scale
+
+
 @pl.jit.inline(auto_scope=False)
 def o_proj_a_pypto(
     payload: pl.Tensor[[O_GROUP_ROWS, O_GROUP_IN], pl.FP8E4M3FN],
@@ -1331,16 +1346,29 @@ def o_proj_hc_post(
     oa_tile = oa_row_tile
     if total_rows > oa_row_tile:
         oa_tile = 128
-    padded_rows = ((total_rows + oa_tile - 1) // oa_tile) * oa_tile
+    ob_padded_rows = (total_rows + oa_tile - 1) // oa_tile * oa_tile
+    padded_rows = ob_padded_rows
+    stream_prefill = oa_row_tile == 128 and total_rows > 128
+    if stream_prefill:
+        # O-A reads compact row groups; O-B needs backing for its full scale tile view.
+        padded_rows = (total_rows + 31) // 32 * 32
     payload_all = pl.create_tensor([LOCAL_O_GROUPS * padded_rows, O_GROUP_IN], dtype=pl.FP8E4M3FN)
     scales_all = pl.create_tensor([LOCAL_O_GROUPS, padded_rows * (O_GROUP_IN // 32)], dtype=pl.FP8E8M0)
     quant_o_vf_pypto(attn_out, rope_cos, rope_sin, payload_all, scales_all, num_tokens, padded_rows)
-    payload = pl.create_tensor([padded_rows, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
-    activation_scale = pl.create_tensor([1, padded_rows * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)
-    payload, activation_scale = o_proj_a_pypto(
-        payload_all, wo_a, scales_all, wo_a_scale, payload, activation_scale,
-        LOCAL_O_WIDTH, num_tokens, padded_rows, oa_tile,
-    )
+    payload = pl.create_tensor([ob_padded_rows, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
+    activation_scale = pl.create_tensor([1, ob_padded_rows * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)
+    if stream_prefill:
+        oa_workers = pl.min(LOCAL_O_WIDTH // O_A_N_TILE, pl.system.available_cluster_count())
+        with pl.spmd(oa_workers, name_hint="proj_o_a_quant_stream_long"):
+            payload, activation_scale = _o_proj_a_stream(
+                payload_all, wo_a, scales_all, wo_a_scale, payload, activation_scale,
+                num_tokens, padded_rows,
+            )
+    else:
+        payload, activation_scale = o_proj_a_pypto(
+            payload_all, wo_a, scales_all, wo_a_scale, payload, activation_scale,
+            LOCAL_O_WIDTH, num_tokens, padded_rows, oa_tile,
+        )
     ob_tasks = ((total_rows + ob_row_tile - 1) // ob_row_tile) * ((D + O_B_N_TILE - 1) // O_B_N_TILE)
     ob_workers = pl.max(1, pl.min(ob_tasks, pl.system.available_cluster_count()))
     output, ready = o_proj_b_hc_post(
