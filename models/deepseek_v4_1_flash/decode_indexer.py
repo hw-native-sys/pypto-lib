@@ -801,14 +801,13 @@ def score_select_paged(
     request_rows = pl.reshape(request_ids, [capacity])
     length_rows = pl.reshape(lengths, [capacity])
     mixed_output = pl.reshape(output, [capacity, INDEX_TOPK])
-    score_rows = pl.slice(scores, [capacity, width], [0, 0])
     candidate_keys = pl.create_tensor([capacity, shards * INDEX_TOPK], dtype=pl.UINT16)
     candidate_indices = pl.create_tensor([capacity, shards * INDEX_TOPK], dtype=pl.INT32)
     with pl.spmd(workers, name_hint="idx_score_topk", sync_start=True):
         _idx_score_topk(
             query_rows, scale_rows, weight_rows, index_cache, index_cache_scale,
             block_table, request_rows, length_rows, mixed_output, runs, candidate_keys, candidate_indices,
-            block_table, block_table, score_rows, width, run_stride, table_width, active_tokens, 0,
+            block_table, block_table, scores, width, run_stride, table_width, active_tokens, 0,
             emit_scores, shards, direct_limit_i32,
         )
     return output
