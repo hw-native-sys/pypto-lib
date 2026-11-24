@@ -75,7 +75,8 @@ def _random_specs(specs):
 
     # Constants, not data: randomising these would have solve_tril contract against a
     # random matrix instead of -I, and leave the strict causal mask non-triangular.
-    leave_alone = {"mask", "mask_strict", "tril", "eye", "m_diag", "m_low", "row_base"}
+    leave_alone = {"mask", "mask_strict", "tril", "eye", "m_diag", "m_low", "row_base",
+                   "state_rows", "row_ends"}
     out = []
     for spec in specs:
         if not isinstance(spec, TensorSpec) or spec.name in leave_alone or spec.init_value is None:
@@ -109,6 +110,11 @@ def bench_stage(stage: str, t: int, backend_type: str, device: int,
         fn = mod.gdn_chunk_o_pipe_test
         specs = mod.build_tensor_specs(t=t)
         config["ring_heap"] = mod.PIPE_RING_HEAP
+    elif stage == "chunk_h":
+        # The recurrence also resumes and publishes the cache hand-off, so the stage
+        # carries the owner specs. One owner spanning the call, as a prefill issues it.
+        fn = mod.gdn_chunk_h_final_test
+        specs = mod.build_final_tensor_specs(t=t)
     elif stage in ("in_proj_ab", "quant_x", "qk_norm_gate"):
         fn = getattr(mod, f"gdn_{stage}_test")
         specs = mod.build_tensor_specs(t=t)
