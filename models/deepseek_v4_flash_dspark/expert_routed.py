@@ -26,6 +26,23 @@ SWIGLU_LIMIT = M.swiglu_limit
 # EP layout / recv buffers (single-card view: kernel only sees the local shard)
 N_LOCAL_EXPERTS = M.n_routed_experts // EP
 
+# The standalone grouped case specializes the same kernels to two four-expert groups.
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--case", choices=["all", "random", "boundaries", "grouped-medium"], default="all")
+    args = parser.parse_args()
+    if args.case == "grouped-medium":
+        MOE_TOKENS = 32
+        N_LOCAL_EXPERTS = 8
+        RECV_MAX = 64
+
 # tiling
 RECV_TILE = 16 if MOE_TOKENS <= 8 else (128 if RECV_MAX % 128 == 0 else 64)
 W2_EXPERT_ROWS = (MOE_TOKENS * M.num_experts_per_tok + N_LOCAL_EXPERTS - 1) // N_LOCAL_EXPERTS
@@ -658,18 +675,12 @@ def compare_expert_rows(actual, expected, *, inputs, **kwargs):
 
 
 if __name__ == "__main__":
-    import argparse
+    import subprocess
+    import sys
+
     from golden import run
     import torch
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
-    parser.add_argument("--sim", dest="execution_mode", action="store_true")
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
-    parser.add_argument("--dump-passes", action="store_true", default=False)
-    parser.add_argument("--case", choices=["all", "random", "boundaries"], default="all")
-    args = parser.parse_args()
 
     boundary_counts = [0, 1, 15, 16, 17, 63, 64, 65, 127, 128, 129, 191, 192, 193, 255, 256]
     if RECV_TILE == 64:
@@ -677,8 +688,12 @@ if __name__ == "__main__":
     boundary_counts = [count for count in boundary_counts if count <= RECV_MAX]
     counts = [boundary_counts[expert % len(boundary_counts)] for expert in range(N_LOCAL_EXPERTS)]
     cases = {"random": None, "boundaries": counts}
-    selected_cases = cases if args.case == "all" else {args.case: cases[args.case]}
-    for case_name, expert_counts in selected_cases.items():
+    if args.case == "grouped-medium":
+        # The first group fits M48. The 49th row sends the second group through the per-expert path.
+        cases = {"grouped-medium": [33, 37, 47, 48, 33, 47, 48, 49]}
+    elif args.case != "all":
+        cases = {args.case: cases[args.case]}
+    for case_name, expert_counts in cases.items():
         print(f"[CASE] {case_name}", flush=True)
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(0)
@@ -702,3 +717,7 @@ if __name__ == "__main__":
             if result.error:
                 print(result.error)
             raise SystemExit(1)
+
+    if args.case == "all":
+        # Kernel shapes are bound at import, so specialize the bounded case in a fresh interpreter.
+        subprocess.run([sys.executable, __file__, *sys.argv[1:], "--case", "grouped-medium"], check=True)

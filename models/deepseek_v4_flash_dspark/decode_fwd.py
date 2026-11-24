@@ -316,7 +316,7 @@ def decode_fwd_attn_pad(
 def pad_moe_input(
     x_hc: pl.Tensor[[MOE_TOKENS, HC_MULT, D], pl.FP32],
     owner_tokens: pl.Scalar[pl.INT32],
-):
+) -> pl.Tensor[[MOE_TOKENS, HC_MULT, D], pl.FP32]:
     """Skip padding for a full buffer; otherwise retain the producer dependency."""
     if owner_tokens < MOE_TOKENS:
         inactive_tiles = (MOE_TOKENS - owner_tokens + MOE_PAD_TOKEN_TILE - 1) // MOE_PAD_TOKEN_TILE
@@ -328,6 +328,7 @@ def pad_moe_input(
             self.decode_fwd_attn_pad,  # noqa: F821 - materialized by @pl.jit
             x_hc, owner_tokens, core_num=inactive_tiles,
         )
+    return x_hc
 
 
 def _decode_fwd(
@@ -611,7 +612,7 @@ def _decode_fwd(
                     )
 
         with pl.scope():
-            pad_moe_input(x_attn_moe_swa0, owner_tokens)
+            x_attn_moe_swa0 = pad_moe_input(x_attn_moe_swa0, owner_tokens)
             moe(
                 x_attn_moe_swa0,
                 hc_ffn_fn_layer_swa0, hc_ffn_scale_layer_swa0, hc_ffn_base_layer_swa0,
@@ -700,7 +701,7 @@ def _decode_fwd(
                     )
 
         with pl.scope():
-            pad_moe_input(x_attn_moe_swa1, owner_tokens)
+            x_attn_moe_swa1 = pad_moe_input(x_attn_moe_swa1, owner_tokens)
             moe(
                 x_attn_moe_swa1,
                 hc_ffn_fn_layer_swa1, hc_ffn_scale_layer_swa1, hc_ffn_base_layer_swa1,
@@ -841,7 +842,7 @@ def _decode_fwd(
                         )
 
             with pl.scope():
-                pad_moe_input(x_attn_moe_csa, owner_tokens)
+                x_attn_moe_csa = pad_moe_input(x_attn_moe_csa, owner_tokens)
                 moe(
                     x_attn_moe_csa,
                     hc_ffn_fn_layer_csa, hc_ffn_scale_layer_csa, hc_ffn_base_layer_csa,
@@ -949,7 +950,7 @@ def _decode_fwd(
                         )
 
             with pl.scope():
-                pad_moe_input(x_attn_moe_hca, owner_tokens)
+                x_attn_moe_hca = pad_moe_input(x_attn_moe_hca, owner_tokens)
                 moe(
                     x_attn_moe_hca,
                     hc_ffn_fn_layer_hca, hc_ffn_scale_layer_hca, hc_ffn_base_layer_hca,

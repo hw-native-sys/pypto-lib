@@ -719,13 +719,16 @@ if __name__ == "__main__":
         "decode_dp":  (DECODE_BATCH, DECODE_SEQ),
         "prefill":    (PREFILL_BATCH, PREFILL_SEQ),
     }
-    ALL_MODES = ["decode", "prefill"]
+    tail_modes = {f"t{tokens}": (1, tokens) for tokens in (1, T_TILE - 1, T_TILE, T_TILE + 1)}
+    MODES.update(tail_modes)
+    ALL_MODES = ["decode", "prefill", *tail_modes]
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--mode", choices=["decode", "decode_dp", "prefill", "all"], default="all", help="decode (per-TP-rank batch) / decode_dp (whole DP-rank batch) / prefill batch sizes, or decode+prefill.")
+    parser.add_argument("--mode", choices=[*MODES, "all"], default="all",
+                        help="Run a decode, prefill or token-tile boundary case (default: all standard cases).")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--golden-data", type=str, default=None)
