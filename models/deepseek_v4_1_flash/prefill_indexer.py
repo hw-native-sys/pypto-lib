@@ -1394,7 +1394,7 @@ def _select_all_pool_rows(
         if pl.read(route, [0]) != C1A_ALL_FIT:
             active_tokens = pl.cast(0, pl.INT32)
         for token in pl.range(worker, active_tokens, workers):
-            pl.store(pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1), [token, 0], output)
+            packed = pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
             request = pl.read(requests, [token])
             length = pl.max(0, pl.read(lengths, [token]))
             count = pl.min(pl.max(0, pl.read(pool_counts, [token])), pl.tensor.dim(pool_ids, 1))
@@ -1409,8 +1409,14 @@ def _select_all_pool_rows(
                             valid = pl.min(CANDIDATE_BLOCK_SIZE, length - logical)
                             first = pl.cast(page, pl.INDEX) * page_rows + logical % page_rows
                             physical = pl.add(offsets, pl.cast(first, pl.INT32))
-                            pl.store(pl.tile.set_validshape(physical, 1, valid), [token, written], output)
+                            # A partial block can leave the next tile destination unaligned.
+                            if valid == CANDIDATE_BLOCK_SIZE and written % CANDIDATE_BLOCK_SIZE == 0:
+                                packed = pl.tile.assemble(packed, physical, [0, written])
+                            else:
+                                for lane in pl.range(valid):
+                                    pl.tile.write(packed, [0, written + lane], pl.cast(first + lane, pl.INT32))
                             written = written + valid
+            pl.store(packed, [token, 0], output)
     return selected
 
 
