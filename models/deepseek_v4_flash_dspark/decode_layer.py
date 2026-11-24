@@ -130,6 +130,8 @@ N_RANKS = moe_module.N_RANKS
 N_EXPERTS_GLOBAL = moe_module.N_EXPERTS_GLOBAL
 N_LOCAL = moe_module.N_LOCAL
 META_SLOTS = moe_module.META_SLOTS
+EPLB_BANK_ROWS = moe_module.EPLB_BANK_ROWS
+EPLB_LAYERS = moe_module.EPLB_LAYERS
 MOE_INTER = moe_module.MOE_INTER
 VOCAB = moe_module.VOCAB
 TOPK = moe_module.TOPK
@@ -545,10 +547,10 @@ def decode_layer_swa(
             else:
                 x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
 
-        eplb_mapping_ph = pl.create_tensor([moe_module.EPLB_BANK_ROWS, moe_module.N_RANKS], dtype=pl.INT32)
-        eplb_replicas_ph = pl.create_tensor([moe_module.EPLB_BANK_ROWS], dtype=pl.INT32)
-        eplb_source_rows_ph = pl.create_tensor([moe_module.T], dtype=pl.INT32)
-        eplb_load_ph = pl.create_tensor([moe_module.EPLB_LAYERS, moe_module.META_SLOTS], dtype=pl.INT32)
+        eplb_mapping_ph = pl.create_tensor([EPLB_BANK_ROWS, N_RANKS], dtype=pl.INT32)
+        eplb_replicas_ph = pl.create_tensor([EPLB_BANK_ROWS], dtype=pl.INT32)
+        eplb_source_rows_ph = pl.create_tensor([MOE_TOKENS], dtype=pl.INT32)
+        eplb_load_ph = pl.create_tensor([EPLB_LAYERS, META_SLOTS], dtype=pl.INT32)
         eplb_control_ph = pl.create_tensor([2], dtype=pl.INT32)
         moe(
             x_attn_moe,
@@ -947,10 +949,10 @@ def decode_layer_hca(
             else:
                 x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
 
-        eplb_mapping_ph = pl.create_tensor([moe_module.EPLB_BANK_ROWS, moe_module.N_RANKS], dtype=pl.INT32)
-        eplb_replicas_ph = pl.create_tensor([moe_module.EPLB_BANK_ROWS], dtype=pl.INT32)
-        eplb_source_rows_ph = pl.create_tensor([moe_module.T], dtype=pl.INT32)
-        eplb_load_ph = pl.create_tensor([moe_module.EPLB_LAYERS, moe_module.META_SLOTS], dtype=pl.INT32)
+        eplb_mapping_ph = pl.create_tensor([EPLB_BANK_ROWS, N_RANKS], dtype=pl.INT32)
+        eplb_replicas_ph = pl.create_tensor([EPLB_BANK_ROWS], dtype=pl.INT32)
+        eplb_source_rows_ph = pl.create_tensor([MOE_TOKENS], dtype=pl.INT32)
+        eplb_load_ph = pl.create_tensor([EPLB_LAYERS, META_SLOTS], dtype=pl.INT32)
         eplb_control_ph = pl.create_tensor([2], dtype=pl.INT32)
         moe(
             x_attn_moe,
@@ -1435,10 +1437,10 @@ def decode_layer_csa(
             else:
                 x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
 
-        eplb_mapping_ph = pl.create_tensor([moe_module.EPLB_BANK_ROWS, moe_module.N_RANKS], dtype=pl.INT32)
-        eplb_replicas_ph = pl.create_tensor([moe_module.EPLB_BANK_ROWS], dtype=pl.INT32)
-        eplb_source_rows_ph = pl.create_tensor([moe_module.T], dtype=pl.INT32)
-        eplb_load_ph = pl.create_tensor([moe_module.EPLB_LAYERS, moe_module.META_SLOTS], dtype=pl.INT32)
+        eplb_mapping_ph = pl.create_tensor([EPLB_BANK_ROWS, N_RANKS], dtype=pl.INT32)
+        eplb_replicas_ph = pl.create_tensor([EPLB_BANK_ROWS], dtype=pl.INT32)
+        eplb_source_rows_ph = pl.create_tensor([MOE_TOKENS], dtype=pl.INT32)
+        eplb_load_ph = pl.create_tensor([EPLB_LAYERS, META_SLOTS], dtype=pl.INT32)
         eplb_control_ph = pl.create_tensor([2], dtype=pl.INT32)
         moe(
             x_attn_moe,
