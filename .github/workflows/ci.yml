@@ -14,6 +14,61 @@ concurrency:
 # A5 jobs use the `pr` runner pool for pull requests, main pushes, and manual runs.
 # CPU and A3 jobs keep their existing shared runner selection.
 jobs:
+  o-projection-diagnostic:
+    name: O projection precision (a5)
+    if: github.event_name == 'pull_request' && github.head_ref == 'ci/trace-v4-1-o-projection-precision-on-a5'
+    runs-on: [self-hosted, linux, npu-a5, pr]
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      CCACHE_UMASK: '000'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+      - uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: checkout
+          needs-device: 'true'
+          runtime-platform: a5
+          build-namespace: a5-o-projection-diagnostic
+          pip-cache-name: pip-a5-o-projection-diagnostic
+          toolchain: bundle
+          torch-version: 'torch==2.10.0'
+          pypto-ref: dd5641a986c89660fd4d68c98e1ef713a28a8b47
+      - name: Prepare the production program and reference tensors
+        working-directory: checkout
+        shell: bash
+        run: |
+          set -eo pipefail
+          source activate.sh
+          export PYTHONPATH="$PWD" PYPTO_BENCH=0 PYPTO_RUNTIME_LOG=error
+          python .github/scripts/trace_o_projection.py prepare --work "$RUNNER_TEMP/o-projection-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Replay the 0, 1 and 17 token sequence on A5
+        working-directory: checkout
+        shell: bash
+        run: |
+          set -eo pipefail
+          printf -v command 'cd %q && source activate.sh && PYPTO_BENCH=0 PYPTO_LOG_LEVEL=error PYPTO_WARNING_LEVEL=none PYPTO_RUNTIME_LOG=error PYTHONPATH=%q python .github/scripts/trace_o_projection.py run --work %q --device "$TASK_DEVICE"' \
+            "$PWD" "$PWD" "$RUNNER_TEMP/o-projection-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          task-submit --device 5 --timeout 1200 --max-time 600 --run "$command"
+      - name: Save stage comparisons
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: o-projection-a5-stage-comparisons
+          path: ${{ runner.temp }}/o-projection-${{ github.run_id }}-${{ github.run_attempt }}/report.json
+          retention-days: 5
+          if-no-files-found: warn
+
   pre-commit:
     runs-on: ubuntu-latest
     timeout-minutes: 10
