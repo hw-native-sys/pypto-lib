@@ -405,14 +405,15 @@ def decode_publish(
     """Publish target backbone hidden states and decode metadata."""
     published_x = pl.reshape(x_hc, [PADDED_ROWS, HC_MULT * D])
     source_x = pl.reshape(local_x_hc, [PADDED_ROWS, HC_MULT * D])
-    for row in pl.spmd(PADDED_ROWS, name_hint="decode_publish"):
-        hidden_tile = pl.load(source_x, [row, 0], [1, HC_MULT * D])
-        pl.store(hidden_tile, [row, 0], published_x)
-        target_tile = pl.load(local_target_hidden, [row, 0], [1, MAIN_IN])
-        pl.store(target_tile, [row, 0], target_hidden)
-        indices_tile = pl.load(local_window_indices, [row, 0], [1, WINDOW])
-        pl.store(indices_tile, [row, 0], window_indices)
-        if row == 0:
+    for block in pl.spmd(pl.min(PADDED_ROWS, 64), name_hint="decode_publish"):
+        for row in pl.range(block, PADDED_ROWS, 64):
+            hidden_tile = pl.load(source_x, [row, 0], [1, HC_MULT * D])
+            pl.store(hidden_tile, [row, 0], published_x)
+            target_tile = pl.load(local_target_hidden, [row, 0], [1, MAIN_IN])
+            pl.store(target_tile, [row, 0], target_hidden)
+            indices_tile = pl.load(local_window_indices, [row, 0], [1, WINDOW])
+            pl.store(indices_tile, [row, 0], window_indices)
+        if block == 0:
             for metadata_row in pl.range(PADDED_ROWS):
                 for stream in pl.range(HC_MULT):
                     value = pl.read(local_pre_mix, [metadata_row, stream])

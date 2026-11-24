@@ -118,8 +118,8 @@ def capture_dspark_target_hidden(
     target_column: pl.Scalar[pl.INDEX],
 ):
     """Register the residual as InOut so the next layer waits for this snapshot."""
-    token = pl.tile.get_block_idx()
-    if token < active_rows:
+    block = pl.tile.get_block_idx()
+    for token in pl.range(block, pl.min(active_rows, MOE_TOKENS), 64):
         hc_row = x_hc[token : token + 1, 0:HC_MULT, 0:D]
         hc_mean = pl.mul(pl.col_sum(pl.reshape(hc_row, [HC_MULT, D])), 1.0 / HC_MULT)
         target_hidden[token : token + 1, target_column : target_column + D] = pl.cast(hc_mean, pl.BF16, mode="rint")
@@ -663,7 +663,7 @@ def decode_decoder(
             target_column = (target_layer - DSPARK_TARGET_LAYER_IDS[0]) * D
             (x_hc, dspark_target_hidden), _capture_tid = pl.spmd_submit(
                 capture_dspark_target_hidden, x_hc, dspark_target_hidden, local_moe_tokens,
-                target_column, core_num=MOE_TOKENS,
+                target_column, core_num=pl.min(MOE_TOKENS, 64),
             )
     return x_hc
 

@@ -43,8 +43,7 @@ import dspark_drafter as draft
 import markov
 import decode_metadata as state_ops
 from decode_fwd import decode_fwd
-from hc import hc_head
-from rmsnorm import rms_norm
+from hc import hc_head_norm, hc_head_norm_store
 from lm_head import VOCAB, lm_head
 from sample import sample
 import lm_head as head
@@ -398,14 +397,8 @@ def l2_decode_fwd_dspark(
     head_rows = (pl.min(group_rows, TARGET_ROWS) + 15) // 16 * 16
     sample_hidden = local_x_hc[:head_rows, :, :]
     sample_pre_mix = local_pre_mix[:head_rows, :]
-    sample_tokens = pl.tensor.dim(sample_hidden, 0)
-    sample_collapsed = pl.create_tensor([head_rows, D], dtype=pl.BF16)
-    hc_head(sample_hidden, sample_pre_mix, sample_collapsed, worker_limit=64)
     sample_normalized = pl.create_tensor([head_rows, D], dtype=pl.BF16)
-    rms_norm(
-        sample_collapsed, final_norm_weight, sample_normalized,
-        sample_tokens, width=D, zero_tail=False,
-    )
+    hc_head_norm(sample_hidden, sample_pre_mix, final_norm_weight, sample_normalized, worker_limit=64)
     sample_logits = pl.create_tensor([head_rows, VOCAB], dtype=pl.FP32)
     lm_head(
         sample_normalized, lm_head_weight, sample_row_indices, sample_logits,
@@ -445,12 +438,13 @@ def l2_decode_fwd_dspark(
     )
     markov_batch = pl.tensor.dim(num_sampled, 0)
     markov_rows = markov_batch * MARKOV_DSPARK_QUERY_WIDTH
+    markov_hidden = draft_x_hc[:markov_rows, :, :]
+    markov_pre_mix = draft_pre_mix[:markov_rows, :]
     markov_flat_hidden = pl.reshape(draft_head_hidden, [markov_rows, D])
-    hc_head(draft_x_hc[:markov_rows, :, :], draft_pre_mix[:markov_rows, :], markov_flat_hidden, worker_limit=64)
     markov_normalized = pl.create_tensor([markov_rows, D], dtype=pl.BF16)
-    rms_norm(
-        markov_flat_hidden, markov_final_norm_weight, markov_normalized,
-        markov_rows, width=D, zero_tail=False,
+    hc_head_norm_store(
+        markov_hidden, markov_pre_mix, markov_final_norm_weight,
+        markov_normalized, markov_flat_hidden, markov_rows, worker_limit=64,
     )
     markov_logits = pl.create_tensor([MARKOV_MAX_LOGIT_ROWS, MARKOV_VOCAB], dtype=pl.FP32)
     lm_head(
