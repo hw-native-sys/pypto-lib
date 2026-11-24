@@ -61,6 +61,8 @@ def _score_prepare(
     metadata: pl.Out[pl.Tensor],
     active: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor:
+    # Persistent dispatches can reuse these GM addresses with updated inputs.
+    pl.system.cacheinvalid()
     packed_bounds = pl.tile.create([1, 72], dtype=pl.INT32, target_memory=pl.MemorySpace.Vec)
     zero = pl.cast(0, pl.INDEX)
     for (row, accumulated_cost) in pl.while_(init_values=(zero, zero)):
