@@ -632,18 +632,209 @@ def stress(area, device, sessions, repeats):
         raise SystemExit(1)
 
 
+HANDOFF_VARIANTS = ("baseline", "l1-fence", "l0-fence", "swap-a")
+
+
+def prepare_handoff(area):
+    """Change one AIC property on the production M80 branch, and check the compiled binaries."""
+    from pypto.backend import BackendType
+    from pypto.ir import CompiledProgram
+    from pypto.runtime import ExecutionMode
+
+    reference = None
+    hashes = {}
+    for name in HANDOFF_VARIANTS:
+        src = area / "retained"
+        dest = src if name == "baseline" else area / name
+        if name != "baseline":
+            shutil.copytree(src, dest, ignore=shutil.ignore_patterns("cache", "*.o", "*.so", "dfx_outputs"))
+            kernel = dest / "kernels/aic/proj_o_a_quant_0_aic.cpp"
+            text = kernel.read_text()
+            cube, tail = text.split("#endif // __DAV_CUBE__", 1)
+            if name == "swap-a":
+                # Worker 28..31 processes group 7. Exchange only its two
+                # M80xK256 L1 activation slots; weights and L0 keep their addresses.
+                tiles = re.findall(r"Tile<TileType::Mat, float8_e4m3_t, 80, 256, [^>]+> (v\d+) =", cube)
+                constants = dict(re.findall(r"const int64_t (v\d+) = (\d+);", cube))
+                addresses = dict(re.findall(r"uint64_t (v\d+) = \(uint64_t\) (v\d+);", cube))
+                if len(tiles) != 31 or "int32_t v9, int32_t v10)" not in cube:
+                    raise ValueError("Unexpected M80 activation views or logical block argument")
+                seen = set()
+                for tile in tiles:
+                    (address,) = re.findall(rf"TASSIGN\({tile}, (v\d+)\);", cube)
+                    seen.add(int(constants[addresses[address]]))
+                    cube = cube.replace(
+                        f"TASSIGN({tile}, {address});",
+                        f"TASSIGN({tile}, v9 >= 28 ? ({address} ^ 86016ULL) : {address});",
+                    )
+                if seen != {0, 86016}:
+                    raise ValueError(f"Unexpected activation L1 offsets {seen}")
+            else:
+                source, sink = ("MTE1", "MTE2") if name == "l1-fence" else ("M", "MTE1")
+                (call,) = re.findall(r"(?m)^    (proj_o_a_quant_0_aic\(.*?\);)$", tail)
+                if "EVENT_ID7" in cube:
+                    raise ValueError("Diagnostic handoff event is already in use")
+                tail = tail.replace(
+                    call,
+                    call
+                    + f"\n    set_flag(PIPE_{source}, PIPE_{sink}, EVENT_ID7);"
+                    + f"\n    wait_flag(PIPE_{source}, PIPE_{sink}, EVENT_ID7);",
+                )
+            kernel.write_text(cube + "#endif // __DAV_CUBE__" + tail)
+        compiled = CompiledProgram.from_dir(
+            dest, backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD
+        )
+        compiled.load()
+        bins = list((dest / "cache").glob("*.bin"))
+        unchanged = sorted(
+            hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in bins
+            if "_aic_proj_o_a_quant_0_aic_" not in p.name
+        )
+        (changed,) = [
+            hashlib.sha256(p.read_bytes()).hexdigest() for p in bins if "_aic_proj_o_a_quant_0_aic_" in p.name
+        ]
+        if len(unchanged) != 10 or (reference is not None and unchanged != reference):
+            raise ValueError("A binary outside the tested M80 AIC changed")
+        reference = unchanged
+        hashes[name] = changed
+    if len(set(hashes.values())) != len(hashes):
+        raise ValueError("Two handoff variants ran the same AIC binary")
+    (area / "handoff-binaries.json").write_text(json.dumps(hashes, indent=2))
+    print("O_HANDOFF_BINARIES " + json.dumps(hashes), flush=True)
+
+
+def handoff(area, device, sessions, repeats, batch):
+    """Alternate fixed input and full-chain calls on one card with its normal physical worker pool."""
+    import ctypes
+    from pypto.backend import BackendType
+    from pypto.ir import CompiledProgram
+    from pypto.runtime import ChipWorker, ExecutionMode, RunConfig
+
+    def load_tensors(path):
+        return torch.load(path, weights_only=True)
+
+    cfg = RunConfig(
+        backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD, device_id=device
+    )
+    programs = {
+        name: CompiledProgram.from_dir(
+            area / ("retained" if name == "baseline" else name),
+            backend_type=BackendType.Ascend950,
+            execution_mode=ExecutionMode.ONBOARD,
+        )
+        for name in HANDOFF_VARIANTS
+    }
+    data = {}
+    for n in (1, 17):
+        parent = area / f"normal-{n}"
+        specs = o.build_o_proj_hc_post_specs(n, pad_to_tile=True)
+        golden_out = load_tensors(parent / "out/output.pt")
+        argv = [
+            load_tensors(parent / "in" / (s.name + ".pt"))
+            for s in specs
+            if s.name not in ("num_tokens", "output")
+        ]
+        argv.append(torch.empty_like(golden_out))
+        reference = load_tensors(area / f"reference-{n}.pt")
+        expected = [reference[k].view(torch.uint8).reshape(shape) for k, (shape, _, _) in RETAINED.items()]
+        data[n] = argv, golden_out, expected
+    stats, samples = {}, []
+    result = area / f"handoff-batch-{batch}.json"
+    buffers = [torch.zeros(shape, dtype=torch.uint8).view(dtype) for shape, _, dtype in RETAINED.values()]
+    for session in range(sessions):
+        with ChipWorker(config=cfg, runtime=programs["baseline"].runtime_name) as worker:
+            handles = {name: worker.register(p) for name, p in programs.items()}
+            for rep in range(repeats):
+                shift = (rep + session + batch) % len(HANDOFF_VARIANTS)
+                for name in HANDOFF_VARIANTS[shift:] + HANDOFF_VARIANTS[:shift]:
+                    for n in (1, 17):
+                        argv, final, expected = data[n]
+                        # Run the production producers first, then run the very same O-A
+                        # with its quantized input supplied as external, known bytes.
+                        for route in ("chain", "oa-only"):
+                            for i, buf in enumerate(buffers):
+                                if route == "oa-only" and i < 2:
+                                    buf.view(torch.uint8).copy_(expected[i])
+                                else:
+                                    buf.view(torch.uint8).zero_()
+                            argv[-1].fill_(float("nan"))
+                            handles[name](
+                                *argv,
+                                *buffers,
+                                ctypes.c_int32(n),
+                                ctypes.c_int32(3 if route == "oa-only" else 0),
+                                config=cfg,
+                            )
+                            bits = [b.view(torch.uint8) for b in buffers]
+                            diff = [(a != e) for a, e in zip(bits, expected, strict=True)]
+                            # Count the separate saturating-conversion signature as well as total byte errors.
+                            sat = ((expected[2] & 127) == 126) & (bits[2] == 127)
+                            unexpected = diff[2] & ~sat
+                            hc_bad = (
+                                int((~torch.isclose(argv[-1][:n], final[:n], atol=0.01, rtol=1 / 128)).sum())
+                                if route == "chain"
+                                else 0
+                            )
+                            counts = [int(m.sum()) for m in diff]
+                            key = f"{name}/{route}/{n}"
+                            row = stats.setdefault(
+                                key,
+                                dict(
+                                    calls=0,
+                                    wrong_inputs=0,
+                                    payload=0,
+                                    scale=0,
+                                    non_saturation_payload=0,
+                                    hc_over_threshold=0,
+                                ),
+                            )
+                            row["calls"] += 1
+                            row["wrong_inputs"] += int(any(counts[:2]))
+                            row["payload"] += int(bool(counts[2]))
+                            row["scale"] += int(bool(counts[3]))
+                            row["non_saturation_payload"] += int(bool(unexpected.any()))
+                            row["hc_over_threshold"] += int(hc_bad > n * 4 * o.D * 0.005)
+                            if (counts[2] or counts[3]) and sum(s["key"] == key for s in samples) < 4:
+                                samples.append(
+                                    dict(
+                                        key=key,
+                                        session=session,
+                                        repeat=rep,
+                                        byte_errors=counts,
+                                        hc_outliers=hc_bad,
+                                        non_saturation_bytes=int(unexpected.sum()),
+                                        row0_xor=encode_delta((bits[2][0] ^ expected[2][0]).numpy()),
+                                        scale_row0_xor=encode_delta(
+                                            first_row(
+                                                (bits[3] ^ expected[3]).numpy().reshape(-1), "oa_out", "scale"
+                                            )
+                                        ),
+                                    )
+                                )
+                # A later device timeout must not discard completed comparison blocks.
+                result.write_text(json.dumps(dict(batch=batch, stats=stats, samples=samples)) + "\n")
+        print("O_HANDOFF_COUNTS " + json.dumps(stats), flush=True)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", choices=["prepare", "run", "stress"])
+    parser.add_argument("stage", choices=["prepare", "run", "stress", "prepare-handoff", "handoff"])
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--device", type=int, default=int(os.getenv("TASK_DEVICE", "0")))
     parser.add_argument("--sessions", type=int, default=8)
     parser.add_argument("--repeats", type=int, default=8)
+    parser.add_argument("--batch", type=int, default=0)
     args = parser.parse_args()
     area = args.work.resolve()
     area.mkdir(parents=True, exist_ok=True)
     os.chdir(area)
-    if args.stage == "prepare":
+    if args.stage == "prepare-handoff":
+        prepare(area)
+        prepare_handoff(area)
+    elif args.stage == "handoff":
+        handoff(area, args.device, args.sessions, args.repeats, args.batch)
+    elif args.stage == "prepare":
         prepare(area)
     elif args.stage == "stress":
         stress(area, args.device, args.sessions, args.repeats)
