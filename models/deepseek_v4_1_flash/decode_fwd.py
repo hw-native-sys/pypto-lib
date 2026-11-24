@@ -110,6 +110,22 @@ FWD_C2A_TABLE_DYN = pl.dynamic("FWD_C2A_TABLE_DYN")
 FWD_C1A_TABLE_DYN = pl.dynamic("FWD_C1A_TABLE_DYN")
 
 
+@pl.jit.incore
+def capture_dspark_target_hidden(
+    x_hc: pl.InOut[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+    target_hidden: pl.InOut[pl.Tensor[[T_DYN, DSPARK_MAIN_IN], pl.BF16]],
+    active_rows: pl.Scalar[pl.INT32],
+    target_column: pl.Scalar[pl.INDEX],
+):
+    """Register the residual as InOut so the next layer waits for this snapshot."""
+    token = pl.tile.get_block_idx()
+    if token < active_rows:
+        hc_row = x_hc[token : token + 1, 0:HC_MULT, 0:D]
+        hc_mean = pl.mul(pl.col_sum(pl.reshape(hc_row, [HC_MULT, D])), 1.0 / HC_MULT)
+        target_hidden[token : token + 1, target_column : target_column + D] = pl.cast(hc_mean, pl.BF16, mode="rint")
+    return x_hc, target_hidden
+
+
 @pl.jit.inline(auto_scope=False)
 def decode_encoder(
     engram_lookup: pl.Tensor[[2, T_DYN, ENGRAM_K], pl.BF16],
@@ -645,12 +661,10 @@ def decode_decoder(
         target_layer = layer + 1
         if target_layer >= DSPARK_TARGET_LAYER_IDS[0] and target_layer <= DSPARK_LAST_TARGET_LAYER:
             target_column = (target_layer - DSPARK_TARGET_LAYER_IDS[0]) * D
-            for token in pl.spmd(MOE_TOKENS, name_hint="decode_dspark_target_hidden"):
-                if token < local_moe_tokens:
-                    hc_row = x_hc[token : token + 1, 0:HC_MULT, 0:D]
-                    hc_mean = pl.mul(pl.col_sum(pl.reshape(hc_row, [HC_MULT, D])), 1.0 / HC_MULT)
-                    target_bf16 = pl.cast(hc_mean, pl.BF16, mode="rint")
-                    dspark_target_hidden[token : token + 1, target_column : target_column + D] = target_bf16
+            (x_hc, dspark_target_hidden), _capture_tid = pl.spmd_submit(
+                capture_dspark_target_hidden, x_hc, dspark_target_hidden, local_moe_tokens,
+                target_column, core_num=MOE_TOKENS,
+            )
     return x_hc
 
 
