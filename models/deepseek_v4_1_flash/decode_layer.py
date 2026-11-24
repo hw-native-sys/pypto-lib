@@ -19,7 +19,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from config import CACHE_ROWS_DYN
 from config import (
-    FLASH as M, MOE_TOKENS, B_DYN, T_DYN, Q_START_DYN, ROUTE_T_DYN, TABLE_DYN, ORI_BLOCKS_DYN,
+    FLASH as M, MOE_TOKENS, B_DYN, T_DYN, Q_START_DYN, TABLE_DYN, ORI_BLOCKS_DYN,
     CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, STATE_BLOCKS_DYN, INDEX_CACHE_GROUP,
     STATE_CAPACITY, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
@@ -32,7 +32,7 @@ from decode_c2a_reuse import decode_c2a_reuse
 from decode_swa import decode_swa
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
 from decode_moe import (
-    moe, DISPATCH_PACKET_WIDTH, EP_SIZE, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD, clear_moe_signals,
+    moe, EP_SIZE, N_EXPERTS, N_LOCAL_EXPERTS, MOE_WORKSPACE_BYTES,
 )
 
 
@@ -52,7 +52,6 @@ MIX_HC = M.mix_hc
 INDEX_H = M.index_n_heads
 INDEX_DIM = M.index_head_dim
 INDEX_TOPK = M.index_topk
-N_EXPERTS = M.n_routed_experts
 TOPK = M.num_experts_per_tok
 MOE_INTER = M.moe_intermediate_size
 MX_GROUP = M.weight_block_size[0]
@@ -134,17 +133,11 @@ def l2_decode_layer(
     next_pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
     x_mixed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
     x_next: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
-    recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], pl.INT8],
-    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    data_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
-    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
+    moe_workspace: pld.DistributedTensor,
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     rank: pl.Scalar[pl.INT32],
     attention_num_tokens: pl.Scalar[pl.INT32],
-    moe_epoch: pl.Scalar[pl.INT32],
 ):
     """Run one scheduled Attention sublayer followed by the EP MoE sublayer."""
     x_hc.bind_dynamic(0, T_DYN)
@@ -290,8 +283,6 @@ def l2_decode_layer(
 
     local_moe_tokens = pl.read(moe_num_tokens, [rank])
     force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
-    recv_x_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.FP8E4M3FN)
-    recv_x_last_use = pl.array.create(1, pl.TASK_ID)
     moe(
         attention_hidden, attention_pre_mix,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
@@ -305,13 +296,8 @@ def l2_decode_layer(
         shared_w2, shared_w2_scale,
         shared_w3, shared_w3_scale,
         next_pre_mix, x_mixed, x_next,
-        recv_meta, recv_x, recv_routes,
-        data_arrived, routed_output, combine_arrived,
-        local_moe_tokens, rank, moe_epoch,
-        force_topk, recv_x_local, recv_x_last_use,
-        local_experts=N_LOCAL_EXPERTS, topk=TOPK, dispatch_worker_limit=0,
+        moe_workspace, local_moe_tokens, force_topk,
     )
-    clear_moe_signals(x_next, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
 
 
 @pl.jit.host
@@ -406,19 +392,9 @@ def l3_decode_layer(
     index_block_table.bind_dynamic(2, TABLE_DYN)
     state_cache.bind_dynamic(1, STATE_BLOCKS_DYN)
     pool_block_ids.bind_dynamic(2, INDEX_POOL_BLOCKS_DYN)
-    recv_meta_buffer = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-    recv_x_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], dtype=pl.INT8)
-    recv_routes_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-    data_arrived_buffer = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32 )
-    routed_output_buffer = pld.alloc_window_buffer([MOE_TOKENS * TOPK, D], dtype=pl.BF16)
-    combine_arrived_buffer = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32 )
+    moe_workspace_buffer = pld.alloc_window_buffer([MOE_WORKSPACE_BYTES], dtype=pl.UINT8)
     for rank in pl.range(pld.world_size()):
-        recv_meta = pld.window(recv_meta_buffer, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-        recv_x = pld.window(recv_x_buffer, [N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], dtype=pl.INT8)
-        recv_routes = pld.window(recv_routes_buffer, [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-        data_arrived = pld.window(data_arrived_buffer, [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
-        routed_output = pld.window(routed_output_buffer, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
-        combine_arrived = pld.window(combine_arrived_buffer, [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
+        moe_workspace = pld.window(moe_workspace_buffer, [MOE_WORKSPACE_BYTES], dtype=pl.UINT8)
         wq_a_scale_rank: pl.Tensor[[D // MX_GROUP, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[rank]
         wq_b_scale_rank: pl.Tensor[[Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wq_b_scale[rank]
         wkv_scale_rank: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[rank]
@@ -470,9 +446,7 @@ def l3_decode_layer(
             shared_w2[rank], shared_w2_scale_rank,
             shared_w3[rank], shared_w3_scale_rank,
             next_pre_mix[rank], x_mixed[rank], x_next[rank],
-            recv_meta, recv_x, recv_routes,
-            data_arrived, routed_output, combine_arrived,
-            moe_num_tokens, layer_id, rank, attention_num_tokens, moe_epoch,
+            moe_workspace, moe_num_tokens, layer_id, rank, attention_num_tokens,
             device=rank,
         )
 

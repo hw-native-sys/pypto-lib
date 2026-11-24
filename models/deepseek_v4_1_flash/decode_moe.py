@@ -10,7 +10,6 @@
 # ci: no-sim
 """DeepSeek-V4.1 decode MoE with HC and expert parallelism."""
 
-from dataclasses import replace
 import sys
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -29,29 +28,33 @@ def parse_expert_token():
                 raise ValueError(f"{flag} requires a value")
             value = sys.argv[index + 1]
         values[flag] = value
-    experts = int(values.get("--experts-per-rank", config.N_LOCAL_EXPERTS))
+    experts = int(values["--experts-per-rank"]) if "--experts-per-rank" in values else None
     tokens = values.get("--num-tokens-per-rank", values.get("--num-tokens", str(config.MOE_TOKENS)))
     counts = [int(value) for value in tokens.split(",")]
     return experts, max(config.MOE_TOKENS, max(counts))
 
 
 # Resolve entry dimensions before importing kernels.
-_experts_per_rank, _token_capacity = parse_expert_token()
+_requested_experts, _token_capacity = parse_expert_token()
+N_LOCAL_EXPERTS = config.N_LOCAL_EXPERTS if _requested_experts is None else _requested_experts
+# The EP2 full-forward smoke fixture uses a bounded weight bank.
+FORWARD_LOCAL_EXPERTS = 64 if config.EP_SIZE == 2 and _requested_experts is None else N_LOCAL_EXPERTS
 config.set_moe_tokens((_token_capacity + 15) // 16 * 16)
-_test_experts = config.EP_SIZE * _experts_per_rank
-if _experts_per_rank <= 0 or not config.FLASH.num_experts_per_tok <= _test_experts <= 384:
+_test_experts = config.EP_SIZE * N_LOCAL_EXPERTS
+if N_LOCAL_EXPERTS <= 0 or not config.FLASH.num_experts_per_tok <= _test_experts <= 384:
     raise ValueError("--experts-per-rank must give between TopK and 384 total routed experts")
-config.FLASH = replace(config.FLASH, n_routed_experts=_test_experts)
-config.N_LOCAL_EXPERTS = _experts_per_rank
 
 
-from config import FLASH as M, EP_SIZE, MOE_TOKENS, MOE_RECV_MAX, N_LOCAL_EXPERTS, T_DYN, ROUTE_T_DYN
-from gate import gate
+from config import FLASH as M, EP_SIZE, MOE_TOKENS, MOE_RECV_MAX, T_DYN
+from gate import gate, route_tokens
 from expert_shared import SWIGLU_WORKER_TILE, W13_WORKER_TILE, W2_WORKER_TILE, expert_shared
+from mega_moe import (
+    FP4_PANEL_ROWS, _resident_down_weight, _resident_gate_up_half,
+    specialize_mega_moe, use_packed_decode_weights, workspace_bytes,
+)
 from expert_routed import (
     ROUTED_CUBE_WORKER_TILE, ROUTED_VECTOR_WORKER_TILE, dispatch,
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS, expert_routed_scatter,
-    DISPATCH_PACKET_WIDTH,
 )
 from hc import hc_head_norm_store, hc_project, hc_sinkhorn, hc_post
 
@@ -91,6 +94,9 @@ LONG_TOKEN_MIN = 256
 SHORT_EXPERT_ROWS_MIN = 32
 LONG_EXPERT_ROWS_MIN = 64
 DENSE_EXPERT_ROWS = 128
+
+
+MOE_WORKSPACE_BYTES = workspace_bytes(EP_SIZE, N_LOCAL_EXPERTS, MOE_TOKENS, TOPK, D, MOE_INTER)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -218,7 +224,7 @@ def _decode_ffn_workers(num_tokens: pl.Scalar[pl.INT32], local_experts: pl.const
 
 
 @pl.jit.inline(auto_scope=False)
-def moe(
+def split_moe(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
@@ -328,6 +334,85 @@ def moe(
     return x_next
 
 
+def make_decode_moe(local_experts, topk, packed_routed_weights=False):
+    """Wire HC and routing to the fused experts specialized for this entry."""
+    fused_experts = specialize_mega_moe(local_experts, topk, packed_routed_weights)
+
+    @pl.jit.inline(auto_scope=False)
+    def moe(
+        x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+        pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+        hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+        hc_ffn_scale: pl.Tensor[[3], pl.FP32],
+        hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
+        norm_weight: pl.Tensor[[D], pl.BF16],
+        gate_weight: pl.Tensor,
+        correction_bias: pl.Tensor,
+        routed_w1: pl.Tensor,
+        routed_w1_scale: pl.Tensor[None, pl.FP8E8M0, pl.MX_B_NN],
+        routed_w2: pl.Tensor,
+        routed_w2_scale: pl.Tensor[None, pl.FP8E8M0, pl.MX_B_NN],
+        routed_w3: pl.Tensor,
+        routed_w3_scale: pl.Tensor[None, pl.FP8E8M0, pl.MX_B_NN],
+        shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
+        shared_w1_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+        shared_w2: pl.Tensor[[MOE_INTER, D], pl.FP8E4M3FN],
+        shared_w2_scale: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN],
+        shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
+        shared_w3_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+        next_pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
+        x_mixed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+        x_next: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+        moe_workspace: pld.DistributedTensor,
+        num_tokens: pl.Scalar[pl.INT32],
+        force_topk: pl.Tensor,
+    ) -> pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]:
+        """Run delayed HC pre-mix, MoE, and residual expansion."""
+        t = MOE_TOKENS
+        post_mix = pl.create_tensor([t, HC_MULT], dtype=pl.FP32)
+        residual_mix = pl.create_tensor([t, HC_MULT, HC_MULT], dtype=pl.FP32)
+        x_norm = pl.create_tensor([t, D], dtype=pl.BF16)
+        hc_head_norm_store(x_hc, pre_mix, norm_weight, x_norm, x_mixed, num_tokens, worker_limit=64)
+        inv_rms, partials = hc_project(x_hc, hc_ffn_fn, rms_worker_limit=64)
+        hc_sinkhorn(inv_rms, partials, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
+
+        # MoE transport and routed-result scope.
+        with pl.scope():
+            indices = pl.create_tensor([MOE_TOKENS, topk], dtype=pl.INT32)
+            weights = pl.create_tensor([t, topk], dtype=pl.FP32)
+            route_tokens(
+                x_norm, gate_weight, correction_bias, num_tokens,
+                indices, weights, n_experts=EP_SIZE * local_experts, topk=topk,
+            )
+            if BALANCED_ROUTING:
+                dispatch_indices = force_topk
+            else:
+                dispatch_indices = indices
+
+            sublayer = pl.create_tensor([t, D], dtype=pl.BF16)
+            fused_experts(
+                dispatch_indices, x_norm, weights, sublayer,
+                routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+                shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, shared_w2, shared_w2_scale,
+                moe_workspace, num_tokens,
+            )
+            hc_post(sublayer, x_hc, post_mix, residual_mix, x_next, deps=None, dep_count=0)
+        return x_next
+
+    return moe
+
+
+# The standalone entry owns the resident upload. Layer/forward callers
+# pass weights in the public FP4 layout unless they opt into the packed ABI.
+PACK_ROUTED_WEIGHTS = __name__ == "__main__" and use_packed_decode_weights(MOE_TOKENS, N_LOCAL_EXPERTS, TOPK)
+PANEL_ROWS = FP4_PANEL_ROWS if PACK_ROUTED_WEIGHTS else 1
+WEIGHT_PANEL_BYTES = PANEL_ROWS * MX_PACKED_LANE_COLS
+W1_DEVICE_ROWS = MX_W1_PACKED_ROWS // PANEL_ROWS
+W2_DEVICE_ROWS = MX_W2_PACKED_ROWS // PANEL_ROWS
+W3_DEVICE_ROWS = MX_W3_PACKED_ROWS // PANEL_ROWS
+moe = make_decode_moe(N_LOCAL_EXPERTS, TOPK, packed_routed_weights=PACK_ROUTED_WEIGHTS)
+
+
 @pl.jit
 def l2_moe(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
@@ -338,11 +423,11 @@ def l2_moe(
     norm_weight: pl.Tensor[[D], pl.BF16],
     gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
-    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, W1_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, W2_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN],
-    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, W3_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
     shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
@@ -353,15 +438,9 @@ def l2_moe(
     next_pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
     x_mixed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
     x_next: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
-    recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], pl.INT8],
-    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    data_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
-    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
+    moe_workspace: pld.DistributedTensor,
     num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     ep_rank: pl.Scalar[pl.INT32],
-    moe_epoch: pl.Scalar[pl.INT32],
     force_topk: pl.Tensor[[MOE_TOKENS, TOPK], pl.INT32],
 ) -> pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]:
     x_hc.bind_dynamic(0, T_DYN)
@@ -370,8 +449,6 @@ def l2_moe(
     x_mixed.bind_dynamic(0, T_DYN)
     x_next.bind_dynamic(0, T_DYN)
     local_num_tokens = pl.read(num_tokens, [ep_rank])
-    recv_x_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.FP8E4M3FN)
-    recv_x_last_use = pl.array.create(1, pl.TASK_ID)
     moe(
         x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_weight, gate_weight, correction_bias,
@@ -379,12 +456,8 @@ def l2_moe(
         routed_w3, routed_w3_scale, shared_w1, shared_w1_scale,
         shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
         next_pre_mix, x_mixed, x_next,
-        recv_meta, recv_x, recv_routes,
-        data_arrived, routed_output, combine_arrived,
-        local_num_tokens, ep_rank, moe_epoch, force_topk, recv_x_local, recv_x_last_use,
-        local_experts=N_LOCAL_EXPERTS, topk=TOPK, dispatch_worker_limit=0,
+        moe_workspace, local_num_tokens, force_topk,
     )
-    clear_moe_signals(x_next, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
     return x_next
 
 
@@ -398,11 +471,11 @@ def l3_moe(
     norm_weight: pl.Tensor[[EP_SIZE, D], pl.BF16],
     gate_weight: pl.Tensor[[EP_SIZE, N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[EP_SIZE, N_EXPERTS], pl.FP32],
-    routed_w1: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w1: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, W1_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     routed_w1_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
-    routed_w2: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w2: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, W2_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     routed_w2_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
-    routed_w3: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w3: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, W3_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     routed_w3_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
     shared_w1: pl.Tensor[[EP_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[EP_SIZE, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
@@ -418,21 +491,11 @@ def l3_moe(
     force_topk: pl.Tensor[[EP_SIZE, MOE_TOKENS, TOPK], pl.INT32],
 ):
     """EP host driver for the HC-wrapped Flash MoE block."""
-    recv_meta_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-    recv_x_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], dtype=pl.INT8)
-    recv_routes_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
-    routed_output_buf = pld.alloc_window_buffer([MOE_TOKENS * TOPK, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
+    moe_workspace_buf = pld.alloc_window_buffer([MOE_WORKSPACE_BYTES], dtype=pl.UINT8)
 
     rank_count = pld.world_size()
     for r in pl.range(rank_count):
-        recv_meta = pld.window(recv_meta_buf, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-        recv_x = pld.window(recv_x_buf, [N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], dtype=pl.INT8)
-        recv_routes = pld.window(recv_routes_buf, [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-        data_arrived = pld.window(data_arrived_buf, [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
-        routed_output = pld.window(routed_output_buf, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
-        combine_arrived = pld.window(combine_arrived_buf, [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
+        moe_workspace = pld.window(moe_workspace_buf, [MOE_WORKSPACE_BYTES], dtype=pl.UINT8)
         # Per-rank MX_B_NN scale views.
         routed_w1_scale_r: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = routed_w1_scale[r]
         routed_w2_scale_r: pl.Tensor[[N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN] = routed_w2_scale[r]
@@ -447,9 +510,8 @@ def l3_moe(
             routed_w3[r], routed_w3_scale_r, shared_w1[r], shared_w1_scale_r,
             shared_w2[r], shared_w2_scale_r, shared_w3[r], shared_w3_scale_r,
             next_pre_mix[r], x_mixed[r], x_next[r],
-            recv_meta, recv_x, recv_routes,
-            data_arrived, routed_output, combine_arrived,
-            num_tokens, r, moe_epoch, force_topk[r], device=r,
+            moe_workspace,
+            num_tokens, r, force_topk[r], device=r,
         )
 
 
@@ -470,13 +532,13 @@ def _normalise_num_tokens(value):
     return counts.contiguous()
 
 
-def _route_bias():
+def _route_bias(experts=N_EXPERTS):
     """Build correction biases for TopK expert ids spread across ranks."""
     import torch
 
-    selected = (torch.arange(TOPK, dtype=torch.int64) * max(1, N_EXPERTS // TOPK))
-    selected = torch.remainder(selected, N_EXPERTS)
-    bias = torch.full((N_EXPERTS,), -1.0, dtype=torch.float32)
+    selected = (torch.arange(TOPK, dtype=torch.int64) * max(1, experts // TOPK))
+    selected = torch.remainder(selected, experts)
+    bias = torch.full((experts,), -1.0, dtype=torch.float32)
     bias[selected] = 4.0
     return bias
 
@@ -586,7 +648,15 @@ def build_moe_specs(num_tokens=MOE_TOKENS, *, initialize=True):
         value = values.get(name)
         init = None if value is None else partial(torch.clone, value)
         resident = None if name in nonresident else "stacked"
-        specs.append(TensorSpec(name, shapes[name], dtype, init_value=init, resident=resident))
+        pack = None
+        if PACK_ROUTED_WEIGHTS and name in ("routed_w1", "routed_w3"):
+            pack = partial(_resident_gate_up_half, half=int(name == "routed_w3"))
+        elif PACK_ROUTED_WEIGHTS and name == "routed_w2":
+            pack = _resident_down_weight
+        shape = shapes[name]
+        upload_shape = [*shape[:-2], shape[-2] // PANEL_ROWS, WEIGHT_PANEL_BYTES] if pack else None
+        specs.append(TensorSpec(name, shape, dtype, init_value=init, resident=resident,
+                                pack_for_upload=pack, upload_shape=upload_shape))
     return specs
 
 

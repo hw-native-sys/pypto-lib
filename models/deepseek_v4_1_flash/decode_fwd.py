@@ -20,13 +20,10 @@ if C.EP_SIZE % C.LM_HEAD_TP_SIZE:
     raise ValueError("EP must be divisible by LM head TP")
 
 _shape_parser = argparse.ArgumentParser(add_help=False)
-_default_experts = C.FLASH.n_routed_experts // C.EP_SIZE if C.EP_SIZE in (4, 8) else 64
-_shape_parser.add_argument("--experts-per-rank", type=int, default=_default_experts)
 _shape_parser.add_argument("--weight-bank-size", type=int, default=C.FLASH.num_hidden_layers)
+_shape_parser.add_argument("--packed-routed-weights", action=argparse.BooleanOptionalAction, default=False)
+_shape_parser.add_argument("--runtime-dir", default=None)
 _shape_options = _shape_parser.parse_known_args()[0]
-if _shape_options.experts_per_rank <= 0 or C.EP_SIZE * _shape_options.experts_per_rank < C.FLASH.num_experts_per_tok:
-    _shape_parser.error("--experts-per-rank must give at least TopK routed experts")
-C.N_LOCAL_EXPERTS = _shape_options.experts_per_rank
 WEIGHT_BANK_SIZE = _shape_options.weight_bank_size
 if WEIGHT_BANK_SIZE not in (1, C.FLASH.num_hidden_layers):
     _shape_parser.error("--weight-bank-size must be 1 or the full layer count")
@@ -34,7 +31,7 @@ if WEIGHT_BANK_SIZE not in (1, C.FLASH.num_hidden_layers):
 
 from config import COMPRESSED_POOL_UNIT_ROWS, C2A_STORAGE_ROWS, C1A_STORAGE_ROWS
 from config import (
-    FLASH as M, LM_HEAD_TP_SIZE, B_DYN, Q_START_DYN, ROUTE_T_DYN, T_DYN, BLOCK_SIZE, DECODE_MAX_TOKENS,
+    FLASH as M, LM_HEAD_TP_SIZE, B_DYN, Q_START_DYN, T_DYN, BLOCK_SIZE, DECODE_MAX_TOKENS,
     DECODE_INPUT_MAX_TOKENS, INDEX_CACHE_GROUP, STATE_CAPACITY, MOE_TOKENS, DSPARK_DRAFT_LAYERS,
     DSPARK_LAST_TARGET_LAYER, DSPARK_TARGET_LAYER_IDS, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
@@ -49,8 +46,9 @@ from input_pack import prepare_compressed_lens
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
 from engram import ENGRAM_K, KV_OUT, engram_from_rows
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
+from mega_moe import FP4_PANEL_ROWS, forward_routed_weight_spec, use_packed_decode_weights, workspace_bytes
 from decode_moe import (
-    BALANCED_ROUTING, initialize_balanced_routes, moe, SIGNAL_PAD, clear_moe_signals, DISPATCH_PACKET_WIDTH, EP_SIZE, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH,
+    BALANCED_ROUTING, initialize_balanced_routes, make_decode_moe, EP_SIZE, FORWARD_LOCAL_EXPERTS as N_LOCAL_EXPERTS,
 )
 
 
@@ -79,6 +77,16 @@ MOE_INTER = M.moe_intermediate_size
 MX_GROUP = M.weight_block_size[0]
 
 
+PACK_ROUTED_WEIGHTS = use_packed_decode_weights(MOE_TOKENS, N_LOCAL_EXPERTS, TOPK) and (
+    _shape_options.packed_routed_weights or _shape_options.runtime_dir is not None
+)
+PANEL_ROWS = FP4_PANEL_ROWS if PACK_ROUTED_WEIGHTS else 1
+WEIGHT_PANEL_BYTES = PANEL_ROWS * MX_PACKED_LANE_COLS
+W1_DEVICE_ROWS = MX_W1_PACKED_ROWS // PANEL_ROWS
+W2_DEVICE_ROWS = MX_W2_PACKED_ROWS // PANEL_ROWS
+W3_DEVICE_ROWS = MX_W3_PACKED_ROWS // PANEL_ROWS
+moe = make_decode_moe(N_LOCAL_EXPERTS, TOPK, packed_routed_weights=PACK_ROUTED_WEIGHTS)
+MOE_WORKSPACE_BYTES = workspace_bytes(EP_SIZE, N_LOCAL_EXPERTS, MOE_TOKENS, TOPK, D, MOE_INTER)
 N_LAYERS = M.num_hidden_layers
 C2A_SOURCE_COUNT = 3
 KV_SOURCE_COUNT = 4
@@ -89,7 +97,7 @@ BLOCK_SIZE = BLOCK_SIZE
 DECODE_MAX_TOKENS = DECODE_MAX_TOKENS
 STATE_CAPACITY = STATE_CAPACITY
 
-FIXTURE_BATCH = 12
+FIXTURE_BATCH = C.DECODE_BATCH
 FIXTURE_SEQUENCE = 6
 FIXTURE_TOKENS = FIXTURE_BATCH * FIXTURE_SEQUENCE
 
@@ -100,6 +108,22 @@ FWD_INDEX_BLOCKS_DYN = pl.dynamic("FWD_INDEX_BLOCKS_DYN")
 FWD_STATE_BLOCKS_DYN = pl.dynamic("FWD_STATE_BLOCKS_DYN")
 FWD_C2A_TABLE_DYN = pl.dynamic("FWD_C2A_TABLE_DYN")
 FWD_C1A_TABLE_DYN = pl.dynamic("FWD_C1A_TABLE_DYN")
+
+
+@pl.jit.incore
+def capture_dspark_target_hidden(
+    x_hc: pl.InOut[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+    target_hidden: pl.InOut[pl.Tensor[[T_DYN, DSPARK_MAIN_IN], pl.BF16]],
+    active_rows: pl.Scalar[pl.INT32],
+    target_column: pl.Scalar[pl.INDEX],
+):
+    """Register the residual as InOut so the next layer waits for this snapshot."""
+    token = pl.tile.get_block_idx()
+    if token < active_rows:
+        hc_row = x_hc[token : token + 1, 0:HC_MULT, 0:D]
+        hc_mean = pl.mul(pl.col_sum(pl.reshape(hc_row, [HC_MULT, D])), 1.0 / HC_MULT)
+        target_hidden[token : token + 1, target_column : target_column + D] = pl.cast(hc_mean, pl.BF16, mode="rint")
+    return x_hc, target_hidden
 
 
 @pl.jit.inline(auto_scope=False)
@@ -156,22 +180,13 @@ def decode_encoder(
     ffn_norm_weight: pl.Tensor[[WEIGHT_BANK_SIZE * D], pl.BF16],
     gate_weight: pl.Tensor[[WEIGHT_BANK_SIZE * N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[WEIGHT_BANK_SIZE * N_EXPERTS], pl.FP32],
-    routed_w1: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w2: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w3: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w1: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, W1_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
+    routed_w2: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, W2_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
+    routed_w3: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, W3_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     shared_w1: pl.Tensor[[WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w2: pl.Tensor[[WEIGHT_BANK_SIZE, MOE_INTER, D], pl.FP8E4M3FN],
     shared_w3: pl.Tensor[[WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
-    recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], pl.INT8],
-    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    data_arrived: pld.DistributedTensor[
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
-    ],
-    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
-    ],
+    moe_workspace: pld.DistributedTensor,
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     attention_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     rank: pl.Scalar[pl.INT32],
@@ -240,8 +255,6 @@ def decode_encoder(
     force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
     if BALANCED_ROUTING:
         initialize_balanced_routes(force_topk, local_moe_tokens, rank, N_LOCAL_EXPERTS, TOPK)
-    recv_x_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.FP8E4M3FN)
-    recv_x_last_use = pl.array.create(1, pl.TASK_ID)
     for layer in pl.range(0, 20):
         if layer == 1 or layer == 14:
             with pl.scope():
@@ -362,11 +375,11 @@ def decode_encoder(
             layer_ffn_norm: pl.Tensor[[D], pl.BF16] = pl.slice(ffn_norm_weight, [D], [weight_layer * D])
             ffn_gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16] = pl.slice(gate_weight, [N_EXPERTS, D], [weight_layer * N_EXPERTS, 0])
             ffn_correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32] = pl.slice(correction_bias, [N_EXPERTS], [weight_layer * N_EXPERTS])
-            ffn_routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w1, [N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], [ffn_routed_base, 0, 0])
+            ffn_routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, W1_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8] = pl.slice(routed_w1, [N_LOCAL_EXPERTS, W1_DEVICE_ROWS, WEIGHT_PANEL_BYTES], [ffn_routed_base, 0, 0])
             ffn_routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w1_scale, [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [weight_layer * (N_LOCAL_EXPERTS * (D // MX_GROUP)), 0])
-            ffn_routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w2, [N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], [ffn_routed_base, 0, 0])
+            ffn_routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, W2_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8] = pl.slice(routed_w2, [N_LOCAL_EXPERTS, W2_DEVICE_ROWS, WEIGHT_PANEL_BYTES], [ffn_routed_base, 0, 0])
             ffn_routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w2_scale, [N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], [weight_layer * (N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), 0])
-            ffn_routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w3, [N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], [ffn_routed_base, 0, 0])
+            ffn_routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, W3_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8] = pl.slice(routed_w3, [N_LOCAL_EXPERTS, W3_DEVICE_ROWS, WEIGHT_PANEL_BYTES], [ffn_routed_base, 0, 0])
             ffn_routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w3_scale, [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [weight_layer * (N_LOCAL_EXPERTS * (D // MX_GROUP)), 0])
             ffn_shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN] = shared_w1[weight_layer]
             ffn_shared_w1_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w1_scale, [D // MX_GROUP, MOE_INTER], [weight_layer * (D // MX_GROUP), 0])
@@ -386,12 +399,7 @@ def decode_encoder(
                 ffn_shared_w2, ffn_shared_w2_scale,
                 ffn_shared_w3, ffn_shared_w3_scale,
                 pre_mix, x_mixed, x_hc,
-                recv_meta, recv_x, recv_routes,
-                data_arrived,
-                routed_output, combine_arrived,
-                local_moe_tokens, rank, layer + 1,
-                force_topk, recv_x_local, recv_x_last_use,
-                local_experts=N_LOCAL_EXPERTS, topk=TOPK, dispatch_worker_limit=0,
+                moe_workspace, local_moe_tokens, force_topk,
             )
     return x_hc, pre_mix, token_rope_cos, token_rope_sin
 
@@ -445,22 +453,13 @@ def decode_decoder(
     ffn_norm_weight: pl.Tensor[[WEIGHT_BANK_SIZE * D], pl.BF16],
     gate_weight: pl.Tensor[[WEIGHT_BANK_SIZE * N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[WEIGHT_BANK_SIZE * N_EXPERTS], pl.FP32],
-    routed_w1: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w2: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w3: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w1: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, W1_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
+    routed_w2: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, W2_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
+    routed_w3: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, W3_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     shared_w1: pl.Tensor[[WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w2: pl.Tensor[[WEIGHT_BANK_SIZE, MOE_INTER, D], pl.FP8E4M3FN],
     shared_w3: pl.Tensor[[WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
-    recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], pl.INT8],
-    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    data_arrived: pld.DistributedTensor[
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
-    ],
-    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
-    ],
+    moe_workspace: pld.DistributedTensor,
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     attention_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     rank: pl.Scalar[pl.INT32],
@@ -509,8 +508,6 @@ def decode_decoder(
     force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
     if BALANCED_ROUTING:
         initialize_balanced_routes(force_topk, local_moe_tokens, rank, N_LOCAL_EXPERTS, TOPK)
-    recv_x_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.FP8E4M3FN)
-    recv_x_last_use = pl.array.create(1, pl.TASK_ID)
     for layer in pl.range(20, 40):
         with pl.scope():
             weight_layer = layer % WEIGHT_BANK_SIZE
@@ -634,11 +631,11 @@ def decode_decoder(
             layer_ffn_norm: pl.Tensor[[D], pl.BF16] = pl.slice(ffn_norm_weight, [D], [weight_layer * D])
             ffn_gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16] = pl.slice(gate_weight, [N_EXPERTS, D], [weight_layer * N_EXPERTS, 0])
             ffn_correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32] = pl.slice(correction_bias, [N_EXPERTS], [weight_layer * N_EXPERTS])
-            ffn_routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w1, [N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], [ffn_routed_base, 0, 0])
+            ffn_routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, W1_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8] = pl.slice(routed_w1, [N_LOCAL_EXPERTS, W1_DEVICE_ROWS, WEIGHT_PANEL_BYTES], [ffn_routed_base, 0, 0])
             ffn_routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w1_scale, [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [weight_layer * (N_LOCAL_EXPERTS * (D // MX_GROUP)), 0])
-            ffn_routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w2, [N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], [ffn_routed_base, 0, 0])
+            ffn_routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, W2_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8] = pl.slice(routed_w2, [N_LOCAL_EXPERTS, W2_DEVICE_ROWS, WEIGHT_PANEL_BYTES], [ffn_routed_base, 0, 0])
             ffn_routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w2_scale, [N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], [weight_layer * (N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), 0])
-            ffn_routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w3, [N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], [ffn_routed_base, 0, 0])
+            ffn_routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, W3_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8] = pl.slice(routed_w3, [N_LOCAL_EXPERTS, W3_DEVICE_ROWS, WEIGHT_PANEL_BYTES], [ffn_routed_base, 0, 0])
             ffn_routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w3_scale, [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [weight_layer * (N_LOCAL_EXPERTS * (D // MX_GROUP)), 0])
             ffn_shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN] = shared_w1[weight_layer]
             ffn_shared_w1_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w1_scale, [D // MX_GROUP, MOE_INTER], [weight_layer * (D // MX_GROUP), 0])
@@ -658,23 +655,16 @@ def decode_decoder(
                 ffn_shared_w2, ffn_shared_w2_scale,
                 ffn_shared_w3, ffn_shared_w3_scale,
                 pre_mix, x_mixed, x_hc,
-                recv_meta, recv_x, recv_routes,
-                data_arrived,
-                routed_output, combine_arrived,
-                local_moe_tokens, rank, layer + 1,
-                force_topk, recv_x_local, recv_x_last_use,
-                local_experts=N_LOCAL_EXPERTS, topk=TOPK, dispatch_worker_limit=0,
+                moe_workspace, local_moe_tokens, force_topk,
             )
         # This residual enters the next layer's attention.
         target_layer = layer + 1
         if target_layer >= DSPARK_TARGET_LAYER_IDS[0] and target_layer <= DSPARK_LAST_TARGET_LAYER:
             target_column = (target_layer - DSPARK_TARGET_LAYER_IDS[0]) * D
-            for token in pl.spmd(MOE_TOKENS, name_hint="decode_dspark_target_hidden"):
-                if token < local_moe_tokens:
-                    hc_row = x_hc[token : token + 1, 0:HC_MULT, 0:D]
-                    hc_mean = pl.mul(pl.col_sum(pl.reshape(hc_row, [HC_MULT, D])), 1.0 / HC_MULT)
-                    target_bf16 = pl.cast(hc_mean, pl.BF16, mode="rint")
-                    dspark_target_hidden[token : token + 1, target_column : target_column + D] = target_bf16
+            (x_hc, dspark_target_hidden), _capture_tid = pl.spmd_submit(
+                capture_dspark_target_hidden, x_hc, dspark_target_hidden, local_moe_tokens,
+                target_column, core_num=MOE_TOKENS,
+            )
     return x_hc
 
 
@@ -733,22 +723,13 @@ def decode_fwd(
     ffn_norm_weight: pl.Tensor[[WEIGHT_BANK_SIZE * D], pl.BF16],
     gate_weight: pl.Tensor[[WEIGHT_BANK_SIZE * N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[WEIGHT_BANK_SIZE * N_EXPERTS], pl.FP32],
-    routed_w1: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w2: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w3: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w1: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, W1_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
+    routed_w2: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, W2_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
+    routed_w3: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, W3_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     shared_w1: pl.Tensor[[WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w2: pl.Tensor[[WEIGHT_BANK_SIZE, MOE_INTER, D], pl.FP8E4M3FN],
     shared_w3: pl.Tensor[[WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
-    recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], pl.INT8],
-    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    data_arrived: pld.DistributedTensor[
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
-    ],
-    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
-    ],
+    moe_workspace: pld.DistributedTensor,
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     attention_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     rank: pl.Scalar[pl.INT32],
@@ -794,9 +775,7 @@ def decode_fwd(
         gate_weight, correction_bias,
         routed_w1, routed_w2, routed_w3,
         shared_w1, shared_w2, shared_w3,
-        recv_meta, recv_x, recv_routes,
-        data_arrived, routed_output, combine_arrived,
-        moe_num_tokens, attention_num_tokens, rank,
+        moe_workspace, moe_num_tokens, attention_num_tokens, rank,
         wq_a_scale, wq_b_scale, wkv_scale, wo_b_scale,
         index_wq_b_scale,
         routed_w1_scale, routed_w2_scale, routed_w3_scale,
@@ -827,9 +806,7 @@ def decode_fwd(
         gate_weight, correction_bias,
         routed_w1, routed_w2, routed_w3,
         shared_w1, shared_w2, shared_w3,
-        recv_meta, recv_x, recv_routes,
-        data_arrived, routed_output, combine_arrived,
-        moe_num_tokens, attention_num_tokens, rank,
+        moe_workspace, moe_num_tokens, attention_num_tokens, rank,
         wq_a_scale, wq_b_scale, wkv_scale, wo_b_scale,
         index_wq_b_scale,
         routed_w1_scale, routed_w2_scale, routed_w3_scale,
@@ -893,22 +870,13 @@ def l2_decode_fwd(
     ffn_norm_weight: pl.Tensor[[WEIGHT_BANK_SIZE * D], pl.BF16],
     gate_weight: pl.Tensor[[WEIGHT_BANK_SIZE * N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[WEIGHT_BANK_SIZE * N_EXPERTS], pl.FP32],
-    routed_w1: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w2: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w3: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w1: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, W1_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
+    routed_w2: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, W2_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
+    routed_w3: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, W3_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     shared_w1: pl.Tensor[[WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w2: pl.Tensor[[WEIGHT_BANK_SIZE, MOE_INTER, D], pl.FP8E4M3FN],
     shared_w3: pl.Tensor[[WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
-    recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], pl.INT8],
-    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    data_arrived: pld.DistributedTensor[
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
-    ],
-    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
-    ],
+    moe_workspace: pld.DistributedTensor,
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     attention_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     rank: pl.Scalar[pl.INT32],
@@ -950,15 +918,12 @@ def l2_decode_fwd(
         gate_weight, correction_bias,
         routed_w1, routed_w2, routed_w3,
         shared_w1, shared_w2, shared_w3,
-        recv_meta, recv_x, recv_routes,
-        data_arrived, routed_output, combine_arrived,
-        moe_num_tokens, attention_num_tokens, rank,
+        moe_workspace, moe_num_tokens, attention_num_tokens, rank,
         wq_a_scale, wq_b_scale, wkv_scale, wo_b_scale,
         index_wq_b_scale,
         routed_w1_scale, routed_w2_scale, routed_w3_scale,
         shared_w1_scale, shared_w2_scale, shared_w3_scale,
     )
-    clear_moe_signals(result, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
     return result, final_pre_mix
 
 
@@ -1029,19 +994,19 @@ def l3_decode_fwd(
     gate_weight: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[
-        [EP_SIZE, WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8
+        [EP_SIZE, WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, W1_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8
     ],
     routed_w1_scale: pl.Tensor[
         [EP_SIZE, WEIGHT_BANK_SIZE * (N_LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0
     ],
     routed_w2: pl.Tensor[
-        [EP_SIZE, WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8
+        [EP_SIZE, WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, W2_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8
     ],
     routed_w2_scale: pl.Tensor[
         [EP_SIZE, WEIGHT_BANK_SIZE * (N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), D], pl.FP8E8M0
     ],
     routed_w3: pl.Tensor[
-        [EP_SIZE, WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8
+        [EP_SIZE, WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, W3_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8
     ],
     routed_w3_scale: pl.Tensor[
         [EP_SIZE, WEIGHT_BANK_SIZE * (N_LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0
@@ -1121,33 +1086,9 @@ def l3_decode_fwd(
     position_ids.bind_dynamic(1, T_DYN)
     freqs_cos.bind_dynamic(2, ROPE_ROWS_DYN)
     freqs_sin.bind_dynamic(2, ROPE_ROWS_DYN)
-    recv_meta_buffer = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-    recv_x_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], dtype=pl.INT8)
-    recv_routes_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-    data_arrived_buffer = pld.alloc_window_buffer(
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
-    )
-    routed_output_buffer = pld.alloc_window_buffer([MOE_TOKENS * TOPK, D], dtype=pl.BF16)
-    combine_arrived_buffer = pld.alloc_window_buffer(
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
-    )
+    moe_workspace_buffer = pld.alloc_window_buffer([MOE_WORKSPACE_BYTES], dtype=pl.UINT8)
     for rank in pl.range(pld.world_size()):
-        recv_meta = pld.window(recv_meta_buffer, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-        recv_x = pld.window(recv_x_buffer, [N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], dtype=pl.INT8)
-        recv_routes = pld.window(
-            recv_routes_buffer, [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32
-        )
-        data_arrived = pld.window(
-            data_arrived_buffer,
-            [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD],
-            dtype=pl.INT32,
-        )
-        routed_output = pld.window(routed_output_buffer, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
-        combine_arrived = pld.window(
-            combine_arrived_buffer,
-            [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD],
-            dtype=pl.INT32,
-        )
+        moe_workspace = pld.window(moe_workspace_buffer, [MOE_WORKSPACE_BYTES], dtype=pl.UINT8)
         l2_decode_fwd(
             engram_lookup[rank], engram_wkv[rank], engram_wkv_scale[rank], engram_weight[rank],
             x_hc[rank], pre_mix[rank], dspark_target_hidden[rank],
@@ -1174,9 +1115,7 @@ def l3_decode_fwd(
             gate_weight[rank], correction_bias[rank],
             routed_w1[rank], routed_w2[rank], routed_w3[rank],
             shared_w1[rank], shared_w2[rank], shared_w3[rank],
-            recv_meta, recv_x, recv_routes,
-            data_arrived, routed_output, combine_arrived,
-            moe_num_tokens, attention_num_tokens, rank,
+            moe_workspace, moe_num_tokens, attention_num_tokens, rank,
             wq_a_scale[rank], wq_b_scale[rank], wkv_scale[rank], wo_b_scale[rank],
             index_wq_b_scale[rank],
             routed_w1_scale[rank], routed_w2_scale[rank], routed_w3_scale[rank],
@@ -1230,8 +1169,7 @@ def _fixture_extent(dim):
 
 
 def build_tensor_specs():
-    """Build the twelve-request decode smoke fixture."""
-    from golden import TensorSpec
+    """Build the decode smoke fixture for the configured request capacity."""
     from decode_moe import _route_bias
 
     signature = inspect.signature(l3_decode_fwd._func)
@@ -1282,10 +1220,10 @@ def build_tensor_specs():
         elif name in ("moe_num_tokens", "attention_num_tokens"):
             init_value = torch.full(shape, FIXTURE_TOKENS, dtype=torch.int32)
         elif name == "correction_bias":
-            init_value = _route_bias().repeat(EP_SIZE, WEIGHT_BANK_SIZE)
+            init_value = _route_bias(N_EXPERTS).repeat(EP_SIZE, WEIGHT_BANK_SIZE)
         elif name.endswith("_scale"):
             init_value = 1.0
-        specs.append(TensorSpec(name, shape, dtype, init_value=init_value))
+        specs.append(forward_routed_weight_spec(name, shape, dtype, init_value, PACK_ROUTED_WEIGHTS))
     return specs
 
 
@@ -1303,6 +1241,8 @@ if __name__ == "__main__":
     parser.add_argument("--weight-bank-size", type=int, default=WEIGHT_BANK_SIZE, choices=[1, N_LAYERS])
     parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(EP_SIZE)))
     parser.add_argument("--balanced-routing", action="store_true")
+    parser.add_argument("--packed-routed-weights", action=argparse.BooleanOptionalAction, default=False, help="pack resident routed FP4 weights before upload")
+    parser.add_argument("--runtime-dir", default=None)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--dump-passes", action="store_true")
     parser.add_argument("--enable-scope-stats", action="store_true")
@@ -1331,6 +1271,18 @@ if __name__ == "__main__":
             num_sub_workers=0,
         ),
     )
+    if not (args.compile_only or args.runtime_dir or args.packed_routed_weights):
+        from functools import cache, partial
+
+        @cache
+        def zero_routed_bank(shape, dtype):
+            return torch.zeros(shape, dtype=dtype)
+
+        # These three synthetic read-only FP4 banks have identical zero contents.
+        for spec in specs:
+            if spec.name in ("routed_w1", "routed_w2", "routed_w3") and spec.init_value is None:
+                spec.init_value = partial(zero_routed_bank, tuple(spec.shape), spec.dtype)
+
     result = run(
         a5_default_runtime="host_build_graph",
         fn=l3_decode_fwd,
@@ -1338,6 +1290,7 @@ if __name__ == "__main__":
         config=config,
         golden_fn=None,
         compile_only=args.compile_only,
+        runtime_dir=args.runtime_dir,
     )
     if not result.passed:
         raise SystemExit(result.error or 1)
