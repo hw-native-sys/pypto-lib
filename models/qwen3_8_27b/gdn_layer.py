@@ -23,9 +23,9 @@ import torch
 from chunk_cumsum import CHUNK_TILE, DISPATCH_TOKENS, cumsum_ref, gdn_chunk_cumsum
 from chunk_h import (FSTATE_DYN, chunk_h_ref, compare_final_state,
                      compare_packed_final_state, gdn_chunk_h_final, gdn_chunk_h_final_packed)
-from chunk_o import chunk_o_ref
 from chunk_o_pipe import gdn_chunk_o_pipe
 from config import QWEN3_8_27B
+from delta_rule_reference import chunk_o_ref
 from reference import frob_ok, make_inputs, to_hT
 from scaled_dot_kkt import gdn_scaled_dot_kkt, kkt_ref
 import solve_tril

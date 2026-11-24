@@ -8,8 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """Gated DeltaNet chunk_o as an explicit cube/vector pipeline.
 
-Same arithmetic as `chunk_o.py`, with the cube and vector programs written
-separately and joined by GM mailboxes and three events:
+    inter = exp(g_i) * (Q @ S)
+    intra = (Q @ K^T * exp(min(g_i - g_j, 0)) * causal) @ V_new
+    O     = inter + intra
+
+The causal mask includes the diagonal, unlike scaled_dot_kkt's strictly-lower
+one. The cube and vector programs are written separately and joined by GM
+mailboxes and three events:
 
     AIC  Q@S, Q@K^T  --qs,qk-->  AIV gate  --gated-->  AIC gated@V  --intra-->  AIV out
 
@@ -18,10 +23,13 @@ cube `PRE_LAUNCH` heads ahead of the vector. `inter` is rebuilt at the consume
 step from the `qs` mailbox slot, which the ring holds until then.
 """
 import pypto.language as pl
+import torch
 
 from chunk_cumsum import CHUNK_TILE
 from config import QWEN3_8_27B
-from reference import frob_ok
+from delta_rule_reference import (chunk_h_ref, chunk_o_ref, cumsum_ref, kkt_ref,
+                                  solve_tril_ref, wy_fast_ref)
+from reference import flat_state, frob_ok, make_inputs, to_hT
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")                 # tokens
@@ -44,9 +52,8 @@ BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # tiling
 AIV_LANES = 2           # vector lanes per cube core, each owning half the chunk rows
-# One head of run-ahead is enough to cover the hand-off, and deeper rings cost
-# more in mailbox traffic than the extra overlap returns: 614.8 / 627.0 / 644.0
-# us at 1 / 2 / 3 (T = 8192, a2a3), against 880.8 for the auto-synchronised form.
+# One head of run-ahead covers the hand-off; deeper rings cost more in mailbox
+# traffic than the extra overlap returns.
 PRE_LAUNCH = 1          # heads the cube runs ahead of the vector
 # `qs` is written at the produce step and read at the CONSUME step, so it lives
 # pre_launch steps longer than the other three mailboxes, and the ring has to be
@@ -194,9 +201,9 @@ def _gdn_chunk_o_pipe(
 # The explicit pipeline keeps GM mailboxes and the rescale queue live at once, so the task
 # allocator needs more than the runtime's own 256 MiB default: at T = 65536 that default
 # fails with `orch_error_code=2 HEAP_RING_DEADLOCK`, which arrives as `finalize_native_run
-# failed with code -2` and names nothing about the heap. **Measured floor 512 MiB at
-# T = 65536**; set one power of two above it, as `mlp` and `gated_attention` are. The
-# heapless entry ran at T = 8192 and 32768, which is why this was missed.
+# failed with code -2` and names nothing about the heap. The floor there is 512 MiB; this
+# sets one power of two above it, as `mlp` and `gated_attention` do. Shapes up to T = 32768
+# run inside the default, so a small case does not exercise this.
 # Bytes per ring, one entry per scope depth, 0 leaving a ring at its default. The stage
 # scopes allocate on ring 1; a scalar here would reserve the same bytes on all four.
 PIPE_RING_HEAP = [0, 1024 * 1024 * 1024, 0, 0]
@@ -206,16 +213,62 @@ gdn_chunk_o_pipe = pl.jit.inline(auto_scope=False)(_gdn_chunk_o_pipe)
 gdn_chunk_o_pipe_test = pl.jit(auto_scope=False)(_gdn_chunk_o_pipe)
 
 
-def build_tensor_specs(t: int = BENCH_SEQ):
-    import chunk_o
+_INPUTS: dict = {}
 
-    return chunk_o.build_tensor_specs(t=t)
+
+def _inputs(t: int) -> dict:
+    """The chain this stage consumes, memoised so the several specs pay for it once."""
+    key = t
+    if key not in _INPUTS:
+        st = make_inputs(t, H, D, HG)
+        st["g_sum"] = cumsum_ref(st["g"], CHUNK_TILE)
+        a16 = kkt_ref(st["k"], st["beta"], st["g_sum"], CHUNK_TILE).to(torch.float16)
+        a_inv16 = solve_tril_ref(a16, CHUNK_TILE).to(torch.float16)
+        w, u = wy_fast_ref(st["k"], st["v"], st["beta"], a_inv16, st["g_sum"], CHUNK_TILE)
+        w16 = w.to(torch.float16)
+        u16 = u.to(torch.float16)
+        state, v_new, _ = chunk_h_ref(st["k"], w16, u16, st["g_sum"], CHUNK_TILE)
+        st["state"] = state
+        st["v_new16"] = v_new.to(torch.float16)
+        _INPUTS[key] = st
+    return _INPUTS[key]
+
+
+def build_tensor_specs(t: int = BENCH_SEQ):
+    from golden import TensorSpec
+
+    def draw(key, transform=None):
+        def make():
+            value = _inputs(t)[key]
+            return transform(value) if transform is not None else value
+
+        return make
+
+    nc = t // CHUNK_TILE
+
+    def init_mask():
+        rows = torch.arange(CHUNK_TILE)[:, None]
+        cols = torch.arange(CHUNK_TILE)[None, :]
+        return (rows >= cols).float()      # inclusive diagonal
+
+    return [
+        TensorSpec("q", [t, HG, D], torch.float16, init_value=draw("q")),
+        TensorSpec("k", [t, HG, D], torch.float16, init_value=draw("k")),
+        TensorSpec("v", [t, H, D], torch.float16, init_value=draw("v_new16")),
+        TensorSpec("state", [nc * H * D, D], torch.float16, init_value=draw("state", flat_state)),
+        TensorSpec("g_sum", [H, t], torch.float32, init_value=draw("g_sum", to_hT)),
+        TensorSpec("mask", [CHUNK_TILE, CHUNK_TILE], torch.float32, init_value=init_mask),
+        TensorSpec("o_out", [t, H, D], torch.float16),
+    ]
 
 
 def golden_gdn_chunk_o_pipe(tensors):
-    import chunk_o
-
-    chunk_o.golden_gdn_chunk_o(tensors)
+    t, _, d = tensors["q"].shape          # q and k have Hg heads under GQA
+    h = tensors["v"].shape[1]             # V, O and the state are per value head
+    chunk = tensors["mask"].shape[0]
+    state = tensors["state"].reshape(t // chunk, h, d, d)
+    o = chunk_o_ref(tensors["q"], tensors["k"], tensors["v"], state, tensors["g_sum"].t(), chunk)
+    tensors["o_out"].copy_(o)
 
 
 if __name__ == "__main__":

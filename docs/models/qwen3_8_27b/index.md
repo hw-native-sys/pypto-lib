@@ -65,10 +65,6 @@ references come from.
 
 FP32 inversion and block substitution preserve precision for correlated keys,
 including repeated-token prompts. The kernel publishes the inverse in FP16.
-The default `solve_tril.py` validation includes a correlated-key case alongside
-its random cases; select it with `--input-case correlated --seq-len 256`.
-The timing figures below predate this FP32 solve update and require
-remeasurement before they describe the current implementation.
 
 ## The layer
 
@@ -111,14 +107,10 @@ reshapes its rank-3 inputs to `[T, heads*D]` as its first statement, so what
 the consumers need is each tensor contiguous in its own buffer, not a
 particular rank.
 
-**On a2a3 at T = 8192: 9353 us**, against 9559 for the same fourteen kernels
-timed separately in the same grant -- so composing is worth about 205 us, and
-that difference is the whole of the inter-kernel overlap the runtime performs.
-Both figures come from one sitting, which is what makes the difference
-meaningful: the block's own between-grant spread is about 150 us, and it
-re-measured 9378 us mean over 50 rounds on a later one.
-Most of it is at the head, where `in_proj_ab`, the halo fill, the gate half of
-`qk_norm_gate` and `chunk_cumsum` all run underneath `quant_x` for free.
+Composing the fourteen into one program is what lets the runtime overlap them,
+and the gain is concentrated at the head, where `in_proj_ab`, the halo fill,
+the gate half of `qk_norm_gate` and `chunk_cumsum` all run underneath
+`quant_x`.
 
 **Accuracy is scored as ratios against the quantization floor, not as an
 element-wise tolerance**, because the block quantizes the hidden states per
@@ -128,10 +120,9 @@ integer -- so an element-wise comparison taken after a quantiser measures
 which side of a boundary a value fell on, not whether the kernel is right.
 The gate is instead total relative error within 1.05x of what W8A8 alone
 costs and worst token row within 1.25x, plus the same two distances to the
-fake-quant chain itself. Measured at T = 2048 on random weights: **1.032x and
-1.094x**, and 0.272 of the floor away from the chain the kernels implement.
-The worst row is the sharper of the two -- one dead row in 2048 moves the
-whole-tensor norm by 1.12x and the worst row by 10.6x.
+fake-quant chain itself. The worst row is the sharper of the two: one dead
+row moves it by an order of magnitude where the whole-tensor norm barely
+registers the same row.
 
 Packed GDN uses separate convolution halos and recurrent state rows for each
 request. The caller provides the row boundaries and cache owners.
@@ -248,11 +239,9 @@ entries share the Torch stage operations in
 and check device results against their goldens.
 [reference.py](../../../models/qwen3_8_27b/reference.py) holds what they share: the
 drawn inputs, the two layout conversions and the acceptance criterion.
-A default invocation runs each entry's `DEFAULT_CASES`: a single chunk where the entry
-supports one, the cross-chunk recurrence, and the minimum dispatch. `--seq-len` runs one
-shape instead, and `BENCH_SEQ = 8192` is the prefill shape a performance run names.
-`PYPTO_BENCH=1` turns any of them into a benchmark, and the harness prints the median
-`effective_us`.
+A default invocation runs each entry's own bounded correctness cases, and `--seq-len`
+runs one shape instead. `PYPTO_BENCH=1` turns any of them into a benchmark, and the
+harness prints the median `effective_us`.
 
 Around those six, `reference.py` carries the whole block: the four projections, the
 depthwise convolution, the qk-norm and gate, the gated RMSNorm and `out_proj`, read
@@ -278,11 +267,10 @@ quantizing the normed activations separately.
 Two weight sets serve that check and every later one: random weights drawn the
 way the module's own `__init__` draws them, and one real layer.
 [weights.py](../../../models/qwen3_8_27b/weights.py) fetches a layer's nine
-`linear_attn` tensors from the published checkpoint with a single 221 MiB range
-request -- they are contiguous in their shard -- so no checkpoint download is
-needed. A trained layer's `A_log` and `dt_bias` reach a decay range the random
-init does not, and that is the range where a wrong scale, a wrong eps or a
-saturating gate would show.
+`linear_attn` tensors from the published checkpoint by range request, so no
+checkpoint download is needed. A trained layer's `A_log` and `dt_bias` reach a
+decay range the random init does not, and that is the range where a wrong
+scale, a wrong eps or a saturating gate would show.
 
 ```bash
 python models/qwen3_8_27b/gdn_block.py -p a2a3 -d "$TASK_DEVICE"
@@ -292,15 +280,13 @@ python models/qwen3_8_27b/solve_tril.py -p a2a3 --sim --seq-len 1024
 PYPTO_BENCH=1 python models/qwen3_8_27b/gdn_layer.py -p a2a3 -d "$TASK_DEVICE" --seq-len 8192
 ```
 
-The standalone block defaults to a 512-token fresh check and a 2048-token
-resumed check with two requests. Use `--packed` to select packed validation
-with a 2048-token-aligned total and 256-token-aligned requests.
-Use `--save-data` to capture a standalone run and `--golden-data` to replay
-its inputs, initial cache pools, and expected outputs. For checkpoint replay,
-pass the original floating-point layer with `--weights` to compute the
-quantization floor.
+The standalone block validates a fresh sequence and a resumed one with two
+requests. `--packed` selects packed validation, whose total is 2048-token
+aligned and whose requests are 256-token aligned. `--weights` takes the
+original floating-point layer, which is what the quantization floor is
+measured against.
 
-The block reference check needs no NPU, only `transformers` (5.17.0), and skips with a message if it is absent. Its default sequence length is 1024, which checks the same thing element for element; the numbers quoted above are at 8192. `weights.py` needs `--fetch` the first time, since it pulls from the checkpoint:
+The block reference check needs no NPU, only `transformers` (5.17.0), and skips with a message if it is absent. `weights.py` needs `--fetch` the first time, since it pulls from the checkpoint:
 
 ```bash
 python models/qwen3_8_27b/weights.py --layer 0 --fetch
