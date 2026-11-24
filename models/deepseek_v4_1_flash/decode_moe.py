@@ -373,8 +373,6 @@ def make_decode_moe(local_experts, topk, packed_routed_weights=False):
         residual_mix = pl.create_tensor([t, HC_MULT, HC_MULT], dtype=pl.FP32)
         x_norm = pl.create_tensor([t, D], dtype=pl.BF16)
         hc_head_norm_store(x_hc, pre_mix, norm_weight, x_norm, x_mixed, num_tokens, worker_limit=64)
-        inv_rms, partials = hc_project(x_hc, hc_ffn_fn, rms_worker_limit=64)
-        hc_sinkhorn(inv_rms, partials, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
 
         # MoE transport and routed-result scope.
         with pl.scope():
@@ -396,6 +394,8 @@ def make_decode_moe(local_experts, topk, packed_routed_weights=False):
                 shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, shared_w2, shared_w2_scale,
                 moe_workspace, num_tokens,
             )
+            inv_rms, partials = hc_project(x_hc, hc_ffn_fn, rms_worker_limit=64)
+            hc_sinkhorn(inv_rms, partials, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
             hc_post(sublayer, x_hc, post_mix, residual_mix, x_next, deps=None, dep_count=0)
         return x_next
 
