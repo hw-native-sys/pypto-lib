@@ -197,26 +197,30 @@ def _prefill_compressor_ratio4_tile(
     write_pos_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
     write_dst_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
     write_src_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
-    tile_positions_consecutive_flag = pl.create_tensor([1], dtype=pl.INT32)
+    tile_window_flags = pl.create_tensor([2], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_c4_write_map"):
         write_pos_map[0:1, 0:MAX_CMP_WRITES] = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=0)
         write_dst_map[0:1, 0:MAX_CMP_WRITES] = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=-1)
         write_src_map[0:1, 0:MAX_CMP_WRITES] = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=-1)
         map_seen = pl.cast(0, pl.INDEX)
         tile_positions_are_consecutive = pl.cast(1, pl.INT32)
+        tile_has_all_state_slots = pl.cast(1, pl.INT32)
         for map_local in pl.range(tile_rows):
             map_global = tile_base + map_local
             map_position = pl.read(position_ids, [map_global])
             expected_position = pl.cast(tile_first_position, pl.INDEX) + map_local
             if pl.cast(map_position, pl.INDEX) != expected_position:
                 tile_positions_are_consecutive = pl.cast(0, pl.INT32)
+            if pl.read(state_slot_mapping, [map_global]) < 0:
+                tile_has_all_state_slots = pl.cast(0, pl.INT32)
             map_slot_raw = pl.read(cmp_slot_mapping, [map_global])
             if map_slot_raw >= 0:
                 pl.write(write_pos_map, [0, map_seen], map_position)
                 pl.write(write_dst_map, [0, map_seen], pl.cast(map_slot_raw, pl.INT32))
                 pl.write(write_src_map, [0, map_seen], pl.cast(map_global, pl.INT32))
                 map_seen = map_seen + 1
-        pl.write(tile_positions_consecutive_flag, [0], tile_positions_are_consecutive)
+        pl.write(tile_window_flags, [0], tile_positions_are_consecutive)
+        pl.write(tile_window_flags, [1], tile_has_all_state_slots)
 
     pooled_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
     with pl.spmd(MAX_CMP_WRITES, name_hint="prefill_c4_softmax_pool") as pool_tid:
@@ -229,7 +233,30 @@ def _prefill_compressor_ratio4_tile(
             write_pos = pl.read(write_pos_map, [0, write_i])
             cur_start = write_pos + 1 - COMPRESS_RATIO
             prev_start = cur_start - COMPRESS_RATIO
-            for pool_s in pl.range(COMPRESS_RATIO):
+            # Consecutive tile-local windows read each half directly from its projection columns.
+            history_slots = pl.cast(COMPRESS_RATIO, pl.INDEX)
+            overlay_begin = pl.cast(0, pl.INDEX)
+            overlay_end = tile_rows
+            if pl.read(tile_window_flags, [0]) > 0:
+                first_pos = pl.cast(tile_first_position, pl.INDEX)
+                prev_local = pl.cast(prev_start, pl.INDEX) - first_pos
+                end_local = pl.cast(write_pos, pl.INDEX) + 1 - first_pos
+                overlay_begin = pl.max(0, prev_local)
+                overlay_end = pl.min(tile_rows, end_local)
+                whole_window = prev_local >= 0 and end_local <= tile_rows and write_pos >= STATE_LEN - 1
+                if whole_window and prev_start % COMPRESS_RATIO == 0 and pl.read(tile_window_flags, [1]) > 0:
+                    cur_local = prev_local + COMPRESS_RATIO
+                    pool_kv_tile[0:COMPRESS_RATIO, :] = pl.slice(kv_proj_scratch, [COMPRESS_RATIO, HEAD_D_TILE], [prev_local, 0])
+                    pool_kv_tile[COMPRESS_RATIO:STATE_LEN, :] = pl.slice(kv_proj_scratch, [COMPRESS_RATIO, HEAD_D_TILE], [cur_local, HEAD_DIM])
+                    prev_scores = pl.slice(score_proj_scratch, [COMPRESS_RATIO, HEAD_D_TILE], [prev_local, 0])
+                    cur_scores = pl.slice(score_proj_scratch, [COMPRESS_RATIO, HEAD_D_TILE], [cur_local, HEAD_DIM])
+                    prev_ape = pl.slice(ape, [COMPRESS_RATIO, HEAD_D_TILE], [0, 0])
+                    cur_ape = pl.slice(ape, [COMPRESS_RATIO, HEAD_D_TILE], [0, HEAD_DIM])
+                    pool_score_tile[0:COMPRESS_RATIO, :] = pl.add(prev_scores, prev_ape)
+                    pool_score_tile[COMPRESS_RATIO:STATE_LEN, :] = pl.add(cur_scores, cur_ape)
+                    history_slots = pl.cast(0, pl.INDEX)
+                    overlay_end = overlay_begin
+            for pool_s in pl.range(history_slots):
                 pool_kv_tile[pool_s : pool_s + 1, 0:HEAD_D_TILE] = pl.full(
                     [1, HEAD_D_TILE], dtype=pl.FP32, value=0.0
                 )
@@ -292,13 +319,6 @@ def _prefill_compressor_ratio4_tile(
                         OUT_DIM + HEAD_DIM : COMPRESS_STATE_DIM,
                     ]
 
-            # Current-tile state overlay from projection scratch.
-            overlay_begin = pl.cast(0, pl.INDEX)
-            overlay_end = tile_rows
-            if pl.read(tile_positions_consecutive_flag, [0]) > 0:
-                overlay_first = pl.cast(tile_first_position, pl.INDEX)
-                overlay_begin = pl.max(0, pl.cast(prev_start, pl.INDEX) - overlay_first)
-                overlay_end = pl.min(tile_rows, pl.cast(write_pos, pl.INDEX) + 1 - overlay_first)
             for pool_local in pl.range(overlay_begin, overlay_end):
                 pool_global = tile_base + pool_local
                 pool_state_row_raw = pl.read(state_slot_mapping, [pool_global])

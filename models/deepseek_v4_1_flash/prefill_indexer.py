@@ -127,8 +127,11 @@ def _project_index_query_packed(
     cosine_rows = pl.reshape(cosine, [rows, 32])
     sine_rows = pl.reshape(sine, [rows, 32])
     output_scales = pl.reshape(query_scale, [rows, INDEX_QUERY_SCALE_WIDTH])
+    flat_scales = pl.reshape(scales, [padded_rows * (Q_LORA // 32)])
     with pl.spmd(8, name_hint="idx_q", deps=[quantized]) as projected:
-        packed_result = _idx_q(payload, weight, scales, weight_scale, cosine_rows, sine_rows, query, output_scales, num_tokens)
+        packed_result = _idx_q(
+            payload, weight, flat_scales, weight_scale, cosine_rows, sine_rows, query, output_scales, num_tokens,
+        )
     return projected
 
 
@@ -1620,8 +1623,11 @@ def prefill_indexer(
                     packed_done = pl.array.create(1, pl.TASK_ID)
                     if begin % 16 == 0 and begin + required_rows <= pl.tensor.dim(latent_payload, 0):
                         q_payload = pl.slice(latent_payload, [required_rows, Q_LORA], [begin, 0])
-                        q_scales = pl.slice(latent_scales, [1, required_rows * (Q_LORA // 32)],
-                                            [0, begin * (Q_LORA // 32)])
+                        # The native projection reads the packed scales as a
+                        # byte stream. A flat slice needs no dynamic row pitch.
+                        scale_stream = pl.reshape(latent_scales, [pl.tensor.dim(latent_scales, 1)])
+                        q_scales = pl.slice(scale_stream, [required_rows * (Q_LORA // 32)],
+                                            [begin * (Q_LORA // 32)])
                         with pl.spmd(8, name_hint="idx_q_reuse_mx") as projected:
                             projected_query = _idx_q(q_payload, query_weight, q_scales, query_weight_scale,
                                                      chunk_cos, chunk_sin, packed_query, query_scale, count)
@@ -1636,19 +1642,25 @@ def prefill_indexer(
                     gemm_bf16_to_bf16(chunk_x, weight_projection, raw_weights, count,
                                       width=D, output_width=INDEX_H, n_tile=INDEX_H, k_tile=INDEX_PROJ_K_TILE,
                                       workers=4, name_hint="prefill_index_weights")
-                    if native != 0:
-                        score_requests = pl.create_tensor([rows], dtype=pl.INT32)
-                        # The guarded native scorer accepts at most eight pages per request.
-                        score_pages = pl.create_tensor([rows, 8], dtype=pl.INT32)
-                        metadata = pl.create_tensor([33, 2], dtype=pl.INT32)
-                        score_requests, score_pages, metadata = _group_prefill_index_queries(
-                            chunk_requests, table, score_requests, score_pages, metadata, count)
-                        score_active = pl.cast(count, pl.INT64)
-                        with pl.spmd(PREFILL_SCORE_WORKERS, name_hint="qli_score"):
-                            _prefill_score(packed_query, query_scale, raw_weights, cache, cache_scale, score_pages,
-                                   score_requests, chunk_lengths, metadata, packed_scores, score_active, SCORE)
-                        scoring[0] = pl.system.task_dummy(deps=[packed_tid, chunk_ready])
-                    else:
+                    if not c2a:
+                        if native != 0:
+                            score_requests = pl.create_tensor([rows], dtype=pl.INT32)
+                            # The guarded native scorer accepts at most eight pages per request.
+                            score_pages = pl.create_tensor([rows, 8], dtype=pl.INT32)
+                            metadata = pl.create_tensor([33, 2], dtype=pl.INT32)
+                            score_requests, score_pages, metadata = _group_prefill_index_queries(
+                                chunk_requests, table, score_requests, score_pages, metadata, count)
+                            score_active = pl.cast(count, pl.INT64)
+                            # The native gate requires the full 128-row pages.
+                            key_pages = cache[:, :128, :, :]
+                            scale_pages = cache_scale[:, :128, :, :]
+                            with pl.spmd(PREFILL_SCORE_WORKERS, name_hint="qli_score"):
+                                _prefill_score(
+                                    packed_query, query_scale, raw_weights, key_pages, scale_pages, score_pages,
+                                    score_requests, chunk_lengths, metadata, packed_scores, score_active, SCORE,
+                                )
+                            scoring[0] = pl.system.task_dummy(deps=[packed_tid, chunk_ready])
+                    if native == 0:
                         query_tid = _index_query_carrier(packed_query, query, count, packed_tid, chunk_ready)
                         weights_tid = _scale_index_weights(raw_weights, weights, count)
                         prepared = pl.system.task_dummy(deps=[query_tid, weights_tid])

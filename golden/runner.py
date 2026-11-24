@@ -12,13 +12,14 @@
 Public entry point: :func:`run`.
 """
 
+import ast
 import os
 import re
 import statistics
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -215,13 +216,45 @@ def _validate_stepped_swimlane(
     )
 
 
+def _artifact_runtime(config_path: Path) -> str:
+    """Read the baked ABI literal without executing generated Python."""
+    try:
+        for stmt in ast.parse(config_path.read_bytes(), filename=str(config_path)).body:
+            if isinstance(stmt, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "RUNTIME_CONFIG" for target in stmt.targets
+            ):
+                config = ast.literal_eval(stmt.value)
+                runtime = config.get("runtime") if isinstance(config, dict) else None
+                return runtime if isinstance(runtime, str) and runtime else "unknown"
+    except (OSError, SyntaxError, ValueError, TypeError):
+        pass
+    return "unknown"
+
+
+def _report_a5_artifact_runtime(compiled: Any, work_dir: Path, cfg: Any) -> None:
+    dc = cfg.distributed_config
+    devices = list(dc.device_ids) if dc is not None else [cfg.device_id]
+    next_levels = work_dir / "next_levels"
+    if next_levels.is_dir():
+        # These are chip callables. Multiple ranks can use the same callable.
+        callables = {
+            path.parent.name: _artifact_runtime(path)
+            for path in sorted(next_levels.glob("*/kernel_config.py"))
+        }
+    else:
+        cached = getattr(compiled, "_runtime_name", None)
+        runtime = cached if isinstance(cached, str) and cached else _artifact_runtime(work_dir / "kernel_config.py")
+        callables = {work_dir.name: runtime}
+    print(f"[RUN] artifact runtime: devices={devices} callables={callables or 'unknown'}", flush=True)
+
+
 def _stale_cpps(work_dir: Path, *, platform: str) -> list[Path]:
     """Find missing or outdated generated binaries using registered code identities.
 
     Generated kernels may have several registrations sharing one content-keyed
     binary. Require a fresh sidecar for every distinct code contract and the
     replay platform, using PyPTO's own identity function. Plain kernels and
-    orchestration retain their legacy sibling naming. External/builtin caches
+    orchestration retain their legacy sibling naming. External, builtin and VPTO helper caches
     belong to the runtime.
     """
     stale: list[Path] = []
@@ -243,9 +276,9 @@ def _stale_cpps(work_dir: Path, *, platform: str) -> list[Path]:
             for kernel in read_kernel_config(config_path).KERNELS:
                 source = Path(kernel["source"])
                 expected = sidecars.setdefault(source.resolve(), set())
-                if kernel.get("external", False) or kernel.get("builtin", False):
+                if kernel.get("external") or kernel.get("builtin") or kernel.get("vpto_sources"):
                     # These never have source-adjacent binaries; their content
-                    # and include closure are checked by the runtime cache.
+                    # and toolchain identity are checked by the runtime cache.
                     continue
                 stem = source.stem
                 if _generated_code_key(kernel) is not None:
@@ -938,6 +971,10 @@ def _abi_error(details: list[str]) -> ValueError:
     )
 
 
+def _matches_shape(artifact: tuple[int, ...], shape: Sequence[int]) -> bool:
+    return len(artifact) == len(shape) and all(a == -1 or a == s for a, s in zip(artifact, shape, strict=True))
+
+
 def _check_param_abi(param_infos: Any, specs: list[TensorSpec | ScalarSpec]) -> None:
     """Reject any drift between the artifact's parameters and *specs*.
 
@@ -991,15 +1028,13 @@ def _check_param_abi(param_infos: Any, specs: list[TensorSpec | ScalarSpec]) -> 
             expected_shape = tuple(spec.shape)
             if artifact_shape is None:
                 mismatches.append(f"{name}: expected tensor shape={expected_shape}, artifact is scalar")
-            elif len(artifact_shape) != len(expected_shape) or any(
-                artifact_dim != -1 and artifact_dim != expected_dim
-                for artifact_dim, expected_dim in zip(
-                    artifact_shape, expected_shape, strict=True
-                )
-            ):
-                mismatches.append(
-                    f"{name}: shape spec={expected_shape} artifact={artifact_shape}"
-                )
+            else:
+                canonical = _matches_shape(artifact_shape, expected_shape)
+                packed = spec.upload_shape is not None and _matches_shape(artifact_shape, spec.upload_shape)
+                if not (canonical or packed):
+                    mismatches.append(f"{name}: shape spec={expected_shape} artifact={artifact_shape}")
+                elif packed and (canonical or directions.get(info.direction) != "in"):
+                    mismatches.append(f"{name}: packed ABI requires an unambiguous input-only parameter")
 
         if artifact_dtype != spec.dtype:
             mismatches.append(
@@ -1131,6 +1166,27 @@ def _readback_resident_outputs(
             )
 
 
+def _packed_resident_inputs(
+    compiled: Any, specs: list[TensorSpec | ScalarSpec], tensors: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Select packing from the loaded artifact ABI, including on runtime-dir replay."""
+    candidates = [s for s in specs if isinstance(s, TensorSpec) and s.pack_for_upload is not None]
+    if not candidates:
+        return {}
+    infos, _, _ = compiled._get_metadata()
+    shapes = {_strip_ssa_suffix(info.name): info.shape for info in infos}
+    packed = {}
+    for spec in candidates:
+        assert spec.upload_shape is not None and spec.pack_for_upload is not None
+        if not _matches_shape(tuple(shapes[spec.name]), spec.upload_shape):
+            continue
+        value = spec.pack_for_upload(tensors)
+        if tuple(value.shape) != tuple(spec.upload_shape) or value.dtype != spec.dtype:
+            raise ValueError(f"packed tensor {spec.name!r} must have shape {spec.upload_shape} and dtype {spec.dtype}")
+        packed[spec.name] = value
+    return packed
+
+
 def _run_l3_resident(
     compiled: Any,
     specs: list[TensorSpec | ScalarSpec],
@@ -1180,7 +1236,12 @@ def _run_l3_resident(
         )
 
     # Per-call IO + resident upload sources must be shared memory before prepare().
-    _share_in_place(tensors)
+    packed = _packed_resident_inputs(compiled, specs, tensors)
+    upload = {**tensors, **packed} if packed else tensors
+    _share_in_place(upload)
+    if packed:
+        # Preserve logical inputs for comparisons and expose shared outputs to the caller.
+        tensors.update((name, value) for name, value in upload.items() if name not in packed)
 
     pure_out_names = _l3_pure_out_names(compiled)
     run_config = cfg
@@ -1231,15 +1292,16 @@ def _run_l3_resident(
                                 f"exposing DistributedWorker.alloc_stacked_tensor; this runtime lacks it."
                             )
                         else:
-                            handle = rt.alloc_stacked_tensor(tensors[s.name])
+                            handle = rt.alloc_stacked_tensor(upload[s.name])
                         resident_handles.append((s.name, handle, True, 0))
                     else:
                         # Whole-tensor resident on a single card: resident is the int
                         # worker id (0, 1, ...) the consuming kernel is dispatched to.
                         wid = int(s.resident)
-                        init = None if s.name in pure_out_names else tensors[s.name]
+                        init = None if s.name in pure_out_names else upload[s.name]
                         handle = rt.alloc_tensor(
-                            tuple(s.shape), s.dtype, init=init, worker_id=wid
+                            tuple(packed[s.name].shape if s.name in packed else s.shape),
+                            s.dtype, init=init, worker_id=wid,
                         )
                         resident_handles.append((s.name, handle, False, wid))
                 # Resident weights replace their host buffer in the arg list;
@@ -1476,6 +1538,37 @@ def _validate(
         )
 
 
+@contextmanager
+def _fresh_compile_config(cfg: Any, a5_default_runtime: str | None = None) -> Iterator[Any]:
+    """Select an opted-in A5 runtime for new builds while preserving explicit pass settings."""
+    requested = os.environ.get("PYPTO_LIB_A5_RUNTIME", a5_default_runtime)
+    if cfg.platform not in ("a5", "a5sim") or requested is None:
+        yield cfg
+        return
+
+    from pypto.pypto_core import passes
+
+    if passes.PassContext.current() is not None:
+        yield cfg
+        return
+
+    runtime = passes.runtime_kind_from_name(requested)
+    # PyPTO rejects these options when passed both to ir.compile and to a
+    # PassContext. Move the caller's values into the context for this compile.
+    options = {}
+    for field in ("diagnostic_phase", "memory_planner", "enable_software_pipeline"):
+        value = getattr(cfg, field)
+        if value is not None:
+            options[field] = value
+    if cfg.enable_software_pipeline:
+        options["enable_buffer_ir"] = False
+    options.setdefault("diagnostic_phase", passes.get_default_diagnostic_phase())
+    with passes.PassContext(
+        [], runtime=runtime, verification_level=passes.get_default_verification_level(), **options,
+    ):
+        yield replace(cfg, diagnostic_phase=None, memory_planner=None, enable_software_pipeline=None)
+
+
 def _run_pipeline(
     specs: list[TensorSpec | ScalarSpec],
     *,
@@ -1491,6 +1584,7 @@ def _run_pipeline(
     compile_only: bool,
     runtime_dir: str | None,
     save_data: bool,
+    a5_default_runtime: str | None,
 ) -> RunResult:
     """Compile / run / validate body behind :func:`run`.
 
@@ -1548,9 +1642,12 @@ def _run_pipeline(
         # dispatch below calls, so this is not an L3-only concern.
         compiled = _reload_from_dir(work_dir, cfg)
     else:
-        with _Stage("compile"):
-            compiled = compile_step(cfg, compile_state)
+        with _Stage("compile"), _fresh_compile_config(cfg, a5_default_runtime) as compile_cfg:
+            compiled = compile_step(compile_cfg, compile_state)
             work_dir = Path(compiled.output_dir)
+
+    if cfg.platform == "a5":
+        _report_a5_artifact_runtime(compiled, work_dir, cfg)
 
     # Neither a signature-driven compile (which trusts annotations over tensor
     # samples) nor a runtime-dir replay (which trusts a persisted artifact) can
@@ -1722,7 +1819,7 @@ def _jit_entry(
         dummy_args = [
             compile_scalars[spec.name].to_python()
             if isinstance(spec, ScalarSpec)
-            else torch.empty(spec.shape, dtype=spec.dtype)
+            else torch.empty(spec.upload_shape if spec.upload_shape is not None else spec.shape, dtype=spec.dtype)
             for spec in specs
         ]
         return fn.compile(*dummy_args, config=cfg)
@@ -1742,6 +1839,7 @@ def run(
     compile_only: bool = False,
     runtime_dir: str | None = None,
     save_data: bool = False,
+    a5_default_runtime: str | None = None,
 ) -> RunResult:
     """Compile *fn*, run it on device, and validate against golden.
 
@@ -1752,6 +1850,9 @@ def run(
 
     Args:
         fn: ``@pl.jit`` callable, ``@pl.program`` class, or ``ir.Program``.
+        a5_default_runtime: Runtime used for fresh A5/A5sim compiles of this entry.
+            An explicit PassContext or PYPTO_LIB_A5_RUNTIME overrides this default.
+            When omitted, PyPTO selects its usual runtime.
         specs: :class:`TensorSpec` / :class:`ScalarSpec` list in *fn*'s
             parameter order. A mismatched order is rejected, never reordered.
         golden_fn: ``golden_fn(values)`` that fills outputs in-place; *values*
@@ -1814,4 +1915,5 @@ def run(
             compile_only=compile_only,
             runtime_dir=runtime_dir,
             save_data=save_data,
+            a5_default_runtime=a5_default_runtime,
         )

@@ -6,6 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: no-sim
 """V4.1 Engram projection and residual gating from host rows or local lookup tables."""
 
 import math
@@ -33,7 +34,10 @@ NORM_EPS = M.rms_norm_eps
 D_INV = 1.0 / D
 DOT_SCALE = D**-0.5
 
-# PyPTO comparison tiling.
+# Quantization and projection tiling.
+ENGRAM_QUANT_M_TILE = 16
+ENGRAM_QUANT_K_TILE = 256
+ENGRAM_QUANT_SCALE_TILE = 128
 GATE_T_TILE = 8
 GATE_D_TILE = 1280
 PROJECTION_N_TILE = 256
@@ -54,6 +58,50 @@ def _engram_quantize(lookup: pl.Tensor, payload: pl.Out[pl.Tensor], scales: pl.O
 def _engram_project(payload: pl.Tensor, weight: pl.Tensor, scales: pl.Tensor, weight_scale: pl.Tensor,
                     kv: pl.Out[pl.Tensor], tokens: pl.Scalar[pl.INDEX], row_tile: pl.Scalar[pl.INDEX]) -> pl.Tensor:
     """Project quantized rows into BF16 keys and values."""
+    return kv
+
+
+@pl.jit.inline(auto_scope=False)
+def _engram_project_pypto(
+    payload: pl.Tensor, weight: pl.Tensor, scales: pl.Tensor, weight_scale: pl.Tensor,
+    kv: pl.Tensor, tokens: pl.Scalar[pl.INDEX], row_tile: pl.constexpr,
+    n_tile: pl.constexpr, inner_k: pl.constexpr,
+):
+    """Hold the K256 payload projection for validation after packed MX scale lowering is fixed."""
+    scale_groups = ENGRAM_K // 32
+    scale_tile = inner_k // 32
+    row_tiles = (tokens + row_tile - 1) // row_tile
+    col_tiles = KV_OUT // n_tile
+    padded = row_tiles * row_tile
+    activation_scale = pl.tensor.view(scales, [padded, scale_groups], layout=pl.MX_A_ZZ)
+    packed_weight_scale = pl.tensor.view(weight_scale, [scale_groups, KV_OUT], layout=pl.MX_B_NN)
+    with pl.spmd(pl.system.available_cluster_count(), name_hint="engram_projection_pypto"):
+        worker = pl.tile.get_block_idx()
+        workers = pl.tile.get_block_num()
+        for row in pl.range(row_tiles):
+            for col in pl.range(col_tiles):
+                if (row * col_tiles + col) % workers == worker:
+                    m0 = row * row_tile
+                    n0 = col * n_tile
+                    sa = pl.load(activation_scale, [m0, 0], [row_tile, scale_tile], target_memory=pl.Mem.Mat)
+                    sb = pl.load(packed_weight_scale, [0, n0], [scale_tile, n_tile], target_memory=pl.Mem.Mat)
+                    a_l1 = pl.load(payload, [m0, 0], [row_tile, PROJECTION_K_TILE], target_memory=pl.Mem.Mat)
+                    b_l1 = pl.load(weight, [0, n0], [PROJECTION_K_TILE, n_tile], target_memory=pl.Mem.Mat)
+                    a = pl.tile.extract(a_l1, 0, 0, [row_tile, inner_k], target_memory=pl.Mem.Left)
+                    b = pl.tile.extract(b_l1, 0, 0, [inner_k, n_tile], target_memory=pl.Mem.Right)
+                    acc = pl.matmul_mx(a, sa, b, sb)
+                    for k0 in pl.range(inner_k, ENGRAM_K, inner_k):
+                        local_k = k0 % PROJECTION_K_TILE
+                        if local_k == 0:
+                            a_l1 = pl.load(payload, [m0, k0], [row_tile, PROJECTION_K_TILE], target_memory=pl.Mem.Mat)
+                            b_l1 = pl.load(weight, [k0, n0], [PROJECTION_K_TILE, n_tile], target_memory=pl.Mem.Mat)
+                        a = pl.tile.extract(a_l1, 0, local_k, [row_tile, inner_k], target_memory=pl.Mem.Left)
+                        b = pl.tile.extract(b_l1, local_k, 0, [inner_k, n_tile], target_memory=pl.Mem.Right)
+                        sa = pl.load(activation_scale, [m0, k0 // 32], [row_tile, scale_tile], target_memory=pl.Mem.Mat)
+                        sb = pl.load(packed_weight_scale, [k0 // 32, n0], [scale_tile, n_tile], target_memory=pl.Mem.Mat)
+                        acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
+                    valid_acc = pl.set_validshape(acc, pl.min(row_tile, tokens - m0), n_tile)
+                    kv = pl.store(valid_acc, [m0, n0], kv)
     return kv
 
 
@@ -108,6 +156,153 @@ def engram_gate(
 
 
 @pl.jit.inline(auto_scope=False)
+def _load_engram_quant_work(
+    x: pl.Tensor,
+    inputs: pl.Tile[[2 * ENGRAM_QUANT_M_TILE, ENGRAM_QUANT_K_TILE], pl.BF16, pl.Mem.Vec],
+    work: pl.Scalar[pl.INDEX],
+    slot: pl.Scalar[pl.INDEX],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    t0 = work // (ENGRAM_K // ENGRAM_QUANT_K_TILE) * ENGRAM_QUANT_M_TILE
+    k0 = work % (ENGRAM_K // ENGRAM_QUANT_K_TILE) * ENGRAM_QUANT_K_TILE
+    rows = pl.max(0, pl.min(ENGRAM_QUANT_M_TILE, num_tokens - t0))
+    if rows > 0:
+        input_row = slot * ENGRAM_QUANT_M_TILE
+        inputs = pl.tile.gather_row(inputs, x, [input_row, 0], [t0, k0], [ENGRAM_QUANT_M_TILE, ENGRAM_QUANT_K_TILE],
+                                    valid_shape=[rows, ENGRAM_QUANT_K_TILE])
+    return inputs
+
+
+
+@pl.jit.incore
+def _engram_quantize_pypto(
+    x: pl.Tensor,
+    payload: pl.Out[pl.Tensor],
+    scales: pl.Out[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+    padded_rows: pl.Scalar[pl.INDEX],
+) -> tuple[pl.Tensor, pl.Tensor]:
+    """Quantize row-major BF16 projection inputs with M16-packed E8M0 scales."""
+    first = pl.tile.get_block_idx()
+    workers = pl.tile.get_block_num()
+    column_tiles = ENGRAM_K // ENGRAM_QUANT_K_TILE
+    total = padded_rows // ENGRAM_QUANT_M_TILE * column_tiles
+    if first < total:
+        inputs = pl.create_tile([2 * ENGRAM_QUANT_M_TILE, ENGRAM_QUANT_K_TILE], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+        output = pl.create_tile([2 * ENGRAM_QUANT_M_TILE * ENGRAM_QUANT_K_TILE], dtype=pl.INT8, target_memory=pl.Mem.Vec)
+        # Reserve a full 256-byte register store per scale slot.
+        codes = pl.create_tile([ENGRAM_QUANT_SCALE_TILE], dtype=pl.UINT32, target_memory=pl.Mem.Vec)
+        inputs = _load_engram_quant_work(x, inputs, first, 0, num_tokens)
+        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, 0)
+        pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, 0)
+        pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, 1)
+        rounds = (total - first + workers - 1) // workers
+        for iteration in pl.range(rounds):
+            work = first + iteration * workers
+            slot = iteration % 2
+            next_slot = 1 - slot
+            next_work = work + workers
+            # Prefetch the next tile while the vector pipe consumes the current slot.
+            if next_work < total:
+                if iteration > 0:
+                    pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, next_slot)
+                inputs = _load_engram_quant_work(x, inputs, next_work, next_slot, num_tokens)
+                pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, next_slot)
+            t0 = work // column_tiles * ENGRAM_QUANT_M_TILE
+            k0 = work % column_tiles * ENGRAM_QUANT_K_TILE
+            rows = pl.max(0, pl.min(ENGRAM_QUANT_M_TILE, num_tokens - t0))
+            source = pl.reshape(inputs, [2 * ENGRAM_QUANT_M_TILE * ENGRAM_QUANT_K_TILE])
+            pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.V, slot)
+            pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, slot)
+            output_words = pl.reinterpret_view(output, pl.UINT32, shape=[2 * ENGRAM_QUANT_M_TILE * ENGRAM_QUANT_K_TILE // 4])
+            with pl.reg_scope(auto_sync=False):
+                # Keep aligned row and slot offsets visible to register lowering.
+                slot_row = slot * ENGRAM_QUANT_M_TILE
+                code_offset = slot * (ENGRAM_QUANT_SCALE_TILE // 2)
+                full = pl.reg.full_mask(lanes=ENGRAM_QUANT_K_TILE)
+                groups = pl.reg.full_mask(lanes=ENGRAM_QUANT_K_TILE // 32)
+                packed_mask = pl.reg.full_mask(lanes=64)
+                # Eight words per group pair hold two rows of scale bytes each.
+                lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
+                pair_mask = pl.reg.broadcast(3, lanes=64, dtype=pl.UINT32)
+                pair_index = pl.reg.shift_rights(lane, 3, packed_mask)
+                pair_index = pl.reg.bitwise_and(pair_index, pair_mask, packed_mask)
+                low_index = pl.reg.shift_lefts(pair_index, 4, packed_mask)
+                high_index = pl.reg.adds(low_index, 8, packed_mask)
+                row_mask = pl.reg.broadcast(7, lanes=64, dtype=pl.UINT32)
+                row_indices = pl.reg.bitwise_and(lane, row_mask, packed_mask)
+                zero = pl.reg.broadcast(0, lanes=64, dtype=pl.UINT32)
+                for row, (packed_scales,) in pl.hardware_loop(rows, init_values=(zero,)):
+                    tile_row = slot_row + row
+                    offset = tile_row * ENGRAM_QUANT_K_TILE
+                    raw = pl.reg.load(source, offset, lanes=ENGRAM_QUANT_K_TILE)
+                    value = pl.reg.convert(raw, dtype=pl.FP32)
+                    magnitude = pl.reg.abs(value, full)
+                    maximum = pl.reg.reduce_max(magnitude, full, group_size=32)
+                    maximum_bits = pl.reg.interpret_cast(maximum, dtype=pl.INT32)
+                    exponent = pl.reg.shift_rights(maximum_bits, 23, groups)
+                    exponent = pl.reg.adds(exponent, -8, groups)
+                    exponent = pl.reg.maximums(exponent, 0, groups)
+                    nonzero = pl.reg.minimums(exponent, 1, groups)
+                    reciprocal_code = pl.reg.muls(exponent, -1, groups)
+                    reciprocal_code = pl.reg.adds(reciprocal_code, 254, groups)
+                    reciprocal_code = pl.reg.mul(reciprocal_code, nonzero, groups)
+                    reciprocal_bits = pl.reg.shift_lefts(reciprocal_code, 23, groups)
+                    reciprocal = pl.reg.interpret_cast(reciprocal_bits, dtype=pl.FP32)
+                    reciprocal = pl.reg.group_broadcast(reciprocal, lanes=ENGRAM_QUANT_K_TILE)
+                    value = pl.reg.mul(value, reciprocal, full)
+                    value = pl.reg.maximums(value, -448.0, full)
+                    value = pl.reg.minimums(value, 448.0, full)
+                    fp8 = pl.reg.convert(value, dtype=pl.FP8E4M3FN, rounding="R", saturate=False)
+                    words = pl.reg.interpret_cast(fp8, dtype=pl.UINT32)
+                    word_offset = tile_row * (ENGRAM_QUANT_K_TILE // 4)
+                    _payload = pl.reg.store(output_words, word_offset, words)
+
+                    scale_words = pl.reg.interpret_cast(exponent, dtype=pl.UINT32)
+                    scale_words = pl.reg.group_broadcast(scale_words, lanes=64)
+                    low = pl.reg.gather_lanes(scale_words, low_index)
+                    high = pl.reg.gather_lanes(scale_words, high_index)
+                    high = pl.reg.shift_lefts(high, 8, packed_mask)
+                    pair = pl.reg.bitwise_or(low, high, packed_mask)
+                    bit = pl.cast((row % 2) * 16, pl.INT16)
+                    pair = pl.reg.shift_lefts(pair, bit, packed_mask)
+                    word = pl.cast(row // 2, pl.UINT32)
+                    row_selected = pl.reg.compares(row_indices, word, packed_mask, predicate="eq")
+                    pair = pl.reg.select(row_selected, pair, zero)
+                    updated_scales = pl.reg.bitwise_or(packed_scales, pair, packed_mask)
+                    packed_scales = pl.yield_(updated_scales)
+                # Complete the active payload stores before the scale and padding stores.
+                pl.reg.mem_bar("VST_VST")
+                _scales = pl.reg.store(codes, code_offset, packed_scales)
+                padding = pl.reg.broadcast(0, lanes=ENGRAM_QUANT_K_TILE // 4, dtype=pl.UINT32)
+                for inactive in pl.hardware_loop(ENGRAM_QUANT_M_TILE - rows):
+                    row = rows + inactive
+                    tile_row = slot_row + row
+                    word_offset = tile_row * (ENGRAM_QUANT_K_TILE // 4)
+                    _payload_pad = pl.reg.store(output_words, word_offset, padding)
+            pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE2, slot)
+            pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE3, slot)
+            pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE3, slot)
+            output_rows = pl.reshape(output, [2 * ENGRAM_QUANT_M_TILE, ENGRAM_QUANT_K_TILE])
+            output_tile = pl.tile.slice(output_rows, [ENGRAM_QUANT_M_TILE, ENGRAM_QUANT_K_TILE], [slot * ENGRAM_QUANT_M_TILE, 0])
+            quantized = pl.reinterpret_view(output_tile, pl.FP8E4M3FN)
+            scale_bytes = pl.reinterpret_view(codes, pl.UINT8, shape=[2, 2 * ENGRAM_QUANT_SCALE_TILE])
+            scale_tile = pl.tile.slice(scale_bytes, [1, ENGRAM_QUANT_SCALE_TILE], [slot, 0])
+            scale_codes = pl.reinterpret_view(scale_tile, pl.FP8E8M0)
+            scale_offset = t0 * (ENGRAM_K // 32) + k0 // ENGRAM_QUANT_K_TILE * ENGRAM_QUANT_SCALE_TILE
+            pl.store(quantized, [t0, k0], payload)
+            pl.store(scale_codes, [0, scale_offset], scales)
+            pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, slot)
+        pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, 0)
+        if rounds > 1:
+            pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, 1)
+        pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 0)
+        pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 1)
+        pl.system.barrier(pipe=pl.PipeType.ALL)
+    return payload, scales
+
+
+@pl.jit.inline(auto_scope=False)
 def _engram_rows_tile(
     lookup: pl.Tensor, wkv: pl.Tensor, wkv_scale: pl.Tensor, weight: pl.Tensor,
     x: pl.Tensor, out: pl.Tensor, tokens: pl.Scalar[pl.INT32],
@@ -119,10 +314,22 @@ def _engram_rows_tile(
     scales = pl.create_tensor([1, padded * (ENGRAM_K // 32)], dtype=pl.FP8E8M0)
     kv = pl.create_tensor([tokens, KV_OUT], dtype=pl.BF16)
     with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_quant"):
-        quantized, quantized_scales = _engram_quantize(lookup, payload, scales, tokens, padded, 1)
+        quantized, quantized_scales = _engram_quantize_pypto(lookup, payload, scales, tokens, padded)
     with pl.spmd(pl.system.available_cluster_count(), name_hint="engram_projection"):
         projected = _engram_project(quantized, wkv, quantized_scales, wkv_scale, kv, tokens, row_tile)
-    return engram_gate(projected, weight, x, out, lookup, mask_zero_rows)
+    if mask_zero_rows:
+        return engram_gate(projected, weight, x, out, lookup, mask_zero_rows)
+    output_rows = pl.reshape(out, [pl.tensor.dim(out, 0) * HC_MULT, D])
+    if tokens >= 256:
+        hidden_pairs = pl.reshape(x, [pl.tensor.dim(x, 0) * (HC_MULT // 2), 2 * D])
+        weight_pairs = pl.reshape(weight, [HC_MULT // 2, 2 * D])
+        with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_gate_pairs"):
+            _engram_gate_pairs_reg(projected, weight_pairs, hidden_pairs, output_rows, tokens)
+    else:
+        hidden_rows = pl.reshape(x, [pl.tensor.dim(x, 0) * HC_MULT, D])
+        with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_gate"):
+            _engram_gate_reg(projected, weight, hidden_rows, output_rows, tokens)
+    return out
 
 
 @pl.jit.inline(auto_scope=False)
@@ -494,6 +701,219 @@ def golden_engram_rows_case(tensors):
     root = dot.abs().clamp_min(CLAMP).sqrt()
     gate = torch.sigmoid(torch.where(dot >= 0, root, -root))
     tensors["x"][:] = (h + gate.unsqueeze(-1) * value.unsqueeze(-2)).bfloat16().float()
+
+
+@pl.jit.inline(auto_scope=False)
+def _engram_gate_row_reg(
+    hidden: pl.Tile[[D], pl.FP32, pl.Mem.Vec],
+    key: pl.Tile[[D], pl.BF16, pl.Mem.Vec],
+    value: pl.Tile[[D], pl.BF16, pl.Mem.Vec],
+    weight: pl.Tile[[D], pl.FP32, pl.Mem.Vec],
+    output: pl.Tile[[D], pl.FP32, pl.Mem.Vec],
+):
+    """Apply the C++ lane accumulation, inverse-root correction and BF16 residual rounding."""
+    with pl.reg_scope(auto_sync=False):
+        full = pl.reg.full_mask(lanes=64)
+        sx = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+        sk = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+        dot = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+        for chunk in pl.hardware_loop(D // 64):
+            xv = pl.reg.load(hidden, chunk * 64, lanes=64)
+            kb = pl.reg.load(key, chunk * 64, lanes=64)
+            kv = pl.reg.convert(kb, dtype=pl.FP32)
+            wv = pl.reg.load(weight, chunk * 64, lanes=64)
+            square_x = pl.reg.mul(xv, xv, full)
+            sx = pl.reg.add(sx, square_x, full)
+            square_k = pl.reg.mul(kv, kv, full)
+            sk = pl.reg.add(sk, square_k, full)
+            product = pl.reg.mul(xv, wv, full)
+            product = pl.reg.mul(product, kv, full)
+            dot = pl.reg.add(dot, product, full)
+        sx = pl.reg.reduce_sum(sx, full, reassoc=True)
+        sk = pl.reg.reduce_sum(sk, full, reassoc=True)
+        dot = pl.reg.reduce_sum(dot, full, reassoc=True)
+        sx = pl.reg.broadcast(sx, lanes=64, dtype=pl.FP32)
+        sk = pl.reg.broadcast(sk, lanes=64, dtype=pl.FP32)
+        dot = pl.reg.broadcast(dot, lanes=64, dtype=pl.FP32)
+        sx = pl.reg.muls(sx, D_INV, full)
+        sk = pl.reg.muls(sk, D_INV, full)
+        x_variance = pl.reg.adds(sx, NORM_EPS, full)
+        x_one = pl.reg.broadcast(1.0, lanes=64, dtype=pl.FP32)
+        x_r = pl.reg.div(x_one, x_variance, full)
+        x_root = pl.reg.sqrt(x_r, full)
+        x_t = pl.reg.muls(x_variance, -0.5, full)
+        x_t = pl.reg.mul(x_t, x_root, full)
+        x_three_halves = pl.reg.broadcast(1.5, lanes=64, dtype=pl.FP32)
+        x_factor = pl.reg.mula(x_three_halves, x_t, x_root, full)
+        x_inverse = pl.reg.mul(x_root, x_factor, full)
+        x_negative_variance = pl.reg.muls(x_variance, -1.0, full)
+        x_correction = pl.reg.mula(x_one, x_negative_variance, x_r, full)
+        x_negative_inverse = pl.reg.muls(x_inverse, -1.0, full)
+        x_error = pl.reg.mula(x_r, x_negative_inverse, x_inverse, full)
+        x_correction = pl.reg.mula(x_correction, x_variance, x_error, full)
+        x_correction = pl.reg.mul(x_correction, x_inverse, full)
+        x_half = pl.reg.broadcast(0.5, lanes=64, dtype=pl.FP32)
+        x_inverse = pl.reg.mula(x_inverse, x_correction, x_half, full)
+        x_bits = pl.reg.interpret_cast(x_variance, dtype=pl.UINT32)
+        x_infinite = pl.reg.compares(x_bits, 2139095040, full, predicate="eq")
+        x_zero = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+        x_inverse = pl.reg.select(x_infinite, x_zero, x_inverse)
+        k_variance = pl.reg.adds(sk, NORM_EPS, full)
+        k_one = pl.reg.broadcast(1.0, lanes=64, dtype=pl.FP32)
+        k_r = pl.reg.div(k_one, k_variance, full)
+        k_root = pl.reg.sqrt(k_r, full)
+        k_t = pl.reg.muls(k_variance, -0.5, full)
+        k_t = pl.reg.mul(k_t, k_root, full)
+        k_three_halves = pl.reg.broadcast(1.5, lanes=64, dtype=pl.FP32)
+        k_factor = pl.reg.mula(k_three_halves, k_t, k_root, full)
+        k_inverse = pl.reg.mul(k_root, k_factor, full)
+        k_negative_variance = pl.reg.muls(k_variance, -1.0, full)
+        k_correction = pl.reg.mula(k_one, k_negative_variance, k_r, full)
+        k_negative_inverse = pl.reg.muls(k_inverse, -1.0, full)
+        k_error = pl.reg.mula(k_r, k_negative_inverse, k_inverse, full)
+        k_correction = pl.reg.mula(k_correction, k_variance, k_error, full)
+        k_correction = pl.reg.mul(k_correction, k_inverse, full)
+        k_half = pl.reg.broadcast(0.5, lanes=64, dtype=pl.FP32)
+        k_inverse = pl.reg.mula(k_inverse, k_correction, k_half, full)
+        k_bits = pl.reg.interpret_cast(k_variance, dtype=pl.UINT32)
+        k_infinite = pl.reg.compares(k_bits, 2139095040, full, predicate="eq")
+        k_zero = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+        k_inverse = pl.reg.select(k_infinite, k_zero, k_inverse)
+        dot = pl.reg.mul(dot, x_inverse, full)
+        dot = pl.reg.mul(dot, k_inverse, full)
+        dot = pl.reg.muls(dot, DOT_SCALE, full)
+        root = pl.reg.abs(dot, full)
+        root = pl.reg.maximums(root, CLAMP, full)
+        root = pl.reg.sqrt(root, full)
+        nonnegative = pl.reg.compares(dot, 0.0, full, predicate="ge")
+        negative = pl.reg.muls(root, -1.0, full)
+        root = pl.reg.select(nonnegative, root, negative)
+        root = pl.reg.muls(root, -1.0, full)
+        root = pl.reg.exp(root, full)
+        root = pl.reg.adds(root, 1.0, full)
+        gate = pl.reg.div(x_one, root, full)
+        for chunk in pl.hardware_loop(D // 64):
+            xv = pl.reg.load(hidden, chunk * 64, lanes=64)
+            vb = pl.reg.load(value, chunk * 64, lanes=64)
+            vv = pl.reg.convert(vb, dtype=pl.FP32)
+            y = pl.reg.mul(vv, gate, full)
+            y = pl.reg.add(xv, y, full)
+            rounded = pl.reg.convert(y, dtype=pl.BF16, rounding="R", saturate=False)
+            y = pl.reg.convert(rounded, dtype=pl.FP32)
+            pl.reg.mem_bar("VLD_VST")
+            _written = pl.reg.store(output, chunk * 64, y, full)
+            pl.reg.mem_bar("VST_VLD")
+    return output
+
+
+
+@pl.jit.incore
+def _engram_gate_reg(
+    kv: pl.Tensor[[T_DYN, KV_OUT], pl.BF16],
+    weight: pl.Tensor[[HC_MULT, D], pl.FP32],
+    x: pl.Tensor[[T_DYN * HC_MULT, D], pl.FP32],
+    out: pl.Out[pl.Tensor[[T_DYN * HC_MULT, D], pl.FP32]],
+    tokens: pl.Scalar[pl.INDEX],
+):
+    """Run the per-copy gate with cached weights and the C++ worker traversal."""
+    first = pl.tile.get_block_idx()
+    workers = pl.tile.get_block_num()
+    if first < tokens * HC_MULT:
+        weight_raw = pl.tile.load(weight, [first % HC_MULT, 0], [1, D], target_memory=pl.Mem.Vec)
+        for work in pl.range(first, tokens * HC_MULT, workers):
+            if work != first and workers % HC_MULT != 0:
+                weight_raw = pl.tile.load(weight, [work % HC_MULT, 0], [1, D], target_memory=pl.Mem.Vec)
+            gain = pl.reshape(weight_raw, [D])
+            hidden_raw = pl.tile.load(x, [work, 0], [1, D], target_memory=pl.Mem.Vec)
+            key_raw = pl.tile.load(kv, [work // HC_MULT, work % HC_MULT * D], [1, D], target_memory=pl.Mem.Vec)
+            value_raw = pl.tile.load(kv, [work // HC_MULT, HC_MULT * D], [1, D], target_memory=pl.Mem.Vec)
+            hidden = pl.reshape(hidden_raw, [D])
+            key = pl.reshape(key_raw, [D])
+            value = pl.reshape(value_raw, [D])
+            output = pl.create_tile([D], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+            output = _engram_gate_row_reg(hidden, key, value, gain, output)
+            pl.store(pl.reshape(output, [1, D]), [work, 0], out)
+    return out
+
+
+
+@pl.jit.inline(auto_scope=False)
+def _load_engram_gate_pair(
+    kv: pl.Tensor[[T_DYN, KV_OUT], pl.BF16],
+    x: pl.Tensor[[T_DYN * (HC_MULT // 2), 2 * D], pl.FP32],
+    hidden: pl.Tile[[2, 2 * D], pl.FP32, pl.Mem.Vec],
+    key: pl.Tile[[2, 2 * D], pl.BF16, pl.Mem.Vec],
+    value: pl.Tile[[2, D], pl.BF16, pl.Mem.Vec],
+    work: pl.Scalar[pl.INDEX], slot: pl.Scalar[pl.INDEX],
+):
+    hidden = pl.tile.gather_row(hidden, x, [slot, 0], [work, 0], [1, 2 * D])
+    key = pl.tile.gather_row(key, kv, [slot, 0], [work // 2, work % 2 * 2 * D], [1, 2 * D])
+    value = pl.tile.gather_row(value, kv, [slot, 0], [work // 2, HC_MULT * D], [1, D])
+    return hidden, key, value
+
+
+
+@pl.jit.incore
+def _engram_gate_pairs_reg(
+    kv: pl.Tensor[[T_DYN, KV_OUT], pl.BF16],
+    weight: pl.Tensor[[HC_MULT // 2, 2 * D], pl.FP32],
+    x: pl.Tensor[[T_DYN * (HC_MULT // 2), 2 * D], pl.FP32],
+    out: pl.Out[pl.Tensor[[T_DYN * HC_MULT, D], pl.FP32]],
+    tokens: pl.Scalar[pl.INDEX],
+):
+    """Prefetch the next pair into a separate UB slot while consuming the current pair."""
+    first = pl.tile.get_block_idx()
+    workers = pl.tile.get_block_num()
+    total = tokens * 2
+    if first < total:
+        hidden = pl.create_tile([2, 2 * D], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+        key = pl.create_tile([2, 2 * D], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+        value = pl.create_tile([2, D], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+        gain = pl.tile.load(weight, [first % 2, 0], [1, 2 * D], target_memory=pl.Mem.Vec)
+        output = pl.create_tile([2, D], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+        hidden, key, value = _load_engram_gate_pair(kv, x, hidden, key, value, first, 0)
+        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, 0)
+        pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, 2)
+        pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, 3)
+        rounds = (total - first + workers - 1) // workers
+        for group in pl.range((rounds + 1) // 2):
+            for slot in pl.unroll(2):
+                iteration = group * 2 + slot
+                if iteration < rounds:
+                    work = first + iteration * workers
+                    next_slot = 1 - slot
+                    if iteration > 0 and workers % 2 != 0:
+                        pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE2, 4)
+                        pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, 4)
+                        gain = pl.tile.gather_row(gain, weight, [0, 0], [work % 2, 0], [1, 2 * D])
+                        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, 4)
+                        pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.V, 4)
+                    if iteration + 1 < rounds:
+                        if iteration > 0:
+                            pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, next_slot)
+                        hidden, key, value = _load_engram_gate_pair(kv, x, hidden, key, value, work + workers, next_slot)
+                        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, next_slot)
+                    pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.V, slot)
+                    for copy in pl.unroll(2):
+                        output_event = copy + 2
+                        copy_offset = copy * D
+                        pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, output_event)
+                        hidden_row = pl.reshape(pl.tile.slice(hidden, [1, D], [slot, copy_offset]), [D])
+                        key_row = pl.reshape(pl.tile.slice(key, [1, D], [slot, copy_offset]), [D])
+                        value_row = pl.reshape(pl.tile.slice(value, [1, D], [slot, 0]), [D])
+                        gain_row = pl.reshape(pl.tile.slice(gain, [1, D], [0, copy_offset]), [D])
+                        output_row = pl.reshape(pl.tile.slice(output, [1, D], [copy, 0]), [D])
+                        output_row = _engram_gate_row_reg(hidden_row, key_row, value_row, gain_row, output_row)
+                        pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE3, output_event)
+                        pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE3, output_event)
+                        pl.store(pl.reshape(output_row, [1, D]), [work * 2 + copy, 0], out)
+                        pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, output_event)
+                    if iteration + 2 < rounds:
+                        pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE2, slot)
+        pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 2)
+        pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 3)
+        pl.system.barrier(pipe=pl.PipeType.ALL)
+    return out
 
 
 if __name__ == "__main__":

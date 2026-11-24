@@ -22,10 +22,12 @@ from numbers import Integral
 from typing import Mapping, Sequence
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 import importlib.util
 import json
 import os
 from pathlib import Path
+import tempfile
 import time
 
 
@@ -43,16 +45,11 @@ import config as C
 _shape_parser = argparse.ArgumentParser(add_help=False)
 _shape_parser.add_argument("--checkpoint")
 _shape_parser.add_argument("--ep", type=int, choices=[2, 4, 8])
-_shape_parser.add_argument("--experts-per-rank", type=int)
 _shape_parser.add_argument("--capacity", type=int, default=128)
 _shape_parser.add_argument("--moe-tokens", type=int, default=1024)
 _shape_parser.add_argument("--dp", type=int)
 _shape_options = _shape_parser.parse_known_args()[0]
 C.EP_SIZE = _shape_options.ep or (4 if _shape_options.checkpoint else 2)
-_default_experts = C.FLASH.n_routed_experts // C.EP_SIZE if C.EP_SIZE in (4, 8) else 64
-C.N_LOCAL_EXPERTS = _default_experts if _shape_options.experts_per_rank is None else _shape_options.experts_per_rank
-if C.N_LOCAL_EXPERTS <= 0 or C.EP_SIZE * C.N_LOCAL_EXPERTS % 16:
-    _shape_parser.error("--experts-per-rank must be positive and give a total expert count aligned to 16")
 _MAX_CHUNK_TOKENS = 4096
 CAPACITY = _shape_options.capacity
 CP_SIZE = C.CP_SIZE
@@ -87,8 +84,8 @@ from gate import gather_routing_bias
 from sample import sample
 
 BIAS_DYN = pl.dynamic("PREFILL_FORWARD_BIAS_DYN")
-from prefill_moe import AUX_WIDTH, ROUTE_WIDTH, clear_moe_signals
-from prefill_moe import prefill_moe_slabs
+from mega_moe import workspace_bytes
+from prefill_moe import FORWARD_LOCAL_EXPERTS as LOCAL_EXPERTS, make_prefill_moe
 from compressor import STATE_WIDTH
 from prefill_c1a_full import prefill_publish_decoder, prefill_c1a_full, prefill_c1a_full_cp
 from prefill_swa import prefill_swa, prefill_swa_cp
@@ -108,7 +105,8 @@ PAGES = pl.dynamic("PREFILL_HISTORY_PAGES")
 WINDOW_PAGES = pl.dynamic("PREFILL_WINDOW_PAGES")
 C2A_TABLE_DYN = pl.dynamic("PREFILL_C2A_TABLE")
 C1A_TABLE_DYN = pl.dynamic("PREFILL_C1A_TABLE")
-LOCAL_EXPERTS = C.N_LOCAL_EXPERTS
+if RANKS * LOCAL_EXPERTS % 16:
+    _shape_parser.error("--experts-per-rank must give a total expert count aligned to 16")
 N_LAYERS = M.num_hidden_layers
 RING_HEAP_BYTES = 4 * 1024**3
 FINAL_SLOT = 2 * CAPACITY
@@ -133,6 +131,9 @@ O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
 O_LORA = M.o_lora_rank
 Q_LORA = M.q_lora_rank
 TOPK = M.num_experts_per_tok
+
+_, prefill_moe_slabs = make_prefill_moe(LOCAL_EXPERTS)
+MOE_WORKSPACE_BYTES = workspace_bytes(RANKS, LOCAL_EXPERTS, MOE_TOKENS, TOPK, D, MOE_INTER)
 
 ROPE_DIM = M.qk_rope_head_dim
 
@@ -230,76 +231,79 @@ def prefill_attention(
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
     mode: pl.Scalar[pl.INT32],
+    c1a_phase: pl.constexpr,
 ):
-    if mode == 0:
-        prefill_swa(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, q_window_indices,
-            rope_cos, rope_sin, window_slots, num_tokens, window_cache,
-            kv_hidden, hc_output, hc_next_pre_mix,
-        )
-    elif mode == 1:
-        prefill_c2a_full(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, compressor_wkv,
-            compressor_wgate, compressor_norm_weight, index_wk, index_norm_weight, index_wq_b,
-            index_wq_b_scale, index_weights_proj, q_window_indices, q_request_ids, q_compressed_lens,
-            rope_cos, rope_sin, window_slots, num_tokens, window_cache,
-            compressed_rope_cos, compressed_rope_sin, c2a_compressed_slots, token_to_req_indices, position_ids,
-            query_start_loc, state_block_table, state_cache, compressed_cache, index_cache,
-            index_cache_scale, c2a_index_block_table, kv_hidden, hc_output,
-            hc_next_pre_mix, topk_indices,
-        )
-    elif mode == 2:
-        prefill_c1a_reuse(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, q_window_indices,
-            topk_indices, rope_cos, rope_sin, window_slots, num_tokens,
-            window_cache, compressed_cache, kv_hidden, hc_output,
-            hc_next_pre_mix,
-        )
-    elif mode == 3:
-        prefill_c1a_full(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, compressor_wkv,
-            compressor_norm_weight, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
-            index_weights_proj, q_window_indices, q_request_ids, q_compressed_lens, rope_cos,
-            rope_sin, window_slots, num_tokens, window_cache, compressed_rope_cos,
-            compressed_rope_sin, c2a_compressed_slots, compressed_cache, index_cache, index_cache_scale,
-            c1a_index_block_table, kv_hidden, hc_output, hc_next_pre_mix,
-            topk_indices, pool_block_ids, pool_block_counts,
-            publish_compressed=False,
-        )
-    elif mode == 4:
-        prefill_c1a_reindex(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, index_wq_b,
-            index_wq_b_scale, index_weights_proj, q_window_indices, q_request_ids, q_compressed_lens,
-            pool_block_ids, pool_block_counts, rope_cos, rope_sin, window_slots,
-            num_tokens, window_cache, compressed_cache, index_cache, index_cache_scale,
-            c1a_index_block_table, kv_hidden, hc_output, hc_next_pre_mix,
-            topk_indices,
-        )
-    elif mode == 5:
-        prefill_c1a_reuse(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, q_window_indices,
-            topk_indices, rope_cos, rope_sin, window_slots, num_tokens,
-            window_cache, compressed_cache, kv_hidden, hc_output,
-            hc_next_pre_mix,
-        )
+    if not c1a_phase:
+        if mode == 0:
+            prefill_swa(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, q_window_indices,
+                rope_cos, rope_sin, window_slots, num_tokens, window_cache,
+                kv_hidden, hc_output, hc_next_pre_mix,
+            )
+        elif mode == 1:
+            prefill_c2a_full(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, compressor_wkv,
+                compressor_wgate, compressor_norm_weight, index_wk, index_norm_weight, index_wq_b,
+                index_wq_b_scale, index_weights_proj, q_window_indices, q_request_ids, q_compressed_lens,
+                rope_cos, rope_sin, window_slots, num_tokens, window_cache,
+                compressed_rope_cos, compressed_rope_sin, c2a_compressed_slots, token_to_req_indices, position_ids,
+                query_start_loc, state_block_table, state_cache, compressed_cache, index_cache,
+                index_cache_scale, c2a_index_block_table, kv_hidden, hc_output,
+                hc_next_pre_mix, topk_indices,
+            )
+        elif mode == 2:
+            prefill_c1a_reuse(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, q_window_indices,
+                topk_indices, rope_cos, rope_sin, window_slots, num_tokens,
+                window_cache, compressed_cache, kv_hidden, hc_output,
+                hc_next_pre_mix,
+            )
+    else:
+        if mode == 3:
+            prefill_c1a_full(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, compressor_wkv,
+                compressor_norm_weight, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
+                index_weights_proj, q_window_indices, q_request_ids, q_compressed_lens, rope_cos,
+                rope_sin, window_slots, num_tokens, window_cache, compressed_rope_cos,
+                compressed_rope_sin, c2a_compressed_slots, compressed_cache, index_cache, index_cache_scale,
+                c1a_index_block_table, kv_hidden, hc_output, hc_next_pre_mix,
+                topk_indices, pool_block_ids, pool_block_counts,
+                publish_compressed=False,
+            )
+        elif mode == 4:
+            prefill_c1a_reindex(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, index_wq_b,
+                index_wq_b_scale, index_weights_proj, q_window_indices, q_request_ids, q_compressed_lens,
+                pool_block_ids, pool_block_counts, rope_cos, rope_sin, window_slots,
+                num_tokens, window_cache, compressed_cache, index_cache, index_cache_scale,
+                c1a_index_block_table, kv_hidden, hc_output, hc_next_pre_mix,
+                topk_indices,
+            )
+        elif mode == 5:
+            prefill_c1a_reuse(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, q_window_indices,
+                topk_indices, rope_cos, rope_sin, window_slots, num_tokens,
+                window_cache, compressed_cache, kv_hidden, hc_output,
+                hc_next_pre_mix,
+            )
     return hc_output, hc_next_pre_mix
 
 
@@ -371,85 +375,88 @@ def prefill_attention_cp(
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
     mode: pl.Scalar[pl.INT32],
+    c1a_phase: pl.constexpr,
 ):
-    if mode == 0:
-        prefill_swa_cp(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, q_rope_cos,
-            q_rope_sin, q_window_indices, local_tokens, rope_cos, rope_sin,
-            window_slots, num_tokens, window_cache, output_window, output_arrived,
-            kv_restore_indices, cp_group_base, cp_rank, attention_epoch, kv_hidden,
-            hc_output, hc_next_pre_mix,
-        )
-    elif mode == 1:
-        prefill_c2a_full_cp(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, compressor_wkv,
-            compressor_wgate, compressor_norm_weight, index_wk, index_norm_weight, index_wq_b,
-            index_wq_b_scale, index_weights_proj, q_rope_cos, q_rope_sin, q_window_indices,
-            q_request_ids, q_compressed_lens, local_tokens, rope_cos, rope_sin,
-            window_slots, num_tokens, window_cache, compressed_rope_cos, compressed_rope_sin,
-            c2a_compressed_slots, token_to_req_indices, position_ids, query_start_loc, state_block_table,
-            state_cache, compressed_cache, index_cache, index_cache_scale, c2a_index_block_table,
-            output_window, output_arrived, kv_restore_indices, cp_group_base, cp_rank,
-            attention_epoch, kv_hidden, hc_output, hc_next_pre_mix,
-            topk_indices,
-        )
-    elif mode == 2:
-        prefill_c1a_reuse_cp(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, q_rope_cos,
-            q_rope_sin, q_window_indices, topk_indices, local_tokens, rope_cos,
-            rope_sin, window_slots, num_tokens, window_cache, compressed_cache,
-            output_window, output_arrived, kv_restore_indices, cp_group_base, cp_rank,
-            attention_epoch, kv_hidden, hc_output, hc_next_pre_mix,
-        )
-    elif mode == 3:
-        prefill_c1a_full_cp(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, compressor_wkv,
-            compressor_norm_weight, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
-            index_weights_proj, q_rope_cos, q_rope_sin, q_window_indices, q_request_ids,
-            q_compressed_lens, local_tokens, rope_cos, rope_sin, window_slots,
-            num_tokens, window_cache, compressed_rope_cos, compressed_rope_sin, c2a_compressed_slots,
-            compressed_cache, index_cache, index_cache_scale, c1a_index_block_table, output_window,
-            output_arrived, kv_restore_indices, cp_group_base, cp_rank, attention_epoch,
-            kv_hidden, hc_output, hc_next_pre_mix, topk_indices,
-            pool_block_ids, pool_block_counts,
-            publish_compressed=False,
-        )
-    elif mode == 4:
-        prefill_c1a_reindex_cp(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, index_wq_b,
-            index_wq_b_scale, index_weights_proj, q_rope_cos, q_rope_sin, q_window_indices,
-            q_request_ids, q_compressed_lens, pool_block_ids, pool_block_counts, local_tokens,
-            rope_cos, rope_sin, window_slots, num_tokens, window_cache,
-            compressed_cache, index_cache, index_cache_scale, c1a_index_block_table, output_window,
-            output_arrived, kv_restore_indices, cp_group_base, cp_rank, attention_epoch,
-            kv_hidden, hc_output, hc_next_pre_mix, topk_indices,
-        )
-    elif mode == 5:
-        prefill_c1a_reuse_cp(
-            hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, q_rope_cos,
-            q_rope_sin, q_window_indices, topk_indices, local_tokens, rope_cos,
-            rope_sin, window_slots, num_tokens, window_cache, compressed_cache,
-            output_window, output_arrived, kv_restore_indices, cp_group_base, cp_rank,
-            attention_epoch, kv_hidden, hc_output, hc_next_pre_mix,
-        )
+    if not c1a_phase:
+        if mode == 0:
+            prefill_swa_cp(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, q_rope_cos,
+                q_rope_sin, q_window_indices, local_tokens, rope_cos, rope_sin,
+                window_slots, num_tokens, window_cache, output_window, output_arrived,
+                kv_restore_indices, cp_group_base, cp_rank, attention_epoch, kv_hidden,
+                hc_output, hc_next_pre_mix,
+            )
+        elif mode == 1:
+            prefill_c2a_full_cp(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, compressor_wkv,
+                compressor_wgate, compressor_norm_weight, index_wk, index_norm_weight, index_wq_b,
+                index_wq_b_scale, index_weights_proj, q_rope_cos, q_rope_sin, q_window_indices,
+                q_request_ids, q_compressed_lens, local_tokens, rope_cos, rope_sin,
+                window_slots, num_tokens, window_cache, compressed_rope_cos, compressed_rope_sin,
+                c2a_compressed_slots, token_to_req_indices, position_ids, query_start_loc, state_block_table,
+                state_cache, compressed_cache, index_cache, index_cache_scale, c2a_index_block_table,
+                output_window, output_arrived, kv_restore_indices, cp_group_base, cp_rank,
+                attention_epoch, kv_hidden, hc_output, hc_next_pre_mix,
+                topk_indices,
+            )
+        elif mode == 2:
+            prefill_c1a_reuse_cp(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, q_rope_cos,
+                q_rope_sin, q_window_indices, topk_indices, local_tokens, rope_cos,
+                rope_sin, window_slots, num_tokens, window_cache, compressed_cache,
+                output_window, output_arrived, kv_restore_indices, cp_group_base, cp_rank,
+                attention_epoch, kv_hidden, hc_output, hc_next_pre_mix,
+            )
+    else:
+        if mode == 3:
+            prefill_c1a_full_cp(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, compressor_wkv,
+                compressor_norm_weight, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
+                index_weights_proj, q_rope_cos, q_rope_sin, q_window_indices, q_request_ids,
+                q_compressed_lens, local_tokens, rope_cos, rope_sin, window_slots,
+                num_tokens, window_cache, compressed_rope_cos, compressed_rope_sin, c2a_compressed_slots,
+                compressed_cache, index_cache, index_cache_scale, c1a_index_block_table, output_window,
+                output_arrived, kv_restore_indices, cp_group_base, cp_rank, attention_epoch,
+                kv_hidden, hc_output, hc_next_pre_mix, topk_indices,
+                pool_block_ids, pool_block_counts,
+                publish_compressed=False,
+            )
+        elif mode == 4:
+            prefill_c1a_reindex_cp(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, index_wq_b,
+                index_wq_b_scale, index_weights_proj, q_rope_cos, q_rope_sin, q_window_indices,
+                q_request_ids, q_compressed_lens, pool_block_ids, pool_block_counts, local_tokens,
+                rope_cos, rope_sin, window_slots, num_tokens, window_cache,
+                compressed_cache, index_cache, index_cache_scale, c1a_index_block_table, output_window,
+                output_arrived, kv_restore_indices, cp_group_base, cp_rank, attention_epoch,
+                kv_hidden, hc_output, hc_next_pre_mix, topk_indices,
+            )
+        elif mode == 5:
+            prefill_c1a_reuse_cp(
+                hc_input, hc_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                w_attn_norm, wq_a, wq_a_scale, q_norm_weight, wq_b,
+                wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale, q_rope_cos,
+                q_rope_sin, q_window_indices, topk_indices, local_tokens, rope_cos,
+                rope_sin, window_slots, num_tokens, window_cache, compressed_cache,
+                output_window, output_arrived, kv_restore_indices, cp_group_base, cp_rank,
+                attention_epoch, kv_hidden, hc_output, hc_next_pre_mix,
+            )
     return hc_output, hc_next_pre_mix
 
 
@@ -543,15 +550,7 @@ def l2_prefill_fwd(
     dspark_target_hidden: pl.Out[pl.Tensor[[CAPACITY, DSPARK_MAIN_IN], pl.BF16]],
     logits: pl.Out[pl.Tensor[[16, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[16, 8], pl.INT32]],
-    recv_meta: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
-    recv_scale: pld.DistributedTensor[[LOCAL_EXPERTS * RECV_MAX, D // 32], pl.UINT8],
-    recv_weights: pld.DistributedTensor[[LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
-    recv_routes: pld.DistributedTensor[[LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    arrived: pld.DistributedTensor[[RANKS, 128], pl.INT32],
-    data_arrived: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS, 128], pl.INT32],
-    routed_output: pld.DistributedTensor[[MOE_TOKENS * TOPK, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS, 128], pl.INT32],
+    moe_workspace: pld.DistributedTensor,
     attention_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, D], pl.BF16],
     attention_arrived: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     hc_window: pld.DistributedTensor[[LOCAL_CAPACITY, HC_DIM + 16], pl.FP32],
@@ -685,10 +684,10 @@ def l2_prefill_fwd(
     history_pages = pl.tensor.dim(compressed_cache, 1)
     c1a_cache_units = pl.slice(compressed_cache, [2, history_pages, 64, 1, COMPRESSED_CACHE_BYTES], [3, 0, 0, 0, 0])
     c1a_cache = pl.reshape(c1a_cache_units, [history_pages, 128, 1, COMPRESSED_CACHE_BYTES])
-    c1a_index_units = pl.slice(index_cache, [2, history_pages, 64, 1, 64], [3, 0, 0, 0, 0])
-    c1a_index = pl.reshape(c1a_index_units, [history_pages, 128, 1, 64])
-    c1a_scale_units = pl.slice(index_scales, [2, history_pages, 64, 1, 4], [3, 0, 0, 0, 0])
-    c1a_scale = pl.reshape(c1a_scale_units, [history_pages, 128, 1, 4])
+    c1a_index_units = index_cache[3:5]
+    c1a_index = pl.reshape(c1a_index_units, [pl.tensor.dim(index_cache, 1), 128, 1, 64])
+    c1a_scale_units = index_scales[3:5]
+    c1a_scale = pl.reshape(c1a_scale_units, [pl.tensor.dim(index_scales, 1), 128, 1, 4])
     for layer in pl.range(N_LAYERS):
         stage = layer // 20
         active = pl.read(counts, [stage])
@@ -828,6 +827,7 @@ def l2_prefill_fwd(
                     layer_index_weights, pool_block_ids, pool_block_counts, topk_indices, attention_window, attention_arrived,
                     normalized, attn_hidden, attn_pre, local_active,
                     rank // CP_SIZE * CP_SIZE, rank % CP_SIZE, active, layer + 1, mode,
+                    c1a_phase=True,
                 )
             else:
                 prefill_attention_entry(
@@ -845,15 +845,16 @@ def l2_prefill_fwd(
                     layer_index_weights, pool_block_ids, pool_block_counts, topk_indices, attention_window, attention_arrived,
                     normalized, attn_hidden, attn_pre, local_active,
                     rank // CP_SIZE * CP_SIZE, rank % CP_SIZE, active, layer + 1, mode,
+                    c1a_phase=False,
                 )
         moe_ready = prefill_moe_slabs(
             attn_hidden, attn_pre, layer_ffn_fn, layer_ffn_scale, layer_ffn_base, layer_ffn_norm, layer_gate_weight, layer_gate_bias,
             layer_routed_w1, layer_routed_w1_scale, layer_routed_w2, layer_routed_w2_scale, layer_routed_w3, layer_routed_w3_scale,
             layer_shared_w1, layer_shared_w1_scale, layer_shared_w2, layer_shared_w2_scale,
             layer_shared_w3, layer_shared_w3_scale, local_next_pre, ffn_mixed, local_next_hidden,
-            recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
-            routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, slab_rows,
-            moe_ready, pl.read(q_counts, [stage]), rank, layer + 1, capacity=LOCAL_CAPACITY,
+            moe_workspace,
+            slab_hidden, slab_pre, slab_mixed, slab_rows,
+            moe_ready, pl.read(q_counts, [stage]), capacity=LOCAL_CAPACITY,
         )
         if CP_SIZE > 1:
             moe_ready = prefill_cp_gather_hc(
@@ -893,7 +894,6 @@ def l2_prefill_fwd(
     output_hidden = pl.reshape(x_hc_out, [CAPACITY, HC_DIM])
     gather_rows(source_hidden, identity_rows, output_hidden, gather_ready, column_tile=D)
     gather_rows(final_pre, identity_rows, pre_mix_out, gather_ready, column_tile=512)
-    clear_moe_signals(x_hc_out, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
     if CP_SIZE > 1:
         retire_prefill_signals(x_hc_out, attention_arrived, rank // CP_SIZE * CP_SIZE, rank % CP_SIZE, group_size=CP_SIZE)
         retire_prefill_signals(x_hc_out, hc_arrived, rank // CP_SIZE * CP_SIZE, rank % CP_SIZE, group_size=CP_SIZE)
@@ -1077,15 +1077,7 @@ def l3_prefill_fwd(
     c1a_index_block_table.bind_dynamic(1, B_DYN)
     c1a_index_block_table.bind_dynamic(2, C1A_TABLE_DYN)
     query_start_loc.bind_dynamic(2, Q_START_DYN)
-    recv_meta_buffer = pld.alloc_window_buffer([RANKS, LOCAL_EXPERTS], dtype=pl.INT32)
-    recv_x_buffer = pld.alloc_window_buffer([LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
-    recv_scale_buffer = pld.alloc_window_buffer([LOCAL_EXPERTS * RECV_MAX, D // 32], dtype=pl.UINT8)
-    recv_weights_buffer = pld.alloc_window_buffer([LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
-    recv_routes_buffer = pld.alloc_window_buffer([LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-    arrived_buffer = pld.alloc_window_buffer([RANKS, 128], dtype=pl.INT32)
-    data_arrived_buffer = pld.alloc_window_buffer([RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
-    routed_output_buffer = pld.alloc_window_buffer([MOE_TOKENS * TOPK, D], dtype=pl.BF16)
-    combine_arrived_buffer = pld.alloc_window_buffer([RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
+    moe_workspace_buffer = pld.alloc_window_buffer([MOE_WORKSPACE_BYTES], dtype=pl.UINT8)
     attention_window_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     attention_arrived_buffer = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
     hc_window_buffer = pld.alloc_window_buffer([LOCAL_CAPACITY, HC_DIM + 16], dtype=pl.FP32)
@@ -1095,15 +1087,7 @@ def l3_prefill_fwd(
     head_logits_buffer = pld.alloc_window_buffer([16, VOCAB], dtype=pl.BF16)
     head_logits_done_buffer = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
-        recv_meta = pld.window(recv_meta_buffer, [RANKS, LOCAL_EXPERTS], dtype=pl.INT32)
-        recv_x = pld.window(recv_x_buffer, [LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
-        recv_scale = pld.window(recv_scale_buffer, [LOCAL_EXPERTS * RECV_MAX, D // 32], dtype=pl.UINT8)
-        recv_weights = pld.window(recv_weights_buffer, [LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
-        recv_routes = pld.window(recv_routes_buffer, [LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-        arrived = pld.window(arrived_buffer, [RANKS, 128], dtype=pl.INT32)
-        data_arrived = pld.window(data_arrived_buffer, [RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
-        routed_output = pld.window(routed_output_buffer, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
-        combine_arrived = pld.window(combine_arrived_buffer, [RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
+        moe_workspace = pld.window(moe_workspace_buffer, [MOE_WORKSPACE_BYTES], dtype=pl.UINT8)
         attention_window = pld.window(attention_window_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
         attention_arrived = pld.window(attention_arrived_buffer, [CP_SIZE, 1], dtype=pl.INT32)
         hc_window = pld.window(hc_window_buffer, [LOCAL_CAPACITY, HC_DIM + 16], dtype=pl.FP32)
@@ -1162,15 +1146,7 @@ def l3_prefill_fwd(
             x_hc_out[rank], pre_mix_out[rank], dspark_target_hidden[rank],
             logits[rank],
             sampled_ids[rank],
-            recv_meta,
-            recv_x,
-            recv_scale,
-            recv_weights,
-            recv_routes,
-            arrived,
-            data_arrived,
-            routed_output,
-            combine_arrived,
+            moe_workspace,
             attention_window,
             attention_arrived,
             hc_window, hc_arrived,
@@ -2198,6 +2174,16 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
     }
 
 
+def _zero_packed_weight(shape):
+    """Map an independent sparse file for a read-only smoke weight shared with forked ranks."""
+    # The three packed weights total 84 GiB at the default EP2 smoke shape.
+    # Prefer the build workspace because the system temporary directory may be tmpfs.
+    directory = "." if os.access(".", os.W_OK) else None
+    with tempfile.NamedTemporaryFile(dir=directory) as backing:
+        tensor = torch.from_file(backing.name, shared=True, size=math.prod(shape), dtype=torch.uint8)
+    return tensor.view(shape)
+
+
 def build_tensor_specs(args=None):
     """Build independent per-DP batches for a checkpoint-free, 40-layer CED smoke fixture."""
     from golden import TensorSpec
@@ -2246,8 +2232,10 @@ def build_tensor_specs(args=None):
             rank_shape, dtype = weight_layouts[name]
             shape = [RANKS, *rank_shape]
             value = 1.0 if dtype == torch.float8_e8m0fnu or name == "final_norm_weight" else 0.0
-            if name == "correction_bias":
-                value = _route_bias().repeat(RANKS, N_LAYERS)
+            if name in ("routed_w1", "routed_w2", "routed_w3"):
+                value = partial(_zero_packed_weight, shape)
+            elif name == "correction_bias":
+                value = _route_bias(N_EXPERTS).repeat(RANKS, N_LAYERS)
         elif name in outputs:
             shape, dtype = outputs[name]
             value = None

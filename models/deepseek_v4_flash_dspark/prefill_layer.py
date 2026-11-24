@@ -1053,7 +1053,7 @@ def main():
     parser.add_argument("--layer-id", type=int, default=0, choices=list(SUPPORTED_LAYERS))
     parser.add_argument("--start-pos", type=int, default=0)
     parser.add_argument(
-        "--token-count", type=int, default=GROUP_TOKENS,
+        "--token-count", type=int, default=None,
         help=f"logical current-chunk rows before CP padding; must be at most {PREFILL_GROUP_CAP}",
     )
     parser.add_argument(
@@ -1081,37 +1081,44 @@ def main():
         parser.error(f"import-time N_RANKS must match --ep, got {N_RANKS} vs {args.ep}")
     if args.ep % args.tp != 0:
         parser.error(f"EP must be divisible by TP/CP, got --ep {args.ep} and --tp {args.tp}")
-    if args.token_count < 1 or args.token_count > PREFILL_GROUP_CAP:
+    token_counts = [GROUP_TOKENS if args.token_count is None else args.token_count]
+    if (
+        args.token_count is None and TP_SIZE == 2 and args.start_pos == 0
+        and not (args.runtime_dir or args.save_data or args.golden_data)
+    ):
+        token_counts.append(TP_SIZE * (PREFILL_MOE_T_TILE + 1))
+    if any(not 1 <= count <= PREFILL_GROUP_CAP for count in token_counts):
         parser.error(f"--token-count must be in [1, {PREFILL_GROUP_CAP}]")
 
     import torch
 
-    torch.manual_seed(args.seed)
-    result = run(
-        fn=l3_prefill_layer,
-        specs=build_tensor_specs(args.layer_id, start_pos=args.start_pos, token_count=args.token_count),
-        golden_fn=golden_prefill_layer,
-        compile_only=args.compile_only,
-        runtime_dir=args.runtime_dir,
-        save_data=args.save_data,
-        golden_data=args.golden_data,
-        config=dict(
-            dump_passes=args.dump_passes,
-            distributed_config=DistributedConfig(
-                device_ids=device_ids[:N_RANKS], num_sub_workers=0
+    for token_count in token_counts:
+        torch.manual_seed(args.seed)
+        result = run(
+            fn=l3_prefill_layer,
+            specs=build_tensor_specs(args.layer_id, start_pos=args.start_pos, token_count=token_count),
+            golden_fn=golden_prefill_layer,
+            compile_only=args.compile_only,
+            runtime_dir=args.runtime_dir,
+            save_data=args.save_data,
+            golden_data=args.golden_data,
+            config=dict(
+                dump_passes=args.dump_passes,
+                distributed_config=DistributedConfig(
+                    device_ids=device_ids[:N_RANKS], num_sub_workers=0
+                ),
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                ring_heap=PREFILL_RING_HEAP,
             ),
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            ring_heap=PREFILL_RING_HEAP,
-        ),
-        rtol=1e-3,
-        atol=1e-3,
-        compare_fn=_compare_functions(args.layer_id),
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+            rtol=1e-3,
+            atol=1e-3,
+            compare_fn=_compare_functions(args.layer_id),
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -49,6 +49,11 @@ __aicore__ inline __gm__ T* data(__gm__ int64_t* args, int slot) {
 }
 
 #include <c_api/asc_simd.h>
+#if defined(__DAV_VEC__)
+// Parse CANN hardware type aliases before PTO imports its A5 types into global lookup.
+#include <adv_api/sort/sort.h>
+#include <kernel_operator.h>
+#endif
 // DeepGEMM-Ascend: common.hpp
 // CLion uses a regular C++ frontend, so load the CCE shim before any CANN header.
 // The real device compiler does not define __CLION_IDE__ and is unaffected.
@@ -1857,7 +1862,6 @@ static __aicore__ __attribute__((noinline)) void score(__gm__ int64_t* args) {
 }
 #if defined(__DAV_VEC__)
 #include <c_api/asc_simd.h>
-#include <kernel_operator.h>
 
 // DeepSelect: Ascend configuration and row selection.
 #include <cstdint>
