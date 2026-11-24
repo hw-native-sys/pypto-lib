@@ -12,6 +12,12 @@
 
 using namespace bf16_projection;
 
+constexpr int PROJECT_M_TILE = 224;
+constexpr int PROJECT_N_TILE = 256;
+constexpr int PUBLISH_M_TILE = PROJECT_M_TILE / 2;
+constexpr int PUBLISH_ROW_BYTES = PROJECT_N_TILE * sizeof(BFloat);
+constexpr int PUBLISH_SLOT_BYTES = PROJECT_M_TILE * PUBLISH_ROW_BYTES;
+
 #if defined(__DAV_CUBE__)
 struct PublishPanel {
     static constexpr bool full_rows = false;
@@ -22,8 +28,8 @@ struct PublishPanel {
         int slot = count % 2;
         wait_intra_block(PIPE_FIX, slot * 2 + 1);
         wait_intra_block(PIPE_FIX, slot * 2 + 17);
-        Tile<TileType::Vec, BFloat, 192, 256, BLayout::RowMajor, DYNAMIC, Acc::Cols> raw(rows);
-        TASSIGN(raw, slot * 98304);
+        Tile<TileType::Vec, BFloat, PROJECT_M_TILE, PROJECT_N_TILE, BLayout::RowMajor, DYNAMIC, Acc::Cols> raw(rows);
+        TASSIGN(raw, slot * PUBLISH_SLOT_BYTES);
         TMOV<decltype(raw), Acc, AccToVecMode::SingleModeVec0>(raw, acc);
         TMOV<decltype(raw), Acc, AccToVecMode::SingleModeVec1>(raw, acc);
         set_intra_block(PIPE_FIX, slot * 2);
@@ -43,7 +49,7 @@ template <int Vocab>
 __aicore__ inline void cube(__gm__ int64_t* args) {
     auto hidden = reinterpret_cast<__gm__ Tensor*>(args[0]);
     PublishPanel emit;
-    project<5120, Vocab, 256, 256, 64, 2, Layout::NZ, 192>(
+    project<5120, Vocab, PROJECT_N_TILE, 128, 64, 4, Layout::NZ, PROJECT_M_TILE>(
         data<BFloat>(args, 0), data<BFloat>(args, 1), args[5] * args[6], hidden->shapes[0],
         hidden->strides[0], 0, args[8], get_block_idx(args), get_block_num(args), emit);
     emit.finish();
@@ -74,8 +80,8 @@ __aicore__ inline void send_panel(__gm__ int64_t* args, int row, int column, int
         auto remote = reinterpret_cast<__gm__ BFloat*>(reinterpret_cast<uint64_t>(local_window) + ctx[peer + 2] - ctx[local_rank + 2]);
         using Shape = TileShape2D<BFloat, DYNAMIC, Width>;
         using Stride = pto::Stride<1, 1, 1, DYNAMIC, 1>;
-        Tile<TileType::Vec, BFloat, 96, 256, BLayout::RowMajor, DYNAMIC, Width> tile(rows);
-        TASSIGN(tile, slot * 98304 + (lane * band + first - begin) * 512);
+        Tile<TileType::Vec, BFloat, PUBLISH_M_TILE, PROJECT_N_TILE, BLayout::RowMajor, DYNAMIC, Width> tile(rows);
+        TASSIGN(tile, slot * PUBLISH_SLOT_BYTES + (lane * band + first - begin) * PUBLISH_ROW_BYTES);
         int owner_row = first / (args[9] * args[5]) * args[9] + first % args[9];
         int destination = args[3] * args[6] * args[7] + column * args[6] + owner_row * Width;
         GlobalTensor<BFloat, Shape, Stride> dst(remote + destination, Shape(rows, Width), Stride(1, 1, 1, Width, 1));

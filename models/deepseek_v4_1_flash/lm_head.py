@@ -54,12 +54,12 @@ GROUP_LOGIT_ROWS = LM_HEAD_TP_SIZE * MAX_LOGIT_ROWS
 LM_HEAD_M_TILE = 80
 LM_HEAD_N_TILE = 256
 LM_HEAD_K_TILE = 128
-LM_HEAD_GATHER_M_TILE = 72
+LM_HEAD_PROJECT_M_TILE = 192
+LM_HEAD_PROJECT_WIDE_M_TILE = 224
+LM_HEAD_GATHER_M_TILE = 80
 LM_HEAD_TAIL_TILE = VOCAB_PER_TP % LM_HEAD_N_TILE or LM_HEAD_N_TILE
-HIDDEN_OWNER_ROW_TILE = gcd(MAX_LOGIT_ROWS, 48)
-HIDDEN_PUSH_WORKER_TILE = (MAX_LOGIT_ROWS + 64 // LM_HEAD_TP_SIZE - 1) // (64 // LM_HEAD_TP_SIZE)
-HIDDEN_PUSH_ROW_TILE = gcd(HIDDEN_OWNER_ROW_TILE, HIDDEN_PUSH_WORKER_TILE)
-HIDDEN_PUSH_CHUNK_TILE = min(12, HIDDEN_PUSH_ROW_TILE)
+HIDDEN_OWNER_ROW_TILE = gcd(MAX_LOGIT_ROWS, 16)
+HIDDEN_PUSH_CHUNK_TILE = min(4, HIDDEN_OWNER_ROW_TILE)
 
 # Padded sampled-ids row width shared with the decode sampling operators.
 SAMPLED_IDS_PAD = 8
@@ -151,17 +151,20 @@ def lm_head(
         lm_head_project(selected_hidden, lm_head_weight, logits)
     else:
         pl.static_assert(num_rows % HIDDEN_OWNER_ROW_TILE == 0, "LM-head owner rows must fill complete interleaved stripes")
-        with pl.spmd(64, name_hint="lm_head_dispatch_push", deps=[selected_ready]) as dispatch_pushed:
+        row_tiles = selected_rows // HIDDEN_OWNER_ROW_TILE
+        transfer_count = LM_HEAD_TP_SIZE * row_tiles
+        push_workers = pl.max(1, pl.min(64, transfer_count))
+        # Consecutive workers send the same row stripe to different peers.
+        with pl.spmd(push_workers, name_hint="lm_head_dispatch_push", deps=[selected_ready]) as dispatch_pushed:
             worker = pl.tile.get_block_idx()
-            row_tiles = selected_rows // HIDDEN_PUSH_ROW_TILE
-            for tile in pl.range(worker, LM_HEAD_TP_SIZE * row_tiles, 64):
-                peer = (tp_rank + tile // row_tiles) % LM_HEAD_TP_SIZE
-                row = tile % row_tiles * HIDDEN_PUSH_ROW_TILE
-                owner_stripe = row // HIDDEN_OWNER_ROW_TILE * LM_HEAD_TP_SIZE + tp_rank
-                destination = owner_stripe * HIDDEN_OWNER_ROW_TILE + row % HIDDEN_OWNER_ROW_TILE
+            for tile in pl.range(worker, transfer_count, 64):
+                peer = (tp_rank + tile % LM_HEAD_TP_SIZE) % LM_HEAD_TP_SIZE
+                stripe = tile // LM_HEAD_TP_SIZE
+                row = stripe * HIDDEN_OWNER_ROW_TILE
+                destination = (stripe * LM_HEAD_TP_SIZE + tp_rank) * HIDDEN_OWNER_ROW_TILE
                 pld.tensor.put(
                     hidden_window, peer=group_base + peer, src=selected_hidden, dst_offsets=[destination, 0],
-                    src_offsets=[row, 0], shape=[HIDDEN_PUSH_ROW_TILE, D], chunk_rows=HIDDEN_PUSH_CHUNK_TILE,
+                    src_offsets=[row, 0], shape=[HIDDEN_OWNER_ROW_TILE, D], chunk_rows=HIDDEN_PUSH_CHUNK_TILE,
                     chunk_cols=D, pipeline=True,
                 )
         with pl.spmd(LM_HEAD_TP_SIZE, name_hint="lm_head_dispatch_notify", deps=[dispatch_pushed]) as dispatch_notified:
@@ -180,7 +183,12 @@ def lm_head(
                         cmp=pld.WaitCmp.Ge,
                     )
 
-        group_m_tile = pl.min(192, LM_HEAD_TP_SIZE * selected_rows)
+        group_rows = LM_HEAD_TP_SIZE * selected_rows
+        group_m_tile = pl.min(LM_HEAD_PROJECT_M_TILE, group_rows)
+        bands = (group_rows + LM_HEAD_PROJECT_M_TILE - 1) // LM_HEAD_PROJECT_M_TILE
+        wide_bands = (group_rows + LM_HEAD_PROJECT_WIDE_M_TILE - 1) // LM_HEAD_PROJECT_WIDE_M_TILE
+        if wide_bands < bands:
+            group_m_tile = LM_HEAD_PROJECT_WIDE_M_TILE
         project_tp_rank = pl.cast(tp_rank, pl.INT32)
         project_group_base = pl.cast(group_base, pl.INT32)
         with pl.spmd(32, name_hint="lm_head_matmul_push", deps=[dispatch_ready, dispatch_notified]) as logits_pushed:
@@ -400,7 +408,7 @@ if __name__ == "__main__":
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--lm-head-tp", type=int, default=LM_HEAD_TP_SIZE, choices=SUPPORTED_LM_HEAD_TP_SIZES, help="LM-head tensor-parallel world size")
     parser.add_argument("--dp", type=int, default=DP_SIZE, help="DP groups (world size = tp * dp)")
-    parser.add_argument("--logit-rows", type=int, choices=[16, 72, 384], default=MAX_LOGIT_ROWS)
+    parser.add_argument("--logit-rows", type=int, choices=[16, 64, 72, 80, 320, 384], default=MAX_LOGIT_ROWS)
     parser.add_argument("--num-tokens", type=int, default=MAX_LOGIT_ROWS, help="Active hidden rows each owner projects (0 = empty shard)")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(WORLD_SIZE)), help=f"comma-separated device ids; need at least {WORLD_SIZE}")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
