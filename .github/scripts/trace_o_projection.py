@@ -9,6 +9,7 @@
 """Compare the three stages of a V4.1 O projection in the A5 invocation that produces the output."""
 
 import argparse
+import base64
 from functools import partial
 import hashlib
 import json
@@ -18,6 +19,7 @@ from pathlib import Path
 import re
 import shutil
 import sys
+import zlib
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(REPO / "models/deepseek_v4_1_flash"), str(REPO)]
@@ -59,6 +61,19 @@ def tag_boundaries(program):
     host.write_text("".join(lines))
 
 
+def encode_delta(data):
+    return base64.b64encode(zlib.compress(data.tobytes())).decode("ascii")
+
+
+def first_row(buf, stage, dtype):
+    groups, width = (o.LOCAL_O_GROUPS, o.O_GROUP_IN) if stage == "oa_in" else (1, o.LOCAL_O_WIDTH)
+    data = np.frombuffer(buf, dtype=np.uint8)
+    if dtype == "payload":
+        return data.reshape(groups, 80, width)[:, 0].reshape(-1)
+    # MX_A_ZZ lays out two exponents per row of each 16-row band.
+    return data.reshape(groups, 5, width // 64, 16, 2)[:, 0, :, 0, :].reshape(-1)
+
+
 def capture_stats(program, expected):
     manifest_file = program / "dfx_outputs/args_dump/args_dump.json"
     manifest = json.loads(manifest_file.read_text())
@@ -83,9 +98,11 @@ def capture_stats(program, expected):
             key = stage + "_" + dtype
             start = rec["bin_offset"]
             data = memoryview(raw)[start : start + rec["bin_size"]]
-            state = stats.setdefault(key, {"captures": 0, "bad": 0})
+            state = stats.setdefault(key, {"captures": 0, "bad": 0, "hashes": {}})
             state["captures"] += 1
-            if hashlib.sha256(data).digest() != hashes[key]:
+            digest = hashlib.sha256(data).digest()
+            state["hashes"][digest.hex()] = state["hashes"].get(digest.hex(), 0) + 1
+            if digest != hashes[key]:
                 state["bad"] += 1
                 if "first_byte" not in state:
                     bad = np.flatnonzero(
@@ -98,6 +115,9 @@ def capture_stats(program, expected):
                         actual=data[pos],
                         expected=expected[key][pos],
                         task=rec["task_id"],
+                    )
+                    state["row0_xor"] = encode_delta(
+                        first_row(data, stage, dtype) ^ first_row(expected[key], stage, dtype)
                     )
             del data
     if set(stats) != set(expected):
@@ -137,12 +157,12 @@ def fixture(area, active):
         torch.save(expected, directory / "out/output.pt")
 
     save_hc(normal)
-    if active != 17:
+    if not active:
         return
 
     # Each head of HC has independent coefficients. The fourth can expose the
     # BF16 projection from the same vector register that feeds the first three.
-    witness = area / "witness-17"
+    witness = area / f"witness-{active}"
     (witness / "in").mkdir(parents=True)
     (witness / "out").mkdir()
     for name, value in values.items():
@@ -173,7 +193,7 @@ def fixture(area, active):
             oa_out_scale=pack_mx_a_scale(q_scale),
             projected=projected,
         ),
-        area / "reference.pt",
+        area / f"reference-{active}.pt",
     )
 
 
@@ -203,31 +223,75 @@ def prepare(area):
     tag_boundaries(program)
 
 
-def observe(mode, values, expected, projected, program, wanted):
+def infer_projection(normal, values, active):
+    residual = values["residual"][:active]
+    post = values["post_mix"][:active]
+    mix = values["residual_mix"][:active]
+    rows = torch.arange(active)
+    best_stream = post.abs().argmax(dim=1)
+    zero = golden_hc_post(torch.zeros_like(normal[:active, 0]), residual, post, mix)
+    initial = (
+        (normal[rows, best_stream] - zero[rows, best_stream]) / post[rows, best_stream, None]
+    ).bfloat16()
+    best = initial.clone()
+
+    def error(candidate):
+        return (golden_hc_post(candidate, residual, post, mix) - normal[:active]).abs().amax(dim=1)
+
+    smallest = error(best)
+    for direction in (-float("inf"), float("inf")):
+        candidate = initial
+        for _ in range(2):
+            candidate = torch.nextafter(candidate, torch.full_like(candidate, direction))
+            distance = error(candidate)
+            best = torch.where(distance < smallest, candidate, best)
+            smallest = torch.minimum(smallest, distance)
+    return best.float(), int((smallest != 0).sum())
+
+
+def observe(mode, active, values, expected, projected, program, wanted):
     got = values["output"]
     gold = expected["output"]
-    normal = got[:, :3] if mode == "witness" else got
+    witness = mode in ("witness", "witness-only")
+    normal = got[:, :3] if witness else got
     ref = gold[:, : normal.shape[1]]
-    errors = ~torch.isclose(normal[:17], ref[:17], atol=0.01, rtol=1 / 128)
+    errors = ~torch.isclose(normal[:active], ref[:active], atol=0.01, rtol=1 / 128)
+    count = int(errors.sum())
     record = {
+        "active_tokens": active,
         "active_elements": errors.numel(),
-        "active_outliers": int(errors.sum()),
-        "max_abs": float((normal[:17] - ref[:17]).abs().max()),
-        "inactive_different": int((normal[17:] != ref[17:]).sum()),
+        "active_outliers": count,
+        "max_abs": float((normal[:active] - ref[:active]).abs().max()),
+        "inactive_different": int((normal[active:] != ref[active:]).sum()),
     }
-    if mode != "control":
+    if mode in ("capture", "witness"):
         record["boundary"] = capture_stats(program, wanted)
-    if mode == "witness":
-        raw = got[:, 3]
-        rebuilt = golden_hc_post(raw, values["residual"], values["post_mix"], values["residual_mix"])
-        record.update(
-            projection_different=int((raw != projected).sum()),
-            projection_max=float((raw - projected).abs().max()),
-            non_bf16=int((raw != raw.bfloat16().float()).sum()),
-            hc_fma_different=int((normal != rebuilt[:, :3]).sum()),
+    raw = None
+    if witness:
+        raw = got[:active, 3]
+        rebuilt = golden_hc_post(
+            raw, values["residual"][:active], values["post_mix"][:active], values["residual_mix"][:active]
         )
+        record["hc_fma_different"] = int((normal[:active] != rebuilt[:, :3]).sum())
+        record["non_bf16"] = int((raw != raw.bfloat16().float()).sum())
+    elif count:
+        raw, unmatched = infer_projection(normal, values, active)
+        record["inferred_columns_without_exact_four_stream_match"] = unmatched
+    if raw is not None:
+        delta = (raw - projected[:active]).abs()
+        record.update(projection_different=int((delta != 0).sum()), projection_max=float(delta.max()))
+        if count:
+            record["max_projection_error_by_n160_tile"] = (
+                delta.reshape(active, -1, 160).amax(dim=(0, 2)).tolist()
+            )
+            xor = (
+                raw[0].bfloat16().view(torch.int16) ^ projected[0].bfloat16().view(torch.int16)
+            ).contiguous()
+            record["row0_bf16_xor"] = encode_delta(xor.numpy())
     indices = errors.nonzero()[:10].tolist()
-    indices.extend([[0, 0, 0], [11, 1, 3676]])
+    indices.append([0, 0, 0])
+    if active > 11:
+        indices.append([11, 1, 3676])
     record["samples"] = []
     for row, stream, col in indices:
         point = {
@@ -235,34 +299,55 @@ def observe(mode, values, expected, projected, program, wanted):
             "output": float(got[row, stream, col]),
             "reference": float(gold[row, stream, col]),
         }
-        if mode == "witness":
+        if raw is not None:
             point.update(projected=float(raw[row, col]), projected_reference=float(projected[row, col]))
         record["samples"].append(point)
     return record
 
 
 def run(area, device):
-    reference = torch.load(area / "reference.pt", weights_only=True)
-    projected = reference.pop("projected").float()
-    wanted = {k: v.contiguous().numpy().tobytes() for k, v in reference.items()}
-    wanted.update(ob_in_payload=wanted["oa_out_payload"], ob_in_scale=wanted["oa_out_scale"])
+    references = {}
+    for active in (1, 17):
+        reference = torch.load(area / f"reference-{active}.pt", weights_only=True)
+        projected = reference.pop("projected").float()
+        wanted = {k: v.contiguous().numpy().tobytes() for k, v in reference.items()}
+        wanted.update(ob_in_payload=wanted["oa_out_payload"], ob_in_scale=wanted["oa_out_scale"])
+        references[active] = projected, wanted
     program = area / "program"
     validate = runner._validate
     log = []
     failed = False
-    for attempt in range(2):
-        for mode in ("control", "capture", "witness"):
+    modes = ("control", "witness-only", "capture", "witness")
+    for attempt in range(3):
+        for mode in modes:
             for n in (0, 1, 17):
-                folder = area / ("witness-17" if mode == "witness" and n == 17 else f"normal-{n}")
+                kind = "witness" if n and mode in ("witness", "witness-only") else "normal"
+                folder = area / f"{kind}-{n}"
                 specs = o.build_o_proj_hc_post_specs(n, pad_to_tile=True)
                 fn = o.o_proj_hc_post_validation
 
                 def inspect(sp, values, outputs, *args, **kwargs):
-                    if n == 17:
-                        rec = observe(mode, values, outputs, projected, program, wanted)
+                    if n:
+                        projected, wanted = references[n]
+                        rec = observe(mode, n, values, outputs, projected, program, wanted)
                         rec.update(attempt=attempt + 1, mode=mode, device=device)
                         log.append(rec)
                         print("O_CHAIN_PROBE " + json.dumps(rec, sort_keys=True), flush=True)
+                        if rec["active_outliers"]:
+                            summary = {
+                                k: rec[k]
+                                for k in ("active_tokens", "attempt", "mode", "active_outliers", "max_abs")
+                            }
+                            for key in (
+                                "hc_fma_different",
+                                "inferred_columns_without_exact_four_stream_match",
+                            ):
+                                if key in rec:
+                                    summary[key] = rec[key]
+                            summary["bad_captures"] = {
+                                k: v["bad"] for k, v in rec.get("boundary", {}).items()
+                            }
+                            print("::notice title=O projection outliers::" + json.dumps(summary), flush=True)
                         (area / "report.json").write_text(json.dumps(log, indent=2) + "\n")
                     return validate(sp, values, outputs, *args, **kwargs)
 
@@ -279,7 +364,7 @@ def run(area, device):
                             backend_type="a5",
                             execution_mode=False,
                             device_id=device,
-                            enable_dump_args=int(n == 17 and mode != "control"),
+                            enable_dump_args=int(n != 0 and mode in ("capture", "witness")),
                         ),
                         compare_fn={
                             "output": partial(
@@ -299,7 +384,7 @@ def run(area, device):
                 if not result.passed:
                     failed = True
                     print(result.error, flush=True)
-    if len(log) != 6 or failed:
+    if len(log) != 3 * len(modes) * 2 or failed:
         raise SystemExit(1)
 
 
