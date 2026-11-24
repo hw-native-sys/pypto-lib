@@ -14,6 +14,7 @@ so they run without a device.
 """
 
 import ctypes
+import struct
 import sys
 import types
 from contextlib import contextmanager
@@ -27,6 +28,7 @@ from golden.runner import (
     RunResult,
     _bench_loop_sizes,
     _format_stale_paths,
+    _fresh_compile_config,
     normalize_config,
     _ordered_args,
     _prepare_inputs,
@@ -45,6 +47,66 @@ from golden.runner import (
     _stale_cpps,
     _validate_compiled_spec_abi,
 )
+
+
+@pytest.mark.parametrize("platform", ["a5", "a5sim", "a2a3"])
+def test_fresh_compile_platform_default(platform, monkeypatch):
+    from pypto.pypto_core import passes
+
+    monkeypatch.delenv("PYPTO_LIB_A5_RUNTIME", raising=False)
+    cfg = normalize_config(dict(platform=platform))
+    with _fresh_compile_config(cfg) as compile_cfg:
+        assert compile_cfg is cfg
+        assert passes.PassContext.current() is None
+    with _fresh_compile_config(cfg, "host_build_graph"):
+        ctx = passes.PassContext.current()
+        if platform == "a2a3":
+            assert ctx is None
+        else:
+            assert ctx.get_runtime() == passes.RuntimeKind.HOST_BUILD_GRAPH
+    assert passes.PassContext.current() is None
+
+
+def test_fresh_compile_a5_overrides(monkeypatch):
+    from pypto.pypto_core import passes
+
+    cfg = normalize_config(dict(platform="a5", memory_planner=passes.MemoryPlanner.PTOAS))
+    monkeypatch.setenv("PYPTO_LIB_A5_RUNTIME", "tensormap_and_ringbuffer")
+    with _fresh_compile_config(cfg, "host_build_graph") as compile_cfg:
+        ctx = passes.PassContext.current()
+        assert ctx.get_runtime() == passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER
+        assert ctx.get_memory_planner() == passes.MemoryPlanner.PTOAS
+        assert compile_cfg.memory_planner is None
+    assert cfg.memory_planner == passes.MemoryPlanner.PTOAS
+    with passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH):
+        with _fresh_compile_config(cfg, "host_build_graph") as compile_cfg:
+            assert compile_cfg is cfg
+            assert passes.PassContext.current().get_runtime() == passes.RuntimeKind.HOST_BUILD_GRAPH
+
+
+
+def test_a5_artifact_runtime_reads_selected_chip_metadata_without_execution(tmp_path, capsys):
+    from golden.runner import _report_a5_artifact_runtime
+
+    for name, value in (("one", "'percounter'"), ("two", "get_dynamic_runtime()")):
+        chip_dir = tmp_path / "next_levels" / name
+        chip_dir.mkdir(parents=True)
+        (chip_dir / "kernel_config.py").write_text(
+            f"RUNTIME_CONFIG = {{'runtime': {value}}}\nraise AssertionError('must only read metadata')\n"
+        )
+    cfg = types.SimpleNamespace(distributed_config=types.SimpleNamespace(device_ids=[4, 6]))
+    _report_a5_artifact_runtime(None, tmp_path, cfg)
+    report = capsys.readouterr().out
+    assert "devices=[4, 6]" in report and "'one': 'percounter'" in report and "'two': 'unknown'" in report
+
+
+def test_a5_artifact_runtime_prefers_loaded_single_chip_runtime(tmp_path, capsys):
+    from golden.runner import _report_a5_artifact_runtime
+
+    cfg = types.SimpleNamespace(distributed_config=None, device_id=3)
+    compiled = types.SimpleNamespace(_runtime_name="tensormap_and_ringbuffer")
+    _report_a5_artifact_runtime(compiled, tmp_path, cfg)
+    assert "tensormap_and_ringbuffer" in capsys.readouterr().out
 
 
 class _FakeCompiled:
@@ -1887,10 +1949,22 @@ class TestGeneratedCppCache:
         # This cannot invoke a native compiler or initialize a device.
         from pypto.runtime.device_runner import _compile_single_kernel
 
+        # ELF64 with a section-name table and a linked device entry at the
+        # beginning of .text. Exercise the production image checks and extraction.
+        names = b"\0.shstrtab\0.text\0"
+        text = b"\0" * 4
+        section_table = 96
+        image = bytearray(section_table + 3 * 64)
+        image[:7] = b"\x7fELF\x02\x01\x01"
+        struct.pack_into("<HHIQQQIHHHHHH", image, 16, 2, 0x1029, 1, 0x1000, 0, section_table,
+                         0, 64, 0, 0, 64, 3, 1)
+        image[64:64 + len(names)] = names
+        image[88:88 + len(text)] = text
+        struct.pack_into("<IIQQQQIIQQ", image, section_table + 64, 1, 3, 0, 0, 64, len(names), 0, 0, 1, 0)
+        struct.pack_into("<IIQQQQIIQQ", image, section_table + 128, 11, 1, 6, 0x1000, 88, len(text), 0, 0, 4, 0)
         compiler = MagicMock()
-        compiler.compile_incore.return_value = b"cached kernel"
-        with patch("pypto.runtime.device_runner.extract_text_section", side_effect=lambda raw: raw):
-            _compile_single_kernel(kernel, compiler, platform, "", "hbg")
+        compiler.compile_incore.return_value = bytes(image)
+        _compile_single_kernel(kernel, compiler, platform, "", "hbg")
         compiler.compile_incore.assert_called_once()
 
     @pytest.mark.parametrize("platform", ["a5", "a5sim"])
@@ -2035,9 +2109,9 @@ class TestGeneratedCppCache:
             _setup_runtime_dir(str(tmp_path), compile_label="test", platform="a5sim")
         assert invalidate.call_count == int(not fresh)
 
-    @pytest.mark.parametrize("kind", ["external", "builtin"])
-    def test_external_and_builtin_sidecars_are_runtime_owned(self, tmp_path, kind):
-        kernel = self._kernel(tmp_path, **{kind: True})
+    @pytest.mark.parametrize("options", [{"external": True}, {"builtin": True}, {"vpto_sources": ["helper.pto"]}])
+    def test_runtime_owned_caches_do_not_require_a_sidecar(self, tmp_path, options):
+        kernel = self._kernel(tmp_path, **options)
         self._config(tmp_path, [kernel])
         assert _stale_cpps(tmp_path, platform="a5sim") == []
 

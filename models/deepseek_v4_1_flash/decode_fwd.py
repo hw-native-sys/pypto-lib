@@ -1258,6 +1258,7 @@ if __name__ == "__main__":
         ),
     )
     result = run(
+        a5_default_runtime="host_build_graph",
         fn=l3_decode_fwd,
         specs=specs,
         config=config,

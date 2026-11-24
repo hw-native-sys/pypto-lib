@@ -343,6 +343,7 @@ if __name__ == "__main__":
     )
 
     result = run(
+        a5_default_runtime="host_build_graph",
         fn=host,
         specs=specs,
         golden_fn=partial(golden_c1a, mode="reindex"),

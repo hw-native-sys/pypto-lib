@@ -491,6 +491,7 @@ if __name__ == "__main__":
     args.bench = False
     devices = [args.device]
     result = run(
+        a5_default_runtime="host_build_graph",
         fn=l3_decode_swa,
         specs=build_swa_specs(args),
         golden_fn=golden_swa,
