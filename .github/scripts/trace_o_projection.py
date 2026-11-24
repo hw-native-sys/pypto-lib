@@ -422,9 +422,17 @@ def prepare_retained(program, destination, ignore):
             raise ValueError(f"Cannot expose {var}")
     source = source.replace(".expected_arg_count = 12,", ".expected_arg_count = 17,")
     prefix, ob = source.split("        int64_t ob_tasks_", 1)
+    ordinal = "orch_args.scalar<int32_t>(1)"
     prefix = prefix.replace(
-        "    SIMPLER_SCOPE() {", "    SIMPLER_SCOPE() {\n        if (!orch_args.scalar<int32_t>(1)) {", 1
+        "    SIMPLER_SCOPE() {", f"    SIMPLER_SCOPE() {{\n        if ({ordinal} != 1) {{", 1
     )
+    quant_start = "        int64_t full_rows_"
+    quant_end = f"        const Tensor& {allocs[2][0]} = orch_args.tensor(13).ref();"
+    (result_var,) = set(re.findall(rf"\.add_input\(({allocs[0][0]}__\w+)\);", prefix.split(quant_end, 1)[-1]))
+    if prefix.count(quant_start) != 1 or prefix.count(quant_end) != 1:
+        raise ValueError("Cannot separate O-Quant from O-A")
+    prefix = prefix.replace(quant_start, f"        if ({ordinal} == 0) {{\n" + quant_start)
+    prefix = prefix.replace(quant_end, f"        }} else {{ {result_var} = {allocs[0][0]}; }}\n" + quant_end)
     group, args = ob.split("// Group _o_proj_b_hc_post:", 1)
     inputs = re.findall(r"(params_\w+)\.add_input\((\w+)\);", args)
     if len(inputs) != 7 or not inputs[0][1].startswith(allocs[2][0]) or inputs[2][1] != allocs[3][0]:
@@ -435,7 +443,11 @@ def prepare_retained(program, destination, ignore):
             f"{params}.add_input({var});", f"{params}.add_input(orch_args.tensor({external}).ref());"
         )
     host.write_text(
-        prefix + "        }\n        int64_t ob_tasks_" + group + "// Group _o_proj_b_hc_post:" + args
+        prefix
+        + f"        }}\n        if ({ordinal} == 3) return;\n        int64_t ob_tasks_"
+        + group
+        + "// Group _o_proj_b_hc_post:"
+        + args
     )
     metadata = destination / "compiled_meta.json"
     meta = json.loads(metadata.read_text())
@@ -521,13 +533,14 @@ def stress(area, device, sessions, repeats):
         )
         for path in ("program", "retained")
     ]
+    route = {"retained": 0, "direct": 1, "from-quant": 2, "oa-only": 3}
     stats = {}
     failures = []
     for session in range(sessions):
         with ChipWorker(config=cfg, runtime=programs[0].runtime_name) as worker:
             handles = [worker.register(prog) for prog in programs]
             for iteration in range(repeats):
-                order = ["original", "retained", "direct"]
+                order = ["original", *route]
                 shift = (session + iteration) % len(order)
                 for path in order[shift:] + order[:shift]:
                     for n in (0, 1, 17):
@@ -539,29 +552,52 @@ def stress(area, device, sessions, repeats):
                             handles[0](*argv, ctypes.c_int32(n), config=cfg)
                         else:
                             stage = direct[n] if path == "direct" else buffers
-                            if path == "retained":
-                                for buf in buffers:
-                                    buf.view(torch.uint8).zero_()
+                            if path != "direct":
+                                for i, buf in enumerate(buffers):
+                                    if path != "retained" and i < 2:
+                                        buf.view(torch.uint8).copy_(direct[n][i].view(torch.uint8))
+                                    else:
+                                        buf.view(torch.uint8).zero_()
                             handles[1](
-                                *argv, *stage, ctypes.c_int32(n), ctypes.c_int32(path == "direct"), config=cfg
+                                *argv, *stage, ctypes.c_int32(n), ctypes.c_int32(route[path]), config=cfg
                             )
-                        streams = 3 if witness else 4
-                        truth = expected["output"]
-                        count = int(
-                            (
-                                ~torch.isclose(
-                                    got[:n, :streams], truth[:n, :streams], atol=0.01, rtol=1 / 128
-                                )
-                            ).sum()
+                        count = tail = 0
+                        if path != "oa-only":
+                            streams = 3 if witness else 4
+                            truth = expected["output"]
+                            count = int(
+                                (
+                                    ~torch.isclose(
+                                        got[:n, :streams], truth[:n, :streams], atol=0.01, rtol=1 / 128
+                                    )
+                                ).sum()
+                            )
+                            tail = int((got[n:] != truth[n:]).sum())
+                        late = (
+                            late_buffers(buffers, references[n][1])
+                            if path in ("retained", "from-quant", "oa-only") and n
+                            else {}
                         )
-                        tail = int((got[n:] != truth[n:]).sum())
-                        late = late_buffers(buffers, references[n][1]) if path == "retained" and n else {}
                         key = f"{path}/{n}/{'witness' if witness else 'normal'}"
                         rec = stats.setdefault(
-                            key, dict(calls=0, failures=0, buffer_differences=0, max_outliers=0)
+                            key,
+                            dict(
+                                calls=0,
+                                failures=0,
+                                buffer_differences=0,
+                                oa_input_differences=0,
+                                oa_output_differences=0,
+                                output_failure_with_oa_difference=0,
+                                max_outliers=0,
+                            ),
                         )
                         rec["calls"] += 1
                         rec["buffer_differences"] += int(bool(late))
+                        wrong_input = any(k.startswith("oa_in_") for k in late)
+                        wrong_output = any(k.startswith("oa_out_") for k in late)
+                        rec["oa_input_differences"] += int(wrong_input)
+                        rec["oa_output_differences"] += int(wrong_output)
+                        rec["output_failure_with_oa_difference"] += int(bool(count or tail) and wrong_output)
                         rec["max_outliers"] = max(rec["max_outliers"], count)
                         if count or tail or late:
                             should_sample = (
@@ -577,7 +613,7 @@ def stress(area, device, sessions, repeats):
                                     inactive_different=tail,
                                     final_buffers=late,
                                 )
-                                if n:
+                                if n and path != "oa-only":
                                     mode = "witness-only" if witness else "control"
                                     bad.update(
                                         observe(mode, n, values, expected, references[n][0], None, None)

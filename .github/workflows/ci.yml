@@ -52,7 +52,7 @@ jobs:
           source activate.sh
           export PYTHONPATH="$PWD" PYPTO_BENCH=0 PYPTO_RUNTIME_LOG=error
           python .github/scripts/trace_o_projection.py prepare --work "$RUNNER_TEMP/o-projection-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-      - name: Compare the original chain, retained intermediates and isolated O-B on A5
+      - name: Compare the original chain with isolated O-A and O-B on A5
         working-directory: checkout
         shell: bash
         run: |
