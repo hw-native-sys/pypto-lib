@@ -220,6 +220,7 @@ def prepare(area):
         ]
 
     shutil.copytree(src, program, ignore=ignore)
+    prepare_retained(src, area / "retained", ignore)
     tag_boundaries(program)
 
 
@@ -388,16 +389,227 @@ def run(area, device):
         raise SystemExit(1)
 
 
+RETAINED = {
+    "oa_in_payload": ((640, 4096), "fp8e4m3fn", torch.float8_e4m3fn),
+    "oa_in_scale": ((8, 10240), "fp8e8m0", torch.float8_e8m0fnu),
+    "oa_out_payload": ((80, 8192), "fp8e4m3fn", torch.float8_e4m3fn),
+    "oa_out_scale": ((1, 20480), "fp8e8m0", torch.float8_e8m0fnu),
+}
+
+
+def prepare_retained(program, destination, ignore):
+    """Return intermediate GM buffers after HC. Both paths use the production device binaries."""
+    shutil.copytree(program, destination, ignore=ignore)
+    (host,) = destination.glob("orchestration/*.cpp")
+    source = host.read_text()
+    allocs = re.findall(r"const Tensor& (\w+) = (alloc_\d+)\.get_ref\(0\);", source)
+    if len(allocs) != 4 or ".expected_arg_count = 12," not in source:
+        raise ValueError("Unexpected host allocation ABI")
+    for i, ((var, alloc), prefix) in enumerate(
+        zip(allocs, ("payload_all", "scales_all", "payload", "activation_scale"), strict=True)
+    ):
+        if not var.startswith(prefix + "_"):
+            raise ValueError(f"Unexpected O projection buffer {var}")
+        source, count = re.subn(
+            rf"        uint32_t {var}_ci_shapes\[2\][^\n]*\n"
+            rf"        TensorCreateInfo {var}_ci[^\n]*\n"
+            rf"        TaskOutputTensors {alloc} = alloc_tensors\({var}_ci\);\n"
+            rf"        const Tensor& {var} = {alloc}\.get_ref\(0\);",
+            f"        const Tensor& {var} = orch_args.tensor({11 + i}).ref();",
+            source,
+        )
+        if count != 1:
+            raise ValueError(f"Cannot expose {var}")
+    source = source.replace(".expected_arg_count = 12,", ".expected_arg_count = 17,")
+    prefix, ob = source.split("        int64_t ob_tasks_", 1)
+    prefix = prefix.replace(
+        "    SIMPLER_SCOPE() {", "    SIMPLER_SCOPE() {\n        if (!orch_args.scalar<int32_t>(1)) {", 1
+    )
+    group, args = ob.split("// Group _o_proj_b_hc_post:", 1)
+    inputs = re.findall(r"(params_\w+)\.add_input\((\w+)\);", args)
+    if len(inputs) != 7 or not inputs[0][1].startswith(allocs[2][0]) or inputs[2][1] != allocs[3][0]:
+        raise ValueError("Unexpected O-B input order")
+    for position, external in ((0, 13), (2, 14)):
+        params, var = inputs[position]
+        args = args.replace(
+            f"{params}.add_input({var});", f"{params}.add_input(orch_args.tensor({external}).ref());"
+        )
+    host.write_text(
+        prefix + "        }\n        int64_t ob_tasks_" + group + "// Group _o_proj_b_hc_post:" + args
+    )
+    metadata = destination / "compiled_meta.json"
+    meta = json.loads(metadata.read_text())
+    for key in ("params", "lowered_params"):
+        params = meta[key]
+        if len(params) != 12 or params[-1]["name"] != "num_tokens":
+            raise ValueError("Unexpected model signature")
+        extra = [
+            dict(name=k, direction="InOut", shape=list(shape), dtype=dtype, layout="ND")
+            for k, (shape, dtype, _) in RETAINED.items()
+        ]
+        meta[key] = params[:-1] + extra + [params[-1], dict(params[-1], name="bypass")]
+    metadata.write_text(json.dumps(meta))
+
+
+def verify_device_binaries(program, destination):
+    bins = {f.name: hashlib.sha256(f.read_bytes()).digest() for f in (program / "cache").glob("*.bin")}
+    copies = {f.name: hashlib.sha256(f.read_bytes()).digest() for f in (destination / "cache").glob("*.bin")}
+    if len(bins) < 3 or sorted(bins.values()) != sorted(copies.values()):
+        raise ValueError("The retained path changed the production device binaries")
+    print(f"Verified {len(bins)} device binaries", flush=True)
+
+
+def late_buffers(buffers, reference):
+    result = {}
+    for (key, expected), tensor in zip(reference.items(), buffers, strict=True):
+        actual = tensor.view(torch.uint8).numpy().reshape(-1)
+        exp = expected.view(torch.uint8).numpy().reshape(-1)
+        bad = np.flatnonzero(actual != exp)
+        if bad.size:
+            stage, dtype = key.rsplit("_", 1)
+            result[key] = dict(
+                different_bytes=int(bad.size),
+                first_byte=int(bad[0]),
+                row0_xor=encode_delta(first_row(actual, stage, dtype) ^ first_row(exp, stage, dtype)),
+            )
+    return result
+
+
+def stress(area, device, sessions, repeats):
+    """Alternate complete and isolated O-B calls with argument capture disabled."""
+    import ctypes
+    from pypto.backend import BackendType
+    from pypto.ir import CompiledProgram
+    from pypto.runtime import ChipWorker, ExecutionMode, RunConfig
+
+    def read(path):
+        return torch.load(path, weights_only=True)
+
+    fixtures = {}
+    references = {}
+    for n in (0, 1, 17):
+        if n:
+            ref = read(area / f"reference-{n}.pt")
+            projected = ref.pop("projected").float()
+            references[n] = projected, {k: ref[k] for k in RETAINED}
+        for witness in (False, True) if n else (False,):
+            folder = area / f"{'witness' if witness else 'normal'}-{n}"
+            output = read(folder / "out/output.pt")
+            specs = o.build_o_proj_hc_post_specs(n, pad_to_tile=True)
+            values = {
+                s.name: read(folder / "in" / (s.name + ".pt"))
+                for s in specs
+                if s.name not in ("output", "num_tokens")
+            }
+            values["output"] = torch.empty_like(output)
+            fixtures[n, witness] = list(values.values()), values, {"output": output}
+    buffers = [torch.zeros(shape, dtype=torch.uint8).view(dtype) for shape, _, dtype in RETAINED.values()]
+    direct = {}
+    for n in (0, 1, 17):
+        direct[n] = [torch.zeros_like(t) for t in buffers]
+        if n:
+            for i, k in enumerate(RETAINED):
+                direct[n][i].view(torch.uint8).copy_(
+                    references[n][1][k].reshape_as(direct[n][i]).view(torch.uint8)
+                )
+    cfg = RunConfig(
+        backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD, device_id=device
+    )
+    programs = [
+        CompiledProgram.from_dir(
+            area / path, backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD
+        )
+        for path in ("program", "retained")
+    ]
+    stats = {}
+    failures = []
+    for session in range(sessions):
+        with ChipWorker(config=cfg, runtime=programs[0].runtime_name) as worker:
+            handles = [worker.register(prog) for prog in programs]
+            for iteration in range(repeats):
+                order = ["original", "retained", "direct"]
+                shift = (session + iteration) % len(order)
+                for path in order[shift:] + order[:shift]:
+                    for n in (0, 1, 17):
+                        witness = bool((session + iteration) % 2) and bool(n)
+                        argv, values, expected = fixtures[n, witness]
+                        got = values["output"]
+                        got.fill_(float("nan"))
+                        if path == "original":
+                            handles[0](*argv, ctypes.c_int32(n), config=cfg)
+                        else:
+                            stage = direct[n] if path == "direct" else buffers
+                            if path == "retained":
+                                for buf in buffers:
+                                    buf.view(torch.uint8).zero_()
+                            handles[1](
+                                *argv, *stage, ctypes.c_int32(n), ctypes.c_int32(path == "direct"), config=cfg
+                            )
+                        streams = 3 if witness else 4
+                        truth = expected["output"]
+                        count = int(
+                            (
+                                ~torch.isclose(
+                                    got[:n, :streams], truth[:n, :streams], atol=0.01, rtol=1 / 128
+                                )
+                            ).sum()
+                        )
+                        tail = int((got[n:] != truth[n:]).sum())
+                        late = late_buffers(buffers, references[n][1]) if path == "retained" and n else {}
+                        key = f"{path}/{n}/{'witness' if witness else 'normal'}"
+                        rec = stats.setdefault(
+                            key, dict(calls=0, failures=0, buffer_differences=0, max_outliers=0)
+                        )
+                        rec["calls"] += 1
+                        rec["buffer_differences"] += int(bool(late))
+                        rec["max_outliers"] = max(rec["max_outliers"], count)
+                        if count or tail or late:
+                            should_sample = (
+                                rec["failures"] < 2 if count or tail else rec["buffer_differences"] == 1
+                            )
+                            if should_sample:
+                                bad = dict(
+                                    path=path,
+                                    session=session,
+                                    iteration=iteration,
+                                    active_tokens=n,
+                                    active_outliers=count,
+                                    inactive_different=tail,
+                                    final_buffers=late,
+                                )
+                                if n:
+                                    mode = "witness-only" if witness else "control"
+                                    bad.update(
+                                        observe(mode, n, values, expected, references[n][0], None, None)
+                                    )
+                                    bad.update(mode=mode, attempt=iteration + 1)
+                                failures.append(bad)
+                                print("O_CHAIN_STRESS " + json.dumps(bad, sort_keys=True), flush=True)
+                            rec["failures"] += int(bool(count or tail))
+        if session == 0:
+            verify_device_binaries(area / "program", area / "retained")
+        (area / "stress.json").write_text(
+            json.dumps(dict(stats=stats, first_failures=failures), indent=2) + "\n"
+        )
+        print("O_CHAIN_COUNTS " + json.dumps(stats, sort_keys=True), flush=True)
+    if any(r["failures"] for r in stats.values()):
+        raise SystemExit(1)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", choices=["prepare", "run"])
+    parser.add_argument("stage", choices=["prepare", "run", "stress"])
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--device", type=int, default=int(os.getenv("TASK_DEVICE", "0")))
+    parser.add_argument("--sessions", type=int, default=8)
+    parser.add_argument("--repeats", type=int, default=8)
     args = parser.parse_args()
     area = args.work.resolve()
     area.mkdir(parents=True, exist_ok=True)
     os.chdir(area)
     if args.stage == "prepare":
         prepare(area)
+    elif args.stage == "stress":
+        stress(area, args.device, args.sessions, args.repeats)
     else:
         run(area, args.device)

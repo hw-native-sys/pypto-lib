@@ -52,12 +52,12 @@ jobs:
           source activate.sh
           export PYTHONPATH="$PWD" PYPTO_BENCH=0 PYPTO_RUNTIME_LOG=error
           python .github/scripts/trace_o_projection.py prepare --work "$RUNNER_TEMP/o-projection-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-      - name: Replay the 0, 1 and 17 token sequence on A5
+      - name: Compare the original chain, retained intermediates and isolated O-B on A5
         working-directory: checkout
         shell: bash
         run: |
           set -eo pipefail
-          printf -v command 'cd %q && source activate.sh && PYPTO_BENCH=0 PYPTO_LOG_LEVEL=error PYPTO_WARNING_LEVEL=none PYPTO_RUNTIME_LOG=error PYTHONPATH=%q python .github/scripts/trace_o_projection.py run --work %q --device "$TASK_DEVICE"' \
+          printf -v command 'cd %q && source activate.sh && PYPTO_BENCH=0 PYPTO_LOG_LEVEL=error PYPTO_WARNING_LEVEL=none PYPTO_RUNTIME_LOG=error PYTHONPATH=%q python .github/scripts/trace_o_projection.py stress --work %q --device "$TASK_DEVICE"' \
             "$PWD" "$PWD" "$RUNNER_TEMP/o-projection-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           task-submit --device 5 --timeout 1200 --max-time 600 --run "$command"
       - name: Save stage comparisons
@@ -65,7 +65,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: o-projection-a5-stage-comparisons
-          path: ${{ runner.temp }}/o-projection-${{ github.run_id }}-${{ github.run_attempt }}/report.json
+          path: ${{ runner.temp }}/o-projection-${{ github.run_id }}-${{ github.run_attempt }}/stress.json
           retention-days: 5
           if-no-files-found: warn
 
