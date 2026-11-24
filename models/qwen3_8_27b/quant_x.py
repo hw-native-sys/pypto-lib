@@ -114,132 +114,6 @@ def build_kernel(tok_tile: int = TOK_TILE, ch_tile: int = CH_TILE, group: int = 
     return _gdn_quant_x
 
 
-# Column groups the decode form splits the reduction over; see `build_fanned_kernel`.
-COL_GROUPS = 4
-VEC_BUFFER_BYTES = 188416       # a2a3's vector buffer, which bounds the column range
-
-# Speculative early dispatch on the decode chain; `rmsnorm.EARLY_RESOLVE` carries the full
-# note. It only pays when every direct producer of a consumer has it, so the flag travels
-# along a chain rather than sitting on one stage.
-EARLY_RESOLVE = True
-
-
-def build_fanned_kernel(m: int, col_groups: int = COL_GROUPS, tok_tile: int = TOK_TILE,
-                        inline: bool = False):
-    """The decode form: the per-token reduction split across the column axis.
-
-    Same shape of fix as `act_quant.build_fanned_kernel`, and the same reason. The body
-    above gives one block a run of token rows and walks the column axis inside it; at a
-    decode batch that is one task walking `C / ch_tile` reduction steps and as many
-    quantisation steps, with nothing to overlap. The token axis is exhausted, so the fan-out
-    moves to the columns: a partial pass over a `[col_groups, m]` FP32 scratch, a single-task
-    combine that owns the whole `x_scale` cache line, and an apply pass.
-
-    The combine must be one task because 16 FP32 scales are exactly one 64-byte line and a
-    line written from two blocks loses one of them silently. The apply pass re-folds the
-    scratch rather than carrying `amax` forward, which costs `col_groups * m` elements and
-    removes a second scratch.
-
-    **Bit-identical to the body above.** Maximum and minimum are associative and exact, so
-    splitting the reduction by column group and combining cannot move `amax`; the epsilon
-    clamp commutes with it; `x_scale` keeps the same multiply by `1 / SCALE_MAX` and the
-    apply keeps the same `recip` and the same INT32-then-truncate cast.
-
-    `col_groups` must divide `C / STORE_GROUP` so that no INT8 store is a partial
-    128-element group, which is miscompiled (see `act_quant.build_fanned_kernel`). The apply
-    pass also holds its column range as FP32 twice, INT32 once and INT8 once, so the range
-    is capacity-bound from the other side: 4 and 5 groups do not fit, which leaves 8, 10, 20
-    and 40.
-
-    **The win is modest and it shrinks with the batch**, which is the honest reason to read
-    this entry before reusing the pattern. a2a3, median of 30 rounds, every variant in
-    one process:
-
-    | col_groups | shipped | 4 | 5 | 8 | 10 | 20 |
-    |---|---:|---:|---:|---:|---:|---:|
-    | column width | 5120 | 1280 | 1024 | 640 | 512 | 256 |
-    | us at M = 16 | 23.9 | **18.2** | 18.6 | 20.8 | 21.8 | 28.0 |
-    | us at M = 32 | 24.7 | **22.5** | 22.5 | 23.0 | 23.8 | 29.0 |
-
-    1.31x at M = 16 and 1.10x at M = 32, so 5.7 and 2.3 us per invocation. `quant_x` runs
-    **128 times per decode step** -- `gdn_block` x48, `gated_attention` x16, the MLP x64 --
-    which is 45.2 us/token at batch 16 and 9.0 at batch 32. Against `act_quant`'s 203.6
-    us/token for the same structural change, this stage was already near the launch floor
-    that `decode_kv_append` puts around 14 us: there is only about 10 us of serial work here
-    to divide, where `act_quant` had 64.
-
-    **4 groups is the edge, and this time the bound is the compiler's**: 2 groups needs
-    327808 B of the 188416 B vector buffer, which it says so itself. An earlier version of
-    this file put the floor at 8 groups because the guard above estimated the working set at
-    13 bytes per element; the real figure is 8, so 4 and 5 were refused by arithmetic rather
-    than by capacity and the default was set one step inside a boundary of its own making.
-    Four groups is four tasks on a 48-core machine and still wins, which is
-    `decode_short_conv`'s rule again: a task that carries enough work to amortise its own
-    cost should be big, not numerous.
-    """
-    if m % tok_tile:
-        raise ValueError(f"m={m} must be a multiple of tok_tile={tok_tile}")
-    if C % col_groups:
-        raise ValueError(f"col_groups={col_groups} must divide C={C}")
-    width = C // col_groups
-    if width % STORE_GROUP:
-        raise ValueError(
-            f"col_groups={col_groups} leaves a {width}-column range, which is not a multiple "
-            f"of {STORE_GROUP}; an INT8 tile store of a partial group writes wrong values. "
-            f"col_groups must divide {C // STORE_GROUP}")
-    # 8 bytes per element, calibrated against the compiler's own reported usage rather than
-    # counted off the source: the apply pass names four tiles (FP32 in, FP32 scaled, INT32,
-    # INT8) but the scaled buffer is reused, so a naive 13 refuses configurations that build.
-    # The compiler holds the real number -- "Vec buffer usage (N bytes) exceeds platform
-    # limit" -- and this check only moves that error earlier.
-    live = tok_tile * width * 8
-    if live > VEC_BUFFER_BYTES:
-        raise ValueError(f"col_groups={col_groups} needs about {live} B of the "
-                         f"{VEC_BUFFER_BYTES} B vector buffer in the apply pass; use at least "
-                         f"{C * tok_tile * 8 // VEC_BUFFER_BYTES + 1} groups")
-
-    @(pl.jit.inline if inline else pl.jit)
-    def _gdn_quant_x_fanned(
-        x: pl.Tensor[[m, C], pl.BF16],
-        x_q: pl.Out[pl.Tensor[[m, C], pl.INT8]],
-        x_scale: pl.Out[pl.Tensor[[1, m], pl.FP32]],
-    ):
-        """One task per column group; `m` is the padded decode batch."""
-        part = pl.create_tensor([col_groups, m], dtype=pl.FP32)
-
-        for cg in pl.spmd(col_groups, name_hint="quant_x_amax",
-                          allow_early_resolve=EARLY_RESOLVE):
-            c0 = cg * width
-            for t0 in pl.range(0, m, tok_tile):
-                xf = pl.cast(x[t0 : t0 + tok_tile, c0 : c0 + width], target_type=pl.FP32)
-                group_amax = pl.maximum(pl.row_max(xf), pl.neg(pl.row_min(xf)))
-                part[cg : cg + 1, t0 : t0 + tok_tile] = pl.reshape(group_amax, [1, tok_tile])
-
-        for _solo in pl.spmd(1, name_hint="quant_x_scale",
-                             allow_early_resolve=EARLY_RESOLVE):
-            for t0 in pl.range(0, m, tok_tile):
-                folded_row = pl.col_max(part[0:col_groups, t0 : t0 + tok_tile])
-                amax_row = pl.maximum(folded_row, AMAX_EPS)
-                x_scale[0:1, t0 : t0 + tok_tile] = pl.mul(amax_row, 1.0 / SCALE_MAX)
-
-        # `amax_col` is a distinct name from the scale pass's `amax_row`: one body is one
-        # scope, and the DSL refuses a name reassigned at a different tile shape.
-        for cg in pl.spmd(col_groups, name_hint="quant_x_apply",
-                          allow_early_resolve=EARLY_RESOLVE):
-            c0 = cg * width
-            for t0 in pl.range(0, m, tok_tile):
-                folded_col = pl.col_max(part[0:col_groups, t0 : t0 + tok_tile])
-                amax_col = pl.reshape(pl.maximum(folded_col, AMAX_EPS), [tok_tile, 1])
-                inv = pl.mul(pl.recip(amax_col, high_precision=True), SCALE_MAX)
-                xf = pl.cast(x[t0 : t0 + tok_tile, c0 : c0 + width], target_type=pl.FP32)
-                q32 = pl.cast(pl.row_expand_mul(xf, inv), target_type=pl.INT32, mode="rint")
-                x_q[t0 : t0 + tok_tile, c0 : c0 + width] = pl.cast(q32, target_type=pl.INT8,
-                                                                   mode="trunc")
-        return x_q, x_scale
-
-    return _gdn_quant_x_fanned
-
-
 gdn_quant_x = build_kernel(inline=True)
 gdn_quant_x_test = build_kernel()
 
@@ -324,8 +198,6 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seq-len", type=int, default=None, help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--ch-tile", type=int, default=CH_TILE)
-    parser.add_argument("--fanned", action="store_true", default=False,
-                        help="only the per-token form, one task per token")
     parser.add_argument("--rounds", type=int, default=0,
                         help="also time the kernel over this many rounds (device only)")
     parser.add_argument("--save-data", action="store_true", default=False)
@@ -333,11 +205,9 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
-    cases = [args.seq_len] if args.seq_len is not None else list(DEFAULT_CASES[:2] if args.fanned else DEFAULT_CASES)
-    if any(t <= 0 or (args.fanned and t % TOK_TILE) for t in cases):
-        parser.error(f"--seq-len must be positive and a multiple of {TOK_TILE} for --fanned")
-    if args.fanned and args.ch_tile != CH_TILE:
-        parser.error("--ch-tile is only supported by the tiled kernel")
+    cases = [args.seq_len] if args.seq_len is not None else list(DEFAULT_CASES)
+    if any(t <= 0 for t in cases):
+        parser.error("--seq-len must be positive")
     if len(cases) > 1 and (args.golden_data or args.runtime_dir):
         parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
 
@@ -346,17 +216,13 @@ if __name__ == "__main__":
         os.environ["PYPTO_BENCH_ROUNDS"] = str(args.rounds)
         os.environ["PYPTO_BENCH_WARMUP"] = "5"
 
-    # Two programs live here, the token-tiled form and the per-token one the decode path
-    # reads, so the default set runs both rather than leaving the second uncovered.
-    plan = [("fanned", t) for t in cases] if args.fanned else [("tiled", t) for t in cases]
-    if not args.fanned and not args.seq_len:
-        plan += [("fanned", TOK_TILE)]
+    plan = [("tiled", t) for t in cases]
 
     tiled_kernel = gdn_quant_x_test if args.ch_tile == CH_TILE else build_kernel(ch_tile=args.ch_tile)
     for label, t in plan:
         print(f"[case] quant_x {label} T={t}", flush=True)
         result = run(
-            fn=build_fanned_kernel(t) if label == "fanned" else tiled_kernel,
+            fn=tiled_kernel,
             specs=build_tensor_specs(t=t),
             golden_fn=golden_gdn_quant_x,
             golden_data=args.golden_data,

@@ -33,21 +33,17 @@ VAL_WIDTH = H * D                           # one token's contiguous run
 SCALE_MAX = GDN_QUANT.scale_max
 AMAX_EPS = GDN_QUANT.amax_eps
 # validation
-# One chunk of the fixture's chain, then eight; the bf16 and fanned bodies are separate
-# programs, so the default set runs each of them once rather than leaving two uncovered.
+# One chunk of the fixture's chain, then eight; the int8 epilogue and the bf16 output are
+# separate programs, so the default set runs each of them rather than leaving one uncovered.
 DEFAULT_CASES = (128, 1024)
-TAIL_SEQ = 17           # one token past a tile: the clamped tail of both token-tiled bodies
+TAIL_SEQ = 17           # one token past a tile: the clamped tail of both bodies
 BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # gate
 MIN_EXACT_VS_REFERENCE = 0.95   # of y_q elements identical to the fake-quant reference
 
-# scheduling: see `rmsnorm.EARLY_RESOLVE`, which carries the note and the measurement
-EARLY_RESOLVE = True
-
 # tiling
 TOK_TILE = 16           # tokens per block; 16 scalar scale writes fill one 64-byte line
-LANES = 16              # amax lanes the decode form publishes; 16 FP32 is one 64-byte line
 
 # `y_scale` is a [1, T] row and not a [T] vector: an A8W8 projection reshapes its
 # slice to the [M, 1] column it multiplies by, and a tile store must be 2-D anyway.
@@ -137,81 +133,6 @@ gdn_gated_rmsnorm = pl.jit.inline(_gdn_gated_rmsnorm)
 gdn_gated_rmsnorm_test = pl.jit(_gdn_gated_rmsnorm)
 
 
-def build_fanned_kernel(m: int, inline: bool = False):
-    """The decode form: one task per token, and the scale written by a task that owns its line.
-
-    The body above gives one task a whole token tile and walks its 16 rows at `stage=2`. At
-    prefill that is right -- T = 8192 is 512 tiles and the cores are full. **At a decode batch
-    it is one task**, and the critical path of a composed layer puts it at **68.5 us**, the
-    largest vector stage left on that path.
-
-    The token axis is the one to split, and the only thing stopping the obvious `pl.spmd(m)` is
-    the scale: 16 FP32 scalars are exactly one 64-byte cache line, and a line written from two
-    blocks loses one of them silently. So each task publishes its token's amax as a `[1, LANES]`
-    tile into a row of a `[m, LANES]` scratch -- 16 FP32 is the whole line, so no two tasks
-    share one -- and a single `pl.spmd(1)` folds the scratch and writes `y_scale`.
-
-    **This is bit-identical to the body above.** Each task computes one token's norm, gate and
-    quantisation with the same operations in the same order; only the amax reduction is
-    reassociated, from 8 lanes to 16, and a maximum is exact under any association. The scale
-    is still `amax / SCALE_MAX` by division rather than by a multiply, which the reciprocal of
-    127 would not reproduce. The composed block's output is **exact over all 81920 elements**
-    against the shipped build's own device output, on random and on real weights.
-
-    This stage has no decode-shaped specs of its own -- its `o` comes from the prefill chunked
-    chain, which needs a chunk multiple -- so it is measured and gated inside
-    `decode_gdn_block`. A composed linear-attention layer goes **785.8 -> 727.4 us at batch 16**
-    and 1000.0 -> 953.3 at batch 32, which is 175.1 us/token over the 48 layers at batch 16.
-    """
-    @(pl.jit.inline if inline else pl.jit)
-    def _gdn_gated_rmsnorm_fanned(
-        o: pl.Tensor[[m, H, D], pl.FP16],
-        z: pl.Tensor[[m, VAL_WIDTH], pl.BF16],
-        norm_w: pl.Tensor[[D], pl.BF16],
-        y_q: pl.Out[pl.Tensor[[m, VAL_WIDTH], pl.INT8]],
-        y_scale: pl.Out[pl.Tensor[[1, m], pl.FP32]],
-    ):
-        """One task per token; `m` is the padded decode batch."""
-        o_flat = pl.reshape(o, [m, VAL_WIDTH])
-        part = pl.create_tensor([m, LANES], dtype=pl.FP32)
-
-        for r0 in pl.spmd(m, name_hint="gated_rmsnorm_token",
-                          allow_early_resolve=EARLY_RESOLVE):
-            w_row = pl.cast(pl.reshape(norm_w[:], [1, D]), target_type=pl.FP32)
-            ones_h = pl.full([H, LANES], dtype=pl.FP32, value=1.0)
-            of_run = pl.cast(o_flat[r0 : r0 + 1, :], target_type=pl.FP32)
-            of = pl.reshape(of_run, [H, D])
-            inv_rms = pl.rsqrt(pl.add(pl.mul(pl.row_sum(pl.mul(of, of)), 1.0 / D), EPS),
-                               high_precision=True)
-            normed_bf = pl.cast(pl.row_expand_mul(of, inv_rms), target_type=pl.BF16, mode="rint")
-            normed = pl.cast(normed_bf, target_type=pl.FP32)
-            weighted_bf = pl.cast(pl.col_expand_mul(normed, w_row), target_type=pl.BF16, mode="rint")
-
-            zf_run = pl.cast(z[r0 : r0 + 1, :], target_type=pl.FP32)
-            zf = pl.reshape(zf_run, [H, D])
-            gate = pl.div(zf, pl.add(pl.exp(pl.neg(zf)), 1.0))
-            y = pl.mul(pl.cast(weighted_bf, target_type=pl.FP32), gate)
-
-            # the token's amax as LANES partials, clamped here so the fold inherits it
-            lane_max = pl.col_max(pl.reshape(pl.col_max(pl.abs(y)), [D // LANES, LANES]))
-            lanes = pl.maximum(lane_max, pl.full([1, LANES], dtype=pl.FP32, value=AMAX_EPS))
-            part[r0 : r0 + 1, 0:LANES] = lanes
-            amax = pl.row_max(pl.col_expand_mul(ones_h, lanes))
-
-            q = pl.row_expand_mul(y, pl.mul(pl.recip(amax, high_precision=True), SCALE_MAX))
-            q32 = pl.cast(q, target_type=pl.INT32, mode="rint")
-            q_i8 = pl.cast(q32, target_type=pl.INT8, mode="trunc")
-            y_q[r0 : r0 + 1, :] = pl.reshape(q_i8, [1, VAL_WIDTH])
-
-        for _solo in pl.spmd(1, name_hint="gated_rmsnorm_scale",
-                             allow_early_resolve=EARLY_RESOLVE):
-            folded = pl.row_max(part[0:m, 0:LANES])
-            y_scale[0:1, 0:m] = pl.div(pl.reshape(folded, [1, m]), SCALE_MAX)
-        return y_q, y_scale
-
-    return _gdn_gated_rmsnorm_fanned
-
-
 def _gdn_gated_rmsnorm_bf16(
     o: pl.Tensor[[T_DYN, H, D], pl.FP16],
     z: pl.Tensor[[T_DYN, VAL_WIDTH], pl.BF16],
@@ -252,46 +173,6 @@ def _gdn_gated_rmsnorm_bf16(
                            target_type=pl.BF16, mode="rint")
             y[r0 : r0 + 1, :] = pl.reshape(y_bf, [1, VAL_WIDTH])
     return y
-
-
-def build_fanned_bf16_kernel(m: int, inline: bool = False):
-    """The decode form of the bf16-output variant: one task per token, and nothing else.
-
-    `build_fanned_kernel` needs a scratch and a second `pl.spmd` group only because of its
-    per-token scale: 16 FP32 scalars are one 64-byte line. This variant has no scale, so the
-    fan-out is the whole change -- one task per token, no fold, no hand-off.
-
-    Bit-identical to the body above: the same operations on the same token in the same order.
-    """
-    @(pl.jit.inline if inline else pl.jit)
-    def _gdn_gated_rmsnorm_bf16_fanned(
-        o: pl.Tensor[[m, H, D], pl.FP16],
-        z: pl.Tensor[[m, VAL_WIDTH], pl.BF16],
-        norm_w: pl.Tensor[[D], pl.BF16],
-        y: pl.Out[pl.Tensor[[m, VAL_WIDTH], pl.BF16]],
-    ):
-        """One task per token; `m` is the padded decode batch."""
-        o_flat = pl.reshape(o, [m, VAL_WIDTH])
-        for r0 in pl.spmd(m, name_hint="gated_rmsnorm_bf16_token",
-                          allow_early_resolve=EARLY_RESOLVE):
-            w_row = pl.cast(pl.reshape(norm_w[:], [1, D]), target_type=pl.FP32)
-            of_run = pl.cast(o_flat[r0 : r0 + 1, :], target_type=pl.FP32)
-            of = pl.reshape(of_run, [H, D])
-            inv_rms = pl.rsqrt(pl.add(pl.mul(pl.row_sum(pl.mul(of, of)), 1.0 / D), EPS),
-                               high_precision=True)
-            normed_bf = pl.cast(pl.row_expand_mul(of, inv_rms), target_type=pl.BF16, mode="rint")
-            normed = pl.cast(normed_bf, target_type=pl.FP32)
-            weighted_bf = pl.cast(pl.col_expand_mul(normed, w_row), target_type=pl.BF16, mode="rint")
-
-            zf_run = pl.cast(z[r0 : r0 + 1, :], target_type=pl.FP32)
-            zf = pl.reshape(zf_run, [H, D])
-            gate = pl.div(zf, pl.add(pl.exp(pl.neg(zf)), 1.0))
-            y_bf = pl.cast(pl.mul(pl.cast(weighted_bf, target_type=pl.FP32), gate),
-                           target_type=pl.BF16, mode="rint")
-            y[r0 : r0 + 1, :] = pl.reshape(y_bf, [1, VAL_WIDTH])
-        return y
-
-    return _gdn_gated_rmsnorm_bf16_fanned
 
 
 gdn_gated_rmsnorm_bf16 = pl.jit.inline(_gdn_gated_rmsnorm_bf16)
@@ -506,8 +387,6 @@ if __name__ == "__main__":
                         help="a real layer from weights.py; default: random weights")
     parser.add_argument("--bf16-out", action="store_true", default=False,
                         help="the bf16-output variant, to price the int8 epilogue")
-    parser.add_argument("--fanned", action="store_true", default=False,
-                        help="the decode form: one task per token (int8 output only)")
     parser.add_argument("--rounds", type=int, default=0,
                         help="also time the kernel over this many rounds (device only)")
     parser.add_argument("--save-data", action="store_true", default=False)
@@ -523,25 +402,19 @@ if __name__ == "__main__":
         os.environ["PYPTO_BENCH_ROUNDS"] = str(args.rounds)
         os.environ["PYPTO_BENCH_WARMUP"] = "5"
 
-    # Four programs live here -- the int8 epilogue and the bf16 one, each in a token-tiled
-    # and a per-token form -- so the default set runs every one of them: the int8 epilogue
-    # at both shapes and the other three once at the smaller.
-    suffix = "_fanned" if args.fanned else ""
-    if args.bf16_out or args.fanned:
-        plan = [(("bf16" if args.bf16_out else "int8") + suffix, t) for t in cases]
+    # Two programs live here -- the int8 epilogue and the bf16 one -- so the default set
+    # runs the int8 epilogue at both shapes and the bf16 output once at the smaller.
+    if args.bf16_out:
+        plan = [("bf16", t) for t in cases]
     else:
         plan = [("int8", t) for t in cases]
         if not args.seq_len:
-            plan += [("bf16", cases[0]), ("int8_fanned", cases[0]), ("bf16_fanned", cases[0])]
-            # and the clamped tail in both token-tiled bodies: the fanned ones take any
-            # token count by construction, one task per token and no tile to fall short of.
+            plan += [("bf16", cases[0])]
+            # and the clamped tail of both token-tiled bodies
             plan += [("int8", TAIL_SEQ), ("bf16", TAIL_SEQ)]
     for label, t in plan:
         quant = not label.startswith("bf16")
-        if label.endswith("_fanned"):
-            entry = build_fanned_kernel(t) if quant else build_fanned_bf16_kernel(t)
-        else:
-            entry = gdn_gated_rmsnorm_test if quant else gdn_gated_rmsnorm_bf16_test
+        entry = gdn_gated_rmsnorm_test if quant else gdn_gated_rmsnorm_bf16_test
         print(f"[case] gated_rmsnorm {label} T={t}", flush=True)
         result = run(
             fn=entry,
