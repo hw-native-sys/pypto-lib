@@ -52,7 +52,7 @@ import sys
 import tempfile
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import cache, partial
 from pathlib import Path
@@ -616,6 +616,56 @@ def _validate_tensor(tensor: torch.Tensor, spec: WeightSpec) -> None:
         )
 
 
+def prepare_contract_tensor(
+    spec: WeightSpec,
+    tensor: torch.Tensor,
+    *,
+    verify_zero_offsets: bool = True,
+) -> torch.Tensor | None:
+    """Validate one checkpoint tensor and put it in the form the kernels take.
+
+    Returns ``None`` for a symmetric ``weight_offset``, which is checked and then
+    dropped because no kernel reads it.
+    """
+    _validate_tensor(tensor, spec)
+    if spec.is_zero_offset:
+        if verify_zero_offsets and bool(torch.count_nonzero(tensor)):
+            raise ValueError(f"{spec.name}: symmetric W8A8 checkpoint offset is not zero")
+        return None
+    if spec.role == "weight_scale":
+        tensor = tensor.reshape(-1)
+    return tensor.contiguous()
+
+
+def prepare_memory_tensors(
+    tensors: Mapping[str, torch.Tensor],
+    *,
+    contract: Qwen38TextContract = QWEN3_8_27B_TEXT_CONTRACT,
+    verify_zero_offsets: bool = True,
+) -> dict[str, torch.Tensor]:
+    """Prepare checkpoint-native tensors already in memory, without the file format.
+
+    `prepare_qwen38_weights` reads the published shards; this runs the same
+    per-tensor preparation over tensors a caller holds, so an operator entry can
+    hand its kernel exactly what a real load produces without the index, the shard
+    headers or the optional safetensors package. The file path itself is covered on
+    the host by `test_weights_contract.py`.
+
+    Names are looked up in *contract*, so a tensor this checkpoint does not carry is
+    rejected rather than passed through.
+    """
+    specs = {spec.name: spec for spec in contract.weight_specs}
+    prepared: dict[str, torch.Tensor] = {}
+    for name, value in tensors.items():
+        spec = specs.get(name)
+        if spec is None:
+            raise KeyError(f"{name} is not a tensor of this text contract")
+        tensor = prepare_contract_tensor(spec, value, verify_zero_offsets=verify_zero_offsets)
+        if tensor is not None:
+            prepared[name] = tensor
+    return prepared
+
+
 def prepare_qwen38_weights(
     checkpoint_dir: str | Path,
     tensor_exporter: TensorExporter,
@@ -652,16 +702,10 @@ def prepare_qwen38_weights(
                 if missing:
                     raise ValueError(f"{shard}: index names absent from safetensors header: {missing[:3]}")
                 for spec in specs:
-                    name = spec.name
-                    tensor = handle.get_tensor(name)
-                    _validate_tensor(tensor, spec)
-                    if spec.is_zero_offset:
-                        if verify_zero_offsets and bool(torch.count_nonzero(tensor)):
-                            raise ValueError(f"{name}: symmetric W8A8 checkpoint offset is not zero")
-                        continue
-                    if spec.role == "weight_scale":
-                        tensor = tensor.reshape(-1)
-                    prepared[name] = tensor_exporter(tensor.contiguous())
+                    tensor = prepare_contract_tensor(spec, handle.get_tensor(spec.name),
+                                                     verify_zero_offsets=verify_zero_offsets)
+                    if tensor is not None:
+                        prepared[spec.name] = tensor_exporter(tensor)
 
     expected_prepared = [spec.name for spec in contract.prepared_weight_specs]
     prepared = {name: prepared[name] for name in expected_prepared}
@@ -821,13 +865,8 @@ def write_fixture_checkpoint(
     contract: Qwen38TextContract,
     *,
     seed: int = 42,
-    tensors: dict[str, torch.Tensor] | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, str]]:
     """Write *contract*'s tensors as a checkpoint directory in the published layout.
-
-    Values are drawn at random unless *tensors* names a replacement, which is how an
-    operator entry feeds weights of its own to a kernel through this module's loader
-    rather than quantising them on the host.
 
     Two properties are deliberate, both of which the real checkpoint has: the tensors
     are split across two shards, so a layer is assembled from more than one file; and
@@ -836,16 +875,8 @@ def write_fixture_checkpoint(
     from safetensors.torch import save_file
 
     checkpoint_dir = Path(checkpoint_dir)
-    supplied = tensors or {}
     generator = torch.Generator().manual_seed(seed)
-    source: dict[str, torch.Tensor] = {}
-    for spec in contract.weight_specs:
-        value = supplied.get(spec.name)
-        if value is None:
-            source[spec.name] = _fixture_tensor(spec, generator)
-            continue
-        _validate_tensor(value, spec)
-        source[spec.name] = value
+    source = {spec.name: _fixture_tensor(spec, generator) for spec in contract.weight_specs}
 
     names = list(source)
     split = len(names) // 2

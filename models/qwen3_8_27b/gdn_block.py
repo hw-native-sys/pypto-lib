@@ -39,7 +39,7 @@ KCONV = QWEN3_8_27B.linear_conv_kernel_dim  # convolution taps
 # validation
 DEFAULT_TEST_SEQ_LEN = 512
 DEFAULT_CASES = (2048, 4096)
-# The one-layer checkpoint fixture `loader_block_weights` writes: everything the block
+# The one-layer contract `loader_block_weights` prepares against: everything the block
 # reads keeps the model's dimensions, and the two the text contract carries but the
 # block never reads shrink to their smallest legal widths.
 FIXTURE_VOCAB = 32
@@ -270,27 +270,30 @@ def _cache_pools(resume: bool):
 def loader_block_weights() -> dict:
     """The block's weights as the published checkpoint loader hands them over.
 
-    Writes the layer `load_weights` would have drawn as a checkpoint -- the two
-    projections carrying ModelSlim's own INT8 recipe, everything else
-    checkpoint-native -- then reads it back through `prepare_qwen38_weights`. What
-    the kernel then receives has been through the index, the shard headers, dtype
-    and shape validation, the symmetric zero-offset drop and the `[out, 1] -> [out]`
-    scale flattening, none of which a host-side check exercises against a kernel.
+    Draws the layer `load_weights` would have drawn, puts the two quantized
+    projections in ModelSlim's own INT8 recipe and leaves everything else
+    checkpoint-native, then runs it through the loader's own per-tensor preparation:
+    the contract's dtype and shape validation, the symmetric zero-offset drop and the
+    `[out, 1] -> [out]` scale flattening. What the kernel receives is what a real load
+    produces, and the golden beside it stays `reference.block` on CPU.
 
-    The fixture is one layer wide. `prepare_qwen38_weights` loads a whole text
-    contract, so the stack is cut to a single Gated DeltaNet layer and the vocabulary
-    and MLP to their smallest legal widths; every dimension the block reads stays the
-    model's own.
+    No checkpoint is written and the safetensors package is not needed: the file
+    format -- the index, the shard headers, the revision stamp -- is the host's to
+    cover, and `test_weights_contract.py` owns it. What is covered here instead is
+    the one thing a host check cannot reach, the prepared tensors arriving at a
+    kernel.
+
+    The contract is cut to one layer because it names the tensors: a single Gated
+    DeltaNet layer, with the vocabulary and MLP at their smallest legal widths. Every
+    dimension the block reads stays the model's own.
     """
     import dataclasses
-    import tempfile
 
     import torch
 
     import reference
     from contract import make_text_contract
-    from weights import (default_checkpoint_path, modelslim_quantize_rows,
-                         prepare_qwen38_weights, write_fixture_checkpoint)
+    from weights import modelslim_quantize_rows, prepare_memory_tensors
 
     config = dataclasses.replace(QWEN3_8_27B, name="Qwen3.8-27B-one-gdn-layer",
                                  num_hidden_layers=1, vocab_size=FIXTURE_VOCAB,
@@ -308,14 +311,8 @@ def loader_block_weights() -> dict:
         supplied[module + ".weight_scale"] = scale
         supplied[module + ".weight_offset"] = offset
 
-    parent = default_checkpoint_path().parent
-    parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="gdn_block_checkpoint_", dir=parent) as directory:
-        write_fixture_checkpoint(directory, contract, tensors=supplied)
-        # The exporter clones: safetensors hands back views of a file this scope deletes.
-        prepared = prepare_qwen38_weights(directory, lambda tensor: tensor.clone(), contract=contract)
-    layer = {name.removeprefix(prefix): tensor for name, tensor in prepared.tensors.items()
-             if name.startswith(prefix)}
+    prepared = prepare_memory_tensors(supplied, contract=contract)
+    layer = {name.removeprefix(prefix): tensor for name, tensor in prepared.items()}
 
     # The form the kernel takes, checked on what the loader returned rather than on the
     # specs: `reference.quantize_weights` flattens a scale on its way to the spec, so a
@@ -755,7 +752,7 @@ if __name__ == "__main__":
     parser.add_argument("--weights", type=str, default=None,
                         help="a real layer from weights.py; default: random weights")
     parser.add_argument("--checkpoint-weights", action="store_true", default=False,
-                        help="only the case whose INT8 projections come back through the "
+                        help="only the case whose INT8 projections are prepared by the "
                              "checkpoint loader, which a default run also includes")
     parser.add_argument("--resume", action="store_true", default=False)
     parser.add_argument("--packed", action="store_true", default=False)
