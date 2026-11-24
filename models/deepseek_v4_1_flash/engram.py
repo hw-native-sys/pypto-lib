@@ -10,10 +10,8 @@
 """V4.1 Engram projection and residual gating from host rows or local lookup tables."""
 
 import math
-from pathlib import Path
 
 import pypto.language as pl
-from pypto.runtime import pto_isa_include_dir
 import torch
 
 from config import FLASH as M, T_DYN
@@ -41,23 +39,6 @@ ENGRAM_QUANT_SCALE_ROW_BYTES = 32
 PROJECTION_N_TILE = 256
 PROJECTION_N_TILE_M80 = 512
 PROJECTION_K_TILE = 256
-
-
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels/engram.cpp",
-               include_dirs=(pto_isa_include_dir(),))
-def _engram_quantize(lookup: pl.Tensor, payload: pl.Out[pl.Tensor], scales: pl.Out[pl.Tensor],
-                      tokens: pl.Scalar[pl.INT32], padded: pl.Scalar[pl.INDEX],
-                      mode: pl.Scalar[pl.INDEX]) -> tuple[pl.Tensor, pl.Tensor]:
-    """Write FP8 activation payload and packed E8M0 scales."""
-    return payload, scales
-
-
-@pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels/engram.cpp",
-               include_dirs=(pto_isa_include_dir(),))
-def _engram_project(payload: pl.Tensor, weight: pl.Tensor, scales: pl.Tensor, weight_scale: pl.Tensor,
-                    kv: pl.Out[pl.Tensor], tokens: pl.Scalar[pl.INDEX], row_tile: pl.Scalar[pl.INDEX]) -> pl.Tensor:
-    """Project quantized rows into BF16 keys and values."""
-    return kv
 
 
 @pl.jit.inline(auto_scope=False)
@@ -163,20 +144,12 @@ def _engram_project_pypto(
     return kv
 
 
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels/engram.cpp",
-               include_dirs=(pto_isa_include_dir(),))
-def _engram_gate_native(kv: pl.Tensor, weight: pl.Tensor, x: pl.Tensor, out: pl.Out[pl.Tensor],
-                        tokens: pl.Scalar[pl.INDEX], mode: pl.Scalar[pl.INDEX]) -> pl.Tensor:
-    """Compute the normalized-dot gate and update the residual."""
-    return out
-
-
 @pl.jit.inline(auto_scope=False)
 def engram_gate(
     kv: pl.Tensor, weight: pl.Tensor, x: pl.Tensor, out: pl.Tensor,
     lookup: pl.Tensor, mask_zero_rows: pl.constexpr,
 ):
-    """Run native gating and preserve zero-lookup FP32 residual rows."""
+    """Run PyPTO gating and preserve zero-lookup FP32 residual rows."""
     tokens = pl.tensor.dim(x, 0)
     if mask_zero_rows:
         original = pl.create_tensor([tokens, HC_MULT * D], dtype=pl.FP32)
@@ -186,9 +159,18 @@ def engram_gate(
             for column in pl.range(0, HC_MULT * D, 512):
                 value = pl.load(hidden, [row, column], [1, 512])
                 pl.store(value, [row, column], original)
-        with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_gate", deps=[saved_ready]):
-            result = _engram_gate_native(kv, weight, x, out, tokens, 3)
-        output = pl.reshape(result, [tokens, HC_MULT * D])
+        if tokens >= 256:
+            hidden_pairs = pl.reshape(x, [tokens * (HC_MULT // 2), 2 * D])
+            output_pairs = pl.reshape(out, [tokens * (HC_MULT // 2), 2 * D])
+            weight_pairs = pl.reshape(weight, [HC_MULT // 2, 2 * D])
+            with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_gate_pairs", deps=[saved_ready]):
+                _engram_gate_pairs_reg(kv, weight_pairs, hidden_pairs, output_pairs, tokens)
+        else:
+            hidden_rows = pl.reshape(x, [tokens * HC_MULT, D])
+            output_rows = pl.reshape(out, [tokens * HC_MULT, D])
+            with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_gate", deps=[saved_ready]):
+                _engram_gate_reg(kv, weight, hidden_rows, output_rows, tokens)
+        output = pl.reshape(out, [tokens, HC_MULT * D])
         for block in pl.spmd((tokens + 7) // 8, name_hint="engram_restore_masked"):
             row = block * 8
             valid_rows = pl.min(8, tokens - row)
@@ -208,8 +190,7 @@ def engram_gate(
                 restored = pl.tile.select(active, pl.set_validshape(updated, 8, 512), pl.set_validshape(saved, 8, 512))
                 pl.store(pl.set_validshape(restored, valid_rows, 512), [row, column], output)
     else:
-        with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_gate"):
-            result = _engram_gate_native(kv, weight, x, out, tokens, 3)
+        _engram_gate_unmasked(kv, weight, x, out, tokens)
     return out
 
 
@@ -402,19 +383,13 @@ def _engram_quantize_pypto(
 def _engram_rows_tile(
     lookup: pl.Tensor, wkv: pl.Tensor, wkv_scale: pl.Tensor, weight: pl.Tensor,
     x: pl.Tensor, out: pl.Tensor, tokens: pl.Scalar[pl.INT32],
-    row_tile: pl.constexpr, mask_zero_rows: pl.constexpr, native_projection: pl.constexpr,
+    row_tile: pl.constexpr, mask_zero_rows: pl.constexpr,
 ):
     """Quantize and project host rows before gating the residual."""
     padded = ((tokens + row_tile - 1) // row_tile) * row_tile
     payload = pl.create_tensor([padded, ENGRAM_K], dtype=pl.FP8E4M3FN)
     kv = pl.create_tensor([tokens, KV_OUT], dtype=pl.BF16)
-    if native_projection:
-        scales = pl.create_tensor([1, padded * (ENGRAM_K // 32)], dtype=pl.FP8E8M0)
-        with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_quant"):
-            quantized, quantized_scales = _engram_quantize_pypto(lookup, payload, scales, tokens, padded, True)
-        with pl.spmd(pl.system.available_cluster_count(), name_hint="engram_projection"):
-            projected = _engram_project(quantized, wkv, quantized_scales, wkv_scale, kv, tokens, row_tile)
-    elif row_tile == 128:
+    if row_tile == 128:
         # The 81–128 token interval always fits in one static M128 scale view.
         scales = pl.create_tensor([1, padded * (ENGRAM_K // 32)], dtype=pl.FP8E8M0)
         with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_quant"):
@@ -439,16 +414,23 @@ def _engram_rows_tile(
             )
     if mask_zero_rows:
         return engram_gate(projected, weight, x, out, lookup, mask_zero_rows)
+    return _engram_gate_unmasked(projected, weight, x, out, tokens)
+
+
+@pl.jit.inline(auto_scope=False)
+def _engram_gate_unmasked(
+    kv: pl.Tensor, weight: pl.Tensor, x: pl.Tensor, out: pl.Tensor, tokens: pl.Scalar[pl.INDEX],
+):
     output_rows = pl.reshape(out, [pl.tensor.dim(out, 0) * HC_MULT, D])
     if tokens >= 256:
         hidden_pairs = pl.reshape(x, [pl.tensor.dim(x, 0) * (HC_MULT // 2), 2 * D])
         weight_pairs = pl.reshape(weight, [HC_MULT // 2, 2 * D])
         with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_gate_pairs"):
-            _engram_gate_pairs_reg(projected, weight_pairs, hidden_pairs, output_rows, tokens)
+            _engram_gate_pairs_reg(kv, weight_pairs, hidden_pairs, output_rows, tokens)
     else:
         hidden_rows = pl.reshape(x, [pl.tensor.dim(x, 0) * HC_MULT, D])
         with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_gate"):
-            _engram_gate_reg(projected, weight, hidden_rows, output_rows, tokens)
+            _engram_gate_reg(kv, weight, hidden_rows, output_rows, tokens)
     return out
 
 
@@ -461,22 +443,21 @@ def _engram_from_rows(
     x: pl.Tensor,
     out: pl.Tensor,
     mask_zero_rows: pl.constexpr,
-    native_projection: pl.constexpr,
 ):
     """Project host-gathered ND rows and gate the FP32 residual in place or out of place."""
     tokens = pl.tensor.dim(x, 0)
     if tokens > 0:
         if tokens <= 80:
             result = _engram_rows_tile(
-                lookup, wkv_weight, wkv_scale, weight, x, out, tokens, 80, mask_zero_rows, native_projection,
+                lookup, wkv_weight, wkv_scale, weight, x, out, tokens, 80, mask_zero_rows,
             )
         elif tokens <= 128:
             result = _engram_rows_tile(
-                lookup, wkv_weight, wkv_scale, weight, x, out, tokens, 128, mask_zero_rows, native_projection,
+                lookup, wkv_weight, wkv_scale, weight, x, out, tokens, 128, mask_zero_rows,
             )
         else:
             result = _engram_rows_tile(
-                lookup, wkv_weight, wkv_scale, weight, x, out, tokens, 256, mask_zero_rows, native_projection,
+                lookup, wkv_weight, wkv_scale, weight, x, out, tokens, 256, mask_zero_rows,
             )
     else:
         result = out
@@ -494,7 +475,7 @@ def engram_from_rows(
     mask_zero_rows: pl.constexpr = False,
 ):
     """Project host-gathered rows and gate the FP32 residual."""
-    return _engram_from_rows(lookup, wkv_weight, wkv_scale, weight, x, out, mask_zero_rows, False)
+    return _engram_from_rows(lookup, wkv_weight, wkv_scale, weight, x, out, mask_zero_rows)
 
 
 class HostEngram:
@@ -696,21 +677,6 @@ def l2_engram_rows(
     lookup.bind_dynamic(0, T_DYN)
     x.bind_dynamic(0, T_DYN)
     engram_from_rows(lookup, wkv_weight, wkv_scale, weight, x, x, False)
-    return x
-
-
-@pl.jit
-def l2_engram_rows_cpp(
-    lookup: pl.Tensor[[T_DYN, ENGRAM_K], pl.BF16],
-    wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[ENGRAM_K // 32, KV_OUT], pl.FP8E8M0],
-    weight: pl.Tensor[[HC_MULT, D], pl.FP32],
-    x: pl.InOut[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
-):
-    """Validate the C++ projection reference with the shared quantization and gating."""
-    lookup.bind_dynamic(0, T_DYN)
-    x.bind_dynamic(0, T_DYN)
-    _engram_from_rows(lookup, wkv_weight, wkv_scale, weight, x, x, False, True)
     return x
 
 
@@ -992,8 +958,6 @@ if __name__ == "__main__":
         help="comma-separated device ids; provide one device id",
     )
     parser.add_argument("--masked-gate", action="store_true")
-    parser.add_argument("--implementation", choices=["cpp", "pypto"], default="pypto",
-                        help="Select the projection implementation")
     parser.add_argument("--tokens", type=int, help="explicit row count; default checks tile boundaries and tails")
     parser.add_argument("--runtime-dir", help="reuse a CPU-prebuilt runtime; requires --tokens")
     parser.add_argument("--golden-data", help="reuse frozen input/reference tensors; requires --tokens")
@@ -1010,21 +974,13 @@ if __name__ == "__main__":
         parser.error("--tokens must be positive")
     if (args.runtime_dir or args.golden_data or args.save_data) and args.tokens is None:
         parser.error("replay/capture options require an explicit --tokens case")
-    if args.runtime_dir:
-        from pypto.runtime._artifact_sources import read_kernel_config
-
-        kernels = read_kernel_config(Path(args.runtime_dir) / "kernel_config.py").KERNELS
-        native_runtime = any(kernel.get("external", False) for kernel in kernels)
-        if native_runtime != (args.implementation == "cpp"):
-            parser.error("--runtime-dir implementation does not match --implementation")
-    entry = l2_engram_rows_cpp if args.implementation == "cpp" else l2_engram_rows
     token_cases = [17, 81, 129, 256] if args.execution_mode else [17, 80, 81, 128, 129, 256, 257]
     if args.tokens is not None:
         token_cases = [args.tokens]
     for tokens in ([] if args.masked_gate else token_cases):
         specs = build_engram_rows_specs(tokens)
         result = run(
-            fn=entry,
+            fn=l2_engram_rows,
             specs=specs,
             golden_fn=golden_engram_rows_case,
             config={
