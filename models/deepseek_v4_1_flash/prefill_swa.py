@@ -109,7 +109,6 @@ def prefill_swa(
             kv_token_count,
         )
         active = kv_token_count
-        no_dependency = pl.system.task_invalid()
         padded_query_rows = (active + 255) // 256 * 256
         active_rope_cos = pl.slice(kv_rope_cos, [active, ROPE_DIM // 2], [0, 0])
         active_rope_sin = pl.slice(kv_rope_sin, [active, ROPE_DIM // 2], [0, 0])
@@ -124,7 +123,7 @@ def prefill_swa(
             wq_b, wq_b_scale,
             active_rope_cos, active_rope_sin,
             q_latent, q,
-            active, previous_chunk=no_dependency, qa_worker_limit=24, qb_worker_limit=32,
+            active, qa_worker_limit=24, qb_worker_limit=32,
             padded_rows=padded_query_rows,
             qa_row_tile=256, qb_row_tile=128,
         )
@@ -384,7 +383,7 @@ def prefill_swa_cp(
                 wq_b, wq_b_scale,
                 chunk_rope_cos, chunk_rope_sin,
                 q_latent, q,
-                active, previous_chunk=chunk_done, qa_worker_limit=24, qb_worker_limit=32,
+                active, qa_worker_limit=24, qb_worker_limit=32,
                 padded_rows=q_input_payload_padded_rows,
                 qa_row_tile=256, qb_row_tile=128,
             )

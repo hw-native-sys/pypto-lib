@@ -53,6 +53,7 @@ O_OUT_SCALE_COLS = pl.dynamic("O_OUT_SCALE_COLS")
 
 # tiling
 O_A_N_TILE = 256
+O_A_RECEIVER_READY = 14
 O_B_N_TILE = 160
 O_B_DECODE_N_TILE = 160
 O_B_NATIVE_N_TILE = 256
@@ -626,6 +627,9 @@ def _o_proj_a_mixed(
     w: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN, pl.NZ] = weight[:, :, :]
     workers = output_width // O_A_N_TILE
     for worker in pl.spmd(workers, name_hint="proj_o_a_quant", optimizations=[pl.cross_core_slot(slot_num=1)]):
+        # Each Vector lane grants its initial UB slot when it owns the worker.
+        if padded_rows >= row_tile:
+            pl.system.set_intra_block(O_A_RECEIVER_READY, pipe=pl.PipeType.V, core_type=pl.KernelType.AIV)
         for cube_mt in pl.range(padded_rows // row_tile):
             cube_row = cube_mt * row_tile
             cube_group = worker // 4
@@ -739,6 +743,9 @@ def _o_proj_a_mixed(
             # Publish the completed accumulator to the two quantization lanes.
             pl.system.set_flag(pl.PipeType.M, pl.PipeType.FIX, 0, core_type=pl.KernelType.AIC)
             pl.system.wait_flag(pl.PipeType.M, pl.PipeType.FIX, 0, core_type=pl.KernelType.AIC)
+            if cube_mt == 0:
+                pl.system.wait_intra_block(O_A_RECEIVER_READY, pipe=pl.PipeType.FIX, core_type=pl.KernelType.AIC)
+                pl.system.wait_intra_block(O_A_RECEIVER_READY + 16, pipe=pl.PipeType.FIX, core_type=pl.KernelType.AIC)
             for lane in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
                 row = cube_row
                 group = cube_group

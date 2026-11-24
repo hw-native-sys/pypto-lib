@@ -925,7 +925,6 @@ def q_proj_rope(
     query: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     padded_rows: pl.Scalar[pl.INDEX],
-    previous_chunk: pl.Scalar[pl.TASK_ID],
     qa_worker_limit: pl.constexpr = 32,
     qb_worker_limit: pl.constexpr = 32,
     qa_row_tile: pl.constexpr = 80,
@@ -969,7 +968,7 @@ def q_proj_rope(
     qb_scale_stream = pl.reshape(qb_scales, [pl.tensor.dim(qb_scales, 1)])
     qb_tasks = ((num_tokens + qb_tile - 1) // qb_tile) * (LOCAL_H * HEAD_DIM // Q_B_N_TILE)
     qb_workers = pl.max(pl.min(qb_tasks, pl.min(qb_worker_limit, pl.system.available_cluster_count())), 1)
-    with pl.spmd(qb_workers, name_hint="proj_q_b", deps=[previous_chunk]) as projected_q:
+    with pl.spmd(qb_workers, name_hint="proj_q_b"):
         query = _proj_q_b(
             qb_payload, wq_b, qb_scale_stream, wq_b_scale,
             query, rope_cos, rope_sin, num_tokens, LOCAL_H * HEAD_DIM, 0, qb_tile,
@@ -2145,11 +2144,10 @@ def qkv_cpp(
     num_tokens: pl.Scalar[pl.INT32],
     padded_rows: pl.Scalar[pl.INDEX],
 ):
-    previous_chunk = pl.system.task_invalid()
     q_proj_rope(
         payload, scales, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
         rope_cos, rope_sin, query_latent, query, num_tokens, padded_rows,
-        previous_chunk=previous_chunk, qa_worker_limit=NATIVE_VALIDATION_WORKERS, qb_worker_limit=NATIVE_VALIDATION_WORKERS,
+        qa_worker_limit=NATIVE_VALIDATION_WORKERS, qb_worker_limit=NATIVE_VALIDATION_WORKERS,
         qa_row_tile=80, qb_row_tile=80,
     )
     kv_proj(
