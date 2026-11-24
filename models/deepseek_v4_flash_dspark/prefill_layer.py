@@ -1018,6 +1018,16 @@ def golden_prefill_layer(tensors):
             tensors["x_next"][rank].copy_(full_next)
 
 
+def compare_ffn_out(actual, expected, **kwargs):
+    """Check the whole output and separately check rows using a recycled MoE slot."""
+    compare = ratio_reldiff(diff_thd=0.01, pct_thd=0.05)
+    valid, detail = compare(actual, expected, **kwargs)
+    last_wave_start = 2 * PREFILL_MOE_T_TILE
+    if valid and actual.shape[1] > last_wave_start:
+        return compare(actual[:, last_wave_start:], expected[:, last_wave_start:], **kwargs)
+    return valid, detail
+
+
 def _compare_functions(layer_id):
     attention_diff_thd = 3e-3 if layer_id == 0 else 5e-3
     compare = {
@@ -1025,7 +1035,7 @@ def _compare_functions(layer_id):
         "x_mixed": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
         "post_ffn": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
         "comb_ffn": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
-        "ffn_out": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
+        "ffn_out": compare_ffn_out,
         "x_next": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
         "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
     }
@@ -1091,7 +1101,7 @@ def main():
         args.token_count is None and TP_SIZE == 2 and args.start_pos == 0
         and not (args.runtime_dir or args.save_data or args.golden_data)
     ):
-        token_counts.append(TP_SIZE * (PREFILL_MOE_T_TILE + 1))
+        token_counts.append(TP_SIZE * (2 * PREFILL_MOE_T_TILE + 1))
     if any(not 1 <= count <= PREFILL_GROUP_CAP for count in token_counts):
         parser.error(f"--token-count must be in [1, {PREFILL_GROUP_CAP}]")
 
