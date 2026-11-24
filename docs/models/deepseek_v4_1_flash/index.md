@@ -30,7 +30,7 @@ operator define its executable storage and layout contracts.
 | Hyper-connections | 4 streams; persistent hidden state is FP32 |
 | Context ceiling | 1,048,576 positions, with 128-token cache pages |
 | Engram | Layers 1 and 14; forward consumes host-gathered embedding rows |
-| DSpark | 5 speculative tokens plus one verification row per request. The per-rank request capacity is 12 (default), 32, or 64. |
+| DSpark | 5 speculative tokens plus one verification row per request. The per-rank decode capacity is 12 requests, or 72 local verification rows. |
 
 Quantized projection paths use MXFP8 weights and activations; routed expert
 weights use packed MXFP4. Scale tensors use the owning operator's MX layout.
@@ -128,23 +128,14 @@ shards, and return results to the row owners.
 | Speculative decoding | [`decode_fwd_dspark.py`](../../../models/deepseek_v4_1_flash/decode_fwd_dspark.py), `dspark_drafter.py`, `dspark_init.py`, `decode_metadata.py`, `dspark_attn.py`, and `markov.py` |
 | Shared operators | `hc.py`, `qkv_proj_rope.py`, `compressor.py`, `sparse_attention.py`, `o_proj.py`, `engram.py`, `lm_head.py`, and `sample.py` |
 
-The standalone decode MoE entry and the direct DSpark decode entry pack
-eligible routed FP4 weights once before resident upload. Target and draft
-select their layouts independently. Capacities up to 80 rows use packed
-weights. At capacities 192 and 384, packing is enabled when
-`capacity * topk <= 96 * local_experts`. Other capacities use the ordinary
-layout. Logical checkpoint weights retain their existing shape and dtype. For DSpark, `--no-packed-routed-weights` selects the
-ordinary layout when compiling a new artifact. Replaying `--runtime-dir`
-uses the compiled argument shapes to select the matching upload layout.
-The imported forward modules keep the ordinary layout by default.
+The standalone decode MoE and direct DSpark entries can pack routed FP4
+weights before resident upload. For DSpark, use
+`--no-packed-routed-weights` to compile with the ordinary layout.
+`--runtime-dir` replays the weight layout recorded in the compiled artifact.
 
-The direct DSpark entry accepts `--decode-batch {12,32,64}`. It reserves
-six target rows and five draft rows per request. Set `--active-requests`
-to run between one request (the default) and the compiled capacity per
-rank. When replaying a compiled artifact, pass the same `--decode-batch`
-and expert counts used at compile time. For example,
-`--decode-batch 32 --active-requests 32` runs 192 target and 160 draft
-rows per rank.
+Set `--active-requests` to populate between one request (the default) and
+the configured per-rank capacity in the DSpark fixture. Each request uses
+six target rows and five draft rows.
 
 The six standalone decode attention entries accept explicit request starts and
 query lengths through `--start-pos` and `--query-lens`. Both lists have one
