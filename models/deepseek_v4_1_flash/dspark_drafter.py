@@ -27,14 +27,12 @@ from config import (
     DSPARK_NOISE_TOKEN_ID, DSPARK_QUERY_WIDTH, DSPARK_SWA_INDEX_WIDTH,
 )
 from rmsnorm import rms_norm
+from mega_moe import FP4_PANEL_ROWS, forward_routed_weight_spec, use_packed_decode_weights, workspace_bytes
 from expert_routed import (
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS,
 )
 from input_pack import pack_x_hc
-from decode_moe import (
-    BALANCED_ROUTING, DISPATCH_PACKET_WIDTH, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD,
-    clear_moe_signals, initialize_balanced_routes, moe,
-)
+from decode_moe import BALANCED_ROUTING, initialize_balanced_routes, make_decode_moe
 
 from dspark_attn import dspark_attn, dspark_context_kv
 from qkv_proj_rope import qkv_quant
@@ -46,6 +44,8 @@ DSPARK_QUERY_T_DYN = pl.dynamic("DSPARK_QUERY_T_DYN")
 
 _shape_parser = argparse.ArgumentParser(add_help=False)
 _shape_parser.add_argument("--draft-experts-per-rank", type=int, default=DSPARK_N_ROUTED_EXPERTS // EP_SIZE)
+_shape_parser.add_argument("--packed-routed-weights", action=argparse.BooleanOptionalAction, default=False)
+_shape_parser.add_argument("--runtime-dir", default=None)
 _shape_options = _shape_parser.parse_known_args()[0]
 if _shape_options.draft_experts_per_rank <= 0 or EP_SIZE * _shape_options.draft_experts_per_rank < DSPARK_NUM_EXPERTS_PER_TOK:
     _shape_parser.error("--draft-experts-per-rank must give at least draft TopK routed experts")
@@ -81,6 +81,18 @@ PROJ_N_TILE = 160
 PROJ_K_TILE = 384
 QUANT_M_TILE = 16
 QUANT_K_TILE = 1280
+
+
+MOE_WORKSPACE_BYTES = workspace_bytes(EP_SIZE, N_LOCAL_EXPERTS, MOE_TOKENS, TOPK, D, MOE_INTER)
+PACK_ROUTED_WEIGHTS = use_packed_decode_weights(MOE_TOKENS, N_LOCAL_EXPERTS, TOPK) and (
+    _shape_options.packed_routed_weights or _shape_options.runtime_dir is not None
+)
+PANEL_ROWS = FP4_PANEL_ROWS if PACK_ROUTED_WEIGHTS else 1
+WEIGHT_PANEL_BYTES = PANEL_ROWS * MX_PACKED_LANE_COLS
+W1_DEVICE_ROWS = MX_W1_PACKED_ROWS // PANEL_ROWS
+W2_DEVICE_ROWS = MX_W2_PACKED_ROWS // PANEL_ROWS
+W3_DEVICE_ROWS = MX_W3_PACKED_ROWS // PANEL_ROWS
+draft_moe = make_decode_moe(N_LOCAL_EXPERTS, TOPK, packed_routed_weights=PACK_ROUTED_WEIGHTS)
 
 
 @pl.jit.extern(
@@ -321,11 +333,11 @@ def dspark_drafter(
     ffn_norm_weight: pl.Tensor[[DSPARK_DRAFT_LAYERS, D], pl.BF16],
     gate_weight: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_EXPERTS], pl.FP32],
-    routed_w1: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w1: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS, W1_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     routed_w1_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
-    routed_w2: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w2: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS, W2_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     routed_w2_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
-    routed_w3: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w3: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS, W3_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     routed_w3_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
     shared_w1: pl.Tensor[[DSPARK_DRAFT_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
@@ -335,14 +347,8 @@ def dspark_drafter(
     shared_w3_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
     draft_x_hc: pl.Out[pl.Tensor[[MOE_TOKENS, HC_MULT, D], pl.FP32]],
     draft_pre_mix: pl.Out[pl.Tensor[[MOE_TOKENS, HC_MULT], pl.FP32]],
-    recv_meta: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], pl.INT8],
-    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    data_arrived: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
-    routed_output: pld.DistributedTensor,
-    combine_arrived: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
+    moe_workspace: pld.DistributedTensor,
     rank: pl.Scalar[pl.INT32],
-    moe_epoch: pl.Scalar[pl.INT32],
 ):
     """Compose three draft layers and publish their final HC state and coefficients."""
     target_hidden.bind_dynamic(0, T_DYN)
@@ -395,8 +401,6 @@ def dspark_drafter(
     force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
     if BALANCED_ROUTING:
         initialize_balanced_routes(force_topk, query_tokens, rank, N_LOCAL_EXPERTS, TOPK)
-    recv_x_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.FP8E4M3FN)
-    recv_x_last_use = pl.array.create(1, pl.TASK_ID)
     for layer in pl.range(DSPARK_DRAFT_LAYERS):
         layer_wq_a_scale: pl.Tensor[[D // MX_GROUP, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[layer]
         layer_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wq_b_scale[layer]
@@ -422,7 +426,7 @@ def dspark_drafter(
             query_tokens,
         )
 
-        moe(
+        draft_moe(
             attention_hidden, attention_pre_mix,
             hc_ffn_fn[layer], hc_ffn_scale[layer], hc_ffn_base[layer],
             ffn_norm_weight[layer],
@@ -434,11 +438,7 @@ def dspark_drafter(
             shared_w2[layer], layer_shared_w2_scale,
             shared_w3[layer], layer_shared_w3_scale,
             pre_mix, x_mixed, x_hc,
-            recv_meta, recv_x, recv_routes,
-            data_arrived, routed_output, combine_arrived,
-            query_tokens, rank, moe_epoch + layer,
-            force_topk, recv_x_local, recv_x_last_use,
-            local_experts=N_LOCAL_EXPERTS, topk=TOPK, dispatch_worker_limit=64,
+            moe_workspace, query_tokens, force_topk,
         )
 
 
@@ -484,11 +484,11 @@ def l2_dspark_drafter(
     ffn_norm_weight: pl.Tensor[[DSPARK_DRAFT_LAYERS, D], pl.BF16],
     gate_weight: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_EXPERTS], pl.FP32],
-    routed_w1: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w1: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS, W1_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     routed_w1_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
-    routed_w2: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w2: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS, W2_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     routed_w2_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
-    routed_w3: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w3: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS, W3_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     routed_w3_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
     shared_w1: pl.Tensor[[DSPARK_DRAFT_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
@@ -498,14 +498,8 @@ def l2_dspark_drafter(
     shared_w3_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
     draft_x_hc: pl.Out[pl.Tensor[[MOE_TOKENS, HC_MULT, D], pl.FP32]],
     draft_pre_mix: pl.Out[pl.Tensor[[MOE_TOKENS, HC_MULT], pl.FP32]],
-    recv_meta: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], pl.INT8],
-    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    data_arrived: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
-    routed_output: pld.DistributedTensor,
-    combine_arrived: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
+    moe_workspace: pld.DistributedTensor,
     rank: pl.Scalar[pl.INT32],
-    moe_epoch: pl.Scalar[pl.INT32],
 ):
     dspark_drafter(
         target_hidden, main_proj_weight, main_proj_scale, main_norm_weight,
@@ -535,11 +529,8 @@ def l2_dspark_drafter(
         shared_w2, shared_w2_scale,
         shared_w3, shared_w3_scale,
         draft_x_hc, draft_pre_mix,
-        recv_meta, recv_x, recv_routes,
-        data_arrived, routed_output, combine_arrived,
-        rank, moe_epoch,
+        moe_workspace, rank,
     )
-    clear_moe_signals(draft_x_hc, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
 
 
 @pl.jit.host
@@ -584,11 +575,11 @@ def l3_dspark_drafter(
     ffn_norm_weight: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, D], pl.BF16],
     gate_weight: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, N_EXPERTS], pl.FP32],
-    routed_w1: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w1: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS, W1_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     routed_w1_scale: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
-    routed_w2: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w2: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS, W2_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     routed_w2_scale: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
-    routed_w3: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w3: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS, W3_DEVICE_ROWS, WEIGHT_PANEL_BYTES], pl.UINT8],
     routed_w3_scale: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
     shared_w1: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
@@ -615,19 +606,9 @@ def l3_dspark_drafter(
     block_tables.bind_dynamic(3, TABLE_DYN)
     window_cache.bind_dynamic(2, C.ORI_BLOCKS_DYN)
 
-    recv_meta_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-    recv_x_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], dtype=pl.INT8)
-    recv_routes_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
-    routed_output_buf = pld.alloc_window_buffer([MOE_TOKENS * TOPK, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
+    moe_workspace_buf = pld.alloc_window_buffer([MOE_WORKSPACE_BYTES], dtype=pl.UINT8)
     for rank in pl.range(pld.world_size()):
-        recv_meta = pld.window(recv_meta_buf, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-        recv_x = pld.window(recv_x_buf, [N_LOCAL_EXPERTS * RECV_MAX, DISPATCH_PACKET_WIDTH], dtype=pl.INT8)
-        recv_routes = pld.window(recv_routes_buf, [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-        data_arrived = pld.window(data_arrived_buf, [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
-        routed_output = pld.window(routed_output_buf, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
-        combine_arrived = pld.window(combine_arrived_buf, [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
+        moe_workspace = pld.window(moe_workspace_buf, [MOE_WORKSPACE_BYTES], dtype=pl.UINT8)
         l2_dspark_drafter(
             target_hidden[rank], main_proj_weight[rank], main_proj_scale[rank], main_norm_weight[rank],
             num_sampled[rank], last_sampled[rank], next_prefill_tokens[rank],
@@ -656,16 +637,14 @@ def l3_dspark_drafter(
             shared_w2[rank], shared_w2_scale[rank],
             shared_w3[rank], shared_w3_scale[rank],
             draft_x_hc[rank], draft_pre_mix[rank],
-            recv_meta, recv_x, recv_routes,
-            data_arrived, routed_output, combine_arrived,
-            rank, moe_epoch,
+            moe_workspace, rank,
             device=rank,
         )
 
 
 def build_drafter_specs():
     """One request on every DP rank, with nonzero embeddings and two context writes."""
-    from golden import ScalarSpec, TensorSpec
+    from golden import ScalarSpec
 
     dynamic_sizes = {
         "DSPARK_CONTEXT_T_DYN": 6,
@@ -713,7 +692,7 @@ def build_drafter_specs():
             shape = [size if isinstance(size, int) else dynamic_sizes[size.name] for size in annotation.shape]
             dtype = dtypes[str(annotation.dtype)]
             init = initial_value(parameter.name, shape, dtype)
-            specs.append(TensorSpec(parameter.name, shape, dtype, init_value=init))
+            specs.append(forward_routed_weight_spec(parameter.name, shape, dtype, init, PACK_ROUTED_WEIGHTS))
         else:
             specs.append(ScalarSpec(parameter.name, torch.int32, 1, compile_runtime=True))
     return specs
@@ -728,6 +707,8 @@ if __name__ == "__main__":
     parser.add_argument("--draft-experts-per-rank", type=int, default=N_LOCAL_EXPERTS)
     parser.add_argument("-p", "--platform", choices=("a5",), default="a5")
     parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(EP_SIZE)))
+    parser.add_argument("--packed-routed-weights", action=argparse.BooleanOptionalAction, default=False, help="pack resident routed FP4 weights before upload")
+    parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
     devices = [int(device) for device in args.device.split(",")]
@@ -735,6 +716,7 @@ if __name__ == "__main__":
         parser.error(f"drafter needs {EP_SIZE} devices")
 
     result = run(
+        a5_default_runtime="host_build_graph",
         fn=l3_dspark_drafter,
         specs=build_drafter_specs(),
         golden_fn=None,
@@ -745,6 +727,7 @@ if __name__ == "__main__":
             "ring_heap": (2 * 1024**3, 2 * 1024**3, 1024**3, 512 * 1024**2),
         },
         compile_only=args.compile_only,
+        runtime_dir=args.runtime_dir,
     )
     print(result)
     if not result.passed:

@@ -62,20 +62,30 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
     int64_t compactBase = 0;
     int64_t activationBase = 0;
     int64_t workBase = 0;
+    int64_t previousRowTile = 0;
     for (int64_t expert = 0; expert < experts; ++expert) {
         const int64_t count = acquireCount(counts, expert);
-        const int64_t workCount = ((count + M_TILE - 1) / M_TILE) * nTiles;
+        const int64_t rowTile = selectRowTile(count);
+        if (count > 0) {
+            // Drain both lanes before changing the shared L1 partition.
+            if (previousRowTile != 0 && rowTile != previousRowTile) {
+                endGemm();
+                beginGemm();
+            }
+            previousRowTile = rowTile;
+        }
+        const int64_t workCount = ((count + rowTile - 1) / rowTile) * nTiles;
         const int64_t first = (block + blocks - workBase % blocks) % blocks;
         for (int64_t work = first; work < workCount; work += blocks) {
-            const int64_t row = work / nTiles * M_TILE;
+            const int64_t row = work / nTiles * rowTile;
             const int64_t col = work % nTiles * N_TILE;
-            const int64_t valid = count - row < M_TILE ? count - row : M_TILE;
+            const int64_t valid = count - row < rowTile ? count - row : rowTile;
 #ifdef __DAV_VEC__
-            produceWeight(weight, hidden, width, expert, col);
+            dispatchWeight(rowTile, weight, hidden, width, expert, col);
 #endif
 #ifdef __DAV_CUBE__
             const Chunk chunk{expert, activationBase + row, valid};
-            computeProjection<M_TILE>(x, xScale, weightScale, hidden, width, experts,
+            dispatchProjection(rowTile, x, xScale, weightScale, hidden, width, experts,
                                       activationRows, chunk, col,
                                       StoreOutput{out, width, outputRows, compactBase + row, col});
 #endif

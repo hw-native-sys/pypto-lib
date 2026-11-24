@@ -30,7 +30,7 @@ operator define its executable storage and layout contracts.
 | Hyper-connections | 4 streams; persistent hidden state is FP32 |
 | Context ceiling | 1,048,576 positions, with 128-token cache pages |
 | Engram | Layers 1 and 14; forward consumes host-gathered embedding rows |
-| DSpark | 5 speculative tokens plus one verification row per request; default per-rank decode batch 12, or 72 local rows |
+| DSpark | 5 speculative tokens plus one verification row per request. The per-rank decode capacity is 12 requests, or 72 local verification rows. |
 
 Quantized projection paths use MXFP8 weights and activations; routed expert
 weights use packed MXFP4. Scale tensors use the owning operator's MX layout.
@@ -128,14 +128,22 @@ shards, and return results to the row owners.
 | Speculative decoding | [`decode_fwd_dspark.py`](../../../models/deepseek_v4_1_flash/decode_fwd_dspark.py), `dspark_drafter.py`, `dspark_init.py`, `decode_metadata.py`, `dspark_attn.py`, and `markov.py` |
 | Shared operators | `hc.py`, `qkv_proj_rope.py`, `compressor.py`, `sparse_attention.py`, `o_proj.py`, `engram.py`, `lm_head.py`, and `sample.py` |
 
+The standalone decode MoE and direct DSpark entries can pack routed FP4
+weights before resident upload. For DSpark, use
+`--no-packed-routed-weights` to compile with the ordinary layout.
+`--runtime-dir` replays the weight layout recorded in the compiled artifact.
+
+Set `--active-requests` to populate between one request (the default) and
+the configured per-rank capacity in the DSpark fixture. Each request uses
+six target rows and five draft rows.
+
 The six standalone decode attention entries accept explicit request starts and
 query lengths through `--start-pos` and `--query-lens`. Both lists have one
 comma-separated value per request. Their lengths and sum determine the request
 and token counts; the default batch of 12 and 72-token workload are not limits
 for these standalone entries. For example, batch 64 with four query tokens per
 request uses 64 starting positions and 64 query lengths of `4` (256 tokens).
-Query blocks must remain within the model position range. This does not change
-the forward or DSpark serving capacities.
+Query blocks must remain within the model position range.
 
 For prefill attention, `--tokens` is capacity per DP group, before CP partitioning.
 `--query-lens '65,31;96'` describes two requests in DP0 and one in DP1;

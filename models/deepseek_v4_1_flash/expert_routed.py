@@ -27,6 +27,8 @@ if __name__ == "__main__":
     parser.add_argument("--ep", type=int, choices=[2, 4, 8], default=2)
     parser.add_argument("--experts-per-rank", type=int, default=4)
     parser.add_argument("--case", choices=["all", "bounds", "tails", "zero", "full", "balanced"], default="all")
+    parser.add_argument("--num-tokens", type=int, default=None, help="token capacity for validation; defaults to model config")
+    parser.add_argument("--tail-round", type=int, default=None, help="run only this zero-based round of --case tails")
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
@@ -34,10 +36,14 @@ if __name__ == "__main__":
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     args = parser.parse_args()
+    if args.tail_round is not None and args.case != "tails":
+        parser.error("--tail-round requires --case tails")
     from dataclasses import replace
 
     import config
 
+    if args.num_tokens is not None:
+        config.set_moe_tokens((args.num_tokens + 15) // 16 * 16)
     test_experts = args.ep * args.experts_per_rank
     if args.experts_per_rank <= 0 or not config.FLASH.num_experts_per_tok <= test_experts <= 384:
         parser.error("--experts-per-rank must give between TopK and 384 total routed experts")
@@ -1118,6 +1124,9 @@ def _expert_routed_output(
     width: pl.constexpr,
     hidden: pl.constexpr,
     row_capacity: pl.constexpr,
+    w13_workers: pl.Scalar[pl.INT32],
+    w2_workers: pl.Scalar[pl.INT32],
+    swiglu_workers: pl.Scalar[pl.INT32],
 ):
     """Run BF16 W13, FP32 weighted MXFP8 activation, and full-K BF16 W2.
 
@@ -1128,7 +1137,7 @@ def _expert_routed_output(
     activation_rows = ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE
     pair = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, 2 * hidden], dtype=pl.BF16)
     compact_weights = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, 1], dtype=pl.FP32)
-    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w13"):
+    with pl.spmd(w13_workers, name_hint="routed_w13"):
         pair, compact_weights = _routed_w13(
             x, x_scale, counts, w1, w1_scale, w3, w3_scale, pair,
             weights, compact_weights, experts, stride, width, hidden, activation_rows, row_capacity,
@@ -1136,14 +1145,14 @@ def _expert_routed_output(
 
     payload = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, hidden], dtype=pl.FP8E4M3FN)
     scales = pl.create_tensor([1, ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE * (hidden // MX_GROUP)], dtype=pl.FP8E8M0)
-    with pl.spmd(ROUTED_VECTOR_WORKER_TILE, name_hint="routed_swiglu_quant"):
+    with pl.spmd(swiglu_workers, name_hint="routed_swiglu_quant"):
         payload, scales = _routed_swiglu_quant(
             pair, compact_weights, counts, payload, scales, experts, stride, hidden, row_capacity,
         )
 
     output_rows = ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE
     output = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, width], dtype=pl.BF16)
-    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w2"):
+    with pl.spmd(w2_workers, name_hint="routed_w2"):
         output = _routed_w2(
             payload, scales, counts, w2, w2_scale, output,
             experts, stride, width, hidden, output_rows, activation_rows, row_capacity,
@@ -1166,8 +1175,11 @@ def expert_routed_scatter(
     recv_route: pl.Tensor,
     recv_meta: pl.Tensor,
     routed_output: pld.DistributedTensor,
-    local_experts: pl.constexpr = N_LOCAL_EXPERTS,
-    topk: pl.constexpr = M.num_experts_per_tok,
+    local_experts: pl.constexpr,
+    topk: pl.constexpr,
+    w13_workers: pl.Scalar[pl.INT32],
+    w2_workers: pl.Scalar[pl.INT32],
+    swiglu_workers: pl.Scalar[pl.INT32],
 ):
     """Compute active expert rows and scatter each source interval to its route destinations."""
     recv_x_flat = pl.reshape(recv_x, [local_experts * RECV_MAX, D])
@@ -1178,6 +1190,7 @@ def expert_routed_scatter(
         routed_w2_packed, routed_w2_scale,
         local_experts, RECV_MAX, D, MOE_INTER,
         (local_experts if local_experts < topk else topk) * RECV_MAX,
+        w13_workers, w2_workers, swiglu_workers,
     )
     flat_counts = pl.reshape(recv_expert_count, [1, local_experts])
     metadata_cols = ((local_experts + 7) // 8) * 8
@@ -1251,6 +1264,7 @@ def local_compute_test(
         routed_w1_packed, routed_w1_scale, routed_w3_packed, routed_w3_scale,
         routed_w2_packed, routed_w2_scale,
         N_LOCAL_EXPERTS, RECV_MAX, D, MOE_INTER, N_LOCAL_EXPERTS * RECV_MAX,
+        ROUTED_CUBE_WORKER_TILE, ROUTED_CUBE_WORKER_TILE, ROUTED_VECTOR_WORKER_TILE,
     )
     with pl.spmd(64, name_hint="ffn_copy"):
         core = pl.tile.get_block_idx()
@@ -1284,17 +1298,18 @@ def golden_expert_routed(tensors):
     from gemm import golden_gemm_mxfp8_to_fp32_dequantized as matmul_mx_golden
 
     recv_x = tensors["recv_x"]
-    recv_scale_codes = tensors["recv_mx_scale"].reshape(N_LOCAL_EXPERTS * RECV_MAX, K_SCALE)
+    local_experts, recv_max, _ = recv_x.shape
+    recv_scale_codes = tensors["recv_mx_scale"].reshape(local_experts * recv_max, K_SCALE)
     recv_scale_decoded = decode_e8m0_codes(recv_scale_codes, side="a")
-    recv_mx_scale = recv_scale_decoded.reshape(N_LOCAL_EXPERTS, RECV_MAX, K_SCALE)
+    recv_mx_scale = recv_scale_decoded.reshape(local_experts, recv_max, K_SCALE)
     recv_weights = tensors["recv_weights"].float()
     recv_expert_count = tensors["recv_expert_count"]
-    w1_scale = decode_e8m0_codes(tensors['routed_w1_scale'], side='b').reshape(N_LOCAL_EXPERTS, K_SCALE, MOE_INTER)
-    w3_scale = decode_e8m0_codes(tensors['routed_w3_scale'], side='b').reshape(N_LOCAL_EXPERTS, K_SCALE, MOE_INTER)
-    w2_scale = decode_e8m0_codes(tensors['routed_w2_scale'], side='b').reshape(N_LOCAL_EXPERTS, H_SCALE, D)
+    w1_scale = decode_e8m0_codes(tensors['routed_w1_scale'], side='b').reshape(local_experts, K_SCALE, MOE_INTER)
+    w3_scale = decode_e8m0_codes(tensors['routed_w3_scale'], side='b').reshape(local_experts, K_SCALE, MOE_INTER)
+    w2_scale = decode_e8m0_codes(tensors['routed_w2_scale'], side='b').reshape(local_experts, H_SCALE, D)
 
-    recv_y = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, D)
-    for e in range(N_LOCAL_EXPERTS):
+    recv_y = torch.zeros(local_experts, recv_max, D)
+    for e in range(local_experts):
         n_rows = int(recv_expert_count[e, 0].item())
         if n_rows == 0:
             continue
@@ -1375,14 +1390,15 @@ def gen_routed_mxfp4_weights(n_experts, dequant_std, seed_base=0):
 
 # validation
 OUTPUT_SENTINEL = 37.0
+TAIL_COUNTS = (15, 16, 17, 63, 64, 65, 127, 128, 129, 255, 256, 257)
 
 
 def golden_local_compute(tensors):
     """Fill active local output rows through the production expert golden."""
     values = dict(tensors)
-    values["recv_y"] = torch.empty_like(tensors["routed_y"]).reshape(N_LOCAL_EXPERTS, RECV_MAX, D)
+    values["recv_y"] = torch.empty_like(tensors["routed_y"]).reshape_as(tensors["recv_x"])
     golden_expert_routed(values)
-    output = tensors["routed_y"].reshape(N_LOCAL_EXPERTS, RECV_MAX, D)
+    output = tensors["routed_y"].reshape_as(tensors["recv_x"])
     for expert, count in enumerate(tensors["recv_expert_count"].reshape(-1).tolist()):
         output[expert, :count] = values["recv_y"][expert, :count]
 
@@ -1391,7 +1407,7 @@ def compare_local_compute(actual, expected, *, inputs, **kwargs):
     """Compare active expert rows and require exact inactive output guards."""
     from golden import ratio_reldiff
 
-    actual_rows = actual.reshape(N_LOCAL_EXPERTS, RECV_MAX, D)
+    actual_rows = actual.reshape(inputs["recv_expert_count"].numel(), -1, D)
     expected_rows = expected.reshape_as(actual_rows)
     comparator = ratio_reldiff(diff_thd=2e-3, pct_thd=0.01)
     for expert, count in enumerate(inputs["recv_expert_count"].reshape(-1).tolist()):
@@ -1403,8 +1419,13 @@ def compare_local_compute(actual, expected, *, inputs, **kwargs):
     return True, ""
 
 
-def validation_counts(case="bounds", *, tail_offset=0):
-    """Return bounded empty, 16-row-tail, and receive-capacity workloads."""
+def effective_tail_counts():
+    """Return tail counts representable by the configured receive capacity."""
+    return tuple(count for count in TAIL_COUNTS if count <= RECV_MAX)
+
+
+def validation_counts(case="bounds", *, tail_offset=0, local_experts=N_LOCAL_EXPERTS):
+    """Return bounded empty, row-tile-tail, and receive-capacity workloads."""
     if case == "zero":
         pattern = (0,)
     elif case == "full":
@@ -1412,32 +1433,32 @@ def validation_counts(case="bounds", *, tail_offset=0):
     elif case == "balanced":
         pattern = (36,)
     elif case == "tails":
-        pattern = (15, 16, 17, 63, 64, 65)
+        pattern = effective_tail_counts()
     elif case == "bounds":
         pattern = (0, 1, RECV_MAX - 1, RECV_MAX)
     else:
         raise ValueError(f"Unknown local compute case: {case}")
-    values = [min(RECV_MAX, pattern[(expert + tail_offset) % len(pattern)]) for expert in range(N_LOCAL_EXPERTS)]
-    return torch.tensor(values, dtype=torch.int32).reshape(N_LOCAL_EXPERTS, 1)
+    values = [min(RECV_MAX, pattern[(expert + tail_offset) % len(pattern)]) for expert in range(local_experts)]
+    return torch.tensor(values, dtype=torch.int32).reshape(local_experts, 1)
 
 
-def build_tensor_specs(case="bounds", *, tail_offset=0):
+def build_tensor_specs(case="bounds", *, tail_offset=0, seed=20261028, local_experts=N_LOCAL_EXPERTS):
     """Build local compute tensors with poisoned inactive capacity and lazy packed weights."""
     from functools import cache
 
     from golden import TensorSpec
     from quant import pack_mx_a_scale, quantize_mxfp8_upward_e8m0
 
-    counts = validation_counts(case, tail_offset=tail_offset)
+    counts = validation_counts(case, tail_offset=tail_offset, local_experts=local_experts)
 
     @cache
     def receive_inputs():
-        generator = torch.Generator().manual_seed(20261028)
-        source = torch.randn(N_LOCAL_EXPERTS, RECV_MAX, D, dtype=torch.bfloat16, generator=generator)
+        generator = torch.Generator().manual_seed(seed)
+        source = torch.randn(local_experts, RECV_MAX, D, dtype=torch.bfloat16, generator=generator)
         payload, codes = quantize_mxfp8_upward_e8m0(source.reshape(-1, D).float())
-        payload = payload.reshape(N_LOCAL_EXPERTS, RECV_MAX, D)
-        codes = codes.reshape(N_LOCAL_EXPERTS, RECV_MAX, K_SCALE).view(torch.uint8)
-        route_weights = torch.rand(N_LOCAL_EXPERTS, RECV_MAX, generator=generator)
+        payload = payload.reshape(local_experts, RECV_MAX, D)
+        codes = codes.reshape(local_experts, RECV_MAX, K_SCALE).view(torch.uint8)
+        route_weights = torch.rand(local_experts, RECV_MAX, generator=generator)
         for expert, count in enumerate(counts.reshape(-1).tolist()):
             payload.view(torch.uint8)[expert, count:] = 127
             codes[expert, count:] = 255
@@ -1447,22 +1468,22 @@ def build_tensor_specs(case="bounds", *, tail_offset=0):
 
     @cache
     def routed_weights():
-        return gen_routed_mxfp4_weights(N_LOCAL_EXPERTS, ROUTED_DEQUANT_STD, seed_base=10)
+        return gen_routed_mxfp4_weights(local_experts, ROUTED_DEQUANT_STD, seed_base=10)
 
     fp8 = torch.float8_e4m3fn
     e8m0 = torch.float8_e8m0fnu
     return [
-        TensorSpec("recv_x", [N_LOCAL_EXPERTS, RECV_MAX, D], fp8, init_value=lambda: receive_inputs()[0]),
-        TensorSpec("recv_mx_scale", [1, N_LOCAL_EXPERTS * RECV_MAX * K_SCALE], e8m0, init_value=lambda: receive_inputs()[1]),
-        TensorSpec("recv_weights", [N_LOCAL_EXPERTS, RECV_MAX], torch.float32, init_value=lambda: receive_inputs()[2]),
-        TensorSpec("recv_expert_count", [N_LOCAL_EXPERTS, 1], torch.int32, init_value=counts),
-        TensorSpec("routed_w1_packed", [N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], torch.uint8, init_value=lambda: routed_weights()[0]),
-        TensorSpec("routed_w1_scale", [N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], e8m0, init_value=lambda: routed_weights()[1]),
-        TensorSpec("routed_w3_packed", [N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], torch.uint8, init_value=lambda: routed_weights()[2]),
-        TensorSpec("routed_w3_scale", [N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], e8m0, init_value=lambda: routed_weights()[3]),
-        TensorSpec("routed_w2_packed", [N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], torch.uint8, init_value=lambda: routed_weights()[4]),
-        TensorSpec("routed_w2_scale", [N_LOCAL_EXPERTS * H_SCALE, D], e8m0, init_value=lambda: routed_weights()[5]),
-        TensorSpec("routed_y", [N_LOCAL_EXPERTS * RECV_MAX, D], torch.bfloat16, init_value=OUTPUT_SENTINEL),
+        TensorSpec("recv_x", [local_experts, RECV_MAX, D], fp8, init_value=lambda: receive_inputs()[0]),
+        TensorSpec("recv_mx_scale", [1, local_experts * RECV_MAX * K_SCALE], e8m0, init_value=lambda: receive_inputs()[1]),
+        TensorSpec("recv_weights", [local_experts, RECV_MAX], torch.float32, init_value=lambda: receive_inputs()[2]),
+        TensorSpec("recv_expert_count", [local_experts, 1], torch.int32, init_value=counts),
+        TensorSpec("routed_w1_packed", [local_experts, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], torch.uint8, init_value=lambda: routed_weights()[0]),
+        TensorSpec("routed_w1_scale", [local_experts * K_SCALE, MOE_INTER], e8m0, init_value=lambda: routed_weights()[1]),
+        TensorSpec("routed_w3_packed", [local_experts, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], torch.uint8, init_value=lambda: routed_weights()[2]),
+        TensorSpec("routed_w3_scale", [local_experts * K_SCALE, MOE_INTER], e8m0, init_value=lambda: routed_weights()[3]),
+        TensorSpec("routed_w2_packed", [local_experts, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], torch.uint8, init_value=lambda: routed_weights()[4]),
+        TensorSpec("routed_w2_scale", [local_experts * H_SCALE, D], e8m0, init_value=lambda: routed_weights()[5]),
+        TensorSpec("routed_y", [local_experts * RECV_MAX, D], torch.bfloat16, init_value=OUTPUT_SENTINEL),
     ]
 
 
@@ -1471,8 +1492,13 @@ if __name__ == "__main__":
 
     cases = ("bounds", "tails", "zero") if args.case == "all" else (args.case,)
     for case in cases:
-        tail_rounds = (6 + N_LOCAL_EXPERTS - 1) // N_LOCAL_EXPERTS if case == "tails" else 1
+        tail_count = len(effective_tail_counts())
+        tail_rounds = (tail_count + N_LOCAL_EXPERTS - 1) // N_LOCAL_EXPERTS if case == "tails" else 1
+        if args.tail_round is not None and not 0 <= args.tail_round < tail_rounds:
+            parser.error(f"--tail-round must be in [0, {tail_rounds - 1}]")
         for tail_round in range(tail_rounds):
+            if args.tail_round is not None and tail_round != args.tail_round:
+                continue
             print(f"Local routed compute: case={case}, tail_round={tail_round}, experts={N_LOCAL_EXPERTS}, stride={RECV_MAX}")
             result = run(
                 fn=local_compute_test,

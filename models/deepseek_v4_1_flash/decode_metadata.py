@@ -246,13 +246,11 @@ def decode_accept(
         cached_widths = pl.load(flat_widths, [0, 0], [1, REQUEST_TILE], [1, DECODE_BATCH])
         if _core == 0:
             for start in pl.range(0, markov_capacity, 64):
-                columns = pl.arange(pl.cast(start, pl.INT32), [1, 64], dtype=pl.INT32)
-                mask = pl.cmp(columns, pl.cast(QUERY_ROWS, pl.INT32), cmp_type=2)
-                incremented = pl.add(columns, pl.cast(1, pl.INT32))
-                active_indices = pl.mul(mask, incremented)
-                ids = pl.sub(active_indices, pl.cast(1, pl.INT32))
+                columns = pl.tile.arange(pl.cast(start, pl.INT32), [1, 64], dtype=pl.INT32)
+                markov_mask = pl.tile.cmps(columns, pl.cast(QUERY_ROWS, pl.INT32), cmp_type=2)
+                ids = pl.tile.select(markov_mask, columns, -1)
                 markov_valid = pl.min(64, markov_capacity - start)
-                flat_markov_row_indices[:, start:start + markov_valid] = ids[:, :markov_valid]
+                pl.store(pl.set_validshape(ids, 1, markov_valid), [0, start], flat_markov_row_indices)
         for request in pl.range(DECODE_BATCH):
             owner = pl.cast(request, pl.INT32)
             owned_slot = pl.cast(0, pl.INT32)

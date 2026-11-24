@@ -54,12 +54,12 @@ GROUP_LOGIT_ROWS = LM_HEAD_TP_SIZE * MAX_LOGIT_ROWS
 LM_HEAD_M_TILE = 80
 LM_HEAD_N_TILE = 256
 LM_HEAD_K_TILE = 128
-LM_HEAD_GATHER_M_TILE = 72
+LM_HEAD_PROJECT_M_TILE = 192
+LM_HEAD_PROJECT_WIDE_M_TILE = 224
+LM_HEAD_GATHER_M_TILE = 80
 LM_HEAD_TAIL_TILE = VOCAB_PER_TP % LM_HEAD_N_TILE or LM_HEAD_N_TILE
-HIDDEN_OWNER_ROW_TILE = gcd(MAX_LOGIT_ROWS, 48)
-HIDDEN_PUSH_WORKER_TILE = (MAX_LOGIT_ROWS + 64 // LM_HEAD_TP_SIZE - 1) // (64 // LM_HEAD_TP_SIZE)
-HIDDEN_PUSH_ROW_TILE = gcd(HIDDEN_OWNER_ROW_TILE, HIDDEN_PUSH_WORKER_TILE)
-HIDDEN_PUSH_CHUNK_TILE = min(12, HIDDEN_PUSH_ROW_TILE)
+HIDDEN_OWNER_ROW_TILE = gcd(MAX_LOGIT_ROWS, 16)
+HIDDEN_PUSH_CHUNK_TILE = min(4, HIDDEN_OWNER_ROW_TILE)
 
 # Padded sampled-ids row width shared with the decode sampling operators.
 SAMPLED_IDS_PAD = 8
@@ -136,10 +136,11 @@ def lm_head(
     hidden_rows = pl.tensor.dim(hidden_states, 0)
     group_base = rank // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE
     tp_rank = rank % LM_HEAD_TP_SIZE
-    selected_hidden = pl.create_tensor([num_rows, D], dtype=pl.BF16)
+    selected_rows = pl.tensor.dim(logits, 0)
+    selected_hidden = pl.create_tensor([selected_rows, D], dtype=pl.BF16)
     with pl.spmd(64, name_hint="lm_head_select_rows") as selected_ready:
         block = pl.tile.get_block_idx()
-        for row in pl.range(block, num_rows, 64):
+        for row in pl.range(block, selected_rows, 64):
             source_raw = pl.read(logit_row_indices, [row])
             source = pl.cast(pl.max(pl.min(source_raw, hidden_rows - 1), 0), pl.INDEX)
             selected = pl.full([1, D], dtype=pl.BF16, value=0.0)
@@ -150,17 +151,20 @@ def lm_head(
         lm_head_project(selected_hidden, lm_head_weight, logits)
     else:
         pl.static_assert(num_rows % HIDDEN_OWNER_ROW_TILE == 0, "LM-head owner rows must fill complete interleaved stripes")
-        with pl.spmd(64, name_hint="lm_head_dispatch_push", deps=[selected_ready]) as dispatch_pushed:
+        row_tiles = selected_rows // HIDDEN_OWNER_ROW_TILE
+        transfer_count = LM_HEAD_TP_SIZE * row_tiles
+        push_workers = pl.max(1, pl.min(64, transfer_count))
+        # Consecutive workers send the same row stripe to different peers.
+        with pl.spmd(push_workers, name_hint="lm_head_dispatch_push", deps=[selected_ready]) as dispatch_pushed:
             worker = pl.tile.get_block_idx()
-            row_tiles = num_rows // HIDDEN_PUSH_ROW_TILE
-            for tile in pl.range(worker, LM_HEAD_TP_SIZE * row_tiles, 64):
-                peer = (tp_rank + tile // row_tiles) % LM_HEAD_TP_SIZE
-                row = tile % row_tiles * HIDDEN_PUSH_ROW_TILE
-                owner_stripe = row // HIDDEN_OWNER_ROW_TILE * LM_HEAD_TP_SIZE + tp_rank
-                destination = owner_stripe * HIDDEN_OWNER_ROW_TILE + row % HIDDEN_OWNER_ROW_TILE
+            for tile in pl.range(worker, transfer_count, 64):
+                peer = (tp_rank + tile % LM_HEAD_TP_SIZE) % LM_HEAD_TP_SIZE
+                stripe = tile // LM_HEAD_TP_SIZE
+                row = stripe * HIDDEN_OWNER_ROW_TILE
+                destination = (stripe * LM_HEAD_TP_SIZE + tp_rank) * HIDDEN_OWNER_ROW_TILE
                 pld.tensor.put(
                     hidden_window, peer=group_base + peer, src=selected_hidden, dst_offsets=[destination, 0],
-                    src_offsets=[row, 0], shape=[HIDDEN_PUSH_ROW_TILE, D], chunk_rows=HIDDEN_PUSH_CHUNK_TILE,
+                    src_offsets=[row, 0], shape=[HIDDEN_OWNER_ROW_TILE, D], chunk_rows=HIDDEN_PUSH_CHUNK_TILE,
                     chunk_cols=D, pipeline=True,
                 )
         with pl.spmd(LM_HEAD_TP_SIZE, name_hint="lm_head_dispatch_notify", deps=[dispatch_pushed]) as dispatch_notified:
@@ -179,13 +183,18 @@ def lm_head(
                         cmp=pld.WaitCmp.Ge,
                     )
 
-        group_m_tile = pl.min(192, LM_HEAD_TP_SIZE * num_rows)
+        group_rows = LM_HEAD_TP_SIZE * selected_rows
+        group_m_tile = pl.min(LM_HEAD_PROJECT_M_TILE, group_rows)
+        bands = (group_rows + LM_HEAD_PROJECT_M_TILE - 1) // LM_HEAD_PROJECT_M_TILE
+        wide_bands = (group_rows + LM_HEAD_PROJECT_WIDE_M_TILE - 1) // LM_HEAD_PROJECT_WIDE_M_TILE
+        if wide_bands < bands:
+            group_m_tile = LM_HEAD_PROJECT_WIDE_M_TILE
         project_tp_rank = pl.cast(tp_rank, pl.INT32)
         project_group_base = pl.cast(group_base, pl.INT32)
         with pl.spmd(32, name_hint="lm_head_matmul_push", deps=[dispatch_ready, dispatch_notified]) as logits_pushed:
             logits_window = _lm_head_project_push(
                 hidden_window, lm_head_weight, logits_window, project_tp_rank, project_group_base, LM_HEAD_TP_SIZE,
-                num_rows, VOCAB_PER_TP, group_m_tile, HIDDEN_OWNER_ROW_TILE,
+                selected_rows, VOCAB_PER_TP, group_m_tile, HIDDEN_OWNER_ROW_TILE,
             )
 
         # Publish one completion update after all vector workers finish their puts.
@@ -207,7 +216,7 @@ def lm_head(
 
         with pl.spmd(64, name_hint="lm_head_combine_gather", deps=[combine_ready, combine_notified]):
             gather_worker = pl.tile.get_block_idx()
-            row_tiles = (num_rows + LM_HEAD_GATHER_M_TILE - 1) // LM_HEAD_GATHER_M_TILE
+            row_tiles = (selected_rows + LM_HEAD_GATHER_M_TILE - 1) // LM_HEAD_GATHER_M_TILE
             full_panels = VOCAB_PER_TP // LM_HEAD_N_TILE
             panel_tasks = LM_HEAD_TP_SIZE * row_tiles * full_panels
             panels_u32 = pl.cast(full_panels, pl.UINT32)
@@ -224,9 +233,9 @@ def lm_head(
                 shard = pl.cast(packed_row // rows_u32, pl.INDEX)
                 row = pl.cast(packed_row % rows_u32, pl.INDEX) * LM_HEAD_GATHER_M_TILE
                 panel = pl.cast(ordinal - packed_row * panels_u32, pl.INDEX)
-                input_row = shard * (VOCAB_PER_TP * num_rows // LM_HEAD_N_TILE) + panel * num_rows + row
+                input_row = shard * (VOCAB_PER_TP * selected_rows // LM_HEAD_N_TILE) + panel * selected_rows + row
                 output_column = shard * VOCAB_PER_TP + panel * LM_HEAD_N_TILE
-                rows = pl.min(LM_HEAD_GATHER_M_TILE, num_rows - row)
+                rows = pl.min(LM_HEAD_GATHER_M_TILE, selected_rows - row)
                 slot = pl.cast((ordinal // pl.cast(64, pl.UINT32)) % pl.cast(2, pl.UINT32), pl.INDEX)
                 pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, slot)
                 panel_input: pl.Tile[
@@ -256,8 +265,8 @@ def lm_head(
                 row = tail % row_tiles * LM_HEAD_GATHER_M_TILE
                 column = VOCAB_PER_TP - LM_HEAD_TAIL_TILE
                 output_column = shard * VOCAB_PER_TP + column
-                input_row = output_column * num_rows // LM_HEAD_TAIL_TILE + row
-                rows = pl.min(LM_HEAD_GATHER_M_TILE, num_rows - row)
+                input_row = output_column * selected_rows // LM_HEAD_TAIL_TILE + row
+                rows = pl.min(LM_HEAD_GATHER_M_TILE, selected_rows - row)
                 pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, 0)
                 tail_tile: pl.Tile[
                     [LM_HEAD_GATHER_M_TILE, LM_HEAD_TAIL_TILE], pl.BF16, pl.MemRef("input", slots=2)[0], pl.Mem.Vec
@@ -399,7 +408,7 @@ if __name__ == "__main__":
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--lm-head-tp", type=int, default=LM_HEAD_TP_SIZE, choices=SUPPORTED_LM_HEAD_TP_SIZES, help="LM-head tensor-parallel world size")
     parser.add_argument("--dp", type=int, default=DP_SIZE, help="DP groups (world size = tp * dp)")
-    parser.add_argument("--logit-rows", type=int, choices=[16, 72, 384], default=MAX_LOGIT_ROWS)
+    parser.add_argument("--logit-rows", type=int, choices=[16, 64, 72, 80, 320, 384], default=MAX_LOGIT_ROWS)
     parser.add_argument("--num-tokens", type=int, default=MAX_LOGIT_ROWS, help="Active hidden rows each owner projects (0 = empty shard)")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(WORLD_SIZE)), help=f"comma-separated device ids; need at least {WORLD_SIZE}")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))

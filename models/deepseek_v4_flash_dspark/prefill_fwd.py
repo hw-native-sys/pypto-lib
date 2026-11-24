@@ -38,6 +38,7 @@ from moe import (
     prefill_moe_local,
 )
 from config import FLASH as MODEL_CONFIG
+from prefill_sparse_attn import prepare_sparse_attn_rope
 from prefill_swa import (
     build_cp_tensor_specs as build_swa_attention_tensor_specs,
     build_ragged2_cp_tensor_specs as build_swa_ragged2_tensor_specs,
@@ -86,12 +87,13 @@ from prefill_csa import (
     build_cp_tensor_specs as build_csa_attention_tensor_specs,
     build_ragged2_cp_tensor_specs as build_csa_ragged2_tensor_specs,
     prefill_attention_csa_cp_local,
+    prepare_csa_compact_plan,
 )
 from prefill_cp_token_allgather import (
     PREFILL_GROUP_CAP,
     TP_SIZE,
     prefill_cp_materialize_hc_full,
-    prefill_cp_materialize_coeff_full,
+    prefill_cp_materialize_ffn_coeffs,
     prefill_cp_token_allgather_into,
 )
 from prefill_metadata import (
@@ -111,6 +113,7 @@ from prefill_o_proj import (
     retire_o_proj_weight_signals,
 )
 from hc_head import hc_head
+from hc_post import golden_hc_post, hc_post
 from lm_head import (
     GRAMMAR_SEGMENT_WORDS,
     GREEDY_GRID_ROWS,
@@ -439,6 +442,23 @@ def prefill_fwd(
         pl.write(stage_token, [0], pl.cast(0, pl.INT32))
         pl.write(layer_completion, [0], pl.cast(0, pl.INT32))
 
+    # The forward ABI supplies one immutable set of CSA slot maps for all layers.
+    csa_plan = pl.create_tensor([1], dtype=pl.INT32)
+    with pl.scope():
+        prepare_csa_compact_plan(
+            local_tokens, query_start_loc, state_checkpoint_ends, position_ids_full, ori_slot_mapping_full,
+            csa_cmp_slot_mapping_full, csa_idx_slot_mapping_full, csa_state_slot_mapping_full,
+            csa_inner_state_slot_mapping_full, csa_plan,
+        )
+
+    # Query frequencies are shared by layer kind for this forward.
+    swa_inverse, swa_swap_idx, swa_rope_ready = prepare_sparse_attn_rope(
+        swa_freqs_cos, swa_freqs_sin, local_start, local_tokens, group_tokens,
+    )
+    compressed_inverse, compressed_swap_idx, compressed_rope_ready = prepare_sparse_attn_rope(
+        compressed_freqs_cos, compressed_freqs_sin, local_start, local_tokens, group_tokens,
+    )
+
     # Local HC state and FFN coefficient views.
     hc_elements_local = local_tokens * HC_MULT * D
     hidden_elements_local = local_tokens * D
@@ -533,6 +553,7 @@ def prefill_fwd(
                     o_proj_weight_ready, o_proj_weight_consumed,
                     layer_completion,
                     group_base, tp_rank, layer_l0 + pl.const(1, pl.INT32),
+                    swa_inverse, swa_swap_idx, swa_rope_ready,
                 )
 
         with pl.scope():
@@ -624,6 +645,7 @@ def prefill_fwd(
                     o_proj_weight_ready, o_proj_weight_consumed,
                     layer_completion,
                     group_base, tp_rank, layer_l1 + pl.const(1, pl.INT32),
+                    swa_inverse, swa_swap_idx, swa_rope_ready,
                 )
 
         with pl.scope():
@@ -645,6 +667,8 @@ def prefill_fwd(
     target_l41_start = pl.cast(local_tokens, pl.INDEX)
     target_hc_rows = 2 * local_tokens
     target_hc_stack = pl.create_tensor([target_hc_rows, HC_MULT, D], dtype=pl.FP32)
+
+    csa_compact = pl.read(csa_plan, [0])
 
     # Layers 2-41: CSA/HCA pairs.
     for pair_order in pl.range(HCA_NUM_LAYERS):
@@ -783,7 +807,8 @@ def prefill_fwd(
                         o_proj_wo_a_window, o_proj_wo_b_window,
                         o_proj_weight_ready, o_proj_weight_consumed,
                         layer_completion,
-                        group_base, tp_rank, csa_layer + pl.const(1, pl.INT32),
+                        group_base, tp_rank, csa_layer + pl.const(1, pl.INT32), csa_compact,
+                        compressed_inverse, compressed_swap_idx, compressed_rope_ready,
                     )
 
             with pl.scope():
@@ -913,6 +938,7 @@ def prefill_fwd(
                         o_proj_weight_ready, o_proj_weight_consumed,
                         layer_completion,
                         group_base, tp_rank, hca_layer + pl.const(1, pl.INT32),
+                        compressed_inverse, compressed_swap_idx, compressed_rope_ready,
                     )
 
             with pl.scope():
@@ -1079,7 +1105,8 @@ def prefill_fwd(
                     o_proj_wo_a_window, o_proj_wo_b_window,
                     o_proj_weight_ready, o_proj_weight_consumed,
                     layer_completion,
-                    group_base, tp_rank, layer_last + pl.const(1, pl.INT32),
+                    group_base, tp_rank, layer_last + pl.const(1, pl.INT32), csa_compact,
+                    compressed_inverse, compressed_swap_idx, compressed_rope_ready,
                 )
 
         with pl.scope():
@@ -1139,21 +1166,28 @@ def prefill_fwd(
     with pl.scope():
         if group_tokens > 0:
             materialize_ready_tid = pl.system.task_dummy(deps=[])
-            hc_full_tid = prefill_cp_materialize_hc_full(
-                x_hc_local, x_hc, gather_window, gather_signal, group_base, tp_rank, materialize_ready_tid,
-            )
+            rebuild_hc = group_rows == PREFILL_GROUP_CAP and TP_SIZE > 1
+            if not rebuild_hc:
+                materialize_ready_tid = prefill_cp_materialize_hc_full(
+                    x_hc_local, x_hc, gather_window, gather_signal, group_base, tp_rank, materialize_ready_tid,
+                )
             attn_full_tid = prefill_cp_materialize_hc_full(
-                attn_stage_local, attn_stage, gather_window, gather_signal, group_base, tp_rank, hc_full_tid,
+                attn_stage_local, attn_stage, gather_window, gather_signal, group_base, tp_rank, materialize_ready_tid,
             )
             mixed_full_tid = prefill_cp_token_allgather_into(
                 x_mixed_local, x_mixed, gather_window, gather_signal, group_base, tp_rank, attn_full_tid,
             )
-            post_full_tid = prefill_cp_materialize_coeff_full(
-                post_ffn_local, post_ffn, gather_window, gather_signal, group_base, tp_rank, mixed_full_tid,
+            coeffs_full_tid = prefill_cp_materialize_ffn_coeffs(
+                post_ffn_local, comb_ffn_local, post_ffn, comb_ffn,
+                gather_window, gather_signal, group_base, tp_rank, mixed_full_tid,
             )
-            prefill_cp_materialize_coeff_full(
-                comb_ffn_local, comb_ffn, gather_window, gather_signal, group_base, tp_rank, post_full_tid,
-            )
+            if rebuild_hc:
+                # Rebuild the final HC rows from the replicated residual and the narrow FFN output.
+                ffn_full = pl.create_tensor([group_rows, D], dtype=pl.BF16)
+                _ffn_full_tid = prefill_cp_token_allgather_into(
+                    ffn_out, ffn_full, gather_window, gather_signal, group_base, tp_rank, coeffs_full_tid,
+                )
+                hc_post(ffn_full, attn_stage, post_ffn, comb_ffn, x_hc, pl.const(-1, pl.INT32), T_TILE=16)
 
     # All head-group ranks participate, including ranks with no attention tokens.
     layer42_hidden = pl.create_tensor([group_rows, D], dtype=pl.BF16)
@@ -2092,6 +2126,40 @@ def finite_tensor_compare(actual, expected, *, preserve_inactive=False, zero_ina
     return True, ""
 
 
+def x_hc_compare(actual, expected, **kwargs):
+    """Validate full-group HC against each owner's residual, coefficients, and FFN result."""
+    import torch
+    from golden import ratio_allclose
+
+    valid, detail = finite_tensor_compare(actual, expected, zero_inactive=True, **kwargs)
+    if not valid or TP_SIZE == 1 or actual.shape[1] != PREFILL_GROUP_CAP:
+        return valid, detail
+
+    outputs = kwargs["actual_outputs"]
+    starts = kwargs["inputs"]["query_start_loc"]
+    owner_ffn = outputs["ffn_out"]
+    local_rows = owner_ffn.shape[1]
+    compare = ratio_allclose(atol=1e-6, rtol=1e-6, max_error_ratio=0)
+    for owner in range(actual.shape[0]):
+        if int(starts[owner, -1]) == 0:
+            continue
+        group_base = owner // TP_SIZE * TP_SIZE
+        start = (owner - group_base) * local_rows
+        rows = slice(start, start + local_rows)
+        owner_hc = torch.empty_like(actual[owner, rows], device="cpu")
+        golden_hc_post({
+            "x": owner_ffn[owner].cpu(),
+            "residual": outputs["attn_stage"][owner, rows].cpu(),
+            "post": outputs["post_ffn"][owner, rows].cpu(),
+            "comb": outputs["comb_ffn"][owner, rows].cpu(),
+            "y": owner_hc,
+        })
+        for rank in range(group_base, group_base + TP_SIZE):
+            matches, mismatch = compare(actual[rank, rows].cpu(), owner_hc, **kwargs)
+            if not matches:
+                return False, f"    rank {rank} HC rows owned by rank {owner}:\n{mismatch}"
+    return True, ""
+
 def x_out_compare(actual, _expected, **kwargs):
     """Recompute hc_head plus the final norm from the device x_hc and compare."""
     import torch
@@ -2251,7 +2319,7 @@ def compare_functions():
     compare["dspark_target_hidden"] = dspark_target_hidden_compare
     for name in CACHE_NAMES | {"attn_stage"}:
         compare[name] = partial(finite_tensor_compare, preserve_inactive=True)
-    compare["x_hc"] = partial(finite_tensor_compare, zero_inactive=True)
+    compare["x_hc"] = x_hc_compare
     compare["x_out"] = x_out_compare
     compare["logits"] = logits_compare
     compare["sampled_ids"] = sampled_ids_compare
@@ -2286,8 +2354,8 @@ def main():
         help=f"B1 prompt tokens per TP/CP group; defaults to {DEFAULT_GROUP_TOKENS}. ragged2 is fixed at 7.",
     )
     parser.add_argument(
-        "--case", choices=["b1", "ragged2"], default="b1",
-        help="Fixture case; ragged2 is the fixed two-request TP2 boundary case.",
+        "--case", choices=["b1", "ragged2", "full-group"], default="b1",
+        help="Fixture case; ragged2 is the two-request TP2 case and full-group checks HC at full CP capacity.",
     )
     parser.add_argument(
         "--inactive-dp-groups", type=int, nargs="*", default=[],
@@ -2331,6 +2399,10 @@ def main():
         parser.error("--case ragged2 requires --tp 2")
     if args.case == "ragged2" and args.start_pos != 0:
         parser.error("--case ragged2 has fixed request starts and requires --start-pos 0")
+    if args.case == "full-group":
+        if TP_SIZE == 1 or args.num_tokens not in (None, PREFILL_GROUP_CAP):
+            parser.error(f"--case full-group requires TP > 1 and {PREFILL_GROUP_CAP} tokens")
+        args.num_tokens = PREFILL_GROUP_CAP
     if args.num_tokens is None:
         args.num_tokens = 7 if args.case == "ragged2" else DEFAULT_GROUP_TOKENS
     if args.case == "ragged2" and args.num_tokens != 7:
@@ -2348,7 +2420,8 @@ def main():
         idx_block_num=args.idx_block_num,
         hca_state_block_num=args.hca_state_block_num, csa_state_block_num=args.csa_state_block_num,
         inner_state_block_num=args.inner_state_block_num,
-        fixture_case=args.case, inactive_dp_groups=args.inactive_dp_groups,
+        fixture_case="ragged2" if args.case == "ragged2" else "b1",
+        inactive_dp_groups=args.inactive_dp_groups,
     )
 
     result = run(

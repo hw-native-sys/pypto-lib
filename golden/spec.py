@@ -77,6 +77,11 @@ class TensorSpec:
               each rank's slice must reside on the card that consumes it.
 
             ``True`` is rejected as ambiguous — pass an int worker id instead.
+        pack_for_upload: Convert canonical host tensors to the physical layout of
+            this resident input. The callback runs before device workers start,
+            only when the compiled parameter matches ``upload_shape``.
+        upload_shape: Shape of the packed input. Artifacts compiled for ``shape``
+            receive the original tensor. The two shapes must be distinguishable.
         direction: ``"in"`` / ``"out"`` / ``"inout"``, stamped by the harness
             from the compiled artifact's ``ParamDirection`` before any tensor is
             allocated. Not an init argument: the kernel signature owns the
@@ -96,6 +101,8 @@ class TensorSpec:
     dtype: torch.dtype
     init_value: int | float | torch.Tensor | Callable | None = field(default=None)
     resident: int | str | bool | None = None
+    pack_for_upload: Callable[[dict[str, torch.Tensor]], torch.Tensor] | None = None
+    upload_shape: list[int] | None = None
     direction: str | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -122,6 +129,13 @@ class TensorSpec:
                 f'(whole-tensor resident on that card), or "stacked" (leading-dim sharded); '
                 f"got {r!r}."
             )
+        if (self.pack_for_upload is None) != (self.upload_shape is None):
+            raise ValueError(f"TensorSpec {self.name!r}: specify pack_for_upload and upload_shape together")
+        if self.upload_shape is not None:
+            if not self.is_resident or tuple(self.upload_shape) == tuple(self.shape):
+                raise ValueError(f"TensorSpec {self.name!r}: packing requires a resident and a distinct upload shape")
+            if r == "stacked" and (not self.shape or not self.upload_shape or self.shape[0] != self.upload_shape[0]):
+                raise ValueError(f"TensorSpec {self.name!r}: packing must preserve the stacked rank axis")
 
     def _stamped_direction(self) -> str:
         """The artifact-stamped direction; reading it before the stamp is a bug."""

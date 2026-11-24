@@ -123,12 +123,16 @@ def gather_sparse_attention(
         if whole_tiles - balanced_tiles >= 3:
             balanced = pl.cast(1, pl.INT32)
     slots = pl.max(1, 2 * workers * balanced)
-    partials = pl.create_tensor([slots * 64 * (HEAD_DIM + 2) + 2 * workers], dtype=pl.FP32)
+    partials_size = slots * 64 * (HEAD_DIM + 2) + 2 * workers
+    partials = pl.create_tensor([partials_size], dtype=pl.FP32)
     if balanced != 0:
         ready_offset = 2 * workers * 64 * (HEAD_DIM + 2)
-        for ready_index in pl.range(2 * workers):
-            pl.write(partials, [ready_offset + ready_index], pl.cast(0, pl.FP32))
-        with pl.spmd(workers, name_hint="sparse_gather_vf", sync_start=True) as attended:
+        flat_partials = pl.reshape(partials, [1, partials_size])
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="sparse_gather_reset") as reset:
+            flags = pl.tile.full([1, 2 * SPARSE_VF_WORKER_TILE], dtype=pl.FP32, value=0.0)
+            flags = pl.tile.set_validshape(flags, 1, 2 * workers)
+            pl.store(flags, [0, ready_offset], flat_partials)
+        with pl.spmd(workers, name_hint="sparse_gather_vf", sync_start=True, deps=[reset]) as attended:
             _gather_sparse_vf_rows(
                 active_output, query, sink, window, compressed,
                 window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
