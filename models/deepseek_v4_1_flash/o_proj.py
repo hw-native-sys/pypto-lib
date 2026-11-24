@@ -832,6 +832,18 @@ def _o_proj_a_mixed(
     return output, output_scale
 
 
+@pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "o_proj_a_stream.cpp",
+               aiv_source=Path(__file__).parent / "kernels" / "o_proj_a_stream.cpp",
+               include_dirs=(pto_isa_include_dir(),), dual_aiv_dispatch=True)
+def _o_proj_a_stream(
+    payload: pl.Tensor, weight: pl.Tensor, activation_scale: pl.Tensor, weight_scale: pl.Tensor,
+    output: pl.Out[pl.Tensor], output_scale: pl.Out[pl.Tensor],
+    active_rows: pl.Scalar[pl.INT32], padded_rows: pl.Scalar[pl.INDEX],
+) -> tuple[pl.Tensor, pl.Tensor]:
+    """Run all M128 tiles of the eight-group O-A projection on the same worker grid."""
+    return output, output_scale
+
+
 @pl.jit.inline(auto_scope=False)
 def o_proj_a_pypto(
     payload: pl.Tensor[[O_GROUP_ROWS, O_GROUP_IN], pl.FP8E4M3FN],
@@ -1311,10 +1323,16 @@ def o_proj_hc_post(
     quant_o_vf_pypto(attn_out, rope_cos, rope_sin, payload_all, scales_all, num_tokens, padded_rows)
     payload = pl.create_tensor([padded_rows, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
     activation_scale = pl.create_tensor([1, padded_rows * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)
-    payload, activation_scale = o_proj_a_pypto(
-        payload_all, wo_a, scales_all, wo_a_scale, payload, activation_scale,
-        LOCAL_O_WIDTH, num_tokens, padded_rows, oa_tile,
-    )
+    if oa_tile == 128 and padded_rows >= 1024 and LOCAL_O_GROUPS == 8 and pl.system.available_cluster_count() >= 32:
+        with pl.spmd(32, name_hint="proj_o_a_stream", sync_start=True):
+            payload, activation_scale = _o_proj_a_stream(
+                payload_all, wo_a, scales_all, wo_a_scale, payload, activation_scale, num_tokens, padded_rows,
+            )
+    else:
+        payload, activation_scale = o_proj_a_pypto(
+            payload_all, wo_a, scales_all, wo_a_scale, payload, activation_scale,
+            LOCAL_O_WIDTH, num_tokens, padded_rows, oa_tile,
+        )
     ob_tasks = ((total_rows + ob_row_tile - 1) // ob_row_tile) * ((D + O_B_N_TILE - 1) // O_B_N_TILE)
     ob_workers = pl.max(1, pl.min(ob_tasks, pl.system.available_cluster_count()))
     output, ready = o_proj_b_hc_post(
