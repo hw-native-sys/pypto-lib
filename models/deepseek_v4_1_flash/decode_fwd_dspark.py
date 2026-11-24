@@ -32,7 +32,7 @@ from config import (
     DSPARK_DRAFT_LAYERS,
     EP_SIZE,
     FLASH,
-    DECODE_BATCH, SUPPORTED_DECODE_BATCHES,
+    DECODE_BATCH,
     LM_HEAD_TP_SIZE, SUPPORTED_LM_HEAD_TP_SIZES, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
 from quant import unpack_quantized_cache
@@ -833,8 +833,6 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--lm-head-tp", type=int, default=LM_HEAD_TP_SIZE, choices=SUPPORTED_LM_HEAD_TP_SIZES)
-    parser.add_argument("--decode-batch", type=int, choices=SUPPORTED_DECODE_BATCHES, default=DECODE_BATCH,
-                        help="maximum requests per rank in the compiled DSpark step")
     parser.add_argument("--active-requests", type=int, default=1, help="number of active requests per rank in the fixture")
     parser.add_argument("--ep", type=int, default=EP_SIZE)
     parser.add_argument("--dp", type=int, default=EP_SIZE)
