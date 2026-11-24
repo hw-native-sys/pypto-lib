@@ -111,40 +111,38 @@ def prefill_c1a_reuse(
             kv_write_slots, window_cache,
             kv_token_count,
         )
-        chunk_done = pl.system.task_invalid()
-        for start in pl.range(0, kv_token_count, Q_TILE):
-            active = pl.min(Q_TILE, kv_token_count - start)
-            chunk_rope_cos = pl.slice(kv_rope_cos, [active, ROPE_DIM // 2], [start, 0])
-            chunk_rope_sin = pl.slice(kv_rope_sin, [active, ROPE_DIM // 2], [start, 0])
-            chunk_window_indices = pl.slice(q_window_indices, [active, 128], [start, 0])
-            chunk_compressed_indices = pl.slice(q_compressed_indices, [active, INDEX_TOPK], [start, 0])
-            q_latent = pl.create_tensor([Q_TILE, Q_LORA], dtype=pl.BF16)
-            q = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-            q_input_payload_padded_rows = ((active + 255) // 256) * 256
-            q_input_end = start + q_input_payload_padded_rows
-            q_input_payload = kv_input_payload[start:q_input_end, :]
-            q_scale_start = start * (D // 32)
-            q_scale_end = q_input_end * (D // 32)
-            q_input_scales = kv_input_scales[:, q_scale_start:q_scale_end]
-            q_proj_rope(
-                q_input_payload, q_input_scales,
-                wq_a, wq_a_scale, wq_norm,
-                wq_b, wq_b_scale,
-                chunk_rope_cos, chunk_rope_sin,
-                q_latent, q,
-                active, previous_chunk=chunk_done, qa_worker_limit=24, qb_worker_limit=32,
-                padded_rows=q_input_payload_padded_rows,
-                qa_row_tile=256, qb_row_tile=128,
-            )
-            attn_out = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        active = kv_token_count
+        no_dependency = pl.system.task_invalid()
+        padded_query_rows = (active + 255) // 256 * 256
+        active_rope_cos = pl.slice(kv_rope_cos, [active, ROPE_DIM // 2], [0, 0])
+        active_rope_sin = pl.slice(kv_rope_sin, [active, ROPE_DIM // 2], [0, 0])
+        active_window_indices = pl.slice(q_window_indices, [active, 128], [0, 0])
+        active_compressed_indices = pl.slice(q_compressed_indices, [active, INDEX_TOPK], [0, 0])
+        q_latent = pl.create_tensor([padded_query_rows, Q_LORA], dtype=pl.BF16)
+        q = pl.create_tensor([padded_query_rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        q_input_payload = pl.slice(kv_input_payload, [padded_query_rows, D], [0, 0])
+        q_input_scales = pl.slice(kv_input_scales, [1, padded_query_rows * (D // 32)], [0, 0])
+        q_proj_rope(
+            q_input_payload, q_input_scales,
+            wq_a, wq_a_scale, wq_norm,
+            wq_b, wq_b_scale,
+            active_rope_cos, active_rope_sin,
+            q_latent, q,
+            active, previous_chunk=no_dependency, qa_worker_limit=24, qb_worker_limit=32,
+            padded_rows=padded_query_rows,
+            qa_row_tile=256, qb_row_tile=128,
+        )
+        # Keep the full query and attention output in separate scope-depth rings.
+        with pl.scope():
+            attn_out = pl.create_tensor([padded_query_rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
             gather_sparse_attention(
-                q, chunk_window_indices, window_cache, chunk_compressed_indices, compressed_cache,
+                q, active_window_indices, window_cache, active_compressed_indices, compressed_cache,
                 attn_sink, attn_out, active, compressed_keys=INDEX_TOPK,
             )
-            _chunk_output, chunk_done = o_proj_hc_post(
-                attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_rope_cos, chunk_rope_sin,
-                hc_input[start:start + active, :, :], post_mix[start:start + active, :],
-                residual_mix[start:start + active, :, :], hc_output[start:start + active, :, :], active,
+            _output, _output_ready = o_proj_hc_post(
+                attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, active_rope_cos, active_rope_sin,
+                hc_input[0:active, :, :], post_mix[0:active, :],
+                residual_mix[0:active, :, :], hc_output[0:active, :, :], active,
                 oa_row_tile=128, ob_row_tile=128,
             )
 
