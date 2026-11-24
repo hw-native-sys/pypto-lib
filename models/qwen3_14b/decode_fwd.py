@@ -28,10 +28,12 @@ boundaries and model-defined compute boundaries.
 
 import argparse
 import os
+from contextlib import nullcontext
 from pathlib import Path
 
 import pypto.language as pl
 import torch
+from pypto import passes
 from pypto.backend import BackendType, set_backend_type
 
 from config import (
@@ -80,6 +82,7 @@ Q_HEAD_PAD = M.q_head_pad
 # paged KV pool (CACHE_ROWS) and the RoPE tables, so a 512-token run can use a much
 # smaller pool than the 4096 micro-benchmark default (less KV memory).
 MAX_SEQ = int(os.environ.get("PTO2_MANUAL_MAX_SEQ", str(M.max_seq)))
+USE_LAYER_GRAPH = False  # Set through configure_layer_graph before compilation.
 
 # ── Derived shapes — recomputed from the above, don't edit ──
 
@@ -114,16 +117,8 @@ RMSNORM_K_CHUNK = 256
 # amortizes the stage=2 pipeline fill better than 8 blocks (only 2-3 chunks each).
 XG_BLOCKS = 5
 
-# ── Scope 1b · Q / K / V projections — SPLIT-K + inner N/K tiling, SPMD style ──
-# Tiling: TM=16 (M = full batch, OM=1), TN=256 inner N sub-tile, TK=256 inner
-# K chunk. Outer: ON = 10 (Q) / 2 (K) / 2 (V) N-tiles of QKV_N_TILE=512 each
-# (= N_SUB=2 inner TN subtiles); OK=4 split-K slices of QKV_K_SLICE=1280 each
-# (= QKV_K_CHUNKS=5 inner TK chunks), atomic-added. Each projection is ONE
-# pl.spmd dispatch of ON*OK blocks; each block does N_SUB N-subtiles x
-# QKV_K_CHUNKS chunks and atomic-adds into a zero-seeded output. SPMD (not
-# pl.parallel + per-iter pl.at) keeps the split-K atomic-adds inside a SINGLE
-# orchestration task so they accumulate in parallel via hardware atomic; auto-dep
-# orders seed -> spmd -> rope_qkv, so NO explicit deps are needed.
+# Q/K/V matmul blocks store disjoint FP32 split-K partials.
+# Dedicated vector tasks reduce the five K slices in increasing order.
 TM = 16  # M tile = BATCH_PAD (OM = 1; M is not split)
 TN = 256  # inner N sub-tile
 TK = 256  # inner K chunk
@@ -131,7 +126,7 @@ QKV_N_TILE = 512  # outer N-tile width (one ON unit) = N_SUB inner TN subtiles
 N_SUB = QKV_N_TILE // TN  # 2 inner N-subtiles per outer N-tile
 Q_ON = HIDDEN // QKV_N_TILE  # 10 outer N-tiles (Q)
 KV_ON = KV_HIDDEN // QKV_N_TILE  # 2 outer N-tiles (K, V)
-QKV_OK = 5  # split-K slices (atomic-add)  # 5 -> QKV_K_SLICE=1024 = normed slab (1:1 partial-Q)
+QKV_OK = 5  # split-K slices  # 5 -> QKV_K_SLICE=1024 = normed slab (1:1 partial-Q)
 QKV_K_SLICE = HIDDEN // QKV_OK  # 1280 K per split
 QKV_K_CHUNKS = QKV_K_SLICE // TK  # 5 inner TK chunks per split
 
@@ -158,40 +153,32 @@ K_RED_ROWS = 8
 assert (Q_HEAD_PAD * 4) % 32 == 0, "Q QK-norm reduction rows (Q_HEAD_PAD) must be 32B-aligned"
 assert (K_RED_ROWS * 4) % 32 == 0, "K QK-norm reduction rows (K_RED_ROWS) must be 32B-aligned"
 
-# ── Scope 3a · out_proj (split-K × split-N, atomic-add into attn_proj_fp32) ──
-K_SPLITS_OUT = 5
+# ── Scope 3a · out_proj (kernel-local K accumulation) ──
 N_SPLITS_OUT = 10
 OUT_INNER_TK = 64
 OUT_TN = HIDDEN // N_SPLITS_OUT  # 512 output N per task
-OUT_TK = HIDDEN // K_SPLITS_OUT  # 1024 K per task
-OUT_N_SUB_K = OUT_TK // OUT_INNER_TK  # 16 inner K iters per task
-N_OUT_DIRECT_BLOCKS = 24
+OUT_FULL_N_TILE = 256
 
 # ── Scope 3b · residual + BF16 cast + RMS reduce ──
 K_CHUNK = 256  # inner pipe width for residual_rms_cast and post_rms_reduce
 
 # ── Scope 3b · MLP gate / up (split-K, atomic-add into per-batch FP32) ──
 MLP_TN = 1024  # output N-tile per task (= silu task N-width = DOWN_TN)
+GATE_N_TILE = 1024
 K_SPLITS_MLP = 5
 MLP_INNER_TK = 64
 MLP_K_SLICE = HIDDEN // K_SPLITS_MLP  # 1024 K per task
-MLP_N_SUB_K = MLP_K_SLICE // MLP_INNER_TK  # 16 inner K iters per task
 MLP_ON = INTERMEDIATE // MLP_TN  # 17 output N-blocks (= silu task count)
-GATE_UP_SPMD_N = 6  # critical-wave: n_out 0..5 → pl.spmd; n≥6 deferred via dummy
 
 # ── Scope 3b · silu (MLP_TN-wide tasks, inner pipe over MLP_OUT_CHUNK sub-tiles) ──
 MLP_OUT_CHUNK = 256  # silu inner-pipe sub-tile width
 SILU_INNER_CHUNKS = MLP_TN // MLP_OUT_CHUNK  # 4 sub-tiles per silu task
 
-# ── Scope 3b · down (split-K, atomic-add into down_acc_all) ──
+# ── Scope 3b · down (two FP32 atomic contributions per destination) ──
 DOWN_TN = 1024  # output N-tile per task (must equal MLP_TN, see assert)
-DOWN_TK = 64  # inner K iter (keeps L0 W tile within Mat buffer at DOWN_TN)
 DOWN_ON = HIDDEN // DOWN_TN  # 5 output N-blocks
-K_SPLITS = INTERMEDIATE // DOWN_TN  # 17 K-slices per N-block
-N_SUB_K = DOWN_TN // DOWN_TK  # 16 inner K iters per task
-
-# ── Cross-stage wiring constraints ──
-N_PER_CAST_K = MLP_K_SLICE // OUT_TN  # 2
+DOWN_PROJ_N_TILE = 512
+DOWN_PROJ_K_TILE = 128
 
 # Geometry assertions — keep at the bottom so all constants are defined first.
 assert QKV_N_TILE % TN == 0, "TN must divide the outer N-tile"
@@ -202,44 +189,11 @@ assert Q_ON == 10 and KV_ON == 2, "expected ON = 10 (Q) + 2 (K) + 2 (V)"
 assert TM == BATCH_PAD and N_SUB == 2 and QKV_K_CHUNKS == 4
 assert DOWN_TN % MLP_OUT_CHUNK == 0, "DOWN_TN must be a multiple of MLP_OUT_CHUNK"
 assert DOWN_ON * DOWN_TN == HIDDEN
-assert K_SPLITS * DOWN_TN == INTERMEDIATE
 assert MLP_ON * MLP_TN == INTERMEDIATE
 assert K_SPLITS_MLP * MLP_K_SLICE == HIDDEN
 assert MLP_TN % MLP_OUT_CHUNK == 0
 assert MLP_TN == DOWN_TN, "silu/down K-slice alignment requires MLP_TN == DOWN_TN"
 assert N_SPLITS_OUT * OUT_TN == HIDDEN
-assert K_SPLITS_OUT * OUT_TK == HIDDEN
-assert OUT_N_SUB_K * OUT_INNER_TK == OUT_TK
-assert N_PER_CAST_K * OUT_TN == MLP_K_SLICE
-
-N_OUT_DIRECT = N_SPLITS_OUT * K_SPLITS_OUT - N_OUT_DIRECT_BLOCKS
-_OUT_TILES_PER_CAST = N_PER_CAST_K * K_SPLITS_OUT  # tiles of one residual-cast slice
-
-
-def _out_direct_split_points():
-    pts = [N_OUT_DIRECT]
-    pt = ((N_OUT_DIRECT // _OUT_TILES_PER_CAST) + 1) * _OUT_TILES_PER_CAST
-    while pt < N_SPLITS_OUT * K_SPLITS_OUT:
-        pts.append(pt)
-        pt += _OUT_TILES_PER_CAST
-    pts.append(N_SPLITS_OUT * K_SPLITS_OUT)
-    return tuple(pts)
-
-
-OUT_DIRECT_SPLIT_POINTS = _out_direct_split_points()
-# _decode_layer expands the direct region as exactly three pl.spmd dispatches;
-# a different N_OUT_DIRECT_BLOCKS needs a matching dispatch count there.
-assert len(OUT_DIRECT_SPLIT_POINTS) == 4, "out_proj direct region must split into exactly 3 segments"
-
-# One named constant per segment: pl.unroll() only accepts compile-time integer
-# literals or resolvable constant names, not subscript expressions.
-OUT_SEG0_START = OUT_DIRECT_SPLIT_POINTS[0]
-OUT_SEG1_START = OUT_DIRECT_SPLIT_POINTS[1]
-OUT_SEG2_START = OUT_DIRECT_SPLIT_POINTS[2]
-OUT_SEG0_WIDTH = OUT_DIRECT_SPLIT_POINTS[1] - OUT_DIRECT_SPLIT_POINTS[0]
-OUT_SEG1_WIDTH = OUT_DIRECT_SPLIT_POINTS[2] - OUT_DIRECT_SPLIT_POINTS[1]
-OUT_SEG2_WIDTH = OUT_DIRECT_SPLIT_POINTS[3] - OUT_DIRECT_SPLIT_POINTS[2]
-assert GATE_UP_SPMD_N < MLP_ON
 
 
 @pl.jit.inline(auto_scope=False)
@@ -312,21 +266,145 @@ def _run_paged_attention(  # noqa: PLR0913 -- paged-attention adapter ABI
 
 
 @pl.jit.inline
+def _full_output_projection(
+    lhs: pl.Tensor[[BATCH_PAD, HIDDEN], pl.BF16],
+    weight: pl.Tensor,
+    layer_base: pl.Scalar[pl.INDEX],
+    result: pl.InOut[pl.Tensor[[BATCH_PAD, HIDDEN], pl.FP32]],
+    ready: pl.Scalar[pl.TASK_ID],
+    done: pl.Array[K_SPLITS_MLP, pl.TASK_ID],
+) -> pl.Tensor[[BATCH_PAD, HIDDEN], pl.FP32]:
+    for group in pl.parallel(K_SPLITS_MLP):
+        with pl.spmd(MLP_K_SLICE // OUT_FULL_N_TILE, name_hint="out_proj", deps=[ready]) as tid:
+            col = group * MLP_K_SLICE + pl.get_block_idx() * OUT_FULL_N_TILE
+            a0 = lhs[:, 0:OUT_INNER_TK]
+            b0 = weight[layer_base:layer_base + OUT_INNER_TK, col:col + OUT_FULL_N_TILE]
+            acc = pl.matmul(a0, b0, out_dtype=pl.FP32)
+            for step in pl.pipeline(1, HIDDEN // OUT_INNER_TK, stage=2):
+                offset = step * OUT_INNER_TK
+                a = lhs[:, offset:offset + OUT_INNER_TK]
+                b = weight[layer_base + offset:layer_base + offset + OUT_INNER_TK, col:col + OUT_FULL_N_TILE]
+                acc = pl.matmul_acc(acc, a, b)
+            result = pl.assemble(result, acc, [0, col])
+        done[group] = tid
+    return result
+
+@pl.jit.inline
+def _mlp_projection_part(
+    lhs: pl.Tensor[[BATCH_PAD, HIDDEN], pl.BF16],
+    weight: pl.Tensor,
+    layer_base: pl.Scalar[pl.INDEX],
+    result: pl.InOut[pl.Tensor[[BATCH_PAD, INTERMEDIATE], pl.FP32]],
+    group: pl.Scalar[pl.INDEX],
+    k_base: pl.Scalar[pl.INDEX],
+    k_length: pl.Scalar[pl.INDEX],
+    ready: pl.Scalar[pl.TASK_ID],
+):
+    with pl.spmd(MLP_TN // GATE_N_TILE, name_hint="gate_proj", deps=[ready]) as tid:
+        pl.set_cache_policy(weight, pl.CachePolicy.BYPASS)
+        col = group * MLP_TN + pl.get_block_idx() * GATE_N_TILE
+        acc = pl.create_tensor([BATCH_PAD, GATE_N_TILE], dtype=pl.FP32)
+        for step in pl.pipeline(0, k_length // MLP_INNER_TK, stage=2):
+            offset = k_base + step * MLP_INNER_TK
+            a = lhs[:, offset:offset + MLP_INNER_TK]
+            b = weight[layer_base + offset:layer_base + offset + MLP_INNER_TK, col:col + GATE_N_TILE]
+            acc = pl.matmul_acc(acc, a, b, init_cond=(step == 0))
+        result = pl.assemble(result, acc, [0, col], atomic=pl.AtomicType.Add)
+    return result, tid
+
+@pl.jit.inline
+def _full_gate_up_projection(
+    lhs: pl.Tensor[[BATCH_PAD, HIDDEN], pl.BF16],
+    gate_weight: pl.Tensor,
+    up_weight: pl.Tensor,
+    layer_base: pl.Scalar[pl.INDEX],
+    gate: pl.InOut[pl.Tensor[[BATCH_PAD, INTERMEDIATE], pl.FP32]],
+    up: pl.InOut[pl.Tensor[[BATCH_PAD, INTERMEDIATE], pl.FP32]],
+    ready: pl.Array[K_SPLITS_MLP, pl.TASK_ID],
+    gate_done: pl.Array[2 * MLP_ON, pl.TASK_ID],
+    up_done: pl.Array[2 * MLP_ON, pl.TASK_ID],
+) -> tuple[pl.Tensor, pl.Tensor]:
+    # Destinations are zeroed before the cast dependencies. Each element has two finite FP32 contributions.
+    first_ready = pl.system.task_dummy(deps=[ready[0], ready[1], ready[2]])
+    last_ready = pl.system.task_dummy(deps=[ready[2], ready[3], ready[4]])
+    first_base = pl.cast(0, pl.INDEX)
+    half_hidden = pl.cast(HIDDEN // 2, pl.INDEX)
+    for group in pl.parallel(MLP_ON):
+        gate, gate_first = _mlp_projection_part(
+            lhs, gate_weight, layer_base, gate, group, first_base, half_hidden, first_ready,
+        )
+        up, up_first = _mlp_projection_part(
+            lhs, up_weight, layer_base, up, group, first_base, half_hidden, first_ready,
+        )
+        gate, gate_last = _mlp_projection_part(
+            lhs, gate_weight, layer_base, gate, group, half_hidden, half_hidden, last_ready,
+        )
+        up, up_last = _mlp_projection_part(
+            lhs, up_weight, layer_base, up, group, half_hidden, half_hidden, last_ready,
+        )
+        gate_done[2 * group] = gate_first
+        gate_done[2 * group + 1] = gate_last
+        up_done[2 * group] = up_first
+        up_done[2 * group + 1] = up_last
+    return gate, up
+
+@pl.jit.inline
+def _down_projection_part(
+    lhs: pl.Tensor[[BATCH_PAD, INTERMEDIATE], pl.BF16],
+    weight: pl.Tensor,
+    layer_base: pl.Scalar[pl.INDEX],
+    result: pl.InOut[pl.Tensor[[BATCH_PAD, HIDDEN], pl.FP32]],
+    k_base: pl.Scalar[pl.INDEX],
+    ready: pl.Scalar[pl.TASK_ID],
+):
+    with pl.spmd(HIDDEN // DOWN_PROJ_N_TILE, name_hint="down_proj", allow_early_resolve=True, deps=[ready]) as tid:
+        pl.set_cache_policy(weight, pl.CachePolicy.BYPASS)
+        col = pl.get_block_idx() * DOWN_PROJ_N_TILE
+        acc = pl.create_tensor([BATCH_PAD, DOWN_PROJ_N_TILE], dtype=pl.FP32)
+        for step in pl.pipeline(0, INTERMEDIATE // (2 * DOWN_PROJ_K_TILE), stage=2):
+            offset = k_base + step * DOWN_PROJ_K_TILE
+            a = lhs[:, offset:offset + DOWN_PROJ_K_TILE]
+            b = weight[layer_base + offset:layer_base + offset + DOWN_PROJ_K_TILE, col:col + DOWN_PROJ_N_TILE]
+            acc = pl.matmul_acc(acc, a, b, init_cond=(step == 0))
+        result = pl.assemble(result, acc, [0, col], atomic=pl.AtomicType.Add)
+    return result, tid
+
+@pl.jit.inline
+def _full_down_projection(
+    lhs: pl.Tensor[[BATCH_PAD, INTERMEDIATE], pl.BF16],
+    weight: pl.Tensor,
+    layer_base: pl.Scalar[pl.INDEX],
+    result: pl.InOut[pl.Tensor[[BATCH_PAD, HIDDEN], pl.FP32]],
+    ready: pl.Array[MLP_ON, pl.TASK_ID],
+    done: pl.Array[2, pl.TASK_ID],
+) -> pl.Tensor:
+    first_ready = pl.system.task_dummy(deps=[ready[i] for i in range((MLP_ON + 1) // 2)])
+    last_ready = pl.system.task_dummy(deps=[ready[MLP_ON // 2 + i] for i in range((MLP_ON + 1) // 2)])
+    first_base = pl.cast(0, pl.INDEX)
+    last_base = pl.cast(INTERMEDIATE // 2, pl.INDEX)
+    result, first = _down_projection_part(lhs, weight, layer_base, result, first_base, first_ready)
+    result, last = _down_projection_part(lhs, weight, layer_base, result, last_base, last_ready)
+    done[0] = first
+    done[1] = last
+    return result
+
+
+@pl.jit.inline
 def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     hidden_states: pl.Tensor[[BATCH_PAD, HIDDEN], pl.FP32],  # FP32: inter-layer carry (was BF16)
     input_rms_weight: pl.Tensor,
     wq: pl.Tensor,
     wk: pl.Tensor,
     wv: pl.Tensor,
-    q_norm_weight: pl.Tensor,
-    k_norm_weight: pl.Tensor,
-    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
-    block_table: pl.Tensor[[D.block_table_flat], pl.INT32],
-    slot_mapping: pl.Tensor[[BATCH_DYN], pl.INT32],
+    q_norm_w: pl.Tensor,
+    k_norm_w: pl.Tensor,
+    window_seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    window_block_table: pl.Tensor[[D.block_table_flat], pl.INT32],
+    window_slot_mapping: pl.Tensor[[BATCH_DYN], pl.INT32],
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
-    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
-    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
     score_transfer: pl.Tensor[[PA_TRANSFER_ROWS, PA_STACK_TOKENS], pl.FP32],
     probability_transfer: pl.Tensor[[PA_TRANSFER_ROWS, PA_STACK_TOKENS], pl.BF16],
     pv_transfer: pl.Tensor[[PA_TRANSFER_ROWS, HEAD_DIM], pl.FP32],
@@ -337,7 +415,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     w_up: pl.Tensor,
     w_down: pl.Tensor,
     post_rms_weight: pl.Tensor,
-    out: pl.Tensor[[BATCH_PAD, HIDDEN], pl.FP32],  # FP32: inter-layer carry (was BF16)
+    out: pl.Tensor[[BATCH_PAD, HIDDEN], pl.FP32],
     # normed_in: THIS layer's x*gamma (BF16), produced by the previous layer's fused
     # dcr_xgamma (x_gamma_0 for layer 0). Consumed by QKV — replaces the local x_gamma.
     normed_in: pl.Tensor[[BATCH_PAD, HIDDEN], pl.BF16],
@@ -346,16 +424,10 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     normed_out: pl.Tensor[[BATCH_PAD, HIDDEN], pl.BF16],
     layer_idx: pl.Scalar[pl.INT32],
     next_gamma_idx: pl.Scalar[pl.INT32],  # clamped min(layer_idx+1, N-1) for dcr_xgamma's gamma
-    # x_gamma0 / dcr_xgamma are SPMD producers, so each carry has exactly one
-    # task id.  Keep that id in a length-one Array across inline-loop boundaries:
-    # Array mutation is preserved by the inline lowering, unlike a re-bound Scalar.
+    layer_cache_base_token_rows: pl.Scalar[pl.INDEX],
     prev_out_tid: pl.Array[1, pl.TASK_ID],
     prev_normed_tid: pl.Array[1, pl.TASK_ID],
-    # Public batch WINDOW this call serves. The row-indexed tensors above
-    # (hidden_states, normed_in/out, out) already hold the window's rows;
-    # seq_lens / slot_mapping / block_table are whole-batch; native PA receives
-    # runtime-shaped views of the rows starting at batch_offset.
-    batch_offset: pl.Scalar[pl.INDEX],
+    # Row metadata and hidden/normed tensors already describe this batch window.
     batch_count: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[BATCH_PAD, HIDDEN], pl.FP32]:
     # Per-layer offsets into the STACKED weights / PAGED KV cache. decode_fwd passes
@@ -363,51 +435,19 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     # 0.._CHUNK_NLAYERS-1 (per-chunk weight slices).
     layer_hidden_base = layer_idx * HIDDEN
     layer_inter_base = layer_idx * INTERMEDIATE
-    # Paged KV: the public ABI is flat [head_rows, HEAD_DIM]. Native PyPTO packs
-    # all KV heads into one BSND token row through this zero-copy view.
-    num_layers_actual = pl.tensor.dim(input_rms_weight, 0)
-    cache_rows = pl.tensor.dim(k_cache, 0) // NUM_KV_HEADS
-    layer_cache_rows = cache_rows // num_layers_actual
-    layer_cache_base_token_rows = layer_idx * layer_cache_rows
+    # The caller supplies the layer's paged-KV base in BSND token rows.
     batch = batch_count  # live rows in THIS window; pipeline rows above it are masked
-    batch_rows = pl.cast(batch_count, pl.INDEX)
-
-    # Native PyPTO PA derives its active batch and block-table row stride from
-    # the descriptors it receives. Give it a dynamic view of this public-batch
-    # window while preserving the absolute physical page / slot ids stored in
-    # the underlying tensors.
-    public_batch = pl.tensor.dim(seq_lens, 0)
-    max_blocks_per_seq = pl.tensor.dim(block_table, 0) // public_batch
-    window_seq_lens = pl.slice(
-        seq_lens,
-        [batch_rows],
-        [batch_offset],
-    )
-    window_slot_mapping = pl.slice(
-        slot_mapping,
-        [batch_rows],
-        [batch_offset],
-    )
-    window_block_table = pl.slice(
-        block_table,
-        [batch_rows * max_blocks_per_seq],
-        [batch_offset * max_blocks_per_seq],
-    )
-    q_norm_w = pl.slice(q_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
-    k_norm_w = pl.slice(k_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
 
     # Scope 1
-    # down_proj TaskIds — HOISTED to orchestration scope (declared before
-    # manual_scope) so the consolidated `down_cast_residual` writer that runs
-    # AFTER the manual_scope can gate on them via deps=. Filled inside the
-    # manual_scope down_proj loop; the consolidated writer reads them per-index
-    # (deps=[down_tids[k] for k in range(DOWN_ON * K_SPLITS)] — list-comprehension
-    # per-index fence works for large N; whole-array deps=[down_tids] does not).
-    down_tids = pl.array.create(DOWN_ON * K_SPLITS, pl.TASK_ID)
+    # Both Down completion ids remain visible to the residual writer outside the manual scope.
+    down_tids = pl.array.create(2, pl.TASK_ID)
     inv_rms_states = pl.create_tensor([BATCH_PAD, 1], dtype=pl.FP32)  # deferred 1/rms denominator
     q_proj = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.FP32)
+    q_parts = pl.create_tensor([BATCH_PAD * QKV_OK, HIDDEN], dtype=pl.FP32)
     k_proj = pl.create_tensor([BATCH_PAD, KV_HIDDEN], dtype=pl.FP32)
+    k_parts = pl.create_tensor([BATCH_PAD * QKV_OK, KV_HIDDEN], dtype=pl.FP32)
     v_proj = pl.create_tensor([BATCH_PAD, KV_HIDDEN], dtype=pl.FP32)
+    v_parts = pl.create_tensor([BATCH_PAD * QKV_OK, KV_HIDDEN], dtype=pl.FP32)
 
     # ── Scope 1: input RMSNorm, SPLIT into two INDEPENDENT steps. ──
     # RMSNorm(x) = (x * inv_rms) * gamma, where inv_rms[b] = 1/sqrt(mean_k x^2 +
@@ -469,26 +509,18 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             inv_rms = pl.recip(pl.sqrt(variance))
             inv_rms_states = pl.assemble(inv_rms_states, inv_rms, [0, 0])
 
-        # ── Scope 1: Q projection — SPLIT-K + inner N/K tiling, SPMD (seed + atomic). ──
-        with (
-            pl.at(level=pl.Level.CORE_GROUP, name_hint="q_seed", allow_early_resolve=True) as q_seed_tid
-        ):  # no explicit dep: runtime q_proj WAR hazard orders it after the previous fused PA reader
-            for snb in pl.pipeline(Q_ON, stage=2):
-                q_proj = pl.assemble(
-                    q_proj, pl.full([BATCH_PAD, QKV_N_TILE], dtype=pl.FP32, value=0.0), [0, snb * QKV_N_TILE]
-                )
+        # ── Scope 1: Q projection — SPLIT-K + inner N/K tiling, SPMD private partials. ──
         # Carry task ids are length-one Arrays; build the explicit dependency
         # array before passing it through deps= so inline lowering retains the
         # prev_normed edge.
-        prev_normed_q_deps = pl.array.create(2, pl.TASK_ID)
+        prev_normed_q_deps = pl.array.create(1, pl.TASK_ID)
         prev_normed_q_deps[0] = prev_normed_tid[0]
-        prev_normed_q_deps[1] = q_seed_tid
         with pl.spmd(
             Q_ON * QKV_OK,
             name_hint="q_proj",
             allow_early_resolve=True,
-            deps=[prev_normed_q_deps[i] for i in range(2)],
-        ) as q_proj_tid:
+            deps=[prev_normed_q_deps[i] for i in range(1)],
+        ) as q_parts_tid:
             pl.set_cache_policy(wq, pl.CachePolicy.BYPASS)
             q_blk = pl.get_block_idx()
             q_nt = q_blk // QKV_OK
@@ -506,20 +538,24 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                         wq[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN],
                         init_cond=(kc == 0),
                     )
-                q_proj = pl.assemble(q_proj, q_acc, [0, n0], atomic=pl.AtomicType.Add)
+                q_parts = pl.assemble(q_parts, q_acc, [q_ks * BATCH_PAD, n0])
 
-        # ── Scope 1: K projection — SPLIT-K + inner N/K tiling, SPMD (seed + atomic). ──
-        with pl.at(
-            level=pl.Level.CORE_GROUP,
-            name_hint="kv_seed",
-            deps=[prev_normed_seed_deps[i] for i in range(2)],
-        ) as kv_seed_tid:
-            k_proj = pl.assemble(k_proj, pl.full([BATCH_PAD, KV_HIDDEN], dtype=pl.FP32, value=0.0), [0, 0])
-            v_proj = pl.assemble(v_proj, pl.full([BATCH_PAD, KV_HIDDEN], dtype=pl.FP32, value=0.0), [0, 0])
 
-        # Create the MLP/output accumulators and their single seed immediately
-        # after kv_seed, matching c61f710's task-generation order.  The
-        # unflagged seed_dummy keeps this setup out of Q's early window.
+        with pl.spmd(Q_ON, name_hint="q_split_k_reduce", allow_early_resolve=True, deps=[q_parts_tid]) as q_proj_tid:
+            q_reduce_base = pl.get_block_idx() * QKV_N_TILE
+            for q_reduce_sub in pl.range(N_SUB):
+                q_reduce_n0 = q_reduce_base + q_reduce_sub * TN
+                q_reduce_acc = q_parts[0:BATCH_PAD, q_reduce_n0:q_reduce_n0 + TN]
+                for q_reduce_k in pl.range(1, QKV_OK):
+                    q_reduce_row = q_reduce_k * BATCH_PAD
+                    q_reduce_part = q_parts[q_reduce_row:q_reduce_row + BATCH_PAD, q_reduce_n0:q_reduce_n0 + TN]
+                    q_reduce_acc = pl.add(q_reduce_acc, q_reduce_part)
+                q_proj = pl.assemble(q_proj, q_reduce_acc, [0, q_reduce_n0])
+
+        # ── Scope 1: K projection — SPLIT-K + inner N/K tiling, SPMD private partials. ──
+        kv_seed_tid = pl.system.task_dummy(deps=[prev_normed_seed_deps[i] for i in range(2)])
+
+        # Down must be zero-initialized before either atomic-add producer runs.
         down_acc_all = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.FP32)
         gate_acc_all = pl.create_tensor([BATCH_PAD, INTERMEDIATE], dtype=pl.FP32)
         up_acc_all = pl.create_tensor([BATCH_PAD, INTERMEDIATE], dtype=pl.FP32)
@@ -530,10 +566,6 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             allow_early_resolve=True,
             deps=[prev_normed_seed_deps[i] for i in range(2)],
         ) as mlp_out_seed_tid:
-            for nb in pl.pipeline(DOWN_ON, stage=2):
-                n0 = nb * DOWN_TN
-                zero = pl.full([BATCH_PAD, DOWN_TN], dtype=pl.FP32, value=0.0)
-                down_acc_all = pl.assemble(down_acc_all, zero, [0, n0])
             for nb in pl.pipeline(MLP_ON, stage=2):
                 n0 = nb * MLP_TN
                 zero = pl.full([BATCH_PAD, MLP_TN], dtype=pl.FP32, value=0.0)
@@ -542,17 +574,18 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 n0 = nb * MLP_TN
                 zero = pl.full([BATCH_PAD, MLP_TN], dtype=pl.FP32, value=0.0)
                 up_acc_all = pl.assemble(up_acc_all, zero, [0, n0])
-            for nb in pl.pipeline(N_SPLITS_OUT, stage=2):
-                out_seed_n0 = nb * OUT_TN
+
+            for out_seed_n in pl.pipeline(N_SPLITS_OUT, stage=2):
+                out_seed_n0 = out_seed_n * OUT_TN
                 out_zero = pl.full([BATCH_PAD, OUT_TN], dtype=pl.FP32, value=0.0)
-                attn_proj_fp32 = pl.assemble(attn_proj_fp32, out_zero, [0, out_seed_n0])
+                down_acc_all = pl.assemble(down_acc_all, out_zero, [0, out_seed_n0])
 
         with pl.spmd(
             KV_ON * QKV_OK,
             name_hint="k_proj",
             allow_early_resolve=True,
             deps=[kv_seed_tid],
-        ) as k_proj_tid:
+        ) as k_parts_tid:
             pl.set_cache_policy(wk, pl.CachePolicy.BYPASS)
             k_blk = pl.get_block_idx()
             k_nt = k_blk // QKV_OK
@@ -570,14 +603,26 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                         wk[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN],
                         init_cond=(kc == 0),
                     )
-                k_proj = pl.assemble(k_proj, k_acc, [0, n0], atomic=pl.AtomicType.Add)
+                k_parts = pl.assemble(k_parts, k_acc, [k_ks * BATCH_PAD, n0])
+
+
+        with pl.spmd(KV_ON, name_hint="k_split_k_reduce", allow_early_resolve=True, deps=[k_parts_tid]) as k_proj_tid:
+            k_reduce_base = pl.get_block_idx() * QKV_N_TILE
+            for k_reduce_sub in pl.range(N_SUB):
+                k_reduce_n0 = k_reduce_base + k_reduce_sub * TN
+                k_reduce_acc = k_parts[0:BATCH_PAD, k_reduce_n0:k_reduce_n0 + TN]
+                for k_reduce_k in pl.range(1, QKV_OK):
+                    k_reduce_row = k_reduce_k * BATCH_PAD
+                    k_reduce_part = k_parts[k_reduce_row:k_reduce_row + BATCH_PAD, k_reduce_n0:k_reduce_n0 + TN]
+                    k_reduce_acc = pl.add(k_reduce_acc, k_reduce_part)
+                k_proj = pl.assemble(k_proj, k_reduce_acc, [0, k_reduce_n0])
 
         with pl.spmd(
             KV_ON * QKV_OK,
             name_hint="v_proj",
             allow_early_resolve=True,
             deps=[kv_seed_tid],
-        ) as v_proj_tid:
+        ) as v_parts_tid:
             pl.set_cache_policy(wv, pl.CachePolicy.BYPASS)
             v_blk = pl.get_block_idx()
             v_nt = v_blk // QKV_OK
@@ -595,7 +640,19 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                         wv[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN],
                         init_cond=(kc == 0),
                     )
-                v_proj = pl.assemble(v_proj, v_acc, [0, n0], atomic=pl.AtomicType.Add)
+                v_parts = pl.assemble(v_parts, v_acc, [v_ks * BATCH_PAD, n0])
+
+
+        with pl.spmd(KV_ON, name_hint="v_split_k_reduce", allow_early_resolve=True, deps=[v_parts_tid]) as v_proj_tid:
+            v_reduce_base = pl.get_block_idx() * QKV_N_TILE
+            for v_reduce_sub in pl.range(N_SUB):
+                v_reduce_n0 = v_reduce_base + v_reduce_sub * TN
+                v_reduce_acc = v_parts[0:BATCH_PAD, v_reduce_n0:v_reduce_n0 + TN]
+                for v_reduce_k in pl.range(1, QKV_OK):
+                    v_reduce_row = v_reduce_k * BATCH_PAD
+                    v_reduce_part = v_parts[v_reduce_row:v_reduce_row + BATCH_PAD, v_reduce_n0:v_reduce_n0 + TN]
+                    v_reduce_acc = pl.add(v_reduce_acc, v_reduce_part)
+                v_proj = pl.assemble(v_proj, v_reduce_acc, [0, v_reduce_n0])
 
         # PyPTO emits one fused Q/K/V/RMS -> Phase-0 -> syncall -> PA task over
         # the shared BSND cache root. The row-window views keep its local batch
@@ -634,8 +691,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         )
         # Explicit caller-owned carry serializes reuse of the single scratch set.
         scratch_ready[0] = attn_done_tid
-        # Scope-3 allocations. (down_acc_all / gate_acc_all / up_acc_all / attn_proj_fp32
-        # are created earlier, alongside their hoisted seed tasks between rope and attn.)
+        # Raw residual and normalized MLP input are shared by the following consumers.
         post_norm_partial = pl.create_tensor(
             [BATCH_PAD, HIDDEN], dtype=pl.FP32
         )  # raw residual h1 (add-back); FP32 (was BF16)
@@ -648,176 +704,25 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         # down_tids is hoisted to orchestration scope (declared before this
         # manual_scope) so the post-scope consolidated writer can gate on it;
         # it is FILLED here in the down_proj loop below.
-        gate_tids = pl.array.create(MLP_ON * K_SPLITS_MLP, pl.TASK_ID)
-        up_tids = pl.array.create(MLP_ON * K_SPLITS_MLP, pl.TASK_ID)
         cast_tids = pl.array.create(K_SPLITS_MLP, pl.TASK_ID)
-        # Per-k task_dummy funnels for the deferred (non-critical) gate/up tiles.
-        # Filled in the k_split-keyed critical-wave loop, consumed by the
-        # [n_out outer, k_split inner] deferred-tile loop (symbolic pl.range
-        # indexing requires a pl.array, not a Python list).
-        gate_late_tids = pl.array.create(K_SPLITS_MLP, pl.TASK_ID)
-        up_late_tids = pl.array.create(K_SPLITS_MLP, pl.TASK_ID)
-        out_tids = pl.array.create(N_SPLITS_OUT * K_SPLITS_OUT, pl.TASK_ID)
+        out_tids = pl.array.create(K_SPLITS_MLP, pl.TASK_ID)
 
-        # 14e2635 critical-wave split: defer the first 26 tiles through an
-        # unflagged dummy, while the final 24 tiles are gated directly by FAI.
-        # The direct region is split at residual-cast slice boundaries
-        # (OUT_DIRECT_SPLIT_POINTS, derived at module level), so each cast
-        # slice starts as soon as its own out_proj tiles finish instead of
-        # waiting for the whole 24-tile region.  The direct dispatches
-        # intentionally have no allow_early_resolve flag.
-        out_proj_dummy = pl.system.task_dummy(deps=[attn_done_tid])
-        for out_idx in pl.parallel(0, N_OUT_DIRECT):
-            n_out_proj = out_idx // K_SPLITS_OUT
-            k_split_out = out_idx % K_SPLITS_OUT
-            n_op = n_out_proj * OUT_TN
-            k_op = k_split_out * OUT_TK
-            with pl.at(
-                level=pl.Level.CORE_GROUP,
-                name_hint="out_proj",
-                deps=[out_proj_dummy],
-            ) as out_tid:
-                out_c_acc = pl.create_tensor([BATCH_PAD, OUT_TN], dtype=pl.FP32)
-                for out_lk in pl.pipeline(0, OUT_N_SUB_K, stage=2):
-                    out_ks_off = out_lk * OUT_INNER_TK
-                    out_a_k = attn_out[:, k_op + out_ks_off : k_op + out_ks_off + OUT_INNER_TK]
-                    out_w_k = wo[
-                        layer_hidden_base + k_op + out_ks_off : layer_hidden_base
-                        + k_op
-                        + out_ks_off
-                        + OUT_INNER_TK,
-                        n_op : n_op + OUT_TN,
-                    ]
-                    out_c_acc = pl.matmul_acc(out_c_acc, out_a_k, out_w_k, init_cond=(out_lk == 0))
-                attn_proj_fp32 = pl.assemble(attn_proj_fp32, out_c_acc, [0, n_op], atomic=pl.AtomicType.Add)
-            out_tids[out_idx] = out_tid
-
-        with pl.spmd(
-            OUT_SEG0_WIDTH,
-            name_hint="out_proj",
-            deps=[attn_done_tid],
-        ) as out_proj_direct_tid_0:
-            out_idx = OUT_SEG0_START + pl.get_block_idx()
-            n_out_proj = out_idx // K_SPLITS_OUT
-            k_split_out = out_idx % K_SPLITS_OUT
-            n_op = n_out_proj * OUT_TN
-            k_op = k_split_out * OUT_TK
-            # This peel is NOT foldable into init_cond: with a create_tensor
-            # accumulator ptoas rejects the region with "'pto.tmatmul' op expects
-            # dst to be in the acc address space". The pl.at out_proj above takes
-            # init_cond fine; only this pl.spmd copy does not.
-            out_a0 = attn_out[:, k_op : k_op + OUT_INNER_TK]
-            out_w0 = wo[
-                layer_hidden_base + k_op : layer_hidden_base + k_op + OUT_INNER_TK, n_op : n_op + OUT_TN
-            ]
-            out_c_acc = pl.matmul(out_a0, out_w0, out_dtype=pl.FP32)
-            for out_lk in pl.pipeline(1, OUT_N_SUB_K, stage=2):
-                out_ks_off = out_lk * OUT_INNER_TK
-                out_a_k = attn_out[:, k_op + out_ks_off : k_op + out_ks_off + OUT_INNER_TK]
-                out_w_k = wo[
-                    layer_hidden_base + k_op + out_ks_off : layer_hidden_base
-                    + k_op
-                    + out_ks_off
-                    + OUT_INNER_TK,
-                    n_op : n_op + OUT_TN,
-                ]
-                out_c_acc = pl.matmul_acc(out_c_acc, out_a_k, out_w_k, init_cond=(out_lk == 0))
-            attn_proj_fp32 = pl.assemble(attn_proj_fp32, out_c_acc, [0, n_op], atomic=pl.AtomicType.Add)
-        for _block in pl.unroll(OUT_SEG0_WIDTH):
-            out_tids[OUT_SEG0_START + _block] = out_proj_direct_tid_0
-
-        with pl.spmd(
-            OUT_SEG1_WIDTH,
-            name_hint="out_proj",
-            deps=[attn_done_tid],
-        ) as out_proj_direct_tid_1:
-            out_idx = OUT_SEG1_START + pl.get_block_idx()
-            n_out_proj = out_idx // K_SPLITS_OUT
-            k_split_out = out_idx % K_SPLITS_OUT
-            n_op = n_out_proj * OUT_TN
-            k_op = k_split_out * OUT_TK
-            # This peel is NOT foldable into init_cond: with a create_tensor
-            # accumulator ptoas rejects the region with "'pto.tmatmul' op expects
-            # dst to be in the acc address space". The pl.at out_proj above takes
-            # init_cond fine; only this pl.spmd copy does not.
-            out_a0 = attn_out[:, k_op : k_op + OUT_INNER_TK]
-            out_w0 = wo[
-                layer_hidden_base + k_op : layer_hidden_base + k_op + OUT_INNER_TK, n_op : n_op + OUT_TN
-            ]
-            out_c_acc = pl.matmul(out_a0, out_w0, out_dtype=pl.FP32)
-            for out_lk in pl.pipeline(1, OUT_N_SUB_K, stage=2):
-                out_ks_off = out_lk * OUT_INNER_TK
-                out_a_k = attn_out[:, k_op + out_ks_off : k_op + out_ks_off + OUT_INNER_TK]
-                out_w_k = wo[
-                    layer_hidden_base + k_op + out_ks_off : layer_hidden_base
-                    + k_op
-                    + out_ks_off
-                    + OUT_INNER_TK,
-                    n_op : n_op + OUT_TN,
-                ]
-                out_c_acc = pl.matmul_acc(out_c_acc, out_a_k, out_w_k, init_cond=(out_lk == 0))
-            attn_proj_fp32 = pl.assemble(attn_proj_fp32, out_c_acc, [0, n_op], atomic=pl.AtomicType.Add)
-        for _block in pl.unroll(OUT_SEG1_WIDTH):
-            out_tids[OUT_SEG1_START + _block] = out_proj_direct_tid_1
-
-        with pl.spmd(
-            OUT_SEG2_WIDTH,
-            name_hint="out_proj",
-            deps=[attn_done_tid],
-        ) as out_proj_direct_tid_2:
-            out_idx = OUT_SEG2_START + pl.get_block_idx()
-            n_out_proj = out_idx // K_SPLITS_OUT
-            k_split_out = out_idx % K_SPLITS_OUT
-            n_op = n_out_proj * OUT_TN
-            k_op = k_split_out * OUT_TK
-            # This peel is NOT foldable into init_cond: with a create_tensor
-            # accumulator ptoas rejects the region with "'pto.tmatmul' op expects
-            # dst to be in the acc address space". The pl.at out_proj above takes
-            # init_cond fine; only this pl.spmd copy does not.
-            out_a0 = attn_out[:, k_op : k_op + OUT_INNER_TK]
-            out_w0 = wo[
-                layer_hidden_base + k_op : layer_hidden_base + k_op + OUT_INNER_TK, n_op : n_op + OUT_TN
-            ]
-            out_c_acc = pl.matmul(out_a0, out_w0, out_dtype=pl.FP32)
-            for out_lk in pl.pipeline(1, OUT_N_SUB_K, stage=2):
-                out_ks_off = out_lk * OUT_INNER_TK
-                out_a_k = attn_out[:, k_op + out_ks_off : k_op + out_ks_off + OUT_INNER_TK]
-                out_w_k = wo[
-                    layer_hidden_base + k_op + out_ks_off : layer_hidden_base
-                    + k_op
-                    + out_ks_off
-                    + OUT_INNER_TK,
-                    n_op : n_op + OUT_TN,
-                ]
-                out_c_acc = pl.matmul_acc(out_c_acc, out_a_k, out_w_k, init_cond=(out_lk == 0))
-            attn_proj_fp32 = pl.assemble(attn_proj_fp32, out_c_acc, [0, n_op], atomic=pl.AtomicType.Add)
-        for _block in pl.unroll(OUT_SEG2_WIDTH):
-            out_tids[OUT_SEG2_START + _block] = out_proj_direct_tid_2
+        attn_proj_fp32 = _full_output_projection(
+            attn_out, wo, layer_hidden_base, attn_proj_fp32, attn_done_tid, out_tids,
+        )
 
         # Tiled residual + BF16 cast.
         for k_slice in pl.unroll(K_SPLITS_MLP):
             k_base = k_slice * MLP_K_SLICE
-            n_split_base = k_slice * N_PER_CAST_K
             with pl.at(
                 level=pl.Level.CORE_GROUP,
                 name_hint="residual_rms_cast",
                 allow_early_resolve=True,
-                deps=[
-                    out_tids[(n_split_base + 0) * K_SPLITS_OUT + 0],
-                    out_tids[(n_split_base + 0) * K_SPLITS_OUT + 1],
-                    out_tids[(n_split_base + 0) * K_SPLITS_OUT + 2],
-                    out_tids[(n_split_base + 0) * K_SPLITS_OUT + 3],
-                    out_tids[(n_split_base + 0) * K_SPLITS_OUT + 4],
-                    out_tids[(n_split_base + 1) * K_SPLITS_OUT + 0],
-                    out_tids[(n_split_base + 1) * K_SPLITS_OUT + 1],
-                    out_tids[(n_split_base + 1) * K_SPLITS_OUT + 2],
-                    out_tids[(n_split_base + 1) * K_SPLITS_OUT + 3],
-                    out_tids[(n_split_base + 1) * K_SPLITS_OUT + 4],
-                ],
+                deps=[out_tids[k_slice]],
             ) as cast_tid_k:
                 for kb in pl.pipeline(MLP_K_SLICE // K_CHUNK, stage=2):
                     k0 = k_base + kb * K_CHUNK
-                    attn_chunk = attn_proj_fp32[:, k0 : k0 + K_CHUNK]
+                    attn_chunk = attn_proj_fp32[:, k0:k0 + K_CHUNK]
                     hidden_chunk = hidden_states[:, k0 : k0 + K_CHUNK]  # FP32 already
                     resid_fp32 = pl.add(attn_chunk, hidden_chunk)
                     # Raw residual h1 — added back after down_proj (must NOT be gamma-scaled).
@@ -835,14 +740,12 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     )
             cast_tids[k_slice] = cast_tid_k
 
-        # RMS reduction reads all of attn_proj_fp32.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="post_rms_reduce", deps=[out_tids]) as reduce_tid:
+        # Reduce the raw residual produced by the casts, preserving the FP32 order.
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="post_rms_reduce", deps=[cast_tids]) as reduce_tid:
             sq_sum = pl.full([1, BATCH_PAD], dtype=pl.FP32, value=0.0)
             for kb in pl.pipeline(HIDDEN // K_CHUNK, stage=2):
                 k0 = kb * K_CHUNK
-                attn_chunk = attn_proj_fp32[:, k0 : k0 + K_CHUNK]
-                hidden_chunk = hidden_states[:, k0 : k0 + K_CHUNK]  # FP32 already
-                resid_chunk = pl.add(attn_chunk, hidden_chunk)
+                resid_chunk = post_norm_partial[:, k0:k0 + K_CHUNK]
                 sq_sum = pl.add(
                     sq_sum,
                     pl.reshape(pl.row_sum(pl.mul(resid_chunk, resid_chunk)), [1, BATCH_PAD]),
@@ -851,128 +754,12 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             post_inv_rms_col = pl.reshape(post_inv_rms, [BATCH_PAD, 1])
             inv_rms_tile = pl.assemble(inv_rms_tile, post_inv_rms_col, [0, 0])
 
-        # Split-K gate + up critical-wave (per cast / k_split), like out_proj:
-        #   * n_out ∈ [0, GATE_UP_SPMD_N) → pl.spmd(GATE_UP_SPMD_N, deps=[cast])
-        #   * n_out ∈ [GATE_UP_SPMD_N, MLP_ON) → task_dummy(cast) → pl.at
-        #
-        # EXPERIMENT: this is split into two loops so the deferred (non-critical)
-        # tiles run in the baseline [n_out outer, k_split inner] order:
-        #   Loop 1 (k_split-keyed, pl.unroll): the critical-wave SPMD dispatches
-        #     for the leading GATE_UP_SPMD_N tiles + the per-k task_dummy funnels
-        #     (gate_late_tids/up_late_tids).
-        #   Loop 2 (n_out outer / pl.parallel, k_split inner / pl.range): the
-        #     deferred tiles' gate/up matmuls, each depending on the funnel dummy
-        #     for its k_split.
-        # The two n-tile ranges write disjoint n0 columns of gate/up_acc_all
-        # (atomic-add over k), so the split is value-equivalent to the fused form.
-        #
-        # NOTE: Loop 1 still runs at the top level of a `pl.unroll` body, so it
-        # keeps the dedicated `gu_k0` (a bare `k0` would leak as a constant into
-        # the later down_proj `pl.parallel(DOWN_ON)` loop — orchestration codegen
-        # rejects the literal-init iter_arg). Loop 2 reassigns `k0` inside a real
-        # `pl.range` scope, so that leak does not apply there.
-        for k_split in pl.unroll(K_SPLITS_MLP):
-            gu_k0 = k_split * MLP_K_SLICE
-            gate_late_tids[k_split] = pl.system.task_dummy(deps=[cast_tids[k_split]])
-            up_late_tids[k_split] = pl.system.task_dummy(deps=[cast_tids[k_split]])
-
-            with pl.spmd(
-                GATE_UP_SPMD_N,
-                name_hint="gate_proj",
-                deps=[cast_tids[k_split]],
-            ) as gate_spmd_tid:
-                pl.set_cache_policy(w_gate, pl.CachePolicy.BYPASS)
-                spmd_gate_n_out = pl.get_block_idx()
-                spmd_gate_n0 = spmd_gate_n_out * MLP_TN
-                spmd_gate_c_acc = pl.create_tensor([BATCH_PAD, MLP_TN], dtype=pl.FP32)
-                for spmd_gate_lk in pl.pipeline(0, MLP_N_SUB_K, stage=2):
-                    spmd_gate_ks_off = spmd_gate_lk * MLP_INNER_TK
-                    spmd_gate_a_k = mlp_norm_in[
-                        :, gu_k0 + spmd_gate_ks_off : gu_k0 + spmd_gate_ks_off + MLP_INNER_TK
-                    ]
-                    spmd_gate_w_k = w_gate[
-                        layer_hidden_base + gu_k0 + spmd_gate_ks_off : layer_hidden_base
-                        + gu_k0
-                        + spmd_gate_ks_off
-                        + MLP_INNER_TK,
-                        spmd_gate_n0 : spmd_gate_n0 + MLP_TN,
-                    ]
-                    spmd_gate_c_acc = pl.matmul_acc(spmd_gate_c_acc, spmd_gate_a_k, spmd_gate_w_k, init_cond=(spmd_gate_lk == 0))
-                gate_acc_all = pl.assemble(
-                    gate_acc_all, spmd_gate_c_acc, [0, spmd_gate_n0], atomic=pl.AtomicType.Add
-                )
-            for spmd_n_out in pl.unroll(GATE_UP_SPMD_N):
-                gate_tids[spmd_n_out * K_SPLITS_MLP + k_split] = gate_spmd_tid
-
-            with pl.spmd(
-                GATE_UP_SPMD_N,
-                name_hint="up_proj",
-                deps=[cast_tids[k_split]],
-            ) as up_spmd_tid:
-                pl.set_cache_policy(w_up, pl.CachePolicy.BYPASS)
-                spmd_up_n_out = pl.get_block_idx()
-                spmd_up_n0 = spmd_up_n_out * MLP_TN
-                spmd_up_c_acc = pl.create_tensor([BATCH_PAD, MLP_TN], dtype=pl.FP32)
-                for spmd_up_lk in pl.pipeline(0, MLP_N_SUB_K, stage=2):
-                    spmd_up_ks_off = spmd_up_lk * MLP_INNER_TK
-                    spmd_up_a_k = mlp_norm_in[
-                        :, gu_k0 + spmd_up_ks_off : gu_k0 + spmd_up_ks_off + MLP_INNER_TK
-                    ]
-                    spmd_up_w_k = w_up[
-                        layer_hidden_base + gu_k0 + spmd_up_ks_off : layer_hidden_base
-                        + gu_k0
-                        + spmd_up_ks_off
-                        + MLP_INNER_TK,
-                        spmd_up_n0 : spmd_up_n0 + MLP_TN,
-                    ]
-                    spmd_up_c_acc = pl.matmul_acc(spmd_up_c_acc, spmd_up_a_k, spmd_up_w_k, init_cond=(spmd_up_lk == 0))
-                up_acc_all = pl.assemble(up_acc_all, spmd_up_c_acc, [0, spmd_up_n0], atomic=pl.AtomicType.Add)
-            for spmd_n_out in pl.unroll(GATE_UP_SPMD_N):
-                up_tids[spmd_n_out * K_SPLITS_MLP + k_split] = up_spmd_tid
-
-        # Deferred (non-critical) gate/up tiles n_out ∈ [GATE_UP_SPMD_N, MLP_ON),
-        # restored to the baseline [n_out outer, k_split inner] loop order. Each
-        # tile funnels its cast dependency through the per-k dummy so it carries a
-        # single edge to cast_tids[k_split] instead of one edge per tile.
-        for n_out in pl.parallel(GATE_UP_SPMD_N, MLP_ON):
-            n0 = n_out * MLP_TN
-            for k_split in pl.range(K_SPLITS_MLP):
-                k0 = k_split * MLP_K_SLICE
-                with pl.at(
-                    level=pl.Level.CORE_GROUP,
-                    name_hint="gate_proj",
-                    deps=[gate_late_tids[k_split]],
-                ) as gate_tid:
-                    pl.set_cache_policy(w_gate, pl.CachePolicy.BYPASS)
-                    c_acc = pl.create_tensor([BATCH_PAD, MLP_TN], dtype=pl.FP32)
-                    for lk in pl.pipeline(0, MLP_N_SUB_K, stage=2):
-                        ks_off = lk * MLP_INNER_TK
-                        a_k = mlp_norm_in[:, k0 + ks_off : k0 + ks_off + MLP_INNER_TK]
-                        w_k = w_gate[
-                            layer_hidden_base + k0 + ks_off : layer_hidden_base + k0 + ks_off + MLP_INNER_TK,
-                            n0 : n0 + MLP_TN,
-                        ]
-                        c_acc = pl.matmul_acc(c_acc, a_k, w_k, init_cond=(lk == 0))
-                    gate_acc_all = pl.assemble(gate_acc_all, c_acc, [0, n0], atomic=pl.AtomicType.Add)
-                gate_tids[n_out * K_SPLITS_MLP + k_split] = gate_tid
-
-                with pl.at(
-                    level=pl.Level.CORE_GROUP,
-                    name_hint="up_proj",
-                    deps=[up_late_tids[k_split]],
-                ) as up_tid:
-                    pl.set_cache_policy(w_up, pl.CachePolicy.BYPASS)
-                    c_acc = pl.create_tensor([BATCH_PAD, MLP_TN], dtype=pl.FP32)
-                    for lk in pl.pipeline(0, MLP_N_SUB_K, stage=2):
-                        ks_off = lk * MLP_INNER_TK
-                        a_k = mlp_norm_in[:, k0 + ks_off : k0 + ks_off + MLP_INNER_TK]
-                        w_k = w_up[
-                            layer_hidden_base + k0 + ks_off : layer_hidden_base + k0 + ks_off + MLP_INNER_TK,
-                            n0 : n0 + MLP_TN,
-                        ]
-                        c_acc = pl.matmul_acc(c_acc, a_k, w_k, init_cond=(lk == 0))
-                    up_acc_all = pl.assemble(up_acc_all, c_acc, [0, n0], atomic=pl.AtomicType.Add)
-                up_tids[n_out * K_SPLITS_MLP + k_split] = up_tid
+        gate_done = pl.array.create(2 * MLP_ON, pl.TASK_ID)
+        up_done = pl.array.create(2 * MLP_ON, pl.TASK_ID)
+        gate_acc_all, up_acc_all = _full_gate_up_projection(
+            mlp_norm_in, w_gate, w_up, layer_hidden_base, gate_acc_all, up_acc_all,
+            cast_tids, gate_done, up_done,
+        )
 
         # silu.
         for n_out in pl.parallel(MLP_ON):
@@ -982,23 +769,17 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 name_hint="silu",
                 deps=[
                     reduce_tid,
-                    gate_tids[n_out * K_SPLITS_MLP + 0],
-                    gate_tids[n_out * K_SPLITS_MLP + 1],
-                    gate_tids[n_out * K_SPLITS_MLP + 2],
-                    gate_tids[n_out * K_SPLITS_MLP + 3],
-                    gate_tids[n_out * K_SPLITS_MLP + 4],
-                    up_tids[n_out * K_SPLITS_MLP + 0],
-                    up_tids[n_out * K_SPLITS_MLP + 1],
-                    up_tids[n_out * K_SPLITS_MLP + 2],
-                    up_tids[n_out * K_SPLITS_MLP + 3],
-                    up_tids[n_out * K_SPLITS_MLP + 4],
+                    gate_done[2 * n_out],
+                    gate_done[2 * n_out + 1],
+                    up_done[2 * n_out],
+                    up_done[2 * n_out + 1],
                 ],
             ) as silu_tid:
                 inv_rms_chunk = inv_rms_tile[:, 0:1]
                 for sub in pl.pipeline(SILU_INNER_CHUNKS, stage=2):
                     silu_off = n0 + sub * MLP_OUT_CHUNK
-                    gate_chunk = gate_acc_all[:, silu_off : silu_off + MLP_OUT_CHUNK]
-                    up_chunk = up_acc_all[:, silu_off : silu_off + MLP_OUT_CHUNK]
+                    gate_chunk = gate_acc_all[:, silu_off:silu_off + MLP_OUT_CHUNK]
+                    up_chunk = up_acc_all[:, silu_off:silu_off + MLP_OUT_CHUNK]
                     scaled_gate = pl.row_expand_mul(gate_chunk, inv_rms_chunk)
                     scaled_up = pl.row_expand_mul(up_chunk, inv_rms_chunk)
                     sigmoid = pl.recip(pl.add(pl.exp(pl.neg(scaled_gate)), 1.0))
@@ -1006,74 +787,21 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     mlp_tile = pl.assemble(mlp_tile, pl.cast(mlp_chunk, target_type=pl.BF16), [0, silu_off])
             silu_tids[n_out] = silu_tid
 
-        for n_out in pl.parallel(DOWN_ON):
-            n0 = n_out * DOWN_TN
-            for k_split in pl.range(K_SPLITS):
-                k0 = k_split * DOWN_TN
-                with pl.at(
-                    level=pl.Level.CORE_GROUP,
-                    name_hint="down_proj",
-                    allow_early_resolve=True,
-                    deps=[
-                        silu_tids[k_split]
-                    ],  # down_seed flows through MLP, output projection, and attention
-                ) as down_tid:
-                    pl.set_cache_policy(w_down, pl.CachePolicy.BYPASS)
-                    c_acc = pl.create_tensor([BATCH_PAD, DOWN_TN], dtype=pl.FP32)
-                    for lk in pl.pipeline(0, N_SUB_K, stage=2):
-                        ks_off = lk * DOWN_TK
-                        a_k = mlp_tile[:, k0 + ks_off : k0 + ks_off + DOWN_TK]
-                        w_k = w_down[
-                            layer_inter_base + k0 + ks_off : layer_inter_base + k0 + ks_off + DOWN_TK,
-                            n0 : n0 + DOWN_TN,
-                        ]
-                        c_acc = pl.matmul_acc(c_acc, a_k, w_k, init_cond=(lk == 0))
-                    down_acc_all = pl.assemble(down_acc_all, c_acc, [0, n0], atomic=pl.AtomicType.Add)
-                down_tids[n_out * K_SPLITS + k_split] = down_tid
+        down_acc_all = _full_down_projection(
+            mlp_tile, w_down, layer_inter_base, down_acc_all, silu_tids, down_tids,
+        )
 
-    # ── down_cast_residual (DOWN_ON-way, OUTSIDE manual_scope): the residual
-    # add (down_acc_all + post_norm_partial, both FP32) is the layer output,
-    # emitted as DOWN_ON sliced writers of `out` in the AUTO-DEP region —
-    # restoring the baseline's 5-way parallelism while keeping the fusion
-    # (no scratch out_partial, no out_consolidate copy).
-    #
-    # Why outside manual_scope: inside manual_scope, auto-dep (tensormap)
-    # registration is suppressed (explicit deps= only), so partial writers
-    # register NO tensormap edge to downstream caller readers (proven on
-    # device: next_hidden's writers had no edge to copy_out → garbage). In the
-    # auto-dep region each sliced writer registers `out`; OptimizeOrchTensors
-    # Pattern-5 narrows the footprint to a window, and the runtime tensormap
-    # check is region-precise per-dim, so the 5 writers do not serialize
-    # against each other while the next layer's x_gamma still waits on all 5.
-    #
-    # Deps: each block needs only its own K_SPLITS (=17) down_proj atomic-add
-    # tids (per-index list comprehension), so block n starts as soon as its
-    # column slab is accumulated. Transitivity covers post_norm_partial: every
-    # down_proj K-slice deps on a silu task, which deps on ALL cast_tids =
-    # residual_rms_cast — the full producer of post_norm_partial.
-    # dcr_xgamma as a SINGLE pl.spmd(DOWN_ON) dispatch (was DOWN_ON separate pl.parallel
-    # pl.at tasks). PERF: the separate-task form WAW-serialized the DOWN_ON sliced writers
-    # of `out` / `normed_out` on this runtime — the OptimizeOrchTensors region-narrowing
-    # that was meant to keep them parallel did NOT fire (measured: the 5 dcr ran SERIAL on
-    # one core, ~35us, both at the chunk tail AND every layer boundary). A single spmd
-    # dispatch's blocks are inherently parallel (exactly like x_gamma's disjoint
-    # normed_states writes), so the disjoint-slice writes run on DOWN_ON cores. Trade-offs:
-    # the dispatch deps on ALL down_proj tids (not per-column), but down_proj finishes
-    # ~together; and the carry is ONE dispatch tid for all DOWN_ON slabs (the next layer's
-    # rms_recip/QKV/seeds wait on the whole dcr dispatch — fine once it is ~3us not ~35us).
+    # Add the residual and publish the next normalized input after both Down contributions.
     with pl.spmd(
         DOWN_ON,
         name_hint="dcr_xgamma",
         allow_early_resolve=True,
-        deps=[down_tids[i] for i in range(DOWN_ON * K_SPLITS)],
+        deps=[down_tids[i] for i in range(2)],
     ) as dcr_tid:
         n_out = pl.tile.get_block_idx()
         n0 = n_out * DOWN_TN
-        # OUTPUT 1: layer residual (down_acc + post_norm, both FP32) -> `out` (cur).
-        out_chunk = pl.add(down_acc_all[:, n0 : n0 + DOWN_TN], post_norm_partial[:, n0 : n0 + DOWN_TN])
+        out_chunk = pl.add(down_acc_all[:, n0:n0 + DOWN_TN], post_norm_partial[:, n0:n0 + DOWN_TN])
         out = pl.assemble(out, out_chunk, [0, n0])
-        # OUTPUT 2: NEXT layer's x*gamma from the same in-register FP32 chunk (no GM
-        # re-read of `out`). gamma row clamped via next_gamma_idx (last layer unused).
         gamma_next = pl.slice(input_rms_weight, [1, DOWN_TN], [next_gamma_idx, n0])
         xg = pl.col_expand_mul(out_chunk, gamma_next)
         normed_out = pl.assemble(normed_out, pl.cast(xg, target_type=pl.BF16), [0, n0])
@@ -1192,6 +920,54 @@ def _greedy_sample_inline(
     return sampled_ids
 
 
+@pl.jit.inline(auto_scope=False)
+def _decode_layer_graph(
+    hidden_states: pl.Tensor, input_rms_weight: pl.Tensor,
+    wq: pl.Tensor, wk: pl.Tensor, wv: pl.Tensor, q_norm_w: pl.Tensor, k_norm_w: pl.Tensor,
+    window_seq_lens: pl.Tensor, window_block_table: pl.Tensor, window_slot_mapping: pl.Tensor,
+    rope_cos: pl.Tensor, rope_sin: pl.Tensor, k_cache: pl.Tensor, v_cache: pl.Tensor,
+    score_transfer: pl.Tensor, probability_transfer: pl.Tensor, pv_transfer: pl.Tensor,
+    ffts_workspace: pl.Tensor, scratch_ready: pl.Array[1, pl.TASK_ID],
+    wo: pl.Tensor, w_gate: pl.Tensor, w_up: pl.Tensor, w_down: pl.Tensor, post_rms_weight: pl.Tensor,
+    out: pl.Tensor, normed_in: pl.Tensor, normed_out: pl.Tensor,
+    layer_idx: pl.Scalar[pl.INT32], next_gamma_idx: pl.Scalar[pl.INT32],
+    layer_cache_base_token_rows: pl.Scalar[pl.INDEX],
+    prev_out_tid: pl.Array[1, pl.TASK_ID], prev_normed_tid: pl.Array[1, pl.TASK_ID],
+    batch_count: pl.Scalar[pl.INT32],
+):
+    """Record one layer with external completion edges and Graph-local task IDs."""
+    with pl.graph("qwen_decoder_layer", deps=[prev_out_tid[0], prev_normed_tid[0], scratch_ready[0]]) as layer_done:
+        layer_scratch_ready = pl.array.create(1, pl.TASK_ID)
+        layer_prev_out_tid = pl.array.create(1, pl.TASK_ID)
+        layer_prev_normed_tid = pl.array.create(1, pl.TASK_ID)
+        layer_scratch_ready[0] = pl.system.task_dummy(deps=[])
+        layer_prev_out_tid[0] = pl.system.task_dummy(deps=[])
+        layer_prev_normed_tid[0] = pl.system.task_dummy(deps=[])
+        out = _decode_layer(
+            hidden_states, input_rms_weight, wq, wk, wv, q_norm_w, k_norm_w,
+            window_seq_lens, window_block_table, window_slot_mapping,
+            rope_cos, rope_sin, k_cache, v_cache,
+            score_transfer, probability_transfer, pv_transfer, ffts_workspace,
+            layer_scratch_ready, wo, w_gate, w_up, w_down, post_rms_weight,
+            out, normed_in, normed_out, layer_idx, next_gamma_idx, layer_cache_base_token_rows,
+            layer_prev_out_tid, layer_prev_normed_tid, batch_count,
+        )
+    prev_out_tid[0] = layer_done
+    prev_normed_tid[0] = layer_done
+    scratch_ready[0] = layer_done
+    return out
+
+
+_decode_layer_dispatch = _decode_layer
+
+
+def configure_layer_graph(enabled: bool) -> None:
+    """Select layer scheduling before JIT discovery; Graph scheduling requires HBG."""
+    global USE_LAYER_GRAPH, _decode_layer_dispatch
+    USE_LAYER_GRAPH = enabled
+    _decode_layer_dispatch = _decode_layer_graph if enabled else _decode_layer
+
+
 _FWD_NLAYERS = NUM_LAYERS  # decode_fwd loop bound; overridable for layer-count tests
 
 
@@ -1208,8 +984,8 @@ def _decode_fwd_body(  # noqa: PLR0913 — PyPTO-state fused decode body
     slot_mapping: pl.Tensor[[BATCH_DYN], pl.INT32],
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
-    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
-    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
     wo: pl.Tensor,
     w_gate: pl.Tensor,
     w_up: pl.Tensor,
@@ -1258,6 +1034,7 @@ def _decode_fwd_body(  # noqa: PLR0913 — PyPTO-state fused decode body
     sampled_ids_out.bind_dynamic(0, BATCH_DYN)
     next_hidden.bind_dynamic(0, BATCH_DYN)
     batch = pl.tensor.dim(seq_lens, 0)
+    max_blocks_per_seq = pl.tensor.dim(block_table, 0) // batch
 
     next_hidden = _token_embed_inline(sampled_ids_in, embed_weight, next_hidden)
 
@@ -1272,7 +1049,13 @@ def _decode_fwd_body(  # noqa: PLR0913 — PyPTO-state fused decode body
     for chunk_idx in pl.range(num_chunks):
         chunk_row0 = pl.cast(chunk_idx * BATCH_PAD, pl.INDEX)
         chunk_rows = pl.min(BATCH_PAD, batch - chunk_row0)  # < BATCH_PAD on the tail window
+        chunk_batch_rows = pl.cast(chunk_rows, pl.INDEX)
         chunk_rows_i32 = pl.cast(chunk_rows, pl.INT32)
+        window_seq_lens = pl.slice(seq_lens, [chunk_batch_rows], [chunk_row0])
+        window_slot_mapping = pl.slice(slot_mapping, [chunk_batch_rows], [chunk_row0])
+        window_block_table = pl.slice(
+            block_table, [chunk_batch_rows * max_blocks_per_seq], [chunk_row0 * max_blocks_per_seq],
+        )
 
         cur = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.FP32)  # FP32 inter-layer carry (was BF16)
         prev_out_tid = pl.array.create(1, pl.TASK_ID)
@@ -1330,40 +1113,20 @@ def _decode_fwd_body(  # noqa: PLR0913 — PyPTO-state fused decode body
             layer_next_hidden = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.FP32)  # FP32 layer output
             next_normed = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.BF16)  # next layer's x*gamma
             next_gamma_idx = pl.min(layer_idx + 1, _FWD_NLAYERS - 1)  # clamp: last layer's normed unused
-            cur = _decode_layer(
-                cur,
-                input_rms_weight,
-                wq,
-                wk,
-                wv,
-                q_norm_weight,
-                k_norm_weight,
-                seq_lens,
-                block_table,
-                slot_mapping,
-                rope_cos,
-                rope_sin,
-                k_cache,
-                v_cache,
-                score_transfer,
-                probability_transfer,
-                pv_transfer,
-                ffts_workspace,
-                scratch_ready,
-                wo,
-                w_gate,
-                w_up,
-                w_down,
-                post_rms_weight,
-                layer_next_hidden,
-                normed,
-                next_normed,
-                layer_idx,
-                next_gamma_idx,
-                prev_out_tid,
-                prev_normed_tid,
-                chunk_row0,
-                chunk_rows_i32,
+            num_layers_actual = pl.tensor.dim(input_rms_weight, 0)
+            layer_cache_rows = pl.tensor.dim(k_cache, 0) // NUM_KV_HEADS // num_layers_actual
+            layer_cache_base_token_rows = layer_idx * layer_cache_rows
+            q_norm_w = pl.slice(q_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
+            k_norm_w = pl.slice(k_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
+            cur = _decode_layer_dispatch(
+                cur, input_rms_weight, wq, wk, wv, q_norm_w, k_norm_w,
+                window_seq_lens, window_block_table, window_slot_mapping,
+                rope_cos, rope_sin, k_cache, v_cache,
+                score_transfer, probability_transfer, pv_transfer, ffts_workspace,
+                scratch_ready, wo, w_gate, w_up, w_down, post_rms_weight,
+                layer_next_hidden, normed, next_normed,
+                layer_idx, next_gamma_idx, layer_cache_base_token_rows,
+                prev_out_tid, prev_normed_tid, chunk_rows_i32,
             )
             normed = next_normed
         out = rms_lm_head_fp32(cur, final_norm_weight, lm_head_weight, out, chunk_row0, chunk_rows)
@@ -1387,8 +1150,8 @@ def decode_fwd(  # noqa: PLR0913 -- public model ABI
     slot_mapping: pl.Tensor[[BATCH_DYN], pl.INT32],
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
-    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
-    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
     wo: pl.Tensor,
     w_gate: pl.Tensor,
     w_up: pl.Tensor,
@@ -1462,8 +1225,8 @@ def _decode_fwd_layers_body(  # noqa: PLR0913 — PyPTO-state chunk body
     slot_mapping: pl.Tensor,
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
-    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
-    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
     wo: pl.Tensor,
     w_gate: pl.Tensor,
     w_up: pl.Tensor,
@@ -1493,6 +1256,11 @@ def _decode_fwd_layers_body(  # noqa: PLR0913 — PyPTO-state chunk body
     # Layer-chunk entry: STATIC BATCH_PAD-row hidden in/out, so it serves one
     # window (rows 0..batch). Public batches above BATCH_PAD are decode_fwd's job.
     batch_i32 = pl.cast(batch, pl.INT32)
+    batch_rows = pl.cast(batch, pl.INDEX)
+    max_blocks_per_seq = pl.tensor.dim(block_table, 0) // batch
+    window_seq_lens = pl.slice(seq_lens, [batch_rows], [0])
+    window_slot_mapping = pl.slice(slot_mapping, [batch_rows], [0])
+    window_block_table = pl.slice(block_table, [batch_rows * max_blocks_per_seq], [0])
     cur = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.FP32)
     prev_out_tid = pl.array.create(1, pl.TASK_ID)
     prev_out_tid[0] = pl.system.task_dummy(deps=[])
@@ -1533,17 +1301,21 @@ def _decode_fwd_layers_body(  # noqa: PLR0913 — PyPTO-state chunk body
         next_hidden = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.FP32)
         next_normed = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.BF16)
         next_gamma_idx = pl.min(i + 1, _CHUNK_NLAYERS - 1)
+        layer_cache_rows = pl.tensor.dim(k_cache, 0) // NUM_KV_HEADS // pl.tensor.dim(input_rms_weight, 0)
+        layer_cache_base_token_rows = i * layer_cache_rows
+        q_norm_w = pl.slice(q_norm_weight, [1, HEAD_DIM], [i, 0])
+        k_norm_w = pl.slice(k_norm_weight, [1, HEAD_DIM], [i, 0])
         cur = _decode_layer(
             cur,
             input_rms_weight,
             wq,
             wk,
             wv,
-            q_norm_weight,
-            k_norm_weight,
-            seq_lens,
-            block_table,
-            slot_mapping,
+            q_norm_w,
+            k_norm_w,
+            window_seq_lens,
+            window_block_table,
+            window_slot_mapping,
             rope_cos,
             rope_sin,
             k_cache,
@@ -1563,9 +1335,9 @@ def _decode_fwd_layers_body(  # noqa: PLR0913 — PyPTO-state chunk body
             next_normed,
             i,
             next_gamma_idx,
+            layer_cache_base_token_rows,
             prev_out_tid,
             prev_normed_tid,
-            0,
             batch_i32,
         )
         normed = next_normed
@@ -1595,8 +1367,8 @@ def decode_fwd_layers(  # noqa: PLR0913 -- public model ABI
     slot_mapping: pl.Tensor,
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
-    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
-    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
     wo: pl.Tensor,
     w_gate: pl.Tensor,
     w_up: pl.Tensor,
@@ -1686,15 +1458,14 @@ def _paged_block_table_slot_mapping(seq_lens: torch.Tensor) -> tuple[torch.Tenso
     return block_table, slot_mapping
 
 
-def _decode_smoke_inputs(batch: int = BATCH_PAD + 1) -> list[torch.Tensor]:
-    """One-layer production-decode inputs with a non-empty tail window.
+def _decode_smoke_inputs(batch: int = BATCH_PAD + 1, layers: int = 1) -> list[torch.Tensor]:
+    """Production-decode shapes with a non-empty tail window and the selected layer stack.
 
     Only shapes and dtypes are consumed by compile-only smoke.  ``batch=17`` is
     deliberate: it traces ``decode_fwd``'s dynamic public-batch path as one full
     16-row window plus a one-row tail, matching the entry delegated to by the
     serving HOST wrapper.
     """
-    layers = 1
     cache_rows = layers * batch * DECODE_MAX_BLOCKS_PER_SEQ * NUM_KV_HEADS * BLOCK_SIZE
     return [
         torch.empty([layers, HIDDEN], dtype=torch.float32),
@@ -1729,6 +1500,13 @@ def _backend_type(platform: str) -> BackendType:
     if platform not in PA_SUPPORTED_PLATFORMS:
         raise ValueError(f"Qwen decode attention does not support platform {platform!r}")
     return BackendType.Ascend910B
+
+
+def _layer_graph_context():
+    """Select the runtime ABI for standalone layer-Graph validation."""
+    if USE_LAYER_GRAPH:
+        return passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH)
+    return nullcontext()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1853,12 +1631,30 @@ def golden_decode_layer(values: dict) -> None:
     """
     x = values["hidden_states"].float()  # [B,H], residual source
     gamma_in = values["input_rms_weight"].float()[0]  # [H]
-    inv_rms = _rmsnorm_inv(x)  # [B,1] (deferred)
+    partial_sq = torch.zeros([BATCH_PAD, 1], dtype=torch.float32)
+    for k0 in range(0, HIDDEN, RMSNORM_K_CHUNK):
+        partial_sq += x[:, k0:k0 + RMSNORM_K_CHUNK].square().sum(dim=-1, keepdim=True)
+    inv_rms = torch.reciprocal(torch.sqrt(partial_sq * HIDDEN_INV + EPS))
 
     normed = _bf16(x * gamma_in)  # bf16 normed (no inv_rms yet)
-    q_proj = normed @ values["wq"].float()  # [B,H]
-    k_proj = normed @ values["wk"].float()  # [B,KVH]
-    v_proj = normed @ values["wv"].float()  # [B,KVH]
+
+    def project(weight: torch.Tensor) -> torch.Tensor:
+        # Match the FP32 chunk accumulation and ordered split-K reduction
+        # before the cache's BF16 rounding boundary.
+        parts = []
+        for base in range(0, HIDDEN, QKV_K_SLICE):
+            partial = torch.zeros([BATCH_PAD, weight.shape[1]], dtype=torch.float32)
+            for k0 in range(base, base + QKV_K_SLICE, TK):
+                partial += normed[:, k0:k0 + TK] @ weight[k0:k0 + TK].float()
+            parts.append(partial)
+        result = parts[0]
+        for partial in parts[1:]:
+            result = result + partial
+        return result
+
+    q_proj = project(values["wq"])
+    k_proj = project(values["wk"])
+    v_proj = project(values["wv"])
 
     qn = values["q_norm_weight"].float()[0]
     kn = values["k_norm_weight"].float()[0]
@@ -1883,6 +1679,10 @@ def golden_decode_layer(values: dict) -> None:
         q_b = _bf16(_rope_half(qh[b], cos_p, sin_p))  # [40,128] current Q (bf16)
         k_cur = _bf16(_rope_half(kh[b], cos_p, sin_p))  # [8,128] current K (bf16)
         v_cur = _bf16(v_heads[b])  # [8,128]
+        # BSND slot mapping addresses a token row containing every KV head.
+        slot = int(values["slot_mapping"][b].item())
+        values["k_cache"].view(-1, NUM_KV_HEADS, HEAD_DIM)[slot].copy_(k_cur)
+        values["v_cache"].view(-1, NUM_KV_HEADS, HEAD_DIM)[slot].copy_(v_cur)
         n_blocks = (slen + BLOCK_SIZE - 1) // BLOCK_SIZE
         for kvh in range(NUM_KV_HEADS):
             # Each physical page is [BLOCK_SIZE, KV_HIDDEN] in BSND order.
@@ -1931,6 +1731,57 @@ def _build_specs(inputs: dict) -> list:
     ]
     specs.append(TensorSpec("out", [BATCH_PAD, HIDDEN], torch.bfloat16))
     return specs
+
+
+def _compare_decode_cache(actual, expected, *, inputs, **kwargs):
+    """Check appended BF16 tokens numerically and untouched cache bytes exactly."""
+    from golden import ratio_allclose
+
+    slots = inputs["slot_mapping"].to(torch.int64).clamp_min(0)
+    active_rows = (slots[:, None] * NUM_KV_HEADS + torch.arange(NUM_KV_HEADS)).flatten().unique()
+    # CPU and Cube FP32 reductions can straddle a BF16 midpoint. One BF16
+    # relative ULP covers that rounding boundary for appended tokens only.
+    compare = ratio_allclose(atol=0.0, rtol=1.0 / 128, max_error_ratio=0.0)
+    ok, detail = compare(actual[active_rows], expected[active_rows], inputs=inputs, **kwargs)
+    if not ok:
+        return False, detail
+    untouched = torch.ones(actual.shape[0], dtype=torch.bool)
+    untouched[active_rows] = False
+    if not torch.equal(actual[untouched].view(torch.uint8), expected[untouched].view(torch.uint8)):
+        return False, "    cache bytes outside slot_mapping were modified"
+    return True, ""
+
+
+def _run_decode_replays(compiled, call_args: list[torch.Tensor], config, repetitions: int) -> None:
+    """Restore KV before every dispatch and compare FP32 logits and greedy IDs exactly."""
+    caches = [call_args[INPUT_NAMES.index(name) - 1] for name in ("k_cache", "v_cache")]
+    snapshots = [cache.clone() for cache in caches]
+    # The production decode ABI ends in logits, embedding, input IDs, output IDs, hidden.
+    logits, _, _, sampled_ids, next_hidden = call_args[-5:]
+    expected_logits = None
+    expected_ids = None
+    try:
+        for replay in range(repetitions):
+            for cache, snapshot in zip(caches, snapshots):
+                cache.copy_(snapshot)
+            logits.fill_(float("nan"))
+            sampled_ids.fill_(-1)
+            next_hidden.fill_(float("nan"))
+            compiled(*call_args, config=config)
+            if logits.dtype != torch.float32 or not torch.isfinite(logits).all():
+                raise AssertionError(f"decode replay {replay + 1}: logits must be finite FP32")
+            current_logits = logits.detach().cpu().contiguous().view(torch.uint8)
+            current_ids = sampled_ids.detach().cpu().contiguous()
+            if expected_logits is None:
+                expected_logits = current_logits.clone()
+                expected_ids = current_ids.clone()
+            elif not torch.equal(current_logits, expected_logits) or not torch.equal(current_ids, expected_ids):
+                raise AssertionError(f"decode replay {replay + 1}: logits bytes or greedy token IDs differ")
+    finally:
+        # The independent layer-stack reference must start from the same KV snapshot too.
+        for cache, snapshot in zip(caches, snapshots):
+            cache.copy_(snapshot)
+    print(f"[decode-repeatability] PASS {repetitions}/{repetitions}: FP32 logits bytes and greedy IDs", flush=True)
 
 
 if __name__ == "__main__":
@@ -2052,7 +1903,16 @@ if __name__ == "__main__":
         default=False,
         help="persist inputs + golden for replay (off: large fixtures)",
     )
+    parser.add_argument("--layer-graph", action="store_true", help="compile the decode stack as HBG layer Graphs")
+    parser.add_argument("--repeat-runs", type=int, default=3, help="same-KV replays for single-step forward validation")
     args = parser.parse_args()
+    configure_layer_graph(args.layer_graph)
+    if args.layer_graph:
+        args.validate_fwd = True
+    if args.repeat_runs < 1:
+        parser.error("--repeat-runs must be >= 1")
+    if args.fwd_layers < 1:
+        parser.error("--fwd-layers must be >= 1")
 
     if args.dep_output_dir is not None and not args.enable_dep_gen:
         parser.error("--dep-output-dir requires --enable-dep-gen")
@@ -2088,13 +1948,16 @@ if __name__ == "__main__":
     # second one-row window exercises the same sliced block-table shapes used by
     # serving.  `.lower()` alone does not exercise kernel-wrapper extraction.
     if args.smoke or args.execution_mode:
-        compiled = decode_fwd.compile(
-            *_decode_smoke_inputs(),
-            config=normalize_config(dict(
-                backend_type=args.backend_type,
-                execution_mode=args.execution_mode,
-            )),
-        )
+        if args.layer_graph:
+            _FWD_NLAYERS = args.fwd_layers
+        with _layer_graph_context():
+            compiled = decode_fwd.compile(
+                *_decode_smoke_inputs(layers=_FWD_NLAYERS),
+                config=normalize_config(dict(
+                    backend_type=args.backend_type,
+                    execution_mode=args.execution_mode,
+                )),
+            )
         print(f"Compiled dynamic B{BATCH_PAD + 1} decode smoke: {compiled.output_dir}")
         raise SystemExit(0)
 
@@ -2134,7 +1997,11 @@ if __name__ == "__main__":
             ),
             rtol=3e-3,
             atol=3e-3,
-            compare_fn={"out": ratio_allclose(atol=3e-3, rtol=3e-3, max_error_ratio=0.02)},
+            compare_fn={
+                "out": ratio_allclose(atol=3e-3, rtol=3e-3, max_error_ratio=0.02),
+                "k_cache": _compare_decode_cache,
+                "v_cache": _compare_decode_cache,
+            },
             save_data=args.save_data,
         )
         if not result.passed:
@@ -2292,16 +2159,14 @@ if __name__ == "__main__":
             sampled_ids_in[b, 0] = b
         sampled_ids_out = torch.zeros(UB, SAMPLED_IDS_PAD, dtype=torch.int32)
         next_hidden = torch.zeros(UB, HIDDEN, dtype=torch.bfloat16)
+        call_args = [*stacked, logits, embed_weight, sampled_ids_in, sampled_ids_out, next_hidden]
+        with _layer_graph_context():
+            compiled_decode = decode_fwd.compile(*call_args, config=run_cfg)
+        if _n_steps == 1:
+            _run_decode_replays(compiled_decode, call_args, run_cfg, args.repeat_runs)
         for _step in range(_n_steps):
-            decode_fwd(
-                *stacked,
-                logits,
-                embed_weight,
-                sampled_ids_in,
-                sampled_ids_out,
-                next_hidden,
-                config=run_cfg,
-            )
+            if _n_steps > 1:
+                compiled_decode(*call_args, config=run_cfg)
             if _step + 1 < _n_steps:
                 # Feed the sampled token back and grow the context by one token:
                 # seq_lens += 1 and re-point slot_mapping to the new token's KV slot
@@ -2361,7 +2226,9 @@ if __name__ == "__main__":
             _win[_slot("block_table")] = bt[_w0 * _BPS : (_w0 + _n) * _BPS].contiguous()
             _win[_slot("slot_mapping")] = sm[_w0 : _w0 + _n].contiguous()
             _ref_w = torch.zeros(BATCH_PAD, HIDDEN, dtype=torch.bfloat16)
-            decode_fwd_layers(_hs_w, *_win, _ref_w, config=run_cfg)
+            with _layer_graph_context():
+                compiled_reference = decode_fwd_layers.compile(_hs_w, *_win, _ref_w, config=run_cfg)
+            compiled_reference(_hs_w, *_win, _ref_w, config=run_cfg)
             ref_rows.append(_ref_w[:_n])
         ref_out = torch.cat(ref_rows, dim=0)
         hn = ref_out.float()
@@ -2406,8 +2273,8 @@ def qwen3_decode_host(  # noqa: PLR0913 — HOST entry over decode_fwd for servi
     slot_mapping: pl.Tensor[[BATCH_DYN], pl.INT32],
     rope_cos: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
     rope_sin: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
-    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
-    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
     wo: pl.Tensor[[NUM_LAYERS * HIDDEN, HIDDEN], pl.BF16],
     w_gate: pl.Tensor[[NUM_LAYERS * HIDDEN, INTERMEDIATE], pl.BF16],
     w_up: pl.Tensor[[NUM_LAYERS * HIDDEN, INTERMEDIATE], pl.BF16],
