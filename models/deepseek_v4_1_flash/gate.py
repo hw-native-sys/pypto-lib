@@ -894,7 +894,7 @@ if __name__ == "__main__":
     if args.compile_only:
         counts = [T if args.num_tokens is None else args.num_tokens]
     cases = [(n, N_EXPERTS, args.token_bias) for n in counts]
-    if args.num_tokens is None and not args.compile_only and N_EXPERTS != 96:
+    if args.num_tokens is None and not args.compile_only and (N_EXPERTS != 96 or not args.token_bias):
         cases.append((min(72, T), 96, True))
     for active_count, experts, token_bias in cases:
         torch.manual_seed(args.seed)
