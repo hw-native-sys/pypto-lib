@@ -16,7 +16,6 @@ import pypto.language as pl
 
 import out_proj
 from gated_rmsnorm import gdn_gated_rmsnorm_bf16
-from gdn_layer import gdn_layer as gdn_layer_fn
 import gdn_layer
 from in_proj_ab import gdn_in_proj_ab
 from qk_norm_gate import gdn_qk_norm_gate
@@ -77,6 +76,7 @@ def build_kernel(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, hg: int = HG, d: int
     z_m_group = gcd(t // in_proj_z.M_TILE, in_proj_z.M_GROUP)
     op_z = in_proj_z.build_kernel(t=t, m_group=z_m_group, inline=True)
     conv = dict(t=t, c=cqkv, k=k, inline=True)
+    op_layer = gdn_layer.build_kernel(rows=1, inline=True)
     op_conv_q = short_conv.build_kernel(**conv, c_off=0, c_out=key_width,
                                         out_heads=hg, name="conv_q")
     op_conv_k = short_conv.build_kernel(**conv, c_off=key_width, c_out=key_width,
@@ -105,13 +105,16 @@ def build_kernel(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, hg: int = HG, d: int
         m_diag: pl.Tensor[[chunk, chunk], pl.FP16],
         m_low: pl.Tensor[[chunk, chunk], pl.FP16],
         row_base: pl.Tensor[[t], pl.INT32],
-        state_row: pl.Scalar[pl.INDEX],
+        state_rows: pl.Tensor[[1], pl.INT32],
+        row_ends: pl.Tensor[[1], pl.INT32],
         conv_state: pl.InOut[pl.Tensor[[short_conv.CSTATE_DYN, k - 1, cqkv], pl.BF16]],
         final_state: pl.InOut[pl.Tensor[[FSTATE_DYN, h, d, d], pl.FP32]],
         out: pl.Out[pl.Tensor[[t, c], pl.BF16]],
     ):
         conv_state.bind_dynamic(0, short_conv.CSTATE_DYN)
         final_state.bind_dynamic(0, FSTATE_DYN)
+        # One owner: the convolution halo and the recurrent hand-off share its pool row.
+        state_row = pl.cast(pl.read(state_rows, [0]), pl.INDEX)
         x_q = pl.create_tensor([t, c], dtype=pl.INT8)
         x_scale = pl.create_tensor([1, t], dtype=pl.FP32)
         gdn_quant_x(x, x_q, x_scale)
@@ -149,8 +152,8 @@ def build_kernel(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, hg: int = HG, d: int
         gdn_qk_norm_gate(q_conv, k_conv, a_proj, b_proj, a_log, dt_bias, q_n, k_n, beta, g)
 
         o = pl.create_tensor([t, h, d], dtype=pl.FP16)
-        gdn_layer_fn(q_n, k_n, v_conv, g, beta, tril, mask_strict, eye,
-                 m_diag, m_low, row_base, state_row, final_state, o)
+        op_layer(q_n, k_n, v_conv, g, beta, tril, mask_strict, eye,
+                 m_diag, m_low, row_base, state_rows, row_ends, final_state, o)
 
         y = pl.create_tensor([t, cv], dtype=pl.BF16)
         gdn_gated_rmsnorm_bf16(o, z, norm_w, y)
@@ -179,7 +182,7 @@ def build_packed_kernel(t: int, rows: int, chunk: int = CHUNK_TILE, inline: bool
                                                out_dtype=pl.FP16, name="conv_v_packed")
     op_state = short_conv.build_packed_state_swap_kernel(t=t, rows=rows, c=cqkv, k=k,
                                                           inline=True)
-    op_layer = gdn_layer.build_packed_kernel(rows=rows, inline=True)
+    op_layer = gdn_layer.build_kernel(rows=rows, inline=True)
     op_out = out_proj.build_kernel(t, cv, c, inline=True)
 
     @(pl.jit.inline if inline else pl.jit)
@@ -239,7 +242,7 @@ def build_packed_kernel(t: int, rows: int, chunk: int = CHUNK_TILE, inline: bool
         gdn_qk_norm_gate(q_conv, k_conv, a_proj, b_proj, a_log, dt_bias, q_n, k_n, beta, g)
         o = pl.create_tensor([t, H, D], dtype=pl.FP16)
         op_layer(q_n, k_n, v_conv, g, beta, tril, mask_strict, eye,
-                 m_diag, m_low, state_rows, row_ends, final_state, o)
+                 m_diag, m_low, row_base, state_rows, row_ends, final_state, o)
         y = pl.create_tensor([t, cv], dtype=pl.BF16)
         gdn_gated_rmsnorm_bf16(o, z, norm_w, y)
         op_out(y, w_out, out)
@@ -334,7 +337,7 @@ def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, hg: int = HG, 
                        resume: bool = False, checkpoint: bool = False):
     """Every weight the block reads, plus the delta rule's three constants."""
     import torch
-    from golden import ScalarSpec, TensorSpec
+    from golden import TensorSpec
 
     import reference
     from weights import load_weights, stacked_ab_weight
@@ -400,7 +403,8 @@ def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, hg: int = HG, 
         TensorSpec("m_low", [chunk, chunk], torch.float16,
                    init_value=lambda: solve_tril.blk_masks(chunk)[1]),
         TensorSpec("row_base", [t], torch.int32, init_value=lambda: torch.zeros(t, dtype=torch.int32)),
-        ScalarSpec("state_row", torch.int64, 2, compile_runtime=True),
+        TensorSpec("state_rows", [1], torch.int32, init_value=lambda: torch.tensor([2], dtype=torch.int32)),
+        TensorSpec("row_ends", [1], torch.int32, init_value=lambda: torch.tensor([t], dtype=torch.int32)),
         TensorSpec("conv_state", [4, KCONV - 1, CQKV], torch.bfloat16,
                    init_value=lambda: _cache_pools(resume)[0]),
         TensorSpec("final_state", [4, H, D, D], torch.float32,
@@ -480,7 +484,7 @@ def _block_reference(inputs, weights, conv, state, *, quant: bool):
 
 def golden_gdn_block(tensors):
     """Fill the golden output and cache rows from the supplied inputs."""
-    row = int(tensors["state_row"])
+    row = int(tensors["state_rows"][0])
     state = _block_reference(tensors, block_weights(tensors), tensors["conv_state"][row],
                              tensors["final_state"][row], quant=True)
     tensors["out"].copy_(state["out"])
@@ -523,7 +527,10 @@ def build_packed_tensor_specs(t: int = 2048, starts: tuple[int, ...] = (0, 256),
     for owner, (start, end) in enumerate(zip(starts, ends)):
         row_base[start:end] = start
         row_owner[start:end] = owner
-    return base[:16] + [
+    # Compose by name: the single-request specs carry their own cache naming, and a
+    # positional slice silently duplicates or drops one when that set changes.
+    replaced = {"row_base", "row_owner", "row_ends", "state_rows", "conv_state", "final_state"}
+    return [spec for spec in base if spec.name not in replaced and spec.name != "out"] + [
         TensorSpec("row_base", [t], torch.int32, init_value=lambda: row_base),
         TensorSpec("row_owner", [t], torch.int32, init_value=lambda: row_owner),
         TensorSpec("row_ends", [len(starts)], torch.int32,
@@ -534,7 +541,7 @@ def build_packed_tensor_specs(t: int = 2048, starts: tuple[int, ...] = (0, 256),
                    init_value=lambda: conv),
         TensorSpec("final_state", [pool_rows, H, D, D], torch.float32,
                    init_value=lambda: final),
-    ] + base[20:]
+    ] + [spec for spec in base if spec.name == "out"]
 
 
 _PACKED_TRUTH: dict[str, object] = {}
@@ -657,7 +664,7 @@ def block_comparators(weights_path: str | None, resume: bool, golden_data: str |
     def references(inputs):
         nonlocal chains
         if chains is None:
-            row = int(inputs["state_row"])
+            row = int(inputs["state_rows"][0])
             conv, state = initial_pools()
             quantized = block_weights(inputs)
             truth_weights = _truth_weights(quantized, weights_path)
@@ -697,7 +704,7 @@ def block_comparators(weights_path: str | None, resume: bool, golden_data: str |
 
     def compare_cache(name, pool):
         def compare(actual, expected, *, inputs, **_kwargs):
-            row = int(inputs["state_row"])
+            row = int(inputs["state_rows"][0])
             others = [r for r in range(actual.shape[0]) if r != row]
             if others and not torch.equal(actual[others], initial_pools()[pool][others]):
                 return False, f"{name}: unowned rows changed"

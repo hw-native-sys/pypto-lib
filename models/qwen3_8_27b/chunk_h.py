@@ -151,62 +151,74 @@ def _gdn_chunk_h_final(
     u: pl.Tensor[[T_DYN, H, D], pl.FP16],
     g_sum: pl.Tensor[[H, T_DYN], pl.FP32],
     row_base: pl.Tensor[[T_DYN], pl.INT32],
+    state_rows: pl.Tensor[[ROWS_DYN], pl.INT32],
+    row_ends: pl.Tensor[[ROWS_DYN], pl.INT32],
     state: pl.Out[pl.Tensor[[STATE_DYN, D], pl.FP16]],
     v_new: pl.Out[pl.Tensor[[T_DYN, H, D], pl.FP16]],
-    state_row: pl.Scalar[pl.INDEX],
     final_state: pl.InOut[pl.Tensor[[FSTATE_DYN, H, D, D], pl.FP32]],
 ):
-    """As `_gdn_chunk_h`, seeded by and updating the decode state pool.
+    """Resume and publish the recurrent state for every cache owner this call carries.
 
-    `state_row` names the pool row this sequence owns, the same indirection
-    `decode_delta_rule` uses, so the hand-off is a write into the pool rather than a
-    copy of 3 MiB per sequence.
+    One program serves a single-request call and a packed one: `row_ends` and
+    `state_rows` name the owners, one entry each, and a single-request call is the
+    one-owner case rather than a second kernel.
+
+    `row_base` marks where each sequence begins, as in `_gdn_chunk_h_final`. A row whose
+    span is one sequence never sees it fire -- inside a row `row_base[t0]` is the row's
+    own start, which only equals `t0` at the chunk this loop starts from, and that chunk
+    is excluded. It is read so that one program serves a single packed call and a
+    multi-row one alike.
     """
     k.bind_dynamic(0, T_DYN)
     w.bind_dynamic(0, T_DYN)
     u.bind_dynamic(0, T_DYN)
     g_sum.bind_dynamic(1, T_DYN)
     row_base.bind_dynamic(0, T_DYN)
+    state_rows.bind_dynamic(0, ROWS_DYN)
+    row_ends.bind_dynamic(0, ROWS_DYN)
     state.bind_dynamic(0, STATE_DYN)
     v_new.bind_dynamic(0, T_DYN)
     final_state.bind_dynamic(0, FSTATE_DYN)
     t_dim = pl.tensor.dim(k, 0)
+    rows = pl.tensor.dim(state_rows, 0)
     k_flat = pl.reshape(k, [t_dim, KEY_WIDTH])
     w_flat = pl.reshape(w, [t_dim, VAL_WIDTH])
     u_flat = pl.reshape(u, [t_dim, VAL_WIDTH])
     v_flat = pl.reshape(v_new, [t_dim, VAL_WIDTH])
-    # The pool is addressed through a flat view of the same buffer, as
-    # `decode_delta_rule` addresses it: a `[1, H, D, D]` subview would need a
-    # single-element row, which ptoas rejects on its 32-byte row alignment.
     fs_2d = pl.reshape(final_state, [pl.tensor.dim(final_state, 0) * H * D, D])
-    fs_row = state_row
-    carry = pl.create_tensor([H * D, D], dtype=pl.FP32)
-    # The decode pool is [V, K]; the chunk recurrence carries [K, V]. A separate
-    # pass keeps the transpose outside the split mixed kernel below.
-    for hh0 in pl.spmd(H, name_hint="chunk_h_resume"):
-        crow = hh0 * D
-        frow = (fs_row * H + hh0) * D
+    seeds = pl.create_tensor([rows * H * D, D], dtype=pl.FP32)
+    published = pl.create_tensor([rows * H * D, D], dtype=pl.FP32)
+    for seed_idx in pl.spmd(rows * H, name_hint="chunk_h_resume"):
+        owner = seed_idx // H
+        hh0 = seed_idx % H
+        state_row = pl.cast(pl.read(state_rows, [owner]), pl.INDEX)
+        crow = seed_idx * D
+        frow = (state_row * H + hh0) * D
         for v0 in pl.range(0, D, HANDOFF_TILE):
             seed_band = fs_2d[frow + v0 : frow + v0 + HANDOFF_TILE, 0:D]
-            carry[crow : crow + D, v0 : v0 + HANDOFF_TILE] = pl.transpose(seed_band, 0, 1)
+            seeds[crow : crow + D, v0 : v0 + HANDOFF_TILE] = pl.transpose(seed_band, 0, 1)
 
-    for hh in pl.spmd(H, name_hint="chunk_h",
+    for work in pl.spmd(rows * H, name_hint="chunk_h",
                       optimizations=[pl.cross_core_slot(slot_num=1)]):
+        owner = work // H
+        hh = work % H
+        end = pl.cast(pl.read(row_ends, [owner]), pl.INDEX)
+        if owner == 0:
+            start = 0
+        else:
+            start = pl.cast(pl.read(row_ends, [owner - 1]), pl.INDEX)
         for lane in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.NONE):
-            row_start = hh * D + lane * STATE_TILE
-            s0 = carry[row_start : row_start + STATE_TILE, 0:D]
-        for c, (s_cur,) in pl.range(t_dim // CHUNK_TILE, init_values=(s0,)):
-            t0 = c * CHUNK_TILE
+            row_start = work * D + lane * STATE_TILE
+            s0 = seeds[row_start : row_start + STATE_TILE, 0:D]
+        for c, (s_cur,) in pl.range((end - start) // CHUNK_TILE, init_values=(s0,)):
+            t0 = start + c * CHUNK_TILE
             if c > 0 and pl.read(row_base, [t0]) == t0:
                 keep = 0.0
             else:
                 keep = 1.0
-            row = (c * H + hh) * D
+            row = ((t0 // CHUNK_TILE) * H + hh) * D
             d0 = hh * D
-            # GQA: K comes from key head hh // GRP; W, U and the state are per
-            # value head.
             dg0 = (hh // GRP) * D
-
             g_last = pl.read(g_sum, [hh, t0 + CHUNK_TILE - 1])
 
             for state_aiv in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
@@ -246,130 +258,11 @@ def _gdn_chunk_h_final(
                 decay = pl.mul(decay, keep)
                 s_next = pl.add(pl.row_expand_mul(s_cur, decay), pl.aiv_shard(kv))
             s_end, = pl.yield_(s_next)
-
-        # The state the loop ends with, still [K, V] and still FP32, parked for the
-        # transpose pass below.
-        for lane in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.NONE):
-            row_start = hh * D + lane * STATE_TILE
-            carry[row_start : row_start + STATE_TILE, 0:D] = s_end
-
-    # Transpose the FP32 recurrence state into the decode pool layout.
-    for hh2 in pl.spmd(H, name_hint="chunk_h_handoff"):
-        crow = hh2 * D
-        frow = (fs_row * H + hh2) * D
-        # In HANDOFF_TILE bands of the value axis: a whole head transposed at once
-        # needs three [D, D] FP32 tiles live, 196608 B of a 188416 B buffer, and a
-        # band of 64 value rows needs three of half that. `decode_delta_rule` tiles
-        # its own state the same way for the same reason.
-        for v0 in pl.range(0, D, HANDOFF_TILE):
-            band = pl.slice(carry, [D, HANDOFF_TILE], [crow, v0])
-            fs_2d[frow + v0 : frow + v0 + HANDOFF_TILE, 0:D] = pl.transpose(band, 0, 1)
-    return state, v_new, final_state
-
-
-gdn_chunk_h_final = pl.jit.inline(_gdn_chunk_h_final)
-gdn_chunk_h_final_test = pl.jit(_gdn_chunk_h_final)
-
-
-def _gdn_chunk_h_final_packed(
-    k: pl.Tensor[[T_DYN, HG, D], pl.FP16],
-    w: pl.Tensor[[T_DYN, H, D], pl.FP16],
-    u: pl.Tensor[[T_DYN, H, D], pl.FP16],
-    g_sum: pl.Tensor[[H, T_DYN], pl.FP32],
-    state_rows: pl.Tensor[[ROWS_DYN], pl.INT32],
-    row_ends: pl.Tensor[[ROWS_DYN], pl.INT32],
-    state: pl.Out[pl.Tensor[[STATE_DYN, D], pl.FP16]],
-    v_new: pl.Out[pl.Tensor[[T_DYN, H, D], pl.FP16]],
-    final_state: pl.InOut[pl.Tensor[[FSTATE_DYN, H, D, D], pl.FP32]],
-):
-    """Resume and publish the recurrent state for every packed row's cache owner."""
-    k.bind_dynamic(0, T_DYN)
-    w.bind_dynamic(0, T_DYN)
-    u.bind_dynamic(0, T_DYN)
-    g_sum.bind_dynamic(1, T_DYN)
-    state_rows.bind_dynamic(0, ROWS_DYN)
-    row_ends.bind_dynamic(0, ROWS_DYN)
-    state.bind_dynamic(0, STATE_DYN)
-    v_new.bind_dynamic(0, T_DYN)
-    final_state.bind_dynamic(0, FSTATE_DYN)
-    t_dim = pl.tensor.dim(k, 0)
-    rows = pl.tensor.dim(state_rows, 0)
-    k_flat = pl.reshape(k, [t_dim, KEY_WIDTH])
-    w_flat = pl.reshape(w, [t_dim, VAL_WIDTH])
-    u_flat = pl.reshape(u, [t_dim, VAL_WIDTH])
-    v_flat = pl.reshape(v_new, [t_dim, VAL_WIDTH])
-    fs_2d = pl.reshape(final_state, [pl.tensor.dim(final_state, 0) * H * D, D])
-    seeds = pl.create_tensor([rows * H * D, D], dtype=pl.FP32)
-    published = pl.create_tensor([rows * H * D, D], dtype=pl.FP32)
-    for seed_idx in pl.spmd(rows * H, name_hint="chunk_h_packed_resume"):
-        owner = seed_idx // H
-        hh0 = seed_idx % H
-        state_row = pl.cast(pl.read(state_rows, [owner]), pl.INDEX)
-        crow = seed_idx * D
-        frow = (state_row * H + hh0) * D
-        for v0 in pl.range(0, D, HANDOFF_TILE):
-            seed_band = fs_2d[frow + v0 : frow + v0 + HANDOFF_TILE, 0:D]
-            seeds[crow : crow + D, v0 : v0 + HANDOFF_TILE] = pl.transpose(seed_band, 0, 1)
-
-    for work in pl.spmd(rows * H, name_hint="chunk_h_packed",
-                      optimizations=[pl.cross_core_slot(slot_num=1)]):
-        owner = work // H
-        hh = work % H
-        end = pl.cast(pl.read(row_ends, [owner]), pl.INDEX)
-        if owner == 0:
-            start = 0
-        else:
-            start = pl.cast(pl.read(row_ends, [owner - 1]), pl.INDEX)
-        for lane in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.NONE):
-            row_start = work * D + lane * STATE_TILE
-            s0 = seeds[row_start : row_start + STATE_TILE, 0:D]
-        for c, (s_cur,) in pl.range((end - start) // CHUNK_TILE, init_values=(s0,)):
-            t0 = start + c * CHUNK_TILE
-            row = ((t0 // CHUNK_TILE) * H + hh) * D
-            d0 = hh * D
-            dg0 = (hh // GRP) * D
-            g_last = pl.read(g_sum, [hh, t0 + CHUNK_TILE - 1])
-
-            for state_aiv in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
-                sr0 = state_aiv * STATE_TILE
-                s16 = pl.cast(s_cur, target_type=pl.FP16, mode="rint")
-                state[row + sr0 : row + sr0 + STATE_TILE, 0:D] = s16   # state ENTERING this chunk
-                s16_full = pl.aic_gather(s16)                          # the cube needs both halves
-            wc = w_flat[t0 : t0 + CHUNK_TILE, d0 : d0 + D]
-            ws = pl.matmul(wc, s16_full, out_dtype=pl.FP32)
-
-            # S = exp(g_last) * S + K^T @ (coeff * V_new). The decay goes on V, not
-            # on K: K^T (V c) == (K c)^T V. A matmul whose transposed operand came
-            # from the vector unit cannot be lowered (pypto#2902).
-            for v_aiv in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
-                r0 = v_aiv * ROW_TILE
-                # coeff[i] = exp(g_last - g_i), argument <= 0
-                g_lane = g_sum[hh : hh + 1, t0 + r0 : t0 + r0 + ROW_TILE]
-                zero_row = pl.full([1, ROW_TILE], dtype=pl.FP32, value=0.0)
-                neg_g = pl.sub(zero_row, g_lane)
-                # exp before the [1,C]->[C,1] reshape, not after (pypto#2947)
-                coeff = pl.reshape(pl.exp(pl.add(neg_g, g_last)), [ROW_TILE, 1])
-                uc = u_flat[t0 + r0 : t0 + r0 + ROW_TILE, d0 : d0 + D]
-                vc = pl.sub(pl.cast(uc, target_type=pl.FP32), pl.aiv_shard(ws))   # V_new = U - W @ S
-                vc16 = pl.cast(vc, target_type=pl.FP16, mode="rint")
-                v_flat[t0 + r0 : t0 + r0 + ROW_TILE, d0 : d0 + D] = vc16
-                vs = pl.row_expand_mul(vc, coeff)
-                vs16 = pl.cast(vs, target_type=pl.FP16, mode="rint")
-                vs16_full = pl.aic_gather(vs16)
-            kc = k_flat[t0 : t0 + CHUNK_TILE, dg0 : dg0 + D]
-            kv = pl.matmul(kc, vs16_full, a_trans=True, out_dtype=pl.FP32)
-
-            for _ in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
-                # decay = exp(g_last) on every row, so the lane builds its own width
-                zero_d = pl.full([1, STATE_TILE], dtype=pl.FP32, value=0.0)
-                decay = pl.reshape(pl.exp(pl.add(zero_d, g_last)), [STATE_TILE, 1])
-                s_next = pl.add(pl.row_expand_mul(s_cur, decay), pl.aiv_shard(kv))
-            s_end, = pl.yield_(s_next)
         for lane in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.NONE):
             row_start = work * D + lane * STATE_TILE
             published[row_start : row_start + STATE_TILE, 0:D] = s_end
 
-    for out_idx in pl.spmd(rows * H, name_hint="chunk_h_packed_handoff"):
+    for out_idx in pl.spmd(rows * H, name_hint="chunk_h_handoff"):
         owner = out_idx // H
         hh2 = out_idx % H
         state_row = pl.cast(pl.read(state_rows, [owner]), pl.INDEX)
@@ -381,8 +274,8 @@ def _gdn_chunk_h_final_packed(
     return state, v_new, final_state
 
 
-gdn_chunk_h_final_packed = pl.jit.inline(_gdn_chunk_h_final_packed)
-gdn_chunk_h_final_packed_test = pl.jit(_gdn_chunk_h_final_packed)
+gdn_chunk_h_final = pl.jit.inline(_gdn_chunk_h_final)
+gdn_chunk_h_final_test = pl.jit(_gdn_chunk_h_final)
 
 
 _INPUTS: dict = {}
@@ -485,62 +378,33 @@ def golden_gdn_chunk_h(tensors):
     tensors["v_new"].copy_(v_new)
 
 
-def build_final_tensor_specs(t: int = BENCH_SEQ, pool_rows: int = 4, state_row: int = 2,
-                             resume: bool = False, starts: tuple[int, ...] = (0,)):
-    """`build_tensor_specs` plus the decode pool and the row this sequence owns.
+def build_final_tensor_specs(t: int = BENCH_SEQ, starts: tuple[int, ...] = (0,),
+                             owner_starts: tuple[int, ...] = (0,),
+                             state_rows: tuple[int, ...] = (2,),
+                             pool_rows: int = 4, resume: bool = False):
+    """`build_tensor_specs` plus the decode pool and the rows this call owns.
 
-    `state_row` defaults away from 0 so a kernel that ignored `state_row` and wrote row 0
-    would leave the gated row untouched and pass.
+    `starts` are the sequence boundaries `row_base` marks, which is where the recurrence
+    resets. `owner_starts` are the cache spans, one state pool row each. They are
+    independent: a single-request call can pack several sequences into one owned row,
+    and a packed call gives each row its own. Every owner span must begin at a sequence
+    boundary, or a span would resume a state its own first chunk then discards.
+
+    `state_rows` defaults away from 0 so a kernel that ignored them and wrote row 0 would
+    leave the gated rows untouched and pass.
     """
-    from golden import ScalarSpec, TensorSpec
+    from golden import TensorSpec
+
+    if (len(owner_starts) != len(state_rows) or owner_starts[0] != 0
+            or any(start not in starts for start in owner_starts)
+            or len(set(state_rows)) != len(state_rows)
+            or any(row < 0 or row >= pool_rows for row in state_rows)):
+        raise ValueError("each owner span starts at a sequence boundary and owns a distinct pool row")
+    ends = owner_starts[1:] + (t,)
 
     def pool():
         # Non-zero, so a row the kernel fails to write shows up as the fill rather than
         # as a plausible zero state.
-        rows = torch.full((pool_rows, H, D, D), -1.0)
-        if resume:
-            gen = torch.Generator().manual_seed(91)
-            rows[state_row] = torch.randn(H, D, D, generator=gen) * 0.02
-        else:
-            rows[state_row] = 0.0
-        return rows
-
-    return build_tensor_specs(t=t, starts=starts) + [
-        ScalarSpec("state_row", torch.int64, state_row, compile_runtime=True),
-        TensorSpec("final_state", [pool_rows, H, D, D], torch.float32, init_value=pool),
-    ]
-
-
-def golden_gdn_chunk_h_final(tensors):
-    """The snapshots and V_new as before, plus the hand-off transposed and widened."""
-    t, _, d = tensors["k"].shape
-    h = tensors["w"].shape[1]
-    chunk = t // (tensors["state"].shape[0] // (h * d))
-    row = int(tensors["state_row"])
-    initial = tensors["final_state"][row].transpose(-2, -1).contiguous()
-    state, v_new, final = chunk_h_ref(tensors["k"], tensors["w"], tensors["u"],
-                                      tensors["g_sum"].t(), chunk, initial,
-                                      row_base=tensors["row_base"])
-    tensors["state"].copy_(flat_state(state))
-    tensors["v_new"].copy_(v_new)
-    # `chunk_h_ref` returns the hand-off as [H, K, V]; the decode pool holds [V, K].
-    tensors["final_state"][row] = final.transpose(-2, -1).to(tensors["final_state"].dtype)
-
-
-def build_packed_final_tensor_specs(t: int = 512, starts: tuple[int, ...] = (0, 256),
-                                    state_rows: tuple[int, ...] = (1, 3),
-                                    pool_rows: int = 5, resume: bool = False):
-    from golden import TensorSpec
-
-    if (len(starts) != len(state_rows) or starts[0] != 0 or t % 256
-            or any(start % 256 for start in starts)
-            or any(b - a < 256 for a, b in zip(starts, starts[1:] + (t,)))
-            or len(set(state_rows)) != len(state_rows)
-            or any(row < 0 or row >= pool_rows for row in state_rows)):
-        raise ValueError("packed final needs disjoint state rows and complete 256-token spans")
-    ends = starts[1:] + (t,)
-
-    def pool():
         value = torch.full((pool_rows, H, D, D), -1.0)
         for owner, row in enumerate(state_rows):
             if resume:
@@ -551,17 +415,23 @@ def build_packed_final_tensor_specs(t: int = 512, starts: tuple[int, ...] = (0, 
         return value
 
     base = build_tensor_specs(t=t, starts=starts)
-    return base[:4] + [
-        TensorSpec("state_rows", [len(starts)], torch.int32,
+    return base[:5] + [
+        TensorSpec("state_rows", [len(state_rows)], torch.int32,
                    init_value=lambda: torch.tensor(state_rows, dtype=torch.int32)),
-        TensorSpec("row_ends", [len(starts)], torch.int32,
+        TensorSpec("row_ends", [len(ends)], torch.int32,
                    init_value=lambda: torch.tensor(ends, dtype=torch.int32)),
     ] + base[5:] + [
         TensorSpec("final_state", [pool_rows, H, D, D], torch.float32, init_value=pool),
     ]
 
 
-def golden_gdn_chunk_h_final_packed(tensors):
+def golden_gdn_chunk_h_final(tensors):
+    """The snapshots and V_new, plus each owner's hand-off transposed and widened.
+
+    One owner span at a time, seeded from its pool row. `row_base` is shifted to the
+    span so the reset lands on the same chunks the kernel resets on, where a span
+    carries more than one sequence.
+    """
     ends = tensors["row_ends"].tolist()
     starts = [0] + ends[:-1]
     for owner, (start, end) in enumerate(zip(starts, ends)):
@@ -569,15 +439,24 @@ def golden_gdn_chunk_h_final_packed(tensors):
         initial = tensors["final_state"][row].transpose(-2, -1).contiguous()
         state, v_new, final = chunk_h_ref(
             tensors["k"][start:end], tensors["w"][start:end], tensors["u"][start:end],
-            tensors["g_sum"][:, start:end].t(), CHUNK_TILE, initial)
+            tensors["g_sum"][:, start:end].t(), CHUNK_TILE, initial,
+            row_base=tensors["row_base"][start:end] - start)
         first = start // CHUNK_TILE * H * D
         last = end // CHUNK_TILE * H * D
         tensors["state"][first:last].copy_(flat_state(state))
         tensors["v_new"][start:end].copy_(v_new)
+        # `chunk_h_ref` returns the hand-off as [H, K, V]; the decode pool holds [V, K].
         tensors["final_state"][row].copy_(final.transpose(-2, -1))
 
 
-def compare_packed_final_state(state_rows: tuple[int, ...]):
+def compare_final_state(state_rows: tuple[int, ...]):
+    """Score the rows the kernel owns, and prove it left the others alone.
+
+    A whole-pool norm would be diluted: with four rows and one owned, three quarters of
+    the tensor is trivially equal. The unowned rows are also the control -- they carry
+    -1.0, which no state takes, so a kernel that ignored `state_rows` shows up as a row
+    that should have been left alone and was not.
+    """
     scored = frob_ok()
 
     def compare(actual, expected, **kwargs):
@@ -588,27 +467,7 @@ def compare_packed_final_state(state_rows: tuple[int, ...]):
         others = [row for row in range(actual.shape[0]) if row not in state_rows]
         if others and not bool((actual[others] == -1.0).all()):
             return False, f"unowned state rows {others} were modified"
-        return True, "packed recurrent states pass; unowned rows untouched"
-
-    return compare
-
-
-def compare_final_state(state_row: int):
-    """Score the row the kernel wrote, and prove it left the others alone.
-
-    A whole-pool norm would be diluted: with four rows and one written, three quarters of
-    the tensor is trivially equal. The untouched rows are also the control -- they carry
-    -1.0, which no state takes, so a kernel that ignored `state_row` shows up as a row
-    that should have been left alone and was not.
-    """
-    scored = frob_ok()
-
-    def compare(actual, expected, **kwargs):
-        ok, detail = scored(actual[state_row], expected[state_row], **kwargs)
-        others = [r for r in range(actual.shape[0]) if r != state_row]
-        if others and not bool((actual[others] == -1.0).all()):
-            return False, f"{detail}\n    rows {others} were written and should not have been"
-        return ok, detail
+        return True, "recurrent states pass; unowned rows untouched"
 
     compare.__name__ = "compare_final_state"
     return compare
@@ -657,11 +516,14 @@ if __name__ == "__main__":
         (f"chunk_h T={t} starts={starts}", t, starts, gdn_chunk_h_test,
          build_tensor_specs, golden_gdn_chunk_h,
          {"state": frob_ok(), "v_new": frob_ok()}) for t, starts in cases]
+    # One owner spanning the whole call: several sequences may still be packed into it,
+    # which is what separates a cache span from a sequence boundary.
     plan += [
         (f"chunk_h final T={t} starts={starts} resume={resume}", t, starts, gdn_chunk_h_final_test,
-         lambda t, starts, resume=resume: build_final_tensor_specs(t=t, starts=starts, resume=resume),
+         lambda t, starts, resume=resume: build_final_tensor_specs(
+             t=t, starts=starts, owner_starts=(0,), state_rows=(2,), resume=resume),
          golden_gdn_chunk_h_final,
-         {"state": frob_ok(), "v_new": frob_ok(), "final_state": compare_final_state(2)})
+         {"state": frob_ok(), "v_new": frob_ok(), "final_state": compare_final_state((2,))})
         for t, starts in (cases if args.seq_len or args.final else [(FINAL_CASE, (0,)), (512, (0, 256))])
         for resume in initial_states] if publish_final else []
     if args.packed_final:
@@ -670,13 +532,13 @@ if __name__ == "__main__":
         state_rows = tuple(2 * owner + 1 for owner in range(len(starts)))
         plan += [
             (f"chunk_h packed final T={args.seq_len} starts={starts} resume={resume}",
-             args.seq_len, starts, gdn_chunk_h_final_packed_test,
-             lambda t, starts, resume=resume: build_packed_final_tensor_specs(
-                 t=t, starts=starts, state_rows=state_rows,
+             args.seq_len, starts, gdn_chunk_h_final_test,
+             lambda t, starts, resume=resume: build_final_tensor_specs(
+                 t=t, starts=starts, owner_starts=starts, state_rows=state_rows,
                  pool_rows=2 * len(starts) + 1, resume=resume),
-             golden_gdn_chunk_h_final_packed,
+             golden_gdn_chunk_h_final,
              {"state": frob_ok(), "v_new": frob_ok(),
-              "final_state": compare_packed_final_state(state_rows)})
+              "final_state": compare_final_state(state_rows)})
             for resume in initial_states]
     if replay and len(plan) != 1:
         parser.error("state-publishing replay requires --initial-state zero or nonzero")
