@@ -17,7 +17,6 @@ from pypto.runtime import pto_isa_include_dir
 import torch
 
 from config import FLASH as M, T_DYN
-from gemm import gemm_bf16_via_mxfp8_to_bf16_staged
 
 
 # model config
@@ -38,9 +37,9 @@ DOT_SCALE = D**-0.5
 ENGRAM_QUANT_M_TILE = 16
 ENGRAM_QUANT_K_TILE = 256
 ENGRAM_QUANT_SCALE_TILE = 128
-GATE_T_TILE = 8
-GATE_D_TILE = 1280
+ENGRAM_QUANT_SCALE_ROW_BYTES = 32
 PROJECTION_N_TILE = 256
+PROJECTION_N_TILE_M80 = 512
 PROJECTION_K_TILE = 256
 
 
@@ -65,41 +64,100 @@ def _engram_project(payload: pl.Tensor, weight: pl.Tensor, scales: pl.Tensor, we
 def _engram_project_pypto(
     payload: pl.Tensor, weight: pl.Tensor, scales: pl.Tensor, weight_scale: pl.Tensor,
     kv: pl.Tensor, tokens: pl.Scalar[pl.INDEX], row_tile: pl.constexpr,
-    n_tile: pl.constexpr, inner_k: pl.constexpr,
+    n_tile: pl.constexpr, inner_k: pl.constexpr, scale_tile: pl.constexpr,
+    packed_scale: pl.constexpr, four_l1_slots: pl.constexpr, l1_slots: pl.constexpr, a_slots: pl.constexpr, a_slot: pl.constexpr, sa_slots: pl.constexpr, sa_slot: pl.constexpr,
 ):
-    """Hold the K256 payload projection for validation after packed MX scale lowering is fixed."""
+    """Project from K256 L1 tiles using K64 or K128 Cube slices."""
     scale_groups = ENGRAM_K // 32
-    scale_tile = inner_k // 32
     row_tiles = (tokens + row_tile - 1) // row_tile
     col_tiles = KV_OUT // n_tile
-    padded = row_tiles * row_tile
-    activation_scale = pl.tensor.view(scales, [padded, scale_groups], layout=pl.MX_A_ZZ)
     packed_weight_scale = pl.tensor.view(weight_scale, [scale_groups, KV_OUT], layout=pl.MX_B_NN)
-    with pl.spmd(pl.system.available_cluster_count(), name_hint="engram_projection_pypto"):
+    if packed_scale:
+        packed_activation_scale = pl.tensor.view(scales, [row_tile, scale_groups], layout=pl.MX_A_ZZ)
+    else:
+        activation_scale = pl.tensor.view(scales, [row_tiles * row_tile, scale_groups], layout=pl.MX_A_ND)
+    tiles = row_tiles * col_tiles
+    workers = pl.min(tiles, pl.system.available_cluster_count())
+    with pl.spmd(workers, name_hint="engram_projection_pypto"):
         worker = pl.tile.get_block_idx()
-        workers = pl.tile.get_block_num()
+        block_num = pl.tile.get_block_num()
         for row in pl.range(row_tiles):
+            m0 = row * row_tile
             for col in pl.range(col_tiles):
-                if (row * col_tiles + col) % workers == worker:
-                    m0 = row * row_tile
+                if (row * col_tiles + col) % block_num == worker:
                     n0 = col * n_tile
-                    sa = pl.load(activation_scale, [m0, 0], [row_tile, scale_tile], target_memory=pl.Mem.Mat)
-                    sb = pl.load(packed_weight_scale, [0, n0], [scale_tile, n_tile], target_memory=pl.Mem.Mat)
-                    a_l1 = pl.load(payload, [m0, 0], [row_tile, PROJECTION_K_TILE], target_memory=pl.Mem.Mat)
-                    b_l1 = pl.load(weight, [0, n0], [PROJECTION_K_TILE, n_tile], target_memory=pl.Mem.Mat)
-                    a = pl.tile.extract(a_l1, 0, 0, [row_tile, inner_k], target_memory=pl.Mem.Left)
-                    b = pl.tile.extract(b_l1, 0, 0, [inner_k, n_tile], target_memory=pl.Mem.Right)
-                    acc = pl.matmul_mx(a, sa, b, sb)
-                    for k0 in pl.range(inner_k, ENGRAM_K, inner_k):
-                        local_k = k0 % PROJECTION_K_TILE
-                        if local_k == 0:
-                            a_l1 = pl.load(payload, [m0, k0], [row_tile, PROJECTION_K_TILE], target_memory=pl.Mem.Mat)
-                            b_l1 = pl.load(weight, [k0, n0], [PROJECTION_K_TILE, n_tile], target_memory=pl.Mem.Mat)
-                        a = pl.tile.extract(a_l1, 0, local_k, [row_tile, inner_k], target_memory=pl.Mem.Left)
-                        b = pl.tile.extract(b_l1, local_k, 0, [inner_k, n_tile], target_memory=pl.Mem.Right)
-                        sa = pl.load(activation_scale, [m0, k0 // 32], [row_tile, scale_tile], target_memory=pl.Mem.Mat)
-                        sb = pl.load(packed_weight_scale, [k0 // 32, n0], [scale_tile, n_tile], target_memory=pl.Mem.Mat)
-                        acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
+                    if packed_scale:
+                        sa_l1 = pl.load(packed_activation_scale, [0, 0], [row_tile, scale_groups], target_memory=pl.Mem.Mat)
+                    else:
+                        sa_l1 = pl.load(activation_scale, [m0, 0], [row_tile, scale_groups], target_memory=pl.Mem.Mat)
+                    sb_l1 = pl.load(packed_weight_scale, [0, n0], [scale_groups, n_tile], target_memory=pl.Mem.Mat)
+                    acc = pl.create_tile([row_tile, n_tile], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+                    # Keep each K256 panel resident until its Cube inputs have been extracted.
+                    a_even = pl.load(payload, [m0, 0], [row_tile, PROJECTION_K_TILE], target_memory=pl.Mem.Mat)
+                    b_even = pl.load(weight, [0, n0], [PROJECTION_K_TILE, n_tile], target_memory=pl.Mem.Mat)
+                    a_odd = pl.load(payload, [m0, PROJECTION_K_TILE], [row_tile, PROJECTION_K_TILE], target_memory=pl.Mem.Mat)
+                    b_odd = pl.load(weight, [PROJECTION_K_TILE, n0], [PROJECTION_K_TILE, n_tile], target_memory=pl.Mem.Mat)
+                    if four_l1_slots:
+                        a_third = pl.load(payload, [m0, 2 * PROJECTION_K_TILE], [row_tile, PROJECTION_K_TILE], target_memory=pl.Mem.Mat)
+                        b_third = pl.load(weight, [2 * PROJECTION_K_TILE, n0], [PROJECTION_K_TILE, n_tile], target_memory=pl.Mem.Mat)
+                        a_fourth = pl.load(payload, [m0, 3 * PROJECTION_K_TILE], [row_tile, PROJECTION_K_TILE], target_memory=pl.Mem.Mat)
+                        b_fourth = pl.load(weight, [3 * PROJECTION_K_TILE, n0], [PROJECTION_K_TILE, n_tile], target_memory=pl.Mem.Mat)
+                    for k_base in pl.range(0, ENGRAM_K, l1_slots * PROJECTION_K_TILE):
+                        for panel in pl.unroll(l1_slots):
+                            if panel == 0:
+                                a_l1 = a_even
+                                b_l1 = b_even
+                            elif panel == 1:
+                                a_l1 = a_odd
+                                b_l1 = b_odd
+                            else:
+                                if four_l1_slots:
+                                    if panel == 2:
+                                        a_l1 = a_third
+                                        b_l1 = b_third
+                                    else:
+                                        a_l1 = a_fourth
+                                        b_l1 = b_fourth
+                                else:
+                                    a_l1 = a_odd
+                                    b_l1 = b_odd
+                            # The A5 scale address is the payload byte address shifted right by four.
+                            # Scale slots 0 and 2 match the two payload slots because each scale
+                            # tile uses one thirty-second of the corresponding FP8 payload bytes.
+                            for local_pair in pl.range(0, PROJECTION_K_TILE, 2 * inner_k):
+                                local_k = local_pair
+                                k = k_base + panel * PROJECTION_K_TILE + local_k
+                                a: pl.Tile[[row_tile, inner_k], pl.FP8E4M3FN, pl.MemRef("engram_a_l0", slots=a_slots)[0], pl.Mem.Left] = pl.tile.extract(a_l1, 0, local_k, [row_tile, inner_k], target_memory=pl.Mem.Left)
+                                b: pl.Tile[[inner_k, n_tile], pl.FP8E4M3FN, pl.MemRef("engram_b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_l1, local_k, 0, [inner_k, n_tile], target_memory=pl.Mem.Right)
+                                sa: pl.Tile[[row_tile, scale_tile], pl.FP8E8M0, pl.MemRef("engram_sa_l0", slots=sa_slots)[0], pl.Mem.LeftScale] = pl.tile.extract(sa_l1, 0, k // 32, [row_tile, scale_tile], target_memory=pl.Mem.LeftScale)
+                                sb: pl.Tile[[scale_tile, n_tile], pl.FP8E8M0, pl.MemRef("engram_sb_l0", slots=3)[0], pl.Mem.RightScale] = pl.tile.extract(sb_l1, k // 32, 0, [scale_tile, n_tile], target_memory=pl.Mem.RightScale)
+                                if k == 0:
+                                    acc = pl.matmul_mx(a, sa, b, sb)
+                                else:
+                                    acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
+                                local_k = local_pair + inner_k
+                                k = k_base + panel * PROJECTION_K_TILE + local_k
+                                a: pl.Tile[[row_tile, inner_k], pl.FP8E4M3FN, pl.MemRef("engram_a_l0", slots=a_slots)[a_slot], pl.Mem.Left] = pl.tile.extract(a_l1, 0, local_k, [row_tile, inner_k], target_memory=pl.Mem.Left)
+                                b: pl.Tile[[inner_k, n_tile], pl.FP8E4M3FN, pl.MemRef("engram_b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_l1, local_k, 0, [inner_k, n_tile], target_memory=pl.Mem.Right)
+                                sa: pl.Tile[[row_tile, scale_tile], pl.FP8E8M0, pl.MemRef("engram_sa_l0", slots=sa_slots)[sa_slot], pl.Mem.LeftScale] = pl.tile.extract(sa_l1, 0, k // 32, [row_tile, scale_tile], target_memory=pl.Mem.LeftScale)
+                                sb: pl.Tile[[scale_tile, n_tile], pl.FP8E8M0, pl.MemRef("engram_sb_l0", slots=3)[2], pl.Mem.RightScale] = pl.tile.extract(sb_l1, k // 32, 0, [scale_tile, n_tile], target_memory=pl.Mem.RightScale)
+                                acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
+                            # Refill the consumed slot while the other panel is ready.
+                            next_k = k_base + (panel + l1_slots) * PROJECTION_K_TILE
+                            if next_k < ENGRAM_K:
+                                if panel == 0:
+                                    a_even = pl.tile.gather_row(a_even, payload, [0, 0], [m0, next_k], [row_tile, PROJECTION_K_TILE])
+                                    b_even = pl.tile.gather_row(b_even, weight, [0, 0], [next_k, n0], [PROJECTION_K_TILE, n_tile])
+                                elif panel == 1:
+                                    a_odd = pl.tile.gather_row(a_odd, payload, [0, 0], [m0, next_k], [row_tile, PROJECTION_K_TILE])
+                                    b_odd = pl.tile.gather_row(b_odd, weight, [0, 0], [next_k, n0], [PROJECTION_K_TILE, n_tile])
+                                elif four_l1_slots:
+                                    if panel == 2:
+                                        a_third = pl.tile.gather_row(a_third, payload, [0, 0], [m0, next_k], [row_tile, PROJECTION_K_TILE])
+                                        b_third = pl.tile.gather_row(b_third, weight, [0, 0], [next_k, n0], [PROJECTION_K_TILE, n_tile])
+                                    else:
+                                        a_fourth = pl.tile.gather_row(a_fourth, payload, [0, 0], [m0, next_k], [row_tile, PROJECTION_K_TILE])
+                                        b_fourth = pl.tile.gather_row(b_fourth, weight, [0, 0], [next_k, n0], [PROJECTION_K_TILE, n_tile])
                     valid_acc = pl.set_validshape(acc, pl.min(row_tile, tokens - m0), n_tile)
                     kv = pl.store(valid_acc, [m0, n0], kv)
     return kv
@@ -181,8 +239,9 @@ def _engram_quantize_pypto(
     scales: pl.Out[pl.Tensor],
     num_tokens: pl.Scalar[pl.INT32],
     padded_rows: pl.Scalar[pl.INDEX],
+    packed_scale: pl.constexpr,
 ) -> tuple[pl.Tensor, pl.Tensor]:
-    """Quantize row-major BF16 projection inputs with M16-packed E8M0 scales."""
+    """Quantize BF16 projection inputs with packed or row-major E8M0 scales."""
     first = pl.tile.get_block_idx()
     workers = pl.tile.get_block_num()
     column_tiles = ENGRAM_K // ENGRAM_QUANT_K_TILE
@@ -190,8 +249,8 @@ def _engram_quantize_pypto(
     if first < total:
         inputs = pl.create_tile([2 * ENGRAM_QUANT_M_TILE, ENGRAM_QUANT_K_TILE], dtype=pl.BF16, target_memory=pl.Mem.Vec)
         output = pl.create_tile([2 * ENGRAM_QUANT_M_TILE * ENGRAM_QUANT_K_TILE], dtype=pl.INT8, target_memory=pl.Mem.Vec)
-        # Reserve a full 256-byte register store per scale slot.
-        codes = pl.create_tile([ENGRAM_QUANT_SCALE_TILE], dtype=pl.UINT32, target_memory=pl.Mem.Vec)
+        # The row-major DMA needs 32-byte UB rows for the eight valid scales.
+        codes = pl.create_tile([2 * ENGRAM_QUANT_M_TILE * (ENGRAM_QUANT_SCALE_ROW_BYTES // 4)], dtype=pl.UINT32, target_memory=pl.Mem.Vec)
         inputs = _load_engram_quant_work(x, inputs, first, 0, num_tokens)
         pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, 0)
         pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, 0)
@@ -218,19 +277,37 @@ def _engram_quantize_pypto(
             with pl.reg_scope(auto_sync=False):
                 # Keep aligned row and slot offsets visible to register lowering.
                 slot_row = slot * ENGRAM_QUANT_M_TILE
-                code_offset = slot * (ENGRAM_QUANT_SCALE_TILE // 2)
+                code_offset = slot * ENGRAM_QUANT_M_TILE * (ENGRAM_QUANT_SCALE_ROW_BYTES // 4)
                 full = pl.reg.full_mask(lanes=ENGRAM_QUANT_K_TILE)
                 groups = pl.reg.full_mask(lanes=ENGRAM_QUANT_K_TILE // 32)
-                packed_mask = pl.reg.full_mask(lanes=64)
-                # Eight words per group pair hold two rows of scale bytes each.
+                scale_mask = pl.reg.full_mask(lanes=64)
                 lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
                 pair_mask = pl.reg.broadcast(3, lanes=64, dtype=pl.UINT32)
-                pair_index = pl.reg.shift_rights(lane, 3, packed_mask)
-                pair_index = pl.reg.bitwise_and(pair_index, pair_mask, packed_mask)
-                low_index = pl.reg.shift_lefts(pair_index, 4, packed_mask)
-                high_index = pl.reg.adds(low_index, 8, packed_mask)
+                pair_index = pl.reg.shift_rights(lane, 3, scale_mask)
+                pair_index = pl.reg.bitwise_and(pair_index, pair_mask, scale_mask)
+                # Each word holds two neighboring scales from two rows.
+                low_index = pl.reg.shift_lefts(pair_index, 4, scale_mask)
+                high_index = pl.reg.adds(low_index, 8, scale_mask)
                 row_mask = pl.reg.broadcast(7, lanes=64, dtype=pl.UINT32)
-                row_indices = pl.reg.bitwise_and(lane, row_mask, packed_mask)
+                row_indices = pl.reg.bitwise_and(lane, row_mask, scale_mask)
+                if not packed_scale:
+                    # Unpack each word pair into two consecutive words per row.
+                    one = pl.reg.broadcast(1, lanes=64, dtype=pl.UINT32)
+                    group_half = pl.reg.bitwise_and(lane, one, scale_mask)
+                    row_pair = pl.reg.shift_rights(lane, 2, scale_mask)
+                    row_pair = pl.reg.bitwise_and(row_pair, row_mask, scale_mask)
+                    first_pair = pl.reg.shift_lefts(group_half, 4, scale_mask)
+                    low_packed_index = pl.reg.add(first_pair, row_pair, scale_mask)
+                    high_packed_index = pl.reg.adds(low_packed_index, 8, scale_mask)
+                    row_parity = pl.reg.shift_rights(lane, 1, scale_mask)
+                    row_parity = pl.reg.bitwise_and(row_parity, one, scale_mask)
+                    bit_shift = pl.reg.shift_lefts(row_parity, 4, scale_mask)
+                    half_word = pl.reg.broadcast(65535, lanes=64, dtype=pl.UINT32)
+                    scale_row = pl.reg.shift_rights(lane, 1, scale_mask)
+                    scale_row = pl.reg.shift_lefts(scale_row, 3, scale_mask)
+                    scale_index = pl.reg.add(scale_row, group_half, scale_mask)
+                    scale_index = pl.reg.adds(scale_index, pl.cast(code_offset, pl.UINT32), scale_mask)
+                    active_words = pl.reg.compares(lane, ENGRAM_QUANT_SCALE_TILE // 4, scale_mask, predicate="lt")
                 zero = pl.reg.broadcast(0, lanes=64, dtype=pl.UINT32)
                 for row, (packed_scales,) in pl.hardware_loop(rows, init_values=(zero,)):
                     tile_row = slot_row + row
@@ -262,18 +339,30 @@ def _engram_quantize_pypto(
                     scale_words = pl.reg.group_broadcast(scale_words, lanes=64)
                     low = pl.reg.gather_lanes(scale_words, low_index)
                     high = pl.reg.gather_lanes(scale_words, high_index)
-                    high = pl.reg.shift_lefts(high, 8, packed_mask)
-                    pair = pl.reg.bitwise_or(low, high, packed_mask)
+                    high = pl.reg.shift_lefts(high, 8, scale_mask)
+                    pair = pl.reg.bitwise_or(low, high, scale_mask)
                     bit = pl.cast((row % 2) * 16, pl.INT16)
-                    pair = pl.reg.shift_lefts(pair, bit, packed_mask)
+                    pair = pl.reg.shift_lefts(pair, bit, scale_mask)
                     word = pl.cast(row // 2, pl.UINT32)
-                    row_selected = pl.reg.compares(row_indices, word, packed_mask, predicate="eq")
+                    row_selected = pl.reg.compares(row_indices, word, scale_mask, predicate="eq")
                     pair = pl.reg.select(row_selected, pair, zero)
-                    updated_scales = pl.reg.bitwise_or(packed_scales, pair, packed_mask)
+                    updated_scales = pl.reg.bitwise_or(packed_scales, pair, scale_mask)
                     packed_scales = pl.yield_(updated_scales)
+                if not packed_scale:
+                    low_word = pl.reg.gather_lanes(packed_scales, low_packed_index)
+                    high_word = pl.reg.gather_lanes(packed_scales, high_packed_index)
+                    low_scale = pl.reg.shift_right(low_word, bit_shift, scale_mask)
+                    second = pl.reg.shift_right(high_word, bit_shift, scale_mask)
+                    low_scale = pl.reg.bitwise_and(low_scale, half_word, scale_mask)
+                    second = pl.reg.bitwise_and(second, half_word, scale_mask)
+                    second = pl.reg.shift_lefts(second, 16, scale_mask)
+                    packed_scales = pl.reg.bitwise_or(low_scale, second, scale_mask)
                 # Complete the active payload stores before the scale and padding stores.
                 pl.reg.mem_bar("VST_VST")
-                _scales = pl.reg.store(codes, code_offset, packed_scales)
+                if packed_scale:
+                    _scales = pl.reg.store(codes, code_offset, packed_scales)
+                else:
+                    _scales = pl.reg.scatter(codes, scale_index, packed_scales, active_words)
                 padding = pl.reg.broadcast(0, lanes=ENGRAM_QUANT_K_TILE // 4, dtype=pl.UINT32)
                 for inactive in pl.hardware_loop(ENGRAM_QUANT_M_TILE - rows):
                     row = rows + inactive
@@ -286,12 +375,19 @@ def _engram_quantize_pypto(
             output_rows = pl.reshape(output, [2 * ENGRAM_QUANT_M_TILE, ENGRAM_QUANT_K_TILE])
             output_tile = pl.tile.slice(output_rows, [ENGRAM_QUANT_M_TILE, ENGRAM_QUANT_K_TILE], [slot * ENGRAM_QUANT_M_TILE, 0])
             quantized = pl.reinterpret_view(output_tile, pl.FP8E4M3FN)
-            scale_bytes = pl.reinterpret_view(codes, pl.UINT8, shape=[2, 2 * ENGRAM_QUANT_SCALE_TILE])
-            scale_tile = pl.tile.slice(scale_bytes, [1, ENGRAM_QUANT_SCALE_TILE], [slot, 0])
-            scale_codes = pl.reinterpret_view(scale_tile, pl.FP8E8M0)
-            scale_offset = t0 * (ENGRAM_K // 32) + k0 // ENGRAM_QUANT_K_TILE * ENGRAM_QUANT_SCALE_TILE
             pl.store(quantized, [t0, k0], payload)
-            pl.store(scale_codes, [0, scale_offset], scales)
+            if packed_scale:
+                scale_bytes = pl.reinterpret_view(codes, pl.UINT8, shape=[2, ENGRAM_QUANT_M_TILE * ENGRAM_QUANT_SCALE_ROW_BYTES])
+                scale_tile = pl.tile.slice(scale_bytes, [1, ENGRAM_QUANT_SCALE_TILE], [slot, 0])
+                scale_codes = pl.reinterpret_view(scale_tile, pl.FP8E8M0)
+                scale_offset = t0 * (ENGRAM_K // 32) + k0 // ENGRAM_QUANT_K_TILE * ENGRAM_QUANT_SCALE_TILE
+                pl.store(scale_codes, [0, scale_offset], scales)
+            else:
+                scale_bytes = pl.reinterpret_view(codes, pl.UINT8, shape=[2 * ENGRAM_QUANT_M_TILE, 32])
+                scale_tile = pl.tile.slice(scale_bytes, [ENGRAM_QUANT_M_TILE, 32], [slot * ENGRAM_QUANT_M_TILE, 0])
+                scale_codes = pl.reinterpret_view(scale_tile, pl.FP8E8M0)
+                scale_rows = pl.set_validshape(scale_codes, ENGRAM_QUANT_M_TILE, ENGRAM_QUANT_K_TILE // 32)
+                pl.store(scale_rows, [t0, k0 // 32], scales)
             pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, slot)
         pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, 0)
         if rounds > 1:
@@ -306,17 +402,41 @@ def _engram_quantize_pypto(
 def _engram_rows_tile(
     lookup: pl.Tensor, wkv: pl.Tensor, wkv_scale: pl.Tensor, weight: pl.Tensor,
     x: pl.Tensor, out: pl.Tensor, tokens: pl.Scalar[pl.INT32],
-    row_tile: pl.constexpr, mask_zero_rows: pl.constexpr,
+    row_tile: pl.constexpr, mask_zero_rows: pl.constexpr, native_projection: pl.constexpr,
 ):
     """Quantize and project host rows before gating the residual."""
     padded = ((tokens + row_tile - 1) // row_tile) * row_tile
     payload = pl.create_tensor([padded, ENGRAM_K], dtype=pl.FP8E4M3FN)
-    scales = pl.create_tensor([1, padded * (ENGRAM_K // 32)], dtype=pl.FP8E8M0)
     kv = pl.create_tensor([tokens, KV_OUT], dtype=pl.BF16)
-    with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_quant"):
-        quantized, quantized_scales = _engram_quantize_pypto(lookup, payload, scales, tokens, padded)
-    with pl.spmd(pl.system.available_cluster_count(), name_hint="engram_projection"):
-        projected = _engram_project(quantized, wkv, quantized_scales, wkv_scale, kv, tokens, row_tile)
+    if native_projection:
+        scales = pl.create_tensor([1, padded * (ENGRAM_K // 32)], dtype=pl.FP8E8M0)
+        with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_quant"):
+            quantized, quantized_scales = _engram_quantize_pypto(lookup, payload, scales, tokens, padded, True)
+        with pl.spmd(pl.system.available_cluster_count(), name_hint="engram_projection"):
+            projected = _engram_project(quantized, wkv, quantized_scales, wkv_scale, kv, tokens, row_tile)
+    elif row_tile == 128:
+        # The 81–128 token interval always fits in one static M128 scale view.
+        scales = pl.create_tensor([1, padded * (ENGRAM_K // 32)], dtype=pl.FP8E8M0)
+        with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_quant"):
+            quantized, quantized_scales = _engram_quantize_pypto(lookup, payload, scales, tokens, padded, True)
+        projected = _engram_project_pypto(
+            quantized, wkv, quantized_scales, wkv_scale, kv, tokens, row_tile, PROJECTION_N_TILE, 128, 4,
+            True, True, 4, 2, 1, 3, 2,
+        )
+    else:
+        scales = pl.create_tensor([padded, ENGRAM_K // 32], dtype=pl.FP8E8M0)
+        with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_quant"):
+            quantized, quantized_scales = _engram_quantize_pypto(lookup, payload, scales, tokens, padded, False)
+        if row_tile == 80:
+            # A K64 payload tile occupies 5120 bytes. Slot 7 places the second
+            # L0A tile beyond 32 KiB, and scale slot 14 matches its address >> 4.
+            projected = _engram_project_pypto(
+                quantized, wkv, quantized_scales, wkv_scale, kv, tokens, row_tile, PROJECTION_N_TILE_M80, 64, 2, False, False, 2, 8, 7, 15, 14,
+            )
+        else:
+            projected = _engram_project_pypto(
+                quantized, wkv, quantized_scales, wkv_scale, kv, tokens, row_tile, PROJECTION_N_TILE, 128, 4, False, False, 2, 2, 1, 3, 2,
+            )
     if mask_zero_rows:
         return engram_gate(projected, weight, x, out, lookup, mask_zero_rows)
     output_rows = pl.reshape(out, [pl.tensor.dim(out, 0) * HC_MULT, D])
@@ -333,6 +453,37 @@ def _engram_rows_tile(
 
 
 @pl.jit.inline(auto_scope=False)
+def _engram_from_rows(
+    lookup: pl.Tensor,
+    wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[ENGRAM_K // 32, KV_OUT], pl.FP8E8M0],
+    weight: pl.Tensor[[HC_MULT, D], pl.FP32],
+    x: pl.Tensor,
+    out: pl.Tensor,
+    mask_zero_rows: pl.constexpr,
+    native_projection: pl.constexpr,
+):
+    """Project host-gathered ND rows and gate the FP32 residual in place or out of place."""
+    tokens = pl.tensor.dim(x, 0)
+    if tokens > 0:
+        if tokens <= 80:
+            result = _engram_rows_tile(
+                lookup, wkv_weight, wkv_scale, weight, x, out, tokens, 80, mask_zero_rows, native_projection,
+            )
+        elif tokens <= 128:
+            result = _engram_rows_tile(
+                lookup, wkv_weight, wkv_scale, weight, x, out, tokens, 128, mask_zero_rows, native_projection,
+            )
+        else:
+            result = _engram_rows_tile(
+                lookup, wkv_weight, wkv_scale, weight, x, out, tokens, 256, mask_zero_rows, native_projection,
+            )
+    else:
+        result = out
+    return result
+
+
+@pl.jit.inline(auto_scope=False)
 def engram_from_rows(
     lookup: pl.Tensor,
     wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
@@ -342,99 +493,8 @@ def engram_from_rows(
     out: pl.Tensor,
     mask_zero_rows: pl.constexpr = False,
 ):
-    """Project host-gathered ND rows and gate the FP32 residual in place or out of place."""
-    tokens = pl.tensor.dim(x, 0)
-    if tokens > 0:
-        if tokens <= 80:
-            result = _engram_rows_tile(
-                lookup, wkv_weight, wkv_scale, weight, x, out, tokens, 80, mask_zero_rows,
-            )
-        elif tokens <= 128:
-            result = _engram_rows_tile(
-                lookup, wkv_weight, wkv_scale, weight, x, out, tokens, 128, mask_zero_rows,
-            )
-        else:
-            result = _engram_rows_tile(
-                lookup, wkv_weight, wkv_scale, weight, x, out, tokens, 256, mask_zero_rows,
-            )
-    else:
-        result = out
-    return result
-
-
-@pl.jit.inline
-def _engram_gate_pypto(
-    kv: pl.Tensor,
-    weight: pl.Tensor[[HC_MULT, D], pl.FP32],
-    x: pl.Tensor,
-    out: pl.Tensor,
-):
-    """Gate projected keys and values into each residual stream copy."""
-    t_dim = pl.tensor.dim(kv, 0)
-    x_flat = pl.reshape(x, [t_dim, HC_MULT * D])
-    out_flat = pl.reshape(out, [t_dim, HC_MULT * D])
-    t_blocks = (t_dim + GATE_T_TILE - 1) // GATE_T_TILE
-    workers = pl.min(t_blocks * HC_MULT, pl.system.available_aiv_count())
-    for worker in pl.spmd(workers, name_hint="_engram_gate_pypto"):
-        for wave in pl.pipeline((t_blocks * HC_MULT + workers - 1) // workers, stage=2):
-            block = wave * workers + worker
-            if block < t_blocks * HC_MULT:
-                t0 = (block // HC_MULT) * GATE_T_TILE
-                c = block % HC_MULT
-                valid_rows = pl.min(GATE_T_TILE, t_dim - t0)
-                reduction_tmp = pl.create_tile([GATE_T_TILE, GATE_D_TILE], dtype=pl.FP32)
-                # Reduction accumulators have 32-byte aligned rows.
-                sq_x = pl.tile.full([1, GATE_T_TILE], dtype=pl.FP32, value=0.0)
-                sq_k = pl.tile.full([1, GATE_T_TILE], dtype=pl.FP32, value=0.0)
-                dot = pl.tile.full([1, GATE_T_TILE], dtype=pl.FP32, value=0.0)
-                for d0 in pl.range(0, D, GATE_D_TILE):
-                    x_raw = pl.load(x_flat, [t0, c * D + d0], [GATE_T_TILE, GATE_D_TILE], valid_shape=[valid_rows, GATE_D_TILE])
-                    key_raw = pl.load(kv, [t0, c * D + d0], [GATE_T_TILE, GATE_D_TILE], valid_shape=[valid_rows, GATE_D_TILE])
-                    key_d = pl.cast(pl.set_validshape(pl.fillpad(key_raw, pad_value=pl.PadValue.zero), GATE_T_TILE, GATE_D_TILE), pl.FP32)
-                    x_d = pl.set_validshape(pl.fillpad(x_raw, pad_value=pl.PadValue.zero), GATE_T_TILE, GATE_D_TILE)
-                    sq_x = pl.add(sq_x, pl.reshape(pl.row_sum(pl.mul(x_d, x_d), reduction_tmp), [1, GATE_T_TILE]))
-                    sq_k = pl.add(sq_k, pl.reshape(pl.row_sum(pl.mul(key_d, key_d), reduction_tmp), [1, GATE_T_TILE]))
-                    w_d = pl.load(weight, [c, d0], [1, GATE_D_TILE])
-                    xw_d = pl.col_expand_mul(x_d, w_d)
-                    dot = pl.add(dot, pl.reshape(pl.row_sum(pl.mul(xw_d, key_d), reduction_tmp), [1, GATE_T_TILE]))
-                inv_x = pl.rsqrt(pl.add(pl.mul(sq_x, D_INV), NORM_EPS))
-                inv_k = pl.rsqrt(pl.add(pl.mul(sq_k, D_INV), NORM_EPS))
-                dot = pl.mul(pl.mul(pl.mul(dot, inv_x), inv_k), DOT_SCALE)
-                root = pl.sqrt(pl.maximum(pl.abs(dot), CLAMP))
-                nonnegative = pl.cmps(dot, 0.0, cmp_type=5)
-                signed = pl.tile.select(nonnegative, root, pl.neg(root))
-                gate = pl.reshape(pl.recip(pl.add(pl.exp(pl.neg(signed)), 1.0)), [GATE_T_TILE, 1])
-                for d0 in pl.range(0, D, GATE_D_TILE):
-                    output_source = pl.load(x_flat, [t0, c * D + d0], [GATE_T_TILE, GATE_D_TILE], valid_shape=[valid_rows, GATE_D_TILE])
-                    output_value = pl.load(kv, [t0, HC_MULT * D + d0], [GATE_T_TILE, GATE_D_TILE], valid_shape=[valid_rows, GATE_D_TILE])
-                    gated = pl.row_expand_mul(pl.cast(output_value, pl.FP32), gate)
-                    y = pl.add(output_source, gated)
-                    y_bf16 = pl.cast(y, target_type=pl.BF16, mode="rint")
-                    y_rounded = pl.cast(y_bf16, pl.FP32)
-                    pl.store(pl.set_validshape(y_rounded, valid_rows, GATE_D_TILE), [t0, c * D + d0], out_flat)
-    return out
-
-
-@pl.jit.inline(auto_scope=False)
-def engram_from_rows_pypto(
-    lookup: pl.Tensor,
-    wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[ENGRAM_K // 32, KV_OUT], pl.FP8E8M0],
-    weight: pl.Tensor[[HC_MULT, D], pl.FP32],
-    x: pl.Tensor,
-    out: pl.Tensor,
-):
-    """Compute Engram in PyPTO DSL for explicit comparison with the production entry."""
-    tokens = pl.tensor.dim(x, 0)
-    if tokens > 0:
-        kv = pl.create_tensor([tokens, KV_OUT], dtype=pl.BF16)
-        projected = gemm_bf16_via_mxfp8_to_bf16_staged(
-            lookup, wkv_weight, wkv_scale, kv, tokens,
-            ENGRAM_K, KV_OUT, "engram_pypto_projection", "engram_pypto_quant",
-            PROJECTION_N_TILE, PROJECTION_K_TILE, 1, 2147483647,
-        )
-        _engram_gate_pypto(projected, weight, x, out)
-    return out
+    """Project host-gathered rows and gate the FP32 residual."""
+    return _engram_from_rows(lookup, wkv_weight, wkv_scale, weight, x, out, mask_zero_rows, False)
 
 
 class HostEngram:
@@ -640,17 +700,17 @@ def l2_engram_rows(
 
 
 @pl.jit
-def l2_engram_rows_pypto(
+def l2_engram_rows_cpp(
     lookup: pl.Tensor[[T_DYN, ENGRAM_K], pl.BF16],
     wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
     wkv_scale: pl.Tensor[[ENGRAM_K // 32, KV_OUT], pl.FP8E8M0],
     weight: pl.Tensor[[HC_MULT, D], pl.FP32],
     x: pl.InOut[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
 ):
-    """Validate the explicit PyPTO comparison implementation in place."""
+    """Validate the C++ projection reference with the shared quantization and gating."""
     lookup.bind_dynamic(0, T_DYN)
     x.bind_dynamic(0, T_DYN)
-    engram_from_rows_pypto(lookup, wkv_weight, wkv_scale, weight, x, x)
+    _engram_from_rows(lookup, wkv_weight, wkv_scale, weight, x, x, False, True)
     return x
 
 
@@ -932,8 +992,8 @@ if __name__ == "__main__":
         help="comma-separated device ids; provide one device id",
     )
     parser.add_argument("--masked-gate", action="store_true")
-    parser.add_argument("--implementation", choices=["cpp", "pypto"], default="cpp",
-                        help="cpp is the production default; pypto is for explicit comparison")
+    parser.add_argument("--implementation", choices=["cpp", "pypto"], default="pypto",
+                        help="Select the projection implementation")
     parser.add_argument("--tokens", type=int, help="explicit row count; default checks tile boundaries and tails")
     parser.add_argument("--runtime-dir", help="reuse a CPU-prebuilt runtime; requires --tokens")
     parser.add_argument("--golden-data", help="reuse frozen input/reference tensors; requires --tokens")
@@ -957,7 +1017,7 @@ if __name__ == "__main__":
         native_runtime = any(kernel.get("external", False) for kernel in kernels)
         if native_runtime != (args.implementation == "cpp"):
             parser.error("--runtime-dir implementation does not match --implementation")
-    entry = l2_engram_rows if args.implementation == "cpp" else l2_engram_rows_pypto
+    entry = l2_engram_rows_cpp if args.implementation == "cpp" else l2_engram_rows
     token_cases = [17, 81, 129, 256] if args.execution_mode else [17, 80, 81, 128, 129, 256, 257]
     if args.tokens is not None:
         token_cases = [args.tokens]
