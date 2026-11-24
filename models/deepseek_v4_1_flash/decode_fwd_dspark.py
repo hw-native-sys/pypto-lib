@@ -254,7 +254,7 @@ def l2_decode_fwd_dspark(
     context_rope_sin: pl.Out[pl.Tensor[[DECODE_BATCH * STATE_OPS_ROWS, STATE_OPS_ROPE_HALF], pl.FP32]],
     query_rope_cos: pl.Out[pl.Tensor[[DECODE_BATCH * STATE_OPS_DSPARK_QUERY_WIDTH, STATE_OPS_ROPE_HALF], pl.FP32]],
     query_rope_sin: pl.Out[pl.Tensor[[DECODE_BATCH * STATE_OPS_DSPARK_QUERY_WIDTH, STATE_OPS_ROPE_HALF], pl.FP32]],
-    draft_main_proj_weight: pl.Tensor[[DRAFT_MAIN_IN, D], pl.FP8E4M3FN],
+    draft_main_proj_weight: pl.Tensor[[DRAFT_MAIN_IN, D], pl.FP8E4M3FN, pl.NZ],
     draft_main_proj_scale: pl.Tensor[[DRAFT_MAIN_IN // DRAFT_MX_GROUP, D], pl.FP8E8M0],
     draft_main_norm_weight: pl.Tensor[[D], pl.BF16],
     zero_prefill_tokens: pl.Tensor[[DRAFT_B_DYN], pl.INT64],
@@ -584,7 +584,7 @@ def l3_decode_fwd_dspark(
     context_rope_sin: pl.Out[pl.Tensor[[EP_SIZE, DECODE_BATCH * STATE_OPS_ROWS, STATE_OPS_ROPE_HALF], pl.FP32]],
     query_rope_cos: pl.Out[pl.Tensor[[EP_SIZE, DECODE_BATCH * STATE_OPS_DSPARK_QUERY_WIDTH, STATE_OPS_ROPE_HALF], pl.FP32]],
     query_rope_sin: pl.Out[pl.Tensor[[EP_SIZE, DECODE_BATCH * STATE_OPS_DSPARK_QUERY_WIDTH, STATE_OPS_ROPE_HALF], pl.FP32]],
-    draft_main_proj_weight: pl.Tensor[[DRAFT_EP_SIZE, DRAFT_MAIN_IN, D], pl.FP8E4M3FN],
+    draft_main_proj_weight: pl.Tensor[[DRAFT_EP_SIZE, DRAFT_MAIN_IN, D], pl.FP8E4M3FN, pl.NZ],
     draft_main_proj_scale: pl.Tensor[[DRAFT_EP_SIZE, DRAFT_MAIN_IN // DRAFT_MX_GROUP, D], pl.FP8E8M0],
     draft_main_norm_weight: pl.Tensor[[DRAFT_EP_SIZE, D], pl.BF16],
     zero_prefill_tokens: pl.Tensor[[DRAFT_EP_SIZE, DRAFT_B_DYN], pl.INT64],
@@ -794,6 +794,8 @@ def build_tensor_specs(active_requests=1):
             extents[d.name] if hasattr(d, "name") and d.name in extents else target_fwd._fixture_extent(d)
             for d in ann.shape
         ]
+        if name == "draft_main_proj_weight":
+            shape = [shape[0], D // 32, DRAFT_MAIN_IN // 16, 16, 32]
         dtype = target_fwd._torch_dtype(ann.dtype)
         base = target_specs.get(name)
         value = initial.get(name, base.init_value if base is not None else None)

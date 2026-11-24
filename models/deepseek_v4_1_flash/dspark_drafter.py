@@ -12,9 +12,6 @@
 
 import argparse
 import inspect
-from pathlib import Path
-
-from pypto.runtime import pto_isa_include_dir
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -77,8 +74,13 @@ DSPARK_WINDOW = FLASH.sliding_window
 
 # Projection tiles.
 PROJ_M_TILE = 80
+PROJ_ROWS_PER_LAUNCH = 32 * PROJ_M_TILE
 PROJ_N_TILE = 160
-PROJ_K_TILE = 384
+PROJ_K_TILE = 256
+PROJ_CUBE_K_TILE = 128
+PROJ_SCALE_K_TILE = PROJ_CUBE_K_TILE // MX_GROUP
+PROJ_L1_BUFFERS = 4
+PROJ_L0_BUFFERS = 2
 QUANT_M_TILE = 16
 QUANT_K_TILE = 1280
 
@@ -95,103 +97,255 @@ W3_DEVICE_ROWS = MX_W3_PACKED_ROWS // PANEL_ROWS
 draft_moe = make_decode_moe(N_LOCAL_EXPERTS, TOPK, packed_routed_weights=PACK_ROUTED_WEIGHTS)
 
 
-@pl.jit.extern(
-    core_type="mixed", dual_aiv_dispatch=True,
-    aic_source=Path(__file__).parent / "kernels/dspark_projection.cpp",
-    aiv_source=Path(__file__).parent / "kernels/dspark_projection.cpp",
-    include_dirs=(str(Path(__file__).parent / "kernels"), pto_isa_include_dir()),
-)
-def _dspark_projection_mix(
-    hidden: pl.Tensor,
-    payload: pl.Out[pl.Tensor],
-    scales: pl.Out[pl.Tensor],
-    num_tokens: pl.Scalar[pl.INT32],
-    padded_rows: pl.Scalar[pl.INDEX],
-    weight: pl.Tensor,
-    weight_scale: pl.Tensor,
-    output: pl.Out[pl.Tensor],
-) -> tuple[pl.Tensor, pl.Tensor, pl.Tensor]:
-    return payload, scales, output
+@pl.jit.inline
+def _accumulate_dspark_payload(
+    acc: pl.Tile[[PROJ_M_TILE, PROJ_N_TILE], pl.FP32, pl.Mem.Acc],
+    a_l1: pl.Tile[[PROJ_M_TILE, PROJ_K_TILE], pl.FP8E4M3FN, pl.Mem.Mat],
+    b_l1: pl.Tile[[PROJ_K_TILE, PROJ_N_TILE], pl.FP8E4M3FN, pl.Mem.Mat],
+    sa_l1: pl.Tile[[PROJ_M_TILE, MAIN_IN // MX_GROUP], pl.FP8E8M0, pl.Mem.Mat],
+    sb_l1: pl.Tile[[MAIN_IN // MX_GROUP, PROJ_N_TILE], pl.FP8E8M0, pl.Mem.Mat],
+    group: pl.Scalar[pl.INDEX],
+) -> pl.Tile:
+    pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, group % PROJ_L1_BUFFERS)
+    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
+    scale_offset = group * (PROJ_K_TILE // MX_GROUP)
+    a: pl.Tile[
+        [PROJ_M_TILE, PROJ_CUBE_K_TILE], pl.FP8E4M3FN,
+        pl.MemRef("a_l0", slots=PROJ_L0_BUFFERS)[0], pl.Mem.Left,
+    ] = pl.tile.extract(a_l1, 0, 0, [PROJ_M_TILE, PROJ_CUBE_K_TILE], target_memory=pl.Mem.Left)
+    b: pl.Tile[
+        [PROJ_CUBE_K_TILE, PROJ_N_TILE], pl.FP8E4M3FN,
+        pl.MemRef("b_l0", slots=PROJ_L0_BUFFERS)[0], pl.Mem.Right,
+    ] = pl.tile.extract(b_l1, 0, 0, [PROJ_CUBE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Right)
+    sa = pl.tile.extract(
+        sa_l1, 0, scale_offset, [PROJ_M_TILE, PROJ_SCALE_K_TILE], target_memory=pl.Mem.LeftScale, scale_for=a,
+    )
+    sb = pl.tile.extract(
+        sb_l1, scale_offset, 0, [PROJ_SCALE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.RightScale, scale_for=b,
+    )
+    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
+    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
+    if group == 0:
+        acc = pl.tile.matmul_mx(a, sa, b, sb)
+    else:
+        acc = pl.tile.matmul_mx_acc(acc, a, sa, b, sb)
+    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
+    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
+    scale_offset = group * (PROJ_K_TILE // MX_GROUP) + PROJ_SCALE_K_TILE
+    a: pl.Tile[
+        [PROJ_M_TILE, PROJ_CUBE_K_TILE], pl.FP8E4M3FN,
+        pl.MemRef("a_l0", slots=PROJ_L0_BUFFERS)[1], pl.Mem.Left,
+    ] = pl.tile.extract(a_l1, 0, PROJ_CUBE_K_TILE, [PROJ_M_TILE, PROJ_CUBE_K_TILE], target_memory=pl.Mem.Left)
+    b: pl.Tile[
+        [PROJ_CUBE_K_TILE, PROJ_N_TILE], pl.FP8E4M3FN,
+        pl.MemRef("b_l0", slots=PROJ_L0_BUFFERS)[1], pl.Mem.Right,
+    ] = pl.tile.extract(b_l1, PROJ_CUBE_K_TILE, 0, [PROJ_CUBE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Right)
+    sa = pl.tile.extract(
+        sa_l1, 0, scale_offset, [PROJ_M_TILE, PROJ_SCALE_K_TILE], target_memory=pl.Mem.LeftScale, scale_for=a,
+    )
+    sb = pl.tile.extract(
+        sb_l1, scale_offset, 0, [PROJ_SCALE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.RightScale, scale_for=b,
+    )
+    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
+    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
+    acc = pl.tile.matmul_mx_acc(acc, a, sa, b, sb)
+    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
+    return acc
+
+
+@pl.jit.inline
+def _dspark_publish_quant(
+    source: pl.Tile[[QUANT_M_TILE, QUANT_K_TILE], pl.BF16, pl.Mem.Vec],
+    payload: pl.Tensor,
+    scales: pl.Tensor,
+    row: pl.Scalar[pl.INDEX],
+    k: pl.Scalar[pl.INDEX],
+):
+    padded = pl.fillpad(source, pad_value=pl.PadValue.zero)
+    full = pl.set_validshape(padded, QUANT_M_TILE, QUANT_K_TILE)
+    data, scale = pl.quant_mx(full, group_axis=1, quant_scale_alg="ocp")
+    payload = pl.store(data, [row, k], payload)
+    packed = pl.reshape(scale, [1, QUANT_M_TILE * (QUANT_K_TILE // MX_GROUP)])
+    offset = row * (MAIN_IN // MX_GROUP) + k // MX_GROUP * QUANT_M_TILE
+    scales = pl.store(packed, [0, offset], scales)
+    return payload, scales
 
 
 @pl.jit.inline(auto_scope=False)
 def dspark_proj(
-    target_hidden: pl.Tensor[[T_DYN, MAIN_IN], pl.BF16],
-    main_proj_weight: pl.Tensor[[MAIN_IN, D], pl.FP8E4M3FN],
-    main_proj_scale: pl.Tensor[[MAIN_IN // MX_GROUP, D], pl.FP8E8M0],
-    projected: pl.Tensor[[T_DYN, D], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Project target taps with NZ MXFP8 weights and MX_B_NN E8M0 scales in a MIX launch."""
-    target_hidden.bind_dynamic(0, T_DYN)
-    projected.bind_dynamic(0, T_DYN)
-    padded_rows = (num_tokens + 79) // 80 * 80
-    payload = pl.create_tensor([padded_rows, MAIN_IN], dtype=pl.FP8E4M3FN)
-    scales = pl.create_tensor([1, padded_rows * (MAIN_IN // MX_GROUP)], dtype=pl.FP8E8M0)
-    workers = pl.min(D // PROJ_N_TILE, pl.system.available_cluster_count())
-    with pl.spmd(workers, name_hint="dspark_quant_gemm_mix", sync_start=True):
-        payload, scales, projected = _dspark_projection_mix(
-            target_hidden, payload, scales, num_tokens, padded_rows,
-            main_proj_weight, main_proj_scale, projected,
-        )
-    return projected
-
-
-@pl.jit.inline(auto_scope=False)
-def dspark_proj_pypto(
     target_hidden: pl.Tensor[[T_DYN, MAIN_IN], pl.BF16],
     main_proj_weight: pl.Tensor[[MAIN_IN, D], pl.FP8E4M3FN, pl.NZ],
     main_proj_scale: pl.Tensor[[MAIN_IN // MX_GROUP, D], pl.FP8E8M0],
     projected: pl.Tensor[[T_DYN, D], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    """Quantize target taps once and project them with NZ MXFP8 weights."""
+    """Quantize and project each row batch in one A5 MIX launch."""
     target_hidden.bind_dynamic(0, T_DYN)
     projected.bind_dynamic(0, T_DYN)
-    padded_rows = (num_tokens + PROJ_M_TILE - 1) // PROJ_M_TILE * PROJ_M_TILE
-    payload = pl.create_tensor([padded_rows, MAIN_IN], dtype=pl.FP8E4M3FN)
-    scales = pl.create_tensor([1, padded_rows * (MAIN_IN // MX_GROUP)], dtype=pl.FP8E8M0)
-    quant_tasks = padded_rows // QUANT_M_TILE * (MAIN_IN // QUANT_K_TILE)
-    quant_workers = pl.min(quant_tasks, 2 * pl.system.available_cluster_count())
-    with pl.spmd(quant_workers, name_hint="dspark_projection_quant") as quantized:
-        worker = pl.tile.get_block_idx()
-        workers = pl.tile.get_block_num()
-        for task in pl.range(worker, quant_tasks, workers):
-            row = task // (MAIN_IN // QUANT_K_TILE) * QUANT_M_TILE
-            k = task % (MAIN_IN // QUANT_K_TILE) * QUANT_K_TILE
-            source_row = pl.min(row, num_tokens - 1)
-            rows = pl.min(QUANT_M_TILE, num_tokens - source_row)
-            source = pl.load(target_hidden, [source_row, k], [QUANT_M_TILE, QUANT_K_TILE], valid_shape=[rows, QUANT_K_TILE])
-            padded = pl.fillpad(source, pad_value=pl.PadValue.zero)
-            full = pl.set_validshape(padded, QUANT_M_TILE, QUANT_K_TILE)
-            data, scale = pl.quant_mx(full, group_axis=1, quant_scale_alg="ocp")
-            payload = pl.store(data, [row, k], payload)
-            packed = pl.reshape(scale, [1, QUANT_M_TILE * (QUANT_K_TILE // MX_GROUP)])
-            offset = row * (MAIN_IN // MX_GROUP) + k // MX_GROUP * QUANT_M_TILE
-            scales = pl.store(packed, [0, offset], scales)
-
     weight_scale = pl.tensor.view(main_proj_scale, [MAIN_IN // MX_GROUP, D], layout=pl.MX_B_NN)
-    for row_tile in pl.parallel((num_tokens + PROJ_M_TILE - 1) // PROJ_M_TILE):
-        row = row_tile * PROJ_M_TILE
-        scale_begin = row * (MAIN_IN // MX_GROUP)
-        scale_end = scale_begin + PROJ_M_TILE * (MAIN_IN // MX_GROUP)
-        scale_slice = scales[0:1, scale_begin:scale_end]
-        activation_scale = pl.tensor.view(scale_slice, [PROJ_M_TILE, MAIN_IN // MX_GROUP], layout=pl.MX_A_ZZ)
-        with pl.spmd(D // PROJ_N_TILE, name_hint="dspark_projection_gemm", deps=[quantized]):
-            col = pl.tile.get_block_idx() * PROJ_N_TILE
-            a = pl.load(payload, [row, 0], [PROJ_M_TILE, PROJ_K_TILE], target_memory=pl.Mem.Mat)
-            sa = pl.load(activation_scale, [0, 0], [PROJ_M_TILE, PROJ_K_TILE // MX_GROUP])
-            b = pl.load(main_proj_weight, [0, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
-            sb = pl.load(weight_scale, [0, col], [PROJ_K_TILE // MX_GROUP, PROJ_N_TILE])
-            acc = pl.matmul_mx(a, sa, b, sb)
-            for k in pl.pipeline(PROJ_K_TILE, MAIN_IN, PROJ_K_TILE, stage=2):
-                a_next = pl.load(payload, [row, k], [PROJ_M_TILE, PROJ_K_TILE], target_memory=pl.Mem.Mat)
-                sa_next = pl.load(activation_scale, [0, k // MX_GROUP], [PROJ_M_TILE, PROJ_K_TILE // MX_GROUP])
-                b_next = pl.load(main_proj_weight, [k, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
-                sb_next = pl.load(weight_scale, [k // MX_GROUP, col], [PROJ_K_TILE // MX_GROUP, PROJ_N_TILE])
-                acc = pl.matmul_mx_acc(acc, a_next, sa_next, b_next, sb_next)
-            valid = pl.set_validshape(acc, pl.min(PROJ_M_TILE, num_tokens - row), PROJ_N_TILE)
-            projected = pl.store(valid, [row, col], projected)
+    workers = pl.system.available_cluster_count()
+    for batch_start in pl.range(0, num_tokens, PROJ_ROWS_PER_LAUNCH):
+        batch_rows = pl.min(PROJ_ROWS_PER_LAUNCH, num_tokens - batch_start)
+        padded_rows = (batch_rows + PROJ_M_TILE - 1) // PROJ_M_TILE * PROJ_M_TILE
+        payload = pl.create_tensor([padded_rows, MAIN_IN], dtype=pl.FP8E4M3FN)
+        scales = pl.create_tensor([1, PROJ_ROWS_PER_LAUNCH * (MAIN_IN // MX_GROUP)], dtype=pl.FP8E8M0)
+        with pl.spmd(workers, name_hint="dspark_projection_mix", sync_start=True):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                worker = pl.tile.get_block_idx()
+                block_workers = pl.tile.get_block_num()
+                quant_tasks = padded_rows // QUANT_M_TILE * (MAIN_IN // QUANT_K_TILE)
+                for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                    first_task = worker * 2 + lane
+                    task_stride = block_workers * 2
+                    active_tasks = (batch_rows + QUANT_M_TILE - 1) // QUANT_M_TILE * (MAIN_IN // QUANT_K_TILE)
+                    pairs = pl.max(0, (active_tasks - first_task + task_stride - 1) // (2 * task_stride))
+                    for pair in pl.range(pairs):
+                        work0 = first_task + pair * 2 * task_stride
+                        work1 = work0 + task_stride
+                        row0 = work0 // (MAIN_IN // QUANT_K_TILE) * QUANT_M_TILE
+                        row1 = work1 // (MAIN_IN // QUANT_K_TILE) * QUANT_M_TILE
+                        k0 = work0 % (MAIN_IN // QUANT_K_TILE) * QUANT_K_TILE
+                        k1 = work1 % (MAIN_IN // QUANT_K_TILE) * QUANT_K_TILE
+                        rows0 = pl.min(QUANT_M_TILE, batch_rows - row0)
+                        rows1 = pl.min(QUANT_M_TILE, batch_rows - row1)
+                        source0: pl.Tile[
+                            [QUANT_M_TILE, QUANT_K_TILE], pl.BF16, pl.MemRef("quant_input_ub", slots=2)[0], pl.Mem.Vec,
+                        ] = pl.load(
+                            target_hidden, [batch_start + row0, k0], [QUANT_M_TILE, QUANT_K_TILE],
+                            valid_shape=[rows0, QUANT_K_TILE],
+                        )
+                        source1: pl.Tile[
+                            [QUANT_M_TILE, QUANT_K_TILE], pl.BF16, pl.MemRef("quant_input_ub", slots=2)[1], pl.Mem.Vec,
+                        ] = pl.load(
+                            target_hidden, [batch_start + row1, k1], [QUANT_M_TILE, QUANT_K_TILE],
+                            valid_shape=[rows1, QUANT_K_TILE],
+                        )
+                        payload, scales = _dspark_publish_quant(source0, payload, scales, row0, k0)
+                        payload, scales = _dspark_publish_quant(source1, payload, scales, row1, k1)
+                    tail_task = first_task + pairs * 2 * task_stride
+                    for task in pl.range(tail_task, quant_tasks, task_stride):
+                        row = task // (MAIN_IN // QUANT_K_TILE) * QUANT_M_TILE
+                        k = task % (MAIN_IN // QUANT_K_TILE) * QUANT_K_TILE
+                        rows = pl.max(0, pl.min(QUANT_M_TILE, batch_rows - row))
+                        offset = row * (MAIN_IN // MX_GROUP) + k // MX_GROUP * QUANT_M_TILE
+                        if rows > 0:
+                            # Keep the next input load independent of the previous quantized writeback.
+                            source: pl.Tile[
+                                [QUANT_M_TILE, QUANT_K_TILE], pl.BF16,
+                                pl.MemRef("quant_input_ub", slots=2)[0], pl.Mem.Vec,
+                            ] = pl.load(
+                                target_hidden,
+                                [batch_start + row, k],
+                                [QUANT_M_TILE, QUANT_K_TILE],
+                                valid_shape=[rows, QUANT_K_TILE],
+                            )
+                            payload, scales = _dspark_publish_quant(source, payload, scales, row, k)
+                        else:
+                            data_bytes = pl.tile.full(
+                                [QUANT_M_TILE, QUANT_K_TILE], dtype=pl.INT8, value=0
+                            )
+                            scale_bytes = pl.tile.full(
+                                [1, QUANT_M_TILE * (QUANT_K_TILE // MX_GROUP)],
+                                dtype=pl.UINT8,
+                                value=0,
+                            )
+                            payload = pl.store(
+                                pl.reinterpret_view(data_bytes, pl.FP8E4M3FN), [row, k], payload
+                            )
+                            scales = pl.store(
+                                pl.reinterpret_view(scale_bytes, pl.FP8E8M0), [0, offset], scales
+                            )
+
+                # Publish the quantized activations before Cube reads the workspace.
+                pl.system.fence()
+                pl.system.syncall(core_type=pl.KernelType.MIX)
+                activation_scale = pl.tensor.view(
+                    scales, [PROJ_ROWS_PER_LAUNCH, MAIN_IN // MX_GROUP], layout=pl.MX_A_ZZ
+                )
+                column_waves = (D // PROJ_N_TILE + block_workers - 1 - worker) // block_workers
+                for column_wave in pl.range(column_waves):
+                    column_tile = worker + column_wave * block_workers
+                    col = column_tile * PROJ_N_TILE
+                    for row in pl.range(0, batch_rows, PROJ_M_TILE):
+                        row_base = batch_start + row
+                        # Keep the full K dimension of both scale panels resident in L1.
+                        sa_l1 = pl.load(
+                            activation_scale, [row, 0], [PROJ_M_TILE, MAIN_IN // MX_GROUP],
+                            target_memory=pl.Mem.Mat,
+                        )
+                        sb_l1 = pl.load(
+                            weight_scale, [0, col], [MAIN_IN // MX_GROUP, PROJ_N_TILE],
+                            target_memory=pl.Mem.Mat,
+                        )
+                        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, PROJ_L1_BUFFERS)
+                        pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, PROJ_L1_BUFFERS)
+                        pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
+                        pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
+                        a0: pl.Tile[
+                            [PROJ_M_TILE, PROJ_K_TILE], pl.FP8E4M3FN,
+                            pl.MemRef("a_l1", slots=PROJ_L1_BUFFERS)[0], pl.Mem.Mat,
+                        ] = pl.tile.load(payload, [row, 0], [PROJ_M_TILE, PROJ_K_TILE], target_memory=pl.Mem.Mat)
+                        b0: pl.Tile[
+                            [PROJ_K_TILE, PROJ_N_TILE], pl.FP8E4M3FN,
+                            pl.MemRef("b_l1", slots=PROJ_L1_BUFFERS)[0], pl.Mem.Mat,
+                        ] = pl.tile.load(main_proj_weight, [0, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+                        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 0)
+                        a1: pl.Tile[
+                            [PROJ_M_TILE, PROJ_K_TILE], pl.FP8E4M3FN,
+                            pl.MemRef("a_l1", slots=PROJ_L1_BUFFERS)[1], pl.Mem.Mat,
+                        ] = pl.tile.load(payload, [row, PROJ_K_TILE], [PROJ_M_TILE, PROJ_K_TILE], target_memory=pl.Mem.Mat)
+                        b1: pl.Tile[
+                            [PROJ_K_TILE, PROJ_N_TILE], pl.FP8E4M3FN,
+                            pl.MemRef("b_l1", slots=PROJ_L1_BUFFERS)[1], pl.Mem.Mat,
+                        ] = pl.tile.load(main_proj_weight, [PROJ_K_TILE, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+                        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 1)
+                        a2: pl.Tile[
+                            [PROJ_M_TILE, PROJ_K_TILE], pl.FP8E4M3FN,
+                            pl.MemRef("a_l1", slots=PROJ_L1_BUFFERS)[2], pl.Mem.Mat,
+                        ] = pl.tile.load(payload, [row, 2 * PROJ_K_TILE], [PROJ_M_TILE, PROJ_K_TILE], target_memory=pl.Mem.Mat)
+                        b2: pl.Tile[
+                            [PROJ_K_TILE, PROJ_N_TILE], pl.FP8E4M3FN,
+                            pl.MemRef("b_l1", slots=PROJ_L1_BUFFERS)[2], pl.Mem.Mat,
+                        ] = pl.tile.load(main_proj_weight, [2 * PROJ_K_TILE, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+                        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 2)
+                        a3: pl.Tile[
+                            [PROJ_M_TILE, PROJ_K_TILE], pl.FP8E4M3FN,
+                            pl.MemRef("a_l1", slots=PROJ_L1_BUFFERS)[3], pl.Mem.Mat,
+                        ] = pl.tile.load(payload, [row, 3 * PROJ_K_TILE], [PROJ_M_TILE, PROJ_K_TILE], target_memory=pl.Mem.Mat)
+                        b3: pl.Tile[
+                            [PROJ_K_TILE, PROJ_N_TILE], pl.FP8E4M3FN,
+                            pl.MemRef("b_l1", slots=PROJ_L1_BUFFERS)[3], pl.Mem.Mat,
+                        ] = pl.tile.load(main_proj_weight, [3 * PROJ_K_TILE, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+                        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 3)
+                        acc = pl.tile.create([PROJ_M_TILE, PROJ_N_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+                        for group in pl.unroll(MAIN_IN // PROJ_K_TILE):
+                            acc = _accumulate_dspark_payload(acc, a0, b0, sa_l1, sb_l1, group)
+                            a0, b0 = a1, b1
+                            a1, b1 = a2, b2
+                            a2, b2 = a3, b3
+                            next_group = group + PROJ_L1_BUFFERS
+                            if next_group < MAIN_IN // PROJ_K_TILE:
+                                slot = group % PROJ_L1_BUFFERS
+                                pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, slot)
+                                pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, slot)
+                                a3: pl.Tile[
+                                    [PROJ_M_TILE, PROJ_K_TILE], pl.FP8E4M3FN,
+                                    pl.MemRef("a_l1", slots=PROJ_L1_BUFFERS)[slot], pl.Mem.Mat,
+                                ] = pl.tile.load(payload, [row, next_group * PROJ_K_TILE], [PROJ_M_TILE, PROJ_K_TILE], target_memory=pl.Mem.Mat)
+                                b3: pl.Tile[
+                                    [PROJ_K_TILE, PROJ_N_TILE], pl.FP8E4M3FN,
+                                    pl.MemRef("b_l1", slots=PROJ_L1_BUFFERS)[slot], pl.Mem.Mat,
+                                ] = pl.tile.load(main_proj_weight, [next_group * PROJ_K_TILE, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+                                pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, slot)
+                        pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
+                        pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
+                        pl.system.set_flag(pl.PipeType.M, pl.PipeType.FIX, 0)
+                        pl.system.wait_flag(pl.PipeType.M, pl.PipeType.FIX, 0)
+                        valid = pl.set_validshape(
+                            acc, pl.min(PROJ_M_TILE, num_tokens - row_base), PROJ_N_TILE
+                        )
+                        projected = pl.store(valid, [row_base, col], projected)
+                        pl.system.barrier(pipe=pl.PipeType.ALL)
     return projected
 
 
@@ -294,7 +448,7 @@ def dspark_metadata(
 @pl.jit.inline(auto_scope=False)
 def dspark_drafter(
     target_hidden: pl.Tensor[[T_DYN, MAIN_IN], pl.BF16],
-    main_proj_weight: pl.Tensor[[MAIN_IN, D], pl.FP8E4M3FN],
+    main_proj_weight: pl.Tensor[[MAIN_IN, D], pl.FP8E4M3FN, pl.NZ],
     main_proj_scale: pl.Tensor[[MAIN_IN // MX_GROUP, D], pl.FP8E8M0],
     main_norm_weight: pl.Tensor[[D], pl.BF16],
     num_sampled: pl.Tensor[[B_DYN], pl.INT32],
@@ -445,7 +599,7 @@ def dspark_drafter(
 @pl.jit(auto_scope=False)
 def l2_dspark_drafter(
     target_hidden: pl.Tensor[[T_DYN, MAIN_IN], pl.BF16],
-    main_proj_weight: pl.Tensor[[MAIN_IN, D], pl.FP8E4M3FN],
+    main_proj_weight: pl.Tensor[[MAIN_IN, D], pl.FP8E4M3FN, pl.NZ],
     main_proj_scale: pl.Tensor[[MAIN_IN // MX_GROUP, D], pl.FP8E8M0],
     main_norm_weight: pl.Tensor[[D], pl.BF16],
     num_sampled: pl.Tensor[[B_DYN], pl.INT32],
@@ -536,7 +690,7 @@ def l2_dspark_drafter(
 @pl.jit.host
 def l3_dspark_drafter(
     target_hidden: pl.Tensor[[C.EP_SIZE, T_DYN, MAIN_IN], pl.BF16],
-    main_proj_weight: pl.Tensor[[C.EP_SIZE, MAIN_IN, D], pl.FP8E4M3FN],
+    main_proj_weight: pl.Tensor[[C.EP_SIZE, MAIN_IN, D], pl.FP8E4M3FN, pl.NZ],
     main_proj_scale: pl.Tensor[[C.EP_SIZE, MAIN_IN // MX_GROUP, D], pl.FP8E8M0],
     main_norm_weight: pl.Tensor[[C.EP_SIZE, D], pl.BF16],
     num_sampled: pl.Tensor[[C.EP_SIZE, B_DYN], pl.INT32],
@@ -690,6 +844,8 @@ def build_drafter_specs():
         annotation = parameter.annotation
         if hasattr(annotation, "shape"):
             shape = [size if isinstance(size, int) else dynamic_sizes[size.name] for size in annotation.shape]
+            if parameter.name == "main_proj_weight":
+                shape = [shape[0], D // 32, MAIN_IN // 16, 16, 32]
             dtype = dtypes[str(annotation.dtype)]
             init = initial_value(parameter.name, shape, dtype)
             specs.append(forward_routed_weight_spec(parameter.name, shape, dtype, init, PACK_ROUTED_WEIGHTS))
