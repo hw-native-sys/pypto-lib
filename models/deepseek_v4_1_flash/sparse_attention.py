@@ -9,11 +9,8 @@
 # ci: no-sim
 """Gather sparse attention over packed FP8/FP4 caches with an attention sink."""
 
-from pathlib import Path
-
 import pypto.language as pl
 import torch
-from pypto.runtime import pto_isa_include_dir
 
 from config import (
     FLASH as M, CACHE_ROWS_DYN, CMP_BLOCKS_DYN, ORI_BLOCKS_DYN, T_DYN, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
@@ -76,108 +73,6 @@ SPARSE_VF_WINDOW_SHIFT = 5
 SPARSE_VF_WINDOW_SCALE_TILE = SPARSE_VF_REG_TILE // SPARSE_VF_WINDOW_GROUP
 SPARSE_VF_COMPRESSED_SCALE_TILE = SPARSE_VF_REG_TILE // SPARSE_VF_COMPRESSED_GROUP
 SPARSE_VF_WINDOW_SCALE_ROW_TILE = SPARSE_VF_REG_TILE // SPARSE_VF_WINDOW_GROUPS
-
-
-@pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "sparse_gather_vf.cpp",
-               aiv_source=Path(__file__).parent / "kernels" / "sparse_gather_vf.cpp",
-               include_dirs=(pto_isa_include_dir(),), dual_aiv_dispatch=True)
-def _gather_sparse_vf_rows(
-    output: pl.Out[pl.Tensor],
-    query: pl.Tensor,
-    sink: pl.Tensor,
-    window: pl.Tensor,
-    compressed: pl.Tensor,
-    window_indices: pl.Tensor,
-    compressed_indices: pl.Tensor,
-    partials: pl.InOut[pl.Tensor],
-    num_tokens: pl.Scalar[pl.INT32],
-    heads: pl.Scalar[pl.INT32],
-    window_keys: pl.Scalar[pl.INT32],
-    compressed_keys: pl.Scalar[pl.INT32],
-    balanced: pl.Scalar[pl.INT32],
-    cache_mode: pl.constexpr,
-):
-    """Stream cache rows through L1 with sink-aware sparse attention.
-
-    Scalar gather indices use refreshed GM cache lines; vector masks use
-    the asynchronous index copy in UB.
-    """
-    ...
-
-
-@pl.jit.inline(auto_scope=False)
-def gather_sparse_attention(
-    query: pl.Tensor,
-    window_indices: pl.Tensor,
-    window: pl.Tensor,
-    compressed_indices: pl.Tensor,
-    compressed: pl.Tensor,
-    sink: pl.Tensor,
-    output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-    compressed_keys: pl.constexpr,
-):
-    """Route packed SWA and compressed attention through the shared entry."""
-    if compressed_keys == 0:
-        attended = _attend_window_fused(query, window_indices, window, sink, output, num_tokens)
-    else:
-        attended = _gather_sparse_attention_extern(
-            query, window_indices, window, compressed_indices, compressed,
-            sink, output, num_tokens, compressed_keys,
-        )
-    return attended
-
-
-@pl.jit.inline(auto_scope=False)
-def _gather_sparse_attention_extern(
-    query: pl.Tensor,
-    window_indices: pl.Tensor,
-    window: pl.Tensor,
-    compressed_indices: pl.Tensor,
-    compressed: pl.Tensor,
-    sink: pl.Tensor,
-    output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-    compressed_keys: pl.constexpr,
-):
-    """Attend packed window and compressed caches with both Vector lanes."""
-    query = query[:num_tokens, :]
-    active_output = output[:num_tokens, :]
-    window_indices = window_indices[:num_tokens, :]
-    compressed_indices = compressed_indices[:num_tokens, :]
-    workers = pl.max(1, pl.min(num_tokens, SPARSE_VF_WORKER_TILE))
-    workers = pl.min(workers, pl.system.available_cluster_count())
-    parts = (WINDOW_KEYS + compressed_keys) // 128
-    whole_tiles = ((num_tokens + workers - 1) // workers) * parts
-    balanced_tiles = (num_tokens * parts + workers - 1) // workers
-    balanced = pl.cast(0, pl.INT32)
-    if num_tokens > workers:
-        if whole_tiles - balanced_tiles >= 3:
-            balanced = pl.cast(1, pl.INT32)
-    slots = pl.max(1, 2 * workers * balanced)
-    partials_size = slots * 64 * (HEAD_DIM + 2) + 2 * workers
-    partials = pl.create_tensor([partials_size], dtype=pl.FP32)
-    if balanced != 0:
-        ready_offset = 2 * workers * 64 * (HEAD_DIM + 2)
-        flat_partials = pl.reshape(partials, [1, partials_size])
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="sparse_gather_reset") as reset:
-            flags = pl.tile.full([1, 2 * SPARSE_VF_WORKER_TILE], dtype=pl.FP32, value=0.0)
-            flags = pl.tile.set_validshape(flags, 1, 2 * workers)
-            pl.store(flags, [0, ready_offset], flat_partials)
-        with pl.spmd(workers, name_hint="sparse_gather_vf", sync_start=True, deps=[reset]) as attended:
-            _gather_sparse_vf_rows(
-                active_output, query, sink, window, compressed,
-                window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
-                balanced, cache_mode=compressed_keys,
-            )
-    else:
-        with pl.spmd(workers, name_hint="sparse_gather_vf") as attended:
-            _gather_sparse_vf_rows(
-                active_output, query, sink, window, compressed,
-                window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
-                balanced, cache_mode=compressed_keys,
-            )
-    return attended
 
 
 @pl.jit.inline(auto_scope=False)
@@ -798,8 +693,7 @@ def sparse_vf_fused_cube(qflat: pl.Tensor, window_indices: pl.Tensor, compressed
     pl.func_attr({'split_aiv': True})
     keys = WINDOW_KEYS + compressed_keys
     _parts = keys // SPARSE_VF_KEY_TILE
-    workers = pl.min(num_tokens * (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE), SPARSE_VF_WORKER_TILE)
-    workers = pl.max(1, workers)
+    workers = pl.tile.get_block_num()
     if compressed_keys > 0:
         kv_ring = pl.system.reserve_buffer(name='sparse_kv_ring', size=262144)
     else:
@@ -1017,8 +911,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
     pl.func_attr({'split_aiv': True, 'dual_aiv_dispatch': True})
     keys = WINDOW_KEYS + compressed_keys
     parts = keys // SPARSE_VF_KEY_TILE
-    workers = pl.min(num_tokens * (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE), SPARSE_VF_WORKER_TILE)
-    workers = pl.max(1, workers)
+    workers = pl.tile.get_block_num()
     aiv_id = pl.tile.get_subblock_idx()
     pv_ring = pl.system.reserve_buffer(name='sparse_qk_ring', size=16384)
     kv_peer = pl.system.import_peer_buffer(name='sparse_kv_ring', peer_func='sparse_vf_fused_cube')
@@ -4402,28 +4295,29 @@ def _attend_window_fused(
 
 
 @pl.jit.inline(auto_scope=False)
-def gather_sparse_attention_pypto(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
-    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
-    sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+def gather_sparse_attention(
+    query: pl.Tensor,
+    window_indices: pl.Tensor,
+    window: pl.Tensor,
+    compressed_indices: pl.Tensor,
+    compressed: pl.Tensor,
+    sink: pl.Tensor,
+    output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
-    source_ready: pl.Scalar[pl.TASK_ID],
     compressed_keys: pl.constexpr,
 ):
-    """Fuse packed-cache decoding and attention; keep single-part SWA scheduling."""
+    """Attend to packed window and compressed caches with PyPTO."""
     query = query[:num_tokens, :]
     output = output[:num_tokens, :]
     window_indices = window_indices[:num_tokens, :]
     compressed_indices = compressed_indices[:num_tokens, :]
     attended = pl.system.task_invalid()
-    if compressed_keys > 0 and LOCAL_H >= 32:
+    if compressed_keys == 0:
+        attended = _attend_window_fused(query, window_indices, window, sink, output, num_tokens)
+    elif LOCAL_H >= 32:
         window_rows = pl.tensor.dim(window, 0) * 128
         window_flat = pl.reshape(window, [window_rows, WINDOW_CACHE_BYTES])
-        compressed_rows = pl.tensor.dim(compressed, 0) * 128
+        compressed_rows = pl.tensor.dim(compressed, 0) * pl.tensor.dim(compressed, 1)
         compressed_flat = pl.reshape(compressed, [compressed_rows, COMPRESSED_CACHE_BYTES])
         tokens = pl.tensor.dim(query, 0)
         qflat = pl.reshape(query, [tokens * LOCAL_H, HEAD_DIM])
@@ -4431,7 +4325,8 @@ def gather_sparse_attention_pypto(
         sink_row = pl.reshape(sink, [1, LOCAL_H])
         workers = pl.min(num_tokens * (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE), SPARSE_VF_WORKER_TILE)
         workers = pl.max(1, workers)
-        with pl.spmd(workers, name_hint='sparse_vf_fused', deps=[source_ready]) as fused:
+        workers = pl.min(workers, pl.system.available_cluster_count())
+        with pl.spmd(workers, name_hint="sparse_vf_fused") as fused:
             sparse_vf_fused_group(
                 qflat,
                 window_indices, compressed_indices,
@@ -4451,7 +4346,7 @@ def gather_sparse_attention_pypto(
             window_indices, window,
             compressed_indices, compressed,
             decoded, selected_ids,
-            num_tokens, source_ready, compressed_keys=compressed_keys,
+            num_tokens, attended, compressed_keys=compressed_keys,
         )
         attended = sparse_vf_attend_pypto(
             query,
