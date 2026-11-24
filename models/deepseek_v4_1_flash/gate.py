@@ -278,7 +278,10 @@ def _gate_select_routes(
 ):
     """Apply sqrt-softplus and bias, select routes, and clear the inactive output rows."""
     blocks = (active_tokens + GATE_T_TILE - 1) // GATE_T_TILE
-    workers = pl.max(1, pl.min(blocks, ROUTE_WORKER_TILE))
+    if columns == 128:
+        workers = pl.max(1, pl.min(blocks, 64))
+    else:
+        workers = pl.max(1, pl.min(blocks, ROUTE_WORKER_TILE))
     with pl.spmd(workers, name_hint="gate_select"):
         indices, weights = _gate_select_routes_block(
             raw_scores, gate_bias, indices, weights, active_tokens, topk, columns, experts,
@@ -557,24 +560,31 @@ def gate(
     return route_tokens(xg_buf, gate_w, gate_bias, num_tokens, indices, weights, n_experts=n_experts, topk=topk)
 
 
-@pl.jit
-def l2_gate(
-    x_normed: pl.Tensor[[T_PAD, D], pl.BF16],
-    gate_w: pl.Tensor[[N_EXPERTS, D], pl.BF16],
-    gate_bias: pl.Tensor[[BIAS_DYN], pl.FP32],
-    num_tokens: pl.Scalar[pl.INT32],
-    x_norm_mx: pl.Out[pl.Tensor[[T_PAD, D], pl.FP8E4M3FN]],
-    x_norm_scale: pl.Out[pl.Tensor[[1, T_PAD * MX_SCALE_GROUPS], pl.FP8E8M0]],
-    indices: pl.Out[pl.Tensor[[T, TOPK], pl.INT32]],
-    weights: pl.Out[pl.Tensor[[T, TOPK], pl.FP32]],
-):
-    gate_bias.bind_dynamic(0, BIAS_DYN)
-    gate(
-        x_normed, gate_w, gate_bias,
-        num_tokens,
-        x_norm_mx, x_norm_scale, indices, weights, n_experts=N_EXPERTS, topk=TOPK,
-    )
-    return x_norm_mx, x_norm_scale, indices, weights
+def _gate_validation_entry(experts):
+    """Specialize the standalone validator for a model router width."""
+    @pl.jit
+    def l2_gate(
+        x_normed: pl.Tensor[[T_PAD, D], pl.BF16],
+        gate_w: pl.Tensor[[experts, D], pl.BF16],
+        gate_bias: pl.Tensor[[BIAS_DYN], pl.FP32],
+        num_tokens: pl.Scalar[pl.INT32],
+        x_norm_mx: pl.Out[pl.Tensor[[T_PAD, D], pl.FP8E4M3FN]],
+        x_norm_scale: pl.Out[pl.Tensor[[1, T_PAD * MX_SCALE_GROUPS], pl.FP8E8M0]],
+        indices: pl.Out[pl.Tensor[[T, TOPK], pl.INT32]],
+        weights: pl.Out[pl.Tensor[[T, TOPK], pl.FP32]],
+    ):
+        gate_bias.bind_dynamic(0, BIAS_DYN)
+        gate(
+            x_normed, gate_w, gate_bias,
+            num_tokens,
+            x_norm_mx, x_norm_scale, indices, weights, n_experts=experts, topk=TOPK,
+        )
+        return x_norm_mx, x_norm_scale, indices, weights
+
+    return l2_gate
+
+
+l2_gate = _gate_validation_entry(N_EXPERTS)
 
 
 def _golden_gate_scores(tensors):
@@ -634,7 +644,7 @@ def golden_gate_normalized_core(tensors):
     _golden_gate_core(tensors, x_norm, scores, biased)
 
 
-def build_tensor_specs(num_tokens=T, *, token_bias=False):
+def build_tensor_specs(num_tokens=T, *, token_bias=False, experts=N_EXPERTS):
     import torch
     from golden import ScalarSpec, TensorSpec
 
@@ -646,14 +656,14 @@ def build_tensor_specs(num_tokens=T, *, token_bias=False):
         return value
 
     def init_gate_w():
-        return torch.randn(N_EXPERTS, D) / D ** 0.5
+        return torch.randn(experts, D) / D ** 0.5
 
     def init_gate_bias():
         if not token_bias:
-            return torch.randn(N_EXPERTS) * 0.1
-        bias = torch.full((T_PAD, N_EXPERTS), -10.0)
+            return torch.randn(experts) * 0.1
+        bias = torch.full((T_PAD, experts), -10.0)
         for row in range(T_PAD):
-            selected = (torch.arange(TOPK) + row * TOPK) % N_EXPERTS
+            selected = (torch.arange(TOPK) + row * TOPK) % experts
             bias[row, selected] = 10.0
         return bias.flatten()
 
@@ -671,8 +681,8 @@ def build_tensor_specs(num_tokens=T, *, token_bias=False):
 
     return [
         TensorSpec("x_normed", [T_PAD, D], torch.bfloat16, init_value=init_x_normed),
-        TensorSpec("gate_w", [N_EXPERTS, D], torch.bfloat16, init_value=init_gate_w),
-        TensorSpec("gate_bias", [T_PAD * N_EXPERTS if token_bias else N_EXPERTS], torch.float32, init_value=init_gate_bias),
+        TensorSpec("gate_w", [experts, D], torch.bfloat16, init_value=init_gate_w),
+        TensorSpec("gate_bias", [T_PAD * experts if token_bias else experts], torch.float32, init_value=init_gate_bias),
         ScalarSpec("num_tokens", torch.int32, num_tokens, compile_runtime=True),
         TensorSpec("x_norm_mx", [T_PAD, D], torch.float8_e4m3fn, init_value=lambda: init_fp8((T_PAD, D))),
         TensorSpec("x_norm_scale", [1, T_PAD * MX_SCALE_GROUPS], getattr(torch, "float8_e8m0fnu", torch.uint8), init_value=lambda: init_e8m0((1, T_PAD * MX_SCALE_GROUPS))),
@@ -732,12 +742,13 @@ def gate_indices_compare(
         if actual.numel() == 0:
             return True, ""
 
-        invalid = (actual < 0) | (actual >= N_EXPERTS)
+        experts = inputs["gate_w"].shape[0]
+        invalid = (actual < 0) | (actual >= experts)
         if invalid.any().item():
             bad = invalid.nonzero(as_tuple=False)
             lines = [
                 f"    score route contains {bad.shape[0]} out-of-range id(s); "
-                f"valid range is [0, {N_EXPERTS})"
+                f"valid range is [0, {experts})"
             ]
             for row, pos in bad[:max_show].tolist():
                 lines.append(f"      [{row},{pos}] actual={int(actual[row, pos])}")
@@ -882,14 +893,17 @@ if __name__ == "__main__":
     counts = [args.num_tokens] if args.num_tokens is not None else [0, 1, T - 1, T]
     if args.compile_only:
         counts = [T if args.num_tokens is None else args.num_tokens]
-    for active_count in counts:
+    cases = [(n, N_EXPERTS, args.token_bias) for n in counts]
+    if args.num_tokens is None and not args.compile_only and N_EXPERTS != 96:
+        cases.append((min(72, T), 96, True))
+    for active_count, experts, token_bias in cases:
         torch.manual_seed(args.seed)
-        print(f"Gate validation: num_tokens={active_count}", flush=True)
+        print(f"Gate validation: num_tokens={active_count}, experts={experts}", flush=True)
 
         result = run(
             a5_default_runtime="host_build_graph",
-            fn=l2_gate,
-            specs=build_tensor_specs(num_tokens=active_count, token_bias=args.token_bias),
+            fn=l2_gate if experts == N_EXPERTS else _gate_validation_entry(experts),
+            specs=build_tensor_specs(num_tokens=active_count, token_bias=token_bias, experts=experts),
             golden_fn=golden_gate_normalized_core,
             compile_only=args.compile_only,
             runtime_dir=args.runtime_dir,
