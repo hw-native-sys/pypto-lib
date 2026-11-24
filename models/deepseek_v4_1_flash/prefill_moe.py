@@ -615,10 +615,16 @@ def make_prefill_moe(local_experts):
             # Carry completion explicitly before overwriting shared scratch.
             row_ids = pl.slice(slab_rows, [MOE_TOKENS], [0])
             round_hidden = pl.slice(slab_hidden, [MOE_TOKENS, HC_MULT, D], [0, 0, 0])
-            round_output = pl.slice(slab_hidden, [MOE_TOKENS, HC_MULT, D], [MOE_TOKENS, 0, 0])
             round_pre = pl.slice(slab_pre, [MOE_TOKENS, HC_MULT], [0, 0])
-            round_next = pl.slice(slab_pre, [MOE_TOKENS, HC_MULT], [MOE_TOKENS, 0])
-            round_mixed = pl.slice(slab_mixed, [MOE_TOKENS, D], [0, 0])
+            # Complete physical slabs publish every output row, including inactive padding.
+            if capacity % MOE_TOKENS == 0:
+                round_output = pl.slice(x_next, [MOE_TOKENS, HC_MULT, D], [begin, 0, 0])
+                round_next = pl.slice(next_pre_mix, [MOE_TOKENS, HC_MULT], [begin, 0])
+                round_mixed = pl.slice(x_mixed, [MOE_TOKENS, D], [begin, 0])
+            else:
+                round_output = pl.slice(slab_hidden, [MOE_TOKENS, HC_MULT, D], [MOE_TOKENS, 0, 0])
+                round_next = pl.slice(slab_pre, [MOE_TOKENS, HC_MULT], [MOE_TOKENS, 0])
+                round_mixed = pl.slice(slab_mixed, [MOE_TOKENS, D], [0, 0])
             with pl.scope():
                 active = pl.max(0, pl.min(rows, num_tokens - begin))
                 with pl.spmd(1, name_hint="prefill_moe_rows", deps=[round_completion[0]]) as rows_ready:
@@ -650,25 +656,33 @@ def make_prefill_moe(local_experts):
                     moe_workspace,
                     active,
                 )
-                with pl.spmd(32, name_hint="prefill_moe_results") as hidden_copied:
-                    worker = pl.tile.get_block_idx()
-                    for row in pl.range(worker, MOE_TOKENS, 32):
-                        if row < rows:
-                            for lane in pl.range(HC_MULT):
-                                for column in pl.range(0, D, D):
-                                    hidden = round_output[row:row + 1, lane:lane + 1, column:column + D]
-                                    hidden_destination[row:row + 1, lane:lane + 1, column:column + D] = hidden
-                            mixed = round_mixed[row:row + 1, :]
-                            mixed_destination[row:row + 1, :] = mixed
-                with pl.spmd(1, name_hint="prefill_moe_pre_mix") as pre_copied:
-                    pl.system.cacheinvalid()
-                    writer = pl.tile.get_block_idx()
-                    for row in pl.range(writer, MOE_TOKENS):
-                        if row < rows:
-                            for lane in pl.range(HC_MULT):
-                                value = pl.read(round_next, [row, lane])
-                                pl.write(pre_destination, [row, lane], value)
-                round_completion[0] = pl.system.task_dummy(deps=[hidden_copied, pre_copied])
+                if capacity % MOE_TOKENS == 0:
+                    # HC post joins the expert and mix producers before the next slab reuses scratch.
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_outputs_ready") as outputs_ready:
+                        pl.system.cacheinvalid()
+                        anchor = pl.read(hidden_destination, [0, 0, 0])
+                        pl.write(hidden_destination, [0, 0, 0], anchor)
+                    round_completion[0] = outputs_ready
+                else:
+                    with pl.spmd(32, name_hint="prefill_moe_results") as hidden_copied:
+                        worker = pl.tile.get_block_idx()
+                        for row in pl.range(worker, MOE_TOKENS, 32):
+                            if row < rows:
+                                for lane in pl.range(HC_MULT):
+                                    for column in pl.range(0, D, D):
+                                        hidden = round_output[row:row + 1, lane:lane + 1, column:column + D]
+                                        hidden_destination[row:row + 1, lane:lane + 1, column:column + D] = hidden
+                                mixed = round_mixed[row:row + 1, :]
+                                mixed_destination[row:row + 1, :] = mixed
+                    with pl.spmd(1, name_hint="prefill_moe_pre_mix") as pre_copied:
+                        pl.system.cacheinvalid()
+                        writer = pl.tile.get_block_idx()
+                        for row in pl.range(writer, MOE_TOKENS):
+                            if row < rows:
+                                for lane in pl.range(HC_MULT):
+                                    value = pl.read(round_next, [row, lane])
+                                    pl.write(pre_destination, [row, lane], value)
+                    round_completion[0] = pl.system.task_dummy(deps=[hidden_copied, pre_copied])
         return round_completion[0]
 
     return prefill_moe, prefill_moe_slabs
