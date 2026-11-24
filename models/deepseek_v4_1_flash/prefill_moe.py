@@ -608,6 +608,7 @@ def make_prefill_moe(local_experts):
         for round_id in pl.range(rounds):
             begin = owner_begin + round_id * MOE_TOKENS
             rows = pl.min(MOE_TOKENS, owner_begin + owner_capacity - begin)
+            full_slab = capacity % MOE_TOKENS == 0 or round_id < capacity // MOE_TOKENS
             # Keep caller-owned destinations outside the slab allocation scope.
             hidden_destination = pl.slice(x_next, [rows, HC_MULT, D], [begin, 0, 0])
             mixed_destination = pl.slice(x_mixed, [rows, D], [begin, 0])
@@ -617,7 +618,7 @@ def make_prefill_moe(local_experts):
             round_hidden = pl.slice(slab_hidden, [MOE_TOKENS, HC_MULT, D], [0, 0, 0])
             round_pre = pl.slice(slab_pre, [MOE_TOKENS, HC_MULT], [0, 0])
             # Complete physical slabs publish every output row, including inactive padding.
-            if capacity % MOE_TOKENS == 0:
+            if full_slab:
                 round_output = pl.slice(x_next, [MOE_TOKENS, HC_MULT, D], [begin, 0, 0])
                 round_next = pl.slice(next_pre_mix, [MOE_TOKENS, HC_MULT], [begin, 0])
                 round_mixed = pl.slice(x_mixed, [MOE_TOKENS, D], [begin, 0])
@@ -656,7 +657,7 @@ def make_prefill_moe(local_experts):
                     moe_workspace,
                     active,
                 )
-                if capacity % MOE_TOKENS == 0:
+                if full_slab:
                     # HC post joins the expert and mix producers before the next slab reuses scratch.
                     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_outputs_ready") as outputs_ready:
                         pl.system.cacheinvalid()
