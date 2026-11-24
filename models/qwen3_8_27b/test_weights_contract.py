@@ -61,44 +61,13 @@ def tiny_config() -> Qwen38Config:
     )
 
 
-def _tensor(spec, generator: torch.Generator) -> torch.Tensor:
-    if spec.dtype == "int8":
-        return torch.randint(-127, 128, spec.shape, dtype=torch.int8, generator=generator)
-    if spec.dtype == "fp32":
-        if spec.is_zero_offset:
-            return torch.zeros(spec.shape, dtype=torch.float32)
-        return torch.rand(spec.shape, dtype=torch.float32, generator=generator) + 1e-4
-    return torch.randn(spec.shape, dtype=torch.bfloat16, generator=generator)
-
-
 def _write_fixture(root: Path, contract) -> tuple[dict[str, torch.Tensor], dict[str, str]]:
-    from safetensors.torch import save_file
+    """The two-shard fixture checkpoint, written by the module under test's own writer.
 
-    generator = torch.Generator().manual_seed(42)
-    source = {spec.name: _tensor(spec, generator) for spec in contract.weight_specs}
-    names = list(source)
-    split = len(names) // 2
-    shard_names = (
-        "quant_model_weights-00001-of-00002.safetensors",
-        "quant_model_weights-00002-of-00002.safetensors",
-    )
-    shard_tensors = (
-        {name: source[name] for name in names[:split]},
-        {name: source[name] for name in names[split:]},
-    )
-    # Non-text tensors are legal and must not leak into the text-only load.
-    shard_tensors[0]["model.visual.blocks.0.norm1.weight"] = torch.ones(4, dtype=torch.bfloat16)
-    for shard, tensors in zip(shard_names, shard_tensors, strict=True):
-        save_file(tensors, root / shard)
-
-    weight_map = {
-        name: shard_names[0] if position < split else shard_names[1] for position, name in enumerate(names)
-    }
-    weight_map["model.visual.blocks.0.norm1.weight"] = shard_names[0]
-    (root / weights.ECO_INDEX).write_text(
-        json.dumps({"metadata": {"total_size": 0}, "weight_map": weight_map})
-    )
-    return source, weight_map
+    `gdn_block` writes one the same way to feed a kernel checkpoint-native weights, so
+    the layout a load is checked against is the layout a device case is checked against.
+    """
+    return weights.write_fixture_checkpoint(root, contract)
 
 
 def check_contract() -> None:

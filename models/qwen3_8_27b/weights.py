@@ -806,6 +806,72 @@ def _validate_local_shard(shard: str, specs: list[WeightSpec], path: Path) -> No
     _verify_assigned_tensors(shard, specs, _local_header(path))
 
 
+def _fixture_tensor(spec: WeightSpec, generator: torch.Generator) -> torch.Tensor:
+    if spec.dtype == INT8:
+        return torch.randint(-127, 128, spec.shape, dtype=torch.int8, generator=generator)
+    if spec.dtype == FP32:
+        if spec.is_zero_offset:
+            return torch.zeros(spec.shape, dtype=torch.float32)
+        return torch.rand(spec.shape, dtype=torch.float32, generator=generator) + 1e-4
+    return torch.randn(spec.shape, dtype=torch.bfloat16, generator=generator)
+
+
+def write_fixture_checkpoint(
+    checkpoint_dir: str | Path,
+    contract: Qwen38TextContract,
+    *,
+    seed: int = 42,
+    tensors: dict[str, torch.Tensor] | None = None,
+) -> tuple[dict[str, torch.Tensor], dict[str, str]]:
+    """Write *contract*'s tensors as a checkpoint directory in the published layout.
+
+    Values are drawn at random unless *tensors* names a replacement, which is how an
+    operator entry feeds weights of its own to a kernel through this module's loader
+    rather than quantising them on the host.
+
+    Two properties are deliberate, both of which the real checkpoint has: the tensors
+    are split across two shards, so a layer is assembled from more than one file; and
+    a non-text tensor sits in the first shard, which a text-only load must ignore.
+    """
+    from safetensors.torch import save_file
+
+    checkpoint_dir = Path(checkpoint_dir)
+    supplied = tensors or {}
+    generator = torch.Generator().manual_seed(seed)
+    source: dict[str, torch.Tensor] = {}
+    for spec in contract.weight_specs:
+        value = supplied.get(spec.name)
+        if value is None:
+            source[spec.name] = _fixture_tensor(spec, generator)
+            continue
+        _validate_tensor(value, spec)
+        source[spec.name] = value
+
+    names = list(source)
+    split = len(names) // 2
+    shard_names = (
+        "quant_model_weights-00001-of-00002.safetensors",
+        "quant_model_weights-00002-of-00002.safetensors",
+    )
+    shard_tensors = (
+        {name: source[name] for name in names[:split]},
+        {name: source[name] for name in names[split:]},
+    )
+    shard_tensors[0]["model.visual.blocks.0.norm1.weight"] = torch.ones(4, dtype=torch.bfloat16)
+    for shard, shard_source in zip(shard_names, shard_tensors, strict=True):
+        save_file(shard_source, checkpoint_dir / shard)
+
+    weight_map = {
+        name: shard_names[0] if position < split else shard_names[1]
+        for position, name in enumerate(names)
+    }
+    weight_map["model.visual.blocks.0.norm1.weight"] = shard_names[0]
+    (checkpoint_dir / ECO_INDEX).write_text(
+        json.dumps({"metadata": {"total_size": 0}, "weight_map": weight_map})
+    )
+    return source, weight_map
+
+
 def fetch_checkpoint(
     checkpoint_dir: str | Path,
     *,

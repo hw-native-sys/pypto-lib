@@ -40,6 +40,11 @@ KCONV = QWEN3_8_27B.linear_conv_kernel_dim  # convolution taps
 # validation
 DEFAULT_TEST_SEQ_LEN = 512
 DEFAULT_CASES = (2048, 4096)
+# The one-layer checkpoint fixture `loader_block_weights` writes: everything the block
+# reads keeps the model's dimensions, and the two the text contract carries but the
+# block never reads shrink to their smallest legal widths.
+FIXTURE_VOCAB = 32
+FIXTURE_INTERMEDIATE = 128
 
 # At T = 8192 the block holds about 1.3 GB of intermediates at once: 0.6 GB
 # inside the delta rule, and the projections, the convolution's three outputs
@@ -259,22 +264,102 @@ def _cache_pools(resume: bool):
     return conv, state
 
 
+def loader_block_weights() -> dict:
+    """The block's weights as the published checkpoint loader hands them over.
+
+    Writes the layer `load_weights` would have drawn as a checkpoint -- the two
+    projections carrying ModelSlim's own INT8 recipe, everything else
+    checkpoint-native -- then reads it back through `prepare_qwen38_weights`. What
+    the kernel then receives has been through the index, the shard headers, dtype
+    and shape validation, the symmetric zero-offset drop and the `[out, 1] -> [out]`
+    scale flattening, none of which a host-side check exercises against a kernel.
+
+    The fixture is one layer wide. `prepare_qwen38_weights` loads a whole text
+    contract, so the stack is cut to a single Gated DeltaNet layer and the vocabulary
+    and MLP to their smallest legal widths; every dimension the block reads stays the
+    model's own.
+    """
+    import dataclasses
+    import tempfile
+
+    import torch
+
+    import reference
+    from contract import make_text_contract
+    from weights import (default_checkpoint_path, modelslim_quantize_rows,
+                         prepare_qwen38_weights, write_fixture_checkpoint)
+
+    config = dataclasses.replace(QWEN3_8_27B, name="Qwen3.8-27B-one-gdn-layer",
+                                 num_hidden_layers=1, vocab_size=FIXTURE_VOCAB,
+                                 intermediate_size=FIXTURE_INTERMEDIATE)
+    contract = make_text_contract(config)
+    prefix = "model.language_model.layers.0.linear_attn."
+    supplied = {}
+    for name, value in reference.make_block_weights(QWEN3_8_27B).items():
+        if name not in GDN_QUANT.weights:
+            supplied[prefix + name] = value
+            continue
+        module = prefix + name.removesuffix(".weight")
+        quantized, scale, offset = modelslim_quantize_rows(value)
+        supplied[module + ".weight"] = quantized
+        supplied[module + ".weight_scale"] = scale
+        supplied[module + ".weight_offset"] = offset
+
+    parent = default_checkpoint_path().parent
+    parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="gdn_block_checkpoint_", dir=parent) as directory:
+        write_fixture_checkpoint(directory, contract, tensors=supplied)
+        # The exporter clones: safetensors hands back views of a file this scope deletes.
+        prepared = prepare_qwen38_weights(directory, lambda tensor: tensor.clone(), contract=contract)
+    layer = {name.removeprefix(prefix): tensor for name, tensor in prepared.tensors.items()
+             if name.startswith(prefix)}
+
+    # The form the kernel takes, checked on what the loader returned rather than on the
+    # specs: `reference.quantize_weights` flattens a scale on its way to the spec, so a
+    # loader that stopped flattening its own would reach the kernel unnoticed.
+    for name in GDN_QUANT.weights:
+        module = name.removesuffix(".weight")
+        scale = layer[f"{module}.weight_scale"]
+        if scale.dtype != torch.float32 or tuple(scale.shape) != (layer[name].shape[0],):
+            raise RuntimeError(f"{module}.weight_scale arrived as {tuple(scale.shape)} "
+                               f"{scale.dtype}; the kernel takes one FP32 scale per output row")
+        if f"{module}.weight_offset" in layer:
+            raise RuntimeError(f"{module}.weight_offset reached the kernel; the symmetric "
+                               "offset is validated and dropped by the loader")
+    return layer
+
+
 def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, hg: int = HG, d: int = D,
                        chunk: int = CHUNK_TILE, weights: str | None = None,
-                       resume: bool = False):
+                       resume: bool = False, checkpoint: bool = False):
     """Every weight the block reads, plus the delta rule's three constants."""
     import torch
     from golden import ScalarSpec, TensorSpec
 
     import reference
-    from weights import load_weights, quantized_weight, stacked_ab_weight
+    from weights import load_weights, stacked_ab_weight
 
     @cache
     def block_weights():
-        return load_weights(QWEN3_8_27B, weights)
+        return loader_block_weights() if checkpoint else load_weights(QWEN3_8_27B, weights)
 
-    w_qkv, w_qkv_scale = quantized_weight(QWEN3_8_27B, "in_proj_qkv", weights)
-    w_z, w_z_scale = quantized_weight(QWEN3_8_27B, "in_proj_z", weights)
+    def projection(module: str):
+        """One INT8 projection and its flat scales, whichever source drew the layer.
+
+        `reference.quantize_weights` quantizes a floating-point weight and passes an
+        already-quantized one through, so both weight sources meet here.
+        """
+        name = f"{module}.weight"
+
+        @cache
+        def load():
+            layer = reference.quantize_weights(block_weights(), names=(name,))
+            return layer[name], layer[f"{module}.weight_scale"]
+
+        return (lambda: load()[0]), (lambda: load()[1])
+
+    w_qkv, w_qkv_scale = projection("in_proj_qkv")
+    w_z, w_z_scale = projection("in_proj_z")
 
     def stacked_ab():
         return stacked_ab_weight(block_weights())
@@ -351,10 +436,18 @@ def block_weights(tensors):
 
 
 def _truth_weights(quantized, weights_path):
+    """The floating-point layer behind the run's integers, and proof that it is that layer.
+
+    Two recipes reach the kernel: `reference.quantize_rows` when the entry quantizes a
+    floating-point layer itself, and ModelSlim's when the integers came out of a
+    checkpoint. The truth weight is the same either way, so either match identifies the
+    layer -- and the match is what rules out comparing against a weight the device was
+    never given.
+    """
     import torch
 
     import reference
-    from weights import load_weights
+    from weights import load_weights, modelslim_quantize_rows
 
     originals = load_weights(QWEN3_8_27B, weights_path)
     truth = quantized.copy()
@@ -362,9 +455,15 @@ def _truth_weights(quantized, weights_path):
         weight = originals.get(name)
         if weight is None or not weight.is_floating_point():
             raise ValueError(f"quantization baseline requires the original floating-point weight {name}")
-        q, scale = reference.quantize_rows(weight)
         scale_name = name.removesuffix(".weight") + ".weight_scale"
-        if not torch.equal(q, quantized[name]) or not torch.equal(scale, quantized[scale_name]):
+        kernel_q, kernel_scale = reference.quantize_rows(weight)
+        slim_q, slim_scale, _ = modelslim_quantize_rows(weight)
+        matched = (
+            (torch.equal(kernel_q, quantized[name]) and torch.equal(kernel_scale, quantized[scale_name]))
+            or (torch.equal(slim_q, quantized[name])
+                and torch.equal(slim_scale.reshape(-1), quantized[scale_name]))
+        )
+        if not matched:
             raise ValueError(f"{name} differs from the run's weights and scales; use the original --weights")
         truth[name] = weight
     return truth
@@ -648,6 +747,9 @@ if __name__ == "__main__":
     parser.add_argument("--seq-len", type=int, default=None, help="override the standalone or packed token count")
     parser.add_argument("--weights", type=str, default=None,
                         help="a real layer from weights.py; default: random weights")
+    parser.add_argument("--checkpoint-weights", action="store_true", default=False,
+                        help="only the case whose INT8 projections come back through the "
+                             "checkpoint loader, which a default run also includes")
     parser.add_argument("--resume", action="store_true", default=False)
     parser.add_argument("--packed", action="store_true", default=False)
     parser.add_argument("--row-starts", type=str, default="0,256")
@@ -668,17 +770,25 @@ if __name__ == "__main__":
         parser.error("packed block validation does not support save or replay options")
     if len(cases) > 1 and (args.golden_data or args.runtime_dir):
         parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
-    plan = [(t, args.packed, args.resume) for t in cases]
+    if args.checkpoint_weights and (args.packed or args.weights):
+        parser.error("--checkpoint-weights draws its own layer and runs the standalone block; "
+                     "it takes neither --packed nor --weights")
+    plan = [(t, args.packed, args.resume, args.checkpoint_weights) for t in cases]
     if args.seq_len is None and not (args.packed or args.resume or args.rounds
-                                     or args.save_data or args.golden_data or args.runtime_dir):
-        plan.append((DEFAULT_CASES[0], True, True))
+                                     or args.checkpoint_weights or args.save_data
+                                     or args.golden_data or args.runtime_dir):
+        plan.append((DEFAULT_CASES[0], True, True, False))
+        if args.weights is None:
+            # The same block over weights the checkpoint loader produced rather than
+            # ones this entry quantized. A named real layer runs its own case instead.
+            plan.append((DEFAULT_TEST_SEQ_LEN, False, False, True))
 
     if args.rounds:
         os.environ["PYPTO_BENCH"] = "1"
         os.environ["PYPTO_BENCH_ROUNDS"] = str(args.rounds)
         os.environ["PYPTO_BENCH_WARMUP"] = "5"
 
-    for t, packed, resume in plan:
+    for t, packed, resume, checkpoint in plan:
         if packed:
             starts = tuple(int(value) for value in args.row_starts.split(","))
             state_rows = tuple(2 * owner + 1 for owner in range(len(starts)))
@@ -702,10 +812,11 @@ if __name__ == "__main__":
                     print(result.error)
                 raise SystemExit(f"FAILED at packed GDN block T={t}")
             continue
-        print(f"[case] gdn_block T={t}", flush=True)
+        source = " checkpoint-weights" if checkpoint else ""
+        print(f"[case] gdn_block T={t}{source} resume={resume}", flush=True)
         result = run(
             fn=build_kernel(t=t),
-            specs=build_tensor_specs(t=t, weights=args.weights, resume=args.resume),
+            specs=build_tensor_specs(t=t, weights=args.weights, resume=resume, checkpoint=checkpoint),
             golden_fn=golden_gdn_block,
             golden_data=args.golden_data,
             runtime_dir=args.runtime_dir,
@@ -713,7 +824,7 @@ if __name__ == "__main__":
             config=run_config(args.backend_type, args.execution_mode, args.device, args.enable_chip_swimlane, t=t),
             rtol=1e-2,
             atol=1e-5,
-            compare_fn=block_comparators(args.weights, args.resume, args.golden_data),
+            compare_fn=block_comparators(args.weights, resume, args.golden_data),
             compile_only=args.compile_only,
         )
         if not result.passed:
@@ -721,4 +832,4 @@ if __name__ == "__main__":
                 print(result.error)
             # Stop at the first failure: one device failure poisons the chip run
             # lane, so every later case reports a failure it did not cause.
-            raise SystemExit(f"FAILED at T={t}")
+            raise SystemExit(f"FAILED at T={t}{source}")
