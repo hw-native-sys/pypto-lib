@@ -681,6 +681,9 @@ if __name__ == "__main__":
     from golden import run
     import torch
 
+    if args.case == "all":
+        # Shapes are bound at import. Finish the specialized child before this process opens the device.
+        subprocess.run([sys.executable, __file__, *sys.argv[1:], "--case", "grouped-medium"], check=True)
 
     boundary_counts = [0, 1, 15, 16, 17, 63, 64, 65, 127, 128, 129, 191, 192, 193, 255, 256]
     if RECV_TILE == 64:
@@ -717,7 +720,3 @@ if __name__ == "__main__":
             if result.error:
                 print(result.error)
             raise SystemExit(1)
-
-    if args.case == "all":
-        # Kernel shapes are bound at import, so specialize the bounded case in a fresh interpreter.
-        subprocess.run([sys.executable, __file__, *sys.argv[1:], "--case", "grouped-medium"], check=True)
