@@ -181,6 +181,19 @@ If neither `golden_fn` nor `golden_data` is provided, the runtime can still
 execute, but validation is explicitly reported as skipped. Such a run is not
 a correctness check.
 
+## Prepare-time options
+
+Entries whose kernels read named Host windows, or that keep weights resident on
+the device, execute through `DistributedCompiledProgram.prepare()`. `run`
+accepts these prepared-worker options for that path:
+
+| Argument | Effect |
+| --- | --- |
+| `window_sources` | Map each named Host window to per-domain-rank binary files or contiguous CPU tensors, bound when each Host domain is created. The caller owns the sources' lifetime. Host-window entries use the prepared path even without resident specs. |
+| `persistent` | Retain CommDomains across dispatches (`prepare(persistent=True)`). |
+| `reset_persistent_windows` | Restore retained communication windows to zero before reuse. Pass `False` only when the kernels clear all reused window state themselves. |
+| `return_tensors` | Expose the shared host input/output buffers through `RunResult.tensors` for caller post-checks (for example finite-output smoke checks) when no golden reference exists. |
+
 ## Handle RunResult
 
 `run` returns:
