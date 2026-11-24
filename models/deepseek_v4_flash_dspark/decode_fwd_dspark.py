@@ -832,6 +832,10 @@ def l3_decode_fwd_dspark(
 ):
     """Launch one complete DSpark decode L2 on every rank."""
     'Prepare, run target decode, and accept K=7 output in one L3 graph.'
+    eplb_mapping_ph = pl.create_tensor([EPLB_BANK_ROWS, N_RANKS], dtype=pl.INT32)
+    eplb_replicas_ph = pl.create_tensor([EPLB_BANK_ROWS], dtype=pl.INT32)
+    eplb_load_ph = pl.create_tensor([EPLB_LAYERS, META_SLOTS], dtype=pl.INT32)
+    eplb_control_ph = pl.create_tensor([2], dtype=pl.INT32)
     embed_weight.bind_dynamic(1, EMBED_VOCAB_DYN)
     hidden_workspace.bind_dynamic(1, T_DYN)
     dspark_target_hidden.bind_dynamic(1, T_DYN)
@@ -992,7 +996,7 @@ def l3_decode_fwd_dspark(
             gather_window, gather_signal, attention_window, attention_signal, o_window, o_signal,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf,
             combine_arrived, lm_head_hidden_window, lm_head_hidden_done, lm_head_logits_window,
-            lm_head_logits_done, gate_w[rank], gate_bias[rank], gate_w[rank], gate_bias[rank],
+            lm_head_logits_done, eplb_mapping_ph, eplb_replicas_ph, eplb_load_ph, eplb_control_ph,
                                  group_base, tp_rank, rank, draft_main_proj_weight[rank],
             draft_main_norm_weight[rank], draft_embedding_weight[rank],
             draft_block_tables[rank],
@@ -1446,7 +1450,7 @@ def _fixture_device_state():
     return slot_ids, generations, group_slot_ids, group_generations, tokens, meta
 
 
-def build_tensor_specs():
+def build_tensor_specs(eplb=False):
     """Assemble the fused L2's fixture from the component builders it inlines."""
     import inspect
 
@@ -1485,7 +1489,8 @@ def build_tensor_specs():
         "int8": torch.int8, "int16": torch.int16, "int32": torch.int32, "int64": torch.int64,
     }
     ordered = []
-    for param in inspect.signature(l3_decode_fwd_dspark._func).parameters.values():
+    entry = l3_decode_fwd_dspark_eplb if eplb else l3_decode_fwd_dspark
+    for param in inspect.signature(entry._func).parameters.values():
         spec = specs.get(param.name)
         if spec is None:
             shape = resolve(param.annotation.shape)
@@ -1526,6 +1531,14 @@ def main():
         "-d", "--device", type=str, default=None,
         help=f"comma-separated device ids; EP={EP_SIZE} needs {EP_SIZE}",
     )
+    parser.add_argument(
+        "--enable-eplb", action="store_true", default=False,
+        help="compile the EPLB host ABI entry (compile-only until a placement fixture exists)",
+    )
+    parser.add_argument(
+        "--num-redundant-experts", type=int, default=decode.NUM_REDUNDANT_EXPERTS,
+        help="physical experts beyond the logical width (parsed at import by moe)",
+    )
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
@@ -1551,9 +1564,11 @@ def main():
     if len(set(device_ids)) != len(device_ids) or any(device < 0 for device in device_ids):
         parser.error(f"device IDs must be distinct and non-negative: {device_ids}")
 
+    if args.enable_eplb and not args.compile_only:
+        parser.error("--enable-eplb currently supports --compile-only validation")
     result = run(
-        fn=l3_decode_fwd_dspark,
-        specs=build_tensor_specs(),
+        fn=l3_decode_fwd_dspark_eplb if args.enable_eplb else l3_decode_fwd_dspark,
+        specs=build_tensor_specs(eplb=args.enable_eplb),
         save_data=args.save_data,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,

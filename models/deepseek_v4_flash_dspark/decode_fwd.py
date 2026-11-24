@@ -139,6 +139,7 @@ EPLB_LAYERS = moe_module.EPLB_LAYERS
 EPLB_ABI_VERSION = moe_module.EPLB_ABI_VERSION
 EPLB_ENABLED = moe_module.EPLB_ENABLED
 EPLB_BANK_ROWS = moe_module.EPLB_BANK_ROWS
+NUM_REDUNDANT_EXPERTS = moe_module.NUM_REDUNDANT_EXPERTS
 MOE_INTER = moe_module.MOE_INTER
 VOCAB = moe_module.VOCAB
 TOPK = moe_module.TOPK
@@ -1287,6 +1288,10 @@ def l3_decode_fwd(
     sampled_ids: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
 ):
     """Allocate each communication window once and submit one decode forward child."""
+    eplb_mapping_ph = pl.create_tensor([EPLB_BANK_ROWS, N_RANKS], dtype=pl.INT32)
+    eplb_replicas_ph = pl.create_tensor([EPLB_BANK_ROWS], dtype=pl.INT32)
+    eplb_load_ph = pl.create_tensor([EPLB_LAYERS, META_SLOTS], dtype=pl.INT32)
+    eplb_control_ph = pl.create_tensor([2], dtype=pl.INT32)
     embed_weight.bind_dynamic(1, EMBED_VOCAB_DYN)
     input_ids.bind_dynamic(1, T_DYN)
     hidden_workspace.bind_dynamic(1, T_DYN)
@@ -1437,7 +1442,7 @@ def l3_decode_fwd(
             arrived, data_arrived, routed_y_buf, combine_arrived,
             lm_head_hidden_window, lm_head_hidden_done,
             lm_head_logits_window, lm_head_logits_done,
-            gate_w[rank], gate_bias[rank], gate_w[rank], gate_bias[rank],
+            eplb_mapping_ph, eplb_replicas_ph, eplb_load_ph, eplb_control_ph,
             group_base, tp_rank, rank,
             device=rank,
         )
@@ -1897,6 +1902,7 @@ def build_tensor_specs(
     num_tokens_per_owner=None,
     weight_bank_size=RUNTIME_WEIGHT_BANK,
     runtime_case="full_active",
+    eplb=False,
 ):
     """Build the production or bounded-runtime decode forward L3 fixture."""
     import inspect
@@ -2246,7 +2252,16 @@ def build_tensor_specs(
     for name in ("csa_kv_seq_lens", "hca_kv_seq_lens"):
         transform_spec(name, mask_local_request_rows)
 
-    parameter_names = list(inspect.signature(l3_decode_fwd._func).parameters)
+    if eplb:
+        for name, shape in (
+            ("eplb_mapping", [N_RANKS, EPLB_BANK_ROWS, N_RANKS]),
+            ("eplb_replicas", [N_RANKS, EPLB_BANK_ROWS]),
+            ("eplb_load", [N_RANKS, EPLB_LAYERS, META_SLOTS]),
+            ("eplb_control", [N_RANKS, 2]),
+        ):
+            specs_by_name[name] = TensorSpec(name, shape, torch.int32)
+    entry = l3_decode_fwd_eplb if eplb else l3_decode_fwd
+    parameter_names = list(inspect.signature(entry._func).parameters)
     missing = [name for name in parameter_names if name not in specs_by_name]
     extra = [name for name in specs_by_name if name not in parameter_names]
     if missing or extra:
@@ -2292,6 +2307,14 @@ def main():
     parser.add_argument(
         "--experts-per-rank", type=int, default=moe_module.EXPERTS_PER_RANK,
         help="routed experts per rank (parsed at import by moe)",
+    )
+    parser.add_argument(
+        "--enable-eplb", action="store_true", default=False,
+        help="compile the EPLB host ABI entry (compile-only until a placement fixture exists)",
+    )
+    parser.add_argument(
+        "--num-redundant-experts", type=int, default=NUM_REDUNDANT_EXPERTS,
+        help="physical experts beyond the logical width (parsed at import by moe)",
     )
     parser.add_argument(
         "-d", "--device", type=str, default=None,
@@ -2351,12 +2374,15 @@ def main():
         parser.error(f"device IDs must be distinct and non-negative: {device_ids}")
 
     runtime_case = None if weight_bank_size == MAIN_LAYER_COUNT else args.runtime_case
+    if args.enable_eplb and not args.compile_only:
+        parser.error("--enable-eplb currently supports --compile-only validation")
     specs = build_tensor_specs(
         start_pos=start_pos, num_tokens_per_owner=num_tokens_per_owner,
         weight_bank_size=weight_bank_size, runtime_case=runtime_case,
+        eplb=args.enable_eplb,
     )
     result = run(
-        fn=l3_decode_fwd,
+        fn=l3_decode_fwd_eplb if args.enable_eplb else l3_decode_fwd,
         specs=specs,
         save_data=args.save_data,
         compile_only=args.compile_only,

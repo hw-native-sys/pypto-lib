@@ -545,6 +545,11 @@ def decode_layer_swa(
             else:
                 x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
 
+        eplb_mapping_ph = pl.create_tensor([moe_module.EPLB_BANK_ROWS, moe_module.N_RANKS], dtype=pl.INT32)
+        eplb_replicas_ph = pl.create_tensor([moe_module.EPLB_BANK_ROWS], dtype=pl.INT32)
+        eplb_source_rows_ph = pl.create_tensor([moe_module.T], dtype=pl.INT32)
+        eplb_load_ph = pl.create_tensor([moe_module.EPLB_LAYERS, moe_module.META_SLOTS], dtype=pl.INT32)
+        eplb_control_ph = pl.create_tensor([2], dtype=pl.INT32)
         moe(
             x_attn_moe,
             hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
@@ -556,7 +561,7 @@ def decode_layer_swa(
             x_moe_next,
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
-            gate_w, input_ids, input_ids, gate_w, input_ids,
+            eplb_mapping_ph, eplb_replicas_ph, eplb_source_rows_ph, eplb_load_ph, eplb_control_ph,
             layer_id, owner_tokens, my_rank, moe_epoch,
             pl.const(-1, pl.INT32),
         )
@@ -942,6 +947,11 @@ def decode_layer_hca(
             else:
                 x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
 
+        eplb_mapping_ph = pl.create_tensor([moe_module.EPLB_BANK_ROWS, moe_module.N_RANKS], dtype=pl.INT32)
+        eplb_replicas_ph = pl.create_tensor([moe_module.EPLB_BANK_ROWS], dtype=pl.INT32)
+        eplb_source_rows_ph = pl.create_tensor([moe_module.T], dtype=pl.INT32)
+        eplb_load_ph = pl.create_tensor([moe_module.EPLB_LAYERS, moe_module.META_SLOTS], dtype=pl.INT32)
+        eplb_control_ph = pl.create_tensor([2], dtype=pl.INT32)
         moe(
             x_attn_moe,
             hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
@@ -953,7 +963,7 @@ def decode_layer_hca(
             x_moe_next,
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
-            gate_w, input_ids, input_ids, gate_w, input_ids,
+            eplb_mapping_ph, eplb_replicas_ph, eplb_source_rows_ph, eplb_load_ph, eplb_control_ph,
             layer_id, owner_tokens, my_rank, moe_epoch,
             pl.const(-1, pl.INT32),
         )
@@ -1425,6 +1435,11 @@ def decode_layer_csa(
             else:
                 x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
 
+        eplb_mapping_ph = pl.create_tensor([moe_module.EPLB_BANK_ROWS, moe_module.N_RANKS], dtype=pl.INT32)
+        eplb_replicas_ph = pl.create_tensor([moe_module.EPLB_BANK_ROWS], dtype=pl.INT32)
+        eplb_source_rows_ph = pl.create_tensor([moe_module.T], dtype=pl.INT32)
+        eplb_load_ph = pl.create_tensor([moe_module.EPLB_LAYERS, moe_module.META_SLOTS], dtype=pl.INT32)
+        eplb_control_ph = pl.create_tensor([2], dtype=pl.INT32)
         moe(
             x_attn_moe,
             hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
@@ -1436,7 +1451,7 @@ def decode_layer_csa(
             x_moe_next,
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
-            gate_w, input_ids, input_ids, gate_w, input_ids,
+            eplb_mapping_ph, eplb_replicas_ph, eplb_source_rows_ph, eplb_load_ph, eplb_control_ph,
             layer_id, owner_tokens, my_rank, moe_epoch,
             pl.const(-1, pl.INT32),
         )

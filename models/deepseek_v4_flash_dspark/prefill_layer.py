@@ -21,6 +21,8 @@ from pypto.ir import DistributedConfig
 
 from moe import (
     D,
+    EPLB_BANK_ROWS,
+    EPLB_LAYERS,
     EXPERTS_PER_RANK,
     HC_DIM,
     HC_MULT,
@@ -417,6 +419,10 @@ def prefill_layer_moe(
         pl.write(stage_token, [0], epoch_base)
         pl.write(layer_completion, [0], layer_i32)
 
+    eplb_mapping_ph = pl.create_tensor([EPLB_BANK_ROWS, N_RANKS], dtype=pl.INT32)
+    eplb_replicas_ph = pl.create_tensor([EPLB_BANK_ROWS], dtype=pl.INT32)
+    eplb_load_ph = pl.create_tensor([EPLB_LAYERS, META_SLOTS], dtype=pl.INT32)
+    eplb_control_ph = pl.create_tensor([2], dtype=pl.INT32)
     prefill_moe(
         attn_stage,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
@@ -430,7 +436,7 @@ def prefill_layer_moe(
         arrived, data_arrived, routed_y_buf, combine_arrived,
         stage_done, stage_token, layer_completion,
         gather_window, gather_signal,
-        gate_w, input_ids, gate_w, input_ids,
+        eplb_mapping_ph, eplb_replicas_ph, eplb_load_ph, eplb_control_ph,
         group_base, tp_rank, layer_i32, my_rank, pl.cast(pl.tensor.dim(attn_stage, 0), pl.INT32),
     )
     clear_prefill_moe_signals(stage_token, arrived, data_arrived, combine_arrived, stage_done)

@@ -21,6 +21,7 @@ from pypto.ir import DistributedConfig
 from moe import (
     EPLB_ABI_VERSION as EPLB_ABI_VERSION,
     EPLB_ENABLED as EPLB_ENABLED,
+    NUM_REDUNDANT_EXPERTS,
     D,
     EXPERTS_PER_RANK,
     HC_DIM,
@@ -1350,6 +1351,10 @@ def l3_prefill_fwd(
     mappings for padding, and restrict live ``logit_row_indices`` to ``[0, N)``.
     The device schedule, including MoE collectives, runs over physical P/L.
     """
+    eplb_mapping_ph = pl.create_tensor([EPLB_BANK_ROWS, N_RANKS], dtype=pl.INT32)
+    eplb_replicas_ph = pl.create_tensor([EPLB_BANK_ROWS], dtype=pl.INT32)
+    eplb_load_ph = pl.create_tensor([EPLB_LAYERS, META_SLOTS], dtype=pl.INT32)
+    eplb_control_ph = pl.create_tensor([2], dtype=pl.INT32)
     x_hc.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     query_start_loc.bind_dynamic(1, QUERY_START_LOC_DYN)
     state_checkpoint_ends.bind_dynamic(1, REQUESTS_DYN)
@@ -1483,7 +1488,7 @@ def l3_prefill_fwd(
             o_proj_weight_ready, o_proj_weight_consumed,
             lm_head_hidden_window, lm_head_hidden_done,
             lm_head_logits_window, lm_head_logits_done,
-            gate_w[r], gate_bias[r], gate_w[r], gate_bias[r],
+            eplb_mapping_ph, eplb_replicas_ph, eplb_load_ph, eplb_control_ph,
             r,
             device=r,
         )
@@ -2064,6 +2069,7 @@ def build_tensor_specs(
     inner_state_block_num=INNER_STATE_BLOCK_NUM,
     fixture_case="b1",
     inactive_dp_groups=(),
+    eplb=False,
 ):
     """Build CP-padded full-forward fixtures from a logical prompt length."""
     import torch
@@ -2388,6 +2394,14 @@ def build_tensor_specs(
             return value
 
         spec.init_value = init_inactive_groups
+    if eplb:
+        for name, shape in (
+            ("eplb_mapping", [N_RANKS, EPLB_BANK_ROWS, N_RANKS]),
+            ("eplb_replicas", [N_RANKS, EPLB_BANK_ROWS]),
+            ("eplb_load", [N_RANKS, EPLB_LAYERS, META_SLOTS]),
+            ("eplb_control", [N_RANKS, 2]),
+        ):
+            specs.append(TensorSpec(name, shape, torch.int32))
     return specs
 
 
@@ -2665,6 +2679,14 @@ def main():
     )
     parser.add_argument("--start-pos", type=int, default=0)
     parser.add_argument(
+        "--enable-eplb", action="store_true", default=False,
+        help="compile the EPLB host ABI entry (compile-only until a placement fixture exists)",
+    )
+    parser.add_argument(
+        "--num-redundant-experts", type=int, default=NUM_REDUNDANT_EXPERTS,
+        help="physical experts beyond the logical width (parsed at import by moe)",
+    )
+    parser.add_argument(
         "--num-tokens", type=int, default=None,
         help=f"B1 prompt tokens per TP/CP group; defaults to {DEFAULT_GROUP_TOKENS}. ragged2 is fixed at 7.",
     )
@@ -2737,10 +2759,13 @@ def main():
         inner_state_block_num=args.inner_state_block_num,
         fixture_case="ragged2" if args.case == "ragged2" else "b1",
         inactive_dp_groups=args.inactive_dp_groups,
+        eplb=args.enable_eplb,
     )
 
+    if args.enable_eplb and not args.compile_only:
+        parser.error("--enable-eplb currently supports --compile-only validation")
     result = run(
-        fn=l3_prefill_fwd,
+        fn=l3_prefill_fwd_eplb if args.enable_eplb else l3_prefill_fwd,
         specs=specs,
         golden_fn=golden_prefill_fwd,
         compile_only=args.compile_only,
