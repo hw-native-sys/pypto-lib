@@ -1271,6 +1271,18 @@ if __name__ == "__main__":
             num_sub_workers=0,
         ),
     )
+    if not (args.compile_only or args.runtime_dir or args.packed_routed_weights):
+        from functools import cache, partial
+
+        @cache
+        def zero_routed_bank(shape, dtype):
+            return torch.zeros(shape, dtype=dtype)
+
+        # These three synthetic read-only FP4 banks have identical zero contents.
+        for spec in specs:
+            if spec.name in ("routed_w1", "routed_w2", "routed_w3") and spec.init_value is None:
+                spec.init_value = partial(zero_routed_bank, tuple(spec.shape), spec.dtype)
+
     result = run(
         a5_default_runtime="host_build_graph",
         fn=l3_decode_fwd,
