@@ -559,6 +559,7 @@ def prefill_fwd(
                     layer_completion,
                     group_base, tp_rank, layer_l0 + pl.const(1, pl.INT32),
                     swa_inverse, swa_swap_idx, swa_rope_ready,
+                    False,
                 )
 
         with pl.scope():
@@ -651,6 +652,7 @@ def prefill_fwd(
                     layer_completion,
                     group_base, tp_rank, layer_l1 + pl.const(1, pl.INT32),
                     swa_inverse, swa_swap_idx, swa_rope_ready,
+                    False,
                 )
 
         with pl.scope():
@@ -814,6 +816,7 @@ def prefill_fwd(
                         layer_completion,
                         group_base, tp_rank, csa_layer + pl.const(1, pl.INT32), csa_compact,
                         compressed_inverse, compressed_swap_idx, compressed_rope_ready,
+                        False,
                     )
 
             with pl.scope():
@@ -944,6 +947,7 @@ def prefill_fwd(
                         layer_completion,
                         group_base, tp_rank, hca_layer + pl.const(1, pl.INT32),
                         compressed_inverse, compressed_swap_idx, compressed_rope_ready,
+                        False,
                     )
 
             with pl.scope():
@@ -1112,6 +1116,7 @@ def prefill_fwd(
                     layer_completion,
                     group_base, tp_rank, layer_last + pl.const(1, pl.INT32), csa_compact,
                     compressed_inverse, compressed_swap_idx, compressed_rope_ready,
+                    True,
                 )
 
         with pl.scope():
@@ -2131,6 +2136,30 @@ def finite_tensor_compare(actual, expected, *, preserve_inactive=False, zero_ina
     return True, ""
 
 
+def o_proj_wo_a_full_compare(actual, expected, **kwargs):
+    """Check the final layer's ND export and preserve inactive ranks' scratch."""
+    from golden import ratio_allclose
+
+    valid, detail = finite_tensor_compare(actual, expected, preserve_inactive=True, **kwargs)
+    if not valid or TP_SIZE == 1:
+        return valid, detail
+
+    starts = kwargs["inputs"]["query_start_loc"]
+    shards = kwargs["inputs"]["wo_a"]
+    last_group = (FWD_NUM_LAYERS - 1) * O_PROJ_LOCAL_GROUPS
+    compare = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0)
+    for group_base in range(0, actual.shape[0], TP_SIZE):
+        group_ranks = slice(group_base, group_base + TP_SIZE)
+        if int(starts[group_base, -1]) == 0:
+            continue
+        last_layer = shards[group_ranks, last_group:last_group + O_PROJ_LOCAL_GROUPS].reshape_as(actual[group_base])
+        group_expected = last_layer.to(device=actual.device).unsqueeze(0).expand_as(actual[group_ranks])
+        valid, detail = compare(actual[group_ranks], group_expected, **kwargs)
+        if not valid:
+            return False, f"    TP group starting at rank {group_base}: {detail}"
+    return True, ""
+
+
 def x_hc_compare(actual, expected, **kwargs):
     """Validate full-group HC against each owner's residual, coefficients, and FFN result."""
     import torch
@@ -2314,7 +2343,7 @@ def compare_functions():
 
     finite_names = {
         "x_hc", "attn_stage",
-        "o_proj_wo_a_full", "o_proj_wo_b_full",
+        "o_proj_wo_b_full",
         "x_mixed", "post_ffn", "comb_ffn", "ffn_out",
         "kv_cache", "hca_cmp_kv", "csa_cmp_kv",
         "hca_compress_state", "csa_compress_state", "csa_inner_compress_state",
@@ -2325,6 +2354,7 @@ def compare_functions():
     for name in CACHE_NAMES | {"attn_stage"}:
         compare[name] = partial(finite_tensor_compare, preserve_inactive=True)
     compare["x_hc"] = x_hc_compare
+    compare["o_proj_wo_a_full"] = o_proj_wo_a_full_compare
     compare["x_out"] = x_out_compare
     compare["logits"] = logits_compare
     compare["sampled_ids"] = sampled_ids_compare

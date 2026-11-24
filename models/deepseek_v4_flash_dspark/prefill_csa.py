@@ -1413,6 +1413,7 @@ def prefill_attention_csa_cp_local(
     inverse_rope: pl.Tensor[[SPARSE_ROPE_ROWS, 2 * ROPE_HEAD_DIM], pl.FP32],
     inverse_swap_idx: pl.Tensor[[SPARSE_ROPE_HEAD_TILE, ROPE_HEAD_DIM], pl.INT32],
     inverse_ready: pl.Scalar[pl.TASK_ID],
+    WRITE_WO_A_ND: pl.constexpr,
 ):
     """Run CSA with local HC state and replicated normalized input."""
     wo_a_nz = pl.create_tensor([O_GROUPS, O_LORA, O_GROUP_IN], dtype=pl.BF16, layout=pl.NZ)
@@ -1453,6 +1454,7 @@ def prefill_attention_csa_cp_local(
             o_proj_wo_a_window, o_proj_wo_b_window,
             o_proj_weight_consumed, o_proj_order_fence,
             group_base, tp_rank, weight_published, weight_waited, norm_ready_tid,
+            WRITE_WO_A_ND,
         )
     x_normed_full = pl.create_tensor([kv_dim, D], dtype=pl.BF16)
     local_base = tp_rank * q_dim
@@ -1606,6 +1608,7 @@ def prefill_attention_csa_cp(
         o_proj_order_fence,
         group_base, tp_rank, weight_epoch, compact,
         inverse_rope, inverse_swap_idx, inverse_ready,
+        True,
     )
     materialize_ready_tid = pl.system.task_dummy(deps=[])
     prefill_cp_materialize_hc_full(
