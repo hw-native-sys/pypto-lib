@@ -53,7 +53,7 @@ from prefill_sparse_attn import (
 
 import pypto.language.distributed as pld
 
-from prefill_hca_cp_cache import hca_owner_eligible, hca_publish_owner_caches
+from prefill_hca_cp_cache import hca_publish_owner_caches, prepare_hca_owner_plan
 from prefill_cp_token_allgather import (
     PREFILL_GROUP_CAP,
     TP_SIZE,
@@ -1028,6 +1028,7 @@ def prefill_attention_hca_cp_local(
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     weight_epoch: pl.Scalar[pl.INT32],
+    use_owner_cache: pl.Scalar[pl.INT32],
     inverse_rope: pl.Tensor[[SPARSE_ROPE_ROWS, 2 * ROPE_DIM], pl.FP32],
     inverse_swap_idx: pl.Tensor[[SPARSE_ROPE_HEAD_TILE, ROPE_DIM], pl.INT32],
     inverse_ready: pl.Scalar[pl.TASK_ID],
@@ -1101,13 +1102,7 @@ def prefill_attention_hca_cp_local(
     prefill_compressor_ratio128_project_local(x_normed_local, cmp_wkv, cmp_wgate, cmp_values_local, cmp_scores_local)
 
     update = pl.array.create(1, pl.TASK_ID)
-    owner_plan = pl.create_tensor([1], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_cp_owner_init"):
-        pl.write(owner_plan, [0], pl.cast(0, pl.INT32))
-    if TP_SIZE > 1 and pl.tensor.dim(query_start_loc, 0) == 2 and q_dim >= PREFILL_STATE_TILE and q_dim % PREFILL_STATE_TILE == 0 and kv_dim == TP_SIZE * q_dim:
-        hca_owner_eligible(query_start_loc, state_checkpoint_ends, position_ids_full,
-                           ori_slot_mapping_full, cmp_slot_mapping_full, state_slot_mapping_full, owner_plan)
-    if pl.read(owner_plan, [0]) > 0:
+    if use_owner_cache > 0:
         owner_done = hca_publish_owner_caches(
             kv_local, cmp_values_local, cmp_scores_local, state_checkpoint_ends, cmp_ape, cmp_norm_w,
             cmp_freqs_cos, cmp_freqs_sin, position_ids_full, ori_slot_mapping_full, cmp_slot_mapping_full,
@@ -1230,6 +1225,12 @@ def prefill_attention_hca_cp(
     request_count = pl.tensor.dim(query_start_loc, 0) - 1
     request_ranges = pl.create_tensor([request_count, HCA_REQUEST_RANGE_WORDS], dtype=pl.INT32)
     request_ranges = prepare_hca_query_ranges(local_request_ids, request_ranges)
+    owner_plan = pl.create_tensor([1], dtype=pl.INT32)
+    prepare_hca_owner_plan(
+        q_dim, query_start_loc, state_checkpoint_ends, position_ids_full,
+        ori_slot_mapping_full, cmp_slot_mapping_full, state_slot_mapping_full, owner_plan,
+    )
+    use_owner_cache = pl.read(owner_plan, [0])
     x_out_local, gather_signal = prefill_attention_hca_cp_local(
         x_hc_local,
         query_start_loc, state_checkpoint_ends, local_request_ids, request_ranges,
@@ -1253,6 +1254,7 @@ def prefill_attention_hca_cp(
         o_proj_weight_ready, o_proj_weight_consumed,
         o_proj_order_fence,
         group_base, tp_rank, weight_epoch,
+        use_owner_cache,
         inverse_rope, inverse_swap_idx, inverse_ready,
     )
     materialize_ready_tid = pl.system.task_dummy(deps=[])

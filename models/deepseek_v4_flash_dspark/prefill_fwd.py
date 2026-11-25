@@ -40,6 +40,7 @@ from moe import (
 )
 from config import FLASH as MODEL_CONFIG
 from prefill_sparse_attn import prepare_sparse_attn_rope
+from prefill_hca_cp_cache import prepare_hca_owner_plan
 from prefill_swa import (
     build_cp_tensor_specs as build_swa_attention_tensor_specs,
     build_ragged2_cp_tensor_specs as build_swa_ragged2_tensor_specs,
@@ -447,13 +448,19 @@ def prefill_fwd(
         pl.write(stage_token, [0], pl.cast(0, pl.INT32))
         pl.write(layer_completion, [0], pl.cast(0, pl.INT32))
 
-    # The forward ABI supplies one immutable set of CSA slot maps for all layers.
+    # Layer-shared cache publication plans.
     csa_plan = pl.create_tensor([1], dtype=pl.INT32)
     with pl.scope():
         prepare_csa_compact_plan(
             local_tokens, query_start_loc, state_checkpoint_ends, position_ids_full, ori_slot_mapping_full,
             csa_cmp_slot_mapping_full, csa_idx_slot_mapping_full, csa_state_slot_mapping_full,
             csa_inner_state_slot_mapping_full, csa_plan,
+        )
+    hca_plan = pl.create_tensor([1], dtype=pl.INT32)
+    with pl.scope():
+        prepare_hca_owner_plan(
+            local_tokens, query_start_loc, state_checkpoint_ends, position_ids_full,
+            ori_slot_mapping_full, hca_cmp_slot_mapping_full, hca_state_slot_mapping_full, hca_plan,
         )
 
     # Query frequencies are shared by layer kind for this forward.
@@ -676,6 +683,7 @@ def prefill_fwd(
     target_hc_stack = pl.create_tensor([target_hc_rows, HC_MULT, D], dtype=pl.FP32)
 
     csa_compact = pl.read(csa_plan, [0])
+    hca_owner = pl.read(hca_plan, [0])
 
     # Layers 2-41: CSA/HCA pairs.
     for pair_order in pl.range(HCA_NUM_LAYERS):
@@ -947,6 +955,7 @@ def prefill_fwd(
                         o_proj_weight_ready, o_proj_weight_consumed,
                         layer_completion,
                         group_base, tp_rank, hca_layer + pl.const(1, pl.INT32),
+                        hca_owner,
                         compressed_inverse, compressed_swap_idx, compressed_rope_ready,
                     )
 

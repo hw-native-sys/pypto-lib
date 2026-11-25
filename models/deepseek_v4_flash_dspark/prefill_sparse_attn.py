@@ -125,7 +125,9 @@ SPARSE_CMP_BIAS_COLS = max(0, SPARSE_BIAS_COLS - WIN)
 # HCA streaming tiling.
 HCA_ATTN_TILE = 128
 HCA_CMP_PAGES_PER_WORK = HCA_ATTN_TILE // HCA_CMP_STORAGE_BLOCK_SIZE
-HCA_SHORT_CMP_PAGE_TILE = HCA_CMP_PAGES_PER_WORK // 8
+HCA_CMP_GATHER_PAGE_TILE = 16
+HCA_CMP_GATHER_ROW_TILE = HCA_CMP_GATHER_PAGE_TILE * HCA_CMP_STORAGE_BLOCK_SIZE
+HCA_CMP_GATHER_WORKERS = 32
 HCA_CMP_MAX_BLOCKS = (MAX_SEQ_LEN // HCA_COMPRESS_RATIO + HCA_CMP_STORAGE_BLOCK_SIZE - 1) // HCA_CMP_STORAGE_BLOCK_SIZE
 HCA_CMP_WORK_COUNT = (HCA_CMP_MAX_BLOCKS + HCA_CMP_PAGES_PER_WORK - 1) // HCA_CMP_PAGES_PER_WORK
 HCA_CMP_PAD_ROWS = HCA_CMP_WORK_COUNT * HCA_ATTN_TILE
@@ -822,41 +824,33 @@ def _hca_streaming_attn_tile(
         # Tile-local HCA workspaces.
         cmp_work_kv = pl.create_tensor([HCA_CMP_PAD_ROWS, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
         cmp_work_valid = pl.create_tensor([HCA_CMP_WORK_COUNT, HCA_WORK_VALID_STRIDE], dtype=pl.INT32, manual_dep=True)
-        # Keep slot zero initialized for an empty compressed interval.
         gather_panels = pl.max(1, pl.min(pl.cast(panel_count, pl.INDEX), HCA_CMP_WORK_COUNT))
-        gather_page_tile = pl.const(HCA_CMP_PAGES_PER_WORK, pl.INDEX)
-        if panel_count == 1:
-            gather_page_tile = pl.const(HCA_SHORT_CMP_PAGE_TILE, pl.INDEX)
-        blocks_per_panel = HCA_CMP_PAGES_PER_WORK // gather_page_tile
-        gather_blocks = gather_panels * blocks_per_panel
+        page_tiles = gather_panels * (HCA_CMP_PAGES_PER_WORK // HCA_CMP_GATHER_PAGE_TILE)
+        gather_workers = pl.min(page_tiles, HCA_CMP_GATHER_WORKERS)
         with pl.spmd(
-            gather_blocks, name_hint="prefill_hca_stream_cmp_gather", deps=[packed_init_tid],
+            gather_workers, name_hint="prefill_hca_stream_cmp_gather", deps=[packed_init_tid],
         ) as cmp_gather_tid:
-            gather_block = pl.tile.get_block_idx()
-            gather_work = gather_block // blocks_per_panel
-            gather_page_base = (gather_block % blocks_per_panel) * gather_page_tile
-            if gather_page_base == 0:
-                pl.write(cmp_work_valid, [gather_work, 0], pl.cast(0, pl.INT32))
-            if gather_work < panel_count:
-                gather_dst0 = gather_work * HCA_ATTN_TILE
-                gather_page_end = gather_page_base + gather_page_tile
-                for gather_page in pl.range(gather_page_base, gather_page_end):
-                    gather_table_col = gather_work * HCA_CMP_PAGES_PER_WORK + gather_page
-                    gather_local = gather_page * HCA_CMP_STORAGE_BLOCK_SIZE
-                    gather_dst = gather_dst0 + gather_local
-                    # Preserve the manually managed workspace identity across gather writes.
-                    gather_zero = pl.tile.full([HCA_CMP_STORAGE_BLOCK_SIZE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                    pl.store(gather_zero, [gather_dst, 0], cmp_work_kv)
-                    gather_block_i32 = pl.read(cmp_block_table, [gather_table_col])
-                    if gather_block_i32 >= 0:
-                        if gather_block_i32 < cmp_block_num:
-                            if gather_page == 0:
-                                pl.write(cmp_work_valid, [gather_work, 0], pl.cast(1, pl.INT32))
-                            gather_block = pl.cast(gather_block_i32, pl.INDEX)
-                            gather_src = gather_block * HCA_CMP_STORAGE_BLOCK_SIZE
-                            gather_page_kv = pl.load(cmp_kv_flat, [gather_src, 0], [HCA_CMP_STORAGE_BLOCK_SIZE, HEAD_DIM])
-                            pl.store(gather_page_kv, [gather_dst, 0], cmp_work_kv)
-
+            worker = pl.tile.get_block_idx()
+            for page_tile in pl.range(worker, page_tiles, HCA_CMP_GATHER_WORKERS):
+                first_page = page_tile * HCA_CMP_GATHER_PAGE_TILE
+                panel = first_page // HCA_CMP_PAGES_PER_WORK
+                first_block = pl.cast(-1, pl.INT32)
+                if panel < panel_count:
+                    first_block = pl.read(cmp_block_table, [first_page])
+                if first_page % HCA_CMP_PAGES_PER_WORK == 0:
+                    panel_valid = pl.cast(first_block >= 0 and first_block < cmp_block_num, pl.INT32)
+                    pl.write(cmp_work_valid, [panel, 0], panel_valid)
+                if panel < panel_count:
+                    tile = pl.tile.full([HCA_CMP_GATHER_ROW_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                    for page in pl.range(HCA_CMP_GATHER_PAGE_TILE):
+                        block = pl.read(cmp_block_table, [first_page + page])
+                        if block >= 0 and block < cmp_block_num:
+                            dst = page * HCA_CMP_STORAGE_BLOCK_SIZE
+                            src = pl.cast(block, pl.INDEX) * HCA_CMP_STORAGE_BLOCK_SIZE
+                            tile = pl.tile.gather_row(
+                                tile, cmp_kv_flat, [dst, 0], [src, 0], [HCA_CMP_STORAGE_BLOCK_SIZE, HEAD_DIM],
+                            )
+                    pl.store(tile, [first_page * HCA_CMP_STORAGE_BLOCK_SIZE, 0], cmp_work_kv)
 
         # Raw KV is reusable after raw QK/PV. The partial statistics stay live through merge.
         raw_kv = pl.create_tensor([HCA_QUERY_TILE * WIN, HEAD_DIM], dtype=pl.BF16)

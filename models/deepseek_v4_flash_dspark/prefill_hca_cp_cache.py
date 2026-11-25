@@ -89,6 +89,31 @@ def hca_owner_eligible(
 
 
 @pl.jit.inline(auto_scope=False)
+def prepare_hca_owner_plan(
+    local_rows: pl.Scalar[pl.INDEX],
+    starts: pl.Tensor,
+    checkpoints: pl.Tensor,
+    positions: pl.Tensor,
+    raw_slots: pl.Tensor,
+    cmp_slots: pl.Tensor,
+    state_slots: pl.Tensor,
+    decision: pl.Tensor,
+):
+    """Select owner publication for one physical CP layout."""
+    total = pl.tensor.dim(positions, 0)
+    if (
+        TP_SIZE > 1 and pl.tensor.dim(starts, 0) == 2
+        and local_rows >= PREFILL_STATE_TILE and local_rows % PREFILL_STATE_TILE == 0
+        and total == TP_SIZE * local_rows
+    ):
+        hca_owner_eligible(starts, checkpoints, positions, raw_slots, cmp_slots, state_slots, decision)
+    else:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_cp_owner_init"):
+            pl.write(decision, [0], pl.cast(0, pl.INT32))
+    return decision
+
+
+@pl.jit.inline(auto_scope=False)
 def hca_publish_owner_caches(
     raw: pl.Tensor, values: pl.Tensor, scores: pl.Tensor, checkpoints: pl.Tensor,
     ape: pl.Tensor, norm: pl.Tensor, cos: pl.Tensor, sin: pl.Tensor, positions: pl.Tensor,

@@ -93,13 +93,10 @@ WEIGHTS_TAIL_ROW_TILE = 16
 TOPK_LEAF_TILE = 8192
 TOPK_SHORT_LEAF_TILE = 2048
 TOPK_GROUP_TILE = 2
-TOPK_GROUP_CANDIDATES = TOPK_LEAF_TILE * TOPK_GROUP_TILE
 TOPK_MAX_LEAVES = (INDEXER_MAX_CANDIDATES + TOPK_LEAF_TILE - 1) // TOPK_LEAF_TILE
 TOPK_GROUPS_PER_QUERY = (TOPK_MAX_LEAVES + TOPK_GROUP_TILE - 1) // TOPK_GROUP_TILE
 TOPK_GROUP_WORKERS = 48
-TOPK_GROUP_ROOT_ROWS = PREFILL_DENSE_TILE * TOPK_GROUPS_PER_QUERY
-TOPK_GROUP_SCRATCH_ROWS = TOPK_GROUP_WORKERS * TOPK_GROUP_TILE
-TOPK_ARENA_ROWS = TOPK_GROUP_ROOT_ROWS + TOPK_GROUP_SCRATCH_ROWS
+TOPK_ARENA_ROWS = PREFILL_DENSE_TILE * TOPK_GROUPS_PER_QUERY
 TOPK_SCORE_WORKERS = 24
 SCORE_CANDIDATE_TILE = 64
 SCORE_QUERY_TILE = 4
@@ -138,15 +135,13 @@ def _merge_topk_level_pairs(
     pair_arena: pl.Tensor,
     arena_base: pl.Scalar[pl.INDEX],
     input_count: pl.Scalar[pl.INDEX],
-    input_base: pl.Scalar[pl.INDEX],
-    output_base: pl.Scalar[pl.INDEX],
 ) -> None:
     output_count = (input_count + 1) // 2
     for output in pl.range(output_count):
-        left_slot = arena_base + input_base + 2 * output
+        left_slot = arena_base + 2 * output
         right_slot = left_slot + 1
-        output_slot = arena_base + output_base + output
-        if right_slot < arena_base + input_base + input_count:
+        output_slot = arena_base + output
+        if right_slot < arena_base + input_count:
             _merge2_top512_pairs(pair_arena, left_slot, right_slot, output_slot)
         else:
             forwarded = pl.load(pair_arena, [left_slot, 0], [1, TOPK_PAIR_WIDTH])
@@ -227,121 +222,75 @@ def _store_topk_indices(
     pl.store(selected, [output_query, 0], topk_indices)
 
 
+@pl.jit.inline
+def _store_topk_group(
+    group_pairs: pl.Tile[[1, TOPK_PAIR_WIDTH], pl.FP32],
+    visible_count: pl.Scalar[pl.INDEX],
+    group_count: pl.Scalar[pl.INDEX],
+    pair_arena: pl.Tensor,
+    root_slot: pl.Scalar[pl.INDEX],
+    topk_indices: pl.Tensor,
+    output_query: pl.Scalar[pl.INDEX],
+) -> None:
+    if group_count == 1:
+        _store_topk_indices(group_pairs, visible_count, topk_indices, output_query)
+    else:
+        pl.store(group_pairs, [root_slot, 0], pair_arena)
+
+
 @pl.jit.incore
-def _topk_single_group(
+def _topk_query_rows(
     position_ids: pl.Tensor,
     local_request_ids: pl.Tensor,
     score_arena: pl.Tensor,
+    pair_arena: pl.Tensor,
     topk_indices: pl.Tensor,
     tile_base: pl.Scalar[pl.INDEX],
     tile_rows: pl.Scalar[pl.INDEX],
 ):
+    """Reduce each query's sorted groups to its final Top-512 row."""
     worker = pl.tile.get_block_idx()
     for query in pl.range(worker, tile_rows, TOPK_GROUP_WORKERS):
         output_query = tile_base + query
-        position = pl.read(position_ids, [output_query])
         request_id = pl.read(local_request_ids, [output_query])
         visible_count = pl.const(0, pl.INDEX)
         if request_id >= 0:
-            visible_count = pl.max(pl.min(pl.cast((position + 1) // COMPRESS_RATIO, pl.INDEX), INDEXER_MAX_CANDIDATES), 0)
+            position = pl.read(position_ids, [output_query])
+            visible = pl.cast((position + 1) // COMPRESS_RATIO, pl.INDEX)
+            visible_count = pl.max(0, pl.min(visible, INDEXER_MAX_CANDIDATES))
         if visible_count > 0:
-            left_count = pl.min(visible_count, TOPK_LEAF_TILE)
-            left_pairs = _topk_leaf_pairs(score_arena, query, pl.const(0, pl.INDEX), left_count)
-            if visible_count > TOPK_LEAF_TILE:
-                right_begin = pl.const(TOPK_LEAF_TILE, pl.INDEX)
-                right_count = visible_count - right_begin
-                right_pairs = _topk_leaf_pairs(score_arena, query, right_begin, right_count)
-                top_pairs = _merge_top512_pairs(left_pairs, right_pairs)
-                _store_topk_indices(top_pairs, visible_count, topk_indices, output_query)
-            else:
-                _store_topk_indices(left_pairs, visible_count, topk_indices, output_query)
+            group_tile = TOPK_GROUP_TILE * TOPK_LEAF_TILE
+            group_count = (visible_count + group_tile - 1) // group_tile
+            arena_base = query * TOPK_GROUPS_PER_QUERY
+            for group in pl.range(group_count):
+                group_begin = group * group_tile
+                group_visible = visible_count - group_begin
+                left_count = pl.min(group_visible, TOPK_LEAF_TILE)
+                left_pairs = _topk_leaf_pairs(score_arena, query, group_begin, left_count)
+                root_slot = arena_base + group
+                if group_visible > TOPK_LEAF_TILE:
+                    right_begin = group_begin + TOPK_LEAF_TILE
+                    right_count = pl.min(group_visible - TOPK_LEAF_TILE, TOPK_LEAF_TILE)
+                    right_pairs = _topk_leaf_pairs(score_arena, query, right_begin, right_count)
+                    group_pairs = _merge_top512_pairs(left_pairs, right_pairs)
+                    _store_topk_group(
+                        group_pairs, visible_count, group_count, pair_arena, root_slot, topk_indices, output_query,
+                    )
+                else:
+                    _store_topk_group(
+                        left_pairs, visible_count, group_count, pair_arena, root_slot, topk_indices, output_query,
+                    )
+            if group_count > 1:
+                root_count = group_count
+                for _ in pl.range(4):
+                    if root_count > 1:
+                        _merge_topk_level_pairs(pair_arena, arena_base, root_count)
+                        root_count = (root_count + 1) // 2
+                root_pairs = pl.load(pair_arena, [arena_base, 0], [1, TOPK_PAIR_WIDTH])
+                _store_topk_indices(root_pairs, visible_count, topk_indices, output_query)
         else:
             missing = pl.tile.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
             pl.store(missing, [output_query, 0], topk_indices)
-
-
-@pl.jit.incore
-def _topk_group_wave(
-    position_ids: pl.Tensor,
-    local_request_ids: pl.Tensor,
-    score_arena: pl.Tensor,
-    pair_arena: pl.Tensor,
-    tile_base: pl.Scalar[pl.INDEX],
-    tile_rows: pl.Scalar[pl.INDEX],
-):
-    """Reduce striped two-leaf subtrees into compact roots."""
-    worker = pl.tile.get_block_idx()
-    global_group_base = 0
-    for query in pl.range(tile_rows):
-        position = pl.read(position_ids, [tile_base + query])
-        request_id = pl.read(local_request_ids, [tile_base + query])
-        visible_count = 0
-        if request_id >= 0:
-            visible_count = pl.max(pl.min((position + 1) // COMPRESS_RATIO, INDEXER_MAX_CANDIDATES), 0)
-        leaf_count = (visible_count + TOPK_LEAF_TILE - 1) // TOPK_LEAF_TILE
-        group_count = (leaf_count + TOPK_GROUP_TILE - 1) // TOPK_GROUP_TILE
-        base_mod = global_group_base % TOPK_GROUP_WORKERS
-        first_group = (worker + base_mod) % TOPK_GROUP_WORKERS
-        for group in pl.range(first_group, group_count, TOPK_GROUP_WORKERS):
-            leaf_begin = group * TOPK_GROUP_TILE
-            group_leaf_count = pl.min(TOPK_GROUP_TILE, leaf_count - leaf_begin)
-            group_root_slot = query * TOPK_GROUPS_PER_QUERY + group
-            if group_leaf_count == 1:
-                logical_begin = leaf_begin * TOPK_LEAF_TILE
-                valid_count = pl.min(TOPK_LEAF_TILE, visible_count - logical_begin)
-                top_pairs = _topk_leaf_pairs(score_arena, query, logical_begin, valid_count)
-                pl.store(top_pairs, [group_root_slot, 0], pair_arena)
-            else:
-                scratch_base = TOPK_GROUP_ROOT_ROWS + worker * TOPK_GROUP_TILE
-                for group_leaf in pl.unroll(TOPK_GROUP_TILE):
-                    leaf = leaf_begin + group_leaf
-                    logical_begin = leaf * TOPK_LEAF_TILE
-                    valid_count = pl.min(TOPK_LEAF_TILE, visible_count - logical_begin)
-                    top_pairs = _topk_leaf_pairs(score_arena, query, logical_begin, valid_count)
-                    pl.store(top_pairs, [scratch_base + group_leaf, 0], pair_arena)
-                _merge2_top512_pairs(pair_arena, scratch_base, scratch_base + 1, group_root_slot)
-        global_group_base = global_group_base + group_count
-
-
-@pl.jit.incore
-def _topk_query_merge(
-    position_ids: pl.Tensor,
-    local_request_ids: pl.Tensor,
-    pair_arena: pl.Tensor,
-    topk_indices: pl.Tensor,
-    tile_base: pl.Scalar[pl.INDEX],
-    tile_rows: pl.Scalar[pl.INDEX],
-):
-    """Merge compact group roots into one Top-512 row."""
-    worker = pl.tile.get_block_idx()
-    for query in pl.range(worker, tile_rows, TOPK_GROUP_WORKERS):
-        output_query = tile_base + query
-        position = pl.read(position_ids, [output_query])
-        request_id = pl.read(local_request_ids, [output_query])
-        visible_count = 0
-        if request_id >= 0:
-            visible_count = pl.max(pl.min((position + 1) // COMPRESS_RATIO, INDEXER_MAX_CANDIDATES), 0)
-        empty_indices = pl.tile.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
-        pl.store(empty_indices, [output_query, 0], topk_indices)
-
-        if visible_count > 0:
-            leaf_count = (visible_count + TOPK_LEAF_TILE - 1) // TOPK_LEAF_TILE
-            group_count = (leaf_count + TOPK_GROUP_TILE - 1) // TOPK_GROUP_TILE
-            arena_base = query * TOPK_GROUPS_PER_QUERY
-            if group_count > 1:
-                level1_count = (group_count + 1) // 2
-                _merge_topk_level_pairs(pair_arena, arena_base, group_count, 0, 0)
-                if level1_count > 1:
-                    level2_count = (level1_count + 1) // 2
-                    _merge_topk_level_pairs(pair_arena, arena_base, level1_count, 0, 0)
-                    if level2_count > 1:
-                        level3_count = (level2_count + 1) // 2
-                        _merge_topk_level_pairs(pair_arena, arena_base, level2_count, 0, 0)
-                        if level3_count > 1:
-                            _merge_topk_level_pairs(pair_arena, arena_base, level3_count, 0, 0)
-
-            root_pairs = pl.load(pair_arena, [arena_base, 0], [1, TOPK_PAIR_WIDTH])
-            _store_topk_indices(root_pairs, visible_count, topk_indices, output_query)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -366,18 +315,6 @@ def _prefill_indexer_score_topk(
     idx_cache_rows = idx_block_num * BLOCK_SIZE
     kv_cache_i8_flat = pl.reshape(idx_kv_cache, [idx_cache_rows, IDX_HEAD_DIM])
     kv_scale_row_flat = pl.reshape(idx_kv_scale, [1, idx_cache_rows])
-    # A single group already owns the final Top-K for its query.
-    tile_position_bound = pl.create_tensor([1], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_position_bound") as bound_tid:
-        peak = pl.const(-1, pl.INT32)
-        for pos_row, (peak_so_far,) in pl.range(tile_rows, init_values=(peak,)):
-            output_row = tile_base + pos_row
-            pos_value = pl.const(-1, pl.INT32)
-            if pl.read(local_request_ids, [output_row]) >= 0:
-                pos_value = pl.read(position_ids, [output_row])
-            peak = pl.yield_(pl.max(peak_so_far, pos_value))
-        pl.write(tile_position_bound, [0], peak)
-
     with pl.spmd(
         TOPK_SCORE_WORKERS, name_hint="prefill_idx_score_leaf_wave", deps=[completion[0]],
         optimizations=[pl.cross_core_slot(slot_num=2, local_slot_num=1)],
@@ -495,20 +432,10 @@ def _prefill_indexer_score_topk(
                                                     score_valid = pl.maximum(score_padded, score_floor)
                                                     pl.store(score_valid, [query + member, logical_row], score_arena)
 
-    max_position = pl.read(tile_position_bound, [0])
     output_workers = pl.min(tile_rows, TOPK_GROUP_WORKERS)
-    if (max_position + 1) // COMPRESS_RATIO <= TOPK_GROUP_CANDIDATES:
-        with pl.spmd(output_workers, name_hint="prefill_idx_topk_single_group", deps=[score_tid, bound_tid]) as single_tid:
-            _topk_single_group(position_ids, local_request_ids, score_arena, topk_indices, tile_base, tile_rows)
-        completion[0] = single_tid
-    else:
-        with pl.spmd(TOPK_GROUP_WORKERS, name_hint="prefill_idx_topk_group_wave", deps=[score_tid]) as topk_tid:
-            _topk_group_wave(position_ids, local_request_ids, score_arena, pair_arena, tile_base, tile_rows)
-
-        with pl.spmd(output_workers, name_hint="prefill_idx_topk_query_merge", deps=[topk_tid]) as merge_tid:
-            _topk_query_merge(position_ids, local_request_ids, pair_arena, topk_indices, tile_base, tile_rows)
-
-        completion[0] = merge_tid
+    with pl.spmd(output_workers, name_hint="prefill_idx_topk_query_rows", deps=[score_tid]) as topk_tid:
+        _topk_query_rows(position_ids, local_request_ids, score_arena, pair_arena, topk_indices, tile_base, tile_rows)
+    completion[0] = topk_tid
     return topk_indices
 
 
