@@ -1011,7 +1011,7 @@ def prefill_attention_hca_cp_local(
     wo_a_local: pl.Tensor[[O_PROJ_LOCAL_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b_local: pl.Tensor[[O_PROJ_LOCAL_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
-    wo_a_full: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], pl.BF16],
+    wo_a_nz: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], pl.BF16, pl.NZ],
     wo_b_full: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_D, O_LORA], pl.INT8],
     x_out_local: pl.Tensor[[CP_Q_T_DYN, HC_MULT, D], pl.FP32],
     gather_window: pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16],
@@ -1027,10 +1027,8 @@ def prefill_attention_hca_cp_local(
     inverse_rope: pl.Tensor[[SPARSE_ROPE_ROWS, 2 * ROPE_DIM], pl.FP32],
     inverse_swap_idx: pl.Tensor[[SPARSE_ROPE_HEAD_TILE, ROPE_DIM], pl.INT32],
     inverse_ready: pl.Scalar[pl.TASK_ID],
-    WRITE_WO_A_ND: pl.constexpr,
 ):
     """Run HCA with local HC state and gathered KV and compressor projections."""
-    wo_a_nz = pl.create_tensor([O_GROUPS, O_LORA, O_GROUP_IN], dtype=pl.BF16, layout=pl.NZ)
     if TP_SIZE > 1:
         weight_published, weight_waited = _begin_o_proj_full_weights_gather(
             wo_a_local, wo_b_local,
@@ -1041,7 +1039,7 @@ def prefill_attention_hca_cp_local(
     else:
         o_proj_weight_dep = gather_o_proj_full_weights(
             wo_a_local, wo_b_local,
-            wo_a_full, wo_a_nz, wo_b_full,
+            wo_a_nz, wo_b_full,
             o_proj_wo_a_window, o_proj_wo_b_window,
             o_proj_weight_ready, o_proj_weight_consumed,
             o_proj_order_fence,
@@ -1064,11 +1062,10 @@ def prefill_attention_hca_cp_local(
     if TP_SIZE > 1:
         o_proj_weight_dep = _finish_o_proj_full_weights_gather(
             wo_a_local, wo_b_local,
-            wo_a_full, wo_a_nz, wo_b_full,
+            wo_a_nz, wo_b_full,
             o_proj_wo_a_window, o_proj_wo_b_window,
             o_proj_weight_consumed, o_proj_order_fence,
             group_base, tp_rank, weight_published, weight_waited, norm_ready_tid,
-            WRITE_WO_A_ND,
         )
     local_base = tp_rank * q_dim
     freqs_cos_local = pl.slice(freqs_cos, [q_dim, ROPE_DIM], [local_base, 0])
@@ -1204,7 +1201,7 @@ def prefill_attention_hca_cp(
     wo_a_local: pl.Tensor[[O_PROJ_LOCAL_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b_local: pl.Tensor[[O_PROJ_LOCAL_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
-    wo_a_full: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], pl.BF16],
+    wo_a_nz: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], pl.BF16, pl.NZ],
     wo_b_full: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_D, O_LORA], pl.INT8],
     x_out_full: pl.Tensor[[CP_KV_T_DYN, HC_MULT, D], pl.FP32],
     gather_window: pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16],
@@ -1245,7 +1242,7 @@ def prefill_attention_hca_cp(
         cmp_slot_mapping_full, state_slot_mapping_full,
         attn_sink,
         wo_a_local, wo_b_local, wo_b_scale,
-        wo_a_full, wo_b_full,
+        wo_a_nz, wo_b_full,
         x_out_local,
         gather_window, gather_signal,
         o_proj_wo_a_window, o_proj_wo_b_window,
@@ -1253,7 +1250,6 @@ def prefill_attention_hca_cp(
         o_proj_order_fence,
         group_base, tp_rank, weight_epoch,
         inverse_rope, inverse_swap_idx, inverse_ready,
-        True,
     )
     materialize_ready_tid = pl.system.task_dummy(deps=[])
     prefill_cp_materialize_hc_full(
@@ -1338,7 +1334,7 @@ def prefill_attention_hca_cp_test(
     state_slot_mapping_full.bind_dynamic(0, CP_KV_T_DYN)
     x_out_full.bind_dynamic(0, CP_KV_T_DYN)
 
-    wo_a_full = pl.create_tensor([O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], dtype=pl.BF16)
+    wo_a_nz = pl.create_tensor([O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], dtype=pl.BF16, layout=pl.NZ)
     wo_b_full = pl.create_tensor([O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_D, O_LORA], dtype=pl.INT8)
     o_proj_order_fence = pl.create_tensor([1], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_o_proj_order_init"):
@@ -1357,7 +1353,7 @@ def prefill_attention_hca_cp_test(
         position_ids_local, position_ids_full,
         cmp_slot_mapping_full, state_slot_mapping_full,
         attn_sink, wo_a, wo_b, wo_b_scale,
-        wo_a_full, wo_b_full,
+        wo_a_nz, wo_b_full,
         x_out_full,
         gather_window, gather_signal,
         o_proj_wo_a_window, o_proj_wo_b_window,

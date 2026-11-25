@@ -192,7 +192,6 @@ def _begin_o_proj_full_weights_gather(
 def _finish_o_proj_full_weights_gather(
     wo_a_local: pl.Tensor[[O_PROJ_LOCAL_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b_local: pl.Tensor[[O_PROJ_LOCAL_GROUPS, D, O_LORA], pl.INT8],
-    wo_a_full: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], pl.BF16],
     wo_a_nz: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], pl.BF16, pl.NZ],
     wo_b_full: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_D, O_LORA], pl.INT8],
     wo_a_window: pld.DistributedTensor[[O_PROJ_WO_A_WINDOW_ROWS, O_PROJ_WO_A_WINDOW_COLS], pl.BF16],
@@ -204,12 +203,10 @@ def _finish_o_proj_full_weights_gather(
     publish_tid: pl.Scalar[pl.TASK_ID],
     ready_wait_tid: pl.Scalar[pl.TASK_ID],
     norm_ready_tid: pl.Scalar[pl.TASK_ID],
-    WRITE_WO_A_ND: pl.constexpr,
 ) -> pl.Scalar[pl.TASK_ID]:
-    """Read the TP shards into NZ scratch and optionally publish the ND copy."""
+    """Pack gathered O-A shards into NZ and copy gathered O-B shards."""
     wo_a_local_flat = pl.reshape(wo_a_local, [O_PROJ_LOCAL_COLS, O_GROUP_IN])
     wo_b_local_flat = pl.reshape(wo_b_local, [O_PROJ_LOCAL_ROWS_B, O_LORA])
-    wo_a_full_flat = pl.reshape(wo_a_full, [O_PROJ_FULL_ROWS, O_GROUP_IN])
     wo_a_raw = pl.reshape(wo_a_nz, [O_PROJ_FULL_ROWS * O_GROUP_IN])
     wo_a_packed = pl.reshape(wo_a_raw, [O_PROJ_A_NZ_ROWS, O_PROJ_A_NZ_COLS])
     with pl.spmd(
@@ -235,8 +232,6 @@ def _finish_o_proj_full_weights_gather(
                         wo_a_window, [row, k0], [O_PROJ_WEIGHT_COPY_TILE, O_PROJ_A_PACK_K_TILE],
                         target_memory=pl.Mem.Vec,
                     )
-                if WRITE_WO_A_ND:
-                    pl.store(nd_tile, [row, k0], wo_a_full_flat)
                 stripe = nz_row + k0 // O_PROJ_A_NZ_C0
                 packed_tile = _o_proj_a_pack_chunk(nd_tile, indices, tmp)
                 pl.store(packed_tile, [stripe, nz_col], wo_a_packed)
@@ -282,7 +277,6 @@ if TP_SIZE == 1:
     def gather_o_proj_full_weights(
         wo_a_local: pl.Tensor[[O_PROJ_LOCAL_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
         wo_b_local: pl.Tensor[[O_PROJ_LOCAL_GROUPS, D, O_LORA], pl.INT8],
-        wo_a_full: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], pl.BF16],
         wo_a_nz: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], pl.BF16, pl.NZ],
         wo_b_full: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_D, O_LORA], pl.INT8],
         wo_a_window: pld.DistributedTensor[[O_PROJ_WO_A_WINDOW_ROWS, O_PROJ_WO_A_WINDOW_COLS], pl.BF16],
@@ -294,9 +288,8 @@ if TP_SIZE == 1:
         tp_rank: pl.Scalar[pl.INT32],
         weight_epoch: pl.Scalar[pl.INT32],
     ) -> pl.Scalar[pl.TASK_ID]:
-        """Copy TP1's resident full weights into ND and NZ scratch."""
+        """Pack TP1 O-A into NZ and copy O-B into full-weight scratch."""
         wo_a_local_flat = pl.reshape(wo_a_local, [O_PROJ_FULL_ROWS, O_GROUP_IN])
-        wo_a_full_flat = pl.reshape(wo_a_full, [O_PROJ_FULL_ROWS, O_GROUP_IN])
         wo_a_raw = pl.reshape(wo_a_nz, [O_PROJ_FULL_ROWS * O_GROUP_IN])
         wo_a_packed = pl.reshape(wo_a_raw, [O_PROJ_A_NZ_ROWS, O_PROJ_A_NZ_COLS])
         with pl.spmd(O_PROJ_FULL_ROWS // O_PROJ_WEIGHT_COPY_TILE, name_hint="o_proj_tp1_wo_a_copy") as wo_a_copy_tid:
@@ -312,7 +305,6 @@ if TP_SIZE == 1:
                         wo_a_local_flat, [row, k0], [O_PROJ_WEIGHT_COPY_TILE, O_PROJ_A_PACK_K_TILE],
                         target_memory=pl.Mem.Vec,
                     )
-                    pl.store(nd_tile, [row, k0], wo_a_full_flat)
                     stripe = nz_row + k0 // O_PROJ_A_NZ_C0
                     packed_tile = _o_proj_a_pack_chunk(nd_tile, indices, tmp)
                     pl.store(packed_tile, [stripe, nz_col], wo_a_packed)

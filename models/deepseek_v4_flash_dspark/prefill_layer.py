@@ -236,7 +236,7 @@ def prefill_layer_attention(
     local_tokens = pl.tensor.dim(position_ids_local, 0)
     local_request_ids = pl.create_tensor([local_tokens], dtype=pl.INT32)
     lower_local_request_ids(query_start_loc, local_request_ids, tp_rank * local_tokens)
-    wo_a_full = pl.create_tensor([O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], dtype=pl.BF16)
+    wo_a_nz = pl.create_tensor([O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], dtype=pl.BF16, layout=pl.NZ)
     wo_b_full = pl.create_tensor([O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_D, O_LORA], dtype=pl.INT8)
     o_proj_order_fence = pl.create_tensor([1], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_layer_o_proj_order_init"):
@@ -255,7 +255,7 @@ def prefill_layer_attention(
                 position_ids_local, position_ids_full, local_request_ids,
                 attn_sink,
                 wo_a, wo_b, wo_b_scale,
-                wo_a_full, wo_b_full,
+                wo_a_nz, wo_b_full,
                 attn_stage,
                 gather_window, gather_signal,
                 o_proj_wo_a_window, o_proj_wo_b_window,
@@ -289,7 +289,7 @@ def prefill_layer_attention(
                 csa_inner_state_slot_mapping_full,
                 attn_sink,
                 wo_a, wo_b, wo_b_scale,
-                wo_a_full, wo_b_full,
+                wo_a_nz, wo_b_full,
                 attn_stage,
                 gather_window, gather_signal,
                 o_proj_wo_a_window, o_proj_wo_b_window,
@@ -316,7 +316,7 @@ def prefill_layer_attention(
                 hca_cmp_slot_mapping_full, hca_state_slot_mapping_full,
                 attn_sink,
                 wo_a, wo_b, wo_b_scale,
-                wo_a_full, wo_b_full,
+                wo_a_nz, wo_b_full,
                 attn_stage,
                 gather_window, gather_signal,
                 o_proj_wo_a_window, o_proj_wo_b_window,

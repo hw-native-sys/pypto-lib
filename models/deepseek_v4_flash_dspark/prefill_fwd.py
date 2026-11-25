@@ -359,7 +359,7 @@ def prefill_fwd(
     shared_w3_scale: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[FWD_NUM_LAYERS, D, MOE_INTER], pl.INT8, pl.NZ],
     shared_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
-    o_proj_wo_a_full: pl.Out[pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], pl.BF16]],
+    o_proj_wo_a_full: pl.Out[pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], pl.BF16, pl.NZ]],
     o_proj_wo_b_full: pl.Out[pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_D, O_LORA], pl.INT8]],
     attn_stage: pl.InOut[pl.Tensor[[FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32]],
     x_mixed: pl.Out[pl.Tensor[[FWD_GROUP_TOKENS_DYN, D], pl.BF16]],
@@ -542,6 +542,7 @@ def prefill_fwd(
             gather_signal_step = gather_signal
             o_proj_wo_b_full_step = o_proj_wo_b_full
             if group_tokens > 0:
+                wo_a_nz_step = pl.create_tensor([O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], dtype=pl.BF16, layout=pl.NZ)
                 prefill_attention_swa_cp_local(
                     x_hc_local,
                     hc_attn_fn_l0, hc_attn_scale_l0, hc_attn_base_l0,
@@ -551,7 +552,7 @@ def prefill_fwd(
                     kv_cache_l0, ori_block_table, ori_slot_mapping_full,
                     position_ids_local, position_ids_full, local_request_ids,
                     attn_sink_l0, wo_a_l0, wo_b_l0, wo_b_scale_l0,
-                    o_proj_wo_a_full, o_proj_wo_b_full_step,
+                    wo_a_nz_step, o_proj_wo_b_full_step,
                     attn_stage_step,
                     gather_window, gather_signal_step,
                     o_proj_wo_a_window, o_proj_wo_b_window,
@@ -559,7 +560,6 @@ def prefill_fwd(
                     layer_completion,
                     group_base, tp_rank, layer_l0 + pl.const(1, pl.INT32),
                     swa_inverse, swa_swap_idx, swa_rope_ready,
-                    False,
                 )
 
         with pl.scope():
@@ -635,6 +635,7 @@ def prefill_fwd(
             gather_signal_step = gather_signal
             o_proj_wo_b_full_step = o_proj_wo_b_full
             if group_tokens > 0:
+                wo_a_nz_step = pl.create_tensor([O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], dtype=pl.BF16, layout=pl.NZ)
                 prefill_attention_swa_cp_local(
                     x_hc_local,
                     hc_attn_fn_l1, hc_attn_scale_l1, hc_attn_base_l1,
@@ -644,7 +645,7 @@ def prefill_fwd(
                     kv_cache_l1, ori_block_table, ori_slot_mapping_full,
                     position_ids_local, position_ids_full, local_request_ids,
                     attn_sink_l1, wo_a_l1, wo_b_l1, wo_b_scale_l1,
-                    o_proj_wo_a_full, o_proj_wo_b_full_step,
+                    wo_a_nz_step, o_proj_wo_b_full_step,
                     attn_stage_step,
                     gather_window, gather_signal_step,
                     o_proj_wo_a_window, o_proj_wo_b_window,
@@ -652,7 +653,6 @@ def prefill_fwd(
                     layer_completion,
                     group_base, tp_rank, layer_l1 + pl.const(1, pl.INT32),
                     swa_inverse, swa_swap_idx, swa_rope_ready,
-                    False,
                 )
 
         with pl.scope():
@@ -787,6 +787,7 @@ def prefill_fwd(
                 gather_signal_step = gather_signal
                 o_proj_wo_b_full_step = o_proj_wo_b_full
                 if group_tokens > 0:
+                    wo_a_nz_step = pl.create_tensor([O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], dtype=pl.BF16, layout=pl.NZ)
                     prefill_attention_csa_cp_local(
                         x_hc_local,
                         query_start_loc, state_checkpoint_ends,
@@ -808,7 +809,7 @@ def prefill_fwd(
                         csa_cmp_slot_mapping_full, csa_idx_slot_mapping_full,
                         csa_state_slot_mapping_full, csa_inner_state_slot_mapping_full,
                         attn_sink_csa, wo_a_csa, wo_b_csa, wo_b_scale_csa,
-                        o_proj_wo_a_full, o_proj_wo_b_full_step,
+                        wo_a_nz_step, o_proj_wo_b_full_step,
                         attn_stage_step,
                         gather_window, gather_signal_step,
                         o_proj_wo_a_window, o_proj_wo_b_window,
@@ -816,7 +817,6 @@ def prefill_fwd(
                         layer_completion,
                         group_base, tp_rank, csa_layer + pl.const(1, pl.INT32), csa_compact,
                         compressed_inverse, compressed_swap_idx, compressed_rope_ready,
-                        False,
                     )
 
             with pl.scope():
@@ -924,6 +924,7 @@ def prefill_fwd(
                 gather_signal_step = gather_signal
                 o_proj_wo_b_full_step = o_proj_wo_b_full
                 if group_tokens > 0:
+                    wo_a_nz_step = pl.create_tensor([O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], dtype=pl.BF16, layout=pl.NZ)
                     prefill_attention_hca_cp_local(
                         x_hc_local,
                         query_start_loc, state_checkpoint_ends, local_request_ids, hca_request_ranges,
@@ -939,7 +940,7 @@ def prefill_fwd(
                         position_ids_local, position_ids_full,
                         hca_cmp_slot_mapping_full, hca_state_slot_mapping_full,
                         attn_sink_hca, wo_a_hca, wo_b_hca, wo_b_scale_hca,
-                        o_proj_wo_a_full, o_proj_wo_b_full_step,
+                        wo_a_nz_step, o_proj_wo_b_full_step,
                         attn_stage_step,
                         gather_window, gather_signal_step,
                         o_proj_wo_a_window, o_proj_wo_b_window,
@@ -947,7 +948,6 @@ def prefill_fwd(
                         layer_completion,
                         group_base, tp_rank, hca_layer + pl.const(1, pl.INT32),
                         compressed_inverse, compressed_swap_idx, compressed_rope_ready,
-                        False,
                     )
 
             with pl.scope():
@@ -1116,7 +1116,6 @@ def prefill_fwd(
                     layer_completion,
                     group_base, tp_rank, layer_last + pl.const(1, pl.INT32), csa_compact,
                     compressed_inverse, compressed_swap_idx, compressed_rope_ready,
-                    True,
                 )
 
         with pl.scope():
@@ -2137,11 +2136,12 @@ def finite_tensor_compare(actual, expected, *, preserve_inactive=False, zero_ina
 
 
 def o_proj_wo_a_full_compare(actual, expected, **kwargs):
-    """Check the final layer's ND export and preserve inactive ranks' scratch."""
+    """Check the final layer's packed O-A weights and inactive ranks' scratch."""
     from golden import ratio_allclose
+    from utils import pack_nz
 
     valid, detail = finite_tensor_compare(actual, expected, preserve_inactive=True, **kwargs)
-    if not valid or TP_SIZE == 1:
+    if not valid:
         return valid, detail
 
     starts = kwargs["inputs"]["query_start_loc"]
@@ -2153,7 +2153,8 @@ def o_proj_wo_a_full_compare(actual, expected, **kwargs):
         if int(starts[group_base, -1]) == 0:
             continue
         last_layer = shards[group_ranks, last_group:last_group + O_PROJ_LOCAL_GROUPS].reshape_as(actual[group_base])
-        group_expected = last_layer.to(device=actual.device).unsqueeze(0).expand_as(actual[group_ranks])
+        packed = pack_nz(last_layer).to(device=actual.device)
+        group_expected = packed.unsqueeze(0).expand_as(actual[group_ranks])
         valid, detail = compare(actual[group_ranks], group_expected, **kwargs)
         if not valid:
             return False, f"    TP group starting at rank {group_base}: {detail}"
