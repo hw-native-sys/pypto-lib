@@ -31,7 +31,7 @@ N_HASH_LAYERS = M.num_hash_layers
 # tiling
 NORM_TOKEN_TILE = 4
 GATE_T_TILE = 8
-GATE_M_TILE = 16 if T <= 8 else min(64, ((T + GATE_T_TILE - 1) // GATE_T_TILE) * GATE_T_TILE)
+GATE_M_TILE = 16 if T <= 8 else min(32, ((T + GATE_T_TILE - 1) // GATE_T_TILE) * GATE_T_TILE)
 GATE_N_TILE = 16 if T <= 8 else 32
 assert N_EXPERTS % GATE_N_TILE == 0
 T_PAD = ((T + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
@@ -146,35 +146,56 @@ def _gate(
             pl.tile.store(xn_q_i8, [tok, 0], x_norm_i8, shapes=[1, D])
 
     # Zero inactive fixed-tile inputs/outputs and mask padded expert scores.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route"):
-        for zt in pl.range(T):
-            if zt >= active_tokens:
-                # Positive FP16 zero has zero bytes; no numeric conversion is needed.
-                inactive_x_norm_f16 = pl.full([1, D // 2], dtype=pl.FP16, value=0.0)
-                inactive_x_norm_i8 = pl.reinterpret_view(inactive_x_norm_f16, pl.INT8)
-                x_norm_i8[zt : zt + 1, :] = inactive_x_norm_i8
-                pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
-                for zk in pl.range(TOPK):
-                    pl.write(indices, [zt, zk], pl.cast(0, pl.INT32))
-                    pl.write(weights, [zt, zk], pl.cast(0.0, pl.FP32))
+    if active_tokens < T:
+        if active_tokens % 8 == 0 and T % 8 == 0:
+            # The three compact metadata outputs share cache lines across row groups.
+            # One worker owns them. Every worker clears eight disjoint 4-KiB INT8 rows.
+            scale_row = pl.reshape(x_norm_scale, [1, T])
+            index_row = pl.reshape(indices, [1, T * TOPK])
+            weight_row = pl.reshape(weights, [1, T * TOPK])
+            tail_groups = (T - active_tokens) // 8
+            for group in pl.spmd(tail_groups, name_hint="gate_pre_route"):
+                t0 = active_tokens + group * 8
+                zero_x = pl.full([8, D // 2], dtype=pl.FP16, value=0.0)
+                x_norm_i8[t0:t0 + 8, :] = pl.reinterpret_view(zero_x, pl.INT8)
+                if group == 0:
+                    zero_scale = pl.tile.full([1, 8], dtype=pl.FP32, value=0.0)
+                    zero_weight = pl.tile.full([1, 8 * TOPK], dtype=pl.FP32, value=0.0)
+                    zero_index = pl.tile.full([1, 8 * TOPK], dtype=pl.INT32, value=0)
+                    for meta in pl.range(tail_groups):
+                        first = active_tokens + meta * 8
+                        pl.store(zero_scale, [0, first], scale_row)
+                        pl.store(zero_index, [0, first * TOPK], index_row)
+                        pl.store(zero_weight, [0, first * TOPK], weight_row)
+        else:
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route"):
+                for zt in pl.range(active_tokens, T):
+                    # Positive FP16 zero has zero bytes; no numeric conversion is needed.
+                    inactive_x_norm_f16 = pl.full([1, D // 2], dtype=pl.FP16, value=0.0)
+                    inactive_x_norm_i8 = pl.reinterpret_view(inactive_x_norm_f16, pl.INT8)
+                    x_norm_i8[zt : zt + 1, :] = inactive_x_norm_i8
+                    pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
+                    for zk in pl.range(TOPK):
+                        pl.write(indices, [zt, zk], pl.cast(0, pl.INT32))
+                        pl.write(weights, [zt, zk], pl.cast(0.0, pl.FP32))
     # Gate projection over expert columns.
-    # Fan the matmul over expert columns so each block computes a [GATE_M_TILE,
-    # GATE_N_TILE] slice on its own core; token-tile is the dynamic dim, so it
-    # stays outermost and // % divide by the compile-time GATE_N_BLOCKS.
     GATE_N_BLOCKS = N_EXPERTS // GATE_N_TILE
-    for gb_idx in pl.spmd(active_gate_tiles * GATE_N_BLOCKS, name_hint="gate", allow_early_resolve=True):
+    gate_tiles = active_gate_tiles * GATE_N_BLOCKS
+    gate_workers = pl.min(gate_tiles, pl.system.available_cluster_count())
+    for worker in pl.spmd(gate_workers, name_hint="gate", allow_early_resolve=True):
         pl.set_cache_policy(gate_w, GATE_WEIGHT_CACHE)
-        tg = gb_idx // GATE_N_BLOCKS
-        nb = gb_idx % GATE_N_BLOCKS
-        t1 = tg * GATE_M_TILE
-        n0 = nb * GATE_N_TILE
-        gate_logits_tile = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
-        for kb in pl.pipeline(0, D // GATE_D_TILE, stage=2):
-            gd_kd = kb * GATE_D_TILE
-            gd_x = xg_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
-            gd_w = gate_w[n0 : n0 + GATE_N_TILE, gd_kd : gd_kd + GATE_D_TILE]
-            gate_logits_tile = pl.matmul_acc(gate_logits_tile, gd_x, gd_w, b_trans=True, init_cond=(gd_kd == 0))
-        gate_logits_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gate_logits_tile
+        for gb_idx in pl.range(worker, gate_tiles, gate_workers):
+            tg = gb_idx // GATE_N_BLOCKS
+            nb = gb_idx % GATE_N_BLOCKS
+            t1 = tg * GATE_M_TILE
+            n0 = nb * GATE_N_TILE
+            gate_logits_tile = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
+            for kb in pl.pipeline(0, D // GATE_D_TILE, stage=2):
+                gd_kd = kb * GATE_D_TILE
+                gd_x = xg_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
+                gd_w = gate_w[n0 : n0 + GATE_N_TILE, gd_kd : gd_kd + GATE_D_TILE]
+                gate_logits_tile = pl.matmul_acc(gate_logits_tile, gd_x, gd_w, b_trans=True, init_cond=(gd_kd == 0))
+            gate_logits_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gate_logits_tile
 
     active_route_tiles = (active_tokens + GATE_T_TILE - 1) // GATE_T_TILE
     # PyPTO cannot launch an SPMD task with zero blocks.  The guarded store in

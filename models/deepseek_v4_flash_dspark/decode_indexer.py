@@ -687,6 +687,7 @@ def indexer_score_topk_forest(
     cache_write_tid: pl.Scalar[pl.TASK_ID],
     max_topk_cache_len: pl.Scalar[pl.INDEX],
     stream_score: pl.Scalar[pl.INDEX],
+    DEFER_8K: pl.constexpr,
 ):
     """Score with streamed roots at TP1/S6 long history, otherwise half-leaves."""
     b_dim = pl.tensor.dim(idx_block_table, 0)
@@ -899,7 +900,6 @@ def indexer_score_topk_forest(
             name_hint="indexer_score_topk_leaf",
             deps=[qh_quant_tid, weights_tid, cache_write_tid],
             allow_early_resolve=True,
-            sync_start=True,
             optimizations=[pl.cross_core_slot(slot_num=4)],
         ) as direct_leaf_tid:
             worker = pl.tile.get_block_idx()
@@ -1043,9 +1043,10 @@ def indexer_score_topk_forest(
 
     with pl.scope():
         if max_topk_cache_len <= TOPK_CANDIDATES_PER_LEAF:
-            single_leaf_query_workers = pl.min(TOPK_QUERY_WORKERS, pl.tensor.dim(position_ids, 0))
-            with pl.spmd(single_leaf_query_workers, name_hint="indexer_topk_single_leaf_publish", deps=[score_tid], allow_early_resolve=True):
-                indexer_topk_single_leaf_publish(position_ids, kv_seq_lens, score_arena, topk_scores, topk_idxs)
+            if (max_topk_cache_len > 4096) or (not DEFER_8K):
+                single_leaf_query_workers = pl.min(TOPK_QUERY_WORKERS, pl.tensor.dim(position_ids, 0))
+                with pl.spmd(single_leaf_query_workers, name_hint="indexer_topk_single_leaf_publish", deps=[score_tid], allow_early_resolve=True):
+                    indexer_topk_single_leaf_publish(position_ids, kv_seq_lens, score_arena, topk_scores, topk_idxs)
         elif stream_score > 0:
             with pl.spmd(TOPK_QUERY_WORKERS, name_hint="indexer_topk_query_merge", deps=[score_tid], allow_early_resolve=True):
                 indexer_topk_query_merge(position_ids, kv_seq_lens, pair_arena, topk_scores, topk_idxs, 1)
@@ -1053,7 +1054,7 @@ def indexer_score_topk_forest(
             with pl.spmd(TOPK_QUERY_WORKERS, name_hint="indexer_topk_query_merge", deps=[score_tid], allow_early_resolve=True):
                 indexer_topk_query_merge(position_ids, kv_seq_lens, pair_arena, topk_scores, topk_idxs, 2)
 
-    return topk_scores, topk_idxs, score_tid
+    return topk_scores, topk_idxs, score_tid, score_arena
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1139,14 +1140,12 @@ def indexer_qr_rope(
 
 
 @pl.jit.inline(auto_scope=False)
-def indexer_qr_hadamard_mm(
+def indexer_qr_hadamard_accumulate(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     qr_bf16: pl.Tensor[[T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], pl.BF16],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
-    qr_hadamard_i8: pl.Out[pl.Tensor[[T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], pl.INT8]],
-    qr_hadamard_scale_dq: pl.Out[pl.Tensor[[T_PAD * IDX_N_HEADS, 1], pl.FP32]],
     qh_mm_dep: pl.Scalar[pl.TASK_ID],
-) -> tuple[pl.Scalar[pl.TASK_ID], pl.Scalar[pl.TASK_ID]]:
+):
     """q @ hadamard and its INT8 quant, fenced behind the caller's cube ordering."""
     bs = pl.tensor.dim(x, 0)
     bs_heads = bs * IDX_N_HEADS
@@ -1165,6 +1164,24 @@ def indexer_qr_hadamard_mm(
             o0 = idx * QH_MM_TILE
             qh_acc = pl.matmul(qr_bf16[o0 : o0 + QH_MM_TILE, :], qh_hadamard, out_dtype=pl.FP32)
             qh_acc_gm[o0 : o0 + QH_MM_TILE, :] = qh_acc
+
+    return qh_acc_gm, qh_mm_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def indexer_qr_hadamard_mm(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    qr_bf16: pl.Tensor[[T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], pl.BF16],
+    hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
+    qr_hadamard_i8: pl.Out[pl.Tensor[[T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], pl.INT8]],
+    qr_hadamard_scale_dq: pl.Out[pl.Tensor[[T_PAD * IDX_N_HEADS, 1], pl.FP32]],
+    qh_mm_dep: pl.Scalar[pl.TASK_ID],
+) -> tuple[pl.Scalar[pl.TASK_ID], pl.Scalar[pl.TASK_ID]]:
+    """q @ hadamard and its INT8 quant, fenced behind the caller's cube ordering."""
+    bs = pl.tensor.dim(x, 0)
+    bs_heads = bs * IDX_N_HEADS
+
+    qh_acc_gm, qh_mm_tid = indexer_qr_hadamard_accumulate(x, qr_bf16, hadamard, qh_mm_dep)
 
     qh_quant_units = (bs_heads + QH_QUANT_TILE - 1) // QH_QUANT_TILE
     qh_quant_active_workers = pl.min(QH_QUANT_WORKERS, qh_quant_units)
@@ -1203,60 +1220,16 @@ def indexer_qr_hadamard_mm(
 
 
 @pl.jit.inline(auto_scope=False)
-def indexer_qr_hadamard(
+def indexer_weights_partials(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
-    qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
-    # NOT pl.NZ: the fused row-block/output-tile spmd index makes o_base's
-    # trailing-dim offset a subtraction, which NZ addressability cannot prove
-    # non-negative (mtp's analogue keeps ot as the bare spmd index instead).
-    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
-    sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.FP32],
-    hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
-    qr_hadamard_i8: pl.Out[pl.Tensor[[T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], pl.INT8]],
-    qr_hadamard_scale_dq: pl.Out[pl.Tensor[[T_PAD * IDX_N_HEADS, 1], pl.FP32]],
-):
-    """Query half of the indexer: qr projection, rope, hadamard, and INT8 quant."""
-    qr_bf16 = pl.create_tensor([T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.BF16)
-    idx_qr_mm_tid = indexer_qr_rope(
-        x, qr, qr_scale, wq_b, wq_b_scale, cos, sin, qr_bf16,
-    )
-    qh_mm_tid, qh_quant_tid = indexer_qr_hadamard_mm(
-        x, qr_bf16, hadamard, qr_hadamard_i8, qr_hadamard_scale_dq, idx_qr_mm_tid,
-    )
-    return qh_mm_tid, qh_quant_tid, idx_qr_mm_tid
-
-
-
-@pl.jit.inline(auto_scope=False)
-def indexer_weights_score(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    # NOT pl.NZ: the fused row-block/K-split spmd index makes k_base's
-    # leading-dim offset a subtraction, which NZ addressability cannot prove
-    # non-negative.
     weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
-    qr_hadamard_i8: pl.Tensor[[T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], pl.INT8],
-    qr_hadamard_scale_dq: pl.Tensor[[T_PAD * IDX_N_HEADS, 1], pl.FP32],
-    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
-    idx_block_table: pl.Tensor[[B_DYN, IDX_MAX_BLOCKS], pl.INT32],
-    topk_scores: pl.Out[pl.Tensor[[T_DYN, IDX_TOPK], pl.FP32]],
-    topk_idxs: pl.Out[pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32]],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
-    cache_write_dep: pl.Scalar[pl.TASK_ID],
     weights_gate_dep: pl.Scalar[pl.TASK_ID],
-    qh_quant_tid: pl.Scalar[pl.TASK_ID],
     weights_workers: pl.Scalar[pl.INDEX],
-) -> tuple[pl.Tensor[[T_DYN, IDX_TOPK], pl.FP32], pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32], pl.Scalar[pl.TASK_ID]]:
-    """Weights projection and the score/top-k forest over an already-quantized query."""
+):
     bs = pl.tensor.dim(x, 0)
     row_blocks = (bs + MM_ROW_TILE - 1) // MM_ROW_TILE
 
     x_flat = x
-    weights = pl.create_tensor([T_PAD, IDX_N_HEADS], dtype=pl.FP32)
     weights_partial = pl.create_tensor([WEIGHTS_OK * T_PAD, IDX_N_HEADS], dtype=pl.FP32)
     # Caller-ordered weights projection.
     active_weights_workers = pl.min(weights_workers, WEIGHTS_OK * row_blocks)
@@ -1279,6 +1252,38 @@ def indexer_weights_score(
                 weights_proj_tile = weights_proj[d0 : d0 + D_TILE, :]
                 weights_acc = pl.matmul_acc(weights_acc, x_tile, weights_proj_tile, init_cond=(db == 0))
             weights_partial[kb * T_PAD + w_r0 : kb * T_PAD + w_r0 + MM_ROW_TILE, :] = weights_acc
+
+    return weights_partial
+
+
+@pl.jit.inline(auto_scope=False)
+def indexer_weights_score(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    # NOT pl.NZ: the fused row-block/K-split spmd index makes k_base's
+    # leading-dim offset a subtraction, which NZ addressability cannot prove
+    # non-negative.
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
+    qr_hadamard_i8: pl.Tensor[[T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], pl.INT8],
+    qr_hadamard_scale_dq: pl.Tensor[[T_PAD * IDX_N_HEADS, 1], pl.FP32],
+    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
+    idx_block_table: pl.Tensor[[B_DYN, IDX_MAX_BLOCKS], pl.INT32],
+    topk_scores: pl.Out[pl.Tensor[[T_DYN, IDX_TOPK], pl.FP32]],
+    topk_idxs: pl.Out[pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32]],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
+    cache_write_dep: pl.Scalar[pl.TASK_ID],
+    weights_gate_dep: pl.Scalar[pl.TASK_ID],
+    qh_quant_tid: pl.Scalar[pl.TASK_ID],
+    weights_workers: pl.Scalar[pl.INDEX],
+    DEFER_8K: pl.constexpr,
+):
+    """Weights projection and the score/top-k forest over an already-quantized query."""
+    bs = pl.tensor.dim(x, 0)
+    row_blocks = (bs + MM_ROW_TILE - 1) // MM_ROW_TILE
+
+    weights = pl.create_tensor([T_PAD, IDX_N_HEADS], dtype=pl.FP32)
+    weights_partial = indexer_weights_partials(x, weights_proj, weights_gate_dep, weights_workers)
 
     # Left operand of the Cube head reduction, one MM_ROW_TILE fractal per query
     # pair. Row t holds token t's head weight times its query dequantization
@@ -1372,15 +1377,72 @@ def indexer_weights_score(
                             stream_padding = pl.tile.full([MM_ROW_TILE - STREAM_QUERY_TILE, IDX_N_HEADS * STREAM_QUERY_TILE], dtype=pl.FP16, value=0.0)
                             pl.tile.store(stream_padding, [w_query // STREAM_QUERY_TILE * MM_ROW_TILE + STREAM_QUERY_TILE, 0], stream_coefficient)
 
-    topk_scores, topk_idxs, leaf_tid = indexer_score_topk_forest(
+    topk_scores, topk_idxs, leaf_tid, arena = indexer_score_topk_forest(
         qr_hadamard_i8, qr_hadamard_scale_dq, weights, score_coefficient, stream_coefficient,
         idx_kv_cache, idx_kv_scale, idx_block_table,
         position_ids, kv_seq_lens,
         topk_scores, topk_idxs,
         qh_quant_tid, weights_tid, cache_write_dep,
-        max_topk_cache_len, stream_score,
+        max_topk_cache_len, stream_score, DEFER_8K,
     )
-    return topk_scores, topk_idxs, leaf_tid
+    return topk_scores, topk_idxs, leaf_tid, arena, max_topk_cache_len
+
+
+@pl.jit.inline(auto_scope=False)
+def quant_reduce_pairs(
+    qh_acc_gm: pl.Tensor[[T_DYN * IDX_N_HEADS, IDX_HEAD_DIM], pl.FP32],
+    weights_partial: pl.Tensor[[WEIGHTS_OK * T_PAD, IDX_N_HEADS], pl.FP32],
+    qr_hadamard_i8: pl.Out[pl.Tensor[[T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], pl.INT8]],
+    qr_hadamard_scale_dq: pl.Out[pl.Tensor[[T_PAD * IDX_N_HEADS, 1], pl.FP32]],
+    weights: pl.Out[pl.Tensor[[T_PAD, IDX_N_HEADS], pl.FP32]],
+    score_coefficient: pl.Out[pl.Tensor[[T_PAD // SCORE_QUERY_TILE * MM_ROW_TILE, IDX_N_HEADS * SCORE_QUERY_TILE], pl.FP16]],
+    stream_coefficient: pl.Out[pl.Tensor[[STREAM_COEF_ROWS, IDX_N_HEADS * STREAM_QUERY_TILE], pl.FP16]],
+    bs: pl.Scalar[pl.INDEX],
+    stream_score: pl.Scalar[pl.INDEX],
+    qh_mm_tid: pl.Scalar[pl.TASK_ID],
+):
+    pairs = (bs + SCORE_QUERY_TILE - 1) // SCORE_QUERY_TILE
+    workers = pl.min(QH_QUANT_WORKERS, pairs)
+    with pl.spmd(workers, name_hint="qr_quant_weights_reduce", deps=[qh_mm_tid], allow_early_resolve=True) as fused_tid:
+        for pair in pl.range(pl.tile.get_block_idx(), pairs, workers):
+            first = pair * SCORE_QUERY_TILE
+            if stream_score == 0:
+                zeros = pl.tile.full([MM_ROW_TILE, IDX_N_HEADS * SCORE_QUERY_TILE], dtype=pl.FP16, value=0.0)
+                pl.tile.store(zeros, [pair * MM_ROW_TILE, 0], score_coefficient)
+            for lane in pl.unroll(SCORE_QUERY_TILE):
+                query = first + lane
+                head = query * IDX_N_HEADS
+                vals = pl.load(qh_acc_gm, [head, 0], [IDX_N_HEADS, IDX_HEAD_DIM])
+                max_col = pl.row_max(pl.abs(vals), pl.create_tile([IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.FP32))
+                max_row = pl.reshape(max_col, [1, IDX_N_HEADS])
+                denom = pl.maximum(max_row, INT8_AMAX_EPS)
+                numerator = pl.tile.full([1, IDX_N_HEADS], dtype=pl.FP32, value=INT8_SCALE_MAX)
+                mult = pl.div(numerator, denom)
+                dq = pl.recip(mult)
+                pl.store(pl.reshape(dq, [IDX_N_HEADS, 1]), [head, 0], qr_hadamard_scale_dq)
+                scaled = pl.row_expand_mul(vals, pl.reshape(mult, [IDX_N_HEADS, 1]))
+                rounded = pl.cast(scaled, target_type=pl.INT32, mode="rint")
+                half = pl.cast(rounded, target_type=pl.FP16, mode="round")
+                pl.store(pl.cast(half, target_type=pl.INT8, mode="trunc"), [head, 0], qr_hadamard_i8)
+                w_sum = pl.tile.load(weights_partial, [query, 0], [1, IDX_N_HEADS], target_memory=pl.Mem.Vec)
+                for kb in pl.unroll(1, WEIGHTS_OK):
+                    part = pl.tile.load(weights_partial, [kb * T_PAD + query, 0], [1, IDX_N_HEADS], target_memory=pl.Mem.Vec)
+                    w_sum = pl.tile.add(w_sum, part)
+                w_scaled = pl.tile.muls(w_sum, WEIGHTS_SCALE)
+                coef = pl.tile.cast(pl.tile.muls(pl.tile.mul(dq, w_scaled), SCORE_COEF_SCALE), target_type=pl.FP16, mode="rint")
+                if stream_score == 0:
+                    pl.tile.store(w_scaled, [query, 0], weights)
+                    pl.tile.store(coef, [pair * MM_ROW_TILE + lane, lane * IDX_N_HEADS], score_coefficient)
+                else:
+                    stream_base = query // STREAM_QUERY_TILE * MM_ROW_TILE
+                    stream_lane = query % STREAM_QUERY_TILE
+                    empty = pl.tile.full([1, IDX_N_HEADS * STREAM_QUERY_TILE], dtype=pl.FP16, value=0.0)
+                    pl.tile.store(empty, [stream_base + stream_lane, 0], stream_coefficient)
+                    pl.tile.store(coef, [stream_base + stream_lane, stream_lane * IDX_N_HEADS], stream_coefficient)
+                    if stream_lane == 0:
+                        pad = pl.tile.full([MM_ROW_TILE - STREAM_QUERY_TILE, IDX_N_HEADS * STREAM_QUERY_TILE], dtype=pl.FP16, value=0.0)
+                        pl.tile.store(pad, [stream_base + STREAM_QUERY_TILE, 0], stream_coefficient)
+    return fused_tid
 
 
 @pl.jit.inline
@@ -1409,21 +1471,37 @@ def indexer(
     kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
     late_dep: pl.Scalar[pl.TASK_ID],
     cache_write_dep: pl.Scalar[pl.TASK_ID],
+    DEFER_8K: pl.constexpr,
 ):
     qr_hadamard_i8 = pl.create_tensor([T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
     qr_hadamard_scale_dq = pl.create_tensor([T_PAD * IDX_N_HEADS, 1], dtype=pl.FP32)
-    _qh_mm_tid, qh_quant_tid, _idx_qr_mm_tid = indexer_qr_hadamard(
-        x, qr, qr_scale, wq_b, wq_b_scale, cos, sin, hadamard,
-        qr_hadamard_i8, qr_hadamard_scale_dq,
-    )
+    qr_bf16 = pl.create_tensor([T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.BF16)
+    idx_qr_mm_tid = indexer_qr_rope(x, qr, qr_scale, wq_b, wq_b_scale, cos, sin, qr_bf16)
+    qh_acc_gm, qh_mm_tid = indexer_qr_hadamard_accumulate(x, qr_bf16, hadamard, idx_qr_mm_tid)
     weights_gate_dep = pl.system.task_dummy(deps=[])
-    topk_scores, topk_idxs, _leaf_tid = indexer_weights_score(
-        x, weights_proj, qr_hadamard_i8, qr_hadamard_scale_dq,
-        idx_kv_cache, idx_kv_scale, idx_block_table,
-        topk_scores, topk_idxs, position_ids, kv_seq_lens,
-        cache_write_dep, weights_gate_dep, qh_quant_tid, TP1_WEIGHTS_WORKERS,
+    weights_partial = indexer_weights_partials(x, weights_proj, weights_gate_dep, TP1_WEIGHTS_WORKERS)
+    weights = pl.create_tensor([T_PAD, IDX_N_HEADS], dtype=pl.FP32)
+    score_coefficient = pl.create_tensor(
+        [T_PAD // SCORE_QUERY_TILE * MM_ROW_TILE, IDX_N_HEADS * SCORE_QUERY_TILE],
+        dtype=pl.FP16,
     )
-    return topk_scores, topk_idxs
+    stream_coefficient = pl.create_tensor([STREAM_COEF_ROWS, IDX_N_HEADS * STREAM_QUERY_TILE], dtype=pl.FP16)
+    topk_batch_count = pl.tensor.dim(idx_block_table, 0)
+    max_topk_cache_len = 0
+    for topk_batch in pl.range(topk_batch_count):
+        topk_cache_len = pl.read(kv_seq_lens, [topk_batch]) // COMPRESS_RATIO
+        max_topk_cache_len = pl.max(max_topk_cache_len, topk_cache_len)
+    stream_score = pl.cast(max_topk_cache_len >= 32768, pl.INDEX) * STREAM_ENABLED
+    stream_score = stream_score * pl.cast(topk_batch_count < 64, pl.INDEX)
+    fused_tid = quant_reduce_pairs(qh_acc_gm, weights_partial, qr_hadamard_i8, qr_hadamard_scale_dq,
+                                  weights, score_coefficient, stream_coefficient, pl.tensor.dim(x, 0),
+                                  stream_score, qh_mm_tid)
+    topk_scores, topk_idxs, leaf_tid, arena = indexer_score_topk_forest(
+        qr_hadamard_i8, qr_hadamard_scale_dq, weights, score_coefficient, stream_coefficient,
+        idx_kv_cache, idx_kv_scale, idx_block_table, position_ids, kv_seq_lens,
+        topk_scores, topk_idxs, fused_tid, fused_tid, cache_write_dep, max_topk_cache_len, stream_score, DEFER_8K,
+    )
+    return topk_scores, topk_idxs, leaf_tid, arena, max_topk_cache_len
 
 
 @pl.jit
@@ -1489,13 +1567,14 @@ def indexer_test(
         position_ids, idx_slot_mapping, inner_state_slot_mapping,
         late_dep, late_dep,
     )
-    topk_scores, topk_idxs = indexer(
+    topk_scores, topk_idxs, _leaf, _arena, _cap = indexer(
         x, qr, qr_scale, wq_b, wq_b_scale, weights_proj,
         cos, sin, hadamard,
         idx_kv_cache, idx_kv_scale, idx_block_table,
         topk_scores, topk_idxs,
         position_ids, kv_seq_lens,
         late_dep, cache_write_dep,
+        False,
     )
     return topk_scores, idx_kv_cache, idx_kv_scale, topk_idxs
 

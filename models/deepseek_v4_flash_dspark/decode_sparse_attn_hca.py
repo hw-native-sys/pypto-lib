@@ -332,6 +332,10 @@ def sparse_attn_hca(
             valid_slots_i32 = pl.fillpad(valid_slots_i32, pad_value=pl.PadValue.zero)
             valid_slots_i32 = pl.set_validshape(valid_slots_i32, VALID_TOKEN_TILE, WIN)
             g_sequence_col = pl.tile.arange(0, [1, WIN], dtype=pl.INT32)
+            # Reject a scattered window before the full-contiguity check.
+            if g_bulk_matches == 1:
+                last_slot = pl.read(window_swa_indices, [g_t0, WIN - 1])
+                g_bulk_matches = pl.cast(last_slot == g_bulk_first + WIN - 1, pl.INT32)
             if g_bulk_matches == 1:
                 g_sequence = pl.add(g_sequence_col, g_bulk_first)
                 g_differences = pl.col_expand_sub(valid_slots_i32, g_sequence)
@@ -346,7 +350,7 @@ def sparse_attn_hca(
                 for g_token in pl.unroll(S - 1):
                     g_t = g_t0 + g_token + 1
                     g_len = pl.read(window_swa_lens, [g_t])
-                    g_slot_i32 = pl.read(window_swa_indices, [g_t, g_len - 1])
+                    g_slot_i32 = pl.read(window_swa_indices, [g_t, WIN - 1])
                     g_matches = pl.cast(g_slot_i32 == g_bulk_first + WIN + g_token, pl.INT32)
                     g_bulk_matches = g_bulk_matches * g_matches
                     g_bulk_matches = g_bulk_matches * pl.cast(g_len == WIN, pl.INT32)
@@ -355,49 +359,90 @@ def sparse_attn_hca(
                 g_bulk_rows = ori_kv_flat[g_bulk_src : g_bulk_src + REQUEST_KV_ROWS, 0:HEAD_DIM]
                 raw_kv[g_base : g_base + REQUEST_KV_ROWS, 0:HEAD_DIM] = g_bulk_rows
             else:
-                g_zero_rows = pl.full([REQUEST_KV_ROWS, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                raw_kv[g_base : g_base + REQUEST_KV_ROWS, 0:HEAD_DIM] = g_zero_rows
-                for g_sub in pl.range(WIN // GATHER_RUN_TILE):
-                    g_sr0 = g_sub * GATHER_RUN_TILE
-                    g_sdst = g_base + g_sr0
-                    if g_sr0 + GATHER_RUN_TILE <= g_first_len:
-                        g_first = pl.read(window_swa_indices, [g_t0, g_sr0])
-                        g_run_matches = pl.cast(g_first >= 0, pl.INT32)
-                        for g_dr in pl.unroll(GATHER_RUN_TILE):
-                            g_slot_i32 = pl.read(window_swa_indices, [g_t0, g_sr0 + g_dr])
-                            g_run_matches = g_run_matches * pl.cast(g_slot_i32 == g_first + g_dr, pl.INT32)
-                        if g_run_matches == 1:
-                            g_run_src = pl.cast(g_first, pl.INDEX)
-                            g_run_rows = ori_kv_flat[g_run_src : g_run_src + GATHER_RUN_TILE, 0:HEAD_DIM]
-                            raw_kv[g_sdst : g_sdst + GATHER_RUN_TILE, 0:HEAD_DIM] = g_run_rows
+                # A full sliding window may start partway through a physical page.
+                # Validate every index before issuing one transfer per page fragment.
+                use_pages = pl.cast(g_first_len == WIN and g_bulk_first >= 0, pl.INT32)
+                page_offset = pl.cast(pl.max(g_bulk_first, 0) % BLOCK_SIZE, pl.INDEX)
+                page_count = (page_offset + WIN + BLOCK_SIZE - 1) // BLOCK_SIZE
+                if use_pages == 1:
+                    first_count = pl.min(WIN, BLOCK_SIZE - page_offset)
+                    first_end = pl.read(window_swa_indices, [g_t0, first_count - 1])
+                    next_start = pl.read(window_swa_indices, [g_t0, pl.min(first_count, WIN - 1)])
+                    use_pages = pl.cast(first_end == g_bulk_first + first_count - 1 and (first_count == WIN or (next_start >= 0 and next_start % BLOCK_SIZE == 0)), pl.INT32)
+                if use_pages == 1:
+                    columns = pl.tile.arange(0, [1, BLOCK_SIZE], dtype=pl.INT32)
+                    for page in pl.range(page_count):
+                        begin = pl.max(page * BLOCK_SIZE - page_offset, 0)
+                        end = pl.min((page + 1) * BLOCK_SIZE - page_offset, WIN)
+                        rows = end - begin
+                        first = pl.read(window_swa_indices, [g_t0, begin])
+                        slots = pl.load(window_swa_indices, [g_t0, begin], [1, BLOCK_SIZE], valid_shape=[1, rows])
+                        offsets = pl.sub(pl.set_validshape(slots, 1, BLOCK_SIZE), pl.add(columns, first))
+                        used = pl.fillpad(pl.set_validshape(offsets, 1, rows), pad_value=pl.PadValue.zero)
+                        error = pl.abs(pl.cast(used, pl.FP32))
+                        # The reduction requires an aligned physical row count.
+                        zeros = pl.tile.full([VALID_TOKEN_TILE, BLOCK_SIZE], dtype=pl.FP32, value=0.0)
+                        errors = pl.col_expand_add(zeros, error)
+                        scratch = pl.create_tile([VALID_TOKEN_TILE, BLOCK_SIZE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+                        maximum = pl.row_max(errors, scratch)
+                        if first < 0 or pl.read(maximum, [0, 0]) != 0.0:
+                            use_pages = pl.cast(0, pl.INT32)
+                if use_pages == 1:
+                    for page in pl.range(page_count):
+                        begin = pl.max(page * BLOCK_SIZE - page_offset, 0)
+                        end = pl.min((page + 1) * BLOCK_SIZE - page_offset, WIN)
+                        src_row = pl.cast(pl.read(window_swa_indices, [g_t0, begin]), pl.INDEX)
+                        tile = pl.load(ori_kv_flat, [src_row, 0], [BLOCK_SIZE, HEAD_DIM], valid_shape=[end - begin, HEAD_DIM])
+                        pl.store(tile, [g_base + begin, 0], raw_kv)
+                else:
+                    g_zero_rows = pl.full([REQUEST_KV_ROWS, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                    raw_kv[g_base : g_base + REQUEST_KV_ROWS, 0:HEAD_DIM] = g_zero_rows
+                    for g_sub in pl.range(WIN // GATHER_RUN_TILE):
+                        g_sr0 = g_sub * GATHER_RUN_TILE
+                        g_sdst = g_base + g_sr0
+                        if g_sr0 + GATHER_RUN_TILE <= g_first_len:
+                            g_first = pl.read(window_swa_indices, [g_t0, g_sr0])
+                            g_run_matches = pl.cast(g_first >= 0, pl.INT32)
+                            for g_dr in pl.unroll(GATHER_RUN_TILE):
+                                g_slot_i32 = pl.read(window_swa_indices, [g_t0, g_sr0 + g_dr])
+                                g_run_matches = g_run_matches * pl.cast(g_slot_i32 == g_first + g_dr, pl.INT32)
+                            if g_run_matches == 1:
+                                g_run_src = pl.cast(g_first, pl.INDEX)
+                                g_run_rows = ori_kv_flat[g_run_src : g_run_src + GATHER_RUN_TILE, 0:HEAD_DIM]
+                                raw_kv[g_sdst : g_sdst + GATHER_RUN_TILE, 0:HEAD_DIM] = g_run_rows
+                            else:
+                                for g_dr in pl.range(GATHER_RUN_TILE):
+                                    g_slot_i32 = pl.read(window_swa_indices, [g_t0, g_sr0 + g_dr])
+                                    if g_slot_i32 >= 0:
+                                        g_slot = pl.cast(g_slot_i32, pl.INDEX)
+                                        g_dst = g_sdst + g_dr
+                                        g_slot_row = ori_kv_flat[g_slot : g_slot + 1, 0:HEAD_DIM]
+                                        raw_kv[g_dst : g_dst + 1, 0:HEAD_DIM] = g_slot_row
                         else:
                             for g_dr in pl.range(GATHER_RUN_TILE):
-                                g_slot_i32 = pl.read(window_swa_indices, [g_t0, g_sr0 + g_dr])
-                                if g_slot_i32 >= 0:
-                                    g_slot = pl.cast(g_slot_i32, pl.INDEX)
-                                    g_dst = g_sdst + g_dr
-                                    g_slot_row = ori_kv_flat[g_slot : g_slot + 1, 0:HEAD_DIM]
-                                    raw_kv[g_dst : g_dst + 1, 0:HEAD_DIM] = g_slot_row
-                    else:
-                        for g_dr in pl.range(GATHER_RUN_TILE):
-                            g_row = g_sr0 + g_dr
-                            if g_row < g_first_len:
-                                g_slot_i32 = pl.read(window_swa_indices, [g_t0, g_row])
-                                if g_slot_i32 >= 0:
-                                    g_slot = pl.cast(g_slot_i32, pl.INDEX)
-                                    g_dst = g_base + g_row
-                                    g_slot_row = ori_kv_flat[g_slot : g_slot + 1, 0:HEAD_DIM]
-                                    raw_kv[g_dst : g_dst + 1, 0:HEAD_DIM] = g_slot_row
+                                g_row = g_sr0 + g_dr
+                                if g_row < g_first_len:
+                                    g_slot_i32 = pl.read(window_swa_indices, [g_t0, g_row])
+                                    if g_slot_i32 >= 0:
+                                        g_slot = pl.cast(g_slot_i32, pl.INDEX)
+                                        g_dst = g_base + g_row
+                                        g_slot_row = ori_kv_flat[g_slot : g_slot + 1, 0:HEAD_DIM]
+                                        raw_kv[g_dst : g_dst + 1, 0:HEAD_DIM] = g_slot_row
 
                 for g_token in pl.unroll(S - 1):
                     g_t = g_t0 + g_token + 1
                     g_len = pl.read(window_swa_lens, [g_t])
-                    g_slot_i32 = pl.read(window_swa_indices, [g_t, g_len - 1])
+                    g_slot_i32 = pl.cast(-1, pl.INT32)
+                    if g_len > 0:
+                        g_slot_i32 = pl.read(window_swa_indices, [g_t, g_len - 1])
                     if g_slot_i32 >= 0:
                         g_slot = pl.cast(g_slot_i32, pl.INDEX)
                         g_dst = g_base + g_first_len + g_token
                         g_slot_row = ori_kv_flat[g_slot : g_slot + 1, 0:HEAD_DIM]
                         raw_kv[g_dst : g_dst + 1, 0:HEAD_DIM] = g_slot_row
+                    elif use_pages == 1:
+                        zero_row = pl.tile.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                        pl.store(zero_row, [g_base + g_first_len + g_token, 0], raw_kv)
 
             valid_t0 = g_t0
             valid_col = pl.cast(g_sequence_col, target_type=pl.FP32)
