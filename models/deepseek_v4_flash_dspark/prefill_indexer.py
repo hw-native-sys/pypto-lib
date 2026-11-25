@@ -202,8 +202,15 @@ def _topk_leaf_pairs(
         pairs = pl.tile.mrgsort(pairs, block_len=64)
         pairs = pl.tile.mrgsort(pairs, block_len=256)
         pairs = pl.tile.mrgsort(pairs, block_len=1024)
-        pairs = pl.tile.mrgsort(pairs, block_len=4096)
-        top_pairs = pl.tile.slice(pairs, [1, TOPK_PAIR_WIDTH], [0, 0])
+        # Each sorted run can contribute at most 512 pairs to the final prefix.
+        run_width = 2 * (TOPK_LEAF_TILE // 4)
+        first = pl.tile.slice(pairs, [1, TOPK_PAIR_WIDTH], [0, 0])
+        second = pl.tile.slice(pairs, [1, TOPK_PAIR_WIDTH], [0, run_width])
+        third = pl.tile.slice(pairs, [1, TOPK_PAIR_WIDTH], [0, 2 * run_width])
+        fourth = pl.tile.slice(pairs, [1, TOPK_PAIR_WIDTH], [0, 3 * run_width])
+        merge_tmp = pl.tile.create([1, 4 * TOPK_PAIR_WIDTH], dtype=pl.FP32)
+        merged = pl.tile.mrgsort(first, second, third, fourth, merge_tmp)
+        top_pairs = pl.tile.slice(merged, [1, TOPK_PAIR_WIDTH], [0, 0])
     return top_pairs
 
 

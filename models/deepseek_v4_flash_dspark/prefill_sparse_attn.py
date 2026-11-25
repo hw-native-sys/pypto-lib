@@ -1055,29 +1055,28 @@ def _sparse_attn_wave(
                             gather_indices = pl.set_validshape(gather_indices, 1, PREFILL_ATTN_TILE)
                             gather_rows = _compressed_physical_rows(gather_indices, cmp_block_table, request_id, cmp_block_num)
                             for gather_g0 in pl.range(0, PREFILL_ATTN_TILE, SPARSE_OPT_CMP_GATHER_ROW_TILE):
-                                gather_first = pl.tile.read(gather_indices, [0, gather_g0])
-                                gather_page = gather_first // BLOCK_SIZE
-                                gather_intra = gather_first - gather_page * BLOCK_SIZE
-                                gather_contiguous = gather_first >= 0 and gather_g0 + SPARSE_OPT_CMP_GATHER_ROW_TILE <= gather_cmp_cols
-                                gather_contiguous = gather_contiguous and gather_intra + SPARSE_OPT_CMP_GATHER_ROW_TILE <= BLOCK_SIZE
-                                for gather_ci, (contiguous_iter,) in pl.range(1, SPARSE_OPT_CMP_GATHER_ROW_TILE, init_values=(gather_contiguous,)):
-                                    gather_next = pl.tile.read(gather_indices, [0, gather_g0 + gather_ci])
-                                    gather_matches = contiguous_iter and gather_next == gather_first + gather_ci
-                                    gather_contiguous = pl.yield_(gather_matches)
+                                gather_first = pl.tile.read(gather_rows, [0, gather_g0])
+                                gather_last_offset = SPARSE_OPT_CMP_GATHER_ROW_TILE - 1
+                                gather_last = pl.tile.read(gather_rows, [0, gather_g0 + gather_last_offset])
+                                gather_endpoints_match = gather_first >= 0 and gather_last == gather_first + gather_last_offset
+                                if gather_endpoints_match:
+                                    for gather_ci, (contiguous_iter,) in pl.range(1, gather_last_offset, init_values=(gather_endpoints_match,)):
+                                        gather_next = pl.tile.read(gather_rows, [0, gather_g0 + gather_ci])
+                                        gather_matches = contiguous_iter and gather_next == gather_first + gather_ci
+                                        gather_interior_match = pl.yield_(gather_matches)
+                                    gather_contiguous = pl.yield_(gather_interior_match)
+                                else:
+                                    gather_contiguous = pl.yield_(gather_endpoints_match)
                                 if gather_contiguous:
-                                    mapped_row = pl.tile.read(gather_rows, [0, gather_g0])
-                                    if mapped_row >= 0:
-                                        src = pl.cast(mapped_row, pl.INDEX)
-                                        stage = pl.tile.gather_row(stage, cmp_kv_flat, [gather_g0, 0], [src, 0], [SPARSE_OPT_CMP_GATHER_ROW_TILE, HEAD_DIM])
+                                    src = pl.cast(gather_first, pl.INDEX)
+                                    stage = pl.tile.gather_row(stage, cmp_kv_flat, [gather_g0, 0], [src, 0], [SPARSE_OPT_CMP_GATHER_ROW_TILE, HEAD_DIM])
                                 else:
                                     for gather_ci in pl.range(SPARSE_OPT_CMP_GATHER_ROW_TILE):
                                         gather_ki = gather_g0 + gather_ci
-                                        gather_cmp_k = gather_cmp_offset + gather_ki
-                                        if gather_cmp_k < IDX_TOPK:
-                                            mapped_row = pl.tile.read(gather_rows, [0, gather_ki])
-                                            if mapped_row >= 0:
-                                                src = pl.cast(mapped_row, pl.INDEX)
-                                                stage = pl.tile.gather_row(stage, cmp_kv_flat, [gather_ki, 0], [src, 0], [1, HEAD_DIM])
+                                        mapped_row = pl.tile.read(gather_rows, [0, gather_ki])
+                                        if mapped_row >= 0:
+                                            src = pl.cast(mapped_row, pl.INDEX)
+                                            stage = pl.tile.gather_row(stage, cmp_kv_flat, [gather_ki, 0], [src, 0], [1, HEAD_DIM])
                         pl.store(stage, [block_base, 0], sparse_cmp_kv)
 
     # Pipeline K blocks and keep the online-softmax state local to each query.
