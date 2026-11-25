@@ -138,8 +138,10 @@ def _gdn_chunk_h_final(
 
             for state_aiv in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
                 sr0 = state_aiv * STATE_TILE
-                s16 = pl.cast(s_cur, target_type=pl.FP16, mode="rint")
-                s16 = pl.mul(s16, keep)
+                # The reset scales before the cast: a scalar multiply widens its
+                # tensor to the scalar's FP32, which the cube refuses against FP16 W.
+                s_keep = pl.mul(s_cur, keep)
+                s16 = pl.cast(s_keep, target_type=pl.FP16, mode="rint")
                 state[row + sr0 : row + sr0 + STATE_TILE, 0:D] = s16   # state ENTERING this chunk
                 s16_full = pl.aic_gather(s16)                          # the cube needs both halves
             wc = w_flat[t0 : t0 + CHUNK_TILE, d0 : d0 + D]
