@@ -661,18 +661,22 @@ def prefill_fwd(
                 else:
                     q_window_indices[stage_index, row:row + 1, :] = pl.full([1, 128], dtype=pl.INT32, value=-1)
         rope_slot = stage_index + 1
-        gather_rows(rope_cos[rope_slot], q_rows[stage_index], q_rope_cos[rope_slot], rows_ready, column_tile=32)
-        gather_rows(rope_sin[rope_slot], q_rows[stage_index], q_rope_sin[rope_slot], rows_ready, column_tile=32)
+        gather_rows(
+            rope_cos[rope_slot], q_rows[stage_index], q_rope_cos[rope_slot], rows_ready, column_tile=32, refresh_row_ids=False,
+        )
+        gather_rows(
+            rope_sin[rope_slot], q_rows[stage_index], q_rope_sin[rope_slot], rows_ready, column_tile=32, refresh_row_ids=False,
+        )
         if stage_index == 0:
-            gather_rows(rope_cos[0], q_rows[0], q_rope_cos[0], rows_ready, column_tile=32)
-            gather_rows(rope_sin[0], q_rows[0], q_rope_sin[0], rows_ready, column_tile=32)
+            gather_rows(rope_cos[0], q_rows[0], q_rope_cos[0], rows_ready, column_tile=32, refresh_row_ids=False)
+            gather_rows(rope_sin[0], q_rows[0], q_rope_sin[0], rows_ready, column_tile=32, refresh_row_ids=False)
     hidden_pair = pl.create_tensor([4 * CAPACITY, HC_MULT, D], dtype=pl.FP32)
     pre_pair = pl.create_tensor([4 * CAPACITY, HC_MULT], dtype=pl.FP32)
     initial_hidden = pl.slice(hidden_pair, [CAPACITY, HC_MULT, D], [0, 0, 0])
     initial_mix = pl.slice(pre_pair, [CAPACITY, HC_MULT], [0, 0])
     gather_ready = pl.system.task_dummy(deps=[])
     pack_x_hc(embedding_ids, embedding, initial_hidden, hidden_tile=D)
-    gather_rows(initial_pre, identity_rows, initial_mix, gather_ready, column_tile=512)
+    gather_rows(initial_pre, identity_rows, initial_mix, gather_ready, column_tile=512, refresh_row_ids=False)
     topk_indices = pl.create_tensor([LOCAL_CAPACITY, INDEX_TOPK], dtype=pl.INT32)
     history_positions = pl.tensor.dim(compressed_cache, 1) * 128
     pool_blocks = pl.min(INDEX_POOL_BLOCKS, (history_positions // 8 + 31) // 32 * 32)
@@ -764,12 +768,18 @@ def prefill_fwd(
         source_bias = pl.slice(correction_bias, [bias_length], [layer * bias_length])
         stage_gate_bias = pl.create_tensor([bias_length], dtype=pl.FP32)
         if stage == 0:
-            gather_routing_bias(source_bias, identity_rows, stage_gate_bias, moe_ready, n_experts=N_EXPERTS)
+            gather_routing_bias(
+                source_bias, identity_rows, stage_gate_bias, moe_ready, n_experts=N_EXPERTS, refresh_row_ids=False,
+            )
         else:
-            gather_routing_bias(source_bias, replay_rows, stage_gate_bias, moe_ready, n_experts=N_EXPERTS)
+            gather_routing_bias(
+                source_bias, replay_rows, stage_gate_bias, moe_ready, n_experts=N_EXPERTS, refresh_row_ids=False,
+            )
         local_bias_rows = pl.min(bias_rows, LOCAL_CAPACITY)
         layer_gate_bias = pl.create_tensor([local_bias_rows * N_EXPERTS], dtype=pl.FP32)
-        gather_routing_bias(stage_gate_bias, q_rows[stage], layer_gate_bias, moe_ready, n_experts=N_EXPERTS)
+        gather_routing_bias(
+            stage_gate_bias, q_rows[stage], layer_gate_bias, moe_ready, n_experts=N_EXPERTS, refresh_row_ids=False,
+        )
         layer_routed_w1: pl.Tensor[[LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w1, [LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
         layer_routed_w1_scale: pl.Tensor[[LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w1_scale, [LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [layer * (LOCAL_EXPERTS * (D // MX_GROUP)), 0])
         layer_routed_w2: pl.Tensor[[LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w2, [LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
@@ -794,8 +804,12 @@ def prefill_fwd(
                 )
                 gathered_hidden = pl.reshape(hidden, [CAPACITY, HC_DIM])
                 source_hidden = pl.reshape(encoder_hidden, [CAPACITY, HC_DIM])
-                gather_rows(source_hidden, replay_rows, gathered_hidden, publisher_ready, column_tile=D)
-                gather_rows(encoder_pre, replay_rows, delayed_pre, publisher_ready, column_tile=512)
+                gather_rows(
+                    source_hidden, replay_rows, gathered_hidden, publisher_ready, column_tile=D, refresh_row_ids=False,
+                )
+                gather_rows(
+                    encoder_pre, replay_rows, delayed_pre, publisher_ready, column_tile=512, refresh_row_ids=False,
+                )
         if layer == 1 or layer == 14:
             with pl.scope():
                 engram_slot = layer // 14
@@ -809,8 +823,8 @@ def prefill_fwd(
             normalized = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
             global_hc = pl.reshape(hidden, [CAPACITY, HC_DIM])
             local_hc = pl.reshape(local_hidden, [LOCAL_CAPACITY, HC_DIM])
-            gather_rows(global_hc, q_rows[stage], local_hc, moe_ready, column_tile=D)
-            gather_rows(delayed_pre, q_rows[stage], local_pre, moe_ready, column_tile=16)
+            gather_rows(global_hc, q_rows[stage], local_hc, moe_ready, column_tile=D, refresh_row_ids=False)
+            gather_rows(delayed_pre, q_rows[stage], local_pre, moe_ready, column_tile=16, refresh_row_ids=False)
             mode = 0
             cache_slot = 0
             rope_slot = 0
@@ -910,8 +924,8 @@ def prefill_fwd(
     final_pre = pl.slice(pre_pair, [CAPACITY, HC_MULT], [FINAL_SLOT, 0])
     source_hidden = pl.reshape(final_hidden, [CAPACITY, HC_DIM])
     output_hidden = pl.reshape(x_hc_out, [CAPACITY, HC_DIM])
-    gather_rows(source_hidden, identity_rows, output_hidden, gather_ready, column_tile=D)
-    gather_rows(final_pre, identity_rows, pre_mix_out, gather_ready, column_tile=512)
+    gather_rows(source_hidden, identity_rows, output_hidden, gather_ready, column_tile=D, refresh_row_ids=False)
+    gather_rows(final_pre, identity_rows, pre_mix_out, gather_ready, column_tile=512, refresh_row_ids=False)
     if CP_SIZE > 1:
         retire_prefill_signals(x_hc_out, attention_arrived, rank // CP_SIZE * CP_SIZE, rank % CP_SIZE, group_size=CP_SIZE)
         retire_prefill_signals(x_hc_out, hc_arrived, rank // CP_SIZE * CP_SIZE, rank % CP_SIZE, group_size=CP_SIZE)
