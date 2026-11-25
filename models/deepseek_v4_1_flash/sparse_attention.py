@@ -4351,62 +4351,63 @@ def _sparse_swa_vector(
             ring_slot = (ring_slot + 1) % SPARSE_VF_SWA_KV_LANE_ROWS
         else:
             ring_slot = pl.cast(0, pl.INDEX)
-            for chunk_id in pl.unroll(WINDOW_KEYS // (2 * SPARSE_VF_GATHER_TILE)):
-                start = chunk_id * SPARSE_VF_GATHER_TILE
+            # Gather and decode the entire 64-row AIV lane in one stage.
+            for chunk_id in pl.unroll(WINDOW_KEYS // (2 * SPARSE_VF_SWA_KV_LANE_ROWS)):
+                start = chunk_id * SPARSE_VF_SWA_KV_LANE_ROWS
                 # The static local slice needs no further global index load.
-                gather_ids = pl.tile.slice(current_ids, [1, SPARSE_VF_GATHER_TILE], [0, start])
-                gather_ids_flat = pl.tile.reshape(gather_ids, [SPARSE_VF_GATHER_TILE])
+                gather_ids = pl.tile.slice(current_ids, [1, SPARSE_VF_SWA_KV_LANE_ROWS], [0, start])
+                gather_ids_flat = pl.tile.reshape(gather_ids, [SPARSE_VF_SWA_KV_LANE_ROWS])
                 first = pl.tile.read(gather_ids, [0, 0])
-                first_rows = pl.cast(pl.min(SPARSE_VF_GATHER_TILE, WINDOW_KEYS - first % WINDOW_KEYS), pl.INT32)
-                second = pl.tile.read(gather_ids, [0, pl.min(first_rows, SPARSE_VF_GATHER_TILE - 1)])
+                first_rows = pl.cast(pl.min(SPARSE_VF_SWA_KV_LANE_ROWS, WINDOW_KEYS - first % WINDOW_KEYS), pl.INT32)
+                second = pl.tile.read(gather_ids, [0, pl.min(first_rows, SPARSE_VF_SWA_KV_LANE_ROWS - 1)])
                 mismatch_count = pl.tile.create([1, 8], dtype=pl.INT32, target_memory=pl.Mem.Vec)
                 count_flat = pl.tile.reshape(mismatch_count, [8])
                 with pl.reg_scope():
-                    lanes = pl.reg.full_mask(lanes=SPARSE_VF_GATHER_TILE)
-                    actual = pl.reg.load(gather_ids_flat, 0, lanes=SPARSE_VF_GATHER_TILE)
-                    positions = pl.reg.index_gen(0, lanes=SPARSE_VF_GATHER_TILE, dtype=pl.INT32)
+                    lanes = pl.reg.full_mask(lanes=SPARSE_VF_SWA_KV_LANE_ROWS)
+                    actual = pl.reg.load(gather_ids_flat, 0, lanes=SPARSE_VF_SWA_KV_LANE_ROWS)
+                    positions = pl.reg.index_gen(0, lanes=SPARSE_VF_SWA_KV_LANE_ROWS, dtype=pl.INT32)
                     first_run = pl.reg.compares(positions, first_rows, lanes, predicate="lt")
-                    expected_first = pl.reg.index_gen(first, lanes=SPARSE_VF_GATHER_TILE, dtype=pl.INT32)
-                    expected_second = pl.reg.index_gen(second - first_rows, lanes=SPARSE_VF_GATHER_TILE, dtype=pl.INT32)
+                    expected_first = pl.reg.index_gen(first, lanes=SPARSE_VF_SWA_KV_LANE_ROWS, dtype=pl.INT32)
+                    expected_second = pl.reg.index_gen(second - first_rows, lanes=SPARSE_VF_SWA_KV_LANE_ROWS, dtype=pl.INT32)
                     expected = pl.reg.select(first_run, expected_first, expected_second)
                     valid = pl.reg.compares(actual, 0, lanes, predicate="ge")
                     matches = pl.reg.compare(actual, expected, valid, predicate="eq")
-                    zeros = pl.reg.broadcast(0, lanes=SPARSE_VF_GATHER_TILE, dtype=pl.INT32)
-                    ones = pl.reg.broadcast(1, lanes=SPARSE_VF_GATHER_TILE, dtype=pl.INT32)
+                    zeros = pl.reg.broadcast(0, lanes=SPARSE_VF_SWA_KV_LANE_ROWS, dtype=pl.INT32)
+                    ones = pl.reg.broadcast(1, lanes=SPARSE_VF_SWA_KV_LANE_ROWS, dtype=pl.INT32)
                     mismatches = pl.reg.select(matches, zeros, ones)
                     # Valid contiguous page runs score 0, other valid rows 1, and masked rows 2.
-                    twos = pl.reg.broadcast(2, lanes=SPARSE_VF_GATHER_TILE, dtype=pl.INT32)
+                    twos = pl.reg.broadcast(2, lanes=SPARSE_VF_SWA_KV_LANE_ROWS, dtype=pl.INT32)
                     gather_costs = pl.reg.select(valid, mismatches, twos)
                     count = pl.reg.reduce_sum(gather_costs, lanes)
                     _write_count = pl.reg.store(count_flat, 0, count)
                 classification = pl.tile.read(mismatch_count, [0, 0])
-                if classification == 2 * SPARSE_VF_GATHER_TILE:
+                if classification == 2 * SPARSE_VF_SWA_KV_LANE_ROWS:
                     with pl.reg_scope():
                         zero_kv = pl.reg.broadcast(0.0, lanes=SPARSE_VF_REG_TILE, dtype=pl.BF16)
                         for fractal in pl.hardware_loop(HEAD_DIM // 16):
                             panel_offset = (fractal * SPARSE_VF_SWA_KV_LANE_ROWS + start) * 16
-                            for zero_chunk in pl.hardware_loop(SPARSE_VF_GATHER_TILE * 16 // SPARSE_VF_REG_TILE):
+                            for zero_chunk in pl.hardware_loop(SPARSE_VF_SWA_KV_LANE_ROWS * 16 // SPARSE_VF_REG_TILE):
                                 zero_destination = panel_offset + zero_chunk * SPARSE_VF_REG_TILE
                                 _write_zero = pl.reg.store(kv_flat, zero_destination, zero_kv)
                 else:
-                    raw = pl.tile.create([SPARSE_VF_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, target_memory=pl.Mem.Vec)
+                    raw = pl.tile.create([SPARSE_VF_SWA_KV_LANE_ROWS, WINDOW_CACHE_BYTES], dtype=pl.UINT8, target_memory=pl.Mem.Vec)
                     if classification == 0:
                         first_row = pl.cast(first, pl.INDEX)
                         raw = pl.tile.gather_row(
-                            raw, window, [0, 0], [first_row, 0], [SPARSE_VF_GATHER_TILE, WINDOW_CACHE_BYTES],
+                            raw, window, [0, 0], [first_row, 0], [SPARSE_VF_SWA_KV_LANE_ROWS, WINDOW_CACHE_BYTES],
                             valid_shape=[first_rows, WINDOW_CACHE_BYTES],
                         )
-                        if first_rows < SPARSE_VF_GATHER_TILE:
+                        if first_rows < SPARSE_VF_SWA_KV_LANE_ROWS:
                             second_row = pl.cast(second, pl.INDEX)
-                            second_rows = SPARSE_VF_GATHER_TILE - first_rows
+                            second_rows = SPARSE_VF_SWA_KV_LANE_ROWS - first_rows
                             tail_offset = pl.cast(first_rows, pl.INDEX)
                             raw = pl.tile.gather_row(
-                                raw, window, [tail_offset, 0], [second_row, 0], [SPARSE_VF_GATHER_TILE, WINDOW_CACHE_BYTES],
+                                raw, window, [tail_offset, 0], [second_row, 0], [SPARSE_VF_SWA_KV_LANE_ROWS, WINDOW_CACHE_BYTES],
                                 valid_shape=[second_rows, WINDOW_CACHE_BYTES],
                             )
                     else:
-                        raw = pl.tile.full([SPARSE_VF_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
-                        for key in pl.range(0, SPARSE_VF_GATHER_TILE, 2):
+                        raw = pl.tile.full([SPARSE_VF_SWA_KV_LANE_ROWS, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                        for key in pl.range(0, SPARSE_VF_SWA_KV_LANE_ROWS, 2):
                             first_id = pl.tile.read(gather_ids, [0, key])
                             second_id = pl.tile.read(gather_ids, [0, key + 1])
                             first_valid = first_id >= 0
@@ -4419,7 +4420,7 @@ def _sparse_swa_vector(
                                     raw = pl.tile.gather_row(raw, window, [key, 0], [first_row, 0], [1, WINDOW_CACHE_BYTES])
                                 if second_id >= 0:
                                     raw = pl.tile.gather_row(raw, window, [key + 1, 0], [second_row, 0], [1, WINDOW_CACHE_BYTES])
-                    kv_flat = _decode_swa_rows(raw, kv_flat, start, SPARSE_VF_GATHER_TILE)
+                    kv_flat = _decode_swa_rows(raw, kv_flat, start, SPARSE_VF_SWA_KV_LANE_ROWS)
         pl.system.tpush_to_aic(kv_nz, split=1, id=0)
         # Send the next KV before consuming the previous score. Publish its
         # weights before draining the older PV, while retaining both norms.
