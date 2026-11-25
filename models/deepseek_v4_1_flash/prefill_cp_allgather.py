@@ -11,7 +11,7 @@
 import pypto.language as pl
 import pypto.language.distributed as pld
 
-from config import PREFILL_MAX_TOKENS, FLASH as M, LOCAL_T_DYN, T_DYN
+from config import CP_SIZE, PREFILL_MAX_TOKENS, FLASH as M, LOCAL_T_DYN, T_DYN
 
 
 # Model config.
@@ -140,7 +140,7 @@ def prefill_cp_gather_hc(
     hidden: pl.Tensor,
     pre_mix: pl.Tensor,
     window: pld.DistributedTensor,
-    arrived: pld.DistributedTensor,
+    arrived: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     cp_rank: pl.Scalar[pl.INT32],
     epoch: pl.Scalar[pl.INT32],

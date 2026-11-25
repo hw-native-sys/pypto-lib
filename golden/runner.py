@@ -17,11 +17,11 @@ import os
 import re
 import statistics
 import time
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import torch
 
@@ -38,6 +38,7 @@ class RunResult:
     execution_time: float | None = None
     work_dir: Path | None = None
     bench: Any = None  # BenchmarkStats when PYPTO_BENCH timed the run; None otherwise
+    tensors: dict[str, torch.Tensor] | None = None  # host buffers when return_tensors=True
 
     def __str__(self) -> str:
         time_str = f" ({self.execution_time:.2f}s)" if self.execution_time is not None else ""
@@ -1198,16 +1199,19 @@ def _run_l3_resident(
     atol: float,
     compare_fn: dict[str, Callable],
     benchmark_enabled: bool | None = None,
+    window_sources: Mapping[str, Sequence[BinaryIO | torch.Tensor]] | None = None,
+    persistent: bool = False,
+    reset_persistent_windows: bool | None = None,
 ) -> Any:
     """Dispatch an L3 program keeping resident weights device-resident.
 
     Routes through :meth:`DistributedCompiledProgram.prepare` — the only path
-    that can build worker-resident :class:`~pypto.runtime.DeviceTensor` buffers.
-    Each resident input / ``InOut`` spec is uploaded once via
-    ``rt.alloc_tensor(init=...)`` and reused across the validation dispatch and
-    every benchmark round; a pure ``Out`` resident is allocated uninitialized.
-    Resident outputs are read back once before golden validation via
-    :func:`_readback_resident_outputs`.
+    that can build worker-resident :class:`~pypto.runtime.DeviceTensor` buffers
+    or bind named Host-window sources. Each resident input / ``InOut`` spec is
+    uploaded once via ``rt.alloc_tensor(init=...)`` and reused across the
+    validation dispatch and every benchmark round; a pure ``Out`` resident is
+    allocated uninitialized. Resident outputs are read back once before golden
+    validation via :func:`_readback_resident_outputs`.
 
     When *benchmark_enabled* is true (default: :func:`_bench_enabled`), the
     resident weights are reused for :func:`_bench_loop_sizes` timed rounds.
@@ -1231,8 +1235,8 @@ def _run_l3_resident(
         ) from e
     if not isinstance(compiled, DistributedCompiledProgram):
         raise ValueError(
-            "resident is only supported for L3 distributed programs "
-            "(a @pl.jit.host kernel compiled with distributed_config)."
+            "resident specs and window_sources are only supported for L3 distributed "
+            "programs (a @pl.jit.host kernel compiled with distributed_config)."
         )
 
     # Per-call IO + resident upload sources must be shared memory before prepare().
@@ -1264,14 +1268,19 @@ def _run_l3_resident(
         every launch and are always released — even if *dispatch_fn* raises.
         """
         # Benchmarks model serving's steady-state dispatch: retain CommDomains
-        # across rounds and let kernels clear their own signal windows. Keep the
-        # ordinary validation path one-shot.
+        # across rounds and let kernels clear their own signal windows. The
+        # ordinary validation path stays one-shot unless the caller asks for
+        # retained domains or repeated dispatches.
+        prepare_kwargs: dict[str, Any] = {}
         if bench:
-            prepared = compiled.prepare(
-                run_config,
-                persistent=True,
-                reset_persistent_windows=False,
-            )
+            prepare_kwargs.update(persistent=True, reset_persistent_windows=False)
+        elif persistent:
+            prepare_kwargs.update(persistent=True, reset_persistent_windows=reset_persistent_windows)
+        if window_sources is not None:
+            prepare_kwargs["window_sources"] = window_sources
+        if prepare_kwargs:
+            # Prewarm the runtime arena with the same ring sizing the dispatch uses.
+            prepared = compiled.prepare(run_config, **prepare_kwargs)
         else:
             prepared = compiled.prepare()
         with prepared as rt:
@@ -1585,6 +1594,10 @@ def _run_pipeline(
     runtime_dir: str | None,
     save_data: bool,
     a5_default_runtime: str | None,
+    window_sources: Mapping[str, Sequence[BinaryIO | torch.Tensor]] | None = None,
+    persistent: bool = False,
+    reset_persistent_windows: bool | None = None,
+    return_tensors: bool = False,
 ) -> RunResult:
     """Compile / run / validate body behind :func:`run`.
 
@@ -1709,18 +1722,26 @@ def _run_pipeline(
         print(f"[RUN] PASS ({total:.2f}s{skip_note})", flush=True)
         return RunResult(
             passed=True, execution_time=total, work_dir=work_dir, bench=bench,
+            tensors=tensors if return_tensors else None,
         )
 
-    # Resident-weight path: keep resident specs device-resident across the
-    # validation dispatch and any benchmark rounds via the L3 prepare() worker
-    # (validation + benchmark are handled inside; return early).
-    if any(s.is_resident for s in tensor_specs):
+    # Prepared-worker path: keep resident specs device-resident and bind any
+    # named Host windows before dispatch, across the correctness dispatches and
+    # any benchmark rounds (validation + benchmark are handled inside; return
+    # early). A Host-window entry needs the prepared worker even with no
+    # resident specs because the one-shot dispatch cannot bind window sources.
+    if any(s.is_resident for s in tensor_specs) or window_sources is not None:
+        if window_sources is not None and not _is_l3(compiled):
+            return _fail("window_sources require an L3 distributed program")
         with _Stage("runtime"):
             try:
                 bench = _run_l3_resident(
                     compiled, specs, tensors, scalar_specs_eff,
                     cfg, golden_outputs, rtol, atol, compare_fn,
                     benchmark_enabled=benchmark_enabled,
+                    window_sources=window_sources,
+                    persistent=persistent,
+                    reset_persistent_windows=reset_persistent_windows,
                 )
             except (AssertionError, ValueError) as e:
                 return _fail(str(e))
@@ -1840,6 +1861,10 @@ def run(
     runtime_dir: str | None = None,
     save_data: bool = False,
     a5_default_runtime: str | None = None,
+    window_sources: Mapping[str, Sequence[BinaryIO | torch.Tensor]] | None = None,
+    persistent: bool = False,
+    reset_persistent_windows: bool | None = None,
+    return_tensors: bool = False,
 ) -> RunResult:
     """Compile *fn*, run it on device, and validate against golden.
 
@@ -1892,6 +1917,22 @@ def run(
             Defaults to False, skipping the on-disk ``.pt`` snapshot;
             validation still runs against the in-memory golden. Enable it
             when you need to replay the exact inputs/outputs later.
+        window_sources: Named Host windows mapped to per-domain-rank binary
+            files or contiguous CPU tensors, bound when the prepared L3 worker
+            creates each Host domain. Requires an L3 program and routes the run
+            through ``DistributedCompiledProgram.prepare()`` even without
+            resident specs. The caller owns the sources' lifetime; keep them
+            open for the duration of this call.
+        persistent: Retain the prepared worker's CommDomains across dispatches
+            (``prepare(persistent=True)``). Requires an artifact built by a
+            PyPTO version that supports the domain-provider hook.
+        reset_persistent_windows: Restore retained communication windows to zero
+            before every reuse. ``None`` keeps the runtime default; pass
+            ``False`` only when the kernels clear all reused window state
+            themselves.
+        return_tensors: Include the host input/output buffers in
+            :attr:`RunResult.tensors` so callers can run their own post-checks
+            (e.g. finite-output smoke checks) without a golden.
 
     Returns:
         :class:`RunResult`.
@@ -1916,4 +1957,8 @@ def run(
             runtime_dir=runtime_dir,
             save_data=save_data,
             a5_default_runtime=a5_default_runtime,
+            window_sources=window_sources,
+            persistent=persistent,
+            reset_persistent_windows=reset_persistent_windows,
+            return_tensors=return_tensors,
         )

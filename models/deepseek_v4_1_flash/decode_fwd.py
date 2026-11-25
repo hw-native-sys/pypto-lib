@@ -44,7 +44,11 @@ from decode_c2a_reuse import decode_c2a_reuse
 from decode_swa import decode_swa
 from input_pack import prepare_compressed_lens
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
-from engram import ENGRAM_K, KV_OUT, engram_from_rows
+from engram import ENGRAM_K, FETCH_TILE, KV_OUT, N_HASH_COLS, engram_from_rows, engram_host_lookup
+from utils import (
+    ENGRAM_ROWS, ENGRAM_SHARD_ROWS, ENGRAM_LOOKUPS_DYN, EngramPayloadSource,
+    write_forward_engram_layout,
+)
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
 from mega_moe import FP4_PANEL_ROWS, forward_routed_weight_spec, use_packed_decode_weights, workspace_bytes
 from decode_moe import (
@@ -118,8 +122,8 @@ def capture_dspark_target_hidden(
     target_column: pl.Scalar[pl.INDEX],
 ):
     """Register the residual as InOut so the next layer waits for this snapshot."""
-    token = pl.tile.get_block_idx()
-    if token < active_rows:
+    block = pl.tile.get_block_idx()
+    for token in pl.range(block, pl.min(active_rows, MOE_TOKENS), 64):
         hc_row = x_hc[token : token + 1, 0:HC_MULT, 0:D]
         hc_mean = pl.mul(pl.col_sum(pl.reshape(hc_row, [HC_MULT, D])), 1.0 / HC_MULT)
         target_hidden[token : token + 1, target_column : target_column + D] = pl.cast(hc_mean, pl.BF16, mode="rint")
@@ -663,14 +667,16 @@ def decode_decoder(
             target_column = (target_layer - DSPARK_TARGET_LAYER_IDS[0]) * D
             (x_hc, dspark_target_hidden), _capture_tid = pl.spmd_submit(
                 capture_dspark_target_hidden, x_hc, dspark_target_hidden, local_moe_tokens,
-                target_column, core_num=MOE_TOKENS,
+                target_column, core_num=pl.min(MOE_TOKENS, 64),
             )
     return x_hc
 
 
 @pl.jit.inline(auto_scope=False)
 def decode_fwd(
-    engram_lookup: pl.Tensor[[2, T_DYN, ENGRAM_K], pl.BF16],
+    engram_ids: pl.Tensor[[2 * T_DYN * N_HASH_COLS, 1], pl.INT32],
+    engram_scales: pl.Tensor[[2 * ENGRAM_ROWS, 8], pl.UINT8],
+    engram_payload: pld.DistributedTensor[[2 * ENGRAM_SHARD_ROWS, 256], pl.UINT8],
     engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
     engram_wkv_scale: pl.Tensor[[2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
     engram_weight: pl.Tensor[[2, HC_MULT, D], pl.FP32],
@@ -746,6 +752,16 @@ def decode_fwd(
     shared_w3_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
 ):
     """Run the decode backbone and retain final HC state in the input buffers."""
+    engram_ids.bind_dynamic(0, ENGRAM_LOOKUPS_DYN)
+    lookup_count = pl.tensor.dim(engram_ids, 0)
+    lookup_flat = pl.create_tensor([lookup_count, 256], dtype=pl.BF16)
+    engram_first = pl.create_tensor([FETCH_TILE, 256], dtype=pl.UINT8)
+    engram_second = pl.create_tensor([FETCH_TILE, 256], dtype=pl.UINT8)
+    lookup_flat = engram_host_lookup(
+        engram_ids, engram_payload, engram_first, engram_second, engram_scales, lookup_flat,
+        ENGRAM_SHARD_ROWS,
+    )
+    engram_lookup = pl.reshape(lookup_flat, [2, pl.tensor.dim(x_hc, 0), ENGRAM_K])
     compressed_token_rope_cos = pl.create_tensor([DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
     compressed_token_rope_sin = pl.create_tensor([DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
     encoder_hidden, encoder_pre_mix, token_cos, token_sin = decode_encoder(
@@ -814,10 +830,11 @@ def decode_fwd(
     )
     return result, encoder_pre_mix
 
-
 @pl.jit(auto_scope=False)
 def l2_decode_fwd(
-    engram_lookup: pl.Tensor[[2, T_DYN, ENGRAM_K], pl.BF16],
+    engram_ids: pl.Tensor[[2 * T_DYN * N_HASH_COLS, 1], pl.INT32],
+    engram_scales: pl.Tensor[[2 * ENGRAM_ROWS, 8], pl.UINT8],
+    engram_payload: pld.DistributedTensor[[2 * ENGRAM_SHARD_ROWS, 256], pl.UINT8],
     engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
     engram_wkv_scale: pl.Tensor[[2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
     engram_weight: pl.Tensor[[2, HC_MULT, D], pl.FP32],
@@ -846,9 +863,7 @@ def l2_decode_fwd(
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     index_cache_pool: pl.InOut[pl.Tensor[[FWD_INDEX_BLOCKS_DYN, COMPRESSED_POOL_UNIT_ROWS, 1, INDEX_DIM // 2], pl.UINT8]],
-    index_cache_scale_pool: pl.InOut[
-        pl.Tensor[[FWD_INDEX_BLOCKS_DYN, COMPRESSED_POOL_UNIT_ROWS, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
-    ],
+    index_cache_scale_pool: pl.InOut[pl.Tensor[[FWD_INDEX_BLOCKS_DYN, COMPRESSED_POOL_UNIT_ROWS, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
     c2a_index_block_table: pl.Tensor[[B_DYN, FWD_C2A_TABLE_DYN], pl.INT32],
     c1a_index_block_table: pl.Tensor[[B_DYN, FWD_C1A_TABLE_DYN], pl.INT32],
     c2a_compressor_wkv: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.BF16, pl.NZ],
@@ -892,29 +907,20 @@ def l2_decode_fwd(
     shared_w2_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
     shared_w3_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
 ):
-    result, final_pre_mix = decode_fwd(
-        engram_lookup, engram_wkv, engram_wkv_scale, engram_weight,
+    result, encoder_pre_mix = decode_fwd(
+        engram_ids, engram_scales, engram_payload, engram_wkv, engram_wkv_scale, engram_weight,
         x_hc, pre_mix, dspark_target_hidden,
-        hc_attn_fn, hc_attn_scale, hc_attn_base,
-        attn_norm_weight,
-        wq_a, q_norm_weight, wq_b,
-        wkv, kv_norm_weight,
-        attn_sink,
+        hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,
+        wq_a, q_norm_weight, wq_b, wkv, kv_norm_weight, attn_sink,
         wo_a, wo_a_scale, wo_b,
-        freqs_cos, freqs_sin,
-        window_slots, window_indices,
-        window_cache_pool,
-        compressed_cache_pool,
-        token_to_req_indices, position_ids,
-        index_cache_pool, index_cache_scale_pool,
-        c2a_index_block_table, c1a_index_block_table,
+        freqs_cos, freqs_sin, window_slots, window_indices,
+        window_cache_pool, compressed_cache_pool, token_to_req_indices, position_ids,
+        index_cache_pool, index_cache_scale_pool, c2a_index_block_table, c1a_index_block_table,
         c2a_compressor_wkv, c2a_compressor_wgate, c1a_compressor_wkv,
-        query_start_loc, state_block_table, state_cache_pool,
-        compressor_norm_weight,
+        query_start_loc, state_block_table, state_cache_pool, compressor_norm_weight,
         c2a_compressed_slots, c1a_compressed_slots,
         index_wk, index_norm_weight, index_wq_b, index_weights_proj,
-        hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        ffn_norm_weight,
+        hc_ffn_fn, hc_ffn_scale, hc_ffn_base, ffn_norm_weight,
         gate_weight, correction_bias,
         routed_w1, routed_w2, routed_w3,
         shared_w1, shared_w2, shared_w3,
@@ -924,12 +930,13 @@ def l2_decode_fwd(
         routed_w1_scale, routed_w2_scale, routed_w3_scale,
         shared_w1_scale, shared_w2_scale, shared_w3_scale,
     )
-    return result, final_pre_mix
+    return result, encoder_pre_mix
 
 
 @pl.jit.host
 def l3_decode_fwd(
-    engram_lookup: pl.Tensor[[EP_SIZE, 2, T_DYN, ENGRAM_K], pl.BF16],
+    engram_ids: pl.Tensor[[EP_SIZE, 2 * T_DYN * N_HASH_COLS, 1], pl.INT32],
+    engram_scales: pl.Tensor[[EP_SIZE, 2 * ENGRAM_ROWS, 8], pl.UINT8],
     engram_wkv: pl.Tensor[[EP_SIZE, 2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
     engram_wkv_scale: pl.Tensor[[EP_SIZE, 2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
     engram_weight: pl.Tensor[[EP_SIZE, 2, HC_MULT, D], pl.FP32],
@@ -1067,7 +1074,7 @@ def l3_decode_fwd(
     commit lengths before the next call. Completed forwards clear MoE signals;
     use persistent=True with reset_persistent_windows=False for serialized calls.
     Reset a reused request slot in all C2A sources after its users complete. Restore or reset mutated state before retrying failed
-    calls. Engram consumes host lookup rows; vision and DSpark require no inputs here.
+    calls. Engram fetches FP8 Host payloads using Device-resident scales; vision and DSpark require no inputs here.
     """
     x_hc.bind_dynamic(1, T_DYN)
     pre_mix.bind_dynamic(1, T_DYN)
@@ -1086,11 +1093,15 @@ def l3_decode_fwd(
     position_ids.bind_dynamic(1, T_DYN)
     freqs_cos.bind_dynamic(2, ROPE_ROWS_DYN)
     freqs_sin.bind_dynamic(2, ROPE_ROWS_DYN)
+    engram_ids.bind_dynamic(1, ENGRAM_LOOKUPS_DYN)
+    engram_payload_buffer = pld.alloc_window_buffer([2 * ENGRAM_SHARD_ROWS, 256], dtype=pl.UINT8, memory_source="host", init="engram_payload")
     moe_workspace_buffer = pld.alloc_window_buffer([MOE_WORKSPACE_BYTES], dtype=pl.UINT8)
     for rank in pl.range(pld.world_size()):
+        engram_payload = pld.window(engram_payload_buffer, [2 * ENGRAM_SHARD_ROWS, 256], dtype=pl.UINT8)
         moe_workspace = pld.window(moe_workspace_buffer, [MOE_WORKSPACE_BYTES], dtype=pl.UINT8)
         l2_decode_fwd(
-            engram_lookup[rank], engram_wkv[rank], engram_wkv_scale[rank], engram_weight[rank],
+            engram_ids[rank], engram_scales[rank], engram_payload,
+            engram_wkv[rank], engram_wkv_scale[rank], engram_weight[rank],
             x_hc[rank], pre_mix[rank], dspark_target_hidden[rank],
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_weight[rank],
@@ -1199,8 +1210,15 @@ def build_tensor_specs():
         annotation = signature.parameters[name].annotation
         shape = [_fixture_extent(dim) for dim in annotation.shape]
         dtype = _torch_dtype(annotation.dtype)
+        if name == "engram_ids":
+            shape = [EP_SIZE, 2 * MOE_TOKENS * N_HASH_COLS, 1]
         init_value = None
-        if name == "token_to_req_indices":
+        if name == "engram_ids":
+            init_value = torch.full(shape, -1, dtype=dtype)
+            init_value[:, :2 * N_HASH_COLS, 0] = 0
+        elif name == "engram_scales":
+            init_value = 127
+        elif name == "token_to_req_indices":
             init_value = request_ids.repeat(EP_SIZE, 1)
         elif name == "position_ids":
             init_value = position_ids.repeat(EP_SIZE, 1)
@@ -1228,6 +1246,8 @@ def build_tensor_specs():
 
 
 if __name__ == "__main__":
+    from contextlib import ExitStack
+
     from golden import run
     from pypto.ir import DistributedConfig
 
@@ -1243,6 +1263,7 @@ if __name__ == "__main__":
     parser.add_argument("--balanced-routing", action="store_true")
     parser.add_argument("--packed-routed-weights", action=argparse.BooleanOptionalAction, default=False, help="pack resident routed FP4 weights before upload")
     parser.add_argument("--runtime-dir", default=None)
+    parser.add_argument("--engram-table-rows", type=int, default=ENGRAM_ROWS)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--dump-passes", action="store_true")
     parser.add_argument("--enable-scope-stats", action="store_true")
@@ -1283,14 +1304,30 @@ if __name__ == "__main__":
             if spec.name in ("routed_w1", "routed_w2", "routed_w3") and spec.init_value is None:
                 spec.init_value = partial(zero_routed_bank, tuple(spec.shape), spec.dtype)
 
-    result = run(
-        a5_default_runtime="host_build_graph",
-        fn=l3_decode_fwd,
-        specs=specs,
-        config=config,
-        golden_fn=None,
-        compile_only=args.compile_only,
-        runtime_dir=args.runtime_dir,
-    )
+    with ExitStack() as sources:
+        result = run(
+            a5_default_runtime="host_build_graph",
+            fn=l3_decode_fwd,
+            specs=specs,
+            config=config,
+            golden_fn=None,
+            compile_only=args.compile_only,
+            runtime_dir=args.runtime_dir,
+            # The prepared worker binds the Host window source before dispatch.
+            window_sources=None if args.compile_only else {"engram_payload": [
+                sources.enter_context(EngramPayloadSource([(None, 0, 2 * ENGRAM_SHARD_ROWS * 256)]))
+                for _ in devices
+            ]},
+            persistent=True,
+            reset_persistent_windows=False,
+            return_tensors=True,
+        )
+    if result.passed:
+        write_forward_engram_layout(result.work_dir)
+    if result.passed and not args.compile_only:
+        for name in ("x_hc", "pre_mix", "dspark_target_hidden"):
+            if not torch.isfinite(result.tensors[name]).all():
+                raise RuntimeError(f"decode backbone output {name} contains non-finite values")
+        print("[FWD] Execution and backbone output checks passed; numerical accuracy was not validated.", flush=True)
     if not result.passed:
         raise SystemExit(result.error or 1)

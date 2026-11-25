@@ -2732,6 +2732,43 @@ __simd_vf__ inline void topk_pad_index_sort(__ubuf__ int32_t* tail, uint32_t val
     asc_storealign(tail, index, asc_update_mask_b32(group));
 }
 
+// The selected physical indices are distinct. Mark their positions in the released
+// selection scratch, then emit them in ascending order directly into the index buffer.
+__simd_vf__ inline void topk_compact_sorted_indices(__ubuf__ int32_t* selected, uint32_t topk,
+                                                   uint32_t valid_len) {
+    constexpr uint32_t kLanes = 64;
+    auto* flags = reinterpret_cast<__ubuf__ uint32_t*>(0);
+    const auto full = pset_b32(PAT_ALL);
+    vector_uint32_t zero, one, indices, flag;
+    vdup(zero, 0u, full, MODE_ZEROING);
+    vdup(one, 1u, full, MODE_ZEROING);
+    const uint16_t flag_chunks = ceil_div(valid_len, kLanes);
+    mem_bar(VLD_VST);
+    for (uint16_t chunk = 0; chunk < flag_chunks; ++chunk) {
+        vsts(zero, flags, chunk * kLanes, NORM_B32, full);
+    }
+    mem_bar(VST_VST);
+    mem_bar(VST_VLD);
+    for (uint16_t chunk = 0; chunk < ceil_div(topk, kLanes); ++chunk) {
+        uint32_t remaining = topk - chunk * kLanes;
+        const auto active = plt_b32(remaining, POST_UPDATE);
+        vlds(indices, reinterpret_cast<__ubuf__ uint32_t*>(selected), chunk * kLanes, NORM);
+        vscatter(one, flags, indices, active);
+    }
+    mem_bar(VST_VLD);
+    vector_store_unalign state;
+    vector_int32_t positions, packed;
+    asc_squeeze_and_storeunalign_init();
+    for (uint16_t chunk = 0; chunk < flag_chunks; ++chunk) {
+        vector_bool present;
+        vlds(flag, flags, chunk * kLanes, NORM);
+        vcmp_eq(present, flag, one, full);
+        asc_arange(positions, static_cast<int32_t>(chunk * kLanes));
+        asc_squeeze_and_storeunalign(selected, packed, state, positions, present);
+    }
+    asc_squeeze_and_storeunalign_finalize(selected, state);
+}
+
 template <typename Config, bool kSortedIndex, typename value_t,
           typename output_idx_t, typename OutputStore = TopkOutputStore>
 __aicore__ inline void topk_select_run(uint32_t valid_len, uint32_t topk, __gm__ value_t* row_in,
@@ -2924,7 +2961,10 @@ __aicore__ inline void topk_select_run(uint32_t valid_len, uint32_t topk, __gm__
         topk, min(valid_len, topk), restore_index, output_idx_offset);
 
     if constexpr (kSortedIndex) {
-        if (sort_index) {
+        if (sort_index && !return_value && output_idx_offset == 0 && kTopkCapacity >= 2048 &&
+            aligned(valid_len, 64u) <= kInputOffset / sizeof(uint32_t)) {
+            topk_compact_sorted_indices(output_index, topk, valid_len);
+        } else if (sort_index) {
             LocalTensor<int32_t> source_index_tensor(TPosition::VECCALC, kInputOffset,
                                                      kTopkCapacity);
             LocalTensor<int32_t> sorted_index_tensor(TPosition::VECCALC, kSortedIndexOffset,

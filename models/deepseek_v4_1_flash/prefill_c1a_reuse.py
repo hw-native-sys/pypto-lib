@@ -111,54 +111,40 @@ def prefill_c1a_reuse(
             kv_write_slots, window_cache,
             kv_token_count,
         )
-        chunk_rope_cos = pl.create_tensor([Q_TILE, ROPE_DIM // 2], dtype=pl.FP32)
-        chunk_rope_sin = pl.create_tensor([Q_TILE, ROPE_DIM // 2], dtype=pl.FP32)
-        chunk_window_indices = pl.create_tensor([Q_TILE, 128], dtype=pl.INT32)
-        chunk_compressed_indices = pl.create_tensor([Q_TILE, INDEX_TOPK], dtype=pl.INT32)
-        q_latent = pl.create_tensor([Q_TILE, Q_LORA], dtype=pl.BF16)
-        q = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-
-        chunk_done = pl.system.task_invalid()
-        for start in pl.range(0, kv_token_count, Q_TILE):
-            active = pl.min(Q_TILE, kv_token_count - start)
-            # The prior chunk must finish reading every reusable scratch buffer.
-            with pl.spmd(WORKER_TILE, name_hint="prefill_c1a_reuse_stage", deps=[chunk_done]):
-                worker = pl.tile.get_block_idx()
-                for row in pl.range(worker, active, WORKER_TILE):
-                    source_row = start + row
-                    chunk_rope_cos[row:row + 1, :] = kv_rope_cos[source_row:source_row + 1, :]
-                    chunk_rope_sin[row:row + 1, :] = kv_rope_sin[source_row:source_row + 1, :]
-                    chunk_window_indices[row:row + 1, :] = q_window_indices[source_row:source_row + 1, :]
-                    chunk_compressed_indices[row:row + 1, :] = q_compressed_indices[source_row:source_row + 1, :]
-            q_input_payload_padded_rows = ((active + 255) // 256) * 256
-            q_input_end = start + q_input_payload_padded_rows
-            q_input_payload = kv_input_payload[start:q_input_end, :]
-            q_scale_start = start * (D // 32)
-            q_scale_end = q_input_end * (D // 32)
-            q_input_scales = kv_input_scales[:, q_scale_start:q_scale_end]
-            q_proj_rope(
-                q_input_payload, q_input_scales,
-                wq_a, wq_a_scale, wq_norm,
-                wq_b, wq_b_scale,
-                chunk_rope_cos, chunk_rope_sin,
-                q_latent, q,
-                active, qa_worker_limit=24, qb_worker_limit=32,
-                padded_rows=q_input_payload_padded_rows,
-                qa_row_tile=256, qb_row_tile=128,
-            )
-            attn_out = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        active = kv_token_count
+        padded_query_rows = (active + 255) // 256 * 256
+        active_rope_cos = pl.slice(kv_rope_cos, [active, ROPE_DIM // 2], [0, 0])
+        active_rope_sin = pl.slice(kv_rope_sin, [active, ROPE_DIM // 2], [0, 0])
+        active_window_indices = pl.slice(q_window_indices, [active, 128], [0, 0])
+        active_compressed_indices = pl.slice(q_compressed_indices, [active, INDEX_TOPK], [0, 0])
+        q_latent = pl.create_tensor([padded_query_rows, Q_LORA], dtype=pl.BF16)
+        q = pl.create_tensor([padded_query_rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        q_input_payload = pl.slice(kv_input_payload, [padded_query_rows, D], [0, 0])
+        q_input_scales = pl.slice(kv_input_scales, [1, padded_query_rows * (D // 32)], [0, 0])
+        q_proj_rope(
+            q_input_payload, q_input_scales,
+            wq_a, wq_a_scale, wq_norm,
+            wq_b, wq_b_scale,
+            active_rope_cos, active_rope_sin,
+            q_latent, q,
+            active, qa_worker_limit=24, qb_worker_limit=32,
+            padded_rows=padded_query_rows,
+            qa_row_tile=256, qb_row_tile=128,
+        )
+        # Keep the full query and attention output in separate scope-depth rings.
+        with pl.scope():
+            attn_out = pl.create_tensor([padded_query_rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
             gather_sparse_attention(
-                q, chunk_window_indices, window_cache, chunk_compressed_indices, compressed_cache,
+                q, active_window_indices, window_cache, active_compressed_indices, compressed_cache,
                 attn_sink, attn_out, active, compressed_keys=INDEX_TOPK,
             )
-            _chunk_output, projection_done = o_proj_hc_post(
-                attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_rope_cos, chunk_rope_sin,
-                hc_input[start:start + active, :, :], post_mix[start:start + active, :],
-                residual_mix[start:start + active, :, :], hc_output[start:start + active, :, :], active,
+            _output, _output_ready = o_proj_hc_post(
+                attn_out, wo_a, wo_a_scale, wo_b, wo_b_scale, active_rope_cos, active_rope_sin,
+                hc_input[0:active, :, :], post_mix[0:active, :],
+                residual_mix[0:active, :, :], hc_output[0:active, :, :], active,
                 oa_row_tile=128, ob_row_tile=128,
             )
 
-            chunk_done = projection_done
     if kv_token_count < q_capacity:
         with pl.spmd(32, name_hint="prefill_c1a_reuse_zero_padding"):
             worker = pl.tile.get_block_idx()
@@ -620,7 +606,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=lambda value: [int(part) for part in value.split(",")], help="comma-separated device IDs")
     parser.add_argument("--cp", type=int, default=CP_SIZE, choices=SUPPORTED_CP_SIZES)
     parser.add_argument("--dp", type=int, default=1, choices=[1, 2, 4, 8])
-    parser.add_argument("--tokens", type=int, default=128)
+    parser.add_argument("--tokens", type=int, default=Q_TILE + 1)
     parser.add_argument("--dp-tokens", type=lambda value: [int(part) for part in value.split(",")], help="active token counts per DP group")
     parser.add_argument("--requests", type=int, default=1, help="request count per DP when query-lens is omitted")
     parser.add_argument("--query-lens", type=parse_prefill_groups, help="request lengths, e.g. '17,15;32'")
