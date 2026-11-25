@@ -1294,7 +1294,7 @@ def prefill_moe_dispatch(
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="prefill_moe_dispatch_count_exchange",
-        deps=[count_tid, forward_slot_tid],
+        deps=[prefix_tid, forward_slot_tid],
     ) as count_publish_tid:
         forward_rank = forward_slot * N_RANKS + my_rank
         for dest in pl.range(N_RANKS):
