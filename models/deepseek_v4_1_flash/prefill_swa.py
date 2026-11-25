@@ -559,7 +559,6 @@ def l3_prefill_swa_cp(
 def build_swa_specs(args, entry):
     """Build independent DP request batches and optional single-request CP shards."""
     import math
-    import os
 
     import torch
     from golden import ScalarSpec, TensorSpec
@@ -717,10 +716,9 @@ def build_swa_specs(args, entry):
         TensorSpec("window_cache", [ranks, pages, 128, 1, WINDOW_CACHE_BYTES], torch.uint8),
         TensorSpec("kv_restore_indices", [ranks, tokens], torch.int32),
     ]
-    host_count = CP_SIZE == 1 and os.environ.get("PYPTO_LIB_A5_RUNTIME") == "host_build_graph"
     for spec in specs:
         # Host-built CP1 orchestration reads the per-rank active length before dispatch.
-        spec.resident = None if host_count and spec.name == "kv_token_count" else "stacked"
+        spec.resident = None if CP_SIZE == 1 and spec.name == "kv_token_count" else "stacked"
         spec.init_value = lambda name=spec.name: initialize(name)
     specs += [
         ScalarSpec("attention_epoch", torch.int32, 1, compile_runtime=True, benchmark_step=None),
@@ -844,6 +842,7 @@ if __name__ == "__main__":
     torch.set_num_threads(8)
     entry = l3_prefill_swa if CP_SIZE == 1 else l3_prefill_swa_cp
     result = run(
+        a5_default_runtime="host_build_graph",
         fn=entry,
         specs=build_swa_specs(args, entry),
         golden_fn=golden_swa,

@@ -1574,6 +1574,7 @@ if __name__ == "__main__":
     for active, padded in cases:
         print(f"[O_PROJ] active={active}, padded={padded}, FP32 HC post", flush=True)
         result = run(
+            a5_default_runtime="host_build_graph",
             fn=o_proj_hc_post_validation,
             specs=build_o_proj_hc_post_specs(active, pad_to_tile=padded),
             golden_fn=golden_o_proj_hc_post_validation,

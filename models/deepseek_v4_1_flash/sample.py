@@ -781,6 +781,7 @@ if __name__ == "__main__":
     if args.top_p is not None and not 0.0 < args.top_p <= 1.0:
         parser.error(f"--top-p must be in (0, 1], got {args.top_p}; 1.0 disables nucleus filtering")
     result = run(
+        a5_default_runtime="host_build_graph",
         fn=sample_test,
         specs=build_tensor_specs(args.temperature, args.top_k, args.top_p, dspark_fixture=args.dspark_fixture),
         golden_fn=golden_sample,

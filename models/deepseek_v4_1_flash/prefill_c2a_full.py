@@ -1284,7 +1284,9 @@ def build_c2a_specs(args, entry, *, mode="full"):
     ]
     outputs = {"kv_hidden", "hc_output", "hc_next_pre_mix", "q_topk_indices"}
     for spec in specs:
-        spec.resident = "stacked"
+        # L2 reads these counts on the host before launching its kernels.
+        if spec.name not in {"q_token_count", "kv_token_count"}:
+            spec.resident = "stacked"
         if spec.name not in outputs:
             spec.init_value = lambda name=spec.name: initialize(name)
     specs.append(ScalarSpec("attention_epoch", torch.int32, 1, compile_runtime=True, benchmark_step=None))
@@ -1332,6 +1334,7 @@ if __name__ == "__main__":
     torch.set_num_threads(8)
     entry = l3_prefill_c2a_full if CP_SIZE == 1 else l3_prefill_c2a_full_cp
     run_kwargs = dict(
+        a5_default_runtime="host_build_graph",
         fn=entry,
         golden_fn=functools.partial(golden_c2a_prefill, mode="full"),
         compile_only=args.compile_only,

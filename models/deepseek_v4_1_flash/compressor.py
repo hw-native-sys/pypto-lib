@@ -1117,6 +1117,7 @@ if __name__ == "__main__":
         specs = build_c1a_compressor_specs()
         valid_rows = next(int(spec.value) for spec in specs if spec.name == "num_tokens")
         result = run(
+            a5_default_runtime="host_build_graph",
             fn=c1a_compressor_test,
             specs=specs,
             golden_fn=golden_c1a_compressor_test,
@@ -1131,6 +1132,7 @@ if __name__ == "__main__":
     if args.case in ("c2a", "all"):
         print("[compressor] c2a", flush=True)
         result = run(
+            a5_default_runtime="host_build_graph",
             fn=c2a_compressor_test,
             specs=build_c2a_state_feedback_specs(args.start_position),
             golden_fn=partial(golden_c2a_state_feedback, start_position=args.start_position, accepted=args.accepted),

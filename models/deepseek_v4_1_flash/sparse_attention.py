@@ -4330,6 +4330,7 @@ if __name__ == "__main__":
             result = run(
                 l2_gather_sparse_attention,
                 specs,
+                a5_default_runtime="host_build_graph",
                 golden_fn=lambda tensors: tensors["output"][:active].copy_(golden_gather_sparse_attention(
                     tensors["query"][query_rows], tensors["window_indices"][query_rows], tensors["window"],
                     tensors["compressed_indices"][query_rows], tensors["compressed"], tensors["sink"],

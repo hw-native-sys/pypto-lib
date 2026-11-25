@@ -845,6 +845,7 @@ if __name__ == "__main__":
         parser.error(f"--num-tokens must be between 0 and {MAX_LOGIT_ROWS}")
 
     result = run(
+        a5_default_runtime="host_build_graph",
         fn=l3_lm_head,
         specs=build_tensor_specs(args.num_tokens),
         golden_fn=golden_lm_head,

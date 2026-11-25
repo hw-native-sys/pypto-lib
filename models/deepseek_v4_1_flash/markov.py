@@ -596,6 +596,7 @@ if __name__ == "__main__":
     if (args.lm_head_tp, args.dp, args.ep) != (LM_HEAD_TP_SIZE, DP_SIZE, EP_SIZE):
         parser.error("--lm-head-tp/--dp/--ep must match the import-time configuration")
     result = run(
+        a5_default_runtime="host_build_graph",
         fn=markov_sample_test,
         specs=build_tensor_specs(),
         golden_fn=golden_markov_sample_test,

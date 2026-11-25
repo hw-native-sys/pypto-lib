@@ -860,6 +860,7 @@ def run_context_kv_case(*, device_id: int = 0, compile_only: bool = False, execu
     ]
     compare = {"window_cache": _compare_context_cache}
     result = run(
+        a5_default_runtime="host_build_graph",
         fn=dspark_context_kv_test,
         specs=specs,
         golden_fn=golden,
@@ -893,6 +894,7 @@ if __name__ == "__main__":
     from golden import mapped_pool_ratio_allclose, ratio_allclose, run
 
     result = run(
+        a5_default_runtime="host_build_graph",
         fn=l2_dspark_attn,
         specs=build_attention_specs(),
         golden_fn=golden_dspark_attn,

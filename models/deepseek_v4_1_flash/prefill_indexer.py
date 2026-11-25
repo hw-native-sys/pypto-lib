@@ -70,6 +70,7 @@ CANDIDATE_SCORE_TILE = 1024
 CANDIDATE_LEAF_TILE = 8192
 CANDIDATE_SHORT_LEAF_TILE = 2048
 CANDIDATE_MAX_LEAVES = (M.max_position_embeddings // CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_LEAF_TILE + 1
+C1A_ALL_FIT, C1A_PAGED_PAIRED, C1A_PAGED_SINGLE, C1A_POOL_PAIRED, C1A_POOL_SINGLE, C1A_NATIVE = range(6)
 INDEX_SCORE_POSITIONS_DYN = pl.dynamic("INDEX_SCORE_POSITIONS_DYN")
 
 
@@ -661,6 +662,8 @@ def _prefill_index_scores(
     skip_short: pl.constexpr,
     head_rows: pl.constexpr,
     part_rows: pl.constexpr,
+    route: pl.Tensor[[1], pl.INT32],
+    required_mode: pl.constexpr,
 ):
     """Score paged or compact-pool MX index keys."""
     groups = pl.cast((num_tokens + query_tile - 1) // query_tile, pl.INDEX)
@@ -671,7 +674,11 @@ def _prefill_index_scores(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_index_plan", deps=[ready]) as plan_tid:
         total = pl.cast(0, pl.INDEX)
         pl.write(prefix, [0], pl.cast(total, pl.INT32))
-        for group in pl.range(groups):
+        active_groups = groups
+        if required_mode != 0:
+            if pl.read(route, [0]) != required_mode:
+                active_groups = pl.cast(0, pl.INDEX)
+        for group in pl.range(active_groups):
             visible = pl.cast(0, pl.INDEX)
             for row in pl.unroll(query_tile):
                 token = group * query_tile + row
@@ -689,7 +696,11 @@ def _prefill_index_scores(
     output_panels = (width + 127) // 128
     with pl.spmd(32, name_hint="prefill_index_score_clear", deps=[ready]) as clear_tid:
         worker = pl.tile.get_block_idx()
-        for work in pl.range(worker, num_tokens * output_panels, 32):
+        active_tokens = num_tokens
+        if required_mode != 0:
+            if pl.read(route, [0]) != required_mode:
+                active_tokens = pl.cast(0, pl.INT32)
+        for work in pl.range(worker, active_tokens * output_panels, 32):
             token = work // output_panels
             begin = (work % output_panels) * 128
             clear_value = pl.reinterpret_view(pl.tile.full([1, 128], dtype=pl.INT32, value=-8388608), pl.FP32)
@@ -710,7 +721,11 @@ def _prefill_index_scores(
     with pl.spmd(8, name_hint="prefill_index_cache_decode", deps=[ready]) as decoded_tid:
         decode_worker = pl.tile.get_block_idx()
         decode_lut = fp4_e4m3_lut()
-        for decode_row in pl.range(decode_worker * 64, cache_rows, 8 * 64):
+        active_cache_rows = cache_rows
+        if required_mode != 0:
+            if pl.read(route, [0]) != required_mode:
+                active_cache_rows = pl.cast(0, pl.INDEX)
+        for decode_row in pl.range(decode_worker * 64, active_cache_rows, 8 * 64):
             decode_packed = pl.load(packed_flat, [decode_row, 0], [64, INDEX_DIM // 2])
             decode_signed = pl.reinterpret_view(decode_packed, pl.INT8)
             decode_bytes = pl.ands(pl.cast(decode_signed, pl.INT16), 255)
@@ -736,7 +751,12 @@ def _prefill_index_scores(
     with pl.spmd(workers, name_hint="prefill_index_mx_scores", deps=[plan_tid, clear_tid, decoded_tid],
                  optimizations=[pl.cross_core_slot(slot_num=2)]) as score_tid:
         worker = pl.tile.get_block_idx()
-        work_items = pl.cast(pl.read(prefix, [groups]), pl.INDEX)
+        work_items = pl.cast(0, pl.INDEX)
+        if required_mode == 0:
+            work_items = pl.cast(pl.read(prefix, [groups]), pl.INDEX)
+        else:
+            if pl.read(route, [0]) == required_mode:
+                work_items = pl.cast(pl.read(prefix, [groups]), pl.INDEX)
         for work in pl.range(worker, work_items, workers):
             lower = pl.cast(0, pl.INDEX)
             upper = groups
@@ -938,6 +958,7 @@ def _select_short_c1a_topk(
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
+    route: pl.Tensor[[1], pl.INT32],
     bf16_scores: pl.constexpr = False,
 ):
     """Sort one score tile per row, breaking BF16 ties by logical position."""
@@ -948,7 +969,14 @@ def _select_short_c1a_topk(
         lanes = pl.tile.arange(0, [1, 1024], dtype=pl.INT32)
         tie = pl.sub(pl.tile.full([1, 1024], dtype=pl.INT32, value=1023), lanes)
         empty = pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
-        for row in pl.range(worker, num_tokens, workers):
+        active_tokens = num_tokens
+        mode = pl.read(route, [0])
+        if bf16_scores:
+            if mode != C1A_NATIVE:
+                active_tokens = pl.cast(0, pl.INT32)
+        elif mode == C1A_NATIVE:
+            active_tokens = pl.cast(0, pl.INT32)
+        for row in pl.range(worker, active_tokens, workers):
             request = pl.read(requests, [row])
             if request >= 0 and request < pl.tensor.dim(table, 0):
                 length = pl.min(width, pl.max(0, pl.read(lengths, [row])))
@@ -1007,6 +1035,7 @@ def _select_c1a_topk(
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
+    route: pl.Tensor[[1], pl.INT32],
     pool: pl.constexpr,
 ):
     """Select stable C1A Top-K physical rows."""
@@ -1018,7 +1047,10 @@ def _select_c1a_topk(
     arena = pl.create_tensor([arena_rows, TOPK_PAIR_WIDTH], dtype=pl.FP32)
     with pl.spmd(64, name_hint="prefill_index_topk_groups", deps=[ready]) as group_tid:
         worker = pl.tile.get_block_idx()
-        for token in pl.range(worker, num_tokens, 64):
+        active_tokens = num_tokens
+        if pl.read(route, [0]) == C1A_ALL_FIT or pl.read(route, [0]) == C1A_NATIVE:
+            active_tokens = pl.cast(0, pl.INT32)
+        for token in pl.range(worker, active_tokens, 64):
             visible = pl.min(pl.max(pl.read(lengths, [token]), 0), width)
             if pool:
                 visible = pl.min(pl.max(pl.read(pool_counts, [token]), 0) * 8, width)
@@ -1042,7 +1074,10 @@ def _select_c1a_topk(
                     _merge_topk_pairs(arena, scratch, scratch + 1, root)
     with pl.spmd(64, name_hint="prefill_index_topk_merge", deps=[group_tid]) as selected:
         worker = pl.tile.get_block_idx()
-        for token in pl.range(worker, num_tokens, 64):
+        active_tokens = num_tokens
+        if pl.read(route, [0]) == C1A_ALL_FIT or pl.read(route, [0]) == C1A_NATIVE:
+            active_tokens = pl.cast(0, pl.INT32)
+        for token in pl.range(worker, active_tokens, 64):
             visible = pl.min(pl.max(pl.read(lengths, [token]), 0), width)
             if pool:
                 visible = pl.min(pl.max(pl.read(pool_counts, [token]), 0) * 8, width)
@@ -1333,13 +1368,17 @@ def _select_all_pool_rows(
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
+    route: pl.Tensor[[1], pl.INT32],
 ):
     """Map a sorted candidate pool directly when every valid key fits the output."""
     workers = pl.min(64, num_tokens)
     with pl.spmd(workers, name_hint="prefill_c1a_all_pool_rows", deps=[ready]) as selected:
         worker = pl.tile.get_block_idx()
         offsets = pl.tile.arange(0, [1, CANDIDATE_BLOCK_SIZE], dtype=pl.INT32)
-        for token in pl.range(worker, num_tokens, workers):
+        active_tokens = num_tokens
+        if pl.read(route, [0]) != C1A_ALL_FIT:
+            active_tokens = pl.cast(0, pl.INT32)
+        for token in pl.range(worker, active_tokens, workers):
             pl.store(pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1), [token, 0], output)
             request = pl.read(requests, [token])
             length = pl.max(0, pl.read(lengths, [token]))
@@ -1438,15 +1477,20 @@ def _group_prefill_index_queries(
     query_pages: pl.Tensor,
     metadata: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
+    route: pl.Tensor[[1], pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
 ):
     """Partition short paged histories on queries as well as keys for the native scorer."""
     width = pl.tensor.dim(table, 1)
     groups = (num_tokens + 15) // 16
     workers = pl.min(groups, 32)
-    with pl.spmd(workers, name_hint="c1a_group_score_pages"):
+    with pl.spmd(workers, name_hint="c1a_group_score_pages", deps=[ready]) as pages_ready:
         worker = pl.tile.get_block_idx()
         # Each worker owns whole 64-byte lines of request indices.
-        for begin in pl.range(worker * 16, num_tokens, workers * 16):
+        active_tokens = num_tokens
+        if pl.read(route, [0]) != C1A_NATIVE:
+            active_tokens = pl.cast(0, pl.INT32)
+        for begin in pl.range(worker * 16, active_tokens, workers * 16):
             first = pl.read(requests, [begin])
             for lane in pl.range(pl.min(16, num_tokens - begin)):
                 row = begin + lane
@@ -1458,14 +1502,18 @@ def _group_prefill_index_queries(
                 if lane == 0 or request != first:
                     pages = pl.load(table, [request, 0], [1, 8], valid_shape=[1, width])
                     pl.store(pages, [row, 0], query_pages)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_group_score_bounds"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_group_score_bounds", deps=[ready]) as bounds_ready:
         # Every boundary is a distinct virtual request. The native scheduler
         # can walk complete KV splits without crossing the next core's queries.
         for core in pl.range(33):
             first_group = (groups * pl.min(core, PREFILL_SCORE_WORKERS)) // PREFILL_SCORE_WORKERS
-            pl.write(metadata, [core, 0], pl.cast(pl.min(num_tokens, first_group * 16), pl.INT32))
+            # A boundary at num_tokens describes an empty interval to the native scorer.
+            first_token = pl.cast(num_tokens, pl.INT32)
+            if pl.read(route, [0]) == C1A_NATIVE:
+                first_token = pl.cast(pl.min(num_tokens, first_group * 16), pl.INT32)
+            pl.write(metadata, [core, 0], first_token)
             pl.write(metadata, [core, 1], pl.cast(0, pl.INT32))
-    return query_ids, query_pages, metadata
+    return pl.system.task_dummy(deps=[pages_ready, bounds_ready])
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1477,9 +1525,9 @@ def _valid_index_pages(
     width: pl.Scalar[pl.INDEX],
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
+    flags: pl.Tensor,
 ):
     """Check request and page bounds before dispatching the packed native scorer."""
-    flags = pl.create_tensor([16, 16], dtype=pl.INT32)
     table_rows = pl.tensor.dim(table, 0)
     table_width = pl.tensor.dim(table, 1)
     with pl.spmd(16, name_hint="prefill_c1a_native_bounds", deps=[ready]) as checked:
@@ -1510,6 +1558,99 @@ def _valid_index_pages(
                 valid = pl.cast(0, pl.INT32)
         pl.write(flags, [worker, 0], valid)
     return flags, checked
+
+
+@pl.jit.inline(auto_scope=False)
+def _plan_c2a_score_route(
+    requests: pl.Tensor,
+    lengths: pl.Tensor,
+    count: pl.Scalar[pl.INT32],
+    width: pl.Scalar[pl.INDEX],
+    ready: pl.Scalar[pl.TASK_ID],
+):
+    """Select no scoring, four-row scoring, or single-row scoring on device."""
+    route = pl.create_tensor([1], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_c2a_score_route", deps=[ready]) as planned:
+        maximum_visible = pl.cast(0, pl.INT32)
+        paired = pl.cast(width >= 256 and count % 4 == 0, pl.INT32)
+        for token in pl.range(count):
+            maximum_visible = pl.max(maximum_visible, pl.read(lengths, [token]))
+            if token % 4 != 0:
+                if pl.read(requests, [token]) != pl.read(requests, [token - token % 4]):
+                    paired = pl.cast(0, pl.INT32)
+        mode = pl.cast(0, pl.INT32)
+        if maximum_visible > INDEX_TOPK:
+            if paired != 0:
+                mode = pl.cast(1, pl.INT32)
+            else:
+                mode = pl.cast(2, pl.INT32)
+        pl.write(route, [0], mode)
+    return route, planned
+
+
+@pl.jit.inline(auto_scope=False)
+def _plan_c1a_score_route(
+    pool_ids: pl.Tensor,
+    pool_counts: pl.Tensor,
+    lengths: pl.Tensor,
+    requests: pl.Tensor,
+    table: pl.Tensor,
+    cache_pages: pl.Scalar[pl.INDEX],
+    width: pl.Scalar[pl.INDEX],
+    count: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+    allow_native: pl.Scalar[pl.INT32],
+    route: pl.Tensor[[1], pl.INT32],
+    pool: pl.constexpr,
+):
+    """Classify C1A batches without reading device results in orchestration."""
+    page_flags = pl.create_tensor([16, 16], dtype=pl.INT32)
+    pending = pl.array.create(1, pl.TASK_ID)
+    pending[0] = ready
+    if allow_native != 0:
+        _, page_ready = _valid_index_pages(requests, lengths, table, cache_pages, width, count, ready, page_flags)
+        pending[0] = page_ready
+    if pool:
+        pool_flags, pool_ready = _prefill_pool_is_dense(
+            pool_ids, pool_counts, lengths, requests, count, width, pl.tensor.dim(table, 1), ready,
+        )
+        classify_ready = pl.system.task_dummy(deps=[pending[0], pool_ready])
+    else:
+        pool_flags = page_flags
+        classify_ready = pending[0]
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_c1a_score_route", deps=[classify_ready]) as planned:
+        dense = pl.cast(1, pl.INT32)
+        all_fit = pl.cast(0, pl.INT32)
+        pool_paired = pl.cast(1, pl.INT32)
+        if pool:
+            all_fit = pl.cast(1, pl.INT32)
+            for worker in pl.range(32):
+                dense = dense * pl.read(pool_flags, [worker, 0])
+                all_fit = all_fit * pl.read(pool_flags, [worker, 2])
+                pool_paired = pool_paired * pl.read(pool_flags, [worker, 1])
+        mode = pl.cast(C1A_ALL_FIT, pl.INT32)
+        if all_fit == 0:
+            if dense != 0:
+                paired = pl.cast(width >= 256 and count % 4 == 0, pl.INT32)
+                for token in pl.range(count):
+                    if token % 4 != 0:
+                        if pl.read(requests, [token]) != pl.read(requests, [token - token % 4]):
+                            paired = pl.cast(0, pl.INT32)
+                mode = pl.cast(C1A_PAGED_SINGLE, pl.INT32)
+                if paired != 0:
+                    mode = pl.cast(C1A_PAGED_PAIRED, pl.INT32)
+                if allow_native != 0:
+                    native = pl.cast(1, pl.INT32)
+                    for worker in pl.range(16):
+                        native = native * pl.read(page_flags, [worker, 0])
+                    if native != 0:
+                        mode = pl.cast(C1A_NATIVE, pl.INT32)
+            elif pool_paired != 0:
+                mode = pl.cast(C1A_POOL_PAIRED, pl.INT32)
+            else:
+                mode = pl.cast(C1A_POOL_SINGLE, pl.INT32)
+        pl.write(route, [0], mode)
+    return planned
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1569,52 +1710,22 @@ def prefill_indexer(
                 query = pl.create_tensor([rows, INDEX_H * INDEX_DIM], dtype=pl.FP8E4M3FN)
                 query_scale = pl.create_tensor([rows, INDEX_H * 4], dtype=pl.FP8E8M0)
                 weights = pl.create_tensor([rows, INDEX_H], dtype=pl.BF16)
-                maximum_visible = pl.cast(0, pl.INDEX)
-                paired = pl.cast(0, pl.INT32)
-                dense = pl.cast(1, pl.INT32)
-                all_fit = pl.cast(0, pl.INT32)
-                pool_paired = pl.cast(1, pl.INT32)
                 chunk_ready = completion[0]
-                if pool:
-                    flags, pool_plan = _prefill_pool_is_dense(
-                        chunk_pool, chunk_counts, chunk_lengths, chunk_requests,
-                        count, width, pl.tensor.dim(table, 1), chunk_ready,
+                c1a_route = pl.create_tensor([1], dtype=pl.INT32)
+                allow_native = pl.cast(
+                    width <= 1024 and pl.tensor.dim(cache, 1) == 128
+                    and pl.tensor.dim(table, 1) <= 8 and capacity * 8 >= width,
+                    pl.INT32,
+                )
+                if not c2a:
+                    chunk_ready = _plan_c1a_score_route(
+                        chunk_pool, chunk_counts, chunk_lengths, chunk_requests, table,
+                        pl.tensor.dim(cache, 0), width, count, chunk_ready,
+                        allow_native, c1a_route, pool=pool,
                     )
-                    all_fit = pl.cast(1, pl.INT32)
-                    for worker in pl.range(32):
-                        dense = dense * pl.read(flags, [worker, 0])
-                        pool_paired = pool_paired * pl.read(flags, [worker, 1])
-                        all_fit = all_fit * pl.read(flags, [worker, 2])
-                    chunk_ready = pool_plan
-                if dense != 0:
-                    if width >= 256:
-                        paired = pl.cast(rows % 4 == 0, pl.INT32)
-                    for token in pl.range(rows):
-                        if c2a:
-                            maximum_visible = pl.max(maximum_visible, pl.read(chunk_lengths, [token]))
-                        if token % 4 != 0:
-                            if pl.read(chunk_requests, [token]) != pl.read(chunk_requests, [token - token % 4]):
-                                paired = pl.cast(0, pl.INT32)
-                native = pl.cast(0, pl.INT32)
-                if not c2a and dense != 0 and all_fit == 0:
-                    if width <= 1024 and pl.tensor.dim(cache, 1) == 128 and pl.tensor.dim(table, 1) <= 8 and capacity * 8 >= width:
-                        page_flags, page_ready = _valid_index_pages(chunk_requests, chunk_lengths, table,
-                            pl.tensor.dim(cache, 0), width, count, chunk_ready)
-                        native = pl.cast(1, pl.INT32)
-                        for worker in pl.range(16):
-                            native = native * pl.read(page_flags, [worker, 0])
-                        chunk_ready = page_ready
-                # The compact native scorer stores BF16 scores. Keep its
-                # scratch bounded even when long histories use the FP32 path.
-                packed_rows = pl.cast(1, pl.INDEX)
-                packed_cols = pl.cast(1, pl.INDEX)
-                if native != 0:
-                    packed_rows = rows
-                    packed_cols = (width + 255) // 256 * 256
-                packed_scores = pl.create_tensor([packed_rows, packed_cols], dtype=pl.BF16)
                 scoring = pl.array.create(1, pl.TASK_ID)
                 scoring[0] = chunk_ready
-                if all_fit == 0 and (not c2a or maximum_visible > INDEX_TOPK):
+                if not c2a or width > INDEX_TOPK:
                     packed_query = pl.create_tensor([rows, INDEX_QUERY_WIDTH // 2], dtype=pl.UINT8)
                     raw_weights = pl.create_tensor([rows, INDEX_H], dtype=pl.BF16)
                     # Index-Q and Q-B consume MXFP8 from the same rounded BF16 latent.
@@ -1642,86 +1753,96 @@ def prefill_indexer(
                     gemm_bf16_to_bf16(chunk_x, weight_projection, raw_weights, count,
                                       width=D, output_width=INDEX_H, n_tile=INDEX_H, k_tile=INDEX_PROJ_K_TILE,
                                       workers=4, name_hint="prefill_index_weights")
-                    if not c2a:
-                        if native != 0:
-                            score_requests = pl.create_tensor([rows], dtype=pl.INT32)
-                            # The guarded native scorer accepts at most eight pages per request.
-                            score_pages = pl.create_tensor([rows, 8], dtype=pl.INT32)
-                            metadata = pl.create_tensor([33, 2], dtype=pl.INT32)
-                            score_requests, score_pages, metadata = _group_prefill_index_queries(
-                                chunk_requests, table, score_requests, score_pages, metadata, count)
-                            score_active = pl.cast(count, pl.INT64)
-                            # The native gate requires the full 128-row pages.
-                            key_pages = cache[:, :128, :, :]
-                            scale_pages = cache_scale[:, :128, :, :]
-                            with pl.spmd(PREFILL_SCORE_WORKERS, name_hint="qli_score"):
-                                _prefill_score(
-                                    packed_query, query_scale, raw_weights, key_pages, scale_pages, score_pages,
-                                    score_requests, chunk_lengths, metadata, packed_scores, score_active, SCORE,
-                                )
-                            scoring[0] = pl.system.task_dummy(deps=[packed_tid, chunk_ready])
-                    if native == 0:
-                        query_tid = _index_query_carrier(packed_query, query, count, packed_tid, chunk_ready)
-                        weights_tid = _scale_index_weights(raw_weights, weights, count)
-                        prepared = pl.system.task_dummy(deps=[query_tid, weights_tid])
-                        if paired != 0:
-                            paired_tid = _prefill_index_scores(
-                                query, query_scale, weights, cache, cache_scale, table,
-                                chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
-                                count, prepared, tile_n=128, query_tile=4, pool=False, skip_short=c2a,
-                                head_rows=4 * INDEX_H, part_rows=64 if c2a else 128,
-                            )
-                            scoring[0] = paired_tid
-                        elif dense != 0:
-                            paged_tid = _prefill_index_scores(
-                                query, query_scale, weights, cache, cache_scale, table,
-                                chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
-                                count, prepared, tile_n=128, query_tile=1, pool=False, skip_short=c2a,
-                                head_rows=INDEX_H, part_rows=64 if c2a else 128,
-                            )
-                            scoring[0] = paged_tid
-                        elif pool and pool_paired != 0:
+                    query_tid = _index_query_carrier(packed_query, query, count, packed_tid, chunk_ready)
+                    weights_tid = _scale_index_weights(raw_weights, weights, count)
+                    prepared = pl.system.task_dummy(deps=[query_tid, weights_tid])
+                    if c2a:
+                        route, route_ready = _plan_c2a_score_route(
+                            chunk_requests, chunk_lengths, count, width, prepared,
+                        )
+                        paired_tid = _prefill_index_scores(
+                            query, query_scale, weights, cache, cache_scale, table,
+                            chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
+                            count, route_ready, tile_n=128, query_tile=4, pool=False, skip_short=True,
+                            head_rows=4 * INDEX_H, part_rows=64, route=route, required_mode=1,
+                        )
+                        scoring[0] = _prefill_index_scores(
+                            query, query_scale, weights, cache, cache_scale, table,
+                            chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
+                            count, paired_tid, tile_n=128, query_tile=1, pool=False, skip_short=True,
+                            head_rows=INDEX_H, part_rows=64, route=route, required_mode=2,
+                        )
+                    else:
+                        paired_tid = _prefill_index_scores(
+                            query, query_scale, weights, cache, cache_scale, table,
+                            chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
+                            count, prepared, tile_n=128, query_tile=4, pool=False, skip_short=False,
+                            head_rows=4 * INDEX_H, part_rows=128, route=c1a_route, required_mode=C1A_PAGED_PAIRED,
+                        )
+                        paged_tid = _prefill_index_scores(
+                            query, query_scale, weights, cache, cache_scale, table,
+                            chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
+                            count, paired_tid, tile_n=128, query_tile=1, pool=False, skip_short=False,
+                            head_rows=INDEX_H, part_rows=128, route=c1a_route, required_mode=C1A_PAGED_SINGLE,
+                        )
+                        scoring[0] = paged_tid
+                        if pool:
                             pooled_tid = _prefill_index_scores(
                                 query, query_scale, weights, cache, cache_scale, table,
                                 chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
-                                count, prepared, tile_n=128, query_tile=4, pool=True, skip_short=c2a,
-                                head_rows=4 * INDEX_H, part_rows=8,
+                                count, paged_tid, tile_n=128, query_tile=4, pool=True, skip_short=False,
+                                head_rows=4 * INDEX_H, part_rows=8, route=c1a_route, required_mode=C1A_POOL_PAIRED,
                             )
-                            scoring[0] = pooled_tid
-                        else:
-                            general_tid = _prefill_index_scores(
+                            scoring[0] = _prefill_index_scores(
                                 query, query_scale, weights, cache, cache_scale, table,
                                 chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
-                                count, prepared, tile_n=128, query_tile=1, pool=pool, skip_short=c2a,
-                                head_rows=INDEX_H, part_rows=8 if pool else (64 if c2a else 128),
+                                count, pooled_tid, tile_n=128, query_tile=1, pool=True, skip_short=False,
+                                head_rows=INDEX_H, part_rows=8, route=c1a_route, required_mode=C1A_POOL_SINGLE,
                             )
-                            scoring[0] = general_tid
+                        if allow_native != 0:
+                            packed_scores = pl.create_tensor([rows, (width + 255) // 256 * 256], dtype=pl.BF16)
+                            score_requests = pl.create_tensor([rows], dtype=pl.INT32)
+                            score_pages = pl.create_tensor([rows, 8], dtype=pl.INT32)
+                            metadata = pl.create_tensor([33, 2], dtype=pl.INT32)
+                            metadata_ready = _group_prefill_index_queries(
+                                chunk_requests, table, score_requests, score_pages, metadata,
+                                count, c1a_route, chunk_ready,
+                            )
+                            score_active = pl.cast(count, pl.INT64)
+                            with pl.spmd(PREFILL_SCORE_WORKERS, name_hint="qli_score", deps=[prepared, metadata_ready]) as native_tid:
+                                _prefill_score(
+                                    packed_query, query_scale, raw_weights, cache, cache_scale, score_pages,
+                                    score_requests, chunk_lengths, metadata, packed_scores, score_active, SCORE,
+                                )
+                            native_selected = _select_short_c1a_topk(
+                                packed_scores, chunk_lengths, chunk_requests, table, chunk_output,
+                                count, native_tid, c1a_route, bf16_scores=True,
+                            )
+                            scoring[0] = pl.system.task_dummy(deps=[scoring[0], native_selected])
                 score_ready = scoring[0]
                 selection = pl.array.create(1, pl.TASK_ID)
-                selection[0] = score_ready
                 if c2a:
-                    selected = _select_c2a_topk(chunk_scores, chunk_lengths, chunk_requests,
-                                              table, pl.tensor.dim(cache, 0), chunk_output, count, score_ready)
-                    selection[0] = selected
-                elif pool and all_fit != 0:
-                    selected = _select_all_pool_rows(
-                        chunk_pool, chunk_counts, chunk_lengths, chunk_requests, table,
-                        pl.tensor.dim(cache, 0), pl.tensor.dim(cache, 1), chunk_output, count, score_ready,
+                    selection[0] = _select_c2a_topk(
+                        chunk_scores, chunk_lengths, chunk_requests,
+                        table, pl.tensor.dim(cache, 0), chunk_output, count, score_ready,
                     )
-                    selection[0] = selected
-                elif native != 0:
-                    selected = _select_short_c1a_topk(packed_scores, chunk_lengths, chunk_requests, table,
-                                                      chunk_output, count, score_ready, bf16_scores=True)
-                    selection[0] = selected
                 elif not pool and width <= 1024 and pl.tensor.dim(cache, 1) == 128:
-                    selected = _select_short_c1a_topk(chunk_scores, chunk_lengths, chunk_requests, table, chunk_output, count, score_ready, bf16_scores=False)
-                    selection[0] = selected
-                else:
-                    selected = _select_c1a_topk(
-                        chunk_scores, chunk_lengths, chunk_requests, table,
-                        chunk_pool, chunk_counts, chunk_output, count, score_ready, pool=pool,
+                    selection[0] = _select_short_c1a_topk(
+                        chunk_scores, chunk_lengths, chunk_requests, table, chunk_output,
+                        count, score_ready, c1a_route, bf16_scores=False,
                     )
-                    selection[0] = selected
+                else:
+                    topk_tid = _select_c1a_topk(
+                        chunk_scores, chunk_lengths, chunk_requests, table,
+                        chunk_pool, chunk_counts, chunk_output, count, score_ready, c1a_route, pool=pool,
+                    )
+                    selection[0] = topk_tid
+                    if pool:
+                        selection[0] = _select_all_pool_rows(
+                            chunk_pool, chunk_counts, chunk_lengths, chunk_requests, table,
+                            pl.tensor.dim(cache, 0), pl.tensor.dim(cache, 1), chunk_output, count,
+                            topk_tid, c1a_route,
+                        )
                 topk_ready = selection[0]
                 completion[0] = topk_ready
                 if not pool and not c2a:

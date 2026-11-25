@@ -60,6 +60,7 @@ if __name__ == "__main__":
     torch.set_num_threads(8)
     entry = l3_prefill_c1a_reuse if CP_SIZE == 1 else l3_prefill_c1a_reuse_cp
     result = run(
+        a5_default_runtime="host_build_graph",
         fn=entry,
         specs=build_c2a_specs(args, entry, mode="reuse"),
         golden_fn=functools.partial(golden_c2a_prefill, mode="reuse"),

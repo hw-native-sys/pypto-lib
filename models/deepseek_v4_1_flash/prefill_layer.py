@@ -474,6 +474,7 @@ if __name__ == "__main__":
     entry = l3_prefill_layer if CP_SIZE == 1 else l3_prefill_layer_cp
     moe_reference = LayerMoeReference()
     result = run(
+        a5_default_runtime="host_build_graph",
         fn=entry, specs=build_layer_specs(args, entry), golden_fn=golden_layer,
         compare_fn={
             "kv_hidden": ratio_allclose(atol=1e-4, rtol=1.0 / 128),

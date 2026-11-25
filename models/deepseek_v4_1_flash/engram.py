@@ -1121,6 +1121,7 @@ if __name__ == "__main__":
     for tokens in ([] if args.masked_gate else token_cases):
         specs = build_engram_rows_specs(tokens)
         result = run(
+            a5_default_runtime="host_build_graph",
             fn=l2_engram_rows,
             specs=specs,
             golden_fn=golden_engram_rows_case,
@@ -1141,6 +1142,7 @@ if __name__ == "__main__":
             raise SystemExit(result.error or 1)
 
     result = run(
+        a5_default_runtime="host_build_graph",
         fn=l2_engram_masked_gate,
         specs=build_masked_gate_specs(8),
         golden_fn=golden_masked_gate,

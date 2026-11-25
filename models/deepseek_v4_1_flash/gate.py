@@ -830,6 +830,7 @@ if __name__ == "__main__":
         print(f"Gate validation: num_tokens={active_count}", flush=True)
 
         result = run(
+            a5_default_runtime="host_build_graph",
             fn=l2_gate,
             specs=build_tensor_specs(num_tokens=active_count, token_bias=args.token_bias),
             golden_fn=golden_gate_normalized_core,

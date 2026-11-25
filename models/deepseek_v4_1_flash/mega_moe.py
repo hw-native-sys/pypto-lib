@@ -441,6 +441,7 @@ if __name__ == "__main__":
         for tail_round in range(tail_rounds):
             print(f"Fused routed compute: case={case}, tail_round={tail_round}, ep={EP_WORLD_SIZE}, experts={N_LOCAL_EXPERTS}, stride={RECV_MAX}")
             result = run(
+                a5_default_runtime="host_build_graph",
                 fn=distributed_compute_test,
                 specs=build_distributed_tensor_specs(case, tail_offset=tail_round * N_LOCAL_EXPERTS),
                 golden_fn=golden_distributed_compute,

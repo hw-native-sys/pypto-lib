@@ -780,6 +780,7 @@ if __name__ == "__main__":
         tensors["embeddings"].copy_(embeddings)
 
     result = run(make_vision_program(cfg), specs, golden_fn=golden,
+                 a5_default_runtime="host_build_graph",
                  compare_fn=validation_comparators(cfg),
                  config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device, "ring_heap": args.ring_heap},
                  compile_only=args.compile_only, save_data=args.save_data,
