@@ -1725,7 +1725,9 @@ def prefill_indexer(
                     )
                 scoring = pl.array.create(1, pl.TASK_ID)
                 scoring[0] = chunk_ready
-                if not c2a or width > INDEX_TOPK:
+                # C1A full still needs scores to produce its candidate pool.
+                # A bounded reindex pool only maps rows when every key fits.
+                if width > INDEX_TOPK or (not c2a and not pool):
                     packed_query = pl.create_tensor([rows, INDEX_QUERY_WIDTH // 2], dtype=pl.UINT8)
                     raw_weights = pl.create_tensor([rows, INDEX_H], dtype=pl.BF16)
                     # Index-Q and Q-B consume MXFP8 from the same rounded BF16 latent.

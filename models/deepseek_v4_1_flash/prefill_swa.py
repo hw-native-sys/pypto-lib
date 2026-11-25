@@ -718,7 +718,7 @@ def build_swa_specs(args, entry):
     ]
     for spec in specs:
         # Host-built CP1 orchestration reads the per-rank active length before dispatch.
-        spec.resident = None if CP_SIZE == 1 and spec.name == "kv_token_count" else "stacked"
+        spec.resident = None if spec.name in {"q_token_count", "kv_token_count"} else "stacked"
         spec.init_value = lambda name=spec.name: initialize(name)
     specs += [
         ScalarSpec("attention_epoch", torch.int32, 1, compile_runtime=True, benchmark_step=None),

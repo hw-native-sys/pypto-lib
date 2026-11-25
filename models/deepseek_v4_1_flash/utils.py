@@ -98,6 +98,10 @@ def prefill_index_validation_cases(args, ratio):
     scored = copy.copy(args)
     scored.query_lens = [[8]]
     scored.start_pos = [[ratio * (M.index_topk + 32)]]
+    if ratio == 2:
+        single = copy.copy(scored)
+        single.query_lens = [[1]]
+        return [args, scored, single]
     return [args, scored]
 
 
