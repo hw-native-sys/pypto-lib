@@ -95,7 +95,7 @@ PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
 SWA_TILE_WIN_ROWS = min(ATTN_K_TILE, WIN)
 SWA_RUNS = (SWA_TILE_WIN_ROWS + 2 * (BLOCK_SIZE - 1)) // BLOCK_SIZE  # Sliding-window page runs
 BIAS_T_TILE = 8
-BIAS_T_STEP = gcd(S, BIAS_T_TILE)
+BIAS_T_STEP = S if S <= BIAS_T_TILE else gcd(S, BIAS_T_TILE)
 if T % BIAS_T_STEP != 0:
     raise ValueError("CSA token capacity must contain complete bias tiles")
 if H_TILE % HEADS_PER_GROUP != 0:
@@ -193,7 +193,12 @@ def _sparse_attn_csa(
             # Physical compressed-cache rows for one request's query tile.
             c_logical = pl.cast(pl.maximum(c_out, 0.0), target_type=pl.INT32)
             c_page_indices = pl.tile.shrs(c_logical, CACHE_BLOCK_SHIFT)
-            c_table = pl.load(cmp_block_table, [bias_t0 // S, 0], [1, CMP_MAX_BLOCKS])
+            # All valid sparse indices lie in this request's visible compressed prefix.
+            max_comp_len = pl.cast(1, target_type=pl.INT32)
+            for row in pl.range(BIAS_T_STEP):
+                max_comp_len = pl.max(max_comp_len, pl.read(c_pos_i32, [row, 0]))
+            page_cols = pl.min(CMP_MAX_BLOCKS, (max_comp_len + BLOCK_SIZE - 1) // BLOCK_SIZE)
+            c_table = pl.load(cmp_block_table, [bias_t0 // S, 0], [1, CMP_MAX_BLOCKS], valid_shape=[1, page_cols])
             c_gather_tmp = pl.create_tile([BIAS_T_TILE, IDX_TOPK], dtype=pl.INT32)
             c_pages = pl.tile.gather(c_table, c_page_indices, c_gather_tmp)
             c_page_starts = pl.tile.shls(c_pages, CACHE_BLOCK_SHIFT)

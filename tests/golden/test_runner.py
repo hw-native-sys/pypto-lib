@@ -2932,6 +2932,117 @@ class TestResidentPath:
             )
 
 
+class TestPreparedWorkerOptions:
+    """``window_sources`` / ``persistent`` / ``return_tensors``."""
+
+    def test_window_sources_route_nonresident_l3_through_prepared_worker(self, build_dir):
+        """A Host-window run uses the prepared worker even without resident specs."""
+        sources = {"engram_payload": [object()]}
+        with (
+            patch("pypto.ir.compile", return_value=_FakeCompiled(build_dir)),
+            patch(
+                "golden.runner._dispatch",
+                side_effect=lambda *a, **k: pytest.fail("one-shot dispatch must not run"),
+            ),
+            patch("golden.runner._run_l3_resident", return_value=None) as l3res,
+            patch("golden.runner._is_l3", return_value=True),
+        ):
+            r = run(
+                fn=object(),
+                specs=[TensorSpec("x", [4], torch.float32)],
+                window_sources=sources,
+                persistent=True,
+                reset_persistent_windows=False,
+            )
+
+        assert r.passed, r.error
+        l3res.assert_called_once()
+        kwargs = l3res.call_args.kwargs
+        assert kwargs["window_sources"] == sources
+        assert kwargs["persistent"] is True
+        assert kwargs["reset_persistent_windows"] is False
+
+    def test_window_sources_rejected_for_non_l3(self, build_dir):
+        with (
+            patch("pypto.ir.compile", return_value=_FakeCompiled(build_dir)),
+            patch("golden.runner._is_l3", return_value=False),
+        ):
+            r = run(
+                fn=object(),
+                specs=[TensorSpec("x", [4], torch.float32)],
+                window_sources={"engram_payload": [object()]},
+            )
+        assert not r.passed
+        assert "window_sources require an L3" in (r.error or "")
+
+    def test_prepare_binds_sources_and_persistent_flags(self, monkeypatch):
+        sentinel = object()
+        cfg = _run_config()
+        rt = _ResidentRT()
+        prepared = []
+        _stub_l3_helpers(monkeypatch)
+        dcp = _resident_dcp(rt, prepare_log=prepared)
+        with patch.dict(sys.modules, _resident_modules(dcp)):
+            result = _run_l3_resident(
+                compiled=dcp(), specs=[], tensors={}, scalar_specs_eff={},
+                cfg=cfg, golden_outputs=None, rtol=1e-5, atol=1e-5, compare_fn={},
+                window_sources={"engram_payload": [sentinel]},
+                persistent=True, reset_persistent_windows=False,
+            )
+
+        assert result is None
+        assert prepared == [
+            ((cfg,), {
+                "persistent": True,
+                "reset_persistent_windows": False,
+                "window_sources": {"engram_payload": [sentinel]},
+            }),
+        ]
+        assert rt.kinds() == ["dispatch"]
+
+    def test_sources_without_persistent_leave_validation_one_shot(self, monkeypatch):
+        sentinel = object()
+        cfg = _run_config()
+        rt = _ResidentRT()
+        prepared = []
+        _stub_l3_helpers(monkeypatch)
+        dcp = _resident_dcp(rt, prepare_log=prepared)
+        with patch.dict(sys.modules, _resident_modules(dcp)):
+            result = _run_l3_resident(
+                compiled=dcp(), specs=[], tensors={}, scalar_specs_eff={},
+                cfg=cfg, golden_outputs=None, rtol=1e-5, atol=1e-5, compare_fn={},
+                window_sources={"engram_payload": [sentinel]},
+            )
+
+        assert result is None
+        assert prepared == [((cfg,), {"window_sources": {"engram_payload": [sentinel]}})]
+        assert rt.kinds() == ["dispatch"]
+
+    def test_return_tensors_exposes_host_buffers(self, build_dir):
+        specs = [TensorSpec("x", [2], torch.float32, init_value=1.0)]
+        with (
+            patch("pypto.ir.compile", return_value=_FakeCompiled(build_dir)),
+            patch("golden.runner._dispatch"),
+        ):
+            r = run(fn=object(), specs=specs, return_tensors=True)
+
+        assert r.passed, r.error
+        assert r.tensors is not None
+        assert set(r.tensors) == {"x"}
+        assert torch.equal(r.tensors["x"], torch.full((2,), 1.0))
+
+    def test_return_tensors_absent_by_default(self, build_dir):
+        specs = [TensorSpec("x", [2], torch.float32, init_value=1.0)]
+        with (
+            patch("pypto.ir.compile", return_value=_FakeCompiled(build_dir)),
+            patch("golden.runner._dispatch"),
+        ):
+            r = run(fn=object(), specs=specs)
+
+        assert r.passed, r.error
+        assert r.tensors is None
+
+
 class _FakeInv:
     """Stand-in for a runtime ``TraceInvocation`` — only what the reporters read."""
 

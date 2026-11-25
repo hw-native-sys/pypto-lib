@@ -829,6 +829,9 @@ def _o_proj_a_mixed(
                 pl.system.barrier(pipe=pl.PipeType.ALL, core_type=pl.KernelType.AIC)
                 pl.system.set_intra_block(5, pipe=pl.PipeType.FIX, core_type=pl.KernelType.AIC)
                 pl.system.set_intra_block(21, pipe=pl.PipeType.FIX, core_type=pl.KernelType.AIC)
+        # Finish all L1 reads before a new worker can overwrite these slots.
+        pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 7, core_type=pl.KernelType.AIC)
+        pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 7, core_type=pl.KernelType.AIC)
     return output, output_scale
 
 

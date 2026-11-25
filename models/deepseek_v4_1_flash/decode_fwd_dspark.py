@@ -43,8 +43,7 @@ import dspark_drafter as draft
 import markov
 import decode_metadata as state_ops
 from decode_fwd import decode_fwd
-from hc import hc_head
-from rmsnorm import rms_norm
+from hc import hc_head_norm, hc_head_norm_store
 from lm_head import VOCAB, lm_head
 from sample import sample
 import lm_head as head
@@ -70,6 +69,10 @@ STATE_OPS_ROWS = state_ops.ROWS
 TARGET_FWD_T_DYN = target_fwd.T_DYN
 TARGET_FWD_ENGRAM_K = target_fwd.ENGRAM_K
 TARGET_FWD_KV_OUT = target_fwd.KV_OUT
+TARGET_FWD_ENGRAM_ROWS = target_fwd.ENGRAM_ROWS
+TARGET_FWD_ENGRAM_SHARD_ROWS = target_fwd.ENGRAM_SHARD_ROWS
+TARGET_FWD_N_HASH_COLS = target_fwd.N_HASH_COLS
+TARGET_FWD_ENGRAM_LOOKUPS_DYN = target_fwd.ENGRAM_LOOKUPS_DYN
 TARGET_FWD_DSPARK_MAIN_IN = target_fwd.DSPARK_MAIN_IN
 TARGET_FWD_WEIGHT_BANK_SIZE = target_fwd.WEIGHT_BANK_SIZE
 TARGET_FWD_MIX_HC = target_fwd.MIX_HC
@@ -171,7 +174,9 @@ def l2_decode_fwd_dspark(
     c2a_slots: pl.Out[pl.Tensor[[PADDED_ROWS], pl.INT64]],
     c1a_slots: pl.Out[pl.Tensor[[PADDED_ROWS], pl.INT64]],
     query_starts: pl.Out[pl.Tensor[[DECODE_BATCH + 1], pl.INT32]],
-    engram_lookup: pl.Tensor[[2, PADDED_ROWS, TARGET_FWD_ENGRAM_K], pl.BF16],
+    engram_ids: pl.Tensor[[2 * PADDED_ROWS * TARGET_FWD_N_HASH_COLS, 1], pl.INT32],
+    engram_scales: pl.Tensor[[2 * TARGET_FWD_ENGRAM_ROWS, 8], pl.UINT8],
+    engram_payload: pld.DistributedTensor[[2 * TARGET_FWD_ENGRAM_SHARD_ROWS, 256], pl.UINT8],
     engram_wkv: pl.Tensor[[2, TARGET_FWD_ENGRAM_K, TARGET_FWD_KV_OUT], pl.FP8E4M3FN],
     engram_wkv_scale: pl.Tensor[[2 * (TARGET_FWD_ENGRAM_K // 32), TARGET_FWD_KV_OUT], pl.FP8E8M0],
     engram_weight: pl.Tensor[[2, HC_MULT, D], pl.FP32],
@@ -361,7 +366,7 @@ def l2_decode_fwd_dspark(
         local_window_indices, local_c2a_slots, local_c1a_slots, local_query_starts, sample_row_indices,
     )
     decode_fwd(
-        engram_lookup, engram_wkv, engram_wkv_scale, engram_weight,
+        engram_ids, engram_scales, engram_payload, engram_wkv, engram_wkv_scale, engram_weight,
         local_x_hc, local_pre_mix, local_target_hidden_padded, hc_attn_fn,
         hc_attn_scale, hc_attn_base, attn_norm_weight, wq_a,
         q_norm_weight, wq_b, wkv, kv_norm_weight,
@@ -398,14 +403,8 @@ def l2_decode_fwd_dspark(
     head_rows = (pl.min(group_rows, TARGET_ROWS) + 15) // 16 * 16
     sample_hidden = local_x_hc[:head_rows, :, :]
     sample_pre_mix = local_pre_mix[:head_rows, :]
-    sample_tokens = pl.tensor.dim(sample_hidden, 0)
-    sample_collapsed = pl.create_tensor([head_rows, D], dtype=pl.BF16)
-    hc_head(sample_hidden, sample_pre_mix, sample_collapsed, worker_limit=64)
     sample_normalized = pl.create_tensor([head_rows, D], dtype=pl.BF16)
-    rms_norm(
-        sample_collapsed, final_norm_weight, sample_normalized,
-        sample_tokens, width=D, zero_tail=False,
-    )
+    hc_head_norm(sample_hidden, sample_pre_mix, final_norm_weight, sample_normalized, worker_limit=64)
     sample_logits = pl.create_tensor([head_rows, VOCAB], dtype=pl.FP32)
     lm_head(
         sample_normalized, lm_head_weight, sample_row_indices, sample_logits,
@@ -445,12 +444,13 @@ def l2_decode_fwd_dspark(
     )
     markov_batch = pl.tensor.dim(num_sampled, 0)
     markov_rows = markov_batch * MARKOV_DSPARK_QUERY_WIDTH
+    markov_hidden = draft_x_hc[:markov_rows, :, :]
+    markov_pre_mix = draft_pre_mix[:markov_rows, :]
     markov_flat_hidden = pl.reshape(draft_head_hidden, [markov_rows, D])
-    hc_head(draft_x_hc[:markov_rows, :, :], draft_pre_mix[:markov_rows, :], markov_flat_hidden, worker_limit=64)
     markov_normalized = pl.create_tensor([markov_rows, D], dtype=pl.BF16)
-    rms_norm(
-        markov_flat_hidden, markov_final_norm_weight, markov_normalized,
-        markov_rows, width=D, zero_tail=False,
+    hc_head_norm_store(
+        markov_hidden, markov_pre_mix, markov_final_norm_weight,
+        markov_normalized, markov_flat_hidden, markov_rows, worker_limit=64,
     )
     markov_logits = pl.create_tensor([MARKOV_MAX_LOGIT_ROWS, MARKOV_VOCAB], dtype=pl.FP32)
     lm_head(
@@ -501,7 +501,8 @@ def l3_decode_fwd_dspark(
     c2a_slots: pl.Out[pl.Tensor[[EP_SIZE, PADDED_ROWS], pl.INT64]],
     c1a_slots: pl.Out[pl.Tensor[[EP_SIZE, PADDED_ROWS], pl.INT64]],
     query_starts: pl.Out[pl.Tensor[[EP_SIZE, DECODE_BATCH + 1], pl.INT32]],
-    engram_lookup: pl.Tensor[[EP_SIZE, 2, TARGET_FWD_T_DYN, TARGET_FWD_ENGRAM_K], pl.BF16],
+    engram_ids: pl.Tensor[[EP_SIZE, 2 * TARGET_FWD_T_DYN * TARGET_FWD_N_HASH_COLS, 1], pl.INT32],
+    engram_scales: pl.Tensor[[EP_SIZE, 2 * TARGET_FWD_ENGRAM_ROWS, 8], pl.UINT8],
     engram_wkv: pl.Tensor[[EP_SIZE, 2, TARGET_FWD_ENGRAM_K, TARGET_FWD_KV_OUT], pl.FP8E4M3FN],
     engram_wkv_scale: pl.Tensor[[EP_SIZE, 2 * (TARGET_FWD_ENGRAM_K // 32), TARGET_FWD_KV_OUT], pl.FP8E8M0],
     engram_weight: pl.Tensor[[EP_SIZE, 2, HC_MULT, D], pl.FP32],
@@ -642,7 +643,7 @@ def l3_decode_fwd_dspark(
     target_window_table.bind_dynamic(2, WINDOW_TABLE_DYN)
     target_c2a_table.bind_dynamic(2, FWD_C2A_TABLE_DYN)
     target_c1a_table.bind_dynamic(2, FWD_C1A_TABLE_DYN)
-    engram_lookup.bind_dynamic(2, TARGET_FWD_T_DYN)
+    engram_ids.bind_dynamic(1, TARGET_FWD_ENGRAM_LOOKUPS_DYN)
     target_hidden_padded.bind_dynamic(1, TARGET_FWD_T_DYN)
     freqs_cos.bind_dynamic(2, TARGET_FWD_ROPE_ROWS_DYN)
     freqs_sin.bind_dynamic(2, TARGET_FWD_ROPE_ROWS_DYN)
@@ -664,6 +665,10 @@ def l3_decode_fwd_dspark(
     draft_head_hidden.bind_dynamic(1, DRAFT_B_DYN)
     draft_ids.bind_dynamic(1, MARKOV_B_DYN)
     confidences.bind_dynamic(1, MARKOV_B_DYN)
+    engram_payload_buffer = pld.alloc_window_buffer(
+        [2 * TARGET_FWD_ENGRAM_SHARD_ROWS, 256], dtype=pl.UINT8,
+        memory_source="host", init="engram_payload",
+    )
     target_fwd_moe_workspace_buffer = pld.alloc_window_buffer([TARGET_MOE_WORKSPACE_BYTES], dtype=pl.UINT8)
     draft_moe_workspace_buf = pld.alloc_window_buffer([DRAFT_MOE_WORKSPACE_BYTES], dtype=pl.UINT8)
     sample_hidden_buffer = pld.alloc_window_buffer([TARGET_FWD_GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
@@ -675,6 +680,9 @@ def l3_decode_fwd_dspark(
     markov_logits_window_buf = pld.alloc_window_buffer([MARKOV_MAX_LOGIT_ROWS, MARKOV_VOCAB], dtype=pl.BF16)
     markov_logits_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
+        engram_payload = pld.window(
+            engram_payload_buffer, [2 * TARGET_FWD_ENGRAM_SHARD_ROWS, 256], dtype=pl.UINT8,
+        )
         target_fwd_moe_workspace = pld.window(target_fwd_moe_workspace_buffer, [TARGET_MOE_WORKSPACE_BYTES], dtype=pl.UINT8)
         sampling_hidden_window = pld.window(sample_hidden_buffer, [TARGET_FWD_GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
         sampling_hidden_done = pld.window(sample_hidden_done_buffer, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
@@ -691,7 +699,8 @@ def l3_decode_fwd_dspark(
             target_window_table[rank], target_c2a_table[rank], target_c1a_table[rank], x_hc[rank],
             pre_mix[rank], position_ids[rank], request_ids[rank], window_slots[rank],
             window_indices[rank], c2a_slots[rank], c1a_slots[rank], query_starts[rank],
-            engram_lookup[rank], engram_wkv[rank], engram_wkv_scale[rank], engram_weight[rank],
+            engram_ids[rank], engram_scales[rank], engram_payload,
+            engram_wkv[rank], engram_wkv_scale[rank], engram_weight[rank],
             target_hidden_padded[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_weight[rank], wq_a[rank], wq_a_scale[rank], q_norm_weight[rank],
             wq_b[rank], wq_b_scale[rank], wkv[rank], wkv_scale[rank],
@@ -760,6 +769,7 @@ def build_tensor_specs(active_requests=1):
     target_cos, target_sin = target_fwd.prepare_forward_rope_tables(limit)
     initial = {
         "slot_ids": -1,
+        "engram_scales": 127,
         "target_window_table": table,
         "target_c2a_table": target_specs["c2a_index_block_table"].init_value,
         "target_c1a_table": target_specs["c1a_index_block_table"].init_value,
@@ -794,9 +804,14 @@ def build_tensor_specs(active_requests=1):
             extents[d.name] if hasattr(d, "name") and d.name in extents else target_fwd._fixture_extent(d)
             for d in ann.shape
         ]
+        if name == "engram_ids":
+            shape = [EP_SIZE, 2 * PADDED_ROWS * TARGET_FWD_N_HASH_COLS, 1]
         dtype = target_fwd._torch_dtype(ann.dtype)
         base = target_specs.get(name)
         value = initial.get(name, base.init_value if base is not None else None)
+        if name == "engram_ids":
+            value = torch.full(shape, -1, dtype=dtype)
+            value[:, :TARGET_FWD_N_HASH_COLS, 0] = 0
         if name == "draft_window_cache":
             value = torch.zeros(shape, dtype=torch.uint8)
             _, factors = unpack_quantized_cache(value, False)
@@ -828,6 +843,7 @@ def build_tensor_specs(active_requests=1):
 
 if __name__ == "__main__":
     import argparse
+    from contextlib import ExitStack
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", choices=["a5"], default="a5")
@@ -842,6 +858,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", default=",".join(map(str, range(EP_SIZE))))
     parser.add_argument("--balanced-routing", action="store_true")
     parser.add_argument("--packed-routed-weights", action=argparse.BooleanOptionalAction, default=False, help="pack resident routed FP4 weights for target and draft")
+    parser.add_argument("--engram-table-rows", type=int, default=TARGET_FWD_ENGRAM_ROWS)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=range(5))
@@ -857,20 +874,33 @@ if __name__ == "__main__":
         parser.error(f"need {EP_SIZE} distinct non-negative device IDs")
     from golden import run
     from pypto.ir import DistributedConfig
+    from utils import ENGRAM_SHARD_ROWS, EngramPayloadSource
 
-    result = run(
-        a5_default_runtime="host_build_graph",
-        fn=l3_decode_fwd_dspark,
-        specs=build_tensor_specs(args.active_requests),
-        golden_fn=None,
-        compile_only=args.compile_only,
-        runtime_dir=args.runtime_dir,
-        config=dict(
-            backend_type="a5", execution_mode=False,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-            distributed_config=DistributedConfig(device_ids=list(devices), num_sub_workers=0),
-            ring_heap=(2 * 1024**3, 2 * 1024**3, 1024**3, 512 * 1024**2), ring_dep_pool=131072,
-        ),
+    config = dict(
+        backend_type="a5", execution_mode=False,
+        enable_chip_swimlane=args.enable_chip_swimlane,
+        distributed_config=DistributedConfig(device_ids=list(devices), num_sub_workers=0),
+        ring_heap=(2 * 1024**3, 2 * 1024**3, 1024**3, 512 * 1024**2), ring_dep_pool=131072,
     )
+    specs = build_tensor_specs(args.active_requests)
+    with ExitStack() as sources:
+        result = run(
+            a5_default_runtime="host_build_graph",
+            fn=l3_decode_fwd_dspark,
+            specs=specs,
+            golden_fn=None,
+            config=config,
+            compile_only=args.compile_only,
+            runtime_dir=args.runtime_dir,
+            # The prepared worker binds the Host window source before dispatch.
+            window_sources=None if args.compile_only else {"engram_payload": [
+                sources.enter_context(EngramPayloadSource([(None, 0, 2 * ENGRAM_SHARD_ROWS * 256)]))
+                for _ in devices
+            ]},
+            persistent=True,
+            reset_persistent_windows=False,
+        )
+    if result.passed and not args.compile_only:
+        print("[DSPARK] Execution completed; numerical accuracy was not validated.", flush=True)
     if not result.passed:
         raise SystemExit(result.error or 1)

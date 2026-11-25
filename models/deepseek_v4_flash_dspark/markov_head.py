@@ -60,8 +60,6 @@ def markov_head(
         name_hint="markov_logits",
         deps=[embedding_tid],
     ) as logits_tid:
-        # Weight reads bypass L2.
-        pl.set_cache_policy(markov_w2, pl.CachePolicy.BYPASS)
         block = pl.tile.get_block_idx()
         for work_idx in pl.range(block, work_items, SPMD_BLOCKS):
             t0 = (work_idx // (vocab_dim // VOCAB_TILE)) * T_TILE
