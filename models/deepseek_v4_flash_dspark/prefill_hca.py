@@ -77,7 +77,7 @@ from prefill_o_proj import (
 
 if TP_SIZE == 1:
     from prefill_o_proj import gather_o_proj_full_weights
-from qkv_proj_rope import kv_proj_rope, q_proj_rope, rope_prepare
+from qkv_proj_rope import kv_proj_rope, prepare_prefill_query_rope, q_proj_rope
 
 
 # Dynamic shape variables.
@@ -992,8 +992,9 @@ def prefill_attention_hca_cp_local(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    q_cos_il: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    q_sin_signed: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    q_swap_idx: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.INT32],
     cmp_freqs_cos: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_sin: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
@@ -1072,15 +1073,6 @@ def prefill_attention_hca_cp_local(
             o_proj_weight_consumed, o_proj_order_fence,
             group_base, tp_rank, weight_published, weight_waited, norm_ready_tid,
         )
-    local_base = tp_rank * q_dim
-    freqs_cos_local = pl.slice(freqs_cos, [q_dim, ROPE_DIM], [local_base, 0])
-    freqs_sin_local = pl.slice(freqs_sin, [q_dim, ROPE_DIM], [local_base, 0])
-
-    q_cos_il = pl.create_tensor([q_dim, ROPE_DIM], dtype=pl.FP32)
-    q_sin_signed = pl.create_tensor([q_dim, ROPE_DIM], dtype=pl.FP32)
-    q_swap_idx = pl.create_tensor([q_dim, ROPE_DIM], dtype=pl.INT32)
-    rope_prepare(freqs_cos_local, freqs_sin_local, q_cos_il, q_sin_signed, q_swap_idx)
-
     q = pl.create_tensor([q_dim, H, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([q_dim, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([q_dim, 1], dtype=pl.FP32)
@@ -1220,6 +1212,9 @@ def prefill_attention_hca_cp(
     inverse_rope, inverse_swap_idx, inverse_ready = prepare_sparse_attn_rope(
         freqs_cos, freqs_sin, local_base, q_dim, pl.const(1, pl.INT32),
     )
+    q_cos_il, q_sin_signed, q_swap_idx = prepare_prefill_query_rope(
+        freqs_cos, freqs_sin, local_base, q_dim, pl.const(1, pl.INT32),
+    )
     x_hc_local = pl.slice(x_hc_full, [q_dim, HC_MULT, D], [local_base, 0, 0])
     x_out_local = pl.slice(x_out_full, [q_dim, HC_MULT, D], [local_base, 0, 0])
     request_count = pl.tensor.dim(query_start_loc, 0) - 1
@@ -1237,7 +1232,7 @@ def prefill_attention_hca_cp(
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale,
         wkv, gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin,
+        q_cos_il, q_sin_signed, q_swap_idx,
         cmp_freqs_cos, cmp_freqs_sin,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         compress_state, compress_state_block_table,

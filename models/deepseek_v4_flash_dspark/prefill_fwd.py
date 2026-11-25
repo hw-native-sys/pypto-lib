@@ -39,6 +39,7 @@ from moe import (
     prefill_moe_local,
 )
 from config import FLASH as MODEL_CONFIG
+from qkv_proj_rope import prepare_prefill_query_rope
 from prefill_sparse_attn import prepare_sparse_attn_rope
 from prefill_hca_cp_cache import prepare_hca_owner_plan
 from prefill_swa import (
@@ -92,6 +93,7 @@ from prefill_csa import (
     build_ragged2_cp_tensor_specs as build_csa_ragged2_tensor_specs,
     prefill_attention_csa_cp_local,
     prepare_csa_compact_plan,
+    prepare_csa_indexer_rope,
     prepare_csa_sparse_indices,
 )
 from prefill_cp_token_allgather import (
@@ -476,6 +478,14 @@ def prefill_fwd(
         compressed_freqs_cos, compressed_freqs_sin, local_start, local_tokens, group_tokens,
     )
 
+    # CSA and HCA use the same forward frequencies for the local physical rows.
+    compressed_q_cos, compressed_q_sin, compressed_q_swap = prepare_prefill_query_rope(
+        compressed_freqs_cos, compressed_freqs_sin, local_start, local_tokens, group_tokens,
+    )
+    csa_idx_cos, csa_idx_sin = prepare_csa_indexer_rope(
+        compressed_freqs_cos, compressed_freqs_sin, local_start, local_tokens, group_tokens,
+    )
+
     # Local HC state and FFN coefficient views.
     hc_elements_local = local_tokens * HC_MULT * D
     hidden_elements_local = local_tokens * D
@@ -808,6 +818,7 @@ def prefill_fwd(
                         attn_norm_w_csa, wq_a_csa, wq_b_csa, wq_b_scale_csa,
                         wkv_csa, gamma_cq_csa, gamma_ckv_csa,
                         compressed_freqs_cos, compressed_freqs_sin,
+                        compressed_q_cos, compressed_q_sin, compressed_q_swap, csa_idx_cos, csa_idx_sin,
                         csa_cmp_freqs_cos, csa_cmp_freqs_sin,
                         csa_cmp_wkv_csa, csa_cmp_wgate_csa, csa_cmp_ape_csa, csa_cmp_norm_w_csa,
                         csa_compress_state_csa, csa_compress_state_block_table,
@@ -944,7 +955,7 @@ def prefill_fwd(
                         hc_attn_fn_hca, hc_attn_scale_hca, hc_attn_base_hca,
                         attn_norm_w_hca, wq_a_hca, wq_b_hca, wq_b_scale_hca,
                         wkv_hca, gamma_cq_hca, gamma_ckv_hca,
-                        compressed_freqs_cos, compressed_freqs_sin,
+                        compressed_q_cos, compressed_q_sin, compressed_q_swap,
                         hca_cmp_freqs_cos, hca_cmp_freqs_sin,
                         hca_cmp_wkv_hca, hca_cmp_wgate_hca, hca_cmp_ape_hca, hca_cmp_norm_w_hca,
                         hca_compress_state_hca, hca_compress_state_block_table,
@@ -1108,6 +1119,7 @@ def prefill_fwd(
                     attn_norm_w_last, wq_a_last, wq_b_last, wq_b_scale_last,
                     wkv_last, gamma_cq_last, gamma_ckv_last,
                     compressed_freqs_cos, compressed_freqs_sin,
+                    compressed_q_cos, compressed_q_sin, compressed_q_swap, csa_idx_cos, csa_idx_sin,
                     csa_cmp_freqs_cos, csa_cmp_freqs_sin,
                     csa_cmp_wkv_last, csa_cmp_wgate_last, csa_cmp_ape_last, csa_cmp_norm_w_last,
                     csa_compress_state_last, csa_compress_state_block_table,

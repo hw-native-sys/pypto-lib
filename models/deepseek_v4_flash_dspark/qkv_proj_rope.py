@@ -288,6 +288,25 @@ def rope_prepare(
 
 
 @pl.jit.inline(auto_scope=False)
+def prepare_prefill_query_rope(
+    freqs_cos: pl.Tensor[[ROPE_T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[ROPE_T_DYN, ROPE_DIM], pl.BF16],
+    local_base: pl.Scalar[pl.INDEX],
+    rows: pl.Scalar[pl.INDEX],
+    active: pl.Scalar[pl.INT32],
+):
+    """Prepare forward RoPE for one rank's physical token interval."""
+    q_cos = pl.create_tensor([rows, ROPE_DIM], dtype=pl.FP32)
+    q_sin = pl.create_tensor([rows, ROPE_DIM], dtype=pl.FP32)
+    q_swap = pl.create_tensor([rows, ROPE_DIM], dtype=pl.INT32)
+    if active > 0:
+        local_cos = pl.slice(freqs_cos, [rows, ROPE_DIM], [local_base, 0])
+        local_sin = pl.slice(freqs_sin, [rows, ROPE_DIM], [local_base, 0])
+        rope_prepare(local_cos, local_sin, q_cos, q_sin, q_swap)
+    return q_cos, q_sin, q_swap
+
+
+@pl.jit.inline(auto_scope=False)
 def q_proj_qr(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],

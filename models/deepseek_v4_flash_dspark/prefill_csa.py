@@ -100,7 +100,7 @@ from prefill_o_proj import (
 
 if TP_SIZE == 1:
     from prefill_o_proj import gather_o_proj_full_weights
-from qkv_proj_rope import kv_proj_rope, q_proj_rope, rope_prepare
+from qkv_proj_rope import kv_proj_rope, prepare_prefill_query_rope, q_proj_rope, rope_prepare
 
 
 # Largest runtime token count the prefill path accepts (Issue #905 P4).
@@ -1128,6 +1128,33 @@ def prepare_csa_compact_plan(
             csa_compact_eligible(starts, checkpoints, pos, raw_map, cmp_map, index_map, state_map, index_state_map, plan)
 
 
+@pl.jit.inline(auto_scope=False)
+def prepare_csa_indexer_rope(
+    freqs_cos: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    local_base: pl.Scalar[pl.INDEX],
+    q_dim: pl.Scalar[pl.INDEX],
+    active: pl.Scalar[pl.INT32],
+):
+    """Prepare half-width FP32 RoPE for local indexer queries."""
+    idx_cos = pl.create_tensor([q_dim, HALF_ROPE], dtype=pl.FP32)
+    idx_sin = pl.create_tensor([q_dim, HALF_ROPE], dtype=pl.FP32)
+    if active > 0:
+        freqs_cos_local = pl.slice(freqs_cos, [q_dim, ROPE_HEAD_DIM], [local_base, 0])
+        freqs_sin_local = pl.slice(freqs_sin, [q_dim, ROPE_HEAD_DIM], [local_base, 0])
+        rope_blocks = (q_dim + CSA_ROPE_TILE - 1) // CSA_ROPE_TILE
+        for prep_block in pl.spmd(rope_blocks, name_hint="prefill_csa_cp_idx_halfrope"):
+            idx_t = prep_block * CSA_ROPE_TILE
+            idx_rows = pl.min(CSA_ROPE_TILE, q_dim - idx_t)
+            idx_cos_bf16 = pl.slice(freqs_cos_local, [CSA_ROPE_TILE, HALF_ROPE], [idx_t, 0], valid_shape=[idx_rows, HALF_ROPE])
+            idx_sin_bf16 = pl.slice(freqs_sin_local, [CSA_ROPE_TILE, HALF_ROPE], [idx_t, 0], valid_shape=[idx_rows, HALF_ROPE])
+            idx_cos_fp32 = pl.cast(idx_cos_bf16, target_type=pl.FP32)
+            idx_sin_fp32 = pl.cast(idx_sin_bf16, target_type=pl.FP32)
+            idx_cos[idx_t : idx_t + CSA_ROPE_TILE, 0:HALF_ROPE] = idx_cos_fp32
+            idx_sin[idx_t : idx_t + CSA_ROPE_TILE, 0:HALF_ROPE] = idx_sin_fp32
+    return idx_cos, idx_sin
+
+
 @pl.jit.inline
 def prefill_attention_csa_cp_core(
     x_normed_local: pl.Tensor[[CP_Q_T_DYN, D], pl.BF16],
@@ -1140,8 +1167,11 @@ def prefill_attention_csa_cp_core(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos_local: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_local: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    q_cos_il: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    q_sin_signed: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    q_swap_idx: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.INT32],
+    idx_cos: pl.Tensor[[CP_Q_T_DYN, HALF_ROPE], pl.FP32],
+    idx_sin: pl.Tensor[[CP_Q_T_DYN, HALF_ROPE], pl.FP32],
     freqs_cos_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_cos_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
@@ -1201,11 +1231,6 @@ def prefill_attention_csa_cp_core(
     """CSA attention body: local queries/indexer and replicated full KV state."""
     q_dim = pl.tensor.dim(x_normed_local, 0)
     kv_dim = pl.tensor.dim(x_normed_full, 0)
-
-    q_cos_il = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-    q_sin_signed = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-    q_swap_idx = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
-    rope_prepare(freqs_cos_local, freqs_sin_local, q_cos_il, q_sin_signed, q_swap_idx)
 
     q = pl.create_tensor([q_dim, H, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([q_dim, Q_LORA], dtype=pl.INT8)
@@ -1275,20 +1300,6 @@ def prefill_attention_csa_cp_core(
             indexer_cache_ready,
         )
 
-    # Local indexer queries with half-width FP32 RoPE.
-    idx_cos = pl.create_tensor([q_dim, HALF_ROPE], dtype=pl.FP32)
-    idx_sin = pl.create_tensor([q_dim, HALF_ROPE], dtype=pl.FP32)
-    rope_blocks = (q_dim + CSA_ROPE_TILE - 1) // CSA_ROPE_TILE
-    for prep_block in pl.spmd(rope_blocks, name_hint="prefill_csa_cp_idx_halfrope"):
-        idx_t = prep_block * CSA_ROPE_TILE
-        idx_rows = pl.min(CSA_ROPE_TILE, q_dim - idx_t)
-        idx_cos_bf16 = pl.slice(freqs_cos_local, [CSA_ROPE_TILE, HALF_ROPE], [idx_t, 0], valid_shape=[idx_rows, HALF_ROPE])
-        idx_sin_bf16 = pl.slice(freqs_sin_local, [CSA_ROPE_TILE, HALF_ROPE], [idx_t, 0], valid_shape=[idx_rows, HALF_ROPE])
-        idx_cos_fp32 = pl.cast(idx_cos_bf16, target_type=pl.FP32)
-        idx_sin_fp32 = pl.cast(idx_sin_bf16, target_type=pl.FP32)
-        idx_cos[idx_t : idx_t + CSA_ROPE_TILE, 0:HALF_ROPE] = idx_cos_fp32
-        idx_sin[idx_t : idx_t + CSA_ROPE_TILE, 0:HALF_ROPE] = idx_sin_fp32
-
     dup, swap, sign, scores, pairs, ready = prepare_prefill_indexer_workspace(indexer_cache_ready)
     selection_completion = pl.array.create(1, pl.TASK_ID)
     selection_completion[0] = ready
@@ -1336,6 +1347,11 @@ def prefill_attention_csa_cp_local(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    q_cos_il: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    q_sin_signed: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    q_swap_idx: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.INT32],
+    idx_cos: pl.Tensor[[CP_Q_T_DYN, HALF_ROPE], pl.FP32],
+    idx_sin: pl.Tensor[[CP_Q_T_DYN, HALF_ROPE], pl.FP32],
     cmp_freqs_cos: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_sin: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
@@ -1434,16 +1450,12 @@ def prefill_attention_csa_cp_local(
             group_base, tp_rank, weight_published, weight_waited, norm_ready_tid,
         )
     x_normed_full = pl.create_tensor([kv_dim, D], dtype=pl.BF16)
-    local_base = tp_rank * q_dim
-    freqs_cos_local = pl.slice(freqs_cos, [q_dim, ROPE_HEAD_DIM], [local_base, 0])
-    freqs_sin_local = pl.slice(freqs_sin, [q_dim, ROPE_HEAD_DIM], [local_base, 0])
-
     attn_out_local = pl.create_tensor([q_dim, D], dtype=pl.BF16)
     attn_out_local = prefill_attention_csa_cp_core(
         x_normed_local, x_normed_full, query_start_loc, state_checkpoint_ends,
         wq_a, wq_b, wq_b_scale,
         wkv, gamma_cq, gamma_ckv,
-        freqs_cos_local, freqs_sin_local,
+        q_cos_il, q_sin_signed, q_swap_idx, idx_cos, idx_sin,
         freqs_cos, freqs_sin,
         cmp_freqs_cos, cmp_freqs_sin,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
@@ -1547,6 +1559,12 @@ def prefill_attention_csa_cp(
     inverse_rope, inverse_swap_idx, inverse_ready = prepare_sparse_attn_rope(
         freqs_cos, freqs_sin, local_base, q_dim, pl.const(1, pl.INT32),
     )
+    q_cos_il, q_sin_signed, q_swap_idx = prepare_prefill_query_rope(
+        freqs_cos, freqs_sin, local_base, q_dim, pl.const(1, pl.INT32),
+    )
+    idx_cos, idx_sin = prepare_csa_indexer_rope(
+        freqs_cos, freqs_sin, local_base, q_dim, pl.const(1, pl.INT32),
+    )
     x_hc_local = pl.slice(x_hc_full, [q_dim, HC_MULT, D], [local_base, 0, 0])
     x_out_local = pl.slice(x_out_full, [q_dim, HC_MULT, D], [local_base, 0, 0])
     plan = pl.create_tensor([1], dtype=pl.INT32)
@@ -1565,6 +1583,7 @@ def prefill_attention_csa_cp(
         attn_norm_w, wq_a, wq_b, wq_b_scale,
         wkv, gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin,
+        q_cos_il, q_sin_signed, q_swap_idx, idx_cos, idx_sin,
         cmp_freqs_cos, cmp_freqs_sin,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         compress_state, compress_state_block_table,
