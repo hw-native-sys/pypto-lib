@@ -20,7 +20,7 @@ from config import (
     ORI_BLOCKS_DYN, TABLE_DYN, T_DYN, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
 from hc import hc_head_norm, hc_project, hc_sinkhorn
-from decode_indexer import c1a_index, score_reindex_pool
+from decode_indexer import c1a_index, score_reindex_pool_pypto
 from qkv_proj_rope import qkv_quant, q_proj_rope, kv_proj, window_publish
 from o_proj import o_proj_hc_post
 from sparse_attention import gather_sparse_attention
@@ -122,7 +122,7 @@ def decode_c1a_reindex(
         num_tokens,
         qb_payload, qb_scales,
     )
-    score_reindex_pool(
+    score_reindex_pool_pypto(
         index_query, index_query_scale, index_weights, index_cache, index_cache_scale,
         index_block_table, request_ids, compressed_lens, pool_block_ids, pool_block_counts,
         topk_indices, num_tokens,
