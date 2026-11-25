@@ -873,121 +873,29 @@ def _score_index_rows(
 ):
     tokens = pl.tensor.dim(query, 0)
     query_rows = tokens * INDEX_H
-    query_packed = pl.reshape(query, [query_rows, INDEX_DIM // 2])
+    packed_query_bytes = pl.reshape(query, [query_rows, INDEX_DIM // 2])
+    query_packed = pl.reinterpret_view(packed_query_bytes, pl.FP4E2M1X2)
     query_carrier = pl.create_tensor([query_rows, INDEX_DIM], dtype=pl.FP8E4M3FN)
     with pl.spmd(16, name_hint="idx_score_query_decode", deps=[query_ready]) as query_tid:
         worker = pl.tile.get_block_idx()
         for token in pl.range(worker, num_tokens, 16):
-            packed_query = pl.tile.load(query_packed, [token * INDEX_H, 0], [INDEX_H, INDEX_DIM // 2], target_memory=pl.MemorySpace.Vec)
-            source = pl.reshape(packed_query, [32 * 64])
-            decoded = pl.tile.full([32 * 128], dtype=pl.UINT8, value=0)
-            decoded = pl.tile.move(decoded, target_memory=pl.MemorySpace.Vec)
-            with pl.reg_scope():
-                for query_row in pl.hardware_loop(32):
-                    r1_mask = pl.reg.full_mask(lanes=64)
-                    r1_raw = pl.reg.load(source, query_row * 64, lanes=64)
-                    r1_wide16 = pl.reg.convert(r1_raw, dtype=pl.UINT16)
-                    r1_wide = pl.reg.convert(r1_wide16, dtype=pl.UINT32)
-                    r1_nibble_mask = pl.reg.broadcast(15, lanes=64, dtype=pl.UINT32)
-                    r1_low = pl.reg.bitwise_and(r1_wide, r1_nibble_mask)
-                    r1_high = pl.reg.shift_rights(r1_wide, 4, r1_mask)
-                    r1_high = pl.reg.bitwise_and(r1_high, r1_nibble_mask)
-                    r1_magnitude_mask = pl.reg.broadcast(7, lanes=64, dtype=pl.UINT32)
-                    r1_sign_mask = pl.reg.broadcast(8, lanes=64, dtype=pl.UINT32)
-                    r1_zero = pl.reg.broadcast(0, lanes=64, dtype=pl.UINT32)
-                    r1_half = pl.reg.broadcast(48, lanes=64, dtype=pl.UINT32)
-                    r1_low_magnitude = pl.reg.bitwise_and(r1_low, r1_magnitude_mask)
-                    r1_low_bits = pl.reg.shift_lefts(r1_low_magnitude, 2, r1_mask)
-                    r1_low_bits = pl.reg.adds(r1_low_bits, 48, r1_mask)
-                    r1_low_zero = pl.reg.compares(r1_low_magnitude, 0, r1_mask, predicate="eq")
-                    r1_low_half = pl.reg.compares(r1_low_magnitude, 1, r1_mask, predicate="eq")
-                    r1_low_bits = pl.reg.select(r1_low_half, r1_half, r1_low_bits)
-                    r1_low_bits = pl.reg.select(r1_low_zero, r1_zero, r1_low_bits)
-                    r1_low_sign = pl.reg.bitwise_and(r1_low, r1_sign_mask)
-                    r1_low_sign = pl.reg.shift_lefts(r1_low_sign, 4, r1_mask)
-                    r1_low_bits = pl.reg.bitwise_or(r1_low_bits, r1_low_sign)
-                    r1_low_signed = pl.reg.interpret_cast(r1_low_bits, dtype=pl.INT32)
-                    r1_low_byte = pl.reg.convert(r1_low_signed, dtype=pl.INT8, saturate=False)
-                    r1_low_byte = pl.reg.interpret_cast(r1_low_byte, dtype=pl.UINT8)
-                    r1_high_magnitude = pl.reg.bitwise_and(r1_high, r1_magnitude_mask)
-                    r1_high_bits = pl.reg.shift_lefts(r1_high_magnitude, 2, r1_mask)
-                    r1_high_bits = pl.reg.adds(r1_high_bits, 48, r1_mask)
-                    r1_high_zero = pl.reg.compares(r1_high_magnitude, 0, r1_mask, predicate="eq")
-                    r1_high_half = pl.reg.compares(r1_high_magnitude, 1, r1_mask, predicate="eq")
-                    r1_high_bits = pl.reg.select(r1_high_half, r1_half, r1_high_bits)
-                    r1_high_bits = pl.reg.select(r1_high_zero, r1_zero, r1_high_bits)
-                    r1_high_sign = pl.reg.bitwise_and(r1_high, r1_sign_mask)
-                    r1_high_sign = pl.reg.shift_lefts(r1_high_sign, 4, r1_mask)
-                    r1_high_bits = pl.reg.bitwise_or(r1_high_bits, r1_high_sign)
-                    r1_high_signed = pl.reg.interpret_cast(r1_high_bits, dtype=pl.INT32)
-                    r1_high_byte = pl.reg.convert(r1_high_signed, dtype=pl.INT8, saturate=False)
-                    r1_high_byte = pl.reg.interpret_cast(r1_high_byte, dtype=pl.UINT8)
-                    r1_first, r1_second = pl.reg.intlv(r1_low_byte, r1_high_byte, r1_mask)
-                    _query_write0 = pl.reg.store(decoded, query_row * 128, r1_first)
-                    _query_write1 = pl.reg.store(decoded, query_row * 128 + 64, r1_second)
-            signed_carrier = pl.reinterpret_view(decoded, pl.INT8)
-            carrier = pl.reinterpret_view(signed_carrier, pl.FP8E4M3FN)
-            decoded_query = pl.reshape(carrier, [32, INDEX_DIM])
-            query_carrier = pl.store(decoded_query, [token * INDEX_H, 0], query_carrier)
+            query_row = token * INDEX_H
+            packed_query = pl.tile.load(query_packed, [query_row, 0], [INDEX_H, INDEX_DIM // 2])
+            decoded_query = pl.cast(packed_query, pl.FP8E4M3FN)
+            query_carrier = pl.store(decoded_query, [query_row, 0], query_carrier)
 
     pages = pl.tensor.dim(cache, 0)
     cache_rows = pages * 128
-    packed_cache = pl.reshape(cache, [cache_rows, INDEX_DIM // 2])
+    cache_bytes = pl.reshape(cache, [cache_rows, INDEX_DIM // 2])
+    packed_cache = pl.reinterpret_view(cache_bytes, pl.FP4E2M1X2)
     decoded_keys = pl.create_tensor([cache_rows, INDEX_DIM], dtype=pl.FP8E4M3FN)
     with pl.spmd(16, name_hint="idx_score_key_decode", deps=[cache_ready]) as cache_tid:
         worker = pl.tile.get_block_idx()
         for page in pl.range(worker, pages, 16):
-            packed_key = pl.tile.load(packed_cache, [page * 128, 0], [128, INDEX_DIM // 2], target_memory=pl.MemorySpace.Vec)
-            key_source = pl.reshape(packed_key, [128 * 64])
-            key_decoded = pl.tile.full([128 * 128], dtype=pl.UINT8, value=0)
-            key_decoded = pl.tile.move(key_decoded, target_memory=pl.MemorySpace.Vec)
-            with pl.reg_scope():
-                for key_row in pl.hardware_loop(128):
-                    r2_key_mask = pl.reg.full_mask(lanes=64)
-                    r2_key_raw = pl.reg.load(key_source, key_row * 64, lanes=64)
-                    r2_key_wide16 = pl.reg.convert(r2_key_raw, dtype=pl.UINT16)
-                    r2_key_wide = pl.reg.convert(r2_key_wide16, dtype=pl.UINT32)
-                    r2_key_nibble_mask = pl.reg.broadcast(15, lanes=64, dtype=pl.UINT32)
-                    r2_key_low = pl.reg.bitwise_and(r2_key_wide, r2_key_nibble_mask)
-                    r2_key_high = pl.reg.shift_rights(r2_key_wide, 4, r2_key_mask)
-                    r2_key_high = pl.reg.bitwise_and(r2_key_high, r2_key_nibble_mask)
-                    r2_key_magnitude_mask = pl.reg.broadcast(7, lanes=64, dtype=pl.UINT32)
-                    r2_key_sign_mask = pl.reg.broadcast(8, lanes=64, dtype=pl.UINT32)
-                    r2_key_zero = pl.reg.broadcast(0, lanes=64, dtype=pl.UINT32)
-                    r2_key_half = pl.reg.broadcast(48, lanes=64, dtype=pl.UINT32)
-                    r2_key_low_magnitude = pl.reg.bitwise_and(r2_key_low, r2_key_magnitude_mask)
-                    r2_key_low_bits = pl.reg.shift_lefts(r2_key_low_magnitude, 2, r2_key_mask)
-                    r2_key_low_bits = pl.reg.adds(r2_key_low_bits, 48, r2_key_mask)
-                    r2_key_low_zero = pl.reg.compares(r2_key_low_magnitude, 0, r2_key_mask, predicate="eq")
-                    r2_key_low_half = pl.reg.compares(r2_key_low_magnitude, 1, r2_key_mask, predicate="eq")
-                    r2_key_low_bits = pl.reg.select(r2_key_low_half, r2_key_half, r2_key_low_bits)
-                    r2_key_low_bits = pl.reg.select(r2_key_low_zero, r2_key_zero, r2_key_low_bits)
-                    r2_key_low_sign = pl.reg.bitwise_and(r2_key_low, r2_key_sign_mask)
-                    r2_key_low_sign = pl.reg.shift_lefts(r2_key_low_sign, 4, r2_key_mask)
-                    r2_key_low_bits = pl.reg.bitwise_or(r2_key_low_bits, r2_key_low_sign)
-                    r2_key_low_signed = pl.reg.interpret_cast(r2_key_low_bits, dtype=pl.INT32)
-                    r2_key_low_byte = pl.reg.convert(r2_key_low_signed, dtype=pl.INT8, saturate=False)
-                    r2_key_low_byte = pl.reg.interpret_cast(r2_key_low_byte, dtype=pl.UINT8)
-                    r2_key_high_magnitude = pl.reg.bitwise_and(r2_key_high, r2_key_magnitude_mask)
-                    r2_key_high_bits = pl.reg.shift_lefts(r2_key_high_magnitude, 2, r2_key_mask)
-                    r2_key_high_bits = pl.reg.adds(r2_key_high_bits, 48, r2_key_mask)
-                    r2_key_high_zero = pl.reg.compares(r2_key_high_magnitude, 0, r2_key_mask, predicate="eq")
-                    r2_key_high_half = pl.reg.compares(r2_key_high_magnitude, 1, r2_key_mask, predicate="eq")
-                    r2_key_high_bits = pl.reg.select(r2_key_high_half, r2_key_half, r2_key_high_bits)
-                    r2_key_high_bits = pl.reg.select(r2_key_high_zero, r2_key_zero, r2_key_high_bits)
-                    r2_key_high_sign = pl.reg.bitwise_and(r2_key_high, r2_key_sign_mask)
-                    r2_key_high_sign = pl.reg.shift_lefts(r2_key_high_sign, 4, r2_key_mask)
-                    r2_key_high_bits = pl.reg.bitwise_or(r2_key_high_bits, r2_key_high_sign)
-                    r2_key_high_signed = pl.reg.interpret_cast(r2_key_high_bits, dtype=pl.INT32)
-                    r2_key_high_byte = pl.reg.convert(r2_key_high_signed, dtype=pl.INT8, saturate=False)
-                    r2_key_high_byte = pl.reg.interpret_cast(r2_key_high_byte, dtype=pl.UINT8)
-                    r2_key_first, r2_key_second = pl.reg.intlv(r2_key_low_byte, r2_key_high_byte, r2_key_mask)
-                    _key_write0 = pl.reg.store(key_decoded, key_row * 128, r2_key_first)
-                    _key_write1 = pl.reg.store(key_decoded, key_row * 128 + 64, r2_key_second)
-            key_signed_carrier = pl.reinterpret_view(key_decoded, pl.INT8)
-            key_carrier = pl.reinterpret_view(key_signed_carrier, pl.FP8E4M3FN)
-            key = pl.reshape(key_carrier, [128, INDEX_DIM])
-            decoded_keys = pl.store(key, [page * 128, 0], decoded_keys)
+            key_row = page * 128
+            packed_key = pl.tile.load(packed_cache, [key_row, 0], [128, INDEX_DIM // 2])
+            decoded_key = pl.cast(packed_key, pl.FP8E4M3FN)
+            decoded_keys = pl.store(decoded_key, [key_row, 0], decoded_keys)
 
     width = pl.tensor.dim(scores, 1)
     panels = (width + SCORE_TILE - 1) // SCORE_TILE
@@ -2279,6 +2187,50 @@ def qli_validation(
     return physical
 
 
+@pl.jit
+def reindex_validation(
+    query: pl.Tensor[[T_DYN, INDEX_H * INDEX_DIM // 2], pl.UINT8],
+    query_scale: pl.Tensor[[T_DYN, INDEX_H * _SCALE_COUNT], pl.FP8E8M0],
+    raw_weights: pl.Tensor[[T_DYN, INDEX_H], pl.BF16],
+    key: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
+    key_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, _SCALE_COUNT], pl.FP8E8M0],
+    table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
+    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    lengths: pl.Tensor[[T_DYN], pl.INT32],
+    physical: pl.InOut[pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32]],
+    pool_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
+    pool_counts: pl.Tensor[[T_DYN], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    use_pypto: pl.constexpr,
+):
+    query.bind_dynamic(0, T_DYN)
+    key.bind_dynamic(0, INDEX_BLOCKS_DYN)
+    table.bind_dynamic(0, B_DYN)
+    table.bind_dynamic(1, TABLE_DYN)
+    pool_ids.bind_dynamic(1, INDEX_POOL_BLOCKS_DYN)
+    width = pl.tensor.dim(pool_ids, 1) * CANDIDATE_BLOCK_SIZE
+    if use_pypto:
+        tokens = pl.tensor.dim(physical, 0)
+        dense_width = pl.min(width, pl.tensor.dim(table, 1) * 128)
+        scores = pl.create_tensor([tokens, dense_width], dtype=pl.FP32)
+        ready = pl.system.task_dummy(deps=[])
+        score_select_paged_pypto(
+            query, query_scale, raw_weights, key, key_scale,
+            table, request_ids, lengths, scores, physical,
+            num_tokens, ready, ready, ready, pl.tensor.dim(pool_ids, 1), "score",
+        )
+    else:
+        runs, dense_width = plan_reindex_pool(
+            key, table, request_ids, lengths, pool_ids, pool_counts, width, num_tokens,
+        )
+        score_reindex_pool(
+            query, query_scale, raw_weights, key, key_scale,
+            table, request_ids, lengths, pool_ids, pool_counts,
+            runs, dense_width, physical, num_tokens,
+        )
+    return physical
+
+
 import numpy as np
 import torch
 from qkv_proj_rope import golden_rope_tail, golden_rope_interleave
@@ -2667,7 +2619,25 @@ def golden_qli(tensors, *, candidates, sorted_index):
         tensors["pool_counts"][:] = counts
 
 
-def build_validation_specs(batch=2, sequence=2, kv_length=16513, seed=17, page_rows=128):
+def golden_reindex(tensors):
+    """Select from an identity or sparse pool using the same score reference."""
+    tokens = int(tensors["num_tokens"])
+    query = tensors["query"][:tokens].reshape(tokens, INDEX_H, INDEX_DIM // 2)
+    scales = tensors["query_scale"][:tokens].reshape(tokens, INDEX_H, _SCALE_COUNT)
+    queries = dequantize_mxfp4_cache(query, scales, INDEX_CACHE_GROUP, "e8m0")
+    keys = dequantize_mxfp4_cache(tensors["key"], tensors["key_scale"], INDEX_CACHE_GROUP, "e8m0")
+    weights = (tensors["raw_weights"][:tokens].float() * (INDEX_H * INDEX_DIM) ** -0.5).bfloat16()
+    lengths = tensors["lengths"][:tokens]
+    scores, physical = _golden_paged_index_scores(
+        queries, weights, keys.reshape(-1, INDEX_DIM),
+        tensors["table"], tensors["request_ids"][:tokens], lengths,
+    )
+    counts = tensors["pool_counts"][:tokens]
+    scores, physical = golden_pool_index_scores(scores, physical, tensors["pool_ids"][:tokens], counts)
+    tensors["physical"][:tokens] = golden_c1a_index_topk(scores, physical, lengths, counts)
+
+
+def build_validation_specs(batch=2, sequence=2, kv_length=16513, seed=17, page_rows=128, reindex_pool=None):
     from golden import ScalarSpec, TensorSpec
 
     if min(batch, sequence, kv_length) <= 0:
@@ -2707,8 +2677,23 @@ def build_validation_specs(batch=2, sequence=2, kv_length=16513, seed=17, page_r
     blocks = (pages * page_rows + 7) // 8
     capacity = min(2048, max(32, (blocks + 31) // 32 * 32))
     rows = tokens + 1
-    for name, shape in [("physical", [rows, 512]), ("pool_ids", [rows, capacity]), ("pool_counts", [rows])]:
-        specs.append(TensorSpec(name, shape, torch.int32, init_value=lambda shape=shape: torch.full(shape, -777, dtype=torch.int32)))
+    specs.append(TensorSpec("physical", [rows, INDEX_TOPK], torch.int32, init_value=-777))
+    if reindex_pool is None:
+        specs.append(TensorSpec("pool_ids", [rows, capacity], torch.int32, init_value=-777))
+        specs.append(TensorSpec("pool_counts", [rows], torch.int32, init_value=-777))
+    else:
+        if reindex_pool == "dense" and kv_length > CANDIDATE_TOPK_BLOCKS * CANDIDATE_BLOCK_SIZE:
+            raise ValueError("Dense reindex requires the complete history to fit in the candidate pool")
+        capacity = min(CANDIDATE_TOPK_BLOCKS, ((blocks + 31) // 32) * 32)
+        block_ids = torch.arange(capacity, dtype=torch.int32)
+        counts = (values["lengths"] + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+        block_ids = block_ids.unsqueeze(0).expand(rows, -1)
+        if reindex_pool == "sparse":
+            counts = ((counts + 1) // 2).clamp_max(capacity)
+            block_ids = block_ids * 2
+        pool = torch.where(torch.arange(capacity) < counts[:, None], block_ids, -1)
+        specs.append(TensorSpec("pool_ids", [rows, capacity], torch.int32, init_value=pool))
+        specs.append(TensorSpec("pool_counts", [rows], torch.int32, init_value=counts))
     specs.append(ScalarSpec("num_tokens", torch.int32, tokens, compile_runtime=True))
     return specs
 
@@ -2718,7 +2703,7 @@ if __name__ == "__main__":
     from functools import partial
     from golden import run
 
-    parser = argparse.ArgumentParser(description="Paged C++ LI precision validation")
+    parser = argparse.ArgumentParser(description="A5 Lightning Indexer validation")
     parser.add_argument("--device", "-d", type=int, default=0)
     parser.add_argument("--batch", type=int, help="Default: 2")
     parser.add_argument("--sequence", type=int, help="Default: 2")
@@ -2731,8 +2716,44 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-dir")
     parser.add_argument("--candidates", choices=["both", "on", "off"], default="both")
     parser.add_argument("--sorted-index", choices=["both", "on", "off"], default="both")
+    parser.add_argument("--reindex-pool", choices=["dense", "sparse"])
+    parser.add_argument("--reindex-backend", choices=["cpp", "python"], default="cpp")
     parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=range(5))
     args = parser.parse_args()
+    if args.reindex_pool:
+        if args.page_rows not in (None, 128):
+            parser.error("Reindex validation uses 128-row cache pages")
+        if args.reindex_backend == "python" and args.reindex_pool != "dense":
+            parser.error("The Python reindex candidate supports identity pools")
+        mode = f"pool={args.reindex_pool} backend={args.reindex_backend}"
+        if args.runtime_dir:
+            marker = Path(args.runtime_dir) / "reindex_validation.mode"
+            if not marker.is_file() or marker.read_text().strip() != mode:
+                parser.error(f"Reindex replay requires a build for {mode}")
+        batch = 2 if args.batch is None else args.batch
+        sequence = 2 if args.sequence is None else args.sequence
+        kv_length = 1025 if args.kv_length is None else args.kv_length
+        print(f"Reindex {mode} shape={batch}x{sequence} kv={kv_length}", flush=True)
+        result = run(
+            fn=reindex_validation.specialize(num_tokens=pl.RUNTIME, use_pypto=args.reindex_backend == "python"),
+            specs=build_validation_specs(batch, sequence, kv_length, args.seed, reindex_pool=args.reindex_pool),
+            golden_fn=golden_reindex,
+            compile_only=args.compile_only,
+            save_data=args.save_data,
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            config=dict(backend_type="a5", execution_mode=False, device_id=args.device,
+                        enable_chip_swimlane=args.enable_chip_swimlane),
+            rtol=0,
+            atol=0,
+        )
+        if not args.runtime_dir and result.work_dir is not None:
+            (result.work_dir / "reindex_validation.mode").write_text(mode + "\n")
+        if not result.passed:
+            raise SystemExit(result.error or 1)
+        raise SystemExit(0)
+    if args.reindex_backend != "cpp":
+        parser.error("--reindex-backend requires --reindex-pool")
     replay = bool(args.golden_data or args.runtime_dir)
     if replay and (args.candidates == "both" or args.sorted_index == "both"):
         parser.error("Replay requires explicit --candidates on/off and --sorted-index on/off")
