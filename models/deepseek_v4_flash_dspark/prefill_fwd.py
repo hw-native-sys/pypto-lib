@@ -113,6 +113,7 @@ from prefill_o_proj import (
     O_PROJ_WO_A_WINDOW_ROWS,
     O_PROJ_WO_B_WINDOW_COLS,
     O_PROJ_WO_B_WINDOW_ROWS,
+    copy_full_o_proj_weights,
     retire_o_proj_weight_signals,
 )
 from hc_head import hc_head
@@ -147,6 +148,9 @@ FWD_INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_INNER_STATE_BLOCK_NUM_DYN")
 # model config
 MODEL_NUM_LAYERS = MODEL_CONFIG.num_hidden_layers
 FWD_NUM_LAYERS = 43
+FULL_O_PROJ_WEIGHTS = os.environ.get("PYPTO_DSPARK_PREFILL_FULL_O_PROJ_WEIGHTS") == "1"
+FWD_O_PROJ_GROUPS = O_PROJ_SCRATCH_GROUPS if FULL_O_PROJ_WEIGHTS else O_PROJ_LOCAL_GROUPS
+FWD_O_PROJ_A_LAYOUT = pl.NZ if FULL_O_PROJ_WEIGHTS else pl.ND
 CSA_NUM_LAYERS = 21
 HCA_NUM_LAYERS = 20
 CSA_CMP_STORAGE_BLOCK_SIZE = BLOCK_SIZE
@@ -272,6 +276,42 @@ def _copy_target_hc_row(
     return target
 
 
+if FULL_O_PROJ_WEIGHTS:
+    @pl.jit.inline
+    def _prefill_o_proj_layer_weights(
+        wo_a: pl.Tensor,
+        wo_b: pl.Tensor,
+        group_start: pl.Scalar[pl.INDEX],
+        wo_a_scratch: pl.Tensor,
+        wo_b_scratch: pl.Tensor,
+        ALLOCATE_A: pl.constexpr,
+    ) -> tuple[
+        pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+        pl.Tensor[[O_PROJ_SCRATCH_GROUPS, D, O_LORA], pl.INT8],
+    ]:
+        layer_a = pl.slice(wo_a, [O_PROJ_SCRATCH_GROUPS, O_LORA, O_GROUP_IN], [group_start, 0, 0])
+        layer_b = pl.slice(wo_b, [O_PROJ_SCRATCH_GROUPS, D, O_LORA], [group_start, 0, 0])
+        return layer_a, layer_b
+else:
+    @pl.jit.inline
+    def _prefill_o_proj_layer_weights(
+        wo_a: pl.Tensor,
+        wo_b: pl.Tensor,
+        group_start: pl.Scalar[pl.INDEX],
+        wo_a_scratch: pl.Tensor,
+        wo_b_scratch: pl.Tensor,
+        ALLOCATE_A: pl.constexpr,
+    ) -> tuple[
+        pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+        pl.Tensor[[O_PROJ_SCRATCH_GROUPS, D, O_LORA], pl.INT8],
+    ]:
+        if ALLOCATE_A:
+            layer_a = pl.create_tensor([O_PROJ_SCRATCH_GROUPS, O_LORA, O_GROUP_IN], dtype=pl.BF16, layout=pl.NZ)
+        else:
+            layer_a = wo_a_scratch
+        return layer_a, wo_b_scratch
+
+
 @pl.jit(auto_scope=False)
 def prefill_fwd(
     x_hc: pl.InOut[pl.Tensor[[FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32]],
@@ -289,8 +329,8 @@ def prefill_fwd(
     gamma_ckv: pl.Tensor[[FWD_NUM_LAYERS * HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[FWD_ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     attn_sink: pl.Tensor[[FWD_NUM_LAYERS * H], pl.FP32],
-    wo_a: pl.Tensor[[FWD_NUM_LAYERS * O_PROJ_LOCAL_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[FWD_NUM_LAYERS * O_PROJ_LOCAL_GROUPS, D, O_LORA], pl.INT8],
+    wo_a: pl.Tensor[[FWD_NUM_LAYERS * FWD_O_PROJ_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, FWD_O_PROJ_A_LAYOUT],
+    wo_b: pl.Tensor[[FWD_NUM_LAYERS * FWD_O_PROJ_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
     hca_cmp_kv: pl.InOut[pl.Tensor[[FWD_HCA_CMP_BLOCK_NUM_DYN, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     csa_cmp_kv: pl.InOut[pl.Tensor[[FWD_CSA_CMP_BLOCK_NUM_DYN, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
@@ -495,7 +535,7 @@ def prefill_fwd(
         q_head_start_l0 = layer_l0 * H * HEAD_DIM
         head_dim_start_l0 = layer_l0 * HEAD_DIM
         attn_head_start_l0 = layer_l0 * H
-        o_proj_group_start_l0 = layer_l0 * O_PROJ_LOCAL_GROUPS
+        o_proj_group_start_l0 = layer_l0 * FWD_O_PROJ_GROUPS
         expert_start_l0 = layer_l0 * N_EXPERTS_GLOBAL
         vocab_start_l0 = layer_l0 * VOCAB
         local_expert_start_l0 = layer_l0 * N_LOCAL
@@ -542,7 +582,9 @@ def prefill_fwd(
             gather_signal_step = gather_signal
             o_proj_wo_b_full_step = o_proj_wo_b_full
             if group_tokens > 0:
-                wo_a_nz_step = pl.create_tensor([O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], dtype=pl.BF16, layout=pl.NZ)
+                weights_a, weights_b = _prefill_o_proj_layer_weights(
+                    wo_a, wo_b, o_proj_group_start_l0, o_proj_wo_a_full, o_proj_wo_b_full_step, ALLOCATE_A=True,
+                )
                 prefill_attention_swa_cp_local(
                     x_hc_local,
                     hc_attn_fn_l0, hc_attn_scale_l0, hc_attn_base_l0,
@@ -552,7 +594,7 @@ def prefill_fwd(
                     kv_cache_l0, ori_block_table, ori_slot_mapping_full,
                     position_ids_local, position_ids_full, local_request_ids,
                     attn_sink_l0, wo_a_l0, wo_b_l0, wo_b_scale_l0,
-                    wo_a_nz_step, o_proj_wo_b_full_step,
+                    weights_a, weights_b,
                     attn_stage_step,
                     gather_window, gather_signal_step,
                     o_proj_wo_a_window, o_proj_wo_b_window,
@@ -560,6 +602,7 @@ def prefill_fwd(
                     layer_completion,
                     group_base, tp_rank, layer_l0 + pl.const(1, pl.INT32),
                     swa_inverse, swa_swap_idx, swa_rope_ready,
+                    FULL_O_PROJ_WEIGHTS=FULL_O_PROJ_WEIGHTS,
                 )
 
         with pl.scope():
@@ -588,7 +631,7 @@ def prefill_fwd(
         q_head_start_l1 = layer_l1 * H * HEAD_DIM
         head_dim_start_l1 = layer_l1 * HEAD_DIM
         attn_head_start_l1 = layer_l1 * H
-        o_proj_group_start_l1 = layer_l1 * O_PROJ_LOCAL_GROUPS
+        o_proj_group_start_l1 = layer_l1 * FWD_O_PROJ_GROUPS
         expert_start_l1 = layer_l1 * N_EXPERTS_GLOBAL
         vocab_start_l1 = layer_l1 * VOCAB
         local_expert_start_l1 = layer_l1 * N_LOCAL
@@ -635,7 +678,9 @@ def prefill_fwd(
             gather_signal_step = gather_signal
             o_proj_wo_b_full_step = o_proj_wo_b_full
             if group_tokens > 0:
-                wo_a_nz_step = pl.create_tensor([O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], dtype=pl.BF16, layout=pl.NZ)
+                weights_a, weights_b = _prefill_o_proj_layer_weights(
+                    wo_a, wo_b, o_proj_group_start_l1, o_proj_wo_a_full, o_proj_wo_b_full_step, ALLOCATE_A=True,
+                )
                 prefill_attention_swa_cp_local(
                     x_hc_local,
                     hc_attn_fn_l1, hc_attn_scale_l1, hc_attn_base_l1,
@@ -645,7 +690,7 @@ def prefill_fwd(
                     kv_cache_l1, ori_block_table, ori_slot_mapping_full,
                     position_ids_local, position_ids_full, local_request_ids,
                     attn_sink_l1, wo_a_l1, wo_b_l1, wo_b_scale_l1,
-                    wo_a_nz_step, o_proj_wo_b_full_step,
+                    weights_a, weights_b,
                     attn_stage_step,
                     gather_window, gather_signal_step,
                     o_proj_wo_a_window, o_proj_wo_b_window,
@@ -653,6 +698,7 @@ def prefill_fwd(
                     layer_completion,
                     group_base, tp_rank, layer_l1 + pl.const(1, pl.INT32),
                     swa_inverse, swa_swap_idx, swa_rope_ready,
+                    FULL_O_PROJ_WEIGHTS=FULL_O_PROJ_WEIGHTS,
                 )
 
         with pl.scope():
@@ -690,7 +736,7 @@ def prefill_fwd(
             q_head_start_csa = csa_layer * H * HEAD_DIM
             head_dim_start_csa = csa_layer * HEAD_DIM
             attn_head_start_csa = csa_layer * H
-            o_proj_group_start_csa = csa_layer * O_PROJ_LOCAL_GROUPS
+            o_proj_group_start_csa = csa_layer * FWD_O_PROJ_GROUPS
             expert_start_csa = csa_layer * N_EXPERTS_GLOBAL
             vocab_start_csa = csa_layer * VOCAB
             local_expert_start_csa = csa_layer * N_LOCAL
@@ -787,7 +833,9 @@ def prefill_fwd(
                 gather_signal_step = gather_signal
                 o_proj_wo_b_full_step = o_proj_wo_b_full
                 if group_tokens > 0:
-                    wo_a_nz_step = pl.create_tensor([O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], dtype=pl.BF16, layout=pl.NZ)
+                    weights_a, weights_b = _prefill_o_proj_layer_weights(
+                        wo_a, wo_b, o_proj_group_start_csa, o_proj_wo_a_full, o_proj_wo_b_full_step, ALLOCATE_A=True,
+                    )
                     prefill_attention_csa_cp_local(
                         x_hc_local,
                         query_start_loc, state_checkpoint_ends,
@@ -809,7 +857,7 @@ def prefill_fwd(
                         csa_cmp_slot_mapping_full, csa_idx_slot_mapping_full,
                         csa_state_slot_mapping_full, csa_inner_state_slot_mapping_full,
                         attn_sink_csa, wo_a_csa, wo_b_csa, wo_b_scale_csa,
-                        wo_a_nz_step, o_proj_wo_b_full_step,
+                        weights_a, weights_b,
                         attn_stage_step,
                         gather_window, gather_signal_step,
                         o_proj_wo_a_window, o_proj_wo_b_window,
@@ -817,6 +865,7 @@ def prefill_fwd(
                         layer_completion,
                         group_base, tp_rank, csa_layer + pl.const(1, pl.INT32), csa_compact,
                         compressed_inverse, compressed_swap_idx, compressed_rope_ready,
+                        FULL_O_PROJ_WEIGHTS=FULL_O_PROJ_WEIGHTS,
                     )
 
             with pl.scope():
@@ -857,7 +906,7 @@ def prefill_fwd(
             q_head_start_hca = hca_layer * H * HEAD_DIM
             head_dim_start_hca = hca_layer * HEAD_DIM
             attn_head_start_hca = hca_layer * H
-            o_proj_group_start_hca = hca_layer * O_PROJ_LOCAL_GROUPS
+            o_proj_group_start_hca = hca_layer * FWD_O_PROJ_GROUPS
             expert_start_hca = hca_layer * N_EXPERTS_GLOBAL
             vocab_start_hca = hca_layer * VOCAB
             local_expert_start_hca = hca_layer * N_LOCAL
@@ -924,7 +973,9 @@ def prefill_fwd(
                 gather_signal_step = gather_signal
                 o_proj_wo_b_full_step = o_proj_wo_b_full
                 if group_tokens > 0:
-                    wo_a_nz_step = pl.create_tensor([O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], dtype=pl.BF16, layout=pl.NZ)
+                    weights_a, weights_b = _prefill_o_proj_layer_weights(
+                        wo_a, wo_b, o_proj_group_start_hca, o_proj_wo_a_full, o_proj_wo_b_full_step, ALLOCATE_A=True,
+                    )
                     prefill_attention_hca_cp_local(
                         x_hc_local,
                         query_start_loc, state_checkpoint_ends, local_request_ids, hca_request_ranges,
@@ -940,7 +991,7 @@ def prefill_fwd(
                         position_ids_local, position_ids_full,
                         hca_cmp_slot_mapping_full, hca_state_slot_mapping_full,
                         attn_sink_hca, wo_a_hca, wo_b_hca, wo_b_scale_hca,
-                        wo_a_nz_step, o_proj_wo_b_full_step,
+                        weights_a, weights_b,
                         attn_stage_step,
                         gather_window, gather_signal_step,
                         o_proj_wo_a_window, o_proj_wo_b_window,
@@ -948,6 +999,7 @@ def prefill_fwd(
                         layer_completion,
                         group_base, tp_rank, hca_layer + pl.const(1, pl.INT32),
                         compressed_inverse, compressed_swap_idx, compressed_rope_ready,
+                        FULL_O_PROJ_WEIGHTS=FULL_O_PROJ_WEIGHTS,
                     )
 
             with pl.scope():
@@ -990,7 +1042,7 @@ def prefill_fwd(
         q_head_start_last = layer_last * H * HEAD_DIM
         head_dim_start_last = layer_last * HEAD_DIM
         attn_head_start_last = layer_last * H
-        o_proj_group_start_last = layer_last * O_PROJ_LOCAL_GROUPS
+        o_proj_group_start_last = layer_last * FWD_O_PROJ_GROUPS
         expert_start_last = layer_last * N_EXPERTS_GLOBAL
         vocab_start_last = layer_last * VOCAB
         local_expert_start_last = layer_last * N_LOCAL
@@ -1087,6 +1139,9 @@ def prefill_fwd(
             gather_signal_step = gather_signal
             o_proj_wo_b_full_step = o_proj_wo_b_full
             if group_tokens > 0:
+                weights_a, weights_b = _prefill_o_proj_layer_weights(
+                    wo_a, wo_b, o_proj_group_start_last, o_proj_wo_a_full, o_proj_wo_b_full_step, ALLOCATE_A=False,
+                )
                 prefill_attention_csa_cp_local(
                     x_hc_local,
                     query_start_loc, state_checkpoint_ends,
@@ -1108,7 +1163,7 @@ def prefill_fwd(
                     csa_cmp_slot_mapping_full, csa_idx_slot_mapping_full,
                     csa_state_slot_mapping_full, csa_inner_state_slot_mapping_full,
                     attn_sink_last, wo_a_last, wo_b_last, wo_b_scale_last,
-                    o_proj_wo_a_full, o_proj_wo_b_full_step,
+                    weights_a, weights_b,
                     attn_stage_step,
                     gather_window, gather_signal_step,
                     o_proj_wo_a_window, o_proj_wo_b_window,
@@ -1116,7 +1171,10 @@ def prefill_fwd(
                     layer_completion,
                     group_base, tp_rank, layer_last + pl.const(1, pl.INT32), csa_compact,
                     compressed_inverse, compressed_swap_idx, compressed_rope_ready,
+                    FULL_O_PROJ_WEIGHTS=FULL_O_PROJ_WEIGHTS,
                 )
+                if FULL_O_PROJ_WEIGHTS:
+                    copy_full_o_proj_weights(weights_a, weights_b, o_proj_wo_a_full, o_proj_wo_b_full_step)
 
         with pl.scope():
             prefill_moe_local(
@@ -1136,7 +1194,7 @@ def prefill_fwd(
 
     moe_retired_tid = clear_prefill_moe_signals(stage_token, arrived, data_arrived, combine_arrived, stage_done)
     with pl.scope():
-        if group_tokens > 0:
+        if group_tokens > 0 and not FULL_O_PROJ_WEIGHTS:
             retire_o_proj_weight_signals(
                 layer_completion,
                 o_proj_weight_ready, o_proj_weight_consumed,
@@ -1233,8 +1291,8 @@ def l3_prefill_fwd(
     gamma_ckv: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[N_RANKS, FWD_ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     attn_sink: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * H], pl.FP32],
-    wo_a: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * O_PROJ_LOCAL_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * O_PROJ_LOCAL_GROUPS, D, O_LORA], pl.INT8],
+    wo_a: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * FWD_O_PROJ_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * FWD_O_PROJ_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D], pl.FP32],
     hca_cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, FWD_HCA_CMP_BLOCK_NUM_DYN, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     csa_cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, FWD_CSA_CMP_BLOCK_NUM_DYN, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
@@ -1531,15 +1589,16 @@ def _make_stacked_spec(name, base_specs, cache_block_nums=None):
 
 
 def _make_o_proj_tp_stacked_spec(name, base_specs):
-    """Pack 43 resident output-projection layers in TP-sharded layout."""
+    """Pack the 43 output-projection weight layers for each rank."""
     import torch
     from golden import TensorSpec
+    from utils import pack_nz
 
     spec = base_specs[name]
     if name == "wo_a":
-        packed_shape = [N_RANKS, FWD_NUM_LAYERS * O_PROJ_LOCAL_GROUPS, O_LORA, O_GROUP_IN]
+        packed_shape = [N_RANKS, FWD_NUM_LAYERS * FWD_O_PROJ_GROUPS, O_LORA, O_GROUP_IN]
     elif name == "wo_b":
-        packed_shape = [N_RANKS, FWD_NUM_LAYERS * O_PROJ_LOCAL_GROUPS, D, O_LORA]
+        packed_shape = [N_RANKS, FWD_NUM_LAYERS * FWD_O_PROJ_GROUPS, D, O_LORA]
     else:
         raise ValueError(f"unsupported o-projection TP weight {name!r}")
 
@@ -1550,13 +1609,17 @@ def _make_o_proj_tp_stacked_spec(name, base_specs):
             source_ranks = full.shape[0]
             if source_ranks not in {TP_SIZE, N_RANKS}:
                 raise ValueError(f"{name} fixture rank axis must be TP={TP_SIZE} or EP={N_RANKS}, got {source_ranks}")
-            for rank in range(N_RANKS):
-                source_rank = rank if source_ranks == N_RANKS else rank % TP_SIZE
-                # Both wo_a and wo_b bank-stack along the leading O_PROJ_LOCAL_GROUPS axis.
-                layer_start = layer * O_PROJ_LOCAL_GROUPS
-                target = packed[rank, layer_start : layer_start + O_PROJ_LOCAL_GROUPS]
-                source = full[source_rank]
-                target.copy_(source)
+            layer_start = layer * FWD_O_PROJ_GROUPS
+            for group_base in range(0, N_RANKS, TP_SIZE):
+                source_base = group_base % source_ranks
+                shards = full[source_base : source_base + TP_SIZE]
+                ranks = slice(group_base, group_base + TP_SIZE)
+                target = packed[ranks, layer_start : layer_start + FWD_O_PROJ_GROUPS]
+                if FULL_O_PROJ_WEIGHTS:
+                    full_layer = shards.flatten(0, 1)
+                    target.copy_(pack_nz(full_layer) if name == "wo_a" else full_layer)
+                else:
+                    target.copy_(shards)
         return packed
 
     return TensorSpec(name, packed_shape, spec.dtype, init_value=init_value)
@@ -2135,8 +2198,8 @@ def finite_tensor_compare(actual, expected, *, preserve_inactive=False, zero_ina
     return True, ""
 
 
-def o_proj_wo_a_full_compare(actual, expected, **kwargs):
-    """Check the final layer's packed O-A weights and inactive ranks' scratch."""
+def o_proj_full_weights_compare(actual, expected, *, weight_name, **kwargs):
+    """Check the final layer's weight copies and the inactive ranks' scratch."""
     from golden import ratio_allclose
     from utils import pack_nz
 
@@ -2145,16 +2208,20 @@ def o_proj_wo_a_full_compare(actual, expected, **kwargs):
         return valid, detail
 
     starts = kwargs["inputs"]["query_start_loc"]
-    shards = kwargs["inputs"]["wo_a"]
-    last_group = (FWD_NUM_LAYERS - 1) * O_PROJ_LOCAL_GROUPS
+    shards = kwargs["inputs"][weight_name]
+    last_group = (FWD_NUM_LAYERS - 1) * FWD_O_PROJ_GROUPS
     compare = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0)
     for group_base in range(0, actual.shape[0], TP_SIZE):
         group_ranks = slice(group_base, group_base + TP_SIZE)
         if int(starts[group_base, -1]) == 0:
             continue
-        last_layer = shards[group_ranks, last_group:last_group + O_PROJ_LOCAL_GROUPS].reshape_as(actual[group_base])
-        packed = pack_nz(last_layer).to(device=actual.device)
-        group_expected = packed.unsqueeze(0).expand_as(actual[group_ranks])
+        if FULL_O_PROJ_WEIGHTS:
+            group_expected = shards[group_ranks, last_group:].to(device=actual.device)
+        else:
+            last_layer = shards[group_ranks, last_group:].reshape_as(actual[group_base])
+            if weight_name == "wo_a":
+                last_layer = pack_nz(last_layer)
+            group_expected = last_layer.to(device=actual.device).unsqueeze(0).expand_as(actual[group_ranks])
         valid, detail = compare(actual[group_ranks], group_expected, **kwargs)
         if not valid:
             return False, f"    TP group starting at rank {group_base}: {detail}"
@@ -2344,7 +2411,6 @@ def compare_functions():
 
     finite_names = {
         "x_hc", "attn_stage",
-        "o_proj_wo_b_full",
         "x_mixed", "post_ffn", "comb_ffn", "ffn_out",
         "kv_cache", "hca_cmp_kv", "csa_cmp_kv",
         "hca_compress_state", "csa_compress_state", "csa_inner_compress_state",
@@ -2355,7 +2421,8 @@ def compare_functions():
     for name in CACHE_NAMES | {"attn_stage"}:
         compare[name] = partial(finite_tensor_compare, preserve_inactive=True)
     compare["x_hc"] = x_hc_compare
-    compare["o_proj_wo_a_full"] = o_proj_wo_a_full_compare
+    compare["o_proj_wo_a_full"] = partial(o_proj_full_weights_compare, weight_name="wo_a")
+    compare["o_proj_wo_b_full"] = partial(o_proj_full_weights_compare, weight_name="wo_b")
     compare["x_out"] = x_out_compare
     compare["logits"] = logits_compare
     compare["sampled_ids"] = sampled_ids_compare

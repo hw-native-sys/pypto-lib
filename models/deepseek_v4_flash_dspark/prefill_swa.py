@@ -363,24 +363,26 @@ def prefill_attention_swa_cp_local(
     inverse_rope: pl.Tensor[[SPARSE_ROPE_ROWS, 2 * ROPE_HEAD_DIM], pl.FP32],
     inverse_swap_idx: pl.Tensor[[SPARSE_ROPE_HEAD_TILE, ROPE_HEAD_DIM], pl.INT32],
     inverse_ready: pl.Scalar[pl.TASK_ID],
+    FULL_O_PROJ_WEIGHTS: pl.constexpr = False,
 ):
     """Run SWA with local HC state and replicated projected KV."""
-    if TP_SIZE > 1:
-        weight_published, weight_waited = _begin_o_proj_full_weights_gather(
-            wo_a_local, wo_b_local,
-            o_proj_wo_a_window, o_proj_wo_b_window,
-            o_proj_weight_ready, o_proj_weight_consumed,
-            group_base, tp_rank, weight_epoch,
-        )
-    else:
-        o_proj_weight_dep = gather_o_proj_full_weights(
-            wo_a_local, wo_b_local,
-            wo_a_nz, wo_b_full,
-            o_proj_wo_a_window, o_proj_wo_b_window,
-            o_proj_weight_ready, o_proj_weight_consumed,
-            o_proj_order_fence,
-            group_base, tp_rank, weight_epoch,
-        )
+    if not FULL_O_PROJ_WEIGHTS:
+        if TP_SIZE > 1:
+            weight_published, weight_waited = _begin_o_proj_full_weights_gather(
+                wo_a_local, wo_b_local,
+                o_proj_wo_a_window, o_proj_wo_b_window,
+                o_proj_weight_ready, o_proj_weight_consumed,
+                group_base, tp_rank, weight_epoch,
+            )
+        else:
+            o_proj_weight_dep = gather_o_proj_full_weights(
+                wo_a_local, wo_b_local,
+                wo_a_nz, wo_b_full,
+                o_proj_wo_a_window, o_proj_wo_b_window,
+                o_proj_weight_ready, o_proj_weight_consumed,
+                o_proj_order_fence,
+                group_base, tp_rank, weight_epoch,
+            )
     q_dim = pl.tensor.dim(position_ids_local, 0)
     kv_dim = pl.tensor.dim(position_ids_full, 0)
 
@@ -395,7 +397,9 @@ def prefill_attention_swa_cp_local(
 
     x_normed_local = pl.create_tensor([q_dim, D], dtype=pl.BF16)
     norm_ready_tid = rms_norm(x_mixed_local, attn_norm_w, x_normed_local)
-    if TP_SIZE > 1:
+    if FULL_O_PROJ_WEIGHTS:
+        o_proj_weight_dep = norm_ready_tid
+    elif TP_SIZE > 1:
         o_proj_weight_dep = _finish_o_proj_full_weights_gather(
             wo_a_local, wo_b_local,
             wo_a_nz, wo_b_full,
@@ -507,6 +511,7 @@ def prefill_attention_swa_cp(
         o_proj_order_fence,
         group_base, tp_rank, weight_epoch,
         inverse_rope, inverse_swap_idx, inverse_ready,
+                                               FULL_O_PROJ_WEIGHTS=False,
     )
     materialize_ready_tid = pl.system.task_dummy(deps=[])
     prefill_cp_materialize_hc_full(

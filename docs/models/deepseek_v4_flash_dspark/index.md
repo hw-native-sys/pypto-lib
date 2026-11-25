@@ -113,6 +113,14 @@ orchestrations, and the same `hc_head → rms_norm → lm_head` tail. Prompt
 sequence lengths that do not divide the CP group are padded rather than
 rejected, so one program serves an arbitrary chunk against a resident prefix.
 
+The default prefill forward takes one output-projection weight shard per TP
+rank and gathers the weights each layer. Set
+`PYPTO_DSPARK_PREFILL_FULL_O_PROJ_WEIGHTS=1` before importing or compiling
+`prefill_fwd` to opt into full weights on every rank. Supply all eight groups
+for each of the 43 layers in both banks, with BF16 O-A packed in NZ and INT8
+O-B in group-major ND. The TP4 weight banks require an additional 3.02 GiB per
+rank.
+
 Prefill also takes `state_checkpoint_ends`, an INT32
 `[requests, checkpoint_tiles, 6]` tensor (rank-stacked in L3).
 Checkpoint tiles follow each request's own 512-token projection tiles. Each

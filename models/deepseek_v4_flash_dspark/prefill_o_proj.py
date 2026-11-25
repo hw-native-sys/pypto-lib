@@ -46,6 +46,7 @@ O_PROJ_WO_B_WINDOW_COLS = O_LORA if TP_SIZE > 1 else 1
 
 # tiling
 O_PROJ_WEIGHT_COPY_TILE = 16
+O_PROJ_WEIGHT_COPY_WORKERS = 32
 O_PROJ_PUSH_SLABS = 4
 O_PROJ_A_SLAB_ROWS = O_PROJ_LOCAL_COLS // O_PROJ_PUSH_SLABS
 O_PROJ_B_SLAB_ROWS = O_PROJ_LOCAL_ROWS_B // O_PROJ_PUSH_SLABS
@@ -322,6 +323,35 @@ if TP_SIZE == 1:
                 pl.store(tile, [row, 0], wo_b_full_flat)
         weights_ready_tid = pl.system.task_dummy(deps=[wo_a_copy_tid, wo_b_copy_tid])
         return weights_ready_tid
+
+
+@pl.jit.inline
+def copy_full_o_proj_weights(
+    wo_a: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_D, O_LORA], pl.INT8],
+    wo_a_out: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], pl.BF16, pl.NZ],
+    wo_b_out: pl.Tensor[[O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_D, O_LORA], pl.INT8],
+):
+    """Copy the last layer's NZ O-A and ND O-B to the forward outputs."""
+    wo_a_bytes = pl.reshape(wo_a, [O_PROJ_FULL_ROWS * O_GROUP_IN])
+    wo_a_out_bytes = pl.reshape(wo_a_out, [O_PROJ_FULL_ROWS * O_GROUP_IN])
+    wo_a_raw = pl.reshape(wo_a_bytes, [O_PROJ_FULL_ROWS, O_GROUP_IN])
+    wo_a_out_raw = pl.reshape(wo_a_out_bytes, [O_PROJ_FULL_ROWS, O_GROUP_IN])
+    for worker in pl.spmd(O_PROJ_WEIGHT_COPY_WORKERS, name_hint="o_proj_resident_final_a"):
+        for tile_index in pl.range(worker, O_PROJ_FULL_ROWS // O_PROJ_WEIGHT_COPY_TILE, O_PROJ_WEIGHT_COPY_WORKERS):
+            row = tile_index * O_PROJ_WEIGHT_COPY_TILE
+            tile_a = pl.load(wo_a_raw, [row, 0], [O_PROJ_WEIGHT_COPY_TILE, O_GROUP_IN], target_memory=pl.Mem.Vec)
+            pl.store(tile_a, [row, 0], wo_a_out_raw)
+
+    wo_b_raw = pl.reshape(wo_b, [O_PROJ_FULL_ROWS_B, O_LORA])
+    wo_b_out_raw = pl.reshape(wo_b_out, [O_PROJ_FULL_ROWS_B, O_LORA])
+    for worker in pl.spmd(O_PROJ_WEIGHT_COPY_WORKERS, name_hint="o_proj_resident_final_b"):
+        for tile_index in pl.range(worker, O_PROJ_FULL_ROWS_B // O_PROJ_WO_B_COPY_TILE, O_PROJ_WEIGHT_COPY_WORKERS):
+            row = tile_index * O_PROJ_WO_B_COPY_TILE
+            tile_b = pl.load(wo_b_raw, [row, 0], [O_PROJ_WO_B_COPY_TILE, O_LORA], target_memory=pl.Mem.Vec)
+            pl.store(tile_b, [row, 0], wo_b_out_raw)
+
+    return wo_a_out, wo_b_out
 
 
 @pl.jit.inline(auto_scope=False)
