@@ -54,8 +54,12 @@ SPARSE_VF_FUSED_FP4_SCALE_TILE = 16
 SPARSE_VF_SWA_VALUE_TILE = 256
 SPARSE_VF_SWA_KV_LANE_ROWS = WINDOW_KEYS // 2
 SPARSE_VF_SWA_KV_SLOT_BYTES = WINDOW_KEYS * HEAD_DIM * 2
+SPARSE_VF_SWA_KV_SLOTS = 3
+SPARSE_VF_SWA_KV_BUFFER_BYTES = SPARSE_VF_SWA_KV_SLOT_BYTES * SPARSE_VF_SWA_KV_SLOTS
 SPARSE_VF_SWA_WEIGHT_SLOT_BYTES = SPARSE_VF_FUSED_CUBE_HEAD_TILE * WINDOW_KEYS * 2
 SPARSE_VF_SWA_SCORE_SLOT_BYTES = SPARSE_VF_FUSED_AIV_HEAD_TILE * WINDOW_KEYS * 4
+SPARSE_VF_SWA_SCORE_SLOTS = 2
+SPARSE_VF_SWA_SCORE_BUFFER_BYTES = SPARSE_VF_SWA_SCORE_SLOT_BYTES * SPARSE_VF_SWA_SCORE_SLOTS
 SPARSE_VF_SWA_RESULT_SLOT_BYTES = SPARSE_VF_FUSED_AIV_HEAD_TILE * SPARSE_VF_SWA_VALUE_TILE * 4
 SPARSE_VF_SWA_RESULT_SLOTS = 2
 SPARSE_VF_SWA_RESULT_BUFFER_BYTES = SPARSE_VF_SWA_RESULT_SLOT_BYTES * SPARSE_VF_SWA_RESULT_SLOTS
@@ -3979,6 +3983,65 @@ def sparse_vf_fused_group(
     return oflat
 
 
+@pl.jit.inline(auto_scope=False)
+def _swa_qk(
+    q: pl.Tile[[LOCAL_H, HEAD_DIM], pl.BF16, pl.Mem.Mat],
+    kv: pl.Tile[[WINDOW_KEYS, HEAD_DIM], pl.BF16, pl.Mem.Mat],
+):
+    """Publish the score panel and retain its KV slot until PV completes."""
+    key = pl.tile.transpose_view(kv)
+    score = pl.tile.matmul(q, key)
+    pl.system.tpush_to_aiv(score, split=1, id=2)
+    return score
+
+
+@pl.jit.inline(auto_scope=False)
+def _swa_pv(kv: pl.Tile[[WINDOW_KEYS, HEAD_DIM], pl.BF16, pl.Mem.Mat]):
+    """Consume the weights once and publish both PV panels."""
+    weights = pl.system.tpop_from_aiv(shape=[LOCAL_H, WINDOW_KEYS], dtype=pl.BF16, split=1, id=1)
+    weights_left = pl.tile.move(weights, pl.Mem.Left)
+    # The weight FIFO is no longer needed after the L1-to-L0A move.
+    pl.system.tfree_to_aiv(weights, id=1)
+    for column in pl.range(0, HEAD_DIM, SPARSE_VF_SWA_VALUE_TILE):
+        value = pl.tile.extract(kv, 0, column, [WINDOW_KEYS, SPARSE_VF_SWA_VALUE_TILE], target_memory=pl.Mem.Right)
+        weighted = pl.tile.matmul(weights_left, value)
+        pl.system.tpush_to_aiv(weighted, split=1, id=3)
+    return kv
+
+
+@pl.jit.inline(auto_scope=False)
+def _swa_query_group(
+    query: pl.Tensor[[SWA_HEAD_ROWS_DYN, HEAD_DIM], pl.BF16],
+    start: pl.Scalar[pl.INDEX],
+    count: pl.constexpr,
+):
+    """Keep one query ahead until its predecessor's PV is issued."""
+    q0 = pl.tile.load(query, [start * LOCAL_H, 0], [LOCAL_H, HEAD_DIM], target_memory=pl.Mem.Mat)
+    kv_even = pl.system.tpop_from_aiv(shape=[WINDOW_KEYS, HEAD_DIM], dtype=pl.BF16, split=1, id=0)
+    _score0 = _swa_qk(q0, kv_even)
+    # The first unrolled step replaces this alias with the next FIFO slot.
+    kv_odd = kv_even
+    for offset in pl.unroll(1, count):
+        q = pl.tile.load(query, [(start + offset) * LOCAL_H, 0], [LOCAL_H, HEAD_DIM], target_memory=pl.Mem.Mat)
+        if offset % 2 == 1:
+            kv_odd = pl.system.tpop_from_aiv(shape=[WINDOW_KEYS, HEAD_DIM], dtype=pl.BF16, split=1, id=0)
+            _score_odd = _swa_qk(q, kv_odd)
+            _pv_even = _swa_pv(kv_even)
+            pl.system.tfree_to_aiv(kv_even, id=0)
+        else:
+            kv_even = pl.system.tpop_from_aiv(shape=[WINDOW_KEYS, HEAD_DIM], dtype=pl.BF16, split=1, id=0)
+            _score_even = _swa_qk(q, kv_even)
+            _pv_odd = _swa_pv(kv_odd)
+            pl.system.tfree_to_aiv(kv_odd, id=0)
+    if count % 2 == 1:
+        _last_even = _swa_pv(kv_even)
+        pl.system.tfree_to_aiv(kv_even, id=0)
+    else:
+        _last_odd = _swa_pv(kv_odd)
+        pl.system.tfree_to_aiv(kv_odd, id=0)
+    return query
+
+
 @pl.jit.incore(level=pl.Level.AIC)
 def _sparse_swa_cube(
     query: pl.Tensor[[SWA_HEAD_ROWS_DYN, HEAD_DIM], pl.BF16],
@@ -3988,30 +4051,29 @@ def _sparse_swa_cube(
 ):
     """Multiply QK and PV using one L1 copy of the window KV tile."""
     pl.func_attr({"split_aiv": True})
-    kv_buffer = pl.system.reserve_buffer(name="sparse_swa_kv", size=SPARSE_VF_SWA_KV_SLOT_BYTES)
+    kv_buffer = pl.system.reserve_buffer(name="sparse_swa_kv", size=SPARSE_VF_SWA_KV_BUFFER_BYTES)
     weight_buffer = pl.system.reserve_buffer(name="sparse_swa_weights", size=SPARSE_VF_SWA_WEIGHT_SLOT_BYTES)
     score_peer = pl.system.import_peer_buffer(name="sparse_swa_scores", peer_func="_sparse_swa_vector")
     value_peer = pl.system.import_peer_buffer(name="sparse_swa_values", peer_func="_sparse_swa_vector")
-    pl.system.aic_initialize_pipe(v2c_consumer_buf=kv_buffer, dir_mask=2, slot_size=SPARSE_VF_SWA_KV_SLOT_BYTES, slot_num=1, id=0)
+    pl.system.aic_initialize_pipe(v2c_consumer_buf=kv_buffer, dir_mask=2, slot_size=SPARSE_VF_SWA_KV_SLOT_BYTES, slot_num=SPARSE_VF_SWA_KV_SLOTS, id=0)
     pl.system.aic_initialize_pipe(v2c_consumer_buf=weight_buffer, dir_mask=2, slot_size=SPARSE_VF_SWA_WEIGHT_SLOT_BYTES, slot_num=1, id=1)
-    pl.system.aic_initialize_pipe(score_peer, dir_mask=1, slot_size=SPARSE_VF_SWA_SCORE_SLOT_BYTES, slot_num=1, id=2)
+    pl.system.aic_initialize_pipe(score_peer, dir_mask=1, slot_size=SPARSE_VF_SWA_SCORE_SLOT_BYTES, slot_num=SPARSE_VF_SWA_SCORE_SLOTS, id=2)
     pl.system.aic_initialize_pipe(value_peer, dir_mask=1, slot_size=SPARSE_VF_SWA_RESULT_SLOT_BYTES, slot_num=SPARSE_VF_SWA_RESULT_SLOTS, id=3)
     worker = pl.tile.get_block_idx()
     first_token = worker * num_tokens // workers
     last_token = (worker + 1) * num_tokens // workers
-    for token in pl.range(first_token, last_token):
-        q = pl.tile.load(query, [token * LOCAL_H, 0], [LOCAL_H, HEAD_DIM], target_memory=pl.Mem.Mat)
-        kv = pl.system.tpop_from_aiv(shape=[WINDOW_KEYS, HEAD_DIM], dtype=pl.BF16, split=1, id=0)
-        key = pl.tile.transpose_view(kv)
-        score = pl.tile.matmul(q, key)
-        pl.system.tpush_to_aiv(score, split=1, id=2)
-        weights = pl.system.tpop_from_aiv(shape=[LOCAL_H, WINDOW_KEYS], dtype=pl.BF16, split=1, id=1)
-        for column in pl.range(0, HEAD_DIM, SPARSE_VF_SWA_VALUE_TILE):
-            value = pl.tile.slice(kv, [WINDOW_KEYS, SPARSE_VF_SWA_VALUE_TILE], [0, column])
-            weighted = pl.tile.matmul(weights, value)
-            pl.system.tpush_to_aiv(weighted, split=1, id=3)
-        pl.system.tfree_to_aiv(weights, id=1)
-        pl.system.tfree_to_aiv(kv, id=0)
+    # Static groups keep QK one token ahead of PV without carrying a popped
+    # tile across a dynamic loop boundary. Cover 12-token workers in one group.
+    group_end = first_token + (last_token - first_token) // 12 * 12
+    for token in pl.range(first_token, group_end, 12):
+        _group = _swa_query_group(query, token, 12)
+    triplet_end = group_end + (last_token - group_end) // 3 * 3
+    for token in pl.range(group_end, triplet_end, 3):
+        _triplet = _swa_query_group(query, token, 3)
+    if last_token - triplet_end == 2:
+        _pair = _swa_query_group(query, triplet_end, 2)
+    elif last_token - triplet_end == 1:
+        _single = _swa_query_group(query, triplet_end, 1)
     return output
 
 
@@ -4097,6 +4159,77 @@ def _decode_swa_rows(
     return kv_flat
 
 
+@pl.jit.inline(auto_scope=False)
+def _swa_softmax(
+    indices: pl.Tensor[[T_DYN, WINDOW_KEYS], pl.INT32],
+    sink_tile: pl.Tile[[1, SPARSE_VF_FUSED_AIV_HEAD_TILE], pl.FP32, pl.Mem.Vec],
+    softmax_token: pl.Scalar[pl.INDEX],
+):
+    """Receive QK scores, publish BF16 weights and return sink normalization."""
+    scores_in = pl.system.tpop_from_aic(shape=[SPARSE_VF_FUSED_AIV_HEAD_TILE, WINDOW_KEYS], dtype=pl.FP32, split=1, id=2)
+    scores = pl.mul(scores_in, SCALE)
+    weight_storage: pl.Tile[
+        [SPARSE_VF_FUSED_AIV_HEAD_TILE, WINDOW_KEYS], pl.BF16, pl.MemRef("swa_weights_nz"), pl.Mem.Vec
+    ] = pl.tile.create([SPARSE_VF_FUSED_AIV_HEAD_TILE, WINDOW_KEYS], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+    maximum = pl.tile.create([1, SPARSE_VF_FUSED_AIV_HEAD_TILE], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+    denominator = pl.tile.create([1, SPARSE_VF_FUSED_AIV_HEAD_TILE], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+    all_ids = pl.tile.load(indices, [softmax_token, 0], [1, WINDOW_KEYS], target_memory=pl.Mem.Vec)
+    ids_flat = pl.tile.reshape(all_ids, [WINDOW_KEYS])
+    scores_flat = pl.tile.reshape(scores, [SPARSE_VF_FUSED_AIV_HEAD_TILE * WINDOW_KEYS])
+    weights_flat = pl.tile.reshape(weight_storage, [SPARSE_VF_FUSED_AIV_HEAD_TILE * WINDOW_KEYS])
+    max_flat = pl.tile.reshape(maximum, [SPARSE_VF_FUSED_AIV_HEAD_TILE])
+    denominator_flat = pl.tile.reshape(denominator, [SPARSE_VF_FUSED_AIV_HEAD_TILE])
+    with pl.reg_scope():
+        full64 = pl.reg.full_mask(lanes=64)
+        ids_lo = pl.reg.load(ids_flat, 0, lanes=64)
+        ids_hi = pl.reg.load(ids_flat, 64, lanes=64)
+        valid_lo = pl.reg.compares(ids_lo, 0, full64, predicate="ge")
+        valid_hi = pl.reg.compares(ids_hi, 0, full64, predicate="ge")
+        invalid = pl.reg.broadcast(-1e30, lanes=64, dtype=pl.FP32)
+        for row in pl.hardware_loop(SPARSE_VF_FUSED_AIV_HEAD_TILE):
+            offset = row * WINDOW_KEYS
+            score_lo = pl.reg.load(scores_flat, offset, lanes=64)
+            score_hi = pl.reg.load(scores_flat, offset + 64, lanes=64)
+            score_lo = pl.reg.select(valid_lo, score_lo, invalid)
+            score_hi = pl.reg.select(valid_hi, score_hi, invalid)
+            maxima = pl.reg.maximum(score_lo, score_hi, full64)
+            max_row = pl.reg.reduce_max(maxima, full64)
+            reference = pl.reg.broadcast(max_row, lanes=64, dtype=pl.FP32)
+            weights_lo = pl.reg.expdif(score_lo, reference, valid_lo)
+            weights_hi = pl.reg.expdif(score_hi, reference, valid_hi)
+            weight_pairs = pl.reg.add(weights_lo, weights_hi, full64)
+            summed = pl.reg.reduce_sum(weight_pairs, full64, reassoc=True)
+            bf16_lo = pl.reg.convert(weights_lo, dtype=pl.BF16, rounding="R", saturate=False)
+            bf16_hi = pl.reg.convert(weights_hi, dtype=pl.BF16, rounding="R", saturate=False)
+            nz_offset = row * 16
+            nz_hi = nz_offset + 64 * SPARSE_VF_FUSED_AIV_HEAD_TILE
+            _write_lo = pl.reg.store(
+                weights_flat, nz_offset, bf16_lo, full64, block_stride=SPARSE_VF_FUSED_AIV_HEAD_TILE
+            )
+            _write_hi = pl.reg.store(
+                weights_flat, nz_hi, bf16_hi, full64, block_stride=SPARSE_VF_FUSED_AIV_HEAD_TILE
+            )
+            _write_max = pl.reg.store(max_flat, row, max_row)
+            _write_sum = pl.reg.store(denominator_flat, row, summed)
+    pl.system.tfree_to_aic(scores_in, id=2)
+    weights_nz: pl.Tile[
+        [SPARSE_VF_FUSED_AIV_HEAD_TILE, WINDOW_KEYS],
+        pl.BF16,
+        pl.MemRef("swa_weights_nz"),
+        pl.Mem.Vec,
+        pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512),
+    ] = pl.tile.create([SPARSE_VF_FUSED_AIV_HEAD_TILE, WINDOW_KEYS], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+    pl.system.tpush_to_aic(weights_nz, split=1, id=1)
+
+    final_max = pl.maximum(maximum, sink_tile)
+    correction = pl.col_expand_expdif(maximum, final_max)
+    sink_weight = pl.col_expand_expdif(sink_tile, final_max)
+    corrected_total = pl.mul(denominator, correction)
+    total = pl.add(corrected_total, sink_weight)
+    norm = pl.div(correction, total)
+    return norm
+
+
 @pl.jit.incore(level=pl.Level.AIV)
 def _sparse_swa_vector(
     indices: pl.Tensor[[T_DYN, WINDOW_KEYS], pl.INT32],
@@ -4110,11 +4243,11 @@ def _sparse_swa_vector(
     pl.func_attr({"split_aiv": True, "dual_aiv_dispatch": True})
     kv_peer = pl.system.import_peer_buffer(name="sparse_swa_kv", peer_func="_sparse_swa_cube")
     weight_peer = pl.system.import_peer_buffer(name="sparse_swa_weights", peer_func="_sparse_swa_cube")
-    score_buffer = pl.system.reserve_buffer(name="sparse_swa_scores", size=SPARSE_VF_SWA_SCORE_SLOT_BYTES)
+    score_buffer = pl.system.reserve_buffer(name="sparse_swa_scores", size=SPARSE_VF_SWA_SCORE_BUFFER_BYTES)
     value_buffer = pl.system.reserve_buffer(name="sparse_swa_values", size=SPARSE_VF_SWA_RESULT_BUFFER_BYTES)
-    pl.system.aiv_initialize_pipe(v2c_consumer_buf=kv_peer, dir_mask=2, slot_size=SPARSE_VF_SWA_KV_SLOT_BYTES, slot_num=1, id=0)
+    pl.system.aiv_initialize_pipe(v2c_consumer_buf=kv_peer, dir_mask=2, slot_size=SPARSE_VF_SWA_KV_SLOT_BYTES, slot_num=SPARSE_VF_SWA_KV_SLOTS, id=0)
     pl.system.aiv_initialize_pipe(v2c_consumer_buf=weight_peer, dir_mask=2, slot_size=SPARSE_VF_SWA_WEIGHT_SLOT_BYTES, slot_num=1, id=1)
-    pl.system.aiv_initialize_pipe(score_buffer, dir_mask=1, slot_size=SPARSE_VF_SWA_SCORE_SLOT_BYTES, slot_num=1, id=2)
+    pl.system.aiv_initialize_pipe(score_buffer, dir_mask=1, slot_size=SPARSE_VF_SWA_SCORE_SLOT_BYTES, slot_num=SPARSE_VF_SWA_SCORE_SLOTS, id=2)
     pl.system.aiv_initialize_pipe(value_buffer, dir_mask=1, slot_size=SPARSE_VF_SWA_RESULT_SLOT_BYTES, slot_num=SPARSE_VF_SWA_RESULT_SLOTS, id=3)
     worker = pl.tile.get_block_idx()
     lane = pl.tile.get_subblock_idx()
@@ -4240,74 +4373,22 @@ def _sparse_swa_vector(
                                     raw = pl.tile.gather_row(raw, window, [key + 1, 0], [second_row, 0], [1, WINDOW_CACHE_BYTES])
                     kv_flat = _decode_swa_rows(raw, kv_flat, start, SPARSE_VF_GATHER_TILE)
         pl.system.tpush_to_aic(kv_nz, split=1, id=0)
-        # The result FIFO holds both panels of the previous token.
+        # Send the next KV before consuming the previous score. Publish its
+        # weights before draining the older PV, while retaining both norms.
         if token > first_token:
-            previous_norm = pl.reshape(norm, [SPARSE_VF_FUSED_AIV_HEAD_TILE, 1])
-            previous_row = (token - 1) * LOCAL_H + head
-            _store_swa_pv(previous_norm, output, previous_row)
-
-        scores_in = pl.system.tpop_from_aic(shape=[SPARSE_VF_FUSED_AIV_HEAD_TILE, WINDOW_KEYS], dtype=pl.FP32, split=1, id=2)
-        scores = pl.mul(scores_in, SCALE)
-        weight_storage: pl.Tile[
-            [SPARSE_VF_FUSED_AIV_HEAD_TILE, WINDOW_KEYS], pl.BF16, pl.MemRef("swa_weights_nz"), pl.Mem.Vec
-        ] = pl.tile.create([SPARSE_VF_FUSED_AIV_HEAD_TILE, WINDOW_KEYS], dtype=pl.BF16, target_memory=pl.Mem.Vec)
-        maximum = pl.tile.create([1, SPARSE_VF_FUSED_AIV_HEAD_TILE], dtype=pl.FP32, target_memory=pl.Mem.Vec)
-        denominator = pl.tile.create([1, SPARSE_VF_FUSED_AIV_HEAD_TILE], dtype=pl.FP32, target_memory=pl.Mem.Vec)
-        all_ids = pl.tile.load(indices, [token, 0], [1, WINDOW_KEYS], target_memory=pl.Mem.Vec)
-        ids_flat = pl.tile.reshape(all_ids, [WINDOW_KEYS])
-        scores_flat = pl.tile.reshape(scores, [SPARSE_VF_FUSED_AIV_HEAD_TILE * WINDOW_KEYS])
-        weights_flat = pl.tile.reshape(weight_storage, [SPARSE_VF_FUSED_AIV_HEAD_TILE * WINDOW_KEYS])
-        max_flat = pl.tile.reshape(maximum, [SPARSE_VF_FUSED_AIV_HEAD_TILE])
-        denominator_flat = pl.tile.reshape(denominator, [SPARSE_VF_FUSED_AIV_HEAD_TILE])
-        with pl.reg_scope():
-            full64 = pl.reg.full_mask(lanes=64)
-            ids_lo = pl.reg.load(ids_flat, 0, lanes=64)
-            ids_hi = pl.reg.load(ids_flat, 64, lanes=64)
-            valid_lo = pl.reg.compares(ids_lo, 0, full64, predicate="ge")
-            valid_hi = pl.reg.compares(ids_hi, 0, full64, predicate="ge")
-            invalid = pl.reg.broadcast(-1e30, lanes=64, dtype=pl.FP32)
-            for row in pl.hardware_loop(SPARSE_VF_FUSED_AIV_HEAD_TILE):
-                offset = row * WINDOW_KEYS
-                score_lo = pl.reg.load(scores_flat, offset, lanes=64)
-                score_hi = pl.reg.load(scores_flat, offset + 64, lanes=64)
-                score_lo = pl.reg.select(valid_lo, score_lo, invalid)
-                score_hi = pl.reg.select(valid_hi, score_hi, invalid)
-                maxima = pl.reg.maximum(score_lo, score_hi, full64)
-                max_row = pl.reg.reduce_max(maxima, full64)
-                reference = pl.reg.broadcast(max_row, lanes=64, dtype=pl.FP32)
-                weights_lo = pl.reg.expdif(score_lo, reference, valid_lo)
-                weights_hi = pl.reg.expdif(score_hi, reference, valid_hi)
-                weight_pairs = pl.reg.add(weights_lo, weights_hi, full64)
-                summed = pl.reg.reduce_sum(weight_pairs, full64, reassoc=True)
-                bf16_lo = pl.reg.convert(weights_lo, dtype=pl.BF16, rounding="R", saturate=False)
-                bf16_hi = pl.reg.convert(weights_hi, dtype=pl.BF16, rounding="R", saturate=False)
-                nz_offset = row * 16
-                nz_hi = nz_offset + 64 * SPARSE_VF_FUSED_AIV_HEAD_TILE
-                _write_lo = pl.reg.store(
-                    weights_flat, nz_offset, bf16_lo, full64, block_stride=SPARSE_VF_FUSED_AIV_HEAD_TILE
-                )
-                _write_hi = pl.reg.store(
-                    weights_flat, nz_hi, bf16_hi, full64, block_stride=SPARSE_VF_FUSED_AIV_HEAD_TILE
-                )
-                _write_max = pl.reg.store(max_flat, row, max_row)
-                _write_sum = pl.reg.store(denominator_flat, row, summed)
-        pl.system.tfree_to_aic(scores_in, id=2)
-        weights_nz: pl.Tile[
-            [SPARSE_VF_FUSED_AIV_HEAD_TILE, WINDOW_KEYS],
-            pl.BF16,
-            pl.MemRef("swa_weights_nz"),
-            pl.Mem.Vec,
-            pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512),
-        ] = pl.tile.create([SPARSE_VF_FUSED_AIV_HEAD_TILE, WINDOW_KEYS], dtype=pl.BF16, target_memory=pl.Mem.Vec)
-        pl.system.tpush_to_aic(weights_nz, split=1, id=1)
-
-        final_max = pl.maximum(maximum, sink_tile)
-        correction = pl.col_expand_expdif(maximum, final_max)
-        sink_weight = pl.col_expand_expdif(sink_tile, final_max)
-        corrected_total = pl.mul(denominator, correction)
-        total = pl.add(corrected_total, sink_weight)
-        norm = pl.div(correction, total)
+            next_norm = _swa_softmax(indices, sink_tile, token - 1)
+            if token > first_token + 1:
+                prior_norm = pl.reshape(norm, [SPARSE_VF_FUSED_AIV_HEAD_TILE, 1])
+                prior_row = (token - 2) * LOCAL_H + head
+                _store_swa_pv(prior_norm, output, prior_row)
+            norm = next_norm
     if last_token > first_token:
+        last_norm = _swa_softmax(indices, sink_tile, last_token - 1)
+        if last_token > first_token + 1:
+            prior_norm = pl.reshape(norm, [SPARSE_VF_FUSED_AIV_HEAD_TILE, 1])
+            prior_row = (last_token - 2) * LOCAL_H + head
+            _store_swa_pv(prior_norm, output, prior_row)
+        norm = last_norm
         final_norm = pl.reshape(norm, [SPARSE_VF_FUSED_AIV_HEAD_TILE, 1])
         final_row = (last_token - 1) * LOCAL_H + head
         _store_swa_pv(final_norm, output, final_row)
