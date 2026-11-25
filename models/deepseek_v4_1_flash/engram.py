@@ -7,6 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: no-sim
+# ci: devices=2
 """V4.1 Engram Host FP8 lookup, dequantization, projection and residual gating."""
 
 import math
@@ -1100,6 +1101,94 @@ def _engram_gate_pairs_reg(
     return out
 
 
+LOOKUP_TEST_RANKS = 2
+LOOKUP_TEST_SHARD_ROWS = 64
+LOOKUP_TEST_ROWS = 2 * 5 * N_HASH_COLS
+
+
+@pl.jit(auto_scope=False)
+def l2_engram_host_lookup_test(
+    ids: pl.Tensor[[LOOKUP_TEST_ROWS, 1], pl.INT32],
+    payload: pld.DistributedTensor[[2 * LOOKUP_TEST_SHARD_ROWS, HEAD_DIM], pl.UINT8],
+    scales: pld.DistributedTensor[[2 * LOOKUP_TEST_SHARD_ROWS, HEAD_DIM // 32], pl.UINT8],
+    out: pl.Out[pl.Tensor[[LOOKUP_TEST_ROWS, HEAD_DIM], pl.BF16]],
+):
+    first = pl.create_tensor([FETCH_TILE, HEAD_DIM], dtype=pl.UINT8)
+    second = pl.create_tensor([FETCH_TILE, HEAD_DIM], dtype=pl.UINT8)
+    first_codes = pl.create_tensor([FETCH_TILE, SCALE_TILE], dtype=pl.UINT8)
+    second_codes = pl.create_tensor([FETCH_TILE, SCALE_TILE], dtype=pl.UINT8)
+    return engram_host_lookup(
+        ids, payload, scales, first, second, first_codes, second_codes, out, LOOKUP_TEST_SHARD_ROWS,
+    )
+
+
+@pl.jit.host
+def l3_engram_host_lookup_test(
+    ids: pl.Tensor[[LOOKUP_TEST_RANKS, LOOKUP_TEST_ROWS, 1], pl.INT32],
+    out: pl.Out[pl.Tensor[[LOOKUP_TEST_RANKS, LOOKUP_TEST_ROWS, HEAD_DIM], pl.BF16]],
+):
+    payload_buffer = pld.alloc_window_buffer(
+        [2 * LOOKUP_TEST_SHARD_ROWS, HEAD_DIM], dtype=pl.UINT8, memory_source="host", init="payload",
+    )
+    scale_buffer = pld.alloc_window_buffer(
+        [2 * LOOKUP_TEST_SHARD_ROWS, HEAD_DIM // 32], dtype=pl.UINT8, memory_source="host", init="scales",
+    )
+    for rank in pl.range(pld.world_size()):
+        payload = pld.window(payload_buffer, [2 * LOOKUP_TEST_SHARD_ROWS, HEAD_DIM], dtype=pl.UINT8)
+        scales = pld.window(scale_buffer, [2 * LOOKUP_TEST_SHARD_ROWS, HEAD_DIM // 32], dtype=pl.UINT8)
+        l2_engram_host_lookup_test(ids[rank], payload, scales, out[rank], device=rank)
+    return out
+
+
+def check_engram_host_lookup(config, device_ids, compile_only):
+    """Compare local and remote Host lookup rows with a Torch golden."""
+    from golden import TensorSpec, run
+    from pypto.ir import DistributedConfig
+
+    table_rows = LOOKUP_TEST_RANKS * LOOKUP_TEST_SHARD_ROWS
+    rows = torch.arange(2 * table_rows).reshape(2, table_rows, 1)
+    columns = torch.arange(HEAD_DIM)
+    payload = (((rows * 5 + columns) % 13 + 1) / 4).to(torch.float8_e4m3fn)
+    groups = torch.arange(HEAD_DIM // 32)
+    codes = (119 + (rows % 16 + (rows // 16) * groups) % 16).to(torch.uint8)
+    positions = torch.arange(LOOKUP_TEST_ROWS)
+    ranks = torch.arange(LOOKUP_TEST_RANKS)[:, None]
+    # Alternate owners within each slot and change the row on every reuse.
+    owners = (positions + ranks) % LOOKUP_TEST_RANKS
+    ids = (owners * LOOKUP_TEST_SHARD_ROWS + (positions // LOOKUP_TEST_RANKS) % LOOKUP_TEST_SHARD_ROWS)
+    ids = ids.to(torch.int32).unsqueeze(-1)
+    ids[:, 15::37, 0] = -1
+
+    def golden_lookup(tensors):
+        row_ids = tensors["ids"].squeeze(-1).long()
+        layers = positions // (LOOKUP_TEST_ROWS // 2)
+        values = payload.float()[layers, row_ids.clamp_min(0)]
+        exponents = codes.int()[layers, row_ids.clamp_min(0)] - 127
+        scales = torch.exp2(exponents.float()).repeat_interleave(32, dim=-1)
+        tensors["out"][:] = (values * scales).masked_fill(row_ids[..., None] < 0, 0).to(torch.bfloat16)
+
+    def shard(table, rank):
+        start = rank * LOOKUP_TEST_SHARD_ROWS
+        return table[:, start:start + LOOKUP_TEST_SHARD_ROWS].flatten(0, 1).contiguous()
+
+    sources = {
+        "payload": [shard(payload.view(torch.uint8), rank) for rank in range(LOOKUP_TEST_RANKS)],
+        "scales": [shard(codes, rank) for rank in range(LOOKUP_TEST_RANKS)],
+    }
+    specs = [
+        TensorSpec("ids", list(ids.shape), torch.int32, init_value=ids),
+        TensorSpec("out", [LOOKUP_TEST_RANKS, LOOKUP_TEST_ROWS, HEAD_DIM], torch.bfloat16),
+    ]
+    distributed = DistributedConfig(device_ids=device_ids, num_sub_workers=0)
+    result = run(
+        fn=l3_engram_host_lookup_test, specs=specs, golden_fn=golden_lookup,
+        config=dict(config, distributed_config=distributed), window_sources=sources,
+        rtol=0, atol=0, compile_only=compile_only,
+    )
+    if not result.passed:
+        raise SystemExit(result.error or 1)
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -1112,8 +1201,7 @@ if __name__ == "__main__":
         "-d",
         "--device",
         type=str,
-        default="0",
-        help="comma-separated device ids; provide one device id",
+        help="comma-separated device ids; default A5 validation uses two devices",
     )
     parser.add_argument("--masked-gate", action="store_true")
     parser.add_argument("--tokens", type=int, help="explicit row count; default checks tile boundaries and tails")
@@ -1124,14 +1212,22 @@ if __name__ == "__main__":
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     args = parser.parse_args()
 
-    device_ids = [int(d) for d in args.device.split(",")]
-    if len(device_ids) != 1:
-        raise ValueError(f"need exactly one device id, got {device_ids}")
+    default_cases = args.tokens is None and not args.masked_gate
+    host_lookup = default_cases and not args.execution_mode
+    default_devices = "0,1" if host_lookup else "0"
+    device_ids = [int(d) for d in (args.device or default_devices).split(",")]
+    if host_lookup and len(set(device_ids)) != LOOKUP_TEST_RANKS:
+        parser.error("default A5 validation requires two distinct devices")
+    if len(device_ids) not in (1, LOOKUP_TEST_RANKS):
+        parser.error("provide one or two device IDs")
 
     if args.tokens is not None and args.tokens <= 0:
         parser.error("--tokens must be positive")
     if (args.runtime_dir or args.golden_data or args.save_data) and args.tokens is None:
         parser.error("replay/capture options require an explicit --tokens case")
+    if host_lookup:
+        config = {"backend_type": args.backend_type, "execution_mode": False, "enable_chip_swimlane": args.enable_chip_swimlane}
+        check_engram_host_lookup(config, device_ids, args.compile_only)
     token_cases = [17, 81, 129, 256] if args.execution_mode else [17, 80, 81, 128, 129, 256, 257]
     if args.tokens is not None:
         token_cases = [args.tokens]
