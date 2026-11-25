@@ -631,15 +631,18 @@ def make_prefill_moe(local_experts):
                             source_row = pl.cast(begin + row, pl.INT32)
                         pl.write(row_ids, [row], source_row)
                 packed_hidden = pl.reshape(round_hidden, [MOE_TOKENS, HC_DIM])
-                gather_rows(source_hidden, row_ids, packed_hidden, rows_ready, column_tile=D)
-                gather_rows(pre_mix, row_ids, round_pre, rows_ready, column_tile=512)
+                # Other AIVs overwrite this shared row-ID scratch each round.
+                gather_rows(source_hidden, row_ids, packed_hidden, rows_ready, column_tile=D, refresh_row_ids=True)
+                gather_rows(pre_mix, row_ids, round_pre, rows_ready, column_tile=512, refresh_row_ids=True)
                 bias_rows = pl.min(pl.tensor.dim(correction_bias, 0) // experts, MOE_TOKENS)
                 bias_tile_rows = bias_rows
                 if bias_rows > 1:
                     bias_tile_rows = (bias_rows + 15) // 16 * 16
                 bias_elements = bias_tile_rows * experts
                 round_bias = pl.create_tensor([bias_elements], dtype=pl.FP32)
-                gather_routing_bias(correction_bias, row_ids, round_bias, rows_ready, n_experts=experts)
+                gather_routing_bias(
+                    correction_bias, row_ids, round_bias, rows_ready, n_experts=experts, refresh_row_ids=True,
+                )
                 prefill_moe(
                     round_hidden, round_pre, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_weight,
                     gate_weight, round_bias,
@@ -660,6 +663,7 @@ def make_prefill_moe(local_experts):
                             mixed = round_mixed[row:row + 1, :]
                             mixed_destination[row:row + 1, :] = mixed
                 with pl.spmd(1, name_hint="prefill_moe_pre_mix") as pre_copied:
+                    pl.system.cacheinvalid()
                     writer = pl.tile.get_block_idx()
                     for row in pl.range(writer, MOE_TOKENS):
                         if row < rows:

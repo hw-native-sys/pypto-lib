@@ -134,6 +134,7 @@ def gather_routing_bias(
     output: pl.Tensor,
     ready: pl.Scalar[pl.TASK_ID],
     n_experts: pl.constexpr,
+    refresh_row_ids: pl.constexpr = False,
 ):
     """Gather token routing biases or copy one broadcast expert vector."""
     source_rows = pl.tensor.dim(source, 0) // n_experts
@@ -143,6 +144,8 @@ def gather_routing_bias(
     for row in pl.spmd(output_rows, name_hint="gate_bias_gather", deps=[ready]):
         source_row = pl.cast(0, pl.INT32)
         if source_rows > 1:
+            if refresh_row_ids:
+                pl.system.cacheinvalid()
             source_row = pl.read(row_ids, [row])
         for column in pl.range(0, n_experts, 32):
             valid_columns = pl.min(32, n_experts - column)

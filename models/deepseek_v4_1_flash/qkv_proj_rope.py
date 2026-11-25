@@ -1998,6 +1998,7 @@ def _proj_kv_tile_pypto(
             if task + pl.tile.get_block_num() < tasks:
                 pl.system.set_flag(pl.PipeType.FIX, pl.PipeType.MTE2, 0, core_type=pl.KernelType.AIC)
                 pl.system.wait_flag(pl.PipeType.FIX, pl.PipeType.MTE2, 0, core_type=pl.KernelType.AIC)
+        pl.system.barrier(pipe=pl.PipeType.ALL, core_type=pl.KernelType.AIC)
     return output
 
 
