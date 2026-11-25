@@ -390,22 +390,35 @@ def _prefill_indexer_score_topk(
                                 for shard_lane in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
                                     score_lane = pl.aiv_shard(score_i32)
                                 for aiv_lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                                    logical_page = logical_row // BLOCK_SIZE
+                                    first_block_raw = pl.read(idx_block_table, [request_id, logical_page])
+                                    second_block_raw = pl.read(idx_block_table, [request_id, logical_page + 1])
+                                    first_block_safe = pl.max(pl.min(first_block_raw, idx_block_num - 1), 0)
+                                    second_block_safe = pl.max(pl.min(second_block_raw, idx_block_num - 1), 0)
+                                    first_row = pl.cast(first_block_safe, pl.INDEX) * BLOCK_SIZE
+                                    second_row = pl.cast(second_block_safe, pl.INDEX) * BLOCK_SIZE
                                     kv_scale = pl.tile.create([1, SCORE_CANDIDATE_TILE], pl.FP32)
-                                    page_flags = pl.tile.full([1, SCORE_CANDIDATE_TILE], pl.FP32, 0.0)
-                                    for scale_part in pl.unroll(SCORE_CANDIDATE_TILE // BLOCK_SIZE):
-                                        scale_begin = scale_part * BLOCK_SIZE
-                                        scale_logical_page = (logical_row + scale_begin) // BLOCK_SIZE
-                                        scale_block_raw = pl.read(idx_block_table, [request_id, scale_logical_page])
-                                        scale_block_safe = pl.max(pl.min(scale_block_raw, idx_block_num - 1), 0)
-                                        scale_physical_row = pl.cast(scale_block_safe, pl.INDEX) * BLOCK_SIZE
-                                        kv_scale = pl.tile.gather_row(
-                                            kv_scale, kv_scale_row_flat, [0, scale_begin],
-                                            [0, scale_physical_row], [1, BLOCK_SIZE],
-                                        )
-                                        if scale_block_raw >= 0 and scale_block_raw < idx_block_num:
-                                            part_flags = pl.tile.full([1, BLOCK_SIZE], pl.FP32, 1.0)
-                                            page_flags = pl.tile.assemble(page_flags, part_flags, [0, scale_begin])
-                                    page_mask = pl.tile.cmps(page_flags, 0, cmp_type=1)
+                                    kv_scale = pl.tile.gather_row(
+                                        kv_scale, kv_scale_row_flat, [0, 0], [0, first_row], [1, BLOCK_SIZE],
+                                    )
+                                    kv_scale = pl.tile.gather_row(
+                                        kv_scale, kv_scale_row_flat, [0, BLOCK_SIZE], [0, second_row], [1, BLOCK_SIZE],
+                                    )
+                                    first_valid = first_block_raw >= 0 and first_block_raw < idx_block_num
+                                    second_valid = second_block_raw >= 0 and second_block_raw < idx_block_num
+                                    mask_required = not (first_valid and second_valid)
+                                    page_mask = pl.tile.create([1, 32], pl.UINT8)
+                                    if mask_required:
+                                        page_flags = pl.tile.full([1, SCORE_CANDIDATE_TILE], pl.FP32, 0.0)
+                                        if first_valid:
+                                            first_flags = pl.tile.full([1, BLOCK_SIZE], pl.FP32, 1.0)
+                                            page_flags = pl.tile.assemble(page_flags, first_flags, [0, 0])
+                                        if second_valid:
+                                            second_flags = pl.tile.full([1, BLOCK_SIZE], pl.FP32, 1.0)
+                                            page_flags = pl.tile.assemble(page_flags, second_flags, [0, BLOCK_SIZE])
+                                        invalid_page_mask = pl.tile.cmps(page_flags, 0, cmp_type=1)
+                                        page_mask = pl.tile.assemble(page_mask, invalid_page_mask, [0, 0])
+                                    page_mask = pl.set_validshape(page_mask, 1, SCORE_CANDIDATE_TILE // 8)
                                     lane_begin = aiv_lane * (SCORE_QUERY_TILE // 2)
                                     for member in pl.range(lane_begin, lane_begin + SCORE_QUERY_TILE // 2):
                                         if query + member < tile_rows:
@@ -423,10 +436,13 @@ def _prefill_indexer_score_topk(
                                                 score_sum = pl.row_sum(score_fp32, tmp_tile=score_reduce_tmp)
                                                 score_row = pl.reshape(score_sum, [1, SCORE_CANDIDATE_TILE])
                                                 score_scaled = pl.mul(score_row, kv_scale)
-                                                score_masked = pl.tile.select(page_mask, score_scaled, FP32_NEG_INF)
                                                 if logical_row < member_count:
                                                     # The TopK leaf clips the score row to the visible prefix.
-                                                    pl.store(score_masked, [query + member, logical_row], score_arena)
+                                                    if mask_required:
+                                                        score_masked = pl.tile.select(page_mask, score_scaled, FP32_NEG_INF)
+                                                        pl.store(score_masked, [query + member, logical_row], score_arena)
+                                                    else:
+                                                        pl.store(score_scaled, [query + member, logical_row], score_arena)
 
     output_workers = pl.min(tile_rows, TOPK_GROUP_WORKERS)
     with pl.spmd(output_workers, name_hint="prefill_idx_topk_query_rows", deps=[score_tid]) as topk_tid:
