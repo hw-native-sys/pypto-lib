@@ -44,7 +44,7 @@ from decode_c2a_reuse import decode_c2a_reuse
 from decode_swa import decode_swa
 from input_pack import prepare_compressed_lens
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
-from engram import ENGRAM_K, FETCH_TILE, KV_OUT, N_HASH_COLS, engram_from_rows, engram_host_lookup
+from engram import ENGRAM_K, FETCH_TILE, KV_OUT, N_HASH_COLS, SCALE_TILE, engram_from_rows, engram_host_lookup
 from utils import (
     ENGRAM_ROWS, ENGRAM_SHARD_ROWS, ENGRAM_LOOKUPS_DYN, EngramPayloadSource,
     write_forward_engram_layout,
@@ -675,7 +675,7 @@ def decode_decoder(
 @pl.jit.inline(auto_scope=False)
 def decode_fwd(
     engram_ids: pl.Tensor[[2 * T_DYN * N_HASH_COLS, 1], pl.INT32],
-    engram_scales: pl.Tensor[[2 * ENGRAM_ROWS, 8], pl.UINT8],
+    engram_scales: pld.DistributedTensor[[2 * ENGRAM_SHARD_ROWS, 8], pl.UINT8],
     engram_payload: pld.DistributedTensor[[2 * ENGRAM_SHARD_ROWS, 256], pl.UINT8],
     engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
     engram_wkv_scale: pl.Tensor[[2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
@@ -757,9 +757,11 @@ def decode_fwd(
     lookup_flat = pl.create_tensor([lookup_count, 256], dtype=pl.BF16)
     engram_first = pl.create_tensor([FETCH_TILE, 256], dtype=pl.UINT8)
     engram_second = pl.create_tensor([FETCH_TILE, 256], dtype=pl.UINT8)
+    engram_codes_first = pl.create_tensor([FETCH_TILE, SCALE_TILE], dtype=pl.UINT8)
+    engram_codes_second = pl.create_tensor([FETCH_TILE, SCALE_TILE], dtype=pl.UINT8)
     lookup_flat = engram_host_lookup(
-        engram_ids, engram_payload, engram_first, engram_second, engram_scales, lookup_flat,
-        ENGRAM_SHARD_ROWS,
+        engram_ids, engram_payload, engram_scales, engram_first, engram_second,
+        engram_codes_first, engram_codes_second, lookup_flat, ENGRAM_SHARD_ROWS,
     )
     engram_lookup = pl.reshape(lookup_flat, [2, pl.tensor.dim(x_hc, 0), ENGRAM_K])
     compressed_token_rope_cos = pl.create_tensor([DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
@@ -833,7 +835,7 @@ def decode_fwd(
 @pl.jit(auto_scope=False)
 def l2_decode_fwd(
     engram_ids: pl.Tensor[[2 * T_DYN * N_HASH_COLS, 1], pl.INT32],
-    engram_scales: pl.Tensor[[2 * ENGRAM_ROWS, 8], pl.UINT8],
+    engram_scales: pld.DistributedTensor[[2 * ENGRAM_SHARD_ROWS, 8], pl.UINT8],
     engram_payload: pld.DistributedTensor[[2 * ENGRAM_SHARD_ROWS, 256], pl.UINT8],
     engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
     engram_wkv_scale: pl.Tensor[[2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
@@ -936,7 +938,6 @@ def l2_decode_fwd(
 @pl.jit.host
 def l3_decode_fwd(
     engram_ids: pl.Tensor[[EP_SIZE, 2 * T_DYN * N_HASH_COLS, 1], pl.INT32],
-    engram_scales: pl.Tensor[[EP_SIZE, 2 * ENGRAM_ROWS, 8], pl.UINT8],
     engram_wkv: pl.Tensor[[EP_SIZE, 2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
     engram_wkv_scale: pl.Tensor[[EP_SIZE, 2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
     engram_weight: pl.Tensor[[EP_SIZE, 2, HC_MULT, D], pl.FP32],
@@ -1074,7 +1075,7 @@ def l3_decode_fwd(
     commit lengths before the next call. Completed forwards clear MoE signals;
     use persistent=True with reset_persistent_windows=False for serialized calls.
     Reset a reused request slot in all C2A sources after its users complete. Restore or reset mutated state before retrying failed
-    calls. Engram fetches FP8 Host payloads using Device-resident scales; vision and DSpark require no inputs here.
+    calls. Engram fetches FP8 payloads and E8M0 scale bytes from Host shards; vision and DSpark require no inputs here.
     """
     x_hc.bind_dynamic(1, T_DYN)
     pre_mix.bind_dynamic(1, T_DYN)
@@ -1095,12 +1096,14 @@ def l3_decode_fwd(
     freqs_sin.bind_dynamic(2, ROPE_ROWS_DYN)
     engram_ids.bind_dynamic(1, ENGRAM_LOOKUPS_DYN)
     engram_payload_buffer = pld.alloc_window_buffer([2 * ENGRAM_SHARD_ROWS, 256], dtype=pl.UINT8, memory_source="host", init="engram_payload")
+    engram_scale_buffer = pld.alloc_window_buffer([2 * ENGRAM_SHARD_ROWS, 8], dtype=pl.UINT8, memory_source="host", init="engram_scale")
     moe_workspace_buffer = pld.alloc_window_buffer([MOE_WORKSPACE_BYTES], dtype=pl.UINT8)
     for rank in pl.range(pld.world_size()):
         engram_payload = pld.window(engram_payload_buffer, [2 * ENGRAM_SHARD_ROWS, 256], dtype=pl.UINT8)
+        engram_scales = pld.window(engram_scale_buffer, [2 * ENGRAM_SHARD_ROWS, 8], dtype=pl.UINT8)
         moe_workspace = pld.window(moe_workspace_buffer, [MOE_WORKSPACE_BYTES], dtype=pl.UINT8)
         l2_decode_fwd(
-            engram_ids[rank], engram_scales[rank], engram_payload,
+            engram_ids[rank], engram_scales, engram_payload,
             engram_wkv[rank], engram_wkv_scale[rank], engram_weight[rank],
             x_hc[rank], pre_mix[rank], dspark_target_hidden[rank],
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
@@ -1216,8 +1219,6 @@ def build_tensor_specs():
         if name == "engram_ids":
             init_value = torch.full(shape, -1, dtype=dtype)
             init_value[:, :2 * N_HASH_COLS, 0] = 0
-        elif name == "engram_scales":
-            init_value = 127
         elif name == "token_to_req_indices":
             init_value = request_ids.repeat(EP_SIZE, 1)
         elif name == "position_ids":
@@ -1314,10 +1315,16 @@ if __name__ == "__main__":
             compile_only=args.compile_only,
             runtime_dir=args.runtime_dir,
             # The prepared worker binds the Host window source before dispatch.
-            window_sources=None if args.compile_only else {"engram_payload": [
-                sources.enter_context(EngramPayloadSource([(None, 0, 2 * ENGRAM_SHARD_ROWS * 256)]))
-                for _ in devices
-            ]},
+            window_sources=None if args.compile_only else {
+                "engram_payload": [
+                    sources.enter_context(EngramPayloadSource([(None, 0, 2 * ENGRAM_SHARD_ROWS * 256)]))
+                    for _ in devices
+                ],
+                "engram_scale": [
+                    sources.enter_context(EngramPayloadSource([(None, 0, 2 * ENGRAM_SHARD_ROWS * 8)]))
+                    for _ in devices
+                ],
+            },
             persistent=True,
             reset_persistent_windows=False,
             return_tensors=True,

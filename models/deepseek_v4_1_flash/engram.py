@@ -79,10 +79,12 @@ def engram_host_fetch(
     ids: pl.Tensor,
     begin: pl.Scalar[pl.INDEX],
     table: pld.DistributedTensor,
+    scales: pld.DistributedTensor,
     staging: pl.InOut[pl.Tensor],
+    staging_codes: pl.InOut[pl.Tensor],
     shard_rows: pl.constexpr,
 ):
-    """Load at most 32 remote FP8 rows through the Host-window MTE path."""
+    """Load at most 32 remote FP8 rows and their scale bytes through the Host-window MTE path."""
     rank = pld.rank(pld.get_comm_ctx(table))
     lookups = pl.tensor.dim(ids, 0)
     for offset in pl.range(FETCH_TILE):
@@ -98,7 +100,12 @@ def engram_host_fetch(
                         table, peer=owner, offsets=[source, 0], shape=[1, HEAD_DIM],
                     )
                     staging = pl.store(payload, [offset, 0], staging)
-    return staging
+                    codes = pld.tile.remote_load(
+                        scales, peer=owner, offsets=[source, 0], shape=[1, SCALE_TILE],
+                        valid_shape=[1, HEAD_DIM // 32],
+                    )
+                    staging_codes = pl.store(codes, [offset, 0], staging_codes)
+    return staging, staging_codes
 
 
 @pl.jit.incore
@@ -106,13 +113,13 @@ def engram_host_consume(
     ids: pl.Tensor,
     begin: pl.Scalar[pl.INDEX],
     table: pld.DistributedTensor,
+    scales: pld.DistributedTensor,
     staging: pl.Tensor,
-    scales: pl.Tensor,
+    staging_codes: pl.Tensor,
     output: pl.InOut[pl.Tensor],
     table_rows: pl.constexpr,
 ):
-    """Read local or staged ENP FP8 rows and write dequantized BF16 Device rows."""
-    rows_per_layer = pl.tensor.dim(scales, 0) // 2
+    """Read local or staged ENP FP8 rows and scale bytes, then write dequantized BF16 Device rows."""
     lookups = pl.tensor.dim(ids, 0)
     rank = pld.rank(pld.get_comm_ctx(table))
     for offset in pl.range(FETCH_TILE):
@@ -125,10 +132,10 @@ def engram_host_consume(
                 if owner == rank:
                     source = layer * table_rows + row % table_rows
                     payload = pl.load(table, [source, 0], [1, HEAD_DIM])
+                    codes = pl.load(scales, [source, 0], [1, SCALE_TILE], valid_shape=[1, HEAD_DIM // 32])
                 else:
                     payload = pl.load(staging, [offset, 0], [1, HEAD_DIM])
-                scale_row = layer * rows_per_layer + row
-                codes = pl.load(scales, [scale_row, 0], [1, SCALE_TILE], valid_shape=[1, HEAD_DIM // 32])
+                    codes = pl.load(staging_codes, [offset, 0], [1, SCALE_TILE], valid_shape=[1, HEAD_DIM // 32])
                 values = engram_dequantize(payload, codes)
                 output = pl.store(values, [index, 0], output)
             else:
@@ -141,17 +148,19 @@ def engram_host_consume(
 def engram_host_lookup(
     ids: pl.Tensor,
     table: pld.DistributedTensor,
+    scales: pld.DistributedTensor,
     staging_first: pl.Tensor,
     staging_second: pl.Tensor,
-    scales: pl.Tensor,
+    staging_codes_first: pl.Tensor,
+    staging_codes_second: pl.Tensor,
     output: pl.Tensor,
     table_rows: pl.constexpr,
 ):
     """Fetch two layers' flattened hash rows with bounded reusable Device staging.
 
-    IDs are layer-major, negative IDs produce zero padding, and scales contain
-    the complete layer-major scale table on each Device. Host windows contain
-    one contiguous shard of each payload table.
+    IDs are layer-major and negative IDs produce zero padding. Both Host windows
+    contain one contiguous shard of each layer's payload table and of its E8M0
+    scale table, so a row's payload and scale bytes use the same source index.
     """
     lookups = pl.tensor.dim(ids, 0)
     previous_first = pl.system.task_invalid()
@@ -163,15 +172,23 @@ def engram_host_lookup(
                 second = begin + FETCH_TILE
                 # Each Device slot is reused after its preceding consumer finishes.
                 with pl.spmd(1, name_hint="engram_fetch_first", deps=[previous_first]) as fetched_first:
-                    staging_first = engram_host_fetch(ids, begin, table, staging_first, table_rows)
+                    staging_first, staging_codes_first = engram_host_fetch(
+                        ids, begin, table, scales, staging_first, staging_codes_first, table_rows,
+                    )
                 with pl.spmd(1, name_hint="engram_consume_first", deps=[fetched_first]) as consumed_first:
-                    output = engram_host_consume(ids, begin, table, staging_first, scales, output, table_rows)
+                    output = engram_host_consume(
+                        ids, begin, table, scales, staging_first, staging_codes_first, output, table_rows,
+                    )
                 previous_first = consumed_first
                 if second < end:
                     with pl.spmd(1, name_hint="engram_fetch_second", deps=[previous_second]) as fetched_second:
-                        staging_second = engram_host_fetch(ids, second, table, staging_second, table_rows)
+                        staging_second, staging_codes_second = engram_host_fetch(
+                            ids, second, table, scales, staging_second, staging_codes_second, table_rows,
+                        )
                     with pl.spmd(1, name_hint="engram_consume_second", deps=[fetched_second]) as consumed_second:
-                        output = engram_host_consume(ids, second, table, staging_second, scales, output, table_rows)
+                        output = engram_host_consume(
+                            ids, second, table, scales, staging_second, staging_codes_second, output, table_rows,
+                        )
                     previous_second = consumed_second
     return output
 

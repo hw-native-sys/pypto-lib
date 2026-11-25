@@ -175,7 +175,7 @@ def l2_decode_fwd_dspark(
     c1a_slots: pl.Out[pl.Tensor[[PADDED_ROWS], pl.INT64]],
     query_starts: pl.Out[pl.Tensor[[DECODE_BATCH + 1], pl.INT32]],
     engram_ids: pl.Tensor[[2 * PADDED_ROWS * TARGET_FWD_N_HASH_COLS, 1], pl.INT32],
-    engram_scales: pl.Tensor[[2 * TARGET_FWD_ENGRAM_ROWS, 8], pl.UINT8],
+    engram_scales: pld.DistributedTensor[[2 * TARGET_FWD_ENGRAM_SHARD_ROWS, 8], pl.UINT8],
     engram_payload: pld.DistributedTensor[[2 * TARGET_FWD_ENGRAM_SHARD_ROWS, 256], pl.UINT8],
     engram_wkv: pl.Tensor[[2, TARGET_FWD_ENGRAM_K, TARGET_FWD_KV_OUT], pl.FP8E4M3FN],
     engram_wkv_scale: pl.Tensor[[2 * (TARGET_FWD_ENGRAM_K // 32), TARGET_FWD_KV_OUT], pl.FP8E8M0],
@@ -502,7 +502,6 @@ def l3_decode_fwd_dspark(
     c1a_slots: pl.Out[pl.Tensor[[EP_SIZE, PADDED_ROWS], pl.INT64]],
     query_starts: pl.Out[pl.Tensor[[EP_SIZE, DECODE_BATCH + 1], pl.INT32]],
     engram_ids: pl.Tensor[[EP_SIZE, 2 * TARGET_FWD_T_DYN * TARGET_FWD_N_HASH_COLS, 1], pl.INT32],
-    engram_scales: pl.Tensor[[EP_SIZE, 2 * TARGET_FWD_ENGRAM_ROWS, 8], pl.UINT8],
     engram_wkv: pl.Tensor[[EP_SIZE, 2, TARGET_FWD_ENGRAM_K, TARGET_FWD_KV_OUT], pl.FP8E4M3FN],
     engram_wkv_scale: pl.Tensor[[EP_SIZE, 2 * (TARGET_FWD_ENGRAM_K // 32), TARGET_FWD_KV_OUT], pl.FP8E8M0],
     engram_weight: pl.Tensor[[EP_SIZE, 2, HC_MULT, D], pl.FP32],
@@ -669,6 +668,10 @@ def l3_decode_fwd_dspark(
         [2 * TARGET_FWD_ENGRAM_SHARD_ROWS, 256], dtype=pl.UINT8,
         memory_source="host", init="engram_payload",
     )
+    engram_scale_buffer = pld.alloc_window_buffer(
+        [2 * TARGET_FWD_ENGRAM_SHARD_ROWS, 8], dtype=pl.UINT8,
+        memory_source="host", init="engram_scale",
+    )
     target_fwd_moe_workspace_buffer = pld.alloc_window_buffer([TARGET_MOE_WORKSPACE_BYTES], dtype=pl.UINT8)
     draft_moe_workspace_buf = pld.alloc_window_buffer([DRAFT_MOE_WORKSPACE_BYTES], dtype=pl.UINT8)
     sample_hidden_buffer = pld.alloc_window_buffer([TARGET_FWD_GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
@@ -682,6 +685,9 @@ def l3_decode_fwd_dspark(
     for rank in pl.range(pld.world_size()):
         engram_payload = pld.window(
             engram_payload_buffer, [2 * TARGET_FWD_ENGRAM_SHARD_ROWS, 256], dtype=pl.UINT8,
+        )
+        engram_scales = pld.window(
+            engram_scale_buffer, [2 * TARGET_FWD_ENGRAM_SHARD_ROWS, 8], dtype=pl.UINT8,
         )
         target_fwd_moe_workspace = pld.window(target_fwd_moe_workspace_buffer, [TARGET_MOE_WORKSPACE_BYTES], dtype=pl.UINT8)
         sampling_hidden_window = pld.window(sample_hidden_buffer, [TARGET_FWD_GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
@@ -699,7 +705,7 @@ def l3_decode_fwd_dspark(
             target_window_table[rank], target_c2a_table[rank], target_c1a_table[rank], x_hc[rank],
             pre_mix[rank], position_ids[rank], request_ids[rank], window_slots[rank],
             window_indices[rank], c2a_slots[rank], c1a_slots[rank], query_starts[rank],
-            engram_ids[rank], engram_scales[rank], engram_payload,
+            engram_ids[rank], engram_scales, engram_payload,
             engram_wkv[rank], engram_wkv_scale[rank], engram_weight[rank],
             target_hidden_padded[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_weight[rank], wq_a[rank], wq_a_scale[rank], q_norm_weight[rank],
@@ -769,7 +775,6 @@ def build_tensor_specs(active_requests=1):
     target_cos, target_sin = target_fwd.prepare_forward_rope_tables(limit)
     initial = {
         "slot_ids": -1,
-        "engram_scales": 127,
         "target_window_table": table,
         "target_c2a_table": target_specs["c2a_index_block_table"].init_value,
         "target_c1a_table": target_specs["c1a_index_block_table"].init_value,
@@ -893,10 +898,16 @@ if __name__ == "__main__":
             compile_only=args.compile_only,
             runtime_dir=args.runtime_dir,
             # The prepared worker binds the Host window source before dispatch.
-            window_sources=None if args.compile_only else {"engram_payload": [
-                sources.enter_context(EngramPayloadSource([(None, 0, 2 * ENGRAM_SHARD_ROWS * 256)]))
-                for _ in devices
-            ]},
+            window_sources=None if args.compile_only else {
+                "engram_payload": [
+                    sources.enter_context(EngramPayloadSource([(None, 0, 2 * ENGRAM_SHARD_ROWS * 256)]))
+                    for _ in devices
+                ],
+                "engram_scale": [
+                    sources.enter_context(EngramPayloadSource([(None, 0, 2 * ENGRAM_SHARD_ROWS * 8)]))
+                    for _ in devices
+                ],
+            },
             persistent=True,
             reset_persistent_windows=False,
         )

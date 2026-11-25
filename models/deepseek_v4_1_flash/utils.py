@@ -18,7 +18,6 @@ from pathlib import Path
 
 import pypto.language as pl
 import torch
-from pypto.runtime import StackedDeviceTensor
 
 import config as C
 from config import BLOCK_SIZE, EP_SIZE, FLASH as M
@@ -352,7 +351,7 @@ class EngramPayloadSource(io.RawIOBase):
 
 
 class EngramHostTables:
-    """Own streamed ENP Host shards and complete Device-resident scale replicas."""
+    """Own the streamed ENP payload and scale Host shards."""
 
     def __init__(self, checkpoint, ranks, *, num_embeddings=M.engram_num_embeddings, program_count=1):
         if ranks not in (2, 4, 8):
@@ -378,20 +377,21 @@ class EngramHostTables:
         self.shard_rows = self.rows_per_layer // ranks
         self.program_count = program_count
         self.host_payload_bytes_per_program = ranks * 2 * self.shard_rows * HEAD_DIM
+        self.host_scale_bytes_per_program = ranks * 2 * self.shard_rows * (HEAD_DIM // 32)
         self.host_payload_bytes = program_count * self.host_payload_bytes_per_program
-        self.device_scale_bytes_per_rank = 2 * self.rows_per_layer * (HEAD_DIM // 32)
-        self.upload_buffer = torch.empty(64 * 1024**2, dtype=torch.uint8).share_memory_()
+        self.host_scale_bytes = program_count * self.host_scale_bytes_per_program
         self.sources = []
-        self.device_scales = None
+        self.scale_sources = []
 
     def __enter__(self):
         try:
             available = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
         except (AttributeError, OSError, ValueError):
             available = None
-        if available is not None and self.host_payload_bytes > available:
+        host_bytes = self.host_payload_bytes + self.host_scale_bytes
+        if available is not None and host_bytes > available:
             raise MemoryError(
-                f"ENP requires {self.host_payload_bytes} Host payload bytes, "
+                f"ENP requires {host_bytes} Host table bytes, "
                 f"only {available} are available"
             )
         try:
@@ -403,40 +403,21 @@ class EngramHostTables:
                     segments.append((path, offset + row * HEAD_DIM, count * HEAD_DIM))
                     segments.append((None, 0, (self.shard_rows - count) * HEAD_DIM))
                 self.sources.append(EngramPayloadSource(segments))
+                scale_segments = []
+                width = HEAD_DIM // 32
+                for path, offset, shape, _dtype in self.scale_spans:
+                    count = max(0, min(self.shard_rows, shape[0] - row))
+                    scale_segments.append((path, offset + row * width, count * width))
+                    scale_segments.append((None, 0, (self.shard_rows - count) * width))
+                self.scale_sources.append(EngramPayloadSource(scale_segments))
         except BaseException:
             self.__exit__(None, None, None)
             raise
         return self
 
     def __exit__(self, *_exception):
-        for source in self.sources:
+        for source in (*self.sources, *self.scale_sources):
             source.close()
         self.sources.clear()
+        self.scale_sources.clear()
 
-    def upload_scales(self, runtime):
-        """Upload each native scale byte once to every rank using bounded shared scratch."""
-        shape = (2 * self.rows_per_layer, HEAD_DIM // 32)
-        shards = [runtime.alloc_tensor(shape, torch.uint8, worker_id=rank) for rank in range(self.ranks)]
-        target = memoryview(self.upload_buffer.numpy()).cast("B")
-        for layer, (path, offset, source_shape, _dtype) in enumerate(self.scale_spans):
-            live = source_shape[0] * (HEAD_DIM // 32)
-            layer_bytes = self.rows_per_layer * (HEAD_DIM // 32)
-            with path.open("rb") as file:
-                file.seek(offset)
-                for begin in range(0, layer_bytes, len(target)):
-                    count = min(len(target), layer_bytes - begin)
-                    valid = max(0, min(count, live - begin))
-                    if valid:
-                        read = file.readinto(target[:valid])
-                        if read != valid:
-                            raise EOFError("truncated Engram scale table")
-                    if valid < count:
-                        target[valid:count] = bytes(count - valid)
-                    for rank, shard in enumerate(shards):
-                        offset = layer * layer_bytes + begin
-                        runtime.copy_to(
-                            shard.data_ptr, self.upload_buffer.data_ptr(), count, dst_offset=offset, worker_id=rank,
-                        )
-        stack_shape = (self.ranks, *shape)
-        self.device_scales = StackedDeviceTensor(shards, stack_shape, tuple(range(self.ranks)))
-        return self.device_scales
