@@ -115,7 +115,7 @@ from decode_sparse_attn_csa import (
     ROPE_CS_T_TILE,
     T_PAD,
     sparse_attn_csa,
-    sparse_attn_csa_tp1,
+    sparse_attn_from_scores,
 )
 
 # Dynamic shape variables.
@@ -506,12 +506,13 @@ def _decode_csa(
                     idx_topk[short_query : short_query + 1, :] = short_output
             indexer_phase_deps[IDX_LEAF_DEP_SLOT] = all_visible_tid
         else:
-            idx_topk_scores, idx_topk, scored_leaf_tid = indexer_weights_score(
+            idx_topk_scores, idx_topk, scored_leaf_tid, _unused_arena, _unused_cap = indexer_weights_score(
                 x_normed_t, weights_proj, qr_hadamard_i8, qr_hadamard_scale_dq,
                 idx_kv_cache, idx_kv_scale, idx_block_table,
                 idx_topk_scores, idx_topk,
                 idx_positions, kv_seq_lens,
                 idx_cache_write_tid, idx_hadamard_tid, qh_quant_tid, IDX_WEIGHTS_WORKERS,
+                False,
             )
             indexer_phase_deps[IDX_LEAF_DEP_SLOT] = scored_leaf_tid
         leaf_tid = indexer_phase_deps[IDX_LEAF_DEP_SLOT]
@@ -922,23 +923,25 @@ def _decode_csa_tp1(
             position_ids, idx_slot_mapping, inner_state_slot_mapping,
             late_dep, cmp_kv_score_tid,
         )
-        idx_topk_scores, idx_topk = indexer(
+        idx_topk_scores, idx_topk, leaf_tid, arena, cap = indexer(
             x_normed_t, qr, qr_scale, idx_wq_b, idx_wq_b_scale,
             weights_proj, idx_cos_il, idx_sin_signed,
             hadamard_idx,
             idx_kv_cache, idx_kv_scale, idx_block_table,
             idx_topk_scores, idx_topk,
             position_ids, kv_seq_lens, late_dep, idx_cache_write_tid,
+            True,
         )
 
         # sparse_attn_csa folds the compressed-slot masking + valid-block flags in from the
         # raw indexer topk + position.
         o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD, O_GROUP_IN], dtype=pl.BF16)
-        o_packed_heads, heads_dep = sparse_attn_csa_tp1(
+        o_packed_heads, heads_dep = sparse_attn_from_scores(
             q, kv_cache, window_swa_indices,
             cmp_kv, cmp_block_table, idx_topk, position_ids_t1,
             attn_sink, freqs_cos, freqs_sin,
             o_packed_heads,
+            kv_seq_lens, leaf_tid, arena, cap,
         )
         decode_o_proj_tp1_hc(
             o_packed_heads, wo_a, wo_b, wo_b_scale, x_hc, post_t, comb_t, x_out, heads_dep,

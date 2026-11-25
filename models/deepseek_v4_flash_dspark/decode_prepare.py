@@ -258,28 +258,30 @@ def build_group_decode_metadata(
                             pl.read(csa_inner_state_block_table, [group_request, source_index]),
                         )
     local_token_begin = tp_rank * LOCAL_T
-    for local_token in pl.spmd(LOCAL_T, name_hint="dspark_build_swa_metadata"):
-        group_token = local_token_begin + local_token
-        request = group_token // S
-        request_offset = group_token % S
-        active_width = pl.read(active_widths, [request])
-        position = pl.read(position_ids, [group_token])
-        index_row = pl.create_tensor([1, WIN], dtype=pl.INT32)
-        index_row[:, :] = pl.full([1, WIN], dtype=pl.INT32, value=-1)
-        visible_len = pl.cast(0, pl.INT32)
-        if request_offset < active_width:
-            visible_len = pl.cast(pl.min(position + 1, WIN), pl.INT32)
-            start = position - visible_len + 1
-            for offset in pl.range(WIN):
-                if offset < visible_len:
-                    visible_position = start + offset
-                    logical_block = visible_position // BLOCK_SIZE
-                    block_offset = visible_position % BLOCK_SIZE
-                    physical_block = pl.read(ori_block_table, [request, pl.cast(logical_block, pl.INDEX)])
-                    pl.write(index_row, [0, offset], pl.cast(physical_block * BLOCK_SIZE + block_offset, pl.INT32))
-        swa_indices[local_token : local_token + 1, :] = index_row
-        hca_swa_indices[local_token : local_token + 1, :] = index_row
-        csa_swa_indices[local_token : local_token + 1, :] = index_row
+    swa_workers = pl.min(LOCAL_T, 2 * pl.system.available_cluster_count())
+    for worker in pl.spmd(swa_workers, name_hint="dspark_build_swa_metadata", allow_early_resolve=True):
+        for local_token in pl.range(worker, LOCAL_T, swa_workers):
+            group_token = local_token_begin + local_token
+            request = group_token // S
+            request_offset = group_token % S
+            active_width = pl.read(active_widths, [request])
+            position = pl.read(position_ids, [group_token])
+            index_row = pl.create_tensor([1, WIN], dtype=pl.INT32)
+            index_row[:, :] = pl.full([1, WIN], dtype=pl.INT32, value=-1)
+            visible_len = pl.cast(0, pl.INT32)
+            if request_offset < active_width:
+                visible_len = pl.cast(pl.min(position + 1, WIN), pl.INT32)
+                start = position - visible_len + 1
+                for offset in pl.range(WIN):
+                    if offset < visible_len:
+                        visible_position = start + offset
+                        logical_block = visible_position // BLOCK_SIZE
+                        block_offset = visible_position % BLOCK_SIZE
+                        physical_block = pl.read(ori_block_table, [request, pl.cast(logical_block, pl.INDEX)])
+                        pl.write(index_row, [0, offset], pl.cast(physical_block * BLOCK_SIZE + block_offset, pl.INT32))
+            swa_indices[local_token : local_token + 1, :] = index_row
+            hca_swa_indices[local_token : local_token + 1, :] = index_row
+            csa_swa_indices[local_token : local_token + 1, :] = index_row
 
     for core in pl.spmd(1, name_hint="dspark_build_cache_metadata"):
         for token in pl.range(core, T):
@@ -414,7 +416,7 @@ def prepare_target_group_from_device_state(
     tp_rank: pl.Scalar[pl.INT32],
 ):
     """Resolve the TP-group target window, capped by valid draft counts."""
-    for core in pl.spmd(1, name_hint="dspark_group_state_prepare"):
+    for core in pl.spmd(1, name_hint="dspark_group_state_prepare", allow_early_resolve=True):
         local_begin = tp_rank * LOCAL_BATCH
         local_end = local_begin + LOCAL_BATCH
         for local_request in pl.range(LOCAL_BATCH):

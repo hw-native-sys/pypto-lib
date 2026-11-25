@@ -97,6 +97,8 @@ N_LOCAL = N_EXPERTS_GLOBAL // N_RANKS
 # TaskAllocator ring heap, scaled from the 256 MiB runtime default per 16 local experts.
 MOE_RING_HEAP = (1 << 28) * max(1, N_LOCAL // 16)
 N_ROUTES = T * TOPK
+SCATTER_ROW_TILE = 16
+SCATTER_T_DYN = pl.dynamic("SCATTER_T_DYN")
 
 # recv_x/recv_aux laid out [expert, source, slot], flattened to
 # [N_LOCAL * RECV_MAX, D]. Lane (e, src, slot) flat row = e * RECV_MAX +
@@ -498,6 +500,33 @@ def combine(
     return _reduce_tid
 
 
+@pl.jit.incore
+def expert_tile_scatter(
+    recv_y: pl.Tensor[[SCATTER_T_DYN, D], pl.BF16],
+    recv_meta_local: pl.Tensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_routes: pl.Tensor[[N_LOCAL, RECV_MAX], pl.INT32],
+    routed_y_buf: pl.InOut[pld.DistributedTensor[[N_ROUTES, D], pl.BF16]],
+    local_e: pl.Scalar[pl.INDEX],
+    tile_row: pl.Scalar[pl.INDEX],
+    valid_rows: pl.Scalar[pl.INDEX],
+):
+    """Return one disjoint interval of compact rows to its source ranks."""
+    row_begin = tile_row + pl.tile.get_block_idx() * SCATTER_ROW_TILE
+    row_end = pl.min(row_begin + SCATTER_ROW_TILE, tile_row + valid_rows)
+    source_begin = pl.cast(0, pl.INDEX)
+    for src in pl.range(N_RANKS):
+        source_rows = pl.cast(pl.read(recv_meta_local, [src, local_e]), pl.INDEX)
+        source_end = source_begin + source_rows
+        for compact_row in pl.range(pl.max(row_begin, source_begin), pl.min(row_end, source_end)):
+            route = pl.cast(pl.read(recv_routes, [local_e, compact_row]), pl.INDEX)
+            pld.tensor.put(
+                dst=routed_y_buf, peer=src, src=recv_y,
+                dst_offsets=[route, 0], src_offsets=[compact_row - tile_row, 0], shape=[1, D],
+            )
+        source_begin = source_end
+    return routed_y_buf
+
+
 @pl.jit.inline(auto_scope=False)
 def scatter_expert_tile(
     recv_y: pl.Tensor,
@@ -509,22 +538,17 @@ def scatter_expert_tile(
     valid_rows: pl.Scalar[pl.INDEX],
     ready: pl.Scalar[pl.TASK_ID],
 ) -> pl.Scalar[pl.TASK_ID]:
-    """Scatter this compact expert-row interval to its source ranks."""
-    # Routes are disjoint within the epoch. Combine joins every scatter task.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="expert_tile_scatter", deps=[ready],
-               no_dep_args=[routed_y_buf]) as scatter_tid:
-        tile_end = tile_row + valid_rows
-        source_begin = pl.cast(0, pl.INDEX)
-        for src in pl.range(N_RANKS):
-            source_rows = pl.cast(pl.read(recv_meta_local, [src, local_e]), pl.INDEX)
-            source_end = source_begin + source_rows
-            for compact_row in pl.range(pl.max(tile_row, source_begin), pl.min(tile_end, source_end)):
-                route = pl.cast(pl.read(recv_routes, [local_e, compact_row]), pl.INDEX)
-                pld.tensor.put(
-                    dst=routed_y_buf, peer=src, src=recv_y,
-                    dst_offsets=[route, 0], src_offsets=[compact_row - tile_row, 0], shape=[1, D],
-                )
-            source_begin = source_end
+    """Submit one scatter grid after the producer of this expert tile."""
+    row_blocks = pl.max(1, (valid_rows + SCATTER_ROW_TILE - 1) // SCATTER_ROW_TILE)
+    # Materialize the callee for explicit SPMD submission.
+    if False:
+        expert_tile_scatter(recv_y, recv_meta_local, recv_routes, routed_y_buf, local_e, tile_row, valid_rows)
+    # Each route has a unique output row. Combine waits for every scatter grid.
+    _, scatter_tid = pl.spmd_submit(
+        self.expert_tile_scatter,  # noqa: F821 - materialized by @pl.jit
+        recv_y, recv_meta_local, recv_routes, pl.no_dep(routed_y_buf), local_e, tile_row, valid_rows,
+        core_num=row_blocks, deps=[ready],
+    )
     return scatter_tid
 
 
