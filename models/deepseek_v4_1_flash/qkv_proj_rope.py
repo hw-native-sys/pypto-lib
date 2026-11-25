@@ -28,9 +28,6 @@ from rmsnorm import EPS, golden_rms_norm
 QA_INPUT_ROWS = pl.dynamic("QA_INPUT_ROWS")
 QA_SCALE_COLS = pl.dynamic("QA_SCALE_COLS")
 QA_OUTPUT_ROWS = pl.dynamic("QA_OUTPUT_ROWS")
-KV_INPUT_ROWS = pl.dynamic("KV_INPUT_ROWS")
-KV_SCALE_COLS = pl.dynamic("KV_SCALE_COLS")
-KV_OUTPUT_ROWS = pl.dynamic("KV_OUTPUT_ROWS")
 QB_INPUT_ROWS = pl.dynamic("QB_INPUT_ROWS")
 QB_SCALE_BYTES = pl.dynamic("QB_SCALE_BYTES")
 QB_OUTPUT_ROWS = pl.dynamic("QB_OUTPUT_ROWS")
@@ -45,9 +42,6 @@ Q_LORA = M.q_lora_rank
 # tiling
 Q_B_N_TILE = 256
 KV_N_TILE = 64
-KV_DECODE_N_TILE = 32
-KV_DECODE_K_TILE = 384
-KV_DECODE_LAST_K_TILE = (D - 1) % KV_DECODE_K_TILE + 1
 QKV_SCALE_TILE = MX_M_TILE * MX_K_TILE // 32
 PROJ_M_TILE = 80
 PROJ_WIDE_M_TILE = 128
@@ -79,22 +73,6 @@ def _proj_q_b(
     row_tile: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor:
     """Project Q and rotate the BF16-rounded tail on the paired Vector core."""
-    return output
-
-
-@pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "proj_kv.cpp",
-               include_dirs=(pto_isa_include_dir(),))
-def _proj_kv(
-    payload: pl.Tensor[[KV_INPUT_ROWS, D], pl.FP8E4M3FN],
-    weight: pl.Tensor,
-    activation_scale: pl.Tensor[[1, KV_SCALE_COLS], pl.FP8E8M0],
-    weight_scale: pl.Tensor,
-    output: pl.Out[pl.Tensor[[KV_OUTPUT_ROWS, HEAD_DIM], pl.BF16]],
-    rows: pl.Scalar[pl.INDEX],
-    row_start: pl.Scalar[pl.INDEX],
-    row_tile: pl.Scalar[pl.INDEX],
-) -> pl.Tensor:
-    """Project ND activations and NZ weights with packed MX scales."""
     return output
 
 
@@ -974,30 +952,6 @@ def q_proj_rope(
             query, rope_cos, rope_sin, num_tokens, LOCAL_H * HEAD_DIM, 0, qb_tile,
         )
     return qb_payload, qb_scales
-
-
-@pl.jit.inline(auto_scope=False)
-def kv_proj_cpp(
-    payload: pl.Tensor,
-    scales: pl.Tensor,
-    wkv: pl.Tensor,
-    wkv_scale: pl.Tensor,
-    kv_projection: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-    worker_limit: pl.constexpr = 32,
-    row_tile: pl.constexpr = 80,
-):
-    """Project NZ KV weights to BF16 with bounded active rows."""
-    # Native KV tiles: M80/N64 or M256/N256.
-    if row_tile == 256:
-        n_tile = 256
-    else:
-        n_tile = KV_N_TILE
-    tasks = ((num_tokens + row_tile - 1) // row_tile) * (HEAD_DIM // n_tile)
-    workers = pl.max(pl.min(tasks, pl.min(worker_limit, pl.system.available_cluster_count())), 1)
-    with pl.spmd(workers, name_hint="proj_kv"):
-        kv_projection = _proj_kv(payload, wkv, scales, wkv_scale, kv_projection, num_tokens, 0, row_tile)
-    return kv_projection
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1956,53 +1910,94 @@ def _proj_kv_tile_pypto(
     n_tile: pl.constexpr,
     k_tile: pl.constexpr,
 ):
-    """Project each row group using logical MX scale tiles."""
-    nz_weight: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN, pl.NZ] = weight[:, :]
-    scale_backing = pl.tensor.view(weight_scale, [D // 32, HEAD_DIM], layout=pl.ND)
-    b_scales = pl.tensor.view(scale_backing, [D // 32, HEAD_DIM], layout=pl.MX_B_NN)
+    """Distribute row-major output tiles across one SPMD group."""
+    panel_k = 2 * k_tile
+    groups = k_tile // 32
     scale_width = D // 32
-    lanes = pl.max(1, worker_limit)
-    for mt in pl.parallel((rows + m_tile - 1) // m_tile):
-        row = mt * m_tile
-        valid_rows = pl.min(m_tile, rows - row)
-        row_output = output[row:row + valid_rows, :HEAD_DIM]
-        scale_begin = mt * m_tile * scale_width
-        scale_end = scale_begin + m_tile * scale_width
-        sa = activation_scale[0, scale_begin:scale_end]
-        sa = pl.reshape(sa, [m_tile, scale_width])
-        sa = pl.tensor.view(sa, [m_tile, scale_width], layout=pl.MX_A_ZZ)
-        for worker in pl.spmd(pl.min(lanes, HEAD_DIM // n_tile), name_hint="proj_kv"):
-            for base in pl.range(0, HEAD_DIM // n_tile, lanes):
-                if base + worker < HEAD_DIM // n_tile:
-                    col = (base + worker) * n_tile
-                    if m_tile == 80:
-                        k_end = D - KV_DECODE_LAST_K_TILE
-                        full_a = pl.load(payload, [row, 0], [80, D], target_memory=pl.Mem.Mat)
-                        a0 = pl.tile.slice(full_a, [80, k_tile], [0, 0])
+    activation_bytes = pl.tensor.dim(activation_scale, 1)
+    a_bytes = pl.tensor.view(activation_scale, [activation_bytes], layout=pl.ND)
+    b_bytes = pl.tensor.view(weight_scale, [scale_width * HEAD_DIM], layout=pl.ND)
+    nz_weight: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN, pl.NZ] = weight[:, :]
+    columns = HEAD_DIM // n_tile
+    tasks = ((rows + m_tile - 1) // m_tile) * columns
+    workers = pl.max(pl.min(tasks, pl.min(worker_limit, pl.system.available_cluster_count())), 1)
+    # Assign row-major tiles round-robin across the group.
+    for worker in pl.spmd(workers, name_hint="proj_kv"):
+        for task in pl.range(worker, tasks, pl.tile.get_block_num()):
+            row = task // columns * m_tile
+            col = task % columns * n_tile
+            valid_rows = pl.min(m_tile, rows - row)
+            a_window = pl.tensor.view(a_bytes, [m_tile * scale_width], offsets=[row * scale_width])
+            a_scales = pl.tensor.view(a_window, [m_tile, scale_width], layout=pl.MX_A_ZZ)
+            b_window = pl.tensor.view(b_bytes, [n_tile * scale_width], offsets=[col * scale_width])
+            b_scales = pl.tensor.view(b_window, [scale_width, n_tile], layout=pl.MX_B_NN)
+            # Prime the first L1 bank with one payload panel and two scale fragments per operand.
+            acc = pl.tile.create([m_tile, n_tile], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+            a: pl.Tile[[m_tile, panel_k], pl.FP8E4M3FN, pl.MemRef("kv_panel_a", slots=2)[0], pl.Mem.Mat] = pl.load(payload, [row, 0], [m_tile, panel_k], target_memory=pl.Mem.Mat)
+            b: pl.Tile[[panel_k, n_tile], pl.FP8E4M3FN, pl.MemRef("kv_panel_b", slots=2)[0], pl.Mem.Mat] = pl.load(nz_weight, [0, col], [panel_k, n_tile], target_memory=pl.Mem.Mat)
+            sa_lo: pl.Tile[[m_tile, groups], pl.FP8E8M0, pl.MemRef("kv_panel_sa", slots=4)[0], pl.Mem.Mat] = pl.load(a_scales, [0, 0], [m_tile, groups], target_memory=pl.Mem.Mat)
+            sb_lo: pl.Tile[[groups, n_tile], pl.FP8E8M0, pl.MemRef("kv_panel_sb", slots=4)[0], pl.Mem.Mat] = pl.load(b_scales, [0, 0], [groups, n_tile], target_memory=pl.Mem.Mat)
+            sa_hi: pl.Tile[[m_tile, groups], pl.FP8E8M0, pl.MemRef("kv_panel_sa", slots=4)[1], pl.Mem.Mat] = pl.load(a_scales, [0, groups], [m_tile, groups], target_memory=pl.Mem.Mat)
+            sb_hi: pl.Tile[[groups, n_tile], pl.FP8E8M0, pl.MemRef("kv_panel_sb", slots=4)[1], pl.Mem.Mat] = pl.load(b_scales, [groups, 0], [groups, n_tile], target_memory=pl.Mem.Mat)
+            pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 0, core_type=pl.KernelType.AIC)
+            for slot in pl.unroll(2):
+                pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, slot, core_type=pl.KernelType.AIC)
+            # Load the next panel while the cube consumes the current bank.
+            for step in pl.unroll(D // (2 * k_tile)):
+                bank = step % 2
+                next_bank = (step + 1) % 2
+                next_a, next_b = a, b
+                next_sa_lo, next_sb_lo = sa_lo, sb_lo
+                next_sa_hi, next_sb_hi = sa_hi, sb_hi
+                if step + 1 < D // (2 * k_tile):
+                    if step > 0:
+                        pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, next_bank, core_type=pl.KernelType.AIC)
+                    next_k = (step + 1) * panel_k
+                    next_group = next_k // 32
+                    next_a: pl.Tile[[m_tile, panel_k], pl.FP8E4M3FN, pl.MemRef("kv_panel_a", slots=2)[next_bank], pl.Mem.Mat] = pl.load(payload, [row, next_k], [m_tile, panel_k], target_memory=pl.Mem.Mat)
+                    next_b: pl.Tile[[panel_k, n_tile], pl.FP8E4M3FN, pl.MemRef("kv_panel_b", slots=2)[next_bank], pl.Mem.Mat] = pl.load(nz_weight, [next_k, col], [panel_k, n_tile], target_memory=pl.Mem.Mat)
+                    next_sa_lo: pl.Tile[[m_tile, groups], pl.FP8E8M0, pl.MemRef("kv_panel_sa", slots=4)[2 * next_bank], pl.Mem.Mat] = pl.load(a_scales, [0, next_group], [m_tile, groups], target_memory=pl.Mem.Mat)
+                    next_sb_lo: pl.Tile[[groups, n_tile], pl.FP8E8M0, pl.MemRef("kv_panel_sb", slots=4)[2 * next_bank], pl.Mem.Mat] = pl.load(b_scales, [next_group, 0], [groups, n_tile], target_memory=pl.Mem.Mat)
+                    next_sa_hi: pl.Tile[[m_tile, groups], pl.FP8E8M0, pl.MemRef("kv_panel_sa", slots=4)[2 * next_bank + 1], pl.Mem.Mat] = pl.load(a_scales, [0, next_group + groups], [m_tile, groups], target_memory=pl.Mem.Mat)
+                    next_sb_hi: pl.Tile[[groups, n_tile], pl.FP8E8M0, pl.MemRef("kv_panel_sb", slots=4)[2 * next_bank + 1], pl.Mem.Mat] = pl.load(b_scales, [next_group + groups, 0], [groups, n_tile], target_memory=pl.Mem.Mat)
+                    pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, next_bank, core_type=pl.KernelType.AIC)
+                pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, bank, core_type=pl.KernelType.AIC)
+                for half in pl.unroll(2):
+                    sa = sa_lo
+                    sb = sb_lo
+                    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, half, core_type=pl.KernelType.AIC)
+                    if half == 0:
+                        left: pl.Tile[[m_tile, k_tile], pl.FP8E4M3FN, pl.MemRef("kv_left", slots=2)[0], pl.Mem.Left] = pl.tile.extract(a, 0, 0, [m_tile, k_tile], target_memory=pl.Mem.Left)
+                        right: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("kv_right", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b, 0, 0, [k_tile, n_tile], target_memory=pl.Mem.Right)
                     else:
-                        k_end = D
-                        a0 = pl.load(payload, [row, 0], [m_tile, k_tile], target_memory=pl.Mem.Mat)
-                    sa0 = pl.load(sa, [0, 0], [m_tile, k_tile // 32])
-                    b0 = pl.load(nz_weight, [0, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
-                    sb0 = pl.load(b_scales, [0, col], [k_tile // 32, n_tile])
-                    acc = pl.matmul_mx(a0, sa0, b0, sb0)
-                    for k in pl.pipeline(k_tile, k_end, k_tile, stage=2):
-                        if m_tile == 80:
-                            av = pl.tile.slice(full_a, [80, k_tile], [0, k])
-                        else:
-                            av = pl.load(payload, [row, k], [m_tile, k_tile], target_memory=pl.Mem.Mat)
-                        sav = pl.load(sa, [0, k // 32], [m_tile, k_tile // 32])
-                        bv = pl.load(nz_weight, [k, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
-                        sbv = pl.load(b_scales, [k // 32, col], [k_tile // 32, n_tile])
-                        acc = pl.matmul_mx_acc(acc, av, sav, bv, sbv)
-                    if m_tile == 80:
-                        a_tail = pl.tile.slice(full_a, [80, KV_DECODE_LAST_K_TILE], [0, k_end])
-                        sa_tail = pl.load(sa, [0, k_end // 32], [80, KV_DECODE_LAST_K_TILE // 32])
-                        b_tail = pl.load(nz_weight, [k_end, col], [KV_DECODE_LAST_K_TILE, n_tile], target_memory=pl.Mem.Mat)
-                        sb_tail = pl.load(b_scales, [k_end // 32, col], [KV_DECODE_LAST_K_TILE // 32, n_tile])
-                        acc = pl.matmul_mx_acc(acc, a_tail, sa_tail, b_tail, sb_tail)
-                    valid = pl.set_validshape(acc, valid_rows, n_tile)
-                    row_output = pl.store(valid, [0, col], row_output)
+                        sa = sa_hi
+                        sb = sb_hi
+                        left: pl.Tile[[m_tile, k_tile], pl.FP8E4M3FN, pl.MemRef("kv_left", slots=2)[1], pl.Mem.Left] = pl.tile.extract(a, 0, k_tile, [m_tile, k_tile], target_memory=pl.Mem.Left)
+                        right: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("kv_right", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b, k_tile, 0, [k_tile, n_tile], target_memory=pl.Mem.Right)
+                    left_scale = pl.tile.move(sa, target_memory=pl.Mem.LeftScale)
+                    right_scale = pl.tile.move(sb, target_memory=pl.Mem.RightScale)
+                    if half == 1 and step + 2 < D // (2 * k_tile):
+                        pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, bank, core_type=pl.KernelType.AIC)
+                    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, half, core_type=pl.KernelType.AIC)
+                    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, half, core_type=pl.KernelType.AIC)
+                    if step == 0 and half == 0:
+                        acc = pl.matmul_mx(left, left_scale, right, right_scale)
+                    else:
+                        acc = pl.matmul_mx_acc(acc, left, left_scale, right, right_scale)
+                    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, half, core_type=pl.KernelType.AIC)
+                a, b = next_a, next_b
+                sa_lo, sb_lo = next_sa_lo, next_sb_lo
+                sa_hi, sb_hi = next_sa_hi, next_sb_hi
+            for slot in pl.unroll(2):
+                pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, slot, core_type=pl.KernelType.AIC)
+            pl.system.set_flag(pl.PipeType.M, pl.PipeType.FIX, 0, core_type=pl.KernelType.AIC)
+            pl.system.wait_flag(pl.PipeType.M, pl.PipeType.FIX, 0, core_type=pl.KernelType.AIC)
+            valid = pl.set_validshape(acc, valid_rows, n_tile)
+            output = pl.store(valid, [row, col], output)
+            # Finish this tile before loading the next tile into the same L1 banks.
+            if task + pl.tile.get_block_num() < tasks:
+                pl.system.set_flag(pl.PipeType.FIX, pl.PipeType.MTE2, 0, core_type=pl.KernelType.AIC)
+                pl.system.wait_flag(pl.PipeType.FIX, pl.PipeType.MTE2, 0, core_type=pl.KernelType.AIC)
     return output
 
 
@@ -2054,25 +2049,20 @@ def kv_proj_pypto(
     worker_limit: pl.constexpr = 32,
     row_tile: pl.constexpr = 80,
 ):
-    """Project packed KV weights to BF16 using the M80 or M256 preset.
-
-    Stock PTOAS 0.74 misaddresses logical MX scale slices (hw-native-sys/PTOAS#1763).
-    The model CI pin uses PTOAS 0.72.
-    """
+    """Project packed KV weights using the model's decode or prefill output tiles."""
     if row_tile == 256:
         kv_projection = _proj_kv_tile_pypto(
-            payload, wkv, scales, wkv_scale, kv_projection, num_tokens, worker_limit, 256, 128, 128,
+            payload, wkv, scales, wkv_scale, kv_projection, num_tokens, worker_limit, 256, 256, 128,
         )
     else:
         kv_projection = _proj_kv_tile_pypto(
-            payload, wkv, scales, wkv_scale, kv_projection, num_tokens, worker_limit, 80,
-            KV_DECODE_N_TILE if worker_limit >= HEAD_DIM // KV_DECODE_N_TILE else KV_N_TILE, KV_DECODE_K_TILE,
+            payload, wkv, scales, wkv_scale, kv_projection, num_tokens, worker_limit, 80, KV_N_TILE, 256,
         )
     return kv_projection
 
 
-# Shared model entry. Set to kv_proj_pypto to select the native backend.
-kv_proj = kv_proj_cpp
+# Shared KV projection for decode and prefill.
+kv_proj = kv_proj_pypto
 
 
 @pl.jit
@@ -2091,6 +2081,21 @@ def proj_q_a_validation(
     tile_rows = ((num_tokens + row_tile - 1) // row_tile) * row_tile
     scale_view = scales[:, :tile_rows * (D // 32)]
     return proj_q_a(payload, wq_a, scale_view, wq_a_scale, projected, num_tokens, row_tile, NATIVE_VALIDATION_WORKERS)
+
+
+@pl.jit
+def kv_proj_validation(
+    payload: pl.Tensor,
+    scales: pl.Tensor,
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    kv_projection: pl.InOut[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    return kv_proj(
+        payload, scales, wkv, wkv_scale, kv_projection, num_tokens,
+        worker_limit=NATIVE_VALIDATION_WORKERS, row_tile=PROJ_M_TILE,
+    )
 
 
 @pl.jit
@@ -2126,9 +2131,9 @@ def qkv_native(
 
 
 @pl.jit
-def qkv_cpp(
-    payload: pl.Tensor,
-    scales: pl.Tensor,
+def qkv_validation(
+    payload: pl.Tensor[[QA_INPUT_ROWS, D], pl.FP8E4M3FN],
+    scales: pl.Tensor[[1, QA_SCALE_COLS], pl.FP8E8M0],
     wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
     wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
     q_norm_weight: pl.Tensor,
@@ -2144,6 +2149,8 @@ def qkv_cpp(
     num_tokens: pl.Scalar[pl.INT32],
     padded_rows: pl.Scalar[pl.INDEX],
 ):
+    payload.bind_dynamic(0, QA_INPUT_ROWS)
+    scales.bind_dynamic(1, QA_SCALE_COLS)
     q_proj_rope(
         payload, scales, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
         rope_cos, rope_sin, query_latent, query, num_tokens, padded_rows,
@@ -2280,41 +2287,44 @@ def build_qkv_validation_specs(active, capacity):
     return specs + [ScalarSpec("num_tokens", torch.int32, active), ScalarSpec("padded_rows", torch.int64, padded)]
 
 
-def _golden_q_a(values, active):
+def _golden_input_projection(values, active, weight_name):
     from quant import decode_e8m0, unpack_mx_a_scale, unpack_fp8_nz
 
     padded = values["payload"].shape[0]
     codes = values["scales"].view(torch.uint8).reshape(padded, D // 32)
     scales = decode_e8m0(unpack_mx_a_scale(codes))[:active].repeat_interleave(32, dim=-1)
     source = (values["payload"][:active].float() * scales).bfloat16()
-    weight = unpack_fp8_nz(values["wq_a"])
-    projected = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(source, weight, values["wq_a_scale"])
+    weight = unpack_fp8_nz(values[weight_name])
+    projected = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(source, weight, values[weight_name + "_scale"])
     return source, projected
 
 
 def golden_proj_q_a_validation(values):
     active = int(values["num_tokens"])
     if active:
-        _, projected = _golden_q_a(values, active)
+        _, projected = _golden_input_projection(values, active, "wq_a")
         values["projected"][:active].copy_(projected)
 
 
 def golden_qkv_validation(values):
-    """Compute Q normalization, Q RoPE, and raw KV projection with K32 accumulation."""
+    """Compute raw KV and the requested query outputs with K32 accumulation."""
     from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential as project
     from quant import unpack_fp8_nz
 
     active = int(values["num_tokens"])
     if active == 0:
         return
-    source, projected = _golden_q_a(values, active)
+    source, kv = _golden_input_projection(values, active, "wkv")
+    values["kv_projection"][:active].copy_(kv)
+    if "query" not in values:
+        return
+    projected = project(source, unpack_fp8_nz(values["wq_a"]), values["wq_a_scale"])
     latent = golden_rms_norm(projected, values["q_norm_weight"])
     query = project(latent, unpack_fp8_nz(values["wq_b"]), values["wq_b_scale"])
     query = query.reshape(active, LOCAL_H, HEAD_DIM)
     query = golden_rope_tail(query, values["rope_cos"][:active], values["rope_sin"][:active])
     values["query_latent"][:active].copy_(latent)
     values["query"][:active].copy_(query.flatten(1).bfloat16())
-    values["kv_projection"][:active].copy_(project(source, unpack_fp8_nz(values["wkv"]), values["wkv_scale"]))
 
 
 def compare_qkv_output(actual, expected, *, inputs, **kwargs):
@@ -2343,20 +2353,39 @@ if __name__ == "__main__":
     import argparse
     from golden import run
 
-    parser = argparse.ArgumentParser(description="Validate Native Q-A projections against the model golden")
+    parser = argparse.ArgumentParser(description="Validate Q-A and QKV projections against the model golden")
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
+    config = {"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device}
     for active, capacity, row_tile in ((72, 80, 80), (127, 160, 128), (129, 320, 256)):
         result = run(
             fn=proj_q_a_validation,
             specs=build_proj_q_a_validation_specs(active, capacity, row_tile),
             golden_fn=golden_proj_q_a_validation,
             compare_fn={"projected": compare_qkv_output},
-            config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
+            config=config,
             compile_only=args.compile_only,
         )
         if not result.passed:
             raise SystemExit(result.error or 1)
+
+    specs = build_qkv_validation_specs(active=72, capacity=80)
+    validation = qkv_validation
+    outputs = ("query_latent", "query", "kv_projection")
+    if args.execution_mode:
+        # Q normalization uses device-only VPTO helpers. Exercise the shared KV projection on A5sim.
+        validation = kv_proj_validation
+        kv_params = {"payload", "scales", "wkv", "wkv_scale", "kv_projection", "num_tokens"}
+        specs = [spec for spec in specs if spec.name in kv_params]
+        outputs = ("kv_projection",)
+    result = run(
+        fn=validation, specs=specs,
+        golden_fn=golden_qkv_validation,
+        compare_fn={name: compare_qkv_output for name in outputs},
+        config=config, compile_only=args.compile_only,
+    )
+    if not result.passed:
+        raise SystemExit(result.error or 1)
