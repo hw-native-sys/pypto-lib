@@ -497,7 +497,9 @@ def golden_prefill_attention_hca(tensors):
     tensors["x_out"][:] = y
 
 
-def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SEQ, checkpoint_end: int = 0):
+def build_tensor_specs(
+    start_pos: int = START_POS, token_count: int = PREFILL_SEQ, checkpoint_end: int = 0, *, state_ring: bool = False,
+):
     import torch
     from golden import TensorSpec
     from utils import (block_table, cache_row_from_table, pack_nz, prefill_state_fixture,
@@ -648,6 +650,8 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         physical_blocks=HCA_STATE_PHYSICAL_BLOCKS,
         request_slots=DECODE_BATCH,
     )[0]
+    if state_ring:
+        state_table = torch.arange(HCA_STATE_MAX_BLOCKS, dtype=torch.int32) % (STATE_STORAGE_LEN // HCA_STATE_BLOCK_SIZE)
     state_table, state_mapping, state_blocks = prefill_state_fixture(
         start_pos, token_count, checkpoint_end, history=COMPRESS_RATIO, block_size=HCA_STATE_BLOCK_SIZE,
         table=state_table, physical_blocks=HCA_STATE_BLOCK_NUM,
@@ -1477,6 +1481,8 @@ def build_cp_tensor_specs(
     token_count: int = PREFILL_SEQ,
     tp_size: int = TP_SIZE,
     checkpoint_end: int = 0,
+    *,
+    state_ring: bool = False,
 ):
     """Replicate layer-boundary state and full inputs while sharding query positions."""
     import torch
@@ -1498,7 +1504,7 @@ def build_cp_tensor_specs(
     full_names = ("ori_slot_mapping", "cmp_slot_mapping", "state_slot_mapping")
 
     specs = []
-    for spec in build_tensor_specs(start_pos, token_count, checkpoint_end):
+    for spec in build_tensor_specs(start_pos, token_count, checkpoint_end, state_ring=state_ring):
         value = materialize_spec(spec)
         if spec.name == "query_start_loc":
             specs.append(TensorSpec(
@@ -1815,29 +1821,24 @@ if __name__ == "__main__":
         from pypto.ir import DistributedConfig
 
         compact_rows = TP_SIZE * PREFILL_STATE_TILE
-        token_counts = [args.token_count]
-        if default_cp_cases and args.token_count != compact_rows:
-            token_counts.append(compact_rows)
-        for token_count in token_counts:
+        cases = [(args.start_pos, args.token_count)]
+        if default_cp_cases:
+            if args.token_count != compact_rows:
+                cases.append((0, compact_rows))
+            cases.append((compact_rows, compact_rows))
+        for start_pos, token_count in cases:
+            owner_case = args.case == "b1" and start_pos % COMPRESS_RATIO == 0 and token_count == compact_rows
             specs = (
                 build_ragged2_cp_tensor_specs(TP_SIZE)
                 if args.case == "ragged2"
-                else build_cp_tensor_specs(args.start_pos, token_count, TP_SIZE)
+                else build_cp_tensor_specs(start_pos, token_count, TP_SIZE, state_ring=owner_case)
             )
             cp_cache_compare = {
                 "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
                 "cmp_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
                 "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3),
             }
-            if args.case == "b1" and args.start_pos == 0 and token_count == compact_rows:
-                from dataclasses import replace
-
-                state_ring = torch.arange(token_count, dtype=torch.int64) % STATE_STORAGE_LEN
-                specs = [
-                    replace(spec, init_value=state_ring.repeat(TP_SIZE, 1))
-                    if spec.name == "state_slot_mapping_full" else spec
-                    for spec in specs
-                ]
+            if owner_case:
                 pool_layouts = (
                     ("kv_cache", "ori_slot_mapping_full", BLOCK_SIZE, 1e-4, 1.0 / 128),
                     ("cmp_kv", "cmp_slot_mapping_full", CMP_STORAGE_BLOCK_SIZE, 1e-4, 1.0 / 128),

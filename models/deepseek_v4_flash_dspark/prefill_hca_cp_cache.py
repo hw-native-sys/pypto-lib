@@ -37,6 +37,9 @@ def hca_owner_eligible(
         page = pl.tile.get_block_idx()
         begin = page * BLOCK_SIZE
         ok = pl.cast(1, pl.INT32)
+        first_position = pl.read(positions, [0])
+        if first_position < 0 or first_position % COMPRESS_RATIO != 0:
+            ok = pl.cast(0, pl.INT32)
         raw_page = pl.read(raw_slots, [begin])
         if raw_page < 0 or raw_page % BLOCK_SIZE != 0:
             ok = pl.cast(0, pl.INT32)
@@ -45,7 +48,7 @@ def hca_owner_eligible(
                 ok = pl.cast(0, pl.INT32)
         for offset in pl.range(BLOCK_SIZE):
             row = begin + offset
-            if pl.read(positions, [row]) != row or pl.read(raw_slots, [row]) != raw_page + offset:
+            if pl.read(positions, [row]) != first_position + row or pl.read(raw_slots, [row]) != raw_page + offset:
                 ok = pl.cast(0, pl.INT32)
             last = total - 1 - (total - 1 - row) % STATE_STORAGE_LEN
             state = pl.read(state_slots, [row])

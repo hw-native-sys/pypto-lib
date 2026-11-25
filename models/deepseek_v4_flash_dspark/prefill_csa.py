@@ -1207,7 +1207,9 @@ def prefill_attention_csa_cp_core(
         compact_cache_tid = csa_compact_caches(
             x_normed_local, kv_local, halo, cmp_freqs_cos_full, cmp_freqs_sin_full,
             cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w, inner_wkv, inner_wgate, inner_ape, inner_norm_w, hadamard_idx,
-            ori_slot_mapping_full, cmp_slot_mapping_full, idx_slot_mapping_full, state_slot_mapping_full, inner_state_slot_mapping_full,
+            position_ids_full, ori_slot_mapping_full, cmp_slot_mapping_full, idx_slot_mapping_full,
+            state_slot_mapping_full, inner_state_slot_mapping_full,
+            compress_state_block_table, inner_compress_state_block_table,
             kv_cache, cmp_kv, idx_kv_cache, idx_kv_scale, compress_state, inner_compress_state,
             gather_window, gather_signal, group_base, tp_rank, halo_ready,
         )
@@ -2278,17 +2280,18 @@ if __name__ == "__main__":
         from pypto.ir import DistributedConfig
 
         compact_rows = TP_SIZE * PREFILL_STATE_TILE
-        token_counts = [args.token_count]
+        cases = [(args.start_pos, args.token_count)]
         if default_cp_cases and args.token_count != compact_rows:
-            token_counts.append(compact_rows)
-        for token_count in token_counts:
+            cases.append((0, compact_rows))
+            cases.append((compact_rows, compact_rows))
+        for start_pos, token_count in cases:
             specs = (
                 build_ragged2_cp_tensor_specs(TP_SIZE)
                 if args.case == "ragged2"
-                else build_cp_tensor_specs(args.start_pos, token_count, TP_SIZE)
+                else build_cp_tensor_specs(start_pos, token_count, TP_SIZE)
             )
             cp_cache_compare = cache_compare
-            if args.case == "b1" and args.start_pos == 0 and token_count == compact_rows:
+            if args.case == "b1" and start_pos % (COMPRESS_RATIO * BLOCK_SIZE) == 0 and token_count == compact_rows:
                 pool_layouts = (
                     ("kv_cache", "ori_slot_mapping_full", BLOCK_SIZE, 1e-4, 1.0 / 128, 0.005),
                     ("cmp_kv", "cmp_slot_mapping_full", BLOCK_SIZE, 1e-4, 1.0 / 128, 0.005),
