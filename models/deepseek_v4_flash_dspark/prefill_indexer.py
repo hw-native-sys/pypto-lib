@@ -425,12 +425,8 @@ def _prefill_indexer_score_topk(
                                                 score_scaled = pl.mul(score_row, kv_scale)
                                                 score_masked = pl.tile.select(page_mask, score_scaled, FP32_NEG_INF)
                                                 if logical_row < member_count:
-                                                    valid_rows = pl.min(SCORE_CANDIDATE_TILE, member_count - logical_row)
-                                                    score_view = pl.set_validshape(score_masked, 1, valid_rows)
-                                                    score_padded = pl.fillpad(score_view, pad_value=pl.PadValue.min)
-                                                    score_floor = pl.tile.full([1, SCORE_CANDIDATE_TILE], pl.FP32, FP32_NEG_INF)
-                                                    score_valid = pl.maximum(score_padded, score_floor)
-                                                    pl.store(score_valid, [query + member, logical_row], score_arena)
+                                                    # The TopK leaf clips the score row to the visible prefix.
+                                                    pl.store(score_masked, [query + member, logical_row], score_arena)
 
     output_workers = pl.min(tile_rows, TOPK_GROUP_WORKERS)
     with pl.spmd(output_workers, name_hint="prefill_idx_topk_query_rows", deps=[score_tid]) as topk_tid:
