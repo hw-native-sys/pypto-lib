@@ -1184,8 +1184,7 @@ def prefill_fwd(
     with pl.scope():
         if group_tokens > 0:
             materialize_ready_tid = pl.system.task_dummy(deps=[])
-            rebuild_hc = group_rows == PREFILL_GROUP_CAP and TP_SIZE > 1
-            if not rebuild_hc:
+            if TP_SIZE == 1:
                 materialize_ready_tid = prefill_cp_materialize_hc_full(
                     x_hc_local, x_hc, gather_window, gather_signal, group_base, tp_rank, materialize_ready_tid,
                 )
@@ -1199,7 +1198,7 @@ def prefill_fwd(
                 post_ffn_local, comb_ffn_local, post_ffn, comb_ffn,
                 gather_window, gather_signal, group_base, tp_rank, mixed_full_tid,
             )
-            if rebuild_hc:
+            if TP_SIZE > 1:
                 # Rebuild the final HC rows from the replicated residual and the narrow FFN output.
                 ffn_full = pl.create_tensor([group_rows, D], dtype=pl.BF16)
                 _ffn_full_tid = prefill_cp_token_allgather_into(
@@ -2171,12 +2170,12 @@ def o_proj_wo_a_full_compare(actual, expected, **kwargs):
 
 
 def x_hc_compare(actual, expected, **kwargs):
-    """Validate full-group HC against each owner's residual, coefficients, and FFN result."""
+    """Validate replicated HC against each owner's residual, coefficients, and FFN result."""
     import torch
     from golden import ratio_allclose
 
     valid, detail = finite_tensor_compare(actual, expected, zero_inactive=True, **kwargs)
-    if not valid or TP_SIZE == 1 or actual.shape[1] != PREFILL_GROUP_CAP:
+    if not valid or TP_SIZE == 1:
         return valid, detail
 
     outputs = kwargs["actual_outputs"]
