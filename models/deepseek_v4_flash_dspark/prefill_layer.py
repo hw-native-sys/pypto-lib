@@ -29,6 +29,7 @@ from moe import (
     N_EXPERTS_GLOBAL,
     N_LOCAL,
     N_RANKS,
+    PREFILL_MOE_FORWARD_SLOTS,
     PREFILL_MOE_SCALE_PAD,
     PREFILL_MOE_TOTAL_CAP,
     PREFILL_MOE_T_TILE,
@@ -235,7 +236,7 @@ def prefill_layer_attention(
     local_tokens = pl.tensor.dim(position_ids_local, 0)
     local_request_ids = pl.create_tensor([local_tokens], dtype=pl.INT32)
     lower_local_request_ids(query_start_loc, local_request_ids, tp_rank * local_tokens)
-    wo_a_full = pl.create_tensor([O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], dtype=pl.BF16)
+    wo_a_nz = pl.create_tensor([O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], dtype=pl.BF16, layout=pl.NZ)
     wo_b_full = pl.create_tensor([O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_D, O_LORA], dtype=pl.INT8)
     o_proj_order_fence = pl.create_tensor([1], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_layer_o_proj_order_init"):
@@ -254,7 +255,7 @@ def prefill_layer_attention(
                 position_ids_local, position_ids_full, local_request_ids,
                 attn_sink,
                 wo_a, wo_b, wo_b_scale,
-                wo_a_full, wo_b_full,
+                wo_a_nz, wo_b_full,
                 attn_stage,
                 gather_window, gather_signal,
                 o_proj_wo_a_window, o_proj_wo_b_window,
@@ -288,7 +289,7 @@ def prefill_layer_attention(
                 csa_inner_state_slot_mapping_full,
                 attn_sink,
                 wo_a, wo_b, wo_b_scale,
-                wo_a_full, wo_b_full,
+                wo_a_nz, wo_b_full,
                 attn_stage,
                 gather_window, gather_signal,
                 o_proj_wo_a_window, o_proj_wo_b_window,
@@ -315,7 +316,7 @@ def prefill_layer_attention(
                 hca_cmp_slot_mapping_full, hca_state_slot_mapping_full,
                 attn_sink,
                 wo_a, wo_b, wo_b_scale,
-                wo_a_full, wo_b_full,
+                wo_a_nz, wo_b_full,
                 attn_stage,
                 gather_window, gather_signal,
                 o_proj_wo_a_window, o_proj_wo_b_window,
@@ -355,11 +356,11 @@ def prefill_layer_moe(
     comb_ffn: pl.Out[pl.Tensor[[FWD_GROUP_TOKENS_DYN, HC_MULT * HC_MULT], pl.FP32]],
     ffn_out: pl.Out[pl.Tensor[[FWD_TOKENS_DYN, D], pl.BF16]],
     x_next: pl.Out[pl.Tensor[[FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32]],
-    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
-    recv_x: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
-    recv_aux: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    recv_meta: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * N_RANKS, N_LOCAL], pl.INT32],
+    recv_x: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
+    recv_aux: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
+    arrived: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * N_RANKS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[PREFILL_MOE_FORWARD_SLOTS * N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     stage_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
@@ -387,9 +388,13 @@ def prefill_layer_moe(
     num_waves = (local_rows + PREFILL_MOE_T_TILE - 1) // PREFILL_MOE_T_TILE
     epoch_base = layer_i32 * pl.cast(num_waves, pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_layer_moe_epoch_seed") as seed_tid:
+        for forward_slot in pl.range(PREFILL_MOE_FORWARD_SLOTS):
+            prior_epochs = pl.cast((epoch_base + PREFILL_MOE_FORWARD_SLOTS - 1 - forward_slot) // PREFILL_MOE_FORWARD_SLOTS, pl.INT32)
+            for src in pl.range(N_RANKS):
+                signal_row = forward_slot * N_RANKS + src
+                pl.write(arrived, [signal_row, 0], prior_epochs)
+                pl.write(data_arrived, [signal_row, 0], prior_epochs)
         for src in pl.range(N_RANKS):
-            pl.write(arrived, [src, 0], epoch_base)
-            pl.write(data_arrived, [src, 0], epoch_base)
             pl.write(combine_arrived, [src, 0], epoch_base)
             pl.write(stage_done, [src, 0], epoch_base)
         for peer in pl.range(N_RANKS):
@@ -571,11 +576,11 @@ def l3_prefill_layer(
     comb_ffn.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     ffn_out.bind_dynamic(1, FWD_TOKENS_DYN)
     x_next.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
-    recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
-    recv_x_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
-    recv_aux_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32)
-    arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    recv_meta_buf = pld.alloc_window_buffer([PREFILL_MOE_FORWARD_SLOTS * N_RANKS, N_LOCAL], dtype=pl.INT32)
+    recv_x_buf = pld.alloc_window_buffer([PREFILL_MOE_FORWARD_SLOTS * PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
+    recv_aux_buf = pld.alloc_window_buffer([PREFILL_MOE_FORWARD_SLOTS * PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32)
+    arrived_buf = pld.alloc_window_buffer([PREFILL_MOE_FORWARD_SLOTS * N_RANKS, 1], dtype=pl.INT32)
+    data_arrived_buf = pld.alloc_window_buffer([PREFILL_MOE_FORWARD_SLOTS * N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     stage_done_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
@@ -643,11 +648,11 @@ def l3_prefill_layer(
             )
 
     for rank in pl.range(pld.world_size()):
-        recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
-        recv_x = pld.window(recv_x_buf, [PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
-        recv_aux = pld.window(recv_aux_buf, [PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32)
-        arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        data_arrived = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        recv_meta = pld.window(recv_meta_buf, [PREFILL_MOE_FORWARD_SLOTS * N_RANKS, N_LOCAL], dtype=pl.INT32)
+        recv_x = pld.window(recv_x_buf, [PREFILL_MOE_FORWARD_SLOTS * PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
+        recv_aux = pld.window(recv_aux_buf, [PREFILL_MOE_FORWARD_SLOTS * PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32)
+        arrived = pld.window(arrived_buf, [PREFILL_MOE_FORWARD_SLOTS * N_RANKS, 1], dtype=pl.INT32)
+        data_arrived = pld.window(data_arrived_buf, [PREFILL_MOE_FORWARD_SLOTS * N_RANKS, 1], dtype=pl.INT32)
         routed_y_buf = pld.window(routed_y_buf_buf, [PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         stage_done = pld.window(stage_done_buf, [N_RANKS, 1], dtype=pl.INT32)
@@ -1013,6 +1018,16 @@ def golden_prefill_layer(tensors):
             tensors["x_next"][rank].copy_(full_next)
 
 
+def compare_ffn_out(actual, expected, **kwargs):
+    """Check the whole output and separately check rows using a recycled MoE slot."""
+    compare = ratio_reldiff(diff_thd=0.01, pct_thd=0.05)
+    valid, detail = compare(actual, expected, **kwargs)
+    last_wave_start = 2 * PREFILL_MOE_T_TILE
+    if valid and actual.shape[1] > last_wave_start:
+        return compare(actual[:, last_wave_start:], expected[:, last_wave_start:], **kwargs)
+    return valid, detail
+
+
 def _compare_functions(layer_id):
     attention_diff_thd = 3e-3 if layer_id == 0 else 5e-3
     compare = {
@@ -1020,7 +1035,7 @@ def _compare_functions(layer_id):
         "x_mixed": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
         "post_ffn": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
         "comb_ffn": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
-        "ffn_out": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
+        "ffn_out": compare_ffn_out,
         "x_next": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
         "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
     }
@@ -1086,7 +1101,7 @@ def main():
         args.token_count is None and TP_SIZE == 2 and args.start_pos == 0
         and not (args.runtime_dir or args.save_data or args.golden_data)
     ):
-        token_counts.append(TP_SIZE * (PREFILL_MOE_T_TILE + 1))
+        token_counts.append(TP_SIZE * (2 * PREFILL_MOE_T_TILE + 1))
     if any(not 1 <= count <= PREFILL_GROUP_CAP for count in token_counts):
         parser.error(f"--token-count must be in [1, {PREFILL_GROUP_CAP}]")
 

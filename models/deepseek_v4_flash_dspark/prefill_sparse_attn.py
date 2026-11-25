@@ -23,6 +23,7 @@ from config import (
     PREFILL_SEQ,
 )
 from prefill_metadata import REQUESTS_DYN
+from prefill_o_proj import pack_o_proj_a_weights
 
 # Longest sequence the model config admits; the host-side bound on token_count.
 MAX_SEQ_LEN = M.max_position_embeddings
@@ -36,6 +37,7 @@ PREFILL_RING_HEAP = (1024 * 1024 * 1024,) * 4
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("PREFILL_ATTN_T_DYN")
+PACKED_ROWS_DYN = pl.dynamic("PREFILL_PACKED_ROWS_DYN")
 SPARSE_ROPE_ROWS = pl.dynamic("PREFILL_SPARSE_ROPE_ROWS")
 ORI_BLOCK_NUM_DYN = pl.dynamic("PREFILL_ORI_BLOCK_NUM_DYN")
 CMP_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CMP_BLOCK_NUM_DYN")
@@ -45,6 +47,7 @@ B = PREFILL_BATCH
 S = PREFILL_SEQ
 T = B * S
 T_PAD = PREFILL_DENSE_TILE
+PROJECTION_PAIR_TILE = 2 * T_PAD
 D = M.hidden_size
 H = M.num_attention_heads
 HEAD_DIM = M.head_dim
@@ -58,6 +61,7 @@ SOFTMAX_SCALE = M.softmax_scale
 O_LORA = M.o_lora_rank
 O_GROUPS = M.o_groups
 HEADS_PER_GROUP = H // O_GROUPS
+PACKED_HEAD_ROWS = O_GROUPS * T_PAD * HEADS_PER_GROUP
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 SUPPORTED_COMPRESS_RATIOS = (0, 4, 128)
 DEFAULT_COMPRESS_RATIO = 4
@@ -90,7 +94,6 @@ ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
 A_K_TILE = 256  # proj_a GM-to-L1 K fragment
 B_K_TILE = 128  # proj_b_mm L0 K fragment
 B_L1_K_TILE = 512  # proj_b_mm GM-to-L1 K fragment
-QUANT_TILE = 512  # quant column tile over O_LORA
 PROJ_A_MM_N_TILE = 128  # proj_a cube N frag
 PROJ_B_MM_N_TILE = 128  # proj_b_mm cube N fragment
 PROJ_B_D_TILE = 512  # proj_b_mm D slab per task; its N frags loop inside the task
@@ -122,11 +125,13 @@ SPARSE_CMP_BIAS_COLS = max(0, SPARSE_BIAS_COLS - WIN)
 # HCA streaming tiling.
 HCA_ATTN_TILE = 128
 HCA_CMP_PAGES_PER_WORK = HCA_ATTN_TILE // HCA_CMP_STORAGE_BLOCK_SIZE
+HCA_SHORT_CMP_PAGE_TILE = HCA_CMP_PAGES_PER_WORK // 8
 HCA_CMP_MAX_BLOCKS = (MAX_SEQ_LEN // HCA_COMPRESS_RATIO + HCA_CMP_STORAGE_BLOCK_SIZE - 1) // HCA_CMP_STORAGE_BLOCK_SIZE
 HCA_CMP_WORK_COUNT = (HCA_CMP_MAX_BLOCKS + HCA_CMP_PAGES_PER_WORK - 1) // HCA_CMP_PAGES_PER_WORK
 HCA_CMP_PAD_ROWS = HCA_CMP_WORK_COUNT * HCA_ATTN_TILE
 HCA_WORK_VALID_STRIDE = 16  # one 64-byte cache line per INT32 writer
 HCA_QUERY_TILE = 128
+HCA_LOG_WEIGHT_MARGIN = 32.0
 HCA_RAW_QK_CORES = 24
 HCA_GATHER_TOKEN_TILE = 8
 HCA_OVERLAP_ROW_TILE = 8  # 32-byte FP32 reduction result
@@ -233,6 +238,37 @@ def _hca_panel_probabilities(
 
 
 @pl.jit.inline
+def _hca_normalize_and_pack(
+    left: pl.Tile[[HEADS_PER_GROUP, HEAD_DIM // 2], pl.FP32],
+    right: pl.Tile[[HEADS_PER_GROUP, HEAD_DIM // 2], pl.FP32],
+    group_denom: pl.Tile[[HEADS_PER_GROUP, 1], pl.FP32],
+    cos_il: pl.Tile[[1, ROPE_DIM], pl.FP32],
+    sin_signed: pl.Tile[[1, ROPE_DIM], pl.FP32],
+    swap_index: pl.Tile[[HEADS_PER_GROUP, ROPE_DIM], pl.INT32],
+    gather_tmp: pl.Tile[[HEADS_PER_GROUP, ROPE_DIM], pl.INT32],
+    output_group: pl.Scalar[pl.INDEX],
+    dense_row: pl.Scalar[pl.INDEX],
+    o_packed_heads: pl.Tensor,
+):
+    """Normalize and inverse-rotate one group for the output projection."""
+    norm_left = pl.row_expand_div(left, group_denom)
+    norm_right = pl.row_expand_div(right, group_denom)
+    rope = pl.tile.slice(norm_right, [HEADS_PER_GROUP, ROPE_DIM], [0, NOPE_DIM - HEAD_DIM // 2])
+    swapped = pl.tile.gather(norm_right, swap_index, gather_tmp)
+    rope_cos = pl.col_expand_mul(rope, cos_il)
+    swapped_sin = pl.col_expand_mul(swapped, sin_signed)
+    rotated = pl.add(rope_cos, swapped_sin)
+    left_bf16 = pl.cast(norm_left, target_type=pl.BF16, mode="rint")
+    right_bf16 = pl.cast(norm_right, target_type=pl.BF16, mode="rint")
+    rot_bf16 = pl.cast(rotated, target_type=pl.BF16, mode="rint")
+    right_packed = pl.tile.assemble(right_bf16, rot_bf16, [0, NOPE_DIM - HEAD_DIM // 2])
+    left_nd = pl.tile.reshape(left_bf16, [1, 1, HEADS_PER_GROUP, HEAD_DIM // 2])
+    right_nd = pl.tile.reshape(right_packed, [1, 1, HEADS_PER_GROUP, HEAD_DIM // 2])
+    pl.tile.store(left_nd, [output_group, dense_row, 0, 0], o_packed_heads)
+    pl.tile.store(right_nd, [output_group, dense_row, 0, HEAD_DIM // 2], o_packed_heads)
+
+
+@pl.jit.inline
 def _hca_merge_packed_heads(
     running_m: pl.Tile[[QK_M_TILE // 2, 1], pl.FP32], running_l: pl.Tile[[QK_M_TILE // 2, 1], pl.FP32],
     running_left: pl.Tile[[QK_M_TILE // 2, HEAD_DIM // 2], pl.FP32], running_right: pl.Tile[[QK_M_TILE // 2, HEAD_DIM // 2], pl.FP32],
@@ -273,116 +309,159 @@ def _hca_merge_packed_heads(
         merged_left = pl.add(pl.row_expand_mul(raw_left, raw_weight), scaled_left)
         scaled_right = pl.row_expand_mul(right, cmp_weight)
         merged_right = pl.add(pl.row_expand_mul(raw_right, raw_weight), scaled_right)
-        norm_left = pl.row_expand_div(merged_left, group_denom)
-        norm_right = pl.row_expand_div(merged_right, group_denom)
-        rope = pl.tile.slice(norm_right, [HEADS_PER_GROUP, ROPE_DIM], [0, NOPE_DIM - HEAD_DIM // 2])
-        swapped = pl.tile.gather(norm_right, swap_index, gather_tmp)
-        rope_cos = pl.col_expand_mul(rope, cos_il)
-        swapped_sin = pl.col_expand_mul(swapped, sin_signed)
-        rotated = pl.add(rope_cos, swapped_sin)
-        left_bf16 = pl.cast(norm_left, target_type=pl.BF16, mode="rint")
-        right_bf16 = pl.cast(norm_right, target_type=pl.BF16, mode="rint")
-        rot_bf16 = pl.cast(rotated, target_type=pl.BF16, mode="rint")
-        right_packed = pl.tile.assemble(right_bf16, rot_bf16, [0, NOPE_DIM - HEAD_DIM // 2])
         output_group = first_head // HEADS_PER_GROUP + group
-        output_head = (output_group * T_PAD + dense_row) * HEADS_PER_GROUP
-        pl.store(left_bf16, [output_head, 0], o_packed_heads)
-        pl.store(right_packed, [output_head, HEAD_DIM // 2], o_packed_heads)
+        _hca_normalize_and_pack(
+            merged_left, merged_right, group_denom, cos_il, sin_signed,
+            swap_index, gather_tmp, output_group, dense_row, o_packed_heads,
+        )
+
+
+@pl.jit.inline
+def _hca_pack_combined_heads(
+    values: pl.Tensor, denominators: pl.Tensor, row: pl.Scalar[pl.INDEX], first_head: pl.Scalar[pl.INDEX],
+    qk_local_t: pl.Scalar[pl.INDEX], dense_query_base: pl.Scalar[pl.INDEX], query_base: pl.Scalar[pl.INDEX],
+    inverse_rope: pl.Tensor, inverse_swap_idx: pl.Tensor, o_packed_heads: pl.Tensor,
+):
+    """Normalize the joint value accumulator and pack inverse-rotated O-projection heads."""
+    dense_row = dense_query_base + qk_local_t
+    cos_il = pl.load(inverse_rope, [query_base + qk_local_t, 0], [1, ROPE_DIM], target_memory=pl.MemorySpace.Vec)
+    sin_signed = pl.load(inverse_rope, [query_base + qk_local_t, ROPE_DIM], [1, ROPE_DIM], target_memory=pl.MemorySpace.Vec)
+    swap = pl.load(inverse_swap_idx, [0, 0], [HEADS_PER_GROUP, ROPE_DIM], target_memory=pl.MemorySpace.Vec)
+    head_rows = pl.tile.arange(0, [1, HEADS_PER_GROUP], dtype=pl.INT32)
+    head_offsets = pl.reshape(pl.mul(head_rows, HEAD_DIM // 2), [HEADS_PER_GROUP, 1])
+    rope_offsets = pl.add(head_offsets, NOPE_DIM - HEAD_DIM // 2)
+    swap_index = pl.row_expand_add(swap, rope_offsets)
+    gather_tmp = pl.create_tile([HEADS_PER_GROUP, ROPE_DIM], dtype=pl.INT32, target_memory=pl.MemorySpace.Vec)
+    for group in pl.range((QK_M_TILE // 2) // HEADS_PER_GROUP):
+        local_head = group * HEADS_PER_GROUP
+        group_denom = pl.load(denominators, [row + local_head, 0], [HEADS_PER_GROUP, 1])
+        left = pl.load(values, [row + local_head, 0], [HEADS_PER_GROUP, HEAD_DIM // 2])
+        right = pl.load(values, [row + local_head, HEAD_DIM // 2], [HEADS_PER_GROUP, HEAD_DIM // 2])
+        output_group = first_head // HEADS_PER_GROUP + group
+        _hca_normalize_and_pack(
+            left, right, group_denom, cos_il, sin_signed,
+            swap_index, gather_tmp, output_group, dense_row, o_packed_heads,
+        )
 
 
 @pl.jit.inline(auto_scope=False)
 def _hca_short_panel_wave(
-    q_flat: pl.Tensor, cmp_work_kv: pl.Tensor, cmp_work_valid: pl.Tensor, position_ids: pl.Tensor, attn_sink_col: pl.Tensor,
-    stream_state_m: pl.Tensor, stream_state_l: pl.Tensor, stream_heads: pl.Tensor,
+    q_flat: pl.Tensor, raw_kv: pl.Tensor, raw_valid: pl.Tensor, raw_offsets: pl.Tensor,
+    cmp_work_kv: pl.Tensor, cmp_work_valid: pl.Tensor, position_ids: pl.Tensor, attn_sink_col: pl.Tensor,
     inverse_rope: pl.Tensor, inverse_swap_idx: pl.Tensor, o_packed_heads: pl.Tensor,
     query_base: pl.Scalar[pl.INDEX], request_end: pl.Scalar[pl.INDEX], dense_query_base: pl.Scalar[pl.INDEX],
-    raw_done: pl.Scalar[pl.TASK_ID],
+    raw_ready: pl.Scalar[pl.TASK_ID], last_wave: pl.Array[1, pl.TASK_ID],
 ) -> pl.Scalar[pl.TASK_ID]:
-    """Keep the common compressed panel in L1 and pipeline consecutive queries."""
-    transfer_heads = HCA_RAW_QK_CORES * QK_TRANSFER_SLOTS * QK_M_TILE
-    score_transfer = pl.create_tensor([transfer_heads, HCA_ATTN_TILE], dtype=pl.FP32)
-    probability_transfer = pl.create_tensor([transfer_heads, HCA_ATTN_TILE], dtype=pl.BF16)
-    pv_transfer = pl.create_tensor([transfer_heads, HEAD_DIM], dtype=pl.FP32)
-    mi_transfer = pl.create_tensor([transfer_heads, 1], dtype=pl.FP32)
-    li_transfer = pl.create_tensor([transfer_heads, 1], dtype=pl.FP32)
-    ffts_workspace = pl.create_tensor([256], dtype=pl.INT64)
-    with pl.spmd(HCA_RAW_QK_CORES, name_hint="prefill_hca_stream_short_qk_pv", deps=[raw_done], allow_early_resolve=True) as short_tid:
+    """Stream raw-window and compressed scores through one softmax and value accumulation."""
+    transfer_rows = HCA_RAW_QK_CORES * QK_TRANSFER_SLOTS * H
+    raw_scores = pl.create_tensor([transfer_rows, WIN], dtype=pl.FP32)
+    cmp_scores = pl.create_tensor([transfer_rows, HCA_ATTN_TILE], dtype=pl.FP32)
+    raw_probs = pl.create_tensor([transfer_rows, WIN], dtype=pl.BF16)
+    cmp_probs = pl.create_tensor([transfer_rows, HCA_ATTN_TILE], dtype=pl.BF16)
+    cmp_lows = pl.create_tensor([transfer_rows, HCA_ATTN_TILE], dtype=pl.BF16)
+    combined_values = pl.create_tensor([transfer_rows, HEAD_DIM], dtype=pl.FP32)
+    denominators = pl.create_tensor([transfer_rows, 1], dtype=pl.FP32)
+    ffts = pl.create_tensor([256], dtype=pl.INT64)
+    with pl.spmd(HCA_RAW_QK_CORES, name_hint="hca_stream_combined_qk_pv", deps=[raw_ready, last_wave[0]], allow_early_resolve=True) as completed:
         worker = pl.tile.get_block_idx()
-        pl.system.set_ffts(ffts_workspace)
-        units = pl.min(HCA_QUERY_TILE, pl.max(request_end - query_base, 0)) * (H // QK_M_TILE)
-        count = pl.max((units - worker + HCA_RAW_QK_CORES - 1) // HCA_RAW_QK_CORES, 0)
-        first_valid = pl.read(cmp_work_valid, [0, 0])
-        if first_valid > 0:
-            keys = pl.load(cmp_work_kv, [0, 0], [HCA_ATTN_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
-            for tick in pl.range(count + QK_PRE_LAUNCH):
-                if tick < count:
-                    unit = worker + tick * HCA_RAW_QK_CORES
-                    t = query_base + unit // (H // QK_M_TILE)
-                    if pl.read(position_ids, [t]) >= HCA_COMPRESS_RATIO - 1:
-                        head = (unit % (H // QK_M_TILE)) * QK_M_TILE
-                        row = (worker * QK_TRANSFER_SLOTS + tick % QK_TRANSFER_SLOTS) * QK_M_TILE
-                        q = pl.load(q_flat, [t * H + head, 0], [QK_M_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
-                        scores = pl.matmul(q, pl.tile.transpose_view(keys), out_dtype=pl.FP32)
-                        pl.store(scores, [row, 0], score_transfer)
-                        pl.system.sync_set(QK_SCORE_READY_EVENT, pipe=pl.PipeType.FIX, ffts_mode=2, core_type=pl.KernelType.AIC)
-                if tick >= QK_PRE_LAUNCH:
-                    item = tick - QK_PRE_LAUNCH
-                    unit = worker + item * HCA_RAW_QK_CORES
-                    t = query_base + unit // (H // QK_M_TILE)
-                    if pl.read(position_ids, [t]) >= HCA_COMPRESS_RATIO - 1:
-                        row = (worker * QK_TRANSFER_SLOTS + item % QK_TRANSFER_SLOTS) * QK_M_TILE
-                        pl.system.sync_wait(QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
-                        probs = pl.load(probability_transfer, [row, 0], [QK_M_TILE, HCA_ATTN_TILE], target_memory=pl.MemorySpace.Mat)
-                        values = pl.matmul(probs, keys, out_dtype=pl.FP32)
-                        pl.store(values, [row, 0], pv_transfer)
-                        pl.system.sync_set(QK_PV_READY_EVENT, pipe=pl.PipeType.FIX, ffts_mode=2, core_type=pl.KernelType.AIC)
+        pl.system.set_ffts(ffts)
+        count = pl.max(
+            (pl.min(HCA_QUERY_TILE, pl.max(request_end - query_base, 0)) - worker + HCA_RAW_QK_CORES - 1) // HCA_RAW_QK_CORES, 0,
+        )
+        has_page = pl.read(cmp_work_valid, [0, 0])
+        common_keys = pl.tile.create([HCA_ATTN_TILE, HEAD_DIM], pl.BF16, target_memory=pl.Mem.Mat)
+        if has_page > 0:
+            common_keys = pl.tile.gather_row(
+                common_keys, cmp_work_kv, [0, 0], [0, 0], [HCA_ATTN_TILE, HEAD_DIM],
+            )
+        for tick in pl.range(count + QK_PRE_LAUNCH):
+            if tick < count:
+                local = worker + tick * HCA_RAW_QK_CORES
+                t = query_base + local
+                row = (worker * QK_TRANSFER_SLOTS + tick % QK_TRANSFER_SLOTS) * H
+                base = pl.cast(pl.read(raw_offsets, [local, 0]), pl.INDEX)
+                q = pl.load(q_flat, [t * H, 0], [H, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+                window = pl.load(raw_kv, [base, 0], [WIN, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+                raw = pl.matmul(q, pl.tile.transpose_view(window), out_dtype=pl.FP32)
+                pl.store(raw, [row, 0], raw_scores)
+                if has_page > 0 and pl.read(position_ids, [t]) >= HCA_COMPRESS_RATIO - 1:
+                    compressed = pl.matmul(q, pl.tile.transpose_view(common_keys), out_dtype=pl.FP32)
+                    pl.store(compressed, [row, 0], cmp_scores)
+                pl.system.sync_set(QK_SCORE_READY_EVENT, pipe=pl.PipeType.FIX, ffts_mode=2, core_type=pl.KernelType.AIC)
+            if tick >= QK_PRE_LAUNCH:
+                item = tick - QK_PRE_LAUNCH
+                local = worker + item * HCA_RAW_QK_CORES
+                row = (worker * QK_TRANSFER_SLOTS + item % QK_TRANSFER_SLOTS) * H
+                base = pl.cast(pl.read(raw_offsets, [local, 0]), pl.INDEX)
+                pl.system.sync_wait(QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
+                raw_probability = pl.load(raw_probs, [row, 0], [H, WIN], target_memory=pl.MemorySpace.Mat)
+                raw_keys = pl.load(raw_kv, [base, 0], [WIN, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+                value = pl.matmul(raw_probability, raw_keys, out_dtype=pl.FP32)
+                if has_page > 0 and pl.read(position_ids, [query_base + local]) >= HCA_COMPRESS_RATIO - 1:
+                    cmp_probability = pl.load(cmp_probs, [row, 0], [H, HCA_ATTN_TILE], target_memory=pl.MemorySpace.Mat)
+                    value = pl.matmul_acc(value, cmp_probability, common_keys)
+                    correction = pl.load(cmp_lows, [row, 0], [H, HCA_ATTN_TILE], target_memory=pl.MemorySpace.Mat)
+                    value = pl.matmul_acc(value, correction, common_keys)
+                pl.store(value, [row, 0], combined_values)
+                pl.system.sync_set(QK_PV_READY_EVENT, pipe=pl.PipeType.FIX, ffts_mode=2, core_type=pl.KernelType.AIC)
         for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
-            pl.system.set_ffts(ffts_workspace)
-            qk_lane_head = lane * (QK_M_TILE // 2)
-            tmp = pl.create_tile([QK_M_TILE // 2, HCA_ATTN_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-            for tick in pl.range(count + QK_PRE_LAUNCH):
-                if tick < count:
-                    unit = worker + tick * HCA_RAW_QK_CORES
-                    t = query_base + unit // (H // QK_M_TILE)
-                    visible = pl.min(HCA_ATTN_TILE, (pl.max(pl.read(position_ids, [t]), -1) + 1) // HCA_COMPRESS_RATIO)
-                    if first_valid > 0 and visible > 0:
-                        row = (worker * QK_TRANSFER_SLOTS + tick % QK_TRANSFER_SLOTS) * QK_M_TILE + qk_lane_head
-                        pl.system.sync_wait(QK_SCORE_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
-                        qk_scores = pl.load(score_transfer, [row, 0], [QK_M_TILE // 2, HCA_ATTN_TILE], target_memory=pl.MemorySpace.Vec)
-                        half_probs, mi, li = _hca_panel_probabilities(qk_scores, visible, tmp)
-                        pl.store(half_probs, [row, 0], probability_transfer)
-                        pl.store(mi, [row, 0], mi_transfer)
-                        pl.store(li, [row, 0], li_transfer)
-                        pl.system.sync_set(QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE3, ffts_mode=2, core_type=pl.KernelType.AIV)
-                if tick >= QK_PRE_LAUNCH:
-                    item = tick - QK_PRE_LAUNCH
-                    unit = worker + item * HCA_RAW_QK_CORES
-                    qk_local_t = unit // (H // QK_M_TILE)
-                    t = query_base + qk_local_t
-                    qk_head_base = (unit % (H // QK_M_TILE)) * QK_M_TILE
-                    running_m = pl.load(attn_sink_col, [qk_head_base + qk_lane_head, 0], [QK_M_TILE // 2, 1], target_memory=pl.MemorySpace.Vec)
-                    running_l = pl.tile.muls(running_m, 0.0)
-                    running_left = pl.tile.full([QK_M_TILE // 2, HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-                    running_right = pl.tile.full([QK_M_TILE // 2, HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-                    if first_valid > 0 and pl.read(position_ids, [t]) >= HCA_COMPRESS_RATIO - 1:
-                        row = (worker * QK_TRANSFER_SLOTS + item % QK_TRANSFER_SLOTS) * QK_M_TILE + qk_lane_head
-                        pl.system.sync_wait(QK_PV_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
-                        pv_m = pl.load(mi_transfer, [row, 0], [QK_M_TILE // 2, 1], target_memory=pl.MemorySpace.Vec)
-                        pv_l = pl.load(li_transfer, [row, 0], [QK_M_TILE // 2, 1], target_memory=pl.MemorySpace.Vec)
-                        next_m = pl.maximum(running_m, pv_m)
-                        alpha = pl.exp(pl.sub(running_m, next_m))
-                        beta = pl.exp(pl.sub(pv_m, next_m))
-                        running_l = pl.add(pl.mul(alpha, running_l), pl.mul(beta, pv_l))
-                        pv_left = pl.load(pv_transfer, [row, 0], [QK_M_TILE // 2, HEAD_DIM // 2], target_memory=pl.MemorySpace.Vec)
-                        pv_right = pl.load(pv_transfer, [row, HEAD_DIM // 2], [QK_M_TILE // 2, HEAD_DIM // 2], target_memory=pl.MemorySpace.Vec)
-                        running_left = pl.add(pl.row_expand_mul(running_left, alpha), pl.row_expand_mul(pv_left, beta))
-                        running_right = pl.add(pl.row_expand_mul(running_right, alpha), pl.row_expand_mul(pv_right, beta))
-                        running_m = next_m
-                    _hca_merge_packed_heads(
-                        running_m, running_l, running_left, running_right, qk_head_base + qk_lane_head, qk_local_t, dense_query_base, query_base,
-                        attn_sink_col, stream_state_m, stream_state_l, stream_heads, inverse_rope, inverse_swap_idx, o_packed_heads,
+            pl.system.set_ffts(ffts)
+            head = lane * (H // 2)
+            sink = pl.load(attn_sink_col, [head, 0], [H // 2, 1], target_memory=pl.MemorySpace.Vec)
+            tmp = pl.create_tile([H // 2, WIN], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+            for vec_tick in pl.range(count + QK_PRE_LAUNCH):
+                if vec_tick < count:
+                    vec_local = worker + vec_tick * HCA_RAW_QK_CORES
+                    vec_row = (worker * QK_TRANSFER_SLOTS + vec_tick % QK_TRANSFER_SLOTS) * H + head
+                    visible = pl.min(HCA_ATTN_TILE, (pl.max(pl.read(position_ids, [query_base + vec_local]), -1) + 1) // HCA_COMPRESS_RATIO)
+                    pl.system.sync_wait(QK_SCORE_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
+                    vec_raw = pl.load(raw_scores, [vec_row, 0], [H // 2, WIN], target_memory=pl.MemorySpace.Vec)
+                    valid = pl.load(raw_valid, [vec_local, 0], [1, WIN], target_memory=pl.MemorySpace.Vec)
+                    bias = pl.mul(pl.sub(valid, 1.0), -FP32_NEG_INF)
+                    raw_masked = pl.col_expand_add(pl.mul(vec_raw, SOFTMAX_SCALE), bias)
+                    raw_peak = pl.row_max(raw_masked, tmp)
+                    raw_exp = pl.col_expand_mul(pl.exp(pl.row_expand_sub(raw_masked, raw_peak)), valid)
+                    raw_sum = pl.row_sum(raw_exp, tmp)
+                    raw_rounded = pl.cast(pl.cast(raw_exp, target_type=pl.BF16, mode="rint"), target_type=pl.FP32)
+                    # Keep the original raw BF16 probabilities when the raw maximum is within 32 logits.
+                    # Larger sink or compressed scores shift the reference up to bound both exponentials.
+                    base_peak = pl.maximum(raw_peak, pl.sub(sink, HCA_LOG_WEIGHT_MARGIN))
+                    if has_page > 0 and visible > 0:
+                        comp = pl.load(cmp_scores, [vec_row, 0], [H // 2, HCA_ATTN_TILE], target_memory=pl.MemorySpace.Vec)
+                        comp_scaled = pl.mul(comp, SOFTMAX_SCALE)
+                        comp_masked = pl.fillpad(pl.set_validshape(comp_scaled, H // 2, visible), pad_value=pl.PadValue.min)
+                        comp_peak = pl.row_max(comp_masked, tmp)
+                        common_peak = pl.maximum(base_peak, pl.sub(comp_peak, HCA_LOG_WEIGHT_MARGIN))
+                        comp_exp = pl.exp(pl.row_expand_sub(comp_masked, comp_peak))
+                        comp_factor = pl.exp(pl.sub(comp_peak, common_peak))
+                        comp_sum = pl.mul(pl.row_sum(comp_exp, tmp), comp_factor)
+                        comp_rounded = pl.cast(pl.cast(comp_exp, target_type=pl.BF16, mode="rint"), target_type=pl.FP32)
+                        comp_scaled_p = pl.row_expand_mul(comp_rounded, comp_factor)
+                        comp_high = pl.cast(comp_scaled_p, target_type=pl.BF16, mode="rint")
+                        pl.store(comp_high, [vec_row, 0], cmp_probs)
+                        # Preserve the panel-local BF16 rounding after rescaling to the shared reference.
+                        comp_delta = pl.sub(comp_scaled_p, pl.cast(comp_high, target_type=pl.FP32))
+                        pl.store(pl.cast(comp_delta, target_type=pl.BF16, mode="rint"), [vec_row, 0], cmp_lows)
+                    else:
+                        common_peak = base_peak
+                        comp_sum = pl.mul(base_peak, 0.0)
+                    raw_factor = pl.exp(pl.sub(raw_peak, common_peak))
+                    weighted_sum = pl.mul(raw_sum, raw_factor)
+                    denom = pl.add(pl.add(weighted_sum, comp_sum), pl.exp(pl.sub(sink, common_peak)))
+                    raw_weighted = pl.row_expand_mul(raw_rounded, raw_factor)
+                    pl.store(pl.cast(raw_weighted, target_type=pl.BF16, mode="rint"), [vec_row, 0], raw_probs)
+                    pl.store(denom, [vec_row, 0], denominators)
+                    pl.system.sync_set(QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE3, ffts_mode=2, core_type=pl.KernelType.AIV)
+                if vec_tick >= QK_PRE_LAUNCH:
+                    vec_item = vec_tick - QK_PRE_LAUNCH
+                    vec_local = worker + vec_item * HCA_RAW_QK_CORES
+                    vec_row = (worker * QK_TRANSFER_SLOTS + vec_item % QK_TRANSFER_SLOTS) * H + head
+                    pl.system.sync_wait(QK_PV_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
+                    _hca_pack_combined_heads(
+                        combined_values, denominators, vec_row, head, vec_local, dense_query_base, query_base,
+                        inverse_rope, inverse_swap_idx, o_packed_heads,
                     )
-    return short_tid
+    return completed
 
 
 @pl.jit.inline(auto_scope=False)
@@ -395,7 +474,7 @@ def _hca_streaming_wave(
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     active_rows: pl.Scalar[pl.INDEX],
-    o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16],
+    o_packed_heads: pl.Tensor[[O_GROUPS, T_PAD, HEADS_PER_GROUP, HEAD_DIM], pl.BF16],
     raw_kv: pl.Tensor[[HCA_QUERY_TILE * WIN, HEAD_DIM], pl.BF16],
     raw_valid: pl.Tensor[[HCA_QUERY_TILE, WIN], pl.FP32],
     raw_offsets: pl.Tensor[[HCA_QUERY_TILE, HCA_WORK_VALID_STRIDE], pl.INT32],
@@ -494,72 +573,72 @@ def _hca_streaming_wave(
     # Raw-window online-softmax state.
     q_rows = t_dim * H
     q_flat = pl.reshape(q, [q_rows, HEAD_DIM])
-    raw_transfer_rows = HCA_RAW_QK_CORES * QK_TRANSFER_SLOTS * H
-    raw_score_transfer = pl.create_tensor([raw_transfer_rows, HCA_ATTN_TILE], dtype=pl.FP32)
-    raw_probability_transfer = pl.create_tensor([raw_transfer_rows, HCA_ATTN_TILE], dtype=pl.BF16)
-    raw_ffts_workspace = pl.create_tensor([256], dtype=pl.INT64)
-
-    with pl.spmd(HCA_RAW_QK_CORES, name_hint="prefill_hca_stream_raw_qk_pv", deps=[raw_gather_tid, wave_completion[0]], allow_early_resolve=True) as raw_heads_tid:
-        raw_qk_task = pl.tile.get_block_idx()
-        pl.system.set_ffts(raw_ffts_workspace)
-        raw_qk_count = pl.max((pl.min(HCA_QUERY_TILE, pl.max(request_end - query_base, 0)) - raw_qk_task + HCA_RAW_QK_CORES - 1) // HCA_RAW_QK_CORES, 0)
-        for raw_qk_tick in pl.range(raw_qk_count + QK_PRE_LAUNCH):
-            if raw_qk_tick < raw_qk_count:
-                raw_qk_t = raw_qk_task + raw_qk_tick * HCA_RAW_QK_CORES
-                raw_qk_slot = raw_qk_task * QK_TRANSFER_SLOTS + raw_qk_tick % QK_TRANSFER_SLOTS
-                raw_qk_row = raw_qk_slot * H
-                raw_qk_base = pl.cast(pl.read(raw_offsets, [raw_qk_t, 0]), pl.INDEX)
-                raw_qk_q = pl.load(q_flat, [(query_base + raw_qk_t) * H, 0], [H, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
-                raw_qk_kv = pl.load(raw_kv, [raw_qk_base, 0], [HCA_ATTN_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
-                raw_qk_scores = pl.matmul(raw_qk_q, pl.tile.transpose_view(raw_qk_kv), out_dtype=pl.FP32)
-                pl.store(raw_qk_scores, [raw_qk_row, 0], raw_score_transfer)
-                pl.system.sync_set(QK_SCORE_READY_EVENT, pipe=pl.PipeType.FIX, ffts_mode=2, core_type=pl.KernelType.AIC)
-            if raw_qk_tick >= QK_PRE_LAUNCH:
-                raw_pv_item = raw_qk_tick - QK_PRE_LAUNCH
-                raw_pv_t = raw_qk_task + raw_pv_item * HCA_RAW_QK_CORES
-                raw_pv_slot = raw_qk_task * QK_TRANSFER_SLOTS + raw_pv_item % QK_TRANSFER_SLOTS
-                raw_pv_base = pl.cast(pl.read(raw_offsets, [raw_pv_t, 0]), pl.INDEX)
-                pl.system.sync_wait(QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
-                raw_pv_probability = pl.load(
-                    raw_probability_transfer, [raw_pv_slot * H, 0], [H, HCA_ATTN_TILE], target_memory=pl.MemorySpace.Mat,
-                )
-                raw_pv_kv = pl.load(raw_kv, [raw_pv_base, 0], [HCA_ATTN_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
-                raw_pv_output = pl.matmul(raw_pv_probability, raw_pv_kv, out_dtype=pl.FP32)
-                pl.store(raw_pv_output, [raw_pv_t * H, 0], stream_heads)
-
-        for raw_qk_aiv in pl.split_aiv(2, mode=pl.SplitMode.NONE):
-            pl.system.set_ffts(raw_ffts_workspace)
-            raw_qk_head = raw_qk_aiv * (H // 2)
-            raw_qk_reduce_tmp = pl.create_tile([H // 2, HCA_ATTN_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-            for raw_qk_item in pl.range(raw_qk_count):
-                raw_qk_t = raw_qk_task + raw_qk_item * HCA_RAW_QK_CORES
-                raw_qk_slot = raw_qk_task * QK_TRANSFER_SLOTS + raw_qk_item % QK_TRANSFER_SLOTS
-                raw_qk_row = raw_qk_slot * H + raw_qk_head
-                pl.system.sync_wait(QK_SCORE_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
-                raw_qk_scores_half = pl.load(raw_score_transfer, [raw_qk_row, 0], [H // 2, HCA_ATTN_TILE], target_memory=pl.MemorySpace.Vec)
-                raw_qk_valid_row = pl.load(raw_valid, [raw_qk_t, 0], [1, HCA_ATTN_TILE], target_memory=pl.MemorySpace.Vec)
-                raw_qk_bias = pl.mul(pl.sub(raw_qk_valid_row, 1.0), -FP32_NEG_INF)
-                raw_qk_scores_half = pl.col_expand_add(pl.mul(raw_qk_scores_half, SOFTMAX_SCALE), raw_qk_bias)
-                raw_qk_mi = pl.row_max(raw_qk_scores_half, raw_qk_reduce_tmp)
-                raw_qk_exp = pl.exp(pl.row_expand_sub(raw_qk_scores_half, raw_qk_mi))
-                raw_qk_exp = pl.col_expand_mul(raw_qk_exp, raw_qk_valid_row)
-                raw_qk_li = pl.row_sum(raw_qk_exp, raw_qk_reduce_tmp)
-                raw_qk_probability = pl.cast(raw_qk_exp, target_type=pl.BF16, mode="rint")
-                pl.store(raw_qk_probability, [raw_qk_row, 0], raw_probability_transfer)
-                pl.store(raw_qk_mi, [raw_qk_t * H + raw_qk_head, 0], stream_state_m)
-                pl.store(raw_qk_li, [raw_qk_t * H + raw_qk_head, 0], stream_state_l)
-                pl.system.sync_set(QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE3, ffts_mode=2, core_type=pl.KernelType.AIV)
-
-    # Keep compressed block accumulation in the QK/PV task.
     attn_sink_col = pl.reshape(attn_sink, [H, 1])
-    raw_consumed[0] = raw_heads_tid
     if panel_count <= 1:
         short_done = _hca_short_panel_wave(
-            q_flat, cmp_work_kv, cmp_work_valid, position_ids, attn_sink_col, stream_state_m, stream_state_l, stream_heads,
-            inverse_rope, inverse_swap_idx, o_packed_heads, query_base, request_end, dense_query_base, raw_heads_tid,
+            q_flat, raw_kv, raw_valid, raw_offsets, cmp_work_kv, cmp_work_valid, position_ids, attn_sink_col,
+            inverse_rope, inverse_swap_idx, o_packed_heads, query_base, request_end, dense_query_base, raw_gather_tid, wave_completion,
         )
+        raw_consumed[0] = short_done
         wave_completion[0] = short_done
     else:
+        raw_transfer_rows = HCA_RAW_QK_CORES * QK_TRANSFER_SLOTS * H
+        raw_score_transfer = pl.create_tensor([raw_transfer_rows, HCA_ATTN_TILE], dtype=pl.FP32)
+        raw_probability_transfer = pl.create_tensor([raw_transfer_rows, HCA_ATTN_TILE], dtype=pl.BF16)
+        raw_ffts_workspace = pl.create_tensor([256], dtype=pl.INT64)
+
+        with pl.spmd(HCA_RAW_QK_CORES, name_hint="prefill_hca_stream_raw_qk_pv", deps=[raw_gather_tid, wave_completion[0]], allow_early_resolve=True) as raw_heads_tid:
+            raw_qk_task = pl.tile.get_block_idx()
+            pl.system.set_ffts(raw_ffts_workspace)
+            raw_qk_count = pl.max((pl.min(HCA_QUERY_TILE, pl.max(request_end - query_base, 0)) - raw_qk_task + HCA_RAW_QK_CORES - 1) // HCA_RAW_QK_CORES, 0)
+            for raw_qk_tick in pl.range(raw_qk_count + QK_PRE_LAUNCH):
+                if raw_qk_tick < raw_qk_count:
+                    raw_qk_t = raw_qk_task + raw_qk_tick * HCA_RAW_QK_CORES
+                    raw_qk_slot = raw_qk_task * QK_TRANSFER_SLOTS + raw_qk_tick % QK_TRANSFER_SLOTS
+                    raw_qk_row = raw_qk_slot * H
+                    raw_qk_base = pl.cast(pl.read(raw_offsets, [raw_qk_t, 0]), pl.INDEX)
+                    raw_qk_q = pl.load(q_flat, [(query_base + raw_qk_t) * H, 0], [H, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+                    raw_qk_kv = pl.load(raw_kv, [raw_qk_base, 0], [HCA_ATTN_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+                    raw_qk_scores = pl.matmul(raw_qk_q, pl.tile.transpose_view(raw_qk_kv), out_dtype=pl.FP32)
+                    pl.store(raw_qk_scores, [raw_qk_row, 0], raw_score_transfer)
+                    pl.system.sync_set(QK_SCORE_READY_EVENT, pipe=pl.PipeType.FIX, ffts_mode=2, core_type=pl.KernelType.AIC)
+                if raw_qk_tick >= QK_PRE_LAUNCH:
+                    raw_pv_item = raw_qk_tick - QK_PRE_LAUNCH
+                    raw_pv_t = raw_qk_task + raw_pv_item * HCA_RAW_QK_CORES
+                    raw_pv_slot = raw_qk_task * QK_TRANSFER_SLOTS + raw_pv_item % QK_TRANSFER_SLOTS
+                    raw_pv_base = pl.cast(pl.read(raw_offsets, [raw_pv_t, 0]), pl.INDEX)
+                    pl.system.sync_wait(QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
+                    raw_pv_probability = pl.load(
+                        raw_probability_transfer, [raw_pv_slot * H, 0], [H, HCA_ATTN_TILE], target_memory=pl.MemorySpace.Mat,
+                    )
+                    raw_pv_kv = pl.load(raw_kv, [raw_pv_base, 0], [HCA_ATTN_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+                    raw_pv_output = pl.matmul(raw_pv_probability, raw_pv_kv, out_dtype=pl.FP32)
+                    pl.store(raw_pv_output, [raw_pv_t * H, 0], stream_heads)
+
+            for raw_qk_aiv in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                pl.system.set_ffts(raw_ffts_workspace)
+                raw_qk_head = raw_qk_aiv * (H // 2)
+                raw_qk_reduce_tmp = pl.create_tile([H // 2, HCA_ATTN_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+                for raw_qk_item in pl.range(raw_qk_count):
+                    raw_qk_t = raw_qk_task + raw_qk_item * HCA_RAW_QK_CORES
+                    raw_qk_slot = raw_qk_task * QK_TRANSFER_SLOTS + raw_qk_item % QK_TRANSFER_SLOTS
+                    raw_qk_row = raw_qk_slot * H + raw_qk_head
+                    pl.system.sync_wait(QK_SCORE_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
+                    raw_qk_scores_half = pl.load(raw_score_transfer, [raw_qk_row, 0], [H // 2, HCA_ATTN_TILE], target_memory=pl.MemorySpace.Vec)
+                    raw_qk_valid_row = pl.load(raw_valid, [raw_qk_t, 0], [1, HCA_ATTN_TILE], target_memory=pl.MemorySpace.Vec)
+                    raw_qk_bias = pl.mul(pl.sub(raw_qk_valid_row, 1.0), -FP32_NEG_INF)
+                    raw_qk_scores_half = pl.col_expand_add(pl.mul(raw_qk_scores_half, SOFTMAX_SCALE), raw_qk_bias)
+                    raw_qk_mi = pl.row_max(raw_qk_scores_half, raw_qk_reduce_tmp)
+                    raw_qk_exp = pl.exp(pl.row_expand_sub(raw_qk_scores_half, raw_qk_mi))
+                    raw_qk_exp = pl.col_expand_mul(raw_qk_exp, raw_qk_valid_row)
+                    raw_qk_li = pl.row_sum(raw_qk_exp, raw_qk_reduce_tmp)
+                    raw_qk_probability = pl.cast(raw_qk_exp, target_type=pl.BF16, mode="rint")
+                    pl.store(raw_qk_probability, [raw_qk_row, 0], raw_probability_transfer)
+                    pl.store(raw_qk_mi, [raw_qk_t * H + raw_qk_head, 0], stream_state_m)
+                    pl.store(raw_qk_li, [raw_qk_t * H + raw_qk_head, 0], stream_state_l)
+                    pl.system.sync_set(QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE3, ffts_mode=2, core_type=pl.KernelType.AIV)
+
+        raw_consumed[0] = raw_heads_tid
         general_done = _hca_multi_panel_wave(
             q_flat, cmp_work_kv, cmp_work_valid, position_ids, attn_sink_col,
             stream_state_m, stream_state_l, stream_heads, inverse_rope, inverse_swap_idx, o_packed_heads,
@@ -722,7 +801,7 @@ def _hca_streaming_attn_tile(
     inverse_rope: pl.Tensor[[SPARSE_ROPE_ROWS, 2 * ROPE_DIM], pl.FP32],
     inverse_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
     inverse_ready: pl.Scalar[pl.TASK_ID],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
     wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -743,14 +822,25 @@ def _hca_streaming_attn_tile(
         # Tile-local HCA workspaces.
         cmp_work_kv = pl.create_tensor([HCA_CMP_PAD_ROWS, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
         cmp_work_valid = pl.create_tensor([HCA_CMP_WORK_COUNT, HCA_WORK_VALID_STRIDE], dtype=pl.INT32, manual_dep=True)
+        # Keep slot zero initialized for an empty compressed interval.
+        gather_panels = pl.max(1, pl.min(pl.cast(panel_count, pl.INDEX), HCA_CMP_WORK_COUNT))
+        gather_page_tile = pl.const(HCA_CMP_PAGES_PER_WORK, pl.INDEX)
+        if panel_count == 1:
+            gather_page_tile = pl.const(HCA_SHORT_CMP_PAGE_TILE, pl.INDEX)
+        blocks_per_panel = HCA_CMP_PAGES_PER_WORK // gather_page_tile
+        gather_blocks = gather_panels * blocks_per_panel
         with pl.spmd(
-            HCA_CMP_WORK_COUNT, name_hint="prefill_hca_stream_cmp_gather", deps=[packed_init_tid],
+            gather_blocks, name_hint="prefill_hca_stream_cmp_gather", deps=[packed_init_tid],
         ) as cmp_gather_tid:
-            gather_work = pl.tile.get_block_idx()
-            pl.write(cmp_work_valid, [gather_work, 0], pl.cast(0, pl.INT32))
+            gather_block = pl.tile.get_block_idx()
+            gather_work = gather_block // blocks_per_panel
+            gather_page_base = (gather_block % blocks_per_panel) * gather_page_tile
+            if gather_page_base == 0:
+                pl.write(cmp_work_valid, [gather_work, 0], pl.cast(0, pl.INT32))
             if gather_work < panel_count:
                 gather_dst0 = gather_work * HCA_ATTN_TILE
-                for gather_page in pl.range(HCA_CMP_PAGES_PER_WORK):
+                gather_page_end = gather_page_base + gather_page_tile
+                for gather_page in pl.range(gather_page_base, gather_page_end):
                     gather_table_col = gather_work * HCA_CMP_PAGES_PER_WORK + gather_page
                     gather_local = gather_page * HCA_CMP_STORAGE_BLOCK_SIZE
                     gather_dst = gather_dst0 + gather_local
@@ -780,12 +870,18 @@ def _hca_streaming_attn_tile(
         raw_consumed = pl.array.create(1, pl.TASK_ID)
         raw_consumed[0] = wave_ready_tid
         wave_completion[0] = wave_ready_tid
+        # Expose heads on the burst axis over the head-major backing buffer.
+        packed_head_major: pl.Tensor[
+            [O_GROUPS, T_PAD, HEADS_PER_GROUP, HEAD_DIM],
+            pl.BF16,
+            pl.TensorView(layout=pl.ND, stride=[HEADS_PER_GROUP * T_PAD * HEAD_DIM, HEAD_DIM, T_PAD * HEAD_DIM, 1]),
+        ] = pl.reshape(o_packed_heads, [O_GROUPS, T_PAD, HEADS_PER_GROUP, HEAD_DIM])
         for dense_query_base in pl.range(0, tile_rows, HCA_QUERY_TILE):
             _hca_streaming_wave(
                 q, ori_kv, swa_indices,
                 cmp_work_kv, cmp_work_valid,
                 position_ids, attn_sink, active_rows,
-                o_packed_heads,
+                packed_head_major,
                 raw_kv, raw_valid, raw_offsets,
                 stream_state_m, stream_state_l, stream_heads,
                 inverse_rope, inverse_swap_idx,
@@ -801,6 +897,7 @@ def _hca_streaming_attn_tile(
             attn_out,
             request_offset + tile_base, tile_rows,
             heads_complete_tid, o_proj_weight_dep,
+            PROJECTION_ROWS=T_PAD, PROJ_A_FENCE=False,
         )
         tile_completion[0] = act_tid
 
@@ -817,7 +914,7 @@ def _sparse_attn_wave(
     valid_block_mask: pl.Tensor[[T_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     active_rows: pl.Scalar[pl.INDEX],
-    o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16],
+    o_packed_heads: pl.Tensor[[O_GROUPS, T_PAD, HEADS_PER_GROUP, HEAD_DIM], pl.BF16],
     sparse_kv: pl.Tensor[[PREFILL_QUERY_TILE * PREFILL_SPARSE_PAD, HEAD_DIM], pl.BF16],
     sparse_bias: pl.Tensor[[PREFILL_QUERY_TILE, PREFILL_SPARSE_PAD], pl.FP32],
     inverse_rope: pl.Tensor[[SPARSE_ROPE_ROWS, 2 * ROPE_DIM], pl.FP32],
@@ -1107,9 +1204,10 @@ def _sparse_attn_wave(
                     rot_bf16 = pl.cast(rotated, target_type=pl.BF16, mode="rint")
                     right_packed = pl.tile.assemble(right_bf16, rot_bf16, [0, NOPE_DIM - HEAD_DIM // 2])
                     output_group = qk_lane_head // HEADS_PER_GROUP + group
-                    output_head = (output_group * T_PAD + dense_row) * HEADS_PER_GROUP
-                    pl.store(left_bf16, [output_head, 0], o_packed_heads)
-                    pl.store(right_packed, [output_head, HEAD_DIM // 2], o_packed_heads)
+                    left_nd = pl.tile.reshape(left_bf16, [1, 1, HEADS_PER_GROUP, HEAD_DIM // 2])
+                    right_nd = pl.tile.reshape(right_packed, [1, 1, HEADS_PER_GROUP, HEAD_DIM // 2])
+                    pl.tile.store(left_nd, [output_group, dense_row, 0, 0], o_packed_heads)
+                    pl.tile.store(right_nd, [output_group, dense_row, 0, HEAD_DIM // 2], o_packed_heads)
 
     return qk_tid
 
@@ -1129,7 +1227,7 @@ def _sparse_attn_heads(
     inverse_rope: pl.Tensor[[SPARSE_ROPE_ROWS, 2 * ROPE_DIM], pl.FP32],
     inverse_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
     inverse_ready: pl.Scalar[pl.TASK_ID],
-    o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16],
+    o_packed_heads: pl.Tensor[[O_GROUPS, T_PAD, HEADS_PER_GROUP, HEAD_DIM], pl.BF16],
     packed_init_tid: pl.Scalar[pl.TASK_ID],
     tile_base: pl.Scalar[pl.INDEX],
     tile_rows: pl.Scalar[pl.INDEX],
@@ -1180,10 +1278,22 @@ def _sparse_attn_heads(
     return o_packed_heads, wave_tids[0]
 
 
+@pl.jit.inline
+def _proj_b_accumulate_group(
+    acc: pl.Tile[[PROJ_B_ACT_T_TILE, PROJ_B_ACT_N_TILE], pl.FP32],
+    values: pl.Tile[[PROJ_B_ACT_T_TILE, PROJ_B_ACT_N_TILE], pl.INT32],
+    row_scale: pl.Tile[[1, PROJ_B_ACT_T_TILE], pl.FP32],
+) -> pl.Tile[[PROJ_B_ACT_T_TILE, PROJ_B_ACT_N_TILE], pl.FP32]:
+    values_f32 = pl.cast(values, target_type=pl.FP32, mode="none")
+    scale = pl.reshape(row_scale, [PROJ_B_ACT_T_TILE, 1])
+    scaled = pl.row_expand_mul(values_f32, scale)
+    return pl.add(acc, scaled)
+
+
 @pl.jit.inline(auto_scope=False)
 def _sparse_attn_o_proj(
-    o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    o_packed_heads: pl.Tensor[[PACKED_ROWS_DYN, HEAD_DIM], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
     wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -1191,18 +1301,22 @@ def _sparse_attn_o_proj(
     tile_rows: pl.Scalar[pl.INDEX],
     heads_dep: pl.Scalar[pl.TASK_ID],
     weight_dep: pl.Scalar[pl.TASK_ID],
+    PROJECTION_ROWS: pl.constexpr,
+    PROJ_A_FENCE: pl.constexpr,
 ) -> pl.Scalar[pl.TASK_ID]:
     """Project one local-token dense tile into BF16 hidden rows."""
-    o_packed = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
-    wo_a_2d = pl.reshape(wo_a, [O_GROUPS * O_LORA, O_GROUP_IN])
+    o_packed = pl.reshape(o_packed_heads, [O_GROUPS * PROJECTION_ROWS * HEADS_PER_GROUP, HEAD_DIM])
     wo_b_2d = pl.reshape(wo_b, [O_GROUPS * D, O_LORA])
 
     # Chain merge, quantization, and projection through explicit task dependencies.
-    o_r = pl.create_tensor([T_PAD, O_GROUPS * O_LORA], dtype=pl.FP32)
-    o_r_i8 = pl.create_tensor([T_PAD, O_GROUPS * O_LORA], dtype=pl.INT8)
-    act_scale_dq = pl.create_tensor([O_GROUPS, T_PAD], dtype=pl.FP32)
-    partials = pl.create_tensor([T_PAD, O_GROUPS * D], dtype=pl.INT32)
-    proj_a_tids = pl.array.create(O_GROUPS * PA_NFRAGS, pl.TASK_ID)
+    o_r = pl.create_tensor([O_GROUPS * PROJECTION_ROWS, O_LORA], dtype=pl.FP32)
+    o_r_i8 = pl.create_tensor([O_GROUPS * PROJECTION_ROWS, O_LORA], dtype=pl.INT8)
+    act_scale_dq = pl.create_tensor([O_GROUPS, PROJECTION_ROWS], dtype=pl.FP32)
+    if PROJECTION_ROWS == T_PAD:
+        partials = pl.create_tensor([PROJECTION_ROWS, O_GROUPS * D], dtype=pl.INT32)
+    else:
+        partials = pl.create_tensor([O_GROUPS * PROJECTION_ROWS, D], dtype=pl.INT32)
+    proj_a_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
     quant_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
     proj_b_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
     # Round physical tails up to complete projection tiles; only the final store
@@ -1213,86 +1327,93 @@ def _sparse_attn_o_proj(
     proj_b_rows = o_compute_rows // PROJ_B_ROW_TILE
 
     with pl.scope():
-        # proj_a[g, nf]: BF16 grouped GEMM -> o_r[:, group g], init_cond K loop.
-        # Row-blocked over PROJ_A_ROW_TILE with a padded load, so the T_PAD-strided
-        # o_packed slab never feeds uninitialized rows into the matmul.
+        # Publish one O-A task per group with disjoint token and output blocks.
+        pa_blocks = proj_a_rows * PA_NFRAGS
         for g in pl.parallel(O_GROUPS):
-            row_base_o = g * T_PAD
-            out_col_g = g * O_LORA
-            for nf in pl.range(PA_NFRAGS):
-                n0 = nf * PROJ_A_MM_N_TILE
-                pa_col0 = out_col_g + n0
-                pa_output: pl.Tensor[
-                    [T_PAD, PROJ_A_MM_N_TILE], pl.FP32, pl.TensorView(stride=[O_GROUPS * O_LORA, 1])
-                ] = pl.slice(o_r, [T_PAD, PROJ_A_MM_N_TILE], [0, pa_col0])
-                with pl.spmd(proj_a_rows, name_hint="proj_a_mm", deps=[heads_dep, weight_dep]) as pa_tid:
-                    pa_r0 = pl.tile.get_block_idx() * PROJ_A_ROW_TILE
+            row_base_o = g * HEADS_PER_GROUP * T_PAD
+            group_row = g * PROJECTION_ROWS
+            pa_output: pl.Tensor[
+                [PROJECTION_ROWS, O_LORA], pl.FP32, pl.TensorView(stride=[O_LORA, 1])
+            ] = pl.slice(o_r, [PROJECTION_ROWS, O_LORA], [group_row, 0])
+            with pl.spmd(pa_blocks, name_hint="proj_a_mm", deps=[heads_dep, weight_dep]) as pa_tid:
+                pa_block = pl.tile.get_block_idx()
+                pa_r0 = (pa_block % proj_a_rows) * PROJ_A_ROW_TILE
+                pa_n0 = pl.max(pa_block // proj_a_rows, 0) * PROJ_A_MM_N_TILE
+                if PROJECTION_ROWS == T_PAD:
                     pa_src0 = row_base_o + pa_r0
-                    acc_a = pl.create_tensor([PROJ_A_ROW_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
-                    for kb in pl.pipeline(0, O_GROUP_IN, A_K_TILE, stage=2):
-                        xa_k = pl.slice(o_packed, [PROJ_A_ROW_TILE, A_K_TILE], [pa_src0, kb])
-                        wa_k = pl.slice(wo_a_2d, [PROJ_A_MM_N_TILE, A_K_TILE], [pa_col0, kb])
-                        acc_a = pl.matmul_acc(acc_a, xa_k, wa_k, b_trans=True, init_cond=(kb == 0))
-                    pl.assemble(pa_output, acc_a, [pa_r0, 0])
-                proj_a_tids[g * PA_NFRAGS + nf] = pa_tid
+                else:
+                    bank_row = (pa_r0 // T_PAD) * PACKED_HEAD_ROWS
+                    pa_src0 = bank_row + row_base_o + (pa_r0 % T_PAD)
+                acc_a = pl.create_tensor([1, PROJ_A_ROW_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
+                for kb in pl.pipeline(0, O_GROUP_IN, A_K_TILE, stage=2):
+                    pa_head0 = pa_src0 + (kb // HEAD_DIM) * T_PAD
+                    xa_k = pl.slice(o_packed, [PROJ_A_ROW_TILE, A_K_TILE], [pa_head0, kb % HEAD_DIM])
+                    wa_k = wo_a[g : g + 1, pa_n0 : pa_n0 + PROJ_A_MM_N_TILE, kb : kb + A_K_TILE]
+                    acc_a = pl.matmul_acc(acc_a, xa_k, wa_k, b_trans=True, init_cond=(kb == 0))
+                pl.assemble(pa_output, acc_a, [pa_r0, pa_n0])
+            proj_a_tids[g] = pa_tid
 
         # quant[g]: per-group amax and symmetric INT8 quant over physical rows.
         for g in pl.parallel(O_GROUPS):
-            col_g = g * O_LORA
+            group_row = g * PROJECTION_ROWS
             quant_input: pl.Tensor[
-                [T_PAD, O_LORA], pl.FP32, pl.TensorView(stride=[O_GROUPS * O_LORA, 1])
-            ] = pl.slice(o_r, [T_PAD, O_LORA], [0, col_g])
+                [PROJECTION_ROWS, O_LORA], pl.FP32, pl.TensorView(stride=[O_LORA, 1])
+            ] = pl.slice(o_r, [PROJECTION_ROWS, O_LORA], [group_row, 0])
             quant_output: pl.Tensor[
-                [T_PAD, O_LORA], pl.INT8, pl.TensorView(stride=[O_GROUPS * O_LORA, 1])
-            ] = pl.slice(o_r_i8, [T_PAD, O_LORA], [0, col_g])
+                [PROJECTION_ROWS, O_LORA], pl.INT8, pl.TensorView(stride=[O_LORA, 1])
+            ] = pl.slice(o_r_i8, [PROJECTION_ROWS, O_LORA], [group_row, 0])
             quant_scale_output: pl.Tensor[
-                [1, T_PAD], pl.FP32, pl.TensorView(stride=[T_PAD, 1])
-            ] = pl.slice(act_scale_dq, [1, T_PAD], [g, 0])
+                [1, PROJECTION_ROWS], pl.FP32, pl.TensorView(stride=[PROJECTION_ROWS, 1])
+            ] = pl.slice(act_scale_dq, [1, PROJECTION_ROWS], [g, 0])
             with pl.spmd(
                 quant_rows,
                 name_hint="quant",
-                deps=[proj_a_tids[g * PA_NFRAGS + j] for j in range(PA_NFRAGS)],
+                deps=[proj_a_tids[g]],
             ) as q_tid:
                 qt = pl.tile.get_block_idx() * QUANT_TOKEN_TILE
-                g_amax = pl.full([1, QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-                for k1 in pl.range(0, O_LORA, QUANT_TILE):
-                    oc = quant_input[
-                        qt : qt + QUANT_TOKEN_TILE,
-                        k1 : k1 + QUANT_TILE,
-                    ]
-                    oc_abs = pl.maximum(oc, pl.neg(oc))
-                    oc_amax = pl.reshape(pl.row_max(oc_abs), [1, QUANT_TOKEN_TILE])
-                    g_amax = pl.maximum(g_amax, oc_amax)
-                g_scale_num = pl.full([1, QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
+                oc = pl.load(quant_input, [qt, 0], [QUANT_TOKEN_TILE, O_LORA], target_memory=pl.Mem.Vec)
+                neg_oc = pl.neg(oc)
+                oc_abs = pl.maximum(oc, neg_oc)
+                max_tmp = pl.create_tile([QUANT_TOKEN_TILE, O_LORA], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                row_max = pl.row_max(oc_abs, max_tmp)
+                oc_amax = pl.reshape(row_max, [1, QUANT_TOKEN_TILE])
+                g_eps = pl.tile.full([1, QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+                g_amax = pl.maximum(g_eps, oc_amax)
+                g_scale_num = pl.tile.full([1, QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
                 g_sq_row = pl.div(g_scale_num, g_amax)
-                pl.assemble(quant_scale_output, pl.recip(g_sq_row), [0, qt])
+                dq_scale = pl.recip(g_sq_row)
+                pl.store(dq_scale, [0, qt], quant_scale_output)
                 g_sq_col = pl.reshape(g_sq_row, [QUANT_TOKEN_TILE, 1])
-                for k1 in pl.range(0, O_LORA, QUANT_TILE):
-                    oc = quant_input[
-                        qt : qt + QUANT_TOKEN_TILE,
-                        k1 : k1 + QUANT_TILE,
-                    ]
-                    oq_scaled = pl.row_expand_mul(oc, g_sq_col)
-                    oq_i32 = pl.cast(oq_scaled, target_type=pl.INT32, mode="rint")
-                    oq_half = pl.cast(oq_i32, target_type=pl.FP16, mode="round")
-                    oq_i8 = pl.cast(oq_half, target_type=pl.INT8, mode="trunc")
-                    pl.assemble(quant_output, oq_i8, [qt, k1])
+                oq_scaled = pl.row_expand_mul(oc, g_sq_col)
+                oq_i32 = pl.cast(oq_scaled, target_type=pl.INT32, mode="rint")
+                oq_half = pl.cast(oq_i32, target_type=pl.FP16, mode="round")
+                oq_i8 = pl.cast(oq_half, target_type=pl.INT8, mode="trunc")
+                pl.store(oq_i8, [qt, 0], quant_output)
             quant_tids[g] = q_tid
 
         # Each group projects independent row blocks and output slabs.
         for g in pl.parallel(O_GROUPS):
-            col_g = g * O_LORA
+            group_row = g * PROJECTION_ROWS
             pb_input: pl.Tensor[
-                [T_PAD, O_LORA], pl.INT8, pl.TensorView(stride=[O_GROUPS * O_LORA, 1])
-            ] = pl.slice(o_r_i8, [T_PAD, O_LORA], [0, col_g])
+                [PROJECTION_ROWS, O_LORA], pl.INT8, pl.TensorView(stride=[O_LORA, 1])
+            ] = pl.slice(o_r_i8, [PROJECTION_ROWS, O_LORA], [group_row, 0])
             group_col = g * D
-            pb_output: pl.Tensor[
-                [T_PAD, D], pl.INT32, pl.TensorView(stride=[O_GROUPS * D, 1])
-            ] = pl.slice(partials, [T_PAD, D], [0, group_col])
+            if PROJECTION_ROWS == T_PAD:
+                pb_output: pl.Tensor[
+                    [PROJECTION_ROWS, D], pl.INT32, pl.TensorView(stride=[O_GROUPS * D, 1])
+                ] = pl.slice(partials, [PROJECTION_ROWS, D], [0, group_col])
+            else:
+                pb_output: pl.Tensor[
+                    [PROJECTION_ROWS, D], pl.INT32, pl.TensorView(stride=[D, 1])
+                ] = pl.slice(partials, [PROJECTION_ROWS, D], [group_row, 0])
             with pl.spmd(proj_b_rows * PB_DSLABS, name_hint="proj_b_mm", deps=[quant_tids[g]]) as pb_tid:
                 pb_block = pl.tile.get_block_idx()
-                pb_r0 = (pb_block // PB_DSLABS) * PROJ_B_ROW_TILE
-                pb_slab = (pb_block % PB_DSLABS) * PROJ_B_D_TILE
+                if PROJECTION_ROWS == T_PAD:
+                    pb_r0 = (pb_block // PB_DSLABS) * PROJ_B_ROW_TILE
+                    pb_slab = (pb_block % PB_DSLABS) * PROJ_B_D_TILE
+                else:
+                    pb_r0 = (pb_block % proj_b_rows) * PROJ_B_ROW_TILE
+                    pb_slab = (pb_block // proj_b_rows) * PROJ_B_D_TILE
                 for frag in pl.range(PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
                     pb_out_n0 = pb_slab + frag * PROJ_B_MM_N_TILE
                     pb_weight_row0 = group_col + pb_out_n0
@@ -1311,6 +1432,7 @@ def _sparse_attn_o_proj(
     # Dequantize and sum per-group INT32 partials into the BF16 output.
     act_t_blks = (tile_rows + PROJ_B_ACT_TASK_T_TILE - 1) // PROJ_B_ACT_TASK_T_TILE
     act_blocks = (D // PROJ_B_ACT_N_TILE) * act_t_blks
+    wb_scale = pl.reshape(wo_b_scale, [1, D])
     with pl.spmd(
         act_blocks, name_hint="proj_b_act",
         deps=[proj_b_tids[i] for i in range(O_GROUPS)],
@@ -1320,29 +1442,55 @@ def _sparse_attn_o_proj(
         tblk = act_idx - nreg * act_t_blks
         ob_n0 = nreg * PROJ_B_ACT_N_TILE
         t0 = tblk * PROJ_B_ACT_TASK_T_TILE
-        wb_scale = wo_b_scale[ob_n0 : ob_n0 + PROJ_B_ACT_N_TILE]
-        wb_scale_chunk = pl.reshape(wb_scale, [1, PROJ_B_ACT_N_TILE])
+        wb_scale_chunk = pl.load(wb_scale, [0, ob_n0], [1, PROJ_B_ACT_N_TILE], target_memory=pl.Mem.Vec)
         for b_tb in pl.range(t0, t0 + PROJ_B_ACT_TASK_T_TILE, PROJ_B_ACT_T_TILE):
             if b_tb < tile_rows:
                 out_rows = pl.min(PROJ_B_ACT_T_TILE, tile_rows - b_tb)
-                acc = pl.full([PROJ_B_ACT_T_TILE, PROJ_B_ACT_N_TILE], dtype=pl.FP32, value=0.0)
-                for g in pl.range(O_GROUPS):
-                    p_g = partials[
-                        b_tb : b_tb + PROJ_B_ACT_T_TILE,
-                        g * D + ob_n0 : g * D + ob_n0 + PROJ_B_ACT_N_TILE,
-                    ]
-                    g_scale_row = act_scale_dq[g : g + 1, b_tb : b_tb + PROJ_B_ACT_T_TILE]
-                    g_scale = pl.reshape(g_scale_row, [PROJ_B_ACT_T_TILE, 1])
-                    p_g_f32 = pl.cast(p_g, target_type=pl.FP32, mode="none")
-                    p_g_scaled = pl.row_expand_mul(p_g_f32, g_scale)
-                    acc = pl.add(acc, p_g_scaled)
+                acc = pl.tile.full([PROJ_B_ACT_T_TILE, PROJ_B_ACT_N_TILE], dtype=pl.FP32, value=0.0)
+                even_values = pl.load(
+                    partials, [b_tb, ob_n0], [PROJ_B_ACT_T_TILE, PROJ_B_ACT_N_TILE], target_memory=pl.Mem.Vec,
+                )
+                even_scale = pl.load(act_scale_dq, [0, b_tb], [1, PROJ_B_ACT_T_TILE], target_memory=pl.Mem.Vec)
+                for pair in pl.unroll(O_GROUPS // 2):
+                    odd_group = pair * 2 + 1
+                    if PROJECTION_ROWS == T_PAD:
+                        odd_row = b_tb
+                        odd_col = odd_group * D + ob_n0
+                    else:
+                        odd_row = odd_group * PROJECTION_ROWS + b_tb
+                        odd_col = ob_n0
+                    odd_values = pl.load(
+                        partials, [odd_row, odd_col], [PROJ_B_ACT_T_TILE, PROJ_B_ACT_N_TILE], target_memory=pl.Mem.Vec,
+                    )
+                    odd_scale = pl.load(
+                        act_scale_dq, [odd_group, b_tb], [1, PROJ_B_ACT_T_TILE], target_memory=pl.Mem.Vec,
+                    )
+                    acc = _proj_b_accumulate_group(acc, even_values, even_scale)
+                    if pair + 1 < O_GROUPS // 2:
+                        next_group = odd_group + 1
+                        if PROJECTION_ROWS == T_PAD:
+                            next_row = b_tb
+                            next_col = next_group * D + ob_n0
+                        else:
+                            next_row = next_group * PROJECTION_ROWS + b_tb
+                            next_col = ob_n0
+                        even_values = pl.load(
+                            partials, [next_row, next_col], [PROJ_B_ACT_T_TILE, PROJ_B_ACT_N_TILE], target_memory=pl.Mem.Vec,
+                        )
+                        even_scale = pl.load(
+                            act_scale_dq, [next_group, b_tb], [1, PROJ_B_ACT_T_TILE], target_memory=pl.Mem.Vec,
+                        )
+                    acc = _proj_b_accumulate_group(acc, odd_values, odd_scale)
                 out_t = pl.col_expand_mul(acc, wb_scale_chunk)
                 out_bf16 = pl.cast(out_t, target_type=pl.BF16, mode="rint")
                 out_valid = pl.set_validshape(out_bf16, out_rows, PROJ_B_ACT_N_TILE)
                 out_t0 = tile_base + b_tb
-                pl.assemble(attn_out, out_valid, [out_t0, ob_n0])
+                pl.store(out_valid, [out_t0, ob_n0], attn_out)
 
-    return act_tid
+    completion_tid = act_tid
+    if PROJ_A_FENCE:
+        completion_tid = pl.system.task_dummy(deps=[proj_a_tids[i] for i in range(O_GROUPS)])
+    return completion_tid
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1357,7 +1505,7 @@ def hca_streaming_attn_physical(
     inverse_rope: pl.Tensor[[SPARSE_ROPE_ROWS, 2 * ROPE_DIM], pl.FP32],
     inverse_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
     inverse_ready: pl.Scalar[pl.TASK_ID],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
     wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -1433,6 +1581,88 @@ def hca_streaming_attn_physical(
 
 
 @pl.jit.inline(auto_scope=False)
+def sparse_attn_project_pair(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[REQUESTS_DYN, CMP_MAX_BLOCKS], pl.INT32],
+    local_request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    cmp_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
+    valid_block_mask: pl.Tensor[[T_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    pair_base: pl.Scalar[pl.INDEX],
+    pair_rows: pl.Scalar[pl.INDEX],
+    inverse_rope: pl.Tensor[[SPARSE_ROPE_ROWS, 2 * ROPE_DIM], pl.FP32],
+    inverse_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
+    inverse_ready: pl.Scalar[pl.TASK_ID],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
+    o_proj_weight_dep: pl.Scalar[pl.TASK_ID],
+    completion: pl.Array[1, pl.TASK_ID],
+    TRACK_COMPLETION: pl.constexpr,
+    PROJ_A_FENCE: pl.constexpr,
+):
+    """Project a pair of 512-row head tiles."""
+    with pl.scope():
+        packed_bank = pl.create_tensor([2 * PACKED_HEAD_ROWS, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
+        head_tids = pl.array.create(2, pl.TASK_ID)
+        for tile_offset in pl.range(0, pair_rows, T_PAD):
+            with pl.scope():
+                tile_base = pair_base + tile_offset
+                tile_rows = pl.min(T_PAD, pair_rows - tile_offset)
+                tile_end = tile_base + tile_rows
+                rope_end = pl.min(tile_end, pl.tensor.dim(inverse_rope, 0))
+                bank_slot = tile_offset // T_PAD
+                packed_start = bank_slot * PACKED_HEAD_ROWS
+                packed_tile = pl.slice(packed_bank, [PACKED_HEAD_ROWS, HEAD_DIM], [packed_start, 0])
+                packed_rows = ((tile_rows + O_PROJ_ROW_TILE - 1) // O_PROJ_ROW_TILE) * O_PROJ_ROW_TILE
+                packed_head_blocks = packed_rows // PREFILL_QUERY_TILE
+                packed_deps = pl.array.create(1, pl.TASK_ID)
+                packed_deps[0] = pl.system.task_dummy(deps=[])
+                if tile_rows < T_PAD:
+                    blocks = O_GROUPS * HEADS_PER_GROUP * packed_head_blocks
+                    with pl.spmd(blocks, name_hint="prefill_sparse_packed_init") as padding_tid:
+                        packed_block = pl.tile.get_block_idx()
+                        packed_head = packed_block // packed_head_blocks
+                        head_start = packed_head * T_PAD
+                        block_start = (packed_block % packed_head_blocks) * PREFILL_QUERY_TILE
+                        packed_row = head_start + block_start
+                        packed_zero = pl.full([PREFILL_QUERY_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                        packed_tile[packed_row : packed_row + PREFILL_QUERY_TILE, 0:HEAD_DIM] = packed_zero
+                    packed_deps[0] = padding_tid
+                tile_q = q[tile_base:tile_end]
+                tile_swa = swa_indices[tile_base:tile_end]
+                tile_ids = local_request_ids[tile_base:tile_end]
+                tile_topk = cmp_indices[tile_base:tile_end]
+                tile_mask = valid_block_mask[tile_base:tile_end]
+                tile_rope = inverse_rope[tile_base:rope_end]
+                packed_init_tid = packed_deps[0]
+                packed_head_major: pl.Tensor[
+                    [O_GROUPS, T_PAD, HEADS_PER_GROUP, HEAD_DIM],
+                    pl.BF16,
+                    pl.TensorView(layout=pl.ND, stride=[HEADS_PER_GROUP * T_PAD * HEAD_DIM, HEAD_DIM, T_PAD * HEAD_DIM, 1]),
+                ] = pl.reshape(packed_tile, [O_GROUPS, T_PAD, HEADS_PER_GROUP, HEAD_DIM])
+                _heads, tile_ready = _sparse_attn_heads(
+                    tile_q, ori_kv, tile_swa, cmp_kv, cmp_block_table,
+                    tile_ids, tile_topk, tile_mask, attn_sink, tile_rows,
+                    tile_rope, inverse_swap_idx, inverse_ready,
+                    packed_head_major, packed_init_tid, pl.const(0, pl.INDEX), tile_rows,
+                )
+                head_tids[bank_slot] = tile_ready
+        heads_ready = pl.system.task_dummy(deps=[head_tids[0], head_tids[1]])
+        projection_tid = _sparse_attn_o_proj(
+            packed_bank, wo_a, wo_b, wo_b_scale, attn_out,
+            pair_base, pair_rows, heads_ready, o_proj_weight_dep,
+            PROJECTION_ROWS=PROJECTION_PAIR_TILE, PROJ_A_FENCE=PROJ_A_FENCE,
+        )
+        if TRACK_COMPLETION:
+            completion[0] = projection_tid
+
+
+@pl.jit.inline(auto_scope=False)
 def sparse_attn_compute(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
@@ -1447,64 +1677,22 @@ def sparse_attn_compute(
     inverse_rope: pl.Tensor[[SPARSE_ROPE_ROWS, 2 * ROPE_DIM], pl.FP32],
     inverse_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
     inverse_ready: pl.Scalar[pl.TASK_ID],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
     wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
     o_proj_weight_dep: pl.Scalar[pl.TASK_ID],
 ):
-    """Run sparse heads and dense output projection over bounded physical tiles."""
-    for tile_base in pl.range(0, active_rows, T_PAD):
-        # Tile-local attention workspace scope.
-        with pl.scope():
-            tile_rows = pl.min(T_PAD, active_rows - tile_base)
-            o_packed_heads = pl.create_tensor(
-                [O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM],
-                dtype=pl.BF16,
-                manual_dep=True,
-            )
-            packed_rows = ((tile_rows + O_PROJ_ROW_TILE - 1) // O_PROJ_ROW_TILE) * O_PROJ_ROW_TILE
-            packed_group_blocks = packed_rows * HEADS_PER_GROUP // PREFILL_QUERY_TILE
-            packed_deps = pl.array.create(1, pl.TASK_ID)
-            packed_deps[0] = pl.system.task_dummy(deps=[])
-            if tile_rows < T_PAD:
-                with pl.spmd(O_GROUPS * packed_group_blocks, name_hint="prefill_sparse_packed_init") as padding_tid:
-                    packed_block = pl.tile.get_block_idx()
-                    packed_group = packed_block // packed_group_blocks
-                    packed_row = packed_group * T_PAD * HEADS_PER_GROUP
-                    packed_row = packed_row + (packed_block % packed_group_blocks) * PREFILL_QUERY_TILE
-                    packed_zero = pl.full([PREFILL_QUERY_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                    o_packed_heads[packed_row : packed_row + PREFILL_QUERY_TILE, 0:HEAD_DIM] = packed_zero
-                packed_deps[0] = padding_tid
-            packed_init_tid = packed_deps[0]
-            o_packed_heads, heads_dep = _sparse_attn_heads(
-                q,
-                ori_kv,
-                swa_indices,
-                cmp_kv,
-                cmp_block_table,
-                local_request_ids,
-                cmp_indices,
-                valid_block_mask,
-                attn_sink,
-                active_rows,
-                inverse_rope, inverse_swap_idx, inverse_ready,
-                o_packed_heads,
-                packed_init_tid,
-                tile_base,
-                tile_rows,
-            )
-            _act_tid = _sparse_attn_o_proj(
-                o_packed_heads,
-                wo_a,
-                wo_b,
-                wo_b_scale,
-                attn_out,
-                tile_base,
-                tile_rows,
-                heads_dep,
-                o_proj_weight_dep,
-            )
+    """Build and project consecutive dense token pairs."""
+    completion = pl.array.create(1, pl.TASK_ID)
+    for pair_base in pl.range(0, active_rows, PROJECTION_PAIR_TILE):
+        pair_rows = pl.min(PROJECTION_PAIR_TILE, active_rows - pair_base)
+        sparse_attn_project_pair(
+            q, ori_kv, swa_indices, cmp_kv, cmp_block_table, local_request_ids, cmp_indices, valid_block_mask,
+            attn_sink, pair_base, pair_rows, inverse_rope, inverse_swap_idx, inverse_ready,
+            wo_a, wo_b, wo_b_scale, attn_out, o_proj_weight_dep, completion,
+            TRACK_COMPLETION=False, PROJ_A_FENCE=False,
+        )
     return attn_out
 
 
@@ -1522,7 +1710,7 @@ def sparse_attn_physical(
     inverse_rope: pl.Tensor[[SPARSE_ROPE_ROWS, 2 * ROPE_DIM], pl.FP32],
     inverse_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
     inverse_ready: pl.Scalar[pl.TASK_ID],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
     wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -1579,7 +1767,9 @@ def prefill_sparse_attn_test(
     freqs_cos.bind_dynamic(0, T_DYN)
     freqs_sin.bind_dynamic(0, T_DYN)
     attn_out.bind_dynamic(0, T_DYN)
-    o_proj_weight_dep = pl.system.task_dummy(deps=[])
+    unpacked_weight_dep = pl.system.task_dummy(deps=[])
+    wo_a_nz = pl.create_tensor([O_GROUPS, O_LORA, O_GROUP_IN], dtype=pl.BF16, layout=pl.NZ)
+    o_proj_weight_dep = pack_o_proj_a_weights(wo_a, wo_a_nz, unpacked_weight_dep)
     inverse_rope, inverse_swap_idx, inverse_ready = prepare_sparse_attn_rope(
         freqs_cos, freqs_sin, pl.const(0, pl.INDEX), pl.tensor.dim(q, 0), pl.const(1, pl.INT32),
     )
@@ -1594,7 +1784,7 @@ def prefill_sparse_attn_test(
         valid_block_mask,
         attn_sink,
         inverse_rope, inverse_swap_idx, inverse_ready,
-        wo_a,
+        wo_a_nz,
         wo_b,
         wo_b_scale,
         attn_out,
@@ -1851,7 +2041,7 @@ if __name__ == "__main__":
     ratio_choices = list(SUPPORTED_COMPRESS_RATIOS)
     parser.add_argument("--compress-ratio", type=int, default=DEFAULT_COMPRESS_RATIO, choices=ratio_choices)
     parser.add_argument(
-        "--tokens", type=int, default=T, help=f"Physical token rows, up to {MAX_SEQ_LEN}."
+        "--tokens", type=int, default=None, help=f"Physical token rows, up to {MAX_SEQ_LEN}."
     )
     parser.add_argument("--ori-block-num", type=int, default=ORI_BLOCK_NUM)
     parser.add_argument("--cmp-block-num", type=int, default=CMP_BLOCK_NUM)
@@ -1863,29 +2053,40 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run(
-        fn=prefill_sparse_attn_test,
-        specs=build_tensor_specs(args.compress_ratio, args.tokens, args.ori_block_num, args.cmp_block_num),
-        golden_fn=golden_prefill_sparse_attn,
-        save_data=args.save_data,
-        golden_data=args.golden_data,
-        config=dict(
-            dump_passes=args.dump_passes,
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            device_id=args.device,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-            enable_pmu=args.enable_pmu,
-            enable_scope_stats=args.enable_scope_stats,
-        ),
-        rtol=1e-3,
-        atol=1e-3,
-        compile_only=args.compile_only,
-        compare_fn={
-            "attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-        },
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    compare = ratio_allclose(atol=1e-4, rtol=1.0 / 128)
+
+    def compare_attn_out(actual, expected, **kwargs):
+        valid, detail = compare(actual, expected, **kwargs)
+        if valid and actual.shape[0] > T_PAD:
+            return compare(actual[T_PAD:T_PAD + 1], expected[T_PAD:T_PAD + 1], **kwargs)
+        return valid, detail
+
+    token_counts = [T if args.tokens is None else args.tokens]
+    if args.tokens is None and not (args.save_data or args.golden_data):
+        token_counts.append(T_PAD + 1)
+    for token_count in token_counts:
+        result = run(
+            fn=prefill_sparse_attn_test,
+            specs=build_tensor_specs(args.compress_ratio, token_count, args.ori_block_num, args.cmp_block_num),
+            golden_fn=golden_prefill_sparse_attn,
+            save_data=args.save_data,
+            golden_data=args.golden_data,
+            config=dict(
+                dump_passes=args.dump_passes,
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                device_id=args.device,
+                enable_chip_swimlane=args.enable_chip_swimlane,
+                enable_pmu=args.enable_pmu,
+                enable_scope_stats=args.enable_scope_stats,
+                ring_heap=PREFILL_RING_HEAP,
+            ),
+            rtol=1e-3,
+            atol=1e-3,
+            compile_only=args.compile_only,
+            compare_fn={"attn_out": compare_attn_out},
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
