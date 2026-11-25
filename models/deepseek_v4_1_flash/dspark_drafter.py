@@ -102,13 +102,14 @@ def _accumulate_dspark_payload(
     acc: pl.Tile[[PROJ_M_TILE, PROJ_N_TILE], pl.FP32, pl.Mem.Acc],
     a_l1: pl.Tile[[PROJ_M_TILE, PROJ_K_TILE], pl.FP8E4M3FN, pl.Mem.Mat],
     b_l1: pl.Tile[[PROJ_K_TILE, PROJ_N_TILE], pl.FP8E4M3FN, pl.Mem.Mat],
-    sa_l1: pl.Tile[[PROJ_M_TILE, MAIN_IN // MX_GROUP], pl.FP8E8M0, pl.Mem.Mat],
-    sb_l1: pl.Tile[[MAIN_IN // MX_GROUP, PROJ_N_TILE], pl.FP8E8M0, pl.Mem.Mat],
+    sa_first: pl.Tile[[PROJ_M_TILE, PROJ_SCALE_K_TILE], pl.FP8E8M0, pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)],
+    sb_first: pl.Tile[[PROJ_SCALE_K_TILE, PROJ_N_TILE], pl.FP8E8M0, pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)],
+    sa_second: pl.Tile[[PROJ_M_TILE, PROJ_SCALE_K_TILE], pl.FP8E8M0, pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)],
+    sb_second: pl.Tile[[PROJ_SCALE_K_TILE, PROJ_N_TILE], pl.FP8E8M0, pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)],
     group: pl.Scalar[pl.INDEX],
 ) -> pl.Tile:
     pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, group % PROJ_L1_BUFFERS)
     pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
-    scale_offset = group * (PROJ_K_TILE // MX_GROUP)
     a: pl.Tile[
         [PROJ_M_TILE, PROJ_CUBE_K_TILE], pl.FP8E4M3FN,
         pl.MemRef("a_l0", slots=PROJ_L0_BUFFERS)[0], pl.Mem.Left,
@@ -117,12 +118,8 @@ def _accumulate_dspark_payload(
         [PROJ_CUBE_K_TILE, PROJ_N_TILE], pl.FP8E4M3FN,
         pl.MemRef("b_l0", slots=PROJ_L0_BUFFERS)[0], pl.Mem.Right,
     ] = pl.tile.extract(b_l1, 0, 0, [PROJ_CUBE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Right)
-    sa = pl.tile.extract(
-        sa_l1, 0, scale_offset, [PROJ_M_TILE, PROJ_SCALE_K_TILE], target_memory=pl.Mem.LeftScale, scale_for=a,
-    )
-    sb = pl.tile.extract(
-        sb_l1, scale_offset, 0, [PROJ_SCALE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.RightScale, scale_for=b,
-    )
+    sa = pl.tile.move(sa_first, pl.Mem.LeftScale)
+    sb = pl.tile.move(sb_first, pl.Mem.RightScale)
     pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
     pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
     if group == 0:
@@ -131,7 +128,6 @@ def _accumulate_dspark_payload(
         acc = pl.tile.matmul_mx_acc(acc, a, sa, b, sb)
     pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
     pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
-    scale_offset = group * (PROJ_K_TILE // MX_GROUP) + PROJ_SCALE_K_TILE
     a: pl.Tile[
         [PROJ_M_TILE, PROJ_CUBE_K_TILE], pl.FP8E4M3FN,
         pl.MemRef("a_l0", slots=PROJ_L0_BUFFERS)[1], pl.Mem.Left,
@@ -140,12 +136,8 @@ def _accumulate_dspark_payload(
         [PROJ_CUBE_K_TILE, PROJ_N_TILE], pl.FP8E4M3FN,
         pl.MemRef("b_l0", slots=PROJ_L0_BUFFERS)[1], pl.Mem.Right,
     ] = pl.tile.extract(b_l1, PROJ_CUBE_K_TILE, 0, [PROJ_CUBE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Right)
-    sa = pl.tile.extract(
-        sa_l1, 0, scale_offset, [PROJ_M_TILE, PROJ_SCALE_K_TILE], target_memory=pl.Mem.LeftScale, scale_for=a,
-    )
-    sb = pl.tile.extract(
-        sb_l1, scale_offset, 0, [PROJ_SCALE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.RightScale, scale_for=b,
-    )
+    sa = pl.tile.move(sa_second, pl.Mem.LeftScale)
+    sb = pl.tile.move(sb_second, pl.Mem.RightScale)
     pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
     pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
     acc = pl.tile.matmul_mx_acc(acc, a, sa, b, sb)
@@ -198,6 +190,7 @@ def dspark_proj(
                     first_task = worker * 2 + lane
                     task_stride = block_workers * 2
                     active_tasks = (batch_rows + QUANT_M_TILE - 1) // QUANT_M_TILE * (MAIN_IN // QUANT_K_TILE)
+                    # Pair only tasks with live input rows. The tail also writes padding.
                     pairs = pl.max(0, (active_tasks - first_task + task_stride - 1) // (2 * task_stride))
                     for pair in pl.range(pairs):
                         work0 = first_task + pair * 2 * task_stride
@@ -268,17 +261,6 @@ def dspark_proj(
                     col = column_tile * PROJ_N_TILE
                     for row in pl.range(0, batch_rows, PROJ_M_TILE):
                         row_base = batch_start + row
-                        # Keep the full K dimension of both scale panels resident in L1.
-                        sa_l1 = pl.load(
-                            activation_scale, [row, 0], [PROJ_M_TILE, MAIN_IN // MX_GROUP],
-                            target_memory=pl.Mem.Mat,
-                        )
-                        sb_l1 = pl.load(
-                            weight_scale, [0, col], [MAIN_IN // MX_GROUP, PROJ_N_TILE],
-                            target_memory=pl.Mem.Mat,
-                        )
-                        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, PROJ_L1_BUFFERS)
-                        pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, PROJ_L1_BUFFERS)
                         pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
                         pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
                         a0: pl.Tile[
@@ -289,6 +271,24 @@ def dspark_proj(
                             [PROJ_K_TILE, PROJ_N_TILE], pl.FP8E4M3FN,
                             pl.MemRef("b_l1", slots=PROJ_L1_BUFFERS)[0], pl.Mem.Mat,
                         ] = pl.tile.load(main_proj_weight, [0, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+                        offset = 0 // MX_GROUP
+                        next_offset = offset + PROJ_SCALE_K_TILE
+                        sa0: pl.Tile[
+                            [PROJ_M_TILE, PROJ_SCALE_K_TILE], pl.FP8E8M0,
+                            pl.MemRef("sa_l1_first", slots=PROJ_L1_BUFFERS)[0], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32),
+                        ] = pl.load(activation_scale, [row, offset], [PROJ_M_TILE, PROJ_SCALE_K_TILE], target_memory=pl.Mem.Mat)
+                        sb0: pl.Tile[
+                            [PROJ_SCALE_K_TILE, PROJ_N_TILE], pl.FP8E8M0,
+                            pl.MemRef("sb_l1_first", slots=PROJ_L1_BUFFERS)[0], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32),
+                        ] = pl.load(weight_scale, [offset, col], [PROJ_SCALE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+                        sc0: pl.Tile[
+                            [PROJ_M_TILE, PROJ_SCALE_K_TILE], pl.FP8E8M0,
+                            pl.MemRef("sa_l1_second", slots=PROJ_L1_BUFFERS)[0], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32),
+                        ] = pl.load(activation_scale, [row, next_offset], [PROJ_M_TILE, PROJ_SCALE_K_TILE], target_memory=pl.Mem.Mat)
+                        sd0: pl.Tile[
+                            [PROJ_SCALE_K_TILE, PROJ_N_TILE], pl.FP8E8M0,
+                            pl.MemRef("sb_l1_second", slots=PROJ_L1_BUFFERS)[0], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32),
+                        ] = pl.load(weight_scale, [next_offset, col], [PROJ_SCALE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
                         pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 0)
                         a1: pl.Tile[
                             [PROJ_M_TILE, PROJ_K_TILE], pl.FP8E4M3FN,
@@ -298,6 +298,24 @@ def dspark_proj(
                             [PROJ_K_TILE, PROJ_N_TILE], pl.FP8E4M3FN,
                             pl.MemRef("b_l1", slots=PROJ_L1_BUFFERS)[1], pl.Mem.Mat,
                         ] = pl.tile.load(main_proj_weight, [PROJ_K_TILE, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+                        offset = PROJ_K_TILE // MX_GROUP
+                        next_offset = offset + PROJ_SCALE_K_TILE
+                        sa1: pl.Tile[
+                            [PROJ_M_TILE, PROJ_SCALE_K_TILE], pl.FP8E8M0,
+                            pl.MemRef("sa_l1_first", slots=PROJ_L1_BUFFERS)[1], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32),
+                        ] = pl.load(activation_scale, [row, offset], [PROJ_M_TILE, PROJ_SCALE_K_TILE], target_memory=pl.Mem.Mat)
+                        sb1: pl.Tile[
+                            [PROJ_SCALE_K_TILE, PROJ_N_TILE], pl.FP8E8M0,
+                            pl.MemRef("sb_l1_first", slots=PROJ_L1_BUFFERS)[1], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32),
+                        ] = pl.load(weight_scale, [offset, col], [PROJ_SCALE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+                        sc1: pl.Tile[
+                            [PROJ_M_TILE, PROJ_SCALE_K_TILE], pl.FP8E8M0,
+                            pl.MemRef("sa_l1_second", slots=PROJ_L1_BUFFERS)[1], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32),
+                        ] = pl.load(activation_scale, [row, next_offset], [PROJ_M_TILE, PROJ_SCALE_K_TILE], target_memory=pl.Mem.Mat)
+                        sd1: pl.Tile[
+                            [PROJ_SCALE_K_TILE, PROJ_N_TILE], pl.FP8E8M0,
+                            pl.MemRef("sb_l1_second", slots=PROJ_L1_BUFFERS)[1], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32),
+                        ] = pl.load(weight_scale, [next_offset, col], [PROJ_SCALE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
                         pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 1)
                         a2: pl.Tile[
                             [PROJ_M_TILE, PROJ_K_TILE], pl.FP8E4M3FN,
@@ -307,6 +325,24 @@ def dspark_proj(
                             [PROJ_K_TILE, PROJ_N_TILE], pl.FP8E4M3FN,
                             pl.MemRef("b_l1", slots=PROJ_L1_BUFFERS)[2], pl.Mem.Mat,
                         ] = pl.tile.load(main_proj_weight, [2 * PROJ_K_TILE, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+                        offset = 2 * PROJ_K_TILE // MX_GROUP
+                        next_offset = offset + PROJ_SCALE_K_TILE
+                        sa2: pl.Tile[
+                            [PROJ_M_TILE, PROJ_SCALE_K_TILE], pl.FP8E8M0,
+                            pl.MemRef("sa_l1_first", slots=PROJ_L1_BUFFERS)[2], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32),
+                        ] = pl.load(activation_scale, [row, offset], [PROJ_M_TILE, PROJ_SCALE_K_TILE], target_memory=pl.Mem.Mat)
+                        sb2: pl.Tile[
+                            [PROJ_SCALE_K_TILE, PROJ_N_TILE], pl.FP8E8M0,
+                            pl.MemRef("sb_l1_first", slots=PROJ_L1_BUFFERS)[2], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32),
+                        ] = pl.load(weight_scale, [offset, col], [PROJ_SCALE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+                        sc2: pl.Tile[
+                            [PROJ_M_TILE, PROJ_SCALE_K_TILE], pl.FP8E8M0,
+                            pl.MemRef("sa_l1_second", slots=PROJ_L1_BUFFERS)[2], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32),
+                        ] = pl.load(activation_scale, [row, next_offset], [PROJ_M_TILE, PROJ_SCALE_K_TILE], target_memory=pl.Mem.Mat)
+                        sd2: pl.Tile[
+                            [PROJ_SCALE_K_TILE, PROJ_N_TILE], pl.FP8E8M0,
+                            pl.MemRef("sb_l1_second", slots=PROJ_L1_BUFFERS)[2], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32),
+                        ] = pl.load(weight_scale, [next_offset, col], [PROJ_SCALE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
                         pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 2)
                         a3: pl.Tile[
                             [PROJ_M_TILE, PROJ_K_TILE], pl.FP8E4M3FN,
@@ -316,13 +352,34 @@ def dspark_proj(
                             [PROJ_K_TILE, PROJ_N_TILE], pl.FP8E4M3FN,
                             pl.MemRef("b_l1", slots=PROJ_L1_BUFFERS)[3], pl.Mem.Mat,
                         ] = pl.tile.load(main_proj_weight, [3 * PROJ_K_TILE, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+                        offset = 3 * PROJ_K_TILE // MX_GROUP
+                        next_offset = offset + PROJ_SCALE_K_TILE
+                        sa3: pl.Tile[
+                            [PROJ_M_TILE, PROJ_SCALE_K_TILE], pl.FP8E8M0,
+                            pl.MemRef("sa_l1_first", slots=PROJ_L1_BUFFERS)[3], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32),
+                        ] = pl.load(activation_scale, [row, offset], [PROJ_M_TILE, PROJ_SCALE_K_TILE], target_memory=pl.Mem.Mat)
+                        sb3: pl.Tile[
+                            [PROJ_SCALE_K_TILE, PROJ_N_TILE], pl.FP8E8M0,
+                            pl.MemRef("sb_l1_first", slots=PROJ_L1_BUFFERS)[3], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32),
+                        ] = pl.load(weight_scale, [offset, col], [PROJ_SCALE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+                        sc3: pl.Tile[
+                            [PROJ_M_TILE, PROJ_SCALE_K_TILE], pl.FP8E8M0,
+                            pl.MemRef("sa_l1_second", slots=PROJ_L1_BUFFERS)[3], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32),
+                        ] = pl.load(activation_scale, [row, next_offset], [PROJ_M_TILE, PROJ_SCALE_K_TILE], target_memory=pl.Mem.Mat)
+                        sd3: pl.Tile[
+                            [PROJ_SCALE_K_TILE, PROJ_N_TILE], pl.FP8E8M0,
+                            pl.MemRef("sb_l1_second", slots=PROJ_L1_BUFFERS)[3], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32),
+                        ] = pl.load(weight_scale, [next_offset, col], [PROJ_SCALE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
                         pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 3)
                         acc = pl.tile.create([PROJ_M_TILE, PROJ_N_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc)
                         for group in pl.unroll(MAIN_IN // PROJ_K_TILE):
-                            acc = _accumulate_dspark_payload(acc, a0, b0, sa_l1, sb_l1, group)
+                            acc = _accumulate_dspark_payload(acc, a0, b0, sa0, sb0, sc0, sd0, group)
                             a0, b0 = a1, b1
+                            sa0, sb0, sc0, sd0 = sa1, sb1, sc1, sd1
                             a1, b1 = a2, b2
+                            sa1, sb1, sc1, sd1 = sa2, sb2, sc2, sd2
                             a2, b2 = a3, b3
+                            sa2, sb2, sc2, sd2 = sa3, sb3, sc3, sd3
                             next_group = group + PROJ_L1_BUFFERS
                             if next_group < MAIN_IN // PROJ_K_TILE:
                                 slot = group % PROJ_L1_BUFFERS
@@ -336,6 +393,25 @@ def dspark_proj(
                                     [PROJ_K_TILE, PROJ_N_TILE], pl.FP8E4M3FN,
                                     pl.MemRef("b_l1", slots=PROJ_L1_BUFFERS)[slot], pl.Mem.Mat,
                                 ] = pl.tile.load(main_proj_weight, [next_group * PROJ_K_TILE, col], [PROJ_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+                                k = next_group * PROJ_K_TILE
+                                offset = k // MX_GROUP
+                                next_offset = offset + PROJ_SCALE_K_TILE
+                                sa3: pl.Tile[
+                                    [PROJ_M_TILE, PROJ_SCALE_K_TILE], pl.FP8E8M0,
+                                    pl.MemRef("sa_l1_first", slots=PROJ_L1_BUFFERS)[slot], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32),
+                                ] = pl.load(activation_scale, [row, offset], [PROJ_M_TILE, PROJ_SCALE_K_TILE], target_memory=pl.Mem.Mat)
+                                sb3: pl.Tile[
+                                    [PROJ_SCALE_K_TILE, PROJ_N_TILE], pl.FP8E8M0,
+                                    pl.MemRef("sb_l1_first", slots=PROJ_L1_BUFFERS)[slot], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32),
+                                ] = pl.load(weight_scale, [offset, col], [PROJ_SCALE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
+                                sc3: pl.Tile[
+                                    [PROJ_M_TILE, PROJ_SCALE_K_TILE], pl.FP8E8M0,
+                                    pl.MemRef("sa_l1_second", slots=PROJ_L1_BUFFERS)[slot], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32),
+                                ] = pl.load(activation_scale, [row, next_offset], [PROJ_M_TILE, PROJ_SCALE_K_TILE], target_memory=pl.Mem.Mat)
+                                sd3: pl.Tile[
+                                    [PROJ_SCALE_K_TILE, PROJ_N_TILE], pl.FP8E8M0,
+                                    pl.MemRef("sb_l1_second", slots=PROJ_L1_BUFFERS)[slot], pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32),
+                                ] = pl.load(weight_scale, [next_offset, col], [PROJ_SCALE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Mat)
                                 pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, slot)
                         pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
                         pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
@@ -822,7 +898,7 @@ def build_drafter_specs():
         "num_sampled": 1, "last_sampled": 7, "anchor_ids": 7,
         "first_query_positions": 2,
         "context_rope_cos": 1, "query_rope_cos": 1,
-        "target_hidden": 0.25, "main_norm_weight": 1,
+        "target_hidden": 0.25, "main_norm_weight": 1, "main_proj_weight": 0.25,
     }
 
     def initial_value(name, shape, dtype):
@@ -854,6 +930,67 @@ def build_drafter_specs():
     return specs
 
 
+@pl.jit
+def dspark_projection_validation(
+    target_hidden: pl.Tensor[[T_DYN, MAIN_IN], pl.BF16],
+    main_proj_weight: pl.Tensor[[MAIN_IN, D], pl.FP8E4M3FN, pl.NZ],
+    main_proj_scale: pl.Tensor[[MAIN_IN // MX_GROUP, D], pl.FP8E8M0],
+    projected: pl.InOut[pl.Tensor[[T_DYN, D], pl.BF16]],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    dspark_proj(target_hidden, main_proj_weight, main_proj_scale, projected, num_tokens)
+
+
+def _projection_fixture_columns():
+    cols = torch.arange(D)
+    first = cols * 97 % (MAIN_IN // 2)
+    second = first + MAIN_IN // 2
+    return cols, first, second
+
+
+def build_projection_specs():
+    from golden import ScalarSpec, TensorSpec
+    from quant import pack_fp8_nz, pack_mx_b_scale
+
+    active = PROJ_ROWS_PER_LAUNCH + 1
+    capacity = active + 1
+
+    def hidden():
+        rows = torch.arange(capacity)[:, None]
+        groups = torch.arange(MAIN_IN)[None, :] // MX_GROUP
+        return torch.exp2((rows + groups * 3) % 7 - 4).bfloat16()
+
+    def weight():
+        cols, first, second = _projection_fixture_columns()
+        codes = torch.zeros([MAIN_IN, D], dtype=torch.uint8)
+        codes[first, cols] = 0x38  # E4M3FN +1
+        codes[second, cols] = 0xB0  # E4M3FN -0.5
+        return pack_fp8_nz(codes).view(torch.float8_e4m3fn)
+
+    def scale():
+        cols, first, _ = _projection_fixture_columns()
+        codes = torch.full([MAIN_IN // MX_GROUP, D], 127, dtype=torch.uint8)
+        codes[first // MX_GROUP, cols] = (127 - cols % 3).to(torch.uint8)
+        return pack_mx_b_scale(codes).view(torch.float8_e8m0fnu)
+
+    return [
+        TensorSpec("target_hidden", [capacity, MAIN_IN], torch.bfloat16, init_value=hidden),
+        TensorSpec("main_proj_weight", [MAIN_IN, D], torch.float8_e4m3fn, init_value=weight),
+        TensorSpec("main_proj_scale", [MAIN_IN // MX_GROUP, D], torch.float8_e8m0fnu, init_value=scale),
+        TensorSpec("projected", [capacity, D], torch.bfloat16, init_value=13.0),
+        ScalarSpec("num_tokens", torch.int32, active, compile_runtime=True),
+    ]
+
+
+def golden_dspark_projection(values):
+    cols, first, second = _projection_fixture_columns()
+    active = int(values["num_tokens"])
+    hidden = values["target_hidden"][:active]
+    # Powers of two are exact after OCP quantization. Each output has two nonzero weights.
+    result = hidden[:, first].float() * torch.exp2(-(cols % 3)) - hidden[:, second].float() * 0.5
+    values["projected"][:active].copy_(result)
+
+
 if __name__ == "__main__":
     from golden import run
     from pypto.ir import DistributedConfig
@@ -866,8 +1003,26 @@ if __name__ == "__main__":
     parser.add_argument("--packed-routed-weights", action=argparse.BooleanOptionalAction, default=False, help="pack resident routed FP4 weights before upload")
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--projection-only", action="store_true", help="validate the projection on one device")
     args = parser.parse_args()
     devices = [int(device) for device in args.device.split(",")]
+    if args.projection_only or args.runtime_dir is None:
+        projection_result = run(
+            a5_default_runtime="host_build_graph",
+            fn=dspark_projection_validation,
+            specs=build_projection_specs(),
+            golden_fn=golden_dspark_projection,
+            config={"backend_type": args.platform, "execution_mode": False, "device_id": devices[0]},
+            rtol=0.0,
+            atol=0.0,
+            compile_only=args.compile_only,
+            runtime_dir=args.runtime_dir if args.projection_only else None,
+        )
+        print(projection_result)
+        if not projection_result.passed:
+            raise SystemExit(1)
+        if args.projection_only:
+            raise SystemExit(0)
     if len(devices) != EP_SIZE:
         parser.error(f"drafter needs {EP_SIZE} devices")
 

@@ -768,6 +768,7 @@ def build_tensor_specs(active_requests=1):
         "freqs_sin": target_sin.unsqueeze(0).repeat(EP_SIZE, 1, 1, 1),
         "draft_cos": 1.0,
         "draft_main_norm_weight": 1.0,
+        "draft_main_proj_weight": 0.25,
         "markov_final_norm_weight": 1.0,
         "final_norm_weight": 1.0,
         "sampling_temperatures": torch.tensor([0.7, 0.0] * (DECODE_BATCH // 2)).repeat_interleave(DECODE_SEQ).repeat(EP_SIZE, 1),
