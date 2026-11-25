@@ -1055,6 +1055,7 @@ def _o_b_hc_prefill(
     residual: pl.Tensor, post_mix: pl.Tensor, residual_mix: pl.Tensor, output: pl.Tensor,
     rows: pl.Scalar[pl.INDEX], workers: pl.Scalar[pl.INDEX],
     row_tile: pl.constexpr, n_tile: pl.constexpr, hc_rows: pl.constexpr, k_tile: pl.constexpr, auto_vf_sync: pl.constexpr, l1_banks: pl.constexpr,
+    weight_cache: pl.constexpr, residual_cache: pl.constexpr,
 ):
     """Assign each worker a strided sequence of 256-row by 160-column tiles."""
     weight_nz: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN, pl.NZ] = weight[:, :]
@@ -1104,12 +1105,12 @@ def _o_b_hc_prefill(
                 pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 0, core_type=pl.KernelType.AIC)
                 a0_loaded: pl.Tile[[row_tile, k_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_a", slots=l1_banks)[0], pl.Mem.Mat] = pl.load(payload, [subrow, 0], [row_tile, k_tile], valid_shape=[valid_rows, k_tile], target_memory=pl.Mem.Mat)
                 a0 = pl.set_validshape(a0_loaded, row_tile, k_tile)
-                b0: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=l1_banks)[0], pl.Mem.Mat] = pl.load(weight_nz, [0, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
+                b0: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=l1_banks)[0], pl.Mem.Mat] = pl.load(weight_nz, [0, col], [k_tile, n_tile], target_memory=pl.Mem.Mat, cache=weight_cache)
                 pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 0, core_type=pl.KernelType.AIC)
                 pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 1, core_type=pl.KernelType.AIC)
                 a1_loaded: pl.Tile[[row_tile, k_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_a", slots=l1_banks)[1], pl.Mem.Mat] = pl.load(payload, [subrow, k_tile], [row_tile, k_tile], valid_shape=[valid_rows, k_tile], target_memory=pl.Mem.Mat)
                 a1 = pl.set_validshape(a1_loaded, row_tile, k_tile)
-                b1: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=l1_banks)[1], pl.Mem.Mat] = pl.load(weight_nz, [k_tile, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
+                b1: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=l1_banks)[1], pl.Mem.Mat] = pl.load(weight_nz, [k_tile, col], [k_tile, n_tile], target_memory=pl.Mem.Mat, cache=weight_cache)
                 pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 1, core_type=pl.KernelType.AIC)
                 a2 = a1
                 b2 = b1
@@ -1117,7 +1118,7 @@ def _o_b_hc_prefill(
                     pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 2, core_type=pl.KernelType.AIC)
                     a2_loaded: pl.Tile[[row_tile, k_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_a", slots=l1_banks)[l1_banks - 1], pl.Mem.Mat] = pl.load(payload, [subrow, 2 * k_tile], [row_tile, k_tile], valid_shape=[valid_rows, k_tile], target_memory=pl.Mem.Mat)
                     a2 = pl.set_validshape(a2_loaded, row_tile, k_tile)
-                    b2: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=l1_banks)[l1_banks - 1], pl.Mem.Mat] = pl.load(weight_nz, [2 * k_tile, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
+                    b2: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=l1_banks)[l1_banks - 1], pl.Mem.Mat] = pl.load(weight_nz, [2 * k_tile, col], [k_tile, n_tile], target_memory=pl.Mem.Mat, cache=weight_cache)
                     pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 2, core_type=pl.KernelType.AIC)
                 for panel in pl.unroll(LOCAL_O_WIDTH // k_tile):
                     bank = panel % l1_banks
@@ -1156,15 +1157,15 @@ def _o_b_hc_prefill(
                         if bank == 0:
                             a0_loaded: pl.Tile[[row_tile, k_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_a", slots=l1_banks)[0], pl.Mem.Mat] = pl.load(payload, [subrow, next_k], [row_tile, k_tile], valid_shape=[valid_rows, k_tile], target_memory=pl.Mem.Mat)
                             a0 = pl.set_validshape(a0_loaded, row_tile, k_tile)
-                            b0: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=l1_banks)[0], pl.Mem.Mat] = pl.load(weight_nz, [next_k, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
+                            b0: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=l1_banks)[0], pl.Mem.Mat] = pl.load(weight_nz, [next_k, col], [k_tile, n_tile], target_memory=pl.Mem.Mat, cache=weight_cache)
                         if bank == 1:
                             a1_loaded: pl.Tile[[row_tile, k_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_a", slots=l1_banks)[1], pl.Mem.Mat] = pl.load(payload, [subrow, next_k], [row_tile, k_tile], valid_shape=[valid_rows, k_tile], target_memory=pl.Mem.Mat)
                             a1 = pl.set_validshape(a1_loaded, row_tile, k_tile)
-                            b1: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=l1_banks)[1], pl.Mem.Mat] = pl.load(weight_nz, [next_k, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
+                            b1: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=l1_banks)[1], pl.Mem.Mat] = pl.load(weight_nz, [next_k, col], [k_tile, n_tile], target_memory=pl.Mem.Mat, cache=weight_cache)
                         if l1_banks == 3 and bank == 2:
                             a2_loaded: pl.Tile[[row_tile, k_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_a", slots=l1_banks)[l1_banks - 1], pl.Mem.Mat] = pl.load(payload, [subrow, next_k], [row_tile, k_tile], valid_shape=[valid_rows, k_tile], target_memory=pl.Mem.Mat)
                             a2 = pl.set_validshape(a2_loaded, row_tile, k_tile)
-                            b2: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=l1_banks)[l1_banks - 1], pl.Mem.Mat] = pl.load(weight_nz, [next_k, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
+                            b2: pl.Tile[[k_tile, n_tile], pl.FP8E4M3FN, pl.MemRef("ob_l1_b", slots=l1_banks)[l1_banks - 1], pl.Mem.Mat] = pl.load(weight_nz, [next_k, col], [k_tile, n_tile], target_memory=pl.Mem.Mat, cache=weight_cache)
                         pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, bank, core_type=pl.KernelType.AIC)
                 pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 0, core_type=pl.KernelType.AIC)
                 pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 1, core_type=pl.KernelType.AIC)
@@ -1182,7 +1183,7 @@ def _o_b_hc_prefill(
                     for group in pl.range(0, valid, hc_rows):
                         count = pl.min(hc_rows, valid - group)
                         row_base = start + group
-                        streams = pl.tile.load(residual_rows, [row_base * HC_MULT, col], [hc_rows * HC_MULT, n_tile], valid_shape=[count * HC_MULT, n_tile], target_memory=pl.Mem.Vec)
+                        streams = pl.tile.load(residual_rows, [row_base * HC_MULT, col], [hc_rows * HC_MULT, n_tile], valid_shape=[count * HC_MULT, n_tile], target_memory=pl.Mem.Vec, cache=residual_cache)
                         post = pl.tile.load(post_mix, [row_base, 0], [hc_rows, POST_STRIDE], valid_shape=[count, HC_MULT], target_memory=pl.Mem.Vec)
                         matrix = pl.tile.load(mix_rows, [row_base, 0], [hc_rows, HC_MULT * HC_MULT], valid_shape=[count, HC_MULT * HC_MULT], target_memory=pl.Mem.Vec)
                         with pl.reg_scope(auto_sync=auto_vf_sync):
@@ -1279,23 +1280,27 @@ def o_proj_b_hc_post_native(
         output, ready = _o_b_hc_prefill(
             payload, weight, activation_scale, weight_scale, residual, post_mix, residual_mix, output,
             rows, workers, O_B_ROW_TILE, O_B_N_TILE, HC_ROW_TILE, 256, auto_vf_sync=False, l1_banks=2,
+            weight_cache=pl.CachePolicy.DEFAULT, residual_cache=pl.CachePolicy.DEFAULT,
         )
     elif rows % 128 == 0 and scale_rows >= rows:
         # Three K512 panel pairs and both packed scale tiles fit in 504 KiB of L1.
         output, ready = _o_b_hc_prefill(
             payload, weight, activation_scale, weight_scale, residual, post_mix, residual_mix, output,
             rows, workers, 128, O_B_N_TILE, HC_ROW_TILE, 512, auto_vf_sync=False, l1_banks=3,
+            weight_cache=pl.CachePolicy.NORMAL_LAST_VICTIM, residual_cache=pl.CachePolicy.NOT_ALLOC_KEEP,
         )
     elif scale_rows >= (rows + 127) // 128 * 128:
         # A partial M128 band uses the original HC writeback schedule.
         output, ready = _o_b_hc_prefill(
             payload, weight, activation_scale, weight_scale, residual, post_mix, residual_mix, output,
             rows, workers, 128, O_B_N_TILE, HC_ROW_TILE, 512, auto_vf_sync=True, l1_banks=2,
+            weight_cache=pl.CachePolicy.DEFAULT, residual_cache=pl.CachePolicy.DEFAULT,
         )
     else:
         output, ready = _o_b_hc_prefill(
             payload, weight, activation_scale, weight_scale, residual, post_mix, residual_mix, output,
             rows, workers, 16, O_B_N_TILE, HC_ROW_TILE, 256, auto_vf_sync=True, l1_banks=2,
+            weight_cache=pl.CachePolicy.DEFAULT, residual_cache=pl.CachePolicy.DEFAULT,
         )
     return output, ready
 
