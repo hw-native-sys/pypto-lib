@@ -165,6 +165,54 @@ assert PREFILL_ATTN_BLOCKS <= VALID_BLOCK_MASK_COLS
 assert IDX_TOPK <= SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE
 
 
+@pl.jit.inline(auto_scope=False)
+def prepare_csa_sparse_indices(
+    position_ids: pl.Tensor, local_request_ids: pl.Tensor, ori_block_table: pl.Tensor,
+    t_dim: pl.Scalar[pl.INDEX], group_tokens: pl.Scalar[pl.INT32],
+) -> tuple[pl.Tensor, pl.Tensor]:
+    """Prepare raw KV indices and visible sparse blocks for every CSA layer."""
+    swa_indices = pl.create_tensor([t_dim, WIN], dtype=pl.INT32)
+    valid_block_mask = pl.create_tensor([t_dim, VALID_BLOCK_MASK_COLS], dtype=pl.INT32)
+    if group_tokens > 0:
+        csa_topk_blocks = (t_dim + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE
+        for topk_block in pl.spmd(csa_topk_blocks, name_hint="prefill_csa_sparse_idx_tile"):
+            topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
+            for topk_dt in pl.range(CSA_TOPK_TOKEN_TILE):
+                t_idx = topk_t0 + topk_dt
+                swa_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
+                mask_row = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
+                if t_idx < t_dim:
+                    request_id = pl.read(local_request_ids, [t_idx])
+                    if request_id >= 0:
+                        abs_pos = pl.read(position_ids, [t_idx])
+                        # Sparse-block liveness from the dense TopK prefix.
+                        visible_cmp = pl.min((abs_pos + 1) // COMPRESS_RATIO, pl.cast(IDX_TOPK, pl.INT32))
+                        for mask_sb in pl.unroll(PREFILL_ATTN_BLOCKS):
+                            cmp_lo = pl.max(mask_sb * PREFILL_ATTN_TILE - WIN, pl.cast(0, pl.INT32))
+                            cmp_hi = pl.min(
+                                (mask_sb + 1) * PREFILL_ATTN_TILE - WIN,
+                                pl.cast(SPARSE_CMP_BIAS_COLS, pl.INT32),
+                            )
+                            if cmp_lo < cmp_hi:
+                                if visible_cmp > cmp_lo:
+                                    pl.write(mask_row, [0, mask_sb], pl.cast(1, pl.INT32))
+                        window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
+                        key_start_abs = abs_pos + 1 - window_valid
+                        for win_col in pl.range(WIN):
+                            win_col_i32 = pl.cast(win_col, pl.INT32)
+                            if win_col_i32 < window_valid:
+                                key_abs = key_start_abs + win_col_i32
+                                blk_slot = key_abs // BLOCK_SIZE
+                                blk = pl.read(ori_block_table, [request_id, pl.cast(blk_slot, pl.INDEX)])
+                                if blk >= 0:
+                                    row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
+                                    pl.write(swa_row, [0, win_col], row)
+                                    pl.write(mask_row, [0, win_col // PREFILL_ATTN_TILE], pl.cast(1, pl.INT32))
+                    swa_indices[t_idx : t_idx + 1, 0:WIN] = swa_row
+                    valid_block_mask[t_idx : t_idx + 1, 0:VALID_BLOCK_MASK_COLS] = mask_row
+    return swa_indices, valid_block_mask
+
+
 def _prefill_attention_csa(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
@@ -360,44 +408,9 @@ def _prefill_attention_csa(
         inner_state_slot_mapping,
     )
 
-    swa_indices = pl.create_tensor([t_dim, WIN], dtype=pl.INT32)
-    valid_block_mask = pl.create_tensor([t_dim, VALID_BLOCK_MASK_COLS], dtype=pl.INT32)
-    csa_topk_blocks = (t_dim + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE
-    for topk_block in pl.spmd(csa_topk_blocks, name_hint="prefill_csa_sparse_idx_tile"):
-        topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
-        for topk_dt in pl.range(CSA_TOPK_TOKEN_TILE):
-            t_idx = topk_t0 + topk_dt
-            swa_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
-            mask_row = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
-            if t_idx < t_dim:
-                request_id = pl.read(local_request_ids, [t_idx])
-                if request_id >= 0:
-                    abs_pos = pl.read(position_ids, [t_idx])
-                    # Sparse-block liveness from the dense TopK prefix.
-                    visible_cmp = pl.min((abs_pos + 1) // COMPRESS_RATIO, pl.cast(IDX_TOPK, pl.INT32))
-                    for mask_sb in pl.unroll(PREFILL_ATTN_BLOCKS):
-                        cmp_lo = pl.max(mask_sb * PREFILL_ATTN_TILE - WIN, pl.cast(0, pl.INT32))
-                        cmp_hi = pl.min(
-                            (mask_sb + 1) * PREFILL_ATTN_TILE - WIN,
-                            pl.cast(SPARSE_CMP_BIAS_COLS, pl.INT32),
-                        )
-                        if cmp_lo < cmp_hi:
-                            if visible_cmp > cmp_lo:
-                                pl.write(mask_row, [0, mask_sb], pl.cast(1, pl.INT32))
-                    window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
-                    key_start_abs = abs_pos + 1 - window_valid
-                    for win_col in pl.range(WIN):
-                        win_col_i32 = pl.cast(win_col, pl.INT32)
-                        if win_col_i32 < window_valid:
-                            key_abs = key_start_abs + win_col_i32
-                            blk_slot = key_abs // BLOCK_SIZE
-                            blk = pl.read(ori_block_table, [request_id, pl.cast(blk_slot, pl.INDEX)])
-                            if blk >= 0:
-                                row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
-                                pl.write(swa_row, [0, win_col], row)
-                                pl.write(mask_row, [0, win_col // PREFILL_ATTN_TILE], pl.cast(1, pl.INT32))
-                swa_indices[t_idx : t_idx + 1, 0:WIN] = swa_row
-                valid_block_mask[t_idx : t_idx + 1, 0:VALID_BLOCK_MASK_COLS] = mask_row
+    swa_indices, valid_block_mask = prepare_csa_sparse_indices(
+        position_ids, local_request_ids, ori_block_table, t_dim, pl.const(1, pl.INT32),
+    )
 
     unpacked_weight_dep = pl.system.task_dummy(deps=[])
     wo_a_nz = pl.create_tensor([O_GROUPS, O_LORA, O_GROUP_IN], dtype=pl.BF16, layout=pl.NZ)
@@ -1154,7 +1167,8 @@ def prefill_attention_csa_cp_core(
     ],
     inner_compress_state_block_table: pl.Tensor[[REQUESTS_DYN, INNER_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    ori_block_table: pl.Tensor[[REQUESTS_DYN, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
+    swa_indices: pl.Tensor[[CP_Q_T_DYN, WIN], pl.INT32],
+    valid_block_mask: pl.Tensor[[CP_Q_T_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
     ori_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[REQUESTS_DYN, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
@@ -1275,43 +1289,6 @@ def prefill_attention_csa_cp_core(
         idx_cos[idx_t : idx_t + CSA_ROPE_TILE, 0:HALF_ROPE] = idx_cos_fp32
         idx_sin[idx_t : idx_t + CSA_ROPE_TILE, 0:HALF_ROPE] = idx_sin_fp32
 
-    swa_indices = pl.create_tensor([q_dim, WIN], dtype=pl.INT32)
-    valid_block_mask = pl.create_tensor([q_dim, VALID_BLOCK_MASK_COLS], dtype=pl.INT32)
-    csa_topk_blocks = (q_dim + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE
-    for topk_block in pl.spmd(csa_topk_blocks, name_hint="prefill_csa_cp_sparse_idx_tile"):
-        topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
-        for topk_dt in pl.range(CSA_TOPK_TOKEN_TILE):
-            t_idx = topk_t0 + topk_dt
-            swa_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
-            mask_row = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
-            if t_idx < q_dim:
-                request_id = pl.read(local_request_ids, [t_idx])
-                if request_id >= 0:
-                    abs_pos = pl.read(position_ids_local, [t_idx])
-                    visible_cmp = pl.min((abs_pos + 1) // COMPRESS_RATIO, pl.cast(IDX_TOPK, pl.INT32))
-                    for mask_sb in pl.unroll(PREFILL_ATTN_BLOCKS):
-                        cmp_lo = pl.max(mask_sb * PREFILL_ATTN_TILE - WIN, pl.cast(0, pl.INT32))
-                        cmp_hi_unclamped = (mask_sb + 1) * PREFILL_ATTN_TILE - WIN
-                        cmp_hi_cap = pl.cast(SPARSE_CMP_BIAS_COLS, pl.INT32)
-                        cmp_hi = pl.min(cmp_hi_unclamped, cmp_hi_cap)
-                        if cmp_lo < cmp_hi:
-                            if visible_cmp > cmp_lo:
-                                pl.write(mask_row, [0, mask_sb], pl.cast(1, pl.INT32))
-                    window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
-                    key_start_abs = abs_pos + 1 - window_valid
-                    for win_col in pl.range(WIN):
-                        win_col_i32 = pl.cast(win_col, pl.INT32)
-                        if win_col_i32 < window_valid:
-                            key_abs = key_start_abs + win_col_i32
-                            blk_slot = key_abs // BLOCK_SIZE
-                            blk = pl.read(ori_block_table, [request_id, pl.cast(blk_slot, pl.INDEX)])
-                            if blk >= 0:
-                                row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
-                                pl.write(swa_row, [0, win_col], row)
-                                pl.write(mask_row, [0, win_col // PREFILL_ATTN_TILE], pl.cast(1, pl.INT32))
-                swa_indices[t_idx : t_idx + 1, 0:WIN] = swa_row
-                valid_block_mask[t_idx : t_idx + 1, 0:VALID_BLOCK_MASK_COLS] = mask_row
-
     dup, swap, sign, scores, pairs, ready = prepare_prefill_indexer_workspace(indexer_cache_ready)
     selection_completion = pl.array.create(1, pl.TASK_ID)
     selection_completion[0] = ready
@@ -1380,7 +1357,8 @@ def prefill_attention_csa_cp_local(
     ],
     inner_compress_state_block_table: pl.Tensor[[REQUESTS_DYN, INNER_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    ori_block_table: pl.Tensor[[REQUESTS_DYN, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
+    swa_indices: pl.Tensor[[CP_Q_T_DYN, WIN], pl.INT32],
+    valid_block_mask: pl.Tensor[[CP_Q_T_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
     ori_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[REQUESTS_DYN, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
@@ -1474,7 +1452,7 @@ def prefill_attention_csa_cp_local(
         idx_wq_b, idx_wq_b_scale, idx_weights_proj,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
         inner_compress_state, inner_compress_state_block_table,
-        kv_cache, ori_block_table, ori_slot_mapping_full,
+        kv_cache, swa_indices, valid_block_mask, ori_slot_mapping_full,
         cmp_kv, cmp_block_table,
         idx_kv_cache, idx_kv_scale, idx_block_table,
         position_ids_local, position_ids_full, local_request_ids,
@@ -1577,6 +1555,9 @@ def prefill_attention_csa_cp(
         cmp_slot_mapping_full, idx_slot_mapping_full, state_slot_mapping_full, inner_state_slot_mapping_full, plan,
     )
     compact = pl.read(plan, [0])
+    swa_indices, valid_block_mask = prepare_csa_sparse_indices(
+        position_ids_local, local_request_ids, ori_block_table, q_dim, pl.const(1, pl.INT32),
+    )
     x_out_local, gather_signal = prefill_attention_csa_cp_local(
         x_hc_local,
         query_start_loc, state_checkpoint_ends,
@@ -1591,7 +1572,7 @@ def prefill_attention_csa_cp(
         idx_wq_b, idx_wq_b_scale, idx_weights_proj,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
         inner_compress_state, inner_compress_state_block_table,
-        kv_cache, ori_block_table, ori_slot_mapping_full,
+        kv_cache, swa_indices, valid_block_mask, ori_slot_mapping_full,
         cmp_kv, cmp_block_table,
         idx_kv_cache, idx_kv_scale, idx_block_table,
         position_ids_local, position_ids_full, local_request_ids,

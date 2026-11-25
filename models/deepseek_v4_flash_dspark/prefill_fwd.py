@@ -92,6 +92,7 @@ from prefill_csa import (
     build_ragged2_cp_tensor_specs as build_csa_ragged2_tensor_specs,
     prefill_attention_csa_cp_local,
     prepare_csa_compact_plan,
+    prepare_csa_sparse_indices,
 )
 from prefill_cp_token_allgather import (
     PREFILL_GROUP_CAP,
@@ -463,6 +464,10 @@ def prefill_fwd(
             ori_slot_mapping_full, hca_cmp_slot_mapping_full, hca_state_slot_mapping_full, hca_plan,
         )
 
+    csa_swa_indices, csa_valid_block_mask = prepare_csa_sparse_indices(
+        position_ids_local, local_request_ids, ori_block_table, local_tokens, group_tokens,
+    )
+
     # Query frequencies are shared by layer kind for this forward.
     swa_inverse, swa_swap_idx, swa_rope_ready = prepare_sparse_attn_rope(
         swa_freqs_cos, swa_freqs_sin, local_start, local_tokens, group_tokens,
@@ -810,7 +815,7 @@ def prefill_fwd(
                         csa_idx_wq_b_csa, csa_idx_wq_b_scale_csa, csa_weights_proj_csa,
                         csa_inner_wkv_csa, csa_inner_wgate_csa, csa_inner_ape_csa, csa_inner_norm_w_csa,
                         csa_inner_compress_state_csa, csa_inner_compress_state_block_table,
-                        kv_cache_csa, ori_block_table, ori_slot_mapping_full,
+                        kv_cache_csa, csa_swa_indices, csa_valid_block_mask, ori_slot_mapping_full,
                         csa_cmp_kv_csa, csa_cmp_block_table,
                         idx_kv_cache_csa, idx_kv_scale_csa, idx_block_table,
                         position_ids_local, position_ids_full, local_request_ids,
@@ -1110,7 +1115,7 @@ def prefill_fwd(
                     csa_idx_wq_b_last, csa_idx_wq_b_scale_last, csa_weights_proj_last,
                     csa_inner_wkv_last, csa_inner_wgate_last, csa_inner_ape_last, csa_inner_norm_w_last,
                     csa_inner_compress_state_last, csa_inner_compress_state_block_table,
-                    kv_cache_last, ori_block_table, ori_slot_mapping_full,
+                    kv_cache_last, csa_swa_indices, csa_valid_block_mask, ori_slot_mapping_full,
                     csa_cmp_kv_last, csa_cmp_block_table,
                     idx_kv_cache_last, idx_kv_scale_last, idx_block_table,
                     position_ids_local, position_ids_full, local_request_ids,
