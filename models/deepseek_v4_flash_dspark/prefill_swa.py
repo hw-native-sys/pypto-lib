@@ -225,7 +225,7 @@ def _prefill_attention_swa(
         valid_block_mask,
         attn_sink,
         inverse_rope, inverse_swap_idx, inverse_ready,
-        wo_a_nz, wo_b, wo_b_scale, attn_out, o_proj_weight_dep,
+        wo_a_nz, wo_b, wo_b_scale, attn_out, o_proj_weight_dep, GATHER_BUFFERS=1,
     )
 
     hc_post(attn_out, x_hc, post, comb, x_out, pl.const(-1, pl.INT32), T_TILE=16)
@@ -317,7 +317,7 @@ def prefill_attention_swa_cp_core(
         valid_block_mask, attn_sink,
         inverse_rope, inverse_swap_idx, inverse_ready,
         wo_a, wo_b, wo_b_scale,
-        attn_out_local, o_proj_weight_dep,
+        attn_out_local, o_proj_weight_dep, GATHER_BUFFERS=1,
     )
     return kv_cache, attn_out_local
 

@@ -411,7 +411,7 @@ def _prefill_attention_csa(
         inverse_rope, inverse_swap_idx, inverse_ready,
         wo_a_nz, wo_b, wo_b_scale,
         attn_out,
-        o_proj_weight_dep,
+        o_proj_weight_dep, GATHER_BUFFERS=2,
     )
 
     hc_post(attn_out, x_hc, post, comb, x_out, pl.const(-1, pl.INT32), T_TILE=16)
@@ -1335,7 +1335,7 @@ def prefill_attention_csa_cp_core(
             local_request_ids[first:first + pair_rows], topk, valid_block_mask[first:first + pair_rows], attn_sink,
             pl.const(0, pl.INDEX), pair_rows, inverse_rope[first:rope_end], inverse_swap_idx, inverse_ready,
             wo_a, wo_b, wo_b_scale, attn_out_local[first:first + pair_rows], o_proj_weight_dep,
-            selection_completion, TRACK_COMPLETION=False, PROJ_A_FENCE=False,
+            selection_completion, TRACK_COMPLETION=False, PROJ_A_FENCE=False, GATHER_BUFFERS=2,
         )
     return attn_out_local
 

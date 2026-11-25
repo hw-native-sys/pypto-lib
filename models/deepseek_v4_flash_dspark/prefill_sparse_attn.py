@@ -919,7 +919,8 @@ def _sparse_attn_wave(
     sparse_bias: pl.Tensor[[PREFILL_QUERY_TILE, PREFILL_SPARSE_PAD], pl.FP32],
     inverse_rope: pl.Tensor[[SPARSE_ROPE_ROWS, 2 * ROPE_DIM], pl.FP32],
     inverse_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
-    prior_wave_tid: pl.Scalar[pl.TASK_ID],
+    previous_reader: pl.Scalar[pl.TASK_ID],
+    previous_qk: pl.Scalar[pl.TASK_ID],
     query_base: pl.Scalar[pl.INDEX],
     dense_query_base: pl.Scalar[pl.INDEX],
 ) -> pl.Scalar[pl.TASK_ID]:
@@ -941,7 +942,7 @@ def _sparse_attn_wave(
     with pl.spmd(
         gather_blocks,
         name_hint="gather_ori_kv",
-        deps=[prior_wave_tid],
+        deps=[previous_reader],
     ) as gather_ori_tid:
         gather_schedule_block = pl.tile.get_block_idx()
         gather_token_block = gather_blocks - 1 - gather_schedule_block
@@ -997,7 +998,7 @@ def _sparse_attn_wave(
     with pl.spmd(
         gather_cmp_blocks,
         name_hint="gather_cmp_kv",
-        deps=[prior_wave_tid],
+        deps=[previous_reader],
     ) as gather_cmp_tid:
         gather_block = pl.tile.get_block_idx()
         gather_schedule_block = gather_block // (PREFILL_ATTN_BLOCKS - 1)
@@ -1059,7 +1060,10 @@ def _sparse_attn_wave(
     mi_transfer = pl.create_tensor([transfer_heads, 1], dtype=pl.FP32)
     li_transfer = pl.create_tensor([transfer_heads, 1], dtype=pl.FP32)
     ffts_workspace = pl.create_tensor([256], dtype=pl.INT64)
-    with pl.spmd(NUM_QK_CORES, name_hint="qk_pv", deps=[gather_ori_tid, gather_cmp_tid], allow_early_resolve=True) as qk_tid:
+    with pl.spmd(
+        NUM_QK_CORES, name_hint="qk_pv",
+        deps=[gather_ori_tid, gather_cmp_tid, previous_qk], allow_early_resolve=True,
+    ) as qk_tid:
         qk_core = pl.tile.get_block_idx()
         pl.system.set_ffts(ffts_workspace)
         qk_rows = pl.min(PREFILL_QUERY_TILE, pl.max(pl.min(t_dim, active_rows) - query_base, 0))
@@ -1231,29 +1235,37 @@ def _sparse_attn_heads(
     packed_init_tid: pl.Scalar[pl.TASK_ID],
     tile_base: pl.Scalar[pl.INDEX],
     tile_rows: pl.Scalar[pl.INDEX],
+    GATHER_BUFFERS: pl.constexpr,
 ) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
-    """Write one bounded dense tile through serial 128-row waves."""
-    # Query waves share their large KV workspace.  Keeping the
-    # waves chained lets the allocator recycle it instead of retaining one
-    # full sparse workspace per query block.
-    wave_tids = pl.array.create(1, pl.TASK_ID)
+    """Gather and compute the 128-row waves of one packed head tile."""
+    readers = pl.array.create(GATHER_BUFFERS, pl.TASK_ID)
+    qk_completion = pl.array.create(1, pl.TASK_ID)
     with pl.scope():
-        sparse_kv = pl.create_tensor(
-            [PREFILL_QUERY_TILE * PREFILL_SPARSE_PAD, HEAD_DIM],
-            dtype=pl.BF16,
+        banks_kv = pl.create_tensor(
+            [GATHER_BUFFERS * PREFILL_QUERY_TILE * PREFILL_SPARSE_PAD, HEAD_DIM],
+            dtype=pl.BF16, manual_dep=True,
         )
-        sparse_bias = pl.create_tensor(
-            [PREFILL_QUERY_TILE, PREFILL_SPARSE_PAD],
-            dtype=pl.FP32,
+        banks_bias = pl.create_tensor(
+            [GATHER_BUFFERS * PREFILL_QUERY_TILE, PREFILL_SPARSE_PAD],
+            dtype=pl.FP32, manual_dep=True,
         )
         ready_tid = pl.system.task_dummy(deps=[packed_init_tid, inverse_ready])
-        wave_tids[0] = ready_tid
+        qk_completion[0] = ready_tid
+        for buffer in pl.unroll(GATHER_BUFFERS):
+            readers[buffer] = ready_tid
         for query_block in pl.unroll(PREFILL_QUERY_BLOCKS):
             dense_query_base = query_block * PREFILL_QUERY_TILE
             query_base = tile_base + dense_query_base
-            prior_wave_tid = wave_tids[0]
-            wave_tid = prior_wave_tid
+            buffer = query_block % GATHER_BUFFERS
             if dense_query_base < tile_rows:
+                kv_start = buffer * PREFILL_QUERY_TILE * PREFILL_SPARSE_PAD
+                wave_kv = pl.slice(banks_kv, [PREFILL_QUERY_TILE * PREFILL_SPARSE_PAD, HEAD_DIM], [kv_start, 0])
+                wave_bias = pl.slice(
+                    banks_bias, [PREFILL_QUERY_TILE, PREFILL_SPARSE_PAD], [buffer * PREFILL_QUERY_TILE, 0],
+                )
+                # A gather may run during the other buffer's ordered QK/PV wave.
+                previous_reader = readers[buffer]
+                previous_qk = qk_completion[0]
                 wave_tid = _sparse_attn_wave(
                     q,
                     ori_kv,
@@ -1266,16 +1278,17 @@ def _sparse_attn_heads(
                     attn_sink,
                     active_rows,
                     o_packed_heads,
-                    sparse_kv,
-                    sparse_bias,
+                    wave_kv,
+                    wave_bias,
                     inverse_rope, inverse_swap_idx,
-                    prior_wave_tid,
+                    previous_reader, previous_qk,
                     query_base,
                     dense_query_base,
                 )
-            wave_tids[0] = wave_tid
+                readers[buffer] = wave_tid
+                qk_completion[0] = wave_tid
 
-    return o_packed_heads, wave_tids[0]
+    return o_packed_heads, qk_completion[0]
 
 
 @pl.jit.inline
@@ -1604,6 +1617,7 @@ def sparse_attn_project_pair(
     completion: pl.Array[1, pl.TASK_ID],
     TRACK_COMPLETION: pl.constexpr,
     PROJ_A_FENCE: pl.constexpr,
+    GATHER_BUFFERS: pl.constexpr,
 ):
     """Project a pair of 512-row head tiles."""
     with pl.scope():
@@ -1649,7 +1663,7 @@ def sparse_attn_project_pair(
                     tile_q, ori_kv, tile_swa, cmp_kv, cmp_block_table,
                     tile_ids, tile_topk, tile_mask, attn_sink, tile_rows,
                     tile_rope, inverse_swap_idx, inverse_ready,
-                    packed_head_major, packed_init_tid, pl.const(0, pl.INDEX), tile_rows,
+                    packed_head_major, packed_init_tid, pl.const(0, pl.INDEX), tile_rows, GATHER_BUFFERS,
                 )
                 head_tids[bank_slot] = tile_ready
         heads_ready = pl.system.task_dummy(deps=[head_tids[0], head_tids[1]])
@@ -1682,6 +1696,7 @@ def sparse_attn_compute(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
     o_proj_weight_dep: pl.Scalar[pl.TASK_ID],
+    GATHER_BUFFERS: pl.constexpr,
 ):
     """Build and project consecutive dense token pairs."""
     completion = pl.array.create(1, pl.TASK_ID)
@@ -1691,7 +1706,7 @@ def sparse_attn_compute(
             q, ori_kv, swa_indices, cmp_kv, cmp_block_table, local_request_ids, cmp_indices, valid_block_mask,
             attn_sink, pair_base, pair_rows, inverse_rope, inverse_swap_idx, inverse_ready,
             wo_a, wo_b, wo_b_scale, attn_out, o_proj_weight_dep, completion,
-            TRACK_COMPLETION=False, PROJ_A_FENCE=False,
+            TRACK_COMPLETION=False, PROJ_A_FENCE=False, GATHER_BUFFERS=GATHER_BUFFERS,
         )
     return attn_out
 
@@ -1715,6 +1730,7 @@ def sparse_attn_physical(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
     o_proj_weight_dep: pl.Scalar[pl.TASK_ID],
+    GATHER_BUFFERS: pl.constexpr,
 ):
     """Run sparse attention over the full physical token dimension."""
     active_rows = pl.tensor.dim(q, 0)
@@ -1734,7 +1750,7 @@ def sparse_attn_physical(
         wo_b,
         wo_b_scale,
         attn_out,
-        o_proj_weight_dep,
+        o_proj_weight_dep, GATHER_BUFFERS,
     )
 
 
@@ -1788,7 +1804,7 @@ def prefill_sparse_attn_test(
         wo_b,
         wo_b_scale,
         attn_out,
-        o_proj_weight_dep,
+        o_proj_weight_dep, GATHER_BUFFERS=2,
     )
 
 
