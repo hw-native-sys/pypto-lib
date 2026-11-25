@@ -7,6 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: no-sim
+# ci: devices=2
 """V4.1 Engram Host FP8 lookup, dequantization, projection and residual gating."""
 
 import argparse
@@ -21,7 +22,6 @@ from pathlib import Path
 import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
-from pypto.runtime import StackedDeviceTensor
 
 from config import EP_SIZE, FLASH as M, RANKS_DYN, T_DYN
 
@@ -66,14 +66,13 @@ ENGRAM_SHARD_ROWS = ENGRAM_ROWS // EP_SIZE
 
 # Validation fixture.
 TEST_SHARD_ROWS = 64
-TEST_TABLE_ROWS = 8 * TEST_SHARD_ROWS
 
 
 @pl.jit.inline(auto_scope=False)
 def engram_lookup(
     ids: pl.Tensor,
     table: pld.DistributedTensor,
-    scales: pl.Tensor,
+    scales: pld.DistributedTensor,
     output: pl.Tensor,
     layer: pl.Scalar[pl.INDEX],
     shard_rows: pl.constexpr,
@@ -83,11 +82,9 @@ def engram_lookup(
     if lookups > 0:
         workers = pl.min(lookups, pl.system.available_aiv_count())
         for worker in pl.spmd(workers, name_hint="engram_lookup"):
-            rows_per_layer = pl.tensor.dim(scales, 0) // 2
             rank = pld.rank(pld.get_comm_ctx(table))
             first_id = layer * lookups
             first_payload = layer * shard_rows
-            first_scale = layer * rows_per_layer
             zero = pl.tile.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
             for (index,) in pl.while_(init_values=(worker,)):
                 pl.cond(index < lookups)
@@ -97,10 +94,13 @@ def engram_lookup(
                     source = first_payload + row % shard_rows
                     if owner == rank:
                         payload = pl.load(table, [source, 0], [1, HEAD_DIM])
+                        scale_codes = pl.load(scales, [source, 0], [1, SCALE_TILE], valid_shape=[1, HEAD_DIM // 32])
                     else:
                         payload = pld.tile.remote_load(table, peer=owner, offsets=[source, 0], shape=[1, HEAD_DIM])
-                    scale_row = first_scale + row
-                    scale_codes = pl.load(scales, [scale_row, 0], [1, SCALE_TILE], valid_shape=[1, HEAD_DIM // 32])
+                        scale_codes = pld.tile.remote_load(
+                            scales, peer=owner, offsets=[source, 0], shape=[1, SCALE_TILE],
+                            valid_shape=[1, HEAD_DIM // 32],
+                        )
                     # Decode group-32 E8M0 scales and apply them to the FP8 row.
                     padded = pl.fillpad(scale_codes, pad_value=pl.PadValue.zero)
                     all_codes = pl.set_validshape(padded, 1, SCALE_TILE)
@@ -553,7 +553,7 @@ def _engram_gate_unmasked(
 def engram(
     ids: pl.Tensor,
     table: pld.DistributedTensor,
-    scales: pl.Tensor,
+    scales: pld.DistributedTensor,
     layer: pl.Scalar[pl.INDEX],
     shard_rows: pl.constexpr,
     wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
@@ -603,7 +603,7 @@ def engram(
 def write_forward_engram_layout(directory):
     """Record compile-time Host-window layout beside the integrated forward artifact."""
     layout = {
-        "abi_version": 1, "ranks": EP_SIZE, "rows_per_layer": ENGRAM_ROWS,
+        "abi_version": 2, "ranks": EP_SIZE, "rows_per_layer": ENGRAM_ROWS,
     }
     path = Path(directory) / "engram_layout.json"
     path.write_text(json.dumps(layout, indent=2) + "\n")
@@ -612,7 +612,7 @@ def write_forward_engram_layout(directory):
 def validate_forward_engram_layout(directory, ranks, rows):
     """Reject artifacts compiled for different Host-window ownership or table extents."""
     path = Path(directory) / "engram_layout.json"
-    expected = {"abi_version": 1, "ranks": ranks, "rows_per_layer": rows}
+    expected = {"abi_version": 2, "ranks": ranks, "rows_per_layer": rows}
     if not path.is_file() or json.loads(path.read_text()) != expected:
         raise ValueError("forward Engram layout is missing or mismatched; recompile with matching --ep and --engram-table-rows")
 
@@ -695,7 +695,7 @@ class EngramPayloadSource(io.RawIOBase):
 
 
 class EngramHostTables:
-    """Own streamed ENP Host shards and complete Device-resident scale replicas."""
+    """Own the streamed ENP payload and scale Host shards."""
 
     def __init__(self, checkpoint, ranks, *, num_embeddings=M.engram_num_embeddings, program_count=1):
         if ranks not in (2, 4, 8):
@@ -721,19 +721,21 @@ class EngramHostTables:
         self.shard_rows = self.rows_per_layer // ranks
         self.program_count = program_count
         self.host_payload_bytes_per_program = ranks * 2 * self.shard_rows * HEAD_DIM
+        self.host_scale_bytes_per_program = ranks * 2 * self.shard_rows * (HEAD_DIM // 32)
         self.host_payload_bytes = program_count * self.host_payload_bytes_per_program
-        self.device_scale_bytes_per_rank = 2 * self.rows_per_layer * (HEAD_DIM // 32)
-        self.upload_buffer = torch.empty(64 * 1024**2, dtype=torch.uint8).share_memory_()
+        self.host_scale_bytes = program_count * self.host_scale_bytes_per_program
         self.sources = []
+        self.scale_sources = []
 
     def __enter__(self):
         try:
             available = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
         except (AttributeError, OSError, ValueError):
             available = None
-        if available is not None and self.host_payload_bytes > available:
+        host_bytes = self.host_payload_bytes + self.host_scale_bytes
+        if available is not None and host_bytes > available:
             raise MemoryError(
-                f"ENP requires {self.host_payload_bytes} Host payload bytes, "
+                f"ENP requires {host_bytes} Host table bytes, "
                 f"only {available} are available"
             )
         try:
@@ -745,42 +747,23 @@ class EngramHostTables:
                     segments.append((path, offset + row * HEAD_DIM, count * HEAD_DIM))
                     segments.append((None, 0, (self.shard_rows - count) * HEAD_DIM))
                 self.sources.append(EngramPayloadSource(segments))
+                scale_segments = []
+                width = HEAD_DIM // 32
+                for path, offset, shape, _dtype in self.scale_spans:
+                    count = max(0, min(self.shard_rows, shape[0] - row))
+                    scale_segments.append((path, offset + row * width, count * width))
+                    scale_segments.append((None, 0, (self.shard_rows - count) * width))
+                self.scale_sources.append(EngramPayloadSource(scale_segments))
         except BaseException:
             self.__exit__(None, None, None)
             raise
         return self
 
     def __exit__(self, *_exception):
-        for source in self.sources:
+        for source in (*self.sources, *self.scale_sources):
             source.close()
         self.sources.clear()
-
-    def upload_scales(self, runtime):
-        """Upload each native scale byte once to every rank using bounded shared scratch."""
-        shape = (2 * self.rows_per_layer, HEAD_DIM // 32)
-        shards = [runtime.alloc_tensor(shape, torch.uint8, worker_id=rank) for rank in range(self.ranks)]
-        target = memoryview(self.upload_buffer.numpy()).cast("B")
-        for layer, (path, offset, source_shape, _dtype) in enumerate(self.scale_spans):
-            live = source_shape[0] * (HEAD_DIM // 32)
-            layer_bytes = self.rows_per_layer * (HEAD_DIM // 32)
-            with path.open("rb") as file:
-                file.seek(offset)
-                for begin in range(0, layer_bytes, len(target)):
-                    count = min(len(target), layer_bytes - begin)
-                    valid = max(0, min(count, live - begin))
-                    if valid:
-                        read = file.readinto(target[:valid])
-                        if read != valid:
-                            raise EOFError("truncated Engram scale table")
-                    if valid < count:
-                        target[valid:count] = bytes(count - valid)
-                    for rank, shard in enumerate(shards):
-                        offset = layer * layer_bytes + begin
-                        runtime.copy_to(
-                            shard.data_ptr, self.upload_buffer.data_ptr(), count, dst_offset=offset, worker_id=rank,
-                        )
-        stack_shape = (self.ranks, *shape)
-        return StackedDeviceTensor(shards, stack_shape, tuple(range(self.ranks)))
+        self.scale_sources.clear()
 
 
 class HostEngram:
@@ -1094,7 +1077,7 @@ def engram_gate_pairs(
 def l2_engram(
     ids: pl.Tensor[[TEST_LOOKUPS_DYN, 1], pl.INT32],
     table: pld.DistributedTensor[[2 * TEST_SHARD_ROWS, HEAD_DIM], pl.UINT8],
-    scales: pl.Tensor[[2 * TEST_TABLE_ROWS, HEAD_DIM // 32], pl.UINT8],
+    scales: pld.DistributedTensor[[2 * TEST_SHARD_ROWS, HEAD_DIM // 32], pl.UINT8],
     wkv: pl.Tensor[[ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
     wkv_scale: pl.Tensor[[ENGRAM_K // 32, KV_OUT], pl.FP8E8M0],
     weight: pl.Tensor[[HC_MULT, D], pl.FP32],
@@ -1112,7 +1095,6 @@ def l2_engram(
 @pl.jit.host
 def l3_engram(
     ids: pl.Tensor[[RANKS_DYN, TEST_LOOKUPS_DYN, 1], pl.INT32],
-    scales: pl.Tensor[[2 * TEST_TABLE_ROWS, HEAD_DIM // 32], pl.UINT8],
     wkv: pl.Tensor[[ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
     wkv_scale: pl.Tensor[[ENGRAM_K // 32, KV_OUT], pl.FP8E8M0],
     weight: pl.Tensor[[HC_MULT, D], pl.FP32],
@@ -1123,8 +1105,12 @@ def l3_engram(
     buffer = pld.alloc_window_buffer(
         [2 * TEST_SHARD_ROWS, HEAD_DIM], dtype=pl.UINT8, memory_source="host", init="payload",
     )
+    scale_buffer = pld.alloc_window_buffer(
+        [2 * TEST_SHARD_ROWS, HEAD_DIM // 32], dtype=pl.UINT8, memory_source="host", init="scales",
+    )
     for rank in pl.range(pld.world_size()):
         table = pld.window(buffer, [2 * TEST_SHARD_ROWS, HEAD_DIM], dtype=pl.UINT8)
+        scales = pld.window(scale_buffer, [2 * TEST_SHARD_ROWS, HEAD_DIM // 32], dtype=pl.UINT8)
         l2_engram(ids[rank], table, scales, wkv, wkv_scale, weight, x[rank], out[rank], device=rank)
 
 
@@ -1137,7 +1123,7 @@ def build_tensor_specs(ranks, tokens):
     ids = build_random_engram_ids(ranks, tokens, max(1, tokens - 1), ranks * TEST_SHARD_ROWS)
     payload_shape = (ranks, 2 * TEST_SHARD_ROWS, HEAD_DIM)
     payload = torch.randint(-16, 17, payload_shape, generator=generator).to(torch.float8_e4m3fn).view(torch.uint8)
-    scale_shape = (2 * TEST_TABLE_ROWS, HEAD_DIM // 32)
+    scale_shape = (ranks, 2 * TEST_SHARD_ROWS, HEAD_DIM // 32)
     scales = torch.randint(124, 131, scale_shape, generator=generator, dtype=torch.uint8)
     channels = torch.arange(0, ENGRAM_K, HEAD_DIM)
     # One nonzero weight channel per K panel.
@@ -1155,17 +1141,16 @@ def build_tensor_specs(ranks, tokens):
 
     specs = [
         TensorSpec("ids", list(ids.shape), ids.dtype, init_value=ids),
-        TensorSpec("scales", list(scales.shape), scales.dtype, init_value=scales),
         TensorSpec("wkv", [ENGRAM_K, KV_OUT], torch.float8_e4m3fn, init_value=init_wkv),
         TensorSpec("wkv_scale", list(packed_scales.shape), packed_scales.dtype, init_value=packed_scales),
         TensorSpec("weight", [HC_MULT, D], torch.float32, init_value=1.0),
         TensorSpec("x", [ranks, 2, tokens, HC_MULT, D], torch.float32, init_value=init_x),
         TensorSpec("out", [ranks, 2, tokens, HC_MULT, D], torch.float32),
     ]
-    return specs, payload
+    return specs, payload, scales
 
 
-def golden_engram(tensors, *, payload):
+def golden_engram(tensors, *, payload, scales):
     """Compute the full Engram residual from the same sharded Host table."""
     from gemm import _quantize_mxfp8_activation
     from quant import unpack_mx_b_scale
@@ -1179,7 +1164,7 @@ def golden_engram(tensors, *, payload):
     owner = selected // TEST_SHARD_ROWS
     address = layers * TEST_SHARD_ROWS + selected % TEST_SHARD_ROWS
     rows = payload[owner, address].view(torch.float8_e4m3fn).float()
-    codes = tensors["scales"][layers * TEST_TABLE_ROWS + selected].int() - 127
+    codes = scales[owner, address].int() - 127
     lookup = torch.zeros(*row_ids.shape, HEAD_DIM, dtype=torch.bfloat16)
     lookup[valid] = torch.ldexp(rows, codes.repeat_interleave(32, dim=-1)).bfloat16()
 
@@ -1207,7 +1192,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="DeepSeek V4.1 full Engram validation")
     parser.add_argument("-p", "--platform", choices=["a5"], default="a5")
-    parser.add_argument("-d", "--device", default="0", help="comma-separated IDs for 1, 2, 4, or 8 devices")
+    parser.add_argument("-d", "--device", default="0,1", help="comma-separated IDs for 1, 2, 4, or 8 devices")
     parser.add_argument("--tokens", type=int, default=8, help="token rows per layer and rank")
     parser.add_argument("--runtime-dir", help="reuse a CPU-prebuilt runtime")
     parser.add_argument("--golden-data", help="reuse frozen input/reference tensors")
@@ -1224,11 +1209,11 @@ if __name__ == "__main__":
     if args.tokens <= 0:
         parser.error("--tokens must be positive")
 
-    specs, payload = build_tensor_specs(len(device_ids), args.tokens)
+    specs, payload, scales = build_tensor_specs(len(device_ids), args.tokens)
     result = run(
         fn=l3_engram,
         specs=specs,
-        golden_fn=partial(golden_engram, payload=payload),
+        golden_fn=partial(golden_engram, payload=payload, scales=scales),
         config={
             "backend_type": "a5",
             "execution_mode": False,
@@ -1240,7 +1225,10 @@ if __name__ == "__main__":
         runtime_dir=args.runtime_dir,
         golden_data=args.golden_data,
         save_data=args.save_data,
-        window_sources=None if args.compile_only else {"payload": list(payload.unbind(0))},
+        window_sources=None if args.compile_only else {
+            "payload": list(payload.unbind(0)),
+            "scales": list(scales.unbind(0)),
+        },
         persistent=True,
         reset_persistent_windows=False,
         compare_fn={"out": ratio_allclose(atol=1e-3, rtol=1e-2)},
