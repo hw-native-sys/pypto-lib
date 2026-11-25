@@ -42,7 +42,8 @@ the table below lists common entry points, not an exhaustive skill catalog.
 
 | Task | Required guidance and workflow |
 | --- | --- |
-| Model implementation, optimization, or review | [Model rules](rules/models.md) |
+| Model implementation or optimization | [Model rules](rules/models.md) |
+| Model PR review or re-review | [PR review workflow](skills/pr-review/SKILL.md) |
 | Writing or modifying kernels | [L2 programming](../docs/pypto-coding/l2-programming.md), relevant sibling pages in [PyPTO coding](../docs/pypto-coding/index.md), and [formatting workflow](skills/fmt-coding-style/SKILL.md) |
 | Environment setup | [Setup skill](skills/setup-env/SKILL.md) and [installation guide](../docs/get-started/installation.md) |
 | Running a model | [Compile/runtime workflow](../docs/run-and-validate/compile-runtime-workflow.md#selecting-and-running-a-case) and the relevant [model documentation](../docs/models/index.md) |
