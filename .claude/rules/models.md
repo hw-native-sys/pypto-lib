@@ -33,6 +33,15 @@ entries, must follow the project [coding style](../skills/fmt-coding-style/SKILL
 - Deferred performance work does not waive correctness or interface contracts
   for supported paths. Check new branches and implementation variants against
   the model's priorities during review.
+- Size each SPMD launch to the work and the AICs or AIVs available in the
+  target device allocation, including any virtual partition. For example,
+  an A5 allocation may expose 32 AICs and 64 AIVs, and an A3 allocation
+  may expose 24 AICs and 48 AIVs. Cap workers at the actual allocation's
+  limit for their core type. For mixed kernels, respect both limits.
+  When there are more tiles than workers, distribute all tiles among the
+  workers, including the tail. In performance PRs,
+  check that the launch stays within these limits as supported shapes and
+  tiling parameters vary.
 
 ## File ownership
 
@@ -41,8 +50,11 @@ entries, must follow the project [coding style](../skills/fmt-coding-style/SKILL
   without separate goldens or validation entries.
 - Decode and prefill normally have separate files for large operators. Share
   small operators when both paths can use the same implementation.
-- `config.py` contains model configuration only. Tiling, scheduling, execution
-  shapes, and validation defaults belong to their owning operator or entry.
+- `config.py` owns model configuration, including capacities that define
+  caller-visible tensor shapes, such as the maximum decode batch per rank.
+  The caller supplies the active workload for each invocation. The owning
+  operator or entry determines tiling, internal padding, and launch shapes
+  and owns its scheduling choices and validation defaults.
 - `utils.py` contains shared host utilities, never kernel implementations,
   including undecorated bodies later wrapped in JIT decorators.
 
@@ -60,6 +72,15 @@ entries, must follow the project [coding style](../skills/fmt-coding-style/SKILL
 
 - Reuse existing operators and host utilities. Standalone validation and model
   composition must use the same compute implementation.
+- Before changing a shared signature for one use case, weigh the benefit to
+  that caller against the changes required across other callers. If most
+  callers would only forward the argument or pass a placeholder, first check
+  whether the caller that needs it can handle the requirement locally.
+- Prefer automatic dependency inference from tensor reads and writes. Before
+  adding a `TaskId` argument, identify the caller that needs the ordering and
+  the tasks it must order. Check whether existing dependencies already order
+  them, including through intermediate tasks. Add an explicit dependency
+  only where the required ordering is missing.
 - For small changes to an existing operator, modify that operator and update
   all affected callers. Do not add a wrapper, factory, or near-duplicate for
   the new path while leaving other paths on the old implementation. An extra
@@ -69,6 +90,20 @@ entries, must follow the project [coding style](../skills/fmt-coding-style/SKILL
   performance need within the model's development priorities that the existing
   implementation cannot meet. New files and entry points require an actual
   consumer and a distinct responsibility.
+- For a kernel mode argument, such as an integer selector or a boolean flag
+  (including compile-time flags), check what varies and why the caller needs
+  to select it. If it switches between distinct algorithms, such as separate
+  decode and prefill implementations, give each algorithm its own kernel.
+  If one algorithm can express both, derive its tiling from the input shape
+  and hardware constraints where possible. For example, choose between tile
+  sizes by comparing padded work or tile counts. Expose a tiling parameter
+  when the caller has information or a scheduling choice the kernel lacks.
+- For parameters that vary widely across workloads, introduce a performance
+  branch only when the optimization benefits a meaningful range of values.
+  For example, a speedup at `token == 128` alone does not justify a fast
+  path. If a short-sequence strategy benefits token counts up to 128, select
+  it with `if token <= 128` and check the benefit at representative lengths
+  across that range.
 - When replacing an implementation or interface, update affected callers,
   including drafts, and remove obsolete code, parameters, exports, validation
   entries, and documentation in the same change. Keep compatibility wrappers
