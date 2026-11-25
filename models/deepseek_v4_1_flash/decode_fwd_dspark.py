@@ -36,6 +36,7 @@ from config import (
     LM_HEAD_TP_SIZE, SUPPORTED_LM_HEAD_TP_SIZES, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
 from quant import unpack_quantized_cache
+from engram import build_random_engram_ids
 from mega_moe import forward_routed_weight_spec
 from decode_fwd import FWD_C1A_TABLE_DYN, FWD_C2A_TABLE_DYN
 import decode_fwd as target_fwd
@@ -810,8 +811,8 @@ def build_tensor_specs(active_requests=1):
         base = target_specs.get(name)
         value = initial.get(name, base.init_value if base is not None else None)
         if name == "engram_ids":
-            value = torch.full(shape, -1, dtype=dtype)
-            value[:, :TARGET_FWD_N_HASH_COLS, 0] = 0
+            active_tokens = active_requests * ROWS
+            value = build_random_engram_ids(EP_SIZE, PADDED_ROWS, active_tokens, TARGET_FWD_ENGRAM_ROWS)
         if name == "draft_window_cache":
             value = torch.zeros(shape, dtype=torch.uint8)
             _, factors = unpack_quantized_cache(value, False)
