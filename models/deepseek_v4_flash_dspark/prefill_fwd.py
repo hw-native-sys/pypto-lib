@@ -682,7 +682,7 @@ def prefill_fwd(
                 arrived, data_arrived, routed_y_buf, combine_arrived,
                 stage_done, stage_token, layer_completion,
                 eplb_mapping, eplb_replicas, eplb_load, eplb_control,
-                layer_l1, my_rank, group_tokens, group_local_base,
+                layer_l1, my_rank, group_tokens,
             )
 
     target_l41_start = pl.cast(local_tokens, pl.INDEX)
@@ -847,7 +847,7 @@ def prefill_fwd(
                     arrived, data_arrived, routed_y_buf, combine_arrived,
                     stage_done, stage_token, layer_completion,
                     eplb_mapping, eplb_replicas, eplb_load, eplb_control,
-                    csa_layer, my_rank, group_tokens, group_local_base,
+                    csa_layer, my_rank, group_tokens,
                 )
                 if group_tokens > 0:
                     if pair_order == HCA_NUM_LAYERS - 1:
@@ -979,7 +979,7 @@ def prefill_fwd(
                     arrived, data_arrived, routed_y_buf, combine_arrived,
                     stage_done, stage_token, layer_completion,
                     eplb_mapping, eplb_replicas, eplb_load, eplb_control,
-                    hca_layer, my_rank, group_tokens, group_local_base,
+                    hca_layer, my_rank, group_tokens,
                 )
                 if group_tokens > 0:
                     if pair_order == HCA_NUM_LAYERS - 1:
@@ -1148,7 +1148,7 @@ def prefill_fwd(
                 arrived, data_arrived, routed_y_buf, combine_arrived,
                 stage_done, stage_token, layer_completion,
                 eplb_mapping, eplb_replicas, eplb_load, eplb_control,
-                layer_last, my_rank, group_tokens, group_local_base,
+                layer_last, my_rank, group_tokens,
             )
 
     moe_retired_tid = clear_prefill_moe_signals(stage_token, arrived, data_arrived, combine_arrived, stage_done)

@@ -348,7 +348,7 @@ def make_moe(local_experts: int, *, enable_eplb: bool = False):
             # One meta row per dst (all LOCAL_EXPERTS counts, zeros included), then bump the
             # per-source arrival counter. AtomicAdd on a monotonic window is
             # order-independent, so a late notify from an earlier epoch cannot clobber it.
-            meta_tile = pl.tile.full([1, META_SLOTS], dtype=pl.INT32, value=0)
+            meta_tile = pl.tile.full([1, LOCAL_META_SLOTS], dtype=pl.INT32, value=0)
             for dst in pl.range(N_RANKS):
                 for e in pl.range(LOCAL_EXPERTS):
                     pl.tile.write(meta_tile, [0, e], cursor[dst * LOCAL_EXPERTS + e])
