@@ -90,6 +90,41 @@ decomposition to the mixed AIC/AIV software pipeline.
 `decode_fwd_layers` in the same file is the same fused body over a contiguous
 layer *chunk* with no LM head, for callers that compose the stack externally.
 
+#### HBG layer Graphs
+
+The decode entry supports a layer-Graph form selected before compilation by
+calling `decode_fwd.configure_layer_graph(True)` and targeting
+`passes.RuntimeKind.HOST_BUILD_GRAPH`. The standalone `--layer-graph` option
+selects both settings:
+
+```bash
+python models/qwen3_14b/decode_fwd.py -p a2a3 --smoke --layer-graph --fwd-layers 40
+python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0 --layer-graph --fwd-layers 4 --repeat-runs 8
+```
+
+Each decode invocation constructs its own layer Definition and execution
+contents. Layers within that invocation share the Definition, with individual
+weight offsets, KV boundaries, residual outputs and completion dependencies.
+Batch windows serialize access to the shared paged-attention scratch buffers.
+K/V parameters are `InOut` throughout the decode call chain.
+
+`--layer-graph` selects production forward validation. A single-step forward
+(`--validate-fwd` or `--layer-graph`) restores the same initial KV before each
+replay and fails on any FP32 logits byte difference or greedy token ID mismatch.
+The default is three invocations; `--repeat-runs` controls that count. The
+independent layer-stack reference then starts from the same initial KV.
+`--decode-steps` runs a separate context-growth timing mode when greater than
+one and does not perform the same-state repeatability check.
+
+Graph compilation requires a PyPTO version containing the boundary alias and
+run-invariant resource-query fixes in [PyPTO #3560](https://github.com/hw-native-sys/pypto/pull/3560).
+The attention launch retains its full-cohort hard-syncall requirement.
+
+The default single-layer golden also checks KV writeback. Appended tokens use
+BF16 relative precision (`rtol=1/128`, no outliers); cache bytes outside the
+supplied slots must remain identical. Same-state forward replays retain the
+exact FP32 logits and token-ID checks described above.
+
 ### Quantized and compressed variants
 
 ```
