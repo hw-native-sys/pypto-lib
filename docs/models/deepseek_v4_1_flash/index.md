@@ -152,10 +152,6 @@ Commas separate requests and semicolons separate DP groups. `--requests` provide
 a balanced split when explicit query lengths are omitted. The forward entry
 uses `--capacity` for its DP capacity.
 
-The validation entries in this model use the host-built graph runtime
-by default on A5. To compile with TMR, set
-`PYPTO_LIB_A5_RUNTIME=tensormap_and_ringbuffer`.
-
 For example, these commands generate SWA artifacts without executing devices:
 
 ```bash

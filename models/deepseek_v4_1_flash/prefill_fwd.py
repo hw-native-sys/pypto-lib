@@ -2163,6 +2163,7 @@ def generate(
     finished = [False] * RANKS
     image_rows_seen = [0] * RANKS
     # Host control tensors must be shared and registered before the chip-worker fork.
+    prefill_counts = torch.zeros((RANKS, 2), dtype=torch.int32).share_memory_()
     decode_counts = {
         name: torch.zeros(RANKS, dtype=torch.int32).share_memory_()
         for name in ("moe_num_tokens", "attention_num_tokens")
@@ -2184,7 +2185,7 @@ def generate(
             raise ValueError("generation head parameters must match the staged head tensor names in order")
     if generation_head is not None:
         extra.append(generation_head)
-    inherited = [*decode_counts.values(), tables.upload_buffer]
+    inherited = [prefill_counts, *decode_counts.values(), tables.upload_buffer]
     with tables, compiled.prepare(
         config, extra_compiled=extra, persistent=True, reset_persistent_windows=False,
         inherited_host_tensors=inherited, window_sources={"engram_payload": tables.sources},
@@ -2202,6 +2203,8 @@ def generate(
             rope_tables = inputs["freqs_cos"], inputs["freqs_sin"]
             host_cache.append({name: inputs[name] for name in cache_names})
             for name in PREFILL_TENSORS:
+                if name == "counts":
+                    continue
                 if name == "correction_bias" and multimodal:
                     shape = (N_LAYERS * CAPACITY * N_EXPERTS,)
                     tensors[name] = runtime.alloc_tensor(shape, torch.float32, worker_id=rank)
@@ -2227,8 +2230,9 @@ def generate(
             name: StackedDeviceTensor(
                 [rank[name] for rank in per_rank], (RANKS, *per_rank[0][name].shape), tuple(range(RANKS))
             )
-            for name in PREFILL_TENSORS
+            for name in PREFILL_TENSORS if name != "counts"
         }
+        stacked["counts"] = prefill_counts
         logits = torch.empty((RANKS, 16, VOCAB), dtype=torch.float32)
         sampled_ids = torch.empty((RANKS, 16, 8), dtype=torch.int32)
         committed = [0] * RANKS
@@ -2316,6 +2320,8 @@ def generate(
                     inputs = prepare_decode_inputs(inputs)
                     for counts in decode_counts.values():
                         counts[rank] = len(token_ids)
+                else:
+                    prefill_counts[rank].copy_(inputs.pop("counts"))
                 for name, value in inputs.items():
                     if name not in constants and name not in ("engram_scales", "engram_hash_ids"):
                         runtime.copy_to(
