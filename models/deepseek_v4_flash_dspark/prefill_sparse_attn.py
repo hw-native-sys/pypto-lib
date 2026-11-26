@@ -1350,7 +1350,8 @@ def _sparse_attn_o_proj(
     o_r_i8 = pl.create_tensor([O_GROUPS * PROJECTION_ROWS, O_LORA], dtype=pl.INT8)
     act_scale_dq = pl.create_tensor([O_GROUPS, PROJECTION_ROWS], dtype=pl.FP32)
     if PROJECTION_ROWS == T_PAD:
-        partials = pl.create_tensor([PROJECTION_ROWS, O_GROUPS * D], dtype=pl.INT32)
+        # O-B groups write disjoint columns and the reduction waits on every group.
+        partials = pl.create_tensor([PROJECTION_ROWS, O_GROUPS * D], dtype=pl.INT32, manual_dep=True)
     else:
         partials = pl.create_tensor([O_GROUPS * PROJECTION_ROWS, D], dtype=pl.INT32)
     heads_deps = pl.array.create(2, pl.TASK_ID)
@@ -1382,9 +1383,7 @@ def _sparse_attn_o_proj(
                     o_packed, [HEADS_PER_GROUP * T_PAD, HEAD_DIM],
                     [bank * PACKED_HEAD_ROWS + group_head, 0],
                 )
-                pa_output: pl.Tensor[
-                    [bank_rows, O_LORA], pl.FP32, pl.TensorView(stride=[O_LORA, 1])
-                ] = pl.slice(o_r, [bank_rows, O_LORA], [group_row + bank * T_PAD, 0])
+                pa_output = pl.slice(o_r, [bank_rows, O_LORA], [group_row + bank * T_PAD, 0])
                 with pl.spmd(pa_blocks, name_hint="proj_a_mm", deps=[heads_deps[bank], weight_dep]) as pa_tid:
                     pa_block = pl.tile.get_block_idx()
                     pa_r0 = (pa_block % pa_rows) * PROJ_A_ROW_TILE
@@ -1401,15 +1400,9 @@ def _sparse_attn_o_proj(
         # quant[g]: per-group amax and symmetric INT8 quant over physical rows.
         for g in pl.parallel(O_GROUPS):
             group_row = g * PROJECTION_ROWS
-            quant_input: pl.Tensor[
-                [PROJECTION_ROWS, O_LORA], pl.FP32, pl.TensorView(stride=[O_LORA, 1])
-            ] = pl.slice(o_r, [PROJECTION_ROWS, O_LORA], [group_row, 0])
-            quant_output: pl.Tensor[
-                [PROJECTION_ROWS, O_LORA], pl.INT8, pl.TensorView(stride=[O_LORA, 1])
-            ] = pl.slice(o_r_i8, [PROJECTION_ROWS, O_LORA], [group_row, 0])
-            quant_scale_output: pl.Tensor[
-                [1, PROJECTION_ROWS], pl.FP32, pl.TensorView(stride=[PROJECTION_ROWS, 1])
-            ] = pl.slice(act_scale_dq, [1, PROJECTION_ROWS], [g, 0])
+            quant_input = pl.slice(o_r, [PROJECTION_ROWS, O_LORA], [group_row, 0])
+            quant_output = pl.slice(o_r_i8, [PROJECTION_ROWS, O_LORA], [group_row, 0])
+            quant_scale_output = pl.slice(act_scale_dq, [1, PROJECTION_ROWS], [g, 0])
             with pl.spmd(
                 quant_rows,
                 name_hint="quant",
@@ -1439,21 +1432,14 @@ def _sparse_attn_o_proj(
         # Each group projects independent row blocks and output slabs.
         for g in pl.parallel(O_GROUPS):
             group_row = g * PROJECTION_ROWS
-            pb_input: pl.Tensor[
-                [PROJECTION_ROWS, O_LORA], pl.INT8, pl.TensorView(stride=[O_LORA, 1])
-            ] = pl.slice(o_r_i8, [PROJECTION_ROWS, O_LORA], [group_row, 0])
+            pb_input = pl.slice(o_r_i8, [PROJECTION_ROWS, O_LORA], [group_row, 0])
             group_col = g * D
-            if PROJECTION_ROWS == T_PAD:
-                pb_output: pl.Tensor[
-                    [PROJECTION_ROWS, D], pl.INT32, pl.TensorView(stride=[O_GROUPS * D, 1])
-                ] = pl.slice(partials, [PROJECTION_ROWS, D], [0, group_col])
-            else:
-                pb_output: pl.Tensor[
-                    [PROJECTION_ROWS, D], pl.INT32, pl.TensorView(stride=[D, 1])
-                ] = pl.slice(partials, [PROJECTION_ROWS, D], [group_row, 0])
+            if PROJECTION_ROWS != T_PAD:
+                pb_output = pl.slice(partials, [PROJECTION_ROWS, D], [group_row, 0])
             with pl.spmd(proj_b_rows * PB_DSLABS, name_hint="proj_b_mm", deps=[quant_tids[g]]) as pb_tid:
                 pb_block = pl.tile.get_block_idx()
                 if PROJECTION_ROWS == T_PAD:
+                    pb_output = pl.tensor.view(partials, [PROJECTION_ROWS, D], offsets=[0, group_col])
                     pb_r0 = (pb_block // PB_DSLABS) * PROJ_B_ROW_TILE
                     pb_slab = (pb_block % PB_DSLABS) * PROJ_B_D_TILE
                 else:
