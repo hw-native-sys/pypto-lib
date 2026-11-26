@@ -18,6 +18,13 @@
 #include "intrinsic.h"
 
 using namespace pto;
+#ifdef PREFILL_INDEX_ROUTE
+constexpr int kRouteArg = 8;
+constexpr int kTokenCountArg = 9;
+#else
+constexpr int kTokenCountArg = 8;
+#endif
+
 #if defined(__CPU_SIM)
 template <int Rows>
 using SimPipe = TPipe<0, Direction::DIR_C2V, Rows * 128 * 4, 2, 2>;
@@ -225,7 +232,7 @@ __aicore__ inline void project(__gm__ int64_t* args, int block) {
             ::data<F>(args, 1) + block * 256 * 1280 + k * 256 * 32);
         TLOAD(bm, bg);
     }
-    for (int row = 0; row < args[8]; row += M) {
+    for (int row = 0; row < args[kTokenCountArg]; row += M) {
         mxfp8_projection::GM<F, M, 1280, M, 1280, Layout::ND> ag(::data<F>(args, 0) + row * 1280);
         mxfp8_projection::GM<S, M, 40, M, 40, Layout::MX_A_ZZ> sag(::data<S>(args, 2) + row * 40);
         TLOAD(am, ag);
@@ -262,7 +269,7 @@ __aicore__ inline void project(__gm__ int64_t* args, int block) {
         pipe_barrier(PIPE_ALL);
     }
 #if !defined(__CPU_SIM)
-    if (args[8] > 0) {
+    if (args[kTokenCountArg] > 0) {
         wait_intra_block(PIPE_FIX, 1);
         wait_intra_block(PIPE_FIX, 17);
         wait_intra_block(PIPE_FIX, 3);
@@ -299,14 +306,14 @@ __aicore__ inline void finish(__gm__ int64_t* args, int block) {
     TASSIGN(scales, ScaleBase);
 #if !defined(__CPU_SIM)
     // Both AIV receivers release their UB slots before the first C2V transfer.
-    if (args[8] > 0) {
+    if (args[kTokenCountArg] > 0) {
         set_intra_block(PIPE_V, 1);
         set_intra_block(PIPE_V, 3);
     }
 #endif
-    for (int begin = 0; begin < args[8]; begin += M) {
+    for (int begin = 0; begin < args[kTokenCountArg]; begin += M) {
         int row = begin + sub * Rows;
-        int rows = args[8] - row;
+        int rows = args[kTokenCountArg] - row;
         rows = rows < 0 ? 0 : (rows < Rows ? rows : Rows);
         if (rows > 0) {
             using Shape = TileShape2D<float, DYNAMIC, 32>;
@@ -362,6 +369,12 @@ __aicore__ inline void finish(__gm__ int64_t* args, int block) {
 #endif
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
+#ifdef PREFILL_INDEX_ROUTE
+    auto route = data<int32_t>(args, kRouteArg);
+    dcci((__gm__ void*)route, cache_line_t::SINGLE_CACHE_LINE);
+    if (*route == 0)
+        return;
+#endif
 #if !defined(__CPU_SIM) && !defined(__COSTMODEL)
     set_atomic_none();
 #if defined(__DAV_VEC__)
@@ -373,16 +386,16 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 #endif
 #if defined(__DAV_CUBE__)
     for (int block = get_block_idx(args); block < 16; block += get_block_num(args)) {
-        if ((args[8] + 127) / 128 * 128 <= (args[8] + 79) / 80 * 80 &&
-            reinterpret_cast<__gm__ Tensor*>(args[0])->shapes[0] >= (args[8] + 127) / 128 * 128)
+        if ((args[kTokenCountArg] + 127) / 128 * 128 <= (args[kTokenCountArg] + 79) / 80 * 80 &&
+            reinterpret_cast<__gm__ Tensor*>(args[0])->shapes[0] >= (args[kTokenCountArg] + 127) / 128 * 128)
             project<128>(args, block);
         else
             project<80>(args, block);
     }
 #else
     for (int block = get_block_idx(args); block < 16; block += get_block_num(args)) {
-        if ((args[8] + 127) / 128 * 128 <= (args[8] + 79) / 80 * 80 &&
-            reinterpret_cast<__gm__ Tensor*>(args[0])->shapes[0] >= (args[8] + 127) / 128 * 128)
+        if ((args[kTokenCountArg] + 127) / 128 * 128 <= (args[kTokenCountArg] + 79) / 80 * 80 &&
+            reinterpret_cast<__gm__ Tensor*>(args[0])->shapes[0] >= (args[kTokenCountArg] + 127) / 128 * 128)
             finish<128>(args, block);
         else
             finish<80>(args, block);

@@ -11,7 +11,7 @@
 from pathlib import Path
 from pypto.runtime import pto_isa_include_dir
 
-from gemm import gemm_bf16_to_bf16
+from gemm import _gemm_bf16_to_bf16, gemm_bf16_to_bf16
 
 import torch
 import torch.nn.functional as F
@@ -74,8 +74,8 @@ C1A_ALL_FIT, C1A_PAGED_PAIRED, C1A_PAGED_SINGLE, C1A_POOL_PAIRED, C1A_POOL_SINGL
 INDEX_SCORE_POSITIONS_DYN = pl.dynamic("INDEX_SCORE_POSITIONS_DYN")
 
 
-@pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "idx_q.cpp",
-               aiv_source=Path(__file__).parent / "kernels" / "idx_q.cpp", dual_aiv_dispatch=True,
+@pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "prefill_idx_q.cpp",
+               aiv_source=Path(__file__).parent / "kernels" / "prefill_idx_q.cpp", dual_aiv_dispatch=True,
                include_dirs=(pto_isa_include_dir(),))
 def _idx_q(
     payload: pl.Tensor,
@@ -86,6 +86,7 @@ def _idx_q(
     sin: pl.Tensor,
     output: pl.Out[pl.Tensor],
     output_scale: pl.Out[pl.Tensor],
+    route: pl.Tensor[[1], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor:
     """Project and quantize query heads with two C-to-V transfers per cube worker."""
@@ -101,6 +102,7 @@ def _project_index_query_packed(
     sine: pl.Tensor,
     query: pl.Tensor,
     query_scale: pl.Tensor,
+    route: pl.Tensor[[1], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Quantize the latent and project packed FP4 index queries."""
@@ -110,7 +112,10 @@ def _project_index_query_packed(
     scales = pl.create_tensor([1, padded_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
     with pl.spmd(16, name_hint="prefill_index_input_quant") as quantized:
         worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, padded_rows // 16 * (Q_LORA // 256), 16):
+        blocks = padded_rows // 16 * (Q_LORA // 256)
+        if pl.read(route, [0]) == 0:
+            blocks = pl.cast(0, pl.INDEX)
+        for block in pl.range(worker, blocks, 16):
             row = block // (Q_LORA // 256) * 16
             column = block % (Q_LORA // 256) * 256
             active = pl.max(0, pl.min(16, num_tokens - row))
@@ -131,7 +136,7 @@ def _project_index_query_packed(
     flat_scales = pl.reshape(scales, [padded_rows * (Q_LORA // 32)])
     with pl.spmd(8, name_hint="idx_q", deps=[quantized]) as projected:
         packed_result = _idx_q(
-            payload, weight, flat_scales, weight_scale, cosine_rows, sine_rows, query, output_scales, num_tokens,
+            payload, weight, flat_scales, weight_scale, cosine_rows, sine_rows, query, output_scales, route, num_tokens,
         )
     return projected
 
@@ -140,6 +145,7 @@ def _project_index_query_packed(
 def _index_query_carrier(
     packed_result: pl.Tensor,
     query: pl.Tensor,
+    route: pl.Tensor[[1], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     projected: pl.Scalar[pl.TASK_ID],
     ready: pl.Scalar[pl.TASK_ID],
@@ -148,7 +154,10 @@ def _index_query_carrier(
     with pl.spmd(16, name_hint="prefill_index_query_carrier", deps=[projected, ready]) as completed:
         worker = pl.tile.get_block_idx()
         lut = fp4_e4m3_lut()
-        for row in pl.range(worker, num_tokens, 16):
+        active_tokens = num_tokens
+        if pl.read(route, [0]) == 0:
+            active_tokens = pl.cast(0, pl.INT32)
+        for row in pl.range(worker, active_tokens, 16):
             packed_row = pl.tile.load(packed_result, [row, 0], [1, INDEX_QUERY_WIDTH // 2])
             signed_bytes = pl.reinterpret_view(packed_row, pl.INT8)
             byte_values = pl.ands(pl.cast(signed_bytes, pl.INT16), 255)
@@ -625,13 +634,17 @@ def _index_rope(
 def _scale_index_weights(
     projected_weights: pl.Tensor[[T_DYN, INDEX_H], pl.BF16],
     output: pl.Tensor[[T_DYN, INDEX_H], pl.BF16],
+    route: pl.Tensor[[1], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     scale_blocks = (num_tokens + M_TILE - 1) // M_TILE
     scale_workers = pl.max(pl.min(scale_blocks, 8), 1)
     with pl.spmd(scale_workers, name_hint="c1a_index_weights_scale") as weights_tid:
         worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, scale_blocks, scale_workers):
+        active_blocks = scale_blocks
+        if pl.read(route, [0]) == 0:
+            active_blocks = pl.cast(0, pl.INDEX)
+        for block in pl.range(worker, active_blocks, scale_workers):
             token = block * M_TILE
             rows = pl.min(M_TILE, num_tokens - token)
             projected = pl.slice(projected_weights, [M_TILE, INDEX_H], [token, 0], valid_shape=[rows, INDEX_H])
@@ -1567,9 +1580,9 @@ def _plan_c2a_score_route(
     count: pl.Scalar[pl.INT32],
     width: pl.Scalar[pl.INDEX],
     ready: pl.Scalar[pl.TASK_ID],
+    route: pl.Tensor[[1], pl.INT32],
 ):
     """Select no scoring, four-row scoring, or single-row scoring on device."""
-    route = pl.create_tensor([1], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_c2a_score_route", deps=[ready]) as planned:
         maximum_visible = pl.cast(0, pl.INT32)
         paired = pl.cast(width >= 256 and count % 4 == 0, pl.INT32)
@@ -1585,7 +1598,7 @@ def _plan_c2a_score_route(
             else:
                 mode = pl.cast(2, pl.INT32)
         pl.write(route, [0], mode)
-    return route, planned
+    return planned
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1711,7 +1724,7 @@ def prefill_indexer(
                 query_scale = pl.create_tensor([rows, INDEX_H * 4], dtype=pl.FP8E8M0)
                 weights = pl.create_tensor([rows, INDEX_H], dtype=pl.BF16)
                 chunk_ready = completion[0]
-                c1a_route = pl.create_tensor([1], dtype=pl.INT32)
+                score_route = pl.create_tensor([1], dtype=pl.INT32)
                 allow_native = pl.cast(
                     width <= 1024 and pl.tensor.dim(cache, 1) == 128
                     and pl.tensor.dim(table, 1) <= 8 and capacity * 8 >= width,
@@ -1721,13 +1734,17 @@ def prefill_indexer(
                     chunk_ready = _plan_c1a_score_route(
                         chunk_pool, chunk_counts, chunk_lengths, chunk_requests, table,
                         pl.tensor.dim(cache, 0), width, count, chunk_ready,
-                        allow_native, c1a_route, pool=pool,
+                        allow_native, score_route, pool=pool,
                     )
                 scoring = pl.array.create(1, pl.TASK_ID)
                 scoring[0] = chunk_ready
                 # C1A full still needs scores to produce its candidate pool.
                 # A bounded reindex pool only maps rows when every key fits.
                 if width > INDEX_TOPK or (not c2a and not pool):
+                    if c2a:
+                        chunk_ready = _plan_c2a_score_route(
+                            chunk_requests, chunk_lengths, count, width, chunk_ready, score_route,
+                        )
                     packed_query = pl.create_tensor([rows, INDEX_QUERY_WIDTH // 2], dtype=pl.UINT8)
                     raw_weights = pl.create_tensor([rows, INDEX_H], dtype=pl.BF16)
                     # Index-Q and Q-B consume MXFP8 from the same rounded BF16 latent.
@@ -1743,49 +1760,46 @@ def prefill_indexer(
                                             [begin * (Q_LORA // 32)])
                         with pl.spmd(8, name_hint="idx_q_reuse_mx") as projected:
                             projected_query = _idx_q(q_payload, query_weight, q_scales, query_weight_scale,
-                                                     chunk_cos, chunk_sin, packed_query, query_scale, count)
+                                                     chunk_cos, chunk_sin, packed_query, query_scale, score_route, count)
                         packed_done[0] = projected
                     else:
                         quantized_tid = _project_index_query_packed(
                             chunk_latent, query_weight, query_weight_scale, chunk_cos, chunk_sin,
-                            packed_query, query_scale, count,
+                            packed_query, query_scale, score_route, count,
                         )
                         packed_done[0] = quantized_tid
                     packed_tid = packed_done[0]
-                    gemm_bf16_to_bf16(chunk_x, weight_projection, raw_weights, count,
+                    _gemm_bf16_to_bf16(chunk_x, weight_projection, raw_weights, count,
                                       width=D, output_width=INDEX_H, n_tile=INDEX_H, k_tile=INDEX_PROJ_K_TILE,
-                                      workers=4, name_hint="prefill_index_weights")
-                    query_tid = _index_query_carrier(packed_query, query, count, packed_tid, chunk_ready)
-                    weights_tid = _scale_index_weights(raw_weights, weights, count)
+                                      workers=4, name_hint="prefill_index_weights", route=score_route, guarded=True)
+                    query_tid = _index_query_carrier(packed_query, query, score_route, count, packed_tid, chunk_ready)
+                    weights_tid = _scale_index_weights(raw_weights, weights, score_route, count)
                     prepared = pl.system.task_dummy(deps=[query_tid, weights_tid])
                     if c2a:
-                        route, route_ready = _plan_c2a_score_route(
-                            chunk_requests, chunk_lengths, count, width, prepared,
-                        )
                         paired_tid = _prefill_index_scores(
                             query, query_scale, weights, cache, cache_scale, table,
                             chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
-                            count, route_ready, tile_n=128, query_tile=4, pool=False, skip_short=True,
-                            head_rows=4 * INDEX_H, part_rows=64, route=route, required_mode=1,
+                            count, prepared, tile_n=128, query_tile=4, pool=False, skip_short=True,
+                            head_rows=4 * INDEX_H, part_rows=64, route=score_route, required_mode=1,
                         )
                         scoring[0] = _prefill_index_scores(
                             query, query_scale, weights, cache, cache_scale, table,
                             chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
                             count, paired_tid, tile_n=128, query_tile=1, pool=False, skip_short=True,
-                            head_rows=INDEX_H, part_rows=64, route=route, required_mode=2,
+                            head_rows=INDEX_H, part_rows=64, route=score_route, required_mode=2,
                         )
                     else:
                         paired_tid = _prefill_index_scores(
                             query, query_scale, weights, cache, cache_scale, table,
                             chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
                             count, prepared, tile_n=128, query_tile=4, pool=False, skip_short=False,
-                            head_rows=4 * INDEX_H, part_rows=128, route=c1a_route, required_mode=C1A_PAGED_PAIRED,
+                            head_rows=4 * INDEX_H, part_rows=128, route=score_route, required_mode=C1A_PAGED_PAIRED,
                         )
                         paged_tid = _prefill_index_scores(
                             query, query_scale, weights, cache, cache_scale, table,
                             chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
                             count, paired_tid, tile_n=128, query_tile=1, pool=False, skip_short=False,
-                            head_rows=INDEX_H, part_rows=128, route=c1a_route, required_mode=C1A_PAGED_SINGLE,
+                            head_rows=INDEX_H, part_rows=128, route=score_route, required_mode=C1A_PAGED_SINGLE,
                         )
                         scoring[0] = paged_tid
                         if pool:
@@ -1793,13 +1807,13 @@ def prefill_indexer(
                                 query, query_scale, weights, cache, cache_scale, table,
                                 chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
                                 count, paged_tid, tile_n=128, query_tile=4, pool=True, skip_short=False,
-                                head_rows=4 * INDEX_H, part_rows=8, route=c1a_route, required_mode=C1A_POOL_PAIRED,
+                                head_rows=4 * INDEX_H, part_rows=8, route=score_route, required_mode=C1A_POOL_PAIRED,
                             )
                             scoring[0] = _prefill_index_scores(
                                 query, query_scale, weights, cache, cache_scale, table,
                                 chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
                                 count, pooled_tid, tile_n=128, query_tile=1, pool=True, skip_short=False,
-                                head_rows=INDEX_H, part_rows=8, route=c1a_route, required_mode=C1A_POOL_SINGLE,
+                                head_rows=INDEX_H, part_rows=8, route=score_route, required_mode=C1A_POOL_SINGLE,
                             )
                         if allow_native != 0:
                             packed_scores = pl.create_tensor([rows, (width + 255) // 256 * 256], dtype=pl.BF16)
@@ -1808,7 +1822,7 @@ def prefill_indexer(
                             metadata = pl.create_tensor([33, 2], dtype=pl.INT32)
                             metadata_ready = _group_prefill_index_queries(
                                 chunk_requests, table, score_requests, score_pages, metadata,
-                                count, c1a_route, chunk_ready,
+                                count, score_route, chunk_ready,
                             )
                             score_active = pl.cast(count, pl.INT64)
                             with pl.spmd(PREFILL_SCORE_WORKERS, name_hint="qli_score", deps=[prepared, metadata_ready]) as native_tid:
@@ -1818,7 +1832,7 @@ def prefill_indexer(
                                 )
                             native_selected = _select_short_c1a_topk(
                                 packed_scores, chunk_lengths, chunk_requests, table, chunk_output,
-                                count, native_tid, c1a_route, bf16_scores=True,
+                                count, native_tid, score_route, bf16_scores=True,
                             )
                             scoring[0] = pl.system.task_dummy(deps=[scoring[0], native_selected])
                 score_ready = scoring[0]
@@ -1831,19 +1845,19 @@ def prefill_indexer(
                 elif not pool and width <= 1024 and pl.tensor.dim(cache, 1) == 128:
                     selection[0] = _select_short_c1a_topk(
                         chunk_scores, chunk_lengths, chunk_requests, table, chunk_output,
-                        count, score_ready, c1a_route, bf16_scores=False,
+                        count, score_ready, score_route, bf16_scores=False,
                     )
                 else:
                     topk_tid = _select_c1a_topk(
                         chunk_scores, chunk_lengths, chunk_requests, table,
-                        chunk_pool, chunk_counts, chunk_output, count, score_ready, c1a_route, pool=pool,
+                        chunk_pool, chunk_counts, chunk_output, count, score_ready, score_route, pool=pool,
                     )
                     selection[0] = topk_tid
                     if pool:
                         selection[0] = _select_all_pool_rows(
                             chunk_pool, chunk_counts, chunk_lengths, chunk_requests, table,
                             pl.tensor.dim(cache, 0), pl.tensor.dim(cache, 1), chunk_output, count,
-                            topk_tid, c1a_route,
+                            topk_tid, score_route,
                         )
                 topk_ready = selection[0]
                 completion[0] = topk_ready

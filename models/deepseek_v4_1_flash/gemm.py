@@ -146,6 +146,44 @@ def gemm_bf16_via_mxfp8_to_bf16_staged(
 
 
 @pl.jit.inline(auto_scope=False)
+def _gemm_bf16_to_bf16(
+    source: pl.Tensor,
+    weight: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    width: pl.constexpr,
+    output_width: pl.constexpr,
+    n_tile: pl.constexpr,
+    k_tile: pl.constexpr,
+    workers: pl.constexpr,
+    name_hint: pl.constexpr,
+    route: pl.Tensor,
+    guarded: pl.constexpr,
+):
+    """Project ND activations with NZ weights and store BF16 through Fixpipe."""
+    blocks = (num_tokens + 16 - 1) // 16 * (output_width // n_tile)
+    task_workers = pl.max(pl.min(blocks, workers), 1)
+    with pl.spmd(task_workers, name_hint=name_hint):
+        worker = pl.tile.get_block_idx()
+        active_blocks = blocks
+        if guarded:
+            if pl.read(route, [0]) == 0:
+                active_blocks = pl.cast(0, pl.INDEX)
+        for block in pl.range(worker, active_blocks, task_workers):
+            row = block // (output_width // n_tile) * 16
+            col = block % (output_width // n_tile) * n_tile
+            rows = pl.min(16, num_tokens - row)
+            acc = pl.tile.create([16, n_tile], dtype=pl.FP32)
+            for k in pl.range(0, width, k_tile):
+                a = pl.load(source, [row, k], [16, k_tile], valid_shape=[rows, k_tile])
+                w = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
+                acc = pl.matmul_acc(acc, a, w, init_cond=(k == 0))
+            value = pl.set_validshape(acc, rows, n_tile)
+            output = pl.store(value, [row, col], output)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
 def gemm_bf16_to_bf16(
     source: pl.Tensor,
     weight: pl.Tensor,
@@ -159,22 +197,10 @@ def gemm_bf16_to_bf16(
     name_hint: pl.constexpr,
 ):
     """Project ND activations with NZ weights and store BF16 through Fixpipe."""
-    blocks = (num_tokens + 16 - 1) // 16 * (output_width // n_tile)
-    task_workers = pl.max(pl.min(blocks, workers), 1)
-    with pl.spmd(task_workers, name_hint=name_hint):
-        worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, blocks, task_workers):
-            row = block // (output_width // n_tile) * 16
-            col = block % (output_width // n_tile) * n_tile
-            rows = pl.min(16, num_tokens - row)
-            acc = pl.tile.create([16, n_tile], dtype=pl.FP32)
-            for k in pl.range(0, width, k_tile):
-                a = pl.load(source, [row, k], [16, k_tile], valid_shape=[rows, k_tile])
-                w = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
-                acc = pl.matmul_acc(acc, a, w, init_cond=(k == 0))
-            value = pl.set_validshape(acc, rows, n_tile)
-            output = pl.store(value, [row, col], output)
-    return output
+    return _gemm_bf16_to_bf16(
+        source, weight, output, num_tokens, width, output_width, n_tile, k_tile,
+        workers, name_hint, route=source, guarded=False,
+    )
 
 
 def golden_mxfp8_linear_grouped_sum(
