@@ -49,7 +49,7 @@ from config import FLASH as M, EP_SIZE, MOE_TOKENS, MOE_RECV_MAX, T_DYN
 from gate import gate, route_tokens
 from expert_shared import SWIGLU_WORKER_TILE, W13_WORKER_TILE, W2_WORKER_TILE, expert_shared
 from mega_moe import (
-    FP4_PANEL_ROWS, _resident_down_weight, _resident_gate_up_half,
+    FP4_PANEL_ROWS, forward_routed_weight_spec,
     specialize_mega_moe, use_packed_decode_weights, workspace_bytes,
 )
 from expert_routed import (
@@ -646,21 +646,24 @@ def build_moe_specs(num_tokens=MOE_TOKENS, *, initialize=True):
         value = values.get(name)
         init = None if value is None else partial(torch.clone, value)
         resident = None if name in nonresident else "stacked"
-        pack = None
-        if PACK_ROUTED_WEIGHTS and name in ("routed_w1", "routed_w3"):
-            pack = partial(_resident_gate_up_half, half=int(name == "routed_w3"))
-        elif PACK_ROUTED_WEIGHTS and name == "routed_w2":
-            pack = _resident_down_weight
         shape = shapes[name]
-        upload_shape = [*shape[:-2], shape[-2] // PANEL_ROWS, WEIGHT_PANEL_BYTES] if pack else None
-        specs.append(TensorSpec(name, shape, dtype, init_value=init, resident=resident,
-                                pack_for_upload=pack, upload_shape=upload_shape))
+        if name.startswith(("routed_", "shared_")):
+            if PACK_ROUTED_WEIGHTS and name in ("routed_w1", "routed_w2", "routed_w3"):
+                shape = [*shape[:-2], shape[-2] // PANEL_ROWS, WEIGHT_PANEL_BYTES]
+            spec = forward_routed_weight_spec(name, shape, dtype, init, PACK_ROUTED_WEIGHTS,
+                                              local_experts=N_LOCAL_EXPERTS)
+            spec.resident = resident
+            specs.append(spec)
+        else:
+            specs.append(TensorSpec(name, shape, dtype, init_value=init, resident=resident))
     return specs
 
 
 def golden_moe(tensors):
     """Compose the validated HC references around the MoE reference."""
     import torch
+    from mega_moe import golden_weight_views
+    tensors = golden_weight_views(tensors)
     from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_norm, golden_hc_post
     from gate import golden_gate_normalized_core
     from expert_shared import golden_expert_shared

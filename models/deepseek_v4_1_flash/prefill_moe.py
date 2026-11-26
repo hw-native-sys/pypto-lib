@@ -45,7 +45,7 @@ from config import FLASH as M
 from config import EP_SIZE, SUPPORTED_EP_SIZES
 from config import MOE_TOKENS, MOE_RECV_MAX, LOCAL_T_DYN, ROUTE_T_DYN
 from config import T_DYN
-from mega_moe import specialize_mega_moe, workspace_bytes
+from mega_moe import forward_routed_weight_spec, specialize_mega_moe, workspace_bytes
 from gate import gate, route_tokens, gather_routing_bias, prepare_routing_bias
 from expert_shared import SWIGLU_WORKER_TILE, W13_WORKER_TILE, W2_WORKER_TILE, expert_shared
 
@@ -989,6 +989,10 @@ def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
     for spec in specs:
         if spec.name not in {"x", "output", "num_tokens", "moe_epoch"}:
             spec.resident = "stacked"
+    for index, spec in enumerate(specs):
+        if spec.name.startswith(("routed_w", "shared_w")):
+            specs[index] = forward_routed_weight_spec(spec.name, spec.shape, spec.dtype, spec.init_value, False,
+                                                       local_experts=N_LOCAL_EXPERTS)
     return specs
 
 
@@ -1124,6 +1128,8 @@ def golden_moe_slabs(tensors):
 def _golden_moe_core(tensors):
     import torch
 
+    from mega_moe import golden_weight_views
+    tensors = golden_weight_views(tensors)
     from gate import golden_gate_normalized_core
     from expert_shared import golden_expert_shared
     from expert_routed import golden_expert_routed
