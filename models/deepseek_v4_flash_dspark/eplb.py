@@ -420,7 +420,10 @@ def _routing_placement(physical, logical_experts, ranks, bank_layers):
 
     mapping = torch.empty((bank_layers, physical), dtype=torch.int32)
     for bank in range(bank_layers):
-        mapping[bank] = torch.roll(torch.arange(physical) % logical_experts, shifts=bank + 1)
+        # Global bank row: bank * E + logical expert, with a per-bank rotation
+        # so the two banks place the same expert on different ranks.
+        mapping[bank] = (bank * logical_experts
+                         + torch.roll(torch.arange(physical) % logical_experts, shifts=bank + 1))
     return mapping.reshape(-1)
 
 

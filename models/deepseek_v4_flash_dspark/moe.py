@@ -1732,12 +1732,12 @@ def prefill_moe_tile(
     expert_tids = pl.array.create(N_LOCAL, pl.TASK_ID)
     # Routing takes an INT32 row marker, never the INT64 token IDs. The wave's
     # num_tokens already excludes CP padding, so every in-range row is valid.
-    route_rows = pl.create_tensor([PREFILL_MOE_T_TILE], dtype=pl.INT32)
+    route_rows = pl.create_tensor([1, PREFILL_MOE_T_TILE], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_route_rows"):
         route_ones = pl.tile.full([1, PREFILL_MOE_T_TILE], dtype=pl.INT32, value=1)
         pl.tile.store(route_ones, [0, 0], route_rows)
     physical_indices = prefill_route_eplb(
-        indices, eplb_mapping, eplb_replicas, route_rows, eplb_control,
+        indices, eplb_mapping, eplb_replicas, pl.reshape(route_rows, [PREFILL_MOE_T_TILE]), eplb_control,
         layer_id, num_tokens, my_rank,
     )
     with pl.scope():
@@ -2065,6 +2065,12 @@ def moe_test(
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     # final output
     x_next: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
+    # EPLB placement: per-rank placement table, replica counts, load history,
+    # and [route epoch, publish-enable] control.
+    eplb_mapping: pl.Tensor[[EPLB_BANK_ROWS, N_RANKS], pl.INT32],
+    eplb_replicas: pl.Tensor[[EPLB_BANK_ROWS], pl.INT32],
+    eplb_load: pl.Tensor[[EPLB_LAYERS, META_SLOTS], pl.INT32],
+    eplb_control: pl.Tensor[[2], pl.INT32],
     # windows
     recv_meta: pld.DistributedTensor[[N_RANKS, META_SLOTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
@@ -2082,11 +2088,17 @@ def moe_test(
     moe_epoch: pl.Scalar[pl.INT32],
     finalize_moe: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
-    eplb_mapping = pl.create_tensor([EPLB_BANK_ROWS, N_RANKS], dtype=pl.INT32)
-    eplb_replicas = pl.create_tensor([EPLB_BANK_ROWS], dtype=pl.INT32)
+    # Routing takes an independent INT32 validity marker; the active prefix is
+    # every row below num_tokens.
     eplb_source_rows = pl.create_tensor([T], dtype=pl.INT32)
-    eplb_load = pl.create_tensor([EPLB_LAYERS, META_SLOTS], dtype=pl.INT32)
-    eplb_control = pl.create_tensor([2], dtype=pl.INT32)
+    for block in pl.spmd((T + 15) // 16, name_hint="moe_test_valid_rows"):
+        for offset in pl.range(16):
+            row = block * 16 + offset
+            if row < T:
+                marker = pl.cast(-1, pl.INT32)
+                if row < num_tokens:
+                    marker = pl.cast(1, pl.INT32)
+                pl.write(eplb_source_rows, [row], marker)
     moe(
         x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias, tid2eid, input_ids,
@@ -2135,6 +2147,10 @@ def l3_moe(
     shared_w2: pl.Tensor[[N_RANKS, D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
     x_next: pl.Out[pl.Tensor[[MOE_ROUNDS, N_RANKS, T, HC_MULT, D], pl.FP32]],
+    eplb_mapping: pl.Tensor[[N_RANKS, EPLB_BANK_ROWS, N_RANKS], pl.INT32],
+    eplb_replicas: pl.Tensor[[N_RANKS, EPLB_BANK_ROWS], pl.INT32],
+    eplb_load: pl.InOut[pl.Tensor[[N_RANKS, EPLB_LAYERS, META_SLOTS], pl.INT32]],
+    eplb_control: pl.Tensor[[N_RANKS, 2], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
@@ -2167,6 +2183,7 @@ def l3_moe(
                 shared_w1[r], shared_w1_scale[r], shared_w3[r], shared_w3_scale[r],
                 shared_w2[r], shared_w2_scale[r],
                 x_next[round_id, r],
+                eplb_mapping[r], eplb_replicas[r], eplb_load[r], eplb_control[r],
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
                 layer_id, num_tokens, r, moe_epoch, finalize_moe,
@@ -2240,13 +2257,42 @@ def _golden_moe_single(tensors):
         all_scale.append(src_x_norm_scale)
         all_weights.append(src_weights)
 
-    # Route counts per (src, dst, local expert); drives the per-source lane cumsum.
+    # EPLB routing: a logical expert reaches a physical slot through the
+    # placement table, with the same seed the device uses. The identity path
+    # keeps the logical id as the physical slot.
+    eplb_on = EPLB_ENABLED and "eplb_mapping" in tensors
+    layer_bank = int(tensors["layer_id"]) % EPLB_LAYERS
+    epoch = int(tensors["eplb_control"][0, 0].item()) if eplb_on else 0
+
+    def physical_route(src, t, k, eid):
+        if not eplb_on:
+            return eid
+        row = layer_bank * N_EXPERTS_GLOBAL + eid
+        count = int(tensors["eplb_replicas"][src, row].item())
+        replica = (t + src * T + k + epoch) % count
+        return int(tensors["eplb_mapping"][src, row, replica].item())
+
+    all_physical = []
+    for src in range(N_RANKS):
+        physical = torch.zeros(T, TOPK, dtype=torch.int32)
+        for t in range(num_tokens):
+            for k in range(TOPK):
+                physical[t, k] = physical_route(src, t, k, int(all_indices[src][t, k].item()))
+        all_physical.append(physical)
+
+    # Route counts per (src, dst, physical slot); drives the per-source lane cumsum.
     send_counts = torch.zeros(N_RANKS, N_RANKS, N_LOCAL, dtype=torch.int32)
     for src in range(N_RANKS):
         for t in range(num_tokens):
             for k in range(TOPK):
-                eid = int(all_indices[src][t, k].item())
-                send_counts[src, eid // N_LOCAL, eid % N_LOCAL] += 1
+                slot = int(all_physical[src][t, k].item())
+                send_counts[src, slot // N_LOCAL, slot % N_LOCAL] += 1
+    if eplb_on:
+        load = torch.zeros(N_RANKS, EPLB_LAYERS, META_SLOTS, dtype=torch.int32)
+        for dst in range(N_RANKS):
+            for loc_e in range(N_LOCAL):
+                load[dst, layer_bank, loc_e] = int(send_counts[:, dst, loc_e].sum().item())
+        tensors["eplb_load"][:] = load
 
     # Stages 4-5: dispatch replay + routed expert per dst. Also rank-independent
     # (each recv row's SwiGLU output depends only on that row), so compute once.
@@ -2269,10 +2315,10 @@ def _golden_moe_single(tensors):
             cursor = torch.zeros(N_LOCAL, dtype=torch.int32)
             for t in range(num_tokens):
                 for k in range(TOPK):
-                    eid = int(all_indices[src][t, k].item())
-                    if eid // N_LOCAL != dst:
+                    slot = int(all_physical[src][t, k].item())
+                    if slot // N_LOCAL != dst:
                         continue
-                    loc_e = eid % N_LOCAL
+                    loc_e = slot % N_LOCAL
                     slot = int(d_slot_offsets[src, loc_e].item() + cursor[loc_e].item())
                     cursor[loc_e] += 1
                     d_recv_x[loc_e, slot, :] = all_x_i8[src][t, :]
@@ -2321,9 +2367,9 @@ def _golden_moe_single(tensors):
         my_routes = []
         for t in range(num_tokens):
             for k in range(TOPK):
-                eid = int(all_indices[r][t, k].item())
-                dst = eid // N_LOCAL
-                loc_e = eid % N_LOCAL
+                slot = int(all_physical[r][t, k].item())
+                dst = slot // N_LOCAL
+                loc_e = slot % N_LOCAL
                 my_routes.append((t, k, dst, loc_e))
 
         # Rank r's contribution to dst sits at slot offset
@@ -2583,6 +2629,35 @@ def _build_tensor_specs(layer_id, num_tokens, routing, fixture_rounds):
         x_hc_shape = [rounds, *x_hc_shape]
         input_ids_shape = [rounds, *input_ids_shape]
 
+    # EPLB fixtures: a non-identity placement with redundant slots, distinct per
+    # bank, plus the per-call route epoch that feeds replica selection. The
+    # identity path ignores them.
+    physical_slots = N_LOCAL * N_RANKS
+    if physical_slots < N_EXPERTS_GLOBAL:
+        raise ValueError("EPLB routing validation needs at least one slot per logical expert")
+    placement = torch.zeros(EPLB_LAYERS, N_EXPERTS_GLOBAL, N_RANKS, dtype=torch.int32)
+    replica_counts = torch.zeros(EPLB_LAYERS, N_EXPERTS_GLOBAL, dtype=torch.int32)
+    for bank in range(EPLB_LAYERS):
+        face = (torch.arange(physical_slots) + bank) % N_EXPERTS_GLOBAL
+        for expert in range(N_EXPERTS_GLOBAL):
+            slots = torch.nonzero(face == expert).flatten()
+            placement[bank, expert, :slots.numel()] = slots
+            replica_counts[bank, expert] = slots.numel()
+    placement = placement.reshape(EPLB_LAYERS * N_EXPERTS_GLOBAL, N_RANKS)
+    replica_counts = replica_counts.reshape(-1)
+
+    def init_eplb_mapping():
+        return placement.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
+
+    def init_eplb_replicas():
+        return replica_counts.unsqueeze(0).expand(N_RANKS, -1).contiguous()
+
+    def init_eplb_control():
+        control = torch.zeros(N_RANKS, 2, dtype=torch.int32)
+        control[:, 0] = 1  # route epoch
+        control[:, 1] = 1  # publish per-slot loads
+        return control
+
     specs = [
         TensorSpec("x_hc", x_hc_shape, torch.float32, init_value=init_x_hc),
         TensorSpec("hc_ffn_fn",     [N_RANKS, MIX_HC, HC_DIM],       torch.float32,  init_value=init_hc_ffn_fn),
@@ -2606,6 +2681,11 @@ def _build_tensor_specs(layer_id, num_tokens, routing, fixture_rounds):
         TensorSpec("shared_w2",        [N_RANKS, D, MOE_INTER],          torch.int8,    init_value=lambda: _shared_weights()["shared_w2"]),
         TensorSpec("shared_w2_scale",  [N_RANKS, D],                     torch.float32, init_value=lambda: _shared_weights()["shared_w2_scale"]),
         TensorSpec("x_next", x_hc_shape, torch.float32),
+        TensorSpec("eplb_mapping", [N_RANKS, EPLB_BANK_ROWS, N_RANKS], torch.int32, init_value=init_eplb_mapping),
+        TensorSpec("eplb_replicas", [N_RANKS, EPLB_BANK_ROWS], torch.int32, init_value=init_eplb_replicas),
+        TensorSpec("eplb_load", [N_RANKS, EPLB_LAYERS, META_SLOTS], torch.int32,
+                   init_value=lambda: torch.zeros(N_RANKS, EPLB_LAYERS, META_SLOTS, dtype=torch.int32)),
+        TensorSpec("eplb_control", [N_RANKS, 2], torch.int32, init_value=init_eplb_control),
         ScalarSpec("layer_id",         torch.int32,                      layer_id),
         ScalarSpec("num_tokens",       torch.int32,                      num_tokens),
     ]

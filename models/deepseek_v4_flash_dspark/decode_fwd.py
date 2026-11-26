@@ -548,16 +548,22 @@ def _decode_fwd(
     # names the rows to sample, not the rows that hold real tokens. Plain decode
     # keeps the active owner prefix; the fused DSpark target marks exactly the
     # active draft offsets in its prepared logit rows.
-    moe_valid_rows = pl.create_tensor([MOE_TOKENS], dtype=pl.INT32)
-    for valid_row in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_moe_valid_rows"):
-        marker = pl.cast(-1, pl.INT32)
-        if valid_rows_from_logits:
-            if valid_row < owner_tokens and pl.read(logit_row_indices, [valid_row]) >= 0:
-                marker = pl.cast(1, pl.INT32)
-        else:
+    # Build the marker through one UB tile: scalar writes from several blocks
+    # would share 64-byte lines and silently drop each other's rows.
+    moe_valid_rows = pl.create_tensor([1, MOE_TOKENS], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_fwd_moe_valid_rows"):
+        valid_rows_tile = pl.tile.full([1, MOE_TOKENS], dtype=pl.INT32, value=-1)
+        for valid_row in pl.range(MOE_TOKENS):
+            marker = pl.cast(-1, pl.INT32)
             if valid_row < owner_tokens:
-                marker = pl.cast(1, pl.INT32)
-        pl.write(moe_valid_rows, [valid_row], marker)
+                if valid_rows_from_logits:
+                    if pl.read(logit_row_indices, [valid_row]) >= 0:
+                        marker = pl.cast(1, pl.INT32)
+                else:
+                    marker = pl.cast(1, pl.INT32)
+            pl.tile.write(valid_rows_tile, [0, valid_row], marker)
+        pl.tile.store(valid_rows_tile, [0, 0], moe_valid_rows)
+    moe_valid_rows_flat = pl.reshape(moe_valid_rows, [MOE_TOKENS])
 
     raw_blocks_per_layer = pl.tensor.dim(raw_kv_pool, 0) // MAIN_LAYER_COUNT
     csa_state_blocks_per_layer = pl.tensor.dim(csa_compress_state, 0) // CSA_LAYER_COUNT
@@ -653,7 +659,7 @@ def _decode_fwd(
                 x_pong,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
-                eplb_mapping, eplb_replicas, moe_valid_rows, eplb_load, eplb_control,
+                eplb_mapping, eplb_replicas, moe_valid_rows_flat, eplb_load, eplb_control,
                 pl.const(0, pl.INT32), owner_tokens, my_rank, pl.const(1, pl.INT32), owner_tokens,
             )
 
@@ -743,7 +749,7 @@ def _decode_fwd(
                 x_ping,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
-                eplb_mapping, eplb_replicas, moe_valid_rows, eplb_load, eplb_control,
+                eplb_mapping, eplb_replicas, moe_valid_rows_flat, eplb_load, eplb_control,
                 pl.const(1, pl.INT32), owner_tokens, my_rank, pl.const(2, pl.INT32), owner_tokens,
             )
 
@@ -885,7 +891,7 @@ def _decode_fwd(
                     x_pong,
                     recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                     routed_y_buf, combine_arrived,
-                    eplb_mapping, eplb_replicas, moe_valid_rows, eplb_load, eplb_control,
+                    eplb_mapping, eplb_replicas, moe_valid_rows_flat, eplb_load, eplb_control,
                     csa_model_layer, owner_tokens, my_rank, csa_model_layer + 1, owner_tokens,
                 )
 
@@ -994,7 +1000,7 @@ def _decode_fwd(
                     x_ping,
                     recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                     routed_y_buf, combine_arrived,
-                    eplb_mapping, eplb_replicas, moe_valid_rows, eplb_load, eplb_control,
+                    eplb_mapping, eplb_replicas, moe_valid_rows_flat, eplb_load, eplb_control,
                     hca_model_layer, owner_tokens, my_rank, hca_model_layer + 1, owner_tokens,
                 )
 
@@ -1137,7 +1143,7 @@ def _decode_fwd(
                 pre_hc_hidden_out,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
-                eplb_mapping, eplb_replicas, moe_valid_rows, eplb_load, eplb_control,
+                eplb_mapping, eplb_replicas, moe_valid_rows_flat, eplb_load, eplb_control,
                 model_layer_last, owner_tokens, my_rank, pl.const(43, pl.INT32), owner_tokens,
             )
 
@@ -1737,6 +1743,7 @@ def l3_decode_fwd_eplb(
             group_base, tp_rank, rank, False,
             device=rank,
         )
+    return x_out, logits, sampled_ids, dspark_target_hidden
 
 
 

@@ -1754,6 +1754,7 @@ def l3_prefill_fwd_eplb(
             r,
             device=r,
         )
+    return x_out, logits, sampled_ids, dspark_target_hidden
 
 
 

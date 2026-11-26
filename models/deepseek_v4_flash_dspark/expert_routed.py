@@ -556,8 +556,11 @@ def golden_expert_routed(tensors):
     w3 = dequant_w(tensors["routed_w3"], tensors["routed_w3_scale"].float())
     w2 = dequant_w(tensors["routed_w2"], tensors["routed_w2_scale"].float())
 
-    recv_y = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, D)
-    for e in range(N_LOCAL_EXPERTS):
+    # Derive the expert/row geometry from the inputs: one caller (the MoE
+    # integration test) runs a physical slot count that differs from this
+    # module's logical default.
+    recv_y = torch.zeros(recv_x_i8.shape[0], recv_x_i8.shape[1], w2.shape[1])
+    for e in range(recv_x_i8.shape[0]):
         n_rows = int(recv_expert_count[e, 0].item())
         if n_rows == 0:
             continue
