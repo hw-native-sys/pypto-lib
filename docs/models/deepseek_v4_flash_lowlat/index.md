@@ -1,9 +1,10 @@
-# DeepSeek V4-Flash low-latency decode
+# DeepSeek V4-Flash low-latency prefill and decode
 
-This model directory provides the batch-one decode path with two physical TP
-ranks by default. The verification width remains eight tokens, and the eight
-attention projection groups are assigned four per rank. It is an experimental
-decode implementation, not a `pypto-serving` deployment contract.
+This directory provides experimental batch-one decode and chunked prefill.
+The standalone decode path defaults to two physical TP ranks, each owning four
+of the eight attention projection groups. The 43-layer prefill program uses CP8
+attention and TP8 MoE and vocabulary projections. See [batch-one DSpark request
+serving](#batch-one-dspark-request-serving) for the shared-cache handoff.
 
 ## Context capacity
 

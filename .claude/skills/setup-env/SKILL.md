@@ -22,8 +22,9 @@ this skill.
      roots;
    - for a device target, check whether CANN is configured and whether the
      user has an allocated device.
-2. Do not infer the target from CPU architecture. Architecture selects the
-   PTOAS asset; `-p` selects simulator versus device.
+2. Select the PTOAS asset for the host CPU architecture. On the smoke-test CLI,
+   `-p a2a3` or `-p a5` selects the chip family. Add `--sim` for simulation
+   or `-d <allocated-device>` for device execution.
 3. Reuse a user-selected PyPTO checkout when one is provided. Otherwise place
    a new checkout in a scoped sibling directory after obtaining any required
    network approval. Never overwrite or delete an existing checkout.
@@ -32,16 +33,16 @@ this skill.
    - initialize PyPTO submodules;
    - take `PTOAS_VERSION` from that revision's `toolchain/versions.env`, never
      from a log or a previous session;
-   - install PyPTO, then unpack that PTOAS release under `PTOAS_ROOT`;
+   - install PyPTO, then point `PTOAS_ROOT` at that release's unpacked
+     standalone distribution or a dedicated venv containing its matching wheel;
    - leave PTO ISA alone — simpler clones and pins the one managed checkout
      on first use, and `PTO_ISA_ROOT` cannot redirect it.
 5. For a device environment, source the selected CANN `set_env.sh` and run
-   `npu-smi info` before installing simpler. Simpler detects `ccec` and the
-   cross-compiler during installation and only prebuilds the platforms whose
-   toolchains are active.
-6. Install PyPTO's pinned `runtime/` submodule after the requested simulator or
-   device toolchain is active. Confirm that the requested platform binaries
-   were built.
+   `npu-smi info` before installing simpler.
+6. Install PyPTO's pinned `runtime/` submodule with the installation guide's
+   `build_package_${RUNTIME_PLATFORM}` target. Select `a2a3sim` or `a5sim`
+   for simulation and `a2a3` or `a5` for a device. Verify the selected
+   platform binaries were built.
 7. Keep installs inside the active environment and user-writable directories.
    Do not use `sudo`, modify CANN, or install into a system directory unless
    the user explicitly requests and authorizes it.
@@ -50,8 +51,8 @@ this skill.
    - `import pypto`, `import torch`, and imports from `golden`;
    - `<root>/ptoas`, `<root>/ptoas.sh`, or `<root>/bin/ptoas` under `PTOAS_ROOT`
      answers `--version` — probe in that order, as pypto's
-     `backend/_ptoas_locate.py` does, because a v0.55+ release runs only
-     through its own `ptoas.sh`;
+     `backend/_ptoas_locate.py` does. The standalone bundle can use
+     `ptoas.sh` to select its interpreter. A wheel venv provides `bin/ptoas`;
    - the simpler submodule revision belongs to the selected PyPTO checkout;
    - the commit at the checkout `pypto.runtime.ensure_pto_isa_root()` returns
      matches the full hash in `runtime/pto_isa.pin`;

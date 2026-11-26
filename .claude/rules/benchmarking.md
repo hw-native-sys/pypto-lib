@@ -59,8 +59,11 @@ none of which is the thing being measured. Do not pay for them twice.
    directory.
 5. **Cut rounds while iterating; restore them for the number you report.** 100
    rounds is ~0.1 s of device time for a decode step but minutes for a long
-   prefill or a multi-card run. Compare matching rounds and warmup. Daily CI
-   uses the counts in `.github/scripts/perf_cases.json`.
+   prefill or a multi-card run. Any two numbers being compared must come from
+   the same rounds and warmup. The local harness defaults to 100 measured
+   rounds and 5 warmups. To reproduce Daily CI, use the sampling settings
+   from the [case manifest](../../.github/scripts/perf_cases.json) at the
+   revision being compared (currently 100 measured rounds and 10 warmups).
 6. **Keep the baseline's build and data until the comparison is reported.**
    Re-measuring a baseline you already measured is the same waste as re-running
    a variant.
@@ -105,8 +108,10 @@ Keep it honest:
 
 - A persistent gap between ranks that is **not** start skew is a load-balance
   problem. It belongs in the report, not in the discarded wait.
-- Fastest-rank is not end-to-end step latency, and the dashboard number is the
-  headline max. State which convention a number used, and compare like for like.
+- Daily CI sums each rank's dispatch times within each round, takes the
+  median across rounds for each rank, and publishes the lowest of those
+  medians. Label the local headline separately when reporting the slowest
+  rank per round.
 - Warmup discards leading launches; it does not remove per-round start skew.
 
 ## Reporting a Result

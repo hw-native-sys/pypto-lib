@@ -22,6 +22,11 @@ def demand(task):
     return blocks * int(kernels[0] >= 0), blocks * sum(k >= 0 for k in kernels[1:])
 
 
+def wait_edges(deps):
+    """Select ordering edges including the plain edges in host and legacy captures."""
+    return [edge for edge in deps["edges"] if "wait" in edge.get("flags", ("wait",))]
+
+
 def expand_waves(deps, stats):
     """Retain original task IDs as completion nodes; redirect incoming edges."""
     info = {str(t["task_id"]): dict(t) for t in deps["tasks"]}
@@ -67,7 +72,7 @@ def expand_waves(deps, stats):
                 "worker_max_us": old["max_us"],
             }
         )
-    edges = {(str(e["pred"]), first.get(str(e["succ"]), str(e["succ"]))) for e in deps["edges"]}
+    edges = {(str(e["pred"]), first.get(str(e["succ"]), str(e["succ"]))) for e in wait_edges(deps)}
     edges.update(extra_edges)
     return info, stats, sorted(edges), expansions
 

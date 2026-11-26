@@ -177,6 +177,13 @@ can make that storage reusable before its consumers finish. Check the actual
 runtime's lifetime rules and `creator` edges; an arbitrary transitive execution
 path or a missing creator edge alone does not prove when storage was reclaimed.
 
+In a device-orchestrated `deps.json`, `edges[].flags` records the constructed
+dependency before runtime transitive reduction. Follow edges containing `wait`
+to check execution order. A `retain` flag keeps the producer's storage or slot
+alive. A record carrying only `retain`, or an empty flag list, contributes no
+ordering edge. Host-built graphs and older captures omit `flags` and record
+ordinary predecessor edges without a separate lifetime annotation.
+
 A concrete example is the DSpark HCA Prefill path in
 [`prefill_sparse_attn.py`](../../models/deepseek_v4_flash_dspark/prefill_sparse_attn.py):
 `_hca_streaming_attn_tile()` and its `_sparse_attn_o_proj()` helper changed from
@@ -488,8 +495,10 @@ with pl.spmd(token_tiles, name_hint="rms_norm", allow_early_resolve=True) as rms
 
 Four conditions decide whether it does anything:
 
-1. **Every** direct producer of the consumer must be flagged or already
-   complete. Flagging one producer of a three-producer consumer buys nothing.
+1. In the tensor-map runtime, **every direct compute producer still in the
+   consumer's wait fan-in** must opt in with `allow_early_resolve=True`.
+   A completed producer still in that set is checked. A producer already
+   consumed before the runtime claims the dependency is skipped.
    This is why the hint tends to be applied along a whole chain, as in
    `models/qwen3_14b/decode_fwd.py`.
 2. A producer propagates eligibility only once **fully published** —
@@ -509,7 +518,7 @@ carries the producer-side flag — a statement about that task's consumers, not
 about the task itself. Two things must hold together:
 
 ```text
-structural:  every direct producer is an allocation source or has early_dispatch=true,
+structural:  every direct ordering predecessor is an allocation source or has early_dispatch=true,
              and at least one is a non-allocation task
 temporal:    block.dispatch_time_us + tol < max(producer finish_time_us)
              where tol = 2 * 1e6 / metadata.clock_freq_hz   (two clock ticks)
@@ -517,9 +526,10 @@ temporal:    block.dispatch_time_us + tol < max(producer finish_time_us)
 
 An SPMD task can satisfy this on some physical rows and not others, so the
 honest answer is `full N/N`, `partial N/M`, or `none` — never a bare yes. If
-the timestamps look early but the graph is not structurally eligible, the
-capture and the source disagree; suspect a stale artifact before believing the
-timestamps.
+the timestamps look early despite an unflagged producer in the recorded
+graph, report the mismatch. Check whether the producer was still live when
+the runtime built the fan-in and whether both captures cover the same run
+topology before attributing a blocker.
 
 ### Deliberately delaying a task
 

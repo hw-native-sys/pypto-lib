@@ -38,7 +38,7 @@ except ImportError as exc:  # pragma: no cover - environment preflight
 
 RECORD_NAMES = ("chip_swimlane_records.json", "l2_swimlane_records.json", "l2_perf_records.json")
 RANK_RE = re.compile(r"rank\d+$")
-BASELINE_VERSION = 2
+BASELINE_VERSION = 3
 
 
 @dataclass
@@ -229,6 +229,10 @@ def _build_run(directory: Path) -> Run:
         raise ValueError(f"{records}: no joined AICore/AICPU task rows")
     raw_aicore = raw.get("aicore_tasks")
     raw_aicpu = raw.get("aicpu_tasks")
+    if raw_aicpu is None:
+        scheduler = raw.get("scheduler_tasks")
+        if isinstance(scheduler, dict) and scheduler.get("producer") == "aicpu":
+            raw_aicpu = scheduler.get("records")
     if not isinstance(raw_aicore, list) or not isinstance(raw_aicpu, list):
         raise ValueError(f"{records}: missing raw AICore/AICPU task streams")
     if len(raw_aicore) != len(raw_aicpu) or len(rows) != len(raw_aicore):
@@ -291,6 +295,8 @@ def _build_run(directory: Path) -> Run:
     predecessors: dict[str, set[str]] = collections.defaultdict(set)
     for edge in deps.get("edges", []):
         if not isinstance(edge, dict) or edge.get("pred") is None or edge.get("succ") is None:
+            continue
+        if "flags" in edge and "wait" not in edge["flags"]:
             continue
         pred, succ = _task_id(edge["pred"]), _task_id(edge["succ"])
         if pred != succ:
@@ -487,7 +493,7 @@ def _snapshot(run: Run, task: str, occurrence: int, dispatch_index: int) -> Targ
     structural_status = "root"
     if predecessors:
         if unflagged:
-            structural_status = "policy-blocked"
+            structural_status = "unflagged-recorded-producer"
         elif non_alloc:
             structural_status = "eligible"
         else:
@@ -535,7 +541,9 @@ def _snapshot(run: Run, task: str, occurrence: int, dispatch_index: int) -> Targ
     blockers: list[str] = []
     if unflagged:
         details = ", ".join(f"{pred} ({'/'.join(run.names.get(pred, ['unknown']))})" for pred in unflagged)
-        blockers.append(f"early-dispatch policy: unflagged direct producer(s): {details}")
+        blockers.append(
+            f"unflagged recorded wait producer(s), policy blockers if still live at fan-in construction: {details}"
+        )
     elif untimed:
         blockers.append(f"unverifiable predecessor timing: {', '.join(untimed)}")
     elif observed_status in {"full", "partial"}:
@@ -1041,7 +1049,9 @@ def main(argv: list[str]) -> int:
             baseline_path = args.baseline_json.expanduser().resolve()
             baseline = _read_json(baseline_path)
             if baseline.get("version") != BASELINE_VERSION:
-                raise ValueError(f"{baseline_path}: unsupported baseline version")
+                raise ValueError(
+                    f"{baseline_path}: regenerate this baseline from its raw capture with this helper"
+                )
             if str(baseline.get("target", "")).casefold() != args.target.casefold():
                 raise ValueError(
                     f"{baseline_path}: target {baseline.get('target')!r} does not match {args.target!r}"

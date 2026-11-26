@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Report task existence and producer-to-consumer reachability from deps.json."""
+"""Report task existence and producer-to-consumer execution ordering from deps.json."""
 
 from __future__ import annotations
 
@@ -64,6 +64,7 @@ class DispatchResult:
     producer_matches: int
     consumer_matches: int
     pairs: list[PairResult]
+    edges_without_flags: int
 
 
 @dataclass
@@ -74,6 +75,7 @@ class Graph:
     tasks: dict[str, Task]
     successors: dict[str, set[str]]
     edge_sources: dict[tuple[str, str], set[str]]
+    edges_without_flags: int
 
 
 def _read_json(path: Path) -> Any:
@@ -176,12 +178,18 @@ def _load_graph(directory: Path, root: Path) -> Graph:
 
     successors: dict[str, set[str]] = collections.defaultdict(set)
     edge_sources: dict[tuple[str, str], set[str]] = collections.defaultdict(set)
+    edges_without_flags = 0
     for edge in data.get("edges") or []:
         if not isinstance(edge, dict) or edge.get("pred") is None or edge.get("succ") is None:
             continue
         pred = _task_id(edge["pred"])
         succ = _task_id(edge["succ"])
         if pred not in tasks or succ not in tasks:
+            continue
+        if "flags" not in edge:
+            # Host-built graphs and older captures record plain dependency edges.
+            edges_without_flags += 1
+        elif "wait" not in edge["flags"]:
             continue
         successors[pred].add(succ)
         edge_sources[(pred, succ)].add(str(edge.get("source") or "unknown"))
@@ -190,7 +198,9 @@ def _load_graph(directory: Path, root: Path) -> Graph:
         label = str(directory.relative_to(root)) or "."
     except ValueError:
         label = str(directory)
-    return Graph(directory, label, _program(directory), tasks, dict(successors), dict(edge_sources))
+    return Graph(
+        directory, label, _program(directory), tasks, dict(successors), dict(edge_sources), edges_without_flags
+    )
 
 
 def _dispatch_directories(root: Path) -> list[Path]:
@@ -351,6 +361,7 @@ def _analyze_graph(graph: Graph, args: argparse.Namespace) -> DispatchResult:
         len(producers),
         len(consumers),
         pairs,
+        graph.edges_without_flags,
     )
 
 
@@ -403,7 +414,7 @@ def _recommendations(results: list[DispatchResult]) -> list[str]:
         )
     if statuses["no_path"]:
         recommendations.append(
-            "Both endpoints exist without a path. Repair the tensor direction/slice or add the narrowest "
+            "Both endpoints exist without an ordering path. Repair the tensor direction/slice or add the narrowest "
             "explicit TaskId dependency.",
         )
     reachable = statuses["direct"] + statuses["transitive"] + statuses["same_task"]
@@ -456,6 +467,9 @@ def _markdown(root: Path, args: argparse.Namespace, results: list[DispatchResult
     lines.extend(["", "## Pair details", ""])
     for result in results:
         lines.extend([f"### `{_md(result.label)}`", ""])
+        if result.edges_without_flags:
+            lines.append(f"{result.edges_without_flags} edge record(s) use plain predecessors without wait/retain flags.")
+            lines.append("")
         for pair in result.pairs:
             producer_occurrence = "-" if pair.producer_occurrence is None else str(pair.producer_occurrence)
             consumer_occurrence = "-" if pair.consumer_occurrence is None else str(pair.consumer_occurrence)
@@ -468,7 +482,7 @@ def _markdown(root: Path, args: argparse.Namespace, results: list[DispatchResult
                         f"producer `{_md(_name(pair.producer))}[{producer_id}]`; "
                         f"consumer `{_md(_name(pair.consumer))}[{consumer_id}]`"
                     ),
-                    f"  - Shortest path: `{_md(_path_text(pair, args.max_path_nodes))}`",
+                    f"  - Shortest ordering path: `{_md(_path_text(pair, args.max_path_nodes))}`",
                     f"  - Edge sources: `{_md(_edge_text(pair))}`",
                 ],
             )

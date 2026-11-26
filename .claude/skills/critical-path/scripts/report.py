@@ -235,11 +235,17 @@ def _build_analysis(directory: Path, root: Path, tol: int) -> RunAnalysis:
     for edge in deps.get("edges", []):
         if not isinstance(edge, dict) or edge.get("pred") is None or edge.get("succ") is None:
             continue
+        if "flags" in edge and "wait" not in edge["flags"]:
+            continue
         pred, succ = _task_id(edge["pred"]), _task_id(edge["succ"])
         if pred != succ:
             preds[succ].add(pred)
 
     graph = critical_path.build_graph(directory, root, tol)
+    # Some simpler versions include retention edges in their time-forward graph.
+    for consumer, predecessors in graph.hb_pred.items():
+        graph.hb_pred[consumer] = [pred for pred in predecessors if pred in preds[consumer]]
+    graph.kept_edges = sum(map(len, graph.hb_pred.values()))
     result = critical_path.analyze_rank(graph, tol)
     dispatch = _aggregate_min(rows_by_task, "dispatch_time_us")
     finish = _aggregate_max(rows_by_task, "finish_time_us")
@@ -524,19 +530,21 @@ def _dispatch_diagnostics(
         if is_early:
             attribution.append("actually early-dispatched; no predecessor blocked dispatch")
         elif early_status == "mismatch":
-            attribution.append("dispatch timing precedes predecessor FIN but dependency policy is ineligible")
+            attribution.append(
+                "dispatch precedes predecessor FIN despite an unflagged recorded producer; check the live fan-in"
+            )
         elif early_status == "unverifiable":
             attribution.append("early-dispatch proof is unverifiable because a direct producer lacks timing")
         elif policy_blockers:
-            attribution.append("not early-eligible: unflagged direct producer(s)")
+            attribution.append("recorded wait graph has unflagged direct producer(s)")
             for blocker in policy_blockers:
                 named_blockers.append(
                     (
                         task,
                         blocker,
                         _logical_name(blocker, analysis),
-                        "early-dispatch policy",
-                        "direct producer lacks `early_dispatch=true`",
+                        "candidate early-dispatch policy blocker",
+                        "unflagged wait producer if still live at fan-in construction",
                     )
                 )
         if delay > gap_threshold_us:
