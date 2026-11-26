@@ -11,9 +11,9 @@
 import pypto.language as pl
 
 if __package__:
-    from .config import FLASH as M
+    from .decode_shapes import DECODE_CONFIG as M
 else:
-    from config import FLASH as M
+    from decode_shapes import DECODE_CONFIG as M
 if __package__:
     from .decode_shapes import (
         BLOCK_SIZE,
@@ -159,7 +159,7 @@ def build_decode_metadata(
         swa_indices,
         swa_lens,
     )
-    for metadata_core in pl.spmd(1, name_hint="decode_build_cache_metadata"):
+    for metadata_core in pl.spmd(1, name_hint="decode_build_cache_metadata", allow_early_resolve=True):
         for token in pl.range(metadata_core, T):
             request = token // S
             position = pl.read(position_ids, [token])

@@ -37,9 +37,9 @@ if __package__:
 else:
     from expert_routed import IDX_PAD, N_BANK, N_SLOTS_B, RECV_MAX, SHARED_EID, SH_SLOT
 if __package__:
-    from .expert_routed_persistent_balanced import WORK_SLOTS_PAD, expert_routed_persistent_planned
+    from .expert_routed import WORK_SLOTS_PAD, expert_routed_persistent_planned
 else:
-    from expert_routed_persistent_balanced import WORK_SLOTS_PAD, expert_routed_persistent_planned
+    from expert_routed import WORK_SLOTS_PAD, expert_routed_persistent_planned
 if __package__:
     from .gate import gate, ROUTE_ROW_PAD
 else:
@@ -119,58 +119,60 @@ def route_group(
     Routing fills at most ``T * TOPK == N_SLOTS`` slots, so it never claims it.
     """
     recv_x_flat = pl.reshape(recv_x, [N_SLOTS_B * RECV_MAX, D])
-    expert_slot = pl.create_tensor([1, N_EXPERTS], dtype=pl.INT32, manual_dep=True)
     work_slot_2d = pl.reshape(work_slot, [1, WORK_SLOTS_PAD])
     work_rows_2d = pl.reshape(work_rows, [1, WORK_SLOTS_PAD])
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_table_init", allow_early_resolve=True) as init_tid:
-        expert_slot[:, :] = pl.full([1, N_EXPERTS], dtype=pl.INT32, value=-1)
-        work_slot_2d[:, :] = pl.full([1, WORK_SLOTS_PAD], dtype=pl.INT32, value=0)
-        work_rows_2d[:, :] = pl.full([1, WORK_SLOTS_PAD], dtype=pl.INT32, value=0)
-        slot_expert[:, :] = pl.full([N_SLOTS_B, IDX_PAD], dtype=pl.INT32, value=0)
-        recv_scale[:, :] = pl.full([N_SLOTS_B, RECV_MAX], dtype=pl.FP32, value=0.0)
-        recv_w[:, :] = pl.full([N_SLOTS_B, RECV_MAX], dtype=pl.FP32, value=0.0)
-        route_slot_row[:, :] = pl.full([N_ROUTES, IDX_PAD], dtype=pl.INT32, value=0)
-        # The shared expert's slot is static: same id every step.
-        slot_expert[SH_SLOT : SH_SLOT + 1, :] = pl.full(
-            [1, IDX_PAD], dtype=pl.INT32, value=SHARED_EID)
-
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
         active_tokens = pl.cast(0, pl.INDEX)
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
 
-    # One core owns the slot table: adjacent scalar writes from several SPMD
-    # cores can race through overlapping DMA units.
-    with pl.spmd(1, name_hint="route_group_scalar", allow_early_resolve=True, deps=[init_tid]) as scalar_tid:
-        scalar_core = pl.tile.get_block_idx()
+    # Build routing metadata in UB and publish each table once.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_group_scalar", allow_early_resolve=True) as scalar_tid:
+        expert_slot = pl.tile.full([1, N_EXPERTS], dtype=pl.INT32, value=-1)
+        slots = pl.tile.full([1, WORK_SLOTS_PAD], dtype=pl.INT32, value=0)
+        rows = pl.tile.full([1, WORK_SLOTS_PAD], dtype=pl.INT32, value=0)
+        experts = pl.tile.full([N_SLOTS_B, IDX_PAD], dtype=pl.INT32, value=0)
+        scales = pl.tile.full([N_SLOTS_B, RECV_MAX], dtype=pl.FP32, value=0.0)
+        route_weights = pl.tile.full([N_SLOTS_B, RECV_MAX], dtype=pl.FP32, value=0.0)
+        route_rows = pl.tile.full([N_ROUTES, IDX_PAD], dtype=pl.INT32, value=0)
+        route_ids = pl.load(indices, [0, 0], [T, ROUTE_ROW_PAD])
+        input_weights = pl.load(weights, [0, 0], [T, ROUTE_ROW_PAD])
+        for col in pl.range(IDX_PAD):
+            pl.tile.write(experts, [SH_SLOT, col], pl.cast(SHARED_EID, pl.INT32))
+
         next_slot = pl.cast(0, pl.INDEX)
-        for token in pl.range(scalar_core, active_tokens):
+        for token in pl.range(active_tokens):
             token_scale = pl.read(x_norm_scale, [token, 0])
             for k in pl.range(TOPK):
-                expert_id = pl.read(indices, [token, k])
+                expert_id = pl.tile.read(route_ids, [token, k])
                 expert_col = pl.cast(expert_id, pl.INDEX)
-                slot = pl.read(expert_slot, [0, expert_col])
+                slot = pl.tile.read(expert_slot, [0, expert_col])
                 if slot < 0:
                     slot = pl.cast(next_slot, pl.INT32)
-                    pl.write(expert_slot, [0, expert_col], slot)
-                    pl.write(slot_expert, [next_slot, 0], expert_id)
-                    pl.write(work_slot, [next_slot], slot)
+                    pl.tile.write(expert_slot, [0, expert_col], slot)
+                    pl.tile.write(experts, [next_slot, 0], expert_id)
+                    pl.tile.write(slots, [0, next_slot], slot)
                     next_slot = next_slot + 1
                 slot_row = pl.cast(slot, pl.INDEX)
-                count = pl.read(work_rows, [slot_row])
+                count = pl.tile.read(rows, [0, slot_row])
                 count_col = pl.cast(count, pl.INDEX)
-                pl.write(work_rows, [slot_row], pl.cast(count + 1, pl.INT32))
-                pl.write(recv_scale, [slot_row, count_col], token_scale)
-                pl.write(recv_w, [slot_row, count_col], pl.read(weights, [token, k]))
+                pl.tile.write(rows, [0, slot_row], pl.cast(count + 1, pl.INT32))
+                pl.tile.write(scales, [slot_row, count_col], token_scale)
+                pl.tile.write(route_weights, [slot_row, count_col], pl.tile.read(input_weights, [token, k]))
                 route = token * TOPK + k
-                pl.write(route_slot_row, [route, 0], pl.cast(slot * RECV_MAX + count, pl.INT32))
+                pl.tile.write(route_rows, [route, 0], pl.cast(slot * RECV_MAX + count, pl.INT32))
             # The shared expert takes this token ungated, at the same quant scale.
-            pl.write(recv_scale, [SH_SLOT, token], token_scale)
-            pl.write(recv_w, [SH_SLOT, token], pl.cast(1.0, pl.FP32))
-        pl.write(work_slot, [next_slot], pl.cast(SH_SLOT, pl.INT32))
-        pl.write(work_rows, [next_slot], pl.cast(active_tokens, pl.INT32))
+            pl.tile.write(scales, [SH_SLOT, token], token_scale)
+            pl.tile.write(route_weights, [SH_SLOT, token], pl.cast(1.0, pl.FP32))
+        pl.tile.write(slots, [0, next_slot], pl.cast(SH_SLOT, pl.INT32))
+        pl.tile.write(rows, [0, next_slot], pl.cast(active_tokens, pl.INT32))
+        pl.store(slots, [0, 0], work_slot_2d)
+        pl.store(rows, [0, 0], work_rows_2d)
+        pl.store(experts, [0, 0], slot_expert)
+        pl.store(scales, [0, 0], recv_scale)
+        pl.store(route_weights, [0, 0], recv_w)
+        pl.store(route_rows, [0, 0], route_slot_row)
 
     # One block per token -- it moves that token's TOPK routed rows -- plus one
     # for the shared expert. A 4 KB row is far too little to earn a block of its
@@ -427,6 +429,228 @@ def moe(
     return x_next
 
 
+from .hc_pre import _hc_post_and_mix_inputs
+from .gate import gate_and_plan
+from .moe_same_wave import reduce_and_hc
+
+@pl.jit.inline
+def publish_and_wait(
+    ffn_partial: pl.Tensor[[T, D], pl.FP32],
+    reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.FP32],
+    reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    # 1-based MoE call id; reduce_signal is monotonic so waits use `>= moe_epoch`.
+    moe_epoch: pl.Scalar[pl.INT32],
+):
+    """Sum every rank's intermediate-slice partial into a full-precision ffn_out."""
+    lane_base = pl.cast(((moe_epoch - 1) % 2) * REDUCE_LANE_ROWS, pl.INDEX)
+    my_row = lane_base + pl.cast(my_rank, pl.INDEX) * T_PAD
+
+    with pl.spmd(N_RANKS, name_hint="moe_reduce_publish", allow_early_resolve=True) as publish_tid:
+        peer = pl.tile.get_block_idx()
+        pld.tensor.put(
+            dst=reduce_window,
+            peer=peer,
+            src=ffn_partial,
+            dst_offsets=[my_row, 0],
+            src_offsets=[0, 0],
+            shape=[T, D],
+            chunk_rows=T,
+            chunk_cols=D,
+        )
+        pld.system.notify(
+            target=reduce_signal,
+            peer=peer,
+            offsets=[my_rank, 0],
+            value=1,
+            op=pld.NotifyOp.AtomicAdd,
+        )
+
+    # Split from the push so the notify rides the push scope's program order and
+    # only the wait holds a core group.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_reduce_barrier", allow_early_resolve=True, deps=[publish_tid]) as barrier_tid:
+        for src in pl.range(N_RANKS):
+            pld.system.wait(
+                signal=reduce_signal,
+                offsets=[src, 0],
+                expected=moe_epoch,
+                cmp=pld.WaitCmp.Ge,
+            )
+    return lane_base, barrier_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def moe_parallel_macro(
+    # model inputs
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
+    input_ids: pl.Tensor[[T], pl.INT64],
+    # Expert SHARED_EID of each bank is the shared expert (see route_group).
+    routed_w1: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_BANK, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_BANK, D], pl.FP32],
+    # final output
+    x_next: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
+    # windows
+    reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.FP32],
+    reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    local_ready: pld.DistributedTensor[[2, 32], pl.INT32],
+    # scalars last: runtime TaskArgs forbids a tensor arg after a scalar arg.
+    layer_id: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    # 1-based MoE call id for the shared reduce window (distinct from layer_id).
+    moe_epoch: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
+    post_ffn = pl.create_tensor([T,HC_MULT], dtype=pl.FP32, manual_dep=True)
+    comb_ffn = pl.create_tensor([T,HC_MULT*HC_MULT], dtype=pl.FP32)
+    mixes_partials, rms_partials, t_linear = _hc_post_and_mix_inputs(
+        x_hc,hc_ffn_fn,hc_ffn_scale,hc_ffn_base,post_ffn,comb_ffn,
+    )
+
+    token_x = pl.create_tensor([T,D], dtype=pl.INT8)
+    normal_scale = pl.create_tensor([T,1], dtype=pl.FP32, manual_dep=True)
+    indices = pl.create_tensor([T,ROUTE_ROW_PAD], dtype=pl.INT32)
+    weights = pl.create_tensor([T,ROUTE_ROW_PAD], dtype=pl.FP32)
+    recv_scale = pl.create_tensor([N_SLOTS_B,RECV_MAX], dtype=pl.FP32)
+    recv_w = pl.create_tensor([N_SLOTS_B,RECV_MAX], dtype=pl.FP32)
+    work_slot = pl.create_tensor([WORK_SLOTS_PAD], dtype=pl.INT32)
+    work_rows = pl.create_tensor([WORK_SLOTS_PAD], dtype=pl.INT32)
+    slot_expert = pl.create_tensor([N_SLOTS_B,IDX_PAD], dtype=pl.INT32)
+    order = pl.create_tensor([N_ROUTES,IDX_PAD], dtype=pl.INT32)
+    recv_x = pl.create_tensor([N_SLOTS_B,RECV_MAX,D], dtype=pl.INT8)
+    gate_and_plan(x_hc,hc_ffn_scale,hc_ffn_base,mixes_partials,rms_partials,t_linear,
+                  norm_w,gate_w,gate_bias,layer_id,num_tokens,tid2eid,input_ids,
+                  token_x, normal_scale, indices, weights, recv_scale, recv_w, work_slot,
+                  work_rows, slot_expert, order, recv_x, local_ready, my_rank, moe_epoch)
+    with pl.scope():
+        recv_y = pl.create_tensor([N_SLOTS_B,RECV_MAX,D], dtype=pl.BF16)
+        ffn_partial = pl.create_tensor([T,D], dtype=pl.FP32)
+        expert_routed_persistent_planned(
+            recv_x, recv_scale, recv_w, work_slot, work_rows, slot_expert,
+            routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+            routed_w2, routed_w2_scale, recv_y,
+        )
+        combine_local(recv_y, order, ffn_partial, num_tokens)
+        lane_base, barrier = publish_and_wait(ffn_partial, reduce_window, reduce_signal, my_rank, moe_epoch)
+        reduce_and_hc(reduce_window, x_hc, post_ffn, comb_ffn, x_next, lane_base, barrier)
+    return x_next
+
+
+@pl.jit.inline
+def clear_native_moe_signals(
+    completion_anchor: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    local_ready: pld.DistributedTensor[[2, 32], pl.INT32],
+):
+    """Clear this rank's all-reduce counters after its final MoE completes."""
+    with pl.at(
+        level=pl.Level.CORE_GROUP, name_hint="moe_signal_clear", allow_early_resolve=True
+    ) as s6_moe_cleanup_tid:
+        # The final MoE output depends on this rank observing every peer's final
+        # publish notify, so no peer can issue another one in this forward.
+        _completion_anchor = pl.read(completion_anchor, [0, 0, 0])
+        zero = pl.cast(0, pl.INT32)
+        for src in pl.range(N_RANKS):
+            pl.write(reduce_signal, [src, 0], zero)
+        if TP == 8 and T == 6:
+            pl.write(local_ready, [0, 0], zero)
+            pl.write(local_ready, [1, 0], zero)
+    return s6_moe_cleanup_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def _native_legacy_moe(
+    # model inputs
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
+    input_ids: pl.Tensor[[T], pl.INT64],
+    # Expert SHARED_EID of each bank is the shared expert (see route_group).
+    routed_w1: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_BANK, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_BANK, D], pl.FP32],
+    # final output
+    x_next: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
+    # windows
+    reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.FP32],
+    reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    local_ready: pld.DistributedTensor[[2, 32], pl.INT32],
+    # scalars last: runtime TaskArgs forbids a tensor arg after a scalar arg.
+    layer_id: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    # 1-based MoE call id for the shared reduce window (distinct from layer_id).
+    moe_epoch: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
+    return moe(
+            x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_w, gate_w, gate_bias,
+            tid2eid, input_ids, routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+            routed_w2, routed_w2_scale, x_next, reduce_window, reduce_signal,
+            layer_id, num_tokens, my_rank, moe_epoch,
+    )
+
+
+@pl.jit.inline(auto_scope=False)
+def _native_macro_moe(
+    # model inputs
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
+    input_ids: pl.Tensor[[T], pl.INT64],
+    # Expert SHARED_EID of each bank is the shared expert (see route_group).
+    routed_w1: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_BANK, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_BANK, D], pl.FP32],
+    # final output
+    x_next: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
+    # windows
+    reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.FP32],
+    reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    local_ready: pld.DistributedTensor[[2, 32], pl.INT32],
+    # scalars last: runtime TaskArgs forbids a tensor arg after a scalar arg.
+    layer_id: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    # 1-based MoE call id for the shared reduce window (distinct from layer_id).
+    moe_epoch: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
+    return moe_parallel_macro(
+            x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_w, gate_w, gate_bias,
+            tid2eid, input_ids, routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+            routed_w2, routed_w2_scale, x_next, reduce_window, reduce_signal,
+            local_ready, layer_id, num_tokens, my_rank, moe_epoch,
+    )
+
+
+moe_for_native = _native_macro_moe if TP == 8 and T == 6 else _native_legacy_moe
+
+
 @pl.jit
 def moe_test(
     # model inputs
@@ -519,9 +743,9 @@ def golden_moe(tensors):
     else:
         from hc_pre import golden_hc_pre
     if __package__:
-        from .hc_post import golden_hc_post
+        from .hc_post_common import golden_hc_post
     else:
-        from hc_post import golden_hc_post
+        from models.deepseek_v4_flash_lowlat.hc_post_common import golden_hc_post
     if __package__:
         from .gate import golden_gate_core
     else:

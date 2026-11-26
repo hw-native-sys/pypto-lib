@@ -19,9 +19,11 @@ from typing import Any, Callable
 import torch
 
 if __package__:
-    from .config import FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
+    from .decode_shapes import DECODE_CONFIG as M
+    from .config import INT8_AMAX_EPS, INT8_SCALE_MAX
 else:
-    from config import FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
+    from decode_shapes import DECODE_CONFIG as M
+    from config import INT8_AMAX_EPS, INT8_SCALE_MAX
 if __package__:
     from .decode_shapes import (
         BLOCK_SIZE,
@@ -32,6 +34,58 @@ if __package__:
     )
 else:
     from decode_shapes import BLOCK_SIZE, C4A_COMPRESSOR_BLOCK_SIZE, C128_COMPRESSOR_BLOCK_SIZE, DECODE_BATCH, DECODE_SEQ
+
+
+def run_operator_validations(cases, *, single_device=(), automatic=None, standalone_options=None):
+    """Preserve standalone component cases and route the CI device assignment."""
+    import argparse
+    import subprocess
+    import sys
+
+    selector = argparse.ArgumentParser(add_help=False)
+    selector.add_argument("--operator", choices=tuple(cases), help="Select one standalone validation case")
+    selected, remaining = selector.parse_known_args()
+    if selected.operator is None and standalone_options:
+        option_names = {arg.partition("=")[0] for arg in remaining if arg.startswith("--")}
+        known = set().union(*standalone_options.values())
+        recognized = set()
+        for name in option_names:
+            matches = [flag for flag in known if flag.startswith(name)]
+            if name in known:
+                recognized.add(name)
+            elif len(matches) == 1:
+                recognized.add(matches[0])
+        requested = [name for name, flags in standalone_options.items() if recognized.intersection(flags)]
+        if len(requested) > 1:
+            selector.error("Options refer to different standalone operators")
+        if requested:
+            selected.operator = requested[0]
+    if selected.operator is not None:
+        sys.argv[:] = [sys.argv[0], *remaining]
+        cases[selected.operator]()
+        return
+    if any(arg in ("-h", "--help") for arg in remaining):
+        selector.print_help()
+        return
+
+    device_parser = argparse.ArgumentParser(add_help=False)
+    device_parser.add_argument("-d", "--device")
+    options, forwarded = device_parser.parse_known_args(remaining)
+    for name in automatic if automatic is not None else cases:
+        args = remaining
+        if options.device is not None and name in single_device:
+            args = [*forwarded, "-d", options.device.split(",", 1)[0]]
+        print(f"Validating {name}", flush=True)
+        subprocess.run(validation_subprocess_command("--operator", name, *args), check=True)
+
+
+def validation_subprocess_command(*args):
+    """Preserve module execution when rerunning a standalone validation."""
+    import sys
+
+    main_spec = getattr(sys.modules["__main__"], "__spec__", None)
+    entry = [sys.argv[0]] if main_spec is None else ["-m", main_spec.name]
+    return [sys.executable, *entry, *args]
 
 
 # Validation default; runtime operators receive actual request positions.

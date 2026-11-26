@@ -6,17 +6,72 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: devices=2
-"""DeepSeek-V4 Flash token embedding over a TP vocab shard.
-
-Rank r holds embedding rows [r * VOCAB_PER_TP, (r+1) * VOCAB_PER_TP), the same split
-lm_head uses. Exactly one rank owns each token's row, so the owner publishes it to
-every peer and the exchange is an all-gather with no reduction.
-"""
+"""Token embedding lookup and tensor-parallel exchange."""
 
 import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
+
+
+if __package__:
+    from .config import FLASH as M
+else:
+    from config import FLASH as M
+if __package__:
+    from .decode_shapes import DECODE_TOKENS
+else:
+    from decode_shapes import DECODE_TOKENS
+
+
+# Dynamic shape variables.
+T_DYN = pl.dynamic('LOWLAT_TARGET_LOOKUP_EMBEDDING_T_DYN')
+VOCAB_DYN = pl.dynamic('LOWLAT_TARGET_LOOKUP_EMBEDDING_VOCAB_DYN')
+
+# model config
+D = M.hidden_size
+
+# tiling
+HIDDEN_TILE = 512
+SPMD_BLOCKS = 48
+
+
+@pl.jit.inline
+def lookup_embedding(
+    input_ids: pl.Tensor[[T_DYN], pl.INT64],
+    embed_weight: pl.Tensor[[VOCAB_DYN, D], pl.BF16],
+    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
+) -> pl.Tensor[[T_DYN, D], pl.BF16]:
+    token_count = pl.tensor.dim(input_ids, 0)
+    work_items = token_count * (D // HIDDEN_TILE)
+    for block in pl.spmd(SPMD_BLOCKS, name_hint="lookup_embedding"):
+        for work_idx in pl.range(block, work_items, SPMD_BLOCKS):
+            token_idx = work_idx // (D // HIDDEN_TILE)
+            hidden_block = work_idx % (D // HIDDEN_TILE)
+            hidden_offset = hidden_block * HIDDEN_TILE
+            token_id = pl.tensor.read(input_ids, [token_idx])
+            token_row = pl.cast(token_id, target_type=pl.INDEX)
+            hidden_chunk = embed_weight[token_row : token_row + 1, hidden_offset : hidden_offset + HIDDEN_TILE]
+            hidden_states[token_idx : token_idx + 1, hidden_offset : hidden_offset + HIDDEN_TILE] = hidden_chunk
+
+    return hidden_states
+
+
+@pl.jit
+def lookup_embedding_test(
+    input_ids: pl.Tensor[[T_DYN], pl.INT64],
+    embed_weight: pl.Tensor[[VOCAB_DYN, D], pl.BF16],
+    hidden_states: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+) -> pl.Tensor[[T_DYN, D], pl.BF16]:
+    input_ids.bind_dynamic(0, T_DYN)
+    embed_weight.bind_dynamic(0, VOCAB_DYN)
+    hidden_states.bind_dynamic(0, T_DYN)
+
+    lookup_embedding(input_ids, embed_weight, hidden_states)
+    return hidden_states
+
+
+# ci: devices=2
+
 
 if __package__:
     from .config import FLASH as M
@@ -30,13 +85,12 @@ else:
 
 # model config
 T = DECODE_TOKENS
-D = M.hidden_size
+HC_MULT = M.hc_mult
 VOCAB = M.vocab_size
 N_RANKS = TP
 VOCAB_PER_TP = VOCAB // N_RANKS
 
 # tiling
-HIDDEN_TILE = 512
 
 
 @pl.jit.inline
@@ -92,6 +146,45 @@ def all_gather_embedding(input_ids: pl.Tensor[[T], pl.INT64], owned_rows: pl.Ten
 
 
 @pl.jit.inline
+def tp_lookup_embedding_hc(
+    input_ids: pl.Tensor[[T], pl.INT64],
+    embed_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    x_hc: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
+    gather_window: pld.DistributedTensor[[T, D], pl.BF16],
+    gather_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+):
+    """Publish directly from the weight bank and expand the readback into HC rows."""
+    vocab_base = pl.cast(my_rank, pl.INT32) * VOCAB_PER_TP
+    with pl.spmd(T, name_hint="embed_publish", allow_early_resolve=True) as sent:
+        token = pl.tile.get_block_idx()
+        local_id = pl.cast(pl.read(input_ids, [token]), pl.INT32) - vocab_base
+        if local_id >= 0:
+            if local_id < VOCAB_PER_TP:
+                row = pl.cast(local_id, pl.INDEX)
+                for peer in pl.range(N_RANKS):
+                    pld.tensor.put(dst=gather_window, peer=peer, src=embed_weight,
+                                   dst_offsets=[token, 0], src_offsets=[row, 0], shape=[1, D])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="embed_barrier",
+               deps=[sent], allow_early_resolve=True) as arrived:
+        for peer in pl.range(N_RANKS):
+            pld.system.notify(target=gather_signal, peer=peer, offsets=[my_rank, 0],
+                              value=1, op=pld.NotifyOp.AtomicAdd)
+        for src in pl.range(N_RANKS):
+            pld.system.wait(signal=gather_signal, offsets=[src, 0], expected=1, cmp=pld.WaitCmp.Ge)
+    rows = pl.reshape(x_hc, [T * HC_MULT, D])
+    with pl.spmd(T * (D // HIDDEN_TILE), name_hint="embed_readback_hc",
+                 deps=[arrived], allow_early_resolve=True):
+        block = pl.tile.get_block_idx()
+        token = block // (D // HIDDEN_TILE)
+        col = block % (D // HIDDEN_TILE) * HIDDEN_TILE
+        gathered = pl.cast(pl.load(gather_window, [token, col], [1, HIDDEN_TILE]), pl.FP32)
+        for hc in pl.range(HC_MULT):
+            pl.store(gathered, [token * HC_MULT + hc, col], rows)
+    return x_hc
+
+
+@pl.jit.inline
 def clear_embedding_signals(
     completion_anchor: pl.Tensor[[T, D], pl.BF16],
     gather_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
@@ -142,6 +235,29 @@ def l3_tp_embedding(
         )
 
 
+def golden_lookup_embedding_test(tensors):
+    tensors["hidden_states"][:] = tensors["embed_weight"].index_select(0, tensors["input_ids"].long())
+
+
+def build_tensor_specs_lookup(token_count, vocab_size):
+    import torch
+    from golden import TensorSpec
+
+    def init_input_ids():
+        sample_ids = torch.tensor([0, 1, 17, vocab_size - 1, 17, 2, vocab_size // 2, 1], dtype=torch.int64)
+        repeats = (token_count + sample_ids.numel() - 1) // sample_ids.numel()
+        return sample_ids.repeat(repeats)[:token_count].contiguous()
+
+    def init_embed_weight():
+        return torch.randn(vocab_size, D, dtype=torch.bfloat16)
+
+    return [
+        TensorSpec("input_ids", [token_count], torch.int64, init_value=init_input_ids),
+        TensorSpec("embed_weight", [vocab_size, D], torch.bfloat16, init_value=init_embed_weight),
+        TensorSpec("hidden_states", [token_count, D], torch.bfloat16),
+    ]
+
+
 def golden_tp_embedding(tensors):
     """Concatenating the rank shards in index order reproduces the global table."""
     import torch
@@ -151,7 +267,7 @@ def golden_tp_embedding(tensors):
     tensors["hidden_states"][:] = rows.unsqueeze(0).expand(N_RANKS, -1, -1)
 
 
-def build_tensor_specs():
+def build_tensor_specs_tp():
     import torch
     from golden import TensorSpec
 
@@ -178,7 +294,46 @@ def build_tensor_specs():
     return specs
 
 
-if __name__ == "__main__":
+def validate_lookup():
+    import argparse
+    from golden import run
+
+    MODES = {"decode": DECODE_TOKENS}
+    TEST_VOCAB_SIZE = 256
+
+    parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 Flash embedding lookup validation.")
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("--sim", action="store_true")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--mode", choices=["decode"], default="decode")
+    parser.add_argument("--compile-only", action="store_true", default=False)
+    args = parser.parse_args()
+
+    modes_to_run = list(MODES) if args.mode == "all" else [args.mode]
+    for mode_name in modes_to_run:
+        token_count = MODES[mode_name]
+        print(f"--- lookup_embedding_test {mode_name}: T={token_count} ---")
+        result = run(
+            compile_only=args.compile_only,
+            fn=lookup_embedding_test,
+            specs=build_tensor_specs_lookup(token_count, TEST_VOCAB_SIZE),
+            golden_fn=golden_lookup_embedding_test,
+            config=dict(
+                backend_type=args.platform.removesuffix("sim"),
+                execution_mode=args.sim or args.platform.endswith("sim"),
+                device_id=args.device,
+            ),
+            rtol=0.0,
+            atol=0.0,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
+
+
+
+def validate_tp():
     import argparse
 
     from golden import run
@@ -199,7 +354,7 @@ if __name__ == "__main__":
 
     result = run(
         fn=l3_tp_embedding,
-        specs=build_tensor_specs(),
+        specs=build_tensor_specs_tp(),
         golden_fn=golden_tp_embedding,
         compile_only=args.compile_only,
         config=dict(
@@ -215,3 +370,17 @@ if __name__ == "__main__":
         if result.error:
             print(result.error)
         raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    from models.deepseek_v4_flash_lowlat.utils import run_operator_validations
+
+    run_operator_validations(
+        {
+            'lookup': validate_lookup,
+            'tp': validate_tp,
+        },
+        single_device=('lookup',),
+        automatic=('tp', 'lookup'),
+        standalone_options={"lookup": {"--mode"}, "tp": {"--tp", "--dump-passes"}},
+    )

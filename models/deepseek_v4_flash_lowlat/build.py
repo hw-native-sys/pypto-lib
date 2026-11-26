@@ -281,7 +281,15 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
         # A validated GENERATED cache hit does not re-enter the generation hook.
         # Validate its source choice instead of mistaking the hit for new work.
         selection = json.loads((directory / "report/native-w2-source-selection.json").read_text())
-        if selection["source_sha256"] != selected_source or len(selection["selected"]) not in (2, 10):
+        tp8_drafter = (
+            profile in ("one", "two") and selection.get("full_tp8_drafter") is True
+            and selection["sites_by_role"] == {"l2_full_cycles": 1, "l2_s6_cycles_only": 0}
+            and any(row["name"].startswith("d_main_proj_weight") and row["shape"][0] == 8
+                    for row in metadata["params"])
+            and not (directory / "next_levels/l2_s6_cycles_only").exists()
+        )
+        expected_site_counts = (1,) if tp8_drafter else (2, 10)
+        if selection["source_sha256"] != selected_source or len(selection["selected"]) not in expected_site_counts:
             raise RuntimeError("Cached program has a different native implementation")
         for item in selection["selected"]:
             original = directory / "report/original-native-source" / item["source"]
