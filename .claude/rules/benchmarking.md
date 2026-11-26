@@ -23,7 +23,7 @@ Where the numbers come from — see
 
 | Metric | Source | Quote |
 | --- | --- | --- |
-| Wall time | `PYPTO_BENCH=1` → `[RUN] effective_us (N rounds) …` | `median=`; historical Daily CI figures used `mean=`, so compare only matching metric contracts |
+| Wall time | [`PYPTO_BENCH=1` benchmark output](../../docs/debug-and-tune/performance-tuning.md#measuring-the-benchmark-loop-pypto_bench) | `median=` for TMR Effective or A5 host-graph AICore wall. Compare matching metrics and aggregation |
 | Core busy time | chip swimlane per-task durations; PMU `*_busy_cycles` vs `pmu_total_cycles` | The bottleneck pipe's ratio |
 
 A `*sim` platform prints `effective_us unavailable: no device-domain spans`. A
@@ -59,8 +59,8 @@ none of which is the thing being measured. Do not pay for them twice.
    directory.
 5. **Cut rounds while iterating; restore them for the number you report.** 100
    rounds is ~0.1 s of device time for a decode step but minutes for a long
-   prefill or a multi-card run. Any two numbers being compared must come from
-   the same rounds/warmup, and CI's baseline is the 100 / 5 default.
+   prefill or a multi-card run. Compare matching rounds and warmup. Daily CI
+   uses the counts in `.github/scripts/perf_cases.json`.
 6. **Keep the baseline's build and data until the comparison is reported.**
    Re-measuring a baseline you already measured is the same waste as re-running
    a variant.
@@ -87,12 +87,10 @@ Ranks do not start together. A late-dispatched rank spends the head of its
 window waiting; that wait is not kernel time, it varies round to round, and it
 lands inside the measured window.
 
-**Report the fastest rank's median, not the headline.** The `effective_us`
-headline is the per-round **max across ranks** (the round ends when the slowest
-card finishes), so it carries the full start skew. For tuning comparisons, quote
-the lowest per-rank **median** from the `[RUN] rank N: eff_us … median=`
-breakdown — the median over a mean, because a single stalled round moves the
-mean and not the median.
+**Report the fastest rank's median, not the benchmark headline.** The headline
+uses the per-round **max across ranks** and can carry start skew. For tuning,
+use the lowest per-rank **median** from the matching `eff_us` or
+`aicore_wall_us` breakdown.
 
 When the per-rank breakdown is not enough:
 

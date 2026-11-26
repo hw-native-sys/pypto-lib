@@ -3129,6 +3129,26 @@ class TestBenchLoopSizes:
 class TestBenchReports:
     """The ``[RUN]`` benchmark report lines."""
 
+    def test_host_graph_reports_aicore_wall_across_dispatches(self, capsys):
+        stats = _FakeStats()
+
+        def invocation(pid, inv, duration):
+            result = _FakeInv(pid, inv, 0.0)
+            result.spans = (types.SimpleNamespace(name="chip.run.runner_run.aicore_wall", dur_us=duration),)
+            return result
+
+        stats.rounds_dispatches = (
+            {10: [invocation(10, 0, 15.0), invocation(10, 1, 25.0)], 11: [invocation(11, 0, 80.0)]},
+            {10: [invocation(10, 2, 19.0), invocation(10, 3, 27.0)], 11: [invocation(11, 1, 90.0)]},
+        )
+        stats.invocations = tuple(inv for row in stats.rounds_dispatches for invs in row.values() for inv in invs)
+        _report_bench(stats, types.SimpleNamespace(), l3=True, resident=True)
+        out = capsys.readouterr().out
+        assert "aicore_wall_us (2 rounds) min=80.00 median=85.00" in out
+        assert "rank 10: aicore_wall_us min=40.00 median=43.00" in out
+        assert "rank 10 raw n=4 aicore_wall_us=[15.0, 25.0, 19.0, 27.0]" in out
+        assert "eff_us" not in out
+
     def test_raw_samples_omitted_without_invocations(self, capsys):
         _report_raw_samples(types.SimpleNamespace(invocations=()))
         assert capsys.readouterr().out == ""

@@ -337,7 +337,8 @@ for full per-flag details. There is no `runtime_profiling` /
 With `PYPTO_BENCH=1` in the environment, the harness re-dispatches the
 compiled program in a timed loop right after the correctness dispatch and
 before validation, and prints
-`[RUN]   effective_us (N rounds) min=… median=… mean=… max=…`. It is
+`[RUN]   effective_us (N rounds) min=… median=… mean=… max=…` for TMR or
+`aicore_wall_us` for A5 host-graph benchmarks with device timing enabled. It is
 env-gated only — no model file needs a flag. `PYPTO_BENCH_ROUNDS` /
 `PYPTO_BENCH_WARMUP` (default 100 / 5) size the loop. Every benchmark also
 prints the raw per-dispatch samples after measurement. See

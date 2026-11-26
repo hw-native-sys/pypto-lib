@@ -21,15 +21,16 @@ from typing import TextIO
 
 # Older headers may omit fields; keep their samples without inferring round timing.
 HEADER_RE = re.compile(r"^\[RUN\]\s+raw samples:(?P<fields>.*)$")
+TIMING_FIELD = r"(?P<metric>eff_us|aicore_wall_us)"
+METRIC_NAMES = {"eff_us": "Effective", "aicore_wall_us": "AICore wall"}
 SAMPLE_RE = re.compile(
-    r"^\[RUN\]\s+rank\s+(?P<rank>\S+)\s+raw\s+n=(?P<n>\d+)\s+"
-    r"eff_us=\[(?P<samples>[^\]]*)\]\s*$"
+    rf"^\[RUN\]\s+rank\s+(?P<rank>\S+)\s+raw\s+n=(?P<n>\d+)\s+{TIMING_FIELD}=\[(?P<samples>[^\]]*)\]\s*$"
 )
 # The harness's own per-rank summary, printed just above the raw block for an
 # L3 run. Each entry sums that rank's dispatches within a round, so it is the
 # per-round rank latency the raw per-dispatch samples cannot give.
 PER_RANK_RE = re.compile(
-    r"^\[RUN\]\s+rank\s+(?P<rank>\S+):\s+eff_us\s+.*?\bmedian=(?P<median>[0-9.]+)"
+    rf"^\[RUN\]\s+rank\s+(?P<rank>\S+):\s+{TIMING_FIELD}\s+.*?\bmedian=(?P<median>[0-9.]+)"
 )
 
 
@@ -51,12 +52,13 @@ class Block:
 
     def __init__(
         self, rounds: int | None, ranks: int | None = None, *,
-        warmup: int | None = None, flattened: bool = False,
+        warmup: int | None = None, flattened: bool = False, metric: str = "eff_us",
     ) -> None:
         self.rounds = rounds
         self.ranks = ranks
         self.warmup = warmup
         self.flattened = flattened
+        self.metric = metric
         self.rows: list[tuple[str, int, list[float]]] = []
         # rank -> median of that rank's per-round totals, from the harness's own
         # per-rank summary lines. Empty for L2 and the flatten fallback.
@@ -66,22 +68,23 @@ class Block:
 def _read_blocks(stream: TextIO) -> list[Block]:
     blocks: list[Block] = []
     current: Block | None = None
-    pending_median: dict[str, float] = {}
+    pending_medians: dict[str, dict[str, float]] = {}
 
     for raw_line in stream:
         line = raw_line.rstrip("\n")
 
         header = HEADER_RE.match(line)
         if header is not None:
-            fields = dict(re.findall(r"(\w+)=(\d+)", header.group("fields")))
+            fields = dict(re.findall(r"(\w+)=(\w+)", header.group("fields")))
             current = Block(
                 int(fields["rounds"]) if "rounds" in fields else None,
                 int(fields["ranks"]) if "ranks" in fields else None,
                 warmup=int(fields["warmup"]) if "warmup" in fields else None,
                 flattened=fields.get("fallback_flattened", "0") != "0",
+                metric=fields.get("metric", "eff_us"),
             )
-            current.per_rank_median = pending_median
-            pending_median = {}
+            current.per_rank_median = pending_medians.get(current.metric, {})
+            pending_medians.clear()
             blocks.append(current)
             continue
 
@@ -89,17 +92,20 @@ def _read_blocks(stream: TextIO) -> list[Block]:
         # block opens.
         per_rank = PER_RANK_RE.match(line)
         if per_rank is not None:
-            pending_median[per_rank.group("rank")] = float(per_rank.group("median"))
+            metric = per_rank.group("metric")
+            pending_medians.setdefault(metric, {})[per_rank.group("rank")] = float(per_rank.group("median"))
             continue
 
         match = SAMPLE_RE.match(line)
         if match is None:
             continue
         if current is None:
-            current = Block(None)
-            current.per_rank_median = pending_median
-            pending_median = {}
+            current = Block(None, metric=match.group("metric"))
+            current.per_rank_median = pending_medians.get(current.metric, {})
+            pending_medians.clear()
             blocks.append(current)
+        if match.group("metric") != current.metric:
+            raise ValueError("raw sample metric differs from the benchmark block header")
         current.rows.append(
             (
                 match.group("rank"),
@@ -191,8 +197,12 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    with _open_input(args.log) as stream:
-        blocks = _read_blocks(stream)
+    try:
+        with _open_input(args.log) as stream:
+            blocks = _read_blocks(stream)
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
 
     if not blocks:
         print("No PYPTO_BENCH raw samples found.", file=sys.stderr)
@@ -214,7 +224,7 @@ def main() -> int:
             print()
         rounds = block.rounds if block.rounds is not None else "unknown"
         warmup = block.warmup if block.warmup is not None else "unknown"
-        print(f"rounds={rounds} warmup={warmup}")
+        print(f"metric={METRIC_NAMES[block.metric]}, rounds={rounds} warmup={warmup}")
         print()
         print("| device | rank | n | min_us | max_us | median_us | mean_us | stdev_us |")
         print("|---:|---:|---:|---:|---:|---:|---:|---:|")
@@ -256,7 +266,8 @@ def main() -> int:
             if not samples:
                 print(f"| {device} | {rank} | 0 | N/A | N/A | N/A | N/A | N/A |")
                 continue
-            raw_median[rank] = statistics.median(samples)
+            if not missing or block.metric == "eff_us":
+                raw_median[rank] = statistics.median(samples)
             stdev = statistics.stdev(samples) if len(samples) > 1 else 0.0
             print(
                 f"| {device} | {rank} | {len(samples)} | "

@@ -76,7 +76,8 @@ sections for measurement and capture semantics.
 **Benchmark (default):** set
 `PYPTO_BENCH=1`, with the selected rounds and warmup explicitly
 in `PYPTO_BENCH_ROUNDS` / `PYPTO_BENCH_WARMUP`. Keep raw samples in the log;
-return summary statistics to the user. Do not enable swimlane capture unless
+enable `SIMPLER_DEVICE_STRACE_ENABLE=1` for A5 timing and label the reported
+metric as AICore wall or Effective. Do not enable swimlane capture unless
 the user requests both. Report any changed sample counts and compare only
 matching configurations.
 
@@ -184,7 +185,8 @@ python .claude/skills/perf/scripts/summarize_bench.py \
   --devices <device-csv-in-verified-rank-order> <run-log>
 ```
 
-If rank-to-device mapping is unknown, pass `--devices unknown` and retain
+The parser reads both AICore wall and legacy Effective sample blocks. If
+rank-to-device mapping is unknown, pass `--devices unknown` and retain
 runtime rank IDs. Keep separate benchmark blocks separate. Report rounds,
 warmup, min/max/median/mean/sample-standard-deviation and the headline:
 single-card median, or lowest per-rank median for multiple cards. For multiple
