@@ -837,6 +837,19 @@ def _try_find(tensors: Mapping[str, torch.Tensor], candidates: Sequence[str]) ->
     return None
 
 
+def _ffn_sources(tensors, prefixes, roles, expert):
+    """Resolve the fused/separate input projections and the down projection."""
+    fmt = {"e": expert} if expert is not None else {}
+    fused_role, fused_down_role, gate_role, up_role, down_role = roles
+    fused = _try_find(tensors, _prefixed(prefixes, ROLES[fused_role], **fmt))
+    down = _find(tensors, _prefixed(prefixes, ROLES[fused_down_role] + ROLES[down_role], **fmt))
+    inputs = (fused,) if fused is not None else (
+        _find(tensors, _prefixed(prefixes, ROLES[gate_role], **fmt)),
+        _find(tensors, _prefixed(prefixes, ROLES[up_role], **fmt)),
+    )
+    return inputs, down
+
+
 def _fused_ffn(
     tensors: Mapping[str, torch.Tensor],
     prefixes: Sequence[str],
@@ -853,11 +866,9 @@ def _fused_ffn(
     one names it ``down_proj``, and either spelling is accepted. ``prefixes``
     carries every accepted layer-root spelling.
     """
-    fmt = {"e": expert} if expert is not None else {}
-    fused_role, fused_down_role, gate_role, up_role, down_role = roles
-    fused_name = _try_find(tensors, _prefixed(prefixes, ROLES[fused_role], **fmt))
-    down_name = _find(tensors, _prefixed(prefixes, ROLES[fused_down_role] + ROLES[down_role], **fmt))
-    if fused_name is not None:
+    inputs, down_name = _ffn_sources(tensors, prefixes, roles, expert)
+    if len(inputs) == 1:
+        fused_name = inputs[0]
         shape = _weight_shape(tensors, fused_name)
         if len(shape) != 2:
             raise ValueError(f"{fused_name} must be a matrix, got shape {shape}")
@@ -872,8 +883,7 @@ def _fused_ffn(
             up, up_scale = _read_quant(tensors, fused_name, up_rows)
             gate_up, gate_up_scale = fuse_gate_up(gate, up, gate_scale, up_scale)
     else:
-        gate_name = _find(tensors, _prefixed(prefixes, ROLES[gate_role], **fmt))
-        up_name = _find(tensors, _prefixed(prefixes, ROLES[up_role], **fmt))
+        gate_name, up_name = inputs
         shape = _weight_shape(tensors, gate_name)
         if len(shape) != 2:
             raise ValueError(f"{gate_name} must be a matrix, got shape {shape}")
@@ -1041,7 +1051,7 @@ class Checkpoint(Mapping[str, torch.Tensor]):
                 raise ValueError(f"invalid checkpoint shard path for {key}: {filename}")
         self.used: set[str] = set()
         self.dequantized: set[str] = set()
-        self._shapes: dict[str, tuple[int, ...]] = {}
+        self._headers: dict[str, tuple[tuple[int, ...], str]] = {}
 
     def _json(self, name: str) -> dict:
         path = self.root / name
@@ -1143,12 +1153,28 @@ class Checkpoint(Mapping[str, torch.Tensor]):
                 pass
             raise
 
-    def shape(self, key: str) -> tuple[int, ...]:
-        """Read a tensor's dimensions from its shard header without loading its payload."""
-        if key not in self._shapes:
+    def _header(self, key: str) -> tuple[tuple[int, ...], str]:
+        """Cache indexed tensor shapes and storage dtypes once per shard."""
+        if key not in self.index:
+            raise KeyError(f"tensor is absent from checkpoint index: {key}")
+        if key not in self._headers:
             with self._open(key) as source:
-                self._shapes[key] = tuple(source.get_slice(key).get_shape())
-        return self._shapes[key]
+                filename = self.index[key]
+                for name in source.keys():
+                    if self.index.get(name) == filename:
+                        view = source.get_slice(name)
+                        self._headers[name] = (tuple(view.get_shape()), view.get_dtype())
+                if key not in self._headers:
+                    raise ValueError(f"tensor {key} is absent from its indexed shard {filename}")
+        return self._headers[key]
+
+    def shape(self, key: str) -> tuple[int, ...]:
+        """Read dimensions without materializing a tensor payload."""
+        return self._header(key)[0]
+
+    def dtype(self, key: str) -> str:
+        """Read the safetensors storage dtype without materializing its payload."""
+        return self._header(key)[1]
 
     def read(self, key: str, selection=None) -> torch.Tensor:
         """Read only the requested tensor or slice; retain names rather than tensor copies."""
