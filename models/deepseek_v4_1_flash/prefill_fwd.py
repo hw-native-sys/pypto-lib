@@ -476,7 +476,7 @@ prefill_attention_entry = prefill_attention_cp if CP_SIZE > 1 else prefill_atten
 def prefill_fwd(
     embedding: pl.Tensor[[CAPACITY, D], pl.BF16],
     engram_ids: pl.Tensor[[2 * CAPACITY * N_HASH_COLS, 1], pl.INT32],
-    engram_scales: pl.Tensor[[2 * ENGRAM_ROWS, 8], pl.UINT8],
+    engram_scales: pld.DistributedTensor[[2 * ENGRAM_SHARD_ROWS, 8], pl.UINT8],
     engram_payload: pld.DistributedTensor[[2 * ENGRAM_SHARD_ROWS, 256], pl.UINT8],
     engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
     engram_wkv_scale: pl.Tensor[[2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
@@ -963,7 +963,7 @@ def prefill_fwd(
 def l2_prefill_fwd(
     embedding: pl.Tensor[[CAPACITY, D], pl.BF16],
     engram_ids: pl.Tensor[[2 * CAPACITY * N_HASH_COLS, 1], pl.INT32],
-    engram_scales: pl.Tensor[[2 * ENGRAM_ROWS, 8], pl.UINT8],
+    engram_scales: pld.DistributedTensor[[2 * ENGRAM_SHARD_ROWS, 8], pl.UINT8],
     engram_payload: pld.DistributedTensor[[2 * ENGRAM_SHARD_ROWS, 256], pl.UINT8],
     engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
     engram_wkv_scale: pl.Tensor[[2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
@@ -1094,7 +1094,6 @@ def l2_prefill_fwd(
 def l3_prefill_fwd(
     embedding: pl.Tensor[[RANKS, CAPACITY, D], pl.BF16],
     engram_ids: pl.Tensor[[RANKS, 2 * CAPACITY * N_HASH_COLS, 1], pl.INT32],
-    engram_scales: pl.Tensor[[RANKS, 2 * ENGRAM_ROWS, 8], pl.UINT8],
     engram_wkv: pl.Tensor[[RANKS, 2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
     engram_wkv_scale: pl.Tensor[[RANKS, 2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
     engram_weight: pl.Tensor[[RANKS, 2, HC_MULT, D], pl.FP32],
@@ -1247,6 +1246,9 @@ def l3_prefill_fwd(
     c1a_index_block_table.bind_dynamic(1, B_DYN)
     c1a_index_block_table.bind_dynamic(2, C1A_TABLE_DYN)
     query_start_loc.bind_dynamic(2, Q_START_DYN)
+    engram_scale_buffer = pld.alloc_window_buffer(
+        [2 * ENGRAM_SHARD_ROWS, 8], dtype=pl.UINT8, memory_source="host", init="engram_scale",
+    )
     engram_payload_buffer = pld.alloc_window_buffer([2 * ENGRAM_SHARD_ROWS, 256], dtype=pl.UINT8, memory_source="host", init="engram_payload")
     moe_workspace_buffer = pld.alloc_window_buffer([MOE_WORKSPACE_BYTES], dtype=pl.UINT8)
     attention_window_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
@@ -1258,6 +1260,7 @@ def l3_prefill_fwd(
     head_logits_buffer = pld.alloc_window_buffer([16, VOCAB], dtype=pl.BF16)
     head_logits_done_buffer = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
+        engram_scales = pld.window(engram_scale_buffer, [2 * ENGRAM_SHARD_ROWS, 8], dtype=pl.UINT8)
         engram_payload = pld.window(engram_payload_buffer, [2 * ENGRAM_SHARD_ROWS, 256], dtype=pl.UINT8)
         moe_workspace = pld.window(moe_workspace_buffer, [MOE_WORKSPACE_BYTES], dtype=pl.UINT8)
         attention_window = pld.window(attention_window_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
@@ -1270,7 +1273,7 @@ def l3_prefill_fwd(
         head_logits_done = pld.window(head_logits_done_buffer, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         l2_prefill_fwd(
             embedding[rank],
-            engram_ids[rank], engram_scales[rank], engram_payload,
+            engram_ids[rank], engram_scales, engram_payload,
             engram_wkv[rank], engram_wkv_scale[rank], engram_weight[rank],
             embedding_ids[rank],
             initial_pre[rank],
@@ -1332,7 +1335,7 @@ def l3_prefill_fwd(
 
 PREFILL_TENSORS = (
     "embedding",
-    "engram_ids", "engram_scales", "engram_wkv", "engram_wkv_scale", "engram_weight",
+    "engram_ids", "engram_wkv", "engram_wkv_scale", "engram_weight",
     "embedding_ids",
     "initial_pre",
     "identity_rows",
@@ -2097,19 +2100,17 @@ def generate(
     parameters = compiled._get_metadata()[0]
     names = [parameter.name.removesuffix("__ssa_v0") for parameter in parameters]
     if (names != list(PREFILL_TENSORS) or tuple(parameters[0].shape) != (RANKS, CAPACITY, D)
-            or tuple(parameters[1].shape) != (RANKS, 2 * CAPACITY * N_HASH_COLS, 1)
-            or tuple(parameters[2].shape) != (RANKS, 2 * ENGRAM_ROWS, 8)):
+            or tuple(parameters[1].shape) != (RANKS, 2 * CAPACITY * N_HASH_COLS, 1)):
         raise ValueError("--runtime-dir must contain prefill compiled for the same EP and capacity with integrated Engram lookup")
     decode_names = []
     if decode_compiled is not None:
         decode_parameters = decode_compiled._get_metadata()[0]
         decode_names = [parameter.name.removesuffix("__ssa_v0") for parameter in decode_parameters]
-        if decode_names[:5] != ["engram_ids", "engram_scales", "engram_wkv", "engram_wkv_scale", "engram_weight"]:
+        if decode_names[:4] != ["engram_ids", "engram_wkv", "engram_wkv_scale", "engram_weight"]:
             raise ValueError("decode artifact must use the integrated Engram ABI")
         decode_shape = decode_parameters[0].shape
         decode_rows = C.DECODE_INPUT_MAX_TOKENS
-        if (decode_shape[0] != RANKS or decode_shape[-1] != 1
-                or tuple(decode_parameters[1].shape) != (RANKS, 2 * ENGRAM_ROWS, 8)):
+        if decode_shape[0] != RANKS or decode_shape[-1] != 1:
             raise ValueError("decode artifact must match EP and the configured decode capacity")
     if len(device_ids) != RANKS or len(set(device_ids)) != RANKS or len(prompts) != RANKS:
         raise ValueError(f"prefill requires {RANKS} distinct devices and one prompt per rank")
@@ -2213,12 +2214,11 @@ def generate(
         if head_parameter_names != list(head_names):
             raise ValueError("generation head parameters must match the staged head tensor names in order")
         extra.extend((decode_compiled, generation_head))
-    inherited = [prefill_counts, *decode_counts.values(), tables.upload_buffer]
+    inherited = [prefill_counts, *decode_counts.values()]
     with tables, compiled.prepare(
         config, extra_compiled=extra, persistent=True, reset_persistent_windows=False,
-        inherited_host_tensors=inherited, window_sources={"engram_payload": tables.sources},
+        inherited_host_tensors=inherited, window_sources={"engram_payload": tables.sources, "engram_scale": tables.scale_sources},
     ) as runtime:
-        device_scales = tables.upload_scales(runtime)
         per_rank = [{} for _ in device_ids]
         host_cache = []
         rope_tables = None
@@ -2239,8 +2239,6 @@ def generate(
                 elif name in weights.tensor_layouts:
                     shape, dtype = weights.tensor_layouts[name]
                     tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
-                elif name == "engram_scales":
-                    tensors[name] = device_scales.shards[rank]
                 elif name in outputs:
                     shape, dtype = outputs[name]
                     tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
@@ -2294,8 +2292,6 @@ def generate(
                         )
                     elif name in constants:
                         tensors[name] = per_rank[rank][name]
-                    elif name == "engram_scales":
-                        tensors[name] = device_scales.shards[rank]
                     elif name == "dspark_target_hidden":
                         tensors[name] = runtime.alloc_tensor((decode_rows, DSPARK_MAIN_IN), torch.bfloat16, worker_id=rank)
                     else:
@@ -2351,7 +2347,7 @@ def generate(
                 else:
                     prefill_counts[rank].copy_(inputs.pop("counts"))
                 for name, value in inputs.items():
-                    if name not in constants and name not in ("engram_scales", "engram_hash_ids"):
+                    if name not in constants and name != "engram_hash_ids":
                         runtime.copy_to(
                             tensors[name].data_ptr, value.data_ptr(), value.numel() * value.element_size(),
                             worker_id=rank,
@@ -2420,7 +2416,8 @@ def generate(
         "engram_host_payload_bytes": tables.host_payload_bytes,
         "engram_host_payload_bytes_per_program": tables.host_payload_bytes_per_program,
         "engram_host_window_program_count": tables.program_count,
-        "engram_device_scale_bytes_per_rank": tables.device_scale_bytes_per_rank,
+        "engram_host_scale_bytes": tables.host_scale_bytes,
+        "engram_host_scale_bytes_per_program": tables.host_scale_bytes_per_program,
         "timing_samples": timing_samples,
         "timing_boundary": (
             "Per-sample Host wall time: metadata/upload, integrated lookup and forward, copy-back and greedy checks; "
@@ -2504,9 +2501,6 @@ def build_tensor_specs(args=None):
                 value = partial(_zero_packed_weight, shape)
             elif name == "correction_bias":
                 value = _route_bias(N_EXPERTS).repeat(RANKS, N_LAYERS)
-        elif name == "engram_scales":
-            shape, dtype = [RANKS, 2 * ENGRAM_ROWS, 8], torch.uint8
-            value = 127
         elif name in outputs:
             shape, dtype = outputs[name]
             value = None
@@ -2729,10 +2723,16 @@ if __name__ == "__main__":
                 config=config,
                 compile_only=args.compile_only,
                 # The prepared worker binds the Host window source before dispatch.
-                window_sources=None if args.compile_only else {"engram_payload": [
-                    sources.enter_context(EngramPayloadSource([(None, 0, 2 * ENGRAM_SHARD_ROWS * 256)]))
-                    for _ in devices
-                ]},
+                window_sources=None if args.compile_only else {
+                    "engram_payload": [
+                        sources.enter_context(EngramPayloadSource([(None, 0, 2 * ENGRAM_SHARD_ROWS * 256)]))
+                        for _ in devices
+                    ],
+                    "engram_scale": [
+                        sources.enter_context(EngramPayloadSource([(None, 0, 2 * ENGRAM_SHARD_ROWS * 8)]))
+                        for _ in devices
+                    ],
+                },
                 persistent=True,
                 reset_persistent_windows=False,
                 return_tensors=True,
