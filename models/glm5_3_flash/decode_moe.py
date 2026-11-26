@@ -319,17 +319,12 @@ def moe_combine(
     with pl.spmd(T, name_hint="moe_ep_combine", deps=[wait_tid]) as _combine_tid:
         t = pl.tile.get_block_idx()
         acc = pl.full([1, D], dtype=pl.FP32, value=0.0)
-        correction = pl.full([1, D], dtype=pl.FP32, value=0.0)
         if t < active:
             for k in pl.range(TOPK):
                 slot = t * TOPK + k
                 value = slot_out[slot : slot + 1, :]
-                updated = pl.add(acc, value)
-                recovered = pl.sub(updated, acc)
-                error = pl.add(pl.sub(acc, pl.sub(updated, recovered)), pl.sub(value, recovered))
-                correction = pl.add(correction, error)
-                acc = updated
-        y[t : t + 1, :] = pl.add(acc, correction)
+                acc = pl.add(acc, value)
+        y[t : t + 1, :] = acc
 
     return y
 

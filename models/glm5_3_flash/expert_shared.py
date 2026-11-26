@@ -21,7 +21,7 @@ import torch
 
 from models.glm5_3_flash.all_reduce import tp_all_reduce
 from models.glm5_3_flash.config import EP_SIZE, FLASH, TP_SIZE, D
-from models.glm5_3_flash.elementwise import accurate_divide, accurate_sigmoid
+from models.glm5_3_flash.elementwise import sigmoid_fp32
 from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX, expert, quantize_per_token_int8
 from models.glm5_3_flash.utils import pack_int8_nz, unpack_int8_nz
 
@@ -118,7 +118,7 @@ def expert_shared(
                     up_fp32 = pl.maximum(pl.minimum(up_fp32, SWIGLU_LIMIT), -SWIGLU_LIMIT)
                 gate_buffer = pl.create_tensor([SH_ROW_PAD, ACT_INTER_TILE], dtype=pl.FP32)
                 gate_buffer[:, :] = gate_fp32
-                sigmoid = accurate_sigmoid(gate_buffer, SH_ROW_PAD, ACT_INTER_TILE)
+                sigmoid = sigmoid_fp32(gate_buffer, SH_ROW_PAD, ACT_INTER_TILE)
                 gated = pl.mul(pl.mul(gate_fp32, sigmoid), up_fp32)
                 gated_bf16 = pl.cast(gated, pl.BF16, mode="rint")
                 gated = pl.cast(gated_bf16, pl.FP32)
@@ -136,7 +136,7 @@ def expert_shared(
             row_scale_q = pl.create_tensor([1, SH_ROW_PAD], dtype=pl.FP32)
             one = pl.create_tensor([1, SH_ROW_PAD], dtype=pl.FP32)
             one[:, :] = pl.full([1, SH_ROW_PAD], dtype=pl.FP32, value=1.0)
-            inverse_maximum = accurate_divide(one, amax_buffer)
+            inverse_maximum = pl.div(one, amax_buffer)
             row_scale_q[:, :] = pl.mul(inverse_maximum, INT8_SCALE_MAX)
             scale_dq_buffer = pl.create_tensor([1, SH_ROW_PAD], dtype=pl.FP32)
             scale_dq_buffer[:, :] = pl.mul(row_amax, 1.0 / INT8_SCALE_MAX)
