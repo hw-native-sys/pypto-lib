@@ -74,8 +74,11 @@ def test_packed_prefill_returns_completed_requests_and_expires_released_handles(
     assert list(completed) == [a, b]
     assert completed[a].tolist() == [capacity, 33]
     assert completed[b].tolist() == [1, 23]
+    page_table = device_inputs[0]["c1a_index_block_table"]
+    assert page_table.tolist() == [[2, -1], [0, 1]]
     session.release(a)
     replacement = session.admit("a", 0, 1)
     with pytest.raises(ValueError, match="Expired"):
         session.advance_batch("decode", [(a, [1])])
     assert session.advance_batch("prefill", [(replacement, [44])])[replacement].tolist() == [0, 44]
+    assert page_table.tolist() == [[0, -1], [-1, -1]]

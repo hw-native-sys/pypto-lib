@@ -12,11 +12,7 @@
 import pypto.language as pl
 from .activation_quant import quantize_projection_activation
 import pypto.language.distributed as pld
-from .sparse_attention import (
-    SWA_RUN_DESCRIPTOR_WIDTH as RUN_DESCRIPTOR_WIDTH, SWA_RUN_PARTS as RUN_PARTS,
-    analyze_index_runs, attend_shared_cache, decode_shared_cache_after_publish,
-    prefill_publish_window,
-)
+from .sparse_attention import attend_shared_cache_direct, decode_shared_cache_after_publish, prefill_publish_window
 from .config import WINDOW_CACHE_GROUP, FLASH as M, TP_SIZE, PREFILL_MAX_TOKENS
 from .dsl_types import ORI_BLOCKS_DYN, T_DYN, SP_T_DYN
 from .hc import prefill_sp_post
@@ -45,11 +41,6 @@ MIX_HC = M.mix_hc
 
 
 prefill_sp_input_allgather = make_prefill_sp_input_allgather(PREFILL_MAX_TOKENS)
-
-
-# tiling
-QUERY_TILE = 512
-WORKER_TILE = 64
 
 
 @pl.jit.inline(auto_scope=False)
@@ -99,65 +90,30 @@ def prefill_swa_attention(
         kv_projection, kv,
         num_tokens,
     )
-    chunk_done = prefill_publish_window(kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
-    cache_blocks = pl.tensor.dim(window_cache, 0)
-    cache_rows = cache_blocks * 128
-    decoded_cache = pl.create_tensor([cache_blocks, 128, 1, HEAD_DIM], dtype=pl.BF16)
+    published = prefill_publish_window(kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
+    cache_rows = pl.tensor.dim(window_cache, 0) * 128
+    key_rows = cache_rows + tokens * 128
+    keys = pl.create_tensor([key_rows, HEAD_DIM], dtype=pl.BF16)
     zero_row = pl.create_tensor([32, HEAD_DIM], dtype=pl.BF16)
-    # Decode once for the entire packed prompt. The explicit publication
-    # dependency protects the hoisted reader independently of query staging.
-    decoded_ready = decode_shared_cache_after_publish(window_cache, window_cache_scale, decoded_cache, zero_row, chunk_done)
+    decoded_ready = decode_shared_cache_after_publish(window_cache, window_cache_scale, keys, zero_row, published)
 
-    chunk_codes = pl.create_tensor([QUERY_TILE, D], dtype=pl.INT8)
-    chunk_scales = pl.create_tensor([QUERY_TILE, 1], dtype=pl.FP32)
-    chunk_cos = pl.create_tensor([QUERY_TILE, ROPE_DIM // 2], dtype=pl.FP32)
-    chunk_sin = pl.create_tensor([QUERY_TILE, ROPE_DIM // 2], dtype=pl.FP32)
-    chunk_indices = pl.create_tensor([QUERY_TILE, 128], dtype=pl.INT32)
-    qr = pl.create_tensor([QUERY_TILE, Q_LORA], dtype=pl.BF16)
-    q = pl.create_tensor([QUERY_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    descriptors = pl.create_tensor([QUERY_TILE, RUN_PARTS, RUN_DESCRIPTOR_WIDTH], dtype=pl.INT32)
-    attended = pl.create_tensor([QUERY_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    chunk_partial = pl.create_tensor([QUERY_TILE, D], dtype=pl.BF16)
+    qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
+    q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    q_proj_rope(
+        kv_input_payload, kv_input_scales,
+        wq_a, wq_a_scale, q_norm_weight,
+        wq_b, wq_b_scale,
+        rope_cos, rope_sin,
+        qr, q, num_tokens,
+    )
 
-    for start in pl.range(0, num_tokens, QUERY_TILE):
-        active = pl.min(QUERY_TILE, num_tokens - start)
-        # The prior chunk must finish reading every reusable scratch buffer.
-        stage_workers = pl.max(1, pl.min(active, pl.system.available_aiv_count()))
-        with pl.spmd(stage_workers, name_hint="prefill_swa_stage", deps=[chunk_done]) as _stage_tid:
-            worker = pl.tile.get_block_idx()
-            for row in pl.range(worker, active, stage_workers):
-                source_row = start + row
-                for col in pl.range(0, D, 512):
-                    chunk_codes[row:row + 1, col:col + 512] = kv_input_payload[source_row:source_row + 1, col:col + 512]
-                chunk_cos[row:row + 1, :] = rope_cos[source_row:source_row + 1, :]
-                chunk_sin[row:row + 1, :] = rope_sin[source_row:source_row + 1, :]
-                chunk_indices[row:row + 1, :] = window_indices[source_row:source_row + 1, :]
-            for tile in pl.range(worker, (active + 15) // 16, stage_workers):
-                row = tile * 16
-                rows = pl.min(16, active - row)
-                factors = pl.load(kv_input_scales, [start + row, 0], [16, 1], valid_shape=[rows, 1])
-                pl.store(factors, [row, 0], chunk_scales)
-        q_proj_rope(
-            chunk_codes, chunk_scales,
-            wq_a, wq_a_scale, q_norm_weight,
-            wq_b, wq_b_scale,
-            chunk_cos, chunk_sin,
-            qr, q,
-            active,
-        )
-        index_ready = analyze_index_runs(chunk_indices, descriptors, active, cache_rows)
-        attend_shared_cache(
-            q, decoded_cache, zero_row,
-            descriptors, chunk_indices, attn_sink,
-            attended, active, decoded_ready, index_ready,
-        )
-        o_proj(attended, wo_a, wo_b, chunk_cos, chunk_sin, chunk_partial, active)
-        with pl.spmd(stage_workers, name_hint="prefill_swa_collect") as collect_tid:
-            worker = pl.tile.get_block_idx()
-            for row in pl.range(worker, active, stage_workers):
-                for col in pl.range(0, D, 1280):
-                    partial[start + row:start + row + 1, col:col + 1280] = chunk_partial[row:row + 1, col:col + 1280]
-        chunk_done = collect_tid
+    attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    attend_shared_cache_direct(
+        q, keys, cache_rows, zero_row,
+        window_indices, attn_sink,
+        attended, num_tokens, decoded_ready,
+    )
+    o_proj(attended, wo_a, wo_b, rope_cos, rope_sin, partial, num_tokens)
     return partial
 
 

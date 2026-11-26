@@ -46,6 +46,8 @@ from .dsl_types import CMP_BLOCKS_DYN, ORI_BLOCKS_DYN, T_DYN
 
 # Dynamic shape variables.
 SELECTED_ROWS = pl.dynamic("SPARSE_SELECTED_ROWS")
+SWA_KEY_ROWS = pl.dynamic("SWA_KEY_ROWS")
+SWA_RUN_WIDTH = pl.dynamic("SWA_RUN_WIDTH")
 BF16_HEADS = pl.dynamic("SPARSE_BF16_HEADS")
 BF16_PAGES_W = pl.dynamic("SPARSE_BF16_PAGES_W")
 BF16_PAGES_C = pl.dynamic("SPARSE_BF16_PAGES_C")
@@ -114,7 +116,7 @@ SWA_SHARED_HEAD_TILE = 16
 SWA_GATHER_TILE = 16
 SWA_SELECTED_GATHER_TILE = 64 if TP_SIZE == 1 else SWA_GATHER_TILE
 SWA_WORKER_TILE = 32
-SWA_CROSS_CORE_SLOT_TILE = 1
+SWA_CROSS_CORE_SLOT_TILE = 3
 SWA_RUN_TILE = 32
 SWA_RUN_PARTS = SWA_WINDOW // SWA_RUN_TILE
 SWA_RUN_DESCRIPTOR_WIDTH = 8
@@ -618,30 +620,39 @@ def attention_tile(
 @pl.jit.inline(auto_scope=False)
 def attend_window_tiled(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    selected: pl.Tensor[[T_DYN, SWA_WINDOW, HEAD_DIM], pl.BF16],
+    keys: pl.Tensor[[SWA_KEY_ROWS, HEAD_DIM], pl.BF16],
     indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
     output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
+    key_offsets: pl.Tensor,
+    use_offsets: pl.constexpr,
 ):
-    """Attend staged SWA rows with increasing-K FP32 score accumulation."""
+    """Attend SWA keys in logical order with FP32 score accumulation."""
     tokens = pl.tensor.dim(query, 0)
     qflat = pl.reshape(query, [tokens * LOCAL_H, HEAD_DIM])
-    kflat = pl.reshape(selected, [tokens * SWA_WINDOW, HEAD_DIM])
     oflat = pl.reshape(output, [tokens * LOCAL_H, HEAD_DIM])
     sink_row = pl.reshape(sink, [1, LOCAL_H])
     head_blocks = LOCAL_H // SWA_HEAD_TILE
     tasks = num_tokens * head_blocks
     workers = pl.max(1, pl.min(pl.min(tasks, SWA_WORKER_TILE), pl.system.available_cluster_count()))
-    with pl.spmd(workers, name_hint="swa_attn", deps=[ready], optimizations=[pl.cross_core_slot(slot_num=1)]) as attention_done:
+    with pl.spmd(
+        workers, name_hint="swa_attn", deps=[ready], optimizations=[pl.cross_core_slot(slot_num=SWA_CROSS_CORE_SLOT_TILE)],
+    ) as attention_done:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, tasks, workers):
             token = block // head_blocks
             head = block % head_blocks * SWA_HEAD_TILE
             q0 = token * LOCAL_H + head
-            k0 = token * SWA_WINDOW
-            attention_tile(qflat, kflat, indices, sink_row, oflat, q0, k0, token, head, SWA_HEAD_TILE, SWA_WINDOW, SWA_WINDOW, True)
+            if use_offsets:
+                k0 = pl.cast(pl.read(key_offsets, [token, 0]), pl.INDEX)
+            else:
+                k0 = token * SWA_WINDOW
+            attention_tile(
+                qflat, keys, indices, sink_row, oflat,
+                q0, k0, token, head, SWA_HEAD_TILE, SWA_WINDOW, SWA_WINDOW, True,
+            )
     return attention_done
 
 
@@ -718,6 +729,40 @@ def decode_shared_cache_packed(
 
 
 @pl.jit.inline(auto_scope=False)
+def _classify_swa_run(
+    ids: pl.Tile[[1, SWA_RUN_WIDTH], pl.INT32],
+    cache_rows: pl.Scalar[pl.INDEX],
+    width: pl.constexpr,
+    classify_empty: pl.constexpr,
+):
+    """Return the physical start, -1 for scattered keys, or -2 for an empty run."""
+    ids_fixed = pl.reshape(ids, [1, width])
+    first = pl.tile.read(ids_fixed, [0, 0])
+    start = pl.cast(first, pl.INDEX)
+    run = pl.cast(-1, pl.INT32)
+    reduction = pl.tile.create([8, width], dtype=pl.FP32)
+    if first >= 0 and start + width <= cache_rows:
+        expected_ids = pl.tile.ci(first, [1, width], dtype=pl.INT32)
+        # Subtract in INT32 before rounding to FP32.
+        difference = pl.sub(ids_fixed, expected_ids)
+        delta = pl.abs(pl.cast(difference, pl.FP32))
+        delta_rows = pl.tile.full([8, width], dtype=pl.FP32, value=0.0)
+        delta_rows = pl.tile.assemble(delta_rows, delta, [0, 0])
+        error = pl.tile.read(pl.row_max(delta_rows, tmp_tile=reduction), [0, 0])
+        if error == 0.0:
+            run = first
+    if classify_empty:
+        if first < 0:
+            index_rows = pl.tile.full([8, width], dtype=pl.FP32, value=0.0)
+            index_values = pl.cast(ids_fixed, pl.FP32)
+            index_rows = pl.tile.assemble(index_rows, index_values, [0, 0])
+            largest = pl.tile.read(pl.row_max(index_rows, tmp_tile=reduction), [0, 0])
+            if largest < 0.0:
+                run = pl.cast(-2, pl.INT32)
+    return run
+
+
+@pl.jit.inline(auto_scope=False)
 def analyze_index_runs(
     indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
     descriptors: pl.Tensor[[T_DYN, SWA_RUN_PARTS, SWA_RUN_DESCRIPTOR_WIDTH], pl.INT32],
@@ -735,35 +780,10 @@ def analyze_index_runs(
             token = block // SWA_RUN_PARTS
             part = block % SWA_RUN_PARTS
             ids = pl.tile.load(indices, [token, part * SWA_RUN_TILE], [1, SWA_RUN_TILE])
-            first = pl.tile.read(ids, [0, 0])
-            expected_ids = pl.tile.ci(first, [1, SWA_RUN_TILE], dtype=pl.INT32)
-            # Subtract in INT32 before casting: FP32 rounding cannot turn a
-            # nonzero integer difference into zero, including large row IDs.
-            delta = pl.abs(pl.cast(pl.sub(ids, expected_ids), pl.FP32))
-            check_data = pl.tile.full([8, SWA_RUN_TILE], dtype=pl.FP32, value=0.0)
-            check_data = pl.tile.assemble(check_data, delta, [0, 0])
-            check_tmp = pl.tile.create([8, SWA_RUN_TILE], dtype=pl.FP32)
-            error = pl.tile.read(pl.row_max(check_data, tmp_tile=check_tmp), [0, 0])
-            first_wide = pl.cast(first, pl.INDEX)
-            contiguous = (first >= 0) and (first_wide + SWA_RUN_TILE <= cache_rows) and (error == 0.0)
-            index_data = pl.tile.full([8, SWA_RUN_TILE], dtype=pl.FP32, value=0.0)
-            index_data = pl.tile.assemble(index_data, pl.cast(ids, pl.FP32), [0, 0])
-            largest_index = pl.tile.read(pl.row_max(index_data, tmp_tile=check_tmp), [0, 0])
-            if largest_index < 0.0:
-                # All invalid rows use a separate, initialized GM zero block.
-                # No cache row zero is referenced, so poisoned cache cannot leak.
-                value_full = pl.tile.full([1, SWA_RUN_DESCRIPTOR_WIDTH], dtype=pl.INT32, value=-2)
-                pl.tile.store(value_full, [block, 0], descriptor_flat)
-            elif contiguous:
-                # Runtime fill values are unsupported by this pinned tile.full.
-                # The difference of two CI tiles broadcasts the INT32 start.
-                descriptor_ci = pl.tile.ci(first, [1, SWA_RUN_DESCRIPTOR_WIDTH], dtype=pl.INT32)
-                descriptor_ci_2 = pl.tile.ci(0, [1, SWA_RUN_DESCRIPTOR_WIDTH], dtype=pl.INT32)
-                descriptor = pl.sub(descriptor_ci, descriptor_ci_2)
-                pl.tile.store(descriptor, [block, 0], descriptor_flat)
-            else:
-                value_full_2 = pl.tile.full([1, SWA_RUN_DESCRIPTOR_WIDTH], dtype=pl.INT32, value=-1)
-                pl.tile.store(value_full_2, [block, 0], descriptor_flat)
+            run = _classify_swa_run(ids, cache_rows, SWA_RUN_TILE, True)
+            # Only column zero stores the run descriptor.
+            descriptor = pl.tile.ci(run, [1, SWA_RUN_DESCRIPTOR_WIDTH], dtype=pl.INT32)
+            pl.tile.store(descriptor, [block, 0], descriptor_flat)
     return ready
 
 
@@ -771,14 +791,13 @@ def analyze_index_runs(
 def decode_shared_cache_after_publish(
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.UINT8],
     scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_GROUPS], pl.BF16],
-    decoded_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.BF16],
+    decoded_flat: pl.Tensor[[SWA_KEY_ROWS, HEAD_DIM], pl.BF16],
     zero_row: pl.Tensor[[32, HEAD_DIM], pl.BF16],
     publish_ready: pl.Scalar[pl.TASK_ID],
 ):
     rows = pl.tensor.dim(cache, 0) * 128
     payload_flat = pl.reshape(cache, [rows, HEAD_DIM])
     scale_flat = pl.reshape(scales, [rows, SWA_GROUPS])
-    decoded_flat = pl.reshape(decoded_cache, [rows, HEAD_DIM])
     # Physical pages are a multiple of 128 rows; GATHER_TILE=32 has no tail.
     # Decode each physical row once with contiguous transfers.
     workers = pl.max(1, pl.min(pl.min(rows // SWA_GATHER_TILE, SWA_WORKER_TILE), pl.system.available_aiv_count()))
@@ -798,6 +817,33 @@ def decode_shared_cache_after_publish(
             decoded = pl.reshape(decoded_bf16, [SWA_GATHER_TILE, HEAD_DIM])
             pl.tile.store(decoded, [row, 0], decoded_flat)
     return ready
+
+
+@pl.jit.inline(auto_scope=False)
+def _load_swa_run(
+    decoded: pl.Tensor,
+    zero_row: pl.Tensor,
+    indices: pl.Tensor,
+    token: pl.Scalar[pl.INDEX],
+    column: pl.Scalar[pl.INDEX],
+    run: pl.Scalar[pl.INT32],
+):
+    """Load one zero, contiguous, or scattered run of SWA keys."""
+    values = pl.create_tile([SWA_RUN_TILE, HEAD_DIM], dtype=pl.BF16)
+    if run == -2:
+        values = pl.load(zero_row, [0, 0], [SWA_RUN_TILE, HEAD_DIM])
+    elif run >= 0:
+        physical = pl.cast(run, pl.INDEX)
+        values = pl.load(decoded, [physical, 0], [SWA_RUN_TILE, HEAD_DIM])
+    else:
+        for lane in pl.range(SWA_RUN_TILE):
+            row = pl.read(indices, [token, column + lane])
+            if row >= 0:
+                physical = pl.cast(row, pl.INDEX)
+                values = pl.tile.gather_row(values, decoded, [lane, 0], [physical, 0], [1, HEAD_DIM])
+            else:
+                values = pl.tile.gather_row(values, zero_row, [lane, 0], [0, 0], [1, HEAD_DIM])
+    return values
 
 
 @pl.jit.inline(auto_scope=False)
@@ -828,23 +874,45 @@ def attend_shared_cache(
             token = block // SWA_RUN_PARTS
             column = block % SWA_RUN_PARTS * SWA_RUN_TILE
             run = pl.read(descriptor_flat, [block, 0])
-            values = pl.create_tile([SWA_RUN_TILE, HEAD_DIM], dtype=pl.BF16)
-            if run == -2:
-                values = pl.load(zero_row, [0, 0], [SWA_RUN_TILE, HEAD_DIM])
-            elif run >= 0:
-                physical = pl.cast(run, pl.INDEX)
-                values = pl.load(decoded, [physical, 0], [SWA_RUN_TILE, HEAD_DIM])
-            else:
-                for lane in pl.range(SWA_RUN_TILE):
-                    row = pl.read(indices, [token, column + lane])
-                    if row >= 0:
-                        physical = pl.cast(row, pl.INDEX)
-                        values = pl.tile.gather_row(values, decoded, [lane, 0], [physical, 0], [1, HEAD_DIM])
-                    else:
-                        values = pl.tile.gather_row(values, zero_row, [lane, 0], [0, 0], [1, HEAD_DIM])
+            values = _load_swa_run(decoded, zero_row, indices, token, column, run)
             destination = token * SWA_WINDOW + column
             pl.store(values, [destination, 0], selected_flat)
-    return attend_window_tiled(query, selected, indices, sink, output, num_tokens, gathered)
+    return attend_window_tiled(query, selected_flat, indices, sink, output, num_tokens, gathered, indices, False)
+
+
+@pl.jit.inline(auto_scope=False)
+def attend_shared_cache_direct(
+    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    keys: pl.Tensor[[SWA_KEY_ROWS, HEAD_DIM], pl.BF16],
+    cache_rows: pl.Scalar[pl.INDEX],
+    zero_row: pl.Tensor[[SWA_RUN_TILE, HEAD_DIM], pl.BF16],
+    indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
+    sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+):
+    """Select contiguous windows and stage fragmented windows after the cache."""
+    tokens = pl.tensor.dim(query, 0)
+    key_offsets = pl.create_tensor([tokens, SWA_RUN_DESCRIPTOR_WIDTH], dtype=pl.INT32)
+    workers = pl.max(1, pl.min(num_tokens, pl.system.available_aiv_count()))
+    with pl.spmd(workers, name_hint="swa_select_window_offsets", deps=[ready]) as selected:
+        worker = pl.tile.get_block_idx()
+        for token in pl.range(worker, num_tokens, workers):
+            window_ids = pl.load(indices, [token, 0], [1, SWA_WINDOW])
+            offset = _classify_swa_run(window_ids, cache_rows, SWA_WINDOW, False)
+            if offset < 0:
+                fallback_row = cache_rows + token * SWA_WINDOW
+                for column in pl.range(0, SWA_WINDOW, SWA_RUN_TILE):
+                    # A2/A3 tile extraction does not support INT32 indices.
+                    run_ids = pl.load(indices, [token, column], [1, SWA_RUN_TILE])
+                    run = _classify_swa_run(run_ids, cache_rows, SWA_RUN_TILE, True)
+                    values = _load_swa_run(keys, zero_row, indices, token, column, run)
+                    pl.store(values, [fallback_row + column, 0], keys)
+                offset = pl.cast(fallback_row, pl.INT32)
+            offsets = pl.tile.ci(offset, [1, SWA_RUN_DESCRIPTOR_WIDTH], dtype=pl.INT32)
+            pl.store(offsets, [token, 0], key_offsets)
+    return attend_window_tiled(query, keys, indices, sink, output, num_tokens, selected, key_offsets, True)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -891,7 +959,8 @@ def swa_attention_partial(
     if use_shared == 0:
         selected = pl.create_tensor([tokens, SWA_WINDOW, HEAD_DIM], dtype=pl.BF16)
         gathered = gather_window_batched(cache, scales, indices, selected, num_tokens)
-        attention_done = attend_window_tiled(query, selected, indices, sink, output, num_tokens, gathered)
+        selected_flat = pl.reshape(selected, [tokens * SWA_WINDOW, HEAD_DIM])
+        attention_done = attend_window_tiled(query, selected_flat, indices, sink, output, num_tokens, gathered, indices, False)
         cache_consumed = attention_done
     else:
         decoded_cache = pl.create_tensor([blocks, 128, 1, HEAD_DIM], dtype=pl.BF16)
@@ -983,7 +1052,8 @@ def _swa_attention_packed_partial(
     if use_shared == 0:
         selected = pl.create_tensor([tokens, SWA_WINDOW, HEAD_DIM], dtype=pl.BF16)
         gathered = gather_window_packed544(cache, indices, selected, num_tokens)
-        attention_done = attend_window_tiled(query, selected, indices, sink, output, num_tokens, gathered)
+        selected_flat = pl.reshape(selected, [tokens * SWA_WINDOW, HEAD_DIM])
+        attention_done = attend_window_tiled(query, selected_flat, indices, sink, output, num_tokens, gathered, indices, False)
         cache_consumed = attention_done
     else:
         decoded_cache = pl.create_tensor([blocks, 128, 1, HEAD_DIM], dtype=pl.BF16)
@@ -1028,6 +1098,30 @@ def l2_sparse_attention_swa(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     output = swa_attention(query, cache, scales, indices, sink, output, num_tokens)
+    return output
+
+
+@pl.jit(auto_scope=False)
+def l2_sparse_attention_swa_direct(
+    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.UINT8],
+    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_GROUPS], pl.BF16],
+    indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
+    sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    output: pl.InOut[pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16]],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    query.bind_dynamic(0, T_DYN)
+    cache.bind_dynamic(0, ORI_BLOCKS_DYN)
+    tokens = pl.tensor.dim(query, 0)
+    cache_rows = pl.tensor.dim(cache, 0) * SWA_WINDOW
+    key_rows = cache_rows + tokens * SWA_WINDOW
+    keys = pl.create_tensor([key_rows, HEAD_DIM], dtype=pl.BF16)
+    zero_row = pl.create_tensor([SWA_RUN_TILE, HEAD_DIM], dtype=pl.BF16)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_fixture_ready") as cache_ready:
+        _anchor = pl.read(indices, [0, 0])
+    decoded = decode_shared_cache_after_publish(cache, scales, keys, zero_row, cache_ready)
+    attend_shared_cache_direct(query, keys, cache_rows, zero_row, indices, sink, output, num_tokens, decoded)
     return output
 
 
@@ -2416,21 +2510,24 @@ def compare_swa_core(actual, expected, *, inputs, reference, **kwargs):
 
 
 def validate_swa_core(args):
-    """Validate the split BF16-scale and packed544 production SWA paths."""
+    """Validate staged and direct SWA on the supported cache layouts."""
     from functools import partial
 
     from golden import run
 
     cases = ("gather", "plain", "runs") if args.swa_case == "all" else (args.swa_case,)
-    layouts = (False,) if args.mode == "swa" else (True,)
-    if args.mode in ("all", "swa-both"):
-        layouts = (False, True)
+    entries = {
+        "swa": l2_sparse_attention_swa,
+        "swa-packed": l2_sparse_attention_swa_packed,
+        "swa-direct": l2_sparse_attention_swa_direct,
+    }
+    modes = {"all": tuple(entries), "swa-both": ("swa", "swa-packed")}.get(args.mode, (args.mode,))
     records = []
-    for packed in layouts:
-        entry = l2_sparse_attention_swa_packed if packed else l2_sparse_attention_swa
-        mode = "swa-packed" if packed else "swa"
-        for case in cases:
-            inputs, reference = make_swa_case(case, packed)
+    for mode in modes:
+        entry = entries[mode]
+        mode_cases = ("runs",) if args.mode == "all" and mode == "swa-direct" and args.swa_case == "all" else cases
+        for case in mode_cases:
+            inputs, reference = make_swa_case(case, packed=mode == "swa-packed")
             result = run(
                 entry,
                 build_swa_specs(inputs),
@@ -2746,7 +2843,7 @@ if __name__ == "__main__":
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[4])
     rows_help = "single row count (default: 1, 7, 12, 13)"
     parser.add_argument("--rows", type=int, help=rows_help)
-    mode_choices = ["packed", "bf16", "both", "c2a", "swa", "swa-packed", "swa-both", "all"]
+    mode_choices = ["packed", "bf16", "both", "c2a", "swa", "swa-packed", "swa-direct", "swa-both", "all"]
     parser.add_argument("--mode", default="all", choices=mode_choices)
     parser.add_argument("--swa-case", default="all", choices=["gather", "plain", "runs", "all"])
     parser.add_argument("--compile-only", action="store_true")
@@ -2755,7 +2852,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.tp != TP_SIZE:
         raise ValueError(f"--tp {args.tp} does not match configured TP_SIZE {TP_SIZE}")
-    if args.mode in ("swa", "swa-packed", "swa-both", "all") and (args.fixture or args.runtime_dir):
+    if (args.mode.startswith("swa") or args.mode == "all") and (args.fixture or args.runtime_dir):
         raise ValueError("--fixture and --runtime-dir require a sparse MLA mode: packed, bf16 or c2a")
     if args.runtime_dir and args.mode == "both":
         raise ValueError("--runtime-dir requires one --mode")

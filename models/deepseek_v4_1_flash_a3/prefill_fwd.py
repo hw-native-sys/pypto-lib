@@ -111,15 +111,13 @@ ROPE_DIM = M.qk_rope_head_dim
 
 
 @pl.jit.inline(auto_scope=False)
-def _shared_prefill_prefix(starts: pl.Tensor[[Q_START_DYN], pl.INT32],
-                           logical_rows: pl.Scalar[pl.INDEX], pool_rows: pl.Scalar[pl.INDEX]):
-    # Single-slot callers retain the original whole-batch path. Packed request
-    # chunks arrive in decreasing length, so the streaming rows form one prefix.
+def _shared_prefill_prefix(starts: pl.Tensor[[Q_START_DYN], pl.INT32], logical_rows: pl.Scalar[pl.INDEX]):
+    # Single-slot dispatches use the whole-batch path. Packed chunks are length-sorted.
     slots = pl.tensor.dim(starts, 0) - 1
     prefix = pl.cast(-1, pl.INT32)
     if slots > 1:
         prefix = pl.cast(0, pl.INT32)
-        if pool_rows <= CACHE_MAX_ROWS:
+        if logical_rows <= CACHE_MAX_ROWS:
             for slot in pl.range(slots):
                 start = pl.read(starts, [slot])
                 end = pl.read(starts, [slot + 1])
@@ -573,9 +571,8 @@ def l2_prefill_fwd(
     encoder_count = pl.read(counts, [0])
     decoder_count = pl.read(counts, [1])
     logical_cache_rows = (pl.tensor.dim(c1a_index_block_table, 1) + 1) * 2 * 128
-    pool_cache_rows = pl.tensor.dim(window_cache, 1) * 2 * 128
-    encoder_shared = _shared_prefill_prefix(query_start_loc[0], logical_cache_rows, pool_cache_rows)
-    decoder_shared = _shared_prefill_prefix(query_start_loc[1], logical_cache_rows, pool_cache_rows)
+    encoder_shared = _shared_prefill_prefix(query_start_loc[0], logical_cache_rows)
+    decoder_shared = _shared_prefill_prefix(query_start_loc[1], logical_cache_rows)
     materialize_rope_rows(
         freqs_cos[0], freqs_sin[0], position_ids[0], encoder_count, rope_cos[0], rope_sin[0], False,
     )

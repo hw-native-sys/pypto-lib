@@ -47,8 +47,7 @@ class PackedSession:
         self._idle_values = {}
         self._active_dps = [set(), set()]
         self.failed = False
-        n = slots * ((context + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE)
-        self.free_pages = [list(reversed(range(n))) for _ in range(C.DP_SIZE)]
+        self._pages_per_slot = (context + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE
 
     def _ready(self):
         if self.failed:
@@ -100,7 +99,6 @@ class PackedSession:
         except BaseException:
             self.failed = True
             raise
-        self.free_pages[handle.dp].extend(reversed(record.pages))
         g.engram.history.pop(handle, None)
         del self.history[handle.request_id]
 
@@ -142,7 +140,7 @@ class PackedSession:
                 record.committed += len(ids)
         return {handle: result[handle] for handle, _ in queries if handle in result}
 
-    def _inputs(self, dp, group, index, capacity):
+    def _inputs(self, group, index, capacity):
         g = self.graphs
         # Prefill and Decode share the same packed positions, page maps and cache allocations.
         template = g.host_io["idle_inputs"][0]
@@ -158,7 +156,9 @@ class PackedSession:
             start = record.committed
             end = start + len(tokens)
             needed = (end + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE
-            record.pages.extend(self.free_pages[dp].pop() for _ in range(needed - len(record.pages)))
+            # Keep each request's physical pages in chronological order.
+            base = handle.slot * self._pages_per_slot
+            record.pages.extend(range(base + len(record.pages), base + needed))
             physical = torch.tensor(record.pages, dtype=torch.int32)
             table[row, :needed] = physical
             n_half = (end // 2 + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE
@@ -219,10 +219,10 @@ class PackedSession:
                 if not group and dp not in self._active_dps[index]:
                     continue
                 if group:
-                    values, sampled, count = self._inputs(dp, group, index, capacity)
+                    values, sampled, count = self._inputs(group, index, capacity)
                 else:
                     if index not in self._idle_values:
-                        self._idle_values[index] = self._inputs(dp, [], index, capacity)
+                        self._idle_values[index] = self._inputs([], index, capacity)
                     values, sampled, count = self._idle_values[index]
                 selections.extend((handle, owner, row) for row, (handle, _) in enumerate(sampled))
                 if index:
