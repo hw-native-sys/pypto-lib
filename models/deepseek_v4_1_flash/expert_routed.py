@@ -1501,6 +1501,7 @@ if __name__ == "__main__":
                 continue
             print(f"Local routed compute: case={case}, tail_round={tail_round}, experts={N_LOCAL_EXPERTS}, stride={RECV_MAX}")
             result = run(
+                a5_default_runtime="host_build_graph",
                 fn=local_compute_test,
                 specs=build_tensor_specs(case, tail_offset=tail_round * N_LOCAL_EXPERTS),
                 golden_fn=golden_local_compute,

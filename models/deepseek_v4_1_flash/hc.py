@@ -933,6 +933,7 @@ if __name__ == "__main__":
         for batch, sequence in shapes:
             print(f"[HC] {name} rows={batch * sequence}", flush=True)
             result = run(
+                a5_default_runtime="host_build_graph",
                 fn=fn,
                 specs=build_specs(batch, sequence),
                 golden_fn=golden_fn,

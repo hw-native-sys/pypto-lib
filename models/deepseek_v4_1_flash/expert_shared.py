@@ -721,6 +721,7 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     result = run(
+        a5_default_runtime="host_build_graph",
         fn=l2_expert_shared,
         specs=build_tensor_specs(),
         golden_fn=golden_expert_shared,

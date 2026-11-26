@@ -1284,7 +1284,9 @@ def build_c2a_specs(args, entry, *, mode="full"):
     ]
     outputs = {"kv_hidden", "hc_output", "hc_next_pre_mix", "q_topk_indices"}
     for spec in specs:
-        spec.resident = "stacked"
+        # L2 reads these counts on the host before launching its kernels.
+        if spec.name not in {"q_token_count", "kv_token_count"}:
+            spec.resident = "stacked"
         if spec.name not in outputs:
             spec.init_value = lambda name=spec.name: initialize(name)
     specs.append(ScalarSpec("attention_epoch", torch.int32, 1, compile_runtime=True, benchmark_step=None))
@@ -1332,6 +1334,7 @@ if __name__ == "__main__":
     torch.set_num_threads(8)
     entry = l3_prefill_c2a_full if CP_SIZE == 1 else l3_prefill_c2a_full_cp
     run_kwargs = dict(
+        a5_default_runtime="host_build_graph",
         fn=entry,
         golden_fn=functools.partial(golden_c2a_prefill, mode="full"),
         compile_only=args.compile_only,
@@ -1345,19 +1348,22 @@ if __name__ == "__main__":
             enable_dep_gen=args.enable_dep_gen,
             ring_heap=PREFILL_ATTN_RING_HEAP,
         ),
-        compare_fn={
+    )
+
+    def compare_outputs(mapping_shape):
+        return {
             "kv_hidden": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "hc_next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
             "hc_output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
             "window_cache": packed_cache_compare(
                 mapped_pool_ratio_allclose(
                     "kv_write_slots", pool_name="window_cache",
-                    mapping_shape=(len(devices), args.tokens), block_size=128, leading_rank_axis=True,
+                    mapping_shape=mapping_shape, block_size=128, leading_rank_axis=True,
                     atol=0.0, rtol=0.0, max_error_ratio=0.01,
                 ),
                 mapped_pool_ratio_allclose(
                     "kv_write_slots", pool_name="window_cache scale",
-                    mapping_shape=(len(devices), args.tokens), block_size=128, leading_rank_axis=True,
+                    mapping_shape=mapping_shape, block_size=128, leading_rank_axis=True,
                     atol=0.0, rtol=0.0, max_error_ratio=0.0,
                 ),
                 fp4=False,
@@ -1365,33 +1371,37 @@ if __name__ == "__main__":
             "compressed_cache": packed_cache_compare(
                 mapped_pool_ratio_allclose(
                     "compressed_write_slots", pool_name="compressed_cache",
-                    mapping_shape=(len(devices), args.tokens), block_size=64, leading_rank_axis=True,
+                    mapping_shape=mapping_shape, block_size=64, leading_rank_axis=True,
                     atol=0.0, rtol=0.0, max_error_ratio=0.01,
                 ),
                 mapped_pool_ratio_allclose(
                     "compressed_write_slots", pool_name="compressed_cache scale",
-                    mapping_shape=(len(devices), args.tokens), block_size=64, leading_rank_axis=True,
+                    mapping_shape=mapping_shape, block_size=64, leading_rank_axis=True,
                     atol=0.0, rtol=0.0, max_error_ratio=0.01,
                 ),
                 fp4=True,
             ),
             "index_cache": mapped_pool_ratio_allclose(
                 "compressed_write_slots", pool_name="index_cache",
-                mapping_shape=(len(devices), args.tokens), block_size=64, leading_rank_axis=True,
+                mapping_shape=mapping_shape, block_size=64, leading_rank_axis=True,
                 atol=0.0, rtol=0.0, max_error_ratio=0.01,
             ),
             "index_cache_scale": mapped_pool_ratio_allclose(
                 "compressed_write_slots", pool_name="index_cache_scale",
-                mapping_shape=(len(devices), args.tokens), block_size=64, leading_rank_axis=True,
+                mapping_shape=mapping_shape, block_size=64, leading_rank_axis=True,
                 atol=0.0, rtol=0.0, max_error_ratio=0.0,
             ),
             "state_cache": ratio_allclose(atol=1e-3, rtol=1e-3),
             "q_topk_indices": functools.partial(
                 compare_compressed_topk, ratio=2, mode="full", cutoff_atol=5e-5, cutoff_rtol=0.03,
             ),
-        },
-    )
+        }
+
     for case in prefill_index_validation_cases(args, ratio=2):
-        result = run(specs=build_c2a_specs(case, entry, mode="full"), **run_kwargs)
+        result = run(
+            specs=build_c2a_specs(case, entry, mode="full"),
+            compare_fn=compare_outputs((len(devices), case.tokens)),
+            **run_kwargs,
+        )
         if not result.passed:
             raise SystemExit(result.error or 1)

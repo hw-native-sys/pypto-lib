@@ -1998,6 +1998,7 @@ def _proj_kv_tile_pypto(
             if task + pl.tile.get_block_num() < tasks:
                 pl.system.set_flag(pl.PipeType.FIX, pl.PipeType.MTE2, 0, core_type=pl.KernelType.AIC)
                 pl.system.wait_flag(pl.PipeType.FIX, pl.PipeType.MTE2, 0, core_type=pl.KernelType.AIC)
+        pl.system.barrier(pipe=pl.PipeType.ALL, core_type=pl.KernelType.AIC)
     return output
 
 
@@ -2362,6 +2363,7 @@ if __name__ == "__main__":
     config = {"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device}
     for active, capacity, row_tile in ((72, 80, 80), (127, 160, 128), (129, 320, 256)):
         result = run(
+            a5_default_runtime="host_build_graph",
             fn=proj_q_a_validation,
             specs=build_proj_q_a_validation_specs(active, capacity, row_tile),
             golden_fn=golden_proj_q_a_validation,
@@ -2382,6 +2384,7 @@ if __name__ == "__main__":
         specs = [spec for spec in specs if spec.name in kv_params]
         outputs = ("kv_projection",)
     result = run(
+        a5_default_runtime="host_build_graph",
         fn=validation, specs=specs,
         golden_fn=golden_qkv_validation,
         compare_fn={name: compare_qkv_output for name in outputs},

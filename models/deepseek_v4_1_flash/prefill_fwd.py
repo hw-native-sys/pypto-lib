@@ -610,14 +610,15 @@ def prefill_fwd(
     )
     q_rows = pl.create_tensor([2, LOCAL_CAPACITY], dtype=pl.INT32)
     restore_indices = pl.create_tensor([2, CAPACITY], dtype=pl.INT32)
-    q_counts = pl.create_tensor([2], dtype=pl.INT32)
     q_rope_cos = pl.create_tensor([3, LOCAL_CAPACITY, 32], dtype=pl.FP32)
     q_rope_sin = pl.create_tensor([3, LOCAL_CAPACITY, 32], dtype=pl.FP32)
     q_window_indices = pl.create_tensor([2, LOCAL_CAPACITY, 128], dtype=pl.INT32)
     q_request_ids = pl.create_tensor([2, LOCAL_CAPACITY], dtype=pl.INT32)
     q_compressed_lens = pl.create_tensor([2, LOCAL_CAPACITY], dtype=pl.INT32)
     for stage_index in pl.range(2):
-        count = pl.read(counts, [stage_index])
+        count = encoder_count
+        if stage_index == 1:
+            count = decoder_count
         chunk = (count + 2 * CP_SIZE - 1) // (2 * CP_SIZE)
         cp_rank = rank % CP_SIZE
         head_start = cp_rank * chunk
@@ -626,7 +627,6 @@ def prefill_fwd(
         tail_count = pl.max(0, pl.min(chunk, count - tail_start))
         with pl.spmd(1, name_hint="prefill_cp_rows") as rows_ready:
             writer = pl.tile.get_block_idx()
-            pl.write(q_counts, [stage_index], pl.cast(head_count + tail_count, pl.INT32))
             for row in pl.range(writer, LOCAL_CAPACITY):
                 source = pl.cast(-1, pl.INT32)
                 if row < head_count:
@@ -664,18 +664,22 @@ def prefill_fwd(
                 else:
                     q_window_indices[stage_index, row:row + 1, :] = pl.full([1, 128], dtype=pl.INT32, value=-1)
         rope_slot = stage_index + 1
-        gather_rows(rope_cos[rope_slot], q_rows[stage_index], q_rope_cos[rope_slot], rows_ready, column_tile=32)
-        gather_rows(rope_sin[rope_slot], q_rows[stage_index], q_rope_sin[rope_slot], rows_ready, column_tile=32)
+        gather_rows(
+            rope_cos[rope_slot], q_rows[stage_index], q_rope_cos[rope_slot], rows_ready, column_tile=32, refresh_row_ids=False,
+        )
+        gather_rows(
+            rope_sin[rope_slot], q_rows[stage_index], q_rope_sin[rope_slot], rows_ready, column_tile=32, refresh_row_ids=False,
+        )
         if stage_index == 0:
-            gather_rows(rope_cos[0], q_rows[0], q_rope_cos[0], rows_ready, column_tile=32)
-            gather_rows(rope_sin[0], q_rows[0], q_rope_sin[0], rows_ready, column_tile=32)
+            gather_rows(rope_cos[0], q_rows[0], q_rope_cos[0], rows_ready, column_tile=32, refresh_row_ids=False)
+            gather_rows(rope_sin[0], q_rows[0], q_rope_sin[0], rows_ready, column_tile=32, refresh_row_ids=False)
     hidden_pair = pl.create_tensor([4 * CAPACITY, HC_MULT, D], dtype=pl.FP32)
     pre_pair = pl.create_tensor([4 * CAPACITY, HC_MULT], dtype=pl.FP32)
     initial_hidden = pl.slice(hidden_pair, [CAPACITY, HC_MULT, D], [0, 0, 0])
     initial_mix = pl.slice(pre_pair, [CAPACITY, HC_MULT], [0, 0])
     gather_ready = pl.system.task_dummy(deps=[])
     pack_x_hc(embedding_ids, embedding, initial_hidden, hidden_tile=D)
-    gather_rows(initial_pre, identity_rows, initial_mix, gather_ready, column_tile=512)
+    gather_rows(initial_pre, identity_rows, initial_mix, gather_ready, column_tile=512, refresh_row_ids=False)
     topk_indices = pl.create_tensor([LOCAL_CAPACITY, INDEX_TOPK], dtype=pl.INT32)
     history_positions = pl.tensor.dim(compressed_cache, 1) * 128
     pool_blocks = pl.min(INDEX_POOL_BLOCKS, (history_positions // 8 + 31) // 32 * 32)
@@ -703,7 +707,16 @@ def prefill_fwd(
     c1a_scale = pl.reshape(c1a_scale_units, [history_pages, 128, 1, 4])
     for layer in pl.range(N_LAYERS):
         stage = layer // 20
-        active = pl.read(counts, [stage])
+        active = encoder_count
+        if stage == 1:
+            active = decoder_count
+        # The row count is known before launch. Reuse the CP row-mapping
+        # formula without a Device write followed by a Host read.
+        cp_chunk = (active + 2 * CP_SIZE - 1) // (2 * CP_SIZE)
+        cp_rank = rank % CP_SIZE
+        cp_head = pl.max(0, pl.min(cp_chunk, active - cp_rank * cp_chunk))
+        cp_tail = pl.max(0, pl.min(cp_chunk, active - (2 * CP_SIZE - 1 - cp_rank) * cp_chunk))
+        local_active = pl.cast(cp_head + cp_tail, pl.INT32)
         current_slot = (2 * stage + layer % 2) * CAPACITY
         next_slot = (2 * stage + (layer + 1) % 2) * CAPACITY
         hidden = pl.slice(hidden_pair, [CAPACITY, HC_MULT, D], [current_slot, 0, 0])
@@ -758,12 +771,18 @@ def prefill_fwd(
         source_bias = pl.slice(correction_bias, [bias_length], [layer * bias_length])
         stage_gate_bias = pl.create_tensor([bias_length], dtype=pl.FP32)
         if stage == 0:
-            gather_routing_bias(source_bias, identity_rows, stage_gate_bias, moe_ready, n_experts=N_EXPERTS)
+            gather_routing_bias(
+                source_bias, identity_rows, stage_gate_bias, moe_ready, n_experts=N_EXPERTS, refresh_row_ids=False,
+            )
         else:
-            gather_routing_bias(source_bias, replay_rows, stage_gate_bias, moe_ready, n_experts=N_EXPERTS)
+            gather_routing_bias(
+                source_bias, replay_rows, stage_gate_bias, moe_ready, n_experts=N_EXPERTS, refresh_row_ids=False,
+            )
         local_bias_rows = pl.min(bias_rows, LOCAL_CAPACITY)
         layer_gate_bias = pl.create_tensor([local_bias_rows * N_EXPERTS], dtype=pl.FP32)
-        gather_routing_bias(stage_gate_bias, q_rows[stage], layer_gate_bias, moe_ready, n_experts=N_EXPERTS)
+        gather_routing_bias(
+            stage_gate_bias, q_rows[stage], layer_gate_bias, moe_ready, n_experts=N_EXPERTS, refresh_row_ids=False,
+        )
         layer_routed_w1: pl.Tensor[[LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w1, [LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
         layer_routed_w1_scale: pl.Tensor[[LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w1_scale, [LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [layer * (LOCAL_EXPERTS * (D // MX_GROUP)), 0])
         layer_routed_w2: pl.Tensor[[LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w2, [LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
@@ -784,12 +803,16 @@ def prefill_fwd(
                     encoder_normalized, c1a_compressor_wkv, layer_compressor_norm, layer_index_wk, layer_index_norm,
                     rope_cos[1], rope_sin[1], c1a_compressed_slots,
                     c1a_cache, c1a_index, c1a_scale,
-                    pl.read(counts, [0]),
+                    encoder_count,
                 )
                 gathered_hidden = pl.reshape(hidden, [CAPACITY, HC_DIM])
                 source_hidden = pl.reshape(encoder_hidden, [CAPACITY, HC_DIM])
-                gather_rows(source_hidden, replay_rows, gathered_hidden, publisher_ready, column_tile=D)
-                gather_rows(encoder_pre, replay_rows, delayed_pre, publisher_ready, column_tile=512)
+                gather_rows(
+                    source_hidden, replay_rows, gathered_hidden, publisher_ready, column_tile=D, refresh_row_ids=False,
+                )
+                gather_rows(
+                    encoder_pre, replay_rows, delayed_pre, publisher_ready, column_tile=512, refresh_row_ids=False,
+                )
         if layer == 1 or layer == 14:
             with pl.scope():
                 engram_slot = layer // 14
@@ -803,9 +826,8 @@ def prefill_fwd(
             normalized = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
             global_hc = pl.reshape(hidden, [CAPACITY, HC_DIM])
             local_hc = pl.reshape(local_hidden, [LOCAL_CAPACITY, HC_DIM])
-            gather_rows(global_hc, q_rows[stage], local_hc, moe_ready, column_tile=D)
-            gather_rows(delayed_pre, q_rows[stage], local_pre, moe_ready, column_tile=16)
-            local_active = pl.read(q_counts, [stage])
+            gather_rows(global_hc, q_rows[stage], local_hc, moe_ready, column_tile=D, refresh_row_ids=False)
+            gather_rows(delayed_pre, q_rows[stage], local_pre, moe_ready, column_tile=16, refresh_row_ids=False)
             mode = 0
             cache_slot = 0
             rope_slot = 0
@@ -867,7 +889,7 @@ def prefill_fwd(
             layer_shared_w3, layer_shared_w3_scale, local_next_pre, ffn_mixed, local_next_hidden,
             moe_workspace,
             slab_hidden, slab_pre, slab_mixed, slab_rows,
-            moe_ready, pl.read(q_counts, [stage]), capacity=LOCAL_CAPACITY,
+            moe_ready, local_active, capacity=LOCAL_CAPACITY,
         )
         if CP_SIZE > 1:
             moe_ready = prefill_cp_gather_hc(
@@ -905,8 +927,8 @@ def prefill_fwd(
     final_pre = pl.slice(pre_pair, [CAPACITY, HC_MULT], [FINAL_SLOT, 0])
     source_hidden = pl.reshape(final_hidden, [CAPACITY, HC_DIM])
     output_hidden = pl.reshape(x_hc_out, [CAPACITY, HC_DIM])
-    gather_rows(source_hidden, identity_rows, output_hidden, gather_ready, column_tile=D)
-    gather_rows(final_pre, identity_rows, pre_mix_out, gather_ready, column_tile=512)
+    gather_rows(source_hidden, identity_rows, output_hidden, gather_ready, column_tile=D, refresh_row_ids=False)
+    gather_rows(final_pre, identity_rows, pre_mix_out, gather_ready, column_tile=512, refresh_row_ids=False)
     if CP_SIZE > 1:
         retire_prefill_signals(x_hc_out, attention_arrived, rank // CP_SIZE * CP_SIZE, rank % CP_SIZE, group_size=CP_SIZE)
         retire_prefill_signals(x_hc_out, hc_arrived, rank // CP_SIZE * CP_SIZE, rank % CP_SIZE, group_size=CP_SIZE)
@@ -2027,6 +2049,20 @@ def prepare_decode_inputs(values):
     return result
 
 
+def _checkpoint_artifact_runtime(compiled):
+    """Read the runtime used by every chip callable in a checkpoint artifact."""
+    from pypto.runtime._artifact_sources import read_kernel_config
+
+    configs = sorted((compiled.output_dir / "next_levels").glob("*/kernel_config.py"))
+    runtimes = {
+        getattr(read_kernel_config(path), "RUNTIME_CONFIG", {}).get("runtime", "tensormap_and_ringbuffer")
+        for path in configs
+    }
+    if len(runtimes) != 1:
+        raise ValueError(f"expected one runtime in checkpoint artifact {compiled.output_dir}, found {sorted(runtimes)}")
+    return runtimes.pop()
+
+
 def generate(
     checkpoint, compiled, device_ids, prompts, max_new_tokens, *,
     chunk_size=None, decode_compiled=None,
@@ -2046,6 +2082,13 @@ def generate(
     validate_forward_engram_layout(compiled.output_dir, RANKS, ENGRAM_ROWS)
     if decode_compiled is not None:
         validate_forward_engram_layout(decode_compiled.output_dir, RANKS, ENGRAM_ROWS)
+        prefill_runtime = _checkpoint_artifact_runtime(compiled)
+        decode_runtime = _checkpoint_artifact_runtime(decode_compiled)
+        if prefill_runtime != decode_runtime:
+            raise ValueError(
+                f"checkpoint generation requires the same runtime for prefill and decode artifacts "
+                f"({prefill_runtime!r} != {decode_runtime!r})"
+            )
 
     from tokenizers import Tokenizer
     from pypto.runtime import DeviceTensor
@@ -2136,6 +2179,7 @@ def generate(
     finished = [False] * RANKS
     image_rows_seen = [0] * RANKS
     # Host control tensors must be shared and registered before the chip-worker fork.
+    prefill_counts = torch.zeros((RANKS, 2), dtype=torch.int32).share_memory_()
     decode_counts = {
         name: torch.zeros(RANKS, dtype=torch.int32).share_memory_()
         for name in ("moe_num_tokens", "attention_num_tokens")
@@ -2149,15 +2193,27 @@ def generate(
         "sampling_temperatures", "sampling_top_ks", "sampling_top_ps", "sampling_seeds", "sampling_positions",
         "logits", "sampled_ids",
     )
-    extra = [] if decode_compiled is None else [decode_compiled]
-    generation_head = None if decode_compiled is None else l3_generation_head.compile(config=config)
-    if generation_head is not None:
+    extra = []
+    generation_head = None
+    if decode_compiled is not None:
+        from pypto.pypto_core import passes
+
+        # A5's compiler runtime selectors and the emitted Simpler runtime names differ for HBG.
+        selector = {
+            "percounter": "host_build_graph",
+            "host_build_graph": "host_build_graph_experimental",
+        }.get(decode_runtime, decode_runtime)
+        with passes.PassContext(
+            [], runtime=passes.runtime_kind_from_name(selector),
+            verification_level=passes.get_default_verification_level(),
+            diagnostic_phase=passes.get_default_diagnostic_phase(),
+        ):
+            generation_head = l3_generation_head.compile(config=config)
         head_parameter_names = [parameter.name.removesuffix("__ssa_v0") for parameter in generation_head._get_metadata()[0]]
         if head_parameter_names != list(head_names):
             raise ValueError("generation head parameters must match the staged head tensor names in order")
-    if generation_head is not None:
-        extra.append(generation_head)
-    inherited = [*decode_counts.values(), tables.upload_buffer]
+        extra.extend((decode_compiled, generation_head))
+    inherited = [prefill_counts, *decode_counts.values(), tables.upload_buffer]
     with tables, compiled.prepare(
         config, extra_compiled=extra, persistent=True, reset_persistent_windows=False,
         inherited_host_tensors=inherited, window_sources={"engram_payload": tables.sources},
@@ -2175,6 +2231,8 @@ def generate(
             rope_tables = inputs["freqs_cos"], inputs["freqs_sin"]
             host_cache.append({name: inputs[name] for name in cache_names})
             for name in PREFILL_TENSORS:
+                if name == "counts":
+                    continue
                 if name == "correction_bias" and multimodal:
                     shape = (N_LAYERS * CAPACITY * N_EXPERTS,)
                     tensors[name] = runtime.alloc_tensor(shape, torch.float32, worker_id=rank)
@@ -2200,8 +2258,9 @@ def generate(
             name: StackedDeviceTensor(
                 [rank[name] for rank in per_rank], (RANKS, *per_rank[0][name].shape), tuple(range(RANKS))
             )
-            for name in PREFILL_TENSORS
+            for name in PREFILL_TENSORS if name != "counts"
         }
+        stacked["counts"] = prefill_counts
         logits = torch.empty((RANKS, 16, VOCAB), dtype=torch.float32)
         sampled_ids = torch.empty((RANKS, 16, 8), dtype=torch.int32)
         committed = [0] * RANKS
@@ -2289,6 +2348,8 @@ def generate(
                     inputs = prepare_decode_inputs(inputs)
                     for counts in decode_counts.values():
                         counts[rank] = len(token_ids)
+                else:
+                    prefill_counts[rank].copy_(inputs.pop("counts"))
                 for name, value in inputs.items():
                     if name not in constants and name not in ("engram_scales", "engram_hash_ids"):
                         runtime.copy_to(
@@ -2661,6 +2722,7 @@ if __name__ == "__main__":
         )
         with ExitStack() as sources:
             result = run(
+                a5_default_runtime="host_build_graph",
                 fn=l3_prefill_fwd,
                 specs=specs,
                 golden_fn=None,

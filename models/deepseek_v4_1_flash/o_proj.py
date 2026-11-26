@@ -1599,6 +1599,7 @@ if __name__ == "__main__":
     for active, padded, oa_row_tile in cases:
         print(f"[O_PROJ] active={active}, padded={padded}, oa_row_tile={oa_row_tile}, FP32 HC post", flush=True)
         result = run(
+            a5_default_runtime="host_build_graph",
             fn=o_proj_hc_post_validation.specialize(num_tokens=pl.RUNTIME, oa_row_tile=oa_row_tile),
             specs=build_o_proj_hc_post_specs(active, pad_to_tile=padded),
             golden_fn=golden_o_proj_hc_post_validation,

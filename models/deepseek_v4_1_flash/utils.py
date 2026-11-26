@@ -87,6 +87,16 @@ def prefill_index_validation_cases(args, ratio):
     scored = copy.copy(args)
     scored.query_lens = [[8]]
     scored.start_pos = [[ratio * (M.index_topk + 32)]]
+    if ratio == 2:
+        single = copy.copy(scored)
+        single.query_lens = [[1]]
+        # The first C2A chunk maps keys. The four live rows in the next chunk score.
+        mixed = copy.copy(args)
+        mapping_rows = ratio * M.index_topk
+        mixed.tokens = 2 * mapping_rows
+        mixed.query_lens = [[mapping_rows + 4]]
+        mixed.start_pos = [[0]]
+        return [args, scored, single, mixed]
     return [args, scored]
 
 
