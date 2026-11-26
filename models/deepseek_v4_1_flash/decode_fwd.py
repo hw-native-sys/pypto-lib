@@ -45,11 +45,8 @@ from decode_swa import decode_swa
 from input_pack import prepare_compressed_lens
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
 from engram import (
-    ENGRAM_K, KV_OUT, N_HASH_COLS, build_random_engram_ids, engram,
-)
-from utils import (
-    ENGRAM_ROWS, ENGRAM_SHARD_ROWS, ENGRAM_LOOKUPS_DYN, EngramPayloadSource,
-    write_forward_engram_layout,
+    ENGRAM_K, ENGRAM_LOOKUPS_DYN, ENGRAM_ROWS, ENGRAM_SHARD_ROWS, KV_OUT, N_HASH_COLS,
+    EngramPayloadSource, build_random_engram_ids, engram, write_forward_engram_layout,
 )
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
 from mega_moe import FP4_PANEL_ROWS, forward_routed_weight_spec, use_packed_decode_weights, workspace_bytes

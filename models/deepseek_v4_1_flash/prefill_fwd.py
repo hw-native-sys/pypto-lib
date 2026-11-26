@@ -78,16 +78,17 @@ from prefill_cp_allgather import prefill_cp_gather_hc
 from hc import hc_head
 from input_pack import gather_rows, pack_x_hc
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, prepare_forward_rope_tables
-from utils import (
-    ENGRAM_ROWS, ENGRAM_SHARD_ROWS, EngramHostTables, EngramPayloadSource,
-    paged_slots, validate_forward_engram_layout, window_metadata, write_forward_engram_layout,
+from engram import (
+    ENGRAM_K, ENGRAM_ROWS, ENGRAM_SHARD_ROWS, KV_OUT, N_HASH_COLS,
+    EngramHostTables, EngramPayloadSource, HostEngram, engram,
+    validate_forward_engram_layout, write_forward_engram_layout,
 )
+from utils import paged_slots, window_metadata
 from lm_head import MAX_LOGIT_ROWS, clear_lm_head_signals, lm_head
 from gate import gather_routing_bias
 from sample import sample
 
 BIAS_DYN = pl.dynamic("PREFILL_FORWARD_BIAS_DYN")
-from engram import ENGRAM_K, KV_OUT, N_HASH_COLS, HostEngram, engram
 from mega_moe import workspace_bytes
 from prefill_moe import FORWARD_LOCAL_EXPERTS as LOCAL_EXPERTS, make_prefill_moe
 from compressor import STATE_WIDTH

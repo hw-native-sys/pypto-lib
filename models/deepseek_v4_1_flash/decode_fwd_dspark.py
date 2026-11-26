@@ -875,7 +875,7 @@ if __name__ == "__main__":
         parser.error(f"need {EP_SIZE} distinct non-negative device IDs")
     from golden import run
     from pypto.ir import DistributedConfig
-    from utils import ENGRAM_SHARD_ROWS, EngramPayloadSource
+    from engram import EngramPayloadSource
 
     config = dict(
         backend_type="a5", execution_mode=False,
@@ -895,7 +895,7 @@ if __name__ == "__main__":
             runtime_dir=args.runtime_dir,
             # The prepared worker binds the Host window source before dispatch.
             window_sources=None if args.compile_only else {"engram_payload": [
-                sources.enter_context(EngramPayloadSource([(None, 0, 2 * ENGRAM_SHARD_ROWS * 256)]))
+                sources.enter_context(EngramPayloadSource([(None, 0, 2 * TARGET_FWD_ENGRAM_SHARD_ROWS * 256)]))
                 for _ in devices
             ]},
             persistent=True,
