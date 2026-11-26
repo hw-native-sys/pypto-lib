@@ -44,10 +44,9 @@ from decode_c2a_reuse import decode_c2a_reuse
 from decode_swa import decode_swa
 from input_pack import prepare_compressed_lens
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
-from engram import ENGRAM_K, FETCH_TILE, KV_OUT, N_HASH_COLS, engram_from_rows, engram_host_lookup
-from utils import (
-    ENGRAM_ROWS, ENGRAM_SHARD_ROWS, ENGRAM_LOOKUPS_DYN, EngramPayloadSource,
-    write_forward_engram_layout,
+from engram import (
+    ENGRAM_K, ENGRAM_LOOKUPS_DYN, ENGRAM_ROWS, ENGRAM_SHARD_ROWS, KV_OUT, N_HASH_COLS,
+    EngramPayloadSource, build_random_engram_ids, engram, write_forward_engram_layout,
 )
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
 from mega_moe import FP4_PANEL_ROWS, forward_routed_weight_spec, use_packed_decode_weights, workspace_bytes
@@ -132,7 +131,9 @@ def capture_dspark_target_hidden(
 
 @pl.jit.inline(auto_scope=False)
 def decode_encoder(
-    engram_lookup: pl.Tensor[[2, T_DYN, ENGRAM_K], pl.BF16],
+    engram_ids: pl.Tensor[[2 * T_DYN * N_HASH_COLS, 1], pl.INT32],
+    engram_scales: pl.Tensor[[2 * ENGRAM_ROWS, 8], pl.UINT8],
+    engram_payload: pld.DistributedTensor[[2 * ENGRAM_SHARD_ROWS, 256], pl.UINT8],
     engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
     engram_wkv_scale: pl.Tensor[[2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
     engram_weight: pl.Tensor[[2, HC_MULT, D], pl.FP32],
@@ -264,10 +265,10 @@ def decode_encoder(
             with pl.scope():
                 engram_slot = layer // 14
                 layer_engram_scale = pl.slice(engram_wkv_scale, [ENGRAM_K // 32, KV_OUT], [engram_slot * (ENGRAM_K // 32), 0])
-                engram_from_rows(
-                    engram_lookup[engram_slot], engram_wkv[engram_slot], layer_engram_scale,
-                    engram_weight[engram_slot], x_hc, x_hc,
-                    mask_zero_rows=False,
+                engram(
+                    engram_ids, engram_payload, engram_scales, engram_slot, ENGRAM_SHARD_ROWS,
+                    engram_wkv[engram_slot], layer_engram_scale, engram_weight[engram_slot],
+                    x_hc, x_hc, mask_zero_rows=False,
                 )
         with pl.scope():
             weight_layer = layer % WEIGHT_BANK_SIZE
@@ -753,19 +754,11 @@ def decode_fwd(
 ):
     """Run the decode backbone and retain final HC state in the input buffers."""
     engram_ids.bind_dynamic(0, ENGRAM_LOOKUPS_DYN)
-    lookup_count = pl.tensor.dim(engram_ids, 0)
-    lookup_flat = pl.create_tensor([lookup_count, 256], dtype=pl.BF16)
-    engram_first = pl.create_tensor([FETCH_TILE, 256], dtype=pl.UINT8)
-    engram_second = pl.create_tensor([FETCH_TILE, 256], dtype=pl.UINT8)
-    lookup_flat = engram_host_lookup(
-        engram_ids, engram_payload, engram_first, engram_second, engram_scales, lookup_flat,
-        ENGRAM_SHARD_ROWS,
-    )
-    engram_lookup = pl.reshape(lookup_flat, [2, pl.tensor.dim(x_hc, 0), ENGRAM_K])
     compressed_token_rope_cos = pl.create_tensor([DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
     compressed_token_rope_sin = pl.create_tensor([DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
     encoder_hidden, encoder_pre_mix, token_cos, token_sin = decode_encoder(
-        engram_lookup, engram_wkv, engram_wkv_scale, engram_weight,
+        engram_ids, engram_scales, engram_payload,
+        engram_wkv, engram_wkv_scale, engram_weight,
         x_hc, pre_mix,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_weight,
@@ -1214,8 +1207,7 @@ def build_tensor_specs():
             shape = [EP_SIZE, 2 * MOE_TOKENS * N_HASH_COLS, 1]
         init_value = None
         if name == "engram_ids":
-            init_value = torch.full(shape, -1, dtype=dtype)
-            init_value[:, :2 * N_HASH_COLS, 0] = 0
+            init_value = build_random_engram_ids(EP_SIZE, MOE_TOKENS, FIXTURE_TOKENS, ENGRAM_ROWS)
         elif name == "engram_scales":
             init_value = 127
         elif name == "token_to_req_indices":

@@ -78,16 +78,17 @@ from prefill_cp_allgather import prefill_cp_gather_hc
 from hc import hc_head
 from input_pack import gather_rows, pack_x_hc
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, prepare_forward_rope_tables
-from utils import (
-    ENGRAM_ROWS, ENGRAM_SHARD_ROWS, EngramHostTables, EngramPayloadSource,
-    paged_slots, validate_forward_engram_layout, window_metadata, write_forward_engram_layout,
+from engram import (
+    ENGRAM_K, ENGRAM_ROWS, ENGRAM_SHARD_ROWS, KV_OUT, N_HASH_COLS,
+    EngramHostTables, EngramPayloadSource, HostEngram, engram,
+    validate_forward_engram_layout, write_forward_engram_layout,
 )
+from utils import paged_slots, window_metadata
 from lm_head import MAX_LOGIT_ROWS, clear_lm_head_signals, lm_head
 from gate import gather_routing_bias
 from sample import sample
 
 BIAS_DYN = pl.dynamic("PREFILL_FORWARD_BIAS_DYN")
-from engram import ENGRAM_K, FETCH_TILE, KV_OUT, N_HASH_COLS, HostEngram, engram_from_rows, engram_host_lookup
 from mega_moe import workspace_bytes
 from prefill_moe import FORWARD_LOCAL_EXPERTS as LOCAL_EXPERTS, make_prefill_moe
 from compressor import STATE_WIDTH
@@ -474,7 +475,9 @@ prefill_attention_entry = prefill_attention_cp if CP_SIZE > 1 else prefill_atten
 @pl.jit.inline(auto_scope=False)
 def prefill_fwd(
     embedding: pl.Tensor[[CAPACITY, D], pl.BF16],
-    engram_lookup: pl.Tensor[[2, CAPACITY, ENGRAM_K], pl.BF16],
+    engram_ids: pl.Tensor[[2 * CAPACITY * N_HASH_COLS, 1], pl.INT32],
+    engram_scales: pl.Tensor[[2 * ENGRAM_ROWS, 8], pl.UINT8],
+    engram_payload: pld.DistributedTensor[[2 * ENGRAM_SHARD_ROWS, 256], pl.UINT8],
     engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
     engram_wkv_scale: pl.Tensor[[2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
     engram_weight: pl.Tensor[[2, HC_MULT, D], pl.FP32],
@@ -791,10 +794,10 @@ def prefill_fwd(
             with pl.scope():
                 engram_slot = layer // 14
                 layer_engram_scale = pl.slice(engram_wkv_scale, [ENGRAM_K // 32, KV_OUT], [engram_slot * (ENGRAM_K // 32), 0])
-                engram_from_rows(
-                    engram_lookup[engram_slot], engram_wkv[engram_slot], layer_engram_scale,
-                    engram_weight[engram_slot], hidden, hidden,
-                    mask_zero_rows=True,
+                engram(
+                    engram_ids, engram_payload, engram_scales, engram_slot, ENGRAM_SHARD_ROWS,
+                    engram_wkv[engram_slot], layer_engram_scale, engram_weight[engram_slot],
+                    hidden, hidden, mask_zero_rows=True,
                 )
         with pl.scope():
             normalized = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
@@ -1034,18 +1037,10 @@ def l2_prefill_fwd(
     head_logits_done: pld.DistributedTensor[[C.LM_HEAD_TP_SIZE, 1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
 ):
-    lookup_count = 2 * CAPACITY * N_HASH_COLS
-    lookup_flat = pl.create_tensor([lookup_count, 256], dtype=pl.BF16)
-    engram_first = pl.create_tensor([FETCH_TILE, 256], dtype=pl.UINT8)
-    engram_second = pl.create_tensor([FETCH_TILE, 256], dtype=pl.UINT8)
-    lookup_flat = engram_host_lookup(
-        engram_ids, engram_payload, engram_first, engram_second, engram_scales, lookup_flat,
-        ENGRAM_SHARD_ROWS,
-    )
-    engram_lookup = pl.reshape(lookup_flat, [2, CAPACITY, ENGRAM_K])
     return prefill_fwd(
         embedding,
-        engram_lookup, engram_wkv, engram_wkv_scale, engram_weight,
+        engram_ids, engram_scales, engram_payload,
+        engram_wkv, engram_wkv_scale, engram_weight,
         embedding_ids, initial_pre, identity_rows,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_weight,
@@ -2115,7 +2110,7 @@ def generate(
     if eos_id is None:
         raise ValueError("checkpoint EOS token is missing from its tokenizer")
     weights = ResidentPrefillWeights(checkpoint, ep_size=RANKS)
-    engram = HostEngram(checkpoint, tokenizer)
+    engram = HostEngram(tokenizer)
     config = RunConfig(
         backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD, ring_heap=ring_heap_bytes,
         distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
