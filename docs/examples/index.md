@@ -23,6 +23,7 @@ one above it.
 | Intermediate | [LayerNorm](../../examples/intermediate/layer_norm.py) | Two dependent reductions in one tile, then gamma and beta by broadcast |
 | Intermediate | [RMSNorm](../../examples/intermediate/rms_norm.py) | A reduction wider than one tile: chunked accumulation, then a second normalizing pass |
 | Intermediate | [RoPE](../../examples/intermediate/rope.py) | Transformer layout — half-head slicing, column broadcast, assembling an output from slices |
+| Intermediate | [Per-token INT8 quantization](../../examples/intermediate/per_token_quant.py) | Exact round-to-nearest-even per-row dynamic quantization, fused absmax + scale + quantize |
 | Advanced | [GEMM + elementwise](../../examples/advanced/gemm_eltwise.py) | Fusion: a BF16 matmul with an FP32 accumulator adds its residual without leaving the scope |
 | Advanced | [Multi-projection](../../examples/advanced/multi_proj.py) | One `@pl.jit.inline` body reused for Q, K and V without a dispatch per call |
 | Advanced | [Top-k](../../examples/advanced/topk.py) | Specialized instructions — `sort32` and chained `mrgsort`, mask gather, tie-aware validation |
