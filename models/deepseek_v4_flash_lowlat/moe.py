@@ -429,9 +429,14 @@ def moe(
     return x_next
 
 
-from .hc_pre import _hc_post_and_mix_inputs
-from .gate import gate_and_plan
-from .moe_same_wave import reduce_and_hc
+if __package__:
+    from .gate import gate_and_plan
+    from .hc_pre import _hc_post_and_mix_inputs
+    from .moe_same_wave import reduce_and_hc
+else:
+    from gate import gate_and_plan
+    from hc_pre import _hc_post_and_mix_inputs
+    from moe_same_wave import reduce_and_hc
 
 @pl.jit.inline
 def publish_and_wait(

@@ -12,8 +12,12 @@
 import pypto.language as pl
 import pypto.language.distributed as pld
 
-from .config import FLASH as M
-from .decode_shapes import MOE_TOKENS as T, TP
+if __package__:
+    from .config import FLASH as M
+    from .decode_shapes import MOE_TOKENS as T, TP
+else:
+    from config import FLASH as M
+    from decode_shapes import MOE_TOKENS as T, TP
 
 D = M.hidden_size
 HC = M.hc_mult

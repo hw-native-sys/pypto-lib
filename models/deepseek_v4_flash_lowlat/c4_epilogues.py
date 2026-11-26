@@ -12,13 +12,34 @@
 import pypto.language as pl
 import pypto.language.distributed as pld
 
-from .decode_indexer import (
-    IDX_TOPK, QUERY_SLOTS, TOPK_PAIR_WIDTH, TOPK_ARENA_ROWS,
-)
-from .decode_sparse_attn import (
-    CSA_ATTN_K_TILE, CSA_CMP_GE_BIAS, CSA_CMP_TOPK, CSA_COMPRESS_RATIO,
-    CSA_PADDED_TOPK, CSA_SPARSE_BLOCKS, CSA_TOPK, NEG_INF, WIN, WIN_BLOCKS,
-)
+if __package__:
+    from .decode_indexer import IDX_TOPK, QUERY_SLOTS, TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH
+    from .decode_sparse_attn import (
+        CSA_ATTN_K_TILE,
+        CSA_CMP_GE_BIAS,
+        CSA_CMP_TOPK,
+        CSA_COMPRESS_RATIO,
+        CSA_PADDED_TOPK,
+        CSA_SPARSE_BLOCKS,
+        CSA_TOPK,
+        NEG_INF,
+        WIN,
+        WIN_BLOCKS,
+    )
+else:
+    from decode_indexer import IDX_TOPK, QUERY_SLOTS, TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH
+    from decode_sparse_attn import (
+        CSA_ATTN_K_TILE,
+        CSA_CMP_GE_BIAS,
+        CSA_CMP_TOPK,
+        CSA_COMPRESS_RATIO,
+        CSA_PADDED_TOPK,
+        CSA_SPARSE_BLOCKS,
+        CSA_TOPK,
+        NEG_INF,
+        WIN,
+        WIN_BLOCKS,
+    )
 
 
 PADDED_PLAN_COLS = 32

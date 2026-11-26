@@ -820,9 +820,11 @@ def _gate(
     # are compiled out of the stock branch.
     unused_x = pl.create_tensor([T, 4 * D], dtype=pl.FP32)
     unused_pre = pl.create_tensor([T, 8], dtype=pl.FP32)
-    gate_tp8(x_mixed, norm_w, gate_w, gate_bias, layer_id, num_tokens,
-             tid2eid, input_ids, x_norm_i8, x_norm_scale, indices, weights,
-             unused_x, unused_pre, False)
+    return gate_tp8(
+        x_mixed, norm_w, gate_w, gate_bias, layer_id, num_tokens,
+        tid2eid, input_ids, x_norm_i8, x_norm_scale, indices, weights,
+        unused_x, unused_pre, False,
+    )
 
 
 gate = pl.jit.inline(_gate)

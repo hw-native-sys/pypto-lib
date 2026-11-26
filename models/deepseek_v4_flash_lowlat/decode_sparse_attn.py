@@ -1417,7 +1417,7 @@ def sparse_attn_hca_packed(
     cmp_block_num = pl.tensor.dim(cmp_kv, 0)
     ori_kv_flat = pl.reshape(ori_kv, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
     cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * HCA_CMP_STORAGE_BLOCK_SIZE, HEAD_DIM])
-    cmp_run_bases = pl.create_tensor([B, HCA_CMP_TOPK // HCA_ATTN_K_TILE], dtype=pl.INT32)
+    cmp_run_bases = pl.create_tensor([B, HCA_CMP_TOPK // HCA_ATTN_K_TILE, 3], dtype=pl.INT32)
     for plan_b in pl.spmd(B, name_hint="hca_page_runs", allow_early_resolve=True):
         plan_last_t = plan_b * S + S - 1
         plan_length = pl.cast(pl.read(cmp_seq_lens, [plan_last_t]), pl.INDEX)
@@ -1441,11 +1441,49 @@ def sparse_attn_hca_packed(
             )
             plan_error = pl.row_max(plan_delta_rows)
             plan_base = pl.cast(-1, pl.INT32)
+            plan_next_base = pl.cast(-1, pl.INT32)
+            plan_split = plan_rows
+            physical_limit = cmp_block_num * HCA_CMP_STORAGE_BLOCK_SIZE
             if pl.read(plan_error, [0, 0]) == 0.0:
-                if plan_first >= 0:
-                    if plan_first + plan_rows <= cmp_block_num * HCA_CMP_STORAGE_BLOCK_SIZE:
-                        plan_base = plan_first
-            pl.write(cmp_run_bases, [plan_b, plan_cb], plan_base)
+                if plan_first >= 0 and plan_first + plan_rows <= physical_limit:
+                    plan_base = plan_first
+            else:
+                # Cache pages may wrap inside a block. Find the first logical
+                # mismatch, then validate both complete runs before using DMA.
+                bad = pl.minimum(plan_delta_padded, 1.0)
+                reverse = pl.add(pl.mul(plan_cols, -1.0), 128.0)
+                ranked_bad = pl.mul(reverse, bad)
+                ranked_rows = pl.col_expand(
+                    pl.full([8, HCA_ATTN_K_TILE], dtype=pl.FP32, value=0.0), ranked_bad
+                )
+                max_rank = pl.cast(pl.read(pl.row_max(ranked_rows), [0, 0]), pl.INT32)
+                split = HCA_ATTN_K_TILE - pl.cast(max_rank, pl.INDEX)
+                last = pl.read(cmp_block_table, [plan_b, plan_c0 + plan_rows - 1])
+                second = pl.cast(last, pl.INDEX) - (plan_rows - split - 1)
+                if split > 0 and split < plan_rows and plan_first >= 0 and second >= 0:
+                    if plan_first + split <= physical_limit and second + plan_rows - split <= physical_limit:
+                        first_mask = pl.minimum(
+                            pl.maximum(
+                                pl.add(pl.mul(plan_cols, -1.0), pl.cast(pl.cast(split, pl.INT32), pl.FP32)),
+                                0.0,
+                            ),
+                            1.0,
+                        )
+                        second_offset = pl.cast(pl.cast(second - split, pl.INT32), pl.FP32)
+                        gap = pl.cast(pl.cast(plan_first - second + split, pl.INT32), pl.FP32)
+                        expected = pl.add(pl.add(plan_cols, second_offset), pl.mul(first_mask, gap))
+                        error = pl.abs(pl.sub(plan_pages, expected))
+                        masked = pl.fillpad(pl.set_validshape(error, 1, plan_rows), pad_value=pl.PadValue.zero)
+                        error_rows = pl.col_expand(
+                            pl.full([8, HCA_ATTN_K_TILE], dtype=pl.FP32, value=0.0), masked
+                        )
+                        if pl.read(pl.row_max(error_rows), [0, 0]) == 0.0:
+                            plan_base = plan_first
+                            plan_next_base = pl.cast(second, pl.INT32)
+                            plan_split = split
+            pl.write(cmp_run_bases, [plan_b, plan_cb, 0], plan_base)
+            pl.write(cmp_run_bases, [plan_b, plan_cb, 1], plan_next_base)
+            pl.write(cmp_run_bases, [plan_b, plan_cb, 2], pl.cast(plan_split, pl.INT32))
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
     head_base = pl.cast(my_rank, pl.INDEX) * HCA_H_LOCAL
     sparse_blk_mi = pl.create_tensor([T * QK_M_BOX * HCA_SPARSE_BLOCKS, 1], dtype=pl.FP32)
@@ -1513,17 +1551,29 @@ def sparse_attn_hca_packed(
                                 )
                     else:
                         qk_col0 = (qk_sb - 1) * HCA_ATTN_K_TILE
-                        qk_base_i32 = pl.read(cmp_run_bases, [qk_b, qk_sb - 1])
+                        qk_base_i32 = pl.read(cmp_run_bases, [qk_b, qk_sb - 1, 0])
                         if qk_base_i32 >= 0:
                             qk_base = pl.cast(qk_base_i32, pl.INDEX)
+                            qk_cut = pl.cast(pl.read(cmp_run_bases, [qk_b, qk_sb - 1, 2]), pl.INDEX)
+                            run0_rows = pl.min(qk_cut, qk_valid)
                             qk_kv = pl.gather_row(
                                 qk_kv,
                                 cmp_kv_flat,
                                 [0, 0],
                                 [qk_base, 0],
                                 [HCA_ATTN_K_TILE, HEAD_DIM],
-                                valid_shape=[qk_valid, HEAD_DIM],
+                                valid_shape=[run0_rows, HEAD_DIM],
                             )
+                            if run0_rows < qk_valid:
+                                qk_base1 = pl.cast(pl.read(cmp_run_bases, [qk_b, qk_sb - 1, 1]), pl.INDEX)
+                                qk_kv = pl.gather_row(
+                                    qk_kv,
+                                    cmp_kv_flat,
+                                    [run0_rows, 0],
+                                    [qk_base1, 0],
+                                    [HCA_ATTN_K_TILE, HEAD_DIM],
+                                    valid_shape=[qk_valid - run0_rows, HEAD_DIM],
+                                )
                             qk_pad_rows = HCA_ATTN_K_TILE - qk_valid
                             if qk_pad_rows > 0:
                                 qk_pad_src0 = pl.cast(pl.read(window_swa_indices, [qk_t, 0]), pl.INDEX)

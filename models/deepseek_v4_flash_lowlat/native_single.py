@@ -186,6 +186,7 @@ def l2_decode_fwd(
     sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.FP32],
     reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    local_moe_ready: pld.DistributedTensor[[2, 32], pl.INT32],
     oproj_reduce_window: pld.DistributedTensor[[CSA_OPROJ_REDUCE_ROWS, D], pl.FP32],
     oproj_reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     oproj_sync_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
@@ -193,6 +194,8 @@ def l2_decode_fwd(
     tok_q_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     tok_o_window: pld.DistributedTensor[[T, TOK_O_COLS], pl.BF16],
     tok_o_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    idx_owned_window: pld.DistributedTensor[[12, 512], pl.INT32],
+    idx_owned_ready: pld.DistributedTensor[[12, 32], pl.INT32],
     embed_window: pld.DistributedTensor[[T, D], pl.BF16],
     embed_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     lm_head_hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
@@ -338,6 +341,7 @@ def l2_decode_fwd(
         sampled_ids,
         reduce_window,
         reduce_signal,
+        local_moe_ready,
         oproj_reduce_window,
         oproj_reduce_signal,
         oproj_sync_signal,
@@ -345,6 +349,8 @@ def l2_decode_fwd(
         tok_q_signal,
         tok_o_window,
         tok_o_signal,
+        idx_owned_window,
+        idx_owned_ready,
         lm_head_hidden_window,
         lm_head_hidden_done,
         lm_head_logits_window,
@@ -463,6 +469,7 @@ def l3_decode_fwd(
 ):
     reduce_window_buf = pld.alloc_window_buffer([REDUCE_WINDOW_ROWS, D], dtype=pl.FP32)
     reduce_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    local_moe_ready_buf = pld.alloc_window_buffer([2, 32], dtype=pl.INT32)
     embed_window_buf = pld.alloc_window_buffer([T, D], dtype=pl.BF16)
     embed_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     oproj_reduce_buf = pld.alloc_window_buffer([CSA_OPROJ_REDUCE_ROWS, D], dtype=pl.FP32)
@@ -472,6 +479,8 @@ def l3_decode_fwd(
     tok_q_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     tok_o_window_buf = pld.alloc_window_buffer([T, TOK_O_COLS], dtype=pl.BF16)
     tok_o_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    idx_owned_window_buf = pld.alloc_window_buffer([12, 512], dtype=pl.INT32)
+    idx_owned_ready_buf = pld.alloc_window_buffer([12, 32], dtype=pl.INT32)
     lm_head_hidden_window_buf = pld.alloc_window_buffer(GROUP_LOGIT_ROWS * D * 2)
     lm_head_logits_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * LM_HEAD_VOCAB * 4)
     lm_head_hidden_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
@@ -479,6 +488,7 @@ def l3_decode_fwd(
     for r in pl.range(pld.world_size()):
         reduce_window = pld.window(reduce_window_buf, [REDUCE_WINDOW_ROWS, D], dtype=pl.FP32)
         reduce_signal = pld.window(reduce_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
+        local_moe_ready = pld.window(local_moe_ready_buf, [2, 32], dtype=pl.INT32)
         embed_window = pld.window(embed_window_buf, [T, D], dtype=pl.BF16)
         embed_signal = pld.window(embed_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         oproj_reduce_window = pld.window(oproj_reduce_buf, [CSA_OPROJ_REDUCE_ROWS, D], dtype=pl.FP32)
@@ -488,6 +498,8 @@ def l3_decode_fwd(
         tok_q_signal = pld.window(tok_q_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         tok_o_window = pld.window(tok_o_window_buf, [T, TOK_O_COLS], dtype=pl.BF16)
         tok_o_signal = pld.window(tok_o_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
+        idx_owned_window = pld.window(idx_owned_window_buf, [12, 512], dtype=pl.INT32)
+        idx_owned_ready = pld.window(idx_owned_ready_buf, [12, 32], dtype=pl.INT32)
         lm_head_hidden_window = pld.window(lm_head_hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
         lm_head_hidden_done = pld.window(lm_head_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         lm_head_logits_window = pld.window(
@@ -577,6 +589,7 @@ def l3_decode_fwd(
             sampled_ids[r],
             reduce_window,
             reduce_signal,
+            local_moe_ready,
             oproj_reduce_window,
             oproj_reduce_signal,
             oproj_sync_signal,
@@ -584,6 +597,8 @@ def l3_decode_fwd(
             tok_q_signal,
             tok_o_window,
             tok_o_signal,
+            idx_owned_window,
+            idx_owned_ready,
             embed_window,
             embed_signal,
             lm_head_hidden_window,

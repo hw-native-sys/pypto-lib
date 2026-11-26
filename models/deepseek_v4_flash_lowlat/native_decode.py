@@ -77,8 +77,13 @@ from .decode_csa_owned import (
     TOK_O_COLS,
 )
 from .config import FLASH as MODEL_CONFIG, _parse_int_argv
-from .decode_prepare import N_CACHE_GROUPS, build_decode_metadata
-from .tp_embedding import VOCAB_PER_TP as EMBED_VOCAB_PER_TP, clear_embedding_signals, tp_lookup_embedding_hc
+from .decode_prepare import N_CACHE_GROUPS, build_decode_metadata, pack_x_hc_rows
+from .tp_embedding import (
+    VOCAB_PER_TP as EMBED_VOCAB_PER_TP,
+    clear_embedding_signals,
+    tp_lookup_embedding,
+    tp_lookup_embedding_hc,
+)
 from .target_state import device_input_bridge
 from .target_state import device_commit_inline
 from .target_state import publish_next_request_state

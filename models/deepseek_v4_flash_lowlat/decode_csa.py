@@ -183,9 +183,14 @@ CSA_WB_TOKEN_TILE = 8
 TOKEN_SHARDED = T == O_GROUPS
 
 
-from .c4_epilogues import merge_leaf_and_plan
-from .decode_indexer import indexer_original_leaves,TOPK_ARENA_ROWS,TOPK_PAIR_WIDTH,TOPK_RUN_SCORES
-from .decode_sparse_attn import sparse_attn_csa_head_with_plan,CSA_CMP_TOPK,CSA_PADDED_TOPK,C4_PLAN_COLS
+if __package__:
+    from .c4_epilogues import merge_leaf_and_plan
+    from .decode_indexer import TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH, TOPK_RUN_SCORES, indexer_original_leaves
+    from .decode_sparse_attn import C4_PLAN_COLS, CSA_CMP_TOPK, CSA_PADDED_TOPK, sparse_attn_csa_head_with_plan
+else:
+    from c4_epilogues import merge_leaf_and_plan
+    from decode_indexer import TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH, TOPK_RUN_SCORES, indexer_original_leaves
+    from decode_sparse_attn import C4_PLAN_COLS, CSA_CMP_TOPK, CSA_PADDED_TOPK, sparse_attn_csa_head_with_plan
 
 @pl.jit.inline
 def prepare_csa_metadata(freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16], freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16], position_ids: pl.Tensor[[T], pl.INT32], rope_cos_t: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16]], rope_sin_t: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.BF16]], step_cos_il: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]], step_sin_signed: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]], cmp_cos_il: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]], cmp_sin_signed: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]], q_rope_cos_il: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]], q_rope_sin_signed: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]], q_rope_swap_idx: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.INT32]], out_rope_cos_il: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]], out_rope_sin_signed: pl.Out[pl.Tensor[[T, ROPE_HEAD_DIM], pl.FP32]], out_rope_swap_idx: pl.Out[pl.Tensor[[CSA_ROPE_ROWS, ROPE_HEAD_DIM], pl.INT32]], idx_rope_swap_idx: pl.Out[pl.Tensor[[IDX_ROPE_ROWS, ROPE_HEAD_DIM], pl.INT32]]):

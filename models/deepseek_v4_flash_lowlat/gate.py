@@ -266,16 +266,33 @@ def gate(
 
 
 import pypto.language.distributed as pld
-from .expert_routed import IDX_PAD,N_SLOTS_B,RECV_MAX,SHARED_EID,SH_SLOT,WORK_SLOTS_PAD
-from .moe_same_wave import publish_sort_row,wait_for_sort_rows,publish_group,wait_for_group
+
+if __package__:
+    from .expert_routed import IDX_PAD, N_SLOTS_B, RECV_MAX, SHARED_EID, SH_SLOT, WORK_SLOTS_PAD
+    from .hc_pre import (
+        HC_DIM_INV as HC_MIX_DIM_INV,
+        HC_EPS,
+        HC_PAD as HC_MIX_PAD,
+        LINEAR_OK as HC_MIX_SPLITS,
+        NORM_EPS as HC_MIX_NORM_EPS,
+        RMS_CHUNKS as HC_MIX_RMS_CHUNKS,
+        T_TILE as HC_MIX_TILE,
+    )
+    from .moe_same_wave import publish_group, publish_sort_row, wait_for_group, wait_for_sort_rows
+else:
+    from expert_routed import IDX_PAD, N_SLOTS_B, RECV_MAX, SHARED_EID, SH_SLOT, WORK_SLOTS_PAD
+    from hc_pre import (
+        HC_DIM_INV as HC_MIX_DIM_INV,
+        HC_EPS,
+        HC_PAD as HC_MIX_PAD,
+        LINEAR_OK as HC_MIX_SPLITS,
+        NORM_EPS as HC_MIX_NORM_EPS,
+        RMS_CHUNKS as HC_MIX_RMS_CHUNKS,
+        T_TILE as HC_MIX_TILE,
+    )
+    from moe_same_wave import publish_group, publish_sort_row, wait_for_group, wait_for_sort_rows
 
 N_ROUTES = T * TOPK
-
-from .hc_pre import (
-    HC_DIM_INV as HC_MIX_DIM_INV, HC_EPS, HC_PAD as HC_MIX_PAD,
-    LINEAR_OK as HC_MIX_SPLITS, NORM_EPS as HC_MIX_NORM_EPS,
-    RMS_CHUNKS as HC_MIX_RMS_CHUNKS, T_TILE as HC_MIX_TILE,
-)
 HC_MIX_PARTIAL_ROWS=pl.dynamic("WAVE15_HC_MIX_PARTIAL_ROWS")
 HC_MIX_RMS_ROWS=pl.dynamic("WAVE15_HC_MIX_RMS_ROWS")
 
