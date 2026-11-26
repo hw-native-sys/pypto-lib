@@ -1728,7 +1728,7 @@ def _decode_smoke_inputs(batch: int = BATCH_PAD + 1) -> list[torch.Tensor]:
 def _backend_type(platform: str) -> BackendType:
     if platform not in PA_SUPPORTED_PLATFORMS:
         raise ValueError(f"Qwen decode attention does not support platform {platform!r}")
-    return BackendType.Ascend910B
+    return BackendType.Ascend910
 
 
 # ──────────────────────────────────────────────────────────────────────────────

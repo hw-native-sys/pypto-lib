@@ -365,7 +365,7 @@ def _emit_header(artifact: Path, dst: Path) -> None:
 def _backend_type(platform: str) -> BackendType:
     # The fused RoPE+FAI extern this artifact feeds is A2/A3-only, matching
     # decode_fwd._backend_type / paged_attention_cce.SUPPORTED_PLATFORMS.
-    return BackendType.Ascend910B
+    return BackendType.Ascend910
 
 
 if __name__ == "__main__":

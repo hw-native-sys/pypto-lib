@@ -61,8 +61,8 @@ host's allocator rather than probing for an idle card and racing another user.
 
 | CLI value | PyPTO backend | Execution target | Device argument |
 |---|---|---|---|
-| `-p a2a3 --sim` | `Ascend910B` | A2/A3 simulator | none |
-| `-p a2a3` | `Ascend910B` | Ascend 910B/C NPU | usually one integer ID |
+| `-p a2a3 --sim` | `Ascend910` | A2/A3 simulator | none |
+| `-p a2a3` | `Ascend910` | Ascend 910B/C NPU | usually one integer ID |
 | `-p a5 --sim` | `Ascend950` | A5 simulator | none |
 | `-p a5` | `Ascend950` | Ascend 950 NPU | usually one integer ID |
 

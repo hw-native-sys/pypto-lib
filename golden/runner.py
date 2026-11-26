@@ -181,7 +181,7 @@ def normalize_config(config: Any | None) -> Any:
     if isinstance(fields.get("backend_type"), str):
         from pypto.backend import BackendType
 
-        backends = {"a2a3": BackendType.Ascend910B, "a5": BackendType.Ascend950}
+        backends = {"a2a3": BackendType.Ascend910, "a5": BackendType.Ascend950}
         backend = fields["backend_type"]
         if backend not in backends:
             raise ValueError(f"Invalid backend_type {backend!r}. Expected one of {sorted(backends)}.")
