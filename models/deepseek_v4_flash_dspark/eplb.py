@@ -30,7 +30,7 @@ from math import gcd
 import pypto.language as pl
 import pypto.language.distributed as pld
 
-EPLB_ABI_VERSION = 1
+EPLB_ABI_VERSION = 2  # v2: the transfer HOST ABI carries no external epoch
 
 # An a3 allocation exposes 24 AIC / 48 AIV; a larger SPMD launch would queue
 # blocks on the same cores instead of adding parallelism. Each worker strides
@@ -443,6 +443,8 @@ def build_routing_specs(*, logical_experts: int, ranks: int, redundant_experts: 
     mapping = _routing_placement(physical, logical_experts, ranks, bank_layers)
     inverse = torch.full((bank_rows, ranks), -1, dtype=torch.int32)
     counts = torch.bincount(mapping, minlength=bank_rows).to(torch.int32)
+    if int(counts.max()) > ranks:
+        raise ValueError("A bank row cannot host more replicas than the placement table's rank axis")
     for bank_expert in range(bank_rows):
         locations = torch.nonzero(mapping == bank_expert).flatten().to(torch.int32)
         inverse[bank_expert, :len(locations)] = locations

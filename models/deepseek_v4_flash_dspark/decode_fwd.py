@@ -549,20 +549,22 @@ def _decode_fwd(
     # keeps the active owner prefix; the fused DSpark target marks exactly the
     # active draft offsets in its prepared logit rows.
     # Build the marker through one UB tile: scalar writes from several blocks
-    # would share 64-byte lines and silently drop each other's rows.
+    # would share 64-byte lines and silently drop each other's rows. Identity
+    # routing ignores the marker, so the disabled path skips the fill.
     moe_valid_rows = pl.create_tensor([1, MOE_TOKENS], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_fwd_moe_valid_rows"):
-        valid_rows_tile = pl.tile.full([1, MOE_TOKENS], dtype=pl.INT32, value=-1)
-        for valid_row in pl.range(MOE_TOKENS):
-            marker = pl.cast(-1, pl.INT32)
-            if valid_row < owner_tokens:
-                if valid_rows_from_logits:
-                    if pl.read(logit_row_indices, [valid_row]) >= 0:
+    if EPLB_ENABLED:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_fwd_moe_valid_rows"):
+            valid_rows_tile = pl.tile.full([1, MOE_TOKENS], dtype=pl.INT32, value=-1)
+            for valid_row in pl.range(MOE_TOKENS):
+                marker = pl.cast(-1, pl.INT32)
+                if valid_row < owner_tokens:
+                    if valid_rows_from_logits:
+                        if pl.read(logit_row_indices, [valid_row]) >= 0:
+                            marker = pl.cast(1, pl.INT32)
+                    else:
                         marker = pl.cast(1, pl.INT32)
-                else:
-                    marker = pl.cast(1, pl.INT32)
-            pl.tile.write(valid_rows_tile, [0, valid_row], marker)
-        pl.tile.store(valid_rows_tile, [0, 0], moe_valid_rows)
+                pl.tile.write(valid_rows_tile, [0, valid_row], marker)
+            pl.tile.store(valid_rows_tile, [0, 0], moe_valid_rows)
     moe_valid_rows_flat = pl.reshape(moe_valid_rows, [MOE_TOKENS])
 
     raw_blocks_per_layer = pl.tensor.dim(raw_kv_pool, 0) // MAIN_LAYER_COUNT

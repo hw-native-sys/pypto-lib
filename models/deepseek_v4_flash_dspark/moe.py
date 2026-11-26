@@ -98,7 +98,7 @@ N_PHYSICAL_EXPERTS = N_EXPERTS_GLOBAL + NUM_REDUNDANT_EXPERTS
 if NUM_REDUNDANT_EXPERTS < 0 or N_PHYSICAL_EXPERTS % N_RANKS:
     raise ValueError("Physical expert capacity must be non-negative and divisible by EP")
 EPLB_ENABLED = "--enable-eplb" in sys.argv
-EPLB_ABI_VERSION = 1
+EPLB_ABI_VERSION = 2  # v2: the transfer HOST ABI carries no external epoch
 EPLB_LAYERS = _parse_int_argv("--weight-bank-size", 1)
 EPLB_BANK_ROWS = EPLB_LAYERS * N_EXPERTS_GLOBAL
 N_LOCAL = N_PHYSICAL_EXPERTS // N_RANKS
@@ -1733,9 +1733,10 @@ def prefill_moe_tile(
     # Routing takes an INT32 row marker, never the INT64 token IDs. The wave's
     # num_tokens already excludes CP padding, so every in-range row is valid.
     route_rows = pl.create_tensor([1, PREFILL_MOE_T_TILE], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_route_rows"):
-        route_ones = pl.tile.full([1, PREFILL_MOE_T_TILE], dtype=pl.INT32, value=1)
-        pl.tile.store(route_ones, [0, 0], route_rows)
+    if EPLB_ENABLED:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_route_rows"):
+            route_ones = pl.tile.full([1, PREFILL_MOE_T_TILE], dtype=pl.INT32, value=1)
+            pl.tile.store(route_ones, [0, 0], route_rows)
     physical_indices = prefill_route_eplb(
         indices, eplb_mapping, eplb_replicas, pl.reshape(route_rows, [PREFILL_MOE_T_TILE]), eplb_control,
         layer_id, num_tokens, my_rank,
@@ -2089,16 +2090,17 @@ def moe_test(
     finalize_moe: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
     # Routing takes an independent INT32 validity marker; the active prefix is
-    # every row below num_tokens.
+    # every row below num_tokens. Identity routing ignores it.
     eplb_source_rows = pl.create_tensor([T], dtype=pl.INT32)
-    for block in pl.spmd((T + 15) // 16, name_hint="moe_test_valid_rows"):
-        for offset in pl.range(16):
-            row = block * 16 + offset
-            if row < T:
-                marker = pl.cast(-1, pl.INT32)
-                if row < num_tokens:
-                    marker = pl.cast(1, pl.INT32)
-                pl.write(eplb_source_rows, [row], marker)
+    if EPLB_ENABLED:
+        for block in pl.spmd((T + 15) // 16, name_hint="moe_test_valid_rows"):
+            for offset in pl.range(16):
+                row = block * 16 + offset
+                if row < T:
+                    marker = pl.cast(-1, pl.INT32)
+                    if row < num_tokens:
+                        marker = pl.cast(1, pl.INT32)
+                    pl.write(eplb_source_rows, [row], marker)
     moe(
         x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias, tid2eid, input_ids,
@@ -2645,6 +2647,8 @@ def _build_tensor_specs(layer_id, num_tokens, routing, fixture_rounds):
             replica_counts[bank, expert] = slots.numel()
     placement = placement.reshape(EPLB_LAYERS * N_EXPERTS_GLOBAL, N_RANKS)
     replica_counts = replica_counts.reshape(-1)
+    if int(replica_counts.max()) > N_RANKS:
+        raise ValueError("A bank row cannot host more replicas than the placement table's rank axis")
 
     def init_eplb_mapping():
         return placement.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
