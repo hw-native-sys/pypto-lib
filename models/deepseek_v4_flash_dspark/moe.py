@@ -98,7 +98,7 @@ N_PHYSICAL_EXPERTS = N_EXPERTS_GLOBAL + NUM_REDUNDANT_EXPERTS
 if NUM_REDUNDANT_EXPERTS < 0 or N_PHYSICAL_EXPERTS % N_RANKS:
     raise ValueError("Physical expert capacity must be non-negative and divisible by EP")
 EPLB_ENABLED = "--enable-eplb" in sys.argv
-EPLB_ABI_VERSION = 2  # v2: the transfer HOST ABI carries no external epoch
+EPLB_ABI_VERSION = 1
 EPLB_LAYERS = _parse_int_argv("--weight-bank-size", 1)
 EPLB_BANK_ROWS = EPLB_LAYERS * N_EXPERTS_GLOBAL
 N_LOCAL = N_PHYSICAL_EXPERTS // N_RANKS

@@ -20,9 +20,11 @@ Frozen conventions (serving checks them through ``EPLB_ABI_VERSION``):
   ``[bank_layers, C_PAD]`` history when ``control[1]`` is nonzero, optionally
   accumulating into the slot counts of the same wave.
 - migration: ``make_eplb_transfer`` moves the six resident expert tensors
-  ``[R, C, ...]`` through receive windows allocated per call. Every peer adds
-  exactly one notification on each of its two completion barriers, so both
-  waits target one and no external epoch is accepted.
+  ``[R, C, ...]`` through receive windows and two completion barriers. Serving
+  dispatches every migrated layer on one persistent L3 worker with retained
+  CommDomains and ``reset_persistent_windows=False``, so each peer's signal
+  count keeps growing across calls: the caller passes ``epoch`` >= 1, the
+  1-based call number.
 """
 
 from math import gcd
@@ -30,7 +32,7 @@ from math import gcd
 import pypto.language as pl
 import pypto.language.distributed as pld
 
-EPLB_ABI_VERSION = 2  # v2: the transfer HOST ABI carries no external epoch
+EPLB_ABI_VERSION = 1
 
 # An a3 allocation exposes 24 AIC / 48 AIV; a larger SPMD launch would queue
 # blocks on the same cores instead of adding parallelism. Each worker strides
@@ -187,15 +189,15 @@ def make_moe_eplb(*, enabled: bool, logical_experts: int, ranks: int, tokens: in
 # === Migration ===============================================================
 
 
-def make_eplb_transfer(*, ranks: int, local_slots: int, hidden_size: int, intermediate_size: int):
-    """Specialize a raw-storage maintenance program to a resident target weight bank."""
+def _eplb_transfer_dims(ranks, local_slots, hidden_size, intermediate_size):
     if min(ranks, local_slots, hidden_size, intermediate_size) <= 0:
         raise ValueError("EPLB transfer dimensions must be positive")
-    R = ranks
-    C = local_slots
-    W = hidden_size * intermediate_size
-    I = intermediate_size
-    D = hidden_size
+    return ranks, local_slots, hidden_size * intermediate_size, intermediate_size, hidden_size
+
+
+def _make_eplb_transfer_layer(*, ranks: int, local_slots: int, hidden_size: int, intermediate_size: int):
+    """Specialize the six-tensor migration kernel to one resident weight bank."""
+    R, C, W, I, D = _eplb_transfer_dims(ranks, local_slots, hidden_size, intermediate_size)
     # tiling
     COPY_COL_TILE = 8192
 
@@ -218,11 +220,13 @@ def make_eplb_transfer(*, ranks: int, local_slots: int, hidden_size: int, interm
         sources_done: pld.DistributedTensor[[R, 1], pl.INT32],
         installed: pld.DistributedTensor[[R, 1], pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
+        epoch: pl.Scalar[pl.INT32],
     ):
-        # Both barriers count notifications in windows this host call allocated
-        # fresh: every peer adds exactly one, so every wait targets one. An
-        # external epoch would have to match that history and cannot.
-        barrier_count = pl.const(1, pl.INT32)
+        # The two signal windows keep their notification counts across calls:
+        # serving runs one persistent L3 worker with retained CommDomains and
+        # `reset_persistent_windows=False` (npu_runner._shared_l3_worker), and
+        # the benchmark replay does the same. Each peer adds exactly one
+        # notification per call, so the caller passes the 1-based call number.
         # All resident reads finish before any resident write, including local moves.
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="eplb_read_sources") as push_tid:
             for peer in pl.range(R):
@@ -266,7 +270,7 @@ def make_eplb_transfer(*, ranks: int, local_slots: int, hidden_size: int, interm
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="eplb_wait_sources", deps=[push_tid]) as read_wait_tid:
             for peer in pl.range(R):
                 if peer != my_rank:
-                    pld.system.defer_wait(sources_done, [peer, 0], barrier_count, cmp=pld.WaitCmp.Ge)
+                    pld.system.defer_wait(sources_done, [peer, 0], epoch, cmp=pld.WaitCmp.Ge)
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="eplb_install", deps=[push_tid, read_wait_tid]) as install_tid:
             for slot in pl.range(C):
@@ -293,9 +297,20 @@ def make_eplb_transfer(*, ranks: int, local_slots: int, hidden_size: int, interm
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="eplb_wait_install", deps=[install_tid]) as wait_install_tid:
             for peer in pl.range(R):
                 if peer != my_rank:
-                    pld.system.defer_wait(installed, [peer, 0], barrier_count, cmp=pld.WaitCmp.Ge)
+                    pld.system.defer_wait(installed, [peer, 0], epoch, cmp=pld.WaitCmp.Ge)
 
         return w1, w1_scale, w3, w3_scale, w2, w2_scale
+
+    return eplb_transfer_layer
+
+
+def make_eplb_transfer(*, ranks: int, local_slots: int, hidden_size: int, intermediate_size: int):
+    """EPLB HOST ABI v1: one migration call whose `epoch` is the 1-based call number."""
+    R, C, W, I, D = _eplb_transfer_dims(ranks, local_slots, hidden_size, intermediate_size)
+    eplb_transfer_layer = _make_eplb_transfer_layer(
+        ranks=ranks, local_slots=local_slots,
+        hidden_size=hidden_size, intermediate_size=intermediate_size,
+    )
 
     @pl.jit.host
     def l3_eplb_transfer_layer(
@@ -307,8 +322,9 @@ def make_eplb_transfer(*, ranks: int, local_slots: int, hidden_size: int, interm
         w2_scale: pl.InOut[pl.Tensor[[R, C, D], pl.FP32]],
         sources: pl.Tensor[[R, R, C, 2], pl.INT32],
         changed: pl.Tensor[[R, R, C], pl.INT32],
+        epoch: pl.Scalar[pl.INT32],
     ):
-        """EPLB HOST ABI v1: six-tensor migration and two completion barriers."""
+        """EPLB HOST ABI v1: six-tensor migration and completion epochs."""
         receive_w1_buf = pld.alloc_window_buffer([C, W], dtype=pl.INT8)
         receive_w1_scale_buf = pld.alloc_window_buffer([C, I], dtype=pl.FP32)
         receive_w3_buf = pld.alloc_window_buffer([C, W], dtype=pl.INT8)
@@ -331,11 +347,71 @@ def make_eplb_transfer(*, ranks: int, local_slots: int, hidden_size: int, interm
                 sources[rank], changed[rank],
                 receive_w1, receive_w1_scale, receive_w3, receive_w3_scale, receive_w2, receive_w2_scale,
                 sources_done, installed,
-                rank, device=rank,
+                rank, epoch, device=rank,
             )
         return w1, w1_scale, w3, w3_scale, w2, w2_scale
 
     return l3_eplb_transfer_layer
+
+
+def make_eplb_transfer_rounds(*, rounds: int, ranks: int, local_slots: int,
+                              hidden_size: int, intermediate_size: int):
+    """Validation entry: `rounds` consecutive migrations on one retained domain.
+
+    Serving calls this HOST entry once per migrated layer on a persistent
+    worker whose signal windows are not reset, so the second call must wait on
+    the second notification. This entry reproduces that sequence in one host
+    call and takes the per-round plans and the first epoch.
+    """
+    if rounds < 1:
+        raise ValueError("EPLB transfer validation needs at least one round")
+    R, C, W, I, D = _eplb_transfer_dims(ranks, local_slots, hidden_size, intermediate_size)
+    eplb_transfer_layer = _make_eplb_transfer_layer(
+        ranks=ranks, local_slots=local_slots,
+        hidden_size=hidden_size, intermediate_size=intermediate_size,
+    )
+
+    @pl.jit.host
+    def l3_eplb_transfer_rounds(
+        w1: pl.InOut[pl.Tensor[[R, C, W], pl.INT8]],
+        w1_scale: pl.InOut[pl.Tensor[[R, C, I], pl.FP32]],
+        w3: pl.InOut[pl.Tensor[[R, C, W], pl.INT8]],
+        w3_scale: pl.InOut[pl.Tensor[[R, C, I], pl.FP32]],
+        w2: pl.InOut[pl.Tensor[[R, C, W], pl.INT8]],
+        w2_scale: pl.InOut[pl.Tensor[[R, C, D], pl.FP32]],
+        sources: pl.Tensor[[R, rounds, R, C, 2], pl.INT32],
+        changed: pl.Tensor[[R, rounds, R, C], pl.INT32],
+        epoch0: pl.Scalar[pl.INT32],
+    ):
+        receive_w1_buf = pld.alloc_window_buffer([C, W], dtype=pl.INT8)
+        receive_w1_scale_buf = pld.alloc_window_buffer([C, I], dtype=pl.FP32)
+        receive_w3_buf = pld.alloc_window_buffer([C, W], dtype=pl.INT8)
+        receive_w3_scale_buf = pld.alloc_window_buffer([C, I], dtype=pl.FP32)
+        receive_w2_buf = pld.alloc_window_buffer([C, W], dtype=pl.INT8)
+        receive_w2_scale_buf = pld.alloc_window_buffer([C, D], dtype=pl.FP32)
+        sources_done_buf = pld.alloc_window_buffer([R, 1], dtype=pl.INT32)
+        installed_buf = pld.alloc_window_buffer([R, 1], dtype=pl.INT32)
+        for round_idx in pl.range(rounds):
+            epoch = epoch0 + pl.cast(round_idx, pl.INT32)
+            for rank in pl.range(R):
+                receive_w1 = pld.window(receive_w1_buf, [C, W], dtype=pl.INT8)
+                receive_w1_scale = pld.window(receive_w1_scale_buf, [C, I], dtype=pl.FP32)
+                receive_w3 = pld.window(receive_w3_buf, [C, W], dtype=pl.INT8)
+                receive_w3_scale = pld.window(receive_w3_scale_buf, [C, I], dtype=pl.FP32)
+                receive_w2 = pld.window(receive_w2_buf, [C, W], dtype=pl.INT8)
+                receive_w2_scale = pld.window(receive_w2_scale_buf, [C, D], dtype=pl.FP32)
+                sources_done = pld.window(sources_done_buf, [R, 1], dtype=pl.INT32)
+                installed = pld.window(installed_buf, [R, 1], dtype=pl.INT32)
+                eplb_transfer_layer(
+                    w1[rank], w1_scale[rank], w3[rank], w3_scale[rank], w2[rank], w2_scale[rank],
+                    sources[rank, round_idx], changed[rank, round_idx],
+                    receive_w1, receive_w1_scale, receive_w3, receive_w3_scale, receive_w2, receive_w2_scale,
+                    sources_done, installed,
+                    rank, epoch, device=rank,
+                )
+        return w1, w1_scale, w3, w3_scale, w2, w2_scale
+
+    return l3_eplb_transfer_rounds
 
 
 # === Routing validation ======================================================
@@ -472,16 +548,22 @@ def build_routing_specs(*, logical_experts: int, ranks: int, redundant_experts: 
 # === Migration validation ====================================================
 
 
-def build_transfer_specs(*, ranks: int, local_slots: int, hidden_size: int, intermediate_size: int):
-    """Small two-card fixture: local swaps, cross-rank moves, and unchanged slots."""
+TRANSFER_ROUNDS = 2
+
+
+def build_transfer_specs(*, ranks: int, local_slots: int, hidden_size: int,
+                         intermediate_size: int, rounds: int = TRANSFER_ROUNDS):
+    """Small two-card fixture: two consecutive plans, local and cross-rank moves."""
     import torch
 
-    from golden import TensorSpec
+    from golden import ScalarSpec, TensorSpec
 
     R, C, D, I = ranks, local_slots, hidden_size, intermediate_size
     W = D * I
     if C < 4:
         raise ValueError("The transfer fixture needs at least four local slots")
+    if rounds < 1:
+        raise ValueError("The transfer fixture needs at least one round")
 
     def resident(limit):
         return torch.arange(R * C * limit, dtype=torch.float32).reshape(R, C, limit)
@@ -493,20 +575,22 @@ def build_transfer_specs(*, ranks: int, local_slots: int, hidden_size: int, inte
     w3_scale = resident(I) * 0.5 + 0.125
     w2_scale = resident(D) * 0.75 + 0.25
 
-    plan_changed = torch.zeros((R, C), dtype=torch.int32)
-    plan_sources = torch.zeros((R, C, 2), dtype=torch.int32)
-    moves = [
-        (0, 1, (1, 2)),  # cross-rank move
-        (0, 2, (0, 3)),  # local move
-        (1, 0, (1, 3)),  # local move
-        (1, 2, (0, 0)),  # cross-rank move
-    ]
-    for dest, slot, (source_rank, source_slot) in moves:
-        plan_changed[dest, slot] = 1
-        plan_sources[dest, slot] = torch.tensor([source_rank, source_slot], dtype=torch.int32)
+    # Round 0: local swaps and cross-rank moves. Round 1: moves that read slots
+    # round 0 already rewrote, so a stale window or an early barrier shows up.
+    plans = [
+        [(0, 1, (1, 2)), (0, 2, (0, 3)), (1, 0, (1, 3)), (1, 2, (0, 0))],
+        [(0, 3, (0, 1)), (1, 3, (0, 2)), (1, 1, (1, 0))],
+    ][:rounds]
+    plan_changed = torch.zeros((rounds, R, C), dtype=torch.int32)
+    plan_sources = torch.zeros((rounds, R, C, 2), dtype=torch.int32)
+    for round_idx, moves in enumerate(plans):
+        for dest, slot, (source_rank, source_slot) in moves:
+            plan_changed[round_idx, dest, slot] = 1
+            plan_sources[round_idx, dest, slot] = torch.tensor(
+                [source_rank, source_slot], dtype=torch.int32)
     # Every rank submits the same plan for all destinations.
-    changed = plan_changed.unsqueeze(0).repeat(R, 1, 1)
-    sources = plan_sources.unsqueeze(0).repeat(R, 1, 1, 1)
+    changed = plan_changed.unsqueeze(1).repeat(1, R, 1, 1).permute(1, 0, 2, 3).contiguous()
+    sources = plan_sources.unsqueeze(1).repeat(1, R, 1, 1, 1).permute(1, 0, 2, 3, 4).contiguous()
 
     return [
         TensorSpec("w1", [R, C, W], torch.int8, init_value=lambda: w1),
@@ -515,30 +599,35 @@ def build_transfer_specs(*, ranks: int, local_slots: int, hidden_size: int, inte
         TensorSpec("w3_scale", [R, C, I], torch.float32, init_value=lambda: w3_scale),
         TensorSpec("w2", [R, C, W], torch.int8, init_value=lambda: w2),
         TensorSpec("w2_scale", [R, C, D], torch.float32, init_value=lambda: w2_scale),
-        TensorSpec("sources", [R, R, C, 2], torch.int32, init_value=lambda: sources),
-        TensorSpec("changed", [R, R, C], torch.int32, init_value=lambda: changed),
+        TensorSpec("sources", [R, rounds, R, C, 2], torch.int32, init_value=lambda: sources),
+        TensorSpec("changed", [R, rounds, R, C], torch.int32, init_value=lambda: changed),
+        ScalarSpec("epoch0", torch.int32, 1),
     ]
 
 
 def golden_transfer(tensors):
-    """Reference: moves read the pre-transfer snapshot; untouched slots stay."""
+    """Reference: apply each round's plan to the state it starts from."""
     import torch
 
     names = ("w1", "w1_scale", "w3", "w3_scale", "w2", "w2_scale")
-    originals = {name: tensors[name].clone() for name in names}
     changed = tensors["changed"]
     sources = tensors["sources"]
-    ranks, local_slots = changed.shape[0], changed.shape[2]
-    for dest in range(ranks):
-        # Ranks must agree on the plan; validation would catch a divergence in
-        # the resident tensors, so check it explicitly first.
-        if not torch.equal(changed[dest], changed[0]) or not torch.equal(sources[dest], sources[0]):
-            raise AssertionError("transfer plans differ across ranks")
-        for slot in range(local_slots):
-            if int(changed[0, dest, slot]) != 0:
-                source_rank, source_slot = (int(value) for value in sources[0, dest, slot])
-                for name in names:
-                    tensors[name][dest, slot] = originals[name][source_rank, source_slot]
+    ranks, rounds, local_slots = changed.shape[0], changed.shape[1], changed.shape[3]
+    for round_idx in range(rounds):
+        # Ranks must agree on the plan; check before trusting one copy of it.
+        for rank in range(ranks):
+            if not torch.equal(changed[rank, round_idx], changed[0, round_idx]):
+                raise AssertionError("transfer plans differ across ranks")
+            if not torch.equal(sources[rank, round_idx], sources[0, round_idx]):
+                raise AssertionError("transfer plans differ across ranks")
+        before = {name: tensors[name].clone() for name in names}
+        for dest in range(ranks):
+            for slot in range(local_slots):
+                if int(changed[0, round_idx, dest, slot]) != 0:
+                    source_rank, source_slot = (
+                        int(value) for value in sources[0, round_idx, dest, slot])
+                    for name in names:
+                        tensors[name][dest, slot] = before[name][source_rank, source_slot]
 
 
 if __name__ == "__main__":
@@ -603,13 +692,18 @@ if __name__ == "__main__":
                 compare_fn={"physical_ids": ratio_allclose(atol=0, rtol=0, max_error_ratio=0)},
             ))
     if args.case in ("all", "transfer"):
-        fn = make_eplb_transfer(ranks=args.ep, local_slots=args.local_slots,
-                                hidden_size=args.hidden_size, intermediate_size=args.intermediate_size)
+        # Two consecutive migrations share one retained domain, exactly like
+        # serving's per-layer calls on its persistent worker.
+        fn = make_eplb_transfer_rounds(rounds=TRANSFER_ROUNDS, ranks=args.ep,
+                                       local_slots=args.local_slots,
+                                       hidden_size=args.hidden_size,
+                                       intermediate_size=args.intermediate_size)
         results.append(run(
             fn=fn,
             specs=build_transfer_specs(ranks=args.ep, local_slots=args.local_slots,
                                        hidden_size=args.hidden_size,
-                                       intermediate_size=args.intermediate_size),
+                                       intermediate_size=args.intermediate_size,
+                                       rounds=TRANSFER_ROUNDS),
             golden_fn=golden_transfer,
             compile_only=args.compile_only,
             config=config,
