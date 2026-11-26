@@ -480,6 +480,8 @@ def build_transfer_specs(*, ranks: int, local_slots: int, hidden_size: int, inte
 
     R, C, D, I = ranks, local_slots, hidden_size, intermediate_size
     W = D * I
+    if C < 4:
+        raise ValueError("The transfer fixture needs at least four local slots")
 
     def resident(limit):
         return torch.arange(R * C * limit, dtype=torch.float32).reshape(R, C, limit)
