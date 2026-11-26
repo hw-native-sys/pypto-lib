@@ -92,6 +92,33 @@ def _gather_sparse_vf_rows(
     ...
 
 
+@pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "sparse_gather_compact_vf.cpp",
+               aiv_source=Path(__file__).parent / "kernels" / "sparse_gather_compact_vf.cpp",
+               include_dirs=(pto_isa_include_dir(),), dual_aiv_dispatch=True)
+def _gather_compact_sparse_vf_rows(
+    output: pl.Out[pl.Tensor],
+    query: pl.Tensor,
+    sink: pl.Tensor,
+    window: pl.Tensor,
+    compressed: pl.Tensor,
+    window_indices: pl.Tensor,
+    compressed_indices: pl.Tensor,
+    partials: pl.InOut[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+    heads: pl.Scalar[pl.INT32],
+    window_keys: pl.Scalar[pl.INT32],
+    compressed_keys: pl.Scalar[pl.INT32],
+    balanced: pl.Scalar[pl.INT32],
+    cache_mode: pl.constexpr,
+):
+    """Stream cache rows through L1 with sink-aware sparse attention.
+
+    Scalar gather indices use refreshed GM cache lines; vector masks use
+    the asynchronous index copy in UB.
+    """
+    ...
+
+
 @pl.jit.inline(auto_scope=False)
 def gather_sparse_attention(
     query: pl.Tensor,
@@ -125,6 +152,11 @@ def gather_sparse_attention(
     slots = pl.max(1, 2 * workers * balanced)
     partials_size = slots * 64 * (HEAD_DIM + 2) + 2 * workers
     partials = pl.create_tensor([partials_size], dtype=pl.FP32)
+    # For a short batch, a large physical pool can already supply a full
+    # selection for every query. Keep the ordinary gather image in that case.
+    page_rows = pl.max(1, pl.tensor.dim(compressed, 1))
+    batch_pages = (num_tokens + page_rows - 1) // page_rows
+    plan_pool = num_tokens >= INDEX_TOPK or pl.tensor.dim(compressed, 0) <= batch_pages + 1
     if balanced != 0:
         ready_offset = 2 * workers * 64 * (HEAD_DIM + 2)
         flat_partials = pl.reshape(partials, [1, partials_size])
@@ -137,6 +169,16 @@ def gather_sparse_attention(
                 active_output, query, sink, window, compressed,
                 window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
                 balanced, cache_mode=compressed_keys,
+            )
+    elif compressed_keys == INDEX_TOPK and num_tokens >= SPARSE_VF_WORKER_TILE and plan_pool:
+        tiles_per_worker = ((num_tokens + workers - 1) // workers) * parts
+        plan_cols = 128 + ((tiles_per_worker + 127) // 128) * 128
+        compact_plan = pl.create_tensor([workers * plan_cols], dtype=pl.INT32)
+        with pl.spmd(workers, name_hint="sparse_gather_vf") as attended:
+            _gather_compact_sparse_vf_rows(
+                active_output, query, sink, window, compressed,
+                window_indices, compressed_indices, compact_plan, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
+                pl.cast(2, pl.INT32), cache_mode=compressed_keys,
             )
     else:
         with pl.spmd(workers, name_hint="sparse_gather_vf") as attended:
@@ -4204,7 +4246,7 @@ def build_sparse_attention_specs(rows, active, *, compressed_keys, start=0, case
 
     if not 0 <= start <= rows or not 0 <= active <= rows - start:
         raise ValueError("active query range must fit in rows")
-    if compressed_keys not in (0, INDEX_TOPK) or case not in ("normal", "codes"):
+    if compressed_keys not in (0, INDEX_TOPK) or case not in ("normal", "codes", "tile-transitions"):
         raise ValueError("unsupported compressed key count or fixture case")
     window_pages = 1 if case == "codes" else 2
     compressed_pages = 1 if not compressed_keys or case == "codes" else 4
@@ -4257,6 +4299,16 @@ def build_sparse_attention_specs(rows, active, *, compressed_keys, start=0, case
                     else:
                         wi[row, 0] = row % 128
                 query.zero_()
+            elif case == "tile-transitions":
+                # Per worker: eight sparse queries, all four compressed parts
+                # live on the ninth, then holes again in the suffix.
+                ci.fill_(torch.iinfo(torch.int32).min)
+                current = ci[start:start + active]
+                batch_end = 8 * SPARSE_VF_WORKER_TILE
+                dense_end = batch_end + SPARSE_VF_WORKER_TILE
+                current[:batch_end, 130:133] = 17
+                current[batch_end:dense_end, ::SPARSE_VF_KEY_TILE] = torch.arange(INDEX_TOPK // SPARSE_VF_KEY_TILE, dtype=torch.int32)
+                current[dense_end:, 400:403] = 29
             else:
                 ci[(wi < 0).all(dim=-1)] = -1
             if active:
@@ -4301,13 +4353,15 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--rows", type=int, help="active row count; defaults to boundary cases")
     parser.add_argument("--compressed-keys", type=int, choices=[0, INDEX_TOPK], help="defaults to both key counts")
-    parser.add_argument("--case", choices=["normal", "codes", "all"], default="all")
+    parser.add_argument("--case", choices=["normal", "codes", "tile-transitions", "all"], default="all")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--save-data", action="store_true")
     parser.add_argument("--runtime-dir", type=str)
     args = parser.parse_args()
     if args.rows is not None and args.rows < 0:
         parser.error("--rows must be nonnegative")
+    if args.case == "tile-transitions" and args.compressed_keys == 0:
+        parser.error("tile-transitions requires compressed keys")
     if args.runtime_dir and (args.rows is None or args.compressed_keys is None or args.case == "all"):
         parser.error("--runtime-dir requires --rows, --compressed-keys and one --case")
     torch.set_num_threads(8)
@@ -4318,11 +4372,15 @@ if __name__ == "__main__":
         cases += [(13, 7, 3, "normal"), (73, 72, 1, "normal")]
     if args.case in ("codes", "all"):
         cases.append((13, 7, 3, "codes"))
+    if args.case in ("tile-transitions", "all"):
+        cases.append((322, 320, 1, "tile-transitions"))
     if args.rows is not None:
-        cases = [(args.rows + 1, args.rows, 1, case) for case in ("normal", "codes") if args.case in (case, "all")]
+        cases = [(args.rows + 1, args.rows, 1, case) for case in ("normal", "codes", "tile-transitions") if args.case in (case, "all")]
     records = []
     for compressed_keys in keys:
         for rows, active, start, case in cases:
+            if case == "tile-transitions" and not compressed_keys:
+                continue
             specs = build_sparse_attention_specs(rows, active, compressed_keys=compressed_keys, start=start, case=case)
             query_rows = slice(start, start + active)
             exact = case == "codes" or active <= 1
