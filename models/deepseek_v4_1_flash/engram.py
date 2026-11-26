@@ -9,20 +9,30 @@
 # ci: no-sim
 """V4.1 Engram Host FP8 lookup, dequantization, projection and residual gating."""
 
+import argparse
+from bisect import bisect_right
+from contextlib import ExitStack
+import io
+import json
 import math
+import os
+from pathlib import Path
 
 import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
+from pypto.runtime import StackedDeviceTensor
 
-from config import FLASH as M, T_DYN
+from config import EP_SIZE, FLASH as M, RANKS_DYN, T_DYN
 
+
+# Dynamic shape variables.
+ENGRAM_LOOKUPS_DYN = pl.dynamic("ENGRAM_LOOKUPS_DYN")
+TEST_LOOKUPS_DYN = pl.dynamic("engram_lookups")
 
 # model config
 D = M.hidden_size
 HC_MULT = M.hc_mult
-
-
 N_HASH_COLS = (M.engram_max_ngram_size - 1) * M.engram_n_heads  # 24
 HEAD_DIM = M.engram_head_dim  # 256
 ENGRAM_K = N_HASH_COLS * HEAD_DIM  # 6144 flattened lookup width
@@ -32,169 +42,121 @@ NORM_EPS = M.rms_norm_eps
 D_INV = 1.0 / D
 DOT_SCALE = D**-0.5
 
-# Quantization and projection tiling.
+# tiling
 ENGRAM_QUANT_M_TILE = 16
 ENGRAM_QUANT_K_TILE = 256
 ENGRAM_QUANT_SCALE_TILE = 128
-ENGRAM_QUANT_SCALE_ROW_BYTES = 32
+ENGRAM_QUANT_SCALE_ROW_TILE = 32
 PROJECTION_N_TILE = 256
-PROJECTION_N_TILE_M80 = 512
+PROJECTION_M80_N_TILE = 512
 PROJECTION_K_TILE = 256
-
-
-FETCH_TILE = 32
 SCALE_TILE = 32
 
+# Host-window shape.
+_shape_parser = argparse.ArgumentParser(add_help=False)
+_shape_parser.add_argument("--checkpoint")
+_shape_parser.add_argument("--engram-table-rows", type=int)
+_shape_options = _shape_parser.parse_known_args()[0]
+if _shape_options.engram_table_rows is None:
+    _shape_options.engram_table_rows = max(M.engram_num_embeddings) if _shape_options.checkpoint else 4096
+if _shape_options.engram_table_rows <= 0:
+    _shape_parser.error("--engram-table-rows must be positive")
+ENGRAM_ROWS = (_shape_options.engram_table_rows + EP_SIZE - 1) // EP_SIZE * EP_SIZE
+ENGRAM_SHARD_ROWS = ENGRAM_ROWS // EP_SIZE
 
-@pl.jit.inline
-def engram_dequantize(
-    payload: pl.Tile[[1, HEAD_DIM], pl.UINT8, pl.Mem.Vec],
-    scale_codes: pl.Tile[[1, SCALE_TILE], pl.UINT8, pl.Mem.Vec],
-):
-    """Decode an FP8 row with eight Device-resident group-32 E8M0 codes."""
-    padded = pl.fillpad(scale_codes, pad_value=pl.PadValue.zero)
-    all_codes = pl.set_validshape(padded, 1, SCALE_TILE)
-    code_fp16 = pl.cast(all_codes, pl.FP16)
-    codes = pl.cast(code_fp16, pl.INT32, mode="trunc")
-    bits = pl.shls(codes, 23)
-    is_subnormal = pl.tile.cmps(codes, 0, cmp_type=0)
-    bits = pl.tile.select(is_subnormal, 0x00400000, bits)
-    is_nan = pl.tile.cmps(codes, 255, cmp_type=0)
-    bits = pl.tile.select(is_nan, 0x7FC00000, bits)
-    scales = pl.reinterpret_view(bits, pl.FP32)
-    columns = pl.tile.arange(0, [1, HEAD_DIM], dtype=pl.INT32)
-    groups = pl.shrs(columns, 5)
-    temporary = pl.create_tile([1, HEAD_DIM], dtype=pl.FP32)
-    expanded = pl.tile.gather(scales, groups, temporary)
-    signed = pl.reinterpret_view(payload, pl.INT8)
-    fp8 = pl.reinterpret_view(signed, pl.FP8E4M3FN)
-    bf16 = pl.cast(fp8, pl.BF16)
-    values = pl.cast(bf16, pl.FP32)
-    dequantized = pl.mul(values, expanded)
-    return pl.cast(dequantized, pl.BF16, mode="rint")
-
-
-@pl.jit.incore
-def engram_host_fetch(
-    ids: pl.Tensor,
-    begin: pl.Scalar[pl.INDEX],
-    table: pld.DistributedTensor,
-    staging: pl.InOut[pl.Tensor],
-    shard_rows: pl.constexpr,
-):
-    """Load at most 32 remote FP8 rows through the Host-window MTE path."""
-    rank = pld.rank(pld.get_comm_ctx(table))
-    lookups = pl.tensor.dim(ids, 0)
-    for offset in pl.range(FETCH_TILE):
-        index = begin + offset
-        if index < lookups:
-            row = pl.read(ids, [index, 0])
-            if row >= 0:
-                owner = row // shard_rows
-                if owner != rank:
-                    layer = index // (lookups // 2)
-                    source = layer * shard_rows + row % shard_rows
-                    payload = pld.tile.remote_load(
-                        table, peer=owner, offsets=[source, 0], shape=[1, HEAD_DIM],
-                    )
-                    staging = pl.store(payload, [offset, 0], staging)
-    return staging
-
-
-@pl.jit.incore
-def engram_host_consume(
-    ids: pl.Tensor,
-    begin: pl.Scalar[pl.INDEX],
-    table: pld.DistributedTensor,
-    staging: pl.Tensor,
-    scales: pl.Tensor,
-    output: pl.InOut[pl.Tensor],
-    table_rows: pl.constexpr,
-):
-    """Read local or staged ENP FP8 rows and write dequantized BF16 Device rows."""
-    rows_per_layer = pl.tensor.dim(scales, 0) // 2
-    lookups = pl.tensor.dim(ids, 0)
-    rank = pld.rank(pld.get_comm_ctx(table))
-    for offset in pl.range(FETCH_TILE):
-        index = begin + offset
-        if index < lookups:
-            row = pl.read(ids, [index, 0])
-            if row >= 0:
-                layer = index // (lookups // 2)
-                owner = row // table_rows
-                if owner == rank:
-                    source = layer * table_rows + row % table_rows
-                    payload = pl.load(table, [source, 0], [1, HEAD_DIM])
-                else:
-                    payload = pl.load(staging, [offset, 0], [1, HEAD_DIM])
-                scale_row = layer * rows_per_layer + row
-                codes = pl.load(scales, [scale_row, 0], [1, SCALE_TILE], valid_shape=[1, HEAD_DIM // 32])
-                values = engram_dequantize(payload, codes)
-                output = pl.store(values, [index, 0], output)
-            else:
-                zero = pl.tile.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                output = pl.store(zero, [index, 0], output)
-    return output
+# Validation fixture.
+TEST_SHARD_ROWS = 64
+TEST_TABLE_ROWS = 8 * TEST_SHARD_ROWS
 
 
 @pl.jit.inline(auto_scope=False)
-def engram_host_lookup(
+def engram_lookup(
     ids: pl.Tensor,
     table: pld.DistributedTensor,
-    staging_first: pl.Tensor,
-    staging_second: pl.Tensor,
     scales: pl.Tensor,
     output: pl.Tensor,
-    table_rows: pl.constexpr,
+    layer: pl.Scalar[pl.INDEX],
+    shard_rows: pl.constexpr,
 ):
-    """Fetch two layers' flattened hash rows with bounded reusable Device staging.
-
-    IDs are layer-major, negative IDs produce zero padding, and scales contain
-    the complete layer-major scale table on each Device. Host windows contain
-    one contiguous shard of each payload table.
-    """
-    lookups = pl.tensor.dim(ids, 0)
-    previous_first = pl.system.task_invalid()
-    previous_second = pl.system.task_invalid()
-    for chunk in pl.range(0, lookups, 2048):
-        with pl.scope():
-            end = pl.min(chunk + 2048, lookups)
-            for begin in pl.range(chunk, end, 2 * FETCH_TILE):
-                second = begin + FETCH_TILE
-                # Each Device slot is reused after its preceding consumer finishes.
-                with pl.spmd(1, name_hint="engram_fetch_first", deps=[previous_first]) as fetched_first:
-                    staging_first = engram_host_fetch(ids, begin, table, staging_first, table_rows)
-                with pl.spmd(1, name_hint="engram_consume_first", deps=[fetched_first]) as consumed_first:
-                    output = engram_host_consume(ids, begin, table, staging_first, scales, output, table_rows)
-                previous_first = consumed_first
-                if second < end:
-                    with pl.spmd(1, name_hint="engram_fetch_second", deps=[previous_second]) as fetched_second:
-                        staging_second = engram_host_fetch(ids, second, table, staging_second, table_rows)
-                    with pl.spmd(1, name_hint="engram_consume_second", deps=[fetched_second]) as consumed_second:
-                        output = engram_host_consume(ids, second, table, staging_second, scales, output, table_rows)
-                    previous_second = consumed_second
+    """Look up one layer's rows in a single AIV SPMD."""
+    lookups = pl.tensor.dim(output, 0)
+    if lookups > 0:
+        workers = pl.min(lookups, pl.system.available_aiv_count())
+        for worker in pl.spmd(workers, name_hint="engram_lookup"):
+            rows_per_layer = pl.tensor.dim(scales, 0) // 2
+            rank = pld.rank(pld.get_comm_ctx(table))
+            first_id = layer * lookups
+            first_payload = layer * shard_rows
+            first_scale = layer * rows_per_layer
+            zero = pl.tile.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+            for (index,) in pl.while_(init_values=(worker,)):
+                pl.cond(index < lookups)
+                row = pl.read(ids, [first_id + index, 0])
+                if row >= 0:
+                    owner = row // shard_rows
+                    source = first_payload + row % shard_rows
+                    if owner == rank:
+                        payload = pl.load(table, [source, 0], [1, HEAD_DIM])
+                    else:
+                        payload = pld.tile.remote_load(table, peer=owner, offsets=[source, 0], shape=[1, HEAD_DIM])
+                    scale_row = first_scale + row
+                    scale_codes = pl.load(scales, [scale_row, 0], [1, SCALE_TILE], valid_shape=[1, HEAD_DIM // 32])
+                    # Decode group-32 E8M0 scales and apply them to the FP8 row.
+                    padded = pl.fillpad(scale_codes, pad_value=pl.PadValue.zero)
+                    all_codes = pl.set_validshape(padded, 1, SCALE_TILE)
+                    code_fp16 = pl.cast(all_codes, pl.FP16)
+                    codes = pl.cast(code_fp16, pl.INT32, mode="trunc")
+                    bits = pl.shls(codes, 23)
+                    is_subnormal = pl.tile.cmps(codes, 0, cmp_type=0)
+                    bits = pl.tile.select(is_subnormal, 0x00400000, bits)
+                    is_nan = pl.tile.cmps(codes, 255, cmp_type=0)
+                    bits = pl.tile.select(is_nan, 0x7FC00000, bits)
+                    row_scales = pl.reinterpret_view(bits, pl.FP32)
+                    columns = pl.tile.arange(0, [1, HEAD_DIM], dtype=pl.INT32)
+                    groups = pl.shrs(columns, 5)
+                    temporary = pl.create_tile([1, HEAD_DIM], dtype=pl.FP32)
+                    expanded = pl.tile.gather(row_scales, groups, temporary)
+                    signed = pl.reinterpret_view(payload, pl.INT8)
+                    fp8 = pl.reinterpret_view(signed, pl.FP8E4M3FN)
+                    bf16 = pl.cast(fp8, pl.BF16)
+                    values = pl.cast(bf16, pl.FP32)
+                    dequantized = pl.mul(values, expanded)
+                    decoded = pl.cast(dequantized, pl.BF16, mode="rint")
+                    output = pl.store(decoded, [index, 0], output)
+                else:
+                    output = pl.store(zero, [index, 0], output)
+                next_index = pl.yield_(index + pl.tile.get_block_num())
     return output
 
 
 @pl.jit.inline(auto_scope=False)
-def _engram_project_pypto(
-    payload: pl.Tensor, weight: pl.Tensor, scales: pl.Tensor, weight_scale: pl.Tensor,
-    kv: pl.Tensor, tokens: pl.Scalar[pl.INDEX], row_tile: pl.constexpr,
-    n_tile: pl.constexpr, inner_k: pl.constexpr, scale_tile: pl.constexpr,
-    packed_scale: pl.constexpr, four_l1_slots: pl.constexpr, l1_slots: pl.constexpr, a_slots: pl.constexpr, a_slot: pl.constexpr, sa_slots: pl.constexpr, sa_slot: pl.constexpr,
+def engram_proj(
+    payload: pl.Tensor,
+    weight: pl.Tensor,
+    scales: pl.Tensor,
+    weight_scale: pl.Tensor,
+    kv: pl.Tensor,
+    tokens: pl.Scalar[pl.INDEX],
+    row_tile: pl.constexpr,
+    n_tile: pl.constexpr,
+    inner_k: pl.constexpr,
+    scale_tile: pl.constexpr,
+    four_l1_slots: pl.constexpr,
+    l1_slots: pl.constexpr,
+    a_slots: pl.constexpr,
+    a_slot: pl.constexpr,
+    sa_slots: pl.constexpr,
+    sa_slot: pl.constexpr,
 ):
     """Project from K256 L1 tiles using K64 or K128 Cube slices."""
     scale_groups = ENGRAM_K // 32
     row_tiles = (tokens + row_tile - 1) // row_tile
     col_tiles = KV_OUT // n_tile
     packed_weight_scale = pl.tensor.view(weight_scale, [scale_groups, KV_OUT], layout=pl.MX_B_NN)
-    if packed_scale:
-        packed_activation_scale = pl.tensor.view(scales, [row_tile, scale_groups], layout=pl.MX_A_ZZ)
-    else:
-        activation_scale = pl.tensor.view(scales, [row_tiles * row_tile, scale_groups], layout=pl.MX_A_ND)
+    activation_scale = pl.tensor.view(scales, [row_tiles * row_tile, scale_groups], layout=pl.MX_A_ND)
     tiles = row_tiles * col_tiles
     workers = pl.min(tiles, pl.system.available_cluster_count())
-    with pl.spmd(workers, name_hint="engram_projection_pypto"):
+    with pl.spmd(workers, name_hint="engram_proj"):
         worker = pl.tile.get_block_idx()
         block_num = pl.tile.get_block_num()
         for row in pl.range(row_tiles):
@@ -202,22 +164,31 @@ def _engram_project_pypto(
             for col in pl.range(col_tiles):
                 if (row * col_tiles + col) % block_num == worker:
                     n0 = col * n_tile
-                    if packed_scale:
-                        sa_l1 = pl.load(packed_activation_scale, [0, 0], [row_tile, scale_groups], target_memory=pl.Mem.Mat)
-                    else:
-                        sa_l1 = pl.load(activation_scale, [m0, 0], [row_tile, scale_groups], target_memory=pl.Mem.Mat)
+                    sa_l1 = pl.load(activation_scale, [m0, 0], [row_tile, scale_groups], target_memory=pl.Mem.Mat)
                     sb_l1 = pl.load(packed_weight_scale, [0, n0], [scale_groups, n_tile], target_memory=pl.Mem.Mat)
                     acc = pl.create_tile([row_tile, n_tile], dtype=pl.FP32, target_memory=pl.Mem.Acc)
-                    # Keep each K256 panel resident until its Cube inputs have been extracted.
+                    # Load the initial K256 panels into L1.
                     a_even = pl.load(payload, [m0, 0], [row_tile, PROJECTION_K_TILE], target_memory=pl.Mem.Mat)
                     b_even = pl.load(weight, [0, n0], [PROJECTION_K_TILE, n_tile], target_memory=pl.Mem.Mat)
-                    a_odd = pl.load(payload, [m0, PROJECTION_K_TILE], [row_tile, PROJECTION_K_TILE], target_memory=pl.Mem.Mat)
-                    b_odd = pl.load(weight, [PROJECTION_K_TILE, n0], [PROJECTION_K_TILE, n_tile], target_memory=pl.Mem.Mat)
+                    a_odd = pl.load(
+                        payload, [m0, PROJECTION_K_TILE], [row_tile, PROJECTION_K_TILE], target_memory=pl.Mem.Mat,
+                    )
+                    b_odd = pl.load(
+                        weight, [PROJECTION_K_TILE, n0], [PROJECTION_K_TILE, n_tile], target_memory=pl.Mem.Mat,
+                    )
                     if four_l1_slots:
-                        a_third = pl.load(payload, [m0, 2 * PROJECTION_K_TILE], [row_tile, PROJECTION_K_TILE], target_memory=pl.Mem.Mat)
-                        b_third = pl.load(weight, [2 * PROJECTION_K_TILE, n0], [PROJECTION_K_TILE, n_tile], target_memory=pl.Mem.Mat)
-                        a_fourth = pl.load(payload, [m0, 3 * PROJECTION_K_TILE], [row_tile, PROJECTION_K_TILE], target_memory=pl.Mem.Mat)
-                        b_fourth = pl.load(weight, [3 * PROJECTION_K_TILE, n0], [PROJECTION_K_TILE, n_tile], target_memory=pl.Mem.Mat)
+                        a_third = pl.load(
+                            payload, [m0, 2 * PROJECTION_K_TILE], [row_tile, PROJECTION_K_TILE], target_memory=pl.Mem.Mat,
+                        )
+                        b_third = pl.load(
+                            weight, [2 * PROJECTION_K_TILE, n0], [PROJECTION_K_TILE, n_tile], target_memory=pl.Mem.Mat,
+                        )
+                        a_fourth = pl.load(
+                            payload, [m0, 3 * PROJECTION_K_TILE], [row_tile, PROJECTION_K_TILE], target_memory=pl.Mem.Mat,
+                        )
+                        b_fourth = pl.load(
+                            weight, [3 * PROJECTION_K_TILE, n0], [PROJECTION_K_TILE, n_tile], target_memory=pl.Mem.Mat,
+                        )
                     for k_base in pl.range(0, ENGRAM_K, l1_slots * PROJECTION_K_TILE):
                         for panel in pl.unroll(l1_slots):
                             if panel == 0:
@@ -243,89 +214,134 @@ def _engram_project_pypto(
                             for local_pair in pl.range(0, PROJECTION_K_TILE, 2 * inner_k):
                                 local_k = local_pair
                                 k = k_base + panel * PROJECTION_K_TILE + local_k
-                                a: pl.Tile[[row_tile, inner_k], pl.FP8E4M3FN, pl.MemRef("engram_a_l0", slots=a_slots)[0], pl.Mem.Left] = pl.tile.extract(a_l1, 0, local_k, [row_tile, inner_k], target_memory=pl.Mem.Left)
-                                b: pl.Tile[[inner_k, n_tile], pl.FP8E4M3FN, pl.MemRef("engram_b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(b_l1, local_k, 0, [inner_k, n_tile], target_memory=pl.Mem.Right)
-                                sa: pl.Tile[[row_tile, scale_tile], pl.FP8E8M0, pl.MemRef("engram_sa_l0", slots=sa_slots)[0], pl.Mem.LeftScale] = pl.tile.extract(sa_l1, 0, k // 32, [row_tile, scale_tile], target_memory=pl.Mem.LeftScale)
-                                sb: pl.Tile[[scale_tile, n_tile], pl.FP8E8M0, pl.MemRef("engram_sb_l0", slots=3)[0], pl.Mem.RightScale] = pl.tile.extract(sb_l1, k // 32, 0, [scale_tile, n_tile], target_memory=pl.Mem.RightScale)
+                                a: pl.Tile[[row_tile, inner_k], pl.FP8E4M3FN,
+                                    pl.MemRef("engram_a_l0", slots=a_slots)[0], pl.Mem.Left] = pl.tile.extract(
+                                    a_l1, 0, local_k, [row_tile, inner_k], target_memory=pl.Mem.Left,
+                                )
+                                b: pl.Tile[[inner_k, n_tile], pl.FP8E4M3FN,
+                                    pl.MemRef("engram_b_l0", slots=2)[0], pl.Mem.Right] = pl.tile.extract(
+                                    b_l1, local_k, 0, [inner_k, n_tile], target_memory=pl.Mem.Right,
+                                )
+                                sa: pl.Tile[[row_tile, scale_tile], pl.FP8E8M0,
+                                    pl.MemRef("engram_sa_l0", slots=sa_slots)[0], pl.Mem.LeftScale] = pl.tile.extract(
+                                    sa_l1, 0, k // 32, [row_tile, scale_tile], target_memory=pl.Mem.LeftScale,
+                                )
+                                sb: pl.Tile[[scale_tile, n_tile], pl.FP8E8M0,
+                                    pl.MemRef("engram_sb_l0", slots=3)[0], pl.Mem.RightScale] = pl.tile.extract(
+                                    sb_l1, k // 32, 0, [scale_tile, n_tile], target_memory=pl.Mem.RightScale,
+                                )
                                 if k == 0:
                                     acc = pl.matmul_mx(a, sa, b, sb)
                                 else:
                                     acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
                                 local_k = local_pair + inner_k
                                 k = k_base + panel * PROJECTION_K_TILE + local_k
-                                a: pl.Tile[[row_tile, inner_k], pl.FP8E4M3FN, pl.MemRef("engram_a_l0", slots=a_slots)[a_slot], pl.Mem.Left] = pl.tile.extract(a_l1, 0, local_k, [row_tile, inner_k], target_memory=pl.Mem.Left)
-                                b: pl.Tile[[inner_k, n_tile], pl.FP8E4M3FN, pl.MemRef("engram_b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(b_l1, local_k, 0, [inner_k, n_tile], target_memory=pl.Mem.Right)
-                                sa: pl.Tile[[row_tile, scale_tile], pl.FP8E8M0, pl.MemRef("engram_sa_l0", slots=sa_slots)[sa_slot], pl.Mem.LeftScale] = pl.tile.extract(sa_l1, 0, k // 32, [row_tile, scale_tile], target_memory=pl.Mem.LeftScale)
-                                sb: pl.Tile[[scale_tile, n_tile], pl.FP8E8M0, pl.MemRef("engram_sb_l0", slots=3)[2], pl.Mem.RightScale] = pl.tile.extract(sb_l1, k // 32, 0, [scale_tile, n_tile], target_memory=pl.Mem.RightScale)
+                                a: pl.Tile[[row_tile, inner_k], pl.FP8E4M3FN,
+                                    pl.MemRef("engram_a_l0", slots=a_slots)[a_slot], pl.Mem.Left] = pl.tile.extract(
+                                    a_l1, 0, local_k, [row_tile, inner_k], target_memory=pl.Mem.Left,
+                                )
+                                b: pl.Tile[[inner_k, n_tile], pl.FP8E4M3FN,
+                                    pl.MemRef("engram_b_l0", slots=2)[1], pl.Mem.Right] = pl.tile.extract(
+                                    b_l1, local_k, 0, [inner_k, n_tile], target_memory=pl.Mem.Right,
+                                )
+                                sa: pl.Tile[[row_tile, scale_tile], pl.FP8E8M0,
+                                    pl.MemRef("engram_sa_l0", slots=sa_slots)[sa_slot], pl.Mem.LeftScale] = pl.tile.extract(
+                                    sa_l1, 0, k // 32, [row_tile, scale_tile], target_memory=pl.Mem.LeftScale,
+                                )
+                                sb: pl.Tile[[scale_tile, n_tile], pl.FP8E8M0,
+                                    pl.MemRef("engram_sb_l0", slots=3)[2], pl.Mem.RightScale] = pl.tile.extract(
+                                    sb_l1, k // 32, 0, [scale_tile, n_tile], target_memory=pl.Mem.RightScale,
+                                )
                                 acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
-                            # Refill the consumed slot while the other panel is ready.
+                            # Refill the consumed L1 slot.
                             next_k = k_base + (panel + l1_slots) * PROJECTION_K_TILE
                             if next_k < ENGRAM_K:
                                 if panel == 0:
-                                    a_even = pl.tile.gather_row(a_even, payload, [0, 0], [m0, next_k], [row_tile, PROJECTION_K_TILE])
-                                    b_even = pl.tile.gather_row(b_even, weight, [0, 0], [next_k, n0], [PROJECTION_K_TILE, n_tile])
+                                    a_even = pl.tile.gather_row(
+                                        a_even, payload, [0, 0], [m0, next_k], [row_tile, PROJECTION_K_TILE],
+                                    )
+                                    b_even = pl.tile.gather_row(
+                                        b_even, weight, [0, 0], [next_k, n0], [PROJECTION_K_TILE, n_tile],
+                                    )
                                 elif panel == 1:
-                                    a_odd = pl.tile.gather_row(a_odd, payload, [0, 0], [m0, next_k], [row_tile, PROJECTION_K_TILE])
-                                    b_odd = pl.tile.gather_row(b_odd, weight, [0, 0], [next_k, n0], [PROJECTION_K_TILE, n_tile])
+                                    a_odd = pl.tile.gather_row(
+                                        a_odd, payload, [0, 0], [m0, next_k], [row_tile, PROJECTION_K_TILE],
+                                    )
+                                    b_odd = pl.tile.gather_row(
+                                        b_odd, weight, [0, 0], [next_k, n0], [PROJECTION_K_TILE, n_tile],
+                                    )
                                 elif four_l1_slots:
                                     if panel == 2:
-                                        a_third = pl.tile.gather_row(a_third, payload, [0, 0], [m0, next_k], [row_tile, PROJECTION_K_TILE])
-                                        b_third = pl.tile.gather_row(b_third, weight, [0, 0], [next_k, n0], [PROJECTION_K_TILE, n_tile])
+                                        a_third = pl.tile.gather_row(
+                                            a_third, payload, [0, 0], [m0, next_k], [row_tile, PROJECTION_K_TILE],
+                                        )
+                                        b_third = pl.tile.gather_row(
+                                            b_third, weight, [0, 0], [next_k, n0], [PROJECTION_K_TILE, n_tile],
+                                        )
                                     else:
-                                        a_fourth = pl.tile.gather_row(a_fourth, payload, [0, 0], [m0, next_k], [row_tile, PROJECTION_K_TILE])
-                                        b_fourth = pl.tile.gather_row(b_fourth, weight, [0, 0], [next_k, n0], [PROJECTION_K_TILE, n_tile])
+                                        a_fourth = pl.tile.gather_row(
+                                            a_fourth, payload, [0, 0], [m0, next_k], [row_tile, PROJECTION_K_TILE],
+                                        )
+                                        b_fourth = pl.tile.gather_row(
+                                            b_fourth, weight, [0, 0], [next_k, n0], [PROJECTION_K_TILE, n_tile],
+                                        )
                     valid_acc = pl.set_validshape(acc, pl.min(row_tile, tokens - m0), n_tile)
                     kv = pl.store(valid_acc, [m0, n0], kv)
     return kv
 
 
 @pl.jit.inline(auto_scope=False)
-def engram_gate(
-    kv: pl.Tensor, weight: pl.Tensor, x: pl.Tensor, out: pl.Tensor,
-    lookup: pl.Tensor, mask_zero_rows: pl.constexpr,
+def _engram_gate_masked(
+    kv: pl.Tensor,
+    weight: pl.Tensor,
+    x: pl.Tensor,
+    out: pl.Tensor,
+    lookup: pl.Tensor,
 ):
     """Run PyPTO gating and preserve zero-lookup FP32 residual rows."""
     tokens = pl.tensor.dim(x, 0)
-    if mask_zero_rows:
-        original = pl.create_tensor([tokens, HC_MULT * D], dtype=pl.FP32)
-        hidden = pl.reshape(x, [tokens, HC_MULT * D])
-        with pl.spmd(tokens, name_hint="engram_save_residual") as saved_ready:
-            row = pl.tile.get_block_idx()
-            for column in pl.range(0, HC_MULT * D, 512):
-                value = pl.load(hidden, [row, column], [1, 512])
-                pl.store(value, [row, column], original)
-        if tokens >= 256:
-            hidden_pairs = pl.reshape(x, [tokens * (HC_MULT // 2), 2 * D])
-            output_pairs = pl.reshape(out, [tokens * (HC_MULT // 2), 2 * D])
-            weight_pairs = pl.reshape(weight, [HC_MULT // 2, 2 * D])
-            with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_gate_pairs", deps=[saved_ready]):
-                _engram_gate_pairs_reg(kv, weight_pairs, hidden_pairs, output_pairs, tokens)
-        else:
-            hidden_rows = pl.reshape(x, [tokens * HC_MULT, D])
-            output_rows = pl.reshape(out, [tokens * HC_MULT, D])
-            with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_gate", deps=[saved_ready]):
-                _engram_gate_reg(kv, weight, hidden_rows, output_rows, tokens)
-        output = pl.reshape(out, [tokens, HC_MULT * D])
-        for block in pl.spmd((tokens + 7) // 8, name_hint="engram_restore_masked"):
-            row = block * 8
-            valid_rows = pl.min(8, tokens - row)
-            total = pl.tile.full([1, 8], dtype=pl.FP32, value=0.0)
-            reduction_tmp = pl.create_tile([8, 256], dtype=pl.FP32)
-            for column in pl.range(0, ENGRAM_K, 256):
-                source = pl.load(lookup, [row, column], [8, 256], valid_shape=[valid_rows, 256])
-                padded = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 8, 256)
-                source_fp32 = pl.cast(padded, pl.FP32)
-                part = pl.reshape(pl.row_sum(pl.abs(source_fp32), reduction_tmp), [1, 8])
-                total = pl.add(total, part)
-            ones = pl.tile.full([8, 512], dtype=pl.FP32, value=1.0)
-            active = pl.cmps(pl.row_expand_mul(ones, pl.reshape(total, [8, 1])), 0.0, cmp_type=4)
-            for column in pl.range(0, HC_MULT * D, 512):
-                saved = pl.load(original, [row, column], [8, 512], valid_shape=[valid_rows, 512])
-                updated = pl.load(output, [row, column], [8, 512], valid_shape=[valid_rows, 512])
-                restored = pl.tile.select(active, pl.set_validshape(updated, 8, 512), pl.set_validshape(saved, 8, 512))
-                pl.store(pl.set_validshape(restored, valid_rows, 512), [row, column], output)
+    original = pl.create_tensor([tokens, HC_MULT * D], dtype=pl.FP32)
+    hidden = pl.reshape(x, [tokens, HC_MULT * D])
+    with pl.spmd(tokens, name_hint="engram_save_residual") as saved_ready:
+        row = pl.tile.get_block_idx()
+        for column in pl.range(0, HC_MULT * D, 512):
+            value = pl.load(hidden, [row, column], [1, 512])
+            pl.store(value, [row, column], original)
+    output_rows = pl.reshape(out, [tokens * HC_MULT, D])
+    if tokens >= 256:
+        hidden_pairs = pl.reshape(x, [tokens * (HC_MULT // 2), 2 * D])
+        weight_pairs = pl.reshape(weight, [HC_MULT // 2, 2 * D])
+        with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_gate_pairs", deps=[saved_ready]):
+            engram_gate_pairs(kv, weight_pairs, hidden_pairs, output_rows, tokens)
     else:
-        _engram_gate_unmasked(kv, weight, x, out, tokens)
+        hidden_rows = pl.reshape(x, [tokens * HC_MULT, D])
+        with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_gate", deps=[saved_ready]):
+            engram_gate(kv, weight, hidden_rows, output_rows, tokens)
+    output = pl.reshape(out, [tokens, HC_MULT * D])
+    for block in pl.spmd((tokens + 7) // 8, name_hint="engram_restore_masked"):
+        row = block * 8
+        valid_rows = pl.min(8, tokens - row)
+        total = pl.tile.full([1, 8], dtype=pl.FP32, value=0.0)
+        reduction_tmp = pl.create_tile([8, 256], dtype=pl.FP32)
+        for column in pl.range(0, ENGRAM_K, 256):
+            source = pl.load(lookup, [row, column], [8, 256], valid_shape=[valid_rows, 256])
+            filled = pl.fillpad(source, pad_value=pl.PadValue.zero)
+            padded = pl.set_validshape(filled, 8, 256)
+            source_fp32 = pl.cast(padded, pl.FP32)
+            part = pl.reshape(pl.row_sum(pl.abs(source_fp32), reduction_tmp), [1, 8])
+            total = pl.add(total, part)
+        ones = pl.tile.full([8, 512], dtype=pl.FP32, value=1.0)
+        row_totals = pl.reshape(total, [8, 1])
+        expanded_totals = pl.row_expand_mul(ones, row_totals)
+        active = pl.cmps(expanded_totals, 0.0, cmp_type=4)
+        for column in pl.range(0, HC_MULT * D, 512):
+            saved = pl.load(original, [row, column], [8, 512], valid_shape=[valid_rows, 512])
+            updated = pl.load(output, [row, column], [8, 512], valid_shape=[valid_rows, 512])
+            updated_full = pl.set_validshape(updated, 8, 512)
+            saved_full = pl.set_validshape(saved, 8, 512)
+            restored = pl.tile.select(active, updated_full, saved_full)
+            restored_rows = pl.set_validshape(restored, valid_rows, 512)
+            pl.store(restored_rows, [row, column], output)
     return out
 
 
@@ -342,71 +358,78 @@ def _load_engram_quant_work(
     rows = pl.max(0, pl.min(ENGRAM_QUANT_M_TILE, num_tokens - t0))
     if rows > 0:
         input_row = slot * ENGRAM_QUANT_M_TILE
-        inputs = pl.tile.gather_row(inputs, x, [input_row, 0], [t0, k0], [ENGRAM_QUANT_M_TILE, ENGRAM_QUANT_K_TILE],
-                                    valid_shape=[rows, ENGRAM_QUANT_K_TILE])
+        inputs = pl.tile.gather_row(
+            inputs, x,
+            [input_row, 0], [t0, k0],
+            [ENGRAM_QUANT_M_TILE, ENGRAM_QUANT_K_TILE], valid_shape=[rows, ENGRAM_QUANT_K_TILE],
+        )
     return inputs
 
 
-
-@pl.jit.incore
-def _engram_quantize_pypto(
+@pl.jit.inline(auto_scope=False)
+def engram_quant(
     x: pl.Tensor,
-    payload: pl.Out[pl.Tensor],
-    scales: pl.Out[pl.Tensor],
     num_tokens: pl.Scalar[pl.INT32],
-    padded_rows: pl.Scalar[pl.INDEX],
-    packed_scale: pl.constexpr,
+    row_tile: pl.constexpr,
 ) -> tuple[pl.Tensor, pl.Tensor]:
-    """Quantize BF16 projection inputs with packed or row-major E8M0 scales."""
-    first = pl.tile.get_block_idx()
-    workers = pl.tile.get_block_num()
-    column_tiles = ENGRAM_K // ENGRAM_QUANT_K_TILE
-    total = padded_rows // ENGRAM_QUANT_M_TILE * column_tiles
-    if first < total:
-        inputs = pl.create_tile([2 * ENGRAM_QUANT_M_TILE, ENGRAM_QUANT_K_TILE], dtype=pl.BF16, target_memory=pl.Mem.Vec)
-        output = pl.create_tile([2 * ENGRAM_QUANT_M_TILE * ENGRAM_QUANT_K_TILE], dtype=pl.INT8, target_memory=pl.Mem.Vec)
-        # The row-major DMA needs 32-byte UB rows for the eight valid scales.
-        codes = pl.create_tile([2 * ENGRAM_QUANT_M_TILE * (ENGRAM_QUANT_SCALE_ROW_BYTES // 4)], dtype=pl.UINT32, target_memory=pl.Mem.Vec)
-        inputs = _load_engram_quant_work(x, inputs, first, 0, num_tokens)
-        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, 0)
-        pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, 0)
-        pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, 1)
-        rounds = (total - first + workers - 1) // workers
-        for iteration in pl.range(rounds):
-            work = first + iteration * workers
-            slot = iteration % 2
-            next_slot = 1 - slot
-            next_work = work + workers
-            # Prefetch the next tile while the vector pipe consumes the current slot.
-            if next_work < total:
-                if iteration > 0:
-                    pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, next_slot)
-                inputs = _load_engram_quant_work(x, inputs, next_work, next_slot, num_tokens)
-                pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, next_slot)
-            t0 = work // column_tiles * ENGRAM_QUANT_M_TILE
-            k0 = work % column_tiles * ENGRAM_QUANT_K_TILE
-            rows = pl.max(0, pl.min(ENGRAM_QUANT_M_TILE, num_tokens - t0))
-            source = pl.reshape(inputs, [2 * ENGRAM_QUANT_M_TILE * ENGRAM_QUANT_K_TILE])
-            pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.V, slot)
-            pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, slot)
-            output_words = pl.reinterpret_view(output, pl.UINT32, shape=[2 * ENGRAM_QUANT_M_TILE * ENGRAM_QUANT_K_TILE // 4])
-            with pl.reg_scope(auto_sync=False):
-                # Keep aligned row and slot offsets visible to register lowering.
-                slot_row = slot * ENGRAM_QUANT_M_TILE
-                code_offset = slot * ENGRAM_QUANT_M_TILE * (ENGRAM_QUANT_SCALE_ROW_BYTES // 4)
-                full = pl.reg.full_mask(lanes=ENGRAM_QUANT_K_TILE)
-                groups = pl.reg.full_mask(lanes=ENGRAM_QUANT_K_TILE // 32)
-                scale_mask = pl.reg.full_mask(lanes=64)
-                lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
-                pair_mask = pl.reg.broadcast(3, lanes=64, dtype=pl.UINT32)
-                pair_index = pl.reg.shift_rights(lane, 3, scale_mask)
-                pair_index = pl.reg.bitwise_and(pair_index, pair_mask, scale_mask)
-                # Each word holds two neighboring scales from two rows.
-                low_index = pl.reg.shift_lefts(pair_index, 4, scale_mask)
-                high_index = pl.reg.adds(low_index, 8, scale_mask)
-                row_mask = pl.reg.broadcast(7, lanes=64, dtype=pl.UINT32)
-                row_indices = pl.reg.bitwise_and(lane, row_mask, scale_mask)
-                if not packed_scale:
+    """Quantize BF16 projection inputs with row-major E8M0 scales."""
+    padded_rows = ((num_tokens + row_tile - 1) // row_tile) * row_tile
+    payload = pl.create_tensor([padded_rows, ENGRAM_K], dtype=pl.FP8E4M3FN)
+    scales = pl.create_tensor([padded_rows, ENGRAM_K // 32], dtype=pl.FP8E8M0)
+    for first in pl.spmd(pl.system.available_aiv_count(), name_hint="engram_quant"):
+        workers = pl.tile.get_block_num()
+        column_tiles = ENGRAM_K // ENGRAM_QUANT_K_TILE
+        total = padded_rows // ENGRAM_QUANT_M_TILE * column_tiles
+        if first < total:
+            inputs = pl.create_tile(
+                [2 * ENGRAM_QUANT_M_TILE, ENGRAM_QUANT_K_TILE], dtype=pl.BF16, target_memory=pl.Mem.Vec,
+            )
+            output = pl.create_tile(
+                [2 * ENGRAM_QUANT_M_TILE * ENGRAM_QUANT_K_TILE], dtype=pl.INT8, target_memory=pl.Mem.Vec,
+            )
+            # The row-major DMA needs 32-byte UB rows for the eight valid scales.
+            codes = pl.create_tile(
+                [2 * ENGRAM_QUANT_M_TILE * (ENGRAM_QUANT_SCALE_ROW_TILE // 4)], dtype=pl.UINT32, target_memory=pl.Mem.Vec,
+            )
+            inputs = _load_engram_quant_work(x, inputs, first, 0, num_tokens)
+            pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, 0)
+            pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, 0)
+            pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, 1)
+            rounds = (total - first + workers - 1) // workers
+            for iteration in pl.range(rounds):
+                work = first + iteration * workers
+                slot = iteration % 2
+                next_slot = 1 - slot
+                next_work = work + workers
+                # Prefetch the next tile while the vector pipe consumes the current slot.
+                if next_work < total:
+                    if iteration > 0:
+                        pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, next_slot)
+                    inputs = _load_engram_quant_work(x, inputs, next_work, next_slot, num_tokens)
+                    pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, next_slot)
+                t0 = work // column_tiles * ENGRAM_QUANT_M_TILE
+                k0 = work % column_tiles * ENGRAM_QUANT_K_TILE
+                rows = pl.max(0, pl.min(ENGRAM_QUANT_M_TILE, num_tokens - t0))
+                source = pl.reshape(inputs, [2 * ENGRAM_QUANT_M_TILE * ENGRAM_QUANT_K_TILE])
+                pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.V, slot)
+                pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, slot)
+                output_words = pl.reinterpret_view(output, pl.UINT32, shape=[2 * ENGRAM_QUANT_M_TILE * ENGRAM_QUANT_K_TILE // 4])
+                with pl.reg_scope(auto_sync=False):
+                    # Compute aligned row and slot offsets.
+                    slot_row = slot * ENGRAM_QUANT_M_TILE
+                    code_offset = slot * ENGRAM_QUANT_M_TILE * (ENGRAM_QUANT_SCALE_ROW_TILE // 4)
+                    full = pl.reg.full_mask(lanes=ENGRAM_QUANT_K_TILE)
+                    groups = pl.reg.full_mask(lanes=ENGRAM_QUANT_K_TILE // 32)
+                    scale_mask = pl.reg.full_mask(lanes=64)
+                    lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
+                    pair_mask = pl.reg.broadcast(3, lanes=64, dtype=pl.UINT32)
+                    pair_index = pl.reg.shift_rights(lane, 3, scale_mask)
+                    pair_index = pl.reg.bitwise_and(pair_index, pair_mask, scale_mask)
+                    # Each word holds two neighboring scales from two rows.
+                    low_index = pl.reg.shift_lefts(pair_index, 4, scale_mask)
+                    high_index = pl.reg.adds(low_index, 8, scale_mask)
+                    row_mask = pl.reg.broadcast(7, lanes=64, dtype=pl.UINT32)
+                    row_indices = pl.reg.bitwise_and(lane, row_mask, scale_mask)
                     # Unpack each word pair into two consecutive words per row.
                     one = pl.reg.broadcast(1, lanes=64, dtype=pl.UINT32)
                     group_half = pl.reg.bitwise_and(lane, one, scale_mask)
@@ -424,47 +447,46 @@ def _engram_quantize_pypto(
                     scale_index = pl.reg.add(scale_row, group_half, scale_mask)
                     scale_index = pl.reg.adds(scale_index, pl.cast(code_offset, pl.UINT32), scale_mask)
                     active_words = pl.reg.compares(lane, ENGRAM_QUANT_SCALE_TILE // 4, scale_mask, predicate="lt")
-                zero = pl.reg.broadcast(0, lanes=64, dtype=pl.UINT32)
-                for row, (packed_scales,) in pl.hardware_loop(rows, init_values=(zero,)):
-                    tile_row = slot_row + row
-                    offset = tile_row * ENGRAM_QUANT_K_TILE
-                    raw = pl.reg.load(source, offset, lanes=ENGRAM_QUANT_K_TILE)
-                    value = pl.reg.convert(raw, dtype=pl.FP32)
-                    magnitude = pl.reg.abs(value, full)
-                    maximum = pl.reg.reduce_max(magnitude, full, group_size=32)
-                    maximum_bits = pl.reg.interpret_cast(maximum, dtype=pl.INT32)
-                    exponent = pl.reg.shift_rights(maximum_bits, 23, groups)
-                    exponent = pl.reg.adds(exponent, -8, groups)
-                    exponent = pl.reg.maximums(exponent, 0, groups)
-                    nonzero = pl.reg.minimums(exponent, 1, groups)
-                    reciprocal_code = pl.reg.muls(exponent, -1, groups)
-                    reciprocal_code = pl.reg.adds(reciprocal_code, 254, groups)
-                    reciprocal_code = pl.reg.mul(reciprocal_code, nonzero, groups)
-                    reciprocal_bits = pl.reg.shift_lefts(reciprocal_code, 23, groups)
-                    reciprocal = pl.reg.interpret_cast(reciprocal_bits, dtype=pl.FP32)
-                    reciprocal = pl.reg.group_broadcast(reciprocal, lanes=ENGRAM_QUANT_K_TILE)
-                    value = pl.reg.mul(value, reciprocal, full)
-                    value = pl.reg.maximums(value, -448.0, full)
-                    value = pl.reg.minimums(value, 448.0, full)
-                    fp8 = pl.reg.convert(value, dtype=pl.FP8E4M3FN, rounding="R", saturate=False)
-                    words = pl.reg.interpret_cast(fp8, dtype=pl.UINT32)
-                    word_offset = tile_row * (ENGRAM_QUANT_K_TILE // 4)
-                    _payload = pl.reg.store(output_words, word_offset, words)
+                    zero = pl.reg.broadcast(0, lanes=64, dtype=pl.UINT32)
+                    for row, (packed_scales,) in pl.hardware_loop(rows, init_values=(zero,)):
+                        tile_row = slot_row + row
+                        offset = tile_row * ENGRAM_QUANT_K_TILE
+                        raw = pl.reg.load(source, offset, lanes=ENGRAM_QUANT_K_TILE)
+                        value = pl.reg.convert(raw, dtype=pl.FP32)
+                        magnitude = pl.reg.abs(value, full)
+                        maximum = pl.reg.reduce_max(magnitude, full, group_size=32)
+                        maximum_bits = pl.reg.interpret_cast(maximum, dtype=pl.INT32)
+                        exponent = pl.reg.shift_rights(maximum_bits, 23, groups)
+                        exponent = pl.reg.adds(exponent, -8, groups)
+                        exponent = pl.reg.maximums(exponent, 0, groups)
+                        nonzero = pl.reg.minimums(exponent, 1, groups)
+                        reciprocal_code = pl.reg.muls(exponent, -1, groups)
+                        reciprocal_code = pl.reg.adds(reciprocal_code, 254, groups)
+                        reciprocal_code = pl.reg.mul(reciprocal_code, nonzero, groups)
+                        reciprocal_bits = pl.reg.shift_lefts(reciprocal_code, 23, groups)
+                        reciprocal = pl.reg.interpret_cast(reciprocal_bits, dtype=pl.FP32)
+                        reciprocal = pl.reg.group_broadcast(reciprocal, lanes=ENGRAM_QUANT_K_TILE)
+                        value = pl.reg.mul(value, reciprocal, full)
+                        value = pl.reg.maximums(value, -448.0, full)
+                        value = pl.reg.minimums(value, 448.0, full)
+                        fp8 = pl.reg.convert(value, dtype=pl.FP8E4M3FN, rounding="R", saturate=False)
+                        words = pl.reg.interpret_cast(fp8, dtype=pl.UINT32)
+                        word_offset = tile_row * (ENGRAM_QUANT_K_TILE // 4)
+                        _payload = pl.reg.store(output_words, word_offset, words)
 
-                    scale_words = pl.reg.interpret_cast(exponent, dtype=pl.UINT32)
-                    scale_words = pl.reg.group_broadcast(scale_words, lanes=64)
-                    low = pl.reg.gather_lanes(scale_words, low_index)
-                    high = pl.reg.gather_lanes(scale_words, high_index)
-                    high = pl.reg.shift_lefts(high, 8, scale_mask)
-                    pair = pl.reg.bitwise_or(low, high, scale_mask)
-                    bit = pl.cast((row % 2) * 16, pl.INT16)
-                    pair = pl.reg.shift_lefts(pair, bit, scale_mask)
-                    word = pl.cast(row // 2, pl.UINT32)
-                    row_selected = pl.reg.compares(row_indices, word, scale_mask, predicate="eq")
-                    pair = pl.reg.select(row_selected, pair, zero)
-                    updated_scales = pl.reg.bitwise_or(packed_scales, pair, scale_mask)
-                    packed_scales = pl.yield_(updated_scales)
-                if not packed_scale:
+                        scale_words = pl.reg.interpret_cast(exponent, dtype=pl.UINT32)
+                        scale_words = pl.reg.group_broadcast(scale_words, lanes=64)
+                        low = pl.reg.gather_lanes(scale_words, low_index)
+                        high = pl.reg.gather_lanes(scale_words, high_index)
+                        high = pl.reg.shift_lefts(high, 8, scale_mask)
+                        pair = pl.reg.bitwise_or(low, high, scale_mask)
+                        bit = pl.cast((row % 2) * 16, pl.INT16)
+                        pair = pl.reg.shift_lefts(pair, bit, scale_mask)
+                        word = pl.cast(row // 2, pl.UINT32)
+                        row_selected = pl.reg.compares(row_indices, word, scale_mask, predicate="eq")
+                        pair = pl.reg.select(row_selected, pair, zero)
+                        updated_scales = pl.reg.bitwise_or(packed_scales, pair, scale_mask)
+                        packed_scales = pl.yield_(updated_scales)
                     low_word = pl.reg.gather_lanes(packed_scales, low_packed_index)
                     high_word = pl.reg.gather_lanes(packed_scales, high_packed_index)
                     low_scale = pl.reg.shift_right(low_word, bit_shift, scale_mask)
@@ -473,149 +495,339 @@ def _engram_quantize_pypto(
                     second = pl.reg.bitwise_and(second, half_word, scale_mask)
                     second = pl.reg.shift_lefts(second, 16, scale_mask)
                     packed_scales = pl.reg.bitwise_or(low_scale, second, scale_mask)
-                # Complete the active payload stores before the scale and padding stores.
-                pl.reg.mem_bar("VST_VST")
-                if packed_scale:
-                    _scales = pl.reg.store(codes, code_offset, packed_scales)
-                else:
+                    # Complete the active payload stores before the scale and padding stores.
+                    pl.reg.mem_bar("VST_VST")
                     _scales = pl.reg.scatter(codes, scale_index, packed_scales, active_words)
-                padding = pl.reg.broadcast(0, lanes=ENGRAM_QUANT_K_TILE // 4, dtype=pl.UINT32)
-                for inactive in pl.hardware_loop(ENGRAM_QUANT_M_TILE - rows):
-                    row = rows + inactive
-                    tile_row = slot_row + row
-                    word_offset = tile_row * (ENGRAM_QUANT_K_TILE // 4)
-                    _payload_pad = pl.reg.store(output_words, word_offset, padding)
-            pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE2, slot)
-            pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE3, slot)
-            pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE3, slot)
-            output_rows = pl.reshape(output, [2 * ENGRAM_QUANT_M_TILE, ENGRAM_QUANT_K_TILE])
-            output_tile = pl.tile.slice(output_rows, [ENGRAM_QUANT_M_TILE, ENGRAM_QUANT_K_TILE], [slot * ENGRAM_QUANT_M_TILE, 0])
-            quantized = pl.reinterpret_view(output_tile, pl.FP8E4M3FN)
-            pl.store(quantized, [t0, k0], payload)
-            if packed_scale:
-                scale_bytes = pl.reinterpret_view(codes, pl.UINT8, shape=[2, ENGRAM_QUANT_M_TILE * ENGRAM_QUANT_SCALE_ROW_BYTES])
-                scale_tile = pl.tile.slice(scale_bytes, [1, ENGRAM_QUANT_SCALE_TILE], [slot, 0])
-                scale_codes = pl.reinterpret_view(scale_tile, pl.FP8E8M0)
-                scale_offset = t0 * (ENGRAM_K // 32) + k0 // ENGRAM_QUANT_K_TILE * ENGRAM_QUANT_SCALE_TILE
-                pl.store(scale_codes, [0, scale_offset], scales)
-            else:
+                    padding = pl.reg.broadcast(0, lanes=ENGRAM_QUANT_K_TILE // 4, dtype=pl.UINT32)
+                    for inactive in pl.hardware_loop(ENGRAM_QUANT_M_TILE - rows):
+                        row = rows + inactive
+                        tile_row = slot_row + row
+                        word_offset = tile_row * (ENGRAM_QUANT_K_TILE // 4)
+                        _payload_pad = pl.reg.store(output_words, word_offset, padding)
+                pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE2, slot)
+                pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE3, slot)
+                pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE3, slot)
+                output_rows = pl.reshape(output, [2 * ENGRAM_QUANT_M_TILE, ENGRAM_QUANT_K_TILE])
+                output_tile = pl.tile.slice(
+                    output_rows, [ENGRAM_QUANT_M_TILE, ENGRAM_QUANT_K_TILE], [slot * ENGRAM_QUANT_M_TILE, 0],
+                )
+                quantized = pl.reinterpret_view(output_tile, pl.FP8E4M3FN)
+                payload = pl.store(quantized, [t0, k0], payload)
                 scale_bytes = pl.reinterpret_view(codes, pl.UINT8, shape=[2 * ENGRAM_QUANT_M_TILE, 32])
                 scale_tile = pl.tile.slice(scale_bytes, [ENGRAM_QUANT_M_TILE, 32], [slot * ENGRAM_QUANT_M_TILE, 0])
                 scale_codes = pl.reinterpret_view(scale_tile, pl.FP8E8M0)
                 scale_rows = pl.set_validshape(scale_codes, ENGRAM_QUANT_M_TILE, ENGRAM_QUANT_K_TILE // 32)
-                pl.store(scale_rows, [t0, k0 // 32], scales)
-            pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, slot)
-        pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, 0)
-        if rounds > 1:
-            pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, 1)
-        pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 0)
-        pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 1)
-        pl.system.barrier(pipe=pl.PipeType.ALL)
+                scales = pl.store(scale_rows, [t0, k0 // 32], scales)
+                pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.V, slot)
+            pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, 0)
+            if rounds > 1:
+                pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE2, 1)
+            pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 0)
+            pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.V, 1)
+            pl.system.barrier(pipe=pl.PipeType.ALL)
     return payload, scales
 
 
 @pl.jit.inline(auto_scope=False)
-def _engram_rows_tile(
-    lookup: pl.Tensor, wkv: pl.Tensor, wkv_scale: pl.Tensor, weight: pl.Tensor,
-    x: pl.Tensor, out: pl.Tensor, tokens: pl.Scalar[pl.INT32],
-    row_tile: pl.constexpr, mask_zero_rows: pl.constexpr,
-):
-    """Quantize and project host rows before gating the residual."""
-    padded = ((tokens + row_tile - 1) // row_tile) * row_tile
-    payload = pl.create_tensor([padded, ENGRAM_K], dtype=pl.FP8E4M3FN)
-    kv = pl.create_tensor([tokens, KV_OUT], dtype=pl.BF16)
-    if row_tile == 128:
-        # The 81–128 token interval always fits in one static M128 scale view.
-        scales = pl.create_tensor([1, padded * (ENGRAM_K // 32)], dtype=pl.FP8E8M0)
-        with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_quant"):
-            quantized, quantized_scales = _engram_quantize_pypto(lookup, payload, scales, tokens, padded, True)
-        projected = _engram_project_pypto(
-            quantized, wkv, quantized_scales, wkv_scale, kv, tokens, row_tile, PROJECTION_N_TILE, 128, 4,
-            True, True, 4, 2, 1, 3, 2,
-        )
-    else:
-        scales = pl.create_tensor([padded, ENGRAM_K // 32], dtype=pl.FP8E8M0)
-        with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_quant"):
-            quantized, quantized_scales = _engram_quantize_pypto(lookup, payload, scales, tokens, padded, False)
-        if row_tile == 80:
-            # A K64 payload tile occupies 5120 bytes. Slot 7 places the second
-            # L0A tile beyond 32 KiB, and scale slot 14 matches its address >> 4.
-            projected = _engram_project_pypto(
-                quantized, wkv, quantized_scales, wkv_scale, kv, tokens, row_tile, PROJECTION_N_TILE_M80, 64, 2, False, False, 2, 8, 7, 15, 14,
-            )
-        else:
-            projected = _engram_project_pypto(
-                quantized, wkv, quantized_scales, wkv_scale, kv, tokens, row_tile, PROJECTION_N_TILE, 128, 4, False, False, 2, 2, 1, 3, 2,
-            )
-    if mask_zero_rows:
-        return engram_gate(projected, weight, x, out, lookup, mask_zero_rows)
-    return _engram_gate_unmasked(projected, weight, x, out, tokens)
-
-
-@pl.jit.inline(auto_scope=False)
 def _engram_gate_unmasked(
-    kv: pl.Tensor, weight: pl.Tensor, x: pl.Tensor, out: pl.Tensor, tokens: pl.Scalar[pl.INDEX],
+    kv: pl.Tensor,
+    weight: pl.Tensor,
+    x: pl.Tensor,
+    out: pl.Tensor,
+    tokens: pl.Scalar[pl.INDEX],
 ):
     output_rows = pl.reshape(out, [pl.tensor.dim(out, 0) * HC_MULT, D])
     if tokens >= 256:
         hidden_pairs = pl.reshape(x, [pl.tensor.dim(x, 0) * (HC_MULT // 2), 2 * D])
         weight_pairs = pl.reshape(weight, [HC_MULT // 2, 2 * D])
         with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_gate_pairs"):
-            _engram_gate_pairs_reg(kv, weight_pairs, hidden_pairs, output_rows, tokens)
+            engram_gate_pairs(kv, weight_pairs, hidden_pairs, output_rows, tokens)
     else:
         hidden_rows = pl.reshape(x, [pl.tensor.dim(x, 0) * HC_MULT, D])
         with pl.spmd(pl.system.available_aiv_count(), name_hint="engram_gate"):
-            _engram_gate_reg(kv, weight, hidden_rows, output_rows, tokens)
+            engram_gate(kv, weight, hidden_rows, output_rows, tokens)
     return out
 
 
 @pl.jit.inline(auto_scope=False)
-def engram_from_rows(
-    lookup: pl.Tensor,
+def engram(
+    ids: pl.Tensor,
+    table: pld.DistributedTensor,
+    scales: pl.Tensor,
+    layer: pl.Scalar[pl.INDEX],
+    shard_rows: pl.constexpr,
     wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
     wkv_scale: pl.Tensor[[ENGRAM_K // 32, KV_OUT], pl.FP8E8M0],
     weight: pl.Tensor[[HC_MULT, D], pl.FP32],
     x: pl.Tensor,
     out: pl.Tensor,
-    mask_zero_rows: pl.constexpr = False,
+    mask_zero_rows: pl.constexpr,
 ):
-    """Project dequantized BF16 lookup rows and gate the FP32 residual stream."""
+    """Look up one layer's host rows, project them, and gate the residual."""
+    lookup_count = pl.tensor.dim(ids, 0) // 2
+    rows = pl.create_tensor([lookup_count, HEAD_DIM], dtype=pl.BF16)
+    rows = engram_lookup(ids, table, scales, rows, layer, shard_rows)
+    lookup = pl.reshape(rows, [lookup_count // N_HASH_COLS, ENGRAM_K])
     tokens = pl.tensor.dim(x, 0)
     if tokens > 0:
+        kv = pl.create_tensor([tokens, KV_OUT], dtype=pl.BF16)
         if tokens <= 80:
-            result = _engram_rows_tile(
-                lookup, wkv_weight, wkv_scale, weight, x, out, tokens, 80, mask_zero_rows,
+            payload_m80, scales_m80 = engram_quant(lookup, tokens, 80)
+            # Slot 7 puts the second K64 tile beyond 32 KiB. Scale slot 14 matches its address >> 4.
+            projected = engram_proj(
+                payload_m80, wkv_weight, scales_m80, wkv_scale, kv, tokens, 80, PROJECTION_M80_N_TILE,
+                64, 2, False, 2, 8, 7, 15, 14,
             )
         elif tokens <= 128:
-            result = _engram_rows_tile(
-                lookup, wkv_weight, wkv_scale, weight, x, out, tokens, 128, mask_zero_rows,
+            payload_m128, scales_m128 = engram_quant(lookup, tokens, 128)
+            projected = engram_proj(
+                payload_m128, wkv_weight, scales_m128, wkv_scale, kv, tokens, 128, PROJECTION_N_TILE,
+                128, 4, True, 4, 2, 1, 3, 2,
             )
         else:
-            result = _engram_rows_tile(
-                lookup, wkv_weight, wkv_scale, weight, x, out, tokens, 256, mask_zero_rows,
+            payload_m256, scales_m256 = engram_quant(lookup, tokens, 256)
+            projected = engram_proj(
+                payload_m256, wkv_weight, scales_m256, wkv_scale, kv, tokens, 256, PROJECTION_N_TILE,
+                128, 4, False, 2, 2, 1, 3, 2,
             )
+
+        if mask_zero_rows:
+            result = _engram_gate_masked(projected, weight, x, out, lookup)
+        else:
+            result = _engram_gate_unmasked(projected, weight, x, out, tokens)
     else:
         result = out
     return result
 
 
-class EngramHistory:
-    """Maintain request-local compressed-token history and native Engram hashes."""
+def write_forward_engram_layout(directory):
+    """Record compile-time Host-window layout beside the integrated forward artifact."""
+    layout = {
+        "abi_version": 1, "ranks": EP_SIZE, "rows_per_layer": ENGRAM_ROWS,
+    }
+    path = Path(directory) / "engram_layout.json"
+    path.write_text(json.dumps(layout, indent=2) + "\n")
 
-    def __init__(self, token_map, pad_id, primes, multipliers):
-        self.token_map = torch.as_tensor(token_map, dtype=torch.int64, device="cpu")
-        self.primes = torch.as_tensor(primes, dtype=torch.int64, device="cpu")
-        self.multipliers = torch.as_tensor(multipliers, dtype=torch.int64, device="cpu")
-        layers = len(M.engram_layer_ids)
-        if self.token_map.ndim != 1 or self.token_map.numel() == 0 or bool((self.token_map < 0).any()):
-            raise ValueError("Engram token_map must be a nonempty vector of compressed token IDs")
-        if self.primes.shape != (layers, N_HASH_COLS) or bool((self.primes <= 0).any()):
-            raise ValueError("Engram hash buckets must contain positive sizes for every layer and hash head")
-        if self.multipliers.shape != (layers, M.engram_max_ngram_size):
-            raise ValueError("Engram hash multipliers must contain one value per layer and n-gram position")
-        if not isinstance(pad_id, int) or isinstance(pad_id, bool) or pad_id < 0:
-            raise ValueError("Engram pad_id must be a nonnegative compressed token ID")
-        self.pad_id = pad_id
+
+def validate_forward_engram_layout(directory, ranks, rows):
+    """Reject artifacts compiled for different Host-window ownership or table extents."""
+    path = Path(directory) / "engram_layout.json"
+    expected = {"abi_version": 1, "ranks": ranks, "rows_per_layer": rows}
+    if not path.is_file() or json.loads(path.read_text()) != expected:
+        raise ValueError("forward Engram layout is missing or mismatched; recompile with matching --ep and --engram-table-rows")
+
+
+class EngramPayloadSource(io.RawIOBase):
+    """Expose checkpoint slices and zero padding as one seekable Host-window source."""
+
+    def __init__(self, segments):
+        super().__init__()
+        self._files = ExitStack()
+        self._segments = []
+        self._ends = []
+        self._position = 0
+        total = 0
+        try:
+            for path, offset, count in segments:
+                if offset < 0 or count < 0:
+                    raise ValueError("Engram source ranges must be nonnegative")
+                if count:
+                    file = None if path is None else self._files.enter_context(Path(path).open("rb"))
+                    self._segments.append((file, offset, count))
+                    total += count
+                    self._ends.append(total)
+        except BaseException:
+            self.close()
+            raise
+        self._size = total
+
+    def readable(self):
+        return not self.closed
+
+    def seekable(self):
+        return not self.closed
+
+    def tell(self):
+        if self.closed:
+            raise ValueError("Engram source is closed")
+        return self._position
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        if self.closed:
+            raise ValueError("Engram source is closed")
+        if whence == io.SEEK_CUR:
+            offset += self._position
+        elif whence == io.SEEK_END:
+            offset += self._size
+        elif whence != io.SEEK_SET:
+            raise ValueError("invalid Engram seek origin")
+        if offset < 0:
+            raise ValueError("negative Engram source position")
+        self._position = offset
+        return offset
+
+    def readinto(self, buffer):
+        if self.closed:
+            raise ValueError("Engram source is closed")
+        destination = memoryview(buffer).cast("B")
+        copied = 0
+        while copied < len(destination) and self._position < self._size:
+            segment = bisect_right(self._ends, self._position)
+            start = 0 if segment == 0 else self._ends[segment - 1]
+            file, offset, length = self._segments[segment]
+            local = self._position - start
+            count = min(length - local, len(destination) - copied)
+            target = destination[copied:copied + count]
+            if file is None:
+                target[:] = bytes(count)
+            else:
+                file.seek(offset + local)
+                count = file.readinto(target)
+                if not count:
+                    raise EOFError("truncated Engram checkpoint payload")
+            copied += count
+            self._position += count
+        return copied
+
+    def close(self):
+        self._files.close()
+        super().close()
+
+
+class EngramHostTables:
+    """Own streamed ENP Host shards and complete Device-resident scale replicas."""
+
+    def __init__(self, checkpoint, ranks, *, num_embeddings=M.engram_num_embeddings, program_count=1):
+        if ranks not in (2, 4, 8):
+            raise ValueError("Engram ENP offload requires two, four, or eight ranks")
+        if program_count < 1:
+            raise ValueError("Engram Host-window program count must be positive")
+        self.ranks = ranks
+        self.payload_spans = []
+        self.scale_spans = []
+        if len(num_embeddings) != len(M.engram_layer_ids) or any(rows <= 0 for rows in num_embeddings):
+            raise ValueError("Engram table sizes must contain one positive row count per layer")
+        for slot, layer in enumerate(M.engram_layer_ids):
+            prefix = f"layers.{layer}.engram.embed."
+            payload = checkpoint.tensor_span(prefix + "weight")
+            scale = checkpoint.tensor_span(prefix + "scale")
+            if payload[2] != (num_embeddings[slot], HEAD_DIM) or payload[3] != torch.float8_e4m3fn:
+                raise ValueError(f"unsupported Engram payload layout: {prefix}weight")
+            if scale[2] != (payload[2][0], HEAD_DIM // 32) or scale[3] != torch.float8_e8m0fnu:
+                raise ValueError(f"unsupported Engram scale layout: {prefix}scale")
+            self.payload_spans.append(payload)
+            self.scale_spans.append(scale)
+        self.rows_per_layer = (max(span[2][0] for span in self.payload_spans) + ranks - 1) // ranks * ranks
+        self.shard_rows = self.rows_per_layer // ranks
+        self.program_count = program_count
+        self.host_payload_bytes_per_program = ranks * 2 * self.shard_rows * HEAD_DIM
+        self.host_payload_bytes = program_count * self.host_payload_bytes_per_program
+        self.device_scale_bytes_per_rank = 2 * self.rows_per_layer * (HEAD_DIM // 32)
+        self.upload_buffer = torch.empty(64 * 1024**2, dtype=torch.uint8).share_memory_()
+        self.sources = []
+
+    def __enter__(self):
+        try:
+            available = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        except (AttributeError, OSError, ValueError):
+            available = None
+        if available is not None and self.host_payload_bytes > available:
+            raise MemoryError(
+                f"ENP requires {self.host_payload_bytes} Host payload bytes, "
+                f"only {available} are available"
+            )
+        try:
+            for rank in range(self.ranks):
+                row = rank * self.shard_rows
+                segments = []
+                for path, offset, shape, _dtype in self.payload_spans:
+                    count = max(0, min(self.shard_rows, shape[0] - row))
+                    segments.append((path, offset + row * HEAD_DIM, count * HEAD_DIM))
+                    segments.append((None, 0, (self.shard_rows - count) * HEAD_DIM))
+                self.sources.append(EngramPayloadSource(segments))
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def __exit__(self, *_exception):
+        for source in self.sources:
+            source.close()
+        self.sources.clear()
+
+    def upload_scales(self, runtime):
+        """Upload each native scale byte once to every rank using bounded shared scratch."""
+        shape = (2 * self.rows_per_layer, HEAD_DIM // 32)
+        shards = [runtime.alloc_tensor(shape, torch.uint8, worker_id=rank) for rank in range(self.ranks)]
+        target = memoryview(self.upload_buffer.numpy()).cast("B")
+        for layer, (path, offset, source_shape, _dtype) in enumerate(self.scale_spans):
+            live = source_shape[0] * (HEAD_DIM // 32)
+            layer_bytes = self.rows_per_layer * (HEAD_DIM // 32)
+            with path.open("rb") as file:
+                file.seek(offset)
+                for begin in range(0, layer_bytes, len(target)):
+                    count = min(len(target), layer_bytes - begin)
+                    valid = max(0, min(count, live - begin))
+                    if valid:
+                        read = file.readinto(target[:valid])
+                        if read != valid:
+                            raise EOFError("truncated Engram scale table")
+                    if valid < count:
+                        target[valid:count] = bytes(count - valid)
+                    for rank, shard in enumerate(shards):
+                        offset = layer * layer_bytes + begin
+                        runtime.copy_to(
+                            shard.data_ptr, self.upload_buffer.data_ptr(), count, dst_offset=offset, worker_id=rank,
+                        )
+        stack_shape = (self.ranks, *shape)
+        return StackedDeviceTensor(shards, stack_shape, tuple(range(self.ranks)))
+
+
+class HostEngram:
+    """Normalize tokenizer text and hash the compressed token history of each request."""
+
+    def __init__(self, tokenizer):
+        import numpy as np
+        from tokenizers import Regex, normalizers
+
+        sentinel = "\ue000"
+        normalizer = normalizers.Sequence([
+            normalizers.NFKC(), normalizers.NFD(), normalizers.StripAccents(), normalizers.Lowercase(),
+            normalizers.Replace(Regex(r"[ \t\r\n]+"), " "), normalizers.Replace(Regex(r"^ $"), sentinel),
+            normalizers.Strip(), normalizers.Replace(sentinel, " "),
+        ])
+        keys = {}
+        token_map = []
+        for token in range(tokenizer.get_vocab_size(with_added_tokens=True)):
+            text = tokenizer.decode([token], skip_special_tokens=False)
+            key = tokenizer.id_to_token(token) if "\ufffd" in text else normalizer.normalize_str(text) or text
+            token_map.append(keys.setdefault(key, len(keys)))
+        if len(keys) != M.engram_compressed_vocab_size:
+            raise ValueError(f"Engram compressed vocabulary has {len(keys)} entries")
+        primes, seen = [], set()
+        for layer in M.engram_layer_ids:
+            buckets = []
+            for _ in range(M.engram_max_ngram_size - 1):
+                candidate = M.engram_vocab_size - 1
+                for _ in range(M.engram_n_heads):
+                    candidate += 1
+                    while candidate in seen or any(candidate % d == 0 for d in range(2, math.isqrt(candidate) + 1)):
+                        candidate += 1
+                    seen.add(candidate)
+                    buckets.append(candidate)
+            primes.append(buckets)
+        if tuple(map(sum, primes)) != M.engram_num_embeddings:
+            raise ValueError("Engram prime buckets do not match checkpoint table sizes")
+        bound = max(1, (np.iinfo(np.int64).max // len(keys)) // 2)
+        self.multipliers = torch.stack([
+            torch.from_numpy(np.random.default_rng(10007 * layer).integers(
+                0, bound, size=M.engram_max_ngram_size, dtype=np.int64,
+            ) * 2 + 1)
+            for layer in M.engram_layer_ids
+        ])
+        self.token_map = torch.tensor(token_map, dtype=torch.int64, device="cpu")
+        self.pad_id = token_map[M.engram_pad_token_id]
+        self.primes = torch.tensor(primes, dtype=torch.int64, device="cpu")
         self.offsets = self.primes.cumsum(-1) - self.primes
         self.history = {}
 
@@ -657,228 +869,26 @@ class EngramHistory:
         return torch.cat(hashes, dim=-1) + self.offsets.unsqueeze(1)
 
 
-class HostEngram(EngramHistory):
-    """Normalize checkpoint token text and hash request histories.
-
-    lookup_reference reads checkpoint rows on the CPU for validation.
-
-    Reuse one instance across prefill chunks and decode calls. Each request_id
-    owns its compressed-token history; start_pos=0 resets that request, and
-    continuation requires the preceding history. False token_mask entries exclude
-    image positions and stop n-grams from crossing image spans.
-    """
-
-    def __init__(self, checkpoint, tokenizer):
-        import numpy as np
-        from tokenizers import Regex, normalizers
-
-        self.checkpoint = checkpoint
-        sentinel = "\ue000"
-        normalizer = normalizers.Sequence([
-            normalizers.NFKC(), normalizers.NFD(), normalizers.StripAccents(), normalizers.Lowercase(),
-            normalizers.Replace(Regex(r"[ \t\r\n]+"), " "), normalizers.Replace(Regex(r"^ $"), sentinel),
-            normalizers.Strip(), normalizers.Replace(sentinel, " "),
-        ])
-        keys = {}
-        token_map = []
-        for token in range(tokenizer.get_vocab_size(with_added_tokens=True)):
-            text = tokenizer.decode([token], skip_special_tokens=False)
-            key = tokenizer.id_to_token(token) if "\ufffd" in text else normalizer.normalize_str(text) or text
-            token_map.append(keys.setdefault(key, len(keys)))
-        if len(keys) != M.engram_compressed_vocab_size:
-            raise ValueError(f"Engram compressed vocabulary has {len(keys)} entries")
-        primes, seen = [], set()
-        for layer in M.engram_layer_ids:
-            buckets = []
-            for _ in range(M.engram_max_ngram_size - 1):
-                candidate = M.engram_vocab_size - 1
-                for _ in range(M.engram_n_heads):
-                    candidate += 1
-                    while candidate in seen or any(candidate % d == 0 for d in range(2, math.isqrt(candidate) + 1)):
-                        candidate += 1
-                    seen.add(candidate)
-                    buckets.append(candidate)
-            primes.append(buckets)
-        if tuple(map(sum, primes)) != M.engram_num_embeddings:
-            raise ValueError("Engram prime buckets do not match checkpoint table sizes")
-        primes = torch.tensor(primes, dtype=torch.int64)
-        bound = max(1, (np.iinfo(np.int64).max // len(keys)) // 2)
-        multipliers = torch.stack([
-            torch.from_numpy(np.random.default_rng(10007 * layer).integers(
-                0, bound, size=M.engram_max_ngram_size, dtype=np.int64,
-            ) * 2 + 1)
-            for layer in M.engram_layer_ids
-        ])
-        super().__init__(token_map, token_map[M.engram_pad_token_id], primes, multipliers)
-
-    def lookup(self, token_ids, capacity, start_pos=0, *, request_id=0, token_mask=None):
-        """Read current rows and group-32 E8M0 scales into [2, capacity, 6144] BF16.
-
-        Tables stay in host checkpoint files; only selected rows are read.
-        Unused token rows are zero-padded.
-        """
-        from quant import decode_e8m0
-
-        if len(token_ids) > capacity or capacity <= 0:
-            raise ValueError("Engram rows must fit the current-token capacity")
-        hashes = self.hash_ids(token_ids, start_pos, request_id=request_id, token_mask=token_mask)
-        active = torch.ones(len(token_ids), dtype=torch.bool)
-        if token_mask is not None:
-            active = torch.as_tensor(token_mask, device="cpu")
-        layers = len(M.engram_layer_ids)
-        width = self.primes.shape[1] * M.engram_head_dim
-        result = torch.zeros((layers, capacity, width), dtype=torch.bfloat16)
-        for slot, layer in enumerate(M.engram_layer_ids):
-            prefix = f"layers.{layer}.engram.embed."
-            if not bool(active.any()):
-                continue
-            rows = self.checkpoint.tensor_rows(prefix + "weight", hashes[slot, active])
-            scales = self.checkpoint.tensor_rows(prefix + "scale", hashes[slot, active])
-            if rows.dtype != torch.float8_e4m3fn or rows.shape[-1] != M.engram_head_dim:
-                raise ValueError(f"unsupported native Engram table layout: {prefix}weight")
-            if scales.dtype != torch.float8_e8m0fnu or scales.shape[-1] != M.engram_head_dim // 32:
-                raise ValueError(f"unsupported native Engram table scales: {prefix}scale")
-            values = rows.float() * decode_e8m0(scales).repeat_interleave(32, dim=-1)
-            result[slot, :len(token_ids)][active] = values.flatten(1).to(torch.bfloat16)
-        return result
-
-
-def build_masked_gate_specs(tokens):
-    """Build mixed text/image rows with non-BF16 FP32 residual values."""
-    from golden import TensorSpec
-
-    generator = torch.Generator().manual_seed(9)
-    lookup = torch.randn(tokens, ENGRAM_K, generator=generator).bfloat16()
-    kv = torch.randn(tokens, KV_OUT, generator=generator).bfloat16()
-    lookup[1::3] = 0
-    kv[1::3] = 0
-    hidden = torch.randn(tokens, HC_MULT, D, generator=generator)
-    return [
-        TensorSpec("kv", [tokens, KV_OUT], torch.bfloat16, init_value=kv),
-        TensorSpec("weight", [HC_MULT, D], torch.float32, init_value=1.0),
-        TensorSpec("x", [tokens, HC_MULT, D], torch.float32, init_value=hidden),
-        TensorSpec("lookup", [tokens, ENGRAM_K], torch.bfloat16, init_value=lookup),
-        TensorSpec("out", [tokens, HC_MULT, D], torch.float32),
-    ]
-
-
-def golden_masked_gate(tensors):
-    """Evaluate gated text rows and exact image-row residual passthrough."""
-    hidden = tensors["x"]
-    keys = tensors["kv"][:, :HC_MULT * D].float().reshape(-1, HC_MULT, D)
-    value = tensors["kv"][:, HC_MULT * D:].float()
-    dot = (hidden * tensors["weight"] * keys).sum(-1)
-    dot *= torch.rsqrt(hidden.square().mean(-1) + NORM_EPS)
-    dot *= torch.rsqrt(keys.square().mean(-1) + NORM_EPS) * DOT_SCALE
-    gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(CLAMP).sqrt(), dot))
-    expected = (hidden + gate.unsqueeze(-1) * value[:, None]).bfloat16().float()
-    masked = tensors["lookup"].count_nonzero(dim=-1) == 0
-    expected[masked] = hidden[masked]
-    tensors["out"].copy_(expected)
-
-
-def compare_masked_gate(actual, expected, *, inputs, **kwargs):
-    """Require exact masked residuals and the existing Engram text comparator."""
-    from golden import ratio_allclose
-
-    masked = inputs["lookup"].count_nonzero(dim=-1) == 0
-    if not torch.equal(actual[masked], inputs["x"][masked]):
-        return False, "masked FP32 residual changed"
-    if bool(masked.all()):
-        return True, ""
-    return ratio_allclose(atol=1e-3, rtol=1e-2)(actual[~masked], expected[~masked], inputs=inputs, **kwargs)
-
-
-@pl.jit
-def l2_engram_masked_gate(
-    kv: pl.Tensor[[T_DYN, KV_OUT], pl.BF16],
-    weight: pl.Tensor[[HC_MULT, D], pl.FP32],
-    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    lookup: pl.Tensor[[T_DYN, ENGRAM_K], pl.BF16],
-    out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
-):
-    """Validate masked host-lookup gating over FP32 residual streams."""
-    kv.bind_dynamic(0, T_DYN)
-    x.bind_dynamic(0, T_DYN)
-    lookup.bind_dynamic(0, T_DYN)
-    out.bind_dynamic(0, T_DYN)
-    engram_gate(kv, weight, x, out, lookup, mask_zero_rows=True)
-    return out
-
-
-@pl.jit
-def l2_engram_rows(
-    lookup: pl.Tensor[[T_DYN, ENGRAM_K], pl.BF16],
-    wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[ENGRAM_K // 32, KV_OUT], pl.FP8E8M0],
-    weight: pl.Tensor[[HC_MULT, D], pl.FP32],
-    x: pl.InOut[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
-):
-    """Validate the same in-place entry used by decode and prefill forwards."""
-    lookup.bind_dynamic(0, T_DYN)
-    x.bind_dynamic(0, T_DYN)
-    engram_from_rows(lookup, wkv_weight, wkv_scale, weight, x, x, False)
-    return x
-
-
-def build_engram_rows_specs(tokens: int):
-    """Build deterministic host-row inputs with nonuniform packed MX scales."""
-    from golden import TensorSpec
-    from quant import pack_mx_b_scale
-
-    generator = torch.Generator().manual_seed(3)
-
-    def init_lookup():
-        return (torch.randn(tokens, ENGRAM_K, generator=generator) * 0.2).bfloat16()
-
-    def init_wkv():
-        value = (torch.randn(ENGRAM_K, KV_OUT, generator=generator) * 0.02).to(torch.float8_e4m3fn)
-        return value
-
-    def init_scale():
-        codes = torch.randint(120, 128, (ENGRAM_K // 32, KV_OUT), generator=generator, dtype=torch.uint8)
-        return pack_mx_b_scale(codes).view(torch.float8_e8m0fnu)
-
-    def init_weight():
-        return torch.rand(HC_MULT, D, generator=generator) + 0.5
-
-    def init_x():
-        return torch.randn(tokens, HC_MULT, D, generator=generator)
-
-    return [
-        TensorSpec("lookup", [tokens, ENGRAM_K], torch.bfloat16, init_value=init_lookup),
-        TensorSpec("wkv_weight", [ENGRAM_K, KV_OUT], torch.float8_e4m3fn, init_value=init_wkv),
-        TensorSpec("wkv_scale", [ENGRAM_K // 32, KV_OUT], torch.float8_e8m0fnu, init_value=init_scale),
-        TensorSpec("weight", [HC_MULT, D], torch.float32, init_value=init_weight),
-        TensorSpec("x", [tokens, HC_MULT, D], torch.float32, init_value=init_x),
-    ]
-
-
-def golden_engram_rows_case(tensors):
-    """Apply independent sequential MX projection and the released gate formula."""
-    from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
-
-    wkv = tensors["wkv_weight"]
-    kv = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(tensors["lookup"], wkv, tensors["wkv_scale"])
-    key = kv[:, :HC_MULT * D].float().reshape(-1, HC_MULT, D)
-    value = kv[:, HC_MULT * D:].float()
-    h = tensors["x"].float()
-    inverse = torch.rsqrt(h.square().mean(-1) + NORM_EPS) * torch.rsqrt(key.square().mean(-1) + NORM_EPS)
-    dot = (h * tensors["weight"] * key).sum(-1) * inverse * DOT_SCALE
-    root = dot.abs().clamp_min(CLAMP).sqrt()
-    gate = torch.sigmoid(torch.where(dot >= 0, root, -root))
-    tensors["x"][:] = (h + gate.unsqueeze(-1) * value.unsqueeze(-2)).bfloat16().float()
+def build_random_engram_ids(ranks, capacity, active_tokens, table_rows):
+    """Build reproducible layer-major lookup IDs with negative padding."""
+    layers = len(M.engram_layer_ids)
+    ids = torch.full((ranks, layers, capacity, N_HASH_COLS), -1, dtype=torch.int32)
+    generator = torch.Generator().manual_seed(166)
+    active_shape = (ranks, layers, active_tokens, N_HASH_COLS)
+    active = torch.randint(table_rows, active_shape, generator=generator, dtype=torch.int32)
+    ids[:, :, :active_tokens] = active
+    return ids.reshape(ranks, layers * capacity * N_HASH_COLS, 1)
 
 
 @pl.jit.inline(auto_scope=False)
-def _engram_gate_row_reg(
+def _engram_gate_row(
     hidden: pl.Tile[[D], pl.FP32, pl.Mem.Vec],
     key: pl.Tile[[D], pl.BF16, pl.Mem.Vec],
     value: pl.Tile[[D], pl.BF16, pl.Mem.Vec],
     weight: pl.Tile[[D], pl.FP32, pl.Mem.Vec],
     output: pl.Tile[[D], pl.FP32, pl.Mem.Vec],
 ):
-    """Apply the C++ lane accumulation, inverse-root correction and BF16 residual rounding."""
+    """Compute the gate and round the updated residual to BF16."""
     with pl.reg_scope(auto_sync=False):
         full = pl.reg.full_mask(lanes=64)
         sx = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
@@ -973,16 +983,15 @@ def _engram_gate_row_reg(
     return output
 
 
-
 @pl.jit.incore
-def _engram_gate_reg(
+def engram_gate(
     kv: pl.Tensor[[T_DYN, KV_OUT], pl.BF16],
     weight: pl.Tensor[[HC_MULT, D], pl.FP32],
     x: pl.Tensor[[T_DYN * HC_MULT, D], pl.FP32],
     out: pl.Out[pl.Tensor[[T_DYN * HC_MULT, D], pl.FP32]],
     tokens: pl.Scalar[pl.INDEX],
 ):
-    """Run the per-copy gate with cached weights and the C++ worker traversal."""
+    """Apply the per-copy gate with cached weights."""
     first = pl.tile.get_block_idx()
     workers = pl.tile.get_block_num()
     if first < tokens * HC_MULT:
@@ -998,10 +1007,9 @@ def _engram_gate_reg(
             key = pl.reshape(key_raw, [D])
             value = pl.reshape(value_raw, [D])
             output = pl.create_tile([D], dtype=pl.FP32, target_memory=pl.Mem.Vec)
-            output = _engram_gate_row_reg(hidden, key, value, gain, output)
+            output = _engram_gate_row(hidden, key, value, gain, output)
             pl.store(pl.reshape(output, [1, D]), [work, 0], out)
     return out
-
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1019,9 +1027,8 @@ def _load_engram_gate_pair(
     return hidden, key, value
 
 
-
 @pl.jit.incore
-def _engram_gate_pairs_reg(
+def engram_gate_pairs(
     kv: pl.Tensor[[T_DYN, KV_OUT], pl.BF16],
     weight: pl.Tensor[[HC_MULT // 2, 2 * D], pl.FP32],
     x: pl.Tensor[[T_DYN * (HC_MULT // 2), 2 * D], pl.FP32],
@@ -1070,7 +1077,7 @@ def _engram_gate_pairs_reg(
                         value_row = pl.reshape(pl.tile.slice(value, [1, D], [slot, 0]), [D])
                         gain_row = pl.reshape(pl.tile.slice(gain, [1, D], [0, copy_offset]), [D])
                         output_row = pl.reshape(pl.tile.slice(output, [1, D], [copy, 0]), [D])
-                        output_row = _engram_gate_row_reg(hidden_row, key_row, value_row, gain_row, output_row)
+                        output_row = _engram_gate_row(hidden_row, key_row, value_row, gain_row, output_row)
                         pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE3, output_event)
                         pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE3, output_event)
                         pl.store(pl.reshape(output_row, [1, D]), [work * 2 + copy, 0], out)
@@ -1083,73 +1090,160 @@ def _engram_gate_pairs_reg(
     return out
 
 
+@pl.jit
+def l2_engram(
+    ids: pl.Tensor[[TEST_LOOKUPS_DYN, 1], pl.INT32],
+    table: pld.DistributedTensor[[2 * TEST_SHARD_ROWS, HEAD_DIM], pl.UINT8],
+    scales: pl.Tensor[[2 * TEST_TABLE_ROWS, HEAD_DIM // 32], pl.UINT8],
+    wkv: pl.Tensor[[ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[ENGRAM_K // 32, KV_OUT], pl.FP8E8M0],
+    weight: pl.Tensor[[HC_MULT, D], pl.FP32],
+    x: pl.Tensor[[2, T_DYN, HC_MULT, D], pl.FP32],
+    out: pl.Out[pl.Tensor[[2, T_DYN, HC_MULT, D], pl.FP32]],
+):
+    """Run both Engram layers through the full device path."""
+    for layer in pl.range(2):
+        hidden = x[layer]
+        output = out[layer]
+        engram(ids, table, scales, layer, TEST_SHARD_ROWS, wkv, wkv_scale, weight, hidden, output, False)
+    return out
+
+
+@pl.jit.host
+def l3_engram(
+    ids: pl.Tensor[[RANKS_DYN, TEST_LOOKUPS_DYN, 1], pl.INT32],
+    scales: pl.Tensor[[2 * TEST_TABLE_ROWS, HEAD_DIM // 32], pl.UINT8],
+    wkv: pl.Tensor[[ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[ENGRAM_K // 32, KV_OUT], pl.FP8E8M0],
+    weight: pl.Tensor[[HC_MULT, D], pl.FP32],
+    x: pl.Tensor[[RANKS_DYN, 2, T_DYN, HC_MULT, D], pl.FP32],
+    out: pl.Out[pl.Tensor[[RANKS_DYN, 2, T_DYN, HC_MULT, D], pl.FP32]],
+):
+    """Dispatch the full Engram validation on each participating rank."""
+    buffer = pld.alloc_window_buffer(
+        [2 * TEST_SHARD_ROWS, HEAD_DIM], dtype=pl.UINT8, memory_source="host", init="payload",
+    )
+    for rank in pl.range(pld.world_size()):
+        table = pld.window(buffer, [2 * TEST_SHARD_ROWS, HEAD_DIM], dtype=pl.UINT8)
+        l2_engram(ids[rank], table, scales, wkv, wkv_scale, weight, x[rank], out[rank], device=rank)
+
+
+def build_tensor_specs(ranks, tokens):
+    """Build the validation tensors and their sharded Host-window payload."""
+    from golden import TensorSpec
+    from quant import pack_mx_b_scale
+
+    generator = torch.Generator().manual_seed(17)
+    ids = build_random_engram_ids(ranks, tokens, max(1, tokens - 1), ranks * TEST_SHARD_ROWS)
+    payload_shape = (ranks, 2 * TEST_SHARD_ROWS, HEAD_DIM)
+    payload = torch.randint(-16, 17, payload_shape, generator=generator).to(torch.float8_e4m3fn).view(torch.uint8)
+    scale_shape = (2 * TEST_TABLE_ROWS, HEAD_DIM // 32)
+    scales = torch.randint(124, 131, scale_shape, generator=generator, dtype=torch.uint8)
+    channels = torch.arange(0, ENGRAM_K, HEAD_DIM)
+    # One nonzero weight channel per K panel.
+    active_weights = torch.randint(1, 9, (N_HASH_COLS, KV_OUT), generator=generator).float() / 64
+    weight_codes = torch.randint(124, 131, (ENGRAM_K // 32, KV_OUT), generator=generator, dtype=torch.uint8)
+    packed_scales = pack_mx_b_scale(weight_codes).view(torch.float8_e8m0fnu)
+
+    def init_wkv():
+        weights = torch.zeros(ENGRAM_K, KV_OUT, dtype=torch.uint8)
+        weights[channels] = active_weights.to(torch.float8_e4m3fn).view(torch.uint8)
+        return weights.view(torch.float8_e4m3fn)
+
+    def init_x():
+        return torch.randn(ranks, 2, tokens, HC_MULT, D, generator=torch.Generator().manual_seed(9))
+
+    specs = [
+        TensorSpec("ids", list(ids.shape), ids.dtype, init_value=ids),
+        TensorSpec("scales", list(scales.shape), scales.dtype, init_value=scales),
+        TensorSpec("wkv", [ENGRAM_K, KV_OUT], torch.float8_e4m3fn, init_value=init_wkv),
+        TensorSpec("wkv_scale", list(packed_scales.shape), packed_scales.dtype, init_value=packed_scales),
+        TensorSpec("weight", [HC_MULT, D], torch.float32, init_value=1.0),
+        TensorSpec("x", [ranks, 2, tokens, HC_MULT, D], torch.float32, init_value=init_x),
+        TensorSpec("out", [ranks, 2, tokens, HC_MULT, D], torch.float32),
+    ]
+    return specs, payload
+
+
+def golden_engram(tensors, *, payload):
+    """Compute the full Engram residual from the same sharded Host table."""
+    from gemm import _quantize_mxfp8_activation
+    from quant import unpack_mx_b_scale
+
+    hidden = tensors["x"]
+    ranks, layers_count, tokens = hidden.shape[:3]
+    row_ids = tensors["ids"].reshape(ranks, layers_count, tokens, N_HASH_COLS).long()
+    valid = row_ids >= 0
+    layers = torch.arange(layers_count).reshape(1, layers_count, 1, 1).expand_as(row_ids)[valid]
+    selected = row_ids[valid]
+    owner = selected // TEST_SHARD_ROWS
+    address = layers * TEST_SHARD_ROWS + selected % TEST_SHARD_ROWS
+    rows = payload[owner, address].view(torch.float8_e4m3fn).float()
+    codes = tensors["scales"][layers * TEST_TABLE_ROWS + selected].int() - 127
+    lookup = torch.zeros(*row_ids.shape, HEAD_DIM, dtype=torch.bfloat16)
+    lookup[valid] = torch.ldexp(rows, codes.repeat_interleave(32, dim=-1)).bfloat16()
+
+    activations, scale_a = _quantize_mxfp8_activation(lookup.flatten(-2), scale_alg=0)
+    channels = torch.arange(0, ENGRAM_K, HEAD_DIM)
+    groups = channels // 32
+    left = activations.float().flatten(-2)[..., channels] * scale_a[..., groups]
+    weights = tensors["wkv"].view(torch.uint8)[channels].view(torch.float8_e4m3fn).float()
+    scales_b = unpack_mx_b_scale(tensors["wkv_scale"].view(torch.uint8))
+    right = torch.ldexp(weights, scales_b[groups].int() - 127)
+    kv = (left @ right).bfloat16().float()
+    keys = kv[..., :HC_MULT * D].unflatten(-1, (HC_MULT, D))
+    value = kv[..., HC_MULT * D:]
+    inverse = torch.rsqrt(hidden.square().mean(-1) + NORM_EPS) * torch.rsqrt(keys.square().mean(-1) + NORM_EPS)
+    dot = (hidden * tensors["weight"] * keys).sum(-1) * inverse * DOT_SCALE
+    gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(CLAMP).sqrt(), dot))
+    tensors["out"].copy_((hidden + gate.unsqueeze(-1) * value.unsqueeze(-2)).bfloat16().float())
+
+
 if __name__ == "__main__":
-    import argparse
+    from functools import partial
 
     from golden import ratio_allclose, run
+    from pypto.ir import DistributedConfig
 
-    parser = argparse.ArgumentParser(description="DeepSeek V4.1 Engram validation")
-    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
-    parser.add_argument("--sim", dest="execution_mode", action="store_true")
-    parser.add_argument(
-        "-d",
-        "--device",
-        type=str,
-        default="0",
-        help="comma-separated device ids; provide one device id",
-    )
-    parser.add_argument("--masked-gate", action="store_true")
-    parser.add_argument("--tokens", type=int, help="explicit row count; default checks tile boundaries and tails")
-    parser.add_argument("--runtime-dir", help="reuse a CPU-prebuilt runtime; requires --tokens")
-    parser.add_argument("--golden-data", help="reuse frozen input/reference tensors; requires --tokens")
+    parser = argparse.ArgumentParser(description="DeepSeek V4.1 full Engram validation")
+    parser.add_argument("-p", "--platform", choices=["a5"], default="a5")
+    parser.add_argument("-d", "--device", default="0", help="comma-separated IDs for 1, 2, 4, or 8 devices")
+    parser.add_argument("--tokens", type=int, default=8, help="token rows per layer and rank")
+    parser.add_argument("--runtime-dir", help="reuse a CPU-prebuilt runtime")
+    parser.add_argument("--golden-data", help="reuse frozen input/reference tensors")
     parser.add_argument("--save-data", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     args = parser.parse_args()
 
     device_ids = [int(d) for d in args.device.split(",")]
-    if len(device_ids) != 1:
-        raise ValueError(f"need exactly one device id, got {device_ids}")
-
-    if args.tokens is not None and args.tokens <= 0:
+    if len(device_ids) not in (1, 2, 4, 8) or len(set(device_ids)) != len(device_ids):
+        parser.error("provide 1, 2, 4, or 8 distinct device IDs")
+    if min(device_ids) < 0:
+        parser.error("device IDs must be nonnegative")
+    if args.tokens <= 0:
         parser.error("--tokens must be positive")
-    if (args.runtime_dir or args.golden_data or args.save_data) and args.tokens is None:
-        parser.error("replay/capture options require an explicit --tokens case")
-    token_cases = [17, 81, 129, 256] if args.execution_mode else [17, 80, 81, 128, 129, 256, 257]
-    if args.tokens is not None:
-        token_cases = [args.tokens]
-    for tokens in ([] if args.masked_gate else token_cases):
-        specs = build_engram_rows_specs(tokens)
-        result = run(
-            a5_default_runtime="host_build_graph",
-            fn=l2_engram_rows,
-            specs=specs,
-            golden_fn=golden_engram_rows_case,
-            config={
-                "backend_type": args.backend_type, "execution_mode": args.execution_mode,
-                "device_id": device_ids[0],
-                "enable_chip_swimlane": args.enable_chip_swimlane,
-            },
-            rtol=1e-3,
-            atol=1e-3,
-            compare_fn={"x": ratio_allclose(atol=1e-3, rtol=1e-2)},
-            compile_only=args.compile_only,
-            runtime_dir=args.runtime_dir,
-            golden_data=args.golden_data,
-            save_data=args.save_data,
-        )
-        if not result.passed:
-            raise SystemExit(result.error or 1)
 
+    specs, payload = build_tensor_specs(len(device_ids), args.tokens)
     result = run(
+        fn=l3_engram,
+        specs=specs,
+        golden_fn=partial(golden_engram, payload=payload),
+        config={
+            "backend_type": "a5",
+            "execution_mode": False,
+            "distributed_config": DistributedConfig(device_ids=device_ids, num_sub_workers=0),
+            "enable_chip_swimlane": args.enable_chip_swimlane,
+        },
         a5_default_runtime="host_build_graph",
-        fn=l2_engram_masked_gate,
-        specs=build_masked_gate_specs(8),
-        golden_fn=golden_masked_gate,
-        config={"backend_type": args.backend_type, "execution_mode": args.execution_mode,
-                "device_id": device_ids[0]},
-        compare_fn={"out": compare_masked_gate},
         compile_only=args.compile_only,
+        runtime_dir=args.runtime_dir,
+        golden_data=args.golden_data,
+        save_data=args.save_data,
+        window_sources=None if args.compile_only else {"payload": list(payload.unbind(0))},
+        persistent=True,
+        reset_persistent_windows=False,
+        compare_fn={"out": ratio_allclose(atol=1e-3, rtol=1e-2)},
     )
     if not result.passed:
         raise SystemExit(result.error or 1)
