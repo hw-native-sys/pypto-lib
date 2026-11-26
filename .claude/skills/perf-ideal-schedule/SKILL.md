@@ -1,12 +1,12 @@
 ---
 name: perf-ideal-schedule
-description: Capture a level-1 PyPTO swimlane and estimate a resource-constrained ideal task schedule, including oversized launches, off-path core contention, MIX placement, and actionable parallel-demand diagnostics. Use for best-schedule kernel latency estimates and dependency-only versus finite-core comparisons, rather than benchmark medians or observed dispatch-gap attribution.
+description: Capture a level-1 PyPTO swimlane and estimate a resource-constrained ideal task schedule, including oversized launches, off-path core contention, MIX resource demand, and actionable parallel-demand diagnostics. Use for best-schedule kernel latency estimates and dependency-only versus finite-core comparisons, rather than benchmark medians or observed dispatch-gap attribution.
 ---
 
 # Ideal Schedule Performance
 
 Run the requested case with numerical validation, collect a level-1 chip
-swimlane, and compute a physically core-feasible ideal schedule. Report it as
+swimlane, and compute a capacity-constrained ideal schedule. Report it as
 **a conservative ordered-wave task-gang model estimate**, never as measured latency or a
 proof of hardware-optimal execution.
 
@@ -44,8 +44,8 @@ simulate cross-rank communication. Report other ranks rather than hiding skew.
 
 ## Solve
 
-The helper requires the active PyPTO runtime (for `read_perf_data`) and
-OR-Tools. If OR-Tools is absent, install it into an isolated target or use an
+The helper requires the active PyPTO runtime (for `read_perf_data`). The
+CP-SAT solve also requires OR-Tools. If OR-Tools is absent, install it into an isolated target or use an
 existing compatible isolated installation, retaining the selected runtime's
 Python environment. Do not embed a host-specific solver location in the skill:
 
@@ -103,8 +103,9 @@ For each included task:
   core until this task duration expires. For oversized launches, apply this
   rule separately to sequential capacity-sized waves. This is conservative for launches
   that can actually stagger blocks or release short worker lanes early.
-- Allocate pure AIC/AIV blocks from their corresponding capacity. MIX requires
-  an AIC and its associated one/two AIV cores in the same cluster.
+- Allocate each whole task from independent pools of 32 AICs and 64 AIVs.
+  MIX uses one AIC and one or two AIVs per block. Account for total free AIVs
+  without distinguishing V0/V1 or imposing cluster affinity.
 - Allow new task order and new core assignments. Discard observed same-core
   predecessor edges and inter-task idle gaps.
 
@@ -113,34 +114,33 @@ publication/pool outputs, rather than stopping at an arbitrarily named HC post.
 This accounts for branches competing for cores; branches with sufficient slack
 can still be hidden.
 
-The helper first constructs a physical list schedule, prioritizing the longest
-remaining dependency chain. It groups ready tasks by core demand, and validates
-precedence, exact worker counts, MIX slot pairing and core overlap independently.
-This provides a feasible fallback and a CP-SAT warm start.
+The helper builds a list schedule, prioritizing the longest remaining
+dependency chain among ready tasks that fit both pools. It starts the entire
+task together and holds its resources until completion. It independently
+checks precedence, exact worker counts and pool occupancy. The result provides
+the fallback and CP-SAT warm start.
 
 `--solver auto` (default) uses CP-SAT up to `--exact-task-limit 500` expanded
 graph nodes, then uses the verified list schedule for larger graphs. Use
 `--solver heuristic` for a quick estimate or `--solver exact` to explicitly
-attempt CP-SAT on a larger graph. `--timeout` bounds each optimization and
-placement solve separately; parsing, graph construction and checks are outside
+attempt CP-SAT on a larger graph. `--timeout` bounds the optimization solve; parsing, graph construction and checks are outside
 that limit. Do not keep increasing timeouts without a useful bound improvement.
 
-CP-SAT solves engine-capacity scheduling, then checks physical paired-core
-placement at those times. On timeout or unavailable placement, retain the engine
-candidate/status as diagnostics and report the independently verified fallback.
-A candidate without placement is never promoted to a feasible schedule. Report
-the chosen method, fallback reason, dependency/workload lower bound, solver bound
-when available, and feasible-minus-bound gap. `HEURISTIC` is an upper bound within
-this model and carries no optimality claim, even if it happens to meet the bound.
+CP-SAT solves the same pool-capacity problem. The returned times are checked
+with an independent allocation to anonymous cores. On timeout without a
+candidate, report the independently verified fallback. Report the chosen
+method, fallback reason, dependency/workload lower bound, solver bound
+when available, and feasible-minus-bound gap.
 
-- `OPTIMAL` plus a paired-core witness proves optimality **within this model**.
+- `OPTIMAL` proves optimality **within this model**.
 - `FEASIBLE` is a model-feasible upper bound; report the solver lower bound too.
 - The unlimited-resource dependency path is a cross-check, not a substitute
   for finite-core scheduling. Report the additional contention separately.
 
 Do not describe this as a hardware lower bound. Fixed measured durations retain
 kernel-internal waits and capture-time contention. The model does not recompute
-memory bandwidth, cache interference, remote-peer progress, descriptor slots,
+physical cluster or slot placement, memory bandwidth, cache interference,
+remote-peer progress, descriptor slots,
 or changes in kernel duration under a different execution order. Ordered waves
 also impose extra barriers and charge the slowest worker to every wave; they do not reconstruct actual wave timing. A finer
 per-block model can reduce the conservative gang-model result.
@@ -198,5 +198,5 @@ wall-time claims still require an unprofiled benchmark through `perf`.
 ## Helper validation
 
 After changing scheduling logic, reanalyze compatible existing captures and
-check work conservation, dependencies and physical core assignments. A new
+check work conservation, dependencies and pool occupancy. A new
 device capture is unnecessary for changes confined to this analyzer.

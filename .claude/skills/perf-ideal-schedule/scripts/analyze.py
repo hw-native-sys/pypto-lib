@@ -15,18 +15,13 @@ import math
 import time
 from pathlib import Path
 
-try:
-    from ortools.sat.python import cp_model
-except ImportError as exc:
-    raise SystemExit(
-        "Install ortools in an isolated target and add it to PYTHONPATH; retain the active PyPTO environment."
-    ) from exc
-
 from scheduling import (
+    CAPACITIES,
     SCALE,
     demand,
     expand_waves,
     graph_times,
+    assign_pool_cores,
     list_schedule,
     pressure_report,
     verify_schedule,
@@ -34,10 +29,17 @@ from scheduling import (
 
 
 def solve_exact(info, stats, edges, graph, timeout, hint):
+    try:
+        from ortools.sat.python import cp_model
+    except ImportError as exc:
+        raise SystemExit(
+            "Install ortools in an isolated target and add it to PYTHONPATH; retain the active PyPTO environment."
+        ) from exc
+
     duration = graph[0]
     horizon = max(hint[1].values())
     model = cp_model.CpModel()
-    starts, ends, intervals = {}, {}, {}
+    starts, ends = {}, {}
     resource, demands = {"aic": [], "aiv": []}, {"aic": [], "aiv": []}
     for tid in sorted(duration):
         w = duration[tid]
@@ -49,14 +51,13 @@ def solve_exact(info, stats, edges, graph, timeout, hint):
         if not w:
             continue
         iv = model.new_interval_var(starts[tid], w, ends[tid], "iv" + tid)
-        intervals[tid] = iv
         for engine, n in zip(("aic", "aiv"), demand(info[tid])):
             if n:
                 resource[engine].append(iv)
                 demands[engine].append(n)
     for a, b in edges:
         model.add(starts[b] >= ends[a])
-    for engine, cap in [("aic", 32), ("aiv", 64)]:
+    for engine, cap in zip(("aic", "aiv"), CAPACITIES, strict=True):
         model.add_cumulative(resource[engine], demands[engine], cap)
     makespan = model.new_int_var(0, horizon, "makespan")
     model.add_max_equality(makespan, [ends[t] for t in duration])
@@ -70,7 +71,6 @@ def solve_exact(info, stats, edges, graph, timeout, hint):
         "engine_status": solver.status_name(status),
         "engine_schedule_us": None,
         "solver_bound_us": solver.best_objective_bound / SCALE,
-        "paired_core_assignment": "NOT_RUN",
         "candidate": None,
     }
     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
@@ -78,68 +78,10 @@ def solve_exact(info, stats, edges, graph, timeout, hint):
             raise ValueError(("Unexpected solver failure with verified feasible hint", result))
         return result
     result["engine_schedule_us"] = solver.value(makespan) / SCALE
-    # Verify the relaxed engine capacities have a physically paired core assignment.
-    placement = cp_model.CpModel()
-    cores = defaultdict(list)
-    presence = defaultdict(list)
-    for tid in intervals:
-        ks = info[tid]["kernel_ids"]
-        b = info[tid]["block_num"]
-        st = solver.value(starts[tid])
-        en = solver.value(ends[tid])
-        candidates = []
-        if ks[0] >= 0:
-            for cluster in range(32):
-                v = placement.new_bool_var(f"{tid}c{cluster}")
-                iv = placement.new_optional_fixed_size_interval_var(st, en - st, v, f"p{tid}c{cluster}")
-                cores[cluster].append(iv)
-                presence[cluster].append((tid, v))
-                candidates.append(v)
-                if ks[1] >= 0 and ks[2] >= 0:
-                    cores[32 + 2 * cluster].append(iv)
-                    cores[33 + 2 * cluster].append(iv)
-                    presence[32 + 2 * cluster].append((tid, v))
-                    presence[33 + 2 * cluster].append((tid, v))
-                elif ks[1] >= 0 or ks[2] >= 0:
-                    # Preserve the active AIV slot within the selected MIX cluster.
-                    pair = []
-                    for slot in [i for i in range(2) if ks[i + 1] >= 0]:
-                        a = placement.new_bool_var(f"{tid}v{cluster}_{slot}")
-                        vi = placement.new_optional_fixed_size_interval_var(
-                            st, en - st, a, f"pv{tid}{cluster}_{slot}"
-                        )
-                        cores[32 + 2 * cluster + slot].append(vi)
-                        presence[32 + 2 * cluster + slot].append((tid, a))
-                        pair.append(a)
-                    placement.add(sum(pair) == v)
-            placement.add(sum(candidates) == b)
-        else:
-            for core in range(32, 96):
-                v = placement.new_bool_var(f"{tid}v{core}")
-                iv = placement.new_optional_fixed_size_interval_var(st, en - st, v, f"p{tid}v{core}")
-                cores[core].append(iv)
-                presence[core].append((tid, v))
-                candidates.append(v)
-            placement.add(sum(candidates) == b * sum(k >= 0 for k in ks[1:]))
-    for ivs in cores.values():
-        placement.add_no_overlap(ivs)
-    ps = cp_model.CpSolver()
-    ps.parameters.max_time_in_seconds = timeout
-    ps.parameters.num_search_workers = 4
-    pstatus = ps.solve(placement)
-    has_placement = pstatus in [cp_model.OPTIMAL, cp_model.FEASIBLE]
-    result["paired_core_assignment"] = ps.status_name(pstatus)
-    if has_placement:
-        assigned = defaultdict(list)
-        for core, entries in presence.items():
-            for tid, present in entries:
-                if ps.value(present):
-                    assigned[tid].append(core)
-        result["candidate"] = (
-            {tid: solver.value(v) for tid, v in starts.items()},
-            {tid: solver.value(v) for tid, v in ends.items()},
-            dict(assigned),
-        )
+    solved_starts = {tid: solver.value(var) for tid, var in starts.items()}
+    solved_ends = {tid: solver.value(var) for tid, var in ends.items()}
+    assigned = assign_pool_cores(info, duration, solved_starts, solved_ends)
+    result["candidate"] = solved_starts, solved_ends, assigned
     return result
 
 
@@ -161,13 +103,12 @@ def run(key, record):
             max(asap_end.values()),
             *(
                 math.ceil(sum(duration[t] * demand(info[t])[engine] for t in included) / capacity)
-                for engine, capacity in enumerate((32, 64))
+                for engine, capacity in enumerate(CAPACITIES)
             ),
         )
         / SCALE
     )
     fallback = list_schedule(info, stats, graph)
-    verify_schedule(info, duration, edges, *fallback)
     mode = record.get("solver", "auto")
     limit = record.get("exact_task_limit", 500)
     use_exact = mode == "exact" or (mode == "auto" and len(duration) <= limit)
@@ -175,7 +116,6 @@ def run(key, record):
         "engine_status": "NOT_RUN",
         "engine_schedule_us": None,
         "solver_bound_us": lower,
-        "paired_core_assignment": "NOT_RUN",
         "candidate": None,
     }
     reason = (
@@ -185,7 +125,7 @@ def run(key, record):
     )
     if use_exact:
         exact = solve_exact(info, stats, edges, graph, record.get("timeout", 30), fallback)
-        reason = f"engine {exact['engine_status']}; placement {exact['paired_core_assignment']}"
+        reason = f"engine {exact['engine_status']}"
     candidate = exact.pop("candidate")
     chosen = fallback
     method = "heuristic"
@@ -194,9 +134,9 @@ def run(key, record):
         if max(candidate[1].values()) <= max(fallback[1].values()):
             chosen, method = candidate, "cp-sat"
         else:
-            reason = "verified heuristic is shorter than the placed engine candidate"
+            reason = "verified heuristic is shorter than the engine candidate"
     starts, ends, assigned = chosen
-    physical = verify_schedule(info, duration, edges, starts, ends, assigned)
+    pool_cores = verify_schedule(info, duration, edges, starts, ends, assigned)
     feasible = max(ends.values()) / SCALE
     lower = max(lower, exact["solver_bound_us"])
     if lower > feasible + 1e-6:
@@ -227,8 +167,8 @@ def run(key, record):
         **exact,
         "schedule_method": method,
         "fallback_reason": reason if method == "heuristic" else None,
-        "physical_assignment": "VERIFIED",
-        "physical_cores": physical,
+        "resource_assignment": "VERIFIED",
+        "pool_cores": pool_cores,
         "solver_wall_s": time.monotonic() - began,
         "schedule": schedule,
         "records": str(p),
@@ -238,7 +178,7 @@ def run(key, record):
         "parallel_pressure": pressure,
         "graph_nodes": len(duration),
         "compute_tasks": len(included),
-        "model": "ordered-wave task-gang; each wave charges original max worker duration; paired MIX cores; ignores gaps and bandwidth changes",
+        "model": "ordered-wave task-gang; each wave charges original max worker duration; independent AIC/AIV core pools; ignores gaps and bandwidth changes",
     }
 
 
@@ -363,7 +303,7 @@ def main():
         default=500,
         help="Auto mode uses the verified heuristic above this expanded graph size",
     )
-    parser.add_argument("--timeout", type=float, default=30, help="Seconds per optimization/placement solve")
+    parser.add_argument("--timeout", type=float, default=30, help="Seconds for the optimization solve")
     args = parser.parse_args()
     if (
         args.exact_task_limit < 1
@@ -478,6 +418,7 @@ def main():
         ),
         "",
         "Conservative ordered-wave task-gang model, not measured latency or hardware-optimal execution. "
+        "Tasks start as gangs in separate AIC and AIV pools. V0/V1 and cluster affinity are outside the model. "
         "Oversized launches become sequential capacity-sized waves; each wave holds cores for the original maximum worker duration. "
         "Inter-task gaps and fixed-core ordering are removed; bandwidth/cache effects and remote-rank progress are not simulated.",
         "",
@@ -490,7 +431,7 @@ def main():
 
     for key, r in results.items():
         lines.append(
-            f"| {key} | {r['previous_path_us']:.3f} | {timing(r['resource_schedule_us'])} | {r['resource_lower_bound_us']:.3f} | {r['status']}; {r['schedule_method']}; physical {r['physical_assignment']} |"
+            f"| {key} | {r['previous_path_us']:.3f} | {timing(r['resource_schedule_us'])} | {r['resource_lower_bound_us']:.3f} | {r['status']}; {r['schedule_method']}; pools {r['resource_assignment']} |"
         )
     for key, r in results.items():
         lines += [
@@ -504,8 +445,7 @@ def main():
         if r["fallback_reason"]:
             lines.append(f"Verified heuristic: {r['fallback_reason']}. No optimality claim.")
         lines.append(
-            f"Engine status: {r['engine_status']}; candidate: {timing(r['engine_schedule_us'])} us; "
-            f"engine placement: {r['paired_core_assignment']}."
+            f"Engine status: {r['engine_status']}; candidate: {timing(r['engine_schedule_us'])} us."
         )
         lines.append("")
         for wave in r["wave_expansions"]:
@@ -575,9 +515,9 @@ def main():
         )
     lines += [
         "",
-        "Engine OPTIMAL proves model optimality only with a paired-core witness; "
-        "engine FEASIBLE is an upper bound only with that witness. HEURISTIC is a verified upper bound, not an optimum. "
-        "Every reported feasible schedule has independently checked dependencies, core demand, MIX pairing and core overlap. "
+        "Engine OPTIMAL proves optimality within the AIC/AIV pool model. "
+        "Engine FEASIBLE and HEURISTIC are verified upper bounds within that model. "
+        "Every reported feasible schedule has independently checked dependencies, core demand and pool occupancy. "
         "Durations round upward to 0.001 us. All non-excluded compute tasks contribute to makespan.",
         "",
     ]
