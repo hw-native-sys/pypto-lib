@@ -89,7 +89,9 @@ DSPARK_WINDOW = FLASH.sliding_window
 
 # Projection tiles.
 PROJ_M_TILE = 80
-PROJ_ROWS_PER_LAUNCH = 32 * PROJ_M_TILE
+# MX_A_ZZ requires a static row extent. Use 33 tiles to fit 2561 active rows
+# in one launch while retaining bounded workspaces for longer inputs.
+PROJ_ROWS_PER_LAUNCH = 33 * PROJ_M_TILE
 PROJ_N_TILE = 160
 PROJ_K_TILE = 256
 PROJ_CUBE_K_TILE = 128
@@ -133,10 +135,10 @@ def _accumulate_dspark_payload(
         pl.MemRef("b_l0", slots=PROJ_L0_BUFFERS)[0], pl.Mem.Right,
     ] = pl.tile.extract(b_l1, 0, 0, [PROJ_CUBE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Right)
     sa = pl.tile.extract(
-        sa_l1, 0, scale_offset, [PROJ_M_TILE, PROJ_SCALE_K_TILE], target_memory=pl.Mem.LeftScale, scale_for=a,
+        sa_l1, 0, scale_offset, [PROJ_M_TILE, PROJ_SCALE_K_TILE], target_memory=pl.Mem.LeftScale,
     )
     sb = pl.tile.extract(
-        sb_l1, scale_offset, 0, [PROJ_SCALE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.RightScale, scale_for=b,
+        sb_l1, scale_offset, 0, [PROJ_SCALE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.RightScale,
     )
     pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
     pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
@@ -156,10 +158,10 @@ def _accumulate_dspark_payload(
         pl.MemRef("b_l0", slots=PROJ_L0_BUFFERS)[1], pl.Mem.Right,
     ] = pl.tile.extract(b_l1, PROJ_CUBE_K_TILE, 0, [PROJ_CUBE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.Right)
     sa = pl.tile.extract(
-        sa_l1, 0, scale_offset, [PROJ_M_TILE, PROJ_SCALE_K_TILE], target_memory=pl.Mem.LeftScale, scale_for=a,
+        sa_l1, 0, scale_offset, [PROJ_M_TILE, PROJ_SCALE_K_TILE], target_memory=pl.Mem.LeftScale,
     )
     sb = pl.tile.extract(
-        sb_l1, scale_offset, 0, [PROJ_SCALE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.RightScale, scale_for=b,
+        sb_l1, scale_offset, 0, [PROJ_SCALE_K_TILE, PROJ_N_TILE], target_memory=pl.Mem.RightScale,
     )
     pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
     pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
