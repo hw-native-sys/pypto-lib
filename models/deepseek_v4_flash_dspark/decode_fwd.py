@@ -472,6 +472,7 @@ def _decode_fwd(
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
+    valid_rows_from_logits: pl.constexpr,
 ):
     """Run the fixed 2-SWA, 21-CSA, 20-HCA model in one rank child."""
     embed_weight.bind_dynamic(0, EMBED_VOCAB_DYN)
@@ -542,6 +543,21 @@ def _decode_fwd(
             input_ids, embed_weight, hidden_workspace, x_ping, moe_input_ids,
             owner_tokens,
         )
+
+    # EPLB routing takes an independent INT32 row-validity marker: a logit list
+    # names the rows to sample, not the rows that hold real tokens. Plain decode
+    # keeps the active owner prefix; the fused DSpark target marks exactly the
+    # active draft offsets in its prepared logit rows.
+    moe_valid_rows = pl.create_tensor([MOE_TOKENS], dtype=pl.INT32)
+    for valid_row in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_moe_valid_rows"):
+        marker = pl.cast(-1, pl.INT32)
+        if valid_rows_from_logits:
+            if valid_row < owner_tokens and pl.read(logit_row_indices, [valid_row]) >= 0:
+                marker = pl.cast(1, pl.INT32)
+        else:
+            if valid_row < owner_tokens:
+                marker = pl.cast(1, pl.INT32)
+        pl.write(moe_valid_rows, [valid_row], marker)
 
     raw_blocks_per_layer = pl.tensor.dim(raw_kv_pool, 0) // MAIN_LAYER_COUNT
     csa_state_blocks_per_layer = pl.tensor.dim(csa_compress_state, 0) // CSA_LAYER_COUNT
@@ -637,7 +653,7 @@ def _decode_fwd(
                 x_pong,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
-                eplb_mapping, eplb_replicas, logit_row_indices, eplb_load, eplb_control,
+                eplb_mapping, eplb_replicas, moe_valid_rows, eplb_load, eplb_control,
                 pl.const(0, pl.INT32), owner_tokens, my_rank, pl.const(1, pl.INT32), owner_tokens,
             )
 
@@ -727,7 +743,7 @@ def _decode_fwd(
                 x_ping,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
-                eplb_mapping, eplb_replicas, logit_row_indices, eplb_load, eplb_control,
+                eplb_mapping, eplb_replicas, moe_valid_rows, eplb_load, eplb_control,
                 pl.const(1, pl.INT32), owner_tokens, my_rank, pl.const(2, pl.INT32), owner_tokens,
             )
 
@@ -869,7 +885,7 @@ def _decode_fwd(
                     x_pong,
                     recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                     routed_y_buf, combine_arrived,
-                    eplb_mapping, eplb_replicas, logit_row_indices, eplb_load, eplb_control,
+                    eplb_mapping, eplb_replicas, moe_valid_rows, eplb_load, eplb_control,
                     csa_model_layer, owner_tokens, my_rank, csa_model_layer + 1, owner_tokens,
                 )
 
@@ -978,7 +994,7 @@ def _decode_fwd(
                     x_ping,
                     recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                     routed_y_buf, combine_arrived,
-                    eplb_mapping, eplb_replicas, logit_row_indices, eplb_load, eplb_control,
+                    eplb_mapping, eplb_replicas, moe_valid_rows, eplb_load, eplb_control,
                     hca_model_layer, owner_tokens, my_rank, hca_model_layer + 1, owner_tokens,
                 )
 
@@ -1121,7 +1137,7 @@ def _decode_fwd(
                 pre_hc_hidden_out,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
-                eplb_mapping, eplb_replicas, logit_row_indices, eplb_load, eplb_control,
+                eplb_mapping, eplb_replicas, moe_valid_rows, eplb_load, eplb_control,
                 model_layer_last, owner_tokens, my_rank, pl.const(43, pl.INT32), owner_tokens,
             )
 
@@ -1443,7 +1459,7 @@ def l3_decode_fwd(
             lm_head_hidden_window, lm_head_hidden_done,
             lm_head_logits_window, lm_head_logits_done,
             eplb_mapping_ph, eplb_replicas_ph, eplb_load_ph, eplb_control_ph,
-            group_base, tp_rank, rank,
+            group_base, tp_rank, rank, False,
             device=rank,
         )
     return x_out, logits, sampled_ids, dspark_target_hidden
@@ -1718,7 +1734,7 @@ def l3_decode_fwd_eplb(
             lm_head_hidden_window, lm_head_hidden_done,
             lm_head_logits_window, lm_head_logits_done,
             eplb_mapping[rank], eplb_replicas[rank], eplb_load[rank], eplb_control[rank],
-            group_base, tp_rank, rank,
+            group_base, tp_rank, rank, False,
             device=rank,
         )
 

@@ -45,8 +45,11 @@ def make_eplb_transfer(*, ranks: int, local_slots: int, hidden_size: int, interm
         sources_done: pld.DistributedTensor[[R, 1], pl.INT32],
         installed: pld.DistributedTensor[[R, 1], pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
-        epoch: pl.Scalar[pl.INT32],
     ):
+        # Both barriers count notifications in windows this host call allocated
+        # fresh: every peer adds exactly one, so every wait targets one. An
+        # external epoch would have to match that history and cannot.
+        barrier_count = pl.const(1, pl.INT32)
         # All resident reads finish before any resident write, including local moves.
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="eplb_read_sources") as push_tid:
             for peer in pl.range(R):
@@ -90,7 +93,7 @@ def make_eplb_transfer(*, ranks: int, local_slots: int, hidden_size: int, interm
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="eplb_wait_sources", deps=[push_tid]) as read_wait_tid:
             for peer in pl.range(R):
                 if peer != my_rank:
-                    pld.system.defer_wait(sources_done, [peer, 0], epoch, cmp=pld.WaitCmp.Ge)
+                    pld.system.defer_wait(sources_done, [peer, 0], barrier_count, cmp=pld.WaitCmp.Ge)
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="eplb_install", deps=[push_tid, read_wait_tid]) as install_tid:
             for slot in pl.range(C):
@@ -117,7 +120,7 @@ def make_eplb_transfer(*, ranks: int, local_slots: int, hidden_size: int, interm
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="eplb_wait_install", deps=[install_tid]) as wait_install_tid:
             for peer in pl.range(R):
                 if peer != my_rank:
-                    pld.system.defer_wait(installed, [peer, 0], epoch, cmp=pld.WaitCmp.Ge)
+                    pld.system.defer_wait(installed, [peer, 0], barrier_count, cmp=pld.WaitCmp.Ge)
 
         return w1, w1_scale, w3, w3_scale, w2, w2_scale
 
@@ -131,9 +134,8 @@ def make_eplb_transfer(*, ranks: int, local_slots: int, hidden_size: int, interm
         w2_scale: pl.InOut[pl.Tensor[[R, C, D], pl.FP32]],
         sources: pl.Tensor[[R, R, C, 2], pl.INT32],
         changed: pl.Tensor[[R, R, C], pl.INT32],
-        epoch: pl.Scalar[pl.INT32],
     ):
-        """EPLB HOST ABI v1: six-tensor migration and completion epochs."""
+        """EPLB HOST ABI v1: six-tensor migration and two completion barriers."""
         receive_w1_buf = pld.alloc_window_buffer([C, W], dtype=pl.INT8)
         receive_w1_scale_buf = pld.alloc_window_buffer([C, I], dtype=pl.FP32)
         receive_w3_buf = pld.alloc_window_buffer([C, W], dtype=pl.INT8)
@@ -156,7 +158,7 @@ def make_eplb_transfer(*, ranks: int, local_slots: int, hidden_size: int, interm
                 sources[rank], changed[rank],
                 receive_w1, receive_w1_scale, receive_w3, receive_w3_scale, receive_w2, receive_w2_scale,
                 sources_done, installed,
-                rank, epoch, device=rank,
+                rank, device=rank,
             )
         return w1, w1_scale, w3, w3_scale, w2, w2_scale
 

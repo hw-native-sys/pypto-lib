@@ -579,7 +579,7 @@ def l2_decode_fwd_dspark(
             recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived,
             lm_head_hidden_window, lm_head_hidden_done, lm_head_logits_window, lm_head_logits_done,
             eplb_mapping, eplb_replicas, eplb_load, eplb_control,
-            group_base, tp_rank, my_rank
+            group_base, tp_rank, my_rank, True
         )
         accept_target_into_device_state(
             state_slot_ids, state_generations, valid_draft_counts, tp_rank,

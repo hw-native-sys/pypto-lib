@@ -13,6 +13,11 @@ from math import gcd
 
 import pypto.language as pl
 
+# An a3 allocation exposes 24 AIC / 48 AIV; a larger SPMD launch would queue
+# blocks on the same cores instead of adding parallelism. Each worker strides
+# over its share of the token blocks so the tail is covered either way.
+MAX_ROUTE_WORKERS = 48
+
 
 def make_eplb_routing(*, logical_experts: int, ranks: int, tokens: int, top_k: int,
                       bank_layers: int = 1, boolean_mask: bool = True, single_replica: bool = False):
@@ -29,6 +34,8 @@ def make_eplb_routing(*, logical_experts: int, ranks: int, tokens: int, top_k: i
     K_TILE = 8
     if T % TOKEN_TILE:
         raise ValueError("EPLB token blocks must own complete 64-byte route spans")
+    TOKEN_BLOCKS = T // TOKEN_TILE
+    ROUTE_WORKERS = min(TOKEN_BLOCKS, MAX_ROUTE_WORKERS)
 
     @pl.jit.inline
     def route_experts(
@@ -42,35 +49,38 @@ def make_eplb_routing(*, logical_experts: int, ranks: int, tokens: int, top_k: i
         layer_id: pl.Scalar[pl.INT32],
         num_tokens: pl.Scalar[pl.INT32],
     ):
-        for token_block in pl.spmd(T // TOKEN_TILE, name_hint="eplb_select_replica"):
-            token0 = token_block * TOKEN_TILE
-            logical_tile = pl.tile.load(logical_ids, [token0, 0], [TOKEN_TILE, K_TILE], valid_shape=[TOKEN_TILE, K])
-            physical_tile = pl.tile.full([TOKEN_TILE, K_TILE], dtype=pl.INT32, value=-1)
-            for row in pl.range(TOKEN_TILE):
-                token = token0 + row
-                row_marker = pl.read(valid_rows, [token])
-                if boolean_mask:
-                    valid = row_marker != 0
-                else:
-                    valid = row_marker >= 0
-                if token < num_tokens and valid:
-                    for route in pl.range(K):
-                        expert = pl.tile.read(logical_tile, [row, route])
-                        bank_expert = (layer_id % bank_layers) * E + expert
-                        # With no redundant slots, coverage of every logical
-                        # expert guarantees exactly one replica even after a
-                        # rebalance. Avoid a dynamic count read and remainder
-                        # for every route; the placement lookup still applies.
-                        if single_replica:
-                            replica = 0
-                        else:
-                            count = pl.read(replica_count, [bank_expert])
-                            seed = token + my_rank * T + route + route_epoch
-                            replica = seed % count
-                        physical = pl.read(logical_to_physical, [bank_expert, replica])
-                        pl.tile.write(physical_tile, [row, route], physical)
-            physical_valid = pl.set_validshape(physical_tile, TOKEN_TILE, K)
-            pl.tile.store(physical_valid, [token0, 0], physical_ids)
+        with pl.spmd(ROUTE_WORKERS, name_hint="eplb_select_replica"):
+            worker = pl.tile.get_block_idx()
+            for token_block in pl.range(worker, TOKEN_BLOCKS, ROUTE_WORKERS):
+                token0 = token_block * TOKEN_TILE
+                logical_tile = pl.tile.load(
+                    logical_ids, [token0, 0], [TOKEN_TILE, K_TILE], valid_shape=[TOKEN_TILE, K])
+                physical_tile = pl.tile.full([TOKEN_TILE, K_TILE], dtype=pl.INT32, value=-1)
+                for row in pl.range(TOKEN_TILE):
+                    token = token0 + row
+                    row_marker = pl.read(valid_rows, [token])
+                    if boolean_mask:
+                        valid = row_marker != 0
+                    else:
+                        valid = row_marker >= 0
+                    if token < num_tokens and valid:
+                        for route in pl.range(K):
+                            expert = pl.tile.read(logical_tile, [row, route])
+                            bank_expert = (layer_id % bank_layers) * E + expert
+                            # With no redundant slots, coverage of every logical
+                            # expert guarantees exactly one replica even after a
+                            # rebalance. Avoid a dynamic count read and remainder
+                            # for every route; the placement lookup still applies.
+                            if single_replica:
+                                replica = 0
+                            else:
+                                count = pl.read(replica_count, [bank_expert])
+                                seed = token + my_rank * T + route + route_epoch
+                                replica = seed % count
+                            physical = pl.read(logical_to_physical, [bank_expert, replica])
+                            pl.tile.write(physical_tile, [row, route], physical)
+                physical_valid = pl.set_validshape(physical_tile, TOKEN_TILE, K)
+                pl.tile.store(physical_valid, [token0, 0], physical_ids)
         return physical_ids
 
     return route_experts

@@ -64,7 +64,7 @@ from expert_routed import (
     TAIL_TILE, TAIL_D_OUT_TILE_ACT, make_expert_routed_tile,
 )
 from expert_shared import expert_shared
-from eplb_routing import make_moe_eplb
+from eplb import make_moe_eplb
 from gate import gate
 from hc_post import OUT_T_DYN, hc_post
 from hc_pre import hc_pre, _hc_pre_prefill
@@ -216,6 +216,7 @@ def combine(
     sh: pl.Tensor[[T, D], pl.BF16],
     ffn_out: pl.Tensor[[T, D], pl.BF16],
     routed_y_buf: pld.DistributedTensor[[T * TOPK, D], pl.BF16],
+    route_ids: pl.Tensor[[T, TOPK], pl.INT32],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     scatter_done: pl.Scalar[pl.TASK_ID],
     num_tokens: pl.Scalar[pl.INT32],
@@ -250,14 +251,19 @@ def combine(
         active_tokens = pl.cast(0, pl.INDEX)
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
+    routes_flat = pl.reshape(route_ids, [1, T * TOPK])
     with pl.spmd(T // COMBINE_TOKEN_TILE, name_hint="shared_routed", deps=[_cwait_tid]) as _reduce_tid:
         t0 = pl.tile.get_block_idx() * COMBINE_TOKEN_TILE
+        routes_tile = pl.tile.load(routes_flat, [0, t0 * TOPK], [1, COMBINE_TOKEN_TILE * TOPK])
         for t in pl.range(t0, t0 + COMBINE_TOKEN_TILE):
             if t < active_tokens:
                 acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
                 for k in pl.range(TOPK):
-                    r = t * TOPK + k
-                    acc = pl.add(acc, pl.cast(routed_y_buf[r:r + 1, :], target_type=pl.FP32))
+                    # Invalid rows keep their routes at -1 and never receive a
+                    # routed output; summing one would add stale lane data.
+                    if pl.tile.read(routes_tile, [0, (t - t0) * TOPK + k]) >= 0:
+                        r = t * TOPK + k
+                        acc = pl.add(acc, pl.cast(routed_y_buf[r:r + 1, :], target_type=pl.FP32))
                 ffn_out[t:t + 1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
             else:
                 ffn_out[t:t + 1, :] = sh[t:t + 1, :]
@@ -343,7 +349,10 @@ def make_moe(local_experts: int, *, enable_eplb: bool = False):
             for t in pl.range(active_tokens):
                 for k in pl.range(TOPK):
                     eid = pl.tile.read(indices_tile, [t, k])
-                    cursor[eid] = cursor[eid] + 1
+                    # An invalid token row keeps every route at -1; it neither
+                    # lands in a receive lane nor may index the cursor.
+                    if eid >= 0:
+                        cursor[eid] = cursor[eid] + 1
 
             # One meta row per dst (all LOCAL_EXPERTS counts, zeros included), then bump the
             # per-source arrival counter. AtomicAdd on a monotonic window is
@@ -792,7 +801,7 @@ def make_moe(local_experts: int, *, enable_eplb: bool = False):
 
         completion_tid = combine(
             shared_out, ffn_out,
-            routed_y_buf, combine_arrived, scatter_done,
+            routed_y_buf, physical_indices, combine_arrived, scatter_done,
             num_tokens, my_rank, moe_epoch,
         )
         return completion_tid
@@ -1721,8 +1730,14 @@ def prefill_moe_tile(
     grouped_y = pl.create_tensor([PREFILL_MOE_GROUPED_TOTAL_CAP, D], dtype=pl.BF16, manual_dep=True)
     dispatch_tids = pl.array.create(1, pl.TASK_ID)
     expert_tids = pl.array.create(N_LOCAL, pl.TASK_ID)
+    # Routing takes an INT32 row marker, never the INT64 token IDs. The wave's
+    # num_tokens already excludes CP padding, so every in-range row is valid.
+    route_rows = pl.create_tensor([PREFILL_MOE_T_TILE], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_route_rows"):
+        route_ones = pl.tile.full([1, PREFILL_MOE_T_TILE], dtype=pl.INT32, value=1)
+        pl.tile.store(route_ones, [0, 0], route_rows)
     physical_indices = prefill_route_eplb(
-        indices, eplb_mapping, eplb_replicas, input_ids, eplb_control,
+        indices, eplb_mapping, eplb_replicas, route_rows, eplb_control,
         layer_id, num_tokens, my_rank,
     )
     with pl.scope():
@@ -1793,6 +1808,7 @@ def prefill_moe_local(
     layer_id: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     group_tokens: pl.Scalar[pl.INT32],
+    local_base: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[PREFILL_LOCAL_T_DYN, HC_MULT, D], pl.FP32]:
     """Run one local prefill MoE layer."""
     with pl.scope():
@@ -1824,6 +1840,14 @@ def prefill_moe_local(
             local_wave_base = wave_i32 * PREFILL_MOE_T_TILE
             # Physical rows in the fixed-capacity wave.
             wave_rows = pl.min(PREFILL_MOE_T_TILE, local_rows - local_wave_base)
+            if EPLB_ENABLED:
+                # CP padding rows carry no real token; route only this rank's
+                # slice of the group's real tokens so they never enter the
+                # exchange or the exported expert load. num_waves stays based
+                # on the fixed local capacity, so every rank keeps the same
+                # wave and collective structure.
+                rank_active = pl.max(group_tokens - local_base - local_wave_base, 0)
+                wave_rows = pl.min(wave_rows, pl.cast(rank_active, pl.INDEX))
             if group_tokens <= 0:
                 wave_rows = pl.cast(0, pl.INDEX)
             wave_rows_i32 = pl.cast(wave_rows, pl.INT32)
@@ -1995,7 +2019,7 @@ def prefill_moe(
         recv_meta, recv_x, recv_aux, arrived, data_arrived,
         routed_y_buf, combine_arrived, stage_done, stage_token, layer_completion,
         eplb_mapping, eplb_replicas, eplb_load, eplb_control,
-        layer_id, my_rank, group_tokens,
+        layer_id, my_rank, group_tokens, local_base,
     )
     with pl.scope():
         if group_tokens > 0:
