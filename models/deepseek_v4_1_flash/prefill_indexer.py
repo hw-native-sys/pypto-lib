@@ -155,7 +155,8 @@ def _index_query_carrier(
         worker = pl.tile.get_block_idx()
         lut = fp4_e4m3_lut()
         active_tokens = num_tokens
-        if pl.read(route, [0]) == 0:
+        mode = pl.read(route, [0])
+        if mode == 0 or mode == C1A_NATIVE:
             active_tokens = pl.cast(0, pl.INT32)
         for row in pl.range(worker, active_tokens, 16):
             packed_row = pl.tile.load(packed_result, [row, 0], [1, INDEX_QUERY_WIDTH // 2])
@@ -642,7 +643,8 @@ def _scale_index_weights(
     with pl.spmd(scale_workers, name_hint="c1a_index_weights_scale") as weights_tid:
         worker = pl.tile.get_block_idx()
         active_blocks = scale_blocks
-        if pl.read(route, [0]) == 0:
+        mode = pl.read(route, [0])
+        if mode == 0 or mode == C1A_NATIVE:
             active_blocks = pl.cast(0, pl.INDEX)
         for block in pl.range(worker, active_blocks, scale_workers):
             token = block * M_TILE
@@ -1825,7 +1827,7 @@ def prefill_indexer(
                                 count, score_route, chunk_ready,
                             )
                             score_active = pl.cast(count, pl.INT64)
-                            with pl.spmd(PREFILL_SCORE_WORKERS, name_hint="qli_score", deps=[prepared, metadata_ready]) as native_tid:
+                            with pl.spmd(PREFILL_SCORE_WORKERS, name_hint="qli_score", deps=[packed_tid, metadata_ready]) as native_tid:
                                 _prefill_score(
                                     packed_query, query_scale, raw_weights, cache, cache_scale, score_pages,
                                     score_requests, chunk_lengths, metadata, packed_scores, score_active, SCORE,
