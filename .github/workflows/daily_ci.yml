@@ -103,9 +103,8 @@ jobs:
           - platform: a5
             runner: [self-hosted, linux, npu-a5]
     runs-on: ${{ matrix.runner }}
-    # The cases run one after another, each bounded by task-submit's own
-    # --timeout 3600 queue wait + --max-time 900 run, on top of the build.
-    # Each entry declares its device count with a CI marker.
+    # Prepared dispatches borrow the number of cards declared by each entry.
+    # The job budget covers setup, host preparation and the device queue.
     timeout-minutes: 120
     defaults:
       run:

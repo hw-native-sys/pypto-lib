@@ -8,6 +8,14 @@ inputs:
   files:
     description: Space-separated entry paths from detect_changes.py; empty runs no cases.
     required: true
+  workers:
+    description: Concurrent golden workers. Up to twice this many entries can hold prepared tensors.
+    required: false
+    default: '2'
+  compile-workers:
+    description: Concurrent entries compiling PyPTO programs and native chip binaries.
+    required: false
+    default: '8'
 
 runs:
   using: composite
@@ -18,4 +26,6 @@ runs:
       env:
         FILES: ${{ inputs.files }}
         PLATFORM: ${{ inputs.platform }}
+        PYPTO_CI_DEVICE_WORKERS: ${{ inputs.workers }}
+        PYPTO_CI_COMPILE_WORKERS: ${{ inputs.compile-workers }}
       run: bash .github/scripts/run_device_tests.sh
