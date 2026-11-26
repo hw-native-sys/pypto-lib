@@ -171,31 +171,25 @@ def pressure_report(info, stats, starts, ends):
     }
 
 
-def choose_cores(task, busy):
-    kernels = task["kernel_ids"]
-    blocks = task["block_num"]
-    if kernels[0] >= 0:
-        groups = [[c] + [32 + 2 * c + slot for slot in range(2) if kernels[slot + 1] >= 0] for c in range(32)]
-        free = [group for group in groups if not any(c in busy for c in group)]
-        return [c for group in free[:blocks] for c in group] if len(free) >= blocks else None
-    count = demand(task)[1]
-    free = [c for c in range(32, 96) if c not in busy]
-    # Fill fragmented clusters first to leave whole MIX clusters available.
-    free.sort(key=lambda c: (not (32 + ((c - 32) ^ 1) in busy or (c - 32) // 2 in busy), c))
-    return free[:count] if len(free) >= count else None
+def choose_cores(counts, busy):
+    """Select anonymous cores from the independent AIC and AIV pools."""
+    aic_count, aiv_count = counts
+    free_aic = [core for core in range(CAPACITIES[0]) if core not in busy]
+    free_aiv = [core for core in range(CAPACITIES[0], sum(CAPACITIES)) if core not in busy]
+    if aic_count > len(free_aic) or aiv_count > len(free_aiv):
+        return None
+    return free_aic[:aic_count] + free_aiv[:aiv_count]
 
 
 def list_schedule(info, stats, graph):
-    """Critical-tail priority, with ready heaps grouped by identical core demand."""
+    """Dispatch whole ready gangs as soon as both resource pools can fit them."""
     duration, pred, succ, _, _, order, tail = graph
     indegree = {t: len(pred[t]) for t in order}
     ready = defaultdict(list)
     running, busy, starts, ends, assigned = [], set(), {}, {}, {}
 
     def enqueue(t):
-        signature = (
-            (info[t]["block_num"], tuple(k >= 0 for k in info[t]["kernel_ids"])) if duration[t] else (0, ())
-        )
+        signature = demand(info[t]) if duration[t] else (0, 0)
         heapq.heappush(ready[signature], (-tail[t], t))
 
     def complete(t):
@@ -212,7 +206,7 @@ def list_schedule(info, stats, graph):
         selected = None
         for signature, heap in ready.items():
             _, tid = heap[0]
-            cores = choose_cores(info[tid], busy) if duration[tid] else []
+            cores = choose_cores(signature, busy) if duration[tid] else []
             if cores is not None and (selected is None or heap[0] < selected[0]):
                 selected = (heap[0], signature, cores)
         if selected is not None:
@@ -229,7 +223,7 @@ def list_schedule(info, stats, graph):
                 complete(tid)
             continue
         if not running:
-            raise ValueError("No physically feasible ready task")
+            raise ValueError("No ready task fits the resource pools")
         now = running[0][0]
         while running and running[0][0] == now:
             _, tid = heapq.heappop(running)
@@ -240,8 +234,26 @@ def list_schedule(info, stats, graph):
     return starts, ends, assigned
 
 
+def assign_pool_cores(info, duration, starts, ends):
+    """Construct an independent pool assignment for fixed start/end times."""
+    assigned, busy, running = {}, set(), []
+    for tid in sorted(duration, key=lambda tid: (starts[tid], tid)):
+        while running and running[0][0] <= starts[tid]:
+            _, finished = heapq.heappop(running)
+            busy.difference_update(assigned[finished])
+        if not duration[tid]:
+            continue
+        cores = choose_cores(demand(info[tid]), busy)
+        if cores is None:
+            raise ValueError(f"Core pool capacity exceeded: {tid}")
+        assigned[tid] = cores
+        busy.update(cores)
+        heapq.heappush(running, (ends[tid], tid))
+    return assigned
+
+
 def verify_schedule(info, duration, edges, starts, ends, assigned):
-    """Independently check precedence, exact demand, MIX slots and half-open core occupancy."""
+    """Independently check precedence, exact demand and half-open pool occupancy."""
     cores = defaultdict(list)
     if set(starts) != set(duration) or set(ends) != set(duration):
         raise ValueError("Incomplete schedule")
@@ -257,21 +269,11 @@ def verify_schedule(info, duration, edges, starts, ends, assigned):
         nc, nv = demand(info[tid])
         if (
             len(set(selected)) != len(selected)
-            or any(c < 0 or c >= 96 for c in selected)
-            or sum(c < 32 for c in selected) != nc
-            or sum(c >= 32 for c in selected) != nv
+            or any(c < 0 or c >= sum(CAPACITIES) for c in selected)
+            or sum(c < CAPACITIES[0] for c in selected) != nc
+            or sum(c >= CAPACITIES[0] for c in selected) != nv
         ):
             raise ValueError(f"Invalid core demand: {tid}")
-        if nc:
-            expected = {
-                32 + 2 * c + slot
-                for c in selected
-                if c < 32
-                for slot in range(2)
-                if info[tid]["kernel_ids"][slot + 1] >= 0
-            }
-            if expected != {c for c in selected if c >= 32}:
-                raise ValueError(f"Invalid MIX pairing: {tid}")
         for core in selected:
             cores[core].append((starts[tid], ends[tid], tid))
     for core, intervals in cores.items():
