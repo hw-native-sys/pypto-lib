@@ -24,12 +24,11 @@ T_DYN = pl.dynamic("LM_HEAD_T_DYN")
 
 # model config
 D = M.hidden_size
-VOCAB = M.vocab_size
 # Rows one owner projects: the TP group splits the step across its ranks, so a
 # rank carries exactly the tokens it owns through MoE and the group window holds
 # exactly one step. Taken from config rather than derived from TP, which the
 # forward entries rewrite at import before this module loads.
-MAX_LOGIT_ROWS = MOE_TOKENS
+MAX_LOGIT_ROWS, VOCAB = globals().get("_projection_fixture_shape", (MOE_TOKENS, M.vocab_size))
 
 # parallelism
 _TP_CHOICES = (1, 2, 4, 8, 16)
@@ -58,38 +57,6 @@ if WORLD_SIZE <= 0 or WORLD_SIZE % TP_SIZE:
 if VOCAB % TP_SIZE:
     raise ValueError(f"vocab size {VOCAB} must be divisible by LM-head TP={TP_SIZE}")
 VOCAB_PER_TP = VOCAB // TP_SIZE
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
-    parser.add_argument("--sim", dest="execution_mode", action="store_true")
-    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES), help="LM-head tensor-parallel world size")
-    parser.add_argument("--dp", type=int, default=DP_SIZE, choices=list(_DP_CHOICES), help="DP groups (world size = tp * dp)")
-    parser.add_argument("--num-tokens", type=int, default=None, help="Active hidden rows each owner projects")
-    parser.add_argument("--entry", type=str, default="projection", choices=("projection", "sample"))
-    parser.add_argument(
-        "--case", choices=("configured", "nd-control", "nz96"),
-        help="Projection fixture (default on two ranks: ND control and 96-row NZ golden)",
-    )
-    device_default = ",".join(str(i) for i in range(WORLD_SIZE))
-    parser.add_argument("-d", "--device", type=str, default=device_default, help=f"comma-separated device ids; need at least {WORLD_SIZE}")
-    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
-    parser.add_argument("--enable-scope-stats", action="store_true", default=False)
-    parser.add_argument("--compile-only", action="store_true", default=False)
-    parser.add_argument("--runtime-dir", type=str, default=None)
-    parser.add_argument("--dump-passes", action="store_true", default=False)
-    args = parser.parse_args()
-
-    if args.case in ("nz96", "nd-control") and (args.entry != "projection" or TP_SIZE != 2 or WORLD_SIZE != 2):
-        parser.error("nz96 and nd-control require two ranks and the TP2 projection entry")
-    if args.case == "nz96":
-        MAX_LOGIT_ROWS = 96
-        VOCAB = 6464  # Bounded golden with a full vocab tile and a tail on each rank.
-        VOCAB_PER_TP = VOCAB // TP_SIZE
-    elif args.case == "nd-control":
-        MAX_LOGIT_ROWS = 128
 
 GROUP_LOGIT_ROWS = TP_SIZE * MAX_LOGIT_ROWS
 TEST_TOKENS = 2 * MAX_LOGIT_ROWS  # standalone fixture: hidden rows per card
@@ -820,20 +787,9 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
     ]
 
 
-if __name__ == "__main__":
-    import subprocess
-
+def _run_case(args):
     from golden import run
 
-    if (
-        args.case is None and args.entry == "projection" and TP_SIZE == 2 and WORLD_SIZE == 2
-        and args.num_tokens is None and not args.compile_only and args.runtime_dir is None
-        and not args.enable_chip_swimlane and not args.enable_scope_stats and not args.dump_passes
-    ):
-        # Shapes bind at import. Run each golden before the parent opens any device.
-        for case in ("nd-control", "nz96"):
-            subprocess.run([sys.executable, __file__, *sys.argv[1:], "--case", case], check=True)
-        raise SystemExit(0)
     if args.case == "nz96" and gather_head_hidden is not _gather_hidden_nz:
         raise RuntimeError("the 96-row TP2 golden requires the NZ gather")
     if args.case == "nd-control" and gather_head_hidden is not _gather_hidden_nd:
@@ -903,3 +859,55 @@ if __name__ == "__main__":
         if result.error:
             print(result.error)
         raise SystemExit(1)
+
+
+def main():
+    import argparse
+    import subprocess
+    from runpy import run_path
+
+    # A reduced vocabulary in the NZ case covers both full and tail projection tiles.
+    fixture_shapes = {"nd-control": (128, M.vocab_size), "nz96": (96, 6464)}
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
+    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES), help="LM-head tensor-parallel world size")
+    parser.add_argument("--dp", type=int, default=DP_SIZE, choices=list(_DP_CHOICES), help="DP groups (world size = tp * dp)")
+    parser.add_argument("--num-tokens", type=int, default=None, help="Active hidden rows each owner projects")
+    parser.add_argument("--entry", type=str, default="projection", choices=("projection", "sample"))
+    parser.add_argument(
+        "--case", choices=("configured", *fixture_shapes),
+        help="Projection fixture (default on two ranks: ND control and 96-row NZ golden)",
+    )
+    device_default = ",".join(str(i) for i in range(WORLD_SIZE))
+    parser.add_argument("-d", "--device", type=str, default=device_default, help=f"comma-separated device ids; need at least {WORLD_SIZE}")
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.add_argument("--enable-scope-stats", action="store_true", default=False)
+    parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--dump-passes", action="store_true", default=False)
+    args = parser.parse_args()
+
+    if args.case in fixture_shapes and (args.entry != "projection" or TP_SIZE != 2 or WORLD_SIZE != 2):
+        parser.error("nz96 and nd-control require two ranks and the TP2 projection entry")
+
+    if (
+        args.case is None and args.entry == "projection" and TP_SIZE == 2 and WORLD_SIZE == 2
+        and args.num_tokens is None and not args.compile_only and args.runtime_dir is None
+        and not args.enable_chip_swimlane and not args.enable_scope_stats and not args.dump_passes
+    ):
+        # Shapes bind at import. Run each golden before the parent opens any device.
+        for case in fixture_shapes:
+            subprocess.run([sys.executable, __file__, *sys.argv[1:], "--case", case], check=True)
+        return
+    shape = fixture_shapes.get(args.case, (MAX_LOGIT_ROWS, VOCAB))
+    if shape != (MAX_LOGIT_ROWS, VOCAB):
+        # JIT shapes bind at definition time. Load the fixture into its own namespace.
+        fixture = run_path(__file__, init_globals={"_projection_fixture_shape": shape})
+        fixture["_run_case"](args)
+    else:
+        _run_case(args)
+
+
+if __name__ == "__main__":
+    main()
