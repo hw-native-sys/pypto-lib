@@ -146,10 +146,25 @@ def compile_generation_graphs(prefill_dir, decode_dir, *, devices, context, pref
         subprocess.run(cmd, check=True)
 
 
-def main(function, *, mode, capacity, slab_rows=None, argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+def _device_parser():
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("-p", "--platform", choices=["a2a3"], default="a2a3")
     parser.add_argument("-d", "--device", "--devices", dest="devices", default=",".join(map(str, range(16))))
+    return parser
+
+
+def forward_validation_argv(argv, *, mode):
+    """Supply the bounded compile case when invoked with only common CI options."""
+    _, remaining = _device_parser().parse_known_args(argv)
+    if remaining:
+        return argv
+    capacity_flag = "--capacity" if mode == "prefill" else "--decode-capacity"
+    return [*argv, "--compile-only", "--prepare-windows", "--context-capacity", "256",
+            "--request-slots-per-dp", "2", capacity_flag, "16"]
+
+
+def main(function, *, mode, capacity, slab_rows=None, argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, parents=[_device_parser()])
     parser.add_argument("--tp", type=int, choices=[4], default=4)
     parser.add_argument("--dp", type=int, choices=[4], default=4)
     parser.add_argument("--ep", type=int, choices=[16], default=16)

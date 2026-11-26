@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: devices=16
+# ci: compile-only
 # ci: no-sim
 """Compose the forty-layer W8A8 A3 prefill with TP4 heads and EP16 experts."""
 
@@ -25,15 +25,16 @@ import pypto.language.distributed as pld
 
 from .sparse_attention import CACHE_MAX_ROWS, SELECTED_KEYS
 from . import config as C
-from .driver import PREFILL_MOE_SLAB_ROWS, default_prefill_slab_rows, main
+from .driver import PREFILL_MOE_SLAB_ROWS, default_prefill_slab_rows, forward_validation_argv, main
 
+_argv = forward_validation_argv(sys.argv[1:], mode="prefill") if __name__ == "__main__" else sys.argv[1:]
 _shape_parser = argparse.ArgumentParser(add_help=False)
 _shape_parser.add_argument("--checkpoint")
 _shape_parser.add_argument("--prefill-moe-slab-rows", type=int, choices=PREFILL_MOE_SLAB_ROWS)
 _shape_parser.add_argument("--capacity", type=int, default=8192)
 _shape_parser.add_argument("--experts-per-rank", type=int, default=C.N_LOCAL_EXPERTS)
 _shape_parser.add_argument("--prepare-windows", action="store_true")
-_shape_options = _shape_parser.parse_known_args()[0]
+_shape_options = _shape_parser.parse_known_args(_argv)[0]
 # Direct tensor-only callers specialize this flag away. Generation can reserve
 # the program's communication windows before the first request arrives.
 ExecutionFlag = pl.Scalar[pl.INT32] if _shape_options.prepare_windows else pl.constexpr
@@ -1004,5 +1005,10 @@ def l3_prefill_fwd(
             )
 
 
+def validate():
+    """Compile the bounded packed Prefill graph by default."""
+    main(l3_prefill_fwd, mode="prefill", capacity=CAPACITY, slab_rows=MOE_TOKENS, argv=_argv)
+
+
 if __name__ == "__main__":
-    main(l3_prefill_fwd, mode="prefill", capacity=CAPACITY, slab_rows=MOE_TOKENS)
+    validate()

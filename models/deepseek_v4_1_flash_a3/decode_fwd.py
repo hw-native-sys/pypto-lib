@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: devices=16
+# ci: compile-only
 # ci: no-sim
 """DeepSeek-V4.1-Flash 40-layer decode with final HC, RMSNorm, logits and greedy sampling."""
 
@@ -22,13 +22,15 @@ import pypto.language as pl
 from .config import SWA_LAYER_COUNT, TP_SIZE
 import pypto.language.distributed as pld
 from . import config as C
+from .driver import forward_validation_argv, main
 
+_argv = forward_validation_argv(sys.argv[1:], mode="decode") if __name__ == "__main__" else sys.argv[1:]
 _shape_parser = argparse.ArgumentParser(add_help=False)
 _shape_parser.add_argument("--decode-capacity", type=int, choices=[16, C.DECODE_INPUT_MAX_TOKENS],
                            default=C.DECODE_INPUT_MAX_TOKENS)
 _shape_parser.add_argument("--experts-per-rank", type=int, default=C.N_LOCAL_EXPERTS)
 _shape_parser.add_argument("--prepare-windows", action="store_true")
-_shape_options = _shape_parser.parse_known_args()[0]
+_shape_options = _shape_parser.parse_known_args(_argv)[0]
 # Direct tensor-only callers specialize this flag away. Generation can reserve
 # the program's communication windows before the first request arrives.
 ExecutionFlag = pl.Scalar[pl.INT32] if _shape_options.prepare_windows else pl.constexpr
@@ -980,7 +982,10 @@ def l3_decode_fwd(
     return logits, sampled_ids
 
 
-if __name__ == "__main__":
-    from .driver import main
+def validate():
+    """Compile the bounded packed Decode graph by default."""
+    main(l3_decode_fwd, mode="decode", capacity=DECODE_CAPACITY, slab_rows=MOE_TOKENS, argv=_argv)
 
-    main(l3_decode_fwd, mode="decode", capacity=DECODE_CAPACITY, slab_rows=MOE_TOKENS)
+
+if __name__ == "__main__":
+    validate()

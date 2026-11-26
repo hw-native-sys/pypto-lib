@@ -20,7 +20,8 @@ from models.deepseek_v4_1_flash_a3.packed import PackedSession
 from models.deepseek_v4_1_flash_a3.weights import ENGRAM_K
 
 
-def test_packed_prefill_returns_completed_requests_and_expires_released_handles():
+@pytest.mark.parametrize("finish_b", [True, False])
+def test_packed_prefill_returns_completed_requests_and_expires_released_handles(finish_b):
     capacity = c.BLOCK_SIZE
     context = 2 * c.BLOCK_SIZE
     slots = 2
@@ -29,16 +30,19 @@ def test_packed_prefill_returns_completed_requests_and_expires_released_handles(
         capacity, max_seq_len=context, request_slots=slots,
     )
     fields = (
-        "embedding", "position_ids", "logit_rows", "engram_lookup",
+        "embedding", "position_ids", "logit_rows", "engram_lookup", "window_slots", "window_indices",
         "c1a_index_block_table", "c2a_index_block_table", "state_block_table",
     )
     inputs = {name: template[name] for name in fields}
     staging = {"prefill_" + name: torch.stack((value, value)) for name, value in inputs.items()}
     device_inputs = [{name: value.clone() for name, value in inputs.items()} for _ in range(c.TP_SIZE)]
-    device_logits = torch.zeros(slots, 2, dtype=torch.float32)
+    device_logits = torch.zeros(slots, 3, dtype=torch.float32)
+    initial_cache = torch.zeros(1, slots * context // capacity, capacity, dtype=torch.bfloat16)
+    device_cache = initial_cache.clone()
     ranks = [{name: SimpleNamespace(data_ptr=field.data_ptr()) for name, field in image.items()}
              for image in device_inputs]
     ranks[0]["logits"] = SimpleNamespace(data_ptr=device_logits.data_ptr())
+    ranks[0]["window_cache"] = SimpleNamespace(data_ptr=device_cache.data_ptr())
 
     def copy_to(dst, src, size, *, worker_id, dst_offset=0):
         ctypes.memmove(dst + dst_offset, src, size)
@@ -48,17 +52,22 @@ def test_packed_prefill_returns_completed_requests_and_expires_released_handles(
 
     def run(program, *, config):
         owner = device_inputs[0]
+        cache = device_cache.flatten()
         for index, row in enumerate(owner["logit_rows"][:slots].tolist()):
             if row >= 0:
                 device_logits[index, 0] = owner["position_ids"][0, row]
                 device_logits[index, 1] = owner["embedding"][row, 0]
+                device_logits[index, 2] = cache[owner["window_indices"][0, row, 0]]
+        destinations = owner["window_slots"][0]
+        active = destinations >= 0
+        cache[destinations[active]] = owner["embedding"][active, 0]
 
     def embed(ids):
         return ids[:, None].expand(-1, c.FLASH.hidden_size).to(torch.bfloat16)
 
     graphs = SimpleNamespace(
-        host_io={"idle_inputs": (inputs, {}), "logits": torch.empty(1, 2), **staging},
-        host_cache=[{} for _ in range(c.TP_SIZE)], ranks=[ranks],
+        host_io={"idle_inputs": (inputs, {}), "logits": torch.empty(1, 3), **staging},
+        host_cache=[{"window_cache": initial_cache}] + [{} for _ in range(c.TP_SIZE - 1)], ranks=[ranks],
         runtime=SimpleNamespace(copy_to=copy_to, copy_from=copy_from, run=run),
         weights=SimpleNamespace(lookup_rows=embed),
         engram=SimpleNamespace(lookup=lambda ids, n, offset, **kw: torch.zeros(2, n, ENGRAM_K), history={}),
@@ -66,19 +75,23 @@ def test_packed_prefill_returns_completed_requests_and_expires_released_handles(
     )
     session = PackedSession(graphs, slots, context, (capacity, 16))
     a = session.admit("a", 0, capacity + 1)
-    b = session.admit("b", 0, 2)
+    b = session.admit("b", 0, 2 if finish_b else 3)
     assert session.advance_batch("prefill", [(a, [11] * capacity)]) == {}
     with pytest.raises(ValueError, match="completed Prefill"):
         session.advance_batch("decode", [(a, [99])])
     completed = session.advance_batch("prefill", [(a, [33]), (b, [22, 23])])
-    assert list(completed) == [a, b]
-    assert completed[a].tolist() == [capacity, 33]
-    assert completed[b].tolist() == [1, 23]
-    page_table = device_inputs[0]["c1a_index_block_table"]
-    assert page_table.tolist() == [[2, -1], [0, 1]]
+    assert list(completed) == ([a, b] if finish_b else [a])
+    assert completed[a].tolist() == [capacity, 33, 11]
+    if finish_b:
+        assert completed[b].tolist() == [1, 23, 0]
     session.release(a)
     replacement = session.admit("a", 0, 1)
     with pytest.raises(ValueError, match="Expired"):
         session.advance_batch("decode", [(a, [1])])
-    assert session.advance_batch("prefill", [(replacement, [44])])[replacement].tolist() == [0, 44]
-    assert page_table.tolist() == [[0, -1], [-1, -1]]
+    queries = [(replacement, [44])]
+    if not finish_b:
+        queries.append((b, [24]))
+    completed = session.advance_batch("prefill", queries)
+    assert completed[replacement].tolist() == [0, 44, 0]
+    if not finish_b:
+        assert completed[b].tolist() == [2, 24, 22]

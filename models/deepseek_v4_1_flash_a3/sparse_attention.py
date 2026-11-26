@@ -2407,6 +2407,72 @@ def l2_sparse_attention_bf16(
     return output
 
 
+@pl.jit(auto_scope=False)
+def l2_window_publish_validation(
+    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    slots: pl.Tensor[[T_DYN], pl.INT64],
+    cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.UINT8]],
+    scales: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_GROUPS], pl.BF16]],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    ready = pl.system.task_dummy(deps=[])
+    prefill_publish_window(kv, slots, cache, scales, num_tokens, ready)
+    return cache, scales
+
+
+def golden_window_publish(tensors):
+    """Quantize active rows and preserve every other cache byte and scale."""
+    rows = int(tensors["num_tokens"])
+    slots = tensors["slots"][:rows]
+    payload, scales = quantize_mxfp8_cache(tensors["kv"][:rows])
+    tensors["cache"].reshape(-1, HEAD_DIM)[slots] = payload.view(torch.uint8)
+    tensors["scales"].reshape(-1, SWA_GROUPS)[slots] = scales
+
+
+def validate_window_publish(args):
+    """Run two packed chunks, reusing one request's slot while its neighbor continues."""
+    from golden import ScalarSpec, ratio_allclose, run
+
+    cache_shape = (3, 128, 1)
+    empty_cache = torch.full((*cache_shape, HEAD_DIM), 61, dtype=torch.uint8)
+    empty_scales = torch.full((*cache_shape, SWA_GROUPS), 0.25, dtype=torch.bfloat16)
+    cache, scales = empty_cache.clone(), empty_scales.clone()
+    generator = torch.Generator().manual_seed(4102026)
+    exact = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
+    cases = (
+        ("packed", list(range(122, 131)), [0, 1], [[2, 0], [1, -1]]),
+        ("reuse", [0, 1, 2], [2, 3], [[2, -1], [1, -1]]),
+    )
+    for case, first, second, pages in cases:
+        positions = torch.tensor(first + second)
+        owners = torch.tensor([0] * len(first) + [1] * len(second))
+        table = torch.tensor(pages, dtype=torch.int32)
+        slots, _, _ = window_metadata(positions, owners, table)
+        padded = torch.full((16,), -1, dtype=torch.int64)
+        padded[:slots.numel()] = slots
+        kv = torch.randn(16, HEAD_DIM, generator=generator).bfloat16()
+        specs = [
+            TensorSpec("kv", list(kv.shape), kv.dtype, init_value=kv),
+            TensorSpec("slots", list(padded.shape), padded.dtype, init_value=padded),
+            TensorSpec("cache", list(cache.shape), cache.dtype, init_value=cache),
+            TensorSpec("scales", list(scales.shape), scales.dtype, init_value=scales),
+            ScalarSpec("num_tokens", torch.int32, slots.numel()),
+        ]
+        result = run(
+            l2_window_publish_validation, specs, golden_fn=golden_window_publish,
+            config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
+            compare_fn={"cache": exact, "scales": exact}, compile_only=args.compile_only,
+        )
+        if not result.passed:
+            raise RuntimeError(f"Window cache case {case}: {result.error}")
+        print(f"Window cache case {case}: {result.work_dir}")
+        if case == "packed":
+            golden_window_publish(dict(num_tokens=slots.numel(), slots=slots, kv=kv, cache=cache, scales=scales))
+            # The released request owns pages 2 and 0. The live request keeps page 1.
+            cache[[2, 0]] = empty_cache[[2, 0]]
+            scales[[2, 0]] = empty_scales[[2, 0]]
+
+
 def swa_core_reference(inputs):
     """Compute sink-aware FP32 attention over the decoded BF16 SWA rows."""
     tokens = int(inputs["num_tokens"])
@@ -2843,7 +2909,8 @@ if __name__ == "__main__":
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[4])
     rows_help = "single row count (default: 1, 7, 12, 13)"
     parser.add_argument("--rows", type=int, help=rows_help)
-    mode_choices = ["packed", "bf16", "both", "c2a", "swa", "swa-packed", "swa-direct", "swa-both", "all"]
+    mode_choices = ["packed", "bf16", "both", "c2a", "swa", "swa-packed", "swa-direct", "swa-both",
+                    "window-publish", "all"]
     parser.add_argument("--mode", default="all", choices=mode_choices)
     parser.add_argument("--swa-case", default="all", choices=["gather", "plain", "runs", "all"])
     parser.add_argument("--compile-only", action="store_true")
@@ -2852,15 +2919,19 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.tp != TP_SIZE:
         raise ValueError(f"--tp {args.tp} does not match configured TP_SIZE {TP_SIZE}")
-    if (args.mode.startswith("swa") or args.mode == "all") and (args.fixture or args.runtime_dir):
+    if (args.mode.startswith("swa") or args.mode in ("all", "window-publish")) and (args.fixture or args.runtime_dir):
         raise ValueError("--fixture and --runtime-dir require a sparse MLA mode: packed, bf16 or c2a")
     if args.runtime_dir and args.mode == "both":
         raise ValueError("--runtime-dir requires one --mode")
     if args.rows is not None and args.rows < 1:
         raise ValueError("--rows must be positive")
-    if args.mode.startswith("swa"):
+    if args.mode == "window-publish":
+        validate_window_publish(args)
+    elif args.mode.startswith("swa"):
         _main_results = validate_swa_core(args)
     else:
+        if args.mode == "all":
+            validate_window_publish(args)
         row_cases = [1, 7, 12, 13]
         if args.rows is not None:
             row_cases = [args.rows]

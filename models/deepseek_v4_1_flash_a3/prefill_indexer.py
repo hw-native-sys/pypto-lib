@@ -19,19 +19,24 @@ from .activation_quant import quantize_projection_activation
 from .gemm import gemm_bf16_to_bf16, gemm_int8, prefill_gemm_int8_tiled
 
 import torch
-import torch.nn.functional as F
 
 
 import pypto.language as pl
+
+from .indexer_common import (
+    CANDIDATE_BLOCK_SIZE, CANDIDATE_LEAF_TILE, CANDIDATE_PAIR_WIDTH, CANDIDATE_SHORT_LEAF_TILE,
+    CANDIDATE_TOPK_BLOCKS, golden_index_query_fp4, golden_select_candidate_block_pool,
+    index_pool_block_capacity, merge_candidate_level, sort_candidate_leaf, sort_candidate_short_leaf,
+)
 INDEX_POOL_SCORE_DYN = pl.dynamic("A3_INDEX_POOL_SCORE_DYN")
 from .quant import decode_fp4, decode_scale
 
 from .config import INDEX_CACHE_GROUP, FLASH as M
 from .dsl_types import INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, T_DYN
-from .rmsnorm import EPS, rms_norm, golden_rms_norm
+from .rmsnorm import EPS, rms_norm
 from .quant import dequantize_mxfp4_cache, quantize_mxfp4_cache
 from .gemm import golden_dynamic_int8
-from .qkv_proj_rope import _rotate_rope, golden_rope_tail, golden_rope_interleave
+from .qkv_proj_rope import _rotate_rope, golden_rope_tail
 from .rope import make_pipelined_rope
 
 
@@ -45,10 +50,7 @@ INDEX_DIM = M.index_head_dim
 INDEX_TOPK = M.index_topk
 INDEX_QUERY_WIDTH = M.index_n_heads * INDEX_DIM
 INDEX_QUERY_SCALE_WIDTH = INDEX_QUERY_WIDTH // 32
-CANDIDATE_BLOCK_SIZE = M.candidate_block_size
 CANDIDATE_BLOCK_SHIFT = CANDIDATE_BLOCK_SIZE.bit_length() - 1
-CANDIDATE_TOPK_BLOCKS = M.candidate_topk_blocks
-CANDIDATE_PAIR_WIDTH = 2 * CANDIDATE_TOPK_BLOCKS
 TOPK_CACHED_PAGES = (M.max_position_embeddings + 127) // 128
 
 
@@ -79,8 +81,6 @@ INDEX_SCORE_QUERY_TILE = 2
 
 CANDIDATE_SCORE_TILE = 1024
 CANDIDATE_DIRECT_ROWS_TILE = 8
-CANDIDATE_LEAF_TILE = 8192
-CANDIDATE_SHORT_LEAF_TILE = 2048
 CANDIDATE_MAX_LEAVES = (M.max_position_embeddings // CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_LEAF_TILE + 1
 INDEX_SCORE_POSITIONS_DYN = pl.dynamic("V41_INDEX_SCORE_POSITIONS_DYN")
 INDEX_WEIGHT_ROWS_DYN = pl.dynamic("A3_INDEX_WEIGHT_ROWS_DYN")
@@ -337,83 +337,6 @@ def materialize_index_topk(
     return output
 
 
-@pl.jit.inline
-def _merge_candidate_pairs(
-    arena: pl.Tensor,
-    left: pl.Scalar[pl.INDEX],
-    right: pl.Scalar[pl.INDEX],
-    output: pl.Scalar[pl.INDEX],
-):
-    left_pairs = pl.load(arena, [left, 0], [1, CANDIDATE_PAIR_WIDTH])
-    right_pairs = pl.load(arena, [right, 0], [1, CANDIDATE_PAIR_WIDTH])
-    temporary = pl.tile.create([1, 2 * CANDIDATE_PAIR_WIDTH], dtype=pl.FP32)
-    merged_all = pl.tile.mrgsort(left_pairs, right_pairs, tmp=temporary)
-    merged = pl.tile.slice(merged_all, [1, CANDIDATE_PAIR_WIDTH], [0, 0])
-    pl.store(merged, [output, 0], arena)
-
-
-@pl.jit.inline
-def _merge_candidate_level(
-    arena: pl.Tensor,
-    base: pl.Scalar[pl.INDEX],
-    count: pl.Scalar[pl.INDEX],
-):
-    output_count = (count + 1) // 2
-    for output in pl.range(output_count):
-        left = base + 2 * output
-        right = left + 1
-        if right < base + count:
-            _merge_candidate_pairs(arena, left, right, base + output)
-        else:
-            forwarded = pl.load(arena, [left, 0], [1, CANDIDATE_PAIR_WIDTH])
-            pl.store(forwarded, [base + output, 0], arena)
-    return output_count
-
-
-@pl.jit.inline
-def _sort_candidate_leaf(
-    scores: pl.Tensor,
-    arena: pl.Tensor,
-    token: pl.Scalar[pl.INDEX],
-    block_begin: pl.Scalar[pl.INDEX],
-    valid_count: pl.Scalar[pl.INDEX],
-    output_slot: pl.Scalar[pl.INDEX],
-):
-    raw = pl.load(scores, [token, block_begin], [1, CANDIDATE_LEAF_TILE], valid_shape=[1, valid_count])
-    padded = pl.tile.fillpad(raw, pad_value=pl.PadValue.min)
-    floor = pl.tile.full([1, CANDIDATE_LEAF_TILE], dtype=pl.FP32, value=-1e30)
-    values = pl.maximum(padded, floor)
-    block_begin_i32 = pl.cast(block_begin, pl.INT32)
-    indices = pl.add(pl.tile.arange(0, [1, CANDIDATE_LEAF_TILE], dtype=pl.INT32), block_begin_i32)
-    pairs = pl.tile.sort32(values, pl.reinterpret_view(indices, pl.UINT32))
-    pairs = pl.tile.mrgsort(pairs, block_len=64)
-    pairs = pl.tile.mrgsort(pairs, block_len=256)
-    pairs = pl.tile.mrgsort(pairs, block_len=1024)
-    pairs = pl.tile.mrgsort(pairs, block_len=4096)
-    top_pairs = pl.tile.slice(pairs, [1, CANDIDATE_PAIR_WIDTH], [0, 0])
-    pl.store(top_pairs, [output_slot, 0], arena)
-
-
-@pl.jit.inline
-def _sort_candidate_short_leaf(
-    scores: pl.Tensor,
-    arena: pl.Tensor,
-    token: pl.Scalar[pl.INDEX],
-    valid_count: pl.Scalar[pl.INDEX],
-    output_slot: pl.Scalar[pl.INDEX],
-):
-    raw = pl.load(scores, [token, 0], [1, CANDIDATE_SHORT_LEAF_TILE], valid_shape=[1, valid_count])
-    values = pl.tile.fillpad(raw, pad_value=pl.PadValue.min)
-    values = pl.maximum(values, -1e30)
-    indices = pl.tile.arange(0, [1, CANDIDATE_SHORT_LEAF_TILE], dtype=pl.INT32)
-    pairs = pl.tile.sort32(values, pl.reinterpret_view(indices, pl.UINT32))
-    pairs = pl.tile.mrgsort(pairs, block_len=64)
-    pairs = pl.tile.mrgsort(pairs, block_len=256)
-    pairs = pl.tile.mrgsort(pairs, block_len=1024)
-    top_pairs = pl.tile.slice(pairs, [1, CANDIDATE_PAIR_WIDTH], [0, 0])
-    pl.store(top_pairs, [output_slot, 0], arena)
-
-
 @pl.jit.inline(auto_scope=False)
 def _publish_all_candidate_blocks(
     lengths: pl.Tensor,
@@ -527,23 +450,23 @@ def select_candidate_block_pool(
                 arena_base = token * CANDIDATE_MAX_LEAVES
                 count = 0
                 if visible_blocks > 0 and visible_blocks <= CANDIDATE_SHORT_LEAF_TILE:
-                    _sort_candidate_short_leaf(block_scores, arena, token, visible_blocks, arena_base)
+                    sort_candidate_short_leaf(block_scores, arena, token, visible_blocks, arena_base)
                     count = 1
                 elif visible_blocks > 0:
                     leaf_count = (visible_blocks + CANDIDATE_LEAF_TILE - 1) // CANDIDATE_LEAF_TILE
                     for leaf in pl.range(leaf_count):
                         block_begin = leaf * CANDIDATE_LEAF_TILE
                         valid_count = pl.min(CANDIDATE_LEAF_TILE, visible_blocks - block_begin)
-                        _sort_candidate_leaf(block_scores, arena, token, block_begin, valid_count, arena_base + leaf)
+                        sort_candidate_leaf(block_scores, arena, token, block_begin, valid_count, arena_base + leaf)
                     count = leaf_count
                 if count > 1:
-                    count = _merge_candidate_level(arena, arena_base, count)
+                    count = merge_candidate_level(arena, arena_base, count)
                 if count > 1:
-                    count = _merge_candidate_level(arena, arena_base, count)
+                    count = merge_candidate_level(arena, arena_base, count)
                 if count > 1:
-                    count = _merge_candidate_level(arena, arena_base, count)
+                    count = merge_candidate_level(arena, arena_base, count)
                 if count > 1:
-                    count = _merge_candidate_level(arena, arena_base, count)
+                    count = merge_candidate_level(arena, arena_base, count)
 
                 selected_count = pl.min(pl.min(visible_blocks, CANDIDATE_TOPK_BLOCKS), capacity)
                 ordered_scores = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.FP32, value=-1e30)
@@ -1549,76 +1472,6 @@ def prefill_indexer(
     return completion[0]
 
 
-def golden_index_query_fp4(value: torch.Tensor) -> torch.Tensor:
-    """Round group-32 index queries to E2M1 with upward E8M0 scales."""
-    payload, scales = quantize_mxfp4_cache(value, 32, "e8m0", round_to_even=True)
-    return dequantize_mxfp4_cache(payload, scales, 32, "e8m0").to(value.dtype)
-
-
-def golden_index_key(
-    latent: torch.Tensor,
-    wk: torch.Tensor,
-    norm_weight: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> torch.Tensor:
-    """Project an unrotated compressor latent into a rotated index key."""
-    projected = torch.matmul(latent.float(), wk.float()).to(latent.dtype)
-    key = golden_rms_norm(projected, norm_weight)
-    rd = cos.shape[-1] * 2
-    return torch.cat((key[..., :-rd], golden_rope_interleave(key[..., -rd:], cos, sin)), dim=-1)
-
-
-def golden_select_candidate_block_pool(
-    logits: torch.Tensor,
-    compressed_lens: torch.Tensor | int,
-    topk_blocks: int = M.candidate_topk_blocks,
-    block_size: int = M.candidate_block_size,
-    *,
-    num_tokens: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return sorted logical block IDs and counts with a causal tail and fixed selected prefix."""
-    if logits.ndim != 2:
-        raise ValueError(f"logits must be rank-2, got shape {tuple(logits.shape)}")
-    if block_size != CANDIDATE_BLOCK_SIZE:
-        raise ValueError(f"block_size must be {CANDIDATE_BLOCK_SIZE}, got {block_size}")
-    if topk_blocks != CANDIDATE_TOPK_BLOCKS:
-        raise ValueError(f"topk_blocks must be {CANDIDATE_TOPK_BLOCKS}, got {topk_blocks}")
-
-    tokens, width = logits.shape
-    # Inactive tensor rows publish canonical empty pool state.
-    active_tokens = tokens if num_tokens is None else max(0, min(tokens, int(num_tokens)))
-    capacity = index_pool_block_capacity(width)
-    ids = torch.full((tokens, capacity), -1, dtype=torch.int32, device=logits.device)
-    counts = torch.zeros((tokens,), dtype=torch.int32, device=logits.device)
-    if width == 0:
-        return ids, counts
-
-    lengths = torch.as_tensor(compressed_lens, device=logits.device, dtype=torch.int64)
-    if lengths.ndim == 0:
-        lengths = lengths.expand(tokens)
-    if lengths.ndim != 1 or lengths.numel() != tokens:
-        raise ValueError("compressed_lens must provide one causal length per score row")
-
-    padded = F.pad(logits, (0, -width % block_size), value=-torch.inf)
-    block_scores = padded.unflatten(-1, (-1, block_size)).amax(dim=-1)
-    for token in range(active_tokens):
-        visible = max(0, min(int(lengths[token]), width))
-        visible_blocks = (visible + block_size - 1) // block_size
-        if visible_blocks == 0:
-            continue
-        selected_count = min(visible_blocks, topk_blocks, capacity)
-        # Rank invalid block maxima at the device sort floor.
-        scores = block_scores[token, :visible_blocks].clone().clamp_min(-1e30)
-        # Include the newest causal block independently of its score.
-        scores[visible_blocks - 1] = 1e30
-        # Resolve equal block maxima by stable logical order.
-        selected = torch.argsort(scores, descending=True, stable=True)[:selected_count].to(torch.int32)
-        ids[token, :selected_count] = selected.sort().values
-        counts[token] = selected_count
-    return ids, counts
-
-
 def golden_prefill_indexer(
     x, qr, request_ids, index_cache, block_table, compressed_lens,
     wq_b, wq_b_scale, weights_proj, cos, sin, *,
@@ -1682,16 +1535,6 @@ def golden_prefill_index_scores(mode, rank, cache_outputs, inputs):
         inputs["index_weights_proj"][rank], inputs["rope_cos"][rank], inputs["rope_sin"][rank], **pool,
     )
     return scores
-
-
-def index_pool_block_capacity(score_width: int) -> int:
-    """Return the aligned compact-pool capacity for one score row."""
-    if score_width < 0:
-        raise ValueError(f"score_width must be nonnegative, got {score_width}")
-    block_size = M.candidate_block_size
-    blocks = max(1, (score_width + block_size - 1) // block_size)
-    aligned = (blocks + 31) // 32 * 32
-    return min(M.candidate_topk_blocks, aligned)
 
 
 @pl.jit(auto_scope=False)

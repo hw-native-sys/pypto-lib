@@ -16,7 +16,7 @@ from .qkv_proj_rope import golden_rope_tail
 from .quant import FP4_VALUES, dequantize_mxfp4_cache, quantize_mxfp4_cache
 
 
-def make_index_case(checkpoint, layer, history, *, ties=False, num_tokens=12):
+def make_index_case(checkpoint, layer, history, *, ties=False, num_tokens=12, request_lens=None):
     """Create page permutations, a zero row, causal boundaries and initialized inactive rows."""
     pages = (history + 127) // 128
     generator = torch.Generator().manual_seed(41051)
@@ -45,16 +45,29 @@ def make_index_case(checkpoint, layer, history, *, ties=False, num_tokens=12):
         if weight.dtype != torch.int8 or bool(offset.count_nonzero()):
             raise ValueError("index query projection requires symmetric INT8 checkpoint weights")
         head_weight = checkpoint.tensor(prefix + "weights_proj.weight").t().contiguous()
-    values = torch.randn(pages + 1, 128, 1, M.index_head_dim, generator=generator).bfloat16()
+    request_ids = torch.zeros(16, dtype=torch.int32)
+    requests = 1
+    if request_lens is not None:
+        requests = len(request_lens)
+        num_tokens = sum(len(rows) for rows in request_lens)
+        lengths.zero_()
+        start = 0
+        for request, rows in enumerate(request_lens):
+            end = start + len(rows)
+            request_ids[start:end] = request
+            lengths[start:end] = torch.tensor(rows, dtype=torch.int32)
+            start = end
+    values = torch.randn(requests * pages + 1, 128, 1, M.index_head_dim, generator=generator).bfloat16()
     cache, scales = quantize_mxfp4_cache(values, 32, "e8m0", round_to_even=True)
-    table = torch.randperm(pages, generator=generator).reshape(1, -1).int()
+    table = torch.stack([torch.randperm(pages, generator=generator) + request * pages
+                         for request in range(requests)]).int()
     positions = torch.arange(history - 16, history).float().unsqueeze(-1)
     frequency = 10000.0 ** (-torch.arange(0, 64, 2).float() / 64)
     angles = positions * frequency
     return dict(x=x, latent=latent, query_weight=weight, query_weight_scale=scale,
                 weight_projection=head_weight, cos=angles.cos(), sin=angles.sin(),
                 cache=cache, cache_scale=scales, table=table,
-                request_ids=torch.zeros(16, dtype=torch.int32), lengths=lengths, num_tokens=num_tokens)
+                request_ids=request_ids, lengths=lengths, num_tokens=num_tokens)
 
 
 def indexer_reference(inputs):

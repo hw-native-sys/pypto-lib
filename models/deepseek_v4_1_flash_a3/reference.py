@@ -32,7 +32,7 @@ from .gemm import golden_activation_int8
 from .hc import golden_hc_collapse, golden_hc_post, golden_mhc_mixes
 from .host import prepare_prefill_inputs
 from .o_proj import golden_o_proj
-from .prefill_indexer import golden_select_candidate_block_pool
+from .indexer_common import golden_select_candidate_block_pool
 from .qkv_proj_rope import golden_rope_tail
 from .quant import dequantize_mxfp4_cache, quantize_mxfp4_cache, quantize_mxfp8_cache
 from .rmsnorm import golden_rms_norm

@@ -12,13 +12,18 @@ for file in $FILES; do
   test -f "$file"
   ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$file" | head -1 || true)
   ndev=${ndev:-1}
-  device_flags=()
-  if [ "$ndev" -gt 1 ]; then
-    device_flags+=(--device-num "$ndev" --ignore-whitelist)
-  fi
-  printf -v command 'cd %q && source activate.sh && PYPTO_BENCH=0 PYPTO_LOG_LEVEL=error PYPTO_WARNING_LEVEL=none PYPTO_RUNTIME_LOG=error PYTHONPATH=%q python %q -p %q -d "$TASK_DEVICE"' \
+  printf -v command 'cd %q && source activate.sh && PYPTO_BENCH=0 PYPTO_LOG_LEVEL=error PYPTO_WARNING_LEVEL=none PYPTO_RUNTIME_LOG=error PYTHONPATH=%q python %q -p %q' \
     "$PWD" "$PWD" "$file" "$PLATFORM"
-  if task-submit --device auto "${device_flags[@]}" --timeout 3600 --max-time 900 --run "$command"; then
+  if grep -Eq '^#[[:space:]]*ci:[[:space:]]*compile-only[[:space:]]*$' "$file"; then
+    device_flags=(--no-device)
+  else
+    device_flags=(--device auto)
+    command+=' -d "$TASK_DEVICE"'
+    if [ "$ndev" -gt 1 ]; then
+      device_flags+=(--device-num "$ndev" --ignore-whitelist)
+    fi
+  fi
+  if task-submit "${device_flags[@]}" --timeout 3600 --max-time 900 --run "$command"; then
     status=pass
   else
     status=fail
