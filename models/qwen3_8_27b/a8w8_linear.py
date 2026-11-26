@@ -21,12 +21,11 @@ The weight keeps `nn.Linear`'s `[out, in]` layout and is read with
 the K tile: an INT8 row of `k_tile` bytes should cover a 512-byte L2 line, so
 `k_tile >= 512`.
 
-The three instances live in `in_proj_qkv.py`, `in_proj_z.py` and `out_proj.py`,
-which supply the shape, the tiles, and where the weight and the reference come
-from.
+The two instances live in `in_proj_qkv.py` and `in_proj_z.py`, which supply
+the shape, the tiles, and where the weight and the reference come from; the
+attention projections and the MLP build their own. The block's `out_proj` is
+BF16 both sides in `out_proj.py`.
 """
-from math import gcd
-
 import pypto.language as pl
 
 # tiling defaults; each instance overrides them
@@ -37,10 +36,16 @@ M_GROUP = 4             # output tiles a block walks down the token axis
 N_GROUP = 4             # and across the channel axis
 
 
+# scheduling: see `rmsnorm.EARLY_RESOLVE`. This kernel is shared with prefill, where a
+# saturated engine leaves no early window for the hint to win, so it should be inert there;
+# that is measured rather than assumed.
+EARLY_RESOLVE = True
+
+
 def build_kernel(m: int, k: int, n: int, name: str = "a8w8_linear",
                  inline: bool = False, m_tile: int = M_TILE, n_tile: int = N_TILE,
                  k_tile: int = K_TILE, m_group: int = M_GROUP, n_group: int = N_GROUP,
-                 row_off: int = 0):
+                 row_off: int = 0, k_stagger: int = 0, ring_slots: int = 1):
     """The projection at one shape.
 
     One output tile is capped near 128x128 by the cube-to-vector crossing: the
@@ -57,6 +62,14 @@ def build_kernel(m: int, k: int, n: int, name: str = "a8w8_linear",
     The inner loop takes two n-tiles at a time against one activation tile, so
     `n_group` must be even. Two accumulators keep each crossing at one tile
     while the cube works a 128x256 region from a single L1 operand.
+
+    `k_stagger` rotates each block's K start by its own block index, so the blocks
+    resident on the 24 cube cores are not all asking for the same slice of the weight at
+    the same moment. It is the cheapest of the two L2-contention levers CANN's own GEMM
+    uses (its other one, an L2-tiled serpentine block walk, measured smaller here and does
+    not add to this one). Default off: it is measured on the three GDN projections and
+    nowhere else, and this kernel also serves the attention and MLP projections and the
+    decode shapes.
 
     `row_off` makes the output `[m + row_off, n]` and writes the result below
     that many rows. The convolution downstream of `in_proj_qkv` reads the K-1
@@ -83,11 +96,15 @@ def build_kernel(m: int, k: int, n: int, name: str = "a8w8_linear",
         w_scale: pl.Tensor[[n], pl.FP32],
         y: pl.Out[pl.Tensor[[m + row_off, n], pl.BF16]],
     ):
-        # slot_num=1: the cross-core ring is sized by the tile crossing cube to
-        # vector, here the INT32 accumulator, and at the default depth of two its
-        # reserve alone is larger than the whole vector buffer.
+        # The ring is sized by the tile crossing cube to vector, here the INT32
+        # accumulator, and two on-chip slots of it exceed the vector buffer
+        # (pypto#2903). `local_slot_num` keeps that reserve at one slot while
+        # `ring_slots` buys transport depth in GM, so the cube need not wait for
+        # the vector to free a slot before pushing the next tile.
         for blk in pl.spmd(mg * ng, name_hint=name,
-                           optimizations=[pl.cross_core_slot(slot_num=1)]):
+                           optimizations=[pl.cross_core_slot(slot_num=ring_slots,
+                                                             local_slot_num=1)],
+                           allow_early_resolve=EARLY_RESOLVE):
             pm = (blk % mg) * m_group
             pn = (blk // mg) * n_group
             for gm in pl.range(m_group):
@@ -105,7 +122,11 @@ def build_kernel(m: int, k: int, n: int, name: str = "a8w8_linear",
                     acc0 = pl.create_tensor([m_tile, n_tile], dtype=pl.INT32)
                     acc1 = pl.create_tensor([m_tile, n_tile], dtype=pl.INT32)
                     for kb in pl.pipeline(0, k // k_tile, stage=2):
-                        k0 = kb * k_tile
+                        # `k_stagger` rotates where this block starts its K sweep. Without
+                        # it every block asks for the same K slice of the weight at the same
+                        # moment; `init_cond` still holds, because it means this block's
+                        # first step rather than K block zero, and the sum is commutative.
+                        k0 = ((kb + blk * k_stagger) % (k // k_tile)) * k_tile
                         at = a_q[m0 : m0 + m_tile, k0 : k0 + k_tile]
                         acc0 = pl.matmul_acc(acc0, at, w_q[n0 : n0 + n_tile, k0 : k0 + k_tile],
                                              b_trans=True, init_cond=(kb == 0))
@@ -169,14 +190,16 @@ def compare_y(truth_fn, fakequant_fn, label: str):
 
     def compare(actual, expected, **kw):
         ok, detail = gate(actual, expected, **kw)
+        if ok:
+            return True, ""
         dev = actual.double()
         fq = fakequant_fn()
         truth = truth_fn()
-        print(f"[stats] {label}: rel frob {float((dev - fq).norm() / fq.norm()):.3e} vs the "
-              f"float64 W8A8 chain, {float((dev - truth).norm() / truth.norm()):.3e} vs the "
-              f"float64 truth; quantization alone costs "
-              f"{float((fq - truth).norm() / truth.norm()):.3e}", flush=True)
-        return ok, detail
+        head = (f"    {label}: rel frob {float((dev - fq).norm() / fq.norm()):.3e} vs the "
+                  f"float64 W8A8 chain, {float((dev - truth).norm() / truth.norm()):.3e} vs the "
+                f"float64 truth; quantization alone costs "
+                f"{float((fq - truth).norm() / truth.norm()):.3e}")
+        return False, f"{head}\n{detail}"
 
     return compare
 
@@ -217,25 +240,24 @@ def references(cfg, module: str, act_fn, weights: str | None):
     truth, `q` and `scale` for the chain the kernel implements.
     """
     import reference
-    from weights import load_weights, quantize_weights
+    from weights import load_weights
 
     cache = {}
-    name = module + ".weight"
 
     def truth():
         if "truth" not in cache:
             reference.host_torch_setup()
-            w = load_weights(cfg, weights)[name]
+            w = reference.weight(load_weights(cfg, weights), module)
             cache["truth"] = reference.linear(act_fn()["x"], w)
         return cache["truth"]
 
     def fakequant():
         if "fq" not in cache:
             reference.host_torch_setup()
-            wq = quantize_weights(load_weights(cfg, weights), names=(name,))
-            act = act_fn()
-            x = reference.dequantize(act["q"], act["scale"].reshape(-1))
-            cache["fq"] = reference.linear(x, reference.weight(wq, module))
+            wq = reference.quantize_weights(load_weights(cfg, weights),
+                                            names=(module + ".weight",))
+            xf = reference.dequantize(act_fn()["q"], act_fn()["scale"].reshape(-1))
+            cache["fq"] = reference.linear(xf, reference.weight(wq, module))
         return cache["fq"]
 
     return truth, fakequant
@@ -255,23 +277,20 @@ def build_specs(m: int, k: int, n: int, a_q_fn, a_scale_fn, w_q_fn, w_scale_fn):
     ]
 
 
-def default_m_group(m: int, m_tile: int, preferred: int) -> int:
-    return gcd(m // m_tile, preferred)
-
-
-def parse_args(parser, m_tile: int, n_tile: int, k_tile: int, t: int,
-               m_group: int = M_GROUP, n_group: int = N_GROUP):
-    """The CLI every instance shares."""
+def add_args(parser, m_tile: int, n_tile: int, k_tile: int,
+             m_group: int | None = M_GROUP, n_group: int = N_GROUP):
+    """The CLI every instance shares. The shape comes from the entry's DEFAULT_CASES."""
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=t)
+    parser.add_argument("--seq-len", type=int, default=None,
+                        help="one shape instead of the entry's DEFAULT_CASES")
     parser.add_argument("--weights", type=str, default=None,
                         help="a real layer from weights.py; default: random weights")
     parser.add_argument("--m-tile", type=int, default=m_tile)
     parser.add_argument("--n-tile", type=int, default=n_tile)
     parser.add_argument("--k-tile", type=int, default=k_tile)
-    parser.add_argument("--m-group", type=int, help="override the default group for the token count")
+    parser.add_argument("--m-group", type=int, default=m_group)
     parser.add_argument("--n-group", type=int, default=n_group)
     parser.add_argument("--rounds", type=int, default=0,
                         help="also time the kernel over this many rounds (device only)")
@@ -279,14 +298,15 @@ def parse_args(parser, m_tile: int, n_tile: int, k_tile: int, t: int,
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--compile-only", action="store_true", default=False)
-    args = parser.parse_args()
-    if args.m_group is None:
-        args.m_group = default_m_group(args.seq_len, args.m_tile, m_group)
-    return args
+    return parser
 
 
-def report(label: str, args, result, k: int, n: int):
-    """One `[bench]` line with the shape, the tiles and the achieved rate."""
+def report(label: str, t: int, args, result, k: int, n: int, *, m_group: int | None = None):
+    """The achieved rate for the shape and tiles, which the harness cannot derive.
+
+    The harness already prints the per-round statistics, so this adds only what it
+    does not know: the matmul's shape, the tiles it ran with, and the rate those imply.
+    """
     import statistics
 
     if not args.rounds or result.bench is None:
@@ -294,11 +314,9 @@ def report(label: str, args, result, k: int, n: int):
     samples = [s for s in result.bench.per_round("effective") if s > 0]
     if not samples:
         return
-    mean = statistics.fmean(samples)
     # 2 ops per MAC, the convention every TOPS figure uses
-    tops = 2 * args.seq_len * k * n / (mean * 1e-6) / 1e12
-    print(f"[bench] {label} M={args.seq_len} K={k} N={n} "
+    tops = 2 * t * k * n / (statistics.fmean(samples) * 1e-6) / 1e12
+    m_group = args.m_group if m_group is None else m_group
+    print(f"[bench] {label} M={t} K={k} N={n} "
           f"m={args.m_tile} n={args.n_tile} k={args.k_tile} "
-          f"patch={args.m_group}x{args.n_group} rounds={len(samples)} "
-          f"mean={mean:.1f} us median={statistics.median(samples):.1f} "
-          f"min={min(samples):.1f} -> {tops:.1f} TOPS", flush=True)
+          f"patch={m_group}x{args.n_group} -> {tops:.1f} TOPS", flush=True)

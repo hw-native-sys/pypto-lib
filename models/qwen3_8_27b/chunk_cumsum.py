@@ -12,7 +12,8 @@ import pypto.language as pl
 import torch
 
 from config import QWEN3_8_27B
-from reference import REF_DTYPE, make_inputs, to_hT
+from delta_rule_reference import cumsum_ref
+from reference import make_inputs, to_hT
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")                 # tokens
@@ -56,15 +57,6 @@ def _gdn_chunk_cumsum(
 
 gdn_chunk_cumsum = pl.jit.inline(_gdn_chunk_cumsum)
 gdn_chunk_cumsum_test = pl.jit(_gdn_chunk_cumsum)
-
-
-def cumsum_ref(g: torch.Tensor, chunk: int) -> torch.Tensor:
-    """S1: chunk-local prefix sum of the gate logits. [T, H] -> [T, H]."""
-    out = torch.zeros_like(g, dtype=REF_DTYPE)
-    gf = g.to(REF_DTYPE)
-    for t0 in range(0, g.shape[0], chunk):
-        out[t0 : t0 + chunk] = gf[t0 : t0 + chunk].cumsum(dim=0)
-    return out
 
 
 _INPUTS: dict = {}

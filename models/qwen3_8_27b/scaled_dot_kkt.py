@@ -13,7 +13,8 @@ import torch
 
 from chunk_cumsum import CHUNK_TILE, cumsum_ref
 from config import QWEN3_8_27B
-from reference import REF_DTYPE, make_inputs, to_hT
+from delta_rule_reference import kkt_ref
+from reference import make_inputs, to_hT
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")                 # tokens
@@ -93,32 +94,6 @@ def _gdn_scaled_dot_kkt(
 
 gdn_scaled_dot_kkt = pl.jit.inline(_gdn_scaled_dot_kkt)
 gdn_scaled_dot_kkt_test = pl.jit(_gdn_scaled_dot_kkt)
-
-
-def kkt_ref(k: torch.Tensor, beta: torch.Tensor, g_sum: torch.Tensor, chunk: int) -> torch.Tensor:
-    """S3: the gated key-key matrix, strictly lower triangular. -> [T, H, chunk].
-
-    The decay is `exp(g_i - g_j)` clamped to zero above the diagonal rather than
-    `exp(min(g_i - g_j, 0))`: on the strict lower triangle the two agree, and the
-    masked-out entries are discarded either way.
-    """
-    t, hg, _ = k.shape
-    h = beta.shape[1]
-    grp = h // hg
-    kf, bf, gf = k.to(REF_DTYPE), beta.to(REF_DTYPE), g_sum.to(REF_DTYPE)
-    out = torch.zeros(t, h, chunk, dtype=REF_DTYPE)
-    rows = torch.arange(chunk)[:, None]
-    cols = torch.arange(chunk)[None, :]
-    strict_lower = (rows > cols).to(REF_DTYPE)
-    for t0 in range(0, t, chunk):
-        for hh in range(h):
-            kc = kf[t0 : t0 + chunk, hh // grp, :]
-            gc = gf[t0 : t0 + chunk, hh]
-            diff = gc[:, None] - gc[None, :]
-            decay = torch.where(diff <= 0, torch.exp(diff), torch.zeros_like(diff))
-            gated = (kc @ kc.T) * decay * bf[t0 : t0 + chunk, hh, None]
-            out[t0 : t0 + chunk, hh, :] = gated * strict_lower
-    return out
 
 
 _INPUTS: dict = {}

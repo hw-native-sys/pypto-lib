@@ -15,15 +15,17 @@
     S, Vnew = chunk_h(k, W, U, g_sum)             inter-chunk state recurrence
     O       = chunk_o(q, k, Vnew, S, g_sum)       chunk output
 
-Only q, k, v, the gate and beta come in, and only O goes out.
+The layer reads and updates a caller-owned recurrent state row and returns O.
 """
 import pypto.language as pl
 import torch
 
 from chunk_cumsum import CHUNK_TILE, DISPATCH_TOKENS, cumsum_ref, gdn_chunk_cumsum
-from chunk_h import chunk_h_ref, gdn_chunk_h
-from chunk_o import chunk_o_ref, gdn_chunk_o
+from chunk_h import (FSTATE_DYN, chunk_h_ref, compare_final_state,
+                     gdn_chunk_h_final, row_base_table)
+from chunk_o_pipe import gdn_chunk_o_pipe
 from config import QWEN3_8_27B
+from delta_rule_reference import chunk_o_ref
 from reference import frob_ok, make_inputs, to_hT
 from scaled_dot_kkt import gdn_scaled_dot_kkt, kkt_ref
 import solve_tril
@@ -60,84 +62,85 @@ def run_config(backend_type: str = "a2a3", sim: bool = False, device: int = 0, s
     )
 
 
-def _gdn_layer(
-    q: pl.Tensor[[T_DYN, HG, D], pl.FP16],
-    k: pl.Tensor[[T_DYN, HG, D], pl.FP16],
-    v: pl.Tensor[[T_DYN, H, D], pl.FP16],
-    g: pl.Tensor[[T_DYN, H], pl.FP32],
-    beta: pl.Tensor[[H, T_DYN], pl.FP32],
-    tril: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP32],
-    mask_strict: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP32],
-    eye: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP16],
-    m_diag: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP16],
-    m_low: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP16],
-    o_out: pl.Out[pl.Tensor[[T_DYN, H, D], pl.FP16]],
-):
-    """The token count must be a multiple of chunk_cumsum's DISPATCH_TOKENS, the coarsest tile here."""
-    q.bind_dynamic(0, T_DYN)
-    k.bind_dynamic(0, T_DYN)
-    v.bind_dynamic(0, T_DYN)
-    g.bind_dynamic(0, T_DYN)
-    beta.bind_dynamic(1, T_DYN)
-    o_out.bind_dynamic(0, T_DYN)
-    t_dim = pl.tensor.dim(q, 0)
-    nchunk = t_dim // CHUNK_TILE
-    # `tril` serves twice: chunk_cumsum contracts against it, and it is also
-    # chunk_o's causal mask -- both want the inclusive lower triangle. Only
-    # scaled_dot_kkt's is strict, so that one is a second constant.
-    g_sum = pl.create_tensor([H, t_dim], dtype=pl.FP32)
-    gdn_chunk_cumsum(g, tril, g_sum)
+def build_kernel(rows: int = 1, inline: bool = False):
+    """The delta rule, with resumed state for each cache owner this call carries.
 
-    a = pl.create_tensor([t_dim, H, CHUNK_TILE], dtype=pl.FP16)
-    gdn_scaled_dot_kkt(k, beta, g_sum, mask_strict, a)
+    `rows` is how many owners the call publishes to. One is the single-request case and
+    is not a separate program: `row_base` still marks sequence boundaries inside the
+    call, so one owned cache row can carry several packed sequences.
+    """
+    if rows < 1:
+        raise ValueError("the GDN layer needs at least one cache owner")
 
-    a_inv = pl.create_tensor([t_dim, H, CHUNK_TILE], dtype=pl.FP16)
-    gdn_solve_tril(a, eye, m_diag, m_low, a_inv)
+    @(pl.jit.inline if inline else pl.jit)
+    def gdn_layer(
+        q: pl.Tensor[[T_DYN, HG, D], pl.FP16],
+        k: pl.Tensor[[T_DYN, HG, D], pl.FP16],
+        v: pl.Tensor[[T_DYN, H, D], pl.FP16],
+        g: pl.Tensor[[T_DYN, H], pl.FP32],
+        beta: pl.Tensor[[H, T_DYN], pl.FP32],
+        tril: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP32],
+        mask_strict: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP32],
+        eye: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP16],
+        m_diag: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP16],
+        m_low: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP16],
+        row_base: pl.Tensor[[T_DYN], pl.INT32],
+        state_rows: pl.Tensor[[rows], pl.INT32],
+        row_ends: pl.Tensor[[rows], pl.INT32],
+        final_state: pl.InOut[pl.Tensor[[FSTATE_DYN, H, D, D], pl.FP32]],
+        o_out: pl.Out[pl.Tensor[[T_DYN, H, D], pl.FP16]],
+    ):
+        q.bind_dynamic(0, T_DYN)
+        k.bind_dynamic(0, T_DYN)
+        v.bind_dynamic(0, T_DYN)
+        g.bind_dynamic(0, T_DYN)
+        beta.bind_dynamic(1, T_DYN)
+        row_base.bind_dynamic(0, T_DYN)
+        final_state.bind_dynamic(0, FSTATE_DYN)
+        o_out.bind_dynamic(0, T_DYN)
+        t_dim = pl.tensor.dim(q, 0)
+        nchunk = t_dim // CHUNK_TILE
+        g_sum = pl.create_tensor([H, t_dim], dtype=pl.FP32)
+        gdn_chunk_cumsum(g, tril, g_sum)
+        a = pl.create_tensor([t_dim, H, CHUNK_TILE], dtype=pl.FP16)
+        gdn_scaled_dot_kkt(k, beta, g_sum, mask_strict, a)
+        a_inv = pl.create_tensor([t_dim, H, CHUNK_TILE], dtype=pl.FP16)
+        gdn_solve_tril(a, eye, m_diag, m_low, a_inv)
+        w = pl.create_tensor([t_dim, H, D], dtype=pl.FP16)
+        u = pl.create_tensor([t_dim, H, D], dtype=pl.FP16)
+        gdn_wy_fast(k, v, a_inv, beta, g_sum, w, u)
+        state = pl.create_tensor([nchunk * VAL_WIDTH, D], dtype=pl.FP16)
+        v_new = pl.create_tensor([t_dim, H, D], dtype=pl.FP16)
+        gdn_chunk_h_final(k, w, u, g_sum, row_base, state_rows, row_ends,
+                          state, v_new, final_state)
+        gdn_chunk_o_pipe(q, k, v_new, state, g_sum, tril, o_out)
+        return o_out, final_state
 
-    w = pl.create_tensor([t_dim, H, D], dtype=pl.FP16)
-    u = pl.create_tensor([t_dim, H, D], dtype=pl.FP16)
-    gdn_wy_fast(k, v, a_inv, beta, g_sum, w, u)
-
-    state_rows = nchunk * VAL_WIDTH
-    state = pl.create_tensor([state_rows, D], dtype=pl.FP16)
-    v_new = pl.create_tensor([t_dim, H, D], dtype=pl.FP16)
-    gdn_chunk_h(k, w, u, g_sum, state, v_new)
-
-    gdn_chunk_o(q, k, v_new, state, g_sum, tril, o_out)
-    return o_out
+    return gdn_layer
 
 
-gdn_layer = pl.jit.inline(_gdn_layer)
-gdn_layer_test = pl.jit(_gdn_layer)
 
-
-def delta_rule_ref(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-    beta: torch.Tensor, g: torch.Tensor,
-    chunk: int, narrow: bool = True,
-) -> dict[str, torch.Tensor]:
+def delta_rule_ref(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+               beta: torch.Tensor, g: torch.Tensor, chunk: int,
+               initial_state: torch.Tensor | None = None,
+               row_base: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
     """All six stages on the given inputs; every intermediate, `o` the output.
 
     Values crossing a stage boundary are narrowed to the dtype the kernels
     exchange -- FP16 for A, A_inv, W, U, V_new and the state snapshots -- so a
-    stage reads what the preceding kernel would have handed it. *narrow* off
-    keeps the whole chain in REF_DTYPE, which is the float64 truth the block
-    reference measures the model against; the `16` in the key names marks the
-    boundary either way.
+    stage reads what the preceding kernel would have handed it.
     """
-    def across(x):
-        return x.to(torch.float16) if narrow else x
-
     st = dict(q=q, k=k, v=v, beta=beta, g=g)
     st["g_sum"] = cumsum_ref(g, chunk)
-    st["a16"] = across(kkt_ref(k, beta, st["g_sum"], chunk))
-    st["a_inv16"] = across(solve_tril_ref(st["a16"], chunk))
+    st["a16"] = kkt_ref(k, beta, st["g_sum"], chunk).to(torch.float16)
+    st["a_inv16"] = solve_tril_ref(st["a16"], chunk).to(torch.float16)
     w, u = wy_fast_ref(k, v, beta, st["a_inv16"], st["g_sum"], chunk)
-    st["w16"] = across(w)
-    st["u16"] = across(u)
-    state, v_new, st["final_state"] = chunk_h_ref(k, st["w16"], st["u16"], st["g_sum"], chunk)
-    st["state16"] = across(state)
-    st["v_new16"] = across(v_new)
+    st["w16"] = w.to(torch.float16)
+    st["u16"] = u.to(torch.float16)
+    state, v_new, st["final_state"] = chunk_h_ref(
+        k, st["w16"], st["u16"], st["g_sum"], chunk, initial_state, row_base)
+    st["state16"] = state.to(torch.float16)
+    st["v_new16"] = v_new.to(torch.float16)
     st["o"] = chunk_o_ref(q, k, st["v_new16"], st["state16"], st["g_sum"], chunk)
     return st
 
@@ -153,7 +156,10 @@ def _inputs(t: int) -> dict:
     return _INPUTS[key]
 
 
-def build_tensor_specs(t: int = BENCH_SEQ):
+def build_tensor_specs(t: int = BENCH_SEQ, resume: bool = False,
+                       starts: tuple[int, ...] = (0,),
+                       owner_starts: tuple[int, ...] = (0,),
+                       state_rows: tuple[int, ...] = (2,), pool_rows: int = 4):
     from golden import TensorSpec
 
     def init_tril():
@@ -171,30 +177,67 @@ def build_tensor_specs(t: int = BENCH_SEQ):
 
         return make
 
+    if (len(owner_starts) != len(state_rows) or owner_starts[0] != 0
+            or any(start not in starts for start in owner_starts)
+            or len(set(state_rows)) != len(state_rows)
+            or any(not 0 <= row < pool_rows for row in state_rows)):
+        raise ValueError("each owner span starts at a sequence boundary and owns a distinct pool row")
+    ends = owner_starts[1:] + (t,)
+
+    def pool():
+        rows = torch.full((pool_rows, H, D, D), -1.0, dtype=torch.float32)
+        for owner, row in enumerate(state_rows):
+            gen = torch.Generator().manual_seed(91 + owner)
+            rows[row] = (torch.randn(H, D, D, generator=gen) * 0.02 if resume else 0.0)
+        return rows
+
     return [
         TensorSpec("q", [t, HG, D], torch.float16, init_value=draw("q")),
         TensorSpec("k", [t, HG, D], torch.float16, init_value=draw("k")),
         TensorSpec("v", [t, H, D], torch.float16, init_value=draw("v")),
         TensorSpec("g", [t, H], torch.float32, init_value=draw("g")),
-        TensorSpec("beta", [H, t], torch.float32, init_value=draw("beta", to_hT)),
+        TensorSpec("beta", [H, t], torch.float32,
+                   init_value=draw("beta", to_hT)),
         TensorSpec("tril", [CHUNK_TILE, CHUNK_TILE], torch.float32, init_value=init_tril),
-        TensorSpec("mask_strict", [CHUNK_TILE, CHUNK_TILE], torch.float32, init_value=init_mask_strict),
-        TensorSpec("eye", [CHUNK_TILE, CHUNK_TILE], torch.float16, init_value=lambda: solve_tril.eye_block(CHUNK_TILE)),
-        TensorSpec("m_diag", [CHUNK_TILE, CHUNK_TILE], torch.float16, init_value=lambda: solve_tril.blk_masks()[0]),
-        TensorSpec("m_low", [CHUNK_TILE, CHUNK_TILE], torch.float16, init_value=lambda: solve_tril.blk_masks()[1]),
+        TensorSpec("mask_strict", [CHUNK_TILE, CHUNK_TILE], torch.float32,
+                   init_value=init_mask_strict),
+        TensorSpec("eye", [CHUNK_TILE, CHUNK_TILE], torch.float16,
+                   init_value=lambda: solve_tril.eye_block(CHUNK_TILE)),
+        TensorSpec("m_diag", [CHUNK_TILE, CHUNK_TILE], torch.float16,
+                   init_value=lambda: solve_tril.blk_masks()[0]),
+        TensorSpec("m_low", [CHUNK_TILE, CHUNK_TILE], torch.float16,
+                   init_value=lambda: solve_tril.blk_masks()[1]),
+        TensorSpec("row_base", [t], torch.int32,
+                   init_value=lambda: row_base_table(t, starts)),
+        TensorSpec("state_rows", [len(state_rows)], torch.int32,
+                   init_value=lambda: torch.tensor(state_rows, dtype=torch.int32)),
+        TensorSpec("row_ends", [len(ends)], torch.int32,
+                   init_value=lambda: torch.tensor(ends, dtype=torch.int32)),
+        TensorSpec("final_state", [pool_rows, H, D, D], torch.float32, init_value=pool),
         TensorSpec("o_out", [t, H, D], torch.float16),
     ]
 
 
 def golden_gdn_layer(tensors):
-    """The whole chain in float64 on the tensors the kernel was given, scored end to end."""
+    """The whole chain in float64 on the tensors the kernel was given, scored end to end.
+
+    One owner span at a time, seeded from its pool row, with `row_base` shifted to the
+    span so a reset lands on the same chunk the kernel resets on.
+    """
     chunk = tensors["tril"].shape[0]
-    st = delta_rule_ref(
-        tensors["q"].double(), tensors["k"].double(), tensors["v"].double(),
-        tensors["beta"].t().double(), tensors["g"].double(),
-        chunk,
-    )
-    tensors["o_out"].copy_(st["o"])
+    ends = tensors["row_ends"].tolist()
+    starts = [0] + ends[:-1]
+    for owner, (start, end) in enumerate(zip(starts, ends)):
+        row = int(tensors["state_rows"][owner])
+        initial = tensors["final_state"][row].transpose(-2, -1).contiguous()
+        st = delta_rule_ref(tensors["q"][start:end].double(),
+                            tensors["k"][start:end].double(),
+                            tensors["v"][start:end].double(),
+                            tensors["beta"][:, start:end].t().double(),
+                            tensors["g"][start:end].double(), chunk, initial,
+                            tensors["row_base"][start:end] - start)
+        tensors["o_out"][start:end].copy_(st["o"])
+        tensors["final_state"][row].copy_(st["final_state"].transpose(-2, -1))
 
 
 if __name__ == "__main__":
@@ -206,6 +249,10 @@ if __name__ == "__main__":
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seq-len", type=int, default=None, help="one shape instead of DEFAULT_CASES")
+    parser.add_argument("--resume", action="store_true", default=False)
+    parser.add_argument("--packed", action="store_true", default=False)
+    parser.add_argument("--row-starts", type=str, default="0,256")
+    parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
@@ -218,16 +265,32 @@ if __name__ == "__main__":
         parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
 
     for t in cases:
-        print(f"[case] gdn_layer T={t}", flush=True)
+        if args.packed:
+            starts = tuple(int(value) for value in args.row_starts.split(","))
+            owner_starts = starts
+            state_rows = tuple(2 * owner + 1 for owner in range(len(starts)))
+            pool_rows = 2 * len(starts) + 1
+            label = f" packed starts={starts}"
+        else:
+            # One owned cache row, and at 512 tokens two sequences packed into it: a
+            # single owner does not make the sequence boundary disappear.
+            starts = (0, 256) if t >= 512 else (0,)
+            owner_starts, state_rows, pool_rows = (0,), (2,), 4
+            label = f" starts={starts}"
+        print(f"[case] gdn_layer T={t}{label} resume={args.resume}", flush=True)
         result = run(
-            fn=gdn_layer_test,
-            specs=build_tensor_specs(t=t),
+            fn=build_kernel(rows=len(state_rows)),
+            specs=build_tensor_specs(t=t, resume=args.resume, starts=starts,
+                                     owner_starts=owner_starts, state_rows=state_rows,
+                                     pool_rows=pool_rows),
             golden_fn=golden_gdn_layer,
             golden_data=args.golden_data,
             runtime_dir=args.runtime_dir,
             save_data=args.save_data,
-            config=run_config(args.backend_type, args.execution_mode, args.device, args.enable_chip_swimlane),
-            compare_fn={"o_out": frob_ok()},
+            config=run_config(args.backend_type, args.execution_mode, args.device,
+                              args.enable_chip_swimlane),
+            compare_fn={"o_out": frob_ok(), "final_state": compare_final_state(state_rows)},
+            compile_only=args.compile_only,
         )
         if not result.passed:
             if result.error:
