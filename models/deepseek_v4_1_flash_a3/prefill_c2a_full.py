@@ -280,7 +280,7 @@ def prefill_c2a_full_sp(
     norm_workers = pl.max(1, pl.min(norm_tiles, pl.system.available_aiv_count()))
     for norm_worker in pl.spmd(norm_workers, name_hint="rms_norm"):
         for hc_norm_block in pl.range(norm_worker, norm_tiles, norm_workers):
-            rms_norm_tiled(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_block, hc_norm_tokens, output_fp32=False)
+            rms_norm_tiled(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_block, hc_norm_tokens, output_fp32=False, compensated=False)
     prefill_sp_input_allgather(
         local_hidden, input_window, input_arrived, attn_input,
         group_base, tp_rank, num_tokens, attention_epoch,
@@ -575,6 +575,7 @@ def l3_prefill_c2a_full(
     input_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     data_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    # These signal windows are fresh on every standalone launch.
     for rank in pl.range(pld.world_size()):
         input_data = pld.window(input_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
         input_signal = pld.window(input_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
@@ -586,7 +587,7 @@ def l3_prefill_c2a_full(
         wkv_scale_r: pl.Tensor[[1, HEAD_DIM], pl.FP32, pl.ND] = wkv_scale[rank]
         index_wq_b_scale_r: pl.Tensor[[1, INDEX_H * INDEX_DIM], pl.FP32, pl.ND] = index_wq_b_scale[rank]
         l2_prefill_c2a_full(
-            x_hc[rank], pre_mix[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank], attn_norm_weight[rank], wq_a[rank], wq_a_scale_r, q_norm_weight[rank], wq_b[rank], wq_b_scale_r, wkv[rank], wkv_scale_r, kv_norm_weight[rank], attn_sink[rank], wo_a[rank], wo_b[rank], freqs_cos[rank], freqs_sin[rank], window_slots[rank], window_indices[rank], window_cache[rank], window_cache_scale[rank], compressed_cache[rank], compressed_cache_scale[rank], token_to_req_indices[rank], compressed_lens[rank], index_cache[rank], index_cache_scale[rank], index_block_table[rank], position_ids[rank], compressed_freqs_cos[rank], compressed_freqs_sin[rank], compressed_rope_positions[rank], compressor_wkv[rank], compressor_wgate[rank], query_start_loc[rank], state_block_table[rank], state_cache[rank], compressor_norm_weight[rank], compressed_slots[rank], index_wk[rank], index_norm_weight[rank], index_wq_b[rank], index_wq_b_scale_r, index_weights_proj[rank], topk_indices[rank], attn_input[rank], attn_output[rank], next_pre_mix[rank], x_hc_out[rank], input_data, input_signal, data, signal, rank, num_tokens[rank], attention_epoch, device=rank,
+            x_hc[rank], pre_mix[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank], attn_norm_weight[rank], wq_a[rank], wq_a_scale_r, q_norm_weight[rank], wq_b[rank], wq_b_scale_r, wkv[rank], wkv_scale_r, kv_norm_weight[rank], attn_sink[rank], wo_a[rank], wo_b[rank], freqs_cos[rank], freqs_sin[rank], window_slots[rank], window_indices[rank], window_cache[rank], window_cache_scale[rank], compressed_cache[rank], compressed_cache_scale[rank], token_to_req_indices[rank], compressed_lens[rank], index_cache[rank], index_cache_scale[rank], index_block_table[rank], position_ids[rank], compressed_freqs_cos[rank], compressed_freqs_sin[rank], compressed_rope_positions[rank], compressor_wkv[rank], compressor_wgate[rank], query_start_loc[rank], state_block_table[rank], state_cache[rank], compressor_norm_weight[rank], compressed_slots[rank], index_wk[rank], index_norm_weight[rank], index_wq_b[rank], index_wq_b_scale_r, index_weights_proj[rank], topk_indices[rank], attn_input[rank], attn_output[rank], next_pre_mix[rank], x_hc_out[rank], input_data, input_signal, data, signal, rank, num_tokens[rank], 1, device=rank,
         )
 
 

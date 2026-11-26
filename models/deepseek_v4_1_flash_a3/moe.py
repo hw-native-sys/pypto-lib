@@ -610,11 +610,11 @@ def _decode_ffn_owner_norm(
         slab_rows = pl.tensor.dim(output, 0)
         compact = pl.create_tensor([slab_rows, D], dtype=pl.BF16)
         _compact_local_tokens(source, compact, num_tokens, tp_rank)
-        norm_tiles = (slab_rows + 7) // 8
+        norm_tiles = (local_tokens + 7) // 8
         norm_workers = pl.max(1, pl.min(norm_tiles, pl.system.available_aiv_count()))
         for norm_worker in pl.spmd(norm_workers, name_hint="rms_norm"):
             for block in pl.range(norm_worker, norm_tiles, norm_workers):
-                rms_norm_tiled(compact, norm_weight, output, block, slab_rows, output_fp32=False)
+                rms_norm_tiled(compact, norm_weight, output, block, local_tokens, output_fp32=False, compensated=False)
 
 
 @pl.jit.inline

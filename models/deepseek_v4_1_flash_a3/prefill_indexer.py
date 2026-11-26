@@ -24,9 +24,9 @@ import torch
 import pypto.language as pl
 
 from .indexer_common import (
-    CANDIDATE_BLOCK_SIZE, CANDIDATE_LEAF_TILE, CANDIDATE_PAIR_WIDTH, CANDIDATE_SHORT_LEAF_TILE,
-    CANDIDATE_TOPK_BLOCKS, golden_index_query_fp4, golden_select_candidate_block_pool,
-    index_pool_block_capacity, merge_candidate_level, sort_candidate_leaf, sort_candidate_short_leaf,
+    rank_candidate_blocks,
+    CANDIDATE_BLOCK_SIZE, CANDIDATE_LEAF_TILE, CANDIDATE_PAIR_WIDTH, CANDIDATE_TOPK_BLOCKS, golden_index_query_fp4, golden_select_candidate_block_pool,
+    index_pool_block_capacity,
 )
 INDEX_POOL_SCORE_DYN = pl.dynamic("A3_INDEX_POOL_SCORE_DYN")
 from .quant import decode_fp4, decode_scale
@@ -446,43 +446,7 @@ def select_candidate_block_pool(
             sorted_ids = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32, value=-1)
             if token < active_tokens:
                 visible = pl.min(pl.max(pl.read(compressed_lens, [token]), 0), positions)
-                visible_blocks = (visible + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
-                arena_base = token * CANDIDATE_MAX_LEAVES
-                count = 0
-                if visible_blocks > 0 and visible_blocks <= CANDIDATE_SHORT_LEAF_TILE:
-                    sort_candidate_short_leaf(block_scores, arena, token, visible_blocks, arena_base)
-                    count = 1
-                elif visible_blocks > 0:
-                    leaf_count = (visible_blocks + CANDIDATE_LEAF_TILE - 1) // CANDIDATE_LEAF_TILE
-                    for leaf in pl.range(leaf_count):
-                        block_begin = leaf * CANDIDATE_LEAF_TILE
-                        valid_count = pl.min(CANDIDATE_LEAF_TILE, visible_blocks - block_begin)
-                        sort_candidate_leaf(block_scores, arena, token, block_begin, valid_count, arena_base + leaf)
-                    count = leaf_count
-                if count > 1:
-                    count = merge_candidate_level(arena, arena_base, count)
-                if count > 1:
-                    count = merge_candidate_level(arena, arena_base, count)
-                if count > 1:
-                    count = merge_candidate_level(arena, arena_base, count)
-                if count > 1:
-                    count = merge_candidate_level(arena, arena_base, count)
-
-                selected_count = pl.min(pl.min(visible_blocks, CANDIDATE_TOPK_BLOCKS), capacity)
-                ordered_scores = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.FP32, value=-1e30)
-                ordered_indices = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32, value=-1)
-                if selected_count > 0:
-                    root = pl.load(arena, [arena_base, 0], [1, CANDIDATE_PAIR_WIDTH])
-                    selected = pl.tile.gather_mask(root, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-                    for lane in pl.range(selected_count):
-                        block_id = pl.tile.read(selected, [0, lane])
-                        pl.tile.write(ordered_scores, [0, lane], -pl.cast(pl.cast(block_id, pl.INT32), pl.FP32))
-                        pl.tile.write(ordered_indices, [0, lane], block_id)
-                ordered = pl.tile.sort32(ordered_scores, pl.reinterpret_view(ordered_indices, pl.UINT32))
-                ordered = pl.tile.mrgsort(ordered, block_len=64)
-                ordered = pl.tile.mrgsort(ordered, block_len=256)
-                ordered = pl.tile.mrgsort(ordered, block_len=1024)
-                sorted_ids = pl.tile.gather_mask(ordered, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+                sorted_ids = rank_candidate_blocks(block_scores, arena, token, visible, capacity, CANDIDATE_MAX_LEAVES)
             # Publish the sorted prefix and -1 padding as one aligned pool row.
             pl.store(pl.tile.set_validshape(sorted_ids, 1, capacity), [token, 0], pool_block_ids)
     # Publish cache-line-sharing counts from one worker after the ID rows.
@@ -1587,10 +1551,14 @@ def l2_prefill_indexer_validation(
         tile_n=128, query_tile=1, skip_short=False, head_rows=INDEX_H, materialize_padding=True,
         ordered_keys=False, physical_pages=0,
     )
-    _select_c1a_topk(
-        scores, lengths, request_ids, table, pool_ids, pool_counts, c1a, num_tokens, scored, pool=False,
+    _select_paged_topk(
+        scores, lengths, request_ids, table, pool_ids, pool_counts, pl.tensor.dim(cache, 0),
+        c1a, num_tokens, scored, pool=False, c2a=False,
     )
-    _select_c2a_topk(scores, lengths, request_ids, table, pl.tensor.dim(cache, 0), c2a, num_tokens, scored)
+    _select_paged_topk(
+        scores, lengths, request_ids, table, pool_ids, pool_counts, pl.tensor.dim(cache, 0),
+        c2a, num_tokens, scored, pool=False, c2a=True,
+    )
     pool_ready = select_candidate_block_pool(scores, lengths, pool_ids, pool_counts, num_tokens, scored)
     pool_tokens = pl.tensor.dim(pool_ids, 0)
     compact_pages = pl.tensor.dim(pool_ids, 1) // 16

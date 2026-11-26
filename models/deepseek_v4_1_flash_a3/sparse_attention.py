@@ -2218,9 +2218,10 @@ def attend_packed(
     cache_rows = (pl.tensor.dim(window, 0) + pl.tensor.dim(compressed, 0)) * 128
     # The packed host groups longer chunks first. Only those rows use the
     # cache-streaming reduction selected for the equivalent single request.
-    shared = pl.cast(pl.max(shared_prefix, 0), pl.INT32)
-    if shared_prefix < 0:
-        if cache_rows <= CACHE_MAX_ROWS and cache_rows < num_tokens * SELECTED_KEYS:
+    shared = pl.cast(0, pl.INT32)
+    if cache_rows <= CACHE_MAX_ROWS:
+        shared = pl.cast(pl.min(pl.max(shared_prefix, 0), num_tokens), pl.INT32)
+        if shared_prefix < 0 and cache_rows < num_tokens * SELECTED_KEYS:
             shared = num_tokens
     if shared > 0:
         _attend_cache_shared(
@@ -2425,8 +2426,9 @@ def golden_window_publish(tensors):
     rows = int(tensors["num_tokens"])
     slots = tensors["slots"][:rows]
     payload, scales = quantize_mxfp8_cache(tensors["kv"][:rows])
-    tensors["cache"].reshape(-1, HEAD_DIM)[slots] = payload.view(torch.uint8)
-    tensors["scales"].reshape(-1, SWA_GROUPS)[slots] = scales
+    valid = slots >= 0
+    tensors["cache"].reshape(-1, HEAD_DIM)[slots[valid]] = payload.view(torch.uint8)[valid]
+    tensors["scales"].reshape(-1, SWA_GROUPS)[slots[valid]] = scales[valid]
 
 
 def validate_window_publish(args):
@@ -2449,6 +2451,7 @@ def validate_window_publish(args):
         table = torch.tensor(pages, dtype=torch.int32)
         slots, _, _ = window_metadata(positions, owners, table)
         padded = torch.full((16,), -1, dtype=torch.int64)
+        slots[1] = -1
         padded[:slots.numel()] = slots
         kv = torch.randn(16, HEAD_DIM, generator=generator).bfloat16()
         specs = [
@@ -2935,9 +2938,14 @@ if __name__ == "__main__":
         row_cases = [1, 7, 12, 13]
         if args.rows is not None:
             row_cases = [args.rows]
+        fixture = torch.load(args.fixture, weights_only=True) if args.fixture else None
+        if fixture is not None:
+            fixture_rows = fixture["q"].shape[0]
+            if args.rows is not None and args.rows != fixture_rows:
+                parser.error("--rows must match the saved fixture")
+            row_cases = [fixture_rows]
         records = []
         for rows in row_cases:
-            fixture = torch.load(args.fixture, weights_only=True) if args.fixture else None
             if fixture is None:
                 torch.manual_seed(4102026)
                 query = (torch.randn(rows, LOCAL_H, HEAD_DIM) * 0.7).bfloat16()

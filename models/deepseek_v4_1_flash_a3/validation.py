@@ -133,9 +133,20 @@ def concentrated_fixture(fixture, target, reference_dir, weights, tokenizer, req
     return {**fixture, **frozen}
 
 
+def _engram_input(reference, weights, request, layer, hidden):
+    prefix = f"layers.{layer}.engram."
+    lookup = reference.engram.lookup(torch.tensor(request["input_ids"]), 8192, request_id=0)[M.engram_layer_ids.index(layer)]
+    gate = reference.tensor(prefix + "q_weight").float() * reference.tensor(prefix + "k_weight").float()
+    engrammed = torch.empty_like(hidden)
+    golden_engram(dict(source=hidden, lookup=lookup, output=engrammed, weight=gate,
+                       wkv_weight=reference.tensor(prefix + "wkv.weight").t(),
+                       rotation=weights.checkpoint.rotation_blocks()))
+    return engrammed
+
+
 def freeze_cache_reference(layer, fixture, reference_dir, weights, tokenizer, request, rope):
     """Freeze independent post-attention caches for each representative residual fixture."""
-    path = reference_dir / f"layer_{layer:02d}_cache_reference.pt"
+    path = reference_dir / f"layer_{layer:02d}_cache_reference_v2.pt"
     if path.exists():
         return torch.load(path, map_location="cpu", weights_only=True)
     reference = W8A8Reference(weights.checkpoint, tokenizer)
@@ -143,18 +154,9 @@ def freeze_cache_reference(layer, fixture, reference_dir, weights, tokenizer, re
     cache = {name: value.clone() for name, value in fixture["cache"].items()}
     values = prepare_prefill_inputs(embedding, 8192, max_seq_len=8200, cache_state=cache, rope_tables=rope)
     reference.cache, reference.rope = cache, rope
-    snapshot = torch.load(reference_dir / f"layer_{layer:02d}.pt", map_location="cpu", weights_only=True)
-    hidden, pre = snapshot["hidden"], snapshot["pre_mix"]
-    if layer == 14:
-        hidden, pre = fixture["hidden"], fixture["pre_mix"]
-        prefix = "layers.14.engram."
-        lookup = reference.engram.lookup(torch.tensor(request["input_ids"]), 8192, request_id=0)[1]
-        gate = reference.tensor(prefix + "q_weight").float() * reference.tensor(prefix + "k_weight").float()
-        engrammed = torch.empty_like(hidden)
-        golden_engram(dict(source=hidden, lookup=lookup, output=engrammed, weight=gate,
-                           wkv_weight=reference.tensor(prefix + "wkv.weight").t(),
-                           rotation=weights.checkpoint.rotation_blocks()))
-        hidden = engrammed
+    hidden, pre = fixture["hidden"], fixture["pre_mix"]
+    if layer in M.engram_layer_ids:
+        hidden = _engram_input(reference, weights, request, layer, hidden)
     plan = M.layer_config(layer)
     if plan.mode in ("reuse", "reindex"):
         reference.selected = fixture["topk_indices"]
@@ -212,45 +214,25 @@ def make_layer_fixture(layer, reference_dir, weights, tokenizer, request, rope):
     """Load frozen residuals and independently regenerate the reused source caches."""
     snapshot = torch.load(reference_dir / f"layer_{layer:02d}.pt", map_location="cpu", weights_only=True)
     hidden, pre = snapshot["hidden"], snapshot["pre_mix"]
-    if layer == 1:
-        previous = torch.load(reference_dir / "layer_00.pt", map_location="cpu", weights_only=True)
+    if layer in M.engram_layer_ids and snapshot.get("hidden_stage") != "layer_input":
+        previous_path = reference_dir / f"layer_{layer - 1:02d}.pt"
+        if not previous_path.exists():
+            raise ValueError(f"Regenerate layer {layer} reference with a pre-Engram layer input")
+        previous = torch.load(previous_path, map_location="cpu", weights_only=True)
         hidden, pre = previous["output"], previous["output_pre_mix"]
     reference = W8A8Reference(weights.checkpoint, tokenizer)
     embedding = weights.lookup_rows(torch.tensor(request["input_ids"]))
     values = prepare_prefill_inputs(embedding, 8192, max_seq_len=8200, rope_tables=rope)
     reference.cache = {name: value for name, value in values.items() if name.endswith(("_cache", "_scales"))}
     reference.rope = rope
-    if layer == 14:
-        replay = reference_dir / "layer_14_engram_replay.pt"
-        if replay.exists():
-            return torch.load(replay, map_location="cpu", weights_only=True)
-        lookup = reference.engram.lookup(torch.tensor(request["input_ids"]), 8192, request_id=0)[1]
-        prefix = "layers.14.engram."
-        gate = reference.tensor(prefix + "q_weight").float() * reference.tensor(prefix + "k_weight").float()
-        engrammed = torch.empty_like(hidden)
-        golden_engram(dict(source=hidden, lookup=lookup, output=engrammed, weight=gate,
-                           wkv_weight=reference.tensor(prefix + "wkv.weight").t(),
-                           rotation=weights.checkpoint.rotation_blocks()))
-        output, output_pre, counts = reference.layer_forward(engrammed, pre, layer, values)
-        if int(counts.sum()) != 49152:
-            raise ValueError("independent layer 14 routes do not cover all six branches")
-        fixture = dict(hidden=hidden, pre_mix=pre, output=output, output_pre_mix=output_pre,
-                       cache={name: value.clone() for name, value in values.items()
-                              if name.endswith(("_cache", "_scales"))},
-                       topk_indices=values["topk_indices"], pool_block_ids=values["pool_block_ids"],
-                       pool_block_counts=values["pool_block_counts"])
-        for name, value in fixture["cache"].items():
-            if name.endswith("_scales"):
-                value.fill_(127 if name == "index_scales" else 1)
-            else:
-                value.zero_()
-        torch.save(fixture, replay)
-        return fixture
     plan = M.layer_config(layer)
     if plan.mode in ("reuse", "reindex"):
         source = plan.kv_source_layer_id
         initial = torch.load(reference_dir / f"layer_{source:02d}.pt", map_location="cpu", weights_only=True)
-        collapsed = golden_hc_collapse(initial["hidden"], initial["pre_mix"]).bfloat16()
+        source_hidden = initial["hidden"]
+        if source in M.engram_layer_ids and initial.get("hidden_stage") == "layer_input":
+            source_hidden = _engram_input(reference, weights, request, source, source_hidden)
+        collapsed = golden_hc_collapse(source_hidden, initial["pre_mix"]).bfloat16()
         norm = weights.checkpoint.tensor(f"layers.{source}.attn_norm.weight")
         reference.attention(golden_rms_norm(collapsed, norm), source, values)
     topk = torch.full((8192, M.index_topk), -1, dtype=torch.int32)

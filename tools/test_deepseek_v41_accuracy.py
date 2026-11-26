@@ -32,13 +32,25 @@ def prepared(tmp_path):
     accuracy.write_json(checkpoint / "quant_model_weights.safetensors.index.json",
                         dict(weight_map={"model.weight": "weights.safetensors"}))
     (checkpoint / "weights.safetensors").write_bytes(b"fixture-only")
-    for name in ("tokenizer.json", "quant_model_description.json"):
-        accuracy.write_json(checkpoint / name, {})
+    accuracy.write_json(checkpoint / "tokenizer.json", {})
+    rotation = checkpoint / "optional" / "quarot.safetensors"
+    rotation.parent.mkdir()
+    rotation.write_bytes(b"first")
+    accuracy.write_json(checkpoint / "quant_model_description.json", {
+        "optional": {"quarot": {"rotation_map": {"global_rotation": "optional/quarot.safetensors"}}}
+    })
     source = tmp_path / "source.json"
     accuracy.write_json(source, dict(cases=[dict(id="trace", prompt_token_ids=[0, 1], trace_token_ids=[5, 6, 7])]))
     path = tmp_path / "cases.json"
     spec = accuracy.prepare_cases(checkpoint, source, path)
     return spec, path, source
+
+
+def test_rotation_change_invalidates_prepared_cases(prepared):
+    spec, path, _ = prepared
+    (Path(spec["checkpoint"]) / "optional/quarot.safetensors").write_bytes(b"other")
+    with pytest.raises(ValueError, match="metadata differs"):
+        accuracy.load_cases(path)
 
 
 @pytest.mark.parametrize("shift_history", [False, True])

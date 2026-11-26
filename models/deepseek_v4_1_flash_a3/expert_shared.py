@@ -137,7 +137,7 @@ def golden_expert_shared(payload, activation_scale, w1, scale1, w3, scale3, w2, 
     return golden_dynamic_int8(hidden.bfloat16(), w2, scale2)
 
 
-VALIDATION_ROWS = 32
+VALIDATION_ROWS = 80
 
 
 @pl.jit
@@ -218,7 +218,7 @@ if __name__ == "__main__":
     base_specs = [TensorSpec(name, list(value.shape), value.dtype, init_value=value) for name, value in values.items()]
     reports = []
     passed = True
-    for count in (1, 17):
+    for count in (1, 17, 65):
         counts = torch.tensor([count], dtype=torch.int32)
         specs = [
             *base_specs,

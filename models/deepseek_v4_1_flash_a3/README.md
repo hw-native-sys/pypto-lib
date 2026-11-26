@@ -55,6 +55,10 @@ windows. For reusable generation artifacts, add `--prepare-windows` to both
 `generation/tokens.json` holds the generated IDs. `--dump-logits` saves the
 vocabulary vector for each emitted token.
 
+Running `python -m models.deepseek_v4_1_flash_a3.prefill_fwd -d 0` compares the
+layer-20 replay gather against CPU indexing on one device. It covers layer ranges
+starting at 0, 19 and 20. Pass `--compile-only` to compile the full forward graph.
+
 For the bundled 8192-token replay, build Prefill with `--capacity 8192`
 and `--prefill-moe-slab-rows 2048`, Decode with `--decode-capacity 16`, and both
 programs with `--context-capacity 8200`. Run the compiled pair with

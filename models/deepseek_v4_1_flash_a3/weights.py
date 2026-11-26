@@ -78,7 +78,7 @@ class Checkpoint:
 
     def __init__(self, root: str | Path):
         self.root = Path(root).resolve()
-        config = json.loads((self.root / "config.json").read_text())
+        config = json.loads(self._path("config.json").read_text())
         text = config["text_config"]
         quant = config.get("quantization_config", {})
         if quant.get("quant_method") != "ascend" or quant.get("model_quant_type") != "W8A8_DYNAMIC":
@@ -103,13 +103,13 @@ class Checkpoint:
         for name, expected in required.items():
             if text.get(name) != expected:
                 raise ValueError(f"checkpoint {name}={text.get(name)!r}, expected {expected!r}")
-        index = json.loads((self.root / "quant_model_weights.safetensors.index.json").read_text())
+        index = json.loads(self._path("quant_model_weights.safetensors.index.json").read_text())
         self.weight_map = index["weight_map"].copy()
         expected_rotation = {"value_projection_rotated": True, "value_basis": "quarot_global",
                              "key_and_gate_basis": "original", "runtime_delta_rotation": False}
         if config.get("engram_rotation_config") != expected_rotation:
             raise ValueError("unsupported Engram key/value basis contract")
-        description = json.loads((self.root / "quant_model_description.json").read_text())
+        description = json.loads(self._path("quant_model_description.json").read_text())
         rotation = description["optional"]["quarot"]["rotation_map"]["global_rotation"]
         if rotation != "optional/quarot.safetensors":
             raise ValueError("unsupported global rotation payload location")
@@ -117,12 +117,16 @@ class Checkpoint:
         self._headers = {}
         self._row_tables = {}
 
+    def _path(self, name):
+        path = (self.root / name).resolve()
+        if self.root not in path.parents:
+            raise ValueError(f"checkpoint file leaves its root: {name}")
+        return path
+
     def tensor(self, name: str) -> torch.Tensor:
         """Return an owned CPU tensor without loading the rest of its shard."""
         shard = self.weight_map[name]
-        path = (self.root / shard).resolve()
-        if not path.is_relative_to(self.root):
-            raise ValueError(f"checkpoint shard leaves its root: {shard}")
+        path = self._path(shard)
         with path.open("rb") as file:
             header_size = struct.unpack("<Q", file.read(8))[0]
             if header_size > 64 * 1024 * 1024:
@@ -149,9 +153,7 @@ class Checkpoint:
         ids = rows.to(dtype=torch.int64, device="cpu").flatten()
         if name not in self._row_tables:
             shard = self.weight_map[name]
-            path = (self.root / shard).resolve()
-            if not path.is_relative_to(self.root):
-                raise ValueError(f"checkpoint shard leaves its root: {shard}")
+            path = self._path(shard)
             with path.open("rb") as file:
                 header_size = struct.unpack("<Q", file.read(8))[0]
                 if header_size > 64 * 1024 * 1024:
@@ -180,7 +182,7 @@ class Checkpoint:
         """Read shape and dtype metadata without materializing a tensor."""
         shard = self.weight_map[name]
         if shard not in self._headers:
-            with (self.root / shard).open("rb") as file:
+            with self._path(shard).open("rb") as file:
                 size = struct.unpack("<Q", file.read(8))[0]
                 if size > 64 * 1024**2:
                     raise ValueError("safetensors header exceeds 64 MiB")
@@ -190,8 +192,8 @@ class Checkpoint:
     def rotation_blocks(self):
         """Read and validate the checkpoint's orthogonal 32-dimensional rotation blocks."""
         relative = self.weight_map["global_rotation"]
-        path = self.root / relative
-        manifest = json.loads((self.root / "aurora_export_manifest.json").read_text())
+        path = self._path(relative)
+        manifest = json.loads(self._path("aurora_export_manifest.json").read_text())
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         if digest != manifest["files"][relative]["sha256"]:
             raise ValueError("global rotation payload does not match the checkpoint manifest")
@@ -213,7 +215,7 @@ class Checkpoint:
     def identity(self):
         names = ("config.json", "quant_model_weights.safetensors.index.json", "aurora_export_manifest.json",
                  "quant_model_description.json", self.weight_map["global_rotation"])
-        return {name: hashlib.sha256((self.root / name).read_bytes()).hexdigest() for name in names}
+        return {name: hashlib.sha256(self._path(name).read_bytes()).hexdigest() for name in names}
 
 
 def forward_weight_layouts(local_experts=N_LOCAL_EXPERTS):

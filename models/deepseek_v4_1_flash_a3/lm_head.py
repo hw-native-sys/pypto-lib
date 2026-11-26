@@ -30,9 +30,7 @@ Each dispatch clears its signal windows after all TP ranks finish reading
 the communication windows. Complete a dispatch on all ranks before replacing
 its inputs or launching another host dispatch with the same resident buffers.
 
-TP1 bring-up uses ``MAX_LOGIT_ROWS=16`` so ``GROUP_LOGIT_ROWS`` stays a multiple of
-16 without MTP's AIV/MATMUL_ROWS padding path. Do not size the fixture from
-``DECODE_MAX_TOKENS``.
+The A3 head uses TP4 within each of four DP groups.
 """
 
 import sys
@@ -47,11 +45,9 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 
-# Standalone LM-head validation defaults to TP2/DP1.
-
 from .config import FLASH as M, TP_SIZE as CONFIG_TP_SIZE, DP_SIZE as CONFIG_DP_SIZE
 from .hc import hc_head, golden_hc_collapse
-from .rmsnorm import rms_norm_tiled_compensated, golden_rms_norm_tiled
+from .rmsnorm import rms_norm_tiled, golden_rms_norm_tiled
 
 
 # model config
@@ -70,6 +66,8 @@ _TP_DEFAULT = CONFIG_TP_SIZE
 
 
 def _parse_int_argv(name, default=None):
+    if __name__ != "__main__":
+        return default
     for i, tok in enumerate(sys.argv):
         if tok == name and i + 1 < len(sys.argv):
             return int(sys.argv[i + 1])
@@ -84,8 +82,7 @@ DP_SIZE: int = _parse_int_argv("--dp") or CONFIG_DP_SIZE
 WORLD_SIZE = TP_SIZE * DP_SIZE
 VOCAB_PER_TP = VOCAB // TP_SIZE
 
-# Small decode fixture size (not DECODE_MAX_TOKENS). TP1 * 16 == 16 satisfies
-# the matmul M % 16 == 0 constraint on Pro's simpler path.
+# Each TP group projects 4 owners x 16 output rows.
 MAX_LOGIT_ROWS = 16
 TEST_TOKENS = 16  # standalone fixture: hidden rows per card
 GROUP_LOGIT_ROWS = TP_SIZE * MAX_LOGIT_ROWS
@@ -239,7 +236,14 @@ def lm_head(
     # Send each owner its slice of this card's vocab shard, split over vocab comm
     # tiles: block blk pushes its tiles to every owner.
     push_workers = pl.min(LOGITS_COMM_BLOCKS, pl.system.available_aiv_count())
-    with pl.spmd(push_workers, name_hint="lm_head_combine_push") as _push_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_acquire_logits") as acquired:
+        for peer in pl.range(TP_SIZE):
+            if peer != tp_rank:
+                pld.system.defer_wait(
+                    logits_done, offsets=[peer, 0], expected=(done_epoch - 1) * (LOGITS_COMM_BLOCKS + 1),
+                    cmp=pld.WaitCmp.Ge,
+                )
+    with pl.spmd(push_workers, name_hint="lm_head_combine_push", deps=[acquired]) as _push_tid:
         push_worker = pl.tile.get_block_idx()
         for blk in pl.range(push_worker, LOGITS_COMM_BLOCKS, push_workers):
             vocab_base = tp_rank * VOCAB_PER_TP
@@ -512,7 +516,7 @@ def l3_final_output(
     This entry only reads layer state and never mutates caches. Wait for the
     backbone to complete before dispatch and for this call before reading
     logits or reusing state. Use persistent=True with reset_persistent_windows=False for repeated calls.
-    Wait for each dispatch to complete on all ranks before the next call. TP1/DP8 uses eight full head replicas.
+    Wait for each dispatch to complete on all ranks before the next call.
     """
     x_hc.bind_dynamic(1, T_DYN)
     hidden_buffer = pld.alloc_window_buffer([GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
@@ -560,7 +564,7 @@ def _final_output(
     norm_workers = pl.max(1, pl.min(norm_tiles, pl.system.available_aiv_count()))
     for norm_worker in pl.spmd(norm_workers, name_hint="final_rms_norm"):
         for norm_block in pl.range(norm_worker, norm_tiles, norm_workers):
-            rms_norm_tiled_compensated(collapsed, final_norm_weight, normalized, norm_block, rows)
+            rms_norm_tiled(collapsed, final_norm_weight, normalized, norm_block, rows, output_fp32=False, compensated=True)
     lm_head_with_sampling(
         normalized, lm_head_weight, logit_row_indices, logits, sampled_ids,
         hidden_window, hidden_done, logits_window, logits_done, group_base, tp_rank, done_epoch, completed_epochs,
@@ -761,7 +765,7 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--checkpoint", type=Path)
-    parser.add_argument("--request-dp", type=int, choices=range(DP_SIZE), default=0)
+    parser.add_argument("--request-dp", type=int, choices=range(DP_SIZE), default=None)
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
 

@@ -462,7 +462,7 @@ def quantize_grouped_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, t
     payload, scale = _quantize_mxfp8_activation(weight)
     payload = payload.flatten(-2).transpose(-1, -2).contiguous()
     codes = encode_e8m0(scale).transpose(-1, -2).contiguous()
-    return pack_fp8_nz(payload), pack_mx_b_scale(codes).view(torch.float8_e8m0fnu)
+    return pack_fp8_nz(payload), pack_mx_b_scale(codes).view(getattr(torch, "float8_e8m0fnu", torch.uint8))
 
 
 # E8M0 has no native dtype in some PyTorch versions, so it is always carried as uint8.

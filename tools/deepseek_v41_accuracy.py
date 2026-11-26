@@ -55,13 +55,21 @@ def write_json(path, value):
 
 def checkpoint_identity(checkpoint):
     root = Path(checkpoint).resolve()
-    identity = {name: file_sha256(root / name) for name in CHECKPOINT_METADATA}
-    index = read_json(root / "quant_model_weights.safetensors.index.json")
-    shards = {}
-    for name in sorted(set(index["weight_map"].values())):
+    def checkpoint_file(name):
         path = (root / name).resolve()
         if root not in path.parents:
-            raise ValueError("Checkpoint index names a shard outside the checkpoint directory")
+            raise ValueError(f"File outside the checkpoint directory: {name}")
+        return path
+
+    identity = {name: file_sha256(checkpoint_file(name)) for name in CHECKPOINT_METADATA}
+    index = read_json(root / "quant_model_weights.safetensors.index.json")
+    description = read_json(checkpoint_file("quant_model_description.json"))
+    rotation = description.get("optional", {}).get("quarot", {}).get("rotation_map", {}).get("global_rotation")
+    if rotation is not None:
+        identity["global_rotation_sha256"] = file_sha256(checkpoint_file(rotation))
+    shards = {}
+    for name in sorted(set(index["weight_map"].values())):
+        path = checkpoint_file(name)
         stat = path.stat()
         shards[name] = dict(size_bytes=stat.st_size, mtime_ns=stat.st_mtime_ns)
     identity["weight_shard_stats"] = shards

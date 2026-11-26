@@ -354,7 +354,7 @@ def l2_prefill_c1a_full_sharded(
     norm_workers = pl.max(1, pl.min(norm_tiles, pl.system.available_aiv_count()))
     for norm_worker in pl.spmd(norm_workers, name_hint="rms_norm"):
         for hc_norm_block in pl.range(norm_worker, norm_tiles, norm_workers):
-            rms_norm_tiled(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_block, hc_norm_tokens, output_fp32=False)
+            rms_norm_tiled(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_block, hc_norm_tokens, output_fp32=False, compensated=False)
     prefill_sp_input_allgather(
         local_hidden, input_window, input_arrived, attn_input, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE,
         active, attention_epoch,
@@ -460,6 +460,7 @@ def l3_prefill_c1a_full_sharded(
     input_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     output_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     output_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    # These signal windows are fresh on every standalone launch.
     for rank in pl.range(pld.world_size()):
         input_window = pld.window(input_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
         input_arrived = pld.window(input_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
@@ -470,7 +471,7 @@ def l3_prefill_c1a_full_sharded(
         wkv_scale_r: pl.Tensor[[1, HEAD_DIM], pl.FP32, pl.ND] = wkv_scale[rank]
         index_wq_b_scale_r: pl.Tensor[[1, INDEX_H * INDEX_DIM], pl.FP32, pl.ND] = index_wq_b_scale[rank]
         l2_prefill_c1a_full_sharded(
-            x_hc[rank], pre_mix[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank], attn_norm_weight[rank], wq_a[rank], wq_a_scale_r, q_norm_weight[rank], wq_b[rank], wq_b_scale_r, wkv[rank], wkv_scale_r, kv_norm_weight[rank], attn_sink[rank], wo_a[rank], wo_b[rank], rope_cos[rank], rope_sin[rank], window_slots[rank], window_indices[rank], window_cache[rank], window_cache_scale[rank], compressed_cache[rank], compressed_cache_scale[rank], request_ids[rank], compressed_lens[rank], index_cache[rank], index_cache_scale[rank], index_block_table[rank], compressed_rope_cos[rank], compressed_rope_sin[rank], compressor_wkv[rank], compressor_norm_weight[rank], compressed_slots[rank], index_wk[rank], index_norm_weight[rank], index_wq_b[rank], index_wq_b_scale_r, index_weights_proj[rank], topk_indices[rank], pool_block_ids[rank], pool_block_counts[rank], compressed_indices[rank], attn_input[rank], attn_output[rank], next_pre_mix[rank], x_hc_out[rank], input_window, input_arrived, output_window, output_arrived, num_tokens[rank], rank, attention_epoch, device=rank,
+            x_hc[rank], pre_mix[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank], attn_norm_weight[rank], wq_a[rank], wq_a_scale_r, q_norm_weight[rank], wq_b[rank], wq_b_scale_r, wkv[rank], wkv_scale_r, kv_norm_weight[rank], attn_sink[rank], wo_a[rank], wo_b[rank], rope_cos[rank], rope_sin[rank], window_slots[rank], window_indices[rank], window_cache[rank], window_cache_scale[rank], compressed_cache[rank], compressed_cache_scale[rank], request_ids[rank], compressed_lens[rank], index_cache[rank], index_cache_scale[rank], index_block_table[rank], compressed_rope_cos[rank], compressed_rope_sin[rank], compressor_wkv[rank], compressor_norm_weight[rank], compressed_slots[rank], index_wk[rank], index_norm_weight[rank], index_wq_b[rank], index_wq_b_scale_r, index_weights_proj[rank], topk_indices[rank], pool_block_ids[rank], pool_block_counts[rank], compressed_indices[rank], attn_input[rank], attn_output[rank], next_pre_mix[rank], x_hc_out[rank], input_window, input_arrived, output_window, output_arrived, num_tokens[rank], rank, 1, device=rank,
         )
 
 
@@ -558,7 +559,7 @@ def prefill_c1a_full(
     norm_workers = pl.max(1, pl.min(norm_tiles, pl.system.available_aiv_count()))
     for norm_worker in pl.spmd(norm_workers, name_hint="rms_norm"):
         for norm_block in pl.range(norm_worker, norm_tiles, norm_workers):
-            rms_norm_tiled(hidden, attn_norm_weight, attn_input, norm_block, norm_tokens, output_fp32=False)
+            rms_norm_tiled(hidden, attn_norm_weight, attn_input, norm_block, norm_tokens, output_fp32=False, compensated=False)
     prefill_c1a_full_attention(
         attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, request_ids, compressed_lens, index_cache, index_cache_scale, index_block_table, compressed_rope_cos, compressed_rope_sin, compressor_wkv, compressor_norm_weight, compressed_slots, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale, index_weights_proj, topk_indices, pool_block_ids, pool_block_counts, output_window, output_arrived, attn_out, group_base, tp_rank, num_tokens, attention_epoch, scatter_output=False,
     )

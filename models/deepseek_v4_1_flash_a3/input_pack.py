@@ -132,6 +132,47 @@ def l2_input_pack(
     return pack_x_hc(input_ids, embed_weight, x_hc)
 
 
+@pl.jit
+def _validate_row_metadata(
+    source: pl.Tensor[[16, 32], pl.FP32],
+    ids: pl.Tensor[[16], pl.INT32],
+    positions: pl.Tensor[[16], pl.INT32],
+    output: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+    c1a: pl.Out[pl.Tensor[[16], pl.INT32]],
+    c2a: pl.Out[pl.Tensor[[16], pl.INT32]],
+):
+    ready = pl.system.task_dummy(deps=[])
+    gather_rows(source, ids, output, ready, 32)
+    prepare_compressed_lens(positions, c1a, 0)
+    prepare_compressed_lens(positions, c2a, 1)
+    return output, c1a, c2a
+
+
+def validate_row_metadata(config, compile_only):
+    import torch
+    from golden import TensorSpec, run
+
+    ids = torch.tensor([3, 2, 2, -1, *range(4, 16)], dtype=torch.int32)
+    positions = torch.tensor([-1, 0, 1, 2, *range(122, 134)], dtype=torch.int32)
+    source = torch.arange(512, dtype=torch.float32).reshape(16, 32)
+
+    def golden(tensors):
+        values = source[ids.clamp_min(0).long()]
+        values[ids < 0] = 0
+        tensors["output"].copy_(values)
+        tensors["c1a"].copy_(positions + 1)
+        tensors["c2a"].copy_((positions + 1) // 2)
+
+    specs = [TensorSpec(name, list(t.shape), t.dtype, init_value=t)
+             for name, t in (("source", source), ("ids", ids), ("positions", positions))]
+    specs.extend((TensorSpec("output", [16, 32], torch.float32),
+                  TensorSpec("c1a", [16], torch.int32), TensorSpec("c2a", [16], torch.int32)))
+    result = run(fn=_validate_row_metadata, specs=specs, golden_fn=golden, config=config,
+                 compile_only=compile_only, rtol=0, atol=0)
+    if not result.passed:
+        raise SystemExit(result.error or 1)
+
+
 def golden_pack_x_hc(tensors):
     vocab_size = tensors["embed_weight"].shape[0]
     safe_ids = tensors["input_ids"].long().clamp(0, vocab_size - 1)
@@ -195,3 +236,5 @@ if __name__ == "__main__":
     )
     if not result.passed:
         raise SystemExit(result.error or 1)
+    validate_row_metadata(dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
+                          args.compile_only)

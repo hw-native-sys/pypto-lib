@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from .activation_quant import (
-    DECODE_QUANT_REDUCE_TILE, _decode_checkpoint_codes, _quantize_projection_activation_into,
+    DECODE_QUANT_REDUCE_TILE, _checkpoint_codes, _quantize_projection_activation_into,
 )
 from .config import FLASH as M
 from .dsl_types import SP_T_DYN, T_DYN
@@ -1194,13 +1194,15 @@ def hc_head_norm_quantize_decode(
                     pl.store(pl.reshape(inactive, [8, 1]), [8, 0], scale)
                     denominator = pl.mul(pl.maximum(maximum, 127e-30), 1.0 / 128.0)
                     reciprocal = pl.recip(denominator)
-                    codes = _decode_checkpoint_codes(fp32, denominator, reciprocal)
+                    codes = _checkpoint_codes(fp32, denominator, reciprocal)
                     pl.store(pl.reshape(codes, [1, D]), [0, 0], payload)
                 else:
                     col = (worker - 1) * DECODE_QUANT_REDUCE_TILE
                     pad = pl.cast(pl.tile.full([8, DECODE_QUANT_REDUCE_TILE], dtype=pl.FP32, value=0.0), pl.INT8, mode="rint")
                     pl.store(pl.set_validshape(pad, 7, DECODE_QUANT_REDUCE_TILE), [1, col], payload)
                     pl.store(pad, [8, col], payload)
+        if zero_padding:
+            zero_bf16_padding(output, num_tokens)
     else:
         ready = hc_head_norm_adaptive(x_hc, pre_mix, norm_weight, output, num_tokens)
         if zero_padding:
@@ -1664,11 +1666,8 @@ def prefill_sp_post(
                     hidden = pl.cast(
                         sublayer[row:row + 1, col:col + PREFILL_POST_D_TILE], pl.FP32
                     )
-                    update = pl.mul(hidden, pl.read(post_mix, [row, out_h]))
-                    lane0 = residual_flat[row:row + 1, col:col + PREFILL_POST_D_TILE]
-                    value = pl.mul(lane0, pl.read(mix_flat, [row, out_h]))
-                    for index in pl.unroll(HC_MULT - 1):
-                        in_h = index + 1
+                    value = pl.mul(hidden, pl.read(post_mix, [row, out_h]))
+                    for in_h in pl.unroll(HC_MULT):
                         lane = residual_flat[
                             row:row + 1,
                             in_h * D + col:in_h * D + col + PREFILL_POST_D_TILE,
@@ -1677,7 +1676,6 @@ def prefill_sp_post(
                             value,
                             pl.mul(lane, pl.read(mix_flat, [row, in_h * HC_MULT + out_h])),
                         )
-                    value = pl.add(value, update)
                 output_flat[
                     row:row + 1,
                     out_h * D + col:out_h * D + col + PREFILL_POST_D_TILE,

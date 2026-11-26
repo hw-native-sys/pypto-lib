@@ -12,9 +12,13 @@ for file in $FILES; do
   test -f "$file"
   ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$file" | head -1 || true)
   ndev=${ndev:-1}
-  printf -v command 'cd %q && source activate.sh && PYPTO_BENCH=0 PYPTO_LOG_LEVEL=error PYPTO_WARNING_LEVEL=none PYPTO_RUNTIME_LOG=error PYTHONPATH=%q python %q -p %q' \
+  printf -v command 'cd %q && source activate.sh && PYPTO_BENCH=0 PYPTO_LOG_LEVEL=error PYPTO_WARNING_LEVEL=none PYPTO_RUNTIME_LOG=error PYTHONPATH=%q"${PYTHONPATH:+:$PYTHONPATH}" python %q -p %q' \
     "$PWD" "$PWD" "$file" "$PLATFORM"
-  if grep -Eq '^#[[:space:]]*ci:[[:space:]]*compile-only[[:space:]]*$' "$file"; then
+  compile_case=$(sed -nE 's/^#[[:space:]]*ci:[[:space:]]*(compile-only([[:space:]].*)?)$/\1/p' "$file" | head -1)
+  if [ -n "$compile_case" ]; then
+    read -ra compile_args <<< "--$compile_case"
+    printf -v flags ' %q' "${compile_args[@]}"
+    command+="$flags"
     device_flags=(--no-device)
   else
     device_flags=(--device auto)

@@ -156,7 +156,7 @@ def golden_l2_expert_routed(tensors):
     tensors["output"][:count].copy_(projected)
 
 
-VALIDATION_ROWS = PREFILL_FUSED_MAX_ROWS
+VALIDATION_ROWS = PREFILL_FUSED_MAX_ROWS + 16
 
 
 @pl.jit
@@ -199,7 +199,7 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint', type=Path)
     parser.add_argument('--layer', type=int, choices=range(M.num_hidden_layers), default=0)
     parser.add_argument('--expert', type=int, choices=range(M.n_routed_experts))
-    parser.add_argument('--num-tokens', type=int, choices=range(1, VALIDATION_ROWS + 1), default=17)
+    parser.add_argument('--num-tokens', type=int, choices=range(1, VALIDATION_ROWS + 1))
     parser.add_argument('--compile-only', action='store_true')
     parser.add_argument('--report', type=Path)
     args = parser.parse_args()
@@ -208,12 +208,6 @@ if __name__ == '__main__':
     hidden[0].zero_()
     source = golden_activation_int8(hidden)
     factor = (hidden.float().abs().amax(-1) / 127).clamp_min(1e-30).reshape(VALIDATION_ROWS, 1)
-    route_weights = torch.zeros(1, VALIDATION_ROWS)
-    route_weights[0, :args.num_tokens] = torch.linspace(0, 1.5, args.num_tokens)
-    if args.num_tokens == 1:
-        route_weights[0, 0] = 1.0
-        source[0].fill_(1)
-        factor[0] = 0.01
     reports = []
     if args.checkpoint:
         from .weights import Checkpoint, ResidentWeights
@@ -223,7 +217,7 @@ if __name__ == '__main__':
     if args.expert is not None:
         experts = (args.expert,)
     for expert in experts:
-        values = {'source': source, 'source_scale': factor, 'route_weights': route_weights}
+        matrices = {}
         for number, width, columns in ((1, D, MOE_INTER), (3, D, MOE_INTER), (2, MOE_INTER, D)):
             if args.checkpoint:
                 stem = f'layers.{args.layer}.ffn.experts.{expert}.w{number}'
@@ -231,10 +225,20 @@ if __name__ == '__main__':
             else:
                 weight = torch.randint(-127, 128, (columns, width), dtype=torch.int8, generator=gen)
                 scale = torch.full((1, columns), 0.02 / 127)
-            values[f'w{number}'], values[f'scale{number}'] = weight, scale
-        values['counts'] = torch.tensor([args.num_tokens], dtype=torch.int32)
-        inputs = [TensorSpec(name, list(value.shape), value.dtype, init_value=value) for name, value in values.items()]
-        for phase in ("decode", "prefill"):
+            matrices[f'w{number}'], matrices[f'scale{number}'] = weight, scale
+        cases = [("decode", args.num_tokens or 17), ("prefill", args.num_tokens or 17)]
+        if args.num_tokens is None:
+            cases.append(("prefill", PREFILL_FUSED_MAX_ROWS + 1))
+        for phase, count in cases:
+            route_weights = torch.zeros(1, VALIDATION_ROWS)
+            route_weights[0, :count] = torch.linspace(0, 1.5, count)
+            if count == 1:
+                route_weights[0, 0] = 1.0
+                source[0].fill_(1)
+                factor[0] = 0.01
+            values = dict(source=source, source_scale=factor, route_weights=route_weights, **matrices)
+            values["counts"] = torch.tensor([count], dtype=torch.int32)
+            inputs = [TensorSpec(name, list(value.shape), value.dtype, init_value=value) for name, value in values.items()]
             specs = [
                 *inputs,
                 ScalarSpec("prefill", torch.int32, int(phase == "prefill")),
@@ -249,7 +253,7 @@ if __name__ == '__main__':
                 config={"backend_type": args.platform, "execution_mode": args.sim, "device_id": args.device},
                 compile_only=args.compile_only,
             )
-            reports.append(dict(layer=args.layer, expert=expert, phase=phase, passed=result.passed,
+            reports.append(dict(layer=args.layer, expert=expert, phase=phase, count=count, passed=result.passed,
                                 compile_only=args.compile_only, build=str(result.work_dir)))
             if args.report:
                 args.report.write_text(json.dumps(reports, indent=2) + "\n")

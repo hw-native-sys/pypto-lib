@@ -120,9 +120,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--execution-log", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument("--devices", help="Physical device IDs in launch rank order, comma separated")
     args = parser.parse_args()
     report = json.loads(args.report.read_text())
-    report["device_timings"] = rank_timings(args.execution_log, dp_rank=report.get("dp_rank", 0))
+    devices = args.devices if args.devices is not None else report.get("devices", list(range(16)))
+    if isinstance(devices, str):
+        devices = [int(item) for item in devices.split(",")]
+    if len(devices) != 16 or len(set(devices)) != 16:
+        parser.error("expected sixteen distinct devices in launch rank order")
+    report["device_timings"] = rank_timings(args.execution_log, devices=devices, dp_rank=report.get("dp_rank", 0))
     args.report.write_text(json.dumps(report, indent=2) + "\n")
 
 

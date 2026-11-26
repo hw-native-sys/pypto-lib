@@ -17,6 +17,7 @@ K_TILE = 256
 VEC_M_TILE = 8
 PREFILL_QUANT_WORKERS = 48
 QUANT_REDUCE_TILE = 1024
+CHECKPOINT_COLUMNS = pl.dynamic("CHECKPOINT_QUANT_COLUMNS")
 CHECKPOINT_ROWS = pl.dynamic("CHECKPOINT_QUANT_ROWS")
 _TILE_RSQRT_HAS_HIGH_PRECISION = "high_precision" in inspect.signature(pl.tile.rsqrt).parameters
 
@@ -38,7 +39,7 @@ else:
 
 @pl.jit.inline(auto_scope=False)
 def _checkpoint_codes(
-    value: pl.Tile[[CHECKPOINT_ROWS, K_TILE], pl.FP32],
+    value: pl.Tile[[CHECKPOINT_ROWS, CHECKPOINT_COLUMNS], pl.FP32],
     denominator: pl.Tile[[CHECKPOINT_ROWS, 1], pl.FP32],
     inverse: pl.Tile[[CHECKPOINT_ROWS, 1], pl.FP32],
 ):
@@ -217,34 +218,6 @@ def normalize_quantize_prefill_projection(
 DECODE_QUANT_ENCODE_TILE = 256
 DECODE_QUANT_REDUCE_TILE = 1024
 DECODE_HIDDEN_WIDTH = pl.dynamic("DECODE_HIDDEN_WIDTH")
-DECODE_CODE_COLUMNS = pl.dynamic("DECODE_CODE_COLUMNS")
-
-
-@pl.jit.inline(auto_scope=False)
-def _decode_checkpoint_codes(
-    value: pl.Tile[[8, DECODE_CODE_COLUMNS], pl.FP32],
-    denominator: pl.Tile[[8, 1], pl.FP32],
-    inverse: pl.Tile[[8, 1], pl.FP32],
-):
-    """Encode one live Decode row with the checkpoint midpoint rule."""
-    magnitude = pl.abs(value)
-    scaled_magnitude = pl.mul(magnitude, 127.0 / 128.0)
-    estimate = pl.row_expand_mul(scaled_magnitude, inverse)
-    floor_int = pl.cast(pl.minimum(estimate, 127.0), pl.INT32, mode="floor")
-    lower = pl.cast(floor_int, pl.FP32)
-    midpoint = pl.row_expand_mul(pl.add(lower, 0.5), denominator)
-    upper = pl.add(lower, 1.0)
-    nearest = pl.tile.select(pl.tile.cmp(scaled_magnitude, midpoint, cmp_type=4), upper, lower)
-    odd = pl.cast(pl.ands(pl.cast(lower, pl.INT16), 1), pl.FP32)
-    nearest = pl.tile.select(
-        pl.tile.cmp(scaled_magnitude, midpoint, cmp_type=0),
-        pl.add(lower, odd),
-        nearest,
-    )
-    signed = pl.tile.select(pl.tile.cmps(value, 0.0, cmp_type=2), pl.neg(nearest), nearest)
-    return pl.cast(signed, pl.INT8, mode="rint")
-
-
 @pl.jit.inline(auto_scope=False)
 def _quantize_decode_active_row(
     source: pl.Tensor,
@@ -280,7 +253,7 @@ def _quantize_decode_active_row(
                 pl.reshape(pl.load(source, [0, col], [1, DECODE_QUANT_ENCODE_TILE]), [8, DECODE_QUANT_ENCODE_TILE // 8]),
                 pl.FP32,
             )
-            codes = _decode_checkpoint_codes(value, denominator, inverse)
+            codes = _checkpoint_codes(value, denominator, inverse)
             pl.store(pl.reshape(codes, [1, DECODE_QUANT_ENCODE_TILE]), [0, col], payload)
             padding = pl.cast(
                 pl.tile.full([8, DECODE_QUANT_ENCODE_TILE], dtype=pl.FP32, value=0.0),
@@ -330,7 +303,7 @@ def _quantize_decode_wide_row(
                 panel = pl.load(source, [0, column], [1, width // 2])
                 panel_rows = pl.reshape(panel, [8, width // 16])
                 activation = pl.cast(panel_rows, pl.FP32)
-                encoded = _decode_checkpoint_codes(activation, denominator, inverse)
+                encoded = _checkpoint_codes(activation, denominator, inverse)
                 pl.store(pl.reshape(encoded, [1, width // 2]), [0, column], payload)
             else:
                 column = (worker - 2) * DECODE_QUANT_REDUCE_TILE
@@ -381,7 +354,7 @@ def _quantize_decode_wide_pair(
                 inverse = pl.recip(denominator)
                 panel = pl.load(source, [row, col], [1, width // 2])
                 value = pl.cast(pl.reshape(panel, [8, width // 16]), pl.FP32)
-                encoded = _decode_checkpoint_codes(value, denominator, inverse)
+                encoded = _checkpoint_codes(value, denominator, inverse)
                 pl.store(pl.reshape(encoded, [1, (width // 2)]), [row, col], payload)
             else:
                 col = (worker - 4) * DECODE_QUANT_ENCODE_TILE
@@ -539,7 +512,7 @@ def _normalize_quantize_projection_row(
                 inverse = pl.recip(broadcast)
                 live = pl.tile.slice(quantized, [1, width], [0, 0])
                 chunks = pl.reshape(live, [VEC_M_TILE, width // VEC_M_TILE])
-                encoded = _decode_checkpoint_codes(chunks, broadcast, inverse)
+                encoded = _checkpoint_codes(chunks, broadcast, inverse)
                 pl.store(pl.reshape(encoded, [1, width]), [0, 0], payload)
                 pl.store(pl.set_validshape(padding, VEC_M_TILE - 1, width), [1, 0], payload)
             else:

@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: compile-only
+# ci: compile-only --prepare-windows --context-capacity 256 --request-slots-per-dp 2 --decode-capacity 16
 # ci: no-sim
 """DeepSeek-V4.1-Flash 40-layer decode with final HC, RMSNorm, logits and greedy sampling."""
 
@@ -24,7 +24,7 @@ import pypto.language.distributed as pld
 from . import config as C
 from .driver import forward_validation_argv, main
 
-_argv = forward_validation_argv(sys.argv[1:], mode="decode") if __name__ == "__main__" else sys.argv[1:]
+_argv = forward_validation_argv(sys.argv[1:], mode="decode") if __name__ == "__main__" else []
 _shape_parser = argparse.ArgumentParser(add_help=False)
 _shape_parser.add_argument("--decode-capacity", type=int, choices=[16, C.DECODE_INPUT_MAX_TOKENS],
                            default=C.DECODE_INPUT_MAX_TOKENS)

@@ -590,7 +590,7 @@ def decode_tp_output_post(
 
 
 # Standalone validation shapes.
-VALIDATION_ROWS = 32
+VALIDATION_ROWS = 144
 
 
 @pl.jit
@@ -724,7 +724,7 @@ if __name__ == "__main__":
         from .weights import Checkpoint
 
         checkpoint = Checkpoint(args.checkpoint)
-    phase_cases = (("prefill", (17,), l2_prefill_o_proj), ("decode-swa", (1, 3), l2_decode_swa_o_proj))
+    phase_cases = (("prefill", (17, 129), l2_prefill_o_proj), ("decode-swa", (1, 3), l2_decode_swa_o_proj))
     if args.tp_rank is not None:
         lanes = [args.tp_rank]
     else:

@@ -154,13 +154,14 @@ def _device_parser():
 
 
 def forward_validation_argv(argv, *, mode):
-    """Supply the bounded compile case when invoked with only common CI options."""
+    """Use the numerical Prefill smoke case by default and bound explicit CI compilations."""
     _, remaining = _device_parser().parse_known_args(argv)
+    if mode == "prefill" and remaining in ([], ["--sim"]):
+        return [*argv, "--validate-replay"]
     if remaining:
         return argv
-    capacity_flag = "--capacity" if mode == "prefill" else "--decode-capacity"
     return [*argv, "--compile-only", "--prepare-windows", "--context-capacity", "256",
-            "--request-slots-per-dp", "2", capacity_flag, "16"]
+            "--request-slots-per-dp", "2", "--decode-capacity", "16"]
 
 
 def main(function, *, mode, capacity, slab_rows=None, argv=None):
@@ -307,6 +308,7 @@ def main(function, *, mode, capacity, slab_rows=None, argv=None):
         if args.dump_logits and args.save_logits is None:
             args.save_logits = result_dir / "logits.pt"
     report = generate(args, devices, manifests=manifests)
+    report["devices"] = devices
     if args.execution_log:
         from .telemetry import rank_timings
 

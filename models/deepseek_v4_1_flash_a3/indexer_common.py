@@ -104,6 +104,52 @@ def sort_candidate_short_leaf(
     pl.store(top_pairs, [output_slot, 0], arena)
 
 
+@pl.jit.inline(auto_scope=False)
+def rank_candidate_blocks(
+    block_scores: pl.Tensor, arena: pl.Tensor, token: pl.Scalar[pl.INDEX],
+    visible: pl.Scalar[pl.INDEX], capacity: pl.Scalar[pl.INDEX], max_leaves: pl.constexpr,
+):
+    """Rank visible blocks by score, then emit selected IDs in logical order."""
+    visible_blocks = (visible + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+    arena_base = token * max_leaves
+    count = 0
+    if visible_blocks > 0 and visible_blocks <= CANDIDATE_SHORT_LEAF_TILE:
+        sort_candidate_short_leaf(block_scores, arena, token, visible_blocks, arena_base)
+        count = 1
+    elif visible_blocks > 0:
+        leaf_count = (visible_blocks + CANDIDATE_LEAF_TILE - 1) // CANDIDATE_LEAF_TILE
+        for leaf in pl.range(leaf_count):
+            block_begin = leaf * CANDIDATE_LEAF_TILE
+            valid_count = pl.min(CANDIDATE_LEAF_TILE, visible_blocks - block_begin)
+            sort_candidate_leaf(block_scores, arena, token, block_begin, valid_count, arena_base + leaf)
+        count = leaf_count
+    if count > 1:
+        count = merge_candidate_level(arena, arena_base, count)
+    if count > 1:
+        count = merge_candidate_level(arena, arena_base, count)
+    if count > 1:
+        count = merge_candidate_level(arena, arena_base, count)
+    if count > 1:
+        count = merge_candidate_level(arena, arena_base, count)
+
+    selected_count = pl.min(pl.min(visible_blocks, CANDIDATE_TOPK_BLOCKS), capacity)
+    ordered_scores = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.FP32, value=-1e30)
+    ordered_indices = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32, value=-1)
+    if selected_count > 0:
+        root = pl.load(arena, [arena_base, 0], [1, CANDIDATE_PAIR_WIDTH])
+        selected = pl.tile.gather_mask(root, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+        for lane in pl.range(selected_count):
+            block_id = pl.tile.read(selected, [0, lane])
+            pl.tile.write(ordered_scores, [0, lane], -pl.cast(pl.cast(block_id, pl.INT32), pl.FP32))
+            pl.tile.write(ordered_indices, [0, lane], block_id)
+    ordered = pl.tile.sort32(ordered_scores, pl.reinterpret_view(ordered_indices, pl.UINT32))
+    ordered = pl.tile.mrgsort(ordered, block_len=64)
+    ordered = pl.tile.mrgsort(ordered, block_len=256)
+    ordered = pl.tile.mrgsort(ordered, block_len=1024)
+    sorted_ids = pl.tile.gather_mask(ordered, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+    return sorted_ids
+
+
 def index_pool_block_capacity(score_width: int) -> int:
     """Return the aligned compact-pool capacity for one score row."""
     if score_width < 0:

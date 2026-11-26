@@ -312,6 +312,22 @@ def l2_engram(
     return output
 
 
+@pl.jit(auto_scope=False)
+def l2_prefill_engram(
+    lookup: pl.Tensor[[T_DYN, ENGRAM_K], pl.BF16],
+    wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.BF16, pl.NZ],
+    weight: pl.Tensor[[HC_MULT, D], pl.FP32],
+    rotation: pl.Tensor[[D // 32, 32, 32], pl.FP32],
+    source: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    output: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+):
+    lookup.bind_dynamic(0, T_DYN)
+    source.bind_dynamic(0, T_DYN)
+    output.bind_dynamic(0, T_DYN)
+    prefill_engram_from_rows(lookup, wkv_weight, weight, rotation, source, output)
+    return output
+
+
 def golden_engram(tensors, *, packed_weight=False):
     """Project real host rows, unrotate queries and gate the rotated value residual."""
     source = tensors["source"].float()
@@ -554,18 +570,19 @@ if __name__ == "__main__":
                 TensorSpec("source", [tokens, HC_MULT, D], torch.float32, init_value=source),
                 TensorSpec("output", [tokens, HC_MULT, D], torch.float32),
             ]
-            result = run(
-                fn=l2_engram,
-                specs=specs,
-                golden_fn=partial(golden_engram, packed_weight=True),
-                compare_fn={"output": ratio_allclose(atol=0.003, rtol=0.03, max_error_ratio=0.005)},
-                config=config,
-                compile_only=args.compile_only,
-                save_data=checkpoint is not None,
-            )
-            if not result.passed:
-                raise RuntimeError(result.error)
-            records.append(dict(layer=layer, tokens=tokens, passed=result.passed, work_dir=str(result.work_dir)))
+            for phase, entry in (("decode", l2_engram), ("prefill", l2_prefill_engram)):
+                result = run(
+                    fn=entry,
+                    specs=specs,
+                    golden_fn=partial(golden_engram, packed_weight=True),
+                    compare_fn={"output": ratio_allclose(atol=0.003, rtol=0.03, max_error_ratio=0.005)},
+                    config=config,
+                    compile_only=args.compile_only,
+                    save_data=checkpoint is not None,
+                )
+                if not result.passed:
+                    raise RuntimeError(result.error)
+                records.append(dict(phase=phase, layer=layer, tokens=tokens, passed=result.passed, work_dir=str(result.work_dir)))
     if args.report:
         identity = checkpoint.identity if checkpoint is not None else "synthetic"
         args.report.write_text(json.dumps(dict(checkpoint=identity, cases=records), indent=2) + "\n")

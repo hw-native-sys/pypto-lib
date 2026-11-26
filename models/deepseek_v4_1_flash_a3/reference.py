@@ -320,6 +320,9 @@ class W8A8Reference:
         pre[:, 0] = 1
         for layer in range(M.num_hidden_layers):
             started = time.monotonic()
+            snapshot = None
+            if step == 0 and layer in self.save_layers:
+                snapshot = {"hidden_stage": "layer_input", "hidden": hidden.clone(), "pre_mix": pre.clone()}
             if layer in M.engram_layer_ids:
                 prefix = f"layers.{layer}.engram."
                 gate = self.tensor(prefix + "q_weight").float() * self.tensor(prefix + "k_weight").float()
@@ -328,9 +331,6 @@ class W8A8Reference:
                                    wkv_weight=self.tensor(prefix + "wkv.weight").t(), weight=gate,
                                    rotation=self.checkpoint.rotation_blocks(), output=result))
                 hidden = result
-            snapshot = None
-            if step == 0 and layer in self.save_layers:
-                snapshot = {"hidden": hidden.clone(), "pre_mix": pre.clone()}
             hidden, pre, counts = self.layer_forward(hidden, pre, layer, values)
             record = dict(step=step, layer=layer, route_count=int(counts.sum()), expert_counts=counts.tolist(),
                           seconds=time.monotonic() - started, residual_norm=float(hidden.norm()))

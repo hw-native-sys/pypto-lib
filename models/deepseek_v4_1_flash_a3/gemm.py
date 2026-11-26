@@ -111,7 +111,7 @@ def mx_mm_acc(
         right = pl.cast(pl.cast(b_group, pl.FP32), pl.BF16, mode="rint")
         product = pl.matmul(left, right)
         left_indices = pl.add(pl.mul(left_lanes, pl.cast(group_count, pl.INT32)), pl.cast(group, pl.INT32))
-        right_indices = pl.add(pl.mul(right_lanes, pl.cast(group_count, pl.INT32)), pl.cast(group, pl.INT32))
+        right_indices = pl.add(right_lanes, pl.cast(group * n, pl.INT32))
         left_scale = pl.tile.gather(left_factors, left_indices, left_tmp)
         left_scale = pl.reshape(left_scale, [m, 1])
         right_scale = pl.tile.gather(right_factors, right_indices, right_tmp)
@@ -791,7 +791,10 @@ def validate_bf16_dot(
 
 def golden_bf16_dot(tensors):
     """Evaluate the independent CPU FP32 attention score matrix."""
-    tensors["output"].copy_(tensors["query"].float() @ tensors["keys"].float().t())
+    query, keys = tensors["query"].float(), tensors["keys"].float()
+    output = tensors["output"].zero_()
+    for k in range(query.shape[1]):
+        output.add_(query[:, k:k + 1] * keys[:, k].unsqueeze(0))
 
 
 if __name__ == "__main__":

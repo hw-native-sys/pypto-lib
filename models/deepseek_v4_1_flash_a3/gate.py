@@ -384,7 +384,9 @@ def _gate_panel_from_fp32(
                     gp_neg_abs = pl.neg(gp_abs)
                     gp_exp_abs = pl.exp(gp_neg_abs)
                     gp_exp_plus = pl.add(gp_exp_abs, 1.0)
-                    gp_softplus_tail = pl.log(gp_exp_plus)
+                    # log(1 + t) loses tiny t in FP32. t - t^2/2 is its lower bound.
+                    gp_small = pl.mul(gp_exp_abs, pl.add(pl.mul(gp_exp_abs, -0.5), 1.0))
+                    gp_softplus_tail = pl.maximum(pl.log(gp_exp_plus), gp_small)
                     gp_softplus = pl.add(gp_relu, gp_softplus_tail)
                     gp_score = pl.sqrt(gp_softplus)
                     route_scores_buf = pl.store(gp_score, [t1, n0], route_scores_buf)
@@ -407,7 +409,9 @@ def _gate_panel_from_fp32(
                 expert_ids[:, :] = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
                 for decode_row in pl.range(decode_worker, active_tokens, decode_route_workers):
                     decode_logits = pl.slice(route_scores_buf, [1, SCORE_PAD], [decode_row, 0])
-                    decode_tail = pl.log(pl.add(pl.exp(pl.neg(pl.abs(decode_logits))), 1.0))
+                    decode_exp_abs = pl.exp(pl.neg(pl.abs(decode_logits)))
+                    decode_small = pl.mul(decode_exp_abs, pl.add(pl.mul(decode_exp_abs, -0.5), 1.0))
+                    decode_tail = pl.maximum(pl.log(pl.add(decode_exp_abs, 1.0)), decode_small)
                     decode_scores = pl.sqrt(pl.add(pl.maximum(decode_logits, 0.0), decode_tail))
                     biased = pl.create_tensor([1, SCORE_PAD], dtype=pl.FP32)
                     biased[:, :] = pl.add(decode_scores, gate_bias_matrix)
@@ -442,7 +446,9 @@ def _gate_panel_from_fp32(
                 biased_panel = pl.create_tensor([sort_tile, SCORE_PAD], dtype=pl.FP32)
                 if dense_prefill:
                     values = pl.slice(route_scores_buf, [sort_tile, SCORE_PAD], [t1, 0])
-                    tail = pl.log(pl.add(pl.exp(pl.neg(pl.abs(values))), 1.0))
+                    exp_abs = pl.exp(pl.neg(pl.abs(values)))
+                    small = pl.mul(exp_abs, pl.add(pl.mul(exp_abs, -0.5), 1.0))
+                    tail = pl.maximum(pl.log(pl.add(exp_abs, 1.0)), small)
                     dense_scores[:, :] = pl.sqrt(pl.add(pl.maximum(values, 0.0), tail))
                     biased_panel[:, :] = pl.col_expand_add(dense_scores, gate_bias_matrix)
                 sr_idx_init = pl.create_tensor([1, SCORE_PAD], dtype=pl.UINT32)
@@ -551,6 +557,8 @@ if __name__ == "__main__":
     source = torch.randn(VALIDATION_ROWS, D, generator=torch.Generator().manual_seed(4103)).bfloat16()
     records = []
     cases = [("empty", 0), ("single", 1), ("tail", 17), ("full", VALIDATION_ROWS), ("ties", 17)]
+    if checkpoint is None:
+        cases.append(("negative-tail", 17))
     selected_rows = []
     if args.input_data is not None:
         if checkpoint is None:
@@ -571,8 +579,15 @@ if __name__ == "__main__":
     for label, count in cases:
         x = torch.zeros_like(source) if label == "ties" else source
         bias = torch.zeros_like(gate_bias) if label == "ties" else gate_bias
+        weight = gate_weight
+        if label == "negative-tail":
+            x = torch.zeros_like(source)
+            x[:, 0] = 1
+            weight = torch.zeros_like(gate_weight)
+            weight[:, 0] = torch.linspace(-32, -18, N_EXPERTS)
+            bias = torch.zeros_like(gate_bias)
         specs = [TensorSpec("source", [VALIDATION_ROWS, D], torch.bfloat16, init_value=x),
-                 TensorSpec("gate_weight", [N_EXPERTS, D], torch.float32, init_value=gate_weight),
+                 TensorSpec("gate_weight", [N_EXPERTS, D], torch.float32, init_value=weight),
                  TensorSpec("gate_bias", [N_EXPERTS], torch.float32, init_value=bias),
                  ScalarSpec("num_tokens", torch.int32, count),
                  TensorSpec("codes", [VALIDATION_ROWS, D], torch.int8),

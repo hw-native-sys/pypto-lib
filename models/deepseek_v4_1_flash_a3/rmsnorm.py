@@ -88,21 +88,10 @@ def rms_norm_tiled(
     block: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     output_fp32: pl.constexpr,
+    compensated: pl.constexpr,
 ):
     """Normalize eight rows with BF16 rounding and optional padded FP32 output."""
-    return _rms_norm_tiled(x, norm_w, x_normed, block, num_tokens, compensated=False, output_fp32=output_fp32)
-
-
-@pl.jit.inline(auto_scope=False)
-def rms_norm_tiled_compensated(
-    x: pl.Tensor,
-    norm_w: pl.Tensor[[D], pl.BF16],
-    x_normed: pl.Tensor,
-    block: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Normalize final projection inputs with compensated FP32 chunk sums."""
-    return _rms_norm_tiled(x, norm_w, x_normed, block, num_tokens, compensated=True, output_fp32=False)
+    return _rms_norm_tiled(x, norm_w, x_normed, block, num_tokens, compensated=compensated, output_fp32=output_fp32)
 
 
 @pl.jit.inline

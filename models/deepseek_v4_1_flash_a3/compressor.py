@@ -656,15 +656,21 @@ def l2_compressor(
     if ratio == 1:
         projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
         projected, projected_tid = c1a_compressor_project(source, wkv, projected, num_tokens, entry)
-        norm_tiles = (num_tokens + 7) // 8
-        norm_workers = pl.max(1, pl.min(norm_tiles, pl.system.available_aiv_count()))
-        with pl.spmd(norm_workers, name_hint="norm_cmp", deps=[projected_tid]) as normalized:
-            norm_worker = pl.tile.get_block_idx()
-            for worker in pl.range(norm_worker, norm_tiles, norm_workers):
-                rms_norm(projected, norm_weight, latent, worker, num_tokens, width=HEAD_DIM)
         rotated = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        compressor_rope(latent, cos, sin, rotated, num_tokens)
-        c1a_compressor_publish(rotated, slots, cache, scales, num_tokens, normalized)
+        if num_tokens <= 16:
+            _, decode_ready = decode_compressor_norm_rope(
+                projected, norm_weight, cos, sin, latent, rotated, num_tokens, projected_tid,
+            )
+            c1a_compressor_publish(rotated, slots, cache, scales, num_tokens, decode_ready)
+        else:
+            norm_tiles = (num_tokens + 7) // 8
+            norm_workers = pl.max(1, pl.min(norm_tiles, pl.system.available_aiv_count()))
+            with pl.spmd(norm_workers, name_hint="norm_cmp", deps=[projected_tid]) as normalized:
+                norm_worker = pl.tile.get_block_idx()
+                for worker in pl.range(norm_worker, norm_tiles, norm_workers):
+                    rms_norm(projected, norm_weight, latent, worker, num_tokens, width=HEAD_DIM)
+            compressor_rope(latent, cos, sin, rotated, num_tokens)
+            c1a_compressor_publish(rotated, slots, cache, scales, num_tokens, normalized)
     else:
         kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
         score = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)

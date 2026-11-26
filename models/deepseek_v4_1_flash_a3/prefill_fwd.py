@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: compile-only
+# ci: compile-only --prepare-windows --context-capacity 256 --request-slots-per-dp 2 --capacity 16
 # ci: no-sim
 """Compose the forty-layer W8A8 A3 prefill with TP4 heads and EP16 experts."""
 
@@ -27,7 +27,7 @@ from .sparse_attention import CACHE_MAX_ROWS, SELECTED_KEYS
 from . import config as C
 from .driver import PREFILL_MOE_SLAB_ROWS, default_prefill_slab_rows, forward_validation_argv, main
 
-_argv = forward_validation_argv(sys.argv[1:], mode="prefill") if __name__ == "__main__" else sys.argv[1:]
+_argv = forward_validation_argv(sys.argv[1:], mode="prefill") if __name__ == "__main__" else []
 _shape_parser = argparse.ArgumentParser(add_help=False)
 _shape_parser.add_argument("--checkpoint")
 _shape_parser.add_argument("--prefill-moe-slab-rows", type=int, choices=PREFILL_MOE_SLAB_ROWS)
@@ -109,6 +109,62 @@ TOPK = M.num_experts_per_tok
 ROUTED_RECV_ROWS = RANKS * MOE_TOKENS * TOPK
 
 ROPE_DIM = M.qk_rope_head_dim
+
+
+@pl.jit.inline
+def _hidden_slot(
+    boundary: pl.Scalar[pl.INDEX], first_layer: pl.Scalar[pl.INT32],
+    stage_layer: pl.Scalar[pl.INDEX], capacity: pl.constexpr,
+):
+    """Row offset of a layer boundary in the producing or consuming stage."""
+    slot = (boundary - first_layer) % 2
+    if stage_layer >= 20 and first_layer <= 20:
+        slot = 2 - boundary % 2
+    return slot * capacity
+
+
+@pl.jit
+def _validate_decoder_replay(
+    slots: pl.InOut[pl.Tensor[[48, 32], pl.FP32]],
+    row_ids: pl.Tensor[[16], pl.INT32],
+    first_layer: pl.Scalar[pl.INT32],
+    output: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+):
+    encoder = _hidden_slot(20, first_layer, 19, 16)
+    decoder = _hidden_slot(20, first_layer, 20, 16)
+    source = pl.slice(slots, [16, 32], [encoder, 0])
+    target = pl.slice(slots, [16, 32], [decoder, 0])
+    ready = pl.system.task_dummy(deps=[])
+    gather_rows(source, row_ids, target, ready, 32)
+    with pl.at(level=pl.Level.CORE_GROUP):
+        output[:, :] = target[:, :]
+    return output
+
+
+def validate_decoder_replay(device, *, sim=False):
+    """Compare the production slot selection and replay gather with independent CPU indexing."""
+    import torch
+    from golden import ScalarSpec, TensorSpec, run
+
+    rows = torch.tensor([1, 0, 1, -1, *range(15, 3, -1)], dtype=torch.int32)
+    slots = torch.arange(48 * 32, dtype=torch.float32).reshape(48, 32)
+    for start, source_base in ((0, 0), (19, 16), (20, 0)):
+        expected = slots[source_base + rows.clamp_min(0).long()].clone()
+        expected[rows < 0] = 0
+
+        def golden(tensors):
+            tensors["output"].copy_(expected)
+            tensors["slots"][32:].copy_(expected)
+
+        result = run(fn=_validate_decoder_replay, specs=[
+            TensorSpec("slots", [48, 32], torch.float32, init_value=slots.clone()),
+            TensorSpec("row_ids", [16], torch.int32, init_value=rows),
+            ScalarSpec("first_layer", torch.int32, start),
+            TensorSpec("output", [16, 32], torch.float32),
+        ], golden_fn=golden, config=dict(backend_type="a2a3", execution_mode=sim, device_id=device),
+            rtol=0.0, atol=0.0)
+        if not result.passed:
+            raise SystemExit(result.error or 1)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -622,12 +678,8 @@ def l2_prefill_fwd(
         shared_prefix = encoder_shared
         if stage == 1:
             shared_prefix = decoder_shared
-        current_slot = (2 * (stage - first_layer // 20) + (layer - first_layer) % 2) * CAPACITY
-        next_slot = (2 * (stage - first_layer // 20) + (layer - first_layer + 1) % 2) * CAPACITY
-        if current_slot == 3 * CAPACITY:
-            current_slot = CAPACITY
-        if next_slot == 3 * CAPACITY:
-            next_slot = CAPACITY
+        current_slot = _hidden_slot(layer, first_layer, layer, CAPACITY)
+        next_slot = _hidden_slot(layer + 1, first_layer, layer, CAPACITY)
         hidden = pl.slice(hidden_pair, [CAPACITY, HC_MULT, D], [current_slot, 0, 0])
         delayed_pre = pl.slice(pre_pair, [CAPACITY, HC_MULT], [current_slot, 0])
         next_hidden = pl.slice(hidden_pair, [CAPACITY, HC_MULT, D], [next_slot, 0, 0])
@@ -682,8 +734,9 @@ def l2_prefill_fwd(
         if layer == 20:
             with pl.scope():
                 # Publish C1A source KV for ALL encoder rows before selecting replay.
-                encoder_hidden = pl.slice(hidden_pair, [CAPACITY, HC_MULT, D], [0, 0, 0])
-                encoder_pre = pl.slice(pre_pair, [CAPACITY, HC_MULT], [0, 0])
+                encoder_slot = _hidden_slot(layer, first_layer, layer - 1, CAPACITY)
+                encoder_hidden = pl.slice(hidden_pair, [CAPACITY, HC_MULT, D], [encoder_slot, 0, 0])
+                encoder_pre = pl.slice(pre_pair, [CAPACITY, HC_MULT], [encoder_slot, 0])
                 encoder_collapsed = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
                 encoder_normalized = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
                 hc_head(encoder_hidden, encoder_pre, encoder_collapsed)
@@ -699,61 +752,59 @@ def l2_prefill_fwd(
                 source_hidden = pl.reshape(encoder_hidden, [CAPACITY, HC_DIM])
                 gather_rows(source_hidden, replay_rows, gathered_hidden, publisher_ready, D)
                 gather_rows(encoder_pre, replay_rows, delayed_pre, publisher_ready, HIDDEN_TILE)
-        # Empty source rounds consume zeros. Materialize the observable attention output on the final layer.
-        if active > 0 or layer + 1 == last_layer:
-            if layer == 1 or layer == 14:
-                with pl.scope():
-                    engram_slot = layer // 14
-                    prefill_engram_from_rows(
-                        engram_lookup[engram_slot], engram_wkv[engram_slot], engram_weight[engram_slot], engram_rotation, hidden, hidden,
-                    )
+        if layer == 1 or layer == 14:
             with pl.scope():
-                attn_post = pl.create_tensor([CAPACITY, HC_MULT], dtype=pl.FP32)
-                attn_residual = pl.create_tensor([CAPACITY, HC_MULT, HC_MULT], dtype=pl.FP32)
-                collapsed = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
-                normalized = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
-                attn_output = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
-                hc_pre(
-                    hidden, delayed_pre, layer_attn_fn, layer_attn_scale, layer_attn_base,
-                    collapsed, attn_pre, attn_post, attn_residual,
-                    prefill=True,
+                engram_slot = layer // 14
+                prefill_engram_from_rows(
+                    engram_lookup[engram_slot], engram_wkv[engram_slot], engram_weight[engram_slot], engram_rotation, hidden, hidden,
                 )
-                norm_tokens = pl.tensor.dim(collapsed, 0)
-                prefill_rms_norm(collapsed, layer_attn_norm, normalized, norm_tokens)
-                mode = 0
-                cache_slot = 0
-                rope_slot = 0
-                if layer >= 20:
-                    cache_slot = 3
-                    rope_slot = 2
-                    mode = 5
-                    if layer == 20:
+        with pl.scope():
+            attn_post = pl.create_tensor([CAPACITY, HC_MULT], dtype=pl.FP32)
+            attn_residual = pl.create_tensor([CAPACITY, HC_MULT, HC_MULT], dtype=pl.FP32)
+            collapsed = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
+            normalized = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
+            attn_output = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
+            hc_pre(
+                hidden, delayed_pre, layer_attn_fn, layer_attn_scale, layer_attn_base,
+                collapsed, attn_pre, attn_post, attn_residual,
+                prefill=True,
+            )
+            norm_tokens = pl.tensor.dim(collapsed, 0)
+            prefill_rms_norm(collapsed, layer_attn_norm, normalized, norm_tokens)
+            mode = 0
+            cache_slot = 0
+            rope_slot = 0
+            if layer >= 20:
+                cache_slot = 3
+                rope_slot = 2
+                mode = 5
+                if layer == 20:
+                    mode = 3
+                elif layer % 4 == 0:
+                    mode = 4
+                    # A pool published in this replay contains every causal block when all fit.
+                    history_blocks = pl.tensor.dim(c1a_index_block_table, 1) * 128 // POOL_BLOCK_SIZE
+                    if first_layer <= 20 and history_blocks <= pl.tensor.dim(pool_block_ids, 1) and history_blocks <= INDEX_POOL_BLOCKS:
                         mode = 3
-                    elif layer % 4 == 0:
-                        mode = 4
-                        # A pool published in this replay contains every causal block when all fit.
-                        history_blocks = pl.tensor.dim(c1a_index_block_table, 1) * 128 // POOL_BLOCK_SIZE
-                        if first_layer <= 20 and history_blocks <= pl.tensor.dim(pool_block_ids, 1) and history_blocks <= INDEX_POOL_BLOCKS:
-                            mode = 3
-                elif layer >= 2:
-                    cache_slot = (layer - 2) // 6
-                    rope_slot = 1
-                    mode = 2
-                    if (layer - 2) % 6 == 0:
-                        mode = 1
-                state_slot = pl.min(cache_slot, 2)
-                if active > 0:
-                    prefill_attention(
-                        normalized, layer_wq_a, layer_wq_a_scale, layer_q_norm, layer_wq_b, layer_wq_b_scale, layer_wkv, layer_wkv_scale, layer_kv_norm, layer_attn_sink, layer_wo_a, layer_wo_b, rope_cos[rope_slot], rope_sin[rope_slot], window_slots[stage], window_indices[stage], window_cache[layer], window_scales[layer], compressed_cache[cache_slot], compressed_scales[cache_slot], token_to_req_indices[stage], c2a_compressed_lens, c1a_compressed_lens, index_cache[cache_slot], index_scales[cache_slot], c2a_index_block_table, c1a_index_block_table, position_ids[stage], compressed_cos, compressed_sin, layer_compressor_wkv, layer_compressor_wgate, query_start_loc[stage], state_block_table, state_cache[state_slot], layer_compressor_norm, c2a_compressed_slots, layer_index_wk, layer_index_norm, layer_index_wq_b, layer_index_wq_b_scale, layer_index_weights, pool_block_ids, pool_block_counts, topk_indices, attention_window, attention_arrived, attn_output, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, active, layer - first_layer + 1, mode, shared_prefix,
-                    )
-                else:
-                    zero_bf16_padding(attn_output, pl.cast(0, pl.INT32))
-                hc_post_deps = pl.array.create(2, pl.TASK_ID)
-                hc_post_deps[0] = moe_ready
-                hc_post(
-                    attn_output, hidden, attn_post, attn_residual, attn_hidden,
-                    deps=hc_post_deps, prefill=True,
+            elif layer >= 2:
+                cache_slot = (layer - 2) // 6
+                rope_slot = 1
+                mode = 2
+                if (layer - 2) % 6 == 0:
+                    mode = 1
+            state_slot = pl.min(cache_slot, 2)
+            if active > 0:
+                prefill_attention(
+                    normalized, layer_wq_a, layer_wq_a_scale, layer_q_norm, layer_wq_b, layer_wq_b_scale, layer_wkv, layer_wkv_scale, layer_kv_norm, layer_attn_sink, layer_wo_a, layer_wo_b, rope_cos[rope_slot], rope_sin[rope_slot], window_slots[stage], window_indices[stage], window_cache[layer], window_scales[layer], compressed_cache[cache_slot], compressed_scales[cache_slot], token_to_req_indices[stage], c2a_compressed_lens, c1a_compressed_lens, index_cache[cache_slot], index_scales[cache_slot], c2a_index_block_table, c1a_index_block_table, position_ids[stage], compressed_cos, compressed_sin, layer_compressor_wkv, layer_compressor_wgate, query_start_loc[stage], state_block_table, state_cache[state_slot], layer_compressor_norm, c2a_compressed_slots, layer_index_wk, layer_index_norm, layer_index_wq_b, layer_index_wq_b_scale, layer_index_weights, pool_block_ids, pool_block_counts, topk_indices, attention_window, attention_arrived, attn_output, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, active, layer - first_layer + 1, mode, shared_prefix,
                 )
+            else:
+                zero_bf16_padding(attn_output, pl.cast(0, pl.INT32))
+            hc_post_deps = pl.array.create(2, pl.TASK_ID)
+            hc_post_deps[0] = moe_ready
+            hc_post(
+                attn_output, hidden, attn_post, attn_residual, attn_hidden,
+                deps=hc_post_deps, prefill=True,
+            )
         moe_ready = _prefill_moe(
             attn_hidden, attn_pre, layer_ffn_fn, layer_ffn_scale, layer_ffn_base, layer_ffn_norm, layer_gate_weight, layer_gate_bias,
             layer_routed_w1, layer_routed_w1_scale, layer_routed_w2, layer_routed_w2_scale, layer_routed_w3, layer_routed_w3_scale,
@@ -765,9 +816,7 @@ def l2_prefill_fwd(
             moe_gate_inputs, owner_payload, owner_scales, moe_route_indices[layer], moe_route_weights[layer],
             moe_ready, active, rank, layer - first_layer + 1, ffn_window, ffn_arrived,
         )
-    final_slot = (2 * ((last_layer - 1) // 20 - first_layer // 20) + (last_layer - first_layer) % 2) * CAPACITY
-    if final_slot == 3 * CAPACITY:
-        final_slot = CAPACITY
+    final_slot = _hidden_slot(last_layer, first_layer, last_layer - 1, CAPACITY)
     final_hidden = pl.slice(hidden_pair, [CAPACITY, HC_MULT, D], [final_slot, 0, 0])
     final_pre = pl.slice(pre_pair, [CAPACITY, HC_MULT], [final_slot, 0])
     source_hidden = pl.reshape(final_hidden, [CAPACITY, HC_DIM])
@@ -1006,8 +1055,17 @@ def l3_prefill_fwd(
 
 
 def validate():
-    """Compile the bounded packed Prefill graph by default."""
-    main(l3_prefill_fwd, mode="prefill", capacity=CAPACITY, slab_rows=MOE_TOKENS, argv=_argv)
+    """Run the replay golden by default or compile the complete graph on request."""
+    if "--validate-replay" in _argv:
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--validate-replay", action="store_true")
+        parser.add_argument("-p", "--platform", choices=["a2a3"], default="a2a3")
+        parser.add_argument("-d", "--device", "--devices", default="0")
+        parser.add_argument("--sim", action="store_true")
+        options = parser.parse_args(_argv)
+        validate_decoder_replay(int(options.device.split(",")[0]), sim=options.sim)
+    else:
+        main(l3_prefill_fwd, mode="prefill", capacity=CAPACITY, slab_rows=MOE_TOKENS, argv=_argv)
 
 
 if __name__ == "__main__":
