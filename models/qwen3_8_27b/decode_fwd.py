@@ -390,12 +390,23 @@ def build_tensor_specs(batch: int, groups: int, max_pages: int = SMOKE_PAGES,
         order = torch.randperm(states - STATE_FIRST_ROW, generator=gen(40))
         return (order[:gdn_layers * m] + STATE_FIRST_ROW).to(torch.int32)
 
-    def tables():
-        t = torch.zeros(groups * m, max_pages, dtype=torch.int32)
-        for row in range(groups * m):
-            for p in range(pages):
-                t[row, p] = (p * groups * m + row) % pool_pages
-        return t
+    table_rows = torch.zeros(groups * m, max_pages, dtype=torch.int32)
+    for row in range(groups * m):
+        for p in range(pages):
+            table_rows[row, p] = (p * groups * m + row) % pool_pages
+    # The rows no sequence owns are zero, which is `decode_attention`'s contract: the
+    # mask closes an unowned column only after its score exists, so a large value there
+    # still reaches `row_max` and the PV matmul. Serving must hold the same, and this
+    # fixture would otherwise run the composed entry at a cache state it must never see.
+    seq_lens_vec = torch.full((m,), context, dtype=torch.int32)
+    owned = decode_attention.owned_mask(table_rows, seq_lens_vec, kv_rows)
+
+    def pool(offset):
+        def make():
+            t = torch.randn(kv_rows, KV_WIDTH, generator=gen(offset)) * 0.5
+            t[~owned] = 0.0
+            return t.to(torch.bfloat16)
+        return make
 
     return [
         TensorSpec("residual", [m, C], torch.float32,
@@ -448,9 +459,9 @@ def build_tensor_specs(batch: int, groups: int, max_pages: int = SMOKE_PAGES,
         TensorSpec("rope_cos", [m, ROT], torch.float32, init_value=rope(0)),
         TensorSpec("rope_sin", [m, ROT], torch.float32, init_value=rope(1)),
         TensorSpec("state_rows", [gdn_layers * m], torch.int32, init_value=rowmap),
-        TensorSpec("block_tables", [groups * m, max_pages], torch.int32, init_value=tables),
-        TensorSpec("seq_lens", [m], torch.int32,
-                   init_value=lambda: torch.full((m,), context, dtype=torch.int32)),
+        TensorSpec("block_tables", [groups * m, max_pages], torch.int32,
+                   init_value=lambda: table_rows),
+        TensorSpec("seq_lens", [m], torch.int32, init_value=lambda: seq_lens_vec),
         TensorSpec("tail_mask", [PAGE + 1, PAGE], torch.float32,
                    init_value=lambda: decode_attention.build_tail_mask()),
         TensorSpec("conv_state", [states, KCONV - 1, CQKV], torch.bfloat16,
@@ -458,12 +469,8 @@ def build_tensor_specs(batch: int, groups: int, max_pages: int = SMOKE_PAGES,
                                                    generator=gen(30)) * 0.5).to(torch.bfloat16)),
         TensorSpec("final_state", [states, H, D, D], torch.float32,
                    init_value=lambda: torch.randn(states, H, D, D, generator=gen(31)) * 0.1),
-        TensorSpec("k_pages", [kv_rows, KV_WIDTH], torch.bfloat16,
-                   init_value=lambda: (torch.randn(kv_rows, KV_WIDTH,
-                                                   generator=gen(32)) * 0.5).to(torch.bfloat16)),
-        TensorSpec("v_pages", [kv_rows, KV_WIDTH], torch.bfloat16,
-                   init_value=lambda: (torch.randn(kv_rows, KV_WIDTH,
-                                                   generator=gen(33)) * 0.5).to(torch.bfloat16)),
+        TensorSpec("k_pages", [kv_rows, KV_WIDTH], torch.bfloat16, init_value=pool(32)),
+        TensorSpec("v_pages", [kv_rows, KV_WIDTH], torch.bfloat16, init_value=pool(33)),
         TensorSpec("residual_out", [m, C], torch.float32),
         TensorSpec("mlp_out", [m, C], torch.bfloat16),
         ScalarSpec("group_start", torch.int64, 0),

@@ -311,6 +311,27 @@ def golden_fn(tensors):
     tensors["o"].copy_(out.to(tensors["o"].dtype))
 
 
+def owned_mask(table, lens, pool_rows: int):
+    """Which pool rows the block table's lanes hold, as a `[pool_rows]` bool.
+
+    One implementation of the zero-row contract above, so a fixture cannot drift from it.
+    Lane `i` takes its length from `lens[i % len(lens)]`, which lets a stacked table --
+    `decode_fwd`'s `[groups * m, max_pages]`, one length set repeated per layer group --
+    use the same rule as a plain `[batch, max_pages]` one.
+    """
+    import torch
+
+    owned = torch.zeros(pool_rows, dtype=torch.bool)
+    n = len(lens)
+    for row in range(table.shape[0]):
+        length = int(lens[row % n])
+        for p in range((length + PAGE - 1) // PAGE):
+            base = int(table[row, p]) * PAGE
+            held = min(PAGE, length - p * PAGE)
+            owned[base : base + held] = True
+    return owned
+
+
 def page_layout(batch: int, context: int, max_pages: int, pool_pages: int | None = None):
     """Per-lane lengths, the block table for them, and the pool they need.
 
@@ -338,16 +359,11 @@ def page_layout(batch: int, context: int, max_pages: int, pool_pages: int | None
 
     free = torch.randperm(pool, generator=torch.Generator().manual_seed(29))
     table = torch.zeros(batch, max_pages, dtype=torch.int32)
-    owned = torch.zeros(pool * PAGE, dtype=torch.bool)
     taken = 0
     for s, pages_s in enumerate(lane_pages):
         table[s, :pages_s] = free[taken : taken + pages_s].to(torch.int32)
-        for p in range(pages_s):
-            base = int(table[s, p]) * PAGE
-            held = min(PAGE, int(lens[s]) - p * PAGE)
-            owned[base : base + held] = True
         taken += pages_s
-    return lens, table, pool, owned
+    return lens, table, pool, owned_mask(table, lens, pool * PAGE)
 
 
 def build_tensor_specs(batch: int = 4, context: int = 320, max_pages: int = 8,
