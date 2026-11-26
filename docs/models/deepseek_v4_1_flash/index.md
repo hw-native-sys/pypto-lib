@@ -139,6 +139,19 @@ The DSpark `--packed-routed-weights` switch selects the compiled parameter
 shape. Both parameter shapes use the same resident MegaMoE weight bytes.
 Recompile old MegaMoE artifacts before replaying them with this upload path.
 
+Set `PYPTO_V41_HC_ROUTER_REUSE=1` before compiling to enable **live-prefix**
+HC/routing for a 384-expert, top-6 MoE. Here `num_tokens` is a contiguous
+local prefix: only those rows of the HC, routing and MoE outputs are defined.
+A zero-token rank skips HC/routing but still participates in expert communication.
+Default builds keep the existing full-slab HC output contract.
+
+On A5 the opted-in router selects Cube reuse for 160 through 1024 **live**
+tokens with at least four mixed clusters. Its 16-row tiles may use the last
+few padding rows if the buffer contains them. A tightly allocated input uses
+Cube reuse on complete tiles and the upstream operators only for its short
+tail. Below the cutoff, the entire live prefix runs upstream. Capacity limits memory access; it does not
+select the algorithm. The expert workspace retains its compiled capacity.
+
 Set `--active-requests` to populate between one request (the default) and
 the configured per-rank capacity in the DSpark fixture. Each request uses
 six target rows and five draft rows.

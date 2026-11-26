@@ -580,9 +580,10 @@ def hc_head_norm_store(
 
 
 @pl.jit.inline(auto_scope=False)
-def hc_pre_moe(
+def hc_pre_moe_tiled(
     x_hc: pl.Tensor, pre_mix: pl.Tensor, norm_weight: pl.Tensor, output: pl.Tensor,
     collapsed: pl.Tensor, num_tokens: pl.Scalar[pl.INT32], function: pl.Tensor,
+    row_tile: pl.constexpr,
 ):
     """Collapse HC streams for routing and project their normalized coefficients."""
     tokens = pl.tensor.dim(x_hc, 0)
@@ -592,9 +593,17 @@ def hc_pre_moe(
         outputs=_NORM_COLLAPSED_AND_INV_RMS,
     )
     partials = hc_linear(
-        x_hc, function, MOE_LINEAR_T_TILE, 128 if MOE_LINEAR_T_TILE > LINEAR_T_TILE else HF32_LINEAR_K_L0_TILE,
+        x_hc, function, row_tile, 128 if row_tile > LINEAR_T_TILE else HF32_LINEAR_K_L0_TILE,
     )
     return inv_rms, partials
+
+
+@pl.jit.inline(auto_scope=False)
+def hc_pre_moe(
+    x_hc: pl.Tensor, pre_mix: pl.Tensor, norm_weight: pl.Tensor, output: pl.Tensor,
+    collapsed: pl.Tensor, num_tokens: pl.Scalar[pl.INT32], function: pl.Tensor,
+):
+    return hc_pre_moe_tiled(x_hc, pre_mix, norm_weight, output, collapsed, num_tokens, function, MOE_LINEAR_T_TILE)
 
 
 @pl.jit.inline
@@ -693,6 +702,27 @@ def hc_post(
     return output
 
 
+
+
+@pl.jit.inline(auto_scope=False)
+def hc_post_live(
+    sublayer: pl.Tensor, residual: pl.Tensor, post_mix: pl.Tensor, residual_mix: pl.Tensor,
+    output: pl.Tensor, active: pl.Scalar[pl.INT32], deps: pl.Array[2, pl.TASK_ID], dep_count: pl.constexpr,
+):
+    live = pl.max(0, pl.min(pl.cast(active, pl.INDEX), pl.tensor.dim(residual, 0)))
+    if live > 0:
+        x = pl.slice(sublayer, [live, D], [0, 0])
+        h = pl.slice(residual, [live, HC_MULT, D], [0, 0, 0])
+        p = pl.slice(post_mix, [live, HC_MULT], [0, 0])
+        r = pl.slice(residual_mix, [live, HC_MULT, HC_MULT], [0, 0, 0])
+        out = pl.slice(output, [live, HC_MULT, D], [0, 0, 0])
+        hc_post(x, h, p, r, out, deps=deps, dep_count=dep_count)
+    else:
+        # Preserve the completion edge to the next EP round even when this rank has no tokens.
+        with pl.spmd(1, name_hint="hc_post_empty", deps=[deps[i] for i in range(dep_count)]):
+            row = pl.tile.get_block_idx()
+            if row < pl.tensor.dim(output, 0):
+                pl.write(output, [row, 0, 0], 0.0)
 
 
 def _round_hf32(value: torch.Tensor) -> torch.Tensor:

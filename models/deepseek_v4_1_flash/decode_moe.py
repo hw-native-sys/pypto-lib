@@ -56,7 +56,8 @@ from expert_routed import (
     ROUTED_CUBE_WORKER_TILE, ROUTED_VECTOR_WORKER_TILE, dispatch,
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS, expert_routed_scatter,
 )
-from hc import hc_pre_moe, hc_sinkhorn, hc_post
+from hc import hc_pre_moe, hc_sinkhorn, hc_post, hc_post_live
+from hc_router import compare_live_ranks, live_prefix_contract, select_hc_router
 
 
 # model config
@@ -337,6 +338,9 @@ def make_decode_moe(local_experts, topk, packed_routed_weights=False):
     """Wire HC and routing to the fused experts specialized for this entry."""
     fused_experts = specialize_mega_moe(local_experts, topk, packed_routed_weights)
 
+    cube_router = select_hc_router(EP_SIZE * local_experts, topk)
+    enabled = cube_router is not None
+
     @pl.jit.inline(auto_scope=False)
     def moe(
         x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
@@ -371,30 +375,45 @@ def make_decode_moe(local_experts, topk, packed_routed_weights=False):
         post_mix = pl.create_tensor([t, HC_MULT], dtype=pl.FP32)
         residual_mix = pl.create_tensor([t, HC_MULT, HC_MULT], dtype=pl.FP32)
         x_norm = pl.create_tensor([t, D], dtype=pl.BF16)
-        inv_rms, partials = hc_pre_moe(x_hc, pre_mix, norm_weight, x_norm, x_mixed, num_tokens, hc_ffn_fn)
-        hc_sinkhorn(inv_rms, partials, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
+        if not enabled:
+            inv_rms, partials = hc_pre_moe(x_hc, pre_mix, norm_weight, x_norm, x_mixed, num_tokens, hc_ffn_fn)
+            hc_sinkhorn(inv_rms, partials, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
 
         # MoE transport and routed-result scope.
         with pl.scope():
             indices = pl.create_tensor([MOE_TOKENS, topk], dtype=pl.INT32)
             weights = pl.create_tensor([t, topk], dtype=pl.FP32)
-            route_tokens(
-                x_norm, gate_weight, correction_bias, num_tokens,
-                indices, weights, n_experts=EP_SIZE * local_experts, topk=topk,
-            )
+            if enabled:
+                router_done = pl.array.create(1, pl.TASK_ID)
+                cube_router(
+                    x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_weight,
+                    x_mixed, x_norm, next_pre_mix, post_mix, residual_mix,
+                    gate_weight, correction_bias, indices, weights, num_tokens, pl.system.available_cluster_count(), router_done,
+                )
+            else:
+                route_tokens(
+                    x_norm, gate_weight, correction_bias, num_tokens,
+                    indices, weights, n_experts=EP_SIZE * local_experts, topk=topk,
+                )
             if BALANCED_ROUTING:
                 dispatch_indices = force_topk
             else:
                 dispatch_indices = indices
 
             sublayer = pl.create_tensor([t, D], dtype=pl.BF16)
-            fused_experts(
+            expert_done = fused_experts(
                 dispatch_indices, x_norm, weights, sublayer,
                 routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
                 shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, shared_w2, shared_w2_scale,
                 moe_workspace, num_tokens,
             )
-            hc_post(sublayer, x_hc, post_mix, residual_mix, x_next, deps=None, dep_count=0)
+            if enabled:
+                post_deps = pl.array.create(2, pl.TASK_ID)
+                post_deps[0] = expert_done
+                post_deps[1] = router_done[0]
+                hc_post_live(sublayer, x_hc, post_mix, residual_mix, x_next, num_tokens, deps=post_deps, dep_count=2)
+            else:
+                hc_post(sublayer, x_hc, post_mix, residual_mix, x_next, deps=None, dep_count=0)
         return x_next
 
     return moe
@@ -815,7 +834,7 @@ def golden_moe(tensors):
     tensors["x_next"][:] = x_next
 
 
-def _local_hc_compare(num_tokens):
+def _local_hc_compare(num_tokens, *, active_only=False):
     """Compare the complete local-token output for every EP rank."""
     import torch
     from golden.validation import ratio_reldiff
@@ -870,6 +889,8 @@ def _local_hc_compare(num_tokens):
                         f"    rank {rank} active rows [:{active}] left the "
                         f"MoE budget\n{message}"
                     )
+            if active_only:
+                continue
             for row in range(active, MOE_TOKENS):
                 ok, message = compare_region(
                     actual[rank:rank + 1, row:row + 1],
@@ -946,6 +967,11 @@ if __name__ == "__main__":
         "x_mixed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         "x_next": _local_hc_compare(counts),
     }
+
+    if live_prefix_contract(N_EXPERTS, TOPK, args.runtime_dir):
+        for name in ("x_mixed", "next_pre_mix"):
+            compare_fn[name] = compare_live_ranks(compare_fn[name], counts)
+        compare_fn["x_next"] = _local_hc_compare(counts, active_only=True)
 
     result = run(
         a5_default_runtime="host_build_graph",
