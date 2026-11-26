@@ -17,8 +17,8 @@ The eps sits inside the sqrt, not outside it. fp16 out for q and k, fp32 for
 beta and g.
 
 The tile is a `build_kernel` argument because the task count is a quotient of it, and
-at a decode batch the prefill value makes that quotient zero. `decode_vector.py`
-carries the decode value.
+at a decode batch the prefill value makes that quotient zero. The decode path uses
+`decode_gate` instead.
 """
 import pypto.language as pl
 

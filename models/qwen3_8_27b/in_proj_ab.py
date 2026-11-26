@@ -13,8 +13,8 @@
 One matmul against a `[96, 5120]` weight built by stacking the two.
 
 The tile is a `build_kernel` argument because the task count is a quotient of it, and
-at a decode batch the prefill value makes that quotient zero. `decode_vector.py`
-carries the decode value.
+at a decode batch the prefill value makes that quotient zero. `decode_gdn_block` passes
+the decode value.
 """
 import pypto.language as pl
 

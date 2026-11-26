@@ -12,13 +12,14 @@ tracked runnable set.
 | [deepseek_v4_flash_lowlat](deepseek_v4_flash_lowlat/index.md) | Batch-one V4-Flash decode and 43-layer chunked prefill with CP8 attention and TP8 MoE and LM head | No model-specific job |
 | [deepseek_v4_1_flash](deepseek_v4_1_flash/index.md) | A5 prefill and decode with full attention weights on each rank, configurable prefill CP and MoE EP, independently sharded LM head, and DSpark | No model-specific job |
 | [glm5_3_flash](glm5_3_flash/index.md) | W8A8 prefill and decode on A2/A3 at TP8/EP8 or TP16/EP16, with hybrid KDA and NoPE-MLA attention, MoE, MTP, and a vision encoder | No model-specific job |
-| [qwen3_8_27b](qwen3_8_27b/index.md) | W8A8 Gated DeltaNet block with checkpoint-compatible projections and per-request convolution and recurrent state for packed prefill | No model-specific job |
+| [qwen3_8_27b](qwen3_8_27b/index.md) | W8A8 Gated DeltaNet block and composed decode with resident GDN and attention caches | No model-specific job |
 
 Each page covers that directory's deployment configuration and how its files
-compose. The Qwen3-14B and V4-Flash MTP pages also carry the optimization
-history of their tuned path —
-[Qwen3-14B optimization](qwen3_14b/optimization.md) and
-[V4-Flash decode optimization](deepseek_v4_flash_mtp/decode_optimization.md) —
+compose. The Qwen3-14B, V4-Flash MTP and Qwen3.8-27B pages also carry the
+optimization history of their tuned path —
+[Qwen3-14B optimization](qwen3_14b/optimization.md),
+[V4-Flash decode optimization](deepseek_v4_flash_mtp/decode_optimization.md) and
+[Qwen3.8-27B decode optimization](qwen3_8_27b/optimization.md) —
 which record which levers moved the number and what each one cost.
 
 Entry points take script-specific platform and device arguments; inspect
