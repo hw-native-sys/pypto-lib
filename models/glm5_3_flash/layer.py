@@ -54,7 +54,7 @@ from models.glm5_3_flash.gate import (
 )
 from models.glm5_3_flash.indexer import (
     POOL_VALID_WIDTH, SORT_TILE, IndexerTensors, indexer_cache_write, indexer_expand,
-    indexer_pool_write, indexer_proj, indexer_select, reference_indexer_topk,
+    indexer_pool_write, indexer_proj, indexer_select, indexer_tail_publish, reference_indexer_topk,
     synthetic_indexer,
 )
 from models.glm5_3_flash.kda import (
@@ -73,6 +73,9 @@ from models.glm5_3_flash.prefill_moe import (
 from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX
 from models.glm5_3_flash.rmsnorm import golden_rmsnorm_quant, reference_rms_norm, rmsnorm, rmsnorm_quant
 from models.glm5_3_flash.utils import _assert_close, _prefill_model, _randn, gen_routed_weight, pack_int8_nz
+
+# Vector scheduling.
+AIV_WORKERS_TILE = 48
 
 MAX_BATCH_PER_DP = 32
 PREFILL_MAX_TOKENS = 8192
@@ -532,13 +535,14 @@ def zero_bf16_padding_rows(
     active = pl.cast(num_tokens, pl.INDEX)
     if active < 0:
         active = pl.cast(0, pl.INDEX)
-    with pl.spmd(pl.max(rows - active, 1), name_hint="zero_bf16_padding"):
-        row = active + pl.tile.get_block_idx()
-        if row < rows:
-            # shapes-less store: the tile's own [1, D] extent is the store extent;
-            # a shapes= kwarg becomes a 4th operand the static-extent partition
-            # path cannot strip (lower_tile_to_buffer_pass rank-2 check).
-            pl.tile.store(pl.tile.full([1, D], dtype=pl.BF16, value=0.0), [row, 0], x)
+    with pl.spmd(pl.min(pl.max(rows - active, 1), AIV_WORKERS_TILE), name_hint="zero_bf16_padding"):
+        for zero_bf16_padding_partition in pl.range(pl.tile.get_block_idx(), pl.max(rows - active, 1), AIV_WORKERS_TILE):
+            row = active + zero_bf16_padding_partition
+            if row < rows:
+                # shapes-less store: the tile's own [1, D] extent is the store extent;
+                # a shapes= kwarg becomes a 4th operand the static-extent partition
+                # path cannot strip (lower_tile_to_buffer_pass rank-2 check).
+                pl.tile.store(pl.tile.full([1, D], dtype=pl.BF16, value=0.0), [row, 0], x)
 
 
 @pl.jit.inline
@@ -581,9 +585,10 @@ def scatter_local_tokens_fp32(
     """
     local_tokens = local_token_count(num_tokens, my_rank)
     rows = pl.tensor.dim(output, 0)
-    with pl.spmd(rows, name_hint="moe_scatter_zero") as zero_tid:
-        row = pl.tile.get_block_idx()
-        pl.tile.store(pl.tile.full([1, D], dtype=pl.FP32, value=0.0), [row, 0], output)
+    with pl.spmd(pl.min(rows, AIV_WORKERS_TILE), name_hint="moe_scatter_zero") as zero_tid:
+        for moe_scatter_zero_partition in pl.range(pl.tile.get_block_idx(), rows, AIV_WORKERS_TILE):
+            row = moe_scatter_zero_partition
+            pl.tile.store(pl.tile.full([1, D], dtype=pl.FP32, value=0.0), [row, 0], output)
     with pl.spmd(T_MOE, name_hint="moe_scatter", deps=[zero_tid]):
         row = pl.tile.get_block_idx()
         if row < local_tokens:
@@ -683,14 +688,8 @@ def dsa_attention_sublayer(
         raw_cache, compress_ape, pool_token_slots, pool_slots, pool_cache, pool_valid,
     )
     tail_tokens = pl.tensor.dim(index_slots, 0)
-    with pl.spmd(tail_tokens, name_hint="indexer_tail_publish", deps=[pool_tid]):
-        token = pl.tile.get_block_idx()
-        destination = pl.read(index_tail_slots, [token])
-        if destination >= 0:
-            source = pl.cast(pl.read(index_slots, [token]), pl.INDEX)
-            target = pl.cast(destination, pl.INDEX)
-            tail_row = pl.load(raw_cache, [source, 0], [1, INDEX_STATE_WIDTH])
-            pl.store(tail_row, [target, 0], raw_cache)
+    with pl.spmd(pl.min(tail_tokens, AIV_WORKERS_TILE), name_hint="indexer_tail_publish", deps=[pool_tid]):
+        indexer_tail_publish(raw_cache, index_slots, index_tail_slots)
     if skip_topk == 0:
         indexer_select(
             index_q, pool_cache, pool_blocks, head_weights, seg_start, pool_count_tok,
@@ -774,6 +773,29 @@ def dense_ffn_sublayer(
     an FP32 partial for the shared reduction."""
     rmsnorm_quant(ffn_input, post_norm_w, normed, x_int8, x_scale, num_tokens)
     dense_mlp(x_int8, x_scale, w_gate_up, w_gate_up_scale, w_down, w_down_scale, ffn_partial)
+
+
+@pl.jit.inline
+def add_shared_shard(
+    ffn_partial: pl.Tensor[[CAPACITY, D], pl.FP32],
+    shared_out: pl.Tensor[[CAPACITY, D], pl.FP32],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Add shared expert output with BF16 rounding and zero padded rows."""
+    rows = pl.tensor.dim(ffn_partial, 0)
+    for moe_add_shared_shard_worker in pl.spmd(pl.min(((rows + 7) // 8) * (D // 128), AIV_WORKERS_TILE), name_hint="moe_add_shared_shard"):
+        for block in pl.range(moe_add_shared_shard_worker, ((rows + 7) // 8) * (D // 128), AIV_WORKERS_TILE):
+            row = block // (D // 128) * 8
+            column = block % (D // 128) * 128
+            valid = pl.max(pl.min(8, num_tokens - row), 0)
+            routed_tile = pl.slice(ffn_partial, [8, 128], [row, column], valid_shape=[valid, 128])
+            shared_tile = pl.slice(shared_out, [8, 128], [row, column], valid_shape=[valid, 128])
+            routed_bf16 = pl.cast(pl.cast(routed_tile, pl.BF16, mode="rint"), pl.FP32)
+            summed = pl.add(routed_bf16, shared_tile)
+            combined = pl.cast(pl.cast(summed, pl.BF16, mode="rint"), pl.FP32)
+            combined = pl.fillpad(pl.set_validshape(combined, valid, 128), pad_value=pl.PadValue.zero)
+            ffn_partial[row:row + 8, column:column + 128] = combined
+    return ffn_partial
 
 
 @pl.jit.inline(auto_scope=False)
@@ -867,17 +889,7 @@ def moe_ffn_sublayer(
         shared_out,
     )
     scatter_local_tokens_fp32(routed, ffn_partial, num_tokens, my_rank)
-    for block in pl.spmd(((rows + 7) // 8) * (D // 128), name_hint="moe_add_shared_shard"):
-        row = block // (D // 128) * 8
-        column = block % (D // 128) * 128
-        valid = pl.max(pl.min(8, num_tokens - row), 0)
-        routed_tile = pl.slice(ffn_partial, [8, 128], [row, column], valid_shape=[valid, 128])
-        shared_tile = pl.slice(shared_out, [8, 128], [row, column], valid_shape=[valid, 128])
-        routed_bf16 = pl.cast(pl.cast(routed_tile, pl.BF16, mode="rint"), pl.FP32)
-        summed = pl.add(routed_bf16, shared_tile)
-        combined = pl.cast(pl.cast(summed, pl.BF16, mode="rint"), pl.FP32)
-        combined = pl.fillpad(pl.set_validshape(combined, valid, 128), pad_value=pl.PadValue.zero)
-        ffn_partial[row:row + 8, column:column + 128] = combined
+    add_shared_shard(ffn_partial, shared_out, num_tokens)
     return ffn_partial
 
 
