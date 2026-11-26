@@ -71,6 +71,7 @@ HCA_COMPRESS_RATIO = 128
 PREFILL_SPARSE_TOPK = WIN + IDX_TOPK
 ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
 CMP_MAX_BLOCKS = (MAX_SEQ_LEN // DEFAULT_COMPRESS_RATIO + BLOCK_SIZE - 1) // BLOCK_SIZE
+CMP_ROW_CAPACITY_F32 = float(CMP_MAX_BLOCKS * BLOCK_SIZE)
 CMP_BLOCK_NUM = CMP_MAX_BLOCKS
 
 # tiling
@@ -903,7 +904,11 @@ def _compressed_physical_rows(
     block_num: pl.Scalar[pl.INDEX],
 ) -> pl.Tile[[1, PREFILL_ATTN_TILE], pl.INT32]:
     """Map compressed indices to physical rows and retain missing entries."""
-    safe = pl.maximum(indices, 0)
+    index_f32 = pl.cast(indices, target_type=pl.FP32)
+    nonnegative = pl.tile.cmps(index_f32, 0.0, cmp_type=5)
+    below_capacity = pl.tile.cmps(index_f32, CMP_ROW_CAPACITY_F32, cmp_type=2)
+    present = pl.tile.and_(nonnegative, below_capacity)
+    safe = pl.tile.select(present, indices, 0)
     page_ids = pl.tile.shrs(safe, CMP_PAGE_SHIFT)
     page_values = pl.cast(page_ids, target_type=pl.FP32)
     groups = pl.reshape(page_values, [MASK_ALIGN_ELEMS, PREFILL_ATTN_TILE // MASK_ALIGN_ELEMS])
@@ -929,8 +934,6 @@ def _compressed_physical_rows(
     page_rows = pl.tile.shls(valid_pages, CMP_PAGE_SHIFT)
     intra_page = pl.sub(safe, pl.tile.shls(page_ids, CMP_PAGE_SHIFT))
     physical_rows = pl.add(page_rows, intra_page)
-    index_f32 = pl.cast(indices, target_type=pl.FP32)
-    present = pl.tile.cmps(index_f32, 0.0, cmp_type=5)
     return pl.tile.select(present, physical_rows, -1)
 
 
@@ -989,7 +992,11 @@ def _sparse_attn_wave(
             if SPARSE_CMP_BIAS_COLS > 0:
                 gather_bias_cmp_rows = pl.slice(cmp_indices, [GATHER_TOKEN_TILE, SPARSE_CMP_BIAS_COLS], [gather_bias_t0, 0], valid_shape=[gather_bias_rows, SPARSE_CMP_BIAS_COLS])
                 gather_bias_cmp_idx = pl.cast(gather_bias_cmp_rows, target_type=pl.FP32)
-                gather_bias_cmp_flag = pl.minimum(pl.maximum(pl.add(gather_bias_cmp_idx, 1.0), 0.0), 1.0)
+                gather_bias_cmp_lower = pl.add(gather_bias_cmp_idx, 1.0)
+                gather_bias_cmp_neg = pl.neg(gather_bias_cmp_idx)
+                gather_bias_cmp_upper = pl.add(gather_bias_cmp_neg, CMP_ROW_CAPACITY_F32)
+                gather_bias_cmp_valid = pl.minimum(gather_bias_cmp_lower, gather_bias_cmp_upper)
+                gather_bias_cmp_flag = pl.minimum(pl.maximum(gather_bias_cmp_valid, 0.0), 1.0)
                 gather_bias_cmp = pl.mul(pl.sub(gather_bias_cmp_flag, 1.0), -FP32_NEG_INF)
                 sparse_bias[gather_local_t0 : gather_local_t0 + GATHER_TOKEN_TILE, WIN:SPARSE_BIAS_COLS] = gather_bias_cmp
             if PREFILL_SPARSE_PAD > SPARSE_BIAS_COLS:
@@ -1946,6 +1953,8 @@ def build_tensor_specs(
     token_count: int = T,
     ori_block_num: int = ORI_BLOCK_NUM,
     cmp_block_num: int = CMP_BLOCK_NUM,
+    *,
+    check_cmp_upper_bound: bool = False,
 ):
     import torch
     from golden import TensorSpec
@@ -1995,6 +2004,8 @@ def build_tensor_specs(
                 comp_count = min(cmp_valid, (t + 1) // compress_ratio, IDX_TOPK)
                 if comp_count > 0:
                     idx[t, :comp_count] = torch.arange(comp_count, dtype=torch.int32)
+        if check_cmp_upper_bound and cmp_valid > 0:
+            idx[-1, 0] = CMP_MAX_BLOCKS * BLOCK_SIZE
         return idx
 
     def init_valid_block_mask():
@@ -2103,9 +2114,13 @@ if __name__ == "__main__":
     if args.tokens is None and not (args.save_data or args.golden_data):
         token_counts.append(T_PAD + 1)
     for token_count in token_counts:
+        specs = build_tensor_specs(
+            args.compress_ratio, token_count, args.ori_block_num, args.cmp_block_num,
+            check_cmp_upper_bound=args.tokens is None and token_count == T_PAD + 1,
+        )
         result = run(
             fn=prefill_sparse_attn_test,
-            specs=build_tensor_specs(args.compress_ratio, token_count, args.ori_block_num, args.cmp_block_num),
+            specs=specs,
             golden_fn=golden_prefill_sparse_attn,
             save_data=args.save_data,
             golden_data=args.golden_data,

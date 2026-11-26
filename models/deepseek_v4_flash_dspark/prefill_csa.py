@@ -175,41 +175,43 @@ def prepare_csa_sparse_indices(
     valid_block_mask = pl.create_tensor([t_dim, VALID_BLOCK_MASK_COLS], dtype=pl.INT32)
     if group_tokens > 0:
         csa_topk_blocks = (t_dim + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE
-        for topk_block in pl.spmd(csa_topk_blocks, name_hint="prefill_csa_sparse_idx_tile"):
-            topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
-            for topk_dt in pl.range(CSA_TOPK_TOKEN_TILE):
-                t_idx = topk_t0 + topk_dt
-                swa_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
-                mask_row = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
-                if t_idx < t_dim:
-                    request_id = pl.read(local_request_ids, [t_idx])
-                    if request_id >= 0:
-                        abs_pos = pl.read(position_ids, [t_idx])
-                        # Sparse-block liveness from the dense TopK prefix.
-                        visible_cmp = pl.min((abs_pos + 1) // COMPRESS_RATIO, pl.cast(IDX_TOPK, pl.INT32))
-                        for mask_sb in pl.unroll(PREFILL_ATTN_BLOCKS):
-                            cmp_lo = pl.max(mask_sb * PREFILL_ATTN_TILE - WIN, pl.cast(0, pl.INT32))
-                            cmp_hi = pl.min(
-                                (mask_sb + 1) * PREFILL_ATTN_TILE - WIN,
-                                pl.cast(SPARSE_CMP_BIAS_COLS, pl.INT32),
-                            )
-                            if cmp_lo < cmp_hi:
-                                if visible_cmp > cmp_lo:
-                                    pl.write(mask_row, [0, mask_sb], pl.cast(1, pl.INT32))
-                        window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
-                        key_start_abs = abs_pos + 1 - window_valid
-                        for win_col in pl.range(WIN):
-                            win_col_i32 = pl.cast(win_col, pl.INT32)
-                            if win_col_i32 < window_valid:
-                                key_abs = key_start_abs + win_col_i32
-                                blk_slot = key_abs // BLOCK_SIZE
-                                blk = pl.read(ori_block_table, [request_id, pl.cast(blk_slot, pl.INDEX)])
-                                if blk >= 0:
-                                    row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
-                                    pl.write(swa_row, [0, win_col], row)
-                                    pl.write(mask_row, [0, win_col // PREFILL_ATTN_TILE], pl.cast(1, pl.INT32))
-                    swa_indices[t_idx : t_idx + 1, 0:WIN] = swa_row
-                    valid_block_mask[t_idx : t_idx + 1, 0:VALID_BLOCK_MASK_COLS] = mask_row
+        topk_workers = pl.min(csa_topk_blocks, pl.system.available_aiv_count())
+        for worker in pl.spmd(topk_workers, name_hint="prefill_csa_sparse_idx_tile"):
+            for topk_block in pl.range(worker, csa_topk_blocks, pl.tile.get_block_num()):
+                topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
+                for topk_dt in pl.range(CSA_TOPK_TOKEN_TILE):
+                    t_idx = topk_t0 + topk_dt
+                    swa_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
+                    mask_row = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
+                    if t_idx < t_dim:
+                        request_id = pl.read(local_request_ids, [t_idx])
+                        if request_id >= 0:
+                            abs_pos = pl.read(position_ids, [t_idx])
+                            # Sparse-block liveness from the dense TopK prefix.
+                            visible_cmp = pl.min((abs_pos + 1) // COMPRESS_RATIO, pl.cast(IDX_TOPK, pl.INT32))
+                            for mask_sb in pl.unroll(PREFILL_ATTN_BLOCKS):
+                                cmp_lo = pl.max(mask_sb * PREFILL_ATTN_TILE - WIN, pl.cast(0, pl.INT32))
+                                cmp_hi = pl.min(
+                                    (mask_sb + 1) * PREFILL_ATTN_TILE - WIN,
+                                    pl.cast(SPARSE_CMP_BIAS_COLS, pl.INT32),
+                                )
+                                if cmp_lo < cmp_hi:
+                                    if visible_cmp > cmp_lo:
+                                        pl.write(mask_row, [0, mask_sb], pl.cast(1, pl.INT32))
+                            window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
+                            key_start_abs = abs_pos + 1 - window_valid
+                            for win_col in pl.range(WIN):
+                                win_col_i32 = pl.cast(win_col, pl.INT32)
+                                if win_col_i32 < window_valid:
+                                    key_abs = key_start_abs + win_col_i32
+                                    blk_slot = key_abs // BLOCK_SIZE
+                                    blk = pl.read(ori_block_table, [request_id, pl.cast(blk_slot, pl.INDEX)])
+                                    if blk >= 0:
+                                        row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
+                                        pl.write(swa_row, [0, win_col], row)
+                                        pl.write(mask_row, [0, win_col // PREFILL_ATTN_TILE], pl.cast(1, pl.INT32))
+                        swa_indices[t_idx : t_idx + 1, 0:WIN] = swa_row
+                        valid_block_mask[t_idx : t_idx + 1, 0:VALID_BLOCK_MASK_COLS] = mask_row
     return swa_indices, valid_block_mask
 
 
@@ -1143,15 +1145,17 @@ def prepare_csa_indexer_rope(
         freqs_cos_local = pl.slice(freqs_cos, [q_dim, ROPE_HEAD_DIM], [local_base, 0])
         freqs_sin_local = pl.slice(freqs_sin, [q_dim, ROPE_HEAD_DIM], [local_base, 0])
         rope_blocks = (q_dim + CSA_ROPE_TILE - 1) // CSA_ROPE_TILE
-        for prep_block in pl.spmd(rope_blocks, name_hint="prefill_csa_cp_idx_halfrope"):
-            idx_t = prep_block * CSA_ROPE_TILE
-            idx_rows = pl.min(CSA_ROPE_TILE, q_dim - idx_t)
-            idx_cos_bf16 = pl.slice(freqs_cos_local, [CSA_ROPE_TILE, HALF_ROPE], [idx_t, 0], valid_shape=[idx_rows, HALF_ROPE])
-            idx_sin_bf16 = pl.slice(freqs_sin_local, [CSA_ROPE_TILE, HALF_ROPE], [idx_t, 0], valid_shape=[idx_rows, HALF_ROPE])
-            idx_cos_fp32 = pl.cast(idx_cos_bf16, target_type=pl.FP32)
-            idx_sin_fp32 = pl.cast(idx_sin_bf16, target_type=pl.FP32)
-            idx_cos[idx_t : idx_t + CSA_ROPE_TILE, 0:HALF_ROPE] = idx_cos_fp32
-            idx_sin[idx_t : idx_t + CSA_ROPE_TILE, 0:HALF_ROPE] = idx_sin_fp32
+        rope_workers = pl.min(rope_blocks, pl.system.available_aiv_count())
+        for worker in pl.spmd(rope_workers, name_hint="prefill_csa_cp_idx_halfrope"):
+            for prep_block in pl.range(worker, rope_blocks, pl.tile.get_block_num()):
+                idx_t = prep_block * CSA_ROPE_TILE
+                idx_rows = pl.min(CSA_ROPE_TILE, q_dim - idx_t)
+                idx_cos_bf16 = pl.slice(freqs_cos_local, [CSA_ROPE_TILE, HALF_ROPE], [idx_t, 0], valid_shape=[idx_rows, HALF_ROPE])
+                idx_sin_bf16 = pl.slice(freqs_sin_local, [CSA_ROPE_TILE, HALF_ROPE], [idx_t, 0], valid_shape=[idx_rows, HALF_ROPE])
+                idx_cos_fp32 = pl.cast(idx_cos_bf16, target_type=pl.FP32)
+                idx_sin_fp32 = pl.cast(idx_sin_bf16, target_type=pl.FP32)
+                idx_cos[idx_t : idx_t + CSA_ROPE_TILE, 0:HALF_ROPE] = idx_cos_fp32
+                idx_sin[idx_t : idx_t + CSA_ROPE_TILE, 0:HALF_ROPE] = idx_sin_fp32
     return idx_cos, idx_sin
 
 
