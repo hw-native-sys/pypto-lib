@@ -15,7 +15,7 @@ import pypto.language as pl
 import torch
 import torch.nn.functional as F
 
-from config import FLASH as M, T_DYN
+from config import FLASH as M, MOE_TOKENS, T_DYN
 from rmsnorm import _rms_norm_rows, golden_rms_norm
 
 
@@ -42,6 +42,11 @@ SINKHORN_WIDE_T_TILE = 16
 SINKHORN_WORKER_TILE = 12
 RMS_K_TILE = 1024
 LINEAR_OK = 4
+# Map four K splits per row tile onto the 32 A5 cube cores.
+MOE_LINEAR_ROW_GROUPS = 32 // LINEAR_OK
+MOE_LINEAR_T_TILE = LINEAR_T_TILE
+if MOE_TOKENS > MOE_LINEAR_ROW_GROUPS * LINEAR_T_TILE:
+    MOE_LINEAR_T_TILE = 32 if MOE_TOKENS <= MOE_LINEAR_ROW_GROUPS * 32 else 64
 D_TILE = 2560
 PRE_T_TILE = 8
 PRE_NORM_T_TILE = 4
@@ -334,21 +339,34 @@ def hc_project(x_hc: pl.Tensor, function: pl.Tensor, rms_worker_limit: pl.conste
                 pl.rsqrt(rms_arg, high_precision=True), [T_TILE, 1]
             )
 
+    partials = hc_linear(x_hc, function, HF32_LINEAR_T_TILE, HF32_LINEAR_K_L0_TILE)
+    return inv_rms, partials
+
+
+@pl.jit.inline
+def hc_linear(
+    x_hc: pl.Tensor, function: pl.Tensor, row_tile: pl.constexpr,
+    k_tile: pl.constexpr,
+):
+    """Project HC coefficients in FP32 split-K tiles."""
+    t_dim = pl.tensor.dim(x_hc, 0)
+    t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
+    x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
     mixes_partials = pl.create_tensor([LINEAR_OK * t_linear, MIX_PAD], dtype=pl.FP32)
-    tasks = ((t_dim + HF32_LINEAR_T_TILE - 1) // HF32_LINEAR_T_TILE) * LINEAR_OK
+    tasks = ((t_dim + row_tile - 1) // row_tile) * LINEAR_OK
     workers = pl.min(tasks, pl.system.available_cluster_count())
     for worker in pl.spmd(workers, name_hint="hc_linear"):
         for task in pl.range(worker, tasks, pl.tile.get_block_num()):
-            t0 = (task // LINEAR_OK) * HF32_LINEAR_T_TILE
+            t0 = (task // LINEAR_OK) * row_tile
             split = task % LINEAR_OK
             k_base = split * (HC_DIM // LINEAR_OK)
-            valid_rows = pl.min(HF32_LINEAR_T_TILE, t_dim - t0)
-            acc = pl.tile.create([HF32_LINEAR_T_TILE, MIX_PAD], pl.FP32, target_memory=pl.Mem.Acc, compact=True)
+            valid_rows = pl.min(row_tile, t_dim - t0)
+            acc = pl.tile.create([row_tile, MIX_PAD], pl.FP32, target_memory=pl.Mem.Acc, compact=True)
             acc = pl.set_validshape(acc, valid_rows, MIX_HC)
             for kb in pl.pipeline((HC_DIM // LINEAR_OK) // HF32_LINEAR_K_L1_TILE, stage=2):
                 k0 = k_base + kb * HF32_LINEAR_K_L1_TILE
                 a_l1 = pl.load(
-                    x_flat, [t0, k0], [HF32_LINEAR_T_TILE, HF32_LINEAR_K_L1_TILE],
+                    x_flat, [t0, k0], [row_tile, HF32_LINEAR_K_L1_TILE],
                     valid_shape=[valid_rows, HF32_LINEAR_K_L1_TILE], target_memory=pl.Mem.Mat,
                 )
                 b_l1 = pl.load(
@@ -356,20 +374,25 @@ def hc_project(x_hc: pl.Tensor, function: pl.Tensor, rms_worker_limit: pl.conste
                     valid_shape=[MIX_HC, HF32_LINEAR_K_L1_TILE], target_memory=pl.Mem.Mat,
                 )
                 b_l1_t = pl.tile.transpose_view(b_l1)
-                for inner in pl.pipeline(HF32_LINEAR_K_L1_TILE // HF32_LINEAR_K_L0_TILE, stage=2):
-                    k_l0 = inner * HF32_LINEAR_K_L0_TILE
+                for inner in pl.pipeline(HF32_LINEAR_K_L1_TILE // k_tile, stage=2):
+                    k_l0 = inner * k_tile
                     left = pl.tile.extract(
-                        a_l1, 0, k_l0, [HF32_LINEAR_T_TILE, HF32_LINEAR_K_L0_TILE], target_memory=pl.Mem.Left,
+                        a_l1, 0, k_l0, [row_tile, k_tile], target_memory=pl.Mem.Left,
                     )
                     right = pl.tile.extract(
-                        b_l1_t, k_l0, 0, [HF32_LINEAR_K_L0_TILE, MIX_PAD], target_memory=pl.Mem.Right,
+                        b_l1_t, k_l0, 0, [k_tile, MIX_PAD], target_memory=pl.Mem.Right,
                     )
-                    first = kb * (HF32_LINEAR_K_L1_TILE // HF32_LINEAR_K_L0_TILE) + inner == 0
+                    first = kb * (HF32_LINEAR_K_L1_TILE // k_tile) + inner == 0
                     acc = pl.tile.matmul_acc(acc, left, right, init_cond=first, tf32_mode="round_away")
             partial = split * t_linear + t0
             pl.store(acc, [partial, 0], mixes_partials)
 
-    return inv_rms, mixes_partials
+    return mixes_partials
+
+
+_NORM_ONLY = 1
+_NORM_AND_COLLAPSED = 2
+_NORM_COLLAPSED_AND_INV_RMS = 3
 
 
 @pl.jit.inline
@@ -382,10 +405,13 @@ def _hc_collapse_rows(
     active_rows: pl.Scalar[pl.INDEX],
     worker_limit: pl.constexpr,
     row_tile: pl.constexpr,
-    store_collapsed: pl.constexpr,
+    outputs: pl.constexpr,
 ):
-    """Collapse HC streams with ordered FP32 products, sums, and BF16 rounding."""
+    """Normalize the BF16 collapse and optionally emit the raw collapse and the FP32 input inverse RMS."""
     tokens = pl.tensor.dim(x_hc, 0)
+    if outputs == _NORM_COLLAPSED_AND_INV_RMS:
+        padded = (tokens + LINEAR_T_TILE - 1) // LINEAR_T_TILE * LINEAR_T_TILE
+        inv_rms = pl.create_tensor([padded, 1], dtype=pl.FP32)
     x_flat = pl.reshape(x_hc, [tokens, HC_DIM])
     mix_flat = pl.reshape(pre_mix, [1, tokens * HC_MULT])
     with pl.spmd(
@@ -406,8 +432,10 @@ def _hc_collapse_rows(
                 source = pl.load(x_flat, [row, 0], [1, HC_DIM], target_memory=pl.MemorySpace.Vec)
                 source = pl.reshape(source, [HC_DIM])
                 collapsed = pl.create_tile([D], dtype=pl.BF16, target_memory=pl.MemorySpace.Vec)
+                rms_row = pl.create_tile([64], dtype=pl.FP32, target_memory=pl.Mem.Vec)
                 with pl.reg_scope():
                     full = pl.reg.full_mask(lanes=64)
+                    square_sum = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
                     mix0 = pl.reg.load(mix, offset=local * HC_MULT, lanes=1)
                     mix1 = pl.reg.load(mix, offset=local * HC_MULT + 1, lanes=1)
                     mix2 = pl.reg.load(mix, offset=local * HC_MULT + 2, lanes=1)
@@ -418,15 +446,38 @@ def _hc_collapse_rows(
                     p3 = pl.reg.broadcast(mix3, lanes=64, dtype=pl.FP32)
                     for chunk in pl.hardware_loop(D // 64):
                         offset = chunk * 64
-                        x0 = pl.reg.mul(pl.reg.load(source, offset=offset, lanes=64), p0, full)
-                        x1 = pl.reg.mul(pl.reg.load(source, offset=D + offset, lanes=64), p1, full)
-                        x2 = pl.reg.mul(pl.reg.load(source, offset=2 * D + offset, lanes=64), p2, full)
-                        x3 = pl.reg.mul(pl.reg.load(source, offset=3 * D + offset, lanes=64), p3, full)
+                        stream0 = pl.reg.load(source, offset=offset, lanes=64)
+                        x0 = pl.reg.mul(stream0, p0, full)
+                        stream1 = pl.reg.load(source, offset=D + offset, lanes=64)
+                        x1 = pl.reg.mul(stream1, p1, full)
+                        stream2 = pl.reg.load(source, offset=2 * D + offset, lanes=64)
+                        x2 = pl.reg.mul(stream2, p2, full)
+                        stream3 = pl.reg.load(source, offset=3 * D + offset, lanes=64)
+                        x3 = pl.reg.mul(stream3, p3, full)
+                        if outputs == _NORM_COLLAPSED_AND_INV_RMS:
+                            sq0 = pl.reg.mul(stream0, stream0, full)
+                            sq1 = pl.reg.mul(stream1, stream1, full)
+                            sq2 = pl.reg.mul(stream2, stream2, full)
+                            sq3 = pl.reg.mul(stream3, stream3, full)
+                            sq01 = pl.reg.add(sq0, sq1, full)
+                            sq23 = pl.reg.add(sq2, sq3, full)
+                            square_sum = pl.reg.add(square_sum, pl.reg.add(sq01, sq23, full), full)
                         value = pl.reg.add(pl.reg.add(pl.reg.add(x0, x1, full), x2, full), x3, full)
                         rounded = pl.reg.convert(value, dtype=pl.BF16, rounding="R", saturate=False)
                         _stored = pl.reg.store(collapsed, offset=offset, value=rounded, mask=full)
+                    if outputs == _NORM_COLLAPSED_AND_INV_RMS:
+                        total = pl.reg.reduce_sum(square_sum, full, reassoc=True)
+                        total = pl.reg.broadcast(total, lanes=64, dtype=pl.FP32)
+                        mean = pl.reg.muls(total, HC_DIM_INV, full)
+                        variance = pl.reg.adds(mean, NORM_EPS, full)
+                        one = pl.reg.broadcast(1.0, lanes=64, dtype=pl.FP32)
+                        inverse = pl.reg.sqrt(pl.reg.div(one, variance, full), full)
+                        _rms_written = pl.reg.store(rms_row, 0, inverse, full)
+                if outputs == _NORM_COLLAPSED_AND_INV_RMS:
+                    inverse_tile = pl.reshape(rms_row, [1, 64])
+                    pl.store(pl.set_validshape(inverse_tile, 1, 1), [row, 0], inv_rms)
                 collapsed = pl.reshape(collapsed, [1, D])
-                if store_collapsed:
+                if outputs != _NORM_ONLY:
                     pl.store(collapsed, [row, 0], raw_output)
                 if row < active_rows:
                     normalized = _rms_norm_rows(collapsed, gamma, D, 1, D * 4 // 5)
@@ -435,7 +486,10 @@ def _hc_collapse_rows(
                 else:
                     zero = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
                     pl.store(zero, [row, 0], output)
-    return output
+    if outputs == _NORM_COLLAPSED_AND_INV_RMS:
+        return inv_rms
+    else:
+        return output
 
 
 @pl.jit.inline
@@ -501,7 +555,8 @@ def hc_head_norm(
     """Collapse HC streams and normalize their rounded BF16 values."""
     tokens = pl.tensor.dim(x_hc, 0)
     return _hc_collapse_rows(
-        x_hc, pre_mix, output, norm_weight, output, tokens, worker_limit, PRE_NORM_T_TILE, False,
+        x_hc, pre_mix, output, norm_weight, output, tokens, worker_limit, PRE_NORM_T_TILE,
+        outputs=_NORM_ONLY,
     )
 
 
@@ -519,8 +574,27 @@ def hc_head_norm_store(
     tokens = pl.tensor.dim(x_hc, 0)
     active_rows = pl.max(pl.min(pl.cast(num_tokens, pl.INDEX), tokens), 0)
     return _hc_collapse_rows(
-        x_hc, pre_mix, output, norm_weight, collapsed, active_rows, worker_limit, PRE_NORM_STORE_T_TILE, True,
+        x_hc, pre_mix, output, norm_weight, collapsed, active_rows,
+        worker_limit, PRE_NORM_STORE_T_TILE, outputs=_NORM_AND_COLLAPSED,
     )
+
+
+@pl.jit.inline(auto_scope=False)
+def hc_pre_moe(
+    x_hc: pl.Tensor, pre_mix: pl.Tensor, norm_weight: pl.Tensor, output: pl.Tensor,
+    collapsed: pl.Tensor, num_tokens: pl.Scalar[pl.INT32], function: pl.Tensor,
+):
+    """Collapse HC streams for routing and project their normalized coefficients."""
+    tokens = pl.tensor.dim(x_hc, 0)
+    active = pl.max(pl.min(pl.cast(num_tokens, pl.INDEX), tokens), 0)
+    inv_rms = _hc_collapse_rows(
+        x_hc, pre_mix, output, norm_weight, collapsed, active, 64, PRE_NORM_STORE_T_TILE,
+        outputs=_NORM_COLLAPSED_AND_INV_RMS,
+    )
+    partials = hc_linear(
+        x_hc, function, MOE_LINEAR_T_TILE, 128 if MOE_LINEAR_T_TILE > LINEAR_T_TILE else HF32_LINEAR_K_L0_TILE,
+    )
+    return inv_rms, partials
 
 
 @pl.jit.inline
