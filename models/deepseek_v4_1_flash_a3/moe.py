@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4.1 prefill MoE with compact TP owner rows and mHC."""
+"""DeepSeek-V4.1 MoE with compact TP owner rows and mHC."""
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -156,6 +156,41 @@ def _publish_wide_route_counts(
 
 
 @pl.jit.inline
+def _finalize_dispatch_counts(
+    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_meta_local: pl.Tensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_starts: pl.Tensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_count_out: pl.Tensor[[N_LOCAL, 2], pl.INT32],
+    source_mask: pl.Scalar[pl.INDEX],
+    ready: pl.Array[2, pl.TASK_ID],
+    prefill: pl.constexpr,
+):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta_finalize",
+               deps=[ready], allow_early_resolve=True) as finalized:
+        source_prefix = pl.array.create(N_RANKS, pl.INT32)
+        for src in pl.range(N_RANKS):
+            source_prefix[src] = 0
+        expert_prefix = pl.const(0, pl.INT32)
+        for e in pl.range(N_LOCAL):
+            acc = pl.const(0, pl.INT32)
+            pending_sources = source_mask
+            for src in pl.range(N_RANKS):
+                active_source = pending_sources % 2 != 0
+                pending_sources = pending_sources // 2
+                count = pl.const(0, pl.INT32)
+                if prefill or active_source:
+                    count = pl.read(recv_meta, [src, e])
+                pl.write(recv_meta_local, [src, e], count)
+                pl.write(recv_starts, [src, e], source_prefix[src])
+                source_prefix[src] = source_prefix[src] + count
+                acc = acc + count
+            pl.write(recv_count_out, [e, 0], acc)
+            pl.write(recv_count_out, [e, 1], expert_prefix)
+            expert_prefix = expert_prefix + pl.cast((acc + 15) // 16 * 16, pl.INT32)
+    return finalized
+
+
+@pl.jit.inline
 def dispatch(
     indices: pl.Tensor[[SLAB_T_DYN, TOPK], pl.INT32],
     x_norm_mx: pl.Tensor[[SLAB_T_DYN, D], pl.INT8],
@@ -185,9 +220,9 @@ def dispatch(
         _anchor = pl.read(indices, [0, 0])
     rows_per_rank = slab_rows * TOPK
     send_starts = pl.create_tensor([count_shards * N_RANKS, WIDE_PEER_TILE], dtype=pl.INT32)
-    recv_starts = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32)
     route_slots = pl.create_tensor([slab_rows, ROUTE_WIDTH], dtype=pl.INT32)
     send_totals = pl.create_tensor([N_RANKS * WIDE_TOTAL_TILE], dtype=pl.INT32)
+    meta_stage = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32)
     meta_tids = pl.array.create(1, pl.TASK_ID)
     if count_shards > 1:
         counted = _publish_wide_route_counts(
@@ -196,9 +231,9 @@ def dispatch(
         )
         meta_tids[0] = counted
     else:
-        meta_stage = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32)
-        # Publish per-source route counts.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta_publish", deps=[_reuse_tid], allow_early_resolve=True) as published:
+        # Stage per-destination route counts and publish them immediately for Prefill.
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta_publish",
+                   deps=[_reuse_tid], allow_early_resolve=True) as published:
             active_tokens = pl.cast(num_tokens, pl.INDEX)
             if active_tokens < 0:
                 active_tokens = pl.cast(0, pl.INDEX)
@@ -231,12 +266,13 @@ def dispatch(
                         prefix = prefix + count
                     meta_valid = pl.tile.set_validshape(meta_tile, 1, N_LOCAL)
                     meta_stage = pl.store(meta_valid, [dst, 0], meta_stage)
-                    pld.tensor.put(
-                        dst=recv_meta, peer=dst, src=meta_stage,
-                        dst_offsets=[my_rank, 0], src_offsets=[dst, 0], shape=[1, N_LOCAL],
-                    )
+                    if prefill:
+                        pld.tensor.put(
+                            dst=recv_meta, peer=dst, src=meta_stage,
+                            dst_offsets=[my_rank, 0], src_offsets=[dst, 0], shape=[1, N_LOCAL],
+                        )
                     pl.write(send_totals, [dst * WIDE_TOTAL_TILE], prefix)
-                    if dst != my_rank:
+                    if prefill and dst != my_rank:
                         pld.system.notify(
                             target=arrived, peer=dst, offsets=[my_rank, 0],
                             value=moe_epoch, op=pld.NotifyOp.Set,
@@ -245,45 +281,30 @@ def dispatch(
                 for dst in pl.range(N_RANKS):
                     pl.write(send_totals, [dst * WIDE_TOTAL_TILE], pl.cast(0, pl.INT32))
         meta_tids[0] = published
-    _meta_push_tid = meta_tids[0]
+    _count_tid = meta_tids[0]
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta_wait") as _meta_wait_tid:
-        pending_sources = source_mask
-        for src in pl.range(N_RANKS):
-            has_routes = pending_sources % 2 != 0
-            pending_sources = pending_sources // 2
-            if src != my_rank and (prefill or has_routes):
-                pld.system.defer_wait(
-                    signal=arrived, offsets=[src, 0],
-                    expected=moe_epoch, cmp=pld.WaitCmp.Ge,
-                )
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta_finalize", deps=[_meta_push_tid, _meta_wait_tid], allow_early_resolve=True) as _meta_tid:
-        source_prefix = pl.array.create(N_RANKS, pl.INT32)
-        for src in pl.range(N_RANKS):
-            source_prefix[src] = 0
-        expert_prefix = pl.const(0, pl.INT32)
-        for e in pl.range(N_LOCAL):
-            acc = pl.const(0, pl.INT32)
-            pending_sources = source_mask
+    recv_starts = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32)
+    finalized = pl.array.create(1, pl.TASK_ID)
+    meta_ready = pl.array.create(2, pl.TASK_ID)
+    if prefill:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta_wait") as _meta_wait_tid:
             for src in pl.range(N_RANKS):
-                has_routes = pending_sources % 2 != 0
-                pending_sources = pending_sources // 2
-                count = pl.const(0, pl.INT32)
-                if prefill or has_routes:
-                    count = pl.read(recv_meta, [src, e])
-                pl.write(recv_meta_local, [src, e], count)
-                pl.write(recv_starts, [src, e], source_prefix[src])
-                source_prefix[src] = source_prefix[src] + count
-                acc = acc + count
-            pl.write(recv_count_out, [e, 0], acc)
-            pl.write(recv_count_out, [e, 1], expert_prefix)
-            expert_prefix = expert_prefix + pl.cast((acc + 15) // 16 * 16, pl.INT32)
+                if src != my_rank:
+                    pld.system.defer_wait(
+                        signal=arrived, offsets=[src, 0],
+                        expected=moe_epoch, cmp=pld.WaitCmp.Ge,
+                    )
+        meta_ready[0] = _count_tid
+        meta_ready[1] = _meta_wait_tid
+        finalized[0] = _finalize_dispatch_counts(
+            recv_meta, recv_meta_local, recv_starts, recv_count_out,
+            source_mask, meta_ready, prefill,
+        )
 
     send_aux = pl.create_tensor([N_RANKS * rows_per_rank, AUX_WIDTH], dtype=pl.FP32)
     active_tokens = pl.max(0, pl.min(num_tokens, slab_rows))
     workers = pl.max(1, pl.min(active_tokens, pl.system.available_aiv_count()))
-    with pl.spmd(workers, name_hint="dispatch_pack", deps=[_meta_push_tid], allow_early_resolve=False) as _pack_tid:
+    with pl.spmd(workers, name_hint="dispatch_pack", deps=[_count_tid], allow_early_resolve=False) as _pack_tid:
         worker = pl.tile.get_block_idx()
         for token in pl.range(worker, active_tokens, workers):
             # A token has TOPK destinations, but the quantized hidden vector
@@ -335,9 +356,13 @@ def dispatch(
                     dst_offsets=[destination_base, 0], src_offsets=[source_base, 0],
                     shape=[total, AUX_WIDTH], chunk_rows=RECV_TILE,
                 )
-            # Decode publishes from the block that owns this destination.
-            if not prefill:
-                if dst != my_rank and active_tokens > 0:
+            # Each active Decode source publishes count rows, including zero-route destinations.
+            if not prefill and active_tokens > 0:
+                pld.tensor.put(
+                    dst=recv_meta, peer=dst, src=meta_stage,
+                    dst_offsets=[my_rank, 0], src_offsets=[dst, 0], shape=[1, N_LOCAL],
+                )
+                if dst != my_rank:
                     pld.system.notify(
                         target=data_arrived, peer=dst, offsets=[my_rank, 0, 0],
                         value=moe_epoch, op=pld.NotifyOp.Set,
@@ -360,13 +385,23 @@ def dispatch(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait", deps=[publish_deps]) as _wait_tid:
         pending_sources = source_mask
         for src in pl.range(N_RANKS):
-            has_routes = pending_sources % 2 != 0
+            active_source = pending_sources % 2 != 0
             pending_sources = pending_sources // 2
-            if src != my_rank and (prefill or has_routes):
+            if src != my_rank and (prefill or active_source):
                 pld.system.defer_wait(
                     signal=data_arrived, offsets=[src, 0, 0],
                     expected=moe_epoch, cmp=pld.WaitCmp.Ge,
                 )
+
+    if not prefill:
+        # Local puts complete with the push; remote puts complete with the data epoch.
+        meta_ready[0] = _push_tid
+        meta_ready[1] = _wait_tid
+        finalized[0] = _finalize_dispatch_counts(
+            recv_meta, recv_meta_local, recv_starts, recv_count_out,
+            source_mask, meta_ready, prefill,
+        )
+    _meta_tid = finalized[0]
 
     # Gather aligned row tiles into compact expert buffers.
     gather_tids = pl.array.create(N_LOCAL, pl.TASK_ID)
