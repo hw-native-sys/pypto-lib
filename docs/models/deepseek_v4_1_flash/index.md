@@ -13,7 +13,7 @@ operators.
 | --- | --- |
 | Performance target | 72-token decode and 1,024-token standalone prefill attention (DP1/CP1), using full attention weights. Apply optimizations to the shared implementation across all attention layers and adapt all affected callers. |
 | Deferred performance work | Performance tuning for other token counts and prefill parallel configurations remains secondary to these targets; correctness and the shared fused output projection / HC-post implementation remain required. |
-| Compatibility requirements | Preserve correctness and interface contracts for already supported paths, including other token counts and DP/CP configurations. Update affected callers to use revised shared implementations. The optimized C++ routed FFN requires A5 device execution; simulation requests fail explicitly rather than selecting a different numerical implementation. |
+| Compatibility requirements | Preserve correctness and interface contracts for already supported paths, including other token counts and DP/CP configurations. Update affected callers to use revised shared implementations. The routed MXFP4 FFN requires A5 device execution; simulation requests fail explicitly rather than selecting a different numerical implementation. |
 
 ## Model configuration
 

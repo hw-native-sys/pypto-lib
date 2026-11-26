@@ -11,12 +11,10 @@
 
 import argparse
 from math import gcd
-from pathlib import Path
 
 import torch
 import pypto.language as pl
 import pypto.language.distributed as pld
-from pypto.runtime import pto_isa_include_dir
 
 
 if __name__ == "__main__":
@@ -99,14 +97,21 @@ SWIGLU_GROUPS_PER_CHUNK = SWIGLU_LANES // MX_GROUP
 SWIGLU_COUNT_LANES = SWIGLU_LANES
 SWIGLU_SCALE_SCRATCH_TILE = SWIGLU_ROW_TILE * (MOE_INTER // SWIGLU_LANES) * 8
 
-# Full physical activation-scale row tiles with a clamped capacity tail.
-W13_M_TILE = min(64, gcd(RECV_MAX, 160))
-W13_TAIL_M_TILE = RECV_MAX % W13_M_TILE or W13_M_TILE
+# Use the kernel's wide M256 capacity with dynamic valid rows on larger workloads.
+W13_M_TILE = 256 if MOE_TOKENS >= 384 else min(64, gcd(RECV_MAX, 160))
+# Shorten each activation stage for the wider M tile to fit both stages in Mat.
+W13_A_STAGE_K = 256 if W13_M_TILE > 128 else 1024
+W13_SHORT_M_TILE = 64
 W13_N_TILE = MX_MM_INTER_TILE
 W13_K_TILE = MX_K_TILE
-W13_SCALE_K = W13_K_TILE // MX_GROUP
+# Four raw prefetch slots fit beside the two padded NZ conversion slots.
+W13_K_BATCH = 4
+W13_L0_K = 128
+W13_L0_SCALE_K = W13_L0_K // MX_GROUP
+W13_SHORT_SCALE_STAGE_K = 4096
+W13_LONG_SCALE_STAGE_K = 2048
+W13_PACKED_LANE_BYTES = MX_PACKED_LANE_ROWS * MX_PACKED_LANE_COLS
 W13_PACKED_EXPERT_ROWS = MX_W1_PACKED_ROWS
-FP4_LUT_SIZE = 256
 
 
 @pl.jit.inline(auto_scope=False)
@@ -467,219 +472,312 @@ def dispatch(
     )
 
 
-@pl.jit.extern(
-    core_type="mixed",
-    aic_source=Path(__file__).parent / "kernels" / "expert_routed_w13.cpp",
-    aiv_source=Path(__file__).parent / "kernels" / "expert_routed_w13.cpp",
-    dual_aiv_dispatch=True, include_dirs=(pto_isa_include_dir(),),
-)
-def _routed_w13(
+@pl.jit.inline(auto_scope=False)
+def _w13_load_scale_stage(
+    x_scale: pl.Tensor,
+    w1_scale: pl.Tensor,
+    w3_scale: pl.Tensor,
+    x_row: pl.Scalar[pl.INDEX],
+    compute_m: pl.Scalar[pl.INDEX],
+    expert: pl.Scalar[pl.INDEX],
+    col: pl.Scalar[pl.INDEX],
+    projection: pl.Scalar[pl.INDEX],
+    experts: pl.constexpr,
+    stride: pl.constexpr,
+    m_tile: pl.constexpr,
+    scale_offset: pl.constexpr,
+    scale_groups: pl.constexpr,
+):
+    a_scale = pl.tensor.view(x_scale, [experts * stride, K_SCALE], layout=pl.MX_A_ZZ)
+    # Mat scale loads cover complete 16-row fractals; L0 extraction uses the actual M.
+    a_scale_loaded = pl.load(
+        a_scale, [x_row, scale_offset], [m_tile, scale_groups],
+        valid_shape=[((compute_m + 15) // 16) * 16, scale_groups], target_memory=pl.Mem.Mat,
+    )
+    a_scale_stage = pl.set_validshape(a_scale_loaded, compute_m, scale_groups)
+    # Weight scales already have MX_B_NN physical order. Gather either
+    # projection directly into the same Mat allocation, then reinterpret it
+    # as a logical scale tile. This avoids an unsupported Mat-to-Mat scale copy
+    # when merging the projection branches.
+    raw_b1 = pl.tensor.view(w1_scale, [MOE_INTER // 16, experts * K_SCALE * 16], layout=pl.ND)
+    raw_b3 = pl.tensor.view(w3_scale, [MOE_INTER // 16, experts * K_SCALE * 16], layout=pl.ND)
+    b_buf: pl.Tile[[W13_N_TILE // 16, scale_groups * 16], pl.FP8E8M0, pl.MemRef("w13_bs_stage"), pl.Mem.Mat] = pl.tile.create(
+        [W13_N_TILE // 16, scale_groups * 16], pl.FP8E8M0, target_memory=pl.Mem.Mat, flat_layout=True,
+    )
+    b_dst = pl.tile.reshape(b_buf, [W13_N_TILE // 16, scale_groups * 16])
+    if projection == 0:
+        _b_loaded = pl.tile.gather_row(
+            b_dst, raw_b1, [0, 0], [col // 16, (expert * K_SCALE + scale_offset) * 16],
+            [W13_N_TILE // 16, scale_groups * 16],
+        )
+    else:
+        _b_loaded = pl.tile.gather_row(
+            b_dst, raw_b3, [0, 0], [col // 16, (expert * K_SCALE + scale_offset) * 16],
+            [W13_N_TILE // 16, scale_groups * 16],
+        )
+    b_scale_stage: pl.Tile[
+        [scale_groups, W13_N_TILE], pl.FP8E8M0,
+        pl.MemRef("w13_bs_stage"), pl.Mem.Mat,
+        pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32),
+    ] = pl.tile.create([scale_groups, W13_N_TILE], pl.FP8E8M0, target_memory=pl.Mem.Mat)
+    return a_scale_stage, b_scale_stage
+
+
+@pl.jit.inline(auto_scope=False)
+def _w13_cube_panel(
     x: pl.Tensor,
     x_scale: pl.Tensor,
-    counts: pl.Tensor,
-    w1: pl.Tensor,
     w1_scale: pl.Tensor,
-    w3: pl.Tensor,
     w3_scale: pl.Tensor,
-    pair: pl.Out[pl.Tensor],
-    route_weights: pl.Tensor,
-    compact_weights: pl.Out[pl.Tensor],
-    experts: pl.Scalar[pl.INDEX],
-    stride: pl.Scalar[pl.INDEX],
-    width: pl.Scalar[pl.INDEX],
-    hidden: pl.Scalar[pl.INDEX],
-    activation_rows: pl.Scalar[pl.INDEX],
-    row_capacity: pl.constexpr,
-) -> tuple[pl.Tensor, pl.Tensor]:
-    """Store compact BF16 projections and route weights with the same row order."""
-    return pair, compact_weights
-
-
+    pair: pl.InOut[pl.Tensor],
+    expert: pl.Scalar[pl.INDEX],
+    row: pl.Scalar[pl.INDEX],
+    projection: pl.Scalar[pl.INDEX],
+    block: pl.Scalar[pl.INDEX],
+    out_row: pl.Scalar[pl.INDEX],
+    valid: pl.Scalar[pl.INDEX],
+    experts: pl.constexpr,
+    stride: pl.constexpr,
+    m_tile: pl.constexpr,
+    a_stage_k: pl.constexpr,
+    scale_stage_k: pl.constexpr,
+    scale_stage1_k: pl.constexpr,
+):
+    # The row origin stays fixed; dynamic valid M prevents reading or computing a padded tail.
+    x_row = pl.max(0, expert * (stride // 16) + row // 16) * 16
+    col = block * W13_N_TILE
+    compute_m = pl.min(m_tile, valid)
+    a_stage0 = pl.load(
+        x, [x_row, 0], [m_tile, a_stage_k], valid_shape=[compute_m, a_stage_k], target_memory=pl.Mem.Mat,
+    )
+    as_stage0, bs_stage0 = _w13_load_scale_stage(
+        x_scale, w1_scale, w3_scale, x_row, compute_m, expert, col, projection,
+        experts, stride, m_tile, 0, scale_stage_k // MX_GROUP,
+    )
+    a_stage1 = pl.load(
+        x, [x_row, a_stage_k], [m_tile, a_stage_k], valid_shape=[compute_m, a_stage_k], target_memory=pl.Mem.Mat,
+    )
+    as_stage1, bs_stage1 = _w13_load_scale_stage(
+        x_scale, w1_scale, w3_scale, x_row, compute_m, expert, col, projection,
+        experts, stride, m_tile, scale_stage_k // MX_GROUP, scale_stage1_k // MX_GROUP,
+    )
+    if scale_stage_k == W13_LONG_SCALE_STAGE_K:
+        as_stage2, bs_stage2 = _w13_load_scale_stage(
+            x_scale, w1_scale, w3_scale, x_row, compute_m, expert, col, projection,
+            experts, stride, m_tile, (D - 1024) // MX_GROUP, 1024 // MX_GROUP,
+        )
+    else:
+        as_stage2, bs_stage2 = as_stage1, bs_stage1
+    acc_seed = pl.tile.create([m_tile, W13_N_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc, compact=True)
+    acc = pl.set_validshape(acc_seed, pl.min(compute_m, m_tile), W13_N_TILE)
+    for k in pl.unroll(0, D, W13_K_TILE):
+        b = pl.system.tpop_from_aiv(shape=[W13_K_TILE, W13_N_TILE], dtype=pl.FP8E4M3FN, split=1, id=0)
+        a_offset = k % a_stage_k
+        scale_offset = (k % scale_stage_k) // MX_GROUP
+        if (k // a_stage_k) % 2 == 0:
+            a_left0 = pl.tile.extract(a_stage0, 0, a_offset, [m_tile, W13_L0_K], target_memory=pl.Mem.Left)
+        else:
+            a_left0 = pl.tile.extract(a_stage1, 0, a_offset, [m_tile, W13_L0_K], target_memory=pl.Mem.Left)
+        b_right0 = pl.tile.extract(b, 0, 0, [W13_L0_K, W13_N_TILE], target_memory=pl.Mem.Right)
+        if k < scale_stage_k:
+            as0 = pl.tile.extract(as_stage0, 0, scale_offset, [m_tile, W13_L0_SCALE_K], target_memory=pl.Mem.LeftScale)
+            bs0 = pl.tile.extract(bs_stage0, scale_offset, 0, [W13_L0_SCALE_K, W13_N_TILE], target_memory=pl.Mem.RightScale)
+        elif k < 2 * scale_stage_k:
+            as0 = pl.tile.extract(as_stage1, 0, scale_offset, [m_tile, W13_L0_SCALE_K], target_memory=pl.Mem.LeftScale)
+            bs0 = pl.tile.extract(bs_stage1, scale_offset, 0, [W13_L0_SCALE_K, W13_N_TILE], target_memory=pl.Mem.RightScale)
+        else:
+            as0 = pl.tile.extract(as_stage2, 0, scale_offset, [m_tile, W13_L0_SCALE_K], target_memory=pl.Mem.LeftScale)
+            bs0 = pl.tile.extract(bs_stage2, scale_offset, 0, [W13_L0_SCALE_K, W13_N_TILE], target_memory=pl.Mem.RightScale)
+        # Keep both K128 halves live to reserve distinct L0 slots. With scale
+        # addresses paired to these slots at allocation time, MTE1 and Cube
+        # have no intervening scalar address-binding dependency.
+        if (k // a_stage_k) % 2 == 0:
+            a_left1 = pl.tile.extract(a_stage0, 0, a_offset + W13_L0_K, [m_tile, W13_L0_K], target_memory=pl.Mem.Left)
+        else:
+            a_left1 = pl.tile.extract(a_stage1, 0, a_offset + W13_L0_K, [m_tile, W13_L0_K], target_memory=pl.Mem.Left)
+        b_right1 = pl.tile.extract(b, W13_L0_K, 0, [W13_L0_K, W13_N_TILE], target_memory=pl.Mem.Right)
+        if k < scale_stage_k:
+            as1 = pl.tile.extract(as_stage0, 0, scale_offset + W13_L0_SCALE_K, [m_tile, W13_L0_SCALE_K], target_memory=pl.Mem.LeftScale)
+            bs1 = pl.tile.extract(bs_stage0, scale_offset + W13_L0_SCALE_K, 0, [W13_L0_SCALE_K, W13_N_TILE], target_memory=pl.Mem.RightScale)
+        elif k < 2 * scale_stage_k:
+            as1 = pl.tile.extract(as_stage1, 0, scale_offset + W13_L0_SCALE_K, [m_tile, W13_L0_SCALE_K], target_memory=pl.Mem.LeftScale)
+            bs1 = pl.tile.extract(bs_stage1, scale_offset + W13_L0_SCALE_K, 0, [W13_L0_SCALE_K, W13_N_TILE], target_memory=pl.Mem.RightScale)
+        else:
+            as1 = pl.tile.extract(as_stage2, 0, scale_offset + W13_L0_SCALE_K, [m_tile, W13_L0_SCALE_K], target_memory=pl.Mem.LeftScale)
+            bs1 = pl.tile.extract(bs_stage2, scale_offset + W13_L0_SCALE_K, 0, [W13_L0_SCALE_K, W13_N_TILE], target_memory=pl.Mem.RightScale)
+        pl.system.tfree_to_aiv(b, id=0)
+        if k == 0:
+            acc = pl.matmul_mx(a_left0, as0, b_right0, bs0)
+        else:
+            acc = pl.matmul_mx_acc(acc, a_left0, as0, b_right0, bs0)
+        acc = pl.matmul_mx_acc(acc, a_left1, as1, b_right1, bs1)
+        if k % a_stage_k == a_stage_k - W13_K_TILE and k + a_stage_k + W13_K_TILE < D:
+            if (k // a_stage_k) % 2 == 0:
+                a_stage0 = pl.load(
+                    x, [x_row, k + a_stage_k + W13_K_TILE], [m_tile, a_stage_k], valid_shape=[compute_m, a_stage_k], target_memory=pl.Mem.Mat,
+                )
+            else:
+                a_stage1 = pl.load(
+                    x, [x_row, k + a_stage_k + W13_K_TILE], [m_tile, a_stage_k], valid_shape=[compute_m, a_stage_k], target_memory=pl.Mem.Mat,
+                )
+    pair = pl.store(acc, [out_row, projection * MOE_INTER + col], pair)
+    return pair
 
 
 @pl.jit.incore(level=pl.Level.AIC)
-def routed_w13_nz_cube(x: pl.Tensor, x_scale: pl.Tensor, counts: pl.Tensor, w1: pl.Tensor, w1_scale: pl.Tensor, w3: pl.Tensor, w3_scale: pl.Tensor, fp4_lut: pl.Tensor, pair: pl.InOut[pl.Tensor], route_weights: pl.Tensor, compact_weights: pl.InOut[pl.Tensor], experts: pl.constexpr, stride: pl.constexpr):
+def routed_w13_nz_cube(x: pl.Tensor, x_scale: pl.Tensor, counts: pl.Tensor, w1: pl.Tensor, w1_scale: pl.Tensor, w3: pl.Tensor, w3_scale: pl.Tensor, pair: pl.InOut[pl.Tensor], route_weights: pl.Tensor, compact_weights: pl.InOut[pl.Tensor], experts: pl.constexpr, stride: pl.constexpr):
     pl.func_attr({'split_aiv': True})
     weight_ring = pl.system.reserve_buffer(name='w13_weight_ring', size=196608)
     pl.system.aic_initialize_pipe(v2c_consumer_buf=weight_ring, dir_mask=2, slot_size=65536, slot_num=3, id=0)
     core = pl.tile.get_block_idx()
+    workers = pl.tile.get_block_num()
     work_base = 0
     active_base = 0
     for expert in pl.range(experts):
         count = pl.cast(pl.read(counts, [expert, 0]), pl.INDEX)
-        row_tiles = (count + W13_M_TILE - 1) // W13_M_TILE
+        short_rows = MOE_TOKENS >= 384 and count <= W13_SHORT_M_TILE
+        row_tile = W13_M_TILE
+        if short_rows:
+            row_tile = W13_SHORT_M_TILE
+        row_tiles = (count + row_tile - 1) // row_tile
         panel_cols = MOE_INTER // W13_N_TILE
         panels = row_tiles * 2 * panel_cols
-        first_panel = (core + ROUTED_CUBE_WORKER_TILE - work_base % ROUTED_CUBE_WORKER_TILE) % ROUTED_CUBE_WORKER_TILE
-        for panel_id in pl.range(first_panel, panels, ROUTED_CUBE_WORKER_TILE):
-            row = panel_id // (2 * panel_cols) * W13_M_TILE
+        first_panel = (core + workers - work_base % workers) % workers
+        for panel_id in pl.range(first_panel, panels, workers):
+            row = panel_id // (2 * panel_cols) * row_tile
             projection = panel_id // panel_cols % 2
             block = panel_id % panel_cols
-            input_row = pl.min(row // 16, (stride - W13_M_TILE) // 16) * 16
-            x_row = expert * stride + input_row
             out_row = active_base + row
-            valid = pl.min(W13_M_TILE, count - row)
-            col = block * W13_N_TILE
-            scale_row = expert * K_SCALE
-            a_stage0: pl.Tile[[W13_M_TILE, 1024], pl.FP8E4M3FN, pl.MemRef('w13_a_stage', slots=2)[0], pl.Mem.Mat] = pl.load(x, [x_row, 0], [W13_M_TILE, 1024], target_memory=pl.Mem.Mat)
-            a0 = pl.tile.slice(a_stage0, [W13_M_TILE, W13_K_TILE], [0, 0], valid_shape=[W13_M_TILE, W13_K_TILE])
-            a0_left = pl.move(a0, target_memory=pl.Mem.Left)
-            a_stage1: pl.Tile[[W13_M_TILE, 1024], pl.FP8E4M3FN, pl.MemRef('w13_a_stage', slots=2)[1], pl.Mem.Mat] = pl.load(x, [x_row, 1024], [W13_M_TILE, 1024], target_memory=pl.Mem.Mat)
-            as0: pl.Tile[[W13_M_TILE, W13_SCALE_K], pl.FP8E8M0, pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.system.tpop_from_aiv(shape=[W13_M_TILE, W13_SCALE_K], dtype=pl.FP8E8M0, split=1, id=0)
-            as0_scale = pl.move(as0, target_memory=pl.Mem.LeftScale)
-            pl.system.tfree_to_aiv(as0, id=0)
-            bs0: pl.Tile[[W13_SCALE_K, W13_N_TILE], pl.FP8E8M0, pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.system.tpop_from_aiv(shape=[W13_SCALE_K, W13_N_TILE], dtype=pl.FP8E8M0, split=1, id=0)
-            b0 = pl.system.tpop_from_aiv(shape=[W13_K_TILE, W13_N_TILE], dtype=pl.FP8E4M3FN, split=1, id=0)
-            b0_right = pl.move(b0, target_memory=pl.Mem.Right)
-            bs0_scale = pl.move(bs0, target_memory=pl.Mem.RightScale)
-            pl.system.tfree_to_aiv(bs0, id=0)
-            pl.system.tfree_to_aiv(b0, id=0)
-            acc = pl.matmul_mx(a0_left, as0_scale, b0_right, bs0_scale)
-            for k in pl.unroll(W13_K_TILE, D, W13_K_TILE):
-                if (k // 1024) % 2 == 0:
-                    a = pl.tile.slice(a_stage0, [W13_M_TILE, W13_K_TILE], [0, k % 1024], valid_shape=[W13_M_TILE, W13_K_TILE])
-                else:
-                    a = pl.tile.slice(a_stage1, [W13_M_TILE, W13_K_TILE], [0, k % 1024], valid_shape=[W13_M_TILE, W13_K_TILE])
-                a_left = pl.move(a, target_memory=pl.Mem.Left)
-                if k % 1024 == 768 and k + 1280 < D:
-                    if (k // 1024) % 2 == 0:
-                        a_stage0: pl.Tile[[W13_M_TILE, 1024], pl.FP8E4M3FN, pl.MemRef('w13_a_stage', slots=2)[0], pl.Mem.Mat] = pl.load(x, [x_row, k + 1280], [W13_M_TILE, 1024], target_memory=pl.Mem.Mat)
-                    else:
-                        a_stage1: pl.Tile[[W13_M_TILE, 1024], pl.FP8E4M3FN, pl.MemRef('w13_a_stage', slots=2)[1], pl.Mem.Mat] = pl.load(x, [x_row, k + 1280], [W13_M_TILE, 1024], target_memory=pl.Mem.Mat)
-                as_: pl.Tile[[W13_M_TILE, W13_SCALE_K], pl.FP8E8M0, pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.system.tpop_from_aiv(shape=[W13_M_TILE, W13_SCALE_K], dtype=pl.FP8E8M0, split=1, id=0)
-                as_scale = pl.move(as_, target_memory=pl.Mem.LeftScale)
-                pl.system.tfree_to_aiv(as_, id=0)
-                bs: pl.Tile[[W13_SCALE_K, W13_N_TILE], pl.FP8E8M0, pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.system.tpop_from_aiv(shape=[W13_SCALE_K, W13_N_TILE], dtype=pl.FP8E8M0, split=1, id=0)
-                b = pl.system.tpop_from_aiv(shape=[W13_K_TILE, W13_N_TILE], dtype=pl.FP8E4M3FN, split=1, id=0)
-                b_right = pl.move(b, target_memory=pl.Mem.Right)
-                bs_scale = pl.move(bs, target_memory=pl.Mem.RightScale)
-                pl.system.tfree_to_aiv(bs, id=0)
-                pl.system.tfree_to_aiv(b, id=0)
-                acc = pl.matmul_mx_acc(acc, a_left, as_scale, b_right, bs_scale)
-            if row + W13_M_TILE > stride:
-                tail_offset = W13_M_TILE - W13_TAIL_M_TILE
-                tail = pl.tile.slice(acc, [W13_TAIL_M_TILE, W13_N_TILE], [tail_offset, 0], valid_shape=[valid, W13_N_TILE])
-                pair = pl.store(tail, [out_row, projection * MOE_INTER + col], pair)
+            valid = pl.min(row_tile, count - row)
+            if short_rows:
+                pair = _w13_cube_panel(
+                    x, x_scale, w1_scale, w3_scale, pair, expert, row, projection,
+                    block, out_row, valid, experts, stride, W13_SHORT_M_TILE,
+                    1024, W13_SHORT_SCALE_STAGE_K, 1024,
+                )
             else:
-                narrowed = pl.tile.slice(acc, [W13_M_TILE, W13_N_TILE], [0, 0], valid_shape=[valid, W13_N_TILE])
-                pair = pl.store(narrowed, [out_row, projection * MOE_INTER + col], pair)
+                pair = _w13_cube_panel(
+                    x, x_scale, w1_scale, w3_scale, pair, expert, row, projection,
+                    block, out_row, valid, experts, stride, W13_M_TILE,
+                    W13_A_STAGE_K,
+                    W13_LONG_SCALE_STAGE_K if W13_M_TILE > 128 else W13_SHORT_SCALE_STAGE_K,
+                    2048 if W13_M_TILE > 128 else 1024,
+                )
         work_base = work_base + panels
         active_base = active_base + count
     return pair
 
 
+@pl.jit.inline(auto_scope=False)
+def _w13_vector_panel(
+    w1: pl.Tensor,
+    w3: pl.Tensor,
+    expert: pl.Scalar[pl.INDEX],
+    projection: pl.Scalar[pl.INDEX],
+    block: pl.Scalar[pl.INDEX],
+    lane: pl.Scalar[pl.INDEX],
+    experts: pl.constexpr,
+):
+    packed_rows = experts * W13_PACKED_EXPERT_ROWS // W13_K_TILE
+    w1_packed = pl.tensor.view(w1, [packed_rows, 2 * W13_PACKED_LANE_BYTES], layout=pl.ND)
+    w3_packed = pl.tensor.view(w3, [packed_rows, 2 * W13_PACKED_LANE_BYTES], layout=pl.ND)
+    panel = expert * W13_PACKED_EXPERT_ROWS + block * D
+    packed_row = panel // W13_K_TILE
+    packed_col = lane * W13_PACKED_LANE_BYTES
+    # Prime four independent raw slots, then refill a slot as soon as its cast is issued.
+    if projection == 0:
+        raw0 = pl.load(w1_packed, [packed_row + 0, packed_col], [1, W13_PACKED_LANE_BYTES])
+    else:
+        raw0 = pl.load(w3_packed, [packed_row + 0, packed_col], [1, W13_PACKED_LANE_BYTES])
+    if projection == 0:
+        raw1 = pl.load(w1_packed, [packed_row + 1, packed_col], [1, W13_PACKED_LANE_BYTES])
+    else:
+        raw1 = pl.load(w3_packed, [packed_row + 1, packed_col], [1, W13_PACKED_LANE_BYTES])
+    if projection == 0:
+        raw2 = pl.load(w1_packed, [packed_row + 2, packed_col], [1, W13_PACKED_LANE_BYTES])
+    else:
+        raw2 = pl.load(w3_packed, [packed_row + 2, packed_col], [1, W13_PACKED_LANE_BYTES])
+    if projection == 0:
+        raw3 = pl.load(w1_packed, [packed_row + 3, packed_col], [1, W13_PACKED_LANE_BYTES])
+    else:
+        raw3 = pl.load(w3_packed, [packed_row + 3, packed_col], [1, W13_PACKED_LANE_BYTES])
+    for i in pl.unroll(0, D // W13_K_TILE):
+        if i % W13_K_BATCH == 0:
+            raw = raw0
+        elif i % W13_K_BATCH == 1:
+            raw = raw1
+        elif i % W13_K_BATCH == 2:
+            raw = raw2
+        else:
+            raw = raw3
+        packed = pl.reshape(raw, [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS])
+        fp4_raw = pl.reinterpret_view(packed, pl.FP4E2M1X2)
+        if i % 2 == 0:
+            nz: pl.Tile[
+                [W13_N_TILE // 2, W13_K_TILE], pl.FP8E4M3FN,
+                pl.MemRef("w13_nz", slots=2)[0], pl.Mem.Vec,
+                pl.TileView(
+                    blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major,
+                    fractal=512, compact=pl.CompactMode.row_plus_one,
+                ),
+            ] = pl.cast(fp4_raw, pl.FP8E4M3FN, layout=pl.NZ)
+        else:
+            nz: pl.Tile[
+                [W13_N_TILE // 2, W13_K_TILE], pl.FP8E4M3FN,
+                pl.MemRef("w13_nz", slots=2)[1], pl.Mem.Vec,
+                pl.TileView(
+                    blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major,
+                    fractal=512, compact=pl.CompactMode.row_plus_one,
+                ),
+            ] = pl.cast(fp4_raw, pl.FP8E4M3FN, layout=pl.NZ)
+        if i + W13_K_BATCH < D // W13_K_TILE:
+            if projection == 0:
+                next_raw = pl.load(w1_packed, [packed_row + i + W13_K_BATCH, packed_col], [1, W13_PACKED_LANE_BYTES])
+            else:
+                next_raw = pl.load(w3_packed, [packed_row + i + W13_K_BATCH, packed_col], [1, W13_PACKED_LANE_BYTES])
+            if i % W13_K_BATCH == 0:
+                raw0 = next_raw
+            elif i % W13_K_BATCH == 1:
+                raw1 = next_raw
+            elif i % W13_K_BATCH == 2:
+                raw2 = next_raw
+            else:
+                raw3 = next_raw
+        pl.system.tpush_to_aic(nz, split=1, id=0)
+
+
 @pl.jit.incore(level=pl.Level.AIV)
-def routed_w13_nz_vector(x: pl.Tensor, x_scale: pl.Tensor, counts: pl.Tensor, w1: pl.Tensor, w1_scale: pl.Tensor, w3: pl.Tensor, w3_scale: pl.Tensor, fp4_lut: pl.Tensor, pair: pl.InOut[pl.Tensor], route_weights: pl.Tensor, compact_weights: pl.InOut[pl.Tensor], experts: pl.constexpr, stride: pl.constexpr):
+def routed_w13_nz_vector(x: pl.Tensor, x_scale: pl.Tensor, counts: pl.Tensor, w1: pl.Tensor, w1_scale: pl.Tensor, w3: pl.Tensor, w3_scale: pl.Tensor, pair: pl.InOut[pl.Tensor], route_weights: pl.Tensor, compact_weights: pl.InOut[pl.Tensor], experts: pl.constexpr, stride: pl.constexpr):
     pl.func_attr({'split_aiv': True, 'dual_aiv_dispatch': True})
     lane = pl.tile.get_subblock_idx()
     peer_ring = pl.system.import_peer_buffer(name='w13_weight_ring', peer_func='routed_w13_nz_cube')
     pl.system.aiv_initialize_pipe(v2c_consumer_buf=peer_ring, dir_mask=2, slot_size=65536, slot_num=3, id=0)
-    w1_flat = pl.tensor.view(w1, [experts * W13_PACKED_EXPERT_ROWS, MX_PACKED_LANE_COLS], layout=pl.ND)
-    w3_flat = pl.tensor.view(w3, [experts * W13_PACKED_EXPERT_ROWS, MX_PACKED_LANE_COLS], layout=pl.ND)
-    w13_a_nd = pl.tensor.view(x_scale, [experts * stride // 16, K_SCALE * 16], layout=pl.ND)
-    w1_scale_nd = pl.tensor.view(w1_scale, [MOE_INTER // 16, experts * K_SCALE * 16], layout=pl.ND)
-    w3_scale_nd = pl.tensor.view(w3_scale, [MOE_INTER // 16, experts * K_SCALE * 16], layout=pl.ND)
     route_flat = pl.tensor.view(route_weights, [1, experts * stride], layout=pl.ND)
     compact_flat = pl.tensor.view(compact_weights, [1, compact_weights.shape[0]], layout=pl.ND)
     core = pl.tile.get_block_idx()
+    workers = pl.tile.get_block_num()
     work_base = 0
     active_base = 0
     for expert in pl.range(experts):
         count = pl.cast(pl.read(counts, [expert, 0]), pl.INDEX)
-        row_tiles = (count + W13_M_TILE - 1) // W13_M_TILE
+        short_rows = MOE_TOKENS >= 384 and count <= W13_SHORT_M_TILE
+        row_tile = W13_M_TILE
+        if short_rows:
+            row_tile = W13_SHORT_M_TILE
+        row_tiles = (count + row_tile - 1) // row_tile
         panel_cols = MOE_INTER // W13_N_TILE
         panels = row_tiles * 2 * panel_cols
-        first_panel = (core + ROUTED_CUBE_WORKER_TILE - work_base % ROUTED_CUBE_WORKER_TILE) % ROUTED_CUBE_WORKER_TILE
-        for panel_id in pl.range(first_panel, panels, ROUTED_CUBE_WORKER_TILE):
-            row = panel_id // (2 * panel_cols) * W13_M_TILE
+        first_panel = (core + workers - work_base % workers) % workers
+        for panel_id in pl.range(first_panel, panels, workers):
+            row = panel_id // (2 * panel_cols) * row_tile
             projection = panel_id // panel_cols % 2
             block = panel_id % panel_cols
             out_row = active_base + row
-            valid = pl.min(W13_M_TILE, count - row)
-            panel = expert * W13_PACKED_EXPERT_ROWS + block * D
-            a_scale_resident = pl.load(w13_a_nd, [(expert * stride + pl.min(row, stride - W13_M_TILE) + lane * (W13_M_TILE // 2)) // 16, 0], [W13_M_TILE // 32, K_SCALE * 16], target_memory=pl.Mem.Vec)
-            a_scale_resident_codes = pl.reinterpret_view(a_scale_resident, pl.UINT8)
-            a_scale_resident_bytes = pl.reinterpret_view(a_scale_resident_codes, pl.INT8)
-            if projection == 0:
-                b_scale_resident = pl.load(w1_scale_nd, [(block * W13_N_TILE + lane * 128) // 16, expert * K_SCALE * 16], [8, K_SCALE * 16], target_memory=pl.Mem.Vec)
-            else:
-                b_scale_resident = pl.load(w3_scale_nd, [(block * W13_N_TILE + lane * 128) // 16, expert * K_SCALE * 16], [8, K_SCALE * 16], target_memory=pl.Mem.Vec)
-            b_scale_resident_codes = pl.reinterpret_view(b_scale_resident, pl.UINT8)
-            b_scale_resident_bytes = pl.reinterpret_view(b_scale_resident_codes, pl.INT8)
-            if projection == 0:
-                raw0: pl.Tile[[128, 128], pl.UINT8, pl.Mem.Vec] = pl.load(w1_flat, [panel + 0 * W13_K_TILE + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-            else:
-                raw0: pl.Tile[[128, 128], pl.UINT8, pl.Mem.Vec] = pl.load(w3_flat, [panel + 0 * W13_K_TILE + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-            if projection == 0:
-                raw1: pl.Tile[[128, 128], pl.UINT8, pl.Mem.Vec] = pl.load(w1_flat, [panel + 1 * W13_K_TILE + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-            else:
-                raw1: pl.Tile[[128, 128], pl.UINT8, pl.Mem.Vec] = pl.load(w3_flat, [panel + 1 * W13_K_TILE + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-            if projection == 0:
-                raw2: pl.Tile[[128, 128], pl.UINT8, pl.Mem.Vec] = pl.load(w1_flat, [panel + 2 * W13_K_TILE + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-            else:
-                raw2: pl.Tile[[128, 128], pl.UINT8, pl.Mem.Vec] = pl.load(w3_flat, [panel + 2 * W13_K_TILE + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-            if projection == 0:
-                raw3: pl.Tile[[128, 128], pl.UINT8, pl.Mem.Vec] = pl.load(w1_flat, [panel + 3 * W13_K_TILE + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-            else:
-                raw3: pl.Tile[[128, 128], pl.UINT8, pl.Mem.Vec] = pl.load(w3_flat, [panel + 3 * W13_K_TILE + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-            for batch in pl.unroll(0, D, 4 * W13_K_TILE):
-                fp4_raw = pl.reinterpret_view(raw0, pl.FP4E2M1X2)
-                nz0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef('w13_nz', slots=2)[0], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.cast(fp4_raw, pl.FP8E4M3FN, layout=pl.NZ)
-                if batch + 4 * W13_K_TILE < D:
-                    if projection == 0:
-                        raw0: pl.Tile[[128, 128], pl.UINT8, pl.Mem.Vec] = pl.load(w1_flat, [panel + (batch + 4 * W13_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-                    else:
-                        raw0: pl.Tile[[128, 128], pl.UINT8, pl.Mem.Vec] = pl.load(w3_flat, [panel + (batch + 4 * W13_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-                a_scale_bytes: pl.Tile[[W13_M_TILE // 32, 128], pl.INT8, pl.MemRef('w13_scale_a_packet'), pl.Mem.Vec] = pl.tile.extract(a_scale_resident_bytes, 0, (batch + 0 * W13_K_TILE) // MX_GROUP * 16, [W13_M_TILE // 32, 128], target_memory=pl.Mem.Vec)
-                a_scale_packet: pl.Tile[[W13_M_TILE // 2, 8], pl.FP8E8M0, pl.MemRef('w13_scale_a_packet'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([W13_M_TILE // 2, 8], dtype=pl.FP8E8M0, target_memory=pl.Mem.Vec)
-                pl.system.tpush_to_aic(a_scale_packet, split=1, id=0)
-                b_scale_bytes: pl.Tile[[8, 128], pl.INT8, pl.MemRef('w13_scale_b_packet'), pl.Mem.Vec] = pl.tile.extract(b_scale_resident_bytes, 0, (expert * K_SCALE + (batch + 0 * W13_K_TILE) // MX_GROUP) * 16 - expert * K_SCALE * 16, [8, 128], target_memory=pl.Mem.Vec)
-                b_scale_packet: pl.Tile[[8, 128], pl.FP8E8M0, pl.MemRef('w13_scale_b_packet'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([8, 128], dtype=pl.FP8E8M0, target_memory=pl.Mem.Vec)
-                pl.system.tpush_to_aic(b_scale_packet, split=1, id=0)
-                pl.system.tpush_to_aic(nz0, split=1, id=0)
-                fp4_raw = pl.reinterpret_view(raw1, pl.FP4E2M1X2)
-                nz1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef('w13_nz', slots=2)[1], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.cast(fp4_raw, pl.FP8E4M3FN, layout=pl.NZ)
-                if batch + 5 * W13_K_TILE < D:
-                    if projection == 0:
-                        raw1: pl.Tile[[128, 128], pl.UINT8, pl.Mem.Vec] = pl.load(w1_flat, [panel + (batch + 5 * W13_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-                    else:
-                        raw1: pl.Tile[[128, 128], pl.UINT8, pl.Mem.Vec] = pl.load(w3_flat, [panel + (batch + 5 * W13_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-                a_scale_bytes: pl.Tile[[W13_M_TILE // 32, 128], pl.INT8, pl.MemRef('w13_scale_a_packet'), pl.Mem.Vec] = pl.tile.extract(a_scale_resident_bytes, 0, (batch + 1 * W13_K_TILE) // MX_GROUP * 16, [W13_M_TILE // 32, 128], target_memory=pl.Mem.Vec)
-                a_scale_packet: pl.Tile[[W13_M_TILE // 2, 8], pl.FP8E8M0, pl.MemRef('w13_scale_a_packet'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([W13_M_TILE // 2, 8], dtype=pl.FP8E8M0, target_memory=pl.Mem.Vec)
-                pl.system.tpush_to_aic(a_scale_packet, split=1, id=0)
-                b_scale_bytes: pl.Tile[[8, 128], pl.INT8, pl.MemRef('w13_scale_b_packet'), pl.Mem.Vec] = pl.tile.extract(b_scale_resident_bytes, 0, (expert * K_SCALE + (batch + 1 * W13_K_TILE) // MX_GROUP) * 16 - expert * K_SCALE * 16, [8, 128], target_memory=pl.Mem.Vec)
-                b_scale_packet: pl.Tile[[8, 128], pl.FP8E8M0, pl.MemRef('w13_scale_b_packet'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([8, 128], dtype=pl.FP8E8M0, target_memory=pl.Mem.Vec)
-                pl.system.tpush_to_aic(b_scale_packet, split=1, id=0)
-                pl.system.tpush_to_aic(nz1, split=1, id=0)
-                fp4_raw = pl.reinterpret_view(raw2, pl.FP4E2M1X2)
-                nz0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef('w13_nz', slots=2)[0], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.cast(fp4_raw, pl.FP8E4M3FN, layout=pl.NZ)
-                if batch + 6 * W13_K_TILE < D:
-                    if projection == 0:
-                        raw2: pl.Tile[[128, 128], pl.UINT8, pl.Mem.Vec] = pl.load(w1_flat, [panel + (batch + 6 * W13_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-                    else:
-                        raw2: pl.Tile[[128, 128], pl.UINT8, pl.Mem.Vec] = pl.load(w3_flat, [panel + (batch + 6 * W13_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-                a_scale_bytes: pl.Tile[[W13_M_TILE // 32, 128], pl.INT8, pl.MemRef('w13_scale_a_packet'), pl.Mem.Vec] = pl.tile.extract(a_scale_resident_bytes, 0, (batch + 2 * W13_K_TILE) // MX_GROUP * 16, [W13_M_TILE // 32, 128], target_memory=pl.Mem.Vec)
-                a_scale_packet: pl.Tile[[W13_M_TILE // 2, 8], pl.FP8E8M0, pl.MemRef('w13_scale_a_packet'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([W13_M_TILE // 2, 8], dtype=pl.FP8E8M0, target_memory=pl.Mem.Vec)
-                pl.system.tpush_to_aic(a_scale_packet, split=1, id=0)
-                b_scale_bytes: pl.Tile[[8, 128], pl.INT8, pl.MemRef('w13_scale_b_packet'), pl.Mem.Vec] = pl.tile.extract(b_scale_resident_bytes, 0, (expert * K_SCALE + (batch + 2 * W13_K_TILE) // MX_GROUP) * 16 - expert * K_SCALE * 16, [8, 128], target_memory=pl.Mem.Vec)
-                b_scale_packet: pl.Tile[[8, 128], pl.FP8E8M0, pl.MemRef('w13_scale_b_packet'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([8, 128], dtype=pl.FP8E8M0, target_memory=pl.Mem.Vec)
-                pl.system.tpush_to_aic(b_scale_packet, split=1, id=0)
-                pl.system.tpush_to_aic(nz0, split=1, id=0)
-                fp4_raw = pl.reinterpret_view(raw3, pl.FP4E2M1X2)
-                nz1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef('w13_nz', slots=2)[1], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.cast(fp4_raw, pl.FP8E4M3FN, layout=pl.NZ)
-                if batch + 7 * W13_K_TILE < D:
-                    if projection == 0:
-                        raw3: pl.Tile[[128, 128], pl.UINT8, pl.Mem.Vec] = pl.load(w1_flat, [panel + (batch + 7 * W13_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-                    else:
-                        raw3: pl.Tile[[128, 128], pl.UINT8, pl.Mem.Vec] = pl.load(w3_flat, [panel + (batch + 7 * W13_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-                a_scale_bytes: pl.Tile[[W13_M_TILE // 32, 128], pl.INT8, pl.MemRef('w13_scale_a_packet'), pl.Mem.Vec] = pl.tile.extract(a_scale_resident_bytes, 0, (batch + 3 * W13_K_TILE) // MX_GROUP * 16, [W13_M_TILE // 32, 128], target_memory=pl.Mem.Vec)
-                a_scale_packet: pl.Tile[[W13_M_TILE // 2, 8], pl.FP8E8M0, pl.MemRef('w13_scale_a_packet'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([W13_M_TILE // 2, 8], dtype=pl.FP8E8M0, target_memory=pl.Mem.Vec)
-                pl.system.tpush_to_aic(a_scale_packet, split=1, id=0)
-                b_scale_bytes: pl.Tile[[8, 128], pl.INT8, pl.MemRef('w13_scale_b_packet'), pl.Mem.Vec] = pl.tile.extract(b_scale_resident_bytes, 0, (expert * K_SCALE + (batch + 3 * W13_K_TILE) // MX_GROUP) * 16 - expert * K_SCALE * 16, [8, 128], target_memory=pl.Mem.Vec)
-                b_scale_packet: pl.Tile[[8, 128], pl.FP8E8M0, pl.MemRef('w13_scale_b_packet'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([8, 128], dtype=pl.FP8E8M0, target_memory=pl.Mem.Vec)
-                pl.system.tpush_to_aic(b_scale_packet, split=1, id=0)
-                pl.system.tpush_to_aic(nz1, split=1, id=0)
-            if projection == 0 and block == 0 and (lane == 0):
+            _w13_vector_panel(
+                w1, w3, expert, projection, block, lane, experts,
+            )
+            valid = pl.min(row_tile, count - row)
+            if projection == 0 and block == 0 and lane == 0:
                 route_row = expert * stride + row
                 route = pl.load(route_flat, [0, route_row], [1, W13_M_TILE], valid_shape=[1, valid])
                 compact_flat = pl.store(route, [0, out_row], compact_flat)
@@ -692,74 +790,296 @@ def routed_w13_nz_vector(x: pl.Tensor, x_scale: pl.Tensor, counts: pl.Tensor, w1
 def routed_w13_nz_group(
     x: pl.Tensor, x_scale: pl.Tensor, counts: pl.Tensor,
     w1: pl.Tensor, w1_scale: pl.Tensor, w3: pl.Tensor, w3_scale: pl.Tensor,
-    fp4_lut: pl.Tensor, pair: pl.InOut[pl.Tensor],
+    pair: pl.InOut[pl.Tensor],
     route_weights: pl.Tensor, compact_weights: pl.InOut[pl.Tensor],
     experts: pl.constexpr, stride: pl.constexpr,
 ):
-    pair = routed_w13_nz_cube(x, x_scale, counts, w1, w1_scale, w3, w3_scale, fp4_lut, pair, route_weights, compact_weights, experts, stride)
-    compact_weights = routed_w13_nz_vector(x, x_scale, counts, w1, w1_scale, w3, w3_scale, fp4_lut, pair, route_weights, compact_weights, experts, stride)
+    pair = routed_w13_nz_cube(x, x_scale, counts, w1, w1_scale, w3, w3_scale, pair, route_weights, compact_weights, experts, stride)
+    compact_weights = routed_w13_nz_vector(x, x_scale, counts, w1, w1_scale, w3, w3_scale, pair, route_weights, compact_weights, experts, stride)
     return pair, compact_weights
 
 
+# Routed W2 projection. Compact activations use the row-major MX_A_ND ABI;
+# Cube MTE2 packs their scales into Mat, so AIV only converts packed weights.
+W2_N_TILE = MX_W2_D_OUT_TILE
+W2_K_TILE = MX_K_TILE
+W2_L0_K = 128
+W2_L0_SCALE_K = W2_L0_K // MX_GROUP
+W2_SCALE_STAGE_K = 2048
+W2_K_BATCH = 4
+W2_PACKED_LANE_BYTES = MX_PACKED_LANE_ROWS * MX_PACKED_LANE_COLS
+
+
 @pl.jit.inline(auto_scope=False)
-def routed_w13_pypto(
+def _w2_row_tile(count: pl.Scalar[pl.INDEX]):
+    row_tile = 64
+    if count > 128:
+        row_tile = 256
+    elif count > 64:
+        row_tile = 128
+    return row_tile
+
+
+@pl.jit.inline(auto_scope=False)
+def _w2_cube_panel(
+    payload: pl.Tensor,
+    scales: pl.Tensor,
+    weight_scale: pl.Tensor,
+    output: pl.InOut[pl.Tensor],
+    expert: pl.Scalar[pl.INDEX],
+    row: pl.Scalar[pl.INDEX],
+    block: pl.Scalar[pl.INDEX],
+    valid: pl.Scalar[pl.INDEX],
+    m_tile: pl.constexpr,
+    a_stage_k: pl.constexpr,
+):
+    col = block * W2_N_TILE
+    compute_m = pl.min(m_tile, valid)
+    a_scale = pl.tensor.view(scales, [payload.shape[0], H_SCALE], layout=pl.MX_A_ND)
+    # Load scale stages directly in the Cube's Mat layout, including exact
+    # partial rows and the final K256 scale slice. Expert row bases need not
+    # be 16-row aligned because activation scales are stored in MX_A_ND.
+    scale_groups = W2_SCALE_STAGE_K // MX_GROUP
+    tail_groups = H_SCALE - scale_groups
+    as_stage0 = pl.load(
+        a_scale, [row, 0], [m_tile, scale_groups],
+        valid_shape=[compute_m, scale_groups], target_memory=pl.Mem.Mat,
+    )
+    bs_stage0 = pl.load(
+        weight_scale, [expert * H_SCALE, col], [scale_groups, W2_N_TILE],
+        target_memory=pl.Mem.Mat,
+    )
+    as_stage1 = pl.load(
+        a_scale, [row, scale_groups], [m_tile, tail_groups],
+        valid_shape=[compute_m, tail_groups], target_memory=pl.Mem.Mat,
+    )
+    bs_stage1 = pl.load(
+        weight_scale, [expert * H_SCALE + scale_groups, col], [tail_groups, W2_N_TILE],
+        target_memory=pl.Mem.Mat,
+    )
+    a_stage0 = pl.load(
+        payload, [row, 0], [m_tile, a_stage_k],
+        valid_shape=[compute_m, a_stage_k], target_memory=pl.Mem.Mat,
+    )
+    a_stage1 = pl.load(
+        payload, [row, a_stage_k], [m_tile, a_stage_k],
+        valid_shape=[compute_m, a_stage_k], target_memory=pl.Mem.Mat,
+    )
+    acc_seed = pl.tile.create([m_tile, W2_N_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc, compact=True)
+    acc = pl.set_validshape(acc_seed, pl.min(compute_m, m_tile), W2_N_TILE)
+    for k in pl.unroll(0, MOE_INTER, W2_K_TILE):
+        b = pl.system.tpop_from_aiv(shape=[W2_K_TILE, W2_N_TILE], dtype=pl.FP8E4M3FN, split=1, id=0)
+        a_offset = k % a_stage_k
+        scale_offset = (k % W2_SCALE_STAGE_K) // MX_GROUP
+        if (k // a_stage_k) % 2 == 0:
+            a_left0 = pl.tile.extract(a_stage0, 0, a_offset, [m_tile, W2_L0_K], target_memory=pl.Mem.Left)
+        else:
+            a_left0 = pl.tile.extract(a_stage1, 0, a_offset, [m_tile, W2_L0_K], target_memory=pl.Mem.Left)
+        b_right0 = pl.tile.extract(b, 0, 0, [W2_L0_K, W2_N_TILE], target_memory=pl.Mem.Right)
+        if k < W2_SCALE_STAGE_K:
+            as0 = pl.tile.extract(as_stage0, 0, scale_offset, [m_tile, W2_L0_SCALE_K], target_memory=pl.Mem.LeftScale)
+            bs0 = pl.tile.extract(bs_stage0, scale_offset, 0, [W2_L0_SCALE_K, W2_N_TILE], target_memory=pl.Mem.RightScale)
+        else:
+            as0 = pl.tile.extract(as_stage1, 0, scale_offset, [m_tile, W2_L0_SCALE_K], target_memory=pl.Mem.LeftScale)
+            bs0 = pl.tile.extract(bs_stage1, scale_offset, 0, [W2_L0_SCALE_K, W2_N_TILE], target_memory=pl.Mem.RightScale)
+        # Both K128 halves remain live in separate L0 slots.
+        if (k // a_stage_k) % 2 == 0:
+            a_left1 = pl.tile.extract(a_stage0, 0, a_offset + W2_L0_K, [m_tile, W2_L0_K], target_memory=pl.Mem.Left)
+        else:
+            a_left1 = pl.tile.extract(a_stage1, 0, a_offset + W2_L0_K, [m_tile, W2_L0_K], target_memory=pl.Mem.Left)
+        b_right1 = pl.tile.extract(b, W2_L0_K, 0, [W2_L0_K, W2_N_TILE], target_memory=pl.Mem.Right)
+        if k < W2_SCALE_STAGE_K:
+            as1 = pl.tile.extract(as_stage0, 0, scale_offset + W2_L0_SCALE_K, [m_tile, W2_L0_SCALE_K], target_memory=pl.Mem.LeftScale)
+            bs1 = pl.tile.extract(bs_stage0, scale_offset + W2_L0_SCALE_K, 0, [W2_L0_SCALE_K, W2_N_TILE], target_memory=pl.Mem.RightScale)
+        else:
+            as1 = pl.tile.extract(as_stage1, 0, scale_offset + W2_L0_SCALE_K, [m_tile, W2_L0_SCALE_K], target_memory=pl.Mem.LeftScale)
+            bs1 = pl.tile.extract(bs_stage1, scale_offset + W2_L0_SCALE_K, 0, [W2_L0_SCALE_K, W2_N_TILE], target_memory=pl.Mem.RightScale)
+        pl.system.tfree_to_aiv(b, id=0)
+        if k == 0:
+            acc = pl.matmul_mx(a_left0, as0, b_right0, bs0)
+        else:
+            acc = pl.matmul_mx_acc(acc, a_left0, as0, b_right0, bs0)
+        acc = pl.matmul_mx_acc(acc, a_left1, as1, b_right1, bs1)
+        if k % a_stage_k == a_stage_k - W2_K_TILE and k + a_stage_k + W2_K_TILE < MOE_INTER:
+            next_k = k + a_stage_k + W2_K_TILE
+            if (k // a_stage_k) % 2 == 0:
+                a_stage0 = pl.load(
+                    payload, [row, next_k], [m_tile, a_stage_k],
+                    valid_shape=[compute_m, a_stage_k], target_memory=pl.Mem.Mat,
+                )
+            else:
+                a_stage1 = pl.load(
+                    payload, [row, next_k], [m_tile, a_stage_k],
+                    valid_shape=[compute_m, a_stage_k], target_memory=pl.Mem.Mat,
+                )
+    output = pl.store(acc, [row, col], output)
+    return output
+
+
+@pl.jit.incore(level=pl.Level.AIC)
+def routed_w2_nz_cube(
+    payload: pl.Tensor, scales: pl.Tensor, counts: pl.Tensor, weight: pl.Tensor, weight_scale: pl.Tensor,
+    output: pl.InOut[pl.Tensor], experts: pl.constexpr, stride: pl.constexpr,
+):
+    pl.func_attr({'split_aiv': True})
+    weight_ring = pl.system.reserve_buffer(name='w2_weight_ring', size=196608)
+    pl.system.aic_initialize_pipe(v2c_consumer_buf=weight_ring, dir_mask=2, slot_size=65536, slot_num=3, id=0)
+    core = pl.tile.get_block_idx()
+    workers = pl.tile.get_block_num()
+    compact = 0
+    work_base = 0
+    for expert in pl.range(experts):
+        count = pl.cast(pl.read(counts, [expert, 0]), pl.INDEX)
+        row_tile = _w2_row_tile(count)
+        row_tiles = (count + row_tile - 1) // row_tile
+        work_count = row_tiles * (D // W2_N_TILE)
+        first = (core + workers - work_base % workers) % workers
+        for work in pl.range(first, work_count, workers):
+            row = work // (D // W2_N_TILE) * row_tile
+            block = work % (D // W2_N_TILE)
+            valid = pl.min(row_tile, count - row)
+            # K768 divides the full reduction for M64/M128. M256 uses
+            # K256 activation stages to stay within the Mat budget.
+            if row_tile == 64:
+                output = _w2_cube_panel(payload, scales, weight_scale, output, expert, compact + row, block, valid,
+                                        64, 768)
+            elif row_tile == 128:
+                output = _w2_cube_panel(payload, scales, weight_scale, output, expert, compact + row, block, valid,
+                                        128, 768)
+            else:
+                output = _w2_cube_panel(payload, scales, weight_scale, output, expert, compact + row, block, valid,
+                                        256, 256)
+        work_base = work_base + work_count
+        compact = compact + count
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
+def _w2_vector_panel(
+    weight: pl.Tensor, expert: pl.Scalar[pl.INDEX], block: pl.Scalar[pl.INDEX],
+    lane: pl.Scalar[pl.INDEX], experts: pl.constexpr,
+):
+    packed_rows = experts * MX_W2_PACKED_ROWS // W2_K_TILE
+    packed = pl.tensor.view(weight, [packed_rows, 2 * W2_PACKED_LANE_BYTES], layout=pl.ND)
+    packed_row = (expert * MX_W2_PACKED_ROWS + block * MOE_INTER) // W2_K_TILE
+    packed_col = lane * W2_PACKED_LANE_BYTES
+    raw0 = pl.load(packed, [packed_row, packed_col], [1, W2_PACKED_LANE_BYTES])
+    raw1 = pl.load(packed, [packed_row + 1, packed_col], [1, W2_PACKED_LANE_BYTES])
+    raw2 = pl.load(packed, [packed_row + 2, packed_col], [1, W2_PACKED_LANE_BYTES])
+    raw3 = pl.load(packed, [packed_row + 3, packed_col], [1, W2_PACKED_LANE_BYTES])
+    for i in pl.unroll(0, MOE_INTER // W2_K_TILE):
+        if i % W2_K_BATCH == 0:
+            raw = raw0
+        elif i % W2_K_BATCH == 1:
+            raw = raw1
+        elif i % W2_K_BATCH == 2:
+            raw = raw2
+        else:
+            raw = raw3
+        raw_packet = pl.reshape(raw, [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS])
+        fp4_raw = pl.reinterpret_view(raw_packet, pl.FP4E2M1X2)
+        if i % 2 == 0:
+            nz: pl.Tile[
+                [MX_PACKED_LANE_ROWS, W2_K_TILE], pl.FP8E4M3FN, pl.MemRef("w2_nz", slots=2)[0], pl.Mem.Vec,
+                pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major,
+                            fractal=512, compact=pl.CompactMode.row_plus_one),
+            ] = pl.cast(fp4_raw, pl.FP8E4M3FN, layout=pl.NZ)
+        else:
+            nz: pl.Tile[
+                [MX_PACKED_LANE_ROWS, W2_K_TILE], pl.FP8E4M3FN, pl.MemRef("w2_nz", slots=2)[1], pl.Mem.Vec,
+                pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major,
+                            fractal=512, compact=pl.CompactMode.row_plus_one),
+            ] = pl.cast(fp4_raw, pl.FP8E4M3FN, layout=pl.NZ)
+        if i + W2_K_BATCH < MOE_INTER // W2_K_TILE:
+            next_raw = pl.load(packed, [packed_row + i + W2_K_BATCH, packed_col], [1, W2_PACKED_LANE_BYTES])
+            if i % W2_K_BATCH == 0:
+                raw0 = next_raw
+            elif i % W2_K_BATCH == 1:
+                raw1 = next_raw
+            elif i % W2_K_BATCH == 2:
+                raw2 = next_raw
+            else:
+                raw3 = next_raw
+        pl.system.tpush_to_aic(nz, split=1, id=0)
+
+
+@pl.jit.incore(level=pl.Level.AIV)
+def routed_w2_nz_vector(
+    payload: pl.Tensor, scales: pl.Tensor, counts: pl.Tensor, weight: pl.Tensor, weight_scale: pl.Tensor,
+    output: pl.InOut[pl.Tensor], experts: pl.constexpr, stride: pl.constexpr,
+):
+    pl.func_attr({'split_aiv': True, 'dual_aiv_dispatch': True})
+    lane = pl.tile.get_subblock_idx()
+    peer_ring = pl.system.import_peer_buffer(name='w2_weight_ring', peer_func='routed_w2_nz_cube')
+    pl.system.aiv_initialize_pipe(v2c_consumer_buf=peer_ring, dir_mask=2, slot_size=65536, slot_num=3, id=0)
+    core = pl.tile.get_block_idx()
+    workers = pl.tile.get_block_num()
+    work_base = 0
+    for expert in pl.range(experts):
+        count = pl.cast(pl.read(counts, [expert, 0]), pl.INDEX)
+        row_tile = _w2_row_tile(count)
+        row_tiles = (count + row_tile - 1) // row_tile
+        work_count = row_tiles * (D // W2_N_TILE)
+        first = (core + workers - work_base % workers) % workers
+        for work in pl.range(first, work_count, workers):
+            block = work % (D // W2_N_TILE)
+            _w2_vector_panel(weight, expert, block, lane, experts)
+        work_base = work_base + work_count
+    return output
+
+
+@pl.jit.incore(level=pl.Level.CORE_GROUP)
+def routed_w2_nz_group(
+    payload: pl.Tensor, scales: pl.Tensor, counts: pl.Tensor,
+    weight: pl.Tensor, weight_scale: pl.Tensor,
+    output: pl.InOut[pl.Tensor], experts: pl.constexpr, stride: pl.constexpr,
+):
+    output = routed_w2_nz_cube(payload, scales, counts, weight, weight_scale, output, experts, stride)
+    output = routed_w2_nz_vector(payload, scales, counts, weight, weight_scale, output, experts, stride)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
+def _expert_routed_output(
     x: pl.Tensor,
     x_scale: pl.Tensor,
+    weights: pl.Tensor,
     counts: pl.Tensor,
     w1: pl.Tensor,
     w1_scale: pl.Tensor,
     w3: pl.Tensor,
     w3_scale: pl.Tensor,
-    fp4_lut: pl.Tensor,
-    pair: pl.Tensor,
-    route_weights: pl.Tensor,
-    compact_weights: pl.Tensor,
-    input_ready: pl.Scalar[pl.TASK_ID],
+    w2: pl.Tensor,
+    w2_scale: pl.Tensor,
     experts: pl.constexpr,
     stride: pl.constexpr,
-):
-    """Compute compact BF16 gate/up projections with two weight-decoding lanes.
-
-    Model callers retain the extern until native latency reaches parity.
-    """
-    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w13_nz", deps=[input_ready]) as ready:
-        pair, compact_weights = routed_w13_nz_group(x, x_scale, counts, w1, w1_scale, w3, w3_scale, fp4_lut, pair, route_weights, compact_weights, experts, stride)
-    return pair, compact_weights, ready
-
-
-@pl.jit.extern(
-    core_type="aiv", source=Path(__file__).parent / "kernels" / "expert_routed_swiglu.cpp",
-    include_dirs=(pto_isa_include_dir(),),
-)
-def _routed_swiglu_quant(
-    pair: pl.Tensor,
-    weights: pl.Tensor,
-    counts: pl.Tensor,
-    payload: pl.Out[pl.Tensor],
-    scales: pl.Out[pl.Tensor],
-    experts: pl.Scalar[pl.INDEX],
-    stride: pl.Scalar[pl.INDEX],
-    hidden: pl.Scalar[pl.INDEX],
+    width: pl.constexpr,
+    hidden: pl.constexpr,
     row_capacity: pl.constexpr,
-) -> tuple[pl.Tensor, pl.Tensor]:
-    """Apply FP32 weighted SwiGLU and upward group-32 MXFP8 quantization."""
-    return payload, scales
-
-
-@pl.jit.inline(auto_scope=False)
-def routed_swiglu_quant_pypto(
-    pair: pl.Tensor,
-    weights: pl.Tensor,
-    counts: pl.Tensor,
-    payload: pl.Tensor,
-    scales: pl.Tensor,
-    w13_ready: pl.Scalar[pl.TASK_ID],
-    experts: pl.constexpr,
+    w13_workers: pl.Scalar[pl.INT32],
+    w2_workers: pl.Scalar[pl.INT32],
+    swiglu_workers: pl.Scalar[pl.INT32],
 ):
-    """Apply weighted SwiGLU and group-32 MXFP8 quantization in vector registers."""
+    """Run BF16 W13, FP32 weighted MXFP8 activation, and full-K BF16 W2.
+
+    Counts lie in [0, stride] and sum to
+    at most row_capacity. Stride is divisible by 16; width and hidden are
+    divisible by 256.
+    """
+    pair = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, 2 * hidden], dtype=pl.BF16)
+    compact_weights = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, 1], dtype=pl.FP32)
+    with pl.spmd(w13_workers, name_hint="routed_w13") as w13_ready:
+        pair, compact_weights = routed_w13_nz_group(
+            x, x_scale, counts, w1, w1_scale, w3, w3_scale, pair,
+            weights, compact_weights, experts, stride,
+        )
+
+    payload = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, hidden], dtype=pl.FP8E4M3FN)
+    scales = pl.create_tensor([1, ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE * (hidden // MX_GROUP)], dtype=pl.FP8E8M0)
     counts_row = pl.reshape(counts, [1, experts])
-    with pl.spmd(ROUTED_VECTOR_WORKER_TILE, name_hint="routed_swiglu_quant_pypto", deps=[w13_ready]) as ready:
+    with pl.spmd(swiglu_workers, name_hint="routed_swiglu_quant", deps=[w13_ready]) as swiglu_ready:
         core = pl.tile.get_block_idx()
+        workers = pl.tile.get_block_num()
         rows = pl.cast(0, pl.INDEX)
         for first in pl.range(0, experts, SWIGLU_COUNT_LANES):
             remaining = pl.min(SWIGLU_COUNT_LANES, experts - first)
@@ -777,13 +1097,13 @@ def routed_swiglu_quant_pypto(
                 total_written = pl.reg.store(total_tile, 0, value=count_total)
             rows = rows + pl.cast(pl.tile.read(total_written, [0]), pl.INDEX)
         work_count = (rows + SWIGLU_ROW_TILE - 1) // SWIGLU_ROW_TILE
-        for work in pl.range(core, work_count, ROUTED_VECTOR_WORKER_TILE):
+        for work in pl.range(core, work_count, workers):
             row = work * SWIGLU_ROW_TILE
             gate_tile = pl.load(pair, [row, 0], [SWIGLU_ROW_TILE, MOE_INTER],
                                 target_memory=pl.MemorySpace.Vec)
             up_tile = pl.load(pair, [row, MOE_INTER], [SWIGLU_ROW_TILE, MOE_INTER],
                               target_memory=pl.MemorySpace.Vec)
-            weight_tile = pl.load(weights, [row, 0], [SWIGLU_ROW_TILE, 1],
+            weight_tile = pl.load(compact_weights, [row, 0], [SWIGLU_ROW_TILE, 1],
                                   target_memory=pl.MemorySpace.Vec)
             gate_flat = pl.reshape(gate_tile, [SWIGLU_ROW_TILE * MOE_INTER])
             up_flat = pl.reshape(up_tile, [SWIGLU_ROW_TILE * MOE_INTER])
@@ -858,305 +1178,10 @@ def routed_swiglu_quant_pypto(
             code_bytes = pl.reinterpret_view(code_row, pl.UINT8)
             codes = pl.reinterpret_view(code_bytes, pl.FP8E8M0)
             scales = pl.store(codes, [0, row * SWIGLU_SCALE_COLS], scales)
-    return payload, scales, ready
 
-
-@pl.jit.extern(
-    core_type="mixed",
-    aic_source=Path(__file__).parent / "kernels" / "expert_routed_w2.cpp",
-    aiv_source=Path(__file__).parent / "kernels" / "expert_routed_w2.cpp",
-    dual_aiv_dispatch=True, include_dirs=(pto_isa_include_dir(),),
-)
-def _routed_w2(
-    payload: pl.Tensor,
-    scales: pl.Tensor,
-    counts: pl.Tensor,
-    weight: pl.Tensor,
-    weight_scale: pl.Tensor,
-    output: pl.Out[pl.Tensor],
-    experts: pl.Scalar[pl.INDEX],
-    stride: pl.Scalar[pl.INDEX],
-    width: pl.Scalar[pl.INDEX],
-    hidden: pl.Scalar[pl.INDEX],
-    output_rows: pl.Scalar[pl.INDEX],
-    activation_rows: pl.Scalar[pl.INDEX],
-    row_capacity: pl.constexpr,
-) -> pl.Tensor:
-    """Store full-K BF16 results in compact active-row order."""
-    ...
-
-
-# Routed W2 projection and ND-to-ZZ activation scale conversion.
-W2_M_TILE = min(64, gcd(RECV_MAX, 160))
-W2_TAIL_M_TILE = RECV_MAX % W2_M_TILE or W2_M_TILE
-W2_HALF_M_TILE = W2_M_TILE // 2
-W2_N_TILE = MX_W2_D_OUT_TILE
-W2_K_TILE = 256
-W2_SCALE_K_TILE = W2_K_TILE // MX_GROUP
-W2_K_STAGE = 2
-W2_SCALE_ROW_TILE = 32
-W2_SCALE_WORD_TILE = W2_SCALE_ROW_TILE // 2
-W2_SCALE_RESIDENT_TILE = ((H_SCALE + 31) // 32) * 32
-W2_SCALE_RESIDENT_WORD_TILE = W2_SCALE_RESIDENT_TILE // 2
-W2_SCALE_INDEX_TILE = W2_HALF_M_TILE * (W2_SCALE_K_TILE // 2)
-W2_SCALE_TMP_TILE = ((64 + (W2_HALF_M_TILE // 16) * W2_SCALE_K_TILE + 31) // 32) * 32
-
-
-@pl.jit.inline(auto_scope=False)
-def _w2_pack_scale_packet(
-    scale_source: pl.Tile[[1, W2_HALF_M_TILE * W2_SCALE_RESIDENT_WORD_TILE], pl.INT16, pl.Mem.Vec],
-    scale_packet_words: pl.Tile[[W2_SCALE_INDEX_TILE], pl.INT16, pl.Mem.Vec],
-    word_offset: pl.Scalar[pl.UINT16],
-):
-    """Pack the current activation-scale packet into its physical ZZ order."""
-    source_flat = pl.reshape(scale_source, [W2_HALF_M_TILE * W2_SCALE_RESIDENT_WORD_TILE])
-    words_view = pl.reshape(scale_packet_words, [W2_SCALE_INDEX_TILE])
-    with pl.reg_scope():
-        active_scale = pl.reg.full_mask(lanes=W2_SCALE_INDEX_TILE)
-        physical = pl.reg.index_gen(0, lanes=W2_SCALE_INDEX_TILE, dtype=pl.UINT16)
-        row_block = pl.reg.shift_rights(physical, 6, active_scale)
-        row_high = pl.reg.shift_lefts(row_block, 4, active_scale)
-        inner_mask = pl.reg.broadcast(15, lanes=W2_SCALE_INDEX_TILE, dtype=pl.UINT16)
-        row_inner = pl.reg.bitwise_and(physical, inner_mask, active_scale)
-        row = pl.reg.add(row_high, row_inner, active_scale)
-        row_base = pl.reg.muls(row, W2_SCALE_RESIDENT_WORD_TILE, active_scale)
-        pairs = pl.reg.shift_rights(physical, 4, active_scale)
-        pair_mask = pl.reg.broadcast(3, lanes=W2_SCALE_INDEX_TILE, dtype=pl.UINT16)
-        pair = pl.reg.bitwise_and(pairs, pair_mask, active_scale)
-        base = pl.reg.add(row_base, pair, active_scale)
-        source_indices = pl.reg.adds(base, word_offset, active_scale)
-        scale_codes = pl.reg.gather(source_flat, source_indices, active_scale)
-        scale_stored = pl.reg.store(words_view, 0, scale_codes, active_scale)
-    return scale_stored
-
-
-@pl.jit.incore(level=pl.Level.AIC)
-def routed_w2_nz_cube(payload: pl.Tensor, scales: pl.Tensor, counts: pl.Tensor, weight: pl.Tensor, weight_scale: pl.Tensor, fp4_lut: pl.Tensor, output: pl.InOut[pl.Tensor], experts: pl.constexpr, stride: pl.constexpr):
-    pl.func_attr({'split_aiv': True})
-    weight_ring = pl.system.reserve_buffer(name='w2_weight_ring', size=196608)
-    pl.system.aic_initialize_pipe(v2c_consumer_buf=weight_ring, dir_mask=2, slot_size=65536, slot_num=3, id=0)
-    core = pl.tile.get_block_idx()
-    compact = 0
-    work_base = 0
-    for expert in pl.range(experts):
-        count = pl.cast(pl.read(counts, [expert, 0]), pl.INDEX)
-        row_tiles = (count + W2_M_TILE - 1) // W2_M_TILE
-        work_count = row_tiles * (D // W2_N_TILE)
-        first = (core + ROUTED_CUBE_WORKER_TILE - work_base % ROUTED_CUBE_WORKER_TILE) % ROUTED_CUBE_WORKER_TILE
-        for work in pl.range(first, work_count, ROUTED_CUBE_WORKER_TILE):
-            row_tile = work // (D // W2_N_TILE)
-            block = work % (D // W2_N_TILE)
-            row = row_tile * W2_M_TILE
-            input_row = pl.min(row, stride - W2_M_TILE)
-            valid = pl.min(W2_M_TILE, count - row)
-            col = block * W2_N_TILE
-            a0 = pl.load(payload, [compact + input_row, 0], [W2_M_TILE, W2_K_TILE], target_memory=pl.Mem.Mat)
-            a0_left = pl.move(a0, target_memory=pl.Mem.Left)
-            as0: pl.Tile[[W2_M_TILE, W2_SCALE_K_TILE], pl.FP8E8M0, pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.system.tpop_from_aiv(shape=[W2_M_TILE, W2_SCALE_K_TILE], dtype=pl.FP8E8M0, split=1, id=0)
-            as0_left = pl.move(as0, target_memory=pl.Mem.LeftScale)
-            pl.system.tfree_to_aiv(as0, id=0)
-            bs0: pl.Tile[[W2_SCALE_K_TILE, W2_N_TILE], pl.FP8E8M0, pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.system.tpop_from_aiv(shape=[W2_SCALE_K_TILE, W2_N_TILE], dtype=pl.FP8E8M0, split=1, id=0)
-            b0 = pl.system.tpop_from_aiv(shape=[W2_K_TILE, W2_N_TILE], dtype=pl.FP8E4M3FN, split=1, id=0)
-            b0_right = pl.move(b0, target_memory=pl.Mem.Right)
-            bs0_scale = pl.move(bs0, target_memory=pl.Mem.RightScale)
-            pl.system.tfree_to_aiv(bs0, id=0)
-            pl.system.tfree_to_aiv(b0, id=0)
-            acc = pl.matmul_mx(a0_left, as0_left, b0_right, bs0_scale)
-            for k in pl.unroll(W2_K_TILE, MOE_INTER, W2_K_TILE):
-                a = pl.load(payload, [compact + input_row, k], [W2_M_TILE, W2_K_TILE], target_memory=pl.Mem.Mat)
-                a_left = pl.move(a, target_memory=pl.Mem.Left)
-                as_: pl.Tile[[W2_M_TILE, W2_SCALE_K_TILE], pl.FP8E8M0, pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.system.tpop_from_aiv(shape=[W2_M_TILE, W2_SCALE_K_TILE], dtype=pl.FP8E8M0, split=1, id=0)
-                as_left = pl.move(as_, target_memory=pl.Mem.LeftScale)
-                pl.system.tfree_to_aiv(as_, id=0)
-                bs: pl.Tile[[W2_SCALE_K_TILE, W2_N_TILE], pl.FP8E8M0, pl.Mem.Mat, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.system.tpop_from_aiv(shape=[W2_SCALE_K_TILE, W2_N_TILE], dtype=pl.FP8E8M0, split=1, id=0)
-                b = pl.system.tpop_from_aiv(shape=[W2_K_TILE, W2_N_TILE], dtype=pl.FP8E4M3FN, split=1, id=0)
-                b_right = pl.move(b, target_memory=pl.Mem.Right)
-                bs_scale = pl.move(bs, target_memory=pl.Mem.RightScale)
-                pl.system.tfree_to_aiv(bs, id=0)
-                pl.system.tfree_to_aiv(b, id=0)
-                acc = pl.matmul_mx_acc(acc, a_left, as_left, b_right, bs_scale)
-            if row + W2_M_TILE > stride:
-                tail_offset = W2_M_TILE - W2_TAIL_M_TILE
-                tail_acc = pl.tile.slice(acc, [W2_TAIL_M_TILE, W2_N_TILE], [tail_offset, 0], valid_shape=[valid, W2_N_TILE])
-                output = pl.store(tail_acc, [compact + row, col], output)
-            else:
-                valid_acc = pl.tile.slice(acc, [W2_M_TILE, W2_N_TILE], [0, 0], valid_shape=[valid, W2_N_TILE])
-                output = pl.store(valid_acc, [compact + row, col], output)
-        work_base = work_base + work_count
-        compact = compact + count
-    return output
-
-
-@pl.jit.incore(level=pl.Level.AIV)
-def routed_w2_nz_vector(payload: pl.Tensor, scales: pl.Tensor, counts: pl.Tensor, weight: pl.Tensor, weight_scale: pl.Tensor, fp4_lut: pl.Tensor, output: pl.InOut[pl.Tensor], experts: pl.constexpr, stride: pl.constexpr):
-    pl.func_attr({'split_aiv': True, 'dual_aiv_dispatch': True})
-    lane = pl.tile.get_subblock_idx()
-    peer_ring = pl.system.import_peer_buffer(name='w2_weight_ring', peer_func='routed_w2_nz_cube')
-    pl.system.aiv_initialize_pipe(v2c_consumer_buf=peer_ring, dir_mask=2, slot_size=65536, slot_num=3, id=0)
-    scale_fp8: pl.Tile[[W2_HALF_M_TILE, W2_SCALE_K_TILE], pl.FP8E8M0, pl.MemRef('w2_scale_packet'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major, fractal=32)] = pl.tile.create([W2_HALF_M_TILE, W2_SCALE_K_TILE], dtype=pl.FP8E8M0, target_memory=pl.Mem.Vec)
-    scale_packet_codes = pl.reinterpret_view(scale_fp8, pl.UINT8)
-    scale_packet_bytes = pl.reshape(scale_packet_codes, [W2_HALF_M_TILE * W2_SCALE_K_TILE])
-    scale_packet_words = pl.reinterpret_view(scale_packet_bytes, pl.INT16)
-    weight_flat = pl.tensor.view(weight, [experts * MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], layout=pl.ND)
-    scale_nd = pl.tensor.view(scales, [payload.shape[0], H_SCALE], layout=pl.ND)
-    w2_bscale_nd = pl.tensor.view(weight_scale, [D // 16, experts * H_SCALE * 16], layout=pl.ND)
-    core = pl.tile.get_block_idx()
-    compact = 0
-    work_base = 0
-    for expert in pl.range(experts):
-        count = pl.cast(pl.read(counts, [expert, 0]), pl.INDEX)
-        row_tiles = (count + W2_M_TILE - 1) // W2_M_TILE
-        work_count = row_tiles * (D // W2_N_TILE)
-        first = (core + ROUTED_CUBE_WORKER_TILE - work_base % ROUTED_CUBE_WORKER_TILE) % ROUTED_CUBE_WORKER_TILE
-        for work in pl.range(first, work_count, ROUTED_CUBE_WORKER_TILE):
-            row_tile = work // (D // W2_N_TILE)
-            block = work % (D // W2_N_TILE)
-            row = row_tile * W2_M_TILE
-            input_row = pl.min(row, stride - W2_M_TILE)
-            col = block * W2_N_TILE
-            panel = expert * MX_W2_PACKED_ROWS + block * MOE_INTER
-            scale_row = compact + input_row + lane * W2_HALF_M_TILE
-            scale_resident = pl.load(scale_nd, [scale_row, 0], [W2_HALF_M_TILE, W2_SCALE_RESIDENT_TILE], valid_shape=[W2_HALF_M_TILE, H_SCALE], target_memory=pl.Mem.Vec)
-            scale_resident_codes = pl.reinterpret_view(scale_resident, pl.UINT8)
-            scale_resident_padded = pl.fillpad_expand(scale_resident_codes, [W2_HALF_M_TILE, W2_SCALE_RESIDENT_TILE], pad_value=0)
-            scale_resident_words = pl.reinterpret_view(scale_resident_padded, pl.INT16)
-            scale_source = pl.reshape(scale_resident_words, [1, W2_HALF_M_TILE * W2_SCALE_RESIDENT_WORD_TILE])
-            raw0: pl.Tile[[128, 128], pl.UINT8, pl.MemRef('w2_raw', slots=4)[0], pl.Mem.Vec] = pl.load(weight_flat, [panel + 0 + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-            raw1: pl.Tile[[128, 128], pl.UINT8, pl.MemRef('w2_raw', slots=4)[1], pl.Mem.Vec] = pl.load(weight_flat, [panel + W2_K_TILE + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-            raw2: pl.Tile[[128, 128], pl.UINT8, pl.MemRef('w2_raw', slots=4)[2], pl.Mem.Vec] = pl.load(weight_flat, [panel + 2 * W2_K_TILE + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-            raw3: pl.Tile[[128, 128], pl.UINT8, pl.MemRef('w2_raw', slots=4)[3], pl.Mem.Vec] = pl.load(weight_flat, [panel + 3 * W2_K_TILE + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-            scale_word_offset = pl.cast(0, pl.UINT16)
-            _scale_packet_ready = _w2_pack_scale_packet(scale_source, scale_packet_words, scale_word_offset)
-            fp4_raw = pl.reinterpret_view(raw0, pl.FP4E2M1X2)
-            pl.system.tpush_to_aic(scale_fp8, split=1, id=0)
-            b_scale_bytes: pl.Tile[[8, 128], pl.FP8E8M0, pl.MemRef('w2_scale_b_packet'), pl.Mem.Vec] = pl.load(w2_bscale_nd, [(col + lane * 128) // 16, (expert * H_SCALE + pl.cast(scale_word_offset, pl.INDEX) * 2) * 16], [8, 128], target_memory=pl.Mem.Vec)
-            b_scale_packet: pl.Tile[[8, 128], pl.FP8E8M0, pl.MemRef('w2_scale_b_packet'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([8, 128], dtype=pl.FP8E8M0, target_memory=pl.Mem.Vec)
-            pl.system.tpush_to_aic(b_scale_packet, split=1, id=0)
-            nz0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef('w2_nz', slots=2)[0], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.cast(fp4_raw, pl.FP8E4M3FN, layout=pl.NZ)
-            raw0: pl.Tile[[128, 128], pl.UINT8, pl.MemRef('w2_raw', slots=4)[0], pl.Mem.Vec] = pl.load(weight_flat, [panel + 4 * W2_K_TILE + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-            pl.system.tpush_to_aic(nz0, split=1, id=0)
-            for batch in pl.unroll(W2_K_TILE, MOE_INTER, 4 * W2_K_TILE):
-                scale_word_offset = pl.cast(batch // (2 * MX_GROUP), pl.UINT16)
-                _scale_packet_ready = _w2_pack_scale_packet(scale_source, scale_packet_words, scale_word_offset)
-                fp4_raw = pl.reinterpret_view(raw1, pl.FP4E2M1X2)
-                pl.system.tpush_to_aic(scale_fp8, split=1, id=0)
-                b_scale_bytes: pl.Tile[[8, 128], pl.FP8E8M0, pl.MemRef('w2_scale_b_packet'), pl.Mem.Vec] = pl.load(w2_bscale_nd, [(col + lane * 128) // 16, (expert * H_SCALE + pl.cast(scale_word_offset, pl.INDEX) * 2) * 16], [8, 128], target_memory=pl.Mem.Vec)
-                b_scale_packet: pl.Tile[[8, 128], pl.FP8E8M0, pl.MemRef('w2_scale_b_packet'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([8, 128], dtype=pl.FP8E8M0, target_memory=pl.Mem.Vec)
-                pl.system.tpush_to_aic(b_scale_packet, split=1, id=0)
-                nz1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef('w2_nz', slots=2)[1], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.cast(fp4_raw, pl.FP8E4M3FN, layout=pl.NZ)
-                if batch + 4 * W2_K_TILE < MOE_INTER:
-                    raw1: pl.Tile[[128, 128], pl.UINT8, pl.MemRef('w2_raw', slots=4)[1], pl.Mem.Vec] = pl.load(weight_flat, [panel + (batch + 4 * W2_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-                pl.system.tpush_to_aic(nz1, split=1, id=0)
-                scale_word_offset = pl.cast((batch + W2_K_TILE) // (2 * MX_GROUP), pl.UINT16)
-                _scale_packet_ready = _w2_pack_scale_packet(scale_source, scale_packet_words, scale_word_offset)
-                fp4_raw = pl.reinterpret_view(raw2, pl.FP4E2M1X2)
-                pl.system.tpush_to_aic(scale_fp8, split=1, id=0)
-                b_scale_bytes: pl.Tile[[8, 128], pl.FP8E8M0, pl.MemRef('w2_scale_b_packet'), pl.Mem.Vec] = pl.load(w2_bscale_nd, [(col + lane * 128) // 16, (expert * H_SCALE + pl.cast(scale_word_offset, pl.INDEX) * 2) * 16], [8, 128], target_memory=pl.Mem.Vec)
-                b_scale_packet: pl.Tile[[8, 128], pl.FP8E8M0, pl.MemRef('w2_scale_b_packet'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([8, 128], dtype=pl.FP8E8M0, target_memory=pl.Mem.Vec)
-                pl.system.tpush_to_aic(b_scale_packet, split=1, id=0)
-                nz0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef('w2_nz', slots=2)[0], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.cast(fp4_raw, pl.FP8E4M3FN, layout=pl.NZ)
-                if batch + 5 * W2_K_TILE < MOE_INTER:
-                    raw2: pl.Tile[[128, 128], pl.UINT8, pl.MemRef('w2_raw', slots=4)[2], pl.Mem.Vec] = pl.load(weight_flat, [panel + (batch + 5 * W2_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-                pl.system.tpush_to_aic(nz0, split=1, id=0)
-                scale_word_offset = pl.cast((batch + 2 * W2_K_TILE) // (2 * MX_GROUP), pl.UINT16)
-                _scale_packet_ready = _w2_pack_scale_packet(scale_source, scale_packet_words, scale_word_offset)
-                fp4_raw = pl.reinterpret_view(raw3, pl.FP4E2M1X2)
-                pl.system.tpush_to_aic(scale_fp8, split=1, id=0)
-                b_scale_bytes: pl.Tile[[8, 128], pl.FP8E8M0, pl.MemRef('w2_scale_b_packet'), pl.Mem.Vec] = pl.load(w2_bscale_nd, [(col + lane * 128) // 16, (expert * H_SCALE + pl.cast(scale_word_offset, pl.INDEX) * 2) * 16], [8, 128], target_memory=pl.Mem.Vec)
-                b_scale_packet: pl.Tile[[8, 128], pl.FP8E8M0, pl.MemRef('w2_scale_b_packet'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([8, 128], dtype=pl.FP8E8M0, target_memory=pl.Mem.Vec)
-                pl.system.tpush_to_aic(b_scale_packet, split=1, id=0)
-                nz1: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef('w2_nz', slots=2)[1], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.cast(fp4_raw, pl.FP8E4M3FN, layout=pl.NZ)
-                if batch + 6 * W2_K_TILE < MOE_INTER:
-                    raw3: pl.Tile[[128, 128], pl.UINT8, pl.MemRef('w2_raw', slots=4)[3], pl.Mem.Vec] = pl.load(weight_flat, [panel + (batch + 6 * W2_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-                pl.system.tpush_to_aic(nz1, split=1, id=0)
-                scale_word_offset = pl.cast((batch + 3 * W2_K_TILE) // (2 * MX_GROUP), pl.UINT16)
-                _scale_packet_ready = _w2_pack_scale_packet(scale_source, scale_packet_words, scale_word_offset)
-                fp4_raw = pl.reinterpret_view(raw0, pl.FP4E2M1X2)
-                pl.system.tpush_to_aic(scale_fp8, split=1, id=0)
-                b_scale_bytes: pl.Tile[[8, 128], pl.FP8E8M0, pl.MemRef('w2_scale_b_packet'), pl.Mem.Vec] = pl.load(w2_bscale_nd, [(col + lane * 128) // 16, (expert * H_SCALE + pl.cast(scale_word_offset, pl.INDEX) * 2) * 16], [8, 128], target_memory=pl.Mem.Vec)
-                b_scale_packet: pl.Tile[[8, 128], pl.FP8E8M0, pl.MemRef('w2_scale_b_packet'), pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major, fractal=32)] = pl.tile.create([8, 128], dtype=pl.FP8E8M0, target_memory=pl.Mem.Vec)
-                pl.system.tpush_to_aic(b_scale_packet, split=1, id=0)
-                nz0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef('w2_nz', slots=2)[0], pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512)] = pl.cast(fp4_raw, pl.FP8E4M3FN, layout=pl.NZ)
-                if batch + 7 * W2_K_TILE < MOE_INTER:
-                    raw0: pl.Tile[[128, 128], pl.UINT8, pl.MemRef('w2_raw', slots=4)[0], pl.Mem.Vec] = pl.load(weight_flat, [panel + (batch + 7 * W2_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
-                pl.system.tpush_to_aic(nz0, split=1, id=0)
-        work_base = work_base + work_count
-        compact = compact + count
-    return output
-
-
-@pl.jit.incore(level=pl.Level.CORE_GROUP)
-def routed_w2_nz_group(
-    payload: pl.Tensor, scales: pl.Tensor, counts: pl.Tensor,
-    weight: pl.Tensor, weight_scale: pl.Tensor, fp4_lut: pl.Tensor,
-    output: pl.InOut[pl.Tensor], experts: pl.constexpr, stride: pl.constexpr,
-):
-    output = routed_w2_nz_cube(payload, scales, counts, weight, weight_scale, fp4_lut, output, experts, stride)
-    output = routed_w2_nz_vector(payload, scales, counts, weight, weight_scale, fp4_lut, output, experts, stride)
-    return output
-
-
-@pl.jit.inline(auto_scope=False)
-def routed_w2_pypto(
-    payload: pl.Tensor, scales: pl.Tensor, counts: pl.Tensor,
-    weight: pl.Tensor, weight_scale: pl.Tensor, fp4_lut: pl.Tensor,
-    output: pl.Tensor, input_ready: pl.Scalar[pl.TASK_ID], experts: pl.constexpr, stride: pl.constexpr,
-):
-    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w2_nz", deps=[input_ready]) as ready:
-        output = routed_w2_nz_group(payload, scales, counts, weight, weight_scale, fp4_lut, output, experts, stride)
-    return output, ready
-
-
-@pl.jit.inline(auto_scope=False)
-def _expert_routed_output(
-    x: pl.Tensor,
-    x_scale: pl.Tensor,
-    weights: pl.Tensor,
-    counts: pl.Tensor,
-    w1: pl.Tensor,
-    w1_scale: pl.Tensor,
-    w3: pl.Tensor,
-    w3_scale: pl.Tensor,
-    w2: pl.Tensor,
-    w2_scale: pl.Tensor,
-    experts: pl.constexpr,
-    stride: pl.constexpr,
-    width: pl.constexpr,
-    hidden: pl.constexpr,
-    row_capacity: pl.constexpr,
-    w13_workers: pl.Scalar[pl.INT32],
-    w2_workers: pl.Scalar[pl.INT32],
-    swiglu_workers: pl.Scalar[pl.INT32],
-):
-    """Run BF16 W13, FP32 weighted MXFP8 activation, and full-K BF16 W2.
-
-    Counts lie in [0, stride] and sum to
-    at most row_capacity. Stride is divisible by 16; width and hidden are
-    divisible by 256.
-    """
-    activation_rows = ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE
-    pair = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, 2 * hidden], dtype=pl.BF16)
-    compact_weights = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, 1], dtype=pl.FP32)
-    with pl.spmd(w13_workers, name_hint="routed_w13"):
-        pair, compact_weights = _routed_w13(
-            x, x_scale, counts, w1, w1_scale, w3, w3_scale, pair,
-            weights, compact_weights, experts, stride, width, hidden, activation_rows, row_capacity,
-        )
-
-    payload = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, hidden], dtype=pl.FP8E4M3FN)
-    scales = pl.create_tensor([1, ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE * (hidden // MX_GROUP)], dtype=pl.FP8E8M0)
-    with pl.spmd(swiglu_workers, name_hint="routed_swiglu_quant"):
-        payload, scales = _routed_swiglu_quant(
-            pair, compact_weights, counts, payload, scales, experts, stride, hidden, row_capacity,
-        )
-
-    output_rows = ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE
     output = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, width], dtype=pl.BF16)
-    with pl.spmd(w2_workers, name_hint="routed_w2"):
-        output = _routed_w2(
-            payload, scales, counts, w2, w2_scale, output,
-            experts, stride, width, hidden, output_rows, activation_rows, row_capacity,
-        )
+    with pl.spmd(w2_workers, name_hint="routed_w2", deps=[swiglu_ready]):
+        output = routed_w2_nz_group(payload, scales, counts, w2, w2_scale, output, experts, stride)
     return output
 
 
