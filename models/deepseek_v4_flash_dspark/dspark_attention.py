@@ -381,7 +381,7 @@ def dspark_attention(
                         pl.store(packed_nope, [packed_row, 0], o_packed_flat)
                         pl.store(packed_rope, [packed_row, NOPE_DIM], o_packed_flat)
 
-    return kv_cache, o_packed_heads
+    return kv_cache, o_packed_heads, qk_tid
 
 
 @pl.jit
@@ -414,7 +414,7 @@ def dspark_attention_test(
         o_packed_heads,
         [O_GROUPS * LOCAL_T_PAD * HEADS_PER_GROUP, HEAD_DIM],
     )
-    kv_cache, o_packed_flat = dspark_attention(
+    kv_cache, o_packed_flat, _heads_ready = dspark_attention(
         x,
         x,
         wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,

@@ -66,12 +66,13 @@ from decode_o_proj import (
     LOCAL_T_PAD,
     O_WINDOW_ROWS,
     TP_SIZE,
+    decode_o_proj_tp1_hc,
     o_group_a2a,
     o_proj_reduce_scatter,
 )
 from hc_head import hc_head
 from hc_post import hc_post_prefill
-from hc_pre import hc_pre
+from hc_pre import hc_pre_norm
 from lookup_embedding import lookup_embedding
 from rmsnorm import rms_norm
 from moe import (
@@ -389,20 +390,23 @@ def draft_layer(
     layer_shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ] = shared_w2[draft_layer_index]
     layer_shared_w2_scale: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [draft_layer_index * D])
 
-    query_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     combine = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre(query_hc, layer_hc_attn_fn, layer_hc_attn_scale, layer_hc_attn_base, query_mixed, post, combine)
-
-    query_normed = pl.create_tensor([T_QUERY, D], dtype=pl.BF16)
-    query_mixed_active: pl.Tensor[[T_QUERY, D], pl.BF16] = pl.slice(query_mixed, [T_QUERY, D], [0, 0])
-    rms_norm(query_mixed_active, layer_attn_norm_w, query_normed)
     query_group = pl.create_tensor([DSPARK_CP_SIZE * T_QUERY, D], dtype=pl.BF16)
     if DSPARK_CP_SIZE == 1:
-        with pl.spmd(T_QUERY, name_hint="dspark_local_query_copy"):
-            row = pl.tile.get_block_idx()
-            query_group[row : row + 1, 0:D] = query_normed[row : row + 1, 0:D]
+        # Normalize directly into the group KV input when this rank owns every row.
+        query_normed = pl.slice(query_group, [T_QUERY, D], [0, 0])
     else:
+        query_normed = pl.create_tensor([T_QUERY, D], dtype=pl.BF16)
+    # Attention and both HC post paths read gates only in the query prefix.
+    query_prefix = pl.slice(query_hc, [T_QUERY, HC_MULT, D], [0, 0, 0])
+    post_prefix = pl.slice(post, [T_QUERY, HC_MULT], [0, 0])
+    combine_prefix = pl.slice(combine, [T_QUERY, HC_MULT * HC_MULT], [0, 0])
+    hc_pre_norm(
+        query_prefix, layer_hc_attn_fn, layer_hc_attn_scale, layer_hc_attn_base,
+        layer_attn_norm_w, post_prefix, combine_prefix, query_normed, False,
+    )
+    if DSPARK_CP_SIZE > 1:
         with pl.scope():
             _gathered_query, hidden_gather_signal = prefill_cp_token_allgather_step(
                 query_normed,
@@ -413,7 +417,7 @@ def draft_layer(
                 dsa_cp_rank,
             )
     o_packed_heads = pl.create_tensor([O_GROUPS * LOCAL_T_PAD * (H // O_GROUPS), HEAD_DIM], dtype=pl.BF16)
-    dspark_attention(
+    _kv, _packed, heads_ready = dspark_attention(
         query_normed,
         query_group,
         layer_wq_a, layer_wq_b, layer_wq_b_scale, layer_wkv, layer_gamma_cq, layer_gamma_ckv,
@@ -424,74 +428,94 @@ def draft_layer(
         layer_attn_sink, o_packed_heads,
     )
     attention_grouped = pl.reshape(o_packed_heads, [O_GROUPS * LOCAL_T_PAD, O_GROUP_IN])
-    attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
-    # DSA-CP and O projection use the same TP group, including a singleton.
-    tp_rank = pl.cast(dsa_cp_rank, pl.INT32)
-    with pl.spmd(
-        ATTENTION_PUBLISH_WORKERS,
-        name_hint="dspark_o_group_publish",
-    ) as attention_publish_tid:
-        worker = pl.tile.get_block_idx()
-        for global_group in pl.range(worker, O_GROUPS, ATTENTION_PUBLISH_WORKERS):
-            destination_rank = global_group // LOCAL_O_GROUPS
-            local_group = global_group - destination_rank * LOCAL_O_GROUPS
-            source_row = global_group * LOCAL_T_PAD
-            target_row = local_group * GROUP_T_PAD + tp_rank * active_tokens
-            pld.tensor.put(
-                dst=attention_window,
-                peer=group_base + destination_rank,
-                src=attention_grouped,
-                dst_offsets=[target_row, 0],
-                src_offsets=[source_row, 0],
-                shape=[active_tokens, O_GROUP_IN],
-                chunk_rows=COMM_ROW_TILE,
-                chunk_cols=O_GROUP_IN,
-            )
-
-        for destination_rank in pl.range(TP_SIZE):
-            if destination_rank != tp_rank:
-                pld.system.notify(
-                    target=attention_signal,
+    attention_hc = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    if TP_SIZE == 1:
+        # The packed groups already belong to this rank. Only the active prefix
+        # participates in projection; MoE also consumes the padded HC slab.
+        rows = pl.cast(active_tokens, pl.INDEX)
+        active_hc = pl.slice(attention_hc, [rows, HC_MULT, D], [0, 0, 0])
+        active_residual = pl.slice(query_hc, [rows, HC_MULT, D], [0, 0, 0])
+        active_post = pl.slice(post, [rows, HC_MULT], [0, 0])
+        active_combine = pl.slice(combine, [rows, HC_MULT * HC_MULT], [0, 0])
+        decode_o_proj_tp1_hc(
+            attention_grouped, layer_wo_a, layer_wo_b, layer_wo_b_scale,
+            active_residual, active_post, active_combine, active_hc, heads_ready,
+        )
+        if rows < T:
+            tail_hc = pl.reshape(attention_hc, [T, HC_MULT * D])
+            for lane in pl.spmd(HC_MULT * 8, name_hint="dspark_hc_clear_tail"):
+                col = lane * (D // 8)
+                zero = pl.full([1, D // 8], dtype=pl.FP32, value=0.0)
+                for row in pl.range(rows, T):
+                    tail_hc[row : row + 1, col : col + D // 8] = zero
+    else:
+        attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
+        # DSA-CP and O projection use the same TP group, including a singleton.
+        tp_rank = pl.cast(dsa_cp_rank, pl.INT32)
+        with pl.spmd(
+            ATTENTION_PUBLISH_WORKERS,
+            name_hint="dspark_o_group_publish",
+        ) as attention_publish_tid:
+            worker = pl.tile.get_block_idx()
+            for global_group in pl.range(worker, O_GROUPS, ATTENTION_PUBLISH_WORKERS):
+                destination_rank = global_group // LOCAL_O_GROUPS
+                local_group = global_group - destination_rank * LOCAL_O_GROUPS
+                source_row = global_group * LOCAL_T_PAD
+                target_row = local_group * GROUP_T_PAD + tp_rank * active_tokens
+                pld.tensor.put(
+                    dst=attention_window,
                     peer=group_base + destination_rank,
-                    offsets=[tp_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
+                    src=attention_grouped,
+                    dst_offsets=[target_row, 0],
+                    src_offsets=[source_row, 0],
+                    shape=[active_tokens, O_GROUP_IN],
+                    chunk_rows=COMM_ROW_TILE,
+                    chunk_cols=O_GROUP_IN,
                 )
 
-    attention_local_flat, _attention_signal = o_group_a2a(
-        attention_local_flat,
-        attention_window,
-        attention_signal,
-        group_base,
-        tp_rank,
-        active_tokens,
-        attention_publish_tid,
-        ATTENTION_PUBLISH_WORKERS,
-    )
-    attention_local_groups = pl.reshape(attention_local_flat, [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN])
-    o_local = pl.create_tensor([LOCAL_T_PAD, D], dtype=pl.BF16)
-    o_local, _o_signal = o_proj_reduce_scatter(
-        attention_local_groups,
-        layer_wo_a,
-        layer_wo_b,
-        layer_wo_b_scale,
-        active_tokens,
-        o_local,
-        o_window,
-        o_signal,
-        group_base,
-        tp_rank,
-    )
+            for destination_rank in pl.range(TP_SIZE):
+                if destination_rank != tp_rank:
+                    pld.system.notify(
+                        target=attention_signal,
+                        peer=group_base + destination_rank,
+                        offsets=[tp_rank, 0],
+                        value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
 
-    padded_attention = pl.create_tensor([T, D], dtype=pl.BF16)
-    for pad_token in pl.spmd(T, name_hint="dspark_attention_pad"):
-        output_tile = pl.full([1, D], dtype=pl.BF16, value=0.0)
-        if pad_token < active_tokens:
-            output_tile = o_local[pad_token : pad_token + 1, 0:D]
-        padded_attention[pad_token : pad_token + 1, 0:D] = output_tile
+        attention_local_flat, _attention_signal = o_group_a2a(
+            attention_local_flat,
+            attention_window,
+            attention_signal,
+            group_base,
+            tp_rank,
+            active_tokens,
+            attention_publish_tid,
+            ATTENTION_PUBLISH_WORKERS,
+        )
+        attention_local_groups = pl.reshape(attention_local_flat, [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN])
+        o_local = pl.create_tensor([LOCAL_T_PAD, D], dtype=pl.BF16)
+        o_local, _o_signal = o_proj_reduce_scatter(
+            attention_local_groups,
+            layer_wo_a,
+            layer_wo_b,
+            layer_wo_b_scale,
+            active_tokens,
+            o_local,
+            o_window,
+            o_signal,
+            group_base,
+            tp_rank,
+        )
 
-    attention_hc = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
-    hc_post_prefill(padded_attention, query_hc, post, combine, attention_hc, active_tokens)
+        padded_attention = pl.create_tensor([T, D], dtype=pl.BF16)
+        for pad_token in pl.spmd(T, name_hint="dspark_attention_pad"):
+            output_tile = pl.full([1, D], dtype=pl.BF16, value=0.0)
+            if pad_token < active_tokens:
+                output_tile = o_local[pad_token : pad_token + 1, 0:D]
+            padded_attention[pad_token : pad_token + 1, 0:D] = output_tile
+
+        hc_post_prefill(padded_attention, query_hc, post, combine, attention_hc, active_tokens)
 
     moe(
         attention_hc,
@@ -659,9 +683,7 @@ def _dspark_drafter(
     group_context_tokens = pl.tensor.dim(context_group_position_ids, 0)
     group_main_x = pl.create_tensor([group_context_tokens, D], dtype=pl.BF16)
     if DSPARK_CP_SIZE == 1:
-        with pl.spmd(group_context_tokens, name_hint="dspark_local_context_copy"):
-            row = pl.tile.get_block_idx()
-            group_main_x[row : row + 1, 0:D] = main_x[row : row + 1, 0:D]
+        group_main_x = pl.reshape(main_x, [group_context_tokens, D])
     else:
         _gathered_context, hidden_gather_signal = prefill_cp_token_allgather_step(
             main_x,
@@ -1000,7 +1022,7 @@ def _balanced_routes():
 def build_tensor_specs(batch, *, mode="decode"):
     import torch
     from golden import TensorSpec
-    from utils import token_local_rope
+    from utils import pack_nz, token_local_rope
 
     if batch not in DSPARK_SUPPORTED_BATCHES:
         raise ValueError(f"unsupported DSpark batch {batch}; expected one of {DSPARK_SUPPORTED_BATCHES}")
@@ -1165,6 +1187,21 @@ def build_tensor_specs(batch, *, mode="decode"):
             weight[:, layer * D + diagonal, diagonal] = 1
         return weight
 
+    # In the final TP1 layer, project one unrotated attention component into
+    # every hidden column. Both zeroing the projection and skipping HC post
+    # then change the checked intermediate hidden state.
+    def init_wo_a():
+        weights = torch.zeros(N_RANKS, DSPARK_DRAFT_LAYERS * LOCAL_O_GROUPS, O_LORA, O_GROUP_IN, dtype=torch.bfloat16)
+        weights[:, -LOCAL_O_GROUPS, 0, 0] = 1
+        return weights  # The first element has the same offset in ND and NZ.
+
+    def init_wo_b():
+        weights = torch.zeros(N_RANKS, DSPARK_DRAFT_LAYERS * LOCAL_O_GROUPS, D, O_LORA, dtype=torch.int8)
+        group = torch.zeros(D, O_LORA, dtype=torch.int8)
+        group[:, 0] = (torch.arange(D) % 3 - 1).to(torch.int8)
+        weights[:, -LOCAL_O_GROUPS] = pack_nz(group)
+        return weights
+
     def ranked(name, shape, dtype, init_value=0, *, resident=False):
         spec = TensorSpec(name, [N_RANKS, *shape], dtype, init_value=init_value)
         if resident:
@@ -1273,9 +1310,11 @@ def build_tensor_specs(batch, *, mode="decode"):
                 init_value=init_kv_caches,
             ),
             ranked("attn_sink", [DSPARK_DRAFT_LAYERS * H], torch.float32, resident=True),
-            ranked("wo_a", [DSPARK_DRAFT_LAYERS * LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, resident=True),
-            ranked("wo_b", [DSPARK_DRAFT_LAYERS * LOCAL_O_GROUPS, D, O_LORA], torch.int8, resident=True),
-            ranked("wo_b_scale", [DSPARK_DRAFT_LAYERS * D], torch.float32, resident=True),
+            ranked("wo_a", [DSPARK_DRAFT_LAYERS * LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16,
+                   init_value=init_wo_a if TP_SIZE == 1 else 0, resident=True),
+            ranked("wo_b", [DSPARK_DRAFT_LAYERS * LOCAL_O_GROUPS, D, O_LORA], torch.int8,
+                   init_value=init_wo_b if TP_SIZE == 1 else 0, resident=True),
+            ranked("wo_b_scale", [DSPARK_DRAFT_LAYERS * D], torch.float32, init_value=0.25, resident=True),
             ranked("hc_ffn_fn", [DSPARK_DRAFT_LAYERS * MIX_HC, HC_DIM], torch.float32, resident=True),
             ranked("hc_ffn_scale", [DSPARK_DRAFT_LAYERS * 3], torch.float32, resident=True),
             ranked("hc_ffn_base", [DSPARK_DRAFT_LAYERS * MIX_HC], torch.float32, resident=True),
@@ -1346,6 +1385,7 @@ def _dspark_kv_cache_compare():
 
 def golden_dspark_drafter(tensors):
     import torch
+    from utils import unpack_nz
 
     def rms_norm(hidden):
         hidden_fp32 = hidden.float()
@@ -1385,11 +1425,10 @@ def golden_dspark_drafter(tensors):
             mixed = mixed + hidden[:, lane] * pre[:, lane : lane + 1]
         return mixed.to(torch.bfloat16), post, combine
 
-    def hc_post_zero_output(residual, post, combine):
+    def hc_post_with_output(projection, residual, post, combine):
         output = torch.empty_like(residual)
-        zero = torch.zeros(residual.shape[0], D, dtype=torch.float32)
         for output_lane in range(HC_MULT):
-            row = zero * post[:, output_lane : output_lane + 1]
+            row = projection * post[:, output_lane : output_lane + 1]
             for input_lane in range(HC_MULT):
                 row = row + residual[:, input_lane] * combine[:, input_lane, output_lane : output_lane + 1]
             output[:, output_lane] = row
@@ -1482,8 +1521,26 @@ def golden_dspark_drafter(tensors):
         for rank in range(N_RANKS):
             hidden = hidden_by_rank[rank]
             post, combine, _ = layer_state[rank]
-            attention_hidden = hc_post_zero_output(
-                hidden[: DSPARK_MAX_BATCH * DSPARK_QUERY_WIDTH],
+            projection = torch.zeros(T_QUERY, D, dtype=torch.float32)
+            if TP_SIZE == 1 and layer == DSPARK_DRAFT_LAYERS - 1:
+                # Zero Q and sink logits give uniform attention with one extra
+                # sink in the denominator. The two sparse projection matrices
+                # select channel zero; its row-wise INT8 code is exactly +/-127.
+                cache = tensors["kv_caches"][rank, layer].view(-1, HEAD_DIM)
+                group = layer * LOCAL_O_GROUPS
+                a = tensors["wo_a"][rank, group, 0, 0].float()
+                b = unpack_nz(tensors["wo_b"][rank, group])[:, 0].float()
+                scale = tensors["wo_b_scale"][rank, layer * D : (layer + 1) * D]
+                for request, anchor in enumerate(positions[rank].tolist()):
+                    end = anchor + 1
+                    visible = torch.arange(max(0, end - WIN), end + DSPARK_QUERY_WIDTH)
+                    pages = tensors["block_tables"][rank, layer, request, visible // BLOCK_SIZE]
+                    slots = pages.long() * BLOCK_SIZE + visible % BLOCK_SIZE
+                    value = (cache[slots, 0].float().sum() / (len(slots) + 1)).to(torch.bfloat16)
+                    start = request * DSPARK_QUERY_WIDTH
+                    projection[start : start + DSPARK_QUERY_WIDTH] = (value.float() * a * b * scale).to(torch.bfloat16)
+            attention_hidden = hc_post_with_output(
+                projection, hidden[: DSPARK_MAX_BATCH * DSPARK_QUERY_WIDTH],
                 post[: DSPARK_MAX_BATCH * DSPARK_QUERY_WIDTH],
                 combine[: DSPARK_MAX_BATCH * DSPARK_QUERY_WIDTH],
             )
@@ -1492,7 +1549,7 @@ def golden_dspark_drafter(tensors):
                 : positions.shape[1] * DSPARK_QUERY_WIDTH
             ]
             _, moe_post, moe_combine = hc_pre_zero_function(padded_attention)
-            hidden = hc_post_zero_output(padded_attention, moe_post, moe_combine)
+            hidden = hc_post_with_output(torch.zeros_like(padded_attention[:, 0]), padded_attention, moe_post, moe_combine)
             tensors["intermediate_hidden"][rank, layer] = hidden
             next_hidden_by_rank.append(hidden)
         hidden_by_rank = next_hidden_by_rank
