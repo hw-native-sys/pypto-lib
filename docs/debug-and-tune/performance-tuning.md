@@ -31,10 +31,13 @@ PYPTO_BENCH=1 python models/deepseek_v4_flash_mtp/decode_csa.py -p a2a3 -d 0
 **Effective** is the framework's post-graph-build execution window on
 device (`orch` ∪ `sched` — the old device-log "Total"), recovered from the
 runtime's `[STRACE]` markers. Quote `median=` for single-card comparisons.
-Daily CI uses the same median convention. Older multi-card Daily CI reports
-used the fastest rank's mean; recompute those baselines from their raw samples
-before comparing them with medians. For multi-card tuning, use the fastest
-rank's median as described below.
+Daily CI reports one median and names the metric for each case. A5 cases that
+do not emit the Effective window use **AICore wall**, from the first business
+kernel start to the last business kernel finish on a rank. Device wall is
+available in the raw samples. Rebuild baselines when the reported metric
+changes. Older multi-card Daily CI reports used the fastest rank's mean;
+recompute those baselines from their raw samples before comparing them with
+medians. For multi-card tuning, use the fastest rank's median as described below.
 
 Requirements: a real device — a `*sim` platform prints
 `effective_us unavailable: no device-domain spans` — and a runtime built

@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Daily operator performance: run each fixed workload and report its effective time.
+"""Daily operator performance: run each fixed workload and report its median time.
 
 Commands: ci submits every case through task-submit and writes report.md;
 prepare freezes a GLM case on CPU; case captures its allocated device replay.
@@ -19,6 +19,7 @@ import copy
 from contextlib import contextmanager
 import importlib
 import json
+import math
 import os
 from pathlib import Path
 import runpy
@@ -222,19 +223,29 @@ def replay_prepared(case, selected, output, prepared):
 
 
 def benchmark_payload(stats):
-    """Serialize RunResult.bench as rounds of {rank: [dispatch effective_us]}."""
+    """Serialize each timing metric as rounds of {rank: [dispatch duration]}.
+
+    Keep Effective samples for continuity and retain Device wall for diagnostics.
+    """
     if stats is None:
         raise ValueError("benchmark unavailable or skipped")
-    grid = stats.rounds_dispatches
-    if grid:
-        rounds = [{str(pid): [item.effective_us for item in items] for pid, items in row.items()}
-                  for row in grid]
-    else:
-        rounds = [{str(item.pid): [item.effective_us]} for item in stats.invocations]
+    grid = stats.rounds_dispatches or [{item.pid: [item]} for item in stats.invocations]
+
+    def samples(measure):
+        return [{str(pid): [measure(item) for item in items] for pid, items in row.items()}
+                for row in grid]
+
+    def aicore_wall(item):
+        span = item.by_name().get("chip.run.runner_run.aicore_wall")
+        return span.dur_us if span is not None else None
+
     return {"rounds": stats.rounds, "warmup": stats.warmup,
             "fallback_flattened": stats.fallback_flattened,
             "unstable_dispatch_slots": getattr(stats, "unstable_dispatch_slots", False),
-            "all_zero_device": stats.all_zero_device, "samples": rounds}
+            "all_zero_device": stats.all_zero_device,
+            "samples": samples(lambda item: item.effective_us),
+            "aicore_wall_samples": samples(aicore_wall),
+            "device_wall_samples": samples(lambda item: item.device_wall_us)}
 
 
 def make_capture(original_run, output, selected, case):
@@ -286,7 +297,11 @@ def run_case(args):
 # ci: submits every case and renders the report.
 
 
-def effective_us(payload, case, sampling):
+class InvalidTimingError(ValueError):
+    """A completed workload produced unusable timing samples."""
+
+
+def median_timing(payload, case, sampling, platform):
     """Per rank and round, sum all dispatches.
 
     Single card reports the median; multi-card reports the lowest per-rank median.
@@ -295,21 +310,27 @@ def effective_us(payload, case, sampling):
         raise ValueError(f"correctness failed: {payload.get('error')}")
     bench = payload["benchmark"]
     if (bench["rounds"], bench["warmup"]) != (sampling["rounds"], sampling["warmup"]):
-        raise ValueError("benchmark rounds/warmup differ from the manifest")
+        raise InvalidTimingError("benchmark rounds/warmup differ from the manifest")
     if bench["fallback_flattened"] or bench["unstable_dispatch_slots"] or bench["all_zero_device"]:
-        raise ValueError("benchmark timing is flattened, unstable or all zero")
+        raise InvalidTimingError("benchmark timing is flattened, unstable or all zero")
     rows = bench["samples"]
-    if len(rows) != sampling["rounds"] or len(rows[0]) != case["device_count"]:
-        raise ValueError("benchmark rounds or ranks are incomplete")
+    metric = "Effective"
+    # A5 HBG and Percounter do not emit the device-side TMR windows.
+    # Select once per case so a missing dispatch cannot mix timing boundaries.
+    if platform == "a5" and not any(value > 0 for row in rows for items in row.values() for value in items):
+        metric = "AICore wall"
+        rows = bench.get("aicore_wall_samples", [])
+    if not rows or len(rows) != sampling["rounds"] or len(rows[0]) != case["device_count"]:
+        raise InvalidTimingError(f"{metric} rounds or ranks are incomplete")
     totals = {}
     for row in rows:
         if set(row) != set(rows[0]):
-            raise ValueError("a rank is missing from a measured round")
+            raise InvalidTimingError(f"a rank is missing from a measured {metric} round")
         for pid, dispatches in row.items():
+            if not dispatches or any(value is None or not math.isfinite(value) or value <= 0 for value in dispatches):
+                raise InvalidTimingError(f"{metric} timing missing or invalid for rank {pid}")
             totals.setdefault(pid, []).append(sum(dispatches))
-    if case["device_count"] == 1:
-        return statistics.median(next(iter(totals.values())))
-    return min(statistics.median(values) for values in totals.values())
+    return metric, min(statistics.median(values) for values in totals.values())
 
 
 def submit_command(case, case_dir, sampling):
@@ -337,11 +358,12 @@ def submit_command(case, case_dir, sampling):
 
 def render_report(manifest, results):
     lines = ["Single-card median or lowest per-rank median, after summing dispatches per round.",
-             "", "| Case | Effective median (us) |", "| --- | --- |"]
+             "Compare only results with the same metric.",
+             "", "| Case | Metric | Median (us) |", "| --- | --- | --- |"]
     for case in manifest["cases"]:
-        value = results.get(case["case_id"], "-")
-        lines.append(f"| {case['case_id']} | {value:.2f} |" if isinstance(value, float)
-                     else f"| {case['case_id']} | {value} |")
+        metric, value = results.get(case["case_id"], ("-", "-"))
+        display = f"{value:.2f}" if isinstance(value, float) else value
+        lines.append(f"| {case['case_id']} | {metric} | {display} |")
     return "\n".join(lines) + "\n"
 
 
@@ -382,10 +404,14 @@ def run_ci(output, platform="a2a3"):
             rc = proc.returncode
             if rc != 0:
                 raise ValueError(f"task-submit exited {rc}")
-            results[case_id] = effective_us(read_json(case_dir / "raw-result.json"), case, sampling)
-            print(f"[perf] {case_id}: {results[case_id]:.2f} us", flush=True)
+            metric, median = median_timing(read_json(case_dir / "raw-result.json"), case, sampling, platform)
+            results[case_id] = (metric, median)
+            print(f"[perf] {case_id}: {median:.2f} us ({metric})", flush=True)
+        except InvalidTimingError as error:
+            results[case_id] = ("-", "INVALID TIMING")
+            print(f"[perf] {case_id}: INVALID TIMING ({error}); see {case_id}/raw-result.json", flush=True)
         except (OSError, UnicodeError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
-            results[case_id] = "FAIL"
+            results[case_id] = ("-", "FAIL")
             print(f"[perf] {case_id}: FAIL ({error}); see {case_id}/run.log in the artifact", flush=True)
         finally:
             print("::endgroup::", flush=True)
@@ -395,7 +421,7 @@ def run_ci(output, platform="a2a3"):
             if (case_dir / name).is_file():
                 shutil.copyfile(case_dir / name, published / case_id / name)
         (published / "report.md").write_text(render_report(manifest, results))
-    return 0 if all(isinstance(value, float) for value in results.values()) else 1
+    return 0 if all(isinstance(value, float) for _, value in results.values()) else 1
 
 
 def main(argv=None):
