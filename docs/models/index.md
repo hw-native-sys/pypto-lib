@@ -11,6 +11,7 @@ tracked runnable set.
 | [deepseek_v4_flash_dspark](deepseek_v4_flash_dspark/index.md) | V4-Flash with seven DSpark draft tokens and TP-sharded DSA-CP attention. At TP4, the group verifies up to 64 requests per step (16 per rank). | A3 eight-card EP8, K=7 accuracy |
 | [deepseek_v4_flash_lowlat](deepseek_v4_flash_lowlat/index.md) | Batch-one V4-Flash decode and 43-layer chunked prefill with CP8 attention and TP8 MoE and LM head | No model-specific job |
 | [deepseek_v4_1_flash](deepseek_v4_1_flash/index.md) | A5 prefill and decode with full attention weights on each rank, configurable prefill CP and MoE EP, independently sharded LM head, and DSpark | No model-specific job |
+| [deepseek_v4_1_flash_a3](deepseek_v4_1_flash_a3/index.md) | DeepSeek V4.1 Flash W8A8 Prefill and Decode with resident weights and paged caches on 16 A3 devices (DP4/TP4/EP16) | No model-specific job |
 | [glm5_3_flash](glm5_3_flash/index.md) | W8A8 prefill and decode on A2/A3 at TP8/EP8 or TP16/EP16, with hybrid KDA and NoPE-MLA attention, MoE, MTP, and a vision encoder | No model-specific job |
 | [qwen3_8_27b](qwen3_8_27b/index.md) | W8A8 Gated DeltaNet block with checkpoint-compatible projections and per-request convolution and recurrent state for packed prefill | No model-specific job |
 

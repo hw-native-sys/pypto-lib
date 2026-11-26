@@ -31,14 +31,16 @@ Runnable entries have a script guard and a platform CLI or a validation entry
 that delegates argument parsing. Golden-only helpers and checkpoint-specific drivers are excluded.
 Simulator selection additionally excludes ``# ci: no-sim`` entries.
 
-Imports resolve two ways. A bare module name (``from qkv_proj_rope import ...``)
+Imports resolve three ways. A bare module name (``from qkv_proj_rope import ...``)
 resolves against the importer's own directory, so that part of the graph is
 keyed by file basename. A repository-rooted name
 (``from models.deepseek_v4_1_flash.config import ...``, or
 ``from models.deepseek_v4_1_flash import config``) resolves against the
 repository root. Both spellings are in use, and a directory written entirely in
 the rooted spelling has no sibling-name edges at all, so ignoring it would
-silently select nothing for every leaf change there.
+silently select nothing for every leaf change there. Explicit package-relative
+imports (such as ``from .qkv_proj_rope import ...`` or ``from . import config``)
+resolve from the importer's package.
 
 The selected, deduplicated, sorted file list is printed space-separated on a
 single line to stdout.
@@ -110,7 +112,7 @@ def _iter_source_files():
         for dirpath, _, files in os.walk(root):
             for name in files:
                 if name.endswith(".py") and not name.endswith("_draft.py"):
-                    yield os.path.join(dirpath, name)
+                    yield (Path(dirpath) / name).as_posix()
 
 
 def _read(path):
@@ -148,7 +150,31 @@ def _candidates(dotted):
     head = dotted.partition(".")[0]
     found = {("sibling", head)}
     if head in SOURCE_ROOTS:
-        found.add(("rooted", os.path.join(*dotted.split(".")) + ".py"))
+        path = Path(*dotted.split("."))
+        found |= _rooted_candidates(path)
+    return found
+
+
+def _rooted_candidates(path):
+    return {
+        ("rooted", path.with_suffix(".py").as_posix()),
+        ("rooted", (path / "__init__.py").as_posix()),
+    }
+
+
+def _relative_candidates(path, node):
+    package = Path(path).parent.parts
+    if node.level > len(package):
+        return set()
+    base = package[:len(package) - node.level + 1]
+    if base[0] not in SOURCE_ROOTS:
+        return set()
+    parts = (*base, *(node.module.split(".") if node.module else ()))
+    module = Path(*parts)
+    found = _rooted_candidates(module)
+    for alias in node.names:
+        if alias.name != "*":
+            found |= _rooted_candidates(module / alias.name)
     return found
 
 
@@ -168,10 +194,13 @@ def _imported_names(path):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 found |= _candidates(alias.name)
-        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
-            found |= _candidates(node.module)
-            for alias in node.names:
-                found |= _candidates(f"{node.module}.{alias.name}")
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                found |= _relative_candidates(path, node)
+            elif node.module:
+                found |= _candidates(node.module)
+                for alias in node.names:
+                    found |= _candidates(f"{node.module}.{alias.name}")
     return found
 
 
@@ -203,7 +232,7 @@ def build_reverse_graph():
 
     A bare import of ``foo`` from a file in ``dir`` resolves to ``dir/foo.py``;
     a rooted import of ``models.pkg.foo`` resolves to ``models/pkg/foo.py`` from
-    anywhere in the tree.
+    anywhere in the tree. A relative import resolves from the current package.
     """
     files = list(_iter_source_files())
     # (dir, basename-without-.py) -> file path, for resolving sibling imports.
