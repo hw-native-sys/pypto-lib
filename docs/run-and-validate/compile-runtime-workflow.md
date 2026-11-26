@@ -332,19 +332,6 @@ for full per-flag details. There is no `runtime_profiling` /
 `--runtime-profiling` compatibility alias in the current Python API; use
 `enable_chip_swimlane` or the entry's `--enable-chip-swimlane` flag.
 
-### 4b. Benchmark (opt-in, before validation)
-
-With `PYPTO_BENCH=1` in the environment, the harness re-dispatches the
-compiled program in a timed loop right after the correctness dispatch and
-before validation, and prints
-`[RUN]   effective_us (N rounds) min=… median=… mean=… max=…` for TMR or
-`aicore_wall_us` for A5 host-graph benchmarks with device timing enabled. It is
-env-gated only — no model file needs a flag. `PYPTO_BENCH_ROUNDS` /
-`PYPTO_BENCH_WARMUP` (default 100 / 5) size the loop. Every benchmark also
-prints the raw per-dispatch samples after measurement. See
-[performance-tuning.md](../debug-and-tune/performance-tuning.md#measuring-the-benchmark-loop-pypto_bench)
-for the output format, the multi-card breakdown, and what the number means.
-
 ### 5. Validate
 
 `golden.validation.validate_golden` compares each device output against
@@ -376,6 +363,22 @@ and a small set of harness-level setup errors return
 and ordinary runtime exceptions generally propagate instead of being converted
 to `RunResult`. A CLI should check a returned result and exit nonzero when it is
 false; an uncaught compile/runtime exception is already a nonzero failure.
+
+### 6. Benchmark (opt-in)
+
+Set `PYPTO_BENCH=1` to time repeated dispatches of the compiled program.
+When golden outputs are available, the harness validates the correctness
+dispatch first. A mismatch ends the run before any timed samples are
+collected. On the resident L3 path, the first warmup serves as the correctness
+dispatch. Runs without golden outputs can still collect timing samples.
+
+`PYPTO_BENCH_ROUNDS` and `PYPTO_BENCH_WARMUP` default to 100 measured
+rounds and 5 warmups locally. The harness prints raw per-dispatch samples
+and a summary for the selected metric. TMR reports `effective_us`. On A5,
+host-graph runs with device timing enabled report `aicore_wall_us` when
+Effective timing is unavailable. See the
+[performance guide](../debug-and-tune/performance-tuning.md#measuring-the-benchmark-loop-pypto_bench)
+for multi-card reporting and Daily CI sampling.
 
 ## Skipping phases
 

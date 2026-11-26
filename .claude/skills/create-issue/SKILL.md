@@ -24,7 +24,7 @@ not on a branch they can fetch, the issue carries its **content** (inlined, or
 attached via the web UI). See Steps 3c–3d.
 
 ```text
-reproduce on CURRENT env → make repro self-contained → collect versions
+record current versions → reproduce on CURRENT env → make repro self-contained
                              → diagnose → check pin consistency
                                                               │
                                               match ──────────┤──────── mismatch
@@ -61,10 +61,8 @@ jump to Step 7.
 | ptoas | `hw-native-sys/PTOAS` | `$PTOAS_ROOT` (binary) / `../PTOAS` (source) | PTO bytecode assembly & optimization |
 | pto-isa | `hw-native-sys/pto-isa` | `$PTO_ISA_CHECKOUT` (see below) | virtual tile-ISA implementations |
 
-There is no pto-isa root to export: simpler owns that checkout and
-`runtime/pto_isa.pin` is the only thing that selects it. Resolve it once with
-`PTO_ISA_CHECKOUT="$(python -c 'from pypto.runtime import ensure_pto_isa_root; print(ensure_pto_isa_root())')"`
-before running the commands below.
+Simpler owns the managed PTO ISA checkout. Step 2 inspects its path directly.
+Resolving the ISA for a build can replace a dirty or off-pin checkout.
 
 `simpler` is the pypto **runtime** submodule (submodule name `simpler`, path
 `$PYPTO_ROOT/runtime`). It tracks `hw-native-sys/simpler`, and it is a
@@ -83,48 +81,46 @@ If not authenticated, tell the user to run `gh auth login` and **stop**.
 
 **Bug reports only.** (Feature/documentation → skip to Step 7.)
 
-Use the `/setup-env` skill only to **install anything missing** (pypto not
-importable, ptoas absent, pto-isa not checked out). **Do not** `git checkout main`
-/ `git pull` / `git submodule update` on pypto — that would overwrite the very
-environment we are trying to reproduce. Whatever pypto commit/branch the user is
-on is the anchor; we validate the rest against it in Step 4.
-
-Collect the five component versions of the **current** environment (short hashes
-for display in the Background table):
+Capture the current toolchain before setup, compilation or reproduction. Keep
+the full hashes and the ISA working-tree status for the comparison in Step 4.
 
 ```bash
 # pypto-lib
-git rev-parse --short HEAD
+git rev-parse HEAD
 git branch --show-current
 
 # pypto (the anchor)
-git -C "$PYPTO_ROOT" rev-parse --short HEAD
+git -C "$PYPTO_ROOT" rev-parse HEAD
 git -C "$PYPTO_ROOT" branch --show-current
 
-# simpler (== pypto/runtime submodule; usually detached HEAD)
-git -C "$PYPTO_ROOT/runtime" rev-parse --short HEAD
-git -C "$PYPTO_ROOT/runtime" branch --show-current   # often empty (detached)
-
-# pto-isa (simpler-managed checkout; usually detached HEAD)
-PTO_ISA_CHECKOUT="$(python -c 'from pypto.runtime import ensure_pto_isa_root; print(ensure_pto_isa_root())')"
-git -C "$PTO_ISA_CHECKOUT" rev-parse --short HEAD
-git -C "$PTO_ISA_CHECKOUT" branch --show-current     # often empty (detached)
-
-# ptoas version. Probe in pypto's own order (backend/_ptoas_locate.py): the
-# three entries are not interchangeable, and from v0.55 only ptoas.sh selects
-# the CPython the release bundles — bin/ptoas dies on the caller's interpreter.
-ptoas_bin=""
-for rel in ptoas ptoas.sh bin/ptoas; do
-  if [ -f "$PTOAS_ROOT/$rel" ] && [ -x "$PTOAS_ROOT/$rel" ]; then
-    ptoas_bin="$PTOAS_ROOT/$rel"
-    break
+# Inspect the runtime's own checkout. Git otherwise searches the parent PyPTO repo.
+simpler_head=unknown
+isa_pin=unknown
+if [ -e "$PYPTO_ROOT/runtime/.git" ]; then
+  simpler_head="$(git -C "$PYPTO_ROOT/runtime" rev-parse --verify HEAD)" || simpler_head=unknown
+  git -C "$PYPTO_ROOT/runtime" branch --show-current
+  if [ -f "$PYPTO_ROOT/runtime/pto_isa.pin" ]; then
+    isa_pin="$(tr -d '[:space:]' < "$PYPTO_ROOT/runtime/pto_isa.pin")"
   fi
-done
-if [ -n "$ptoas_bin" ]; then
-  "$ptoas_bin" --version
-else
-  echo "not found"
 fi
+printf 'simpler HEAD: %s\n' "$simpler_head"
+
+# Inspect the existing ISA checkout, including a symlink or a Git worktree.
+PTO_ISA_CHECKOUT="$(python -c 'from simpler_setup.pto_isa import get_pto_isa_clone_path; print(get_pto_isa_clone_path())')"
+isa_head=unknown
+if [ -n "$PTO_ISA_CHECKOUT" ] && [ -e "$PTO_ISA_CHECKOUT/.git" ]; then
+  isa_head="$(git -C "$PTO_ISA_CHECKOUT" rev-parse HEAD)"
+  git --no-optional-locks -C "$PTO_ISA_CHECKOUT" status --short --branch
+fi
+printf 'PTO ISA HEAD: %s\n' "$isa_head"
+
+# Use the launcher the active PyPTO would invoke, including a wheel venv's bin/ptoas.
+ptoas_bin="$(python -c 'from pypto.backend._ptoas_locate import find_ptoas_binary; print(find_ptoas_binary() or "")')"
+ptoas_version=unknown
+if [ -n "$ptoas_bin" ]; then
+  ptoas_version="$("$ptoas_bin" --version)" || ptoas_version=unknown
+fi
+printf 'PTOAS launcher: %s\nPTOAS version: %s\n' "$ptoas_bin" "$ptoas_version"
 
 # CANN version from the environment used by the reproduction
 cann_root="${ASCEND_HOME_PATH:-${ASCEND_TOOLKIT_HOME:-}}"
@@ -145,7 +141,14 @@ Submodule / pinned checkouts (simpler, pto-isa) are typically in **detached
 HEAD**, so `branch --show-current` prints nothing — in that case record the
 branch as `detached` rather than leaving it blank.
 
-Record every value. If a version cannot be detected, use "unknown" and continue.
+For older revisions, inspect the active revision's resolver to locate the
+checkout and launcher if these discovery functions are unavailable. Record a
+missing checkout or unknown version explicitly. Preserve a dirty or off-pin
+checkout and run any setup or build that could replace it in an isolated
+environment. Use `/setup-env` only for missing components of the selected
+revision. After setup, repeat the probes before reproduction, including the
+runtime checkout and its ISA pin. If the run itself materializes a different
+toolchain, capture that snapshot too and identify which one produced the result.
 If `/setup-env` cannot even make pypto importable, note the failure, **skip
 Steps 3–4**, and treat the boundary as **unclear** (file in pypto-lib).
 
@@ -327,34 +330,30 @@ hashes, and normalize the ptoas string (`--version` prefixes the version with
 ```bash
 # simpler: expected = pypto's recorded submodule commit (full), actual = runtime HEAD (full)
 git -C "$PYPTO_ROOT" rev-parse HEAD:runtime
-git -C "$PYPTO_ROOT/runtime" rev-parse HEAD
+printf '%s\n' "$simpler_head"
 
-# pto-isa: pin is a FULL 40-char hash; compare against the full actual HEAD
-tr -d '[:space:]' < "$PYPTO_ROOT/runtime/pto_isa.pin"
-git -C "$PTO_ISA_CHECKOUT" rev-parse HEAD
+# Compare the full ISA pin to the HEAD captured for this run in Step 2.
+printf '%s\n' "$isa_pin" "$isa_head"
 
 # ptoas: normalize both sides to a bare version, then compare
 ( . "$PYPTO_ROOT/toolchain/versions.env" && echo "${PTOAS_VERSION#v}" )
-ptoas_bin="$PTOAS_ROOT/ptoas"
-if [ ! -f "$ptoas_bin" ] || [ ! -x "$ptoas_bin" ]; then
-  ptoas_bin="$PTOAS_ROOT/bin/ptoas"
-fi
-"$ptoas_bin" --version 2>/dev/null | sed 's/^ptoas //'
+printf '%s\n' "$ptoas_version" | sed -E 's/^ptoas (version )?v?//'
 ```
 
-If every component matches its pin, proceed to Step 5.
+If every component matches its pin and the ISA tree was clean, proceed to
+Step 5.
 
-**If any component is off its pinned version** (a stale ptoas binary, a pto-isa
-checkout at a different commit, or a locally-bumped simpler), the reproduction
-environment is **mismatched** — the bug may be an artifact of the mismatch rather
-than a real defect. **Ask the user explicitly** whether to:
+If a component is off its pin, a version remains unknown, or the ISA tree is
+dirty even at its pinned HEAD, **ask the user explicitly** whether to:
 
 1. **Align to the pins and re-run** (recommended) — check out the expected
-   simpler / pto-isa commits, reinstall the pinned ptoas via `/setup-env`, then
-   repeat Step 3 on the consistent environment. Use the **aligned** versions in
+   simpler commit, let its resolver prepare the pinned ISA in the isolated
+   environment, reinstall the pinned ptoas via `/setup-env`, then
+   repeat Steps 2–4 on the consistent environment. Use the **aligned** versions in
    the Background; **or**
-2. **File as-is** — keep the mismatched versions, and note the mismatch
-   explicitly in the Background (list expected vs actual for each off component).
+2. **File as-is** — record expected and observed versions in the Background.
+   Include any unknown values and identify a dirty ISA tree as locally modified
+   alongside its observed HEAD.
 
 Do not silently proceed on a mismatch — either align the versions or record the
 divergence in the issue.

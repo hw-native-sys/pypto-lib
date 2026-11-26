@@ -29,7 +29,7 @@ operator define its executable storage and layout contracts.
 | MoE | 384 routed experts, top-6 routing, one shared expert; intermediate width 2,304 |
 | Hyper-connections | 4 streams; persistent hidden state is FP32 |
 | Context ceiling | 1,048,576 positions, with 128-token cache pages |
-| Engram | Layers 1 and 14. Forward reads FP8 embedding payloads and E8M0 scales from rank-local and peer Host shards. |
+| Engram | At layers 1 and 14, prefill and decode use hash IDs to fetch FP8 embedding rows and their E8M0 scales from the owning rank's host-memory shards, then dequantize the rows on device. |
 | DSpark | 5 speculative tokens plus one verification row per request. The per-rank decode capacity is 12 requests, or 72 local verification rows. |
 
 Quantized projection paths use MXFP8 weights and activations; routed expert

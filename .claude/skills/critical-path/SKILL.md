@@ -194,7 +194,9 @@ Do not add ⭐ merely because the current task has
 
 For consumer `C`:
 
-1. Deduplicate its direct dependency edges.
+1. Deduplicate its direct ordering predecessors. Select edges containing
+   `wait` in flagged captures. Use the plain dependency edges in host-built
+   and legacy captures that omit `flags`.
 2. Apply the runtime's structural rule: every direct predecessor must be either
    an alloc source or carry `early_dispatch=true`, and at least one predecessor
    must be a non-alloc early producer.
@@ -235,9 +237,10 @@ Apply these attribution rules:
 
 - If `dispatch(C) < observed_ready(C)` and ⭐ is proven, no predecessor blocked
   `C`'s dispatch; it was already dispatched. Analyze its later gate/start wait.
-- List every non-alloc direct predecessor lacking
-  `early_dispatch=true` as an **early-dispatch policy blocker**. Such a task
-  prevents `C` from entering speculative early dispatch.
+- An unflagged compute predecessor on a recorded wait edge is a candidate
+  policy blocker. The runtime can skip an already-consumed producer when it
+  builds the live fan-in. Check that the producer still contributed to the
+  fan-in before attributing the delay to it.
 - If `dispatch(C) > observed_ready(C)`, report the post-FIN ready→dispatch
   scheduler delay. Report `data_ready → observed_ready` separately as producer
   FIN detection/dependency resolution. Ordinary level-4 scheduler phase rows

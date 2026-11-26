@@ -69,15 +69,22 @@ python .claude/skills/dependency-liveness/scripts/report.py \
 `--producer-occurrence` and `--consumer-occurrence` for one exact pair. Runtime
 task IDs are capture-local; use them only for forensic selection in one build.
 
+The report follows ordering edges. In device captures, each hop must carry
+`wait`. A `retain`-only edge keeps a producer alive and cannot establish task
+order. Host-built and legacy captures use plain predecessor edges and omit the
+flags. The report identifies dispatches using this format. A device capture
+records the constructed graph, so a redundant direct wait may be enforced
+through a transitive path at runtime.
+
 The report separates four outcomes:
 
 1. **Producer absent.** The expected task was predicated away, never submitted,
    or removed because its result was not semantically consumed.
 2. **Consumer absent.** The downstream branch did not materialize; an edge edit
    cannot repair a task that does not exist.
-3. **Both tasks exist but no path exists.** The generated graph permits the
+3. **Both tasks exist but no ordering path exists.** The generated graph permits the
    consumer to run before the producer.
-4. **A direct or transitive path exists.** Do not add another edge merely
+4. **A direct or transitive ordering path exists.** Do not add another edge merely
    because the runtime later stalled; investigate scheduling and resources.
 
 Compare every dynamic variant that can remove intermediate work: active and

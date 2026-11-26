@@ -19,14 +19,14 @@ below the presets.
 | Deployment property | Value |
 | --- | --- |
 | Speculative decoding | DSpark — a three-layer drafter proposes `DSPARK_SPEC_TOKENS = 7` drafts per request, so the target model verifies `S = 8` token rows per step (`DECODE_SEQ`) |
-| Decode batch per card | 64 requests → 512 token rows per step (`DECODE_BATCH`, `DECODE_TOKENS`) |
+| Decode capacity | 64 requests (512 verification rows) per attention TP group. At TP4 each rank owns 16 requests (128 rows). |
 | Decode context length | up to 1,048,576 positions, paged in **32-token** pages (`max_position_embeddings`, `BLOCK_SIZE`) |
 | Prefill shape | one packed request stream per CP group, `PREFILL_SEQ = 512` tokens per dispatch; longer prompts arrive as chunks against a resident prefix |
 | Platform | Ascend A2/A3, single node |
 | Attention tensor parallelism | `--tp 1/2/4`; the deployment point is TP 4, including the grouped output projection and DSA-CP token split |
-| LM-head tensor parallelism | `--lm-head-tp 1/2/4/8/16`, defaulting to `--tp`; independent vocabulary shards for both target and Markov sampling |
+| LM-head tensor parallelism | `--lm-head-tp 1/2/4/8/16` controls vocabulary sharding for target and Markov sampling. Decode defaults to `min(4, EP_SIZE)`. Prefill defaults to the attention TP size. |
 | Context parallelism | DSA-CP reuses that same physical TP group: each rank owns a slice of the step's token rows, and the attention KV stream is replicated rank-major across the group |
-| Expert parallelism | `--ep 2/4/8/16`; the deployment point is EP 16, and each rank holds `256 / ep` routed experts |
+| Expert parallelism | `--ep 2/4/8/16`. The full checkpoint distributes 256 routed experts across the EP group, giving 16 per rank at the EP16 deployment point. |
 | Data parallelism | `DP = 4` groups per node, so the deployment point is 16 cards (`TP * DP`) |
 | Quantization | W8A8 INT8, identical to the MTP tree — INT8 weights with FP32 dequant scales, activations quantized per token at the INT8 matmuls |
 
@@ -40,14 +40,13 @@ compressor-state pools.
 | | MTP point | DSpark point |
 | --- | --- | --- |
 | Drafting | one MTP layer, 1 draft token | a 3-layer drafter, 7 draft tokens, plus a Markov head |
-| Rows per decode step, per card | 4 requests × 2 = 8 | 64 requests × 8 = 512 |
+| Verification rows per rank at capacity | 4 requests × 2 = 8 | 16 requests × 8 = 128 at TP4 |
 | Attention parallelism | data-parallel; each rank owns its own micro-batch | TP-sharded output projection over a DSA-CP token split |
 | Page size | 128 | 32 |
 | Context ceiling | `max_position_embeddings` truncated to 16,384 | the checkpoint's own 1,048,576, and the cache capacities are sized from it |
 
-The wider verify window is the reason for the rest of the table: 512 rows per
-step is too much attention work for one card, so the token axis is split across
-the CP group and the output projection is sharded along with it.
+DSA-CP splits the 512 verification rows across the TP group and shards the
+output projection over the same ranks.
 
 ## Model structure, top down
 
@@ -100,9 +99,8 @@ proposals cannot enter the target or accepted prefix.
 
 Every `decode_{swa,csa,hca}` entry has a `_tp1` twin: the single-rank form runs
 the layer without the CP gather and the TP publish, and is what the golden
-compares against. The batch is dynamic: `--start-pos` takes one position per
-request and its length is the batch, defaulting to the 16 per-rank requests the
-MoE token budget is sized for.
+compares against. The `--start-pos` list sets the rank-local batch by supplying
+one position per request. At TP4 the default batch is 16 requests per rank.
 
 ### `prefill_fwd`
 
@@ -197,17 +195,19 @@ decode_csa   … → decode_compressor_ratio4 (main, inner)
 
 ### MoE and output stages
 
-[moe.py](../../../models/deepseek_v4_flash_dspark/moe.py) is unchanged in shape
-from the MTP tree — `gate` produces the top-6 routing and the per-token INT8
-view, `dispatch` / `combine` are the EP collectives, `expert_shared` and
-`expert_routed` are the two FFN paths — but it carries `DP * DECODE_TOKENS`
-worth of receive capacity, because a DSpark step dispatches 512 rows per card
-rather than 8.
+In backbone layers 0–2, the [gate](../../../models/deepseek_v4_flash_dspark/gate.py)
+reads six expert IDs from the layer's `tid2eid` table using the input token ID.
+Later layers select the six highest bias-adjusted router scores. Both paths
+normalize the selected experts' unbiased scores and multiply by the routing
+scale to obtain their weights. The [MoE](../../../models/deepseek_v4_flash_dspark/moe.py)
+dispatches and combines routed FFN work across the EP group alongside the shared
+expert. At TP4 each rank contributes up to 128 input rows, so the EP16 receive
+buffers allow up to 2,048 rows per expert.
 
 `hc_head` folds the hyper-connection stack back to one hidden row, the final
 `rms_norm` normalizes it, and [lm_head.py](../../../models/deepseek_v4_flash_dspark/lm_head.py)
 all-gathers the group's hidden rows, projects them against this card's
-`vocab / tp` shard, and all-to-alls the logits back to their row owners.
+`vocab / lm_head_tp` shard, and all-to-alls the logits back to their row owners.
 
 ### The DSpark drafter
 
@@ -242,23 +242,20 @@ dspark_markov      lm_head → sequential Markov sampling → confidence head
   prompt-context KV insertion followed by the same seven-query proposal.
   `--mode decode`, the default, starts from the accepted decode rows instead.
 
-The drafter's query batch is one MoE slab of padded draft blocks
-(`MOE_TOKENS / DECODE_SEQ` requests), not the TP split of the target batch, so
-its shapes do not move with `--tp`; only the DSA-CP group width does.
+The drafter pads each seven-row query block to eight rows in its local MoE
+buffer. The decode entry sizes this buffer to `DECODE_TOKENS // TP_SIZE`,
+giving each rank capacity for 64, 32 or 16 requests at TP1, TP2 or TP4.
 
 [decode_fwd_dspark.py](../../../models/deepseek_v4_flash_dspark/decode_fwd_dspark.py)
 composes the whole recurrent step — prepare, target forward, accept, drafter,
 Markov sampler, state commit — into one L2, and runs it end to end without a
 golden. The fused step and three-layer drafter accept `--tp 1/2/4`. At TP1,
-each EP rank owns an independent attention/cache group; EP MoE communication
-still spans the selected world. The per-rank 128-token MoE slab and maximum
-16-request drafter batch do not grow when TP decreases.
+each EP rank owns an independent attention/cache group. EP MoE communication
+spans the selected world.
 
-The fused target takes zero-copy views of the padded metadata: compressor
-tables and group RoPE cover `TP * 16` requests and `TP * 128` tokens, while
-attention cache tables and sequence lengths cover 16 rank-local requests.
-Each request therefore retains the K7 width of eight tokens for TP1/2/4;
-the outer metadata ABI and resident cache allocations do not change.
+The fused target takes views of the padded metadata. Compressor tables cover
+the group's requests and group RoPE covers their verification rows. Attention
+cache tables and sequence lengths cover only the requests owned by the rank.
 
 For attention TP1 / EP16, `--lm-head-tp 4` keeps the head's BF16 NZ weight
 vocabulary-sharded without changing the attention/cache layout. As in MTP,
@@ -272,8 +269,9 @@ avoids that layout without changing the SDK or using ND weights.
 
 ## Status
 
-These entries validate library kernels, not a serving deployment. Every executable
-file carries its own Golden Harness fixture; the
+On relevant PRs the serving accuracy job runs the K=7 generation and grouped
+prefix-cache case on eight A3 devices at TP4/EP8. The model's standalone
+entries have separate Golden Harness fixtures. The
 `decode_fwd` / `prefill_fwd` / `decode_layer` / `prefill_layer` compositions and
 the distributed communication oracles are device-only and do not run on a
 simulator. Most kernels are a plain function exposed twice — as the

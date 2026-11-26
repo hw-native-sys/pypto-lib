@@ -25,6 +25,7 @@ from scheduling import (
     list_schedule,
     pressure_report,
     verify_schedule,
+    wait_edges,
 )
 
 
@@ -253,7 +254,7 @@ def load_capture(path, include_setup=False, exclusions=()):
     pred = defaultdict(set)
     succ = defaultdict(set)
     nodes = set(known)
-    for edge in deps["edges"]:
+    for edge in wait_edges(deps):
         a, b = str(edge["pred"]), str(edge["succ"])
         nodes.update([a, b])
         pred[b].add(a)

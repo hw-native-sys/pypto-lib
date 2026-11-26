@@ -105,14 +105,17 @@ A distributed program adds a per-rank breakdown and a context line:
 | `PYPTO_BENCH_ROUNDS` | `100` | Timed rounds. 100 rounds is ~0.1 s of device time for a decode step but minutes for a long prefill or a multi-card run — drop it while iterating. |
 | `PYPTO_BENCH_WARMUP` | `5` | Leading launches discarded before measurement. The resident L3 path always keeps ≥ 1 (its first warmup launch doubles as the validation dispatch). |
 
-Every benchmark prints each measured dispatch's Effective sample, one line
-per rank in dispatch order, after measurement. Use these samples to spot
+After measurement, the harness prints each dispatch's sample for the
+reported metric (`eff_us` or `aicore_wall_us`), one line per rank in
+dispatch order. Use these samples to spot
 start-up drift, a bimodal rank, or one card lagging.
 
-A malformed or out-of-range value warns and falls back to the default
-rather than failing the run. The 100 / 5 default is the baseline every
-reported number should come from; if you change the loop sizes, compare only
-against other runs with the same sizes.
+A malformed or out-of-range value warns and falls back to the local default.
+Compare runs with matching rounds and warmup. For a Daily CI comparison, use
+the [performance case manifest](../../.github/scripts/perf_cases.json) from
+the revision being measured. It currently specifies 100 measured rounds
+and 10 warmups. Its multi-card result is the lowest per-rank median after
+summing each rank's dispatches within each round.
 
 ```bash
 # Quick CSA decode iteration, with the raw per-dispatch samples.
@@ -236,10 +239,11 @@ parallelism shortens the critical path.
 
 **Split critical work across cores.**
 
-When one InCore body contains independent chunks, expose those chunks as
-parallel blocks of a `pl.spmd` task. This example assumes `hidden` is divisible
-by `Q_OUT_CHUNK`. Otherwise, round the block count up and handle the final
-partial chunk in the body; floor division would omit it.
+When one InCore body contains independent chunks, distribute them across
+the cores available to this allocation. For a cube or mixed kernel, query
+`pl.system.available_cluster_count()`. For a vector-only kernel, use
+`pl.system.available_aiv_count()`. Each worker processes additional chunks
+at a stride of the launch width.
 
 ```python
 # Before: one giant InCore region over all q_out blocks
@@ -247,10 +251,17 @@ with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj"):
     for q0 in pl.range(0, hidden, Q_OUT_CHUNK):
         ...
 
-# After: one scheduling unit with parallel blocks of the same body
-for q_block in pl.spmd(hidden // Q_OUT_CHUNK, name_hint="q_proj"):
-    q0 = q_block * Q_OUT_CHUNK
-    ...
+# After: one cube worker per available cluster, up to the chunk count
+if hidden > 0:
+    chunks = (hidden + Q_OUT_CHUNK - 1) // Q_OUT_CHUNK
+    workers = pl.min(chunks, pl.system.available_cluster_count())
+    for worker in pl.spmd(workers, name_hint="q_proj"):
+        for (chunk,) in pl.while_(init_values=(worker,)):
+            pl.cond(chunk < chunks)
+            q0 = chunk * Q_OUT_CHUNK
+            width = pl.min(Q_OUT_CHUNK, hidden - q0)
+            ...  # Load and store only the valid width of this chunk.
+            next_chunk = pl.yield_(chunk + pl.tile.get_block_num())
 ```
 
 **Coarsen noncritical work inside each core.** Move part of an outer
@@ -278,12 +289,10 @@ SPMD unit contains multiple blocks of the same InCore body. An outer
 `pl.parallel` can expose independent chains of InCore launches or SPMD groups
 to the scheduler (MPMD).
 
-For a single InCore body that needs parallel execution, prefer `pl.spmd`:
-
-```python
-for q_grid in pl.spmd(Q_ON * N_SUB, name_hint="q_proj_fused_dequant"):
-    ...
-```
+For a single InCore body that needs parallel execution, prefer a bounded
+`pl.spmd` launch as in the projection example above. A two-dimensional
+grid of `Q_ON * N_SUB` tiles can use the same loop: recover the tile
+coordinates with `tile // N_SUB` and `tile % N_SUB`.
 
 For multiple dependent InCore stages repeated over independent chunks,
 consider `pl.parallel` around the chain, with each stage expressed as an

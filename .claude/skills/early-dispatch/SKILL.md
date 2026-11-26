@@ -151,7 +151,9 @@ post-FIN gap     = S(C) - max(F(P))
 early lead       = max(F(P)) - min(C block dispatch_time_us)
 ```
 
-Deduplicate direct dependency edges by `(pred, succ)`. Fold every physical
+Collect direct ordering predecessors from edges containing `wait`, or from the
+plain dependency edges in host-built and legacy captures that omit `flags`.
+Deduplicate by `(pred, succ)`. Fold every physical
 block of every non-allocation direct producer. If any such producer lacks joined
 timing, mark the metric and actual-dispatch result unverifiable; do not silently
 use the timed subset.
@@ -197,7 +199,7 @@ dispatch_program.json
 
 For every target task ID:
 
-1. Collect and deduplicate every `deps.json::edges[].pred`.
+1. Collect and deduplicate the direct ordering predecessors.
 2. Ignore predecessors absent from `deps.json::tasks`; they are allocation
    sources and are already early-resolvable.
 3. Inspect all active `kernel_ids` slots. A MIX task can map to more than one
@@ -305,8 +307,11 @@ runtime task IDs remain stable across builds.
 
 Always give the user the exact after-artifact directory. Diagnose in this order:
 
-1. **Producer policy:** list every non-allocation direct producer still missing
-   `early_dispatch=true`. This is a proven blocker.
+1. **Producer policy:** list unflagged compute producers on recorded wait
+   edges. Such a producer blocks early dispatch if it is still in the live
+   fan-in. When the timing disagrees, check whether the runtime skipped an
+   already-consumed producer and whether the two captures have matching
+   topology before attributing a blocker.
 2. **Unsupported target:** inspect source for a dispatch predicate or a resource
    shape other than AIC/AIV/MIX. The runtime rejects those from early staging.
 3. **Late target submission:** use the target's L4

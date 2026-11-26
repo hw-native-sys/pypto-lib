@@ -9,19 +9,27 @@ examples/        Self-contained kernels for learning the DSL
   beginner/        hello_world, matmul, etc.
   intermediate/    softmax, rms_norm, rope, etc.
   advanced/        Multi-stage fused + instruction-combo kernels (gemm_eltwise, multi_proj, topk)
-models/          End-to-end LLM kernels, one flat directory per model build
-  qwen3_14b/                   Qwen3-14B prefill + decode, BF16, serving contract
-  deepseek_v4_flash_mtp/       DeepSeek V4-Flash, INT8 W8A8, MTP=1, serving contract
-  (other directories are kernel harnesses — see the model pages)
+models/          Model operators, decoder blocks, and full prefill/decode programs
 golden/          Test harness — compile, run on device, validate against torch
 tests/           Lint checks and golden-fn unit tests
 docs/            Coding-style and workflow reference
 ```
 
-Files ending in `_draft.py` are works-in-progress and excluded from CI. The
-[model pages](docs/models/index.md) list every model directory, whether it is
-wired to `pypto-serving`, and — for the full model trees — its deployment
-configuration and how its files compose.
+Files ending in `_draft.py` are works-in-progress and excluded from CI.
+
+## Models
+
+| Model | Implementation |
+| --- | --- |
+| [Qwen3-14B](docs/models/qwen3_14b/index.md) | Single-card BF16 prefill and decode with grouped-query attention and a paged KV cache. The directory also includes A8W8 projections, TurboQuant variants, and sampling kernels. |
+| [DeepSeek V4-Flash MTP](docs/models/deepseek_v4_flash_mtp/index.md) | W8A8 prefill and decode with expert-parallel MoE. Each rank handles its own decode attention batch, and the multi-token prediction (MTP) layer proposes one draft token per request. |
+| [DeepSeek V4-Flash DSpark](docs/models/deepseek_v4_flash_dspark/index.md) | A wide-batch configuration of the same checkpoint. A three-layer drafter proposes seven tokens per request, and the target splits the verification rows across the attention group. |
+| [DeepSeek V4-Flash low-latency](docs/models/deepseek_v4_flash_lowlat/index.md) | Experimental batch-one decode and chunked prefill. Prefill partitions attention queries across ranks and hands its resident KV cache to decode. |
+| [DeepSeek V4.1 Flash](docs/models/deepseek_v4_1_flash/index.md) | Ascend A5 prefill and decode with MXFP8 projections, MXFP4 routed experts, and Engram embedding lookup. The directory also includes DSpark speculative decoding and a separately callable vision encoder. |
+| [GLM-5.3-Flash](docs/models/glm5_3_flash/index.md) | W8A8 prefill and decode on Ascend A2/A3, combining Kimi Delta Attention (KDA), NoPE-MLA attention, and MoE. The model also includes MTP and a vision encoder for images and video. |
+
+See the [model index](docs/models/index.md) for deployment configurations and
+the `pypto-serving` accuracy jobs run on relevant PRs.
 
 ## Quick start
 

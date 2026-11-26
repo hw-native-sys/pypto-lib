@@ -93,8 +93,10 @@ merely because they are absent from the dependency critical path.
 The helper reads and joins rows through `swimlane_converter.read_perf_data`,
 checks capture level, execution epoch, physical cores, raw/decoded row counts,
 and each task's `block_num * active kernel slots`, including separate AIC/AIV
-worker counts. It retains every dependency edge, regardless of optional
-`flags`, and zero-duration allocation/dummy nodes, and rejects graph cycles.
+worker counts. It keeps ordering edges and zero-duration allocation/dummy
+nodes and rejects ordering cycles. For edges with `flags`, only `wait`
+constrains task start times. Host-built and legacy captures omit `flags`
+and use plain predecessor edges.
 
 For each included task:
 

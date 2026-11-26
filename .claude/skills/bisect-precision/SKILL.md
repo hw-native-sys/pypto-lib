@@ -58,9 +58,9 @@ git -C "${SIMPLER_DIR}" rev-parse HEAD
 git -C "${SIMPLER_DIR}" symbolic-ref --short -q HEAD
 ```
 
-If either checkout has uncommitted user changes, do not stash, discard, or
-overwrite them. Use a safe dedicated checkout when practical or ask the user
-to choose how to proceed.
+Check the existing managed ISA path with `simpler_setup.pto_isa.get_pto_isa_clone_path()`
+before building. Use a separate checkout and environment if an install or
+resolver could replace user changes in PyPTO, simpler or its managed ISA tree.
 
 Resolve and inspect the endpoints:
 
@@ -78,9 +78,43 @@ git -C "${PYPTO_DIR}" log --oneline \
 
 If the good commit is not an ancestor of the bad commit, identify a merge-base
 or a known-good commit on the relevant history. Reproduce both endpoints under
-the same environment before starting. Record the original refs separately from
-the endpoint values so restoration does not assume the bad endpoint was the
-user's original checkout.
+the same environment using the checks below before starting. Record the original
+refs and runtime build targets for restoration.
+
+## Hold the assembler and ISA fixed
+
+Record the common full ISA commit as `FIXED_ISA`, the selected target as
+`RUNTIME_PLATFORM` (`a2a3`, `a5`, `a2a3sim` or `a5sim`), and the effective
+PTOAS launcher's path and full `--version` output. Keep the same assembler
+installation throughout. At each endpoint and midpoint, use the active PyPTO
+revision's launcher discovery to confirm that path and version.
+
+Simpler can resolve its managed ISA during installation. Check the candidate
+pin **before installing simpler**, then verify the effective checkout in the
+same environment that will compile the case:
+
+```bash
+install_bisect_runtime() {
+  local pin isa_dir isa_head
+  pin=$(cat "${SIMPLER_DIR}/pto_isa.pin") || return 1
+  if [ "$pin" != "${FIXED_ISA:?set the common full ISA commit}" ]; then
+    printf 'Candidate ISA pin %s differs from fixed ISA %s\n' "$pin" "$FIXED_ISA" >&2
+    return 1
+  fi
+  python -m pip install --no-build-isolation -e "${SIMPLER_DIR}" \
+    --config-settings="build.targets=build_package_${RUNTIME_PLATFORM:?select the case target}" || return 1
+  isa_dir=$(python -c 'from pypto.runtime import ensure_pto_isa_root; print(ensure_pto_isa_root())') || return 1
+  isa_head=$(git -C "$isa_dir" rev-parse HEAD) || return 1
+  printf 'Effective ISA: %s\n' "$isa_head"
+  [ "$isa_head" = "$FIXED_ISA" ]
+}
+```
+
+For an older revision, use its equivalent install and verification procedure
+if it can establish the same inputs. Skip a midpoint with an incompatible
+pin or unverifiable toolchain and record the reason. If either endpoint cannot
+reproduce with the fixed inputs, report the comparison as inconclusive.
+`PTO_ISA_ROOT` cannot override a pin selected by the managed resolver.
 
 ## Optional generated-source triage
 
@@ -104,8 +138,8 @@ git -C "${PYPTO_DIR}" bisect good "${PYPTO_GOOD}"
 At every selected revision:
 
 1. Run `git submodule update --init runtime`.
-2. Reinstall editable PyPTO and simpler with `--no-build-isolation`.
-3. Run the exact pypto-lib command.
+2. Reinstall editable PyPTO and run `install_bisect_runtime`.
+3. After the toolchain checks pass, run the exact pypto-lib command.
 4. Mark:
    - `good` only for the expected numerical pass;
    - `bad` only for the reproduced precision failure;
@@ -113,18 +147,16 @@ At every selected revision:
      crashes unrelated to validation, or ambiguous results.
 5. Report progress as commit, subject, verdict, and remaining range.
 
-Use this command skeleton for each candidate:
+Prepare each candidate with:
 
 ```bash
-git -C "${PYPTO_DIR}" submodule update --init runtime
-python -m pip install --no-build-isolation -e "${PYPTO_DIR}"
-python -m pip install --no-build-isolation -e "${SIMPLER_DIR}"
-
-cd "${PYPTO_LIB_DIR}"
-python <case.py> -p <platform> -d <device> <replay-arguments>
+git -C "${PYPTO_DIR}" submodule update --init runtime &&
+  python -m pip install --no-build-isolation -e "${PYPTO_DIR}" &&
+  install_bisect_runtime
 ```
 
-Then record exactly one supported verdict:
+After a successful setup, run the recorded reproduction command from
+`PYPTO_LIB_DIR`. Record exactly one supported verdict:
 
 ```bash
 git -C "${PYPTO_DIR}" bisect good
@@ -135,6 +167,7 @@ git -C "${PYPTO_DIR}" bisect skip
 Never classify a generic nonzero exit as a precision failure. Preserve enough
 raw output to justify every verdict.
 
+If skips leave several possible first bad revisions, report the candidate set.
 When Git identifies the first bad commit, capture its full metadata, stat, and
 relevant diff before resetting the bisect:
 
@@ -158,12 +191,12 @@ If the PyPTO culprit changes only the `runtime` gitlink:
 1. Read the old pointer from `<culprit>^:runtime`.
 2. Read the new pointer from `<culprit>:runtime`.
 3. Keep PyPTO at the culprit and install it once.
-4. Bisect the simpler checkout between those pointers.
-5. Reinstall simpler and run the same pypto-lib command for each revision.
+4. Recheck both simpler endpoints with PyPTO held at the culprit. Start the
+   nested bisect only if the old pointer passes and the new pointer reproduces.
+5. Run `install_bisect_runtime` for each candidate before running the same case.
 6. Apply the same good/bad/skip rules and progress reporting.
 
-Extract the endpoints and start the nested search with PyPTO held at the
-culprit:
+Extract the endpoints and hold PyPTO at the culprit:
 
 ```bash
 SIMPLER_GOOD="$(
@@ -175,20 +208,15 @@ SIMPLER_BAD="$(
 
 git -C "${PYPTO_DIR}" checkout <pypto-culprit>
 python -m pip install --no-build-isolation -e "${PYPTO_DIR}"
+```
 
+After confirming each endpoint with `install_bisect_runtime` and the case,
+start the nested bisect:
+
+```bash
 git -C "${SIMPLER_DIR}" bisect start
 git -C "${SIMPLER_DIR}" bisect bad "${SIMPLER_BAD}"
 git -C "${SIMPLER_DIR}" bisect good "${SIMPLER_GOOD}"
-```
-
-For each simpler candidate, reinstall only simpler, run the same command, and
-apply the same good/bad/skip rules:
-
-```bash
-python -m pip install --no-build-isolation -e "${SIMPLER_DIR}"
-
-cd "${PYPTO_LIB_DIR}"
-python <case.py> -p <platform> -d <device> <replay-arguments>
 ```
 
 If PyPTO source also changed, do not assume simpler is solely responsible.
@@ -208,13 +236,14 @@ skips:
 7. Rerun the original bad endpoint when feasible to confirm environment
    restoration.
 
-Use the recorded original branch or detached commit for each checkout:
+Use the recorded original branch or detached commit for each checkout.
+Reapply the original runtime build targets when reinstalling:
 
 ```bash
-if git -C "${SIMPLER_DIR}" rev-parse --verify BISECT_HEAD >/dev/null 2>&1; then
+if git -C "${SIMPLER_DIR}" bisect log >/dev/null 2>&1; then
   git -C "${SIMPLER_DIR}" bisect reset
 fi
-if git -C "${PYPTO_DIR}" rev-parse --verify BISECT_HEAD >/dev/null 2>&1; then
+if git -C "${PYPTO_DIR}" bisect log >/dev/null 2>&1; then
   git -C "${PYPTO_DIR}" bisect reset
 fi
 
@@ -223,7 +252,7 @@ git -C "${PYPTO_DIR}" submodule update --init runtime
 git -C "${SIMPLER_DIR}" checkout <original-simpler-branch-or-commit>
 
 python -m pip install --no-build-isolation -e "${PYPTO_DIR}"
-python -m pip install --no-build-isolation -e "${SIMPLER_DIR}"
+# Reinstall simpler with the original flags recorded above.
 
 git -C "${PYPTO_DIR}" status --short --branch
 git -C "${PYPTO_DIR}" rev-parse HEAD
