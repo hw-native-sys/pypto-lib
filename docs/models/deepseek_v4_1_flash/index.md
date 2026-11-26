@@ -87,6 +87,26 @@ Attention entries own chunk scheduling and dependencies around that shared
 implementation. MoE dispatches local token rows to EP expert owners and combines
 the results back into the local HC state.
 
+### DSpark rejection sampling
+
+Recurrent K=5 decode can opt in to device-side rejection sampling with
+`state_meta` shaped `[EP_SIZE, DECODE_BATCH, REJECTION_STATE_META_WIDTH]`.
+Keep this state across decode invocations and pass it through bootstrap.
+The first six INT32 columns are the standard request metadata. Column 6
+indicates whether proposal distributions are present. Starting at column 16,
+five full-vocabulary FP32 probability rows are stored bit-for-bit in the
+INT32 state buffer. A six-column state selects the existing token-matching
+path. Bootstrap drafts are deterministic.
+
+The recurrent Markov drafter applies temperature, top-p and top-k to its
+biased logits, samples from the normalized distribution, and uses the sampled
+token to condition the next draft position. The verifier uses the stored
+proposal probabilities for the target-to-draft acceptance ratio and samples
+from the positive residual on the first rejection. An all-accepted prefix is
+followed by an ordinary target sample. Proposal, acceptance and correction
+use separate position-keyed random streams. The standalone decode fixture
+selects this mode with `--rejection-sampling`.
+
 ## Parallel configuration
 
 | Component | Contract |

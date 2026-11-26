@@ -29,7 +29,7 @@ from config import (
 
 from decode_metadata import (
     STATE_VALID, STATE_GENERATION, STATE_ANCHOR, STATE_COMMITTED, STATE_DRAFT_COUNT, STATE_LIMIT,
-    STATE_META_WIDTH, STATE_TOKEN_WIDTH,
+    REJECTION_STATE_META_WIDTH, STATE_META_COLUMNS, STATE_PROPOSAL_VALID, STATE_TOKEN_WIDTH,
 )
 from lm_head import SAMPLED_IDS_PAD
 
@@ -73,10 +73,11 @@ def bootstrap_inputs_rank(
     position_limits: pl.Tensor[[DECODE_BATCH], pl.INT32],
     sampled_rows: pl.Tensor[[DECODE_BATCH], pl.INT32],
     sampled_ids: pl.Tensor[[PREFILL_SAMPLE_ROWS, SAMPLED_IDS_PAD], pl.INT32],
-    state_meta: pl.Tensor[[DECODE_BATCH, STATE_META_WIDTH], pl.INT32],
+    state_meta: pl.Tensor[[DECODE_BATCH, STATE_META_COLUMNS], pl.INT32],
     next_prefill_tokens: pl.Out[pl.Tensor[[DECODE_BATCH], pl.INT64]],
     first_query_positions: pl.Out[pl.Tensor[[DECODE_BATCH], pl.INT32]],
 ):
+    state_meta.bind_dynamic(1, STATE_META_COLUMNS)
     for _core in pl.spmd(1, name_hint="dspark_bootstrap_inputs"):
         for request in pl.range(DECODE_BATCH):
             pl.write(next_prefill_tokens, [request], pl.cast(0, pl.INT64))
@@ -105,10 +106,11 @@ def l3_bootstrap_inputs(
     position_limits: pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32],
     sampled_rows: pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32],
     sampled_ids: pl.Tensor[[EP_SIZE, PREFILL_SAMPLE_ROWS, SAMPLED_IDS_PAD], pl.INT32],
-    state_meta: pl.Tensor[[EP_SIZE, DECODE_BATCH, STATE_META_WIDTH], pl.INT32],
+    state_meta: pl.Tensor[[EP_SIZE, DECODE_BATCH, STATE_META_COLUMNS], pl.INT32],
     next_prefill_tokens: pl.Out[pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT64]],
     first_query_positions: pl.Out[pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32]],
 ):
+    state_meta.bind_dynamic(2, STATE_META_COLUMNS)
     for rank in pl.range(pld.world_size()):
         bootstrap_inputs_rank(
             slot_ids[rank], generations[rank], prompt_lengths[rank], position_limits[rank], sampled_rows[rank],
@@ -127,8 +129,9 @@ def publish_bootstrap_rank(
     sampled_ids: pl.Tensor[[PREFILL_SAMPLE_ROWS, SAMPLED_IDS_PAD], pl.INT32],
     draft_ids: pl.Tensor[[DECODE_BATCH, DSPARK_QUERY_WIDTH], pl.INT32],
     state_tokens: pl.InOut[pl.Tensor[[DECODE_BATCH, STATE_TOKEN_WIDTH], pl.INT64]],
-    state_meta: pl.InOut[pl.Tensor[[DECODE_BATCH, STATE_META_WIDTH], pl.INT32]],
+    state_meta: pl.InOut[pl.Tensor[[DECODE_BATCH, STATE_META_COLUMNS], pl.INT32]],
 ):
+    state_meta.bind_dynamic(1, STATE_META_COLUMNS)
     for _core in pl.spmd(1, name_hint="dspark_bootstrap_publish"):
         for request in pl.range(DECODE_BATCH):
             slot = pl.read(slot_ids, [request])
@@ -146,6 +149,8 @@ def publish_bootstrap_rank(
                         pl.write(state_meta, [slot, STATE_ANCHOR], prompt)
                         pl.write(state_meta, [slot, STATE_COMMITTED], prompt)
                         pl.write(state_meta, [slot, STATE_LIMIT], limit)
+                        if pl.tensor.dim(state_meta, 1) == REJECTION_STATE_META_WIDTH:
+                            pl.write(state_meta, [slot, STATE_PROPOSAL_VALID], pl.cast(0, pl.INT32))
                         draft_count = pl.cast(0, pl.INT32)
                         if prompt + DSPARK_QUERY_WIDTH < limit:
                             draft_count = pl.cast(DSPARK_QUERY_WIDTH, pl.INT32)
@@ -167,8 +172,9 @@ def l3_publish_bootstrap(
     sampled_ids: pl.Tensor[[EP_SIZE, PREFILL_SAMPLE_ROWS, SAMPLED_IDS_PAD], pl.INT32],
     draft_ids: pl.Tensor[[EP_SIZE, DECODE_BATCH, DSPARK_QUERY_WIDTH], pl.INT32],
     state_tokens: pl.InOut[pl.Tensor[[EP_SIZE, DECODE_BATCH, STATE_TOKEN_WIDTH], pl.INT64]],
-    state_meta: pl.InOut[pl.Tensor[[EP_SIZE, DECODE_BATCH, STATE_META_WIDTH], pl.INT32]],
+    state_meta: pl.InOut[pl.Tensor[[EP_SIZE, DECODE_BATCH, STATE_META_COLUMNS], pl.INT32]],
 ):
+    state_meta.bind_dynamic(2, STATE_META_COLUMNS)
     for rank in pl.range(pld.world_size()):
         publish_bootstrap_rank(
             slot_ids[rank], generations[rank], prompt_lengths[rank], position_limits[rank],

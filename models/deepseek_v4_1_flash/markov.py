@@ -14,7 +14,7 @@ import pypto.language.distributed as pld
 import torch
 
 from config import (
-    B_DYN, DP_SIZE, MOE_TOKENS,
+    B_DYN, DP_SIZE, MOE_TOKENS, DECODE_SEQ,
     DSPARK_MARKOV_RANK, DSPARK_QUERY_WIDTH,
     EP_SIZE, FLASH, DECODE_BATCH,
     SUPPORTED_EP_SIZES, SUPPORTED_LM_HEAD_TP_SIZES, LM_HEAD_TP_SIZE,
@@ -22,7 +22,10 @@ from config import (
 from lm_head import VOCAB_PER_TP, clear_lm_head_signals, lm_head
 from rmsnorm import rms_norm
 from hc import hc_head
+from sample import ARGMAX_WIDTH_TILE, PROPOSAL_STREAM, _golden_dspark_key, _gumbel_noise, sample_markov_proposal_row
 
+
+PROPOSAL_PARAMS_DYN = pl.dynamic("MARKOV_PROPOSAL_PARAMS")
 
 # model config
 D = FLASH.hidden_size
@@ -379,6 +382,83 @@ def markov_sample(
     return ids_out, conf_out
 
 
+@pl.jit.inline(auto_scope=False)
+def markov_propose(
+    base_logits: pl.Tensor,
+    head_hidden: pl.Tensor,
+    anchor_ids: pl.Tensor,
+    markov_w1: pl.Tensor,
+    markov_w2: pl.Tensor,
+    confidence_weight: pl.Tensor,
+    temperatures: pl.Tensor,
+    top_ks: pl.Tensor,
+    top_ps: pl.Tensor,
+    seeds: pl.Tensor,
+    first_positions: pl.Tensor,
+    draft_ids: pl.Tensor,
+    confidences: pl.Tensor,
+    proposal_probs: pl.Tensor,
+):
+    """Sample each Markov step from its filtered vocabulary distribution."""
+    batch = pl.tensor.dim(anchor_ids, 0)
+    padded = (batch + 15) // 16 * 16
+    hidden = pl.reshape(head_hidden, [batch * DSPARK_QUERY_WIDTH, D])
+    base = pl.reshape(base_logits, [batch * DSPARK_QUERY_WIDTH, VOCAB])
+    for step in pl.range(DSPARK_QUERY_WIDTH):
+        embedding = pl.create_tensor([padded, MARKOV_RANK], dtype=pl.BF16)
+        for request in pl.spmd(padded, name_hint="markov_proposal_embedding"):
+            previous = pl.cast(0, pl.INT64)
+            if request < batch:
+                if step == 0:
+                    previous = pl.read(anchor_ids, [request])
+                else:
+                    previous = pl.cast(pl.read(draft_ids, [request, step - 1]), pl.INT64)
+            embedding[request : request + 1, :] = markov_w1[previous : previous + 1, :]
+
+        bias = pl.create_tensor([padded, VOCAB], dtype=pl.FP32)
+        workers = pl.system.available_cluster_count()
+        for worker in pl.spmd(workers, name_hint="markov_proposal_bias"):
+            for panel in pl.range(worker, VOCAB // VOCAB_TILE, workers):
+                col = panel * VOCAB_TILE
+                for row in pl.range(0, padded, 16):
+                    left = pl.load(embedding, [row, 0], [16, MARKOV_RANK], target_memory=pl.Mem.Mat)
+                    right = pl.load(markov_w2, [col, 0], [VOCAB_TILE, MARKOV_RANK], target_memory=pl.Mem.Mat)
+                    right_transposed = pl.tile.transpose_view(right)
+                    product = pl.matmul(left, right_transposed, out_dtype=pl.FP32)
+                    pl.store(product, [row, col], bias)
+
+        scores = pl.create_tensor([batch, VOCAB], dtype=pl.FP32)
+        for request in pl.spmd(batch, name_hint="markov_proposal_logits"):
+            row = request * DSPARK_QUERY_WIDTH + step
+            for col in pl.range(0, VOCAB, 1280):
+                logits = pl.load(base, [row, col], [1, 1280])
+                correction = pl.load(bias, [request, col], [1, 1280])
+                pl.store(pl.add(logits, correction), [request, col], scores)
+
+        scores_grid = pl.reshape(scores, [batch * (VOCAB // ARGMAX_WIDTH_TILE), ARGMAX_WIDTH_TILE])
+        filtered = pl.create_tensor([batch, VOCAB], dtype=pl.FP32)
+        weights = pl.create_tensor([batch, VOCAB], dtype=pl.FP32)
+        selected = pl.create_tensor([batch, 8], dtype=pl.INT32)
+        confidence_state = pl.create_tensor([batch, 80], dtype=pl.FP32)
+        for request in pl.spmd(batch, name_hint="markov_proposal_sample"):
+            token = sample_markov_proposal_row(
+                scores, scores_grid, filtered, weights, proposal_probs, temperatures, top_ks,
+                top_ps, seeds, first_positions, request, step, DECODE_SEQ,
+            )
+            sampled = pl.full([1, 8], dtype=pl.INT32, value=0)
+            pl.write(sampled, [0, 0], token)
+            selected[request : request + 1, :] = sampled
+            _confidence = _store_markov_confidence(
+                hidden, embedding, confidence_weight, confidence_state, request, step,
+            )
+
+        for _worker in pl.spmd(1, name_hint="markov_proposal_publish"):
+            for request in pl.range(batch):
+                pl.write(draft_ids, [request, step], pl.read(selected, [request, 0]))
+                pl.write(confidences, [request, step], pl.read(confidence_state, [request, step * 16]))
+    return draft_ids, confidences, proposal_probs
+
+
 @pl.jit(auto_scope=False)
 def markov_sample_test(
     base_logits: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, VOCAB], pl.FP32],
@@ -394,6 +474,31 @@ def markov_sample_test(
     return markov_sample(
         base_logits, head_hidden, anchor_ids, markov_w1, markov_w2,
         confidence_weight, draft_ids, confidences,
+    )
+
+
+@pl.jit(auto_scope=False)
+def markov_proposal_test(
+    base_logits: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, VOCAB], pl.FP32],
+    head_hidden: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
+    anchor_ids: pl.Tensor[[B_DYN], pl.INT64],
+    markov_w1: pl.Tensor[[VOCAB, MARKOV_RANK], pl.BF16],
+    markov_w2: pl.Tensor[[VOCAB, MARKOV_RANK], pl.BF16],
+    confidence_weight: pl.Tensor[[1, D + MARKOV_RANK], pl.FP32],
+    temperatures: pl.Tensor[[PROPOSAL_PARAMS_DYN], pl.FP32],
+    top_ks: pl.Tensor[[PROPOSAL_PARAMS_DYN], pl.INT32],
+    top_ps: pl.Tensor[[PROPOSAL_PARAMS_DYN], pl.FP32],
+    seeds: pl.Tensor[[PROPOSAL_PARAMS_DYN], pl.INT32],
+    first_positions: pl.Tensor[[B_DYN], pl.INT32],
+    draft_ids: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH], pl.INT32]],
+    confidences: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH], pl.FP32]],
+    proposal_probs: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH * VOCAB], pl.FP32]],
+):
+    anchor_ids.bind_dynamic(0, B_DYN)
+    return markov_propose(
+        base_logits, head_hidden, anchor_ids, markov_w1, markov_w2, confidence_weight,
+        temperatures, top_ks, top_ps, seeds, first_positions,
+        draft_ids, confidences, proposal_probs,
     )
 
 
@@ -580,6 +685,61 @@ def build_tensor_specs(batch=2):
     ]
 
 
+def build_proposal_specs():
+    from golden import TensorSpec
+
+    specs = build_tensor_specs()
+    by_name = {spec.name: spec for spec in specs}
+    logits = by_name["base_logits"].init_value
+    logits[1].fill_(-4.0)
+    logits[1, :, 5:9] = torch.tensor([0.1, 0.3, 0.2, 0.4])
+    by_name["markov_w2"].init_value.div_(128)
+    params = [
+        TensorSpec("temperatures", [2 * DECODE_SEQ], torch.float32, torch.tensor([0.0, 0.7]).repeat_interleave(DECODE_SEQ)),
+        TensorSpec("top_ks", [2 * DECODE_SEQ], torch.int32, 3),
+        TensorSpec("top_ps", [2 * DECODE_SEQ], torch.float32, 0.75),
+        TensorSpec("seeds", [2 * DECODE_SEQ], torch.int32, 71),
+        TensorSpec("first_positions", [2], torch.int32, torch.tensor([51, 73])),
+    ]
+    return specs[:-2] + params + specs[-2:] + [
+        TensorSpec("proposal_probs", [2, DSPARK_QUERY_WIDTH * VOCAB], torch.float32),
+    ]
+
+
+def golden_proposal_test(tensors):
+    proposal_probs = tensors["proposal_probs"].view(2, DSPARK_QUERY_WIDTH, VOCAB)
+    for request in range(2):
+        params_row = request * DECODE_SEQ
+        temperature = float(tensors["temperatures"][params_row])
+        top_k = int(tensors["top_ks"][params_row])
+        top_p = float(tensors["top_ps"][params_row])
+        seed = int(tensors["seeds"][params_row])
+        first = int(tensors["first_positions"][request])
+        previous = int(tensors["anchor_ids"][request])
+        for step in range(DSPARK_QUERY_WIDTH):
+            embedding = tensors["markov_w1"][previous].float()
+            bias = tensors["markov_w2"].float() @ embedding
+            scores = tensors["base_logits"][request, step] + bias
+            if temperature == 0:
+                previous = int(scores.argmax())
+                proposal_probs[request, step, previous] = 1.0
+            else:
+                ordered, indices = torch.sort(scores / temperature, descending=True, stable=True)
+                full = ordered.softmax(0)
+                keep = (full.cumsum(0) - full < top_p) & (torch.arange(VOCAB) < top_k)
+                ordered[~keep] = -torch.inf
+                probs = ordered.softmax(0)
+                proposal_probs[request, step, indices] = probs
+                key = _golden_dspark_key(seed, first + step, PROPOSAL_STREAM)
+                noise = torch.from_numpy(_gumbel_noise(key, 0))
+                previous = int((proposal_probs[request, step].log() + noise).argmax())
+            tensors["draft_ids"][request, step] = previous
+            hidden = tensors["head_hidden"][request, step].float()
+            features = torch.cat((hidden, embedding))
+            score = features @ tensors["confidence_weight"][0]
+            tensors["confidences"][request, step] = score.sigmoid()
+
+
 if __name__ == "__main__":
     import argparse
     from golden import run
@@ -592,14 +752,15 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--runtime-dir")
+    parser.add_argument("--stochastic", action="store_true")
     args = parser.parse_args()
     if (args.lm_head_tp, args.dp, args.ep) != (LM_HEAD_TP_SIZE, DP_SIZE, EP_SIZE):
         parser.error("--lm-head-tp/--dp/--ep must match the import-time configuration")
     result = run(
         a5_default_runtime="host_build_graph",
-        fn=markov_sample_test,
-        specs=build_tensor_specs(),
-        golden_fn=golden_markov_sample_test,
+        fn=markov_proposal_test if args.stochastic else markov_sample_test,
+        specs=build_proposal_specs() if args.stochastic else build_tensor_specs(),
+        golden_fn=golden_proposal_test if args.stochastic else golden_markov_sample_test,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         config=dict(backend_type=args.platform, execution_mode=False, device_id=args.device),

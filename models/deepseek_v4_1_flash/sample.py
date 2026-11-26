@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: no-sim
-"""Greedy and temperature/top-k/top-p/Gumbel sampling for DeepSeek-V4.1 logits."""
+"""Greedy, stochastic, and rejection sampling for DeepSeek-V4.1 logits."""
 
 import sys
 
@@ -28,6 +28,7 @@ def _parse_int_argv(name, default=None):
 
 # model config
 VOCAB = M.vocab_size
+VERIFY_ROWS_DYN = pl.dynamic("VERIFY_ROWS")
 SAMPLED_IDS_PAD = 8
 
 # Standalone validation shape.
@@ -526,6 +527,33 @@ def _apply_top_p_row(
 
 
 @pl.jit.inline
+def _filter_logits(
+    logits: pl.Tensor,
+    row: pl.Scalar[pl.INDEX],
+    filtered_logits: pl.Tensor,
+    scratch_row: pl.Scalar[pl.INDEX],
+    probabilities: pl.Tensor,
+    row_max: pl.Scalar[pl.FP32],
+    temperature: pl.Scalar[pl.FP32],
+    top_k: pl.Scalar[pl.INT32],
+    top_p: pl.Scalar[pl.FP32],
+    nucleus_first: pl.constexpr,
+):
+    _scale_logits(logits, row, filtered_logits, scratch_row, row_max, temperature)
+    if nucleus_first:
+        if top_p > 0.0 and top_p < 1.0:
+            _apply_top_p_row(filtered_logits, top_p, probabilities, scratch_row)
+        if top_k > 0 and top_k < VOCAB:
+            _apply_top_k_row(filtered_logits, top_k, scratch_row)
+    else:
+        if top_k > 0 and top_k < VOCAB:
+            _apply_top_k_row(filtered_logits, top_k, scratch_row)
+        if top_p > 0.0 and top_p < 1.0:
+            _apply_top_p_row(filtered_logits, top_p, probabilities, scratch_row)
+    return filtered_logits
+
+
+@pl.jit.inline
 def _sample_row(
     logits: pl.Tensor,
     logits_grid: pl.Tensor,
@@ -554,11 +582,10 @@ def _sample_row(
         use_top_k = top_k > 0 and top_k < VOCAB
         use_top_p = top_p > 0.0 and top_p < 1.0
         if use_top_k or use_top_p:
-            _scale_logits(logits, row, filtered_logits, scratch_row, row_max, temperature)
-            if use_top_k:
-                _apply_top_k_row(filtered_logits, top_k, scratch_row)
-            if use_top_p:
-                _apply_top_p_row(filtered_logits, top_p, probabilities, scratch_row)
+            _filter_logits(
+                logits, row, filtered_logits, scratch_row, probabilities,
+                row_max, temperature, top_k, top_p, False,
+            )
             zero = pl.cast(0.0, pl.FP32)
             one = pl.cast(1.0, pl.FP32)
             best_index = _gumbel_argmax(filtered_logits, scratch_row, random_key, zero, one)
@@ -610,6 +637,214 @@ def sample_test(
     sampled_ids: pl.Out[pl.Tensor[[SAMPLE_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
 ):
     return sample(logits, temperatures, top_ks, top_ps, seeds, positions, sampled_ids)
+
+
+@pl.jit.inline
+def _store_exp_weights(
+    filtered_logits: pl.Tensor,
+    weights_out: pl.Tensor,
+    worker: pl.Scalar[pl.INDEX],
+):
+    sums = pl.full([ARGMAX_ROWS_TILE, ARGMAX_WIDTH_TILE], dtype=pl.FP32, value=0.0)
+    for start in pl.range(0, VOCAB, ARGMAX_BLOCK_TILE):
+        score = filtered_logits[worker : worker + 1, start : start + ARGMAX_BLOCK_TILE]
+        exp_score = pl.exp(score)
+        weights_out[worker : worker + 1, start : start + ARGMAX_BLOCK_TILE] = exp_score
+        weights = pl.reshape(exp_score, [ARGMAX_ROWS_TILE, ARGMAX_WIDTH_TILE])
+        sums = pl.add(sums, weights)
+    partial_sums = pl.row_sum(sums)
+    normalizer = pl.cast(0.0, pl.FP32)
+    for lane in pl.range(ARGMAX_ROWS_TILE):
+        normalizer = normalizer + pl.read(partial_sums, [lane, 0])
+
+    return normalizer
+
+
+@pl.jit.inline
+def _verify_stochastic_row(
+    filtered_logits: pl.Tensor,
+    correction_logits: pl.Tensor,
+    worker: pl.Scalar[pl.INDEX],
+    proposal: pl.Scalar[pl.INT32],
+    uniform: pl.Scalar[pl.FP32],
+    correction_key: pl.Scalar[pl.INT32],
+    proposal_state: pl.Tensor,
+    slot: pl.Scalar[pl.INDEX],
+    proposal_start: pl.Scalar[pl.INDEX],
+):
+    selected = proposal
+    accepted = pl.cast(0, pl.INT32)
+    zero = pl.cast(0.0, pl.FP32)
+    one = pl.cast(1.0, pl.FP32)
+    normalizer = _store_exp_weights(filtered_logits, correction_logits, worker)
+    column = pl.cast(proposal, pl.INDEX)
+    draft_word = pl.load(proposal_state, [slot, proposal_start + column // 8 * 8], [1, 8])
+    draft_tile = pl.reinterpret_view(draft_word, pl.FP32)
+    draft_scaled = normalizer * pl.read(draft_tile, [0, column % 8])
+    target_weight = pl.read(correction_logits, [worker, column])
+    if uniform * draft_scaled < target_weight:
+        accepted = pl.cast(1, pl.INT32)
+    else:
+        for start in pl.range(0, VOCAB, ARGMAX_BLOCK_TILE):
+            target = correction_logits[worker : worker + 1, start : start + ARGMAX_BLOCK_TILE]
+            draft_start = proposal_start + start
+            words = proposal_state[slot : slot + 1, draft_start : draft_start + ARGMAX_BLOCK_TILE]
+            draft = pl.reinterpret_view(words, pl.FP32)
+            residual = pl.sub(target, pl.mul(draft, normalizer))
+            positive = pl.maximum(residual, 0.0)
+            correction_logits[worker : worker + 1, start : start + ARGMAX_BLOCK_TILE] = pl.log(positive)
+        selected = _gumbel_argmax(correction_logits, worker, correction_key, zero, one)
+    return selected, accepted
+
+
+# Counter domains for Markov proposals, acceptance, and residual sampling.
+PROPOSAL_STREAM = 0x1D7EBC31
+ACCEPT_STREAM = 0x3569B3A9
+CORRECTION_STREAM = 0x7114A26D
+
+
+@pl.jit.inline
+def dspark_random_key(
+    seed: pl.Scalar[pl.INT32],
+    position: pl.Scalar[pl.INT32],
+    stream: pl.constexpr,
+):
+    mask = pl.cast(0xFFFFFFFF, pl.INT64)
+    shift = pl.cast(16, pl.INT64)
+    multiplier = pl.cast(HASH_MULTIPLIER, pl.INT64)
+    stride = pl.cast(POSITION_MULTIPLIER, pl.INT64)
+    seed_word = pl.cast(seed, pl.INT64)
+    position_word = pl.cast(position, pl.INT64)
+    stream_word = pl.cast(stream, pl.INT64)
+    word = (seed_word + position_word * stride + stream_word) & mask
+    word = ((word ^ (word >> shift)) * multiplier) & mask
+    word = ((word ^ (word >> shift)) * multiplier) & mask
+    positive_mask = pl.cast(0x7FFFFFFF, pl.INT64)
+    return pl.cast((word ^ (word >> shift)) & positive_mask, pl.INT32)
+
+
+@pl.jit.inline
+def sample_markov_proposal_row(
+    logits: pl.Tensor,
+    logits_grid: pl.Tensor,
+    filtered: pl.Tensor,
+    weights: pl.Tensor,
+    proposal_probs: pl.Tensor,
+    temperatures: pl.Tensor,
+    top_ks: pl.Tensor,
+    top_ps: pl.Tensor,
+    seeds: pl.Tensor,
+    first_positions: pl.Tensor,
+    request: pl.Scalar[pl.INDEX],
+    step: pl.Scalar[pl.INDEX],
+    rows_per_request: pl.constexpr,
+):
+    row = request * rows_per_request
+    temperature = pl.read(temperatures, [row])
+    position = pl.cast(pl.read(first_positions, [request]) + step, pl.INT32)
+    if temperature >= SAMPLING_EPS:
+        row_max = _row_max(logits, request)
+        top_k = pl.read(top_ks, [row])
+        top_p = pl.read(top_ps, [row])
+        _filter_logits(logits, request, filtered, request, weights, row_max, temperature, top_k, top_p, True)
+        seed = pl.read(seeds, [row])
+        key = dspark_random_key(seed, position, PROPOSAL_STREAM)
+        random_key = pl.cast(key % RANDOM_KEY_MODULUS, pl.INT32)
+        zero = pl.cast(0.0, pl.FP32)
+        one = pl.cast(1.0, pl.FP32)
+        token = _gumbel_argmax(filtered, request, random_key, zero, one)
+        normalizer = _store_exp_weights(filtered, weights, request)
+        for start in pl.range(0, VOCAB, ARGMAX_BLOCK_TILE):
+            raw = weights[request : request + 1, start : start + ARGMAX_BLOCK_TILE]
+            probs = pl.div(raw, normalizer)
+            dest = step * VOCAB + start
+            proposal_probs[request : request + 1, dest : dest + ARGMAX_BLOCK_TILE] = probs
+    else:
+        token = _greedy_sample_logits(logits_grid, request)
+        for start in pl.range(0, VOCAB, ARGMAX_BLOCK_TILE):
+            token_ids = pl.arange(pl.cast(start, pl.INT32), [1, ARGMAX_BLOCK_TILE], dtype=pl.INT32)
+            probs = pl.cast(pl.cmp(token_ids, token, cmp_type=0), target_type=pl.FP32)
+            dest = step * VOCAB + start
+            proposal_probs[request : request + 1, dest : dest + ARGMAX_BLOCK_TILE] = probs
+    return token
+
+
+@pl.jit.inline
+def dspark_rejection_sample(
+    logits: pl.Tensor,
+    row_proposals: pl.Tensor,
+    proposal_state: pl.Tensor,
+    temperatures: pl.Tensor,
+    top_ks: pl.Tensor,
+    top_ps: pl.Tensor,
+    seeds: pl.Tensor,
+    positions: pl.Tensor,
+    decisions: pl.Tensor,
+):
+    rows = pl.tensor.dim(logits, 0)
+    workers = pl.min(rows, SAMPLE_WORKERS_TILE)
+    logits_grid = pl.reshape(logits, [rows * (VOCAB // ARGMAX_WIDTH_TILE), ARGMAX_WIDTH_TILE])
+    filtered_logits = pl.create_tensor([workers, VOCAB], dtype=pl.FP32)
+    probabilities = pl.create_tensor([workers, VOCAB], dtype=pl.FP32)
+    residual_weights = pl.create_tensor([workers, VOCAB], dtype=pl.FP32)
+    for worker in pl.spmd(workers, name_hint="dspark_verify_rows"):
+        for row in pl.range(worker, rows, workers):
+            slot = pl.read(row_proposals, [row, 1])
+            temperature = pl.read(temperatures, [row])
+            decision_flag = pl.cast(0, pl.INT32)
+            if temperature >= SAMPLING_EPS:
+                row_max = _row_max(logits, row)
+                top_k = pl.read(top_ks, [row])
+                top_p = pl.read(top_ps, [row])
+                _filter_logits(
+                    logits, row, filtered_logits, worker, probabilities, row_max, temperature, top_k, top_p, True,
+                )
+                seed = pl.read(seeds, [row])
+                position = pl.read(positions, [row])
+                if slot >= 0:
+                    proposal = pl.read(row_proposals, [row, 0])
+                    accept_key = dspark_random_key(seed, position, ACCEPT_STREAM)
+                    key = dspark_random_key(seed, position, CORRECTION_STREAM)
+                    correction_key = pl.cast(key % RANDOM_KEY_MODULUS, pl.INT32)
+                    uniform_bits = pl.cast(accept_key >> pl.cast(8, pl.INT32), pl.INT32)
+                    uniform = (pl.cast(uniform_bits, pl.FP32) + 0.5) * UINT23_SCALE
+                    proposal_start = pl.cast(pl.read(row_proposals, [row, 2]), pl.INDEX)
+                    token, accepted = _verify_stochastic_row(
+                        filtered_logits, residual_weights, worker, proposal, uniform,
+                        correction_key, proposal_state, pl.cast(slot, pl.INDEX), proposal_start,
+                    )
+                    decision_flag = pl.cast(accepted * 2 - 1, pl.INT32)
+                else:
+                    random_word = pl.cast(seed, pl.INDEX) + pl.cast(position, pl.INDEX) * POSITION_MULTIPLIER
+                    random_key = pl.cast(random_word % RANDOM_KEY_MODULUS, pl.INT32)
+                    zero = pl.cast(0.0, pl.FP32)
+                    one = pl.cast(1.0, pl.FP32)
+                    token = _gumbel_argmax(filtered_logits, worker, random_key, zero, one)
+            else:
+                token = _greedy_sample_logits(logits_grid, row)
+            decision = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=0)
+            pl.write(decision, [0, 0], token)
+            pl.write(decision, [0, 1], decision_flag)
+            decisions[row : row + 1, :] = decision
+    return decisions
+
+
+@pl.jit(auto_scope=False)
+def rejection_sample_test(
+    logits: pl.Tensor[[VERIFY_ROWS_DYN, VOCAB], pl.FP32],
+    row_proposals: pl.Tensor[[VERIFY_ROWS_DYN, SAMPLED_IDS_PAD], pl.INT32],
+    proposal_state: pl.Tensor[[VERIFY_ROWS_DYN, VOCAB], pl.INT32],
+    temperatures: pl.Tensor[[VERIFY_ROWS_DYN], pl.FP32],
+    top_ks: pl.Tensor[[VERIFY_ROWS_DYN], pl.INT32],
+    top_ps: pl.Tensor[[VERIFY_ROWS_DYN], pl.FP32],
+    seeds: pl.Tensor[[VERIFY_ROWS_DYN], pl.INT32],
+    positions: pl.Tensor[[VERIFY_ROWS_DYN], pl.INT32],
+    decisions: pl.Out[pl.Tensor[[VERIFY_ROWS_DYN, SAMPLED_IDS_PAD], pl.INT32]],
+):
+    logits.bind_dynamic(0, VERIFY_ROWS_DYN)
+    return dspark_rejection_sample(
+        logits, row_proposals, proposal_state, temperatures, top_ks, top_ps, seeds, positions, decisions,
+    )
 
 
 def _gumbel_noise(seed, position):
@@ -748,6 +983,98 @@ def golden_sample(tensors):
         tensors["sampled_ids"][row, 0] = selected.to(torch.int32)
 
 
+def build_rejection_specs():
+    import torch
+
+    from golden import TensorSpec
+
+    def repeat(values, dtype):
+        return torch.tensor(values, dtype=dtype).repeat((SAMPLE_ROWS + len(values) - 1) // len(values))[:SAMPLE_ROWS]
+
+    def target_logits():
+        logits = torch.full((SAMPLE_ROWS, VOCAB), -1000.0)
+        logits[:, 7] = torch.log(torch.tensor(0.25))
+        logits[:, 23] = torch.log(torch.tensor(0.75))
+        logits[8::12, 23] = torch.log(torch.tensor(0.125))
+        logits[8::12, VOCAB - 1] = torch.log(torch.tensor(0.625))
+        return logits
+
+    proposals = torch.full((SAMPLE_ROWS, SAMPLED_IDS_PAD), -1, dtype=torch.int32)
+    proposals[:, 0] = repeat([7, 7, 99, -1, 23, 7, 7, 7, 7, 23, 23, -1], torch.int32)
+    proposals[:, 1] = repeat([23, 23, 7, -1, -1, -1, 23, 23, 99, 7, 7, -1], torch.int32)
+    proposal_probs = torch.zeros((SAMPLE_ROWS, VOCAB), dtype=torch.float32)
+    for row in range(SAMPLE_ROWS):
+        token, other = proposals[row, :2].tolist()
+        if other >= 0:
+            proposal_probs[row, token] = 0.6
+            proposal_probs[row, other] = 0.3
+            proposal_probs[row, 101] = 0.1
+            proposals[row, 1] = row
+            proposals[row, 2] = 0
+    temperatures = repeat([1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0], torch.float32)
+    top_ks = repeat([0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0], torch.int32)
+    top_ps = repeat([1, 1, 0.7, 1, 1, 1, 1, 1, 1, 1, 1, 1], torch.float32)
+    seeds = torch.arange(SAMPLE_ROWS, dtype=torch.int32) - 3
+    positions = torch.arange(SAMPLE_ROWS, dtype=torch.int32) + 65531
+    return [
+        TensorSpec("logits", [SAMPLE_ROWS, VOCAB], torch.float32, init_value=target_logits),
+        TensorSpec("row_proposals", [SAMPLE_ROWS, SAMPLED_IDS_PAD], torch.int32, init_value=proposals),
+        TensorSpec("proposal_state", [SAMPLE_ROWS, VOCAB], torch.int32, init_value=proposal_probs.view(torch.int32)),
+        TensorSpec("temperatures", [SAMPLE_ROWS], torch.float32, init_value=temperatures),
+        TensorSpec("top_ks", [SAMPLE_ROWS], torch.int32, init_value=top_ks),
+        TensorSpec("top_ps", [SAMPLE_ROWS], torch.float32, init_value=top_ps),
+        TensorSpec("seeds", [SAMPLE_ROWS], torch.int32, init_value=seeds),
+        TensorSpec("positions", [SAMPLE_ROWS], torch.int32, init_value=positions),
+        TensorSpec("decisions", [SAMPLE_ROWS, SAMPLED_IDS_PAD], torch.int32),
+    ]
+
+
+def golden_rejection_sample(tensors):
+    import torch
+
+    decisions = tensors["decisions"]
+    golden_sample({**tensors, "sampled_ids": decisions})
+    for row in range(SAMPLE_ROWS):
+        proposal, slot = tensors["row_proposals"][row, :2].tolist()
+        temperature = float(tensors["temperatures"][row])
+        if slot < 0 or temperature < SAMPLING_EPS:
+            continue
+        logits = tensors["logits"][row]
+        scores, indices = torch.sort(logits / temperature, descending=True, stable=True)
+        top_k = int(tensors["top_ks"][row])
+        if 0 < top_k < VOCAB:
+            scores[top_k:] = -torch.inf
+        sorted_probs = torch.softmax(scores, dim=0)
+        top_p = float(tensors["top_ps"][row])
+        if 0.0 < top_p < 1.0:
+            keep = sorted_probs.cumsum(dim=0) - sorted_probs < top_p
+            sorted_probs *= keep
+        target = torch.zeros_like(sorted_probs)
+        target[indices] = sorted_probs / sorted_probs.sum()
+
+        seed = int(tensors["seeds"][row])
+        position = int(tensors["positions"][row])
+        accept_key = _golden_dspark_key(seed, position, ACCEPT_STREAM)
+        uniform = ((accept_key >> 8) + 0.5) * UINT23_SCALE
+        draft = tensors["proposal_state"][slot].view(torch.float32)
+        accepted = uniform * float(draft[proposal]) < float(target[proposal])
+        token = proposal
+        if not accepted:
+            weights = (target - draft).clamp_min(0)
+            key = _golden_dspark_key(seed, position, CORRECTION_STREAM)
+            noise = torch.from_numpy(_gumbel_noise(key, 0))
+            token = int((weights.log() + noise).argmax())
+        decisions[row, 0] = token
+        decisions[row, 1] = 1 if accepted else -1
+
+
+def _golden_dspark_key(seed, position, stream):
+    word = (seed + position * POSITION_MULTIPLIER + stream) & 0xFFFFFFFF
+    for _ in range(2):
+        word = ((word ^ (word >> 16)) * HASH_MULTIPLIER) & 0xFFFFFFFF
+    return (word ^ (word >> 16)) & 0x7FFFFFFF
+
+
 if __name__ == "__main__":
     import argparse
     import math
@@ -765,6 +1092,7 @@ if __name__ == "__main__":
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--top-p", type=float, default=None)
     parser.add_argument("--dspark-fixture", action="store_true", help="Use the DSpark decode smoke sampling parameters")
+    parser.add_argument("--rejection", action="store_true", help="Validate DSpark rejection sampling")
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     args = parser.parse_args()
@@ -780,11 +1108,18 @@ if __name__ == "__main__":
         parser.error(f"--temperature must be non-negative, got {args.temperature}")
     if args.top_p is not None and not 0.0 < args.top_p <= 1.0:
         parser.error(f"--top-p must be in (0, 1], got {args.top_p}; 1.0 disables nucleus filtering")
+    if args.rejection:
+        if args.dspark_fixture or any(value is not None for value in overrides):
+            parser.error("--rejection uses its own sampling fixture")
+        fn, specs, golden_fn = rejection_sample_test, build_rejection_specs(), golden_rejection_sample
+    else:
+        fn, golden_fn = sample_test, golden_sample
+        specs = build_tensor_specs(args.temperature, args.top_k, args.top_p, dspark_fixture=args.dspark_fixture)
     result = run(
         a5_default_runtime="host_build_graph",
-        fn=sample_test,
-        specs=build_tensor_specs(args.temperature, args.top_k, args.top_p, dspark_fixture=args.dspark_fixture),
-        golden_fn=golden_sample,
+        fn=fn,
+        specs=specs,
+        golden_fn=golden_fn,
         golden_data=args.golden_data,
         save_data=args.save_data,
         compile_only=args.compile_only,
