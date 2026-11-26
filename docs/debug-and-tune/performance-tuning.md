@@ -34,10 +34,14 @@ runtime's `[STRACE]` markers. Quote `median=` for single-card comparisons.
 Daily CI reports one median and names the metric for each case. A5 cases that
 do not emit the Effective window use **AICore wall**, from the first business
 kernel start to the last business kernel finish on a rank. Device wall is
-available in the raw samples. Rebuild baselines when the reported metric
-changes. Older multi-card Daily CI reports used the fastest rank's mean;
-recompute those baselines from their raw samples before comparing them with
-medians. For multi-card tuning, use the fastest rank's median as described below.
+available in the Daily CI raw samples. Direct A5 benchmarks can enable the
+device timing spans with `SIMPLER_DEVICE_STRACE_ENABLE=1`. Host-graph runs
+then print an `aicore_wall_us` summary and per-rank raw samples. TMR continues
+to emit `effective_us` summaries and `eff_us` raw samples. Rebuild baselines
+when the reported metric changes. Older multi-card Daily CI reports used the
+fastest rank's mean. Recompute those baselines from their raw samples before
+comparing them with medians. For multi-card tuning, use the fastest rank's
+median as described below.
 
 Requirements: a real device — a `*sim` platform prints
 `effective_us unavailable: no device-domain spans` — and a runtime built
@@ -56,12 +60,10 @@ A distributed program adds a per-rank breakdown and a context line:
 [RUN] benchmark kernel=moe_ep2 l3_resident=1 rounds=100 ranks=2 host_union_mean_us=900 host_mean_us=950
 ```
 
-- The headline is the **per-round max across ranks** — the round ends when
-  the slowest card finishes. The `eff_us` lines expose the cross-card
-  imbalance that max hides; a persistent gap between ranks is a load-balance
-  problem, not a kernel problem.
+- For either metric, the headline uses the **per-round max across ranks**.
+  The rank lines expose persistent imbalance that the headline can hide.
 - For tuning comparisons, report the **lowest per-rank median** from the
-  `rank N: eff_us` lines to reduce the effect of start skew. This is not
+  rank lines for the reported metric to reduce the effect of start skew. This is not
   end-to-end step latency; identify the convention explicitly and compare
   like for like. Retain persistent rank imbalance in the report; a faster
   rank alone does not prove an improvement in the whole distributed step.

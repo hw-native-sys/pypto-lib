@@ -49,7 +49,8 @@ source.
   round count for every candidate.
 - Collect repeats as rounds inside one process (`PYPTO_BENCH_ROUNDS`), not as
   repeated invocations of the script. For single-card tuning, report the
-  `median=` field of the `[RUN] effective_us` line. For multi-card tuning, use
+  `median=` field of the reported `effective_us` or `aicore_wall_us` line.
+  For multi-card tuning, use
   the [lowest per-rank median](performance-tuning.md#multi-card-l3-output).
   Retain the raw samples printed by the benchmark.
 - Keep generated traces and build products under `build_output/`; do not commit

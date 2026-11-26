@@ -229,22 +229,20 @@ def benchmark_payload(stats):
     """
     if stats is None:
         raise ValueError("benchmark unavailable or skipped")
+    from golden.runner import _aicore_wall_us
+
     grid = stats.rounds_dispatches or [{item.pid: [item]} for item in stats.invocations]
 
     def samples(measure):
         return [{str(pid): [measure(item) for item in items] for pid, items in row.items()}
                 for row in grid]
 
-    def aicore_wall(item):
-        span = item.by_name().get("chip.run.runner_run.aicore_wall")
-        return span.dur_us if span is not None else None
-
     return {"rounds": stats.rounds, "warmup": stats.warmup,
             "fallback_flattened": stats.fallback_flattened,
             "unstable_dispatch_slots": getattr(stats, "unstable_dispatch_slots", False),
             "all_zero_device": stats.all_zero_device,
             "samples": samples(lambda item: item.effective_us),
-            "aicore_wall_samples": samples(aicore_wall),
+            "aicore_wall_samples": samples(_aicore_wall_us),
             "device_wall_samples": samples(lambda item: item.device_wall_us)}
 
 
@@ -301,11 +299,7 @@ class InvalidTimingError(ValueError):
     """A completed workload produced unusable timing samples."""
 
 
-def median_timing(payload, case, sampling, platform):
-    """Per rank and round, sum all dispatches.
-
-    Single card reports the median; multi-card reports the lowest per-rank median.
-    """
+def checked_benchmark(payload, sampling):
     if payload.get("passed") is not True:
         raise ValueError(f"correctness failed: {payload.get('error')}")
     bench = payload["benchmark"]
@@ -313,13 +307,10 @@ def median_timing(payload, case, sampling, platform):
         raise InvalidTimingError("benchmark rounds/warmup differ from the manifest")
     if bench["fallback_flattened"] or bench["unstable_dispatch_slots"] or bench["all_zero_device"]:
         raise InvalidTimingError("benchmark timing is flattened, unstable or all zero")
-    rows = bench["samples"]
-    metric = "Effective"
-    # A5 HBG and Percounter do not emit the device-side TMR windows.
-    # Select once per case so a missing dispatch cannot mix timing boundaries.
-    if platform == "a5" and not any(value > 0 for row in rows for items in row.values() for value in items):
-        metric = "AICore wall"
-        rows = bench.get("aicore_wall_samples", [])
+    return bench
+
+
+def rank_median(rows, case, sampling, *, metric, require_positive):
     if not rows or len(rows) != sampling["rounds"] or len(rows[0]) != case["device_count"]:
         raise InvalidTimingError(f"{metric} rounds or ranks are incomplete")
     totals = {}
@@ -327,10 +318,30 @@ def median_timing(payload, case, sampling, platform):
         if set(row) != set(rows[0]):
             raise InvalidTimingError(f"a rank is missing from a measured {metric} round")
         for pid, dispatches in row.items():
-            if not dispatches or any(value is None or not math.isfinite(value) or value <= 0 for value in dispatches):
+            if require_positive and (
+                not dispatches or any(value is None or not math.isfinite(value) or value <= 0 for value in dispatches)
+            ):
                 raise InvalidTimingError(f"{metric} timing missing or invalid for rank {pid}")
             totals.setdefault(pid, []).append(sum(dispatches))
-    return metric, min(statistics.median(values) for values in totals.values())
+    return min(statistics.median(values) for values in totals.values())
+
+
+def effective_us(payload, case, sampling):
+    """Reduce the legacy samples field for existing external benchmark callers."""
+    bench = checked_benchmark(payload, sampling)
+    return rank_median(bench["samples"], case, sampling, metric="Effective", require_positive=False)
+
+
+def median_timing(payload, case, sampling, platform):
+    """Return the case's metric and lowest median of per-rank round totals."""
+    bench = checked_benchmark(payload, sampling)
+    rows = bench["samples"]
+    metric = "Effective"
+    # Select once per case so a missing dispatch cannot mix timing boundaries.
+    if platform == "a5" and not any(value > 0 for row in rows for items in row.values() for value in items):
+        metric = "AICore wall"
+        rows = bench.get("aicore_wall_samples", [])
+    return metric, rank_median(rows, case, sampling, metric=metric, require_positive=True)
 
 
 def submit_command(case, case_dir, sampling):

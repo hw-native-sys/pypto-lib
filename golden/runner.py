@@ -13,6 +13,7 @@ Public entry point: :func:`run`.
 """
 
 import ast
+import math
 import os
 import re
 import statistics
@@ -680,18 +681,17 @@ def _benchmark_and_report(
 
 
 def _report_bench(stats: Any, compiled: Any, *, l3: bool, resident: bool) -> None:
-    """Print one benchmark run's report block.
-
-    Includes the ``effective_us`` headline, raw samples, tagged task slots,
-    and L3's per-rank table and context line. The headline goes first and is
-    the only line spelling the metric out; every breakdown line says ``eff_us``, so one
-    glance down a 60-line multi-card dump finds the headline number. Structured
-    performance consumers use the returned benchmark data rather than this text.
-    """
-    _report_effective(stats)
-    if l3:
-        _report_l3_per_rank(stats)
-    _report_raw_samples(stats)
+    """Print the benchmark headline, rank samples, tagged tasks and run context."""
+    use_aicore = not any(inv.effective_us > 0 for inv in stats.invocations) and any(
+        _aicore_wall_us(inv) for inv in stats.invocations
+    )
+    if use_aicore:
+        _report_aicore_wall(stats, l3=l3)
+    else:
+        _report_effective(stats)
+        if l3:
+            _report_l3_per_rank(stats)
+    _report_raw_samples(stats, use_aicore=use_aicore)
     _report_task_slots(stats)
     if l3:
         _report_l3_detail(stats, compiled, resident=resident)
@@ -753,19 +753,18 @@ def _report_task_slots(stats: Any) -> None:
             prev = slot
 
 
-def _eff_summary(samples: Any) -> tuple[int, str] | None:
+def _eff_summary(samples: Any, *, digits: int = 1) -> tuple[int, str] | None:
     """``(n, "min=... median=... mean=... max=...")``, or ``None`` for no timing.
 
-    The one place Effective samples are aggregated. Zeros are dropped first — a
-    round with no orch/sched span reads 0 — so *n* is the surviving count, not
-    ``len(samples)``.
+    Zero denotes a missing timing sample. The returned count covers the
+    positive samples used for the summary.
     """
     eff = [e for e in samples if e > 0.0]
     if not eff:
         return None
     return len(eff), (
-        f"min={min(eff):.1f} median={statistics.median(eff):.1f} "
-        f"mean={statistics.fmean(eff):.1f} max={max(eff):.1f}"
+        f"min={min(eff):.{digits}f} median={statistics.median(eff):.{digits}f} "
+        f"mean={statistics.fmean(eff):.{digits}f} max={max(eff):.{digits}f}"
     )
 
 
@@ -796,8 +795,34 @@ def _report_effective(stats: Any) -> None:
     print(f"[RUN]   effective_us ({rounds} rounds) {line}", flush=True)
 
 
-def _report_raw_samples(stats: Any) -> None:
-    """Print every measured dispatch's raw Effective sample, per rank.
+def _aicore_wall_us(invocation: Any) -> float | None:
+    """Read the A5 business-kernel window from the runtime's measured launch."""
+    return next((span.dur_us for span in invocation.spans if span.name == "chip.run.runner_run.aicore_wall"), None)
+
+
+def _report_aicore_wall(stats: Any, *, l3: bool) -> None:
+    """Sum dispatches per rank and round, then report the max-rank series."""
+    rows = stats.rounds_dispatches if l3 else [{inv.pid: [inv]} for inv in stats.invocations]
+    totals: dict[int, list[float]] = {}
+    if len(rows) == stats.rounds and not (stats.fallback_flattened or getattr(stats, "unstable_dispatch_slots", False)):
+        for row in rows:
+            for pid, invocations in row.items():
+                durations = [_aicore_wall_us(inv) or 0.0 for inv in invocations]
+                total = sum(durations) if all(math.isfinite(duration) and duration > 0 for duration in durations) else 0.0
+                totals.setdefault(pid, []).append(total)
+
+    if not totals or any(len(values) != stats.rounds or min(values) <= 0 for values in totals.values()):
+        print("[RUN]   aicore_wall_us unavailable: incomplete rank or dispatch timing", flush=True)
+        return
+    summary = _eff_summary(map(max, zip(*totals.values(), strict=True)), digits=2)
+    print(f"[RUN]   aicore_wall_us ({stats.rounds} rounds) {summary[1]}", flush=True)
+    if l3:
+        for pid, values in sorted(totals.items()):
+            print(f"[RUN]     rank {pid}: aicore_wall_us {_eff_summary(values, digits=2)[1]}", flush=True)
+
+
+def _report_raw_samples(stats: Any, *, use_aicore: bool = False) -> None:
+    """Print every measured dispatch's raw sample for the reported metric, per rank.
 
     Reads :attr:`BenchmarkStats.invocations` — the flat per-dispatch list —
     rather than the per-round grid, so it works for L2 (one rank, one dispatch per round),
@@ -805,8 +830,7 @@ def _report_raw_samples(stats: Any) -> None:
     the summary lines are the least trustworthy.
 
     Samples are in ``inv`` order (warmup already dropped), so the sequence shows
-    drift directly. The lines carry a ``raw`` token and ``eff_us``, matching the
-    breakdown-line spelling described in :func:`_report_bench`.
+    drift directly. AICore wall blocks identify their metric in the header.
     """
     if not stats.invocations:
         return
@@ -816,12 +840,16 @@ def _report_raw_samples(stats: Any) -> None:
     head = (
         f"[RUN]   raw samples: ranks={len(by_pid)} rounds={stats.rounds} warmup={stats.warmup}"
     )
-    if stats.fallback_flattened:
+    if stats.fallback_flattened or (use_aicore and getattr(stats, "unstable_dispatch_slots", False)):
         head += " fallback_flattened=1"
+    if use_aicore:
+        head += " metric=aicore_wall_us"
     print(head, flush=True)
+    field = "aicore_wall_us" if use_aicore else "eff_us"
     for pid in sorted(by_pid):
-        eff = [round(iv.effective_us, 1) for iv in by_pid[pid]]
-        print(f"[RUN]     rank {pid} raw n={len(eff)} eff_us={eff}", flush=True)
+        samples = ([round(_aicore_wall_us(iv) or 0.0, 3) for iv in by_pid[pid]] if use_aicore
+                   else [round(iv.effective_us, 1) for iv in by_pid[pid]])
+        print(f"[RUN]     rank {pid} raw n={len(samples)} {field}={samples}", flush=True)
 
 
 def _report_l3_detail(stats: Any, compiled: Any, *, resident: bool) -> None:
