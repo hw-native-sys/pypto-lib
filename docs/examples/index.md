@@ -26,6 +26,7 @@ one above it.
 | Advanced | [GEMM + elementwise](../../examples/advanced/gemm_eltwise.py) | Fusion: a BF16 matmul with an FP32 accumulator adds its residual without leaving the scope |
 | Advanced | [Multi-projection](../../examples/advanced/multi_proj.py) | One `@pl.jit.inline` body reused for Q, K and V without a dispatch per call |
 | Advanced | [Top-k](../../examples/advanced/topk.py) | Specialized instructions — `sort32` and chained `mrgsort`, mask gather, tie-aware validation |
+| Advanced | [HierIndex](../../examples/advanced/hier_index.py) | Exact two-level sparse indexer — SPMD packet scoring, per-leaf `sort32`+`mrgsort`, owner-balanced block maxima, ordered top-512 |
 | Advanced | [All-reduce](../../examples/advanced/allreduce.py) | L3 distributed execution: window buffers, remote tile loads, notify/wait |
 
 All 11 declare `a2a3` and `a5` in their `--platform`
