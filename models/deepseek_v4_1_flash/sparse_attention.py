@@ -9,11 +9,8 @@
 # ci: no-sim
 """Gather sparse attention over packed FP8/FP4 caches with an attention sink."""
 
-from pathlib import Path
-
 import pypto.language as pl
 import torch
-from pypto.runtime import pto_isa_include_dir
 
 from config import (
     FLASH as M, CACHE_ROWS_DYN, CMP_BLOCKS_DYN, ORI_BLOCKS_DYN, T_DYN, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
@@ -22,6 +19,11 @@ from quant import (
     dequantize_mxfp4_cache, dequantize_mxfp8_cache, quantize_mxfp4_cache, quantize_mxfp8_cache,
     pack_quantized_cache, unpack_quantized_cache,
 )
+
+# Dynamic shape variables.
+SWA_HEAD_ROWS_DYN = pl.DynVar("swa_head_rows")
+SWA_CACHE_ROWS_DYN = pl.DynVar("swa_cache_rows")
+SWA_DECODE_ROWS_DYN = pl.DynVar("swa_decode_rows")
 
 # model config
 HEAD_DIM = M.head_dim
@@ -49,6 +51,17 @@ SPARSE_VF_FUSED_GATHER_TILE = 16
 SPARSE_VF_FUSED_SCALE_TILE = 8
 SPARSE_VF_FUSED_FP4_SCALE_TILE = 16
 
+SPARSE_VF_SWA_VALUE_TILE = 256
+SPARSE_VF_SWA_KV_LANE_ROWS = WINDOW_KEYS // 2
+SPARSE_VF_SWA_KV_SLOT_BYTES = WINDOW_KEYS * HEAD_DIM * 2
+SPARSE_VF_SWA_KV_SLOTS = 3
+SPARSE_VF_SWA_KV_BUFFER_BYTES = SPARSE_VF_SWA_KV_SLOT_BYTES * SPARSE_VF_SWA_KV_SLOTS
+SPARSE_VF_SWA_WEIGHT_SLOT_BYTES = SPARSE_VF_FUSED_CUBE_HEAD_TILE * WINDOW_KEYS * 2
+SPARSE_VF_SWA_SCORE_SLOT_BYTES = SPARSE_VF_FUSED_AIV_HEAD_TILE * WINDOW_KEYS * 4
+SPARSE_VF_SWA_SCORE_SLOTS = 2
+SPARSE_VF_SWA_SCORE_BUFFER_BYTES = SPARSE_VF_SWA_SCORE_SLOT_BYTES * SPARSE_VF_SWA_SCORE_SLOTS
+SPARSE_VF_SWA_RESULT_SLOT_BYTES = SPARSE_VF_FUSED_AIV_HEAD_TILE * SPARSE_VF_SWA_VALUE_TILE * 4
+
 # Packed cache layout.
 SPARSE_VF_WINDOW_GROUP = 32
 SPARSE_VF_COMPRESSED_GROUP = 16
@@ -63,89 +76,6 @@ SPARSE_VF_WINDOW_SHIFT = 5
 SPARSE_VF_WINDOW_SCALE_TILE = SPARSE_VF_REG_TILE // SPARSE_VF_WINDOW_GROUP
 SPARSE_VF_COMPRESSED_SCALE_TILE = SPARSE_VF_REG_TILE // SPARSE_VF_COMPRESSED_GROUP
 SPARSE_VF_WINDOW_SCALE_ROW_TILE = SPARSE_VF_REG_TILE // SPARSE_VF_WINDOW_GROUPS
-
-
-@pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "sparse_gather_vf.cpp",
-               aiv_source=Path(__file__).parent / "kernels" / "sparse_gather_vf.cpp",
-               include_dirs=(pto_isa_include_dir(),), dual_aiv_dispatch=True)
-def _gather_sparse_vf_rows(
-    output: pl.Out[pl.Tensor],
-    query: pl.Tensor,
-    sink: pl.Tensor,
-    window: pl.Tensor,
-    compressed: pl.Tensor,
-    window_indices: pl.Tensor,
-    compressed_indices: pl.Tensor,
-    partials: pl.InOut[pl.Tensor],
-    num_tokens: pl.Scalar[pl.INT32],
-    heads: pl.Scalar[pl.INT32],
-    window_keys: pl.Scalar[pl.INT32],
-    compressed_keys: pl.Scalar[pl.INT32],
-    balanced: pl.Scalar[pl.INT32],
-    cache_mode: pl.constexpr,
-):
-    """Stream cache rows through L1 with sink-aware sparse attention.
-
-    Scalar gather indices use refreshed GM cache lines; vector masks use
-    the asynchronous index copy in UB.
-    """
-    ...
-
-
-@pl.jit.inline(auto_scope=False)
-def gather_sparse_attention(
-    query: pl.Tensor,
-    window_indices: pl.Tensor,
-    window: pl.Tensor,
-    compressed_indices: pl.Tensor,
-    compressed: pl.Tensor,
-    sink: pl.Tensor,
-    output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-    compressed_keys: pl.constexpr,
-):
-    """Attend H=32/64, D=512 packed caches with K=128 or 640 and both Vector lanes."""
-    query = query[:num_tokens, :]
-    active_output = output[:num_tokens, :]
-    window_indices = window_indices[:num_tokens, :]
-    compressed_indices = compressed_indices[:num_tokens, :]
-    if compressed_keys == 0:
-        query_waves = pl.max(1, (num_tokens + SPARSE_VF_WORKER_TILE - 1) // SPARSE_VF_WORKER_TILE)
-        workers = pl.max(1, pl.min(SPARSE_VF_WORKER_TILE, (num_tokens + query_waves - 1) // query_waves))
-    else:
-        workers = pl.max(1, pl.min(num_tokens, SPARSE_VF_WORKER_TILE))
-    workers = pl.min(workers, pl.system.available_cluster_count())
-    parts = (WINDOW_KEYS + compressed_keys) // 128
-    whole_tiles = ((num_tokens + workers - 1) // workers) * parts
-    balanced_tiles = (num_tokens * parts + workers - 1) // workers
-    balanced = pl.cast(0, pl.INT32)
-    if num_tokens > workers:
-        if whole_tiles - balanced_tiles >= 3:
-            balanced = pl.cast(1, pl.INT32)
-    slots = pl.max(1, 2 * workers * balanced)
-    partials_size = slots * 64 * (HEAD_DIM + 2) + 2 * workers
-    partials = pl.create_tensor([partials_size], dtype=pl.FP32)
-    if balanced != 0:
-        ready_offset = 2 * workers * 64 * (HEAD_DIM + 2)
-        flat_partials = pl.reshape(partials, [1, partials_size])
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="sparse_gather_reset") as reset:
-            flags = pl.tile.full([1, 2 * SPARSE_VF_WORKER_TILE], dtype=pl.FP32, value=0.0)
-            flags = pl.tile.set_validshape(flags, 1, 2 * workers)
-            pl.store(flags, [0, ready_offset], flat_partials)
-        with pl.spmd(workers, name_hint="sparse_gather_vf", sync_start=True, deps=[reset]) as attended:
-            _gather_sparse_vf_rows(
-                active_output, query, sink, window, compressed,
-                window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
-                balanced, cache_mode=compressed_keys,
-            )
-    else:
-        with pl.spmd(workers, name_hint="sparse_gather_vf") as attended:
-            _gather_sparse_vf_rows(
-                active_output, query, sink, window, compressed,
-                window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
-                balanced, cache_mode=compressed_keys,
-            )
-    return attended
 
 
 @pl.jit.inline(auto_scope=False)
@@ -766,8 +696,7 @@ def sparse_vf_fused_cube(qflat: pl.Tensor, window_indices: pl.Tensor, compressed
     pl.func_attr({'split_aiv': True})
     keys = WINDOW_KEYS + compressed_keys
     _parts = keys // SPARSE_VF_KEY_TILE
-    workers = pl.min(num_tokens * (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE), SPARSE_VF_WORKER_TILE)
-    workers = pl.max(1, workers)
+    workers = pl.tile.get_block_num()
     if compressed_keys > 0:
         kv_ring = pl.system.reserve_buffer(name='sparse_kv_ring', size=262144)
     else:
@@ -985,8 +914,7 @@ def sparse_vf_fused_vector(qflat: pl.Tensor, window_indices: pl.Tensor, compress
     pl.func_attr({'split_aiv': True, 'dual_aiv_dispatch': True})
     keys = WINDOW_KEYS + compressed_keys
     parts = keys // SPARSE_VF_KEY_TILE
-    workers = pl.min(num_tokens * (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE), SPARSE_VF_WORKER_TILE)
-    workers = pl.max(1, workers)
+    workers = pl.tile.get_block_num()
     aiv_id = pl.tile.get_subblock_idx()
     pv_ring = pl.system.reserve_buffer(name='sparse_qk_ring', size=16384)
     kv_peer = pl.system.import_peer_buffer(name='sparse_kv_ring', peer_func='sparse_vf_fused_cube')
@@ -4054,28 +3982,556 @@ def sparse_vf_fused_group(
 
 
 @pl.jit.inline(auto_scope=False)
-def gather_sparse_attention_pypto(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
-    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
-    sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+def _swa_qk(
+    q: pl.Tile[[LOCAL_H, HEAD_DIM], pl.BF16, pl.Mem.Mat],
+    kv: pl.Tile[[WINDOW_KEYS, HEAD_DIM], pl.BF16, pl.Mem.Mat],
+):
+    """Publish the score panel and retain its KV slot until PV completes."""
+    key = pl.tile.transpose_view(kv)
+    # Expose all four K offsets and keep each pair of L0 panels live.
+    q_part_0 = pl.tile.extract(q, 0, 0, [LOCAL_H, 128], target_memory=pl.Mem.Left)
+    k_part_0 = pl.tile.extract(key, 0, 0, [128, WINDOW_KEYS], target_memory=pl.Mem.Right)
+    q_part_1 = pl.tile.extract(q, 0, 128, [LOCAL_H, 128], target_memory=pl.Mem.Left)
+    k_part_1 = pl.tile.extract(key, 128, 0, [128, WINDOW_KEYS], target_memory=pl.Mem.Right)
+    score = pl.tile.matmul(q_part_0, k_part_0)
+    score = pl.tile.matmul_acc(score, q_part_1, k_part_1)
+    q_part_2 = pl.tile.extract(q, 0, 256, [LOCAL_H, 128], target_memory=pl.Mem.Left)
+    k_part_2 = pl.tile.extract(key, 256, 0, [128, WINDOW_KEYS], target_memory=pl.Mem.Right)
+    q_part_3 = pl.tile.extract(q, 0, 384, [LOCAL_H, 128], target_memory=pl.Mem.Left)
+    k_part_3 = pl.tile.extract(key, 384, 0, [128, WINDOW_KEYS], target_memory=pl.Mem.Right)
+    score = pl.tile.matmul_acc(score, q_part_2, k_part_2)
+    score = pl.tile.matmul_acc(score, q_part_3, k_part_3)
+    pl.system.tpush_to_aiv(score, split=1, id=2)
+    return score
+
+
+@pl.jit.inline(auto_scope=False)
+def _swa_pv(kv: pl.Tile[[WINDOW_KEYS, HEAD_DIM], pl.BF16, pl.Mem.Mat]):
+    """Consume the weights once and publish both PV panels."""
+    weights = pl.system.tpop_from_aiv(shape=[LOCAL_H, WINDOW_KEYS], dtype=pl.BF16, split=1, id=1)
+    weights_left = pl.tile.move(weights, pl.Mem.Left)
+    # The weight FIFO is no longer needed after the L1-to-L0A move.
+    pl.system.tfree_to_aiv(weights, id=1)
+    # Each 256-column PV panel has an independent ready/free credit.
+    value = pl.tile.extract(kv, 0, 0, [WINDOW_KEYS, SPARSE_VF_SWA_VALUE_TILE], target_memory=pl.Mem.Right)
+    weighted = pl.tile.matmul(weights_left, value)
+    pl.system.tpush_to_aiv(weighted, split=1, id=3)
+    value = pl.tile.extract(kv, 0, SPARSE_VF_SWA_VALUE_TILE, [WINDOW_KEYS, SPARSE_VF_SWA_VALUE_TILE], target_memory=pl.Mem.Right)
+    weighted = pl.tile.matmul(weights_left, value)
+    pl.system.tpush_to_aiv(weighted, split=1, id=4)
+    return kv
+
+
+@pl.jit.inline(auto_scope=False)
+def _swa_query_group(
+    query: pl.Tensor[[SWA_HEAD_ROWS_DYN, HEAD_DIM], pl.BF16],
+    start: pl.Scalar[pl.INDEX],
+    count: pl.constexpr,
+):
+    """Keep one query ahead until its predecessor's PV is issued."""
+    q0 = pl.tile.load(query, [start * LOCAL_H, 0], [LOCAL_H, HEAD_DIM], target_memory=pl.Mem.Mat)
+    kv_even = pl.system.tpop_from_aiv(shape=[WINDOW_KEYS, HEAD_DIM], dtype=pl.BF16, split=1, id=0)
+    _score0 = _swa_qk(q0, kv_even)
+    # The first unrolled step replaces this alias with the next FIFO slot.
+    kv_odd = kv_even
+    for offset in pl.unroll(1, count):
+        q = pl.tile.load(query, [(start + offset) * LOCAL_H, 0], [LOCAL_H, HEAD_DIM], target_memory=pl.Mem.Mat)
+        if offset % 2 == 1:
+            kv_odd = pl.system.tpop_from_aiv(shape=[WINDOW_KEYS, HEAD_DIM], dtype=pl.BF16, split=1, id=0)
+            _score_odd = _swa_qk(q, kv_odd)
+            _pv_even = _swa_pv(kv_even)
+            pl.system.tfree_to_aiv(kv_even, id=0)
+        else:
+            kv_even = pl.system.tpop_from_aiv(shape=[WINDOW_KEYS, HEAD_DIM], dtype=pl.BF16, split=1, id=0)
+            _score_even = _swa_qk(q, kv_even)
+            _pv_odd = _swa_pv(kv_odd)
+            pl.system.tfree_to_aiv(kv_odd, id=0)
+    if count % 2 == 1:
+        _last_even = _swa_pv(kv_even)
+        pl.system.tfree_to_aiv(kv_even, id=0)
+    else:
+        _last_odd = _swa_pv(kv_odd)
+        pl.system.tfree_to_aiv(kv_odd, id=0)
+    return query
+
+
+@pl.jit.incore(level=pl.Level.AIC)
+def _sparse_swa_cube(
+    query: pl.Tensor[[SWA_HEAD_ROWS_DYN, HEAD_DIM], pl.BF16],
+    output: pl.Out[pl.Tensor[[SWA_HEAD_ROWS_DYN, HEAD_DIM], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
-    source_ready: pl.Scalar[pl.TASK_ID],
+    workers: pl.Scalar[pl.INT32],
+):
+    """Multiply QK and PV using one L1 copy of the window KV tile."""
+    pl.func_attr({"split_aiv": True})
+    kv_buffer = pl.system.reserve_buffer(name="sparse_swa_kv", size=SPARSE_VF_SWA_KV_BUFFER_BYTES)
+    weight_buffer = pl.system.reserve_buffer(name="sparse_swa_weights", size=SPARSE_VF_SWA_WEIGHT_SLOT_BYTES)
+    score_peer = pl.system.import_peer_buffer(name="sparse_swa_scores", peer_func="_sparse_swa_vector")
+    value_peer = pl.system.import_peer_buffer(name="sparse_swa_values", peer_func="_sparse_swa_vector")
+    value_peer_hi = pl.system.import_peer_buffer(name="sparse_swa_values_hi", peer_func="_sparse_swa_vector")
+    pl.system.aic_initialize_pipe(v2c_consumer_buf=kv_buffer, dir_mask=2, slot_size=SPARSE_VF_SWA_KV_SLOT_BYTES, slot_num=SPARSE_VF_SWA_KV_SLOTS, id=0)
+    pl.system.aic_initialize_pipe(v2c_consumer_buf=weight_buffer, dir_mask=2, slot_size=SPARSE_VF_SWA_WEIGHT_SLOT_BYTES, slot_num=1, id=1)
+    pl.system.aic_initialize_pipe(score_peer, dir_mask=1, slot_size=SPARSE_VF_SWA_SCORE_SLOT_BYTES, slot_num=SPARSE_VF_SWA_SCORE_SLOTS, id=2)
+    pl.system.aic_initialize_pipe(value_peer, dir_mask=1, slot_size=SPARSE_VF_SWA_RESULT_SLOT_BYTES, slot_num=1, id=3)
+    pl.system.aic_initialize_pipe(value_peer_hi, dir_mask=1, slot_size=SPARSE_VF_SWA_RESULT_SLOT_BYTES, slot_num=1, id=4)
+    worker = pl.tile.get_block_idx()
+    first_token = worker * num_tokens // workers
+    last_token = (worker + 1) * num_tokens // workers
+    # Static groups keep QK one token ahead of PV without carrying a popped
+    # tile across a dynamic loop boundary. Cover 12-token workers in one group.
+    group_end = first_token + (last_token - first_token) // 12 * 12
+    for token in pl.range(first_token, group_end, 12):
+        _group = _swa_query_group(query, token, 12)
+    triplet_end = group_end + (last_token - group_end) // 3 * 3
+    for token in pl.range(group_end, triplet_end, 3):
+        _triplet = _swa_query_group(query, token, 3)
+    if last_token - triplet_end == 2:
+        _pair = _swa_query_group(query, triplet_end, 2)
+    elif last_token - triplet_end == 1:
+        _single = _swa_query_group(query, triplet_end, 1)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
+def _store_swa_pv_lo(
+    norm: pl.Tile[[SPARSE_VF_FUSED_AIV_HEAD_TILE, 1], pl.FP32, pl.Mem.Vec],
+    output: pl.Tensor,
+    row_start: pl.Scalar[pl.INDEX],
+):
+    weighted = pl.system.tpop_from_aic(
+        shape=[SPARSE_VF_FUSED_AIV_HEAD_TILE, SPARSE_VF_SWA_VALUE_TILE], dtype=pl.FP32, split=1, id=3
+    )
+    normalized = pl.row_expand_mul(weighted, norm)
+    # Release the FP32 panel before converting and storing the private result.
+    pl.system.tfree_to_aic(weighted, id=3)
+    result = pl.cast(normalized, pl.BF16, mode="rint")
+    pl.tile.store(result, [row_start, 0], output)
+
+
+@pl.jit.inline(auto_scope=False)
+def _store_swa_pv_hi(
+    norm: pl.Tile[[SPARSE_VF_FUSED_AIV_HEAD_TILE, 1], pl.FP32, pl.Mem.Vec],
+    output: pl.Tensor,
+    row_start: pl.Scalar[pl.INDEX],
+):
+    weighted = pl.system.tpop_from_aic(
+        shape=[SPARSE_VF_FUSED_AIV_HEAD_TILE, SPARSE_VF_SWA_VALUE_TILE], dtype=pl.FP32, split=1, id=4
+    )
+    normalized = pl.row_expand_mul(weighted, norm)
+    pl.system.tfree_to_aic(weighted, id=4)
+    result = pl.cast(normalized, pl.BF16, mode="rint")
+    pl.tile.store(result, [row_start, SPARSE_VF_SWA_VALUE_TILE], output)
+
+
+@pl.jit.inline(auto_scope=False)
+def _store_swa_pv(
+    norm: pl.Tile[[SPARSE_VF_FUSED_AIV_HEAD_TILE, 1], pl.FP32, pl.Mem.Vec],
+    output: pl.Tensor,
+    row_start: pl.Scalar[pl.INDEX],
+):
+    """Drain and store both PV panels for one query."""
+    _store_swa_pv_lo(norm, output, row_start)
+    _store_swa_pv_hi(norm, output, row_start)
+
+
+@pl.jit.inline(auto_scope=False)
+def _decode_swa_rows(
+    raw: pl.Tile[[SWA_DECODE_ROWS_DYN, WINDOW_CACHE_BYTES], pl.UINT8, pl.Mem.Vec],
+    kv_flat: pl.Tile[[SPARSE_VF_SWA_KV_LANE_ROWS * HEAD_DIM], pl.BF16, pl.Mem.Vec],
+    dst_row: pl.Scalar[pl.INDEX],
+    rows: pl.constexpr,
+):
+    """Decode packed FP8 rows and store BF16 in the lane's NZ tile."""
+    raw_flat = pl.tile.reshape(raw, [rows * WINDOW_CACHE_BYTES])
+    scale_words = pl.reinterpret_view(raw, pl.UINT16)
+    scale_flat = pl.tile.reshape(scale_words, [rows * SPARSE_VF_WINDOW_HALFWORDS])
+    with pl.reg_scope():
+        full = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+        # Map the 7-bit E4M3FN magnitude to its exact BF16 bits.
+        magnitude = pl.reg.index_gen(0, lanes=SPARSE_VF_REG_TILE, dtype=pl.UINT16)
+        # Compare the mantissa of 1.0 + magnitude / 1024 in 128 lanes.
+        order_bits = pl.reg.adds(magnitude, 0x3C00, full)
+        order = pl.reg.interpret_cast(order_bits, dtype=pl.FP16)
+        mantissa = pl.reg.shift_lefts(magnitude, 4, full)
+        normal_bits = pl.reg.adds(mantissa, 0x3C00, full)
+        subnormal_high = pl.reg.shift_lefts(magnitude, 5, full)
+        subnormal_high = pl.reg.adds(subnormal_high, 0x3B80, full)
+        subnormal_low = pl.reg.shift_lefts(magnitude, 6, full)
+        subnormal_low = pl.reg.adds(subnormal_low, 0x3B00, full)
+        low_mask = pl.reg.compares(order, 1.00390625, full, predicate="lt")
+        subnormal_bits = pl.reg.select(low_mask, subnormal_low, subnormal_high)
+        single = pl.reg.broadcast(0x3B00, lanes=SPARSE_VF_REG_TILE, dtype=pl.UINT16)
+        single_mask = pl.reg.compares(order, 1.0009765625, full, predicate="eq")
+        subnormal_bits = pl.reg.select(single_mask, single, subnormal_bits)
+        zero_bits = pl.reg.broadcast(0, lanes=SPARSE_VF_REG_TILE, dtype=pl.UINT16)
+        zero_mask = pl.reg.compares(order, 1.0, full, predicate="eq")
+        subnormal_bits = pl.reg.select(zero_mask, zero_bits, subnormal_bits)
+        subnormal_mask = pl.reg.compares(order, 1.0078125, full, predicate="lt")
+        finite_bits = pl.reg.select(subnormal_mask, subnormal_bits, normal_bits)
+        nan = pl.reg.broadcast(0x7FC0, lanes=SPARSE_VF_REG_TILE, dtype=pl.UINT16)
+        nan_mask = pl.reg.compares(order, 1.1240234375, full, predicate="eq")
+        magnitude_bits = pl.reg.select(nan_mask, nan, finite_bits)
+        magnitude_mask = pl.reg.broadcast(127, lanes=SPARSE_VF_REG_TILE, dtype=pl.UINT16)
+        sign_mask = pl.reg.broadcast(128, lanes=SPARSE_VF_REG_TILE, dtype=pl.UINT16)
+        for row in pl.hardware_loop(rows):
+            for chunk in pl.hardware_loop(HEAD_DIM // SPARSE_VF_REG_TILE):
+                column = chunk * SPARSE_VF_REG_TILE
+                raw_offset = row * WINDOW_CACHE_BYTES + column
+                raw_codes = pl.reg.load(raw_flat, raw_offset, lanes=SPARSE_VF_REG_TILE)
+                codes = pl.reg.convert(raw_codes, dtype=pl.UINT16)
+                code_magnitude = pl.reg.bitwise_and(codes, magnitude_mask, full)
+                code_sign = pl.reg.bitwise_and(codes, sign_mask, full)
+                bf16_sign = pl.reg.shift_lefts(code_sign, 8, full)
+                bf16_magnitude = pl.reg.gather_lanes(magnitude_bits, code_magnitude)
+                bf16_bits = pl.reg.bitwise_or(bf16_magnitude, bf16_sign, full)
+                values = pl.reg.interpret_cast(bf16_bits, dtype=pl.BF16)
+                scale_offset = row * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
+                scale_offset = scale_offset + chunk * SPARSE_VF_WINDOW_SCALE_TILE
+                scale_groups = pl.reg.load(scale_flat, scale_offset, lanes=SPARSE_VF_WINDOW_SCALE_TILE)
+                scale_bits = pl.reg.group_broadcast(scale_groups, lanes=SPARSE_VF_REG_TILE)
+                factors = pl.reg.interpret_cast(scale_bits, dtype=pl.BF16)
+                decoded = pl.reg.mul(values, factors, full)
+                # NZ interleaves rows within each 16-element column block.
+                destination = (dst_row + row) * 16 + column * SPARSE_VF_SWA_KV_LANE_ROWS
+                _write_kv = pl.reg.store(
+                    kv_flat, destination, decoded, full, block_stride=SPARSE_VF_SWA_KV_LANE_ROWS
+                )
+    return kv_flat
+
+
+@pl.jit.inline(auto_scope=False)
+def _swa_softmax(
+    all_ids: pl.Tile[[1, WINDOW_KEYS], pl.INT32, pl.Mem.Vec],
+    sink_tile: pl.Tile[[1, SPARSE_VF_FUSED_AIV_HEAD_TILE], pl.FP32, pl.Mem.Vec],
+):
+    """Receive QK scores, publish BF16 weights and return sink normalization."""
+    scores_in = pl.system.tpop_from_aic(shape=[SPARSE_VF_FUSED_AIV_HEAD_TILE, WINDOW_KEYS], dtype=pl.FP32, split=1, id=2)
+    scores = pl.mul(scores_in, SCALE)
+    # The scaled scores are private to AIV; Cube can recycle the score slot.
+    pl.system.tfree_to_aic(scores_in, id=2)
+    weight_storage: pl.Tile[
+        [SPARSE_VF_FUSED_AIV_HEAD_TILE, WINDOW_KEYS], pl.BF16, pl.MemRef("swa_weights_nz"), pl.Mem.Vec
+    ] = pl.tile.create([SPARSE_VF_FUSED_AIV_HEAD_TILE, WINDOW_KEYS], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+    maximum = pl.tile.create([1, SPARSE_VF_FUSED_AIV_HEAD_TILE], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+    denominator = pl.tile.create([1, SPARSE_VF_FUSED_AIV_HEAD_TILE], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+    ids_flat = pl.tile.reshape(all_ids, [WINDOW_KEYS])
+    scores_flat = pl.tile.reshape(scores, [SPARSE_VF_FUSED_AIV_HEAD_TILE * WINDOW_KEYS])
+    weights_flat = pl.tile.reshape(weight_storage, [SPARSE_VF_FUSED_AIV_HEAD_TILE * WINDOW_KEYS])
+    max_flat = pl.tile.reshape(maximum, [SPARSE_VF_FUSED_AIV_HEAD_TILE])
+    denominator_flat = pl.tile.reshape(denominator, [SPARSE_VF_FUSED_AIV_HEAD_TILE])
+    with pl.reg_scope():
+        full64 = pl.reg.full_mask(lanes=64)
+        ids_lo = pl.reg.load(ids_flat, 0, lanes=64)
+        ids_hi = pl.reg.load(ids_flat, 64, lanes=64)
+        valid_lo = pl.reg.compares(ids_lo, 0, full64, predicate="ge")
+        valid_hi = pl.reg.compares(ids_hi, 0, full64, predicate="ge")
+        invalid = pl.reg.broadcast(-1e30, lanes=64, dtype=pl.FP32)
+        for row in pl.hardware_loop(SPARSE_VF_FUSED_AIV_HEAD_TILE):
+            offset = row * WINDOW_KEYS
+            score_lo = pl.reg.load(scores_flat, offset, lanes=64)
+            score_hi = pl.reg.load(scores_flat, offset + 64, lanes=64)
+            score_lo = pl.reg.select(valid_lo, score_lo, invalid)
+            score_hi = pl.reg.select(valid_hi, score_hi, invalid)
+            maxima = pl.reg.maximum(score_lo, score_hi, full64)
+            max_row = pl.reg.reduce_max(maxima, full64)
+            reference = pl.reg.broadcast(max_row, lanes=64, dtype=pl.FP32)
+            weights_lo = pl.reg.expdif(score_lo, reference, valid_lo)
+            weights_hi = pl.reg.expdif(score_hi, reference, valid_hi)
+            weight_pairs = pl.reg.add(weights_lo, weights_hi, full64)
+            summed = pl.reg.reduce_sum(weight_pairs, full64, reassoc=True)
+            bf16_lo = pl.reg.convert(weights_lo, dtype=pl.BF16, rounding="R", saturate=False)
+            bf16_hi = pl.reg.convert(weights_hi, dtype=pl.BF16, rounding="R", saturate=False)
+            nz_offset = row * 16
+            nz_hi = nz_offset + 64 * SPARSE_VF_FUSED_AIV_HEAD_TILE
+            _write_lo = pl.reg.store(
+                weights_flat, nz_offset, bf16_lo, full64, block_stride=SPARSE_VF_FUSED_AIV_HEAD_TILE
+            )
+            _write_hi = pl.reg.store(
+                weights_flat, nz_hi, bf16_hi, full64, block_stride=SPARSE_VF_FUSED_AIV_HEAD_TILE
+            )
+            _write_max = pl.reg.store(max_flat, row, max_row)
+            _write_sum = pl.reg.store(denominator_flat, row, summed)
+    weights_nz: pl.Tile[
+        [SPARSE_VF_FUSED_AIV_HEAD_TILE, WINDOW_KEYS],
+        pl.BF16,
+        pl.MemRef("swa_weights_nz"),
+        pl.Mem.Vec,
+        pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512),
+    ] = pl.tile.create([SPARSE_VF_FUSED_AIV_HEAD_TILE, WINDOW_KEYS], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+    pl.system.tpush_to_aic(weights_nz, split=1, id=1)
+
+    # Keep the stable sink normalization entirely in registers.
+    norm = pl.tile.create([1, SPARSE_VF_FUSED_AIV_HEAD_TILE], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+    norm_flat = pl.tile.reshape(norm, [SPARSE_VF_FUSED_AIV_HEAD_TILE])
+    sink_flat = pl.tile.reshape(sink_tile, [SPARSE_VF_FUSED_AIV_HEAD_TILE])
+    with pl.reg_scope():
+        heads = pl.reg.full_mask(lanes=SPARSE_VF_FUSED_AIV_HEAD_TILE)
+        m = pl.reg.load(max_flat, 0, lanes=SPARSE_VF_FUSED_AIV_HEAD_TILE)
+        den = pl.reg.load(denominator_flat, 0, lanes=SPARSE_VF_FUSED_AIV_HEAD_TILE)
+        sink = pl.reg.load(sink_flat, 0, lanes=SPARSE_VF_FUSED_AIV_HEAD_TILE)
+        final_max = pl.reg.maximum(m, sink, heads)
+        correction = pl.reg.expdif(m, final_max, heads)
+        sink_weight = pl.reg.expdif(sink, final_max, heads)
+        total = pl.reg.add(pl.reg.mul(den, correction, heads), sink_weight, heads)
+        ratio = pl.reg.div(correction, total, heads)
+        _write_norm = pl.reg.store(norm_flat, 0, ratio)
+    return norm
+
+
+@pl.jit.incore(level=pl.Level.AIV)
+def _sparse_swa_vector(
+    indices: pl.Tensor[[T_DYN, WINDOW_KEYS], pl.INT32],
+    window: pl.Tensor[[SWA_CACHE_ROWS_DYN, WINDOW_CACHE_BYTES], pl.UINT8],
+    sink: pl.Tensor[[1, LOCAL_H], pl.FP32],
+    output: pl.Out[pl.Tensor[[SWA_HEAD_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    num_tokens: pl.Scalar[pl.INT32],
+    workers: pl.Scalar[pl.INT32],
+):
+    """Decode FP8 KV directly into the Cube pipe and apply sink normalization."""
+    pl.func_attr({"split_aiv": True, "dual_aiv_dispatch": True})
+    kv_peer = pl.system.import_peer_buffer(name="sparse_swa_kv", peer_func="_sparse_swa_cube")
+    weight_peer = pl.system.import_peer_buffer(name="sparse_swa_weights", peer_func="_sparse_swa_cube")
+    score_buffer = pl.system.reserve_buffer(name="sparse_swa_scores", size=SPARSE_VF_SWA_SCORE_BUFFER_BYTES)
+    value_buffer = pl.system.reserve_buffer(name="sparse_swa_values", size=SPARSE_VF_SWA_RESULT_SLOT_BYTES)
+    value_buffer_hi = pl.system.reserve_buffer(name="sparse_swa_values_hi", size=SPARSE_VF_SWA_RESULT_SLOT_BYTES)
+    pl.system.aiv_initialize_pipe(v2c_consumer_buf=kv_peer, dir_mask=2, slot_size=SPARSE_VF_SWA_KV_SLOT_BYTES, slot_num=SPARSE_VF_SWA_KV_SLOTS, id=0)
+    pl.system.aiv_initialize_pipe(v2c_consumer_buf=weight_peer, dir_mask=2, slot_size=SPARSE_VF_SWA_WEIGHT_SLOT_BYTES, slot_num=1, id=1)
+    pl.system.aiv_initialize_pipe(score_buffer, dir_mask=1, slot_size=SPARSE_VF_SWA_SCORE_SLOT_BYTES, slot_num=SPARSE_VF_SWA_SCORE_SLOTS, id=2)
+    pl.system.aiv_initialize_pipe(value_buffer, dir_mask=1, slot_size=SPARSE_VF_SWA_RESULT_SLOT_BYTES, slot_num=1, id=3)
+    pl.system.aiv_initialize_pipe(value_buffer_hi, dir_mask=1, slot_size=SPARSE_VF_SWA_RESULT_SLOT_BYTES, slot_num=1, id=4)
+    worker = pl.tile.get_block_idx()
+    lane = pl.tile.get_subblock_idx()
+    lane32 = pl.cast(lane, pl.INT32)
+    head = lane * SPARSE_VF_FUSED_AIV_HEAD_TILE
+    sink_tile = pl.tile.load(sink, [0, head], [1, SPARSE_VF_FUSED_AIV_HEAD_TILE])
+    first_token = worker * num_tokens // workers
+    last_token = (worker + 1) * num_tokens // workers
+    norm = pl.tile.full([1, SPARSE_VF_FUSED_AIV_HEAD_TILE], dtype=pl.FP32, value=0.0)
+    kv_storage: pl.Tile[
+        [SPARSE_VF_SWA_KV_LANE_ROWS, HEAD_DIM], pl.BF16, pl.MemRef("swa_kv_nz"), pl.Mem.Vec
+    ] = pl.tile.create([SPARSE_VF_SWA_KV_LANE_ROWS, HEAD_DIM], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+    kv_flat = pl.tile.reshape(kv_storage, [SPARSE_VF_SWA_KV_LANE_ROWS * HEAD_DIM])
+    # The FIFO consumes the NZ view of the register store buffer.
+    kv_nz: pl.Tile[
+        [SPARSE_VF_SWA_KV_LANE_ROWS, HEAD_DIM],
+        pl.BF16,
+        pl.MemRef("swa_kv_nz"),
+        pl.Mem.Vec,
+        pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512),
+    ] = pl.tile.create([SPARSE_VF_SWA_KV_LANE_ROWS, HEAD_DIM], dtype=pl.BF16, target_memory=pl.Mem.Vec)
+    previous_ids = pl.tile.full([1, SPARSE_VF_SWA_KV_LANE_ROWS], dtype=pl.INT32, value=-1)
+    previous_flat = pl.tile.reshape(previous_ids, [SPARSE_VF_SWA_KV_LANE_ROWS])
+    reuse_count = pl.tile.create([1, 8], dtype=pl.INT32, target_memory=pl.Mem.Vec)
+    reuse_flat = pl.tile.reshape(reuse_count, [8])
+    # Carry the full mask alongside the window pipeline, sharing one DMA with gather.
+    previous_all_ids = pl.tile.full([1, WINDOW_KEYS], dtype=pl.INT32, value=-1)
+    ring_slot = pl.cast(0, pl.INDEX)
+    for token in pl.range(first_token, last_token):
+        current_all_ids = pl.tile.load(indices, [token, 0], [1, WINDOW_KEYS], target_memory=pl.Mem.Vec)
+        current_ids = pl.tile.create([1, SPARSE_VF_SWA_KV_LANE_ROWS], dtype=pl.INT32, target_memory=pl.Mem.Vec)
+        all_current_flat = pl.tile.reshape(current_all_ids, [WINDOW_KEYS])
+        current_flat = pl.tile.reshape(current_ids, [64])
+        with pl.reg_scope():
+            reuse_full = pl.reg.full_mask(lanes=64)
+            reuse_prefix_mask = pl.reg.active_mask(63, lanes=64)
+            actual_lo = pl.reg.load(all_current_flat, 0, lanes=64)
+            actual_hi = pl.reg.load(all_current_flat, 64, lanes=64)
+            lane_reg = pl.reg.broadcast(lane32, lanes=64, dtype=pl.INT32)
+            lo_mask = pl.reg.compares(lane_reg, 0, reuse_full, predicate="eq")
+            reuse_actual = pl.reg.select(lo_mask, actual_lo, actual_hi)
+            _write_current_ids = pl.reg.store(current_flat, 0, reuse_actual)
+            reuse_previous = pl.reg.load(previous_flat, 0, lanes=64)
+            reuse_positions = pl.reg.index_gen(1, lanes=64, dtype=pl.INT32)
+            reuse_wrap_mask = pl.reg.broadcast(63, lanes=64, dtype=pl.INT32)
+            reuse_positions = pl.reg.bitwise_and(reuse_positions, reuse_wrap_mask, reuse_full)
+            reuse_shifted = pl.reg.gather_lanes(reuse_previous, reuse_positions)
+            reuse_expected = pl.reg.select(reuse_prefix_mask, reuse_shifted, reuse_actual)
+            reuse_valid = pl.reg.compares(reuse_actual, 0, reuse_full, predicate="ge")
+            reuse_matches = pl.reg.compare(reuse_actual, reuse_expected, reuse_valid, predicate="eq")
+            reuse_zeros = pl.reg.broadcast(0, lanes=64, dtype=pl.INT32)
+            reuse_ones = pl.reg.broadcast(1, lanes=64, dtype=pl.INT32)
+            reuse_mismatches = pl.reg.select(reuse_matches, reuse_zeros, reuse_ones)
+            reuse_total = pl.reg.reduce_sum(reuse_mismatches, reuse_full)
+            _write_reuse = pl.reg.store(reuse_flat, 0, reuse_total)
+            _remember_ids = pl.reg.store(previous_flat, 0, reuse_actual, reuse_full)
+        if pl.tile.read(reuse_count, [0, 0]) == 0:
+            # All 64 indices are valid. Retain the 63 shared rows in ring order
+            # and overwrite the dropped row. QK and PV use the same permuted order.
+            physical = pl.tile.read(current_ids, [0, SPARSE_VF_SWA_KV_LANE_ROWS - 1])
+            tail = pl.tile.load(window, [pl.cast(pl.cast(physical, pl.UINT32), pl.INDEX), 0], [1, WINDOW_CACHE_BYTES], target_memory=pl.Mem.Vec)
+            kv_flat = _decode_swa_rows(tail, kv_flat, ring_slot, 1)
+            # The ring has 64 slots; unsigned masking removes signed modulo correction.
+            ring_slot = pl.cast((pl.cast(ring_slot, pl.UINT32) + pl.cast(1, pl.UINT32)) & pl.cast(SPARSE_VF_SWA_KV_LANE_ROWS - 1, pl.UINT32), pl.INDEX)
+        else:
+            ring_slot = pl.cast(0, pl.INDEX)
+            # Gather the complete lane with constant width.
+            gather_ids = current_ids
+            gather_ids_flat = current_flat
+            first = pl.tile.read(gather_ids, [0, 0])
+            # A power-of-two page offset is the low seven bits, even for masked IDs.
+            page_offset = pl.cast(first, pl.UINT32) & pl.cast(WINDOW_KEYS - 1, pl.UINT32)
+            page_remaining = WINDOW_KEYS - pl.cast(page_offset, pl.INDEX)
+            first_rows = pl.cast(pl.min(SPARSE_VF_SWA_KV_LANE_ROWS, page_remaining), pl.INT32)
+            second = first
+            if first_rows < SPARSE_VF_SWA_KV_LANE_ROWS:
+                second = pl.tile.read(gather_ids, [0, first_rows])
+            mismatch_count = pl.tile.create([1, 8], dtype=pl.INT32, target_memory=pl.Mem.Vec)
+            count_flat = pl.tile.reshape(mismatch_count, [8])
+            with pl.reg_scope():
+                lanes = pl.reg.full_mask(lanes=SPARSE_VF_SWA_KV_LANE_ROWS)
+                actual = pl.reg.load(gather_ids_flat, 0, lanes=SPARSE_VF_SWA_KV_LANE_ROWS)
+                positions = pl.reg.index_gen(0, lanes=SPARSE_VF_SWA_KV_LANE_ROWS, dtype=pl.INT32)
+                first_run = pl.reg.compares(positions, first_rows, lanes, predicate="lt")
+                expected_first = pl.reg.index_gen(first, lanes=SPARSE_VF_SWA_KV_LANE_ROWS, dtype=pl.INT32)
+                expected_second = pl.reg.index_gen(second - first_rows, lanes=SPARSE_VF_SWA_KV_LANE_ROWS, dtype=pl.INT32)
+                expected = pl.reg.select(first_run, expected_first, expected_second)
+                valid = pl.reg.compares(actual, 0, lanes, predicate="ge")
+                matches = pl.reg.compare(actual, expected, valid, predicate="eq")
+                zeros = pl.reg.broadcast(0, lanes=SPARSE_VF_SWA_KV_LANE_ROWS, dtype=pl.INT32)
+                ones = pl.reg.broadcast(1, lanes=SPARSE_VF_SWA_KV_LANE_ROWS, dtype=pl.INT32)
+                mismatches = pl.reg.select(matches, zeros, ones)
+                # Valid contiguous page runs score 0, other valid rows 1, and masked rows 2.
+                twos = pl.reg.broadcast(2, lanes=SPARSE_VF_SWA_KV_LANE_ROWS, dtype=pl.INT32)
+                gather_costs = pl.reg.select(valid, mismatches, twos)
+                count = pl.reg.reduce_sum(gather_costs, lanes)
+                _write_count = pl.reg.store(count_flat, 0, count)
+            classification = pl.tile.read(mismatch_count, [0, 0])
+            if classification == 2 * SPARSE_VF_SWA_KV_LANE_ROWS:
+                with pl.reg_scope():
+                    zero_kv = pl.reg.broadcast(0.0, lanes=SPARSE_VF_REG_TILE, dtype=pl.BF16)
+                    for fractal in pl.hardware_loop(HEAD_DIM // 16):
+                        panel_offset = fractal * SPARSE_VF_SWA_KV_LANE_ROWS * 16
+                        for zero_chunk in pl.hardware_loop(SPARSE_VF_SWA_KV_LANE_ROWS * 16 // SPARSE_VF_REG_TILE):
+                            zero_destination = panel_offset + zero_chunk * SPARSE_VF_REG_TILE
+                            _write_zero = pl.reg.store(kv_flat, zero_destination, zero_kv)
+            else:
+                raw = pl.tile.create([SPARSE_VF_SWA_KV_LANE_ROWS, WINDOW_CACHE_BYTES], dtype=pl.UINT8, target_memory=pl.Mem.Vec)
+                if classification == 0:
+                    first_row = pl.cast(pl.cast(first, pl.UINT32), pl.INDEX)
+                    # Use a constant DMA shape when the complete lane is physically contiguous.
+                    if first_rows == SPARSE_VF_SWA_KV_LANE_ROWS or pl.cast(second, pl.INDEX) == pl.cast(first, pl.INDEX) + first_rows:
+                        raw = pl.tile.gather_row(
+                            raw, window, [0, 0], [first_row, 0], [SPARSE_VF_SWA_KV_LANE_ROWS, WINDOW_CACHE_BYTES]
+                        )
+                    else:
+                        raw = pl.tile.gather_row(
+                            raw, window, [0, 0], [first_row, 0], [SPARSE_VF_SWA_KV_LANE_ROWS, WINDOW_CACHE_BYTES],
+                            valid_shape=[first_rows, WINDOW_CACHE_BYTES],
+                        )
+                        if first_rows < SPARSE_VF_SWA_KV_LANE_ROWS:
+                            second_row = pl.cast(pl.cast(second, pl.UINT32), pl.INDEX)
+                            second_rows = SPARSE_VF_SWA_KV_LANE_ROWS - first_rows
+                            tail_offset = pl.cast(first_rows, pl.INDEX)
+                            raw = pl.tile.gather_row(
+                                raw, window, [tail_offset, 0], [second_row, 0], [SPARSE_VF_SWA_KV_LANE_ROWS, WINDOW_CACHE_BYTES],
+                                valid_shape=[second_rows, WINDOW_CACHE_BYTES],
+                            )
+                else:
+                    raw = pl.tile.full([SPARSE_VF_SWA_KV_LANE_ROWS, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                    for key in pl.range(0, SPARSE_VF_SWA_KV_LANE_ROWS, 2):
+                        first_id = pl.tile.read(gather_ids, [0, key])
+                        second_id = pl.tile.read(gather_ids, [0, key + 1])
+                        first_valid = first_id >= 0
+                        first_row = pl.cast(pl.cast(first_id, pl.UINT32), pl.INDEX)
+                        second_row = pl.cast(pl.cast(second_id, pl.UINT32), pl.INDEX)
+                        if first_valid and second_row == first_row + 1:
+                            raw = pl.tile.gather_row(raw, window, [key, 0], [first_row, 0], [2, WINDOW_CACHE_BYTES])
+                        else:
+                            if first_valid:
+                                raw = pl.tile.gather_row(raw, window, [key, 0], [first_row, 0], [1, WINDOW_CACHE_BYTES])
+                            if second_id >= 0:
+                                raw = pl.tile.gather_row(raw, window, [key + 1, 0], [second_row, 0], [1, WINDOW_CACHE_BYTES])
+                kv_flat = _decode_swa_rows(raw, kv_flat, pl.cast(0, pl.INDEX), SPARSE_VF_SWA_KV_LANE_ROWS)
+        pl.system.tpush_to_aic(kv_nz, split=1, id=0)
+        # Send the next KV before consuming the previous score. Publish its
+        # weights before draining the older PV, while retaining both norms.
+        if token > first_token:
+            next_norm = _swa_softmax(previous_all_ids, sink_tile)
+            if token > first_token + 1:
+                prior_norm = pl.reshape(norm, [SPARSE_VF_FUSED_AIV_HEAD_TILE, 1])
+                prior_row = (token - 2) * LOCAL_H + head
+                _store_swa_pv(prior_norm, output, prior_row)
+            norm = next_norm
+        previous_all_ids = current_all_ids
+    if last_token > first_token:
+        last_norm = _swa_softmax(previous_all_ids, sink_tile)
+        if last_token > first_token + 1:
+            prior_norm = pl.reshape(norm, [SPARSE_VF_FUSED_AIV_HEAD_TILE, 1])
+            prior_row = (last_token - 2) * LOCAL_H + head
+            _store_swa_pv(prior_norm, output, prior_row)
+        norm = last_norm
+        final_norm = pl.reshape(norm, [SPARSE_VF_FUSED_AIV_HEAD_TILE, 1])
+        final_row = (last_token - 1) * LOCAL_H + head
+        _store_swa_pv(final_norm, output, final_row)
+    return output
+
+
+@pl.jit.incore(level=pl.Level.CORE_GROUP)
+def _sparse_swa_group(
+    query: pl.Tensor[[SWA_HEAD_ROWS_DYN, HEAD_DIM], pl.BF16],
+    indices: pl.Tensor[[T_DYN, WINDOW_KEYS], pl.INT32],
+    window: pl.Tensor[[SWA_CACHE_ROWS_DYN, WINDOW_CACHE_BYTES], pl.UINT8],
+    sink: pl.Tensor[[1, LOCAL_H], pl.FP32],
+    output: pl.Out[pl.Tensor[[SWA_HEAD_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    num_tokens: pl.Scalar[pl.INT32],
+    workers: pl.Scalar[pl.INT32],
+):
+    output = _sparse_swa_cube(query, output, num_tokens, workers)
+    output = _sparse_swa_vector(indices, window, sink, output, num_tokens, workers)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
+def _attend_window_fused(
+    query: pl.Tensor,
+    indices: pl.Tensor,
+    window: pl.Tensor,
+    sink: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Run one mixed-core SWA task over the active query rows."""
+    rows = pl.tensor.dim(window, 0) * WINDOW_KEYS
+    flat_window = pl.reshape(window, [rows, WINDOW_CACHE_BYTES])
+    query = query[:num_tokens, :]
+    indices = indices[:num_tokens, :]
+    output = output[:num_tokens, :]
+    tokens = pl.tensor.dim(query, 0)
+    flat_query = pl.reshape(query, [tokens * LOCAL_H, HEAD_DIM])
+    flat_output = pl.reshape(output, [tokens * LOCAL_H, HEAD_DIM])
+    sink_row = pl.reshape(sink, [1, LOCAL_H])
+    waves = pl.max(1, (num_tokens + SPARSE_VF_WORKER_TILE - 1) // SPARSE_VF_WORKER_TILE)
+    workers = pl.max(1, (num_tokens + waves - 1) // waves)
+    workers = pl.min(workers, pl.system.available_cluster_count())
+    with pl.spmd(workers, name_hint="sparse_swa_fused") as attended:
+        _sparse_swa_group(flat_query, indices, flat_window, sink_row, flat_output, num_tokens, workers)
+    return attended
+
+
+@pl.jit.inline(auto_scope=False)
+def gather_sparse_attention(
+    query: pl.Tensor,
+    window_indices: pl.Tensor,
+    window: pl.Tensor,
+    compressed_indices: pl.Tensor,
+    compressed: pl.Tensor,
+    sink: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
     compressed_keys: pl.constexpr,
 ):
-    """Fuse packed-cache decoding and attention; keep single-part SWA scheduling."""
+    """Attend to packed window and compressed caches with PyPTO."""
     query = query[:num_tokens, :]
     output = output[:num_tokens, :]
     window_indices = window_indices[:num_tokens, :]
     compressed_indices = compressed_indices[:num_tokens, :]
     attended = pl.system.task_invalid()
-    if compressed_keys > 0 and LOCAL_H >= 32:
+    if compressed_keys == 0:
+        attended = _attend_window_fused(query, window_indices, window, sink, output, num_tokens)
+    elif LOCAL_H >= 32:
         window_rows = pl.tensor.dim(window, 0) * 128
         window_flat = pl.reshape(window, [window_rows, WINDOW_CACHE_BYTES])
-        compressed_rows = pl.tensor.dim(compressed, 0) * 128
+        compressed_rows = pl.tensor.dim(compressed, 0) * pl.tensor.dim(compressed, 1)
         compressed_flat = pl.reshape(compressed, [compressed_rows, COMPRESSED_CACHE_BYTES])
         tokens = pl.tensor.dim(query, 0)
         qflat = pl.reshape(query, [tokens * LOCAL_H, HEAD_DIM])
@@ -4083,7 +4539,8 @@ def gather_sparse_attention_pypto(
         sink_row = pl.reshape(sink, [1, LOCAL_H])
         workers = pl.min(num_tokens * (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE), SPARSE_VF_WORKER_TILE)
         workers = pl.max(1, workers)
-        with pl.spmd(workers, name_hint='sparse_vf_fused', deps=[source_ready]) as fused:
+        workers = pl.min(workers, pl.system.available_cluster_count())
+        with pl.spmd(workers, name_hint="sparse_vf_fused") as fused:
             sparse_vf_fused_group(
                 qflat,
                 window_indices, compressed_indices,
@@ -4103,7 +4560,7 @@ def gather_sparse_attention_pypto(
             window_indices, window,
             compressed_indices, compressed,
             decoded, selected_ids,
-            num_tokens, source_ready, compressed_keys=compressed_keys,
+            num_tokens, attended, compressed_keys=compressed_keys,
         )
         attended = sparse_vf_attend_pypto(
             query,
@@ -4218,7 +4675,7 @@ def build_sparse_attention_specs(rows, active, *, compressed_keys, start=0, case
             wp, ws = quantize_mxfp8_cache(window)
             wi = torch.full((rows, WINDOW_KEYS), -1, dtype=torch.int32)
             for row in range(rows):
-                kind = row % 6
+                kind = row % (6 if compressed_keys else 9)
                 if kind == 1:
                     wi[row, :13] = torch.arange(13, dtype=torch.int32) + 127
                 elif kind == 2:
@@ -4231,6 +4688,11 @@ def build_sparse_attention_specs(rows, active, *, compressed_keys, start=0, case
                     wi[row, 5:9] = 17
                 elif kind == 5:
                     wi[row, :65] = torch.arange(65, dtype=torch.int32) + 64
+                elif kind >= 6:
+                    # Consecutive windows cross physical pages and slide past a masked row.
+                    wi[row] = (torch.arange(WINDOW_KEYS, dtype=torch.int32) + 221 + kind - 6) % 256
+                    if kind == 6:
+                        wi[row, 0] = -2
             compressed = torch.randn(compressed_pages, 128, 1, HEAD_DIM, generator=generator).mul_(0.6).bfloat16()
             cp, cs = quantize_mxfp4_cache(compressed, 16, "bf16")
             ci = torch.randint(0, compressed_pages * 128, (rows, INDEX_TOPK), generator=generator, dtype=torch.int32)
