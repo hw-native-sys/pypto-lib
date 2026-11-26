@@ -1997,7 +1997,11 @@ def build_swa_layer_specs(start_pos=None, layer_id=0, num_tokens_per_owner=None)
     ):
         if not isinstance(spec, TensorSpec):
             continue
-        if spec.name in {"x_hc", "x_next"} or spec.name in existing:
+        # Layer hosts build EPLB placeholders themselves; the MoE entry's EPLB
+        # fixture specs belong to the standalone MoE validation.
+        if spec.name in {"x_hc", "x_next", "eplb_mapping", "eplb_replicas", "eplb_load", "eplb_control"}:
+            continue
+        if spec.name in existing:
             continue
         specs.append(spec)
         existing.add(spec.name)
@@ -2121,7 +2125,11 @@ def build_hca_layer_specs(start_pos=None, layer_id=3, num_tokens_per_owner=None)
     ):
         if not isinstance(spec, TensorSpec):
             continue
-        if spec.name in {"x_hc", "x_next"} or spec.name in existing:
+        # Layer hosts build EPLB placeholders themselves; the MoE entry's EPLB
+        # fixture specs belong to the standalone MoE validation.
+        if spec.name in {"x_hc", "x_next", "eplb_mapping", "eplb_replicas", "eplb_load", "eplb_control"}:
+            continue
+        if spec.name in existing:
             continue
         specs.append(spec)
         existing.add(spec.name)
@@ -2245,7 +2253,11 @@ def build_csa_layer_specs(start_pos=None, layer_id=2, num_tokens_per_owner=None)
     ):
         if not isinstance(spec, TensorSpec):
             continue
-        if spec.name in {"x_hc", "x_next"} or spec.name in existing:
+        # Layer hosts build EPLB placeholders themselves; the MoE entry's EPLB
+        # fixture specs belong to the standalone MoE validation.
+        if spec.name in {"x_hc", "x_next", "eplb_mapping", "eplb_replicas", "eplb_load", "eplb_control"}:
+            continue
+        if spec.name in existing:
             continue
         specs.append(spec)
         existing.add(spec.name)
