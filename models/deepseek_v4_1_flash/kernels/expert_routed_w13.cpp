@@ -57,11 +57,19 @@ AICORE inline void copyRouteWeights(__gm__ float* input, __gm__ float* output, i
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
 {
     auto* counts = tensorData<int32_t>(args, 2);
+#ifdef EXPERT_SLOT_MAP
+    const int64_t experts = args[11];
+    const int64_t stride = args[12];
+    const int64_t width = args[13];
+    const int64_t hidden = args[14];
+    const int64_t activationRows = args[15];
+#else
     const int64_t experts = args[10];
     const int64_t stride = args[11];
     const int64_t width = args[12];
     const int64_t hidden = args[13];
     const int64_t activationRows = args[14];
+#endif
     const int64_t block = get_block_idx(args);
     const int64_t blocks = get_block_num(args);
     const int64_t hTiles = hidden / N_TILE;
@@ -81,6 +89,11 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
     int64_t activationBase = 0;
     for (int64_t expert = 0; expert < experts; ++expert) {
         const int64_t count = acquireCount(counts, expert);
+#ifdef EXPERT_SLOT_MAP
+        // Slot scales are independently packed, unlike the resident expert-major view.
+        const int64_t slot = count ? acquireCount(tensorData<int32_t>(args, 10), expert) : 0;
+        const int64_t scaleOffset = slot * (width / 32) * hidden;
+#endif
         const int64_t workCount = ((count + M_TILE - 1) / M_TILE) * 2 * hTiles;
         const int64_t first = (block + blocks - workBase % blocks) % blocks;
         for (int64_t work = first; work < workCount; work += blocks) {
@@ -93,11 +106,23 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
                 copyRouteWeights(tensorData<float>(args, 8) + expert * stride + row,
                                  tensorData<float>(args, 9) + activationBase + row, valid);
             }
+#ifdef EXPERT_SLOT_MAP
+            produceWeight(up ? w3 : w1, width, hidden, slot, col);
+#else
             produceWeight(up ? w3 : w1, width, hidden, expert, col);
 #endif
+#endif
 #ifdef __DAV_CUBE__
+#ifdef EXPERT_SLOT_MAP
+            const Chunk chunk{0, expert * stride + row, valid};
+#else
             const Chunk chunk{expert, expert * stride + row, valid};
+#endif
+#ifdef EXPERT_SLOT_MAP
+            computeProjection<M_TILE>(x, xScale, (up ? s3 : s1) + scaleOffset, width, hidden, 1,
+#else
             computeProjection<M_TILE>(x, xScale, up ? s3 : s1, width, hidden, experts,
+#endif
                                       experts * stride, chunk, col,
                                       StorePair{out, activationRows, 2 * hidden,
                                                 activationBase + row,

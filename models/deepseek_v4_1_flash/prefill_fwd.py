@@ -38,11 +38,13 @@ from pypto.backend import BackendType
 from pypto.runtime import ExecutionMode, RunConfig, StackedDeviceTensor
 import torch
 
+from models.common.expert_cache import expert_cache_shape, initial_expert_cache
+
 import config as C
 
 _shape_parser = argparse.ArgumentParser(add_help=False)
 _shape_parser.add_argument("--checkpoint")
-_shape_parser.add_argument("--ep", type=int, choices=[2, 4, 8])
+_shape_parser.add_argument("--ep", type=int, choices=[1, 2, 4, 8])
 _shape_parser.add_argument("--experts-per-rank", type=int)
 _shape_parser.add_argument("--capacity", type=int, default=128)
 _shape_parser.add_argument("--moe-tokens", type=int, default=1024)
@@ -109,6 +111,8 @@ WINDOW_PAGES = pl.dynamic("PREFILL_WINDOW_PAGES")
 C2A_TABLE_DYN = pl.dynamic("PREFILL_C2A_TABLE")
 C1A_TABLE_DYN = pl.dynamic("PREFILL_C1A_TABLE")
 LOCAL_EXPERTS = C.N_LOCAL_EXPERTS
+RESIDENT_EXPERT_SLOTS = 1
+RESIDENT_CACHE_ROWS, RESIDENT_CACHE_COLS = expert_cache_shape(RESIDENT_EXPERT_SLOTS, M.num_hidden_layers, LOCAL_EXPERTS)
 N_LAYERS = M.num_hidden_layers
 RING_HEAP_BYTES = 4 * 1024**3
 FINAL_SLOT = 2 * CAPACITY
@@ -135,6 +139,9 @@ Q_LORA = M.q_lora_rank
 TOPK = M.num_experts_per_tok
 
 ROPE_DIM = M.qk_rope_head_dim
+
+
+from offload_prefill_moe import prefill_moe_slabs as offload_prefill_moe_slabs
 
 
 @pl.jit.inline(auto_scope=False)
@@ -498,12 +505,12 @@ def l2_prefill_fwd(
     ffn_norm_weight: pl.Tensor[[N_LAYERS * D], pl.BF16],
     gate_weight: pl.Tensor[[N_LAYERS * N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[BIAS_DYN], pl.FP32],
-    routed_w1: pl.Tensor[[N_LAYERS * LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w1_scale: pl.Tensor[[N_LAYERS * (LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
-    routed_w2: pl.Tensor[[N_LAYERS * LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w2_scale: pl.Tensor[[N_LAYERS * (LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), D], pl.FP8E8M0],
-    routed_w3: pl.Tensor[[N_LAYERS * LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w3_scale: pl.Tensor[[N_LAYERS * (LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
+    routed_w1: pl.InOut[pl.Tensor],
+    routed_w1_scale: pl.InOut[pl.Tensor],
+    routed_w2: pl.InOut[pl.Tensor],
+    routed_w2_scale: pl.InOut[pl.Tensor],
+    routed_w3: pl.InOut[pl.Tensor],
+    routed_w3_scale: pl.InOut[pl.Tensor],
     shared_w1: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
     shared_w2: pl.Tensor[[N_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
@@ -561,6 +568,10 @@ def l2_prefill_fwd(
     head_logits: pld.DistributedTensor[[16, VOCAB], pl.BF16],
     head_logits_done: pld.DistributedTensor[[C.LM_HEAD_TP_SIZE, 1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
+    expert_state: pl.InOut[pl.Tensor],
+    expert_descriptors: pl.Tensor,
+    expert_slots: pl.constexpr,
+    offload: pl.constexpr,
 ):
     """Run both CED stages and retire communication signals after the decoder."""
     correction_bias.bind_dynamic(0, BIAS_DYN)
@@ -752,12 +763,6 @@ def l2_prefill_fwd(
         local_bias_rows = pl.min(bias_rows, LOCAL_CAPACITY)
         layer_gate_bias = pl.create_tensor([local_bias_rows * N_EXPERTS], dtype=pl.FP32)
         gather_routing_bias(stage_gate_bias, q_rows[stage], layer_gate_bias, moe_ready, n_experts=N_EXPERTS)
-        layer_routed_w1: pl.Tensor[[LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w1, [LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
-        layer_routed_w1_scale: pl.Tensor[[LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w1_scale, [LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [layer * (LOCAL_EXPERTS * (D // MX_GROUP)), 0])
-        layer_routed_w2: pl.Tensor[[LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w2, [LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
-        layer_routed_w2_scale: pl.Tensor[[LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w2_scale, [LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], [layer * (LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), 0])
-        layer_routed_w3: pl.Tensor[[LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w3, [LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
-        layer_routed_w3_scale: pl.Tensor[[LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w3_scale, [LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [layer * (LOCAL_EXPERTS * (D // MX_GROUP)), 0])
         if layer == 20:
             with pl.scope():
                 # Publish C1A source KV for ALL encoder rows before selecting replay.
@@ -846,15 +851,39 @@ def l2_prefill_fwd(
                     normalized, attn_hidden, attn_pre, local_active,
                     rank // CP_SIZE * CP_SIZE, rank % CP_SIZE, active, layer + 1, mode,
                 )
-        moe_ready = prefill_moe_slabs(
-            attn_hidden, attn_pre, layer_ffn_fn, layer_ffn_scale, layer_ffn_base, layer_ffn_norm, layer_gate_weight, layer_gate_bias,
-            layer_routed_w1, layer_routed_w1_scale, layer_routed_w2, layer_routed_w2_scale, layer_routed_w3, layer_routed_w3_scale,
-            layer_shared_w1, layer_shared_w1_scale, layer_shared_w2, layer_shared_w2_scale,
-            layer_shared_w3, layer_shared_w3_scale, local_next_pre, ffn_mixed, local_next_hidden,
-            recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
-            routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, slab_rows,
-            moe_ready, pl.read(q_counts, [stage]), rank, layer + 1, capacity=LOCAL_CAPACITY,
-        )
+        if offload:
+            layer_routed_w1: pl.Tensor[[expert_slots, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w1, [expert_slots, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], [0, 0, 0])
+            layer_routed_w1_scale: pl.Tensor[[expert_slots * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.ND] = pl.slice(routed_w1_scale, [expert_slots * (D // MX_GROUP), MOE_INTER], [0, 0])
+            layer_routed_w2: pl.Tensor[[expert_slots, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w2, [expert_slots, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], [0, 0, 0])
+            layer_routed_w2_scale: pl.Tensor[[expert_slots * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.ND] = pl.slice(routed_w2_scale, [expert_slots * (MOE_INTER // MX_GROUP), D], [0, 0])
+            layer_routed_w3: pl.Tensor[[expert_slots, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w3, [expert_slots, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], [0, 0, 0])
+            layer_routed_w3_scale: pl.Tensor[[expert_slots * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.ND] = pl.slice(routed_w3_scale, [expert_slots * (D // MX_GROUP), MOE_INTER], [0, 0])
+            moe_ready = offload_prefill_moe_slabs(
+                attn_hidden, attn_pre, layer_ffn_fn, layer_ffn_scale, layer_ffn_base, layer_ffn_norm, layer_gate_weight, layer_gate_bias,
+                layer_routed_w1, layer_routed_w1_scale, layer_routed_w2, layer_routed_w2_scale, layer_routed_w3, layer_routed_w3_scale,
+                layer_shared_w1, layer_shared_w1_scale, layer_shared_w2, layer_shared_w2_scale,
+                layer_shared_w3, layer_shared_w3_scale, local_next_pre, ffn_mixed, local_next_hidden,
+                recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
+                routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, slab_rows,
+                moe_ready, pl.read(q_counts, [stage]), rank, layer + 1, capacity=LOCAL_CAPACITY,
+                expert_state=expert_state, expert_descriptors=expert_descriptors, expert_layer=layer,
+            )
+        else:
+            layer_routed_w1: pl.Tensor[[LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w1, [LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
+            layer_routed_w1_scale: pl.Tensor[[LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w1_scale, [LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [layer * (LOCAL_EXPERTS * (D // MX_GROUP)), 0])
+            layer_routed_w2: pl.Tensor[[LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w2, [LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
+            layer_routed_w2_scale: pl.Tensor[[LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w2_scale, [LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], [layer * (LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), 0])
+            layer_routed_w3: pl.Tensor[[LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w3, [LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
+            layer_routed_w3_scale: pl.Tensor[[LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w3_scale, [LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [layer * (LOCAL_EXPERTS * (D // MX_GROUP)), 0])
+            moe_ready = prefill_moe_slabs(
+                attn_hidden, attn_pre, layer_ffn_fn, layer_ffn_scale, layer_ffn_base, layer_ffn_norm, layer_gate_weight, layer_gate_bias,
+                layer_routed_w1, layer_routed_w1_scale, layer_routed_w2, layer_routed_w2_scale, layer_routed_w3, layer_routed_w3_scale,
+                layer_shared_w1, layer_shared_w1_scale, layer_shared_w2, layer_shared_w2_scale,
+                layer_shared_w3, layer_shared_w3_scale, local_next_pre, ffn_mixed, local_next_hidden,
+                recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
+                routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, slab_rows,
+                moe_ready, pl.read(q_counts, [stage]), rank, layer + 1, capacity=LOCAL_CAPACITY,
+            )
         if CP_SIZE > 1:
             moe_ready = prefill_cp_gather_hc(
                 local_next_hidden, local_next_pre, restore_indices[stage], next_hidden, next_pre,
@@ -966,12 +995,12 @@ def l3_prefill_fwd(
     ffn_norm_weight: pl.Tensor[[RANKS, N_LAYERS * D], pl.BF16],
     gate_weight: pl.Tensor[[RANKS, N_LAYERS * N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[RANKS, BIAS_DYN], pl.FP32],
-    routed_w1: pl.Tensor[[RANKS, N_LAYERS * LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w1_scale: pl.Tensor[[RANKS, N_LAYERS * (LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
-    routed_w2: pl.Tensor[[RANKS, N_LAYERS * LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w2_scale: pl.Tensor[[RANKS, N_LAYERS * (LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), D], pl.FP8E8M0],
-    routed_w3: pl.Tensor[[RANKS, N_LAYERS * LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w3_scale: pl.Tensor[[RANKS, N_LAYERS * (LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
+    routed_w1: pl.InOut[pl.Tensor[[RANKS, N_LAYERS * LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8]],
+    routed_w1_scale: pl.InOut[pl.Tensor[[RANKS, N_LAYERS * (LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0]],
+    routed_w2: pl.InOut[pl.Tensor[[RANKS, N_LAYERS * LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8]],
+    routed_w2_scale: pl.InOut[pl.Tensor[[RANKS, N_LAYERS * (LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), D], pl.FP8E8M0]],
+    routed_w3: pl.InOut[pl.Tensor[[RANKS, N_LAYERS * LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8]],
+    routed_w3_scale: pl.InOut[pl.Tensor[[RANKS, N_LAYERS * (LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0]],
     shared_w1: pl.Tensor[[RANKS, N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[RANKS, N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
     shared_w2: pl.Tensor[[RANKS, N_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
@@ -1011,6 +1040,8 @@ def l3_prefill_fwd(
     dspark_target_hidden: pl.Out[pl.Tensor[[RANKS, CAPACITY, DSPARK_MAIN_IN], pl.BF16]],
     logits: pl.Out[pl.Tensor[[RANKS, 16, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[RANKS, 16, 8], pl.INT32]],
+    expert_state: pl.InOut[pl.Tensor[[RANKS, RESIDENT_CACHE_ROWS, RESIDENT_CACHE_COLS], pl.INT32]],
+    expert_descriptors: pl.Tensor[[RANKS, N_LAYERS, 6, 4], pl.INT64],
 ):
     """Append one chunk with EP = DP * CP and return global state/logits.
 
@@ -1177,7 +1208,8 @@ def l3_prefill_fwd(
             head_hidden, head_hidden_done,
             head_logits,
             head_logits_done,
-            rank, device=rank,
+            rank, expert_state=expert_state[rank], expert_descriptors=expert_descriptors[rank],
+            expert_slots=RESIDENT_EXPERT_SLOTS, offload=False, device=rank,
         )
 
 
@@ -1226,6 +1258,7 @@ PREFILL_TENSORS = (
     "x_hc_out", "pre_mix_out", "dspark_target_hidden",
     "logits",
     "sampled_ids",
+    "expert_state", "expert_descriptors",
 )
 
 
@@ -1981,13 +2014,17 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
         "logits": ((16, VOCAB), torch.float32),
         "sampled_ids": ((16, 8), torch.int32),
     }
+    outputs.update({
+        "expert_state": ((RESIDENT_CACHE_ROWS, RESIDENT_CACHE_COLS), torch.int32),
+        "expert_descriptors": ((N_LAYERS, 6, 4), torch.int64),
+    })
     constants = set(weights.tensor_layouts)
     cache_names = {
         "window_cache", "compressed_cache",
         "index_cache", "index_scales", "state_cache",
     }
     constants.update(cache_names)
-    constants.update(("freqs_cos", "freqs_sin"))
+    constants.update(("freqs_cos", "freqs_sin", "expert_state", "expert_descriptors"))
     generated = [[] for _ in prompts]
     finished = [False] * RANKS
     image_rows_seen = [0] * RANKS
@@ -2242,7 +2279,13 @@ def build_tensor_specs(args=None):
         rank_values.extend([values] * CP_SIZE)
     specs = []
     for name in PREFILL_TENSORS:
-        if name in weight_layouts:
+        if name == "expert_state":
+            value = initial_expert_cache(RESIDENT_EXPERT_SLOTS, N_LAYERS, LOCAL_EXPERTS).repeat(RANKS, 1, 1)
+            shape, dtype = list(value.shape), value.dtype
+        elif name == "expert_descriptors":
+            shape, dtype = [RANKS, N_LAYERS, 6, 4], torch.int64
+            value = torch.zeros(shape, dtype=dtype)
+        elif name in weight_layouts:
             rank_shape, dtype = weight_layouts[name]
             shape = [RANKS, *rank_shape]
             value = 1.0 if dtype == torch.float8_e8m0fnu or name == "final_norm_weight" else 0.0

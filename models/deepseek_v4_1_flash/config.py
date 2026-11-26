@@ -285,7 +285,7 @@ INDEX_POOL_POSITIONS_DYN = pl.dynamic("INDEX_POOL_POSITIONS_DYN")
 # Parallel configuration
 SUPPORTED_LM_HEAD_TP_SIZES = (1, 2, 4, 8)
 SUPPORTED_CP_SIZES = (1, 2, 4, 8)
-SUPPORTED_EP_SIZES = (2, 4, 8)
+SUPPORTED_EP_SIZES = (1, 2, 4, 8)
 
 
 def _parse_parallel_size(name: str, default: int, choices: Tuple[int, ...]) -> int:

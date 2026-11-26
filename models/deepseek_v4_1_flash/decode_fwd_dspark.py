@@ -331,6 +331,8 @@ def l2_decode_fwd_dspark(
     sampling_logits_window: pld.DistributedTensor[[TARGET_FWD_MAX_LOGIT_ROWS, TARGET_FWD_VOCAB], pl.BF16],
     sampling_logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
+    expert_state: pl.InOut[pl.Tensor[[target_fwd.RESIDENT_CACHE_ROWS, target_fwd.RESIDENT_CACHE_COLS], pl.INT32]],
+    expert_descriptors: pl.Tensor[[target_fwd.N_LAYERS, 6, 4], pl.INT64],
 ):
     """Verify one rank's draft block and publish its next proposals."""
     local_x_hc = pl.create_tensor([PADDED_ROWS, HC_MULT, D], dtype=pl.FP32)
@@ -395,6 +397,8 @@ def l2_decode_fwd_dspark(
         wq_a_scale, wq_b_scale, wkv_scale, wo_b_scale,
         index_wq_b_scale, routed_w1_scale, routed_w2_scale, routed_w3_scale,
         shared_w1_scale, shared_w2_scale, shared_w3_scale,
+        expert_state=expert_state, expert_descriptors=expert_descriptors,
+        expert_slots=target_fwd.RESIDENT_EXPERT_SLOTS, offload=False,
     )
     decode_publish(
         local_x_hc, local_pre_mix, local_target_hidden_padded,
@@ -649,6 +653,8 @@ def l3_decode_fwd_dspark(
     confidences: pl.Out[pl.Tensor[[EP_SIZE, MARKOV_B_DYN, MARKOV_DSPARK_QUERY_WIDTH], pl.FP32]],
     logits_epoch: pl.Scalar[pl.INT32],
     committed: pl.Out[pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32]],
+    expert_state: pl.InOut[pl.Tensor[[EP_SIZE, target_fwd.RESIDENT_CACHE_ROWS, target_fwd.RESIDENT_CACHE_COLS], pl.INT32]],
+    expert_descriptors: pl.Tensor[[EP_SIZE, target_fwd.N_LAYERS, 6, 4], pl.INT64],
 ):
     """Run one complete recurrent DSpark L2 per rank."""
     target_embedding_weight.bind_dynamic(1, VOCAB_DYN)
@@ -766,6 +772,7 @@ def l3_decode_fwd_dspark(
             draft_data_arrived, draft_routed_output, draft_combine_arrived, markov_hidden_window,
             markov_hidden_done, markov_logits_window, markov_logits_done, sampling_hidden_window,
             sampling_hidden_done, sampling_logits_window, sampling_logits_done, rank,
+            expert_state[rank], expert_descriptors[rank],
             device=rank,
         )
 

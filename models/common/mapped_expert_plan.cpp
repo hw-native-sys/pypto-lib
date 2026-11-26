@@ -54,12 +54,33 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     const int32_t layer = args[4], first = args[5], stop = args[6];
     sync_cache();
     const int32_t capacity = state[0];
+#if defined(MAPPED_EXPERT_PLAN_TOP6)
+    const int32_t experts = slot_tensor->shapes[0];
+    int32_t requested[6];
+    for (int32_t i = first; i < stop; ++i) requested[i - first] = counts[i];
+    // Keep the counts planner's expert order, including its LRU tie behavior.
+    for (int32_t i = 1; i < stop - first; ++i) {
+        const int32_t value = requested[i];
+        int32_t j = i;
+        while (j > 0 && requested[j - 1] > value) {
+            requested[j] = requested[j - 1];
+            --j;
+        }
+        requested[j] = value;
+    }
+#else
     const int32_t experts = counts_tensor->shapes[0];
+#endif
     auto *directory = state + 6 * (capacity + 1);
     // Protect every resident demand before selecting any miss victim.
     for (int32_t position = first; position < stop; ++position) {
+#if defined(MAPPED_EXPERT_PLAN_TOP6)
+        const int32_t e = requested[position - first];
+        const int32_t slot = directory[layer * experts + e];
+#else
         const int32_t e = position;
         const int32_t slot = counts[e] > 0 ? directory[layer * experts + e] : -1;
+#endif
         slot_map[e] = slot;
         misses[e] = -1;
         if (slot >= 0) {
@@ -68,8 +89,13 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         }
     }
     for (int32_t position = first; position < stop; ++position) {
+#if defined(MAPPED_EXPERT_PLAN_TOP6)
+        const int32_t e = requested[position - first];
+        if (slot_map[e] >= 0) continue;
+#else
         const int32_t e = position;
         if (counts[e] <= 0 || slot_map[e] >= 0) continue;
+#endif
         const int32_t row = state[3], slot = row - 1;
         const int32_t owner_layer = state[6 * row], owner = state[6 * row + 1];
         if (owner_layer >= 0) directory[owner_layer * experts + owner] = -1;

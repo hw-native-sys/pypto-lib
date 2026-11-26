@@ -93,7 +93,7 @@ the results back into the local HC state.
 | --- | --- |
 | Attention weights | Full weights on every rank; no attention TP |
 | Prefill CP | `--cp 1/2/4/8`; CP1 uses local attention, CP>1 uses head-tail query placement and KV publication across peers |
-| MoE EP | `--ep 2/4/8`; EP1 is unsupported |
+| MoE EP | Resident forwards use `--ep 2/4/8`; mapped expert forwards also support EP1 |
 | Prefill DP | `DP_SIZE = EP_SIZE // CP_SIZE`; CP must divide EP |
 | Decode attention | CP1. Each rank owns its requests, KV caches, and compressor state |
 | Decode MoE | Dispatch across the EP group and return results to the originating rank |
@@ -102,7 +102,8 @@ the results back into the local HC state.
 For prefill, at CP1, each DP group may pack multiple independent requests. At CP>1, each DP
 group supports one request. Different DP groups own independent requests and
 cache state. The standalone attention entries can run CP1 on a single device;
-layer and forward entries also compose EP MoE and require multiple devices.
+resident layer and forward entries also compose EP MoE and require multiple devices.
+The mapped expert path can execute the complete forward on one device.
 
 For a sequence divided into `2 * CP` contiguous segments, CP rank `r` owns
 segments `r` and `2 * CP - 1 - r`. Thus CP2 assigns segments `(0, 3)` to rank 0
@@ -125,8 +126,30 @@ shards, and return results to the row owners.
 | Decode attention | Corresponding `decode_swa.py`, `decode_c1a_*` and `decode_c2a_*` files |
 | Layer composition | [`prefill_layer.py`](../../../models/deepseek_v4_1_flash/prefill_layer.py), [`decode_layer.py`](../../../models/deepseek_v4_1_flash/decode_layer.py) |
 | Text forward | [`prefill_fwd.py`](../../../models/deepseek_v4_1_flash/prefill_fwd.py), [`decode_fwd.py`](../../../models/deepseek_v4_1_flash/decode_fwd.py) |
+| Mapped expert forward | [`offload_prefill_fwd.py`](../../../models/deepseek_v4_1_flash/offload_prefill_fwd.py), [`decode_generate.py`](../../../models/deepseek_v4_1_flash/decode_generate.py) |
 | Speculative decoding | [`decode_fwd_dspark.py`](../../../models/deepseek_v4_1_flash/decode_fwd_dspark.py), `dspark_drafter.py`, `dspark_init.py`, `decode_metadata.py`, `dspark_attn.py`, and `markov.py` |
 | Shared operators | `hc.py`, `qkv_proj_rope.py`, `compressor.py`, `sparse_attention.py`, `o_proj.py`, `engram.py`, `lm_head.py`, and `sample.py` |
+
+The shared forward implementations require explicit `expert_state`,
+`expert_descriptors`, `expert_slots`, and `offload` arguments. `expert_slots` and
+`offload` are compile-time values. Resident entries bind valid, shape-correct
+placeholder tensors with one slot and select `offload=False`; these buffers are
+not accessed by the resident computation. Serving owns them for the worker's
+lifetime. Mapped entries bind the actual cache banks, state, and host-memory
+descriptors and select `offload=True`. The shared prefill weight parameters use
+`InOut` consistently at both entry levels because the mapped path fills those
+banks; the resident branch only reads them.
+
+Mapped prefill requires enough cache slots for every local expert in one layer.
+The mapped generation entry includes the output head and sampling after the
+shared decode backbone; it currently supports non-speculative generation.
+
+Full-model validation has unresolved baseline errors and repeat-generation
+discrepancies. The same incorrect short answer occurs in both resident EP4 and
+mapped EP4 generation; other differences remain unclassified. These observations
+do not establish a mapped-expert regression. Passing the mapped planner/copy and
+routed-expert numerical checks does not by itself establish checkpoint-level
+generation accuracy.
 
 The six standalone decode attention entries accept explicit request starts and
 query lengths through `--start-pos` and `--query-lens`. Both lists have one
