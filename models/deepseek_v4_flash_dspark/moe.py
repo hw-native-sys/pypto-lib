@@ -1820,6 +1820,8 @@ def prefill_moe_local(
             _hc_pre_prefill(attn_out_local, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, x_mixed_step, post_ffn_step, comb_ffn_step)
 
     local_rows = pl.tensor.dim(ffn_out_local, 0)
+    # Real rows in this rank's slice of the CP group; the tail is padding.
+    local_valid = pl.min(local_rows, pl.max(group_tokens - local_base, 0))
     # Every EP rank participates in every physical wave, including empty groups.
     num_waves = (local_rows + PREFILL_MOE_T_TILE - 1) // PREFILL_MOE_T_TILE
     num_waves_i32 = pl.cast(num_waves, pl.INT32)
@@ -1901,11 +1903,18 @@ def prefill_moe_local(
             output_tids = pl.array.create(1, pl.TASK_ID)
             output_tids[0] = completion_tid
             if wave_rows < PREFILL_MOE_T_TILE:
+                local_wave_rows = pl.min(PREFILL_MOE_T_TILE, local_rows - local_wave_base)
                 with pl.spmd(PREFILL_MOE_T_TILE, name_hint="prefill_moe_output_store_tail", deps=[completion_tid]) as output_store_tail_tid:
                     token = pl.tile.get_block_idx()
-                    if token < wave_rows:
+                    if token < local_wave_rows:
                         local_token = local_wave_base + token
-                        ffn_out_step[local_token : local_token + 1, :] = ffn_wave[token : token + 1, :]
+                        if token < wave_rows:
+                            ffn_out_step[local_token : local_token + 1, :] = ffn_wave[token : token + 1, :]
+                        else:
+                            # Rows the routing clamp dropped still owe the HC
+                            # pass and the full-group gather a defined value.
+                            ffn_out_zero = pl.full([1, D], dtype=pl.BF16, value=0.0)
+                            ffn_out_step[local_token : local_token + 1, :] = ffn_out_zero
                 output_tids[0] = output_store_tail_tid
             output_store_tid = pl.system.task_dummy(deps=[output_tids])
             # Publish one globally complete wave before the windows are reused.
@@ -1944,7 +1953,10 @@ def prefill_moe_local(
 
     with pl.scope():
         if group_tokens > 0:
-            hc_post(ffn_out_local, attn_out_local, post_ffn_local, comb_ffn_local, x_hc_local, pl.const(-1, pl.INT32), T_TILE=16)
+            # Only this rank's real rows are read; the padded tail is zeroed
+            # without touching attention, HC-pre, or FFN padding rows.
+            hc_post(ffn_out_local, attn_out_local, post_ffn_local, comb_ffn_local, x_hc_local,
+                    pl.cast(local_valid, pl.INT32), T_TILE=16)
     return x_hc_local
 
 

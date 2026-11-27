@@ -1213,7 +1213,9 @@ def prefill_fwd(
                 _ffn_full_tid = prefill_cp_token_allgather_into(
                     ffn_out, ffn_full, gather_window, gather_signal, group_base, tp_rank, coeffs_full_tid,
                 )
-                hc_post(ffn_full, attn_stage, post_ffn, comb_ffn, x_hc, pl.const(-1, pl.INT32), T_TILE=16)
+                # Real group rows only; the CP-padded tail of the public output
+                # is zeroed without reading gathered padding rows.
+                hc_post(ffn_full, attn_stage, post_ffn, comb_ffn, x_hc, group_tokens, T_TILE=16)
 
     # All head-group ranks participate, including ranks with no attention tokens.
     layer42_hidden = pl.create_tensor([group_rows, D], dtype=pl.BF16)
