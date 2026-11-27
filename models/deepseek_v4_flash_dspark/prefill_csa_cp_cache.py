@@ -51,47 +51,49 @@ def csa_compact_eligible(
     total = pl.tensor.dim(pos, 0)
     pages = total // BLOCK_SIZE
     flags = pl.create_tensor([pages, 16], dtype=pl.INT32)
-    with pl.spmd(pages, name_hint="csa_cp_validate_pages") as checks_tid:
-        page = pl.tile.get_block_idx()
-        first_position = pl.read(pos, [0])
-        begin = page * BLOCK_SIZE
-        first = pl.read(raw_map, [begin])
-        ok = pl.cast(1, pl.INT32)
-        if first < 0 or first % BLOCK_SIZE != 0:
-            ok = pl.cast(0, pl.INT32)
-        for prev in pl.range(page):
-            if pl.read(raw_map, [prev * BLOCK_SIZE]) == first:
+    page_workers = pl.min(pages, pl.system.available_aiv_count())
+    with pl.spmd(page_workers, name_hint="csa_cp_validate_pages") as checks_tid:
+        worker = pl.tile.get_block_idx()
+        for page in pl.range(worker, pages, pl.tile.get_block_num()):
+            first_position = pl.read(pos, [0])
+            begin = page * BLOCK_SIZE
+            first = pl.read(raw_map, [begin])
+            ok = pl.cast(1, pl.INT32)
+            if first < 0 or first % BLOCK_SIZE != 0:
                 ok = pl.cast(0, pl.INT32)
-        cmp_origin = (begin // (C4 * BLOCK_SIZE)) * C4 * BLOCK_SIZE
-        first_cmp = pl.read(cmp_map, [cmp_origin + C4 - 1])
-        first_idx = pl.read(index_map, [cmp_origin + C4 - 1])
-        if first_cmp < 0 or first_idx < 0 or first_cmp % BLOCK_SIZE != 0 or first_idx % BLOCK_SIZE != 0:
-            ok = pl.cast(0, pl.INT32)
-        if begin == cmp_origin:
-            for earlier in pl.range(0, cmp_origin, C4 * BLOCK_SIZE):
-                if pl.read(cmp_map, [earlier + C4 - 1]) == first_cmp or pl.read(index_map, [earlier + C4 - 1]) == first_idx:
+            for prev in pl.range(page):
+                if pl.read(raw_map, [prev * BLOCK_SIZE]) == first:
                     ok = pl.cast(0, pl.INT32)
-        for j in pl.range(BLOCK_SIZE):
-            t = begin + j
-            if pl.read(pos, [t]) != first_position + t or pl.read(raw_map, [t]) != first + j:
+            cmp_origin = (begin // (C4 * BLOCK_SIZE)) * C4 * BLOCK_SIZE
+            first_cmp = pl.read(cmp_map, [cmp_origin + C4 - 1])
+            first_idx = pl.read(index_map, [cmp_origin + C4 - 1])
+            if first_cmp < 0 or first_idx < 0 or first_cmp % BLOCK_SIZE != 0 or first_idx % BLOCK_SIZE != 0:
                 ok = pl.cast(0, pl.INT32)
-            if pl.read(state_map, [t]) < 0 or pl.read(index_state_map, [t]) < 0:
-                ok = pl.cast(0, pl.INT32)
-            tail = t % PREFILL_STATE_TILE - (PREFILL_STATE_TILE - HALO)
-            if tail > 0:
-                for earlier in pl.range(t - tail, t):
-                    if pl.read(state_map, [earlier]) == pl.read(state_map, [t]) or pl.read(index_state_map, [earlier]) == pl.read(index_state_map, [t]):
+            if begin == cmp_origin:
+                for earlier in pl.range(0, cmp_origin, C4 * BLOCK_SIZE):
+                    if pl.read(cmp_map, [earlier + C4 - 1]) == first_cmp or pl.read(index_map, [earlier + C4 - 1]) == first_idx:
                         ok = pl.cast(0, pl.INT32)
-            c = pl.read(cmp_map, [t])
-            i = pl.read(index_map, [t])
-            if t % C4 == C4 - 1:
-                offset = (t - cmp_origin) // C4
-                if c != first_cmp + offset or i != first_idx + offset:
+            for j in pl.range(BLOCK_SIZE):
+                t = begin + j
+                if pl.read(pos, [t]) != first_position + t or pl.read(raw_map, [t]) != first + j:
                     ok = pl.cast(0, pl.INT32)
-            else:
-                if c >= 0 or i >= 0:
+                if pl.read(state_map, [t]) < 0 or pl.read(index_state_map, [t]) < 0:
                     ok = pl.cast(0, pl.INT32)
-        pl.write(flags, [page, 0], ok)
+                tail = t % PREFILL_STATE_TILE - (PREFILL_STATE_TILE - HALO)
+                if tail > 0:
+                    for earlier in pl.range(t - tail, t):
+                        if pl.read(state_map, [earlier]) == pl.read(state_map, [t]) or pl.read(index_state_map, [earlier]) == pl.read(index_state_map, [t]):
+                            ok = pl.cast(0, pl.INT32)
+                c = pl.read(cmp_map, [t])
+                i = pl.read(index_map, [t])
+                if t % C4 == C4 - 1:
+                    offset = (t - cmp_origin) // C4
+                    if c != first_cmp + offset or i != first_idx + offset:
+                        ok = pl.cast(0, pl.INT32)
+                else:
+                    if c >= 0 or i >= 0:
+                        ok = pl.cast(0, pl.INT32)
+            pl.write(flags, [page, 0], ok)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_cp_check_plan", deps=[checks_tid]):
         accepted = pl.cast(1, pl.INT32)
         first_position = pl.read(pos, [0])

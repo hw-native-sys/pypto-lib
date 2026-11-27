@@ -33,59 +33,61 @@ def hca_owner_eligible(
     total = pl.tensor.dim(positions, 0)
     pages = total // BLOCK_SIZE
     flags = pl.create_tensor([pages, 16], dtype=pl.INT32)
-    with pl.spmd(pages, name_hint="hca_cp_owner_pages") as pages_tid:
-        page = pl.tile.get_block_idx()
-        begin = page * BLOCK_SIZE
-        ok = pl.cast(1, pl.INT32)
-        first_position = pl.read(positions, [0])
-        if first_position < 0 or first_position % COMPRESS_RATIO != 0:
-            ok = pl.cast(0, pl.INT32)
-        raw_page = pl.read(raw_slots, [begin])
-        if raw_page < 0 or raw_page % BLOCK_SIZE != 0:
-            ok = pl.cast(0, pl.INT32)
-        for prev in pl.range(page):
-            if pl.read(raw_slots, [prev * BLOCK_SIZE]) == raw_page:
+    page_workers = pl.min(pages, pl.system.available_aiv_count())
+    with pl.spmd(page_workers, name_hint="hca_cp_owner_pages") as pages_tid:
+        worker = pl.tile.get_block_idx()
+        for page in pl.range(worker, pages, pl.tile.get_block_num()):
+            begin = page * BLOCK_SIZE
+            ok = pl.cast(1, pl.INT32)
+            first_position = pl.read(positions, [0])
+            if first_position < 0 or first_position % COMPRESS_RATIO != 0:
                 ok = pl.cast(0, pl.INT32)
-        for offset in pl.range(BLOCK_SIZE):
-            row = begin + offset
-            if pl.read(positions, [row]) != first_position + row or pl.read(raw_slots, [row]) != raw_page + offset:
+            raw_page = pl.read(raw_slots, [begin])
+            if raw_page < 0 or raw_page % BLOCK_SIZE != 0:
                 ok = pl.cast(0, pl.INT32)
-            last = total - 1 - (total - 1 - row) % STATE_STORAGE_LEN
-            state = pl.read(state_slots, [row])
-            if state < 0 or state != pl.read(state_slots, [last]):
-                ok = pl.cast(0, pl.INT32)
-            if row >= total - STATE_STORAGE_LEN:
-                first = row - row % HCA_STATE_BLOCK_SIZE
-                start = pl.read(state_slots, [first])
-                if start % HCA_STATE_BLOCK_SIZE != 0 or state != start + row % HCA_STATE_BLOCK_SIZE:
+            for prev in pl.range(page):
+                if pl.read(raw_slots, [prev * BLOCK_SIZE]) == raw_page:
                     ok = pl.cast(0, pl.INT32)
-                if row == first:
-                    for earlier in pl.range(total - STATE_STORAGE_LEN, row, HCA_STATE_BLOCK_SIZE):
-                        if pl.read(state_slots, [earlier]) == start:
-                            ok = pl.cast(0, pl.INT32)
-            cmp = pl.read(cmp_slots, [row])
-            if row % COMPRESS_RATIO == COMPRESS_RATIO - 1:
-                if cmp < 0:
+            for offset in pl.range(BLOCK_SIZE):
+                row = begin + offset
+                if pl.read(positions, [row]) != first_position + row or pl.read(raw_slots, [row]) != raw_page + offset:
                     ok = pl.cast(0, pl.INT32)
-                for prior in pl.range(COMPRESS_RATIO - 1, row, COMPRESS_RATIO):
-                    if pl.read(cmp_slots, [prior]) == cmp:
+                last = total - 1 - (total - 1 - row) % STATE_STORAGE_LEN
+                state = pl.read(state_slots, [row])
+                if state < 0 or state != pl.read(state_slots, [last]):
+                    ok = pl.cast(0, pl.INT32)
+                if row >= total - STATE_STORAGE_LEN:
+                    first = row - row % HCA_STATE_BLOCK_SIZE
+                    start = pl.read(state_slots, [first])
+                    if start % HCA_STATE_BLOCK_SIZE != 0 or state != start + row % HCA_STATE_BLOCK_SIZE:
                         ok = pl.cast(0, pl.INT32)
-            else:
-                if cmp >= 0:
-                    ok = pl.cast(0, pl.INT32)
-        pl.write(flags, [page, 0], ok)
+                    if row == first:
+                        for earlier in pl.range(total - STATE_STORAGE_LEN, row, HCA_STATE_BLOCK_SIZE):
+                            if pl.read(state_slots, [earlier]) == start:
+                                ok = pl.cast(0, pl.INT32)
+                cmp = pl.read(cmp_slots, [row])
+                if row % COMPRESS_RATIO == COMPRESS_RATIO - 1:
+                    if cmp < 0:
+                        ok = pl.cast(0, pl.INT32)
+                    for prior in pl.range(COMPRESS_RATIO - 1, row, COMPRESS_RATIO):
+                        if pl.read(cmp_slots, [prior]) == cmp:
+                            ok = pl.cast(0, pl.INT32)
+                else:
+                    if cmp >= 0:
+                        ok = pl.cast(0, pl.INT32)
+            pl.write(flags, [page, 0], ok)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_cp_owner_plan", deps=[pages_tid]):
-        ok = pl.cast(1, pl.INT32)
+        plan_ok = pl.cast(1, pl.INT32)
         if pl.read(starts, [0]) != 0 or pl.read(starts, [1]) != total:
-            ok = pl.cast(0, pl.INT32)
+            plan_ok = pl.cast(0, pl.INT32)
         for tile in pl.range(total // PREFILL_STATE_TILE):
             for checkpoint in pl.range(CHECKPOINTS_PER_TILE):
                 if pl.read(checkpoints, [0, tile, checkpoint]) != 0:
-                    ok = pl.cast(0, pl.INT32)
+                    plan_ok = pl.cast(0, pl.INT32)
         for page in pl.range(pages):
             if pl.read(flags, [page, 0]) == 0:
-                ok = pl.cast(0, pl.INT32)
-        pl.write(decision, [0], ok)
+                plan_ok = pl.cast(0, pl.INT32)
+        pl.write(decision, [0], plan_ok)
 
 
 @pl.jit.inline(auto_scope=False)

@@ -1460,32 +1460,33 @@ def prefill_moe_combine_y_put(
     my_rank: pl.Scalar[pl.INT32],
 ):
     """Return one expert group's disjoint compact row intervals to their source ranks."""
-    transfer_block = pl.tile.get_block_idx()
-    dest = transfer_block // PREFILL_REVERSE_EXPERT_TILE
-    local_e = expert_group * PREFILL_REVERSE_EXPERT_TILE + transfer_block % PREFILL_REVERSE_EXPERT_TILE
-    destination_rows = pl.cast(pl.read(reverse_send_counts, [dest, 0]), pl.INDEX)
-    destination_rows = pl.min(PREFILL_MOE_PEER_CAP, pl.max(destination_rows, 0))
+    worker = pl.tile.get_block_idx()
     dst_base = pl.cast(my_rank, pl.INDEX) * PREFILL_MOE_PEER_CAP
-    send_prefix = pl.cast(0, pl.INDEX)
-    expert_base = pl.cast(0, pl.INDEX)
-    for prior_e in pl.range(local_e):
-        send_prefix = send_prefix + pl.cast(pl.read(recv_expert_counts, [dest, prior_e]), pl.INDEX)
-        expert_rows = pl.cast(pl.read(expert_counts, [prior_e, 0]), pl.INDEX)
-        expert_tiles = (expert_rows + PREFILL_MOE_GROUPED_EXPERT_TILE - 1) // PREFILL_MOE_GROUPED_EXPERT_TILE
-        expert_base = expert_base + expert_tiles * PREFILL_MOE_GROUPED_EXPERT_TILE
-    source_prefix = pl.cast(0, pl.INDEX)
-    for prior_src in pl.range(dest):
-        source_prefix = source_prefix + pl.cast(pl.read(recv_expert_counts, [prior_src, local_e]), pl.INDEX)
-    n_rows = pl.cast(pl.read(recv_expert_counts, [dest, local_e]), pl.INDEX)
-    n_rows = pl.min(n_rows, pl.max(destination_rows - send_prefix, 0))
-    input_base = expert_base + source_prefix
-    output_base = dst_base + send_prefix
-    if n_rows > 0:
-        pld.tensor.put(
-            dst=reverse_target, peer=dest, src=expert_y,
-            dst_offsets=[output_base, 0], src_offsets=[input_base, 0], shape=[n_rows, D],
-            chunk_rows=PREFILL_REVERSE_ROW_TILE, chunk_cols=D, pipeline=True,
-        )
+    for transfer_block in pl.range(worker, N_RANKS * PREFILL_REVERSE_EXPERT_TILE, pl.tile.get_block_num()):
+        dest = transfer_block // PREFILL_REVERSE_EXPERT_TILE
+        local_e = expert_group * PREFILL_REVERSE_EXPERT_TILE + transfer_block % PREFILL_REVERSE_EXPERT_TILE
+        destination_rows = pl.cast(pl.read(reverse_send_counts, [dest, 0]), pl.INDEX)
+        destination_rows = pl.min(PREFILL_MOE_PEER_CAP, pl.max(destination_rows, 0))
+        send_prefix = pl.cast(0, pl.INDEX)
+        expert_base = pl.cast(0, pl.INDEX)
+        for prior_e in pl.range(local_e):
+            send_prefix = send_prefix + pl.cast(pl.read(recv_expert_counts, [dest, prior_e]), pl.INDEX)
+            expert_rows = pl.cast(pl.read(expert_counts, [prior_e, 0]), pl.INDEX)
+            expert_tiles = (expert_rows + PREFILL_MOE_GROUPED_EXPERT_TILE - 1) // PREFILL_MOE_GROUPED_EXPERT_TILE
+            expert_base = expert_base + expert_tiles * PREFILL_MOE_GROUPED_EXPERT_TILE
+        source_prefix = pl.cast(0, pl.INDEX)
+        for prior_src in pl.range(dest):
+            source_prefix = source_prefix + pl.cast(pl.read(recv_expert_counts, [prior_src, local_e]), pl.INDEX)
+        n_rows = pl.cast(pl.read(recv_expert_counts, [dest, local_e]), pl.INDEX)
+        n_rows = pl.min(n_rows, pl.max(destination_rows - send_prefix, 0))
+        input_base = expert_base + source_prefix
+        output_base = dst_base + send_prefix
+        if n_rows > 0:
+            pld.tensor.put(
+                dst=reverse_target, peer=dest, src=expert_y,
+                dst_offsets=[output_base, 0], src_offsets=[input_base, 0], shape=[n_rows, D],
+                chunk_rows=PREFILL_REVERSE_ROW_TILE, chunk_cols=D, pipeline=True,
+            )
     return reverse_target
 
 
@@ -1503,6 +1504,7 @@ def _prefill_moe_reverse_exchange(
     counts_tid: pl.Scalar[pl.TASK_ID],
 ) -> pl.Scalar[pl.TASK_ID]:
     reverse_put_tids = pl.array.create(N_LOCAL // PREFILL_REVERSE_EXPERT_TILE, pl.TASK_ID)
+    workers = pl.min(N_RANKS * PREFILL_REVERSE_EXPERT_TILE, pl.system.available_aiv_count())
     for expert_group in pl.parallel(N_LOCAL // PREFILL_REVERSE_EXPERT_TILE):
         expert_group_tid = pl.system.task_dummy(deps=[expert_tids[expert_group * PREFILL_REVERSE_EXPERT_TILE + offset] for offset in range(PREFILL_REVERSE_EXPERT_TILE)])
         if False:
@@ -1514,7 +1516,7 @@ def _prefill_moe_reverse_exchange(
             self.prefill_moe_combine_y_put,  # noqa: F821 - materialized by @pl.jit
             reverse_send_counts, recv_expert_counts, expert_counts, pl.no_dep(reverse_target),
             expert_y, expert_group, my_rank,
-            core_num=N_RANKS * PREFILL_REVERSE_EXPERT_TILE, deps=[expert_group_tid, counts_tid],
+            core_num=workers, deps=[expert_group_tid, counts_tid],
         )
         reverse_put_tids[expert_group] = reverse_put_tid
 
