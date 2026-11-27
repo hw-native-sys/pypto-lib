@@ -41,6 +41,7 @@ LINEAR_T_TILE = 64  # cube matmul rows must align to 16 rows
 COMB_T_TILE = 8
 PREFILL_COMB_T_TILE = 32
 PRE_POST_WORKERS = 16
+MIX_NORM_WORKERS = 48
 RMS_K_TILE = 512
 LINEAR_K_TILE = 256
 D_TILE = 256
@@ -698,60 +699,62 @@ def hc_pre_norm(
     x_mixed = pl.create_tensor([mixed_rows, D], dtype=pl.BF16)
 
     # The RMS statistic includes the intermediate BF16 rounding.
-    with pl.spmd((t_dim + T_TILE - 1) // T_TILE, name_hint="mix_x_rms_norm", allow_early_resolve=True) as mixed_tid:
-        t0 = pl.tile.get_block_idx() * T_TILE
-        valid_rows = pl.min(T_TILE, t_dim - t0)
-        pre_val, post_pad, mixes_total = _hc_pre_gate_values(
-            mixes_partials, inv_rms, hc_base, t0, t_linear, scale0, scale1,
-        )
-        pl.store(mixes_total, [t0, 0], mixes_raw)
-        pl.store(pre_val, [t0, 0], pre_val_store)
-        post_valid = pl.set_validshape(post_pad, valid_rows, HC_MULT)
-        pl.store(post_valid, [t0, 0], post)
-        pre_tile = pre_val_store[t0:t0 + T_TILE, 0:HC_PAD]
-        pre_tile_t = pl.transpose(pre_tile, axis1=0, axis2=1)
-        pre0 = pl.reshape(pre_tile_t[0:1, 0:T_TILE], [T_TILE, 1])
-        pre1 = pl.reshape(pre_tile_t[1:2, 0:T_TILE], [T_TILE, 1])
-        pre2 = pl.reshape(pre_tile_t[2:3, 0:T_TILE], [T_TILE, 1])
-        pre3 = pl.reshape(pre_tile_t[3:4, 0:T_TILE], [T_TILE, 1])
-        sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-        for mix_db in pl.pipeline(D // D_TILE, stage=2):
-            d0 = mix_db * D_TILE
-            x0_tail = pl.slice(x_flat, [T_TILE, D_TILE], [t0, d0], valid_shape=[valid_rows, D_TILE])
-            x0 = pl.set_validshape(x0_tail, T_TILE, D_TILE)
-            x1_tail = pl.slice(x_flat, [T_TILE, D_TILE], [t0, D + d0], valid_shape=[valid_rows, D_TILE])
-            x1 = pl.set_validshape(x1_tail, T_TILE, D_TILE)
-            x2_tail = pl.slice(x_flat, [T_TILE, D_TILE], [t0, 2 * D + d0], valid_shape=[valid_rows, D_TILE])
-            x2 = pl.set_validshape(x2_tail, T_TILE, D_TILE)
-            x3_tail = pl.slice(x_flat, [T_TILE, D_TILE], [t0, 3 * D + d0], valid_shape=[valid_rows, D_TILE])
-            x3 = pl.set_validshape(x3_tail, T_TILE, D_TILE)
-            y0 = pl.row_expand_mul(x0, pre0)
-            y1 = pl.row_expand_mul(x1, pre1)
-            y2 = pl.row_expand_mul(x2, pre2)
-            y3 = pl.row_expand_mul(x3, pre3)
-            y01 = pl.add(y0, y1)
-            y23 = pl.add(y2, y3)
-            y = pl.add(y01, y23)
-            y_bf16 = pl.cast(y, pl.BF16, mode="rint")
-            x_mixed[t0:t0 + T_TILE, d0:d0 + D_TILE] = y_bf16
-            y_rounded = pl.cast(y_bf16, pl.FP32)
-            y_sq = pl.mul(y_rounded, y_rounded)
-            y_sq_sum = pl.row_sum(y_sq)
-            y_sq_row = pl.reshape(y_sq_sum, [1, T_TILE])
-            sq_sum = pl.add(sq_sum, y_sq_row)
-        norm_sq_sum = pl.create_tensor([1, T_TILE], dtype=pl.FP32)
-        norm_sq_sum[:, :] = sq_sum
-        y_inv = pl.create_tensor([1, T_TILE], dtype=pl.FP32)
-        inverse_result = rms_norm_inverse(norm_sq_sum)
-        y_inv[:, :] = inverse_result
-        for norm_db in pl.pipeline(D // D_TILE, stage=2):
-            d0 = norm_db * D_TILE
-            mixed_input = x_mixed[t0:t0 + T_TILE, d0:d0 + D_TILE]
-            norm_w_input = norm_w[d0:d0 + D_TILE]
-            norm_w_row = pl.reshape(norm_w_input, [1, D_TILE])
-            normed_bf16 = rms_norm_apply(mixed_input, norm_w_row, y_inv)
-            normed_valid = pl.set_validshape(normed_bf16, valid_rows, D_TILE)
-            x_normed[t0:t0 + T_TILE, d0:d0 + D_TILE] = normed_valid
+    mix_tiles = (t_dim + T_TILE - 1) // T_TILE
+    with pl.spmd(pl.min(mix_tiles, MIX_NORM_WORKERS), name_hint="mix_x_rms_norm", allow_early_resolve=True) as mixed_tid:
+        for tile in pl.range(pl.tile.get_block_idx(), mix_tiles, MIX_NORM_WORKERS):
+            t0 = tile * T_TILE
+            valid_rows = pl.min(T_TILE, t_dim - t0)
+            pre_val, post_pad, mixes_total = _hc_pre_gate_values(
+                mixes_partials, inv_rms, hc_base, t0, t_linear, scale0, scale1,
+            )
+            pl.store(mixes_total, [t0, 0], mixes_raw)
+            pl.store(pre_val, [t0, 0], pre_val_store)
+            post_valid = pl.set_validshape(post_pad, valid_rows, HC_MULT)
+            pl.store(post_valid, [t0, 0], post)
+            pre_tile = pre_val_store[t0:t0 + T_TILE, 0:HC_PAD]
+            pre_tile_t = pl.transpose(pre_tile, axis1=0, axis2=1)
+            pre0 = pl.reshape(pre_tile_t[0:1, 0:T_TILE], [T_TILE, 1])
+            pre1 = pl.reshape(pre_tile_t[1:2, 0:T_TILE], [T_TILE, 1])
+            pre2 = pl.reshape(pre_tile_t[2:3, 0:T_TILE], [T_TILE, 1])
+            pre3 = pl.reshape(pre_tile_t[3:4, 0:T_TILE], [T_TILE, 1])
+            sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+            for mix_db in pl.pipeline(D // D_TILE, stage=2):
+                d0 = mix_db * D_TILE
+                x0_tail = pl.slice(x_flat, [T_TILE, D_TILE], [t0, d0], valid_shape=[valid_rows, D_TILE])
+                x0 = pl.set_validshape(x0_tail, T_TILE, D_TILE)
+                x1_tail = pl.slice(x_flat, [T_TILE, D_TILE], [t0, D + d0], valid_shape=[valid_rows, D_TILE])
+                x1 = pl.set_validshape(x1_tail, T_TILE, D_TILE)
+                x2_tail = pl.slice(x_flat, [T_TILE, D_TILE], [t0, 2 * D + d0], valid_shape=[valid_rows, D_TILE])
+                x2 = pl.set_validshape(x2_tail, T_TILE, D_TILE)
+                x3_tail = pl.slice(x_flat, [T_TILE, D_TILE], [t0, 3 * D + d0], valid_shape=[valid_rows, D_TILE])
+                x3 = pl.set_validshape(x3_tail, T_TILE, D_TILE)
+                y0 = pl.row_expand_mul(x0, pre0)
+                y1 = pl.row_expand_mul(x1, pre1)
+                y2 = pl.row_expand_mul(x2, pre2)
+                y3 = pl.row_expand_mul(x3, pre3)
+                y01 = pl.add(y0, y1)
+                y23 = pl.add(y2, y3)
+                y = pl.add(y01, y23)
+                y_bf16 = pl.cast(y, pl.BF16, mode="rint")
+                x_mixed[t0:t0 + T_TILE, d0:d0 + D_TILE] = y_bf16
+                y_rounded = pl.cast(y_bf16, pl.FP32)
+                y_sq = pl.mul(y_rounded, y_rounded)
+                y_sq_sum = pl.row_sum(y_sq)
+                y_sq_row = pl.reshape(y_sq_sum, [1, T_TILE])
+                sq_sum = pl.add(sq_sum, y_sq_row)
+            norm_sq_sum = pl.create_tensor([1, T_TILE], dtype=pl.FP32)
+            norm_sq_sum[:, :] = sq_sum
+            y_inv = pl.create_tensor([1, T_TILE], dtype=pl.FP32)
+            inverse_result = rms_norm_inverse(norm_sq_sum)
+            y_inv[:, :] = inverse_result
+            for norm_db in pl.pipeline(D // D_TILE, stage=2):
+                d0 = norm_db * D_TILE
+                mixed_input = x_mixed[t0:t0 + T_TILE, d0:d0 + D_TILE]
+                norm_w_input = norm_w[d0:d0 + D_TILE]
+                norm_w_row = pl.reshape(norm_w_input, [1, D_TILE])
+                normed_bf16 = rms_norm_apply(mixed_input, norm_w_row, y_inv)
+                normed_valid = pl.set_validshape(normed_bf16, valid_rows, D_TILE)
+                x_normed[t0:t0 + T_TILE, d0:d0 + D_TILE] = normed_valid
     _hc_pre_combinations(
         mixes_raw, inv_rms, hc_base, comb, t_dim, scale2, row_recip,
         COMB_T_TILE=COMB_T_TILE, REDUCE_PARTIALS=False,

@@ -823,7 +823,8 @@ def build_tensor_specs(active_requests=1):
             value = 1.0
         prefix = "draft_" if name.startswith("draft_") else ""
         packed = draft.PACK_ROUTED_WEIGHTS if prefix else target_fwd.PACK_ROUTED_WEIGHTS
-        specs[name] = forward_routed_weight_spec(name, shape, dtype, value, packed, prefix)
+        local_experts = draft.N_LOCAL_EXPERTS if prefix else target_fwd.N_LOCAL_EXPERTS
+        specs[name] = forward_routed_weight_spec(name, shape, dtype, value, packed, prefix, local_experts=local_experts)
 
     for name in ("slot_ids", "generations", "state_meta", "state_tokens"):
         specs[name].init_value = specs[name].create_tensor()

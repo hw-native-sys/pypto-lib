@@ -11,6 +11,7 @@
 import pypto.language as pl
 import pypto.language.distributed as pld
 
+from bf16_nz_pack import NZ_C0, NZ_PACK_COLS, NZ_PACK_ROWS, NZ_PACK_WORDS, bf16_nz_pack_indices, pack_bf16_nz_chunk
 from config import FLASH as M
 from prefill_cp_token_allgather import TP_SIZE
 
@@ -45,7 +46,7 @@ O_PROJ_WO_B_WINDOW_ROWS = O_PROJ_FULL_ROWS_B if TP_SIZE > 1 else 1
 O_PROJ_WO_B_WINDOW_COLS = O_LORA if TP_SIZE > 1 else 1
 
 # tiling
-O_PROJ_WEIGHT_COPY_TILE = 16
+O_PROJ_WEIGHT_COPY_TILE = NZ_PACK_ROWS
 O_PROJ_PUSH_SLABS = 4
 O_PROJ_A_SLAB_ROWS = O_PROJ_LOCAL_COLS // O_PROJ_PUSH_SLABS
 O_PROJ_B_SLAB_ROWS = O_PROJ_LOCAL_ROWS_B // O_PROJ_PUSH_SLABS
@@ -53,43 +54,10 @@ O_PROJ_B_SLAB_ROWS = O_PROJ_LOCAL_ROWS_B // O_PROJ_PUSH_SLABS
 # count to keep each copy the byte size of a 16-row tile spanning every group.
 O_PROJ_WO_B_COPY_TILE = O_PROJ_WEIGHT_COPY_TILE * O_GROUPS
 O_PROJ_WO_B_PUSH_ROWS = O_PROJ_WEIGHT_COPY_TILE * O_PROJ_LOCAL_GROUPS
-O_PROJ_A_PACK_K_TILE = 1024
-O_PROJ_A_NZ_C0 = 16
-O_PROJ_A_PACK_STRIPE_WORDS = O_PROJ_WEIGHT_COPY_TILE * O_PROJ_A_NZ_C0 // 2
-O_PROJ_A_PACK_WORDS = O_PROJ_WEIGHT_COPY_TILE * O_PROJ_A_PACK_K_TILE // 2
+O_PROJ_A_PACK_K_TILE = NZ_PACK_COLS
+O_PROJ_A_NZ_C0 = NZ_C0
 O_PROJ_A_NZ_ROWS = O_GROUPS * O_GROUP_IN // O_PROJ_A_NZ_C0
 O_PROJ_A_NZ_COLS = O_LORA * O_PROJ_A_NZ_C0
-
-
-@pl.jit.inline
-def _o_proj_a_pack_indices() -> pl.Tile[[1, O_PROJ_A_PACK_WORDS], pl.INT32]:
-    lane = pl.tile.arange(0, [1, O_PROJ_A_NZ_C0 // 2], dtype=pl.INT32)
-    rows = pl.tile.arange(0, [1, O_PROJ_WEIGHT_COPY_TILE], dtype=pl.INT32)
-    row_start = pl.tile.mul(rows, O_PROJ_A_PACK_K_TILE // 2)
-    zeros = pl.tile.full([O_PROJ_WEIGHT_COPY_TILE, O_PROJ_A_NZ_C0 // 2], dtype=pl.INT32, value=0)
-    lanes = pl.tile.col_expand_add(zeros, lane)
-    row_major = pl.tile.row_expand_add(lanes, pl.tile.reshape(row_start, [O_PROJ_WEIGHT_COPY_TILE, 1]))
-    one_stripe = pl.tile.reshape(row_major, [1, O_PROJ_A_PACK_STRIPE_WORDS])
-    strips = pl.tile.arange(0, [1, O_PROJ_A_PACK_K_TILE // O_PROJ_A_NZ_C0], dtype=pl.INT32)
-    strip_offsets = pl.tile.mul(strips, O_PROJ_A_NZ_C0 // 2)
-    stripe_zeros = pl.tile.full([O_PROJ_A_PACK_K_TILE // O_PROJ_A_NZ_C0, O_PROJ_A_PACK_STRIPE_WORDS], dtype=pl.INT32, value=0)
-    repeated = pl.tile.col_expand_add(stripe_zeros, one_stripe)
-    offsets = pl.tile.reshape(strip_offsets, [O_PROJ_A_PACK_K_TILE // O_PROJ_A_NZ_C0, 1])
-    lookup = pl.tile.row_expand_add(repeated, offsets)
-    return pl.tile.reshape(lookup, [1, O_PROJ_A_PACK_WORDS])
-
-
-@pl.jit.inline
-def _o_proj_a_pack_chunk(
-    nd: pl.Tile[[O_PROJ_WEIGHT_COPY_TILE, O_PROJ_A_PACK_K_TILE], pl.BF16],
-    indices: pl.Tile[[1, O_PROJ_A_PACK_WORDS], pl.INT32],
-    tmp: pl.Tile[[1, O_PROJ_A_PACK_WORDS], pl.INT32],
-) -> pl.Tile[[O_PROJ_A_PACK_K_TILE // O_PROJ_A_NZ_C0, O_PROJ_WEIGHT_COPY_TILE * O_PROJ_A_NZ_C0], pl.BF16]:
-    words = pl.tile.reinterpret_view(nd, pl.INT32, shape=[1, O_PROJ_A_PACK_WORDS])
-    ordered = pl.tile.gather(words, indices, tmp)
-    return pl.tile.reinterpret_view(
-        ordered, pl.BF16, shape=[O_PROJ_A_PACK_K_TILE // O_PROJ_A_NZ_C0, O_PROJ_WEIGHT_COPY_TILE * O_PROJ_A_NZ_C0],
-    )
 
 
 @pl.jit.inline(auto_scope=False)
@@ -108,15 +76,15 @@ def pack_o_proj_a_weights(
         row = pl.tile.get_block_idx() * O_PROJ_WEIGHT_COPY_TILE
         nz_row = (row // O_LORA) * (O_GROUP_IN // O_PROJ_A_NZ_C0)
         nz_col = (row % O_LORA) * O_PROJ_A_NZ_C0
-        indices = _o_proj_a_pack_indices()
-        tmp = pl.tile.create([1, O_PROJ_A_PACK_WORDS], dtype=pl.INT32, target_memory=pl.Mem.Vec)
+        indices = bf16_nz_pack_indices()
+        tmp = pl.tile.create([1, NZ_PACK_WORDS], dtype=pl.INT32, target_memory=pl.Mem.Vec)
         for k0 in pl.range(0, O_GROUP_IN, O_PROJ_A_PACK_K_TILE):
             nd_tile = pl.load(
                 wo_a_flat, [row, k0], [O_PROJ_WEIGHT_COPY_TILE, O_PROJ_A_PACK_K_TILE],
                 target_memory=pl.Mem.Vec,
             )
             stripe = nz_row + k0 // O_PROJ_A_NZ_C0
-            packed_tile = _o_proj_a_pack_chunk(nd_tile, indices, tmp)
+            packed_tile = pack_bf16_nz_chunk(nd_tile, indices, tmp)
             pl.store(packed_tile, [stripe, nz_col], packed)
     return packed_ready_tid
 
@@ -218,8 +186,8 @@ def _finish_o_proj_full_weights_gather(
             row = pl.tile.get_block_idx() * O_PROJ_WEIGHT_COPY_TILE
             nz_row = (row // O_LORA) * (O_GROUP_IN // O_PROJ_A_NZ_C0)
             nz_col = (row % O_LORA) * O_PROJ_A_NZ_C0
-            indices = _o_proj_a_pack_indices()
-            tmp = pl.tile.create([1, O_PROJ_A_PACK_WORDS], dtype=pl.INT32, target_memory=pl.Mem.Vec)
+            indices = bf16_nz_pack_indices()
+            tmp = pl.tile.create([1, NZ_PACK_WORDS], dtype=pl.INT32, target_memory=pl.Mem.Vec)
             for k0 in pl.range(0, O_GROUP_IN, O_PROJ_A_PACK_K_TILE):
                 if row // O_PROJ_LOCAL_COLS == tp_rank:
                     local_row = row - tp_rank * O_PROJ_LOCAL_COLS
@@ -233,7 +201,7 @@ def _finish_o_proj_full_weights_gather(
                         target_memory=pl.Mem.Vec,
                     )
                 stripe = nz_row + k0 // O_PROJ_A_NZ_C0
-                packed_tile = _o_proj_a_pack_chunk(nd_tile, indices, tmp)
+                packed_tile = pack_bf16_nz_chunk(nd_tile, indices, tmp)
                 pl.store(packed_tile, [stripe, nz_col], wo_a_packed)
 
     wo_b_full_flat = pl.reshape(wo_b_full, [O_PROJ_FULL_ROWS_B, O_LORA])
@@ -298,15 +266,15 @@ if TP_SIZE == 1:
                 row = pl.tile.get_block_idx() * O_PROJ_WEIGHT_COPY_TILE
                 nz_row = (row // O_LORA) * (O_GROUP_IN // O_PROJ_A_NZ_C0)
                 nz_col = (row % O_LORA) * O_PROJ_A_NZ_C0
-                indices = _o_proj_a_pack_indices()
-                tmp = pl.tile.create([1, O_PROJ_A_PACK_WORDS], dtype=pl.INT32, target_memory=pl.Mem.Vec)
+                indices = bf16_nz_pack_indices()
+                tmp = pl.tile.create([1, NZ_PACK_WORDS], dtype=pl.INT32, target_memory=pl.Mem.Vec)
                 for k0 in pl.range(0, O_GROUP_IN, O_PROJ_A_PACK_K_TILE):
                     nd_tile = pl.load(
                         wo_a_local_flat, [row, k0], [O_PROJ_WEIGHT_COPY_TILE, O_PROJ_A_PACK_K_TILE],
                         target_memory=pl.Mem.Vec,
                     )
                     stripe = nz_row + k0 // O_PROJ_A_NZ_C0
-                    packed_tile = _o_proj_a_pack_chunk(nd_tile, indices, tmp)
+                    packed_tile = pack_bf16_nz_chunk(nd_tile, indices, tmp)
                     pl.store(packed_tile, [stripe, nz_col], wo_a_packed)
 
         wo_b_local_flat = pl.reshape(wo_b_local, [O_PROJ_FULL_ROWS_B, O_LORA])

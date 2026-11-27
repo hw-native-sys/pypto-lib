@@ -45,7 +45,7 @@ from config import FLASH as M
 from config import EP_SIZE, SUPPORTED_EP_SIZES
 from config import MOE_TOKENS, MOE_RECV_MAX, LOCAL_T_DYN, ROUTE_T_DYN
 from config import T_DYN
-from mega_moe import specialize_mega_moe, workspace_bytes
+from mega_moe import forward_routed_weight_spec, specialize_mega_moe, workspace_bytes
 from gate import gate, route_tokens, gather_routing_bias, prepare_routing_bias
 from expert_shared import SWIGLU_WORKER_TILE, W13_WORKER_TILE, W2_WORKER_TILE, expert_shared
 
@@ -608,6 +608,7 @@ def make_prefill_moe(local_experts):
         for round_id in pl.range(rounds):
             begin = owner_begin + round_id * MOE_TOKENS
             rows = pl.min(MOE_TOKENS, owner_begin + owner_capacity - begin)
+            full_slab = capacity % MOE_TOKENS == 0 or round_id < capacity // MOE_TOKENS
             # Keep caller-owned destinations outside the slab allocation scope.
             hidden_destination = pl.slice(x_next, [rows, HC_MULT, D], [begin, 0, 0])
             mixed_destination = pl.slice(x_mixed, [rows, D], [begin, 0])
@@ -615,10 +616,16 @@ def make_prefill_moe(local_experts):
             # Carry completion explicitly before overwriting shared scratch.
             row_ids = pl.slice(slab_rows, [MOE_TOKENS], [0])
             round_hidden = pl.slice(slab_hidden, [MOE_TOKENS, HC_MULT, D], [0, 0, 0])
-            round_output = pl.slice(slab_hidden, [MOE_TOKENS, HC_MULT, D], [MOE_TOKENS, 0, 0])
             round_pre = pl.slice(slab_pre, [MOE_TOKENS, HC_MULT], [0, 0])
-            round_next = pl.slice(slab_pre, [MOE_TOKENS, HC_MULT], [MOE_TOKENS, 0])
-            round_mixed = pl.slice(slab_mixed, [MOE_TOKENS, D], [0, 0])
+            # Complete physical slabs publish every output row, including inactive padding.
+            if full_slab:
+                round_output = pl.slice(x_next, [MOE_TOKENS, HC_MULT, D], [begin, 0, 0])
+                round_next = pl.slice(next_pre_mix, [MOE_TOKENS, HC_MULT], [begin, 0])
+                round_mixed = pl.slice(x_mixed, [MOE_TOKENS, D], [begin, 0])
+            else:
+                round_output = pl.slice(slab_hidden, [MOE_TOKENS, HC_MULT, D], [MOE_TOKENS, 0, 0])
+                round_next = pl.slice(slab_pre, [MOE_TOKENS, HC_MULT], [MOE_TOKENS, 0])
+                round_mixed = pl.slice(slab_mixed, [MOE_TOKENS, D], [0, 0])
             with pl.scope():
                 active = pl.max(0, pl.min(rows, num_tokens - begin))
                 with pl.spmd(1, name_hint="prefill_moe_rows", deps=[round_completion[0]]) as rows_ready:
@@ -650,25 +657,33 @@ def make_prefill_moe(local_experts):
                     moe_workspace,
                     active,
                 )
-                with pl.spmd(32, name_hint="prefill_moe_results") as hidden_copied:
-                    worker = pl.tile.get_block_idx()
-                    for row in pl.range(worker, MOE_TOKENS, 32):
-                        if row < rows:
-                            for lane in pl.range(HC_MULT):
-                                for column in pl.range(0, D, D):
-                                    hidden = round_output[row:row + 1, lane:lane + 1, column:column + D]
-                                    hidden_destination[row:row + 1, lane:lane + 1, column:column + D] = hidden
-                            mixed = round_mixed[row:row + 1, :]
-                            mixed_destination[row:row + 1, :] = mixed
-                with pl.spmd(1, name_hint="prefill_moe_pre_mix") as pre_copied:
-                    pl.system.cacheinvalid()
-                    writer = pl.tile.get_block_idx()
-                    for row in pl.range(writer, MOE_TOKENS):
-                        if row < rows:
-                            for lane in pl.range(HC_MULT):
-                                value = pl.read(round_next, [row, lane])
-                                pl.write(pre_destination, [row, lane], value)
-                round_completion[0] = pl.system.task_dummy(deps=[hidden_copied, pre_copied])
+                if full_slab:
+                    # HC post joins the expert and mix producers before the next slab reuses scratch.
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_outputs_ready") as outputs_ready:
+                        pl.system.cacheinvalid()
+                        anchor = pl.read(hidden_destination, [0, 0, 0])
+                        pl.write(hidden_destination, [0, 0, 0], anchor)
+                    round_completion[0] = outputs_ready
+                else:
+                    with pl.spmd(32, name_hint="prefill_moe_results") as hidden_copied:
+                        worker = pl.tile.get_block_idx()
+                        for row in pl.range(worker, MOE_TOKENS, 32):
+                            if row < rows:
+                                for lane in pl.range(HC_MULT):
+                                    for column in pl.range(0, D, D):
+                                        hidden = round_output[row:row + 1, lane:lane + 1, column:column + D]
+                                        hidden_destination[row:row + 1, lane:lane + 1, column:column + D] = hidden
+                                mixed = round_mixed[row:row + 1, :]
+                                mixed_destination[row:row + 1, :] = mixed
+                    with pl.spmd(1, name_hint="prefill_moe_pre_mix") as pre_copied:
+                        pl.system.cacheinvalid()
+                        writer = pl.tile.get_block_idx()
+                        for row in pl.range(writer, MOE_TOKENS):
+                            if row < rows:
+                                for lane in pl.range(HC_MULT):
+                                    value = pl.read(round_next, [row, lane])
+                                    pl.write(pre_destination, [row, lane], value)
+                    round_completion[0] = pl.system.task_dummy(deps=[hidden_copied, pre_copied])
         return round_completion[0]
 
     return prefill_moe, prefill_moe_slabs
@@ -989,6 +1004,10 @@ def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
     for spec in specs:
         if spec.name not in {"x", "output", "num_tokens", "moe_epoch"}:
             spec.resident = "stacked"
+    for index, spec in enumerate(specs):
+        if spec.name.startswith(("routed_w", "shared_w")):
+            specs[index] = forward_routed_weight_spec(spec.name, spec.shape, spec.dtype, spec.init_value, False,
+                                                       local_experts=N_LOCAL_EXPERTS)
     return specs
 
 
@@ -1124,6 +1143,8 @@ def golden_moe_slabs(tensors):
 def _golden_moe_core(tensors):
     import torch
 
+    from mega_moe import golden_weight_views
+    tensors = golden_weight_views(tensors)
     from gate import golden_gate_normalized_core
     from expert_shared import golden_expert_shared
     from expert_routed import golden_expert_routed

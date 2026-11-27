@@ -13,11 +13,8 @@
 #define ASCENDC_TILING_KEY_VAR_IMPL 0
 #include <utils/debug/asc_printf.h>
 #include <utils/debug/asc_assert.h>
-// Packed FP4 uploads contain K256/N256 panels. The 384-row ordinary layout
-// also keeps N256 resident for short expert groups.
-#define MOE_DECODE_K256 (MOE_TOKENS == 384 || MOE_PACKED_ROUTED_WEIGHTS)
-#define MOE_STREAM_W2_SCALES (!MOE_PACKED_ROUTED_WEIGHTS && MOE_TOKENS <= 80 && \
-    1ULL * MOE_TOKENS * (MOE_TOPK + 2) * MOE_HIDDEN * 2 <= 32ULL * 1024 * 1024)
+// Routed weights use CANN ZN/DN; shared NZ weights use prepacked MX_B_NN scale stripes.
+#define MOE_DECODE_K256 1
 /*
  * Operation-private DeepSeek V4.1 MoE pipeline port.
  *
@@ -937,6 +934,11 @@ struct Config {
 
     const uint32_t shared_intermediate_hidden = num_shared_experts * intermediate_hidden;
     const uint32_t num_input_sf_pairs = hidden / MX_SF_DIVISOR;
+
+    constexpr bool overlap_reduce() const {
+        return static_cast<uint64_t>(num_max_tokens_per_rank) * (num_topk + (num_shared_experts > 0)) *
+               hidden * sizeof(bfloat16_t) > 32ull * 1024 * 1024;
+    }
 };
 
 // Typed GM range with a fixed byte stride
@@ -1607,7 +1609,11 @@ __aicore__ inline uint32_t take_linear_task(uint32_t num_shared_tokens, uint32_t
             const uint32_t required_linear1_task_end =
                 ceil_div(min(state.l2_task_base + topology.cores(), num_routed_tasks[1]), kNumLinear2NBlocks) *
                 kNumLinear1NBlocks;
-            constexpr uint32_t lookahead = 1;
+            // Shallow prefill FFNs benefit from making W2 results available to combine early.
+            // Retain the W1 lead when reduction does not overlap or a balanced expert spans more than two tiles.
+            constexpr uint64_t routes = static_cast<uint64_t>(config.num_max_tokens_per_rank) * config.num_topk;
+            constexpr uint32_t local_experts = config.num_experts / config.num_ranks;
+            constexpr uint32_t lookahead = !config.overlap_reduce() || routes > 2ull * local_experts * layout::BLOCK_M;
             is_linear1 = state.l1_task_base < required_linear1_task_end + lookahead * topology.cores();
         }
 
@@ -1635,95 +1641,6 @@ __aicore__ inline uint32_t take_linear_task(uint32_t num_shared_tokens, uint32_t
 #include <c_api/asc_simd.h>
 
 namespace deep_gemm::mega_moe {
-
-// FP4 -> FP8 NZ, scaled by 2^-6; weight SFs compensate with +6
-// Rows map to GEMM N; columns map to K
-template <uint32_t kNumRows, uint32_t kNumCols>
-__simd_vf__ inline void vf_fp4_to_fp8_nz(__ubuf__ uint8_t* src, __ubuf__ uint8_t* dst) {
-    constexpr uint32_t kNumPackedCols = kNumCols / 2;
-    constexpr uint32_t kNumPaddedRows = kNumRows + 1;
-    constexpr uint32_t kNumPackedColsPerVector = sizeof(vector_int8_t) / 2;  // Two FP4 values per byte
-    constexpr uint32_t kNumVectorsPerRow = kNumPackedCols / kNumPackedColsPerVector;
-    static_assert(kNumPackedCols % kNumPackedColsPerVector == 0);
-
-    const auto mask = asc_create_mask_b8(PAT_ALL);
-    vector_int8_t shift_right, shift_left, fp8_mask;
-    asc_duplicate_scalar(shift_right, static_cast<int8_t>(2));
-    asc_duplicate_scalar(reinterpret_cast<vector_uint16_t&>(shift_left), uint16_t{4});  // Alternating byte shifts: 4, 0
-    asc_duplicate_scalar(fp8_mask, static_cast<int8_t>(0x9c));  // Sign and shifted FP4 payload
-
-    auto src_ptr = reinterpret_cast<__ubuf__ int8_t*>(src);
-    constexpr uint32_t kNumRowsPerPass = 4;
-    static_assert(kNumRows % kNumRowsPerPass == 0);
-    constexpr uint32_t kNumVectors = kNumVectorsPerRow * kNumRowsPerPass;
-
-    // Each vector writes one row fragment in NZ order; the extra row pads the stride
-    __ubuf__ uint8_t* dst_ptrs[kNumVectors];
-    #pragma unroll
-    for (uint32_t vector_idx = 0; vector_idx < kNumVectors; ++ vector_idx)
-        dst_ptrs[vector_idx] = dst + vector_idx % kNumVectorsPerRow * kNumPaddedRows * 2 * kNumPackedColsPerVector +
-                               vector_idx / kNumVectorsPerRow * get_frac_k<uint8_t>();
-
-    for (uint32_t row_idx = 0; row_idx < kNumRows; row_idx += kNumRowsPerPass) {
-        // Expand packed nibbles into scaled FP8 values
-        vector_int8_t values[kNumVectors];
-        #pragma unroll
-        for (uint32_t vector_idx = 0; vector_idx < kNumVectors; ++ vector_idx) {
-            asc_loadalign_upsample_postupdate(values[vector_idx], src_ptr, kNumPackedColsPerVector);
-            asc_shiftleft(values[vector_idx], values[vector_idx], shift_left, mask);
-            asc_shiftright(values[vector_idx], values[vector_idx], shift_right, mask);
-            asc_and(values[vector_idx], values[vector_idx], fp8_mask, mask);
-        }
-
-        // Scatter into padded NZ and advance by four rows
-        #pragma unroll
-        for (uint32_t vector_idx = 0; vector_idx < kNumVectors; ++ vector_idx)
-            asc_storealign_postupdate(dst_ptrs[vector_idx], reinterpret_cast<vector_uint8_t&>(values[vector_idx]),
-                                      kNumPaddedRows, kNumRowsPerPass, mask);
-    }
-}
-
-#if MOE_PACKED_ROUTED_WEIGHTS
-// The static FP4 payload already follows Cube's NZ order. Each VF expands
-// adjacent packed nibbles into an adjacent pair of E4M3 bytes.
-__simd_vf__ inline void expand_scaled_linear(__ubuf__ int8_t* input, __ubuf__ int8_t* output) {
-    const auto mask = asc_create_mask_b8(PAT_ALL);
-    vector_int8_t left, right, keep;
-    asc_duplicate_scalar(reinterpret_cast<vector_uint16_t&>(left), uint16_t{4});
-    asc_duplicate_scalar(right, int8_t{2});
-    asc_duplicate_scalar(keep, int8_t(0x9c));
-    for (uint32_t panel = 0; panel < 8; ++panel) {
-        for (uint32_t i = 0; i < 8; ++i) {
-            #pragma unroll
-            for (uint32_t j = 0; j < 4; ++j) {
-                vector_int8_t value;
-                asc_loadalign_upsample_postupdate(value, input, 128);
-                asc_shiftleft(value, value, left, mask);
-                asc_shiftright(value, value, right, mask);
-                asc_and(value, value, keep, mask);
-                asc_storealign_postupdate(output, value, 256, mask);
-            }
-        }
-        output += 32;
-    }
-}
-
-// Quantization uses ceil(log2(amax / 448)) for finite inputs. Its largest
-// possible E8M0 code is 247, so increasing the activation exponent by six is exact.
-__simd_vf__ inline void compensate_routed_scale(__ubuf__ uint8_t* scales, uint32_t count) {
-    for (uint32_t offset = 0; offset < count; offset += sizeof(vector_uint8_t)) {
-        uint32_t remaining = count - offset;
-        auto mask = plt_b8(remaining, POST_UPDATE);
-        vector_uint8_t original, shifted;
-        asc_loadalign(original, scales + offset);
-        asc_add_scalar(shifted, original, uint8_t{6}, mask);
-        vector_bool is_nan;
-        vcmps_eq(is_nan, original, uint8_t{255}, mask);
-        vsel(shifted, original, shifted, is_nan);
-        asc_storealign(scales + offset, shifted, mask);
-    }
-}
-#endif
 
 // Linear1 epilogue: SwiGLU and FP8 quantization
 template <bool kApplyRouteWeight, uint32_t STORE_BLOCK_M>
@@ -1842,17 +1759,6 @@ __simd_vf__ inline void vf_swiglu_quant(__ubuf__ bfloat16_t* input, __ubuf__ flo
             output_ptr += MX_SF_DIVISOR;
 
             asc_shiftright_scalar(bits[0], bits[0], 23, pair_mask_b32);
-#if MOE_PACKED_ROUTED_WEIGHTS
-            if constexpr (kApplyRouteWeight) {
-                // B payloads are widened to FP8 / 64. Apply 64 to this activation
-                // scale after computing its FP8 payload, only for the routed path.
-                vector_bool is_nan;
-                vcmps_eq(is_nan, bits[0], uint32_t{255}, pair_mask_b32);
-                vector_uint32_t shifted;
-                asc_add_scalar(shifted, bits[0], uint32_t{6}, pair_mask_b32);
-                asc_select(bits[0], bits[0], shifted, is_nan);
-            }
-#endif
             asc_gather(bits[1], bits[0], high_group_idx);
             vector_uint8_t packed_sf_half, unused_sf_half;
             asc_intlv(packed_sf_half, unused_sf_half, reinterpret_cast<vector_uint8_t&>(bits[0]),
@@ -1931,7 +1837,7 @@ __aicore__ __attribute__((always_inline)) constexpr uint32_t next_coprime(uint32
 } // namespace deep_gemm
 // END DeepSeek MIT port: include/deep_gemm/utils/math.hpp
 
-// BEGIN PyPTO adapter: original expert weight layout
+// BEGIN PyPTO adapter: CANN expert weight layouts
 
 /*
  * Copyright (c) PyPTO Contributors.
@@ -1947,141 +1853,129 @@ __aicore__ __attribute__((always_inline)) constexpr uint32_t next_coprime(uint32
 #include <cstdint>
 #include <pto/pto-inst.hpp>
 
-namespace deep_gemm::mega_moe::original_weights {
+namespace deep_gemm::mega_moe::cann_weights {
 
-// Public FP4 bytes are [N256 panel, K256 panel, K256, N128 packed bytes].
-// No whole-weight GM conversion or scale bias is introduced by these loads.
-AICORE inline uint64_t fp4_offset(uint32_t expert, uint32_t input_k, uint32_t output_n,
-                                 uint32_t column, uint32_t k_begin) {
-    return static_cast<uint64_t>(expert) * input_k * output_n / 2 +
-           static_cast<uint64_t>(column / 256) * (input_k / 256) * 32768 +
-           static_cast<uint64_t>(k_begin / 256) * 32768 + (column % 256) / 2;
+
+// Stage two N128 source columns in one N256 ZN tile. The resident format is
+// [K/32, N, 16] packed bytes, so each K32/N128 slab is one contiguous run.
+template <uint32_t BlockK, uint32_t Columns>
+AICORE inline void load_zn_tile(uint32_t destination, __gm__ const uint8_t* weights,
+                                uint32_t expert, uint32_t input_k, uint32_t output_n,
+                                uint32_t destination_column, uint32_t column, uint32_t k_begin,
+                                asc_load_l2_cache_mode cache_hint) {
+    const uint64_t expert_offset = static_cast<uint64_t>(expert) * input_k * output_n / 2;
+    const uint64_t source_offset = expert_offset +
+        (static_cast<uint64_t>(k_begin) / 32 * output_n + column) * 16;
+    auto* source = const_cast<__gm__ uint8_t*>(weights) + source_offset;
+    auto* target = reinterpret_cast<__ubuf__ uint8_t*>(destination + destination_column * 16);
+    asc_copy_gm2ub_align(target, source, BlockK / 32, Columns * 16, 0, 0, false,
+                         cache_hint, output_n * 16, 256 * 16);
 }
 
 #if defined(__DAV_VEC__) || defined(__CPU_SIM)
-template <uint32_t BlockK, uint32_t PackedColumns, uint32_t LoadPackedColumns>
-AICORE inline void load_fp4_columns(uint32_t raw_address, __gm__ const uint8_t* weights,
-                                    uint32_t expert, uint32_t input_k, uint32_t output_n,
-                                    uint32_t column, uint32_t k_begin, uint32_t valid_k,
-                                    uint32_t packed_column_offset = 0,
-                                    asc_load_l2_cache_mode cache_hint = asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM) {
-    using Raw = pto::Tile<pto::TileType::Vec, uint8_t, 256, PackedColumns,
-                          pto::BLayout::RowMajor, pto::DYNAMIC, LoadPackedColumns>;
-    using Global = pto::GlobalTensor<uint8_t, pto::Shape<1, 1, 1, pto::DYNAMIC, LoadPackedColumns>,
-                                    pto::Stride<1, 1, 1, 128, 1>>;
-    for (uint32_t offset = 0; offset < valid_k; offset += 256) {
-        const uint32_t rows = valid_k - offset < 256 ? valid_k - offset : 256;
-        Raw raw(rows);
-        pto::TASSIGN(raw, raw_address + offset * PackedColumns + packed_column_offset);
-        auto* source = const_cast<__gm__ uint8_t*>(weights) +
-                       fp4_offset(expert, input_k, output_n, column, k_begin + offset);
-        if constexpr (MOE_TOKENS <= 80) {
-            asc_copy_gm2ub_align(reinterpret_cast<__ubuf__ uint8_t*>(raw_address + offset * PackedColumns + packed_column_offset),
-                source, rows, LoadPackedColumns, 0, 0, false, cache_hint, 128, PackedColumns);
-        } else {
-            Global global(source, typename Global::Shape(1, 1, 1, rows, LoadPackedColumns));
-            pto::TLOAD(raw, global);
+// The two byte lanes of a duplicated FP4 byte need shifts of 4 and 0,
+// respectively. One alternating shift replaces the per-lane select in the
+// general CANN prologue. Exponents are compensated during resident upload.
+__simd_vf__ inline void expand_zn_fp4(__ubuf__ int8_t* input, __ubuf__ int8_t* output) {
+    const auto mask = asc_create_mask_b8(PAT_ALL);
+    vector_int8_t left, right, keep;
+    asc_duplicate_scalar(reinterpret_cast<vector_uint16_t&>(left), uint16_t{4});
+    asc_duplicate_scalar(right, int8_t{2});
+    asc_duplicate_scalar(keep, int8_t(0x9c));
+    for (uint32_t i = 0; i < 64; ++i) {
+        #pragma unroll
+        for (uint32_t j = 0; j < 4; ++j) {
+            vector_int8_t value;
+            asc_loadalign_upsample_postupdate(value, input, 128);
+            asc_shiftleft(value, value, left, mask);
+            asc_shiftright(value, value, right, mask);
+            asc_and(value, value, keep, mask);
+            asc_storealign_postupdate(output, value, 256, mask);
         }
     }
 }
+#endif
 
-template <uint32_t BlockK, uint32_t MadN>
+template <uint32_t BlockK>
+AICORE inline void store_zn_tile(uint32_t destination, uint32_t source) {
+    asc_copy_ub2l1(reinterpret_cast<__cbuf__ uint8_t*>(destination),
+                   reinterpret_cast<__ubuf__ uint8_t*>(source), 1, BlockK * 256 / 32, 0, 0);
+}
+
+#if defined(__DAV_VEC__) || defined(__CPU_SIM)
+template <uint32_t BlockK>
 AICORE inline void load_routed_panel(uint32_t raw_address, __gm__ const uint8_t* first,
                                      __gm__ const uint8_t* up, bool linear1,
                                      uint32_t expert, uint32_t input_k, uint32_t output_n,
                                      uint32_t n_block, uint32_t n_mad, uint32_t k_begin,
                                      uint32_t valid_k, asc_load_l2_cache_mode cache_hint) {
-    static_assert(BlockK * MadN == 65536);
-    constexpr uint32_t PackedColumns = MadN / 2;
-    if constexpr (BlockK == 512) {
-        if (valid_k < BlockK) {
-            // Only the unused K tail is zeroed. The MTE2 head copy is disjoint,
-            // and this V operation precedes the following decode in V order.
-            using Tail = pto::Tile<pto::TileType::Vec, uint8_t, 256, PackedColumns>;
-            Tail tail;
-            pto::TASSIGN(tail, raw_address + 256 * PackedColumns);
-            pto::TEXPANDS(tail, uint8_t{0});
-        }
+    static_assert(BlockK == 256);
+    // Persistent MegaMoE shapes are K256-aligned; no partial FP4 tile is staged.
+    (void)n_mad;
+    (void)valid_k;
+    if (!linear1) {
+        load_zn_tile<BlockK, 256>(raw_address, first, expert, input_k, output_n,
+                                  0, n_block * 256, k_begin, cache_hint);
+        return;
     }
-#if MOE_PACKED_ROUTED_WEIGHTS
-    static_assert(BlockK == 256 && MadN == 256);
-    // Even and odd gate/up panels live in separate shards. Each 32 KiB
-    // panel holds four gate N32 fragments followed by four up fragments.
-    const uint8_t __gm__* shard = linear1 && (n_block & 1) ? up : first;
-    const uint32_t column = (linear1 ? n_block / 2 : n_block) * 256;
-    auto* source = const_cast<__gm__ uint8_t*>(shard) +
-                   fp4_offset(expert, input_k, output_n, column, k_begin);
-    asc_copy_gm2ub_align(reinterpret_cast<__ubuf__ uint8_t*>(raw_address), source,
-                         1, valid_k * PackedColumns, 0, 0, false, cache_hint,
-                         valid_k * PackedColumns, valid_k * PackedColumns);
-    return;
-#endif
-    if (linear1) {
-        const uint32_t column = n_block * 128;
-        if constexpr (MadN == 128) {
-            load_fp4_columns<BlockK, PackedColumns, 64>(raw_address, n_mad == 0 ? first : up,
-                expert, input_k, output_n, column, k_begin, valid_k, 0, cache_hint);
-        } else {
-            load_fp4_columns<BlockK, PackedColumns, 64>(raw_address, first,
-                expert, input_k, output_n, column, k_begin, valid_k, 0, cache_hint);
-            load_fp4_columns<BlockK, PackedColumns, 64>(raw_address, up,
-                expert, input_k, output_n, column, k_begin, valid_k, 64, cache_hint);
-        }
-    } else {
-        load_fp4_columns<BlockK, PackedColumns, PackedColumns>(raw_address, first,
-            expert, input_k, output_n, n_block * 256 + n_mad, k_begin, valid_k, 0, cache_hint);
-    }
+    const uint32_t column = n_block * 128;
+    load_zn_tile<BlockK, 128>(raw_address, first, expert, input_k, output_n,
+                              0, column, k_begin, cache_hint);
+    load_zn_tile<BlockK, 128>(raw_address, up,
+                              expert, input_k, output_n, 128, column,
+                              k_begin, cache_hint);
 }
 
-template <uint32_t BlockK, uint32_t MadN>
-AICORE inline void decode_routed_panel(uint32_t raw_address, uint32_t nz_address, bool shifted_scale = false) {
-#if MOE_PACKED_ROUTED_WEIGHTS
-    static_assert(BlockK * MadN == 65536);
-    deep_gemm::mega_moe::expand_scaled_linear(reinterpret_cast<__ubuf__ int8_t*>(raw_address),
-                                              reinterpret_cast<__ubuf__ int8_t*>(nz_address));
-    return;
-#endif
-    using Packed = pto::Tile<pto::TileType::Vec, float4_e2m1x2_t, BlockK, MadN>;
-    using NZ = pto::Tile<pto::TileType::Vec, float8_e4m3_t, BlockK, MadN,
-                         pto::BLayout::ColMajor, BlockK, MadN, pto::SLayout::RowMajor,
-                         512, pto::PadValue::Null, pto::CompactMode::RowPlusOne>;
-    static_assert(NZ::StorageBytes == (BlockK + 1) * MadN);
-    Packed packed;
-    NZ nz;
-    pto::TASSIGN(packed, raw_address);
-    pto::TASSIGN(nz, nz_address);
-#if MOE_TOKENS <= 80
-    // B / 64 pairs with the guarded +6 exponent shift in streamed W2 scales.
-    if (shifted_scale)
-        deep_gemm::mega_moe::vf_fp4_to_fp8_nz<BlockK, MadN>(
-            reinterpret_cast<__ubuf__ uint8_t*>(raw_address), reinterpret_cast<__ubuf__ uint8_t*>(nz_address));
-    else
-#endif
-        pto::TCVT(nz, packed, pto::RoundMode::CAST_RINT);
+template <uint32_t BlockK>
+AICORE inline void decode_routed_panel(uint32_t raw_address, uint32_t zn_base, uint32_t stage_idx) {
+    static_assert(BlockK == 256);
+    expand_zn_fp4(reinterpret_cast<__ubuf__ int8_t*>(raw_address),
+                  reinterpret_cast<__ubuf__ int8_t*>(zn_base + stage_idx * BlockK * 256));
+}
+
+template <uint32_t BlockK>
+AICORE inline void store_routed_panel(uint32_t destination, uint32_t zn_base, uint32_t stage_idx) {
+    static_assert(BlockK == 256);
+    store_zn_tile<BlockK>(destination, zn_base + stage_idx * BlockK * 256);
 }
 #endif
 
 #if defined(__DAV_CUBE__) || defined(__CPU_SIM)
-template <uint32_t Columns>
-AICORE inline void load_scale_columns(uint32_t destination, __gm__ const uint8_t* scales,
-                                      uint32_t experts, uint32_t input_k, uint32_t output_n,
-                                      uint32_t expert, uint32_t column, uint32_t k_begin,
-                                      uint32_t valid_pairs, asc_load_l2_cache_mode cache_hint) {
+template <uint32_t BlockK, uint32_t MadK, uint32_t MadN>
+AICORE inline void copy_zn_l1_to_l0b(uint32_t destination, uint32_t source, uint32_t k_begin) {
+    using Mat = pto::Tile<pto::TileType::Mat, float8_e4m3_t, BlockK, MadN, pto::BLayout::RowMajor,
+                          BlockK, MadN, pto::SLayout::ColMajor, 512>;
+    Mat tile;
+    pto::TileRight<float8_e4m3_t, MadK, MadN> right;
+    pto::TASSIGN(tile, source);
+    pto::TASSIGN(right, destination);
+    pto::TEXTRACT(right, tile, k_begin, 0);
+}
+
+template <pto::Layout SourceLayout, uint32_t Columns>
+AICORE inline void load_scale_columns_pto(uint32_t destination, __gm__ const uint8_t* scales,
+                                          uint32_t input_k, uint32_t output_n,
+                                          uint32_t expert, uint32_t column, uint32_t k_begin,
+                                          uint32_t valid_pairs, asc_load_l2_cache_mode cache_hint) {
     constexpr uint32_t ScaleRows = 64;
     using Scale = pto::Tile<pto::TileType::Mat, float8_e8m0_t, ScaleRows, Columns,
                             pto::BLayout::ColMajor, pto::DYNAMIC, Columns,
                             pto::SLayout::ColMajor, 32>;
     using Global = pto::GlobalTensor<float8_e8m0_t,
-        pto::TileShape2D<float8_e8m0_t, pto::DYNAMIC, Columns, pto::Layout::MX_B_NN>,
-        pto::BaseShape2D<float8_e8m0_t, pto::DYNAMIC, pto::DYNAMIC, pto::Layout::MX_B_NN>,
-        pto::Layout::MX_B_NN>;
-    const uint64_t scale_rows = static_cast<uint64_t>(experts) * (input_k / 32);
-    const uint64_t offset = column * scale_rows + (expert * (input_k / 32) + k_begin / 32) * 16;
+        pto::TileShape2D<float8_e8m0_t, pto::DYNAMIC, Columns, SourceLayout>,
+        pto::BaseShape2D<float8_e8m0_t, pto::DYNAMIC, pto::DYNAMIC, SourceLayout>, SourceLayout>;
+    uint64_t offset = 0;
+    if constexpr (SourceLayout == pto::Layout::MX_B_DN) {
+        offset = static_cast<uint64_t>(expert) * output_n * (input_k / 32) +
+                 column * (input_k / 32) + k_begin / 32;
+    } else {
+        offset = static_cast<uint64_t>(column) * (input_k / 32) + (k_begin / 32) * 16;
+    }
     Scale target(valid_pairs * 2);
     pto::TASSIGN(target, destination);
     Global source(reinterpret_cast<__gm__ float8_e8m0_t*>(const_cast<__gm__ uint8_t*>(scales)) + offset,
                   typename Global::Shape(valid_pairs * 2, Columns),
-                  typename Global::Stride(scale_rows, output_n));
+                  typename Global::Stride(input_k / 32, output_n));
     if constexpr (MOE_TOKENS <= 80) {
         if (cache_hint == asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM)
             pto::TLOAD<pto::TLoadL2Hint::NormalFirstVictim>(target, source);
@@ -2092,19 +1986,34 @@ AICORE inline void load_scale_columns(uint32_t destination, __gm__ const uint8_t
     }
 }
 
+template <uint32_t Columns>
+AICORE inline void load_scale_columns(uint32_t destination, __gm__ const uint8_t* scales,
+                                      uint32_t experts, uint32_t input_k, uint32_t output_n,
+                                      uint32_t expert, uint32_t column, uint32_t k_begin,
+                                      uint32_t valid_pairs, asc_load_l2_cache_mode cache_hint, bool shared) {
+    (void)experts;
+    if (shared) {
+        load_scale_columns_pto<pto::Layout::MX_B_NN, Columns>(destination, scales, input_k, output_n,
+            expert, column, k_begin, valid_pairs, cache_hint);
+    } else {
+        load_scale_columns_pto<pto::Layout::MX_B_DN, Columns>(destination, scales, input_k, output_n,
+            expert, column, k_begin, valid_pairs, cache_hint);
+    }
+}
+
 AICORE inline void load_weight_scales(uint32_t destination, __gm__ const uint8_t* first,
                                       __gm__ const uint8_t* up, bool linear1,
                                       uint32_t experts, uint32_t input_k, uint32_t output_n,
                                       uint32_t expert, uint32_t n_block, uint32_t k_begin,
-                                      uint32_t valid_pairs, asc_load_l2_cache_mode cache_hint) {
+                                      uint32_t valid_pairs, asc_load_l2_cache_mode cache_hint, bool shared) {
     if (linear1) {
         load_scale_columns<128>(destination, first, experts, input_k, output_n,
-                                expert, n_block * 128, k_begin, valid_pairs, cache_hint);
+                                expert, n_block * 128, k_begin, valid_pairs, cache_hint, shared);
         load_scale_columns<128>(destination + 64 * 128, up, experts, input_k, output_n,
-                                expert, n_block * 128, k_begin, valid_pairs, cache_hint);
+                                expert, n_block * 128, k_begin, valid_pairs, cache_hint, shared);
     } else {
         load_scale_columns<256>(destination, first, experts, input_k, output_n,
-                                expert, n_block * 256, k_begin, valid_pairs, cache_hint);
+                                expert, n_block * 256, k_begin, valid_pairs, cache_hint, shared);
     }
 }
 
@@ -2115,15 +2024,14 @@ AICORE inline void load_shared_columns(uint32_t destination, __gm__ const uint8_
     using Matrix = pto::Tile<pto::TileType::Mat, float8_e4m3_t, BlockK, Columns,
                              pto::BLayout::ColMajor, pto::DYNAMIC, Columns,
                              pto::SLayout::RowMajor, 512>;
-    using Global = pto::GlobalTensor<float8_e4m3_t, pto::Shape<1, 1, 1, pto::DYNAMIC, Columns>,
-                                    pto::Stride<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, 1>>;
+    using Shape = pto::TileShape2D<float8_e4m3_t, BlockK, Columns, pto::Layout::NZ>;
+    using Base = pto::BaseShape2D<float8_e4m3_t, pto::DYNAMIC, pto::DYNAMIC, pto::Layout::NZ>;
+    using Global = pto::GlobalTensor<float8_e4m3_t, Shape, Base, pto::Layout::NZ>;
     Matrix target(valid_k);
     pto::TASSIGN(target, destination);
     Global source(reinterpret_cast<__gm__ float8_e4m3_t*>(const_cast<__gm__ uint8_t*>(weights)) +
-                      static_cast<uint64_t>(k_begin) * output_n + column,
-                  typename Global::Shape(1, 1, 1, valid_k, Columns),
-                  typename Global::Stride(input_k * output_n, input_k * output_n,
-                                         input_k * output_n, output_n, 1));
+                      static_cast<uint64_t>(column) * input_k + k_begin * 32,
+                  Shape(), Base(input_k, output_n));
     pto::TLOAD(target, source);
 }
 
@@ -2144,8 +2052,8 @@ AICORE inline void load_shared_panel(uint32_t destination, __gm__ const uint8_t*
 }
 #endif
 
-}  // namespace deep_gemm::mega_moe::original_weights
-// END PyPTO adapter: original expert weight layout
+}  // namespace deep_gemm::mega_moe::cann_weights
+// END PyPTO adapter: CANN expert weight layouts
 
 /*
  * Operation-private DeepSeek V4.1 MoE pipeline port.
@@ -2197,13 +2105,9 @@ namespace deep_gemm::mega_moe {
 using layout::BLOCK_M;
 using layout::BLOCK_N;
 
-// Double-buffer L0A/B; L1 has two or three A stages and four routed B stages.
+// Double-buffer L0A/B; L1 has three A stages and four routed B stages.
 constexpr uint32_t kNumL0Stages = 2;
-#if MOE_STREAM_W2_SCALES
-constexpr uint32_t kNumL1AStages = 2;
-#else
 constexpr uint32_t kNumL1AStages = 3;
-#endif
 constexpr uint32_t kNumL1BStages = 4, kNumSFStages = 2;
 constexpr uint32_t kL1BBase = 3 * L0ASizeBytes;
 
@@ -2241,8 +2145,7 @@ struct MMAConfig {
 
 // AIC layout (KiB); shared and routed B occupy the same L1 region
 // Memory  Region       Offset  Stages x size
-// L1      A                 0      2 x 64 (streamed W2 SF), otherwise 3 x 64
-//         W2 SF           128      2 x 16 (streamed W2 SF only)
+// L1      A                 0      3 x 64
 //         routed B        192      4 x 64
 //         shared B        192      2 x 128 (M=128), 3 x 64 (M=256)
 //         A SF            448      2 x 16
@@ -2251,7 +2154,7 @@ struct MMAConfig {
 // L0B     B                 0      2 x 32
 // L0C     FP32 accum        0      2 x 64 (M=128), 1 x 256 (M=256)
 
-// AIC: L1A 0–1 or 0–2, SF 3–4, shared L1B 5–6 or 5–7
+// AIC: L1A 0–2, SF 3–4, shared L1B 5–6 or 5–7
 constexpr PipeEvent<PIPE_MTE2, PIPE_MTE1> kL1AFull{0}, kSFFull{3}, kSharedL1BFull{5};
 constexpr PipeEvent<PIPE_MTE1, PIPE_MTE2> kL1AEmpty{0}, kSFEmpty{3}, kSharedL1BEmpty{5};
 
@@ -2259,7 +2162,7 @@ constexpr PipeEvent<PIPE_MTE1, PIPE_MTE2> kL1AEmpty{0}, kSFEmpty{3}, kSharedL1BE
 constexpr PipeEvent<PIPE_MTE1, PIPE_M> kL0AFull{0}, kL0BFull{2};
 constexpr PipeEvent<PIPE_M, PIPE_MTE1> kL0AEmpty{0}, kL0BEmpty{2};
 
-// AIV0: FP4 has 3 stages at 0; NZ has 2 stages at 0
+// AIV0: FP4 has 3 stages at 0; decoded FP8 has 2 stages at 0
 constexpr PipeEvent<PIPE_MTE2, PIPE_V> kFP4Full{0};
 constexpr PipeEvent<PIPE_V, PIPE_MTE2> kFP4Empty{0};
 constexpr PipeEvent<PIPE_V, PIPE_MTE3> kNZFull{0};
@@ -2288,12 +2191,6 @@ constexpr PipeEvent<PIPE_MTE3, PIPE_S> kCommDone{3};
 // Metadata uses flag 2 before routed L1B stages 0–3
 constexpr IntraBlockEvent<0> kMetadataFull{2};
 constexpr IntraBlockEvent<0> kL1BFull{0}, kL1BEmpty{0};
-// AIV0/AIC streamed W2 scales use separate intra-block flags 4–5.
-constexpr IntraBlockEvent<0> kStreamSFFull{4}, kStreamSFEmpty{4};
-constexpr PipeEvent<PIPE_MTE2, PIPE_V> kStreamSFLoaded{5};
-constexpr PipeEvent<PIPE_V, PIPE_S> kStreamSFChecked{5};
-constexpr PipeEvent<PIPE_V, PIPE_MTE3> kStreamSFConverted{5};
-constexpr PipeEvent<PIPE_MTE3, PIPE_MTE2> kStreamSFUBEmpty{5};
 
 // AIC/AIV1: FIX -> V/S full, MTE3/S -> FIX empty
 // Linear1 and Linear2 share the same epilogue credits
@@ -2510,63 +2407,7 @@ __aicore__ __forceinline__ void combine_reduce(__gm__ uint8_t* buffer, __gm__ bf
     }
 }
 
-#if MOE_STREAM_W2_SCALES
-// Shift sixteen N16 SF panels by +6 and flag any original byte >= 249.
-// Each panel has a 1024-byte physical pitch; valid bytes are a multiple of 256.
-__simd_vf__ inline void stream_shift_sf(__ubuf__ uint8_t* data, __ubuf__ uint32_t* status, uint32_t bytes_per_panel) {
-    vector_uint32_t unsafe, lowmask, highmask, part;
-    asc_duplicate_scalar(unsafe, 0u);
-    asc_duplicate_scalar(lowmask, 0x7f7f7f7fu);
-    asc_duplicate_scalar(highmask, 0x80808080u);
-    const auto m32 = asc_create_mask_b32(PAT_ALL);
-    const auto m8 = asc_create_mask_b8(PAT_ALL);
-    for (uint32_t panel = 0; panel < 16; ++panel) {
-        auto* input = data + panel * 1024;
-        auto* output = input;
-        for (uint32_t i = 0; i < bytes_per_panel; i += 256) {
-            vector_uint8_t value;
-            asc_loadalign_postupdate(value, input, 256);
-            auto words = reinterpret_cast<vector_uint32_t&>(value);
-            asc_and(part, words, lowmask, m32);
-            asc_add_scalar(part, part, 0x07070707u, m32);
-            asc_and(part, part, words, m32);
-            asc_and(part, part, highmask, m32);
-            asc_or(unsafe, unsafe, part, m32);
-            asc_add_scalar(value, value, uint8_t{6}, m8);
-            asc_storealign_postupdate(output, value, 256, m8);
-        }
-    }
-    asc_reduce_max(unsafe, unsafe, m32);
-    asc_storealign(status, unsafe, asc_create_mask_b32(PAT_VL1));
-}
-
-// Restore original SF bytes modulo 256 for the exact-conversion fallback.
-__simd_vf__ inline void stream_restore_sf(__ubuf__ uint8_t* data, uint32_t bytes_per_panel) {
-    const auto mask = asc_create_mask_b8(PAT_ALL);
-    for (uint32_t panel = 0; panel < 16; ++panel) {
-        auto* input = data + panel * 1024;
-        auto* output = input;
-        for (uint32_t i = 0; i < bytes_per_panel; i += 256) {
-            vector_uint8_t value;
-            asc_loadalign_postupdate(value, input, 256);
-            asc_add_scalar(value, value, uint8_t{250}, mask);
-            asc_storealign_postupdate(output, value, 256, mask);
-        }
-    }
-}
-
-template <uint32_t Columns>
-__aicore__ inline void load_stream_sf_columns(__ubuf__ uint8_t* destination, __gm__ const uint8_t* source,
-    uint32_t experts, uint32_t num_k, uint32_t expert, uint32_t column, uint32_t k_begin, uint32_t valid_pairs) {
-    const uint64_t scale_rows = static_cast<uint64_t>(experts) * (num_k / 32);
-    const uint64_t offset = column * scale_rows + (expert * (num_k / 32) + k_begin / 32) * 16;
-    asc_copy_gm2ub_align(destination, const_cast<__gm__ uint8_t*>(source) + offset,
-        Columns / 16, valid_pairs * 32, 0, 0, false, asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM,
-        scale_rows * 16, 1024);
-}
-#endif
-
-// AIV0: FP4 weights -> FP8 NZ -> L1B
+// AIV0: FP4 weights -> FP8 ZN -> L1B
 template <const auto& workspace, bool kOverlapReduce, bool kFullTopology>
 __aicore__ inline void aiv0_weight_pipeline(__gm__ uint8_t* buffer, __gm__ bfloat16_t* output,
                                             uint32_t num_tokens, CombineReduceState<workspace, kFullTopology>& reduce, uint32_t num_total_m_blocks,
@@ -2579,27 +2420,17 @@ __aicore__ inline void aiv0_weight_pipeline(__gm__ uint8_t* buffer, __gm__ bfloa
     // AIV0 UB after metadata (KiB)
     // Region   Offset  Stages x size
     // FP4           0      3 x 32
-    // FP8 NZ       96      2 x 64.5
-    // Reduce      225      2 stages within the remaining 31 KiB (overlap reduce)
-    // W2 SF       225      16 KiB (streamed W2 SF, no overlap reduce)
-    // SF status   241      32 bytes
+    // FP8 ZN       96      2 x 64
+    // Reduce      224      2 stages within the remaining 32 KiB (overlap reduce)
     constexpr uint32_t kNumFP4Stages = 3, kNumNZStages = 2;
     constexpr ub_ptr<uint8_t> ub_fp4(1, L0BSizeBytes / 2);
-    constexpr ub_ptr<uint8_t> ub_nz(1, L0BSizeBytes + 512, ub_fp4.offset(kNumFP4Stages));
+    constexpr ub_ptr<uint8_t> ub_nz(1, L0BSizeBytes, ub_fp4.offset(kNumFP4Stages));
     constexpr auto ub_reduce_inputs = make_reduce_buffer<workspace>(ub_nz.offset(kNumNZStages));
-    constexpr uint32_t stream_sf_ub = ub_nz.offset(kNumNZStages);
-    constexpr uint32_t stream_sf_status_ub = stream_sf_ub + 16384;
-    constexpr l1_ptr<int16_t> stream_sfb(BLOCK_N, 32, 2 * L0ASizeBytes);
-    static_assert(MOE_TOKENS > 80 || stream_sf_status_ub + 32 <= UBSizeBytes);
-
     static_assert(ub_nz.offset(kNumNZStages) <= UBSizeBytes and ub_reduce_inputs.shape_n > 0, "AIV0 UB overflow");
 
     // Initialize UB reuse credits; AIC releases the initial L1B credits
     notify<PIPE_V, PIPE_MTE2, kNumFP4Stages>(kFP4Empty);
     notify<PIPE_MTE3, PIPE_V, kNumNZStages>(kNZEmpty);
-#if MOE_STREAM_W2_SCALES
-    notify<PIPE_MTE3, PIPE_MTE2>(kStreamSFUBEmpty);
-#endif
 
     // Size the reduce window from local output tokens
     const uint32_t num_reduce_window_m_blocks = ceil_div(num_tokens, BLOCK_M);
@@ -2608,8 +2439,6 @@ __aicore__ inline void aiv0_weight_pipeline(__gm__ uint8_t* buffer, __gm__ bfloa
     uint32_t fp4_stage_idx = 0, nz_stage_idx = 0;
     uint32_t l1b_stage_idx = 0;
     bool had_routed_task = false;
-    uint32_t stream_sf_stage = 0;
-    bool stream_shifted = false;
 
     while (true) {
         sched::BlockPhase block_phase;
@@ -2626,7 +2455,6 @@ __aicore__ inline void aiv0_weight_pipeline(__gm__ uint8_t* buffer, __gm__ bfloa
         const uint32_t pool_block_idx = task_idx / num_n_blocks;
         const uint32_t n_block_idx = task_idx % num_n_blocks;
         const uint32_t layer_idx = is_linear1 ? 0 : 1;
-        stream_shifted = false;
         const uint32_t valid_m = expert_cursors[layer_idx].advance_to(buffer, pool_block_idx);
         const auto weight_l2_hint = expert_cursors[layer_idx].num_expert_tokens > BLOCK_M ?
             asc_load_l2_cache_mode::NORMAL_LAST_VICTIM : asc_load_l2_cache_mode::NOTALLOC_KEEP;
@@ -2643,79 +2471,27 @@ __aicore__ inline void aiv0_weight_pipeline(__gm__ uint8_t* buffer, __gm__ bfloa
 #endif
             constexpr uint32_t BLOCK_K = MMAConfig<MAD_M>::BLOCK_K;
             constexpr uint32_t MAD_N = MMAConfig<MAD_M>::MAD_N;
-            constexpr uint32_t kNumColGroups = MAD_N / get_frac_k<uint8_t>();
-            constexpr l1_ptr<float8_e4m3_t, Major::MN> l1b(MAD_N, BLOCK_K, kL1BBase);
+            constexpr l1_ptr<float8_e4m3_t, Major::K> l1b(MAD_N, BLOCK_K, kL1BBase);
 
             for (uint32_t k_idx = 0; k_idx < num_k; k_idx += BLOCK_K) {
                 // valid_k remains a multiple of MAD_K, including the final K block
                 const uint32_t valid_k = min(BLOCK_K, num_k - k_idx);
-                bool first_panel_prefetched = false;
-#if MOE_STREAM_W2_SCALES
-                if (not is_linear1 and k_idx % 2048 == 0) {
-                    const uint32_t valid_pairs = min(32u, (num_k - k_idx) / 64);
-                    const uint32_t bytes_per_panel = valid_pairs * 32;
-                    wait<PIPE_MTE3, PIPE_MTE2>(kStreamSFUBEmpty);
-                    auto* scale_ub = reinterpret_cast<__ubuf__ uint8_t*>(stream_sf_ub);
-                    auto* first_sf = reinterpret_cast<__gm__ const uint8_t*>(is_linear1 ? weights.l1.sf : weights.l2.sf);
-                    if (is_linear1) {
-                        load_stream_sf_columns<128>(scale_ub, first_sf, config.num_experts / config.num_ranks,
-                            num_k, weight_expert, n_block_idx * 128, k_idx, valid_pairs);
-                        load_stream_sf_columns<128>(scale_ub + 8192, reinterpret_cast<__gm__ const uint8_t*>(weights.l1_up.sf),
-                            config.num_experts / config.num_ranks, num_k, weight_expert, n_block_idx * 128, k_idx, valid_pairs);
-                    } else {
-                        load_stream_sf_columns<256>(scale_ub, first_sf, config.num_experts / config.num_ranks,
-                            num_k, weight_expert, n_block_idx * 256, k_idx, valid_pairs);
-                    }
-                    notify<PIPE_MTE2, PIPE_V>(kStreamSFLoaded);
-                    // Prefetch raw weights into a protected slot before checking the SF chunk.
-                    wait<PIPE_V, PIPE_MTE2>(kFP4Empty, fp4_stage_idx);
-#ifdef __DAV_VEC__
-                    original_weights::load_routed_panel<BLOCK_K, MAD_N>(
-                        ub_fp4[fp4_stage_idx].addr, first_weight, up_weight, is_linear1,
-                        weight_expert, num_k, weight_output_n, n_block_idx, 0, k_idx, valid_k, weight_l2_hint);
-#endif
-                    notify<PIPE_MTE2, PIPE_V>(kFP4Full, fp4_stage_idx);
-                    first_panel_prefetched = true;
-                    wait<PIPE_MTE2, PIPE_V>(kStreamSFLoaded);
-                    // Partial 256-byte SF slices retain the original scale and exact conversion.
-                    stream_shifted = false;
-                    if (bytes_per_panel % 256 == 0) {
-                        auto* status = reinterpret_cast<__ubuf__ uint32_t*>(stream_sf_status_ub);
-                        stream_shift_sf(scale_ub, status, bytes_per_panel);
-                        notify<PIPE_V, PIPE_S>(kStreamSFChecked);
-                        wait<PIPE_V, PIPE_S>(kStreamSFChecked);
-                        stream_shifted = *status == 0;
-                        if (not stream_shifted)
-                            stream_restore_sf(scale_ub, bytes_per_panel);
-                    }
-                    notify<PIPE_V, PIPE_MTE3>(kStreamSFConverted);
-                    wait<PIPE_V, PIPE_MTE3>(kStreamSFConverted);
-                    wait_intra_block<PIPE_MTE3, 0>(kStreamSFEmpty, stream_sf_stage);
-                    asc_copy_ub2l1(stream_sfb[stream_sf_stage].template ptr<uint8_t>(), scale_ub,
-                        16, valid_pairs, 32 - valid_pairs, 32 - valid_pairs);
-                    notify_intra_block<PIPE_MTE3, 0>(kStreamSFFull, stream_sf_stage);
-                    notify<PIPE_MTE3, PIPE_MTE2>(kStreamSFUBEmpty);
-                    stream_sf_stage = (stream_sf_stage + 1) % kNumSFStages;
-                }
-#endif
                 for (uint32_t n_mad_idx = 0; n_mad_idx < BLOCK_N; n_mad_idx += MAD_N) {
                     // The SF-boundary first panel was already loaded into this protected slot.
-                    if (not first_panel_prefetched or n_mad_idx != 0) {
-                        wait<PIPE_V, PIPE_MTE2>(kFP4Empty, fp4_stage_idx);
+                    wait<PIPE_V, PIPE_MTE2>(kFP4Empty, fp4_stage_idx);
 #ifdef __DAV_VEC__
-                        original_weights::load_routed_panel<BLOCK_K, MAD_N>(
-                            ub_fp4[fp4_stage_idx].addr, first_weight, up_weight, is_linear1,
-                            weight_expert, num_k, weight_output_n, n_block_idx, n_mad_idx, k_idx, valid_k, weight_l2_hint);
+                    cann_weights::load_routed_panel<BLOCK_K>(
+                        ub_fp4[fp4_stage_idx].addr, first_weight, up_weight, is_linear1,
+                        weight_expert, num_k, weight_output_n, n_block_idx, n_mad_idx, k_idx, valid_k, weight_l2_hint);
 #endif
-                        notify<PIPE_MTE2, PIPE_V>(kFP4Full, fp4_stage_idx);
-                    }
+                    notify<PIPE_MTE2, PIPE_V>(kFP4Full, fp4_stage_idx);
 
-                    // Dequantize to FP8 NZ
+                    // Dequantize directly from CANN ZN to compact FP8 ZN.
                     wait<PIPE_MTE2, PIPE_V>(kFP4Full, fp4_stage_idx);
                     wait<PIPE_MTE3, PIPE_V>(kNZEmpty, nz_stage_idx);
 #ifdef __DAV_VEC__
-                    original_weights::decode_routed_panel<BLOCK_K, MAD_N>(
-                        ub_fp4[fp4_stage_idx].addr, ub_nz[nz_stage_idx].addr, stream_shifted);
+                    cann_weights::decode_routed_panel<BLOCK_K>(
+                        ub_fp4[fp4_stage_idx].addr, ub_nz.addr, nz_stage_idx);
 #endif
                     notify<PIPE_V, PIPE_MTE2>(kFP4Empty, fp4_stage_idx);
                     notify<PIPE_V, PIPE_MTE3>(kNZFull, nz_stage_idx);
@@ -2723,7 +2499,10 @@ __aicore__ inline void aiv0_weight_pipeline(__gm__ uint8_t* buffer, __gm__ bfloa
                     // Publish L1B to AIC
                     wait<PIPE_V, PIPE_MTE3>(kNZFull, nz_stage_idx);
                     wait_intra_block<PIPE_MTE3, 0>(kL1BEmpty, l1b_stage_idx);
-                    asc_copy_ub2l1(l1b[l1b_stage_idx].template ptr<uint8_t>(), ub_nz[nz_stage_idx].ptr(), kNumColGroups, BLOCK_K, 1, 0);
+#ifdef __DAV_VEC__
+                    cann_weights::store_routed_panel<BLOCK_K>(
+                        l1b[l1b_stage_idx].addr, ub_nz.addr, nz_stage_idx);
+#endif
                     notify_intra_block<PIPE_MTE3, 0>(kL1BFull, l1b_stage_idx);
                     notify<PIPE_MTE3, PIPE_V>(kNZEmpty, nz_stage_idx);
 
@@ -2763,10 +2542,6 @@ __aicore__ inline void aiv0_weight_pipeline(__gm__ uint8_t* buffer, __gm__ bfloa
     if (had_routed_task) {
         wait_intra_block<PIPE_MTE3, 0, kNumL1BStages>(kL1BEmpty);
     }
-#if MOE_STREAM_W2_SCALES
-    wait_intra_block<PIPE_MTE3, 0, kNumSFStages>(kStreamSFEmpty);
-    wait<PIPE_MTE3, PIPE_MTE2>(kStreamSFUBEmpty);
-#endif
 }
 
 // AIC: shared and routed GEMMs
@@ -2780,8 +2555,6 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
     constexpr l1_ptr<int16_t> l1_sfa(BLOCK_M, kNumSFPairsPerChunk,
                                    kL1BBase + kNumL1BStages * L0BSizeBytes);
     constexpr l1_ptr<int16_t> l1_sfb(BLOCK_N, kNumSFPairsPerChunk, l1_sfa.offset(kNumSFStages));
-    constexpr l1_ptr<int16_t> l1_w2_sfb(BLOCK_N, kNumSFPairsPerChunk, 2 * L0ASizeBytes);
-    static_assert(MOE_TOKENS > 80 || l1_w2_sfb.offset(kNumSFStages) <= kL1BBase);
     constexpr ub_ptr<bfloat16_t> ub_accum(STORE_BLOCK_M, BLOCK_N);
     static_assert(l1_sfb.offset(kNumSFStages) <= L1SizeBytes, "L1 overflow");
 
@@ -2797,9 +2570,6 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
     notify<PIPE_M, PIPE_MTE1, kNumL0Stages>(kL0BEmpty);
     notify<PIPE_MTE1, PIPE_MTE2, kNumL1AStages>(kL1AEmpty);
     notify<PIPE_MTE1, PIPE_MTE2, kNumSFStages>(kSFEmpty);
-#if MOE_STREAM_W2_SCALES
-    notify_intra_block<PIPE_MTE1, 0, kNumSFStages>(kStreamSFEmpty);
-#endif
     if constexpr (kHasSharedExperts)
         notify<PIPE_MTE1, PIPE_MTE2, 3>(kSharedL1BEmpty);
 
@@ -2808,7 +2578,6 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
     uint32_t l1a_stage_idx = 0;
     uint32_t l1b_stage_idx = 0;
     uint32_t sf_stage_idx = 0;
-    uint32_t w2_sf_stage_idx = 0;
     uint8_t num_issued_gemms = 0;
     bool routed_l1b_initialized = false;
     uint32_t num_total_m_blocks = 0;  // Routed pool only; shared blocks are separate
@@ -2888,7 +2657,7 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
             constexpr auto l0_full = BLOCK_N == MAD_N ? kL0AFull : kL0BFull;
             constexpr uint32_t kNumSharedL1BStages = MMAConfig<MAD_M>::get_num_shared_l1b_stages();
             constexpr l1_ptr<float8_e4m3_t, Major::K> l1a(L0ASizeBytes / BLOCK_K, BLOCK_K, 0);
-            constexpr l1_ptr<float8_e4m3_t, Major::MN> l1b(MAD_N, BLOCK_K, kL1BBase);
+            constexpr l1_ptr<float8_e4m3_t, Major::K> l1b(MAD_N, BLOCK_K, kL1BBase);
             constexpr l1_ptr<float8_e4m3_t, Major::MN> shared_l1b(BLOCK_N, BLOCK_K, l1b.addr);
             // The empty events protect physical slots across expert tasks.
             // Keep their pitch fixed when consecutive tasks select different MAD_M.
@@ -2908,25 +2677,22 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
                 if (is_shared) {
                     wait<PIPE_MTE1, PIPE_MTE2>(kSharedL1BEmpty, l1b_stage_idx);
 #ifdef __DAV_CUBE__
-                    original_weights::load_shared_panel<BLOCK_K>(shared_l1b[l1b_stage_idx].addr,
+                    cann_weights::load_shared_panel<BLOCK_K>(shared_l1b[l1b_stage_idx].addr,
                         task_weights.data, up_weights.data, is_linear1, num_k, weight_output_n,
                         n_block_idx, k_idx, valid_k);
 #endif
                     notify<PIPE_MTE2, PIPE_MTE1>(kSharedL1BFull, l1b_stage_idx);
                 }
 
-                // Load weight scales once per SF chunk
+                // Load resident weight scales directly from GM to L1 once per SF chunk.
                 if (sf_pair_idx % kNumSFPairsPerChunk == 0) {
                     wait<PIPE_MTE1, PIPE_MTE2>(kSFEmpty, sf_stage_idx);
 #ifdef __DAV_CUBE__
-#if MOE_STREAM_W2_SCALES
-                    if (is_shared or is_linear1)
-#endif
-                    original_weights::load_weight_scales(l1_sfb[sf_stage_idx].addr,
+                    cann_weights::load_weight_scales(l1_sfb[sf_stage_idx].addr,
                         reinterpret_cast<__gm__ const uint8_t*>(task_weights.sf),
                         reinterpret_cast<__gm__ const uint8_t*>(up_weights.sf), is_linear1,
                         weight_experts, num_k, weight_output_n, weight_expert, n_block_idx,
-                        k_idx, num_chunk_pairs, weight_sf_l2_hint);
+                        k_idx, num_chunk_pairs, weight_sf_l2_hint, is_shared);
 #endif
                 }
 
@@ -2985,17 +2751,18 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
                         const uint32_t l0c_idx = n_mad_idx / MAD_N;
                         const uint32_t l0b_stage_idx = (l0a_stage_idx * (BLOCK_N / MAD_N) + l0c_idx) % kNumL0Stages;
                         wait<PIPE_M, PIPE_MTE1>(kL0BEmpty, l0b_stage_idx);
-                        const auto l1b_src = is_shared ? shared_l1b[l1b_stage_idx] : l1b[(l1b_stage_idx + n_mad_idx / MAD_N) % kNumL1BStages];
                         const auto l0b_mad = l0b[l0b_stage_idx].as_mad_aligned(MAD_N, MAD_K);
-                        copy_l1_to_l0b(l0b_mad, l1b_src, is_shared ? n_mad_idx : 0, k_mad_idx);
-#if MOE_STREAM_W2_SCALES
-                        if (not is_shared and not is_linear1 and sf_pair_idx % kNumSFPairsPerChunk == 0 and k_mad_idx == 0 and n_mad_idx == 0)
-                            wait_intra_block<PIPE_MTE1, 0>(kStreamSFFull, w2_sf_stage_idx);
-                        const auto b_scale = not is_shared and not is_linear1 ? l1_w2_sfb[w2_sf_stage_idx] : l1_sfb[sf_stage_idx];
-#else
-                        const auto b_scale = l1_sfb[sf_stage_idx];
+                        if (is_shared) {
+                            const auto l1b_src = shared_l1b[l1b_stage_idx];
+                            copy_l1_to_l0b(l0b_mad, l1b_src, n_mad_idx, k_mad_idx);
+                        } else {
+                            const auto l1b_src = l1b[(l1b_stage_idx + n_mad_idx / MAD_N) % kNumL1BStages];
+#ifdef __DAV_CUBE__
+                            cann_weights::copy_zn_l1_to_l0b<BLOCK_K, MAD_K, MAD_N>(
+                                l0b_mad.addr, l1b_src.addr, k_mad_idx);
 #endif
-                        copy_l1_to_l0b_mx(l0b_mad, b_scale, n_mad_idx, sf_pair_idx_in_chunk, MAD_K);
+                        }
+                        copy_l1_to_l0b_mx(l0b_mad, l1_sfb[sf_stage_idx], n_mad_idx, sf_pair_idx_in_chunk, MAD_K);
                         notify<PIPE_MTE1, PIPE_M>(l0_full, l0b_stage_idx);
 
                         // B readiness also covers the earlier A/scales loads on the same MTE1 queue
@@ -3057,12 +2824,6 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
 
                 if ((sf_pair_idx + BLOCK_K / MX_SF_DIVISOR) % kNumSFPairsPerChunk == 0 or k_idx + valid_k == num_k) {
                     notify<PIPE_MTE1, PIPE_MTE2>(kSFEmpty, sf_stage_idx);
-#if MOE_STREAM_W2_SCALES
-                    if (not is_shared and not is_linear1) {
-                        notify_intra_block<PIPE_MTE1, 0>(kStreamSFEmpty, w2_sf_stage_idx);
-                        w2_sf_stage_idx = (w2_sf_stage_idx + 1) % kNumSFStages;
-                    }
-#endif
                     sf_stage_idx = (sf_stage_idx + 1) % kNumSFStages;
                 }
             }
@@ -3278,14 +3039,6 @@ __aicore__ inline void aiv1_epilogue_comm(__gm__ uint8_t* buffer, __gm__ bfloat1
                           config.num_input_sf_pairs * sizeof(int16_t), asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM);
             notify<PIPE_MTE2, PIPE_MTE3>(kPullFull, stage_idx);
 
-#if MOE_PACKED_ROUTED_WEIGHTS
-            notify<PIPE_MTE2, PIPE_V>(PipeEvent<PIPE_MTE2, PIPE_V>{2}, stage_idx);
-            wait<PIPE_MTE2, PIPE_V>(PipeEvent<PIPE_MTE2, PIPE_V>{2}, stage_idx);
-            compensate_routed_scale(reinterpret_cast<__ubuf__ uint8_t*>(ub_pull_sf[stage_idx].ptr()),
-                                    config.num_input_sf_pairs * sizeof(int16_t));
-            notify<PIPE_V, PIPE_MTE3>(PipeEvent<PIPE_V, PIPE_MTE3>{2}, stage_idx);
-            wait<PIPE_V, PIPE_MTE3>(PipeEvent<PIPE_V, PIPE_MTE3>{2}, stage_idx);
-#endif
             // Stage routed inputs
             wait<PIPE_MTE2, PIPE_MTE3>(kPullFull, stage_idx);
             copy_ub_to_gm(l1_acts + ring_m_idx * config.hidden,
@@ -3586,8 +3339,7 @@ __aicore__ inline void mega_moe_device(__gm__ bfloat16_t* output, __gm__ int32_t
     // Measured 32 MiB combine-work threshold for tail reduction
     // For the balanced 4096-row specialization, waiting once after the last
     // combine avoids repeatedly polling route readiness across all experts.
-    constexpr bool kOverlapReduce = static_cast<uint64_t>(config.num_max_tokens_per_rank) *
-        (config.num_topk + (config.num_shared_experts > 0)) * config.hidden * sizeof(bfloat16_t) > 32ull * 1024 * 1024;
+    constexpr bool kOverlapReduce = config.overlap_reduce();
 
     constexpr uint32_t kNumExpertsPerRank = config.num_experts / config.num_ranks;
 
@@ -3758,6 +3510,74 @@ __aicore__ inline Global<T> global(__gm__ T* pointer, uint32_t rows, uint32_t co
                      typename Global<T>::Stride(1, 1, 1, stride, 1));
 }
 
+#if defined(__DAV_VEC__) && defined(PTO_NPU_ARCH_A5)
+using moe_input_quant::Columns;
+
+// Two independent 32-lane reductions yield the MX exponent pair. Its power-of-two
+// reciprocal is exactly representable for the clamped BF16 activation range.
+template <int RowCount, typename ScaleTile>
+__tf__ __aicore__ inline void quantize_panel(
+    typename moe_input_quant::Vec<uint8_t, RowCount, Columns>::TileDType __out__ payload, typename ScaleTile::TileDType __out__ scales,
+    typename moe_input_quant::Vec<bfloat16_t, RowCount, Columns>::TileDType __in__ input, uint32_t part) {
+    auto src = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(input);
+    auto dst = (__ubuf__ uint8_t*)__cce_get_tile_ptr(payload);
+    auto packed_scales = (__ubuf__ uint16_t*)__cce_get_tile_ptr(scales);
+    __VEC_SCOPE__ {
+        MaskReg all = pset_b32(PAT_ALL), all8 = pset_b8(PAT_ALL);
+        uint32_t count64 = 64, count1 = 1;
+        MaskReg bytes64 = CreatePredicate<uint8_t>(count64);
+        MaskReg half1 = CreatePredicate<uint16_t>(count1);
+        MaskReg first_group = pset_b32(PAT_VL32), second_group;
+        pnot(second_group, first_group, all);
+        RegTensor<int32_t> reciprocal_bias;
+        vdup(reciprocal_bias, 254, all, MODE_ZEROING);
+        RegTensor<uint8_t> byte_index;
+        vci((RegTensor<int8_t>&)byte_index, static_cast<int8_t>(0), INC_ORDER);
+        vmuls((RegTensor<int16_t>&)byte_index, (RegTensor<int16_t>&)byte_index,
+              static_cast<int16_t>(4), all8);
+        RegTensor<float> floor, lower, upper;
+        vdup(floor, 1e-4f, all, MODE_ZEROING);
+        vdup(lower, -448.0f, all, MODE_ZEROING);
+        vdup(upper, 448.0f, all, MODE_ZEROING);
+        for (uint16_t row = 0; row < RowCount; ++row) {
+            for (uint16_t segment = 0; segment < Columns / 64; ++segment) {
+                RegTensor<float> x, maximum, low_max, high_max, reciprocal;
+                RegTensor<int32_t> exponent;
+                RegTensor<bfloat16_t> raw;
+                vlds(raw, src, row * Columns + segment * 64, UNPK_B16);
+                vcvt(x, raw, all, PART_EVEN);
+                vabs(maximum, x, all, MODE_ZEROING);
+                vcmax(low_max, maximum, first_group);
+                vcmax(high_max, maximum, second_group);
+                vdup(low_max, low_max, all, POS_LOWEST, MODE_ZEROING);
+                vdup(high_max, high_max, all, POS_LOWEST, MODE_ZEROING);
+                vsel(maximum, low_max, high_max, first_group);
+                vmax(maximum, maximum, floor, all, MODE_ZEROING);
+                vmuls(maximum, maximum, 1.0f / 448.0f, all, MODE_ZEROING);
+                vadds(exponent, (RegTensor<int32_t>&)maximum, 8388607, all, MODE_ZEROING);
+                vshrs(exponent, exponent, 23, all, MODE_ZEROING);
+                RegTensor<int32_t> reciprocal_code;
+                vsub(reciprocal_code, reciprocal_bias, exponent, all, MODE_ZEROING);
+                vshls((RegTensor<int32_t>&)reciprocal, reciprocal_code, 23, all, MODE_ZEROING);
+                vmul(x, x, reciprocal, all, MODE_ZEROING);
+                vmax(x, x, lower, all, MODE_ZEROING); vmin(x, x, upper, all, MODE_ZEROING);
+                vector_f8e4m3 converted;
+                RegTensor<uint8_t> packed;
+                vcvt(converted, x, all, ROUND_R, RS_DISABLE, PART_P0);
+                vselr(packed, (RegTensor<uint8_t>&)converted, byte_index);
+                vsts(packed, dst, row * Columns + segment * 64, NORM_B8, bytes64);
+                RegTensor<uint32_t> e0, e1;
+                vdup(e0, (RegTensor<uint32_t>&)exponent, all, POS_LOWEST, MODE_ZEROING);
+                vdup(e1, (RegTensor<uint32_t>&)exponent, all, POS_HIGHEST, MODE_ZEROING);
+                vshls(e1, e1, 8u, all, MODE_ZEROING); vor(e0, e0, e1, all);
+                vsts((RegTensor<uint16_t>&)e0, packed_scales, row * 16 + part * 4 + segment, ONEPT_B16, half1);
+            }
+        }
+    }
+}
+
+#endif
+
 // All scratch is dead before the official persistent pipeline initializes its UB.
 template <const auto& workspace, bool kFullTopology>
 __aicore__ inline void publish(__gm__ uint8_t* buffer, __gm__ bfloat16_t* x,
@@ -3766,7 +3586,7 @@ __aicore__ inline void publish(__gm__ uint8_t* buffer, __gm__ bfloat16_t* x,
 {
 #ifdef __DAV_VEC__
     constexpr auto& config = workspace.config;
-    constexpr uint32_t rows = 16;
+    constexpr uint32_t rows = 8;
     constexpr uint32_t width = config.hidden;
     constexpr uint32_t pairs = width / 64;
     static_assert(config.num_max_tokens_per_rank % rows == 0);
@@ -3797,11 +3617,12 @@ __aicore__ inline void publish(__gm__ uint8_t* buffer, __gm__ bfloat16_t* x,
         constexpr uint32_t output_base = 4 * tile_bytes * sizeof(bfloat16_t);
         constexpr uint32_t scale_base = output_base + 4 * tile_bytes;
         static_assert(scale_base + rows * 32 <= PTO_UBUF_SIZE_BYTES);
-        moe_input_quant::DirectScales scratch;
+        using ScaleTile = moe_input_quant::Vec<uint8_t, 1, rows * 32>;
+        ScaleTile scratch;
         TASSIGN(scratch, scale_base);
         #pragma unroll
         for (uint32_t part = 0; part < 4; ++part) {
-            moe_input_quant::Input input;
+            moe_input_quant::Vec<bfloat16_t, rows, 256> input;
             TASSIGN(input, part * tile_bytes * sizeof(bfloat16_t));
             auto src = global(x + first * width + col + part * 256,
                               rows, 256, width);
@@ -3810,12 +3631,12 @@ __aicore__ inline void publish(__gm__ uint8_t* buffer, __gm__ bfloat16_t* x,
         }
         #pragma unroll
         for (uint32_t part = 0; part < 4; ++part) {
-            moe_input_quant::Input input;
-            moe_input_quant::Payload payload;
+            moe_input_quant::Vec<bfloat16_t, rows, 256> input;
+            moe_input_quant::Vec<uint8_t, rows, 256> payload;
             TASSIGN(input, part * tile_bytes * sizeof(bfloat16_t));
             TASSIGN(payload, output_base + part * tile_bytes);
             wait_flag(PIPE_MTE2, PIPE_V, static_cast<event_t>(part));
-            moe_input_quant::quantize<true, moe_input_quant::DirectScales>(
+            quantize_panel<rows, ScaleTile>(
                 payload.data(), scratch.data(), input.data(), part);
             set_flag(PIPE_V, PIPE_MTE3, static_cast<event_t>(part));
             wait_flag(PIPE_V, PIPE_MTE3, static_cast<event_t>(part));

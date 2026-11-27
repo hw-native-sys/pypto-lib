@@ -1642,7 +1642,8 @@ class ResidentPrefillWeights:
 
     def upload(self, runtime, rank: int, handles):
         """Upload one projection at a time into persistent named allocations."""
-        from quant import pack_bf16_nz, pack_fp8_nz, pack_mx_b_scale, pack_mxfp4_weight_tiles
+        from quant import pack_bf16_nz, pack_fp8_nz, pack_mx_b_scale
+        from mega_moe import pack_checkpoint_zn, prepare_routed_scale
 
         if rank not in range(self.ranks):
             raise ValueError(f"expert rank must be in [0, {self.ranks})")
@@ -1675,7 +1676,7 @@ class ResidentPrefillWeights:
                     logical_scale = logical_scale.reshape(k // 32, M.o_groups, M.o_lora_rank).permute(1, 0, 2)
                 else:
                     weight = weight.t()
-                if target in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b", "index_wq_b"):
+                if target in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b", "index_wq_b", "shared_w1", "shared_w2", "shared_w3"):
                     weight = pack_fp8_nz(weight)
                 copy(target, weight, slot, slots)
                 packed_scale = pack_mx_b_scale(logical_scale).view(torch.float8_e8m0fnu)
@@ -1708,7 +1709,7 @@ class ResidentPrefillWeights:
             for projection in ("w1", "w2", "w3"):
                 k, n = ((M.moe_intermediate_size, M.hidden_size) if projection == "w2"
                         else (M.hidden_size, M.moe_intermediate_size))
-                logical_scales = torch.empty((self.local_experts * (k // 32), n), dtype=torch.uint8)
+
                 for local in range(self.local_experts):
                     expert = rank * self.local_experts + local
                     stem = f"layers.{layer}.ffn.experts.{expert}.{projection}"
@@ -1718,12 +1719,11 @@ class ResidentPrefillWeights:
                     valid_scale = scale.dtype == torch.float8_e8m0fnu and tuple(scale.shape) == (n, k // 32)
                     if not valid_payload or not valid_scale:
                         raise ValueError(f"unsupported native MXFP4 weight layout: {stem}")
-                    packed = pack_mxfp4_weight_tiles(weight, 256, 256)
+                    packed = pack_checkpoint_zn(weight)
                     copy("routed_" + projection, packed, layer * self.local_experts + local,
                          M.num_hidden_layers * self.local_experts)
-                    logical_scales[local * (k // 32) : (local + 1) * (k // 32)] = scale.view(torch.uint8).t()
-                packed_scale = pack_mx_b_scale(logical_scales).view(torch.float8_e8m0fnu)
-                copy("routed_" + projection + "_scale", packed_scale, layer, M.num_hidden_layers)
+                    copy("routed_" + projection + "_scale", prepare_routed_scale(scale),
+                         layer * self.local_experts + local, M.num_hidden_layers * self.local_experts)
 
     def lookup_rows(self, token_ids: torch.Tensor):
         """Read only the prompt's BF16 token embeddings."""
@@ -2450,7 +2450,7 @@ def _zero_packed_weight(shape):
 
 def build_tensor_specs(args=None):
     """Build independent per-DP batches for a checkpoint-free, 40-layer CED smoke fixture."""
-    from golden import TensorSpec
+    from mega_moe import forward_routed_weight_spec
     from prefill_moe import _route_bias
 
     weight_layouts = forward_weight_layouts(LOCAL_EXPERTS)
@@ -2507,7 +2507,7 @@ def build_tensor_specs(args=None):
         else:
             value = torch.stack([values[name] for values in rank_values])
             shape, dtype = list(value.shape), value.dtype
-        specs.append(TensorSpec(name, shape, dtype, init_value=value))
+        specs.append(forward_routed_weight_spec(name, shape, dtype, value, False, local_experts=LOCAL_EXPERTS))
     return specs
 
 
