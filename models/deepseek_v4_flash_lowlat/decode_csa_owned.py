@@ -60,10 +60,6 @@ if __package__:
 else:
     from decode_compressors import compressor_ratio4
 if __package__:
-    from .hc_post import hc_post
-else:
-    from hc_post import hc_post
-if __package__:
     from .hc_pre import hc_pre, hc_pre_norm
 else:
     from hc_pre import hc_pre, hc_pre_norm
@@ -184,11 +180,11 @@ TOKEN_SHARDED = T == O_GROUPS
 
 
 if __package__:
-    from .c4_epilogues import merge_and_publish_owned_leaf, merge_leaf_and_plan, plan_from_remote_selection
+    from .c4_epilogues import merge_and_publish_owned_leaf, plan_from_remote_selection
     from .decode_indexer import TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH, TOPK_RUN_SCORES, indexer_original_leaves
     from .decode_sparse_attn import C4_PLAN_COLS, CSA_CMP_TOPK, CSA_PADDED_TOPK, sparse_attn_csa_head_with_plan
 else:
-    from c4_epilogues import merge_and_publish_owned_leaf, merge_leaf_and_plan, plan_from_remote_selection
+    from c4_epilogues import merge_and_publish_owned_leaf, plan_from_remote_selection
     from decode_indexer import TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH, TOPK_RUN_SCORES, indexer_original_leaves
     from decode_sparse_attn import C4_PLAN_COLS, CSA_CMP_TOPK, CSA_PADDED_TOPK, sparse_attn_csa_head_with_plan
 

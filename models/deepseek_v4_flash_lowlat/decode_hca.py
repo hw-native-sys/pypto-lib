@@ -60,10 +60,6 @@ if __package__:
 else:
     from hc_pre import hc_pre, hc_pre_norm
 if __package__:
-    from .hc_post import hc_post
-else:
-    from hc_post import hc_post
-if __package__:
     from .qkv_proj_rope import qkv_proj_rope
 else:
     from qkv_proj_rope import qkv_proj_rope

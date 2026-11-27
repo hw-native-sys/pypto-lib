@@ -23,7 +23,6 @@ from .native_decode import (
 from .target_state import prepare_device_inputs_after
 from .drafter.kv_tp8 import draft_kv_projection_tp8, draft_kv_norm_tp8
 from .markov.head8 import run_head8_steps
-from .markov.tp8_score import m8_verify_steps
 from .target_state import eight_rank_reuse_gate
 
 NATIVE_S_FWD_ORI_BLOCK_NUM_DYN = pl.dynamic("NATIVE_S_FWD_ORI_BLOCK_NUM_DYN")

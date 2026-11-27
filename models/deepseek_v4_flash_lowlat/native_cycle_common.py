@@ -13,7 +13,7 @@ import pypto.language.distributed as pld
 from .drafter.device_metadata import BANK_COUNT
 from .drafter.entry import drafter_inline
 from .markov.entry import markov_inline
-from .markov.entry import D, DONE_VALUE, DSPARK_MOE_TOKENS, MAX_LOGIT_ROWS, VOCAB, lm_head, normalize_head_hidden
+from .markov.entry import D, DSPARK_MOE_TOKENS, normalize_head_hidden
 from .markov.tp8_score import m8_confidence_outputs
 from .drafter.device_drafter_tp8 import device_drafter_tp8
 from .markov.head8 import publish_base_rows, run_head8_steps

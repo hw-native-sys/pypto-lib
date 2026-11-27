@@ -60,10 +60,6 @@ if __package__:
 else:
     from decode_compressors import compressor_ratio4
 if __package__:
-    from .hc_post import hc_post
-else:
-    from hc_post import hc_post
-if __package__:
     from .hc_pre import hc_pre, hc_pre_norm
 else:
     from hc_pre import hc_pre, hc_pre_norm
@@ -426,6 +422,7 @@ def attention_csa_packed(
             late_dep,
             my_rank,
             idx_rope_swap_idx,
+            False,  # owned_s6
         )
         cmp_sorted=pl.create_tensor([T,CSA_CMP_TOPK],dtype=pl.INT32)
         csa_bias=pl.create_tensor([T,CSA_PADDED_TOPK],dtype=pl.FP32)
