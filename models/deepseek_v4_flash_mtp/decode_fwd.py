@@ -10,6 +10,8 @@
 # ci: no-sim
 """DeepSeek-V4 Flash decode forward experiment with looped CSA/HCA layers inside a pl.jit function."""
 
+from task_policy import ALLOW_EARLY_RESOLVE
+
 import argparse
 
 import pypto.language as pl
@@ -109,6 +111,9 @@ from decode_moe import (
     clear_moe_signals,
     moe,
 )
+from expert_slots import (
+    BANK_DIRECTIONS, EXPERT_SLOTS, MAPPED, RankDescriptors, RankState, WorkerDescriptors, WorkerState,
+)
 
 # The host packs one physical cache pool per forward layer.  The packed axes
 # are dynamic at the orchestration boundary; each layer below derives its
@@ -123,6 +128,9 @@ FWD_INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("FWD_INNER_STATE_BLOCK_NUM_DYN")
 
 MODEL_NUM_LAYERS = MODEL_CONFIG.num_hidden_layers
 FWD_NUM_LAYERS = 43
+ROUTED_ROWS = EXPERT_SLOTS if MAPPED else FWD_NUM_LAYERS * N_LOCAL
+ROUTED_LAYER_ROWS = EXPERT_SLOTS if MAPPED else N_LOCAL
+ROUTED_LAYER_STRIDE = 0 if MAPPED else N_LOCAL
 CSA_NUM_LAYERS = 21
 HCA_NUM_LAYERS = 20
 HCA_CMP_STORAGE_BLOCK_SIZE = BLOCK_SIZE // HCA_COMPRESS_RATIO
@@ -208,6 +216,26 @@ RESIDENT_WEIGHT_NAMES = frozenset(
 RESIDENT_CACHE_OUTPUT_NAMES = CACHE_POOL_NAMES
 
 
+@pl.jit.inline(auto_scope=False)
+def _routed_banks_for_layer(
+    routed_w1: pl.Tensor,
+    routed_w1_scale: pl.Tensor,
+    routed_w3: pl.Tensor,
+    routed_w3_scale: pl.Tensor,
+    routed_w2: pl.Tensor,
+    routed_w2_scale: pl.Tensor,
+    layer: pl.Scalar[pl.INDEX],
+):
+    row = layer * ROUTED_LAYER_STRIDE
+    gate = routed_w1[row : row + ROUTED_LAYER_ROWS, :, :]
+    gate_scale = routed_w1_scale[row : row + ROUTED_LAYER_ROWS, :]
+    up = routed_w3[row : row + ROUTED_LAYER_ROWS, :, :]
+    up_scale = routed_w3_scale[row : row + ROUTED_LAYER_ROWS, :]
+    down = routed_w2[row : row + ROUTED_LAYER_ROWS, :, :]
+    down_scale = routed_w2_scale[row : row + ROUTED_LAYER_ROWS, :]
+    return gate, gate_scale, up, up_scale, down, down_scale
+
+
 def _decode_fwd(
     embed_weight: pl.Tensor[[EMBED_VOCAB_DYN, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
@@ -255,12 +283,12 @@ def _decode_fwd(
     gate_w: pl.Tensor[[FWD_NUM_LAYERS * N_EXPERTS_GLOBAL, D], pl.FP32],
     gate_bias: pl.Tensor[[FWD_NUM_LAYERS * N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[FWD_NUM_LAYERS * VOCAB, TOPK], pl.INT32],
-    routed_w1: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
-    routed_w1_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
-    routed_w3_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ],
-    routed_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, D], pl.FP32],
+    routed_w1: pl.Tensor[[ROUTED_ROWS, MOE_INTER, D], pl.INT8, pl.NZ],
+    routed_w1_scale: pl.Tensor[[ROUTED_ROWS, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[ROUTED_ROWS, MOE_INTER, D], pl.INT8, pl.NZ],
+    routed_w3_scale: pl.Tensor[[ROUTED_ROWS, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[ROUTED_ROWS, D, MOE_INTER], pl.INT8, pl.NZ],
+    routed_w2_scale: pl.Tensor[[ROUTED_ROWS, D], pl.FP32],
     shared_w1: pl.Tensor[[FWD_NUM_LAYERS, MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w1_scale: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
     shared_w3: pl.Tensor[[FWD_NUM_LAYERS, MOE_INTER, D], pl.INT8, pl.NZ],
@@ -308,6 +336,8 @@ def _decode_fwd(
     lm_head_logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32],
     lm_head_logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
+    expert_state: pl.InOut[RankState],
+    expert_descriptors: RankDescriptors,
     my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
     freqs_cos.bind_dynamic(1, ROPE_ROWS_DYN)
@@ -364,9 +394,12 @@ def _decode_fwd(
         swa_freqs_cos, swa_freqs_sin, compressed_freqs_cos, compressed_freqs_sin,
         hca_cmp_freqs_cos, hca_cmp_freqs_sin, csa_cmp_freqs_cos, csa_cmp_freqs_sin,
     )
-    nt = pl.cast(0, pl.INT32)
-    for owner_rank in pl.range(N_RANKS):
-        nt = pl.max(nt, pl.read(num_tokens_per_owner, [owner_rank]))
+    if MAPPED:
+        nt = pl.read(num_tokens_per_owner, [my_rank])
+    else:
+        nt = pl.cast(0, pl.INT32)
+        for owner_rank in pl.range(N_RANKS):
+            nt = pl.max(nt, pl.read(num_tokens_per_owner, [owner_rank]))
     hc_attn_fn_l0: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [0 * MIX_HC, 0])
     hc_attn_scale_l0: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [0 * 3])
     hc_attn_base_l0: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_attn_base, [MIX_HC], [0 * MIX_HC])
@@ -396,12 +429,11 @@ def _decode_fwd(
     gate_w_l0: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32] = pl.slice(gate_w, [N_EXPERTS_GLOBAL, D], [0 * N_EXPERTS_GLOBAL, 0])
     gate_bias_l0: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32] = pl.slice(gate_bias, [N_EXPERTS_GLOBAL], [0 * N_EXPERTS_GLOBAL])
     tid2eid_l0: pl.Tensor[[VOCAB, TOPK], pl.INT32] = pl.slice(tid2eid, [VOCAB, TOPK], [0 * VOCAB, 0])
-    routed_w1_l0: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ] = pl.slice(routed_w1, [N_LOCAL, MOE_INTER, D], [0 * N_LOCAL, 0, 0])
-    routed_w1_scale_l0: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32] = pl.slice(routed_w1_scale, [N_LOCAL, MOE_INTER], [0 * N_LOCAL, 0])
-    routed_w3_l0: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ] = pl.slice(routed_w3, [N_LOCAL, MOE_INTER, D], [0 * N_LOCAL, 0, 0])
-    routed_w3_scale_l0: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32] = pl.slice(routed_w3_scale, [N_LOCAL, MOE_INTER], [0 * N_LOCAL, 0])
-    routed_w2_l0: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ] = pl.slice(routed_w2, [N_LOCAL, D, MOE_INTER], [0 * N_LOCAL, 0, 0])
-    routed_w2_scale_l0: pl.Tensor[[N_LOCAL, D], pl.FP32] = pl.slice(routed_w2_scale, [N_LOCAL, D], [0 * N_LOCAL, 0])
+    (routed_w1_l0, routed_w1_scale_l0, routed_w3_l0, routed_w3_scale_l0,
+     routed_w2_l0, routed_w2_scale_l0) = _routed_banks_for_layer(
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+        0,
+    )
     shared_w1_l0: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ] = shared_w1[0]
     shared_w1_scale_l0: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w1_scale, [MOE_INTER], [0 * MOE_INTER])
     shared_w3_l0: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ] = shared_w3[0]
@@ -430,12 +462,11 @@ def _decode_fwd(
     gate_w_l1: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32] = pl.slice(gate_w, [N_EXPERTS_GLOBAL, D], [1 * N_EXPERTS_GLOBAL, 0])
     gate_bias_l1: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32] = pl.slice(gate_bias, [N_EXPERTS_GLOBAL], [1 * N_EXPERTS_GLOBAL])
     tid2eid_l1: pl.Tensor[[VOCAB, TOPK], pl.INT32] = pl.slice(tid2eid, [VOCAB, TOPK], [1 * VOCAB, 0])
-    routed_w1_l1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ] = pl.slice(routed_w1, [N_LOCAL, MOE_INTER, D], [1 * N_LOCAL, 0, 0])
-    routed_w1_scale_l1: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32] = pl.slice(routed_w1_scale, [N_LOCAL, MOE_INTER], [1 * N_LOCAL, 0])
-    routed_w3_l1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ] = pl.slice(routed_w3, [N_LOCAL, MOE_INTER, D], [1 * N_LOCAL, 0, 0])
-    routed_w3_scale_l1: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32] = pl.slice(routed_w3_scale, [N_LOCAL, MOE_INTER], [1 * N_LOCAL, 0])
-    routed_w2_l1: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ] = pl.slice(routed_w2, [N_LOCAL, D, MOE_INTER], [1 * N_LOCAL, 0, 0])
-    routed_w2_scale_l1: pl.Tensor[[N_LOCAL, D], pl.FP32] = pl.slice(routed_w2_scale, [N_LOCAL, D], [1 * N_LOCAL, 0])
+    (routed_w1_l1, routed_w1_scale_l1, routed_w3_l1, routed_w3_scale_l1,
+     routed_w2_l1, routed_w2_scale_l1) = _routed_banks_for_layer(
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+        1,
+    )
     shared_w1_l1: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ] = shared_w1[1]
     shared_w1_scale_l1: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w1_scale, [MOE_INTER], [1 * MOE_INTER])
     shared_w3_l1: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ] = shared_w3[1]
@@ -469,6 +500,7 @@ def _decode_fwd(
             recv_meta, recv_x, recv_aux, arrived, data_arrived,
             routed_y_buf, combine_arrived,
             pl.cast(0, pl.INT32), nt, my_rank, pl.cast(1, pl.INT32),
+            expert_state=expert_state, expert_descriptors=expert_descriptors,
         )
     with pl.scope():
         attention_swa(
@@ -494,6 +526,7 @@ def _decode_fwd(
             recv_meta, recv_x, recv_aux, arrived, data_arrived,
             routed_y_buf, combine_arrived,
             pl.cast(1, pl.INT32), nt, my_rank, pl.cast(2, pl.INT32),
+            expert_state=expert_state, expert_descriptors=expert_descriptors,
         )
     for loop_i in pl.range(HCA_NUM_LAYERS):
         csa_layer: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 2, pl.INT32)
@@ -542,12 +575,11 @@ def _decode_fwd(
         gate_w_csa: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32] = pl.slice(gate_w, [N_EXPERTS_GLOBAL, D], [csa_layer * N_EXPERTS_GLOBAL, 0])
         gate_bias_csa: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32] = pl.slice(gate_bias, [N_EXPERTS_GLOBAL], [csa_layer * N_EXPERTS_GLOBAL])
         tid2eid_csa: pl.Tensor[[VOCAB, TOPK], pl.INT32] = pl.slice(tid2eid, [VOCAB, TOPK], [csa_layer * VOCAB, 0])
-        routed_w1_csa: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ] = pl.slice(routed_w1, [N_LOCAL, MOE_INTER, D], [csa_layer * N_LOCAL, 0, 0])
-        routed_w1_scale_csa: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32] = pl.slice(routed_w1_scale, [N_LOCAL, MOE_INTER], [csa_layer * N_LOCAL, 0])
-        routed_w3_csa: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ] = pl.slice(routed_w3, [N_LOCAL, MOE_INTER, D], [csa_layer * N_LOCAL, 0, 0])
-        routed_w3_scale_csa: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32] = pl.slice(routed_w3_scale, [N_LOCAL, MOE_INTER], [csa_layer * N_LOCAL, 0])
-        routed_w2_csa: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ] = pl.slice(routed_w2, [N_LOCAL, D, MOE_INTER], [csa_layer * N_LOCAL, 0, 0])
-        routed_w2_scale_csa: pl.Tensor[[N_LOCAL, D], pl.FP32] = pl.slice(routed_w2_scale, [N_LOCAL, D], [csa_layer * N_LOCAL, 0])
+        (routed_w1_csa, routed_w1_scale_csa, routed_w3_csa, routed_w3_scale_csa,
+         routed_w2_csa, routed_w2_scale_csa) = _routed_banks_for_layer(
+            routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+            csa_layer,
+        )
         shared_w1_csa: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ] = shared_w1[csa_layer]
         shared_w1_scale_csa: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w1_scale, [MOE_INTER], [csa_layer * MOE_INTER])
         shared_w3_csa: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ] = shared_w3[csa_layer]
@@ -588,6 +620,7 @@ def _decode_fwd(
                 recv_meta, recv_x, recv_aux, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
                 csa_layer, nt, my_rank, csa_moe_epoch,
+                expert_state=expert_state, expert_descriptors=expert_descriptors,
             )
         hc_attn_fn_hca: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [hca_layer * MIX_HC, 0])
         hc_attn_scale_hca: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [hca_layer * 3])
@@ -617,12 +650,11 @@ def _decode_fwd(
         gate_w_hca: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32] = pl.slice(gate_w, [N_EXPERTS_GLOBAL, D], [hca_layer * N_EXPERTS_GLOBAL, 0])
         gate_bias_hca: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32] = pl.slice(gate_bias, [N_EXPERTS_GLOBAL], [hca_layer * N_EXPERTS_GLOBAL])
         tid2eid_hca: pl.Tensor[[VOCAB, TOPK], pl.INT32] = pl.slice(tid2eid, [VOCAB, TOPK], [hca_layer * VOCAB, 0])
-        routed_w1_hca: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ] = pl.slice(routed_w1, [N_LOCAL, MOE_INTER, D], [hca_layer * N_LOCAL, 0, 0])
-        routed_w1_scale_hca: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32] = pl.slice(routed_w1_scale, [N_LOCAL, MOE_INTER], [hca_layer * N_LOCAL, 0])
-        routed_w3_hca: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ] = pl.slice(routed_w3, [N_LOCAL, MOE_INTER, D], [hca_layer * N_LOCAL, 0, 0])
-        routed_w3_scale_hca: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32] = pl.slice(routed_w3_scale, [N_LOCAL, MOE_INTER], [hca_layer * N_LOCAL, 0])
-        routed_w2_hca: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ] = pl.slice(routed_w2, [N_LOCAL, D, MOE_INTER], [hca_layer * N_LOCAL, 0, 0])
-        routed_w2_scale_hca: pl.Tensor[[N_LOCAL, D], pl.FP32] = pl.slice(routed_w2_scale, [N_LOCAL, D], [hca_layer * N_LOCAL, 0])
+        (routed_w1_hca, routed_w1_scale_hca, routed_w3_hca, routed_w3_scale_hca,
+         routed_w2_hca, routed_w2_scale_hca) = _routed_banks_for_layer(
+            routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+            hca_layer,
+        )
         shared_w1_hca: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ] = shared_w1[hca_layer]
         shared_w1_scale_hca: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w1_scale, [MOE_INTER], [hca_layer * MOE_INTER])
         shared_w3_hca: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ] = shared_w3[hca_layer]
@@ -658,6 +690,7 @@ def _decode_fwd(
                 recv_meta, recv_x, recv_aux, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
                 hca_layer, nt, my_rank, hca_moe_epoch,
+                expert_state=expert_state, expert_descriptors=expert_descriptors,
             )
     # FWD index (14), not CSA_LAST_LAYER (6): the *_last slices below index per-FWD-layer
     # stacked weights; csa-stacked weights use the literal (CSA_NUM_LAYERS-1).
@@ -703,12 +736,11 @@ def _decode_fwd(
     gate_w_last: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32] = pl.slice(gate_w, [N_EXPERTS_GLOBAL, D], [csa_layer_last * N_EXPERTS_GLOBAL, 0])
     gate_bias_last: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32] = pl.slice(gate_bias, [N_EXPERTS_GLOBAL], [csa_layer_last * N_EXPERTS_GLOBAL])
     tid2eid_last: pl.Tensor[[VOCAB, TOPK], pl.INT32] = pl.slice(tid2eid, [VOCAB, TOPK], [csa_layer_last * VOCAB, 0])
-    routed_w1_last: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ] = pl.slice(routed_w1, [N_LOCAL, MOE_INTER, D], [csa_layer_last * N_LOCAL, 0, 0])
-    routed_w1_scale_last: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32] = pl.slice(routed_w1_scale, [N_LOCAL, MOE_INTER], [csa_layer_last * N_LOCAL, 0])
-    routed_w3_last: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ] = pl.slice(routed_w3, [N_LOCAL, MOE_INTER, D], [csa_layer_last * N_LOCAL, 0, 0])
-    routed_w3_scale_last: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32] = pl.slice(routed_w3_scale, [N_LOCAL, MOE_INTER], [csa_layer_last * N_LOCAL, 0])
-    routed_w2_last: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ] = pl.slice(routed_w2, [N_LOCAL, D, MOE_INTER], [csa_layer_last * N_LOCAL, 0, 0])
-    routed_w2_scale_last: pl.Tensor[[N_LOCAL, D], pl.FP32] = pl.slice(routed_w2_scale, [N_LOCAL, D], [csa_layer_last * N_LOCAL, 0])
+    (routed_w1_last, routed_w1_scale_last, routed_w3_last, routed_w3_scale_last,
+     routed_w2_last, routed_w2_scale_last) = _routed_banks_for_layer(
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+        csa_layer_last,
+    )
     shared_w1_last: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ] = shared_w1[csa_layer_last]
     shared_w1_scale_last: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w1_scale, [MOE_INTER], [csa_layer_last * MOE_INTER])
     shared_w3_last: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ] = shared_w3[csa_layer_last]
@@ -749,12 +781,13 @@ def _decode_fwd(
             recv_meta, recv_x, recv_aux, arrived, data_arrived,
             routed_y_buf, combine_arrived,
             csa_layer_last, nt, my_rank, last_moe_epoch,
+            expert_state=expert_state, expert_descriptors=expert_descriptors,
         )
     clear_moe_signals(pre_hc_hidden_out, arrived, data_arrived, combine_arrived)
     x_head: pl.Tensor[[T, D], pl.BF16] = pl.create_tensor([T, D], dtype=pl.BF16)
     with pl.scope():
         hc_head(pre_hc_hidden_out, hc_head_fn, hc_head_scale, hc_head_base, x_head)
-        rms_norm(x_head, final_norm_w, x_out)
+        rms_norm(x_head, final_norm_w, x_out, ALLOW_EARLY_RESOLVE)
         lm_head_with_sampling(
             x_out, lm_head_weight, logit_row_indices,
             sampling_temperatures, sampling_top_ks, sampling_seeds, sampling_positions,
@@ -768,10 +801,10 @@ def _decode_fwd(
 
 
 decode_fwd = pl.jit.inline(auto_scope=False)(_decode_fwd)
-l2_decode_fwd = pl.jit(auto_scope=False)(_decode_fwd)
+l2_decode_fwd = pl.jit(auto_scope=False, **BANK_DIRECTIONS)(_decode_fwd)
 
 
-@pl.jit.host
+@pl.jit.host(**BANK_DIRECTIONS)
 def l3_decode_fwd(
     embed_weight: pl.Tensor[[N_RANKS, EMBED_VOCAB_DYN, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
@@ -819,12 +852,12 @@ def l3_decode_fwd(
     gate_w: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_EXPERTS_GLOBAL, D], pl.FP32],
     gate_bias: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * VOCAB, TOPK], pl.INT32],
-    routed_w1: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8],
-    routed_w1_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8],
-    routed_w3_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, D, MOE_INTER], pl.INT8],
-    routed_w2_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, D], pl.FP32],
+    routed_w1: pl.Tensor[[N_RANKS, ROUTED_ROWS, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_RANKS, ROUTED_ROWS, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_RANKS, ROUTED_ROWS, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_RANKS, ROUTED_ROWS, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_RANKS, ROUTED_ROWS, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_RANKS, ROUTED_ROWS, D], pl.FP32],
     shared_w1: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS, MOE_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
     shared_w3: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS, MOE_INTER, D], pl.INT8],
@@ -861,6 +894,8 @@ def l3_decode_fwd(
     ],
     num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
+    expert_state: pl.InOut[WorkerState] = 0,
+    expert_descriptors: pl.InOut[WorkerDescriptors] = 0,
 ):
     freqs_cos.bind_dynamic(2, ROPE_ROWS_DYN)
     freqs_sin.bind_dynamic(2, ROPE_ROWS_DYN)
@@ -926,7 +961,9 @@ def l3_decode_fwd(
             data_arrived, routed_y_buf, combine_arrived,
             lm_head_hidden_window, lm_head_hidden_done,
             lm_head_logits_window, lm_head_logits_done,
-            num_tokens_per_owner, r,
+            num_tokens_per_owner,
+            expert_state[r] if MAPPED else 0, expert_descriptors[r] if MAPPED else 0,
+            r,
             device=r,
         )
 

@@ -25,6 +25,7 @@ from config import (
     DECODE_CMP_BLOCK_NUM,
     FP32_NEG_INF,
 )
+from task_policy import ALLOW_EARLY_RESOLVE
 
 
 # model config
@@ -202,7 +203,7 @@ def compressor_ratio4(
 
     normed_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope_cache_write", allow_early_resolve=True):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope_cache_write", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         # single 16-row block: B real rows at rows 0..B-1, rows B..15 are pad
         cos_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
         sin_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)

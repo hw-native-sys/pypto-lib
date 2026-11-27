@@ -23,6 +23,7 @@ from config import (
     INT8_AMAX_EPS,
 )
 from rope_interleave import rope_interleave
+from task_policy import ALLOW_EARLY_RESOLVE
 
 
 # model config
@@ -134,7 +135,7 @@ def indexer_compressor(
     # online-softmax pool that batch's window into pooled_kv. One region -- each batch's pool
     # reads only its own just-scattered state (per-batch block table), so no cross-task barrier.
     pooled_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="scatter_softmax_pool", allow_early_resolve=True):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="scatter_softmax_pool", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         for c_idx in pl.range(B):
             for s_sc in pl.pipeline(S, stage=2):
                 token_pos = pl.read(position_ids, [c_idx, s_sc])
@@ -268,7 +269,7 @@ def indexer_compressor(
             kv_hadamard_acc = pl.matmul(kv_proj_tile, hadamard_tile, out_dtype=pl.FP32)
             kv_final[0 : RMS_PAD_TILE, o0 : o0 + OUT_TILE] = kv_hadamard_acc
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_and_cache_write", allow_early_resolve=True):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_and_cache_write", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         # C8 quant-on-write: per-row INT8 quant of the block (M=RMS_PAD_TILE keeps tiles 32B-aligned;
         # quantize the bf16-rounded value to match golden)
         kv_blk_f32 = pl.cast(

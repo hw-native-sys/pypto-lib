@@ -22,6 +22,7 @@ amax+rescale of the same tokens.
 import pypto.language as pl
 
 from config import (FLASH as M, MOE_TOKENS, INT8_SCALE_MAX, INT8_AMAX_EPS)
+from task_policy import ALLOW_EARLY_RESOLVE
 
 
 # model config
@@ -78,7 +79,7 @@ def _make_expert_shared(row_tile: int):
             up_i32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT32)
 
             # gate (w1) cube matmul -> INT32 GM accumulator.
-            for nb_idx in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="sh_gate_mm", allow_early_resolve=True):
+            for nb_idx in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="sh_gate_mm", allow_early_resolve=ALLOW_EARLY_RESOLVE):
                 # Weight reads bypass L2.
                 pl.set_cache_policy(shared_w1, pl.CachePolicy.BYPASS)
                 n0 = nb_idx * MM_INTER_TILE
@@ -99,7 +100,7 @@ def _make_expert_shared(row_tile: int):
                 gate_i32[:, n0 : n0 + MM_INTER_TILE] = gate_acc
 
             # up (w3) cube matmul -> INT32 GM accumulator.
-            for nb_idx in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="sh_up_mm", allow_early_resolve=True):
+            for nb_idx in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="sh_up_mm", allow_early_resolve=ALLOW_EARLY_RESOLVE):
                 pl.set_cache_policy(shared_w3, pl.CachePolicy.BYPASS)
                 n0 = nb_idx * MM_INTER_TILE
                 if SH_M_TILE == 16:
@@ -198,7 +199,7 @@ def _make_expert_shared(row_tile: int):
                 y_i32[:, d0 : d0 + D_OUT_TILE] = y_acc
 
             # Dequant w2 output (per-row h scale x per-channel w2 scale) -> BF16.
-            for block in pl.spmd(((valid_rows + OUTPUT_ROW_TILE - 1) // OUTPUT_ROW_TILE) * (D // (W2_ACT_INNER * D_OUT_TILE_ACT)), name_hint="sh_w2_act", allow_early_resolve=True):
+            for block in pl.spmd(((valid_rows + OUTPUT_ROW_TILE - 1) // OUTPUT_ROW_TILE) * (D // (W2_ACT_INNER * D_OUT_TILE_ACT)), name_hint="sh_w2_act", allow_early_resolve=ALLOW_EARLY_RESOLVE):
                 row0 = (block // (D // (W2_ACT_INNER * D_OUT_TILE_ACT))) * OUTPUT_ROW_TILE
                 d_base = (block % (D // (W2_ACT_INNER * D_OUT_TILE_ACT))) * (W2_ACT_INNER * D_OUT_TILE_ACT)
                 output_valid_rows = pl.min(OUTPUT_ROW_TILE, valid_rows - row0)

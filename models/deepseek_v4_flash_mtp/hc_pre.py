@@ -27,6 +27,7 @@ comb_sinkhorn / mix_x), ordered by their GM read/write dependencies. mix_hc(24) 
 import pypto.language as pl
 
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ
+from task_policy import ALLOW_EARLY_RESOLVE
 
 
 # Dynamic shape variables.
@@ -78,6 +79,7 @@ def hc_pre_gates(
     mixes_raw: pl.Tensor[[T_DYN, MIX_PAD], pl.FP32],
     inv_rms: pl.Tensor[[T_DYN, 1], pl.FP32],
     emit_split: pl.Scalar[pl.BOOL],
+    early_resolve: pl.constexpr = ALLOW_EARLY_RESOLVE,
 ):
     """rms -> linear -> linear_reduce -> split_pre_post / comb_sinkhorn gates.
 
@@ -100,7 +102,7 @@ def hc_pre_gates(
     # rms: full-K sum-of-squares per token-tile -> inv_rms.
     rms_tiles = t_dim // T_TILE
     rms_workers = pl.max(1, pl.min(rms_tiles, HC_RMS_WORKERS))
-    for rms_worker in pl.spmd(rms_workers, name_hint="hc_pre_rms", allow_early_resolve=True):
+    for rms_worker in pl.spmd(rms_workers, name_hint="hc_pre_rms", allow_early_resolve=early_resolve):
         for t in pl.range(rms_worker, rms_tiles, rms_workers):
             t0 = t * T_TILE
             sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
@@ -119,7 +121,7 @@ def hc_pre_gates(
     mixes_partials = pl.create_tensor([LINEAR_OK * t_linear, MIX_PAD], dtype=pl.FP32)
     linear_units = (t_linear // LINEAR_T_TILE) * LINEAR_OK
     linear_workers = pl.min(linear_units, LINEAR_WORKERS)
-    for linear_worker in pl.spmd(linear_workers, name_hint="hc_pre_linear", allow_early_resolve=True):
+    for linear_worker in pl.spmd(linear_workers, name_hint="hc_pre_linear", allow_early_resolve=early_resolve):
         # Weight reads bypass L2.
         pl.set_cache_policy(hc_fn, pl.CachePolicy.BYPASS)
         for task in pl.range(linear_worker, linear_units, linear_workers):
@@ -140,7 +142,7 @@ def hc_pre_gates(
     reduce_workers = pl.min(t_linear // LINEAR_T_TILE, 4)
     if not emit_split:
         reduce_workers = pl.min(t_linear // LINEAR_T_TILE, 2)
-    for reduce_worker in pl.spmd(reduce_workers, name_hint="hc_pre_linear_reduce", allow_early_resolve=True):
+    for reduce_worker in pl.spmd(reduce_workers, name_hint="hc_pre_linear_reduce", allow_early_resolve=early_resolve):
         for linear_block in pl.range(reduce_worker, t_linear // LINEAR_T_TILE, reduce_workers):
             linear_t0 = linear_block * LINEAR_T_TILE
             mixes_total = mixes_partials[linear_t0 : linear_t0 + LINEAR_T_TILE, 0:MIX_PAD]
@@ -157,7 +159,7 @@ def hc_pre_gates(
     if emit_split:
         split_tiles = t_dim // T_TILE
         split_workers = pl.max(1, pl.min(split_tiles, HC_SPLIT_WORKERS))
-        for split_worker in pl.spmd(split_workers, name_hint="split_pre_post", allow_early_resolve=True):
+        for split_worker in pl.spmd(split_workers, name_hint="split_pre_post", allow_early_resolve=early_resolve):
             for ob in pl.range(split_worker, split_tiles, split_workers):
                 t0 = ob * T_TILE
                 inv_col = inv_rms[t0:t0 + T_TILE, 0:1]
@@ -182,7 +184,7 @@ def hc_pre_gates(
     # column-first 20-iteration Sinkhorn -> comb.
     comb_tiles = t_dim // COMB_T_TILE
     comb_workers = pl.max(1, pl.min(comb_tiles, HC_COMB_WORKERS))
-    for comb_worker in pl.spmd(comb_workers, name_hint="comb_sinkhorn", allow_early_resolve=True):
+    for comb_worker in pl.spmd(comb_workers, name_hint="comb_sinkhorn", allow_early_resolve=early_resolve):
         for ob in pl.range(comb_worker, comb_tiles, comb_workers):
             t0 = ob * COMB_T_TILE
             inv_col_t = pl.load(inv_rms, [t0, 0], [COMB_T_TILE, 1], target_memory=pl.MemorySpace.Vec)
@@ -275,6 +277,7 @@ def _hc_pre(
     x_mixed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
     post: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
     comb: pl.Out[pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32]],
+    early_resolve: pl.constexpr = ALLOW_EARLY_RESOLVE,
 ):
     x.bind_dynamic(0, T_DYN)
     x_mixed.bind_dynamic(0, T_DYN)
@@ -291,10 +294,10 @@ def _hc_pre(
     pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
     hc_mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
     hc_inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
-    pre_val_store = hc_pre_gates(x, hc_fn, hc_scale, hc_base, pre_val_store, post, comb, hc_mixes_raw, hc_inv_rms, True)
+    pre_val_store = hc_pre_gates(x, hc_fn, hc_scale, hc_base, pre_val_store, post, comb, hc_mixes_raw, hc_inv_rms, True, early_resolve)
 
     # mix_x: x_mixed = sum_h pre[:,h]*x[:,h,:], fanned over D/D_SPMD blocks per token tile.
-    for blk in pl.spmd((t_dim // T_TILE) * (D // D_SPMD), name_hint="mix_x", allow_early_resolve=True):
+    for blk in pl.spmd((t_dim // T_TILE) * (D // D_SPMD), name_hint="mix_x", allow_early_resolve=early_resolve):
         t0 = (blk // (D // D_SPMD)) * T_TILE
         d_base = (blk % (D // D_SPMD)) * D_SPMD
         pre_tile_t = pl.transpose(pre_val_store[t0:t0 + T_TILE, 0:HC_PAD], axis1=0, axis2=1)
@@ -342,10 +345,10 @@ def hc_pre_norm(
     scale1 = pl.read(hc_scale, [1])
     gate_mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
     gate_inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
-    hc_pre_gates(x, hc_fn, hc_scale, hc_base, pre_val_store, post, comb, gate_mixes_raw, gate_inv_rms, False)
+    hc_pre_gates(x, hc_fn, hc_scale, hc_base, pre_val_store, post, comb, gate_mixes_raw, gate_inv_rms, False, ALLOW_EARLY_RESOLVE)
     mixed_tiles = t_dim // T_TILE
     mixed_workers = pl.min(mixed_tiles, 16)
-    with pl.spmd(mixed_workers, name_hint="mix_x_rms_norm", allow_early_resolve=True) as mixed_tid:
+    with pl.spmd(mixed_workers, name_hint="mix_x_rms_norm", allow_early_resolve=ALLOW_EARLY_RESOLVE) as mixed_tid:
         for mixed_tile in pl.range(pl.tile.get_block_idx(), mixed_tiles, mixed_workers):
             t0 = mixed_tile * T_TILE
             # Compute the pre/post gates in the normalization task.

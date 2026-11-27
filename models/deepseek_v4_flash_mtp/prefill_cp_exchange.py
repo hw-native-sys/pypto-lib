@@ -88,7 +88,8 @@ CMP_ROWS_PER_RANK = LOCAL_PARTS * CMP_ROWS_PER_SEGMENT
 CMP_META_DIM = 8
 STATE_META_DIM = 8
 CMP_WINDOW_ROWS = CP_SIZE * CMP_ROWS_PER_RANK
-STATE_WINDOW_ROWS = CP_SIZE * TAIL_ROWS
+# Owner-history transfer reserves separate lanes for state and raw KV, even at CP1.
+STATE_WINDOW_ROWS = max(2, CP_SIZE) * TAIL_ROWS
 
 ROWS_PER_RANK = (LOCAL_PARTS * MAX_SEGMENT_TILES * TAIL_ROWS // CSA_COMPRESS_RATIO)
 STATE_ROWS_PER_RANK = 8
@@ -459,7 +460,7 @@ def _prefill_cp_hca_history_exchange(
     One phase transfers the raw/state tail; subsequent phases stream compressed
     rows through the existing compact window. Every phase is consumed before
     the next overwrite, including the later current-chunk compact publication.
-    State-window lanes0/1 hold FP32 state/raw respectively (CP is at least2);
+    State-window lanes0/1 hold FP32 state/raw respectively;
     conversion of BF16 raw KV to FP32 and back is exact.
     """
     state_rows = pl.tensor.dim(state, 0) * HCA_STATE_BLOCK_SIZE

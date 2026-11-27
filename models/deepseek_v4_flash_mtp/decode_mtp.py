@@ -9,6 +9,8 @@
 # ci: devices=2
 """DeepSeek-V4 MTP decode layer: projection, SWA attention, MoE, HC head, RMSNorm, and LM head."""
 
+from task_policy import ALLOW_EARLY_RESOLVE
+
 import argparse
 
 import pypto.language as pl
@@ -206,13 +208,14 @@ def _decode_mtp(
             recv_meta, recv_x, recv_aux,
             arrived, data_arrived, routed_y_buf, combine_arrived,
             pl.cast(MTP_LAYER_ID, pl.INT32), num_tokens, my_rank, pl.cast(MTP_MOE_EPOCH, pl.INT32),
+            expert_state=0, expert_descriptors=0,
         )
 
     clear_moe_signals(next_pre_hc_hidden, arrived, data_arrived, combine_arrived)
     x_head = pl.create_tensor([T, D], dtype=pl.BF16)
     with pl.scope():
         hc_head(next_pre_hc_hidden, mtp_hc_head_fn, mtp_hc_head_scale, mtp_hc_head_base, x_head)
-        rms_norm(x_head, mtp_norm_w, hidden_out)
+        rms_norm(x_head, mtp_norm_w, hidden_out, ALLOW_EARLY_RESOLVE)
         lm_head_with_sampling(
             hidden_out, lm_head_weight, logit_row_indices,
             sampling_temperatures, sampling_top_ks, sampling_seeds, sampling_positions,

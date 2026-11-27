@@ -28,6 +28,7 @@ from prefill_indexer_compressor import (
     golden_prefill_indexer_compressor,
     prefill_indexer_compressor,
 )
+from task_policy import ALLOW_EARLY_RESOLVE
 
 # Dynamic shape variables.
 IDX_BLOCK_NUM_DYN = pl.dynamic("PREFILL_IDX_BLOCK_NUM_DYN")
@@ -175,7 +176,7 @@ def prefill_indexer(
     # Materialize fixed-shape interleaved RoPE rows.
     rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
-    for prep_idx in pl.spmd(T // ROPE_PREP_TOKEN_TILE, name_hint="prefill_idx_rope_prepare", allow_early_resolve=True):
+    for prep_idx in pl.spmd(T // ROPE_PREP_TOKEN_TILE, name_hint="prefill_idx_rope_prepare", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         t0 = prep_idx * ROPE_PREP_TOKEN_TILE
         rope_ones = pl.full([ROPE_PREP_TOKEN_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
         rope_col_i32 = pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32)
@@ -194,7 +195,7 @@ def prefill_indexer(
         rope_sin_signed[t0 : t0 + ROPE_PREP_TOKEN_TILE, :] = pl.mul(sin_il, rope_sign)
 
     rope_swap_idx = pl.create_tensor([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_rope_swap_idx", allow_early_resolve=True):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_rope_swap_idx", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         swap_ones = pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
         swap_col_i32 = pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32)
         swap_col_fp32 = pl.cast(swap_col_i32, target_type=pl.FP32)
@@ -206,7 +207,7 @@ def prefill_indexer(
         rope_swap_idx[0:ROPE_ROW_TILE, 0:ROPE_HEAD_DIM] = swap_index
 
     qr_bf16 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.BF16)
-    for token_idx in pl.spmd(T, name_hint="prefill_idx_qr_rope", allow_early_resolve=True):
+    for token_idx in pl.spmd(T, name_hint="prefill_idx_qr_rope", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         r0 = token_idx * ROPE_ROW_TILE
         qr_nope_fp32 = qr_proj_flat[r0 : r0 + ROPE_ROW_TILE, 0 : IDX_NOPE_HEAD_DIM]
         qr_nope = pl.cast(qr_nope_fp32, target_type=pl.BF16, mode="rint")
@@ -222,13 +223,13 @@ def prefill_indexer(
         qr_bf16[r0 : r0 + ROPE_ROW_TILE, :] = pl.concat(qr_nope, rope_bf16)
 
     qh_acc_gm = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.FP32)
-    for mm_idx in pl.spmd(T * IDX_N_HEADS // QH_MM_TILE, name_hint="prefill_idx_qr_hadamard", allow_early_resolve=True):
+    for mm_idx in pl.spmd(T * IDX_N_HEADS // QH_MM_TILE, name_hint="prefill_idx_qr_hadamard", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         r0 = mm_idx * QH_MM_TILE
         qr_bf16_tile = qr_bf16[r0 : r0 + QH_MM_TILE, :]
         qh_acc = pl.matmul(qr_bf16_tile, hadamard, out_dtype=pl.FP32)
         qh_acc_gm[r0 : r0 + QH_MM_TILE, :] = qh_acc
 
-    for quant_idx in pl.spmd(T * IDX_N_HEADS // QH_QUANT_ROW_TILE, name_hint="prefill_idx_qr_quant", allow_early_resolve=True):
+    for quant_idx in pl.spmd(T * IDX_N_HEADS // QH_QUANT_ROW_TILE, name_hint="prefill_idx_qr_quant", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         r0 = quant_idx * QH_QUANT_ROW_TILE
         qh_amax = pl.full([1, QH_QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
         for h0 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
@@ -507,7 +508,7 @@ def _prefill_indexer_cp_score_topk(
         qr_bf16 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.BF16)
         idx_rope_items = T // 4
         idx_rope_workers = pl.min(idx_rope_items, 8)
-        for idx_rope_worker in pl.spmd(idx_rope_workers, name_hint="prefill_cp_idx_qr_rope", allow_early_resolve=True):
+        for idx_rope_worker in pl.spmd(idx_rope_workers, name_hint="prefill_cp_idx_qr_rope", allow_early_resolve=ALLOW_EARLY_RESOLVE):
             swap_ones = pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
             swap_col_i32 = pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32)
             swap_col_fp32 = pl.cast(swap_col_i32, target_type=pl.FP32)
@@ -551,7 +552,7 @@ def _prefill_indexer_cp_score_topk(
         qh_acc_gm = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.FP32)
         hadamard_items = (T * IDX_N_HEADS // QH_MM_TILE) // 16
         hadamard_workers = pl.min(hadamard_items, 2)
-        for hadamard_worker in pl.spmd(hadamard_workers, name_hint="prefill_cp_idx_qr_hadamard", allow_early_resolve=True):
+        for hadamard_worker in pl.spmd(hadamard_workers, name_hint="prefill_cp_idx_qr_hadamard", allow_early_resolve=ALLOW_EARLY_RESOLVE):
             hadamard_tile = pl.load(hadamard, [0, 0], [IDX_HEAD_DIM, IDX_HEAD_DIM], target_memory=pl.MemorySpace.Mat)
             for mm_idx_blk in pl.range(hadamard_worker, hadamard_items, hadamard_workers):
                 # Keep the original 16-tile body and each GEMM's accumulation.
@@ -565,7 +566,7 @@ def _prefill_indexer_cp_score_topk(
         qr_hadamard_i8 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
         # QuantLightningIndexer consumes per-token-head query scales as FP16.
         qr_hadamard_scale_dq = pl.create_tensor([T * IDX_N_HEADS, 1], dtype=pl.FP16)
-        for quant_idx_blk in pl.spmd((T * IDX_N_HEADS // QH_QUANT_ROW_TILE) // 16, name_hint="prefill_cp_idx_qr_quant", allow_early_resolve=True):
+        for quant_idx_blk in pl.spmd((T * IDX_N_HEADS // QH_QUANT_ROW_TILE) // 16, name_hint="prefill_cp_idx_qr_quant", allow_early_resolve=ALLOW_EARLY_RESOLVE):
             # Sixteen quantization tiles per block.
             for quant_idx_g in pl.range(16):
                 quant_idx = quant_idx_blk * 16 + quant_idx_g

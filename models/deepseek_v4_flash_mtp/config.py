@@ -284,7 +284,9 @@ INT8_AMAX_EPS = 1e-4                      # amax floor: avoids 127/0 on all-zero
 FP32_NEG_INF = -3.4028234663852886e38     # most-negative finite fp32 (softmax masking)
 
 # EP communication constants
-EP_WORLD_SIZE = 8  # deployment EP world size (demo overrides to 1)
+EP_WORLD_SIZE = 8  # deployment EP world size, used as the demo's pre-override divisor
+EXPERT_SLOTS = 0
+
 
 # Recv-buffer depth = N_RANKS lanes of MAX_PER_SRC = T rows (distinct top-k, so a
 # source sends at most T rows to a local expert). Recomputed per --ep at import.

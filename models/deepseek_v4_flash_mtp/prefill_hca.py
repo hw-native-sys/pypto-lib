@@ -91,6 +91,7 @@ from rmsnorm import golden_rms_norm
 from prefill_sparse_attn import (
     golden_prefill_sparse_attn,
 )
+from task_policy import ALLOW_EARLY_RESOLVE
 
 
 # model config
@@ -541,7 +542,7 @@ def prefill_attention_hca(
     attn_cmp_table = pl.create_tensor([PREFILL_CMP_MAX_BLOCKS], dtype=pl.INT32)
     history_raw = pl.create_tensor([TAIL_ROWS, HEAD_DIM], dtype=pl.BF16)
     history_state = pl.create_tensor([TAIL_ROWS, COMPRESS_STATE_DIM], dtype=pl.FP32)
-    for init_block in pl.spmd(HCA_MAX_COMPRESSED_ROWS // CACHE_INIT_CMP_ROWS, name_hint="cp_hca_attn_cache_init", allow_early_resolve=True):
+    for init_block in pl.spmd(HCA_MAX_COMPRESSED_ROWS // CACHE_INIT_CMP_ROWS, name_hint="cp_hca_attn_cache_init", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         for cmp_row0 in pl.range(init_block * CACHE_INIT_CMP_ROWS, (init_block + 1) * CACHE_INIT_CMP_ROWS, ROW_TILE):
             attn_cmp_flat[cmp_row0:cmp_row0 + ROW_TILE, :] = pl.full([ROW_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
         for history_row0 in pl.range(init_block * CACHE_INIT_HISTORY_ROWS, (init_block + 1) * CACHE_INIT_HISTORY_ROWS, ROW_TILE):
@@ -720,6 +721,7 @@ def prefill_attention_hca(
         augmented_rope_cos_il,
         augmented_rope_sin_signed,
         augmented_rope_swap_idx,
+        ALLOW_EARLY_RESOLVE,
     )
     kv_proj_rope(
         effective_x,
@@ -805,7 +807,7 @@ def prefill_attention_hca(
         final_rope_cos, final_rope_sin,
         row_tiles_per_worker=1,
     )
-    rope_prepare(final_rope_cos, final_rope_sin, final_rope_cos_il, final_rope_sin_signed, final_rope_swap_idx)
+    rope_prepare(final_rope_cos, final_rope_sin, final_rope_cos_il, final_rope_sin_signed, final_rope_swap_idx, ALLOW_EARLY_RESOLVE)
     kv_proj_rope(
         final_hidden,
         wkv,
@@ -828,7 +830,7 @@ def prefill_attention_hca(
     )
     scratch_state_flat = pl.reshape(scratch_state, [LOCAL_PARTS * state_rows, COMPRESS_STATE_DIM])
     state_init_workers = 8
-    with pl.spmd(state_init_workers, name_hint="cp_hca_init_state", allow_early_resolve=True) as state_init_done:
+    with pl.spmd(state_init_workers, name_hint="cp_hca_init_state", allow_early_resolve=ALLOW_EARLY_RESOLVE) as state_init_done:
         init_worker_id = pl.tile.get_block_idx()
         for part in pl.range(LOCAL_PARTS):
             segment = pl.read(owner_segments_t, [part])
@@ -905,7 +907,7 @@ def prefill_attention_hca(
     leaf_cmp_flat = pl.reshape(leaf_cmp, [LEAF_CMP_ROWS, HEAD_DIM])
     scratch_state_flat = pl.reshape(scratch_state, [LOCAL_PARTS * state_rows, COMPRESS_STATE_DIM])
     final_segment = pl.read(final_segment_t, [0])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_pack_compact", allow_early_resolve=True) as pack_compact_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_pack_compact", allow_early_resolve=ALLOW_EARLY_RESOLVE) as pack_compact_tid:
         for record in pl.range(EPOCHS * CMP_ROWS_PER_RANK):
             local_cmp_payload[record : record + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
             for field in pl.range(CMP_META_DIM):

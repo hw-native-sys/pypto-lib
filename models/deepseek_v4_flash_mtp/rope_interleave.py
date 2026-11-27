@@ -29,6 +29,7 @@ Folding the sign into sin here rather than at each consumer is exact: multiplyin
 import pypto.language as pl
 
 from config import FLASH as M, DECODE_BATCH
+from task_policy import ALLOW_EARLY_RESOLVE
 
 
 B = DECODE_BATCH
@@ -42,9 +43,10 @@ def rope_interleave(
     sin_half: pl.Tensor[[B, HALF_ROPE], pl.FP32],
     cos_il: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
     sin_signed: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    early_resolve: pl.constexpr = ALLOW_EARLY_RESOLVE,
 ):
     """Expand half-width cos/sin rows to the interleaved, sign-folded rope layout."""
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_interleave", allow_early_resolve=True):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_interleave", allow_early_resolve=early_resolve):
         il_ones = pl.full([B, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
         il_col = pl.col_expand_mul(
             il_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))

@@ -55,6 +55,7 @@ from qkv_proj_rope import qkv_proj_rope
 from rmsnorm import rms_norm
 from rope_interleave import rope_interleave
 from decode_sparse_attn_csa import CMP_TABLE_BLOCKS_DYN, sparse_attn_csa
+from task_policy import ALLOW_EARLY_RESOLVE
 
 # model config
 B = DECODE_BATCH
@@ -168,7 +169,7 @@ def _attention_csa(
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post_t = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
+    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t, ALLOW_EARLY_RESOLVE)
 
     step_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
     step_sin = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
@@ -186,15 +187,15 @@ def _attention_csa(
             step_cos[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_cos[first_t : first_t + 1, 0 : HALF_ROPE], target_type=pl.FP32)
             step_sin[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_sin[first_t : first_t + 1, 0 : HALF_ROPE], target_type=pl.FP32)
 
-    rope_interleave(step_cos, step_sin, step_cos_il, step_sin_signed)
+    rope_interleave(step_cos, step_sin, step_cos_il, step_sin_signed, ALLOW_EARLY_RESOLVE)
 
     # Same hoist as step_cos_il above, for the main compressor's rmsnorm_rope.
     cmp_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
-    rope_interleave(cmp_freqs_cos, cmp_freqs_sin, cmp_cos_il, cmp_sin_signed)
+    rope_interleave(cmp_freqs_cos, cmp_freqs_sin, cmp_cos_il, cmp_sin_signed, ALLOW_EARLY_RESOLVE)
 
     x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
-    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
+    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t, ALLOW_EARLY_RESOLVE)
     # rms_norm fans out to qr_proj_matmul (critical path), kv_proj_matmul, kv_score_proj
     # and weights_proj. The latter three take this barrier instead of racing the first:
     # the dummy resolves one hop after rms_norm, so qr_proj_matmul is dispatched first.
@@ -207,6 +208,7 @@ def _attention_csa(
         x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
         freqs_cos, freqs_sin, gamma_cq, gamma_ckv,
         q, kv, qr, qr_scale, late_dep,
+        ALLOW_EARLY_RESOLVE,
     )
     # SDMA CMO L2 warm of the o-projection weights, issued once q is written.
     wo_a_flat = pl.reshape(wo_a, [O_GROUPS * O_LORA * O_GROUP_IN])

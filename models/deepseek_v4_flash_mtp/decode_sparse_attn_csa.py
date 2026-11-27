@@ -26,6 +26,7 @@ from config import (
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
 )
+from task_policy import ALLOW_EARLY_RESOLVE
 
 
 # Dynamic shape variables.
@@ -119,7 +120,7 @@ def _sparse_attn_csa(
     # WAR marker (pypto-lib#481): a scalar-driven gather_row does not mark ori_kv
     # add_inout, so the layer's KV writeback would lose its WAR edge against the
     # qk_pv gather read. add_inout is param-level, so this no-op self-copy suffices.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_touch", allow_early_resolve=True):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_touch", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         ori_kv_flat[0:T, 0:HEAD_DIM] = ori_kv_flat[0:T, 0:HEAD_DIM]
 
     # qk_plan compacts the T*SPARSE_BLOCKS work items into qk_order[], non-empty
@@ -129,7 +130,7 @@ def _sparse_attn_csa(
     valid_block_mask = pl.create_tensor([T, SPARSE_BLOCKS], dtype=pl.INT32)
     qk_order = pl.create_tensor([QK_ITEMS], dtype=pl.INT32)
     qk_wcur = pl.create_tensor([1], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_slots_build_valid_qk_plan", allow_early_resolve=True) as qk_plan_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_slots_build_valid_qk_plan", allow_early_resolve=ALLOW_EARLY_RESOLVE) as qk_plan_tid:
         # Compressed slots [0, IDX_TOPK): vectorized masked copy over all T rows, keeping
         # raw iff 0 <= raw < floor((pos + 1) / COMPRESS_RATIO), as out = mask*(raw + 1) - 1.
         c_raw = pl.cast(idx_topk[0:T, 0:IDX_TOPK], target_type=pl.FP32)
@@ -193,7 +194,7 @@ def _sparse_attn_csa(
     sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
 
-    with pl.spmd(NUM_QK_CORES, name_hint="qk_pv", deps=[qk_plan_tid], allow_early_resolve=True) as qk_tid:
+    with pl.spmd(NUM_QK_CORES, name_hint="qk_pv", deps=[qk_plan_tid], allow_early_resolve=ALLOW_EARLY_RESOLVE) as qk_tid:
         qk_core = pl.tile.get_block_idx()
         # Items for this lane: qk_core, qk_core + NUM_QK_CORES, ...  The per-lane
         # count is derived from the lane index (no stored per-core count); a lane
@@ -309,7 +310,7 @@ def _sparse_attn_csa(
     # j^1 lane-swap index for merge_norm's rotation gather. Shaped [H_TILE, ROPE_DIM]
     # because gather's index must match its source rows.
     rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs", allow_early_resolve=True):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         sw_ones = pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
         sw_idx_f = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
         sw_col = pl.col_expand_mul(sw_ones, sw_idx_f)
@@ -402,7 +403,7 @@ def _sparse_attn_csa(
             out_col_g = g * O_LORA
 
             with pl.spmd(O_LORA // PROJ_A_MM_N_TILE, name_hint="proj_a_mm", deps=[merge_tid],
-                         allow_early_resolve=True) as pa_tid:
+                         allow_early_resolve=ALLOW_EARLY_RESOLVE) as pa_tid:
                 nf = pl.tile.get_block_idx()
                 n0 = nf * PROJ_A_MM_N_TILE
                 acc_a = pl.create_tensor([1, MM_T_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
@@ -415,7 +416,7 @@ def _sparse_attn_csa(
                 o_r_pad = pl.assemble(o_r_pad, acc_a, [0, out_col_g + n0])
 
             col_g = g * O_LORA
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="quant", deps=[pa_tid], allow_early_resolve=True) as q_tid:
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="quant", deps=[pa_tid], allow_early_resolve=ALLOW_EARLY_RESOLVE) as q_tid:
                 for qt in pl.pipeline(0, T, QUANT_TOKEN_TILE, stage=2):
                     oc_amax = o_r_pad[qt : qt + QUANT_TOKEN_TILE, col_g : col_g + O_LORA]
                     g_abs = pl.abs(oc_amax)
@@ -438,7 +439,7 @@ def _sparse_attn_csa(
                         zero_i8 = pl.cast(zero_half, target_type=pl.INT8, mode="trunc")
                         o_r_i8_pad[T:T_PAD, col_g : col_g + O_LORA] = zero_i8
 
-            with pl.spmd(D // PROJ_B_D_TILE, name_hint="proj_b_mm", deps=[q_tid], allow_early_resolve=True) as pb_tid:
+            with pl.spmd(D // PROJ_B_D_TILE, name_hint="proj_b_mm", deps=[q_tid], allow_early_resolve=ALLOW_EARLY_RESOLVE) as pb_tid:
                 dc = pl.tile.get_block_idx()
                 d0 = dc * PROJ_B_D_TILE
                 for nf in pl.range(PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
@@ -456,7 +457,7 @@ def _sparse_attn_csa(
     # per-row act scale -- then applies the per-channel weight scale -> BF16. Explicit
     # deps on all proj_b_mm tasks bridge manual_scope -> the return's auto-dep.
     with pl.spmd((D // PROJ_B_ACT_N_TILE) * (T // PROJ_B_ACT_TASK_T_TILE), name_hint="proj_b_act",
-                 deps=[proj_b_tids[i] for i in range(O_GROUPS)], allow_early_resolve=True) as _act_tid:
+                 deps=[proj_b_tids[i] for i in range(O_GROUPS)], allow_early_resolve=ALLOW_EARLY_RESOLVE) as _act_tid:
         act_idx = pl.tile.get_block_idx()
         nreg = act_idx // (T // PROJ_B_ACT_TASK_T_TILE)
         tblk = act_idx - nreg * (T // PROJ_B_ACT_TASK_T_TILE)

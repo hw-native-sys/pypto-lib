@@ -11,7 +11,7 @@
 """DeepSeek-V4 Flash MTP prefill entry with lib-owned context parallelism.
 
 The serving-facing ``l3_prefill_fwd`` entry owns request distribution and CP
-workspace. With CP=EP>1, it processes active request owners sequentially,
+workspace. With CP=EP, it processes active request owners sequentially,
 using the full CP group for each request, including short chunks. Each owner
 supplies its absolute positions and cache page tables for chunk continuation
 and prefix reuse. Each request contributes 1..CP_SIZE*1024 tokens per call.
@@ -25,6 +25,8 @@ outputs on the affected owner. The colocated standalone runner is an
 execution smoke check, not a numerical oracle.
 """
 
+from task_policy import ALLOW_EARLY_RESOLVE
+
 import argparse
 
 import pypto.language as pl
@@ -37,6 +39,7 @@ import config
 # Import prefill_moe first: it applies the EP/FLASH override before the attention modules
 # bake config-derived MoE shapes.
 from prefill_moe import (
+    BANK_ROWS,
     PrefillMoELayout,
     make_prefill_moe,
     D,
@@ -99,6 +102,8 @@ from lm_head import (
     lm_head_test,
 )
 from rmsnorm import rms_norm
+from expert_slots import BANK_DIRECTIONS, EXPERT_SLOTS, MAPPED, RankDescriptors, RankState, WorkerDescriptors, WorkerState
+from serving_contract import DEEPSEEK_V4_FLASH_SERVING_CONTRACT
 
 assert config.PREFILL_TOKENS == T
 
@@ -113,6 +118,8 @@ assert config.PREFILL_TOKENS == T
 # ---------------------------------------------------------------------------
 MODEL_NUM_LAYERS = MODEL_CONFIG.num_hidden_layers
 FWD_NUM_LAYERS = 43
+ROUTED_STACK_ROWS = EXPERT_SLOTS if MAPPED else FWD_NUM_LAYERS * N_LOCAL
+ROUTED_LAYER_STRIDE = 0 if MAPPED else N_LOCAL
 CSA_NUM_LAYERS = 21
 HCA_NUM_LAYERS = 20
 HCA_CMP_STORAGE_BLOCK_SIZE = BLOCK_SIZE // HCA_COMPRESS_RATIO
@@ -265,7 +272,8 @@ MOE_ID_COPY_TILE = 8
 check_prefill_moe_slab(CP_LOCAL_ROWS)
 assert CP_SIZE in CP_CHOICES, f"--cp must be one of {CP_CHOICES} (got {CP_SIZE})"
 assert CP_SIZE in (1, N_RANKS), f"CP must be 1 or EP (got CP={CP_SIZE}, EP={N_RANKS})"
-assert LOCAL_PARTS == 2 and ATTN_TILE_ROWS == 128 and CP_LOCAL_ROWS == 1024, "CP leaf/slab capacity changed"
+assert LOCAL_PARTS == 2 and ATTN_TILE_ROWS == 128
+assert CP_LOCAL_ROWS == DEEPSEEK_V4_FLASH_SERVING_CONTRACT.prefill_moe_tokens_per_rank
 assert ATTN_TILE_ROWS % PRE_HC_COPY_TOKEN_TILE == 0
 assert CP_LOCAL_ROWS % MOE_ID_COPY_TILE == 0
 
@@ -401,12 +409,12 @@ def _fwd_moe_tail(
     gate_w: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32],
     gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
-    routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
-    routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
-    routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ],
-    routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
+    routed_w1: pl.Tensor[[BANK_ROWS, MOE_INTER, D], pl.INT8, pl.NZ],
+    routed_w1_scale: pl.Tensor[[BANK_ROWS, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[BANK_ROWS, MOE_INTER, D], pl.INT8, pl.NZ],
+    routed_w3_scale: pl.Tensor[[BANK_ROWS, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[BANK_ROWS, D, MOE_INTER], pl.INT8, pl.NZ],
+    routed_w2_scale: pl.Tensor[[BANK_ROWS, D], pl.FP32],
     shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
@@ -428,6 +436,8 @@ def _fwd_moe_tail(
     completion_anchor: pl.Out[pl.Tensor[[1, 1, 8], pl.FP32]],
     attention_done_tid: pl.Scalar[pl.TASK_ID],
     layer_id: pl.Scalar[pl.INT32],
+    expert_state: RankState,
+    expert_descriptors: RankDescriptors,
 ) -> pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS, HC_MULT, D], pl.FP32]:
     """Pack real CP rows, run one MoE slab, and restore the attention slots."""
     x_attn_flat = pl.reshape(x_attn, [CP_LOCAL_ROWS, HC_MULT, D])
@@ -459,6 +469,7 @@ def _fwd_moe_tail(
         attention_done_tid, layer_id,
         pl.cast(layer_id + 1, pl.INT32),
         active_tokens,
+        expert_state=expert_state, expert_descriptors=expert_descriptors,
     )
 
     with pl.at(
@@ -945,12 +956,12 @@ def prefill_fwd(
     gate_bias: pl.Tensor[[FWD_NUM_LAYERS * N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[FWD_NUM_LAYERS * VOCAB, TOPK], pl.INT32],
     input_ids: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS], pl.INT64],
-    routed_w1: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
-    routed_w1_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
-    routed_w3_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ],
-    routed_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, D], pl.FP32],
+    routed_w1: pl.Tensor[[ROUTED_STACK_ROWS, MOE_INTER, D], pl.INT8, pl.NZ],
+    routed_w1_scale: pl.Tensor[[ROUTED_STACK_ROWS, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[ROUTED_STACK_ROWS, MOE_INTER, D], pl.INT8, pl.NZ],
+    routed_w3_scale: pl.Tensor[[ROUTED_STACK_ROWS, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[ROUTED_STACK_ROWS, D, MOE_INTER], pl.INT8, pl.NZ],
+    routed_w2_scale: pl.Tensor[[ROUTED_STACK_ROWS, D], pl.FP32],
     shared_w1: pl.Tensor[[FWD_NUM_LAYERS, MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w1_scale: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
     shared_w3: pl.Tensor[[FWD_NUM_LAYERS, MOE_INTER, D], pl.INT8, pl.NZ],
@@ -983,6 +994,8 @@ def prefill_fwd(
     hidden_out: pl.Out[pl.Tensor[[CP_LOCAL_ROWS, D], pl.BF16]],
     # Scalars last: runtime TaskArgs forbids a tensor arg after a scalar arg.
     my_rank: pl.Scalar[pl.INT32],
+    expert_state: RankState,
+    expert_descriptors: RankDescriptors,
 ) -> pl.Tensor[[CP_LOCAL_ROWS, D], pl.BF16]:
     """Run the chronological attention/MoE schedule over caller-owned caches."""
 
@@ -1096,23 +1109,23 @@ def prefill_fwd(
             gate_bias, [N_EXPERTS_GLOBAL], [layer_index * N_EXPERTS_GLOBAL]
         )
         tid2eid_layer: pl.Tensor[[VOCAB, TOPK], pl.INT32] = pl.slice(tid2eid, [VOCAB, TOPK], [layer_index * VOCAB, 0])
-        routed_w1_layer: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ] = pl.slice(
-            routed_w1, [N_LOCAL, MOE_INTER, D], [layer_index * N_LOCAL, 0, 0]
+        routed_w1_layer: pl.Tensor[[BANK_ROWS, MOE_INTER, D], pl.INT8, pl.NZ] = pl.slice(
+            routed_w1, [BANK_ROWS, MOE_INTER, D], [layer_index * ROUTED_LAYER_STRIDE, 0, 0]
         )
-        routed_w1_scale_layer: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32] = pl.slice(
-            routed_w1_scale, [N_LOCAL, MOE_INTER], [layer_index * N_LOCAL, 0]
+        routed_w1_scale_layer: pl.Tensor[[BANK_ROWS, MOE_INTER], pl.FP32] = pl.slice(
+            routed_w1_scale, [BANK_ROWS, MOE_INTER], [layer_index * ROUTED_LAYER_STRIDE, 0]
         )
-        routed_w3_layer: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ] = pl.slice(
-            routed_w3, [N_LOCAL, MOE_INTER, D], [layer_index * N_LOCAL, 0, 0]
+        routed_w3_layer: pl.Tensor[[BANK_ROWS, MOE_INTER, D], pl.INT8, pl.NZ] = pl.slice(
+            routed_w3, [BANK_ROWS, MOE_INTER, D], [layer_index * ROUTED_LAYER_STRIDE, 0, 0]
         )
-        routed_w3_scale_layer: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32] = pl.slice(
-            routed_w3_scale, [N_LOCAL, MOE_INTER], [layer_index * N_LOCAL, 0]
+        routed_w3_scale_layer: pl.Tensor[[BANK_ROWS, MOE_INTER], pl.FP32] = pl.slice(
+            routed_w3_scale, [BANK_ROWS, MOE_INTER], [layer_index * ROUTED_LAYER_STRIDE, 0]
         )
-        routed_w2_layer: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ] = pl.slice(
-            routed_w2, [N_LOCAL, D, MOE_INTER], [layer_index * N_LOCAL, 0, 0]
+        routed_w2_layer: pl.Tensor[[BANK_ROWS, D, MOE_INTER], pl.INT8, pl.NZ] = pl.slice(
+            routed_w2, [BANK_ROWS, D, MOE_INTER], [layer_index * ROUTED_LAYER_STRIDE, 0, 0]
         )
-        routed_w2_scale_layer: pl.Tensor[[N_LOCAL, D], pl.FP32] = pl.slice(
-            routed_w2_scale, [N_LOCAL, D], [layer_index * N_LOCAL, 0]
+        routed_w2_scale_layer: pl.Tensor[[BANK_ROWS, D], pl.FP32] = pl.slice(
+            routed_w2_scale, [BANK_ROWS, D], [layer_index * ROUTED_LAYER_STRIDE, 0]
         )
         shared_w1_layer: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ] = shared_w1[layer_index]
         shared_w1_scale_layer: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(
@@ -1389,6 +1402,7 @@ def prefill_fwd(
                 moe_completion,
                 moe_ready,
                 layer_index,
+                expert_state=expert_state, expert_descriptors=expert_descriptors,
             )
         layer_hidden = layer_output
 
@@ -1463,7 +1477,7 @@ def prefill_fwd(
         hidden_head = pl.create_tensor([CP_LOCAL_ROWS, D], dtype=pl.BF16)
         with pl.scope():
             hc_head(pre_hc_view, hc_head_fn, hc_head_scale, hc_head_base, hidden_head)
-            rms_norm(hidden_head, final_norm_w, hidden_out)
+            rms_norm(hidden_head, final_norm_w, hidden_out, ALLOW_EARLY_RESOLVE)
     return hidden_out
 
 
@@ -1496,7 +1510,7 @@ from prefill_cp_exchange import (
 )
 
 
-@pl.jit(auto_scope=False)
+@pl.jit(auto_scope=False, **BANK_DIRECTIONS)
 def _prefill_request(
     x_hc: pl.Tensor[[FWD_TOKENS_DYN, FWD_INPUT_STREAMS_DYN, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
@@ -1561,12 +1575,12 @@ def _prefill_request(
     gate_w: pl.Tensor[[FWD_NUM_LAYERS * N_EXPERTS_GLOBAL, D], pl.FP32],
     gate_bias: pl.Tensor[[FWD_NUM_LAYERS * N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[FWD_NUM_LAYERS * VOCAB, TOPK], pl.INT32],
-    routed_w1: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
-    routed_w1_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8, pl.NZ],
-    routed_w3_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, D, MOE_INTER], pl.INT8, pl.NZ],
-    routed_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, D], pl.FP32],
+    routed_w1: pl.Tensor[[ROUTED_STACK_ROWS, MOE_INTER, D], pl.INT8, pl.NZ],
+    routed_w1_scale: pl.Tensor[[ROUTED_STACK_ROWS, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[ROUTED_STACK_ROWS, MOE_INTER, D], pl.INT8, pl.NZ],
+    routed_w3_scale: pl.Tensor[[ROUTED_STACK_ROWS, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[ROUTED_STACK_ROWS, D, MOE_INTER], pl.INT8, pl.NZ],
+    routed_w2_scale: pl.Tensor[[ROUTED_STACK_ROWS, D], pl.FP32],
     shared_w1: pl.Tensor[[FWD_NUM_LAYERS, MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w1_scale: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
     shared_w3: pl.Tensor[[FWD_NUM_LAYERS, MOE_INTER, D], pl.INT8, pl.NZ],
@@ -1609,6 +1623,8 @@ def _prefill_request(
     entry_pre_hc_tail_window: pld.DistributedTensor[[CP_EXCHANGE_NUM_SEGMENTS * CP_EXCHANGE_TAIL_ROWS, CP_EXCHANGE_CP_REQUEST_HC_DIM], pl.FP32],
     entry_complete: pld.DistributedTensor[[CP_EXCHANGE_CP_SIZE, 1], pl.INT32],
     entry_barrier_epochs: pld.DistributedTensor[[CP_EXCHANGE_CP_SIZE, 16], pl.INT32],
+    expert_state: pl.InOut[RankState],
+    expert_descriptors: RankDescriptors,
     my_rank: pl.Scalar[pl.INT32],
 ):
     # Process owners sequentially within each chip invocation.
@@ -1782,6 +1798,7 @@ def _prefill_request(
                     final_norm_w,
                     cp_pre_hc_hidden_out, cp_hidden_out,
                     my_rank,
+                    expert_state=expert_state, expert_descriptors=expert_descriptors,
                 )
                 cp_pre_hc_flat = pl.reshape(cp_pre_hc_hidden_out, [CP_LOCAL_ROWS, HC_DIM])
                 output_pre_hc_flat = pl.reshape(pre_hc_hidden_out, [T, HC_DIM])
@@ -1819,7 +1836,7 @@ def _prefill_request(
     return x_out
 
 
-@pl.jit.host
+@pl.jit.host(**BANK_DIRECTIONS)
 def l3_prefill_fwd(
     x_hc: pl.Tensor[[N_RANKS, FWD_TOKENS_DYN, FWD_INPUT_STREAMS_DYN, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
@@ -1885,12 +1902,12 @@ def l3_prefill_fwd(
     gate_w: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_EXPERTS_GLOBAL, D], pl.FP32],
     gate_bias: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * VOCAB, TOPK], pl.INT32],
-    routed_w1: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8],
-    routed_w1_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8],
-    routed_w3_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, D, MOE_INTER], pl.INT8],
-    routed_w2_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, D], pl.FP32],
+    routed_w1: pl.Tensor[[N_RANKS, ROUTED_STACK_ROWS, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_RANKS, ROUTED_STACK_ROWS, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_RANKS, ROUTED_STACK_ROWS, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_RANKS, ROUTED_STACK_ROWS, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_RANKS, ROUTED_STACK_ROWS, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_RANKS, ROUTED_STACK_ROWS, D], pl.FP32],
     shared_w1: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS, MOE_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
     shared_w3: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS, MOE_INTER, D], pl.INT8],
@@ -1907,9 +1924,10 @@ def l3_prefill_fwd(
     logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
     num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
+    expert_state: pl.InOut[WorkerState] = 0,
+    expert_descriptors: pl.InOut[WorkerDescriptors] = 0,
 ):
-
-    pl.static_assert(CP_SIZE == N_RANKS and CP_SIZE > 1, "Prefill requires CP=EP>1; CP1 is deferred.")
+    pl.static_assert(CP_SIZE == N_RANKS and (MAPPED or CP_SIZE > 1), "Prefill requires CP=EP.")
     x_hc.bind_dynamic(1, FWD_TOKENS_DYN)
     x_hc.bind_dynamic(2, FWD_INPUT_STREAMS_DYN)
     hidden_out.bind_dynamic(1, FWD_TOKENS_DYN)
@@ -2056,6 +2074,7 @@ def l3_prefill_fwd(
             cp_prefill_moe_reverse_target, cp_prefill_moe_reverse_signal,
             entry_header_window, entry_input_window, entry_ids_window, entry_tables_window, entry_ready,
             entry_hidden_window, entry_pre_hc_tail_window, entry_complete, entry_barrier_epochs,
+            expert_state[r] if MAPPED else 0, expert_descriptors[r] if MAPPED else 0,
             r,
             device=r,
         )
