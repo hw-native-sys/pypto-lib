@@ -15,6 +15,7 @@ from config import BLOCK_SIZE, C2A_STORAGE_ROWS, DECODE_BATCH, DECODE_SEQ
 from config import DSPARK_QUERY_WIDTH, DSPARK_DRAFT_LAYERS, FLASH, TABLE_DYN
 from lm_head import SAMPLED_IDS_PAD
 from input_pack import VOCAB_DYN, pack_x_hc
+from sample import VOCAB
 
 
 # Dynamic shape variables.
@@ -32,6 +33,9 @@ STATE_COMMITTED = 3
 STATE_DRAFT_COUNT = 4
 STATE_LIMIT = 5
 STATE_META_WIDTH = 6
+STATE_PROPOSAL_START = 16
+REJECTION_STATE_META_WIDTH = STATE_PROPOSAL_START + DSPARK_QUERY_WIDTH * VOCAB
+PROPOSAL_COPY_TILE = 1280
 STATE_TOKEN_WIDTH = ROWS
 ROPE_HALF = FLASH.qk_rope_head_dim // 2
 TARGET_ROWS = DECODE_BATCH * ROWS
@@ -53,7 +57,7 @@ def decode_prepare(
     slot_ids: pl.Tensor[[DECODE_BATCH], pl.INT32],
     generations: pl.Tensor[[DECODE_BATCH], pl.INT32],
     state_tokens: pl.Tensor[[DECODE_BATCH, STATE_TOKEN_WIDTH], pl.INT64],
-    state_meta: pl.Tensor[[DECODE_BATCH, STATE_META_WIDTH], pl.INT32],
+    state_meta: pl.Tensor[[DECODE_BATCH, REJECTION_STATE_META_WIDTH], pl.INT32],
     active_widths: pl.Tensor[[DECODE_BATCH], pl.INT32],
     embedding_weight: pl.Tensor[[VOCAB_DYN, D], pl.BF16],
     window_table: pl.Tensor[[DECODE_BATCH, WINDOW_TABLE_DYN], pl.INT32],
@@ -205,7 +209,7 @@ def decode_accept(
     active_widths: pl.Tensor[[DECODE_BATCH], pl.INT32],
     sampled_ids: pl.Tensor[[DECODE_BATCH * ROWS, SAMPLED_IDS_PAD], pl.INT32],
     state_tokens: pl.Tensor[[DECODE_BATCH, STATE_TOKEN_WIDTH], pl.INT64],
-    state_meta: pl.Tensor[[DECODE_BATCH, STATE_META_WIDTH], pl.INT32],
+    state_meta: pl.Tensor[[DECODE_BATCH, REJECTION_STATE_META_WIDTH], pl.INT32],
     accepted_ids: pl.Tensor[[DECODE_BATCH, ROWS], pl.INT32],
     accepted_counts: pl.Tensor[[DECODE_BATCH], pl.INT32],
     num_sampled: pl.Tensor[[DECODE_BATCH], pl.INT32],
@@ -268,7 +272,6 @@ def decode_accept(
                 width = pl.read(cached_widths, [0, request])
                 if slot >= 0 and slot < DECODE_BATCH and (width > 0) and (width <= ROWS):
                     meta_row = pl.load(state_meta, [slot, 0], [1, 8], [1, STATE_META_WIDTH])
-                    token_row = pl.load(state_tokens, [slot, 0], [1, 8], [1, STATE_TOKEN_WIDTH])
                     valid = pl.read(meta_row, [0, STATE_VALID])
                     generation = pl.read(meta_row, [0, STATE_GENERATION])
                     expected = pl.cast(0, pl.INT32)
@@ -282,9 +285,8 @@ def decode_accept(
                         still_matching = pl.cast(1, pl.INT32)
                         for offset in pl.range(DSPARK_QUERY_WIDTH):
                             if offset < count and still_matching == 1:
-                                draft = pl.read(token_row, [0, offset + 1])
-                                predicted = pl.read(sampled_ids, [request * ROWS + offset, 0])
-                                if draft == pl.cast(predicted, pl.INT64):
+                                decision = pl.read(sampled_ids, [request * ROWS + offset, 1])
+                                if decision == 1:
                                     matched = pl.cast(offset + 1, pl.INT32)
                                 else:
                                     still_matching = pl.cast(0, pl.INT32)
@@ -427,13 +429,71 @@ def decode_publish(
                 pl.write(query_starts, [request], pl.read(local_query_starts, [request]))
 
 
+@pl.jit.inline
+def prepare_rejection_proposals(
+    slot_ids: pl.Tensor,
+    generations: pl.Tensor,
+    active_widths: pl.Tensor,
+    state_tokens: pl.Tensor,
+    state_meta: pl.Tensor,
+    proposals: pl.Tensor,
+):
+    workers = pl.min(TARGET_ROWS, pl.system.available_aiv_count())
+    for worker in pl.spmd(workers, name_hint="dspark_rejection_proposals"):
+        for row in pl.range(worker, TARGET_ROWS, workers):
+            request = row // ROWS
+            offset = row % ROWS
+            pair = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=-1)
+            slot = pl.read(slot_ids, [request])
+            width = pl.read(active_widths, [request])
+            if slot >= 0 and slot < DECODE_BATCH and offset < width - 1:
+                generation = pl.read(generations, [request])
+                if pl.read(state_meta, [slot, STATE_GENERATION]) == generation:
+                    draft = pl.read(state_tokens, [slot, offset + 1])
+                    pl.write(pair, [0, 0], pl.cast(draft, pl.INT32))
+                    pl.write(pair, [0, 1], pl.cast(slot, pl.INT32))
+                    start = STATE_PROPOSAL_START + offset * VOCAB
+                    pl.write(pair, [0, 2], pl.cast(start, pl.INT32))
+            proposals[row : row + 1, :] = pair
+    return proposals
+
+
+@pl.jit.inline
+def store_proposal_probs(
+    slot_ids: pl.Tensor,
+    generations: pl.Tensor,
+    state_meta: pl.Tensor,
+    proposal_probs: pl.Tensor,
+):
+    tiles = DSPARK_QUERY_WIDTH * VOCAB // PROPOSAL_COPY_TILE
+    workers = pl.min(tiles, pl.system.available_aiv_count())
+    for worker in pl.spmd(workers, name_hint="dspark_store_proposal_probs"):
+        for request in pl.range(DECODE_BATCH):
+            slot = pl.read(slot_ids, [request])
+            if slot >= 0 and slot < DECODE_BATCH:
+                generation = pl.read(state_meta, [slot, STATE_GENERATION])
+                expected = pl.read(generations, [request])
+                valid = pl.read(state_meta, [slot, STATE_VALID])
+                count = pl.read(state_meta, [slot, STATE_DRAFT_COUNT])
+                anchor = pl.read(state_meta, [slot, STATE_ANCHOR])
+                limit = pl.read(state_meta, [slot, STATE_LIMIT])
+                if valid == 1 and generation == expected and count == 0 and anchor + DSPARK_QUERY_WIDTH < limit:
+                    for tile in pl.range(worker, tiles, workers):
+                        start = tile * PROPOSAL_COPY_TILE
+                        probs = proposal_probs[request : request + 1, start : start + PROPOSAL_COPY_TILE]
+                        words = pl.reinterpret_view(probs, pl.INT32)
+                        dest = STATE_PROPOSAL_START + start
+                        state_meta[slot : slot + 1, dest : dest + PROPOSAL_COPY_TILE] = words
+    return state_meta
+
+
 @pl.jit.inline(auto_scope=False)
 def commit_drafts(
     slot_ids: pl.Tensor[[DECODE_BATCH], pl.INT32],
     generations: pl.Tensor[[DECODE_BATCH], pl.INT32],
     draft_ids: pl.Tensor[[DECODE_BATCH, DSPARK_QUERY_WIDTH], pl.INT32],
     state_tokens: pl.InOut[pl.Tensor[[DECODE_BATCH, STATE_TOKEN_WIDTH], pl.INT64]],
-    state_meta: pl.InOut[pl.Tensor[[DECODE_BATCH, STATE_META_WIDTH], pl.INT32]],
+    state_meta: pl.InOut[pl.Tensor[[DECODE_BATCH, REJECTION_STATE_META_WIDTH], pl.INT32]],
     committed: pl.Out[pl.Tensor[[DECODE_BATCH], pl.INT32]],
 ):
     for _core in pl.spmd(1, name_hint="dspark_commit_drafts"):

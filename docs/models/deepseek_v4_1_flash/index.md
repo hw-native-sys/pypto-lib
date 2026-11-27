@@ -64,10 +64,8 @@ last query row per request. The reusable `decode_fwd` and its L3 entry
 run only the backbone, retaining final HC state and DSpark target taps. DSpark
 composes the output head and sampling after that backbone. `lm_head` writes
 FP32 logits in place; the prefill rows (both the forward tail and the resident
-generation head) and the DSpark target rows sample through `sample`
-(`sample.py`), which takes per-row temperature, top-k, and top-p filters with
-Gumbel-max randomness — zero temperature reproduces greedy decoding — while
-the DSpark draft rows use `markov_sample`. Engram contributes at its configured
+generation head) sample through `sample` (`sample.py`). DSpark uses
+device-side rejection sampling for target verification. Engram contributes at its configured
 layers. A layer follows this structure:
 
 ```text
@@ -86,6 +84,12 @@ The output projection uses the fused O-B + HC-post implementation in
 Attention entries own chunk scheduling and dependencies around that shared
 implementation. MoE dispatches local token rows to EP expert owners and combines
 the results back into the local HC state.
+
+DSpark K=5 uses rejection sampling. Callers retain the INT32
+`state_meta` tensor with `REJECTION_STATE_META_WIDTH` columns per request
+slot across bootstrap and decode. The state includes five full-vocabulary
+FP32 proposal distributions. The first draft block uses the same proposal
+sampler as subsequent decode iterations.
 
 ## Parallel configuration
 

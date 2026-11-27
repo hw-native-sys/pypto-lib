@@ -29,9 +29,9 @@ from config import (
 
 from decode_metadata import (
     STATE_VALID, STATE_GENERATION, STATE_ANCHOR, STATE_COMMITTED, STATE_DRAFT_COUNT, STATE_LIMIT,
-    STATE_META_WIDTH, STATE_TOKEN_WIDTH,
+    REJECTION_STATE_META_WIDTH, STATE_TOKEN_WIDTH, commit_drafts, store_proposal_probs,
 )
-from lm_head import SAMPLED_IDS_PAD
+from lm_head import SAMPLED_IDS_PAD, VOCAB
 
 
 StageRunner = Callable[[Any, Mapping[str, Any]], None]
@@ -73,7 +73,7 @@ def bootstrap_inputs_rank(
     position_limits: pl.Tensor[[DECODE_BATCH], pl.INT32],
     sampled_rows: pl.Tensor[[DECODE_BATCH], pl.INT32],
     sampled_ids: pl.Tensor[[PREFILL_SAMPLE_ROWS, SAMPLED_IDS_PAD], pl.INT32],
-    state_meta: pl.Tensor[[DECODE_BATCH, STATE_META_WIDTH], pl.INT32],
+    state_meta: pl.Tensor[[DECODE_BATCH, REJECTION_STATE_META_WIDTH], pl.INT32],
     next_prefill_tokens: pl.Out[pl.Tensor[[DECODE_BATCH], pl.INT64]],
     first_query_positions: pl.Out[pl.Tensor[[DECODE_BATCH], pl.INT32]],
 ):
@@ -105,7 +105,7 @@ def l3_bootstrap_inputs(
     position_limits: pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32],
     sampled_rows: pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32],
     sampled_ids: pl.Tensor[[EP_SIZE, PREFILL_SAMPLE_ROWS, SAMPLED_IDS_PAD], pl.INT32],
-    state_meta: pl.Tensor[[EP_SIZE, DECODE_BATCH, STATE_META_WIDTH], pl.INT32],
+    state_meta: pl.Tensor[[EP_SIZE, DECODE_BATCH, REJECTION_STATE_META_WIDTH], pl.INT32],
     next_prefill_tokens: pl.Out[pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT64]],
     first_query_positions: pl.Out[pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32]],
 ):
@@ -126,11 +126,14 @@ def publish_bootstrap_rank(
     sampled_rows: pl.Tensor[[DECODE_BATCH], pl.INT32],
     sampled_ids: pl.Tensor[[PREFILL_SAMPLE_ROWS, SAMPLED_IDS_PAD], pl.INT32],
     draft_ids: pl.Tensor[[DECODE_BATCH, DSPARK_QUERY_WIDTH], pl.INT32],
+    proposal_probs: pl.Tensor[[DECODE_BATCH, DSPARK_QUERY_WIDTH * VOCAB], pl.FP32],
     state_tokens: pl.InOut[pl.Tensor[[DECODE_BATCH, STATE_TOKEN_WIDTH], pl.INT64]],
-    state_meta: pl.InOut[pl.Tensor[[DECODE_BATCH, STATE_META_WIDTH], pl.INT32]],
+    state_meta: pl.InOut[pl.Tensor[[DECODE_BATCH, REJECTION_STATE_META_WIDTH], pl.INT32]],
 ):
+    initialized_slots = pl.create_tensor([DECODE_BATCH], dtype=pl.INT32)
     for _core in pl.spmd(1, name_hint="dspark_bootstrap_publish"):
         for request in pl.range(DECODE_BATCH):
+            initialized_slot = pl.cast(-1, pl.INT32)
             slot = pl.read(slot_ids, [request])
             row = pl.read(sampled_rows, [request])
             prompt = pl.read(prompt_lengths, [request])
@@ -146,14 +149,13 @@ def publish_bootstrap_rank(
                         pl.write(state_meta, [slot, STATE_ANCHOR], prompt)
                         pl.write(state_meta, [slot, STATE_COMMITTED], prompt)
                         pl.write(state_meta, [slot, STATE_LIMIT], limit)
-                        draft_count = pl.cast(0, pl.INT32)
-                        if prompt + DSPARK_QUERY_WIDTH < limit:
-                            draft_count = pl.cast(DSPARK_QUERY_WIDTH, pl.INT32)
-                            for offset in pl.range(DSPARK_QUERY_WIDTH):
-                                draft = pl.read(draft_ids, [request, offset])
-                                pl.write(state_tokens, [slot, offset + 1], pl.cast(draft, pl.INT64))
-                        pl.write(state_meta, [slot, STATE_DRAFT_COUNT], draft_count)
+                        pl.write(state_meta, [slot, STATE_DRAFT_COUNT], pl.cast(0, pl.INT32))
                         pl.write(state_meta, [slot, STATE_VALID], pl.cast(1, pl.INT32))
+                        initialized_slot = slot
+            pl.write(initialized_slots, [request], initialized_slot)
+    store_proposal_probs(initialized_slots, generations, state_meta, proposal_probs)
+    committed = pl.create_tensor([DECODE_BATCH], dtype=pl.INT32)
+    commit_drafts(initialized_slots, generations, draft_ids, state_tokens, state_meta, committed)
     return state_tokens, state_meta
 
 
@@ -166,13 +168,15 @@ def l3_publish_bootstrap(
     sampled_rows: pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32],
     sampled_ids: pl.Tensor[[EP_SIZE, PREFILL_SAMPLE_ROWS, SAMPLED_IDS_PAD], pl.INT32],
     draft_ids: pl.Tensor[[EP_SIZE, DECODE_BATCH, DSPARK_QUERY_WIDTH], pl.INT32],
+    proposal_probs: pl.Tensor[[EP_SIZE, DECODE_BATCH, DSPARK_QUERY_WIDTH * VOCAB], pl.FP32],
     state_tokens: pl.InOut[pl.Tensor[[EP_SIZE, DECODE_BATCH, STATE_TOKEN_WIDTH], pl.INT64]],
-    state_meta: pl.InOut[pl.Tensor[[EP_SIZE, DECODE_BATCH, STATE_META_WIDTH], pl.INT32]],
+    state_meta: pl.InOut[pl.Tensor[[EP_SIZE, DECODE_BATCH, REJECTION_STATE_META_WIDTH], pl.INT32]],
 ):
     for rank in pl.range(pld.world_size()):
         publish_bootstrap_rank(
             slot_ids[rank], generations[rank], prompt_lengths[rank], position_limits[rank],
-            sampled_rows[rank], sampled_ids[rank], draft_ids[rank], state_tokens[rank], state_meta[rank],
+            sampled_rows[rank], sampled_ids[rank], draft_ids[rank], proposal_probs[rank],
+            state_tokens[rank], state_meta[rank],
             device=rank,
         )
 
@@ -325,6 +329,9 @@ def dspark_init(
         head_hidden=workspace["draft_head_hidden"], num_sampled=workspace["zero_sampled"],
         last_sampled=workspace["zero_last_sampled"], next_prefill_tokens=workspace["next_prefill_tokens"],
         anchor_ids=workspace["next_prefill_tokens"],
+        temperatures=workspace["sampling_temperatures"], top_ks=workspace["sampling_top_ks"],
+        top_ps=workspace["sampling_top_ps"], seeds=workspace["sampling_seeds"],
+        first_positions=workspace["first_query_positions"], proposal_probs=workspace["proposal_probs"],
         draft_ids=workspace["draft_ids"], confidences=workspace["confidences"], logits_epoch=logits_epoch,
     )
     _run_stage(runner, l3_markov_output, markov_args)
@@ -332,5 +339,6 @@ def dspark_init(
         slot_ids=state.slot_ids, generations=state.generations,
         prompt_lengths=workspace["prompt_lengths"], position_limits=workspace["position_limits"],
         sampled_rows=workspace["sampled_rows"], sampled_ids=workspace["prefill_sampled_ids"],
-        draft_ids=workspace["draft_ids"], state_tokens=state.tokens, state_meta=state.meta,
+        draft_ids=workspace["draft_ids"], proposal_probs=workspace["proposal_probs"],
+        state_tokens=state.tokens, state_meta=state.meta,
     ))

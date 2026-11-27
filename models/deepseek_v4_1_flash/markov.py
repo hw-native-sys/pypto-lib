@@ -14,7 +14,7 @@ import pypto.language.distributed as pld
 import torch
 
 from config import (
-    B_DYN, DP_SIZE, MOE_TOKENS,
+    B_DYN, DP_SIZE, MOE_TOKENS, DECODE_SEQ,
     DSPARK_MARKOV_RANK, DSPARK_QUERY_WIDTH,
     EP_SIZE, FLASH, DECODE_BATCH,
     SUPPORTED_EP_SIZES, SUPPORTED_LM_HEAD_TP_SIZES, LM_HEAD_TP_SIZE,
@@ -22,7 +22,10 @@ from config import (
 from lm_head import VOCAB_PER_TP, clear_lm_head_signals, lm_head
 from rmsnorm import rms_norm
 from hc import hc_head
+from sample import ARGMAX_WIDTH_TILE, PROPOSAL_STREAM, golden_categorical, golden_dspark_probs, sample_markov_proposal_row
 
+
+PROPOSAL_PARAMS_DYN = pl.dynamic("MARKOV_PROPOSAL_PARAMS")
 
 # model config
 D = FLASH.hidden_size
@@ -36,11 +39,6 @@ GROUP_LOGIT_ROWS = LM_HEAD_TP_SIZE * LOGIT_ROWS
 
 # tiling
 VOCAB_TILE = 256
-RING_SLOTS = 4
-SLOT_BYTES = 8 * VOCAB_TILE * 4
-RING_BYTES = RING_SLOTS * SLOT_BYTES
-PARTIAL_STRIDE = 16
-PARTIAL_TILE = 64 * PARTIAL_STRIDE  # One gather lane per cluster.
 
 if (D, MARKOV_RANK, DSPARK_QUERY_WIDTH) != (5120, 256, 5):
     raise ValueError("Markov recurrence requires hidden_size=5120, rank=256, and five steps")
@@ -48,20 +46,6 @@ if VOCAB % VOCAB_TILE != 0:
     raise ValueError("Markov recurrence requires complete 256-column vocabulary panels")
 if EP_SIZE % LM_HEAD_TP_SIZE:
     raise ValueError("EP must be divisible by LM head TP")
-
-
-@pl.jit.inline(auto_scope=False)
-def _send_markov_bias(
-    full_left: pl.Tile[[16, 256], pl.BF16, pl.Mem.Left],
-    panel_l1: pl.Tile[[VOCAB_TILE, 256], pl.BF16, pl.Mem.Mat],
-):
-    transposed = pl.tile.transpose_view(panel_l1)
-    acc = pl.create_tile([16, VOCAB_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc)
-    for k in pl.pipeline(0, 256, 64, stage=2):
-        left_k = pl.tile.slice(full_left, [16, 64], [0, k])
-        right_k = pl.tile.extract(transposed, k, 0, [64, VOCAB_TILE], target_memory=pl.Mem.Right)
-        acc = pl.tile.matmul_acc(acc, left_k, right_k, init_cond=(k == 0))
-    pl.system.tpush_to_aiv(acc, split=1, id=0)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -109,291 +93,113 @@ def _store_markov_confidence(
     return confidence_state
 
 
-@pl.jit.incore(level=pl.Level.AIC)
-def _recurrence_cube(
-    logits: pl.Tensor,
-    embed: pl.Out[pl.Tensor],
-    w2: pl.Tensor,
-    partials: pl.Out[pl.Tensor],
-    hidden: pl.Tensor,
-    w1: pl.Tensor,
-    confidence_weight: pl.Tensor,
-    draft_state: pl.Out[pl.Tensor],
-    confidence_state: pl.Out[pl.Tensor],
-    ids: pl.Out[pl.Tensor],
-    probs: pl.Out[pl.Tensor],
-    anchors: pl.Tensor,
-):
-    pl.func_attr({"split_aiv": True})
-    peer = pl.system.import_peer_buffer(name="markov_bias", peer_func="_recurrence_vector")
-    pl.system.aic_initialize_pipe(peer, dir_mask=1, slot_size=SLOT_BYTES, slot_num=RING_SLOTS, id=0)
-    block = pl.tile.get_block_idx()
-    blocks = pl.tile.get_block_num()
-    batch = pl.tensor.dim(anchors, 0)
-    # Reuse the first two W2 panels across all five steps.
-    first_weight = pl.load(w2, [block * VOCAB_TILE, 0], [VOCAB_TILE, 256], target_memory=pl.Mem.Mat)
-    second_weight = pl.load(w2, [(block + blocks) * VOCAB_TILE, 0], [VOCAB_TILE, 256], target_memory=pl.Mem.Mat)
-    pl.system.syncall(core_type=pl.KernelType.MIX)
-    for step in pl.range(5):
-        for first in pl.range(0, batch, 16):
-            embed_l1 = pl.load(embed, [first, 0], [16, 256], target_memory=pl.Mem.Mat)
-            full_left = pl.tile.extract(embed_l1, 0, 0, [16, 256], target_memory=pl.Mem.Left)
-            _send_markov_bias(full_left, first_weight)
-            _send_markov_bias(full_left, second_weight)
-            for wave in pl.pipeline((VOCAB // VOCAB_TILE + blocks - 1 - block) // blocks - 2, stage=2):
-                panel = block + (wave + 2) * blocks
-                col = panel * VOCAB_TILE
-                panel_l1 = pl.load(w2, [col, 0], [VOCAB_TILE, 256], target_memory=pl.Mem.Mat)
-                _send_markov_bias(full_left, panel_l1)
-        pl.system.syncall(core_type=pl.KernelType.MIX)
-    pl.system.syncall(core_type=pl.KernelType.MIX)
-    return ids
-
-
-@pl.jit.incore(level=pl.Level.AIV)
-def _recurrence_vector(
-    logits: pl.Tensor,
-    embed: pl.Out[pl.Tensor],
-    w2: pl.Tensor,
-    partials: pl.Out[pl.Tensor],
-    hidden: pl.Tensor,
-    w1: pl.Tensor,
-    confidence_weight: pl.Tensor,
-    draft_state: pl.Out[pl.Tensor],
-    confidence_state: pl.Out[pl.Tensor],
-    ids: pl.Out[pl.Tensor],
-    probs: pl.Out[pl.Tensor],
-    anchors: pl.Tensor,
-):
-    pl.func_attr({"split_aiv": True, "dual_aiv_dispatch": True})
-    ring = pl.system.reserve_buffer(name="markov_bias", size=RING_BYTES)
-    pl.system.aiv_initialize_pipe(ring, dir_mask=1, slot_size=SLOT_BYTES, slot_num=RING_SLOTS, id=0)
-    block = pl.tile.get_block_idx()
-    blocks = pl.tile.get_block_num()
-    lane = pl.tile.get_subblock_idx()
-    worker = block * 2 + lane
-    batch = pl.tensor.dim(anchors, 0)
-    padded_rows = pl.tensor.dim(embed, 0)
-    for row in pl.range(worker, padded_rows, blocks * 2):
-        token = pl.read(anchors, [pl.min(row, batch - 1)])
-        initial = pl.load(w1, [token, 0], [1, 256], target_memory=pl.Mem.Vec)
-        embed = pl.store(initial, [row, 0], embed)
-    pl.system.barrier(pipe=pl.PipeType.ALL)
-    pl.system.syncall(core_type=pl.KernelType.MIX)
-    for step in pl.range(5):
-        # High-numbered lanes compute confidence from the preceding embedding.
-        for row in pl.range(blocks * 2 - 1 - worker, batch, blocks * 2):
-            confidence_state = _store_markov_confidence(
-                hidden, embed, confidence_weight,
-                confidence_state, row, step,
-            )
-        for first in pl.range(0, batch, 16):
-            row0 = first + lane * 8
-            valid = pl.max(0, pl.min(batch - row0, 8))
-            best_tile = pl.create_tile([512], dtype=pl.FP32, target_memory=pl.Mem.Vec)
-            id_tile = pl.create_tile([512], dtype=pl.INT32, target_memory=pl.Mem.Vec)
-            with pl.reg_scope():
-                init_mask = pl.reg.full_mask(lanes=64)
-                negative_inf_bits = pl.reg.broadcast(-8388608, lanes=64, dtype=pl.INT32)
-                neginf = pl.reg.interpret_cast(negative_inf_bits, dtype=pl.FP32)
-                zero = pl.reg.broadcast(0, lanes=64, dtype=pl.INT32)
-                for init_row in pl.hardware_loop(valid):
-                    _init_scores = pl.reg.store(best_tile, init_row * 64, neginf, init_mask)
-                    _init_ids = pl.reg.store(id_tile, init_row * 64, zero, init_mask)
-            if valid > 0:
-                for panel in pl.range(block, VOCAB // VOCAB_TILE, blocks):
-                    col = panel * VOCAB_TILE
-                    logit_col = step * VOCAB + col
-                    base = pl.load(logits, [row0, logit_col], [8, VOCAB_TILE], valid_shape=[valid, VOCAB_TILE], target_memory=pl.Mem.Vec)
-                    bias = pl.system.tpop_from_aic(shape=[8, VOCAB_TILE], dtype=pl.FP32, split=1, id=0)
-                    base_full = pl.tile.set_validshape(base, 8, VOCAB_TILE)
-                    summed = pl.add(base_full, bias)
-                    pl.system.tfree_to_aic(bias, id=0)
-                    panel_scores = pl.reshape(summed, [8 * VOCAB_TILE])
-                    start = pl.cast(col, pl.INT32)
-                    with pl.reg_scope():
-                        score_mask = pl.reg.full_mask(lanes=64)
-                        for score_row in pl.hardware_loop(valid):
-                            best = pl.reg.load(best_tile, score_row * 64, lanes=64)
-                            winner = pl.reg.load(id_tile, score_row * 64, lanes=64)
-                            token_col = pl.reg.index_gen(start, lanes=64, dtype=pl.INT32)
-                            for seg in pl.hardware_loop(VOCAB_TILE // 64):
-                                score = pl.reg.load(panel_scores, score_row * VOCAB_TILE + seg * 64, lanes=64)
-                                better = pl.reg.compare(score, best, score_mask, predicate="gt")
-                                best = pl.reg.select(better, score, best)
-                                winner = pl.reg.select(better, token_col, winner)
-                                token_col = pl.reg.adds(token_col, 64, score_mask)
-                            _save_scores = pl.reg.store(best_tile, score_row * 64, best, score_mask)
-                            _save_ids = pl.reg.store(id_tile, score_row * 64, winner, score_mask)
-            else:
-                for panel in pl.range(block, VOCAB // VOCAB_TILE, blocks):
-                    discard = pl.system.tpop_from_aic(shape=[8, VOCAB_TILE], dtype=pl.FP32, split=1, id=0)
-                    pl.system.tfree_to_aic(discard, id=0)
-            if valid > 0:
-                block_tile = pl.create_tile([8 * PARTIAL_STRIDE], dtype=pl.INT32, target_memory=pl.Mem.Vec)
-                with pl.reg_scope():
-                    partial_mask = pl.reg.full_mask(lanes=64)
-                    half_line = pl.reg.active_mask(8, lanes=64)
-                    invalid_id = pl.reg.broadcast(2147483647, lanes=64, dtype=pl.INT32)
-                    for partial_row in pl.hardware_loop(valid):
-                        lane_scores = pl.reg.load(best_tile, partial_row * 64, lanes=64)
-                        lane_ids = pl.reg.load(id_tile, partial_row * 64, lanes=64)
-                        highest = pl.reg.reduce_max(lane_scores, partial_mask)
-                        block_max = pl.reg.broadcast(highest, lanes=64, dtype=pl.FP32)
-                        ties = pl.reg.compare(lane_scores, block_max, partial_mask, predicate="eq")
-                        selected = pl.reg.select(ties, lane_ids, invalid_id)
-                        lowest_id = pl.reg.reduce_min(selected, partial_mask)
-                        chosen = pl.reg.broadcast(lowest_id, lanes=64, dtype=pl.INT32)
-                        # One 64-byte record per block. Each half occupies one aligned vector store.
-                        score_bits = pl.reg.interpret_cast(block_max, dtype=pl.INT32)
-                        _partial_scores = pl.reg.store(block_tile, partial_row * PARTIAL_STRIDE, score_bits, half_line)
-                        _partial_ids = pl.reg.store(block_tile, partial_row * PARTIAL_STRIDE + 8, chosen, half_line)
-                active_partials = pl.tile.set_validshape(pl.reshape(block_tile, [8, PARTIAL_STRIDE]), valid, PARTIAL_STRIDE)
-                partials = pl.store(active_partials, [row0, block * PARTIAL_STRIDE], partials)
-        pl.system.barrier(pipe=pl.PipeType.ALL)
-        pl.system.syncall(core_type=pl.KernelType.AIV)
-        for row in pl.range(worker, batch, blocks * 2):
-            block_results_tile = pl.load(
-                partials, [row, 0], [1, PARTIAL_TILE],
-                valid_shape=[1, blocks * PARTIAL_STRIDE], target_memory=pl.Mem.Vec,
-            )
-            block_results_full = pl.tile.set_validshape(block_results_tile, 1, PARTIAL_TILE)
-            block_results = pl.reshape(block_results_full, [PARTIAL_TILE])
-            token_tile = pl.create_tile([64], dtype=pl.INT32, target_memory=pl.Mem.Vec)
-            with pl.reg_scope():
-                winner_mask = pl.reg.full_mask(lanes=64)
-                active = pl.reg.active_mask(blocks, lanes=64)
-                winner_out = pl.reg.active_mask(16, lanes=64)
-                ix = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
-                offsets = pl.reg.muls(ix, PARTIAL_STRIDE, winner_mask)
-                score_words = pl.reg.gather(block_results, offsets, active)
-                vals = pl.reg.interpret_cast(score_words, dtype=pl.FP32)
-                id_offsets = pl.reg.adds(offsets, 8, winner_mask)
-                candidates = pl.reg.gather(block_results, id_offsets, active)
-                high = pl.reg.reduce_max(vals, active)
-                global_max = pl.reg.broadcast(high, lanes=64, dtype=pl.FP32)
-                eq = pl.reg.compare(vals, global_max, active, predicate="eq")
-                invalid_winner = pl.reg.broadcast(2147483647, lanes=64, dtype=pl.INT32)
-                tied = pl.reg.select(eq, candidates, invalid_winner)
-                low = pl.reg.reduce_min(tied, active)
-                token_reg = pl.reg.broadcast(low, lanes=64, dtype=pl.INT32)
-                _id = pl.reg.store(token_tile, 0, token_reg, winner_out)
-            token_view = pl.reshape(token_tile, [1, 64])
-            token_line = pl.tile.set_validshape(token_view, 1, 16)
-            draft_state = pl.store(token_line, [row, step * 16], draft_state)
-            if step < 4:
-                next_id = pl.tile.read(token_tile, [0])
-                next_e = pl.load(w1, [next_id, 0], [1, 256], target_memory=pl.Mem.Vec)
-                embed = pl.store(next_e, [row, 0], embed)
-        pl.system.barrier(pipe=pl.PipeType.ALL)
-        pl.system.syncall(core_type=pl.KernelType.MIX)
-    # Eight rows of five output words give disjoint aligned output ranges.
-    for first_row in pl.range(worker * 8, batch, blocks * 16):
-        rows = pl.min(8, batch - first_row)
-        draft_tile = pl.load(draft_state, [first_row, 0], [8, 80], valid_shape=[rows, 80], target_memory=pl.Mem.Vec)
-        draft_rows_full = pl.tile.set_validshape(draft_tile, 8, 80)
-        draft_rows = pl.reshape(draft_rows_full, [640])
-        conf_tile = pl.load(confidence_state, [first_row, 0], [8, 80], valid_shape=[rows, 80], target_memory=pl.Mem.Vec)
-        confidence_rows_full = pl.tile.set_validshape(conf_tile, 8, 80)
-        confidence_rows = pl.reshape(confidence_rows_full, [640])
-        pack_i = pl.create_tile([64], dtype=pl.INT32, target_memory=pl.Mem.Vec)
-        pack_c = pl.create_tile([64], dtype=pl.FP32, target_memory=pl.Mem.Vec)
-        with pl.reg_scope():
-            pack_mask = pl.reg.active_mask(5, lanes=64)
-            lane_idx = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
-            col_idx = pl.reg.muls(lane_idx, 16, pack_mask)
-            for publish_row in pl.hardware_loop(rows):
-                pack_offset = pl.reg.adds(col_idx, pl.cast(publish_row * 80, pl.UINT32), pack_mask)
-                draft_values = pl.reg.gather(draft_rows, pack_offset, pack_mask)
-                conf_values = pl.reg.gather(confidence_rows, pack_offset, pack_mask)
-                _draft = pl.reg.store(pack_i, publish_row * 8, draft_values, pack_mask)
-                _conf = pl.reg.store(pack_c, publish_row * 8, conf_values, pack_mask)
-        ids = pl.store(pl.tile.set_validshape(pl.reshape(pack_i, [8, 8]), rows, 5), [first_row, 0], ids)
-        probs = pl.store(pl.tile.set_validshape(pl.reshape(pack_c, [8, 8]), rows, 5), [first_row, 0], probs)
-    pl.system.barrier(pipe=pl.PipeType.ALL)
-    pl.system.syncall(core_type=pl.KernelType.MIX)
-    return probs
-
-
-@pl.jit.incore(level=pl.Level.CORE_GROUP)
-def _recurrence_group(
-    logits: pl.Tensor,
-    embed: pl.Out[pl.Tensor],
-    w2: pl.Tensor,
-    partials: pl.Out[pl.Tensor],
-    hidden: pl.Tensor,
-    w1: pl.Tensor,
-    confidence_weight: pl.Tensor,
-    draft_state: pl.Out[pl.Tensor],
-    confidence_state: pl.Out[pl.Tensor],
-    ids: pl.Out[pl.Tensor],
-    probs: pl.Out[pl.Tensor],
-    anchors: pl.Tensor,
-):
-    ids = _recurrence_cube(
-        logits, embed, w2, partials,
-        hidden, w1, confidence_weight,
-        draft_state, confidence_state, ids, probs, anchors,
-    )
-    probs = _recurrence_vector(
-        logits, embed, w2, partials,
-        hidden, w1, confidence_weight,
-        draft_state, confidence_state, ids, probs, anchors,
-    )
-    return ids, probs
-
-
 @pl.jit.inline(auto_scope=False)
-def markov_sample(
-    base_logits: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, VOCAB], pl.FP32],
-    head_hidden: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
-    anchor_ids: pl.Tensor[[B_DYN], pl.INT64],
-    markov_w1: pl.Tensor[[VOCAB, MARKOV_RANK], pl.BF16],
-    markov_w2: pl.Tensor[[VOCAB, MARKOV_RANK], pl.BF16],
-    confidence_weight: pl.Tensor[[1, D + MARKOV_RANK], pl.FP32],
-    draft_ids: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH], pl.INT32]],
-    confidences: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH], pl.FP32]],
+def markov_propose(
+    base_logits: pl.Tensor,
+    head_hidden: pl.Tensor,
+    anchor_ids: pl.Tensor,
+    markov_w1: pl.Tensor,
+    markov_w2: pl.Tensor,
+    confidence_weight: pl.Tensor,
+    temperatures: pl.Tensor,
+    top_ks: pl.Tensor,
+    top_ps: pl.Tensor,
+    seeds: pl.Tensor,
+    first_positions: pl.Tensor,
+    draft_ids: pl.Tensor,
+    confidences: pl.Tensor,
+    proposal_probs: pl.Tensor,
 ):
-    """Generate five drafts with the previous sampled ID at every step."""
-    base_logits.bind_dynamic(0, B_DYN)
-    head_hidden.bind_dynamic(0, B_DYN)
-    anchor_ids.bind_dynamic(0, B_DYN)
-    draft_ids.bind_dynamic(0, B_DYN)
-    confidences.bind_dynamic(0, B_DYN)
+    """Sample each Markov step from its filtered vocabulary distribution."""
     batch = pl.tensor.dim(anchor_ids, 0)
     padded = (batch + 15) // 16 * 16
-    embedding = pl.create_tensor([padded, 256], dtype=pl.BF16)
-    clusters = pl.system.available_cluster_count()
-    partial_width = clusters * PARTIAL_STRIDE
-    partials = pl.create_tensor([batch, partial_width], dtype=pl.INT32)
-    draft_state = pl.create_tensor([batch, 80], dtype=pl.INT32)
-    confidence_state = pl.create_tensor([batch, 80], dtype=pl.FP32)
-    logits = pl.reshape(base_logits, [batch, DSPARK_QUERY_WIDTH * VOCAB])
     hidden = pl.reshape(head_hidden, [batch * DSPARK_QUERY_WIDTH, D])
-    # Every cluster must reach the mixed and AIV hardware barriers.
-    with pl.spmd(pl.system.available_cluster_count(), name_hint="markov_sample", sync_start=True):
-        ids_out, conf_out = _recurrence_group(
-            logits, embedding, markov_w2, partials, hidden, markov_w1, confidence_weight,
-            draft_state, confidence_state, draft_ids, confidences, anchor_ids,
-        )
-    return ids_out, conf_out
+    base = pl.reshape(base_logits, [batch * DSPARK_QUERY_WIDTH, VOCAB])
+    aiv_count = pl.system.available_aiv_count()
+    embedding_workers = pl.min(padded, aiv_count)
+    request_workers = pl.min(batch, aiv_count)
+    previous_selected = pl.create_tensor([batch, 8], dtype=pl.INT32)
+    for step in pl.unroll(DSPARK_QUERY_WIDTH):
+        embedding = pl.create_tensor([padded, MARKOV_RANK], dtype=pl.BF16)
+        for worker in pl.spmd(embedding_workers, name_hint="markov_proposal_embedding"):
+            for request in pl.range(worker, padded, embedding_workers):
+                previous = pl.cast(0, pl.INT64)
+                if request < batch:
+                    if step == 0:
+                        previous = pl.read(anchor_ids, [request])
+                    else:
+                        previous = pl.cast(pl.read(previous_selected, [request, 0]), pl.INT64)
+                embedding[request : request + 1, :] = markov_w1[previous : previous + 1, :]
+
+        bias = pl.create_tensor([padded, VOCAB], dtype=pl.FP32)
+        workers = pl.system.available_cluster_count()
+        for worker in pl.spmd(workers, name_hint="markov_proposal_bias"):
+            for panel in pl.range(worker, VOCAB // VOCAB_TILE, workers):
+                col = panel * VOCAB_TILE
+                for row in pl.range(0, padded, 16):
+                    left = pl.load(embedding, [row, 0], [16, MARKOV_RANK], target_memory=pl.Mem.Mat)
+                    right = pl.load(markov_w2, [col, 0], [VOCAB_TILE, MARKOV_RANK], target_memory=pl.Mem.Mat)
+                    right_transposed = pl.tile.transpose_view(right)
+                    product = pl.matmul(left, right_transposed, out_dtype=pl.FP32)
+                    pl.store(product, [row, col], bias)
+
+        scores = pl.create_tensor([batch, VOCAB], dtype=pl.FP32)
+        for worker in pl.spmd(request_workers, name_hint="markov_proposal_logits"):
+            for request in pl.range(worker, batch, request_workers):
+                row = request * DSPARK_QUERY_WIDTH + step
+                for col in pl.range(0, VOCAB, 1280):
+                    logits = pl.load(base, [row, col], [1, 1280])
+                    correction = pl.load(bias, [request, col], [1, 1280])
+                    pl.store(pl.add(logits, correction), [request, col], scores)
+
+        scores_grid = pl.reshape(scores, [batch * (VOCAB // ARGMAX_WIDTH_TILE), ARGMAX_WIDTH_TILE])
+        filtered = pl.create_tensor([batch, VOCAB], dtype=pl.FP32)
+        weights = pl.create_tensor([batch, VOCAB], dtype=pl.FP32)
+        selected = pl.create_tensor([batch, 8], dtype=pl.INT32)
+        confidence_state = pl.create_tensor([batch, 80], dtype=pl.FP32)
+        for worker in pl.spmd(request_workers, name_hint="markov_proposal_sample"):
+            for request in pl.range(worker, batch, request_workers):
+                token = sample_markov_proposal_row(
+                    scores, scores_grid, filtered, weights, proposal_probs, temperatures, top_ks,
+                    top_ps, seeds, first_positions, request, step, DECODE_SEQ,
+                )
+                sampled = pl.full([1, 8], dtype=pl.INT32, value=0)
+                pl.write(sampled, [0, 0], token)
+                selected[request : request + 1, :] = sampled
+                _confidence = _store_markov_confidence(
+                    hidden, embedding, confidence_weight, confidence_state, request, step,
+                )
+
+        for _worker in pl.spmd(1, name_hint="markov_proposal_publish"):
+            for request in pl.range(batch):
+                pl.write(draft_ids, [request, step], pl.read(selected, [request, 0]))
+                pl.write(confidences, [request, step], pl.read(confidence_state, [request, step * 16]))
+        previous_selected = selected
+    return draft_ids, confidences, proposal_probs
 
 
 @pl.jit(auto_scope=False)
-def markov_sample_test(
+def markov_proposal_test(
     base_logits: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, VOCAB], pl.FP32],
     head_hidden: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
     anchor_ids: pl.Tensor[[B_DYN], pl.INT64],
     markov_w1: pl.Tensor[[VOCAB, MARKOV_RANK], pl.BF16],
     markov_w2: pl.Tensor[[VOCAB, MARKOV_RANK], pl.BF16],
     confidence_weight: pl.Tensor[[1, D + MARKOV_RANK], pl.FP32],
+    temperatures: pl.Tensor[[PROPOSAL_PARAMS_DYN], pl.FP32],
+    top_ks: pl.Tensor[[PROPOSAL_PARAMS_DYN], pl.INT32],
+    top_ps: pl.Tensor[[PROPOSAL_PARAMS_DYN], pl.FP32],
+    seeds: pl.Tensor[[PROPOSAL_PARAMS_DYN], pl.INT32],
+    first_positions: pl.Tensor[[B_DYN], pl.INT32],
     draft_ids: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH], pl.INT32]],
     confidences: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH], pl.FP32]],
+    proposal_probs: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH * VOCAB], pl.FP32]],
 ):
-    """Validate Markov sampling from logits and resolved anchor IDs."""
-    return markov_sample(
-        base_logits, head_hidden, anchor_ids, markov_w1, markov_w2,
-        confidence_weight, draft_ids, confidences,
+    anchor_ids.bind_dynamic(0, B_DYN)
+    return markov_propose(
+        base_logits, head_hidden, anchor_ids, markov_w1, markov_w2, confidence_weight,
+        temperatures, top_ks, top_ps, seeds, first_positions,
+        draft_ids, confidences, proposal_probs,
     )
 
 
@@ -411,6 +217,12 @@ def l2_markov_output(
     markov_w1: pl.Tensor[[VOCAB, MARKOV_RANK], pl.BF16],
     markov_w2: pl.Tensor[[VOCAB, MARKOV_RANK], pl.BF16],
     confidence_weight: pl.Tensor[[1, D + MARKOV_RANK], pl.FP32],
+    temperatures: pl.Tensor[[DECODE_BATCH * DECODE_SEQ], pl.FP32],
+    top_ks: pl.Tensor[[DECODE_BATCH * DECODE_SEQ], pl.INT32],
+    top_ps: pl.Tensor[[DECODE_BATCH * DECODE_SEQ], pl.FP32],
+    seeds: pl.Tensor[[DECODE_BATCH * DECODE_SEQ], pl.INT32],
+    first_positions: pl.Tensor[[B_DYN], pl.INT32],
+    proposal_probs: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH * VOCAB], pl.FP32]],
     draft_ids: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH], pl.INT32]],
     confidences: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH], pl.FP32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
@@ -421,6 +233,8 @@ def l2_markov_output(
     logits_epoch: pl.Scalar[pl.INT32],
 ):
     """Project draft hidden states to full-vocabulary logits, then sample five IDs."""
+    first_positions.bind_dynamic(0, B_DYN)
+    proposal_probs.bind_dynamic(0, B_DYN)
     head_hidden.bind_dynamic(0, B_DYN)
     num_sampled.bind_dynamic(0, B_DYN)
     last_sampled.bind_dynamic(0, B_DYN)
@@ -448,11 +262,11 @@ def l2_markov_output(
     )
     clear_lm_head_signals(logits, hidden_done, logits_done)
     base_logits = pl.reshape(logits[:rows, :], [batch, DSPARK_QUERY_WIDTH, VOCAB])
-    markov_sample(
-        base_logits, head_hidden, anchor_ids, markov_w1, markov_w2,
-        confidence_weight, draft_ids, confidences,
+    return markov_propose(
+        base_logits, head_hidden, anchor_ids, markov_w1, markov_w2, confidence_weight,
+        temperatures, top_ks, top_ps, seeds, first_positions,
+        draft_ids, confidences, proposal_probs,
     )
-    return draft_ids, confidences
 
 
 @pl.jit.host
@@ -469,10 +283,18 @@ def l3_markov_output(
     markov_w1: pl.Tensor[[EP_SIZE, VOCAB, MARKOV_RANK], pl.BF16],
     markov_w2: pl.Tensor[[EP_SIZE, VOCAB, MARKOV_RANK], pl.BF16],
     confidence_weight: pl.Tensor[[EP_SIZE, 1, D + MARKOV_RANK], pl.FP32],
+    temperatures: pl.Tensor[[EP_SIZE, DECODE_BATCH * DECODE_SEQ], pl.FP32],
+    top_ks: pl.Tensor[[EP_SIZE, DECODE_BATCH * DECODE_SEQ], pl.INT32],
+    top_ps: pl.Tensor[[EP_SIZE, DECODE_BATCH * DECODE_SEQ], pl.FP32],
+    seeds: pl.Tensor[[EP_SIZE, DECODE_BATCH * DECODE_SEQ], pl.INT32],
+    first_positions: pl.Tensor[[EP_SIZE, B_DYN], pl.INT32],
+    proposal_probs: pl.Out[pl.Tensor[[EP_SIZE, B_DYN, DSPARK_QUERY_WIDTH * VOCAB], pl.FP32]],
     draft_ids: pl.Out[pl.Tensor[[EP_SIZE, B_DYN, DSPARK_QUERY_WIDTH], pl.INT32]],
     confidences: pl.Out[pl.Tensor[[EP_SIZE, B_DYN, DSPARK_QUERY_WIDTH], pl.FP32]],
     logits_epoch: pl.Scalar[pl.INT32],
 ):
+    first_positions.bind_dynamic(1, B_DYN)
+    proposal_probs.bind_dynamic(1, B_DYN)
     head_hidden.bind_dynamic(1, B_DYN)
     num_sampled.bind_dynamic(1, B_DYN)
     last_sampled.bind_dynamic(1, B_DYN)
@@ -494,56 +316,11 @@ def l3_markov_output(
             final_norm_weight[rank], lm_head_weight[rank],
             num_sampled[rank], last_sampled[rank], next_prefill_tokens[rank], anchor_ids[rank],
             markov_w1[rank], markov_w2[rank], confidence_weight[rank],
-            draft_ids[rank], confidences[rank],
+            temperatures[rank], top_ks[rank], top_ps[rank], seeds[rank],
+            first_positions[rank], proposal_probs[rank], draft_ids[rank], confidences[rank],
             hidden_window, hidden_done, logits_window, logits_done,
             rank, logits_epoch, device=rank,
         )
-
-
-def golden_markov_sample(
-    base_logits: torch.Tensor,
-    anchor_ids: torch.Tensor,
-    markov_w1: torch.Tensor,
-    markov_w2: torch.Tensor,
-    head_hidden: torch.Tensor,
-    confidence_weight: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Greedy full-vocabulary sampling with a previous-token Markov bias."""
-    if base_logits.ndim != 3 or anchor_ids.shape != base_logits.shape[:1]:
-        raise ValueError("base logits must be [batch, steps, vocab] with one anchor per request")
-    batch, steps, vocab = base_logits.shape
-    if markov_w1.shape[0] != vocab or markov_w2.shape != markov_w1.shape:
-        raise ValueError("Markov factors must be [vocab, rank]")
-    confidence_shape = (1, head_hidden.shape[-1] + markov_w1.shape[-1])
-    if head_hidden.shape[:2] != (batch, steps) or confidence_weight.shape != confidence_shape:
-        raise ValueError("confidence weight must cover hidden and Markov dimensions")
-    drafts = torch.empty(batch, steps, dtype=anchor_ids.dtype, device=anchor_ids.device)
-    confidences = []
-    previous = anchor_ids.long()
-    for step in range(steps):
-        embedding = markov_w1[previous]
-        bias = embedding.float() @ markov_w2.float().T
-        logits = base_logits[:, step].float()
-        biased_logits = logits + bias
-        previous = biased_logits.argmax(dim=-1)
-        drafts[:, step] = previous
-        hidden_features = head_hidden[:, step].float()
-        markov_features = embedding.float()
-        features = torch.cat((hidden_features, markov_features), dim=-1)
-        confidence_logits = features @ confidence_weight.float().T
-        confidence = torch.sigmoid(confidence_logits).squeeze(-1)
-        confidences.append(confidence)
-    return drafts, torch.stack(confidences, dim=-1)
-
-
-def golden_markov_sample_test(tensors):
-    """Fill draft IDs and confidences for the standalone sampling entry."""
-    ids, confidence = golden_markov_sample(
-        tensors["base_logits"], tensors["anchor_ids"], tensors["markov_w1"],
-        tensors["markov_w2"], tensors["head_hidden"], tensors["confidence_weight"],
-    )
-    tensors["draft_ids"].copy_(ids.int())
-    tensors["confidences"].copy_(confidence)
 
 
 def build_tensor_specs(batch=2):
@@ -580,6 +357,55 @@ def build_tensor_specs(batch=2):
     ]
 
 
+def build_proposal_specs():
+    from golden import TensorSpec
+
+    specs = build_tensor_specs()
+    by_name = {spec.name: spec for spec in specs}
+    logits = by_name["base_logits"].init_value
+    logits[1].fill_(-4.0)
+    logits[1, :, 5:9] = torch.tensor([0.1, 0.3, 0.2, 0.4])
+    by_name["markov_w2"].init_value.div_(128)
+    params = [
+        TensorSpec("temperatures", [2 * DECODE_SEQ], torch.float32, torch.tensor([0.0, 0.7]).repeat_interleave(DECODE_SEQ)),
+        TensorSpec("top_ks", [2 * DECODE_SEQ], torch.int32, 3),
+        TensorSpec("top_ps", [2 * DECODE_SEQ], torch.float32, 0.75),
+        TensorSpec("seeds", [2 * DECODE_SEQ], torch.int32, 71),
+        TensorSpec("first_positions", [2], torch.int32, torch.tensor([51, 73])),
+    ]
+    return specs[:-2] + params + specs[-2:] + [
+        TensorSpec("proposal_probs", [2, DSPARK_QUERY_WIDTH * VOCAB], torch.float32),
+    ]
+
+
+def golden_proposal_test(tensors):
+    proposal_probs = tensors["proposal_probs"].view(2, DSPARK_QUERY_WIDTH, VOCAB)
+    for request in range(2):
+        params_row = request * DECODE_SEQ
+        temperature = float(tensors["temperatures"][params_row])
+        top_k = int(tensors["top_ks"][params_row])
+        top_p = float(tensors["top_ps"][params_row])
+        seed = int(tensors["seeds"][params_row])
+        first = int(tensors["first_positions"][request])
+        previous = int(tensors["anchor_ids"][request])
+        for step in range(DSPARK_QUERY_WIDTH):
+            embedding = tensors["markov_w1"][previous].float()
+            bias = tensors["markov_w2"].float() @ embedding
+            scores = tensors["base_logits"][request, step] + bias
+            if temperature == 0:
+                previous = int(scores.argmax())
+                proposal_probs[request, step, previous] = 1.0
+            else:
+                probs = golden_dspark_probs(scores, temperature, top_k, top_p)
+                proposal_probs[request, step] = probs
+                previous = golden_categorical(probs, seed, first + step, PROPOSAL_STREAM)
+            tensors["draft_ids"][request, step] = previous
+            hidden = tensors["head_hidden"][request, step].float()
+            features = torch.cat((hidden, embedding))
+            score = features @ tensors["confidence_weight"][0]
+            tensors["confidences"][request, step] = score.sigmoid()
+
+
 if __name__ == "__main__":
     import argparse
     from golden import run
@@ -597,9 +423,9 @@ if __name__ == "__main__":
         parser.error("--lm-head-tp/--dp/--ep must match the import-time configuration")
     result = run(
         a5_default_runtime="host_build_graph",
-        fn=markov_sample_test,
-        specs=build_tensor_specs(),
-        golden_fn=golden_markov_sample_test,
+        fn=markov_proposal_test,
+        specs=build_proposal_specs(),
+        golden_fn=golden_proposal_test,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         config=dict(backend_type=args.platform, execution_mode=False, device_id=args.device),
