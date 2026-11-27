@@ -42,10 +42,12 @@ N_GROUP = 4             # and across the channel axis
 EARLY_RESOLVE = True
 
 
+
 def build_kernel(m: int, k: int, n: int, name: str = "a8w8_linear",
                  inline: bool = False, m_tile: int = M_TILE, n_tile: int = N_TILE,
                  k_tile: int = K_TILE, m_group: int = M_GROUP, n_group: int = N_GROUP,
-                 row_off: int = 0, k_stagger: int = 0, ring_slots: int = 1):
+                 row_off: int = 0, k_stagger: int = 0, ring_slots: int = 1,
+                 workers: int = 0):
     """The projection at one shape.
 
     One output tile is capped near 128x128 by the cube-to-vector crossing: the
@@ -62,6 +64,11 @@ def build_kernel(m: int, k: int, n: int, name: str = "a8w8_linear",
     The inner loop takes two n-tiles at a time against one activation tile, so
     `n_group` must be even. Two accumulators keep each crossing at one tile
     while the cube works a 128x256 region from a single L1 operand.
+
+    `workers` of zero gives every patch its own block, which is what the prefill callers
+    take. A positive `workers` makes that many persistent blocks stride through the patches
+    instead, so the patch stays the size the operand buffers want while the launch stays
+    inside the cube cores the allocation has.
 
     `k_stagger` rotates each block's K start by its own block index, so the blocks
     resident on the 24 cube cores are not all asking for the same slice of the weight at
@@ -86,7 +93,11 @@ def build_kernel(m: int, k: int, n: int, name: str = "a8w8_linear",
                          f"{m_group}x{n_group}")
     if n_group % 2:
         raise ValueError(f"n_group={n_group} must be even: the inner loop pairs n-tiles")
+    if workers < 0:
+        raise ValueError(f"workers={workers} must be zero or a positive block count")
     mg, ng = mb // m_group, nb // n_group
+    patches = mg * ng
+    blocks = min(patches, workers) if workers else patches
 
     @(pl.jit.inline if inline else pl.jit)
     def gdn_a8w8_linear(
@@ -101,49 +112,50 @@ def build_kernel(m: int, k: int, n: int, name: str = "a8w8_linear",
         # (pypto#2903). `local_slot_num` keeps that reserve at one slot while
         # `ring_slots` buys transport depth in GM, so the cube need not wait for
         # the vector to free a slot before pushing the next tile.
-        for blk in pl.spmd(mg * ng, name_hint=name,
+        for blk in pl.spmd(blocks, name_hint=name,
                            optimizations=[pl.cross_core_slot(slot_num=ring_slots,
                                                              local_slot_num=1)],
                            allow_early_resolve=EARLY_RESOLVE):
-            pm = (blk % mg) * m_group
-            pn = (blk // mg) * n_group
-            for gm in pl.range(m_group):
-                m0 = (pm + gm) * m_tile
-                yr = m0 + row_off
-                xs = pl.reshape(a_scale[0:1, m0 : m0 + m_tile], [m_tile, 1])
-                # n innermost: the activation tile is the one held across the
-                # inner loop, and it is the operand every tile in the row reads
-                for gn in pl.range(n_group // 2):
-                    n0 = (pn + 2 * gn) * n_tile
-                    n1 = n0 + n_tile
-                    # init_cond, not a peeled first block: peeling leaves block 0's
-                    # operand load outside the software pipeline, the one load that
-                    # then has nothing to overlap with.
-                    acc0 = pl.create_tensor([m_tile, n_tile], dtype=pl.INT32)
-                    acc1 = pl.create_tensor([m_tile, n_tile], dtype=pl.INT32)
-                    for kb in pl.pipeline(0, k // k_tile, stage=2):
-                        # `k_stagger` rotates where this block starts its K sweep. Without
-                        # it every block asks for the same K slice of the weight at the same
-                        # moment; `init_cond` still holds, because it means this block's
-                        # first step rather than K block zero, and the sum is commutative.
-                        k0 = ((kb + blk * k_stagger) % (k // k_tile)) * k_tile
-                        at = a_q[m0 : m0 + m_tile, k0 : k0 + k_tile]
-                        acc0 = pl.matmul_acc(acc0, at, w_q[n0 : n0 + n_tile, k0 : k0 + k_tile],
-                                             b_trans=True, init_cond=(kb == 0))
-                        acc1 = pl.matmul_acc(acc1, at, w_q[n1 : n1 + n_tile, k0 : k0 + k_tile],
-                                             b_trans=True, init_cond=(kb == 0))
-                    # dequant: the channel's scale along the row, the token's down
-                    # the column
-                    ws0 = pl.reshape(w_scale[n0 : n0 + n_tile], [1, n_tile])
-                    deq0 = pl.row_expand_mul(
-                        pl.col_expand_mul(pl.cast(acc0, target_type=pl.FP32), ws0), xs)
-                    y[yr : yr + m_tile, n0 : n0 + n_tile] = pl.cast(
-                        deq0, target_type=pl.BF16, mode="rint")
-                    ws1 = pl.reshape(w_scale[n1 : n1 + n_tile], [1, n_tile])
-                    deq1 = pl.row_expand_mul(
-                        pl.col_expand_mul(pl.cast(acc1, target_type=pl.FP32), ws1), xs)
-                    y[yr : yr + m_tile, n1 : n1 + n_tile] = pl.cast(
-                        deq1, target_type=pl.BF16, mode="rint")
+            for patch in pl.range(blk, patches, blocks):
+                pm = (patch % mg) * m_group
+                pn = (patch // mg) * n_group
+                for gm in pl.range(m_group):
+                    m0 = (pm + gm) * m_tile
+                    yr = m0 + row_off
+                    xs = pl.reshape(a_scale[0:1, m0 : m0 + m_tile], [m_tile, 1])
+                    # n innermost: the activation tile is the one held across the
+                    # inner loop, and it is the operand every tile in the row reads
+                    for gn in pl.range(n_group // 2):
+                        n0 = (pn + 2 * gn) * n_tile
+                        n1 = n0 + n_tile
+                        # init_cond, not a peeled first block: peeling leaves block 0's
+                        # operand load outside the software pipeline, the one load that
+                        # then has nothing to overlap with.
+                        acc0 = pl.create_tensor([m_tile, n_tile], dtype=pl.INT32)
+                        acc1 = pl.create_tensor([m_tile, n_tile], dtype=pl.INT32)
+                        for kb in pl.pipeline(0, k // k_tile, stage=2):
+                            # `k_stagger` rotates where this block starts its K sweep. Without
+                            # it every block asks for the same K slice of the weight at the same
+                            # moment; `init_cond` still holds, because it means this block's
+                            # first step rather than K block zero, and the sum is commutative.
+                            k0 = ((kb + patch * k_stagger) % (k // k_tile)) * k_tile
+                            at = a_q[m0 : m0 + m_tile, k0 : k0 + k_tile]
+                            acc0 = pl.matmul_acc(acc0, at, w_q[n0 : n0 + n_tile, k0 : k0 + k_tile],
+                                                 b_trans=True, init_cond=(kb == 0))
+                            acc1 = pl.matmul_acc(acc1, at, w_q[n1 : n1 + n_tile, k0 : k0 + k_tile],
+                                                 b_trans=True, init_cond=(kb == 0))
+                        # dequant: the channel's scale along the row, the token's down
+                        # the column
+                        ws0 = pl.reshape(w_scale[n0 : n0 + n_tile], [1, n_tile])
+                        deq0 = pl.row_expand_mul(
+                            pl.col_expand_mul(pl.cast(acc0, target_type=pl.FP32), ws0), xs)
+                        y[yr : yr + m_tile, n0 : n0 + n_tile] = pl.cast(
+                            deq0, target_type=pl.BF16, mode="rint")
+                        ws1 = pl.reshape(w_scale[n1 : n1 + n_tile], [1, n_tile])
+                        deq1 = pl.row_expand_mul(
+                            pl.col_expand_mul(pl.cast(acc1, target_type=pl.FP32), ws1), xs)
+                        y[yr : yr + m_tile, n1 : n1 + n_tile] = pl.cast(
+                            deq1, target_type=pl.BF16, mode="rint")
         return y
 
     return gdn_a8w8_linear

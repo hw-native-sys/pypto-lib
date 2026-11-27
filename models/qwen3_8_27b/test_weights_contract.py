@@ -271,6 +271,34 @@ def check_fetch_publishes_only_verified_index() -> None:
             assert weights.checkpoint_summary(destination, contract)["shards"] == 2
 
 
+def check_reference_consumes_prepared_weights() -> None:
+    """The loader's output must reach the reference with no adapter in between.
+
+    ``test_model_reference.py`` gates the maths, but it feeds the reference a
+    Transformers state dict, where every projection is a plain float tensor.
+    The deployed checkpoint is not: eight of each layer's projections arrive as
+    INT8 plus a separate flattened ``weight_scale``. Nothing else exercises
+    that pairing, so a renamed scale or a changed ``dequantize`` indexing would
+    break the real load path while every other host check stayed green.
+    """
+    contract = make_text_contract(tiny_config())
+    with tempfile.TemporaryDirectory(prefix="qwen38_w8a8_ref_") as directory:
+        root = Path(directory)
+        _write_fixture(root, contract)
+        prepared = weights.load_text_weights(root, contract=contract)
+
+        quantized = [name for name, value in prepared.items() if value.dtype == torch.int8]
+        assert quantized, "the fixture produced no INT8 weights, so this proves nothing"
+        for name in quantized:
+            scale = prepared[name.removesuffix(".weight") + ".weight_scale"]
+            assert scale.ndim == 1, f"{name}: dequantize indexes a flat [out] scale, got {tuple(scale.shape)}"
+
+        ids = reference.make_text_inputs(6, tiny_config(), seed=1)
+        out = reference.text_prefill(ids, prepared, tiny_config(), chunk=4)
+        assert tuple(out["logits"].shape) == (6, tiny_config().vocab_size)
+        assert torch.isfinite(out["logits"]).all()
+
+
 def check_loader_excludes_a_concurrent_fetch() -> None:
     """A fetch must not replace shards under a load that already passed the stamp check.
 
@@ -329,11 +357,12 @@ def main() -> int:
     check_resumed_fetch_verifies_content()
     check_fetch_requires_indexed_shards()
     if importlib.util.find_spec("safetensors") is None:
-        print("SKIP: loader check requires safetensors")
+        print("SKIP: loader and prepared-weight reference checks require safetensors")
     else:
         check_loader()
         check_loader_excludes_a_concurrent_fetch()
         check_fetch_publishes_only_verified_index()
+        check_reference_consumes_prepared_weights()
     print("PASS: Qwen3.8 weight loader and text contract")
     return 0
 

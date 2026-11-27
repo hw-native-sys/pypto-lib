@@ -6,7 +6,8 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Float64 CPU reference for the Qwen3.8-27B GDN block and its operators.
+"""Float64 CPU reference for the Qwen3.8-27B text prefill, and the host helpers the
+operators share.
 
 The delta-rule references use the shared Torch computation for each stage.
 This module also provides inputs, layout conversions, and acceptance criteria.
@@ -19,6 +20,10 @@ it is the float64 truth, how far a result is from the model; on int8 weights
 (:func:`quantize_weights`) with `quant_x` it is the fake-quant reference the kernels are
 gated against; `quant_y` prices quantising the block's last hand-off, which they do not.
 
+The model: :func:`text_prefill`, the embedding, both decoder-layer variants, dense
+SwiGLU, the residual paths, the final RMSNorm and the LM head, checked against
+`Qwen3_5ForConditionalGeneration` by `test_model_reference.py`.
+
 The references follow the model's natural layout ([T, H, D] values, [T, H] per-token
 scalars, [NCHUNK, H, D, D] states); the kernels take some of those transposed or
 flattened, and :func:`to_hT` and :func:`flat_state` convert.
@@ -29,6 +34,8 @@ identity. Packed validation runs the reference separately for each cache owner.
 """
 
 from __future__ import annotations
+
+from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
@@ -569,6 +576,764 @@ def block_inputs(key: str, t: int, cfg: Qwen38Config, chunk: int,
         return transform(value) if transform is not None else value
 
     return load
+
+
+# ---------------------------------------------------------------------------
+# The complete text prefill
+# ---------------------------------------------------------------------------
+
+
+def make_text_inputs(t: int, cfg: Qwen38Config, seed: int = 42) -> torch.Tensor:
+    """Deterministic text token ids for the full-stack reference, shape ``[T]``."""
+    gen = torch.Generator().manual_seed(seed)
+    return torch.randint(0, cfg.vocab_size, (t,), generator=gen, dtype=torch.int64)
+
+
+def rmsnorm(x: torch.Tensor, norm_weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Qwen3.5's zero-centred RMSNorm: ``norm(x) * (1 + weight)``.
+
+    This is distinct from the GDN block's :func:`gated_rmsnorm`, whose weight is
+    centred at one and whose gate follows the norm.
+    """
+    xf = x.to(REF_DTYPE)
+    variance = (xf * xf).mean(dim=-1, keepdim=True)
+    return xf * torch.rsqrt(variance + eps) * (1.0 + norm_weight.to(REF_DTYPE))
+
+
+def swiglu_act(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """`silu(gate) * up`, the MLP's activation on its own, in float64.
+
+    Split out from :func:`swiglu_mlp` because the kernels fuse it with the
+    per-token quantiser that feeds `down_proj`, so it needs its own gate.
+    """
+    gf = gate.to(REF_DTYPE)
+    return F.silu(gf) * up.to(REF_DTYPE)
+
+
+_MLP_CACHE: dict = {}
+
+
+MLP_MODULES = (("w_gate", "gate_proj"), ("w_up", "up_proj"), ("w_down", "down_proj"))
+
+
+def mlp_inputs(key: str, t: int, hidden: int, inter: int, seed: int = 42,
+               weights: str | None = None):
+    """One tensor of the W8A8 MLP's input set, drawn or loaded once and cached.
+
+    The three weights are int8 with one fp32 scale per output channel, which is
+    the deployed checkpoint's layout; the kernel reads them unchanged. With
+    *weights* they come from one layer's BF16 `mlp` tensors, quantised with the
+    checkpoint's own recipe rather than this module's fp32 one.
+
+    `x_q` and `x_scale` are what `quant_x` hands the projections, so a kernel
+    that starts after the quantiser can be fed the same activation the composed
+    MLP would give it. `x_scale` is the `[1, T]` row the kernels read.
+    """
+    cache_key = (t, hidden, inter, seed, weights)
+    st = _MLP_CACHE.get(cache_key)
+    if st is None:
+        gen = torch.Generator().manual_seed(seed)
+        x = torch.randn(t, hidden, generator=gen).to(MODEL_DTYPE)
+        st = {"x": x}
+        x_q, x_scale = quantize_rows(x)
+        st["x_q"], st["x_scale"] = x_q, x_scale.float().reshape(1, -1)
+        if weights is None:
+            for name, out_features, in_features in (
+                ("w_gate", inter, hidden),
+                ("w_up", inter, hidden),
+                ("w_down", hidden, inter),
+            ):
+                dense = torch.randn(out_features, in_features, generator=gen) * (in_features ** -0.5)
+                q, scale = quantize_rows(dense.to(MODEL_DTYPE))
+                st[name] = q
+                st[name + "_scale"] = scale
+        else:
+            if __package__:
+                from .weights import modelslim_quantize_rows
+            else:
+                from weights import modelslim_quantize_rows
+
+            layer = torch.load(weights, weights_only=True)
+            for name, module in MLP_MODULES:
+                q, scale, _ = modelslim_quantize_rows(layer[module + ".weight"])
+                st[name] = q
+                st[name + "_scale"] = scale.reshape(-1).float()
+        _MLP_CACHE[cache_key] = st
+    return st[key]
+
+
+def gate_up_swiglu(a_q: torch.Tensor, a_scale: torch.Tensor,
+                   w_gate: torch.Tensor, w_gate_scale: torch.Tensor,
+                   w_up: torch.Tensor, w_up_scale: torch.Tensor) -> torch.Tensor:
+    """The fused projection pair and activation, in the kernel's dtypes.
+
+    Both projections are narrowed to BF16 before the activation, because that
+    is where the unfused pair stored them and the fused kernel keeps the same
+    narrowing. `a_scale` is the `[1, M]` row the kernels read.
+    """
+    af = dequantize(a_q, a_scale.reshape(-1))
+    gate = (af @ dequantize(w_gate, w_gate_scale).t()).to(MODEL_DTYPE)
+    up = (af @ dequantize(w_up, w_up_scale).t()).to(MODEL_DTYPE)
+    return swiglu_act(gate, up)
+
+
+def mlp_w8a8(x: torch.Tensor, w_gate: torch.Tensor, w_gate_scale: torch.Tensor,
+             w_up: torch.Tensor, w_up_scale: torch.Tensor,
+             w_down: torch.Tensor, w_down_scale: torch.Tensor,
+             act_bf16: bool = False) -> torch.Tensor:
+    """The MLP as the kernels compute it: int8 both sides, float64 in between.
+
+    The fake-quant reference rather than the float64 truth. The activation
+    entering `down_proj` is quantised per token exactly as `swiglu_quant`
+    does, because that hand-off is where the W8A8 chain loses most of what it
+    loses, and a gate against the truth would be measuring the scheme rather
+    than the kernel.
+
+    The **dtypes are modelled, not idealised**: `a8w8_linear` dequantises its
+    INT32 accumulator through fp32 and writes BF16, so `gate` and `up` reach
+    the activation with seven mantissa bits. Leaving them in float64 here puts
+    56% of the output more than 1% away from the kernel and says nothing about
+    whether the kernel is right.
+
+    *act_bf16* models the **fused** chain, where one kernel computes both
+    projections and writes a single BF16 `act` tensor for the quantiser to
+    read. The unfused chain materialises no activation at all -- `swiglu_quant`
+    holds a token's row and goes from the two BF16 projections straight to
+    int8 -- so the fused form adds a rounding that does not exist today, and a
+    reference that skipped it would be scoring a chain the kernel no longer
+    implements.
+    """
+    x_q, x_scale = quantize_rows(x)
+    xf = dequantize(x_q, x_scale)
+    gate = (xf @ dequantize(w_gate, w_gate_scale).t()).to(MODEL_DTYPE)
+    up = (xf @ dequantize(w_up, w_up_scale).t()).to(MODEL_DTYPE)
+    act = swiglu_act(gate, up)
+    if act_bf16:
+        act = act.to(MODEL_DTYPE).to(REF_DTYPE)
+    act_q, act_scale = quantize_rows(act)
+    out = dequantize(act_q, act_scale) @ dequantize(w_down, w_down_scale).t()
+    return out.to(MODEL_DTYPE).to(REF_DTYPE)
+
+
+def mlp_truth(x: torch.Tensor, w_gate: torch.Tensor, w_gate_scale: torch.Tensor,
+              w_up: torch.Tensor, w_up_scale: torch.Tensor,
+              w_down: torch.Tensor, w_down_scale: torch.Tensor) -> torch.Tensor:
+    """The same MLP in float64 throughout: the weights as stored, nothing else quantised.
+
+    The reference :func:`mlp_w8a8` is scored against this, and so is the
+    kernel. What the ratio of the two isolates is the cost of the activation
+    path -- the per-token quantiser and the BF16 hand-offs -- with the
+    checkpoint's own int8 weights held common to both.
+    """
+    xf = x.to(REF_DTYPE)
+    gate = xf @ dequantize(w_gate, w_gate_scale).t()
+    up = xf @ dequantize(w_up, w_up_scale).t()
+    return swiglu_act(gate, up) @ dequantize(w_down, w_down_scale).t()
+
+
+def swiglu_mlp(x: torch.Tensor, w: dict[str, torch.Tensor], prefix: str) -> dict[str, torch.Tensor]:
+    """Dense Qwen SwiGLU MLP under ``prefix``, including all three projections."""
+    gate = linear(x, weight(w, prefix + ".gate_proj"))
+    up = linear(x, weight(w, prefix + ".up_proj"))
+    activated = F.silu(gate) * up
+    return {
+        "gate": gate,
+        "up": up,
+        "activated": activated,
+        "out": linear(activated, weight(w, prefix + ".down_proj")),
+    }
+
+
+def rotary_cos_sin(position_ids: torch.Tensor, cfg: Qwen38Config
+                   ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Text-only partial-RoPE tables for ``position_ids``, both ``[T, rotary_dim]``.
+
+    Qwen3.8 uses multimodal RoPE, but all three spatial position streams equal
+    the text positions when no image or video tokens are present. The frequency
+    recomposition therefore reduces to ordinary RoPE over the first
+    ``cfg.rotary_dim`` dimensions.
+    """
+    rotary_dim = cfg.rotary_dim
+    if rotary_dim <= 0 or rotary_dim > cfg.head_dim or rotary_dim % 2:
+        raise ValueError(
+            f"rotary_dim must be positive, even and <= head_dim; got {rotary_dim} and {cfg.head_dim}"
+        )
+    exponent = torch.arange(0, rotary_dim, 2, dtype=REF_DTYPE) / rotary_dim
+    inv_freq = 1.0 / (cfg.rope_theta ** exponent)
+    frequencies = position_ids.to(REF_DTYPE)[:, None] * inv_freq[None, :]
+    frequencies = torch.cat((frequencies, frequencies), dim=-1)
+    return frequencies.cos(), frequencies.sin()
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    half = x.shape[-1] // 2
+    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+
+def _apply_partial_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    rotary_dim = cos.shape[-1]
+    rotated, passthrough = x[..., :rotary_dim], x[..., rotary_dim:]
+    rotated = rotated * cos[:, None, :] + _rotate_half(rotated) * sin[:, None, :]
+    return torch.cat((rotated, passthrough), dim=-1)
+
+
+def attn_qk_norm_rope(qg: torch.Tensor, k: torch.Tensor, q_norm_w: torch.Tensor,
+                      k_norm_w: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+                      heads: int, kv_heads: int, head_dim: int, eps: float
+                      ) -> tuple[torch.Tensor, torch.Tensor]:
+    """The attention q/k norm and partial RoPE on the kernels' flat layout, in float64.
+
+    `qg` is the `q_proj` output, `[T, heads * 2 * head_dim]` with head `h`'s
+    query in the first half of its `2 * head_dim` columns and its gate in the
+    second; `k` is `[T, kv_heads * head_dim]`. The query also takes the score
+    scale `head_dim ** -0.5`, which the attention core then omits. Returns
+    `q` as `[T, heads * head_dim]` and `k` as `[T, kv_heads * head_dim]`.
+    """
+    t = qg.shape[0]
+    q = qg.to(REF_DTYPE).reshape(t, heads, 2 * head_dim)[..., :head_dim]
+    kk = k.to(REF_DTYPE).reshape(t, kv_heads, head_dim)
+    q = rmsnorm(q, q_norm_w, eps) * head_dim ** -0.5
+    kk = rmsnorm(kk, k_norm_w, eps)
+    cos, sin = cos.to(REF_DTYPE), sin.to(REF_DTYPE)
+    q = _apply_partial_rope(q, cos, sin).reshape(t, heads * head_dim)
+    kk = _apply_partial_rope(kk, cos, sin).reshape(t, kv_heads * head_dim)
+    return q, kk
+
+
+def attn_gate(attended: torch.Tensor, qg: torch.Tensor, heads: int, head_dim: int) -> torch.Tensor:
+    """`attended * sigmoid(gate)` on the kernels' flat layout, in float64.
+
+    `gate` is the second half of each head's `2 * head_dim` columns of the
+    `q_proj` output `qg`; `attended` is `[T, heads * head_dim]`.
+    """
+    t = qg.shape[0]
+    gate = qg.to(REF_DTYPE).reshape(t, heads, 2 * head_dim)[..., head_dim:].reshape(t, heads * head_dim)
+    return attended.to(REF_DTYPE) * torch.sigmoid(gate)
+
+
+ATTN_WEIGHTS = ("q_proj", "k_proj", "v_proj", "o_proj")
+_ATTN_CACHE: dict = {}
+
+
+def attn_inputs(key: str, t: int, cfg: Qwen38Config, weights: str | None = None, seed: int = 42):
+    """One tensor of the W8A8 gated-attention input set, drawn or loaded once and cached.
+
+    Keys: `x`, `w_q`, `w_k`, `w_v`, `w_o` (int8, `[out, in]`), each with a
+    `_scale` (fp32 `[out]`), `q_norm_w` and `k_norm_w`. With *weights* the
+    projections and norms come from one layer's BF16 `self_attn` tensors,
+    quantised with the Eco-Tech checkpoint's own recipe; `x` is drawn either way.
+    """
+    cache_key = (t, cfg.name, weights, seed)
+    st = _ATTN_CACHE.get(cache_key)
+    if st is None:
+        gen = torch.Generator().manual_seed(seed)
+        st = {"x": torch.randn(t, cfg.hidden_size, generator=gen).to(MODEL_DTYPE)}
+        if weights is None:
+            shapes = {
+                "q_proj": (2 * cfg.attention_q_width, cfg.hidden_size),
+                "k_proj": (cfg.attention_kv_width, cfg.hidden_size),
+                "v_proj": (cfg.attention_kv_width, cfg.hidden_size),
+                "o_proj": (cfg.hidden_size, cfg.attention_q_width),
+            }
+            dense = {name: (torch.randn(*shape, generator=gen) * shape[1] ** -0.5).to(MODEL_DTYPE)
+                     for name, shape in shapes.items()}
+            for name in ("q_norm", "k_norm"):
+                dense[name] = (torch.randn(cfg.head_dim, generator=gen) * 0.5).to(MODEL_DTYPE)
+            quantize = quantize_rows
+        else:
+            if __package__:
+                from .weights import modelslim_quantize_rows
+            else:
+                from weights import modelslim_quantize_rows
+
+            layer = torch.load(weights, weights_only=True)
+            dense = {name: layer[name + ".weight"] for name in (*ATTN_WEIGHTS, "q_norm", "k_norm")}
+
+            # the deployed checkpoint's recipe, which reproduces its int8 exactly
+            def quantize(weight):
+                q, scale, _ = modelslim_quantize_rows(weight)
+                return q, scale.reshape(-1)
+        for name in ATTN_WEIGHTS:
+            q, scale = quantize(dense[name])
+            short = "w_" + name[0]
+            st[short], st[short + "_scale"] = q, scale.float()
+        st["q_norm_w"], st["k_norm_w"] = dense["q_norm"], dense["k_norm"]
+        _ATTN_CACHE[cache_key] = st
+    return st[key]
+
+
+def attn_w8a8(x: torch.Tensor, w: dict[str, torch.Tensor], cos: torch.Tensor, sin: torch.Tensor,
+              cfg: Qwen38Config, prefix_k: torch.Tensor | None = None,
+              prefix_v: torch.Tensor | None = None,
+              return_cache: bool = False):
+    """The gated-attention mixer as the kernels compute it: int8 both sides, float64 between.
+
+    The fake-quant reference, not the truth. Every hand-off the kernels make
+    in BF16 is rounded to BF16 here -- the three projections, the normed and
+    rotated q and k, the attention output -- and the two int8 hand-offs use
+    the kernels' per-token quantiser. *w* holds the `attn_inputs` keys.
+    """
+    h, hkv, d = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
+    x_q, x_scale = quantize_rows(x)
+    xf = dequantize(x_q, x_scale)
+    qg = (xf @ dequantize(w["w_q"], w["w_q_scale"]).t()).to(MODEL_DTYPE)
+    k = (xf @ dequantize(w["w_k"], w["w_k_scale"]).t()).to(MODEL_DTYPE)
+    v = (xf @ dequantize(w["w_v"], w["w_v_scale"]).t()).to(MODEL_DTYPE)
+    q_rot, k_rot = attn_qk_norm_rope(qg, k, w["q_norm_w"], w["k_norm_w"], cos, sin, h, hkv, d, cfg.rms_norm_eps)
+    k_attn = k_rot.to(MODEL_DTYPE)
+    v_attn = v
+    if prefix_k is not None:
+        k_attn = torch.cat([prefix_k, k_attn])
+        v_attn = torch.cat([prefix_v, v_attn])
+    attended = causal_gqa_attention(q_rot.to(MODEL_DTYPE), k_attn, v_attn, h, hkv, d).to(MODEL_DTYPE)
+    act_q, act_scale = quantize_rows(attn_gate(attended, qg, h, d))
+    out = dequantize(act_q, act_scale) @ dequantize(w["w_o"], w["w_o_scale"]).t()
+    result = out.to(MODEL_DTYPE).to(REF_DTYPE)
+    return (result, k_rot.to(MODEL_DTYPE), v) if return_cache else result
+
+
+def attn_truth(x: torch.Tensor, w: dict[str, torch.Tensor], cos: torch.Tensor, sin: torch.Tensor,
+               cfg: Qwen38Config, prefix_k: torch.Tensor | None = None,
+               prefix_v: torch.Tensor | None = None,
+               return_cache: bool = False):
+    """The same mixer in float64 throughout: the weights as stored, nothing else quantised.
+
+    Isolates what the activation path costs -- the two per-token quantisers
+    and the BF16 hand-offs -- with the checkpoint's own int8 weights common to
+    both this and :func:`attn_w8a8`.
+    """
+    h, hkv, d = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
+    xf = x.to(REF_DTYPE)
+    qg = xf @ dequantize(w["w_q"], w["w_q_scale"]).t()
+    k = xf @ dequantize(w["w_k"], w["w_k_scale"]).t()
+    v = xf @ dequantize(w["w_v"], w["w_v_scale"]).t()
+    q_rot, k_rot = attn_qk_norm_rope(qg, k, w["q_norm_w"], w["k_norm_w"], cos, sin, h, hkv, d, cfg.rms_norm_eps)
+    k_current, v_current = k_rot, v
+    if prefix_k is not None:
+        k_rot = torch.cat([prefix_k, k_rot])
+        v = torch.cat([prefix_v, v])
+    attended = causal_gqa_attention(q_rot, k_rot, v, h, hkv, d)
+    result = attn_gate(attended, qg, h, d) @ dequantize(w["w_o"], w["w_o_scale"]).t()
+    return (result, k_current, v_current) if return_cache else result
+
+
+ATTN_BAND = 1024        # query rows per band of the causal attention below
+
+
+def causal_gqa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                         heads: int, kv_heads: int, head_dim: int,
+                         scale: float = 1.0) -> torch.Tensor:
+    """Causal grouped-query attention on flat `[T, H * D]` operands, in float64.
+
+    The kernels' layout: `q` is `[T, heads * head_dim]`, `k` and `v` are
+    `[prefix + T, kv_heads * head_dim]`, and query head `h` reads KV head
+    `h // (heads // kv_heads)`. Returns `[T, heads * head_dim]`.
+
+    Banded over query rows, and each band stops at its last key: the whole
+    score tensor is 12.9 GB at T = 8192 in float64, and half of it is masked.
+    """
+    t = q.shape[0]
+    kv_t = k.shape[0]
+    prefix = kv_t - t
+    if prefix < 0 or v.shape[0] != kv_t:
+        raise ValueError("K/V must contain the query chunk and any cached prefix")
+    group = heads // kv_heads
+    qh = q.to(REF_DTYPE).reshape(t, heads, head_dim).transpose(0, 1)
+    kh = k.to(REF_DTYPE).reshape(kv_t, kv_heads, head_dim).transpose(0, 1)
+    vh = v.to(REF_DTYPE).reshape(kv_t, kv_heads, head_dim).transpose(0, 1)
+    out = torch.empty(heads, t, head_dim, dtype=REF_DTYPE)
+    for r0 in range(0, t, ATTN_BAND):
+        r1 = min(r0 + ATTN_BAND, t)
+        k1 = prefix + r1
+        causal = torch.arange(k1)[None, :] > (prefix + torch.arange(r0, r1)[:, None])
+        for h in range(heads):
+            scores = (qh[h, r0:r1] @ kh[h // group, :k1].t()) * scale
+            probs = torch.softmax(scores.masked_fill(causal, -torch.inf), dim=-1)
+            out[h, r0:r1] = probs @ vh[h // group, :k1]
+    return out.transpose(0, 1).reshape(t, heads * head_dim)
+
+
+def kv_page_rows(block_table: torch.Tensor, seq: int, length: int,
+                 page_size: int) -> torch.Tensor:
+    """The physical rows holding sequence `seq`'s first `length` cached tokens, in order.
+
+    The paged cache's index arithmetic, in one place: logical page `p` starts at
+    `block_table[seq, p] * page_size`, and the last page carries only the tokens the
+    length leaves in it. Every reader and writer of the cache derives its rows from
+    here, so a block-table or page-size disagreement between them cannot exist.
+    """
+    pages = (length + page_size - 1) // page_size
+    if pages > block_table.shape[1]:
+        raise ValueError(f"sequence {seq} at length {length} needs {pages} pages, "
+                         f"past the block table's {block_table.shape[1]}")
+    rows = []
+    for p in range(pages):
+        lo = int(block_table[seq, p]) * page_size
+        take = min(page_size, length - p * page_size)
+        rows.append(torch.arange(lo, lo + take))
+    return torch.cat(rows)
+
+
+def decode_gqa_attention(q: torch.Tensor, k_pages: torch.Tensor, v_pages: torch.Tensor,
+                         block_table: torch.Tensor, seq_lens: torch.Tensor,
+                         heads: int, kv_heads: int, head_dim: int, page_size: int,
+                         scale: float = 1.0) -> torch.Tensor:
+    """One decode step of grouped-query attention over a **paged** KV cache, float64.
+
+    The decode form of :func:`causal_gqa_attention`: one query row per sequence,
+    attending to every key that sequence has cached. There is no causal mask --
+    the query is the newest position, so every cached key is in its past.
+
+    `q` is `[B, heads * head_dim]`, one row per sequence. `k_pages` and `v_pages`
+    are the paged cache, `[pages * page_size, kv_heads * head_dim]`, and
+    `block_table[b, i]` is the physical page holding sequence `b`'s logical page
+    `i`. `seq_lens[b]` is how many of those tokens are real; the tail of the last
+    page is not. Query head `h` reads KV head `h // (heads // kv_heads)`.
+
+    The paging is modelled rather than flattened away on purpose: a block-table or
+    page-size error is the failure this reference exists to catch, and a contiguous
+    cache would hide it.
+    """
+    b = q.shape[0]
+    group = heads // kv_heads
+    qh = q.to(REF_DTYPE).reshape(b, heads, head_dim)
+    out = torch.zeros(b, heads, head_dim, dtype=REF_DTYPE)
+    for i in range(b):
+        length = int(seq_lens[i])
+        idx = kv_page_rows(block_table, i, length, page_size)
+        kh = k_pages[idx].to(REF_DTYPE).reshape(length, kv_heads, head_dim)
+        vh = v_pages[idx].to(REF_DTYPE).reshape(length, kv_heads, head_dim)
+        for h in range(heads):
+            scores = (qh[i, h] @ kh[:, h // group].t()) * scale
+            probs = torch.softmax(scores, dim=-1)
+            out[i, h] = probs @ vh[:, h // group]
+    return out.reshape(b, heads * head_dim)
+
+
+def pages_from_contiguous(k: torch.Tensor, v: torch.Tensor, page_size: int,
+                          first_page: int = 0) -> tuple:
+    """Lay a contiguous `[T, kv_heads * head_dim]` cache out in pages.
+
+    Returns `(k_pages, v_pages, block_table)` for one sequence, with its logical
+    pages placed at physical `first_page`, `first_page + 1`, ... so a kernel that
+    ignored the block table reads the wrong rows unless `first_page` is zero.
+    """
+    t, width = k.shape
+    pages = (t + page_size - 1) // page_size
+    total = first_page + pages
+    k_pages = torch.zeros(total * page_size, width, dtype=k.dtype)
+    v_pages = torch.zeros(total * page_size, width, dtype=v.dtype)
+    for p in range(pages):
+        lo, hi = p * page_size, min((p + 1) * page_size, t)
+        dst = (first_page + p) * page_size
+        k_pages[dst : dst + hi - lo] = k[lo:hi]
+        v_pages[dst : dst + hi - lo] = v[lo:hi]
+    table = torch.arange(first_page, first_page + pages, dtype=torch.int32).reshape(1, pages)
+    return k_pages, v_pages, table
+
+
+def append_kv_pages(k_pages: torch.Tensor, v_pages: torch.Tensor,
+                    block_table: torch.Tensor, seq_lens: torch.Tensor,
+                    k_new: torch.Tensor, v_new: torch.Tensor, page_size: int) -> None:
+    """Write one decode token's K and V into each sequence's slot, in place.
+
+    The inverse of the read :func:`decode_gqa_attention` performs, and derived the same
+    way: `seq_lens[i]` **counts the token being written**, so its position is
+    `seq_lens[i] - 1` and its physical row is
+    `block_table[i, pos // page_size] * page_size + pos % page_size`. A length that
+    excluded the new token would place it one slot early and the reader would skip it.
+    """
+    batch = k_new.shape[0]
+    if block_table.shape[0] != batch or seq_lens.shape[0] != batch:
+        raise ValueError(f"block_table {tuple(block_table.shape)} and seq_lens "
+                         f"{tuple(seq_lens.shape)} must both start with batch {batch}")
+    for i in range(batch):
+        pos = int(seq_lens[i]) - 1
+        if pos < 0:
+            raise ValueError(f"seq_lens[{i}] counts the token being written; it must be >= 1")
+        page, offset = divmod(pos, page_size)
+        if page >= block_table.shape[1]:
+            raise ValueError(f"sequence {i} at position {pos} needs page {page}, "
+                             f"past the block table's {block_table.shape[1]}")
+        row = int(block_table[i, page]) * page_size + offset
+        k_pages[row] = k_new[i].to(k_pages.dtype)
+        v_pages[row] = v_new[i].to(v_pages.dtype)
+
+
+def gated_attention(x: torch.Tensor, w: dict[str, torch.Tensor], cfg: Qwen38Config,
+                    prefix: str, position_ids: torch.Tensor) -> dict[str, torch.Tensor]:
+    """One causal Qwen3.8 gated-attention mixer on a single text sequence.
+
+    Q has 24 heads in the real model and shares four KV heads through GQA. The
+    Q projection is twice the usual width: its second half is a sigmoid output
+    gate applied after attention and before ``o_proj``.
+
+    **This is the module-shaped reference, and it is dense on purpose.** It keeps the
+    model's natural `[T, H, D]` layout and scores every key against every query, as the
+    module does, so the two can be read side by side where `test_model_reference` checks
+    `text_prefill` against `Qwen3_5ForConditionalGeneration`. The kernel-shaped
+    references -- `attn_truth` and `attn_w8a8` -- take the flat layout and go through
+    `causal_gqa_attention`, which is banded; `test_attention_reference` ties the two
+    together, and that check is worth something because the two sides compute attention
+    differently.
+
+    **Long sequences do not reach here.** Every caller is a reference check at a short
+    one: `test_attention_reference` at 67 tokens, `test_model_reference` at 7 on a
+    2-layer, 32-wide config, and `test_weights_contract` at 6. Prefill-length runs go
+    through the kernel-shaped references instead. The `[heads, T, T]` score tensor is
+    therefore bounded by how this function is used, not by what it could cost -- it would
+    be 12.9 GB at T = 8192 in float64, which is why the banded form exists for the side
+    that needs it.
+    """
+    if cfg.attention_bias:
+        raise ValueError("the Qwen3.8 reference currently supports bias-free attention only")
+    t = x.shape[0]
+    h, hkv, d = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
+    if h % hkv:
+        raise ValueError(f"num_attention_heads ({h}) must be divisible by num_key_value_heads ({hkv})")
+
+    q_gate = linear(x, weight(w, prefix + ".q_proj")).reshape(t, h, 2 * d)
+    q, gate = torch.chunk(q_gate, 2, dim=-1)
+    k = linear(x, weight(w, prefix + ".k_proj")).reshape(t, hkv, d)
+    v = linear(x, weight(w, prefix + ".v_proj")).reshape(t, hkv, d)
+    q = rmsnorm(q, w[prefix + ".q_norm.weight"], cfg.rms_norm_eps)
+    k = rmsnorm(k, w[prefix + ".k_norm.weight"], cfg.rms_norm_eps)
+
+    cos, sin = rotary_cos_sin(position_ids, cfg)
+    q = _apply_partial_rope(q, cos, sin)
+    k = _apply_partial_rope(k, cos, sin)
+
+    groups = h // hkv
+    q_heads = q.transpose(0, 1)
+    k_heads = k.transpose(0, 1).repeat_interleave(groups, dim=0)
+    v_heads = v.transpose(0, 1).repeat_interleave(groups, dim=0)
+    scores = (q_heads @ k_heads.transpose(-1, -2)) * (d ** -0.5)
+    causal = torch.ones(t, t, dtype=torch.bool).triu(diagonal=1)
+    scores = scores.masked_fill(causal, -torch.inf)
+    probabilities = torch.softmax(scores, dim=-1)
+    attended = (probabilities @ v_heads).transpose(0, 1).reshape(t, h * d)
+    gated = attended * torch.sigmoid(gate.reshape(t, h * d).to(REF_DTYPE))
+    out = linear(gated, weight(w, prefix + ".o_proj"))
+    # `scores` and `probabilities` stay local: nothing in this tree reads them, and they
+    # are the two values that grow with T squared.
+    return {
+        "q": q,
+        "k": k,
+        "v": v,
+        "gate": gate,
+        "attended": attended,
+        "gated": gated,
+        "out": out,
+    }
+
+
+def _subweights(w: dict[str, torch.Tensor], prefix: str) -> dict[str, torch.Tensor]:
+    """Strip ``prefix`` from one GDN block's checkpoint-native tensor names."""
+    out = {}
+    for name, value in w.items():
+        if name.startswith(prefix):
+            out[name[len(prefix):]] = value
+    missing = [name for name in WEIGHT_NAMES if name not in out]
+    if missing:
+        raise KeyError(f"missing GDN weights below {prefix}: {missing}")
+    return out
+
+
+def attn_w8a8_decode(x: torch.Tensor, w: dict[str, torch.Tensor], cos: torch.Tensor,
+                     sin: torch.Tensor, cfg: Qwen38Config, k_pages: torch.Tensor,
+                     v_pages: torch.Tensor, block_table: torch.Tensor,
+                     seq_lens: torch.Tensor, page_size: int) -> torch.Tensor:
+    """:func:`attn_w8a8` for one decode step per sequence, over a paged cache.
+
+    The fake-quant reference, not the truth, and rounded exactly where
+    :func:`attn_w8a8` rounds: the three projections, the normed and rotated q and k and
+    the attention output all pass through BF16, and the two int8 hand-offs use the
+    kernels' per-token quantiser.
+
+    `x` is `[B, hidden]`, one token per sequence. This step's K and V are appended to the
+    slot `block_table` names for position `seq_lens[b] - 1` before the read, which is the
+    convention :func:`append_kv_pages` and :func:`decode_gqa_attention` share. The score
+    scale rides on the query inside :func:`attn_qk_norm_rope`, as in the kernels, so the
+    attention call takes `scale = 1.0`. `k_pages` and `v_pages` are updated in place.
+    """
+    h, hkv, d = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
+    x_q, x_scale = quantize_rows(x)
+    xf = dequantize(x_q, x_scale)
+    qg = (xf @ dequantize(w["w_q"], w["w_q_scale"]).t()).to(MODEL_DTYPE)
+    k = (xf @ dequantize(w["w_k"], w["w_k_scale"]).t()).to(MODEL_DTYPE)
+    v = (xf @ dequantize(w["w_v"], w["w_v_scale"]).t()).to(MODEL_DTYPE)
+    q_rot, k_rot = attn_qk_norm_rope(qg, k, w["q_norm_w"], w["k_norm_w"], cos, sin,
+                                     h, hkv, d, cfg.rms_norm_eps)
+    append_kv_pages(k_pages, v_pages, block_table, seq_lens,
+                    k_rot.to(MODEL_DTYPE), v, page_size)
+    attended = decode_gqa_attention(q_rot.to(MODEL_DTYPE), k_pages, v_pages, block_table,
+                                    seq_lens, h, hkv, d, page_size,
+                                    scale=1.0).to(MODEL_DTYPE)
+    act_q, act_scale = quantize_rows(attn_gate(attended, qg, h, d))
+    out = dequantize(act_q, act_scale) @ dequantize(w["w_o"], w["w_o_scale"]).t()
+    return out.to(MODEL_DTYPE).to(REF_DTYPE)
+
+
+def attn_truth_decode(x: torch.Tensor, w: dict[str, torch.Tensor], cos: torch.Tensor,
+                      sin: torch.Tensor, cfg: Qwen38Config, k_pages: torch.Tensor,
+                      v_pages: torch.Tensor, block_table: torch.Tensor,
+                      seq_lens: torch.Tensor, page_size: int) -> torch.Tensor:
+    """:func:`attn_truth` for one decode step: float64 throughout, same int8 weights.
+
+    Isolates what the decode activation path costs. `k_pages` and `v_pages` are updated in
+    place, so pass a copy if both this and :func:`attn_w8a8_decode` are to read the same
+    starting cache.
+    """
+    h, hkv, d = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
+    xf = x.to(REF_DTYPE)
+    qg = xf @ dequantize(w["w_q"], w["w_q_scale"]).t()
+    k = xf @ dequantize(w["w_k"], w["w_k_scale"]).t()
+    v = xf @ dequantize(w["w_v"], w["w_v_scale"]).t()
+    q_rot, k_rot = attn_qk_norm_rope(qg, k, w["q_norm_w"], w["k_norm_w"], cos, sin,
+                                     h, hkv, d, cfg.rms_norm_eps)
+    append_kv_pages(k_pages, v_pages, block_table, seq_lens, k_rot, v, page_size)
+    attended = decode_gqa_attention(q_rot, k_pages, v_pages, block_table, seq_lens,
+                                    h, hkv, d, page_size, scale=1.0)
+    return attn_gate(attended, qg, h, d) @ dequantize(w["w_o"], w["w_o_scale"]).t()
+
+
+def decoder_layer(x: torch.Tensor, w: dict[str, torch.Tensor], cfg: Qwen38Config,
+                  layer_idx: int, chunk: int, position_ids: torch.Tensor
+                  ) -> dict[str, torch.Tensor]:
+    """One complete decoder layer, including both residual additions and the MLP."""
+    prefix = f"model.language_model.layers.{layer_idx}"
+    input_norm = rmsnorm(x, w[prefix + ".input_layernorm.weight"], cfg.rms_norm_eps)
+    layer_type = cfg.layer_types[layer_idx]
+    if layer_type == "linear_attention":
+        # The stage reference is chunk-shaped, while the model accepts any text
+        # length. Padding only the causal suffix cannot affect real-token rows.
+        pad = (-input_norm.shape[0]) % chunk
+        gdn_input = input_norm
+        if pad:
+            gdn_input = torch.cat(
+                (input_norm, torch.zeros(pad, input_norm.shape[1], dtype=input_norm.dtype)),
+                dim=0,
+            )
+        mixer = block(
+            gdn_input,
+            _subweights(w, prefix + ".linear_attn."),
+            cfg,
+            chunk,
+        )["out"][: input_norm.shape[0]]
+    elif layer_type == "full_attention":
+        mixer = gated_attention(
+            input_norm,
+            w,
+            cfg,
+            prefix + ".self_attn",
+            position_ids,
+        )["out"]
+    else:
+        raise ValueError(f"unsupported layer type at index {layer_idx}: {layer_type!r}")
+
+    post_mixer = x.to(REF_DTYPE) + mixer
+    post_attention_norm = rmsnorm(
+        post_mixer,
+        w[prefix + ".post_attention_layernorm.weight"],
+        cfg.rms_norm_eps,
+    )
+    mlp = swiglu_mlp(post_attention_norm, w, prefix + ".mlp")["out"]
+    return {
+        "input_norm": input_norm,
+        "mixer": mixer,
+        "post_mixer": post_mixer,
+        "post_attention_norm": post_attention_norm,
+        "mlp": mlp,
+        "out": post_mixer + mlp,
+    }
+
+
+def residual_layer(residual: torch.Tensor, delta: torch.Tensor, norm_in_w: torch.Tensor,
+                   norm_post_w: torch.Tensor, mixer: Callable[[torch.Tensor], torch.Tensor],
+                   mlp_w: dict[str, torch.Tensor], cfg: Qwen38Config, quant: bool = True
+                   ) -> dict[str, torch.Tensor]:
+    """One decoder layer: two residual adds, two norms, a mixer and the MLP.
+
+    `mixer` is a callable taking the normed hidden states and returning that mixer's
+    output, so this function carries the layer's own arithmetic and nothing else, and
+    serves both paths. Any of the four mixer oracles fits -- :func:`block` or
+    :func:`attn_w8a8` over a prefill chunk, :func:`recurrent_block` or
+    :func:`attn_w8a8_decode` at a decode batch -- closed over its own weights and its own
+    state, which only the caller can supply.
+
+    **The layer boundary is one add behind the module boundary.** `delta` is the previous
+    layer's MLP output and `residual` the stream it adds to, so the layer begins by
+    completing that addition and ends with its own MLP output still unadded. That is what
+    a stacked loop computes per layer, on either path: two fused add-and-norm stages, not
+    two norms and two separate adds. `out` is the complete layer output for a caller that
+    wants it.
+
+    *quant* picks the chain. With it, the dtypes are modelled where the kernels hold them:
+    the running residual in fp32, every norm output and the mixer output in bf16, and the
+    MLP as :func:`mlp_w8a8` computes it with a bf16 activation. Without it, everything is
+    float64 and the MLP is :func:`mlp_truth` -- the same weights, nothing else narrowed.
+    """
+    def resid(x: torch.Tensor) -> torch.Tensor:
+        """The running residual, which the kernels keep in fp32 and never in bf16."""
+        return x.float().to(REF_DTYPE) if quant else x
+
+    def narrow(x: torch.Tensor) -> torch.Tensor:
+        return x.to(MODEL_DTYPE).to(REF_DTYPE) if quant else x
+
+    st = {}
+    st["residual"] = resid(residual.to(REF_DTYPE) + delta.to(REF_DTYPE))
+    st["input_norm"] = narrow(rmsnorm(st["residual"], norm_in_w, cfg.rms_norm_eps))
+    st["mixer"] = narrow(mixer(st["input_norm"]))
+    st["residual_out"] = resid(st["residual"] + st["mixer"])
+    st["post_attention_norm"] = narrow(
+        rmsnorm(st["residual_out"], norm_post_w, cfg.rms_norm_eps))
+    args = (st["post_attention_norm"], mlp_w["w_gate"], mlp_w["w_gate_scale"],
+            mlp_w["w_up"], mlp_w["w_up_scale"], mlp_w["w_down"], mlp_w["w_down_scale"])
+    st["mlp_out"] = mlp_w8a8(*args, act_bf16=True) if quant else mlp_truth(*args)
+    st["out"] = st["residual_out"] + st["mlp_out"]
+    return st
+
+
+def text_prefill(input_ids: torch.Tensor, w: dict[str, torch.Tensor], cfg: Qwen38Config,
+                 chunk: int, position_ids: torch.Tensor | None = None,
+                 capture_intermediates: bool = False) -> dict[str, torch.Tensor]:
+    """Complete text-only prefill for one sequence, from token ids to logits.
+
+    ``w`` uses the checkpoint's native ``Qwen3_5ForConditionalGeneration`` key
+    names. The returned ``hidden`` and ``logits`` are always present. With
+    ``capture_intermediates``, the dictionary also contains the embedding and
+    every decoder-layer boundary used by the Transformers equivalence test.
+    """
+    if input_ids.ndim != 1:
+        raise ValueError(f"text_prefill expects one packed sequence [T], got {tuple(input_ids.shape)}")
+    if input_ids.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"input_ids must be an integer tensor, got {input_ids.dtype}")
+    t = input_ids.numel()
+    if t == 0:
+        raise ValueError("text_prefill requires at least one token")
+    if chunk <= 0:
+        raise ValueError(f"chunk must be positive, got {chunk}")
+    if position_ids is None:
+        position_ids = torch.arange(t, dtype=torch.int64)
+    if position_ids.shape != (t,):
+        raise ValueError(f"position_ids must have shape ({t},), got {tuple(position_ids.shape)}")
+
+    embedding_weight = w["model.language_model.embed_tokens.weight"].to(REF_DTYPE)
+    hidden = F.embedding(input_ids.to(torch.int64), embedding_weight)
+    state = {"embedding": hidden} if capture_intermediates else {}
+    for layer_idx in range(cfg.num_hidden_layers):
+        layer = decoder_layer(hidden, w, cfg, layer_idx, chunk, position_ids)
+        hidden = layer["out"]
+        if capture_intermediates:
+            state.update({f"layers.{layer_idx}.{name}": value for name, value in layer.items()})
+
+    hidden = rmsnorm(hidden, w["model.language_model.norm.weight"], cfg.rms_norm_eps)
+    logits = linear(hidden, weight(w, "lm_head"))
+    state.update(hidden=hidden, logits=logits)
+    return state
+
+
+
 
 
 # ---------------------------------------------------------------------------

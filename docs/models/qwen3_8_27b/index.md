@@ -1,8 +1,8 @@
 # Qwen3.8-27B
 
-`models/qwen3_8_27b/` implements the W8A8 Gated DeltaNet block, including
-checkpoint-compatible projections and separate convolution and recurrent
-state for each packed request.
+`models/qwen3_8_27b/` implements the W8A8 Gated DeltaNet block and decode
+layers for both Gated DeltaNet and gated attention. The composed decode
+entry uses resident convolution, recurrent and paged K/V caches.
 
 Qwen3.8-27B interleaves three Gated DeltaNet layers with one gated-attention
 layer, `LLLA` repeated sixteen times over 64 layers, so 48 of its layers run the
@@ -300,3 +300,45 @@ python models/qwen3_8_27b/test_block_reference.py --module-dtype float64,bfloat1
 The example commands invoke validation scripts directly. Device validation
 compiles and runs the kernel. The CPU block reference defaults to random
 weights and accepts an extracted layer for real-weight validation.
+
+`decode_layer.py` scores both mixer forms and the MLP against the Torch chain at
+random and real weights. `decode_fwd.py` is a smoke entry over the composed host
+program serving compiles: it builds and runs it, without a golden.
+
+```bash
+python models/qwen3_8_27b/decode_layer.py -p a2a3 -d "$TASK_DEVICE" --kind attn
+python models/qwen3_8_27b/decode_fwd.py -p a2a3 -d "$TASK_DEVICE"
+python models/qwen3_8_27b/decode_fwd.py -p a2a3 --groups 16 --compile-only
+```
+
+## How the decode path was optimized
+
+[Qwen3.8-27B decode optimization](optimization.md) follows the tuning of the
+decode path in order — the weight-stream regime and its tiles, the fused
+attention projection, the vector stages that lose their token axis at a decode
+batch, the recurrence and convolution task counts, the attention page splits, the
+MLP, and the one precision decision — with the measurement behind each constant
+the kernels ship with.
+
+## Composed decode serving entry
+
+`decode_fwd.build_kernel` composes consecutive groups of three GDN layers and one
+full-attention layer. The serving adapter uses all sixteen groups in one NPU
+submission, between the existing embedding and final-head programs. Inputs use
+stacked weights, layer-major state-row mappings and per-layer attention page
+tables; cache pools remain resident and inactive rows use private scratch slots.
+The caller must keep `group_start` and the selected group count within the stacked
+weight extent.
+
+The optional `active_rows` build argument restricts the GDN recurrence to a live
+prefix, while matrix and convolution stages keep their padded extent. Inactive
+recurrence outputs are zeroed and their state rows remain untouched. The default,
+zero, processes all padded rows. Serving builds one- and two-row variants at
+`ACTIVE_HEAD_TILE`, which it reads from this module, and keeps the padded decoder
+for larger active batches. Runtime argument shapes and cache ownership are
+unchanged. The standalone GDN block exposes `--active-rows` for reference
+validation.
+
+The composition reuses the decode layer operators without changing arithmetic or
+precision, so this model's numbers are validated per layer rather than over the
+stack.
