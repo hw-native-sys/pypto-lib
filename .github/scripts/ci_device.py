@@ -33,7 +33,7 @@ from golden.runner import (
     _validate_compiled_spec_abi,
     normalize_config,
 )
-from golden.spec import ScalarSpec, TensorSpec
+from golden.spec import ScalarSpec, SparseZero, TensorSpec
 
 
 def _stage_windows(sources, directory):
@@ -118,6 +118,9 @@ def submit_dispatch(
         else:
             value = packed.get(spec.name, tensors[spec.name])
             initial = value if spec.is_input else None
+            initializer = spec.init_value
+            if spec.direction == "in" and isinstance(initializer, SparseZero) and initializer.owns(value):
+                initial = "sparse_zero"
             args.append((spec.name, list(value.shape), spec.dtype, spec.resident, initial))
     options = asdict(cfg.run_options())
     options.update(options.pop("dfx"))
@@ -187,7 +190,11 @@ def execute(directory, devices):
             spec = scalars[name] = ScalarSpec(name, dtype, value)
         else:
             spec = TensorSpec(name, shape, dtype, resident=resident)
-            tensors[name] = torch.zeros(shape, dtype=dtype) if value is None else value
+            if value is None:
+                value = torch.zeros(shape, dtype=dtype)
+            elif isinstance(value, str) and value == "sparse_zero":
+                value = SparseZero(shape, dtype)()
+            tensors[name] = value
         specs.append(spec)
     _validate_compiled_spec_abi(compiled, specs)
     windows = request["windows"]

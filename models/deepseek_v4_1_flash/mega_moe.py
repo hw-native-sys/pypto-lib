@@ -80,10 +80,14 @@ def pack_checkpoint_zn(weight):
     return weight.view(torch.uint8).unflatten(-1, (-1, 16)).transpose(-3, -2).contiguous()
 
 
-def _resident_weight(tensors, name, projection, local_experts, upload_shape):
+def _resident_weight(tensors, name, projection, local_experts, upload_shape, *, sparse_zero=None):
     from quant import pack_fp8_nz, unpack_mx_b_scale
 
     value = tensors[name]
+    # ZN reordering preserves all-zero FP4 bytes. Use the regular conversion
+    # for replayed inputs, which have their own storage.
+    if sparse_zero is not None and sparse_zero.owns(value):
+        return value.view(upload_shape)
     k, n = (MOE_INTER, D) if projection.startswith(("routed_w2", "shared_w2")) else (D, MOE_INTER)
     if projection.startswith("shared_"):
         return pack_fp8_nz(value.reshape(-1, k, n)).reshape(upload_shape)
@@ -115,10 +119,12 @@ def use_packed_decode_weights(capacity, local_experts, topk):
     return capacity in (192, 384) and capacity * topk <= 96 * local_experts
 
 
-def forward_routed_weight_spec(name, device_shape, dtype, init_value, packed, prefix="", *, local_experts):
+def forward_routed_weight_spec(
+    name, device_shape, dtype, init_value, packed, prefix="", *, local_experts, sparse_zero_routed=False,
+):
     """Keep the host/split fixture ABI; convert only MegaMoE's resident upload."""
     from functools import partial
-    from golden import TensorSpec
+    from golden.spec import SparseZero, TensorSpec
 
     projection = name.removeprefix(prefix).removesuffix("_packed")
     routed = projection in ("routed_w1", "routed_w2", "routed_w3")
@@ -142,8 +148,11 @@ def forward_routed_weight_spec(name, device_shape, dtype, init_value, packed, pr
             original = init_value
             def init_value():
                 return original().reshape(host_shape)
-    pack = partial(_resident_weight, name=name, projection=projection,
-                   local_experts=local_experts, upload_shape=device_shape)
+    sparse_zero = None
+    if routed and sparse_zero_routed and init_value is None:
+        sparse_zero = init_value = SparseZero(host_shape, dtype)
+    pack = partial(_resident_weight, name=name, projection=projection, local_experts=local_experts,
+                   upload_shape=device_shape, sparse_zero=sparse_zero)
     return TensorSpec(name, host_shape, dtype, init_value=init_value, resident="stacked",
                       pack_for_upload=pack, upload_shape=device_shape)
 
