@@ -274,6 +274,7 @@ def decode_layer(
         recv_meta, recv_x, recv_aux, arrived, data_arrived,
         routed_y_buf, combine_arrived,
         layer_id, pl.const(T, pl.INT32), my_rank, pl.const(1, pl.INT32),
+        expert_state=0, expert_descriptors=0,
     )
     clear_moe_signals(x_next, arrived, data_arrived, combine_arrived)
     return x_next

@@ -12,6 +12,7 @@ activations for both decode and prefill attention paths."""
 import pypto.language as pl
 
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ
+from task_policy import ALLOW_EARLY_RESOLVE
 
 
 # Dynamic shape variables.
@@ -35,11 +36,12 @@ def rms_norm(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.BF16],
     x_normed: pl.Tensor[[T_DYN, D], pl.BF16],
+    early_resolve: pl.constexpr = ALLOW_EARLY_RESOLVE,
 ):
     t_dim = pl.tensor.dim(x, 0)
     # Capture form (not `for ... in pl.spmd`): callers need the producer TaskId to
     # hang a `pl.system.task_dummy` barrier off it and defer non-critical consumers.
-    with pl.spmd(t_dim // T_TILE, name_hint="rms_norm", allow_early_resolve=True) as rms_tid:
+    with pl.spmd(t_dim // T_TILE, name_hint="rms_norm", allow_early_resolve=early_resolve) as rms_tid:
         tg_idx = pl.tile.get_block_idx()
         tg = tg_idx * T_TILE
         x_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)

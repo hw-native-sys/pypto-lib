@@ -27,6 +27,7 @@ from config import (
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
 )
+from task_policy import ALLOW_EARLY_RESOLVE
 
 
 # Dynamic shape variables.
@@ -129,7 +130,7 @@ def _sparse_attn_hca(
 
     # Additive softmax bias (0 valid / NEG_INF invalid) that qk_pv adds onto the
     # scaled scores, so invalid lanes exp to ~0 with no per-block mask multiply.
-    for v_blk in pl.spmd(T // VALID_TOKEN_TILE, name_hint="build_valid", allow_early_resolve=True):
+    for v_blk in pl.spmd(T // VALID_TOKEN_TILE, name_hint="build_valid", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         v_t0 = v_blk * VALID_TOKEN_TILE
         v_win_f = pl.cast(window_swa_indices[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : WIN], target_type=pl.FP32)
         v_win_valid = pl.minimum(pl.maximum(pl.add(v_win_f, 1.0), 0.0), 1.0)
@@ -154,7 +155,7 @@ def _sparse_attn_hca(
     # source add_inout, so the KV writebacks would lose their WAR edge against the
     # qk_pv gather reads. add_inout is param-level, so one-row no-op self-copies
     # suffice and stay inside a compressed pool smaller than T rows.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_touch", allow_early_resolve=True) as kv_touch_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_touch", allow_early_resolve=ALLOW_EARLY_RESOLVE) as kv_touch_tid:
         ori_kv_flat[0:1, 0:HEAD_DIM] = ori_kv_flat[0:1, 0:HEAD_DIM]
         cmp_kv_flat[0:1, 0:HEAD_DIM] = cmp_kv_flat[0:1, 0:HEAD_DIM]
 
@@ -176,7 +177,7 @@ def _sparse_attn_hca(
     # the visible rows gather finite rows that the NEG_INF bias kills in the softmax.
     qk_items = T * sparse_blocks
     qk_lanes = pl.min(qk_items, NUM_QK_CORES)
-    with pl.spmd(qk_lanes, name_hint="qk_pv", deps=[kv_touch_tid], allow_early_resolve=True):
+    with pl.spmd(qk_lanes, name_hint="qk_pv", deps=[kv_touch_tid], allow_early_resolve=ALLOW_EARLY_RESOLVE):
         qk_core = pl.tile.get_block_idx()
         qk_lane_iters = (qk_items - qk_core + qk_lanes - 1) // qk_lanes
         for qk_it in pl.range(qk_lane_iters):
@@ -381,7 +382,7 @@ def _sparse_attn_hca(
             row_base_o = g * T
             out_col_g = g * O_LORA
             with pl.spmd(O_LORA // PROJ_A_MM_N_TILE, name_hint="proj_a_mm", deps=[merge_tid],
-                         allow_early_resolve=True) as pa_tid:
+                         allow_early_resolve=ALLOW_EARLY_RESOLVE) as pa_tid:
                 nf = pl.tile.get_block_idx()
                 n0 = nf * PROJ_A_MM_N_TILE
                 acc_a = pl.create_tensor([1, MM_T_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
@@ -395,7 +396,7 @@ def _sparse_attn_hca(
 
             # Per-group proj_a -> quant -> proj_b dependency chain.
             col_g = g * O_LORA
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="quant", deps=[pa_tid], allow_early_resolve=True) as q_tid:
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="quant", deps=[pa_tid], allow_early_resolve=ALLOW_EARLY_RESOLVE) as q_tid:
                 for qt in pl.pipeline(0, T, QUANT_TOKEN_TILE, stage=2):
                     oc_amax = o_r_pad[qt : qt + QUANT_TOKEN_TILE, col_g : col_g + O_LORA]
                     g_abs = pl.abs(oc_amax)
@@ -419,7 +420,7 @@ def _sparse_attn_hca(
                         o_r_i8_pad[T:T_PAD, col_g : col_g + O_LORA] = zero_i8
 
             # One proj_b SPMD grid per output group.
-            with pl.spmd(D // PROJ_B_D_TILE, name_hint="proj_b_mm", deps=[q_tid], allow_early_resolve=True) as pb_tid:
+            with pl.spmd(D // PROJ_B_D_TILE, name_hint="proj_b_mm", deps=[q_tid], allow_early_resolve=ALLOW_EARLY_RESOLVE) as pb_tid:
                 dc = pl.tile.get_block_idx()
                 d0 = dc * PROJ_B_D_TILE
                 for nf in pl.range(PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
@@ -441,7 +442,7 @@ def _sparse_attn_hca(
     # per-row act scale -- then applies the per-channel weight scale -> BF16. Explicit
     # deps on the eight proj_b grids bridge manual_scope -> the return's auto-dep.
     with pl.spmd((D // PROJ_B_ACT_N_TILE) * (T // PROJ_B_ACT_TASK_T_TILE), name_hint="proj_b_act",
-                 deps=[proj_b_tids[i] for i in range(O_GROUPS)], allow_early_resolve=True) as _act_tid:
+                 deps=[proj_b_tids[i] for i in range(O_GROUPS)], allow_early_resolve=ALLOW_EARLY_RESOLVE) as _act_tid:
         act_idx = pl.tile.get_block_idx()
         nreg = act_idx // (T // PROJ_B_ACT_TASK_T_TILE)
         tblk = act_idx - nreg * (T // PROJ_B_ACT_TASK_T_TILE)

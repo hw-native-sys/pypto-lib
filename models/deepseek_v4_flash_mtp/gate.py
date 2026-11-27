@@ -13,6 +13,8 @@ import pypto.language as pl
 
 from config import (FLASH as M, MOE_TOKENS, FP32_NEG_INF,
                     INT8_SCALE_MAX, INT8_AMAX_EPS)
+from expert_slots import MAPPED
+from task_policy import ALLOW_EARLY_RESOLVE
 
 
 # model config
@@ -102,7 +104,7 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE, norm_ro
 
         # Group independent rows to amortize block scheduling and reuse gamma.
         norm_w_2d = pl.reshape(norm_w, [1, D])
-        for norm_block in pl.spmd((active_gate_tokens + NORM_ROWS_PER_BLOCK - 1) // NORM_ROWS_PER_BLOCK, name_hint="ffn_norm", allow_early_resolve=True):
+        for norm_block in pl.spmd((active_gate_tokens + NORM_ROWS_PER_BLOCK - 1) // NORM_ROWS_PER_BLOCK, name_hint="ffn_norm", allow_early_resolve=ALLOW_EARLY_RESOLVE):
             rms_w = pl.cast(pl.tile.load(norm_w_2d, [0, 0], [1, D]), pl.FP32)
             row_begin = norm_block * NORM_ROWS_PER_BLOCK
             row_end = pl.min(row_begin + NORM_ROWS_PER_BLOCK, active_gate_tokens)
@@ -155,7 +157,7 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE, norm_ro
             (active_gate_tokens + T_TILE - 1) // T_TILE,
             name_hint="x_norm_quant",
             deps=[seed_dummy],
-            allow_early_resolve=True,
+            allow_early_resolve=ALLOW_EARLY_RESOLVE,
         ):
             t0 = quant_block * T_TILE
             xn_sq_col = xn_scale_buf[t0 : t0 + T_TILE, 0:1]
@@ -170,8 +172,15 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE, norm_ro
         # columns so the sort ranks pad experts last. Route write-backs are guarded to
         # active tokens, so the inactive-zero can run here rather than post-route.
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route"):
+            if MAPPED:
+                # Empty ranks must not publish the next layer before its hidden input is ready.
+                _epoch_anchor = pl.read(x_mixed, [0, 0])
+                zero_quant = pl.cast(pl.tile.full([1, D], dtype=pl.INT16, value=0), pl.INT8)
             for zt in pl.range(token_rows):
                 if zt >= active_tokens:
+                    if MAPPED:
+                        # With no active rows, quant launches no producer for shared FFN.
+                        pl.tile.store(zero_quant, [zt, 0], x_norm_i8)
                     pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
                     for zk in pl.range(TOPK):
                         pl.write(indices, [zt, zk], pl.cast(0, pl.INT32))
@@ -194,7 +203,7 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE, norm_ro
         # GATE_N_TILE] slice on its own core; token-tile is the dynamic dim, so it
         # stays outermost and // % divide by the compile-time GATE_N_BLOCKS.
         GATE_N_BLOCKS = N_EXPERTS // GATE_N_TILE
-        for gb_idx in pl.spmd(active_gate_tiles * GATE_N_BLOCKS, name_hint="gate", allow_early_resolve=True):
+        for gb_idx in pl.spmd(active_gate_tiles * GATE_N_BLOCKS, name_hint="gate", allow_early_resolve=ALLOW_EARLY_RESOLVE):
             # Weight reads bypass L2.
             pl.set_cache_policy(gate_w, pl.CachePolicy.BYPASS)
             tg = gb_idx // GATE_N_BLOCKS
@@ -226,7 +235,7 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE, norm_ro
         active_route_tiles = (active_tokens + GATE_T_TILE - 1) // GATE_T_TILE
         # Hash layers index via tid2eid[input_ids]; score layers sort+gather.
         if layer_id < N_HASH_LAYERS:
-            for th_idx in pl.spmd(active_route_tiles, name_hint="route_hash", allow_early_resolve=True):
+            for th_idx in pl.spmd(active_route_tiles, name_hint="route_hash", allow_early_resolve=ALLOW_EARLY_RESOLVE):
                 t1 = th_idx * GATE_T_TILE
                 # eids from tid2eid[input_ids]: scalar lookup (dynamic row index) into a
                 # Tensor. tid2eid row load hits the 32B tile floor (TOPK*4=24B), so the
@@ -258,7 +267,7 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE, norm_ro
                             pl.write(indices, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_idx_read, [hs_wt_tt, hs_wt_k]))
                             pl.write(weights, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_weights_pad, [hs_wt_tt, hs_wt_k]))
         else:
-            for ts_idx in pl.spmd(active_route_tiles, name_hint="route_sort", allow_early_resolve=True):
+            for ts_idx in pl.spmd(active_route_tiles, name_hint="route_sort", allow_early_resolve=ALLOW_EARLY_RESOLVE):
                 t1 = ts_idx * GATE_T_TILE
                 # topk_idx_tile stays Tensor (created here, not a pl.full Tile) so
                 # the batched pl.gather below accepts it — Tile-against-Tensor src

@@ -100,9 +100,11 @@ def supply_fixture(case):
     for expert, slot in enumerate(slots):
         expected[3:].flatten()[layer * 4 + expert] = slot
     pattern = torch.arange(FIELD_BYTES + 64).reshape(1, -1) + torch.arange(4).reshape(-1, 1) * 17
-    sources = [(pattern + i * 31).byte() for i in range(6)]
-    descriptors = torch.tensor([[source.data_ptr(), FIELD_BYTES + 64, FIELD_BYTES, SLOT_BYTES]
-                                for source in sources], dtype=torch.int64).repeat(2, 1, 1)
+    sources = [[(pattern + i * 31 + source_layer * 73).byte() for i in range(6)] for source_layer in range(2)]
+    descriptors = torch.tensor([
+        [[source.data_ptr(), FIELD_BYTES + 64, FIELD_BYTES, SLOT_BYTES] for source in fields]
+        for fields in sources
+    ], dtype=torch.int64)
     specs = [
         TensorSpec("counts", (4,), torch.int32, init_value=counts),
         TensorSpec("state", state.shape, torch.int32, init_value=state),
@@ -117,7 +119,7 @@ def supply_fixture(case):
         values["state"].copy_(expected)
         values["slots"].copy_(torch.tensor(slots))
         values["misses"].copy_(torch.tensor(misses))
-        for name, source in zip(FIELDS, sources):
+        for name, source in zip(FIELDS, sources[layer]):
             for expert, slot in enumerate(misses):
                 if slot >= 0:
                     values[name][slot, :FIELD_BYTES].copy_(source[expert, :FIELD_BYTES])

@@ -12,6 +12,8 @@
 import pypto.language as pl
 
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS, EP_WORLD_SIZE, RECV_MAX
+from expert_slots import MAPPED
+from task_policy import ALLOW_EARLY_RESOLVE
 
 
 # model config
@@ -25,6 +27,8 @@ N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
 
 # tiling
 RECV_TILE = 16
+# Padded receive rows and mapped weight slots use different row indices.
+SEPARATE_AUX_ROW = MAPPED or RECV_MAX < RECV_TILE
 K_TILE = 512
 INTER_K_TILE = 512
 MM_INTER_TILE = 256
@@ -37,8 +41,8 @@ D_OUT_ACT_TILE = 512
 W2_INNER = 2
 W2_ACT_INNER = 8
 
-# A partial last tile would read and write the next expert's rows.
-assert RECV_MAX % RECV_TILE == 0, "RECV_MAX must be a whole number of RECV_TILE row-tiles"
+# Only mapped receive lanes may use sub-tile capacity, padded locally before cube reads.
+assert RECV_MAX % RECV_TILE == 0 or (MAPPED and RECV_MAX < RECV_TILE)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -46,20 +50,43 @@ def expert_routed_tile(
     recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.INT8],
     recv_scale_dq: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
     recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
-    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8, pl.NZ],
-    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8, pl.NZ],
-    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8, pl.NZ],
-    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
+    routed_w1: pl.Tensor,
+    routed_w1_scale: pl.Tensor,
+    routed_w3: pl.Tensor,
+    routed_w3_scale: pl.Tensor,
+    routed_w2: pl.Tensor,
+    routed_w2_scale: pl.Tensor,
     recv_y_tile: pl.Tensor[[RECV_TILE, D], pl.BF16],
     local_e: pl.Scalar[pl.INDEX],
     tile_row: pl.Scalar[pl.INDEX],
     valid_rows: pl.Scalar[pl.INDEX],
+    weight_row: pl.Scalar[pl.INDEX],
+    weights_ready: pl.Scalar[pl.TASK_ID] = None,
 ) -> pl.Scalar[pl.TASK_ID]:
     """One RECV_TILE of one local expert: gate/up, SwiGLU, requant, W2, output scaling."""
     recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
     flat_tile_row = local_e * RECV_MAX + tile_row
+    if RECV_MAX < RECV_TILE:
+        x_rows = pl.create_tensor([RECV_TILE, D], dtype=pl.INT8)
+        scales = pl.create_tensor([1, RECV_TILE], dtype=pl.FP32)
+        route_weights = pl.create_tensor([1, RECV_TILE], dtype=pl.FP32)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_pad_recv"):
+            x = pl.load(recv_x_flat, [flat_tile_row, 0], [RECV_TILE, D], valid_shape=[valid_rows, D])
+            scale = pl.load(recv_scale_dq, [local_e, 0], [1, RECV_TILE], valid_shape=[1, valid_rows])
+            weight = pl.load(recv_weights, [local_e, 0], [1, RECV_TILE], valid_shape=[1, valid_rows])
+            pl.store(pl.fillpad(x, pad_value=pl.PadValue.zero), [0, 0], x_rows)
+            pl.store(pl.fillpad(scale, pad_value=pl.PadValue.zero), [0, 0], scales)
+            pl.store(pl.fillpad(weight, pad_value=pl.PadValue.zero), [0, 0], route_weights)
+        x_row = 0
+        aux_row = 0
+        aux_col = 0
+    else:
+        x_rows = recv_x_flat
+        scales = recv_scale_dq
+        route_weights = recv_weights
+        x_row = flat_tile_row
+        aux_row = local_e
+        aux_col = tile_row
     h_tile_i8 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT8)
     h_tile_scale_dq = pl.create_tensor([RECV_TILE, 1], dtype=pl.FP32, manual_dep=True)
 
@@ -67,7 +94,8 @@ def expert_routed_tile(
         gate_tile_i32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT32)
         up_tile_i32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT32)
 
-        with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_mm"):
+        with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_mm",
+                     deps=[weights_ready] if MAPPED else []):
             pl.set_cache_policy(routed_w1, pl.CachePolicy.BYPASS)
             nb_idx = pl.tile.get_block_idx()
             n_base = nb_idx * (MM_GATE_INNER * MM_INTER_TILE)
@@ -75,12 +103,13 @@ def expert_routed_tile(
                 n0 = n_base + ng * MM_INTER_TILE
                 gate_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
                 for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-                    x_k = recv_x_flat[flat_tile_row : flat_tile_row + RECV_TILE, k0 : k0 + K_TILE]
-                    w1_k = routed_w1[local_e : local_e + 1, n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
+                    x_k = x_rows[x_row : x_row + RECV_TILE, k0 : k0 + K_TILE]
+                    w1_k = routed_w1[weight_row : weight_row + 1, n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
                     gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True, init_cond=(k0 == 0))
                 gate_tile_i32[:, n0 : n0 + MM_INTER_TILE] = pl.reshape(gate_acc, [RECV_TILE, MM_INTER_TILE])
 
-        with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_up_mm"):
+        with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_up_mm",
+                     deps=[weights_ready] if MAPPED else []):
             pl.set_cache_policy(routed_w3, pl.CachePolicy.BYPASS)
             ub_idx = pl.tile.get_block_idx()
             u_base = ub_idx * (MM_GATE_INNER * MM_INTER_TILE)
@@ -88,8 +117,8 @@ def expert_routed_tile(
                 u0 = u_base + ug * MM_INTER_TILE
                 up_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
                 for uk0 in pl.pipeline(0, D, K_TILE, stage=2):
-                    x_u = recv_x_flat[flat_tile_row : flat_tile_row + RECV_TILE, uk0 : uk0 + K_TILE]
-                    w3_k = routed_w3[local_e : local_e + 1, u0 : u0 + MM_INTER_TILE, uk0 : uk0 + K_TILE]
+                    x_u = x_rows[x_row : x_row + RECV_TILE, uk0 : uk0 + K_TILE]
+                    w3_k = routed_w3[weight_row : weight_row + 1, u0 : u0 + MM_INTER_TILE, uk0 : uk0 + K_TILE]
                     up_acc = pl.matmul_acc(up_acc, x_u, w3_k, b_trans=True, init_cond=(uk0 == 0))
                 up_tile_i32[:, u0 : u0 + MM_INTER_TILE] = pl.reshape(up_acc, [RECV_TILE, MM_INTER_TILE])
 
@@ -101,10 +130,17 @@ def expert_routed_tile(
                 a0 = a_base + ag * ACT_INTER_TILE
                 gate_2d_i32 = gate_tile_i32[:, a0 : a0 + ACT_INTER_TILE]
                 up_2d_i32 = up_tile_i32[:, a0 : a0 + ACT_INTER_TILE]
-                recv_x_scale_row = recv_scale_dq[local_e : local_e + 1, tile_row : tile_row + RECV_TILE]
+                if SEPARATE_AUX_ROW:
+                    recv_x_scale_row = scales[aux_row : aux_row + 1, aux_col : aux_col + RECV_TILE]
+                else:
+                    recv_x_scale_row = recv_scale_dq[local_e : local_e + 1, tile_row : tile_row + RECV_TILE]
                 recv_x_scale_tile = pl.reshape(recv_x_scale_row, [RECV_TILE, 1])
-                w1_scale_chunk = routed_w1_scale[local_e : local_e + 1, a0 : a0 + ACT_INTER_TILE]
-                w3_scale_chunk = routed_w3_scale[local_e : local_e + 1, a0 : a0 + ACT_INTER_TILE]
+                if MAPPED:
+                    w1_scale_chunk = routed_w1_scale[weight_row : weight_row + 1, a0 : a0 + ACT_INTER_TILE]
+                    w3_scale_chunk = routed_w3_scale[weight_row : weight_row + 1, a0 : a0 + ACT_INTER_TILE]
+                else:
+                    w1_scale_chunk = routed_w1_scale[local_e : local_e + 1, a0 : a0 + ACT_INTER_TILE]
+                    w3_scale_chunk = routed_w3_scale[local_e : local_e + 1, a0 : a0 + ACT_INTER_TILE]
                 gate_2d = pl.cast(gate_2d_i32, target_type=pl.FP32, mode="none")
                 up_2d = pl.cast(up_2d_i32, target_type=pl.FP32, mode="none")
                 gate_2d = pl.col_expand_mul(pl.row_expand_mul(gate_2d, recv_x_scale_tile), w1_scale_chunk)
@@ -136,7 +172,7 @@ def expert_routed_tile(
                 h_tile_i8[:, k1 : k1 + QUANT_TILE] = pl.cast(eh_q_half, target_type=pl.INT8, mode="trunc")
 
     y_i32 = pl.create_tensor([RECV_TILE, D], dtype=pl.INT32)
-    with pl.spmd(D // (W2_INNER * D_OUT_TILE), name_hint="exp_w2_mm", allow_early_resolve=True):
+    with pl.spmd(D // (W2_INNER * D_OUT_TILE), name_hint="exp_w2_mm", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         pl.set_cache_policy(routed_w2, pl.CachePolicy.BYPASS)
         wb_idx = pl.tile.get_block_idx()
         d_base = wb_idx * (W2_INNER * D_OUT_TILE)
@@ -145,20 +181,26 @@ def expert_routed_tile(
             y_acc = pl.create_tensor([1, RECV_TILE, D_OUT_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, MOE_INTER, INTER_K_TILE, stage=2):
                 h_k = h_tile_i8[:, k0 : k0 + INTER_K_TILE]
-                w2_k = routed_w2[local_e : local_e + 1, d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K_TILE]
+                w2_k = routed_w2[weight_row : weight_row + 1, d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K_TILE]
                 y_acc = pl.matmul_acc(y_acc, h_k, w2_k, b_trans=True, init_cond=(k0 == 0))
             y_i32[:, d0 : d0 + D_OUT_TILE] = pl.reshape(y_acc, [RECV_TILE, D_OUT_TILE])
 
-    with pl.spmd(D // (W2_ACT_INNER * D_OUT_ACT_TILE), name_hint="exp_w2_act", allow_early_resolve=True) as w2_act_tid:
+    with pl.spmd(D // (W2_ACT_INNER * D_OUT_ACT_TILE), name_hint="exp_w2_act", allow_early_resolve=ALLOW_EARLY_RESOLVE) as w2_act_tid:
         db_idx = pl.tile.get_block_idx()
         act_d_base = db_idx * (W2_ACT_INNER * D_OUT_ACT_TILE)
-        w_row_blk = recv_weights[local_e : local_e + 1, tile_row : tile_row + RECV_TILE]
+        if SEPARATE_AUX_ROW:
+            w_row_blk = route_weights[aux_row : aux_row + 1, aux_col : aux_col + RECV_TILE]
+        else:
+            w_row_blk = recv_weights[local_e : local_e + 1, tile_row : tile_row + RECV_TILE]
         w_col_blk = pl.reshape(w_row_blk, [RECV_TILE, 1])
         row_scale_blk = pl.mul(h_tile_scale_dq, w_col_blk)
         for dg in pl.pipeline(W2_ACT_INNER, stage=2):
             act_d0 = act_d_base + dg * D_OUT_ACT_TILE
             y_2d_i32 = y_i32[:, act_d0 : act_d0 + D_OUT_ACT_TILE]
-            w2_scale_chunk = routed_w2_scale[local_e : local_e + 1, act_d0 : act_d0 + D_OUT_ACT_TILE]
+            if MAPPED:
+                w2_scale_chunk = routed_w2_scale[weight_row : weight_row + 1, act_d0 : act_d0 + D_OUT_ACT_TILE]
+            else:
+                w2_scale_chunk = routed_w2_scale[local_e : local_e + 1, act_d0 : act_d0 + D_OUT_ACT_TILE]
             y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
             y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, row_scale_blk), w2_scale_chunk)
             recv_y_tile[:, act_d0 : act_d0 + D_OUT_ACT_TILE] = pl.cast(y_2d, target_type=pl.BF16, mode="rint")
@@ -194,6 +236,7 @@ def expert_routed_test(
                     routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
                     recv_y_tile,
                     local_e, tile_row, valid_rows,
+                    weight_row=local_e, weights_ready=None,
                 )
                 recv_y_flat[flat_tile_row : flat_tile_row + RECV_TILE, :] = recv_y_tile
     return recv_y
@@ -365,6 +408,9 @@ if __name__ == "__main__":
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
+
+    if MAPPED:
+        parser.error("expert_routed standalone validation requires resident mode (EXPERT_SLOTS=0)")
 
     result = run(
         fn=expert_routed_test,

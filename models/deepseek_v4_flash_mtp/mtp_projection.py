@@ -19,6 +19,7 @@ from config import (
     PREFILL_BATCH,
     PREFILL_SEQ,
 )
+from task_policy import ALLOW_EARLY_RESOLVE
 
 
 # Dynamic shape variables.
@@ -63,7 +64,7 @@ def _mtp_projection(
     hidden_flat = pl.reshape(hidden_states, [t_dim, D])
     hidden_i8 = pl.create_tensor([t_linear, D], dtype=pl.INT8)
     hidden_scale_dq = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
-    for hidden_idx in pl.spmd(t_dim // T_TILE, name_hint="mtp_hidden_norm_quant", allow_early_resolve=True):
+    for hidden_idx in pl.spmd(t_dim // T_TILE, name_hint="mtp_hidden_norm_quant", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         t0 = hidden_idx * T_TILE
         hidden_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         hidden_amax = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
@@ -108,7 +109,7 @@ def _mtp_projection(
     prev_i8_rows = pl.create_tensor([t_linear_hc, D], dtype=pl.INT8)
     prev_scale_dq = pl.create_tensor([HC_MULT, t_linear], dtype=pl.FP32)
     prev_norm_tasks = (t_dim // T_TILE) * HC_MULT
-    for norm_idx in pl.spmd(prev_norm_tasks, name_hint="mtp_prev_norm_quant", allow_early_resolve=True):
+    for norm_idx in pl.spmd(prev_norm_tasks, name_hint="mtp_prev_norm_quant", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         norm_t_idx = norm_idx // HC_MULT
         hc = norm_idx - norm_t_idx * HC_MULT
         t0 = norm_t_idx * T_TILE

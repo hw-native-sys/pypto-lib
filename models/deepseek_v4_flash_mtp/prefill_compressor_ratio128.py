@@ -19,6 +19,7 @@ from config import (
     PREFILL_CMP_BLOCK_NUM,
     PREFILL_CMP_MAX_BLOCKS,
 )
+from task_policy import ALLOW_EARLY_RESOLVE
 
 
 # Dynamic shape variables.
@@ -116,7 +117,7 @@ def prefill_compressor_ratio128(
     # HCA_C128_RMS_TILE because rmsnorm_rope indexes padded rows beyond MAX_CMP_WRITES (rest stay -1).
     write_pos_map = pl.create_tensor([1, HCA_C128_RMS_TILE], dtype=pl.INT32)
     write_dst_map = pl.create_tensor([1, HCA_C128_RMS_TILE], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_write_map", allow_early_resolve=True):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_write_map", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         write_pos_map[0:1, 0:HCA_C128_RMS_TILE] = pl.full([1, HCA_C128_RMS_TILE], dtype=pl.INT32, value=0)
         write_dst_map[0:1, 0:HCA_C128_RMS_TILE] = pl.full([1, HCA_C128_RMS_TILE], dtype=pl.INT32, value=-1)
         map_seen = pl.cast(0, pl.INDEX)
@@ -129,7 +130,7 @@ def prefill_compressor_ratio128(
                     map_seen = map_seen + 1
 
     # Finish the previous leaf's state reads before scattering raw projections and scores.
-    with pl.spmd(((T) + 8 - 1) // 8, name_hint="prefill_hca_c128_state_scatter_pre", deps=[state_reuse_ready], allow_early_resolve=True) as _state_scatter_tid:
+    with pl.spmd(((T) + 8 - 1) // 8, name_hint="prefill_hca_c128_state_scatter_pre", deps=[state_reuse_ready], allow_early_resolve=ALLOW_EARLY_RESOLVE) as _state_scatter_tid:
         # One block owns 8 rows; the rows are independent.
         scatter_t_blk = pl.tile.get_block_idx()
         for scatter_t_i in pl.range(8):
@@ -146,7 +147,7 @@ def prefill_compressor_ratio128(
                         ape[scatter_ape_slot : scatter_ape_slot + 1, 0:OUT_DIM],
                     )
 
-    with pl.spmd(MAX_CMP_WRITES * (HEAD_DIM // HEAD_TILE), name_hint="prefill_hca_c128_softmax_pool", allow_early_resolve=True) as state_read_done:
+    with pl.spmd(MAX_CMP_WRITES * (HEAD_DIM // HEAD_TILE), name_hint="prefill_hca_c128_softmax_pool", allow_early_resolve=ALLOW_EARLY_RESOLVE) as state_read_done:
         pool_idx = pl.tile.get_block_idx()
         write_i = pool_idx // (HEAD_DIM // HEAD_TILE)
         hb = pool_idx - write_i * (HEAD_DIM // HEAD_TILE)
@@ -245,7 +246,7 @@ def prefill_compressor_ratio128(
         rope_rot = pl.add(pl.mul(rope_normed, cos_il), pl.mul(pl.mul(swapped, rope_sign), sin_il))
         normed_kv_pad[0:HCA_C128_RMS_TILE, NOPE_HEAD_DIM:HEAD_DIM] = rope_rot
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_kv_finalize", allow_early_resolve=True):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_kv_finalize", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         for final_i in pl.range(MAX_CMP_WRITES):
             final_cmp_row_raw = pl.read(write_dst_map, [0, final_i])
             if final_cmp_row_raw >= 0:

@@ -22,6 +22,7 @@ from config import (
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
 )
+from task_policy import ALLOW_EARLY_RESOLVE
 
 
 # MTP's fused Q/KV entry, its HC prelude, and its RMSNorm share one token axis.
@@ -132,7 +133,7 @@ def materialize_rope_rows(
     sin_rows = pl.reshape(rope_sin_t, [t_dim, ROPE_DIM])
     position_view = pl.reshape(position_ids, [1, t_dim])
     rope_work_rows = row_tiles_per_worker * ROPE_ROWS_T_TILE
-    for rope_worker in pl.spmd(pl.max(1, (t_dim + rope_work_rows - 1) // rope_work_rows), name_hint="qkv_rope_rows", allow_early_resolve=True):
+    for rope_worker in pl.spmd(pl.max(1, (t_dim + rope_work_rows - 1) // rope_work_rows), name_hint="qkv_rope_rows", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         for rope_subtile in pl.unroll(row_tiles_per_worker):
             rope_t0 = rope_worker * row_tiles_per_worker + rope_subtile
             t0 = rope_t0 * ROPE_ROWS_T_TILE
@@ -153,6 +154,7 @@ def rope_prepare(
     rope_cos_il: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
     rope_sin_signed: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
     rope_swap_idx: pl.Tensor[[T_DYN, ROPE_DIM], pl.INT32],
+    early_resolve: pl.constexpr = ALLOW_EARLY_RESOLVE,
 ):
     """Build the head-invariant interleaved cos / sign-folded sin / swap-index rope rows."""
     t_dim = pl.tensor.dim(rope_cos, 0)
@@ -167,7 +169,7 @@ def rope_prepare(
     rope_swap_idx_view = pl.reshape(rope_swap_idx, [t_dim, ROPE_DIM])
 
     token_tiles = (t_dim + Q_ROPE_T_TILE - 1) // Q_ROPE_T_TILE
-    for qrp_idx in pl.spmd(token_tiles, name_hint="q_rope_prepare", allow_early_resolve=True):
+    for qrp_idx in pl.spmd(token_tiles, name_hint="q_rope_prepare", allow_early_resolve=early_resolve):
         qrp_t0 = qrp_idx * Q_ROPE_T_TILE
         qrp_valid_rows = pl.min(Q_ROPE_T_TILE, t_dim - qrp_t0)
         qrp_ones = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
@@ -284,7 +286,7 @@ def rope_prepare_prefill(
 
     token_tiles = (t_dim + ROPE_PREP_T_TILE - 1) // ROPE_PREP_T_TILE
     rope_prepare_workers = pl.min(token_tiles, 2)
-    for rope_prepare_worker in pl.spmd(rope_prepare_workers, name_hint="q_rope_prepare", allow_early_resolve=True):
+    for rope_prepare_worker in pl.spmd(rope_prepare_workers, name_hint="q_rope_prepare", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         qrp_ones = pl.full([ROPE_PREP_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
         qrp_idx_i32 = pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32)
         qrp_idx_fp32 = pl.cast(qrp_idx_i32, target_type=pl.FP32)
@@ -429,7 +431,7 @@ def q_proj_rope(
                 for qr_seed_col0 in pl.range(0, qr_seed_elems, PROJ_ZERO_ELEMS_TILE):
                     qr_seed_flat[:, qr_seed_col0 : qr_seed_col0 + PROJ_ZERO_ELEMS_TILE] = qr_seed
 
-            for qbg_idx in pl.spmd((Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul", allow_early_resolve=True):
+            for qbg_idx in pl.spmd((Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul", allow_early_resolve=ALLOW_EARLY_RESOLVE):
                 q_a_col0 = (qbg_idx // QR_OK) * QR_N_TILE
                 qr_k_base = (qbg_idx % QR_OK) * QR_K_SLICE
                 for dense_t0 in pl.range(0, qr_full_rows, QR_DENSE_M_TILE):
@@ -465,7 +467,7 @@ def q_proj_rope(
             # Two passes per block: pass 1 computes amax; pass 2 recomputes norm and quantizes.
             qr_token_tiles = (tile_rows + QR_NORM_T_TILE - 1) // QR_NORM_T_TILE
             qr_norm_workers = (tile_rows + QR_NORM_WORK_T_TILE - 1) // QR_NORM_WORK_T_TILE
-            for qr_norm_worker in pl.spmd(qr_norm_workers, name_hint="qr_rms_norm_quant", allow_early_resolve=True):
+            for qr_norm_worker in pl.spmd(qr_norm_workers, name_hint="qr_rms_norm_quant", allow_early_resolve=ALLOW_EARLY_RESOLVE):
                 for tg_idx in pl.range(qr_norm_worker, qr_token_tiles, qr_norm_workers):
                     tg = tg_idx * QR_NORM_T_TILE
                     valid_rows = pl.min(QR_NORM_T_TILE, tile_rows - tg)
@@ -571,7 +573,7 @@ def q_proj_rope(
             # A bounded worker pool strides over (row tile, head group) items.
             # A stride divisible by the head-group count preserves cache ownership.
             for dq_worker in pl.spmd(
-                Q_DEQUANT_WORKERS, name_hint="qproj_dequant_rms_nope_rope", allow_early_resolve=True
+                Q_DEQUANT_WORKERS, name_hint="qproj_dequant_rms_nope_rope", allow_early_resolve=ALLOW_EARLY_RESOLVE
             ):
                 # Flat pair-swap index into a [1, Q_ROPE_T_TILE * ROPE_DIM] row view: one gather row
                 # instead of a Q_ROPE_T_TILE-iteration row loop.
@@ -976,6 +978,7 @@ def qkv_proj_rope(
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
     late_dep: pl.Scalar[pl.TASK_ID],
+    early_resolve: pl.constexpr = ALLOW_EARLY_RESOLVE,
 ):
     t_dim = pl.tensor.dim(x, 0)
     x_view = pl.reshape(x, [t_dim, D])
@@ -990,7 +993,7 @@ def qkv_proj_rope(
     q_rope_cos_il = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
     q_rope_sin_signed = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
     q_rope_swap_idx = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.INT32)
-    rope_prepare(rope_cos, rope_sin, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx)
+    rope_prepare(rope_cos, rope_sin, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, early_resolve)
 
     # Split-K qr_proj (M=t_dim, K=D=4096, N=Q_LORA=1024). QR_N_TILE=128 gives
     # eight N-groups; QR_OK=2 expands them to 16 cube blocks and atomic-adds the
@@ -1008,7 +1011,7 @@ def qkv_proj_rope(
                 qr_fp32[ts0 : ts0 + QR_M_TILE, nseed0 : nseed0 + QR_N_TILE] = pl.full(
                     [QR_M_TILE, QR_N_TILE], dtype=pl.FP32, value=0.0
                 )
-    for qbg_idx in pl.spmd((Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul", allow_early_resolve=True):
+    for qbg_idx in pl.spmd((Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul", allow_early_resolve=early_resolve):
         # Weight reads bypass L2.
         pl.set_cache_policy(wq_a, pl.CachePolicy.BYPASS)
         q_a_col0 = (qbg_idx // QR_OK) * QR_N_TILE
@@ -1025,7 +1028,7 @@ def qkv_proj_rope(
             qr_fp32 = pl.assemble(qr_fp32, q_acc, [t0, q_a_col0], atomic=pl.AtomicType.Add)
 
     # Two passes per block: pass 1 computes amax; pass 2 recomputes norm and quantizes.
-    for tg_idx in pl.spmd(t_dim // T_TILE, name_hint="qr_rms_norm_quant", allow_early_resolve=True):
+    for tg_idx in pl.spmd(t_dim // T_TILE, name_hint="qr_rms_norm_quant", allow_early_resolve=early_resolve):
         tg = tg_idx * T_TILE
         qr_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         qr_amax_g = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
@@ -1084,7 +1087,7 @@ def qkv_proj_rope(
     # retain it across the RMS reduction instead of rereading/recomputing NOPE.
     # RoPE: out[j] = inv_rms * (x[j] * cos[j] + x[j^1] * sign[j] * sin[j]).
     q_flat = pl.reshape(q, [t_dim, H * HEAD_DIM])
-    with pl.spmd(H // Q_ROPE_H_TILE, name_hint="qproj_dequant_rms_nope_rope", allow_early_resolve=True) as q_rope_tid:
+    with pl.spmd(H // Q_ROPE_H_TILE, name_hint="qproj_dequant_rms_nope_rope", allow_early_resolve=early_resolve) as q_rope_tid:
         hg_idx = pl.tile.get_block_idx()
         hg = hg_idx * Q_ROPE_H_TILE
         for tg_idx in pl.range(t_dim // Q_ROPE_T_TILE):

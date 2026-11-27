@@ -161,6 +161,40 @@ two-rank test, fixtures, and golden.
   runs 16-row-aligned grouped routed experts, and returns them through a
   reverse exchange.
 
+### Expert offload
+
+`config.EXPERT_SLOTS = 0` keeps routed experts resident. Serving sets a positive
+slot count before importing the model to use mapped Host DDR. Both modes use
+the same `prefill_fwd`, `decode_fwd`, routing, and expert arithmetic.
+The current serving offload integration supports A2/A3, EP1/2/4, TP1, and
+ordinary autoregressive inference. Its supported topologies are narrower than
+the resident deployment configuration above. MTP and DSpark remain resident.
+
+The offload ABI appends `expert_state` and `expert_descriptors` to the ordinary
+forward arguments. The six routed weight and scale arguments become mutable
+slot banks shared by prefill and decode. Slots retain the checkpoint's INT8 NZ
+weights and FP32 scales; the bank does not change quantization. A rank-local
+directory and LRU list identify slots by `(layer, local expert)`.
+
+The [common supply implementation](../../../models/common/expert_supply.py)
+protects hits before assigning misses, then copies the six physical fields
+from mapped Host DDR. This model requires at least one complete local expert
+wave of slots per rank and checks that bound when importing the mapped model.
+Serving also checks the configured decode working set. The common cache
+primitives support smaller capacities when their callers bound each wave.
+Empty ranks still participate in dispatch and gather. Layers reuse signal
+windows with increasing epochs; the forward clears the signals on completion.
+Resident specialization removes the offload metadata parameters and copy tasks.
+
+Standalone validation entries retain their resident fixtures. Serving
+supplies the mapped resources for full forwards.
+
+For a separate mapped decode numerical check, run
+`python models/deepseek_v4_flash_mtp/validate_decode_moe_offload.py` from the
+repository root. This manual entry uses the A2/A3 CPU simulator with EP2 and
+shared CPU source weights. It requires no devices and is not part of the
+generic platform CI sweep.
+
 ### Output stage
 
 `hc_head` projects the hyper-connection stack back to one hidden row, the final
@@ -215,6 +249,6 @@ serving-level residency and lowering — with the limit measured at each step.
 | MoE and output | [decode_moe.py](../../../models/deepseek_v4_flash_mtp/decode_moe.py), [prefill_moe.py](../../../models/deepseek_v4_flash_mtp/prefill_moe.py), [gate.py](../../../models/deepseek_v4_flash_mtp/gate.py), [expert_shared.py](../../../models/deepseek_v4_flash_mtp/expert_shared.py), [expert_routed.py](../../../models/deepseek_v4_flash_mtp/expert_routed.py), [lm_head.py](../../../models/deepseek_v4_flash_mtp/lm_head.py) |
 | Metadata and host helpers | [decode_prepare.py](../../../models/deepseek_v4_flash_mtp/decode_prepare.py), [config.py](../../../models/deepseek_v4_flash_mtp/config.py), [utils.py](../../../models/deepseek_v4_flash_mtp/utils.py) |
 
-`config.py`, `utils.py`, `rope_interleave.py`, and `decode_prepare.py` have
+`config.py`, `expert_slots.py`, `task_policy.py`, `utils.py`, `rope_interleave.py`, and `decode_prepare.py` have
 no `__main__` block: they are imported rather than run. Every other file,
 including `decode_fwd_mtp.py`, is an executable composition.

@@ -35,6 +35,7 @@ from rmsnorm import rms_norm
 from rope_interleave import rope_interleave
 from decode_compressor_ratio128 import COMPRESS_STATE_MAX_BLOCKS_DYN, compressor_ratio128
 from decode_sparse_attn_hca import CMP_TABLE_BLOCKS_DYN, sparse_attn_hca
+from task_policy import ALLOW_EARLY_RESOLVE
 
 
 # model config
@@ -126,7 +127,7 @@ def _attention_hca(
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post_t = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
+    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t, ALLOW_EARLY_RESOLVE)
 
     # Interleave-duplicated / sign-folded compressed-position rope rows. The ratio-128
     # compressor's rmsnorm_rope_cache_write rebuilt this j>>1 dup-gather itself; pl.gather
@@ -134,10 +135,10 @@ def _attention_hca(
     # plain load downstream.
     cmp_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
-    rope_interleave(cmp_freqs_cos, cmp_freqs_sin, cmp_cos_il, cmp_sin_signed)
+    rope_interleave(cmp_freqs_cos, cmp_freqs_sin, cmp_cos_il, cmp_sin_signed, ALLOW_EARLY_RESOLVE)
 
     x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
-    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed)
+    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed, ALLOW_EARLY_RESOLVE)
     # Defers kv_proj_matmul one hop behind rms_norm so qr_proj_matmul dispatches first.
     late_dep = pl.system.task_dummy(deps=[rms_tid])
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
@@ -148,6 +149,7 @@ def _attention_hca(
         x_normed, wq_a, wq_b, wq_b_scale, wkv,
         freqs_cos, freqs_sin, gamma_cq, gamma_ckv,
         q, kv, qr, qr_scale, late_dep,
+        ALLOW_EARLY_RESOLVE,
     )
     # SDMA CMO L2 warm of the o-projection weights, issued once q is written.
     wo_a_flat = pl.reshape(wo_a, [O_GROUPS * O_LORA * O_GROUP_IN])

@@ -615,7 +615,7 @@ def l2_decode_fwd_mtp(
         recv_meta, recv_x, recv_aux,
         arrived, data_arrived, routed_y_buf, combine_arrived,
         lm_head_hidden_window, lm_head_hidden_done, lm_head_logits_window, lm_head_logits_done,
-        num_tokens_per_owner, rank,
+        num_tokens_per_owner, 0, 0, rank,
     )
     verify_and_pack_mtp_tokens(
         input_ids, position_ids, sampled_ids,

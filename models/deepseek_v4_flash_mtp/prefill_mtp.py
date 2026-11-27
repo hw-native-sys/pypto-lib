@@ -10,6 +10,8 @@
 # ci: no-sim
 """DeepSeek-V4 MTP prefill: projection, SWA attention, MoE, HC head, RMSNorm, and LM head."""
 
+from task_policy import ALLOW_EARLY_RESOLVE
+
 import argparse
 
 import pypto.language as pl
@@ -240,6 +242,7 @@ def mtp_prefill_fwd(
             scale_target, reverse_target, reverse_signal,
             attention_ready, pl.cast(MTP_LAYER_ID, pl.INT32),
             pl.cast(MTP_MOE_EPOCH, pl.INT32), nt,
+            expert_state=0, expert_descriptors=0,
         )
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_prefill_moe_complete",
@@ -249,7 +252,7 @@ def mtp_prefill_fwd(
     x_head = pl.create_tensor([T, D], dtype=pl.BF16)
     with pl.scope():
         hc_head(pre_hc_hidden_out, mtp_hc_head_fn, mtp_hc_head_scale, mtp_hc_head_base, x_head)
-        rms_norm(x_head, mtp_norm_w, hidden_out)
+        rms_norm(x_head, mtp_norm_w, hidden_out, ALLOW_EARLY_RESOLVE)
     return hidden_out
 
 

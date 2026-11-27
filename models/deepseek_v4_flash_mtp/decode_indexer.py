@@ -27,6 +27,7 @@ from config import (
 from decode_indexer_compressor import COMPRESS_STATE_TABLE_BLOCKS_DYN as INNER_STATE_TABLE_BLOCKS_DYN
 from decode_indexer_compressor import indexer_compressor
 from rope_interleave import rope_interleave
+from task_policy import ALLOW_EARLY_RESOLVE
 
 # Dynamic shape variables.
 INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("INNER_STATE_BLOCK_NUM_DYN")
@@ -138,7 +139,7 @@ def indexer(
     late_dep: pl.Scalar[pl.TASK_ID],
 ):
     qr_acc_pad = pl.create_tensor([T_PAD, IDX_Q_DIM], dtype=pl.INT32)
-    for ot in pl.spmd(IDX_Q_DIM // Q_OUT_TILE, name_hint="idx_qr_proj_matmul", allow_early_resolve=True):
+    for ot in pl.spmd(IDX_Q_DIM // Q_OUT_TILE, name_hint="idx_qr_proj_matmul", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         # Weight reads bypass L2.
         pl.set_cache_policy(wq_b, pl.CachePolicy.BYPASS)
         o_base = ot * Q_OUT_TILE
@@ -152,7 +153,7 @@ def indexer(
             qr_acc_pad[0:T_PAD, o_base + ns : o_base + ns + MM_N_TILE] = qr_acc
 
     qr_proj = pl.create_tensor([T, IDX_Q_DIM], dtype=pl.FP32)
-    for ot in pl.spmd(IDX_Q_DIM // Q_OUT_TILE, name_hint="idx_qr_proj_dequant", allow_early_resolve=True):
+    for ot in pl.spmd(IDX_Q_DIM // Q_OUT_TILE, name_hint="idx_qr_proj_dequant", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         o_base = ot * Q_OUT_TILE
         wq_scale = pl.reshape(wq_b_scale[o_base : o_base + Q_OUT_TILE], [1, Q_OUT_TILE])
         acc_fp32 = pl.cast(qr_acc_pad[0:T, o_base : o_base + Q_OUT_TILE], target_type=pl.FP32, mode="none")
@@ -161,7 +162,7 @@ def indexer(
 
     # j^1 lane-swap gather index, shared by every qr_rope block
     rope_swap_idx_t = pl.create_tensor([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_rope_swap_idx", allow_early_resolve=True):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_rope_swap_idx", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         sw_ones = pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
         sw_j_i32 = pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32)
         sw_col = pl.col_expand_mul(sw_ones, pl.cast(sw_j_i32, target_type=pl.FP32))
@@ -175,7 +176,7 @@ def indexer(
     #   out[j] = x[j]*cos_il[j] + x[j^1]*sin_il_signed[j]
     qr_proj_flat = pl.reshape(qr_proj, [T * IDX_N_HEADS, IDX_HEAD_DIM])
     qr_bf16 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.BF16)
-    for idx in pl.spmd(T * IDX_N_HEADS // ROPE_ROW_TILE, name_hint="qr_rope", allow_early_resolve=True):
+    for idx in pl.spmd(T * IDX_N_HEADS // ROPE_ROW_TILE, name_hint="qr_rope", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         o0 = idx * ROPE_ROW_TILE
         batch_idx = o0 // ROPE_ROW_BLOCK
         rope_swap_idx = rope_swap_idx_t[0:ROPE_ROW_TILE, 0:ROPE_HEAD_DIM]
@@ -191,14 +192,14 @@ def indexer(
 
     # cube-only q @ hadamard into GM; the vector amax/quant runs as its own scope
     qh_acc_gm = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.FP32)
-    for idx in pl.spmd(T * IDX_N_HEADS // QH_MM_TILE, name_hint="qr_hadamard_matmul", allow_early_resolve=True):
+    for idx in pl.spmd(T * IDX_N_HEADS // QH_MM_TILE, name_hint="qr_hadamard_matmul", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         o0 = idx * QH_MM_TILE
         qh_acc = pl.matmul(qr_bf16[o0 : o0 + QH_MM_TILE, :], hadamard, out_dtype=pl.FP32)
         qh_acc_gm[o0 : o0 + QH_MM_TILE, :] = qh_acc
 
     qr_hadamard_i8 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
     qr_hadamard_scale_dq = pl.create_tensor([T, IDX_N_HEADS], dtype=pl.FP32)
-    for idx in pl.spmd(T * IDX_N_HEADS // QH_QUANT_TILE, name_hint="qr_hadamard_quant", allow_early_resolve=True):
+    for idx in pl.spmd(T * IDX_N_HEADS // QH_QUANT_TILE, name_hint="qr_hadamard_quant", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         o0 = idx * QH_QUANT_TILE
         qh_amax = pl.full([1, QH_QUANT_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
         for h0 in pl.range(0, IDX_HEAD_DIM, QH_HEAD_DIM_TILE):
@@ -233,7 +234,7 @@ def indexer(
         weights_partial[kb * MM_ROW_TILE : kb * MM_ROW_TILE + MM_ROW_TILE, :] = weights_acc
 
     weights = pl.create_tensor([T_PAD, IDX_N_HEADS], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="weights_proj_reduce", allow_early_resolve=True):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="weights_proj_reduce", allow_early_resolve=ALLOW_EARLY_RESOLVE):
         w_sum = weights_partial[0:MM_ROW_TILE, :]
         for kb in pl.unroll(1, WEIGHTS_OK):
             w_sum = pl.add(w_sum, weights_partial[kb * MM_ROW_TILE : kb * MM_ROW_TILE + MM_ROW_TILE, :])
@@ -267,7 +268,7 @@ def indexer(
         q_transfer_rows = T * SCORE_TRANSFER_SLOTS * SCORE_AIV_LANES * SCORE_STACK_TILE
         q_acc_transfer = pl.create_tensor([q_transfer_rows, IDX_N_HEADS], dtype=pl.INT32)
         q_ffts_workspace = pl.create_tensor([256], dtype=pl.INT64)
-        with pl.spmd(T, name_hint="score_topk", allow_early_resolve=True):
+        with pl.spmd(T, name_hint="score_topk", allow_early_resolve=ALLOW_EARLY_RESOLVE):
             q_t = pl.tile.get_block_idx()
             pl.system.set_ffts(q_ffts_workspace)
             q_b = q_t // S
@@ -404,7 +405,7 @@ def indexer(
         leaf_transfer_rows = leaf_tasks * SCORE_TRANSFER_SLOTS * SCORE_AIV_LANES * SCORE_STACK_TILE
         leaf_acc_transfer = pl.create_tensor([leaf_transfer_rows, IDX_N_HEADS], dtype=pl.INT32)
         leaf_ffts_workspace = pl.create_tensor([256], dtype=pl.INT64)
-        with pl.spmd(leaf_tasks, name_hint="score_topk_leaf", allow_early_resolve=True) as leaf_tid:
+        with pl.spmd(leaf_tasks, name_hint="score_topk_leaf", allow_early_resolve=ALLOW_EARLY_RESOLVE) as leaf_tid:
             task_item = pl.tile.get_block_idx()
             pl.system.set_ffts(leaf_ffts_workspace)
             leaf_t = task_item // query_tasks
@@ -525,7 +526,7 @@ def indexer(
                             leaf_row = leaf_t * topk_leaves + red_sb // LEAF_STACKS
                             leaf_pairs[leaf_row : leaf_row + 1, 0:TOPK_PAIR_WIDTH] = leaf_merged[:, 0:TOPK_PAIR_WIDTH]
 
-        for merge_t in pl.spmd(T, name_hint="topk_merge", deps=[leaf_tid], allow_early_resolve=True):
+        for merge_t in pl.spmd(T, name_hint="topk_merge", deps=[leaf_tid], allow_early_resolve=ALLOW_EARLY_RESOLVE):
             merge_invalid = pl.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
             topk_idxs[merge_t : merge_t + 1, :] = merge_invalid
             merge_b = merge_t // S

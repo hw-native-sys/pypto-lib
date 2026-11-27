@@ -25,6 +25,7 @@ from config import (
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
 )
+from task_policy import ALLOW_EARLY_RESOLVE
 
 
 # Dynamic shape variables.
@@ -153,7 +154,7 @@ def sparse_attn_swa(
     sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
 
-    with pl.spmd(T, name_hint="qk_pv", deps=[gather_tids[0]], allow_early_resolve=True) as qk_tid:
+    with pl.spmd(T, name_hint="qk_pv", deps=[gather_tids[0]], allow_early_resolve=ALLOW_EARLY_RESOLVE) as qk_tid:
         qk_t = pl.tile.get_block_idx()
         qk_token_base = qk_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
         for qk_sb in pl.unroll(SPARSE_BLOCKS):
@@ -235,7 +236,7 @@ def sparse_attn_swa(
     # submissions. Each block writes two output-projection groups using the
     # same contiguous per-group stores.
     with pl.spmd(T * (H // H_TILE), name_hint="merge_norm", deps=[qk_tid, rope_tid],
-                 allow_early_resolve=True) as merge_tid:
+                 allow_early_resolve=ALLOW_EARLY_RESOLVE) as merge_tid:
         m_idx = pl.tile.get_block_idx()
         m_t = m_idx // (H // H_TILE)
         m_h_idx = m_idx - m_t * (H // H_TILE)
@@ -306,7 +307,7 @@ def sparse_attn_swa(
             out_col_g = g * O_LORA
 
             with pl.spmd(O_LORA // PROJ_A_MM_N_TILE, name_hint="proj_a_mm", deps=[merge_tid],
-                         allow_early_resolve=True) as pa_tid:
+                         allow_early_resolve=ALLOW_EARLY_RESOLVE) as pa_tid:
                 nf = pl.tile.get_block_idx()
                 n0 = nf * PROJ_A_MM_N_TILE
                 acc_a = pl.create_tensor([1, MM_T_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
@@ -319,7 +320,7 @@ def sparse_attn_swa(
                 o_r_pad = pl.assemble(o_r_pad, acc_a, [0, out_col_g + n0])
 
             col_g = g * O_LORA
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="quant", deps=[pa_tid], allow_early_resolve=True) as q_tid:
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="quant", deps=[pa_tid], allow_early_resolve=ALLOW_EARLY_RESOLVE) as q_tid:
                 for qt in pl.pipeline(0, T, QUANT_TOKEN_TILE, stage=2):
                     oc_amax = o_r_pad[qt : qt + QUANT_TOKEN_TILE, col_g : col_g + O_LORA]
                     g_abs = pl.abs(oc_amax)
@@ -343,7 +344,7 @@ def sparse_attn_swa(
                         zero_i8 = pl.cast(zero_half, target_type=pl.INT8, mode="trunc")
                         o_r_i8_pad[T:T_PAD, col_g : col_g + O_LORA] = zero_i8
 
-            with pl.spmd(D // PROJ_B_D_TILE, name_hint="proj_b_mm", deps=[q_tid], allow_early_resolve=True) as pb_tid:
+            with pl.spmd(D // PROJ_B_D_TILE, name_hint="proj_b_mm", deps=[q_tid], allow_early_resolve=ALLOW_EARLY_RESOLVE) as pb_tid:
                 dc = pl.tile.get_block_idx()
                 d0 = dc * PROJ_B_D_TILE
                 for nf in pl.range(PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
@@ -361,7 +362,7 @@ def sparse_attn_swa(
     # the direct per-group task dependencies so there is no synthetic join task
     # between the output-projection cubes and dequantization.
     with pl.spmd((D // PROJ_B_ACT_N_TILE) * (T // PROJ_B_ACT_TASK_T_TILE), name_hint="proj_b_act",
-                 deps=[proj_b_tids[i] for i in range(O_GROUPS)], allow_early_resolve=True) as _act_tid:
+                 deps=[proj_b_tids[i] for i in range(O_GROUPS)], allow_early_resolve=ALLOW_EARLY_RESOLVE) as _act_tid:
         act_idx = pl.tile.get_block_idx()
         nreg = act_idx // (T // PROJ_B_ACT_TASK_T_TILE)
         tblk = act_idx - nreg * (T // PROJ_B_ACT_TASK_T_TILE)

@@ -27,6 +27,7 @@ class DeepSeekV4FlashServingContract:
     max_prefill_tokens_per_request: int
     max_prefill_requests_per_partition: int
     requires_homogeneous_prefill_decode: bool
+    prefill_moe_tokens_per_rank: int = 1024
 
     def __post_init__(self) -> None:
         if self.schema_version != "1":

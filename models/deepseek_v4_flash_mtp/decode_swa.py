@@ -32,6 +32,7 @@ from hc_post import hc_post
 from qkv_proj_rope import qkv_proj_rope
 from rmsnorm import rms_norm
 from decode_sparse_attn_swa import sparse_attn_swa
+from task_policy import ALLOW_EARLY_RESOLVE
 
 
 # model config
@@ -103,10 +104,10 @@ def _attention_swa(
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post_t = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
+    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t, ALLOW_EARLY_RESOLVE)
 
     x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
-    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
+    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t, ALLOW_EARLY_RESOLVE)
     # Defers kv_proj_matmul one hop behind rms_norm so qr_proj_matmul dispatches first.
     late_dep = pl.system.task_dummy(deps=[rms_tid])
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
@@ -117,6 +118,7 @@ def _attention_swa(
         x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
         freqs_cos, freqs_sin, gamma_cq, gamma_ckv,
         q, kv, qr, qr_scale, late_dep,
+        ALLOW_EARLY_RESOLVE,
     )
     # SDMA CMO L2 warm of the o-projection weights, issued once q is written.
     wo_a_flat = pl.reshape(wo_a, [O_GROUPS * O_LORA * O_GROUP_IN])
