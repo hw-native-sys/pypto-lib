@@ -46,13 +46,13 @@ import decode_metadata as state_ops
 from decode_fwd import decode_fwd
 from hc import hc_head_norm, hc_head_norm_store
 from lm_head import VOCAB, lm_head
-from sample import dspark_rejection_sample, sample
+from sample import dspark_rejection_sample
 import lm_head as head
 from dspark_drafter import dspark_drafter
-from markov import markov_propose, markov_sample
+from markov import markov_propose
 from input_pack import VOCAB_DYN
 from decode_metadata import (
-    WINDOW_TABLE_DYN, REJECTION_STATE_META_WIDTH, STATE_META_COLUMNS,
+    WINDOW_TABLE_DYN, REJECTION_STATE_META_WIDTH,
     decode_prepare, decode_accept, decode_publish, commit_drafts,
     prepare_rejection_proposals, store_proposal_probs,
 )
@@ -69,7 +69,6 @@ WINDOW = FLASH.sliding_window
 
 
 STATE_OPS_STATE_TOKEN_WIDTH = state_ops.STATE_TOKEN_WIDTH
-STATE_OPS_STATE_META_WIDTH = state_ops.STATE_META_WIDTH
 STATE_OPS_ROWS = state_ops.ROWS
 TARGET_FWD_T_DYN = target_fwd.T_DYN
 TARGET_FWD_ENGRAM_K = target_fwd.ENGRAM_K
@@ -164,7 +163,7 @@ def l2_decode_fwd_dspark(
     slot_ids: pl.Tensor[[DECODE_BATCH], pl.INT32],
     generations: pl.Tensor[[DECODE_BATCH], pl.INT32],
     state_tokens: pl.InOut[pl.Tensor[[DECODE_BATCH, STATE_OPS_STATE_TOKEN_WIDTH], pl.INT64]],
-    state_meta: pl.InOut[pl.Tensor[[DECODE_BATCH, STATE_META_COLUMNS], pl.INT32]],
+    state_meta: pl.InOut[pl.Tensor[[DECODE_BATCH, REJECTION_STATE_META_WIDTH], pl.INT32]],
     active_widths: pl.Out[pl.Tensor[[DECODE_BATCH], pl.INT32]],
     target_embedding_weight: pl.Tensor[[VOCAB_DYN, D], pl.BF16],
     target_window_table: pl.Tensor[[DECODE_BATCH, WINDOW_TABLE_DYN], pl.INT32],
@@ -338,7 +337,6 @@ def l2_decode_fwd_dspark(
     local_c1a_slots = pl.create_tensor([PADDED_ROWS], dtype=pl.INT64)
     local_query_starts = pl.create_tensor([DECODE_BATCH + 1], dtype=pl.INT32)
     local_target_hidden_padded = pl.create_tensor([PADDED_ROWS, TARGET_FWD_DSPARK_MAIN_IN], dtype=pl.BF16)
-    state_meta.bind_dynamic(1, STATE_META_COLUMNS)
     target_embedding_weight.bind_dynamic(0, VOCAB_DYN)
     target_window_table.bind_dynamic(1, WINDOW_TABLE_DYN)
     target_c2a_table.bind_dynamic(1, FWD_C2A_TABLE_DYN)
@@ -417,19 +415,12 @@ def l2_decode_fwd_dspark(
         sampling_hidden_window, sampling_hidden_done, sampling_logits_window, sampling_logits_done,
         rank, PADDED_ROWS,
     )
-    use_rejection = pl.tensor.dim(state_meta, 1) == REJECTION_STATE_META_WIDTH
-    if use_rejection:
-        proposals = pl.create_tensor([TARGET_ROWS, TARGET_FWD_SAMPLED_IDS_PAD], dtype=pl.INT32)
-        prepare_rejection_proposals(slot_ids, generations, active_widths, state_tokens, state_meta, proposals)
-        dspark_rejection_sample(
-            sample_logits[:live_rows, :], proposals, state_meta, sampling_temperatures, sampling_top_ks, sampling_top_ps,
-            sampling_seeds, sampling_positions, target_sampled_ids,
-        )
-    else:
-        sample(
-            sample_logits[:live_rows, :], sampling_temperatures, sampling_top_ks, sampling_top_ps,
-            sampling_seeds, sampling_positions, target_sampled_ids,
-        )
+    proposals = pl.create_tensor([TARGET_ROWS, TARGET_FWD_SAMPLED_IDS_PAD], dtype=pl.INT32)
+    prepare_rejection_proposals(slot_ids, generations, active_widths, state_tokens, state_meta, proposals)
+    dspark_rejection_sample(
+        sample_logits[:live_rows, :], proposals, state_meta, sampling_temperatures, sampling_top_ks, sampling_top_ps,
+        sampling_seeds, sampling_positions, target_sampled_ids,
+    )
     markov_row_indices = pl.create_tensor([MARKOV_MAX_LOGIT_ROWS], dtype=pl.INT32)
     target_hidden = decode_accept(
         slot_ids, generations, active_widths, target_sampled_ids,
@@ -474,27 +465,17 @@ def l2_decode_fwd_dspark(
         rank, MARKOV_MAX_LOGIT_ROWS,
     )
     markov_base_logits = pl.reshape(markov_logits[:markov_rows, :], [markov_batch, MARKOV_DSPARK_QUERY_WIDTH, MARKOV_VOCAB])
-    if use_rejection:
-        proposal_probs = pl.create_tensor([markov_batch, MARKOV_DSPARK_QUERY_WIDTH * VOCAB], dtype=pl.FP32)
-        markov_propose(
-            markov_base_logits, draft_head_hidden, anchor_ids, markov_markov_w1, markov_markov_w2,
-            markov_confidence_weight, sampling_temperatures, sampling_top_ks, sampling_top_ps,
-            sampling_seeds, first_query_positions, draft_ids, confidences, proposal_probs,
-        )
-        store_proposal_probs(slot_ids, generations, state_meta, proposal_probs)
-        commit_drafts(
-            slot_ids, generations, draft_ids, state_tokens, state_meta,
-            committed, True,
-        )
-    else:
-        markov_sample(
-            markov_base_logits, draft_head_hidden, anchor_ids, markov_markov_w1, markov_markov_w2,
-            markov_confidence_weight, draft_ids, confidences,
-        )
-        commit_drafts(
-            slot_ids, generations, draft_ids, state_tokens, state_meta,
-            committed, False,
-        )
+    proposal_probs = pl.create_tensor([markov_batch, MARKOV_DSPARK_QUERY_WIDTH * VOCAB], dtype=pl.FP32)
+    markov_propose(
+        markov_base_logits, draft_head_hidden, anchor_ids, markov_markov_w1, markov_markov_w2,
+        markov_confidence_weight, sampling_temperatures, sampling_top_ks, sampling_top_ps,
+        sampling_seeds, first_query_positions, draft_ids, confidences, proposal_probs,
+    )
+    store_proposal_probs(slot_ids, generations, state_meta, proposal_probs)
+    commit_drafts(
+        slot_ids, generations, draft_ids, state_tokens, state_meta,
+        committed,
+    )
 
     if LM_HEAD_TP_SIZE > 1:
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="all_signal_clear", allow_early_resolve=False):
@@ -514,7 +495,7 @@ def l3_decode_fwd_dspark(
     slot_ids: pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32],
     generations: pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32],
     state_tokens: pl.InOut[pl.Tensor[[EP_SIZE, DECODE_BATCH, STATE_OPS_STATE_TOKEN_WIDTH], pl.INT64]],
-    state_meta: pl.InOut[pl.Tensor[[EP_SIZE, DECODE_BATCH, STATE_META_COLUMNS], pl.INT32]],
+    state_meta: pl.InOut[pl.Tensor[[EP_SIZE, DECODE_BATCH, REJECTION_STATE_META_WIDTH], pl.INT32]],
     active_widths: pl.Out[pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32]],
     target_embedding_weight: pl.Tensor[[EP_SIZE, VOCAB_DYN, D], pl.BF16],
     target_window_table: pl.Tensor[[EP_SIZE, DECODE_BATCH, WINDOW_TABLE_DYN], pl.INT32],
@@ -666,7 +647,6 @@ def l3_decode_fwd_dspark(
     committed: pl.Out[pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32]],
 ):
     """Run one complete recurrent DSpark L2 per rank."""
-    state_meta.bind_dynamic(2, STATE_META_COLUMNS)
     target_embedding_weight.bind_dynamic(1, VOCAB_DYN)
     target_window_table.bind_dynamic(2, WINDOW_TABLE_DYN)
     target_c2a_table.bind_dynamic(2, FWD_C2A_TABLE_DYN)
@@ -777,7 +757,7 @@ def l3_decode_fwd_dspark(
         )
 
 
-def build_tensor_specs(active_requests=1, *, rejection_sampling=False):
+def build_tensor_specs(active_requests=1):
     """Build a bounded single-dispatch DSpark decode fixture."""
     import inspect
     import torch
@@ -789,7 +769,6 @@ def build_tensor_specs(active_requests=1, *, rejection_sampling=False):
     limit = 64
     extents = {
         VOCAB_DYN.name: 32,
-        STATE_META_COLUMNS.name: REJECTION_STATE_META_WIDTH if rejection_sampling else STATE_OPS_STATE_META_WIDTH,
         WINDOW_TABLE_DYN.name: 1,
         state_ops.TABLE_DYN.name: 1,
         DRAFT_ORI_BLOCKS_DYN.name: DECODE_BATCH,
@@ -866,11 +845,9 @@ def build_tensor_specs(active_requests=1, *, rejection_sampling=False):
     meta[..., state_ops.STATE_DRAFT_COUNT] = ROWS - 1
     meta[..., state_ops.STATE_LIMIT] = limit
     specs["state_tokens"].init_value[:, :active_requests, 1] = 1
-    if rejection_sampling:
-        meta[..., state_ops.STATE_PROPOSAL_VALID] = 1
-        for offset in range(ROWS - 1):
-            start = state_ops.STATE_PROPOSAL_START + offset * VOCAB
-            meta[..., start + int(offset == 0)] = torch.tensor(1.0).view(torch.int32)
+    for offset in range(ROWS - 1):
+        start = state_ops.STATE_PROPOSAL_START + offset * VOCAB
+        meta[..., start + int(offset == 0)] = torch.tensor(1.0).view(torch.int32)
 
     arguments = dict(specs)
     for name, value in scalars.items():
@@ -899,7 +876,6 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=range(5))
-    parser.add_argument("--rejection-sampling", action="store_true")
     args = parser.parse_args()
     if not 1 <= args.active_requests <= DECODE_BATCH:
         parser.error(f"--active-requests must be between 1 and {DECODE_BATCH}")
@@ -920,7 +896,7 @@ if __name__ == "__main__":
         distributed_config=DistributedConfig(device_ids=list(devices), num_sub_workers=0),
         ring_heap=(2 * 1024**3, 2 * 1024**3, 1024**3, 512 * 1024**2), ring_dep_pool=131072,
     )
-    specs = build_tensor_specs(args.active_requests, rejection_sampling=args.rejection_sampling)
+    specs = build_tensor_specs(args.active_requests)
     with ExitStack() as sources:
         result = run(
             a5_default_runtime="host_build_graph",
