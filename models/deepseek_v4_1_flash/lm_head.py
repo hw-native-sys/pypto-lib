@@ -501,23 +501,24 @@ def lm_head_project(
     hidden_states: pl.Tensor,
     lm_head_weight: pl.Tensor[[D, VOCAB], pl.BF16, pl.NZ],
     logits: pl.Tensor,
+    row_tile: pl.constexpr = LM_HEAD_M_TILE,
 ):
     """Project vocabulary logits with BF16 rounding and FP32 output."""
     rows = pl.tensor.dim(logits, 0)
     hidden_rows = pl.tensor.dim(hidden_states, 0)
-    blocks = (rows + LM_HEAD_M_TILE - 1) // LM_HEAD_M_TILE * (VOCAB // LM_HEAD_N_TILE)
+    blocks = (rows + row_tile - 1) // row_tile * (VOCAB // LM_HEAD_N_TILE)
     with pl.spmd(32, name_hint="lm_head_matmul", optimizations=[pl.cross_core_slot(slot_num=1)]):
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, blocks, 32):
-            row = block // (VOCAB // LM_HEAD_N_TILE) * LM_HEAD_M_TILE
+            row = block // (VOCAB // LM_HEAD_N_TILE) * row_tile
             column = block % (VOCAB // LM_HEAD_N_TILE) * LM_HEAD_N_TILE
-            output_rows = pl.min(LM_HEAD_M_TILE, rows - row)
-            source_rows = pl.max(pl.min(LM_HEAD_M_TILE, hidden_rows - row), 0)
-            acc = pl.tile.create([LM_HEAD_M_TILE, LM_HEAD_N_TILE], dtype=pl.FP32)
+            output_rows = pl.min(row_tile, rows - row)
+            source_rows = pl.max(pl.min(row_tile, hidden_rows - row), 0)
+            acc = pl.tile.create([row_tile, LM_HEAD_N_TILE], dtype=pl.FP32)
             for k in pl.pipeline(0, D, LM_HEAD_K_TILE, stage=2):
-                a = pl.load(hidden_states, [row, k], [LM_HEAD_M_TILE, LM_HEAD_K_TILE], valid_shape=[source_rows, LM_HEAD_K_TILE])
+                a = pl.load(hidden_states, [row, k], [row_tile, LM_HEAD_K_TILE], valid_shape=[source_rows, LM_HEAD_K_TILE])
                 a = pl.fillpad(a, pad_value=pl.PadValue.zero)
-                a = pl.set_validshape(a, LM_HEAD_M_TILE, LM_HEAD_K_TILE)
+                a = pl.set_validshape(a, row_tile, LM_HEAD_K_TILE)
                 w = pl.load(lm_head_weight, [k, column], [LM_HEAD_K_TILE, LM_HEAD_N_TILE], target_memory=pl.MemorySpace.Mat, cache=pl.CachePolicy.NOT_ALLOC_KEEP)
                 acc = pl.matmul_acc(acc, a, w, init_cond=(k == 0))
             rounded = pl.cast(acc, pl.BF16, mode="rint")
@@ -555,7 +556,7 @@ def lm_head(
                 selected = hidden_states[source:source + 1, :]
             selected_hidden[row:row + 1, :] = selected
     if LM_HEAD_TP_SIZE == 1:
-        lm_head_project(selected_hidden, lm_head_weight, logits)
+        lm_head_project(selected_hidden, lm_head_weight, logits, row_tile=16 if num_rows <= 16 else LM_HEAD_M_TILE)
     else:
         pl.static_assert(num_rows % HIDDEN_OWNER_ROW_TILE == 0, "LM-head owner rows must fill complete interleaved stripes")
         row_tiles = selected_rows // HIDDEN_OWNER_ROW_TILE
