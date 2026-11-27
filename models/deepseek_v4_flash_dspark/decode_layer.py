@@ -129,6 +129,9 @@ CSA_IDX_MAX_BLOCKS = csa.IDX_MAX_BLOCKS
 N_RANKS = moe_module.N_RANKS
 N_EXPERTS_GLOBAL = moe_module.N_EXPERTS_GLOBAL
 N_LOCAL = moe_module.N_LOCAL
+META_SLOTS = moe_module.META_SLOTS
+EPLB_BANK_ROWS = moe_module.EPLB_BANK_ROWS
+EPLB_LAYERS = moe_module.EPLB_LAYERS
 MOE_INTER = moe_module.MOE_INTER
 VOCAB = moe_module.VOCAB
 TOPK = moe_module.TOPK
@@ -488,7 +491,7 @@ def decode_layer_swa(
     attention_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     o_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.BF16],
     o_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_meta: pld.DistributedTensor[[N_RANKS, META_SLOTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
@@ -544,6 +547,11 @@ def decode_layer_swa(
             else:
                 x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
 
+        eplb_mapping_ph = pl.create_tensor([EPLB_BANK_ROWS, N_RANKS], dtype=pl.INT32)
+        eplb_replicas_ph = pl.create_tensor([EPLB_BANK_ROWS], dtype=pl.INT32)
+        eplb_source_rows_ph = pl.create_tensor([MOE_TOKENS], dtype=pl.INT32)
+        eplb_load_ph = pl.create_tensor([EPLB_LAYERS, META_SLOTS], dtype=pl.INT32)
+        eplb_control_ph = pl.create_tensor([2], dtype=pl.INT32)
         moe(
             x_attn_moe,
             hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
@@ -555,6 +563,7 @@ def decode_layer_swa(
             x_moe_next,
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
+            eplb_mapping_ph, eplb_replicas_ph, eplb_source_rows_ph, eplb_load_ph, eplb_control_ph,
             layer_id, owner_tokens, my_rank, moe_epoch,
             pl.const(-1, pl.INT32),
         )
@@ -622,7 +631,7 @@ def decode_layer_swa_test(
     attention_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     o_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.BF16],
     o_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_meta: pld.DistributedTensor[[N_RANKS, META_SLOTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
@@ -752,7 +761,7 @@ def l3_decode_layer_swa(
     o_window_buf = pld.alloc_window_buffer([O_WINDOW_ROWS, D], dtype=pl.BF16)
     o_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
 
-    recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
+    recv_meta_buf = pld.alloc_window_buffer([N_RANKS, META_SLOTS], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
     recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
     recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
@@ -768,7 +777,7 @@ def l3_decode_layer_swa(
         attention_signal = pld.window(attention_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
         o_window = pld.window(o_window_buf, [O_WINDOW_ROWS, D], dtype=pl.BF16)
         o_signal = pld.window(o_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
+        recv_meta = pld.window(recv_meta_buf, [N_RANKS, META_SLOTS], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
         recv_aux = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
         recv_route = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
@@ -875,7 +884,7 @@ def decode_layer_hca(
     attention_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     o_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.BF16],
     o_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_meta: pld.DistributedTensor[[N_RANKS, META_SLOTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
@@ -940,6 +949,11 @@ def decode_layer_hca(
             else:
                 x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
 
+        eplb_mapping_ph = pl.create_tensor([EPLB_BANK_ROWS, N_RANKS], dtype=pl.INT32)
+        eplb_replicas_ph = pl.create_tensor([EPLB_BANK_ROWS], dtype=pl.INT32)
+        eplb_source_rows_ph = pl.create_tensor([MOE_TOKENS], dtype=pl.INT32)
+        eplb_load_ph = pl.create_tensor([EPLB_LAYERS, META_SLOTS], dtype=pl.INT32)
+        eplb_control_ph = pl.create_tensor([2], dtype=pl.INT32)
         moe(
             x_attn_moe,
             hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
@@ -951,6 +965,7 @@ def decode_layer_hca(
             x_moe_next,
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
+            eplb_mapping_ph, eplb_replicas_ph, eplb_source_rows_ph, eplb_load_ph, eplb_control_ph,
             layer_id, owner_tokens, my_rank, moe_epoch,
             pl.const(-1, pl.INT32),
         )
@@ -1032,7 +1047,7 @@ def decode_layer_hca_test(
     attention_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     o_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.BF16],
     o_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_meta: pld.DistributedTensor[[N_RANKS, META_SLOTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
@@ -1203,7 +1218,7 @@ def l3_decode_layer_hca(
     o_window_buf = pld.alloc_window_buffer([O_WINDOW_ROWS, D], dtype=pl.BF16)
     o_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
 
-    recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
+    recv_meta_buf = pld.alloc_window_buffer([N_RANKS, META_SLOTS], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
     recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
     recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
@@ -1219,7 +1234,7 @@ def l3_decode_layer_hca(
         attention_signal = pld.window(attention_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
         o_window = pld.window(o_window_buf, [O_WINDOW_ROWS, D], dtype=pl.BF16)
         o_signal = pld.window(o_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
+        recv_meta = pld.window(recv_meta_buf, [N_RANKS, META_SLOTS], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
         recv_aux = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
         recv_route = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
@@ -1347,7 +1362,7 @@ def decode_layer_csa(
     attention_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     o_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.BF16],
     o_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_meta: pld.DistributedTensor[[N_RANKS, META_SLOTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
@@ -1422,6 +1437,11 @@ def decode_layer_csa(
             else:
                 x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
 
+        eplb_mapping_ph = pl.create_tensor([EPLB_BANK_ROWS, N_RANKS], dtype=pl.INT32)
+        eplb_replicas_ph = pl.create_tensor([EPLB_BANK_ROWS], dtype=pl.INT32)
+        eplb_source_rows_ph = pl.create_tensor([MOE_TOKENS], dtype=pl.INT32)
+        eplb_load_ph = pl.create_tensor([EPLB_LAYERS, META_SLOTS], dtype=pl.INT32)
+        eplb_control_ph = pl.create_tensor([2], dtype=pl.INT32)
         moe(
             x_attn_moe,
             hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
@@ -1433,6 +1453,7 @@ def decode_layer_csa(
             x_moe_next,
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
+            eplb_mapping_ph, eplb_replicas_ph, eplb_source_rows_ph, eplb_load_ph, eplb_control_ph,
             layer_id, owner_tokens, my_rank, moe_epoch,
             pl.const(-1, pl.INT32),
         )
@@ -1529,7 +1550,7 @@ def decode_layer_csa_test(
     attention_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     o_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.BF16],
     o_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_meta: pld.DistributedTensor[[N_RANKS, META_SLOTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
@@ -1731,7 +1752,7 @@ def l3_decode_layer_csa(
     attention_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     o_window_buf = pld.alloc_window_buffer([O_WINDOW_ROWS, D], dtype=pl.BF16)
     o_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-    recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
+    recv_meta_buf = pld.alloc_window_buffer([N_RANKS, META_SLOTS], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
     recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
     recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
@@ -1747,7 +1768,7 @@ def l3_decode_layer_csa(
         attention_signal = pld.window(attention_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
         o_window = pld.window(o_window_buf, [O_WINDOW_ROWS, D], dtype=pl.BF16)
         o_signal = pld.window(o_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
+        recv_meta = pld.window(recv_meta_buf, [N_RANKS, META_SLOTS], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
         recv_aux = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
         recv_route = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
@@ -1976,7 +1997,11 @@ def build_swa_layer_specs(start_pos=None, layer_id=0, num_tokens_per_owner=None)
     ):
         if not isinstance(spec, TensorSpec):
             continue
-        if spec.name in {"x_hc", "x_next"} or spec.name in existing:
+        # Layer hosts build EPLB placeholders themselves; the MoE entry's EPLB
+        # fixture specs belong to the standalone MoE validation.
+        if spec.name in {"x_hc", "x_next", "eplb_mapping", "eplb_replicas", "eplb_load", "eplb_control"}:
+            continue
+        if spec.name in existing:
             continue
         specs.append(spec)
         existing.add(spec.name)
@@ -2100,7 +2125,11 @@ def build_hca_layer_specs(start_pos=None, layer_id=3, num_tokens_per_owner=None)
     ):
         if not isinstance(spec, TensorSpec):
             continue
-        if spec.name in {"x_hc", "x_next"} or spec.name in existing:
+        # Layer hosts build EPLB placeholders themselves; the MoE entry's EPLB
+        # fixture specs belong to the standalone MoE validation.
+        if spec.name in {"x_hc", "x_next", "eplb_mapping", "eplb_replicas", "eplb_load", "eplb_control"}:
+            continue
+        if spec.name in existing:
             continue
         specs.append(spec)
         existing.add(spec.name)
@@ -2224,7 +2253,11 @@ def build_csa_layer_specs(start_pos=None, layer_id=2, num_tokens_per_owner=None)
     ):
         if not isinstance(spec, TensorSpec):
             continue
-        if spec.name in {"x_hc", "x_next"} or spec.name in existing:
+        # Layer hosts build EPLB placeholders themselves; the MoE entry's EPLB
+        # fixture specs belong to the standalone MoE validation.
+        if spec.name in {"x_hc", "x_next", "eplb_mapping", "eplb_replicas", "eplb_load", "eplb_control"}:
+            continue
+        if spec.name in existing:
             continue
         specs.append(spec)
         existing.add(spec.name)

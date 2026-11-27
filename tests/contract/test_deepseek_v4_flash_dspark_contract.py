@@ -389,3 +389,54 @@ def test_prefill_csa_state_handoff_matches_decode_ring_across_wraps() -> None:
 
         assert torch.equal(decode_rows, prefill_rows)
         assert all(torch.unique(rank_rows).numel() == storage_len for rank_rows in decode_rows)
+
+
+# The DSL cannot factor a HOST orchestrator body into a shared helper:
+# ``pld.alloc_window_buffer`` is rejected outside a HOST orchestration context
+# and a cross-function window helper loses its tensor metadata. The legacy and
+# EPLB entries therefore repeat one source twice, and this test freezes the
+# invariant that they stay one program: the EPLB entry is the legacy entry plus
+# exactly the four EPLB tensors, wired into the same rank submission.
+EPLB_HOST_PAIRS = (
+    ("decode_fwd.py", "l3_decode_fwd", "l3_decode_fwd_eplb"),
+    ("prefill_fwd.py", "l3_prefill_fwd", "l3_prefill_fwd_eplb"),
+    ("decode_fwd_dspark.py", "l3_decode_fwd_dspark", "l3_decode_fwd_dspark_eplb"),
+)
+EPLB_PARAMETERS = ("eplb_mapping", "eplb_replicas", "eplb_load", "eplb_control")
+
+
+class _RenameEplbPlaceholder(ast.NodeTransformer):
+    def visit_Subscript(self, node):
+        self.generic_visit(node)
+        if (isinstance(node.value, ast.Name) and node.value.id in EPLB_PARAMETERS
+                and isinstance(node.slice, ast.Name)):
+            return ast.copy_location(ast.Name(id=node.value.id + "_ph", ctx=ast.Load()), node)
+        return node
+
+
+def _normalized_host_body(host, *, eplb_entry):
+    """Reduce an entry body to the shared program: no docstring, no EPLB wiring."""
+    body = [stmt for stmt in host.body
+            if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant))]
+    if eplb_entry:
+        body = [_RenameEplbPlaceholder().visit(stmt) for stmt in body]
+    else:
+        placeholders = tuple(name + "_ph" for name in EPLB_PARAMETERS)
+        body = [stmt for stmt in body
+                if not (isinstance(stmt, ast.Assign) and isinstance(stmt.targets[0], ast.Name)
+                        and stmt.targets[0].id in placeholders)]
+    return ast.dump(ast.Module(body=body, type_ignores=[]), include_attributes=False)
+
+
+@pytest.mark.parametrize("filename,legacy,eplb", EPLB_HOST_PAIRS)
+def test_eplb_host_entry_is_the_legacy_entry_plus_the_eplb_abi(filename, legacy, eplb):
+    tree = ast.parse((MODEL_DIR / filename).read_text())
+    hosts = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    legacy_host, eplb_host = hosts[legacy], hosts[eplb]
+    legacy_names = [arg.arg for arg in legacy_host.args.args]
+    eplb_names = [arg.arg for arg in eplb_host.args.args]
+    extra = [name for name in eplb_names if name not in legacy_names]
+    assert set(extra) == set(EPLB_PARAMETERS)
+    assert [name for name in eplb_names if name not in extra] == legacy_names
+    assert _normalized_host_body(legacy_host, eplb_entry=False) == _normalized_host_body(
+        eplb_host, eplb_entry=True)
