@@ -51,10 +51,12 @@ def _checkpoint_codes(
     floor_int = pl.cast(pl.minimum(estimate, 127.0), pl.INT32, mode="floor")
     lower = pl.cast(floor_int, pl.FP32)
     midpoint = pl.row_expand_mul(pl.add(lower, 0.5), denominator)
-    upper = pl.add(lower, 1.0)
-    nearest = pl.tile.select(pl.tile.cmp(scaled_magnitude, midpoint, cmp_type=4), upper, lower)
-    odd = pl.cast(pl.ands(pl.cast(lower, pl.INT16), 1), pl.FP32)
-    nearest = pl.tile.select(pl.tile.cmp(scaled_magnitude, midpoint, cmp_type=0), pl.add(lower, odd), nearest)
+    # Nonnegative FP32 bit patterns are ordered. For an odd floor, include
+    # equality at the midpoint so that an exact tie rounds to the even code.
+    distance = pl.sub(pl.reinterpret_view(midpoint, pl.INT32), pl.reinterpret_view(scaled_magnitude, pl.INT32))
+    odd = pl.sub(floor_int, pl.shls(pl.shrs(floor_int, 1), 1))
+    round_up = pl.shrs(pl.sub(distance, odd), 31)
+    nearest = pl.cast(pl.sub(floor_int, round_up), pl.FP32)
     signed = pl.tile.select(pl.tile.cmps(value, 0.0, cmp_type=2), pl.neg(nearest), nearest)
     encoded = pl.cast(signed, pl.INT8, mode="rint")
     return encoded

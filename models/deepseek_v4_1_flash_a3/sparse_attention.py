@@ -1485,7 +1485,7 @@ def _decode_window_fp8(payload: pl.Tile[[GATHER_KEY_TILE, HEAD_DIM], pl.UINT8]):
     normal = pl.reinterpret_view(normal_bits, pl.FP16)
     magnitude_half = pl.cast(magnitude, pl.FP16)
     subnormal = pl.mul(magnitude_half, 0.001953125)
-    is_subnormal = pl.tile.cmps(magnitude_half, 8.0, cmp_type=2)
+    is_subnormal = pl.tile.cmps(magnitude_half, pl.const(8.0, pl.FP16), cmp_type=2)
     select_tmp = pl.create_tile([1, 16], dtype=pl.UINT32)
     absolute = pl.tile.sel(is_subnormal, subnormal, normal, select_tmp)
     sign_bit = pl.shls(pl.ands(code, 128), 8)

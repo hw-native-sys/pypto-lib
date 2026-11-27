@@ -194,7 +194,7 @@ def fp4_bf16_bits(code: pl.Tile[[CODE_ROWS_DYN, CODE_COLS_DYN], pl.INT16]):
     magnitude = pl.ands(code, 7)
     normal = pl.add(pl.shls(magnitude, 6), 0x3F00)
     small = pl.mul(pl.ands(magnitude, 1), 0x3F00)
-    is_small = pl.tile.cmps(pl.cast(magnitude, pl.FP16), 2.0, cmp_type=2)
+    is_small = pl.tile.cmps(pl.cast(magnitude, pl.FP16), pl.const(2.0, pl.FP16), cmp_type=2)
     bits = pl.tile.select(is_small, small, normal)
     return pl.or_(bits, pl.shls(pl.ands(code, 8), 12))
 
