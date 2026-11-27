@@ -21,6 +21,9 @@ Two kinds of specifications are supported:
 from __future__ import annotations
 
 import ctypes
+import math
+import os
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -375,3 +378,26 @@ class ScalarSpec:
         round-trip is just ``.item()``.
         """
         return self.value.item()
+
+
+class SparseZero:
+    """Initialize a read-only fixture with an inherited sparse file mapping."""
+
+    def __init__(self, shape: list[int], dtype: torch.dtype):
+        self.shape = tuple(shape)
+        self.dtype = dtype
+        self._tensor: torch.Tensor | None = None
+
+    def __call__(self) -> torch.Tensor:
+        # Prefer the workspace because the system temporary directory may be tmpfs.
+        directory = "." if os.access(".", os.W_OK) else None
+        with tempfile.NamedTemporaryFile(dir=directory) as backing:
+            storage = torch.from_file(
+                backing.name, shared=True, size=math.prod(self.shape), dtype=self.dtype,
+            )
+        self._tensor = storage.view(self.shape)
+        return self._tensor
+
+    def owns(self, tensor: torch.Tensor) -> bool:
+        """Recognize the generated fixture and its views independently of its shape."""
+        return self._tensor is not None and tensor.untyped_storage() is self._tensor.untyped_storage()

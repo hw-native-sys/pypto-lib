@@ -14,6 +14,15 @@ import config as C
 from config import BLOCK_SIZE, FLASH as M
 
 
+def forward_replay_weight_shapes(runtime_dir):
+    """Read tensor shapes from a saved distributed forward before specializing its inputs."""
+    from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
+
+    compiled = DistributedCompiledProgram.from_dir(runtime_dir)
+    parameters, _, _ = compiled._get_metadata()
+    return {p.name.removesuffix("__ssa_v0"): tuple(p.shape) for p in parameters if p.shape is not None}
+
+
 def parse_decode_startpos(value):
     """Parse one absolute starting position per request."""
     import argparse

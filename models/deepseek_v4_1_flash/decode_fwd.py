@@ -15,16 +15,26 @@ import pypto.language as pl
 
 import pypto.language.distributed as pld
 import config as C
+from utils import forward_replay_weight_shapes
 
 if C.EP_SIZE % C.LM_HEAD_TP_SIZE:
     raise ValueError("EP must be divisible by LM head TP")
 
 _shape_parser = argparse.ArgumentParser(add_help=False)
-_shape_parser.add_argument("--weight-bank-size", type=int, default=C.FLASH.num_hidden_layers)
-_shape_parser.add_argument("--packed-routed-weights", action=argparse.BooleanOptionalAction, default=False)
+_shape_parser.add_argument("--weight-bank-size", type=int, choices=(1, C.FLASH.num_hidden_layers))
+_shape_parser.add_argument("--compile-only", action="store_true")
+_shape_parser.add_argument("--packed-routed-weights", action=argparse.BooleanOptionalAction)
 _shape_parser.add_argument("--runtime-dir", default=None)
 _shape_options = _shape_parser.parse_known_args()[0]
+_replay_shapes = forward_replay_weight_shapes(_shape_options.runtime_dir) if _shape_options.runtime_dir else {}
 WEIGHT_BANK_SIZE = _shape_options.weight_bank_size
+if WEIGHT_BANK_SIZE is None:
+    if _replay_shapes:
+        WEIGHT_BANK_SIZE = _replay_shapes["wq_a"][1]
+    elif __name__ == "__main__" and not _shape_options.compile_only:
+        WEIGHT_BANK_SIZE = 1
+    else:
+        WEIGHT_BANK_SIZE = C.FLASH.num_hidden_layers
 if WEIGHT_BANK_SIZE not in (1, C.FLASH.num_hidden_layers):
     _shape_parser.error("--weight-bank-size must be 1 or the full layer count")
 
@@ -80,9 +90,10 @@ MOE_INTER = M.moe_intermediate_size
 MX_GROUP = M.weight_block_size[0]
 
 
-PACK_ROUTED_WEIGHTS = use_packed_decode_weights(MOE_TOKENS, N_LOCAL_EXPERTS, TOPK) and (
-    _shape_options.packed_routed_weights or _shape_options.runtime_dir is not None
-)
+if _replay_shapes and _shape_options.packed_routed_weights is None:
+    PACK_ROUTED_WEIGHTS = _replay_shapes["routed_w1"][-1] == FP4_PANEL_ROWS * MX_PACKED_LANE_COLS
+else:
+    PACK_ROUTED_WEIGHTS = bool(_shape_options.packed_routed_weights) and use_packed_decode_weights(MOE_TOKENS, N_LOCAL_EXPERTS, TOPK)
 PANEL_ROWS = FP4_PANEL_ROWS if PACK_ROUTED_WEIGHTS else 1
 WEIGHT_PANEL_BYTES = PANEL_ROWS * MX_PACKED_LANE_COLS
 W1_DEVICE_ROWS = MX_W1_PACKED_ROWS // PANEL_ROWS
@@ -1175,7 +1186,7 @@ def _fixture_extent(dim):
     raise ValueError(f"no decode_fwd fixture extent for {dim!r}")
 
 
-def build_tensor_specs():
+def build_tensor_specs(*, sparse_zero_routed=False):
     """Build the decode smoke fixture for the configured request capacity."""
     from decode_moe import _route_bias
 
@@ -1234,7 +1245,10 @@ def build_tensor_specs():
             init_value = _route_bias(N_EXPERTS).repeat(EP_SIZE, WEIGHT_BANK_SIZE)
         elif name.endswith("_scale"):
             init_value = 1.0
-        specs.append(forward_routed_weight_spec(name, shape, dtype, init_value, PACK_ROUTED_WEIGHTS, local_experts=N_LOCAL_EXPERTS))
+        specs.append(forward_routed_weight_spec(
+            name, shape, dtype, init_value, PACK_ROUTED_WEIGHTS,
+            local_experts=N_LOCAL_EXPERTS, sparse_zero_routed=sparse_zero_routed,
+        ))
     return specs
 
 
@@ -1251,7 +1265,10 @@ if __name__ == "__main__":
     parser.add_argument("--ep", type=int, default=EP_SIZE, choices=[2, 4, 8])
     parser.add_argument("--dp", type=int, default=C.DP_SIZE, choices=[2, 4, 8])
     parser.add_argument("--experts-per-rank", type=int, default=N_LOCAL_EXPERTS, help="routed experts on each EP rank")
-    parser.add_argument("--weight-bank-size", type=int, default=WEIGHT_BANK_SIZE, choices=[1, N_LAYERS])
+    parser.add_argument(
+        "--weight-bank-size", type=int, default=WEIGHT_BANK_SIZE, choices=[1, N_LAYERS],
+        help="layer weight sets (default: 1 for smoke, full for --compile-only, saved layout for replay)",
+    )
     parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(EP_SIZE)))
     parser.add_argument("--balanced-routing", action="store_true")
     parser.add_argument("--packed-routed-weights", action=argparse.BooleanOptionalAction, default=False, help="pack resident routed FP4 weights before upload")
@@ -1271,7 +1288,7 @@ if __name__ == "__main__":
     devices = [int(device) for device in args.device.split(",") if device]
     if len(devices) != EP_SIZE or len(set(devices)) != EP_SIZE:
         parser.error(f"need exactly {EP_SIZE} distinct devices, got {devices}")
-    specs = build_tensor_specs()
+    specs = build_tensor_specs(sparse_zero_routed=True)
     config = dict(
         backend_type=args.backend_type,
         execution_mode=args.execution_mode,
@@ -1285,18 +1302,6 @@ if __name__ == "__main__":
             num_sub_workers=0,
         ),
     )
-    if not (args.compile_only or args.runtime_dir or args.packed_routed_weights):
-        from functools import cache, partial
-
-        @cache
-        def zero_routed_bank(shape, dtype):
-            return torch.zeros(shape, dtype=dtype)
-
-        # These three synthetic read-only FP4 banks have identical zero contents.
-        for spec in specs:
-            if spec.name in ("routed_w1", "routed_w2", "routed_w3") and spec.init_value is None:
-                spec.init_value = partial(zero_routed_bank, tuple(spec.shape), spec.dtype)
-
     with ExitStack() as sources:
         result = run(
             a5_default_runtime="host_build_graph",
