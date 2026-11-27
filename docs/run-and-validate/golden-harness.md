@@ -244,7 +244,7 @@ PYPTO_GOLDEN_NUM_THREADS=8 \
 
 ## Backend and execution mode
 
-New configurations can select `backend_type` (`BackendType.Ascend910B` or
+New configurations can select `backend_type` (`BackendType.Ascend910` or
 `BackendType.Ascend950`) and `execution_mode` (`ExecutionMode.ONBOARD` or
 `ExecutionMode.SIM`) separately. Import `BackendType` from `pypto.backend` and
 `ExecutionMode` from `pypto.runtime`. The harness passes these choices through

@@ -1337,8 +1337,8 @@ class TestPlatformResolution:
     @pytest.mark.parametrize(
         "platform, expected_name",
         [
-            ("a2a3", "Ascend910B"),
-            ("a2a3sim", "Ascend910B"),
+            ("a2a3", "Ascend910"),
+            ("a2a3sim", "Ascend910"),
             ("a5", "Ascend950"),
             ("a5sim", "Ascend950"),
         ],
@@ -1365,7 +1365,7 @@ class TestPlatformResolution:
         assert config == dict(backend_type=backend, execution_mode=sim, device_id=3)
         assert cfg.platform == backend + ("sim" if sim else "")
         assert cfg.device_id == 3
-        expected_backend = BackendType.Ascend950 if backend == "a5" else BackendType.Ascend910B
+        expected_backend = BackendType.Ascend950 if backend == "a5" else BackendType.Ascend910
         expected_mode = ExecutionMode.SIM if sim else ExecutionMode.ONBOARD
         assert cfg.backend_type == expected_backend
         assert cfg.execution_mode == expected_mode
@@ -3266,7 +3266,7 @@ def test_explicit_target_config_matches_legacy_platform(platform):
     from pypto.runtime import ExecutionMode
 
     explicit = normalize_config({
-        "backend_type": BackendType.Ascend950 if platform.startswith("a5") else BackendType.Ascend910B,
+        "backend_type": BackendType.Ascend950 if platform.startswith("a5") else BackendType.Ascend910,
         "execution_mode": ExecutionMode.SIM if platform.endswith("sim") else ExecutionMode.ONBOARD,
     })
     legacy = normalize_config({"platform": platform})

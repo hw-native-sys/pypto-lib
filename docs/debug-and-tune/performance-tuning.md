@@ -464,7 +464,7 @@ The current backend definitions expose these values:
 
 | Backend | GM access granularity | PH001 recommended minimum trailing dimension | L2 cache line |
 | --- | ---: | ---: | ---: |
-| `a2a3` / Ascend910B | 512 B | 512 B | 512 B |
+| `a2a3` / Ascend910 | 512 B | 512 B | 512 B |
 | `a5` / Ascend950 | 128 B | 128 B | 512 B |
 
 Check `GetGmAccessGranularityBytes`, `GetRecommendedInnermostDimBytes`, and

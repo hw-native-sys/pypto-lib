@@ -261,7 +261,7 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
     finally:
         sys.argv = saved_argv
     config = RunConfig(
-        backend_type=BackendType.Ascend910B,
+        backend_type=BackendType.Ascend910,
         execution_mode=ExecutionMode.ONBOARD,
         device_id=device_ids[0],
         codegen_only=True,

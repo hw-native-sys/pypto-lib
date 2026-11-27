@@ -71,7 +71,7 @@ differs, see [Compile configuration](#compile-configuration).
 | `-d` / `--device` | Device ID for multi-card hosts. |
 | `--enable-chip-swimlane` | Capture **level** 0-4 forwarded to the runtime; collects per-task chip swimlane records into the build_output (see [Runtime DFX flags](#runtime-dfx-flags)). A bare flag means level 1; dispatch analysis needs an explicit `4`. |
 
-`a2a3*` maps to `BackendType.Ascend910B`; `a5*` maps to
+`a2a3*` maps to `BackendType.Ascend910`; `a5*` maps to
 `BackendType.Ascend950`.
 
 ### Multi-card kernels

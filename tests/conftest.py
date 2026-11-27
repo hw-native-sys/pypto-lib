@@ -42,7 +42,7 @@ def _install_pypto_stubs() -> None:
         )
 
     class BackendType(enum.Enum):
-        Ascend910B = "Ascend910B"
+        Ascend910 = "Ascend910"
         Ascend950 = "Ascend950"
 
     class ExecutionMode(enum.Enum):
@@ -54,8 +54,8 @@ def _install_pypto_stubs() -> None:
     # mapping and the DFX view. A bare kwargs bag would let every one of those
     # fail as an AttributeError instead of as a real assertion.
     _PLATFORM_BACKEND = {
-        "a2a3": BackendType.Ascend910B,
-        "a2a3sim": BackendType.Ascend910B,
+        "a2a3": BackendType.Ascend910,
+        "a2a3sim": BackendType.Ascend910,
         "a5": BackendType.Ascend950,
         "a5sim": BackendType.Ascend950,
     }
@@ -108,7 +108,7 @@ def _install_pypto_stubs() -> None:
         __annotations__ = dict.fromkeys(("platform", *_RUN_CONFIG_FIELDS), object)
 
         def __init__(
-            self, platform=None, *, backend_type=BackendType.Ascend910B,
+            self, platform=None, *, backend_type=BackendType.Ascend910,
             execution_mode=ExecutionMode.SIM, **kwargs,
         ):
             if platform is None:
