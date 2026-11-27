@@ -1840,6 +1840,7 @@ static __aicore__ __attribute__((noinline)) void score(__gm__ int64_t* args) {
     asc_sync_notify(PIPE_V, PIPE_MTE2, EVENT_ID7);
     asc_sync_wait(PIPE_V, PIPE_MTE2, EVENT_ID7);
 #endif
+    const uint64_t saved_ctrl = get_ctrl();
     asc_init();
     if (key->shapes[1] == 64) score_pages<64, kEmitBlockMax>(args, active, core_id, subblock_id);
     else score_pages<128, kEmitBlockMax>(args, active, core_id, subblock_id);
@@ -1859,6 +1860,7 @@ static __aicore__ __attribute__((noinline)) void score(__gm__ int64_t* args) {
             wait_intra_block(PIPE_MTE3, subblock_id, 3 + stage);
 #endif
     asc_sync();
+    set_ctrl(saved_ctrl);
 }
 #if defined(__DAV_VEC__)
 #include <c_api/asc_simd.h>
@@ -3535,6 +3537,7 @@ static __aicore__ __attribute__((noinline)) void prepare_metadata(__gm__ int64_t
 #if defined(__DAV_VEC__)
     using namespace deep_gemm;
     const uint32_t active = args[4];
+    const uint64_t saved_ctrl = get_ctrl();
     asc_init();
     constexpr uint32_t metadata_bytes = 33 * 2 * sizeof(uint32_t);
     // The persistent AIV SIMT entry provides an 8 KiB shared UB window.
@@ -3560,6 +3563,7 @@ static __aicore__ __attribute__((noinline)) void prepare_metadata(__gm__ int64_t
     asc_copy_ub2gm_align(data<uint32_t>(args, 2), metadata_ub, 1, metadata_bytes,
                         asc_store_l2_cache_mode::NORMAL_FIRST_VICTIM, 0, 0);
     asc_sync();
+    set_ctrl(saved_ctrl);
 #endif
 }
 

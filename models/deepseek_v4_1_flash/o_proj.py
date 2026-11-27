@@ -768,7 +768,12 @@ def _o_proj_a_mixed(
                         q_wide_reciprocal = pl.reg.interpret_cast(q_wide_inverse, dtype=pl.BF16)
                         q_wide_scaled = pl.reg.mul(q_values, q_wide_reciprocal)
                         q_wide_float = pl.reg.convert(q_wide_scaled, dtype=pl.FP32)
-                        q_wide_fp8 = pl.reg.convert(q_wide_float, dtype=pl.FP8E4M3FN, rounding="R", saturate=True)
+                        # Explicitly clamp to [-448, 448] until A5 CTRL[60] honors saturate=True
+                        # (hw-native-sys/pypto#3603).
+                        q_wide_float_mask = pl.reg.full_mask(lanes=256)
+                        q_wide_clipped = pl.reg.maximums(q_wide_float, -448.0, q_wide_float_mask)
+                        q_wide_clipped = pl.reg.minimums(q_wide_clipped, 448.0, q_wide_float_mask)
+                        q_wide_fp8 = pl.reg.convert(q_wide_clipped, dtype=pl.FP8E4M3FN, rounding="R", saturate=False)
                         q_wide_words = pl.reg.interpret_cast(q_wide_fp8, dtype=pl.UINT32)
                         _q_quant_written = pl.reg.store(quant_words, offset=q_pair * 64, value=q_wide_words)
                         q_codes = pl.reg.shift_rights(q_group_shared, 7, q_group_mask)
