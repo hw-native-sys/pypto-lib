@@ -70,8 +70,8 @@ def parse_prefill_groups(value):
         raise argparse.ArgumentTypeError("use comma-separated integers and semicolons between DP groups") from error
 
 
-def prefill_index_validation_cases(args, ratio):
-    """Exercise score-dependent TopK in the default C1A/C2A full validation."""
+def prefill_index_validation_cases(args, ratio, *, reindex=False):
+    """Exercise score-dependent TopK in the default prefill index validations."""
     import copy
     import os
     import sys
@@ -85,6 +85,11 @@ def prefill_index_validation_cases(args, ratio):
         return [args]
 
     scored = copy.copy(args)
+    if reindex:
+        # The first request has 65 candidate blocks and the last has one.
+        scored.query_lens = [[1, 7]]
+        scored.start_pos = [[2 * M.index_topk, 0]]
+        return [args, scored]
     scored.query_lens = [[8]]
     scored.start_pos = [[ratio * (M.index_topk + 32)]]
     if ratio == 2:

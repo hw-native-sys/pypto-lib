@@ -40,12 +40,15 @@ INDEX_QUERY_WIDTH = M.index_n_heads * INDEX_DIM
 INDEX_QUERY_SCALE_WIDTH = INDEX_QUERY_WIDTH // 32
 CANDIDATE_BLOCK_SIZE = M.candidate_block_size
 CANDIDATE_TOPK_BLOCKS = M.candidate_topk_blocks
+ALL_FIT_BLOCKS = INDEX_TOPK // CANDIDATE_BLOCK_SIZE
 CANDIDATE_PAIR_WIDTH = 2 * CANDIDATE_TOPK_BLOCKS
 TOPK_CACHED_PAGES = (M.max_position_embeddings + 127) // 128
 
 
 PREFILL_SCORE_WORKERS = 12
 INDEX_SCORE_SCALE = INDEX_DIM ** -0.5 * INDEX_H ** -0.5
+POOL_ROW_TILE = 8
+POOL_COUNT_TILE = 256
 INDEX_MAX_LOGITS_BYTES = 64 * 1024 * 1024
 TOPK_LEAF = 2048
 TOPK_PAIR_WIDTH = 2 * INDEX_TOPK
@@ -1371,6 +1374,61 @@ def _clear_inactive_pool(
     return counts_tid
 
 
+@pl.jit.inline
+def _map_pool_rows(
+    pool_ids: pl.Tensor,
+    pool_counts: pl.Tensor,
+    lengths: pl.Tensor,
+    requests: pl.Tensor,
+    table: pl.Tensor,
+    cache_pages: pl.Scalar[pl.INDEX],
+    page_rows: pl.Scalar[pl.INDEX],
+    output: pl.Tensor,
+    active_tokens: pl.Scalar[pl.INT32],
+    worker: pl.Scalar[pl.INDEX],
+    workers: pl.Scalar[pl.INDEX],
+):
+    """Compact each worker's candidate blocks in pool order and publish complete output rows."""
+    offsets = pl.tile.arange(0, [1, CANDIDATE_BLOCK_SIZE], dtype=pl.INT32)
+    group_rows = pl.min(POOL_ROW_TILE, pl.max(1, (active_tokens + workers - 1) // workers))
+    groups = (active_tokens + group_rows - 1) // group_rows
+    for group in pl.range(worker, groups, workers):
+        # Traverse alternate waves in reverse to balance longer causal rows.
+        wave = group // workers
+        assigned = group
+        if wave % 2 != 0:
+            wave_groups = pl.min(workers, groups - wave * workers)
+            assigned = wave * workers + wave_groups - 1 - worker
+        start = assigned * group_rows
+        rows = pl.min(group_rows, active_tokens - start)
+        packed = pl.tile.full([POOL_ROW_TILE, INDEX_TOPK], dtype=pl.INT32, value=-1)
+        for row in pl.range(rows):
+            token = start + row
+            request = pl.read(requests, [token])
+            length = pl.max(0, pl.read(lengths, [token]))
+            count = pl.min(pl.max(0, pl.read(pool_counts, [token])), pl.tensor.dim(pool_ids, 1))
+            written = pl.cast(0, pl.INDEX)
+            if request >= 0 and request < pl.tensor.dim(table, 0):
+                for slot in pl.range(count):
+                    block = pl.read(pool_ids, [token, slot])
+                    logical = pl.cast(block, pl.INDEX) * CANDIDATE_BLOCK_SIZE
+                    if block >= 0 and logical < length and logical // page_rows < pl.tensor.dim(table, 1):
+                        page = pl.read(table, [request, logical // page_rows])
+                        if page >= 0 and page < cache_pages:
+                            valid = pl.min(CANDIDATE_BLOCK_SIZE, length - logical)
+                            first = pl.cast(page, pl.INDEX) * page_rows + logical % page_rows
+                            physical = pl.add(offsets, pl.cast(first, pl.INT32))
+                            # A partial block can leave the next tile destination unaligned.
+                            if valid == CANDIDATE_BLOCK_SIZE and written % CANDIDATE_BLOCK_SIZE == 0:
+                                packed = pl.tile.assemble(packed, physical, [row, written])
+                            else:
+                                for lane in pl.range(valid):
+                                    pl.tile.write(packed, [row, written + lane], pl.cast(first + lane, pl.INT32))
+                            written = written + valid
+        pl.store(pl.set_validshape(packed, rows, INDEX_TOPK), [start, 0], output)
+    return output
+
+
 @pl.jit.inline(auto_scope=False)
 def _select_all_pool_rows(
     pool_ids: pl.Tensor,
@@ -1389,35 +1447,44 @@ def _select_all_pool_rows(
     workers = pl.min(64, num_tokens)
     with pl.spmd(workers, name_hint="prefill_c1a_all_pool_rows", deps=[ready]) as selected:
         worker = pl.tile.get_block_idx()
-        offsets = pl.tile.arange(0, [1, CANDIDATE_BLOCK_SIZE], dtype=pl.INT32)
-        active_tokens = num_tokens
-        if pl.read(route, [0]) != C1A_ALL_FIT:
-            active_tokens = pl.cast(0, pl.INT32)
-        for token in pl.range(worker, active_tokens, workers):
-            packed = pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
-            request = pl.read(requests, [token])
-            length = pl.max(0, pl.read(lengths, [token]))
-            count = pl.min(pl.max(0, pl.read(pool_counts, [token])), pl.tensor.dim(pool_ids, 1))
-            written = pl.cast(0, pl.INDEX)
-            if request >= 0 and request < pl.tensor.dim(table, 0):
-                for slot in pl.range(count):
-                    block = pl.read(pool_ids, [token, slot])
-                    logical = pl.cast(block, pl.INDEX) * CANDIDATE_BLOCK_SIZE
-                    if block >= 0 and logical < length and logical // page_rows < pl.tensor.dim(table, 1):
-                        page = pl.read(table, [request, logical // page_rows])
-                        if page >= 0 and page < cache_pages:
-                            valid = pl.min(CANDIDATE_BLOCK_SIZE, length - logical)
-                            first = pl.cast(page, pl.INDEX) * page_rows + logical % page_rows
-                            physical = pl.add(offsets, pl.cast(first, pl.INT32))
-                            # A partial block can leave the next tile destination unaligned.
-                            if valid == CANDIDATE_BLOCK_SIZE and written % CANDIDATE_BLOCK_SIZE == 0:
-                                packed = pl.tile.assemble(packed, physical, [0, written])
-                            else:
-                                for lane in pl.range(valid):
-                                    pl.tile.write(packed, [0, written + lane], pl.cast(first + lane, pl.INT32))
-                            written = written + valid
-            pl.store(packed, [token, 0], output)
+        if pl.read(route, [0]) == C1A_ALL_FIT:
+            _map_pool_rows(
+                pool_ids, pool_counts, lengths, requests, table, cache_pages, page_rows, output,
+                num_tokens, worker, workers,
+            )
     return selected
+
+
+@pl.jit.inline
+def _pool_counts_fit(
+    flat_counts: pl.Tensor,
+    capacity: pl.Scalar[pl.INDEX],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Check the active count prefix against the output row capacity."""
+    all_fit = pl.cast(1, pl.INT32)
+    if num_tokens > 0 and capacity > ALL_FIT_BLOCKS:
+        if pl.read(flat_counts, [0, num_tokens - 1]) > ALL_FIT_BLOCKS:
+            all_fit = pl.cast(0, pl.INT32)
+        else:
+            for start in pl.range(0, num_tokens, POOL_COUNT_TILE):
+                count_lanes = pl.min(POOL_COUNT_TILE, num_tokens - start)
+                counts = pl.load(flat_counts, [0, start], [1, POOL_COUNT_TILE], valid_shape=[1, count_lanes])
+                counts = pl.tile.fillpad(counts, pad_value=pl.PadValue.zero)
+                flat = pl.reshape(counts, [POOL_COUNT_TILE])
+                largest = pl.create_tile([1, 64], dtype=pl.INT32, target_memory=pl.Mem.Vec)
+                largest_flat = pl.reshape(largest, [64])
+                with pl.reg_scope():
+                    full = pl.reg.full_mask(lanes=64)
+                    peak = pl.reg.broadcast(0, lanes=64, dtype=pl.INT32)
+                    for segment in pl.hardware_loop(POOL_COUNT_TILE // 64):
+                        items = pl.reg.load(flat, segment * 64, lanes=64)
+                        peak = pl.reg.maximum(peak, items, full)
+                    row_max = pl.reg.reduce_max(peak, full)
+                    _saved = pl.reg.store(largest_flat, 0, row_max, pl.reg.active_mask(1, lanes=1))
+                if pl.tile.read(largest, [0, 0]) > pl.cast(ALL_FIT_BLOCKS, pl.INT32):
+                    all_fit = pl.cast(0, pl.INT32)
+    return all_fit
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1434,15 +1501,18 @@ def _prefill_pool_is_dense(
     """Identify dense pools and four-query groups with matching candidate lists."""
     capacity = pl.tensor.dim(pool_ids, 1)
     flags = pl.create_tensor([32, 16], dtype=pl.INT32)
+    flat_counts = pl.reshape(pool_counts, [1, pl.tensor.dim(pool_counts, 0)])
     with pl.spmd(32, name_hint="prefill_pool_plan", deps=[ready]) as planned:
         worker = pl.tile.get_block_idx()
         dense = pl.cast(1, pl.INT32)
-        all_fit = pl.cast(1, pl.INT32)
+        # The ranked routes only need density and pairing for a chunk that overflows.
+        all_fit = _pool_counts_fit(flat_counts, capacity, num_tokens)
+        check_rows = num_tokens
+        if all_fit != 0:
+            check_rows = pl.cast(0, pl.INT32)
         mismatch = pl.tile.full([1, 16], dtype=pl.FP32, value=0.0)
-        for token in pl.range(worker, num_tokens, 32):
+        for token in pl.range(worker, check_rows, 32):
             count = pl.max(0, pl.min(pl.read(pool_counts, [token]), capacity))
-            if count * CANDIDATE_BLOCK_SIZE > INDEX_TOPK:
-                all_fit = pl.cast(0, pl.INT32)
             visible = pl.max(0, pl.read(lengths, [token]))
             if count != (visible + 7) // 8 or visible > score_width or visible > table_width * 128:
                 dense = pl.cast(0, pl.INT32)
@@ -1463,15 +1533,19 @@ def _prefill_pool_is_dense(
             if pl.tile.read(sums, [0, lane]) != 0.0:
                 dense = pl.cast(0, pl.INT32)
         pl.write(flags, [worker, 0], dense)
-        paired = pl.cast(num_tokens % 4 == 0, pl.INT32)
+        grouped_requests = pl.cast(num_tokens % 4 == 0, pl.INT32)
+        paired = grouped_requests
         pair_error = pl.tile.full([1, 16], dtype=pl.FP32, value=0.0)
-        for token in pl.range(worker * 4, num_tokens, 128):
+        for token in pl.range(worker * 4, check_rows, 128):
             count = pl.max(0, pl.min(pl.read(pool_counts, [token]), capacity))
             request = pl.read(request_ids, [token])
             for row in pl.unroll(1, 4):
                 if token + row < num_tokens:
                     other_count = pl.max(0, pl.min(pl.read(pool_counts, [token + row]), capacity))
-                    if other_count != count or pl.read(request_ids, [token + row]) != request:
+                    if pl.read(request_ids, [token + row]) != request:
+                        grouped_requests = pl.cast(0, pl.INT32)
+                        paired = pl.cast(0, pl.INT32)
+                    if other_count != count:
                         paired = pl.cast(0, pl.INT32)
                     for start in pl.range(0, count, 128):
                         active = pl.min(128, count - start)
@@ -1487,6 +1561,7 @@ def _prefill_pool_is_dense(
                 paired = pl.cast(0, pl.INT32)
         pl.write(flags, [worker, 1], paired)
         pl.write(flags, [worker, 2], all_fit)
+        pl.write(flags, [worker, 3], grouped_requests)
     return flags, planned
 
 
@@ -1643,20 +1718,26 @@ def _plan_c1a_score_route(
         dense = pl.cast(1, pl.INT32)
         all_fit = pl.cast(0, pl.INT32)
         pool_paired = pl.cast(1, pl.INT32)
+        grouped_requests = pl.cast(0, pl.INT32)
         if pool:
-            all_fit = pl.cast(1, pl.INT32)
-            for worker in pl.range(32):
-                dense = dense * pl.read(pool_flags, [worker, 0])
-                all_fit = all_fit * pl.read(pool_flags, [worker, 2])
-                pool_paired = pool_paired * pl.read(pool_flags, [worker, 1])
+            all_fit = pl.read(pool_flags, [0, 2])
+            if all_fit == 0:
+                raw = pl.load(pool_flags, [0, 0], [32, 16], valid_shape=[32, 4])
+                features = pl.col_min(pl.cast(raw, pl.FP32))
+                dense = pl.cast(pl.tile.read(features, [0, 0]), pl.INT32)
+                pool_paired = pl.cast(pl.tile.read(features, [0, 1]), pl.INT32)
+                grouped_requests = pl.cast(pl.tile.read(features, [0, 3]), pl.INT32)
         mode = pl.cast(C1A_ALL_FIT, pl.INT32)
         if all_fit == 0:
             if dense != 0:
                 paired = pl.cast(width >= 256 and count % 4 == 0, pl.INT32)
-                for token in pl.range(count):
-                    if token % 4 != 0:
-                        if pl.read(requests, [token]) != pl.read(requests, [token - token % 4]):
-                            paired = pl.cast(0, pl.INT32)
+                if pool:
+                    paired = paired * grouped_requests
+                else:
+                    for token in pl.range(count):
+                        if token % 4 != 0:
+                            if pl.read(requests, [token]) != pl.read(requests, [token - token % 4]):
+                                paired = pl.cast(0, pl.INT32)
                 mode = pl.cast(C1A_PAGED_SINGLE, pl.INT32)
                 if paired != 0:
                     mode = pl.cast(C1A_PAGED_PAIRED, pl.INT32)
@@ -1709,8 +1790,21 @@ def prefill_indexer(
         if num_tokens < pl.tensor.dim(x, 0):
             cleared = _clear_inactive_pool(pool_ids, pool_counts, num_tokens, ready)
             completion[0] = cleared
-    if num_tokens > 0:
-        active = pl.cast(num_tokens, pl.INDEX)
+    score_tokens = num_tokens
+    if pool and not c2a:
+        # Map the pool directly when its physical width bounds every row count.
+        if pl.tensor.dim(pool_ids, 1) <= ALL_FIT_BLOCKS and num_tokens > 0:
+            workers = pl.min(64, num_tokens)
+            with pl.spmd(workers, name_hint="prefill_c1a_all_pool_rows_direct", deps=[ready]) as selected:
+                _map_pool_rows(
+                    pool_ids, pool_counts, lengths, request_ids, table,
+                    pl.tensor.dim(cache, 0), pl.tensor.dim(cache, 1), output,
+                    num_tokens, pl.tile.get_block_idx(), workers,
+                )
+            completion[0] = selected
+            score_tokens = pl.cast(0, pl.INT32)
+    if score_tokens > 0:
+        active = pl.cast(score_tokens, pl.INDEX)
         chunk = pl.min(active, pl.max(1, INDEX_MAX_LOGITS_BYTES // (width * 4)))
         scores = pl.create_tensor([chunk, width], dtype=pl.FP32)
         for begin in pl.range(0, active, chunk):

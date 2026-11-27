@@ -762,7 +762,7 @@ if __name__ == "__main__":
     from quant import packed_cache_compare
     from pypto.ir import DistributedConfig
 
-    from utils import parse_prefill_groups
+    from utils import parse_prefill_groups, prefill_index_validation_cases
 
     parser = argparse.ArgumentParser(description="DeepSeek V4.1 prefill C1A reindex")
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
@@ -793,10 +793,9 @@ if __name__ == "__main__":
             parser.error("dp-tokens must contain one count per DP group, each in [0, tokens]")
     torch.set_num_threads(8)
     entry = l3_prefill_c1a_reindex if CP_SIZE == 1 else l3_prefill_c1a_reindex_cp
-    result = run(
+    run_kwargs = dict(
         a5_default_runtime="host_build_graph",
         fn=entry,
-        specs=build_c1a_specs(args, entry, mode="reindex"),
         golden_fn=functools.partial(golden_c1a_prefill, mode="reindex"),
         compile_only=args.compile_only,
         save_data=args.save_data,
@@ -831,5 +830,7 @@ if __name__ == "__main__":
             ),
         },
     )
-    if not result.passed:
-        raise SystemExit(result.error or 1)
+    for case in prefill_index_validation_cases(args, ratio=1, reindex=True):
+        result = run(specs=build_c1a_specs(case, entry, mode="reindex"), **run_kwargs)
+        if not result.passed:
+            raise SystemExit(result.error or 1)
