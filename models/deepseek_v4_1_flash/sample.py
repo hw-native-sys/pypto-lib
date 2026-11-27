@@ -734,10 +734,14 @@ def _verify_stochastic_row(
     accepted = pl.cast(0, pl.INT32)
     normalizer = _store_exp_weights(filtered_logits, correction_logits, worker)
     column = pl.cast(proposal, pl.INDEX)
-    draft_word = pl.load(proposal_state, [slot, proposal_start + column // 8 * 8], [1, 8])
+    block_start = column // 8 * 8
+    block_offset = column % 8
+    draft_word = pl.load(proposal_state, [slot, proposal_start + block_start], [1, 8])
     draft_tile = pl.reinterpret_view(draft_word, pl.FP32)
-    draft_scaled = normalizer * pl.read(draft_tile, [0, column % 8])
-    target_weight = pl.read(correction_logits, [worker, column])
+    draft_scaled = normalizer * pl.read(draft_tile, [0, block_offset])
+    # Reload vector-written scratch through the tile pipeline.
+    target_tile = pl.load(correction_logits, [worker, block_start], [1, 8])
+    target_weight = pl.read(target_tile, [0, block_offset])
     if uniform * draft_scaled < target_weight:
         accepted = pl.cast(1, pl.INT32)
     else:
