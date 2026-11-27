@@ -18,12 +18,15 @@ from config import DECODE_SEQ, MOE_TOKENS, FLASH as M
 from lm_head import (
     DONE_VALUE,
     GROUP_LOGIT_ROWS,
+    HIDDEN_GATHER_ROW_TILE,
+    MM_ROW_TILE,
+    PUSH_ROW_TILE,
     LM_HEAD_RING_HEAP,
     MAX_LOGIT_ROWS,
     TP_SIZE,
     VOCAB_PER_TP,
     WORLD_SIZE,
-    lm_head,
+    project_lm_head_rows,
 )
 from markov_head import markov_head
 
@@ -40,6 +43,18 @@ DSPARK_MOE_TOKENS = DSPARK_MAX_BATCH * DSPARK_QUERY_PAD
 
 assert DSPARK_QUERY_WIDTH < DSPARK_QUERY_PAD
 
+# Greedy sampling reads request * DSPARK_QUERY_WIDTH + step. With paired
+# owners, project this prefix while keeping public windows at their usual size.
+_DRAFT_ACTIVE_ROWS = DSPARK_MAX_BATCH * DSPARK_QUERY_WIDTH
+_COMPACT_HEAD = (
+    MM_ROW_TILE == 2 * MAX_LOGIT_ROWS
+    and _DRAFT_ACTIVE_ROWS % 16 == 0
+    and _DRAFT_ACTIVE_ROWS % PUSH_ROW_TILE == 0
+)
+DRAFT_HEAD_ROWS = _DRAFT_ACTIVE_ROWS if _COMPACT_HEAD else MAX_LOGIT_ROWS
+DRAFT_HEAD_ROW_TILE = 2 * DRAFT_HEAD_ROWS if _COMPACT_HEAD else MM_ROW_TILE
+DRAFT_HEAD_GATHER_ROWS = gcd(TP_SIZE * DRAFT_HEAD_ROWS, 64) if _COMPACT_HEAD else HIDDEN_GATHER_ROW_TILE
+
 # model config
 D = M.hidden_size
 VOCAB = M.vocab_size
@@ -48,6 +63,7 @@ EPS = M.rms_norm_eps
 # tiling
 HIDDEN_TILE = 512
 RMS_M_TILE = 8
+AIV_WORKERS = 48
 DSPARK_NORM_TOKENS = (DSPARK_MOE_TOKENS + RMS_M_TILE - 1) // RMS_M_TILE * RMS_M_TILE
 LM_M_TILE = gcd(16, *(batch * DSPARK_QUERY_PAD for batch in DSPARK_SUPPORTED_BATCHES))
 LM_N_TILE = 128
@@ -61,11 +77,13 @@ GREEDY_ARGMAX_ROWS = 8
 GREEDY_SEGMENT_WIDTH = gcd(VOCAB // GREEDY_ARGMAX_ROWS, 808)
 GREEDY_SEGMENTS = VOCAB // GREEDY_SEGMENT_WIDTH
 GREEDY_TILE = GREEDY_ARGMAX_ROWS * GREEDY_SEGMENT_WIDTH
+MARKOV_PANEL_TILE = gcd(VOCAB, 640)
+MARKOV_PANELS = VOCAB // MARKOV_PANEL_TILE
+MARKOV_PANEL_STRIDE = (MARKOV_PANELS + 7) // 8 * 8
 
 assert D % HIDDEN_TILE == 0
 assert D % LM_K_TILE == 0
 assert VOCAB % LM_N_TILE == 0
-assert VOCAB % GREEDY_TILE == 0
 assert CONFIDENCE_PAD * 4 == 32
 # Base-logit row tiling must exactly cover every supported padded batch.
 for _batch in DSPARK_SUPPORTED_BATCHES:
@@ -82,91 +100,81 @@ def normalize_head_hidden(
     active_tokens = batch * DSPARK_QUERY_WIDTH
     padded_tokens = batch * DSPARK_QUERY_PAD
     hidden_flat = pl.reshape(head_hidden, [active_tokens, D])
-    padded_hidden = pl.create_tensor([DSPARK_NORM_TOKENS, D], dtype=pl.BF16)
-    hidden_blocks = D // HIDDEN_TILE
+    # Normalize each compact input tile in place on Vec before publishing to
+    # the padded projection workspace. Only its last tile can lack real rows.
+    norm_blocks = (padded_tokens + RMS_M_TILE - 1) // RMS_M_TILE
     with pl.spmd(
-        (DSPARK_NORM_TOKENS // RMS_M_TILE) * hidden_blocks,
-        name_hint="dspark_hidden_zero",
-    ) as hidden_zero_tid:
-        zero_task = pl.tile.get_block_idx()
-        zero_row = (zero_task // hidden_blocks) * RMS_M_TILE
-        zero_col = (zero_task % hidden_blocks) * HIDDEN_TILE
-        padded_hidden[
-            zero_row : zero_row + RMS_M_TILE,
-            zero_col : zero_col + HIDDEN_TILE,
-        ] = pl.full([RMS_M_TILE, HIDDEN_TILE], dtype=pl.BF16, value=0.0)
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="dspark_hidden_pad",
-        deps=[hidden_zero_tid],
-    ) as hidden_pad_tid:
-        for token in pl.range(active_tokens):
-            padded_hidden[token : token + 1, :] = hidden_flat[token : token + 1, :]
-
-    # Keep this normalization local. Passing a dynamically sized temporary to
-    # the generic rms_norm inline kernel loses its inferred tensor metadata
-    # during JIT specialization.
-    with pl.spmd(
-        (padded_tokens + RMS_M_TILE - 1) // RMS_M_TILE,
+        pl.min(norm_blocks, AIV_WORKERS),
         name_hint="dspark_final_norm",
-        deps=[hidden_pad_tid],
         allow_early_resolve=True,
     ) as final_norm_tid:
-        row_block = pl.tile.get_block_idx()
-        row_offset = row_block * RMS_M_TILE
-        square_sum = pl.full([1, RMS_M_TILE], dtype=pl.FP32, value=0.0)
-        for hidden_block in pl.pipeline(D // HIDDEN_TILE, stage=2):
-            hidden_offset = hidden_block * HIDDEN_TILE
-            rms_hidden_tile = pl.cast(
-                padded_hidden[
-                    row_offset : row_offset + RMS_M_TILE,
-                    hidden_offset : hidden_offset + HIDDEN_TILE,
-                ],
-                target_type=pl.FP32,
-            )
-            square_sum = pl.add(
-                square_sum,
-                pl.reshape(
-                    pl.row_sum(pl.mul(rms_hidden_tile, rms_hidden_tile)),
-                    [1, RMS_M_TILE],
-                ),
-            )
-        inv_rms = pl.reshape(
-            pl.rsqrt(
-                pl.add(pl.mul(square_sum, 1.0 / D), EPS),
-                high_precision=True,
-            ),
-            [RMS_M_TILE, 1],
-        )
-        for hidden_block in pl.pipeline(D // HIDDEN_TILE, stage=2):
-            hidden_offset = hidden_block * HIDDEN_TILE
-            rms_hidden_tile = pl.cast(
-                padded_hidden[
-                    row_offset : row_offset + RMS_M_TILE,
-                    hidden_offset : hidden_offset + HIDDEN_TILE,
-                ],
-                target_type=pl.FP32,
-            )
-            norm_tile = pl.cast(
-                pl.reshape(
-                    final_norm_weight[
-                        hidden_offset : hidden_offset + HIDDEN_TILE
-                    ],
-                    [1, HIDDEN_TILE],
-                ),
-                target_type=pl.FP32,
-            )
-            normalized[
-                row_offset : row_offset + RMS_M_TILE,
-                hidden_offset : hidden_offset + HIDDEN_TILE,
-            ] = pl.cast(
-                pl.col_expand_mul(
-                    pl.row_expand_mul(rms_hidden_tile, inv_rms),
-                    norm_tile,
-                ),
-                target_type=pl.BF16,
-                mode="rint",
-            )
+        for block in pl.range(pl.tile.get_block_idx(), norm_blocks, AIV_WORKERS):
+            row_offset = block * RMS_M_TILE
+            if row_offset < active_tokens:
+                valid_rows = pl.min(RMS_M_TILE, active_tokens - row_offset)
+                square_sum = pl.full([1, RMS_M_TILE], dtype=pl.FP32, value=0.0)
+                for hidden_block in pl.pipeline(D // HIDDEN_TILE, stage=2):
+                    hidden_offset = hidden_block * HIDDEN_TILE
+                    compact_tile = pl.slice(
+                        hidden_flat, [RMS_M_TILE, HIDDEN_TILE], [row_offset, hidden_offset],
+                        valid_shape=[valid_rows, HIDDEN_TILE],
+                    )
+                    padded_tile = pl.fillpad(compact_tile, pad_value=pl.PadValue.zero)
+                    rms_hidden_tile = pl.cast(
+                        pl.set_validshape(padded_tile, RMS_M_TILE, HIDDEN_TILE),
+                        target_type=pl.FP32,
+                    )
+                    square_sum = pl.add(
+                        square_sum,
+                        pl.reshape(
+                            pl.row_sum(pl.mul(rms_hidden_tile, rms_hidden_tile)),
+                            [1, RMS_M_TILE],
+                        ),
+                    )
+                inv_rms = pl.reshape(
+                    pl.rsqrt(
+                        pl.add(pl.mul(square_sum, 1.0 / D), EPS),
+                        high_precision=True,
+                    ),
+                    [RMS_M_TILE, 1],
+                )
+                for hidden_block in pl.pipeline(D // HIDDEN_TILE, stage=2):
+                    hidden_offset = hidden_block * HIDDEN_TILE
+                    compact_tile = pl.slice(
+                        hidden_flat, [RMS_M_TILE, HIDDEN_TILE], [row_offset, hidden_offset],
+                        valid_shape=[valid_rows, HIDDEN_TILE],
+                    )
+                    padded_tile = pl.fillpad(compact_tile, pad_value=pl.PadValue.zero)
+                    rms_hidden_tile = pl.cast(
+                        pl.set_validshape(padded_tile, RMS_M_TILE, HIDDEN_TILE),
+                        target_type=pl.FP32,
+                    )
+                    norm_tile = pl.cast(
+                        pl.reshape(
+                            final_norm_weight[
+                                hidden_offset : hidden_offset + HIDDEN_TILE
+                            ],
+                            [1, HIDDEN_TILE],
+                        ),
+                        target_type=pl.FP32,
+                    )
+                    normalized[
+                        row_offset : row_offset + RMS_M_TILE,
+                        hidden_offset : hidden_offset + HIDDEN_TILE,
+                    ] = pl.cast(
+                        pl.col_expand_mul(
+                            pl.row_expand_mul(rms_hidden_tile, inv_rms),
+                            norm_tile,
+                        ),
+                        target_type=pl.BF16,
+                        mode="rint",
+                    )
+            else:
+                for hidden_block in pl.range(D // HIDDEN_TILE):
+                    col = hidden_block * HIDDEN_TILE
+                    normalized[row_offset : row_offset + RMS_M_TILE, col : col + HIDDEN_TILE] = pl.full(
+                        [RMS_M_TILE, HIDDEN_TILE], dtype=pl.BF16, value=0.0,
+                    )
     return final_norm_tid
 
 
@@ -251,57 +259,50 @@ def compute_base_logits(
 
 
 @pl.jit.inline
-def greedy_markov_step(
-    head_hidden: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
-    base_logits: pl.Tensor,
-    num_sampled: pl.Tensor[[B_DYN], pl.INT32],
-    last_sampled: pl.Tensor[[B_DYN], pl.INT64],
-    next_prefill_tokens: pl.Tensor[[B_DYN], pl.INT64],
-    markov_w1: pl.Tensor[[VOCAB, DSPARK_MARKOV_RANK], pl.BF16],
-    markov_w2: pl.Tensor[[VOCAB, DSPARK_MARKOV_RANK], pl.BF16],
-    confidence_head_weight: pl.Tensor[[1, D + DSPARK_MARKOV_RANK], pl.FP32],
-    draft_token_scratch: pl.Tensor[[MARKOV_M_TILE, MARKOV_ID_PAD], pl.INT32],
-    confidence_scratch: pl.Tensor[[DSPARK_QUERY_WIDTH, MARKOV_M_TILE], pl.FP32],
-    base_logits_ready_tid: pl.Scalar[pl.TASK_ID],
-    start_tid: pl.Scalar[pl.TASK_ID],
-    step: pl.Scalar[pl.INT32],
+def score_markov_panels(
+    embedding: pl.Tensor, weight: pl.Tensor, base_logits: pl.Tensor,
+    maxima: pl.Tensor, indices: pl.Tensor, batch: pl.Scalar[pl.INDEX], step: pl.Scalar[pl.INT32],
+    embedding_tid: pl.Scalar[pl.TASK_ID], logits_tid: pl.Scalar[pl.TASK_ID],
 ):
-    batch = pl.tensor.dim(num_sampled, 0)
-    previous_token_ids = pl.create_tensor([batch], dtype=pl.INT64)
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="dspark_markov_previous_tokens",
-        deps=[start_tid],
-    ) as previous_tokens_tid:
-        for request in pl.range(batch):
-            previous_token = pl.cast(0, pl.INT64)
-            if step == 0:
-                previous_token = pl.read(next_prefill_tokens, [request])
-                if pl.read(num_sampled, [request]) > 0:
-                    previous_token = pl.read(last_sampled, [request])
-            if step > 0:
-                previous_token = pl.cast(
-                    pl.read(draft_token_scratch, [request, step - 1]),
-                    pl.INT64,
-                )
-            pl.write(previous_token_ids, [request], previous_token)
+    # Each panel produces one aligned candidate vector covering sixteen requests.
+    row_groups = (batch + 15) // 16
+    live_prefix = base_logits[:DSPARK_MAX_BATCH * DSPARK_QUERY_WIDTH, :]
+    request_logits = pl.reshape(live_prefix, [DSPARK_MAX_BATCH, DSPARK_QUERY_WIDTH * VOCAB])
+    with pl.spmd(24, name_hint="dspark_markov_score_panels", deps=[embedding_tid, logits_tid]) as panel_tid:
+        block = pl.tile.get_block_idx()
+        for work in pl.range(block, row_groups * MARKOV_PANELS, 24):
+            group = work // MARKOV_PANELS
+            request = group * 16
+            panel = work % MARKOV_PANELS
+            column = panel * MARKOV_PANEL_TILE
+            rows = pl.min(16, batch - request)
+            queries = pl.slice(embedding, [16, DSPARK_MARKOV_RANK], [request, 0],
+                               valid_shape=[rows, DSPARK_MARKOV_RANK])
+            weights = weight[column:column + MARKOV_PANEL_TILE, :]
+            bias = pl.matmul(queries, weights, b_trans=True, out_dtype=pl.FP32)
+            offset = pl.cast(step, pl.INDEX) * VOCAB + column
+            base = pl.slice(request_logits, [16, MARKOV_PANEL_TILE], [request, offset],
+                            valid_shape=[rows, MARKOV_PANEL_TILE])
+            scores = pl.add(base, bias)
+            best = pl.reshape(pl.row_max(scores), [1, 16])
+            local_ids = pl.reshape(pl.row_argmax(scores), [1, 16])
+            output = group * MARKOV_PANEL_STRIDE + panel
+            maxima[output:output + 1, :] = best
+            indices[output:output + 1, :] = local_ids
+            # Duplicate the final value in padding. First-index argmax always picks a real panel.
+            if panel == MARKOV_PANELS - 1:
+                for tail in pl.range(MARKOV_PANELS, MARKOV_PANEL_STRIDE):
+                    padding = group * MARKOV_PANEL_STRIDE + tail
+                    maxima[padding:padding + 1, :] = best
+    return panel_tid
 
-    markov_bias = pl.create_tensor([batch, VOCAB], dtype=pl.FP32)
-    markov_embedding = pl.create_tensor([batch, DSPARK_MARKOV_RANK], dtype=pl.BF16)
-    (
-        markov_bias,
-        markov_embedding,
-        markov_embedding_tid,
-        markov_logits_tid,
-    ) = markov_head(
-        previous_token_ids,
-        markov_w1,
-        markov_w2,
-        markov_bias,
-        markov_embedding,
-        previous_tokens_tid,
-    )
 
+@pl.jit.inline
+def markov_confidence(
+    head_hidden: pl.Tensor, markov_embedding: pl.Tensor, confidence_head_weight: pl.Tensor,
+    confidence_scratch: pl.Tensor, batch: pl.Scalar[pl.INDEX], step: pl.Scalar[pl.INT32],
+    markov_embedding_tid: pl.Scalar[pl.TASK_ID],
+):
     confidence_blocks = (batch + CONFIDENCE_PAD - 1) // CONFIDENCE_PAD
     with pl.spmd(
         confidence_blocks,
@@ -369,13 +370,64 @@ def greedy_markov_step(
             request_base : request_base + CONFIDENCE_PAD,
         ] = confidence_prob
 
+    return confidence_scratch, confidence_tid
+
+
+@pl.jit.inline
+def first_markov_step(
+    head_hidden: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
+    base_logits: pl.Tensor,
+    num_sampled: pl.Tensor[[B_DYN], pl.INT32],
+    last_sampled: pl.Tensor[[B_DYN], pl.INT64],
+    next_prefill_tokens: pl.Tensor[[B_DYN], pl.INT64],
+    markov_w1: pl.Tensor[[VOCAB, DSPARK_MARKOV_RANK], pl.BF16],
+    markov_w2: pl.Tensor[[VOCAB, DSPARK_MARKOV_RANK], pl.BF16],
+    confidence_head_weight: pl.Tensor[[1, D + DSPARK_MARKOV_RANK], pl.FP32],
+    draft_token_scratch: pl.Tensor[[MARKOV_M_TILE, MARKOV_ID_PAD], pl.INT32],
+    confidence_scratch: pl.Tensor[[DSPARK_QUERY_WIDTH, MARKOV_M_TILE], pl.FP32],
+    base_logits_ready_tid: pl.Scalar[pl.TASK_ID],
+    start_tid: pl.Scalar[pl.TASK_ID],
+):
+    # The anchor is available while the drafter LM head is still projecting its logits.
+    step = pl.cast(0, pl.INT32)
+    batch = pl.tensor.dim(num_sampled, 0)
+    previous_token_ids = pl.create_tensor([batch], dtype=pl.INT64)
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="dspark_markov_previous_tokens",
+        deps=[start_tid],
+    ) as previous_tokens_tid:
+        for request in pl.range(batch):
+            previous_token = pl.read(next_prefill_tokens, [request])
+            if pl.read(num_sampled, [request]) > 0:
+                previous_token = pl.read(last_sampled, [request])
+            pl.write(previous_token_ids, [request], previous_token)
+
+    markov_bias = pl.create_tensor([batch, VOCAB], dtype=pl.FP32)
+    markov_embedding = pl.create_tensor([batch, DSPARK_MARKOV_RANK], dtype=pl.BF16)
+    (
+        markov_bias,
+        markov_embedding,
+        markov_embedding_tid,
+        markov_logits_tid,
+    ) = markov_head(
+        previous_token_ids,
+        markov_w1,
+        markov_w2,
+        markov_bias,
+        markov_embedding,
+        previous_tokens_tid,
+    )
+
+    confidence_scratch, confidence_tid = markov_confidence(
+        head_hidden, markov_embedding, confidence_head_weight, confidence_scratch, batch, step, markov_embedding_tid,
+    )
     with pl.spmd(
-        MARKOV_M_TILE,
+        pl.min(batch, AIV_WORKERS),
         name_hint="dspark_markov_greedy",
         deps=[base_logits_ready_tid, confidence_tid, markov_logits_tid],
     ) as greedy_tid:
-        request = pl.tile.get_block_idx()
-        if request < batch:
+        for request in pl.range(pl.tile.get_block_idx(), batch, AIV_WORKERS):
             source_row = request * DSPARK_QUERY_WIDTH + step
             # All eight reduction rows hold neighbouring vocabulary segments.
             segment_maxima = pl.full([GREEDY_ARGMAX_ROWS, GREEDY_SEGMENTS], dtype=pl.FP32, value=0.0)
@@ -397,6 +449,65 @@ def greedy_markov_step(
             winning_segment = pl.read(pl.row_argmax(segment_maxima), [0, 0])
             local_token = pl.read(segment_ids, [0, pl.cast(winning_segment, pl.INDEX)])
             winning_token = pl.cast(winning_segment * GREEDY_SEGMENT_WIDTH, pl.INT32) + local_token
+            token_row = draft_token_scratch[
+                request : request + 1,
+                0:MARKOV_ID_PAD,
+            ]
+            pl.write(token_row, [0, pl.cast(step, pl.INDEX)], winning_token)
+            draft_token_scratch[
+                request : request + 1,
+                0:MARKOV_ID_PAD,
+            ] = token_row
+
+    return greedy_tid
+
+
+@pl.jit.inline
+def greedy_markov_step(
+    head_hidden: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
+    base_logits: pl.Tensor,
+    markov_w1: pl.Tensor[[VOCAB, DSPARK_MARKOV_RANK], pl.BF16],
+    markov_w2: pl.Tensor[[VOCAB, DSPARK_MARKOV_RANK], pl.BF16],
+    confidence_head_weight: pl.Tensor[[1, D + DSPARK_MARKOV_RANK], pl.FP32],
+    draft_token_scratch: pl.Tensor[[MARKOV_M_TILE, MARKOV_ID_PAD], pl.INT32],
+    confidence_scratch: pl.Tensor[[DSPARK_QUERY_WIDTH, MARKOV_M_TILE], pl.FP32],
+    base_logits_ready_tid: pl.Scalar[pl.TASK_ID],
+    start_tid: pl.Scalar[pl.TASK_ID],
+    step: pl.Scalar[pl.INT32],
+):
+    batch = pl.tensor.dim(head_hidden, 0)
+    markov_embedding = pl.create_tensor([batch, DSPARK_MARKOV_RANK], dtype=pl.BF16)
+    with pl.spmd(pl.min(batch, AIV_WORKERS), name_hint="dspark_markov_embedding", deps=[start_tid]) as markov_embedding_tid:
+        pl.set_cache_policy(markov_w1, pl.CachePolicy.BYPASS)
+        for request in pl.range(pl.tile.get_block_idx(), batch, AIV_WORKERS):
+            previous = pl.read(draft_token_scratch, [request, step - 1])
+            token = pl.cast(previous, pl.INDEX)
+            markov_embedding[request:request + 1, :] = markov_w1[token:token + 1, :]
+    candidate_rows = ((DSPARK_MAX_BATCH + 15) // 16) * MARKOV_PANEL_STRIDE
+    maxima = pl.create_tensor([candidate_rows, 16], dtype=pl.FP32)
+    indices = pl.create_tensor([candidate_rows, 16], dtype=pl.INT32)
+    panels_tid = score_markov_panels(
+        markov_embedding, markov_w2, base_logits, maxima, indices, batch, step,
+        markov_embedding_tid, base_logits_ready_tid,
+    )
+
+    confidence_scratch, confidence_tid = markov_confidence(
+        head_hidden, markov_embedding, confidence_head_weight, confidence_scratch, batch, step, markov_embedding_tid,
+    )
+    with pl.spmd(
+        pl.min(batch, AIV_WORKERS),
+        name_hint="dspark_markov_greedy",
+        deps=[confidence_tid, panels_tid],
+    ) as greedy_tid:
+        for request in pl.range(pl.tile.get_block_idx(), batch, AIV_WORKERS):
+            first_panel = request // 16 * MARKOV_PANEL_STRIDE
+            candidates = maxima[first_panel:first_panel + MARKOV_PANEL_STRIDE, :]
+            by_request = pl.transpose(candidates, 0, 1)
+            lane = request % 16
+            winning_panels = pl.row_argmax(by_request)
+            winning_panel = pl.read(winning_panels, [lane, 0])
+            winning_offset = pl.read(indices, [first_panel + pl.cast(winning_panel, pl.INDEX), lane])
+            winning_token = pl.cast(winning_panel * MARKOV_PANEL_TILE, pl.INT32) + winning_offset
             token_row = draft_token_scratch[
                 request : request + 1,
                 0:MARKOV_ID_PAD,
@@ -442,13 +553,15 @@ def sample_from_base_logits(
             request : request + 1,
             0:MARKOV_ID_PAD,
         ] = pl.full([1, MARKOV_ID_PAD], dtype=pl.INT32, value=0)
-    final_step_tid = token_scratch_zero_tid
-    for step in pl.unroll(DSPARK_QUERY_WIDTH):
+    final_step_tid = first_markov_step(
+        head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
+        markov_w1, markov_w2, confidence_head_weight, draft_token_scratch, confidence_scratch,
+        base_logits_ready_tid, token_scratch_zero_tid,
+    )
+    for step in pl.unroll(1, DSPARK_QUERY_WIDTH):
         final_step_tid = greedy_markov_step(
-            head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
-            markov_w1, markov_w2, confidence_head_weight,
-            draft_token_scratch, confidence_scratch,
-            base_logits_ready_tid, final_step_tid, pl.cast(step, pl.INT32)
+            head_hidden, base_logits, markov_w1, markov_w2, confidence_head_weight,
+            draft_token_scratch, confidence_scratch, base_logits_ready_tid, final_step_tid, pl.cast(step, pl.INT32),
         )
     with pl.at(
         level=pl.Level.CORE_GROUP,
@@ -549,7 +662,7 @@ def _distributed_markov_sample(
         normalized,
     )
     base_logits = pl.create_tensor([MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
-    base_logits, base_logits_tid = lm_head(
+    base_logits, base_logits_tid = project_lm_head_rows(
         normalized,
         lm_head_weight,
         logit_row_indices,
@@ -562,6 +675,9 @@ def _distributed_markov_sample(
         tp_rank,
         DONE_VALUE,
         final_norm_tid,
+        DRAFT_HEAD_ROWS,
+        DRAFT_HEAD_ROW_TILE,
+        DRAFT_HEAD_GATHER_ROWS,
     )
     draft_token_ids, confidence_probs = sample_from_base_logits(
         head_hidden,
@@ -717,12 +833,20 @@ def build_tensor_specs(batch: int, *, distributed: bool = False, world_size: int
         weight[1, 0] = -1.0
         weight[2, 0] = 1.0
         weight[3, 0] = -1.0
+        # First-step winners select the last vocabulary ID on the next step.
+        weight[:2, 1] = 1.0
+        weight[4 : 4 + TP_SIZE, 1] = 1.0
+        weight[-1, 0] = -0.75
+        weight[-1, 2] = 1.0
+        weight[MARKOV_PANEL_TILE - 1, 0] = 0.5
         return weight
 
     def init_markov_w2():
         weight = torch.zeros(VOCAB, DSPARK_MARKOV_RANK, dtype=torch.bfloat16)
         weight[0, 0] = -4.0
         weight[1, 0] = 4.0
+        weight[-1, 1] = 32.0
+        weight[MARKOV_PANEL_TILE - 1 : MARKOV_PANEL_TILE + 1, 2] = 32.0
         return weight
 
     def init_confidence_head_weight():
@@ -860,12 +984,11 @@ def golden_nonzero_markov(tensors):
     normalized = (
         hidden_fp32 * inv_rms * tensors["final_norm_weight"].float()
     ).to(torch.bfloat16)
-    # The deterministic fixture has nonzero LM-head and Markov rows only in
-    # this leading support; all remaining vocabulary scores are exactly zero.
-    validation_support = 8
-    base_logits = normalized.float().matmul(
-        tensors["lm_head_weight"][:validation_support].float().t()
-    )
+    # The other vocabulary rows score zero. Sorted IDs preserve full-vocabulary
+    # argmax tie order even when the maxima belong to different panels.
+    support = torch.tensor([*range(4 + TP_SIZE), MARKOV_PANEL_TILE - 1, MARKOV_PANEL_TILE, VOCAB - 1])
+    base_logits = normalized.float().matmul(tensors["lm_head_weight"][support].float().t())
+    bias_weights = tensors["markov_w2"][support].float()
 
     previous = torch.where(
         tensors["num_sampled"] > 0,
@@ -882,12 +1005,15 @@ def golden_nonzero_markov(tensors):
             tensors["confidence_head_weight"].float().t()
         ).squeeze(-1)
         tensors["confidence_probs"][:, step] = torch.sigmoid(confidence_logits)
-        markov_bias = embedding.matmul(
-            tensors["markov_w2"][:validation_support].float().t()
-        )
+        markov_bias = embedding.matmul(bias_weights.t())
         scores = base_logits[:, step] + markov_bias
         assert torch.all(scores.max(dim=-1).values > 0)
-        previous = torch.argmax(scores, dim=-1)
+        previous = support[torch.argmax(scores, dim=-1)]
+        if step == 1:
+            assert torch.all(previous == VOCAB - 1)
+        elif step == 2:
+            assert torch.all(scores[:, -3] == scores[:, -2])
+            assert torch.all(previous == MARKOV_PANEL_TILE - 1)
         tensors["draft_token_ids"][:, step] = previous.to(torch.int32)
 
 
@@ -927,7 +1053,7 @@ def golden_distributed_markov(tensors):
 
 if __name__ == "__main__":
     import argparse
-    from golden import run
+    from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser(description="Validate the DeepSeek V4 DSpark Markov sampler.")
     parser.add_argument("--batch", type=int, choices=DSPARK_SUPPORTED_BATCHES, default=4)
@@ -967,6 +1093,7 @@ if __name__ == "__main__":
         specs=build_tensor_specs(args.batch, distributed=args.distributed),
         golden_fn=golden_fn,
         config=config,
+        compare_fn={"draft_token_ids": ratio_allclose(atol=0, rtol=0, max_error_ratio=0)},
         rtol=2e-3,
         atol=2e-3,
         compile_only=args.compile_only,

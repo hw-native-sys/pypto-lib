@@ -90,6 +90,7 @@ def _token_tile(capacity, ceiling):
 # local output projection tiling
 A_K_TILE = 256
 PROJ_A_MM_N_TILE = 128
+PROJ_A_WORKERS = 24
 PROJ_A_LARGE_N_TILE = 128
 PROJ_A_ROW_TILE = 128  # proj_a token block; one block covers T_PAD, 8 tasks/group
 B_K_TILE = 256
@@ -165,6 +166,7 @@ def _decode_o_proj_tp1_partials(
 ):
     """Compute INT32 group partials and their FP32 activation scales."""
     proj_a_rows = (t_dim + PROJ_A_ROW_TILE - 1) // PROJ_A_ROW_TILE
+    proj_a_units = proj_a_rows * (O_LORA // A_COL_TILE)
     proj_b_t_rows = (t_dim + ROW_TILE - 1) // ROW_TILE
     proj_b_padded_rows = proj_b_t_rows * ROW_TILE
 
@@ -186,25 +188,25 @@ def _decode_o_proj_tp1_partials(
             row_base_o = g * T_PAD
             out_col_g = g * O_LORA
 
-            with pl.spmd(proj_a_rows * (O_LORA // A_COL_TILE), name_hint="proj_a_mm", deps=[heads_dep],
+            with pl.spmd(pl.min(proj_a_units, PROJ_A_WORKERS), name_hint="proj_a_mm", deps=[heads_dep],
                          allow_early_resolve=True) as pa_tid:
-                pa_unit = pl.tile.get_block_idx()
-                pa_rb = pa_unit // (O_LORA // A_COL_TILE)  # row block outermost
-                nf = pa_unit % (O_LORA // A_COL_TILE)
-                pa_r0 = pa_rb * PROJ_A_ROW_TILE
-                pa_rows = pl.min(PROJ_A_ROW_TILE, t_dim - pa_r0)
-                pa_src0 = row_base_o + pa_r0
-                n0 = nf * A_COL_TILE
-                xa_first = pl.slice(o_packed, [PROJ_A_ROW_TILE, A_K_TILE], [pa_src0, 0], valid_shape=[pa_rows, A_K_TILE])
-                wa_first = wo_a[g : g + 1, n0 : n0 + A_COL_TILE, 0 : A_K_TILE]
-                acc_a = pl.matmul(xa_first, wa_first, out_dtype=pl.FP32, b_trans=True)
-                for kb in pl.pipeline(1, O_GROUP_IN // A_K_TILE, stage=4):
-                    k0 = kb * A_K_TILE
-                    xa_k_chunk = pl.slice(o_packed, [PROJ_A_ROW_TILE, A_K_TILE], [pa_src0, k0], valid_shape=[pa_rows, A_K_TILE])
-                    wa_k_chunk = wo_a[g : g + 1, n0 : n0 + A_COL_TILE, k0 : k0 + A_K_TILE]
-                    acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True)
-                # acc_a is 3D (wo_a keeps its group axis), which subscript-write cannot express.
-                o_r_pad = pl.assemble(o_r_pad, acc_a, [pa_r0, out_col_g + n0])
+                for pa_unit in pl.range(pl.tile.get_block_idx(), proj_a_units, PROJ_A_WORKERS):
+                    pa_rb = pa_unit // (O_LORA // A_COL_TILE)  # row block outermost
+                    nf = pa_unit % (O_LORA // A_COL_TILE)
+                    pa_r0 = pa_rb * PROJ_A_ROW_TILE
+                    pa_rows = pl.min(PROJ_A_ROW_TILE, t_dim - pa_r0)
+                    pa_src0 = row_base_o + pa_r0
+                    n0 = nf * A_COL_TILE
+                    xa_first = pl.slice(o_packed, [PROJ_A_ROW_TILE, A_K_TILE], [pa_src0, 0], valid_shape=[pa_rows, A_K_TILE])
+                    wa_first = wo_a[g : g + 1, n0 : n0 + A_COL_TILE, 0 : A_K_TILE]
+                    acc_a = pl.matmul(xa_first, wa_first, out_dtype=pl.FP32, b_trans=True)
+                    for kb in pl.pipeline(1, O_GROUP_IN // A_K_TILE, stage=4):
+                        k0 = kb * A_K_TILE
+                        xa_k_chunk = pl.slice(o_packed, [PROJ_A_ROW_TILE, A_K_TILE], [pa_src0, k0], valid_shape=[pa_rows, A_K_TILE])
+                        wa_k_chunk = wo_a[g : g + 1, n0 : n0 + A_COL_TILE, k0 : k0 + A_K_TILE]
+                        acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True)
+                    # acc_a is 3D (wo_a keeps its group axis), which subscript-write cannot express.
+                    o_r_pad = pl.assemble(o_r_pad, acc_a, [pa_r0, out_col_g + n0])
 
             col_g = g * O_LORA
             with pl.spmd((t_dim + QUANT_TASK_T_TILE - 1) // QUANT_TASK_T_TILE, name_hint="quant", deps=[pa_tid], allow_early_resolve=True) as q_tid:
