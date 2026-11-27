@@ -19,7 +19,7 @@ import re
 import statistics
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -1230,6 +1230,7 @@ def _run_l3_resident(
     window_sources: Mapping[str, Sequence[BinaryIO | torch.Tensor]] | None = None,
     persistent: bool = False,
     reset_persistent_windows: bool | None = None,
+    readback_outputs: bool = False,
 ) -> Any:
     """Dispatch an L3 program keeping resident weights device-resident.
 
@@ -1366,7 +1367,7 @@ def _run_l3_resident(
                         print(f"[RUN] warning: failed to free resident tensor {name}: {e}", flush=True)
 
     def _validate_once(rt: Any, resident_handles: list[tuple[str, Any, bool, int]]) -> None:
-        if golden_outputs is None:
+        if golden_outputs is None and not readback_outputs:
             return
         # A resident spec that is also an output is a read-write state buffer
         # (e.g. a KV cache): updated in place on-device and skipping the
@@ -1375,15 +1376,10 @@ def _run_l3_resident(
         # its handles are still live — so _validate compares what the kernel
         # actually produced (one end-of-run D2H, not a per-dispatch one).
         _readback_resident_outputs(rt, resident_specs, resident_handles, tensors)
-        _validate(
-            tensor_specs,
-            tensors,
-            golden_outputs,
-            rtol,
-            atol,
-            compare_fn,
-            scalar_specs_eff,
-        )
+        if golden_outputs is not None:
+            _validate(
+                tensor_specs, tensors, golden_outputs, rtol, atol, compare_fn, scalar_specs_eff,
+            )
 
     # Non-benchmark: one validation dispatch, no capture.
     if not bench:
@@ -1626,6 +1622,7 @@ def _run_pipeline(
     persistent: bool = False,
     reset_persistent_windows: bool | None = None,
     return_tensors: bool = False,
+    prepare_device_dispatch: Callable | None = None,
 ) -> RunResult:
     """Compile / run / validate body behind :func:`run`.
 
@@ -1703,6 +1700,8 @@ def _run_pipeline(
         print(f"[RUN] PASS ({total:.2f}s)", flush=True)
         return RunResult(passed=True, execution_time=total, work_dir=work_dir)
 
+    device_dispatch = prepare_device_dispatch(compiled, cfg) if prepare_device_dispatch is not None else None
+
     # A data_dir saved by a program with no golden_fn holds in/ but no out/.
     # Replaying it reuses the inputs; there is simply nothing to validate.
     inputs_only_replay = (
@@ -1729,7 +1728,7 @@ def _run_pipeline(
             work_dir, data_dir, golden_fn, save_data,
         )
 
-    benchmark_enabled = _bench_enabled()
+    benchmark_enabled = device_dispatch is None and _bench_enabled()
     stepped = sorted(n for n, s in scalar_specs_eff.items() if s.has_benchmark_step)
     if benchmark_enabled and runtime_dir is not None and stepped:
         print(
@@ -1758,7 +1757,7 @@ def _run_pipeline(
     # any benchmark rounds (validation + benchmark are handled inside; return
     # early). A Host-window entry needs the prepared worker even with no
     # resident specs because the one-shot dispatch cannot bind window sources.
-    if any(s.is_resident for s in tensor_specs) or window_sources is not None:
+    if device_dispatch is None and (any(s.is_resident for s in tensor_specs) or window_sources is not None):
         if window_sources is not None and not _is_l3(compiled):
             return _fail("window_sources require an L3 distributed program")
         with _Stage("runtime"):
@@ -1776,7 +1775,14 @@ def _run_pipeline(
         return _pass(bench)
 
     with _Stage("runtime"):
-        _dispatch(compiled, specs, tensors, scalar_specs_eff, cfg)
+        if device_dispatch is not None:
+            device_dispatch(
+                compiled, specs, tensors, scalar_specs_eff, cfg,
+                readback_outputs=golden_outputs is not None or return_tensors, window_sources=window_sources,
+                persistent=persistent, reset_persistent_windows=reset_persistent_windows,
+            )
+        else:
+            _dispatch(compiled, specs, tensors, scalar_specs_eff, cfg)
 
     # Validate the dedicated correctness dispatch before benchmark launches
     # mutate output or inout tensors in place.
@@ -1969,7 +1975,12 @@ def run(
     # ir.Program, which does not.
     entry = _jit_entry if callable(getattr(fn, "compile", None)) else _program_entry
     compile_step, prologue, compile_label = entry(fn, specs)
-    with _log_level_scope(config):
+    preparation = nullcontext()
+    if count := os.environ.get("PYPTO_CI_DEVICE_COUNT"):
+        from ci_device import prepare_dispatch
+
+        preparation = prepare_dispatch(int(count))
+    with _log_level_scope(config), preparation as prepare_device_dispatch:
         return _run_pipeline(
             specs,
             compile_step=compile_step,
@@ -1989,4 +2000,5 @@ def run(
             persistent=persistent,
             reset_persistent_windows=reset_persistent_windows,
             return_tensors=return_tensors,
+            prepare_device_dispatch=prepare_device_dispatch,
         )
