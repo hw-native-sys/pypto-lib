@@ -96,9 +96,7 @@ TOPK_GROUP_TILE = 2
 TOPK_MAX_LEAVES = (INDEXER_MAX_CANDIDATES + TOPK_LEAF_TILE - 1) // TOPK_LEAF_TILE
 TOPK_GROUPS_PER_QUERY = (TOPK_MAX_LEAVES + TOPK_GROUP_TILE - 1) // TOPK_GROUP_TILE
 TOPK_GROUP_WORKERS = 48
-TOPK_GROUP_ROOT_ROWS = PREFILL_DENSE_TILE * TOPK_GROUPS_PER_QUERY
-TOPK_GROUP_SCRATCH_ROWS = TOPK_GROUP_WORKERS * TOPK_GROUP_TILE
-TOPK_ARENA_ROWS = TOPK_GROUP_ROOT_ROWS + TOPK_GROUP_SCRATCH_ROWS
+TOPK_ARENA_ROWS = PREFILL_DENSE_TILE * TOPK_GROUPS_PER_QUERY
 TOPK_SCORE_WORKERS = 24
 SCORE_CANDIDATE_TILE = 64
 SCORE_QUERY_TILE = 4
@@ -110,6 +108,16 @@ assert TOPK_SHORT_LEAF_TILE >= IDX_TOPK
 
 
 @pl.jit.inline
+def _merge_top512_pairs(
+    left: pl.Tile[[1, TOPK_PAIR_WIDTH], pl.FP32],
+    right: pl.Tile[[1, TOPK_PAIR_WIDTH], pl.FP32],
+):
+    merge_tmp = pl.tile.create([1, 2 * TOPK_PAIR_WIDTH], dtype=pl.FP32)
+    merged_all = pl.tile.mrgsort(left, right, tmp=merge_tmp)
+    return pl.tile.slice(merged_all, [1, TOPK_PAIR_WIDTH], [0, 0])
+
+
+@pl.jit.inline
 def _merge2_top512_pairs(
     pair_arena: pl.Tensor,
     left_slot: pl.Scalar[pl.INDEX],
@@ -118,9 +126,7 @@ def _merge2_top512_pairs(
 ) -> None:
     left = pl.load(pair_arena, [left_slot, 0], [1, TOPK_PAIR_WIDTH])
     right = pl.load(pair_arena, [right_slot, 0], [1, TOPK_PAIR_WIDTH])
-    merge_tmp = pl.tile.create([1, 2 * TOPK_PAIR_WIDTH], dtype=pl.FP32)
-    merged_all = pl.tile.mrgsort(left, right, tmp=merge_tmp)
-    merged = pl.tile.slice(merged_all, [1, TOPK_PAIR_WIDTH], [0, 0])
+    merged = _merge_top512_pairs(left, right)
     pl.store(merged, [output_slot, 0], pair_arena)
 
 
@@ -129,15 +135,13 @@ def _merge_topk_level_pairs(
     pair_arena: pl.Tensor,
     arena_base: pl.Scalar[pl.INDEX],
     input_count: pl.Scalar[pl.INDEX],
-    input_base: pl.Scalar[pl.INDEX],
-    output_base: pl.Scalar[pl.INDEX],
 ) -> None:
     output_count = (input_count + 1) // 2
     for output in pl.range(output_count):
-        left_slot = arena_base + input_base + 2 * output
+        left_slot = arena_base + 2 * output
         right_slot = left_slot + 1
-        output_slot = arena_base + output_base + output
-        if right_slot < arena_base + input_base + input_count:
+        output_slot = arena_base + output
+        if right_slot < arena_base + input_count:
             _merge2_top512_pairs(pair_arena, left_slot, right_slot, output_slot)
         else:
             forwarded = pl.load(pair_arena, [left_slot, 0], [1, TOPK_PAIR_WIDTH])
@@ -172,48 +176,17 @@ def _short_leaf_pairs(
     return short_top_pairs
 
 
-@pl.jit.incore
-def _topk_single_leaf(
-    position_ids: pl.Tensor,
-    local_request_ids: pl.Tensor,
-    score_arena: pl.Tensor,
-    topk_indices: pl.Tensor,
-    tile_base: pl.Scalar[pl.INDEX],
-):
-    query = pl.tile.get_block_idx()
-    output_query = tile_base + query
-    position = pl.read(position_ids, [output_query])
-    request_id = pl.read(local_request_ids, [output_query])
-    visible_count = pl.const(0, pl.INDEX)
-    if request_id >= 0:
-        visible_count = pl.max(pl.min(pl.cast((position + 1) // COMPRESS_RATIO, pl.INDEX), INDEXER_MAX_CANDIDATES), 0)
-    if visible_count > 0:
-        top_pairs = _short_leaf_pairs(score_arena, query, pl.const(0, pl.INDEX), visible_count)
-        selected = pl.tile.gather_mask(top_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-        select_ramp = pl.tile.arange(0, [1, IDX_TOPK], dtype=pl.INT32)
-        select_bound = pl.cast(pl.cast(pl.min(visible_count, IDX_TOPK), pl.INT32), pl.FP32)
-        select_valid = pl.tile.cmps(pl.cast(select_ramp, pl.FP32), select_bound, cmp_type=2)
-        selected = pl.tile.select(select_valid, selected, -1)
-        pl.store(selected, [output_query, 0], topk_indices)
-    else:
-        missing = pl.tile.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
-        pl.store(missing, [output_query, 0], topk_indices)
-
-
 @pl.jit.inline
-def _topk_leaf(
+def _topk_leaf_pairs(
     score_arena: pl.Tensor,
-    pair_arena: pl.Tensor,
     query: pl.Scalar[pl.INDEX],
     logical_begin: pl.Scalar[pl.INDEX],
     valid_count: pl.Scalar[pl.INDEX],
-    output_slot: pl.Scalar[pl.INDEX],
-) -> None:
-    logical_begin_i32 = pl.cast(logical_begin, pl.INT32)
+):
     if valid_count <= TOPK_SHORT_LEAF_TILE:
-        short_top_pairs = _short_leaf_pairs(score_arena, query, logical_begin, valid_count)
-        pl.store(short_top_pairs, [output_slot, 0], pair_arena)
+        top_pairs = _short_leaf_pairs(score_arena, query, logical_begin, valid_count)
     else:
+        logical_begin_i32 = pl.cast(logical_begin, pl.INT32)
         leaf_index_ramp = pl.tile.arange(0, [1, TOPK_LEAF_TILE], dtype=pl.INT32)
         leaf_indices = pl.add(leaf_index_ramp, logical_begin_i32)
         leaf_scores_raw = pl.load(
@@ -229,104 +202,102 @@ def _topk_leaf(
         pairs = pl.tile.mrgsort(pairs, block_len=64)
         pairs = pl.tile.mrgsort(pairs, block_len=256)
         pairs = pl.tile.mrgsort(pairs, block_len=1024)
-        pairs = pl.tile.mrgsort(pairs, block_len=4096)
-        top_pairs = pl.tile.slice(pairs, [1, TOPK_PAIR_WIDTH], [0, 0])
-        pl.store(top_pairs, [output_slot, 0], pair_arena)
+        # Each sorted run can contribute at most 512 pairs to the final prefix.
+        run_width = 2 * (TOPK_LEAF_TILE // 4)
+        first = pl.tile.slice(pairs, [1, TOPK_PAIR_WIDTH], [0, 0])
+        second = pl.tile.slice(pairs, [1, TOPK_PAIR_WIDTH], [0, run_width])
+        third = pl.tile.slice(pairs, [1, TOPK_PAIR_WIDTH], [0, 2 * run_width])
+        fourth = pl.tile.slice(pairs, [1, TOPK_PAIR_WIDTH], [0, 3 * run_width])
+        merge_tmp = pl.tile.create([1, 4 * TOPK_PAIR_WIDTH], dtype=pl.FP32)
+        merged = pl.tile.mrgsort(first, second, third, fourth, merge_tmp)
+        top_pairs = pl.tile.slice(merged, [1, TOPK_PAIR_WIDTH], [0, 0])
+    return top_pairs
+
+
+@pl.jit.inline
+def _store_topk_indices(
+    top_pairs: pl.Tile[[1, TOPK_PAIR_WIDTH], pl.FP32],
+    visible_count: pl.Scalar[pl.INDEX],
+    topk_indices: pl.Tensor,
+    output_query: pl.Scalar[pl.INDEX],
+) -> None:
+    selected = pl.tile.gather_mask(top_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+    select_ramp = pl.tile.arange(0, [1, IDX_TOPK], dtype=pl.INT32)
+    select_bound = pl.cast(pl.cast(pl.min(visible_count, IDX_TOPK), pl.INT32), pl.FP32)
+    select_valid = pl.tile.cmps(pl.cast(select_ramp, pl.FP32), select_bound, cmp_type=2)
+    selected = pl.tile.select(select_valid, selected, -1)
+    pl.store(selected, [output_query, 0], topk_indices)
+
+
+@pl.jit.inline
+def _store_topk_group(
+    group_pairs: pl.Tile[[1, TOPK_PAIR_WIDTH], pl.FP32],
+    visible_count: pl.Scalar[pl.INDEX],
+    group_count: pl.Scalar[pl.INDEX],
+    pair_arena: pl.Tensor,
+    root_slot: pl.Scalar[pl.INDEX],
+    topk_indices: pl.Tensor,
+    output_query: pl.Scalar[pl.INDEX],
+) -> None:
+    if group_count == 1:
+        _store_topk_indices(group_pairs, visible_count, topk_indices, output_query)
+    else:
+        pl.store(group_pairs, [root_slot, 0], pair_arena)
 
 
 @pl.jit.incore
-def _topk_group_wave(
+def _topk_query_rows(
     position_ids: pl.Tensor,
     local_request_ids: pl.Tensor,
     score_arena: pl.Tensor,
     pair_arena: pl.Tensor,
+    topk_indices: pl.Tensor,
     tile_base: pl.Scalar[pl.INDEX],
     tile_rows: pl.Scalar[pl.INDEX],
 ):
-    """Reduce striped two-leaf subtrees into compact roots."""
+    """Reduce each query's sorted groups to its final Top-512 row."""
     worker = pl.tile.get_block_idx()
-    global_group_base = 0
-    for query in pl.range(tile_rows):
-        position = pl.read(position_ids, [tile_base + query])
-        request_id = pl.read(local_request_ids, [tile_base + query])
-        visible_count = 0
+    for query in pl.range(worker, tile_rows, TOPK_GROUP_WORKERS):
+        output_query = tile_base + query
+        request_id = pl.read(local_request_ids, [output_query])
+        visible_count = pl.const(0, pl.INDEX)
         if request_id >= 0:
-            visible_count = pl.max(pl.min((position + 1) // COMPRESS_RATIO, INDEXER_MAX_CANDIDATES), 0)
-        leaf_count = (visible_count + TOPK_LEAF_TILE - 1) // TOPK_LEAF_TILE
-        group_count = (leaf_count + TOPK_GROUP_TILE - 1) // TOPK_GROUP_TILE
-        base_mod = global_group_base % TOPK_GROUP_WORKERS
-        first_group = (worker + base_mod) % TOPK_GROUP_WORKERS
-        for group in pl.range(first_group, group_count, TOPK_GROUP_WORKERS):
-            leaf_begin = group * TOPK_GROUP_TILE
-            group_leaf_count = pl.min(TOPK_GROUP_TILE, leaf_count - leaf_begin)
-            group_root_slot = query * TOPK_GROUPS_PER_QUERY + group
-            if group_leaf_count == 1:
-                logical_begin = leaf_begin * TOPK_LEAF_TILE
-                valid_count = pl.min(TOPK_LEAF_TILE, visible_count - logical_begin)
-                _topk_leaf(
-                    score_arena, pair_arena,
-                    query, logical_begin, valid_count,
-                    group_root_slot,
-                )
-            else:
-                scratch_base = TOPK_GROUP_ROOT_ROWS + worker * TOPK_GROUP_TILE
-                for group_leaf in pl.unroll(TOPK_GROUP_TILE):
-                    leaf = leaf_begin + group_leaf
-                    logical_begin = leaf * TOPK_LEAF_TILE
-                    valid_count = pl.min(TOPK_LEAF_TILE, visible_count - logical_begin)
-                    _topk_leaf(
-                        score_arena, pair_arena,
-                        query, logical_begin, valid_count,
-                        scratch_base + group_leaf,
+            position = pl.read(position_ids, [output_query])
+            visible = pl.cast((position + 1) // COMPRESS_RATIO, pl.INDEX)
+            visible_count = pl.max(0, pl.min(visible, INDEXER_MAX_CANDIDATES))
+        if visible_count > 0:
+            group_tile = TOPK_GROUP_TILE * TOPK_LEAF_TILE
+            group_count = (visible_count + group_tile - 1) // group_tile
+            arena_base = query * TOPK_GROUPS_PER_QUERY
+            for group in pl.range(group_count):
+                group_begin = group * group_tile
+                group_visible = visible_count - group_begin
+                left_count = pl.min(group_visible, TOPK_LEAF_TILE)
+                left_pairs = _topk_leaf_pairs(score_arena, query, group_begin, left_count)
+                root_slot = arena_base + group
+                if group_visible > TOPK_LEAF_TILE:
+                    right_begin = group_begin + TOPK_LEAF_TILE
+                    right_count = pl.min(group_visible - TOPK_LEAF_TILE, TOPK_LEAF_TILE)
+                    right_pairs = _topk_leaf_pairs(score_arena, query, right_begin, right_count)
+                    group_pairs = _merge_top512_pairs(left_pairs, right_pairs)
+                    _store_topk_group(
+                        group_pairs, visible_count, group_count, pair_arena, root_slot, topk_indices, output_query,
                     )
-                _merge2_top512_pairs(pair_arena, scratch_base, scratch_base + 1, group_root_slot)
-        global_group_base = global_group_base + group_count
-
-
-@pl.jit.incore
-def _topk_query_merge(
-    position_ids: pl.Tensor,
-    local_request_ids: pl.Tensor,
-    pair_arena: pl.Tensor,
-    topk_indices: pl.Tensor,
-    tile_base: pl.Scalar[pl.INDEX],
-):
-    """Merge compact group roots into one Top-512 row."""
-    query = pl.tile.get_block_idx()
-    output_query = tile_base + query
-    position = pl.read(position_ids, [output_query])
-    request_id = pl.read(local_request_ids, [output_query])
-    visible_count = 0
-    if request_id >= 0:
-        visible_count = pl.max(pl.min((position + 1) // COMPRESS_RATIO, INDEXER_MAX_CANDIDATES), 0)
-    empty_indices = pl.tile.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
-    pl.store(empty_indices, [output_query, 0], topk_indices)
-
-    if visible_count > 0:
-        leaf_count = (visible_count + TOPK_LEAF_TILE - 1) // TOPK_LEAF_TILE
-        group_count = (leaf_count + TOPK_GROUP_TILE - 1) // TOPK_GROUP_TILE
-        arena_base = query * TOPK_GROUPS_PER_QUERY
-        if group_count > 1:
-            level1_count = (group_count + 1) // 2
-            _merge_topk_level_pairs(pair_arena, arena_base, group_count, 0, 0)
-            if level1_count > 1:
-                level2_count = (level1_count + 1) // 2
-                _merge_topk_level_pairs(pair_arena, arena_base, level1_count, 0, 0)
-                if level2_count > 1:
-                    level3_count = (level2_count + 1) // 2
-                    _merge_topk_level_pairs(pair_arena, arena_base, level2_count, 0, 0)
-                    if level3_count > 1:
-                        _merge_topk_level_pairs(pair_arena, arena_base, level3_count, 0, 0)
-
-        root_pairs = pl.load(pair_arena, [arena_base, 0], [1, TOPK_PAIR_WIDTH])
-        root_indices = pl.tile.gather_mask(root_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-        valid_topk = pl.min(visible_count, IDX_TOPK)
-        index_ramp = pl.tile.arange(0, [1, IDX_TOPK], dtype=pl.INT32)
-        index_ramp_fp32 = pl.cast(index_ramp, pl.FP32)
-        valid_topk_i32 = pl.cast(valid_topk, pl.INT32)
-        valid_mask = pl.tile.cmps(index_ramp_fp32, pl.cast(valid_topk_i32, pl.FP32), cmp_type=2)
-        output_indices = pl.tile.select(valid_mask, root_indices, -1)
-        pl.store(output_indices, [output_query, 0], topk_indices)
+                else:
+                    _store_topk_group(
+                        left_pairs, visible_count, group_count, pair_arena, root_slot, topk_indices, output_query,
+                    )
+            if group_count > 1:
+                root_count = group_count
+                for _ in pl.range(4):
+                    if root_count > 1:
+                        _merge_topk_level_pairs(pair_arena, arena_base, root_count)
+                        root_count = (root_count + 1) // 2
+                root_pairs = pl.load(pair_arena, [arena_base, 0], [1, TOPK_PAIR_WIDTH])
+                _store_topk_indices(root_pairs, visible_count, topk_indices, output_query)
+        else:
+            missing = pl.tile.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
+            pl.store(missing, [output_query, 0], topk_indices)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -351,15 +322,6 @@ def _prefill_indexer_score_topk(
     idx_cache_rows = idx_block_num * BLOCK_SIZE
     kv_cache_i8_flat = pl.reshape(idx_kv_cache, [idx_cache_rows, IDX_HEAD_DIM])
     kv_scale_row_flat = pl.reshape(idx_kv_scale, [1, idx_cache_rows])
-    # Short rows own a complete sorted leaf and can publish their indices directly.
-    tile_position_bound = pl.create_tensor([1], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_position_bound") as bound_tid:
-        peak = pl.const(-1, pl.INT32)
-        for pos_row, (peak_so_far,) in pl.range(tile_rows, init_values=(peak,)):
-            pos_value = pl.read(position_ids, [tile_base + pos_row])
-            peak = pl.yield_(pl.max(peak_so_far, pos_value))
-        pl.write(tile_position_bound, [0], peak)
-
     with pl.spmd(
         TOPK_SCORE_WORKERS, name_hint="prefill_idx_score_leaf_wave", deps=[completion[0]],
         optimizations=[pl.cross_core_slot(slot_num=2, local_slot_num=1)],
@@ -435,22 +397,35 @@ def _prefill_indexer_score_topk(
                                 for shard_lane in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
                                     score_lane = pl.aiv_shard(score_i32)
                                 for aiv_lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                                    logical_page = logical_row // BLOCK_SIZE
+                                    first_block_raw = pl.read(idx_block_table, [request_id, logical_page])
+                                    second_block_raw = pl.read(idx_block_table, [request_id, logical_page + 1])
+                                    first_block_safe = pl.max(pl.min(first_block_raw, idx_block_num - 1), 0)
+                                    second_block_safe = pl.max(pl.min(second_block_raw, idx_block_num - 1), 0)
+                                    first_row = pl.cast(first_block_safe, pl.INDEX) * BLOCK_SIZE
+                                    second_row = pl.cast(second_block_safe, pl.INDEX) * BLOCK_SIZE
                                     kv_scale = pl.tile.create([1, SCORE_CANDIDATE_TILE], pl.FP32)
-                                    page_flags = pl.tile.full([1, SCORE_CANDIDATE_TILE], pl.FP32, 0.0)
-                                    for scale_part in pl.unroll(SCORE_CANDIDATE_TILE // BLOCK_SIZE):
-                                        scale_begin = scale_part * BLOCK_SIZE
-                                        scale_logical_page = (logical_row + scale_begin) // BLOCK_SIZE
-                                        scale_block_raw = pl.read(idx_block_table, [request_id, scale_logical_page])
-                                        scale_block_safe = pl.max(pl.min(scale_block_raw, idx_block_num - 1), 0)
-                                        scale_physical_row = pl.cast(scale_block_safe, pl.INDEX) * BLOCK_SIZE
-                                        kv_scale = pl.tile.gather_row(
-                                            kv_scale, kv_scale_row_flat, [0, scale_begin],
-                                            [0, scale_physical_row], [1, BLOCK_SIZE],
-                                        )
-                                        if scale_block_raw >= 0 and scale_block_raw < idx_block_num:
-                                            part_flags = pl.tile.full([1, BLOCK_SIZE], pl.FP32, 1.0)
-                                            page_flags = pl.tile.assemble(page_flags, part_flags, [0, scale_begin])
-                                    page_mask = pl.tile.cmps(page_flags, 0, cmp_type=1)
+                                    kv_scale = pl.tile.gather_row(
+                                        kv_scale, kv_scale_row_flat, [0, 0], [0, first_row], [1, BLOCK_SIZE],
+                                    )
+                                    kv_scale = pl.tile.gather_row(
+                                        kv_scale, kv_scale_row_flat, [0, BLOCK_SIZE], [0, second_row], [1, BLOCK_SIZE],
+                                    )
+                                    first_valid = first_block_raw >= 0 and first_block_raw < idx_block_num
+                                    second_valid = second_block_raw >= 0 and second_block_raw < idx_block_num
+                                    mask_required = not (first_valid and second_valid)
+                                    page_mask = pl.tile.create([1, 32], pl.UINT8)
+                                    if mask_required:
+                                        page_flags = pl.tile.full([1, SCORE_CANDIDATE_TILE], pl.FP32, 0.0)
+                                        if first_valid:
+                                            first_flags = pl.tile.full([1, BLOCK_SIZE], pl.FP32, 1.0)
+                                            page_flags = pl.tile.assemble(page_flags, first_flags, [0, 0])
+                                        if second_valid:
+                                            second_flags = pl.tile.full([1, BLOCK_SIZE], pl.FP32, 1.0)
+                                            page_flags = pl.tile.assemble(page_flags, second_flags, [0, BLOCK_SIZE])
+                                        invalid_page_mask = pl.tile.cmps(page_flags, 0, cmp_type=1)
+                                        page_mask = pl.tile.assemble(page_mask, invalid_page_mask, [0, 0])
+                                    page_mask = pl.set_validshape(page_mask, 1, SCORE_CANDIDATE_TILE // 8)
                                     lane_begin = aiv_lane * (SCORE_QUERY_TILE // 2)
                                     for member in pl.range(lane_begin, lane_begin + SCORE_QUERY_TILE // 2):
                                         if query + member < tile_rows:
@@ -468,27 +443,18 @@ def _prefill_indexer_score_topk(
                                                 score_sum = pl.row_sum(score_fp32, tmp_tile=score_reduce_tmp)
                                                 score_row = pl.reshape(score_sum, [1, SCORE_CANDIDATE_TILE])
                                                 score_scaled = pl.mul(score_row, kv_scale)
-                                                score_masked = pl.tile.select(page_mask, score_scaled, FP32_NEG_INF)
                                                 if logical_row < member_count:
-                                                    valid_rows = pl.min(SCORE_CANDIDATE_TILE, member_count - logical_row)
-                                                    score_view = pl.set_validshape(score_masked, 1, valid_rows)
-                                                    score_padded = pl.fillpad(score_view, pad_value=pl.PadValue.min)
-                                                    score_floor = pl.tile.full([1, SCORE_CANDIDATE_TILE], pl.FP32, FP32_NEG_INF)
-                                                    score_valid = pl.maximum(score_padded, score_floor)
-                                                    pl.store(score_valid, [query + member, logical_row], score_arena)
+                                                    # The TopK leaf clips the score row to the visible prefix.
+                                                    if mask_required:
+                                                        score_masked = pl.tile.select(page_mask, score_scaled, FP32_NEG_INF)
+                                                        pl.store(score_masked, [query + member, logical_row], score_arena)
+                                                    else:
+                                                        pl.store(score_scaled, [query + member, logical_row], score_arena)
 
-    if pl.read(tile_position_bound, [0]) < TOPK_SHORT_LEAF_TILE * COMPRESS_RATIO:
-        with pl.spmd(tile_rows, name_hint="prefill_idx_single_leaf", deps=[score_tid, bound_tid]) as single_tid:
-            _topk_single_leaf(position_ids, local_request_ids, score_arena, topk_indices, tile_base)
-        completion[0] = single_tid
-    else:
-        with pl.spmd(TOPK_GROUP_WORKERS, name_hint="prefill_idx_topk_group_wave", deps=[score_tid]) as topk_tid:
-            _topk_group_wave(position_ids, local_request_ids, score_arena, pair_arena, tile_base, tile_rows)
-
-        with pl.spmd(tile_rows, name_hint="prefill_idx_topk_query_merge", deps=[topk_tid]) as merge_tid:
-            _topk_query_merge(position_ids, local_request_ids, pair_arena, topk_indices, tile_base)
-
-        completion[0] = merge_tid
+    output_workers = pl.min(tile_rows, TOPK_GROUP_WORKERS)
+    with pl.spmd(output_workers, name_hint="prefill_idx_topk_query_rows", deps=[score_tid]) as topk_tid:
+        _topk_query_rows(position_ids, local_request_ids, score_arena, pair_arena, topk_indices, tile_base, tile_rows)
+    completion[0] = topk_tid
     return topk_indices
 
 
@@ -1225,7 +1191,7 @@ def prefill_indexer_selection_test(
     completion[0] = ready_tid
     tile_base = pl.cast(0, pl.INDEX)
     tile_rows = pl.tensor.dim(position_ids, 0)
-    score_arena = pl.create_tensor([SCORE_QUERY_TILE, TOPK_LEAF_TILE], dtype=pl.FP32, manual_dep=True)
+    score_arena = pl.create_tensor([SCORE_QUERY_TILE, INDEXER_MAX_CANDIDATES], dtype=pl.FP32, manual_dep=True)
     pair_arena = pl.create_tensor([TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], dtype=pl.FP32, manual_dep=True)
     _prefill_indexer_score_topk(
         query_i8, query_scale, weights,
@@ -1288,9 +1254,10 @@ def build_selection_tensor_specs(visible_counts, request_ids):
     cache = torch.zeros(block_count * BLOCK_SIZE, IDX_HEAD_DIM, dtype=torch.int8)
     codes = torch.arange(1, cache.shape[0] + 1)
     cache[:, 0] = (codes % 64).to(torch.int8)
-    cache[:, 1] = (codes // 64).to(torch.int8)
+    cache[:, 1] = (64 + (codes // 64) % 64).to(torch.int8)
     cache = cache.reshape(block_count, BLOCK_SIZE, 1, IDX_HEAD_DIM)
-    cache_scales = torch.full((block_count, BLOCK_SIZE, 1, 1), 1.0 / 32)
+    # Each scale interval keeps the scores distinct after the two base-64 digits wrap.
+    cache_scales = torch.exp2((codes // 4096).float() - 5).reshape(block_count, BLOCK_SIZE, 1, 1)
     table = torch.full((request_count, IDX_CACHE_MAX_BLOCKS), -1, dtype=torch.int32)
     pages = torch.arange(block_count, dtype=torch.int32).reshape(page_count, request_count).T
     for request in range(request_count):
@@ -1566,6 +1533,9 @@ if __name__ == "__main__":
         "projection-tail": None,
         "short-merge-boundary": ((512, 513, 1), (1, 0, 1)),
         "short-long-boundary": ((2048, 2049, 0), (0, 1, -1)),
+        "leaf-boundary": ((8192, 8193, 1), (0, 1, 0)),
+        "single-group-limit": ((16384, 16383, 16385), (1, 0, -1)),
+        "multi-group": ((16385, 8193, 0), (0, 1, 0)),
         "empty-and-prefix": ((0, 1, 511), (0, 1, 0)),
     }
 

@@ -100,7 +100,7 @@ from prefill_o_proj import (
 
 if TP_SIZE == 1:
     from prefill_o_proj import gather_o_proj_full_weights
-from qkv_proj_rope import kv_proj_rope, q_proj_rope, rope_prepare
+from qkv_proj_rope import kv_proj_rope, prepare_prefill_query_rope, q_proj_rope, rope_prepare
 
 
 # Largest runtime token count the prefill path accepts (Issue #905 P4).
@@ -163,6 +163,56 @@ CSA_ROPE_TILE = 8
 assert COMPRESS_RATIO == INDEXER_COMPRESS_RATIO
 assert PREFILL_ATTN_BLOCKS <= VALID_BLOCK_MASK_COLS
 assert IDX_TOPK <= SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE
+
+
+@pl.jit.inline(auto_scope=False)
+def prepare_csa_sparse_indices(
+    position_ids: pl.Tensor, local_request_ids: pl.Tensor, ori_block_table: pl.Tensor,
+    t_dim: pl.Scalar[pl.INDEX], group_tokens: pl.Scalar[pl.INT32],
+) -> tuple[pl.Tensor, pl.Tensor]:
+    """Prepare raw KV indices and visible sparse blocks for every CSA layer."""
+    swa_indices = pl.create_tensor([t_dim, WIN], dtype=pl.INT32)
+    valid_block_mask = pl.create_tensor([t_dim, VALID_BLOCK_MASK_COLS], dtype=pl.INT32)
+    if group_tokens > 0:
+        csa_topk_blocks = (t_dim + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE
+        topk_workers = pl.min(csa_topk_blocks, pl.system.available_aiv_count())
+        for worker in pl.spmd(topk_workers, name_hint="prefill_csa_sparse_idx_tile"):
+            for topk_block in pl.range(worker, csa_topk_blocks, pl.tile.get_block_num()):
+                topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
+                for topk_dt in pl.range(CSA_TOPK_TOKEN_TILE):
+                    t_idx = topk_t0 + topk_dt
+                    swa_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
+                    mask_row = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
+                    if t_idx < t_dim:
+                        request_id = pl.read(local_request_ids, [t_idx])
+                        if request_id >= 0:
+                            abs_pos = pl.read(position_ids, [t_idx])
+                            # Sparse-block liveness from the dense TopK prefix.
+                            visible_cmp = pl.min((abs_pos + 1) // COMPRESS_RATIO, pl.cast(IDX_TOPK, pl.INT32))
+                            for mask_sb in pl.unroll(PREFILL_ATTN_BLOCKS):
+                                cmp_lo = pl.max(mask_sb * PREFILL_ATTN_TILE - WIN, pl.cast(0, pl.INT32))
+                                cmp_hi = pl.min(
+                                    (mask_sb + 1) * PREFILL_ATTN_TILE - WIN,
+                                    pl.cast(SPARSE_CMP_BIAS_COLS, pl.INT32),
+                                )
+                                if cmp_lo < cmp_hi:
+                                    if visible_cmp > cmp_lo:
+                                        pl.write(mask_row, [0, mask_sb], pl.cast(1, pl.INT32))
+                            window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
+                            key_start_abs = abs_pos + 1 - window_valid
+                            for win_col in pl.range(WIN):
+                                win_col_i32 = pl.cast(win_col, pl.INT32)
+                                if win_col_i32 < window_valid:
+                                    key_abs = key_start_abs + win_col_i32
+                                    blk_slot = key_abs // BLOCK_SIZE
+                                    blk = pl.read(ori_block_table, [request_id, pl.cast(blk_slot, pl.INDEX)])
+                                    if blk >= 0:
+                                        row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
+                                        pl.write(swa_row, [0, win_col], row)
+                                        pl.write(mask_row, [0, win_col // PREFILL_ATTN_TILE], pl.cast(1, pl.INT32))
+                        swa_indices[t_idx : t_idx + 1, 0:WIN] = swa_row
+                        valid_block_mask[t_idx : t_idx + 1, 0:VALID_BLOCK_MASK_COLS] = mask_row
+    return swa_indices, valid_block_mask
 
 
 def _prefill_attention_csa(
@@ -360,44 +410,9 @@ def _prefill_attention_csa(
         inner_state_slot_mapping,
     )
 
-    swa_indices = pl.create_tensor([t_dim, WIN], dtype=pl.INT32)
-    valid_block_mask = pl.create_tensor([t_dim, VALID_BLOCK_MASK_COLS], dtype=pl.INT32)
-    csa_topk_blocks = (t_dim + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE
-    for topk_block in pl.spmd(csa_topk_blocks, name_hint="prefill_csa_sparse_idx_tile"):
-        topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
-        for topk_dt in pl.range(CSA_TOPK_TOKEN_TILE):
-            t_idx = topk_t0 + topk_dt
-            swa_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
-            mask_row = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
-            if t_idx < t_dim:
-                request_id = pl.read(local_request_ids, [t_idx])
-                if request_id >= 0:
-                    abs_pos = pl.read(position_ids, [t_idx])
-                    # Sparse-block liveness from the dense TopK prefix.
-                    visible_cmp = pl.min((abs_pos + 1) // COMPRESS_RATIO, pl.cast(IDX_TOPK, pl.INT32))
-                    for mask_sb in pl.unroll(PREFILL_ATTN_BLOCKS):
-                        cmp_lo = pl.max(mask_sb * PREFILL_ATTN_TILE - WIN, pl.cast(0, pl.INT32))
-                        cmp_hi = pl.min(
-                            (mask_sb + 1) * PREFILL_ATTN_TILE - WIN,
-                            pl.cast(SPARSE_CMP_BIAS_COLS, pl.INT32),
-                        )
-                        if cmp_lo < cmp_hi:
-                            if visible_cmp > cmp_lo:
-                                pl.write(mask_row, [0, mask_sb], pl.cast(1, pl.INT32))
-                    window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
-                    key_start_abs = abs_pos + 1 - window_valid
-                    for win_col in pl.range(WIN):
-                        win_col_i32 = pl.cast(win_col, pl.INT32)
-                        if win_col_i32 < window_valid:
-                            key_abs = key_start_abs + win_col_i32
-                            blk_slot = key_abs // BLOCK_SIZE
-                            blk = pl.read(ori_block_table, [request_id, pl.cast(blk_slot, pl.INDEX)])
-                            if blk >= 0:
-                                row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
-                                pl.write(swa_row, [0, win_col], row)
-                                pl.write(mask_row, [0, win_col // PREFILL_ATTN_TILE], pl.cast(1, pl.INT32))
-                swa_indices[t_idx : t_idx + 1, 0:WIN] = swa_row
-                valid_block_mask[t_idx : t_idx + 1, 0:VALID_BLOCK_MASK_COLS] = mask_row
+    swa_indices, valid_block_mask = prepare_csa_sparse_indices(
+        position_ids, local_request_ids, ori_block_table, t_dim, pl.const(1, pl.INT32),
+    )
 
     unpacked_weight_dep = pl.system.task_dummy(deps=[])
     wo_a_nz = pl.create_tensor([O_GROUPS, O_LORA, O_GROUP_IN], dtype=pl.BF16, layout=pl.NZ)
@@ -1115,6 +1130,35 @@ def prepare_csa_compact_plan(
             csa_compact_eligible(starts, checkpoints, pos, raw_map, cmp_map, index_map, state_map, index_state_map, plan)
 
 
+@pl.jit.inline(auto_scope=False)
+def prepare_csa_indexer_rope(
+    freqs_cos: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    local_base: pl.Scalar[pl.INDEX],
+    q_dim: pl.Scalar[pl.INDEX],
+    active: pl.Scalar[pl.INT32],
+):
+    """Prepare half-width FP32 RoPE for local indexer queries."""
+    idx_cos = pl.create_tensor([q_dim, HALF_ROPE], dtype=pl.FP32)
+    idx_sin = pl.create_tensor([q_dim, HALF_ROPE], dtype=pl.FP32)
+    if active > 0:
+        freqs_cos_local = pl.slice(freqs_cos, [q_dim, ROPE_HEAD_DIM], [local_base, 0])
+        freqs_sin_local = pl.slice(freqs_sin, [q_dim, ROPE_HEAD_DIM], [local_base, 0])
+        rope_blocks = (q_dim + CSA_ROPE_TILE - 1) // CSA_ROPE_TILE
+        rope_workers = pl.min(rope_blocks, pl.system.available_aiv_count())
+        for worker in pl.spmd(rope_workers, name_hint="prefill_csa_cp_idx_halfrope"):
+            for prep_block in pl.range(worker, rope_blocks, pl.tile.get_block_num()):
+                idx_t = prep_block * CSA_ROPE_TILE
+                idx_rows = pl.min(CSA_ROPE_TILE, q_dim - idx_t)
+                idx_cos_bf16 = pl.slice(freqs_cos_local, [CSA_ROPE_TILE, HALF_ROPE], [idx_t, 0], valid_shape=[idx_rows, HALF_ROPE])
+                idx_sin_bf16 = pl.slice(freqs_sin_local, [CSA_ROPE_TILE, HALF_ROPE], [idx_t, 0], valid_shape=[idx_rows, HALF_ROPE])
+                idx_cos_fp32 = pl.cast(idx_cos_bf16, target_type=pl.FP32)
+                idx_sin_fp32 = pl.cast(idx_sin_bf16, target_type=pl.FP32)
+                idx_cos[idx_t : idx_t + CSA_ROPE_TILE, 0:HALF_ROPE] = idx_cos_fp32
+                idx_sin[idx_t : idx_t + CSA_ROPE_TILE, 0:HALF_ROPE] = idx_sin_fp32
+    return idx_cos, idx_sin
+
+
 @pl.jit.inline
 def prefill_attention_csa_cp_core(
     x_normed_local: pl.Tensor[[CP_Q_T_DYN, D], pl.BF16],
@@ -1127,8 +1171,11 @@ def prefill_attention_csa_cp_core(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos_local: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin_local: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    q_cos_il: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    q_sin_signed: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    q_swap_idx: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.INT32],
+    idx_cos: pl.Tensor[[CP_Q_T_DYN, HALF_ROPE], pl.FP32],
+    idx_sin: pl.Tensor[[CP_Q_T_DYN, HALF_ROPE], pl.FP32],
     freqs_cos_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_cos_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
@@ -1154,7 +1201,8 @@ def prefill_attention_csa_cp_core(
     ],
     inner_compress_state_block_table: pl.Tensor[[REQUESTS_DYN, INNER_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    ori_block_table: pl.Tensor[[REQUESTS_DYN, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
+    swa_indices: pl.Tensor[[CP_Q_T_DYN, WIN], pl.INT32],
+    valid_block_mask: pl.Tensor[[CP_Q_T_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
     ori_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[REQUESTS_DYN, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
@@ -1188,11 +1236,6 @@ def prefill_attention_csa_cp_core(
     q_dim = pl.tensor.dim(x_normed_local, 0)
     kv_dim = pl.tensor.dim(x_normed_full, 0)
 
-    q_cos_il = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-    q_sin_signed = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-    q_swap_idx = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
-    rope_prepare(freqs_cos_local, freqs_sin_local, q_cos_il, q_sin_signed, q_swap_idx)
-
     q = pl.create_tensor([q_dim, H, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([q_dim, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([q_dim, 1], dtype=pl.FP32)
@@ -1207,7 +1250,9 @@ def prefill_attention_csa_cp_core(
         compact_cache_tid = csa_compact_caches(
             x_normed_local, kv_local, halo, cmp_freqs_cos_full, cmp_freqs_sin_full,
             cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w, inner_wkv, inner_wgate, inner_ape, inner_norm_w, hadamard_idx,
-            ori_slot_mapping_full, cmp_slot_mapping_full, idx_slot_mapping_full, state_slot_mapping_full, inner_state_slot_mapping_full,
+            position_ids_full, ori_slot_mapping_full, cmp_slot_mapping_full, idx_slot_mapping_full,
+            state_slot_mapping_full, inner_state_slot_mapping_full,
+            compress_state_block_table, inner_compress_state_block_table,
             kv_cache, cmp_kv, idx_kv_cache, idx_kv_scale, compress_state, inner_compress_state,
             gather_window, gather_signal, group_base, tp_rank, halo_ready,
         )
@@ -1259,57 +1304,6 @@ def prefill_attention_csa_cp_core(
             indexer_cache_ready,
         )
 
-    # Local indexer queries with half-width FP32 RoPE.
-    idx_cos = pl.create_tensor([q_dim, HALF_ROPE], dtype=pl.FP32)
-    idx_sin = pl.create_tensor([q_dim, HALF_ROPE], dtype=pl.FP32)
-    rope_blocks = (q_dim + CSA_ROPE_TILE - 1) // CSA_ROPE_TILE
-    for prep_block in pl.spmd(rope_blocks, name_hint="prefill_csa_cp_idx_halfrope"):
-        idx_t = prep_block * CSA_ROPE_TILE
-        idx_rows = pl.min(CSA_ROPE_TILE, q_dim - idx_t)
-        idx_cos_bf16 = pl.slice(freqs_cos_local, [CSA_ROPE_TILE, HALF_ROPE], [idx_t, 0], valid_shape=[idx_rows, HALF_ROPE])
-        idx_sin_bf16 = pl.slice(freqs_sin_local, [CSA_ROPE_TILE, HALF_ROPE], [idx_t, 0], valid_shape=[idx_rows, HALF_ROPE])
-        idx_cos_fp32 = pl.cast(idx_cos_bf16, target_type=pl.FP32)
-        idx_sin_fp32 = pl.cast(idx_sin_bf16, target_type=pl.FP32)
-        idx_cos[idx_t : idx_t + CSA_ROPE_TILE, 0:HALF_ROPE] = idx_cos_fp32
-        idx_sin[idx_t : idx_t + CSA_ROPE_TILE, 0:HALF_ROPE] = idx_sin_fp32
-
-    swa_indices = pl.create_tensor([q_dim, WIN], dtype=pl.INT32)
-    valid_block_mask = pl.create_tensor([q_dim, VALID_BLOCK_MASK_COLS], dtype=pl.INT32)
-    csa_topk_blocks = (q_dim + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE
-    for topk_block in pl.spmd(csa_topk_blocks, name_hint="prefill_csa_cp_sparse_idx_tile"):
-        topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
-        for topk_dt in pl.range(CSA_TOPK_TOKEN_TILE):
-            t_idx = topk_t0 + topk_dt
-            swa_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
-            mask_row = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
-            if t_idx < q_dim:
-                request_id = pl.read(local_request_ids, [t_idx])
-                if request_id >= 0:
-                    abs_pos = pl.read(position_ids_local, [t_idx])
-                    visible_cmp = pl.min((abs_pos + 1) // COMPRESS_RATIO, pl.cast(IDX_TOPK, pl.INT32))
-                    for mask_sb in pl.unroll(PREFILL_ATTN_BLOCKS):
-                        cmp_lo = pl.max(mask_sb * PREFILL_ATTN_TILE - WIN, pl.cast(0, pl.INT32))
-                        cmp_hi_unclamped = (mask_sb + 1) * PREFILL_ATTN_TILE - WIN
-                        cmp_hi_cap = pl.cast(SPARSE_CMP_BIAS_COLS, pl.INT32)
-                        cmp_hi = pl.min(cmp_hi_unclamped, cmp_hi_cap)
-                        if cmp_lo < cmp_hi:
-                            if visible_cmp > cmp_lo:
-                                pl.write(mask_row, [0, mask_sb], pl.cast(1, pl.INT32))
-                    window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
-                    key_start_abs = abs_pos + 1 - window_valid
-                    for win_col in pl.range(WIN):
-                        win_col_i32 = pl.cast(win_col, pl.INT32)
-                        if win_col_i32 < window_valid:
-                            key_abs = key_start_abs + win_col_i32
-                            blk_slot = key_abs // BLOCK_SIZE
-                            blk = pl.read(ori_block_table, [request_id, pl.cast(blk_slot, pl.INDEX)])
-                            if blk >= 0:
-                                row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
-                                pl.write(swa_row, [0, win_col], row)
-                                pl.write(mask_row, [0, win_col // PREFILL_ATTN_TILE], pl.cast(1, pl.INT32))
-                swa_indices[t_idx : t_idx + 1, 0:WIN] = swa_row
-                valid_block_mask[t_idx : t_idx + 1, 0:VALID_BLOCK_MASK_COLS] = mask_row
-
     dup, swap, sign, scores, pairs, ready = prepare_prefill_indexer_workspace(indexer_cache_ready)
     selection_completion = pl.array.create(1, pl.TASK_ID)
     selection_completion[0] = ready
@@ -1357,6 +1351,11 @@ def prefill_attention_csa_cp_local(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    q_cos_il: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    q_sin_signed: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    q_swap_idx: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.INT32],
+    idx_cos: pl.Tensor[[CP_Q_T_DYN, HALF_ROPE], pl.FP32],
+    idx_sin: pl.Tensor[[CP_Q_T_DYN, HALF_ROPE], pl.FP32],
     cmp_freqs_cos: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_sin: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
@@ -1378,7 +1377,8 @@ def prefill_attention_csa_cp_local(
     ],
     inner_compress_state_block_table: pl.Tensor[[REQUESTS_DYN, INNER_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    ori_block_table: pl.Tensor[[REQUESTS_DYN, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
+    swa_indices: pl.Tensor[[CP_Q_T_DYN, WIN], pl.INT32],
+    valid_block_mask: pl.Tensor[[CP_Q_T_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
     ori_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[REQUESTS_DYN, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
@@ -1454,16 +1454,12 @@ def prefill_attention_csa_cp_local(
             group_base, tp_rank, weight_published, weight_waited, norm_ready_tid,
         )
     x_normed_full = pl.create_tensor([kv_dim, D], dtype=pl.BF16)
-    local_base = tp_rank * q_dim
-    freqs_cos_local = pl.slice(freqs_cos, [q_dim, ROPE_HEAD_DIM], [local_base, 0])
-    freqs_sin_local = pl.slice(freqs_sin, [q_dim, ROPE_HEAD_DIM], [local_base, 0])
-
     attn_out_local = pl.create_tensor([q_dim, D], dtype=pl.BF16)
     attn_out_local = prefill_attention_csa_cp_core(
         x_normed_local, x_normed_full, query_start_loc, state_checkpoint_ends,
         wq_a, wq_b, wq_b_scale,
         wkv, gamma_cq, gamma_ckv,
-        freqs_cos_local, freqs_sin_local,
+        q_cos_il, q_sin_signed, q_swap_idx, idx_cos, idx_sin,
         freqs_cos, freqs_sin,
         cmp_freqs_cos, cmp_freqs_sin,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
@@ -1472,7 +1468,7 @@ def prefill_attention_csa_cp_local(
         idx_wq_b, idx_wq_b_scale, idx_weights_proj,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
         inner_compress_state, inner_compress_state_block_table,
-        kv_cache, ori_block_table, ori_slot_mapping_full,
+        kv_cache, swa_indices, valid_block_mask, ori_slot_mapping_full,
         cmp_kv, cmp_block_table,
         idx_kv_cache, idx_kv_scale, idx_block_table,
         position_ids_local, position_ids_full, local_request_ids,
@@ -1567,6 +1563,12 @@ def prefill_attention_csa_cp(
     inverse_rope, inverse_swap_idx, inverse_ready = prepare_sparse_attn_rope(
         freqs_cos, freqs_sin, local_base, q_dim, pl.const(1, pl.INT32),
     )
+    q_cos_il, q_sin_signed, q_swap_idx = prepare_prefill_query_rope(
+        freqs_cos, freqs_sin, local_base, q_dim, pl.const(1, pl.INT32),
+    )
+    idx_cos, idx_sin = prepare_csa_indexer_rope(
+        freqs_cos, freqs_sin, local_base, q_dim, pl.const(1, pl.INT32),
+    )
     x_hc_local = pl.slice(x_hc_full, [q_dim, HC_MULT, D], [local_base, 0, 0])
     x_out_local = pl.slice(x_out_full, [q_dim, HC_MULT, D], [local_base, 0, 0])
     plan = pl.create_tensor([1], dtype=pl.INT32)
@@ -1575,6 +1577,9 @@ def prefill_attention_csa_cp(
         cmp_slot_mapping_full, idx_slot_mapping_full, state_slot_mapping_full, inner_state_slot_mapping_full, plan,
     )
     compact = pl.read(plan, [0])
+    swa_indices, valid_block_mask = prepare_csa_sparse_indices(
+        position_ids_local, local_request_ids, ori_block_table, q_dim, pl.const(1, pl.INT32),
+    )
     x_out_local, gather_signal = prefill_attention_csa_cp_local(
         x_hc_local,
         query_start_loc, state_checkpoint_ends,
@@ -1582,6 +1587,7 @@ def prefill_attention_csa_cp(
         attn_norm_w, wq_a, wq_b, wq_b_scale,
         wkv, gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin,
+        q_cos_il, q_sin_signed, q_swap_idx, idx_cos, idx_sin,
         cmp_freqs_cos, cmp_freqs_sin,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         compress_state, compress_state_block_table,
@@ -1589,7 +1595,7 @@ def prefill_attention_csa_cp(
         idx_wq_b, idx_wq_b_scale, idx_weights_proj,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
         inner_compress_state, inner_compress_state_block_table,
-        kv_cache, ori_block_table, ori_slot_mapping_full,
+        kv_cache, swa_indices, valid_block_mask, ori_slot_mapping_full,
         cmp_kv, cmp_block_table,
         idx_kv_cache, idx_kv_scale, idx_block_table,
         position_ids_local, position_ids_full, local_request_ids,
@@ -2278,17 +2284,18 @@ if __name__ == "__main__":
         from pypto.ir import DistributedConfig
 
         compact_rows = TP_SIZE * PREFILL_STATE_TILE
-        token_counts = [args.token_count]
+        cases = [(args.start_pos, args.token_count)]
         if default_cp_cases and args.token_count != compact_rows:
-            token_counts.append(compact_rows)
-        for token_count in token_counts:
+            cases.append((0, compact_rows))
+            cases.append((compact_rows, compact_rows))
+        for start_pos, token_count in cases:
             specs = (
                 build_ragged2_cp_tensor_specs(TP_SIZE)
                 if args.case == "ragged2"
-                else build_cp_tensor_specs(args.start_pos, token_count, TP_SIZE)
+                else build_cp_tensor_specs(start_pos, token_count, TP_SIZE)
             )
             cp_cache_compare = cache_compare
-            if args.case == "b1" and args.start_pos == 0 and token_count == compact_rows:
+            if args.case == "b1" and start_pos % (COMPRESS_RATIO * BLOCK_SIZE) == 0 and token_count == compact_rows:
                 pool_layouts = (
                     ("kv_cache", "ori_slot_mapping_full", BLOCK_SIZE, 1e-4, 1.0 / 128, 0.005),
                     ("cmp_kv", "cmp_slot_mapping_full", BLOCK_SIZE, 1e-4, 1.0 / 128, 0.005),

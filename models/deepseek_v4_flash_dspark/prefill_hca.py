@@ -53,7 +53,7 @@ from prefill_sparse_attn import (
 
 import pypto.language.distributed as pld
 
-from prefill_hca_cp_cache import hca_owner_eligible, hca_publish_owner_caches
+from prefill_hca_cp_cache import hca_publish_owner_caches, prepare_hca_owner_plan
 from prefill_cp_token_allgather import (
     PREFILL_GROUP_CAP,
     TP_SIZE,
@@ -77,7 +77,7 @@ from prefill_o_proj import (
 
 if TP_SIZE == 1:
     from prefill_o_proj import gather_o_proj_full_weights
-from qkv_proj_rope import kv_proj_rope, q_proj_rope, rope_prepare
+from qkv_proj_rope import kv_proj_rope, prepare_prefill_query_rope, q_proj_rope
 
 
 # Dynamic shape variables.
@@ -497,7 +497,9 @@ def golden_prefill_attention_hca(tensors):
     tensors["x_out"][:] = y
 
 
-def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SEQ, checkpoint_end: int = 0):
+def build_tensor_specs(
+    start_pos: int = START_POS, token_count: int = PREFILL_SEQ, checkpoint_end: int = 0, *, state_ring: bool = False,
+):
     import torch
     from golden import TensorSpec
     from utils import (block_table, cache_row_from_table, pack_nz, prefill_state_fixture,
@@ -648,6 +650,8 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         physical_blocks=HCA_STATE_PHYSICAL_BLOCKS,
         request_slots=DECODE_BATCH,
     )[0]
+    if state_ring:
+        state_table = torch.arange(HCA_STATE_MAX_BLOCKS, dtype=torch.int32) % (STATE_STORAGE_LEN // HCA_STATE_BLOCK_SIZE)
     state_table, state_mapping, state_blocks = prefill_state_fixture(
         start_pos, token_count, checkpoint_end, history=COMPRESS_RATIO, block_size=HCA_STATE_BLOCK_SIZE,
         table=state_table, physical_blocks=HCA_STATE_BLOCK_NUM,
@@ -988,8 +992,9 @@ def prefill_attention_hca_cp_local(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    q_cos_il: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    q_sin_signed: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.FP32],
+    q_swap_idx: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.INT32],
     cmp_freqs_cos: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_freqs_sin: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
@@ -1024,6 +1029,7 @@ def prefill_attention_hca_cp_local(
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     weight_epoch: pl.Scalar[pl.INT32],
+    use_owner_cache: pl.Scalar[pl.INT32],
     inverse_rope: pl.Tensor[[SPARSE_ROPE_ROWS, 2 * ROPE_DIM], pl.FP32],
     inverse_swap_idx: pl.Tensor[[SPARSE_ROPE_HEAD_TILE, ROPE_DIM], pl.INT32],
     inverse_ready: pl.Scalar[pl.TASK_ID],
@@ -1067,15 +1073,6 @@ def prefill_attention_hca_cp_local(
             o_proj_weight_consumed, o_proj_order_fence,
             group_base, tp_rank, weight_published, weight_waited, norm_ready_tid,
         )
-    local_base = tp_rank * q_dim
-    freqs_cos_local = pl.slice(freqs_cos, [q_dim, ROPE_DIM], [local_base, 0])
-    freqs_sin_local = pl.slice(freqs_sin, [q_dim, ROPE_DIM], [local_base, 0])
-
-    q_cos_il = pl.create_tensor([q_dim, ROPE_DIM], dtype=pl.FP32)
-    q_sin_signed = pl.create_tensor([q_dim, ROPE_DIM], dtype=pl.FP32)
-    q_swap_idx = pl.create_tensor([q_dim, ROPE_DIM], dtype=pl.INT32)
-    rope_prepare(freqs_cos_local, freqs_sin_local, q_cos_il, q_sin_signed, q_swap_idx)
-
     q = pl.create_tensor([q_dim, H, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([q_dim, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([q_dim, 1], dtype=pl.FP32)
@@ -1097,13 +1094,7 @@ def prefill_attention_hca_cp_local(
     prefill_compressor_ratio128_project_local(x_normed_local, cmp_wkv, cmp_wgate, cmp_values_local, cmp_scores_local)
 
     update = pl.array.create(1, pl.TASK_ID)
-    owner_plan = pl.create_tensor([1], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_cp_owner_init"):
-        pl.write(owner_plan, [0], pl.cast(0, pl.INT32))
-    if TP_SIZE > 1 and pl.tensor.dim(query_start_loc, 0) == 2 and q_dim >= PREFILL_STATE_TILE and q_dim % PREFILL_STATE_TILE == 0 and kv_dim == TP_SIZE * q_dim:
-        hca_owner_eligible(query_start_loc, state_checkpoint_ends, position_ids_full,
-                           ori_slot_mapping_full, cmp_slot_mapping_full, state_slot_mapping_full, owner_plan)
-    if pl.read(owner_plan, [0]) > 0:
+    if use_owner_cache > 0:
         owner_done = hca_publish_owner_caches(
             kv_local, cmp_values_local, cmp_scores_local, state_checkpoint_ends, cmp_ape, cmp_norm_w,
             cmp_freqs_cos, cmp_freqs_sin, position_ids_full, ori_slot_mapping_full, cmp_slot_mapping_full,
@@ -1221,18 +1212,27 @@ def prefill_attention_hca_cp(
     inverse_rope, inverse_swap_idx, inverse_ready = prepare_sparse_attn_rope(
         freqs_cos, freqs_sin, local_base, q_dim, pl.const(1, pl.INT32),
     )
+    q_cos_il, q_sin_signed, q_swap_idx = prepare_prefill_query_rope(
+        freqs_cos, freqs_sin, local_base, q_dim, pl.const(1, pl.INT32),
+    )
     x_hc_local = pl.slice(x_hc_full, [q_dim, HC_MULT, D], [local_base, 0, 0])
     x_out_local = pl.slice(x_out_full, [q_dim, HC_MULT, D], [local_base, 0, 0])
     request_count = pl.tensor.dim(query_start_loc, 0) - 1
     request_ranges = pl.create_tensor([request_count, HCA_REQUEST_RANGE_WORDS], dtype=pl.INT32)
     request_ranges = prepare_hca_query_ranges(local_request_ids, request_ranges)
+    owner_plan = pl.create_tensor([1], dtype=pl.INT32)
+    prepare_hca_owner_plan(
+        q_dim, query_start_loc, state_checkpoint_ends, position_ids_full,
+        ori_slot_mapping_full, cmp_slot_mapping_full, state_slot_mapping_full, owner_plan,
+    )
+    use_owner_cache = pl.read(owner_plan, [0])
     x_out_local, gather_signal = prefill_attention_hca_cp_local(
         x_hc_local,
         query_start_loc, state_checkpoint_ends, local_request_ids, request_ranges,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale,
         wkv, gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin,
+        q_cos_il, q_sin_signed, q_swap_idx,
         cmp_freqs_cos, cmp_freqs_sin,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         compress_state, compress_state_block_table,
@@ -1249,6 +1249,7 @@ def prefill_attention_hca_cp(
         o_proj_weight_ready, o_proj_weight_consumed,
         o_proj_order_fence,
         group_base, tp_rank, weight_epoch,
+        use_owner_cache,
         inverse_rope, inverse_swap_idx, inverse_ready,
     )
     materialize_ready_tid = pl.system.task_dummy(deps=[])
@@ -1477,6 +1478,8 @@ def build_cp_tensor_specs(
     token_count: int = PREFILL_SEQ,
     tp_size: int = TP_SIZE,
     checkpoint_end: int = 0,
+    *,
+    state_ring: bool = False,
 ):
     """Replicate layer-boundary state and full inputs while sharding query positions."""
     import torch
@@ -1498,7 +1501,7 @@ def build_cp_tensor_specs(
     full_names = ("ori_slot_mapping", "cmp_slot_mapping", "state_slot_mapping")
 
     specs = []
-    for spec in build_tensor_specs(start_pos, token_count, checkpoint_end):
+    for spec in build_tensor_specs(start_pos, token_count, checkpoint_end, state_ring=state_ring):
         value = materialize_spec(spec)
         if spec.name == "query_start_loc":
             specs.append(TensorSpec(
@@ -1815,29 +1818,24 @@ if __name__ == "__main__":
         from pypto.ir import DistributedConfig
 
         compact_rows = TP_SIZE * PREFILL_STATE_TILE
-        token_counts = [args.token_count]
-        if default_cp_cases and args.token_count != compact_rows:
-            token_counts.append(compact_rows)
-        for token_count in token_counts:
+        cases = [(args.start_pos, args.token_count)]
+        if default_cp_cases:
+            if args.token_count != compact_rows:
+                cases.append((0, compact_rows))
+            cases.append((compact_rows, compact_rows))
+        for start_pos, token_count in cases:
+            owner_case = args.case == "b1" and start_pos % COMPRESS_RATIO == 0 and token_count == compact_rows
             specs = (
                 build_ragged2_cp_tensor_specs(TP_SIZE)
                 if args.case == "ragged2"
-                else build_cp_tensor_specs(args.start_pos, token_count, TP_SIZE)
+                else build_cp_tensor_specs(start_pos, token_count, TP_SIZE, state_ring=owner_case)
             )
             cp_cache_compare = {
                 "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
                 "cmp_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
                 "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3),
             }
-            if args.case == "b1" and args.start_pos == 0 and token_count == compact_rows:
-                from dataclasses import replace
-
-                state_ring = torch.arange(token_count, dtype=torch.int64) % STATE_STORAGE_LEN
-                specs = [
-                    replace(spec, init_value=state_ring.repeat(TP_SIZE, 1))
-                    if spec.name == "state_slot_mapping_full" else spec
-                    for spec in specs
-                ]
+            if owner_case:
                 pool_layouts = (
                     ("kv_cache", "ori_slot_mapping_full", BLOCK_SIZE, 1e-4, 1.0 / 128),
                     ("cmp_kv", "cmp_slot_mapping_full", CMP_STORAGE_BLOCK_SIZE, 1e-4, 1.0 / 128),

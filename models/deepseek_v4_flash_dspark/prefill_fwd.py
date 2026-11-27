@@ -45,7 +45,9 @@ from moe import (
     prefill_moe_local,
 )
 from config import FLASH as MODEL_CONFIG
+from qkv_proj_rope import prepare_prefill_query_rope
 from prefill_sparse_attn import prepare_sparse_attn_rope
+from prefill_hca_cp_cache import prepare_hca_owner_plan
 from prefill_swa import (
     build_cp_tensor_specs as build_swa_attention_tensor_specs,
     build_ragged2_cp_tensor_specs as build_swa_ragged2_tensor_specs,
@@ -97,6 +99,8 @@ from prefill_csa import (
     build_ragged2_cp_tensor_specs as build_csa_ragged2_tensor_specs,
     prefill_attention_csa_cp_local,
     prepare_csa_compact_plan,
+    prepare_csa_indexer_rope,
+    prepare_csa_sparse_indices,
 )
 from prefill_cp_token_allgather import (
     PREFILL_GROUP_CAP,
@@ -459,7 +463,7 @@ def prefill_fwd(
         pl.write(stage_token, [0], pl.cast(0, pl.INT32))
         pl.write(layer_completion, [0], pl.cast(0, pl.INT32))
 
-    # The forward ABI supplies one immutable set of CSA slot maps for all layers.
+    # Layer-shared cache publication plans.
     csa_plan = pl.create_tensor([1], dtype=pl.INT32)
     with pl.scope():
         prepare_csa_compact_plan(
@@ -467,12 +471,30 @@ def prefill_fwd(
             csa_cmp_slot_mapping_full, csa_idx_slot_mapping_full, csa_state_slot_mapping_full,
             csa_inner_state_slot_mapping_full, csa_plan,
         )
+    hca_plan = pl.create_tensor([1], dtype=pl.INT32)
+    with pl.scope():
+        prepare_hca_owner_plan(
+            local_tokens, query_start_loc, state_checkpoint_ends, position_ids_full,
+            ori_slot_mapping_full, hca_cmp_slot_mapping_full, hca_state_slot_mapping_full, hca_plan,
+        )
+
+    csa_swa_indices, csa_valid_block_mask = prepare_csa_sparse_indices(
+        position_ids_local, local_request_ids, ori_block_table, local_tokens, group_tokens,
+    )
 
     # Query frequencies are shared by layer kind for this forward.
     swa_inverse, swa_swap_idx, swa_rope_ready = prepare_sparse_attn_rope(
         swa_freqs_cos, swa_freqs_sin, local_start, local_tokens, group_tokens,
     )
     compressed_inverse, compressed_swap_idx, compressed_rope_ready = prepare_sparse_attn_rope(
+        compressed_freqs_cos, compressed_freqs_sin, local_start, local_tokens, group_tokens,
+    )
+
+    # CSA and HCA use the same forward frequencies for the local physical rows.
+    compressed_q_cos, compressed_q_sin, compressed_q_swap = prepare_prefill_query_rope(
+        compressed_freqs_cos, compressed_freqs_sin, local_start, local_tokens, group_tokens,
+    )
+    csa_idx_cos, csa_idx_sin = prepare_csa_indexer_rope(
         compressed_freqs_cos, compressed_freqs_sin, local_start, local_tokens, group_tokens,
     )
 
@@ -690,6 +712,7 @@ def prefill_fwd(
     target_hc_stack = pl.create_tensor([target_hc_rows, HC_MULT, D], dtype=pl.FP32)
 
     csa_compact = pl.read(csa_plan, [0])
+    hca_owner = pl.read(hca_plan, [0])
 
     # Layers 2-41: CSA/HCA pairs.
     for pair_order in pl.range(HCA_NUM_LAYERS):
@@ -809,6 +832,7 @@ def prefill_fwd(
                         attn_norm_w_csa, wq_a_csa, wq_b_csa, wq_b_scale_csa,
                         wkv_csa, gamma_cq_csa, gamma_ckv_csa,
                         compressed_freqs_cos, compressed_freqs_sin,
+                        compressed_q_cos, compressed_q_sin, compressed_q_swap, csa_idx_cos, csa_idx_sin,
                         csa_cmp_freqs_cos, csa_cmp_freqs_sin,
                         csa_cmp_wkv_csa, csa_cmp_wgate_csa, csa_cmp_ape_csa, csa_cmp_norm_w_csa,
                         csa_compress_state_csa, csa_compress_state_block_table,
@@ -816,7 +840,7 @@ def prefill_fwd(
                         csa_idx_wq_b_csa, csa_idx_wq_b_scale_csa, csa_weights_proj_csa,
                         csa_inner_wkv_csa, csa_inner_wgate_csa, csa_inner_ape_csa, csa_inner_norm_w_csa,
                         csa_inner_compress_state_csa, csa_inner_compress_state_block_table,
-                        kv_cache_csa, ori_block_table, ori_slot_mapping_full,
+                        kv_cache_csa, csa_swa_indices, csa_valid_block_mask, ori_slot_mapping_full,
                         csa_cmp_kv_csa, csa_cmp_block_table,
                         idx_kv_cache_csa, idx_kv_scale_csa, idx_block_table,
                         position_ids_local, position_ids_full, local_request_ids,
@@ -946,7 +970,7 @@ def prefill_fwd(
                         hc_attn_fn_hca, hc_attn_scale_hca, hc_attn_base_hca,
                         attn_norm_w_hca, wq_a_hca, wq_b_hca, wq_b_scale_hca,
                         wkv_hca, gamma_cq_hca, gamma_ckv_hca,
-                        compressed_freqs_cos, compressed_freqs_sin,
+                        compressed_q_cos, compressed_q_sin, compressed_q_swap,
                         hca_cmp_freqs_cos, hca_cmp_freqs_sin,
                         hca_cmp_wkv_hca, hca_cmp_wgate_hca, hca_cmp_ape_hca, hca_cmp_norm_w_hca,
                         hca_compress_state_hca, hca_compress_state_block_table,
@@ -962,6 +986,7 @@ def prefill_fwd(
                         o_proj_weight_ready, o_proj_weight_consumed,
                         layer_completion,
                         group_base, tp_rank, hca_layer + pl.const(1, pl.INT32),
+                        hca_owner,
                         compressed_inverse, compressed_swap_idx, compressed_rope_ready,
                     )
 
@@ -1110,6 +1135,7 @@ def prefill_fwd(
                     attn_norm_w_last, wq_a_last, wq_b_last, wq_b_scale_last,
                     wkv_last, gamma_cq_last, gamma_ckv_last,
                     compressed_freqs_cos, compressed_freqs_sin,
+                    compressed_q_cos, compressed_q_sin, compressed_q_swap, csa_idx_cos, csa_idx_sin,
                     csa_cmp_freqs_cos, csa_cmp_freqs_sin,
                     csa_cmp_wkv_last, csa_cmp_wgate_last, csa_cmp_ape_last, csa_cmp_norm_w_last,
                     csa_compress_state_last, csa_compress_state_block_table,
@@ -1117,7 +1143,7 @@ def prefill_fwd(
                     csa_idx_wq_b_last, csa_idx_wq_b_scale_last, csa_weights_proj_last,
                     csa_inner_wkv_last, csa_inner_wgate_last, csa_inner_ape_last, csa_inner_norm_w_last,
                     csa_inner_compress_state_last, csa_inner_compress_state_block_table,
-                    kv_cache_last, ori_block_table, ori_slot_mapping_full,
+                    kv_cache_last, csa_swa_indices, csa_valid_block_mask, ori_slot_mapping_full,
                     csa_cmp_kv_last, csa_cmp_block_table,
                     idx_kv_cache_last, idx_kv_scale_last, idx_block_table,
                     position_ids_local, position_ids_full, local_request_ids,
@@ -1192,8 +1218,7 @@ def prefill_fwd(
     with pl.scope():
         if group_tokens > 0:
             materialize_ready_tid = pl.system.task_dummy(deps=[])
-            rebuild_hc = group_rows == PREFILL_GROUP_CAP and TP_SIZE > 1
-            if not rebuild_hc:
+            if TP_SIZE == 1:
                 materialize_ready_tid = prefill_cp_materialize_hc_full(
                     x_hc_local, x_hc, gather_window, gather_signal, group_base, tp_rank, materialize_ready_tid,
                 )
@@ -1207,7 +1232,7 @@ def prefill_fwd(
                 post_ffn_local, comb_ffn_local, post_ffn, comb_ffn,
                 gather_window, gather_signal, group_base, tp_rank, mixed_full_tid,
             )
-            if rebuild_hc:
+            if TP_SIZE > 1:
                 # Rebuild the final HC rows from the replicated residual and the narrow FFN output.
                 ffn_full = pl.create_tensor([group_rows, D], dtype=pl.BF16)
                 _ffn_full_tid = prefill_cp_token_allgather_into(
@@ -2458,12 +2483,12 @@ def o_proj_wo_a_full_compare(actual, expected, **kwargs):
 
 
 def x_hc_compare(actual, expected, **kwargs):
-    """Validate full-group HC against each owner's residual, coefficients, and FFN result."""
+    """Validate replicated HC against each owner's residual, coefficients, and FFN result."""
     import torch
     from golden import ratio_allclose
 
     valid, detail = finite_tensor_compare(actual, expected, zero_inactive=True, **kwargs)
-    if not valid or TP_SIZE == 1 or actual.shape[1] != PREFILL_GROUP_CAP:
+    if not valid or TP_SIZE == 1:
         return valid, detail
 
     outputs = kwargs["actual_outputs"]

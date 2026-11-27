@@ -71,6 +71,7 @@ HCA_COMPRESS_RATIO = 128
 PREFILL_SPARSE_TOPK = WIN + IDX_TOPK
 ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
 CMP_MAX_BLOCKS = (MAX_SEQ_LEN // DEFAULT_COMPRESS_RATIO + BLOCK_SIZE - 1) // BLOCK_SIZE
+CMP_ROW_CAPACITY_F32 = float(CMP_MAX_BLOCKS * BLOCK_SIZE)
 CMP_BLOCK_NUM = CMP_MAX_BLOCKS
 
 # tiling
@@ -86,6 +87,7 @@ GATHER_TOKEN_TILE = 8
 SPARSE_OPT_GATHER_ROW_TILE = 32
 SPARSE_OPT_CMP_GATHER_ROW_TILE = 16
 SPARSE_OPT_CMP_GATHER_TOKEN_TILE = 8
+CMP_PAGE_SHIFT = BLOCK_SIZE.bit_length() - 1
 BIAS_TOKEN_TILE = 16
 QUANT_TOKEN_TILE = 8
 O_PROJ_PAD_ROWS = 256  # internal physical-tail alignment across Cube, quant and epilogue
@@ -125,7 +127,9 @@ SPARSE_CMP_BIAS_COLS = max(0, SPARSE_BIAS_COLS - WIN)
 # HCA streaming tiling.
 HCA_ATTN_TILE = 128
 HCA_CMP_PAGES_PER_WORK = HCA_ATTN_TILE // HCA_CMP_STORAGE_BLOCK_SIZE
-HCA_SHORT_CMP_PAGE_TILE = HCA_CMP_PAGES_PER_WORK // 8
+HCA_CMP_GATHER_PAGE_TILE = 16
+HCA_CMP_GATHER_ROW_TILE = HCA_CMP_GATHER_PAGE_TILE * HCA_CMP_STORAGE_BLOCK_SIZE
+HCA_CMP_GATHER_WORKERS = 32
 HCA_CMP_MAX_BLOCKS = (MAX_SEQ_LEN // HCA_COMPRESS_RATIO + HCA_CMP_STORAGE_BLOCK_SIZE - 1) // HCA_CMP_STORAGE_BLOCK_SIZE
 HCA_CMP_WORK_COUNT = (HCA_CMP_MAX_BLOCKS + HCA_CMP_PAGES_PER_WORK - 1) // HCA_CMP_PAGES_PER_WORK
 HCA_CMP_PAD_ROWS = HCA_CMP_WORK_COUNT * HCA_ATTN_TILE
@@ -680,6 +684,7 @@ def _hca_multi_panel_wave(
             qk_q = pl.load(
                 q_flat, [qk_t * H + qk_head_base, 0], [QK_M_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat,
             )
+            kv_ring = pl.create_tile([QK_TRANSFER_SLOTS * HCA_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, target_memory=pl.MemorySpace.Mat)
             for qk_tick in pl.range(qk_blocks + QK_PRE_LAUNCH):
                 if qk_tick < qk_blocks:
                     qk_sb = qk_tick
@@ -687,11 +692,11 @@ def _hca_multi_panel_wave(
                         qk_slot = qk_core * QK_TRANSFER_SLOTS + qk_sb % QK_TRANSFER_SLOTS
                         qk_kv_row = qk_sb * HCA_ATTN_TILE
                         qk_transfer_row = qk_slot * QK_M_TILE
-                        qk_kv = pl.load(
-                            cmp_work_kv, [qk_kv_row, 0], [HCA_ATTN_TILE, HEAD_DIM],
-                            target_memory=pl.MemorySpace.Mat,
-                        )
-                        qk_scores = pl.matmul(qk_q, pl.tile.transpose_view(qk_kv), out_dtype=pl.FP32)
+                        ring_row = (qk_sb % QK_TRANSFER_SLOTS) * HCA_ATTN_TILE
+                        kv_ring = pl.gather_row(kv_ring, cmp_work_kv, [ring_row, 0], [qk_kv_row, 0], [HCA_ATTN_TILE, HEAD_DIM])
+                        kv_ring_t = pl.tile.transpose_view(kv_ring)
+                        qk_kv = pl.tile.slice(kv_ring_t, [HEAD_DIM, HCA_ATTN_TILE], [0, ring_row])
+                        qk_scores = pl.matmul(qk_q, qk_kv, out_dtype=pl.FP32)
                         pl.store(qk_scores, [qk_transfer_row, 0], score_transfer)
                         pl.system.sync_set(
                             QK_SCORE_READY_EVENT, pipe=pl.PipeType.FIX,
@@ -701,17 +706,14 @@ def _hca_multi_panel_wave(
                     pv_sb = qk_tick - QK_PRE_LAUNCH
                     if pl.read(cmp_work_valid, [pv_sb, 0]) > 0:
                         pv_slot = qk_core * QK_TRANSFER_SLOTS + pv_sb % QK_TRANSFER_SLOTS
-                        pv_kv_row = pv_sb * HCA_ATTN_TILE
                         pv_transfer_row = pv_slot * QK_M_TILE
                         pl.system.sync_wait(QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
                         pv_probability = pl.load(
                             probability_transfer, [pv_transfer_row, 0], [QK_M_TILE, HCA_ATTN_TILE],
                             target_memory=pl.MemorySpace.Mat,
                         )
-                        pv_kv = pl.load(
-                            cmp_work_kv, [pv_kv_row, 0], [HCA_ATTN_TILE, HEAD_DIM],
-                            target_memory=pl.MemorySpace.Mat,
-                        )
+                        pv_ring_row = (pv_sb % QK_TRANSFER_SLOTS) * HCA_ATTN_TILE
+                        pv_kv = pl.tile.slice(kv_ring, [HCA_ATTN_TILE, HEAD_DIM], [pv_ring_row, 0])
                         pv_output = pl.matmul(pv_probability, pv_kv, out_dtype=pl.FP32)
                         pl.store(pv_output, [pv_transfer_row, 0], pv_transfer)
                         pl.system.sync_set(
@@ -822,41 +824,33 @@ def _hca_streaming_attn_tile(
         # Tile-local HCA workspaces.
         cmp_work_kv = pl.create_tensor([HCA_CMP_PAD_ROWS, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
         cmp_work_valid = pl.create_tensor([HCA_CMP_WORK_COUNT, HCA_WORK_VALID_STRIDE], dtype=pl.INT32, manual_dep=True)
-        # Keep slot zero initialized for an empty compressed interval.
         gather_panels = pl.max(1, pl.min(pl.cast(panel_count, pl.INDEX), HCA_CMP_WORK_COUNT))
-        gather_page_tile = pl.const(HCA_CMP_PAGES_PER_WORK, pl.INDEX)
-        if panel_count == 1:
-            gather_page_tile = pl.const(HCA_SHORT_CMP_PAGE_TILE, pl.INDEX)
-        blocks_per_panel = HCA_CMP_PAGES_PER_WORK // gather_page_tile
-        gather_blocks = gather_panels * blocks_per_panel
+        page_tiles = gather_panels * (HCA_CMP_PAGES_PER_WORK // HCA_CMP_GATHER_PAGE_TILE)
+        gather_workers = pl.min(page_tiles, HCA_CMP_GATHER_WORKERS)
         with pl.spmd(
-            gather_blocks, name_hint="prefill_hca_stream_cmp_gather", deps=[packed_init_tid],
+            gather_workers, name_hint="prefill_hca_stream_cmp_gather", deps=[packed_init_tid],
         ) as cmp_gather_tid:
-            gather_block = pl.tile.get_block_idx()
-            gather_work = gather_block // blocks_per_panel
-            gather_page_base = (gather_block % blocks_per_panel) * gather_page_tile
-            if gather_page_base == 0:
-                pl.write(cmp_work_valid, [gather_work, 0], pl.cast(0, pl.INT32))
-            if gather_work < panel_count:
-                gather_dst0 = gather_work * HCA_ATTN_TILE
-                gather_page_end = gather_page_base + gather_page_tile
-                for gather_page in pl.range(gather_page_base, gather_page_end):
-                    gather_table_col = gather_work * HCA_CMP_PAGES_PER_WORK + gather_page
-                    gather_local = gather_page * HCA_CMP_STORAGE_BLOCK_SIZE
-                    gather_dst = gather_dst0 + gather_local
-                    # Preserve the manually managed workspace identity across gather writes.
-                    gather_zero = pl.tile.full([HCA_CMP_STORAGE_BLOCK_SIZE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                    pl.store(gather_zero, [gather_dst, 0], cmp_work_kv)
-                    gather_block_i32 = pl.read(cmp_block_table, [gather_table_col])
-                    if gather_block_i32 >= 0:
-                        if gather_block_i32 < cmp_block_num:
-                            if gather_page == 0:
-                                pl.write(cmp_work_valid, [gather_work, 0], pl.cast(1, pl.INT32))
-                            gather_block = pl.cast(gather_block_i32, pl.INDEX)
-                            gather_src = gather_block * HCA_CMP_STORAGE_BLOCK_SIZE
-                            gather_page_kv = pl.load(cmp_kv_flat, [gather_src, 0], [HCA_CMP_STORAGE_BLOCK_SIZE, HEAD_DIM])
-                            pl.store(gather_page_kv, [gather_dst, 0], cmp_work_kv)
-
+            worker = pl.tile.get_block_idx()
+            for page_tile in pl.range(worker, page_tiles, HCA_CMP_GATHER_WORKERS):
+                first_page = page_tile * HCA_CMP_GATHER_PAGE_TILE
+                panel = first_page // HCA_CMP_PAGES_PER_WORK
+                first_block = pl.cast(-1, pl.INT32)
+                if panel < panel_count:
+                    first_block = pl.read(cmp_block_table, [first_page])
+                if first_page % HCA_CMP_PAGES_PER_WORK == 0:
+                    panel_valid = pl.cast(first_block >= 0 and first_block < cmp_block_num, pl.INT32)
+                    pl.write(cmp_work_valid, [panel, 0], panel_valid)
+                if panel < panel_count:
+                    tile = pl.tile.full([HCA_CMP_GATHER_ROW_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                    for page in pl.range(HCA_CMP_GATHER_PAGE_TILE):
+                        block = pl.read(cmp_block_table, [first_page + page])
+                        if block >= 0 and block < cmp_block_num:
+                            dst = page * HCA_CMP_STORAGE_BLOCK_SIZE
+                            src = pl.cast(block, pl.INDEX) * HCA_CMP_STORAGE_BLOCK_SIZE
+                            tile = pl.tile.gather_row(
+                                tile, cmp_kv_flat, [dst, 0], [src, 0], [HCA_CMP_STORAGE_BLOCK_SIZE, HEAD_DIM],
+                            )
+                    pl.store(tile, [first_page * HCA_CMP_STORAGE_BLOCK_SIZE, 0], cmp_work_kv)
 
         # Raw KV is reusable after raw QK/PV. The partial statistics stay live through merge.
         raw_kv = pl.create_tensor([HCA_QUERY_TILE * WIN, HEAD_DIM], dtype=pl.BF16)
@@ -896,10 +890,51 @@ def _hca_streaming_attn_tile(
             wo_a, wo_b, wo_b_scale,
             attn_out,
             request_offset + tile_base, tile_rows,
-            heads_complete_tid, o_proj_weight_dep,
+            heads_complete_tid, pl.system.task_invalid(), o_proj_weight_dep,
             PROJECTION_ROWS=T_PAD, PROJ_A_FENCE=False,
         )
         tile_completion[0] = act_tid
+
+
+@pl.jit.inline
+def _compressed_physical_rows(
+    indices: pl.Tile[[1, PREFILL_ATTN_TILE], pl.INT32],
+    block_table: pl.Tensor[[REQUESTS_DYN, CMP_MAX_BLOCKS], pl.INT32],
+    request_id: pl.Scalar[pl.INT32],
+    block_num: pl.Scalar[pl.INDEX],
+) -> pl.Tile[[1, PREFILL_ATTN_TILE], pl.INT32]:
+    """Map compressed indices to physical rows and retain missing entries."""
+    index_f32 = pl.cast(indices, target_type=pl.FP32)
+    nonnegative = pl.tile.cmps(index_f32, 0.0, cmp_type=5)
+    below_capacity = pl.tile.cmps(index_f32, CMP_ROW_CAPACITY_F32, cmp_type=2)
+    present = pl.tile.and_(nonnegative, below_capacity)
+    safe = pl.tile.select(present, indices, 0)
+    page_ids = pl.tile.shrs(safe, CMP_PAGE_SHIFT)
+    page_values = pl.cast(page_ids, target_type=pl.FP32)
+    groups = pl.reshape(page_values, [MASK_ALIGN_ELEMS, PREFILL_ATTN_TILE // MASK_ALIGN_ELEMS])
+    reduce_tmp = pl.create_tile([MASK_ALIGN_ELEMS, PREFILL_ATTN_TILE // MASK_ALIGN_ELEMS], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+    largest = pl.row_max(groups, reduce_tmp)
+    last_page_i32 = pl.const(0, pl.INT32)
+    for lane, (prior,) in pl.range(MASK_ALIGN_ELEMS, init_values=(last_page_i32,)):
+        page = pl.cast(pl.tile.read(largest, [lane, 0]), pl.INT32)
+        last_page_i32 = pl.yield_(pl.max(page, prior))
+    last_page = pl.cast(last_page_i32, pl.INDEX)
+    blocks = pl.load(
+        block_table, [request_id, 0], [1, CMP_MAX_BLOCKS],
+        valid_shape=[1, last_page + 1], target_memory=pl.MemorySpace.Vec,
+    )
+    blocks = pl.set_validshape(blocks, 1, CMP_MAX_BLOCKS)
+    tmp = pl.create_tile([1, PREFILL_ATTN_TILE], dtype=pl.INT32, target_memory=pl.MemorySpace.Vec)
+    physical_pages = pl.tile.gather(blocks, page_ids, tmp)
+    physical_pages = pl.maximum(physical_pages, -1)
+    pages_f32 = pl.cast(physical_pages, target_type=pl.FP32)
+    block_num_i32 = pl.cast(block_num, pl.INT32)
+    in_range = pl.tile.cmps(pages_f32, pl.cast(block_num_i32, pl.FP32), cmp_type=2)
+    valid_pages = pl.tile.select(in_range, physical_pages, -1)
+    page_rows = pl.tile.shls(valid_pages, CMP_PAGE_SHIFT)
+    intra_page = pl.sub(safe, pl.tile.shls(page_ids, CMP_PAGE_SHIFT))
+    physical_rows = pl.add(page_rows, intra_page)
+    return pl.tile.select(present, physical_rows, -1)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -957,7 +992,11 @@ def _sparse_attn_wave(
             if SPARSE_CMP_BIAS_COLS > 0:
                 gather_bias_cmp_rows = pl.slice(cmp_indices, [GATHER_TOKEN_TILE, SPARSE_CMP_BIAS_COLS], [gather_bias_t0, 0], valid_shape=[gather_bias_rows, SPARSE_CMP_BIAS_COLS])
                 gather_bias_cmp_idx = pl.cast(gather_bias_cmp_rows, target_type=pl.FP32)
-                gather_bias_cmp_flag = pl.minimum(pl.maximum(pl.add(gather_bias_cmp_idx, 1.0), 0.0), 1.0)
+                gather_bias_cmp_lower = pl.add(gather_bias_cmp_idx, 1.0)
+                gather_bias_cmp_neg = pl.neg(gather_bias_cmp_idx)
+                gather_bias_cmp_upper = pl.add(gather_bias_cmp_neg, CMP_ROW_CAPACITY_F32)
+                gather_bias_cmp_valid = pl.minimum(gather_bias_cmp_lower, gather_bias_cmp_upper)
+                gather_bias_cmp_flag = pl.minimum(pl.maximum(gather_bias_cmp_valid, 0.0), 1.0)
                 gather_bias_cmp = pl.mul(pl.sub(gather_bias_cmp_flag, 1.0), -FP32_NEG_INF)
                 sparse_bias[gather_local_t0 : gather_local_t0 + GATHER_TOKEN_TILE, WIN:SPARSE_BIAS_COLS] = gather_bias_cmp
             if PREFILL_SPARSE_PAD > SPARSE_BIAS_COLS:
@@ -1019,35 +1058,32 @@ def _sparse_attn_wave(
                             gather_cmp_offset = gather_k0 - WIN
                             gather_cmp_cols = pl.min(PREFILL_ATTN_TILE, IDX_TOPK - gather_cmp_offset)
                             gather_indices = pl.load(cmp_indices, [gather_t, gather_cmp_offset], [1, PREFILL_ATTN_TILE], valid_shape=[1, gather_cmp_cols], target_memory=pl.MemorySpace.Vec)
+                            gather_indices = pl.fillpad(gather_indices, pad_value=pl.PadValue.min)
+                            gather_indices = pl.set_validshape(gather_indices, 1, PREFILL_ATTN_TILE)
+                            gather_rows = _compressed_physical_rows(gather_indices, cmp_block_table, request_id, cmp_block_num)
                             for gather_g0 in pl.range(0, PREFILL_ATTN_TILE, SPARSE_OPT_CMP_GATHER_ROW_TILE):
-                                gather_first = pl.tile.read(gather_indices, [0, gather_g0])
-                                gather_page = gather_first // BLOCK_SIZE
-                                gather_intra = gather_first - gather_page * BLOCK_SIZE
-                                gather_contiguous = gather_first >= 0 and gather_g0 + SPARSE_OPT_CMP_GATHER_ROW_TILE <= gather_cmp_cols
-                                gather_contiguous = gather_contiguous and gather_intra + SPARSE_OPT_CMP_GATHER_ROW_TILE <= BLOCK_SIZE
-                                for gather_ci, (contiguous_iter,) in pl.range(1, SPARSE_OPT_CMP_GATHER_ROW_TILE, init_values=(gather_contiguous,)):
-                                    gather_next = pl.tile.read(gather_indices, [0, gather_g0 + gather_ci])
-                                    gather_matches = contiguous_iter and gather_next == gather_first + gather_ci
-                                    gather_contiguous = pl.yield_(gather_matches)
+                                gather_first = pl.tile.read(gather_rows, [0, gather_g0])
+                                gather_last_offset = SPARSE_OPT_CMP_GATHER_ROW_TILE - 1
+                                gather_last = pl.tile.read(gather_rows, [0, gather_g0 + gather_last_offset])
+                                gather_endpoints_match = gather_first >= 0 and gather_last == gather_first + gather_last_offset
+                                if gather_endpoints_match:
+                                    for gather_ci, (contiguous_iter,) in pl.range(1, gather_last_offset, init_values=(gather_endpoints_match,)):
+                                        gather_next = pl.tile.read(gather_rows, [0, gather_g0 + gather_ci])
+                                        gather_matches = contiguous_iter and gather_next == gather_first + gather_ci
+                                        gather_interior_match = pl.yield_(gather_matches)
+                                    gather_contiguous = pl.yield_(gather_interior_match)
+                                else:
+                                    gather_contiguous = pl.yield_(gather_endpoints_match)
                                 if gather_contiguous:
-                                    blk_raw = pl.read(cmp_block_table, [request_id, gather_page])
-                                    if blk_raw >= 0 and blk_raw < cmp_block_num:
-                                        blk = pl.cast(blk_raw, pl.INDEX)
-                                        src = blk * BLOCK_SIZE + gather_intra
-                                        stage = pl.tile.gather_row(stage, cmp_kv_flat, [gather_g0, 0], [src, 0], [SPARSE_OPT_CMP_GATHER_ROW_TILE, HEAD_DIM])
+                                    src = pl.cast(gather_first, pl.INDEX)
+                                    stage = pl.tile.gather_row(stage, cmp_kv_flat, [gather_g0, 0], [src, 0], [SPARSE_OPT_CMP_GATHER_ROW_TILE, HEAD_DIM])
                                 else:
                                     for gather_ci in pl.range(SPARSE_OPT_CMP_GATHER_ROW_TILE):
                                         gather_ki = gather_g0 + gather_ci
-                                        gather_cmp_k = gather_cmp_offset + gather_ki
-                                        if gather_cmp_k < IDX_TOPK:
-                                            gather_raw = pl.tile.read(gather_indices, [0, gather_ki])
-                                            if gather_raw >= 0:
-                                                blk_slot = gather_raw // BLOCK_SIZE
-                                                blk_raw = pl.read(cmp_block_table, [request_id, blk_slot])
-                                                if blk_raw >= 0 and blk_raw < cmp_block_num:
-                                                    blk = pl.cast(blk_raw, pl.INDEX)
-                                                    src = blk * BLOCK_SIZE + (gather_raw - blk_slot * BLOCK_SIZE)
-                                                    stage = pl.tile.gather_row(stage, cmp_kv_flat, [gather_ki, 0], [src, 0], [1, HEAD_DIM])
+                                        mapped_row = pl.tile.read(gather_rows, [0, gather_ki])
+                                        if mapped_row >= 0:
+                                            src = pl.cast(mapped_row, pl.INDEX)
+                                            stage = pl.tile.gather_row(stage, cmp_kv_flat, [gather_ki, 0], [src, 0], [1, HEAD_DIM])
                         pl.store(stage, [block_base, 0], sparse_cmp_kv)
 
     # Pipeline K blocks and keep the online-softmax state local to each query.
@@ -1299,7 +1335,8 @@ def _sparse_attn_o_proj(
     attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
     tile_base: pl.Scalar[pl.INDEX],
     tile_rows: pl.Scalar[pl.INDEX],
-    heads_dep: pl.Scalar[pl.TASK_ID],
+    first_heads_dep: pl.Scalar[pl.TASK_ID],
+    second_heads_dep: pl.Scalar[pl.TASK_ID],
     weight_dep: pl.Scalar[pl.TASK_ID],
     PROJECTION_ROWS: pl.constexpr,
     PROJ_A_FENCE: pl.constexpr,
@@ -1317,40 +1354,48 @@ def _sparse_attn_o_proj(
         partials = pl.create_tensor([PROJECTION_ROWS, O_GROUPS * D], dtype=pl.INT32, manual_dep=True)
     else:
         partials = pl.create_tensor([O_GROUPS * PROJECTION_ROWS, D], dtype=pl.INT32)
-    proj_a_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
+    heads_deps = pl.array.create(2, pl.TASK_ID)
+    heads_deps[0] = first_heads_dep
+    heads_deps[1] = second_heads_dep
+    proj_a_tids = pl.array.create(2 * O_GROUPS, pl.TASK_ID)
     quant_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
     proj_b_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
     # Round physical tails up to complete projection tiles; only the final store
     # writes active rows.
     o_compute_rows = ((tile_rows + O_PROJ_ROW_TILE - 1) // O_PROJ_ROW_TILE) * O_PROJ_ROW_TILE
-    proj_a_rows = o_compute_rows // PROJ_A_ROW_TILE
     quant_rows = o_compute_rows // QUANT_TOKEN_TILE
     proj_b_rows = o_compute_rows // PROJ_B_ROW_TILE
 
     with pl.scope():
-        # Publish one O-A task per group with disjoint token and output blocks.
-        pa_blocks = proj_a_rows * PA_NFRAGS
+        # Each head bank releases its O-A rows independently.
+        pa_banks = (o_compute_rows + T_PAD - 1) // T_PAD
         for g in pl.parallel(O_GROUPS):
-            row_base_o = g * HEADS_PER_GROUP * T_PAD
+            group_head = g * HEADS_PER_GROUP * T_PAD
             group_row = g * PROJECTION_ROWS
-            pa_output = pl.slice(o_r, [PROJECTION_ROWS, O_LORA], [group_row, 0])
-            with pl.spmd(pa_blocks, name_hint="proj_a_mm", deps=[heads_dep, weight_dep]) as pa_tid:
-                pa_block = pl.tile.get_block_idx()
-                pa_r0 = (pa_block % proj_a_rows) * PROJ_A_ROW_TILE
-                pa_n0 = pl.max(pa_block // proj_a_rows, 0) * PROJ_A_MM_N_TILE
-                if PROJECTION_ROWS == T_PAD:
-                    pa_src0 = row_base_o + pa_r0
-                else:
-                    bank_row = (pa_r0 // T_PAD) * PACKED_HEAD_ROWS
-                    pa_src0 = bank_row + row_base_o + (pa_r0 % T_PAD)
-                acc_a = pl.create_tensor([1, PROJ_A_ROW_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
-                for kb in pl.pipeline(0, O_GROUP_IN, A_K_TILE, stage=2):
-                    pa_head0 = pa_src0 + (kb // HEAD_DIM) * T_PAD
-                    xa_k = pl.slice(o_packed, [PROJ_A_ROW_TILE, A_K_TILE], [pa_head0, kb % HEAD_DIM])
-                    wa_k = wo_a[g : g + 1, pa_n0 : pa_n0 + PROJ_A_MM_N_TILE, kb : kb + A_K_TILE]
-                    acc_a = pl.matmul_acc(acc_a, xa_k, wa_k, b_trans=True, init_cond=(kb == 0))
-                pl.assemble(pa_output, acc_a, [pa_r0, pa_n0])
-            proj_a_tids[g] = pa_tid
+            proj_a_tids[2 * g + 1] = pl.system.task_invalid()
+            for bank in pl.range(pa_banks):
+                bank_rows = pl.min(T_PAD, o_compute_rows - bank * T_PAD)
+                pa_rows = bank_rows // PROJ_A_ROW_TILE
+                pa_blocks = pa_rows * PA_NFRAGS
+                packed_group: pl.Tensor[
+                    [HEADS_PER_GROUP * T_PAD, HEAD_DIM], pl.BF16, pl.TensorView(stride=[HEAD_DIM, 1])
+                ] = pl.slice(
+                    o_packed, [HEADS_PER_GROUP * T_PAD, HEAD_DIM],
+                    [bank * PACKED_HEAD_ROWS + group_head, 0],
+                )
+                pa_output = pl.slice(o_r, [bank_rows, O_LORA], [group_row + bank * T_PAD, 0])
+                with pl.spmd(pa_blocks, name_hint="proj_a_mm", deps=[heads_deps[bank], weight_dep]) as pa_tid:
+                    pa_block = pl.tile.get_block_idx()
+                    pa_r0 = (pa_block % pa_rows) * PROJ_A_ROW_TILE
+                    pa_n0 = pl.max(pa_block // pa_rows, 0) * PROJ_A_MM_N_TILE
+                    acc_a = pl.create_tensor([1, PROJ_A_ROW_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
+                    for kb in pl.pipeline(0, O_GROUP_IN, A_K_TILE, stage=2):
+                        pa_head0 = pa_r0 + (kb // HEAD_DIM) * T_PAD
+                        xa_k = pl.slice(packed_group, [PROJ_A_ROW_TILE, A_K_TILE], [pa_head0, kb % HEAD_DIM])
+                        wa_k = wo_a[g : g + 1, pa_n0 : pa_n0 + PROJ_A_MM_N_TILE, kb : kb + A_K_TILE]
+                        acc_a = pl.matmul_acc(acc_a, xa_k, wa_k, b_trans=True, init_cond=(kb == 0))
+                    pl.assemble(pa_output, acc_a, [pa_r0, pa_n0])
+                proj_a_tids[2 * g + bank] = pa_tid
 
         # quant[g]: per-group amax and symmetric INT8 quant over physical rows.
         for g in pl.parallel(O_GROUPS):
@@ -1361,7 +1406,7 @@ def _sparse_attn_o_proj(
             with pl.spmd(
                 quant_rows,
                 name_hint="quant",
-                deps=[proj_a_tids[g]],
+                deps=[proj_a_tids[2 * g], proj_a_tids[2 * g + 1]],
             ) as q_tid:
                 qt = pl.tile.get_block_idx() * QUANT_TOKEN_TILE
                 oc = pl.load(quant_input, [qt, 0], [QUANT_TOKEN_TILE, O_LORA], target_memory=pl.Mem.Vec)
@@ -1475,7 +1520,7 @@ def _sparse_attn_o_proj(
 
     completion_tid = act_tid
     if PROJ_A_FENCE:
-        completion_tid = pl.system.task_dummy(deps=[proj_a_tids[i] for i in range(O_GROUPS)])
+        completion_tid = pl.system.task_dummy(deps=[proj_a_tids[i] for i in range(2 * O_GROUPS)])
     return completion_tid
 
 
@@ -1595,6 +1640,7 @@ def sparse_attn_project_pair(
     with pl.scope():
         packed_bank = pl.create_tensor([2 * PACKED_HEAD_ROWS, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
         head_tids = pl.array.create(2, pl.TASK_ID)
+        head_tids[1] = pl.system.task_invalid()
         for tile_offset in pl.range(0, pair_rows, T_PAD):
             with pl.scope():
                 tile_base = pair_base + tile_offset
@@ -1638,10 +1684,9 @@ def sparse_attn_project_pair(
                     packed_head_major, packed_init_tid, pl.const(0, pl.INDEX), tile_rows,
                 )
                 head_tids[bank_slot] = tile_ready
-        heads_ready = pl.system.task_dummy(deps=[head_tids[0], head_tids[1]])
         projection_tid = _sparse_attn_o_proj(
             packed_bank, wo_a, wo_b, wo_b_scale, attn_out,
-            pair_base, pair_rows, heads_ready, o_proj_weight_dep,
+            pair_base, pair_rows, head_tids[0], head_tids[1], o_proj_weight_dep,
             PROJECTION_ROWS=PROJECTION_PAIR_TILE, PROJ_A_FENCE=PROJ_A_FENCE,
         )
         if TRACK_COMPLETION:
@@ -1894,6 +1939,8 @@ def build_tensor_specs(
     token_count: int = T,
     ori_block_num: int = ORI_BLOCK_NUM,
     cmp_block_num: int = CMP_BLOCK_NUM,
+    *,
+    check_cmp_upper_bound: bool = False,
 ):
     import torch
     from golden import TensorSpec
@@ -1943,6 +1990,8 @@ def build_tensor_specs(
                 comp_count = min(cmp_valid, (t + 1) // compress_ratio, IDX_TOPK)
                 if comp_count > 0:
                     idx[t, :comp_count] = torch.arange(comp_count, dtype=torch.int32)
+        if check_cmp_upper_bound and cmp_valid > 0:
+            idx[-1, 0] = CMP_MAX_BLOCKS * BLOCK_SIZE
         return idx
 
     def init_valid_block_mask():
@@ -2051,9 +2100,13 @@ if __name__ == "__main__":
     if args.tokens is None and not (args.save_data or args.golden_data):
         token_counts.append(T_PAD + 1)
     for token_count in token_counts:
+        specs = build_tensor_specs(
+            args.compress_ratio, token_count, args.ori_block_num, args.cmp_block_num,
+            check_cmp_upper_bound=args.tokens is None and token_count == T_PAD + 1,
+        )
         result = run(
             fn=prefill_sparse_attn_test,
-            specs=build_tensor_specs(args.compress_ratio, token_count, args.ori_block_num, args.cmp_block_num),
+            specs=specs,
             golden_fn=golden_prefill_sparse_attn,
             save_data=args.save_data,
             golden_data=args.golden_data,

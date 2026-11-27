@@ -51,48 +51,54 @@ def csa_compact_eligible(
     total = pl.tensor.dim(pos, 0)
     pages = total // BLOCK_SIZE
     flags = pl.create_tensor([pages, 16], dtype=pl.INT32)
-    with pl.spmd(pages, name_hint="csa_cp_validate_pages") as checks_tid:
-        page = pl.tile.get_block_idx()
-        begin = page * BLOCK_SIZE
-        first = pl.read(raw_map, [begin])
-        ok = pl.cast(1, pl.INT32)
-        if first < 0 or first % BLOCK_SIZE != 0:
-            ok = pl.cast(0, pl.INT32)
-        for prev in pl.range(page):
-            if pl.read(raw_map, [prev * BLOCK_SIZE]) == first:
+    page_workers = pl.min(pages, pl.system.available_aiv_count())
+    with pl.spmd(page_workers, name_hint="csa_cp_validate_pages") as checks_tid:
+        worker = pl.tile.get_block_idx()
+        for page in pl.range(worker, pages, pl.tile.get_block_num()):
+            first_position = pl.read(pos, [0])
+            begin = page * BLOCK_SIZE
+            first = pl.read(raw_map, [begin])
+            ok = pl.cast(1, pl.INT32)
+            if first < 0 or first % BLOCK_SIZE != 0:
                 ok = pl.cast(0, pl.INT32)
-        cmp_origin = (begin // (C4 * BLOCK_SIZE)) * C4 * BLOCK_SIZE
-        first_cmp = pl.read(cmp_map, [cmp_origin + C4 - 1])
-        first_idx = pl.read(index_map, [cmp_origin + C4 - 1])
-        if first_cmp < 0 or first_idx < 0 or first_cmp % BLOCK_SIZE != 0 or first_idx % BLOCK_SIZE != 0:
-            ok = pl.cast(0, pl.INT32)
-        if begin == cmp_origin:
-            for earlier in pl.range(0, cmp_origin, C4 * BLOCK_SIZE):
-                if pl.read(cmp_map, [earlier + C4 - 1]) == first_cmp or pl.read(index_map, [earlier + C4 - 1]) == first_idx:
+            for prev in pl.range(page):
+                if pl.read(raw_map, [prev * BLOCK_SIZE]) == first:
                     ok = pl.cast(0, pl.INT32)
-        for j in pl.range(BLOCK_SIZE):
-            t = begin + j
-            if pl.read(pos, [t]) != t or pl.read(raw_map, [t]) != first + j:
+            cmp_origin = (begin // (C4 * BLOCK_SIZE)) * C4 * BLOCK_SIZE
+            first_cmp = pl.read(cmp_map, [cmp_origin + C4 - 1])
+            first_idx = pl.read(index_map, [cmp_origin + C4 - 1])
+            if first_cmp < 0 or first_idx < 0 or first_cmp % BLOCK_SIZE != 0 or first_idx % BLOCK_SIZE != 0:
                 ok = pl.cast(0, pl.INT32)
-            if pl.read(state_map, [t]) < 0 or pl.read(index_state_map, [t]) < 0:
-                ok = pl.cast(0, pl.INT32)
-            tail = t % PREFILL_STATE_TILE - (PREFILL_STATE_TILE - HALO)
-            if tail > 0:
-                for earlier in pl.range(t - tail, t):
-                    if pl.read(state_map, [earlier]) == pl.read(state_map, [t]) or pl.read(index_state_map, [earlier]) == pl.read(index_state_map, [t]):
+            if begin == cmp_origin:
+                for earlier in pl.range(0, cmp_origin, C4 * BLOCK_SIZE):
+                    if pl.read(cmp_map, [earlier + C4 - 1]) == first_cmp or pl.read(index_map, [earlier + C4 - 1]) == first_idx:
                         ok = pl.cast(0, pl.INT32)
-            c = pl.read(cmp_map, [t])
-            i = pl.read(index_map, [t])
-            if t % C4 == C4 - 1:
-                offset = (t - cmp_origin) // C4
-                if c != first_cmp + offset or i != first_idx + offset:
+            for j in pl.range(BLOCK_SIZE):
+                t = begin + j
+                if pl.read(pos, [t]) != first_position + t or pl.read(raw_map, [t]) != first + j:
                     ok = pl.cast(0, pl.INT32)
-            else:
-                if c >= 0 or i >= 0:
+                if pl.read(state_map, [t]) < 0 or pl.read(index_state_map, [t]) < 0:
                     ok = pl.cast(0, pl.INT32)
-        pl.write(flags, [page, 0], ok)
+                tail = t % PREFILL_STATE_TILE - (PREFILL_STATE_TILE - HALO)
+                if tail > 0:
+                    for earlier in pl.range(t - tail, t):
+                        if pl.read(state_map, [earlier]) == pl.read(state_map, [t]) or pl.read(index_state_map, [earlier]) == pl.read(index_state_map, [t]):
+                            ok = pl.cast(0, pl.INT32)
+                c = pl.read(cmp_map, [t])
+                i = pl.read(index_map, [t])
+                if t % C4 == C4 - 1:
+                    offset = (t - cmp_origin) // C4
+                    if c != first_cmp + offset or i != first_idx + offset:
+                        ok = pl.cast(0, pl.INT32)
+                else:
+                    if c >= 0 or i >= 0:
+                        ok = pl.cast(0, pl.INT32)
+            pl.write(flags, [page, 0], ok)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_cp_check_plan", deps=[checks_tid]):
         accepted = pl.cast(1, pl.INT32)
+        first_position = pl.read(pos, [0])
+        if first_position < 0 or first_position % C4 != 0:
+            accepted = pl.cast(0, pl.INT32)
         if pl.read(starts, [0]) != 0 or pl.read(starts, [1]) != total:
             accepted = pl.cast(0, pl.INT32)
         for t in pl.range(total // PREFILL_STATE_TILE):
@@ -125,7 +131,8 @@ def csa_compact_caches(
     x: pl.Tensor, kv: pl.Tensor, halo: pl.Tensor, comp_cos: pl.Tensor, comp_sin: pl.Tensor,
     wkv: pl.Tensor, wgate: pl.Tensor, ape: pl.Tensor, norm: pl.Tensor,
     iwkv: pl.Tensor, iwgate: pl.Tensor, iape: pl.Tensor, inorm: pl.Tensor, hadamard: pl.Tensor,
-    raw_map: pl.Tensor, cmp_map: pl.Tensor, index_map: pl.Tensor, state_map: pl.Tensor, index_state_map: pl.Tensor,
+    pos: pl.Tensor, raw_map: pl.Tensor, cmp_map: pl.Tensor, index_map: pl.Tensor,
+    state_map: pl.Tensor, index_state_map: pl.Tensor, state_table: pl.Tensor, index_state_table: pl.Tensor,
     raw_cache: pl.Tensor, cmp_cache: pl.Tensor, index_cache: pl.Tensor, scales: pl.Tensor,
     state: pl.Tensor, index_state: pl.Tensor, window: pl.InOut[pld.DistributedTensor], signal: pl.InOut[pld.DistributedTensor],
     group: pl.Scalar[pl.INT32], rank: pl.Scalar[pl.INT32], halo_ready: pl.Scalar[pl.TASK_ID],
@@ -145,26 +152,57 @@ def csa_compact_caches(
     checkpoints = pl.create_tensor([2, tiles, CHECKPOINTS_PER_TILE], dtype=pl.INT32)
     main_table = pl.create_tensor([2, CSA_STATE_MAX_BLOCKS], dtype=pl.INT32)
     index_table = pl.create_tensor([2, INNER_STATE_MAX_BLOCKS], dtype=pl.INT32)
+    main_scratch = pl.create_tensor([extent // CSA_STATE_BLOCK_SIZE, CSA_STATE_BLOCK_SIZE, MAIN_STATE_WIDTH], dtype=pl.FP32)
+    index_scratch = pl.create_tensor([extent // INNER_STATE_BLOCK_SIZE, INNER_STATE_BLOCK_SIZE, INDEX_STATE_WIDTH], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_cp_local_plan", deps=[halo_ready]):
-        pl.write(starts, [0], pl.cast(0, pl.INT32))
+        absolute_base = pl.cast(pl.read(pos, [0]), pl.INDEX) + base
+        first_request_row = pl.cast(0, pl.INT32)
+        if rank == 0:
+            first_request_row = pl.cast(HALO, pl.INT32)
+        pl.write(starts, [0], first_request_row)
         pl.write(starts, [1], pl.cast(HALO, pl.INT32))
         pl.write(starts, [2], pl.cast(extent, pl.INT32))
         for tile in pl.range(tiles):
             for ck in pl.range(CHECKPOINTS_PER_TILE):
                 pl.write(checkpoints, [0, tile, ck], pl.cast(0, pl.INT32))
                 pl.write(checkpoints, [1, tile, ck], pl.cast(0, pl.INT32))
-        if rank > 0:
-            for page in pl.range(HALO // CSA_STATE_BLOCK_SIZE):
-                pl.write(main_table, [1, (base - HALO) // CSA_STATE_BLOCK_SIZE + page], pl.cast(page, pl.INT32))
-            for page in pl.range(HALO // INNER_STATE_BLOCK_SIZE):
-                pl.write(index_table, [1, (base - HALO) // INNER_STATE_BLOCK_SIZE + page], pl.cast(page, pl.INT32))
+        # Rank 0 reads history from the entry state pages. Other ranks project the TP halo.
+        for page in pl.range(HALO // CSA_STATE_BLOCK_SIZE):
+            absolute_row = absolute_base - HALO + page * CSA_STATE_BLOCK_SIZE
+            if absolute_row >= 0:
+                logical = absolute_row // CSA_STATE_BLOCK_SIZE
+                private_page = pl.cast(page, pl.INT32)
+                if rank == 0:
+                    physical = pl.read(state_table, [0, logical])
+                    if physical >= 0:
+                        history = pl.load(state, [physical, 0, 0], [1, CSA_STATE_BLOCK_SIZE, MAIN_STATE_WIDTH])
+                        pl.store(history, [page, 0, 0], main_scratch)
+                    else:
+                        private_page = pl.cast(-1, pl.INT32)
+                pl.write(main_table, [1, logical], private_page)
+
+        for page in pl.range(HALO // INNER_STATE_BLOCK_SIZE):
+            absolute_row = absolute_base - HALO + page * INNER_STATE_BLOCK_SIZE
+            if absolute_row >= 0:
+                logical = absolute_row // INNER_STATE_BLOCK_SIZE
+                private_page = pl.cast(page, pl.INT32)
+                if rank == 0:
+                    index_physical = pl.read(index_state_table, [0, logical])
+                    if index_physical >= 0:
+                        index_history = pl.load(
+                            index_state, [index_physical, 0, 0], [1, INNER_STATE_BLOCK_SIZE, INDEX_STATE_WIDTH],
+                        )
+                        pl.store(index_history, [page, 0, 0], index_scratch)
+                    else:
+                        private_page = pl.cast(-1, pl.INT32)
+                pl.write(index_table, [1, logical], private_page)
         previous_x = pl.load(halo, [0, 0], [HALO, D])
         pl.store(previous_x, [0, 0], local_x)
         z = pl.tile.full([HALO, ROPE], dtype=pl.BF16, value=0.0)
         pl.store(z, [0, 0], local_cos)
         pl.store(z, [0, 0], local_sin)
         for j in pl.range(HALO):
-            pl.write(positions, [j], pl.cast(pl.max(0, base - HALO + j), pl.INT32))
+            pl.write(positions, [j], pl.cast(pl.max(0, absolute_base - HALO + j), pl.INT32))
             pl.write(private_state_slots, [j], pl.cast(j, pl.INT64))
             pl.write(private_cache_slots, [j], pl.cast(-1, pl.INT64))
     position_row = pl.reshape(positions, [1, extent])
@@ -176,8 +214,8 @@ def csa_compact_caches(
         sine = pl.load(comp_sin, [base + t, 0], [COMM_ROW_TILE, ROPE])
         pl.store(cosine, [HALO + t, 0], local_cos)
         pl.store(sine, [HALO + t, 0], local_sin)
-        lane = pl.tile.arange(0, [1, COMM_ROW_TILE], dtype=pl.INT32)
-        local_positions = pl.add(lane, pl.cast(base + t, pl.INT32))
+        local_positions = pl.load(pos, [base + t], [COMM_ROW_TILE])
+        local_positions = pl.reshape(local_positions, [1, COMM_ROW_TILE])
         pl.store(local_positions, [0, HALO + t], position_row)
         for j in pl.range(COMM_ROW_TILE):
             row = HALO + t + j
@@ -187,8 +225,6 @@ def csa_compact_caches(
             else:
                 pl.write(private_cache_slots, [row], pl.cast(-1, pl.INT64))
 
-    main_scratch = pl.create_tensor([extent // CSA_STATE_BLOCK_SIZE, CSA_STATE_BLOCK_SIZE, MAIN_STATE_WIDTH], dtype=pl.FP32)
-    index_scratch = pl.create_tensor([extent // INNER_STATE_BLOCK_SIZE, INNER_STATE_BLOCK_SIZE, INDEX_STATE_WIDTH], dtype=pl.FP32)
     cache_pages = local // (C4 * BLOCK_SIZE)
     main_rows = pl.create_tensor([cache_pages, BLOCK_SIZE, 1, HEAD], dtype=pl.BF16)
     index_rows = pl.create_tensor([cache_pages, BLOCK_SIZE, 1, INDEX_HEAD], dtype=pl.INT8)
