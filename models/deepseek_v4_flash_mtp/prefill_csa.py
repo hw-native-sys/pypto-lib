@@ -1855,10 +1855,17 @@ def prefill_attention_csa(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_seed_persistent_state"):
         packed_main_state_meta[:, :] = pl.full([EPOCHS * STATE_ROWS_PER_RANK, STATE_META_DIM], dtype=pl.INT32, value=-1)
         packed_inner_state_meta[:, :] = pl.full([EPOCHS * STATE_ROWS_PER_RANK, STATE_META_DIM], dtype=pl.INT32, value=-1)
+        # A later segment can publish state rows that it did not write.
+        # Match the former zero-initialized workspaces for every segment.
+        main_state_zero_tile = pl.full([MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], dtype=pl.FP32, value=0.0)
+        for row in pl.range(0, main_state_rows, MAIN_STATE_BLOCK_SIZE):
+            scratch_main0_flat[row:row + MAIN_STATE_BLOCK_SIZE, :] = main_state_zero_tile
+            scratch_main1_flat[row:row + MAIN_STATE_BLOCK_SIZE, :] = main_state_zero_tile
+        inner_state_zero_tile = pl.full([INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], dtype=pl.FP32, value=0.0)
+        for row in pl.range(0, inner_state_rows, INNER_STATE_BLOCK_SIZE):
+            scratch_inner0_flat[row:row + INNER_STATE_BLOCK_SIZE, :] = inner_state_zero_tile
+            scratch_inner1_flat[row:row + INNER_STATE_BLOCK_SIZE, :] = inner_state_zero_tile
         if pl.read(owner_segments_t, [0]) == 0:
-            for row in pl.range(0, main_state_rows, MAIN_STATE_BLOCK_SIZE):
-                main_state_zero_tile0 = pl.full([MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], dtype=pl.FP32, value=0.0)
-                scratch_main0_flat[row:row + MAIN_STATE_BLOCK_SIZE, :] = main_state_zero_tile0
             for row in pl.range(STATE_LEN):
                 position = history_base - STATE_LEN + row
                 if position >= 0:
@@ -1866,9 +1873,6 @@ def prefill_attention_csa(
                     destination = page * MAIN_STATE_BLOCK_SIZE + position % MAIN_STATE_BLOCK_SIZE
                     if page >= 0 and destination < main_state_rows:
                         scratch_main0_flat[destination:destination + 1, :] = history_main[row:row + 1, :]
-            for row in pl.range(0, inner_state_rows, INNER_STATE_BLOCK_SIZE):
-                inner_state_zero_tile0 = pl.full([INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], dtype=pl.FP32, value=0.0)
-                scratch_inner0_flat[row:row + INNER_STATE_BLOCK_SIZE, :] = inner_state_zero_tile0
             for row in pl.range(STATE_LEN):
                 position = history_base - STATE_LEN + row
                 if position >= 0:
@@ -1877,9 +1881,6 @@ def prefill_attention_csa(
                     if page >= 0 and destination < inner_state_rows:
                         scratch_inner0_flat[destination:destination + 1, :] = history_inner[row:row + 1, :]
         if pl.read(owner_segments_t, [1]) == 0:
-            for row in pl.range(0, main_state_rows, MAIN_STATE_BLOCK_SIZE):
-                main_state_zero_tile1 = pl.full([MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], dtype=pl.FP32, value=0.0)
-                scratch_main1_flat[row:row + MAIN_STATE_BLOCK_SIZE, :] = main_state_zero_tile1
             for row in pl.range(STATE_LEN):
                 position = history_base - STATE_LEN + row
                 if position >= 0:
@@ -1887,9 +1888,6 @@ def prefill_attention_csa(
                     destination = page * MAIN_STATE_BLOCK_SIZE + position % MAIN_STATE_BLOCK_SIZE
                     if page >= 0 and destination < main_state_rows:
                         scratch_main1_flat[destination:destination + 1, :] = history_main[row:row + 1, :]
-            for row in pl.range(0, inner_state_rows, INNER_STATE_BLOCK_SIZE):
-                inner_state_zero_tile1 = pl.full([INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], dtype=pl.FP32, value=0.0)
-                scratch_inner1_flat[row:row + INNER_STATE_BLOCK_SIZE, :] = inner_state_zero_tile1
             for row in pl.range(STATE_LEN):
                 position = history_base - STATE_LEN + row
                 if position >= 0:
@@ -2660,6 +2658,12 @@ def prefill_cp_csa_rank(
     # Keeping it child-local avoids changing the standalone test's host
     # interface / build_tensor_specs (the token is not a host-visible output).
     completion_token = pl.create_tensor([NUM_MOE_WAVES, 1, 8], dtype=pl.FP32)
+    # Local compressor scratch is initialized by the rank program and does
+    # not belong to the standalone test's host ABI.
+    main_state_workspace0 = pl.create_tensor([CSA_STATE_PHYSICAL_BLOCKS, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], dtype=pl.FP32)
+    inner_state_workspace0 = pl.create_tensor([CSA_INNER_STATE_PHYSICAL_BLOCKS, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], dtype=pl.FP32)
+    main_state_workspace1 = pl.create_tensor([CSA_STATE_PHYSICAL_BLOCKS, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], dtype=pl.FP32)
+    inner_state_workspace1 = pl.create_tensor([CSA_INNER_STATE_PHYSICAL_BLOCKS, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], dtype=pl.FP32)
     return prefill_attention_csa(
         x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b, wq_b_scale,
         wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin, cmp_wkv, cmp_wgate, cmp_ape,
